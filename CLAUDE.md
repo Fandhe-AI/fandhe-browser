@@ -24,8 +24,13 @@ fandhe-browser/
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
 ├── .editorconfig                  # インデント・改行・文字コード規約
 ├── skills-lock.json               # 導入スキルのロックファイル
+├── Makefile                       # 開発タスク集約（lint-docs・fmt・clippy・test・deny・Servo 隔離検査。`make help`）
+├── lefthook.yml                   # git hooks（整形・秘密情報検査・commit-msg・pre-push）
+├── commitlint.config.mjs          # commitlint 設定（type を 9 種に限定）
+├── Dockerfile / compose.yaml      # 開発コンテナ（環境非依存の `make docker-ci`）
+├── .markdownlint.jsonc / .yamllint / .editorconfig-checker.json  # lint-docs 設定
 ├── Cargo.toml                     #（予定）workspace 定義
-├── deny.toml                      #（予定）cargo-deny 設定（ライセンス検査）
+├── deny.toml                      # cargo-deny 設定（ライセンス・advisories 検査。MPL-2.0 は未許可）
 ├── crates/                        #（予定）
 │   ├── fandhe-browser-core/       #   fetch・HTML パース・DOM・query・CSSOM・config・可観測性
 │   ├── fandhe-browser-js/         #   JS エンジン抽象（V8 既定 / boa）
