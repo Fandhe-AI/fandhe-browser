@@ -1,11 +1,17 @@
 {
   "version": 1,
   "skills": {
-    "amd-rocm": {
+    "anthropic-agent-sdk": {
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
-      "skillPath": "skills/amd-rocm/SKILL.md",
-      "computedHash": "9c351cdf8b86e70241fd1ae3d7c5c7d8aa6f91737c52a4e5858344c0a574032f"
+      "skillPath": "skills/anthropic-agent-sdk/SKILL.md",
+      "computedHash": "9d1b8f231cfe4dbd2a4162d01d1461f94b96247a48fcff534a1a3e6a463b5133"
+    },
+    "anthropic-api-tools-mcp": {
+      "source": "Fandhe-AI/agent-reference-skills",
+      "sourceType": "github",
+      "skillPath": "skills/anthropic-api-tools-mcp/SKILL.md",
+      "computedHash": "1bb41d0251a633ff1da224b080151a9649764af63a75075148430113405de30f"
     },
     "anthropic-claude-code": {
       "source": "Fandhe-AI/agent-reference-skills",
@@ -13,11 +19,11 @@
       "skillPath": "skills/anthropic-claude-code/SKILL.md",
       "computedHash": "aac22f9c6581df5637fc30d38fd7bb0e633f1c3b2d97f1bd400f1ad0c5d6edf1"
     },
-    "apple-silicon": {
+    "anthropic-claude-code-extend": {
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
-      "skillPath": "skills/apple-silicon/SKILL.md",
-      "computedHash": "d0544c37a087c119a7d10aa681713be808447c570463750accb84a19ce640841"
+      "skillPath": "skills/anthropic-claude-code-extend/SKILL.md",
+      "computedHash": "6536a4bfdcb3d50a00281488ca25c996e7f5485813e895f4177affb134c633f3"
     },
     "comment-code": {
       "source": "Fandhe-AI/agent-cli-skills",
@@ -73,6 +79,12 @@
       "skillPath": "skills/editorconfig/SKILL.md",
       "computedHash": "4cdea0ce73faa1731f0084345aeebb48c82cb80cdc0ce6fa460f18b4d919845d"
     },
+    "fandhe-backend": {
+      "source": "Fandhe-AI/agent-reference-skills",
+      "sourceType": "github",
+      "skillPath": "skills/fandhe-backend/SKILL.md",
+      "computedHash": "4c5e5bf2ab38374cfbafb30e22aba62832493a32d2eb8f3c35a20ee91f71e2a5"
+    },
     "github-docs": {
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
@@ -115,11 +127,17 @@
       "skillPath": "skills/lefthook/SKILL.md",
       "computedHash": "976ee8abc6c0c18d2ee7dd823c24a444a50c92558238c9129d345c41b6349bcd"
     },
-    "nvidia-cuda": {
+    "openai-agents": {
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
-      "skillPath": "skills/nvidia-cuda/SKILL.md",
-      "computedHash": "cbc7e89fe4dfadf9c3a9ceaa932d164fa91e2aff3b608286e4339cbc99a79257"
+      "skillPath": "skills/openai-agents/SKILL.md",
+      "computedHash": "7c54b2d514bbd3a7574445f1406707ad76e8764a5af05ab4332e85fecd70a222"
+    },
+    "playwright": {
+      "source": "Fandhe-AI/agent-reference-skills",
+      "sourceType": "github",
+      "skillPath": "skills/playwright/SKILL.md",
+      "computedHash": "22774ae0dcf8620f900738af7383994fbf86b61105c75a9f76c8eddc98abcf9c"
     },
     "rust": {
       "source": "Fandhe-AI/agent-reference-skills",
@@ -150,6 +168,12 @@
       "sourceType": "github",
       "skillPath": "skills/update-issue-tree/SKILL.md",
       "computedHash": "c34283c40c7e5959e6772e841da9fb851505389a6e58fbfa54f8fe23d9fb48cf"
+    },
+    "windows-interop-modernize": {
+      "source": "Fandhe-AI/agent-reference-skills",
+      "sourceType": "github",
+      "skillPath": "skills/windows-interop-modernize/SKILL.md",
+      "computedHash": "59f6571bc6c2c3cd94b6a0c236a33a29eeb5ef5f55f9d8014424f0e1fd039ea2"
     }
   }
 }
