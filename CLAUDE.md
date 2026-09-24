@@ -17,7 +17,7 @@ Rust 製の軽量・ミニマムなブラウザの実装リポジトリ。AI エ
 ```text
 fandhe-browser/
 ├── CLAUDE.md                      # Claude 運用方針（本ファイル）
-├── AGENTS.md                      #（予定）ビルド・テスト・回帰確認コマンド / レビュー観点集（REPAIR-7。setup-repo-guards で整備）
+├── AGENTS.md                      # ビルド・テスト・回帰確認コマンド / AI PR レビュー観点集（REPAIR-7）
 ├── README.md                      # 概要・実装方針（要点）・開発環境構築
 ├── LICENSE-MIT / LICENSE-APACHE   # デュアルライセンス
 ├── NOTICE                         #（予定）サードパーティ帰属表示・MPL 適用範囲
@@ -39,7 +39,7 @@ fandhe-browser/
 ├── docs/
 │   ├── design/                    #（予定）設計ドキュメント（public）
 │   └── spec/                      # fandhe-browser-spec submodule（private・要アクセス権）
-├── .github/workflows/             #（予定）3 OS CI
+├── .github/workflows/             # ai-review・update-external（稼働）/ ci・release（発火条件無効化中・3 OS CI は予定）
 ├── .agents/skills/                # npx skills add の導入実体
 └── .claude/
     ├── agents/                    # カテゴリ別 subagent 定義
