@@ -100,7 +100,28 @@ jobs:
       # crates/fandhe-browser-cdp の雛形のみで重依存は無いが、V8（rusty_v8）・Servo
       # 導入後はビルド時間が増える見込み）。cache-key-prefix は他リポジトリと
       # 同じ既定値 `rust-base-ci` との衝突回避のため本リポ名にする
-      cache: true
+      #
+      # windows-latest のみ既定 false（Issue #59 レビュー指摘。PR #409 CI 失敗の
+      # 実測: rust-base-ci.yml（Fandhe-AI/actions・@latest）の
+      # 「workspace メンバー成果物を prune（cache 保存前・cache 有効時のみ）」
+      # ステップが `cargo clippy`/`cargo test` 自体は成功しているにも関わらず、
+      # windows-latest のみ ##[error]想定外の crate / target 名を検出したため
+      # prune を中止します（名前: fandhe-browser-ai）で exit code 1 になり、
+      # rust-ci (windows-latest) / rust-base-ci-complete を fail させていた
+      # （ubuntu-latest・macos-latest では未再現。実行ログでは jq 側のエラー出力は
+      # 見えず、cargo metadata の出力を読む `while IFS= read -r -d ''` ループの
+      # 最初の 1 件目（sort -u で先頭になった fandhe-browser-ai）で即座に失敗して
+      # おり、crate 名自体は `^[\p{L}\p{N}_-]+$` を満たす正当な値のため、
+      # windows-latest（git-bash/MSYS）環境でこの prune スクリプトの
+      # 名前検証ロジックが誤検出している可能性が高い）。原因は本リポではなく
+      # 呼び出し先の reusable workflow（Fandhe-AI/actions）側にあり、本リポの
+      # crate 構成・PR #409 の差分（ci.yml の cache-key-prefix 変更・render crate
+      # 追加等）には起因しない。恒久修正は Fandhe-AI/actions 側の対応を要する
+      # ため、それまでの回避策として windows-latest のみ cache を無効化する
+      # （現時点は各 crate が雛形のみで依存もなく、cache 無効化によるビルド時間
+      # 増加コストは小さい）。Fandhe-AI/actions 側で修正され次第この条件式は削除
+      # してよい
+      cache: ${{ matrix.os != 'windows-latest' }}
       cache-key-prefix: fandhe-browser
 
   # --------------------------------------------------
