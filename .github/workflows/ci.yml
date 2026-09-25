@@ -3,8 +3,8 @@ name: CI
 # 準備が整うまで発火条件を無効化している（手動実行のみのプレースホルダ）。
 # 有効化時はこの on: を削除し、下のコメントアウトした on: ブロックを戻す。
 # 有効化前に必要な作業: workspace（Cargo.toml）作成、vector-db 固有ジョブ
-# （test-default-build 以降の make / scripts 依存ジョブ）の置換、lint-docs が
-# 参照する設定ファイル（.markdownlint.jsonc 等）の整備。rust-ci の
+# （test-default-build 以降の make / scripts 依存ジョブ）の置換。lint-docs が
+# 参照する設定ファイル（.markdownlint.jsonc 等）の整備・rust-ci の
 # cache-key-prefix をリポ名へ変更する作業は完了済み（TASK-55.3・Issue #60）。
 # 3 OS matrix 対応（.claude/rules/ci.md）は rust-ci ジョブ分のみ対応済み
 # （TASK-55.1・Issue #58）。lint-docs・vector-db 固有ジョブ（test-default-build
