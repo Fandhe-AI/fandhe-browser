@@ -19,7 +19,7 @@
 | コードレビュー | reviewer | sonnet |
 | セキュリティ監査 | security-auditor | sonnet |
 | lint・整形の機械的確認 | linter | haiku |
-| README・CLAUDE.md・`docs/design/` 更新 | docs-writer | haiku |
+| README・CLAUDE.md・`AGENTS.md`・`docs/design/`・`.claude/`（agents・rules・settings.json）更新 | docs-writer | haiku |
 
 複数 crate に跨る変更は crate ごとに builder を分けて委譲する（独立していれば並列可）。
 crate 境界・公開トレイトの設計変更は builder に任せず main（opus / fable）で設計してから委譲する。
