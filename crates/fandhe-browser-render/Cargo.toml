@@ -1,0 +1,15 @@
+[package]
+name = "fandhe-browser-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# ルート Cargo.toml の [workspace.package] コメントが定める契約: `publish` は
+# 他フィールドと異なり自動継承されないため、各 crate 側で明示しないと Cargo の
+# 既定値 `publish = true` になってしまう。`make check-publish-private` が
+# 全 member crate に対してこの明記を機械検証する。
+publish.workspace = true
+
+[dependencies]
+# 依存最小方針（dependency-policy.md）: 本 crate は雛形段階のため依存はゼロ。
+# Servo（MPL-2.0）の導入・feature gate `rendering` の追加は TASK-33
+# （ビヘイビア RENDER-1）でユーザー承認を経て行う。
