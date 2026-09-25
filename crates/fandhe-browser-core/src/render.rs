@@ -161,7 +161,6 @@ impl BoundingBox {
 /// 将来の variant 追加に備え `#[non_exhaustive]` を付与する。新規依存（`thiserror` 等）を
 /// 追加しない方針（dependency-policy.md）のため手書きで `Display` / `Error` を実装する。
 #[non_exhaustive]
-#[derive(Debug)]
 pub enum RenderError {
     /// feature `rendering` が無効、または描画実装が未接続の状態を表す。
     ///
@@ -173,11 +172,25 @@ pub enum RenderError {
     ElementNotFound,
     /// 上記に分類できない内部エラー。
     ///
-    /// `message` はファイルパス等の内部実装詳細を含みうるため、`Display`
-    /// （`cdp`・`ai` が呼び出し元へそのまま文字列化しうる経路。OWASP A02:
-    /// 機密情報の露出対策）には出力しない。詳細を診断目的で取得する場合は
-    /// [`RenderError::internal_detail`] を使い、ログ等の非公開経路に限定する。
+    /// `message` はファイルパス等の内部実装詳細を含みうるため、`Display` と `Debug`
+    /// （`cdp`・`ai` が呼び出し元へそのまま文字列化・ログ出力しうる経路。OWASP A02:
+    /// 機密情報の露出対策）のどちらにも出力しない（`Debug` は `#[derive]` を使わず
+    /// 手書きし、`format!("{err:?}")` でも詳細が漏れないようにする）。詳細を診断目的で
+    /// 取得する場合は [`RenderError::internal_detail`] を使い、ログ等の非公開経路に
+    /// 限定する。
     Internal(String),
+}
+
+impl std::fmt::Debug for RenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RenderingDisabled => f.write_str("RenderingDisabled"),
+            Self::ElementNotFound => f.write_str("ElementNotFound"),
+            // 内部詳細（ファイルパス等）を含みうるため、variant 名のみを出力し
+            // メッセージ本体は伏せる。詳細取得は `internal_detail()` を使うこと。
+            Self::Internal(_) => f.write_str("Internal(..)"),
+        }
+    }
 }
 
 impl RenderError {
@@ -399,5 +412,18 @@ mod tests {
     fn render_error_internal_detail_none_for_other_variants() {
         assert_eq!(RenderError::RenderingDisabled.internal_detail(), None);
         assert_eq!(RenderError::ElementNotFound.internal_detail(), None);
+    }
+
+    /// RENDER-1: `Internal` の `Debug`（`format!("{err:?}")`）も内部詳細（ファイルパス等に
+    /// なりうる `message`）を含まないことを確認する。`#[derive(Debug)]` のままだと
+    /// `Display` を伏せても `{:?}` 経由でそのまま露出するため、手書き `Debug` 実装で
+    /// 伏せていることを検証する（OWASP A02: 機密情報の露出対策）。
+    #[test]
+    fn render_error_internal_debug_hides_detail() {
+        let err = RenderError::Internal("/etc/secret/path.txt".to_string());
+        let debug_output = format!("{err:?}");
+        assert_eq!(debug_output, "Internal(..)");
+        assert!(!debug_output.contains("/etc/secret/path.txt"));
+        assert_eq!(err.internal_detail(), Some("/etc/secret/path.txt"));
     }
 }
