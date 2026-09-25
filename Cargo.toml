@@ -10,8 +10,10 @@
 resolver = "3"
 # `crates/*` へのグロブ採用。TASK-1（1.3）が「最初に merge される crate 追加
 # PR がこの行を空配列から `["crates/*"]` へ書き換える」契約（当時のコメント）
-# に従い、`fandhe-browser-js` 追加でこの行を書き換えた。root 側を固定メンバー
-# 列挙にすると、並列実装される後続タスク（各 crate 追加）がすべて本ファイルの
+# に従い、`fandhe-browser-js` 追加でこの行を書き換えた（空配列時点では glob が
+# 1 件も解決せず `cargo metadata` 等がエラーになるため使えなかった）。root 側を
+# 固定メンバー列挙にすると、並列実装される後続タスク（各 crate 追加。
+# `fandhe-browser-ai`（TASK-1・旧 TASK-1.5・Issue #26）を含む）がすべて本ファイルの
 # 同じ行を編集する必要が生じ、並列 PR 間でコンフリクトを誘発するため、
 # グロブ表記を採用する。以降の crate 追加 PR は本ファイルの変更を伴わない。
 # `make check-workspace-manifest`（`make ci` に含む）が `cargo verify-project`
