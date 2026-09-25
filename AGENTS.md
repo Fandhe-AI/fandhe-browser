@@ -36,9 +36,10 @@ cargo test --workspace
 `fandhe-browser-render`（Servo・MPL-2.0）の feature gate `rendering` に触れる変更では、既定ビルドと `--features rendering` の両方で確認する。PR 本文に次のコマンドの実行結果が記載されているか（同じ PR で CI 設定を変更する場合はその diff に含まれているか）を確認する。
 
 ```bash
-cargo clippy --workspace --all-targets --features rendering -- -D warnings
-cargo test --workspace --features rendering
-cargo tree -p fandhe-browser-cli   # 既定ビルド（feature なし）の依存グラフに Servo 系クレートが含まれないことを確認
+make lint-rendering   # cargo clippy --workspace --all-targets --features rendering -- -D warnings
+make test-rendering   # cargo test --workspace --features rendering
+make check-render-isolation   # cargo tree --workspace -e normal,build,dev --exclude fandhe-browser-render で
+                               # 既定ビルド（feature なし）の依存グラフに Servo 系クレートが含まれないことを確認
 ```
 
 ### ライセンス検査（`deny.toml` 導入後）
