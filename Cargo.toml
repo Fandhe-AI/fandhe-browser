@@ -53,6 +53,29 @@ publish = false
 [workspace.dependencies]
 fandhe-browser-render = { path = "crates/fandhe-browser-render" }
 
+# TASK-24.2（Issue #36・ビヘイビア CORE-1）: fetch モジュールの HTTP クライアント。
+# Issue #35（TASK-24.hdep）で採用承認済み（2026-09-25）。crypto provider は
+# aws-lc-rs（cmake・NASM を要し musl でも問題がある）を避け、ring を明示 install
+# する方針のため rustls は provider 未同梱の `rustls-no-provider` で導入する。
+reqwest = { version = "=0.13.5", default-features = false, features = [
+  "rustls-no-provider",
+] }
+# `fandhe-browser-core::fetch` が `rustls::crypto::ring::default_provider()` を
+# 1 回だけ install するために直接依存する（reqwest 自体は provider を同梱しない
+# ため、ここで ring feature を有効にした rustls を明示的に引き込む）。
+rustls = { version = "=0.23.45", default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+] }
+# fetch の結合テスト（`tests/fetch.rs`）専用のランタイム。ライブラリ本体
+# （`Fetcher::get`）はランタイム非依存の async fn として提供し、実行環境（cdp
+# の tokio ランタイム等）を選ばない。
+tokio = { version = "=1.53.1", default-features = false, features = [
+  "rt",
+  "macros",
+] }
+
 [profile.release]
 # release ビルドは panic 発生時に unwind せず即座に中断する前提
 # （coding-rust.md「release は panic = "abort" 前提のため catch_unwind に頼らない」）。
