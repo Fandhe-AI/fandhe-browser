@@ -9,9 +9,9 @@
 //! [`engine_trait`] は TASK-28（28.2・Issue #148）でエンジン種別の列挙型
 //! （[`EngineKind`]）と同梱一覧関数（[`bundled_engines`]）を、TASK-28（28.3・
 //! Issue #149）でエンジン抽象トレイト本体（[`JsEngine`]）と種別からトレイト
-//! オブジェクトを生成する関数（[`create_engine`]）を追加した。同モジュール
-//! には今後、両エンジン共通のコンフォーマンステスト（TASK-28.4・Issue #150）
-//! が追加される予定である（実装済みを装わない。REPAIR-3）。
+//! オブジェクトを生成する関数（[`create_engine`]）を追加した。両エンジン
+//! 共通のコンフォーマンステスト（TASK-28.4・Issue #150）は本 crate の
+//! `tests/conformance.rs`（結合テスト）にある。
 //!
 //! V8（`rusty_v8`）・boa（`boa_engine`）それぞれの実装切替（JS-3）は、
 //! 対応する依存追加（TASK-29・TASK-32）を経て別途行う。
