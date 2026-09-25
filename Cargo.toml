@@ -1,0 +1,36 @@
+# fandhe-browser の workspace ルート manifest。
+#
+# REPAIR-1（TASK-1・TASK-1（1.1）・MS-1）: fandhe-browser を
+# `-core`/`-js`/`-render`/`-cdp`/`-ai`/`-profile`/`-cli`/`-mcp` の 8 crate に
+# 分割する Cargo workspace 化の第一歩として、このルート manifest だけを作成する
+# （各 crate 本体は TASK-1.2〜1.7 が個別に `crates/fandhe-browser-*/Cargo.toml`
+# として追加する）。
+
+[workspace]
+resolver = "3"
+# `crates/*` へのグロブ採用。root 側を固定メンバー列挙にすると、並列実装される
+# 後続タスク（各 crate 追加）がすべて本ファイルの同じ行を編集する必要が生じ、
+# 並列 PR 間でコンフリクトを誘発する。グロブなら各 crate 追加 PR は自分の
+# `crates/<name>/Cargo.toml` を追加するだけで、root 側の変更なしに workspace へ
+# 自動的に組み込まれる。
+members = ["crates/*"]
+
+[workspace.package]
+# 各 crate 側は `version.workspace = true` 等（`edition`/`license` も同様）で
+# ここから継承する契約とする（TASK-1.2〜1.7 向けの申し送り）。
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+# `deny.toml` の `allow-wildcard-paths = true` は「workspace 内 crate は
+# `publish = false` の private crate」という前提に立っているため、ここで明示する。
+publish = false
+
+# 現時点で追加する依存はない（依存最小方針）。将来 workspace 共通依存を追加する際は
+# ここに `[workspace.dependencies]` テーブルを設け、dependency-policy.md の
+# ユーザー承認制（`=x.y.z` 完全固定）に従う。
+
+[profile.release]
+# release ビルドは panic 発生時に unwind せず即座に中断する前提
+# （coding-rust.md「release は panic = "abort" 前提のため catch_unwind に頼らない」）。
+# 仮想 manifest のルートにしか置けない設定のため、workspace 作成時に確定させる。
+panic = "abort"

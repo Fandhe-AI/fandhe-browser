@@ -2,9 +2,10 @@
 #
 # `make setup` 一発で開発環境（サブモジュール・rustup・lefthook）を構築し、
 # `make ci` でローカル検証（.claude/rules/ci.md のローカルゲート）を一括実行する。
-# 実装は未着手（Cargo.toml 未追加）のため、cargo 系ターゲットは HAS_CARGO 判定で
-# スキップし、workspace 作成後に自動で有効化される（冪等セルフヒール。
-# deny も deny.toml + Cargo.toml が揃った時点で有効化）。
+# 実装は未着手（`crates/` 配下に実クレート未追加）のため、cargo 系ターゲットは
+# HAS_CARGO / HAS_MEMBERS 判定でスキップし、workspace 作成後に自動で有効化される
+# （冪等セルフヒール。deny も deny.toml + Cargo.toml + メンバー crate が揃った
+# 時点で有効化）。
 # Docker で環境非依存に開発・検証する場合は docker-* ターゲットを使う（compose.yaml 参照）。
 # Fandhe-AI/rust-ai-library の Makefile と同一方針。
 
@@ -14,6 +15,16 @@ SHELL := /bin/bash
 # Cargo.toml の有無（無ければ cargo 系をスキップ。workspace 作成後に有効化）
 HAS_CARGO := $(wildcard Cargo.toml)
 HAS_DENY := $(wildcard deny.toml)
+# workspace のメンバー crate（`crates/*/Cargo.toml`）の有無。root の
+# `[workspace] members = ["crates/*"]` はグロブ解決先が 1 つも無いと
+# `cargo metadata`（`--no-deps` 有無を問わず）・`cargo fmt --all --check`・
+# `cargo clippy --workspace`・`cargo test --workspace`・`cargo deny check ...` の
+# いずれもエラーで落ちる（cargo の仕様。実機検証済み）。root Cargo.toml だけが
+# 存在しメンバー crate が無い中間状態（TASK-1.1 完了直後〜TASK-1.2 以降で
+# 最初の crate が追加されるまでの間）でも pre-commit/pre-push を通すため、
+# HAS_CARGO 単独ではなく HAS_MEMBERS も満たすことを cargo 系ターゲットの
+# 有効化条件に加える。
+HAS_MEMBERS := $(wildcard crates/*/Cargo.toml)
 
 # lint ツールの固定バージョン。CI（Fandhe-AI/actions の lint-docs reusable workflow）の
 # 既定値に合わせる（CI 側が正。乖離したらこちらを追従させる）。
@@ -150,18 +161,18 @@ lint-docs: lint-md lint-yaml lint-editorconfig lint-commits ## ドキュメン�
 
 .PHONY: fmt
 fmt: ## cargo fmt --all で整形する
-ifdef HAS_CARGO
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	cargo fmt --all
 else
-	@echo "skip: Cargo.toml 未追加のため fmt をスキップ"
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため fmt をスキップ"
 endif
 
 .PHONY: fmt-check
 fmt-check: ## cargo fmt --check（整形差分の検出）
-ifdef HAS_CARGO
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	cargo fmt --all --check
 else
-	@echo "skip: Cargo.toml 未追加のため fmt-check をスキップ"
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため fmt-check をスキップ"
 endif
 
 # 既定 feature のみで検証する（RENDER-1・licensing.md）。Servo（`rendering` feature）は
@@ -170,18 +181,18 @@ endif
 # --features rendering の両方で検証」）。
 .PHONY: lint
 lint: ## cargo clippy -D warnings（既定 feature。lint ゲート）
-ifdef HAS_CARGO
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	cargo clippy --workspace --all-targets -- -D warnings
 else
-	@echo "skip: Cargo.toml 未追加のため lint をスキップ"
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため lint をスキップ"
 endif
 
 .PHONY: test
 test: ## cargo test（既定 feature。workspace 全体）
-ifdef HAS_CARGO
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	cargo test --workspace
 else
-	@echo "skip: Cargo.toml 未追加のため test をスキップ"
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test をスキップ"
 endif
 
 # `rendering` feature（Servo。RENDER-1）は fandhe-browser-render crate 追加まで
@@ -193,7 +204,7 @@ endif
 # cargo metadata 自体の失敗も「feature 未定義」扱いで無音 skip になっていた）。
 .PHONY: lint-rendering
 lint-rendering: ## cargo clippy -D warnings（--features rendering。Servo 込みの検証）
-ifdef HAS_CARGO
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	@meta=$$(cargo metadata --no-deps --format-version 1 2>&1) || { \
 		echo "$$meta" >&2; \
 		echo "NG: cargo metadata の実行に失敗しました" >&2; \
@@ -205,12 +216,12 @@ ifdef HAS_CARGO
 		echo "skip: rendering feature が未定義のため lint-rendering をスキップ"; \
 	fi
 else
-	@echo "skip: Cargo.toml 未追加のため lint-rendering をスキップ"
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため lint-rendering をスキップ"
 endif
 
 .PHONY: test-rendering
 test-rendering: ## cargo test（--features rendering。Servo 込みの検証）
-ifdef HAS_CARGO
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	@meta=$$(cargo metadata --no-deps --format-version 1 2>&1) || { \
 		echo "$$meta" >&2; \
 		echo "NG: cargo metadata の実行に失敗しました" >&2; \
@@ -222,7 +233,7 @@ ifdef HAS_CARGO
 		echo "skip: rendering feature が未定義のため test-rendering をスキップ"; \
 	fi
 else
-	@echo "skip: Cargo.toml 未追加のため test-rendering をスキップ"
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test-rendering をスキップ"
 endif
 
 # 既定ビルド（feature 指定なし）の依存グラフに Servo 系クレートが混入していないことを
@@ -245,7 +256,7 @@ endif
 RENDER_ISOLATION_PATTERN := servo|fandhe-browser-render
 .PHONY: check-render-isolation
 check-render-isolation: ## 既定ビルドの依存グラフに Servo 系クレートが含まれないことを検証する
-ifdef HAS_CARGO
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	@out=$$(cargo tree --workspace -e normal,build,dev --exclude fandhe-browser-render) || { \
 		echo "NG: cargo tree の実行に失敗しました" >&2; \
 		exit 1; \
@@ -256,12 +267,12 @@ ifdef HAS_CARGO
 		exit 1; \
 	fi
 else
-	@echo "skip: Cargo.toml 未追加のため check-render-isolation をスキップ"
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため check-render-isolation をスキップ"
 endif
 
 .PHONY: deny
 deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
-ifneq ($(and $(HAS_CARGO),$(HAS_DENY)),)
+ifneq ($(and $(HAS_CARGO),$(HAS_DENY),$(HAS_MEMBERS)),)
 	@export PATH="$$HOME/.cargo/bin:$$PATH"; \
 	command -v cargo-deny >/dev/null 2>&1 || { \
 		echo "cargo-deny を導入します"; \
@@ -269,7 +280,7 @@ ifneq ($(and $(HAS_CARGO),$(HAS_DENY)),)
 	}; \
 	cargo deny --locked check advisories bans licenses sources
 else
-	@echo "skip: Cargo.toml または deny.toml 未追加のため deny をスキップ"
+	@echo "skip: Cargo.toml・deny.toml のいずれか未追加、または workspace にメンバー crate が無いため deny をスキップ"
 endif
 
 # `rendering` feature（Servo）を含めた検証（ci.md「既定ビルドと --features rendering
