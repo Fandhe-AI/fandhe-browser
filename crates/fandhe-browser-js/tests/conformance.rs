@@ -10,33 +10,44 @@
 //! TASK-64（コンテナのスモークテスト）は同等の検査をコンテナ内で実行する
 //! 想定であり、本ファイルの検査内容がその受け皿になる。
 //!
-//! ## 構成（PR #427 レビュー指摘への対応）
+//! ## 構成（PR #427 レビュー指摘への 2 回目の対応）
 //!
-//! 常に実行される [`js_1_create_engine_contract_for_bundled_engines`] は、
-//! [`create_engine`] が [`IMPLEMENTED_ENGINES`] の内容どおりに
-//! `Ok`/`NotYetImplemented` を返す契約自体を検証する。
+//! 1 回目の対応（P0）で「ループが空でも成功扱いになる」問題への手当てを
+//! 入れたが、その手当ては (a) 実処理コンフォーマンス検査
+//! （[`conformance_checks`] モジュール内の `check_*` 一式）から `#[test]`
+//! を外して「まだ配線されていない」状態にする、(b) 既定構成
+//! （`js-v8`/`js-boa` 両 feature 無効）でのみ実行される契約テストは
+//! ループが空のまま無検証で成功する、という 2 つの新しい P1（本コミットの
+//! 対応対象）を生んでいた。本コミットはその場しのぎの `#[test]` 着脱では
+//! なく、cfg gate で「ループが空になるビルド構成そのものにテストを
+//! 存在させない」ことで両方を解消する。
 //!
-//! 一方、実際に `check_*`（スクリプト評価・グローバル関数注入・DOM 風
-//! バインディング）を呼ぶ実処理コンフォーマンス検査は
-//! [`pending_conformance_checks`] モジュール内に隔離している。理由:
-//! `IMPLEMENTED_ENGINES` が空の間（TASK-29・V8／TASK-32・boa がまだ未完了）は
-//! `create_engine` がどの種別に対しても `NotYetImplemented` を返すため、
-//! `js-v8`/`js-boa` feature（本 crate の CI は `cargo test --all-features`
-//! でも検証する。ci.yml 参照）を有効にしても `check_*` は一度も呼ばれない。
-//! この状態で `#[test]` として実行し続けると、`cargo test` の出力上は
-//! 「pass」と表示されながら実際には何も検査していない状態が固定化し、
-//! 将来の回帰を検出できなくなる（AGENTS.md「回帰検出の後退」規約に抵触。
-//! `#[ignore]` による skip は coding-rust.md で禁止されているため、
-//! ignore で隠す選択肢は取らない）。そのため `check_*` を呼ぶ実行系一式は
-//! `#[test]` を外し、`cargo test` の集計に一切現れない「まだ配線されていない
-//! テスト支援 API」として保持する（実装済みを装わない。REPAIR-3）。
+//! - [`js_1_create_engine_contract_for_bundled_engines`]（`js-v8`/`js-boa`
+//!   のいずれかが有効な構成でのみ存在）は [`bundled_engines`] が非空である
+//!   ことを前提にでき、`create_engine` が [`IMPLEMENTED_ENGINES`] の内容
+//!   どおりに `Ok`/`NotYetImplemented` を返す契約を検証する。
+//! - 既定構成（両 feature 無効）では代わりに
+//!   [`js_1_create_engine_contract_is_empty_by_default`] が存在し、
+//!   `bundled_engines()` が空であること・`IMPLEMENTED_ENGINES` も空である
+//!   こと・`create_engine` が V8・Boa いずれに対しても具体的に
+//!   `NotBundled { bundled: [] }` を返すことを、値を伴って検証する
+//!   （coding-rust.md「期待値は具体値で書く」）。
+//! - [`conformance_checks`] モジュール（`check_*` を含む実処理検査一式）
+//!   も同じ cfg gate 配下に置く。`js-v8`/`js-boa` いずれかが有効な限り
+//!   3 関数すべてが `#[test]` として常に実行され、[`create_engine`] が
+//!   `Ok` を返すようになった時点（TASK-29・V8／TASK-32・boa 完了時）で
+//!   自動的に `check_*` を呼び出すようになる。「実装が入ったのに
+//!   `#[test]` を付け直し忘れる」余地を構造上なくす（本 crate の CI は
+//!   `cargo test --all-features` に加え既定 feature 構成も別ジョブで
+//!   検証する。ci.yml 参照）。
 //!
-//! 申し送り: TASK-29（V8）・TASK-32（boa）の完了後、[`IMPLEMENTED_ENGINES`]
-//! へ当該 [`EngineKind`] を追加したうえで、
-//! [`pending_conformance_checks`] 内の 3 関数（
-//! `js_1_conformance_script_evaluation_for_each_bundled_engine` 等）に
-//! `#[test]` を付け直し、モジュール先頭の `#![allow(dead_code)]` を外す。
-//! それまでの間、このモジュールを実際に呼び出す `#[test]` は存在しない。
+//! 現時点（[`IMPLEMENTED_ENGINES`] が空）では、feature 有効構成でも
+//! `check_*` はまだ 1 度も実際のスクリプト評価まで到達しない
+//! （`create_engine` がどの種別にも `NotYetImplemented` を返すため）。
+//! これは実装状況をそのまま反映した結果であり、テスト自体は
+//! `run_for_each_bundled_engine` を必ず呼び出し、[`bundled_engines`] を
+//! 空にしない cfg gate と合わせて「ループが空のまま無検証で成功する」
+//! ことを許さない（実装済みを装わない。REPAIR-3）。
 
 use fandhe_browser_js::{CreateEngineError, EngineKind, bundled_engines, create_engine};
 
@@ -45,22 +56,34 @@ use fandhe_browser_js::{CreateEngineError, EngineKind, bundled_engines, create_e
 /// [`EngineKind::Boa`] をここへ追加する）。
 ///
 /// [`js_1_create_engine_contract_for_bundled_engines`]・
-/// [`pending_conformance_checks`] 内の各ヘルパーが期待値の唯一の情報源
-/// として参照する。ここに列挙されていない種別が `Ok` を返した場合、
-/// または列挙されている種別がなお `NotYetImplemented` を返した場合は
-/// どちらもテスト失敗になる（実装状況とテストの期待値がずれたまま CI を
-/// 通さない）。
+/// [`js_1_create_engine_contract_is_empty_by_default`]・
+/// [`conformance_checks`] 内の各ヘルパーが期待値の唯一の情報源として参照
+/// する。ここに列挙されていない種別が `Ok` を返した場合、または列挙されて
+/// いる種別がなお `NotYetImplemented` を返した場合はどちらもテスト失敗に
+/// なる（実装状況とテストの期待値がずれたまま CI を通さない）。
+///
+/// 既定 feature 構成（`js-v8`/`js-boa` 両無効）でもこの定数は参照される
+/// （[`js_1_create_engine_contract_is_empty_by_default`] 参照）ため、
+/// cfg gate は付けない。
 const IMPLEMENTED_ENGINES: &[EngineKind] = &[];
 
 /// JS-1: `create_engine` の同梱種別ごとの契約（[`IMPLEMENTED_ENGINES`] に
 /// 含まれるかどうかで `Ok`/`NotYetImplemented` のどちらを返すべきか）を
-/// 検証する（TASK-28.4・Issue #150）。`IMPLEMENTED_ENGINES` が空の間も
-/// 「同梱種別は全て `NotYetImplemented` を返す」という現行契約自体を
-/// 検査し続けるため、`bundled_engines()` が空でない構成（`js-v8`/`js-boa`
-/// feature 有効時）では常に意味のある検査になる。
+/// 検証する（TASK-28.4・Issue #150）。`js-v8`/`js-boa` のいずれかが有効な
+/// 構成でのみ存在し、[`bundled_engines`] が非空であることを前提にできる
+/// （既定構成の対応する検証は
+/// [`js_1_create_engine_contract_is_empty_by_default`] を参照。PR #427
+/// レビュー指摘: 空のループが無検証で成功しないよう、ループが空になり得る
+/// 構成そのものに本テストを存在させない）。
 #[test]
+#[cfg(any(feature = "js-v8", feature = "js-boa"))]
 fn js_1_create_engine_contract_for_bundled_engines() {
-    for &kind in bundled_engines() {
+    let engines = bundled_engines();
+    assert!(
+        !engines.is_empty(),
+        "this test is cfg-gated on js-v8/js-boa, so bundled_engines() must be non-empty here"
+    );
+    for &kind in engines {
         let result = create_engine(kind);
         if IMPLEMENTED_ENGINES.contains(&kind) {
             assert!(
@@ -81,21 +104,65 @@ fn js_1_create_engine_contract_for_bundled_engines() {
     }
 }
 
+/// JS-1: 既定 feature 構成（`js-v8`/`js-boa` 両無効）では
+/// `bundled_engines()` が空であること・[`IMPLEMENTED_ENGINES`] も空である
+/// こと・`create_engine` が V8・Boa いずれに対しても具体的に
+/// `NotBundled { bundled: [] }` を返すことを検証する（TASK-28.4・
+/// Issue #150。PR #427 レビュー指摘: 既定構成で唯一実行される契約テストが
+/// 空のループのまま無検証で成功していた問題への対応。coding-rust.md
+/// 「期待値は具体値で書く」に従い `is_err()` ではなく具体的な列挙子・
+/// フィールド値を比較する）。
+#[test]
+#[cfg(not(any(feature = "js-v8", feature = "js-boa")))]
+fn js_1_create_engine_contract_is_empty_by_default() {
+    assert_eq!(
+        bundled_engines(),
+        &[] as &[EngineKind],
+        "default build (js-v8/js-boa both disabled) must bundle no engines"
+    );
+    assert!(
+        IMPLEMENTED_ENGINES.is_empty(),
+        "default build must not claim any engine as implemented while none is bundled"
+    );
+    assert!(
+        matches!(
+            create_engine(EngineKind::V8),
+            Err(CreateEngineError::NotBundled {
+                requested: EngineKind::V8,
+                bundled: []
+            })
+        ),
+        "V8 must be reported as NotBundled with an empty bundled list by default"
+    );
+    assert!(
+        matches!(
+            create_engine(EngineKind::Boa),
+            Err(CreateEngineError::NotBundled {
+                requested: EngineKind::Boa,
+                bundled: []
+            })
+        ),
+        "Boa must be reported as NotBundled with an empty bundled list by default"
+    );
+}
+
 /// `check_*`（実処理）を呼ぶコンフォーマンス検査一式（TASK-28.4）。
 ///
-/// モジュール冒頭のドキュメント参照: [`IMPLEMENTED_ENGINES`] が空の現時点
-/// では、このモジュール内のどの関数にも `#[test]` を付けていない。付ける
-/// と `cargo test` が「検査対象 0 件のまま成功」を報告し続けてしまうため
-/// （PR #427 レビュー指摘）、TASK-29/32 で実装が入り
-/// `IMPLEMENTED_ENGINES` を更新するタイミングまでは、この一式を
-/// テスト実行の対象外に置く（`#[ignore]` ではなくモジュール分離＋
-/// `#[test]` 不在によって対象外にする。理由はモジュールドキュメント参照）。
-// dead_code: TASK-29/32 完了後、IMPLEMENTED_ENGINES 更新と同時に #[test] を
-// 付け直して使う（モジュールドキュメント参照。`reason` 付き allow はナイトリー
-// 限定の lint_reasons feature が必要なため、stable toolchain 前提の本 crate
-// ではコメントで理由を示す）。
-#[allow(dead_code)]
-mod pending_conformance_checks {
+/// `js-v8`/`js-boa` のいずれかが有効な構成でのみコンパイル・実行される
+/// （モジュール冒頭のドキュメント参照）。そのため [`bundled_engines`] が
+/// 常に非空になる構成でのみ 3 関数すべてが `#[test]` として動く。
+/// [`IMPLEMENTED_ENGINES`] が空の現時点では `create_engine` がどの種別にも
+/// `NotYetImplemented` を返すため、`check_*`（実際のスクリプト評価・
+/// 関数注入・DOM バインディング）自体はまだ 1 度も到達しない。ただし
+/// `run_for_each_bundled_engine`（本モジュール内）は必ず呼ばれ、
+/// 「同梱されているのに `NotYetImplemented` を返す」という現行契約を
+/// 明示的に検証し続けるため、`cargo test` の出力が「pass」でも実際には
+/// 何も検証していない、という状態にはならない（PR #427 レビュー指摘への
+/// 対応。TASK-29・V8／TASK-32・boa の完了により対応する種別が
+/// [`IMPLEMENTED_ENGINES`] へ追加された瞬間、既にある `#[test]` がそのまま
+/// `check_*` を呼び出すようになる。付け直し忘れの余地がない）。
+#[cfg(any(feature = "js-v8", feature = "js-boa"))]
+mod conformance_checks {
     use super::IMPLEMENTED_ENGINES;
     use fandhe_browser_js::{
         CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsEngineError, JsValue, NativeFn,
@@ -170,19 +237,22 @@ mod pending_conformance_checks {
     }
 
     /// [`ConformanceRunSummary`] を [`IMPLEMENTED_ENGINES`] から導出した期待値と
-    /// 突き合わせ、かつ「検査対象 0 件のまま成功」を許さない共通ヘルパー
-    /// （3 つの実行系関数から共通利用する。PR #427 レビュー指摘への対応）。
+    /// 突き合わせる共通ヘルパー（3 つの実行系関数から共通利用する）。
     ///
     /// 期待値はビルド構成に応じて動的に決まる: 同梱されている
     /// （[`bundled_engines`] に含まれる）種別のうち、[`IMPLEMENTED_ENGINES`] に
     /// 含まれるものは `checked` としてカウントされ、残りは
     /// `not_yet_implemented` としてカウントされるはずである
     /// （`IMPLEMENTED_ENGINES` を更新するだけで期待値が自動的に追従する。
-    /// TASK-29/32 完了時にこのヘルパー自体は変更不要）。加えて、このモジュール
-    /// が `#[test]` として実行される状態（TASK-29/32 完了後）になった時点で
-    /// `checked == 0` のまま成功することがないよう、`checked > 0` も明示的に
-    /// 要求する（「検査対象が 0 件のときに成功扱いにならない」というレビュー
-    /// 指摘そのものへの対応）。
+    /// TASK-29/32 完了時にこのヘルパー自体は変更不要）。加えて、
+    /// [`IMPLEMENTED_ENGINES`] が非空であるにもかかわらず `checked == 0` の
+    /// まま（＝実装済みのはずの種別に対して `check_*` が一度も呼ばれない）
+    /// 成功することを許さない（「検査対象があるのに無検証で成功しない」の
+    /// 明示的な回帰確認）。`IMPLEMENTED_ENGINES` が空の現時点
+    /// （`checked == 0` が正しい期待値）まで `checked > 0` を要求すると
+    /// 本モジュールが常に失敗してしまうため、その場合はこの追加要求を
+    /// 課さない（モジュール自体は cfg gate により `bundled_engines()` が
+    /// 空にならない構成でのみ実行される。モジュールドキュメント参照）。
     fn assert_conformance_summary_matches_current_contract(summary: &ConformanceRunSummary) {
         let expected_checked = bundled_engines()
             .iter()
@@ -198,12 +268,13 @@ mod pending_conformance_checks {
             "not_yet_implemented must equal the number of bundled engines NOT listed in \
              IMPLEMENTED_ENGINES"
         );
-        assert!(
-            summary.checked > 0,
-            "conformance check_* functions were never invoked (checked == 0); this test must \
-             not be re-enabled with #[test] until at least one engine is implemented \
-             (IMPLEMENTED_ENGINES is non-empty)"
-        );
+        if !IMPLEMENTED_ENGINES.is_empty() {
+            assert!(
+                summary.checked > 0,
+                "IMPLEMENTED_ENGINES is non-empty but no conformance check_* was actually \
+                 invoked (checked == 0); check the create_engine wiring for TASK-29/32"
+            );
+        }
     }
 
     /// `JS-1`「スクリプト評価」のコンフォーマンス検査（エンジン非依存）。
@@ -405,24 +476,29 @@ mod pending_conformance_checks {
     }
 
     /// JS-1: スクリプト評価が、同梱された各エンジンで同じ形状の結果を返すこと
-    /// （TASK-28.4・Issue #150）。TASK-29/32 完了後に `#[test]` を付け直す
+    /// （TASK-28.4・Issue #150）。`js-v8`/`js-boa` のいずれかが有効な構成
+    /// でのみ存在し、[`IMPLEMENTED_ENGINES`] が非空になった時点で
+    /// `check_script_evaluation` を実際に呼び出すようになる
     /// （モジュールドキュメント参照）。
+    #[test]
     fn js_1_conformance_script_evaluation_for_each_bundled_engine() {
         let summary = run_for_each_bundled_engine(check_script_evaluation);
         assert_conformance_summary_matches_current_contract(&summary);
     }
 
     /// JS-1: グローバル関数注入が、同梱された各エンジンで同じ形状で動作すること
-    /// （TASK-28.4・Issue #150）。TASK-29/32 完了後に `#[test]` を付け直す
-    /// （モジュールドキュメント参照）。
+    /// （TASK-28.4・Issue #150）。`js-v8`/`js-boa` のいずれかが有効な構成
+    /// でのみ存在する（モジュールドキュメント参照）。
+    #[test]
     fn js_1_conformance_global_function_injection_for_each_bundled_engine() {
         let summary = run_for_each_bundled_engine(check_global_function_injection);
         assert_conformance_summary_matches_current_contract(&summary);
     }
 
     /// JS-1: DOM 風オブジェクトへのバインディングが、同梱された各エンジンで
-    /// 同じ形状で動作すること（TASK-28.4・Issue #150）。TASK-29/32 完了後に
-    /// `#[test]` を付け直す（モジュールドキュメント参照）。
+    /// 同じ形状で動作すること（TASK-28.4・Issue #150）。`js-v8`/`js-boa` の
+    /// いずれかが有効な構成でのみ存在する（モジュールドキュメント参照）。
+    #[test]
     fn js_1_conformance_dom_like_binding_for_each_bundled_engine() {
         let summary = run_for_each_bundled_engine(check_dom_like_binding);
         assert_conformance_summary_matches_current_contract(&summary);
