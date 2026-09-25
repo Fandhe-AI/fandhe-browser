@@ -18,6 +18,15 @@ members = ["crates/*"]
 [workspace.package]
 # 各 crate 側は `version.workspace = true` 等（`edition`/`license` も同様）で
 # ここから継承する契約とする（TASK-1.2〜1.7 向けの申し送り）。
+#
+# `publish` は Cargo の仕様上、他フィールドと異なり member crate が
+# `publish.workspace = true` を明示しない限り自動継承されない（省略した crate は
+# Cargo の既定値 `publish = true` になり公開可能な状態になってしまう）。
+# `deny.toml` の `allow-wildcard-paths = true` は「workspace 内 crate はすべて
+# `publish = false` の private crate」という前提に立っているため、**新規 crate を
+# 追加する各 TASK（1.2〜1.7 等）は自身の `Cargo.toml` に必ず
+# `publish.workspace = true`（または直接 `publish = false`）を明記する**契約とし、
+# `make check-publish-private`（`make ci` に含む）で全 member crate に対して機械的に検証する。
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"

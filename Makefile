@@ -270,6 +270,35 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため check-render-isolation をスキップ"
 endif
 
+# workspace 内の全 member crate が非公開（`publish = false` 相当）であることを
+# 検証する（Cargo.toml の `[workspace.package]` 契約・deny.toml の
+# `allow-wildcard-paths = true` が前提とする private crate 方針）。
+# `publish` は `version`/`edition`/`license` と異なり、member crate が
+# `publish.workspace = true`（または直接 `publish = false`）を明記しない限り
+# 自動継承されず、省略すると Cargo の既定値 `publish = true`（公開可能）になる
+# ため、コメントでの申し送りだけでなく機械的に検証する。
+# `cargo metadata` の出力では公開可能な crate は `"publish": null`、
+# 非公開（`false` または `[]` 空リスト）指定の crate は `"publish": []` になる
+# （`cargo metadata --format-version 1` の仕様。crates.io 限定公開等の
+# registry 名リスト指定は本 workspace では使わない前提のため対象外）。
+.PHONY: check-publish-private
+check-publish-private: ## workspace 内の全 member crate が publish = false であることを検証する
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	@meta=$$(cargo metadata --no-deps --format-version 1 2>&1) || { \
+		echo "$$meta" >&2; \
+		echo "NG: cargo metadata の実行に失敗しました" >&2; \
+		exit 1; \
+	}; \
+	bad=$$(printf '%s\n' "$$meta" | jq -r '.packages[] | select(.publish != []) | .name'); \
+	if [ -n "$$bad" ]; then \
+		echo "NG: 以下の crate が publish = false（または publish.workspace = true）を設定していません:" >&2; \
+		printf '%s\n' "$$bad" >&2; \
+		exit 1; \
+	fi
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため check-publish-private をスキップ"
+endif
+
 .PHONY: deny
 deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
 ifneq ($(and $(HAS_CARGO),$(HAS_DENY),$(HAS_MEMBERS)),)
@@ -289,7 +318,7 @@ endif
 # workspace 作成前・render crate 追加前の CI を壊さない。docker-ci は make ci を
 # 呼ぶため自動的にこの検証を含む。
 .PHONY: ci
-ci: lint-docs fmt-check lint lint-rendering check-render-isolation test test-rendering deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint lint-rendering check-render-isolation check-publish-private test test-rendering deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
