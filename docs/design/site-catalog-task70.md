@@ -3,7 +3,7 @@
 **判定日**: 2026-09-25  
 **判定者**: プロジェクトオーナー  
 **対象**: TASK-70 / COMPAT-3 / MS-1  
-**元カタログ**: `03-poc/baseline-measurement/README.md`「対象サイト群カタログ（36 サイト、類型別）」（PoC-1）
+**元カタログ**: `docs/spec/03-poc/baseline-measurement/README.md`「対象サイト群カタログ（36 サイト、類型別）」（PoC-1）
 
 ## 概要
 
@@ -15,7 +15,7 @@ curl による UA `fandhe-browser-access-check/0.1 (+https://github.com/Fandhe-A
 
 ## 更新済みカタログ
 
-36 サイト全件を元カタログの類型 (a)〜(e) ごとに掲載する。ID は元カタログの通し番号（例: a8 = (a) の 8 番目）。「確認元」は PoC-9（`03-poc/practical-compat-level/harness/results/access_check.txt`）または TASK-70（本ドキュメント）を示す。
+36 サイト全件を元カタログの類型 (a)〜(e) ごとに掲載する。ID は元カタログの通し番号（例: a8 = (a) の 8 番目）。「確認元」は PoC-9（`docs/spec/03-poc/practical-compat-level/harness/results/access_check.txt`）または TASK-70（本ドキュメント）を示す。
 
 ### (a) 静的中心（ニュース・ドキュメント・ブログ）
 
@@ -74,7 +74,7 @@ curl による UA `fandhe-browser-access-check/0.1 (+https://github.com/Fandhe-A
 | e1 | GitHub の Issue 一覧テーブル | <https://github.com/rust-lang/rust/issues> | PoC-9 | 到達（200） | |
 | e2 | DataTables のデモ | <https://datatables.net/examples/basic_init/zero_configuration.html> | PoC-9 | 到達（200） | |
 | e3 | Google スプレッドシートの公開ビュー | <https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/htmlview> | TASK-70（m11） | 到達（200） | 製品トップ（`docs.google.com/spreadsheets/`）は 1 回目で製品紹介ページへ転送。サンプルは Google Sheets API 公式クイックスタートの「Class Data」 |
-| e4 | Airtable の公開ビュー | <https://airtable.com/appf9QLP4vUH4aK8w/shrpFRNJwchpnDrGb> | TASK-70（m12） | 到達（200、描画未確認） | 製品トップ（`airtable.com`）は 1 回目で到達（200）。サンプルは robots.txt で明示許可された唯一の共有ビュー。出典はコミュニティ投稿のみで、応答 HTML に共有ビュー ID が含まれずログイン関連文字列を含むため公開ビューとして描画されたかは未確認 |
+| e4 | Airtable の公開ビュー | <https://airtable.com>（製品トップ） | TASK-70（m12） | 採用保留（公開テーブルビュー未確保） | 製品トップ（`airtable.com`）は 1 回目で到達（200）。サンプル候補 <https://airtable.com/appf9QLP4vUH4aK8w/shrpFRNJwchpnDrGb>（robots.txt で明示許可された唯一の共有ビュー）はログインなしで表示されたが、内容は Omni で作成した要素の紹介ギャラリー（title "Built with Omni: Showcase"）で、テーブル UI ではないため採用しない。動的テーブルの公開ビューが見つかるまで保留 |
 | e5 | Grafana Play の公開ダッシュボードデモ | <https://play.grafana.org> | PoC-9 | 到達（200） | |
 | e6 | Kaggle のデータセット一覧 | <https://www.kaggle.com/datasets> | TASK-70（m13） | 到達（200） | |
 
@@ -111,7 +111,7 @@ curl による UA `fandhe-browser-access-check/0.1 (+https://github.com/Fandhe-A
 | m9 | <https://docs.google.com/forms/d/e/1FAIpQLSd0iBLPh4suZoGW938EU1WIxzObQv_jXto0nT2U8HH2KsI5dg/viewform> | 200（転送なし、title "Famous Black Women"） | Allow（`Allow: /forms`） | Google Forms API 公式ガイド（<https://developers.google.com/workspace/forms/api/guides>）の JSON 例 `responderUri` に載るフォーム。Google が保守するサンプルとは明示されておらず、消える可能性がある |
 | m10 | <https://form.typeform.com/to/HLjqXS5W> | 200（title "embed-next demo (repo)"） | Allow（`*` グループなし） | Typeform 公式 GitHub の Typeform/embed-demo（demo-html/widget-html/index.html の data-tf-widget） |
 | m11 | <https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/htmlview> | 200（title "Example Spreadsheet"） | Allow（`Allow: /spreadsheet`） | Google Sheets API 公式クイックスタートの「Class Data」（SAMPLE_SPREADSHEET_ID） |
-| m12 | <https://airtable.com/appf9QLP4vUH4aK8w/shrpFRNJwchpnDrGb> | 200 | Allow（robots.txt で明示許可された唯一の共有ビュー。`/shr*`・`/app*/shr*` は Disallow） | 出典はコミュニティ投稿のみ（Omni で作成したインターフェースの例として紹介）。応答 HTML に共有ビュー ID が含まれずログイン関連文字列を含むため、公開ビューとして描画されたかは未確認 |
+| m12 | <https://airtable.com/appf9QLP4vUH4aK8w/shrpFRNJwchpnDrGb> | 200 | Allow（robots.txt で明示許可された唯一の共有ビュー。`/shr*`・`/app*/shr*` は Disallow） | 出典はコミュニティ投稿のみ（Omni で作成したインターフェースの例として紹介）。応答 HTML に共有ビュー ID が含まれずログイン関連文字列を含むため、公開ビューとして描画されたかは未確認。ヘッドレスブラウザ（Playwright の Chromium、既定の UA）で 1 回表示したところ、ログインなしで表示されたが内容は Omni 要素の紹介ギャラリー（title "Built with Omni: Showcase"）でテーブル UI はなく、採用保留とした |
 
 補足: <https://tutorials.typeform.com/to/nzthWI>（ヘルプセンター記載）は "This typeform has moved" で不採用。
 
@@ -119,16 +119,16 @@ curl による UA `fandhe-browser-access-check/0.1 (+https://github.com/Fandhe-A
 
 1. 403 の m1 Medium・m2 Figma は SEC-1 に従い MVP 対象から除外する
 2. robots.txt で対象パスが Disallow のサイトは除外する: m3 Airbnb の検索結果・m4 Twitter・m5 Pinterest・m7 Instagram
-3. m9〜m12 は上記の公開サンプル URL を採用する（m9 は消失リスク、m12 は描画未確認を注記）
+3. m9〜m11 は上記の公開サンプル URL を採用する（m9 は消失リスクを注記）。m12 はサンプル候補がテーブル UI ではなかったため採用保留とする
 4. robots.txt を理由とする除外基準は SEC-1 にないため、spec 側（SEC 系）への追記が必要な課題として報告する（本リポでは spec を変更しない）
-5. 本カタログは `docs/design/` に置く（`03-poc` は実施記録のため編集しない）
+5. 本カタログは `docs/design/` に置く（`docs/spec/03-poc` は実施記録のため編集しない）
 
 ## 残課題
 
 1. spec 側の課題として、SEC 系（SEC-1）に robots.txt 準拠を除外基準として追記する必要がある。本リポでは spec を変更しないため、spec リポ側へ報告する
 2. robots.txt 基準を PoC-9 の 23 サイトへ遡及適用するかは未判断である
 3. 各サイトでの代表タスク実行（COMPAT-3 の「タスク実行」部分）は未実施で、TASK-30 以降の実装を待つ
-4. m9（Google Forms 公開サンプル）は Google が保守するサンプルとは明示されておらず消える可能性があり、m12（Airtable 公開ビュー）は公開ビューとして描画されたか未確認である
+4. m9（Google Forms 公開サンプル）は Google が保守するサンプルとは明示されておらず消える可能性があり。m12（Airtable 公開ビュー）は動的テーブルの公開ビューを別途探す必要がある（見つかるまで製品トップのまま採用保留）
 
 ## 関連ビヘイビア・タスク
 
@@ -136,4 +136,4 @@ curl による UA `fandhe-browser-access-check/0.1 (+https://github.com/Fandhe-A
 - **参考ビヘイビア**: MEAS-2
 - **対応タスク**: TASK-70（本カタログの作成）
 - **マイルストーン**: MS-1
-- **参照**: `03-poc/baseline-measurement/README.md`「対象サイト群カタログ（36 サイト、類型別）」（PoC-1）、`03-poc/practical-compat-level/harness/results/access_check.txt`（PoC-9）
+- **参照**: `docs/spec/03-poc/baseline-measurement/README.md`「対象サイト群カタログ（36 サイト、類型別）」（PoC-1）、`docs/spec/03-poc/practical-compat-level/harness/results/access_check.txt`（PoC-9）
