@@ -1,0 +1,19 @@
+# fandhe-browser-ai の crate manifest。
+#
+# REPAIR-1（TASK-1・MS-1）が定める 8 crate 構成のうち、AI 最適化 API・
+# プラグイン API を担う crate。本 manifest は TASK-1（旧 TASK-1.5・Issue #26）が
+# 追加するビルド可能な最小骨格であり、公開 API の実装は含まない
+# （詳細は src/lib.rs のドキュメンテーションコメントを参照）。
+
+[package]
+name = "fandhe-browser-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# 依存は追加しない（dependency-policy.md の依存最小方針・ユーザー承認制）。
+# self-repair-design.md の依存方向により本 crate は core・profile への依存が
+# 許可されるが、両 crate とも本 Issue 時点で workspace に未追加のため、
+# 依存追加は将来のタスクでユーザー承認を経て行う。
+[dependencies]
