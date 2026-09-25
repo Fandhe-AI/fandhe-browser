@@ -21,3 +21,7 @@ version = "0.1.0"
 [[package]]
 name = "fandhe-browser-profile"
 version = "0.1.0"
+
+[[package]]
+name = "fandhe-browser-render"
+version = "0.1.0"
