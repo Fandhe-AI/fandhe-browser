@@ -15,15 +15,16 @@ SHELL := /bin/bash
 # Cargo.toml の有無（無ければ cargo 系をスキップ。workspace 作成後に有効化）
 HAS_CARGO := $(wildcard Cargo.toml)
 HAS_DENY := $(wildcard deny.toml)
-# workspace のメンバー crate（`crates/*/Cargo.toml`）の有無。root の
-# `[workspace] members = ["crates/*"]` はグロブ解決先が 1 つも無いと
-# `cargo metadata`（`--no-deps` 有無を問わず）・`cargo fmt --all --check`・
-# `cargo clippy --workspace`・`cargo test --workspace`・`cargo deny check ...` の
-# いずれもエラーで落ちる（cargo の仕様。実機検証済み）。root Cargo.toml だけが
-# 存在しメンバー crate が無い中間状態（TASK-1.1 完了直後〜TASK-1.2 以降で
-# 最初の crate が追加されるまでの間）でも pre-commit/pre-push を通すため、
-# HAS_CARGO 単独ではなく HAS_MEMBERS も満たすことを cargo 系ターゲットの
-# 有効化条件に加える。
+# workspace のメンバー crate（`crates/*/Cargo.toml`）の有無。member crate が
+# 1 つも無い仮想 workspace（`members = []`）に対しては `cargo fmt --all --check`・
+# `cargo clippy --workspace`・`cargo test --workspace`・`cargo tree --workspace`・
+# `cargo deny check ...` のいずれも「対象パッケージが無い」エラーで落ちる
+# （cargo の仕様。実機検証済み。フォーマット・lint・テストの対象コードが
+# 実在しないため妥当な失敗であり、これらのターゲットは HAS_MEMBERS でスキップする）。
+# 一方 Cargo.toml 自体の構文・workspace 定義としての妥当性は member の有無に
+# 依存せず常に検証可能なため、`check-workspace-manifest`（下記）は HAS_CARGO のみで
+# 判定し、TASK-1.1 完了直後〜TASK-1.2 以降で最初の crate が追加されるまでの
+# 中間状態でも Cargo.toml の妥当性検証をスキップしない。
 HAS_MEMBERS := $(wildcard crates/*/Cargo.toml)
 
 # lint ツールの固定バージョン。CI（Fandhe-AI/actions の lint-docs reusable workflow）の
@@ -158,6 +159,29 @@ lint-docs: lint-md lint-yaml lint-editorconfig lint-commits ## ドキュメン�
 # --------------------------------------------------
 # 品質チェック（Rust。Cargo.toml 追加後に有効化）
 # --------------------------------------------------
+
+# workspace 仮想 manifest（Cargo.toml）自体の構文・定義としての妥当性を検証する。
+# `cargo verify-project` は member crate が 0 件の仮想 workspace でも成功する
+# （fmt/clippy/test 等の「対象パッケージが無い」失敗とは異なる。実機検証済み）ため、
+# HAS_MEMBERS を条件にせず HAS_CARGO のみで常時実行する。TASK-1.1（root Cargo.toml
+# 追加）のように member crate がまだ 1 つも無い段階でも、追加した Cargo.toml が
+# cargo にとって解釈可能な manifest であることをこのターゲットが保証する。
+.PHONY: check-workspace-manifest
+check-workspace-manifest: ## cargo verify-project で workspace manifest の妥当性を検証する
+ifneq ($(HAS_CARGO),)
+	@out=$$(cargo verify-project 2>&1) || { \
+		echo "$$out" >&2; \
+		echo "NG: Cargo.toml が cargo にとって不正な manifest です" >&2; \
+		exit 1; \
+	}; \
+	if ! printf '%s\n' "$$out" | grep -q '"success"'; then \
+		echo "$$out" >&2; \
+		echo "NG: cargo verify-project が success を返しませんでした" >&2; \
+		exit 1; \
+	fi
+else
+	@echo "skip: Cargo.toml 未追加のため check-workspace-manifest をスキップ"
+endif
 
 .PHONY: fmt
 fmt: ## cargo fmt --all で整形する
@@ -325,7 +349,7 @@ endif
 # workspace 作成前・render crate 追加前の CI を壊さない。docker-ci は make ci を
 # 呼ぶため自動的にこの検証を含む。
 .PHONY: ci
-ci: lint-docs fmt-check lint lint-rendering check-render-isolation check-publish-private test test-rendering deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-publish-private test test-rendering deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
