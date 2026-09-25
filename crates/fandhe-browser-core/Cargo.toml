@@ -1,0 +1,21 @@
+# fandhe-browser-core の crate manifest。
+#
+# REPAIR-1（TASK-1（旧サブ番号 1.2）・MS-1）: workspace 分割の一環として
+# `fandhe-browser-core` の空 skeleton を追加する。本 crate は fetch・HTML パース・
+# DOM・query・CSSOM・config・可観測性を担う（CLAUDE.md のリポジトリ構成参照）。
+# 本 PR の受け入れ条件は `cargo build -p fandhe-browser-core` が成功することのみで、
+# 機能実装は含まない。fetch/parse/dom/query の本実装は TASK-24（ビヘイビア `CORE-1`）
+# で行う。
+
+[package]
+name = "fandhe-browser-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# root Cargo.toml の [workspace.package] コメントに明記された契約: `publish` は
+# 他フィールドと異なり自動継承されないため、各 crate が明示する
+# （`make check-publish-private` が機械的に検証する）。
+publish.workspace = true
+
+# 依存最小方針（dependency-policy.md）に従い、雛形段階では新規依存を追加しない。
+[dependencies]
