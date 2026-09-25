@@ -102,12 +102,15 @@ commit-msg:
 
 pre-push:
   jobs:
-    # clippy・test は Makefile の lint / test ターゲットへ委譲し、CI（make ci）と
-    # コマンドを完全一致させてズレを防ぐ。既定 feature のみで実行し `--all-features`
-    # は付けない（RENDER-1・licensing.md。Servo（`rendering` feature）を既定ビルドの
-    # 依存グラフへ混入させない方針のため）。`rendering` 込みの検証は make
-    # lint-rendering / test-rendering が別途担う（ci.md）。Cargo.toml 未追加なら
-    # make 側の HAS_CARGO 判定で skip する
+    # clippy・test は Makefile の lint / test ターゲットへ委譲し、既定 feature のみで
+    # 実行する（`--all-features` は付けない。RENDER-1・licensing.md。Servo（`rendering`
+    # feature）を既定ビルドの依存グラフへ混入させない方針のため）。
+    # pre-push は Servo 込み（--features rendering）のビルド・テストまでは行わない:
+    # git push のたびに Servo の初回ビルド・テストが走ると重く、日常の pre-push を
+    # 阻害するため。`rendering` 込みの検証（make lint-rendering / test-rendering）は
+    # make ci が引き受ける（ci.md「既定ビルドと --features rendering の両方で検証」。
+    # PR 前・CI で必ず実行される）。Cargo.toml 未追加なら make 側の HAS_CARGO 判定で
+    # skip する
     - name: clippy
       run: |
         if [ -f Cargo.toml ]; then

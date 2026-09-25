@@ -110,14 +110,33 @@ lint-editorconfig: ## editorconfig-checker（.editorconfig + .editorconfig-check
 
 # main からの分岐点以降のコミットを CI（lint-docs の commitlint ジョブ）と同じ
 # extends 構成で検証する。origin/main が未取得の環境では範囲を決められないためスキップする。
+# `git rev-parse --verify --quiet refs/remotes/origin/main` は「参照が存在しない」場合に
+# 終了コード 1 を返す（`--quiet` は該当時の "not a valid ref" 系メッセージを抑制する）。
+# これだけを skip 条件にし、終了コードが 1 以外の失敗（`fatal: detected dubious
+# ownership` 等。git がリポジトリを開く時点で発生し、`--quiet` の有無や対象 ref の
+# 存在有無に関係なく典型的には終了コード 128 になる）は「参照が存在しない」とは別扱いにし、
+# エラーメッセージを表示して非 0 終了する（fail-closed。Bugbot 指摘の是正: 以前は
+# `git rev-parse --verify origin/main` の失敗全般（終了コードを問わない）を
+# 「origin/main 未取得」とみなして stderr を捨てていたため、dubious ownership 等の
+# 実エラーも無音 skip になっていた。単に非 0 かどうかだけで判定すると dubious
+# ownership も終了コード 1 以外の非 0 になるだけで区別できないため、終了コードの値まで見る）。
 .PHONY: lint-commits
 lint-commits: ## commitlint（origin/main からの分岐点以降のコミットを検証）
-	@if git rev-parse --verify origin/main >/dev/null 2>&1; then \
-		npx --yes -p @commitlint/cli@$(COMMITLINT_VERSION) -p @commitlint/config-conventional@$(COMMITLINT_CONFIG_VERSION) \
-			commitlint --extends @commitlint/config-conventional --from "$$(git merge-base origin/main HEAD)" --to HEAD; \
-	else \
+	@out=$$(git rev-parse --verify --quiet refs/remotes/origin/main 2>&1 >/dev/null); st=$$?; \
+	if [ "$$st" -eq 1 ]; then \
 		echo "skip: origin/main が未取得のため commitlint をスキップ"; \
-	fi
+		exit 0; \
+	elif [ "$$st" -ne 0 ]; then \
+		printf '%s\n' "$$out" >&2; \
+		echo "NG: origin/main の参照確認に失敗しました（git rev-parse exit=$$st ）" >&2; \
+		exit 1; \
+	fi; \
+	base=$$(git merge-base origin/main HEAD) || { \
+		echo "NG: git merge-base の実行に失敗しました" >&2; \
+		exit 1; \
+	}; \
+	npx --yes -p @commitlint/cli@$(COMMITLINT_VERSION) -p @commitlint/config-conventional@$(COMMITLINT_CONFIG_VERSION) \
+		commitlint --extends @commitlint/config-conventional --from "$$base" --to HEAD
 
 .PHONY: lint-docs
 lint-docs: lint-md lint-yaml lint-editorconfig lint-commits ## ドキュメント／設定ファイル系 lint を一括実行する
@@ -165,11 +184,19 @@ endif
 # `rendering` feature（Servo。RENDER-1）は fandhe-browser-render crate 追加まで
 # workspace に存在しない。`cargo metadata` の feature 一覧に無い間は誤ってビルド
 # エラーとして落とさず skip する（cargo 未導入 / Cargo.toml 未追加の HAS_CARGO 判定と
-# 同じ「未整備段階は skip」方針）。
+# 同じ「未整備段階は skip」方針）。ただし `cargo metadata` 自体の失敗（Cargo.toml の
+# 構文エラー・ロックファイル不整合等）は「feature 未定義」と区別し、標準エラーを
+# 表示して fail-closed にする（以前は 2>/dev/null で標準エラーを常に捨てていたため、
+# cargo metadata 自体の失敗も「feature 未定義」扱いで無音 skip になっていた）。
 .PHONY: lint-rendering
 lint-rendering: ## cargo clippy -D warnings（--features rendering。Servo 込みの検証）
 ifdef HAS_CARGO
-	@if cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q '"rendering":'; then \
+	@meta=$$(cargo metadata --no-deps --format-version 1 2>&1) || { \
+		echo "$$meta" >&2; \
+		echo "NG: cargo metadata の実行に失敗しました" >&2; \
+		exit 1; \
+	}; \
+	if printf '%s\n' "$$meta" | grep -q '"rendering":'; then \
 		cargo clippy --workspace --all-targets --features rendering -- -D warnings; \
 	else \
 		echo "skip: rendering feature が未定義のため lint-rendering をスキップ"; \
@@ -181,7 +208,12 @@ endif
 .PHONY: test-rendering
 test-rendering: ## cargo test（--features rendering。Servo 込みの検証）
 ifdef HAS_CARGO
-	@if cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q '"rendering":'; then \
+	@meta=$$(cargo metadata --no-deps --format-version 1 2>&1) || { \
+		echo "$$meta" >&2; \
+		echo "NG: cargo metadata の実行に失敗しました" >&2; \
+		exit 1; \
+	}; \
+	if printf '%s\n' "$$meta" | grep -q '"rendering":'; then \
 		cargo test --workspace --features rendering; \
 	else \
 		echo "skip: rendering feature が未定義のため test-rendering をスキップ"; \
@@ -237,8 +269,13 @@ else
 	@echo "skip: Cargo.toml または deny.toml 未追加のため deny をスキップ"
 endif
 
+# `rendering` feature（Servo）を含めた検証（ci.md「既定ビルドと --features rendering
+# の両方で検証」）も make ci に含める。lint-rendering / test-rendering は
+# `rendering` feature 未定義の段階では skip メッセージを出して 0 終了するため、
+# workspace 作成前・render crate 追加前の CI を壊さない。docker-ci は make ci を
+# 呼ぶため自動的にこの検証を含む。
 .PHONY: ci
-ci: lint-docs fmt-check lint check-render-isolation test deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint lint-rendering check-render-isolation test test-rendering deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）

@@ -76,6 +76,15 @@ RUN useradd -m -u "${UID}" dev
 RUN mkdir -p /usr/local/cargo/registry /work/target \
     && chown -R dev:dev /usr/local/cargo /work
 
+# compose.yaml の bind mount（`.:/work`）はホスト側のファイル所有者のまま
+# コンテナへ持ち込まれるため、dev ユーザーの UID/GID と一致しないことがあり、
+# git が dubious ownership として `/work` 配下の git 操作（rev-parse・
+# merge-base 等。make lint-commits 等が使う）を拒否する。対象パスを明示して
+# `--system`（/etc/gitconfig。dev ユーザーからも参照される）で許可登録する
+# （`*` によるワイルドカード全許可は、コンテナ内の他パスまで無条件に信頼して
+# しまうため avoid する。Bugbot 指摘の是正）。
+RUN git config --system --add safe.directory /work
+
 USER dev
 WORKDIR /work
 
