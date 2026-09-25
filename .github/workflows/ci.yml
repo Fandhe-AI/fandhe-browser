@@ -40,7 +40,8 @@ jobs:
   # （TASK-55.1・#58）により OS ごとに別名のチェックが生成されるため、
   # branch protection の必須チェックへは、その集約ジョブを OS 数分
   # （`rust-ci (ubuntu-latest|macos-latest|windows-latest) /
-  # rust-base-ci-complete` の 3 件）追加する必要がある（TASK-55.2・#59 時点で
+  # rust-base-ci-complete` の 3 件）に加え、既定 feature 検証ジョブ
+  # `rust-ci-default-features`（下記）も追加する必要がある（TASK-55.2・#59 時点で
   # push/pull_request トリガーが有効化されたため、この登録作業はユーザー作業と
   # して実施可能になった。登録自体は本変更の対象外）。
   lint-docs:
@@ -101,3 +102,34 @@ jobs:
       # 同じ既定値 `rust-base-ci` との衝突回避のため本リポ名にする
       cache: true
       cache-key-prefix: fandhe-browser
+
+  # --------------------------------------------------
+  # rust-ci-default-features（既定 feature でのローカルゲート再現）
+  # --------------------------------------------------
+  # 上記 rust-ci（reusable workflow）は `cargo clippy/test --all-features` で
+  # 検証するため、既定 feature（`--all-features` なし）の構成は別途検証されない。
+  # AGENTS.md「ローカルゲート」・.claude/rules/ci.md が要求する
+  #   cargo clippy --workspace --all-targets -- -D warnings
+  #   cargo test --workspace
+  # （いずれも既定 feature）を、pull_request/push で自動起動する本 workflow 内で
+  # 直接実行し、既定 feature 側の回帰も CI で検出できるようにする
+  # （TASK-55.2・Issue #59 レビュー指摘。REPAIR-5・REPAIR-6）。
+  # Makefile の `lint`/`test` ターゲット（既定 feature 用）と同一コマンドを実行する。
+  # 3 OS matrix は rust-ci（--all-features 側）で担保済みのため、本ジョブは
+  # コスト抑制のため ubuntu-latest 単独実行とする（既定 feature は OS 依存差分が
+  # 小さいクレート構成である現時点の判断。OS 依存差分が生じた場合は 3 OS へ拡張する）。
+  rust-ci-default-features:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      # stable（rust-toolchain.toml の channel = "stable" を単一真実源として追従）
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: clippy
+      - name: cargo clippy（既定 feature）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test（既定 feature）
+        run: cargo test --workspace
