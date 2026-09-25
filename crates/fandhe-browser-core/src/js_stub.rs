@@ -68,7 +68,7 @@ mod tests {
     }
 
     /// CORE-1（TASK-24（24.9）・#43）: 空文字列でも常にエラーになることを
-    /// 確認する（`_script` の内容に依存しない設計であることの裏付け）。
+    /// 確認する（`script` の内容に依存しない設計であることの裏付け）。
     #[test]
     fn core_1_execute_js_stub_returns_error_for_empty_script() {
         let err = execute_js_stub("").expect_err("js_stub は常に失敗する");
