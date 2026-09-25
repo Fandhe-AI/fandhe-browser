@@ -6,11 +6,16 @@
 //! 具象型を漏らさない契約とする（coding-rust.md「JS エンジンはトレイト
 //! 抽象越しに使い、V8 / boa の具象型を上位 crate へ漏らさない」）。
 //!
-//! 現時点は workspace 分割（TASK-1）の雛形のみであり、公開 API・
-//! エンジン抽象トレイト・V8 / boa の実装はまだ存在しない
-//! （実装済みを装わない。REPAIR-3）。将来的には次を提供する想定:
+//! [`engine_trait`] は TASK-28（28.2・Issue #148）でエンジン種別の列挙型
+//! （[`EngineKind`]）と同梱一覧関数（[`bundled_engines`]）を追加した。
+//! 同モジュールにはこの後さらに、エンジン抽象トレイト本体・種別からトレイト
+//! オブジェクトを生成する関数（TASK-28.3・Issue #149）と、両エンジン共通の
+//! コンフォーマンステスト（TASK-28.4・Issue #150）が追加される予定である
+//! （実装済みを装わない。REPAIR-3）。
 //!
-//! - JS 実行エンジンを表すトレイト抽象（`JsEngine` 等。JS-1）
-//! - V8（`rusty_v8`）・boa（`boa_engine`）それぞれの実装切替（JS-3）
-//!
-//! これらは TASK-28 以降で追加する。
+//! V8（`rusty_v8`）・boa（`boa_engine`）それぞれの実装切替（JS-3）は、
+//! 対応する依存追加（TASK-29・TASK-32）を経て別途行う。
+
+pub mod engine_trait;
+
+pub use engine_trait::{EngineKind, bundled_engines};
