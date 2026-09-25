@@ -277,10 +277,20 @@ endif
 # 混入までは捕捉できない。最終的な防御線は deny.toml（[graph].all-features = true
 # により Servo（MPL-2.0）が [licenses] の allow に無いことを検出して fail-closed
 # する）である。
+#
+# `--exclude fandhe-browser-render` は workspace member から render crate を
+# 除いた「残り」を走査する。fandhe-browser-render 以外に member crate が 1 つも
+# 無い状態（TASK-1.4 単独 merge 直後等）でこれを実行すると、cargo は
+# 「virtual manifest で member が 0 件」を manifest エラーとして扱い
+# 非 0 終了する（実機検証済み）。これは「Servo が混入していない」を意味する
+# 正常系ではなく cargo 自体の実行失敗のため、render 以外の member が無い間は
+# 判定不能として skip する（render 以外の member が存在しない時点では既定ビルドに
+# 混入しうる依存グラフ自体が存在しないため、fail-closed の弱体化にはあたらない）。
 RENDER_ISOLATION_PATTERN := servo|fandhe-browser-render
+RENDER_ISOLATION_MEMBERS := $(filter-out crates/fandhe-browser-render/Cargo.toml,$(HAS_MEMBERS))
 .PHONY: check-render-isolation
 check-render-isolation: ## 既定ビルドの依存グラフに Servo 系クレートが含まれないことを検証する
-ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+ifneq ($(and $(HAS_CARGO),$(RENDER_ISOLATION_MEMBERS)),)
 	@out=$$(cargo tree --workspace -e normal,build,dev --exclude fandhe-browser-render) || { \
 		echo "NG: cargo tree の実行に失敗しました" >&2; \
 		exit 1; \
@@ -291,7 +301,7 @@ ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 		exit 1; \
 	fi
 else
-	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため check-render-isolation をスキップ"
+	@echo "skip: Cargo.toml 未追加、または fandhe-browser-render 以外の member crate が無いため check-render-isolation をスキップ"
 endif
 
 # workspace 内の全 member crate が非公開（`publish = false` 相当）であることを
