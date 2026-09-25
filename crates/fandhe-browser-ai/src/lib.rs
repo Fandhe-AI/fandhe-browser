@@ -2,16 +2,25 @@
 //!
 //! `crates/fandhe-browser-core` が保持する DOM を、AI エージェントが
 //! 効率よく読める形（アクセシビリティツリー・役割ベースの簡約表現）へ
-//! 変換して提供する層であり、`crates/fandhe-browser-cdp` の
-//! `/ai/*` 系ルータや、外部プラグイン（`crates/fandhe-browser-mcp` 等）から
-//! 呼び出される想定の crate である。
+//! 変換して提供する層である。
 //!
 //! 依存方向（`docs/spec` submodule `04-behavior/self-repair-design.md`
-//! 「crate 間の依存方向と `AppState` の配置」）により、本 crate は
-//! `fandhe-browser-core`・`fandhe-browser-profile` にのみ依存してよく、
-//! `fandhe-browser-cdp`・`fandhe-browser-render`・`fandhe-browser-cli`・
-//! `fandhe-browser-mcp`・`fandhe-browser-js` には依存しない
-//! （上位 crate から下位 crate への一方向依存を保つため。coding-rust.md）。
+//! 「crate 間の依存方向と `AppState` の配置」・`AGENTS.md`「crate 間の許可依存」）
+//! により、本 crate は `fandhe-browser-core`・`fandhe-browser-profile` にのみ
+//! 依存してよく、`fandhe-browser-cdp`・`fandhe-browser-render`・
+//! `fandhe-browser-cli`・`fandhe-browser-mcp`・`fandhe-browser-js` には
+//! 依存しない（上位 crate から下位 crate への一方向依存を保つため。
+//! coding-rust.md）。同じ層である `fandhe-browser-cdp` との相互依存も禁止される。
+//!
+//! `fandhe-browser-cdp` の `/ai/*` 系ルータは本 crate を直接呼び出さない。
+//! 両 crate はいずれも `fandhe-browser-core` にのみ依存する同じ層に位置し、
+//! 結合は `fandhe-browser-render` と同様に `core` が定義する抽象（トレイト）
+//! 経由で行い、具体的な結線（本 crate の実装を `core` のトレイトへ適合させ、
+//! cdp のルータへ渡す配線）は両者に依存できる `fandhe-browser-cli` が担う
+//! 想定である（TASK-19・AISNAP-6・AISNAP-7 で具体化）。
+//! 外部プラグイン（`crates/fandhe-browser-mcp` 等）からの利用も、mcp crate は
+//! いずれの workspace crate にも依存しない契約のみの層であるため、同様に
+//! `cli` 層での配線を経由する。
 //!
 //! # 現状（スタブ）
 //!
