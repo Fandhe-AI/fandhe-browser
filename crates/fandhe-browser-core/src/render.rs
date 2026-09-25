@@ -5,10 +5,11 @@
 //! 取得・要素可視性判定・境界ボックス取得へアクセスする
 //! （`self-repair-design.md`「crate 間の依存方向と `AppState` の配置」決定 4）。
 //!
-//! 本モジュールはトレイトと入出力型・エラー型の定義のみを提供する。以下は別 issue の担当であり、
-//! 本モジュールには含まれない。
+//! 本モジュールはトレイトと入出力型・エラー型の定義に加え、feature `rendering` 無効時
+//! （または `fandhe-browser-cli` 側で具象実装がまだ結線されていない時）に用いる既定実装
+//! [`DisabledRenderer`] を提供する（TASK-33（サブタスク 33.3）・issue #47）。以下は別 issue の
+//! 担当であり、本モジュールには含まれない。
 //! - feature `rendering` の Cargo 定義（TASK-33.1）
-//! - feature `rendering` 無効時に用いる既定実装（`RenderError::RenderingDisabled` を返す実装。TASK-33.3）
 //! - `AppState` へのレンダリングハンドル格納（TASK-41 系）
 //! - `fandhe-browser-render`（Servo）側の本実装（TASK-33 本体・TASK-38 系）
 
@@ -30,6 +31,43 @@ pub trait Renderer: Send + Sync {
 
     /// 指定した要素の境界ボックスを取得する（RENDER-1）。
     fn bounding_box(&self, element: &ElementRef) -> Result<BoundingBox, RenderError>;
+}
+
+/// レンダリング層が無効（feature `rendering` 無効時、または `fandhe-browser-render`
+/// 側の実装がまだ結線されていない状態）であることを表す既定の [`Renderer`] 実装
+/// （RENDER-1・TASK-33（33.3）・MS-1）。
+///
+/// `cdp`・`ai` は、`rendering` feature を有効化した `fandhe-browser-cli` が
+/// 具象実装（`fandhe-browser-render` 側。TASK-33 本体・別 issue）を注入しない限り、
+/// この既定実装を介してのみ描画機能へアクセスする（`AppState` への配線は
+/// TASK-41 系・別 issue）。すべてのメソッドは入力によらず常に
+/// [`RenderError::RenderingDisabled`] を返し、`Ok` を返すことは決してない。
+/// 未実装の機能で「成功を一律に返す」フォールバックは検出回避として作用しうるため
+/// 明示的にエラーを返す（security.md「偽装・回避機能の禁止」・REPAIR-3）。
+/// cdp/ai はこのエラーを呼び出し元（CDP クライアント等）へそのまま伝播させる想定とする。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DisabledRenderer;
+
+impl DisabledRenderer {
+    /// [`DisabledRenderer`] を構築する（RENDER-1）。本モジュールの他の型と
+    /// 構築経路を揃えるためのコンストラクタ（`Default::default()` と同値）。
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Renderer for DisabledRenderer {
+    fn capture_screenshot(&self, _options: &ScreenshotOptions) -> Result<Screenshot, RenderError> {
+        Err(RenderError::RenderingDisabled)
+    }
+
+    fn element_visibility(&self, _element: &ElementRef) -> Result<ElementVisibility, RenderError> {
+        Err(RenderError::RenderingDisabled)
+    }
+
+    fn bounding_box(&self, _element: &ElementRef) -> Result<BoundingBox, RenderError> {
+        Err(RenderError::RenderingDisabled)
+    }
 }
 
 /// スクリーンショット取得時のオプション（RENDER-1）。
@@ -185,9 +223,10 @@ impl BoundingBox {
 pub enum RenderError {
     /// feature `rendering` が無効、または描画実装が未接続の状態を表す。
     ///
-    /// この variant を返す既定実装は TASK-33.3（issue #47）で追加する。呼び出し失敗時に
-    /// 「成功を一律に返す」フォールバックにしないための土台であり、偽装的な検出回避に
-    /// ならないよう常に `Err` を返せる設計とする（security.md「偽装・回避機能の禁止」）。
+    /// この variant は既定実装 [`DisabledRenderer`]（TASK-33.3・issue #47）が常に返す。
+    /// 呼び出し失敗時に「成功を一律に返す」フォールバックにしないための土台であり、
+    /// 偽装的な検出回避にならないよう常に `Err` を返せる設計とする
+    /// （security.md「偽装・回避機能の禁止」）。
     RenderingDisabled,
     /// 指定した要素が見つからない場合。
     ElementNotFound,
@@ -255,7 +294,9 @@ mod tests {
     }
 
     /// テスト専用のモック実装。本番の既定実装（`RenderingDisabled` を返す実装）は
-    /// TASK-33.3（issue #47）の担当であり、本モジュールには含めない。
+    /// [`DisabledRenderer`]（TASK-33.3・issue #47）として本モジュール上部に実装済み。
+    /// `MockRenderer` は成功パス・`ElementNotFound` 等の可変な戻り値を検証するための
+    /// テスト専用の別実装として残す。
     struct MockRenderer {
         screenshot_ok: bool,
         visible: bool,
@@ -460,5 +501,61 @@ mod tests {
         assert_eq!(debug_output, "Internal(..)");
         assert!(!debug_output.contains("/etc/secret/path.txt"));
         assert_eq!(err.internal_detail(), Some("/etc/secret/path.txt"));
+    }
+
+    /// RENDER-1: `DisabledRenderer::capture_screenshot` が入力によらず常に
+    /// `RenderError::RenderingDisabled` を返すことを確認する（成功を装わないことの固定）。
+    #[test]
+    fn disabled_renderer_capture_screenshot_always_returns_rendering_disabled() {
+        let renderer = DisabledRenderer::new();
+        let err = renderer
+            .capture_screenshot(&ScreenshotOptions::default())
+            .expect_err("rendering is disabled, so this must fail");
+        assert!(matches!(err, RenderError::RenderingDisabled));
+    }
+
+    /// RENDER-1: `DisabledRenderer::element_visibility` が入力によらず常に
+    /// `RenderError::RenderingDisabled` を返すことを確認する（成功を装わないことの固定）。
+    #[test]
+    fn disabled_renderer_element_visibility_always_returns_rendering_disabled() {
+        let renderer = DisabledRenderer::new();
+        let err = renderer
+            .element_visibility(&ElementRef::Selector("#app".to_string()))
+            .expect_err("rendering is disabled, so this must fail");
+        assert!(matches!(err, RenderError::RenderingDisabled));
+    }
+
+    /// RENDER-1: `DisabledRenderer::bounding_box` が入力によらず常に
+    /// `RenderError::RenderingDisabled` を返すことを確認する（成功を装わないことの固定）。
+    #[test]
+    fn disabled_renderer_bounding_box_always_returns_rendering_disabled() {
+        let renderer = DisabledRenderer::new();
+        let err = renderer
+            .bounding_box(&ElementRef::Selector("#app".to_string()))
+            .expect_err("rendering is disabled, so this must fail");
+        assert!(matches!(err, RenderError::RenderingDisabled));
+    }
+
+    /// RENDER-1: `DisabledRenderer` が返す `RenderError::RenderingDisabled` の `Display`
+    /// が固定の英語文言 "rendering layer is disabled" であることを確認する
+    /// （japanese-style.md: プログラム出力文字列は英語、の回帰防止）。
+    #[test]
+    fn disabled_renderer_error_display_is_english() {
+        let renderer = DisabledRenderer::new();
+        let err = renderer
+            .capture_screenshot(&ScreenshotOptions::default())
+            .expect_err("rendering is disabled, so this must fail");
+        assert_eq!(err.to_string(), "rendering layer is disabled");
+    }
+
+    /// RENDER-1: `DisabledRenderer` が `Box<dyn Renderer>` として保持できる
+    /// （object-safe な `Renderer` に既定実装がそのまま当てはまる）ことを確認する。
+    #[test]
+    fn disabled_renderer_can_be_boxed_as_dyn_renderer() {
+        let renderer: Box<dyn Renderer> = Box::new(DisabledRenderer::new());
+        let err = renderer
+            .capture_screenshot(&ScreenshotOptions::default())
+            .expect_err("rendering is disabled, so this must fail");
+        assert!(matches!(err, RenderError::RenderingDisabled));
     }
 }

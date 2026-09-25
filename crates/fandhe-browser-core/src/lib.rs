@@ -18,8 +18,9 @@
 //! 本実装は以降の後続 Issue で行う: `fetch` は TASK-24.2（#36）、`parse` は
 //! TASK-24.4（#38）、`dom` は TASK-24.5（#39）、`query` は TASK-24.7（#41）。
 //! JS 実行スタブとの境界は TASK-24.9（#43）で追加する。[`render`] モジュールは
-//! TASK-33（サブタスク 33.2・ビヘイビア `RENDER-1`）で追加した描画トレイトの
-//! 定義のみを含み、既定実装や `fandhe-browser-render`（Servo）側の本実装は
+//! TASK-33（サブタスク 33.2・ビヘイビア `RENDER-1`）で追加した描画トレイトの定義に加え、
+//! feature `rendering` 無効時に用いる既定実装 `DisabledRenderer`（TASK-33（33.3）・issue #47）
+//! を含む。`fandhe-browser-render`（Servo）側の本実装・`AppState` への配線は
 //! 含まない（別 issue の担当。render モジュールの doc コメントを参照）。
 
 pub mod dom;
