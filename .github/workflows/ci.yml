@@ -137,11 +137,15 @@ jobs:
   # 直接実行し、既定 feature 側の回帰も CI で検出できるようにする
   # （TASK-55.2・Issue #59 レビュー指摘。REPAIR-5・REPAIR-6）。
   # Makefile の `lint`/`test` ターゲット（既定 feature 用）と同一コマンドを実行する。
-  # 3 OS matrix は rust-ci（--all-features 側）で担保済みのため、本ジョブは
-  # コスト抑制のため ubuntu-latest 単独実行とする（既定 feature は OS 依存差分が
-  # 小さいクレート構成である現時点の判断。OS 依存差分が生じた場合は 3 OS へ拡張する）。
+  # 3 OS 一級対応（.claude/rules/ci.md・XOS-1）に従い、rust-ci と同じ 3 OS matrix で
+  # 実行する（既定 feature 構成の OS 依存回帰を --all-features 側だけでは検出できない
+  # ため。PR #409 レビュー指摘）。
   rust-ci-default-features:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     # ハングしたジョブの無期限実行を防ぐ多層防御（NFR-10・.claude/rules/ci.md）。
     # 他の raw-step ジョブ（release.yml の verify 等）と同じ 30 分を採用する。
     timeout-minutes: 30
