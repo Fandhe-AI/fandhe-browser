@@ -5,7 +5,9 @@ name: CI
 # 有効化前に必要な作業: workspace（Cargo.toml）作成、vector-db 固有ジョブ
 # （test-default-build 以降の make / scripts 依存ジョブ）の置換、rust-ci の
 # cache-key-prefix をリポ名へ変更、lint-docs が参照する設定ファイル
-# （.markdownlint.jsonc 等）の整備、3 OS matrix 対応（.claude/rules/ci.md）
+# （.markdownlint.jsonc 等）の整備。3 OS matrix 対応（.claude/rules/ci.md）は
+# rust-ci ジョブ分のみ対応済み（TASK-55.1・Issue #58）。lint-docs・vector-db
+# 固有ジョブ（test-default-build 以降）は対象外（引き続き ubuntu-latest 単独実行）
 on:
   workflow_dispatch:
 
@@ -61,13 +63,23 @@ jobs:
   # TASK-66 の workspace 追加（Cargo.toml）に伴い有効化。集約ジョブは reusable 側の
   # `rust-base-ci-complete`（本呼び出しからは `rust-ci / rust-base-ci-complete` として
   # 見える）。branch protection の必須チェックへ追加する運用はユーザー作業（PR 本文参照）。
+  #
+  # 3 OS 一級対応（.claude/rules/ci.md・XOS-1・TASK-55.1）: Linux・macOS・Windows の
+  # ネイティブ runner で rust-base-ci（fmt/clippy/test/deny）をそれぞれ実行する。
+  # fail-fast: false は 1 OS の失敗で他 OS の実行を打ち切らせないため
+  # （3 OS すべての結果を必ず得る。ci.md「特定 OS のみの skip で CI を通さない」）。
   rust-ci:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     uses: Fandhe-AI/actions/.github/workflows/rust-base-ci.yml@latest
     permissions:
       contents: read
     with:
-      # public リポジトリのため GitHub ホステッド runner を明示指定（lint-docs と同方針）
-      runner-label: ubuntu-latest
+      # 3 OS matrix。matrix.os をそのまま runner-label へ渡す
+      # （public リポジトリの GitHub ホステッド runner 方針は維持）
+      runner-label: ${{ matrix.os }}
       # make deny（Makefile の deny ターゲット）と同一のチェック集合
       deny-checks: advisories bans licenses sources
       # cargo レジストリ・target の cache（reusable 側のオプトイン入力。
