@@ -3,5 +3,9 @@
 version = 4
 
 [[package]]
+name = "fandhe-browser-cdp"
+version = "0.1.0"
+
+[[package]]
 name = "fandhe-browser-render"
 version = "0.1.0"
