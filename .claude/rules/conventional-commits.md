@@ -8,7 +8,7 @@
 <本文（任意・日本語）>
 ```
 
-commitlint を導入した後は CI・commit-msg フックで検証する（導入前も本規約に従う）。
+commit-msg フック（lefthook の正規表現検査）と `make lint-commits`（commitlint・`commitlint.config.mjs`）で検証する。
 
 ## type
 

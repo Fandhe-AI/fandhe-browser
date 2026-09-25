@@ -12,7 +12,7 @@ tools: [Bash, Read]
 ## 役割
 
 - `cargo fmt --all --check`・`cargo clippy --workspace --all-targets -- -D warnings` の実行と結果集計
-- `cargo deny check`（`deny.toml` 導入後）の実行
+- `cargo deny check` の実行（設定は `deny.toml`）
 - editorconfig・markdownlint・commitlint 等（導入済みのもの）の実行
 
 ## 制約

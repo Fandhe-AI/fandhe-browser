@@ -10,7 +10,7 @@
 - 依存は MIT / Apache-2.0 / BSD / ISC / Unlicense / Zlib 等の permissive ライセンスを基本とする
 - GPL / LGPL / AGPL 系の依存は導入しない
 - MPL-2.0 は `fandhe-browser-render`（Servo）配下に限定する
-- `deny.toml` を導入した後は `cargo deny check licenses` を CI で実行し、許可外ライセンスを検出したら fail させる
+- `deny.toml` の許可リストに対して `cargo deny check licenses`（`make deny`・`make ci` に含まれる）を実行し、許可外ライセンスを検出したら fail させる
 
 ## Servo（MPL-2.0）の隔離
 

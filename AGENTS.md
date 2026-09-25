@@ -2,7 +2,7 @@
 
 ## 本書の用途
 
-本書は `.github/workflows/ai-review.yml`（Fandhe-AI/actions の reusable workflow を呼ぶ wrapper。別 PR で導入予定）が Codex による PR 自動レビューの基準として読む、リポジトリ固有のレビュー観点集である。
+本書は `.github/workflows/ai-review.yml`（Fandhe-AI/actions の reusable workflow を呼ぶ wrapper）が Codex による PR 自動レビューの基準として読む、リポジトリ固有のレビュー観点集である。
 
 - Codex の既定 prompt は**PR の base コミットの本書**を読む。そのため本書への変更は、当該 PR のレビューには反映されず、**マージ後の次の PR から実効**になる
 - 本書は日本語で記述する。プログラムの出力文字列（エラーメッセージ・ログ・CLI 出力）や識別子・コマンドは原語（英語）のままでよい
@@ -42,7 +42,7 @@ make check-render-isolation   # cargo tree --workspace -e normal,build,dev --exc
                                # 既定ビルド（feature なし）の依存グラフに Servo 系クレートが含まれないことを確認
 ```
 
-### ライセンス検査（`deny.toml` 導入後）
+### ライセンス検査
 
 ```bash
 cargo deny check licenses
@@ -135,5 +135,5 @@ spec `docs/spec/04-behavior/self-repair-design.md`「crate 間の依存方向と
 | runner 方針 | public リポジトリのため既定は GitHub ホステッドランナー。self-hosted の使用が許可されるのは `ai-review.yml` の `codex`/`review` ジョブのみ（組織承認済み例外）。`preflight`/`post_feedback` を含む他ジョブ・他 workflow は GitHub ホステッドランナーになっているか（補足: 許可範囲の詳細は Fandhe-AI/actions `ai-review/docs/runner-exception.md` 参照。Codex から読めない場合がある） | P0 |
 | permissions | ワークフロー・ジョブの `permissions` が最小権限で明示されているか | P0 |
 | secrets の扱い | secrets が `pull_request` イベントのログへ出力されていないか | P0 |
-| CI パイプライン本体（`ci.yml`・`release.yml`） | `ci.yml`・`release.yml` は vector-db 由来で、発火条件を無効化した（`workflow_dispatch` のみの）プレースホルダとして導入される／されている。発火条件を有効化する変更では、3 OS matrix（Linux・macOS・Windows）を備えているか、vector-db 固有のジョブ（vector-db 向けのビルド・テスト内容）が本リポ向けの内容へ置き換わっているかを確認する | P1 |
+| CI パイプライン本体（`ci.yml`・`release.yml`） | `ci.yml`・`release.yml` は vector-db 由来で、発火条件を無効化した（`workflow_dispatch` のみの）プレースホルダとして導入されている。発火条件を有効化する変更では、3 OS matrix（Linux・macOS・Windows）を備えているか、vector-db 固有のジョブ（vector-db 向けのビルド・テスト内容）が本リポ向けの内容へ置き換わっているかを確認する | P1 |
 | 依存監査パイプライン | 対象サイト群の互換性回帰チェック・`cargo-deny` を含む本格 CI パイプラインは検討中（REPAIR-8）。導入時は本節・`.claude/rules/ci.md` の更新を伴っているか | P2 |
