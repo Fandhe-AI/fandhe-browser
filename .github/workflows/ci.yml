@@ -38,8 +38,12 @@ jobs:
   # 必須チェックの集約: reusable 側の集約ジョブ `lint-docs / lint-docs-complete`
   # （fail-closed。各 lint ジョブは boolean input の if: を持つ条件付きジョブとして
   # 明示リストで skipped を判定する）を branch protection の必須チェックに使う。
-  # Rust 実装の着手時は rust-base-ci reusable workflow のジョブを本 workflow へ
-  # 追加し、必須チェックへその集約ジョブ（rust-base-ci-complete）を加えること。
+  # rust-base-ci reusable workflow のジョブは下記 rust-ci として本 workflow に
+  # 定義済み（#31。TASK-66 の Cargo.toml 追加で有効化）。3 OS matrix
+  # （TASK-55.1・#58）により OS ごとに別名のチェックが生成されるため、
+  # branch protection の必須チェックへは、その集約ジョブを OS 数分
+  # （`rust-ci (ubuntu-latest|macos-latest|windows-latest) /
+  # rust-base-ci-complete` の 3 件）追加すること。
   lint-docs:
     # Fandhe-AI/actions は可変タグ latest（move-latest-tag 管理で main へ追従）で
     # 参照する（組織現行標準。AGENTS.md「CI・ワークフローの改変」の例外を参照）
@@ -60,14 +64,20 @@ jobs:
   # --------------------------------------------------
   # rust-ci（Rust ベースライン品質ゲート: fmt / clippy / test / cargo-deny）
   # --------------------------------------------------
-  # TASK-66 の workspace 追加（Cargo.toml）に伴い有効化。集約ジョブは reusable 側の
-  # `rust-base-ci-complete`（本呼び出しからは `rust-ci / rust-base-ci-complete` として
-  # 見える）。branch protection の必須チェックへ追加する運用はユーザー作業（PR 本文参照）。
+  # TASK-66 の workspace 追加（Cargo.toml）に伴い有効化。reusable workflow 側の
+  # `test` ジョブが `cargo test --workspace --all-features` を continue-on-error
+  # 無しで実行し、集約ジョブ `rust-base-ci-complete` が fmt/clippy/test/deny 各
+  # ジョブの result を明示チェックしてフェイルクローズで判定する
+  # （TASK-5.1・`REPAIR-5`。本呼び出しからは `rust-ci (<os>) / rust-base-ci-complete`
+  # として見える）。branch protection の必須チェックへ追加する運用はユーザー
+  # 作業（PR 本文参照）。
   #
   # 3 OS 一級対応（.claude/rules/ci.md・XOS-1・TASK-55.1）: Linux・macOS・Windows の
   # ネイティブ runner で rust-base-ci（fmt/clippy/test/deny）をそれぞれ実行する。
   # fail-fast: false は 1 OS の失敗で他 OS の実行を打ち切らせないため
   # （3 OS すべての結果を必ず得る。ci.md「特定 OS のみの skip で CI を通さない」）。
+  # matrix.os の要素数だけ別名のチェックが生成されるため、branch protection の
+  # 必須チェックへは OS 数分（3 件）を追加する必要がある。
   rust-ci:
     strategy:
       fail-fast: false
