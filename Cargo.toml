@@ -19,7 +19,7 @@ resolver = "3"
 # 本ファイルの編集を伴うが、以降の crate 追加 PR はグロブが吸収するため
 # root 側の変更が不要になる）。`make check-workspace-manifest`（`make ci` に
 # 含む）が `cargo verify-project` で常時この manifest の妥当性を検証する。
-members = []
+members = ["crates/*"]
 
 [workspace.package]
 # 各 crate 側は `version.workspace = true` 等（`edition`/`license` も同様）で
