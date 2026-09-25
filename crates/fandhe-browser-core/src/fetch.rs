@@ -231,6 +231,11 @@ impl Fetcher {
 
     /// `url` を GET で取得する。
     ///
+    /// 呼び出し元との契約: 本メソッドはランタイムを内蔵しない async fn だが、
+    /// 内部の `reqwest::Client`（hyper 経由）は tokio 前提であり、呼び出し元
+    /// （`cdp` の `Page.navigate` ハンドラ・将来の CLI 等）が tokio ランタイム
+    /// 上で await する必要がある（tokio ランタイムの外で呼ぶと失敗する）。
+    ///
     /// - `url` を [`reqwest::Url`] として解析し、`http`/`https` 以外の
     ///   scheme（`file:`・`data:` 等）は送信前に [`Error::DisallowedScheme`]
     ///   として拒否する（解析失敗は [`Error::InvalidInput`]）
