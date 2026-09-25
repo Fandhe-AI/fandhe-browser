@@ -1,8 +1,12 @@
 //! `fandhe-browser-core`: fandhe-browser のコア crate。
 //!
 //! fetch（ネットワーク取得）・HTML パース・DOM・query（DOM 探索）・CSSOM・
-//! config（設定）・可観測性（ログ・トレーシング）を担う crate。`fandhe-browser-js`
-//! （workspace 内 crate に依存しない下位 crate）に依存し、`fandhe-browser-ai`・
+//! config（設定）・可観測性（ログ・トレーシング）を担う crate。将来的には
+//! `fandhe-browser-js`（workspace 内 crate に依存しない下位 crate）に依存する
+//! 想定だが、本 PR（TASK-1（旧サブ番号 1.2）の空 skeleton 段階）時点では
+//! `Cargo.toml` の `[dependencies]` は空であり、まだ依存を追加していない
+//! （REPAIR-3: 実装済みを装わない。依存追加は該当タスクで
+//! dependency-policy.md のユーザー承認制に従って行う）。`fandhe-browser-ai`・
 //! `fandhe-browser-cdp` 等の上位 crate からは一方向に依存される
 //! （AGENTS.md「crate 間の許可依存」・coding-rust.md「循環依存を作らない」）。
 //!
