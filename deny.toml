@@ -12,6 +12,26 @@
 # 追加時は [licenses] の allow に無い MPL-2.0 が検出され、`[licenses.exceptions]`
 # で明示許可するまで `make deny` が意図通り fail する。
 all-features = true
+# TASK-24.2（Issue #36・ビヘイビア CORE-1）の `fetch` 実装で追加した
+# `rustls-platform-verifier`（reqwest の推移依存）は、wasm32 ターゲット限定で
+# `webpki-root-certs`（CDLA-Permissive-2.0）に依存する。本リポは 3 OS
+# （Linux・macOS・Windows）一級対応が方針であり wasm32 を対象にしないため
+# （ci.md「3 OS CI」・README「3 OS 一級対応」）、評価対象ターゲットを
+# ネイティブ 3 OS の x86_64/aarch64 組み合わせに限定し、到達不能な wasm32 限定
+# 依存を監査対象から外す。これは評価範囲を実際にビルドし得るターゲットへ限定
+# するものであり、CDLA-Permissive-2.0 を新たに許可するものではない
+# （[licenses] の allow には追加しない。許可判断はライセンス判断のため
+# licensing.md に従いユーザーへ報告する）。
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+]
 
 [advisories]
 # RUSTSEC アドバイザリ監査（vulnerability / unmaintained / unsound / yanked）。
