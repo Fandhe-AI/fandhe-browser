@@ -135,5 +135,5 @@ spec `docs/spec/04-behavior/self-repair-design.md`「crate 間の依存方向と
 | runner 方針 | public リポジトリのため既定は GitHub ホステッドランナー。self-hosted の使用が許可されるのは `ai-review.yml` の `codex`/`review` ジョブのみ（組織承認済み例外）。`preflight`/`post_feedback` を含む他ジョブ・他 workflow は GitHub ホステッドランナーになっているか（補足: 許可範囲の詳細は Fandhe-AI/actions `ai-review/docs/runner-exception.md` 参照。Codex から読めない場合がある） | P0 |
 | permissions | ワークフロー・ジョブの `permissions` が最小権限で明示されているか | P0 |
 | secrets の扱い | secrets が `pull_request` イベントのログへ出力されていないか | P0 |
-| CI パイプライン本体（`ci.yml`・`release.yml`） | `ci.yml`・`release.yml` は vector-db 由来で、発火条件を無効化した（`workflow_dispatch` のみの）プレースホルダとして導入されている。発火条件を有効化する変更では、3 OS matrix（Linux・macOS・Windows）を備えているか、vector-db 固有のジョブ（vector-db 向けのビルド・テスト内容）が本リポ向けの内容へ置き換わっているかを確認する | P1 |
+| CI パイプライン本体（`ci.yml`・`release.yml`） | `ci.yml` は TASK-55.2（Issue #59）で `push`（main）/`pull_request` トリガーを有効化済み（`workflow_dispatch` は手動再実行用に併存）。`release.yml` は crates.io 公開用の意図的設計として引き続き `workflow_dispatch` 限定。`ci.yml` への変更では、3 OS matrix（Linux・macOS・Windows）を備えているか、本リポに存在しない `make` ターゲット・`scripts/` を前提にした（vector-db 由来のような）ジョブが混入していないかを確認する | P1 |
 | 依存監査パイプライン | 対象サイト群の互換性回帰チェック・`cargo-deny` を含む本格 CI パイプラインは検討中（REPAIR-8）。導入時は本節・`.claude/rules/ci.md` の更新を伴っているか | P2 |

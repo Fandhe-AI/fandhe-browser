@@ -44,7 +44,7 @@ fandhe-browser/
 ├── docs/
 │   ├── design/                    #（予定）設計ドキュメント（public）
 │   └── spec/                      # fandhe-browser-spec submodule（private・要アクセス権）
-├── .github/workflows/             # ai-review・update-external（稼働）/ ci・release（発火条件無効化中・3 OS CI は予定）
+├── .github/workflows/             # ai-review・update-external・ci（push/pull_request で稼働・3 OS CI 対応済み）/ release（発火条件は workflow_dispatch 限定のまま）
 ├── .agents/skills/                # npx skills add の導入実体
 └── .claude/
     ├── agents/                    # カテゴリ別 subagent 定義
