@@ -2,9 +2,10 @@
 #
 # `make setup` 一発で開発環境（サブモジュール・rustup・lefthook）を構築し、
 # `make ci` でローカル検証（.claude/rules/ci.md のローカルゲート）を一括実行する。
-# 実装は未着手（Cargo.toml 未追加）のため、cargo 系ターゲットは HAS_CARGO 判定で
-# スキップし、workspace 作成後に自動で有効化される（冪等セルフヒール。
-# deny も deny.toml + Cargo.toml が揃った時点で有効化）。
+# 実装は未着手（`crates/` 配下に実クレート未追加）のため、cargo 系ターゲットは
+# HAS_CARGO / HAS_MEMBERS 判定でスキップし、workspace 作成後に自動で有効化される
+# （冪等セルフヒール。deny も deny.toml + Cargo.toml + メンバー crate が揃った
+# 時点で有効化）。
 # Docker で環境非依存に開発・検証する場合は docker-* ターゲットを使う（compose.yaml 参照）。
 # Fandhe-AI/rust-ai-library の Makefile と同一方針。
 
@@ -14,6 +15,17 @@ SHELL := /bin/bash
 # Cargo.toml の有無（無ければ cargo 系をスキップ。workspace 作成後に有効化）
 HAS_CARGO := $(wildcard Cargo.toml)
 HAS_DENY := $(wildcard deny.toml)
+# workspace のメンバー crate（`crates/*/Cargo.toml`）の有無。member crate が
+# 1 つも無い仮想 workspace（`members = []`）に対しては `cargo fmt --all --check`・
+# `cargo clippy --workspace`・`cargo test --workspace`・`cargo tree --workspace`・
+# `cargo deny check ...` のいずれも「対象パッケージが無い」エラーで落ちる
+# （cargo の仕様。実機検証済み。フォーマット・lint・テストの対象コードが
+# 実在しないため妥当な失敗であり、これらのターゲットは HAS_MEMBERS でスキップする）。
+# 一方 Cargo.toml 自体の構文・workspace 定義としての妥当性は member の有無に
+# 依存せず常に検証可能なため、`check-workspace-manifest`（下記）は HAS_CARGO のみで
+# 判定し、TASK-1.1 完了直後〜TASK-1.2 以降で最初の crate が追加されるまでの
+# 中間状態でも Cargo.toml の妥当性検証をスキップしない。
+HAS_MEMBERS := $(wildcard crates/*/Cargo.toml)
 
 # lint ツールの固定バージョン。CI（Fandhe-AI/actions の lint-docs reusable workflow）の
 # 既定値に合わせる（CI 側が正。乖離したらこちらを追従させる）。
@@ -148,20 +160,43 @@ lint-docs: lint-md lint-yaml lint-editorconfig lint-commits ## ドキュメン�
 # 品質チェック（Rust。Cargo.toml 追加後に有効化）
 # --------------------------------------------------
 
+# workspace 仮想 manifest（Cargo.toml）自体の構文・定義としての妥当性を検証する。
+# `cargo verify-project` は member crate が 0 件の仮想 workspace でも成功する
+# （fmt/clippy/test 等の「対象パッケージが無い」失敗とは異なる。実機検証済み）ため、
+# HAS_MEMBERS を条件にせず HAS_CARGO のみで常時実行する。TASK-1.1（root Cargo.toml
+# 追加）のように member crate がまだ 1 つも無い段階でも、追加した Cargo.toml が
+# cargo にとって解釈可能な manifest であることをこのターゲットが保証する。
+.PHONY: check-workspace-manifest
+check-workspace-manifest: ## cargo verify-project で workspace manifest の妥当性を検証する
+ifneq ($(HAS_CARGO),)
+	@out=$$(cargo verify-project 2>&1) || { \
+		echo "$$out" >&2; \
+		echo "NG: Cargo.toml が cargo にとって不正な manifest です" >&2; \
+		exit 1; \
+	}; \
+	if ! printf '%s\n' "$$out" | grep -q '"success"'; then \
+		echo "$$out" >&2; \
+		echo "NG: cargo verify-project が success を返しませんでした" >&2; \
+		exit 1; \
+	fi
+else
+	@echo "skip: Cargo.toml 未追加のため check-workspace-manifest をスキップ"
+endif
+
 .PHONY: fmt
 fmt: ## cargo fmt --all で整形する
-ifdef HAS_CARGO
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	cargo fmt --all
 else
-	@echo "skip: Cargo.toml 未追加のため fmt をスキップ"
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため fmt をスキップ"
 endif
 
 .PHONY: fmt-check
 fmt-check: ## cargo fmt --check（整形差分の検出）
-ifdef HAS_CARGO
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	cargo fmt --all --check
 else
-	@echo "skip: Cargo.toml 未追加のため fmt-check をスキップ"
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため fmt-check をスキップ"
 endif
 
 # 既定 feature のみで検証する（RENDER-1・licensing.md）。Servo（`rendering` feature）は
@@ -170,18 +205,18 @@ endif
 # --features rendering の両方で検証」）。
 .PHONY: lint
 lint: ## cargo clippy -D warnings（既定 feature。lint ゲート）
-ifdef HAS_CARGO
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	cargo clippy --workspace --all-targets -- -D warnings
 else
-	@echo "skip: Cargo.toml 未追加のため lint をスキップ"
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため lint をスキップ"
 endif
 
 .PHONY: test
 test: ## cargo test（既定 feature。workspace 全体）
-ifdef HAS_CARGO
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	cargo test --workspace
 else
-	@echo "skip: Cargo.toml 未追加のため test をスキップ"
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test をスキップ"
 endif
 
 # `rendering` feature（Servo。RENDER-1）は fandhe-browser-render crate 追加まで
@@ -193,7 +228,7 @@ endif
 # cargo metadata 自体の失敗も「feature 未定義」扱いで無音 skip になっていた）。
 .PHONY: lint-rendering
 lint-rendering: ## cargo clippy -D warnings（--features rendering。Servo 込みの検証）
-ifdef HAS_CARGO
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	@meta=$$(cargo metadata --no-deps --format-version 1 2>&1) || { \
 		echo "$$meta" >&2; \
 		echo "NG: cargo metadata の実行に失敗しました" >&2; \
@@ -205,12 +240,12 @@ ifdef HAS_CARGO
 		echo "skip: rendering feature が未定義のため lint-rendering をスキップ"; \
 	fi
 else
-	@echo "skip: Cargo.toml 未追加のため lint-rendering をスキップ"
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため lint-rendering をスキップ"
 endif
 
 .PHONY: test-rendering
 test-rendering: ## cargo test（--features rendering。Servo 込みの検証）
-ifdef HAS_CARGO
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	@meta=$$(cargo metadata --no-deps --format-version 1 2>&1) || { \
 		echo "$$meta" >&2; \
 		echo "NG: cargo metadata の実行に失敗しました" >&2; \
@@ -222,7 +257,7 @@ ifdef HAS_CARGO
 		echo "skip: rendering feature が未定義のため test-rendering をスキップ"; \
 	fi
 else
-	@echo "skip: Cargo.toml 未追加のため test-rendering をスキップ"
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test-rendering をスキップ"
 endif
 
 # 既定ビルド（feature 指定なし）の依存グラフに Servo 系クレートが混入していないことを
@@ -245,7 +280,7 @@ endif
 RENDER_ISOLATION_PATTERN := servo|fandhe-browser-render
 .PHONY: check-render-isolation
 check-render-isolation: ## 既定ビルドの依存グラフに Servo 系クレートが含まれないことを検証する
-ifdef HAS_CARGO
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 	@out=$$(cargo tree --workspace -e normal,build,dev --exclude fandhe-browser-render) || { \
 		echo "NG: cargo tree の実行に失敗しました" >&2; \
 		exit 1; \
@@ -256,12 +291,48 @@ ifdef HAS_CARGO
 		exit 1; \
 	fi
 else
-	@echo "skip: Cargo.toml 未追加のため check-render-isolation をスキップ"
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため check-render-isolation をスキップ"
+endif
+
+# workspace 内の全 member crate が非公開（`publish = false` 相当）であることを
+# 検証する（Cargo.toml の `[workspace.package]` 契約・deny.toml の
+# `allow-wildcard-paths = true` が前提とする private crate 方針）。
+# `publish` は `version`/`edition`/`license` と異なり、member crate が
+# `publish.workspace = true`（または直接 `publish = false`）を明記しない限り
+# 自動継承されず、省略すると Cargo の既定値 `publish = true`（公開可能）になる
+# ため、コメントでの申し送りだけでなく機械的に検証する。
+# `cargo metadata` の出力では公開可能な crate は `"publish": null`、
+# 非公開（`false` または `[]` 空リスト）指定の crate は `"publish": []` になる
+# （`cargo metadata --format-version 1` の仕様。crates.io 限定公開等の
+# registry 名リスト指定は本 workspace では使わない前提のため対象外）。
+.PHONY: check-publish-private
+check-publish-private: ## workspace 内の全 member crate が publish = false であることを検証する
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	@command -v jq >/dev/null 2>&1 || { \
+		echo "NG: jq が未導入のため check-publish-private を実行できません" >&2; \
+		exit 1; \
+	}
+	@meta=$$(cargo metadata --no-deps --format-version 1 2>&1) || { \
+		echo "$$meta" >&2; \
+		echo "NG: cargo metadata の実行に失敗しました" >&2; \
+		exit 1; \
+	}; \
+	bad=$$(printf '%s\n' "$$meta" | jq -r '.packages[] | select(.publish != []) | .name') || { \
+		echo "NG: jq による publish 判定の実行に失敗しました" >&2; \
+		exit 1; \
+	}; \
+	if [ -n "$$bad" ]; then \
+		echo "NG: 以下の crate が publish = false（または publish.workspace = true）を設定していません:" >&2; \
+		printf '%s\n' "$$bad" >&2; \
+		exit 1; \
+	fi
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため check-publish-private をスキップ"
 endif
 
 .PHONY: deny
 deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
-ifneq ($(and $(HAS_CARGO),$(HAS_DENY)),)
+ifneq ($(and $(HAS_CARGO),$(HAS_DENY),$(HAS_MEMBERS)),)
 	@export PATH="$$HOME/.cargo/bin:$$PATH"; \
 	command -v cargo-deny >/dev/null 2>&1 || { \
 		echo "cargo-deny を導入します"; \
@@ -269,7 +340,7 @@ ifneq ($(and $(HAS_CARGO),$(HAS_DENY)),)
 	}; \
 	cargo deny --locked check advisories bans licenses sources
 else
-	@echo "skip: Cargo.toml または deny.toml 未追加のため deny をスキップ"
+	@echo "skip: Cargo.toml・deny.toml のいずれか未追加、または workspace にメンバー crate が無いため deny をスキップ"
 endif
 
 # `rendering` feature（Servo）を含めた検証（ci.md「既定ビルドと --features rendering
@@ -278,7 +349,7 @@ endif
 # workspace 作成前・render crate 追加前の CI を壊さない。docker-ci は make ci を
 # 呼ぶため自動的にこの検証を含む。
 .PHONY: ci
-ci: lint-docs fmt-check lint lint-rendering check-render-isolation test test-rendering deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-publish-private test test-rendering deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
