@@ -2,7 +2,7 @@
 //!
 //! MPL-2.0 である Servo を本 crate 内に閉じ込め、既定ビルドの依存グラフへ
 //! 混入させないためのライセンス境界を crate 分割として先に確保する
-//! （[licensing](../../.claude/rules/licensing.md)・RENDER-1）。
+//! （[licensing](../../../.claude/rules/licensing.md)・RENDER-1）。
 //! 対応: TASK-1（1.4）・REPAIR-1・MS-1。
 //!
 //! 現状はディレクトリ・manifest のみの雛形であり、feature gate `rendering`
