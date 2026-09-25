@@ -10,7 +10,7 @@
 //! TASK-64（コンテナのスモークテスト）は同等の検査をコンテナ内で実行する
 //! 想定であり、本ファイルの検査内容がその受け皿になる。
 //!
-//! ## 構成（PR #427 レビュー指摘への対応。3 回目）
+//! ## 構成（PR #427 レビュー指摘への対応。4 回目）
 //!
 //! 1 回目の対応（P0）で「ループが空でも成功扱いになる」問題への手当てを
 //! 入れたが、その手当ては (a) 実処理コンフォーマンス検査
@@ -47,6 +47,14 @@
 //!   `#[test]` を付け直し忘れる」余地を構造上なくす（本 crate の CI は
 //!   `cargo test --all-features` に加え既定 feature 構成も別ジョブで
 //!   検証する。ci.yml 参照）。
+//! - [`assert_conformance_summary_matches_current_contract`] の
+//!   「検査対象があるのに無検証で成功しない」追加アサーションは、
+//!   `bundled_engines()` と [`IMPLEMENTED_ENGINES`] の積集合
+//!   （`expected_checked`）を基準にする。[`IMPLEMENTED_ENGINES`] 単体の
+//!   非空性を基準にすると、同梱されていない種別しか実装されていない
+//!   ビルド構成（例: `js-boa` のみ有効なのに V8 のみ実装済み）で本来
+//!   `checked == 0` が正しい期待値であるにもかかわらず失敗してしまう
+//!   （PR #427 レビュー指摘（Bugbot）への対応。4 回目）。
 //!
 //! 現時点（[`IMPLEMENTED_ENGINES`] が空）では、feature 有効構成でも
 //! `check_*` はまだ 1 度も実際のスクリプト評価まで到達しない
@@ -263,14 +271,18 @@ mod conformance_checks {
     /// `not_yet_implemented` としてカウントされるはずである
     /// （`IMPLEMENTED_ENGINES` を更新するだけで期待値が自動的に追従する。
     /// TASK-29/32 完了時にこのヘルパー自体は変更不要）。加えて、
-    /// [`IMPLEMENTED_ENGINES`] が非空であるにもかかわらず `checked == 0` の
-    /// まま（＝実装済みのはずの種別に対して `check_*` が一度も呼ばれない）
+    /// `bundled_engines()` と [`IMPLEMENTED_ENGINES`] の積（`expected_checked`）
+    /// が非空であるにもかかわらず `checked == 0` のまま（＝実装済みかつ
+    /// 同梱されているはずの種別に対して `check_*` が一度も呼ばれない）
     /// 成功することを許さない（「検査対象があるのに無検証で成功しない」の
-    /// 明示的な回帰確認）。`IMPLEMENTED_ENGINES` が空の現時点
-    /// （`checked == 0` が正しい期待値）まで `checked > 0` を要求すると
-    /// 本モジュールが常に失敗してしまうため、その場合はこの追加要求を
-    /// 課さない（モジュール自体は cfg gate により `bundled_engines()` が
-    /// 空にならない構成でのみ実行される。モジュールドキュメント参照）。
+    /// 明示的な回帰確認）。判定基準を [`IMPLEMENTED_ENGINES`] 単体の非空性
+    /// にすると、同梱されていない種別しか実装されていないビルド構成
+    /// （`expected_checked == 0` が正しい期待値）で本アサーションが常に
+    /// 失敗してしまうため、必ず両者の積集合（`expected_checked`）を基準に
+    /// する（PR #427 レビュー指摘（Bugbot）への対応）。`expected_checked`
+    /// が 0 の場合はこの追加要求を課さない（モジュール自体は cfg gate に
+    /// より `bundled_engines()` が空にならない構成でのみ実行される。
+    /// モジュールドキュメント参照）。
     fn assert_conformance_summary_matches_current_contract(summary: &ConformanceRunSummary) {
         let expected_checked = bundled_engines()
             .iter()
@@ -286,11 +298,12 @@ mod conformance_checks {
             "not_yet_implemented must equal the number of bundled engines NOT listed in \
              IMPLEMENTED_ENGINES"
         );
-        if !IMPLEMENTED_ENGINES.is_empty() {
+        if expected_checked > 0 {
             assert!(
                 summary.checked > 0,
-                "IMPLEMENTED_ENGINES is non-empty but no conformance check_* was actually \
-                 invoked (checked == 0); check the create_engine wiring for TASK-29/32"
+                "bundled_engines() intersects IMPLEMENTED_ENGINES but no conformance check_* \
+                 was actually invoked (checked == 0); check the create_engine wiring for \
+                 TASK-29/32"
             );
         }
     }
