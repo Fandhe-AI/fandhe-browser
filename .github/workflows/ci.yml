@@ -41,8 +41,12 @@ jobs:
   # （TASK-55.1・#58）により OS ごとに別名のチェックが生成されるため、
   # branch protection の必須チェックへは、その集約ジョブを OS 数分
   # （`rust-ci (ubuntu-latest|macos-latest|windows-latest) /
-  # rust-base-ci-complete` の 3 件）に加え、既定 feature 検証ジョブ
-  # `rust-ci-default-features`（下記）も追加する必要がある（TASK-55.2・#59 時点で
+  # rust-base-ci-complete` の 3 件）に加え、既定 feature 検証ジョブ（下記。
+  # 同じく 3 OS matrix のため OS ごとに別名）の
+  # `rust-ci-default-features (ubuntu-latest)`・
+  # `rust-ci-default-features (macos-latest)`・
+  # `rust-ci-default-features (windows-latest)` の 3 件も追加する必要がある
+  # （TASK-55.2・#59 時点で
   # push/pull_request トリガーが有効化されたため、この登録作業はユーザー作業と
   # して実施可能になった。登録自体は本変更の対象外）。
   lint-docs:
