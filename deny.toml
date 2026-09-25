@@ -24,6 +24,9 @@ ignore = [
 [licenses]
 version = 2
 include-dev = true
+# TASK-77・OSS-3（MS-1）対応: `cargo deny check licenses` による許可外ライセンス
+# （GPL/LGPL/AGPL 系・未許可 MPL-2.0 混入等）の fail-closed 検出
+# （`.github/workflows/ci.yml` の `rust-ci` ジョブから呼び出す）。
 # 本リポは MIT OR Apache-2.0 のデュアルライセンス。依存もこれと互換な permissive
 # ライセンスのみ許可する。allow には互換 permissive の代表集合（rust-ai-library の
 # Cargo.lock 全域実測で出現した SPDX 識別子集合と同一）を事前許可しておき、推移的依存が
