@@ -68,7 +68,8 @@ jobs:
     with:
       # public リポジトリのため GitHub ホステッド runner を明示指定（lint-docs と同方針）
       runner-label: ubuntu-latest
-      # make deny（Makefile の deny ターゲット）と同一のチェック集合
+      # make deny（Makefile の deny ターゲット）と同一のチェック集合。
+      # licenses チェックは TASK-77・OSS-3（MS-1）対応（deny.toml の [licenses] 参照）
       deny-checks: advisories bans licenses sources
       # cargo レジストリ・target の cache（reusable 側のオプトイン入力。
       # `actions/cache`・key は `**/Cargo.lock` のハッシュ）。ホステッド runner は毎回
