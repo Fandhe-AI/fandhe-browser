@@ -71,6 +71,23 @@ pub struct Screenshot {
     pub data: Vec<u8>,
 }
 
+impl Screenshot {
+    /// [`Screenshot`] を構築する（RENDER-1）。
+    ///
+    /// `#[non_exhaustive]` により定義元 crate の外から構造体リテラルで生成できないため、
+    /// `fandhe-browser-render`（TASK-33 本体）が `Renderer::capture_screenshot` の成功結果を
+    /// 構築するための唯一の経路として提供する。将来のフィールド追加時も本コンストラクタへの
+    /// 引数追加のみで済むよう、フィールドを直接公開しない設計を維持する。
+    pub fn new(format: ImageFormat, width: u32, height: u32, data: Vec<u8>) -> Self {
+        Self {
+            format,
+            width,
+            height,
+            data,
+        }
+    }
+}
+
 /// 描画対象の要素を指す暫定的な参照型（RENDER-1）。
 ///
 /// DOM モジュール（TASK-24・CORE-1）が未実装のため、`NodeId` 等の DOM 由来の識別子は
@@ -98,6 +115,17 @@ pub struct ElementVisibility {
     pub visible: bool,
 }
 
+impl ElementVisibility {
+    /// [`ElementVisibility`] を構築する（RENDER-1）。
+    ///
+    /// `#[non_exhaustive]` のため定義元 crate の外から構造体リテラルで生成できず、
+    /// `fandhe-browser-render`（TASK-33 本体）が `Renderer::element_visibility` の成功結果を
+    /// 構築するための唯一の経路として提供する。
+    pub fn new(visible: bool) -> Self {
+        Self { visible }
+    }
+}
+
 /// 要素の境界ボックス（RENDER-1）。
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -110,6 +138,22 @@ pub struct BoundingBox {
     pub width: f64,
     /// 高さ。
     pub height: f64,
+}
+
+impl BoundingBox {
+    /// [`BoundingBox`] を構築する（RENDER-1）。
+    ///
+    /// `#[non_exhaustive]` のため定義元 crate の外から構造体リテラルで生成できず、
+    /// `fandhe-browser-render`（TASK-33 本体）が `Renderer::bounding_box` の成功結果を
+    /// 構築するための唯一の経路として提供する。
+    pub fn new(x: f64, y: f64, width: f64, height: f64) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
 }
 
 /// [`Renderer`] の各メソッドが返すエラー（RENDER-1）。
