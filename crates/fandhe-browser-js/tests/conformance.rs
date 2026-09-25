@@ -10,17 +10,22 @@
 //! TASK-64（コンテナのスモークテスト）は同等の検査をコンテナ内で実行する
 //! 想定であり、本ファイルの検査内容がその受け皿になる。
 //!
-//! ## 構成（PR #427 レビュー指摘への 2 回目の対応）
+//! ## 構成（PR #427 レビュー指摘への対応。3 回目）
 //!
 //! 1 回目の対応（P0）で「ループが空でも成功扱いになる」問題への手当てを
 //! 入れたが、その手当ては (a) 実処理コンフォーマンス検査
 //! （[`conformance_checks`] モジュール内の `check_*` 一式）から `#[test]`
 //! を外して「まだ配線されていない」状態にする、(b) 既定構成
 //! （`js-v8`/`js-boa` 両 feature 無効）でのみ実行される契約テストは
-//! ループが空のまま無検証で成功する、という 2 つの新しい P1（本コミットの
-//! 対応対象）を生んでいた。本コミットはその場しのぎの `#[test]` 着脱では
-//! なく、cfg gate で「ループが空になるビルド構成そのものにテストを
-//! 存在させない」ことで両方を解消する。
+//! ループが空のまま無検証で成功する、という 2 つの新しい P1 を生んでいた。
+//! 2 回目の対応は cfg gate で「ループが空になるビルド構成そのものに
+//! テストを存在させない」ことで両方を解消したが、その際に追加した
+//! 既定構成テストの [`IMPLEMENTED_ENGINES`] 空アサーションが、
+//! 「実装済みかどうか」と「現在のビルドに同梱されているかどうか」を
+//! 混同する新たな P1（本コミットの対応対象）を生んでいた。本コミットは
+//! 既定構成テストから [`IMPLEMENTED_ENGINES`] への参照を外し、
+//! `bundled_engines()`/`NotBundled` のみで既定構成の契約を検証する形に
+//! 直す。
 //!
 //! - [`js_1_create_engine_contract_for_bundled_engines`]（`js-v8`/`js-boa`
 //!   のいずれかが有効な構成でのみ存在）は [`bundled_engines`] が非空である
@@ -28,10 +33,12 @@
 //!   どおりに `Ok`/`NotYetImplemented` を返す契約を検証する。
 //! - 既定構成（両 feature 無効）では代わりに
 //!   [`js_1_create_engine_contract_is_empty_by_default`] が存在し、
-//!   `bundled_engines()` が空であること・`IMPLEMENTED_ENGINES` も空である
-//!   こと・`create_engine` が V8・Boa いずれに対しても具体的に
-//!   `NotBundled { bundled: [] }` を返すことを、値を伴って検証する
-//!   （coding-rust.md「期待値は具体値で書く」）。
+//!   `bundled_engines()` が空であること・`create_engine` が V8・Boa
+//!   いずれに対しても具体的に `NotBundled { bundled: [] }` を返すことを、
+//!   値を伴って検証する（coding-rust.md「期待値は具体値で書く」）。
+//!   [`IMPLEMENTED_ENGINES`] は「実装済みかどうか」と「現在のビルドに
+//!   同梱されているかどうか」が独立した情報であるため、この既定構成
+//!   テストでは参照しない（PR #427 レビュー指摘の 2 回目の対応）。
 //! - [`conformance_checks`] モジュール（`check_*` を含む実処理検査一式）
 //!   も同じ cfg gate 配下に置く。`js-v8`/`js-boa` いずれかが有効な限り
 //!   3 関数すべてが `#[test]` として常に実行され、[`create_engine`] が
@@ -56,15 +63,24 @@ use fandhe_browser_js::{CreateEngineError, EngineKind, bundled_engines, create_e
 /// [`EngineKind::Boa`] をここへ追加する）。
 ///
 /// [`js_1_create_engine_contract_for_bundled_engines`]・
-/// [`js_1_create_engine_contract_is_empty_by_default`]・
 /// [`conformance_checks`] 内の各ヘルパーが期待値の唯一の情報源として参照
-/// する。ここに列挙されていない種別が `Ok` を返した場合、または列挙されて
+/// する（既定構成の
+/// [`js_1_create_engine_contract_is_empty_by_default`] はこの定数を
+/// 参照しない。下記参照）。ここに列挙されていない種別が `Ok` を返した
+/// 場合、または列挙されて
 /// いる種別がなお `NotYetImplemented` を返した場合はどちらもテスト失敗に
 /// なる（実装状況とテストの期待値がずれたまま CI を通さない）。
 ///
-/// 既定 feature 構成（`js-v8`/`js-boa` 両無効）でもこの定数は参照される
-/// （[`js_1_create_engine_contract_is_empty_by_default`] 参照）ため、
-/// cfg gate は付けない。
+/// 「実装済みかどうか」は「現在のビルドに同梱されているかどうか」
+/// （`js-v8`/`js-boa` feature）と独立した情報のため、既定 feature 構成
+/// （両無効）ではこの定数を参照しない（PR #427 レビュー指摘: 既定構成の
+/// テストがこの定数を空であることを要求してしまうと、TASK-29/32 で
+/// 実装済みエンジン種別をここへ追加した瞬間、既定構成（エンジンを同梱
+/// しない契約自体は正しい）のテストが不当に失敗する。既定構成の検証は
+/// [`js_1_create_engine_contract_is_empty_by_default`] が `bundled_engines()`
+/// と `create_engine` の `NotBundled` 応答のみで行う）。そのため `js-v8`/
+/// `js-boa` のいずれかが有効な構成でのみ存在させる。
+#[cfg(any(feature = "js-v8", feature = "js-boa"))]
 const IMPLEMENTED_ENGINES: &[EngineKind] = &[];
 
 /// JS-1: `create_engine` の同梱種別ごとの契約（[`IMPLEMENTED_ENGINES`] に
@@ -105,13 +121,19 @@ fn js_1_create_engine_contract_for_bundled_engines() {
 }
 
 /// JS-1: 既定 feature 構成（`js-v8`/`js-boa` 両無効）では
-/// `bundled_engines()` が空であること・[`IMPLEMENTED_ENGINES`] も空である
-/// こと・`create_engine` が V8・Boa いずれに対しても具体的に
-/// `NotBundled { bundled: [] }` を返すことを検証する（TASK-28.4・
-/// Issue #150。PR #427 レビュー指摘: 既定構成で唯一実行される契約テストが
-/// 空のループのまま無検証で成功していた問題への対応。coding-rust.md
-/// 「期待値は具体値で書く」に従い `is_err()` ではなく具体的な列挙子・
-/// フィールド値を比較する）。
+/// `bundled_engines()` が空であること・`create_engine` が V8・Boa
+/// いずれに対しても具体的に `NotBundled { bundled: [] }` を返すことを
+/// 検証する（TASK-28.4・Issue #150。PR #427 レビュー指摘: 既定構成で
+/// 唯一実行される契約テストが空のループのまま無検証で成功していた問題
+/// への対応。coding-rust.md「期待値は具体値で書く」に従い `is_err()`
+/// ではなく具体的な列挙子・フィールド値を比較する）。
+///
+/// `IMPLEMENTED_ENGINES`（実装済みエンジン種別の宣言）は検証しない
+/// （PR #427 レビュー指摘の 2 回目の対応: 「実装済みかどうか」と
+/// 「現在のビルドに同梱されているかどうか」は独立した情報であり、
+/// TASK-29/32 で実装済みエンジン種別をそこへ追加しても、既定構成が
+/// エンジンを同梱しないという契約自体は変わらない。両者を混ぜて検証
+/// すると、実装が進むたびに既定構成のこのテストが不当に失敗する）。
 #[test]
 #[cfg(not(any(feature = "js-v8", feature = "js-boa")))]
 fn js_1_create_engine_contract_is_empty_by_default() {
@@ -119,10 +141,6 @@ fn js_1_create_engine_contract_is_empty_by_default() {
         bundled_engines(),
         &[] as &[EngineKind],
         "default build (js-v8/js-boa both disabled) must bundle no engines"
-    );
-    assert!(
-        IMPLEMENTED_ENGINES.is_empty(),
-        "default build must not claim any engine as implemented while none is bundled"
     );
     assert!(
         matches!(
