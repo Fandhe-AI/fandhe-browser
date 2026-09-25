@@ -20,7 +20,7 @@ feature `rendering`（`Servo` 組込）を有効化した場合のバイナリ�
 
 - **両者は別サンプルでの実測**である。二層構成 `cli` に feature `rendering` を有効化したフルビルドは PoC-6 では未実施であり（`servo` 本体のフルビルドが必要になるため実施を見送った）、有効時のサイズは `servo-embed` 実測（130MB 水準）で代替している。二層構成 `cli` の feature 有効時実測は本リポジトリで `fandhe-browser-render` crate 実装後にあらためて行う必要がある
 - `servo-embed` の初回ビルド（`println!` のみの Hello World、`Servo` API 未使用）も奇しくも 424KB になっているが、これはリンカが未使用コードを除去し `Servo` が実際にはリンクされていないためであり、二層構成 `cli` の feature 無効時サイズ（RENDER-2）とは無関係の値である。したがって初回ビルドの 3 分 23 秒（下記）は「`Servo` を実際にリンクしたビルド時間」ではない点に注意する
-- 参考: 本リポジトリの想定既定 CLI（V8 同梱）の実サイズは約 42.92MB（`docs/spec/spec.md` L173、JS-3・PERF-1 の照合対象）であり、PoC-6 の 424KB スタブより大きい。`fandhe-browser-render` crate 実装後の実際の増分率は、この約 42.92MB を基準にすると PoC-6 の相対比（424KB → 130MB、約 306,000% 増）より小さくなる見込みである
+- 参考: 本リポジトリの想定既定 CLI（V8 同梱）の実サイズは約 42.92MB（`docs/spec/spec.md`、JS-3・PERF-1 の照合対象）であり、PoC-6 の 424KB スタブより大きい。`fandhe-browser-render` crate 実装後の実際の増分倍率は、この約 42.92MB を基準にすると PoC-6 の相対比（424KB → 130MB、約 306 倍＝約 30,600% 増）より小さくなる見込みである
 
 ## ビルド時間
 
