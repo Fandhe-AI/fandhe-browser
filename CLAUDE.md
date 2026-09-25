@@ -42,7 +42,7 @@ fandhe-browser/
 │   └── fandhe-browser-mcp/        #   MCP 参照プラグイン（別バイナリ）
 ├── tests/ / benches/ / harness/   #（予定）結合テスト・ベンチ・互換性テストハーネス
 ├── docs/
-│   ├── design/                    #（予定）設計ドキュメント（public）
+│   ├── design/                    # 設計ドキュメント（public。render-feature-gate.md 等）
 │   └── spec/                      # fandhe-browser-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・update-external（稼働）/ ci・release（発火条件無効化中・3 OS CI は予定）
 ├── .agents/skills/                # npx skills add の導入実体
