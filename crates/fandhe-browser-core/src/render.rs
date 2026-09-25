@@ -173,9 +173,25 @@ pub enum RenderError {
     ElementNotFound,
     /// 上記に分類できない内部エラー。
     ///
-    /// メッセージには内部実装の詳細（ファイルパス等）を含めすぎないこと
-    /// （OWASP A02: 機密情報の露出対策。将来の実装者への申し送り）。
+    /// `message` はファイルパス等の内部実装詳細を含みうるため、`Display`
+    /// （`cdp`・`ai` が呼び出し元へそのまま文字列化しうる経路。OWASP A02:
+    /// 機密情報の露出対策）には出力しない。詳細を診断目的で取得する場合は
+    /// [`RenderError::internal_detail`] を使い、ログ等の非公開経路に限定する。
     Internal(String),
+}
+
+impl RenderError {
+    /// [`RenderError::Internal`] が保持する内部詳細メッセージを返す（RENDER-1）。
+    ///
+    /// `Display` はこの詳細を含まない固定文言のみを返すため、ファイルパス等の
+    /// 内部情報を診断ログへ残したい呼び出し元はこのメソッドを使う。CDP / AI API の
+    /// レスポンス等、外部へそのまま返す文字列の構築には使わないこと。
+    pub fn internal_detail(&self) -> Option<&str> {
+        match self {
+            Self::Internal(message) => Some(message.as_str()),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for RenderError {
@@ -183,7 +199,7 @@ impl std::fmt::Display for RenderError {
         match self {
             Self::RenderingDisabled => write!(f, "rendering layer is disabled"),
             Self::ElementNotFound => write!(f, "element not found"),
-            Self::Internal(message) => write!(f, "internal render error: {message}"),
+            Self::Internal(_) => write!(f, "internal render error"),
         }
     }
 }
@@ -288,6 +304,7 @@ mod tests {
             .capture_screenshot(&ScreenshotOptions::default())
             .expect_err("screenshot should fail");
         assert!(matches!(err, RenderError::Internal(ref message) if message == "capture failed"));
+        assert_eq!(err.internal_detail(), Some("capture failed"));
     }
 
     /// RENDER-1: `element_visibility` が成功時に具体的な可視性を返すことを確認する。
@@ -362,7 +379,25 @@ mod tests {
         );
         assert_eq!(
             RenderError::Internal("boom".to_string()).to_string(),
-            "internal render error: boom"
+            "internal render error"
         );
+    }
+
+    /// RENDER-1: `Internal` の `Display` が内部詳細（ファイルパス等になりうる `message`）を
+    /// 含まず、詳細取得は `internal_detail` 経由に限られることを確認する
+    /// （OWASP A02: 機密情報の露出対策）。
+    #[test]
+    fn render_error_internal_display_hides_detail() {
+        let err = RenderError::Internal("/etc/secret/path.txt".to_string());
+        assert_eq!(err.to_string(), "internal render error");
+        assert!(!err.to_string().contains("/etc/secret/path.txt"));
+        assert_eq!(err.internal_detail(), Some("/etc/secret/path.txt"));
+    }
+
+    /// RENDER-1: `internal_detail` は `Internal` 以外の variant では `None` を返す。
+    #[test]
+    fn render_error_internal_detail_none_for_other_variants() {
+        assert_eq!(RenderError::RenderingDisabled.internal_detail(), None);
+        assert_eq!(RenderError::ElementNotFound.internal_detail(), None);
     }
 }
