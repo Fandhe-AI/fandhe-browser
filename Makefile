@@ -48,11 +48,14 @@ setup: ## 開発環境を一括構築する（サブモジュール → rustup �
 	$(MAKE) hooks
 	@echo "setup 完了"
 
+# rustup は前提条件として確認のみ行い、自動導入はしない。取得したインストーラを検証なしに
+# 実行する経路（curl | sh）を作らないため（security.md・サプライチェーン対策）。未導入時は
+# 公式の導入手順を案内して停止する。toolchain は rust-toolchain.toml が単一真実源。
 .PHONY: rustup
-rustup: ## rustup（cargo）を未導入の場合のみ導入する
+rustup: ## rustup（cargo）の導入を確認する（未導入なら公式手順を案内して停止）
 	@if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$$HOME/.cargo/bin/rustup" ]; then \
-		echo "rustup を導入します"; \
-		curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable; \
+		echo "error: rustup が見つかりません。公式手順（https://rustup.rs/）で導入してから再実行してください" >&2; \
+		exit 1; \
 	fi
 
 # docs/spec（fandhe-browser-spec）は private リポジトリのため、アクセス権のない環境では
