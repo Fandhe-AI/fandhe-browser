@@ -260,6 +260,7 @@ impl Fetcher {
             .map_err(|source| map_reqwest_error(source, &self.options))?;
 
         let status = response.status().as_u16();
+        reject_unresolved_disallowed_redirect(&response)?;
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -326,6 +327,38 @@ fn reject_disallowed_scheme(url: &Url) -> Result<()> {
             scheme: other.to_string(),
         }),
     }
+}
+
+/// `Fetcher::new` のリダイレクトポリシー（`Policy::custom`）が発火しない
+/// リダイレクトを検出し、scheme を検証する。
+///
+/// 内部で使う `reqwest`（`tower-http` の `follow_redirect` ミドルウェア）は、
+/// `Location` ヘッダをリクエスト URL に対して解決した結果が
+/// `http::Uri`（authority 必須）としてパースできない場合（例:
+/// `file:///etc/passwd` のように authority を持たない URL）、リダイレクト
+/// ポリシーを一切呼び出さずに、その 3xx 応答をそのまま最終応答として返す。
+/// このため `Policy::custom` 内の scheme チェックだけでは、この種の
+/// リダイレクト先を拒否できない（未解決のまま `Ok` になってしまう）。
+///
+/// ここでは、応答が 3xx かつ `Location` ヘッダを持つ場合に限り、リクエスト
+/// URL（`response.url()`）を基準に `Location` を手動で解決し、scheme を
+/// 検証する。`http`/`https` の場合は `Policy::custom` 側で正常に追跡される
+/// はずなので、ここに到達すること自体が想定外だが、念のため許可する
+/// （二重チェックにしかならず、実害はない）。
+fn reject_unresolved_disallowed_redirect(response: &reqwest::Response) -> Result<()> {
+    if !(300..400).contains(&response.status().as_u16()) {
+        return Ok(());
+    }
+    let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+        return Ok(());
+    };
+    let Ok(location_str) = location.to_str() else {
+        return Ok(());
+    };
+    let Ok(location_url) = response.url().join(location_str) else {
+        return Ok(());
+    };
+    reject_disallowed_scheme(&location_url)
 }
 
 /// `reqwest::Error` を [`Error`] へ写像する。

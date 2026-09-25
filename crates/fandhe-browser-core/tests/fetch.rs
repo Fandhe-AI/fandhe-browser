@@ -181,6 +181,76 @@ async fn core_1_fetch_rejects_non_http_scheme() {
     );
 }
 
+/// CORE-1（#36）: リダイレクト先が `http`/`https` 以外の scheme（`file:`）
+/// になる場合、要求前の検査だけでなくリダイレクト経由の経路でも
+/// `Error::DisallowedScheme` を返す（モジュール doc「要求前・リダイレクト先の
+/// 両方で拒否する」の後半を検証する）。
+#[tokio::test]
+async fn core_1_fetch_rejects_disallowed_scheme_via_redirect() {
+    let port = spawn_loopback_server(|mut stream| {
+        drain_request_head(&mut stream);
+        let body = "HTTP/1.1 302 Found\r\nLocation: file:///etc/passwd\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(body.as_bytes());
+    });
+
+    let fetcher = Fetcher::new(FetchOptions::new()).expect("Fetcher::new が失敗しないこと");
+
+    let err = fetcher
+        .get(&format!("http://127.0.0.1:{port}/"))
+        .await
+        .expect_err("file: へのリダイレクトは拒否されるはず");
+    assert!(
+        matches!(err, Error::DisallowedScheme { ref scheme } if scheme == "file"),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// CORE-1（#36）: `FetchOptions::validate`（`Fetcher::new` 経由）はゼロ値の
+/// タイムアウト・接続タイムアウト・本文上限を `Error::InvalidInput` として
+/// 早期に拒否する。
+/// `Fetcher::new(options)` が `Error::InvalidInput` で失敗することを確認する
+/// （`Fetcher` は `Debug` を実装しないため `expect_err` は使えない）。
+fn assert_invalid_input(options: FetchOptions) {
+    match Fetcher::new(options) {
+        Ok(_) => panic!("InvalidInput になるはずが Fetcher::new が成功した"),
+        Err(err) => assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error: {err:?}"
+        ),
+    }
+}
+
+#[test]
+fn core_1_fetcher_new_rejects_zero_timeout() {
+    assert_invalid_input(FetchOptions::new().with_timeout(Duration::from_secs(0)));
+}
+
+#[test]
+fn core_1_fetcher_new_rejects_zero_connect_timeout() {
+    assert_invalid_input(FetchOptions::new().with_connect_timeout(Duration::from_secs(0)));
+}
+
+#[test]
+fn core_1_fetcher_new_rejects_zero_max_body_bytes() {
+    assert_invalid_input(FetchOptions::new().with_max_body_bytes(0));
+}
+
+/// CORE-1（#36）: 解析できない URL（scheme を欠く等）を渡すと
+/// `Error::InvalidInput` を返す（`Url::parse` 失敗の経路）。
+#[tokio::test]
+async fn core_1_fetch_rejects_unparseable_url() {
+    let fetcher = Fetcher::new(FetchOptions::new()).expect("Fetcher::new が失敗しないこと");
+
+    let err = fetcher
+        .get("not a url")
+        .await
+        .expect_err("解析できない URL は InvalidInput のはず");
+    assert!(
+        matches!(err, Error::InvalidInput { .. }),
+        "unexpected error: {err:?}"
+    );
+}
+
 /// CORE-1（#36）: 200 応答は status・body・content_type を具体値で返す。
 /// 404 応答も `Err` にならず `Ok` で返る（4xx/5xx をエラー扱いしない設計）。
 #[tokio::test]
