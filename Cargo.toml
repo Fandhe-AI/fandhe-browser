@@ -8,17 +8,14 @@
 
 [workspace]
 resolver = "3"
-# 暫定的に空配列（実機検証済み: cargo は glob パターンが 1 件も解決しないと
-# `members = ["crates/*"]` 自体を不正な manifest として `cargo metadata` 等を
-# エラーにする。`crates/` 配下が空の TASK-1.1 完了直後の状態ではこのグロブ表記を
-# 使えない）。将来的には `crates/*` へのグロブ採用が望ましい: root 側を固定
-# メンバー列挙にすると、並列実装される後続タスク（各 crate 追加）がすべて
-# 本ファイルの同じ行を編集する必要が生じ、並列 PR 間でコンフリクトを誘発する
-# ため。**最初に merge される crate 追加 PR（TASK-1.2〜1.7 のいずれか）が、
-# この行を `members = ["crates/*"]` へ書き換える契約とする**（その 1 回だけは
-# 本ファイルの編集を伴うが、以降の crate 追加 PR はグロブが吸収するため
-# root 側の変更が不要になる）。`make check-workspace-manifest`（`make ci` に
-# 含む）が `cargo verify-project` で常時この manifest の妥当性を検証する。
+# `crates/*` へのグロブ採用。TASK-1（1.3）が「最初に merge される crate 追加
+# PR がこの行を空配列から `["crates/*"]` へ書き換える」契約（当時のコメント）
+# に従い、`fandhe-browser-js` 追加でこの行を書き換えた。root 側を固定メンバー
+# 列挙にすると、並列実装される後続タスク（各 crate 追加）がすべて本ファイルの
+# 同じ行を編集する必要が生じ、並列 PR 間でコンフリクトを誘発するため、
+# グロブ表記を採用する。以降の crate 追加 PR は本ファイルの変更を伴わない。
+# `make check-workspace-manifest`（`make ci` に含む）が `cargo verify-project`
+# で常時この manifest の妥当性を検証する。
 members = ["crates/*"]
 
 [workspace.package]
