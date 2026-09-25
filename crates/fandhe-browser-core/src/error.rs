@@ -8,7 +8,8 @@
 //! 引き続き空のまま）。
 //!
 //! 呼び出し元は `fandhe-browser-ai`・`fandhe-browser-cdp` 等の上位 crate（本
-//! crate から一方向に依存される）や、本 crate 内の各モジュールを想定する。
+//! crate から一方向に依存される）や、本 crate 内の各モジュール（`js_stub` を
+//! 含む。TASK-24（24.9）・#43）を想定する。
 //!
 //! バリアントは現時点では汎用的なものに留め、fetch/parse/dom/query の各実装
 //! （#36/#38/#39/#41）が固有のケース（HTTP ステータス・パースエラー位置等）を
@@ -44,6 +45,21 @@ pub enum Error {
         /// 未対応の内容を示す英語メッセージ。
         message: String,
     },
+    /// JS 実行を要求されたが実行できない場合（`js_stub::execute_js_stub`。
+    /// CORE-1・TASK-24（24.9）・#43）。
+    ///
+    /// `Unsupported`（構文的に正しいが未対応の入力・機能）とは意味を分ける:
+    /// こちらは「JS エンジンがまだ統合されていない」「エンジン非同梱ビルド
+    /// である」という実行環境側の事情を表す。`fandhe-browser-js`（TASK-28）
+    /// の統合後、TASK-30（Issue #143・ビヘイビア `JS-2`）で V8 実呼び出しに
+    /// 置換されるまでの間、および同梱ビルドでない場合の双方をこの variant
+    /// で表現する（`js-engine.md` 決定 4）。
+    JsExecutionUnavailable {
+        /// 実行できない理由を示す英語メッセージ。呼び出し元から渡された
+        /// スクリプト文字列は埋め込まない（外部入力の反響・ログ肥大化を
+        /// 避けるため。security.md）。
+        message: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -52,6 +68,9 @@ impl fmt::Display for Error {
             Error::Io(source) => write!(f, "I/O error: {source}"),
             Error::InvalidInput { message } => write!(f, "invalid input: {message}"),
             Error::Unsupported { message } => write!(f, "unsupported: {message}"),
+            Error::JsExecutionUnavailable { message } => {
+                write!(f, "JS execution unavailable: {message}")
+            }
         }
     }
 }
@@ -60,7 +79,9 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(source) => Some(source),
-            Error::InvalidInput { .. } | Error::Unsupported { .. } => None,
+            Error::InvalidInput { .. }
+            | Error::Unsupported { .. }
+            | Error::JsExecutionUnavailable { .. } => None,
         }
     }
 }
@@ -157,5 +178,31 @@ mod tests {
     fn core_1_error_is_send_sync_static() {
         fn assert_bounds<T: Send + Sync + 'static>() {}
         assert_bounds::<Error>();
+    }
+
+    /// CORE-1（TASK-24（24.9）・#43）: `Error::JsExecutionUnavailable` の
+    /// `Display` がメッセージを含む。
+    #[test]
+    fn core_1_display_js_execution_unavailable_variant() {
+        let err = Error::JsExecutionUnavailable {
+            message: "js_stub boundary".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "JS execution unavailable: js_stub boundary"
+        );
+    }
+
+    /// CORE-1（TASK-24（24.9）・#43）: `Error::JsExecutionUnavailable` は
+    /// 連鎖する内部エラーを持たないため `source()` が `None` を返す。
+    #[test]
+    fn core_1_source_is_none_for_js_execution_unavailable_variant() {
+        let err = Error::JsExecutionUnavailable {
+            message: "js_stub boundary".to_string(),
+        };
+        assert_eq!(
+            std::error::Error::source(&err).map(ToString::to_string),
+            None::<String>
+        );
     }
 }
