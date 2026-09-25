@@ -11,5 +11,13 @@ name = "fandhe-browser-cdp"
 version = "0.1.0"
 
 [[package]]
+name = "fandhe-browser-core"
+version = "0.1.0"
+
+[[package]]
 name = "fandhe-browser-js"
+version = "0.1.0"
+
+[[package]]
+name = "fandhe-browser-profile"
 version = "0.1.0"
