@@ -22,6 +22,27 @@
 //! 発生しないことを確認し、必要ならその種別を分岐対象から絞り込む（また
 //! 両方完了後は分岐自体を削除する）。実装後もこの分岐を素通りさせたまま
 //! にしない。
+//!
+//! 回帰検出の担保（PR #427 レビュー指摘への対応）: 既定ビルド（feature 無し）
+//! では [`bundled_engines`] が空集合を返すため、
+//! [`run_for_each_bundled_engine`] のループは 1 度も回らず、`check_*` 関数
+//! （実処理）は一度も呼ばれない。この事実を暗黙のまま素通りさせると、CI が
+//! 既定ビルドで `cargo test --workspace` を実行する限り、この 3 テストは
+//! 常に「何も検査せずに成功」し続け、将来回帰が入っても検出できない
+//! （AGENTS.md「回帰検出の後退」規約に抵触）。そのため
+//! [`run_for_each_bundled_engine`] は「実チェックを何件実行したか」
+//! 「`NotYetImplemented` 契約確認で終わった件数」を [`ConformanceRunSummary`]
+//! として返し、各テストは
+//! [`assert_conformance_summary_matches_current_contract`] でその件数を
+//! [`IMPLEMENTED_ENGINES`]（現時点では空）から導出した期待値と突き合わせる。
+//! 加えて `NotYetImplemented` 分岐自体も、要求された種別が
+//! [`IMPLEMENTED_ENGINES`] に含まれていないことをアサートする。これにより
+//! TASK-29/32 完了後に `IMPLEMENTED_ENGINES` を更新し忘れたまま古い
+//! `NotYetImplemented` 分岐が生き残った場合や、`checked` が意図せず増減した
+//! 場合をこのアサーション失敗が機械的に検出する（アサーションの弱体化ではなく
+//! 現行契約を明示化する形で厳格化する）。`js_1_create_engine_contract_for_bundled_engines`
+//! は、その契約自体（`NotYetImplemented` かどうか）を単独で検証する
+//! （レビュー指摘の「契約確認は別テストとして分離する」への対応）。
 
 use fandhe_browser_js::{
     CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsEngineError, JsValue, NativeFn,
@@ -31,33 +52,107 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+/// 具象実装が存在し、[`create_engine`] が `Ok` を返す種別の宣言
+/// （TASK-29 完了時に [`EngineKind::V8`]、TASK-32 完了時に
+/// [`EngineKind::Boa`] をここへ追加する）。
+///
+/// [`run_for_each_bundled_engine`]・[`assert_conformance_summary_matches_current_contract`]
+/// が期待値の唯一の情報源として参照する（本ファイル冒頭「回帰検出の担保」
+/// 参照）。ここに列挙されていない種別が `Ok` を返した場合、または列挙され
+/// ている種別がなお `NotYetImplemented` を返した場合はどちらもテスト失敗に
+/// なる（実装状況とテストの期待値がずれたまま CI を通さない）。
+const IMPLEMENTED_ENGINES: &[EngineKind] = &[];
+
+/// [`run_for_each_bundled_engine`] の実行結果（何件を実チェックし、何件が
+/// `NotYetImplemented` 契約確認で終わったか）。
+///
+/// 呼び出し元は [`assert_conformance_summary_matches_current_contract`] で
+/// この値を検証し、「ループが 0 回だったので何も検査していない」ことを
+/// 暗黙のまま素通りさせない（本ファイル冒頭「回帰検出の担保」参照）。
+#[derive(Debug, PartialEq, Eq)]
+struct ConformanceRunSummary {
+    /// `create_engine` が `Ok` を返し、`check` を実際に呼び出した件数。
+    checked: usize,
+    /// `CreateEngineError::NotYetImplemented` 契約確認で終わった件数。
+    not_yet_implemented: usize,
+}
+
 /// [`bundled_engines`] が返す各エンジン種別に対して `check` を実行する
 /// ドライバ（TASK-28.4）。
 ///
 /// - `Ok` の場合はチェック関数へトレイトオブジェクトを渡す（TASK-29/32
 ///   完了後、この分岐が実際にスクリプトを評価するようになる）
-/// - `NotYetImplemented` の場合は、要求した種別と一致することだけを確認する
-///   （skip ではなく、現行契約（[`create_engine`] のドキュメント参照）の
-///   明示的な回帰確認。TASK-29/32 完了後にこの分岐が発生しなくなる種別から
-///   順に絞り込む）
+/// - `NotYetImplemented` の場合は、要求した種別と一致すること、かつその
+///   種別が [`IMPLEMENTED_ENGINES`] に含まれていないことを確認する（skip
+///   ではなく、現行契約（[`create_engine`] のドキュメント参照）の明示的な
+///   回帰確認。`IMPLEMENTED_ENGINES` に追加した種別がなお
+///   `NotYetImplemented` を返す場合はここで失敗する）
 /// - それ以外の `Err`（`NotBundled` を含む。[`bundled_engines`] 由来の種別で
 ///   起きてはならない）は `panic!` で失敗させる（fail-closed。
 ///   成功を装うフォールバックを行わない。security.md「偽装・回避機能の禁止」）
-fn run_for_each_bundled_engine(check: fn(EngineKind, &mut dyn JsEngine)) {
+///
+/// 戻り値の [`ConformanceRunSummary`] は、呼び出し元（各 `#[test]` 関数）が
+/// 「実際に何件検査したか」を明示的にアサートするための情報を運ぶ
+/// （PR #427 レビュー指摘への対応。本ファイル冒頭のドキュメント参照）。
+fn run_for_each_bundled_engine(check: fn(EngineKind, &mut dyn JsEngine)) -> ConformanceRunSummary {
+    let mut checked = 0usize;
+    let mut not_yet_implemented = 0usize;
     for &kind in bundled_engines() {
         match create_engine(kind) {
-            Ok(mut engine) => check(kind, engine.as_mut()),
+            Ok(mut engine) => {
+                check(kind, engine.as_mut());
+                checked += 1;
+            }
             Err(CreateEngineError::NotYetImplemented { requested }) => {
                 assert_eq!(
                     requested, kind,
                     "NotYetImplemented must report the kind it was requested for"
                 );
+                assert!(
+                    !IMPLEMENTED_ENGINES.contains(&kind),
+                    "{kind:?} is listed in IMPLEMENTED_ENGINES but create_engine still \
+                     returned NotYetImplemented; update the create_engine match arm"
+                );
+                not_yet_implemented += 1;
             }
             Err(other) => {
                 panic!("create_engine({kind:?}) failed unexpectedly: {other}");
             }
         }
     }
+    ConformanceRunSummary {
+        checked,
+        not_yet_implemented,
+    }
+}
+
+/// [`ConformanceRunSummary`] を [`IMPLEMENTED_ENGINES`] から導出した期待値と
+/// 突き合わせる共通ヘルパー（3 つの `#[test]` 関数から共通利用する。
+/// PR #427 レビュー指摘への対応）。
+///
+/// 期待値はビルド構成に応じて動的に決まる: 同梱されている
+/// （[`bundled_engines`] に含まれる）種別のうち、[`IMPLEMENTED_ENGINES`] に
+/// 含まれるものは `checked` としてカウントされ、残りは
+/// `not_yet_implemented` としてカウントされるはずである。これは「0 件しか
+/// 検査していない」という現行の事実を隠さずアサーションへ固定しつつ
+/// （REPAIR-5「アサーション弱体化で CI を通さない」の逆・厳格化）、
+/// `IMPLEMENTED_ENGINES` を更新するだけで期待値が自動的に追従するように
+/// する（TASK-29/32 完了時にこのヘルパー自体は変更不要）。
+fn assert_conformance_summary_matches_current_contract(summary: &ConformanceRunSummary) {
+    let expected_checked = bundled_engines()
+        .iter()
+        .filter(|kind| IMPLEMENTED_ENGINES.contains(kind))
+        .count();
+    let expected_not_yet_implemented = bundled_engines().len() - expected_checked;
+    assert_eq!(
+        summary.checked, expected_checked,
+        "checked must equal the number of bundled engines listed in IMPLEMENTED_ENGINES"
+    );
+    assert_eq!(
+        summary.not_yet_implemented, expected_not_yet_implemented,
+        "not_yet_implemented must equal the number of bundled engines NOT listed in \
+         IMPLEMENTED_ENGINES"
+    );
 }
 
 /// `JS-1`「スクリプト評価」のコンフォーマンス検査（エンジン非依存）。
@@ -259,19 +354,50 @@ fn check_dom_like_binding(kind: EngineKind, engine: &mut dyn JsEngine) {
 /// （TASK-28.4・Issue #150）。
 #[test]
 fn js_1_conformance_script_evaluation_for_each_bundled_engine() {
-    run_for_each_bundled_engine(check_script_evaluation);
+    let summary = run_for_each_bundled_engine(check_script_evaluation);
+    assert_conformance_summary_matches_current_contract(&summary);
 }
 
 /// JS-1: グローバル関数注入が、同梱された各エンジンで同じ形状で動作すること
 /// （TASK-28.4・Issue #150）。
 #[test]
 fn js_1_conformance_global_function_injection_for_each_bundled_engine() {
-    run_for_each_bundled_engine(check_global_function_injection);
+    let summary = run_for_each_bundled_engine(check_global_function_injection);
+    assert_conformance_summary_matches_current_contract(&summary);
 }
 
 /// JS-1: DOM 風オブジェクトへのバインディングが、同梱された各エンジンで
 /// 同じ形状で動作すること（TASK-28.4・Issue #150）。
 #[test]
 fn js_1_conformance_dom_like_binding_for_each_bundled_engine() {
-    run_for_each_bundled_engine(check_dom_like_binding);
+    let summary = run_for_each_bundled_engine(check_dom_like_binding);
+    assert_conformance_summary_matches_current_contract(&summary);
+}
+
+/// JS-1: `create_engine` の同梱種別ごとの契約（[`IMPLEMENTED_ENGINES`] に
+/// 含まれるかどうかで `Ok`/`NotYetImplemented` のどちらを返すべきか）を、
+/// 上記 3 つの `check_*` 実行テストとは独立に検証する（レビュー指摘「未実装
+/// エンジンの契約確認は別テストとして分離する」への対応。PR #427・TASK-28.4・
+/// Issue #150）。
+#[test]
+fn js_1_create_engine_contract_for_bundled_engines() {
+    for &kind in bundled_engines() {
+        let result = create_engine(kind);
+        if IMPLEMENTED_ENGINES.contains(&kind) {
+            assert!(
+                result.is_ok(),
+                "{kind:?} is listed in IMPLEMENTED_ENGINES, so create_engine must return Ok, \
+                 got an Err instead"
+            );
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(CreateEngineError::NotYetImplemented { requested }) if requested == kind
+                ),
+                "{kind:?} is not listed in IMPLEMENTED_ENGINES, so create_engine must return \
+                 NotYetImplemented{{ requested: {kind:?} }}, got something else"
+            );
+        }
+    }
 }
