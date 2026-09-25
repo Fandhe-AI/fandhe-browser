@@ -43,6 +43,27 @@ pub struct ScreenshotOptions {
     pub full_page: bool,
 }
 
+impl ScreenshotOptions {
+    /// 既定値（ビューポートのみを取得）で [`ScreenshotOptions`] を構築する（RENDER-1）。
+    ///
+    /// フィールドは `pub` のため `Self::default()` に対する代入でも構築できるが、
+    /// [`Screenshot::new`] 等の他のコンストラクタと入力・出力双方で構築経路を揃え、
+    /// 将来フィールドを追加する際にビルダー的な `with_*` メソッドを増やすだけで
+    /// 済むようにするため、明示的なコンストラクタを提供する。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// ページ全体を取得するかどうかを指定する（RENDER-1）。
+    ///
+    /// `cdp`・`ai` 等の外部 crate からページ全体のスクリーンショットを要求できるように
+    /// する経路（`ScreenshotOptions::new().with_full_page(true)`）。
+    pub fn with_full_page(mut self, full_page: bool) -> Self {
+        self.full_page = full_page;
+        self
+    }
+}
+
 /// 取得したスクリーンショットの画像形式（RENDER-1）。
 ///
 /// 将来的な形式追加に備え `#[non_exhaustive]` を付与する。
@@ -286,6 +307,20 @@ mod tests {
                 ElementRef::Selector(_) => Err(RenderError::ElementNotFound),
             }
         }
+    }
+
+    /// RENDER-1: `ScreenshotOptions` が `fandhe-browser-render` を経由せず外部 crate から
+    /// ページ全体のスクリーンショットを要求できる（`with_full_page` 経由の構築）ことを確認する。
+    #[test]
+    fn screenshot_options_with_full_page_sets_expected_value() {
+        let options = ScreenshotOptions::new().with_full_page(true);
+        assert_eq!(options, ScreenshotOptions { full_page: true });
+    }
+
+    /// RENDER-1: `ScreenshotOptions::new()` が既定値（ビューポートのみ）と等しいことを確認する。
+    #[test]
+    fn screenshot_options_new_matches_default() {
+        assert_eq!(ScreenshotOptions::new(), ScreenshotOptions::default());
     }
 
     /// RENDER-1: `capture_screenshot` が成功時に具体的な値を返すことを確認する。
