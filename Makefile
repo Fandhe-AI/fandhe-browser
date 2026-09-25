@@ -284,12 +284,19 @@ endif
 .PHONY: check-publish-private
 check-publish-private: ## workspace 内の全 member crate が publish = false であることを検証する
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	@command -v jq >/dev/null 2>&1 || { \
+		echo "NG: jq が未導入のため check-publish-private を実行できません" >&2; \
+		exit 1; \
+	}
 	@meta=$$(cargo metadata --no-deps --format-version 1 2>&1) || { \
 		echo "$$meta" >&2; \
 		echo "NG: cargo metadata の実行に失敗しました" >&2; \
 		exit 1; \
 	}; \
-	bad=$$(printf '%s\n' "$$meta" | jq -r '.packages[] | select(.publish != []) | .name'); \
+	bad=$$(printf '%s\n' "$$meta" | jq -r '.packages[] | select(.publish != []) | .name') || { \
+		echo "NG: jq による publish 判定の実行に失敗しました" >&2; \
+		exit 1; \
+	}; \
 	if [ -n "$$bad" ]; then \
 		echo "NG: 以下の crate が publish = false（または publish.workspace = true）を設定していません:" >&2; \
 		printf '%s\n' "$$bad" >&2; \
