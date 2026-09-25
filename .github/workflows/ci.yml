@@ -120,6 +120,9 @@ jobs:
   # 小さいクレート構成である現時点の判断。OS 依存差分が生じた場合は 3 OS へ拡張する）。
   rust-ci-default-features:
     runs-on: ubuntu-latest
+    # ハングしたジョブの無期限実行を防ぐ多層防御（NFR-10・.claude/rules/ci.md）。
+    # 他の raw-step ジョブ（release.yml の verify 等）と同じ 30 分を採用する。
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
