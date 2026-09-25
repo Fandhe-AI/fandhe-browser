@@ -3,11 +3,12 @@ name: CI
 # 準備が整うまで発火条件を無効化している（手動実行のみのプレースホルダ）。
 # 有効化時はこの on: を削除し、下のコメントアウトした on: ブロックを戻す。
 # 有効化前に必要な作業: workspace（Cargo.toml）作成、vector-db 固有ジョブ
-# （test-default-build 以降の make / scripts 依存ジョブ）の置換、rust-ci の
-# cache-key-prefix をリポ名へ変更、lint-docs が参照する設定ファイル
-# （.markdownlint.jsonc 等）の整備。3 OS matrix 対応（.claude/rules/ci.md）は
-# rust-ci ジョブ分のみ対応済み（TASK-55.1・Issue #58）。lint-docs・vector-db
-# 固有ジョブ（test-default-build 以降）は対象外（引き続き ubuntu-latest 単独実行）
+# （test-default-build 以降の make / scripts 依存ジョブ）の置換。lint-docs が
+# 参照する設定ファイル（.markdownlint.jsonc 等）の整備・rust-ci の
+# cache-key-prefix をリポ名へ変更する作業は完了済み（TASK-55.3・Issue #60）。
+# 3 OS matrix 対応（.claude/rules/ci.md）は rust-ci ジョブ分のみ対応済み
+# （TASK-55.1・Issue #58）。lint-docs・vector-db 固有ジョブ（test-default-build
+# 以降）は対象外（引き続き ubuntu-latest 単独実行）
 on:
   workflow_dispatch:
 
@@ -94,13 +95,14 @@ jobs:
       # licenses チェックは TASK-77・OSS-3（MS-1）対応（deny.toml の [licenses] 参照）
       deny-checks: advisories bans licenses sources
       # cargo レジストリ・target の cache（reusable 側のオプトイン入力。
-      # `actions/cache`・key は `**/Cargo.lock` のハッシュ）。ホステッド runner は毎回
-      # まっさらなため、無効のままだと clippy／test／deny の各ジョブが `--all-features`
-      # の依存（usearch の C++ ビルド・ort・tokenizers・wgpu）を毎回フルビルドし、
-      # test ジョブだけで約 5 分をビルドに費やしていた。cache-key-prefix は
-      # 他リポジトリと同じ既定値 `rust-base-ci` との衝突回避のため本リポ名にする
+      # `actions/cache`・key は `**/Cargo.lock` のハッシュに加え `runner.os` を
+      # 含む形で reusable workflow 側が OS ごとに分離する）。ホステッド runner は
+      # 毎回まっさらなため、無効のままだと fmt／clippy／test／deny の各ジョブが
+      # 依存クレートを毎回フルビルドすることになる。cache-key-prefix は
+      # 他リポジトリ（既定値 `rust-base-ci` や、CI 設定を輸入した際の残置物
+      # `vector-db`）との衝突回避のため本リポ名にする（TASK-55.3・Issue #60）
       cache: true
-      cache-key-prefix: vector-db
+      cache-key-prefix: fandhe-browser
 
   # --------------------------------------------------
   # test-default-build（既定ビルド専用の回帰テスト。Issue #710・#715）
