@@ -39,9 +39,19 @@ license = "MIT OR Apache-2.0"
 # `publish = false` の private crate」という前提に立っているため、ここで明示する。
 publish = false
 
-# 現時点で追加する依存はない（依存最小方針）。将来 workspace 共通依存を追加する際は
-# ここに `[workspace.dependencies]` テーブルを設け、dependency-policy.md の
-# ユーザー承認制（`=x.y.z` 完全固定）に従う。
+# TASK-33（33.1）・RENDER-1・MS-1: `fandhe-browser-render`（Servo・MPL-2.0）を
+# feature gate `rendering` 経由の optional 依存として持つのは唯一
+# `fandhe-browser-cli`（`optional = true` + `rendering = ["dep:fandhe-browser-render"]`）
+# の想定（PoC-6 `docs/spec/03-poc/rendering-layer-servo/two-layer-workspace/` 準拠）。
+# ここでは cli 側から `{ workspace = true }` で参照できるよう path 参照のみを
+# 登録する。cli crate（TASK-41.5・Issue #174）が未作成のため、現時点ではどの
+# member crate もこのエントリを参照していない（既定ビルドの依存グラフへは無影響な
+# 準備変更）。cli crate 追加後、その `Cargo.toml` 側で optional 依存・feature 定義を
+# 行う（本ファイルの変更は不要）。
+# 外部（registry）クレートの追加・更新は本エントリと異なり、
+# dependency-policy.md のユーザー承認制（`=x.y.z` 完全固定）に従う。
+[workspace.dependencies]
+fandhe-browser-render = { path = "crates/fandhe-browser-render" }
 
 [profile.release]
 # release ビルドは panic 発生時に unwind せず即座に中断する前提
