@@ -82,8 +82,12 @@ pub fn bundled_engines() -> &'static [EngineKind] {
 /// を上位 crate へ漏らさない」）。`docs/spec/03-poc/js-engine-comparison` の
 /// PoC-3 で実測した「文字列 in/out・数値 out」の形状をカバーする最小構成
 /// であり、オブジェクト・配列等の複合値は必要になった時点（TASK-29/32）で
-/// variant を追加する（過剰設計を避ける。REPAIR-3）。
+/// variant を追加する（過剰設計を避ける。REPAIR-3）。将来の variant 追加が
+/// 破壊的変更にならないよう `#[non_exhaustive]` を付ける（`JsEngineError`・
+/// `CreateEngineError` と同じ理由づけ。`EngineKind` が spec で V8・Boa の
+/// 2 種に固定されているのとは事情が異なる）。
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum JsValue {
     /// JS の `undefined` に対応する。
     Undefined,
