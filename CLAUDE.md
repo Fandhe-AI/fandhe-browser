@@ -72,7 +72,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 | `docs/spec/`（private） | explorer | 変更しない（spec リポ側で管理） |
 | 外部仕様（WHATWG・CDP・V8・boa・Servo・MCP） | reference-researcher | — |
 | テスト・lint | test-runner / linter | — |
-| ドキュメント | explorer | docs-writer |
+| ドキュメント・`AGENTS.md`・`.claude/`（agents・rules・settings.json） | explorer | docs-writer |
 
 ### model 配分表
 
@@ -99,7 +99,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 | quality | reviewer | sonnet | 設計原則・AI 自己補修性・規約準拠のレビュー |
 | quality | security-auditor | sonnet | 偽装機能・プロファイル境界・外部入力・unsafe・OWASP 監査 |
 | quality | linter | haiku | rustfmt / clippy / cargo deny 等の機械的確認 |
-| docs | docs-writer | haiku | README・CLAUDE.md・docs/design 更新 |
+| docs | docs-writer | haiku | README・CLAUDE.md・AGENTS.md・docs/design・.claude/ 更新 |
 
 ## Rules
 
