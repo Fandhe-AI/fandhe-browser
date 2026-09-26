@@ -1,7 +1,7 @@
-# cargo-deny 設定。`make deny` が本ファイルと Cargo.toml の両方が存在する時点で
-# 自動有効化され、`cargo deny --locked check advisories bans licenses sources` として
-# 実行される（実装未着手のため現時点では Makefile 側の HAS_CARGO 判定でスキップされる。
-# workspace 作成後に有効化）。
+# cargo-deny 設定。`make deny` が本ファイルと Cargo.toml・workspace メンバー crate の
+# 存在時に `cargo deny --locked check advisories bans licenses sources` を実行する
+# （TASK-77・#64 で 3 OS CI（`rust-ci` ジョブ）にも組み込み済み。TASK-9.1・#338・
+# REPAIR-8）。
 # 依存方針（.claude/rules/dependency-policy.md）: 依存最小・`=x.y.z` 完全固定・
 # 追加はユーザー承認制。Fandhe-AI/rust-ai-library の deny.toml と同一方針。
 
@@ -53,7 +53,10 @@ include-dev = true
 # BSD/ISC 等の一般的な permissive を持つだけで make deny が不要に失敗しないようにする。
 # ここに無い識別子の追加は依存追加のユーザー承認
 # （dependency-policy.md）とセットで行い、コピーレフト（GPL/LGPL/MPL 等）は列挙しない
-# ことで fail-closed に検出する。
+# ことで fail-closed に検出する。この fail-closed 性（許可外ライセンスが実際に
+# reject されるか）は、依存ゼロの canary crate に本ファイルをそのまま当てる
+# negative test（TASK-9.1・`make check-deny-license-reject`・#338）で継続的に
+# 検証している。
 #
 # MPL-2.0（Servo）は fandhe-browser-render crate 配下に限定する方針
 # （licensing.md・RENDER-1）のため、ここには追加しない。render crate 導入時に
