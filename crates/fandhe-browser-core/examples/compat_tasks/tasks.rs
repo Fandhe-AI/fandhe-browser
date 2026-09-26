@@ -154,14 +154,19 @@ impl Status {
         matches!(self, Status::Ok)
     }
 
-    /// この結果を成功率の分母（reachable）に含めるかどうか。取得・パース・
-    /// 照合のいずれかに失敗したタスクは「そもそも比較できなかった」ため
-    /// 分母から除く（attempted には含める）。
+    /// この結果を成功率の分母（reachable）に含めるかどうか。HTML を
+    /// 取得できなかったタスク（`Http`・`FetchError`）は「そもそも比較
+    /// できなかった」ため分母から除く（attempted には含める）。
+    ///
+    /// 一方、HTML の取得自体には成功した `ParseError`（core のパース失敗）・
+    /// `QueryError`（core の照合失敗）は core crate 自体の不具合であり
+    /// CORE-1 の失敗として扱う必要があるため reachable に含める（分母に
+    /// 算入したうえで `is_success` が false になり失敗として計上される）。
+    /// ここを取得失敗と同様に除外すると、成功率の分母からパース・照合の
+    /// 失敗が抜け落ち、成功率を過大評価してしまう
+    /// （PR #458 レビュー指摘 <https://github.com/Fandhe-AI/fandhe-browser/pull/458#discussion_r4111863572>）。
     pub fn is_reachable(&self) -> bool {
-        !matches!(
-            self,
-            Status::Http(_) | Status::FetchError(_) | Status::ParseError | Status::QueryError
-        )
+        !matches!(self, Status::Http(_) | Status::FetchError(_))
     }
 
     pub fn label(&self) -> String {
@@ -383,7 +388,8 @@ pub fn judge(outcome: &Outcome, expected: Expected) -> Status {
     }
 }
 
-/// 類型別の集計（attempted: 試行数・reachable: 取得・パースに成功した数・
+/// 類型別の集計（attempted: 試行数・reachable: HTML の取得に成功した数
+/// （`is_reachable`。パース・照合の失敗は含み、取得自体の失敗は除く）・
 /// success: 期待どおりだった数）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Summary {

@@ -256,6 +256,51 @@ fn core_1_category_and_status_labels_format_for_cli_output() {
     assert!(!Status::FetchError("request-failed").is_reachable());
 }
 
+/// CORE-1・TASK-26（26.1）: `ParseError`/`QueryError` は HTML の取得自体には
+/// 成功しているため `is_reachable` は true とし、成功率の分母（reachable）に
+/// 含めたうえで失敗として計上する（PR #458 レビュー指摘。取得失敗
+/// （`Http`/`FetchError`）と同様に分母から除外すると、core 自体のパース・
+/// 照合失敗が CORE-1 の失敗件数から漏れ、成功率を過大評価してしまう）。
+#[test]
+fn core_1_parse_and_query_error_count_as_reachable_failures() {
+    assert!(Status::ParseError.is_reachable());
+    assert!(Status::QueryError.is_reachable());
+    assert!(!Status::ParseError.is_success());
+    assert!(!Status::QueryError.is_success());
+
+    let results = vec![
+        tasks::TaskResult {
+            id: "T-OK",
+            category: Category::Static,
+            kind: TaskKind::Texts,
+            status: Status::Ok,
+            sample: String::new(),
+        },
+        tasks::TaskResult {
+            id: "T-PARSE-ERROR",
+            category: Category::Static,
+            kind: TaskKind::Texts,
+            status: Status::ParseError,
+            sample: String::new(),
+        },
+        tasks::TaskResult {
+            id: "T-QUERY-ERROR",
+            category: Category::Static,
+            kind: TaskKind::Texts,
+            status: Status::QueryError,
+            sample: String::new(),
+        },
+    ];
+    let (static_summary, _ssr_spa_summary) = tasks::summarize(&results);
+    // 3 件とも試行（attempted）・分母（reachable）に含まれ、成功
+    // （success）は Ok の 1 件のみ。分母を 1（Ok のみ）にしてしまうと
+    // 成功率が 100% になり、パース・照合失敗を見逃す。
+    assert_eq!(static_summary.attempted, 3);
+    assert_eq!(static_summary.reachable, 3);
+    assert_eq!(static_summary.success, 1);
+    assert!((static_summary.rate() - (1.0 / 3.0)).abs() < f64::EPSILON);
+}
+
 /// CORE-1・TASK-26（26.1）: `run_local` が返す [`tasks::TaskResult`] の
 /// `id`/`kind`/`sample` フィールド（CLI の出力行が使う）を検証する。
 #[test]
