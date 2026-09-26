@@ -3,9 +3,11 @@
 # REPAIR-1（TASK-1（旧サブ番号 1.2）・MS-1）: workspace 分割の一環として
 # `fandhe-browser-core` の空 skeleton を追加する。本 crate は fetch・HTML パース・
 # DOM・query・CSSOM・config・可観測性を担う（CLAUDE.md のリポジトリ構成参照）。
-# 本 PR の受け入れ条件は `cargo build -p fandhe-browser-core` が成功することのみで、
-# 機能実装は含まない。fetch/parse/dom/query の本実装は TASK-24（ビヘイビア `CORE-1`）
-# で行う。
+# `fetch` モジュールの本実装（TASK-24.2・Issue #36・ビヘイビア `CORE-1`）で
+# reqwest・rustls への依存を追加した（Issue #35 で採用承認済み）。`parse`
+# モジュールの本実装（TASK-24.4・Issue #38・ビヘイビア `CORE-1`）で html5ever への
+# 依存を追加した（同じく Issue #35 で採用承認済み）。dom/query の本実装は
+# 後続タスクで行う。
 
 [package]
 name = "fandhe-browser-core"
@@ -17,5 +19,22 @@ license.workspace = true
 # （`make check-publish-private` が機械的に検証する）。
 publish.workspace = true
 
-# 依存最小方針（dependency-policy.md）に従い、雛形段階では新規依存を追加しない。
+# 依存最小方針（dependency-policy.md）に従い、新規依存の追加はユーザー承認制。
+# いずれも Issue #35（2026-09-25 承認済み）で採用が決まった依存であり、
+# `=x.y.z` 完全固定で管理する。
+#
+# - html5ever: 「scraper は推移的に selectors/cssparser（MPL-2.0）を core の
+#   既定ビルドへ持ち込むため不採用、html5ever を単体で使い TreeSink・DOM・
+#   セレクタ照合は自作する」と決定された `parse` の依存（TASK-24（24.4）・#38）。
+#   markup5ever・tendril 等の推移的依存は直接依存に追加せず、`html5ever::*` の
+#   再エクスポート経由でのみ使う（parse.rs 冒頭コメント参照）。
+# - reqwest・rustls: `fetch`（TASK-24.2・#36）が使う HTTP クライアント。
+#   root `[workspace.dependencies]` に集約し、ここでは `{ workspace = true }` で
+#   参照する。
 [dependencies]
+html5ever = "=0.40.1"
+reqwest = { workspace = true }
+rustls = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
