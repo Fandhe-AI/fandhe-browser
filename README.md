@@ -16,20 +16,20 @@ Rust 製の軽量・ミニマムなブラウザの実装リポジトリです。
   - AI エージェントへ渡す DOM 情報のトークン量削減（アクセシビリティツリー・簡約 DOM を第一級 API として提供）
   - プロファイル分離による安全なマルチテナント運用
   - Linux・macOS・Windows 3 OS への一級対応
-- **非目標（コア v1）**: フル Chromium 互換・GPU レンダリングパイプラインは v1 のコアでは対象外です。段階的な互換拡張はコアでなくプラグインとして扱う方針です（`04-behavior/README.md` の判定節、`plugin-extension.md` PLUG-7、段階 0 は `compat-level.md` COMPAT-1・COMPAT-4）
+- **非目標（コア v1）**: フル Chromium 互換・GPU レンダリングパイプラインは v1 のコアでは対象外です。段階的な互換拡張はコアでなくプラグインとして扱う方針です（`04-behavior/README.md` の判定節、`plugin-extension.md` PLUG-7〔TASK-99・MS-9〕、段階 0 は `compat-level.md` COMPAT-1〔TASK-72・MS-6〕・COMPAT-4〔TASK-71/74・MS-6〕）
 
 ## 到達目標
 
 以下はロードマップ上の**目標値**であり、現時点でこれらを達成していることを意味しません（実装状況は「ステータス」節を参照）。詳細・全体は spec リポの [`06-roadmap.md`](https://github.com/Fandhe-AI/fandhe-browser-spec/blob/main/06-roadmap.md)「成功指標」を参照してください。
 
-- アイドル RSS を Chromium 比 85% 以上削減（`PERF-6`）
-- AI 向けスナップショットのトークン削減率 85% 以上（`AISNAP-1`）
-- 要素参照破損率 10% 以下（`AISNAP-10`）
-- 全体動作率 70% 以上（`COMPAT-4`）
-- 3 OS 間の動作率差 10 ポイント以内（`XOS-2`）
-- コンテナイメージサイズ削減率 95% 以上・100 コンテナ集約メモリ 90% 以上削減（`CTR-5`・`CTR-6`）
-- AI 改修タスクの単独完遂実証（`REPAIR-2`）・CI ゲートによる意図的破壊的変更の検出（`REPAIR-5`）
-- Rust 製 MCP 参照プラグインの軽量性（`PLUG-3`）・トークン削減維持（`PLUG-4`）
+- アイドル RSS を Chromium 比 85% 以上削減（`PERF-6`、TASK-27・MS-3）
+- AI 向けスナップショットのトークン削減率 85% 以上（`AISNAP-1`、TASK-11・MS-2）
+- 要素参照破損率 10% 以下（`AISNAP-10`、TASK-17・MS-2）
+- 全体動作率 70% 以上（`COMPAT-4`、TASK-71/74・MS-6）
+- 3 OS 間の動作率差 10 ポイント以内（`XOS-2`、TASK-59・MS-5）
+- コンテナイメージサイズ削減率 95% 以上・100 コンテナ集約メモリ 90% 以上削減（`CTR-5`・`CTR-6`、TASK-68/69・MS-5）
+- AI 改修タスクの単独完遂実証（`REPAIR-2`、TASK-2・MS-7）・CI ゲートによる意図的破壊的変更の検出（`REPAIR-5`、TASK-6・MS-7）
+- Rust 製 MCP 参照プラグインの軽量性（`PLUG-3`）・トークン削減維持（`PLUG-4`、いずれも TASK-94・MS-9）
 
 最終的な目標は、これらの指標を満たした実装を OSS として公開・維持することです。
 
@@ -58,7 +58,7 @@ workspace と crate 骨格（`crates/fandhe-browser-*`）の実装段階です�
 | `fandhe-browser-js` | JS エンジン抽象トレイト（V8／`rusty_v8` を既定とし `boa` へ切替可能） |
 | `fandhe-browser-ai` | AI 最適化 API（アクセシビリティツリー・簡約 DOM）・プラグイン API |
 | `fandhe-browser-cdp` | CDP（Chrome DevTools Protocol）互換サーバー。Playwright / Puppeteer 互換 |
-| `fandhe-browser-render` | Servo 組込。feature gate `rendering` 配下のオプトインとし、MPL-2.0 を本 crate 内に隔離（`RENDER-1`） |
+| `fandhe-browser-render` | Servo 組込。feature gate `rendering` 配下のオプトインとし、MPL-2.0 を本 crate 内に隔離（`RENDER-1`、TASK-33/34・MS-1） |
 | `fandhe-browser-profile` | プロファイル（ユーザーデータディレクトリ）分離 |
 | `fandhe-browser-cli`（予定） | CLI 本体 |
 | `fandhe-browser-mcp`（予定） | MCP 参照プラグイン（別バイナリ） |
@@ -70,8 +70,9 @@ workspace と crate 骨格（`crates/fandhe-browser-*`）の実装段階です�
 ### 前提ツール
 
 - [git](https://git-scm.com/)
+- [GNU Make](https://www.gnu.org/software/make/)（`make setup`/`make ci` 等のタスク実行に必須です。Linux・macOS には標準で入っています。Windows では [Chocolatey](https://community.chocolatey.org/packages/make)・[Scoop](https://scoop.sh/) 等での導入、または WSL の利用を案内します）
 - [rustup](https://rustup.rs/)（`rust-toolchain.toml` が指定する stable ツールチェーン・rustfmt・clippy を自動選択します。導入方法は rustup 公式サイトの手順を参照してください）
-- 任意: [lefthook](https://github.com/evilmartians/lefthook)（`make hooks` で git hooks を導入）、[Docker](https://www.docker.com/)（`make docker-ci` で環境非依存の検証）
+- 任意: [Docker](https://www.docker.com/)（`make docker-ci` で環境非依存の検証）。[lefthook](https://github.com/evilmartians/lefthook) 本体は任意（未導入でも `make setup` が実行する `make hooks` が brew または npx（`lefthook@<固定バージョン>`）で自動導入します。brew・npx のいずれも無い環境では `make hooks`／`make setup` がエラーで停止するため、その場合は先に brew か Node.js（npx）を導入してください）
 
 ### 手順
 
