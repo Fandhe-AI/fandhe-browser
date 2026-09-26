@@ -37,17 +37,21 @@
 //! 拒否しない（#178 で解消するまでの既知の制約）。
 
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 // unix ではディレクトリハンドル（fd）基準の openat/mkdirat/fchmod を使い、
 // パス文字列の再解決に伴う TOCTOU（symlink 差し替え競合。PR #437 レビュー
 // 指摘）を解消する（ユーザー承認済み・2026-09-26。dependency-policy.md）。
+// `Component` は `open_dir_all_verified` の走査でのみ使うため、Windows
+// ビルドで unused import（`-D warnings`）にならないよう unix 限定にする。
 #[cfg(unix)]
 use rustix::fd::OwnedFd;
 #[cfg(unix)]
 use rustix::fs::{CWD, Mode, OFlags};
 #[cfg(unix)]
 use rustix::io::Errno;
+#[cfg(unix)]
+use std::path::Component;
 
 /// プロファイルディレクトリ構築に失敗した際のエラー。
 ///
@@ -444,7 +448,7 @@ mod tests {
             // `std::env::temp_dir()` を `canonicalize` した基点から組み立てる。
             // macOS では `std::env::temp_dir()` が `/var/...`（`/var` は
             // `/private/var` への OS 標準 symlink）を返すため、正規化せずに
-            // 使うと `create_dir_all_verified` の厳格な symlink 検証
+            // 使うと `open_dir_all_verified` の厳格な symlink 検証
             // （PR #437 レビュー指摘: 途中要素の symlink を無条件に信用しない）
             // に「意図しない既存の symlink」として弾かれてしまう。テスト用
             // 一時ディレクトリの基点をあらかじめ正規化しておくことで、
@@ -500,11 +504,9 @@ mod tests {
         std::fs::write(&root, b"not a directory").expect("ファイル作成");
 
         let err = Profile::open(&root).expect_err("root がファイルなら失敗する");
-        // `create_dir_all_verified` は新規作成前に `symlink_metadata` で
-        // 実体を確認するため、通常ファイルとの衝突は `create_dir` を試みる
-        // 前に `InvalidLayout`（非ディレクトリ）として検出される
-        // （旧実装は `create_dir_all` の `Io`（EEXIST 相当）だったが、
-        // 事前検証を導入したことで検出経路が変わった。PR #437 レビュー対応）。
+        // `open_dir_all_verified` は `openat(..., OFlags::DIRECTORY, ...)` で
+        // 開こうとするため、通常ファイルとの衝突は `ENOTDIR` として
+        // `InvalidLayout`（非ディレクトリ）に分類される（PR #437 レビュー対応）。
         assert!(matches!(
             err,
             ProfileError::InvalidLayout { path, .. } if path == root
@@ -512,10 +514,11 @@ mod tests {
     }
 
     /// PROF-1（Unix 固有）: サブディレクトリのパスが通常ファイルとして
-    /// 存在すると `open` は失敗する。事前検証（`create_single_dir_verified`）
-    /// が `create_dir` を試みる前に非ディレクトリを検出するため、
-    /// ルートが通常ファイルの場合（`prof_1_open_fails_when_root_is_a_file`）
-    /// と同様に `InvalidLayout` になる。
+    /// 存在すると `open` は失敗する。`open_or_create_child_dir` の
+    /// `openat(..., OFlags::DIRECTORY, ...)` が `mkdirat` を試みる前に
+    /// 非ディレクトリを検出するため、ルートが通常ファイルの場合
+    /// （`prof_1_open_fails_when_root_is_a_file`）と同様に `InvalidLayout`
+    /// になる。
     #[cfg(unix)]
     #[test]
     fn prof_1_open_fails_when_subdir_is_a_file() {
@@ -680,9 +683,9 @@ mod tests {
 
     /// PROF-1（Unix 固有）: `root` に末尾区切り文字を付けても、`root` が
     /// symlink であることの検出をすり抜けない（PR #437 Bugbot 指摘の
-    /// 回帰テスト）。末尾に `/` が付いたパスは `lstat` が symlink を
-    /// たどって実体を返すため、正規化せずに `symlink_metadata` へ渡すと
-    /// 検査が無効化される。
+    /// 回帰テスト）。`open_dir_all_verified` は `Path::components()` を
+    /// 1 要素ずつ辿って `openat` するため、末尾に `/` が付いていても
+    /// component の集合は変わらず、検査が無効化されることはない。
     #[cfg(unix)]
     #[test]
     fn prof_1_open_rejects_root_symlink_with_trailing_slash() {
@@ -744,9 +747,9 @@ mod tests {
     }
 
     /// PROF-1（Unix 固有）: `root` に至る途中の祖先が存在しない場合、
-    /// `create_dir_all_verified` がそれらをすべて新規作成する（各要素は
-    /// 作成の都度 symlink でないことを検証されるため、中間ディレクトリの
-    /// 一括作成でも境界検証を素通りしない）。
+    /// `open_dir_all_verified` がそれらをすべて新規作成する（各要素は
+    /// `openat`/`mkdirat` により作成の都度 symlink でないことを検証されるため、
+    /// 中間ディレクトリの一括作成でも境界検証を素通りしない）。
     #[cfg(unix)]
     #[test]
     fn prof_1_open_creates_missing_intermediate_dirs() {
