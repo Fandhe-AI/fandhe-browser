@@ -56,6 +56,13 @@ const MAX_TRIALS: usize = 20;
 const MAX_SITES_ENV_BYTES: usize = 8 * 1024;
 const MAX_SITES: usize = 20;
 
+/// `<PREFIX>_SERVE_ARGS` / `<PREFIX>_MCP_ARGS`（外部入力）に許す上限。
+/// `COMPETITOR_BENCH_SITES` と対称に、`split_args` へ渡す前にバイト数・
+/// 分割後の引数個数を検証し、巨大な環境変数によるメモリ過剰消費を防ぐ
+/// （レビュー指摘 P1: line 140。coding-rust.md「長さ・件数を上限検証」）。
+const MAX_ARGS_ENV_BYTES: usize = 4 * 1024;
+const MAX_ARGS_COUNT: usize = 64;
+
 /// `COMPETITOR_BENCH_SITES` 未設定時の既定サイト群。PoC-13
 /// （`docs/spec/03-poc/browser-landscape-2026/scripts/mcp_snapshot.mjs`）の
 /// `sites` と同じ 5 サイトにし、既定実行時の `tokenReductionPct` が
@@ -124,6 +131,32 @@ struct Target {
     bin: Option<PathBuf>,
     serve_args: Vec<String>,
     mcp_args: Vec<String>,
+    /// `serve_args` / `mcp_args` の元となった環境変数がサイズ・個数上限を
+    /// 超えていた場合の理由。`Some` のときは各計測関数が起動を試みず
+    /// 即座に `Outcome::Error` を返す（レビュー指摘 P1: line 140）。
+    args_error: Option<String>,
+}
+
+/// `<PREFIX>_SERVE_ARGS` / `<PREFIX>_MCP_ARGS` を読み取り、上限検証してから
+/// `split_args` へ渡す（外部入力。`COMPETITOR_BENCH_SITES` の検証と対称）。
+fn args_from_env(env_prefix: &str, var_suffix: &str, default: &str) -> Result<Vec<String>, String> {
+    match std::env::var(format!("{env_prefix}_{var_suffix}")) {
+        Ok(raw) => {
+            if raw.len() > MAX_ARGS_ENV_BYTES {
+                return Err(format!(
+                    "{env_prefix}_{var_suffix} exceeds {MAX_ARGS_ENV_BYTES} bytes"
+                ));
+            }
+            let args = split_args(&raw);
+            if args.len() > MAX_ARGS_COUNT {
+                return Err(format!(
+                    "{env_prefix}_{var_suffix} has more than {MAX_ARGS_COUNT} args"
+                ));
+            }
+            Ok(args)
+        }
+        Err(_) => Ok(split_args(default)),
+    }
 }
 
 impl Target {
@@ -137,19 +170,19 @@ impl Target {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .map(PathBuf::from);
-        let serve_args = std::env::var(format!("{env_prefix}_SERVE_ARGS"))
-            .ok()
-            .map(|s| split_args(&s))
-            .unwrap_or_else(|| split_args(default_serve));
-        let mcp_args = std::env::var(format!("{env_prefix}_MCP_ARGS"))
-            .ok()
-            .map(|s| split_args(&s))
-            .unwrap_or_else(|| split_args(default_mcp));
+        let serve_args = args_from_env(env_prefix, "SERVE_ARGS", default_serve);
+        let mcp_args = args_from_env(env_prefix, "MCP_ARGS", default_mcp);
+        let args_error = serve_args
+            .as_ref()
+            .err()
+            .or(mcp_args.as_ref().err())
+            .cloned();
         Self {
             name,
             bin,
-            serve_args,
-            mcp_args,
+            serve_args: serve_args.unwrap_or_default(),
+            mcp_args: mcp_args.unwrap_or_default(),
+            args_error,
         }
     }
 }
@@ -270,6 +303,9 @@ fn measure_cold_start(target: &Target, trials: usize) -> Outcome {
     let Some(bin) = &target.bin else {
         return Outcome::Skipped(format!("{}: binary path not configured", target.name));
     };
+    if let Some(reason) = &target.args_error {
+        return Outcome::Error(format!("{}: {reason}", target.name));
+    }
     let mut samples = Vec::with_capacity(trials);
     for _ in 0..trials {
         match spawn_and_wait_ready(bin, &target.serve_args) {
@@ -309,6 +345,9 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
     let Some(bin) = &target.bin else {
         return Outcome::Skipped(format!("{}: binary path not configured", target.name));
     };
+    if let Some(reason) = &target.args_error {
+        return Outcome::Error(format!("{}: {reason}", target.name));
+    }
     let mut samples = Vec::with_capacity(trials);
     for _ in 0..trials {
         match spawn_and_wait_ready(bin, &target.serve_args) {
@@ -362,14 +401,28 @@ fn measure_binary_size(target: &Target) -> Outcome {
     }
 }
 
+/// stdout 読み取りスレッドが呼び出し側との間に持つ行キューの上限件数。
+/// `MAX_LINE_BYTES`（1 行あたりの上限）だけでは、外部プロセスが応答を
+/// 読ませないまま大量の行を送り続けた場合にキューが無制限に伸びメモリを
+/// 枯渇させ得る（レビュー指摘 P0: line 386）。`mpsc::sync_channel` で
+/// 容量を区切り、溢れたら読み取りスレッドを止めて `overflowed` を立てる。
+/// 256 件（最悪 256 × `MAX_LINE_BYTES` = 256MiB）は、正常系での
+/// `notifications/message` 等のログ行バーストを誤検知しない余裕を持たせつつ、
+/// 無制限確保にはしない上限として選んだ値。
+const MCP_STDOUT_QUEUE_CAPACITY: usize = 256;
+
 /// MCP stdio JSON-RPC クライアント。stdout を読む別スレッドが行単位で
-/// `mpsc` チャンネルへ push し、呼び出し側は `id` 一致を待つ
+/// 容量付き `mpsc` チャンネルへ push し、呼び出し側は `id` 一致を待つ
 /// （パイプに読み取りタイムアウトが無いため、スレッド + チャンネルで模す）。
 struct McpClient {
     guard: ChildGuard,
     stdin: std::process::ChildStdin,
     rx: mpsc::Receiver<String>,
     next_id: u64,
+    /// 読み取りスレッドがキュー容量超過を検知した際に立てるフラグ。
+    /// `call` はこれを見て、無制限にキューを溜め込む代わりに
+    /// 計測をエラー終了させる。
+    overflowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl McpClient {
@@ -383,18 +436,27 @@ impl McpClient {
             .map_err(|e| format!("spawn failed: {e}"))?;
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
-        let (tx, rx) = mpsc::channel::<String>();
+        let (tx, rx) = mpsc::sync_channel::<String>(MCP_STDOUT_QUEUE_CAPACITY);
+        let overflowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let overflowed_writer = std::sync::Arc::clone(&overflowed);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
                 let mut line = String::new();
                 match read_line_bounded(&mut reader, &mut line) {
                     Ok(0) => break,
-                    Ok(_) => {
-                        if tx.send(line).is_err() {
+                    Ok(_) => match tx.try_send(line) {
+                        Ok(()) => {}
+                        Err(mpsc::TrySendError::Full(_)) => {
+                            // キュー容量超過: 消費側が追いつけていない、または
+                            // 相手プロセスが応答を読ませず出力し続けている。
+                            // 無制限に溜め込まず読み取りを止め、呼び出し側へは
+                            // `overflowed` 経由でエラーとして伝える。
+                            overflowed_writer.store(true, std::sync::atomic::Ordering::SeqCst);
                             break;
                         }
-                    }
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
+                    },
                     Err(_) => break,
                 }
             }
@@ -404,6 +466,7 @@ impl McpClient {
             stdin,
             rx,
             next_id: 1,
+            overflowed,
         })
     }
 
@@ -431,13 +494,25 @@ impl McpClient {
 
         let deadline = Instant::now() + timeout;
         loop {
+            if self.overflowed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(format!(
+                    "{method}: mcp stdout queue exceeded {MCP_STDOUT_QUEUE_CAPACITY} lines, aborting"
+                ));
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(format!("timeout waiting for response to {method}"));
             }
             let line = match self.rx.recv_timeout(remaining) {
                 Ok(line) => line,
-                Err(_) => return Err(format!("timeout waiting for response to {method}")),
+                Err(_) => {
+                    if self.overflowed.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(format!(
+                            "{method}: mcp stdout queue exceeded {MCP_STDOUT_QUEUE_CAPACITY} lines, aborting"
+                        ));
+                    }
+                    return Err(format!("timeout waiting for response to {method}"));
+                }
             };
             let Ok(value) = parse_json(line.trim()) else {
                 continue;
@@ -473,11 +548,17 @@ impl McpClient {
 }
 
 /// MCP 応答の `result.content[].text` を連結して取り出す（PoC-13 の
-/// `extractText` 相当。フィールド欠落は空文字列にし panic させない）。
-fn extract_text(value: &JsonValue) -> String {
-    let Some(content) = value.get("result").and_then(|r| r.get("content")) else {
-        return String::new();
-    };
+/// `extractText` 相当）。`result.content` が欠如している、または
+/// `content` 内のどの項目にも `text` が無く連結結果が空文字列になる場合は
+/// 抽出失敗として `None` を返す（panic はさせない）。
+///
+/// レビュー指摘 P1: line 569。以前は欠落時に空文字列を返しており、
+/// `html` が非空で `tree` の抽出に失敗しただけのケースが
+/// `tree_tok=0` の正常計測（削減率 100%）として記録されてしまっていた。
+/// 呼び出し元 `measure_token_reduction` は `None` を抽出失敗として扱い、
+/// そのサイトを成功サンプルに含めない。
+fn extract_text(value: &JsonValue) -> Option<String> {
+    let content = value.get("result").and_then(|r| r.get("content"))?;
     let mut out = String::new();
     let mut i = 0;
     while let Some(item) = content.index(i) {
@@ -489,7 +570,7 @@ fn extract_text(value: &JsonValue) -> String {
         }
         i += 1;
     }
-    out
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// AISNAP-1: 代表サイト群で `goto` → `html` / `tree` を呼び、近似トークン数の
@@ -499,6 +580,9 @@ fn measure_token_reduction(target: &Target) -> Outcome {
     let Some(bin) = &target.bin else {
         return Outcome::Skipped(format!("{}: binary path not configured", target.name));
     };
+    if let Some(reason) = &target.args_error {
+        return Outcome::Error(format!("{}: {reason}", target.name));
+    }
     let sites: Vec<String> = match std::env::var("COMPETITOR_BENCH_SITES") {
         Ok(raw) => {
             // 分割・確保の前にバイト数を検証する（外部入力。P0 レビュー指摘:
@@ -546,16 +630,21 @@ fn measure_token_reduction(target: &Target) -> Outcome {
     }
     let _ = client.notify("notifications/initialized", "{}");
 
+    // レビュー指摘 P1: line 555。以前は goto・html・tree の失敗サイトを
+    // 無言で `continue` して除外し、残ったサイトだけの中央値を
+    // `measured` として返していたため、既定 5 サイト中 1 サイトしか
+    // 成功しなくても代表値であるかのように報告され得た。失敗したサイトと
+    // 理由を `failed` に記録し、1 件でも完走できなければ `Outcome::Error`
+    // にして「一部失敗を隠した測定値」を返さない（fail-closed）。
     let mut reductions = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
     for url in &sites {
         let goto_params = format!(
             "{{\"name\":\"goto\",\"arguments\":{{\"url\":\"{}\"}}}}",
             json_escape(url)
         );
-        if client
-            .call("tools/call", &goto_params, Duration::from_secs(20))
-            .is_err()
-        {
+        if let Err(e) = client.call("tools/call", &goto_params, Duration::from_secs(20)) {
+            failed.push(format!("{url}: goto failed: {e}"));
             continue;
         }
         let html = match client.call(
@@ -563,24 +652,53 @@ fn measure_token_reduction(target: &Target) -> Outcome {
             "{\"name\":\"html\",\"arguments\":{}}",
             Duration::from_secs(20),
         ) {
-            Ok(v) => extract_text(&v),
-            Err(_) => continue,
+            Ok(v) => match extract_text(&v) {
+                Some(t) => t,
+                None => {
+                    failed.push(format!("{url}: html extraction failed"));
+                    continue;
+                }
+            },
+            Err(e) => {
+                failed.push(format!("{url}: html call failed: {e}"));
+                continue;
+            }
         };
         let tree = match client.call(
             "tools/call",
             "{\"name\":\"tree\",\"arguments\":{}}",
             Duration::from_secs(20),
         ) {
-            Ok(v) => extract_text(&v),
-            Err(_) => continue,
+            Ok(v) => match extract_text(&v) {
+                Some(t) => t,
+                None => {
+                    failed.push(format!("{url}: tree extraction failed"));
+                    continue;
+                }
+            },
+            Err(e) => {
+                failed.push(format!("{url}: tree call failed: {e}"));
+                continue;
+            }
         };
         let html_tok = approx_tokens(html.chars().count());
         let tree_tok = approx_tokens(tree.chars().count());
-        if let Some(pct) = reduction_pct(html_tok as f64, tree_tok as f64) {
-            reductions.push(pct);
+        match reduction_pct(html_tok as f64, tree_tok as f64) {
+            Some(pct) => reductions.push(pct),
+            None => failed.push(format!("{url}: reduction_pct undefined (html_tok=0)")),
         }
     }
     drop(client.guard);
+
+    if !failed.is_empty() {
+        return Outcome::Error(format!(
+            "{}: {}/{} sites failed: {}",
+            target.name,
+            failed.len(),
+            sites.len(),
+            failed.join("; ")
+        ));
+    }
 
     match median(&reductions) {
         Some(v) => Outcome::Value(v),
