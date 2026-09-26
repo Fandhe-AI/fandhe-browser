@@ -6,8 +6,9 @@
 # `fetch` モジュールの本実装（TASK-24.2・Issue #36・ビヘイビア `CORE-1`）で
 # reqwest・rustls への依存を追加した（Issue #35 で採用承認済み）。`parse`
 # モジュールの本実装（TASK-24.4・Issue #38・ビヘイビア `CORE-1`）で html5ever への
-# 依存を追加した（同じく Issue #35 で採用承認済み）。dom/query の本実装は
-# 後続タスクで行う。
+# 依存を追加した（同じく Issue #35 で採用承認済み）。`dom` の走査 API 本実装は
+# TASK-24.5・Issue #39 で行った（新規依存なし）。`query` の本実装は
+# TASK-24.10・Issue #418 で行う。
 
 [package]
 name = "fandhe-browser-core"
