@@ -108,7 +108,7 @@ where
 /// 切断だが、[`map_reqwest_error`]（`crates/fandhe-browser-core/src/fetch.rs`）
 /// はタイムアウト・リダイレクト・内部アドレス以外の接続エラーを一律
 /// `Error::Network` に写像するため検証対象の挙動は変わらない）。
-fn spawn_connection_reset_server() -> u16 {
+fn spawn_close_without_response_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
     let port = listener.local_addr().expect("local_addr").port();
     thread::spawn(move || {
@@ -811,13 +811,13 @@ async fn core_1_fetch_network_error_on_truncated_body() {
 }
 
 /// CORE-1（#37。TASK-24.3・MS-1）: 接続はできても応答を得られない相手への
-/// 取得は `Error::Network`（接続断）になる。[`spawn_connection_reset_server`]
+/// 取得は `Error::Network`（接続断）になる。[`spawn_close_without_response_server`]
 /// が本プロセス内でポートを保持し続けるため、空きポートを bind して即座に
 /// 手放す方式（PR #434 コードレビュー指摘）と異なりポート再利用の競合が
 /// 起きない。
 #[tokio::test]
 async fn core_1_fetch_network_error_on_no_response_before_close() {
-    let port = spawn_connection_reset_server();
+    let port = spawn_close_without_response_server();
 
     let fetcher = Fetcher::new(loopback_allowed_options()).expect("Fetcher::new が失敗しないこと");
 
@@ -835,11 +835,11 @@ async fn core_1_fetch_network_error_on_no_response_before_close() {
 /// `Error::Network` の `message` は、取得元 URL に含まれる userinfo・
 /// クエリパラメータの秘密情報を含まない（`reqwest::Error::without_url()`
 /// の契約確認）。メッセージ全文の一致は reqwest 更新で壊れやすいため
-/// assert しない。[`spawn_connection_reset_server`] を使い、ポート再利用の
+/// assert しない。[`spawn_close_without_response_server`] を使い、ポート再利用の
 /// 競合（PR #434 コードレビュー指摘）を避けて接続断を確定的に起こす。
 #[tokio::test]
 async fn core_1_fetch_network_error_does_not_leak_secrets_in_message() {
-    let port = spawn_connection_reset_server();
+    let port = spawn_close_without_response_server();
 
     let fetcher = Fetcher::new(loopback_allowed_options()).expect("Fetcher::new が失敗しないこと");
 
