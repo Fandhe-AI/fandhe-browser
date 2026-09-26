@@ -2,10 +2,10 @@
 //! `parse_document_bytes`）を crate 外から検証する結合テスト
 //! （TASK-24.4・#38・ビヘイビア `CORE-1`）。
 //!
-//! `dom::Document` のフィールドは `pub(crate)`（走査 API は TASK-24.5・#39 が
-//! 追加する）ため、構造の詳細な検証は `parse` モジュール内のユニットテストが
-//! 担う。ここでは crate 外から見える契約（`Ok`/`Err` の判定・`Error` の
-//! `Display`・`Send + Sync` 境界）のみを確認する。
+//! `dom::Document` のフィールドは `pub(crate)` のままだが、走査 API
+//! （TASK-24.5・#39・`dom` モジュール）を経由すれば構造を検証できる
+//! （`tests/dom.rs` が担当）。ここでは crate 外から見える契約（`Ok`/`Err` の
+//! 判定・`Error` の `Display`・`Send + Sync` 境界）のみを確認する。
 
 use fandhe_browser_core::{Error, ParseError, ParseErrorPolicy, ParseOptions};
 
