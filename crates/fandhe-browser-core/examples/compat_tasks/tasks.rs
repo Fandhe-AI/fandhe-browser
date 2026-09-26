@@ -601,6 +601,13 @@ pub fn run_local() -> Vec<TaskResult> {
 
 /// 出力用のサンプル文字列を [`Outcome`] から組み立てる（先頭 3 件まで。
 /// coding-rust.md「結果件数の表示は先頭 N 件に制限する」）。
+///
+/// [`Outcome::Pairs`]（`Form` タスク）は実サイトモードで取得した実フォームの
+/// 送信値（password・hidden 等。CSRF トークン等の秘密情報を含み得る）を
+/// 集計するため、値そのものは一切出力せず、件数と項目名（`name` 属性）
+/// のみを示す（security.md 秘密情報の混入防止 P0）。項目名も HTML 由来の
+/// 外部入力であるため [`sanitize_sample`] で制御文字除去・長さ制限を適用
+/// してから出力する（端末インジェクション対策）。
 pub fn sample_of(outcome: &Outcome) -> String {
     const MAX_ITEMS: usize = 3;
     match outcome {
@@ -610,11 +617,14 @@ pub fn sample_of(outcome: &Outcome) -> String {
             .map(|v| sanitize_sample(v))
             .collect::<Vec<_>>()
             .join(" | "),
-        Outcome::Pairs(pairs) => pairs
-            .iter()
-            .take(MAX_ITEMS)
-            .map(|(k, v)| format!("{k}={}", sanitize_sample(v)))
-            .collect::<Vec<_>>()
-            .join(" | "),
+        Outcome::Pairs(pairs) => {
+            let names = pairs
+                .iter()
+                .take(MAX_ITEMS)
+                .map(|(k, _)| sanitize_sample(k))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("fields={} names=[{names}]", pairs.len())
+        }
     }
 }
