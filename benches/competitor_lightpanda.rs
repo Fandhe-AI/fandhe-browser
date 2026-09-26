@@ -50,6 +50,24 @@ use support::parse_ps_rss_kb;
 const DEFAULT_TRIALS: usize = 5;
 const MAX_TRIALS: usize = 20;
 
+/// `COMPETITOR_BENCH_SITES`（外部入力）に許す上限。分割・確保の前に検証し、
+/// 巨大な値や大量 URL によるメモリ・実行時間の無制限消費を防ぐ
+/// （coding-rust.md「長さ・件数を上限検証してからアロケーションに使う」）。
+const MAX_SITES_ENV_BYTES: usize = 8 * 1024;
+const MAX_SITES: usize = 20;
+
+/// `COMPETITOR_BENCH_SITES` 未設定時の既定サイト群。PoC-13
+/// （`docs/spec/03-poc/browser-landscape-2026/scripts/mcp_snapshot.mjs`）の
+/// `sites` と同じ 5 サイトにし、既定実行時の `tokenReductionPct` が
+/// 代表サイト群の中央値になるようにする（AISNAP-1）。
+const DEFAULT_SITES: [&str; 5] = [
+    "https://example.com",
+    "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+    "https://news.ycombinator.com",
+    "https://the-internet.herokuapp.com/login",
+    "https://react.dev",
+];
+
 /// readiness probe・MCP 呼び出しそれぞれの外部入力（応答行）に許す最大長。
 /// 相手プロセスが不正・悪意ある出力を送り続けても無制限にバッファへ
 /// 蓄積しないための上限（coding-rust.md）。
@@ -296,11 +314,23 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
         match spawn_and_wait_ready(bin, &target.serve_args) {
             Ok((guard, _port, _elapsed)) => {
                 std::thread::sleep(Duration::from_millis(500));
-                if let Some(rss) = sample_rss_kb(guard.0.id()) {
-                    samples.push(rss as f64);
-                }
+                // `ps` の失敗（プロセス早期終了・パース不能出力）を黙って
+                // 捨てず即座に Error 化する（レビュー指摘: 失敗試行を除外した
+                // まま残り試行だけで中央値を報告すると、trials 回分の計測値
+                // であるかのように結果件数と意味が食い違う）。
+                let pid = guard.0.id();
+                let rss = sample_rss_kb(pid);
                 drop(guard);
                 std::thread::sleep(Duration::from_millis(200));
+                match rss {
+                    Some(rss) => samples.push(rss as f64),
+                    None => {
+                        return Outcome::Error(format!(
+                            "{}: idle RSS trial failed: `ps` sampling failed for pid {pid}",
+                            target.name
+                        ));
+                    }
+                }
             }
             Err(e) => {
                 return Outcome::Error(format!("{}: idle RSS trial failed: {e}", target.name));
@@ -469,16 +499,36 @@ fn measure_token_reduction(target: &Target) -> Outcome {
     let Some(bin) = &target.bin else {
         return Outcome::Skipped(format!("{}: binary path not configured", target.name));
     };
-    let sites: Vec<String> = std::env::var("COMPETITOR_BENCH_SITES")
-        .ok()
-        .map(|s| {
-            s.split(',')
+    let sites: Vec<String> = match std::env::var("COMPETITOR_BENCH_SITES") {
+        Ok(raw) => {
+            // 分割・確保の前にバイト数を検証する（外部入力。P0 レビュー指摘:
+            // 上限検証なしに split・収集すると巨大な値でメモリ・実行時間を
+            // 無制限に消費し得る）。
+            if raw.len() > MAX_SITES_ENV_BYTES {
+                return Outcome::Error(format!(
+                    "{}: COMPETITOR_BENCH_SITES exceeds {MAX_SITES_ENV_BYTES} bytes",
+                    target.name
+                ));
+            }
+            let parsed: Vec<String> = raw
+                .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .filter(|v: &Vec<String>| !v.is_empty())
-        .unwrap_or_else(|| vec!["https://example.com".to_string()]);
+                .collect();
+            if parsed.len() > MAX_SITES {
+                return Outcome::Error(format!(
+                    "{}: COMPETITOR_BENCH_SITES has more than {MAX_SITES} sites",
+                    target.name
+                ));
+            }
+            if parsed.is_empty() {
+                DEFAULT_SITES.iter().map(|s| s.to_string()).collect()
+            } else {
+                parsed
+            }
+        }
+        Err(_) => DEFAULT_SITES.iter().map(|s| s.to_string()).collect(),
+    };
 
     let mut client = match McpClient::spawn(bin, &target.mcp_args) {
         Ok(c) => c,
