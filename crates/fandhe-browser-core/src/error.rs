@@ -4,8 +4,8 @@
 //! `query`（TASK-24.7・#41）の各モジュールは、本モジュールが定義する [`Error`] /
 //! [`Result`] を戻り値の共通土台として使う想定（TASK-24（24.1）・ビヘイビア
 //! `CORE-1`）。`unsafe` は使わず、`thiserror`/`anyhow` 等の外部依存も追加しない
-//! （dependency-policy.md の依存最小方針。`Cargo.toml` の `[dependencies]` は
-//! 引き続き空のまま）。
+//! （dependency-policy.md の依存最小方針。`Cargo.toml` の唯一の依存は
+//! `parse` が使う `html5ever = "=0.40.1"`（Issue #35 承認済み）のみ）。
 //!
 //! 呼び出し元は `fandhe-browser-ai`・`fandhe-browser-cdp` 等の上位 crate（本
 //! crate から一方向に依存される）や、本 crate 内の各モジュール（`js_stub` を

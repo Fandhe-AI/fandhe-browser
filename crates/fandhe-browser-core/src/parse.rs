@@ -51,12 +51,29 @@ use std::cell::{Cell, RefCell};
 /// 確保する。
 const ROOT_ID: NodeId = NodeId::new(0);
 
-/// ノード数上限に達した後のミューテーション呼び出しを吸収する番兵ノードの ID。
-/// arena はこの位置に空の要素ノードを確保する（[`ArenaSink::new`]）。
-const SENTINEL_ID: NodeId = NodeId::new(1);
+/// arena が最初から確保しておくノード数（[`ROOT_ID`] のみ）。
+const RESERVED_NODE_COUNT: usize = 1;
 
-/// arena が最初から確保しておくノード数（[`ROOT_ID`]・[`SENTINEL_ID`]）。
-const RESERVED_NODE_COUNT: usize = 2;
+/// ノード数上限超過後に発行する「オーバーフローハンドル」の初期値
+/// （降順に払い出す）。
+///
+/// 上限超過後も html5ever の tree builder は `create_element` 等の呼び出しを
+/// 止めない（`TreeSink` にエラーを伝える手段が無いため）。ここで**固定の
+/// 番兵 ID を使い回す**設計は、tree builder が異なる論理要素に対して同じ
+/// `Handle` を受け取ることになり、`same_node` が異なる要素同士を「同じ
+/// ノード」と誤判定して tree builder 内部の不変条件（開いている要素の
+/// スタック管理等）を壊し、html5ever 自身が `panic!` する（実測済み。
+/// `<table>`・`<template>`・adoption agency を含む入力を `max_nodes: 3` で
+/// パースすると `no current element` で panic した）。
+///
+/// 対策として、上限超過後も呼び出しごとに一意なオーバーフローハンドルを
+/// 発行する（実ノードは作らない。arena の実インデックスは `nodes.len()` から
+/// 単調増加するため、`usize::MAX` から降順に払い出せば実インデックスと
+/// 衝突しない）。オーバーフローハンドルへの読み取り系メソッド呼び出しは
+/// arena に実体が無いため必ず `None` になるが、`limit_exceeded` が立っている
+/// 間はこれを「想定内の縮退」として扱い、`poison`（内部不変条件違反）とは
+/// 区別する。
+const FIRST_OVERFLOW_ID: usize = usize::MAX;
 
 /// [`parse_document`]・[`parse_document_bytes`] の挙動を制御するオプション。
 ///
@@ -292,32 +309,22 @@ struct ArenaSink {
     /// ノード数が `max_nodes` に達した場合に立つ。以後のミューテーションは
     /// no-op になり、`finish()` で `Err(NodeLimitExceeded)` に変換する。
     limit_exceeded: Cell<bool>,
+    /// 上限超過後に払い出す次のオーバーフローハンドル（[`FIRST_OVERFLOW_ID`]
+    /// から降順）。実ノードを持たないため、対応する arena エントリは存在しない。
+    next_overflow_id: Cell<usize>,
     max_nodes: usize,
     max_recorded_errors: usize,
     strict: bool,
 }
 
 impl ArenaSink {
-    /// [`ROOT_ID`]（Document）・[`SENTINEL_ID`]（ノード数上限超過時の
-    /// 番兵要素）を確保した arena を持つ sink を作る。
+    /// [`ROOT_ID`]（Document）のみを確保した arena を持つ sink を作る。
     fn new(options: &ParseOptions) -> Self {
-        let nodes = vec![
-            Node {
-                parent: None,
-                children: Vec::new(),
-                data: NodeData::Document,
-            },
-            Node {
-                parent: None,
-                children: Vec::new(),
-                data: NodeData::Element {
-                    name: QualName::new(None, Namespace::from(""), LocalName::from("")),
-                    attrs: Vec::new(),
-                    template_contents: None,
-                    mathml_annotation_xml_integration_point: false,
-                },
-            },
-        ];
+        let nodes = vec![Node {
+            parent: None,
+            children: Vec::new(),
+            data: NodeData::Document,
+        }];
 
         ArenaSink {
             nodes: RefCell::new(nodes),
@@ -325,32 +332,45 @@ impl ArenaSink {
             diagnostics: RefCell::new(DiagnosticsState::default()),
             poison: Cell::new(false),
             limit_exceeded: Cell::new(false),
-            // RESERVED_NODE_COUNT 未満だと Document・番兵すら確保できず
-            // 直ちに矛盾するため、最低でもその分は確保できるようにする。
+            next_overflow_id: Cell::new(FIRST_OVERFLOW_ID),
+            // RESERVED_NODE_COUNT 未満だと Document すら確保できず直ちに
+            // 矛盾するため、最低でもその分は確保できるようにする。
             max_nodes: options.max_nodes.max(RESERVED_NODE_COUNT),
             max_recorded_errors: options.max_recorded_errors,
             strict: matches!(options.error_policy, ParseErrorPolicy::Strict),
         }
     }
 
+    /// 一意なオーバーフローハンドルを 1 つ払い出す（[`FIRST_OVERFLOW_ID`] の
+    /// コメント参照）。呼び出しごとに異なる値を返すため、tree builder が
+    /// 異なる論理要素を「同じノード」と誤認しない。
+    fn next_overflow_id(&self) -> NodeId {
+        let id = self.next_overflow_id.get();
+        // 実ノード数（`max_nodes` は現実的にはメモリ上限に遠く及ばない）が
+        // `usize::MAX` に達することはないため、通常この減算が 0 を下回ることはない。
+        self.next_overflow_id.set(id.wrapping_sub(1));
+        NodeId::new(id)
+    }
+
     /// 新規ノードを 1 つ確保し、その ID を返す。ノード数上限に達している、
-    /// または借用に失敗した場合は [`SENTINEL_ID`] を返し、対応するフラグを
-    /// 立てる（panic しない）。
+    /// または借用に失敗した場合は一意なオーバーフローハンドル
+    /// （[`Self::next_overflow_id`]）を返し、対応するフラグを立てる
+    /// （panic しない）。
     fn try_create_node(&self, data: NodeData) -> NodeId {
         if self.poison.get() || self.limit_exceeded.get() {
-            return SENTINEL_ID;
+            return self.next_overflow_id();
         }
         let mut nodes = match self.nodes.try_borrow_mut() {
             Ok(nodes) => nodes,
             Err(_) => {
                 self.poison.set(true);
-                return SENTINEL_ID;
+                return self.next_overflow_id();
             }
         };
         if nodes.len() >= self.max_nodes {
             drop(nodes);
             self.limit_exceeded.set(true);
-            return SENTINEL_ID;
+            return self.next_overflow_id();
         }
         let id = NodeId::new(nodes.len());
         nodes.push(Node {
@@ -510,13 +530,27 @@ impl TreeSink for ArenaSink {
                 return OwnedElemName::empty();
             }
         };
-        match nodes.get(target.index()).map(|n| &n.data) {
-            Some(NodeData::Element { name, .. }) => OwnedElemName(name.clone()),
-            _ => {
-                // html5ever の契約上「要素以外に elem_name が呼ばれることは
-                // ない」が、契約外の呼び出しでも panic は許されない
-                // （coding-rust.md）ため、空の名前を返しつつ内部不変条件違反
-                // として記録する。
+        match nodes.get(target.index()) {
+            Some(node) => match &node.data {
+                NodeData::Element { name, .. } => OwnedElemName(name.clone()),
+                _ => {
+                    // html5ever の契約上「要素以外に elem_name が呼ばれることは
+                    // ない」が、契約外の呼び出しでも panic は許されない
+                    // （coding-rust.md）ため、空の名前を返しつつ内部不変条件
+                    // 違反として記録する。
+                    drop(nodes);
+                    self.poison.set(true);
+                    OwnedElemName::empty()
+                }
+            },
+            None if self.limit_exceeded.get() => {
+                // ノード数上限超過後に払い出したオーバーフローハンドル
+                // （`Self::next_overflow_id`）には対応する arena エントリが
+                // 無いため必ず `None` になる。これは想定内の縮退であり、
+                // 内部不変条件違反（poison）とは区別する。
+                OwnedElemName::empty()
+            }
+            None => {
                 drop(nodes);
                 self.poison.set(true);
                 OwnedElemName::empty()
@@ -695,12 +729,21 @@ impl TreeSink for ArenaSink {
                 return *target;
             }
         };
-        match nodes.get(target.index()).map(|n| &n.data) {
-            Some(NodeData::Element {
-                template_contents: Some(contents),
-                ..
-            }) => *contents,
-            _ => {
+        match nodes.get(target.index()) {
+            Some(node) => match &node.data {
+                NodeData::Element {
+                    template_contents: Some(contents),
+                    ..
+                } => *contents,
+                _ => {
+                    drop(nodes);
+                    self.poison.set(true);
+                    *target
+                }
+            },
+            // オーバーフローハンドル（elem_name の同種の分岐を参照）。
+            None if self.limit_exceeded.get() => *target,
+            None => {
                 drop(nodes);
                 self.poison.set(true);
                 *target
@@ -717,7 +760,9 @@ impl TreeSink for ArenaSink {
     }
 
     fn add_attrs_if_missing(&self, target: &NodeId, attrs: Vec<HtmlAttribute>) {
-        if self.poison.get() {
+        // 「上限超過後のミューテーションは no-op」という契約（parse モジュールの
+        // doc コメント参照）を属性追加にも適用する。
+        if self.poison.get() || self.limit_exceeded.get() {
             return;
         }
         let mut nodes = match self.nodes.try_borrow_mut() {
@@ -948,6 +993,65 @@ mod tests {
             }
             other => panic!("NodeLimitExceeded を期待したが {other:?} だった"),
         }
+    }
+
+    /// CORE-1: `<template>`（`get_template_contents` 経由）・`<table>`
+    /// （foster parenting）・adoption agency（`<b><i></b></i>`）・重複属性の
+    /// いずれの構造でノード数上限に達しても、内部不変条件違反（`Internal`）に
+    /// 誤判定されず `NodeLimitExceeded` になることを確認する
+    /// （`get_template_contents`・`add_attrs_if_missing` が上限超過後の
+    /// 番兵ノードに対して呼ばれても poison を立てないことの回帰テスト）。
+    #[test]
+    fn core_1_node_limit_exceeded_takes_priority_over_internal_for_various_structures() {
+        for input in [
+            "<template>x</template>",
+            "<table>x</table>",
+            "<b><i></b></i>",
+            r#"<html a="1"><html a="2">"#,
+        ] {
+            let options = ParseOptions::default().with_max_nodes(3);
+            let err = parse_document(input, &options)
+                .expect_err(&format!("{input}: ノード数上限超過で Err になるはず"));
+            assert!(
+                matches!(
+                    err,
+                    Error::Parse(ParseError::NodeLimitExceeded { limit: 3 })
+                ),
+                "{input}: NodeLimitExceeded を期待したが {err:?} だった"
+            );
+        }
+    }
+
+    /// CORE-1: adoption agency アルゴリズム（`<b><i></b></i>`）により、`i` が
+    /// 複製され `b` の外側にも配置される。
+    #[test]
+    fn core_1_adoption_agency_duplicates_misnested_element() {
+        let input = "<!DOCTYPE html><html><body><b>1<i>2</b>3</i></body></html>";
+        let parsed = parse_document(input, &ParseOptions::default()).expect("Recover では Ok");
+        let doc = &parsed.document;
+        let html = find_child_element(doc, doc.root(), "html").unwrap();
+        let body = find_child_element(doc, html, "body").unwrap();
+        let body_node = doc.node(body).unwrap();
+
+        // adoption agency により `<i>` が複製されるため、`body` 直下には
+        // `b` と、複製された `i` の 2 要素が並ぶ。
+        assert_eq!(body_node.children.len(), 2);
+        let b = body_node.children[0];
+        assert_eq!(element_local_name(doc, b).as_deref(), Some("b"));
+        let outer_i = body_node.children[1];
+        assert_eq!(element_local_name(doc, outer_i).as_deref(), Some("i"));
+
+        let b_node = doc.node(b).unwrap();
+        // `b` の子は "1" と、内側に複製された `i`（中身は "2"）。
+        assert_eq!(text_of(doc, b_node.children[0]).as_deref(), Some("1"));
+        let inner_i = b_node.children[1];
+        assert_eq!(element_local_name(doc, inner_i).as_deref(), Some("i"));
+        let inner_i_node = doc.node(inner_i).unwrap();
+        assert_eq!(text_of(doc, inner_i_node.children[0]).as_deref(), Some("2"));
+
+        // 外側に複製された `i` の子は "3"。
+        let outer_i_node = doc.node(outer_i).unwrap();
+        assert_eq!(text_of(doc, outer_i_node.children[0]).as_deref(), Some("3"));
     }
 
     /// CORE-1: 隣接するテキストは 1 つのテキストノードに連結される
