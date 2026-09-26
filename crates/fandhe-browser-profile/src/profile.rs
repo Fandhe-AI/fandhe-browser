@@ -287,20 +287,17 @@ mod tests {
         std::fs::write(&root, b"not a directory").expect("ファイル作成");
 
         let err = Profile::open(&root).expect_err("root がファイルなら失敗する");
-        // create_dir_all がファイルと衝突して Io になるか、通過しても
-        // ensure_real_directory が InvalidLayout を返すため、どちらかで
-        // 失敗することのみを確認する。
-        assert!(matches!(
-            err,
-            ProfileError::Io(_) | ProfileError::InvalidLayout { .. }
-        ));
+        // `create_dir_all` は対象パスが既存の非ディレクトリ（通常ファイル）だと
+        // 必ず `Io`（EEXIST 相当）を返し、`ensure_real_directory` の
+        // 「非ディレクトリ」検出パスへは到達しない。期待値は具体的に絞る
+        // （coding-rust.md「期待値は具体値で書く」）。
+        assert!(matches!(err, ProfileError::Io(_)));
     }
 
     /// PROF-1: サブディレクトリのパスが通常ファイルとして存在すると
-    /// `open` は失敗する。`create_dir_all` がファイルと衝突して `Io` に
-    /// なるか、通過しても `ensure_real_directory` が `InvalidLayout` を
-    /// 返すため、ルートが通常ファイルの場合（`prof_1_open_fails_when_root_is_a_file`）
-    /// と同様にどちらかで失敗することのみを確認する。
+    /// `open` は失敗する。`create_dir_all` が対象パスの既存の通常ファイルと
+    /// 衝突して必ず `Io`（EEXIST 相当）を返すため、ルートが通常ファイルの場合
+    /// （`prof_1_open_fails_when_root_is_a_file`）と同様に `Io` に絞って確認する。
     #[test]
     fn prof_1_open_fails_when_subdir_is_a_file() {
         let tmp = TempDir::new();
@@ -309,10 +306,7 @@ mod tests {
         std::fs::write(&cache_path, b"not a directory").expect("ファイル作成");
 
         let err = Profile::open(tmp.path()).expect_err("cache がファイルなら失敗する");
-        assert!(matches!(
-            err,
-            ProfileError::Io(_) | ProfileError::InvalidLayout { .. }
-        ));
+        assert!(matches!(err, ProfileError::Io(_)));
     }
 
     /// PROF-1（Unix 固有）: `root/cookies` が外部ディレクトリへの symlink だと
@@ -337,6 +331,43 @@ mod tests {
         assert!(matches!(
             err,
             ProfileError::InvalidLayout { path, .. } if path == cookies_path
+        ));
+
+        // symlink 先のパーミッションが chmod で変更されていないことを確認する。
+        let mode = std::fs::metadata(external.path())
+            .expect("外部ディレクトリの metadata 取得")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    /// PROF-1（Unix 固有）: `root` 自体が外部ディレクトリへの symlink だと
+    /// `Err(InvalidLayout)` になり、symlink 先のモードは変更されない。
+    /// サブディレクトリ側（`prof_1_open_fails_when_subdir_is_a_symlink`）と
+    /// 同じ `ensure_real_directory` を `root` にも適用していることを確認する。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_open_fails_when_root_is_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let tmp = TempDir::new();
+        let root = tmp.path();
+        // `root` の親ディレクトリだけを作り、`root` パス自体は symlink にする。
+        let parent = root.parent().expect("親ディレクトリが存在する");
+        std::fs::create_dir_all(parent).expect("親ディレクトリの作成");
+
+        let external = TempDir::new();
+        std::fs::create_dir_all(external.path()).expect("外部ディレクトリの作成");
+        std::fs::set_permissions(external.path(), Permissions::from_mode(0o755))
+            .expect("外部ディレクトリのパーミッション設定");
+
+        symlink(external.path(), root).expect("symlink 作成");
+
+        let err = Profile::open(root).expect_err("root が symlink なら失敗する");
+        assert!(matches!(
+            err,
+            ProfileError::InvalidLayout { path, .. } if path == root
         ));
 
         // symlink 先のパーミッションが chmod で変更されていないことを確認する。
