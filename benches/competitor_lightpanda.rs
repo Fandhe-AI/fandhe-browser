@@ -23,6 +23,20 @@
 //!   （未設定時の既定値は `mcp`）
 //! - `COMPETITOR_BENCH_TRIALS`: cold start / RSS の試行回数（既定 5・上限 20）
 //!
+//! `AISNAP-1`（MCP トークン削減率）計測が `goto` する対象（PR #442 再レビュー。
+//! Codex P0）: 以前は `COMPETITOR_BENCH_SITES` で任意の外部 URL を指定できたが、
+//! 計測対象ブラウザは接続時に名前を再解決でき、公開 URL からのリダイレクトにも
+//! 追従し得るため、事前の URL 検証をいくら積み増しても実際の接続先
+//! （内部アドレスに到達しないこと）を保証できなかった（SSRF・TOCTOU）。この
+//! ため任意 URL の指定経路を廃止し、本ベンチが自ら起動するローカル静的
+//! サーバー（`127.0.0.1` の空きポート。[`FixtureServer`]）がリポジトリ同梱の
+//! 自作 fixture（外部参照を含まない。`competitor_lightpanda/fixtures/`）を
+//! 配信し、そこだけを `goto` する構成にした。これは Lightpanda 本家のベンチ
+//! （ローカルで配信するデモサイトを対象にする）と同じ形であり、ベンチが
+//! 外部ネットワークへ一切出ないため SSRF 経路が構造的になくなり、外部サイトの
+//! 可用性・内容変化にも左右されない再現可能な計測になる（security.md
+//! 「SSRF」）。
+//!
 //! 終了コード契約（レビュー指摘 P1。Codex。PR #442）: JSON は必ず stdout へ
 //! 出力したうえで、いずれかの計測項目が `Outcome::Error`（対象バイナリの
 //! 起動失敗・MCP 呼び出し失敗等）になった場合は終了コード `1` で終了する。
@@ -31,26 +45,27 @@
 //! 呼び出し側はこの終了コードで成功・失敗を判定できる。
 //!
 //! 新規外部依存は追加しない（`Cargo.toml` の `dependencies` に変更なし。
-//! dependency-policy.md）。`support::validate_bench_url` の URL 正規化のみ
-//! `reqwest::Url`（暫定ホスト `fandhe-browser-core` が既に依存し、
-//! `Cargo.lock` に解決済みの推移依存）を再利用する（レビュー指摘 P0・Medium。
-//! PR #442。詳細は `support.rs` の同関数ドキュメント参照）。それ以外は
-//! `std` のみで完結する。
+//! dependency-policy.md）。`support::validate_local_bench_url` の URL
+//! 正規化のみ `reqwest::Url`（暫定ホスト `fandhe-browser-core` が既に依存し、
+//! `Cargo.lock` に解決済みの推移依存）を再利用する（詳細は `support.rs` の
+//! 同関数ドキュメント参照）。それ以外は `std` のみで完結する。
 
 #[path = "competitor_lightpanda/support.rs"]
 mod support;
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use support::{
-    JsonValue, Outcome, approx_tokens, bench_exit_code, check_resolved_addrs, expand_args,
-    json_escape, median, parse_http_status, parse_json, reduction_pct, split_args,
-    validate_bench_url,
+    JsonValue, Outcome, approx_tokens, bench_exit_code, expand_args, json_escape, median,
+    parse_http_request_line, parse_http_status, parse_json, reduction_pct, safe_join_fixture_path,
+    split_args, validate_local_bench_url,
 };
 // `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
 // 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
@@ -63,30 +78,27 @@ use support::parse_ps_rss_kb;
 const DEFAULT_TRIALS: usize = 5;
 const MAX_TRIALS: usize = 20;
 
-/// `COMPETITOR_BENCH_SITES`（外部入力）に許す上限。分割・確保の前に検証し、
-/// 巨大な値や大量 URL によるメモリ・実行時間の無制限消費を防ぐ
-/// （coding-rust.md「長さ・件数を上限検証してからアロケーションに使う」）。
-const MAX_SITES_ENV_BYTES: usize = 8 * 1024;
-const MAX_SITES: usize = 20;
-
 /// `<PREFIX>_SERVE_ARGS` / `<PREFIX>_MCP_ARGS`（外部入力）に許す上限。
-/// `COMPETITOR_BENCH_SITES` と対称に、`split_args` へ渡す前にバイト数・
-/// 分割後の引数個数を検証し、巨大な環境変数によるメモリ過剰消費を防ぐ
-/// （レビュー指摘 P1: line 140。coding-rust.md「長さ・件数を上限検証」）。
+/// `split_args` へ渡す前にバイト数・分割後の引数個数を検証し、巨大な
+/// 環境変数によるメモリ過剰消費を防ぐ（レビュー指摘 P1: line 140。
+/// coding-rust.md「長さ・件数を上限検証」）。
 const MAX_ARGS_ENV_BYTES: usize = 4 * 1024;
 const MAX_ARGS_COUNT: usize = 64;
 
-/// `COMPETITOR_BENCH_SITES` 未設定時の既定サイト群。PoC-13
-/// （`docs/spec/03-poc/browser-landscape-2026/scripts/mcp_snapshot.mjs`）の
-/// `sites` と同じ 5 サイトにし、既定実行時の `tokenReductionPct` が
-/// 代表サイト群の中央値になるようにする（AISNAP-1）。
-const DEFAULT_SITES: [&str; 5] = [
-    "https://example.com",
-    "https://en.wikipedia.org/wiki/Rust_(programming_language)",
-    "https://news.ycombinator.com",
-    "https://the-internet.herokuapp.com/login",
-    "https://react.dev",
-];
+/// fixture 配信サーバーの各種上限（coding-rust.md「長さ・件数を上限検証」）。
+/// ローカル専用のベンチ補助サーバーだが、想定外の大量・低速接続で
+/// スレッドが専有され続けないよう防御的に上限を設ける
+/// （security.md「不安全な設計」）。リクエスト行・ヘッダ行のサイズ上限は
+/// 既存の `MAX_LINE_BYTES`（`read_line_bounded` が使う）を共用する。
+const FIXTURE_MAX_FILE_BYTES: u64 = 1024 * 1024;
+const FIXTURE_MAX_CONNECTIONS: u64 = 10_000;
+/// 読み捨てるヘッダ行の総数上限。無制限だと大量のヘッダ行を送るクライアント
+/// がサーバースレッドを専有し続け得る（advisor 指摘。coding-rust.md
+/// 「長さ・件数を上限検証」）。実ブラウザが送る一般的なヘッダ数は数十件に
+/// 収まるため、大きめに倍取って `64` とする。
+const FIXTURE_MAX_HEADER_LINES: u32 = 64;
+const FIXTURE_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const FIXTURE_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// readiness probe・MCP 呼び出しそれぞれの外部入力（応答行）に許す最大長。
 /// 相手プロセスが不正・悪意ある出力を送り続けても無制限にバッファへ
@@ -109,7 +121,7 @@ struct Target {
 }
 
 /// `<PREFIX>_SERVE_ARGS` / `<PREFIX>_MCP_ARGS` を読み取り、上限検証してから
-/// `split_args` へ渡す（外部入力。`COMPETITOR_BENCH_SITES` の検証と対称）。
+/// `split_args` へ渡す（外部入力。coding-rust.md「長さ・件数を上限検証」）。
 fn args_from_env(env_prefix: &str, var_suffix: &str, default: &str) -> Result<Vec<String>, String> {
     match std::env::var(format!("{env_prefix}_{var_suffix}")) {
         Ok(raw) => {
@@ -168,24 +180,200 @@ fn trial_count() -> usize {
         .unwrap_or(DEFAULT_TRIALS)
 }
 
-/// `validate_bench_url` がドメイン名（`Ok(Some(host))`）を返した場合に、
-/// 実際に DNS 解決してすべての解決先が公開アドレスであることを確認する。
+/// `competitor_lightpanda/fixtures/` を配信するローカル静的サーバー。
 ///
-/// レビュー指摘 P0・Medium（PR #442）: `validate_bench_url` は IP リテラル
-/// 表記の正規化・拒否のみを行う純粋関数（support.rs。ソケット通信を持たない
-/// 設計方針）であるため、ドメイン名は呼び出し元がこの関数で DNS 解決した
-/// 結果を検証する。`(host, 80)` はポート番号を必要としない
-/// `ToSocketAddrs` 呼び出し用のダミー値（実際の接続はしない）。解決失敗も
-/// 拒否として扱う（fail-closed。coding-rust.md）。リダイレクト先のホストは
-/// この検証を経ないため、依然として TOCTOU が残る（`validate_bench_url` の
-/// ドキュメント参照。best-effort のゲート）。
-fn resolve_and_check_host(host: &str) -> Result<(), String> {
-    let addrs: Vec<IpAddr> = (host, 80u16)
-        .to_socket_addrs()
-        .map_err(|e| format!("DNS resolution failed: {e}"))?
-        .map(|addr| addr.ip())
-        .collect();
-    check_resolved_addrs(&addrs)
+/// レビュー指摘 P0（Codex。PR #442 再レビュー・competitor_lightpanda.rs:729/783）:
+/// 事前の URL 検証をいくら積み増しても、計測対象ブラウザが実際に接続する
+/// 宛先（名前再解決・リダイレクト追従込み）は保証できない。この問題は
+/// 「ベンチが外部ネットワークへ一切出ない構成にする」ことでのみ解消できる
+/// ため、`127.0.0.1` の空きポートへ bind した最小限の HTTP/1.1 静的サーバーを
+/// 自前で立て、fixture ディレクトリ配下のファイルだけを返す（Lightpanda 本家
+/// のベンチがローカルで配信するデモサイトを対象にするのと同じ構成）。
+///
+/// 接続受付はバックグラウンドスレッドで行い、`Drop` で `stop` フラグを立てて
+/// スレッドの終了を待つ（プロセス終了時にリスナーを残さない）。
+struct FixtureServer {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FixtureServer {
+    /// サーバーを起動する。`root` 配下のファイルだけを配信する。
+    fn start(root: PathBuf) -> Result<Self, String> {
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind failed: {e}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| format!("local_addr failed: {e}"))?
+            .port();
+        // accept をノンブロッキングにし、`stop` を定期的に確認することで
+        // `Drop` 時にスレッドを即座に終了させる（listener を閉じるまで
+        // `accept` がブロックし続ける方式は使わない）。
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("set_nonblocking failed: {e}"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            fixture_accept_loop(listener, root, stop_for_thread);
+        });
+        Ok(Self {
+            port,
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    /// このサーバーの `http://127.0.0.1:<port>/` 形式のベース URL。
+    fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+impl Drop for FixtureServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// [`FixtureServer::start`] が生成する accept ループ本体。
+///
+/// `stop` が立つまで `listener.accept()` をポーリングし、接続ごとに
+/// [`handle_fixture_connection`] を同期的に処理する（ベンチ自身が唯一の
+/// クライアントであるためシングルスレッドで十分。並行処理はしない）。
+fn fixture_accept_loop(listener: TcpListener, root: PathBuf, stop: Arc<AtomicBool>) {
+    let mut served: u64 = 0;
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                served += 1;
+                // レビュー指摘（コーディネーター指示）: 接続数に上限を設け、
+                // 想定外の大量接続でサーバーが無制限に処理し続けないようにする。
+                if served > FIXTURE_MAX_CONNECTIONS {
+                    break;
+                }
+                handle_fixture_connection(stream, &root);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(FIXTURE_ACCEPT_POLL_INTERVAL);
+            }
+            // listener 自体のエラー（fd 枯渇等）はループを止める。`stop` の
+            // 検知漏れでプロセスが終了できなくなることを避ける。
+            Err(_) => break,
+        }
+    }
+}
+
+/// fixture サーバーへの 1 接続を処理する。
+///
+/// リクエスト行のみを読み取り（ヘッダ・ボディは無視。fixture 配信に不要）、
+/// [`safe_join_fixture_path`] でパストラバーサルを拒否してから
+/// `root` 配下のファイルを読み、`200`（成功）・`404`（未検出/検証エラー）・
+/// `400`（リクエスト行が不正）のいずれかを返す。読み書きに
+/// `FIXTURE_IO_TIMEOUT` を設定し、低速・応答なしクライアントでスレッドが
+/// 無期限にブロックしないようにする（coding-rust.md「不安全な設計」）。
+fn handle_fixture_connection(mut stream: TcpStream, root: &Path) {
+    // レビュー指摘（advisor。PR #442 再レビュー後の追加指摘）: macOS（XNU）・
+    // Windows（Winsock）では accept したソケットが listener のノンブロッキング
+    // 状態を継承する（Linux の accept4 は継承しない）。継承されたままだと
+    // 後続の `read_line_bounded` の最初の `read` が即座に `WouldBlock` を
+    // 返し、リクエスト到着前に 400 を返してしまう。ブロッキングへ明示的に
+    // 戻すことで 3 OS で同じ挙動にする（coding-rust.md「クロスプラットフォーム」）。
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(FIXTURE_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(FIXTURE_IO_TIMEOUT));
+
+    let mut reader = BufReader::new(match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    });
+    let mut line = String::new();
+    if read_line_bounded(&mut reader, &mut line).is_err() {
+        let _ = write_fixture_response(&mut stream, 400, "Bad Request", b"");
+        return;
+    }
+
+    let Some((method, path)) = parse_http_request_line(&line) else {
+        let _ = write_fixture_response(&mut stream, 400, "Bad Request", b"");
+        return;
+    };
+    if method != "GET" {
+        let _ = write_fixture_response(&mut stream, 400, "Bad Request", b"");
+        return;
+    }
+
+    // ヘッダ行は使わないが、クライアント（計測対象ブラウザ）が送り終える前に
+    // 接続を切ると `RST` になり得るため、`Connection: close` 前提で読み捨てる
+    // （1 行あたりは `read_line_bounded` の `MAX_LINE_BYTES` で上限済み）。
+    // レビュー指摘（advisor。PR #442 再レビュー後の追加指摘）: 行数自体には
+    // 上限がなく、ヘッダ行を送り続けるクライアントがサーバースレッドを
+    // 無期限に専有し得た。`FIXTURE_MAX_HEADER_LINES` で総行数にも上限を
+    // 設け、超過時は 400 を返して打ち切る（coding-rust.md「長さ・件数を
+    // 上限検証」）。終端判定は `\r\n`（CRLF）だけでなく裸の `\n`（LF のみ）も
+    // 空行として扱う（一部クライアントは LF のみを送るため。LF のみを
+    // 見逃すと `\r\n` を待ち続けて `FIXTURE_IO_TIMEOUT` 分停止していた）。
+    let mut header_lines_seen = 0u32;
+    loop {
+        if header_lines_seen >= FIXTURE_MAX_HEADER_LINES {
+            let _ = write_fixture_response(&mut stream, 400, "Bad Request", b"");
+            return;
+        }
+        header_lines_seen += 1;
+        let mut header_line = String::new();
+        match read_line_bounded(&mut reader, &mut header_line) {
+            Ok(0) => break,
+            Ok(_) if header_line == "\r\n" || header_line == "\n" || header_line.is_empty() => {
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+
+    let file_path = match safe_join_fixture_path(root, &path) {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = write_fixture_response(&mut stream, 404, "Not Found", b"");
+            return;
+        }
+    };
+    let is_readable_fixture = matches!(
+        std::fs::metadata(&file_path),
+        Ok(m) if m.is_file() && m.len() <= FIXTURE_MAX_FILE_BYTES
+    );
+    if !is_readable_fixture {
+        let _ = write_fixture_response(&mut stream, 404, "Not Found", b"");
+        return;
+    }
+    // メタデータの時点で `FIXTURE_MAX_FILE_BYTES` 以下であることを確認済み
+    // だが、読み込み自体に失敗した場合（並行削除等）も 404 として扱う。
+    let body = match std::fs::read(&file_path) {
+        Ok(b) => b,
+        Err(_) => {
+            let _ = write_fixture_response(&mut stream, 404, "Not Found", b"");
+            return;
+        }
+    };
+    let _ = write_fixture_response(&mut stream, 200, "OK", &body);
+}
+
+/// `handle_fixture_connection` が使う最小限の HTTP/1.1 レスポンス書き込み。
+fn write_fixture_response(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
 }
 
 /// 子プロセスを確実に終了させる guard。早期 `return`（`?`）経路でも
@@ -680,63 +868,29 @@ fn extract_text(value: &JsonValue) -> Option<String> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// AISNAP-1: 代表サイト群で `goto` → `html` / `tree` を呼び、近似トークン数の
-/// 削減率を求める。PoC-13 と同じ 5 サイトを既定にし、`COMPETITOR_BENCH_SITES`
-/// （カンマ区切り URL）で上書き可能にする。
-fn measure_token_reduction(target: &Target) -> Outcome {
+/// AISNAP-1: `FIXTURE_PAGES`（ベンチが起動したローカル fixture サーバーが
+/// 配信する自作ページ）へ `goto` → `html` / `tree` を呼び、近似トークン数の
+/// 削減率を求める。`fixture_base_url`・`fixture_port` は呼び出し元
+/// （`main`）が起動した [`FixtureServer`] のもの（モジュールドキュメント
+/// 参照。PR #442 再レビューで外部 URL の指定経路を廃止した）。
+fn measure_token_reduction(target: &Target, fixture_base_url: &str, fixture_port: u16) -> Outcome {
     let Some(bin) = &target.bin else {
         return Outcome::Skipped(format!("{}: binary path not configured", target.name));
     };
     if let Some(reason) = &target.args_error {
         return Outcome::Error(format!("{}: {reason}", target.name));
     }
-    let sites: Vec<String> = match std::env::var("COMPETITOR_BENCH_SITES") {
-        Ok(raw) => {
-            // 分割・確保の前にバイト数を検証する（外部入力。P0 レビュー指摘:
-            // 上限検証なしに split・収集すると巨大な値でメモリ・実行時間を
-            // 無制限に消費し得る）。
-            if raw.len() > MAX_SITES_ENV_BYTES {
-                return Outcome::Error(format!(
-                    "{}: COMPETITOR_BENCH_SITES exceeds {MAX_SITES_ENV_BYTES} bytes",
-                    target.name
-                ));
-            }
-            let parsed: Vec<String> = raw
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if parsed.len() > MAX_SITES {
-                return Outcome::Error(format!(
-                    "{}: COMPETITOR_BENCH_SITES has more than {MAX_SITES} sites",
-                    target.name
-                ));
-            }
-            if parsed.is_empty() {
-                DEFAULT_SITES.iter().map(|s| s.to_string()).collect()
-            } else {
-                parsed
-            }
-        }
-        Err(_) => DEFAULT_SITES.iter().map(|s| s.to_string()).collect(),
-    };
-    // レビュー指摘 P0: `file:` scheme・内部アドレスの無検証な `goto` を防ぐ
-    // （security.md「SSRF」）。既定サイト群も含め、渡す前に必ず検証する。
-    // レビュー指摘 P0・Medium（PR #442）: `validate_bench_url` は IP
-    // リテラルの正規化・拒否のみを行う純粋関数のため、ドメイン名の URL は
-    // ここで実際に DNS 解決し、解決先すべてが公開アドレスであることを
-    // `check_resolved_addrs` で確認する（best-effort。関数ドキュメント参照）。
+    let sites: Vec<String> = support::FIXTURE_PAGES
+        .iter()
+        .map(|page| format!("{fixture_base_url}{page}"))
+        .collect();
+    // レビュー指摘 P0（Codex。PR #442 再レビュー）: 生成した URL が本当に
+    // このベンチが起動した fixture サーバー（127.0.0.1・起動したポート）
+    // だけを指すことを最後にもう一度確認する（モジュールドキュメント参照。
+    // ここで拒否されるのは実装バグの場合のみで、通常経路では常に成功する）。
     for url in &sites {
-        match validate_bench_url(url) {
-            Ok(None) => {}
-            Ok(Some(host)) => {
-                if let Err(reason) = resolve_and_check_host(&host) {
-                    return Outcome::Error(format!("{}: {url}: {reason}", target.name));
-                }
-            }
-            Err(reason) => {
-                return Outcome::Error(format!("{}: {reason}", target.name));
-            }
+        if let Err(reason) = validate_local_bench_url(url, fixture_port) {
+            return Outcome::Error(format!("{}: {reason}", target.name));
         }
     }
 
@@ -863,6 +1017,24 @@ fn main() -> std::process::ExitCode {
         ),
     ];
 
+    // レビュー指摘 P0（Codex。PR #442 再レビュー）: `AISNAP-1` 計測は外部
+    // URL を一切使わず、ここで起動するローカル fixture サーバーだけを
+    // 対象にする（モジュールドキュメント参照）。両方の `target` で
+    // 同じサーバーを共有し、`main` を抜けるときに `Drop` で停止する。
+    // どちらの対象バイナリも未設定（`bin` が `None`）のときは
+    // `measure_token_reduction` が最初の分岐で必ず `Outcome::Skipped` を
+    // 返しサーバーを使わないため、起動自体を省く（advisor 指摘: 起動を
+    // 無条件にすると、サンドボックス等で `bind` が失敗した場合に
+    // 「対象未設定で Skipped のみ→終了コード 0」の契約が崩れ、実際には
+    // 使わないはずのサーバー起動失敗で `Outcome::Error`（終了コード 1）に
+    // なってしまう）。
+    let any_target_configured = targets.iter().any(|t| t.bin.is_some());
+    let fixture_server = if any_target_configured {
+        Some(FixtureServer::start(support::fixtures_root()))
+    } else {
+        None
+    };
+
     let mut body = String::from("{\n");
     // レビュー指摘 P1（Codex。PR #442・competitor_lightpanda.rs:893）:
     // 全計測項目の `Outcome` をここへ集め、`bench_exit_code` へ一括で渡す
@@ -880,7 +1052,17 @@ fn main() -> std::process::ExitCode {
         );
         let idle_rss = measure_idle_rss(target, trials);
         eprintln!("idle RSS (KB, median of {trials}): {}", idle_rss.to_json());
-        let token_reduction = measure_token_reduction(target);
+        let token_reduction = match &fixture_server {
+            Some(Ok(server)) => measure_token_reduction(target, &server.base_url(), server.port),
+            Some(Err(e)) => Outcome::Error(format!(
+                "{}: fixture server failed to start: {e}",
+                target.name
+            )),
+            // `any_target_configured` が `false`（= 全対象が未設定）の
+            // ときだけこの分岐に来る。`measure_token_reduction` 自身の
+            // 「バイナリ未設定 → Skipped」分岐と同じ理由付けにする。
+            None => Outcome::Skipped(format!("{}: binary path not configured", target.name)),
+        };
         eprintln!("token reduction (%): {}", token_reduction.to_json());
 
         body.push_str(&format!(

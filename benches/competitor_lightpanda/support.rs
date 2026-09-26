@@ -11,15 +11,29 @@
 //! としてもコンパイルされるため、`#[cfg(test)]` 外の関数もすべて `cfg(test)` の
 //! テストから到達させる必要がある（到達しない関数・フィールドは dead_code エラーに
 //! なる。unused であっても `pub` は免除されない）。
+//!
+//! `AISNAP-1`（MCP トークン削減率）計測は、任意の外部 URL
+//! （`COMPETITOR_BENCH_SITES`）ではなく、リポジトリに同梱した静的 fixture
+//! （`fixtures/` 配下。外部参照を含まない自作コンテンツ）だけを対象にする
+//! （PR #442 再レビュー。Codex P0: 計測対象ブラウザは接続時に名前を
+//! 再解決し、公開 URL からのリダイレクトにも追従し得るため、事前の URL
+//! 検証をいくら積み増しても実際の接続先を保証できない）。fixture は
+//! `competitor_lightpanda.rs` が起動するローカル静的サーバー
+//! （`127.0.0.1` の空きポート）から配信し、`goto` する URL がそのサーバー
+//! だけを指すことを [`validate_local_bench_url`] で確認する。これにより
+//! ベンチが外部ネットワークへ一切出ない構成になり、SSRF 経路を構造的に
+//! なくすと同時に、外部サイトの可用性・変化に左右されない再現可能な
+//! 計測になる（security.md「SSRF」）。
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 
 // `reqwest`（`fandhe-browser-core` の既存依存。ホストする crate の
 // `Cargo.toml` 参照）は `url::Url` を `reqwest::Url` として re-export している。
 // 新規依存を追加せず（dependency-policy.md）、既存の推移依存から WHATWG URL
 // 準拠のパーサーを使うため、ここでは `reqwest::Url` を経由して取り込む
-// （レビュー指摘 P0/Medium。PR #442）。
+// （レビュー指摘 P0/Medium。PR #442。再レビューでローカル URL 検証
+// （`validate_local_bench_url`）へ用途を変更した）。
 use reqwest::Url;
 
 /// 複数回試行した計測値（ミリ秒・キロバイト等）から中央値を求める。
@@ -214,147 +228,118 @@ pub fn json_escape(input: &str) -> String {
     out
 }
 
-/// IPv4 アドレスが一般公開向けの到達性を持たない特殊用途アドレスかを判定する
-/// （security.md「SSRF」）。
+/// `goto` へ渡す URL がベンチ自身の起動したローカル fixture サーバー
+/// （127.0.0.1・固定ポートではなく起動時に確保したポート）だけを指すことを
+/// 検証する。
 ///
-/// `fandhe-browser-core::fetch` の `is_disallowed_ipv4`（CORE-1・#36・PR #430
-/// レビュー指摘）と同じ規則を適用する。同関数は `fandhe-browser-core` 内部
-/// 限定（`pub` ではない）で bench クレートから再利用できないため、判定規則を
-/// ここに複製する（規則の変更が必要になった場合は両箇所を揃えて更新する）。
-/// `std::net::Ipv4Addr` の安定 API だけでは共有アドレス空間
-/// （`100.64.0.0/10`）等の IANA 特殊用途ブロックが抜け落ちるため、既知ブロックを
-/// 明示的に列挙する。
-fn is_disallowed_ipv4(v4: Ipv4Addr) -> bool {
-    let octets = v4.octets();
-    v4.is_loopback() // 127.0.0.0/8
-        || v4.is_private() // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-        || v4.is_link_local() // 169.254.0.0/16
-        || v4.is_unspecified() // 0.0.0.0
-        || v4.is_broadcast() // 255.255.255.255
-        || v4.is_documentation() // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
-        || octets[0] == 0 // 0.0.0.0/8 ("this network")
-        || (octets[0] == 100 && (64..=127).contains(&octets[1])) // 100.64.0.0/10 共有アドレス空間（CGN）
-        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // 192.0.0.0/24 IETF Protocol Assignments
-        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99) // 192.88.99.0/24 6to4 Relay Anycast
-        || (octets[0] == 198 && (18..=19).contains(&octets[1])) // 198.18.0.0/15 ベンチマーク用
-        || octets[0] >= 224 // 224.0.0.0/4 マルチキャスト + 240.0.0.0/4 予約済み
-}
-
-/// IPv6 アドレスが非推奨のサイトローカルブロック `fec0::/10` に属するかを
-/// 判定する（`fandhe-browser-core::fetch::is_ipv6_site_local` と同じ規則）。
-fn is_ipv6_site_local(v6: Ipv6Addr) -> bool {
-    (v6.segments()[0] & 0xffc0) == 0xfec0
-}
-
-/// [`IpAddr`] が内部・特殊用途アドレスかを判定する。
-///
-/// `fandhe-browser-core::fetch::is_disallowed_address` の規則（IPv4 側の
-/// 判定・IPv6 の ULA・リンクローカル・非推奨サイトローカル・v4-mapped
-/// 埋め込みアドレスの展開）に加え、次の点を拡張する（レビュー指摘 Medium。
-/// PR #442）:
-/// - `Ipv6Addr::to_ipv4`（core 側は `to_ipv4_mapped` のみ）を使い、
-///   `::ffff:a.b.c.d`（v4-mapped）だけでなく `::a.b.c.d`（v4-compatible。
-///   非推奨だがパーサーが受理し得る）も展開する。`[::ffff:127.0.0.1]` の
-///   ような表記で v4 側の分類をすり抜けられない。
-/// - `v6.is_multicast()` を追加する（core 側にはこの判定がなく、IPv6
-///   マルチキャストが素通りし得る。core 側への同様の追加はスコープ外の
-///   発見事項として別途報告する）。
-fn is_disallowed_address(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_disallowed_ipv4(v4),
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || v6.is_unique_local() // ULA（fc00::/7）
-                || v6.is_unicast_link_local() // リンクローカル（fe80::/10）
-                || is_ipv6_site_local(v6)
-                || v6.to_ipv4().is_some_and(is_disallowed_ipv4)
-        }
-    }
-}
-
-/// `COMPETITOR_BENCH_SITES`（外部入力）の各 URL を `goto` へ渡す前に検証する。
-///
-/// レビュー指摘 P0（SSRF。security.md「OWASP Top 10」）: scheme・件数・長さの
-/// 検証がないまま MCP の `goto` ツールへ URL を渡すと、`file:` scheme や
-/// ループバック・プライベート・リンクローカル等の内部アドレスへ計測対象
-/// ブラウザ経由で意図せずアクセスする経路になる。
-///
-/// レビュー指摘 P0・Medium（PR #442）: 独自の素朴な文字列分割でホストを
-/// 取り出していた旧実装は、`http://127.1/`・`http://2130706433/` のような
-/// ブラウザが IPv4 として解釈する数値表記や `[::ffff:127.0.0.1]` のような
-/// IPv4-mapped IPv6 表記を素通りさせていた。ここでは `reqwest::Url`
-/// （新規依存ではなく既存の推移依存を再利用。dependency-policy.md）で
-/// WHATWG URL 標準に沿ってホストを正規化してから判定することで、計測対象
-/// ブラウザ（Chromium 系）が実際に解釈するホストと同じ結果を得る。
-///
-/// ホストが IP リテラルに正規化された場合は上記の内部・特殊用途アドレス
-/// 判定をこの関数内で適用し、`Ok(None)` を返す。ホストがドメイン名の場合は
-/// ここでは DNS を解決せず、正規化済みホスト名を `Ok(Some(host))` で返す
-/// （純粋関数として保つため。呼び出し元がソケット通信を伴う DNS 解決を行い、
-/// 結果を [`check_resolved_addrs`] で検証する契約とする）。
-///
-/// 呼び出し元が解決結果を検証しない限り、ドメイン名の URL は内部アドレス
-/// へ解決され得る点は残る（リダイレクト追従時も同様。TOCTOU）。実際の
-/// 名前解決・リダイレクト追従は計測対象ブラウザ（Lightpanda 等）の実装に
-/// 委ねられ、この 2 関数の組み合わせはベンチスクリプト自身が明らかに
-/// 内部向け・非 HTTP(S) の URL を渡さないことを保証する best-effort の
-/// ゲートである。
-pub fn validate_bench_url(url: &str) -> Result<Option<String>, String> {
+/// レビュー指摘 P0（Codex。PR #442 再レビュー・competitor_lightpanda.rs:729/783）:
+/// 計測対象ブラウザは接続時に名前を再解決でき、また `goto` 先が公開 URL
+/// でもそこからのリダイレクトに追従し得るため、事前検証（DNS 解決結果の
+/// チェックを含む）を積み増しても「ブラウザが実際に接続する宛先」を
+/// 保証できない（TOCTOU）。この問題は「検証を強化する」のではなく
+/// 「外部ネットワークに一切出ない構成にする」ことでしか解消できないため、
+/// `COMPETITOR_BENCH_SITES` による任意外部 URL の指定を廃止し、ベンチが
+/// 自ら起動したローカル静的サーバー（`competitor_lightpanda.rs` の
+/// `FixtureServer`）が配信する fixture ページだけを `goto` する設計へ
+/// 変更した。この関数はその最後の防波堤として、生成した URL が本当に
+/// `http://127.0.0.1:<起動したポート>/...` の形であることを確認する
+/// （scheme が `http`・ホストが `127.0.0.1`・ポートが一致することを要求する）。
+pub fn validate_local_bench_url(url: &str, expected_port: u16) -> Result<(), String> {
     let parsed = Url::parse(url).map_err(|err| format!("{url}: invalid URL ({err})"))?;
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return Err(format!("{url}: only http/https URLs are allowed"));
+    if parsed.scheme() != "http" {
+        return Err(format!("{url}: only http is allowed for local fixtures"));
     }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| format!("{url}: missing host"))?;
-    // IPv6 リテラルは `[...]` 付きで返る（`Url::host_str` の仕様）ため、
-    // IP パース前に括弧を取り除く。
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    if host.is_empty() {
-        return Err(format!("{url}: missing host"));
+    match parsed.host_str() {
+        Some("127.0.0.1") => {}
+        _ => return Err(format!("{url}: host must be 127.0.0.1")),
     }
-    if host.eq_ignore_ascii_case("localhost") {
-        return Err(format!("{url}: internal host is not allowed"));
-    }
-    // ホストが IP リテラルに正規化されていれば、内部・特殊用途アドレスかを
-    // ここで検証し切る（呼び出し元へ DNS 解決を要求しない）。
-    match host.parse::<IpAddr>() {
-        Ok(ip) => {
-            if is_disallowed_address(ip) {
-                return Err(format!("{url}: internal/reserved address is not allowed"));
-            }
-            Ok(None)
+    match parsed.port() {
+        Some(port) if port == expected_port => {}
+        _ => {
+            return Err(format!(
+                "{url}: port must match the fixture server port ({expected_port})"
+            ));
         }
-        // ドメイン名。呼び出し元が DNS 解決した結果を
-        // `check_resolved_addrs` で検証する契約（関数ドキュメント参照）。
-        Err(_) => Ok(Some(host.to_string())),
-    }
-}
-
-/// ドメイン名を DNS 解決した結果（[`validate_bench_url`] が `Ok(Some(host))`
-/// を返した場合の後続処理）が公開アドレスのみから成ることを確認する。
-///
-/// レビュー指摘 P0・Medium（PR #442）: `validate_bench_url` は IP リテラルの
-/// 正規化・拒否は行うが、ドメイン名（DNS 名）はここでは解決しないため、
-/// `goto` へ渡す前に呼び出し元が実際に解決したアドレスも検証する必要がある。
-/// 解決先が 1 件もない、またはいずれか 1 件でも内部・特殊用途アドレスなら
-/// 拒否する（fail-closed。coding-rust.md）。ソケット通信を伴う DNS 解決
-/// 自体は呼び出し元（`competitor_lightpanda.rs`）が行い、この関数は解決済み
-/// アドレス列の判定のみを行う純粋関数に留める（このファイルの設計方針。
-/// モジュールドキュメント参照）。
-pub fn check_resolved_addrs(addrs: &[IpAddr]) -> Result<(), String> {
-    if addrs.is_empty() {
-        return Err("DNS resolution returned no addresses".to_string());
-    }
-    if let Some(addr) = addrs.iter().find(|ip| is_disallowed_address(**ip)) {
-        return Err(format!("resolved to internal/reserved address: {addr}"));
     }
     Ok(())
+}
+
+/// `AISNAP-1`（MCP トークン削減率）計測が `goto` する fixture ページ
+/// （[`fixtures_root`] 配下・`competitor_lightpanda.rs` の `FixtureServer` が
+/// 配信する）。外部 URL ではなく自作の静的 HTML（`fixtures/`。外部参照なし）
+/// にすることで、ベンチが外部ネットワークへ一切出ない構成にする（PR #442
+/// 再レビュー。Codex P0。モジュールドキュメント参照）。fixture を
+/// 追加・削除した場合は [`fixtures_contain_no_external_references`] と
+/// [`fixture_pages_resolve_to_existing_files`] の一覧にも反映すること。
+pub const FIXTURE_PAGES: [&str; 3] = ["/article.html", "/listing.html", "/form.html"];
+
+/// fixture ディレクトリの絶対パス。
+///
+/// `env!("CARGO_MANIFEST_DIR")`（このファイル・`competitor_lightpanda.rs` を
+/// コンパイルする crate、暫定ホストの `fandhe-browser-core` のマニフェスト
+/// ディレクトリ）からの相対パスとしてコンパイル時に埋め込む。実行時の
+/// カレントディレクトリに依存しないため、`cargo bench`/`cargo test` を
+/// どのディレクトリから実行しても・CI のどの作業ディレクトリでも解決できる
+/// （`crates/fandhe-browser-core/Cargo.toml` の `[[bench]]`/`[[test]]` の
+/// `path = "../../benches/..."` と同じ相対関係）。
+pub fn fixtures_root() -> PathBuf {
+    PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benches/competitor_lightpanda/fixtures"
+    ))
+}
+
+/// HTTP リクエストの先頭行（例: `GET /article.html HTTP/1.1`）から
+/// メソッドとパスを取り出す。
+///
+/// fixture 配信サーバー（`competitor_lightpanda.rs` の
+/// `handle_fixture_connection`）が使う。書式に合わない行は `None` にし、
+/// 呼び出し側が 400 相当のエラー応答を返せるようにする（panic させない。
+/// coding-rust.md）。
+pub fn parse_http_request_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim_end_matches(['\r', '\n']);
+    let mut parts = trimmed.split_whitespace();
+    let method = parts.next()?;
+    let path = parts.next()?;
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") {
+        return None;
+    }
+    Some((method.to_string(), path.to_string()))
+}
+
+/// リクエストパスを fixture ルート配下の実ファイルパスへ安全に変換する。
+///
+/// レビュー指摘 P0（Codex。PR #442 再レビュー）: fixture 配信サーバーは
+/// `..` や絶対パス指定によるパストラバーサルを拒否し、fixture ディレクトリ
+/// 配下のファイルだけを返す契約にする（security.md「不安全な設計」）。
+/// クエリ文字列・フラグメントは呼び出し側で既に取り除かれている前提
+/// （`parse_http_request_line` が返す `path` はそのまま渡ってくるため、
+/// この関数自身は末尾の `?...` を追加で切り落とす）。パス要素が
+/// `Normal`（通常のファイル名・ディレクトリ名）以外（`..`・ルート・
+/// prefix 等）を含む場合は拒否する。ファイルの存在確認はここでは行わない
+/// （純粋関数として保つ。存在確認・読み込みは呼び出し側の I/O 責務）。
+pub fn safe_join_fixture_path(root: &Path, request_path: &str) -> Result<PathBuf, String> {
+    let without_query = request_path.split(['?', '#']).next().unwrap_or("");
+    let trimmed = without_query.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Err("empty request path".to_string());
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return Err(format!("{request_path}: absolute paths are not allowed"));
+    }
+    for component in candidate.components() {
+        match component {
+            std::path::Component::Normal(_) => {}
+            other => {
+                return Err(format!(
+                    "{request_path}: disallowed path component {other:?}"
+                ));
+            }
+        }
+    }
+    Ok(root.join(candidate))
 }
 
 /// 手書き最小 JSON パーサーが返す値。
@@ -998,120 +983,155 @@ mod tests {
         assert!(parse_json("1.").is_err());
     }
 
-    // レビュー指摘 P0（SSRF）: `validate_bench_url` が http(s) 以外の scheme・
-    // 内部アドレスを拒否することを確認する。
+    // レビュー指摘 P0（Codex。PR #442 再レビュー）: `validate_local_bench_url`
+    // が 127.0.0.1・指定ポートの http URL のみを許可し、それ以外
+    // （別ホスト・別ポート・https・file 等）を拒否することを確認する。
     #[test]
-    fn validate_bench_url_accepts_public_https() {
-        assert!(validate_bench_url("https://example.com").is_ok());
-        assert!(validate_bench_url("http://example.com/path?q=1#frag").is_ok());
+    fn validate_local_bench_url_accepts_matching_local_url() {
+        assert!(validate_local_bench_url("http://127.0.0.1:9400/article.html", 9400).is_ok());
     }
 
     #[test]
-    fn validate_bench_url_rejects_non_http_scheme() {
-        assert!(validate_bench_url("file:///etc/passwd").is_err());
-        assert!(validate_bench_url("ftp://example.com").is_err());
-        assert!(validate_bench_url("javascript:alert(1)").is_err());
+    fn validate_local_bench_url_rejects_non_http_scheme() {
+        assert!(validate_local_bench_url("https://127.0.0.1:9400/", 9400).is_err());
+        assert!(validate_local_bench_url("file:///etc/passwd", 9400).is_err());
     }
 
     #[test]
-    fn validate_bench_url_rejects_localhost_and_loopback() {
-        assert!(validate_bench_url("http://localhost/").is_err());
-        assert!(validate_bench_url("http://127.0.0.1/").is_err());
-        assert!(validate_bench_url("http://[::1]/").is_err());
+    fn validate_local_bench_url_rejects_other_host() {
+        assert!(validate_local_bench_url("http://example.com:9400/", 9400).is_err());
+        assert!(validate_local_bench_url("http://localhost:9400/", 9400).is_err());
+        assert!(validate_local_bench_url("http://0.0.0.0:9400/", 9400).is_err());
+    }
+
+    // `reqwest::Url`（WHATWG URL 準拠）は `127.1`・`2130706433` のような
+    // IPv4 の別表記を正規化して "127.0.0.1" にする。この関数は正規化後の
+    // 文字列を見るため、これらの表記も結局は許可対象のホストと同じ
+    // アドレスとして受理される（別表記を使っても迂回にはならない。
+    // `goto` 先が変わるわけではないため安全側）。
+    #[test]
+    fn validate_local_bench_url_accepts_ipv4_alt_forms_that_normalize_to_loopback() {
+        assert!(validate_local_bench_url("http://127.1:9400/", 9400).is_ok());
+        assert!(validate_local_bench_url("http://2130706433:9400/", 9400).is_ok());
     }
 
     #[test]
-    fn validate_bench_url_rejects_private_and_link_local() {
-        assert!(validate_bench_url("http://10.0.0.1/").is_err());
-        assert!(validate_bench_url("http://192.168.1.1/").is_err());
-        assert!(validate_bench_url("http://169.254.1.1/").is_err());
-        assert!(validate_bench_url("http://[fe80::1]/").is_err());
-        assert!(validate_bench_url("http://[fc00::1]/").is_err());
+    fn validate_local_bench_url_rejects_mismatched_port() {
+        assert!(validate_local_bench_url("http://127.0.0.1:9401/", 9400).is_err());
+        // ポート省略（80 番）は起動したポートと一致しない限り拒否される。
+        assert!(validate_local_bench_url("http://127.0.0.1/", 9400).is_err());
     }
 
+    // fixture 配信サーバー（competitor_lightpanda.rs の
+    // handle_fixture_connection）が使うリクエスト行パーサー。
     #[test]
-    fn validate_bench_url_rejects_unspecified_and_missing_host() {
-        assert!(validate_bench_url("http://0.0.0.0/").is_err());
-        // `Url::parse` は WHATWG の「特殊 authority スラッシュ」規則により
-        // 余分な `/` を読み飛ばすため（ブラウザの実際の解釈）、
-        // `http:///no-host` は host が空ではなく `no-host` というドメイン名に
-        // なる（このテストでは真に host が空になる形を使う）。
-        assert!(validate_bench_url("http://").is_err());
-    }
-
-    #[test]
-    fn validate_bench_url_allows_userinfo_and_port_with_public_host() {
-        assert!(validate_bench_url("https://user:pass@example.com:8443/x").is_ok());
-    }
-
-    // レビュー指摘 P0（Codex。support.rs:194）: `127.1` のような WHATWG URL
-    // 準拠のブラウザが IPv4 として解釈する非ドット10進数表記も拒否する。
-    #[test]
-    fn validate_bench_url_rejects_ipv4_shorthand_and_numeric_forms() {
-        assert!(validate_bench_url("http://127.1/").is_err());
-        assert!(validate_bench_url("http://2130706433/").is_err());
-        assert!(validate_bench_url("http://0x7f000001/").is_err());
-    }
-
-    // レビュー指摘 Medium（Cursor。support.rs:193-218）: IPv4-mapped IPv6
-    // リテラルへ埋め込まれた内部アドレスを展開して拒否する。
-    #[test]
-    fn validate_bench_url_rejects_ipv4_mapped_ipv6() {
-        assert!(validate_bench_url("http://[::ffff:127.0.0.1]/").is_err());
-        assert!(validate_bench_url("http://[::ffff:169.254.169.254]/").is_err());
-    }
-
-    // レビュー指摘 Medium: IPv4 マルチキャスト・IPv6 非推奨サイトローカル
-    // （fec0::/10）を実際に拒否することを確認する。
-    #[test]
-    fn validate_bench_url_rejects_multicast_and_site_local() {
-        assert!(validate_bench_url("http://224.0.0.1/").is_err());
-        assert!(validate_bench_url("http://[fec0::1]/").is_err());
-    }
-
-    #[test]
-    fn validate_bench_url_accepts_public_ipv4_and_ipv6() {
-        assert_eq!(validate_bench_url("http://93.184.216.34/"), Ok(None));
+    fn parse_http_request_line_basic() {
         assert_eq!(
-            validate_bench_url("http://[2606:2800:220:1:248:1893:25c8:1946]/"),
-            Ok(None)
-        );
-    }
-
-    // レビュー指摘 P0・Medium（PR #442）: ドメイン名は `validate_bench_url`
-    // だけでは内部アドレスへの解決を拒否できないため、正規化済みホスト名を
-    // `Ok(Some(host))` で返し、呼び出し元に `check_resolved_addrs` での
-    // 検証を促す契約になっていることを確認する。
-    #[test]
-    fn validate_bench_url_returns_domain_for_dns_resolution() {
-        assert_eq!(
-            validate_bench_url("https://example.com/path"),
-            Ok(Some("example.com".to_string()))
+            parse_http_request_line("GET /article.html HTTP/1.1\r\n"),
+            Some(("GET".to_string(), "/article.html".to_string()))
         );
     }
 
     #[test]
-    fn check_resolved_addrs_accepts_all_public() {
-        let addrs = [
-            IpAddr::from([93, 184, 216, 34]),
-            IpAddr::V6(Ipv6Addr::new(
-                0x2606, 0x2800, 0x220, 1, 0x248, 0x1893, 0x25c8, 0x1946,
-            )),
-        ];
-        assert!(check_resolved_addrs(&addrs).is_ok());
+    fn parse_http_request_line_malformed_is_none() {
+        assert_eq!(parse_http_request_line(""), None);
+        assert_eq!(parse_http_request_line("GET /only-two-tokens"), None);
+        assert_eq!(parse_http_request_line("GET /path NOT-HTTP/1.1"), None);
+    }
+
+    // レビュー指摘 P0（Codex。PR #442 再レビュー）: fixture 配信サーバーが
+    // パストラバーサル（`..`・絶対パス）を拒否し、fixture ルート配下の
+    // ファイルだけを返すことを確認する。
+    #[test]
+    fn safe_join_fixture_path_accepts_plain_filename() {
+        let root = Path::new("/fixtures");
+        assert_eq!(
+            safe_join_fixture_path(root, "/article.html"),
+            Ok(PathBuf::from("/fixtures/article.html"))
+        );
     }
 
     #[test]
-    fn check_resolved_addrs_rejects_if_any_internal() {
-        let addrs = [
-            IpAddr::from([93, 184, 216, 34]),
-            IpAddr::from([10, 0, 0, 1]),
-        ];
-        assert!(check_resolved_addrs(&addrs).is_err());
+    fn safe_join_fixture_path_strips_query_and_fragment() {
+        let root = Path::new("/fixtures");
+        assert_eq!(
+            safe_join_fixture_path(root, "/article.html?x=1#y"),
+            Ok(PathBuf::from("/fixtures/article.html"))
+        );
     }
 
     #[test]
-    fn check_resolved_addrs_rejects_empty() {
-        assert!(check_resolved_addrs(&[]).is_err());
+    fn safe_join_fixture_path_rejects_parent_traversal() {
+        let root = Path::new("/fixtures");
+        assert!(safe_join_fixture_path(root, "/..").is_err());
+        assert!(safe_join_fixture_path(root, "/a/../../secret").is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn safe_join_fixture_path_rejects_windows_drive_absolute_path() {
+        let root = Path::new(r"C:\fixtures");
+        assert!(safe_join_fixture_path(root, "C:/windows/system32").is_err());
+    }
+
+    #[test]
+    fn safe_join_fixture_path_rejects_empty_path() {
+        let root = Path::new("/fixtures");
+        assert!(safe_join_fixture_path(root, "/").is_err());
+        assert!(safe_join_fixture_path(root, "").is_err());
+    }
+
+    // レビュー指摘（コーディネーター指示。PR #442 再レビュー）: fixture は
+    // 自作の静的コンテンツであり、外部サイトへのサブリソース参照
+    // （`http://`・`https://`・プロトコル相対の `//`）を含まないことを
+    // 確認する。fixture を増やした場合はこの配列にも追加すること。
+    #[test]
+    fn fixtures_contain_no_external_references() {
+        const FIXTURES: &[(&str, &str)] = &[
+            ("article.html", include_str!("fixtures/article.html")),
+            ("listing.html", include_str!("fixtures/listing.html")),
+            ("form.html", include_str!("fixtures/form.html")),
+        ];
+        for (name, content) in FIXTURES {
+            let lower = content.to_ascii_lowercase();
+            assert!(
+                !lower.contains("http://"),
+                "{name}: must not reference http:// URLs"
+            );
+            assert!(
+                !lower.contains("https://"),
+                "{name}: must not reference https:// URLs"
+            );
+            // プロトコル相対参照（`src="//..."`・`src='//...'` の引用符付き、
+            // および HTML が許す `src=//...` の無引用形。レビュー指摘
+            // advisor: 無引用属性値は素通りしていた）の簡易検出。
+            assert!(
+                !lower.contains("=\"//") && !lower.contains("='//") && !lower.contains("=//"),
+                "{name}: must not reference protocol-relative (//) URLs"
+            );
+            // インライン CSS の `url(//...)`（プロトコル相対）も対象にする。
+            assert!(
+                !lower.contains("url(//"),
+                "{name}: must not reference protocol-relative (//) CSS url()"
+            );
+        }
+    }
+
+    // レビュー指摘（advisor。PR #442 再レビュー後の追加指摘）: `FIXTURE_PAGES`
+    // に列挙したパスが、実際に `fixtures_root()` 配下の存在するファイルへ
+    // 解決できることを確認する（3 OS の `CARGO_MANIFEST_DIR` 相対パス解決・
+    // `FIXTURE_PAGES` と実ファイルの一致の双方を検証する。片方だけが更新
+    // されて食い違うことをここで検出する）。
+    #[test]
+    fn fixture_pages_resolve_to_existing_files() {
+        let root = fixtures_root();
+        for page in FIXTURE_PAGES {
+            let path =
+                safe_join_fixture_path(&root, page).unwrap_or_else(|e| panic!("{page}: {e}"));
+            assert!(
+                path.is_file(),
+                "{page}: resolved path {path:?} is not a file"
+            );
+        }
     }
 }

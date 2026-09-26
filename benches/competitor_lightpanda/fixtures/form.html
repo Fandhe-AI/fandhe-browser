@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<!--
+  competitor_lightpanda ベンチ用の自作フィクスチャ（TASK-84.1・Issue #211）。
+  ログインフォーム風の入力要素を持つページ構造を模した新規作成コンテンツ。
+  外部サイトの複製ではなく、外部参照（http(s):// や // で始まる
+  src/href/action）も含まない（`action` はページ自身へのフラグメントに
+  する。実際の送信はベンチが行わない）。
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sample Form</title>
+</head>
+<body>
+<header>
+<h1>Sample Sign-in Form</h1>
+</header>
+<main>
+<form action="#submitted" method="get">
+<label for="username">Username</label>
+<input id="username" name="username" type="text">
+<label for="password">Password</label>
+<input id="password" name="password" type="password">
+<label for="remember">
+<input id="remember" name="remember" type="checkbox">
+Remember me
+</label>
+<button type="submit">Sign in</button>
+</form>
+<p>This form does not submit to any external service; it exists only to
+give the fixture page a variety of interactive elements
+(text input, password input, checkbox, button) for the benchmark.</p>
+</main>
+<footer>
+<p>End of sample form fixture.</p>
+</footer>
+</body>
+</html>
