@@ -45,6 +45,16 @@ const DEFAULT_MAX_REDIRECTS: usize = 10;
 /// デフォルトの最大レスポンス本文サイズ（16 MiB）。
 const DEFAULT_MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
 
+/// 本文読み込み用バッファの初期確保サイズの上限（64 KiB）。
+///
+/// `Content-Length` ヘッダは外部入力であり、事前検査（[`Fetcher::get`]）を
+/// 通過した後でも `max_body_bytes` に近い巨大な値を偽って宣言し得る
+/// （ヘッダ自体は上限以下でも、単に大きい確保を要求してくる場合）。
+/// 初期確保をこの固定上限で頭打ちにし、実際の受信量に応じて `extend_from_slice`
+/// が必要な分だけ再確保するようにすることで、宣言だけによるアロケーション
+/// の増幅（DoS。security.md「不安全な設計」）を避ける。
+const INITIAL_BODY_CAPACITY_LIMIT: u64 = 64 * 1024;
+
 /// `Fetcher::new` の呼び出し元が指定する取得条件。
 ///
 /// `#[non_exhaustive]` により、後続タスクでのフィールド追加（gzip 展開の
@@ -283,10 +293,17 @@ impl Fetcher {
         let _ = final_url.set_username("");
         let _ = final_url.set_password(None);
 
+        // 初期確保は宣言された `Content-Length` をそのまま信用せず、固定の
+        // 小さい上限（`INITIAL_BODY_CAPACITY_LIMIT`）で頭打ちにする。事前検査
+        // （上の `content_length` チェック）は「宣言値が上限を超えていないか」
+        // しか見ないため、上限ぎりぎりの巨大な値を宣言されると、そのまま
+        // `with_capacity` に渡すと確保だけで数十 MiB を要求されかねない
+        // （security.md「不安全な設計」: 宣言だけによるアロケーション増幅）。
         let capacity = response
             .content_length()
             .unwrap_or(0)
-            .min(self.options.max_body_bytes);
+            .min(self.options.max_body_bytes)
+            .min(INITIAL_BODY_CAPACITY_LIMIT);
         let mut body = Vec::with_capacity(usize::try_from(capacity).unwrap_or(0));
 
         let mut response = response;
@@ -301,7 +318,15 @@ impl Fetcher {
                 .ok_or(Error::ResponseTooLarge {
                     limit: self.options.max_body_bytes,
                 })?;
-            if new_len as u64 > self.options.max_body_bytes {
+            // `new_len`（`usize`）と `max_body_bytes`（`u64`）の比較は、
+            // 32bit ターゲットで `usize` が `u64` より小さい可能性があるため
+            // `as u64` によるキャストではなく `u64::try_from` を使う
+            // （変換失敗時もアロケーション増幅を避けるため安全側の `Err` に
+            // 倒す。coding-rust.md「エラーハンドリング」: checked 演算）。
+            let new_len_u64 = u64::try_from(new_len).map_err(|_| Error::ResponseTooLarge {
+                limit: self.options.max_body_bytes,
+            })?;
+            if new_len_u64 > self.options.max_body_bytes {
                 return Err(Error::ResponseTooLarge {
                     limit: self.options.max_body_bytes,
                 });
@@ -368,8 +393,11 @@ fn reject_unresolved_disallowed_redirect(response: &reqwest::Response) -> Result
 ///   `options.timeout` を代表値として使う
 /// - リダイレクト起因のエラーは、`source()` を辿って [`RedirectMarker`] へ
 ///   `downcast_ref` できればそれを対応する `Error` に写像する。マーカーが
-///   見つからなくても `is_redirect()` が真なら `TooManyRedirects` として
-///   扱う（フォールバック）
+///   見つからない場合（`RedirectMarker` を判別できないリダイレクトエラー）は
+///   `TooManyRedirects` へ憶測で丸めず、以下の `Network` 経路へ流す
+///   （`TooManyRedirects`/`DisallowedScheme` は `Policy::custom`
+///   （[`RedirectMarker`] downcast 経路）からしか出さないことで、レビューで
+///   両者を区別できるようにする）
 /// - それ以外は `without_url()` で URL（userinfo・クエリを含み得る）を
 ///   取り除いたメッセージを [`Error::Network`] に詰める（外部型
 ///   `reqwest::Error` 自体は保持しない）
@@ -393,12 +421,6 @@ fn map_reqwest_error(source: reqwest::Error, options: &FetchOptions) -> Error {
             };
         }
         cause = err.source();
-    }
-
-    if source.is_redirect() {
-        return Error::TooManyRedirects {
-            limit: options.max_redirects,
-        };
     }
 
     Error::Network {
