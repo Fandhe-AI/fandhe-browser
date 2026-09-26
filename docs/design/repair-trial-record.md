@@ -144,11 +144,20 @@ cargo test --workspace
 
 | ID | 試行回数 | 結果 | fmt | clippy | test（件数） | 変更ファイル・行数 | 所要ステップ・備考 | 人間判定 |
 | -- | -------- | ---- | --- | ------ | ------------- | ------------------ | ------------------ | -------- |
-| R-1 | 未実施（TASK-2.2・#323 で記入） | 未実施（TASK-2.2・#323 で記入） | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 | 未実施（Issue #324） |
-| R-2 | 未実施（TASK-2.2・#323 で記入） | 未実施（TASK-2.2・#323 で記入） | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 | 未実施（Issue #324） |
-| R-3 | 未実施（TASK-2.2・#323 で記入） | 未実施（TASK-2.2・#323 で記入） | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 | 未実施（Issue #324） |
-| R-4 | 未実施（TASK-2.2・#323 で記入） | 未実施（TASK-2.2・#323 で記入） | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 | 未実施（Issue #324） |
-| R-5 | 未実施（TASK-2.2・#323 で記入） | 未実施（TASK-2.2・#323 で記入） | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 | 未実施（Issue #324） |
+| R-1 | 2 | 到達（fixer 兼務） | 通過 | 1 回目 `clippy::manual_find` で失敗 → 修正後通過 | 226 passed / 0 failed（ベースライン 222 + 新規 4） | 3 ファイル・99 insertions(+)・1 deletion(-)（`src/dom.rs`・`src/lib.rs`・`tests/dom.rs`） | テストファースト → fixer 実装 → clippy 指摘の手直しで通過。fixer 分離なし（Implement が兼務）。trial ブランチ `trial/task-2-r1`（ローカルのみ・push しない） | 未実施（Issue #324） |
+| R-2 | 1 | 到達（fixer 兼務） | 通過 | 通過 | 225 passed / 0 failed（ベースライン 222 + 新規 3） | 2 ファイル・62 insertions(+)（`src/dom.rs`・`tests/dom.rs`） | テストファースト → fixer 実装で 1 回目から全ゲート通過。fixer 分離なし（Implement が兼務）。trial ブランチ `trial/task-2-r2`（ローカルのみ・push しない） | 未実施（Issue #324） |
+| R-3 | 未実施（保留） | 未実施（保留） | 未実施 | 未実施 | 未実施 | 未実施 | 「試行時の基準・前提差分」参照。注入バグの引き渡し隔離要件（独立環境・`origin` 到達不可の事前検証）を単一マシンの自動運転では満たせないため試行しない。注入箇所・注入方法は選定・記載していない | 未実施（Issue #324） |
+| R-4 | 1 | 到達（fixer 兼務） | 通過 | 通過 | 226 passed / 0 failed（ベースライン 222 + 新規 4） | 3 ファイル・147 insertions(+)・1 deletion(-)（`src/fetch.rs`・`src/lib.rs`・`tests/fetch.rs`） | テストファースト → fixer 実装で 1 回目から全ゲート通過。fixer 分離なし（Implement が兼務）。trial ブランチ `trial/task-2-r4`（ローカルのみ・push しない） | 未実施（Issue #324） |
+| R-5 | 4 | 到達（fixer 兼務） | 通過 | 通過 | 225 passed / 0 failed（ベースライン 222 + 新規 3） | 3 ファイル・116 insertions(+)・5 deletions(-)（`src/parse.rs`・`src/lib.rs`・`tests/parse.rs`） | 1 回目: 借用チェッカーエラーで失敗（`diagnostics.entries.push` と `diagnostics.current_line` の同時借用）。2 回目: コンパイルは通ったが `line == 3` の assert が `line == 0` で失敗（html5ever は行が変わった時のみ `set_current_line` を通知するため、1 行目の内部状態初期値を html5ever 側の初期値 1 に揃える必要があった）。3 回目: 修正後 `line == 1` に失敗（受け入れテストの入力 HTML が DOCTYPE 欠如に起因する無関係な `Unexpected token` エラーを 1 行目に生んでおり、先頭エントリがそちらになっていた。実装ロジックではなくテスト入力 HTML の不備と判明）。4 回目: テスト入力を DOCTYPE・head 補完済みの文書に修正（アサーション内容・期待値は変更していない）して全ゲート通過。fixer 分離なし（Implement が兼務）。trial ブランチ `trial/task-2-r5`（ローカルのみ・push しない） | 未実施（Issue #324） |
+
+### 試行時の基準・前提差分
+
+- **新ベースライン**: 本記録の基準コミット `6edf250` から `origin/main` は `15e728dd93ed31928a769f43763659208fcad642`（TASK-2.2 実施時点）まで進んでいる。差分として #434（fetch テスト整備）・#439（セレクタ照合と query API）がマージ済み、#37・#418 は CLOSED、#40・#220 は本記録作成時点と変わらず OPEN のまま（`gh issue view 220` で再確認済み）。`query.rs` に quirks mode 対応の `id_or_class_eq` が追加されているが、R-2 の `has_class`（常に厳密一致・quirks mode 非依存）とは別 API のため衝突しない
+- **ベースラインゲート**: 上記コミットの detached worktree で `cargo fmt --all --check`・`cargo clippy --workspace --all-targets -- -D warnings`・`cargo test --workspace` を実行し、いずれも通過（test 222 passed / 0 failed）。各候補の trial worktree はこのベースラインから分岐する
+- **対象 API の未実装確認**: `element_children`／`has_class`（`dom.rs`）・`mime_type`（`fetch.rs`）・`set_current_line` 実装（`parse.rs`）は、上記ベースライン時点で `git grep` によりいずれも未実装であることを確認済み（試行の前提が崩れていない）
+- **R-3 保留の扱い**: 「引き渡し手順（差分の追跡不可能化）」（実施要領）が要求する独立環境（`.git` を持たないか `main`／`origin/main` の refs・オブジェクトへ到達できない環境）・`origin` へのネットワーク経路遮断を、本セッション（単一マシン・元リポジトリと `.git` を共有する worktree 群）では用意・検証できない。そのため候補としては選定済みだが試行しない。注入箇所・注入方法はそもそも選定・記載していない（本記録・PR・コミットのいずれにも残っていない）。REPAIR-2 の「3 件以上で単独到達」要件は R-1・R-2・R-4・R-5 の 4 件で満たしている。#324（人間判定）向けの対応事項: R-3 を実施する場合は、元リポジトリと `.git`（refs・オブジェクト）を共有しない隔離環境と、`origin` への到達を遮断したネットワーク構成を別途用意する必要がある
+- **fixer 分離の実態**: 本セッションには `core-builder` 等のサブエージェントを起動する手段（`Agent`/`Task` 相当のツール）がなく、Implement（試行のオーケストレーター・テスト作成者・記録者）が fixer（改修担当）を兼務した。各候補の受け入れテストは実装前に先行コミットしており（テストファーストの手順自体は計画どおり）、実装コミットとの差分に受け入れテストの弱体化・削除がないことを `git diff <test-commit> HEAD -- '*/tests/*' 'src/*.rs'` 相当の比較で確認した（R-5 のみ、テストの入力 HTML 文字列 1 か所をアサーションを変えずに修正している。上表「所要ステップ・備考」参照）
+- **trial ブランチの扱い**: `trial/task-2-r1`・`trial/task-2-r2`・`trial/task-2-r4`・`trial/task-2-r5` はいずれもローカルにのみ存在し、push していない。`origin` への取り込み判断は本記録・本 Issue の範囲外とし、#324（人間判定）向けに保持する
 
 ## セキュリティ考慮事項（OWASP Top 10 観点）
 
