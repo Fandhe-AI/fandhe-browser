@@ -82,24 +82,11 @@ cargo test --workspace
 
 ### R-3: `text_content` のオフバイワン注入
 
-- `text_content` の Element 分岐（`dom.rs`）は次の実装になっている（基準コミット時点）。
-
-  ```rust
-  NodeData::Element { .. } | NodeData::DocumentFragment => {
-      let mut text = String::new();
-      for descendant in self.descendants(id) {
-          if let Some(NodeData::Text { contents }) = self.node_data(descendant) {
-              text.push_str(contents);
-          }
-      }
-      Some(text)
-  }
-  ```
-
-  注入は「最初に見つかった Text 子孫を 1 個だけ読み飛ばす」フラグを for ループに加える形で行う（例: `let mut skipped_first = false;` を用意し、最初の Text 一致時に `skipped_first` を立てて `continue` する）
+- 対象は `dom.rs` の `text_content`（Element 分岐）。既存の descendant 走査ロジックに、意図的な軽微な不具合（オフバイワン相当）を注入し、改修担当は失敗するテストの症状だけを手がかりに原因を特定・修正する
+- **注入箇所・具体的な注入方法・影響するテスト名は本ファイルに記載しない**。実施要領が定義するとおり、改修担当が原因特定を伴わずに修正できてしまうと単独修復の実証にならないため、詳細は改修担当がアクセスできない別ファイルへ分離する（[repair-trial-record-r3-injection.md](./repair-trial-record-r3-injection.md)。注入担当専用・改修担当には渡さない）
 - 注入前に改修担当以外の担当（別 Agent または人間）が、全ゲート（fmt/clippy/test）が通過していることを確認してから注入する（TASK-2.2 の前提条件）
-- 注入すると、既存テスト `core_1_text_content_concatenates_descendant_text`（`<p>a<b>b</b><!--x-->c</p>` に対し期待値 `"abc"`。最初の Text `"a"` が失われるため実際の結果は `"bc"` になり失敗する）と `core_1_children_and_siblings_in_source_order`（`<ul><li>a</li><li>b</li><li>c</li></ul>` の子要素 text_content 期待値 `["a","b","c"]`。各 `li` の唯一の Text 子孫が失われるため `["","",""]` 相当になり失敗する）が失敗するはずであることを、本 Issue（TASK-2.1）ではアサーション内容を読むだけで確認済み（実際の注入編集・実行は TASK-2.2 の範囲）
-- 修正後、専用テストを追加しなくても全ゲートを通過する（既存 2 テストの回復で十分）
+- 注入により既存テストが失敗すること、修正後は専用テストを追加しなくても全ゲートを通過することを、注入担当が別ファイル側で確認済み
+- 試行（TASK-2.2）終了後、上記別ファイルの内容を「試行結果」章へ追記する形でこの記録に反映する
 
 ### R-4: `mime_type()`
 
@@ -137,6 +124,7 @@ cargo test --workspace
 - **R-3 の注入**:
   - 注入は改修担当とは別の担当（別 Agent または人間）が行う
   - 改修担当には「`cargo test` が失敗する」という症状だけを伝え、注入箇所は開示しない
+  - 注入箇所・具体的な修正方法は改修担当がアクセスできない [repair-trial-record-r3-injection.md](./repair-trial-record-r3-injection.md) にのみ記録し、注入担当以外（改修担当を含む）には渡さない
   - 注入ブランチは main に取り込まない
   - TASK-6（#330〜#333、`tests/break_detection.rs`）の「検出実証」とは目的が異なる「修復実証」であり、TASK-6 の成果物を作らない・流用しない
 - **記録項目**: 試行回数、各ゲートの結果（test の件数を含む）、変更ファイルと行数、所要ステップ、失敗時の原因分類
