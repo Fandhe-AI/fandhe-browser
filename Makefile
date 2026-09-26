@@ -390,6 +390,13 @@ endif
 # - cargo-deny を別バージョンへ上げると診断文字列（`error[rejected]` /
 #   `error[unlicensed]`）が変わる可能性がある。上げる際は本ターゲットも
 #   合わせて確認すること（`CARGO_DENY_VERSION` を単一の版管理箇所とする）
+# - `run_case` 内の `cargo deny` 呼び出しは `if out=$(...); then code=0; else
+#   code=$?; fi` の形にし、`out=$(cmd); code=$?` の素の代入にはしない。
+#   `errexit` が有効なシェル（`.SHELLFLAGS` が `-ec` の環境・親シェルの
+#   `SHELLOPTS` を継承する環境等）では代入コマンド自体の失敗でシェルが
+#   即終了し、reject 期待ケース（非 0 終了）で後続の診断アサーションへ
+#   到達できなくなるおそれがある。`if` の条件式に置くことで、どちらの
+#   シェル設定でも exit code を確実に読み取れるようにする
 .PHONY: check-deny-license-reject
 check-deny-license-reject: ## cargo deny が許可外ライセンスを reject することを canary で検証する（受入基準2の証跡）
 ifneq ($(HAS_DENY),)
@@ -421,8 +428,11 @@ ifneq ($(HAS_DENY),)
 	}; \
 	run_case() { \
 		label="$$1"; expect_diag="$$2"; manifest="$$3"; \
-		out=$$(cargo deny --manifest-path "$$manifest" --config "$$deny_cfg" --locked --offline check licenses 2>&1); \
-		code=$$?; \
+		if out=$$(cargo deny --manifest-path "$$manifest" --config "$$deny_cfg" --locked --offline check licenses 2>&1); then \
+			code=0; \
+		else \
+			code=$$?; \
+		fi; \
 		printf '%s\n' "$$out" | grep -F -A6 'error[' || true; \
 		if [ -z "$$expect_diag" ]; then \
 			if [ "$$code" -ne 0 ]; then \
