@@ -412,17 +412,17 @@ fn parse_compound_selector(cursor: &mut Cursor<'_>) -> Result<CompoundSelector> 
         match cursor.peek() {
             Some('#') => {
                 let hash_offset = cursor.offset();
+                if simple_selectors.len() >= MAX_SIMPLE_SELECTORS_PER_COMPOUND {
+                    return Err(invalid_input_at(
+                        hash_offset,
+                        "too many simple selectors in compound selector",
+                    ));
+                }
                 cursor.bump();
                 let ident_offset = cursor.offset();
                 match cursor.peek() {
                     Some(c) if is_ident_start_or_hyphen(c) => {
                         let ident = parse_ident(cursor)?;
-                        if simple_selectors.len() >= MAX_SIMPLE_SELECTORS_PER_COMPOUND {
-                            return Err(invalid_input_at(
-                                hash_offset,
-                                "too many simple selectors in compound selector",
-                            ));
-                        }
                         simple_selectors.push(SimpleSelector::Id(ident));
                     }
                     Some('\\') => return Err(unsupported_at(ident_offset, "escape")),
@@ -436,17 +436,17 @@ fn parse_compound_selector(cursor: &mut Cursor<'_>) -> Result<CompoundSelector> 
             }
             Some('.') => {
                 let dot_offset = cursor.offset();
+                if simple_selectors.len() >= MAX_SIMPLE_SELECTORS_PER_COMPOUND {
+                    return Err(invalid_input_at(
+                        dot_offset,
+                        "too many simple selectors in compound selector",
+                    ));
+                }
                 cursor.bump();
                 let ident_offset = cursor.offset();
                 match cursor.peek() {
                     Some(c) if is_ident_start_or_hyphen(c) => {
                         let ident = parse_ident(cursor)?;
-                        if simple_selectors.len() >= MAX_SIMPLE_SELECTORS_PER_COMPOUND {
-                            return Err(invalid_input_at(
-                                dot_offset,
-                                "too many simple selectors in compound selector",
-                            ));
-                        }
                         simple_selectors.push(SimpleSelector::Class(ident));
                     }
                     Some('\\') => return Err(unsupported_at(ident_offset, "escape")),
@@ -460,13 +460,13 @@ fn parse_compound_selector(cursor: &mut Cursor<'_>) -> Result<CompoundSelector> 
             }
             Some('[') => {
                 let bracket_offset = cursor.offset();
-                let attr = parse_attribute_selector(cursor)?;
                 if simple_selectors.len() >= MAX_SIMPLE_SELECTORS_PER_COMPOUND {
                     return Err(invalid_input_at(
                         bracket_offset,
                         "too many simple selectors in compound selector",
                     ));
                 }
+                let attr = parse_attribute_selector(cursor)?;
                 simple_selectors.push(SimpleSelector::Attribute(attr));
             }
             _ => break,
@@ -502,8 +502,8 @@ fn classify_compound_start_error(cursor: &Cursor<'_>, start_offset: usize) -> Er
 }
 
 /// 複合セレクタ間の結合子を解析する。次の複合セレクタが続く場合は
-/// `Some((結合子, 消費した空白の有無))` を返し、複雑セレクタの終端
-/// （カンマ・入力末尾）ならそのまま `None` を返す。
+/// `Some(結合子)` を返し、複雑セレクタの終端（カンマ・入力末尾）なら
+/// そのまま `None` を返す。
 fn parse_combinator(cursor: &mut Cursor<'_>) -> Result<Option<Combinator>> {
     let had_leading_whitespace = cursor.skip_whitespace();
 
@@ -523,11 +523,15 @@ fn parse_combinator(cursor: &mut Cursor<'_>) -> Result<Option<Combinator>> {
         Some('+') | Some('~') => Err(unsupported_at(cursor.offset(), "sibling combinator")),
         _ if had_leading_whitespace => Ok(Some(Combinator::Descendant)),
         _ => {
-            // 空白を挟まず、`>`/`,`/EOF/兄弟結合子でもない場合は、複合セレクタの
-            // 解析側（`classify_compound_start_error` 相当の判定）に委ねる。
-            // ここでは「結合子ではない」として扱い、複合セレクタの解析を試み、
-            // その結果がそのままエラーになるようにする。
-            Ok(Some(Combinator::Descendant))
+            // 空白を挟まず、`>`/`,`/EOF/兄弟結合子でもない場合（例:
+            // `[href]div` の `]` の直後に `d` が続くケース）は、複合
+            // セレクタが続いているのではなく構文として不正な並びである。
+            // 空白なしで複合セレクタを連結できるのは常に子結合子（`>`）
+            // 経由のみであり、それ以外は「宙に浮いた」続きとして扱う
+            // 必要があるため、ここで即座にエラーへ倒す
+            // （`classify_compound_start_error` が次の文字から
+            // `Unsupported`/`InvalidInput` を判定する）。
+            Err(classify_compound_start_error(cursor, cursor.offset()))
         }
     }
 }
@@ -539,13 +543,13 @@ fn parse_complex_selector(cursor: &mut Cursor<'_>) -> Result<ComplexSelector> {
 
     while let Some(combinator) = parse_combinator(cursor)? {
         let compound_offset = cursor.offset();
-        let compound = parse_compound_selector(cursor)?;
         if rest.len() + 1 >= MAX_COMPOUNDS_PER_COMPLEX {
             return Err(invalid_input_at(
                 compound_offset,
                 "too many compound selectors in complex selector",
             ));
         }
+        let compound = parse_compound_selector(cursor)?;
         rest.push((combinator, compound));
     }
 
@@ -582,13 +586,13 @@ pub fn parse_selector_list(input: &str) -> Result<SelectorList> {
 
     let mut selectors = Vec::new();
     loop {
-        let complex = parse_complex_selector(&mut cursor)?;
         if selectors.len() >= MAX_SELECTORS_PER_LIST {
             return Err(invalid_input_at(
                 cursor.offset(),
                 "too many selectors in selector list",
             ));
         }
+        let complex = parse_complex_selector(&mut cursor)?;
         selectors.push(complex);
 
         cursor.skip_whitespace();
@@ -772,6 +776,29 @@ mod tests {
                         name: "href".to_string(),
                         matcher: AttributeMatcher::Exists,
                     }),
+                ],
+            },
+            rest: Vec::new(),
+        };
+        assert_eq!(list.selectors(), &[expected]);
+    }
+
+    /// CORE-1: 属性セレクタ（`]`）の直後に `#`/`.` が続いても、同じ複合
+    /// セレクタの単純セレクタとして継続して解析できることを確認する
+    /// （空白を挟まない別複合セレクタの開始と誤認しないことの回帰確認）。
+    #[test]
+    fn core_1_parses_simple_selectors_continuing_after_attribute() {
+        let list = parse_selector_list("[a]#b.c").expect("[a]#b.c は解析できるはず");
+        let expected = ComplexSelector {
+            first: CompoundSelector {
+                type_name: None,
+                simple_selectors: vec![
+                    SimpleSelector::Attribute(AttributeSelector {
+                        name: "a".to_string(),
+                        matcher: AttributeMatcher::Exists,
+                    }),
+                    SimpleSelector::Id("b".to_string()),
+                    SimpleSelector::Class("c".to_string()),
                 ],
             },
             rest: Vec::new(),
@@ -1018,6 +1045,11 @@ mod tests {
             "[]",
             "[a=\"x\ny\"]",
             "a\u{0}",
+            // 属性セレクタ直後に空白なしで別の複合セレクタが続くケース
+            // （`]` の直後は結合子ではなく構文エラーとして扱う）。
+            "[href]div",
+            "[a='v']b",
+            "[a]-x",
         ];
         for input in invalid_inputs {
             let err = parse_selector_list(input)
