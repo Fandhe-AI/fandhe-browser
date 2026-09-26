@@ -74,10 +74,10 @@ use std::time::{Duration, Instant};
 
 use support::{
     DeadlineReader, JsonValue, Outcome, approx_tokens, arg_error_gate, bench_exit_code,
-    content_length_exceeds_limit, expand_args, http_status_for_io_error, json_escape,
-    looks_like_browser_readiness_response, lookup_fixture, median, parse_content_length,
-    parse_http_request_line, parse_http_status, parse_json, reduction_pct, require_bin, split_args,
-    token_reduction_gate, validate_local_bench_url, validate_mcp_response,
+    content_length_exceeds_limit, exit_status_to_result, expand_args, http_status_for_io_error,
+    json_escape, looks_like_browser_readiness_response, lookup_fixture, median,
+    parse_content_length, parse_http_request_line, parse_http_status, parse_json, reduction_pct,
+    require_bin, split_args, token_reduction_gate, validate_local_bench_url, validate_mcp_response,
 };
 // `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
 // 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
@@ -532,29 +532,43 @@ fn apply_new_process_group(command: &mut Command) {
 /// シグナルを送れば子孫プロセスも含めて終了できる。ただし std には
 /// unix の `killpg`・Windows のプロセスツリー終了に相当する API が無く、
 /// `unsafe`・新規依存（`libc`/`windows-sys` 等）も使えないため、実際の
-/// 終了は OS 標準の外部コマンド（unix: `kill -KILL -<pid>`、Windows:
-/// `taskkill /T /F`）に委ねる。これらのコマンドが使えない環境では
-/// この関数は何もできず、子孫プロセスがパイプを保持し続ける可能性が
-/// 残る（std のみでの実装の限界。将来 `libc` 等の依存追加が承認されれば
-/// `killpg`/`TerminateJobObject` 直呼びに置き換えられる）。
+/// 終了は OS 標準の外部コマンド（unix: `kill -KILL -- -<pid>`、Windows:
+/// `taskkill /T /F`）に委ねる。これらのコマンドが使えない環境（spawn 自体の
+/// 失敗）・非 0 終了（対象が既に存在しない等）では `Err` を返す。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々々々々々々レビュー・
+/// competitor_lightpanda.rs:558）: 以前は `Command::status()` の結果を
+/// `let _ = ...` で握りつぶしており、外部コマンドの spawn 失敗・非 0
+/// 終了に気づけなかった。`Result` にして呼び出し元へ返し、呼び出し元は
+/// 失敗時に `Child::kill`（直接の子のみ）へのフォールバックを行った旨を
+/// エラーメッセージへ含める（`Drop`（`ChildGuard::drop`）内で呼ぶ経路は
+/// 戻り値を返せないため、そこに限り結果を握りつぶしてよい）。
 #[cfg(unix)]
-fn kill_process_group(pid: u32) {
-    let _ = Command::new("kill")
-        .args(["-KILL", &format!("-{pid}")])
+fn kill_process_group(pid: u32) -> Result<(), String> {
+    // レビュー指摘 P1: `-<pid>`（プロセスグループ宛て）はハイフンで
+    // 始まるため、`kill` 実装によってはオプションの一部と誤解釈され得る。
+    // `--` でオプションの終端を明示し、後続の `-<pid>` を確実に引数として
+    // 扱わせる。
+    let status = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .status()
+        .map_err(|e| format!("failed to spawn kill: {e}"))?;
+    exit_status_to_result(status)
 }
 
 #[cfg(windows)]
-fn kill_process_group(pid: u32) {
-    let _ = Command::new("taskkill")
+fn kill_process_group(pid: u32) -> Result<(), String> {
+    let status = Command::new("taskkill")
         .args(["/T", "/F", "/PID", &pid.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .status()
+        .map_err(|e| format!("failed to spawn taskkill: {e}"))?;
+    exit_status_to_result(status)
 }
 
 /// 子プロセスを確実に終了させる guard。早期 `return`（`?`）経路でも
@@ -566,7 +580,12 @@ struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        kill_process_group(self.0.id());
+        // `Drop` は戻り値を呼び出し元へ返せないため、ここに限り
+        // `kill_process_group` の失敗を握りつぶしてよい（レビュー指摘 P1。
+        // Codex。PR #442 再々々々々々々レビュー・
+        // competitor_lightpanda.rs:558）。続く `Child::kill`（直接の子）は
+        // 無条件に行う既存のフォールバックのままにする。
+        let _ = kill_process_group(self.0.id());
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -1077,14 +1096,23 @@ struct McpClient {
     /// `call` はこれを見て、無制限にキューを溜め込む代わりに
     /// 計測をエラー終了させる。
     overflowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// 読み取りスレッドが `read_line_bounded` の `InvalidData`（`MAX_LINE_BYTES`
-    /// 到達・改行未検出、または不正な UTF-8。レビュー指摘 P1・P2）、または
-    /// `UnexpectedEof`（改行に達する前に子プロセスが標準出力を閉じた。
-    /// レビュー指摘 P1。Codex。PR #442 再々々々々々レビュー・
-    /// competitor_lightpanda.rs:1039）を検知した際に立てるフラグ。`call` は
-    /// これを見て、切り詰められた／文字化けした／未完了の行を無視したまま
-    /// 待ち続けるのではなく明示的にエラー終了させる。
-    line_read_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 読み取りスレッドが `read_line_bounded` からエラー（`InvalidData`
+    /// （`MAX_LINE_BYTES` 到達・改行未検出、または不正な UTF-8。レビュー
+    /// 指摘 P1・P2）・`UnexpectedEof`（改行に達する前に子プロセスが標準
+    /// 出力を閉じた。レビュー指摘 P1。Codex。PR #442 再々々々々々レビュー・
+    /// competitor_lightpanda.rs:1039）を含む、あらゆる種別）を受け取った際に
+    /// その内容を記録するスロット。`call` はこれを見て、切り詰められた／
+    /// 文字化けした／未完了の行を無視したまま待ち続けるのではなく明示的に
+    /// エラー終了させる。
+    ///
+    /// レビュー指摘 P2（Codex。PR #442 再々々々々々々々レビュー・
+    /// competitor_lightpanda.rs:1147）: 以前は `AtomicBool` で「エラーが
+    /// あったかどうか」だけを記録し、`InvalidData`・`UnexpectedEof` 以外の
+    /// I/O エラー種別（`ConnectionReset` 等）は無条件の `Err(_) => break`
+    /// に落ちて記録されずスレッドが静かに終了していた。`Mutex<Option<String>>`
+    /// にして、どの種別のエラーであっても実際のメッセージを記録するように
+    /// した。
+    line_read_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl McpClient {
@@ -1103,7 +1131,7 @@ impl McpClient {
         let (tx, rx) = mpsc::sync_channel::<String>(MCP_STDOUT_QUEUE_CAPACITY);
         let overflowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let overflowed_writer = std::sync::Arc::clone(&overflowed);
-        let line_read_error = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let line_read_error = std::sync::Arc::new(std::sync::Mutex::new(None));
         let line_read_error_writer = std::sync::Arc::clone(&line_read_error);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -1123,33 +1151,41 @@ impl McpClient {
                         }
                         Err(mpsc::TrySendError::Disconnected(_)) => break,
                     },
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::InvalidData
-                            || e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                    {
+                    Err(e) => {
                         // `MAX_LINE_BYTES` に達し改行未検出のまま打ち切られた行
                         // （レビュー指摘 P1）、不正な UTF-8（レビュー指摘 P2。
                         // Codex。PR #442 再々々々々レビュー・
                         // competitor_lightpanda.rs:585: `from_utf8_lossy` の
                         // 置換で偶然妥当な JSON に化ける経路を避けるため、
                         // `read_line_bounded` を厳密な UTF-8 変換にした）、
-                        // または改行に達する前に子プロセスが標準出力を閉じた
+                        // 改行に達する前に子プロセスが標準出力を閉じた
                         // （`UnexpectedEof`。レビュー指摘 P1。Codex。PR #442
-                        // 再々々々々々レビュー・competitor_lightpanda.rs:1039:
-                        // 以前は `read_line_bounded` がこのケースでも
-                        // 改行なしの断片を `Ok` で返しており、この
-                        // `Err(_) => break`（当時は無条件で握りつぶす分岐）に
-                        // 落ちずそのまま応答キューへ送られ得た。契約変更後は
-                        // ここへ来るため、明示的に `line_read_error` を立てて
-                        // `call` 側へ伝える）。いずれも切り詰められた／
+                        // 再々々々々々レビュー・competitor_lightpanda.rs:1039）、
+                        // またはそれ以外の I/O エラー（`ConnectionReset` 等。
+                        // レビュー指摘 P2。Codex。PR #442 再々々々々々々々
+                        // レビュー・competitor_lightpanda.rs:1147: 以前は
+                        // 種別を絞った `if` ガード付きの分岐でしか記録して
+                        // おらず、それ以外の種別は無条件の `Err(_) => break`
+                        // に落ちて記録されずスレッドが静かに終了していた）。
+                        // 種別を問わずすべてのエラーを記録し、切り詰められた／
                         // 文字化けした／未完了の断片を正常応答として扱わせず、
                         // 読み取りを止めて `call` 側へ明示的に伝える。
-                        line_read_error_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+                        if let Ok(mut reason) = line_read_error_writer.lock() {
+                            *reason = Some(e.to_string());
+                        }
                         break;
                     }
-                    Err(_) => break,
                 }
             }
+            // レビュー指摘 P2（Codex。PR #442 再々々々々々々々レビュー・
+            // competitor_lightpanda.rs:1147）: 「reader スレッドが終了
+            // したら（EOF の場合も含めて）、送信側を drop する」ことを
+            // 明示する。`tx` はこのクロージャに move 済みのローカル変数
+            // なので、`break` でループを抜けクロージャが終了する時点で
+            // 自動的に drop される（Rust の通常のスコープ規則）。これに
+            // より `call`/`notify` 側の `self.rx.recv_timeout` は
+            // 待機中でも即座に `RecvTimeoutError::Disconnected` で
+            // 返るようになる。
         });
         Ok(Self {
             guard: ChildGuard(child),
@@ -1159,6 +1195,17 @@ impl McpClient {
             overflowed,
             line_read_error,
         })
+    }
+
+    /// `line_read_error` に読み取りスレッドが記録したエラー内容があれば
+    /// 取り出す（`Mutex` のロックが取得できない＝毒された場合は、記録が
+    /// 取れなかったものとして `None` を返す。呼び出し元は他の経路
+    /// （`overflowed`・`recv_timeout` のタイムアウト等）で fail-closed に
+    /// 倒れるため、ここでの panic は避ける）。
+    fn line_read_error_reason(
+        line_read_error: &std::sync::Mutex<Option<String>>,
+    ) -> Option<String> {
+        line_read_error.lock().ok().and_then(|guard| guard.clone())
     }
 
     /// 書き込み中に相手プロセスが標準入力を読まずパイプが満杯になっても
@@ -1229,9 +1276,20 @@ impl McpClient {
                 // `kill` では解放されないが、少なくとも直接の子は確実に
                 // 終了させる床として残す（レビュー指摘。PR #442
                 // 再々々々々レビュー・advisor 追加指摘）。
-                kill_process_group(child.id());
+                //
+                // レビュー指摘 P1（Codex。PR #442 再々々々々々々レビュー・
+                // competitor_lightpanda.rs:558）: `kill_process_group` の
+                // 結果を握りつぶさず、失敗時は `Child::kill` へ
+                // フォールバックした旨をエラーメッセージへ含めて呼び出し元
+                // （`call`/`notify`）へ返す。
+                let group_kill_result = kill_process_group(child.id());
                 let _ = child.kill();
-                Err("write timed out, process group killed".to_string())
+                match group_kill_result {
+                    Ok(()) => Err("write timed out, process group killed".to_string()),
+                    Err(e) => Err(format!(
+                        "write timed out; failed to kill process group ({e}), fell back to killing the direct child process only"
+                    )),
+                }
             }
         }
     }
@@ -1270,32 +1328,51 @@ impl McpClient {
                     "{method}: mcp stdout queue exceeded {MCP_STDOUT_QUEUE_CAPACITY} lines, aborting"
                 ));
             }
-            if self
-                .line_read_error
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
+            if let Some(reason) = Self::line_read_error_reason(&self.line_read_error) {
                 return Err(format!(
-                    "{method}: mcp response line could not be decoded (exceeded {MAX_LINE_BYTES} bytes without newline, contained invalid UTF-8, or the child closed stdout before the line was newline-terminated), aborting"
+                    "{method}: mcp response line could not be decoded ({reason}), aborting"
                 ));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(format!("timeout waiting for response to {method}"));
             }
+            // レビュー指摘 P2（Codex。PR #442 再々々々々々々々レビュー・
+            // competitor_lightpanda.rs:1147）: 読み取りスレッドが終了すると
+            // `tx`（送信側）が drop され、`recv_timeout` は待機中でも即座に
+            // `RecvTimeoutError::Disconnected` で返る。以前はこれを
+            // `Timeout` と区別せず一括りに扱っていたため、実際には切断
+            // （エラー・EOF）が起きているのに「timeout waiting」という
+            // 紛らわしいメッセージになり得た。ここで明示的に区別し、
+            // 「channel の切断を検知して即時に返す」ことを保証する。
             let line = match self.rx.recv_timeout(remaining) {
                 Ok(line) => line,
-                Err(_) => {
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if self.overflowed.load(std::sync::atomic::Ordering::SeqCst) {
                         return Err(format!(
                             "{method}: mcp stdout queue exceeded {MCP_STDOUT_QUEUE_CAPACITY} lines, aborting"
                         ));
                     }
-                    if self
-                        .line_read_error
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                    {
+                    if let Some(reason) = Self::line_read_error_reason(&self.line_read_error) {
                         return Err(format!(
-                            "{method}: mcp response line could not be decoded (exceeded {MAX_LINE_BYTES} bytes without newline, contained invalid UTF-8, or the child closed stdout before the line was newline-terminated), aborting"
+                            "{method}: mcp response line could not be decoded ({reason}), aborting"
+                        ));
+                    }
+                    // 読み取りスレッドが `Ok(0)`（正常な EOF。エラーではない）
+                    // で終了した場合はここへ来る。
+                    return Err(format!(
+                        "{method}: mcp stdout closed before a response with matching id was received"
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if self.overflowed.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(format!(
+                            "{method}: mcp stdout queue exceeded {MCP_STDOUT_QUEUE_CAPACITY} lines, aborting"
+                        ));
+                    }
+                    if let Some(reason) = Self::line_read_error_reason(&self.line_read_error) {
+                        return Err(format!(
+                            "{method}: mcp response line could not be decoded ({reason}), aborting"
                         ));
                     }
                     return Err(format!("timeout waiting for response to {method}"));

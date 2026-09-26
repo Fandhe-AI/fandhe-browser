@@ -540,6 +540,26 @@ pub fn http_status_for_io_error(kind: std::io::ErrorKind) -> (u16, &'static str)
     }
 }
 
+/// 外部コマンド（`kill`/`taskkill`）の終了ステータスを、成功したかどうかの
+/// 判定へ変換する。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々々々々々レビュー・
+/// competitor_lightpanda.rs:558）: `competitor_lightpanda.rs` の
+/// `kill_process_group` は以前 `Command::status()` の結果を
+/// `let _ = ...` で握りつぶしており、外部コマンドの非 0 終了（対象
+/// プロセスが既に存在しない等）に気づけなかった。判定ロジック自体を
+/// この純粋関数へ切り出し、`kill_process_group` はプロセス起動
+/// （`unsafe`・実際の子プロセス操作を伴い、この crate root
+/// （`[[test]]` ターゲット）では単体テストできない）と、この関数が行う
+/// 判定とに分離する。
+pub fn exit_status_to_result(status: std::process::ExitStatus) -> Result<(), String> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("command exited with {status}"))
+    }
+}
+
 /// `Content-Length` ヘッダーの値（コロンの後ろ、前後の空白を含み得る）を
 /// 厳密に解釈する。
 ///
@@ -1664,7 +1684,42 @@ mod tests {
         );
     }
 
-    // レビュー指摘 P2（Codex。PR #442 再々々々々々々レビュー・
+    // レビュー指摘 P1（Codex。PR #442 再々々々々々々レビュー・
+    // competitor_lightpanda.rs:558）: `kill_process_group`（`unsafe`・実際の
+    // プロセス操作を伴うため、この crate root では単体テストできない）が
+    // 使う「終了ステータスから成功／失敗を判定する」ロジック自体は
+    // 実プロセスを起動して検証できる。
+    #[test]
+    fn exit_status_to_result_success_is_ok() {
+        #[cfg(unix)]
+        let status = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .status()
+            .expect("spawn sh");
+        #[cfg(windows)]
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .status()
+            .expect("spawn cmd");
+        assert_eq!(exit_status_to_result(status), Ok(()));
+    }
+
+    #[test]
+    fn exit_status_to_result_failure_is_err() {
+        #[cfg(unix)]
+        let status = std::process::Command::new("sh")
+            .args(["-c", "exit 1"])
+            .status()
+            .expect("spawn sh");
+        #[cfg(windows)]
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "exit 1"])
+            .status()
+            .expect("spawn cmd");
+        assert!(exit_status_to_result(status).is_err());
+    }
+
+    // レビュー指摘 P2（Codex。PR #442 再々々々々々レビュー・
     // competitor_lightpanda.rs:756）: `Content-Length` が読み取り上限を
     // 超える場合は `min` で黙って切り詰めず probe 失敗にする契約を、
     // `probe_once` が呼ぶこの純粋関数の単体テストとして確認する。
