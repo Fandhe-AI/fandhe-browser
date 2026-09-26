@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<!--
+  competitor_lightpanda ベンチ用の自作フィクスチャ（TASK-84.1・Issue #211）。
+  外部サイトの HTML を複製したものではなく、記事ページの構造（見出し・
+  段落・ページ内リンクのみのナビゲーション）を模して新規に作成した。
+  外部参照（http(s):// や // で始まる src/href）は含めない
+  （support.rs の fixtures_contain_no_external_references テストが検証する）。
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sample Article</title>
+</head>
+<body>
+<header>
+<nav>
+<a href="#intro">Intro</a>
+<a href="#details">Details</a>
+<a href="#conclusion">Conclusion</a>
+</nav>
+</header>
+<main>
+<article>
+<h1>A Short Note on Static Fixtures</h1>
+<p id="intro">This page is a self-authored fixture used only to benchmark
+how much a browser's simplified DOM/accessibility snapshot reduces the
+number of tokens compared to raw HTML. It does not reference any
+external site or resource.</p>
+<h2 id="details">Details</h2>
+<p>The article contains a few paragraphs, a short list, and a small
+table so that the simplified tree extraction has a variety of element
+types to summarize.</p>
+<ul>
+<li>Heading and paragraph text</li>
+<li>An unordered list (this one)</li>
+<li>A small data table</li>
+</ul>
+<table>
+<thead>
+<tr><th>Item</th><th>Count</th></tr>
+</thead>
+<tbody>
+<tr><td>Widgets</td><td>3</td></tr>
+<tr><td>Gadgets</td><td>7</td></tr>
+</tbody>
+</table>
+<h2 id="conclusion">Conclusion</h2>
+<p>Because every asset here is local and self-contained, the benchmark
+never leaves 127.0.0.1, which avoids sending real network requests to
+third-party hosts during measurement.</p>
+</article>
+</main>
+<footer>
+<p>End of sample article fixture.</p>
+</footer>
+</body>
+</html>
