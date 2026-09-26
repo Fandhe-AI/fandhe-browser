@@ -104,13 +104,44 @@ pub fn approx_tokens(chars: usize) -> usize {
 /// 呼び出し側のポーリングを継続させる（panic させない。coding-rust.md）。
 pub fn parse_http_status(line: &str) -> Option<u16> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
-    let mut parts = trimmed.split_whitespace();
-    let version = parts.next()?;
-    if !version.starts_with("HTTP/") {
+    // レビュー指摘 P2（コーディネーター指示。PR #442 再々々々々々々々
+    // レビュー・support.rs:109）: 以前は `version.starts_with("HTTP/")`
+    // （`HTTP/potato` のような不正な値も通る）・`code.parse::<u16>()`
+    // （桁数不問。`0`・`65535` のような HTTP のステータスコードとして
+    // 無意味な値も通る）という緩い判定だった。ここでは
+    // `HTTP/1.0`・`HTTP/1.1` のいずれかに続く単一の SP、ちょうど 3 桁の
+    // 数字（100〜599）、その後に SP か行末が続く、という形式だけを
+    // 受理する。
+    let version_len = "HTTP/1.1".len();
+    // `str::split_at` はバイト境界が UTF-8 文字境界からずれていると panic
+    // する。外部プロセスからの未検証入力（マルチバイト文字を含み得る）を
+    // 扱うため、`get` で境界を検証してから取り出す（panic させない。
+    // coding-rust.md「外部入力の経路では unwrap を使わず明示的に処理する」）。
+    let version = trimmed.get(..version_len)?;
+    let rest = trimmed.get(version_len..)?;
+    if version != "HTTP/1.0" && version != "HTTP/1.1" {
         return None;
     }
-    let code = parts.next()?;
-    code.parse::<u16>().ok()
+    let rest = rest.strip_prefix(' ')?;
+    let mut chars = rest.chars();
+    let mut code_str = String::with_capacity(3);
+    for _ in 0..3 {
+        let c = chars.next()?;
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        code_str.push(c);
+    }
+    match chars.next() {
+        None | Some(' ') => {}
+        Some(_) => return None,
+    }
+    let code: u16 = code_str.parse().ok()?;
+    if (100..=599).contains(&code) {
+        Some(code)
+    } else {
+        None
+    }
 }
 
 /// readiness probe の応答本文に含まれていれば「CDP `/json/version` らしい」
@@ -507,6 +538,28 @@ pub fn http_status_for_io_error(kind: std::io::ErrorKind) -> (u16, &'static str)
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => (408, "Request Timeout"),
         _ => (400, "Bad Request"),
     }
+}
+
+/// `Content-Length` ヘッダーの値（コロンの後ろ、前後の空白を含み得る）を
+/// 厳密に解釈する。
+///
+/// レビュー指摘 P2（コーディネーター指示。PR #442 再々々々々々々レビュー）:
+/// 以前は `value.trim().parse::<usize>().ok()` で解釈しており、パースに
+/// 失敗した場合は素通りして `content_length` を `None`（＝ヘッダーが
+/// 無かった場合と同じ「長さ指定なし」）にしていた。しかし `Content-Length`
+/// ヘッダー自体は存在しているので、値が不正（非数値・空・符号付き等）
+/// なら「長さ指定なし」ではなく probe 失敗として扱うべきである
+/// （呼び出し元 `probe_once` はこの関数が `None` を返したら `Content-Length`
+/// が無かった場合とは区別して即座に probe 失敗にする契約とする）。
+/// `usize::parse` は非負整数でも `"+200"` のような符号付き表記を受理して
+/// しまうため、ここでは前後の空白を取り除いた後、ASCII 数字のみで構成
+/// された非空文字列であることを明示的に検証してから `parse` する。
+pub fn parse_content_length(value: &str) -> Option<usize> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    trimmed.parse::<usize>().ok()
 }
 
 /// readiness probe が受け取った `Content-Length` が、読み取りに許す上限
@@ -1183,6 +1236,59 @@ mod tests {
         assert_eq!(parse_http_status("HTTP/1.1 abc"), None);
     }
 
+    // レビュー指摘 P2（コーディネーター指示。PR #442 再々々々々々々
+    // レビュー・support.rs:109）: `HTTP/1.0`・`HTTP/1.1` のいずれかに続く
+    // 単一の SP、ちょうど 3 桁の数字（100〜599）、その後に SP か行末、
+    // という形式だけを受理する。
+    #[test]
+    fn parse_http_status_accepts_http_1_0_and_1_1() {
+        assert_eq!(parse_http_status("HTTP/1.0 200 OK\r\n"), Some(200));
+        assert_eq!(parse_http_status("HTTP/1.1 200 OK\r\n"), Some(200));
+    }
+
+    #[test]
+    fn parse_http_status_accepts_status_without_reason_phrase() {
+        // 行末（SP なし）で終わる場合も受理する。
+        assert_eq!(parse_http_status("HTTP/1.1 200"), Some(200));
+        assert_eq!(parse_http_status("HTTP/1.1 200\r\n"), Some(200));
+    }
+
+    #[test]
+    fn parse_http_status_accepts_boundary_codes() {
+        assert_eq!(parse_http_status("HTTP/1.1 100 Continue\r\n"), Some(100));
+        assert_eq!(parse_http_status("HTTP/1.1 599 Unassigned\r\n"), Some(599));
+    }
+
+    #[test]
+    fn parse_http_status_rejects_unknown_version() {
+        assert_eq!(parse_http_status("HTTP/potato 200 OK\r\n"), None);
+        assert_eq!(parse_http_status("HTTP/2 200 OK\r\n"), None);
+        assert_eq!(parse_http_status("HTTP/2.0 200 OK\r\n"), None);
+        assert_eq!(parse_http_status("http/1.1 200 OK\r\n"), None);
+    }
+
+    #[test]
+    fn parse_http_status_rejects_out_of_range_codes() {
+        assert_eq!(parse_http_status("HTTP/1.1 099 OK\r\n"), None);
+        assert_eq!(parse_http_status("HTTP/1.1 600 OK\r\n"), None);
+        assert_eq!(parse_http_status("HTTP/1.1 000 OK\r\n"), None);
+    }
+
+    #[test]
+    fn parse_http_status_rejects_wrong_digit_count() {
+        assert_eq!(parse_http_status("HTTP/1.1 20 OK\r\n"), None);
+        assert_eq!(parse_http_status("HTTP/1.1 2000 OK\r\n"), None);
+        assert_eq!(parse_http_status("HTTP/1.1 20a OK\r\n"), None);
+    }
+
+    #[test]
+    fn parse_http_status_rejects_missing_or_extra_separators() {
+        // バージョンとコードの間に SP が無い。
+        assert_eq!(parse_http_status("HTTP/1.1200 OK\r\n"), None);
+        // SP が 2 つ（余分な空白）。
+        assert_eq!(parse_http_status("HTTP/1.1  200 OK\r\n"), None);
+    }
+
     // レビュー指摘 Medium（Cursor。PR #442 再々々々々レビュー・
     // competitor_lightpanda.rs:486-535）: readiness probe の応答本文が
     // ブラウザ（CDP `/json/version`）らしい形かどうかで、別プロセスの
@@ -1577,6 +1683,40 @@ mod tests {
     #[test]
     fn content_length_exceeds_limit_false_when_absent() {
         assert!(!content_length_exceeds_limit(None, 64));
+    }
+
+    // レビュー指摘 P2（コーディネーター指示。PR #442 再々々々々々々
+    // レビュー）: `Content-Length` ヘッダーが存在するのに値が不正
+    // （非数値・空・符号付き等）な場合は「長さ指定なし」ではなく
+    // `None`（呼び出し元はこれを probe 失敗として扱う）にする。
+    #[test]
+    fn parse_content_length_accepts_plain_digits() {
+        assert_eq!(parse_content_length("123"), Some(123));
+        assert_eq!(parse_content_length(" 123 "), Some(123));
+        assert_eq!(parse_content_length("0"), Some(0));
+        // 先頭ゼロは HTTP のグラマー上許容される（DIGIT の連続）。
+        assert_eq!(parse_content_length("007"), Some(7));
+    }
+
+    #[test]
+    fn parse_content_length_rejects_empty() {
+        assert_eq!(parse_content_length(""), None);
+        assert_eq!(parse_content_length("   "), None);
+    }
+
+    #[test]
+    fn parse_content_length_rejects_non_numeric() {
+        assert_eq!(parse_content_length("abc"), None);
+        assert_eq!(parse_content_length("12abc"), None);
+        assert_eq!(parse_content_length("12.5"), None);
+    }
+
+    #[test]
+    fn parse_content_length_rejects_signed() {
+        // `usize::parse` は `"+123"` を受理してしまうため、明示的に
+        // 拒否できていることを確認する。
+        assert_eq!(parse_content_length("+123"), None);
+        assert_eq!(parse_content_length("-123"), None);
     }
 
     // レビュー指摘 P0・P1（Codex。PR #442 再々レビュー・

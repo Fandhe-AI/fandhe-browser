@@ -75,9 +75,9 @@ use std::time::{Duration, Instant};
 use support::{
     DeadlineReader, JsonValue, Outcome, approx_tokens, arg_error_gate, bench_exit_code,
     content_length_exceeds_limit, expand_args, http_status_for_io_error, json_escape,
-    looks_like_browser_readiness_response, lookup_fixture, median, parse_http_request_line,
-    parse_http_status, parse_json, reduction_pct, require_bin, split_args, token_reduction_gate,
-    validate_local_bench_url, validate_mcp_response,
+    looks_like_browser_readiness_response, lookup_fixture, median, parse_content_length,
+    parse_http_request_line, parse_http_status, parse_json, reduction_pct, require_bin, split_args,
+    token_reduction_gate, validate_local_bench_url, validate_mcp_response,
 };
 // `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
 // 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
@@ -738,7 +738,23 @@ fn probe_once(port: u16, request: &str, outer_deadline: Instant) -> Option<(u16,
             .to_ascii_lowercase()
             .strip_prefix("content-length:")
         {
-            content_length = value.trim().parse::<usize>().ok();
+            // レビュー指摘 P2（コーディネーター指示。PR #442
+            // 再々々々々々々レビュー）: `Content-Length` ヘッダー自体は
+            // 存在するのに値が不正（非数値・空・符号付き等。
+            // `support::parse_content_length` 参照）な場合、以前は
+            // `.ok()` で握りつぶして「長さ指定なし」（EOF まで読む
+            // フォールバック）扱いにしていた。ヘッダーが実在するのに
+            // その値を無視するのは、相手の応答を正しく解釈できていない
+            // ことを意味するため、ここで probe 失敗にする（フォール
+            // バックしない）。同様に、同じヘッダーが複数回現れて値が
+            // 食い違う場合（重複して矛盾する `Content-Length`）も、
+            // どちらの値を信じるべきか判断できないため probe 失敗にする
+            // （同一値の重複は許容する）。
+            let parsed = parse_content_length(value)?;
+            match content_length {
+                Some(existing) if existing != parsed => return None,
+                _ => content_length = Some(parsed),
+            }
         }
     }
     // レビュー指摘（advisor。PR #442 再々々々々レビュー後の追加指摘）:
