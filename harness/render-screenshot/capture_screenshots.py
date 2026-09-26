@@ -29,6 +29,7 @@ import html
 import ipaddress
 import json
 import math
+import os
 import re
 import shutil
 import socket
@@ -70,6 +71,13 @@ SNAPSHOT_USER_AGENT = "fandhe-browser-harness/0.1 (+https://github.com/Fandhe-AI
 SNAPSHOT_TIMEOUT_SEC = 30
 SNAPSHOT_MAX_BYTES = 5 * 1024 * 1024
 
+# 撮影済み PNG を検証のため読み込む際の上限（Cursor/codex P1）。エンジンが暴走・
+# 破損して巨大ファイルを書き出した場合でも `read_png_size` が `read_bytes()` で
+# 無制限にメモリへ確保しないよう、サイズ超過は `stat` の時点で `failed` として
+# 弾く（security.md OWASP「不安全な設計」）。1280x800 相当の非圧縮 RGBA
+# （約 4 MiB）を大きく上回る値として 64 MiB を採用する。
+MAX_PNG_BYTES = 64 * 1024 * 1024
+
 STDERR_TAIL_CHARS = 2000
 
 CHROMIUM_BIN_CANDIDATES = ("chromium", "chromium-browser", "google-chrome")
@@ -82,10 +90,44 @@ DEFAULT_CHROMIUM_TEMPLATE = [
     "--no-first-run",
     "--user-data-dir={user_data_dir}",
     "--window-size={width},{height}",
+    # HiDPI ホスト（`--force-device-scale-factor` 既定 1 でない環境）で撮影すると
+    # PNG が要求した viewport の DPR 倍の寸法になり、`read_png_size` 後の寸法一致
+    # 検証（capture_one）で全サイトが `failed` になる（Cursor Bugbot Medium）。
+    # デバイススケールを 1 に固定し、`{width}x{height}` の PNG を安定して得る。
+    "--force-device-scale-factor=1",
     "--virtual-time-budget={settle_ms}",
     "--screenshot={out}",
     "{url}",
 ]
+
+# `{url}` を直接エンジンへ渡す直接ナビゲーション経路（既定 Chromium テンプレート等）で
+# 許可する URL の固定リスト（codex P0）。`_check_public_host` はエンジン起動前の
+# 一時点の名前解決に基づくベストエフォートに過ぎず、別プロセスのブラウザが公開
+# ホストから内部アドレスへリダイレクトされた場合の遷移までは検証できない。
+# `--sites` を差し替えれば任意の https URL がこの経路を通ってしまうと SSRF 防御の
+# 迂回になるため、直接ナビゲーションは `sites.json`（TASK-37.1 の代表サイト一覧）
+# に載る既定サイトの URL に完全一致する場合のみ許可し、それ以外は
+# `{html_path}` 経由のスナップショット取得（`fetch_snapshot`。取得後にリダイレクト
+# 先も検証する `_PublicOnlyRedirectHandler` を通る）に限定する。
+# `sites.json` を更新した場合はこの定数も合わせて更新する必要があり、
+# `test_default_sites_urls_are_all_allowlisted`（test_capture_screenshots.py）が
+# 乖離を検出する。
+#
+# 検討したが採用しなかった多層防御: Chromium の `--host-resolver-rules` は
+# ホスト名の解決先を固定できるが、任意の応答先 IP を「グローバルユニキャストの
+# 範囲に強制する」機能ではなく、`file:`/カスタムスキームへの遷移も塞がない。
+# 「確実に防げる」と言えない対策をコメントだけで防げるかのように書かない
+# （REPAIR-3）。
+DIRECT_NAVIGATION_ALLOWED_URLS: frozenset[str] = frozenset(
+    {
+        "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+        "https://doc.rust-lang.org/book/",
+        "https://docs.python.org/3/",
+        "https://news.ycombinator.com",
+        "https://react.dev",
+        "https://developer.mozilla.org/en-US/docs/Web/JavaScript",
+    }
+)
 
 RESULT_SCHEMA_VERSION = 1
 
@@ -245,6 +287,34 @@ def resolve_chromium_bin(explicit: str | None) -> str | None:
     return None
 
 
+# --- symlink を追随しないファイル書き込み ---------------------------------
+
+
+def _write_bytes_nofollow(path: Path, data: bytes) -> None:
+    """`path` がシンボリックリンクなら追随せず拒否し、通常ファイルとして書き込む。
+
+    `--out-dir` を使い回す再実行で `snapshots/<site_id>.html`（や結果 JSON）が
+    既に外部ファイルへの symlink になっていた場合、素朴な `Path.write_bytes` は
+    リンクをたどってそのファイルを取得データで上書きしてしまう（codex P0）。
+    `os.open` に `O_NOFOLLOW`（Linux/macOS）を渡すことで最終コンポーネントの
+    symlink 追随を OS レベルで拒否する。Windows には `O_NOFOLLOW` が無いため、
+    そちらでは事前の `Path.is_symlink()`（`lstat` 相当）で明示的に拒否する
+    （チェックと open の間の TOCTOU は残るが、通常運用では出力先に symlink を
+    作らないため許容する）。呼び出し元の期待する例外型（`SnapshotError` /
+    `CaptureError` 等）へは呼び出し元で変換する。
+    """
+    if path.is_symlink():
+        raise OSError(f"refusing to write through an existing symlink: {path}")
+    # `O_NOFOLLOW` は Linux/macOS でのみ存在する（Windows では 0 扱い）。
+    # `O_BINARY`（Windows のみ）は CRT のテキストモード（`\n` を `\r\n` へ変換する
+    # 挙動）を抑止し、内部データファイルの改行は LF 固定という規約
+    # （coding-rust.md）を Windows でも保つ。
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+
+
 # --- `{html_path}` 用スナップショット取得 --------------------------------
 
 
@@ -363,7 +433,10 @@ def fetch_snapshot(
     if len(data) > max_bytes:
         raise SnapshotError(f"snapshot for {url} exceeds the {max_bytes} byte limit")
 
-    dest_path.write_bytes(inject_base_href(data, url))
+    try:
+        _write_bytes_nofollow(dest_path, inject_base_href(data, url))
+    except OSError as exc:
+        raise SnapshotError(f"failed to write snapshot file: {dest_path}: {exc}") from exc
 
 
 # `(?![a-zA-Z0-9_-])` は `<head>` 直後がタグ名を構成する文字でないことを要求し、
@@ -407,7 +480,19 @@ def read_png_size(path: Path) -> tuple[int, int]:
     ちょうど終わっている（トレイリングの欠落・余剰データが無い）ことまで確認する。
     IDAT のピクセルデータそのものの deflate 展開・画素比較までは行わない
     （全体の内容比較は #54 の measure_ssim.py が担う。REPAIR-3）。
+
+    エンジンが暴走・破損して巨大な PNG を書き出した場合に `read_bytes()` で
+    無制限にメモリへ確保しないよう、内容を読む前に `stat` でサイズを確認し
+    `MAX_PNG_BYTES` を超えていれば `failed` 相当の `PngError` として拒否する
+    （Cursor/codex P1）。
     """
+    try:
+        file_size = path.stat().st_size
+    except OSError as exc:
+        raise PngError(f"failed to stat PNG file: {path}: {exc}") from exc
+    if file_size > MAX_PNG_BYTES:
+        raise PngError(f"PNG file exceeds the {MAX_PNG_BYTES} byte limit: {path}")
+
     try:
         data = path.read_bytes()
     except OSError as exc:
@@ -584,6 +669,16 @@ def capture_one(
         argv = expand_template(template, values)
 
         if needs_html:
+            # `snapshots/<site_id>.html` の保存先が out-dir 配下にあることを
+            # `resolved_out`（PNG 出力先）と同じ方針で確認する（codex P0）。
+            # `resolve()` は途中・末尾の symlink をすべて解決するため、
+            # `snapshots_dir` 自体や `snapshot_path` が out-dir 外を指す symlink
+            # の場合はここで検出できる。書き込み時点の TOCTOU は
+            # `_write_bytes_nofollow` の `O_NOFOLLOW` / `is_symlink` チェックで
+            # 別途防ぐ。
+            resolved_snapshot = snapshot_path.resolve()
+            if not resolved_snapshot.is_relative_to(out_dir.resolve()):
+                raise CaptureError(f"refusing to write outside out-dir: {resolved_snapshot}")
             snapshot_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 fetch_snapshot(site.url, snapshot_path, allow_file_url=allow_file_url)
@@ -594,15 +689,24 @@ def capture_one(
             # そのままエンジンへ渡す（直接ナビゲーション）テンプレート向けの
             # SSRF 対策（codex P0: `fetch_snapshot` 経路にしか掛かっておらず
             # `--sites` に内部アドレスの https URL を指定すると迂回できた）。
-            # `fetch_snapshot` と同じ `_check_public_host` で内部アドレスを拒否する。
-            # ここでの検証はエンジン起動前の一時点の名前解決に基づくベストエフォート
-            # であり、エンジン（ブラウザ）自身がその後たどるリダイレクト先までは
-            # 検証できない（`fetch_snapshot` の `_PublicOnlyRedirectHandler` と異なり、
-            # 別プロセスのブラウザの内部遷移には介入できないため。REPAIR-3）。
+            # `fetch_snapshot` と同じ `_check_public_host` で内部アドレスを拒否する
+            # が、これはエンジン起動前の一時点の名前解決に基づくベストエフォート
+            # に過ぎず、別プロセスのブラウザ自身がその後たどるリダイレクト先までは
+            # 検証できない（`fetch_snapshot` の `_PublicOnlyRedirectHandler` と異なり
+            # 介入できない）。そのため直接ナビゲーションは
+            # `DIRECT_NAVIGATION_ALLOWED_URLS`（sites.json の既定サイトのみを
+            # 複製した固定リスト）に完全一致する URL に限定し、それ以外は
+            # `{html_path}` 経由のスナップショット取得に回す（REPAIR-3）。
             parsed_url = urlparse(site.url)
             try:
                 if parsed_url.scheme == "https":
                     _check_public_host(parsed_url.hostname, context=f"direct navigation URL {site.url}")
+                    if site.url not in DIRECT_NAVIGATION_ALLOWED_URLS:
+                        raise SnapshotError(
+                            "direct navigation ({url} template) is limited to the fixed "
+                            "default sites in DIRECT_NAVIGATION_ALLOWED_URLS; use a "
+                            f"{{html_path}} template to capture other URLs: {site.url}"
+                        )
                 elif not (parsed_url.scheme == "file" and allow_file_url):
                     raise SnapshotError(
                         f"unsupported scheme for direct navigation: {site.url}"
@@ -728,7 +832,12 @@ def write_result(
     captures: list[dict[str, Any]],
     partial: bool,
 ) -> Path:
-    """撮影結果を `<out-dir>/capture-result.json` へ書き出す（#54 の入力契約）。"""
+    """撮影結果を `<out-dir>/capture-result.json` へ書き出す（#54 の入力契約）。
+
+    `--out-dir` を使い回す再実行で `capture-result.json` が外部ファイルへの
+    symlink になっていた場合の上書きを防ぐため、`_write_bytes_nofollow` で
+    追随せずに書き込む（codex P0。`fetch_snapshot` の HTML 保存と同じ問題）。
+    """
     result_path = out_dir / "capture-result.json"
     payload: dict[str, Any] = {
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -748,7 +857,10 @@ def write_result(
     if partial:
         payload["partial"] = True
     text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    result_path.write_text(text, encoding="utf-8", newline="\n")
+    try:
+        _write_bytes_nofollow(result_path, text.encode("utf-8"))
+    except OSError as exc:
+        raise CaptureError(f"failed to write result file: {result_path}: {exc}") from exc
     return result_path
 
 
@@ -951,7 +1063,11 @@ def main(argv: list[str] | None = None) -> int:
         print("dry-run: no files were written")
         return 0
 
-    write_result(out_dir, viewport=viewport, sites=sites, captures=captures, partial=len(engines) < 2)
+    try:
+        write_result(out_dir, viewport=viewport, sites=sites, captures=captures, partial=len(engines) < 2)
+    except CaptureError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     # 受入基準は「代表サイト分の PNG を両エンジンで出力できること」であり、個々の
     # サイトの失敗を即座に fail-closed とはしない。指定した各エンジンについて

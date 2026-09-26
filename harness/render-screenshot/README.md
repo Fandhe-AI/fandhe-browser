@@ -88,6 +88,28 @@ Chromium 側はローカルに `chromium` / `chromium-browser` / `google-chrome`
 非 https への転送は追跡しない。DNS 応答は検証後に変わりうる（DNS リバインディング）
 ため、これは接続前チェックのベストエフォートであり完全な対策ではない。
 
+保存先（`snapshots/<site_id>.html`・`capture-result.json`）は書き込み前に
+`resolve()` して `--out-dir` 配下であることを確認し、既存の symlink があっても
+`O_NOFOLLOW`（Windows では `is_symlink()` での事前拒否）でリンクをたどらずに
+書き込む。`--out-dir` を使い回す再実行で保存先が外部ファイルへの symlink に
+差し替えられていても、そのファイルを取得データで上書きしない。
+
+### `{url}` 直接ナビゲーションの許可リスト
+
+`{html_path}` を使わず `{url}` をそのままエンジンへ渡すテンプレート（既定 Chromium
+テンプレート等）では、上記の SSRF 検証はエンジン起動前の一時点の名前解決に基づく
+ベストエフォートに過ぎず、別プロセスのブラウザ自身がその後たどるリダイレクト先
+までは検証できない。そのため直接ナビゲーションは `capture_screenshots.py` の
+`DIRECT_NAVIGATION_ALLOWED_URLS`（`sites.json` の既定サイト URL をそのまま複製した
+固定リスト）に完全一致する URL のみを許可し、それ以外（`--sites` に差し替えた
+任意の URL 等）は `skipped` として拒否する。任意 URL を撮影したい場合は
+`{html_path}` テンプレートを使うこと（取得後にリダイレクト先も検証する
+`_PublicOnlyRedirectHandler` を通る）。`sites.json` を更新した場合はこの固定リストも
+合わせて更新する必要があり、乖離は `test_default_sites_urls_are_all_allowlisted`
+で検出される。Chromium の `--host-resolver-rules` はホスト名の解決先を固定できる
+だけで、応答先 IP をグローバルユニキャストの範囲に強制する機能ではないため、
+確実な多層防御としては採用していない。
+
 保存した HTML はそのままだと `file://` の保存先パス基準で相対 URL が解決され、
 元の URL を直接開く Chromium と条件が食い違う。取得したスナップショットには
 `<head>` 直後（無ければ先頭）に `<base href="{元の URL}">` を注入し、相対リンク・
@@ -116,8 +138,8 @@ servoshell 系（TASK-36 で確定したオプション名に合わせて読み�
 [
   "{chromium_bin}", "--headless=new", "--disable-gpu", "--hide-scrollbars",
   "--no-first-run", "--user-data-dir={user_data_dir}",
-  "--window-size={width},{height}", "--virtual-time-budget={settle_ms}",
-  "--screenshot={out}", "{url}"
+  "--window-size={width},{height}", "--force-device-scale-factor=1",
+  "--virtual-time-budget={settle_ms}", "--screenshot={out}", "{url}"
 ]
 ```
 
@@ -125,7 +147,11 @@ servoshell 系（TASK-36 で確定したオプション名に合わせて読み�
 （実際のユーザープロファイル・Cookie・キャッシュは使わず、残さない。PROF 系規約）。
 コンテナで root 実行する場合に必要な `--no-sandbox` は既定では付けない。必要なら
 `--chromium-cmd` で明示的に追加する。UA の上書きや anti-bot 回避のフラグは付けない
-（SEC 系: 偽装・回避機能の禁止）。
+（SEC 系: 偽装・回避機能の禁止）。`--force-device-scale-factor=1` は HiDPI ホスト
+（既定のデバイススケールが 1 でない環境）で PNG が `--window-size` の DPR 倍の
+寸法になり、`capture_one` の viewport 寸法一致検証で全サイトが `failed` になる
+問題への対策（Cursor Bugbot）。`--chromium-cmd` で独自テンプレートを使う場合は
+このフラグを自分で含める必要がある。
 
 ## 出力構造
 
@@ -216,10 +242,20 @@ python3 -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
   ブラウザ）自身がその後たどるリダイレクト先までは検証できない。サイト一覧は
   `docs/design/site-catalog-task70.md`（TASK-70 / COMPAT-3）で 403 や
   robots.txt Disallow により除外されたものを使わない（SSRF・偽装回避の禁止）
+- `{url}` を直接エンジンへ渡す直接ナビゲーションは、上記の SSRF 検証に加えて
+  `DIRECT_NAVIGATION_ALLOWED_URLS`（`sites.json` の既定サイト URL の固定リスト）
+  への完全一致を要求する。任意 URL は `{html_path}` 経由でのみ撮影できる
+- 保存先ファイル（`snapshots/<site_id>.html`・`capture-result.json`）は
+  `resolve()` 後に `--out-dir` 配下であることを確認し、既存の symlink があっても
+  `O_NOFOLLOW`（`_write_bytes_nofollow`。Windows では `is_symlink()` 事前チェック）
+  でリンク先ではなく新規ファイルとして書き込む（再実行時の symlink 経由の
+  外部ファイル上書き対策）
 - 撮影ごとのタイムアウト・スナップショットのサイズ上限・サイト数上限（50）・
   `stderr` 末尾 2000 文字までの保持（子プロセスの標準出力・標準エラーは
   無制限にメモリへは保持せず、`stdout` は破棄し `stderr` はテンポラリファイル
-  経由で末尾のみ読む）により、無制限のリソース確保を防ぐ
+  経由で末尾のみ読む）により、無制限のリソース確保を防ぐ。撮影済み PNG の
+  検証も `stat` でのサイズ上限（`MAX_PNG_BYTES`＝64 MiB）確認を先に行い、
+  超過分は `read_bytes()` で読まずに `failed` として扱う
 - `--timeout-sec` / `--settle-ms` / `--min-sites` は有限かつ範囲内の値のみを
   受け付け、`nan` / `inf` / 0 以下 / 極端に大きい値は起動時に拒否する
 - 撮影用の一時 `--user-data-dir`（Chromium）はテンプレート展開・スナップショット

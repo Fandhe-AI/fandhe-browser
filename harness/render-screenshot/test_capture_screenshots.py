@@ -243,6 +243,20 @@ class ReadPngSizeTest(unittest.TestCase):
             with self.assertRaises(cs.PngError):
                 cs.read_png_size(path)
 
+    def test_rejects_oversized_file_before_reading_full_contents(self) -> None:
+        # Cursor/codex P1: `read_bytes()` で無制限にメモリへ読み込む前に、`stat`
+        # の時点でサイズ上限（`MAX_PNG_BYTES`）超過を検出して拒否する。テストでは
+        # 上限を小さく差し替え、実際に巨大なファイルを書かずに検証する。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "oversized.png"
+            # シグネチャだけの小さいファイルでも、サイズ上限チェックが `read_bytes()`
+            # より先に効くことを確認できればよい（内容の妥当性は問わない）。
+            path.write_bytes(cs.PNG_SIGNATURE + b"\x00" * 64)
+            with mock.patch.object(cs, "MAX_PNG_BYTES", 8):
+                with self.assertRaises(cs.PngError) as ctx:
+                    cs.read_png_size(path)
+            self.assertIn("byte limit", str(ctx.exception))
+
 
 class _Resp(io.BytesIO):
     def __enter__(self):
@@ -250,6 +264,82 @@ class _Resp(io.BytesIO):
 
     def __exit__(self, *exc):
         return False
+
+
+class WriteBytesNoFollowTest(unittest.TestCase):
+    """RENDER-5 / TASK-37.1: `_write_bytes_nofollow`（symlink 追随の拒否。codex P0）。"""
+
+    def test_writes_new_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.bin"
+            cs._write_bytes_nofollow(path, b"hello")
+            self.assertEqual(path.read_bytes(), b"hello")
+
+    def test_overwrites_existing_regular_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.bin"
+            path.write_bytes(b"old")
+            cs._write_bytes_nofollow(path, b"new")
+            self.assertEqual(path.read_bytes(), b"new")
+
+    def test_refuses_existing_symlink_via_is_symlink_check(self) -> None:
+        # 実際に symlink を作らずとも、`Path.is_symlink()` が真を返す状況を
+        # モックで再現すれば OS 非依存（Windows 含む）に検証できる。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "link.bin"
+            with mock.patch.object(Path, "is_symlink", return_value=True):
+                with self.assertRaises(OSError):
+                    cs._write_bytes_nofollow(path, b"data")
+            self.assertFalse(path.exists())
+
+    def test_refuses_real_symlink_to_outside_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outside_target = Path(tmp) / "outside.txt"
+            outside_target.write_text("keep me", encoding="utf-8")
+            link = Path(tmp) / "link.bin"
+            try:
+                link.symlink_to(outside_target)
+            except OSError:
+                self.skipTest("symlink creation is not permitted in this environment")
+            with self.assertRaises(OSError):
+                cs._write_bytes_nofollow(link, b"overwrite attempt")
+            self.assertEqual(outside_target.read_text(encoding="utf-8"), "keep me")
+
+
+class WriteResultTest(unittest.TestCase):
+    """RENDER-5 / TASK-37.1: `write_result`（`capture-result.json` の symlink 追随防止。codex P0）。"""
+
+    def test_writes_normally(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            site = cs.Site(site_id="a", url="https://example.invalid", category="static", catalog_id="z1")
+            result_path = cs.write_result(
+                out_dir, viewport={"width": 1280, "height": 800}, sites=[site], captures=[], partial=False
+            )
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema_version"], cs.RESULT_SCHEMA_VERSION)
+
+    def test_refuses_to_overwrite_existing_symlink(self) -> None:
+        # `--out-dir` を使い回す再実行で `capture-result.json` が外部ファイルへの
+        # symlink に差し替えられていた場合、そのファイルを結果 JSON で上書き
+        # してはならない（`fetch_snapshot` の HTML 保存と同じ問題。codex P0）。
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "out"
+            out_dir.mkdir()
+            outside_target = Path(tmp) / "outside.json"
+            outside_target.write_text("keep me", encoding="utf-8")
+            result_path = out_dir / "capture-result.json"
+            try:
+                result_path.symlink_to(outside_target)
+            except OSError:
+                self.skipTest("symlink creation is not permitted in this environment")
+
+            site = cs.Site(site_id="a", url="https://example.invalid", category="static", catalog_id="z1")
+            with self.assertRaises(cs.CaptureError):
+                cs.write_result(
+                    out_dir, viewport={"width": 1280, "height": 800}, sites=[site], captures=[], partial=False
+                )
+            self.assertEqual(outside_target.read_text(encoding="utf-8"), "keep me")
 
 
 class FetchSnapshotTest(unittest.TestCase):
@@ -290,6 +380,26 @@ class FetchSnapshotTest(unittest.TestCase):
                 dest.read_bytes(),
                 b'<base href="https://example.invalid/"><html></html>',
             )
+
+    def test_refuses_to_write_through_existing_symlink(self) -> None:
+        # codex P0: `write_bytes` は既存の symlink をたどってしまう。`--out-dir`
+        # を使い回す再実行で `snapshots/<site_id>.html` が外部ファイルへの
+        # symlink だった場合、そのファイルを取得 HTML で上書きできてはならない。
+        with tempfile.TemporaryDirectory() as tmp:
+            outside_target = Path(tmp) / "outside.txt"
+            outside_target.write_text("do not overwrite me", encoding="utf-8")
+            dest = Path(tmp) / "s.html"
+            try:
+                dest.symlink_to(outside_target)
+            except OSError:
+                self.skipTest("symlink creation is not permitted in this environment")
+            with (
+                mock.patch.object(cs, "_check_public_host"),
+                mock.patch.object(cs, "_open_url", return_value=_Resp(b"<html></html>")),
+            ):
+                with self.assertRaises(cs.SnapshotError):
+                    cs.fetch_snapshot("https://example.invalid/", dest)
+            self.assertEqual(outside_target.read_text(encoding="utf-8"), "do not overwrite me")
 
     def test_injects_base_href_even_without_head_tag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -730,12 +840,15 @@ class CaptureIntegrationTest(unittest.TestCase):
 
     def test_missing_engine_binary_is_reported_as_failed_not_a_crash(self) -> None:
         # テンプレートが `{url}` を直接使うため、直接ナビゲーション向けの SSRF
-        # チェック（`_check_public_host`）が挟まる。実 DNS 解決に依存しない
-        # よう `_check_public_host` をモックする（他の FetchSnapshotTest 系
-        # テストと同じ方針）。
+        # チェック（`_check_public_host`）と既定サイト許可リストの検証が挟まる。
+        # 実 DNS 解決・sites.json への追加に依存しないよう両方をモック・差し替える
+        # （他の FetchSnapshotTest 系テストと同じ方針）。
         with tempfile.TemporaryDirectory() as tmp:
             site = cs.Site(site_id="no-bin", url="https://example.invalid", category="static", catalog_id="z1")
-            with mock.patch.object(cs, "_check_public_host"):
+            with (
+                mock.patch.object(cs, "_check_public_host"),
+                mock.patch.object(cs, "DIRECT_NAVIGATION_ALLOWED_URLS", frozenset({site.url})),
+            ):
                 record = cs.capture_one(
                     site,
                     "servo",
@@ -858,13 +971,17 @@ class CaptureIntegrationTest(unittest.TestCase):
             self.assertEqual(record["status"], "skipped")
 
     def test_direct_url_navigation_to_public_host_still_captures(self) -> None:
-        # 直接ナビゲーションの SSRF チェックが公開ホストの正常系まで壊していない
-        # ことを確認する（実 DNS 解決は `_check_public_host` をモックして避ける）。
+        # 直接ナビゲーションの SSRF チェック・既定サイト許可リスト検証が公開ホスト
+        # の正常系まで壊していないことを確認する（実 DNS 解決は `_check_public_host`
+        # をモックして避け、許可リストはこのテストの URL だけに差し替える）。
         with tempfile.TemporaryDirectory() as tmp:
             site = cs.Site(
                 site_id="ssrf-public-ok", url="https://example.invalid/a", category="static", catalog_id="z1"
             )
-            with mock.patch.object(cs, "_check_public_host"):
+            with (
+                mock.patch.object(cs, "_check_public_host"),
+                mock.patch.object(cs, "DIRECT_NAVIGATION_ALLOWED_URLS", frozenset({site.url})),
+            ):
                 record = cs.capture_one(
                     site,
                     "chromium",
@@ -904,6 +1021,110 @@ class CaptureIntegrationTest(unittest.TestCase):
             )
             self.assertEqual(record["status"], "ok")
             self.assertEqual(record["png"], "servo/ok-id.png")
+
+    def test_snapshot_path_escaping_out_dir_via_symlinked_snapshots_dir_is_rejected(self) -> None:
+        # codex P0: `snapshots_dir` 自体が out-dir 外を指す symlink だった場合、
+        # `snapshot_path.resolve()` はそのリンクをたどって out-dir 外のパスに
+        # 解決される。containment チェックがこれを検出して拒否することを確認する。
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "out"
+            out_dir.mkdir()
+            outside_dir = Path(tmp) / "outside"
+            outside_dir.mkdir()
+            snapshots_dir = out_dir / "snapshots"
+            try:
+                snapshots_dir.symlink_to(outside_dir, target_is_directory=True)
+            except OSError:
+                self.skipTest("symlink creation is not permitted in this environment")
+
+            site = cs.Site(site_id="escape", url="https://example.invalid", category="static", catalog_id="z1")
+            with self.assertRaises(cs.CaptureError):
+                cs.capture_one(
+                    site,
+                    "servo",
+                    ["engine", "{html_path}", "{out}"],
+                    out_dir=out_dir,
+                    snapshots_dir=snapshots_dir,
+                    chromium_bin=None,
+                    width=1280,
+                    height=800,
+                    settle_ms=1000,
+                    timeout_sec=5,
+                    allow_file_url=False,
+                    dry_run=False,
+                )
+            self.assertEqual(list(outside_dir.iterdir()), [])
+
+
+class DirectNavigationAllowlistTest(unittest.TestCase):
+    """RENDER-5 / TASK-37.1: 直接ナビゲーション（`{url}`）の既定サイト許可リスト（codex P0）。
+
+    `_check_public_host` は起動前の一時点の名前解決に基づくベストエフォートに
+    過ぎず、リダイレクトまでは検証できない。`sites.json` を差し替えるだけで
+    任意の https URL を直接ナビゲーションさせられないよう、既定サイトの
+    URL に完全一致する場合のみ許可することを確認する。
+    """
+
+    def test_default_sites_urls_are_all_allowlisted(self) -> None:
+        # sites.json とコード側の固定リストが乖離すると、リポジトリ既定の実行
+        # （`--sites` 省略・既定 Chromium テンプレート）が直接ナビゲーションで
+        # 全滅する。逆方向（sites.json から削除されたサイトが固定リストに残り、
+        # 403・robots.txt Disallow 等で除外したはずの URL への直接ナビゲーションを
+        # 許可し続ける）も検出できるよう、集合として完全一致することを確認する。
+        _viewport, sites = cs.load_sites(DEFAULT_SITES_PATH, min_sites=5)
+        self.assertEqual({site.url for site in sites}, cs.DIRECT_NAVIGATION_ALLOWED_URLS)
+
+    def test_rejects_url_not_in_allowlist_even_when_public_host_check_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            site = cs.Site(
+                site_id="not-allowlisted", url="https://example.invalid/a", category="static", catalog_id="z1"
+            )
+            with (
+                mock.patch.object(cs, "_check_public_host"),
+                mock.patch.object(cs, "DIRECT_NAVIGATION_ALLOWED_URLS", frozenset()),
+            ):
+                record = cs.capture_one(
+                    site,
+                    "chromium",
+                    [sys.executable, str(FAKE_ENGINE), "--out", "{out}", "--url", "{url}"],
+                    out_dir=Path(tmp),
+                    snapshots_dir=Path(tmp) / "snapshots",
+                    chromium_bin=None,
+                    width=1280,
+                    height=800,
+                    settle_ms=1000,
+                    timeout_sec=5,
+                    allow_file_url=False,
+                    dry_run=False,
+                )
+            self.assertEqual(record["status"], "skipped")
+            self.assertFalse((Path(tmp) / "chromium" / "not-allowlisted.png").exists())
+
+
+class DefaultChromiumTemplateTest(unittest.TestCase):
+    """RENDER-5 / TASK-37.1: 既定 Chromium テンプレートの HiDPI 対策（Cursor Bugbot Medium）。"""
+
+    def test_forces_device_scale_factor_to_one(self) -> None:
+        # HiDPI ホスト（既定の `--force-device-scale-factor` が 1 でない環境）で
+        # 撮影すると PNG が DPR 倍の寸法になり、viewport との寸法一致検証
+        # （capture_one）で全サイトが `failed` になっていた。既定テンプレートが
+        # この固定フラグを持つことを確認する。
+        self.assertIn("--force-device-scale-factor=1", cs.DEFAULT_CHROMIUM_TEMPLATE)
+
+    def test_expanded_default_template_includes_scale_factor_flag(self) -> None:
+        argv = cs.expand_template(
+            cs.DEFAULT_CHROMIUM_TEMPLATE,
+            {
+                "chromium_bin": "chromium",
+                "url": "https://example.invalid/",
+                "out": "/tmp/out.png",
+                "width": "1280",
+                "height": "800",
+                "settle_ms": "5000",
+                "user_data_dir": "/tmp/udd",
+            },
+        )
+        self.assertIn("--force-device-scale-factor=1", argv)
 
 
 class ArgValidationTest(unittest.TestCase):
