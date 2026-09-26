@@ -58,7 +58,8 @@ fn run_fake_role(args: &[String]) {
     match args.first().map(String::as_str) {
         Some("cdp-ok") => run_fake_cdp(args, true),
         Some("cdp-invalid") => run_fake_cdp(args, false),
-        Some("mcp-ok") => run_fake_mcp(),
+        Some("mcp-ok") => run_fake_mcp(false),
+        Some("mcp-stale") => run_fake_mcp(true),
         Some("mcp-disconnect") => run_fake_mcp_disconnect(),
         other => {
             eprintln!("competitor_lightpanda_measure: unknown fake role: {other:?}");
@@ -134,15 +135,25 @@ fn run_fake_cdp(args: &[String], valid: bool) {
 ///
 /// `html`/`tree` の応答文字数は [`HTML_TEXT_LEN`]/[`TREE_TEXT_LEN`] に固定し、
 /// トークン削減率（`AISNAP-1`）の期待値を具体値で検証できるようにする
-/// （coding-rust.md「テスト」: 「期待値は具体値で書く」）。
+/// （coding-rust.md「テスト」: 「期待値は具体値で書く」）。それぞれの
+/// テキストは「その `goto` が最後に指した fixture のマーカー」（各ページの
+/// `<title>`。`support::fixture_marker`） + 埋め草文字で固定長にした文字列にする。
+///
+/// `stale` が `true` の場合、`goto` を受けてもマーカーを更新しない（最初の
+/// `goto` のマーカーを使い続ける）ことで、「2 件目以降の `goto` の後も
+/// 1 件目のページ内容を返し続ける（実際には遷移していない）」対象を模す
+/// （レビュー指摘 P1。Codex。PR #442 再々々々々々々々々々レビュー・
+/// measure.rs:1450。結合テストのケース 5
+/// `stale_mcp_response_after_second_goto_is_error` が使う）。
 const HTML_TEXT_LEN: usize = 400;
 const TREE_TEXT_LEN: usize = 100;
 
-fn run_fake_mcp() {
+fn run_fake_mcp(stale: bool) {
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = std::io::stdout();
     let mut line = String::new();
+    let mut current_marker: Option<&'static str> = None;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
@@ -172,9 +183,26 @@ fn run_fake_mcp() {
                     .and_then(JsonValue::as_str)
                     .unwrap_or("");
                 let text = match name {
-                    "goto" => String::from("ok"),
-                    "html" => "a".repeat(HTML_TEXT_LEN),
-                    "tree" => "b".repeat(TREE_TEXT_LEN),
+                    "goto" => {
+                        let url = value
+                            .get("params")
+                            .and_then(|p| p.get("arguments"))
+                            .and_then(|a| a.get("url"))
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("");
+                        // `stale` でなければ毎回のマーカーを更新し、`stale` なら
+                        // 最初の 1 回だけ設定して以降は無視する（実際には遷移
+                        // していない対象を模す）。
+                        if !stale || current_marker.is_none() {
+                            current_marker = support::FIXTURE_TABLE
+                                .iter()
+                                .find(|(path, _, _)| url.ends_with(*path))
+                                .and_then(|(path, _, _)| support::fixture_marker(path));
+                        }
+                        String::from("ok")
+                    }
+                    "html" => padded_marker_text(current_marker, HTML_TEXT_LEN),
+                    "tree" => padded_marker_text(current_marker, TREE_TEXT_LEN),
                     _ => String::new(),
                 };
                 Some(format!(
@@ -189,6 +217,19 @@ fn run_fake_mcp() {
             let _ = stdout.flush();
         }
     }
+}
+
+/// `marker`（現在 `goto` 済みとみなしている fixture のマーカー。未設定なら
+/// マーカーを含まない埋め草のみ）を先頭に置き、`pad` 文字（`marker` が無い
+/// 場合は `'x'`。ある場合はマーカーと紛れない `'a'`/`'b'` は呼び出し側で
+/// 区別する必要が無いためここでは `'a'` に統一）で `total_len` 文字まで
+/// 埋めた文字列を返す。`marker` の文字数によらず常に `total_len` 文字に
+/// なるため、トークン削減率（`AISNAP-1`）の期待値を具体値で検証できる。
+fn padded_marker_text(marker: Option<&'static str>, total_len: usize) -> String {
+    let prefix = marker.unwrap_or("");
+    let prefix_len = prefix.chars().count();
+    let pad_len = total_len.saturating_sub(prefix_len);
+    format!("{prefix}{}", "a".repeat(pad_len))
 }
 
 /// fake MCP（切断版）: `initialize` リクエストを 1 件読み取ったあと、改行を
@@ -229,6 +270,8 @@ fn run_test_cases() {
     mcp_disconnect_without_newline_fails_immediately();
     eprintln!("case: unconfigured_target_is_skipped_with_exit_code_zero");
     unconfigured_target_is_skipped_with_exit_code_zero();
+    eprintln!("case: stale_mcp_response_after_second_goto_is_error");
+    stale_mcp_response_after_second_goto_is_error();
     eprintln!("competitor_lightpanda_measure: all cases passed");
 }
 
@@ -476,4 +519,48 @@ fn unconfigured_target_is_skipped_with_exit_code_zero() {
         exit_code, 0,
         "exit code should be 0 when every measurement is skipped: {body}"
     );
+}
+
+/// ケース 5: fake MCP（`mcp-stale`）が `goto` を受けてもマーカーを更新せず、
+/// 常に 1 件目のページ（`/article.html`）の内容を返し続ける場合、`goto` の
+/// JSON-RPC 応答自体は形式上妥当でも、2 件目以降の fixture
+/// （`/listing.html`・`/form.html`）については `html`/`tree` にその
+/// fixture 自身のマーカーが含まれないため、内容ベースの検証
+/// （レビュー指摘 P1。Codex。PR #442 再々々々々々々々々々レビュー・
+/// measure.rs:1450）によって計測失敗（`Outcome::Error`）になることを
+/// 確認する。
+fn stale_mcp_response_after_second_goto_is_error() {
+    let current_exe = std::env::current_exe().expect("current_exe");
+    let target = Target {
+        name: "fake-browser-stale",
+        bin: Some(current_exe),
+        serve_args: Vec::new(),
+        mcp_args: vec![FAKE_ROLE_FLAG.to_string(), "mcp-stale".to_string()],
+        serve_args_error: None,
+        mcp_args_error: None,
+    };
+
+    // `validate_local_bench_url` は文字列としての形式検証のみ行い、実際の
+    // 接続はしないため、ダミーの fixture サーバー情報（存在しないポート）を
+    // 渡しても各サイトへの `goto`（fake MCP 側は URL 文字列だけを見る）には
+    // 影響しない。
+    let dummy_port: u16 = 1;
+    let dummy_base_url = format!("http://127.0.0.1:{dummy_port}");
+
+    let outcome = measure_token_reduction(&target, &dummy_base_url, dummy_port);
+    match outcome {
+        Outcome::Error(reason) => {
+            assert!(
+                reason.contains("could not be verified"),
+                "error reason should mention the content-based navigation check failing: {reason}"
+            );
+            assert!(
+                reason.contains("listing.html") || reason.contains("form.html"),
+                "error reason should mention one of the fixtures that never actually got navigated to: {reason}"
+            );
+        }
+        other => panic!(
+            "expected Outcome::Error when the fake MCP keeps returning the first page's content after later goto calls, got {other:?}"
+        ),
+    }
 }

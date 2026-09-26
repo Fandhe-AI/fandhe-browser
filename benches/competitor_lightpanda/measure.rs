@@ -1380,15 +1380,29 @@ pub fn measure_token_reduction(
     if let Some(outcome) = arg_error_gate(target.mcp_args_error.as_deref(), target.name) {
         return outcome;
     }
-    let sites: Vec<String> = crate::support::FIXTURE_TABLE
-        .iter()
-        .map(|(page, _content_type, _content)| format!("{fixture_base_url}{page}"))
-        .collect();
+    // `marker` は当該 fixture の `goto` が実際に成功したことを内容ベースで
+    // 確認するための一意な識別子（[`crate::support::fixture_marker`] の
+    // ドキュメント参照。レビュー指摘 P1。Codex。PR #442
+    // 再々々々々々々々々々レビュー・measure.rs:1450）。`FIXTURE_TABLE` の
+    // 各パスには必ず対応するマーカーが登録されている（`support.rs` の
+    // `fixture_table_and_markers_cover_the_same_paths` が保証する）ため、
+    // ここで `unwrap_or("")` にせず明示的に内部不整合として扱う。
+    let mut sites: Vec<(String, &'static str)> =
+        Vec::with_capacity(crate::support::FIXTURE_TABLE.len());
+    for (page, _content_type, _content) in crate::support::FIXTURE_TABLE {
+        let Some(marker) = crate::support::fixture_marker(page) else {
+            return Outcome::Error(format!(
+                "{}: internal error: no fixture marker registered for {page}",
+                target.name
+            ));
+        };
+        sites.push((format!("{fixture_base_url}{page}"), marker));
+    }
     // レビュー指摘 P0（Codex。PR #442 再レビュー）: 生成した URL が本当に
     // このベンチが起動した fixture サーバー（127.0.0.1・起動したポート）
     // だけを指すことを最後にもう一度確認する（モジュールドキュメント参照。
     // ここで拒否されるのは実装バグの場合のみで、通常経路では常に成功する）。
-    for url in &sites {
+    for (url, _marker) in &sites {
         if let Err(reason) = validate_local_bench_url(url, fixture_port) {
             return Outcome::Error(format!("{}: {reason}", target.name));
         }
@@ -1429,7 +1443,7 @@ pub fn measure_token_reduction(
     // にして「一部失敗を隠した測定値」を返さない（fail-closed）。
     let mut reductions = Vec::new();
     let mut failed: Vec<String> = Vec::new();
-    for url in &sites {
+    for (url, marker) in &sites {
         let goto_params = format!(
             "{{\"name\":\"goto\",\"arguments\":{{\"url\":\"{}\"}}}}",
             json_escape(url)
@@ -1472,6 +1486,31 @@ pub fn measure_token_reduction(
                 continue;
             }
         };
+        // レビュー指摘 P1（Codex。PR #442 再々々々々々々々々々レビュー・
+        // measure.rs:1450）: `goto` の応答が JSON-RPC としての形式
+        // （`validate_mcp_response`）を満たしているというだけでは、対象
+        // ブラウザが実際にこの `url` へ遷移したことを意味しない（未実装の
+        // `goto` が常に成功応答だけ返す・前のページに留まったまま等）。
+        // MCP 側に「現在の URL」を取得する専用 API があるとは限らないため
+        // それには依存せず、`html`・`tree` の応答内容そのものに、この
+        // fixture 固有の一意なマーカー（`crate::support::fixture_marker`。
+        // 各ページの `<title>`）が含まれているかを確認する。html・tree の
+        // どちらか一方でも欠けていれば、直前のページのままである・遷移に
+        // 失敗した等の疑いがあるため、その試行を計測失敗にする
+        // （黙って直前のページの内容を当該 fixture の成功サンプルとして
+        // 記録しない）。
+        if !html.contains(marker) {
+            failed.push(format!(
+                "{url}: goto navigation could not be verified: html response does not contain the fixture marker {marker:?}"
+            ));
+            continue;
+        }
+        if !tree.contains(marker) {
+            failed.push(format!(
+                "{url}: goto navigation could not be verified: tree response does not contain the fixture marker {marker:?}"
+            ));
+            continue;
+        }
         let html_tok = approx_tokens(html.chars().count());
         let tree_tok = approx_tokens(tree.chars().count());
         match reduction_pct(html_tok as f64, tree_tok as f64) {

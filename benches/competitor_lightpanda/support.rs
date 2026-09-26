@@ -418,6 +418,50 @@ pub const FIXTURE_TABLE: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// [`FIXTURE_TABLE`] の各パスに対応する、`AISNAP-1` 計測（`measure.rs` の
+/// `measure_token_reduction`）が「`goto` が実際にそのページへ遷移できたか」
+/// を内容ベースで確認するための一意なマーカー文字列。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々々々々々々々々レビュー・
+/// measure.rs:1450）: 以前は `goto` の JSON-RPC 応答が形式上妥当
+/// （`validate_mcp_response`）でありさえすれば遷移成功とみなしており、
+/// 対象ブラウザが実際にはそのページへ遷移していなくても（例えば直前の
+/// ページに留まったまま）、直前のページの `html`/`tree` を当該 fixture の
+/// 成功サンプルとして記録できてしまっていた。MCP 側に「現在の URL」を
+/// 取得する専用 API があるとは限らないためそれには依存せず、各ページの
+/// `<title>` テキスト（`FIXTURE_TABLE` の既存コンテンツにすでに存在する、
+/// fixture ごとに固有のテキストを流用する。fixture ファイル自体への変更は
+/// 不要）を、`goto` 後に取得した `html`・`tree` の応答本文それぞれが
+/// 含んでいるかを確認する材料として使う。`<title>` は「html」（生の
+/// マークアップに近い表現なら文字列としてそのまま含まれる）・「tree」
+/// （アクセシビリティツリーの文脈でも文書のアクセシブルネームとして
+/// 表れ得る）のどちらでも見つかる可能性が高い要素として選んだ
+/// （コーディネーター指示: 「tree に可視テキストが載る前提が成り立たない
+/// なら、tree 側は title やアクセシブルネームなど tree に確実に現れる
+/// 要素で検証する」）。
+///
+/// マーカー同士が互いの部分文字列にならないこと（一意性）は
+/// `fixture_markers_are_mutually_exclusive` が保証する。fixture を
+/// 追加・削除した場合は、対応するマーカーもここへ追加・削除すること
+/// （`fixture_table_and_markers_cover_the_same_paths` が両テーブルの
+/// パス集合の一致を検証する）。
+pub const FIXTURE_MARKERS: &[(&str, &str)] = &[
+    ("/article.html", "Sample Article"),
+    ("/listing.html", "Sample Listing"),
+    ("/form.html", "Sample Form"),
+];
+
+/// リクエストパスに完全一致する [`FIXTURE_MARKERS`] のマーカー文字列を返す。
+///
+/// `measure.rs` の `measure_token_reduction` が `goto` 後の内容検証に使う。
+/// [`lookup_fixture`] と同じく完全一致だけで引く。
+pub fn fixture_marker(request_path: &str) -> Option<&'static str> {
+    FIXTURE_MARKERS
+        .iter()
+        .find(|(path, _)| *path == request_path)
+        .map(|(_, marker)| *marker)
+}
+
 /// リクエストパスに完全一致する fixture の `(content-type, 内容)` を返す。
 ///
 /// [`FIXTURE_TABLE`] のキーとの完全一致だけで引く（`..`・クエリ文字列・
@@ -2081,6 +2125,58 @@ mod tests {
         assert_eq!(lookup_fixture("/article.html?x=1"), None);
         assert_eq!(lookup_fixture("/article.html/"), None);
         assert_eq!(lookup_fixture(""), None);
+    }
+
+    // レビュー指摘 P1（Codex。PR #442 再々々々々々々々々々レビュー・
+    // measure.rs:1450）: `FIXTURE_MARKERS` は `goto` 後の内容検証に使うため、
+    // `FIXTURE_TABLE` と対象パスの集合が一致していること・各マーカーが
+    // 対応する fixture の実際のコンテンツに含まれていること・マーカー同士が
+    // 互いの部分文字列にならない（一意性）ことを確認する。
+    #[test]
+    fn fixture_table_and_markers_cover_the_same_paths() {
+        let table_paths: std::collections::BTreeSet<&str> =
+            FIXTURE_TABLE.iter().map(|(path, _, _)| *path).collect();
+        let marker_paths: std::collections::BTreeSet<&str> =
+            FIXTURE_MARKERS.iter().map(|(path, _)| *path).collect();
+        assert_eq!(
+            table_paths, marker_paths,
+            "FIXTURE_TABLE and FIXTURE_MARKERS must cover exactly the same paths"
+        );
+    }
+
+    #[test]
+    fn fixture_markers_appear_in_their_own_fixture_content() {
+        for (path, _content_type, content) in FIXTURE_TABLE {
+            let marker = fixture_marker(path).unwrap_or_else(|| {
+                panic!("no marker registered for {path} (see fixture_table_and_markers_cover_the_same_paths)")
+            });
+            assert!(
+                content.contains(marker),
+                "fixture {path} does not contain its own marker {marker:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_markers_are_mutually_exclusive() {
+        for (i, (path_a, marker_a)) in FIXTURE_MARKERS.iter().enumerate() {
+            for (path_b, marker_b) in FIXTURE_MARKERS.iter().skip(i + 1) {
+                assert_ne!(
+                    marker_a, marker_b,
+                    "{path_a} and {path_b} must not share the same marker"
+                );
+                assert!(
+                    !marker_a.contains(marker_b) && !marker_b.contains(marker_a),
+                    "markers for {path_a} ({marker_a:?}) and {path_b} ({marker_b:?}) must not be \
+                     substrings of one another, or a goto to one page could be mistaken for the other"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixture_marker_unknown_path_is_none() {
+        assert_eq!(fixture_marker("/does-not-exist.html"), None);
     }
 
     // レビュー指摘（コーディネーター指示。PR #442 再レビュー）: fixture は
