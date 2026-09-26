@@ -8,9 +8,10 @@
 //! アクセサ経由で arena を参照する想定で、html5ever を直接依存に持つ必要が
 //! ないよう [`QualName`] をここで再エクスポートする。
 //!
-//! セレクタ照合（`query_selector(_all)` 相当）・PoC 由来の高レベル helper
-//! （`get_text(selector)` 等）は #418 以降のスコープで、本モジュールでは
-//! 追加しない。
+//! セレクタ照合（`query_selector(_all)` 相当）は `query` モジュール
+//! （TASK-24.10・#418）が本モジュールの走査 API を使って実装する。PoC 由来の
+//! 高レベル helper（`get_text(selector)` 等）は本モジュール・`query` いずれの
+//! スコープにも含めない。
 //!
 //! # 設計上の要点
 //!
@@ -153,8 +154,10 @@ pub use html5ever::QualName;
 /// HTML 名前空間の URI（`html5ever::ns!(html)` が展開する定数と同じ値）。
 ///
 /// [`Document::attribute`]・[`Document::local_name`] の大文字小文字照合規則
-/// （HTML 要素のみ ASCII 大文字小文字を無視する）の判定に使う。
-const HTML_NAMESPACE_URI: &str = "http://www.w3.org/1999/xhtml";
+/// （HTML 要素のみ ASCII 大文字小文字を無視する）の判定に使う。`query`
+/// モジュール（TASK-24.10・#418）が要素の名前空間判定に同じ値を再利用できる
+/// よう `pub(crate)` にしてある（単一の真実源を保つ。crate 外には公開しない）。
+pub(crate) const HTML_NAMESPACE_URI: &str = "http://www.w3.org/1999/xhtml";
 
 /// `parse::parse_document`（#38）が構築する DOM ドキュメント全体。
 ///
