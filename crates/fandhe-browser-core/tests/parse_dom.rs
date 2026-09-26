@@ -179,8 +179,10 @@ const FIXTURE_11_UNICODE: &str = r#"<!DOCTYPE html>
 </body>
 </html>"#;
 
-/// PoC-2 fixture 12: 崩れた HTML（DOCTYPE なし・未閉じ `<span>`/`<b>`・
-/// リストの一部が兄弟から外れる可能性がある）。
+/// PoC-2 fixture 12: 崩れた HTML（DOCTYPE なし・未閉じ `<span>`/`<b>`）。
+/// `<ul>` 配下の 3 つの `<li>` は同一 `<ul>` の兄弟のまま観測される
+/// （html5ever の tree construction により、未閉じ要素は `<ul>` の
+/// 開始前に暗黙的に閉じられるため）。
 const FIXTURE_12_MALFORMED: &str = r#"<html>
 <body>
 <p>段落<span><b>強調
@@ -288,14 +290,14 @@ fn core_1_fixture_01_static_article_structure_and_text() {
     assert_eq!(doc.attribute(meta, "content"), Some("山田太郎"));
 
     let h1 = first_by_local_name(&doc, html, "h1");
-    assert!(doc.class_names(h1).eq(["headline"]));
+    assert_eq!(doc.class_names(h1).collect::<Vec<_>>(), ["headline"]);
     assert_eq!(
         doc.text_content(h1).as_deref(),
         Some("Rust で作る軽量ブラウザ基盤")
     );
 
     let byline = first_by_local_name(&doc, html, "p");
-    assert!(doc.class_names(byline).eq(["byline"]));
+    assert_eq!(doc.class_names(byline).collect::<Vec<_>>(), ["byline"]);
     assert_eq!(doc.text_content(byline).as_deref(), Some("著者: 山田太郎"));
 
     let article = first_by_local_name(&doc, html, "article");
@@ -379,7 +381,7 @@ fn core_1_fixture_03_form_login_input_attributes() {
 fn core_1_fixture_04_list_items_data_sku_and_text() {
     let doc = parse(FIXTURE_04_LIST);
     let ul = first_by_local_name(&doc, doc.root(), "ul");
-    assert!(doc.class_names(ul).eq(["products"]));
+    assert_eq!(doc.class_names(ul).collect::<Vec<_>>(), ["products"]);
 
     let items = elements_by_local_name(&doc, ul, "li");
     assert_eq!(items.len(), 4);
@@ -418,7 +420,7 @@ fn core_1_fixture_05_nav_links_href_and_class() {
     assert_eq!(hrefs, vec!["/home", "/about", "/contact"]);
 
     for &id in &link_ids {
-        assert!(doc.class_names(id).eq(["nav-link"]));
+        assert_eq!(doc.class_names(id).collect::<Vec<_>>(), ["nav-link"]);
     }
 
     assert_eq!(
@@ -449,7 +451,7 @@ fn core_1_fixture_06_ssr_blog_articles_structure_and_text() {
     let articles = elements_by_local_name(&doc, root_div, "article");
     assert_eq!(articles.len(), 3);
     for &article in &articles {
-        assert!(doc.class_names(article).eq(["post"]));
+        assert_eq!(doc.class_names(article).collect::<Vec<_>>(), ["post"]);
         assert_eq!(element_children_names(&doc, article), vec!["h2", "span"]);
     }
 
