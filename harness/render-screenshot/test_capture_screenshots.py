@@ -20,6 +20,7 @@ import capture_screenshots as cs  # noqa: E402
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 FAKE_ENGINE = FIXTURES_DIR / "fake_engine.py"
+SITE_CONDITIONAL_ENGINE = FIXTURES_DIR / "site_conditional_engine.py"
 DEFAULT_SITES_PATH = Path(__file__).resolve().parent / "sites.json"
 
 
@@ -144,6 +145,41 @@ class LoadSitesTest(unittest.TestCase):
             )
             with self.assertRaises(cs.SiteListError):
                 cs.load_sites(path, min_sites=5)
+
+
+class CountCommonOkSitesTest(unittest.TestCase):
+    """RENDER-5 / TASK-37.1: `_count_common_ok_sites`（両エンジン共通 ok 件数。codex P1）。
+
+    エンジンごとに独立した ok 件数ではなく、同じ site_id で全エンジンとも
+    "ok" だった件数を数える必要がある（片方だけ成功したサイトは比較できない）。
+    """
+
+    @staticmethod
+    def _record(site_id: str, engine: str, status: str) -> dict:
+        return {"site_id": site_id, "engine": engine, "status": status}
+
+    def test_counts_only_sites_ok_on_every_engine(self) -> None:
+        # servo: site-1..5 が ok / chromium: site-2..6 が ok
+        # → 両エンジンで共通して ok なのは site-2..5 の 4 件。
+        captures = [self._record(f"site-{i}", "servo", "ok") for i in range(1, 6)]
+        captures += [self._record(f"site-{i}", "chromium", "ok") for i in range(2, 7)]
+        self.assertEqual(cs._count_common_ok_sites(captures, ["servo", "chromium"]), 4)
+
+    def test_non_ok_status_does_not_count(self) -> None:
+        captures = [
+            self._record("site-1", "servo", "ok"),
+            self._record("site-1", "chromium", "failed"),
+        ]
+        self.assertEqual(cs._count_common_ok_sites(captures, ["servo", "chromium"]), 0)
+
+    def test_single_engine_matches_its_own_ok_count(self) -> None:
+        # `--engines chromium` のような単一エンジン実行では、従来通りそのエンジン
+        # の ok 件数そのものになる（後方互換）。
+        captures = [self._record(f"site-{i}", "chromium", "ok") for i in range(1, 4)]
+        self.assertEqual(cs._count_common_ok_sites(captures, ["chromium"]), 3)
+
+    def test_no_captures_yields_zero(self) -> None:
+        self.assertEqual(cs._count_common_ok_sites([], ["servo", "chromium"]), 0)
 
 
 class ExpandTemplateTest(unittest.TestCase):
@@ -570,6 +606,123 @@ class CaptureIntegrationTest(unittest.TestCase):
             self.assertNotIn("partial", result)
             pngs = list((out_dir / "servo").glob("*.png")) + list((out_dir / "chromium").glob("*.png"))
             self.assertEqual(len(pngs), 10)
+
+    def test_exit_code_uses_common_ok_sites_not_per_engine_counts(self) -> None:
+        # codex P1: Servo が site-0..4（5 件）・Chromium が site-1..5（5 件）で
+        # 成功する（サイト一覧は 6 件 site-0..5）。エンジンごとの独立集計では
+        # どちらも 5 件で `--min-sites 5` を満たすが、両エンジンで共通して ok
+        # なのは site-1..4 の 4 件のみであり、RENDER-5 の比較基準を満たさない
+        # ため exit code は 1 になるべきである。
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            sites_path = self._write_sites(tmp, count=6)
+            out_dir = tmp / "out"
+            servo_cmd = json.dumps(
+                [
+                    sys.executable,
+                    str(SITE_CONDITIONAL_ENGINE),
+                    "--out",
+                    "{out}",
+                    "--width",
+                    "{width}",
+                    "--height",
+                    "{height}",
+                    "--fail-sites",
+                    "site-5",
+                ]
+            )
+            chromium_cmd = json.dumps(
+                [
+                    sys.executable,
+                    str(SITE_CONDITIONAL_ENGINE),
+                    "--out",
+                    "{out}",
+                    "--width",
+                    "{width}",
+                    "--height",
+                    "{height}",
+                    "--fail-sites",
+                    "site-0",
+                ]
+            )
+            code = cs.main(
+                [
+                    "--sites",
+                    str(sites_path),
+                    "--out-dir",
+                    str(out_dir),
+                    "--engines",
+                    "servo,chromium",
+                    "--servo-cmd",
+                    servo_cmd,
+                    "--chromium-cmd",
+                    chromium_cmd,
+                    "--min-sites",
+                    "5",
+                ]
+            )
+            self.assertEqual(code, 1)
+            result = json.loads((out_dir / "capture-result.json").read_text(encoding="utf-8"))
+            servo_ok = {c["site_id"] for c in result["captures"] if c["engine"] == "servo" and c["status"] == "ok"}
+            chromium_ok = {
+                c["site_id"] for c in result["captures"] if c["engine"] == "chromium" and c["status"] == "ok"
+            }
+            self.assertEqual(len(servo_ok), 5)
+            self.assertEqual(len(chromium_ok), 5)
+            self.assertEqual(len(servo_ok & chromium_ok), 4)
+
+    def test_exit_code_zero_when_common_ok_sites_reach_min_sites(self) -> None:
+        # 上と同じ overlap パターンだが `--min-sites 4` なら共通 4 件で基準を
+        # 満たし exit code 0 になることを確認する（正常系の回帰防止）。
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            sites_path = self._write_sites(tmp, count=6)
+            out_dir = tmp / "out"
+            servo_cmd = json.dumps(
+                [
+                    sys.executable,
+                    str(SITE_CONDITIONAL_ENGINE),
+                    "--out",
+                    "{out}",
+                    "--width",
+                    "{width}",
+                    "--height",
+                    "{height}",
+                    "--fail-sites",
+                    "site-5",
+                ]
+            )
+            chromium_cmd = json.dumps(
+                [
+                    sys.executable,
+                    str(SITE_CONDITIONAL_ENGINE),
+                    "--out",
+                    "{out}",
+                    "--width",
+                    "{width}",
+                    "--height",
+                    "{height}",
+                    "--fail-sites",
+                    "site-0",
+                ]
+            )
+            code = cs.main(
+                [
+                    "--sites",
+                    str(sites_path),
+                    "--out-dir",
+                    str(out_dir),
+                    "--engines",
+                    "servo,chromium",
+                    "--servo-cmd",
+                    servo_cmd,
+                    "--chromium-cmd",
+                    chromium_cmd,
+                    "--min-sites",
+                    "4",
+                ]
+            )
+            self.assertEqual(code, 0)
 
     def test_fail_mode_marks_failed_and_exit_one(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:
@@ -1099,6 +1252,84 @@ class DirectNavigationAllowlistTest(unittest.TestCase):
                 )
             self.assertEqual(record["status"], "skipped")
             self.assertFalse((Path(tmp) / "chromium" / "not-allowlisted.png").exists())
+
+    def test_rejects_non_allowlisted_url_even_when_template_also_uses_html_path(self) -> None:
+        # codex P0 再指摘: 旧実装は `elif needs_url` で `needs_html` と排他に
+        # していたため、`{html_path}` と `{url}` を両方使うテンプレートでは
+        # `needs_html` 分岐に入ってしまい、直接ナビゲーションの許可リスト検査
+        # （`elif needs_url`）を素通りできた。`{url}` を使う限り `{html_path}`
+        # の有無にかかわらず必ず許可リスト検査を通ることを確認する。
+        with tempfile.TemporaryDirectory() as tmp:
+            site = cs.Site(
+                site_id="both-placeholders", url="https://example.invalid/a", category="static", catalog_id="z1"
+            )
+            with (
+                mock.patch.object(cs, "fetch_snapshot", return_value=None),
+                mock.patch.object(cs, "_check_public_host"),
+                mock.patch.object(cs, "DIRECT_NAVIGATION_ALLOWED_URLS", frozenset()),
+            ):
+                record = cs.capture_one(
+                    site,
+                    "chromium",
+                    [
+                        sys.executable,
+                        str(FAKE_ENGINE),
+                        "--out",
+                        "{out}",
+                        "--url",
+                        "{url}",
+                        "--html",
+                        "{html_path}",
+                    ],
+                    out_dir=Path(tmp),
+                    snapshots_dir=Path(tmp) / "snapshots",
+                    chromium_bin=None,
+                    width=1280,
+                    height=800,
+                    settle_ms=1000,
+                    timeout_sec=5,
+                    allow_file_url=False,
+                    dry_run=False,
+                )
+            self.assertEqual(record["status"], "skipped")
+            self.assertFalse((Path(tmp) / "chromium" / "both-placeholders.png").exists())
+
+    def test_captures_when_template_uses_both_placeholders_and_url_is_allowlisted(self) -> None:
+        # 両方の placeholder を使うテンプレートでも、URL が許可リストに含まれ
+        # ていれば正常系まで壊れていないことを確認する。
+        with tempfile.TemporaryDirectory() as tmp:
+            site = cs.Site(
+                site_id="both-placeholders-ok", url="https://example.invalid/a", category="static", catalog_id="z1"
+            )
+            with (
+                mock.patch.object(cs, "fetch_snapshot", return_value=None),
+                mock.patch.object(cs, "_check_public_host"),
+                mock.patch.object(cs, "DIRECT_NAVIGATION_ALLOWED_URLS", frozenset({site.url})),
+            ):
+                record = cs.capture_one(
+                    site,
+                    "chromium",
+                    [
+                        sys.executable,
+                        str(FAKE_ENGINE),
+                        "--out",
+                        "{out}",
+                        "--url",
+                        "{url}",
+                        "--html",
+                        "{html_path}",
+                    ],
+                    out_dir=Path(tmp),
+                    snapshots_dir=Path(tmp) / "snapshots",
+                    chromium_bin=None,
+                    width=1280,
+                    height=800,
+                    settle_ms=1000,
+                    timeout_sec=5,
+                    allow_file_url=False,
+                    dry_run=False,
+                )
+            self.assertEqual(record["status"], "ok")
 
 
 class DefaultChromiumTemplateTest(unittest.TestCase):

@@ -52,6 +52,10 @@ def main(argv: list[str] | None = None) -> int:
     # テスト（直接ナビゲーション向け SSRF チェックの検証）から渡されることが
     # あるが、この偽エンジンは実際には何も取得しないため値は使わず無視する。
     parser.add_argument("--url", default=None)
+    # `{html_path}` と `{url}` を両方使うテンプレート（codex P0 再指摘: 直接
+    # ナビゲーションの許可リスト検査が `{html_path}` の有無で素通りされないかの
+    # 検証）から渡されることがある。同じく値は使わず無視する。
+    parser.add_argument("--html", default=None)
     args = parser.parse_args(argv)
 
     if args.mode == "fail":

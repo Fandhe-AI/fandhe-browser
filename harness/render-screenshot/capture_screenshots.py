@@ -568,6 +568,25 @@ def _read_tail(path: Path, max_chars: int) -> str:
     return data.decode("utf-8", errors="replace")[-max_chars:]
 
 
+def _count_common_ok_sites(captures: list[dict[str, Any]], engines: list[str]) -> int:
+    """指定した全エンジンで "ok" だった site_id の共通集合の件数を返す。
+
+    RENDER-5 が求めるのは「同じサイトを両エンジンで撮って比較する」ことなので、
+    エンジンごとの ok 件数を独立に数えて `--min-sites` と比べるだけでは判定を
+    誤る（codex P1）。例えば Servo がサイト 1〜5・Chromium がサイト 2〜6 で
+    成功した場合、独立集計ではどちらも 5 件で `--min-sites 5` を満たすが、
+    実際に両エンジンで比較できる（同じ site_id で両方 "ok" の）サイトは
+    サイト 2〜5 の 4 件のみである。`engines` が 1 件のみの場合は、その 1
+    エンジンの ok 件数そのものになる（`--engines chromium` 等の単一エンジン
+    実行との後方互換）。
+    """
+    ok_site_ids_by_engine: dict[str, set[str]] = {engine: set() for engine in engines}
+    for record in captures:
+        if record["status"] == "ok":
+            ok_site_ids_by_engine[record["engine"]].add(record["site_id"])
+    return len(set.intersection(*ok_site_ids_by_engine.values()))
+
+
 def _skip_result(site: Site, engine: str, argv: list[str], detail: str) -> dict[str, Any]:
     return {
         "site_id": site.site_id,
@@ -684,19 +703,26 @@ def capture_one(
                 fetch_snapshot(site.url, snapshot_path, allow_file_url=allow_file_url)
             except SnapshotError as exc:
                 return _skip_result(site, engine, argv, str(exc))
-        elif needs_url:
-            # Chromium 既定テンプレート等、`{html_path}` を経由せず `{url}` を
-            # そのままエンジンへ渡す（直接ナビゲーション）テンプレート向けの
-            # SSRF 対策（codex P0: `fetch_snapshot` 経路にしか掛かっておらず
-            # `--sites` に内部アドレスの https URL を指定すると迂回できた）。
+
+        if needs_url:
+            # Chromium 既定テンプレート等、`{url}` をエンジンへ渡す（直接
+            # ナビゲーション）テンプレート向けの SSRF 対策（codex P0:
+            # `fetch_snapshot` 経路にしか掛かっておらず `--sites` に内部アドレスの
+            # https URL を指定すると迂回できた）。旧実装は `elif needs_url` で
+            # `needs_html` と排他にしていたため、`{html_path}` と `{url}` を両方
+            # 使うテンプレート（撮影対象は `{html_path}` のスナップショットでも、
+            # 参照元 URL として `{url}` も渡すもの等）ではこの検証を素通りできた
+            # （codex P0 再指摘）。`{url}` が使われる限り `needs_html` の有無に
+            # かかわらず必ずここを通す。
+            #
             # `fetch_snapshot` と同じ `_check_public_host` で内部アドレスを拒否する
             # が、これはエンジン起動前の一時点の名前解決に基づくベストエフォート
             # に過ぎず、別プロセスのブラウザ自身がその後たどるリダイレクト先までは
             # 検証できない（`fetch_snapshot` の `_PublicOnlyRedirectHandler` と異なり
-            # 介入できない）。そのため直接ナビゲーションは
+            # 介入できない）。そのため `{url}` を渡すテンプレートは
             # `DIRECT_NAVIGATION_ALLOWED_URLS`（sites.json の既定サイトのみを
             # 複製した固定リスト）に完全一致する URL に限定し、それ以外は
-            # `{html_path}` 経由のスナップショット取得に回す（REPAIR-3）。
+            # `{html_path}` のみを使うテンプレートに回す（REPAIR-3）。
             parsed_url = urlparse(site.url)
             try:
                 if parsed_url.scheme == "https":
@@ -705,7 +731,7 @@ def capture_one(
                         raise SnapshotError(
                             "direct navigation ({url} template) is limited to the fixed "
                             "default sites in DIRECT_NAVIGATION_ALLOWED_URLS; use a "
-                            f"{{html_path}} template to capture other URLs: {site.url}"
+                            f"{{html_path}}-only template to capture other URLs: {site.url}"
                         )
                 elif not (parsed_url.scheme == "file" and allow_file_url):
                     raise SnapshotError(
@@ -1070,18 +1096,29 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # 受入基準は「代表サイト分の PNG を両エンジンで出力できること」であり、個々の
-    # サイトの失敗を即座に fail-closed とはしない。指定した各エンジンについて
-    # ok なサイト数が --min-sites 以上であれば成功とみなす（`--engines chromium` の
-    # ように 1 エンジンだけを指定した実行でも、その 1 エンジンが基準を満たせば
-    # exit 0 になる。その場合は結果 JSON に "partial": true を付け、受入基準
-    # そのものは両エンジンでの実行が必要である旨を README に明記する）。
+    # サイトの失敗を即座に fail-closed とはしない。ただし RENDER-5 が求めるのは
+    # 「同じサイトを両エンジンで撮って比較する」ことなので、エンジンごとの ok
+    # 件数を独立に --min-sites と比べるだけでは、例えば Servo がサイト 1〜5・
+    # Chromium がサイト 2〜6 で成功したケース（両エンジンで共通して比較できる
+    # のはサイト 2〜5 の 4 件のみ）でも `--min-sites 5` を満たしたと誤判定して
+    # しまう（codex P1）。指定した全エンジンで "ok" だった site_id の共通集合の
+    # 件数を数え、それが --min-sites 以上であることを要求する（`--engines
+    # chromium` のように 1 エンジンだけを指定した実行では、共通集合はそのまま
+    # そのエンジンの ok 件数になるため従来の判定と一致する。その場合は結果 JSON
+    # に "partial": true を付け、受入基準そのものは両エンジンでの実行が必要で
+    # ある旨を README に明記する）。
     ok_counts = {engine: 0 for engine in engines}
     for record in captures:
         if record["status"] == "ok":
             ok_counts[record["engine"]] += 1
 
-    all_engines_reached_min = all(count >= args.min_sites for count in ok_counts.values())
-    return 0 if all_engines_reached_min else 1
+    common_ok_count = _count_common_ok_sites(captures, engines)
+    print(
+        f"common ok sites across {', '.join(engines)}: {common_ok_count} "
+        f"(per-engine ok counts: {ok_counts})",
+        file=sys.stderr,
+    )
+    return 0 if common_ok_count >= args.min_sites else 1
 
 
 if __name__ == "__main__":
