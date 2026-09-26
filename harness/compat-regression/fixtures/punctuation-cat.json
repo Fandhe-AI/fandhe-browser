@@ -1,0 +1,5 @@
+[
+  { "id": "p1", "cat": "lazy-load.v2_x", "fandhe_browser_core": true, "chromium": true },
+  { "id": "p2", "cat": "lazy-load.v2_x", "fandhe_browser_core": true, "chromium": true },
+  { "id": "p3", "cat": "lazy-load.v2_x", "fandhe_browser_core": true, "chromium": true }
+]

@@ -193,6 +193,67 @@ jobs:
         run: cargo test --workspace
 
   # --------------------------------------------------
+  # compat-regression（対象サイト群の動作率マトリクスに対する回帰チェック）
+  # --------------------------------------------------
+  # TASK-9.2（Issue #339・REPAIR-8。Could）: 対象サイト群の互換性回帰を機械的に
+  # 検出する CI ゲート。閾値の根拠は COMPAT-4（全体動作率 70% 以上）・COMPAT-1
+  # （静的・SPA・フォーム等の類型別動作率 70% 以上）。判定本体は
+  # harness/compat-regression/check-matrix.sh（bash + jq。新規 Cargo 依存・新規
+  # サードパーティ action は追加しない。dependency-policy.md）で、スキーマ契約・
+  # 終了コードは harness/compat-regression/README.md を参照。
+  #
+  # self-test を毎回先に実行し、fixture（合成データ）に対して「閾値未満で fail
+  # する」ことをこのジョブのログへ証跡として残してから、実マトリクスの判定へ進む
+  # （REPAIR-5・REPAIR-8。品質ゲートが無言で素通りしないことの担保）。
+  #
+  # 実マトリクス harness/compat-practical/results/matrix.json は TASK-71.3
+  # （Issue #312）が生成予定でまだ存在しないため、当面 --allow-missing を渡す
+  # （ファイル不在時は ::warning:: を出して exit 0）。#312 がマトリクスをコミット
+  # したら --allow-missing を削除し、ファイル不在を fail-closed（exit 2）に戻す
+  # こと（harness/compat-regression/README.md にも同じ削除条件を明記）。
+  #
+  # 3 OS 一級対応（.claude/rules/ci.md・XOS-1）に合わせ ubuntu/macos/windows の
+  # 3 OS matrix で実行する。全ステップ shell: bash を明示する（rust-ci-default-
+  # features 上部コメントの「shell: 明示不要」は cargo 単一コマンドのステップに
+  # のみ当てはまる注記であり、本ジョブの複数コマンド・jq を含むシェルスクリプト
+  # 実行には当てはまらないため、Windows（既定 pwsh）でも git-bash で確実に動く
+  # よう明示する）。cargo・ネットワークアクセス・secrets は使わない。
+  #
+  # branch protection の必須チェックへ追加する場合は OS 数分
+  # （`compat-regression (ubuntu-latest)` / `(macos-latest)` / `(windows-latest)`
+  # の 3 件）を登録する必要がある（ユーザー作業。本変更の対象外）。
+  compat-regression:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: jq の導入確認
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "error: jq is required but was not found on PATH" >&2
+            exit 1
+          fi
+      - name: 自己テスト（fixture による閾値未満 fail の証跡確認）
+        run: bash harness/compat-regression/self-test.sh
+      - name: 対象サイト群の動作率回帰チェック
+        run: |
+          bash harness/compat-regression/check-matrix.sh \
+            --matrix harness/compat-practical/results/matrix.json \
+            --threshold 70 \
+            --categories static,spa,form \
+            --all-categories \
+            --allow-missing
+
+  # --------------------------------------------------
   # deny-license-reject（cargo-deny の許可外ライセンス reject negative test）
   # --------------------------------------------------
   # TASK-9.1（#338・REPAIR-8）: 受入基準 2（許可外ライセンスが混入したら fail
