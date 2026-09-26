@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "viewport": {
+    "width": 1280,
+    "height": 800
+  },
+  "sites": [
+    {
+      "id": "a1-wikipedia",
+      "url": "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+      "category": "static",
+      "catalog_id": "a1"
+    },
+    {
+      "id": "a3-rust-book",
+      "url": "https://doc.rust-lang.org/book/",
+      "category": "static",
+      "catalog_id": "a3"
+    },
+    {
+      "id": "a4-python-docs",
+      "url": "https://docs.python.org/3/",
+      "category": "static",
+      "catalog_id": "a4"
+    },
+    {
+      "id": "c6-hacker-news",
+      "url": "https://news.ycombinator.com",
+      "category": "lazy-load",
+      "catalog_id": "c6"
+    },
+    {
+      "id": "b1-react-dev",
+      "url": "https://react.dev",
+      "category": "spa",
+      "catalog_id": "b1"
+    },
+    {
+      "id": "a2-mdn",
+      "url": "https://developer.mozilla.org/en-US/docs/Web/JavaScript",
+      "category": "static",
+      "catalog_id": "a2"
+    }
+  ]
+}

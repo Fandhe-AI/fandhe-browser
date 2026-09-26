@@ -1,0 +1,4 @@
+[
+  { "id": "t1", "cat": "static", "fandhe_browser_core": true, "chromium": true },
+  { "id": "t1", "cat": "spa", "fandhe_browser_core": true, "chromium": true }
+]

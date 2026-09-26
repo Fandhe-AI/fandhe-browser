@@ -21,6 +21,18 @@ cargo test --workspace
 
 - 既定ビルドに Servo が含まれないことを `cargo tree` で検証する（RENDER-1）
 - ライセンス検査は `cargo deny check licenses` で行う（[licensing](./licensing.md)）
+- 対象サイト群の動作率回帰チェック（`REPAIR-8`・`COMPAT-1`・`COMPAT-4`。TASK-9.2）:
+  `make check-compat-regression`（CI では `compat-regression` ジョブ）が
+  `harness/compat-regression/check-matrix.sh` で全体・`--categories` 指定の類型
+  （static/spa/form。存在必須として明示列挙）に加え `--all-categories` で
+  マトリクス内に実在する全ての類型（`cat` は `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`
+  に一致する文字列に限る。lazy・table 等も含む）の動作率が閾値 70% 以上かを
+  判定する。実マトリクス `harness/compat-practical/results/matrix.json`
+  （TASK-71.3・Issue #312 が生成予定）が未導入の間は `--allow-missing` を渡し、
+  ファイル不在時は `::warning::` を出して通過させる。#312 の完了後は
+  `--allow-missing` を外し fail-closed（ファイル不在は exit 2）に戻す。
+  スキーマ契約・終了コードは `harness/compat-regression/README.md` を参照
+- 許可外ライセンス（GPL/AGPL/LGPL/MPL-2.0・ライセンス未記載）を持つ canary を `cargo deny` が reject することを `make check-deny-license-reject` で検証する（TASK-9.1・REPAIR-8）
 
 ## ワークフロー変更時の注意
 

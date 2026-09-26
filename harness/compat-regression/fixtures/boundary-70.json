@@ -1,0 +1,12 @@
+[
+  { "id": "t1", "cat": "static", "fandhe_browser_core": true, "chromium": true },
+  { "id": "t2", "cat": "static", "fandhe_browser_core": true, "chromium": true },
+  { "id": "t3", "cat": "static", "fandhe_browser_core": true, "chromium": true },
+  { "id": "t4", "cat": "static", "fandhe_browser_core": true, "chromium": true },
+  { "id": "t5", "cat": "static", "fandhe_browser_core": true, "chromium": true },
+  { "id": "t6", "cat": "static", "fandhe_browser_core": true, "chromium": true },
+  { "id": "t7", "cat": "static", "fandhe_browser_core": true, "chromium": true },
+  { "id": "t8", "cat": "static", "fandhe_browser_core": false, "chromium": true },
+  { "id": "t9", "cat": "static", "fandhe_browser_core": false, "chromium": true },
+  { "id": "t10", "cat": "static", "fandhe_browser_core": false, "chromium": true }
+]
