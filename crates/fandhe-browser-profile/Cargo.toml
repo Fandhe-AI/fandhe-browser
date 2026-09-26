@@ -5,3 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 description = "プロファイル分離 crate（fandhe-browser）。Profile 型の骨格を実装（TASK-50（50.1））"
+
+# unix 限定。ディレクトリハンドル基準の openat/mkdirat/fchmod で TOCTOU を
+# 解消するために使う（PR #437 レビュー指摘対応・ビヘイビア PROF-1）。
+# Windows では ACL 隔離が未実装（XOS-7〜XOS-10）のため参照しない。
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
