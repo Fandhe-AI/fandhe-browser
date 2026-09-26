@@ -125,7 +125,12 @@ fi
 # 先頭行だけを受け取る）ため、2 つ目以降の配列に不合格な内容を混入させても
 # 検出されずに合格し得る（TASK-9.2 レビュー指摘。codex review, PR #452）。
 # `jq -s`（slurp）でトップレベル値の個数を数え、1 個以外は拒否する。
-if ! DOC_COUNT=$(jq -s 'length' "$MATRIX" 2>&1); then
+# jq は Windows ネイティブ実行時に CRLF を出力しうるため、コマンド置換結果の
+# 末尾に \r が残ると正当な単一ドキュメント（"1"）が "1\r" となり文字列比較で
+# 不一致になる（windows-latest で compat-regression が誤って exit 2 になる。
+# Cursor Bugbot 指摘。PR #452）。`set -o pipefail` 済みのため、jq の非ゼロ
+# 終了は tr を挟んでもパイプライン全体の失敗として検出できる。
+if ! DOC_COUNT=$(jq -s 'length' "$MATRIX" 2>&1 | tr -d '\r'); then
   echo "error: failed to parse matrix as JSON: $DOC_COUNT" >&2
   exit 2
 fi
@@ -234,11 +239,16 @@ fi
 # 検出されずに通過してしまう。TASK-9.2 レビュー指摘。--categories 側で既に
 # 判定済みの値は重複判定を避けるため除外する）。
 if [ "$ALL_CATEGORIES" -eq 1 ]; then
-  # jq の出力は Windows ネイティブ実行時に CRLF になりうるため、cat 値の末尾に
-  # \r が残ると judge_category 内の select(.cat == $cat) がマトリクス内の値と
-  # 一致しなくなり total=0 のまま判定漏れになる（TASK-9.2 レビュー指摘）。
-  DISCOVERED=$(jq -r '[.[].cat] | unique | .[]' "$MATRIX" | tr -d '\r')
-  while IFS= read -r cat; do
+  # README.md のスキーマは "cat" に任意の非空文字列（改行・CR を含む）を
+  # 許容する。改行区切りで jq 出力を読み `tr -d '\r'` で CR を除去する方式では、
+  # 改行や CR を含む有効な cat 値がその場で複数の別カテゴリへ分割されてしまい、
+  # 元の値のまま judge_category に渡らない（同名の分割後カテゴリが存在すると、
+  # 元のカテゴリが閾値未満でも見逃し得る。COMPAT-1 の類型別回帰検出に反する。
+  # codex review 指摘, PR #452）。NUL 区切り（jq -j で改行を一切挿入させず、
+  # 明示的に \u0000 のみを区切りとして付与）で読み取り、値の中身（改行・CR
+  # 含む）を無加工のまま judge_category へ渡す。NUL は bash のコマンド置換
+  # ($(...)) を経由すると保持できないため、プロセス置換で直接読む。
+  while IFS= read -r -d '' cat; do
     already_judged=0
     if [ -n "$CATEGORIES" ]; then
       for done_cat in "${CAT_LIST[@]}"; do
@@ -251,7 +261,7 @@ if [ "$ALL_CATEGORIES" -eq 1 ]; then
     if [ "$already_judged" -eq 0 ]; then
       judge_category "$cat"
     fi
-  done <<<"$DISCOVERED"
+  done < <(jq -j '[.[].cat] | unique | .[] | . + "\u0000"' "$MATRIX")
 fi
 
 if [ "$FAIL" -eq 1 ]; then

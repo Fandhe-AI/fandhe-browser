@@ -105,6 +105,22 @@ fi
 CASES=$((CASES + 1))
 expect_contains "$LAST_OUTPUT" "category static: passed=3 total=3 threshold=70 result=PASS" "all-categories discovers static too"
 
+# cat 値に改行を含む場合、--all-categories のカテゴリ発見が改行区切りで壊れて
+# 別カテゴリへ分割されないことを確認する（codex review 指摘, PR #452。改行を
+# 含む cat 値「weird\ncase」の 4 件（passed=1）が 1 つのカテゴリとして集計され、
+# 分割後の "weird"（0 件）"case"（0 件）へ分かれて total=0 のまま見逃されないこと
+# を、集計結果の具体値まで比較して検証する）。
+expect_exit "cat value containing a newline is not split during --all-categories discovery" 1 \
+  --matrix "$FIXTURES/newline-cat.json" --all-categories
+expect_contains "$LAST_OUTPUT" $'category weird\ncase: passed=1 total=4 threshold=70 result=FAIL' \
+  "newline-containing cat value judged as a single category with correct counts"
+if grep -qE "^category (weird|case): passed=0 total=0" <<<"$LAST_OUTPUT"; then
+  echo "FAIL [newline cat not split]: cat value was split into separate zero-count categories" >&2
+  echo "  output: $LAST_OUTPUT" >&2
+  FAILURES=$((FAILURES + 1))
+fi
+CASES=$((CASES + 1))
+
 # --- 入力・使用エラー系（exit 2） ---
 
 expect_exit "malformed non-boolean" 2 --matrix "$FIXTURES/malformed-non-boolean.json"
