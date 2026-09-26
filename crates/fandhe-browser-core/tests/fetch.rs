@@ -205,6 +205,120 @@ async fn core_1_fetch_rejects_disallowed_scheme_via_redirect() {
     );
 }
 
+/// CORE-1（#36）: リダイレクト先が authority を持つ非 http/https scheme
+/// （`ftp://127.0.0.1:1/`）の場合、`Fetcher::new` の `Policy::custom`
+/// （scheme 拒否分岐・`RedirectMarker::DisallowedScheme` の downcast 経路）が
+/// 実際に通ることを確認する。`file:///...`（authority を持たない）は
+/// `reject_unresolved_disallowed_redirect` 側の未解決経路で処理されるため
+/// この経路を検証できない（fetch.rs モジュール doc のコメント参照）。
+#[tokio::test]
+async fn core_1_fetch_rejects_disallowed_scheme_via_redirect_policy() {
+    let port = spawn_loopback_server(|mut stream| {
+        drain_request_head(&mut stream);
+        let body = "HTTP/1.1 302 Found\r\nLocation: ftp://127.0.0.1:1/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(body.as_bytes());
+    });
+
+    let fetcher = Fetcher::new(FetchOptions::new()).expect("Fetcher::new が失敗しないこと");
+
+    let err = fetcher
+        .get(&format!("http://127.0.0.1:{port}/"))
+        .await
+        .expect_err("ftp: へのリダイレクトは Policy::custom で拒否されるはず");
+    assert!(
+        matches!(err, Error::DisallowedScheme { ref scheme } if scheme == "ftp"),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// CORE-1（#36）: `max_redirects` ちょうどの回数までは追跡に成功し `Ok` を
+/// 返す（境界値検証。`attempt.previous().len() > max_redirects` の判定が
+/// 「N 回まで許可」の意味と一致することの確認）。サーバーはリクエストの
+/// 到達回数を数え、`max_redirects` 回だけ 302 を返してから 200 を返す。
+#[tokio::test]
+async fn core_1_fetch_ok_when_redirects_equal_max_redirects() {
+    const MAX_REDIRECTS: usize = 2;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let port = listener.local_addr().expect("local_addr").port();
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let counter = counter.clone();
+            thread::spawn(move || {
+                let mut stream = stream;
+                drain_request_head(&mut stream);
+                let hop = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if hop < MAX_REDIRECTS {
+                    let body = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(body.as_bytes());
+                } else {
+                    let head = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(b"ok");
+                }
+            });
+        }
+    });
+
+    let options = FetchOptions::new().with_max_redirects(MAX_REDIRECTS);
+    let fetcher = Fetcher::new(options).expect("Fetcher::new が失敗しないこと");
+
+    let ok = fetcher
+        .get(&format!("http://127.0.0.1:{port}/"))
+        .await
+        .expect("ちょうど max_redirects 回のリダイレクトは Ok になるはず");
+    assert_eq!(ok.status(), 200);
+    assert_eq!(ok.body(), b"ok");
+}
+
+/// CORE-1（#36）: `max_redirects = 0` では最初のリダイレクトで即座に
+/// `Error::TooManyRedirects { limit: 0 }` を返す（境界値検証）。
+#[tokio::test]
+async fn core_1_fetch_errors_immediately_when_max_redirects_is_zero() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let port = listener.local_addr().expect("local_addr").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let mut stream = stream;
+                drain_request_head(&mut stream);
+                let body = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(body.as_bytes());
+            });
+        }
+    });
+
+    let options = FetchOptions::new().with_max_redirects(0);
+    let fetcher = Fetcher::new(options).expect("Fetcher::new が失敗しないこと");
+
+    let err = fetcher
+        .get(&format!("http://127.0.0.1:{port}/"))
+        .await
+        .expect_err("max_redirects = 0 は最初のリダイレクトで打ち切られるはず");
+    assert!(
+        matches!(err, Error::TooManyRedirects { limit: 0 }),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// CORE-1（#36）: `Fetcher::new` が rustls の crypto provider（ring）を
+/// 正しく install することを確認する（TLS 配線の回帰検出。実際の TLS
+/// ハンドシェイクを行う結合テストは証明書生成の dev 依存が必要なため
+/// 本 Issue の範囲外。PR 本文に切り出し候補として記載する）。
+#[test]
+fn core_1_fetcher_new_installs_rustls_crypto_provider() {
+    let _fetcher = Fetcher::new(FetchOptions::new()).expect("Fetcher::new が失敗しないこと");
+    assert!(
+        rustls::crypto::CryptoProvider::get_default().is_some(),
+        "rustls の crypto provider が install されているはず"
+    );
+}
+
 /// CORE-1（#36）: `FetchOptions::validate`（`Fetcher::new` 経由）はゼロ値の
 /// タイムアウト・接続タイムアウト・本文上限を `Error::InvalidInput` として
 /// 早期に拒否する。
