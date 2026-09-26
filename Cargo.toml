@@ -53,6 +53,16 @@ publish = false
 [workspace.dependencies]
 fandhe-browser-render = { path = "crates/fandhe-browser-render" }
 
+# fandhe-browser-profile（TASK-50（50.1）・ビヘイビア PROF-1）: unix でディレクトリ
+# ハンドル（fd）基準の openat/mkdirat/fchmod を使い、パス文字列の再解決に伴う
+# TOCTOU（symlink 差し替え競合。PR #437 レビュー指摘）を解消するために使う。
+# ユーザー承認済み（2026-09-26）。Windows 側では使わない（unix 限定の
+# target dependency として crate 側へ登録する）。
+rustix = { version = "=1.1.5", default-features = false, features = [
+  "fs",
+  "std",
+] }
+
 # TASK-24.2（Issue #36・ビヘイビア CORE-1）: fetch モジュールの HTTP クライアント。
 # Issue #35（TASK-24.hdep）で採用承認済み（2026-09-25）。crypto provider は
 # aws-lc-rs（cmake・NASM を要し musl でも問題がある）を避け、ring を明示 install
