@@ -402,6 +402,12 @@ fn parse_string(chars: &[char], pos: &mut usize) -> Result<String, JsonParseErro
                     other => return Err(JsonParseError::UnexpectedChar(other)),
                 }
             }
+            // レビュー指摘 P2（PR #442）: 未エスケープの U+0000〜U+001F 制御
+            // 文字（RFC 8259 の JSON 文法で文字列内に生で現れることを許さない
+            // 範囲）を通常文字として受理していた。MCP 応答を untrusted な
+            // 外部入力として扱う方針（coding-rust.md）に従い、ここで
+            // `JsonParseError` として拒否する。
+            Some(c) if (c as u32) < 0x20 => return Err(JsonParseError::UnexpectedChar(c)),
             Some(c) => {
                 out.push(c);
                 *pos += 1;
@@ -660,6 +666,22 @@ mod tests {
     fn parse_json_lone_surrogate_is_error() {
         let err = parse_json(r#""\uD83D""#).unwrap_err();
         assert_eq!(err, JsonParseError::InvalidSurrogate);
+    }
+
+    // レビュー指摘 P2（PR #442）: 未エスケープの制御文字（U+0000〜U+001F）を
+    // 含む文字列は不正な JSON として拒否する（RFC 8259）。
+    #[test]
+    fn parse_json_unescaped_control_char_is_error() {
+        let raw = "\"a\u{0001}b\"";
+        let err = parse_json(raw).unwrap_err();
+        assert_eq!(err, JsonParseError::UnexpectedChar('\u{0001}'));
+    }
+
+    #[test]
+    fn parse_json_unescaped_newline_in_string_is_error() {
+        let raw = "\"a\nb\"";
+        let err = parse_json(raw).unwrap_err();
+        assert_eq!(err, JsonParseError::UnexpectedChar('\n'));
     }
 
     #[test]

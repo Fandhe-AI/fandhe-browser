@@ -282,6 +282,15 @@ fn probe_once(port: u16, request: &str) -> Option<u16> {
 
 /// `BufRead::read_line` 相当だが、外部プロセスの応答を無制限に信用せず
 /// `MAX_LINE_BYTES` を超えたら打ち切る（DoS を避ける。coding-rust.md）。
+///
+/// レビュー指摘 P1（PR #442）: 以前は `MAX_LINE_BYTES` に達しても改行未検出の
+/// まま `Ok` を返しており、呼び出し側（`probe_once`・MCP stdout 読み取り
+/// スレッド）が切り詰められた不完全な行を正常な 1 行として扱い得た
+/// （`parse_json` が偶然パース可能な断片を返す・`parse_http_status` が誤った
+/// 値を拾う等）。改行を見ないまま上限へ達した場合は
+/// `ErrorKind::InvalidData` で明示的に失敗させ、呼び出し側に「この行は
+/// 読み取れなかった」ことを伝える（coding-rust.md「外部入力の経路では
+/// 明示的に処理する」）。
 fn read_line_bounded<R: BufRead>(reader: &mut R, out: &mut String) -> std::io::Result<usize> {
     let mut buf = Vec::new();
     loop {
@@ -290,8 +299,14 @@ fn read_line_bounded<R: BufRead>(reader: &mut R, out: &mut String) -> std::io::R
             break;
         }
         buf.push(byte[0]);
-        if byte[0] == b'\n' || buf.len() >= MAX_LINE_BYTES {
+        if byte[0] == b'\n' {
             break;
+        }
+        if buf.len() >= MAX_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("line exceeded MAX_LINE_BYTES ({MAX_LINE_BYTES}) without newline"),
+            ));
         }
     }
     *out = String::from_utf8_lossy(&buf).into_owned();
@@ -417,6 +432,13 @@ fn measure_binary_size(target: &Target) -> Outcome {
 /// 無制限確保にはしない上限として選んだ値。
 const MCP_STDOUT_QUEUE_CAPACITY: usize = 256;
 
+/// `McpClient::notify` の書き込みタイムアウト（レビュー指摘 P1（PR #442））。
+/// `notify` は応答を待たないが、書き込み自体（`write_with_deadline`）は
+/// 相手プロセスが標準入力を読まない場合に無期限へブロックし得るため、
+/// `call` と同様に期限を設ける。応答待ちが無い分 `call` の個別呼び出しより
+/// 短い固定値で十分とみなす。
+const NOTIFY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// MCP stdio JSON-RPC クライアント。stdout を読む別スレッドが行単位で
 /// 容量付き `mpsc` チャンネルへ push し、呼び出し側は `id` 一致を待つ
 /// （パイプに読み取りタイムアウトが無いため、スレッド + チャンネルで模す）。
@@ -429,6 +451,11 @@ struct McpClient {
     /// `call` はこれを見て、無制限にキューを溜め込む代わりに
     /// 計測をエラー終了させる。
     overflowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 読み取りスレッドが `read_line_bounded` の `InvalidData`（`MAX_LINE_BYTES`
+    /// 到達・改行未検出）を検知した際に立てるフラグ（レビュー指摘 P1）。
+    /// `call` はこれを見て、切り詰められた行を無視したまま待ち続けるのではなく
+    /// 明示的にエラー終了させる。
+    line_too_long: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl McpClient {
@@ -445,6 +472,8 @@ impl McpClient {
         let (tx, rx) = mpsc::sync_channel::<String>(MCP_STDOUT_QUEUE_CAPACITY);
         let overflowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let overflowed_writer = std::sync::Arc::clone(&overflowed);
+        let line_too_long = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let line_too_long_writer = std::sync::Arc::clone(&line_too_long);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
@@ -463,6 +492,13 @@ impl McpClient {
                         }
                         Err(mpsc::TrySendError::Disconnected(_)) => break,
                     },
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                        // `MAX_LINE_BYTES` に達し改行未検出のまま打ち切られた行
+                        // （レビュー指摘 P1）。切り詰められた断片を正常応答として
+                        // 扱わせず、読み取りを止めて `call` 側へ明示的に伝える。
+                        line_too_long_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
                     Err(_) => break,
                 }
             }
@@ -473,6 +509,49 @@ impl McpClient {
             rx,
             next_id: 1,
             overflowed,
+            line_too_long,
+        })
+    }
+
+    /// 書き込み中に相手プロセスが標準入力を読まずパイプが満杯になっても
+    /// 無期限にブロックしないよう、`deadline` までに `write_all` + `flush` が
+    /// 終わらなければ子プロセスを `kill` して待ち構えているスレッドを
+    /// 解放する（レビュー指摘 P1（PR #442）。子プロセスの標準入力（パイプ）
+    /// には OS レベルの書き込みタイムアウトが無いため、実際の書き込みは
+    /// `std::thread::scope` の子スレッドへ切り出し、`mpsc` の
+    /// `recv_timeout` で待つ。タイムアウト時は `child.kill()` で
+    /// 子プロセスの読み取り側を閉じ、ブロックしている `write_all` を
+    /// `BrokenPipe` で解放してからスレッドの終了（送信）を待つ
+    /// （`thread::scope` はスコープ終了時に生成した全スレッドの
+    /// join を待つため、解放せずに抜けようとすると結局無期限に
+    /// ブロックする）。
+    fn write_with_deadline(
+        stdin: &mut std::process::ChildStdin,
+        child: &mut Child,
+        data: &[u8],
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("write timed out before starting (deadline already elapsed)".to_string());
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let result = stdin.write_all(data).and_then(|()| stdin.flush());
+                let _ = tx.send(result);
+            });
+            match rx.recv_timeout(remaining) {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(format!("write failed: {e}")),
+                Err(_) => {
+                    let _ = child.kill();
+                    // 書き込みスレッドが `BrokenPipe` 等で終わり `tx.send` する
+                    // のを待つ（join のためにスレッドの終了を確定させる）。
+                    let _ = rx.recv();
+                    Err("write timed out, child process killed".to_string())
+                }
+            }
         })
     }
 
@@ -485,24 +564,34 @@ impl McpClient {
     /// `Err` を返す（呼び出し元 `measure_token_reduction` はエラー応答を
     /// そのサイトの skip として扱うため、ここで成功と誤判定すると
     /// トークン削減率の計測に失敗レスポンスの本文が混入する）。
+    ///
+    /// `timeout` は書き込み（`write_with_deadline`）から応答待ちまでの
+    /// 呼び出し全体に適用する（レビュー指摘 P1（PR #442）: 以前は書き込みに
+    /// 期限が無く、書き込みが無期限にブロックし得た）。
     fn call(&mut self, method: &str, params: &str, timeout: Duration) -> Result<JsonValue, String> {
         let id = self.next_id;
         self.next_id += 1;
         let request = format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"{method}\",\"params\":{params}}}\n"
         );
-        self.stdin
-            .write_all(request.as_bytes())
-            .map_err(|e| format!("write failed: {e}"))?;
-        self.stdin
-            .flush()
-            .map_err(|e| format!("flush failed: {e}"))?;
-
         let deadline = Instant::now() + timeout;
+        Self::write_with_deadline(
+            &mut self.stdin,
+            &mut self.guard.0,
+            request.as_bytes(),
+            deadline,
+        )
+        .map_err(|e| format!("{method}: {e}"))?;
+
         loop {
             if self.overflowed.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(format!(
                     "{method}: mcp stdout queue exceeded {MCP_STDOUT_QUEUE_CAPACITY} lines, aborting"
+                ));
+            }
+            if self.line_too_long.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(format!(
+                    "{method}: mcp response line exceeded {MAX_LINE_BYTES} bytes without newline, aborting"
                 ));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -515,6 +604,11 @@ impl McpClient {
                     if self.overflowed.load(std::sync::atomic::Ordering::SeqCst) {
                         return Err(format!(
                             "{method}: mcp stdout queue exceeded {MCP_STDOUT_QUEUE_CAPACITY} lines, aborting"
+                        ));
+                    }
+                    if self.line_too_long.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(format!(
+                            "{method}: mcp response line exceeded {MAX_LINE_BYTES} bytes without newline, aborting"
                         ));
                     }
                     return Err(format!("timeout waiting for response to {method}"));
@@ -552,12 +646,20 @@ impl McpClient {
     }
 
     /// 応答を待たない通知（`initialize` 後の `notifications/initialized` 等）。
+    /// 応答を待たないだけで、書き込み自体には `call` 同様
+    /// `write_with_deadline`（レビュー指摘 P1（PR #442））で
+    /// `NOTIFY_WRITE_TIMEOUT` を適用し、相手プロセスが標準入力を読まない
+    /// 場合の無期限ブロックを避ける。
     fn notify(&mut self, method: &str, params: &str) -> Result<(), String> {
         let line = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\",\"params\":{params}}}\n");
-        self.stdin
-            .write_all(line.as_bytes())
-            .map_err(|e| format!("write failed: {e}"))?;
-        self.stdin.flush().map_err(|e| format!("flush failed: {e}"))
+        let deadline = Instant::now() + NOTIFY_WRITE_TIMEOUT;
+        Self::write_with_deadline(
+            &mut self.stdin,
+            &mut self.guard.0,
+            line.as_bytes(),
+            deadline,
+        )
+        .map_err(|e| format!("{method}: {e}"))
     }
 }
 
