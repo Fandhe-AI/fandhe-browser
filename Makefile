@@ -383,6 +383,7 @@ check-compat-regression: ## 対象サイト群の動作率マトリクスに対�
 		--matrix harness/compat-practical/results/matrix.json \
 		--threshold 70 \
 		--categories static,spa,form \
+		--all-categories \
 		--allow-missing
 
 # --------------------------------------------------

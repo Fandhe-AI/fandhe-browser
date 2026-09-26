@@ -245,4 +245,5 @@ jobs:
             --matrix harness/compat-practical/results/matrix.json \
             --threshold 70 \
             --categories static,spa,form \
+            --all-categories \
             --allow-missing

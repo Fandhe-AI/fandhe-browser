@@ -86,6 +86,25 @@ expect_contains "$LAST_OUTPUT" "overall: passed=7 total=10 threshold=70 result=P
 expect_exit "below category with --categories fails" 1 --matrix "$FIXTURES/below-category.json" --categories static,spa,form
 expect_contains "$LAST_OUTPUT" "category form: passed=1 total=4 threshold=70 result=FAIL" "below-category form counts"
 
+# --all-categories: --categories を指定しなくても、マトリクス内に実在する全ての
+# cat 値（このフィクスチャでは static/spa/form）を判定対象にし、閾値未満の類型を
+# 検出できることを確認する（TASK-9.2 レビュー指摘。COMPAT-1 の類型別回帰検出漏れ対策）。
+expect_exit "below category with --all-categories fails without --categories" 1 --matrix "$FIXTURES/below-category.json" --all-categories
+expect_contains "$LAST_OUTPUT" "category form: passed=1 total=4 threshold=70 result=FAIL" "all-categories form counts"
+
+# --categories と --all-categories を併用した場合、--categories 側で既に判定した
+# 類型を --all-categories 側で重複して二重出力しないことを確認する（同一 cat 値の
+# judge 呼び出しが 1 回だけであることを出現回数で検証）。
+expect_exit "categories and all-categories combined dedupe" 1 --matrix "$FIXTURES/below-category.json" --categories form --all-categories
+FORM_LINE_COUNT=$(grep -c "^category form: " <<<"$LAST_OUTPUT")
+if [ "$FORM_LINE_COUNT" -ne 1 ]; then
+  echo "FAIL [categories/all-categories dedupe]: expected exactly 1 'category form:' line, got $FORM_LINE_COUNT" >&2
+  echo "  output: $LAST_OUTPUT" >&2
+  FAILURES=$((FAILURES + 1))
+fi
+CASES=$((CASES + 1))
+expect_contains "$LAST_OUTPUT" "category static: passed=3 total=3 threshold=70 result=PASS" "all-categories discovers static too"
+
 # --- 入力・使用エラー系（exit 2） ---
 
 expect_exit "malformed non-boolean" 2 --matrix "$FIXTURES/malformed-non-boolean.json"

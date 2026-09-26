@@ -14,12 +14,17 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: check-matrix.sh --matrix <path> [--threshold <0-100>] [--key <name>] [--categories <csv>] [--allow-missing]
+Usage: check-matrix.sh --matrix <path> [--threshold <0-100>] [--key <name>] [--categories <csv>] [--all-categories] [--allow-missing]
 
   --matrix <path>       Path to the compat matrix JSON file (required).
   --threshold <0-100>   Minimum pass rate percentage, integer 0-100 (default: 70).
   --key <name>          Boolean field name to evaluate per entry (default: fandhe_browser_core).
-  --categories <csv>    Comma-separated list of "cat" values that must each also meet the threshold.
+  --categories <csv>    Comma-separated list of "cat" values that must each also meet the threshold
+                         and must each have at least 1 matrix entry (use to require specific
+                         categories to be present).
+  --all-categories      Additionally judge every distinct "cat" value found in the matrix, not just
+                         the ones listed in --categories. Catches categories the schema allows
+                         (any string) but that --categories does not yet enumerate.
   --allow-missing       Exit 0 with a warning instead of failing when the matrix file does not exist.
 EOF
 }
@@ -28,6 +33,7 @@ MATRIX=""
 THRESHOLD=70
 KEY="fandhe_browser_core"
 CATEGORIES=""
+ALL_CATEGORIES=0
 ALLOW_MISSING=0
 
 while [ $# -gt 0 ]; do
@@ -51,6 +57,10 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { echo "error: --categories requires a value" >&2; usage; exit 2; }
       CATEGORIES="$2"
       shift 2
+      ;;
+    --all-categories)
+      ALL_CATEGORIES=1
+      shift
       ;;
     --allow-missing)
       ALLOW_MISSING=1
@@ -181,18 +191,49 @@ IFS=$'\t' read -r TOTAL PASSED < <(
 )
 judge "overall" "$PASSED" "$TOTAL"
 
+judge_category() {
+  # $1=cat value（マトリクス内の "cat" 文字列そのまま）
+  local cat="$1" ctotal cpassed
+  IFS=$'\t' read -r ctotal cpassed < <(
+    jq -r --arg cat "$cat" --arg key "$KEY" '
+      [
+        ([.[] | select(.cat == $cat)] | length),
+        ([.[] | select(.cat == $cat and .[$key] == true)] | length)
+      ] | @tsv
+    ' "$MATRIX" | tr -d '\r'
+  )
+  judge "category ${cat}" "$cpassed" "$ctotal"
+}
+
 if [ -n "$CATEGORIES" ]; then
   for cat in "${CAT_LIST[@]}"; do
-    IFS=$'\t' read -r CTOTAL CPASSED < <(
-      jq -r --arg cat "$cat" --arg key "$KEY" '
-        [
-          ([.[] | select(.cat == $cat)] | length),
-          ([.[] | select(.cat == $cat and .[$key] == true)] | length)
-        ] | @tsv
-      ' "$MATRIX" | tr -d '\r'
-    )
-    judge "category ${cat}" "$CPASSED" "$CTOTAL"
+    judge_category "$cat"
   done
+fi
+
+# --all-categories: マトリクス内に実在する全ての "cat" 値を判定対象にする
+# （COMPAT-1 は「静的・SPA・フォーム等の類型別」動作率を要求するが、スキーマ上
+# "cat" は任意の文字列を許すため、--categories の固定 CSV だけでは呼び出し側が
+# 列挙し忘れた類型〔例: lazy・table〕がマトリクスに含まれていても閾値未満のまま
+# 検出されずに通過してしまう。TASK-9.2 レビュー指摘。--categories 側で既に
+# 判定済みの値は重複判定を避けるため除外する）。
+if [ "$ALL_CATEGORIES" -eq 1 ]; then
+  DISCOVERED=$(jq -r '[.[].cat] | unique | .[]' "$MATRIX")
+  while IFS= read -r cat; do
+    [ -n "$cat" ] || continue
+    already_judged=0
+    if [ -n "$CATEGORIES" ]; then
+      for done_cat in "${CAT_LIST[@]}"; do
+        if [ "$done_cat" = "$cat" ]; then
+          already_judged=1
+          break
+        fi
+      done
+    fi
+    if [ "$already_judged" -eq 0 ]; then
+      judge_category "$cat"
+    fi
+  done <<<"$DISCOVERED"
 fi
 
 if [ "$FAIL" -eq 1 ]; then

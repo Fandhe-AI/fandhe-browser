@@ -23,8 +23,10 @@ cargo test --workspace
 - ライセンス検査は `cargo deny check licenses` で行う（[licensing](./licensing.md)）
 - 対象サイト群の動作率回帰チェック（`REPAIR-8`・`COMPAT-1`・`COMPAT-4`。TASK-9.2）:
   `make check-compat-regression`（CI では `compat-regression` ジョブ）が
-  `harness/compat-regression/check-matrix.sh` で全体・類型別（static/spa/form）の
-  動作率が閾値 70% 以上かを判定する。実マトリクス
+  `harness/compat-regression/check-matrix.sh` で全体・`--categories` 指定の類型
+  （static/spa/form。存在必須として明示列挙）に加え `--all-categories` で
+  マトリクス内に実在する全ての類型（`cat` はスキーマ上任意の文字列を許すため
+  lazy・table 等も含む）の動作率が閾値 70% 以上かを判定する。実マトリクス
   `harness/compat-practical/results/matrix.json`（TASK-71.3・Issue #312 が
   生成予定）が未導入の間は `--allow-missing` を渡し、ファイル不在時は
   `::warning::` を出して通過させる。#312 の完了後は `--allow-missing` を外し
