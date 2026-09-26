@@ -42,8 +42,7 @@ use crate::support::{
     bench_exit_code, content_length_exceeds_limit, expand_args, http_status_for_io_error,
     json_escape, kill_process_group, looks_like_browser_readiness_response, lookup_fixture, median,
     parse_content_length, parse_http_request_line, parse_http_status, parse_json,
-    port_conflict_error, reduction_pct, require_bin, token_reduction_gate,
-    validate_local_bench_url, validate_mcp_response,
+    port_conflict_error, reduction_pct, require_bin, token_reduction_gate, validate_mcp_response,
 };
 // `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
 // 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
@@ -79,21 +78,22 @@ const MAX_LINE_BYTES: usize = 1024 * 1024;
 pub struct Target {
     pub name: &'static str,
     pub bin: Option<PathBuf>,
+    /// `<PREFIX>_BIN` が設定されているが、既存の通常ファイルとして解決
+    /// できなかった場合の理由。`Some` のときは `bin` を常に `None` にし
+    /// （未設定と同じ「起動を試みない」経路を通すが、`Outcome::Skipped` では
+    /// なく `Outcome::Error` にするため `bin` だけでなくこの理由も見る
+    /// 必要がある）、[`require_bin`] が全計測を即座に `Outcome::Error` へ
+    /// 倒す。`bin` の解決は [`Target`] 構築時（環境変数からは 1 回だけ）に
+    /// 行い、以後の起動（`Command::new`）・サイズ計測（`fs::metadata`）は
+    /// 同じ検証済みパスを再利用する（相対パス・PATH 検索の有無による
+    /// 起動先とサイズ計測先の食い違いを防ぐ）。
+    pub bin_error: Option<String>,
     pub serve_args: Vec<String>,
     pub mcp_args: Vec<String>,
     /// `serve_args` の元となった `<PREFIX>_SERVE_ARGS` がサイズ・個数上限を
     /// 超えていた場合の理由。`Some` のときは `serve_args` を使う計測
     /// （cold start・アイドル RSS）だけが起動を試みず即座に `Outcome::Error`
     /// を返す。
-    ///
-    /// レビュー指摘 P2（Codex。PR #442 再々々々レビュー・
-    /// competitor_lightpanda.rs:511/554）: 以前は `serve_args`・`mcp_args`
-    /// 両方の検証エラーを 1 つの `args_error` フィールドにまとめていたため、
-    /// `MCP_ARGS` だけが上限超過でも、`MCP_ARGS` を使わない cold start・
-    /// アイドル RSS 計測まで計測前に `Outcome::Error` になっていた
-    /// （逆方向も同様）。用途ごとに独立したフィールドへ分け、各計測関数が
-    /// 自分の使う引数のエラーだけを [`support::arg_error_gate`] 経由で
-    /// 確認するようにした。
     pub serve_args_error: Option<String>,
     /// `mcp_args` の元となった `<PREFIX>_MCP_ARGS` がサイズ・個数上限を
     /// 超えていた場合の理由。`Some` のときは `mcp_args` を使う計測
@@ -145,11 +145,6 @@ impl FixtureServer {
             stop,
             handle: Some(handle),
         })
-    }
-
-    /// このサーバーの `http://127.0.0.1:<port>/` 形式のベース URL。
-    fn base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
     }
 }
 
@@ -234,7 +229,7 @@ fn read_complete_line<R: BufRead>(reader: &mut R, out: &mut String) -> std::io::
 /// ための小さなヘルパー。
 fn respond_with_io_error(writer: &mut DeadlineReader, err: &std::io::Error) {
     let (status, reason) = http_status_for_io_error(err.kind());
-    let _ = write_fixture_response(writer, status, reason, PLAIN_TEXT, b"", true);
+    let _ = write_fixture_response(writer, status, reason, PLAIN_TEXT, b"");
 }
 
 /// fixture サーバーへの 1 接続を処理する。
@@ -295,24 +290,15 @@ fn handle_fixture_connection(stream: TcpStream) {
     }
 
     let Some((method, path)) = parse_http_request_line(&line) else {
-        let _ = write_fixture_response(&mut writer, 400, "Bad Request", PLAIN_TEXT, b"", true);
+        let _ = write_fixture_response(&mut writer, 400, "Bad Request", PLAIN_TEXT, b"");
         return;
     };
-    // レビュー指摘（コーディネーター指示。PR #442 再々々々レビュー）:
-    // GET 以外（HEAD を除く）は `405 Method Not Allowed` として拒否する。
-    // HEAD はヘッダのみを返し（本文は書かない）、`Content-Length` は
-    // GET したときと同じ値にする（HTTP のセマンティクス。実際に使うのは
-    // `goto`（GET）のみだが、fixture サーバーとしての最小限の正しさを保つ）。
-    let is_head = method == "HEAD";
-    if method != "GET" && !is_head {
-        let _ = write_fixture_response(
-            &mut writer,
-            405,
-            "Method Not Allowed",
-            PLAIN_TEXT,
-            b"",
-            true,
-        );
+    // `goto`（GET）だけを配信対象にする。GET 以外はすべて
+    // `405 Method Not Allowed` として拒否する（このサーバーの唯一の
+    // クライアントは計測対象ブラウザの `goto` であり、GET 以外を受理する
+    // 必要がない）。
+    if method != "GET" {
+        let _ = write_fixture_response(&mut writer, 405, "Method Not Allowed", PLAIN_TEXT, b"");
         return;
     }
 
@@ -328,7 +314,7 @@ fn handle_fixture_connection(stream: TcpStream) {
     let mut header_lines_seen = 0u32;
     loop {
         if header_lines_seen >= FIXTURE_MAX_HEADER_LINES {
-            let _ = write_fixture_response(&mut writer, 400, "Bad Request", PLAIN_TEXT, b"", true);
+            let _ = write_fixture_response(&mut writer, 400, "Bad Request", PLAIN_TEXT, b"");
             return;
         }
         header_lines_seen += 1;
@@ -345,50 +331,39 @@ fn handle_fixture_connection(stream: TcpStream) {
 
     match lookup_fixture(&path) {
         Some((content_type, content)) => {
-            let _ = write_fixture_response(
-                &mut writer,
-                200,
-                "OK",
-                content_type,
-                content.as_bytes(),
-                !is_head,
-            );
+            let _ =
+                write_fixture_response(&mut writer, 200, "OK", content_type, content.as_bytes());
         }
         None => {
-            let _ = write_fixture_response(&mut writer, 404, "Not Found", PLAIN_TEXT, b"", true);
+            let _ = write_fixture_response(&mut writer, 404, "Not Found", PLAIN_TEXT, b"");
         }
     }
 }
 
 /// 400/404/405/408 応答の `Content-Type`。fixture 本体は
-/// `support::FIXTURE_TABLE` が個別に持つ content-type を使う
-/// （レビュー指摘。PR #442 再々レビュー: パス → (content-type, 内容) の
-/// 固定テーブルにする）。
+/// `support::FIXTURE_TABLE` が個別に持つ content-type を使う（パス →
+/// (content-type, 内容) の固定テーブル）。
 const PLAIN_TEXT: &str = "text/plain; charset=utf-8";
 
 /// `handle_fixture_connection` が使う最小限の HTTP/1.1 レスポンス書き込み。
 ///
-/// `write_body` が `false`（`HEAD` リクエストへの応答）でも
-/// `Content-Length` は `body.len()`（`GET` したときの実際の長さ）にする
-/// （HTTP のセマンティクス）。`writer`（[`DeadlineReader`]）経由でのみ
-/// 書き込むことで、接続の絶対期限を守る（レビュー指摘 P1。Codex。
-/// PR #442 再々々々々々レビュー・competitor_lightpanda.rs:364）。
+/// `Content-Length` は常に `body.len()` にし、本文も常に書く（このサーバー
+/// が受理するのは GET のみで HEAD は 405 にするため、本文を省く分岐は
+/// 持たない）。`writer`（[`DeadlineReader`]）経由でのみ書き込むことで、
+/// 接続の絶対期限を守る。
 fn write_fixture_response(
     writer: &mut DeadlineReader,
     status: u16,
     reason: &str,
     content_type: &str,
     body: &[u8],
-    write_body: bool,
 ) -> std::io::Result<()> {
     let header = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     writer.write_all(header.as_bytes())?;
-    if write_body {
-        writer.write_all(body)?;
-    }
+    writer.write_all(body)?;
     writer.flush()
 }
 
@@ -785,7 +760,11 @@ fn read_line_bounded<R: BufRead>(reader: &mut R, out: &mut String) -> std::io::R
 
 /// cold start（`PERF-3`）: `trials` 回起動し、readiness までの時間の中央値（ms）を返す。
 pub fn measure_cold_start(target: &Target, trials: usize) -> Outcome {
-    let bin = match require_bin(target.bin.as_ref(), target.name) {
+    let bin = match require_bin(
+        target.bin.as_ref(),
+        target.bin_error.as_deref(),
+        target.name,
+    ) {
         Ok(bin) => bin,
         Err(skipped) => return skipped,
     };
@@ -834,28 +813,37 @@ pub fn measure_cold_start(target: &Target, trials: usize) -> Outcome {
 /// （実装計画どおり。`parse_ps_rss_kb` は unix 専用経路でのみ呼ぶ）。
 #[cfg(unix)]
 fn sample_rss_kb(pid: u32) -> Option<u64> {
-    let out = Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    // `ps -o rss=` の出力は数字列のみで数十バイトに収まる。想定外に大量の
+    // 出力を返す環境でも無制限に確保しないための上限
+    // （coding-rust.md「長さ・件数を上限検証」）。
+    const MAX_PS_OUTPUT_BYTES: usize = 4096;
+    let mut command = Command::new("ps");
+    command.args(["-o", "rss=", "-p", &pid.to_string()]);
+    let (status, stdout) = crate::support::run_capturing_output_with_deadline(
+        command,
+        crate::support::EXTERNAL_COMMAND_DEADLINE,
+        MAX_PS_OUTPUT_BYTES,
+    )
+    .ok()?;
+    if !status.success() {
         return None;
     }
-    // レビュー指摘 P2（Codex。PR #442 再々々々々レビュー・
-    // competitor_lightpanda.rs:585）: 他の `from_utf8_lossy` 使用箇所も
-    // 確認した。ここは `parse_ps_rss_kb`（`out.trim().parse::<u64>()`）で
-    // 数字列としてのみ解釈するため、`from_utf8_lossy` の置換文字（U+FFFD）
-    // が混入しても `parse::<u64>()` が失敗して `None` になるだけで、
-    // 「文字化けが偶然別の妥当な値に化ける」経路にはならない（`read_line_bounded`
-    // の JSON 応答のように、置換後の文字列が別の意味を持つ妥当な値として
-    // 解釈され得るケースとは異なる）。そのため、ここは厳密な UTF-8 変換に
-    // 変える必要はないと判断した。
-    parse_ps_rss_kb(&String::from_utf8_lossy(&out.stdout))
+    // `parse_ps_rss_kb`（`out.trim().parse::<u64>()`）は数字列としてのみ
+    // 解釈するため、`from_utf8_lossy` の置換文字（U+FFFD）が混入しても
+    // `parse::<u64>()` が失敗して `None` になるだけで、「文字化けが偶然
+    // 別の妥当な値に化ける」経路にはならない（MCP 応答の JSON のように、
+    // 置換後の文字列が別の意味を持つ妥当な値として解釈され得るケースとは
+    // 異なる）。そのため厳密な UTF-8 変換にする必要はない。
+    parse_ps_rss_kb(&String::from_utf8_lossy(&stdout))
 }
 
 #[cfg(unix)]
 fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
-    let bin = match require_bin(target.bin.as_ref(), target.name) {
+    let bin = match require_bin(
+        target.bin.as_ref(),
+        target.bin_error.as_deref(),
+        target.name,
+    ) {
         Ok(bin) => bin,
         Err(skipped) => return skipped,
     };
@@ -923,7 +911,11 @@ fn measure_idle_rss(target: &Target, _trials: usize) -> Outcome {
     // Skipped」という契約に反していた。他の計測関数（`measure_cold_start`・
     // `measure_binary_size`・unix 版 `measure_idle_rss`）と同じ判定を
     // `require_bin`（support.rs。OS に依存しない純粋関数）で先に行う。
-    if let Err(skipped) = require_bin(target.bin.as_ref(), target.name) {
+    if let Err(skipped) = require_bin(
+        target.bin.as_ref(),
+        target.bin_error.as_deref(),
+        target.name,
+    ) {
         return skipped;
     }
     Outcome::Unsupported(format!(
@@ -934,7 +926,11 @@ fn measure_idle_rss(target: &Target, _trials: usize) -> Outcome {
 
 /// バイナリサイズ（`PERF-1`）: 対象実行ファイルの `fs::metadata` によるバイト数。
 fn measure_binary_size(target: &Target) -> Outcome {
-    let bin = match require_bin(target.bin.as_ref(), target.name) {
+    let bin = match require_bin(
+        target.bin.as_ref(),
+        target.bin_error.as_deref(),
+        target.name,
+    ) {
         Ok(bin) => bin,
         Err(skipped) => return skipped,
     };
@@ -1356,35 +1352,27 @@ fn extract_text(value: &JsonValue) -> Option<String> {
 
 /// AISNAP-1: `support::FIXTURE_TABLE`（ベンチが起動したローカル fixture サーバーが
 /// 配信する自作ページ）へ `goto` → `html` / `tree` を呼び、近似トークン数の
-/// 削減率を求める。`fixture_base_url`・`fixture_port` は呼び出し元
-/// （`main`）が起動した [`FixtureServer`] のもの（モジュールドキュメント
-/// 参照。PR #442 再レビューで外部 URL の指定経路を廃止した）。
-pub fn measure_token_reduction(
-    target: &Target,
-    fixture_base_url: &str,
-    fixture_port: u16,
-) -> Outcome {
-    // `require_bin`（support.rs）で他の計測関数と同じ判定に揃える
-    // （レビュー指摘。コーディネーター指示。PR #442 再々々々レビュー:
-    // 「cfg で分かれている計測関数に同じ食い違いがないか確認する」の
-    // 一環で洗い出した、`require_bin` に未集約だった最後の 1 箇所）。
-    // `main` 側の `token_reduction_gate` が既に同じ判定を行った後で
-    // しかこの関数を呼ばないため実質到達しないが、単独呼び出しでも
-    // 安全なようにここでも確認する。
-    let bin = match require_bin(target.bin.as_ref(), target.name) {
+/// 削減率を求める。`fixture_port` は呼び出し元（`main`）が起動した
+/// [`FixtureServer`] のポート。`goto` する URL は [`crate::support::fixture_url`]
+/// でのみ組み立て、`FIXTURE_TABLE` の固定パス以外を渡せない（外部 URL の
+/// 指定経路自体を持たない）。
+pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
+    let bin = match require_bin(
+        target.bin.as_ref(),
+        target.bin_error.as_deref(),
+        target.name,
+    ) {
         Ok(bin) => bin,
         Err(skipped) => return skipped,
     };
-    // `AISNAP-1` は `mcp_args` だけを使うため、`serve_args_error` は無視する
-    // （レビュー指摘 P2。Codex。PR #442 再々々々レビュー）。
+    // `AISNAP-1` は `mcp_args` だけを使うため、`serve_args_error` は無視する。
     if let Some(outcome) = arg_error_gate(target.mcp_args_error.as_deref(), target.name) {
         return outcome;
     }
     // `marker` は当該 fixture の `goto` が実際に成功したことを内容ベースで
     // 確認するための一意な識別子（[`crate::support::fixture_marker`] の
-    // ドキュメント参照。レビュー指摘 P1。Codex。PR #442
-    // 再々々々々々々々々々レビュー・measure.rs:1450）。`FIXTURE_TABLE` の
-    // 各パスには必ず対応するマーカーが登録されている（`support.rs` の
+    // ドキュメント参照）。`FIXTURE_TABLE` の各パスには必ず対応するマーカーが
+    // 登録されている（`support.rs` の
     // `fixture_table_and_markers_cover_the_same_paths` が保証する）ため、
     // ここで `unwrap_or("")` にせず明示的に内部不整合として扱う。
     let mut sites: Vec<(String, &'static str)> =
@@ -1396,16 +1384,7 @@ pub fn measure_token_reduction(
                 target.name
             ));
         };
-        sites.push((format!("{fixture_base_url}{page}"), marker));
-    }
-    // レビュー指摘 P0（Codex。PR #442 再レビュー）: 生成した URL が本当に
-    // このベンチが起動した fixture サーバー（127.0.0.1・起動したポート）
-    // だけを指すことを最後にもう一度確認する（モジュールドキュメント参照。
-    // ここで拒否されるのは実装バグの場合のみで、通常経路では常に成功する）。
-    for (url, _marker) in &sites {
-        if let Err(reason) = validate_local_bench_url(url, fixture_port) {
-            return Outcome::Error(format!("{}: {reason}", target.name));
-        }
+        sites.push((crate::support::fixture_url(fixture_port, page), marker));
     }
 
     let mut client = match McpClient::spawn(bin, &target.mcp_args) {
@@ -1607,14 +1586,13 @@ pub fn run_all(targets: &[Target], trials: usize) -> (String, u8) {
         let server_start_error = fixture_server.as_ref().and_then(|r| r.as_ref().err());
         let token_reduction = match token_reduction_gate(
             target.bin.as_ref(),
+            target.bin_error.as_deref(),
             server_start_error.map(String::as_str),
             target.name,
         ) {
             Some(outcome) => outcome,
             None => match &fixture_server {
-                Some(Ok(server)) => {
-                    measure_token_reduction(target, &server.base_url(), server.port)
-                }
+                Some(Ok(server)) => measure_token_reduction(target, server.port),
                 // `token_reduction_gate` が `None` を返すのは
                 // `bin_configured && server_start_error.is_none()` の場合
                 // だけであり、`bin_configured` なら `any_target_configured`
@@ -1631,13 +1609,22 @@ pub fn run_all(targets: &[Target], trials: usize) -> (String, u8) {
         };
         eprintln!("token reduction (%): {}", token_reduction.to_json());
 
+        // `sitesCount`: `tokenReductionPct` の対象として構成されている
+        // fixture の件数（`support::FIXTURE_TABLE` は記事・一覧・フォームの
+        // 3 類型のみ）。計測の成否とは独立の値であり、`tokenReductionPct` が
+        // `skipped`/`error` のときも `FIXTURE_TABLE` の件数を返す。
+        // `docs/spec/03-poc/browser-landscape-2026`（PoC-13。5 類型）と
+        // 対象ページの種類・件数が異なるため、この値を添えて
+        // `tokenReductionPct` を PoC-13 の実測値と直接比較しないことを
+        // 結果からも判別できるようにする（モジュールドキュメント参照）。
         body.push_str(&format!(
-            "  \"{}\": {{\"binarySizeBytes\":{},\"coldStartMs\":{},\"idleRssKb\":{},\"tokenReductionPct\":{}}}",
+            "  \"{}\": {{\"binarySizeBytes\":{},\"coldStartMs\":{},\"idleRssKb\":{},\"tokenReductionPct\":{},\"sitesCount\":{}}}",
             json_escape(target.name),
             binary_size.to_json(),
             cold_start.to_json(),
             idle_rss.to_json(),
             token_reduction.to_json(),
+            crate::support::FIXTURE_TABLE.len(),
         ));
         if i + 1 < targets.len() {
             body.push(',');

@@ -29,36 +29,25 @@
 //! 起動して検証する（外部プロセス起動を伴うが、対象バイナリではなく
 //! OS 標準のシェルのみを使うため、依存関係は増えない）。
 //!
-//! `AISNAP-1`（MCP トークン削減率）計測は、任意の外部 URL
-//! （`COMPETITOR_BENCH_SITES`）ではなく、リポジトリに同梱した静的 fixture
-//! （外部参照を含まない自作コンテンツ。[`FIXTURE_TABLE`]）だけを対象にする
-//! （PR #442 再レビュー。Codex P0: 計測対象ブラウザは接続時に名前を
+//! `AISNAP-1`（MCP トークン削減率）計測は、任意の外部 URL ではなく、
+//! リポジトリに同梱した静的 fixture（外部参照を含まない自作コンテンツ。
+//! [`FIXTURE_TABLE`]）だけを対象にする。計測対象ブラウザは接続時に名前を
 //! 再解決し、公開 URL からのリダイレクトにも追従し得るため、事前の URL
-//! 検証をいくら積み増しても実際の接続先を保証できない）。fixture は
-//! `include_str!` でコンパイル時にバイナリへ埋め込み（実行時のファイル
-//! I/O を行わない。PR #442 再々レビュー。Codex P0/P1: ファイルシステムから
-//! 都度読む方式はシンボリックリンク追従・メタデータ確認後の TOCTOU
-//! サイズ超過の経路になり得た）、`competitor_lightpanda.rs` が起動する
-//! ローカル静的サーバー（`127.0.0.1` の空きポート）が [`lookup_fixture`]
-//! の完全一致検索で配信する。`goto` する URL がそのサーバーだけを指す
-//! ことを [`validate_local_bench_url`] で確認する。これによりベンチが
-//! 外部ネットワークへ一切出ない構成になり、SSRF 経路を構造的になくすと
-//! 同時に、外部サイトの可用性・変化に左右されない再現可能な計測になる
-//! （security.md「SSRF」）。
+//! 検証をいくら積み増しても実際の接続先を保証できない（SSRF・TOCTOU。
+//! security.md「SSRF」）。fixture は `include_str!` でコンパイル時に
+//! バイナリへ埋め込み（実行時のファイル I/O を行わないため、シンボリック
+//! リンク追従やメタデータ確認後のサイズ変化 TOCTOU が構造的に起こらない）、
+//! `competitor_lightpanda.rs` が起動するローカル静的サーバー（`127.0.0.1`
+//! の空きポート）が [`lookup_fixture`] の完全一致検索で配信する。`goto`
+//! する URL は [`fixture_url`] だけで組み立て、`FIXTURE_TABLE` に列挙した
+//! 固定パス以外を渡せない構造にすることで、ベンチが外部ネットワークへ
+//! 一切出ない構成を保証する。
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::time::Instant;
-
-// `reqwest`（`fandhe-browser-core` の既存依存。ホストする crate の
-// `Cargo.toml` 参照）は `url::Url` を `reqwest::Url` として re-export している。
-// 新規依存を追加せず（dependency-policy.md）、既存の推移依存から WHATWG URL
-// 準拠のパーサーを使うため、ここでは `reqwest::Url` を経由して取り込む
-// （レビュー指摘 P0/Medium。PR #442。再レビューでローカル URL 検証
-// （`validate_local_bench_url`）へ用途を変更した）。
-use reqwest::Url;
+use std::time::{Duration, Instant};
 
 /// 複数回試行した計測値（ミリ秒・キロバイト等）から中央値を求める。
 ///
@@ -349,40 +338,18 @@ pub fn json_escape(input: &str) -> String {
     out
 }
 
-/// `goto` へ渡す URL がベンチ自身の起動したローカル fixture サーバー
-/// （127.0.0.1・固定ポートではなく起動時に確保したポート）だけを指すことを
-/// 検証する。
+/// `AISNAP-1` が `goto` する fixture ページの URL を組み立てる型付き
+/// コンストラクタ。
 ///
-/// レビュー指摘 P0（Codex。PR #442 再レビュー・competitor_lightpanda.rs:729/783）:
-/// 計測対象ブラウザは接続時に名前を再解決でき、また `goto` 先が公開 URL
-/// でもそこからのリダイレクトに追従し得るため、事前検証（DNS 解決結果の
-/// チェックを含む）を積み増しても「ブラウザが実際に接続する宛先」を
-/// 保証できない（TOCTOU）。この問題は「検証を強化する」のではなく
-/// 「外部ネットワークに一切出ない構成にする」ことでしか解消できないため、
-/// `COMPETITOR_BENCH_SITES` による任意外部 URL の指定を廃止し、ベンチが
-/// 自ら起動したローカル静的サーバー（`competitor_lightpanda.rs` の
-/// `FixtureServer`）が配信する fixture ページだけを `goto` する設計へ
-/// 変更した。この関数はその最後の防波堤として、生成した URL が本当に
-/// `http://127.0.0.1:<起動したポート>/...` の形であることを確認する
-/// （scheme が `http`・ホストが `127.0.0.1`・ポートが一致することを要求する）。
-pub fn validate_local_bench_url(url: &str, expected_port: u16) -> Result<(), String> {
-    let parsed = Url::parse(url).map_err(|err| format!("{url}: invalid URL ({err})"))?;
-    if parsed.scheme() != "http" {
-        return Err(format!("{url}: only http is allowed for local fixtures"));
-    }
-    match parsed.host_str() {
-        Some("127.0.0.1") => {}
-        _ => return Err(format!("{url}: host must be 127.0.0.1")),
-    }
-    match parsed.port() {
-        Some(port) if port == expected_port => {}
-        _ => {
-            return Err(format!(
-                "{url}: port must match the fixture server port ({expected_port})"
-            ));
-        }
-    }
-    Ok(())
+/// `path` は [`FIXTURE_TABLE`] に列挙された固定パス（`&'static str`。実行時
+/// 入力を含まない）だけを渡す契約とし、常に
+/// `http://127.0.0.1:<port><path>` の形になることを型で保証する。これに
+/// より、文字列を組み立ててから `reqwest::Url` 等でパースし直して検証する
+/// 経路自体をなくす（誤った scheme・host・port を持つ URL を返しようが
+/// ない）。ベンチが起動するローカル fixture サーバー以外へは構造的に
+/// `goto` できないため、SSRF 経路が生じない（security.md「SSRF」）。
+pub fn fixture_url(port: u16, path: &'static str) -> String {
+    format!("http://127.0.0.1:{port}{path}")
 }
 
 /// `AISNAP-1`（MCP トークン削減率）計測が `goto` する fixture ページの
@@ -483,24 +450,26 @@ pub fn lookup_fixture(request_path: &str) -> Option<(&'static str, &'static str)
 /// 対象バイナリが設定済みならその参照を `Ok` で返し、未設定なら全計測項目で
 /// 共通の `Outcome::Skipped` を `Err` で返す。
 ///
-/// レビュー指摘 P1（Codex。PR #442 再々々レビュー・
-/// competitor_lightpanda.rs:593）: `measure_idle_rss` の `#[cfg(windows)]`
-/// 版が `target.bin` を確認せずに常に `Outcome::Unsupported` を返しており、
-/// 「対象バイナリ未設定なら全計測項目が `Outcome::Skipped`」という契約に
-/// 反していた（`<PREFIX>_BIN` 未設定でも `idleRssKb` だけ `unsupported` に
-/// なる）。この判定は本来 OS に依存しない（`target.bin` の有無だけで決まる）
-/// ため、`competitor_lightpanda.rs` の `measure_cold_start`・
-/// `measure_binary_size`・`measure_token_reduction`・`#[cfg(unix)]`/
-/// `#[cfg(windows)]` 両方の `measure_idle_rss`・[`token_reduction_gate`]
-/// がすべてこの 1 関数を通して判定することで、個別に同じ分岐を書いて
-/// 食い違いを生む余地をなくす。
-/// `Result` にして `bin` そのものを返すことで、呼び出し側は
+/// `<PREFIX>_BIN` が設定されているのに解決に失敗した場合（`bin_error`。
+/// [`Target::bin_error`] 参照）は `Outcome::Skipped` ではなく
+/// `Outcome::Error` にする（設定ミスと「そもそも未設定」を区別する。
+/// coding-rust.md「外部入力の経路では明示的に処理する」）。この判定は
+/// OS に依存しない（`bin`・`bin_error` の値だけで決まる）ため、
+/// `measure_cold_start`・`measure_binary_size`・`measure_token_reduction`・
+/// `#[cfg(unix)]`/`#[cfg(windows)]` 両方の `measure_idle_rss`・
+/// [`token_reduction_gate`] がすべてこの 1 関数を通して判定することで、
+/// 個別に同じ分岐を書いて食い違いを生む余地をなくす。`Result` にして
+/// `bin` そのものを返すことで、呼び出し側は
 /// `let Some(bin) = &target.bin else { unreachable!() }` のような
 /// 冗長かつ不変条件に依存する再チェックを書かずに済む。
 pub fn require_bin<'a>(
     bin: Option<&'a PathBuf>,
+    bin_error: Option<&str>,
     target_name: &str,
 ) -> Result<&'a PathBuf, Outcome> {
+    if let Some(reason) = bin_error {
+        return Err(Outcome::Error(format!("{target_name}: {reason}")));
+    }
     bin.ok_or_else(|| Outcome::Skipped(format!("{target_name}: binary path not configured")))
 }
 
@@ -519,10 +488,11 @@ pub fn require_bin<'a>(
 /// （呼び出し側が実際に `measure_token_reduction` を呼ぶ）。
 pub fn token_reduction_gate(
     bin: Option<&PathBuf>,
+    bin_error: Option<&str>,
     server_start_error: Option<&str>,
     target_name: &str,
 ) -> Option<Outcome> {
-    if let Err(skipped) = require_bin(bin, target_name) {
+    if let Err(skipped) = require_bin(bin, bin_error, target_name) {
         return Some(skipped);
     }
     if let Some(err) = server_start_error {
@@ -615,21 +585,213 @@ pub fn http_status_for_io_error(kind: std::io::ErrorKind) -> (u16, &'static str)
     }
 }
 
-/// 外部コマンド（`kill`/`taskkill`）の終了ステータスを、成功したかどうかの
-/// 判定へ変換する。
+/// `COMPETITOR_BENCH_TRIALS` の生の値を試行回数へ解決する純粋関数
+/// （`competitor_lightpanda.rs` の `trial_count` から呼ばれる。
+/// [`resolve_bin_value`] と同じ理由で `std::env` に触れない形にする）。
 ///
-/// レビュー指摘 P1（Codex。PR #442 再々々々々々々レビュー・
-/// competitor_lightpanda.rs:558）: 以前は `Command::status()` の結果を
-/// `let _ = ...` で握りつぶしており、外部コマンドの非 0 終了（対象
-/// プロセスが既に存在しない等）に気づけなかった。判定ロジック自体を
-/// この純粋関数へ切り出し、[`kill_process_group`] はプロセス起動と、
-/// この関数が行う判定とに分離する。
+/// 未設定（`raw` が `None`）は `default` を返す。設定されているのに
+/// 解決できない場合（非 UTF-8・非数値・`1..=max` の範囲外）は黙って
+/// `default` へフォールバックせず `Err` にする（誤設定に気づけないまま
+/// 意図しない試行回数で計測することを避ける。coding-rust.md「外部入力の
+/// 経路では明示的に処理する」）。
+///
+/// [`split_args`] と同じ理由（本ファイル冒頭 `split_args` のドキュメント
+/// 参照）で `#[allow(dead_code)]` を付ける。`competitor_lightpanda`
+/// （`[[bench]]`）・`competitor_lightpanda_support`（`harness = true` の
+/// `[[test]]`。単体テストから到達）では到達するが、
+/// `competitor_lightpanda_measure`（`harness = false`。独自の `main` を持ち
+/// 環境変数の解析を経由しない）からは到達不能になる。
+#[allow(dead_code)]
+pub fn parse_trial_count(
+    raw: Option<&std::ffi::OsStr>,
+    default: usize,
+    max: usize,
+) -> Result<usize, String> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let Some(raw) = raw.to_str() else {
+        return Err("COMPETITOR_BENCH_TRIALS is not valid UTF-8".to_string());
+    };
+    let trimmed = raw.trim();
+    let n: usize = trimmed
+        .parse()
+        .map_err(|_| format!("COMPETITOR_BENCH_TRIALS ({trimmed:?}) is not a valid integer"))?;
+    if (1..=max).contains(&n) {
+        Ok(n)
+    } else {
+        Err(format!(
+            "COMPETITOR_BENCH_TRIALS ({n}) must be between 1 and {max}"
+        ))
+    }
+}
+
+/// `<PREFIX>_BIN` の生の値（`env::var_os` の結果）を、既存の通常ファイルの
+/// パスへ 1 回だけ解決する純粋関数（`competitor_lightpanda.rs` の
+/// `Target::from_env` から呼ばれる。`std::env` に触れない形にすることで
+/// `std::env::set_var`（edition 2024 では `unsafe`。coding-rust.md
+/// 「unsafe は原則禁止」）を使わずに単体テストできる）。
+///
+/// 戻り値は `(bin, bin_error)` の組。環境変数が未設定（`raw` が `None`）
+/// なら `(None, None)`（全計測を `Outcome::Skipped` にする既存の契約）。
+/// 設定されているのに解決できなかった場合（非 UTF-8・空白のみ・存在しない・
+/// 通常ファイルでない）は `(None, Some(reason))` にし、[`require_bin`] が
+/// `Outcome::Skipped` ではなく `Outcome::Error` として扱えるようにする
+/// （誤設定を「未設定」と黙って同一視しない）。ここで検証したパスを、
+/// 起動（`Command::new`）・サイズ計測（`fs::metadata`）の両方で再利用する
+/// ことで、PATH 検索の有無や cwd の違いによる「起動できたのにサイズ計測
+/// できない」といった食い違いを防ぐ。
+///
+/// [`parse_trial_count`] と同じ理由で `#[allow(dead_code)]` を付ける
+/// （`competitor_lightpanda_measure` からは到達不能）。
+#[allow(dead_code)]
+pub fn resolve_bin_value(
+    var_name: &str,
+    raw: Option<&std::ffi::OsStr>,
+) -> (Option<PathBuf>, Option<String>) {
+    let Some(raw) = raw else {
+        return (None, None);
+    };
+    let Some(raw) = raw.to_str() else {
+        return (None, Some(format!("{var_name} is not valid UTF-8")));
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (None, Some(format!("{var_name} is set but empty")));
+    }
+    let path = PathBuf::from(trimmed);
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => (Some(path), None),
+        Ok(_) => (
+            None,
+            Some(format!(
+                "{var_name} ({}) is not a regular file",
+                path.display()
+            )),
+        ),
+        Err(e) => (
+            None,
+            Some(format!(
+                "{var_name} ({}) could not be accessed: {e}",
+                path.display()
+            )),
+        ),
+    }
+}
+
+/// 外部コマンド（`kill`/`taskkill`）の終了ステータスを、成功したかどうかの
+/// 判定へ変換する。判定ロジック自体をこの純粋関数へ切り出し、
+/// [`kill_process_group`] はプロセス起動と、この関数が行う判定とに分離する。
 pub fn exit_status_to_result(status: std::process::ExitStatus) -> Result<(), String> {
     if status.success() {
         Ok(())
     } else {
         Err(format!("command exited with {status}"))
     }
+}
+
+/// [`run_with_deadline`] が使う既定の期限とポーリング間隔。`kill`/`taskkill`/
+/// `ps` はローカルの OS 標準コマンドで通常ミリ秒オーダーで完了するが、
+/// 環境異常（応答しないシェル等）で無期限にブロックしないよう上限を設ける
+/// （coding-rust.md「外部入力の経路」の精神を、信頼するローカルコマンドの
+/// 待機にも適用する）。
+pub const EXTERNAL_COMMAND_DEADLINE: Duration = Duration::from_secs(10);
+const EXTERNAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// spawn 済みの子プロセスの終了を期限付きで待つ。期限超過時は `kill` して
+/// から `wait` する（`wait` を省くとゾンビプロセスが残る）。
+///
+/// [`kill_process_group`]・`measure.rs` の `sample_rss_kb` が使う共通
+/// プリミティブ。`try_wait` によるポーリングは、`Command::status()` の
+/// ような無期限ブロッキング待機を避けるための唯一の手段（std には
+/// 期限付き `wait` が無く、`unsafe`・新規依存も使えない）。
+pub fn wait_with_deadline(
+    child: &mut std::process::Child,
+    deadline: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if start.elapsed() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "process did not exit within {deadline:?}; killed it"
+                    ));
+                }
+                std::thread::sleep(EXTERNAL_COMMAND_POLL_INTERVAL);
+            }
+            Err(e) => return Err(format!("try_wait failed: {e}")),
+        }
+    }
+}
+
+/// `command` を spawn し、期限付きで完了を待って終了ステータスを返す。
+///
+/// `command` の stdin/stdout/stderr は呼び出し元が設定済みであることを
+/// 前提にする（`Stdio::piped()` を使う場合、本関数は完了を待つ間バッファを
+/// 読み出さないため、大量出力を伴うコマンドには使わないこと。`kill`・
+/// `taskkill` のような出力を持たない・ごく小さいコマンド専用）。
+pub fn run_with_deadline(
+    mut command: std::process::Command,
+    deadline: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("failed to spawn: {e}"))?;
+    wait_with_deadline(&mut child, deadline)
+}
+
+/// `command` の stdout を上限付きで採取しつつ、完了を期限付きで待つ。
+///
+/// `ps` のような出力の小さいローカルコマンド専用（`measure.rs` の
+/// `sample_rss_kb` が使う）。`max_stdout_bytes` を超える出力は切り捨てて
+/// 読み続ける（無制限確保を避ける。coding-rust.md「長さ・件数を上限検証
+/// してからアロケーションに使う」）。stdin は `Stdio::null()` に固定する
+/// （呼び出し元からの入力を渡す用途を持たない）。
+///
+/// `sample_rss_kb`（unix 専用。`ps` を使う）からのみ呼ばれるため
+/// `#[cfg(unix)]` にする（Windows ビルドでは dead_code になる）。
+#[cfg(unix)]
+pub fn run_capturing_output_with_deadline(
+    mut command: std::process::Command,
+    deadline: Duration,
+    max_stdout_bytes: usize,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("failed to spawn: {e}"))?;
+    // `ps -o rss=` のような対象コマンドの出力は常に数バイト〜数十バイト
+    // であり、パイプバッファ（多くの OS で 64KiB 以上）を埋めて書き込みが
+    // ブロックする実運用上のリスクは無視できる。読み出し自体は `wait` の
+    // 前ではなく後に行う（このプリミティブの想定用途では出力が極小で
+    // あるため、待機中に相手が書き込みでブロックすることはない）。
+    let status = wait_with_deadline(&mut child, deadline)?;
+    let mut stdout = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = out
+                .read(&mut buf)
+                .map_err(|e| format!("read stdout: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            let remaining = max_stdout_bytes.saturating_sub(stdout.len());
+            let take = remaining.min(n);
+            stdout.extend_from_slice(&buf[..take]);
+            if stdout.len() >= max_stdout_bytes {
+                break;
+            }
+        }
+    }
+    Ok((status, stdout))
 }
 
 /// 起動する `Command` に「新しいプロセスグループ」を設定する。
@@ -702,28 +864,28 @@ pub fn kill_process_group(pid: u32) -> Result<(), String> {
     // 自プロセスが起動した子プロセスの PID（`u32`）であり外部入力では
     // ない（数字以外を含み得ない）うえ、シェルスクリプト文字列へ埋め込む
     // のではなく別引数（`$1`）として渡すため、シェルへの注入の余地は無い。
-    let status = std::process::Command::new("sh")
+    let mut command = std::process::Command::new("sh");
+    command
         .arg("-c")
         .arg(r#"kill -s KILL -- "-$1""#)
         .arg("sh") // `$0`（スクリプト名。位置引数の 0 番目）のプレースホルダ。
         .arg(pid.to_string()) // `$1`。
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("failed to spawn sh for kill: {e}"))?;
+        .stderr(std::process::Stdio::null());
+    let status = run_with_deadline(command, EXTERNAL_COMMAND_DEADLINE)?;
     exit_status_to_result(status)
 }
 
 #[cfg(windows)]
 pub fn kill_process_group(pid: u32) -> Result<(), String> {
-    let status = std::process::Command::new("taskkill")
+    let mut command = std::process::Command::new("taskkill");
+    command
         .args(["/T", "/F", "/PID", &pid.to_string()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("failed to spawn taskkill: {e}"))?;
+        .stderr(std::process::Stdio::null());
+    let status = run_with_deadline(command, EXTERNAL_COMMAND_DEADLINE)?;
     exit_status_to_result(status)
 }
 
@@ -1059,9 +1221,12 @@ fn validate_mcp_result_shape(result: &JsonValue, method: &str) -> Result<(), Str
     let Some(items) = content.as_array() else {
         return Err("tools/call \"result.content\" is not an array".to_string());
     };
-    if items.is_empty() {
-        return Err("tools/call \"result.content\" is empty".to_string());
-    }
+    // MCP 2025-06-18 の `CallToolResult.content` は空配列を許す（例えば
+    // `goto` のように応答本体を持たないツールがあり得る）。空・欠けた
+    // ページ内容から誤って「削減率 100%」等を導出しないための防御は、
+    // 呼び出し側（`measure_token_reduction`）が `extract_text` の結果と
+    // `FIXTURE_MARKERS` の内容ベース検証で行う（この関数はあくまで
+    // JSON-RPC 2.0・MCP の形式契約だけを見る）。
     for (i, item) in items.iter().enumerate() {
         let Some(item_type) = item.get("type").and_then(JsonValue::as_str) else {
             return Err(format!(
@@ -1088,6 +1253,7 @@ pub enum JsonParseError {
     InvalidSurrogate,
     DepthExceeded,
     TrailingData,
+    DuplicateKey(String),
 }
 
 /// 再帰下降の深さ上限。MCP 応答は数階層のオブジェクト・配列のネストに留まる
@@ -1108,9 +1274,17 @@ pub fn parse_json(input: &str) -> Result<JsonValue, JsonParseError> {
     Ok(value)
 }
 
+/// RFC 8259 §2 が JSON の空白として定義する 4 種のみを空白として扱う。
+/// `char::is_whitespace`（Unicode の広い空白定義）を使うと、RFC 8259 では
+/// 非空白の Unicode 空白文字（例: U+00A0 NBSP）を暗黙に読み飛ばしてしまい、
+/// MCP 応答（外部プロセスからの入力）に対して寛容すぎるパーサーになる。
+fn is_json_whitespace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r')
+}
+
 fn skip_whitespace(chars: &[char], pos: &mut usize) {
     while let Some(&c) = chars.get(*pos) {
-        if c.is_whitespace() {
+        if is_json_whitespace(c) {
             *pos += 1;
         } else {
             break;
@@ -1161,6 +1335,9 @@ fn parse_number(chars: &[char], pos: &mut usize) -> Result<JsonValue, JsonParseE
     if peek(chars, *pos) == Some('-') {
         *pos += 1;
     }
+    // RFC 8259 §6: 整数部の先頭が `0` の場合はそれ 1 桁のみで終わらなければ
+    // ならない（`01`・`00` 等の先頭ゼロを許さない）。`-0` 自体は許容する。
+    let int_start = *pos;
     let mut saw_digit = false;
     while let Some(c) = peek(chars, *pos) {
         if c.is_ascii_digit() {
@@ -1171,6 +1348,10 @@ fn parse_number(chars: &[char], pos: &mut usize) -> Result<JsonValue, JsonParseE
         }
     }
     if !saw_digit {
+        return Err(JsonParseError::InvalidNumber);
+    }
+    let int_len = *pos - int_start;
+    if int_len > 1 && chars.get(int_start) == Some(&'0') {
         return Err(JsonParseError::InvalidNumber);
     }
     if peek(chars, *pos) == Some('.') {
@@ -1379,6 +1560,13 @@ fn parse_object(
             None => return Err(JsonParseError::UnexpectedEnd),
         }
         let value = parse_value(chars, pos, depth + 1)?;
+        // RFC 8259 は重複キーの扱いを規定しないが、後勝ちで黙って上書きすると
+        // MCP 応答（外部プロセスからの入力）で意図的な重複キーを使った
+        // 値のすり替えに気づけない。ここでは明示的にエラーにする
+        // （coding-rust.md「外部入力の経路」）。
+        if map.contains_key(&key) {
+            return Err(JsonParseError::DuplicateKey(key));
+        }
         map.insert(key, value);
         skip_whitespace(chars, pos);
         match peek(chars, *pos) {
@@ -1760,43 +1948,52 @@ mod tests {
         assert!(parse_json("1.").is_err());
     }
 
-    // レビュー指摘 P0（Codex。PR #442 再レビュー）: `validate_local_bench_url`
-    // が 127.0.0.1・指定ポートの http URL のみを許可し、それ以外
-    // （別ホスト・別ポート・https・file 等）を拒否することを確認する。
+    // RFC 8259 §6: 先頭ゼロ（`01`・`00`）は許さない。`0`・`-0`・`0.5` は
+    // 許容する（`0` 単独・小数点付きは先頭ゼロ規則の対象外）。
     #[test]
-    fn validate_local_bench_url_accepts_matching_local_url() {
-        assert!(validate_local_bench_url("http://127.0.0.1:9400/article.html", 9400).is_ok());
+    fn parse_json_rejects_leading_zero() {
+        assert_eq!(parse_json("01"), Err(JsonParseError::InvalidNumber));
+        assert_eq!(parse_json("-01"), Err(JsonParseError::InvalidNumber));
+        assert_eq!(parse_json("00"), Err(JsonParseError::InvalidNumber));
     }
 
     #[test]
-    fn validate_local_bench_url_rejects_non_http_scheme() {
-        assert!(validate_local_bench_url("https://127.0.0.1:9400/", 9400).is_err());
-        assert!(validate_local_bench_url("file:///etc/passwd", 9400).is_err());
+    fn parse_json_accepts_zero_and_negative_zero() {
+        assert_eq!(parse_json("0"), Ok(JsonValue::Number(0.0)));
+        assert_eq!(parse_json("-0"), Ok(JsonValue::Number(-0.0)));
+        assert_eq!(parse_json("0.5"), Ok(JsonValue::Number(0.5)));
+    }
+
+    // RFC 8259 §2 の空白は ` `・`\t`・`\n`・`\r` の 4 種のみ。U+00A0 等の
+    // 他の Unicode 空白は空白として読み飛ばさず、値の外側にある不正な文字
+    // として扱う。
+    #[test]
+    fn parse_json_rejects_non_rfc8259_whitespace() {
+        assert!(parse_json("\u{00A0}1").is_err());
     }
 
     #[test]
-    fn validate_local_bench_url_rejects_other_host() {
-        assert!(validate_local_bench_url("http://example.com:9400/", 9400).is_err());
-        assert!(validate_local_bench_url("http://localhost:9400/", 9400).is_err());
-        assert!(validate_local_bench_url("http://0.0.0.0:9400/", 9400).is_err());
+    fn parse_json_rejects_duplicate_object_keys() {
+        assert_eq!(
+            parse_json(r#"{"a":1,"a":2}"#),
+            Err(JsonParseError::DuplicateKey("a".to_string()))
+        );
     }
 
-    // `reqwest::Url`（WHATWG URL 準拠）は `127.1`・`2130706433` のような
-    // IPv4 の別表記を正規化して "127.0.0.1" にする。この関数は正規化後の
-    // 文字列を見るため、これらの表記も結局は許可対象のホストと同じ
-    // アドレスとして受理される（別表記を使っても迂回にはならない。
-    // `goto` 先が変わるわけではないため安全側）。
+    // PERF-3/AISNAP-1: `fixture_url` は常に 127.0.0.1・指定ポート・渡した
+    // パスの http URL だけを組み立てる（検証ではなく構造で保証する）。
     #[test]
-    fn validate_local_bench_url_accepts_ipv4_alt_forms_that_normalize_to_loopback() {
-        assert!(validate_local_bench_url("http://127.1:9400/", 9400).is_ok());
-        assert!(validate_local_bench_url("http://2130706433:9400/", 9400).is_ok());
+    fn fixture_url_builds_local_http_url() {
+        assert_eq!(
+            fixture_url(9400, "/article.html"),
+            "http://127.0.0.1:9400/article.html"
+        );
     }
 
     #[test]
-    fn validate_local_bench_url_rejects_mismatched_port() {
-        assert!(validate_local_bench_url("http://127.0.0.1:9401/", 9400).is_err());
-        // ポート省略（80 番）は起動したポートと一致しない限り拒否される。
-        assert!(validate_local_bench_url("http://127.0.0.1/", 9400).is_err());
+    fn fixture_url_reflects_the_given_port() {
+        assert_eq!(fixture_url(1, "/"), "http://127.0.0.1:1/");
+        assert_eq!(fixture_url(65535, "/"), "http://127.0.0.1:65535/");
     }
 
     // fixture 配信サーバー（competitor_lightpanda.rs の
@@ -1889,6 +2086,112 @@ mod tests {
         assert_eq!(
             http_status_for_io_error(std::io::ErrorKind::ConnectionReset),
             (400, "Bad Request")
+        );
+    }
+
+    #[test]
+    fn parse_trial_count_absent_uses_default() {
+        assert_eq!(parse_trial_count(None, 5, 20), Ok(5));
+    }
+
+    #[test]
+    fn parse_trial_count_valid_value_in_range() {
+        let raw = std::ffi::OsString::from("3");
+        assert_eq!(parse_trial_count(Some(&raw), 5, 20), Ok(3));
+    }
+
+    // 不正値（非数値・範囲外・空白のみ）は黙って既定値へフォールバックせず
+    // `Err` にする（誤設定に気づけないまま意図しない試行回数で計測しない）。
+    #[test]
+    fn parse_trial_count_non_numeric_is_an_error() {
+        let raw = std::ffi::OsString::from("not-a-number");
+        assert!(parse_trial_count(Some(&raw), 5, 20).is_err());
+    }
+
+    #[test]
+    fn parse_trial_count_zero_is_an_error() {
+        let raw = std::ffi::OsString::from("0");
+        assert!(parse_trial_count(Some(&raw), 5, 20).is_err());
+    }
+
+    #[test]
+    fn parse_trial_count_above_max_is_an_error() {
+        let raw = std::ffi::OsString::from("21");
+        assert!(parse_trial_count(Some(&raw), 5, 20).is_err());
+    }
+
+    #[test]
+    fn parse_trial_count_whitespace_only_is_an_error() {
+        let raw = std::ffi::OsString::from("   ");
+        assert!(parse_trial_count(Some(&raw), 5, 20).is_err());
+    }
+
+    // `<PREFIX>_BIN` 未設定（`raw: None`）は既存の「バイナリ未設定は
+    // Skipped」契約を保つため `(None, None)` にする。
+    #[test]
+    fn resolve_bin_value_absent_is_none_without_error() {
+        assert_eq!(resolve_bin_value("LIGHTPANDA_BIN", None), (None, None));
+    }
+
+    #[test]
+    fn resolve_bin_value_existing_file_resolves_to_that_path() {
+        let path = std::env::temp_dir().join(format!(
+            "fandhe-bench-resolve-bin-value-test-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"stub").expect("write temp file");
+        let raw = std::ffi::OsString::from(path.as_os_str());
+        let (bin, bin_error) = resolve_bin_value("LIGHTPANDA_BIN", Some(&raw));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(bin, Some(path));
+        assert_eq!(bin_error, None);
+    }
+
+    #[test]
+    fn resolve_bin_value_missing_path_is_an_error_not_skipped() {
+        let missing = std::env::temp_dir().join("fandhe-bench-resolve-bin-value-missing-xyz");
+        let raw = std::ffi::OsString::from(missing.as_os_str());
+        let (bin, bin_error) = resolve_bin_value("LIGHTPANDA_BIN", Some(&raw));
+        assert_eq!(bin, None);
+        assert!(
+            bin_error
+                .expect("expected error")
+                .contains("could not be accessed")
+        );
+    }
+
+    #[test]
+    fn resolve_bin_value_directory_is_an_error() {
+        let dir = std::env::temp_dir();
+        let raw = std::ffi::OsString::from(dir.as_os_str());
+        let (bin, bin_error) = resolve_bin_value("LIGHTPANDA_BIN", Some(&raw));
+        assert_eq!(bin, None);
+        assert!(
+            bin_error
+                .expect("expected error")
+                .contains("is not a regular file")
+        );
+    }
+
+    #[test]
+    fn resolve_bin_value_whitespace_only_is_an_error_not_skipped() {
+        let raw = std::ffi::OsString::from("   ");
+        let (bin, bin_error) = resolve_bin_value("LIGHTPANDA_BIN", Some(&raw));
+        assert_eq!(bin, None);
+        assert!(bin_error.expect("expected error").contains("set but empty"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_bin_value_non_utf8_is_an_error() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(&[0xff, 0xfe]).to_os_string();
+        let (bin, bin_error) = resolve_bin_value("LIGHTPANDA_BIN", Some(&raw));
+        assert_eq!(bin, None);
+        assert!(
+            bin_error
+                .expect("expected error")
+                .contains("not valid UTF-8")
         );
     }
 
@@ -2041,6 +2344,101 @@ mod tests {
             "grandchild (pid={grandchild_pid}) should be dead after kill_process_group \
              (not just the direct child; this is the whole point of process-group kill)"
         );
+    }
+
+    /// PERF-3/PERF-6: `wait_with_deadline` は期限を超えて生存し続ける
+    /// 子プロセスを kill し、期限を大きく超えて（テストでは 30 秒）
+    /// ブロックしないことを確認する（[`kill_process_group`]・
+    /// `measure.rs` の `sample_rss_kb` が使う共通プリミティブ）。
+    #[cfg(unix)]
+    #[test]
+    fn wait_with_deadline_kills_process_that_outlives_the_deadline() {
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().expect("spawn sh sleep 30");
+
+        let start = Instant::now();
+        let result = wait_with_deadline(&mut child, std::time::Duration::from_millis(300));
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "expected timeout error, got {result:?} (process should not exit on its own within 300ms of a 30s sleep)"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "wait_with_deadline should return soon after the deadline, took {elapsed:?}"
+        );
+    }
+
+    /// 期限内に自発的に終了するプロセスは、期限を待たずに `Ok` で返る。
+    #[cfg(unix)]
+    #[test]
+    fn wait_with_deadline_returns_ok_for_process_exiting_before_deadline() {
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().expect("spawn sh exit 0");
+
+        let result = wait_with_deadline(&mut child, std::time::Duration::from_secs(5));
+        match result {
+            Ok(status) => assert!(status.success()),
+            Err(e) => panic!("expected Ok, got {e}"),
+        }
+    }
+
+    /// `run_with_deadline` は spawn から完了待ちまでを一括で行う
+    /// （`kill_process_group` が実際に使う経路）。
+    #[cfg(unix)]
+    #[test]
+    fn run_with_deadline_reports_success_exit_status() {
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let status =
+            run_with_deadline(command, std::time::Duration::from_secs(5)).expect("run succeeds");
+        assert!(status.success());
+    }
+
+    /// `run_capturing_output_with_deadline` は `sample_rss_kb` が使う経路。
+    /// stdout を採取しつつ期限内に完了することを確認する。
+    #[cfg(unix)]
+    #[test]
+    fn run_capturing_output_with_deadline_captures_stdout() {
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg("printf hello");
+        let (status, stdout) =
+            run_capturing_output_with_deadline(command, std::time::Duration::from_secs(5), 4096)
+                .expect("run succeeds");
+        assert!(status.success());
+        assert_eq!(stdout, b"hello");
+    }
+
+    /// `max_stdout_bytes` を超える出力は切り詰め、無制限確保しない
+    /// （coding-rust.md「長さ・件数を上限検証」）。
+    #[cfg(unix)]
+    #[test]
+    fn run_capturing_output_with_deadline_caps_stdout_length() {
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg("printf '0123456789'");
+        let (status, stdout) =
+            run_capturing_output_with_deadline(command, std::time::Duration::from_secs(5), 4)
+                .expect("run succeeds");
+        assert!(status.success());
+        assert_eq!(stdout.len(), 4);
     }
 
     // レビュー指摘 P2（Codex。PR #442 再々々々々々レビュー・
@@ -2248,13 +2646,12 @@ mod tests {
         }
     }
 
-    // レビュー指摘 P1（Codex。PR #442 再々レビュー・
-    // competitor_lightpanda.rs:1058）: 対象バイナリ未設定（`bin: None`）は、
-    // fixture サーバーの起動結果に関わらず常に `Skipped` でなければならない
+    // 対象バイナリ未設定（`bin: None`・`bin_error: None`）は、fixture
+    // サーバーの起動結果に関わらず常に `Skipped` でなければならない
     // （`Error` になってはいけない）。
     #[test]
     fn token_reduction_gate_unconfigured_is_skipped_even_if_server_failed() {
-        let outcome = token_reduction_gate(None, Some("bind failed"), "fandhe-browser");
+        let outcome = token_reduction_gate(None, None, Some("bind failed"), "fandhe-browser");
         match outcome {
             Some(Outcome::Skipped(reason)) => {
                 assert!(reason.contains("binary path not configured"));
@@ -2265,14 +2662,14 @@ mod tests {
 
     #[test]
     fn token_reduction_gate_unconfigured_without_server_error_is_skipped() {
-        let outcome = token_reduction_gate(None, None, "fandhe-browser");
+        let outcome = token_reduction_gate(None, None, None, "fandhe-browser");
         assert!(matches!(outcome, Some(Outcome::Skipped(_))));
     }
 
     #[test]
     fn token_reduction_gate_configured_with_server_error_is_error() {
         let bin = PathBuf::from("lightpanda-bin");
-        let outcome = token_reduction_gate(Some(&bin), Some("bind failed"), "lightpanda");
+        let outcome = token_reduction_gate(Some(&bin), None, Some("bind failed"), "lightpanda");
         match outcome {
             Some(Outcome::Error(reason)) => {
                 assert!(reason.contains("bind failed"));
@@ -2284,19 +2681,35 @@ mod tests {
     #[test]
     fn token_reduction_gate_configured_without_server_error_is_none() {
         let bin = PathBuf::from("lightpanda-bin");
-        assert_eq!(token_reduction_gate(Some(&bin), None, "lightpanda"), None);
+        assert_eq!(
+            token_reduction_gate(Some(&bin), None, None, "lightpanda"),
+            None
+        );
     }
 
-    // レビュー指摘 P1（Codex。PR #442 再々々レビュー・
-    // competitor_lightpanda.rs:593）: `measure_idle_rss` の Windows 版が
-    // `target.bin` を確認せず常に `Outcome::Unsupported` を返し、「対象
-    // バイナリ未設定なら全計測項目が Skipped」という契約に反していた。
-    // OS に依存しないこの判定を共通関数として検証する
-    // （`measure_cold_start`・`measure_binary_size`・unix/windows 両方の
-    // `measure_idle_rss`・[`token_reduction_gate`] がすべてこの関数を通す）。
+    // `<PREFIX>_BIN` が設定されているのに解決できなかった（`bin_error`）
+    // 場合は、`bin` が `None` でも `Skipped` ではなく `Error` にする
+    // （設定ミスと「そもそも未設定」を区別する）。
+    #[test]
+    fn token_reduction_gate_bin_error_is_error_even_without_server_error() {
+        let outcome = token_reduction_gate(None, Some("bin is not a file"), None, "lightpanda");
+        match outcome {
+            Some(Outcome::Error(reason)) => {
+                assert!(reason.contains("bin is not a file"));
+            }
+            other => panic!("expected Some(Outcome::Error(_)), got {other:?}"),
+        }
+    }
+
+    // `measure_idle_rss` の Windows 版が `target.bin` を確認せず常に
+    // `Outcome::Unsupported` を返すと、「対象バイナリ未設定なら全計測項目が
+    // Skipped」という契約に反する。OS に依存しないこの判定を共通関数として
+    // 検証する（`measure_cold_start`・`measure_binary_size`・unix/windows
+    // 両方の `measure_idle_rss`・[`token_reduction_gate`] がすべてこの関数を
+    // 通す）。
     #[test]
     fn require_bin_none_is_skipped() {
-        match require_bin(None, "fandhe-browser") {
+        match require_bin(None, None, "fandhe-browser") {
             Err(Outcome::Skipped(reason)) => {
                 assert!(reason.contains("binary path not configured"));
             }
@@ -2307,7 +2720,20 @@ mod tests {
     #[test]
     fn require_bin_some_returns_the_path() {
         let bin = PathBuf::from("lightpanda-bin");
-        assert_eq!(require_bin(Some(&bin), "lightpanda"), Ok(&bin));
+        assert_eq!(require_bin(Some(&bin), None, "lightpanda"), Ok(&bin));
+    }
+
+    // `bin_error` が `Some` のときは `bin` の値に関わらず `Error` にする
+    // （`bin` は解決失敗時に呼び出し側で常に `None` にする契約だが、この
+    // 関数自体は不変条件に依存せず `bin_error` を優先する）。
+    #[test]
+    fn require_bin_error_takes_precedence_and_is_an_error() {
+        match require_bin(None, Some("not a regular file"), "lightpanda") {
+            Err(Outcome::Error(reason)) => {
+                assert!(reason.contains("not a regular file"));
+            }
+            other => panic!("expected Err(Outcome::Error(_)), got {other:?}"),
+        }
     }
 
     // レビュー指摘 P2（Codex。PR #442 再々々々レビュー・
@@ -2455,11 +2881,15 @@ mod tests {
         assert!(validate_mcp_response(&value, 1.0, "tools/call").is_err());
     }
 
+    // MCP 2025-06-18 の `CallToolResult.content` は空配列を許す（`goto` の
+    // ように応答本体を持たないツールがあり得るため）。ページ内容の欠如は
+    // `measure_token_reduction` 側の `extract_text`・マーカー検証で検出する
+    // （このレイヤは JSON-RPC/MCP の形式契約だけを見る）。
     #[test]
-    fn validate_mcp_response_rejects_tools_call_empty_content_array() {
+    fn validate_mcp_response_accepts_tools_call_empty_content_array() {
         let value =
             parse_json(r#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#).expect("valid json");
-        assert!(validate_mcp_response(&value, 1.0, "tools/call").is_err());
+        assert!(validate_mcp_response(&value, 1.0, "tools/call").is_ok());
     }
 
     #[test]

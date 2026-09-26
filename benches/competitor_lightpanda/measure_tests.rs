@@ -283,6 +283,7 @@ fn fake_target(name: &'static str) -> Target {
     Target {
         name,
         bin: Some(current_exe),
+        bin_error: None,
         serve_args: vec![
             FAKE_ROLE_FLAG.to_string(),
             "cdp-ok".to_string(),
@@ -395,6 +396,16 @@ fn successful_measurement_path_reports_measured_values_and_exit_code_zero() {
         "tokenReductionPct should be exactly 75.0 given the fixed fake MCP response lengths: {body}"
     );
 
+    // `sitesCount` は `tokenReductionPct` の対象として構成されている
+    // fixture の件数（`support::FIXTURE_TABLE`。計測の成否とは独立）。
+    // PoC-13（5 類型）と比較しないための注記を結果からも判別できるように
+    // する（モジュールドキュメント参照）。
+    assert_eq!(
+        report.get("sitesCount").and_then(JsonValue::as_f64),
+        Some(3.0),
+        "sitesCount should equal the number of fixtures in FIXTURE_TABLE: {body}"
+    );
+
     assert_eq!(
         exit_code, 0,
         "exit code should be 0 when every measurement succeeds: {body}"
@@ -417,6 +428,7 @@ fn cold_start_invalid_readiness_response_is_error_with_exit_code_one() {
     let target = Target {
         name: "fake-browser-invalid",
         bin: Some(current_exe),
+        bin_error: None,
         serve_args: vec![
             FAKE_ROLE_FLAG.to_string(),
             "cdp-invalid".to_string(),
@@ -450,20 +462,20 @@ fn mcp_disconnect_without_newline_fails_immediately() {
     let target = Target {
         name: "fake-browser-disconnect",
         bin: Some(current_exe),
+        bin_error: None,
         serve_args: Vec::new(),
         mcp_args: vec![FAKE_ROLE_FLAG.to_string(), "mcp-disconnect".to_string()],
         serve_args_error: None,
         mcp_args_error: None,
     };
 
-    // `validate_local_bench_url` は文字列としての形式検証のみ行い、実際の
-    // 接続はしないため、ダミーの fixture サーバー情報（存在しないポート）を
-    // 渡しても `initialize` が失敗する経路には影響しない。
+    // `fixture_url` はポート番号を URL へ埋め込むだけで実際の接続はしない
+    // ため、ダミーのポート（未使用と分かっている値）を渡しても `initialize`
+    // が失敗する経路には影響しない。
     let dummy_port: u16 = 1;
-    let dummy_base_url = format!("http://127.0.0.1:{dummy_port}");
 
     let start = Instant::now();
-    let outcome = measure_token_reduction(&target, &dummy_base_url, dummy_port);
+    let outcome = measure_token_reduction(&target, dummy_port);
     let elapsed = start.elapsed();
 
     match outcome {
@@ -489,6 +501,7 @@ fn unconfigured_target_is_skipped_with_exit_code_zero() {
     let target = Target {
         name: "unconfigured",
         bin: None,
+        bin_error: None,
         serve_args: Vec::new(),
         mcp_args: Vec::new(),
         serve_args_error: None,
@@ -527,28 +540,25 @@ fn unconfigured_target_is_skipped_with_exit_code_zero() {
 /// JSON-RPC 応答自体は形式上妥当でも、2 件目以降の fixture
 /// （`/listing.html`・`/form.html`）については `html`/`tree` にその
 /// fixture 自身のマーカーが含まれないため、内容ベースの検証
-/// （レビュー指摘 P1。Codex。PR #442 再々々々々々々々々々レビュー・
-/// measure.rs:1450）によって計測失敗（`Outcome::Error`）になることを
-/// 確認する。
+/// によって計測失敗（`Outcome::Error`）になることを確認する。
 fn stale_mcp_response_after_second_goto_is_error() {
     let current_exe = std::env::current_exe().expect("current_exe");
     let target = Target {
         name: "fake-browser-stale",
         bin: Some(current_exe),
+        bin_error: None,
         serve_args: Vec::new(),
         mcp_args: vec![FAKE_ROLE_FLAG.to_string(), "mcp-stale".to_string()],
         serve_args_error: None,
         mcp_args_error: None,
     };
 
-    // `validate_local_bench_url` は文字列としての形式検証のみ行い、実際の
-    // 接続はしないため、ダミーの fixture サーバー情報（存在しないポート）を
-    // 渡しても各サイトへの `goto`（fake MCP 側は URL 文字列だけを見る）には
-    // 影響しない。
+    // `fixture_url` はポート番号を URL へ埋め込むだけで実際の接続はしない
+    // ため、ダミーのポートを渡しても各サイトへの `goto`（fake MCP 側は URL
+    // 文字列だけを見る）には影響しない。
     let dummy_port: u16 = 1;
-    let dummy_base_url = format!("http://127.0.0.1:{dummy_port}");
 
-    let outcome = measure_token_reduction(&target, &dummy_base_url, dummy_port);
+    let outcome = measure_token_reduction(&target, dummy_port);
     match outcome {
         Outcome::Error(reason) => {
             assert!(
