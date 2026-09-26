@@ -124,6 +124,33 @@ class LoadSitesTest(unittest.TestCase):
             with self.assertRaises(cs.SiteListError):
                 cs.load_sites(path, min_sites=5)
 
+    def test_rejects_sites_file_exceeding_byte_limit(self) -> None:
+        # codex P1: `MAX_SITES` はパース後の件数にしか効かず、`--sites` に
+        # 巨大なファイルを指定すると `read_text`/`json.loads` が上限なく
+        # メモリを消費してしまう。JSON として妥当かどうかに関わらず、
+        # 読み込み前の `stat` の時点でサイズ超過を検出できることを確認する。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sites.json"
+            path.write_bytes(b"x" * (cs.MAX_SITES_FILE_BYTES + 1))
+            with self.assertRaises(cs.SiteListError) as ctx:
+                cs.load_sites(path, min_sites=5)
+            self.assertIn("byte limit", str(ctx.exception))
+
+    def test_rejects_sites_file_larger_than_stat_reported_at_read_time(self) -> None:
+        # codex P1: `stat` と実際の読み込みの間にファイルが差し替えられて
+        # 大きくなる TOCTOU を想定し、読み込み自体も
+        # `MAX_SITES_FILE_BYTES + 1` バイトまでに制限して fail-closed に
+        # 検出できることを確認する（`stat` が小さいサイズを報告していても、
+        # 実ファイルが大きければ拒否される）。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sites.json"
+            path.write_bytes(b"x" * (cs.MAX_SITES_FILE_BYTES + 1))
+            fake_stat_result = os.stat_result((0,) * 6 + (1,) + (0,) * 3)  # st_size=1（小さいと偽装）
+            with mock.patch.object(Path, "stat", return_value=fake_stat_result):
+                with self.assertRaises(cs.SiteListError) as ctx:
+                    cs.load_sites(path, min_sites=5)
+            self.assertIn("byte limit", str(ctx.exception))
+
     def test_rejects_duplicate_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "sites.json"
@@ -260,6 +287,18 @@ class ExpandTemplateTest(unittest.TestCase):
         self.assertNotEqual(argv1, argv2)
 
 
+def _chunk_bytes(chunk_type: bytes, data: bytes) -> bytes:
+    """CRC 付きの 1 チャンク分のバイト列を組み立てる（`fake_engine._chunk` の薄いラッパー）。
+
+    `_build_png` より柔軟にチャンク構成を組みたいテスト（PLTE・未知の
+    critical チャンク・IHDR 以外を先頭に置く等）から使う。
+    """
+    sys.path.insert(0, str(FIXTURES_DIR))
+    import fake_engine  # noqa: PLC0415
+
+    return fake_engine._chunk(chunk_type, data)  # noqa: SLF001
+
+
 def _build_png(
     width: int,
     height: int,
@@ -270,21 +309,23 @@ def _build_png(
     compression: int = 0,
     filter_method: int = 0,
     interlace: int = 0,
+    extra_chunks_before_idat: list[tuple[bytes, bytes]] | None = None,
 ) -> bytes:
     """テスト用に IHDR・任意個の IDAT・IEND から成る PNG バイト列を組み立てる。
 
     `fake_engine._chunk` を再利用して各チャンクの CRC を正しく計算し、
     `read_png_size` の IDAT 展開検証（codex P1）を IHDR フィールド・IDAT の
-    個数や内容を変えながら検証できるようにする。
+    個数や内容を変えながら検証できるようにする。`extra_chunks_before_idat`
+    は IHDR の直後・IDAT より前に挿む任意のチャンク（`(type, data)` の
+    リスト）で、PLTE 関連のテストに使う。
     """
-    sys.path.insert(0, str(FIXTURES_DIR))
-    import fake_engine  # noqa: PLC0415
-
     ihdr = struct.pack(">IIBBBBB", width, height, bit_depth, color_type, compression, filter_method, interlace)
-    chunks = [fake_engine._chunk(b"IHDR", ihdr)]  # noqa: SLF001
+    chunks = [_chunk_bytes(b"IHDR", ihdr)]
+    for extra_type, extra_data in extra_chunks_before_idat or []:
+        chunks.append(_chunk_bytes(extra_type, extra_data))
     for payload in idat_payloads:
-        chunks.append(fake_engine._chunk(b"IDAT", payload))  # noqa: SLF001
-    chunks.append(fake_engine._chunk(b"IEND", b""))  # noqa: SLF001
+        chunks.append(_chunk_bytes(b"IDAT", payload))
+    chunks.append(_chunk_bytes(b"IEND", b""))
     return cs.PNG_SIGNATURE + b"".join(chunks)
 
 
@@ -544,6 +585,221 @@ class ReadPngSizeTest(unittest.TestCase):
                 with self.assertRaises(cs.PngError):
                     cs.read_png_size(path)
         self.assertFalse(fake.flush_called)
+
+    def test_rejects_ihdr_length_not_exactly_13(self) -> None:
+        # codex P1 再指摘: 旧実装は `chunk_length < 13` しか見ておらず、13 バイト
+        # より長い IHDR（余分なフィールドを持つ不正な IHDR）を受け入れてしまう。
+        ihdr = struct.pack(">IIBBBBB", 4, 4, 8, 2, 0, 0, 0) + b"\x00"  # 14 バイト
+        png_bytes = cs.PNG_SIGNATURE + _chunk_bytes(b"IHDR", ihdr) + _chunk_bytes(b"IEND", b"")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ihdr-too-long.png"
+            path.write_bytes(png_bytes)
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("13", str(ctx.exception))
+
+    def test_rejects_first_chunk_after_signature_must_be_ihdr(self) -> None:
+        # codex P1: シグネチャ直後の最初のチャンクは必ず IHDR でなければならない。
+        ihdr = struct.pack(">IIBBBBB", 4, 4, 8, 2, 0, 0, 0)
+        png_bytes = (
+            cs.PNG_SIGNATURE
+            + _chunk_bytes(b"IDAT", b"dummy")
+            + _chunk_bytes(b"IHDR", ihdr)
+            + _chunk_bytes(b"IEND", b"")
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "wrong-first-chunk.png"
+            path.write_bytes(png_bytes)
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("first chunk", str(ctx.exception))
+
+    def test_rejects_duplicate_ihdr_chunk(self) -> None:
+        ihdr = struct.pack(">IIBBBBB", 4, 4, 8, 2, 0, 0, 0)
+        png_bytes = (
+            cs.PNG_SIGNATURE
+            + _chunk_bytes(b"IHDR", ihdr)
+            + _chunk_bytes(b"IHDR", ihdr)
+            + _chunk_bytes(b"IDAT", b"dummy")
+            + _chunk_bytes(b"IEND", b"")
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "duplicate-ihdr.png"
+            path.write_bytes(png_bytes)
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("duplicate IHDR", str(ctx.exception))
+
+    def test_rejects_iend_with_nonzero_length(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nonempty-iend.png"
+            ihdr = struct.pack(">IIBBBBB", 4, 4, 8, 2, 0, 0, 0)
+            png_bytes = (
+                cs.PNG_SIGNATURE
+                + _chunk_bytes(b"IHDR", ihdr)
+                + _chunk_bytes(b"IDAT", b"dummy")
+                + _chunk_bytes(b"IEND", b"\x00\x00\x00\x00")
+            )
+            path.write_bytes(png_bytes)
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("IEND", str(ctx.exception))
+
+    def test_rejects_unknown_critical_chunk(self) -> None:
+        # codex P1: 先頭文字が大文字（critical）の未知チャンクは、リーダーが
+        # 無視してよい ancillary チャンクとは異なり fail-closed に拒否する。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unknown-critical.png"
+            path.write_bytes(
+                _build_png(4, 4, [b"dummy"], extra_chunks_before_idat=[(b"CUST", b"unexpected")])
+            )
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("critical", str(ctx.exception))
+
+    def test_accepts_unknown_ancillary_chunk(self) -> None:
+        # 先頭文字が小文字（ancillary）の未知チャンクは無視してよい（PNG 仕様）。
+        width, height = 4, 4
+        raw = _raw_pixels(width, height, channels=3)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ancillary.png"
+            path.write_bytes(
+                _build_png(
+                    width,
+                    height,
+                    [zlib.compress(raw)],
+                    extra_chunks_before_idat=[(b"tEXt", b"Comment\x00hello")],
+                )
+            )
+            result_width, result_height = cs.read_png_size(path)
+            self.assertEqual((result_width, result_height), (width, height))
+
+    def test_rejects_missing_plte_for_palette_color_type(self) -> None:
+        # codex P1: 色タイプ 3（パレット）は PLTE が必須で、IDAT より前に
+        # 現れなければならない。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "palette-no-plte.png"
+            path.write_bytes(_build_png(4, 4, [b"dummy"], bit_depth=8, color_type=3))
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("PLTE", str(ctx.exception))
+
+    def test_rejects_plte_chunk_for_disallowed_color_type(self) -> None:
+        # PNG 仕様: PLTE はグレースケール（色タイプ 0）では禁止。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "grayscale-with-plte.png"
+            path.write_bytes(
+                _build_png(
+                    4,
+                    4,
+                    [b"dummy"],
+                    bit_depth=8,
+                    color_type=0,
+                    extra_chunks_before_idat=[(b"PLTE", b"\x00\x00\x00")],
+                )
+            )
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("PLTE", str(ctx.exception))
+
+    def test_rejects_plte_chunk_after_idat(self) -> None:
+        ihdr = struct.pack(">IIBBBBB", 4, 4, 8, 2, 0, 0, 0)
+        png_bytes = (
+            cs.PNG_SIGNATURE
+            + _chunk_bytes(b"IHDR", ihdr)
+            + _chunk_bytes(b"IDAT", b"dummy")
+            + _chunk_bytes(b"PLTE", b"\x00\x00\x00")
+            + _chunk_bytes(b"IEND", b"")
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plte-after-idat.png"
+            path.write_bytes(png_bytes)
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("PLTE", str(ctx.exception))
+
+    def test_rejects_plte_length_not_multiple_of_three(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad-plte-length.png"
+            path.write_bytes(
+                _build_png(
+                    4,
+                    4,
+                    [b"dummy"],
+                    bit_depth=8,
+                    color_type=3,
+                    extra_chunks_before_idat=[(b"PLTE", b"\x00\x00\x00\x00")],
+                )
+            )
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("PLTE", str(ctx.exception))
+
+    def test_rejects_plte_entry_count_exceeds_bit_depth(self) -> None:
+        # bit_depth=1 のパレット画像はエントリ数が 2^1 = 2 まで。3 エントリ
+        # （9 バイト）は超過として拒否する。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plte-too-many-entries.png"
+            path.write_bytes(
+                _build_png(
+                    4,
+                    4,
+                    [b"dummy"],
+                    bit_depth=1,
+                    color_type=3,
+                    extra_chunks_before_idat=[(b"PLTE", b"\x00\x00\x00" * 3)],
+                )
+            )
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("PLTE", str(ctx.exception))
+
+    def test_accepts_palette_png_with_valid_plte(self) -> None:
+        width, height = 4, 4
+        raw = _raw_pixels(width, height, channels=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "valid-palette.png"
+            path.write_bytes(
+                _build_png(
+                    width,
+                    height,
+                    [zlib.compress(raw)],
+                    bit_depth=8,
+                    color_type=3,
+                    extra_chunks_before_idat=[(b"PLTE", b"\x00\x00\x00\xff\xff\xff")],
+                )
+            )
+            result_width, result_height = cs.read_png_size(path)
+            self.assertEqual((result_width, result_height), (width, height))
+
+    def test_rejects_too_many_png_chunks(self) -> None:
+        # codex P1: チャンク数にも上限を設ける。
+        ihdr = struct.pack(">IIBBBBB", 4, 4, 8, 2, 0, 0, 0)
+        extra = _chunk_bytes(b"tEXt", b"a\x00b") * 5
+        png_bytes = (
+            cs.PNG_SIGNATURE + _chunk_bytes(b"IHDR", ihdr) + extra + _chunk_bytes(b"IDAT", b"dummy") + _chunk_bytes(b"IEND", b"")
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "too-many-chunks.png"
+            path.write_bytes(png_bytes)
+            with mock.patch.object(cs, "MAX_PNG_CHUNKS", 3):
+                with self.assertRaises(cs.PngError) as ctx:
+                    cs.read_png_size(path)
+            self.assertIn("chunks", str(ctx.exception))
+
+    def test_rejects_invalid_scanline_filter_type(self) -> None:
+        # codex P1: 「可能なら」求められた追加検証。展開後データの各走査行の
+        # 先頭（フィルタタイプバイト）が PNG 仕様の定める 0〜4 のいずれかで
+        # あることを確認する。
+        width, height = 4, 4
+        raw = bytearray(_raw_pixels(width, height, channels=3))
+        raw[0] = 5  # 1 行目のフィルタタイプバイトを不正な値にする
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad-filter-type.png"
+            path.write_bytes(_build_png(width, height, [zlib.compress(bytes(raw))]))
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("filter type", str(ctx.exception))
 
 
 class _Resp(io.BytesIO):

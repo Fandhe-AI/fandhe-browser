@@ -63,6 +63,13 @@ MIN_VIEWPORT = 1
 MAX_VIEWPORT = 10000
 MAX_SITES = 50
 
+# `--sites` で指定される JSON ファイルの読み込み上限（codex P1）。`MAX_SITES`
+# はパース後のサイト件数にしか適用されないため、巨大な `--sites` ファイルを
+# 指定すると `read_text`/`json.loads` が上限なくメモリを消費してしまう。
+# `sites.json` は数十件のサイト情報を持つだけの小さな設定ファイルであり、
+# 1 MiB あれば十分すぎるほど余裕がある。
+MAX_SITES_FILE_BYTES = 1024 * 1024
+
 # --engines / --timeout-sec / --settle-ms / --min-sites の CLI 引数検証に使う上限。
 # 無制限値（NaN・inf・極端に大きい値）でタイムアウト待ちや DoS を招かないための
 # fail-closed な境界（security.md OWASP「不安全な設計」）。
@@ -89,6 +96,12 @@ MAX_PNG_BYTES = 64 * 1024 * 1024
 # 約 4.1 MiB なので、代表サイトの viewport を大きく上回る余裕を見て 256 MiB
 # とする。
 MAX_PNG_RAW_BYTES = 256 * 1024 * 1024
+
+# PNG チャンクの走査回数の上限（codex P1）。`MAX_PNG_BYTES` の範囲内でも、
+# 最小サイズ（12 バイト: 長さ 4 + 型 4 + CRC 4、データ 0 バイト）のチャンクを
+# 大量に並べたファイルは、CRC 検証だけでも走査に時間がかかる。実際の PNG が
+# 必要とするチャンク数（数個〜数十個）を大きく上回る値として 10000 とする。
+MAX_PNG_CHUNKS = 10_000
 
 STDERR_TAIL_CHARS = 2000
 
@@ -216,11 +229,34 @@ def load_sites(
     `fetch_snapshot` に既にある同名オプションと揃える。P2: これが無いと
     `--allow-file-url` を指定してもサイト一覧の https 限定検証で常に弾かれ、
     README が案内するテスト用フラグが機能しなかった）。
+
+    `MAX_SITES` はパース後のサイト件数にしか効かないため、`--sites` に巨大な
+    ファイルを指定されると `read_text`/`json.loads` が上限なくメモリを消費
+    してしまう（codex P1）。`stat` でのサイズ確認（速い足切り）に加え、
+    読み込み自体も `MAX_SITES_FILE_BYTES + 1` バイトまでに制限する
+    （`stat` と実際の読み込みの間にファイルが差し替えられて大きくなる
+    TOCTOU にも fail-closed に対応できるよう、確認だけでなく読み込み量にも
+    上限を課す）。
     """
     try:
-        raw_text = path.read_text(encoding="utf-8")
+        file_size = path.stat().st_size
+    except OSError as exc:
+        raise SiteListError(f"failed to stat sites file: {path}: {exc}") from exc
+    if file_size > MAX_SITES_FILE_BYTES:
+        raise SiteListError(f"sites file exceeds the {MAX_SITES_FILE_BYTES} byte limit: {path}")
+
+    try:
+        with path.open("rb") as fh:
+            raw_bytes = fh.read(MAX_SITES_FILE_BYTES + 1)
     except OSError as exc:
         raise SiteListError(f"failed to read sites file: {path}: {exc}") from exc
+    if len(raw_bytes) > MAX_SITES_FILE_BYTES:
+        raise SiteListError(f"sites file exceeds the {MAX_SITES_FILE_BYTES} byte limit: {path}")
+
+    try:
+        raw_text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SiteListError(f"sites file is not valid UTF-8: {path}: {exc}") from exc
 
     try:
         data = json.loads(raw_text)
@@ -920,6 +956,33 @@ _PNG_COLOR_TYPE_INFO: dict[int, tuple[set[int], int]] = {
     6: ({8, 16}, 4),  # RGBA
 }
 
+# Adam7 インターレースの 7 パス: (x_start, y_start, x_step, y_step)。
+# `_expected_raw_size`・`_RowFilterByteChecker` の両方から参照する共通定義。
+_ADAM7_PASSES: tuple[tuple[int, int, int, int], ...] = (
+    (0, 0, 8, 8),
+    (4, 0, 8, 8),
+    (0, 4, 4, 8),
+    (2, 0, 4, 4),
+    (0, 2, 2, 4),
+    (1, 0, 2, 2),
+    (0, 1, 1, 2),
+)
+
+
+def _validate_color_type_and_bit_depth(color_type: int, bit_depth: int) -> int:
+    """color_type と bit_depth の組み合わせを検証し、1 ピクセルあたりのチャンネル数を返す。
+
+    `read_png_size`（IHDR 解析直後）・`_expected_raw_size` の両方から呼ばれる
+    共通の検証ロジック（codex P1: 検証の重複・漏れを避けるため 1 箇所にまとめる）。
+    """
+    info = _PNG_COLOR_TYPE_INFO.get(color_type)
+    if info is None:
+        raise PngError(f"unsupported PNG color type: {color_type}")
+    allowed_depths, channels = info
+    if bit_depth not in allowed_depths:
+        raise PngError(f"invalid bit depth {bit_depth} for color type {color_type}")
+    return channels
+
 
 def _expected_raw_size(width: int, height: int, color_type: int, bit_depth: int, interlace: int) -> int:
     """IHDR の値から、フィルタバイトを含む展開後の生データサイズ（バイト）を計算する。
@@ -929,12 +992,7 @@ def _expected_raw_size(width: int, height: int, color_type: int, bit_depth: int,
     （Adam7）は 7 パスそれぞれが独立した行を持つため、パスごとに計算して
     合算する。
     """
-    info = _PNG_COLOR_TYPE_INFO.get(color_type)
-    if info is None:
-        raise PngError(f"unsupported PNG color type: {color_type}")
-    allowed_depths, channels = info
-    if bit_depth not in allowed_depths:
-        raise PngError(f"invalid bit depth {bit_depth} for color type {color_type}")
+    channels = _validate_color_type_and_bit_depth(color_type, bit_depth)
 
     def row_bytes(w: int) -> int:
         return (w * channels * bit_depth + 7) // 8
@@ -944,23 +1002,72 @@ def _expected_raw_size(width: int, height: int, color_type: int, bit_depth: int,
     if interlace != 1:
         raise PngError(f"unsupported PNG interlace method: {interlace}")
 
-    # Adam7: (x_start, y_start, x_step, y_step) の 7 パス。
     total = 0
-    for x_start, y_start, x_step, y_step in (
-        (0, 0, 8, 8),
-        (4, 0, 8, 8),
-        (0, 4, 4, 8),
-        (2, 0, 4, 4),
-        (0, 2, 2, 4),
-        (1, 0, 2, 2),
-        (0, 1, 1, 2),
-    ):
+    for x_start, y_start, x_step, y_step in _ADAM7_PASSES:
         pass_w = max(0, (width - x_start + x_step - 1) // x_step)
         pass_h = max(0, (height - y_start + y_step - 1) // y_step)
         if pass_w == 0 or pass_h == 0:
             continue
         total += pass_h * (1 + row_bytes(pass_w))
     return total
+
+
+class _RowFilterByteChecker:
+    """展開結果を逐次受け取りながら、各走査行の先頭（フィルタタイプバイト）が
+    PNG 仕様の定める 0〜4（None・Sub・Up・Average・Paeth）のいずれかであることを
+    確認する（codex P1: 「可能なら」求められた追加検証）。
+
+    行の内容そのものは保持せず、パスごとの行数・行長（`_expected_raw_size` と
+    同じ計算）だけを保持して現在位置を算術的に追跡するため、`height` が
+    大きい極端なアスペクト比の画像（例: 幅 1・高さ数千万）でも追加メモリは
+    パス数（最大 7）に比例する定数で収まる。`read_png_size` の逐次展開ループ
+    （本体・末尾フラッシュ相当の両方）から `feed()` を呼び出す想定。
+    """
+
+    def __init__(self, width: int, height: int, channels: int, bit_depth: int, interlace: int) -> None:
+        def row_bytes(w: int) -> int:
+            return (w * channels * bit_depth + 7) // 8
+
+        self._passes: list[tuple[int, int]] = []  # (この pass の行数, 1 行のバイト数)
+        if interlace == 0:
+            if height > 0:
+                self._passes.append((height, 1 + row_bytes(width)))
+        else:
+            for x_start, y_start, x_step, y_step in _ADAM7_PASSES:
+                pass_w = max(0, (width - x_start + x_step - 1) // x_step)
+                pass_h = max(0, (height - y_start + y_step - 1) // y_step)
+                if pass_w == 0 or pass_h == 0:
+                    continue
+                self._passes.append((pass_h, 1 + row_bytes(pass_w)))
+
+        self._pass_idx = 0
+        self._rows_left_in_pass = self._passes[0][0] if self._passes else 0
+        self._pos_in_row = 0
+
+    def feed(self, decoded: bytes, path: Path) -> None:
+        """展開済みバイト列を先頭から与える。呼び出しはストリーム順であること。"""
+        i = 0
+        n = len(decoded)
+        while i < n:
+            while self._rows_left_in_pass == 0:
+                self._pass_idx += 1
+                if self._pass_idx >= len(self._passes):
+                    # サイズ検証（`decoded_size == expected_raw_size`）で別途
+                    # 弾かれるはずの想定外の余剰データ。ここでは静かに無視する。
+                    return
+                self._rows_left_in_pass = self._passes[self._pass_idx][0]
+                self._pos_in_row = 0
+            row_len = self._passes[self._pass_idx][1]
+            if self._pos_in_row == 0:
+                filter_type = decoded[i]
+                if filter_type > 4:
+                    raise PngError(f"invalid scanline filter type {filter_type} (corrupted PNG): {path}")
+            step = min(row_len - self._pos_in_row, n - i)
+            self._pos_in_row += step
+            i += step
+            if self._pos_in_row >= row_len:
+                self._pos_in_row = 0
+                self._rows_left_in_pass -= 1
 
 
 def read_png_size(path: Path) -> tuple[int, int]:
@@ -987,6 +1094,18 @@ def read_png_size(path: Path) -> tuple[int, int]:
     無制限にメモリへ確保しないよう、内容を読む前に `stat` でサイズを確認し
     `MAX_PNG_BYTES` を超えていれば `failed` 相当の `PngError` として拒否する
     （Cursor/codex P1）。
+
+    さらに codex P1 再指摘に基づき、以下を網羅的に検証する:
+    シグネチャ直後の最初のチャンクが IHDR であり長さがちょうど 13 バイトで
+    あること／IHDR の幅・高さが 1 以上・色タイプとビット深度の組み合わせが
+    PNG 仕様で許されたもの・圧縮方式 0・フィルタ方式 0・インターレース法が
+    0 か 1 であること／IHDR と IEND が 1 回だけであること／PLTE が
+    色タイプ 3 では IDAT より前に必須（長さ 3 の倍数で 3〜768・エントリ数が
+    2^ビット深度以下）で色タイプ 0・4 では禁止であること／IDAT が連続して
+    現れること／IEND の長さが 0 で最後のチャンクであり直後に余分なバイトが
+    無いこと／全チャンクの CRC／先頭文字が大文字の未知の critical チャンクを
+    拒否すること／チャンク数が `MAX_PNG_CHUNKS` を超えないこと／展開後データの
+    各走査行のフィルタタイプバイトが 0〜4 であること。
     """
     try:
         file_size = path.stat().st_size
@@ -1008,11 +1127,20 @@ def read_png_size(path: Path) -> tuple[int, int]:
     color_type: int | None = None
     bit_depth: int | None = None
     interlace: int | None = None
+    channels: int | None = None
     idat_chunks: list[bytes] = []
+    seen_plte = False
     offset = len(PNG_SIGNATURE)
     seen_iend = False
     seen_non_idat_after_idat = False
+    is_first_chunk = True
+    chunk_count = 0
     while offset < len(data):
+        chunk_count += 1
+        if chunk_count > MAX_PNG_CHUNKS:
+            # codex P1: チャンク数にも上限を設ける。最小サイズのチャンクを
+            # 大量に並べた `MAX_PNG_BYTES` 以内のファイルでも走査を打ち切る。
+            raise PngError(f"too many PNG chunks (> {MAX_PNG_CHUNKS}): {path}")
         if offset + 8 > len(data):
             raise PngError(f"truncated PNG chunk header: {path}")
         (chunk_length,) = struct.unpack(">I", data[offset : offset + 4])
@@ -1028,11 +1156,16 @@ def read_png_size(path: Path) -> tuple[int, int]:
         if stored_crc != computed_crc:
             raise PngError(f"CRC mismatch in {chunk_type!r} chunk (corrupted PNG): {path}")
 
+        if is_first_chunk and chunk_type != b"IHDR":
+            # codex P1: シグネチャ直後の最初のチャンクは必ず IHDR（PNG 仕様）。
+            raise PngError(f"first chunk after signature must be IHDR, got {chunk_type!r}: {path}")
+        is_first_chunk = False
+
         if chunk_type == b"IHDR":
             if width is not None:
                 raise PngError(f"duplicate IHDR chunk: {path}")
-            if chunk_length < 13:
-                raise PngError(f"IHDR chunk too short: {path}")
+            if chunk_length != 13:
+                raise PngError(f"IHDR chunk length must be exactly 13, got {chunk_length}: {path}")
             (width,) = struct.unpack(">I", chunk_data[0:4])
             (height,) = struct.unpack(">I", chunk_data[4:8])
             bit_depth = chunk_data[8]
@@ -1040,23 +1173,63 @@ def read_png_size(path: Path) -> tuple[int, int]:
             compression_method = chunk_data[10]
             filter_method = chunk_data[11]
             interlace = chunk_data[12]
+            if width == 0 or height == 0:
+                raise PngError(f"PNG has zero width or height: {path}")
+            # 色タイプ・ビット深度は IHDR 解析の時点で検証する（`_expected_raw_size`
+            # 呼び出しまで遅延させない。codex P1: IHDR の各フィールドを網羅的に
+            # 検証する）。
+            channels = _validate_color_type_and_bit_depth(color_type, bit_depth)
             if compression_method != 0:
                 raise PngError(f"unsupported PNG compression method: {compression_method}")
             if filter_method != 0:
                 raise PngError(f"unsupported PNG filter method: {filter_method}")
+            if interlace not in (0, 1):
+                raise PngError(f"unsupported PNG interlace method: {interlace}")
+        elif chunk_type == b"PLTE":
+            if width is None:
+                raise PngError(f"PLTE chunk before IHDR: {path}")
+            if color_type in (0, 4):
+                # PNG 仕様: PLTE はグレースケール（0）・グレースケール+アルファ
+                # （4）では禁止。
+                raise PngError(f"PLTE chunk is not allowed for color type {color_type}: {path}")
+            if idat_chunks:
+                raise PngError(f"PLTE chunk must appear before the first IDAT chunk: {path}")
+            if seen_plte:
+                raise PngError(f"duplicate PLTE chunk: {path}")
+            if chunk_length == 0 or chunk_length % 3 != 0 or chunk_length > 768:
+                raise PngError(f"invalid PLTE chunk length {chunk_length} (must be a multiple of 3 in [3, 768]): {path}")
+            plte_entry_count = chunk_length // 3
+            if color_type == 3 and plte_entry_count > (1 << bit_depth):
+                raise PngError(
+                    f"PLTE has {plte_entry_count} entries, exceeding 2^{bit_depth} "
+                    f"for bit depth {bit_depth}: {path}"
+                )
+            seen_plte = True
         elif chunk_type == b"IDAT":
             if width is None:
                 raise PngError(f"IDAT chunk before IHDR: {path}")
+            if color_type == 3 and not seen_plte:
+                # PNG 仕様: パレット画像（色タイプ 3）は PLTE が必須で、
+                # IDAT より前に現れなければならない。
+                raise PngError(f"IDAT chunk before required PLTE chunk (palette PNG): {path}")
             if seen_non_idat_after_idat:
                 raise PngError(f"non-contiguous IDAT chunks: {path}")
             idat_chunks.append(chunk_data)
         elif chunk_type == b"IEND":
+            if chunk_length != 0:
+                raise PngError(f"IEND chunk must be empty, got length {chunk_length}: {path}")
             seen_iend = True
             offset = crc_end
             break
         else:
             if idat_chunks:
                 seen_non_idat_after_idat = True
+            if chunk_type[0:1].isupper():
+                # codex P1: 未知の critical チャンク（先頭文字が大文字。PNG
+                # 仕様上、リーダーが無視してよいのは ancillary チャンク
+                # （先頭文字が小文字）のみで、critical チャンクを無視すると
+                # 画像の意味が変わりうる）は fail-closed に拒否する。
+                raise PngError(f"unknown critical chunk {chunk_type!r}: {path}")
 
         offset = crc_end
 
@@ -1066,8 +1239,8 @@ def read_png_size(path: Path) -> tuple[int, int]:
         raise PngError(f"missing IEND chunk (truncated PNG): {path}")
     if offset != len(data):
         raise PngError(f"trailing data after IEND chunk: {path}")
-    if width == 0 or height == 0:
-        raise PngError(f"PNG has zero width or height: {path}")
+    if color_type == 3 and not seen_plte:
+        raise PngError(f"missing required PLTE chunk for palette PNG (color type 3): {path}")
     if not idat_chunks:
         raise PngError(f"missing IDAT chunk (no pixel data): {path}")
 
@@ -1078,6 +1251,7 @@ def read_png_size(path: Path) -> tuple[int, int]:
             f"{MAX_PNG_RAW_BYTES} byte limit: {path}"
         )
 
+    row_checker = _RowFilterByteChecker(width, height, channels, bit_depth, interlace)
     decompressor = zlib.decompressobj()
     decoded_size = 0
     try:
@@ -1091,6 +1265,7 @@ def read_png_size(path: Path) -> tuple[int, int]:
                 decoded_size += len(decoded)
                 if decoded_size > expected_raw_size:
                     raise PngError(f"IDAT decompresses larger than the IHDR-derived size: {path}")
+                row_checker.feed(decoded, path)
                 remaining = decompressor.unconsumed_tail
         # 全 IDAT を入力し終えた後も、最終ブロック確定のため追加の出力が
         # バッファに残っていることがある。`decompressobj.flush()` は残りを
@@ -1112,6 +1287,7 @@ def read_png_size(path: Path) -> tuple[int, int]:
             decoded_size += len(decoded)
             if decoded_size > expected_raw_size:
                 raise PngError(f"IDAT decompresses larger than the IHDR-derived size: {path}")
+            row_checker.feed(decoded, path)
     except zlib.error as exc:
         raise PngError(f"IDAT is not valid zlib data (corrupted PNG): {path}: {exc}") from exc
 

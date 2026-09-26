@@ -424,6 +424,21 @@ python3 -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
   超えないことを確認し、展開中も 64 KiB 刻みで期待値超過を検知した時点で
   打ち切る（画素データが存在しない・破損しているファイルを "ok" と誤判定
   しない。codex P1）
+- 撮影済み PNG のチャンク構造検証は上記に加え、シグネチャ直後の最初の
+  チャンクが IHDR で長さがちょうど 13 バイトであること・IHDR と IEND が
+  1 回だけであること・IEND の長さが 0 で最後のチャンクであること・
+  パレット画像（色タイプ 3）に必須の PLTE が IDAT より前に正しい長さ・
+  エントリ数で存在すること（色タイプ 0・4 では逆に禁止）・IDAT が連続して
+  現れること・先頭文字が大文字の未知の critical チャンクを拒否すること
+  （ancillary チャンクは無視してよい）・チャンク数が `MAX_PNG_CHUNKS`
+  （10000）を超えないこと・展開後データの各走査行のフィルタタイプバイトが
+  0〜4 であることまで網羅的に確認する（codex P1）
+- `sites.json`（`--sites`）の読み込みは、パース後のサイト件数上限
+  （`MAX_SITES`）とは別に、ファイル自体のサイズも `stat` で事前確認し
+  （`MAX_SITES_FILE_BYTES`＝1 MiB）、実際の読み込みもその上限 + 1 バイトまでに
+  制限する（`stat` と読み込みの間にファイルが差し替えられて大きくなる
+  TOCTOU にも対応するため。codex P1。巨大な `--sites` ファイルで
+  `json.loads` 前のメモリ消費が無制限になるのを防ぐ）
 - `sites.json` の `viewport.width`/`height` は `[1, 10000]`（`MIN_VIEWPORT`〜
   `MAX_VIEWPORT`）の範囲だけでなく、`load_sites` の時点でこの viewport が
   生成しうる PNG の最悪ケース（RGBA・16bit。PNG が許す最大のチャンネル数・
