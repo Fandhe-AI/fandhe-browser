@@ -118,6 +118,22 @@ if [ "$SIZE" -gt 1048576 ]; then
   exit 2
 fi
 
+# jq はデフォルトで 1 ファイル内の複数のトップレベル JSON 値を順に処理できて
+# しまう（JSON Text Sequences 的な挙動）。README.md のスキーマ契約は「トップ
+# レベルは単一の JSON 配列」であり、以降のスキーマ検証・集計はすべて最初の
+# トップレベル値だけを見る箇所がある（例: 187 行目以降の `read` は jq 出力の
+# 先頭行だけを受け取る）ため、2 つ目以降の配列に不合格な内容を混入させても
+# 検出されずに合格し得る（TASK-9.2 レビュー指摘。codex review, PR #452）。
+# `jq -s`（slurp）でトップレベル値の個数を数え、1 個以外は拒否する。
+if ! DOC_COUNT=$(jq -s 'length' "$MATRIX" 2>&1); then
+  echo "error: failed to parse matrix as JSON: $DOC_COUNT" >&2
+  exit 2
+fi
+if [ "$DOC_COUNT" != "1" ]; then
+  echo "error: matrix file must contain exactly one top-level JSON value (found $DOC_COUNT)" >&2
+  exit 2
+fi
+
 # スキーマ検証。$key は --arg で jq へ渡し、フィルタ文字列へ連結しない
 # （jq インジェクション対策。security.md「インジェクション」観点）。
 # jq 自体が壊れた JSON に対して非ゼロ終了するため、その失敗もここで拾う。

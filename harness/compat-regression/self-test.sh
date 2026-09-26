@@ -118,6 +118,13 @@ expect_exit "missing category entries" 2 --matrix "$FIXTURES/missing-category.js
 expect_exit "empty cat rejected" 2 --matrix "$FIXTURES/empty-cat.json"
 expect_exit "empty cat rejected with all-categories" 2 --matrix "$FIXTURES/empty-cat.json" --all-categories
 
+# 1 ファイル内に複数のトップレベル JSON 値（配列）が連続する場合を拒否する
+# ことを確認する（TASK-9.2 レビュー指摘。codex review, PR #452。1 つ目の配列
+# が合格でも 2 つ目の配列を無視して合格してはならない。README.md の
+# 「トップレベルは単一の JSON 配列」契約に対する検証）。
+expect_exit "multiple top-level JSON values rejected" 2 --matrix "$FIXTURES/multi-document.json"
+expect_contains "$LAST_OUTPUT" "exactly one top-level JSON value" "multi-document error message"
+
 expect_exit "file not found without allow-missing" 2 --matrix "$FIXTURES/does-not-exist.json"
 expect_exit "file not found with allow-missing" 0 --matrix "$FIXTURES/does-not-exist.json" --allow-missing
 expect_contains "$LAST_OUTPUT" "::warning::" "allow-missing warning annotation"
