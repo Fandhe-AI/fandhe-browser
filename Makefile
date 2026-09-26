@@ -359,7 +359,31 @@ endif
 # workspace 作成前・render crate 追加前の CI を壊さない。docker-ci は make ci を
 # 呼ぶため自動的にこの検証を含む。
 .PHONY: ci
-ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-publish-private test test-rendering deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-publish-private test test-rendering deny check-compat-regression ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+
+# --------------------------------------------------
+# 対象サイト群の動作率回帰チェック（TASK-9.2・REPAIR-8。harness/compat-regression/README.md 参照）
+# --------------------------------------------------
+
+# HAS_CARGO / HAS_MEMBERS に依存しない（harness/compat-regression は workspace の
+# 有無と無関係に bash + jq のみで動く）。jq 未導入時は check-publish-private と
+# 同じ方針で fail-closed（silent skip にしない）。self-test を先に実行し、
+# fixture（合成データ）に対して「閾値未満で fail する」ことをログに残してから
+# 実マトリクスを判定する。実マトリクス harness/compat-practical/results/matrix.json
+# は TASK-71.3（#312）が生成予定でまだ無いため、当面 --allow-missing を渡す
+# （#312 で導入され次第このフラグを削除し fail-closed に戻す）。
+.PHONY: check-compat-regression
+check-compat-regression: ## 対象サイト群の動作率マトリクスに対する回帰チェック（COMPAT-1・COMPAT-4）
+	@command -v jq >/dev/null 2>&1 || { \
+		echo "NG: jq が未導入のため check-compat-regression を実行できません" >&2; \
+		exit 1; \
+	}
+	bash harness/compat-regression/self-test.sh
+	bash harness/compat-regression/check-matrix.sh \
+		--matrix harness/compat-practical/results/matrix.json \
+		--threshold 70 \
+		--categories static,spa,form \
+		--allow-missing
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
