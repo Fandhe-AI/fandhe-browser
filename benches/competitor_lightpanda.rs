@@ -74,8 +74,8 @@ use std::time::{Duration, Instant};
 
 use support::{
     JsonValue, Outcome, approx_tokens, bench_exit_code, expand_args, json_escape, lookup_fixture,
-    median, parse_http_request_line, parse_http_status, parse_json, reduction_pct, split_args,
-    token_reduction_gate, validate_local_bench_url,
+    median, parse_http_request_line, parse_http_status, parse_json, reduction_pct, require_bin,
+    split_args, token_reduction_gate, validate_local_bench_url,
 };
 // `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
 // 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
@@ -504,8 +504,9 @@ fn read_line_bounded<R: BufRead>(reader: &mut R, out: &mut String) -> std::io::R
 
 /// cold start（`PERF-3`）: `trials` 回起動し、readiness までの時間の中央値（ms）を返す。
 fn measure_cold_start(target: &Target, trials: usize) -> Outcome {
-    let Some(bin) = &target.bin else {
-        return Outcome::Skipped(format!("{}: binary path not configured", target.name));
+    let bin = match require_bin(target.bin.as_ref(), target.name) {
+        Ok(bin) => bin,
+        Err(skipped) => return skipped,
     };
     if let Some(reason) = &target.args_error {
         return Outcome::Error(format!("{}: {reason}", target.name));
@@ -546,8 +547,9 @@ fn sample_rss_kb(pid: u32) -> Option<u64> {
 
 #[cfg(unix)]
 fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
-    let Some(bin) = &target.bin else {
-        return Outcome::Skipped(format!("{}: binary path not configured", target.name));
+    let bin = match require_bin(target.bin.as_ref(), target.name) {
+        Ok(bin) => bin,
+        Err(skipped) => return skipped,
     };
     if let Some(reason) = &target.args_error {
         return Outcome::Error(format!("{}: {reason}", target.name));
@@ -588,6 +590,16 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
 
 #[cfg(windows)]
 fn measure_idle_rss(target: &Target, _trials: usize) -> Outcome {
+    // レビュー指摘 P1（Codex。PR #442 再々々レビュー・
+    // competitor_lightpanda.rs:593）: `target.bin` を確認せず常に
+    // `Outcome::Unsupported` を返していたため、`<PREFIX>_BIN` が未設定でも
+    // `idleRssKb` だけ `unsupported` になり「対象バイナリ未設定なら全計測が
+    // Skipped」という契約に反していた。他の計測関数（`measure_cold_start`・
+    // `measure_binary_size`・unix 版 `measure_idle_rss`）と同じ判定を
+    // `require_bin`（support.rs。OS に依存しない純粋関数）で先に行う。
+    if let Err(skipped) = require_bin(target.bin.as_ref(), target.name) {
+        return skipped;
+    }
     Outcome::Unsupported(format!(
         "{}: idle RSS measurement uses unix `ps`, unsupported on Windows (PERF-6)",
         target.name
@@ -596,8 +608,9 @@ fn measure_idle_rss(target: &Target, _trials: usize) -> Outcome {
 
 /// バイナリサイズ（`PERF-1`）: 対象実行ファイルの `fs::metadata` によるバイト数。
 fn measure_binary_size(target: &Target) -> Outcome {
-    let Some(bin) = &target.bin else {
-        return Outcome::Skipped(format!("{}: binary path not configured", target.name));
+    let bin = match require_bin(target.bin.as_ref(), target.name) {
+        Ok(bin) => bin,
+        Err(skipped) => return skipped,
     };
     match std::fs::metadata(bin) {
         Ok(meta) if meta.is_file() => Outcome::Value(meta.len() as f64),
@@ -1071,7 +1084,7 @@ fn main() -> std::process::ExitCode {
         // 対象単位にする。
         let server_start_error = fixture_server.as_ref().and_then(|r| r.as_ref().err());
         let token_reduction = match token_reduction_gate(
-            target.bin.is_some(),
+            target.bin.as_ref(),
             server_start_error.map(String::as_str),
             target.name,
         ) {

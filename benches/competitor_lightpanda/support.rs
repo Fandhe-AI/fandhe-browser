@@ -30,6 +30,7 @@
 //! （security.md「SSRF」）。
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 // `reqwest`（`fandhe-browser-core` の既存依存。ホストする crate の
 // `Cargo.toml` 参照）は `url::Url` を `reqwest::Url` として re-export している。
@@ -314,6 +315,29 @@ pub fn lookup_fixture(request_path: &str) -> Option<(&'static str, &'static str)
         .map(|(_, content_type, content)| (*content_type, *content))
 }
 
+/// 対象バイナリが設定済みならその参照を `Ok` で返し、未設定なら全計測項目で
+/// 共通の `Outcome::Skipped` を `Err` で返す。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々レビュー・
+/// competitor_lightpanda.rs:593）: `measure_idle_rss` の `#[cfg(windows)]`
+/// 版が `target.bin` を確認せずに常に `Outcome::Unsupported` を返しており、
+/// 「対象バイナリ未設定なら全計測項目が `Outcome::Skipped`」という契約に
+/// 反していた（`<PREFIX>_BIN` 未設定でも `idleRssKb` だけ `unsupported` に
+/// なる）。この判定は本来 OS に依存しない（`target.bin` の有無だけで決まる）
+/// ため、`competitor_lightpanda.rs` の `measure_cold_start`・
+/// `measure_binary_size`・`#[cfg(unix)]`/`#[cfg(windows)]` 両方の
+/// `measure_idle_rss`・[`token_reduction_gate`] がすべてこの 1 関数を通して
+/// 判定することで、個別に同じ分岐を書いて食い違いを生む余地をなくす。
+/// `Result` にして `bin` そのものを返すことで、呼び出し側は
+/// `let Some(bin) = &target.bin else { unreachable!() }` のような
+/// 冗長かつ不変条件に依存する再チェックを書かずに済む。
+pub fn require_bin<'a>(
+    bin: Option<&'a PathBuf>,
+    target_name: &str,
+) -> Result<&'a PathBuf, Outcome> {
+    bin.ok_or_else(|| Outcome::Skipped(format!("{target_name}: binary path not configured")))
+}
+
 /// `AISNAP-1` 計測（`competitor_lightpanda.rs` の `measure_token_reduction`
 /// 呼び出し前）が、対象バイナリの有無と fixture サーバーの起動結果から
 /// `Outcome` を確定できるかを判定する。
@@ -322,20 +346,18 @@ pub fn lookup_fixture(request_path: &str) -> Option<(&'static str, &'static str)
 /// competitor_lightpanda.rs:1058）: 片方の対象だけに `_BIN` を設定した状態で
 /// fixture サーバーの起動（`bind`）が失敗すると、以前は未設定の対象にも
 /// `Outcome::Error` を割り当てていた（「対象バイナリ未設定は常に
-/// `Outcome::Skipped`」という契約に反する）。この関数は対象バイナリが
-/// 未設定なら（サーバー起動結果に関わらず）常に `Some(Outcome::Skipped)`
-/// を返し、バイナリが設定済みでサーバー起動が失敗していた場合だけ
-/// `Some(Outcome::Error)` を返す。両方問題なければ `None`
+/// `Outcome::Skipped`」という契約に反する）。バイナリ未設定の判定自体は
+/// [`require_bin`] と共通化し、この関数はそれに加えて fixture サーバーの
+/// 起動結果を見る（バイナリが設定済みでサーバー起動が失敗していた場合だけ
+/// `Some(Outcome::Error)` を返す）。両方問題なければ `None`
 /// （呼び出し側が実際に `measure_token_reduction` を呼ぶ）。
 pub fn token_reduction_gate(
-    bin_configured: bool,
+    bin: Option<&PathBuf>,
     server_start_error: Option<&str>,
     target_name: &str,
 ) -> Option<Outcome> {
-    if !bin_configured {
-        return Some(Outcome::Skipped(format!(
-            "{target_name}: binary path not configured"
-        )));
+    if let Err(skipped) = require_bin(bin, target_name) {
+        return Some(skipped);
     }
     if let Some(err) = server_start_error {
         return Some(Outcome::Error(format!(
@@ -1128,12 +1150,12 @@ mod tests {
     }
 
     // レビュー指摘 P1（Codex。PR #442 再々レビュー・
-    // competitor_lightpanda.rs:1058）: 対象バイナリ未設定（`bin_configured
-    // == false`）は、fixture サーバーの起動結果に関わらず常に `Skipped`
-    // でなければならない（`Error` になってはいけない）。
+    // competitor_lightpanda.rs:1058）: 対象バイナリ未設定（`bin: None`）は、
+    // fixture サーバーの起動結果に関わらず常に `Skipped` でなければならない
+    // （`Error` になってはいけない）。
     #[test]
     fn token_reduction_gate_unconfigured_is_skipped_even_if_server_failed() {
-        let outcome = token_reduction_gate(false, Some("bind failed"), "fandhe-browser");
+        let outcome = token_reduction_gate(None, Some("bind failed"), "fandhe-browser");
         match outcome {
             Some(Outcome::Skipped(reason)) => {
                 assert!(reason.contains("binary path not configured"));
@@ -1144,13 +1166,14 @@ mod tests {
 
     #[test]
     fn token_reduction_gate_unconfigured_without_server_error_is_skipped() {
-        let outcome = token_reduction_gate(false, None, "fandhe-browser");
+        let outcome = token_reduction_gate(None, None, "fandhe-browser");
         assert!(matches!(outcome, Some(Outcome::Skipped(_))));
     }
 
     #[test]
     fn token_reduction_gate_configured_with_server_error_is_error() {
-        let outcome = token_reduction_gate(true, Some("bind failed"), "lightpanda");
+        let bin = PathBuf::from("lightpanda-bin");
+        let outcome = token_reduction_gate(Some(&bin), Some("bind failed"), "lightpanda");
         match outcome {
             Some(Outcome::Error(reason)) => {
                 assert!(reason.contains("bind failed"));
@@ -1161,6 +1184,30 @@ mod tests {
 
     #[test]
     fn token_reduction_gate_configured_without_server_error_is_none() {
-        assert_eq!(token_reduction_gate(true, None, "lightpanda"), None);
+        let bin = PathBuf::from("lightpanda-bin");
+        assert_eq!(token_reduction_gate(Some(&bin), None, "lightpanda"), None);
+    }
+
+    // レビュー指摘 P1（Codex。PR #442 再々々レビュー・
+    // competitor_lightpanda.rs:593）: `measure_idle_rss` の Windows 版が
+    // `target.bin` を確認せず常に `Outcome::Unsupported` を返し、「対象
+    // バイナリ未設定なら全計測項目が Skipped」という契約に反していた。
+    // OS に依存しないこの判定を共通関数として検証する
+    // （`measure_cold_start`・`measure_binary_size`・unix/windows 両方の
+    // `measure_idle_rss`・[`token_reduction_gate`] がすべてこの関数を通す）。
+    #[test]
+    fn require_bin_none_is_skipped() {
+        match require_bin(None, "fandhe-browser") {
+            Err(Outcome::Skipped(reason)) => {
+                assert!(reason.contains("binary path not configured"));
+            }
+            other => panic!("expected Err(Outcome::Skipped(_)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_bin_some_returns_the_path() {
+        let bin = PathBuf::from("lightpanda-bin");
+        assert_eq!(require_bin(Some(&bin), "lightpanda"), Ok(&bin));
     }
 }
