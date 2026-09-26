@@ -96,14 +96,22 @@ impl Outcome {
     /// 正規化後に内容のある値が 1 件以上存在するかを判定する
     /// （`Expected::NonEmpty` 専用。`is_empty` は要素数のみを見るため、
     /// 実サイトの見出しなどが空文字・空白のみの要素を持つ場合に
-    /// `Texts`/`Attr`/`Form` タスクが誤って `Status::Ok` になり CORE-1 の
-    /// 成功率を過大評価してしまう。`Values` は各要素、`Pairs` は各 value
-    /// を trim して非空かで判定する（`Attr` は [`run_task`] で正規化して
-    /// いないため、ここで trim する）。
+    /// `Texts`/`Attr` タスクが誤って `Status::Ok` になり CORE-1 の
+    /// 成功率を過大評価してしまう。`Values` は各要素を trim して非空かで
+    /// 判定する（`Attr` は [`run_task`] で正規化していないため、ここで
+    /// trim する）。
+    ///
+    /// `Pairs`（`Form` タスク）は要素数のみで判定する。
+    /// [`collect_form_values`] は `name` 属性が空の要素を除外して
+    /// pair を積むため、`Pairs` に要素があること自体が
+    /// 「name 付きフィールドの抽出に成功した」ことを意味する。実サイトの
+    /// ログインフォームは典型的に value が空のデフォルト値を持つ
+    /// named field を返すため、value の非空を要求すると成功した抽出を
+    /// `UnexpectedEmpty` に誤判定し、CORE-1 の成功率を過小評価してしまう。
     fn has_meaningful_content(&self) -> bool {
         match self {
             Outcome::Values(v) => v.iter().any(|s| !s.trim().is_empty()),
-            Outcome::Pairs(v) => v.iter().any(|(_, value)| !value.trim().is_empty()),
+            Outcome::Pairs(v) => !v.is_empty(),
         }
     }
 }

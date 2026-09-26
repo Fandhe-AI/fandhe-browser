@@ -190,8 +190,7 @@ fn core_1_expected_non_empty_matches_any_non_empty_outcome() {
 /// CORE-1・TASK-26（26.1）・PR #458 レビュー指摘（P1）の回帰: 要素数だけで
 /// `Expected::NonEmpty` を判定すると、見出しなどが空文字・空白のみでも
 /// `Status::Ok` になり成功率を過大評価してしまう。正規化後に内容のある値が
-/// 1 件も無い `Values`/`Pairs` は `Status::UnexpectedEmpty` になることを
-/// 確認する。
+/// 1 件も無い `Values` は `Status::UnexpectedEmpty` になることを確認する。
 #[test]
 fn core_1_expected_non_empty_rejects_whitespace_only_outcome() {
     let blank_values = Outcome::Values(vec!["".to_string(), "   ".to_string()]);
@@ -200,14 +199,30 @@ fn core_1_expected_non_empty_rejects_whitespace_only_outcome() {
         Status::UnexpectedEmpty
     );
 
-    let blank_pairs = Outcome::Pairs(vec![("name".to_string(), "  ".to_string())]);
+    let empty_pairs: Outcome = Outcome::Pairs(Vec::new());
     assert_eq!(
-        judge(&blank_pairs, Expected::NonEmpty),
+        judge(&empty_pairs, Expected::NonEmpty),
         Status::UnexpectedEmpty
     );
+}
+
+/// CORE-1・TASK-26（26.1）・PR #458 レビュー指摘（P1・Bugbot）の回帰:
+/// `Pairs`（`Form` タスク）で value の非空を要求すると、実サイトのログイン
+/// フォームに典型的な「name はあるが value が空のデフォルト値を持つ
+/// named field」の抽出成功が `Status::UnexpectedEmpty` に誤判定され、
+/// CORE-1 の抽出成功率を過小評価してしまう。`collect_form_values` は
+/// name が空の要素を除外して pair を積むため、`Pairs` に要素が
+/// 1 件以上あること自体が意味のある抽出成功を表すことを確認する。
+#[test]
+fn core_1_expected_non_empty_accepts_empty_value_named_form_field() {
+    let empty_value_pairs = Outcome::Pairs(vec![("username".to_string(), String::new())]);
+    assert_eq!(judge(&empty_value_pairs, Expected::NonEmpty), Status::Ok);
+
+    let blank_value_pairs = Outcome::Pairs(vec![("username".to_string(), "  ".to_string())]);
+    assert_eq!(judge(&blank_value_pairs, Expected::NonEmpty), Status::Ok);
 
     let meaningful_pairs = Outcome::Pairs(vec![
-        ("name".to_string(), "  ".to_string()),
+        ("username".to_string(), String::new()),
         ("email".to_string(), "a@example.com".to_string()),
     ]);
     assert_eq!(judge(&meaningful_pairs, Expected::NonEmpty), Status::Ok);
