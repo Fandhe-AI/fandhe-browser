@@ -56,11 +56,15 @@ Chromium 側はローカルに `chromium` / `chromium-browser` / `google-chrome`
 | `--servo-cmd` | Servo 側のコマンドテンプレート（JSON 配列文字列） | なし（servo を撮るなら必須） |
 | `--chromium-cmd` | Chromium 側のコマンドテンプレート | 下記の既定テンプレート |
 | `--chromium-bin` | Chromium 実行ファイルのパス | `chromium` → `chromium-browser` → `google-chrome` の順に自動検出 |
-| `--timeout-sec` | 1 回の撮影のタイムアウト（秒） | 90 |
-| `--settle-ms` | 描画の待ち時間（ミリ秒） | 5000 |
-| `--min-sites` | 最低サイト数 | 5 |
+| `--timeout-sec` | 1 回の撮影のタイムアウト（秒。有限数かつ `(0, 3600]` の範囲のみ許可） | 90 |
+| `--settle-ms` | 描画の待ち時間（ミリ秒。`[0, 600000]` の範囲のみ許可） | 5000 |
+| `--min-sites` | 最低サイト数（`[1, 50]` の範囲のみ許可） | 5 |
 | `--dry-run` | 展開後のコマンドを表示するだけで、実行もファイル作成もしない | ― |
 | `--allow-file-url` | `{html_path}` 用スナップショット取得で `file:` を許可する（テスト専用） | ― |
+
+`--engines` にカンマ区切りで同じエンジン名を重複指定した場合（例: `servo,servo`）は
+`ok` サイト数の集計と `partial` 判定が食い違うため、引数エラー（終了コード 2）として
+拒否する。
 
 ### テンプレートの placeholder
 
@@ -76,6 +80,21 @@ Chromium 側はローカルに `chromium` / `chromium-browser` / `google-chrome`
 `urllib`・タイムアウト 30 秒・上限 5 MiB（超えたら打ち切ってそのサイトを `skipped` にする）・
 偽装しない UA（`fandhe-browser-harness/0.1 (+https://github.com/Fandhe-AI/fandhe-browser)`）
 で行う。`--dry-run` 時はこの取得を行わない（表示用のパスを組み立てるだけ）。
+
+取得先ホストは scheme（https のみ）に加え、IP リテラル・`getaddrinfo` で解決した
+すべてのアドレスがグローバルユニキャストであること（ループバック・プライベート・
+リンクローカル・`169.254.169.254` 等のクラウドメタデータアドレスでないこと）を
+毎回検証する（SSRF 対策）。リダイレクト先にも同じ検証を適用し、内部アドレスや
+非 https への転送は追跡しない。DNS 応答は検証後に変わりうる（DNS リバインディング）
+ため、これは接続前チェックのベストエフォートであり完全な対策ではない。
+
+保存した HTML はそのままだと `file://` の保存先パス基準で相対 URL が解決され、
+元の URL を直接開く Chromium と条件が食い違う。取得したスナップショットには
+`<head>` 直後（無ければ先頭）に `<base href="{元の URL}">` を注入し、相対リンク・
+相対リソースの解決基準を揃える（JS が動的に発行するリクエストの起点までは
+揃わないため完全な条件一致ではない）。この撮影が「元 URL を直接開いた」ものか
+「スナップショット経由」だったかは結果 JSON の `captures[].input`（`"url"` /
+`"snapshot"`）で判別できる。
 
 ### Servo のコマンド例
 
@@ -141,16 +160,22 @@ servoshell 系（TASK-36 で確定したオプション名に合わせて読み�
       "duration_ms": 1234,
       "exit_code": 0,
       "stderr_tail": "",
-      "command": ["servo_embed_poc", "..."]
+      "command": ["servo_embed_poc", "..."],
+      "input": "snapshot"
     }
   ],
   "partial": true
 }
 ```
 
-`status` は `ok` / `failed`（終了コード非 0・PNG なし・PNG 不正）/ `timeout` /
-`skipped`（`{html_path}` のスナップショット取得に失敗した場合）のいずれか。
+`status` は `ok` / `failed`（終了コード非 0・PNG なし・PNG 不正・PNG 寸法が
+`viewport` と不一致・エンジンバイナリ不在等でプロセスを起動できなかった場合を含む）/
+`timeout` / `skipped`（`{html_path}` のスナップショット取得に失敗した場合）のいずれか。
 `partial` キーは `--engines` で 1 エンジンのみを指定した実行にのみ付く。
+`input` は `"url"`（テンプレートが `{url}` を直接使う）または `"snapshot"`
+（`{html_path}` 経由でスナップショットを使う）で、`--dry-run` の結果では `null`。
+`--out-dir` を使い回す再実行では、実行前に前回の PNG を必ず削除してから撮影する
+（プロセスが PNG を出力しなくても前回分の残置ファイルで `ok` 誤判定にならない）。
 
 ## 終了コード
 
@@ -180,11 +205,25 @@ python3 -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
 - `site_id` は `^[a-z0-9][a-z0-9_-]{0,63}$` に限定し、出力パスは `resolve()` 後に
   `--out-dir` 配下であることを確認する（パストラバーサル対策）
 - サイト URL・スナップショット取得先はいずれも既定で https のみ（`file:` は
-  `--allow-file-url` を明示したときのみ、テスト用途）。サイト一覧は
+  `--allow-file-url` を明示したときのみ、テスト用途）で、かつ IP リテラル・
+  名前解決結果がグローバルユニキャストアドレスであることを検証する（ループバック・
+  プライベート・リンクローカル・クラウドメタデータアドレス等への SSRF を防ぐ）。
+  リダイレクト先にも同じ検証を適用する。サイト一覧は
   `docs/design/site-catalog-task70.md`（TASK-70 / COMPAT-3）で 403 や
   robots.txt Disallow により除外されたものを使わない（SSRF・偽装回避の禁止）
 - 撮影ごとのタイムアウト・スナップショットのサイズ上限・サイト数上限（50）・
-  `stderr` 末尾 2000 文字までの保持により、無制限のリソース確保を防ぐ
+  `stderr` 末尾 2000 文字までの保持（子プロセスの標準出力・標準エラーは
+  無制限にメモリへは保持せず、`stdout` は破棄し `stderr` はテンポラリファイル
+  経由で末尾のみ読む）により、無制限のリソース確保を防ぐ
+- `--timeout-sec` / `--settle-ms` / `--min-sites` は有限かつ範囲内の値のみを
+  受け付け、`nan` / `inf` / 0 以下 / 極端に大きい値は起動時に拒否する
+- 撮影用の一時 `--user-data-dir`（Chromium）はテンプレート展開・スナップショット
+  取得の失敗を含むあらゆる終了経路で必ず削除する（`try`/`finally`）
+- 撮影した PNG の寸法は要求した `viewport` と一致することを確認し、不一致は
+  `failed` として扱う（エンジンが異なるサイズで撮ってしまう取り違えの検出）
+- エンジンバイナリが存在しない・実行権限がない等でプロセス自体を起動できない
+  場合も例外を伝播させず `failed` として記録し、他サイト・他エンジンの撮影と
+  `capture-result.json` の書き出しを継続する
 
 ## スコープ外・申し送り
 

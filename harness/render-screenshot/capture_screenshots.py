@@ -25,9 +25,13 @@
 from __future__ import annotations
 
 import argparse
+import html
+import ipaddress
 import json
+import math
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -51,6 +55,13 @@ PLACEHOLDER_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 MIN_VIEWPORT = 1
 MAX_VIEWPORT = 10000
 MAX_SITES = 50
+
+# --engines / --timeout-sec / --settle-ms / --min-sites の CLI 引数検証に使う上限。
+# 無制限値（NaN・inf・極端に大きい値）でタイムアウト待ちや DoS を招かないための
+# fail-closed な境界（security.md OWASP「不安全な設計」）。
+MIN_TIMEOUT_SEC = 0.001
+MAX_TIMEOUT_SEC = 3600.0
+MAX_SETTLE_MS = 600_000
 
 # スナップショット取得・アクセス確認（docs/design/site-catalog-task70.md）と同方針で、
 # 偽装しない正直な UA を名乗る（SEC 系: anti-bot 回避目的のヘッダ偽装を行わない）。
@@ -227,6 +238,80 @@ def resolve_chromium_bin(explicit: str | None) -> str | None:
 # --- `{html_path}` 用スナップショット取得 --------------------------------
 
 
+def _check_public_host(hostname: str | None, *, context: str) -> None:
+    """ホスト名がループバック・プライベート・リンクローカル等の内部アドレスでないことを確認する。
+
+    SSRF 対策（security.md OWASP A10・security.md「プロファイル境界」とは別軸の
+    サーバー側リクエスト偽造防止）。IP リテラルはそのまま検証し、ホスト名は
+    `getaddrinfo` で解決した「すべて」の候補アドレスが `is_global` であることを
+    要求する（マルチホームでの部分的な内部アドレス混在を fail-closed に弾く）。
+    DNS 応答は検証後に変わりうる（DNS リバインディング）ため、これは接続前チェックの
+    ベストエフォートであり完全な対策ではない（本モジュールは urllib の単純な
+    GET のみで、接続確立と名前解決の間の TOCTOU を塞ぐ手段（IP 固定接続等）までは
+    持たない。将来必要になれば requests + カスタム HTTPAdapter 等の追加依存が要る
+    ためユーザー承認事項として扱う）。
+    """
+    if not hostname:
+        raise SnapshotError(f"{context}: URL has no hostname")
+
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+
+    if literal is not None:
+        if not literal.is_global:
+            raise SnapshotError(f"{context}: refusing non-global IP literal: {hostname}")
+        return
+
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except OSError as exc:
+        raise SnapshotError(f"{context}: failed to resolve hostname {hostname}: {exc}") from exc
+
+    if not infos:
+        raise SnapshotError(f"{context}: hostname resolved to no addresses: {hostname}")
+
+    for info in infos:
+        addr = info[4][0]
+        try:
+            resolved = ipaddress.ip_address(addr)
+        except ValueError:
+            raise SnapshotError(f"{context}: unparseable resolved address {addr!r}") from None
+        if not resolved.is_global:
+            raise SnapshotError(
+                f"{context}: hostname {hostname} resolves to a non-global address: {addr}"
+            )
+
+
+class _PublicOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """リダイレクト先にも SSRF チェック（scheme・内部アドレス）を適用する `HTTPRedirectHandler`。
+
+    既定の `urlopen` はリダイレクト先を無条件に辿るため、https の公開サイトから
+    `http://169.254.169.254/` 等の内部アドレスへ転送するレスポンスを SSRF の
+    踏み台にされうる。`redirect_request` で毎回検証し、拒否時は `SnapshotError`
+    を送出してリダイレクトを止める（例外は `OSError` を継承しないため、
+    呼び出し元の `except (URLError, OSError)` を素通りして呼び出し元へ伝わる）。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: N802, ANN001, ANN201
+        parsed = urlparse(newurl)
+        if parsed.scheme != "https":
+            raise SnapshotError(f"redirect to non-https URL is not allowed: {newurl}")
+        _check_public_host(parsed.hostname, context=f"redirect target {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_url(request: urllib.request.Request, timeout_sec: float):  # noqa: ANN201
+    """SSRF チェック付きリダイレクトハンドラを組み込んだ opener で `request` を開く。
+
+    テストからは本関数をモックすることで、実ネットワークにも `getaddrinfo` にも
+    依存せず `fetch_snapshot` の呼び出し経路を検証できる。
+    """
+    opener = urllib.request.build_opener(_PublicOnlyRedirectHandler)
+    return opener.open(request, timeout=timeout_sec)  # noqa: S310
+
+
 def fetch_snapshot(
     url: str,
     dest_path: Path,
@@ -239,11 +324,20 @@ def fetch_snapshot(
 
     PoC-6 の `servo-embed` は HTML ファイルしか受け付けないため、URL を直接渡せる
     Chromium と条件を揃える目的でこの前処理を行う。SSRF を避けるため既定では https
-    のみを許可し、`file:` はテスト用途で `allow_file_url=True` を明示したときだけ許可する。
+    かつループバック・プライベート・リンクローカル等の内部アドレスではないホストのみを
+    許可する（`_check_public_host`）。`file:` はテスト用途で `allow_file_url=True` を
+    明示したときだけ許可する。
+
+    保存した HTML はファイル URL（`file://` 経由の相対パス基準）になるため、
+    Chromium が直接開く元の https URL とは相対リンク・相対リソースの解決基準が
+    異なる。呼び出し元の `capture_one` はこの差を縮めるため保存後の HTML へ
+    `<base href="{url}">` を注入する（`inject_base_href`）。ただし JS が動的に
+    発行するリクエストの起点までは揃わないため完全な条件一致ではない
+    （実装済みを装わない。REPAIR-3）。
     """
     parsed = urlparse(url)
     if parsed.scheme == "https":
-        pass
+        _check_public_host(parsed.hostname, context=f"snapshot URL {url}")
     elif parsed.scheme == "file" and allow_file_url:
         pass
     else:
@@ -251,7 +345,7 @@ def fetch_snapshot(
 
     request = urllib.request.Request(url, headers={"User-Agent": SNAPSHOT_USER_AGENT})
     try:
-        with urllib.request.urlopen(request, timeout=timeout_sec) as response:  # noqa: S310
+        with _open_url(request, timeout_sec) as response:
             data = response.read(max_bytes + 1)
     except (urllib.error.URLError, OSError) as exc:
         raise SnapshotError(f"failed to fetch snapshot for {url}: {exc}") from exc
@@ -259,7 +353,29 @@ def fetch_snapshot(
     if len(data) > max_bytes:
         raise SnapshotError(f"snapshot for {url} exceeds the {max_bytes} byte limit")
 
-    dest_path.write_bytes(data)
+    dest_path.write_bytes(inject_base_href(data, url))
+
+
+HEAD_TAG_RE = re.compile(rb"<head[^>]*>", re.IGNORECASE)
+
+
+def inject_base_href(html_bytes: bytes, url: str) -> bytes:
+    """保存した HTML の先頭（`<head>` 直後、無ければ先頭）に `<base href="{url}">` を挿む。
+
+    `fetch_snapshot` が保存するのはローカルファイルであり、そのまま撮影すると
+    相対 URL（css・js・img 等）が `file://` の保存先基準で解決されてしまい、
+    元の https URL を直接開く Chromium と撮影条件が食い違う（RENDER-5 の
+    SSIM 比較が本来の描画差分ではなく取得経路の差分を拾ってしまう）。`<base>`
+    要素で解決基準を元 URL に戻すことでこの差を縮める。`url` は `sites.json`
+    の検証済みエントリだが、属性値へ埋め込む前に `html.escape` で `"` 等を
+    エスケープし、万一の HTML 属性インジェクションを防ぐ（OWASP A03）。
+    """
+    base_tag = f'<base href="{html.escape(url, quote=True)}">'.encode("ascii", errors="xmlcharrefreplace")
+    match = HEAD_TAG_RE.search(html_bytes)
+    if match is None:
+        return base_tag + html_bytes
+    insert_at = match.end()
+    return html_bytes[:insert_at] + base_tag + html_bytes[insert_at:]
 
 
 # --- PNG ヘッダ検証 ------------------------------------------------------
@@ -297,6 +413,41 @@ def read_png_size(path: Path) -> tuple[int, int]:
 
 
 # --- 1 回の撮影 ----------------------------------------------------------
+
+
+def _read_tail(path: Path, max_chars: int) -> str:
+    """`path` の末尾（デコード後 `max_chars` 文字相当）を読む。stderr 保存ファイル向け。"""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return ""
+    # UTF-8 は 1 文字最大 4 バイトなので、文字数の 4 倍バイトだけ末尾から読めば
+    # 少なくとも `max_chars` 文字分は確保できる（全体を読まないためメモリは有界）。
+    read_bytes = max_chars * 4
+    try:
+        with path.open("rb") as fh:
+            if size > read_bytes:
+                fh.seek(size - read_bytes)
+            data = fh.read()
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="replace")[-max_chars:]
+
+
+def _skip_result(site: Site, engine: str, argv: list[str], detail: str) -> dict[str, Any]:
+    return {
+        "site_id": site.site_id,
+        "engine": engine,
+        "status": "skipped",
+        "png": None,
+        "width": None,
+        "height": None,
+        "duration_ms": 0,
+        "exit_code": None,
+        "stderr_tail": detail[-STDERR_TAIL_CHARS:],
+        "command": argv,
+        "input": None,
+    }
 
 
 def capture_one(
@@ -349,17 +500,10 @@ def capture_one(
                 raise CaptureError("chromium binary could not be resolved")
         values["chromium_bin"] = chromium_bin
 
-    user_data_dir: str | None = None
-    if needs_user_data_dir:
-        if dry_run:
-            values["user_data_dir"] = "<user-data-dir>"
-        else:
-            user_data_dir = tempfile.mkdtemp(prefix="fandhe-chromium-udd-")
-            values["user_data_dir"] = user_data_dir
-
-    argv = expand_template(template, values)
-
     if dry_run:
+        if needs_user_data_dir:
+            values["user_data_dir"] = "<user-data-dir>"
+        argv = expand_template(template, values)
         return {
             "site_id": site.site_id,
             "engine": engine,
@@ -371,89 +515,136 @@ def capture_one(
             "exit_code": None,
             "stderr_tail": "",
             "command": argv,
+            "input": None,
         }
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # 再実行で --out-dir を使い回した際、今回のプロセスが PNG を出力しなくても
+    # 前回分が残っていて「成功」と誤判定されないよう、実行前に必ず消しておく
+    # （P1: 再実行時の残置ファイル誤判定対策）。
+    out_path.unlink(missing_ok=True)
 
-    if needs_html:
-        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    input_kind = "snapshot" if needs_html else "url"
+    user_data_dir: str | None = None
+    try:
+        if needs_user_data_dir:
+            user_data_dir = tempfile.mkdtemp(prefix="fandhe-chromium-udd-")
+            values["user_data_dir"] = user_data_dir
+
+        argv = expand_template(template, values)
+
+        if needs_html:
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                fetch_snapshot(site.url, snapshot_path, allow_file_url=allow_file_url)
+            except SnapshotError as exc:
+                return _skip_result(site, engine, argv, str(exc))
+
+        start = time.monotonic()
+        stderr_path: Path | None = None
         try:
-            fetch_snapshot(site.url, snapshot_path, allow_file_url=allow_file_url)
-        except SnapshotError as exc:
+            with tempfile.NamedTemporaryFile(
+                prefix="fandhe-capture-stderr-", delete=False
+            ) as stderr_file:
+                stderr_path = Path(stderr_file.name)
+                proc = subprocess.run(  # noqa: S603
+                    argv,
+                    timeout=timeout_sec,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_file,
+                    shell=False,
+                    check=False,
+                )
+            duration_ms = int((time.monotonic() - start) * 1000)
+            exit_code: int | None = proc.returncode
+            stderr_tail = _read_tail(stderr_path, STDERR_TAIL_CHARS)
+            timed_out = False
+            engine_missing = False
+        except subprocess.TimeoutExpired:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            exit_code = None
+            stderr_tail = _read_tail(stderr_path, STDERR_TAIL_CHARS) if stderr_path else ""
+            timed_out = True
+            engine_missing = False
+        except OSError as exc:
+            # エンジンバイナリ不在（FileNotFoundError）・実行権限なし等。プロセスを
+            # 起動できなかった場合も他サイト・他エンジンの撮影を継続できるよう、
+            # ここで捕捉して「failed」として結果 JSON に記録する（クラッシュさせない。
+            # Bugbot Medium: FileNotFoundError 未捕捉で main が異常終了する問題への対応）。
+            duration_ms = int((time.monotonic() - start) * 1000)
+            exit_code = None
+            stderr_tail = str(exc)[-STDERR_TAIL_CHARS:]
+            timed_out = False
+            engine_missing = True
+        finally:
+            if stderr_path is not None:
+                stderr_path.unlink(missing_ok=True)
+
+        if timed_out:
             return {
                 "site_id": site.site_id,
                 "engine": engine,
-                "status": "skipped",
+                "status": "timeout",
                 "png": None,
                 "width": None,
                 "height": None,
-                "duration_ms": 0,
+                "duration_ms": duration_ms,
                 "exit_code": None,
-                "stderr_tail": str(exc)[-STDERR_TAIL_CHARS:],
+                "stderr_tail": stderr_tail,
                 "command": argv,
+                "input": input_kind,
             }
 
-    start = time.monotonic()
-    try:
-        proc = subprocess.run(  # noqa: S603
-            argv,
-            timeout=timeout_sec,
-            capture_output=True,
-            shell=False,
-            check=False,
-        )
-        duration_ms = int((time.monotonic() - start) * 1000)
-        exit_code: int | None = proc.returncode
-        stderr_tail = proc.stderr.decode("utf-8", errors="replace")[-STDERR_TAIL_CHARS:]
-        timed_out = False
-    except subprocess.TimeoutExpired as exc:
-        duration_ms = int((time.monotonic() - start) * 1000)
-        exit_code = None
-        stderr_bytes = exc.stderr if isinstance(exc.stderr, (bytes, bytearray)) else b""
-        stderr_tail = stderr_bytes.decode("utf-8", errors="replace")[-STDERR_TAIL_CHARS:]
-        timed_out = True
-    finally:
-        if user_data_dir is not None:
-            shutil.rmtree(user_data_dir, ignore_errors=True)
+        if engine_missing:
+            return {
+                "site_id": site.site_id,
+                "engine": engine,
+                "status": "failed",
+                "png": None,
+                "width": None,
+                "height": None,
+                "duration_ms": duration_ms,
+                "exit_code": None,
+                "stderr_tail": stderr_tail,
+                "command": argv,
+                "input": input_kind,
+            }
 
-    if timed_out:
+        status = "failed"
+        png_width: int | None = None
+        png_height: int | None = None
+        png_rel: str | None = None
+        if exit_code == 0 and out_path.exists():
+            try:
+                png_width, png_height = read_png_size(out_path)
+                if (png_width, png_height) == (width, height):
+                    status = "ok"
+                    png_rel = out_path.relative_to(out_dir).as_posix()
+                else:
+                    stderr_tail = (
+                        stderr_tail
+                        + f"\nPNG size {png_width}x{png_height} does not match "
+                        f"requested viewport {width}x{height}"
+                    )[-STDERR_TAIL_CHARS:]
+            except PngError as exc:
+                stderr_tail = (stderr_tail + f"\n{exc}")[-STDERR_TAIL_CHARS:]
+
         return {
             "site_id": site.site_id,
             "engine": engine,
-            "status": "timeout",
-            "png": None,
-            "width": None,
-            "height": None,
+            "status": status,
+            "png": png_rel,
+            "width": png_width,
+            "height": png_height,
             "duration_ms": duration_ms,
-            "exit_code": None,
+            "exit_code": exit_code,
             "stderr_tail": stderr_tail,
             "command": argv,
+            "input": input_kind,
         }
-
-    status = "failed"
-    png_width: int | None = None
-    png_height: int | None = None
-    png_rel: str | None = None
-    if exit_code == 0 and out_path.exists():
-        try:
-            png_width, png_height = read_png_size(out_path)
-            status = "ok"
-            png_rel = out_path.relative_to(out_dir).as_posix()
-        except PngError as exc:
-            stderr_tail = (stderr_tail + f"\n{exc}")[-STDERR_TAIL_CHARS:]
-
-    return {
-        "site_id": site.site_id,
-        "engine": engine,
-        "status": status,
-        "png": png_rel,
-        "width": png_width,
-        "height": png_height,
-        "duration_ms": duration_ms,
-        "exit_code": exit_code,
-        "stderr_tail": stderr_tail,
-        "command": argv,
-    }
+    finally:
+        if user_data_dir is not None:
+            shutil.rmtree(user_data_dir, ignore_errors=True)
 
 
 # --- 結果 JSON の書き出し -------------------------------------------------
@@ -504,6 +695,45 @@ def _parse_command_template(raw: str, *, arg_name: str) -> list[str]:
     return parsed
 
 
+def _timeout_sec_type(raw: str) -> float:
+    """`--timeout-sec` の値検証（0 以下・NaN・inf・上限超過を拒否。P1）。"""
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid float value: {raw!r}") from exc
+    if not math.isfinite(value) or not (MIN_TIMEOUT_SEC <= value <= MAX_TIMEOUT_SEC):
+        raise argparse.ArgumentTypeError(
+            f"--timeout-sec must be a finite number in [{MIN_TIMEOUT_SEC}, {MAX_TIMEOUT_SEC}], got {raw!r}"
+        )
+    return value
+
+
+def _settle_ms_type(raw: str) -> int:
+    """`--settle-ms` の値検証（負数・上限超過を拒否。P1）。"""
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid int value: {raw!r}") from exc
+    if not (0 <= value <= MAX_SETTLE_MS):
+        raise argparse.ArgumentTypeError(
+            f"--settle-ms must be an integer in [0, {MAX_SETTLE_MS}], got {raw!r}"
+        )
+    return value
+
+
+def _min_sites_type(raw: str) -> int:
+    """`--min-sites` の値検証（0 以下・`MAX_SITES` 超過を拒否）。"""
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid int value: {raw!r}") from exc
+    if not (1 <= value <= MAX_SITES):
+        raise argparse.ArgumentTypeError(
+            f"--min-sites must be an integer in [1, {MAX_SITES}], got {raw!r}"
+        )
+    return value
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -539,13 +769,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Chromium executable path (default: auto-detect chromium/chromium-browser/google-chrome).",
     )
     parser.add_argument(
-        "--timeout-sec", type=float, default=90, help="Per-capture timeout in seconds (default: 90)."
+        "--timeout-sec",
+        type=_timeout_sec_type,
+        default=90,
+        help="Per-capture timeout in seconds (default: 90).",
     )
     parser.add_argument(
-        "--settle-ms", type=int, default=5000, help="Render settle time in milliseconds (default: 5000)."
+        "--settle-ms",
+        type=_settle_ms_type,
+        default=5000,
+        help="Render settle time in milliseconds (default: 5000).",
     )
     parser.add_argument(
-        "--min-sites", type=int, default=5, help="Minimum number of sites required (default: 5)."
+        "--min-sites",
+        type=_min_sites_type,
+        default=5,
+        help="Minimum number of sites required (default: 5).",
     )
     parser.add_argument(
         "--dry-run",
@@ -568,6 +807,11 @@ def main(argv: list[str] | None = None) -> int:
         engines = [e.strip() for e in args.engines.split(",") if e.strip()]
         if not engines:
             raise CaptureError("--engines must name at least one engine")
+        if len(engines) != len(set(engines)):
+            # 重複指定（例: `servo,servo`）を許すと ok_counts の集計対象と
+            # captures の件数が食い違い、`partial` 判定が実態と合わなくなるため
+            # fail-closed に拒否する（P2）。
+            raise CaptureError(f"--engines must not contain duplicates: {args.engines}")
 
         templates: dict[str, list[str]] = {}
         if "servo" in engines:

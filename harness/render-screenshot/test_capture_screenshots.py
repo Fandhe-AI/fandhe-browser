@@ -179,8 +179,20 @@ class ReadPngSizeTest(unittest.TestCase):
                 cs.read_png_size(path)
 
 
+class _Resp(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 class FetchSnapshotTest(unittest.TestCase):
-    """RENDER-5 / TASK-37.1: `{html_path}` 用スナップショット取得（実ネットワークには出ない）。"""
+    """RENDER-5 / TASK-37.1: `{html_path}` 用スナップショット取得（実ネットワークには出ない）。
+
+    実 DNS 解決に依存しないよう、公開ホストとして扱いたいケースは `_check_public_host`
+    を、実際の応答は `_open_url` をそれぞれモックする。
+    """
 
     def test_rejects_http_scheme(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -191,33 +203,141 @@ class FetchSnapshotTest(unittest.TestCase):
     def test_truncates_oversized_response(self) -> None:
         big_body = b"x" * (cs.SNAPSHOT_MAX_BYTES + 1)
 
-        class _Resp(io.BytesIO):
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "s.html"
-            with mock.patch.object(cs.urllib.request, "urlopen", return_value=_Resp(big_body)):
+            with (
+                mock.patch.object(cs, "_check_public_host"),
+                mock.patch.object(cs, "_open_url", return_value=_Resp(big_body)),
+            ):
                 with self.assertRaises(cs.SnapshotError):
                     cs.fetch_snapshot("https://example.invalid/", dest)
             self.assertFalse(dest.exists())
 
     def test_writes_response_body_on_success(self) -> None:
-        class _Resp(io.BytesIO):
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "s.html"
-            with mock.patch.object(cs.urllib.request, "urlopen", return_value=_Resp(b"<html></html>")):
+            with (
+                mock.patch.object(cs, "_check_public_host"),
+                mock.patch.object(cs, "_open_url", return_value=_Resp(b"<html></html>")),
+            ):
                 cs.fetch_snapshot("https://example.invalid/", dest)
-            self.assertEqual(dest.read_bytes(), b"<html></html>")
+            self.assertEqual(
+                dest.read_bytes(),
+                b'<base href="https://example.invalid/"><html></html>',
+            )
+
+    def test_injects_base_href_even_without_head_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "s.html"
+            with (
+                mock.patch.object(cs, "_check_public_host"),
+                mock.patch.object(cs, "_open_url", return_value=_Resp(b"no head here")),
+            ):
+                cs.fetch_snapshot("https://example.invalid/x", dest)
+            self.assertEqual(
+                dest.read_bytes(),
+                b'<base href="https://example.invalid/x">no head here',
+            )
+
+    def test_rejects_loopback_ip_literal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "s.html"
+            with self.assertRaises(cs.SnapshotError):
+                cs.fetch_snapshot("https://127.0.0.1/", dest)
+
+    def test_rejects_localhost_hostname(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "s.html"
+            with self.assertRaises(cs.SnapshotError):
+                cs.fetch_snapshot("https://localhost/", dest)
+
+    def test_rejects_private_ip_literal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "s.html"
+            with self.assertRaises(cs.SnapshotError):
+                cs.fetch_snapshot("https://10.0.0.1/", dest)
+
+    def test_rejects_link_local_metadata_ip_literal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "s.html"
+            with self.assertRaises(cs.SnapshotError):
+                cs.fetch_snapshot("https://169.254.169.254/", dest)
+
+    def test_rejects_ipv6_loopback_literal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "s.html"
+            with self.assertRaises(cs.SnapshotError):
+                cs.fetch_snapshot("https://[::1]/", dest)
+
+    def test_rejects_hostname_resolving_to_private_address(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "s.html"
+            with mock.patch.object(
+                cs.socket,
+                "getaddrinfo",
+                return_value=[(cs.socket.AF_INET, None, None, "", ("10.1.2.3", 443))],
+            ):
+                with self.assertRaises(cs.SnapshotError):
+                    cs.fetch_snapshot("https://internal.example.invalid/", dest)
+
+    def test_accepts_hostname_resolving_to_public_address(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "s.html"
+            with (
+                mock.patch.object(
+                    cs.socket,
+                    "getaddrinfo",
+                    return_value=[(cs.socket.AF_INET, None, None, "", ("93.184.216.34", 443))],
+                ),
+                mock.patch.object(cs, "_open_url", return_value=_Resp(b"<html></html>")),
+            ):
+                cs.fetch_snapshot("https://example.invalid/", dest)
+            self.assertTrue(dest.exists())
+
+    def test_rejects_url_with_no_hostname(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "s.html"
+            with self.assertRaises(cs.SnapshotError):
+                cs.fetch_snapshot("https:///path", dest)
+
+    def test_redirect_handler_rejects_non_https_target(self) -> None:
+        handler = cs._PublicOnlyRedirectHandler()
+        with self.assertRaises(cs.SnapshotError):
+            handler.redirect_request(
+                mock.Mock(full_url="https://example.invalid/"),
+                None,
+                302,
+                "Found",
+                {},
+                "http://169.254.169.254/",
+            )
+
+    def test_redirect_handler_rejects_internal_https_target(self) -> None:
+        handler = cs._PublicOnlyRedirectHandler()
+        with self.assertRaises(cs.SnapshotError):
+            handler.redirect_request(
+                mock.Mock(full_url="https://example.invalid/"),
+                None,
+                302,
+                "Found",
+                {},
+                "https://127.0.0.1/",
+            )
+
+
+class InjectBaseHrefTest(unittest.TestCase):
+    """RENDER-5 / TASK-37.1: 相対 URL 解決基準を揃える `<base>` 注入（P1）。"""
+
+    def test_inserts_after_head_tag_case_insensitively(self) -> None:
+        html_bytes = b"<HTML><HEAD lang='en'><title>t</title></HEAD></HTML>"
+        result = cs.inject_base_href(html_bytes, "https://example.invalid/a")
+        self.assertIn(b'<base href="https://example.invalid/a">', result)
+        self.assertTrue(result.startswith(b"<HTML><HEAD lang='en'><base href="))
+
+    def test_escapes_double_quote_in_url(self) -> None:
+        result = cs.inject_base_href(b"<head></head>", 'https://example.invalid/"x')
+        self.assertIn(b"&quot;", result)
+        self.assertNotIn(b'href="https://example.invalid/"x"', result)
 
 
 class CaptureIntegrationTest(unittest.TestCase):
@@ -443,6 +563,145 @@ class CaptureIntegrationTest(unittest.TestCase):
             result = json.loads((out_dir / "capture-result.json").read_text(encoding="utf-8"))
             self.assertTrue(result["partial"])
 
+    def test_duplicate_engine_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            sites_path = self._write_sites(tmp)
+            out_dir = tmp / "out"
+            code = cs.main(
+                [
+                    "--sites",
+                    str(sites_path),
+                    "--out-dir",
+                    str(out_dir),
+                    "--engines",
+                    "servo,servo",
+                    "--servo-cmd",
+                    json.dumps(fake_engine_template("ok")),
+                    "--min-sites",
+                    "5",
+                ]
+            )
+            self.assertEqual(code, 2)
+
+    def test_stale_png_from_previous_run_is_not_reported_as_ok(self) -> None:
+        # --out-dir を使い回す再実行で、今回失敗したサイトの PNG が前回分の
+        # 残置ファイルのまま残っていると誤って ok 判定されないことを確認する
+        # （P1: 再実行時の残置ファイル誤判定対策）。
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "out"
+            site = cs.Site(site_id="stale", url="https://example.invalid", category="static", catalog_id="z1")
+            stale_png_dir = out_dir / "servo"
+            stale_png_dir.mkdir(parents=True)
+            fixtures_path = str(FIXTURES_DIR)
+            sys.path.insert(0, fixtures_path)
+            import fake_engine  # noqa: PLC0415
+
+            fake_engine.write_minimal_png(stale_png_dir / "stale.png", 1280, 800)
+
+            record = cs.capture_one(
+                site,
+                "servo",
+                fake_engine_template("fail"),
+                out_dir=out_dir,
+                snapshots_dir=out_dir / "snapshots",
+                chromium_bin=None,
+                width=1280,
+                height=800,
+                settle_ms=1000,
+                timeout_sec=5,
+                allow_file_url=False,
+                dry_run=False,
+            )
+            self.assertEqual(record["status"], "failed")
+            self.assertIsNone(record["png"])
+
+    def test_png_dimension_mismatch_is_reported_as_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            site = cs.Site(site_id="wrong-size", url="https://example.invalid", category="static", catalog_id="z1")
+            template = [
+                sys.executable,
+                str(FAKE_ENGINE),
+                "--out",
+                "{out}",
+                "--width",
+                "10",
+                "--height",
+                "10",
+            ]
+            record = cs.capture_one(
+                site,
+                "servo",
+                template,
+                out_dir=Path(tmp),
+                snapshots_dir=Path(tmp) / "snapshots",
+                chromium_bin=None,
+                width=1280,
+                height=800,
+                settle_ms=1000,
+                timeout_sec=5,
+                allow_file_url=False,
+                dry_run=False,
+            )
+            self.assertEqual(record["status"], "failed")
+            self.assertIsNone(record["png"])
+            self.assertIn("does not match", record["stderr_tail"])
+
+    def test_missing_engine_binary_is_reported_as_failed_not_a_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            site = cs.Site(site_id="no-bin", url="https://example.invalid", category="static", catalog_id="z1")
+            record = cs.capture_one(
+                site,
+                "servo",
+                ["/nonexistent/definitely-not-a-real-binary", "{url}"],
+                out_dir=Path(tmp),
+                snapshots_dir=Path(tmp) / "snapshots",
+                chromium_bin=None,
+                width=1280,
+                height=800,
+                settle_ms=1000,
+                timeout_sec=5,
+                allow_file_url=False,
+                dry_run=False,
+            )
+            self.assertEqual(record["status"], "failed")
+            self.assertIsNone(record["exit_code"])
+
+    def test_user_data_dir_is_cleaned_up_when_snapshot_fetch_fails(self) -> None:
+        # SnapshotError による早期 return でも一時 user-data-dir が残置されない
+        # ことを確認する（Bugbot Low）。
+        with tempfile.TemporaryDirectory() as tmp:
+            site = cs.Site(site_id="udd-leak", url="https://example.invalid", category="static", catalog_id="z1")
+            created: list[Path] = []
+            real_mkdtemp = tempfile.mkdtemp
+
+            def _tracking_mkdtemp(*args, **kwargs):
+                path = Path(real_mkdtemp(*args, **kwargs, dir=tmp))
+                created.append(path)
+                return str(path)
+
+            with (
+                mock.patch.object(cs.tempfile, "mkdtemp", side_effect=_tracking_mkdtemp),
+                mock.patch.object(cs, "fetch_snapshot", side_effect=cs.SnapshotError("boom")),
+            ):
+                record = cs.capture_one(
+                    site,
+                    "chromium",
+                    ["engine", "{user_data_dir}", "{html_path}", "{out}"],
+                    out_dir=Path(tmp) / "out",
+                    snapshots_dir=Path(tmp) / "out" / "snapshots",
+                    chromium_bin=None,
+                    width=1280,
+                    height=800,
+                    settle_ms=1000,
+                    timeout_sec=5,
+                    allow_file_url=False,
+                    dry_run=False,
+                )
+            self.assertEqual(record["status"], "skipped")
+            self.assertEqual(len(created), 1)
+            self.assertFalse(created[0].exists())
+
     def test_unknown_engine_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
@@ -485,6 +744,47 @@ class CaptureIntegrationTest(unittest.TestCase):
             )
             self.assertEqual(record["status"], "ok")
             self.assertEqual(record["png"], "servo/ok-id.png")
+
+
+class ArgValidationTest(unittest.TestCase):
+    """RENDER-5 / TASK-37.1: `--timeout-sec` / `--settle-ms` / `--min-sites` の値検証（P1）。"""
+
+    def _build(self) -> None:
+        return cs.build_arg_parser()
+
+    def test_rejects_nan_timeout(self) -> None:
+        parser = self._build()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--out-dir", "/tmp/x", "--timeout-sec", "nan"])
+
+    def test_rejects_infinite_timeout(self) -> None:
+        parser = self._build()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--out-dir", "/tmp/x", "--timeout-sec", "inf"])
+
+    def test_rejects_zero_timeout(self) -> None:
+        parser = self._build()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--out-dir", "/tmp/x", "--timeout-sec", "0"])
+
+    def test_rejects_negative_settle_ms(self) -> None:
+        parser = self._build()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--out-dir", "/tmp/x", "--settle-ms", "-1"])
+
+    def test_rejects_zero_min_sites(self) -> None:
+        parser = self._build()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--out-dir", "/tmp/x", "--min-sites", "0"])
+
+    def test_accepts_valid_values(self) -> None:
+        parser = self._build()
+        args = parser.parse_args(
+            ["--out-dir", "/tmp/x", "--timeout-sec", "30", "--settle-ms", "1000", "--min-sites", "3"]
+        )
+        self.assertEqual(args.timeout_sec, 30.0)
+        self.assertEqual(args.settle_ms, 1000)
+        self.assertEqual(args.min_sites, 3)
 
 
 if __name__ == "__main__":
