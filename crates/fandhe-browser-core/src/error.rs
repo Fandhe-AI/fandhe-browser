@@ -4,12 +4,15 @@
 //! `query`（TASK-24.7・#41）の各モジュールは、本モジュールが定義する [`Error`] /
 //! [`Result`] を戻り値の共通土台として使う想定（TASK-24（24.1）・ビヘイビア
 //! `CORE-1`）。`unsafe` は使わず、`thiserror`/`anyhow` 等の外部依存も追加しない
-//! （dependency-policy.md の依存最小方針）。`fetch` 本実装（TASK-24.2・#36）に
-//! 伴い `Cargo.toml` の `[dependencies]` へ `reqwest`・`rustls`（Issue #35 で
-//! 採用承認済み）を追加したが、本モジュールはそれらの型を公開 API に漏らさず、
-//! 汎用的な [`Error`] バリアントへ写像する（coding-rust.md「JS エンジンは
-//! トレイト抽象越しに」と同様、外部クレートの具象型を上位 crate へ漏らさない
-//! 方針を fetch にも適用する）。
+//! （dependency-policy.md の依存最小方針）。`Cargo.toml` の `[dependencies]` には
+//! `parse` が使う `html5ever = "=0.40.1"`（TASK-24.4・#38）と、`fetch` 本実装
+//! （TASK-24.2・#36）に伴う `reqwest`・`rustls`（いずれも Issue #35 で採用
+//! 承認済み）がある。本モジュール（[`Error`] / [`ParseError`]）はそれらの型を
+//! バリアントの内部表現に漏らさず、汎用的な variant へ写像する（coding-rust.md
+//! 「JS エンジンはトレイト抽象越しに」と同様、外部クレートの具象型を上位 crate へ
+//! 漏らさない方針を fetch/parse のエラー表現にも適用する）。`dom`（TASK-24.5・
+//! #39）は arena の型定義として `html5ever::QualName` 等を公開しており、この方針
+//! の対象外（本モジュールのエラー型には限らない）。
 //!
 //! 呼び出し元は `fandhe-browser-ai`・`fandhe-browser-cdp` 等の上位 crate（本
 //! crate から一方向に依存される）や、本 crate 内の各モジュール（`js_stub` を
@@ -65,6 +68,9 @@ pub enum Error {
         /// 避けるため。security.md）。
         message: String,
     },
+    /// `parse` モジュール（TASK-24.4・#38・ビヘイビア `CORE-1`）が返す
+    /// HTML パース固有のエラー。詳細は [`ParseError`] を参照。
+    Parse(ParseError),
     /// `fetch::Fetcher::get`（TASK-24.2・#36・CORE-1）が、`FetchOptions` の
     /// 全体タイムアウト・接続タイムアウトを超過した場合に返す。
     Timeout {
@@ -136,6 +142,7 @@ impl fmt::Display for Error {
             Error::JsExecutionUnavailable { message } => {
                 write!(f, "JS execution unavailable: {message}")
             }
+            Error::Parse(source) => write!(f, "parse error: {source}"),
             Error::Timeout { limit } => write!(f, "request timed out after {limit:?}"),
             Error::TooManyRedirects { limit } => {
                 write!(f, "too many redirects (limit: {limit})")
@@ -161,6 +168,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(source) => Some(source),
+            Error::Parse(source) => Some(source),
             Error::InvalidInput { .. }
             | Error::Unsupported { .. }
             | Error::JsExecutionUnavailable { .. }
@@ -174,6 +182,105 @@ impl std::error::Error for Error {
         }
     }
 }
+
+impl From<ParseError> for Error {
+    fn from(source: ParseError) -> Self {
+        Error::Parse(source)
+    }
+}
+
+/// HTML パース固有のエラー情報（[`Error::Parse`] の payload）。
+///
+/// `parse` モジュール（TASK-24.4・#38）が返す。`#[non_exhaustive]` により、
+/// 後続タスクでのバリアント追加を非破壊にする（REPAIR-4）。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ParseError {
+    /// 入力サイズが `ParseOptions::max_input_bytes` を超えている
+    /// （アロケーション前に検査する。security.md「無制限リソース確保」対策）。
+    InputTooLarge {
+        /// 実際の入力サイズ（バイト数）。
+        len: usize,
+        /// 許容上限（バイト数）。
+        limit: usize,
+    },
+    /// `parse::parse_document_bytes` で入力が不正な UTF-8 だった。
+    InvalidUtf8 {
+        /// 妥当な UTF-8 として解釈できた先頭バイト数。
+        valid_up_to: usize,
+    },
+    /// 構築したノード数が `ParseOptions::max_nodes` を超えた
+    /// （無制限確保による DoS を防ぐための上限。security.md）。
+    NodeLimitExceeded {
+        /// 適用された上限値。
+        limit: usize,
+    },
+    /// `ParseOptions::with_max_nodes` に `0` が指定された。
+    ///
+    /// arena は `Document` ルート用に最低 1 ノードを要するため `0` は
+    /// 構築不能であり、黙って `1` へ引き上げる（公開 API が受け取った上限と
+    /// 実際に適用される上限が乖離する）代わりに明示的に拒否する
+    /// （REPAIR-6 P1 レビュー指摘）。
+    InvalidMaxNodes {
+        /// 呼び出し元が指定した値（常に `0`）。
+        requested: usize,
+    },
+    /// `ParseErrorPolicy::Strict` 指定時に、回復可能なパースエラーが
+    /// 1 件以上検出された（既定の `Recover` ポリシーではこの代わりに
+    /// `Ok` を返し、診断情報として報告する）。
+    Malformed {
+        /// 検出されたパースエラー件数（saturating で加算）。
+        error_count: u64,
+        /// 先頭のパースエラーメッセージ（英語。html5ever が返す静的文字列）。
+        first_message: Option<String>,
+    },
+    /// `TreeSink` の内部不変条件違反（契約外のハンドルでの呼び出し・
+    /// `RefCell` の借用競合等）を検出した。html5ever 側の実装変更や
+    /// 本 crate 側のバグを示す想定外経路であり、通常の入力では発生しない。
+    Internal {
+        /// 診断用の英語メッセージ（入力本文は含めない。security.md）。
+        message: String,
+    },
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::InputTooLarge { len, limit } => {
+                write!(
+                    f,
+                    "input too large: {len} bytes exceeds limit of {limit} bytes"
+                )
+            }
+            ParseError::InvalidUtf8 { valid_up_to } => {
+                write!(f, "invalid UTF-8 input (valid up to byte {valid_up_to})")
+            }
+            ParseError::NodeLimitExceeded { limit } => {
+                write!(f, "node limit of {limit} exceeded during parsing")
+            }
+            ParseError::InvalidMaxNodes { requested } => {
+                write!(
+                    f,
+                    "invalid max_nodes: {requested} (must be at least 1; the arena always \
+                     needs one node for the Document root)"
+                )
+            }
+            ParseError::Malformed {
+                error_count,
+                first_message,
+            } => match first_message {
+                Some(msg) => write!(
+                    f,
+                    "malformed HTML: {error_count} parse error(s), first: {msg}"
+                ),
+                None => write!(f, "malformed HTML: {error_count} parse error(s)"),
+            },
+            ParseError::Internal { message } => write!(f, "internal parser error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 impl From<std::io::Error> for Error {
     fn from(source: std::io::Error) -> Self {
@@ -293,6 +400,101 @@ mod tests {
             std::error::Error::source(&err).map(ToString::to_string),
             None::<String>
         );
+    }
+
+    /// CORE-1（TASK-24.4・#38）: `ParseError` の各バリアントの `Display` が
+    /// 具体値を含むことを確認する。
+    #[test]
+    fn core_1_display_parse_error_variants() {
+        assert_eq!(
+            ParseError::InputTooLarge {
+                len: 200,
+                limit: 100
+            }
+            .to_string(),
+            "input too large: 200 bytes exceeds limit of 100 bytes"
+        );
+        assert_eq!(
+            ParseError::InvalidUtf8 { valid_up_to: 3 }.to_string(),
+            "invalid UTF-8 input (valid up to byte 3)"
+        );
+        assert_eq!(
+            ParseError::NodeLimitExceeded { limit: 5 }.to_string(),
+            "node limit of 5 exceeded during parsing"
+        );
+        assert_eq!(
+            ParseError::InvalidMaxNodes { requested: 0 }.to_string(),
+            "invalid max_nodes: 0 (must be at least 1; the arena always needs one node for the \
+             Document root)"
+        );
+        assert_eq!(
+            ParseError::Malformed {
+                error_count: 2,
+                first_message: Some("bad tag".to_string()),
+            }
+            .to_string(),
+            "malformed HTML: 2 parse error(s), first: bad tag"
+        );
+        assert_eq!(
+            ParseError::Malformed {
+                error_count: 1,
+                first_message: None,
+            }
+            .to_string(),
+            "malformed HTML: 1 parse error(s)"
+        );
+        assert_eq!(
+            ParseError::Internal {
+                message: "borrow conflict".to_string()
+            }
+            .to_string(),
+            "internal parser error: borrow conflict"
+        );
+    }
+
+    /// CORE-1（TASK-24.4・#38）: `Error::Parse` の `Display` が内部の
+    /// `ParseError` メッセージを包んで表示する。
+    #[test]
+    fn core_1_display_parse_variant_wraps_parse_error() {
+        let err = Error::Parse(ParseError::NodeLimitExceeded { limit: 5 });
+        assert_eq!(
+            err.to_string(),
+            "parse error: node limit of 5 exceeded during parsing"
+        );
+    }
+
+    /// CORE-1（TASK-24.4・#38）: `Error::Parse` の `source()` が内部の
+    /// `ParseError` へ連鎖することを確認する。
+    #[test]
+    fn core_1_source_chains_for_parse_variant() {
+        let err = Error::Parse(ParseError::NodeLimitExceeded { limit: 5 });
+        assert_eq!(
+            std::error::Error::source(&err).map(ToString::to_string),
+            Some("node limit of 5 exceeded during parsing".to_string())
+        );
+    }
+
+    /// CORE-1（TASK-24.4・#38）: `?` 演算子で使うための
+    /// `From<ParseError> for Error` 変換を確認する。
+    #[test]
+    fn core_1_from_parse_error_converts_to_parse_variant() {
+        fn parse() -> Result<()> {
+            Err(ParseError::NodeLimitExceeded { limit: 5 })?
+        }
+
+        let err = parse().expect_err("parse は常に失敗する");
+        assert!(matches!(
+            err,
+            Error::Parse(ParseError::NodeLimitExceeded { limit: 5 })
+        ));
+    }
+
+    /// CORE-1（TASK-24.4・#38）: `ParseError` が `Send + Sync + 'static` を
+    /// 満たすことを静的に確認する（`Error` 全体の bound を壊さないことの保証）。
+    #[test]
+    fn core_1_parse_error_is_send_sync_static() {
+        fn assert_bounds<T: Send + Sync + 'static>() {}
+        assert_bounds::<ParseError>();
     }
 
     /// CORE-1（TASK-24.2・#36）: `Error::Timeout` の `Display` が上限値を含む。

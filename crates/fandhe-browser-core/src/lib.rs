@@ -3,19 +3,23 @@
 //! fetch（ネットワーク取得）・HTML パース・DOM・query（DOM 探索）・CSSOM・
 //! config（設定）・可観測性（ログ・トレーシング）・描画機能への境界（[`render`]）を
 //! 担う crate。将来的には `fandhe-browser-js`（workspace 内 crate に依存しない
-//! 下位 crate）に依存する想定。`fandhe-browser-ai`・`fandhe-browser-cdp` 等の
+//! 下位 crate）に依存する想定。`Cargo.toml` の `[dependencies]` には
+//! `html5ever = "=0.40.1"`（Issue #35 承認済み・TASK-24.4・#38）と reqwest・
+//! rustls（同じく Issue #35 承認済み・TASK-24.2・#36）を持つ。他の依存追加は
+//! 該当タスクで dependency-policy.md のユーザー承認制に従って行う。
+//! `fandhe-browser-ai`・`fandhe-browser-cdp` 等の
 //! 上位 crate からは一方向に依存される（AGENTS.md「crate 間の許可依存」・
 //! coding-rust.md「循環依存を作らない」）。
 //!
 //! REPAIR-1（TASK-1（旧サブ番号 1.2）・MS-1）: workspace 分割の一環として追加した
 //! 空 skeleton から出発している。REPAIR-1（TASK-24（24.1）・MS-1）: `fetch`/
 //! `parse`/`dom`/`query` の各モジュール構成と、それらが共通で使うエラー型
-//! （[`error::Error`] / [`error::Result`]）を追加した。`fetch` は TASK-24.2
-//! （Issue #36）で本実装済み（`Cargo.toml` の `[dependencies]` に reqwest・
-//! rustls を追加。Issue #35 で採用承認済み）。`parse`/`dom`/`query` は引き続き
-//! 空 skeleton のままで、後続 Issue（`parse` は TASK-24.4・#38、`dom` は
-//! TASK-24.5・#39、`query` は TASK-24.7・#41）で実装する（REPAIR-3: 実装済みを
-//! 装わない）。
+//! （[`error::Error`] / [`error::Result`]）を追加した。`fetch`（TASK-24.2・#36）は
+//! reqwest・rustls を使う本実装を持つ。`parse`（TASK-24.4・#38）は html5ever の
+//! `TreeSink` を自作実装し、HTML 文字列・バイト列から `dom::Document`（arena）を
+//! 構築する本実装を持つ。`dom`（TASK-24.5・#39）は arena の型定義
+//! （[`dom::Document`]・[`dom::Node`] 等）のみを持ち、走査 API はまだ実装していない
+//! （REPAIR-3: 実装済みを装わない）。`query` は TASK-24.7（#41）で本実装を行う。
 //! JS 実行スタブとの境界は TASK-24（24.9・Issue #43）で `js_stub` モジュールとして
 //! 追加した。関数本体（[`js_stub::execute_js_stub`]）は常にエラーを返すスタブであり、
 //! TASK-30（Issue #143・ビヘイビア `JS-2`）で `fandhe-browser-js` の実装へ置換される。
@@ -33,5 +37,9 @@ pub mod parse;
 pub mod query;
 pub mod render;
 
-pub use error::{Error, Result};
+pub use error::{Error, ParseError, Result};
 pub use fetch::{FetchOptions, FetchResponse, Fetcher};
+pub use parse::{
+    ParseDiagnostics, ParseErrorPolicy, ParseOptions, ParsedDocument, parse_document,
+    parse_document_bytes,
+};
