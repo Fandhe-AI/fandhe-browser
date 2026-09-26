@@ -37,8 +37,13 @@ use std::time::{Duration, Instant};
 
 use support::{
     JsonValue, approx_tokens, expand_args, json_escape, median, parse_http_status, parse_json,
-    parse_ps_rss_kb, reduction_pct, split_args,
+    reduction_pct, split_args,
 };
+// `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
+// 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
+// 警告が `-D warnings`（ci.md「3 OS CI」）で fail するため cfg で分離する。
+#[cfg(unix)]
+use support::parse_ps_rss_kb;
 
 /// 試行回数の既定値・上限（無制限ループ・無制限プロセス起動を避ける。
 /// coding-rust.md「長さ・件数を上限検証」）。
@@ -174,6 +179,12 @@ fn spawn_and_wait_ready(
 ) -> Result<(ChildGuard, u16, Duration), String> {
     let port = reserve_port()?;
     let expanded = expand_args(args, port);
+    // cold start（PERF-3）はプロセスのロード時間を含めて計測する。`spawn()`
+    // 自体が fork/exec を伴いブロッキングするため、計測の起点はプロセス起動
+    // 呼び出し（`Command::new` 実行時点）に置き、`spawn()` 完了後には置かない
+    // （起点を後ろにずらすと実行ファイルのロード時間が計測から漏れ、
+    // cold start が実態より系統的に短く出る）。
+    let start = Instant::now();
     let child = Command::new(bin)
         .args(&expanded)
         .stdin(Stdio::null())
@@ -187,7 +198,6 @@ fn spawn_and_wait_ready(
     let request = format!(
         "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
     );
-    let start = Instant::now();
     loop {
         if Instant::now() >= deadline {
             return Err("timeout waiting for readiness probe".to_string());
@@ -370,6 +380,12 @@ impl McpClient {
     /// JSON-RPC 呼び出しを 1 件送り、`id` が一致する応答を待つ
     /// （タイムアウト内に一致しなければ `Err`。他 id の応答・パース不能行は
     /// 読み捨てて継続する。外部プロセスの応答を untrusted として扱う）。
+    ///
+    /// `id` が一致しても JSON-RPC の `error` フィールドが立っている、または
+    /// `tools/call` 結果の `result.isError` が `true` の応答は失敗として
+    /// `Err` を返す（呼び出し元 `measure_token_reduction` はエラー応答を
+    /// そのサイトの skip として扱うため、ここで成功と誤判定すると
+    /// トークン削減率の計測に失敗レスポンスの本文が混入する）。
     fn call(&mut self, method: &str, params: &str, timeout: Duration) -> Result<JsonValue, String> {
         let id = self.next_id;
         self.next_id += 1;
@@ -397,6 +413,20 @@ impl McpClient {
                 continue;
             };
             if value.get("id").and_then(JsonValue::as_f64) == Some(id as f64) {
+                if let Some(err) = value.get("error") {
+                    let message = err
+                        .get("message")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("unknown error");
+                    return Err(format!("{method}: rpc error: {message}"));
+                }
+                let is_error = value
+                    .get("result")
+                    .and_then(|r| r.get("isError"))
+                    .is_some_and(|v| matches!(v, JsonValue::Bool(true)));
+                if is_error {
+                    return Err(format!("{method}: tool call reported isError"));
+                }
                 return Ok(value);
             }
         }

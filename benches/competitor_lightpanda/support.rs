@@ -81,6 +81,12 @@ pub fn parse_http_status(line: &str) -> Option<u16> {
 ///
 /// アイドル RSS 計測（`PERF-6`）が unix でのみ呼ぶ（Windows は
 /// `Unsupported`。実装計画 3.2 節）。空文字列・数値でない出力は `None` を返す。
+///
+/// 呼び出し元（`competitor_lightpanda.rs` の `sample_rss_kb`）が
+/// `#[cfg(unix)]` 限定のため、この関数自体も `#[cfg(unix)]` にする。
+/// 無条件公開のままだと Windows ネイティブビルドで到達不能になり
+/// `dead_code` 警告が `-D warnings`（ci.md「3 OS CI」）で fail する。
+#[cfg(unix)]
 pub fn parse_ps_rss_kb(out: &str) -> Option<u64> {
     out.trim().parse::<u64>().ok()
 }
@@ -556,12 +562,15 @@ mod tests {
         assert_eq!(parse_http_status("HTTP/1.1 abc"), None);
     }
 
-    // PERF-6: parse_ps_rss_kb は unix の `ps -o rss=` 出力を解釈する。
+    // PERF-6: parse_ps_rss_kb は unix の `ps -o rss=` 出力を解釈する
+    // （関数定義が `#[cfg(unix)]` のため、テストも合わせて限定する）。
+    #[cfg(unix)]
     #[test]
     fn parse_ps_rss_kb_basic() {
         assert_eq!(parse_ps_rss_kb("  12345\n"), Some(12345));
     }
 
+    #[cfg(unix)]
     #[test]
     fn parse_ps_rss_kb_invalid_is_none() {
         assert_eq!(parse_ps_rss_kb(""), None);
