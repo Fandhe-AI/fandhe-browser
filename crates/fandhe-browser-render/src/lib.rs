@@ -5,8 +5,12 @@
 //! （[licensing](../../../.claude/rules/licensing.md)・RENDER-1）。
 //! 対応: TASK-1（1.4）・REPAIR-1・MS-1。
 //!
-//! 現状はディレクトリ・manifest のみの雛形であり、feature gate `rendering`
-//! の追加・core 側の描画トレイトとの結線・Servo 依存の導入・実装は
-//! いずれも別タスク（TASK-33、ビヘイビア RENDER-1）で行う。本 crate に
-//! 公開 API はまだ存在せず、「実装済みを装う」スタブ関数も置かない
-//! （REPAIR-3）。
+//! 現状はディレクトリ・manifest のみの雛形であり、本 crate に公開 API は
+//! まだ存在せず、「実装済みを装う」スタブ関数も置かない（REPAIR-3）。
+//!
+//! # スタブについて
+//!
+//! - feature `rendering` の Cargo 定義・core の描画トレイト（`Renderer`。
+//!   `fandhe-browser-core::render`）との結線（RENDER-1・TASK-33・MS-1）
+//! - Servo の組込・スクリーンショット取得等の本実装（RENDER-1・TASK-38・
+//!   MS-4）

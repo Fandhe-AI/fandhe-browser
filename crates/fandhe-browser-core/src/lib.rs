@@ -33,6 +33,14 @@
 //! `DisabledRenderer`（TASK-33（33.3）・issue #47）を含む。`fandhe-browser-render`
 //! （Servo）側の本実装・`AppState` への配線は含まない（別 issue の担当。render
 //! モジュールの doc コメントを参照）。
+//!
+//! # スタブについて
+//!
+//! 未実装・簡易実装の詳細は各モジュールの `//!` を参照（`REPAIR-3`: 実装済みを
+//! 装わない）。crate 直下では対象モジュールの名前のみを挙げる。
+//!
+//! - [`js_stub`]（`JS-2`・`TASK-30`・`MS-3`）
+//! - [`render::DisabledRenderer`]（`RENDER-1`・`TASK-33`/`TASK-38`・`MS-1`/`MS-4`）
 
 pub mod dom;
 pub mod error;

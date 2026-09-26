@@ -7,11 +7,13 @@
 //!
 //! 本モジュールはトレイトと入出力型・エラー型の定義に加え、feature `rendering` 無効時
 //! （または `fandhe-browser-cli` 側で具象実装がまだ結線されていない時）に用いる既定実装
-//! [`DisabledRenderer`] を提供する（TASK-33（サブタスク 33.3）・issue #47）。以下は別 issue の
-//! 担当であり、本モジュールには含まれない。
-//! - feature `rendering` の Cargo 定義（TASK-33.1）
-//! - `AppState` へのレンダリングハンドル格納（TASK-41 系）
-//! - `fandhe-browser-render`（Servo）側の本実装（TASK-33 本体・TASK-38 系）
+//! [`DisabledRenderer`] を提供する（TASK-33（サブタスク 33.3）・issue #47）。
+//!
+//! ## 本モジュールの範囲外（将来仕様。REPAIR-3: 実装済みを装わない）
+//!
+//! - feature `rendering` の Cargo 定義（`RENDER-1`、`TASK-33`（33.1）、`MS-1`）
+//! - `AppState` へのレンダリングハンドル格納（`RENDER-1`、`TASK-41`、`MS-3`）
+//! - `fandhe-browser-render`（Servo）側の本実装（`RENDER-1`、`TASK-33` 本体・`TASK-38`、`MS-1`/`MS-4`）
 
 /// 描画機能（スクリーンショット・可視性判定・境界ボックス取得）への唯一の境界となるトレイト
 /// （RENDER-1）。
@@ -36,6 +38,8 @@ pub trait Renderer: Send + Sync {
 /// レンダリング層が無効（feature `rendering` 無効時、または `fandhe-browser-render`
 /// 側の実装がまだ結線されていない状態）であることを表す既定の [`Renderer`] 実装
 /// （RENDER-1・TASK-33（33.3）・MS-1）。
+///
+/// スタブ（常に [`RenderError::RenderingDisabled`] を返し、成功を装わない。REPAIR-3）。
 ///
 /// `cdp`・`ai` は、`rendering` feature を有効化した `fandhe-browser-cli` が
 /// 具象実装（`fandhe-browser-render` 側。TASK-33 本体・別 issue）を注入しない限り、
@@ -149,9 +153,10 @@ impl Screenshot {
 
 /// 描画対象の要素を指す暫定的な参照型（RENDER-1）。
 ///
-/// DOM モジュール（TASK-24・CORE-1）が未実装のため、`NodeId` 等の DOM 由来の識別子は
-/// まだ core に存在しない。本 variant はそれまでの暫定的な表現であり、TASK-24 完了後は
-/// DOM の識別子型と統合する想定である（REPAIR-3: 実装済みを装わない）。
+/// 簡易実装: DOM（[`dom::NodeId`](crate::dom::NodeId)）は `TASK-24`（24.5）で実装済みだが、
+/// render 側と統合するまで本 variant は暫定的に `Selector` のみを持つ。統合先の
+/// TASK は未定（対応 TASK・MS 未定・spec 側で未割当）であり、`RENDER-1` の本実装
+/// （`TASK-38`、`MS-4`）で見直す想定である（REPAIR-3: 実装済みを装わない）。
 ///
 /// `Selector` は CSS セレクタ等、cdp・ai からの外部入力をそのまま保持しうる。本モジュールは
 /// 型定義のみを提供し検証・評価ロジックを持たないため、セレクタの検証は将来の実装

@@ -15,6 +15,16 @@
 //!
 //! V8（`rusty_v8`）・boa（`boa_engine`）それぞれの実装切替（JS-3）は、
 //! 対応する依存追加（TASK-29・TASK-32）を経て別途行う。
+//!
+//! # スタブについて
+//!
+//! [`create_engine`] は同梱済みの種別には `NotYetImplemented`、
+//! 同梱されていない種別には `NotBundled`（詳細は [`engine_trait`] を参照）
+//! を返す。以下は未実装（実装済みを装わない。REPAIR-3）。
+//!
+//! - V8 の具象実装（`JS-1`、`TASK-29`、`MS-3`）
+//! - boa の具象実装（`JS-1`、`TASK-32`、`MS-3`）
+//! - core への統合（`js_stub` の置換。`JS-2`、`TASK-30`、`MS-3`）
 
 pub mod engine_trait;
 

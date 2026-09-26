@@ -35,13 +35,15 @@
 //! ## 本 Issue（#36）の範囲外（将来仕様。REPAIR-3: 実装済みを装わない）
 //!
 //! - ローカルファイル（`file:`）の取得: 受け入れ基準外のため対応しない
+//!   （対応 TASK・MS 未定・spec 側で未割当）
 //! - DNS リバインディング対策の強化（TOCTOU）: [`SafeResolver`] は解決の
 //!   都度アドレスを検証するため多くのケースは防げるが、解決結果と実際の
 //!   TCP 接続確立の間に別 IP へ切り替わる極端な race までは保証しない
-//! - Cookie セッション維持（ビヘイビア CORE-5 (8)）
-//! - 文字コード判定（ビヘイビア CORE-5 (7)）: 本文は常にバイト列で返す
+//!   （対応 TASK・MS 未定・spec 側で未割当）
+//! - Cookie セッション維持（ビヘイビア `CORE-5` (8)・`TASK-25`・`MS-3`）
+//! - 文字コード判定（ビヘイビア `CORE-5` (7)・`TASK-25`・`MS-3`）: 本文は常にバイト列で返す
 //! - gzip 等の展開・HTTP/2・プロキシ設定: 挙動の決定性を優先し、`no_proxy()`
-//!   で環境変数のプロキシ設定を無視する
+//!   で環境変数のプロキシ設定を無視する（対応 TASK・MS 未定・spec 側で未割当）
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, OnceLock};
@@ -557,7 +559,8 @@ impl Fetcher {
     ///   [`Error::InvalidInput`] として拒否する
     /// - タイムアウト・接続タイムアウト・リダイレクトポリシー・User-Agent を
     ///   設定し、環境変数のプロキシ設定は `no_proxy()` で無視する（挙動の
-    ///   決定性のため。プロキシ対応自体は将来仕様）
+    ///   決定性のため。プロキシ対応自体は将来仕様。対応 TASK・MS 未定・
+    ///   spec 側で未割当）
     pub fn new(options: FetchOptions) -> Result<Self> {
         ensure_crypto_provider_installed();
         options.validate()?;
@@ -896,17 +899,17 @@ impl FetchResponse {
         self.content_type.as_deref()
     }
 
-    /// レスポンス本文の生バイト列。文字コード判定（ビヘイビア CORE-5 (7)）
-    /// は本 crate の範囲外のため、呼び出し側または `parse` モジュール
-    /// （TASK-24.4・#38）が行う想定。
+    /// レスポンス本文の生バイト列。文字コード判定（ビヘイビア `CORE-5` (7)・
+    /// `TASK-25`・`MS-3`）は本 crate の範囲外のため、呼び出し側または `parse`
+    /// モジュール（TASK-24.4・#38）が行う想定。
     pub fn body(&self) -> &[u8] {
         &self.body
     }
 
     /// レスポンス本文を UTF-8 として非可逆変換した文字列（不正なバイト列は
-    /// 置換文字に置き換える）。厳密な文字コード判定（`charset` ヘッダ・
-    /// meta タグ由来）は範囲外の将来仕様であり、これは参考用の簡易変換に
-    /// 留まる。
+    /// 置換文字に置き換える）簡易実装。厳密な文字コード判定（`charset` ヘッダ・
+    /// meta タグ由来。ビヘイビア `CORE-5` (7)・`TASK-25`・`MS-3`）は範囲外の
+    /// 将来仕様であり、これは参考用の簡易変換に留まる。
     pub fn body_text_lossy(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
