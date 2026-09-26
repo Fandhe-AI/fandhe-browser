@@ -3,8 +3,8 @@
 //!
 //! `parse` モジュールが構築した `Document` に対し、crate 外から走査 API・
 //! アクセサ・`text_content` を呼べること、および `Document` が `Send + Sync`
-//! であることを確認する。代表的な HTML 断片から DOM 構造を網羅的に検証する
-//! 結合テストの拡充は #40（TASK-24.6）が担当するため、ここでは crate 境界を
+//! であることを確認する。代表的な HTML 断片による網羅的な構造検証は
+//! `tests/parse_dom.rs`（TASK-24.6・#40）を参照。ここでは crate 境界を
 //! 越えて呼べることの最小限の確認に留める。
 
 use fandhe_browser_core::{Document, NodeId, ParseOptions, parse_document};
