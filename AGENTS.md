@@ -46,6 +46,8 @@ make check-render-isolation   # cargo tree --workspace -e normal,build,dev --exc
 
 ```bash
 cargo deny check licenses
+make check-deny-license-reject   # 許可外ライセンス（GPL/AGPL/LGPL/MPL-2.0・ライセンス欄なし）が
+                                   # reject されることの negative test（TASK-9.1・REPAIR-8）
 ```
 
 ### 3 OS 一級対応
@@ -136,4 +138,4 @@ spec `docs/spec/04-behavior/self-repair-design.md`「crate 間の依存方向と
 | permissions | ワークフロー・ジョブの `permissions` が最小権限で明示されているか | P0 |
 | secrets の扱い | secrets が `pull_request` イベントのログへ出力されていないか | P0 |
 | CI パイプライン本体（`ci.yml`・`release.yml`） | `ci.yml` は TASK-55.2（Issue #59）で `push`（main）/`pull_request` トリガーを有効化済み（`workflow_dispatch` は手動再実行用に併存）。`release.yml` は crates.io 公開用の意図的設計として引き続き `workflow_dispatch` 限定。`ci.yml` への変更では、3 OS matrix（Linux・macOS・Windows）を備えているか、本リポに存在しない `make` ターゲット・`scripts/` を前提にした（vector-db 由来のような）ジョブが混入していないかを確認する | P1 |
-| 依存監査パイプライン | 対象サイト群の互換性回帰チェック・`cargo-deny` を含む本格 CI パイプラインは検討中（REPAIR-8）。導入時は本節・`.claude/rules/ci.md` の更新を伴っているか | P2 |
+| 依存監査パイプライン | `cargo-deny`（advisories/bans/licenses/sources）は 3 OS の `rust-ci` ジョブへ導入済み（TASK-77・#64）。許可外ライセンスを reject する fail-closed 性の negative test（`make check-deny-license-reject`・`deny-license-reject` ジョブ）も導入済み（TASK-9.1・#338・REPAIR-8）。対象サイト群の互換性回帰チェックは引き続き検討中 | P2 |
