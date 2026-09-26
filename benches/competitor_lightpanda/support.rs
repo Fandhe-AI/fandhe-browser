@@ -325,9 +325,10 @@ pub fn lookup_fixture(request_path: &str) -> Option<(&'static str, &'static str)
 /// 反していた（`<PREFIX>_BIN` 未設定でも `idleRssKb` だけ `unsupported` に
 /// なる）。この判定は本来 OS に依存しない（`target.bin` の有無だけで決まる）
 /// ため、`competitor_lightpanda.rs` の `measure_cold_start`・
-/// `measure_binary_size`・`#[cfg(unix)]`/`#[cfg(windows)]` 両方の
-/// `measure_idle_rss`・[`token_reduction_gate`] がすべてこの 1 関数を通して
-/// 判定することで、個別に同じ分岐を書いて食い違いを生む余地をなくす。
+/// `measure_binary_size`・`measure_token_reduction`・`#[cfg(unix)]`/
+/// `#[cfg(windows)]` 両方の `measure_idle_rss`・[`token_reduction_gate`]
+/// がすべてこの 1 関数を通して判定することで、個別に同じ分岐を書いて
+/// 食い違いを生む余地をなくす。
 /// `Result` にして `bin` そのものを返すことで、呼び出し側は
 /// `let Some(bin) = &target.bin else { unreachable!() }` のような
 /// 冗長かつ不変条件に依存する再チェックを書かずに済む。
@@ -367,6 +368,24 @@ pub fn token_reduction_gate(
     None
 }
 
+/// `<PREFIX>_SERVE_ARGS`/`<PREFIX>_MCP_ARGS` の検証エラーがあれば
+/// `Outcome::Error` を返す。無ければ `None`（呼び出し側が実際の計測を
+/// 続ける）。
+///
+/// レビュー指摘 P2（Codex。PR #442 再々々々レビュー・
+/// competitor_lightpanda.rs:511/554）: 以前は `Target::args_error` が
+/// `SERVE_ARGS`・`MCP_ARGS` 両方の検証エラーを 1 フィールドへまとめていた
+/// ため、`MCP_ARGS` だけが上限超過でも、`MCP_ARGS` を使わない cold start
+/// （`PERF-3`）・アイドル RSS（`PERF-6`）計測まで計測前に `Outcome::Error`
+/// になっていた（逆に `SERVE_ARGS` だけの超過で `AISNAP-1` も巻き込まれる）。
+/// `Target` 側を `serve_args_error`・`mcp_args_error` の 2 フィールドに
+/// 分け、各計測関数（`measure_cold_start`・unix 版 `measure_idle_rss` は
+/// `serve_args_error`、`measure_token_reduction` は `mcp_args_error`）が
+/// 自分の使う引数のエラーだけをこの関数経由で確認するようにした。
+pub fn arg_error_gate(arg_error: Option<&str>, target_name: &str) -> Option<Outcome> {
+    arg_error.map(|reason| Outcome::Error(format!("{target_name}: {reason}")))
+}
+
 /// HTTP リクエストの先頭行（例: `GET /article.html HTTP/1.1`）から
 /// メソッドとパスを取り出す。
 ///
@@ -380,10 +399,55 @@ pub fn parse_http_request_line(line: &str) -> Option<(String, String)> {
     let method = parts.next()?;
     let path = parts.next()?;
     let version = parts.next()?;
-    if !version.starts_with("HTTP/") {
+    // 余分なトークンがあれば不正なリクエスト行として扱う。
+    if parts.next().is_some() {
+        return None;
+    }
+    if !is_valid_http_version(version) {
         return None;
     }
     Some((method.to_string(), path.to_string()))
+}
+
+/// `"HTTP/"` に続けて `<数字列>.<数字列>`（例: `HTTP/1.1`・`HTTP/1.0`）の
+/// 形式かどうかを判定する。
+///
+/// レビュー指摘（コーディネーター指示。PR #442 再々々々レビュー）:
+/// 以前は `version.starts_with("HTTP/")` だけで判定しており、
+/// `HTTP/potato` のような不正な値も通っていた。バージョン番号部分が
+/// 数字のみの 2 要素であることまで確認する。
+pub fn is_valid_http_version(version: &str) -> bool {
+    let Some(rest) = version.strip_prefix("HTTP/") else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    let (Some(major), Some(minor), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !major.is_empty()
+        && !minor.is_empty()
+        && major.chars().all(|c| c.is_ascii_digit())
+        && minor.chars().all(|c| c.is_ascii_digit())
+}
+
+/// ソケット読み取りの `io::Error` から、fixture 配信サーバーが返すべき
+/// HTTP ステータスコードを決める。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々々レビュー・
+/// competitor_lightpanda.rs:352）: リクエスト行・ヘッダ行の読み取りが
+/// タイムアウト・サイズ超過・その他の I/O エラーで失敗した場合、以前は
+/// ループを抜けるだけで後続の処理（`lookup_fixture` によるパス一致判定・
+/// `200` 応答）へ進んでしまい、読み取り未完了のまま既知のパスなら成功応答を
+/// 返し得た。読み取りが完了しなかった経路はすべてこの関数で判定した
+/// ステータスで応答してから接続を終了する契約にする
+/// （`ErrorKind::WouldBlock`/`TimedOut` はソケットの読み取りタイムアウト
+/// （`FIXTURE_IO_TIMEOUT`）由来なので `408 Request Timeout`、それ以外
+/// （接続の早期切断・`MAX_LINE_BYTES` 超過等）は `400 Bad Request`）。
+pub fn http_status_for_io_error(kind: std::io::ErrorKind) -> (u16, &'static str) {
+    match kind {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => (408, "Request Timeout"),
+        _ => (400, "Bad Request"),
+    }
 }
 
 /// 手書き最小 JSON パーサーが返す値。
@@ -435,6 +499,138 @@ impl JsonValue {
             _ => None,
         }
     }
+
+    /// `Bool` のときだけ中身を返す。`result.isError` の型検証に使う
+    /// （レビュー指摘 P1。Codex。PR #442 再々々々レビュー・
+    /// competitor_lightpanda.rs:839）。
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            JsonValue::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// `Array` のときだけ要素列を借用する。`result.content` の形検証に使う。
+    pub fn as_array(&self) -> Option<&Vec<JsonValue>> {
+        match self {
+            JsonValue::Array(items) => Some(items),
+            _ => None,
+        }
+    }
+}
+
+/// MCP サーバー（stdio 越しの JSON-RPC 2.0）からの応答 1 件が、要求した
+/// `method` に対する妥当な応答の形をしているかを検証する。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々々レビュー・
+/// competitor_lightpanda.rs:839）: 以前は `id` が一致し `result.isError` が
+/// `true` でなければ成功として扱っており、`result` が `null`・`{}` の
+/// ような空応答でも `goto` の成功と誤判定し得た（`goto` は本文を見ない
+/// ため、ページ遷移に失敗した応答をそのまま成功扱いにし、続く `html`・
+/// `tree` を別ページの結果として計測する経路になり得た）。ここで
+/// JSON-RPC 2.0 の封筒（`jsonrpc`・`id`・`error`/`result` の排他）と、
+/// `method` ごとに要求される `result` の最小限の形を検証する
+/// （`tools/call` は `content` が空でない配列で各要素に `type` を持ち、
+/// `type == "text"` なら `text` が文字列であること・`isError` があるなら
+/// bool であることまで。`initialize` は `result` がオブジェクトで、
+/// `protocolVersion` が文字列・`capabilities` がオブジェクトであることまで
+/// （`{}` のような空応答を成功とみなさない）。それ以外のメソッド
+/// （`tools/list` 等。現状このベンチからは呼ばない）は `result` が
+/// JSON オブジェクトであることまで）。`error` 応答は封筒として妥当なら
+/// `Ok(())` を返す（`error.message` の取り出しは呼び出し元
+/// `McpClient::call` の既存処理に委ねる）。
+pub fn validate_mcp_response(
+    value: &JsonValue,
+    expected_id: f64,
+    method: &str,
+) -> Result<(), String> {
+    match value.get("jsonrpc").and_then(JsonValue::as_str) {
+        Some("2.0") => {}
+        _ => return Err("response missing or invalid \"jsonrpc\":\"2.0\"".to_string()),
+    }
+    match value.get("id").and_then(JsonValue::as_f64) {
+        Some(id) if id == expected_id => {}
+        _ => return Err("response \"id\" does not match the request".to_string()),
+    }
+    let error = value.get("error");
+    let result = value.get("result");
+    match (error, result) {
+        (Some(_), Some(_)) => Err("response has both \"error\" and \"result\"".to_string()),
+        (None, None) => Err("response has neither \"error\" nor \"result\"".to_string()),
+        (Some(_), None) => Ok(()),
+        (None, Some(result)) => validate_mcp_result_shape(result, method),
+    }
+}
+
+/// `method` ごとに要求される `result` の最小限の形を検証する
+/// （[`validate_mcp_response`] のヘルパー）。
+fn validate_mcp_result_shape(result: &JsonValue, method: &str) -> Result<(), String> {
+    match method {
+        "tools/call" => {}
+        // レビュー指摘（コーディネーター指示。PR #442 再々々々レビュー・
+        // competitor_lightpanda.rs:839）: 「`initialize` や `tools/list`
+        // など、ほかの MCP 呼び出しの応答の形も同じ方針で確認する」ため、
+        // `initialize` は MCP 2025-06-18 の `InitializeResult` が持つべき
+        // 必須フィールド（`protocolVersion`・`capabilities`）まで確認する
+        // （`result: {}` のような空応答をオブジェクトというだけで成功と
+        // みなさない）。
+        "initialize" => {
+            if !matches!(result, JsonValue::Object(_)) {
+                return Err("initialize \"result\" is not a JSON object".to_string());
+            }
+            if result
+                .get("protocolVersion")
+                .and_then(JsonValue::as_str)
+                .is_none()
+            {
+                return Err("initialize \"result.protocolVersion\" is not a string".to_string());
+            }
+            return if matches!(result.get("capabilities"), Some(JsonValue::Object(_))) {
+                Ok(())
+            } else {
+                Err("initialize \"result.capabilities\" is not an object".to_string())
+            };
+        }
+        // 上記以外（`tools/list` 等。現状このベンチからは呼ばない）は、
+        // 最低限 `result` が JSON オブジェクトであることまで確認する。
+        _ => {
+            return if matches!(result, JsonValue::Object(_)) {
+                Ok(())
+            } else {
+                Err(format!("{method}: \"result\" is not a JSON object"))
+            };
+        }
+    }
+    if !matches!(result, JsonValue::Object(_)) {
+        return Err("tools/call \"result\" is not a JSON object".to_string());
+    }
+    if let Some(is_error) = result.get("isError")
+        && is_error.as_bool().is_none()
+    {
+        return Err("tools/call \"result.isError\" is not a bool".to_string());
+    }
+    let Some(content) = result.get("content") else {
+        return Err("tools/call \"result\" is missing \"content\"".to_string());
+    };
+    let Some(items) = content.as_array() else {
+        return Err("tools/call \"result.content\" is not an array".to_string());
+    };
+    if items.is_empty() {
+        return Err("tools/call \"result.content\" is empty".to_string());
+    }
+    for (i, item) in items.iter().enumerate() {
+        let Some(item_type) = item.get("type").and_then(JsonValue::as_str) else {
+            return Err(format!(
+                "tools/call \"result.content[{i}]\" is missing a string \"type\""
+            ));
+        };
+        if item_type == "text" && item.get("text").and_then(JsonValue::as_str).is_none() {
+            return Err(format!(
+                "tools/call \"result.content[{i}]\" has type \"text\" but no string \"text\""
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// JSON パース失敗の理由。呼び出し元（MCP 応答の逐次パース）は該当行を
@@ -1083,6 +1279,82 @@ mod tests {
         assert_eq!(parse_http_request_line("GET /path NOT-HTTP/1.1"), None);
     }
 
+    // レビュー指摘（コーディネーター指示。PR #442 再々々々レビュー）:
+    // `HTTP/` で始まるだけの不正なバージョン表記（`HTTP/potato` 等）を
+    // 許してしまわないことを確認する。
+    #[test]
+    fn parse_http_request_line_rejects_malformed_version() {
+        assert_eq!(
+            parse_http_request_line("GET /article.html HTTP/potato\r\n"),
+            None
+        );
+        assert_eq!(
+            parse_http_request_line("GET /article.html HTTPS/1.1\r\n"),
+            None
+        );
+        assert_eq!(
+            parse_http_request_line("GET /article.html HTTP/1\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_http_request_line_rejects_extra_tokens() {
+        assert_eq!(
+            parse_http_request_line("GET /article.html HTTP/1.1 extra\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn is_valid_http_version_accepts_common_forms() {
+        assert!(is_valid_http_version("HTTP/1.1"));
+        assert!(is_valid_http_version("HTTP/1.0"));
+        assert!(is_valid_http_version("HTTP/2.0"));
+    }
+
+    #[test]
+    fn is_valid_http_version_rejects_malformed_forms() {
+        assert!(!is_valid_http_version("HTTP/potato"));
+        assert!(!is_valid_http_version("HTTP/1"));
+        assert!(!is_valid_http_version("HTTP/1.1.1"));
+        assert!(!is_valid_http_version("HTTPS/1.1"));
+        assert!(!is_valid_http_version("http/1.1"));
+        assert!(!is_valid_http_version(""));
+    }
+
+    // レビュー指摘 P1（Codex。PR #442 再々々々レビュー・
+    // competitor_lightpanda.rs:352）: リクエスト行・ヘッダ行の読み取りが
+    // タイムアウト／サイズ超過／その他の I/O エラーで失敗した経路は、
+    // すべて 400（タイムアウトなら 408）で終了しなければならない。
+    #[test]
+    fn http_status_for_io_error_timeout_is_408() {
+        assert_eq!(
+            http_status_for_io_error(std::io::ErrorKind::WouldBlock),
+            (408, "Request Timeout")
+        );
+        assert_eq!(
+            http_status_for_io_error(std::io::ErrorKind::TimedOut),
+            (408, "Request Timeout")
+        );
+    }
+
+    #[test]
+    fn http_status_for_io_error_other_is_400() {
+        assert_eq!(
+            http_status_for_io_error(std::io::ErrorKind::InvalidData),
+            (400, "Bad Request")
+        );
+        assert_eq!(
+            http_status_for_io_error(std::io::ErrorKind::UnexpectedEof),
+            (400, "Bad Request")
+        );
+        assert_eq!(
+            http_status_for_io_error(std::io::ErrorKind::ConnectionReset),
+            (400, "Bad Request")
+        );
+    }
+
     // レビュー指摘 P0・P1（Codex。PR #442 再々レビュー・
     // competitor_lightpanda.rs:338/352）: fixture はコンパイル時に埋め込んだ
     // 固定テーブルの完全一致だけで引くため、シンボリックリンク・TOCTOU・
@@ -1209,5 +1481,199 @@ mod tests {
     fn require_bin_some_returns_the_path() {
         let bin = PathBuf::from("lightpanda-bin");
         assert_eq!(require_bin(Some(&bin), "lightpanda"), Ok(&bin));
+    }
+
+    // レビュー指摘 P2（Codex。PR #442 再々々々レビュー・
+    // competitor_lightpanda.rs:511/554）: `SERVE_ARGS`・`MCP_ARGS` の検証
+    // エラーは、それぞれを使う計測だけに影響しなければならない。
+    #[test]
+    fn arg_error_gate_none_is_none() {
+        assert_eq!(arg_error_gate(None, "lightpanda"), None);
+    }
+
+    #[test]
+    fn arg_error_gate_some_is_error_with_target_name() {
+        match arg_error_gate(Some("too many args"), "lightpanda") {
+            Some(Outcome::Error(reason)) => {
+                assert!(reason.contains("lightpanda"));
+                assert!(reason.contains("too many args"));
+            }
+            other => panic!("expected Some(Outcome::Error(_)), got {other:?}"),
+        }
+    }
+
+    // レビュー指摘 P1（Codex。PR #442 再々々々レビュー・
+    // competitor_lightpanda.rs:839）: `result` が `null`・`{}` でも
+    // `isError` が無ければ成功として扱っていた。JSON-RPC の封筒と
+    // `tools/call` の `result.content` の形を厳密に検証する。
+    #[test]
+    fn validate_mcp_response_accepts_valid_tools_call() {
+        let value = parse_json(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"<html></html>"}]}}"#,
+        )
+        .expect("valid json");
+        assert_eq!(validate_mcp_response(&value, 1.0, "tools/call"), Ok(()));
+    }
+
+    #[test]
+    fn validate_mcp_response_accepts_error_envelope() {
+        let value = parse_json(r#"{"jsonrpc":"2.0","id":1,"error":{"message":"boom"}}"#)
+            .expect("valid json");
+        assert_eq!(validate_mcp_response(&value, 1.0, "tools/call"), Ok(()));
+    }
+
+    #[test]
+    fn validate_mcp_response_rejects_missing_jsonrpc() {
+        let value = parse_json(r#"{"id":1,"result":{}}"#).expect("valid json");
+        assert!(validate_mcp_response(&value, 1.0, "initialize").is_err());
+    }
+
+    #[test]
+    fn validate_mcp_response_rejects_wrong_jsonrpc_version() {
+        let value = parse_json(r#"{"jsonrpc":"1.0","id":1,"result":{}}"#).expect("valid json");
+        assert!(validate_mcp_response(&value, 1.0, "initialize").is_err());
+    }
+
+    #[test]
+    fn validate_mcp_response_rejects_id_mismatch() {
+        let value = parse_json(r#"{"jsonrpc":"2.0","id":2,"result":{}}"#).expect("valid json");
+        assert!(validate_mcp_response(&value, 1.0, "initialize").is_err());
+    }
+
+    #[test]
+    fn validate_mcp_response_rejects_both_error_and_result() {
+        let value = parse_json(r#"{"jsonrpc":"2.0","id":1,"error":{"message":"x"},"result":{}}"#)
+            .expect("valid json");
+        assert!(validate_mcp_response(&value, 1.0, "initialize").is_err());
+    }
+
+    #[test]
+    fn validate_mcp_response_rejects_neither_error_nor_result() {
+        let value = parse_json(r#"{"jsonrpc":"2.0","id":1}"#).expect("valid json");
+        assert!(validate_mcp_response(&value, 1.0, "initialize").is_err());
+    }
+
+    #[test]
+    fn validate_mcp_response_accepts_valid_initialize_result() {
+        let value = parse_json(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#,
+        )
+        .expect("valid json");
+        assert_eq!(validate_mcp_response(&value, 1.0, "initialize"), Ok(()));
+    }
+
+    // レビュー指摘（コーディネーター指示。PR #442 再々々々レビュー）:
+    // 「initialize や tools/list など、ほかの MCP 呼び出しの応答の形も
+    // 同じ方針で確認する」ため、`initialize` は空の `result: {}` を
+    // 成功と誤判定してはいけない（`tools/call` の `result: {}` を拒否する
+    // のと同じ理由付け）。
+    #[test]
+    fn validate_mcp_response_rejects_initialize_empty_result() {
+        let value = parse_json(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#).expect("valid json");
+        assert!(validate_mcp_response(&value, 1.0, "initialize").is_err());
+    }
+
+    #[test]
+    fn validate_mcp_response_rejects_initialize_missing_protocol_version() {
+        let value = parse_json(r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#)
+            .expect("valid json");
+        assert!(validate_mcp_response(&value, 1.0, "initialize").is_err());
+    }
+
+    #[test]
+    fn validate_mcp_response_rejects_initialize_non_object_capabilities() {
+        let value = parse_json(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":[]}}"#,
+        )
+        .expect("valid json");
+        assert!(validate_mcp_response(&value, 1.0, "initialize").is_err());
+    }
+
+    #[test]
+    fn validate_mcp_response_rejects_non_object_result_for_non_tools_call() {
+        for raw in [
+            r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":42}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":[]}"#,
+        ] {
+            let value = parse_json(raw).expect("valid json");
+            assert!(
+                validate_mcp_response(&value, 1.0, "initialize").is_err(),
+                "{raw} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_mcp_response_rejects_tools_call_null_or_empty_result() {
+        // レビュー指摘 P1 の核心事例: `goto` の応答が `result: null` や
+        // `result: {}`（`content` 欠如）でも、以前は `isError` が無いという
+        // だけで成功扱いにしていた。
+        for raw in [
+            r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+        ] {
+            let value = parse_json(raw).expect("valid json");
+            assert!(
+                validate_mcp_response(&value, 1.0, "tools/call").is_err(),
+                "{raw} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_mcp_response_rejects_tools_call_content_not_array() {
+        let value =
+            parse_json(r#"{"jsonrpc":"2.0","id":1,"result":{"content":"x"}}"#).expect("valid json");
+        assert!(validate_mcp_response(&value, 1.0, "tools/call").is_err());
+    }
+
+    #[test]
+    fn validate_mcp_response_rejects_tools_call_empty_content_array() {
+        let value =
+            parse_json(r#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#).expect("valid json");
+        assert!(validate_mcp_response(&value, 1.0, "tools/call").is_err());
+    }
+
+    #[test]
+    fn validate_mcp_response_rejects_tools_call_content_item_missing_type() {
+        let value = parse_json(r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"text":"x"}]}}"#)
+            .expect("valid json");
+        assert!(validate_mcp_response(&value, 1.0, "tools/call").is_err());
+    }
+
+    #[test]
+    fn validate_mcp_response_rejects_tools_call_text_item_missing_text_field() {
+        let value =
+            parse_json(r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text"}]}}"#)
+                .expect("valid json");
+        assert!(validate_mcp_response(&value, 1.0, "tools/call").is_err());
+    }
+
+    #[test]
+    fn validate_mcp_response_accepts_non_text_content_item_without_text() {
+        // `type` が `"text"` でなければ `text` フィールドは必須ではない。
+        let value =
+            parse_json(r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"image"}]}}"#)
+                .expect("valid json");
+        assert_eq!(validate_mcp_response(&value, 1.0, "tools/call"), Ok(()));
+    }
+
+    #[test]
+    fn validate_mcp_response_rejects_tools_call_non_bool_is_error() {
+        let value = parse_json(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"isError":"true","content":[{"type":"text","text":"x"}]}}"#,
+        )
+        .expect("valid json");
+        assert!(validate_mcp_response(&value, 1.0, "tools/call").is_err());
+    }
+
+    #[test]
+    fn validate_mcp_response_accepts_tools_call_bool_is_error() {
+        let value = parse_json(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"isError":false,"content":[{"type":"text","text":"x"}]}}"#,
+        )
+        .expect("valid json");
+        assert_eq!(validate_mcp_response(&value, 1.0, "tools/call"), Ok(()));
     }
 }

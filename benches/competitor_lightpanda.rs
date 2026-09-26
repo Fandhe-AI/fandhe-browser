@@ -73,9 +73,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use support::{
-    JsonValue, Outcome, approx_tokens, bench_exit_code, expand_args, json_escape, lookup_fixture,
-    median, parse_http_request_line, parse_http_status, parse_json, reduction_pct, require_bin,
-    split_args, token_reduction_gate, validate_local_bench_url,
+    JsonValue, Outcome, approx_tokens, arg_error_gate, bench_exit_code, expand_args,
+    http_status_for_io_error, json_escape, lookup_fixture, median, parse_http_request_line,
+    parse_http_status, parse_json, reduction_pct, require_bin, split_args, token_reduction_gate,
+    validate_local_bench_url, validate_mcp_response,
 };
 // `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
 // 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
@@ -125,10 +126,25 @@ struct Target {
     bin: Option<PathBuf>,
     serve_args: Vec<String>,
     mcp_args: Vec<String>,
-    /// `serve_args` / `mcp_args` の元となった環境変数がサイズ・個数上限を
-    /// 超えていた場合の理由。`Some` のときは各計測関数が起動を試みず
-    /// 即座に `Outcome::Error` を返す（レビュー指摘 P1: line 140）。
-    args_error: Option<String>,
+    /// `serve_args` の元となった `<PREFIX>_SERVE_ARGS` がサイズ・個数上限を
+    /// 超えていた場合の理由。`Some` のときは `serve_args` を使う計測
+    /// （cold start・アイドル RSS）だけが起動を試みず即座に `Outcome::Error`
+    /// を返す。
+    ///
+    /// レビュー指摘 P2（Codex。PR #442 再々々々レビュー・
+    /// competitor_lightpanda.rs:511/554）: 以前は `serve_args`・`mcp_args`
+    /// 両方の検証エラーを 1 つの `args_error` フィールドにまとめていたため、
+    /// `MCP_ARGS` だけが上限超過でも、`MCP_ARGS` を使わない cold start・
+    /// アイドル RSS 計測まで計測前に `Outcome::Error` になっていた
+    /// （逆方向も同様）。用途ごとに独立したフィールドへ分け、各計測関数が
+    /// 自分の使う引数のエラーだけを [`support::arg_error_gate`] 経由で
+    /// 確認するようにした。
+    serve_args_error: Option<String>,
+    /// `mcp_args` の元となった `<PREFIX>_MCP_ARGS` がサイズ・個数上限を
+    /// 超えていた場合の理由。`Some` のときは `mcp_args` を使う計測
+    /// （`AISNAP-1` トークン削減率）だけが起動を試みず即座に
+    /// `Outcome::Error` を返す。
+    mcp_args_error: Option<String>,
 }
 
 /// `<PREFIX>_SERVE_ARGS` / `<PREFIX>_MCP_ARGS` を読み取り、上限検証してから
@@ -166,17 +182,15 @@ impl Target {
             .map(PathBuf::from);
         let serve_args = args_from_env(env_prefix, "SERVE_ARGS", default_serve);
         let mcp_args = args_from_env(env_prefix, "MCP_ARGS", default_mcp);
-        let args_error = serve_args
-            .as_ref()
-            .err()
-            .or(mcp_args.as_ref().err())
-            .cloned();
+        let serve_args_error = serve_args.as_ref().err().cloned();
+        let mcp_args_error = mcp_args.as_ref().err().cloned();
         Self {
             name,
             bin,
             serve_args: serve_args.unwrap_or_default(),
             mcp_args: mcp_args.unwrap_or_default(),
-            args_error,
+            serve_args_error,
+            mcp_args_error,
         }
     }
 }
@@ -279,12 +293,49 @@ fn fixture_accept_loop(listener: TcpListener, stop: Arc<AtomicBool>) {
     }
 }
 
+/// リクエスト行・ヘッダ行を 1 行読み、`read_line_bounded` が返す行が
+/// 改行で終わっていない（`Ok(0)` の完全 EOF、または `MAX_LINE_BYTES` 未満で
+/// 接続が切れた不完全な行）場合を、まとめて「行を読み切れなかった」
+/// エラーとして扱う。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々々レビュー・
+/// competitor_lightpanda.rs:352）: `read_line_bounded` はバイト単位で読み、
+/// 相手が改行を送る前に接続を閉じると、それまでに読めた分だけを
+/// `Ok(n)`（`n > 0`）で返す。呼び出し側がこれを「1 行読めた」として
+/// 扱うと、ヘッダ終端（空行）へ到達しないまま後続処理（`lookup_fixture`
+/// による 200 応答）へ進み得た。改行で終わっていない場合は
+/// `ErrorKind::UnexpectedEof` として扱い、呼び出し元が必ず接続を
+/// 400/408 で終了できるようにする。
+fn read_complete_line<R: BufRead>(reader: &mut R, out: &mut String) -> std::io::Result<()> {
+    match read_line_bounded(reader, out) {
+        Ok(0) => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed before a line was received",
+        )),
+        Ok(_) if !out.ends_with('\n') => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed before the line was terminated",
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `handle_fixture_connection` から、読み取りエラーを
+/// `support::http_status_for_io_error` で分類して応答し接続を終える
+/// ための小さなヘルパー。
+fn respond_with_io_error(stream: &mut TcpStream, err: &std::io::Error) {
+    let (status, reason) = http_status_for_io_error(err.kind());
+    let _ = write_fixture_response(stream, status, reason, PLAIN_TEXT, b"", true);
+}
+
 /// fixture サーバーへの 1 接続を処理する。
 ///
-/// リクエスト行のみを読み取り（ヘッダ・ボディは無視。fixture 配信に不要）、
+/// リクエスト行とヘッダ行を読み取り（ボディは無視。fixture 配信に不要）、
 /// [`lookup_fixture`]（`support::FIXTURE_TABLE` の完全一致検索。実行時の
 /// ファイル I/O を行わない）で本文を引き、`200`（成功）・`404`（未検出）・
-/// `400`（リクエスト行が不正）のいずれかを返す。読み書きに
+/// `405`（許可しないメソッド）・`400`（リクエスト行/ヘッダが不正・読み取り
+/// 未完了）・`408`（読み取りタイムアウト）のいずれかを返す。読み書きに
 /// `FIXTURE_IO_TIMEOUT` を設定し、低速・応答なしクライアントでスレッドが
 /// 無期限にブロックしないようにする（coding-rust.md「不安全な設計」）。
 ///
@@ -295,6 +346,13 @@ fn fixture_accept_loop(listener: TcpListener, stop: Arc<AtomicBool>) {
 /// 読み込みまでの TOCTOU でサイズ上限を超えて確保し得た。`lookup_fixture`
 /// はコンパイル時に埋め込んだ `&'static str` を返すだけでファイルシステムへ
 /// 一切触れないため、両方とも構造的に起こらない。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々々レビュー・
+/// competitor_lightpanda.rs:352）: リクエスト行・ヘッダ行の読み取りが
+/// タイムアウト・サイズ超過・接続の早期切断のいずれで失敗しても、以前は
+/// ループを抜けるだけで後続の 200 応答へ進み得た。読み取りが完了しなかった
+/// 経路はすべて [`respond_with_io_error`] で 400/408 を返してから接続を
+/// 終了する。
 fn handle_fixture_connection(mut stream: TcpStream) {
     // レビュー指摘（advisor。PR #442 再レビュー後の追加指摘）: macOS（XNU）・
     // Windows（Winsock）では accept したソケットが listener のノンブロッキング
@@ -311,17 +369,30 @@ fn handle_fixture_connection(mut stream: TcpStream) {
         Err(_) => return,
     });
     let mut line = String::new();
-    if read_line_bounded(&mut reader, &mut line).is_err() {
-        let _ = write_fixture_response(&mut stream, 400, "Bad Request", PLAIN_TEXT, b"");
+    if let Err(e) = read_complete_line(&mut reader, &mut line) {
+        respond_with_io_error(&mut stream, &e);
         return;
     }
 
     let Some((method, path)) = parse_http_request_line(&line) else {
-        let _ = write_fixture_response(&mut stream, 400, "Bad Request", PLAIN_TEXT, b"");
+        let _ = write_fixture_response(&mut stream, 400, "Bad Request", PLAIN_TEXT, b"", true);
         return;
     };
-    if method != "GET" {
-        let _ = write_fixture_response(&mut stream, 400, "Bad Request", PLAIN_TEXT, b"");
+    // レビュー指摘（コーディネーター指示。PR #442 再々々々レビュー）:
+    // GET 以外（HEAD を除く）は `405 Method Not Allowed` として拒否する。
+    // HEAD はヘッダのみを返し（本文は書かない）、`Content-Length` は
+    // GET したときと同じ値にする（HTTP のセマンティクス。実際に使うのは
+    // `goto`（GET）のみだが、fixture サーバーとしての最小限の正しさを保つ）。
+    let is_head = method == "HEAD";
+    if method != "GET" && !is_head {
+        let _ = write_fixture_response(
+            &mut stream,
+            405,
+            "Method Not Allowed",
+            PLAIN_TEXT,
+            b"",
+            true,
+        );
         return;
     }
 
@@ -333,56 +404,69 @@ fn handle_fixture_connection(mut stream: TcpStream) {
     // 無期限に専有し得た。`FIXTURE_MAX_HEADER_LINES` で総行数にも上限を
     // 設け、超過時は 400 を返して打ち切る（coding-rust.md「長さ・件数を
     // 上限検証」）。終端判定は `\r\n`（CRLF）だけでなく裸の `\n`（LF のみ）も
-    // 空行として扱う（一部クライアントは LF のみを送るため。LF のみを
-    // 見逃すと `\r\n` を待ち続けて `FIXTURE_IO_TIMEOUT` 分停止していた）。
+    // 空行として扱う（一部クライアントは LF のみを送るため）。
     let mut header_lines_seen = 0u32;
     loop {
         if header_lines_seen >= FIXTURE_MAX_HEADER_LINES {
-            let _ = write_fixture_response(&mut stream, 400, "Bad Request", PLAIN_TEXT, b"");
+            let _ = write_fixture_response(&mut stream, 400, "Bad Request", PLAIN_TEXT, b"", true);
             return;
         }
         header_lines_seen += 1;
         let mut header_line = String::new();
-        match read_line_bounded(&mut reader, &mut header_line) {
-            Ok(0) => break,
-            Ok(_) if header_line == "\r\n" || header_line == "\n" || header_line.is_empty() => {
-                break;
+        match read_complete_line(&mut reader, &mut header_line) {
+            Ok(()) if header_line == "\r\n" || header_line == "\n" => break,
+            Ok(()) => continue,
+            Err(e) => {
+                respond_with_io_error(&mut stream, &e);
+                return;
             }
-            Ok(_) => continue,
-            Err(_) => break,
         }
     }
 
     match lookup_fixture(&path) {
         Some((content_type, content)) => {
-            let _ =
-                write_fixture_response(&mut stream, 200, "OK", content_type, content.as_bytes());
+            let _ = write_fixture_response(
+                &mut stream,
+                200,
+                "OK",
+                content_type,
+                content.as_bytes(),
+                !is_head,
+            );
         }
         None => {
-            let _ = write_fixture_response(&mut stream, 404, "Not Found", PLAIN_TEXT, b"");
+            let _ = write_fixture_response(&mut stream, 404, "Not Found", PLAIN_TEXT, b"", true);
         }
     }
 }
 
-/// 400/404 応答の `Content-Type`。fixture 本体は `support::FIXTURE_TABLE`
-/// が個別に持つ content-type を使う（レビュー指摘。PR #442 再々レビュー:
-/// パス → (content-type, 内容) の固定テーブルにする）。
+/// 400/404/405/408 応答の `Content-Type`。fixture 本体は
+/// `support::FIXTURE_TABLE` が個別に持つ content-type を使う
+/// （レビュー指摘。PR #442 再々レビュー: パス → (content-type, 内容) の
+/// 固定テーブルにする）。
 const PLAIN_TEXT: &str = "text/plain; charset=utf-8";
 
 /// `handle_fixture_connection` が使う最小限の HTTP/1.1 レスポンス書き込み。
+///
+/// `write_body` が `false`（`HEAD` リクエストへの応答）でも
+/// `Content-Length` は `body.len()`（`GET` したときの実際の長さ）にする
+/// （HTTP のセマンティクス）。
 fn write_fixture_response(
     stream: &mut TcpStream,
     status: u16,
     reason: &str,
     content_type: &str,
     body: &[u8],
+    write_body: bool,
 ) -> std::io::Result<()> {
     let header = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes())?;
-    stream.write_all(body)?;
+    if write_body {
+        stream.write_all(body)?;
+    }
     stream.flush()
 }
 
@@ -508,8 +592,10 @@ fn measure_cold_start(target: &Target, trials: usize) -> Outcome {
         Ok(bin) => bin,
         Err(skipped) => return skipped,
     };
-    if let Some(reason) = &target.args_error {
-        return Outcome::Error(format!("{}: {reason}", target.name));
+    // cold start は `serve_args` だけを使うため、`mcp_args_error` は無視する
+    // （レビュー指摘 P2。Codex。PR #442 再々々々レビュー）。
+    if let Some(outcome) = arg_error_gate(target.serve_args_error.as_deref(), target.name) {
+        return outcome;
     }
     let mut samples = Vec::with_capacity(trials);
     for _ in 0..trials {
@@ -551,8 +637,10 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
         Ok(bin) => bin,
         Err(skipped) => return skipped,
     };
-    if let Some(reason) = &target.args_error {
-        return Outcome::Error(format!("{}: {reason}", target.name));
+    // アイドル RSS も `serve_args` だけを使うため、`mcp_args_error` は
+    // 無視する（レビュー指摘 P2。Codex。PR #442 再々々々レビュー）。
+    if let Some(outcome) = arg_error_gate(target.serve_args_error.as_deref(), target.name) {
+        return outcome;
     }
     let mut samples = Vec::with_capacity(trials);
     for _ in 0..trials {
@@ -819,31 +907,46 @@ impl McpClient {
             let Ok(value) = parse_json(line.trim()) else {
                 continue;
             };
-            if value.get("id").and_then(JsonValue::as_f64) == Some(id as f64) {
-                if let Some(err) = value.get("error") {
-                    let message = err
-                        .get("message")
-                        .and_then(JsonValue::as_str)
-                        .unwrap_or("unknown error");
-                    return Err(format!("{method}: rpc error: {message}"));
-                }
-                let Some(result) = value.get("result") else {
-                    // レビュー指摘 P1: line 535。`error` も `result.isError` も
-                    // 無いが `result` 自体が欠けている応答（プロトコル逸脱・
-                    // 実質失敗）を、id 一致のみで成功扱いにしていた。
-                    // `result` 欠如は不正な応答として `Err` にし、
-                    // 呼び出し元 `measure_token_reduction` の
-                    // 失敗サイト集計（`failed` への記録）へ回す。
-                    return Err(format!("{method}: response missing result field"));
-                };
-                let is_error = result
-                    .get("isError")
-                    .is_some_and(|v| matches!(v, JsonValue::Bool(true)));
-                if is_error {
-                    return Err(format!("{method}: tool call reported isError"));
-                }
-                return Ok(value);
+            // id が一致しない応答（他の呼び出しの応答等）は読み捨てて
+            // 次の行を待つ。
+            if value.get("id").and_then(JsonValue::as_f64) != Some(id as f64) {
+                continue;
             }
+            // レビュー指摘 P1（Codex。PR #442 再々々々レビュー・
+            // competitor_lightpanda.rs:839）: `result` が `null`・`{}` でも
+            // `isError` さえ立っていなければ成功として扱っていたため、
+            // `goto` のように本文を確認しない呼び出しでは、ページ遷移に
+            // 失敗した応答をそのまま成功と誤判定し得た（続く `html`・
+            // `tree` が別ページの結果として計測される）。JSON-RPC 2.0 の
+            // 封筒（`jsonrpc`・`id`・`error`/`result` の排他）と、
+            // `method` ごとに要求される `result` の最小限の形
+            // （`tools/call` は空でない `content` 配列・各要素の `type`・
+            // `isError` の型など）を `validate_mcp_response`（support.rs。
+            // 純粋関数）で検証してから、`error`/`isError` の実際の失敗判定へ
+            // 進む。
+            if let Err(reason) = validate_mcp_response(&value, id as f64, method) {
+                return Err(format!("{method}: invalid response: {reason}"));
+            }
+            if let Some(err) = value.get("error") {
+                let message = err
+                    .get("message")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("unknown error");
+                return Err(format!("{method}: rpc error: {message}"));
+            }
+            // `validate_mcp_response` が「`error`/`result` のどちらか一方が
+            // 存在する」ことを確認済みであり、上で `error` 分岐を処理した
+            // ため、ここに到達する時点で `result` は必ず存在する。
+            let Some(result) = value.get("result") else {
+                return Err(format!("{method}: response missing result field"));
+            };
+            let is_error = result
+                .get("isError")
+                .is_some_and(|v| matches!(v, JsonValue::Bool(true)));
+            if is_error {
+                return Err(format!("{method}: tool call reported isError"));
+            }
+            return Ok(value);
         }
     }
 
@@ -897,11 +1000,21 @@ fn extract_text(value: &JsonValue) -> Option<String> {
 /// （`main`）が起動した [`FixtureServer`] のもの（モジュールドキュメント
 /// 参照。PR #442 再レビューで外部 URL の指定経路を廃止した）。
 fn measure_token_reduction(target: &Target, fixture_base_url: &str, fixture_port: u16) -> Outcome {
-    let Some(bin) = &target.bin else {
-        return Outcome::Skipped(format!("{}: binary path not configured", target.name));
+    // `require_bin`（support.rs）で他の計測関数と同じ判定に揃える
+    // （レビュー指摘。コーディネーター指示。PR #442 再々々々レビュー:
+    // 「cfg で分かれている計測関数に同じ食い違いがないか確認する」の
+    // 一環で洗い出した、`require_bin` に未集約だった最後の 1 箇所）。
+    // `main` 側の `token_reduction_gate` が既に同じ判定を行った後で
+    // しかこの関数を呼ばないため実質到達しないが、単独呼び出しでも
+    // 安全なようにここでも確認する。
+    let bin = match require_bin(target.bin.as_ref(), target.name) {
+        Ok(bin) => bin,
+        Err(skipped) => return skipped,
     };
-    if let Some(reason) = &target.args_error {
-        return Outcome::Error(format!("{}: {reason}", target.name));
+    // `AISNAP-1` は `mcp_args` だけを使うため、`serve_args_error` は無視する
+    // （レビュー指摘 P2。Codex。PR #442 再々々々レビュー）。
+    if let Some(outcome) = arg_error_gate(target.mcp_args_error.as_deref(), target.name) {
+        return outcome;
     }
     let sites: Vec<String> = support::FIXTURE_TABLE
         .iter()
