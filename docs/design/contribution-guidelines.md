@@ -33,21 +33,21 @@
 1. **現状の明示**: スタブ／簡易実装／スコープ外のいずれであるか
 2. **目指す挙動（将来仕様）の要約**: spec 本文の丸ごと引用ではなく、必要な範囲の要約に留める
 3. **対応するビヘイビア ID**（`<PREFIX>-<N>`。spec-reference.md の表記に従いバッククォート付きで書く）
-4. **実装予定の TASK-n**（分かれば Issue 番号も併記）
+4. **実装予定の TASK-n・対応する MS-n**（spec-reference.md が要求する併記。分かれば Issue 番号も併記）
 5. **簡易実装の場合は現在の制限**: 何が未対応か、どんな入力・条件で挙動が変わるか
 6. **呼び出し元に返す挙動**: エラー variant や既定値など、呼び出し側が依存してよい契約
 
 ## 書式と配置
 
 - **crate 単位の未実装**は crate 直下（`lib.rs`）の `//!` に `# スタブについて` の見出しを立て、
-  未実装項目を「項目（ビヘイビア ID、TASK-n）」の箇条書きで並べる
+  未実装項目を「項目（ビヘイビア ID、TASK-n、MS-n）」の箇条書きで並べる
 - **モジュール単位の未実装**は crate 直下にまとめず、当該モジュールファイルの入口（`//!`）に同じ
   `# スタブについて` の見出しを立てて記載する（`code-comment-style.md` が求める「モジュールの入口」
   から文脈が読めることを優先する。crate 直下と当該モジュールの双方に記載範囲が重なる場合は、
   crate 直下では対象モジュール名を挙げるに留め、詳細は当該モジュールの `//!` 側に置く）
 - **Issue スコープ外として意図的に見送った箇所**は `## 本 Issue（#N）の範囲外（将来仕様。REPAIR-3: 実装済みを装わない）`
   の見出しを立て、同様に箇条書きで示す
-- **関数・型単位**の未実装・簡易実装は `///` に「スタブ」「簡易実装」と明記し、置換先の TASK-n を書く
+- **関数・型単位**の未実装・簡易実装は `///` に「スタブ」「簡易実装」と明記し、置換先の TASK-n・MS-n を書く
 - 見出し語（「スタブについて」「将来仕様」「REPAIR-3」）は固定して使う。既存コードへの適用漏れを
   横断的に洗い出す作業（TASK-3.2）で `grep` できるようにするため
 - ID 表記は [spec-reference.md](../../.claude/rules/spec-reference.md) に従う（バッククォート付き `CORE-1`、`TASK-n`、`MS-n`）
@@ -63,8 +63,8 @@
 //! 以下はいずれも未実装。実装済みを装う公開 API・ダミー実装は置かない
 //! （`code-comment-style.md`・REPAIR-3）。
 //!
-//! - プロファイル削除処理（`PROF-5`、`TASK-53`）
-//! - クロスプラットフォーム advisory lock（`PROF-1`、`TASK-54`）
+//! - プロファイル削除処理（`PROF-5`、`TASK-53`、`MS-3`）
+//! - クロスプラットフォーム advisory lock（`PROF-1`、`TASK-54`、`MS-3`）
 ```
 
 ### 例 2: 常にエラーを返すスタブ関数（`#[non_exhaustive]` の戻り値型）
@@ -92,7 +92,7 @@ pub fn execute_js_stub(script: &str) -> crate::Result<JsExecutionOutput> {
     let _ = script;
     Err(crate::Error::JsExecutionUnavailable {
         message: "JS execution is not implemented yet \
-                   (js_stub boundary; replaced by fandhe-browser-js per JS-2/`TASK-30`)"
+                   (js_stub boundary; replaced by fandhe-browser-js per JS-2/TASK-30)"
             .to_string(),
     })
 }
