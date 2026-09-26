@@ -219,6 +219,17 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test をスキップ"
 endif
 
+# harness/render-screenshot（TASK-37.1・RENDER-5）は Rust workspace に属さない
+# Python 標準ライブラリのみのスクリプトのため、Cargo.toml の有無に関係なく実行できる。
+# `make ci` への組み込みは行わない（スコープ外。PR 本文に後続候補として記載）。
+.PHONY: test-harness
+test-harness: ## harness/render-screenshot のユニットテスト・結合テストを実行する（Python 標準ライブラリのみ）
+	@if ! command -v python3 >/dev/null 2>&1; then \
+		echo "error: python3 が見つかりません。https://www.python.org/ を参照して導入してください" >&2; \
+		exit 1; \
+	fi
+	python3 -B -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
+
 # `rendering` feature（Servo。RENDER-1）は fandhe-browser-render crate 追加まで
 # workspace に存在しない。`cargo metadata` の feature 一覧に無い間は誤ってビルド
 # エラーとして落とさず skip する（cargo 未導入 / Cargo.toml 未追加の HAS_CARGO 判定と
