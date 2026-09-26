@@ -39,3 +39,20 @@ rustls = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+# TASK-84.1（Issue #211・ビヘイビア PERF-1・PERF-3・PERF-6・AISNAP-1）:
+# Lightpanda 比較ベンチスクリプトのホスト先。ルート Cargo.toml は仮想 manifest
+# （`members = ["crates/*"]`）でありベンチを直接ホストできず、`fandhe-browser-cli`
+# （TASK-41.5・Issue #174）は未作成のため、現時点で実ビルドを持つ唯一の member
+# である本 crate を暫定ホストとする（TASK-27 が計測する CORE-2/3/4 の所有者でも
+# ある）。`path` は workspace ルート直下の `benches/` を指す相対パスで、依存の
+# 追加ではない（新規外部依存なし。dependency-policy.md の対象外）。
+# `fandhe-browser-cli` 追加後はそちらへ移設すること。
+[[bench]]
+name = "competitor_lightpanda"
+path = "../../benches/competitor_lightpanda.rs"
+harness = false
+
+[[test]]
+name = "competitor_lightpanda_support"
+path = "../../benches/competitor_lightpanda/support.rs"
