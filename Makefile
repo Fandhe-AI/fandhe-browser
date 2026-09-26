@@ -42,6 +42,13 @@ COMMITLINT_CONFIG_VERSION := 21.2.0
 LEFTHOOK_VERSION := 2.1.10
 CARGO_DENY_VERSION := 0.20.2
 
+# check-deny-license-reject（TASK-9.1・REPAIR-8）が生成する canary crate の
+# ライセンス識別子（SPDX。空白を含まないもののみ）。GPL/AGPL/LGPL の代表と、
+# Servo を fandhe-browser-render に隔離する方針（RENDER-1・licensing.md）を
+# 裏付けるため MPL-2.0 も加える。陽性対照（MIT OR Apache-2.0）は空白を含むため
+# ここには入れず、レシピ内に直書きする。
+DENY_LICENSE_REJECT_CASES := GPL-3.0-only AGPL-3.0-only LGPL-2.1-only MPL-2.0
+
 .PHONY: help
 help: ## ターゲット一覧を表示する
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
@@ -364,13 +371,113 @@ else
 	@echo "skip: Cargo.toml・deny.toml のいずれか未追加、または workspace にメンバー crate が無いため deny をスキップ"
 endif
 
+# 受入基準 2（許可外ライセンスが混入したら fail することをログで示す。TASK-9.1・
+# REPAIR-8・OSS-3・RENDER-1）の negative test。deny.toml の [licenses] allow は
+# 実依存グラフの現状に依存するため、`deny` ターゲット（実 workspace の依存監査）
+# だけでは「許可外ライセンスを実際に reject できるか」を継続的に検証できない
+# （allow が広がりすぎて骨抜きになっても実依存グラフにたまたま該当ライセンスが
+# 無ければ検出できない）。本ターゲットは、依存ゼロの canary crate を
+# `mktemp -d`（リポジトリ外）に都度生成し、本リポの deny.toml をそのまま当てて
+# `cargo deny check licenses` を実行することで、fail-closed 性そのものを検証する。
+#
+# - `--config` はグローバルオプションのため `check` より前に置く（`check --config`
+#   の順だと `unexpected argument '--config'` で失敗する。実機検証済み）
+# - canary は依存ゼロなので `cargo generate-lockfile --offline` 後
+#   `--locked --offline` で実行でき、ネットワークも advisory DB も使わない
+# - canary の `Cargo.toml` には `publish` を書かない。脅威モデルは「サードパーティ
+#   crate の混入」であり、公開可能な crate と同じ扱いで監査対象に含める必要がある
+#   （`[licenses.private] ignore = true` 相当の設定が将来入っても検証が骨抜きに
+#   ならないようにするため）
+# - MPL-2.0 を negative ケースに含めるのは、Servo を fandhe-browser-render に
+#   隔離する方針（RENDER-1・licensing.md）を裏付けるため
+# - 陽性対照（`MIT OR Apache-2.0`）を先に走らせ、deny.toml の破損や cargo-deny の
+#   実行環境の問題を「reject された」と取り違えないようにする（fail-closed の
+#   自己検証）
+# - `warning[license-not-encountered]`（allow にあるが canary では使われていない
+#   識別子）は正常なノイズ。判定は `error` の部分一致ではなく、行全体で
+#   `error[rejected]` または `error[unlicensed]` を含むかで行う
+# - cargo-deny の出力は抑止せず、`error[` 周辺を標準出力へ残す。これが受入基準 2
+#   （CI ログでの証跡）になる
+# - cargo-deny を別バージョンへ上げると診断文字列（`error[rejected]` /
+#   `error[unlicensed]`）が変わる可能性がある。上げる際は本ターゲットも
+#   合わせて確認すること（`CARGO_DENY_VERSION` を単一の版管理箇所とする）
+# - `run_case` 内の `cargo deny` 呼び出しは `if out=$(...); then code=0; else
+#   code=$?; fi` の形にし、`out=$(cmd); code=$?` の素の代入にはしない。
+#   `errexit` が有効なシェル（`.SHELLFLAGS` が `-ec` の環境・親シェルの
+#   `SHELLOPTS` を継承する環境等）では代入コマンド自体の失敗でシェルが
+#   即終了し、reject 期待ケース（非 0 終了）で後続の診断アサーションへ
+#   到達できなくなるおそれがある。`if` の条件式に置くことで、どちらの
+#   シェル設定でも exit code を確実に読み取れるようにする
+.PHONY: check-deny-license-reject
+check-deny-license-reject: ## cargo deny が許可外ライセンスを reject することを canary で検証する（受入基準2の証跡）
+ifneq ($(HAS_DENY),)
+	@export PATH="$$HOME/.cargo/bin:$$PATH"; \
+	command -v cargo-deny >/dev/null 2>&1 || { \
+		echo "cargo-deny を導入します"; \
+		cargo install cargo-deny@$(CARGO_DENY_VERSION) --locked; \
+	}; \
+	tmp=$$(mktemp -d) || { echo "NG: mktemp -d に失敗しました" >&2; exit 1; }; \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	deny_cfg="$$(pwd)/deny.toml"; \
+	make_canary() { \
+		dir="$$tmp/$$1"; \
+		mkdir -p "$$dir/src"; \
+		{ \
+			echo '[package]'; \
+			echo 'name = "deny-license-canary"'; \
+			echo 'version = "0.0.0"'; \
+			echo 'edition = "2024"'; \
+			if [ -n "$$2" ]; then echo "license = \"$$2\""; fi; \
+			echo ''; \
+			echo '[workspace]'; \
+		} > "$$dir/Cargo.toml"; \
+		touch "$$dir/src/lib.rs"; \
+		cargo generate-lockfile --offline --manifest-path "$$dir/Cargo.toml" >/dev/null 2>&1 || { \
+			echo "NG: canary（$$1）の Cargo.lock 生成に失敗しました" >&2; \
+			exit 1; \
+		}; \
+	}; \
+	run_case() { \
+		label="$$1"; expect_diag="$$2"; manifest="$$3"; \
+		if out=$$(cargo deny --manifest-path "$$manifest" --config "$$deny_cfg" --locked --offline check licenses 2>&1); then \
+			code=0; \
+		else \
+			code=$$?; \
+		fi; \
+		printf '%s\n' "$$out" | grep -F -A6 'error[' || true; \
+		if [ -z "$$expect_diag" ]; then \
+			if [ "$$code" -ne 0 ]; then \
+				echo "NG: 陽性対照（$$label）が失敗しました（exit=$$code）。deny.toml の構文エラーや実行環境の問題の可能性があります" >&2; \
+				exit 1; \
+			fi; \
+			echo "OK: $$label ok (exit=$$code)"; \
+		else \
+			if [ "$$code" -eq 0 ] || ! printf '%s\n' "$$out" | grep -qF "$$expect_diag"; then \
+				echo "NG: $$label が reject されませんでした（exit=$$code。期待した診断 $$expect_diag が出ていません）" >&2; \
+				exit 1; \
+			fi; \
+			echo "OK: $$label rejected (exit=$$code)"; \
+		fi; \
+	}; \
+	make_canary positive "MIT OR Apache-2.0"; \
+	run_case "MIT OR Apache-2.0" "" "$$tmp/positive/Cargo.toml"; \
+	for lic in $(DENY_LICENSE_REJECT_CASES); do \
+		make_canary "case-$$lic" "$$lic"; \
+		run_case "$$lic" "error[rejected]" "$$tmp/case-$$lic/Cargo.toml"; \
+	done; \
+	make_canary unlicensed ""; \
+	run_case "unlicensed（license 欄なし）" "error[unlicensed]" "$$tmp/unlicensed/Cargo.toml"
+else
+	@echo "skip: deny.toml 未追加のため check-deny-license-reject をスキップ"
+endif
+
 # `rendering` feature（Servo）を含めた検証（ci.md「既定ビルドと --features rendering
 # の両方で検証」）も make ci に含める。lint-rendering / test-rendering は
 # `rendering` feature 未定義の段階では skip メッセージを出して 0 終了するため、
 # workspace 作成前・render crate 追加前の CI を壊さない。docker-ci は make ci を
 # 呼ぶため自動的にこの検証を含む。
 .PHONY: ci
-ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-publish-private test test-rendering deny check-compat-regression ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-publish-private test test-rendering deny check-deny-license-reject check-compat-regression ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 対象サイト群の動作率回帰チェック（TASK-9.2・REPAIR-8。harness/compat-regression/README.md 参照）

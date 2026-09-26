@@ -10,7 +10,12 @@ name: CI
 # ubuntu-latest 単独実行。clippy -D warnings ゲート（fail-closed）の明文化は
 # TASK-5.2（#32・REPAIR-6）を参照。TASK-7（#335・REPAIR-6）が求める
 # 「clippy 警告 0 件の維持確認」も、下記 rust-ci・rust-ci-default-features の
-# 同ゲートで担保する（新規ジョブ追加ではなく既存ゲートの明文化）
+# 同ゲートで担保する（新規ジョブ追加ではなく既存ゲートの明文化）。
+# TASK-9.1（#338・REPAIR-8）: 下記 deny-license-reject ジョブを追加した。
+# 受入基準 1（cargo deny check licenses を CI で実行する）は TASK-77（#64）の
+# 時点で rust-ci（deny-checks: ... licenses ...）が満たしており、
+# deny-license-reject はその fail-closed 性（許可外ライセンス混入時に確実に
+# reject するか）を negative test で継続的に検証する
 on:
   workflow_dispatch:
   pull_request:
@@ -247,3 +252,41 @@ jobs:
             --categories static,spa,form \
             --all-categories \
             --allow-missing
+
+  # --------------------------------------------------
+  # deny-license-reject（cargo-deny の許可外ライセンス reject negative test）
+  # --------------------------------------------------
+  # TASK-9.1（#338・REPAIR-8）: 受入基準 2（許可外ライセンスが混入したら fail
+  # することをログで示す）の証跡ジョブ。受入基準 1 の本体（実依存グラフに対する
+  # `cargo deny check licenses` の実行）は上記 rust-ci ジョブ（TASK-77・#64・
+  # `deny-checks: advisories bans licenses sources`）が 3 OS で担っており、
+  # 本ジョブは重ねて追加しない。ここでは `make check-deny-license-reject`
+  # （依存ゼロの canary crate へ本リポの deny.toml を当てる negative test。
+  # Makefile 側のコメント参照）を実行し、GPL/AGPL/LGPL/MPL-2.0・ライセンス欄なし
+  # の canary がいずれも `error[rejected]`/`error[unlicensed]` で reject され、
+  # 陽性対照（`MIT OR Apache-2.0`）は通ることをログに残す（fail-closed 性の
+  # 継続的な証跡）。
+  #
+  # ubuntu-latest 単独にする理由: このジョブが検証するのは deny.toml の
+  # ライセンス評価という設定意味論であり、OS 差異に依存しない
+  # （実依存グラフに対する `cargo deny check` 本体はすでに rust-ci の 3 OS
+  # matrix で走っている。lint-docs も同様の理由で ubuntu-latest 単独）。
+  # 「特定 OS のみ skip して CI を通す」（ci.md）には当たらない。
+  #
+  # cargo-deny の導入は `make check-deny-license-reject`（Makefile の
+  # `CARGO_DENY_VERSION` を単一の版管理箇所とする）に委ねるため、本ジョブでは
+  # 新たに `cargo-deny` 専用の action は追加しない。
+  deny-license-reject:
+    runs-on: ubuntu-latest
+    # ハングしたジョブの無期限実行を防ぐ多層防御（NFR-10・.claude/rules/ci.md）
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      # stable（rust-toolchain.toml の channel = "stable" を単一真実源として追従）
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - name: make check-deny-license-reject
+        run: make check-deny-license-reject
