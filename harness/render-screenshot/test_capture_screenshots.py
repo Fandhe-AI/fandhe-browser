@@ -114,6 +114,26 @@ class LoadSitesTest(unittest.TestCase):
             with self.assertRaises(cs.SiteListError):
                 cs.load_sites(path, min_sites=5)
 
+    def test_rejects_file_scheme_url_even_with_allow_file_url_false(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sites.json"
+            sites = [make_site(f"ok-{i}") for i in range(5)]
+            sites[0]["url"] = "file:///tmp/fixture.html"
+            write_sites_json(path, sites)
+            with self.assertRaises(cs.SiteListError):
+                cs.load_sites(path, min_sites=5, allow_file_url=False)
+
+    def test_accepts_file_scheme_url_when_allow_file_url_true(self) -> None:
+        # codex P2: `--allow-file-url` を指定しても `load_sites` が https 限定の
+        # ままだと、README が案内するテスト用フラグが常に拒否されて機能しなかった。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sites.json"
+            sites = [make_site(f"ok-{i}") for i in range(5)]
+            sites[0]["url"] = "file:///tmp/fixture.html"
+            write_sites_json(path, sites)
+            _viewport, loaded_sites = cs.load_sites(path, min_sites=5, allow_file_url=True)
+            self.assertEqual(loaded_sites[0].url, "file:///tmp/fixture.html")
+
     def test_rejects_out_of_range_viewport(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "sites.json"
@@ -175,6 +195,51 @@ class ReadPngSizeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "short.png"
             path.write_bytes(cs.PNG_SIGNATURE)
+            with self.assertRaises(cs.PngError):
+                cs.read_png_size(path)
+
+    def test_rejects_file_truncated_mid_idat(self) -> None:
+        # エンジンが途中終了して IEND を書き切れなかったケース（codex P1）。
+        # 先頭 33 バイト（シグネチャ + IHDR）は正しいままなので、旧実装では
+        # 寸法一致だけを見て "ok" と誤判定してしまっていた。
+        sys.path.insert(0, str(FIXTURES_DIR))
+        import fake_engine  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as tmp:
+            full_path = Path(tmp) / "full.png"
+            fake_engine.write_minimal_png(full_path, 37, 41)
+            full_bytes = full_path.read_bytes()
+            path = Path(tmp) / "truncated.png"
+            path.write_bytes(full_bytes[: len(full_bytes) - 20])
+            with self.assertRaises(cs.PngError):
+                cs.read_png_size(path)
+
+    def test_rejects_corrupted_idat_crc(self) -> None:
+        # IHDR は無傷のまま IDAT チャンクのデータだけが壊れた（画像本体が
+        # 破損した）ケース。寸法検証だけでは検出できない（codex P1）。
+        sys.path.insert(0, str(FIXTURES_DIR))
+        import fake_engine  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "corrupt.png"
+            fake_engine.write_minimal_png(path, 37, 41)
+            data = bytearray(path.read_bytes())
+            # IDAT チャンクのデータ先頭 1 バイトを反転させ、CRC と不整合にする。
+            idat_data_start = len(cs.PNG_SIGNATURE) + 8 + 13 + 4 + 8
+            data[idat_data_start] ^= 0xFF
+            path.write_bytes(bytes(data))
+            with self.assertRaises(cs.PngError):
+                cs.read_png_size(path)
+
+    def test_rejects_trailing_garbage_after_iend(self) -> None:
+        sys.path.insert(0, str(FIXTURES_DIR))
+        import fake_engine  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trailing.png"
+            fake_engine.write_minimal_png(path, 37, 41)
+            with path.open("ab") as fh:
+                fh.write(b"trailing-garbage")
             with self.assertRaises(cs.PngError):
                 cs.read_png_size(path)
 
@@ -338,6 +403,22 @@ class InjectBaseHrefTest(unittest.TestCase):
         result = cs.inject_base_href(b"<head></head>", 'https://example.invalid/"x')
         self.assertIn(b"&quot;", result)
         self.assertNotIn(b'href="https://example.invalid/"x"', result)
+
+    def test_does_not_mistake_header_tag_for_head_tag(self) -> None:
+        # codex/Bugbot P2: 素朴な `<head[^>]*>` は `<header>` にも一致し、`<head>`
+        # を持たず `<header>` を含む HTML では本文中の誤位置へ `<base>` が
+        # 挿入されていた。`<head>` が無いので先頭へ挿入されるのが正しい挙動。
+        html_bytes = b"<html><body><header>nav</header><p>body</p></body></html>"
+        result = cs.inject_base_href(html_bytes, "https://example.invalid/a")
+        self.assertTrue(result.startswith(b'<base href="https://example.invalid/a">'))
+        self.assertEqual(result, b'<base href="https://example.invalid/a">' + html_bytes)
+
+    def test_inserts_after_head_tag_not_header_when_both_present(self) -> None:
+        html_bytes = b"<html><head><title>t</title></head><body><header>nav</header></body></html>"
+        result = cs.inject_base_href(html_bytes, "https://example.invalid/a")
+        self.assertTrue(
+            result.startswith(b'<html><head><base href="https://example.invalid/a">')
+        )
 
 
 class CaptureIntegrationTest(unittest.TestCase):
@@ -648,22 +729,27 @@ class CaptureIntegrationTest(unittest.TestCase):
             self.assertIn("does not match", record["stderr_tail"])
 
     def test_missing_engine_binary_is_reported_as_failed_not_a_crash(self) -> None:
+        # テンプレートが `{url}` を直接使うため、直接ナビゲーション向けの SSRF
+        # チェック（`_check_public_host`）が挟まる。実 DNS 解決に依存しない
+        # よう `_check_public_host` をモックする（他の FetchSnapshotTest 系
+        # テストと同じ方針）。
         with tempfile.TemporaryDirectory() as tmp:
             site = cs.Site(site_id="no-bin", url="https://example.invalid", category="static", catalog_id="z1")
-            record = cs.capture_one(
-                site,
-                "servo",
-                ["/nonexistent/definitely-not-a-real-binary", "{url}"],
-                out_dir=Path(tmp),
-                snapshots_dir=Path(tmp) / "snapshots",
-                chromium_bin=None,
-                width=1280,
-                height=800,
-                settle_ms=1000,
-                timeout_sec=5,
-                allow_file_url=False,
-                dry_run=False,
-            )
+            with mock.patch.object(cs, "_check_public_host"):
+                record = cs.capture_one(
+                    site,
+                    "servo",
+                    ["/nonexistent/definitely-not-a-real-binary", "{url}"],
+                    out_dir=Path(tmp),
+                    snapshots_dir=Path(tmp) / "snapshots",
+                    chromium_bin=None,
+                    width=1280,
+                    height=800,
+                    settle_ms=1000,
+                    timeout_sec=5,
+                    allow_file_url=False,
+                    dry_run=False,
+                )
             self.assertEqual(record["status"], "failed")
             self.assertIsNone(record["exit_code"])
 
@@ -720,6 +806,80 @@ class CaptureIntegrationTest(unittest.TestCase):
                 ]
             )
             self.assertEqual(code, 2)
+
+    def test_direct_url_navigation_to_loopback_is_rejected(self) -> None:
+        # codex P0: `{html_path}` を経由しない直接ナビゲーション（既定 Chromium
+        # テンプレート等、`{url}` をそのままエンジンへ渡すテンプレート）には
+        # SSRF 検証（`_check_public_host`）が掛かっていなかった。`--sites` に
+        # 内部アドレスの https URL を指定すると迂回できていた問題の再現・修正確認。
+        with tempfile.TemporaryDirectory() as tmp:
+            site = cs.Site(
+                site_id="ssrf-loopback", url="https://127.0.0.1/secret", category="static", catalog_id="z1"
+            )
+            record = cs.capture_one(
+                site,
+                "chromium",
+                [sys.executable, str(FAKE_ENGINE), "--out", "{out}", "--url", "{url}"],
+                out_dir=Path(tmp),
+                snapshots_dir=Path(tmp) / "snapshots",
+                chromium_bin=None,
+                width=1280,
+                height=800,
+                settle_ms=1000,
+                timeout_sec=5,
+                allow_file_url=False,
+                dry_run=False,
+            )
+            self.assertEqual(record["status"], "skipped")
+            self.assertFalse((Path(tmp) / "chromium" / "ssrf-loopback.png").exists())
+
+    def test_direct_url_navigation_to_link_local_metadata_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            site = cs.Site(
+                site_id="ssrf-metadata",
+                url="https://169.254.169.254/latest/meta-data/",
+                category="static",
+                catalog_id="z1",
+            )
+            record = cs.capture_one(
+                site,
+                "chromium",
+                [sys.executable, str(FAKE_ENGINE), "--out", "{out}", "--url", "{url}"],
+                out_dir=Path(tmp),
+                snapshots_dir=Path(tmp) / "snapshots",
+                chromium_bin=None,
+                width=1280,
+                height=800,
+                settle_ms=1000,
+                timeout_sec=5,
+                allow_file_url=False,
+                dry_run=False,
+            )
+            self.assertEqual(record["status"], "skipped")
+
+    def test_direct_url_navigation_to_public_host_still_captures(self) -> None:
+        # 直接ナビゲーションの SSRF チェックが公開ホストの正常系まで壊していない
+        # ことを確認する（実 DNS 解決は `_check_public_host` をモックして避ける）。
+        with tempfile.TemporaryDirectory() as tmp:
+            site = cs.Site(
+                site_id="ssrf-public-ok", url="https://example.invalid/a", category="static", catalog_id="z1"
+            )
+            with mock.patch.object(cs, "_check_public_host"):
+                record = cs.capture_one(
+                    site,
+                    "chromium",
+                    [sys.executable, str(FAKE_ENGINE), "--out", "{out}", "--url", "{url}"],
+                    out_dir=Path(tmp),
+                    snapshots_dir=Path(tmp) / "snapshots",
+                    chromium_bin=None,
+                    width=1280,
+                    height=800,
+                    settle_ms=1000,
+                    timeout_sec=5,
+                    allow_file_url=False,
+                    dry_run=False,
+                )
+            self.assertEqual(record["status"], "ok")
 
     def test_output_path_for_valid_site_id_stays_under_out_dir(self) -> None:
         # site_id は load_sites の正規表現で `../` 等を既に拒否しているが（上記

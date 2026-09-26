@@ -48,6 +48,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mode", choices=["ok", "fail", "sleep", "garbage"], default="ok")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=800)
+    # 実エンジン（Chromium 等）の `{url}` 直接ナビゲーションテンプレートを模した
+    # テスト（直接ナビゲーション向け SSRF チェックの検証）から渡されることが
+    # あるが、この偽エンジンは実際には何も取得しないため値は使わず無視する。
+    parser.add_argument("--url", default=None)
     args = parser.parse_args(argv)
 
     if args.mode == "fail":

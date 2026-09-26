@@ -39,6 +39,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -122,12 +123,19 @@ class Site:
 # --- サイト一覧の読み込み・検証 -----------------------------------------
 
 
-def load_sites(path: Path, min_sites: int) -> tuple[dict[str, Any], list[Site]]:
+def load_sites(
+    path: Path, min_sites: int, *, allow_file_url: bool = False
+) -> tuple[dict[str, Any], list[Site]]:
     """サイト一覧 JSON を読み込み、検証済みの `Site` 一覧を返す。
 
     cdp や render 側の実撮影コマンドではなく、このスクリプト自身が入力として読む
     唯一の外部データ（サイト URL 一覧）であり、fetch 先を本リポ管理のこのファイルに
     限定することで SSRF（任意 URL への到達）を防ぐ（security.md OWASP A10）。
+    `allow_file_url` は `--allow-file-url`（テスト用途）から渡され、`file:` の
+    サイト URL を許可する（`capture_one` 側で `{html_path}` テンプレート・
+    `fetch_snapshot` に既にある同名オプションと揃える。P2: これが無いと
+    `--allow-file-url` を指定してもサイト一覧の https 限定検証で常に弾かれ、
+    README が案内するテスト用フラグが機能しなかった）。
     """
     try:
         raw_text = path.read_text(encoding="utf-8")
@@ -182,7 +190,9 @@ def load_sites(path: Path, min_sites: int) -> tuple[dict[str, Any], list[Site]]:
         if not isinstance(url, str) or not url:
             raise SiteListError(f"sites[{index}].url is missing or empty")
         parsed = urlparse(url)
-        if parsed.scheme != "https":
+        if parsed.scheme == "file" and allow_file_url:
+            pass
+        elif parsed.scheme != "https":
             raise SiteListError(f"sites[{index}].url must use https: {url}")
         if not isinstance(category, str) or not category:
             raise SiteListError(f"sites[{index}].category is missing or empty")
@@ -356,7 +366,11 @@ def fetch_snapshot(
     dest_path.write_bytes(inject_base_href(data, url))
 
 
-HEAD_TAG_RE = re.compile(rb"<head[^>]*>", re.IGNORECASE)
+# `(?![a-zA-Z0-9_-])` は `<head>` 直後がタグ名を構成する文字でないことを要求し、
+# `<header>` のような別要素まで拾わないようにする（codex/Bugbot P2: 素朴な
+# `<head[^>]*>` は `<header>` にも一致し、`<head>` を持たず `<header>` を含む
+# HTML で `<base>` の挿入位置がずれていた）。
+HEAD_TAG_RE = re.compile(rb"<head(?![a-zA-Z0-9_-])[^>]*>", re.IGNORECASE)
 
 
 def inject_base_href(html_bytes: bytes, url: str) -> bytes:
@@ -384,29 +398,64 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def read_png_size(path: Path) -> tuple[int, int]:
-    """PNG のシグネチャと IHDR チャンクだけを読み、(width, height) を返す。
+    """PNG のシグネチャ・チャンク構造を検証し、IHDR の (width, height) を返す。
 
-    撮影プロセスの標準的な出力を軽く検証する目的であり、先頭 33 バイトだけを
-    読む（画像全体のデコードは行わない。全体の内容比較は #54 の measure_ssim.py が担う）。
+    撮影プロセスがクラッシュ・途中終了して壊れた PNG を残した場合でも、寸法だけが
+    偶然一致すれば `capture_one` が "ok" と誤判定してしまう（codex P1）。そこで
+    先頭 33 バイトの IHDR だけでなく、シグネチャ直後から全チャンクを順に走査し、
+    各チャンクの CRC32（`zlib.crc32`）を検証しつつ末尾が `IEND` チャンクで
+    ちょうど終わっている（トレイリングの欠落・余剰データが無い）ことまで確認する。
+    IDAT のピクセルデータそのものの deflate 展開・画素比較までは行わない
+    （全体の内容比較は #54 の measure_ssim.py が担う。REPAIR-3）。
     """
     try:
-        with path.open("rb") as fh:
-            header = fh.read(33)
+        data = path.read_bytes()
     except OSError as exc:
         raise PngError(f"failed to read PNG file: {path}: {exc}") from exc
 
-    if len(header) < 24:
-        raise PngError(f"file too short to be a valid PNG: {path}")
-    if header[0:8] != PNG_SIGNATURE:
+    if len(data) < len(PNG_SIGNATURE) or data[: len(PNG_SIGNATURE)] != PNG_SIGNATURE:
         raise PngError(f"invalid PNG signature: {path}")
-    chunk_type = header[12:16]
-    if chunk_type != b"IHDR":
+
+    width: int | None = None
+    height: int | None = None
+    offset = len(PNG_SIGNATURE)
+    seen_iend = False
+    while offset < len(data):
+        if offset + 8 > len(data):
+            raise PngError(f"truncated PNG chunk header: {path}")
+        (chunk_length,) = struct.unpack(">I", data[offset : offset + 4])
+        chunk_type = data[offset + 4 : offset + 8]
+        data_start = offset + 8
+        data_end = data_start + chunk_length
+        crc_end = data_end + 4
+        if crc_end > len(data):
+            raise PngError(f"truncated PNG chunk {chunk_type!r}: {path}")
+        chunk_data = data[data_start:data_end]
+        (stored_crc,) = struct.unpack(">I", data[data_end:crc_end])
+        computed_crc = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
+        if stored_crc != computed_crc:
+            raise PngError(f"CRC mismatch in {chunk_type!r} chunk (corrupted PNG): {path}")
+
+        if chunk_type == b"IHDR":
+            if width is not None:
+                raise PngError(f"duplicate IHDR chunk: {path}")
+            if chunk_length < 13:
+                raise PngError(f"IHDR chunk too short: {path}")
+            (width,) = struct.unpack(">I", chunk_data[0:4])
+            (height,) = struct.unpack(">I", chunk_data[4:8])
+        elif chunk_type == b"IEND":
+            seen_iend = True
+            offset = crc_end
+            break
+
+        offset = crc_end
+
+    if width is None or height is None:
         raise PngError(f"missing IHDR chunk: {path}")
-    (chunk_length,) = struct.unpack(">I", header[8:12])
-    if chunk_length < 13:
-        raise PngError(f"IHDR chunk too short: {path}")
-    (width,) = struct.unpack(">I", header[16:20])
-    (height,) = struct.unpack(">I", header[20:24])
+    if not seen_iend:
+        raise PngError(f"missing IEND chunk (truncated PNG): {path}")
+    if offset != len(data):
+        raise PngError(f"trailing data after IEND chunk: {path}")
     if width == 0 or height == 0:
         raise PngError(f"PNG has zero width or height: {path}")
     return width, height
@@ -477,6 +526,7 @@ def capture_one(
         raise CaptureError(f"refusing to write outside out-dir: {resolved_out}")
 
     needs_html = template_uses(template, "html_path")
+    needs_url = template_uses(template, "url")
     needs_user_data_dir = template_uses(template, "user_data_dir")
     needs_chromium_bin = template_uses(template, "chromium_bin")
 
@@ -537,6 +587,26 @@ def capture_one(
             snapshot_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 fetch_snapshot(site.url, snapshot_path, allow_file_url=allow_file_url)
+            except SnapshotError as exc:
+                return _skip_result(site, engine, argv, str(exc))
+        elif needs_url:
+            # Chromium 既定テンプレート等、`{html_path}` を経由せず `{url}` を
+            # そのままエンジンへ渡す（直接ナビゲーション）テンプレート向けの
+            # SSRF 対策（codex P0: `fetch_snapshot` 経路にしか掛かっておらず
+            # `--sites` に内部アドレスの https URL を指定すると迂回できた）。
+            # `fetch_snapshot` と同じ `_check_public_host` で内部アドレスを拒否する。
+            # ここでの検証はエンジン起動前の一時点の名前解決に基づくベストエフォート
+            # であり、エンジン（ブラウザ）自身がその後たどるリダイレクト先までは
+            # 検証できない（`fetch_snapshot` の `_PublicOnlyRedirectHandler` と異なり、
+            # 別プロセスのブラウザの内部遷移には介入できないため。REPAIR-3）。
+            parsed_url = urlparse(site.url)
+            try:
+                if parsed_url.scheme == "https":
+                    _check_public_host(parsed_url.hostname, context=f"direct navigation URL {site.url}")
+                elif not (parsed_url.scheme == "file" and allow_file_url):
+                    raise SnapshotError(
+                        f"unsupported scheme for direct navigation: {site.url}"
+                    )
             except SnapshotError as exc:
                 return _skip_result(site, engine, argv, str(exc))
 
@@ -830,7 +900,7 @@ def main(argv: list[str] | None = None) -> int:
         if unknown_engines:
             raise CaptureError(f"unknown engine(s): {', '.join(sorted(unknown_engines))}")
 
-        viewport, sites = load_sites(args.sites, args.min_sites)
+        viewport, sites = load_sites(args.sites, args.min_sites, allow_file_url=args.allow_file_url)
     except CaptureError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
