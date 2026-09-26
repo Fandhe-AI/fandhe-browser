@@ -230,9 +230,26 @@ pub fn expand_args(template: &[String], port: u16) -> Vec<String> {
 
 /// 環境変数の値（空白区切り）を引数ベクタへ分割する。
 ///
-/// `FANDHE_BROWSER_SERVE_ARGS` 等の環境変数から起動引数を受け取る経路が使う。
-/// クォート解釈はせず、素朴な空白分割に留める（シェル評価をしないことで
-/// インジェクションを避ける方針。実装計画セクション 6）。
+/// `FANDHE_BROWSER_SERVE_ARGS` 等の環境変数から起動引数を受け取る経路
+/// （`competitor_lightpanda.rs` の `args_from_env`）が使う。クォート解釈は
+/// せず、素朴な空白分割に留める（シェル評価をしないことでインジェクションを
+/// 避ける方針。実装計画セクション 6）。
+///
+/// `#[allow(dead_code)]` の理由（レビュー指摘。コーディネーター指示。PR #442
+/// 再々々々々々々々々レビュー・crates/fandhe-browser-core/Cargo.toml:57）:
+/// この crate root は 3 つの異なる `[[bench]]`/`[[test]]` ターゲットとして
+/// コンパイルされる。`competitor_lightpanda`（`[[bench]]`）と
+/// `competitor_lightpanda_support`（`harness = true` の `[[test]]`）では
+/// それぞれ `args_from_env`（本番コード経路）・`#[test] fn`（`--test` 付きで
+/// 実際に実行される）から到達するため dead_code にならないが、
+/// `competitor_lightpanda_measure`（`harness = false` の `[[test]]`。
+/// `measure_tests.rs` が独自の `main` を持ち、環境変数からの引数分割を
+/// 使わない）は `--test` を渡されず `#[test] fn` を呼ばないため、この関数
+/// だけを見ると到達不能になる（`kill_process_group_kills_child_and_grandchild`
+/// テストのため `process_is_alive` をローカルクロージャへ変えた過去の
+/// 対応と同種の制約だが、`split_args` は本番コード（`args_from_env`）からも
+/// 使う公開関数のため、クロージャ化ではなくこの属性で対応する）。
+#[allow(dead_code)]
 pub fn split_args(env: &str) -> Vec<String> {
     env.split_whitespace().map(str::to_string).collect()
 }
