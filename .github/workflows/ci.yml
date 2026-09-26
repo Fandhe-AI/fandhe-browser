@@ -7,7 +7,8 @@ name: CI
 # ファイル（.markdownlint.jsonc 等）の整備・rust-ci の cache-key-prefix のリポ名への
 # 変更は TASK-55.3（Issue #60）で完了済み。3 OS matrix 対応（.claude/rules/ci.md）は
 # rust-ci ジョブで対応済み（TASK-55.1・Issue #58）。lint-docs は引き続き
-# ubuntu-latest 単独実行
+# ubuntu-latest 単独実行。clippy -D warnings ゲート（fail-closed）の明文化は
+# TASK-5.2（#32・REPAIR-6）を参照
 on:
   workflow_dispatch:
   pull_request:
@@ -77,6 +78,12 @@ jobs:
   # として見える）。branch protection の必須チェックへ追加する運用はユーザー
   # 作業（PR 本文参照）。
   #
+  # clippy -D warnings ゲート（TASK-5.2・`REPAIR-6`）: reusable 側 `clippy` ジョブが
+  # `cargo clippy --workspace --all-targets --all-features -- -D warnings` を
+  # 上記 3 OS で実行し、警告が 1 件でもあれば非ゼロ終了する。`rust-base-ci-complete`
+  # は他ジョブと同様に `needs.clippy.result` を検査するため、clippy 失敗時は
+  # `rust-ci (<os>) / rust-base-ci-complete` 自体が fail-closed で失敗する。
+  #
   # 3 OS 一級対応（.claude/rules/ci.md・XOS-1・TASK-55.1）: Linux・macOS・Windows の
   # ネイティブ runner で rust-base-ci（fmt/clippy/test/deny）をそれぞれ実行する。
   # fail-fast: false は 1 OS の失敗で他 OS の実行を打ち切らせないため
@@ -144,6 +151,13 @@ jobs:
   # 3 OS 一級対応（.claude/rules/ci.md・XOS-1）に従い、rust-ci と同じ 3 OS matrix で
   # 実行する（既定 feature 構成の OS 依存回帰を --all-features 側だけでは検出できない
   # ため。PR #409 レビュー指摘）。
+  #
+  # clippy -D warnings ゲート（TASK-5.2・`REPAIR-6`）: 下記 `cargo clippy` ステップは
+  # 3 OS すべてで同一コマンドを実行し、1 ステップ 1 コマンドのためステップの
+  # 非ゼロ終了がそのままジョブ失敗になる。windows-latest の既定シェルは pwsh だが、
+  # Actions が単一コマンドステップの末尾に付与する `exit $LASTEXITCODE` 相当の
+  # 挙動により終了コードが伝播し、他 OS と同様に fail-closed で機能する
+  # （`shell:` 明示指定は不要。誤って追加修正しないこと）。
   rust-ci-default-features:
     strategy:
       fail-fast: false
