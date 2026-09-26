@@ -73,11 +73,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use support::{
-    DeadlineReader, JsonValue, Outcome, approx_tokens, arg_error_gate, bench_exit_code,
-    content_length_exceeds_limit, exit_status_to_result, expand_args, http_status_for_io_error,
-    json_escape, looks_like_browser_readiness_response, lookup_fixture, median,
-    parse_content_length, parse_http_request_line, parse_http_status, parse_json, reduction_pct,
-    require_bin, split_args, token_reduction_gate, validate_local_bench_url, validate_mcp_response,
+    DeadlineReader, JsonValue, Outcome, apply_new_process_group, approx_tokens, arg_error_gate,
+    bench_exit_code, content_length_exceeds_limit, expand_args, http_status_for_io_error,
+    json_escape, kill_process_group, looks_like_browser_readiness_response, lookup_fixture, median,
+    parse_content_length, parse_http_request_line, parse_http_status, parse_json,
+    port_conflict_error, reduction_pct, require_bin, split_args, token_reduction_gate,
+    validate_local_bench_url, validate_mcp_response,
 };
 // `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
 // 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
@@ -496,81 +497,6 @@ fn write_fixture_response(
     writer.flush()
 }
 
-/// 起動する `Command` に「新しいプロセスグループ」を設定する。
-///
-/// レビュー指摘 P1（Codex。PR #442 再々々々々レビュー・
-/// competitor_lightpanda.rs:827）: 対象プロセス（ブラウザ）が起動した
-/// 子孫プロセスが stdin パイプの読み取り側を継承していると、直接の子だけを
-/// `kill` してもパイプが閉じずベンチ全体が止まり得る。プロセスグループ
-/// 単位で起動しておき、タイムアウト時に [`kill_process_group`] でグループ
-/// ごと終了させることで、子孫がパイプを保持し続ける経路を塞ぐ（#435 と
-/// 同じ方針）。unix は `process_group(0)`（`setpgid(0,0)` 相当。std 1.64 で
-/// 安定化。子プロセス自身を新しいプロセスグループのリーダーにする。
-/// これによりプロセスグループ ID は子プロセスの PID と一致する）、
-/// Windows は `CREATE_NEW_PROCESS_GROUP` を使う。いずれも `unsafe`・新規
-/// 依存なしで `std::os::{unix,windows}::process::CommandExt` の安定 API
-/// だけで実装する。
-#[cfg(unix)]
-fn apply_new_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    command.process_group(0);
-}
-
-#[cfg(windows)]
-fn apply_new_process_group(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    // Win32 `CREATE_NEW_PROCESS_GROUP`（0x00000200）。`windows-sys` 等の
-    // FFI 依存を新規に増やさないため、広く安定した定数値を直接埋め込む。
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
-}
-
-/// `pid` が属するプロセスグループ全体を強制終了する。
-///
-/// [`apply_new_process_group`] で子プロセス自身をグループリーダーにして
-/// いるため（unix はグループ ID が `pid` と一致する）、グループへ
-/// シグナルを送れば子孫プロセスも含めて終了できる。ただし std には
-/// unix の `killpg`・Windows のプロセスツリー終了に相当する API が無く、
-/// `unsafe`・新規依存（`libc`/`windows-sys` 等）も使えないため、実際の
-/// 終了は OS 標準の外部コマンド（unix: `kill -KILL -- -<pid>`、Windows:
-/// `taskkill /T /F`）に委ねる。これらのコマンドが使えない環境（spawn 自体の
-/// 失敗）・非 0 終了（対象が既に存在しない等）では `Err` を返す。
-///
-/// レビュー指摘 P1（Codex。PR #442 再々々々々々々々レビュー・
-/// competitor_lightpanda.rs:558）: 以前は `Command::status()` の結果を
-/// `let _ = ...` で握りつぶしており、外部コマンドの spawn 失敗・非 0
-/// 終了に気づけなかった。`Result` にして呼び出し元へ返し、呼び出し元は
-/// 失敗時に `Child::kill`（直接の子のみ）へのフォールバックを行った旨を
-/// エラーメッセージへ含める（`Drop`（`ChildGuard::drop`）内で呼ぶ経路は
-/// 戻り値を返せないため、そこに限り結果を握りつぶしてよい）。
-#[cfg(unix)]
-fn kill_process_group(pid: u32) -> Result<(), String> {
-    // レビュー指摘 P1: `-<pid>`（プロセスグループ宛て）はハイフンで
-    // 始まるため、`kill` 実装によってはオプションの一部と誤解釈され得る。
-    // `--` でオプションの終端を明示し、後続の `-<pid>` を確実に引数として
-    // 扱わせる。
-    let status = Command::new("kill")
-        .args(["-KILL", "--", &format!("-{pid}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("failed to spawn kill: {e}"))?;
-    exit_status_to_result(status)
-}
-
-#[cfg(windows)]
-fn kill_process_group(pid: u32) -> Result<(), String> {
-    let status = Command::new("taskkill")
-        .args(["/T", "/F", "/PID", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("failed to spawn taskkill: {e}"))?;
-    exit_status_to_result(status)
-}
-
 /// 子プロセスを確実に終了させる guard。早期 `return`（`?`）経路でも
 /// `Drop` で `kill` + `wait` する（`wait` を省くとゾンビプロセスが残る）。
 /// [`kill_process_group`] も合わせて呼び、子孫プロセスが起動していても
@@ -690,6 +616,44 @@ const PROBE_BODY_MAX_BYTES: usize = 64 * 1024;
 /// （レビュー指摘: 「probe の期限は外側の readiness 期限の残り時間を
 /// 超えないようにする」）。
 const PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// [`reprobe_after_kill`] が同じポートへ再接続を試みる際の期限。
+/// `TcpStream::connect_timeout` は接続拒否（誰も listen していない）なら
+/// この期限を待たずに即座に返るため、実際にはこの値は「応答が無いことを
+/// 確認するまでの上限」としてのみ働く。
+const PORT_CONFLICT_REPROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// [`spawn_and_wait_ready`] が起動した対象を `kill_process_group`/
+/// `Child::kill` で終了させ `wait` で確認した直後に、同じポートへまだ
+/// 何か（TCP レベルで）応答するプロセスがいるかを確認する。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々々々々々々レビュー・
+/// competitor_lightpanda.rs:607。Cursor からも同種の指摘あり）:
+/// `reserve_port` はリスナーを解放してから子プロセスを起動するまでの間に
+/// 別プロセスが同じポートを奪える TOCTOU が残り、readiness probe が
+/// 対象自身ではなく別プロセスの応答を拾っていた可能性がある。std だけでは
+/// ソケットの所有者（PID）を直接確認する手段が無いため、代わりに
+/// 「対象を kill して `wait` 済みのはずなのに、まだそのポートへ接続
+/// できるか」を事後確認する（post-hoc な所有権確認。判定ロジック自体は
+/// `support::port_conflict_error` へ切り出し、そちらで単体テストする）。
+///
+/// この確認には以下の限界がある（`support::port_conflict_error` の
+/// ドキュメントにも記載）:
+/// - kill から再接続までの間に第三のプロセスが新たに同じポートを奪った
+///   場合、それを「元から居た別プロセス」と区別できない
+/// - 対象が孫プロセス以降を起動していた場合、`ChildGuard`/
+///   `kill_process_group` の `wait` は直接の子までしか保証しない
+/// - std だけではソケットの所有者を PID で直接確認できない
+///
+/// これらの限界があっても、「対象を殺したのに同じポートがまだ応答する」
+/// という明白な矛盾を検出できることには意味があり、黙って誤った計測値を
+/// 使うより安全である（best-effort な事後確認）。
+fn reprobe_after_kill(port: u16) -> bool {
+    let Ok(addr) = format!("127.0.0.1:{port}").parse() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&addr, PORT_CONFLICT_REPROBE_TIMEOUT).is_ok()
+}
 
 /// readiness probe を 1 回だけ試す。ステータス行と本文を返す。接続失敗・
 /// 応答不正（不正な UTF-8 を含む）・タイムアウトはいずれも `None`
@@ -938,9 +902,25 @@ fn measure_cold_start(target: &Target, trials: usize) -> Outcome {
     let mut samples = Vec::with_capacity(trials);
     for _ in 0..trials {
         match spawn_and_wait_ready(bin, &target.serve_args) {
-            Ok((guard, _port, elapsed)) => {
-                samples.push(elapsed.as_secs_f64() * 1000.0);
+            Ok((guard, port, elapsed)) => {
+                // `drop(guard)` は `kill_process_group`/`Child::kill` で
+                // プロセス（グループ）を終了させ、`wait` で完全な終了を
+                // 確認してから返る。その後に再 probe することで、
+                // 「対象を殺したのに同じポートがまだ応答する」という
+                // ポート競合を検出できる（レビュー指摘 P1。Codex。PR #442
+                // 再々々々々々々々レビュー・competitor_lightpanda.rs:607。
+                // `reprobe_after_kill`・`support::port_conflict_error` の
+                // ドキュメント参照）。
                 drop(guard);
+                if let Some(reason) =
+                    port_conflict_error(target.name, port, reprobe_after_kill(port))
+                {
+                    return Outcome::Error(format!(
+                        "{}: cold start trial failed: {reason}",
+                        target.name
+                    ));
+                }
+                samples.push(elapsed.as_secs_f64() * 1000.0);
                 std::thread::sleep(Duration::from_millis(200));
             }
             Err(e) => {
@@ -992,7 +972,7 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
     let mut samples = Vec::with_capacity(trials);
     for _ in 0..trials {
         match spawn_and_wait_ready(bin, &target.serve_args) {
-            Ok((guard, _port, _elapsed)) => {
+            Ok((guard, port, _elapsed)) => {
                 std::thread::sleep(Duration::from_millis(500));
                 // `ps` の失敗（プロセス早期終了・パース不能出力）を黙って
                 // 捨てず即座に Error 化する（レビュー指摘: 失敗試行を除外した
@@ -1000,7 +980,23 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
                 // であるかのように結果件数と意味が食い違う）。
                 let pid = guard.0.id();
                 let rss = sample_rss_kb(pid);
+                // `drop(guard)` は `kill_process_group`/`Child::kill` で
+                // プロセス（グループ）を終了させ、`wait` で完全な終了を
+                // 確認してから返る。その後に再 probe することで、
+                // 「対象を殺したのに同じポートがまだ応答する」という
+                // ポート競合を検出できる（レビュー指摘 P1。Codex。PR #442
+                // 再々々々々々々々レビュー・competitor_lightpanda.rs:607。
+                // `reprobe_after_kill`・`support::port_conflict_error` の
+                // ドキュメント参照）。
                 drop(guard);
+                if let Some(reason) =
+                    port_conflict_error(target.name, port, reprobe_after_kill(port))
+                {
+                    return Outcome::Error(format!(
+                        "{}: idle RSS trial failed: {reason}",
+                        target.name
+                    ));
+                }
                 std::thread::sleep(Duration::from_millis(200));
                 match rss {
                     Some(rss) => samples.push(rss as f64),

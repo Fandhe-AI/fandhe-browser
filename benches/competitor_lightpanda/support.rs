@@ -20,6 +20,15 @@
 //! 両方で場当たり的に `set_read_timeout` を設定するのではなく、共通の
 //! プリミティブへ統一する）。
 //!
+//! 同様に [`apply_new_process_group`]・[`kill_process_group`] も実際に
+//! プロセスを起動・終了させる副作用を持つ（レビュー指摘。コーディネーター
+//! 指示。PR #442 再々々々々々々々レビュー: プロセスグループ経由で子・孫
+//! プロセスの両方を実際に終了できることを 3 OS CI で検証する単体テストが
+//! 必要なため、`[[bench]]` ターゲット（`cargo test` の対象外）ではなく
+//! この crate root へ移した）。テストは実際に `sh` で子・孫プロセスを
+//! 起動して検証する（外部プロセス起動を伴うが、対象バイナリではなく
+//! OS 標準のシェルのみを使うため、依存関係は増えない）。
+//!
 //! `AISNAP-1`（MCP トークン削減率）計測は、任意の外部 URL
 //! （`COMPETITOR_BENCH_SITES`）ではなく、リポジトリに同梱した静的 fixture
 //! （外部参照を含まない自作コンテンツ。[`FIXTURE_TABLE`]）だけを対象にする
@@ -544,19 +553,152 @@ pub fn http_status_for_io_error(kind: std::io::ErrorKind) -> (u16, &'static str)
 /// 判定へ変換する。
 ///
 /// レビュー指摘 P1（Codex。PR #442 再々々々々々々レビュー・
-/// competitor_lightpanda.rs:558）: `competitor_lightpanda.rs` の
-/// `kill_process_group` は以前 `Command::status()` の結果を
+/// competitor_lightpanda.rs:558）: 以前は `Command::status()` の結果を
 /// `let _ = ...` で握りつぶしており、外部コマンドの非 0 終了（対象
 /// プロセスが既に存在しない等）に気づけなかった。判定ロジック自体を
-/// この純粋関数へ切り出し、`kill_process_group` はプロセス起動
-/// （`unsafe`・実際の子プロセス操作を伴い、この crate root
-/// （`[[test]]` ターゲット）では単体テストできない）と、この関数が行う
-/// 判定とに分離する。
+/// この純粋関数へ切り出し、[`kill_process_group`] はプロセス起動と、
+/// この関数が行う判定とに分離する。
 pub fn exit_status_to_result(status: std::process::ExitStatus) -> Result<(), String> {
     if status.success() {
         Ok(())
     } else {
         Err(format!("command exited with {status}"))
+    }
+}
+
+/// 起動する `Command` に「新しいプロセスグループ」を設定する。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々々々レビュー・
+/// competitor_lightpanda.rs:827）: 対象プロセス（ブラウザ）が起動した
+/// 子孫プロセスが stdin パイプの読み取り側を継承していると、直接の子だけを
+/// `kill` してもパイプが閉じずベンチ全体が止まり得る。プロセスグループ
+/// 単位で起動しておき、タイムアウト時に [`kill_process_group`] でグループ
+/// ごと終了させることで、子孫がパイプを保持し続ける経路を塞ぐ（#435 と
+/// 同じ方針）。unix は `process_group(0)`（`setpgid(0,0)` 相当。std 1.64 で
+/// 安定化。子プロセス自身を新しいプロセスグループのリーダーにする。
+/// これによりプロセスグループ ID は子プロセスの PID と一致する）、
+/// Windows は `CREATE_NEW_PROCESS_GROUP` を使う。いずれも `unsafe`・新規
+/// 依存なしで `std::os::{unix,windows}::process::CommandExt` の安定 API
+/// だけで実装する。
+///
+/// レビュー指摘（コーディネーター指示。PR #442 再々々々々々々々レビュー）:
+/// `kill_process_group` と合わせて、実際に子・孫プロセスの両方を
+/// 終了させられることを 3 OS CI で検証する単体テストが必要なため、
+/// `competitor_lightpanda.rs`（`[[bench]]` ターゲット。`cargo test` の
+/// 対象外）ではなくこの crate root（`[[test]]` ターゲット
+/// `competitor_lightpanda_support`）へ移した。
+#[cfg(unix)]
+pub fn apply_new_process_group(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+pub fn apply_new_process_group(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    // Win32 `CREATE_NEW_PROCESS_GROUP`（0x00000200）。`windows-sys` 等の
+    // FFI 依存を新規に増やさないため、広く安定した定数値を直接埋め込む。
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
+/// `pid` が属するプロセスグループ全体を強制終了する。
+///
+/// [`apply_new_process_group`] で子プロセス自身をグループリーダーにして
+/// いるため（unix はグループ ID が `pid` と一致する）、グループへ
+/// シグナルを送れば子孫プロセスも含めて終了できる。ただし std には
+/// unix の `killpg`・Windows のプロセスツリー終了に相当する API が無く、
+/// `unsafe`・新規依存（`libc`/`windows-sys` 等）も使えないため、実際の
+/// 終了は OS 標準のシェル・外部コマンド（unix: POSIX シェルの組み込み
+/// `kill`、Windows: `taskkill /T /F`）に委ねる。これらが使えない環境
+/// （spawn 自体の失敗）・非 0 終了（対象が既に存在しない等）では `Err`
+/// を返す。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々々々々々々レビュー・
+/// competitor_lightpanda.rs:558）: 以前は `Command::status()` の結果を
+/// `let _ = ...` で握りつぶしており、外部コマンドの spawn 失敗・非 0
+/// 終了に気づけなかった。`Result` にして呼び出し元へ返し、呼び出し元は
+/// 失敗時に `Child::kill`（直接の子のみ）へのフォールバックを行った旨を
+/// エラーメッセージへ含める（`Drop`（`ChildGuard::drop`）内で呼ぶ経路は
+/// 戻り値を返せないため、そこに限り結果を握りつぶしてよい）。
+#[cfg(unix)]
+pub fn kill_process_group(pid: u32) -> Result<(), String> {
+    // レビュー指摘 Medium（Cursor。PR #442 再々々々々々々々々レビュー・
+    // competitor_lightpanda.rs:553）: `-<pid>`（プロセスグループ宛て）は
+    // ハイフンで始まるため、GNU coreutils の `kill` はオプションの
+    // 一部と誤解釈しないよう `--` を要求する（前回のレビュー指摘）が、
+    // macOS の BSD `kill`（`/bin/kill`）は逆に `--` 自体を PID 引数として
+    // 解釈し `illegal pid: --` で失敗する。外部の `kill` バイナリの
+    // 引数解釈の違いに依存せず、POSIX シェル（`sh`）の組み込み `kill` を
+    // 使うことで両方を満たす。bash（macOS の既定 `/bin/sh`）・dash
+    // （多くの Linux ディストリビューションの既定 `/bin/sh`）はどちらも
+    // 組み込み `kill` で `--` を正しく解釈することを確認済み。`pid` は
+    // 自プロセスが起動した子プロセスの PID（`u32`）であり外部入力では
+    // ない（数字以外を含み得ない）うえ、シェルスクリプト文字列へ埋め込む
+    // のではなく別引数（`$1`）として渡すため、シェルへの注入の余地は無い。
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"kill -s KILL -- "-$1""#)
+        .arg("sh") // `$0`（スクリプト名。位置引数の 0 番目）のプレースホルダ。
+        .arg(pid.to_string()) // `$1`。
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("failed to spawn sh for kill: {e}"))?;
+    exit_status_to_result(status)
+}
+
+#[cfg(windows)]
+pub fn kill_process_group(pid: u32) -> Result<(), String> {
+    let status = std::process::Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("failed to spawn taskkill: {e}"))?;
+    exit_status_to_result(status)
+}
+
+/// `spawn_and_wait_ready`（`competitor_lightpanda.rs`）の 1 試行後、対象
+/// プロセス（グループ）を kill し `wait` で終了を確認したあと、同じポート
+/// へ短い期限で再接続を試みた結果から、その試行を計測値としてそのまま
+/// 使ってよいか（別プロセスによるポート競合を検出したか）を判定する。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々々々々々々レビュー・
+/// competitor_lightpanda.rs:607。Cursor からも同種の指摘あり）:
+/// `reserve_port` はリスナーを解放してから子プロセスを起動するまでの間に
+/// 別プロセスが同じポートを奪える TOCTOU が残るため、readiness probe が
+/// 対象自身ではなく別プロセスの応答を拾っていた可能性がある。std だけでは
+/// ソケットの所有者（PID）を直接確認する手段が無いため、代わりに
+/// 「対象を kill して `wait` 済みのはずなのに、同じポートがまだ応答するか」
+/// を事後確認する（post-hoc な所有権確認）。この関数はその確認結果
+/// （`reprobe_still_responds`）だけを受け取り、`true`（まだ応答がある）
+/// なら計測を `Error` として扱うべき理由文字列を返す。
+///
+/// 限界（呼び出し元 `competitor_lightpanda.rs` の `reprobe_after_kill` の
+/// ドキュメントにも記載）: (1) kill から再接続までの間に別のプロセスが
+/// 新たに同じポートを奪った場合、それを「元から居た別プロセス」と区別
+/// できない、(2) 対象が孫プロセスを起動していた場合、`wait` は直接の子
+/// までしか保証しない、(3) ソケットの所有者を PID で直接確認できない。
+/// これらの限界はあるが、少なくとも「対象を殺したのに同じポートがまだ
+/// 応答する」という明白な矛盾を検出でき、黙って誤った計測値を使うより
+/// 安全である。
+pub fn port_conflict_error(
+    target_name: &str,
+    port: u16,
+    reprobe_still_responds: bool,
+) -> Option<String> {
+    if reprobe_still_responds {
+        Some(format!(
+            "port {port} still responded after the measured process (and its process group) was \
+             killed and waited on; another process likely owned this port during the trial \
+             (readiness may have been observed from that other process instead of the measured \
+             one), treating this trial as a port conflict for {target_name}"
+        ))
+    } else {
+        None
     }
 }
 
@@ -1717,6 +1859,122 @@ mod tests {
             .status()
             .expect("spawn cmd");
         assert!(exit_status_to_result(status).is_err());
+    }
+
+    // レビュー指摘 P1（Codex。PR #442 再々々々々々々々レビュー・
+    // competitor_lightpanda.rs:607）: kill 後の再 probe でまだ応答があれば
+    // 「その試行はポート競合」として `Error` にする判定ロジックの単体
+    // テスト。
+    #[test]
+    fn port_conflict_error_none_when_no_response_after_kill() {
+        assert_eq!(port_conflict_error("lightpanda", 9400, false), None);
+    }
+
+    #[test]
+    fn port_conflict_error_some_when_still_responds_after_kill() {
+        let err = port_conflict_error("lightpanda", 9400, true).expect("expected Some(reason)");
+        assert!(err.contains("9400"));
+        assert!(err.contains("lightpanda"));
+        assert!(err.contains("port conflict"));
+    }
+
+    /// レビュー指摘（コーディネーター指示。PR #442 再々々々々々々々
+    /// レビュー）: 新しいプロセスグループで子（`sh`）と孫（`sleep`）を
+    /// 起動し、`kill_process_group`（子の PID）の後に子・孫の両方が
+    /// 終了していることを 3 OS CI で実証する。孫の PID は子の標準出力
+    /// から受け取る。
+    ///
+    /// 注記: このサンドボックス環境では、プロセスグループへのシグナル
+    /// 配送自体が制限されている可能性がある（過去のレビュー対応で、
+    /// 直接の子への `kill`（正の PID）は機能するが、プロセスグループ
+    /// 宛て（負の PID）のシグナル配送だけがサンドボックスの制約で
+    /// 機能しない事例を確認済み）。このテストはアサーションを弱めず、
+    /// 実際に子・孫の両方が終了していることを要求する。ローカルの
+    /// サンドボックスで（環境起因で）失敗する場合は、その旨をそのまま
+    /// 報告し、macOS・Linux の CI（`ci.md`「3 OS CI」）での結果に判断を
+    /// 委ねる。
+    #[cfg(unix)]
+    #[test]
+    fn kill_process_group_kills_child_and_grandchild() {
+        // `kill -0 <pid>` で、指定した PID のプロセスが生存しているかを
+        // 確認する（このテスト専用のローカルクロージャ。`kill -0` は
+        // シグナルを送らず存在確認のみ行う POSIX の慣用手段）。
+        let process_is_alive = |pid: u32| -> bool {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+
+        let mut command = std::process::Command::new("sh");
+        apply_new_process_group(&mut command);
+        let mut child = command
+            .arg("-c")
+            // 孫（`sleep`）をバックグラウンドで起動し、その PID を
+            // 標準出力へ書き出してから `wait` で孫の終了を待つ
+            // （`sh` 自身は孫が生きている間ずっと生存する）。
+            .arg("sleep 30 & echo $!; wait")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        let child_pid = child.id();
+
+        let stdout = child.stdout.take().expect("child stdout");
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut reader, &mut line).expect("read grandchild pid");
+        let grandchild_pid: u32 = line.trim().parse().expect("parse grandchild pid");
+
+        // kill 前に子・孫がともに生存していることを確認する（テスト自体の
+        // 前提が壊れていないことの確認）。
+        assert!(
+            process_is_alive(child_pid),
+            "child (pid={child_pid}) should be alive before kill_process_group"
+        );
+        assert!(
+            process_is_alive(grandchild_pid),
+            "grandchild (pid={grandchild_pid}) should be alive before kill_process_group"
+        );
+
+        let kill_result = kill_process_group(child_pid);
+        // `kill_process_group` はシグナル送信のみで、対象の実際の終了
+        // （プロセステーブルからの除去）は非同期に起こり得るため、
+        // `child.wait()`（直接の子。`sh` 自身）で確実に完了を待ってから
+        // 判定する。
+        let wait_result = child.wait();
+
+        assert!(
+            kill_result.is_ok(),
+            "kill_process_group should succeed for a process we just spawned: {kill_result:?}"
+        );
+        assert!(
+            wait_result.is_ok(),
+            "waiting for the direct child to exit should succeed: {wait_result:?}"
+        );
+
+        // シグナル配送から実際のプロセス終了までの短い遅延を許容する。
+        for _ in 0..50 {
+            if !process_is_alive(child_pid) && !process_is_alive(grandchild_pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(
+            !process_is_alive(child_pid),
+            "child (pid={child_pid}) should be dead after kill_process_group"
+        );
+        assert!(
+            !process_is_alive(grandchild_pid),
+            "grandchild (pid={grandchild_pid}) should be dead after kill_process_group \
+             (not just the direct child; this is the whole point of process-group kill)"
+        );
     }
 
     // レビュー指摘 P2（Codex。PR #442 再々々々々々レビュー・
