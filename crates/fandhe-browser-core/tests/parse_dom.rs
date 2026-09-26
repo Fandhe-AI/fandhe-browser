@@ -264,6 +264,71 @@ fn dump_elements_into(doc: &Document, id: NodeId, out: &mut String) {
     out.push(')');
 }
 
+/// `root` 配下の全ノード（要素・テキスト・コメント）を深さ優先・文書順で辿り、
+/// 要素名・属性（名前でソート済み）・テキスト/コメント内容まで含めた 1 行
+/// 文字列に整形する（`dump_elements` と異なり属性値・テキストの復号結果も
+/// 比較対象にする。`core_1_bytes_and_str_entrypoints_build_identical_trees`
+/// が str/bytes 両エントリポイントの完全な同等性を検証するために使う）。
+fn dump_full(doc: &Document, id: NodeId) -> String {
+    let mut out = String::new();
+    dump_full_into(doc, id, &mut out);
+    out
+}
+
+fn dump_full_into(doc: &Document, id: NodeId, out: &mut String) {
+    match doc.node_data(id) {
+        Some(NodeData::Text { contents }) => {
+            out.push('"');
+            out.push_str(contents);
+            out.push('"');
+            return;
+        }
+        Some(NodeData::Comment { contents }) => {
+            out.push_str("<!--");
+            out.push_str(contents);
+            out.push_str("-->");
+            return;
+        }
+        _ => {}
+    }
+
+    out.push_str(doc.local_name(id).unwrap_or("?"));
+
+    if doc.is_element(id) {
+        let mut attrs: Vec<(&str, &str)> = doc
+            .attributes(id)
+            .iter()
+            .map(|attr| (&*attr.name.local, attr.value.as_str()))
+            .collect();
+        attrs.sort_unstable_by_key(|(name, _)| *name);
+        if !attrs.is_empty() {
+            out.push('[');
+            for (i, (name, value)) in attrs.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                out.push_str(name);
+                out.push('=');
+                out.push_str(value);
+            }
+            out.push(']');
+        }
+    }
+
+    let children: Vec<NodeId> = doc.children(id).collect();
+    if children.is_empty() {
+        return;
+    }
+    out.push('(');
+    for (i, &child) in children.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        dump_full_into(doc, child, out);
+    }
+    out.push(')');
+}
+
 // ---------------------------------------------------------------------------
 // フィクスチャ別テスト
 // ---------------------------------------------------------------------------
@@ -661,8 +726,10 @@ fn core_1_doctype_node_data_is_exposed() {
 }
 
 /// CORE-1: `parse_document`（`&str` 入力）と `parse_document_bytes`
-/// （UTF-8 バイト列入力）は、全フィクスチャについて同一の要素木を構築する
-/// （`dump_elements` の文字列一致で確認する）。
+/// （UTF-8 バイト列入力）は、全フィクスチャについて属性値・テキスト内容まで
+/// 同一の木を構築する（`dump_full` の文字列一致で確認する。要素名だけを
+/// 比較する `dump_elements` では、属性やテキストの復号結果が経路によって
+/// 異なっていても検出できないため使わない）。
 #[test]
 fn core_1_bytes_and_str_entrypoints_build_identical_trees() {
     let fixtures = [
@@ -689,8 +756,8 @@ fn core_1_bytes_and_str_entrypoints_build_identical_trees() {
             .document;
 
         assert_eq!(
-            dump_elements(&from_str, from_str.root()),
-            dump_elements(&from_bytes, from_bytes.root()),
+            dump_full(&from_str, from_str.root()),
+            dump_full(&from_bytes, from_bytes.root()),
             "fixture の str/bytes エントリポイントで木が一致しない: {fixture}"
         );
     }
