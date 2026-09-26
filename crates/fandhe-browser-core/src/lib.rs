@@ -16,7 +16,8 @@
 //! （[`error::Error`] / [`error::Result`]）を追加したが、各モジュール本体は
 //! 空 skeleton のままで機能を一切実装していない（REPAIR-3: 実装済みを装わない）。
 //! 本実装は以降の後続 Issue で行う: `fetch` は TASK-24.2（#36）、`parse` は
-//! TASK-24.4（#38）、`dom` は TASK-24.5（#39）、`query` は TASK-24.7（#41）。
+//! TASK-24.4（#38）、`dom` は TASK-24.5（#39）、`selector` は TASK-24.7（#41）、
+//! `query` は TASK-24.10（#418）。
 //! JS 実行スタブとの境界は TASK-24（24.9・Issue #43）で `js_stub` モジュールとして
 //! 追加した。関数本体（[`js_stub::execute_js_stub`]）は常にエラーを返すスタブであり、
 //! TASK-30（Issue #143・ビヘイビア `JS-2`）で `fandhe-browser-js` の実装へ置換される。
@@ -33,5 +34,6 @@ pub mod js_stub;
 pub mod parse;
 pub mod query;
 pub mod render;
+pub mod selector;
 
 pub use error::{Error, Result};
