@@ -4,8 +4,10 @@
 //!
 //! `dom::Document` のフィールドは `pub(crate)` のままだが、走査 API
 //! （TASK-24.5・#39・`dom` モジュール）を経由すれば構造を検証できる
-//! （`tests/dom.rs` が担当）。ここでは crate 外から見える契約（`Ok`/`Err` の
-//! 判定・`Error` の `Display`・`Send + Sync` 境界）のみを確認する。
+//! （`tests/dom.rs` が最小確認・`tests/parse_dom.rs`（TASK-24.6・#40）が
+//! 代表的な HTML 断片による網羅的な構造検証を担当）。ここでは crate 外から
+//! 見える契約（`Ok`/`Err` の判定・`Error` の `Display`・`Send + Sync` 境界）
+//! のみを確認する。
 
 use fandhe_browser_core::{Error, ParseError, ParseErrorPolicy, ParseOptions};
 
