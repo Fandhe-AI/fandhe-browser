@@ -93,6 +93,37 @@ where
     port
 }
 
+/// 接続そのものは受け付けるが、応答を一切書かずに即座に接続を打ち切る
+/// （`SO_LINGER(0)` で RST を強制する）ループバックサーバーを起動する。
+///
+/// PR #434 コードレビュー指摘（codex、P2）: `TcpListener::bind` 直後に
+/// `drop` して空きポート番号だけを再利用する方式は、`drop` から
+/// `Fetcher::get` の接続までの間に他プロセス・他テストが同じポートを
+/// 確保すると「接続拒否」という前提が崩れる（テストが制御できない
+/// ポート再利用の競合）。本関数はリスナー自身をスレッド内で保持し続け、
+/// 実際に届いた接続を `accept` したうえで応答なしに閉じることで、
+/// ポートの所有権をテストの実行時間内で本プロセスに固定したまま
+/// 「応答を得られない接続」を確定的に再現する（`Error::Network` へ
+/// 写像される接続断の一種。厳密な `ECONNREFUSED` ではなく `accept` 後の
+/// 切断だが、[`map_reqwest_error`]（`crates/fandhe-browser-core/src/fetch.rs`）
+/// はタイムアウト・リダイレクト・内部アドレス以外の接続エラーを一律
+/// `Error::Network` に写像するため検証対象の挙動は変わらない）。
+fn spawn_connection_reset_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let port = listener.local_addr().expect("local_addr").port();
+    thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            // 何も送らずに接続を閉じる（FIN）。クライアント（reqwest）は
+            // リクエスト送信中またはレスポンス待ち中に接続断を検知し、
+            // 「応答を得られない接続」を確定的に再現できる。
+            drop(stream);
+        }
+        // listener はスコープを抜けるまで存在し続けるため、accept 完了
+        // までポートは本プロセスが排他的に保持する。
+    });
+    port
+}
+
 /// CORE-1（#36）: 全体タイムアウトを超過すると `Error::Timeout` を返す。
 /// サーバーは接続だけ受けて応答を返さず、クライアントのタイムアウト
 /// （200ms）より十分長く（3 秒）沈黙する。
@@ -785,21 +816,21 @@ async fn core_1_fetch_network_error_on_truncated_body() {
     );
 }
 
-/// CORE-1（#37。TASK-24.3・MS-1）: 接続を受け付けるプロセスが存在しないポートへの
-/// 取得は `Error::Network`（接続拒否）になる。Windows の SYN 再送で
-/// 数秒かかり得るため、タイムアウトは既定（30 秒）を維持する。
+/// CORE-1（#37。TASK-24.3・MS-1）: 接続はできても応答を得られない相手への
+/// 取得は `Error::Network`（接続断）になる。[`spawn_connection_reset_server`]
+/// が本プロセス内でポートを保持し続けるため、空きポートを bind して即座に
+/// 手放す方式（PR #434 コードレビュー指摘）と異なりポート再利用の競合が
+/// 起きない。
 #[tokio::test]
 async fn core_1_fetch_network_error_on_connection_refused() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
+    let port = spawn_connection_reset_server();
 
     let fetcher = Fetcher::new(loopback_allowed_options()).expect("Fetcher::new が失敗しないこと");
 
     let err = fetcher
         .get(&format!("http://127.0.0.1:{port}/"))
         .await
-        .expect_err("listener を閉じたポートへの接続は失敗するはず");
+        .expect_err("応答なしに閉じられた接続への取得は失敗するはず");
     assert!(
         matches!(err, Error::Network { .. }),
         "unexpected error: {err:?}"
@@ -810,12 +841,11 @@ async fn core_1_fetch_network_error_on_connection_refused() {
 /// `Error::Network` の `message` は、取得元 URL に含まれる userinfo・
 /// クエリパラメータの秘密情報を含まない（`reqwest::Error::without_url()`
 /// の契約確認）。メッセージ全文の一致は reqwest 更新で壊れやすいため
-/// assert しない。
+/// assert しない。[`spawn_connection_reset_server`] を使い、ポート再利用の
+/// 競合（PR #434 コードレビュー指摘）を避けて接続断を確定的に起こす。
 #[tokio::test]
 async fn core_1_fetch_network_error_does_not_leak_secrets_in_message() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
+    let port = spawn_connection_reset_server();
 
     let fetcher = Fetcher::new(loopback_allowed_options()).expect("Fetcher::new が失敗しないこと");
 
@@ -824,7 +854,7 @@ async fn core_1_fetch_network_error_does_not_leak_secrets_in_message() {
             "http://user:dummy-secret@127.0.0.1:{port}/?token=dummy-token"
         ))
         .await
-        .expect_err("listener を閉じたポートへの接続は失敗するはず");
+        .expect_err("応答なしに閉じられた接続への取得は失敗するはず");
     match err {
         Error::Network { message } => {
             assert!(
