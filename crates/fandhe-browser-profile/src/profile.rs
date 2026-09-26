@@ -375,16 +375,42 @@ impl Profile {
     /// `open` から本呼び出しまでの間にディレクトリが symlink へ差し替え
     /// られていてもリンク先へは作成しない（PR #437 P1 レビュー指摘）。
     /// `OFlags::NOFOLLOW` により、`name` の位置に symlink が存在する場合も
-    /// リンク先を辿らず [`ProfileError::InvalidLayout`] で拒否する。
+    /// リンク先を辿らず [`ProfileError::InvalidLayout`] で拒否する
+    /// （`ELOOP`）。ディレクトリ（`EISDIR`）や、対象が非ディレクトリを
+    /// 経由しようとした場合（`ENOTDIR`）も同様に拒否する（PR #437 再レビュー
+    /// Cursor Low 指摘: `O_RDWR` でディレクトリを開くと `EISDIR` になり、
+    /// 以前は `InvalidLayout` ではなく `Io` に分類されていた）。
     ///
     /// `name` はディレクトリ区切り文字を含まない単一の要素であることを
     /// 要求する（`..`・`a/b` 等は [`ProfileError::InvalidLayout`] で拒否し、
     /// `dir_fd` を起点にした名前解決であってもパストラバーサルを許さない。
     /// security.md「プロファイル境界」）。
     ///
-    /// 既存ファイルは truncate せず、パーミッションも変更しない（本関数は
-    /// 骨格であり、実データの書式・ロック方針は後続タスクが決める。
-    /// REPAIR-3）。
+    /// `openat` には `OFlags::NONBLOCK` を付ける。`name` の位置に FIFO が
+    /// あると、`NONBLOCK` なしでは相手側が読み書きのため open するまで
+    /// `openat` 自体がブロックし得るため（PR #437 再レビュー Codex P1
+    /// 指摘）。`NONBLOCK` を付けると FIFO の open 自体は（相手側の有無に
+    /// 関わらず）即座に成功する（`ENXIO` にはならない）ため、成功した
+    /// ハンドルを直後の `fstat` で検査する「成功 → 検査 → 拒否」の流れになる。
+    /// 通常ファイルでなければ（FIFO・デバイス・ソケット等）そのハンドルを
+    /// 閉じて [`ProfileError::InvalidLayout`] で拒否する。
+    ///
+    /// 通常ファイルであることを確認した後、以下も併せて検証し、いずれかに
+    /// 該当すれば拒否する（PR #437 再レビュー Codex P0 指摘: 既存ファイルを
+    /// 無条件に信用して書き込むとプロファイル分離が成立しない）。
+    ///
+    /// - 所有者 uid が [`Profile::root_fd`]（`open` で検証済みのプロファイル
+    ///   ルート）の所有者と異なる（`geteuid` は rustix の `process` feature が
+    ///   要り依存を増やすため使わず、検証済みルートの所有者との比較で代替
+    ///   する）
+    /// - ハードリンク数（`st_nlink`）が 1 でない（境界外の実体を指す
+    ///   ハードリンク経由で、書き込みが別の場所へも及ぶことを防ぐ）
+    ///
+    /// 検証を通過した通常ファイルのみ、`fchmod` でパーミッションを `0o600`
+    /// へ締め直す（既存ファイルが他ユーザーから読める権限のまま Cookie 等を
+    /// 書き込む事故を防ぐ）。最後に `NONBLOCK` を解除する（通常ファイルの
+    /// I/O には本来影響しないが、呼び出し元が `fcntl` でフラグを確認した
+    /// 際に驚かせないよう、明示的に元へ戻す）。
     ///
     /// 戻り値の `File` は独立したハンドルであり、`Profile`（延いては
     /// `root_fd`/`data_dir_fd`）を drop した後も有効なまま使い続けられる
@@ -408,21 +434,56 @@ impl Profile {
                 reason: "file name must be a single path component without separators or '..'",
             });
         }
+        let display_path = self.data_dir(kind).join(name);
 
         let dir_fd = self.data_dir_fd(kind);
-        let flags = OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let mode = Mode::RUSR | Mode::WUSR;
-        let owned = rustix::fs::openat(dir_fd, name, flags, mode).map_err(|err| match err {
-            Errno::LOOP => ProfileError::InvalidLayout {
-                path: self.data_dir(kind).join(name),
-                reason: "file name is a symlink, refusing to follow",
-            },
-            Errno::NOTDIR => ProfileError::InvalidLayout {
-                path: self.data_dir(kind).join(name),
+        // `NONBLOCK` は FIFO 越しの open ブロックを避けるためだけに付ける
+        // （下記で実体確認後に解除する）。
+        let flags =
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+        let create_mode = Mode::RUSR | Mode::WUSR;
+        let owned = rustix::fs::openat(dir_fd, name, flags, create_mode)
+            .map_err(|err| classify_file_open_error(&display_path, err))?;
+
+        // 実体を確認する。ここで拒否する場合、`owned` はこのスコープを
+        // 抜ける際に drop され、FIFO・デバイス等を握ったまま放置しない。
+        let file_stat = rustix::fs::fstat(&owned).map_err(|err| ProfileError::Io(err.into()))?;
+        if !rustix::fs::FileType::from_raw_mode(file_stat.st_mode).is_file() {
+            return Err(ProfileError::InvalidLayout {
+                path: display_path,
                 reason: "path exists but is not a regular file",
-            },
-            other => ProfileError::Io(other.into()),
-        })?;
+            });
+        }
+
+        // 所有者を検証済みのプロファイルルートと比較する（`geteuid` の
+        // 代わり。上記 doc 参照）。
+        let root_stat =
+            rustix::fs::fstat(&self.root_fd).map_err(|err| ProfileError::Io(err.into()))?;
+        if file_stat.st_uid != root_stat.st_uid {
+            return Err(ProfileError::InvalidLayout {
+                path: display_path,
+                reason: "file owner does not match the profile root owner",
+            });
+        }
+
+        // ハードリンク経由で境界外の実体へ書き込ませる攻撃を防ぐ。
+        if file_stat.st_nlink != 1 {
+            return Err(ProfileError::InvalidLayout {
+                path: display_path,
+                reason: "file has multiple hard links, refusing to write through a shared inode",
+            });
+        }
+
+        // ここまでの検証を通過した通常ファイルのみパーミッションを締める。
+        rustix::fs::fchmod(&owned, create_mode).map_err(|err| ProfileError::Io(err.into()))?;
+
+        // `NONBLOCK` を解除する（通常ファイルの I/O には影響しないが、
+        // フラグを元の意図どおりに戻しておく）。
+        let current_flags =
+            rustix::fs::fcntl_getfl(&owned).map_err(|err| ProfileError::Io(err.into()))?;
+        rustix::fs::fcntl_setfl(&owned, current_flags.difference(OFlags::NONBLOCK))
+            .map_err(|err| ProfileError::Io(err.into()))?;
+
         Ok(std::fs::File::from(owned))
     }
 }
@@ -453,6 +514,30 @@ fn classify_dir_open_error(path: &Path, err: Errno) -> ProfileError {
         Errno::NOTDIR => ProfileError::InvalidLayout {
             path: path.to_path_buf(),
             reason: "path exists but is not a directory",
+        },
+        other => ProfileError::Io(other.into()),
+    }
+}
+
+/// [`Profile::create_file_in`] 用の `Errno` 分類。`classify_dir_open_error`
+/// と異なり `Errno::ISDIR` も扱う。`create_file_in` は `OFlags::RDWR` で
+/// 開くため、対象がディレクトリだと `ENOTDIR` ではなく `EISDIR` が返る
+/// （PR #437 再レビュー Cursor Low 指摘: 以前は `EISDIR` を分類しておらず
+/// `ProfileError::Io` になっていた）。
+#[cfg(unix)]
+fn classify_file_open_error(path: &Path, err: Errno) -> ProfileError {
+    match err {
+        Errno::LOOP => ProfileError::InvalidLayout {
+            path: path.to_path_buf(),
+            reason: "file name is a symlink, refusing to follow",
+        },
+        Errno::NOTDIR => ProfileError::InvalidLayout {
+            path: path.to_path_buf(),
+            reason: "a path component is not a directory",
+        },
+        Errno::ISDIR => ProfileError::InvalidLayout {
+            path: path.to_path_buf(),
+            reason: "path exists but is a directory",
         },
         other => ProfileError::Io(other.into()),
     }
@@ -1072,6 +1157,120 @@ mod tests {
 
         // 境界外（プロファイルルートの親）に何も作られていないこと。
         assert!(!tmp.path().join("escape").exists());
+    }
+
+    /// PROF-1（Unix 固有）: 既存ファイルが `0o644`（他ユーザーから読める
+    /// 権限）で存在していても、`create_file_in` はハードリンク・所有者の
+    /// 検証を通過した通常ファイルであれば `0o600` へ締め直す（PR #437
+    /// 再レビュー Codex P0 指摘: 既存ファイルの権限を無条件に信用しない）。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_create_file_in_rechmods_preexisting_file_to_0600() {
+        let tmp = TempDir::new();
+        let profile = Profile::open(tmp.path()).expect("open は成功する");
+
+        let file_path = tmp
+            .path()
+            .join(DataKind::Cookies.dir_name())
+            .join("session");
+        std::fs::write(&file_path, b"existing").expect("既存ファイルの作成");
+        std::fs::set_permissions(&file_path, Permissions::from_mode(0o644))
+            .expect("既存ファイルのパーミッション設定");
+
+        let file = profile
+            .create_file_in(DataKind::Cookies, std::ffi::OsStr::new("session"))
+            .expect("既存の通常ファイルは開ける");
+        let mode = file.metadata().expect("metadata 取得").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "既存ファイルのパーミッションが締め直されない");
+    }
+
+    /// PROF-1（Unix 固有）: `name` の位置に FIFO があると `create_file_in` は
+    /// ブロックせずに `InvalidLayout` で拒否する（PR #437 再レビュー Codex P1
+    /// 指摘: `OFlags::NONBLOCK` を付けない場合、相手側が open するまで
+    /// `openat` 自体がブロックし得る）。`mkfifo` コマンドを使うのは
+    /// `rustix::fs::mkfifoat` が macOS では利用できない（`cfg(not(apple))`）
+    /// ため、3 OS のテストで共通に使えるようにするため。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_create_file_in_fails_on_fifo_without_blocking() {
+        let tmp = TempDir::new();
+        let profile = Profile::open(tmp.path()).expect("open は成功する");
+
+        let fifo_path = tmp
+            .path()
+            .join(DataKind::Cookies.dir_name())
+            .join("session");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo コマンドの起動");
+        assert!(status.success(), "mkfifo コマンドが失敗した");
+
+        // `NONBLOCK` が効いていれば、対向の reader/writer がいなくても
+        // ここで即座に返る（ブロックしない）。
+        let err = profile
+            .create_file_in(DataKind::Cookies, std::ffi::OsStr::new("session"))
+            .expect_err("FIFO は拒否される");
+        assert!(matches!(err, ProfileError::InvalidLayout { .. }));
+    }
+
+    /// PROF-1（Unix 固有）: `name` の位置がディレクトリだと `create_file_in`
+    /// は `InvalidLayout` で拒否する（PR #437 再レビュー Cursor Low 指摘:
+    /// `O_RDWR` でディレクトリを開くと `EISDIR` になり、以前は
+    /// `ProfileError::Io` に分類されて `InvalidLayout` にならなかった）。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_create_file_in_fails_when_name_is_a_directory() {
+        let tmp = TempDir::new();
+        let profile = Profile::open(tmp.path()).expect("open は成功する");
+
+        let dir_path = tmp
+            .path()
+            .join(DataKind::Cookies.dir_name())
+            .join("session");
+        std::fs::create_dir(&dir_path).expect("ディレクトリの作成");
+
+        let err = profile
+            .create_file_in(DataKind::Cookies, std::ffi::OsStr::new("session"))
+            .expect_err("ディレクトリは拒否される");
+        assert!(matches!(err, ProfileError::InvalidLayout { .. }));
+    }
+
+    /// PROF-1（Unix 固有）: `name` の位置がハードリンク（`st_nlink != 1`）だと
+    /// `create_file_in` は `InvalidLayout` で拒否する（PR #437 再レビュー
+    /// Codex P0 指摘: ハードリンク経由で境界外の実体へ書き込ませる攻撃を
+    /// 防ぐ）。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_create_file_in_fails_on_hard_linked_file() {
+        let tmp = TempDir::new();
+        let profile = Profile::open(tmp.path()).expect("open は成功する");
+
+        // リンク元は別のデータ種別ディレクトリ（Storage）配下に置く。
+        // `tmp.path()` 直下（root）は `open` が `0o700` に締めるため、祖先の
+        // search 権限や `fs.protected_hardlinks` の挙動に左右されずに
+        // 同一ファイルシステム内でハードリンクを作れる。かつ「Cookies 側の
+        // ハードリンク経由で Storage 側の実体を書き換えられてはならない」
+        // という境界検証の意図とも一致する。
+        let source_path = tmp
+            .path()
+            .join(DataKind::Storage.dir_name())
+            .join("hardlink-source");
+        std::fs::write(&source_path, b"shared").expect("リンク元ファイルの作成");
+        let link_path = tmp
+            .path()
+            .join(DataKind::Cookies.dir_name())
+            .join("session");
+        std::fs::hard_link(&source_path, &link_path).expect("ハードリンクの作成");
+
+        let err = profile
+            .create_file_in(DataKind::Cookies, std::ffi::OsStr::new("session"))
+            .expect_err("ハードリンクは拒否される");
+        assert!(matches!(err, ProfileError::InvalidLayout { .. }));
+
+        // リンク元の内容が変更されていないこと（誤って書き込まれていない）。
+        let content = std::fs::read(&source_path).expect("リンク元の読み取り");
+        assert_eq!(content, b"shared");
     }
 
     /// PROF-1（Unix 固有）: 相対パスで `open` しても、`root()` は絶対パスを
