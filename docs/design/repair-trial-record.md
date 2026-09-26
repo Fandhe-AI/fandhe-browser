@@ -94,7 +94,7 @@ cargo test --workspace
 - `" application/xhtml+xml "` → type `application`、subtype `xhtml+xml`
 - `"text/"`・`"/html"`・`"texthtml"`・`""`・トークン外の文字を含む値 → `None`
 - ヘッダなし（`content_type()` が `None`）→ `None`
-- テストは `fetch.rs` の unit test に置く（`FetchResponse` のフィールドは private なので、純粋関数 `parse_mime_type(&str)` を切り出してテストする）。名前は `core_1_mime_type_*`
+- テストは `fetch.rs` の unit test に置く。パーサー本体の分岐網羅は純粋関数 `parse_mime_type(&str)` を切り出してテストするが、それだけでは `parse_mime_type` の呼び出しから `FetchResponse::mime_type()` への値の受け渡しが未実装でも受け入れ条件を満たしてしまうため、既存の fetch テスト（レスポンスを取得して検証する形式）と同様に、実際にレスポンスを取得して `mime_type()` の戻り値を確認する受け入れテストを最低 1 本追加し、公開 API 自体を検証する。名前は `core_1_mime_type_*`
 
 ### R-5: `ParseDiagnosticEntry`
 
