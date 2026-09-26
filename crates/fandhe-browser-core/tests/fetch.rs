@@ -6,8 +6,8 @@
 //! #36（TASK-24.2）で用意した最低限（タイムアウト・リダイレクト上限・
 //! 本文上限・scheme 拒否・内部アドレス拒否・正常系）に加え、本ファイルは
 //! #37（TASK-24.3・MS-1）でタイムアウト（本文受信中）・リダイレクト（相対
-//! `Location`・userinfo 除去・`Location` 欠如の 3xx）・異常系（接続断・
-//! 不正な応答・truncated body・接続拒否・秘密情報除去）・本文上限の境界
+//! `Location`・userinfo 除去・`Location` 欠如の 3xx）・異常系（応答なしの
+//! 接続断・不正な応答・truncated body・秘密情報除去）・本文上限の境界
 //! （ちょうど・+1・chunked）・送信前拒否（scheme・内部 IP リテラルの
 //! テーブル駆動）を拡充した（受け入れ条件「タイムアウト・リダイレクト
 //! 上限・異常系のテストが具体値で検証される」）。
@@ -93,8 +93,8 @@ where
     port
 }
 
-/// 接続そのものは受け付けるが、応答を一切書かずに即座に接続を打ち切る
-/// （`SO_LINGER(0)` で RST を強制する）ループバックサーバーを起動する。
+/// 接続そのものは受け付けるが、応答を一切書かずに接続を閉じる（FIN）
+/// ループバックサーバーを起動する。
 ///
 /// PR #434 コードレビュー指摘（codex、P2）: `TcpListener::bind` 直後に
 /// `drop` して空きポート番号だけを再利用する方式は、`drop` から
@@ -610,16 +610,10 @@ async fn core_1_fetch_too_many_redirects_request_count() {
         ),
         "unexpected error: {err:?}"
     );
-    // サーバーへの到達回数が安定するまで（打ち切り後のクライアント側の
-    // 後始末が非同期のため）短時間ポーリングする。
-    let mut reached = counter.load(std::sync::atomic::Ordering::SeqCst);
-    for _ in 0..50 {
-        if reached > MAX_REDIRECTS {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        reached = counter.load(std::sync::atomic::Ordering::SeqCst);
-    }
+    // サーバーはレスポンスを書く前にカウンタをインクリメントし、reqwest は
+    // 直前のレスポンスを受け取るまで次のリクエストを送らないため、`get()`
+    // が返った時点でカウンタは既に確定している（ポーリング不要）。
+    let reached = counter.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         reached,
         MAX_REDIRECTS + 1,
@@ -822,7 +816,7 @@ async fn core_1_fetch_network_error_on_truncated_body() {
 /// 手放す方式（PR #434 コードレビュー指摘）と異なりポート再利用の競合が
 /// 起きない。
 #[tokio::test]
-async fn core_1_fetch_network_error_on_connection_refused() {
+async fn core_1_fetch_network_error_on_no_response_before_close() {
     let port = spawn_connection_reset_server();
 
     let fetcher = Fetcher::new(loopback_allowed_options()).expect("Fetcher::new が失敗しないこと");
