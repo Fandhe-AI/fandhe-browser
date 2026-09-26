@@ -102,7 +102,7 @@ pub fn execute_js_stub(script: &str) -> crate::Result<JsExecutionOutput> {
 
 ```rust
 /// レスポンス本文を UTF-8 として非可逆変換した文字列（不正なバイト列は
-/// 置換文字に置き換える）。厳密な文字コード判定（`charset` ヘッダ・
+/// 置換文字に置き換える）簡易実装。厳密な文字コード判定（`charset` ヘッダ・
 /// meta タグ由来。ビヘイビア `CORE-5` (7)・`TASK-25`・`MS-3`）は範囲外の将来仕様であり、
 /// これは参考用の簡易変換に留まる。
 pub fn body_text_lossy(&self) -> String {
