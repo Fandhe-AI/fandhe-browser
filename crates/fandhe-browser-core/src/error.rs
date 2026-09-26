@@ -133,6 +133,20 @@ pub enum Error {
         /// `reqwest::Error` の `without_url()` 後の Display 文字列。
         message: String,
     },
+    /// `query` モジュール（TASK-24（24.10）・#418・ビヘイビア `CORE-1`）の
+    /// `element_matches`/`query_selector_all`/`query_selector` が、内部の
+    /// 照合メモ化キャッシュ（`MatchCache`）の合計エントリ数が
+    /// `query::MAX_MATCH_CACHE_ENTRIES` を超えると判定した場合に返す。
+    /// `ParseOptions::max_nodes`・`selector::MAX_SELECTORS_PER_LIST`・
+    /// `selector::MAX_COMPOUNDS_PER_COMPLEX` の組み合わせ次第では理論上の
+    /// メモリ上限がこの値を大きく上回るため、実効的なメモリ上限として
+    /// 独立に検査する（security.md「不安全な設計」対策・PR #439 レビュー
+    /// 指摘 P0）。一律 `false`/空の結果へフォールバックせず、明示的な API
+    /// エラーとして呼び出し側に伝える。
+    MatchCacheLimitExceeded {
+        /// 適用された上限値（`query::MAX_MATCH_CACHE_ENTRIES`）。
+        limit: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -162,6 +176,9 @@ impl fmt::Display for Error {
                 write!(f, "too many concurrent DNS resolutions (limit: {limit})")
             }
             Error::Network { message } => write!(f, "network error: {message}"),
+            Error::MatchCacheLimitExceeded { limit } => {
+                write!(f, "selector match cache exceeded limit of {limit} entries")
+            }
         }
     }
 }
@@ -180,7 +197,8 @@ impl std::error::Error for Error {
             | Error::DisallowedScheme { .. }
             | Error::DisallowedAddress { .. }
             | Error::TooManyConcurrentDnsResolutions { .. }
-            | Error::Network { .. } => None,
+            | Error::Network { .. }
+            | Error::MatchCacheLimitExceeded { .. } => None,
         }
     }
 }
@@ -582,5 +600,20 @@ mod tests {
                 None::<String>
             );
         }
+    }
+
+    /// CORE-1（TASK-24（24.10）・#418）: `Error::MatchCacheLimitExceeded` の
+    /// `Display` が上限値を含み、`source()` が `None` を返す。
+    #[test]
+    fn core_1_display_and_source_for_match_cache_limit_exceeded_variant() {
+        let err = Error::MatchCacheLimitExceeded { limit: 1_000_000 };
+        assert_eq!(
+            err.to_string(),
+            "selector match cache exceeded limit of 1000000 entries"
+        );
+        assert_eq!(
+            std::error::Error::source(&err).map(ToString::to_string),
+            None::<String>
+        );
     }
 }
