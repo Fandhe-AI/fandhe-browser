@@ -187,6 +187,32 @@ fn core_1_expected_non_empty_matches_any_non_empty_outcome() {
     assert_eq!(judge(&empty, Expected::NonEmpty), Status::UnexpectedEmpty);
 }
 
+/// CORE-1・TASK-26（26.1）・PR #458 レビュー指摘（P1）の回帰: 要素数だけで
+/// `Expected::NonEmpty` を判定すると、見出しなどが空文字・空白のみでも
+/// `Status::Ok` になり成功率を過大評価してしまう。正規化後に内容のある値が
+/// 1 件も無い `Values`/`Pairs` は `Status::UnexpectedEmpty` になることを
+/// 確認する。
+#[test]
+fn core_1_expected_non_empty_rejects_whitespace_only_outcome() {
+    let blank_values = Outcome::Values(vec!["".to_string(), "   ".to_string()]);
+    assert_eq!(
+        judge(&blank_values, Expected::NonEmpty),
+        Status::UnexpectedEmpty
+    );
+
+    let blank_pairs = Outcome::Pairs(vec![("name".to_string(), "  ".to_string())]);
+    assert_eq!(
+        judge(&blank_pairs, Expected::NonEmpty),
+        Status::UnexpectedEmpty
+    );
+
+    let meaningful_pairs = Outcome::Pairs(vec![
+        ("name".to_string(), "  ".to_string()),
+        ("email".to_string(), "a@example.com".to_string()),
+    ]);
+    assert_eq!(judge(&meaningful_pairs, Expected::NonEmpty), Status::Ok);
+}
+
 /// CORE-1・TASK-26（26.1）: `Category::label`/`Status::label`（CLI 出力の
 /// 整形。`main.rs` の `local`/`real` 両モードが使う）と、実サイトモード限定の
 /// `Status::Http`/`Status::FetchError` variant を検証する。`tasks.rs` は

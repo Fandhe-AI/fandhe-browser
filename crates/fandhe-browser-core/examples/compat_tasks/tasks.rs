@@ -92,6 +92,20 @@ impl Outcome {
             Outcome::Pairs(v) => v.is_empty(),
         }
     }
+
+    /// 正規化後に内容のある値が 1 件以上存在するかを判定する
+    /// （`Expected::NonEmpty` 専用。`is_empty` は要素数のみを見るため、
+    /// 実サイトの見出しなどが空文字・空白のみの要素を持つ場合に
+    /// `Texts`/`Attr`/`Form` タスクが誤って `Status::Ok` になり CORE-1 の
+    /// 成功率を過大評価してしまう。`Values` は各要素、`Pairs` は各 value
+    /// を trim して非空かで判定する（`Attr` は [`run_task`] で正規化して
+    /// いないため、ここで trim する）。
+    fn has_meaningful_content(&self) -> bool {
+        match self {
+            Outcome::Values(v) => v.iter().any(|s| !s.trim().is_empty()),
+            Outcome::Pairs(v) => v.iter().any(|(_, value)| !value.trim().is_empty()),
+        }
+    }
 }
 
 /// タスク実行の判定結果。将来のステータス追加に備えて `#[non_exhaustive]`
@@ -345,10 +359,10 @@ pub fn judge(outcome: &Outcome, expected: Expected) -> Status {
             Outcome::Values(_) => Status::Mismatch,
         },
         Expected::NonEmpty => {
-            if outcome.is_empty() {
-                Status::UnexpectedEmpty
-            } else {
+            if outcome.has_meaningful_content() {
                 Status::Ok
+            } else {
+                Status::UnexpectedEmpty
             }
         }
         Expected::Empty => {
