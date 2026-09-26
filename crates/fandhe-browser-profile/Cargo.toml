@@ -4,4 +4,4 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "プロファイル分離 crate（fandhe-browser）。雛形（TASK-1.7）。本実装は TASK-50"
+description = "プロファイル分離 crate（fandhe-browser）。Profile 型の骨格を実装（TASK-50（50.1））"
