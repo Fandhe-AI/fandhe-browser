@@ -23,21 +23,34 @@
 //!   （未設定時の既定値は `mcp`）
 //! - `COMPETITOR_BENCH_TRIALS`: cold start / RSS の試行回数（既定 5・上限 20）
 //!
-//! 新規外部依存は追加しない（`std` のみで完結。dependency-policy.md）。
+//! 終了コード契約（レビュー指摘 P1。Codex。PR #442）: JSON は必ず stdout へ
+//! 出力したうえで、いずれかの計測項目が `Outcome::Error`（対象バイナリの
+//! 起動失敗・MCP 呼び出し失敗等）になった場合は終了コード `1` で終了する。
+//! 対象バイナリ未設定による `Outcome::Skipped`・Windows 未対応による
+//! `Outcome::Unsupported` のみの場合は `0` で終了する。自動計測（CI 等）の
+//! 呼び出し側はこの終了コードで成功・失敗を判定できる。
+//!
+//! 新規外部依存は追加しない（`Cargo.toml` の `dependencies` に変更なし。
+//! dependency-policy.md）。`support::validate_bench_url` の URL 正規化のみ
+//! `reqwest::Url`（暫定ホスト `fandhe-browser-core` が既に依存し、
+//! `Cargo.lock` に解決済みの推移依存）を再利用する（レビュー指摘 P0・Medium。
+//! PR #442。詳細は `support.rs` の同関数ドキュメント参照）。それ以外は
+//! `std` のみで完結する。
 
 #[path = "competitor_lightpanda/support.rs"]
 mod support;
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use support::{
-    JsonValue, approx_tokens, expand_args, json_escape, median, parse_http_status, parse_json,
-    reduction_pct, split_args, validate_bench_url,
+    JsonValue, Outcome, approx_tokens, bench_exit_code, check_resolved_addrs, expand_args,
+    json_escape, median, parse_http_status, parse_json, reduction_pct, split_args,
+    validate_bench_url,
 };
 // `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
 // 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
@@ -79,48 +92,6 @@ const DEFAULT_SITES: [&str; 5] = [
 /// 相手プロセスが不正・悪意ある出力を送り続けても無制限にバッファへ
 /// 蓄積しないための上限（coding-rust.md）。
 const MAX_LINE_BYTES: usize = 1024 * 1024;
-
-/// 計測 1 件の結果。成功しなかった場合も理由を残し「実装済みを装わない」
-/// （coding-rust.md「公開 API」・REPAIR-4 相当の方針をベンチ出力にも適用）。
-enum Outcome {
-    Value(f64),
-    Skipped(String),
-    // Windows（`cfg(windows)` 版の `measure_idle_rss`）でのみ構築する
-    // バリアント。Linux/macOS ネイティブビルドではこのバリアントを構築する
-    // コード経路が存在しないため dead_code 警告が出るが、3 OS CI
-    // （ci.md）の各ネイティブランナーでは Windows ビルド時に使われる。
-    #[allow(dead_code)]
-    Unsupported(String),
-    Error(String),
-}
-
-impl Outcome {
-    /// `{"status":"...","value":...}` 形式の JSON 断片を返す（依存追加を避けるため
-    /// 手書きシリアライズ。support.rs の `json_escape` を使う）。
-    fn to_json(&self) -> String {
-        match self {
-            Outcome::Value(v) => format!("{{\"status\":\"measured\",\"value\":{v}}}"),
-            Outcome::Skipped(reason) => {
-                format!(
-                    "{{\"status\":\"skipped\",\"reason\":\"{}\"}}",
-                    json_escape(reason)
-                )
-            }
-            Outcome::Unsupported(reason) => {
-                format!(
-                    "{{\"status\":\"unsupported\",\"reason\":\"{}\"}}",
-                    json_escape(reason)
-                )
-            }
-            Outcome::Error(reason) => {
-                format!(
-                    "{{\"status\":\"error\",\"reason\":\"{}\"}}",
-                    json_escape(reason)
-                )
-            }
-        }
-    }
-}
 
 /// 計測対象 1 つ分の設定（Lightpanda / fandhe-browser）。
 ///
@@ -195,6 +166,26 @@ fn trial_count() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| (1..=MAX_TRIALS).contains(&n))
         .unwrap_or(DEFAULT_TRIALS)
+}
+
+/// `validate_bench_url` がドメイン名（`Ok(Some(host))`）を返した場合に、
+/// 実際に DNS 解決してすべての解決先が公開アドレスであることを確認する。
+///
+/// レビュー指摘 P0・Medium（PR #442）: `validate_bench_url` は IP リテラル
+/// 表記の正規化・拒否のみを行う純粋関数（support.rs。ソケット通信を持たない
+/// 設計方針）であるため、ドメイン名は呼び出し元がこの関数で DNS 解決した
+/// 結果を検証する。`(host, 80)` はポート番号を必要としない
+/// `ToSocketAddrs` 呼び出し用のダミー値（実際の接続はしない）。解決失敗も
+/// 拒否として扱う（fail-closed。coding-rust.md）。リダイレクト先のホストは
+/// この検証を経ないため、依然として TOCTOU が残る（`validate_bench_url` の
+/// ドキュメント参照。best-effort のゲート）。
+fn resolve_and_check_host(host: &str) -> Result<(), String> {
+    let addrs: Vec<IpAddr> = (host, 80u16)
+        .to_socket_addrs()
+        .map_err(|e| format!("DNS resolution failed: {e}"))?
+        .map(|addr| addr.ip())
+        .collect();
+    check_resolved_addrs(&addrs)
 }
 
 /// 子プロセスを確実に終了させる guard。早期 `return`（`?`）経路でも
@@ -731,9 +722,21 @@ fn measure_token_reduction(target: &Target) -> Outcome {
     };
     // レビュー指摘 P0: `file:` scheme・内部アドレスの無検証な `goto` を防ぐ
     // （security.md「SSRF」）。既定サイト群も含め、渡す前に必ず検証する。
+    // レビュー指摘 P0・Medium（PR #442）: `validate_bench_url` は IP
+    // リテラルの正規化・拒否のみを行う純粋関数のため、ドメイン名の URL は
+    // ここで実際に DNS 解決し、解決先すべてが公開アドレスであることを
+    // `check_resolved_addrs` で確認する（best-effort。関数ドキュメント参照）。
     for url in &sites {
-        if let Err(reason) = validate_bench_url(url) {
-            return Outcome::Error(format!("{}: {reason}", target.name));
+        match validate_bench_url(url) {
+            Ok(None) => {}
+            Ok(Some(host)) => {
+                if let Err(reason) = resolve_and_check_host(&host) {
+                    return Outcome::Error(format!("{}: {url}: {reason}", target.name));
+                }
+            }
+            Err(reason) => {
+                return Outcome::Error(format!("{}: {reason}", target.name));
+            }
         }
     }
 
@@ -843,7 +846,7 @@ fn measure_token_reduction(target: &Target) -> Outcome {
     }
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     let trials = trial_count();
     let targets = [
         Target::from_env(
@@ -861,6 +864,11 @@ fn main() {
     ];
 
     let mut body = String::from("{\n");
+    // レビュー指摘 P1（Codex。PR #442・competitor_lightpanda.rs:893）:
+    // 全計測項目の `Outcome` をここへ集め、`bench_exit_code` へ一括で渡す
+    // （`Outcome::is_error` は support.rs 内限定のため、判定自体は
+    // `bench_exit_code` 側に閉じる）。
+    let mut outcomes: Vec<Outcome> = Vec::new();
     for (i, target) in targets.iter().enumerate() {
         eprintln!("=== {} ===", target.name);
         let binary_size = measure_binary_size(target);
@@ -887,8 +895,18 @@ fn main() {
             body.push(',');
         }
         body.push('\n');
+
+        outcomes.push(binary_size);
+        outcomes.push(cold_start);
+        outcomes.push(idle_rss);
+        outcomes.push(token_reduction);
     }
     body.push_str("}\n");
 
+    // 終了コードを決める前に必ず JSON を出力する（モジュールドキュメントの
+    // 終了コード契約参照。呼び出し側が失敗時も結果 JSON を取得できるようにする）。
     print!("{body}");
+
+    let outcome_refs: Vec<&Outcome> = outcomes.iter().collect();
+    std::process::ExitCode::from(bench_exit_code(&outcome_refs))
 }

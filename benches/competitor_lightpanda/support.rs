@@ -13,7 +13,14 @@
 //! なる。unused であっても `pub` は免除されない）。
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+// `reqwest`（`fandhe-browser-core` の既存依存。ホストする crate の
+// `Cargo.toml` 参照）は `url::Url` を `reqwest::Url` として re-export している。
+// 新規依存を追加せず（dependency-policy.md）、既存の推移依存から WHATWG URL
+// 準拠のパーサーを使うため、ここでは `reqwest::Url` を経由して取り込む
+// （レビュー指摘 P0/Medium。PR #442）。
+use reqwest::Url;
 
 /// 複数回試行した計測値（ミリ秒・キロバイト等）から中央値を求める。
 ///
@@ -113,6 +120,80 @@ pub fn split_args(env: &str) -> Vec<String> {
     env.split_whitespace().map(str::to_string).collect()
 }
 
+/// 計測 1 件の結果。成功しなかった場合も理由を残し「実装済みを装わない」
+/// （coding-rust.md「公開 API」・REPAIR-4 相当の方針をベンチ出力にも適用）。
+///
+/// `main`（`competitor_lightpanda.rs`）が構築し、[`bench_exit_code`] の入力
+/// および JSON 出力（[`Outcome::to_json`]）に使う。純粋関数群と同じ
+/// `support.rs` に置くことで、[`bench_exit_code`] のテスト（`Skipped`/
+/// `Unsupported` のみでは `0`、`Error` を含むと非ゼロ）を副作用なしに書ける
+/// （レビュー指摘 P1。Codex。PR #442・competitor_lightpanda.rs:893）。
+pub enum Outcome {
+    Value(f64),
+    Skipped(String),
+    // Windows（`cfg(windows)` 版の `measure_idle_rss`）でのみ構築される
+    // バリアント。Linux/macOS ネイティブビルドではこのバリアントを構築する
+    // コード経路が存在しないため dead_code 警告が出るが、3 OS CI
+    // （ci.md）の各ネイティブランナーでは Windows ビルド時に使われる。
+    #[allow(dead_code)]
+    Unsupported(String),
+    Error(String),
+}
+
+impl Outcome {
+    /// この計測項目が失敗（`Outcome::Error`）かどうかを返す。
+    ///
+    /// `main` が全計測項目を走査して終了コード（[`bench_exit_code`]）を
+    /// 決めるために使う。
+    fn is_error(&self) -> bool {
+        matches!(self, Outcome::Error(_))
+    }
+
+    /// `{"status":"...","value":...}` 形式の JSON 断片を返す（依存追加を避けるため
+    /// 手書きシリアライズ。同ファイルの [`json_escape`] を使う）。
+    pub fn to_json(&self) -> String {
+        match self {
+            Outcome::Value(v) => format!("{{\"status\":\"measured\",\"value\":{v}}}"),
+            Outcome::Skipped(reason) => {
+                format!(
+                    "{{\"status\":\"skipped\",\"reason\":\"{}\"}}",
+                    json_escape(reason)
+                )
+            }
+            Outcome::Unsupported(reason) => {
+                format!(
+                    "{{\"status\":\"unsupported\",\"reason\":\"{}\"}}",
+                    json_escape(reason)
+                )
+            }
+            Outcome::Error(reason) => {
+                format!(
+                    "{{\"status\":\"error\",\"reason\":\"{}\"}}",
+                    json_escape(reason)
+                )
+            }
+        }
+    }
+}
+
+/// 全計測結果から `main` の終了コードを決める。
+///
+/// レビュー指摘 P1（Codex。competitor_lightpanda.rs:893）: `Outcome::Error`
+/// （対象バイナリの起動失敗・MCP 呼び出し失敗等の計測失敗）が発生しても
+/// `main` が常に正常終了すると、自動計測が失敗した実行を成功と誤判定し得る。
+/// `main` の終了コード契約: 1 件でも計測失敗（`Outcome::Error`）があれば
+/// 非ゼロ（`1`）で終了する。対象バイナリ未設定による `Outcome::Skipped`・
+/// Windows 未対応による `Outcome::Unsupported` のみの場合は `0` で終了する
+/// （JSON は失敗の有無に関わらず必ず stdout へ出力する）。`main`（`[[bench]]`
+/// ターゲット）は `std::process::ExitCode` を返す契約のため `u8` で返す。
+pub fn bench_exit_code(outcomes: &[&Outcome]) -> u8 {
+    if outcomes.iter().any(|o| o.is_error()) {
+        1
+    } else {
+        0
+    }
+}
+
 /// 出力 JSON へ埋め込む文字列をエスケープする。
 ///
 /// 手書き JSON シリアライズ（実装計画 3.3 節。新規依存を避けるため `serde_json`
@@ -133,88 +214,145 @@ pub fn json_escape(input: &str) -> String {
     out
 }
 
+/// IPv4 アドレスが一般公開向けの到達性を持たない特殊用途アドレスかを判定する
+/// （security.md「SSRF」）。
+///
+/// `fandhe-browser-core::fetch` の `is_disallowed_ipv4`（CORE-1・#36・PR #430
+/// レビュー指摘）と同じ規則を適用する。同関数は `fandhe-browser-core` 内部
+/// 限定（`pub` ではない）で bench クレートから再利用できないため、判定規則を
+/// ここに複製する（規則の変更が必要になった場合は両箇所を揃えて更新する）。
+/// `std::net::Ipv4Addr` の安定 API だけでは共有アドレス空間
+/// （`100.64.0.0/10`）等の IANA 特殊用途ブロックが抜け落ちるため、既知ブロックを
+/// 明示的に列挙する。
+fn is_disallowed_ipv4(v4: Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    v4.is_loopback() // 127.0.0.0/8
+        || v4.is_private() // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+        || v4.is_link_local() // 169.254.0.0/16
+        || v4.is_unspecified() // 0.0.0.0
+        || v4.is_broadcast() // 255.255.255.255
+        || v4.is_documentation() // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+        || octets[0] == 0 // 0.0.0.0/8 ("this network")
+        || (octets[0] == 100 && (64..=127).contains(&octets[1])) // 100.64.0.0/10 共有アドレス空間（CGN）
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // 192.0.0.0/24 IETF Protocol Assignments
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99) // 192.88.99.0/24 6to4 Relay Anycast
+        || (octets[0] == 198 && (18..=19).contains(&octets[1])) // 198.18.0.0/15 ベンチマーク用
+        || octets[0] >= 224 // 224.0.0.0/4 マルチキャスト + 240.0.0.0/4 予約済み
+}
+
+/// IPv6 アドレスが非推奨のサイトローカルブロック `fec0::/10` に属するかを
+/// 判定する（`fandhe-browser-core::fetch::is_ipv6_site_local` と同じ規則）。
+fn is_ipv6_site_local(v6: Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xffc0) == 0xfec0
+}
+
+/// [`IpAddr`] が内部・特殊用途アドレスかを判定する。
+///
+/// `fandhe-browser-core::fetch::is_disallowed_address` の規則（IPv4 側の
+/// 判定・IPv6 の ULA・リンクローカル・非推奨サイトローカル・v4-mapped
+/// 埋め込みアドレスの展開）に加え、次の点を拡張する（レビュー指摘 Medium。
+/// PR #442）:
+/// - `Ipv6Addr::to_ipv4`（core 側は `to_ipv4_mapped` のみ）を使い、
+///   `::ffff:a.b.c.d`（v4-mapped）だけでなく `::a.b.c.d`（v4-compatible。
+///   非推奨だがパーサーが受理し得る）も展開する。`[::ffff:127.0.0.1]` の
+///   ような表記で v4 側の分類をすり抜けられない。
+/// - `v6.is_multicast()` を追加する（core 側にはこの判定がなく、IPv6
+///   マルチキャストが素通りし得る。core 側への同様の追加はスコープ外の
+///   発見事項として別途報告する）。
+fn is_disallowed_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_disallowed_ipv4(v4),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unique_local() // ULA（fc00::/7）
+                || v6.is_unicast_link_local() // リンクローカル（fe80::/10）
+                || is_ipv6_site_local(v6)
+                || v6.to_ipv4().is_some_and(is_disallowed_ipv4)
+        }
+    }
+}
+
 /// `COMPETITOR_BENCH_SITES`（外部入力）の各 URL を `goto` へ渡す前に検証する。
 ///
 /// レビュー指摘 P0（SSRF。security.md「OWASP Top 10」）: scheme・件数・長さの
 /// 検証がないまま MCP の `goto` ツールへ URL を渡すと、`file:` scheme や
 /// ループバック・プライベート・リンクローカル等の内部アドレスへ計測対象
-/// ブラウザ経由で意図せずアクセスする経路になる。ここでは scheme を
-/// `http` / `https` に限定し、ホストがループバック・プライベート・
-/// リンクローカル・未指定・マルチキャストアドレス（または `localhost`）で
-/// ないことを確認する。DNS 名はここでは解決しない（解決してもリダイレクト先
-/// が別アドレスへ変わり得る TOCTOU が残るため）。実際の名前解決・リダイレクト
-/// 追従は計測対象ブラウザ（Lightpanda 等）の実装に委ねられ、本関数はベンチ
-/// スクリプト自身が明らかに内部向け・非 HTTP(S) の URL を渡さないことだけを
-/// 保証する best-effort のゲートである。
-pub fn validate_bench_url(url: &str) -> Result<(), String> {
-    let lower = url.to_ascii_lowercase();
-    let after_scheme = if let Some(rest) = lower.strip_prefix("http://") {
-        rest
-    } else if let Some(rest) = lower.strip_prefix("https://") {
-        rest
-    } else {
+/// ブラウザ経由で意図せずアクセスする経路になる。
+///
+/// レビュー指摘 P0・Medium（PR #442）: 独自の素朴な文字列分割でホストを
+/// 取り出していた旧実装は、`http://127.1/`・`http://2130706433/` のような
+/// ブラウザが IPv4 として解釈する数値表記や `[::ffff:127.0.0.1]` のような
+/// IPv4-mapped IPv6 表記を素通りさせていた。ここでは `reqwest::Url`
+/// （新規依存ではなく既存の推移依存を再利用。dependency-policy.md）で
+/// WHATWG URL 標準に沿ってホストを正規化してから判定することで、計測対象
+/// ブラウザ（Chromium 系）が実際に解釈するホストと同じ結果を得る。
+///
+/// ホストが IP リテラルに正規化された場合は上記の内部・特殊用途アドレス
+/// 判定をこの関数内で適用し、`Ok(None)` を返す。ホストがドメイン名の場合は
+/// ここでは DNS を解決せず、正規化済みホスト名を `Ok(Some(host))` で返す
+/// （純粋関数として保つため。呼び出し元がソケット通信を伴う DNS 解決を行い、
+/// 結果を [`check_resolved_addrs`] で検証する契約とする）。
+///
+/// 呼び出し元が解決結果を検証しない限り、ドメイン名の URL は内部アドレス
+/// へ解決され得る点は残る（リダイレクト追従時も同様。TOCTOU）。実際の
+/// 名前解決・リダイレクト追従は計測対象ブラウザ（Lightpanda 等）の実装に
+/// 委ねられ、この 2 関数の組み合わせはベンチスクリプト自身が明らかに
+/// 内部向け・非 HTTP(S) の URL を渡さないことを保証する best-effort の
+/// ゲートである。
+pub fn validate_bench_url(url: &str) -> Result<Option<String>, String> {
+    let parsed = Url::parse(url).map_err(|err| format!("{url}: invalid URL ({err})"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(format!("{url}: only http/https URLs are allowed"));
-    };
-    // scheme を除いた残り（元の大小文字を保つ）を取り出す。
-    let original_after_scheme = &url[url.len() - after_scheme.len()..];
-
-    // authority（ホスト部）は次の '/' '?' '#' のいずれかで終わる。
-    let authority_end = original_after_scheme
-        .find(['/', '?', '#'])
-        .unwrap_or(original_after_scheme.len());
-    let authority = &original_after_scheme[..authority_end];
-    if authority.is_empty() {
-        return Err(format!("{url}: missing host"));
     }
-    // userinfo（"user:pass@host"）があれば取り除く。
-    let host_port = match authority.rsplit_once('@') {
-        Some((_, rest)) => rest,
-        None => authority,
-    };
-    // IPv6 リテラル（"[::1]:port"）とそれ以外を区別してホスト文字列を取り出す。
-    let host = if let Some(rest) = host_port.strip_prefix('[') {
-        match rest.split_once(']') {
-            Some((inner, _)) => inner,
-            None => return Err(format!("{url}: malformed IPv6 host")),
-        }
-    } else {
-        match host_port.split_once(':') {
-            Some((h, _)) => h,
-            None => host_port,
-        }
-    };
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("{url}: missing host"))?;
+    // IPv6 リテラルは `[...]` 付きで返る（`Url::host_str` の仕様）ため、
+    // IP パース前に括弧を取り除く。
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     if host.is_empty() {
         return Err(format!("{url}: missing host"));
     }
     if host.eq_ignore_ascii_case("localhost") {
         return Err(format!("{url}: internal host is not allowed"));
     }
-    // ホストが IP リテラルなら、内部・特殊用途アドレスかを検証する。
-    // ホスト名（DNS 名）はここでは解決しない（関数ドキュメント参照）。
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        let blocked = match ip {
-            IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-                    || v4.is_documentation()
+    // ホストが IP リテラルに正規化されていれば、内部・特殊用途アドレスかを
+    // ここで検証し切る（呼び出し元へ DNS 解決を要求しない）。
+    match host.parse::<IpAddr>() {
+        Ok(ip) => {
+            if is_disallowed_address(ip) {
+                return Err(format!("{url}: internal/reserved address is not allowed"));
             }
-            IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_multicast()
-                    // ULA（fc00::/7）。安定 API の is_unique_local に頼らず
-                    // 先頭バイトで判定する。
-                    || (v6.segments()[0] & 0xfe00) == 0xfc00
-                    // リンクローカル（fe80::/10）。
-                    || (v6.segments()[0] & 0xffc0) == 0xfe80
-            }
-        };
-        if blocked {
-            return Err(format!("{url}: internal/reserved address is not allowed"));
+            Ok(None)
         }
+        // ドメイン名。呼び出し元が DNS 解決した結果を
+        // `check_resolved_addrs` で検証する契約（関数ドキュメント参照）。
+        Err(_) => Ok(Some(host.to_string())),
+    }
+}
+
+/// ドメイン名を DNS 解決した結果（[`validate_bench_url`] が `Ok(Some(host))`
+/// を返した場合の後続処理）が公開アドレスのみから成ることを確認する。
+///
+/// レビュー指摘 P0・Medium（PR #442）: `validate_bench_url` は IP リテラルの
+/// 正規化・拒否は行うが、ドメイン名（DNS 名）はここでは解決しないため、
+/// `goto` へ渡す前に呼び出し元が実際に解決したアドレスも検証する必要がある。
+/// 解決先が 1 件もない、またはいずれか 1 件でも内部・特殊用途アドレスなら
+/// 拒否する（fail-closed。coding-rust.md）。ソケット通信を伴う DNS 解決
+/// 自体は呼び出し元（`competitor_lightpanda.rs`）が行い、この関数は解決済み
+/// アドレス列の判定のみを行う純粋関数に留める（このファイルの設計方針。
+/// モジュールドキュメント参照）。
+pub fn check_resolved_addrs(addrs: &[IpAddr]) -> Result<(), String> {
+    if addrs.is_empty() {
+        return Err("DNS resolution returned no addresses".to_string());
+    }
+    if let Some(addr) = addrs.iter().find(|ip| is_disallowed_address(**ip)) {
+        return Err(format!("resolved to internal/reserved address: {addr}"));
     }
     Ok(())
 }
@@ -710,6 +848,49 @@ mod tests {
         assert_eq!(split_args(""), Vec::<String>::new());
     }
 
+    // レビュー指摘 P1（Codex。competitor_lightpanda.rs:893）: `Skipped`・
+    // `Unsupported`（未設定・未対応。失敗ではない）のみでは終了コード 0、
+    // `Error`（計測失敗）を 1 件でも含むと非ゼロになることを確認する。
+    #[test]
+    fn bench_exit_code_is_zero_for_skipped_and_unsupported_only() {
+        let skipped = Outcome::Skipped("not configured".to_string());
+        let unsupported = Outcome::Unsupported("not supported on this OS".to_string());
+        let value = Outcome::Value(1.0);
+        assert_eq!(bench_exit_code(&[&skipped, &unsupported, &value]), 0);
+    }
+
+    #[test]
+    fn bench_exit_code_is_nonzero_when_any_error() {
+        let skipped = Outcome::Skipped("not configured".to_string());
+        let error = Outcome::Error("binary launch failed".to_string());
+        assert_eq!(bench_exit_code(&[&skipped, &error]), 1);
+    }
+
+    #[test]
+    fn bench_exit_code_is_zero_for_empty_outcomes() {
+        assert_eq!(bench_exit_code(&[]), 0);
+    }
+
+    #[test]
+    fn outcome_to_json_shapes() {
+        assert_eq!(
+            Outcome::Value(12.5).to_json(),
+            r#"{"status":"measured","value":12.5}"#
+        );
+        assert_eq!(
+            Outcome::Skipped("not configured".to_string()).to_json(),
+            r#"{"status":"skipped","reason":"not configured"}"#
+        );
+        assert_eq!(
+            Outcome::Unsupported("windows only".to_string()).to_json(),
+            r#"{"status":"unsupported","reason":"windows only"}"#
+        );
+        assert_eq!(
+            Outcome::Error("launch failed".to_string()).to_json(),
+            r#"{"status":"error","reason":"launch failed"}"#
+        );
+    }
+
     #[test]
     fn json_escape_basic() {
         assert_eq!(json_escape("plain"), "plain");
@@ -851,11 +1032,86 @@ mod tests {
     #[test]
     fn validate_bench_url_rejects_unspecified_and_missing_host() {
         assert!(validate_bench_url("http://0.0.0.0/").is_err());
-        assert!(validate_bench_url("http:///no-host").is_err());
+        // `Url::parse` は WHATWG の「特殊 authority スラッシュ」規則により
+        // 余分な `/` を読み飛ばすため（ブラウザの実際の解釈）、
+        // `http:///no-host` は host が空ではなく `no-host` というドメイン名に
+        // なる（このテストでは真に host が空になる形を使う）。
+        assert!(validate_bench_url("http://").is_err());
     }
 
     #[test]
     fn validate_bench_url_allows_userinfo_and_port_with_public_host() {
         assert!(validate_bench_url("https://user:pass@example.com:8443/x").is_ok());
+    }
+
+    // レビュー指摘 P0（Codex。support.rs:194）: `127.1` のような WHATWG URL
+    // 準拠のブラウザが IPv4 として解釈する非ドット10進数表記も拒否する。
+    #[test]
+    fn validate_bench_url_rejects_ipv4_shorthand_and_numeric_forms() {
+        assert!(validate_bench_url("http://127.1/").is_err());
+        assert!(validate_bench_url("http://2130706433/").is_err());
+        assert!(validate_bench_url("http://0x7f000001/").is_err());
+    }
+
+    // レビュー指摘 Medium（Cursor。support.rs:193-218）: IPv4-mapped IPv6
+    // リテラルへ埋め込まれた内部アドレスを展開して拒否する。
+    #[test]
+    fn validate_bench_url_rejects_ipv4_mapped_ipv6() {
+        assert!(validate_bench_url("http://[::ffff:127.0.0.1]/").is_err());
+        assert!(validate_bench_url("http://[::ffff:169.254.169.254]/").is_err());
+    }
+
+    // レビュー指摘 Medium: IPv4 マルチキャスト・IPv6 非推奨サイトローカル
+    // （fec0::/10）を実際に拒否することを確認する。
+    #[test]
+    fn validate_bench_url_rejects_multicast_and_site_local() {
+        assert!(validate_bench_url("http://224.0.0.1/").is_err());
+        assert!(validate_bench_url("http://[fec0::1]/").is_err());
+    }
+
+    #[test]
+    fn validate_bench_url_accepts_public_ipv4_and_ipv6() {
+        assert_eq!(validate_bench_url("http://93.184.216.34/"), Ok(None));
+        assert_eq!(
+            validate_bench_url("http://[2606:2800:220:1:248:1893:25c8:1946]/"),
+            Ok(None)
+        );
+    }
+
+    // レビュー指摘 P0・Medium（PR #442）: ドメイン名は `validate_bench_url`
+    // だけでは内部アドレスへの解決を拒否できないため、正規化済みホスト名を
+    // `Ok(Some(host))` で返し、呼び出し元に `check_resolved_addrs` での
+    // 検証を促す契約になっていることを確認する。
+    #[test]
+    fn validate_bench_url_returns_domain_for_dns_resolution() {
+        assert_eq!(
+            validate_bench_url("https://example.com/path"),
+            Ok(Some("example.com".to_string()))
+        );
+    }
+
+    #[test]
+    fn check_resolved_addrs_accepts_all_public() {
+        let addrs = [
+            IpAddr::from([93, 184, 216, 34]),
+            IpAddr::V6(Ipv6Addr::new(
+                0x2606, 0x2800, 0x220, 1, 0x248, 0x1893, 0x25c8, 0x1946,
+            )),
+        ];
+        assert!(check_resolved_addrs(&addrs).is_ok());
+    }
+
+    #[test]
+    fn check_resolved_addrs_rejects_if_any_internal() {
+        let addrs = [
+            IpAddr::from([93, 184, 216, 34]),
+            IpAddr::from([10, 0, 0, 1]),
+        ];
+        assert!(check_resolved_addrs(&addrs).is_err());
+    }
+
+    #[test]
+    fn check_resolved_addrs_rejects_empty() {
+        assert!(check_resolved_addrs(&[]).is_err());
     }
 }
