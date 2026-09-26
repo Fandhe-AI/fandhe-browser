@@ -30,12 +30,22 @@
 //! （内部アドレスに到達しないこと）を保証できなかった（SSRF・TOCTOU）。この
 //! ため任意 URL の指定経路を廃止し、本ベンチが自ら起動するローカル静的
 //! サーバー（`127.0.0.1` の空きポート。[`FixtureServer`]）がリポジトリ同梱の
-//! 自作 fixture（外部参照を含まない。`competitor_lightpanda/fixtures/`）を
-//! 配信し、そこだけを `goto` する構成にした。これは Lightpanda 本家のベンチ
+//! 自作 fixture（外部参照を含まない。`support::FIXTURE_TABLE`）を配信し、
+//! そこだけを `goto` する構成にした。これは Lightpanda 本家のベンチ
 //! （ローカルで配信するデモサイトを対象にする）と同じ形であり、ベンチが
 //! 外部ネットワークへ一切出ないため SSRF 経路が構造的になくなり、外部サイトの
 //! 可用性・内容変化にも左右されない再現可能な計測になる（security.md
 //! 「SSRF」）。
+//!
+//! fixture 配信（PR #442 再々レビュー。Codex P0・P1）: 以前は fixture を
+//! ファイルシステムから実行時に読んでいたため、字面上の `..` 拒否だけでは
+//! fixture 配下のシンボリックリンクがルート外を指す経路を防げず、また
+//! メタデータ確認後の読み込みまでの間にファイルサイズが変わる TOCTOU も
+//! あった。fixture は `include_str!` でコンパイル時にバイナリへ埋め込み
+//! （`support::FIXTURE_TABLE`）、リクエストパスをそのテーブルの完全一致
+//! だけで引く（`support::lookup_fixture`）ことで、実行時のファイル I/O
+//! 自体をなくし、シンボリックリンク・TOCTOU・サイズ超過が構造的に
+//! 起こらないようにした。
 //!
 //! 終了コード契約（レビュー指摘 P1。Codex。PR #442）: JSON は必ず stdout へ
 //! 出力したうえで、いずれかの計測項目が `Outcome::Error`（対象バイナリの
@@ -55,7 +65,7 @@ mod support;
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,9 +73,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use support::{
-    JsonValue, Outcome, approx_tokens, bench_exit_code, expand_args, json_escape, median,
-    parse_http_request_line, parse_http_status, parse_json, reduction_pct, safe_join_fixture_path,
-    split_args, validate_local_bench_url,
+    JsonValue, Outcome, approx_tokens, bench_exit_code, expand_args, json_escape, lookup_fixture,
+    median, parse_http_request_line, parse_http_status, parse_json, reduction_pct, split_args,
+    token_reduction_gate, validate_local_bench_url,
 };
 // `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
 // 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
@@ -90,7 +100,8 @@ const MAX_ARGS_COUNT: usize = 64;
 /// スレッドが専有され続けないよう防御的に上限を設ける
 /// （security.md「不安全な設計」）。リクエスト行・ヘッダ行のサイズ上限は
 /// 既存の `MAX_LINE_BYTES`（`read_line_bounded` が使う）を共用する。
-const FIXTURE_MAX_FILE_BYTES: u64 = 1024 * 1024;
+/// fixture 本体はコンパイル時に埋め込み済み（`support::FIXTURE_TABLE`）で
+/// 実行時のファイル読み込みがないため、ファイルサイズの上限は不要になった。
 const FIXTURE_MAX_CONNECTIONS: u64 = 10_000;
 /// 読み捨てるヘッダ行の総数上限。無制限だと大量のヘッダ行を送るクライアント
 /// がサーバースレッドを専有し続け得る（advisor 指摘。coding-rust.md
@@ -199,8 +210,9 @@ struct FixtureServer {
 }
 
 impl FixtureServer {
-    /// サーバーを起動する。`root` 配下のファイルだけを配信する。
-    fn start(root: PathBuf) -> Result<Self, String> {
+    /// サーバーを起動する。`support::FIXTURE_TABLE`（コンパイル時に埋め込み
+    /// 済みの固定テーブル）に完全一致するパスだけを配信する。
+    fn start() -> Result<Self, String> {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind failed: {e}"))?;
         let port = listener
             .local_addr()
@@ -215,7 +227,7 @@ impl FixtureServer {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
-            fixture_accept_loop(listener, root, stop_for_thread);
+            fixture_accept_loop(listener, stop_for_thread);
         });
         Ok(Self {
             port,
@@ -244,7 +256,7 @@ impl Drop for FixtureServer {
 /// `stop` が立つまで `listener.accept()` をポーリングし、接続ごとに
 /// [`handle_fixture_connection`] を同期的に処理する（ベンチ自身が唯一の
 /// クライアントであるためシングルスレッドで十分。並行処理はしない）。
-fn fixture_accept_loop(listener: TcpListener, root: PathBuf, stop: Arc<AtomicBool>) {
+fn fixture_accept_loop(listener: TcpListener, stop: Arc<AtomicBool>) {
     let mut served: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -255,7 +267,7 @@ fn fixture_accept_loop(listener: TcpListener, root: PathBuf, stop: Arc<AtomicBoo
                 if served > FIXTURE_MAX_CONNECTIONS {
                     break;
                 }
-                handle_fixture_connection(stream, &root);
+                handle_fixture_connection(stream);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(FIXTURE_ACCEPT_POLL_INTERVAL);
@@ -270,12 +282,20 @@ fn fixture_accept_loop(listener: TcpListener, root: PathBuf, stop: Arc<AtomicBoo
 /// fixture サーバーへの 1 接続を処理する。
 ///
 /// リクエスト行のみを読み取り（ヘッダ・ボディは無視。fixture 配信に不要）、
-/// [`safe_join_fixture_path`] でパストラバーサルを拒否してから
-/// `root` 配下のファイルを読み、`200`（成功）・`404`（未検出/検証エラー）・
+/// [`lookup_fixture`]（`support::FIXTURE_TABLE` の完全一致検索。実行時の
+/// ファイル I/O を行わない）で本文を引き、`200`（成功）・`404`（未検出）・
 /// `400`（リクエスト行が不正）のいずれかを返す。読み書きに
 /// `FIXTURE_IO_TIMEOUT` を設定し、低速・応答なしクライアントでスレッドが
 /// 無期限にブロックしないようにする（coding-rust.md「不安全な設計」）。
-fn handle_fixture_connection(mut stream: TcpStream, root: &Path) {
+///
+/// レビュー指摘 P0・P1（Codex。PR #442 再々レビュー・
+/// competitor_lightpanda.rs:338/352）: 以前はここでファイルシステムから
+/// `metadata`/`read` していたため、(1) シンボリックリンクを辿ってしまい
+/// fixture ディレクトリ外のファイルを配信し得た、(2) メタデータ確認後の
+/// 読み込みまでの TOCTOU でサイズ上限を超えて確保し得た。`lookup_fixture`
+/// はコンパイル時に埋め込んだ `&'static str` を返すだけでファイルシステムへ
+/// 一切触れないため、両方とも構造的に起こらない。
+fn handle_fixture_connection(mut stream: TcpStream) {
     // レビュー指摘（advisor。PR #442 再レビュー後の追加指摘）: macOS（XNU）・
     // Windows（Winsock）では accept したソケットが listener のノンブロッキング
     // 状態を継承する（Linux の accept4 は継承しない）。継承されたままだと
@@ -292,16 +312,16 @@ fn handle_fixture_connection(mut stream: TcpStream, root: &Path) {
     });
     let mut line = String::new();
     if read_line_bounded(&mut reader, &mut line).is_err() {
-        let _ = write_fixture_response(&mut stream, 400, "Bad Request", b"");
+        let _ = write_fixture_response(&mut stream, 400, "Bad Request", PLAIN_TEXT, b"");
         return;
     }
 
     let Some((method, path)) = parse_http_request_line(&line) else {
-        let _ = write_fixture_response(&mut stream, 400, "Bad Request", b"");
+        let _ = write_fixture_response(&mut stream, 400, "Bad Request", PLAIN_TEXT, b"");
         return;
     };
     if method != "GET" {
-        let _ = write_fixture_response(&mut stream, 400, "Bad Request", b"");
+        let _ = write_fixture_response(&mut stream, 400, "Bad Request", PLAIN_TEXT, b"");
         return;
     }
 
@@ -318,7 +338,7 @@ fn handle_fixture_connection(mut stream: TcpStream, root: &Path) {
     let mut header_lines_seen = 0u32;
     loop {
         if header_lines_seen >= FIXTURE_MAX_HEADER_LINES {
-            let _ = write_fixture_response(&mut stream, 400, "Bad Request", b"");
+            let _ = write_fixture_response(&mut stream, 400, "Bad Request", PLAIN_TEXT, b"");
             return;
         }
         header_lines_seen += 1;
@@ -333,42 +353,32 @@ fn handle_fixture_connection(mut stream: TcpStream, root: &Path) {
         }
     }
 
-    let file_path = match safe_join_fixture_path(root, &path) {
-        Ok(p) => p,
-        Err(_) => {
-            let _ = write_fixture_response(&mut stream, 404, "Not Found", b"");
-            return;
+    match lookup_fixture(&path) {
+        Some((content_type, content)) => {
+            let _ =
+                write_fixture_response(&mut stream, 200, "OK", content_type, content.as_bytes());
         }
-    };
-    let is_readable_fixture = matches!(
-        std::fs::metadata(&file_path),
-        Ok(m) if m.is_file() && m.len() <= FIXTURE_MAX_FILE_BYTES
-    );
-    if !is_readable_fixture {
-        let _ = write_fixture_response(&mut stream, 404, "Not Found", b"");
-        return;
+        None => {
+            let _ = write_fixture_response(&mut stream, 404, "Not Found", PLAIN_TEXT, b"");
+        }
     }
-    // メタデータの時点で `FIXTURE_MAX_FILE_BYTES` 以下であることを確認済み
-    // だが、読み込み自体に失敗した場合（並行削除等）も 404 として扱う。
-    let body = match std::fs::read(&file_path) {
-        Ok(b) => b,
-        Err(_) => {
-            let _ = write_fixture_response(&mut stream, 404, "Not Found", b"");
-            return;
-        }
-    };
-    let _ = write_fixture_response(&mut stream, 200, "OK", &body);
 }
+
+/// 400/404 応答の `Content-Type`。fixture 本体は `support::FIXTURE_TABLE`
+/// が個別に持つ content-type を使う（レビュー指摘。PR #442 再々レビュー:
+/// パス → (content-type, 内容) の固定テーブルにする）。
+const PLAIN_TEXT: &str = "text/plain; charset=utf-8";
 
 /// `handle_fixture_connection` が使う最小限の HTTP/1.1 レスポンス書き込み。
 fn write_fixture_response(
     stream: &mut TcpStream,
     status: u16,
     reason: &str,
+    content_type: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
     let header = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes())?;
@@ -868,7 +878,7 @@ fn extract_text(value: &JsonValue) -> Option<String> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// AISNAP-1: `FIXTURE_PAGES`（ベンチが起動したローカル fixture サーバーが
+/// AISNAP-1: `support::FIXTURE_TABLE`（ベンチが起動したローカル fixture サーバーが
 /// 配信する自作ページ）へ `goto` → `html` / `tree` を呼び、近似トークン数の
 /// 削減率を求める。`fixture_base_url`・`fixture_port` は呼び出し元
 /// （`main`）が起動した [`FixtureServer`] のもの（モジュールドキュメント
@@ -880,9 +890,9 @@ fn measure_token_reduction(target: &Target, fixture_base_url: &str, fixture_port
     if let Some(reason) = &target.args_error {
         return Outcome::Error(format!("{}: {reason}", target.name));
     }
-    let sites: Vec<String> = support::FIXTURE_PAGES
+    let sites: Vec<String> = support::FIXTURE_TABLE
         .iter()
-        .map(|page| format!("{fixture_base_url}{page}"))
+        .map(|(page, _content_type, _content)| format!("{fixture_base_url}{page}"))
         .collect();
     // レビュー指摘 P0（Codex。PR #442 再レビュー）: 生成した URL が本当に
     // このベンチが起動した fixture サーバー（127.0.0.1・起動したポート）
@@ -1030,7 +1040,7 @@ fn main() -> std::process::ExitCode {
     // なってしまう）。
     let any_target_configured = targets.iter().any(|t| t.bin.is_some());
     let fixture_server = if any_target_configured {
-        Some(FixtureServer::start(support::fixtures_root()))
+        Some(FixtureServer::start())
     } else {
         None
     };
@@ -1052,16 +1062,37 @@ fn main() -> std::process::ExitCode {
         );
         let idle_rss = measure_idle_rss(target, trials);
         eprintln!("idle RSS (KB, median of {trials}): {}", idle_rss.to_json());
-        let token_reduction = match &fixture_server {
-            Some(Ok(server)) => measure_token_reduction(target, &server.base_url(), server.port),
-            Some(Err(e)) => Outcome::Error(format!(
-                "{}: fixture server failed to start: {e}",
-                target.name
-            )),
-            // `any_target_configured` が `false`（= 全対象が未設定）の
-            // ときだけこの分岐に来る。`measure_token_reduction` 自身の
-            // 「バイナリ未設定 → Skipped」分岐と同じ理由付けにする。
-            None => Outcome::Skipped(format!("{}: binary path not configured", target.name)),
+        // レビュー指摘 P1（Codex。PR #442 再々レビュー・
+        // competitor_lightpanda.rs:1058）: 片方の対象だけに `_BIN` を設定した
+        // 状態で fixture サーバーの起動が失敗すると、以前は未設定の対象にも
+        // `Outcome::Error` を割り当てていた（「対象バイナリ未設定は常に
+        // `Outcome::Skipped`」という契約に反する）。`token_reduction_gate`
+        // （support.rs。純粋関数）へ対象ごとの `bin` 有無を渡して判定を
+        // 対象単位にする。
+        let server_start_error = fixture_server.as_ref().and_then(|r| r.as_ref().err());
+        let token_reduction = match token_reduction_gate(
+            target.bin.is_some(),
+            server_start_error.map(String::as_str),
+            target.name,
+        ) {
+            Some(outcome) => outcome,
+            None => match &fixture_server {
+                Some(Ok(server)) => {
+                    measure_token_reduction(target, &server.base_url(), server.port)
+                }
+                // `token_reduction_gate` が `None` を返すのは
+                // `bin_configured && server_start_error.is_none()` の場合
+                // だけであり、`bin_configured` なら `any_target_configured`
+                // も真なので `fixture_server` は必ず `Some(Ok(_))` のはず。
+                // この不変条件が崩れた場合でも panic はせず fail-closed に
+                // `Error` を返す（coding-rust.md「外部入力の経路では
+                // unwrap を使わず明示的に処理する」の精神を内部不変条件にも
+                // 適用する）。
+                _ => Outcome::Error(format!(
+                    "{}: internal error: fixture server unavailable",
+                    target.name
+                )),
+            },
         };
         eprintln!("token reduction (%): {}", token_reduction.to_json());
 

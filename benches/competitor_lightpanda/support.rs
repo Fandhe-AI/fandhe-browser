@@ -14,19 +14,22 @@
 //!
 //! `AISNAP-1`（MCP トークン削減率）計測は、任意の外部 URL
 //! （`COMPETITOR_BENCH_SITES`）ではなく、リポジトリに同梱した静的 fixture
-//! （`fixtures/` 配下。外部参照を含まない自作コンテンツ）だけを対象にする
+//! （外部参照を含まない自作コンテンツ。[`FIXTURE_TABLE`]）だけを対象にする
 //! （PR #442 再レビュー。Codex P0: 計測対象ブラウザは接続時に名前を
 //! 再解決し、公開 URL からのリダイレクトにも追従し得るため、事前の URL
 //! 検証をいくら積み増しても実際の接続先を保証できない）。fixture は
-//! `competitor_lightpanda.rs` が起動するローカル静的サーバー
-//! （`127.0.0.1` の空きポート）から配信し、`goto` する URL がそのサーバー
-//! だけを指すことを [`validate_local_bench_url`] で確認する。これにより
-//! ベンチが外部ネットワークへ一切出ない構成になり、SSRF 経路を構造的に
-//! なくすと同時に、外部サイトの可用性・変化に左右されない再現可能な
-//! 計測になる（security.md「SSRF」）。
+//! `include_str!` でコンパイル時にバイナリへ埋め込み（実行時のファイル
+//! I/O を行わない。PR #442 再々レビュー。Codex P0/P1: ファイルシステムから
+//! 都度読む方式はシンボリックリンク追従・メタデータ確認後の TOCTOU
+//! サイズ超過の経路になり得た）、`competitor_lightpanda.rs` が起動する
+//! ローカル静的サーバー（`127.0.0.1` の空きポート）が [`lookup_fixture`]
+//! の完全一致検索で配信する。`goto` する URL がそのサーバーだけを指す
+//! ことを [`validate_local_bench_url`] で確認する。これによりベンチが
+//! 外部ネットワークへ一切出ない構成になり、SSRF 経路を構造的になくすと
+//! 同時に、外部サイトの可用性・変化に左右されない再現可能な計測になる
+//! （security.md「SSRF」）。
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 
 // `reqwest`（`fandhe-browser-core` の既存依存。ホストする crate の
 // `Cargo.toml` 参照）は `url::Url` を `reqwest::Url` として re-export している。
@@ -142,6 +145,7 @@ pub fn split_args(env: &str) -> Vec<String> {
 /// `support.rs` に置くことで、[`bench_exit_code`] のテスト（`Skipped`/
 /// `Unsupported` のみでは `0`、`Error` を含むと非ゼロ）を副作用なしに書ける
 /// （レビュー指摘 P1。Codex。PR #442・competitor_lightpanda.rs:893）。
+#[derive(Debug, PartialEq)]
 pub enum Outcome {
     Value(f64),
     Skipped(String),
@@ -264,29 +268,81 @@ pub fn validate_local_bench_url(url: &str, expected_port: u16) -> Result<(), Str
     Ok(())
 }
 
-/// `AISNAP-1`（MCP トークン削減率）計測が `goto` する fixture ページ
-/// （[`fixtures_root`] 配下・`competitor_lightpanda.rs` の `FixtureServer` が
-/// 配信する）。外部 URL ではなく自作の静的 HTML（`fixtures/`。外部参照なし）
-/// にすることで、ベンチが外部ネットワークへ一切出ない構成にする（PR #442
-/// 再レビュー。Codex P0。モジュールドキュメント参照）。fixture を
-/// 追加・削除した場合は [`fixtures_contain_no_external_references`] と
-/// [`fixture_pages_resolve_to_existing_files`] の一覧にも反映すること。
-pub const FIXTURE_PAGES: [&str; 3] = ["/article.html", "/listing.html", "/form.html"];
-
-/// fixture ディレクトリの絶対パス。
+/// `AISNAP-1`（MCP トークン削減率）計測が `goto` する fixture ページの
+/// パス → (content-type, 内容) テーブル。
 ///
-/// `env!("CARGO_MANIFEST_DIR")`（このファイル・`competitor_lightpanda.rs` を
-/// コンパイルする crate、暫定ホストの `fandhe-browser-core` のマニフェスト
-/// ディレクトリ）からの相対パスとしてコンパイル時に埋め込む。実行時の
-/// カレントディレクトリに依存しないため、`cargo bench`/`cargo test` を
-/// どのディレクトリから実行しても・CI のどの作業ディレクトリでも解決できる
-/// （`crates/fandhe-browser-core/Cargo.toml` の `[[bench]]`/`[[test]]` の
-/// `path = "../../benches/..."` と同じ相対関係）。
-pub fn fixtures_root() -> PathBuf {
-    PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../benches/competitor_lightpanda/fixtures"
-    ))
+/// レビュー指摘 P0・P1（Codex。PR #442 再々レビュー・
+/// competitor_lightpanda.rs:338/352）: 以前は fixture をファイルシステムから
+/// 実行時に読んでいたため、(1) `safe_join_fixture_path` が字面上の `..` を
+/// 拒否しても `metadata`/`read` はシンボリックリンクを辿ってしまい、fixture
+/// 配下にルート外を指すリンクを置かれるとそれを配信し得た、(2)
+/// `metadata` でサイズを確認した後に `read` するまでの間にファイルが
+/// 大きくなる TOCTOU で上限を超えて確保し得た。fixture をコンパイル時に
+/// `include_str!` でバイナリへ埋め込み、パスからの検索をこの固定テーブルの
+/// 完全一致だけにすることで、シンボリックリンク・TOCTOU・サイズ超過が
+/// 構造的に起こらないようにする（実行時のファイル I/O 自体をなくす）。
+/// fixture を追加・削除した場合は [`fixtures_contain_no_external_references`]
+/// にも反映すること。
+pub const FIXTURE_TABLE: &[(&str, &str, &str)] = &[
+    (
+        "/article.html",
+        "text/html; charset=utf-8",
+        include_str!("fixtures/article.html"),
+    ),
+    (
+        "/listing.html",
+        "text/html; charset=utf-8",
+        include_str!("fixtures/listing.html"),
+    ),
+    (
+        "/form.html",
+        "text/html; charset=utf-8",
+        include_str!("fixtures/form.html"),
+    ),
+];
+
+/// リクエストパスに完全一致する fixture の `(content-type, 内容)` を返す。
+///
+/// [`FIXTURE_TABLE`] のキーとの完全一致だけで引く（`..`・クエリ文字列・
+/// 末尾スラッシュの有無等を正規化しない）。一致しなければ `None`
+/// （呼び出し側は 404 を返す。`competitor_lightpanda.rs` の
+/// `handle_fixture_connection`）。
+pub fn lookup_fixture(request_path: &str) -> Option<(&'static str, &'static str)> {
+    FIXTURE_TABLE
+        .iter()
+        .find(|(path, _, _)| *path == request_path)
+        .map(|(_, content_type, content)| (*content_type, *content))
+}
+
+/// `AISNAP-1` 計測（`competitor_lightpanda.rs` の `measure_token_reduction`
+/// 呼び出し前）が、対象バイナリの有無と fixture サーバーの起動結果から
+/// `Outcome` を確定できるかを判定する。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々レビュー・
+/// competitor_lightpanda.rs:1058）: 片方の対象だけに `_BIN` を設定した状態で
+/// fixture サーバーの起動（`bind`）が失敗すると、以前は未設定の対象にも
+/// `Outcome::Error` を割り当てていた（「対象バイナリ未設定は常に
+/// `Outcome::Skipped`」という契約に反する）。この関数は対象バイナリが
+/// 未設定なら（サーバー起動結果に関わらず）常に `Some(Outcome::Skipped)`
+/// を返し、バイナリが設定済みでサーバー起動が失敗していた場合だけ
+/// `Some(Outcome::Error)` を返す。両方問題なければ `None`
+/// （呼び出し側が実際に `measure_token_reduction` を呼ぶ）。
+pub fn token_reduction_gate(
+    bin_configured: bool,
+    server_start_error: Option<&str>,
+    target_name: &str,
+) -> Option<Outcome> {
+    if !bin_configured {
+        return Some(Outcome::Skipped(format!(
+            "{target_name}: binary path not configured"
+        )));
+    }
+    if let Some(err) = server_start_error {
+        return Some(Outcome::Error(format!(
+            "{target_name}: fixture server failed to start: {err}"
+        )));
+    }
+    None
 }
 
 /// HTTP リクエストの先頭行（例: `GET /article.html HTTP/1.1`）から
@@ -306,40 +362,6 @@ pub fn parse_http_request_line(line: &str) -> Option<(String, String)> {
         return None;
     }
     Some((method.to_string(), path.to_string()))
-}
-
-/// リクエストパスを fixture ルート配下の実ファイルパスへ安全に変換する。
-///
-/// レビュー指摘 P0（Codex。PR #442 再レビュー）: fixture 配信サーバーは
-/// `..` や絶対パス指定によるパストラバーサルを拒否し、fixture ディレクトリ
-/// 配下のファイルだけを返す契約にする（security.md「不安全な設計」）。
-/// クエリ文字列・フラグメントは呼び出し側で既に取り除かれている前提
-/// （`parse_http_request_line` が返す `path` はそのまま渡ってくるため、
-/// この関数自身は末尾の `?...` を追加で切り落とす）。パス要素が
-/// `Normal`（通常のファイル名・ディレクトリ名）以外（`..`・ルート・
-/// prefix 等）を含む場合は拒否する。ファイルの存在確認はここでは行わない
-/// （純粋関数として保つ。存在確認・読み込みは呼び出し側の I/O 責務）。
-pub fn safe_join_fixture_path(root: &Path, request_path: &str) -> Result<PathBuf, String> {
-    let without_query = request_path.split(['?', '#']).next().unwrap_or("");
-    let trimmed = without_query.trim_start_matches('/');
-    if trimmed.is_empty() {
-        return Err("empty request path".to_string());
-    }
-    let candidate = Path::new(trimmed);
-    if candidate.is_absolute() {
-        return Err(format!("{request_path}: absolute paths are not allowed"));
-    }
-    for component in candidate.components() {
-        match component {
-            std::path::Component::Normal(_) => {}
-            other => {
-                return Err(format!(
-                    "{request_path}: disallowed path component {other:?}"
-                ));
-            }
-        }
-    }
-    Ok(root.join(candidate))
 }
 
 /// 手書き最小 JSON パーサーが返す値。
@@ -1039,60 +1061,48 @@ mod tests {
         assert_eq!(parse_http_request_line("GET /path NOT-HTTP/1.1"), None);
     }
 
-    // レビュー指摘 P0（Codex。PR #442 再レビュー）: fixture 配信サーバーが
-    // パストラバーサル（`..`・絶対パス）を拒否し、fixture ルート配下の
-    // ファイルだけを返すことを確認する。
+    // レビュー指摘 P0・P1（Codex。PR #442 再々レビュー・
+    // competitor_lightpanda.rs:338/352）: fixture はコンパイル時に埋め込んだ
+    // 固定テーブルの完全一致だけで引くため、シンボリックリンク・TOCTOU・
+    // サイズ超過が構造的に起こらない（実行時のファイル I/O 自体がない）。
     #[test]
-    fn safe_join_fixture_path_accepts_plain_filename() {
-        let root = Path::new("/fixtures");
-        assert_eq!(
-            safe_join_fixture_path(root, "/article.html"),
-            Ok(PathBuf::from("/fixtures/article.html"))
-        );
+    fn lookup_fixture_returns_known_pages() {
+        for (path, content_type, content) in FIXTURE_TABLE {
+            assert_eq!(lookup_fixture(path), Some((*content_type, *content)));
+        }
     }
 
     #[test]
-    fn safe_join_fixture_path_strips_query_and_fragment() {
-        let root = Path::new("/fixtures");
-        assert_eq!(
-            safe_join_fixture_path(root, "/article.html?x=1#y"),
-            Ok(PathBuf::from("/fixtures/article.html"))
-        );
+    fn lookup_fixture_unknown_path_is_none() {
+        assert_eq!(lookup_fixture("/does-not-exist.html"), None);
     }
 
     #[test]
-    fn safe_join_fixture_path_rejects_parent_traversal() {
-        let root = Path::new("/fixtures");
-        assert!(safe_join_fixture_path(root, "/..").is_err());
-        assert!(safe_join_fixture_path(root, "/a/../../secret").is_err());
+    fn lookup_fixture_parent_traversal_path_is_none() {
+        // テーブルには `..` を含むキーが存在しないため、完全一致の時点で
+        // 自然に拒否される（ファイルシステムへ触れないため辿りようがない）。
+        assert_eq!(lookup_fixture("/../Cargo.toml"), None);
+        assert_eq!(lookup_fixture("/../../etc/passwd"), None);
+        assert_eq!(lookup_fixture("/.."), None);
     }
 
     #[test]
-    #[cfg(windows)]
-    fn safe_join_fixture_path_rejects_windows_drive_absolute_path() {
-        let root = Path::new(r"C:\fixtures");
-        assert!(safe_join_fixture_path(root, "C:/windows/system32").is_err());
-    }
-
-    #[test]
-    fn safe_join_fixture_path_rejects_empty_path() {
-        let root = Path::new("/fixtures");
-        assert!(safe_join_fixture_path(root, "/").is_err());
-        assert!(safe_join_fixture_path(root, "").is_err());
+    fn lookup_fixture_query_or_trailing_slash_is_none() {
+        // 完全一致のみを許可する契約（クエリ文字列・末尾スラッシュの正規化は
+        // 行わない）ことを確認する。
+        assert_eq!(lookup_fixture("/article.html?x=1"), None);
+        assert_eq!(lookup_fixture("/article.html/"), None);
+        assert_eq!(lookup_fixture(""), None);
     }
 
     // レビュー指摘（コーディネーター指示。PR #442 再レビュー）: fixture は
     // 自作の静的コンテンツであり、外部サイトへのサブリソース参照
     // （`http://`・`https://`・プロトコル相対の `//`）を含まないことを
-    // 確認する。fixture を増やした場合はこの配列にも追加すること。
+    // 確認する。埋め込み済みの `FIXTURE_TABLE` に対して検査するため、
+    // fixture を追加した場合もテーブルへ追加するだけで自動的に対象になる。
     #[test]
     fn fixtures_contain_no_external_references() {
-        const FIXTURES: &[(&str, &str)] = &[
-            ("article.html", include_str!("fixtures/article.html")),
-            ("listing.html", include_str!("fixtures/listing.html")),
-            ("form.html", include_str!("fixtures/form.html")),
-        ];
-        for (name, content) in FIXTURES {
+        for (name, _content_type, content) in FIXTURE_TABLE {
             let lower = content.to_ascii_lowercase();
             assert!(
                 !lower.contains("http://"),
@@ -1117,21 +1127,40 @@ mod tests {
         }
     }
 
-    // レビュー指摘（advisor。PR #442 再レビュー後の追加指摘）: `FIXTURE_PAGES`
-    // に列挙したパスが、実際に `fixtures_root()` 配下の存在するファイルへ
-    // 解決できることを確認する（3 OS の `CARGO_MANIFEST_DIR` 相対パス解決・
-    // `FIXTURE_PAGES` と実ファイルの一致の双方を検証する。片方だけが更新
-    // されて食い違うことをここで検出する）。
+    // レビュー指摘 P1（Codex。PR #442 再々レビュー・
+    // competitor_lightpanda.rs:1058）: 対象バイナリ未設定（`bin_configured
+    // == false`）は、fixture サーバーの起動結果に関わらず常に `Skipped`
+    // でなければならない（`Error` になってはいけない）。
     #[test]
-    fn fixture_pages_resolve_to_existing_files() {
-        let root = fixtures_root();
-        for page in FIXTURE_PAGES {
-            let path =
-                safe_join_fixture_path(&root, page).unwrap_or_else(|e| panic!("{page}: {e}"));
-            assert!(
-                path.is_file(),
-                "{page}: resolved path {path:?} is not a file"
-            );
+    fn token_reduction_gate_unconfigured_is_skipped_even_if_server_failed() {
+        let outcome = token_reduction_gate(false, Some("bind failed"), "fandhe-browser");
+        match outcome {
+            Some(Outcome::Skipped(reason)) => {
+                assert!(reason.contains("binary path not configured"));
+            }
+            other => panic!("expected Some(Outcome::Skipped(_)), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn token_reduction_gate_unconfigured_without_server_error_is_skipped() {
+        let outcome = token_reduction_gate(false, None, "fandhe-browser");
+        assert!(matches!(outcome, Some(Outcome::Skipped(_))));
+    }
+
+    #[test]
+    fn token_reduction_gate_configured_with_server_error_is_error() {
+        let outcome = token_reduction_gate(true, Some("bind failed"), "lightpanda");
+        match outcome {
+            Some(Outcome::Error(reason)) => {
+                assert!(reason.contains("bind failed"));
+            }
+            other => panic!("expected Some(Outcome::Error(_)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_reduction_gate_configured_without_server_error_is_none() {
+        assert_eq!(token_reduction_gate(true, None, "lightpanda"), None);
     }
 }
