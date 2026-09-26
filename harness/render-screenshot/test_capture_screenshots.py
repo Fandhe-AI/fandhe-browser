@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
+import urllib.request
 import zlib
 from pathlib import Path
 from unittest import mock
@@ -444,6 +447,21 @@ class ReadPngSizeTest(unittest.TestCase):
 
 
 class _Resp(io.BytesIO):
+    """`urllib` のレスポンスオブジェクトを模したテスト用スタブ。
+
+    `geturl()` はリダイレクトを辿った後の最終 URL を返す（`response.geturl()`
+    が返す値。Cursor Medium 再指摘: `inject_base_href` に渡す URL は最初の
+    リクエスト URL ではなくこれでなければならない）。省略時は最初の URL を
+    そのまま最終 URL として扱う（リダイレクトなしの通常応答を模す）。
+    """
+
+    def __init__(self, data: bytes, *, url: str | None = None) -> None:
+        super().__init__(data)
+        self._url = url
+
+    def geturl(self) -> str | None:
+        return self._url
+
     def __enter__(self):
         return self
 
@@ -538,7 +556,7 @@ class FetchSnapshotTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "s.html"
             with self.assertRaises(cs.SnapshotError):
-                cs.fetch_snapshot("http://example.invalid/", dest)
+                cs.fetch_snapshot("http://example.invalid/", dest, proxy_url="http://127.0.0.1:1")
 
     def test_truncates_oversized_response(self) -> None:
         big_body = b"x" * (cs.SNAPSHOT_MAX_BYTES + 1)
@@ -550,7 +568,7 @@ class FetchSnapshotTest(unittest.TestCase):
                 mock.patch.object(cs, "_open_url", return_value=_Resp(big_body)),
             ):
                 with self.assertRaises(cs.SnapshotError):
-                    cs.fetch_snapshot("https://example.invalid/", dest)
+                    cs.fetch_snapshot("https://example.invalid/", dest, proxy_url="http://127.0.0.1:1")
             self.assertFalse(dest.exists())
 
     def test_writes_response_body_on_success(self) -> None:
@@ -560,10 +578,31 @@ class FetchSnapshotTest(unittest.TestCase):
                 mock.patch.object(cs, "_check_public_host"),
                 mock.patch.object(cs, "_open_url", return_value=_Resp(b"<html></html>")),
             ):
-                cs.fetch_snapshot("https://example.invalid/", dest)
+                cs.fetch_snapshot("https://example.invalid/", dest, proxy_url="http://127.0.0.1:1")
             self.assertEqual(
                 dest.read_bytes(),
                 b'<base href="https://example.invalid/"><html></html>',
+            )
+
+    def test_injects_base_href_using_final_url_after_redirect(self) -> None:
+        # Cursor Medium 再指摘: リダイレクトを辿った後の本文を保存するのに、
+        # `<base href>` が最初にリクエストした URL のままだと、相対 URL の
+        # リソースがリダイレクト前の場所を基準に解決されてしまう。
+        # `response.geturl()`（最終 URL）を使うべきである。
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "s.html"
+            with (
+                mock.patch.object(cs, "_check_public_host"),
+                mock.patch.object(
+                    cs,
+                    "_open_url",
+                    return_value=_Resp(b"<html></html>", url="https://example.invalid/final/"),
+                ),
+            ):
+                cs.fetch_snapshot("https://example.invalid/original", dest, proxy_url="http://127.0.0.1:1")
+            self.assertEqual(
+                dest.read_bytes(),
+                b'<base href="https://example.invalid/final/"><html></html>',
             )
 
     def test_refuses_to_write_through_existing_symlink(self) -> None:
@@ -583,7 +622,7 @@ class FetchSnapshotTest(unittest.TestCase):
                 mock.patch.object(cs, "_open_url", return_value=_Resp(b"<html></html>")),
             ):
                 with self.assertRaises(cs.SnapshotError):
-                    cs.fetch_snapshot("https://example.invalid/", dest)
+                    cs.fetch_snapshot("https://example.invalid/", dest, proxy_url="http://127.0.0.1:1")
             self.assertEqual(outside_target.read_text(encoding="utf-8"), "do not overwrite me")
 
     def test_injects_base_href_even_without_head_tag(self) -> None:
@@ -593,7 +632,7 @@ class FetchSnapshotTest(unittest.TestCase):
                 mock.patch.object(cs, "_check_public_host"),
                 mock.patch.object(cs, "_open_url", return_value=_Resp(b"no head here")),
             ):
-                cs.fetch_snapshot("https://example.invalid/x", dest)
+                cs.fetch_snapshot("https://example.invalid/x", dest, proxy_url="http://127.0.0.1:1")
             self.assertEqual(
                 dest.read_bytes(),
                 b'<base href="https://example.invalid/x">no head here',
@@ -603,31 +642,31 @@ class FetchSnapshotTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "s.html"
             with self.assertRaises(cs.SnapshotError):
-                cs.fetch_snapshot("https://127.0.0.1/", dest)
+                cs.fetch_snapshot("https://127.0.0.1/", dest, proxy_url="http://127.0.0.1:1")
 
     def test_rejects_localhost_hostname(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "s.html"
             with self.assertRaises(cs.SnapshotError):
-                cs.fetch_snapshot("https://localhost/", dest)
+                cs.fetch_snapshot("https://localhost/", dest, proxy_url="http://127.0.0.1:1")
 
     def test_rejects_private_ip_literal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "s.html"
             with self.assertRaises(cs.SnapshotError):
-                cs.fetch_snapshot("https://10.0.0.1/", dest)
+                cs.fetch_snapshot("https://10.0.0.1/", dest, proxy_url="http://127.0.0.1:1")
 
     def test_rejects_link_local_metadata_ip_literal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "s.html"
             with self.assertRaises(cs.SnapshotError):
-                cs.fetch_snapshot("https://169.254.169.254/", dest)
+                cs.fetch_snapshot("https://169.254.169.254/", dest, proxy_url="http://127.0.0.1:1")
 
     def test_rejects_ipv6_loopback_literal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "s.html"
             with self.assertRaises(cs.SnapshotError):
-                cs.fetch_snapshot("https://[::1]/", dest)
+                cs.fetch_snapshot("https://[::1]/", dest, proxy_url="http://127.0.0.1:1")
 
     def test_rejects_hostname_resolving_to_private_address(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -638,7 +677,7 @@ class FetchSnapshotTest(unittest.TestCase):
                 return_value=[(cs.socket.AF_INET, None, None, "", ("10.1.2.3", 443))],
             ):
                 with self.assertRaises(cs.SnapshotError):
-                    cs.fetch_snapshot("https://internal.example.invalid/", dest)
+                    cs.fetch_snapshot("https://internal.example.invalid/", dest, proxy_url="http://127.0.0.1:1")
 
     def test_accepts_hostname_resolving_to_public_address(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -651,14 +690,115 @@ class FetchSnapshotTest(unittest.TestCase):
                 ),
                 mock.patch.object(cs, "_open_url", return_value=_Resp(b"<html></html>")),
             ):
-                cs.fetch_snapshot("https://example.invalid/", dest)
+                cs.fetch_snapshot("https://example.invalid/", dest, proxy_url="http://127.0.0.1:1")
             self.assertTrue(dest.exists())
+
+    def test_rejects_dns_rebinding_between_precheck_and_proxy_connect(self) -> None:
+        # codex P0 再指摘: `_check_public_host` は事前に DNS 解決結果を検証する
+        # だけで、実際の接続（旧実装では `opener.open` が改めて名前解決していた）
+        # との間に DNS 応答が内部アドレスへ変わっていれば直接接続できてしまう
+        # （DNS リバインディング）。修正後は実際の接続を必ずローカル転送
+        # プロキシへ強制するため、`fetch_snapshot` の事前検査を通過した直後に
+        # 名前解決結果が内部アドレスへ変わっても、実際に接続するのはプロキシの
+        # `_resolve_public_addresses` が（接続直前に再度）検証した結果であり、
+        # 内部アドレスへは到達しないことを確認する。
+        #
+        # 実際のプロキシを起動して検証する（`_open_url` をモックすると検証したい
+        # 経路自体が無くなってしまうため）。プロキシ自身への接続（127.0.0.1）は
+        # 実際の `getaddrinfo` にフォールバックし、対象ホストの解決だけを
+        # 1 回目は公開アドレス・2 回目は内部アドレスに差し替える。
+        #
+        # 「内部アドレスへ実際に到達しない」ことは、単に `SnapshotError` が
+        # 送出されるかどうかでは判定しない（サンドボックス環境では 10.x への
+        # 接続自体がタイムアウトで失敗するだけでも同じ例外が出てしまい、旧実装の
+        # バグ（直接接続してしまう）を見逃す）。`socket.socket.connect` を
+        # フックし、内部アドレスへの `connect()` 呼び出しがそもそも発生しないこと
+        # を直接検証する。
+        real_getaddrinfo = cs.socket.getaddrinfo
+        real_connect = cs.socket.socket.connect
+        target_host = "internal.example.invalid"
+        rebound_address = "10.1.2.3"
+        call_count = {"n": 0}
+        connect_attempts: list[tuple] = []
+
+        def fake_getaddrinfo(host, *args, **kwargs):
+            if host == target_host:
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    # fetch_snapshot 側の事前検査には公開アドレスを返す。
+                    return [(cs.socket.AF_INET, cs.socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
+                # プロキシが CONNECT 時に検証する時点では内部アドレスへ
+                # 「変わった」ことにする（DNS リバインディングの再現）。
+                return [(cs.socket.AF_INET, cs.socket.SOCK_STREAM, 0, "", (rebound_address, 443))]
+            return real_getaddrinfo(host, *args, **kwargs)
+
+        def guarded_connect(self_sock, address):
+            connect_attempts.append(address)
+            if isinstance(address, tuple) and address and address[0] == rebound_address:
+                # 内部アドレスへの接続そのものを即座に失敗させる（タイムアウト
+                # 待ちにせず、テストを高速・決定的にする）。
+                raise AssertionError(f"must never connect directly to rebound address: {address}")
+            return real_connect(self_sock, address)
+
+        server, thread, proxy_url = cs.start_filtering_proxy()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                dest = Path(tmp) / "s.html"
+                with (
+                    mock.patch.object(cs.socket, "getaddrinfo", side_effect=fake_getaddrinfo),
+                    mock.patch.object(cs.socket.socket, "connect", guarded_connect),
+                ):
+                    with self.assertRaises(cs.SnapshotError):
+                        cs.fetch_snapshot(f"https://{target_host}/", dest, proxy_url=proxy_url)
+                self.assertFalse(dest.exists())
+        finally:
+            cs.stop_filtering_proxy(server, thread)
+        # 事前検査（1 回目）とプロキシ側検証（2 回目）の両方が実際に呼ばれた
+        # ことを確認し、テストが意図どおりの経路を通ったことを保証する。
+        self.assertEqual(call_count["n"], 2)
+        # 内部アドレスへの `connect()` は一度も発生していないこと
+        # （`guarded_connect` が `AssertionError` を送出せずに完走したこと）。
+        self.assertTrue(
+            all(addr[0] != rebound_address for addr in connect_attempts if isinstance(addr, tuple)),
+        )
+
+    def test_stock_proxy_handler_bypasses_proxy_when_no_proxy_env_matches(self) -> None:
+        # 前提の確認: 素の `urllib.request.ProxyHandler` は明示的な辞書を
+        # 渡していても `no_proxy`/`NO_PROXY` 環境変数を見て直接接続に
+        # フォールバックする。`_ForcedProxyHandler`（次のテスト）が必要な
+        # 理由を示す対照実験。
+        with mock.patch.dict(os.environ, {"no_proxy": "*", "NO_PROXY": "*"}):
+            handler = urllib.request.ProxyHandler({"https": "http://127.0.0.1:9"})
+            req = urllib.request.Request("https://internal.example.invalid/")
+            original_host = req.host
+            result = handler.proxy_open(req, "http://127.0.0.1:9", "https")
+        # バイパスされた場合、`proxy_open` は `None` を返し、`req.host` は
+        # 元のホストのまま変わらない（プロキシへ向いていない）。
+        self.assertIsNone(result)
+        self.assertEqual(req.host, original_host)
+
+    def test_forced_proxy_handler_ignores_no_proxy_env_var(self) -> None:
+        # codex P0 再指摘: CI や開発機で `NO_PROXY=*`（対象ホストを含む値）が
+        # 設定されているだけで、明示的に渡した `ProxyHandler` の辞書が無視され
+        # 直接接続にフォールバックしてしまう（上のテストで確認した挙動）。
+        # `fetch_snapshot`／`_open_url` が使う `_ForcedProxyHandler` はこの
+        # 環境変数によるバイパスを無視し、必ずプロキシへ向けることを確認する。
+        with mock.patch.dict(os.environ, {"no_proxy": "*", "NO_PROXY": "*"}):
+            handler = cs._ForcedProxyHandler({"https": "http://127.0.0.1:9"})
+            req = urllib.request.Request("https://internal.example.invalid/")
+            result = handler.proxy_open(req, "http://127.0.0.1:9", "https")
+        # https の場合、`set_proxy` はトンネル先ホスト（`_tunnel_host`）に
+        # 元のホストを保持しつつ、実際に接続する `req.host` をプロキシへ
+        # 差し替える。
+        self.assertEqual(req.host, "127.0.0.1:9")
+        self.assertEqual(req._tunnel_host, "internal.example.invalid")  # noqa: SLF001
+        self.assertIsNone(result)
 
     def test_rejects_url_with_no_hostname(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "s.html"
             with self.assertRaises(cs.SnapshotError):
-                cs.fetch_snapshot("https:///path", dest)
+                cs.fetch_snapshot("https:///path", dest, proxy_url="http://127.0.0.1:1")
 
     def test_redirect_handler_rejects_non_https_target(self) -> None:
         handler = cs._PublicOnlyRedirectHandler()
@@ -789,6 +929,49 @@ class FilteringProxyTest(unittest.TestCase):
             echo_thread.join(timeout=5)
         self.assertEqual(echoed, b"ping")
 
+    def test_connect_relay_transfers_large_payload_without_truncation(self) -> None:
+        # Cursor Medium: 両ソケットを non-blocking にして `sendall` すると、
+        # 相手側の送信バッファが埋まった際に `BlockingIOError` が飛び、
+        # `_relay` がそれを `except OSError: return` で捕まえてトンネルを
+        # 途中で閉じてしまう（大きな転送が欠落する）。クライアント側の読み出しを
+        # わざと遅らせ、origin からの送信で中継バッファを埋めてこの状況を
+        # 再現し、最終的に全バイトが欠落なく届くことを確認する。
+        payload = bytes((i % 251) for i in range(4 * 1024 * 1024))  # 4 MiB
+
+        import socketserver as socketserver_module  # noqa: PLC0415
+
+        class _BigSenderHandler(socketserver_module.BaseRequestHandler):
+            def handle(self) -> None:
+                self.request.sendall(payload)
+
+        with socketserver_module.TCPServer(("127.0.0.1", 0), _BigSenderHandler) as origin_server:
+            origin_port = origin_server.server_address[1]
+            origin_thread = threading.Thread(target=origin_server.handle_request, daemon=True)
+            origin_thread.start()
+
+            with mock.patch.object(
+                cs, "_resolve_public_addresses", return_value=[("127.0.0.1", origin_port)]
+            ):
+                sock = self._open_proxy_connection()
+                try:
+                    sock.sendall(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")
+                    status_line = self._read_status_line(sock)
+                    self.assertIn("200", status_line)
+                    # 読み出しを遅らせ、origin からの送信で中継側の送信バッファを
+                    # 埋める時間を与える（non-blocking sendall のバグを再現しやすくする）。
+                    time.sleep(0.3)
+                    sock.settimeout(10)
+                    received = b""
+                    while len(received) < len(payload):
+                        chunk = sock.recv(262144)
+                        if not chunk:
+                            break
+                        received += chunk
+                finally:
+                    sock.close()
+            origin_thread.join(timeout=5)
+        self.assertEqual(received, payload)
+
     def test_get_absolute_uri_to_mocked_public_address_returns_origin_response(self) -> None:
         # 絶対 URI 形式の GET フォワード（http:// 用）の正常系。origin をローカルの
         # `http.server` で立て、`_resolve_public_addresses` をモックしてそこへ
@@ -873,6 +1056,67 @@ class CaptureOneProxyRequirementTest(unittest.TestCase):
                 allow_unproxied_engine=True,
             )
             self.assertEqual(record["status"], "ok")
+
+
+class ProcessTreeKillTest(unittest.TestCase):
+    """RENDER-5 / TASK-37.1: タイムアウト時のプロセスツリー終了（Cursor Medium 再指摘）。
+
+    `subprocess.run(..., timeout=)` はタイムアウト時に直接の子しか kill しない。
+    Chromium のレンダラー・GPU プロセス等の子孫が残ってしまう問題の再現・修正確認。
+    """
+
+    @unittest.skipUnless(sys.platform != "win32", "os.killpg によるプロセスグループ終了は POSIX 専用")
+    def test_grandchild_process_is_gone_after_timeout(self) -> None:
+        import os as os_module  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "grandchild.pid"
+            site = cs.Site(site_id="grandchild", url="https://example.invalid", category="static", catalog_id="z1")
+            record = cs.capture_one(
+                site,
+                "servo",
+                [
+                    sys.executable,
+                    str(FAKE_ENGINE),
+                    "--mode",
+                    "spawn-grandchild",
+                    "--out",
+                    "{out}",
+                    "--pid-file",
+                    str(pid_file),
+                ],
+                out_dir=Path(tmp),
+                snapshots_dir=Path(tmp) / "snapshots",
+                chromium_bin=None,
+                width=1280,
+                height=800,
+                settle_ms=1000,
+                timeout_sec=1,
+                allow_file_url=False,
+                dry_run=False,
+                allow_unproxied_engine=True,
+            )
+            self.assertEqual(record["status"], "timeout")
+
+            # 孫プロセスが PID ファイルを書き出すまで待つ（`capture_one` が
+            # 返った時点で書き出し済みのはずだが、フォールバックとして少し待つ）。
+            deadline = time.monotonic() + 5
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(pid_file.exists(), "grandchild did not write its PID in time")
+            grandchild_pid = int(pid_file.read_text(encoding="utf-8"))
+
+            # SIGKILL の配送・reap は非同期なので、消えるまで少し待ってから判定する。
+            deadline = time.monotonic() + 2
+            gone = False
+            while time.monotonic() < deadline:
+                try:
+                    os_module.kill(grandchild_pid, 0)
+                except ProcessLookupError:
+                    gone = True
+                    break
+                time.sleep(0.05)
+            self.assertTrue(gone, f"grandchild pid {grandchild_pid} is still alive after timeout handling")
 
 
 class InjectBaseHrefTest(unittest.TestCase):
@@ -1407,6 +1651,7 @@ class CaptureIntegrationTest(unittest.TestCase):
                     allow_file_url=False,
                     dry_run=False,
                     allow_unproxied_engine=True,
+                    proxy_url="http://127.0.0.1:1",
                 )
             self.assertEqual(record["status"], "skipped")
             self.assertEqual(len(created), 1)
@@ -1655,6 +1900,7 @@ class DirectNavigationAllowlistTest(unittest.TestCase):
                     allow_file_url=False,
                     dry_run=False,
                     allow_unproxied_engine=True,
+                    proxy_url="http://127.0.0.1:1",
                 )
             self.assertEqual(record["status"], "skipped")
             self.assertFalse((Path(tmp) / "chromium" / "both-placeholders.png").exists())
@@ -1694,6 +1940,7 @@ class DirectNavigationAllowlistTest(unittest.TestCase):
                     allow_file_url=False,
                     dry_run=False,
                     allow_unproxied_engine=True,
+                    proxy_url="http://127.0.0.1:1",
                 )
             self.assertEqual(record["status"], "ok")
 

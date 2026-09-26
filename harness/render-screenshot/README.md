@@ -125,6 +125,34 @@ script/img/css・`{url}` 直接ナビゲーションのリダイレクト先・�
 - コマンドテンプレートに `{proxy}` を含めない場合、`capture_one` は既定で
   撮影自体を `skipped` にする（fail-closed）。ネットワークを完全に遮断した
   環境やオフラインのテストでのみ `--allow-unproxied-engine` で無効化する
+- `{html_path}` 用スナップショット取得（`fetch_snapshot`）自体もこのプロキシを
+  必ず経由する（codex P0 再指摘）。従来は `_check_public_host` が事前に
+  DNS 解決結果を検証するだけで、実際の接続は `urllib` が改めて名前解決して
+  直接行っていたため、検証後に DNS 応答が内部アドレスへ変わる（DNS
+  リバインディング）と内部サービスへ到達できてしまっていた。`urllib.request.
+  ProxyHandler` で http/https の両方をこのプロキシへ強制することで、検証
+  （`_resolve_public_addresses`）と実際の接続を同じ場所（プロキシ）に
+  一本化する。https は `CONNECT` になるため、TLS の SNI・`Host` ヘッダは
+  元のホスト名のまま維持され、実際に接続する IP だけがプロキシ側の検証済み
+  のものに固定される。`fetch_snapshot` のリダイレクト追跡も、ホップごとに
+  プロキシが宛先を検証する（`_PublicOnlyRedirectHandler` による事前検査も
+  多層防御として残す）。`file:` はプロキシの対象外（`ProxyHandler` は
+  http/https のみを差し替える）のため、`--allow-file-url` 時は通常どおり
+  ローカルファイルとして読む
+- CONNECT トンネルの中継（`_relay`）は両ソケットをブロッキングのまま
+  `select` で読み取り可能を待ち、`sendall` もブロッキングで行う（書き込み側
+  にもアイドルタイムアウトを設定）。両ソケットを non-blocking にして
+  `sendall` していた旧実装は、相手の送信バッファが埋まると
+  `BlockingIOError` でトンネルを閉じてしまい、大きな転送が途中で欠落する
+  問題があった（Cursor Medium 再指摘）
+- 撮影エンジンのプロセスがタイムアウトした場合、直接の子プロセスだけでなく
+  子孫（Chromium のレンダラー・GPU プロセス等）もまとめて終了する
+  （POSIX: `start_new_session=True` で起動し `os.killpg` + `SIGKILL`。
+  Windows: `CREATE_NEW_PROCESS_GROUP` で起動し `taskkill /T /F` でプロセス
+  ツリーごと終了）。`subprocess.run(..., timeout=)` は直接の子しか kill
+  しないため、子孫が残って以後の撮影のプロキシ接続枠・CPU を奪い合ったり、
+  `user_data_dir` 削除と競合したりする問題があった（Cursor Medium 再指摘）。
+  子孫の終了後に `user_data_dir` を削除する
 
 **このプロキシで防げないこと（正直に書く。REPAIR-3）**:
 
@@ -176,11 +204,14 @@ URL のみへの直接ナビゲーションを許可し、それ以外（`--site
 
 保存した HTML はそのままだと `file://` の保存先パス基準で相対 URL が解決され、
 元の URL を直接開く Chromium と条件が食い違う。取得したスナップショットには
-`<head>` 直後（無ければ先頭）に `<base href="{元の URL}">` を注入し、相対リンク・
+`<head>` 直後（無ければ先頭）に `<base href="...">` を注入し、相対リンク・
 相対リソースの解決基準を揃える（JS が動的に発行するリクエストの起点までは
-揃わないため完全な条件一致ではない）。この撮影が「元 URL を直接開いた」ものか
-「スナップショット経由」だったかは結果 JSON の `captures[].input`（`"url"` /
-`"snapshot"`）で判別できる。
+揃わないため完全な条件一致ではない）。埋め込む URL は `sites.json` の元の
+URL ではなく、取得時にリダイレクトを辿った後の最終 URL（`response.geturl()`）
+である（Cursor Medium 再指摘: 最終的な本文を保存するのに base href がリダイレクト
+前の URL のままだと、相対 URL のリソースが誤った場所を基準に解決される）。
+この撮影が「元 URL を直接開いた」ものか「スナップショット経由」だったかは
+結果 JSON の `captures[].input`（`"url"` / `"snapshot"`）で判別できる。
 
 ### Servo のコマンド例
 
@@ -341,8 +372,15 @@ python3 -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
   （`start_filtering_proxy`）へ強制する。宛先を都度 `_resolve_public_addresses`
   で検証し、検証で得た IP へ直接接続する（ホスト名の再解決をしない。DNS
   リバインディング対策）。`{proxy}` を使わないテンプレートでの撮影は既定で
-  拒否する（`--allow-unproxied-engine` で明示的にオプトアウト）。詳細・限界は
-  上記「ローカル転送プロキシによる撮影プロセスの全通信フィルタ」を参照
+  拒否する（`--allow-unproxied-engine` で明示的にオプトアウト）。`fetch_snapshot`
+  自体（`{html_path}` 用スナップショット取得）もこのプロキシを必ず経由し、
+  直接 `socket` 接続する経路を残さない（`_ForcedProxyHandler`。https は
+  `CONNECT` になるため TLS の SNI・`Host` は元のホスト名のまま維持される）。
+  素の `urllib.request.ProxyHandler` は `no_proxy`/`NO_PROXY` 環境変数を見て
+  明示的な辞書を渡していてもバイパス（直接接続）してしまうため、`_ForcedProxyHandler`
+  でこのバイパスを無視する（CI・開発機の環境変数だけでプロキシ強制が
+  無効化される迂回経路を防ぐ）。詳細・限界は上記「ローカル転送プロキシによる
+  撮影プロセスの全通信フィルタ」を参照
 - 保存先ファイル（`snapshots/<site_id>.html`・`capture-result.json`）は
   `resolve()` 後に `--out-dir` 配下であることを確認し、既存の symlink があっても
   `O_NOFOLLOW`（`_write_bytes_nofollow`。Windows では `is_symlink()` 事前チェック）
@@ -365,7 +403,9 @@ python3 -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
 - `--timeout-sec` / `--settle-ms` / `--min-sites` は有限かつ範囲内の値のみを
   受け付け、`nan` / `inf` / 0 以下 / 極端に大きい値は起動時に拒否する
 - 撮影用の一時 `--user-data-dir`（Chromium）はテンプレート展開・スナップショット
-  取得の失敗を含むあらゆる終了経路で必ず削除する（`try`/`finally`）
+  取得の失敗を含むあらゆる終了経路で必ず削除する（`try`/`finally`）。撮影が
+  タイムアウトした場合は、子孫プロセス（レンダラー・GPU プロセス等）を含めて
+  終了させてからこの削除を行う（下記参照）
 - 撮影した PNG の寸法は要求した `viewport` と一致することを確認し、不一致は
   `failed` として扱う（エンジンが異なるサイズで撮ってしまう取り違えの検出）
 - エンジンバイナリが存在しない・実行権限がない等でプロセス自体を起動できない

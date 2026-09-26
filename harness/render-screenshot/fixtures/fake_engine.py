@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import struct
+import subprocess
 import sys
 import time
 import zlib
@@ -45,7 +46,9 @@ def write_minimal_png(path: Path, width: int, height: int) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--mode", choices=["ok", "fail", "sleep", "garbage"], default="ok")
+    parser.add_argument(
+        "--mode", choices=["ok", "fail", "sleep", "garbage", "spawn-grandchild"], default="ok"
+    )
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=800)
     # 実エンジン（Chromium 等）の `{url}` 直接ナビゲーションテンプレートを模した
@@ -62,6 +65,11 @@ def main(argv: list[str] | None = None) -> int:
     # を含める（`--allow-unproxied-engine` 無しでも `capture_one` の fail-closed
     # チェックを通過させるため。codex P0 再指摘）。
     parser.add_argument("--proxy", default=None)
+    # `--mode spawn-grandchild` 専用: 孫プロセスの PID をここへ書き出す
+    # （タイムアウト後にプロセスツリーごと終了しているかをテストから
+    # 確認するため。Cursor Medium: `subprocess.run(timeout=)` は直接の子しか
+    # kill しない問題の再現・修正確認）。
+    parser.add_argument("--pid-file", type=Path, default=None)
     args = parser.parse_args(argv)
 
     if args.mode == "fail":
@@ -72,6 +80,20 @@ def main(argv: list[str] | None = None) -> int:
         # capture_screenshots の --timeout-sec より十分長く待たせ、subprocess の
         # timeout による強制終了（status=timeout）を確実に発生させる。
         time.sleep(30)
+        return 0
+
+    if args.mode == "spawn-grandchild":
+        # 実エンジン（Chromium 等）がレンダラー・GPU プロセス等の子孫を持つ
+        # 状況を模す。孫プロセス自体も長時間 sleep し、`--pid-file` へ自分の
+        # PID を書き出してからこのプロセス自身も長時間 sleep する
+        # （タイムアウトで直接の子だけが kill されると孫が生き残ってしまう）。
+        grandchild = subprocess.Popen(  # noqa: S603
+            [sys.executable, "-c", "import time; time.sleep(60)"]
+        )
+        if args.pid_file is not None:
+            args.pid_file.write_text(str(grandchild.pid), encoding="utf-8")
+        time.sleep(30)
+        grandchild.wait()
         return 0
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

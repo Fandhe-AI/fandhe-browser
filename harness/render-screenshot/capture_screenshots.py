@@ -33,6 +33,7 @@ import math
 import os
 import re
 import select
+import signal
 import shutil
 import socket
 import socketserver
@@ -419,6 +420,26 @@ def _check_public_host(hostname: str | None, *, context: str) -> None:
     _resolve_public_addresses(hostname, 0, context=context)
 
 
+class _ForcedProxyHandler(urllib.request.ProxyHandler):
+    """`no_proxy`/`NO_PROXY` 環境変数によるバイパスを無視し、http/https の
+    リクエストを必ずこのプロキシへルーティングする `ProxyHandler`。
+
+    既定の `urllib.request.ProxyHandler.proxy_open` は `urllib.request.
+    proxy_bypass`（`no_proxy`/`NO_PROXY` 環境変数を参照する）が真を返すと
+    素通りし、`ProxyHandler` に明示的な辞書を渡していても直接接続してしまう。
+    CI や開発機で `NO_PROXY=*`（あるいは対象ホストを含む値）が設定されている
+    だけで `fetch_snapshot` の「撮影プロセス（この場合はスナップショット取得
+    自体）の通信を必ずローカル転送プロキシへ強制する」という意図を無効化
+    しうる（codex P0 再指摘の実質的な迂回経路）。本ハーネスが渡す
+    `proxy_url` は常に認証なしの `http://127.0.0.1:<port>` である前提で、
+    `no_proxy` チェックを行わない最小限の実装に置き換える。
+    """
+
+    def proxy_open(self, req, proxy, type):  # noqa: A002, ANN001, ANN201
+        req.set_proxy(urlparse(proxy).netloc, "http")
+        return None
+
+
 class _PublicOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
     """リダイレクト先にも SSRF チェック（scheme・内部アドレス）を適用する `HTTPRedirectHandler`。
 
@@ -437,13 +458,28 @@ class _PublicOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _open_url(request: urllib.request.Request, timeout_sec: float):  # noqa: ANN201
+def _open_url(request: urllib.request.Request, timeout_sec: float, *, proxy_url: str):  # noqa: ANN201
     """SSRF チェック付きリダイレクトハンドラを組み込んだ opener で `request` を開く。
+
+    `proxy_url`（`start_filtering_proxy` が起動したローカル転送プロキシの URL）を
+    `_ForcedProxyHandler`（`no_proxy` 環境変数を無視する `ProxyHandler`）で
+    http/https の両方に強制する（codex P0 再指摘）。`_check_public_host` は
+    DNS 解決結果を検証するだけで、実際の接続は `opener.open` が改めて名前
+    解決して行っていたため、検証後に DNS 応答が内部アドレスへ変わる（DNS
+    リバインディング）と `{html_path}` 経由で内部サービスへ到達できてしまって
+    いた。プロキシ経由にすることで、実際の接続先 IP の検証と接続を同じ場所
+    （プロキシの `_resolve_public_addresses` → 検証済み IP への直接接続）に
+    一本化する。https は `CONNECT` になるため、TLS の SNI・`Host` ヘッダは
+    元のホスト名のまま維持され、プロキシは宛先ホスト名の妥当性のみを判定して
+    接続先 IP を差し替える。リダイレクト先も `CONNECT`/フォワードのたびに
+    プロキシが検証するため、各ホップで守られる。`_PublicOnlyRedirectHandler`
+    による事前検査はここでは冗長になるが、多層防御として残す。
 
     テストからは本関数をモックすることで、実ネットワークにも `getaddrinfo` にも
     依存せず `fetch_snapshot` の呼び出し経路を検証できる。
     """
-    opener = urllib.request.build_opener(_PublicOnlyRedirectHandler)
+    proxy_handler = _ForcedProxyHandler({"http": proxy_url, "https": proxy_url})
+    opener = urllib.request.build_opener(proxy_handler, _PublicOnlyRedirectHandler)
     return opener.open(request, timeout=timeout_sec)  # noqa: S310
 
 
@@ -451,6 +487,7 @@ def fetch_snapshot(
     url: str,
     dest_path: Path,
     *,
+    proxy_url: str,
     allow_file_url: bool = False,
     timeout_sec: float = SNAPSHOT_TIMEOUT_SEC,
     max_bytes: int = SNAPSHOT_MAX_BYTES,
@@ -460,15 +497,24 @@ def fetch_snapshot(
     PoC-6 の `servo-embed` は HTML ファイルしか受け付けないため、URL を直接渡せる
     Chromium と条件を揃える目的でこの前処理を行う。SSRF を避けるため既定では https
     かつループバック・プライベート・リンクローカル等の内部アドレスではないホストのみを
-    許可する（`_check_public_host`）。`file:` はテスト用途で `allow_file_url=True` を
-    明示したときだけ許可する。
+    許可する（`_check_public_host`。事前検査で、内部アドレス宛の無駄なプロキシ
+    往復を避けつつ分かりやすい理由を返す）。実際の取得は `proxy_url`
+    （`start_filtering_proxy` が起動したローカル転送プロキシ。必須引数）を必ず
+    経由し、直接 `socket` へ接続する経路は残さない（codex P0 再指摘。DNS
+    リバインディング対策の詳細は `_open_url` 参照）。`file:` はテスト用途で
+    `allow_file_url=True` を明示したときだけ許可し、`file:` はプロキシの対象外
+    （`ProxyHandler` は http/https のみを差し替える）のため通常どおり
+    `FileHandler` で読む。
 
     保存した HTML はファイル URL（`file://` 経由の相対パス基準）になるため、
     Chromium が直接開く元の https URL とは相対リンク・相対リソースの解決基準が
-    異なる。呼び出し元の `capture_one` はこの差を縮めるため保存後の HTML へ
-    `<base href="{url}">` を注入する（`inject_base_href`）。ただし JS が動的に
-    発行するリクエストの起点までは揃わないため完全な条件一致ではない
-    （実装済みを装わない。REPAIR-3）。
+    異なる。この差を縮めるため保存後の HTML へ `<base href="...">` を注入する
+    （`inject_base_href`）。`url` がリダイレクトされた場合、埋め込むのは
+    `response.geturl()` が返す最終 URL であって最初の `url` ではない
+    （Cursor Medium 再指摘: 最終的な本文を保存するのに base href が
+    リダイレクト前の URL のままだと、相対 URL のリソースが誤った場所を
+    基準に解決される）。JS が動的に発行するリクエストの起点までは揃わない
+    ため完全な条件一致ではない（実装済みを装わない。REPAIR-3）。
     """
     parsed = urlparse(url)
     if parsed.scheme == "https":
@@ -480,7 +526,11 @@ def fetch_snapshot(
 
     request = urllib.request.Request(url, headers={"User-Agent": SNAPSHOT_USER_AGENT})
     try:
-        with _open_url(request, timeout_sec) as response:
+        with _open_url(request, timeout_sec, proxy_url=proxy_url) as response:
+            # リダイレクトを辿った後の最終 URL（Cursor Medium 再指摘）。
+            # `inject_base_href` に常に最初の `url` を渡すと、リダイレクト先の
+            # ページなのに相対 URL がリダイレクト前の場所を基準に解決されてしまう。
+            final_url = response.geturl() or url
             data = response.read(max_bytes + 1)
     except (urllib.error.URLError, OSError) as exc:
         raise SnapshotError(f"failed to fetch snapshot for {url}: {exc}") from exc
@@ -489,7 +539,7 @@ def fetch_snapshot(
         raise SnapshotError(f"snapshot for {url} exceeds the {max_bytes} byte limit")
 
     try:
-        _write_bytes_nofollow(dest_path, inject_base_href(data, url))
+        _write_bytes_nofollow(dest_path, inject_base_href(data, final_url))
     except OSError as exc:
         raise SnapshotError(f"failed to write snapshot file: {dest_path}: {exc}") from exc
 
@@ -641,9 +691,20 @@ class _ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
             upstream.close()
 
     def _relay(self, client_sock: socket.socket, upstream_sock: socket.socket) -> None:
-        """CONNECT トンネル確立後、クライアント・upstream 間を双方向に中継する。"""
-        client_sock.setblocking(False)
-        upstream_sock.setblocking(False)
+        """CONNECT トンネル確立後、クライアント・upstream 間を双方向に中継する。
+
+        両ソケットはブロッキングのままにし、読み取り可能かどうかの待ち合わせ
+        だけ `select` に任せる（Cursor Medium 再指摘: 両ソケットを
+        non-blocking にして `sendall` していると、相手の送信バッファが
+        埋まった時点で `BlockingIOError`（`OSError` のサブクラス）が飛び、
+        `except OSError: return` がトンネルを即座に閉じてしまう。大きな
+        転送の途中で欠落する）。ブロッキングソケットの `sendall` は送信し
+        きるまで内部でブロックし続けるため、この問題が起きない。書き込み側にも
+        `PROXY_IDLE_TIMEOUT_SEC` のタイムアウトを設定し、相手が全く読み出さない
+        まま固着した接続だけを打ち切る。
+        """
+        client_sock.settimeout(PROXY_IDLE_TIMEOUT_SEC)
+        upstream_sock.settimeout(PROXY_IDLE_TIMEOUT_SEC)
         total = 0
         sockets = [client_sock, upstream_sock]
         while True:
@@ -1054,6 +1115,60 @@ def _read_tail(path: Path, max_chars: int) -> str:
     return data.decode("utf-8", errors="replace")[-max_chars:]
 
 
+def _process_group_popen_kwargs() -> dict[str, Any]:
+    """撮影エンジンの子孫プロセスをまとめて終了できるよう、`Popen` にプロセスグループ／
+    ジョブを与える引数を返す（Cursor Medium: `subprocess.run(..., timeout=)` は
+    タイムアウト時に直接の子しか kill せず、Chromium のレンダラー・GPU プロセス
+    等の子孫が残ってしまう）。
+
+    POSIX では `start_new_session=True` で新しいセッション（プロセスグループ
+    リーダー）にし、後で `os.killpg` によりグループ全体へシグナルを送れるように
+    する。Windows には `killpg` 相当が無いため `CREATE_NEW_PROCESS_GROUP` を渡し、
+    `_kill_process_tree` 側で `taskkill /T /F` を使ってプロセスツリーごと終了する。
+    """
+    if os.name == "posix":
+        return {"start_new_session": True}
+    return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}  # type: ignore[attr-defined]
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """タイムアウトした撮影プロセスを、子孫を含めて終了させる（Cursor Medium）。
+
+    直接の子だけを kill すると、Chromium のレンダラー・GPU プロセス等の子孫が
+    残り、以後の撮影でプロキシの接続枠・CPU を取り合ったり、`capture_one` の
+    `finally` で行う `user_data_dir` の削除（子孫がまだファイルを開いている
+    場合、特に Windows でロック競合）と衝突しうる。本関数はベストエフォートで
+    プロセスツリー全体の終了を試み、例外を上位へ伝播させない
+    （タイムアウト処理自体を失敗させたくないため）。
+    """
+    try:
+        if os.name == "posix":
+            # `_process_group_popen_kwargs` で `start_new_session=True` を
+            # 渡しているため、プロセスグループ ID は直接の子の pid と一致する。
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # 既に終了している
+        else:
+            # Windows: `CREATE_NEW_PROCESS_GROUP` だけでは子孫は終了しないため、
+            # `taskkill /T`（プロセスツリー）/ `/F`（強制）を使う。
+            subprocess.run(  # noqa: S603, S607
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+    except OSError:
+        pass  # taskkill 不在等。ベストエフォート
+
+    # シグナル送信・taskkill だけでは直接の子がゾンビのまま残るため、必ず reap する。
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _count_common_ok_sites(captures: list[dict[str, Any]], engines: list[str]) -> int:
     """指定した全エンジンで "ok" だった site_id の共通集合の件数を返す。
 
@@ -1218,8 +1333,16 @@ def capture_one(
             if not resolved_snapshot.is_relative_to(out_dir.resolve()):
                 raise CaptureError(f"refusing to write outside out-dir: {resolved_snapshot}")
             snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            if proxy_url is None:
+                # `fetch_snapshot` は必ずローカル転送プロキシを経由させる
+                # （codex P0 再指摘）。エンジン自身のテンプレートが `{proxy}` を
+                # 使うかどうか（`--allow-unproxied-engine`）とは独立に、この
+                # スナップショット取得だけは常にプロキシが必要（`main` は
+                # dry-run 以外で必ずプロキシを起動するため、実運用でここへは
+                # 来ない。直接 `capture_one` を呼ぶテスト向けの防御）。
+                raise CaptureError("fetch_snapshot requires a running filtering proxy (proxy_url)")
             try:
-                fetch_snapshot(site.url, snapshot_path, allow_file_url=allow_file_url)
+                fetch_snapshot(site.url, snapshot_path, allow_file_url=allow_file_url, proxy_url=proxy_url)
             except SnapshotError as exc:
                 return _skip_result(site, engine, argv, str(exc))
 
@@ -1266,24 +1389,28 @@ def capture_one(
                 prefix="fandhe-capture-stderr-", delete=False
             ) as stderr_file:
                 stderr_path = Path(stderr_file.name)
-                proc = subprocess.run(  # noqa: S603
+                # `subprocess.run(..., timeout=...)` はタイムアウト時に直接の
+                # 子プロセスしか kill しない（Cursor Medium 再指摘）。Chromium は
+                # レンダラー・GPU プロセス等の子孫を持つため、直接の子だけを
+                # 殺しても子孫が残り、プロキシの接続枠・CPU を奪い合い、後続の
+                # `user_data_dir` 削除（Windows ではファイルロック）とも競合しうる。
+                # `Popen` + 明示的な `wait`/プロセスツリー kill に置き換える。
+                proc = subprocess.Popen(  # noqa: S603
                     argv,
-                    timeout=timeout_sec,
                     stdout=subprocess.DEVNULL,
                     stderr=stderr_file,
                     shell=False,
-                    check=False,
+                    **_process_group_popen_kwargs(),
                 )
+                try:
+                    exit_code: int | None = proc.wait(timeout=timeout_sec)
+                    timed_out = False
+                except subprocess.TimeoutExpired:
+                    _kill_process_tree(proc)
+                    exit_code = None
+                    timed_out = True
             duration_ms = int((time.monotonic() - start) * 1000)
-            exit_code: int | None = proc.returncode
             stderr_tail = _read_tail(stderr_path, STDERR_TAIL_CHARS)
-            timed_out = False
-            engine_missing = False
-        except subprocess.TimeoutExpired:
-            duration_ms = int((time.monotonic() - start) * 1000)
-            exit_code = None
-            stderr_tail = _read_tail(stderr_path, STDERR_TAIL_CHARS) if stderr_path else ""
-            timed_out = True
             engine_missing = False
         except OSError as exc:
             # エンジンバイナリ不在（FileNotFoundError）・実行権限なし等。プロセスを
