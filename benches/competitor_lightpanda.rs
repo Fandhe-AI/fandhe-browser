@@ -96,8 +96,7 @@ const MAX_TRIALS: usize = 20;
 
 /// `<PREFIX>_SERVE_ARGS` / `<PREFIX>_MCP_ARGS`（外部入力）に許す上限。
 /// `split_args` へ渡す前にバイト数・分割後の引数個数を検証し、巨大な
-/// 環境変数によるメモリ過剰消費を防ぐ（レビュー指摘 P1: line 140。
-/// coding-rust.md「長さ・件数を上限検証」）。
+/// 環境変数によるメモリ過剰消費を防ぐ。
 const MAX_ARGS_ENV_BYTES: usize = 4 * 1024;
 const MAX_ARGS_COUNT: usize = 64;
 

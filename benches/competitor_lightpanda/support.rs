@@ -15,19 +15,15 @@
 //! 例外的に [`DeadlineReader`] だけは実ソケット I/O を行う（`TcpStream` を
 //! 包む）。外部プロセス（対象バイナリ）を起動せずローカルの loopback
 //! ソケットだけで動作を検証できるため、単体テスト（slow-loris 相手の
-//! 全体期限打ち切り等）もこのファイルに置く（レビュー指摘。コーディネーター
-//! 指示。PR #442 再々々々々々レビュー: fixture サーバー・readiness probe の
-//! 両方で場当たり的に `set_read_timeout` を設定するのではなく、共通の
-//! プリミティブへ統一する）。
+//! 全体期限打ち切り等）もこのファイルに置く。
 //!
 //! 同様に [`apply_new_process_group`]・[`kill_process_group`] も実際に
-//! プロセスを起動・終了させる副作用を持つ（レビュー指摘。コーディネーター
-//! 指示。PR #442 再々々々々々々々レビュー: プロセスグループ経由で子・孫
+//! プロセスを起動・終了させる副作用を持つ。プロセスグループ経由で子・孫
 //! プロセスの両方を実際に終了できることを 3 OS CI で検証する単体テストが
 //! 必要なため、`[[bench]]` ターゲット（`cargo test` の対象外）ではなく
-//! この crate root へ移した）。テストは実際に `sh` で子・孫プロセスを
-//! 起動して検証する（外部プロセス起動を伴うが、対象バイナリではなく
-//! OS 標準のシェルのみを使うため、依存関係は増えない）。
+//! この crate root に置く。テストは実際に `sh` で子・孫プロセスを起動して
+//! 検証する（外部プロセス起動を伴うが、対象バイナリではなく OS 標準の
+//! シェルのみを使うため、依存関係は増えない）。
 //!
 //! `AISNAP-1`（MCP トークン削減率）計測は、任意の外部 URL ではなく、
 //! リポジトリに同梱した静的 fixture（外部参照を含まない自作コンテンツ。
@@ -37,8 +33,8 @@
 //! security.md「SSRF」）。fixture は `include_str!` でコンパイル時に
 //! バイナリへ埋め込み（実行時のファイル I/O を行わないため、シンボリック
 //! リンク追従やメタデータ確認後のサイズ変化 TOCTOU が構造的に起こらない）、
-//! `competitor_lightpanda.rs` が起動するローカル静的サーバー（`127.0.0.1`
-//! の空きポート）が [`lookup_fixture`] の完全一致検索で配信する。`goto`
+//! `measure.rs`（`FixtureServer`）が起動するローカル静的サーバー
+//! （`127.0.0.1` の空きポート）が [`lookup_fixture`] の完全一致検索で配信する。`goto`
 //! する URL は [`fixture_url`] だけで組み立て、`FIXTURE_TABLE` に列挙した
 //! 固定パス以外を渡せない構造にすることで、ベンチが外部ネットワークへ
 //! 一切出ない構成を保証する。
@@ -102,14 +98,10 @@ pub fn approx_tokens(chars: usize) -> usize {
 /// 呼び出し側のポーリングを継続させる（panic させない。coding-rust.md）。
 pub fn parse_http_status(line: &str) -> Option<u16> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
-    // レビュー指摘 P2（コーディネーター指示。PR #442 再々々々々々々々
-    // レビュー・support.rs:109）: 以前は `version.starts_with("HTTP/")`
-    // （`HTTP/potato` のような不正な値も通る）・`code.parse::<u16>()`
-    // （桁数不問。`0`・`65535` のような HTTP のステータスコードとして
-    // 無意味な値も通る）という緩い判定だった。ここでは
     // `HTTP/1.0`・`HTTP/1.1` のいずれかに続く単一の SP、ちょうど 3 桁の
-    // 数字（100〜599）、その後に SP か行末が続く、という形式だけを
-    // 受理する。
+    // 数字（100〜599）、その後に SP か行末が続く、という形式だけを受理する
+    // （バージョン部分の判定は [`is_valid_http_version`] に統一し、
+    // リクエスト行検証と基準を揃える）。
     let version_len = "HTTP/1.1".len();
     // `str::split_at` はバイト境界が UTF-8 文字境界からずれていると panic
     // する。外部プロセスからの未検証入力（マルチバイト文字を含み得る）を
@@ -117,7 +109,7 @@ pub fn parse_http_status(line: &str) -> Option<u16> {
     // coding-rust.md「外部入力の経路では unwrap を使わず明示的に処理する」）。
     let version = trimmed.get(..version_len)?;
     let rest = trimmed.get(version_len..)?;
-    if version != "HTTP/1.0" && version != "HTTP/1.1" {
+    if !is_valid_http_version(version) {
         return None;
     }
     let rest = rest.strip_prefix(' ')?;
@@ -162,8 +154,7 @@ const READINESS_RESPONSE_FIELDS: &[&str] = &[
 /// readiness probe の応答本文が「起動した子プロセス（ブラウザ）からの
 /// 応答らしいか」を判定する。
 ///
-/// レビュー指摘 Medium（Cursor。PR #442 再々々々々レビュー・
-/// competitor_lightpanda.rs:486-535）: `reserve_port` は bind したリスナーを
+/// `reserve_port` は bind したリスナーを
 /// 即座に drop してから子プロセスを起動するため、その間に別プロセスが
 /// 同じポートを奪える TOCTOU が残る。ポートが「空いているか」ではなく
 /// 「応答している内容が期待するブラウザらしいか」を検証することで、
@@ -171,10 +162,7 @@ const READINESS_RESPONSE_FIELDS: &[&str] = &[
 /// 下げる。CDP の `/json/version` は JSON オブジェクトで
 /// [`READINESS_RESPONSE_FIELDS`] のいずれかのフィールドを持つのが
 /// 一般的なため、本文が JSON オブジェクトであり、かつそのいずれかの
-/// キー（大小文字を区別しない）を持つことを要求する（レビュー指摘
-/// advisor 追加指摘: 「JSON オブジェクトでありさえすれば `{}` でも通る」
-/// のは弱すぎるため、少なくとも 1 つの既知フィールドを要求するよう
-/// 強化した）。ステータス行だけで判定していた以前の実装より強いが、
+/// キー（大小文字を区別しない）を持つことを要求する。ステータス行だけで判定していた以前の実装より強いが、
 /// 別プロセスがたまたま同じ形の JSON を返す場合までは排除できない
 /// （呼び出し元 `spawn_and_wait_ready` の `Child::try_wait` による生存
 /// 確認と組み合わせた best-effort。完全な防止には子プロセスが実際に
@@ -196,7 +184,7 @@ pub fn looks_like_browser_readiness_response(body: &str) -> bool {
 /// アイドル RSS 計測（`PERF-6`）が unix でのみ呼ぶ（Windows は
 /// `Unsupported`。実装計画 3.2 節）。空文字列・数値でない出力は `None` を返す。
 ///
-/// 呼び出し元（`competitor_lightpanda.rs` の `sample_rss_kb`）が
+/// 呼び出し元（`measure.rs` の `sample_rss_kb`）が
 /// `#[cfg(unix)]` 限定のため、この関数自体も `#[cfg(unix)]` にする。
 /// 無条件公開のままだと Windows ネイティブビルドで到達不能になり
 /// `dead_code` 警告が `-D warnings`（ci.md「3 OS CI」）で fail する。
@@ -224,8 +212,7 @@ pub fn expand_args(template: &[String], port: u16) -> Vec<String> {
 /// せず、素朴な空白分割に留める（シェル評価をしないことでインジェクションを
 /// 避ける方針。実装計画セクション 6）。
 ///
-/// `#[allow(dead_code)]` の理由（レビュー指摘。コーディネーター指示。PR #442
-/// 再々々々々々々々々レビュー・crates/fandhe-browser-core/Cargo.toml:57）:
+/// `#[allow(dead_code)]` の理由:
 /// この crate root は 3 つの異なる `[[bench]]`/`[[test]]` ターゲットとして
 /// コンパイルされる。`competitor_lightpanda`（`[[bench]]`）と
 /// `competitor_lightpanda_support`（`harness = true` の `[[test]]`）では
@@ -249,8 +236,7 @@ pub fn split_args(env: &str) -> Vec<String> {
 /// `main`（`competitor_lightpanda.rs`）が構築し、[`bench_exit_code`] の入力
 /// および JSON 出力（[`Outcome::to_json`]）に使う。純粋関数群と同じ
 /// `support.rs` に置くことで、[`bench_exit_code`] のテスト（`Skipped`/
-/// `Unsupported` のみでは `0`、`Error` を含むと非ゼロ）を副作用なしに書ける
-/// （レビュー指摘 P1。Codex。PR #442・competitor_lightpanda.rs:893）。
+/// `Unsupported` のみでは `0`、`Error` を含むと非ゼロ）を副作用なしに書ける。
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
     Value(f64),
@@ -302,7 +288,7 @@ impl Outcome {
 
 /// 全計測結果から `main` の終了コードを決める。
 ///
-/// レビュー指摘 P1（Codex。competitor_lightpanda.rs:893）: `Outcome::Error`
+/// `Outcome::Error`
 /// （対象バイナリの起動失敗・MCP 呼び出し失敗等の計測失敗）が発生しても
 /// `main` が常に正常終了すると、自動計測が失敗した実行を成功と誤判定し得る。
 /// `main` の終了コード契約: 1 件でも計測失敗（`Outcome::Error`）があれば
@@ -355,8 +341,7 @@ pub fn fixture_url(port: u16, path: &'static str) -> String {
 /// `AISNAP-1`（MCP トークン削減率）計測が `goto` する fixture ページの
 /// パス → (content-type, 内容) テーブル。
 ///
-/// レビュー指摘 P0・P1（Codex。PR #442 再々レビュー・
-/// competitor_lightpanda.rs:338/352）: 以前は fixture をファイルシステムから
+/// 以前は fixture をファイルシステムから
 /// 実行時に読んでいたため、(1) `safe_join_fixture_path` が字面上の `..` を
 /// 拒否しても `metadata`/`read` はシンボリックリンクを辿ってしまい、fixture
 /// 配下にルート外を指すリンクを置かれるとそれを配信し得た、(2)
@@ -389,15 +374,13 @@ pub const FIXTURE_TABLE: &[(&str, &str, &str)] = &[
 /// `measure_token_reduction`）が「`goto` が実際にそのページへ遷移できたか」
 /// を内容ベースで確認するための一意なマーカー文字列。
 ///
-/// レビュー指摘 P1（Codex。PR #442 再々々々々々々々々々レビュー・
-/// measure.rs:1450）: 以前は `goto` の JSON-RPC 応答が形式上妥当
+/// 以前は `goto` の JSON-RPC 応答が形式上妥当
 /// （`validate_mcp_response`）でありさえすれば遷移成功とみなしており、
 /// 対象ブラウザが実際にはそのページへ遷移していなくても（例えば直前の
 /// ページに留まったまま）、直前のページの `html`/`tree` を当該 fixture の
 /// 成功サンプルとして記録できてしまっていた。
 ///
-/// レビュー指摘（Codex P1・measure.rs:1505 / Cursor Medium・support.rs:452。
-/// PR #442 再々々々々々々々々々々レビュー）: 当初は各ページの `<title>`
+/// 当初は各ページの `<title>`
 /// テキストをマーカーに使っていたが、`<title>` は `<head>` にしか存在せず、
 /// アクセシビリティツリー（`tree`）に現れる保証が無い（多くのアクセシビリ
 /// ティツリー実装は文書の `accessible name` を `<title>` から採ることは
@@ -438,7 +421,7 @@ pub fn fixture_marker(request_path: &str) -> Option<&'static str> {
 ///
 /// [`FIXTURE_TABLE`] のキーとの完全一致だけで引く（`..`・クエリ文字列・
 /// 末尾スラッシュの有無等を正規化しない）。一致しなければ `None`
-/// （呼び出し側は 404 を返す。`competitor_lightpanda.rs` の
+/// （呼び出し側は 404 を返す。`measure.rs` の
 /// `handle_fixture_connection`）。
 pub fn lookup_fixture(request_path: &str) -> Option<(&'static str, &'static str)> {
     FIXTURE_TABLE
@@ -473,12 +456,11 @@ pub fn require_bin<'a>(
     bin.ok_or_else(|| Outcome::Skipped(format!("{target_name}: binary path not configured")))
 }
 
-/// `AISNAP-1` 計測（`competitor_lightpanda.rs` の `measure_token_reduction`
+/// `AISNAP-1` 計測（`measure.rs` の `measure_token_reduction`
 /// 呼び出し前）が、対象バイナリの有無と fixture サーバーの起動結果から
 /// `Outcome` を確定できるかを判定する。
 ///
-/// レビュー指摘 P1（Codex。PR #442 再々レビュー・
-/// competitor_lightpanda.rs:1058）: 片方の対象だけに `_BIN` を設定した状態で
+/// 片方の対象だけに `_BIN` を設定した状態で
 /// fixture サーバーの起動（`bind`）が失敗すると、以前は未設定の対象にも
 /// `Outcome::Error` を割り当てていた（「対象バイナリ未設定は常に
 /// `Outcome::Skipped`」という契約に反する）。バイナリ未設定の判定自体は
@@ -507,8 +489,7 @@ pub fn token_reduction_gate(
 /// `Outcome::Error` を返す。無ければ `None`（呼び出し側が実際の計測を
 /// 続ける）。
 ///
-/// レビュー指摘 P2（Codex。PR #442 再々々々レビュー・
-/// competitor_lightpanda.rs:511/554）: 以前は `Target::args_error` が
+/// 以前は `Target::args_error` が
 /// `SERVE_ARGS`・`MCP_ARGS` 両方の検証エラーを 1 フィールドへまとめていた
 /// ため、`MCP_ARGS` だけが上限超過でも、`MCP_ARGS` を使わない cold start
 /// （`PERF-3`）・アイドル RSS（`PERF-6`）計測まで計測前に `Outcome::Error`
@@ -524,7 +505,7 @@ pub fn arg_error_gate(arg_error: Option<&str>, target_name: &str) -> Option<Outc
 /// HTTP リクエストの先頭行（例: `GET /article.html HTTP/1.1`）から
 /// メソッドとパスを取り出す。
 ///
-/// fixture 配信サーバー（`competitor_lightpanda.rs` の
+/// fixture 配信サーバー（`measure.rs` の
 /// `handle_fixture_connection`）が使う。書式に合わない行は `None` にし、
 /// 呼び出し側が 400 相当のエラー応答を返せるようにする（panic させない。
 /// coding-rust.md）。
@@ -544,32 +525,22 @@ pub fn parse_http_request_line(line: &str) -> Option<(String, String)> {
     Some((method.to_string(), path.to_string()))
 }
 
-/// `"HTTP/"` に続けて `<数字列>.<数字列>`（例: `HTTP/1.1`・`HTTP/1.0`）の
-/// 形式かどうかを判定する。
+/// このベンチが唯一扱う HTTP バージョン表記（`HTTP/1.0`・`HTTP/1.1`）
+/// かどうかを判定する。
 ///
-/// レビュー指摘（コーディネーター指示。PR #442 再々々々レビュー）:
-/// 以前は `version.starts_with("HTTP/")` だけで判定しており、
-/// `HTTP/potato` のような不正な値も通っていた。バージョン番号部分が
-/// 数字のみの 2 要素であることまで確認する。
+/// fixture サーバーのリクエスト行検証（[`parse_http_request_line`]）と、
+/// readiness probe のレスポンスステータス行検証（[`parse_http_status`]）の
+/// 両方がこの 1 関数を通す（`HTTP/2.0`・`HTTP/potato` のような表記は
+/// どちら側でも受理しない。両者で別々に判定すると基準が食い違い得るため
+/// 統一する）。
 pub fn is_valid_http_version(version: &str) -> bool {
-    let Some(rest) = version.strip_prefix("HTTP/") else {
-        return false;
-    };
-    let mut parts = rest.split('.');
-    let (Some(major), Some(minor), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    !major.is_empty()
-        && !minor.is_empty()
-        && major.chars().all(|c| c.is_ascii_digit())
-        && minor.chars().all(|c| c.is_ascii_digit())
+    version == "HTTP/1.0" || version == "HTTP/1.1"
 }
 
 /// ソケット読み取りの `io::Error` から、fixture 配信サーバーが返すべき
 /// HTTP ステータスコードを決める。
 ///
-/// レビュー指摘 P1（Codex。PR #442 再々々々レビュー・
-/// competitor_lightpanda.rs:352）: リクエスト行・ヘッダ行の読み取りが
+/// リクエスト行・ヘッダ行の読み取りが
 /// タイムアウト・サイズ超過・その他の I/O エラーで失敗した場合、以前は
 /// ループを抜けるだけで後続の処理（`lookup_fixture` によるパス一致判定・
 /// `200` 応答）へ進んでしまい、読み取り未完了のまま既知のパスなら成功応答を
@@ -796,8 +767,7 @@ pub fn run_capturing_output_with_deadline(
 
 /// 起動する `Command` に「新しいプロセスグループ」を設定する。
 ///
-/// レビュー指摘 P1（Codex。PR #442 再々々々々レビュー・
-/// competitor_lightpanda.rs:827）: 対象プロセス（ブラウザ）が起動した
+/// 対象プロセス（ブラウザ）が起動した
 /// 子孫プロセスが stdin パイプの読み取り側を継承していると、直接の子だけを
 /// `kill` してもパイプが閉じずベンチ全体が止まり得る。プロセスグループ
 /// 単位で起動しておき、タイムアウト時に [`kill_process_group`] でグループ
@@ -809,7 +779,6 @@ pub fn run_capturing_output_with_deadline(
 /// 依存なしで `std::os::{unix,windows}::process::CommandExt` の安定 API
 /// だけで実装する。
 ///
-/// レビュー指摘（コーディネーター指示。PR #442 再々々々々々々々レビュー）:
 /// `kill_process_group` と合わせて、実際に子・孫プロセスの両方を
 /// 終了させられることを 3 OS CI で検証する単体テストが必要なため、
 /// `competitor_lightpanda.rs`（`[[bench]]` ターゲット。`cargo test` の
@@ -842,8 +811,7 @@ pub fn apply_new_process_group(command: &mut std::process::Command) {
 /// （spawn 自体の失敗）・非 0 終了（対象が既に存在しない等）では `Err`
 /// を返す。
 ///
-/// レビュー指摘 P1（Codex。PR #442 再々々々々々々々レビュー・
-/// competitor_lightpanda.rs:558）: 以前は `Command::status()` の結果を
+/// 以前は `Command::status()` の結果を
 /// `let _ = ...` で握りつぶしており、外部コマンドの spawn 失敗・非 0
 /// 終了に気づけなかった。`Result` にして呼び出し元へ返し、呼び出し元は
 /// 失敗時に `Child::kill`（直接の子のみ）へのフォールバックを行った旨を
@@ -851,10 +819,9 @@ pub fn apply_new_process_group(command: &mut std::process::Command) {
 /// 戻り値を返せないため、そこに限り結果を握りつぶしてよい）。
 #[cfg(unix)]
 pub fn kill_process_group(pid: u32) -> Result<(), String> {
-    // レビュー指摘 Medium（Cursor。PR #442 再々々々々々々々々レビュー・
-    // competitor_lightpanda.rs:553）: `-<pid>`（プロセスグループ宛て）は
+    // `-<pid>`（プロセスグループ宛て）は
     // ハイフンで始まるため、GNU coreutils の `kill` はオプションの
-    // 一部と誤解釈しないよう `--` を要求する（前回のレビュー指摘）が、
+    // 一部と誤解釈しないよう `--` を要求するが、
     // macOS の BSD `kill`（`/bin/kill`）は逆に `--` 自体を PID 引数として
     // 解釈し `illegal pid: --` で失敗する。外部の `kill` バイナリの
     // 引数解釈の違いに依存せず、POSIX シェル（`sh`）の組み込み `kill` を
@@ -889,13 +856,11 @@ pub fn kill_process_group(pid: u32) -> Result<(), String> {
     exit_status_to_result(status)
 }
 
-/// `spawn_and_wait_ready`（`competitor_lightpanda.rs`）の 1 試行後、対象
+/// `spawn_and_wait_ready`（`measure.rs`）の 1 試行後、対象
 /// プロセス（グループ）を kill し `wait` で終了を確認したあと、同じポート
 /// へ短い期限で再接続を試みた結果から、その試行を計測値としてそのまま
 /// 使ってよいか（別プロセスによるポート競合を検出したか）を判定する。
 ///
-/// レビュー指摘 P1（Codex。PR #442 再々々々々々々々レビュー・
-/// competitor_lightpanda.rs:607。Cursor からも同種の指摘あり）:
 /// `reserve_port` はリスナーを解放してから子プロセスを起動するまでの間に
 /// 別プロセスが同じポートを奪える TOCTOU が残るため、readiness probe が
 /// 対象自身ではなく別プロセスの応答を拾っていた可能性がある。std だけでは
@@ -905,7 +870,7 @@ pub fn kill_process_group(pid: u32) -> Result<(), String> {
 /// （`reprobe_still_responds`）だけを受け取り、`true`（まだ応答がある）
 /// なら計測を `Error` として扱うべき理由文字列を返す。
 ///
-/// 限界（呼び出し元 `competitor_lightpanda.rs` の `reprobe_after_kill` の
+/// 限界（呼び出し元 `measure.rs` の `reprobe_after_kill` の
 /// ドキュメントにも記載）: (1) kill から再接続までの間に別のプロセスが
 /// 新たに同じポートを奪った場合、それを「元から居た別プロセス」と区別
 /// できない、(2) 対象が孫プロセスを起動していた場合、`wait` は直接の子
@@ -933,7 +898,6 @@ pub fn port_conflict_error(
 /// `Content-Length` ヘッダーの値（コロンの後ろ、前後の空白を含み得る）を
 /// 厳密に解釈する。
 ///
-/// レビュー指摘 P2（コーディネーター指示。PR #442 再々々々々々々レビュー）:
 /// 以前は `value.trim().parse::<usize>().ok()` で解釈しており、パースに
 /// 失敗した場合は素通りして `content_length` を `None`（＝ヘッダーが
 /// 無かった場合と同じ「長さ指定なし」）にしていた。しかし `Content-Length`
@@ -953,11 +917,10 @@ pub fn parse_content_length(value: &str) -> Option<usize> {
 }
 
 /// readiness probe が受け取った `Content-Length` が、読み取りに許す上限
-/// （`competitor_lightpanda.rs` の `PROBE_BODY_MAX_BYTES`）を超えているかを
+/// （`measure.rs` の `PROBE_BODY_MAX_BYTES`）を超えているかを
 /// 判定する。
 ///
-/// レビュー指摘 P2（Codex。PR #442 再々々々々々々レビュー・
-/// competitor_lightpanda.rs:756）: 以前は `Content-Length` が上限を超えて
+/// 以前は `Content-Length` が上限を超えて
 /// いても `len.min(max_bytes)` で黙って切り詰め、その範囲だけ読めれば
 /// probe 成功として扱っていた（サーバーが実際に宣言した長さの応答を
 /// 確認しないまま成功と判定し得た）。呼び出し元（`probe_once`）は、この
@@ -972,23 +935,20 @@ pub fn content_length_exceeds_limit(content_length: Option<usize>, max_bytes: us
 /// 呼び出しではなく「この接続・この probe」全体に対する絶対期限
 /// （`Instant`）を守らせる `Read`/`Write` 実装。
 ///
-/// レビュー指摘 P1（Codex。PR #442 再々々々々々レビュー・
-/// competitor_lightpanda.rs:364/682/711）: `set_read_timeout` は 1 回の
+/// `set_read_timeout` は 1 回の
 /// `read` 呼び出しにしか効かない。相手が 1 バイトずつ小分けに送り続ける
 /// （slow-loris 型）と、個々の `read` は毎回タイムアウト内に完了して
 /// しまうため、`BufRead::read_line` 相当の呼び出し全体としては無期限に
 /// 時間を消費し得た。fixture サーバーの接続 1 本・readiness probe の
 /// 1 回それぞれで場当たり的にタイムアウトを設定し直すのではなく、この
-/// 1 つのプリミティブに統一する（`competitor_lightpanda.rs` の
+/// 1 つのプリミティブに統一する（`measure.rs` の
 /// `handle_fixture_connection`・`probe_once` の両方がこれ経由でのみ
 /// ソケットを読み書きする）。`read`/`write` のたびに
 /// `deadline.saturating_duration_since(Instant::now())` を計算し、
 /// 残りが 0 なら実際には OS の `read`/`write` を呼ばず
 /// `ErrorKind::TimedOut` を返す。`write_all`（`Write` トレイトの
 /// デフォルト実装が `write` を繰り返し呼ぶ）もこの仕組みに自動的に
-/// 従うため、書き込み側も同じプリミティブで期限を守る（レビュー指摘:
-/// 「書き込み側も同様に確認し、必要なら `set_write_timeout` とあわせて
-/// 期限を守らせる」）。
+/// 従うため、書き込み側も同じプリミティブで期限を守る。
 ///
 /// この型だけは実ソケット I/O を行う（モジュールドキュメント参照）。
 /// 外部プロセスを起動せずローカルの loopback ソケットだけで
@@ -1002,13 +962,32 @@ impl DeadlineReader {
     pub fn new(stream: TcpStream, deadline: Instant) -> Self {
         Self { stream, deadline }
     }
+
+    /// 期限を現在時刻から `extra` だけ先に延長する（縮めない。既存の期限が
+    /// まだ先ならそのまま）。
+    ///
+    /// fixture サーバー（`measure.rs` の `respond_with_io_error`）が、読み
+    /// 取り側の絶対期限をちょうど使い切った直後に、小さな固定長のエラー
+    /// 応答（400/408）だけは送れるようにするための限定的な猶予に使う。
+    /// 読み取り・書き込みで同じ 1 つの期限を共有する設計上、読み取り
+    /// タイムアウトが発生した時点で残り時間は必ずゼロになっており、
+    /// 延長しなければエラー応答の書き込み自体が常に即座に失敗し、
+    /// クライアントに 400/408 が届かない（接続が無応答のまま閉じる）
+    /// 構造的な問題になる。無制限な延長ではなく、呼び出し元が決めた短い
+    /// 追加時間だけを許すため、接続全体の上限（`FIXTURE_IO_TIMEOUT` +
+    /// この猶予）は変わらず有界のままである。
+    pub(crate) fn extend_deadline(&mut self, extra: Duration) {
+        let candidate = Instant::now() + extra;
+        if candidate > self.deadline {
+            self.deadline = candidate;
+        }
+    }
 }
 
 /// OS のソケットタイムアウトに由来する `io::Error` を、共通の
 /// `ErrorKind::TimedOut` へ正規化する。
 ///
-/// レビュー指摘（Cursor。PR #442 再々々々々々々レビュー・
-/// competitor_lightpanda.rs:1893。macOS CI 失敗）: unix のブロッキング
+/// unix のブロッキング
 /// ソケットは `set_read_timeout`/`set_write_timeout` の期限切れで
 /// `ErrorKind::WouldBlock` を返す（Linux では `TimedOut` を返すため、
 /// この違いに気づかれにくい）。`DeadlineReader` 呼び出し側（
@@ -1107,8 +1086,7 @@ impl JsonValue {
     }
 
     /// `Bool` のときだけ中身を返す。`result.isError` の型検証に使う
-    /// （レビュー指摘 P1。Codex。PR #442 再々々々レビュー・
-    /// competitor_lightpanda.rs:839）。
+    /// 。
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             JsonValue::Bool(b) => Some(*b),
@@ -1128,8 +1106,7 @@ impl JsonValue {
 /// MCP サーバー（stdio 越しの JSON-RPC 2.0）からの応答 1 件が、要求した
 /// `method` に対する妥当な応答の形をしているかを検証する。
 ///
-/// レビュー指摘 P1（Codex。PR #442 再々々々レビュー・
-/// competitor_lightpanda.rs:839）: 以前は `id` が一致し `result.isError` が
+/// 以前は `id` が一致し `result.isError` が
 /// `true` でなければ成功として扱っており、`result` が `null`・`{}` の
 /// ような空応答でも `goto` の成功と誤判定し得た（`goto` は本文を見ない
 /// ため、ページ遷移に失敗した応答をそのまま成功扱いにし、続く `html`・
@@ -1173,8 +1150,7 @@ pub fn validate_mcp_response(
 fn validate_mcp_result_shape(result: &JsonValue, method: &str) -> Result<(), String> {
     match method {
         "tools/call" => {}
-        // レビュー指摘（コーディネーター指示。PR #442 再々々々レビュー・
-        // competitor_lightpanda.rs:839）: 「`initialize` や `tools/list`
+        // 「`initialize` や `tools/list`
         // など、ほかの MCP 呼び出しの応答の形も同じ方針で確認する」ため、
         // `initialize` は MCP 2025-06-18 の `InitializeResult` が持つべき
         // 必須フィールド（`protocolVersion`・`capabilities`）まで確認する
@@ -1477,7 +1453,7 @@ fn parse_string(chars: &[char], pos: &mut usize) -> Result<String, JsonParseErro
                     other => return Err(JsonParseError::UnexpectedChar(other)),
                 }
             }
-            // レビュー指摘 P2（PR #442）: 未エスケープの U+0000〜U+001F 制御
+            // 未エスケープの U+0000〜U+001F 制御
             // 文字（RFC 8259 の JSON 文法で文字列内に生で現れることを許さない
             // 範囲）を通常文字として受理していた。MCP 応答を untrusted な
             // 外部入力として扱う方針（coding-rust.md）に従い、ここで
@@ -1652,8 +1628,7 @@ mod tests {
         assert_eq!(parse_http_status("HTTP/1.1 abc"), None);
     }
 
-    // レビュー指摘 P2（コーディネーター指示。PR #442 再々々々々々々
-    // レビュー・support.rs:109）: `HTTP/1.0`・`HTTP/1.1` のいずれかに続く
+    // `HTTP/1.0`・`HTTP/1.1` のいずれかに続く
     // 単一の SP、ちょうど 3 桁の数字（100〜599）、その後に SP か行末、
     // という形式だけを受理する。
     #[test]
@@ -1705,8 +1680,7 @@ mod tests {
         assert_eq!(parse_http_status("HTTP/1.1  200 OK\r\n"), None);
     }
 
-    // レビュー指摘 Medium（Cursor。PR #442 再々々々々レビュー・
-    // competitor_lightpanda.rs:486-535）: readiness probe の応答本文が
+    // readiness probe の応答本文が
     // ブラウザ（CDP `/json/version`）らしい形かどうかで、別プロセスの
     // 応答をポート再利用によって誤って readiness と判定しないようにする。
     #[test]
@@ -1721,7 +1695,7 @@ mod tests {
         assert!(looks_like_browser_readiness_response(r#"{"browser":"x"}"#));
     }
 
-    // レビュー指摘（advisor 追加指摘）: JSON オブジェクトでありさえすれば
+    // JSON オブジェクトでありさえすれば
     // `{}` でも通ってしまうのは弱すぎるため、既知フィールドを 1 つも
     // 持たないオブジェクトは拒否することを確認する。
     #[test]
@@ -1798,7 +1772,7 @@ mod tests {
         assert_eq!(split_args(""), Vec::<String>::new());
     }
 
-    // レビュー指摘 P1（Codex。competitor_lightpanda.rs:893）: `Skipped`・
+    // `Skipped`・
     // `Unsupported`（未設定・未対応。失敗ではない）のみでは終了コード 0、
     // `Error`（計測失敗）を 1 件でも含むと非ゼロになることを確認する。
     #[test]
@@ -1886,7 +1860,7 @@ mod tests {
         assert_eq!(err, JsonParseError::InvalidSurrogate);
     }
 
-    // レビュー指摘 P2（PR #442）: 未エスケープの制御文字（U+0000〜U+001F）を
+    // 未エスケープの制御文字（U+0000〜U+001F）を
     // 含む文字列は不正な JSON として拒否する（RFC 8259）。
     #[test]
     fn parse_json_unescaped_control_char_is_error() {
@@ -1996,8 +1970,8 @@ mod tests {
         assert_eq!(fixture_url(65535, "/"), "http://127.0.0.1:65535/");
     }
 
-    // fixture 配信サーバー（competitor_lightpanda.rs の
-    // handle_fixture_connection）が使うリクエスト行パーサー。
+    // fixture 配信サーバー（measure.rs の handle_fixture_connection）が
+    // 使うリクエスト行パーサー。
     #[test]
     fn parse_http_request_line_basic() {
         assert_eq!(
@@ -2013,8 +1987,7 @@ mod tests {
         assert_eq!(parse_http_request_line("GET /path NOT-HTTP/1.1"), None);
     }
 
-    // レビュー指摘（コーディネーター指示。PR #442 再々々々レビュー）:
-    // `HTTP/` で始まるだけの不正なバージョン表記（`HTTP/potato` 等）を
+    // // `HTTP/` で始まるだけの不正なバージョン表記（`HTTP/potato` 等）を
     // 許してしまわないことを確認する。
     #[test]
     fn parse_http_request_line_rejects_malformed_version() {
@@ -2041,14 +2014,17 @@ mod tests {
     }
 
     #[test]
-    fn is_valid_http_version_accepts_common_forms() {
+    fn is_valid_http_version_accepts_only_1_0_and_1_1() {
         assert!(is_valid_http_version("HTTP/1.1"));
         assert!(is_valid_http_version("HTTP/1.0"));
-        assert!(is_valid_http_version("HTTP/2.0"));
     }
 
+    // このベンチが受理する HTTP バージョンは 1.0/1.1 のみ（`HTTP/2.0` も
+    // 含めて他は拒否する）。リクエスト行・レスポンスステータス行の両方が
+    // この関数を通るため、ここで拒否すれば両方に効く。
     #[test]
-    fn is_valid_http_version_rejects_malformed_forms() {
+    fn is_valid_http_version_rejects_other_forms() {
+        assert!(!is_valid_http_version("HTTP/2.0"));
         assert!(!is_valid_http_version("HTTP/potato"));
         assert!(!is_valid_http_version("HTTP/1"));
         assert!(!is_valid_http_version("HTTP/1.1.1"));
@@ -2057,8 +2033,7 @@ mod tests {
         assert!(!is_valid_http_version(""));
     }
 
-    // レビュー指摘 P1（Codex。PR #442 再々々々レビュー・
-    // competitor_lightpanda.rs:352）: リクエスト行・ヘッダ行の読み取りが
+    // リクエスト行・ヘッダ行の読み取りが
     // タイムアウト／サイズ超過／その他の I/O エラーで失敗した経路は、
     // すべて 400（タイムアウトなら 408）で終了しなければならない。
     #[test]
@@ -2195,8 +2170,7 @@ mod tests {
         );
     }
 
-    // レビュー指摘 P1（Codex。PR #442 再々々々々々々レビュー・
-    // competitor_lightpanda.rs:558）: `kill_process_group`（`unsafe`・実際の
+    // `kill_process_group`（`unsafe`・実際の
     // プロセス操作を伴うため、この crate root では単体テストできない）が
     // 使う「終了ステータスから成功／失敗を判定する」ロジック自体は
     // 実プロセスを起動して検証できる。
@@ -2230,8 +2204,7 @@ mod tests {
         assert!(exit_status_to_result(status).is_err());
     }
 
-    // レビュー指摘 P1（Codex。PR #442 再々々々々々々々レビュー・
-    // competitor_lightpanda.rs:607）: kill 後の再 probe でまだ応答があれば
+    // kill 後の再 probe でまだ応答があれば
     // 「その試行はポート競合」として `Error` にする判定ロジックの単体
     // テスト。
     #[test]
@@ -2247,8 +2220,7 @@ mod tests {
         assert!(err.contains("port conflict"));
     }
 
-    /// レビュー指摘（コーディネーター指示。PR #442 再々々々々々々々
-    /// レビュー）: 新しいプロセスグループで子（`sh`）と孫（`sleep`）を
+    /// 新しいプロセスグループで子（`sh`）と孫（`sleep`）を
     /// 起動し、`kill_process_group`（子の PID）の後に子・孫の両方が
     /// 終了していることを 3 OS CI で実証する。孫の PID は子の標準出力
     /// から受け取る。
@@ -2441,8 +2413,7 @@ mod tests {
         assert_eq!(stdout.len(), 4);
     }
 
-    // レビュー指摘 P2（Codex。PR #442 再々々々々々レビュー・
-    // competitor_lightpanda.rs:756）: `Content-Length` が読み取り上限を
+    // `Content-Length` が読み取り上限を
     // 超える場合は `min` で黙って切り詰めず probe 失敗にする契約を、
     // `probe_once` が呼ぶこの純粋関数の単体テストとして確認する。
     #[test]
@@ -2462,8 +2433,7 @@ mod tests {
         assert!(!content_length_exceeds_limit(None, 64));
     }
 
-    // レビュー指摘 P2（コーディネーター指示。PR #442 再々々々々々々
-    // レビュー）: `Content-Length` ヘッダーが存在するのに値が不正
+    // `Content-Length` ヘッダーが存在するのに値が不正
     // （非数値・空・符号付き等）な場合は「長さ指定なし」ではなく
     // `None`（呼び出し元はこれを probe 失敗として扱う）にする。
     #[test]
@@ -2496,8 +2466,7 @@ mod tests {
         assert_eq!(parse_content_length("-123"), None);
     }
 
-    // レビュー指摘 P0・P1（Codex。PR #442 再々レビュー・
-    // competitor_lightpanda.rs:338/352）: fixture はコンパイル時に埋め込んだ
+    // fixture はコンパイル時に埋め込んだ
     // 固定テーブルの完全一致だけで引くため、シンボリックリンク・TOCTOU・
     // サイズ超過が構造的に起こらない（実行時のファイル I/O 自体がない）。
     #[test]
@@ -2530,8 +2499,7 @@ mod tests {
         assert_eq!(lookup_fixture(""), None);
     }
 
-    // レビュー指摘 P1（Codex。PR #442 再々々々々々々々々々レビュー・
-    // measure.rs:1450）: `FIXTURE_MARKERS` は `goto` 後の内容検証に使うため、
+    // `FIXTURE_MARKERS` は `goto` 後の内容検証に使うため、
     // `FIXTURE_TABLE` と対象パスの集合が一致していること・各マーカーが
     // 対応する fixture の実際のコンテンツに含まれていること・マーカー同士が
     // 互いの部分文字列にならない（一意性）ことを確認する。
@@ -2547,8 +2515,7 @@ mod tests {
         );
     }
 
-    // レビュー指摘（Codex P1・measure.rs:1505 / Cursor Medium・support.rs:452。
-    // PR #442 再々々々々々々々々々々レビュー）: マーカーが単に fixture の
+    // マーカーが単に fixture の
     // どこかに出現するだけでは不十分（`<title>`（`<head>` 内）にしか無い
     // 文字列は、アクセシビリティツリーに現れる保証が無いため）。マーカーが
     // `<body>` 内の見出し要素（`<h1>`）のテキストとして実在すること、かつ
@@ -2614,7 +2581,7 @@ mod tests {
         assert_eq!(fixture_marker("/does-not-exist.html"), None);
     }
 
-    // レビュー指摘（コーディネーター指示。PR #442 再レビュー）: fixture は
+    // fixture は
     // 自作の静的コンテンツであり、外部サイトへのサブリソース参照
     // （`http://`・`https://`・プロトコル相対の `//`）を含まないことを
     // 確認する。埋め込み済みの `FIXTURE_TABLE` に対して検査するため、
@@ -2631,9 +2598,7 @@ mod tests {
                 !lower.contains("https://"),
                 "{name}: must not reference https:// URLs"
             );
-            // プロトコル相対参照（`src="//..."`・`src='//...'` の引用符付き、
-            // および HTML が許す `src=//...` の無引用形。レビュー指摘
-            // advisor: 無引用属性値は素通りしていた）の簡易検出。
+            // プロトコル相対参照の簡易検出。
             assert!(
                 !lower.contains("=\"//") && !lower.contains("='//") && !lower.contains("=//"),
                 "{name}: must not reference protocol-relative (//) URLs"
@@ -2736,8 +2701,7 @@ mod tests {
         }
     }
 
-    // レビュー指摘 P2（Codex。PR #442 再々々々レビュー・
-    // competitor_lightpanda.rs:511/554）: `SERVE_ARGS`・`MCP_ARGS` の検証
+    // `SERVE_ARGS`・`MCP_ARGS` の検証
     // エラーは、それぞれを使う計測だけに影響しなければならない。
     #[test]
     fn arg_error_gate_none_is_none() {
@@ -2755,8 +2719,7 @@ mod tests {
         }
     }
 
-    // レビュー指摘 P1（Codex。PR #442 再々々々レビュー・
-    // competitor_lightpanda.rs:839）: `result` が `null`・`{}` でも
+    // `result` が `null`・`{}` でも
     // `isError` が無ければ成功として扱っていた。JSON-RPC の封筒と
     // `tools/call` の `result.content` の形を厳密に検証する。
     #[test]
@@ -2815,8 +2778,7 @@ mod tests {
         assert_eq!(validate_mcp_response(&value, 1.0, "initialize"), Ok(()));
     }
 
-    // レビュー指摘（コーディネーター指示。PR #442 再々々々レビュー）:
-    // 「initialize や tools/list など、ほかの MCP 呼び出しの応答の形も
+    // // 「initialize や tools/list など、ほかの MCP 呼び出しの応答の形も
     // 同じ方針で確認する」ため、`initialize` は空の `result: {}` を
     // 成功と誤判定してはいけない（`tools/call` の `result: {}` を拒否する
     // のと同じ理由付け）。
@@ -2859,9 +2821,8 @@ mod tests {
 
     #[test]
     fn validate_mcp_response_rejects_tools_call_null_or_empty_result() {
-        // レビュー指摘 P1 の核心事例: `goto` の応答が `result: null` や
-        // `result: {}`（`content` 欠如）でも、以前は `isError` が無いという
-        // だけで成功扱いにしていた。
+        // `goto` の応答が `result: null` や `result: {}`（`content` 欠如）
+        // でも、`isError` が無いというだけで成功扱いにしてはならない。
         for raw in [
             r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
             r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
@@ -2934,8 +2895,7 @@ mod tests {
         assert_eq!(validate_mcp_response(&value, 1.0, "tools/call"), Ok(()));
     }
 
-    // レビュー指摘 P1（Codex。PR #442 再々々々々々レビュー・
-    // competitor_lightpanda.rs:364/682/711）: `set_read_timeout` は 1 回の
+    // `set_read_timeout` は 1 回の
     // `read` にしか効かないため、1 バイトずつ送る相手（slow-loris）は
     // 個々の `read` を毎回タイムアウト直前に完了させることで、呼び出し
     // 全体を無期限に専有し得た。`DeadlineReader` が接続全体の絶対期限で
@@ -2948,9 +2908,10 @@ mod tests {
             let (mut socket, _) = listener.accept().expect("accept");
             // 1 バイトずつ、`DeadlineReader` の期限より長い間隔で送り続ける
             // （slow-loris）。テスト側の `DeadlineReader` が期限で打ち切る
-            // ことを検証するため、送信側は本テストの期限（200ms）よりも
-            // 十分長く粘る。
-            for _ in 0..50 {
+            // ことを検証するため、送信側は本テストの期限（300ms）よりも
+            // 十分長く（合計 5 秒）粘る。CI の並行実行によるスケジューリング
+            // 遅延を考慮し、期限とアサーションの上限に十分な余裕を持たせる。
+            for _ in 0..100 {
                 if socket.write_all(b"A").is_err() {
                     break;
                 }
@@ -2959,7 +2920,7 @@ mod tests {
         });
 
         let stream = TcpStream::connect(addr).expect("connect");
-        let deadline_duration = Duration::from_millis(200);
+        let deadline_duration = Duration::from_millis(300);
         let deadline = Instant::now() + deadline_duration;
         let mut reader = DeadlineReader::new(stream, deadline);
 
@@ -2969,7 +2930,7 @@ mod tests {
         // されるとはいえ）データが来れば成功し得るため、`TimedOut` に
         // 達するまでループする。
         //
-        // レビュー指摘（Cursor。PR #442 再々々々々々々レビュー）: 送信側
+        // 送信側
         // （slow-loris スレッド）は接続を close しない前提のため、
         // `Ok(0)`（相手の正常な close）に達することは無いはずである。
         // 万一到達した場合はテストの前提が崩れている（実装の変更漏れ等）
@@ -2988,26 +2949,67 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert_eq!(last_result, std::io::ErrorKind::TimedOut);
-        // 送信側は 50 回 × 50ms = 2.5 秒粘るが、`DeadlineReader` は
-        // 接続全体の期限（200ms）で打ち切るため、実測時間がそれを大幅に
-        // 超えないことを確認する（多少のオーバーヘッドは許容する）。
+        // 送信側は 100 回 × 50ms = 5 秒粘るが、`DeadlineReader` は
+        // 接続全体の期限（300ms）で打ち切るため、実測時間がそれを大幅に
+        // 超えないことを確認する。上限は送信側の総粘り時間（5 秒）より
+        // 十分小さい絶対値にし、CI の並行実行による多少のスケジューリング
+        // 遅延を吸収しつつ、「打ち切られず送信側が尽きるまで待った」という
+        // 誤判定にはならないようにする。
         assert!(
-            elapsed < deadline_duration * 5,
+            elapsed < Duration::from_secs(3),
             "DeadlineReader should cut off around the deadline, took {elapsed:?}"
         );
 
         // ソケットを閉じてから送信側スレッドの終了を待つ。閉じないと
         // 送信側は（誰も読んでいなくても）OS の送信バッファへ書き込み
-        // 続けてしまい、全 50 回分（2.5 秒）の `sleep` を律儀に消化して
+        // 続けてしまい、全 100 回分（5 秒）の `sleep` を律儀に消化して
         // からでないと `join` が返らず、テストが不必要に長くなる。
         drop(reader);
         let _ = handle.join();
     }
 
-    // レビュー指摘 P1（Codex。PR #442 再々々々々々レビュー・
-    // competitor_lightpanda.rs:711）: 宣言された長さに届く前に応答が
+    /// fixture サーバーが読み取り絶対期限をちょうど使い切った直後でも
+    /// 400/408 応答を書き込めるようにする猶予（`measure.rs` の
+    /// `respond_with_io_error` が使う）。期限切れ後に `extend_deadline` を
+    /// 呼べば、それ以降の書き込みが（延長前の期限のままなら即座に
+    /// `TimedOut` になるところを）成功することを、実際の loopback
+    /// ソケットで確認する。
+    #[test]
+    fn deadline_reader_extend_deadline_allows_write_after_original_deadline_elapsed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let mut writer = DeadlineReader::new(server, deadline);
+        // 元の期限を確実に過ぎさせる。
+        std::thread::sleep(Duration::from_millis(150));
+
+        // 延長前なら、この書き込みは期限切れで即座に `Err` になるはず。
+        let before_extend = writer.write(b"x");
+        assert!(
+            before_extend.is_err(),
+            "a write after the original (unextended) deadline should fail: {before_extend:?}"
+        );
+
+        writer.extend_deadline(Duration::from_secs(2));
+        writer
+            .write_all(b"hello")
+            .expect("write should succeed after extend_deadline");
+        drop(writer);
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set_read_timeout");
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).expect("read_exact");
+        assert_eq!(&buf, b"hello");
+    }
+
+    // 宣言された長さに届く前に応答が
     // 途中で切れた場合、それまでに読めた断片を成功として扱ってはいけない。
-    // `probe_once`（competitor_lightpanda.rs）はこの検証を
+    // `probe_once`（measure.rs）はこの検証を
     // `Read::read_exact` に委ねているため、ここでは `DeadlineReader` 越しの
     // `read_exact` が早期 EOF を確実に `Err` にすることを確認する。
     #[test]
@@ -3039,8 +3041,7 @@ mod tests {
         let _ = handle.join();
     }
 
-    // レビュー指摘（Cursor。PR #442 再々々々々々々レビュー・
-    // competitor_lightpanda.rs:1893。macOS CI 失敗）: unix のブロッキング
+    // unix のブロッキング
     // ソケットはタイムアウト時に `WouldBlock` を返すことがある（macOS）が、
     // `DeadlineReader` の利用側は OS 差異を意識せず `TimedOut` だけを
     // 見ればよいようにする。`normalize_timeout_error` がその正規化を

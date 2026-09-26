@@ -2,8 +2,7 @@
 //! probe・cold start / idle RSS / MCP トークン削減率の各計測・結果の JSON 化・
 //! 終了コード判定）。
 //!
-//! レビュー指摘（コーディネーター指示。PR #442 再々々々々々々々々レビュー・
-//! `crates/fandhe-browser-core/Cargo.toml:57`）: AGENTS.md「ユニットテストと
+//! AGENTS.md「ユニットテストと
 //! 結合テストの併置」に基づき、fixture サーバーの起動から対象プロセスとの
 //! 通信・計測結果・終了コードまでを対象バイナリを模したローカルプロセスで
 //! 通す結合テスト（`measure_tests.rs`）を追加するにあたり、計測ロジックを
@@ -59,17 +58,21 @@ use crate::support::parse_ps_rss_kb;
 /// 実行時のファイル読み込みがないため、ファイルサイズの上限は不要になった。
 const FIXTURE_MAX_CONNECTIONS: u64 = 10_000;
 /// 読み捨てるヘッダ行の総数上限。無制限だと大量のヘッダ行を送るクライアント
-/// がサーバースレッドを専有し続け得る（advisor 指摘。coding-rust.md
-/// 「長さ・件数を上限検証」）。実ブラウザが送る一般的なヘッダ数は数十件に
+/// がサーバースレッドを専有し続け得る。実ブラウザが送る一般的なヘッダ数は数十件に
 /// 収まるため、大きめに倍取って `64` とする。
-const FIXTURE_MAX_HEADER_LINES: u32 = 64;
+// `pub(crate)`: 結合テスト（`measure_tests.rs`）がヘッダ行数上限を超える
+// リクエストを実際に送るテストで、上限値そのものを参照する。
+pub(crate) const FIXTURE_MAX_HEADER_LINES: u32 = 64;
 const FIXTURE_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const FIXTURE_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// readiness probe・MCP 呼び出しそれぞれの外部入力（応答行）に許す最大長。
 /// 相手プロセスが不正・悪意ある出力を送り続けても無制限にバッファへ
 /// 蓄積しないための上限（coding-rust.md）。
-const MAX_LINE_BYTES: usize = 1024 * 1024;
+///
+/// `pub(crate)`: 結合テスト（`measure_tests.rs`）が `read_line_bounded` の
+/// 上限超過ケースを検証する際に参照する。
+pub(crate) const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// 計測対象 1 つ分の設定（Lightpanda / fandhe-browser）。
 ///
@@ -104,7 +107,6 @@ pub struct Target {
 
 /// `competitor_lightpanda/fixtures/` を配信するローカル静的サーバー。
 ///
-/// レビュー指摘 P0（Codex。PR #442 再レビュー・competitor_lightpanda.rs:729/783）:
 /// 事前の URL 検証をいくら積み増しても、計測対象ブラウザが実際に接続する
 /// 宛先（名前再解決・リダイレクト追従込み）は保証できない。この問題は
 /// 「ベンチが外部ネットワークへ一切出ない構成にする」ことでのみ解消できる
@@ -114,8 +116,8 @@ pub struct Target {
 ///
 /// 接続受付はバックグラウンドスレッドで行い、`Drop` で `stop` フラグを立てて
 /// スレッドの終了を待つ（プロセス終了時にリスナーを残さない）。
-struct FixtureServer {
-    port: u16,
+pub(crate) struct FixtureServer {
+    pub(crate) port: u16,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -123,7 +125,11 @@ struct FixtureServer {
 impl FixtureServer {
     /// サーバーを起動する。`support::FIXTURE_TABLE`（コンパイル時に埋め込み
     /// 済みの固定テーブル）に完全一致するパスだけを配信する。
-    fn start() -> Result<Self, String> {
+    ///
+    /// `pub(crate)`: `competitor_lightpanda_measure`（`measure_tests.rs`）の
+    /// 結合テストが、fixture サーバーへ直接リクエストを送るテスト
+    /// （400/404/405/408・ヘッダ行数上限・slow-loris）のために使う。
+    pub(crate) fn start() -> Result<Self, String> {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind failed: {e}"))?;
         let port = listener
             .local_addr()
@@ -168,7 +174,7 @@ fn fixture_accept_loop(listener: TcpListener, stop: Arc<AtomicBool>) {
         match listener.accept() {
             Ok((stream, _)) => {
                 served += 1;
-                // レビュー指摘（コーディネーター指示）: 接続数に上限を設け、
+                // 接続数に上限を設け、
                 // 想定外の大量接続でサーバーが無制限に処理し続けないようにする。
                 if served > FIXTURE_MAX_CONNECTIONS {
                     break;
@@ -190,15 +196,13 @@ fn fixture_accept_loop(listener: TcpListener, stop: Arc<AtomicBool>) {
 /// 接続が切れた不完全な行）場合を、まとめて「行を読み切れなかった」
 /// エラーとして扱う。
 ///
-/// レビュー指摘 P1（Codex。PR #442 再々々々レビュー・
-/// competitor_lightpanda.rs:352）: `read_line_bounded` はバイト単位で読み、
+/// `read_line_bounded` はバイト単位で読み、
 /// 以前は相手が改行を送る前に接続を閉じても、それまでに読めた分だけを
 /// `Ok(n)`（`n > 0`）で返していた。呼び出し側がこれを「1 行読めた」として
 /// 扱うと、ヘッダ終端（空行）へ到達しないまま後続処理（`lookup_fixture`
 /// による 200 応答）へ進み得た。
 ///
-/// レビュー指摘 P1（Codex。PR #442 再々々々々々レビュー・
-/// competitor_lightpanda.rs:1039）: この「改行で終わらない行は
+/// この「改行で終わらない行は
 /// `UnexpectedEof`」という契約自体は `read_line_bounded` 側へ集約した
 /// （fixture サーバー・probe・MCP のすべての呼び出し元で一貫させるため。
 /// 同関数のドキュメント参照）。この `read_complete_line` は
@@ -229,6 +233,13 @@ fn read_complete_line<R: BufRead>(reader: &mut R, out: &mut String) -> std::io::
 /// ための小さなヘルパー。
 fn respond_with_io_error(writer: &mut DeadlineReader, err: &std::io::Error) {
     let (status, reason) = http_status_for_io_error(err.kind());
+    // 読み取り側の絶対期限（`FIXTURE_IO_TIMEOUT`）はこの時点でちょうど
+    // 使い切られているため、延長せずに書き込むと常に即座にタイムアウトし、
+    // 400/408 応答自体が構造的にクライアントへ届かない
+    // （`DeadlineReader::extend_deadline` のドキュメント参照）。この小さな
+    // 固定長のエラー応答だけを送るための短い猶予を与える。
+    const ERROR_RESPONSE_GRACE: Duration = Duration::from_secs(2);
+    writer.extend_deadline(ERROR_RESPONSE_GRACE);
     let _ = write_fixture_response(writer, status, reason, PLAIN_TEXT, b"");
 }
 
@@ -242,22 +253,20 @@ fn respond_with_io_error(writer: &mut DeadlineReader, err: &std::io::Error) {
 /// `FIXTURE_IO_TIMEOUT` を設定し、低速・応答なしクライアントでスレッドが
 /// 無期限にブロックしないようにする（coding-rust.md「不安全な設計」）。
 ///
-/// レビュー指摘 P0・P1（Codex。PR #442 再々レビュー・
-/// competitor_lightpanda.rs:338/352）: 以前はここでファイルシステムから
+/// 以前はここでファイルシステムから
 /// `metadata`/`read` していたため、(1) シンボリックリンクを辿ってしまい
 /// fixture ディレクトリ外のファイルを配信し得た、(2) メタデータ確認後の
 /// 読み込みまでの TOCTOU でサイズ上限を超えて確保し得た。`lookup_fixture`
 /// はコンパイル時に埋め込んだ `&'static str` を返すだけでファイルシステムへ
 /// 一切触れないため、両方とも構造的に起こらない。
 ///
-/// レビュー指摘 P1（Codex。PR #442 再々々々レビュー・
-/// competitor_lightpanda.rs:352）: リクエスト行・ヘッダ行の読み取りが
+/// リクエスト行・ヘッダ行の読み取りが
 /// タイムアウト・サイズ超過・接続の早期切断のいずれで失敗しても、以前は
 /// ループを抜けるだけで後続の 200 応答へ進み得た。読み取りが完了しなかった
 /// 経路はすべて [`respond_with_io_error`] で 400/408 を返してから接続を
 /// 終了する。
 fn handle_fixture_connection(stream: TcpStream) {
-    // レビュー指摘（advisor。PR #442 再レビュー後の追加指摘）: macOS（XNU）・
+    // macOS（XNU）・
     // Windows（Winsock）では accept したソケットが listener のノンブロッキング
     // 状態を継承する（Linux の accept4 は継承しない）。継承されたままだと
     // 後続の `read_line_bounded` の最初の `read` が即座に `WouldBlock` を
@@ -265,8 +274,7 @@ fn handle_fixture_connection(stream: TcpStream) {
     // 戻すことで 3 OS で同じ挙動にする（coding-rust.md「クロスプラットフォーム」）。
     let _ = stream.set_nonblocking(false);
 
-    // レビュー指摘 P1（Codex。PR #442 再々々々々々レビュー・
-    // competitor_lightpanda.rs:364）: 接続 1 本ごとの絶対期限を
+    // 接続 1 本ごとの絶対期限を
     // [`DeadlineReader`]（読み取り・書き込みの両方をこの 1 つのプリミティブ
     // 経由でのみ行う）へ通し、1 バイトずつ送る相手（slow-loris）でも
     // 接続全体の処理が `FIXTURE_IO_TIMEOUT` を超えないようにする。
@@ -305,7 +313,7 @@ fn handle_fixture_connection(stream: TcpStream) {
     // ヘッダ行は使わないが、クライアント（計測対象ブラウザ）が送り終える前に
     // 接続を切ると `RST` になり得るため、`Connection: close` 前提で読み捨てる
     // （1 行あたりは `read_line_bounded` の `MAX_LINE_BYTES` で上限済み）。
-    // レビュー指摘（advisor。PR #442 再レビュー後の追加指摘）: 行数自体には
+    // 行数自体には
     // 上限がなく、ヘッダ行を送り続けるクライアントがサーバースレッドを
     // 無期限に専有し得た。`FIXTURE_MAX_HEADER_LINES` で総行数にも上限を
     // 設け、超過時は 400 を返して打ち切る（coding-rust.md「長さ・件数を
@@ -370,16 +378,13 @@ fn write_fixture_response(
 /// 子プロセスを確実に終了させる guard。早期 `return`（`?`）経路でも
 /// `Drop` で `kill` + `wait` する（`wait` を省くとゾンビプロセスが残る）。
 /// [`kill_process_group`] も合わせて呼び、子孫プロセスが起動していても
-/// 極力パイプを保持し続けないようにする（レビュー指摘 P1。PR #442
-/// 再々々々々レビュー・competitor_lightpanda.rs:827）。
+/// 極力パイプを保持し続けないようにする。
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         // `Drop` は戻り値を呼び出し元へ返せないため、ここに限り
-        // `kill_process_group` の失敗を握りつぶしてよい（レビュー指摘 P1。
-        // Codex。PR #442 再々々々々々々レビュー・
-        // competitor_lightpanda.rs:558）。続く `Child::kill`（直接の子）は
+        // `kill_process_group` の失敗を握りつぶしてよい。続く `Child::kill`（直接の子）は
         // 無条件に行う既存のフォールバックのままにする。
         let _ = kill_process_group(self.0.id());
         let _ = self.0.kill();
@@ -391,8 +396,7 @@ impl Drop for ChildGuard {
 /// 固定ポートにすると並列実行される他ベンチ・他 issue の worktree と衝突するため
 /// 使わない。
 ///
-/// レビュー指摘 Medium（Cursor。PR #442 再々々々々レビュー・
-/// competitor_lightpanda.rs:486-535）: リスナーを解放してから子プロセスを
+/// リスナーを解放してから子プロセスを
 /// 起動するまでの間に別プロセスが同じポートを奪える TOCTOU が残る
 /// （bind して保持したまま子へ引き継ぐには、子プロセス側がソケット
 /// 継承（`SO_REUSEPORT`・fd 引き渡し等）に対応している必要があり、対象は
@@ -414,8 +418,7 @@ fn reserve_port() -> Result<u16, String> {
 /// `PERF-3`（cold start）が使う。相手プロセスをシェル経由で起動しない
 /// （`Command::new` + 分割済み引数。security.md「インジェクション」対策）。
 ///
-/// レビュー指摘 Medium（Cursor。PR #442 再々々々々レビュー・
-/// competitor_lightpanda.rs:486-535）: `reserve_port` の TOCTOU により、
+/// `reserve_port` の TOCTOU により、
 /// 別プロセスが同じポートで先に応答し得る。ここでは (1) 毎回のポーリングで
 /// `Child::try_wait` により子プロセスがまだ生きていることを確認し、
 /// 既に終了していれば別プロセスの応答を拾う前に打ち切る、(2) 応答本文が
@@ -451,13 +454,19 @@ fn spawn_and_wait_ready(
     let request = format!(
         "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
     );
+    // タイムアウト時、最後の probe 失敗理由を報告に含める（毎回同じ
+    // 汎用メッセージでは、readiness に失敗した実際の原因（接続拒否・
+    // 不正な応答形式・chunked デコード失敗等）が分からない）。
+    let mut last_error = "no probe attempt was made".to_string();
     loop {
         if Instant::now() >= deadline {
-            return Err("timeout waiting for readiness probe".to_string());
+            return Err(format!(
+                "timeout waiting for readiness probe (last error: {last_error})"
+            ));
         }
-        // レビュー指摘 Medium（Cursor）: 子プロセスが既に終了しているのに
-        // ポートへの応答（＝別プロセスの応答の可能性）だけを見て readiness
-        // と誤認しないよう、まず生存を確認する。
+        // 子プロセスが既に終了しているのにポートへの応答（＝別プロセスの
+        // 応答の可能性）だけを見て readiness と誤認しないよう、まず生存を
+        // 確認する。
         match guard.0.try_wait() {
             Ok(Some(status)) => {
                 return Err(format!("child exited before becoming ready: {status}"));
@@ -466,13 +475,26 @@ fn spawn_and_wait_ready(
             Err(e) => return Err(format!("try_wait failed: {e}")),
         }
         match probe_once(port, &request, deadline) {
-            Some((status, body))
+            Ok((status, body))
                 if (200..300).contains(&status) && looks_like_browser_readiness_response(&body) =>
             {
                 return Ok((guard, port, start.elapsed()));
             }
-            _ => std::thread::sleep(Duration::from_millis(2)),
+            Ok((status, body)) => {
+                // 応答は得られたが readiness の条件を満たさない（ステータス・
+                // 本文形式のいずれか）。本文は上限を設けて表示する（巨大な
+                // 応答をエラーメッセージへそのまま埋め込まない）。
+                const MAX_DISPLAY_BODY_CHARS: usize = 200;
+                let truncated: String = body.chars().take(MAX_DISPLAY_BODY_CHARS).collect();
+                last_error = format!(
+                    "response did not look like browser readiness (status {status}, body {truncated:?})"
+                );
+            }
+            Err(e) => {
+                last_error = e;
+            }
         }
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -482,9 +504,7 @@ fn spawn_and_wait_ready(
 const PROBE_BODY_MAX_BYTES: usize = 64 * 1024;
 
 /// readiness probe 1 回あたりに許す時間。`outer_deadline`（呼び出し元の
-/// readiness 全体の期限）の残り時間がこれより短ければ、そちらを優先する
-/// （レビュー指摘: 「probe の期限は外側の readiness 期限の残り時間を
-/// 超えないようにする」）。
+/// readiness 全体の期限）の残り時間がこれより短ければ、そちらを優先する。
 const PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// [`reprobe_after_kill`] が同じポートへ再接続を試みる際の期限。
@@ -497,8 +517,6 @@ const PORT_CONFLICT_REPROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// `Child::kill` で終了させ `wait` で確認した直後に、同じポートへまだ
 /// 何か（TCP レベルで）応答するプロセスがいるかを確認する。
 ///
-/// レビュー指摘 P1（Codex。PR #442 再々々々々々々々レビュー・
-/// competitor_lightpanda.rs:607。Cursor からも同種の指摘あり）:
 /// `reserve_port` はリスナーを解放してから子プロセスを起動するまでの間に
 /// 別プロセスが同じポートを奪える TOCTOU が残り、readiness probe が
 /// 対象自身ではなく別プロセスの応答を拾っていた可能性がある。std だけでは
@@ -526,165 +544,246 @@ fn reprobe_after_kill(port: u16) -> bool {
 }
 
 /// readiness probe を 1 回だけ試す。ステータス行と本文を返す。接続失敗・
-/// 応答不正（不正な UTF-8 を含む）・タイムアウトはいずれも `None`
-/// （呼び出し側がポーリングを継続する。panic させない）。
+/// 応答不正（不正な UTF-8・不正な `Transfer-Encoding`/`Content-Length`
+/// 併存等を含む）・タイムアウトはいずれも `Err`（理由付き）にする
+/// （呼び出し側 [`spawn_and_wait_ready`] はポーリングを継続しつつ、
+/// 最後の失敗理由をタイムアウト時の報告に使う。panic させない）。
 ///
-/// レビュー指摘 Medium（Cursor。PR #442 再々々々々レビュー・
-/// competitor_lightpanda.rs:486-535）: 以前はステータス行のみを見ており、
-/// ポート再利用で別プロセスが応答してもステータスが 2xx なら readiness と
-/// 誤認し得た。本文まで読み、呼び出し元が
-/// [`looks_like_browser_readiness_response`] で検証できるようにする。
-///
-/// レビュー指摘 P1（Codex。PR #442 再々々々々々レビュー・
-/// competitor_lightpanda.rs:682/711）: この probe 1 回の読み取りは
-/// [`DeadlineReader`] を通し、`outer_deadline` を超えない絶対期限
-/// （`PROBE_ATTEMPT_TIMEOUT` とどちらか短い方）で統一的に区切る。
-/// `Content-Length` 分を読み切る前に EOF・エラー（タイムアウトを含む）が
-/// 起きた場合は、読めた断片を [`looks_like_browser_readiness_response`]
-/// に渡さず probe 失敗（`None`）として扱う（以前は `break` して部分的な
-/// 本文をそのまま検証に回していた）。`Content-Length` が無い場合も、
-/// 読み取りエラー（タイムアウトを含む）は失敗として扱い、正常な EOF
-/// （`Ok(0)`）だけを本文終端とみなす。
-fn probe_once(port: u16, request: &str, outer_deadline: Instant) -> Option<(u16, String)> {
+/// 本文まで読み、呼び出し元が [`looks_like_browser_readiness_response`] で
+/// 検証できるようにする。この 1 回の読み取りは [`DeadlineReader`] を通し、
+/// `outer_deadline` を超えない絶対期限（`PROBE_ATTEMPT_TIMEOUT` とどちらか
+/// 短い方）で統一的に区切る。宣言された長さ（`Content-Length` または
+/// `Transfer-Encoding: chunked`）を読み切る前に EOF・エラー（タイムアウトを
+/// 含む）が起きた場合は、読めた断片を検証に渡さず probe 失敗にする
+/// （部分的な本文をそのまま使わない）。`Content-Length` も
+/// `Transfer-Encoding: chunked` も無い場合は、読み取りエラーを失敗として
+/// 扱いつつ EOF まで読む。
+fn probe_once(port: u16, request: &str, outer_deadline: Instant) -> Result<(u16, String), String> {
     let probe_timeout =
         PROBE_ATTEMPT_TIMEOUT.min(outer_deadline.saturating_duration_since(Instant::now()));
     if probe_timeout.is_zero() {
-        return None;
+        return Err("outer deadline already elapsed".to_string());
     }
     let deadline = Instant::now() + probe_timeout;
 
-    let stream =
-        TcpStream::connect_timeout(&format!("127.0.0.1:{port}").parse().ok()?, probe_timeout)
-            .ok()?;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .map_err(|e| format!("invalid probe address: {e}"))?;
+    let stream = TcpStream::connect_timeout(&addr, probe_timeout)
+        .map_err(|e| format!("connect failed: {e}"))?;
     let mut deadline_stream = DeadlineReader::new(stream, deadline);
     // 書き込み・読み取りの両方を同じ `DeadlineReader`（`Read`・`Write` の
     // 両方を実装する）経由で行う。書き込み後、そのまま `BufReader` に
     // 包んで読み取りへ移る（`BufReader` はどんな `Read` 実装も受け付ける
     // ため、内部の `TcpStream` を取り出し直す必要が無い）。
-    deadline_stream.write_all(request.as_bytes()).ok()?;
+    deadline_stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("request write failed: {e}"))?;
     let mut reader = BufReader::new(deadline_stream);
     let mut status_line = String::new();
-    read_line_bounded(&mut reader, &mut status_line).ok()?;
-    let status = parse_http_status(&status_line)?;
-    // ヘッダ行を空行（終端）まで読み飛ばし、`Content-Length` があれば覚えて
-    // おく。読み取りが完了しなかった（タイムアウト・接続断・不正な行）
-    // 場合は、本文の検証まで進めないため `None`（呼び出し元はポーリングを
-    // 継続する）。
-    //
-    // レビュー指摘（advisor。PR #442 再々々々々レビュー後の追加指摘）:
-    // 行数に上限が無いと、ポートを奪った別プロセスがヘッダ行を送り続ける
-    // ことで `probe_once` を長時間占有し得る（`fixture_accept_loop` の
-    // `FIXTURE_MAX_HEADER_LINES` と同じ理由）。同じ上限を再利用する。
+    read_line_bounded(&mut reader, &mut status_line)
+        .map_err(|e| format!("status line read failed: {e}"))?;
+    let status = parse_http_status(&status_line)
+        .ok_or_else(|| format!("malformed status line: {status_line:?}"))?;
+    // ヘッダ行を空行（終端）まで読み飛ばし、`Content-Length`・
+    // `Transfer-Encoding` があれば覚えておく。行数に上限を設け
+    // （`fixture_accept_loop` の `FIXTURE_MAX_HEADER_LINES` と同じ理由。
+    // ポートを奪った別プロセスがヘッダ行を送り続けて `probe_once` を長時間
+    // 占有することを防ぐ）、上限超過は probe 失敗にする。
     let mut content_length: Option<usize> = None;
+    let mut chunked = false;
     let mut header_lines_seen = 0u32;
     loop {
         if header_lines_seen >= FIXTURE_MAX_HEADER_LINES {
-            return None;
+            return Err(format!(
+                "too many header lines (limit {FIXTURE_MAX_HEADER_LINES})"
+            ));
         }
         header_lines_seen += 1;
         let mut header_line = String::new();
-        read_complete_line(&mut reader, &mut header_line).ok()?;
+        read_complete_line(&mut reader, &mut header_line)
+            .map_err(|e| format!("header line read failed: {e}"))?;
         if header_line == "\r\n" || header_line == "\n" {
             break;
         }
-        if let Some(value) = header_line
-            .to_ascii_lowercase()
-            .strip_prefix("content-length:")
-        {
-            // レビュー指摘 P2（コーディネーター指示。PR #442
-            // 再々々々々々々レビュー）: `Content-Length` ヘッダー自体は
-            // 存在するのに値が不正（非数値・空・符号付き等。
-            // `support::parse_content_length` 参照）な場合、以前は
-            // `.ok()` で握りつぶして「長さ指定なし」（EOF まで読む
-            // フォールバック）扱いにしていた。ヘッダーが実在するのに
-            // その値を無視するのは、相手の応答を正しく解釈できていない
-            // ことを意味するため、ここで probe 失敗にする（フォール
-            // バックしない）。同様に、同じヘッダーが複数回現れて値が
-            // 食い違う場合（重複して矛盾する `Content-Length`）も、
-            // どちらの値を信じるべきか判断できないため probe 失敗にする
-            // （同一値の重複は許容する）。
-            let parsed = parse_content_length(value)?;
+        let lower = header_line.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("content-length:") {
+            // `Content-Length` ヘッダー自体は存在するのに値が不正
+            // （非数値・空・符号付き等。`support::parse_content_length`
+            // 参照）な場合、「長さ指定なし」（EOF まで読む）へフォール
+            // バックせず probe 失敗にする（ヘッダーが実在するのにその値を
+            // 無視するのは、相手の応答を正しく解釈できていないことを
+            // 意味するため）。同じヘッダーが複数回現れて値が食い違う場合
+            // （重複して矛盾する `Content-Length`）も、どちらの値を
+            // 信じるべきか判断できないため probe 失敗にする（同一値の
+            // 重複は許容する）。
+            let parsed = parse_content_length(value.trim())
+                .ok_or_else(|| format!("invalid Content-Length: {value:?}"))?;
             match content_length {
-                Some(existing) if existing != parsed => return None,
+                Some(existing) if existing != parsed => {
+                    return Err(format!(
+                        "conflicting Content-Length values: {existing} and {parsed}"
+                    ));
+                }
                 _ => content_length = Some(parsed),
             }
         }
-    }
-    // レビュー指摘（advisor。PR #442 再々々々々レビュー後の追加指摘）:
-    // `Content-Length` を無視して常に EOF まで（＝読み取りタイムアウトまで）
-    // 読んでいたため、相手が `Connection: close` を要求されても接続を
-    // 保持し続ける HTTP/1.1 実装だと、毎回の readiness probe に
-    // タイムアウト分の遅延が系統的に乗り、cold start（`PERF-3`）の
-    // 計測値を実態より水増しし得た。`Content-Length` が分かればちょうど
-    // その長さだけ読み、無ければ（ヘッダに含まれない応答向けの
-    // フォールバックとして）以前と同じ EOF までの読み取りに戻す。
-    //
-    // レビュー指摘 P1（Codex。PR #442 再々々々々々レビュー・
-    // competitor_lightpanda.rs:711）: `Content-Length` 分を読み切る前に
-    // EOF・エラーが起きた場合は `break` で打ち切って部分的な本文を
-    // そのまま使っていた（本文が途中で切れた応答を成功として扱い得た）。
-    // ここではどちらも probe 失敗（`None`）にする。
-    //
-    // レビュー指摘 P2（Codex。PR #442 再々々々々々々レビュー・
-    // competitor_lightpanda.rs:756）: `Content-Length` が
-    // `PROBE_BODY_MAX_BYTES` を超える場合、以前は `len.min(...)` で
-    // 上限まで黙って切り詰め、その範囲だけ読めれば成功として扱っていた
-    // （＝サーバーが実際に宣言した長さの応答を確認しないまま probe
-    // 成功と判定し得た）。ここでは `len` が上限を超えた時点で読み取りを
-    // 試みず即座に probe 失敗（`None`）にする。`Content-Length` が無い
-    // 分岐（EOF まで読む）でも、読めたバイト数が上限を超えたら「切り詰めて
-    // 使う」のではなく probe 失敗にする（同種の「上限で黙って切り詰めて
-    // 成功扱い」をここでも避ける）。
-    if content_length_exceeds_limit(content_length, PROBE_BODY_MAX_BYTES) {
-        return None;
-    }
-    let mut body = Vec::new();
-    match content_length {
-        Some(len) => {
-            // `Read::read_exact` は指定したバッファをちょうど埋め切る前に
-            // EOF に達すると `ErrorKind::UnexpectedEof` を返す（部分的に
-            // 読めた分をそのまま `Ok` として返すことはない）ため、宣言された
-            // `Content-Length` に届く前に応答が途中で切れたケースを
-            // 取りこぼさず失敗にできる。読み取りエラー（`DeadlineReader`
-            // 経由のタイムアウトを含む）も同様に `Err` になる。
-            let mut buf = vec![0u8; len];
-            reader.read_exact(&mut buf).ok()?;
-            body = buf;
+        if let Some(value) = lower.strip_prefix("transfer-encoding:") {
+            let value = value.trim();
+            // このベンチが対応するのは単一の `chunked` コーディングのみ。
+            // それ以外（`gzip`・複数コーディングの連結等）は本文の実際の
+            // 境界を正しく解釈できないため probe 失敗にする。
+            if value != "chunked" {
+                return Err(format!("unsupported Transfer-Encoding: {value:?}"));
+            }
+            chunked = true;
         }
-        None => {
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    // 正常な EOF（`Ok(0)`）だけを本文終端とみなす。
-                    Ok(0) => break,
-                    Ok(n) => {
-                        body.extend_from_slice(&buf[..n]);
-                        if body.len() > PROBE_BODY_MAX_BYTES {
-                            // 上限超過分をそのまま「読めた分だけ」の
-                            // 成功として使わず、probe 失敗にする。
-                            return None;
+    }
+    // `Content-Length` と `Transfer-Encoding: chunked` が両方存在する応答は
+    // HTTP/1.1 のセマンティクス上あいまい（RFC 9112 §6.1 は `Content-Length`
+    // を無視するよう求めるが、この不一致自体がリクエストスマグリング等の
+    // 攻撃の温床になり得るため、無視して進めるのではなく probe 失敗にする）。
+    if chunked && content_length.is_some() {
+        return Err("response has both Content-Length and Transfer-Encoding: chunked".to_string());
+    }
+    let body = if chunked {
+        read_chunked_body(&mut reader, PROBE_BODY_MAX_BYTES)?
+    } else {
+        // `Content-Length` を無視して常に EOF まで（＝読み取りタイムアウト
+        // まで）読むと、相手が `Connection: close` を要求されても接続を
+        // 保持し続ける HTTP/1.1 実装の場合、毎回の readiness probe に
+        // タイムアウト分の遅延が系統的に乗り、cold start（`PERF-3`）の
+        // 計測値を実態より水増しし得る。`Content-Length` が分かれば
+        // ちょうどその長さだけ読み、無ければ（ヘッダに含まれない応答向けの
+        // フォールバックとして）EOF までの読み取りに戻す。
+        //
+        // `Content-Length` が `PROBE_BODY_MAX_BYTES` を超える場合は、
+        // 読み取りを試みず即座に probe 失敗にする（サーバーが実際に宣言
+        // した長さの応答を確認しないまま `len.min(...)` 等で黙って
+        // 切り詰めて成功扱いにしない）。`Content-Length` が無い分岐
+        // （EOF まで読む）でも、読めたバイト数が上限を超えたら同様に
+        // probe 失敗にする。
+        if content_length_exceeds_limit(content_length, PROBE_BODY_MAX_BYTES) {
+            return Err(format!(
+                "Content-Length exceeds probe body limit ({PROBE_BODY_MAX_BYTES} bytes)"
+            ));
+        }
+        match content_length {
+            Some(len) => {
+                // `Read::read_exact` は指定したバッファをちょうど埋め切る
+                // 前に EOF に達すると `ErrorKind::UnexpectedEof` を返す
+                // （部分的に読めた分をそのまま `Ok` として返すことはない）
+                // ため、宣言された `Content-Length` に届く前に応答が途中で
+                // 切れたケースを取りこぼさず失敗にできる。読み取りエラー
+                // （`DeadlineReader` 経由のタイムアウトを含む）も同様に
+                // `Err` になる。
+                let mut buf = vec![0u8; len];
+                reader
+                    .read_exact(&mut buf)
+                    .map_err(|e| format!("body read failed (Content-Length={len}): {e}"))?;
+                buf
+            }
+            None => {
+                let mut body = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf) {
+                        // 正常な EOF（`Ok(0)`）だけを本文終端とみなす。
+                        Ok(0) => break,
+                        Ok(n) => {
+                            body.extend_from_slice(&buf[..n]);
+                            if body.len() > PROBE_BODY_MAX_BYTES {
+                                // 上限超過分をそのまま「読めた分だけ」の
+                                // 成功として使わず、probe 失敗にする。
+                                return Err(format!(
+                                    "body exceeds probe body limit ({PROBE_BODY_MAX_BYTES} bytes)"
+                                ));
+                            }
                         }
+                        // タイムアウトを含む読み取りエラーは失敗として扱う
+                        // （それまでに読めた断片をそのまま使わない）。
+                        Err(e) => return Err(format!("body read failed: {e}")),
                     }
-                    // タイムアウトを含む読み取りエラーは失敗として扱う
-                    // （以前は `break` して、それまでに読めた断片を
-                    // そのまま使っていた）。
-                    Err(_) => return None,
                 }
+                body
             }
         }
+    };
+    // 本文も厳密な UTF-8 変換にする（`from_utf8_lossy` による文字化けが
+    // 偶然妥当な JSON へ変わり、別プロセスの応答をブラウザらしいと誤判定
+    // する経路を避ける）。
+    let body_str = String::from_utf8(body).map_err(|e| format!("body is not valid UTF-8: {e}"))?;
+    Ok((status, body_str))
+}
+
+/// `Transfer-Encoding: chunked` の本文を読む（[`probe_once`] からのみ呼ぶ）。
+///
+/// RFC 9112 §7.1 のチャンク形式（16 進のチャンクサイズ行。`;` 以降の
+/// チャンク拡張は無視する。チャンクデータに続く CRLF・サイズ 0 のチャンクと
+/// それに続くトレーラー部）を厳密に読む。不正なチャンクサイズ行・
+/// チャンクデータ読み取り前の EOF・チャンクデータ直後の CRLF 欠落・
+/// `max_bytes` を超える累積本文サイズは、いずれも `Err` にする（部分的に
+/// 読めた本文を成功として使わない）。トレーラー行数は
+/// [`FIXTURE_MAX_HEADER_LINES`] で上限を設ける（無制限に送り続けられて
+///占有され続けることを防ぐ。coding-rust.md「長さ・件数を上限検証」）。
+fn read_chunked_body<R: BufRead>(reader: &mut R, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    loop {
+        let mut size_line = String::new();
+        read_complete_line(reader, &mut size_line)
+            .map_err(|e| format!("chunk size line read failed: {e}"))?;
+        let size_line = size_line.trim_end_matches(['\r', '\n']);
+        // チャンク拡張（`;` 以降。例: `1a;foo=bar`）はサイズの解釈に使わない
+        // ため読み捨てる。
+        let size_field = size_line.split(';').next().unwrap_or("");
+        if size_field.is_empty() {
+            return Err("empty chunk size".to_string());
+        }
+        let size = usize::from_str_radix(size_field, 16)
+            .map_err(|_| format!("invalid chunk size: {size_field:?}"))?;
+        if size == 0 {
+            // 最終チャンク。トレーラー部（0 行以上のヘッダ相当）を空行まで
+            // 読み飛ばす。
+            let mut trailer_lines_seen = 0u32;
+            loop {
+                if trailer_lines_seen >= FIXTURE_MAX_HEADER_LINES {
+                    return Err(format!(
+                        "too many chunked trailer lines (limit {FIXTURE_MAX_HEADER_LINES})"
+                    ));
+                }
+                trailer_lines_seen += 1;
+                let mut trailer_line = String::new();
+                read_complete_line(reader, &mut trailer_line)
+                    .map_err(|e| format!("chunk trailer line read failed: {e}"))?;
+                if trailer_line == "\r\n" || trailer_line == "\n" {
+                    break;
+                }
+            }
+            break;
+        }
+        if body.len().saturating_add(size) > max_bytes {
+            return Err(format!("chunked body exceeds {max_bytes} bytes"));
+        }
+        let mut chunk = vec![0u8; size];
+        reader
+            .read_exact(&mut chunk)
+            .map_err(|e| format!("chunk data read failed (size={size}): {e}"))?;
+        body.extend_from_slice(&chunk);
+        let mut crlf = [0u8; 2];
+        reader
+            .read_exact(&mut crlf)
+            .map_err(|e| format!("chunk trailing CRLF read failed: {e}"))?;
+        if &crlf != b"\r\n" {
+            return Err(format!("chunk not terminated by CRLF (got {crlf:?})"));
+        }
     }
-    // レビュー指摘 P2（Codex。PR #442 再々々々レビュー・
-    // competitor_lightpanda.rs:585）と同じ理由付けで、本文も厳密な UTF-8
-    // 変換にする（`from_utf8_lossy` による文字化けが偶然妥当な JSON へ
-    // 変わり、別プロセスの応答をブラウザらしいと誤判定する経路を避ける）。
-    let body_str = String::from_utf8(body).ok()?;
-    Some((status, body_str))
+    Ok(body)
 }
 
 /// `BufRead::read_line` 相当だが、外部プロセスの応答を無制限に信用せず
 /// `MAX_LINE_BYTES` を超えたら打ち切る（DoS を避ける。coding-rust.md）。
 ///
-/// レビュー指摘 P1（PR #442）: 以前は `MAX_LINE_BYTES` に達しても改行未検出の
+/// 以前は `MAX_LINE_BYTES` に達しても改行未検出の
 /// まま `Ok` を返しており、呼び出し側（`probe_once`・MCP stdout 読み取り
 /// スレッド）が切り詰められた不完全な行を正常な 1 行として扱い得た
 /// （`parse_json` が偶然パース可能な断片を返す・`parse_http_status` が誤った
@@ -693,16 +792,14 @@ fn probe_once(port: u16, request: &str, outer_deadline: Instant) -> Option<(u16,
 /// 読み取れなかった」ことを伝える（coding-rust.md「外部入力の経路では
 /// 明示的に処理する」）。
 ///
-/// レビュー指摘 P2（Codex。PR #442 再々々々々レビュー・
-/// competitor_lightpanda.rs:585）: 以前は `String::from_utf8_lossy` で
+/// 以前は `String::from_utf8_lossy` で
 /// 不正なバイト列を置換文字（U+FFFD）へ書き換えていたため、置換後の
 /// 文字列がたまたま妥当な JSON になると、元の応答とは異なる内容を
 /// 正常なトークン削減率として出力し得た。`String::from_utf8` で厳密に
 /// 変換し、失敗したら `ErrorKind::InvalidData` で計測エラーにする
 /// （呼び出し元は他の `Err` 経路と同様に扱えばよく、個別対応は不要）。
 ///
-/// 契約（レビュー指摘 P1。Codex。PR #442 再々々々々々レビュー・
-/// competitor_lightpanda.rs:1039）: 「改行で終わる行を 1 本読めた」場合
+/// 契約: 「改行で終わる行を 1 本読めた」場合
 /// だけ `Ok(len)`（`len > 0`）を返す。ストリームが 1 バイトも読まずに
 /// 終端した場合（前の呼び出しまでに完結した行を読み終え、次の行が
 /// 存在しないことを示す正常な終端）だけ `Ok(0)` を返す。それ以外
@@ -715,7 +812,13 @@ fn probe_once(port: u16, request: &str, outer_deadline: Instant) -> Option<(u16,
 /// 呼び出し側で行っていたが、直接呼ぶ呼び出し元と食い違っていた）。
 /// この契約をここ 1 箇所に集約することで、fixture サーバー・probe・MCP
 /// のすべての呼び出し元で一貫させる。
-fn read_line_bounded<R: BufRead>(reader: &mut R, out: &mut String) -> std::io::Result<usize> {
+///
+/// `pub(crate)`: `competitor_lightpanda_measure`（`measure_tests.rs`）の
+/// 単体テストがループバックソケット経由で直接検証する。
+pub(crate) fn read_line_bounded<R: BufRead>(
+    reader: &mut R,
+    out: &mut String,
+) -> std::io::Result<usize> {
     let mut buf = Vec::new();
     loop {
         let mut byte = [0u8; 1];
@@ -769,7 +872,7 @@ pub fn measure_cold_start(target: &Target, trials: usize) -> Outcome {
         Err(skipped) => return skipped,
     };
     // cold start は `serve_args` だけを使うため、`mcp_args_error` は無視する
-    // （レビュー指摘 P2。Codex。PR #442 再々々々レビュー）。
+    // 。
     if let Some(outcome) = arg_error_gate(target.serve_args_error.as_deref(), target.name) {
         return outcome;
     }
@@ -781,10 +884,7 @@ pub fn measure_cold_start(target: &Target, trials: usize) -> Outcome {
                 // プロセス（グループ）を終了させ、`wait` で完全な終了を
                 // 確認してから返る。その後に再 probe することで、
                 // 「対象を殺したのに同じポートがまだ応答する」という
-                // ポート競合を検出できる（レビュー指摘 P1。Codex。PR #442
-                // 再々々々々々々々レビュー・competitor_lightpanda.rs:607。
-                // `reprobe_after_kill`・`support::port_conflict_error` の
-                // ドキュメント参照）。
+                // ポート競合を検出できる。
                 drop(guard);
                 if let Some(reason) =
                     port_conflict_error(target.name, port, reprobe_after_kill(port))
@@ -848,7 +948,7 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
         Err(skipped) => return skipped,
     };
     // アイドル RSS も `serve_args` だけを使うため、`mcp_args_error` は
-    // 無視する（レビュー指摘 P2。Codex。PR #442 再々々々レビュー）。
+    // 無視する。
     if let Some(outcome) = arg_error_gate(target.serve_args_error.as_deref(), target.name) {
         return outcome;
     }
@@ -858,19 +958,14 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
             Ok((guard, port, _elapsed)) => {
                 std::thread::sleep(Duration::from_millis(500));
                 // `ps` の失敗（プロセス早期終了・パース不能出力）を黙って
-                // 捨てず即座に Error 化する（レビュー指摘: 失敗試行を除外した
-                // まま残り試行だけで中央値を報告すると、trials 回分の計測値
-                // であるかのように結果件数と意味が食い違う）。
+                // 捨てず即座に Error 化する。
                 let pid = guard.0.id();
                 let rss = sample_rss_kb(pid);
                 // `drop(guard)` は `kill_process_group`/`Child::kill` で
                 // プロセス（グループ）を終了させ、`wait` で完全な終了を
                 // 確認してから返る。その後に再 probe することで、
                 // 「対象を殺したのに同じポートがまだ応答する」という
-                // ポート競合を検出できる（レビュー指摘 P1。Codex。PR #442
-                // 再々々々々々々々レビュー・competitor_lightpanda.rs:607。
-                // `reprobe_after_kill`・`support::port_conflict_error` の
-                // ドキュメント参照）。
+                // ポート競合を検出できる。
                 drop(guard);
                 if let Some(reason) =
                     port_conflict_error(target.name, port, reprobe_after_kill(port))
@@ -904,8 +999,7 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
 
 #[cfg(windows)]
 fn measure_idle_rss(target: &Target, _trials: usize) -> Outcome {
-    // レビュー指摘 P1（Codex。PR #442 再々々レビュー・
-    // competitor_lightpanda.rs:593）: `target.bin` を確認せず常に
+    // `target.bin` を確認せず常に
     // `Outcome::Unsupported` を返していたため、`<PREFIX>_BIN` が未設定でも
     // `idleRssKb` だけ `unsupported` になり「対象バイナリ未設定なら全計測が
     // Skipped」という契約に反していた。他の計測関数（`measure_cold_start`・
@@ -936,7 +1030,7 @@ fn measure_binary_size(target: &Target) -> Outcome {
     };
     match std::fs::metadata(bin) {
         Ok(meta) if meta.is_file() => Outcome::Value(meta.len() as f64),
-        // レビュー指摘 P2: line 398。`fs::metadata` はディレクトリにも成功し
+        // line 398。`fs::metadata` はディレクトリにも成功し
         // `len()` がディレクトリエントリサイズ等の無意味な値を返すため、
         // `<PREFIX>_BIN` に誤ってディレクトリを指定した場合に異常値が
         // そのまま `binarySizeBytes` として出力され得た。通常ファイルで
@@ -949,14 +1043,14 @@ fn measure_binary_size(target: &Target) -> Outcome {
 /// stdout 読み取りスレッドが呼び出し側との間に持つ行キューの上限件数。
 /// `MAX_LINE_BYTES`（1 行あたりの上限）だけでは、外部プロセスが応答を
 /// 読ませないまま大量の行を送り続けた場合にキューが無制限に伸びメモリを
-/// 枯渇させ得る（レビュー指摘 P0: line 386）。`mpsc::sync_channel` で
+/// 枯渇させ得る。`mpsc::sync_channel` で
 /// 容量を区切り、溢れたら読み取りスレッドを止めて `overflowed` を立てる。
 /// 256 件（最悪 256 × `MAX_LINE_BYTES` = 256MiB）は、正常系での
 /// `notifications/message` 等のログ行バーストを誤検知しない余裕を持たせつつ、
 /// 無制限確保にはしない上限として選んだ値。
 const MCP_STDOUT_QUEUE_CAPACITY: usize = 256;
 
-/// `McpClient::notify` の書き込みタイムアウト（レビュー指摘 P1（PR #442））。
+/// `McpClient::notify` の書き込みタイムアウト。
 /// `notify` は応答を待たないが、書き込み自体（`write_with_deadline`）は
 /// 相手プロセスが標準入力を読まない場合に無期限へブロックし得るため、
 /// `call` と同様に期限を設ける。応答待ちが無い分 `call` の個別呼び出しより
@@ -968,8 +1062,7 @@ const NOTIFY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// （パイプに読み取りタイムアウトが無いため、スレッド + チャンネルで模す）。
 struct McpClient {
     guard: ChildGuard,
-    /// `Arc<Mutex<_>>` にする理由（レビュー指摘 P1。Codex。PR #442
-    /// 再々々々々レビュー・competitor_lightpanda.rs:827）: `write_with_deadline`
+    /// `Arc<Mutex<_>>` にする理由: `write_with_deadline`
     /// はタイムアウト時に書き込みスレッドを detach し（`join` しない）、
     /// 以後の呼び出しでも同じ `ChildStdin` を再利用できるようにするため、
     /// 所有権を一方的に奪う（`&mut ChildStdin`/`Option::take`）方式ではなく
@@ -985,15 +1078,12 @@ struct McpClient {
     overflowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 読み取りスレッドが `read_line_bounded` からエラー（`InvalidData`
     /// （`MAX_LINE_BYTES` 到達・改行未検出、または不正な UTF-8。レビュー
-    /// 指摘 P1・P2）・`UnexpectedEof`（改行に達する前に子プロセスが標準
-    /// 出力を閉じた。レビュー指摘 P1。Codex。PR #442 再々々々々々レビュー・
-    /// competitor_lightpanda.rs:1039）を含む、あらゆる種別）を受け取った際に
+    /// 指摘 P1・P2）・`UnexpectedEof`を含む、あらゆる種別）を受け取った際に
     /// その内容を記録するスロット。`call` はこれを見て、切り詰められた／
     /// 文字化けした／未完了の行を無視したまま待ち続けるのではなく明示的に
     /// エラー終了させる。
     ///
-    /// レビュー指摘 P2（Codex。PR #442 再々々々々々々々レビュー・
-    /// competitor_lightpanda.rs:1147）: 以前は `AtomicBool` で「エラーが
+    /// 以前は `AtomicBool` で「エラーが
     /// あったかどうか」だけを記録し、`InvalidData`・`UnexpectedEof` 以外の
     /// I/O エラー種別（`ConnectionReset` 等）は無条件の `Err(_) => break`
     /// に落ちて記録されずスレッドが静かに終了していた。`Mutex<Option<String>>`
@@ -1026,37 +1116,44 @@ impl McpClient {
                 let mut line = String::new();
                 match read_line_bounded(&mut reader, &mut line) {
                     Ok(0) => break,
-                    Ok(_) => match tx.try_send(line) {
-                        Ok(()) => {}
-                        Err(mpsc::TrySendError::Full(_)) => {
-                            // キュー容量超過: 消費側が追いつけていない、または
-                            // 相手プロセスが応答を読ませず出力し続けている。
-                            // 無制限に溜め込まず読み取りを止め、呼び出し側へは
-                            // `overflowed` 経由でエラーとして伝える。
-                            overflowed_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(_) => {
+                        // MCP の stdio トランスポート仕様上、stdout に現れる
+                        // 行はすべて 1 行 1 JSON 値の応答でなければならない
+                        // （それ以外を書くのは対象プロセス側の契約違反）。
+                        // 解析できない行を読み飛ばして次の行を待つと、
+                        // 対象プロセスの不正な出力に気づかないまま応答待ちを
+                        // 続け得るため、`line_read_error` に記録して読み取り
+                        // スレッドを止め、`call`/`notify` 側へ明示的に
+                        // 伝える（fail-closed。coding-rust.md「外部入力の
+                        // 経路では明示的に処理する」）。
+                        if let Err(e) = parse_json(line.trim()) {
+                            if let Ok(mut reason) = line_read_error_writer.lock() {
+                                *reason = Some(format!("mcp stdout line is not valid JSON: {e:?}"));
+                            }
                             break;
                         }
-                        Err(mpsc::TrySendError::Disconnected(_)) => break,
-                    },
+                        match tx.try_send(line) {
+                            Ok(()) => {}
+                            Err(mpsc::TrySendError::Full(_)) => {
+                                // キュー容量超過: 消費側が追いつけていない、
+                                // または相手プロセスが応答を読ませず出力し
+                                // 続けている。無制限に溜め込まず読み取りを
+                                // 止め、呼び出し側へは `overflowed` 経由で
+                                // エラーとして伝える。
+                                overflowed_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+                                break;
+                            }
+                            Err(mpsc::TrySendError::Disconnected(_)) => break,
+                        }
+                    }
                     Err(e) => {
-                        // `MAX_LINE_BYTES` に達し改行未検出のまま打ち切られた行
-                        // （レビュー指摘 P1）、不正な UTF-8（レビュー指摘 P2。
-                        // Codex。PR #442 再々々々々レビュー・
-                        // competitor_lightpanda.rs:585: `from_utf8_lossy` の
-                        // 置換で偶然妥当な JSON に化ける経路を避けるため、
-                        // `read_line_bounded` を厳密な UTF-8 変換にした）、
-                        // 改行に達する前に子プロセスが標準出力を閉じた
-                        // （`UnexpectedEof`。レビュー指摘 P1。Codex。PR #442
-                        // 再々々々々々レビュー・competitor_lightpanda.rs:1039）、
-                        // またはそれ以外の I/O エラー（`ConnectionReset` 等。
-                        // レビュー指摘 P2。Codex。PR #442 再々々々々々々々
-                        // レビュー・competitor_lightpanda.rs:1147: 以前は
-                        // 種別を絞った `if` ガード付きの分岐でしか記録して
-                        // おらず、それ以外の種別は無条件の `Err(_) => break`
-                        // に落ちて記録されずスレッドが静かに終了していた）。
-                        // 種別を問わずすべてのエラーを記録し、切り詰められた／
-                        // 文字化けした／未完了の断片を正常応答として扱わせず、
-                        // 読み取りを止めて `call` 側へ明示的に伝える。
+                        // `MAX_LINE_BYTES` に達し改行未検出のまま打ち切られた
+                        // 行・不正な UTF-8・改行に達する前に子プロセスが
+                        // 標準出力を閉じた（`UnexpectedEof`）・その他の I/O
+                        // エラー（`ConnectionReset` 等）を、種別を問わず
+                        // すべて記録する。切り詰められた／文字化けした／
+                        // 未完了の断片を正常応答として扱わせず、読み取りを
+                        // 止めて `call` 側へ明示的に伝える。
                         if let Ok(mut reason) = line_read_error_writer.lock() {
                             *reason = Some(e.to_string());
                         }
@@ -1064,8 +1161,7 @@ impl McpClient {
                     }
                 }
             }
-            // レビュー指摘 P2（Codex。PR #442 再々々々々々々々レビュー・
-            // competitor_lightpanda.rs:1147）: 「reader スレッドが終了
+            // 「reader スレッドが終了
             // したら（EOF の場合も含めて）、送信側を drop する」ことを
             // 明示する。`tx` はこのクロージャに move 済みのローカル変数
             // なので、`break` でループを抜けクロージャが終了する時点で
@@ -1101,8 +1197,7 @@ impl McpClient {
     /// （パイプ）には OS レベルの書き込みタイムアウトが無いため、実際の
     /// 書き込みは別スレッドへ切り出し、`mpsc` の `recv_timeout` で待つ。
     ///
-    /// レビュー指摘 P1（Codex。PR #442 再々々々々レビュー・
-    /// competitor_lightpanda.rs:827）: 以前は `std::thread::scope` を使い、
+    /// 以前は `std::thread::scope` を使い、
     /// タイムアウト時に直接の子プロセスだけを `kill` したあと、書き込み
     /// スレッドからの送信を `rx.recv()`（期限なし）で待っていた。対象
     /// プロセス（ブラウザ）が起動した子孫プロセスが stdin パイプの
@@ -1161,11 +1256,9 @@ impl McpClient {
                 // それだけに頼らず、std の `Child::kill`（直接の子）も必ず
                 // 呼ぶ。子孫プロセスがパイプを保持していると直接の子だけの
                 // `kill` では解放されないが、少なくとも直接の子は確実に
-                // 終了させる床として残す（レビュー指摘。PR #442
-                // 再々々々々レビュー・advisor 追加指摘）。
+                // 終了させる床として残す。
                 //
-                // レビュー指摘 P1（Codex。PR #442 再々々々々々々レビュー・
-                // competitor_lightpanda.rs:558）: `kill_process_group` の
+                // `kill_process_group` の
                 // 結果を握りつぶさず、失敗時は `Child::kill` へ
                 // フォールバックした旨をエラーメッセージへ含めて呼び出し元
                 // （`call`/`notify`）へ返す。
@@ -1192,7 +1285,7 @@ impl McpClient {
     /// トークン削減率の計測に失敗レスポンスの本文が混入する）。
     ///
     /// `timeout` は書き込み（`write_with_deadline`）から応答待ちまでの
-    /// 呼び出し全体に適用する（レビュー指摘 P1（PR #442）: 以前は書き込みに
+    /// 呼び出し全体に適用する（以前は書き込みに
     /// 期限が無く、書き込みが無期限にブロックし得た）。
     fn call(&mut self, method: &str, params: &str, timeout: Duration) -> Result<JsonValue, String> {
         let id = self.next_id;
@@ -1224,8 +1317,7 @@ impl McpClient {
             if remaining.is_zero() {
                 return Err(format!("timeout waiting for response to {method}"));
             }
-            // レビュー指摘 P2（Codex。PR #442 再々々々々々々々レビュー・
-            // competitor_lightpanda.rs:1147）: 読み取りスレッドが終了すると
+            // 読み取りスレッドが終了すると
             // `tx`（送信側）が drop され、`recv_timeout` は待機中でも即座に
             // `RecvTimeoutError::Disconnected` で返る。以前はこれを
             // `Timeout` と区別せず一括りに扱っていたため、実際には切断
@@ -1265,6 +1357,11 @@ impl McpClient {
                     return Err(format!("timeout waiting for response to {method}"));
                 }
             };
+            // 読み取りスレッドが非 JSON 行をキューへ送る前に弾く（`spawn` の
+            // 読み取りループ参照）ため、ここに来る行は必ず有効な JSON の
+            // はずだが、その不変条件が崩れても panic はせず読み飛ばす
+            // （fail-closed。coding-rust.md「外部入力の経路では unwrap を
+            // 使わず明示的に処理する」）。
             let Ok(value) = parse_json(line.trim()) else {
                 continue;
             };
@@ -1273,8 +1370,7 @@ impl McpClient {
             if value.get("id").and_then(JsonValue::as_f64) != Some(id as f64) {
                 continue;
             }
-            // レビュー指摘 P1（Codex。PR #442 再々々々レビュー・
-            // competitor_lightpanda.rs:839）: `result` が `null`・`{}` でも
+            // `result` が `null`・`{}` でも
             // `isError` さえ立っていなければ成功として扱っていたため、
             // `goto` のように本文を確認しない呼び出しでは、ページ遷移に
             // 失敗した応答をそのまま成功と誤判定し得た（続く `html`・
@@ -1313,7 +1409,7 @@ impl McpClient {
 
     /// 応答を待たない通知（`initialize` 後の `notifications/initialized` 等）。
     /// 応答を待たないだけで、書き込み自体には `call` 同様
-    /// `write_with_deadline`（レビュー指摘 P1（PR #442））で
+    /// `write_with_deadline`で
     /// `NOTIFY_WRITE_TIMEOUT` を適用し、相手プロセスが標準入力を読まない
     /// 場合の無期限ブロックを避ける。
     fn notify(&mut self, method: &str, params: &str) -> Result<(), String> {
@@ -1329,7 +1425,7 @@ impl McpClient {
 /// `content` 内のどの項目にも `text` が無く連結結果が空文字列になる場合は
 /// 抽出失敗として `None` を返す（panic はさせない）。
 ///
-/// レビュー指摘 P1: line 569。以前は欠落時に空文字列を返しており、
+/// line 569。以前は欠落時に空文字列を返しており、
 /// `html` が非空で `tree` の抽出に失敗しただけのケースが
 /// `tree_tok=0` の正常計測（削減率 100%）として記録されてしまっていた。
 /// 呼び出し元 `measure_token_reduction` は `None` を抽出失敗として扱い、
@@ -1401,7 +1497,7 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
         drop(client.guard);
         return Outcome::Error(format!("{}: mcp initialize failed: {e}", target.name));
     }
-    // レビュー指摘 P1: line 747。送信失敗を握りつぶすと、初期化未完了のまま
+    // line 747。送信失敗を握りつぶすと、初期化未完了のまま
     // 後続の `goto` 等の計測へ進み、真因（初期化通知の送信失敗）とは別の
     // エラーとして誤って報告され得る。送信失敗は直ちに `Outcome::Error` で
     // 返す（fail-closed。coding-rust.md「外部入力の経路では unwrap を使わず
@@ -1414,7 +1510,7 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
         ));
     }
 
-    // レビュー指摘 P1: line 555。以前は goto・html・tree の失敗サイトを
+    // line 555。以前は goto・html・tree の失敗サイトを
     // 無言で `continue` して除外し、残ったサイトだけの中央値を
     // `measured` として返していたため、既定 5 サイト中 1 サイトしか
     // 成功しなくても代表値であるかのように報告され得た。失敗したサイトと
@@ -1465,8 +1561,7 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
                 continue;
             }
         };
-        // レビュー指摘 P1（Codex。PR #442 再々々々々々々々々々レビュー・
-        // measure.rs:1450）: `goto` の応答が JSON-RPC としての形式
+        // `goto` の応答が JSON-RPC としての形式
         // （`validate_mcp_response`）を満たしているというだけでは、対象
         // ブラウザが実際にこの `url` へ遷移したことを意味しない（未実装の
         // `goto` が常に成功応答だけ返す・前のページに留まったまま等）。
@@ -1476,8 +1571,7 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
         // 各ページ `<body>` 内の可視見出し `<h1>` のテキスト）が含まれて
         // いるかを確認する。
         //
-        // レビュー指摘（Codex P1・measure.rs:1505 / Cursor Medium・
-        // support.rs:452。PR #442 再々々々々々々々々々々レビュー）: 当初は
+        // 当初は
         // `<title>` テキストをマーカーにしていたが、`<title>` は `<head>`
         // にしか存在せずアクセシビリティツリー（`tree`）に現れる保証が
         // 無いため、実ブラウザでは `tree` 側の検証が常に失敗し得た
@@ -1536,18 +1630,15 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
 ///
 /// `../competitor_lightpanda.rs` の `main`（環境変数から実対象を構築する）と、
 /// `measure_tests.rs` の結合テスト（対象バイナリを模したローカルプロセスを
-/// `targets` に指定する）の両方から呼ぶ、計測の唯一のエントリポイント
-/// （レビュー指摘。コーディネーター指示。PR #442 再々々々々々々々々レビュー・
-/// `crates/fandhe-browser-core/Cargo.toml:57`: 「計測ロジックを bench ターゲット
-/// から、テストから `#[path]` で取り込める共有モジュールへ移す」）。
+/// `targets` に指定する）の両方から呼ぶ、計測の唯一のエントリポイント。
 pub fn run_all(targets: &[Target], trials: usize) -> (String, u8) {
-    // レビュー指摘 P0（Codex。PR #442 再レビュー）: `AISNAP-1` 計測は外部
+    // `AISNAP-1` 計測は外部
     // URL を一切使わず、ここで起動するローカル fixture サーバーだけを
     // 対象にする（モジュールドキュメント参照）。両方の `target` で
     // 同じサーバーを共有し、関数を抜けるときに `Drop` で停止する。
     // どちらの対象バイナリも未設定（`bin` が `None`）のときは
     // `measure_token_reduction` が最初の分岐で必ず `Outcome::Skipped` を
-    // 返しサーバーを使わないため、起動自体を省く（advisor 指摘: 起動を
+    // 返しサーバーを使わないため、起動自体を省く（起動を
     // 無条件にすると、サンドボックス等で `bind` が失敗した場合に
     // 「対象未設定で Skipped のみ→終了コード 0」の契約が崩れ、実際には
     // 使わないはずのサーバー起動失敗で `Outcome::Error`（終了コード 1）に
@@ -1560,8 +1651,7 @@ pub fn run_all(targets: &[Target], trials: usize) -> (String, u8) {
     };
 
     let mut body = String::from("{\n");
-    // レビュー指摘 P1（Codex。PR #442・competitor_lightpanda.rs:893）:
-    // 全計測項目の `Outcome` をここへ集め、`bench_exit_code` へ一括で渡す
+    // // 全計測項目の `Outcome` をここへ集め、`bench_exit_code` へ一括で渡す
     // （`Outcome::is_error` は support.rs 内限定のため、判定自体は
     // `bench_exit_code` 側に閉じる）。
     let mut outcomes: Vec<Outcome> = Vec::new();
@@ -1576,8 +1666,7 @@ pub fn run_all(targets: &[Target], trials: usize) -> (String, u8) {
         );
         let idle_rss = measure_idle_rss(target, trials);
         eprintln!("idle RSS (KB, median of {trials}): {}", idle_rss.to_json());
-        // レビュー指摘 P1（Codex。PR #442 再々レビュー・
-        // competitor_lightpanda.rs:1058）: 片方の対象だけに `_BIN` を設定した
+        // 片方の対象だけに `_BIN` を設定した
         // 状態で fixture サーバーの起動が失敗すると、以前は未設定の対象にも
         // `Outcome::Error` を割り当てていた（「対象バイナリ未設定は常に
         // `Outcome::Skipped`」という契約に反する）。`token_reduction_gate`
