@@ -1,20 +1,20 @@
 //! `fandhe-browser-core` 全体で共有するエラー型。
 //!
 //! `fetch`（TASK-24.2・#36）・`parse`（TASK-24.4・#38）・`dom`（TASK-24.5・#39）・
-//! `query`（TASK-24.7・#41）の各モジュールは、本モジュールが定義する [`Error`] /
-//! [`Result`] を戻り値の共通土台として使う想定（TASK-24（24.1）・ビヘイビア
-//! `CORE-1`）。`unsafe` は使わず、`thiserror`/`anyhow` 等の外部依存も追加しない
-//! （dependency-policy.md の依存最小方針。`Cargo.toml` の `[dependencies]` は
-//! 引き続き空のまま）。
+//! `selector`（TASK-24.7・#41）・`query`（TASK-24.10・#418）の各モジュールは、
+//! 本モジュールが定義する [`Error`] / [`Result`] を戻り値の共通土台として
+//! 使う想定（TASK-24（24.1）・ビヘイビア `CORE-1`）。`unsafe` は使わず、
+//! `thiserror`/`anyhow` 等の外部依存も追加しない（dependency-policy.md の
+//! 依存最小方針。`Cargo.toml` の `[dependencies]` は引き続き空のまま）。
 //!
 //! 呼び出し元は `fandhe-browser-ai`・`fandhe-browser-cdp` 等の上位 crate（本
 //! crate から一方向に依存される）や、本 crate 内の各モジュール（`js_stub` を
 //! 含む。TASK-24（24.9）・#43）を想定する。
 //!
-//! バリアントは現時点では汎用的なものに留め、fetch/parse/dom/query の各実装
-//! （#36/#38/#39/#41）が固有のケース（HTTP ステータス・パースエラー位置等）を
-//! 追加できるよう `#[non_exhaustive]` にしてある（REPAIR-4: 戻り値は将来拡張
-//! できる構造にする）。
+//! バリアントは現時点では汎用的なものに留め、fetch/parse/dom/selector/query
+//! の各実装（#36/#38/#39/#41/#418）が固有のケース（HTTP ステータス・パース
+//! エラー位置等）を追加できるよう `#[non_exhaustive]` にしてある
+//! （REPAIR-4: 戻り値は将来拡張できる構造にする）。
 
 use std::fmt;
 

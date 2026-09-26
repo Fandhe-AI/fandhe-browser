@@ -161,7 +161,14 @@ pub enum SimpleSelector {
 }
 
 /// 属性セレクタ（`[name]` または `[name=value]`）。
+///
+/// `#[non_exhaustive]` により、将来の属性フラグ（`i` / `s`。モジュール doc
+/// 参照）追加時にフィールド追加が破壊的変更にならないようにしてある
+/// （他の公開型 `SelectorList` / `ComplexSelector` / `CompoundSelector` は
+/// プライベートフィールド + アクセサ、`SimpleSelector` / `AttributeMatcher` /
+/// `Combinator` は `#[non_exhaustive]` enum とする方針に揃える）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AttributeSelector {
     /// 属性名（ASCII 小文字に正規化済み）。
     pub name: String,
@@ -616,12 +623,10 @@ pub fn parse_selector_list(input: &str) -> Result<SelectorList> {
         }
     }
 
-    if !cursor.is_eof() {
-        return Err(invalid_input_at(
-            cursor.offset(),
-            "unexpected trailing input",
-        ));
-    }
+    // ループは `None => break` でのみ抜けるため、ここに到達した時点で
+    // カーソルは必ず入力末尾を指している（未消費の残り入力があるケースは
+    // 上の `Some(_)` 分岐で既にエラーとして返している）。
+    debug_assert!(cursor.is_eof());
 
     Ok(SelectorList { selectors })
 }
