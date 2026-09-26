@@ -13,6 +13,7 @@
 //! なる。unused であっても `pub` は免除されない）。
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 /// 複数回試行した計測値（ミリ秒・キロバイト等）から中央値を求める。
 ///
@@ -130,6 +131,92 @@ pub fn json_escape(input: &str) -> String {
         }
     }
     out
+}
+
+/// `COMPETITOR_BENCH_SITES`（外部入力）の各 URL を `goto` へ渡す前に検証する。
+///
+/// レビュー指摘 P0（SSRF。security.md「OWASP Top 10」）: scheme・件数・長さの
+/// 検証がないまま MCP の `goto` ツールへ URL を渡すと、`file:` scheme や
+/// ループバック・プライベート・リンクローカル等の内部アドレスへ計測対象
+/// ブラウザ経由で意図せずアクセスする経路になる。ここでは scheme を
+/// `http` / `https` に限定し、ホストがループバック・プライベート・
+/// リンクローカル・未指定・マルチキャストアドレス（または `localhost`）で
+/// ないことを確認する。DNS 名はここでは解決しない（解決してもリダイレクト先
+/// が別アドレスへ変わり得る TOCTOU が残るため）。実際の名前解決・リダイレクト
+/// 追従は計測対象ブラウザ（Lightpanda 等）の実装に委ねられ、本関数はベンチ
+/// スクリプト自身が明らかに内部向け・非 HTTP(S) の URL を渡さないことだけを
+/// 保証する best-effort のゲートである。
+pub fn validate_bench_url(url: &str) -> Result<(), String> {
+    let lower = url.to_ascii_lowercase();
+    let after_scheme = if let Some(rest) = lower.strip_prefix("http://") {
+        rest
+    } else if let Some(rest) = lower.strip_prefix("https://") {
+        rest
+    } else {
+        return Err(format!("{url}: only http/https URLs are allowed"));
+    };
+    // scheme を除いた残り（元の大小文字を保つ）を取り出す。
+    let original_after_scheme = &url[url.len() - after_scheme.len()..];
+
+    // authority（ホスト部）は次の '/' '?' '#' のいずれかで終わる。
+    let authority_end = original_after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(original_after_scheme.len());
+    let authority = &original_after_scheme[..authority_end];
+    if authority.is_empty() {
+        return Err(format!("{url}: missing host"));
+    }
+    // userinfo（"user:pass@host"）があれば取り除く。
+    let host_port = match authority.rsplit_once('@') {
+        Some((_, rest)) => rest,
+        None => authority,
+    };
+    // IPv6 リテラル（"[::1]:port"）とそれ以外を区別してホスト文字列を取り出す。
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inner, _)) => inner,
+            None => return Err(format!("{url}: malformed IPv6 host")),
+        }
+    } else {
+        match host_port.split_once(':') {
+            Some((h, _)) => h,
+            None => host_port,
+        }
+    };
+    if host.is_empty() {
+        return Err(format!("{url}: missing host"));
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return Err(format!("{url}: internal host is not allowed"));
+    }
+    // ホストが IP リテラルなら、内部・特殊用途アドレスかを検証する。
+    // ホスト名（DNS 名）はここでは解決しない（関数ドキュメント参照）。
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        let blocked = match ip {
+            IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+                    || v4.is_documentation()
+            }
+            IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    // ULA（fc00::/7）。安定 API の is_unique_local に頼らず
+                    // 先頭バイトで判定する。
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    // リンクローカル（fe80::/10）。
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+            }
+        };
+        if blocked {
+            return Err(format!("{url}: internal/reserved address is not allowed"));
+        }
+    }
+    Ok(())
 }
 
 /// 手書き最小 JSON パーサーが返す値。
@@ -728,5 +815,47 @@ mod tests {
         assert_eq!(parse_json("1e3"), Ok(JsonValue::Number(1000.0)));
         assert!(parse_json("-").is_err());
         assert!(parse_json("1.").is_err());
+    }
+
+    // レビュー指摘 P0（SSRF）: `validate_bench_url` が http(s) 以外の scheme・
+    // 内部アドレスを拒否することを確認する。
+    #[test]
+    fn validate_bench_url_accepts_public_https() {
+        assert!(validate_bench_url("https://example.com").is_ok());
+        assert!(validate_bench_url("http://example.com/path?q=1#frag").is_ok());
+    }
+
+    #[test]
+    fn validate_bench_url_rejects_non_http_scheme() {
+        assert!(validate_bench_url("file:///etc/passwd").is_err());
+        assert!(validate_bench_url("ftp://example.com").is_err());
+        assert!(validate_bench_url("javascript:alert(1)").is_err());
+    }
+
+    #[test]
+    fn validate_bench_url_rejects_localhost_and_loopback() {
+        assert!(validate_bench_url("http://localhost/").is_err());
+        assert!(validate_bench_url("http://127.0.0.1/").is_err());
+        assert!(validate_bench_url("http://[::1]/").is_err());
+    }
+
+    #[test]
+    fn validate_bench_url_rejects_private_and_link_local() {
+        assert!(validate_bench_url("http://10.0.0.1/").is_err());
+        assert!(validate_bench_url("http://192.168.1.1/").is_err());
+        assert!(validate_bench_url("http://169.254.1.1/").is_err());
+        assert!(validate_bench_url("http://[fe80::1]/").is_err());
+        assert!(validate_bench_url("http://[fc00::1]/").is_err());
+    }
+
+    #[test]
+    fn validate_bench_url_rejects_unspecified_and_missing_host() {
+        assert!(validate_bench_url("http://0.0.0.0/").is_err());
+        assert!(validate_bench_url("http:///no-host").is_err());
+    }
+
+    #[test]
+    fn validate_bench_url_allows_userinfo_and_port_with_public_host() {
+        assert!(validate_bench_url("https://user:pass@example.com:8443/x").is_ok());
     }
 }

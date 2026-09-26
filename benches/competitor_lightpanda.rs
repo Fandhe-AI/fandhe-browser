@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use support::{
     JsonValue, approx_tokens, expand_args, json_escape, median, parse_http_status, parse_json,
-    reduction_pct, split_args,
+    reduction_pct, split_args, validate_bench_url,
 };
 // `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
 // 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
@@ -729,6 +729,13 @@ fn measure_token_reduction(target: &Target) -> Outcome {
         }
         Err(_) => DEFAULT_SITES.iter().map(|s| s.to_string()).collect(),
     };
+    // レビュー指摘 P0: `file:` scheme・内部アドレスの無検証な `goto` を防ぐ
+    // （security.md「SSRF」）。既定サイト群も含め、渡す前に必ず検証する。
+    for url in &sites {
+        if let Err(reason) = validate_bench_url(url) {
+            return Outcome::Error(format!("{}: {reason}", target.name));
+        }
+    }
 
     let mut client = match McpClient::spawn(bin, &target.mcp_args) {
         Ok(c) => c,
@@ -744,7 +751,18 @@ fn measure_token_reduction(target: &Target) -> Outcome {
         drop(client.guard);
         return Outcome::Error(format!("{}: mcp initialize failed: {e}", target.name));
     }
-    let _ = client.notify("notifications/initialized", "{}");
+    // レビュー指摘 P1: line 747。送信失敗を握りつぶすと、初期化未完了のまま
+    // 後続の `goto` 等の計測へ進み、真因（初期化通知の送信失敗）とは別の
+    // エラーとして誤って報告され得る。送信失敗は直ちに `Outcome::Error` で
+    // 返す（fail-closed。coding-rust.md「外部入力の経路では unwrap を使わず
+    // 明示的に処理する」）。
+    if let Err(e) = client.notify("notifications/initialized", "{}") {
+        drop(client.guard);
+        return Outcome::Error(format!(
+            "{}: mcp notifications/initialized failed: {e}",
+            target.name
+        ));
+    }
 
     // レビュー指摘 P1: line 555。以前は goto・html・tree の失敗サイトを
     // 無言で `continue` して除外し、残ったサイトだけの中央値を
