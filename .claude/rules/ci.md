@@ -21,6 +21,7 @@ cargo test --workspace
 
 - 既定ビルドに Servo が含まれないことを `cargo tree` で検証する（RENDER-1）
 - ライセンス検査は `cargo deny check licenses` で行う（[licensing](./licensing.md)）
+- 許可外ライセンス（GPL/AGPL/LGPL/MPL-2.0・ライセンス未記載）を持つ canary を `cargo deny` が reject することを `make check-deny-license-reject` で検証する（TASK-9.1・REPAIR-8）
 
 ## ワークフロー変更時の注意
 
