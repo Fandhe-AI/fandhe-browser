@@ -53,6 +53,32 @@ publish = false
 [workspace.dependencies]
 fandhe-browser-render = { path = "crates/fandhe-browser-render" }
 
+# TASK-24.2（Issue #36・ビヘイビア CORE-1）: fetch モジュールの HTTP クライアント。
+# Issue #35（TASK-24.hdep）で採用承認済み（2026-09-25）。crypto provider は
+# aws-lc-rs（cmake・NASM を要し musl でも問題がある）を避け、ring を明示 install
+# する方針のため rustls は provider 未同梱の `rustls-no-provider` で導入する。
+reqwest = { version = "=0.13.5", default-features = false, features = [
+  "rustls-no-provider",
+] }
+# `fandhe-browser-core::fetch` が `rustls::crypto::ring::default_provider()` を
+# 1 回だけ install するために直接依存する（reqwest 自体は provider を同梱しない
+# ため、ここで ring feature を有効にした rustls を明示的に引き込む）。
+rustls = { version = "=0.23.45", default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+] }
+# `reqwest`（hyper 経由）は既に tokio へ通常の推移依存として依存しており、
+# ここでの直接依存は `fandhe-browser-core` の dev-dependencies のみ（結合
+# テスト `tests/fetch.rs` が `#[tokio::test]` を使うため）。`Fetcher::get`
+# 自体はランタイムを内蔵せず async fn として提供するが、呼び出し元（cdp・
+# CLI 等）は tokio ランタイム上で await する契約とする（reqwest/hyper が
+# tokio 前提のため。呼び出し元がランタイムを保有する）。
+tokio = { version = "=1.53.1", default-features = false, features = [
+  "rt",
+  "macros",
+] }
+
 [profile.release]
 # release ビルドは panic 発生時に unwind せず即座に中断する前提
 # （coding-rust.md「release は panic = "abort" 前提のため catch_unwind に頼らない」）。
