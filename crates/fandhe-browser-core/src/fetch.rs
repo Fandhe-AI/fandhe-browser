@@ -1185,4 +1185,143 @@ mod tests {
             release_dns_resolution_slot();
         }
     }
+
+    /// CORE-1（#37。TASK-24.3・MS-1）: `FetchOptions::default()`（`FetchOptions::new()`
+    /// と同義）が具体値の既定値を返す（REPAIR-4「戻り値は具体値で書く」の
+    /// 単体確認。既存の結合テストはこれらの既定値を前提にするだけで、値
+    /// そのものは検証していなかった）。
+    #[test]
+    fn core_1_fetch_options_default_values() {
+        let options = FetchOptions::default();
+        assert_eq!(options.timeout, Duration::from_secs(30));
+        assert_eq!(options.connect_timeout, Duration::from_secs(10));
+        assert_eq!(options.max_redirects, 10);
+        assert_eq!(options.max_body_bytes, 16 * 1024 * 1024);
+        assert!(!options.allow_private_network_access);
+
+        let via_new = FetchOptions::new();
+        assert_eq!(via_new.timeout, options.timeout);
+        assert_eq!(via_new.connect_timeout, options.connect_timeout);
+        assert_eq!(via_new.max_redirects, options.max_redirects);
+        assert_eq!(via_new.max_body_bytes, options.max_body_bytes);
+        assert_eq!(
+            via_new.allow_private_network_access,
+            options.allow_private_network_access
+        );
+    }
+
+    /// CORE-1（#37。TASK-24.3・MS-1）: 各 `with_*` ビルダーが対応フィールドを
+    /// 指定した具体値に設定する（他のフィールドは既定値のまま変わらない）。
+    #[test]
+    fn core_1_fetch_options_builders_set_fields() {
+        let options = FetchOptions::new()
+            .with_timeout(Duration::from_millis(1234))
+            .with_connect_timeout(Duration::from_millis(567))
+            .with_max_redirects(3)
+            .with_max_body_bytes(2048)
+            .with_allow_private_network_access(true);
+
+        assert_eq!(options.timeout, Duration::from_millis(1234));
+        assert_eq!(options.connect_timeout, Duration::from_millis(567));
+        assert_eq!(options.max_redirects, 3);
+        assert_eq!(options.max_body_bytes, 2048);
+        assert!(options.allow_private_network_access);
+    }
+
+    /// CORE-1（#37。TASK-24.3・MS-1）: `FetchOptions::validate` はゼロ値の
+    /// `timeout`・`connect_timeout`・`max_body_bytes` それぞれについて
+    /// `Error::InvalidInput` を返し、`message` にフィールド名を含む
+    /// （既存の結合テスト `core_1_fetcher_new_rejects_zero_*` はバリアントの
+    /// 種類のみ確認していたため、メッセージの具体値でここを補強する）。
+    #[test]
+    fn core_1_validate_rejects_zero_values_with_message() {
+        let cases: [(FetchOptions, &str); 3] = [
+            (FetchOptions::new().with_timeout(Duration::ZERO), "timeout"),
+            (
+                FetchOptions::new().with_connect_timeout(Duration::ZERO),
+                "connect_timeout",
+            ),
+            (FetchOptions::new().with_max_body_bytes(0), "max_body_bytes"),
+        ];
+        for (options, expected_field) in cases {
+            match options.validate() {
+                Ok(()) => panic!("{expected_field} = 0 は InvalidInput になるはず"),
+                Err(Error::InvalidInput { message }) => {
+                    assert!(
+                        message.contains(expected_field),
+                        "message は {expected_field:?} を含むはず: {message}"
+                    );
+                }
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+    }
+
+    /// CORE-1（#37。TASK-24.3・MS-1）: `reject_disallowed_scheme` は `http`/`https`
+    /// を許可し、それ以外（`file`・`data`・`javascript`・`ftp`・`ws`・`about`）
+    /// を `Error::DisallowedScheme { scheme }` として拒否する
+    /// （テーブル駆動。security.md「SSRF」）。
+    #[test]
+    fn core_1_reject_disallowed_scheme_table() {
+        let allowed = ["http://example.com/", "https://example.com/"];
+        for url in allowed {
+            let parsed = Url::parse(url).expect("valid URL");
+            assert!(
+                reject_disallowed_scheme(&parsed).is_ok(),
+                "{url} は許可されるはず"
+            );
+        }
+
+        let disallowed = [
+            ("file:///etc/passwd", "file"),
+            ("data:text/html,x", "data"),
+            ("javascript:alert(1)", "javascript"),
+            ("ftp://example.com/", "ftp"),
+            ("ws://example.com/", "ws"),
+            ("about:blank", "about"),
+        ];
+        for (url, expected_scheme) in disallowed {
+            let parsed = Url::parse(url).expect("valid URL");
+            match reject_disallowed_scheme(&parsed) {
+                Ok(()) => panic!("{url} は拒否されるはず"),
+                Err(Error::DisallowedScheme { scheme }) => {
+                    assert_eq!(scheme, expected_scheme, "unexpected scheme for {url}");
+                }
+                Err(other) => panic!("unexpected error for {url}: {other:?}"),
+            }
+        }
+    }
+
+    /// CORE-1（#37。TASK-24.3・MS-1）: `reject_disallowed_address` は
+    /// `allow_private_network_access` の値で挙動を切り替える。
+    /// - `false`（既定）: ループバック IP リテラルを `DisallowedAddress` で拒否
+    /// - `true`（opt-in）: 同じループバック IP リテラルを許可
+    /// - host が DNS 名（IP リテラルでない）の場合は `allow` の値に関わらず
+    ///   `Ok`（[`SafeResolver`] が解決結果側で別途検証するため、この関数の
+    ///   責務範囲外であることの確認）
+    #[test]
+    fn core_1_reject_disallowed_address_bypassed_when_opted_in() {
+        let loopback = Url::parse("http://127.0.0.1:8080/").expect("valid URL");
+        match reject_disallowed_address(&loopback, false) {
+            Ok(()) => panic!("既定ではループバック IP リテラルは拒否されるはず"),
+            Err(Error::DisallowedAddress { address }) => {
+                assert_eq!(address, "127.0.0.1");
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            reject_disallowed_address(&loopback, true).is_ok(),
+            "opt-in 時はループバック IP リテラルが許可されるはず"
+        );
+
+        let domain = Url::parse("http://example.com/").expect("valid URL");
+        assert!(
+            reject_disallowed_address(&domain, false).is_ok(),
+            "DNS 名の host は allow=false でも Ok（SafeResolver が別途検証する）はず"
+        );
+        assert!(
+            reject_disallowed_address(&domain, true).is_ok(),
+            "DNS 名の host は allow=true でも Ok のはず"
+        );
+    }
 }
