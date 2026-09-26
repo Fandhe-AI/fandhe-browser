@@ -1,6 +1,6 @@
 //! `parse`（TASK-24.4・#38）→ `dom`（TASK-24.5・#39）の結合を、crate 外から
 //! 代表的な HTML 断片の**具体値**で検証する結合テスト（TASK-24.6・#40・
-//! ビヘイビア `CORE-1`）。
+//! ビヘイビア `CORE-1`・MS-1）。
 //!
 //! `tests/parse.rs`（`parse_document`/`parse_document_bytes` の `Ok`/`Err`
 //! 契約）・`tests/dom.rs`（走査 API を crate 外から呼べることの最小確認）に
