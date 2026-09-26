@@ -247,8 +247,10 @@ fn set_dir_permissions_0700(path: &Path) -> Result<(), ProfileError> {
         });
     }
 
-    // ディレクトリは `File::open` で読み取り用にオープンできる（Unix では
-    // ディレクトリの内容を読む権限が無くても open 自体は成功する）。
+    // ディレクトリを `File::open` でオープンし、fd 経由で fstat する
+    // （実体確認のため。read (r) ビットが無ければここで EACCES となり、
+    // `?` によりエラーとして呼び出し元へ伝播する。fail-closed のため
+    // 実害はないが、open 自体が権限非依存で成功するわけではない）。
     let dir = std::fs::File::open(path)?;
     let fd_meta = dir.metadata()?;
 
