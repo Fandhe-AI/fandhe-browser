@@ -5,7 +5,14 @@
 //! HTTP/1.1 応答を返すテストサーバーだけを使う（CI の決定性のため）。
 //! `parse` モジュール（#38）等の網羅的なケースは #37（TASK-24.3）に委ね、
 //! ここでは受け入れ基準（タイムアウト・リダイレクト上限・本文上限・
-//! scheme 拒否・正常系）の最低限を確認する。
+//! scheme 拒否・内部アドレス拒否・正常系）の最低限を確認する。
+//!
+//! ループバック（`127.0.0.1`）はそれ自体が内部アドレスであるため、既定
+//! （`FetchOptions::allow_private_network_access == false`）ではテスト
+//! サーバーへの接続自体が拒否されてしまう。ループバック接続の正常系を
+//! 検証するテストはすべて [`loopback_allowed_options`] で明示的に
+//! opt-in する（内部アドレス拒否そのものを検証するテストは opt-in せず、
+//! 既定値のまま `Error::DisallowedAddress` を確認する）。
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -40,6 +47,13 @@ fn drain_request_head(stream: &mut TcpStream) {
     }
 }
 
+/// ループバック（内部アドレス）への接続を明示的に許可した [`FetchOptions`]
+/// を返す。本ファイルのテストサーバーはすべて `127.0.0.1` で待ち受けるため、
+/// SSRF 拒否そのものを検証するテスト以外はこれを起点に組み立てる。
+fn loopback_allowed_options() -> FetchOptions {
+    FetchOptions::new().with_allow_private_network_access(true)
+}
+
 /// `127.0.0.1` の空きポートへ bind し、接続ごとに `handler` を新しい
 /// スレッドで呼び出すループバックサーバーを起動する。戻り値は bind した
 /// ポート番号（`http://127.0.0.1:<port>/` の組み立てに使う）。
@@ -68,7 +82,7 @@ async fn core_1_fetch_errors_on_timeout() {
         thread::sleep(Duration::from_secs(3));
     });
 
-    let options = FetchOptions::new().with_timeout(Duration::from_millis(200));
+    let options = loopback_allowed_options().with_timeout(Duration::from_millis(200));
     let fetcher = Fetcher::new(options).expect("Fetcher::new が失敗しないこと");
 
     let err = fetcher
@@ -100,7 +114,7 @@ async fn core_1_fetch_errors_on_too_many_redirects() {
         }
     });
 
-    let options = FetchOptions::new().with_max_redirects(3);
+    let options = loopback_allowed_options().with_max_redirects(3);
     let fetcher = Fetcher::new(options).expect("Fetcher::new が失敗しないこと");
 
     let err = fetcher
@@ -125,7 +139,7 @@ async fn core_1_fetch_rejects_oversized_content_length() {
         let _ = stream.write_all(head.as_bytes());
     });
 
-    let options = FetchOptions::new().with_max_body_bytes(1024);
+    let options = loopback_allowed_options().with_max_body_bytes(1024);
     let fetcher = Fetcher::new(options).expect("Fetcher::new が失敗しないこと");
 
     let err = fetcher
@@ -152,7 +166,7 @@ async fn core_1_fetch_rejects_oversized_streamed_body() {
         let _ = stream.write_all(&body);
     });
 
-    let options = FetchOptions::new().with_max_body_bytes(1024);
+    let options = loopback_allowed_options().with_max_body_bytes(1024);
     let fetcher = Fetcher::new(options).expect("Fetcher::new が失敗しないこと");
 
     let err = fetcher
@@ -193,7 +207,7 @@ async fn core_1_fetch_rejects_disallowed_scheme_via_redirect() {
         let _ = stream.write_all(body.as_bytes());
     });
 
-    let fetcher = Fetcher::new(FetchOptions::new()).expect("Fetcher::new が失敗しないこと");
+    let fetcher = Fetcher::new(loopback_allowed_options()).expect("Fetcher::new が失敗しないこと");
 
     let err = fetcher
         .get(&format!("http://127.0.0.1:{port}/"))
@@ -219,7 +233,7 @@ async fn core_1_fetch_rejects_disallowed_scheme_via_redirect_policy() {
         let _ = stream.write_all(body.as_bytes());
     });
 
-    let fetcher = Fetcher::new(FetchOptions::new()).expect("Fetcher::new が失敗しないこと");
+    let fetcher = Fetcher::new(loopback_allowed_options()).expect("Fetcher::new が失敗しないこと");
 
     let err = fetcher
         .get(&format!("http://127.0.0.1:{port}/"))
@@ -263,7 +277,7 @@ async fn core_1_fetch_ok_when_redirects_equal_max_redirects() {
         }
     });
 
-    let options = FetchOptions::new().with_max_redirects(MAX_REDIRECTS);
+    let options = loopback_allowed_options().with_max_redirects(MAX_REDIRECTS);
     let fetcher = Fetcher::new(options).expect("Fetcher::new が失敗しないこと");
 
     let ok = fetcher
@@ -293,7 +307,7 @@ async fn core_1_fetch_errors_immediately_when_max_redirects_is_zero() {
         }
     });
 
-    let options = FetchOptions::new().with_max_redirects(0);
+    let options = loopback_allowed_options().with_max_redirects(0);
     let fetcher = Fetcher::new(options).expect("Fetcher::new が失敗しないこと");
 
     let err = fetcher
@@ -385,7 +399,7 @@ async fn core_1_fetch_ok_returns_status_and_body() {
         let _ = stream.write_all(head.as_bytes());
     });
 
-    let fetcher = Fetcher::new(FetchOptions::new()).expect("Fetcher::new が失敗しないこと");
+    let fetcher = Fetcher::new(loopback_allowed_options()).expect("Fetcher::new が失敗しないこと");
 
     let ok = fetcher
         .get(&format!("http://127.0.0.1:{ok_port}/"))
@@ -403,4 +417,66 @@ async fn core_1_fetch_ok_returns_status_and_body() {
         .expect("404 応答も Ok になるはず（4xx/5xx はエラー扱いしない）");
     assert_eq!(not_found.status(), 404);
     assert_eq!(not_found.body(), b"");
+}
+
+/// CORE-1（#36。PR #430 コードレビュー指摘）: `allow_private_network_access`
+/// が既定（`false`）のとき、取得先がループバック（`127.0.0.1`）へ解決される
+/// 場合は接続前に `Error::DisallowedAddress` を返す（security.md「SSRF」）。
+#[tokio::test]
+async fn core_1_fetch_rejects_loopback_address_by_default() {
+    let port = spawn_loopback_server(|mut stream| {
+        drain_request_head(&mut stream);
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(head.as_bytes());
+    });
+
+    let fetcher = Fetcher::new(FetchOptions::new()).expect("Fetcher::new が失敗しないこと");
+
+    let err = fetcher
+        .get(&format!("http://127.0.0.1:{port}/"))
+        .await
+        .expect_err("既定ではループバックへの接続は拒否されるはず");
+    assert!(
+        matches!(err, Error::DisallowedAddress { ref address } if address == "127.0.0.1"),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// CORE-1（#36。PR #430 コードレビュー指摘）: `allow_private_network_access`
+/// を `true` にすると、ループバックへの接続が既定の拒否を回避して成功する
+/// （opt-in の動作確認）。
+#[tokio::test]
+async fn core_1_fetch_allows_loopback_when_opted_in() {
+    let port = spawn_loopback_server(|mut stream| {
+        drain_request_head(&mut stream);
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(b"ok");
+    });
+
+    let fetcher = Fetcher::new(loopback_allowed_options()).expect("Fetcher::new が失敗しないこと");
+
+    let ok = fetcher
+        .get(&format!("http://127.0.0.1:{port}/"))
+        .await
+        .expect("opt-in 時はループバックへの接続が成功するはず");
+    assert_eq!(ok.status(), 200);
+    assert_eq!(ok.body(), b"ok");
+}
+
+/// CORE-1（#36。PR #430 コードレビュー指摘）: IP リテラル host（DNS を
+/// 介さない）でも `SafeResolver` が同じ拒否を適用する（`Url::parse` を通した
+/// IPv4 リテラルが `ToSocketAddrs` でそのまま解決される経路の確認）。
+#[tokio::test]
+async fn core_1_fetch_rejects_ipv4_literal_loopback_by_default() {
+    let fetcher = Fetcher::new(FetchOptions::new()).expect("Fetcher::new が失敗しないこと");
+
+    let err = fetcher
+        .get("http://127.0.0.1:1/")
+        .await
+        .expect_err("IP リテラルのループバックも既定では拒否されるはず");
+    assert!(
+        matches!(err, Error::DisallowedAddress { ref address } if address == "127.0.0.1"),
+        "unexpected error: {err:?}"
+    );
 }

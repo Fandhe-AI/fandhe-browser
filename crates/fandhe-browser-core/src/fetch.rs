@@ -11,6 +11,15 @@
 //!   を返す
 //! - `http`/`https` 以外の scheme（`file:` 等）は要求前・リダイレクト先の
 //!   両方で拒否する
+//! - 取得先の接続先アドレス（初回リクエスト・各リダイレクト先の双方、かつ
+//!   DNS 解決結果・IP リテラル host の双方）がループバック・プライベート
+//!   アドレス等の内部アドレスである場合、
+//!   [`FetchOptions::allow_private_network_access`] が `false`（既定）なら
+//!   拒否する（DNS 名は [`SafeResolver`]、IP リテラル host は
+//!   [`reject_disallowed_address`]。IP リテラルは hyper-util が DNS 解決を
+//!   経由せず直接使うため `SafeResolver` だけでは検出できない。
+//!   security.md「SSRF」）。ブラウザでは `localhost` への到達も正当な用途が
+//!   あるため、呼び出し側が明示的に opt-in できるようにする
 //! - 外部入力の経路（レスポンスヘッダ・本文）で `unwrap`/`expect`/添字アクセス
 //!   を使わない
 //!
@@ -21,16 +30,19 @@
 //! ## 本 Issue（#36）の範囲外（将来仕様。REPAIR-3: 実装済みを装わない）
 //!
 //! - ローカルファイル（`file:`）の取得: 受け入れ基準外のため対応しない
-//! - 内部・プライベートアドレスへのアクセス制御（SSRF の深掘り）: ブラウザでは
-//!   `localhost` への到達も正当な用途があるため、方針は人間の判断事項とする
+//! - DNS リバインディング対策の強化（TOCTOU）: [`SafeResolver`] は解決の
+//!   都度アドレスを検証するため多くのケースは防げるが、解決結果と実際の
+//!   TCP 接続確立の間に別 IP へ切り替わる極端な race までは保証しない
 //! - Cookie セッション維持（ビヘイビア CORE-5 (8)）
 //! - 文字コード判定（ビヘイビア CORE-5 (7)）: 本文は常にバイト列で返す
 //! - gzip 等の展開・HTTP/2・プロキシ設定: 挙動の決定性を優先し、`no_proxy()`
 //!   で環境変数のプロキシ設定を無視する
 
-use std::sync::OnceLock;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect::Policy;
 use reqwest::{Client, ClientBuilder, Url};
 
@@ -75,6 +87,17 @@ pub struct FetchOptions {
     /// 許可する最大レスポンス本文サイズ（バイト）。`Content-Length` による
     /// 事前検査と、ストリーミング読み込み中の逐次検査の両方で使う。
     pub max_body_bytes: u64,
+    /// ループバック・プライベートアドレス等の内部アドレスへの接続を許可
+    /// するか（既定 `false` = 拒否）。
+    ///
+    /// `false` の場合、初回リクエスト・各リダイレクト先の双方について、
+    /// DNS 名は解決結果を（[`SafeResolver`]）、IP リテラル host はそのまま
+    /// （[`reject_disallowed_address`]）検査し、内部アドレスであれば接続前に
+    /// [`Error::DisallowedAddress`] を返す（security.md「SSRF」）。ブラウザ的
+    /// な用途では `localhost`（開発サーバー等）への到達が正当な場合がある
+    /// ため、呼び出し側が明示的に `true` を設定すれば許可できる。既定は
+    /// 安全側（拒否）に倒す。
+    pub allow_private_network_access: bool,
 }
 
 impl Default for FetchOptions {
@@ -84,6 +107,7 @@ impl Default for FetchOptions {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             max_redirects: DEFAULT_MAX_REDIRECTS,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            allow_private_network_access: false,
         }
     }
 }
@@ -119,6 +143,15 @@ impl FetchOptions {
     #[must_use]
     pub fn with_max_body_bytes(mut self, max_body_bytes: u64) -> Self {
         self.max_body_bytes = max_body_bytes;
+        self
+    }
+
+    /// ループバック・プライベートアドレス等の内部アドレスへの接続許可を
+    /// 設定する（既定 `false`。`true` にすると `localhost` 等の開発用途を
+    /// 許可する。security.md「SSRF」・[`FetchOptions::allow_private_network_access`]）。
+    #[must_use]
+    pub fn with_allow_private_network_access(mut self, allow_private_network_access: bool) -> Self {
+        self.allow_private_network_access = allow_private_network_access;
         self
     }
 
@@ -179,8 +212,21 @@ fn ensure_crypto_provider_installed() {
 /// 後、`Error::TooManyRedirects`/`Error::DisallowedScheme` へ書き換える）。
 #[derive(Debug)]
 enum RedirectMarker {
-    TooManyRedirects { limit: usize },
-    DisallowedScheme { scheme: String },
+    TooManyRedirects {
+        limit: usize,
+    },
+    DisallowedScheme {
+        scheme: String,
+    },
+    /// リダイレクト先の host が IP リテラルで、かつループバック・
+    /// プライベートアドレス等の内部アドレスである場合（security.md
+    /// 「SSRF」）。[`SafeResolver`] は IP リテラル host に対しては呼ばれない
+    /// （hyper-util の `HttpConnector` が IP リテラルを DNS 解決なしで直接
+    /// 使うため。`try_parse` 経路）ため、`Policy::custom` 側でも
+    /// [`reject_disallowed_address`] を呼んで同じ検証をする。
+    DisallowedAddress {
+        address: String,
+    },
 }
 
 impl std::fmt::Display for RedirectMarker {
@@ -192,11 +238,105 @@ impl std::fmt::Display for RedirectMarker {
             RedirectMarker::DisallowedScheme { scheme } => {
                 write!(f, "disallowed redirect scheme: {scheme}")
             }
+            RedirectMarker::DisallowedAddress { address } => {
+                write!(f, "disallowed redirect target address: {address}")
+            }
         }
     }
 }
 
 impl std::error::Error for RedirectMarker {}
+
+/// [`SafeResolver`] が内部アドレスを検出したときに埋め込む非公開マーカー。
+/// `RedirectMarker` と同じ downcast の仕組み（[`map_reqwest_error`]）で
+/// [`Error::DisallowedAddress`] へ書き換える。
+#[derive(Debug)]
+struct DisallowedAddressMarker {
+    address: IpAddr,
+}
+
+impl std::fmt::Display for DisallowedAddressMarker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "disallowed target address: {}", self.address)
+    }
+}
+
+impl std::error::Error for DisallowedAddressMarker {}
+
+/// [`reqwest::dns::Resolve`] へ渡す `BoxError`（`reqwest` 内部の型 alias は
+/// `pub(crate)` のため名指しできず、同じ具象型を直接綴る）。
+type DnsBoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// IPv4 アドレスがループバック・プライベート・リンクローカル・未指定・
+/// ブロードキャスト・ドキュメント用のいずれかに該当するかを判定する
+/// （security.md「SSRF」: 内部アドレスの無検証アクセスを避けるための
+/// 分類。すべて `std` の安定 API のみを使う）。
+fn is_disallowed_ipv4(v4: Ipv4Addr) -> bool {
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+}
+
+/// [`IpAddr`] が内部アドレス（ループバック・プライベートアドレス等）か
+/// どうかを判定する（[`SafeResolver`] から使う）。IPv6 の v4-mapped
+/// アドレス（`::ffff:a.b.c.d`）は埋め込まれた IPv4 アドレスとして判定し、
+/// v4 側の分類をすり抜けられないようにする。
+fn is_disallowed_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_disallowed_ipv4(v4),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.to_ipv4_mapped().is_some_and(is_disallowed_ipv4)
+        }
+    }
+}
+
+/// [`Fetcher::new`] が `ClientBuilder::dns_resolver` へ渡すカスタムリゾルバ。
+///
+/// `http`/`https` の全接続（初回リクエスト・リダイレクト先の双方）は必ず
+/// このリゾルバの [`Resolve::resolve`] を経由するため、`Policy::custom`
+/// （scheme 検査）と異なりリダイレクト先ごとの個別配線を要さず、ここ 1 箇所
+/// で「取得先とリダイレクト先の内部アドレスを検証する」（security.md
+/// 「SSRF」）を満たす。host が IP リテラルの場合は DNS を介さずそのまま
+/// 検証される（`std::net::ToSocketAddrs` が IP リテラルをそのまま返すため）。
+///
+/// DNS 解決は `std::net::ToSocketAddrs`（システムの getaddrinfo）を直接
+/// await 前の非同期ブロック内で同期呼び出しする。本 crate は tokio を直接の
+/// 依存に持たない（`fandhe-browser-core/Cargo.toml`: tokio は結合テスト用の
+/// dev-dependency のみ。dependency-policy.md によりユーザー承認なしに
+/// 依存を追加できない）ため、reqwest 既定の `GaiResolver` のような
+/// `spawn_blocking` へのオフロードは行わない。DNS 解決のレイテンシは
+/// `FetchOptions::connect_timeout` の範囲内に収まる前提の妥協である。
+struct SafeResolver {
+    allow_private_network_access: bool,
+}
+
+impl Resolve for SafeResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let allow_private_network_access = self.allow_private_network_access;
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // ポートは `reqwest` が URL 由来の値で上書きする契約（`Resolve`
+            // のドキュメント）のため、ここでは 0 を渡す。
+            let addrs: Vec<SocketAddr> = (host.as_str(), 0u16)
+                .to_socket_addrs()
+                .map_err(|source| Box::new(source) as DnsBoxError)?
+                .collect();
+            if !allow_private_network_access
+                && let Some(addr) = addrs.iter().find(|addr| is_disallowed_address(addr.ip()))
+            {
+                return Err(Box::new(DisallowedAddressMarker { address: addr.ip() }) as DnsBoxError);
+            }
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
 
 impl Fetcher {
     /// `options` を検証したうえで `Fetcher` を構築する。
@@ -212,6 +352,7 @@ impl Fetcher {
         options.validate()?;
 
         let max_redirects = options.max_redirects;
+        let allow_private_network_access = options.allow_private_network_access;
         let redirect_policy = Policy::custom(move |attempt| {
             if attempt.previous().len() > max_redirects {
                 return attempt.error(RedirectMarker::TooManyRedirects {
@@ -220,18 +361,37 @@ impl Fetcher {
             }
             let scheme = attempt.url().scheme().to_string();
             match scheme.as_str() {
-                "http" | "https" => attempt.follow(),
-                other => attempt.error(RedirectMarker::DisallowedScheme {
-                    scheme: other.to_string(),
-                }),
+                "http" | "https" => {}
+                other => {
+                    return attempt.error(RedirectMarker::DisallowedScheme {
+                        scheme: other.to_string(),
+                    });
+                }
             }
+            // `SafeResolver` は DNS 名の解決結果しか検証しない（IP リテラル
+            // host は hyper-util が DNS 解決を経由せず直接使うため）。
+            // リダイレクト先の host が IP リテラルの場合はここで直接検証する
+            // （`reject_disallowed_address` のドキュメント参照）。
+            if let Some(ip) = url_ip_literal(attempt.url())
+                && !allow_private_network_access
+                && is_disallowed_address(ip)
+            {
+                return attempt.error(RedirectMarker::DisallowedAddress {
+                    address: ip.to_string(),
+                });
+            }
+            attempt.follow()
         });
 
+        let resolver = Arc::new(SafeResolver {
+            allow_private_network_access: options.allow_private_network_access,
+        });
         let client = ClientBuilder::new()
             .timeout(options.timeout)
             .connect_timeout(options.connect_timeout)
             .redirect(redirect_policy)
             .no_proxy()
+            .dns_resolver(resolver)
             .user_agent(concat!("fandhe-browser/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|source| map_reqwest_error(source, &options))?;
@@ -249,6 +409,11 @@ impl Fetcher {
     /// - `url` を [`reqwest::Url`] として解析し、`http`/`https` 以外の
     ///   scheme（`file:`・`data:` 等）は送信前に [`Error::DisallowedScheme`]
     ///   として拒否する（解析失敗は [`Error::InvalidInput`]）
+    /// - `url` の host が IP リテラルで、かつ
+    ///   `FetchOptions::allow_private_network_access` が `false`（既定）の
+    ///   ときループバック・プライベートアドレス等であれば、送信前に
+    ///   [`Error::DisallowedAddress`] として拒否する
+    ///   （[`reject_disallowed_address`]。security.md「SSRF」）
     /// - `Content-Length` ヘッダが `max_body_bytes` を超える場合は本文を
     ///   読まずに [`Error::ResponseTooLarge`] を返す（(a) 事前検査）
     /// - ヘッダが無い・嘘の値でも、`chunk()` による逐次読み込み中に蓄積
@@ -261,6 +426,7 @@ impl Fetcher {
             message: format!("invalid URL: {source}"),
         })?;
         reject_disallowed_scheme(&parsed)?;
+        reject_disallowed_address(&parsed, self.options.allow_private_network_access)?;
 
         let response = self
             .client
@@ -354,6 +520,44 @@ fn reject_disallowed_scheme(url: &Url) -> Result<()> {
     }
 }
 
+/// `url` の host が IP リテラルの場合に取り出す。ホスト名（DNS 名）の場合は
+/// `None`（[`SafeResolver`] が DNS 解決時に検証するため、ここでは扱わない）。
+///
+/// `url` クレート（`reqwest::Url` の実体）は `pub(crate)`／`reqwest` が
+/// 型を再公開していない `url::Host` を返す `Url::host()` の代わりに、
+/// `Url::host_str()`（IPv6 は `[` `]` 付き。`Ipv6Addr` は `[`/`]` を含む
+/// 文字列を `FromStr` で受理しないため `trim_matches` で除去してから解析
+/// する）を経由して `IpAddr::parse` する。ホスト名（DNS 名）は
+/// `IpAddr::parse` が `Err` になるため自然に `None` へ落ちる。
+fn url_ip_literal(url: &Url) -> Option<IpAddr> {
+    let host = url.host_str()?;
+    let trimmed = host.trim_start_matches('[').trim_end_matches(']');
+    trimmed.parse().ok()
+}
+
+/// `url` の host が IP リテラルで、かつループバック・プライベートアドレス
+/// 等の内部アドレスである場合に拒否する（security.md「SSRF」）。
+///
+/// [`SafeResolver`] は DNS 名の解決結果を検証するが、hyper-util の
+/// `HttpConnector` は host が既に IP リテラルであれば DNS 解決を経由せず
+/// 直接そのアドレスへ接続する（`dns::SocketAddrs::try_parse` が成功する
+/// 経路）ため、[`Resolve::resolve`] は一切呼ばれない。そのため IP リテラル
+/// host は本関数で個別に検証する必要がある（`Fetcher::get` の初回リクエスト
+/// と `Policy::custom` のリダイレクト先の両方から呼ぶ）。
+fn reject_disallowed_address(url: &Url, allow_private_network_access: bool) -> Result<()> {
+    if allow_private_network_access {
+        return Ok(());
+    }
+    if let Some(ip) = url_ip_literal(url)
+        && is_disallowed_address(ip)
+    {
+        return Err(Error::DisallowedAddress {
+            address: ip.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// `Fetcher::new` のリダイレクトポリシー（`Policy::custom`）が発火しない
 /// リダイレクトを検出し、scheme を検証する。
 ///
@@ -398,6 +602,11 @@ fn reject_unresolved_disallowed_redirect(response: &reqwest::Response) -> Result
 ///   （`TooManyRedirects`/`DisallowedScheme` は `Policy::custom`
 ///   （[`RedirectMarker`] downcast 経路）からしか出さないことで、レビューで
 ///   両者を区別できるようにする）
+/// - [`SafeResolver`] が内部アドレスを検出したエラーは、同じ `source()` 走査
+///   で [`DisallowedAddressMarker`] へ `downcast_ref` できれば
+///   [`Error::DisallowedAddress`] に写像する（`reqwest` は DNS リゾルバの
+///   エラーを `DnsError`（`source()` で内側のエラーへ連鎖する）でラップして
+///   返すため、`RedirectMarker` と同じ走査ループで検出できる）
 /// - それ以外は `without_url()` で URL（userinfo・クエリを含み得る）を
 ///   取り除いたメッセージを [`Error::Network`] に詰める（外部型
 ///   `reqwest::Error` 自体は保持しない）
@@ -418,6 +627,14 @@ fn map_reqwest_error(source: reqwest::Error, options: &FetchOptions) -> Error {
                 RedirectMarker::DisallowedScheme { scheme } => Error::DisallowedScheme {
                     scheme: scheme.clone(),
                 },
+                RedirectMarker::DisallowedAddress { address } => Error::DisallowedAddress {
+                    address: address.clone(),
+                },
+            };
+        }
+        if let Some(marker) = err.downcast_ref::<DisallowedAddressMarker>() {
+            return Error::DisallowedAddress {
+                address: marker.address.to_string(),
             };
         }
         cause = err.source();
@@ -472,5 +689,144 @@ impl FetchResponse {
     /// 留まる。
     pub fn body_text_lossy(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    /// CORE-1（#36。PR #430 コードレビュー指摘）: `url_ip_literal` が IPv4
+    /// リテラル host を `IpAddr` として取り出す。
+    #[test]
+    fn core_1_url_ip_literal_extracts_ipv4() {
+        let url = Url::parse("http://127.0.0.1:8080/").expect("valid URL");
+        assert_eq!(
+            url_ip_literal(&url),
+            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+        );
+    }
+
+    /// CORE-1（#36。PR #430 コードレビュー指摘）: `url_ip_literal` が IPv6
+    /// リテラル host（`[` `]` 付き）を `IpAddr` として取り出す。
+    #[test]
+    fn core_1_url_ip_literal_extracts_ipv6() {
+        let url = Url::parse("http://[::1]:8080/").expect("valid URL");
+        assert_eq!(url_ip_literal(&url), Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    /// CORE-1（#36。PR #430 コードレビュー指摘）: `url_ip_literal` は
+    /// ホスト名（DNS 名）に対しては `None` を返す（[`SafeResolver`] が別途
+    /// 検証するため、ここでは扱わない）。
+    #[test]
+    fn core_1_url_ip_literal_is_none_for_domain_name() {
+        let url = Url::parse("http://example.com/").expect("valid URL");
+        assert_eq!(url_ip_literal(&url), None);
+    }
+
+    /// CORE-1（#36。PR #430 コードレビュー指摘）: `is_disallowed_address` が
+    /// ループバック・プライベート・リンクローカル・未指定・ブロードキャスト
+    /// ・ドキュメント用の各 IPv4 アドレスを内部アドレスとして判定する
+    /// （security.md「SSRF」）。
+    #[test]
+    fn core_1_is_disallowed_address_detects_ipv4_categories() {
+        let disallowed = [
+            "127.0.0.1",       // loopback
+            "10.0.0.1",        // private (10/8)
+            "172.16.0.1",      // private (172.16/12)
+            "192.168.1.1",     // private (192.168/16)
+            "169.254.1.1",     // link-local
+            "0.0.0.0",         // unspecified
+            "255.255.255.255", // broadcast
+            "192.0.2.1",       // documentation (TEST-NET-1)
+        ];
+        for addr in disallowed {
+            let ip: IpAddr = addr.parse().expect("valid IPv4 literal");
+            assert!(is_disallowed_address(ip), "{addr} should be disallowed");
+        }
+    }
+
+    /// CORE-1（#36。PR #430 コードレビュー指摘）: `is_disallowed_address` は
+    /// グローバルに到達可能な IPv4 アドレスを内部アドレスとして誤判定しない。
+    #[test]
+    fn core_1_is_disallowed_address_allows_global_ipv4() {
+        let allowed = ["8.8.8.8", "1.1.1.1", "93.184.216.34"];
+        for addr in allowed {
+            let ip: IpAddr = addr.parse().expect("valid IPv4 literal");
+            assert!(!is_disallowed_address(ip), "{addr} should be allowed");
+        }
+    }
+
+    /// CORE-1（#36。PR #430 コードレビュー指摘）: `is_disallowed_address` は
+    /// IPv6 のループバック・ユニークローカル・リンクローカル、および
+    /// v4-mapped アドレス（`::ffff:127.0.0.1`）に埋め込まれた IPv4 側の
+    /// 分類のいずれもすり抜けない。
+    #[test]
+    fn core_1_is_disallowed_address_detects_ipv6_categories() {
+        let disallowed = [
+            "::1",              // loopback
+            "::",               // unspecified
+            "fc00::1",          // unique local
+            "fe80::1",          // unicast link-local
+            "::ffff:127.0.0.1", // v4-mapped loopback
+            "::ffff:10.0.0.1",  // v4-mapped private
+        ];
+        for addr in disallowed {
+            let ip: IpAddr = addr.parse().expect("valid IPv6 literal");
+            assert!(is_disallowed_address(ip), "{addr} should be disallowed");
+        }
+    }
+
+    /// CORE-1（#36。PR #430 コードレビュー指摘）: `is_disallowed_address` は
+    /// グローバルに到達可能な IPv6 アドレスを内部アドレスとして誤判定しない。
+    #[test]
+    fn core_1_is_disallowed_address_allows_global_ipv6() {
+        let ip: IpAddr = "2606:4700:4700::1111".parse().expect("valid IPv6 literal");
+        assert!(!is_disallowed_address(ip), "global IPv6 should be allowed");
+    }
+
+    /// CORE-1（#36。PR #430 コードレビュー指摘）: `SafeResolver::resolve` は
+    /// `allow_private_network_access == false`（既定）のとき、host が
+    /// ループバックの IP リテラルであれば
+    /// `DisallowedAddressMarker`（`downcast_ref` で判別できるマーカー）を
+    /// 返す。`Fetcher::get` はこのリゾルバを初回リクエスト・リダイレクト先の
+    /// 両方の接続で使う（[`Fetcher::new`] の `ClientBuilder::dns_resolver`）
+    /// ため、この単体テストは「接続の種類（初回かリダイレクト先か）に関係
+    /// なく同一の判定になる」ことをリゾルバ単体で保証する。
+    #[tokio::test]
+    async fn core_1_safe_resolver_rejects_loopback_by_default() {
+        let resolver = SafeResolver {
+            allow_private_network_access: false,
+        };
+        let name: Name = "127.0.0.1".parse().expect("valid resolver name");
+        // `Addrs`（`Ok` 側の型）は `Iterator` トレイトオブジェクトで `Debug`
+        // を実装しないため、`expect_err` は使えず `match` で判定する。
+        match resolver.resolve(name).await {
+            Ok(_) => panic!("既定ではループバックの解決結果は拒否されるはず"),
+            Err(err) => assert!(
+                err.downcast_ref::<DisallowedAddressMarker>().is_some(),
+                "unexpected error: {err}"
+            ),
+        }
+    }
+
+    /// CORE-1（#36。PR #430 コードレビュー指摘）: `SafeResolver::resolve` は
+    /// `allow_private_network_access == true` のとき、同じループバックの
+    /// host を許可する（opt-in の単体確認）。
+    #[tokio::test]
+    async fn core_1_safe_resolver_allows_loopback_when_opted_in() {
+        let resolver = SafeResolver {
+            allow_private_network_access: true,
+        };
+        let name: Name = "127.0.0.1".parse().expect("valid resolver name");
+        let mut addrs = resolver
+            .resolve(name)
+            .await
+            .expect("opt-in 時はループバックの解決結果が許可されるはず");
+        assert_eq!(
+            addrs.next().map(|addr| addr.ip()),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
     }
 }

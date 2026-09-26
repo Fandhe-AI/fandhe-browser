@@ -93,6 +93,18 @@ pub enum Error {
         /// 秘匿情報を含み得る）はここへ埋め込まない。
         scheme: String,
     },
+    /// `fetch::Fetcher::get` が、`FetchOptions::allow_private_network_access`
+    /// が `false`（既定）のときに、取得先または各リダイレクト先（DNS 名の
+    /// 解決結果・IP リテラル host のいずれか）がループバック・プライベート
+    /// アドレス等の内部アドレスであると判定した場合に返す（security.md
+    /// 「SSRF」）。DNS 名は `fetch::SafeResolver`、IP リテラル host は
+    /// `fetch::reject_disallowed_address` が、初回リクエスト・リダイレクト先
+    /// の双方で検証するため、この 1 variant で両方の経路をカバーする。
+    DisallowedAddress {
+        /// 拒否した解決先の IP アドレス文字列のみを保持する。ホスト名・
+        /// URL 全体（userinfo・パス等）はここへ埋め込まない。
+        address: String,
+    },
     /// `fetch::Fetcher` の内部 HTTP クライアント（`reqwest`）が返したエラーを
     /// 写像したもの。`reqwest::Error` は公開 API に出さず（外部クレートの
     /// 具象型を上位 crate へ漏らさない方針）、`without_url()` を通した後の
@@ -123,6 +135,9 @@ impl fmt::Display for Error {
             Error::DisallowedScheme { scheme } => {
                 write!(f, "disallowed URL scheme: {scheme}")
             }
+            Error::DisallowedAddress { address } => {
+                write!(f, "disallowed target address: {address}")
+            }
             Error::Network { message } => write!(f, "network error: {message}"),
         }
     }
@@ -139,6 +154,7 @@ impl std::error::Error for Error {
             | Error::TooManyRedirects { .. }
             | Error::ResponseTooLarge { .. }
             | Error::DisallowedScheme { .. }
+            | Error::DisallowedAddress { .. }
             | Error::Network { .. } => None,
         }
     }
@@ -299,6 +315,16 @@ mod tests {
         assert_eq!(err.to_string(), "disallowed URL scheme: file");
     }
 
+    /// CORE-1（TASK-24.2・#36）: `Error::DisallowedAddress` の `Display` が
+    /// アドレスのみを含む。
+    #[test]
+    fn core_1_display_disallowed_address_variant() {
+        let err = Error::DisallowedAddress {
+            address: "127.0.0.1".to_string(),
+        };
+        assert_eq!(err.to_string(), "disallowed target address: 127.0.0.1");
+    }
+
     /// CORE-1（TASK-24.2・#36）: `Error::Network` の `Display` がメッセージを
     /// 含む。
     #[test]
@@ -323,6 +349,9 @@ mod tests {
             },
             Error::DisallowedScheme {
                 scheme: "data".to_string(),
+            },
+            Error::DisallowedAddress {
+                address: "10.0.0.1".to_string(),
             },
             Error::Network {
                 message: "boom".to_string(),
