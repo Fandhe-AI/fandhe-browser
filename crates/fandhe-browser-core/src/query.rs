@@ -1047,7 +1047,7 @@ mod tests {
     }
 
     /// テスト用ヘルパー: `results` に含まれる各要素の `id` 属性値を文書順に
-    /// 並べて返す（TASK-24（24.8）・Issue #42）。件数だけの assert ではなく
+    /// 並べて返す（TASK-24（24.8）・MS-1・Issue #42）。件数だけの assert ではなく
     /// 具体的な id 列で結果を比較できるようにする。`id` を持たない要素は
     /// 番兵文字列 `"<none>"` にする（実在の id 値と衝突しない前提で、
     /// テスト fixture では常に検索対象の要素に一意な id を振る）。
@@ -1059,7 +1059,7 @@ mod tests {
     }
 
     /// テスト用ヘルパー: `(セレクタ, 期待する id 列)` の表を順に検証する
-    /// （TASK-24（24.8）・Issue #42）。失敗時にどのセレクタで落ちたかが
+    /// （TASK-24（24.8）・MS-1・Issue #42）。失敗時にどのセレクタで落ちたかが
     /// わかるよう、`assert_eq!` にセレクタ文字列を含める。
     fn assert_query_ids(doc: &Document, scope: NodeId, cases: &[(&str, &[&str])]) {
         for &(selector_text, expected) in cases {
@@ -1073,7 +1073,7 @@ mod tests {
     }
 
     /// CORE-1: 型セレクタは一致する要素すべてを文書順で返し、存在しない
-    /// 型名は空になる（TASK-24（24.8）・Issue #42）。
+    /// 型名は空になる（TASK-24（24.8）・MS-1・Issue #42）。
     #[test]
     fn core_1_type_selector_match_and_mismatch() {
         let doc = parse(
@@ -1091,7 +1091,7 @@ mod tests {
     /// CORE-1: ID セレクタは一致する id を持つ要素だけを返し、他の id・
     /// 存在しない id は一致しない。同じ id が複数の要素に付いている場合、
     /// `query_selector_all` は両方を文書順で返し、`query_selector` は
-    /// 先頭の要素を返す（TASK-24（24.8）・Issue #42）。
+    /// 先頭の要素を返す（TASK-24（24.8）・MS-1・Issue #42）。
     #[test]
     fn core_1_id_selector_match_and_mismatch() {
         let doc = parse(
@@ -1118,7 +1118,7 @@ mod tests {
     /// CORE-1: クラスセレクタはトークン単位で照合する（前方一致では
     /// 一致しない・空白区切りのクラス値のどのトークンにも一致する・複合
     /// クラスセレクタは全クラスを持つ要素だけに一致する。TASK-24（24.8）・
-    /// Issue #42）。
+    /// MS-1・Issue #42）。
     #[test]
     fn core_1_class_selector_token_semantics() {
         let doc = parse(
@@ -1149,7 +1149,7 @@ mod tests {
     }
 
     /// CORE-1: 属性の有無セレクタ（`[href]`）は同じタグでも属性を持つ要素
-    /// だけを返す（TASK-24（24.8）・Issue #42）。
+    /// だけを返す（TASK-24（24.8）・MS-1・Issue #42）。
     #[test]
     fn core_1_attribute_exists_match_and_mismatch() {
         let doc = parse(
@@ -1166,7 +1166,7 @@ mod tests {
     /// 一致しない（値の比較は大文字小文字を区別するという現状の契約の
     /// 固定。query.rs モジュール doc の「属性値の完全一致」節参照。
     /// REPAIR-3: HTML 仕様上の大文字小文字無視属性への対応はスコープ外
-    /// のまま。TASK-24（24.8）・Issue #42）。
+    /// のまま。TASK-24（24.8）・MS-1・Issue #42）。
     #[test]
     fn core_1_attribute_equals_match_and_mismatch() {
         let doc = parse(
@@ -1207,7 +1207,7 @@ mod tests {
 
     /// CORE-1: 複合セレクタは構成する単純セレクタ・型名がすべて一致した
     /// 要素だけに一致し、いずれか 1 つでも満たさなければ空になる
-    /// （TASK-24（24.8）・Issue #42）。
+    /// （TASK-24（24.8）・MS-1・Issue #42）。
     #[test]
     fn core_1_compound_selector_partial_failure() {
         let doc = parse(
@@ -1236,7 +1236,7 @@ mod tests {
 
     /// CORE-1: 子結合子（`div > span`）は直接の子にしか一致せず、孫要素
     /// には一致しない。子孫結合子（`div span`）は孫要素にも一致する
-    /// （TASK-24（24.8）・Issue #42）。
+    /// （TASK-24（24.8）・MS-1・Issue #42）。
     #[test]
     fn core_1_child_combinator_rejects_grandchild() {
         let doc = parse(
@@ -1253,7 +1253,7 @@ mod tests {
 
     /// CORE-1: セレクタリストに複数の複合セレクタが混在していても、
     /// `query_selector` は記述順ではなく文書順で最初に現れる要素を返す
-    /// （TASK-24（24.8）・Issue #42）。
+    /// （TASK-24（24.8）・MS-1・Issue #42）。
     #[test]
     fn core_1_query_selector_returns_first_in_document_order() {
         let doc = parse(r#"<!DOCTYPE html><h1 id="heading">t</h1><p id="para">a</p>"#);
@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     /// CORE-1: `element_matches` はセレクタの種類ごとに true / false の両方
-    /// を具体的に確認する（TASK-24（24.8）・Issue #42）。
+    /// を具体的に確認する（TASK-24（24.8）・MS-1・Issue #42）。
     #[test]
     fn core_1_element_matches_per_selector_kind() {
         let doc = parse(
@@ -1305,7 +1305,7 @@ mod tests {
     /// `query_selector` は `None` を返す（`docs/spec` の PoC-2
     /// `select_first_returns_none_when_no_match` 相当。型セレクタ版は
     /// `core_1_no_match_returns_empty_or_none` で確認済みのため、ここでは
-    /// クラスセレクタ版を追加する。TASK-24（24.8）・Issue #42）。
+    /// クラスセレクタ版を追加する。TASK-24（24.8）・MS-1・Issue #42）。
     #[test]
     fn core_1_poc2_select_first_returns_none_for_class_selector() {
         let doc = parse("<div></div>");
@@ -1318,7 +1318,7 @@ mod tests {
     /// で属性・テキストを取り出せる（`docs/spec` の PoC-2
     /// `select_extracts_attributes` 相当。PoC の `ElementInfo` のような
     /// 高レベル helper は query モジュールのスコープ外なので、dom
-    /// アクセサを直接組み合わせて確認する。TASK-24（24.8）・Issue #42）。
+    /// アクセサを直接組み合わせて確認する。TASK-24（24.8）・MS-1・Issue #42）。
     #[test]
     fn core_1_poc2_select_extracts_attributes() {
         let doc = parse(r#"<a href="https://example.com" class="link">click</a>"#);
@@ -1337,7 +1337,7 @@ mod tests {
     /// `compile_selector_rejects_invalid_syntax` 相当）。先頭の `:` は
     /// 疑似クラスの分岐に入るため `Error::Unsupported` になる（現状の
     /// 実装の挙動を `matches!` で具体的に固定する。TASK-24（24.8）・
-    /// Issue #42）。
+    /// MS-1・Issue #42）。
     #[test]
     fn core_1_poc2_compile_selector_rejects_invalid_syntax() {
         let doc = parse("<div></div>");
