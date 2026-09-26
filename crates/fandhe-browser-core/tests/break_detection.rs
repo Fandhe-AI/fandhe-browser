@@ -313,3 +313,131 @@ fn repair_5_checkbox_inversion_type_equals_excludes_radio_and_text() {
         ]
     );
 }
+
+// ---- TASK-6.3: 仕様後退（REPAIR-5） ----
+//
+// オフバイワン（6.1）や真偽判定反転（6.2）と異なり、「対応済みの経路
+// （match の腕・分岐）を丸ごと削除する」変更を仕様後退として注入する。
+// 対象は `selector`・`query` モジュール（CORE-1）で、以下の 3 か所を
+// それぞれ削除すると red になることを確認済み（PR 本文の
+// 「注入検証記録」参照）:
+// - `selector::parse_attribute_selector` の
+//   `Some('\'') | Some('"') => parse_quoted_string(cursor)?,` の腕
+//   （属性値の引用符対応が消え、空白を含む値が解析できなくなる）
+// - `query::compound_matches` の
+//   `Some(local_name) if is_html => html_local_name_eq(local_name, type_name),`
+//   の腕（HTML 名前空間での型名の大文字小文字無視が消える）
+// - `query::id_or_class_eq` の
+//   `if document.quirks_mode() == QuirksMode::Quirks { ... }` の分岐
+//   （quirks mode での ID・クラスの大文字小文字無視が消える）
+
+/// REPAIR-5・TASK-6（6.3）・CORE-1: 属性セレクタの引用符付き値
+/// （`[attr="a b"]`・`[attr='c']`）が解析・照合できる。
+/// `parse_attribute_selector` から引用符分岐を削除する仕様後退を注入すると、
+/// 空白を含む値は識別子の経路では解析できず失敗として検出される。
+#[test]
+fn repair_5_spec_regression_quoted_attribute_value() {
+    let doc = parse(r#"<div><a data-x="a b">1</a><a data-x='c'>2</a><a data-x="ab">3</a></div>"#);
+    let root = doc.root();
+
+    let double_quoted =
+        fandhe_browser_core::query_selector_all_str(&doc, root, r#"a[data-x="a b"]"#)
+            .expect("引用符付き属性セレクタは解析・照合に成功するべき");
+    assert_eq!(double_quoted.len(), 1);
+    assert_eq!(doc.text_content(double_quoted[0]).as_deref(), Some("1"));
+
+    let single_quoted = fandhe_browser_core::query_selector_all_str(&doc, root, "a[data-x='c']")
+        .expect("シングルクォート付き属性セレクタは解析・照合に成功するべき");
+    assert_eq!(single_quoted.len(), 1);
+    assert_eq!(doc.text_content(single_quoted[0]).as_deref(), Some("2"));
+}
+
+/// REPAIR-5・TASK-6（6.3）・CORE-1: HTML 名前空間の型セレクタは大文字小文字を
+/// 無視して一致するが、SVG 名前空間（`foreignObject`）は区別する。
+/// `compound_matches` から HTML 名前空間の大文字小文字無視の腕を削除すると、
+/// 大文字の型名（`DIV`・`Div`）が一致しなくなり検出される。
+#[test]
+fn repair_5_spec_regression_html_type_selector_case_insensitive() {
+    let doc = parse("<div><p>x</p></div><svg><foreignObject></foreignObject></svg>");
+    let root = doc.root();
+    let expected_div = find_by_local_name(&doc, root, "div");
+
+    for selector in ["DIV", "Div", "div"] {
+        let matched = fandhe_browser_core::query_selector_all_str(&doc, root, selector)
+            .unwrap_or_else(|e| panic!("selector {selector} の解析・照合に成功するべき: {e:?}"));
+        assert_eq!(
+            matched.len(),
+            1,
+            "selector {selector} は 1 件に一致するべき"
+        );
+        assert_eq!(matched[0], expected_div);
+    }
+
+    // 対照: SVG 名前空間は大文字小文字を区別するため、HTML 側の緩和が
+    // SVG 側へ漏れていないことも併せて固定する。
+    let case_sensitive = fandhe_browser_core::query_selector_all_str(&doc, root, "foreignObject")
+        .expect("foreignObject（正しい大文字小文字）は解析・照合に成功するべき");
+    assert_eq!(case_sensitive.len(), 1);
+
+    let case_mismatched = fandhe_browser_core::query_selector_all_str(&doc, root, "foreignobject")
+        .expect("foreignobject（誤った大文字小文字）も解析自体は成功するべき");
+    assert_eq!(
+        case_mismatched.len(),
+        0,
+        "SVG 名前空間では大文字小文字が異なると一致しないべき"
+    );
+}
+
+/// REPAIR-5・TASK-6（6.3）・CORE-1: quirks mode では ID・クラスセレクタが
+/// 大文字小文字を無視して一致するが、no-quirks（`<!DOCTYPE html>` あり）
+/// では区別する。`id_or_class_eq` から quirks mode 分岐を削除すると、
+/// quirks mode でも大文字小文字を区別するようになり検出される。
+#[test]
+fn repair_5_spec_regression_quirks_mode_id_class_case_insensitive() {
+    let quirks_doc = parse(r#"<p class="foo" id="bar">q</p>"#);
+    assert_eq!(
+        quirks_doc.quirks_mode(),
+        fandhe_browser_core::QuirksMode::Quirks,
+        "DOCTYPE なしの入力は quirks mode になるべき（テスト前提）"
+    );
+    let quirks_root = quirks_doc.root();
+    let expected_p = find_by_local_name(&quirks_doc, quirks_root, "p");
+
+    for selector in [".FOO", "#BAR"] {
+        let matched =
+            fandhe_browser_core::query_selector_all_str(&quirks_doc, quirks_root, selector)
+                .unwrap_or_else(|e| {
+                    panic!("selector {selector} の解析・照合に成功するべき: {e:?}")
+                });
+        assert_eq!(
+            matched.len(),
+            1,
+            "quirks mode では {selector} が 1 件に一致するべき"
+        );
+        assert_eq!(matched[0], expected_p);
+        assert_eq!(quirks_doc.text_content(matched[0]).as_deref(), Some("q"));
+    }
+
+    // 対照: no-quirks では大文字小文字を区別する。
+    let no_quirks_doc = parse(r#"<!DOCTYPE html><p class="foo" id="bar">q</p>"#);
+    assert_eq!(
+        no_quirks_doc.quirks_mode(),
+        fandhe_browser_core::QuirksMode::NoQuirks,
+        "DOCTYPE ありの入力は no-quirks mode になるべき（テスト前提）"
+    );
+    let no_quirks_root = no_quirks_doc.root();
+
+    let upper_in_no_quirks =
+        fandhe_browser_core::query_selector_all_str(&no_quirks_doc, no_quirks_root, ".FOO")
+            .expect(".FOO の解析自体は成功するべき");
+    assert_eq!(
+        upper_in_no_quirks.len(),
+        0,
+        "no-quirks mode では大文字小文字が異なると一致しないべき"
+    );
+
+    let lower_in_no_quirks =
+        fandhe_browser_core::query_selector_all_str(&no_quirks_doc, no_quirks_root, ".foo")
+            .expect(".foo の解析・照合に成功するべき");
+    assert_eq!(lower_in_no_quirks.len(), 1);
+}
