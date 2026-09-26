@@ -18,9 +18,9 @@
 //!
 //! # スタブについて
 //!
-//! [`create_engine`] はすべての種別に `NotYetImplemented`（詳細は
-//! [`engine_trait`] を参照）を返す。以下は未実装（実装済みを装わない。
-//! REPAIR-3）。
+//! [`create_engine`] は同梱済みの種別には `NotYetImplemented`、
+//! 同梱されていない種別には `NotBundled`（詳細は [`engine_trait`] を参照）
+//! を返す。以下は未実装（実装済みを装わない。REPAIR-3）。
 //!
 //! - V8 の具象実装（`JS-1`、`TASK-29`、`MS-3`）
 //! - boa の具象実装（`JS-1`、`TASK-32`、`MS-3`）
