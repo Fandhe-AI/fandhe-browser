@@ -27,6 +27,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=800)
     parser.add_argument("--fail-sites", default="")
+    # `capture_one` の fail-closed チェック（`{proxy}` を使わないテンプレートは
+    # 既定で拒否する。codex P0 再指摘）を通過させるためテンプレートに含めるが、
+    # この偽エンジンは値を使わず無視する。
+    parser.add_argument("--proxy", default=None)
     args = parser.parse_args(argv)
 
     site_id = args.out.stem

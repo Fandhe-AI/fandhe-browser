@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import io
 import json
+import struct
 import sys
 import tempfile
+import threading
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -25,7 +29,24 @@ DEFAULT_SITES_PATH = Path(__file__).resolve().parent / "sites.json"
 
 
 def fake_engine_template(mode: str = "ok") -> list[str]:
-    return [sys.executable, str(FAKE_ENGINE), "--mode", mode, "--out", "{out}", "--width", "{width}", "--height", "{height}"]
+    # `--proxy {proxy}` を含めることで、`main()` が起動する実際のローカル転送
+    # プロキシがあっても `capture_one` の fail-closed チェック（codex P0 再指摘。
+    # `{proxy}` を使わないテンプレートは既定で撮影を拒否する）を通過させる。
+    # 偽エンジン自身は値を使わず無視する。
+    return [
+        sys.executable,
+        str(FAKE_ENGINE),
+        "--mode",
+        mode,
+        "--out",
+        "{out}",
+        "--width",
+        "{width}",
+        "--height",
+        "{height}",
+        "--proxy",
+        "{proxy}",
+    ]
 
 
 def write_sites_json(path: Path, sites: list[dict], *, schema_version: int = 1, viewport: dict | None = None) -> None:
@@ -207,8 +228,42 @@ class ExpandTemplateTest(unittest.TestCase):
         self.assertNotEqual(argv1, argv2)
 
 
+def _build_png(
+    width: int,
+    height: int,
+    idat_payloads: list[bytes],
+    *,
+    bit_depth: int = 8,
+    color_type: int = 2,
+    compression: int = 0,
+    filter_method: int = 0,
+    interlace: int = 0,
+) -> bytes:
+    """テスト用に IHDR・任意個の IDAT・IEND から成る PNG バイト列を組み立てる。
+
+    `fake_engine._chunk` を再利用して各チャンクの CRC を正しく計算し、
+    `read_png_size` の IDAT 展開検証（codex P1）を IHDR フィールド・IDAT の
+    個数や内容を変えながら検証できるようにする。
+    """
+    sys.path.insert(0, str(FIXTURES_DIR))
+    import fake_engine  # noqa: PLC0415
+
+    ihdr = struct.pack(">IIBBBBB", width, height, bit_depth, color_type, compression, filter_method, interlace)
+    chunks = [fake_engine._chunk(b"IHDR", ihdr)]  # noqa: SLF001
+    for payload in idat_payloads:
+        chunks.append(fake_engine._chunk(b"IDAT", payload))  # noqa: SLF001
+    chunks.append(fake_engine._chunk(b"IEND", b""))  # noqa: SLF001
+    return cs.PNG_SIGNATURE + b"".join(chunks)
+
+
+def _raw_pixels(width: int, height: int, *, channels: int = 3) -> bytes:
+    """`write_minimal_png` と同じ形式（filter byte 0 + 単色ピクセル行）の生データを作る。"""
+    pixel_row = bytes([200] * channels * width)
+    return b"".join(bytes([0]) + pixel_row for _ in range(height))
+
+
 class ReadPngSizeTest(unittest.TestCase):
-    """RENDER-5 / TASK-37.1: PNG ヘッダ検証（シグネチャ・IHDR）。"""
+    """RENDER-5 / TASK-37.1: PNG ヘッダ検証（シグネチャ・IHDR・IDAT 展開）。"""
 
     def test_reads_width_and_height_from_minimal_png(self) -> None:
         sys.path.insert(0, str(FIXTURES_DIR))
@@ -292,6 +347,100 @@ class ReadPngSizeTest(unittest.TestCase):
                 with self.assertRaises(cs.PngError) as ctx:
                     cs.read_png_size(path)
             self.assertIn("byte limit", str(ctx.exception))
+
+    def test_rejects_png_with_ihdr_and_iend_but_no_idat(self) -> None:
+        # codex P1 再指摘: IHDR・IEND の CRC が正しく寸法も一致していても、IDAT
+        # （画素データ）が 1 つも無いファイルを "ok" と誤判定してはならない。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "no-idat.png"
+            path.write_bytes(_build_png(37, 41, []))
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("IDAT", str(ctx.exception))
+
+    def test_accepts_idat_split_across_multiple_chunks(self) -> None:
+        # IDAT はエンジンによって複数チャンクに分割されうる。連結して展開できる
+        # ことを確認する。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "split-idat.png"
+            raw = _raw_pixels(37, 41)
+            compressed = zlib.compress(raw)
+            midpoint = len(compressed) // 2
+            path.write_bytes(_build_png(37, 41, [compressed[:midpoint], compressed[midpoint:]]))
+            width, height = cs.read_png_size(path)
+            self.assertEqual((width, height), (37, 41))
+
+    def test_rejects_idat_that_is_not_valid_zlib_data(self) -> None:
+        # IDAT チャンクの CRC 自体は正しくても（＝チャンクとしては壊れていない
+        # ように見えても）、中身が zlib として展開できないケース。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "garbage-idat.png"
+            path.write_bytes(_build_png(37, 41, [b"this is not a zlib stream at all"]))
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("zlib", str(ctx.exception))
+
+    def test_rejects_idat_whose_decompressed_size_mismatches_ihdr(self) -> None:
+        # 展開自体はできても、IHDR の寸法から計算される期待サイズと一致しない
+        # （＝画像本体が別のサイズのデータにすり替わっている）ケース。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "size-mismatch.png"
+            wrong_raw = _raw_pixels(37, 10)  # IHDR は height=41 だが中身は height=10 相当
+            path.write_bytes(_build_png(37, 41, [zlib.compress(wrong_raw)]))
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("does not match", str(ctx.exception))
+
+    def test_rejects_ihdr_declaring_size_over_decompression_bomb_limit(self) -> None:
+        # codex P1: 展開を試みる前に、IHDR の寸法から計算した期待展開サイズが
+        # `MAX_PNG_RAW_BYTES` を超えないことを確認する（解凍爆弾対策）。実際に
+        # 巨大なデータを展開させずに検出できることをテストする。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "huge-ihdr.png"
+            # width/height はテスト用に大きいだけで、IDAT の中身は展開されない
+            # （サイズチェックが先に発火する）ためダミーで良い。
+            path.write_bytes(_build_png(60000, 60000, [b"dummy"]))
+            with mock.patch.object(cs, "MAX_PNG_RAW_BYTES", 1024):
+                with self.assertRaises(cs.PngError) as ctx:
+                    cs.read_png_size(path)
+            self.assertIn("exceeding", str(ctx.exception))
+
+    def test_rejects_invalid_bit_depth_for_color_type(self) -> None:
+        # RGB（color_type=2）は bit_depth に 8 か 16 のみを許す（PNG 仕様）。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad-bit-depth.png"
+            path.write_bytes(_build_png(37, 41, [b"dummy"], bit_depth=4, color_type=2))
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("bit depth", str(ctx.exception))
+
+    def test_rejects_unsupported_interlace_method(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad-interlace.png"
+            path.write_bytes(_build_png(37, 41, [b"dummy"], interlace=9))
+            with self.assertRaises(cs.PngError) as ctx:
+                cs.read_png_size(path)
+            self.assertIn("interlace", str(ctx.exception))
+
+    def test_accepts_adam7_interlaced_png_with_matching_idat(self) -> None:
+        # インターレース（Adam7）は 7 パスの合算サイズになる。`_expected_raw_size`
+        # の計算が実際の展開結果と一致することを、パスごとのダミーデータで確認する。
+        width, height = 8, 8
+        expected = cs._expected_raw_size(width, height, color_type=0, bit_depth=8, interlace=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "interlaced.png"
+            path.write_bytes(
+                _build_png(
+                    width,
+                    height,
+                    [zlib.compress(b"\x00" * expected)],
+                    bit_depth=8,
+                    color_type=0,
+                    interlace=1,
+                )
+            )
+            result_width, result_height = cs.read_png_size(path)
+            self.assertEqual((result_width, result_height), (width, height))
 
 
 class _Resp(io.BytesIO):
@@ -536,6 +685,196 @@ class FetchSnapshotTest(unittest.TestCase):
             )
 
 
+class FilteringProxyTest(unittest.TestCase):
+    """RENDER-5 / TASK-37.1: ローカル転送プロキシの宛先フィルタ（codex P0 再指摘）。
+
+    `_check_public_host` は撮影対象の最初の URL しか検証しないため、撮影
+    プロセス（Chromium 等）自身が読み込むサブリソース・リダイレクト先を
+    防げない。本プロキシは撮影プロセスの全通信をここで検証・中継する。
+    """
+
+    def setUp(self) -> None:
+        self.server, self.thread, self.proxy_url = cs.start_filtering_proxy()
+        self.addCleanup(cs.stop_filtering_proxy, self.server, self.thread)
+        parsed = urlparse(self.proxy_url)
+        self.proxy_host = parsed.hostname
+        self.proxy_port = parsed.port
+
+    def _open_proxy_connection(self) -> "socket.socket":
+        import socket as socket_module  # noqa: PLC0415
+
+        sock = socket_module.create_connection((self.proxy_host, self.proxy_port), timeout=5)
+        sock.settimeout(5)
+        return sock
+
+    def _read_status_line(self, sock: "socket.socket") -> str:
+        data = b""
+        while b"\r\n" not in data and len(data) < 4096:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return data.split(b"\r\n", 1)[0].decode("latin-1", errors="replace")
+
+    def test_connect_to_loopback_ip_literal_is_denied(self) -> None:
+        # IP リテラルなので `_resolve_public_addresses` の実装がそのまま働き、
+        # モック無しで検証できる。
+        sock = self._open_proxy_connection()
+        try:
+            sock.sendall(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+            status_line = self._read_status_line(sock)
+        finally:
+            sock.close()
+        self.assertIn("403", status_line)
+
+    def test_connect_to_private_ip_literal_is_denied(self) -> None:
+        sock = self._open_proxy_connection()
+        try:
+            sock.sendall(b"CONNECT 10.0.0.1:443 HTTP/1.1\r\nHost: 10.0.0.1:443\r\n\r\n")
+            status_line = self._read_status_line(sock)
+        finally:
+            sock.close()
+        self.assertIn("403", status_line)
+
+    def test_get_absolute_uri_to_metadata_address_is_denied(self) -> None:
+        sock = self._open_proxy_connection()
+        try:
+            sock.sendall(b"GET http://169.254.169.254/latest/meta-data/ HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n")
+            status_line = self._read_status_line(sock)
+        finally:
+            sock.close()
+        self.assertIn("403", status_line)
+
+    def test_connect_to_disallowed_port_is_denied_even_for_public_looking_host(self) -> None:
+        # 宛先フィルタの判定より先にポート許可リスト（80/443 のみ）を見るため、
+        # ホスト名解決をモックしなくても検証できる。
+        sock = self._open_proxy_connection()
+        try:
+            sock.sendall(b"CONNECT example.invalid:8443 HTTP/1.1\r\nHost: example.invalid:8443\r\n\r\n")
+            status_line = self._read_status_line(sock)
+        finally:
+            sock.close()
+        self.assertIn("403", status_line)
+
+    def test_connect_to_mocked_public_address_relays_bytes_both_ways(self) -> None:
+        # 「公開アドレス」はモックの判定関数（`_resolve_public_addresses`）で
+        # 表現し、実 DNS 解決には依存しない。CONNECT トンネル確立後、生の
+        # バイト列がクライアント→origin・origin→クライアントの両方向に
+        # 中継されることを、ローカルの TCP エコーサーバーで確認する。
+        import socketserver as socketserver_module  # noqa: PLC0415
+
+        class _EchoHandler(socketserver_module.BaseRequestHandler):
+            def handle(self) -> None:
+                data = self.request.recv(4096)
+                if data:
+                    self.request.sendall(data)
+
+        with socketserver_module.TCPServer(("127.0.0.1", 0), _EchoHandler) as echo_server:
+            echo_port = echo_server.server_address[1]
+            echo_thread = threading.Thread(target=echo_server.handle_request, daemon=True)
+            echo_thread.start()
+
+            with mock.patch.object(
+                cs, "_resolve_public_addresses", return_value=[("127.0.0.1", echo_port)]
+            ):
+                sock = self._open_proxy_connection()
+                try:
+                    sock.sendall(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")
+                    status_line = self._read_status_line(sock)
+                    self.assertIn("200", status_line)
+                    sock.sendall(b"ping")
+                    echoed = sock.recv(4096)
+                finally:
+                    sock.close()
+            echo_thread.join(timeout=5)
+        self.assertEqual(echoed, b"ping")
+
+    def test_get_absolute_uri_to_mocked_public_address_returns_origin_response(self) -> None:
+        # 絶対 URI 形式の GET フォワード（http:// 用）の正常系。origin をローカルの
+        # `http.server` で立て、`_resolve_public_addresses` をモックしてそこへ
+        # 誘導する。
+        import http.server as http_server_module  # noqa: PLC0415
+        import socketserver as socketserver_module  # noqa: PLC0415
+
+        class _OriginHandler(http_server_module.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = b"hello from origin"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                pass
+
+        with socketserver_module.TCPServer(("127.0.0.1", 0), _OriginHandler) as origin_server:
+            origin_port = origin_server.server_address[1]
+            origin_thread = threading.Thread(target=origin_server.handle_request, daemon=True)
+            origin_thread.start()
+
+            with mock.patch.object(
+                cs, "_resolve_public_addresses", return_value=[("127.0.0.1", origin_port)]
+            ):
+                sock = self._open_proxy_connection()
+                try:
+                    sock.sendall(b"GET http://example.test/ HTTP/1.1\r\nHost: example.test\r\n\r\n")
+                    response = b""
+                    while b"hello from origin" not in response and len(response) < 65536:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        response += chunk
+                finally:
+                    sock.close()
+            origin_thread.join(timeout=5)
+        self.assertIn(b"200", response.split(b"\r\n", 1)[0])
+        self.assertIn(b"hello from origin", response)
+
+
+class CaptureOneProxyRequirementTest(unittest.TestCase):
+    """RENDER-5 / TASK-37.1: `capture_one` の fail-closed プロキシ必須化（codex P0 再指摘）。"""
+
+    def test_skips_when_template_omits_proxy_and_unproxied_not_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            site = cs.Site(site_id="no-proxy", url="https://example.invalid", category="static", catalog_id="z1")
+            record = cs.capture_one(
+                site,
+                "servo",
+                [sys.executable, str(FAKE_ENGINE), "--out", "{out}"],
+                out_dir=Path(tmp),
+                snapshots_dir=Path(tmp) / "snapshots",
+                chromium_bin=None,
+                width=1280,
+                height=800,
+                settle_ms=1000,
+                timeout_sec=5,
+                allow_file_url=False,
+                dry_run=False,
+            )
+            self.assertEqual(record["status"], "skipped")
+            self.assertFalse((Path(tmp) / "servo" / "no-proxy.png").exists())
+
+    def test_allow_unproxied_engine_bypasses_the_requirement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            site = cs.Site(site_id="opt-out", url="https://example.invalid", category="static", catalog_id="z1")
+            record = cs.capture_one(
+                site,
+                "servo",
+                [sys.executable, str(FAKE_ENGINE), "--out", "{out}"],
+                out_dir=Path(tmp),
+                snapshots_dir=Path(tmp) / "snapshots",
+                chromium_bin=None,
+                width=1280,
+                height=800,
+                settle_ms=1000,
+                timeout_sec=5,
+                allow_file_url=False,
+                dry_run=False,
+                allow_unproxied_engine=True,
+            )
+            self.assertEqual(record["status"], "ok")
+
+
 class InjectBaseHrefTest(unittest.TestCase):
     """RENDER-5 / TASK-37.1: 相対 URL 解決基準を揃える `<base>` 注入（P1）。"""
 
@@ -606,6 +945,13 @@ class CaptureIntegrationTest(unittest.TestCase):
             self.assertNotIn("partial", result)
             pngs = list((out_dir / "servo").glob("*.png")) + list((out_dir / "chromium").glob("*.png"))
             self.assertEqual(len(pngs), 10)
+            # `main()` が実際に起動したローカル転送プロキシの URL が argv へ
+            # 展開されていること（`{proxy}` がプレースホルダのまま・空のまま
+            # ではないこと）を確認する。偽エンジンは値を使わず無視するだけ
+            # なので、これが無いと実プロキシが配線されていなくても気付けない。
+            self.assertTrue(
+                any("http://127.0.0.1:" in " ".join(c["command"]) for c in result["captures"]),
+            )
 
     def test_exit_code_uses_common_ok_sites_not_per_engine_counts(self) -> None:
         # codex P1: Servo が site-0..4（5 件）・Chromium が site-1..5（5 件）で
@@ -629,6 +975,8 @@ class CaptureIntegrationTest(unittest.TestCase):
                     "{height}",
                     "--fail-sites",
                     "site-5",
+                    "--proxy",
+                    "{proxy}",
                 ]
             )
             chromium_cmd = json.dumps(
@@ -643,6 +991,8 @@ class CaptureIntegrationTest(unittest.TestCase):
                     "{height}",
                     "--fail-sites",
                     "site-0",
+                    "--proxy",
+                    "{proxy}",
                 ]
             )
             code = cs.main(
@@ -690,6 +1040,8 @@ class CaptureIntegrationTest(unittest.TestCase):
                     "{height}",
                     "--fail-sites",
                     "site-5",
+                    "--proxy",
+                    "{proxy}",
                 ]
             )
             chromium_cmd = json.dumps(
@@ -704,6 +1056,8 @@ class CaptureIntegrationTest(unittest.TestCase):
                     "{height}",
                     "--fail-sites",
                     "site-0",
+                    "--proxy",
+                    "{proxy}",
                 ]
             )
             code = cs.main(
@@ -956,6 +1310,7 @@ class CaptureIntegrationTest(unittest.TestCase):
                 timeout_sec=5,
                 allow_file_url=False,
                 dry_run=False,
+                proxy_url="http://127.0.0.1:1",
             )
             self.assertEqual(record["status"], "failed")
             self.assertIsNone(record["png"])
@@ -986,6 +1341,7 @@ class CaptureIntegrationTest(unittest.TestCase):
                 timeout_sec=5,
                 allow_file_url=False,
                 dry_run=False,
+                allow_unproxied_engine=True,
             )
             self.assertEqual(record["status"], "failed")
             self.assertIsNone(record["png"])
@@ -1015,6 +1371,7 @@ class CaptureIntegrationTest(unittest.TestCase):
                     timeout_sec=5,
                     allow_file_url=False,
                     dry_run=False,
+                    allow_unproxied_engine=True,
                 )
             self.assertEqual(record["status"], "failed")
             self.assertIsNone(record["exit_code"])
@@ -1049,6 +1406,7 @@ class CaptureIntegrationTest(unittest.TestCase):
                     timeout_sec=5,
                     allow_file_url=False,
                     dry_run=False,
+                    allow_unproxied_engine=True,
                 )
             self.assertEqual(record["status"], "skipped")
             self.assertEqual(len(created), 1)
@@ -1095,6 +1453,7 @@ class CaptureIntegrationTest(unittest.TestCase):
                 timeout_sec=5,
                 allow_file_url=False,
                 dry_run=False,
+                allow_unproxied_engine=True,
             )
             self.assertEqual(record["status"], "skipped")
             self.assertFalse((Path(tmp) / "chromium" / "ssrf-loopback.png").exists())
@@ -1120,6 +1479,7 @@ class CaptureIntegrationTest(unittest.TestCase):
                 timeout_sec=5,
                 allow_file_url=False,
                 dry_run=False,
+                allow_unproxied_engine=True,
             )
             self.assertEqual(record["status"], "skipped")
 
@@ -1148,6 +1508,7 @@ class CaptureIntegrationTest(unittest.TestCase):
                     timeout_sec=5,
                     allow_file_url=False,
                     dry_run=False,
+                    allow_unproxied_engine=True,
                 )
             self.assertEqual(record["status"], "ok")
 
@@ -1171,6 +1532,7 @@ class CaptureIntegrationTest(unittest.TestCase):
                 timeout_sec=5,
                 allow_file_url=False,
                 dry_run=False,
+                allow_unproxied_engine=True,
             )
             self.assertEqual(record["status"], "ok")
             self.assertEqual(record["png"], "servo/ok-id.png")
@@ -1205,6 +1567,7 @@ class CaptureIntegrationTest(unittest.TestCase):
                     timeout_sec=5,
                     allow_file_url=False,
                     dry_run=False,
+                    allow_unproxied_engine=True,
                 )
             self.assertEqual(list(outside_dir.iterdir()), [])
 
@@ -1249,6 +1612,7 @@ class DirectNavigationAllowlistTest(unittest.TestCase):
                     timeout_sec=5,
                     allow_file_url=False,
                     dry_run=False,
+                    allow_unproxied_engine=True,
                 )
             self.assertEqual(record["status"], "skipped")
             self.assertFalse((Path(tmp) / "chromium" / "not-allowlisted.png").exists())
@@ -1290,6 +1654,7 @@ class DirectNavigationAllowlistTest(unittest.TestCase):
                     timeout_sec=5,
                     allow_file_url=False,
                     dry_run=False,
+                    allow_unproxied_engine=True,
                 )
             self.assertEqual(record["status"], "skipped")
             self.assertFalse((Path(tmp) / "chromium" / "both-placeholders.png").exists())
@@ -1328,6 +1693,7 @@ class DirectNavigationAllowlistTest(unittest.TestCase):
                     timeout_sec=5,
                     allow_file_url=False,
                     dry_run=False,
+                    allow_unproxied_engine=True,
                 )
             self.assertEqual(record["status"], "ok")
 
@@ -1353,9 +1719,17 @@ class DefaultChromiumTemplateTest(unittest.TestCase):
                 "height": "800",
                 "settle_ms": "5000",
                 "user_data_dir": "/tmp/udd",
+                "proxy": "http://127.0.0.1:12345",
             },
         )
         self.assertIn("--force-device-scale-factor=1", argv)
+
+    def test_proxies_all_traffic_via_proxy_server_and_bypass_list_flags(self) -> None:
+        # codex P0 再指摘: 撮影プロセスの通信経路そのものをプロキシへ強制する。
+        # `--proxy-bypass-list=<-loopback>` が無いと Chromium は既定で loopback
+        # 宛の通信をプロキシから除外してしまう。
+        self.assertIn("--proxy-server={proxy}", cs.DEFAULT_CHROMIUM_TEMPLATE)
+        self.assertIn("--proxy-bypass-list=<-loopback>", cs.DEFAULT_CHROMIUM_TEMPLATE)
 
 
 class ArgValidationTest(unittest.TestCase):

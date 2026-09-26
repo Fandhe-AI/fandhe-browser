@@ -56,6 +56,12 @@ def main(argv: list[str] | None = None) -> int:
     # ナビゲーションの許可リスト検査が `{html_path}` の有無で素通りされないかの
     # 検証）から渡されることがある。同じく値は使わず無視する。
     parser.add_argument("--html", default=None)
+    # `capture_one` が起動するローカル転送プロキシの URL（`{proxy}`）。この
+    # 偽エンジンは実際には何も取得しないため値は使わず無視するが、
+    # `fake_engine_template()` はこの引数を渡すことでテンプレートに `{proxy}`
+    # を含める（`--allow-unproxied-engine` 無しでも `capture_one` の fail-closed
+    # チェックを通過させるため。codex P0 再指摘）。
+    parser.add_argument("--proxy", default=None)
     args = parser.parse_args(argv)
 
     if args.mode == "fail":

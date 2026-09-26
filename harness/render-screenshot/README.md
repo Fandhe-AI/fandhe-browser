@@ -61,6 +61,7 @@ Chromium 側はローカルに `chromium` / `chromium-browser` / `google-chrome`
 | `--min-sites` | 最低サイト数（`[1, 50]` の範囲のみ許可） | 5 |
 | `--dry-run` | 展開後のコマンドを表示するだけで、実行もファイル作成もしない | ― |
 | `--allow-file-url` | `{html_path}` 用スナップショット取得で `file:` を許可する（テスト専用） | ― |
+| `--allow-unproxied-engine` | コマンドテンプレートが `{proxy}` を使わなくても撮影を許可する（ネットワークを完全に遮断したテスト環境専用。下記「ローカル転送プロキシ」参照） | ― |
 
 `--engines` にカンマ区切りで同じエンジン名を重複指定した場合（例: `servo,servo`）は
 `ok` サイト数の集計と `partial` 判定が食い違うため、引数エラー（終了コード 2）として
@@ -69,10 +70,14 @@ Chromium 側はローカルに `chromium` / `chromium-browser` / `google-chrome`
 ### テンプレートの placeholder
 
 `{url}` `{out}` `{width}` `{height}` `{settle_ms}` `{html_path}` `{user_data_dir}`
-`{chromium_bin}` が使える。argv の各要素の中で個別に置換するため（`shell=True` は
-使わない）、URL 中の空白やシェルのメタ文字があっても 1 つの argv 要素のまま残る。
-テンプレートに定義されていない placeholder（未知の `{...}`）が含まれる場合は
-実行前にエラーで止まる。
+`{chromium_bin}` `{proxy}` が使える。argv の各要素の中で個別に置換するため
+（`shell=True` は使わない）、URL 中の空白やシェルのメタ文字があっても 1 つの
+argv 要素のまま残る。テンプレートに定義されていない placeholder（未知の
+`{...}`）が含まれる場合は実行前にエラーで止まる。
+
+`--dry-run` を付けない実行では、コマンドテンプレートに `{proxy}` を含めない
+限り撮影を拒否する（`--allow-unproxied-engine` で明示的に無効化できる。下記
+「ローカル転送プロキシによる撮影プロセスの全通信フィルタ」参照）。
 
 `{html_path}` を使うテンプレートを指定した場合だけ、撮影の直前にその URL の HTML を
 1 回取得してスナップショットとして保存する（PoC-6 の `servo-embed` は HTML ファイルしか
@@ -94,26 +99,80 @@ Chromium 側はローカルに `chromium` / `chromium-browser` / `google-chrome`
 書き込む。`--out-dir` を使い回す再実行で保存先が外部ファイルへの symlink に
 差し替えられていても、そのファイルを取得データで上書きしない。
 
-### `{url}` 直接ナビゲーションの許可リスト
+### ローカル転送プロキシによる撮影プロセスの全通信フィルタ
 
-`{url}` をエンジンへ渡すテンプレート（既定 Chromium テンプレート等）では、上記の
-SSRF 検証はエンジン起動前の一時点の名前解決に基づくベストエフォートに過ぎず、
-別プロセスのブラウザ自身がその後たどるリダイレクト先までは検証できない。そのため
-`{url}` を渡すテンプレートは `capture_screenshots.py` の
-`DIRECT_NAVIGATION_ALLOWED_URLS`（`sites.json` の既定サイト URL をそのまま複製した
-固定リスト）に完全一致する URL のみを許可し、それ以外（`--sites` に差し替えた
-任意の URL 等）は `skipped` として拒否する。**この検証は `{url}` を含むテンプレート
-であれば必ず適用する**。同じテンプレートが `{html_path}` も併用している場合でも
-（例: エンジンへスナップショットのパスと元 URL の両方を渡すテンプレート）省略され
-ない（旧実装は `{html_path}` の有無で分岐していたため、両方の placeholder を持つ
-テンプレートでは許可リスト検査を素通りできた。codex P0 の再指摘）。任意 URL を
-撮影したい場合は `{url}` を使わず `{html_path}` のみのテンプレートを使うこと
-（取得後にリダイレクト先も検証する `_PublicOnlyRedirectHandler` を通る）。
-`sites.json` を更新した場合はこの固定リストも合わせて更新する必要があり、乖離は
-`test_default_sites_urls_are_all_allowlisted` で検出される。Chromium の
-`--host-resolver-rules` はホスト名の解決先を固定できるだけで、応答先 IP を
-グローバルユニキャストの範囲に強制する機能ではないため、確実な多層防御としては
-採用していない。
+`_check_public_host`（上記）が検証するのは撮影対象の**最初の URL** だけである。
+`{html_path}` で保存したスナップショットが `<base href>` 経由で読み込む外部の
+script/img/css・`{url}` 直接ナビゲーションのリダイレクト先・撮影プロセス
+（Chromium 等）自身がそれ以降たどる遷移には、この検証は一切効かない。固定 URL
+リスト（後述）もページの内容や遷移先までは制限しない（codex P0 再指摘）。
+
+そこで「最初の URL の検証を積み増す」のではなく、**撮影プロセスの通信経路
+そのもの**を Python 標準ライブラリだけで書いたローカル転送プロキシ
+（`start_filtering_proxy`。HTTP の forward と `CONNECT` に対応）へ強制する。
+
+- `--dry-run` を付けない実行では、`main` がキャプチャループの前に
+  `127.0.0.1` の空きポートでプロキシを起動し、`{proxy}` プレースホルダーへ
+  `http://127.0.0.1:<port>` を渡す。既定 Chromium テンプレートは
+  `--proxy-server={proxy}` と `--proxy-bypass-list=<-loopback>`
+  （Chromium が暗黙に持つ loopback 宛のプロキシ除外を無効化し、`127.0.0.1` 等
+  への接続もプロキシ経由にする）を含む
+- プロキシは宛先ホストを `_resolve_public_addresses`（`_check_public_host` と
+  同じグローバルユニキャスト判定）で検証し、**検証で得た IP へ直接接続する**
+  （ホスト名を再解決しない。DNS リバインディング対策）。非公開アドレス・
+  許可外ポート（80/443 のみ許可）は `CONNECT`・HTTP フォワードのいずれも
+  403 で拒否する
+- コマンドテンプレートに `{proxy}` を含めない場合、`capture_one` は既定で
+  撮影自体を `skipped` にする（fail-closed）。ネットワークを完全に遮断した
+  環境やオフラインのテストでのみ `--allow-unproxied-engine` で無効化する
+
+**このプロキシで防げないこと（正直に書く。REPAIR-3）**:
+
+- UDP（WebRTC/STUN・QUIC 等）はプロキシを経由しないため制限できない
+- `file:` 等プロキシの対象外のスキームは制限できない
+- エンジンがプロキシ設定を無視・迂回する実装だった場合は防げない（`{proxy}`
+  を含むテンプレートで起動していることは確認できるが、エンジンが実際に
+  全通信をそこへ流しているかまでは検証できない）
+- プロキシは認証なしで `127.0.0.1` にバインドするため、実行中は同じホスト上の
+  他プロセスからも到達できる（開発機でのローカル実行を前提とし、認証・TLS
+  終端は実装しない。将来必要になれば追加のユーザー承認事項とする）
+- `CONNECT` トンネルの中身（TLS で暗号化された実際の HTTP リクエスト）までは
+  検査せず、宛先ホスト・ポートのみをフィルタする
+- 同時接続数（既定 64）・アイドルタイムアウト（既定 30 秒）・1 接続あたりの
+  転送量上限（既定 256 MiB）は無制限のリソース確保を防ぐための上限であり、
+  DoS を完全に防ぐものではない
+
+#### Servo（servoshell）のプロキシ対応について
+
+Servo 本体は `network_http_proxy_uri` / `network_https_proxy_uri` /
+`network_http_no_proxy` という preference を持ち（`components/config/prefs.rs`）、
+servoshell の `--pref` 引数から設定できる（例:
+`--pref network_http_proxy_uri=http://127.0.0.1:PORT --pref
+network_https_proxy_uri=http://127.0.0.1:PORT`）。ソースコードの調査では
+この preference の存在までは確認できたが、**実機の servoshell バイナリで
+実際にこのプロキシ経由の通信が強制されることまでは本ハーネスから検証していない**
+（TASK-36／#50・#55 の人間による実機検証の範囲）。そのため `--servo-cmd` の
+テンプレートにも他エンジンと同様 `{proxy}` を必須にし（`--allow-unproxied-engine`
+無しでは `{proxy}` を含まない `--servo-cmd` は撮影を拒否する）、実際に上記の
+`--pref` を使うかはユーザー・実機検証側の判断とする。
+
+### `{url}` 直接ナビゲーションの許可リスト（多層防御）
+
+上記のローカル転送プロキシが撮影プロセスの全通信を検証する一方、`{url}` を
+エンジンへ渡すテンプレート（既定 Chromium テンプレート等）には従来からの
+追加の防御層として、`capture_screenshots.py` の `DIRECT_NAVIGATION_ALLOWED_URLS`
+（`sites.json` の既定サイト URL をそのまま複製した固定リスト）に完全一致する
+URL のみへの直接ナビゲーションを許可し、それ以外（`--sites` に差し替えた
+任意の URL 等）は `skipped` として拒否する仕組みも残している。**この検証は
+`{url}` を含むテンプレートであれば必ず適用する**。同じテンプレートが
+`{html_path}` も併用している場合でも（例: エンジンへスナップショットのパスと
+元 URL の両方を渡すテンプレート）省略されない（旧実装は `{html_path}` の
+有無で分岐していたため、両方の placeholder を持つテンプレートでは許可リスト
+検査を素通りできた。codex P0 の再指摘）。任意 URL を撮影したい場合は `{url}`
+を使わず `{html_path}` のみのテンプレートを使うこと（取得後にリダイレクト先も
+検証する `_PublicOnlyRedirectHandler` を通る）。`sites.json` を更新した場合は
+この固定リストも合わせて更新する必要があり、乖離は
+`test_default_sites_urls_are_all_allowlisted` で検出される。
 
 保存した HTML はそのままだと `file://` の保存先パス基準で相対 URL が解決され、
 元の URL を直接開く Chromium と条件が食い違う。取得したスナップショットには
@@ -125,16 +184,28 @@ SSRF 検証はエンジン起動前の一時点の名前解決に基づくベス
 
 ### Servo のコマンド例
 
-PoC-6 の `servo-embed`（`{html_path}` を渡す想定）:
+`--allow-unproxied-engine` を使わない限り、`--servo-cmd` のテンプレートにも
+`{proxy}` を含める必要がある（上記「Servo（servoshell）のプロキシ対応に
+ついて」参照。servoshell が実際にこれを強制することまでは未検証）。
+
+PoC-6 の `servo-embed`（`{html_path}` を渡す想定。`servo-embed` 自体がプロキシ
+設定に対応するかは PoC-6 側の実装次第で、本ハーネスからは確認していない）:
 
 ```json
-["servo_embed_poc", "{html_path}", "{out}"]
+["servo_embed_poc", "{html_path}", "{out}", "--proxy", "{proxy}"]
 ```
 
-servoshell 系（TASK-36 で確定したオプション名に合わせて読み替える想定）:
+servoshell 系（TASK-36 で確定したオプション名に合わせて読み替える想定。
+`--pref` は servoshell が実際に持つ preference 名）:
 
 ```json
-["servoshell", "--headless", "--window-size", "{width}x{height}", "--output", "{out}", "{url}"]
+[
+  "servoshell", "--headless", "--window-size", "{width}x{height}",
+  "--output", "{out}",
+  "--pref", "network_http_proxy_uri={proxy}",
+  "--pref", "network_https_proxy_uri={proxy}",
+  "{url}"
+]
 ```
 
 ### Chromium の既定テンプレート
@@ -144,6 +215,7 @@ servoshell 系（TASK-36 で確定したオプション名に合わせて読み�
   "{chromium_bin}", "--headless=new", "--disable-gpu", "--hide-scrollbars",
   "--no-first-run", "--user-data-dir={user_data_dir}",
   "--window-size={width},{height}", "--force-device-scale-factor=1",
+  "--proxy-server={proxy}", "--proxy-bypass-list=<-loopback>",
   "--virtual-time-budget={settle_ms}", "--screenshot={out}", "{url}"
 ]
 ```
@@ -155,8 +227,11 @@ servoshell 系（TASK-36 で確定したオプション名に合わせて読み�
 （SEC 系: 偽装・回避機能の禁止）。`--force-device-scale-factor=1` は HiDPI ホスト
 （既定のデバイススケールが 1 でない環境）で PNG が `--window-size` の DPR 倍の
 寸法になり、`capture_one` の viewport 寸法一致検証で全サイトが `failed` になる
-問題への対策（Cursor Bugbot）。`--chromium-cmd` で独自テンプレートを使う場合は
-このフラグを自分で含める必要がある。
+問題への対策（Cursor Bugbot）。`--proxy-server={proxy}` / `--proxy-bypass-list=<-loopback>`
+は撮影プロセスの全通信をローカル転送プロキシへ強制する（上記「ローカル転送
+プロキシによる撮影プロセスの全通信フィルタ」参照）。`--chromium-cmd` で独自
+テンプレートを使う場合はこれらのフラグを自分で含める必要がある（含めない
+場合は `--allow-unproxied-engine` を明示しない限り撮影自体が拒否される）。
 
 ## 出力構造
 
@@ -260,6 +335,14 @@ python3 -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
 - `{url}` を直接エンジンへ渡す直接ナビゲーションは、上記の SSRF 検証に加えて
   `DIRECT_NAVIGATION_ALLOWED_URLS`（`sites.json` の既定サイト URL の固定リスト）
   への完全一致を要求する。任意 URL は `{html_path}` 経由でのみ撮影できる
+- 上記はいずれも撮影対象の最初の URL しか見ておらず、撮影プロセス自身が
+  以後たどるサブリソース・リダイレクトは防げない。そのため撮影プロセスの
+  全通信を、Python 標準ライブラリだけで書いたローカル転送プロキシ
+  （`start_filtering_proxy`）へ強制する。宛先を都度 `_resolve_public_addresses`
+  で検証し、検証で得た IP へ直接接続する（ホスト名の再解決をしない。DNS
+  リバインディング対策）。`{proxy}` を使わないテンプレートでの撮影は既定で
+  拒否する（`--allow-unproxied-engine` で明示的にオプトアウト）。詳細・限界は
+  上記「ローカル転送プロキシによる撮影プロセスの全通信フィルタ」を参照
 - 保存先ファイル（`snapshots/<site_id>.html`・`capture-result.json`）は
   `resolve()` 後に `--out-dir` 配下であることを確認し、既存の symlink があっても
   `O_NOFOLLOW`（`_write_bytes_nofollow`。Windows では `is_symlink()` 事前チェック）
@@ -271,6 +354,14 @@ python3 -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
   経由で末尾のみ読む）により、無制限のリソース確保を防ぐ。撮影済み PNG の
   検証も `stat` でのサイズ上限（`MAX_PNG_BYTES`＝64 MiB）確認を先に行い、
   超過分は `read_bytes()` で読まずに `failed` として扱う
+- 撮影済み PNG は IHDR・IEND の CRC 検証に加え、IDAT チャンクが 1 つ以上
+  存在し zlib として展開できること・展開後のバイト数が IHDR の幅・高さ・
+  色タイプ・ビット深度から計算した期待値と一致することまで確認する
+  （`zlib.decompressobj` の Adler-32 検証を含む）。IHDR だけを偽装した
+  解凍爆弾を防ぐため、展開前に期待サイズが `MAX_PNG_RAW_BYTES`（256 MiB）を
+  超えないことを確認し、展開中も 64 KiB 刻みで期待値超過を検知した時点で
+  打ち切る（画素データが存在しない・破損しているファイルを "ok" と誤判定
+  しない。codex P1）
 - `--timeout-sec` / `--settle-ms` / `--min-sites` は有限かつ範囲内の値のみを
   受け付け、`nan` / `inf` / 0 以下 / 極端に大きい値は起動時に拒否する
 - 撮影用の一時 `--user-data-dir`（Chromium）はテンプレート展開・スナップショット

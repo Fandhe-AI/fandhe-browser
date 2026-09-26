@@ -26,17 +26,21 @@ from __future__ import annotations
 
 import argparse
 import html
+import http.server
 import ipaddress
 import json
 import math
 import os
 import re
+import select
 import shutil
 import socket
+import socketserver
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -78,7 +82,33 @@ SNAPSHOT_MAX_BYTES = 5 * 1024 * 1024
 # （約 4 MiB）を大きく上回る値として 64 MiB を採用する。
 MAX_PNG_BYTES = 64 * 1024 * 1024
 
+# IDAT を展開した生ピクセルデータの上限（codex P1: 解凍爆弾対策）。IHDR の
+# 幅・高さ・色タイプ・ビット深度から計算される期待展開サイズがこれを超える
+# 場合は展開を試みずに拒否する。1280x800 の RGBA（フィルタバイト込み）で
+# 約 4.1 MiB なので、代表サイトの viewport を大きく上回る余裕を見て 256 MiB
+# とする。
+MAX_PNG_RAW_BYTES = 256 * 1024 * 1024
+
 STDERR_TAIL_CHARS = 2000
+
+# ローカル転送プロキシ（`start_filtering_proxy`）の設定。撮影プロセス（Chromium 等）
+# の全通信をここで宛先フィルタする（codex P0 再指摘: 最初の URL だけを検証しても
+# ページが読み込むサブリソース・リダイレクト・以後の遷移までは防げない）。
+PROXY_BIND_HOST = "127.0.0.1"
+# CONNECT（https）・絶対 URI の HTTP フォワードのいずれも、代表サイトの通常の
+# Web 閲覧で使う 80/443 のみに限定する（fail-closed。それ以外のポートは 403）。
+PROXY_ALLOWED_PORTS = frozenset({80, 443})
+# 同時接続数の上限（DoS 対策）。Chromium は 1 プロキシあたり既定で最大 32 本
+# 程度のソケットを張るため、余裕を見て 64 とする。
+PROXY_MAX_CONNECTIONS = 64
+# 接続・中継が沈黙したまま固着しないためのアイドルタイムアウト（秒）。
+PROXY_IDLE_TIMEOUT_SEC = 30
+# 1 接続あたりの転送量上限（往復合計。バイト）。無制限のリソース確保を防ぐ
+# （security.md OWASP「不安全な設計」）。HTTP/2 は 1 本の CONNECT トンネルで
+# サイト全体を多重化しうるため、単一ページ分として余裕を見て 256 MiB とする。
+PROXY_MAX_BYTES_PER_CONNECTION = 256 * 1024 * 1024
+# リクエストボディの上限（バイト）。
+PROXY_MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024
 
 CHROMIUM_BIN_CANDIDATES = ("chromium", "chromium-browser", "google-chrome")
 
@@ -95,6 +125,13 @@ DEFAULT_CHROMIUM_TEMPLATE = [
     # 検証（capture_one）で全サイトが `failed` になる（Cursor Bugbot Medium）。
     # デバイススケールを 1 に固定し、`{width}x{height}` の PNG を安定して得る。
     "--force-device-scale-factor=1",
+    # `start_filtering_proxy` が起動するローカル転送プロキシへ全通信を強制する
+    # （codex P0 再指摘: 最初の URL の検証だけではサブリソース・リダイレクト先を
+    # 防げない）。`--proxy-bypass-list=<-loopback>` は Chromium が暗黙に持つ
+    # loopback 宛のプロキシ除外を無効化し、`127.0.0.1` 等への接続もプロキシ経由に
+    # する（除外したままだと内部の loopback サービスへ直接到達できてしまう）。
+    "--proxy-server={proxy}",
+    "--proxy-bypass-list=<-loopback>",
     "--virtual-time-budget={settle_ms}",
     "--screenshot={out}",
     "{url}",
@@ -318,18 +355,19 @@ def _write_bytes_nofollow(path: Path, data: bytes) -> None:
 # --- `{html_path}` 用スナップショット取得 --------------------------------
 
 
-def _check_public_host(hostname: str | None, *, context: str) -> None:
-    """ホスト名がループバック・プライベート・リンクローカル等の内部アドレスでないことを確認する。
+def _resolve_public_addresses(hostname: str | None, port: int, *, context: str) -> list[tuple[str, int]]:
+    """ホスト名を解決し、すべての解決先アドレスがグローバルユニキャストであることを確認したうえで
+    検証済みの `(ip, port)` の一覧を返す。
 
     SSRF 対策（security.md OWASP A10・security.md「プロファイル境界」とは別軸の
     サーバー側リクエスト偽造防止）。IP リテラルはそのまま検証し、ホスト名は
     `getaddrinfo` で解決した「すべて」の候補アドレスが `is_global` であることを
     要求する（マルチホームでの部分的な内部アドレス混在を fail-closed に弾く）。
-    DNS 応答は検証後に変わりうる（DNS リバインディング）ため、これは接続前チェックの
-    ベストエフォートであり完全な対策ではない（本モジュールは urllib の単純な
-    GET のみで、接続確立と名前解決の間の TOCTOU を塞ぐ手段（IP 固定接続等）までは
-    持たない。将来必要になれば requests + カスタム HTTPAdapter 等の追加依存が要る
-    ためユーザー承認事項として扱う）。
+    DNS 応答は検証後に変わりうる（DNS リバインディング）ため、これは名前解決
+    時点のベストエフォートであり完全な対策ではない。呼び出し元は本関数が返した
+    IP へ直接接続し、ホスト名を再解決してはならない（`_ProxyRequestHandler` は
+    これを守って接続する。DNS リバインディング対策として、検証と接続の間で
+    別の名前解決を挟まないことが重要）。
     """
     if not hostname:
         raise SnapshotError(f"{context}: URL has no hostname")
@@ -342,16 +380,17 @@ def _check_public_host(hostname: str | None, *, context: str) -> None:
     if literal is not None:
         if not literal.is_global:
             raise SnapshotError(f"{context}: refusing non-global IP literal: {hostname}")
-        return
+        return [(hostname, port)]
 
     try:
-        infos = socket.getaddrinfo(hostname, None)
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
     except OSError as exc:
         raise SnapshotError(f"{context}: failed to resolve hostname {hostname}: {exc}") from exc
 
     if not infos:
         raise SnapshotError(f"{context}: hostname resolved to no addresses: {hostname}")
 
+    addresses: list[tuple[str, int]] = []
     for info in infos:
         addr = info[4][0]
         try:
@@ -362,6 +401,22 @@ def _check_public_host(hostname: str | None, *, context: str) -> None:
             raise SnapshotError(
                 f"{context}: hostname {hostname} resolves to a non-global address: {addr}"
             )
+        addresses.append((addr, port))
+    return addresses
+
+
+def _check_public_host(hostname: str | None, *, context: str) -> None:
+    """ホスト名がループバック・プライベート・リンクローカル等の内部アドレスでないことを確認する。
+
+    `_resolve_public_addresses` の判定結果（例外の送出可否）だけを使い、解決済み
+    アドレスの一覧は使わない呼び出し元（`fetch_snapshot` の最初の URL・直接
+    ナビゲーションの最初の URL）向けの薄いラッパー。これらは「最初の 1 リクエスト」
+    しか見ておらず、撮影されたページが読み込むサブリソースやリダイレクト・
+    エンジンが以後たどる遷移までは検証できない（codex P0 再指摘）。撮影プロセス
+    （Chromium 等）が行う全通信の宛先を制限するのは、この関数ではなく
+    `start_filtering_proxy` が起動するローカル転送プロキシの役目である。
+    """
+    _resolve_public_addresses(hostname, 0, context=context)
 
 
 class _PublicOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -465,21 +520,393 @@ def inject_base_href(html_bytes: bytes, url: str) -> bytes:
     return html_bytes[:insert_at] + base_tag + html_bytes[insert_at:]
 
 
+# --- 撮影プロセス向けローカル転送プロキシ ---------------------------------
+#
+# codex P0 再指摘: `_check_public_host` は撮影対象の「最初の URL」しか検証
+# しない。`{html_path}` 経由で保存したスナップショットが読み込む外部の
+# script/img/css・`{url}` 直接ナビゲーションのリダイレクト先には、起動後の
+# 撮影プロセス（Chromium 等）自身がそのままアクセスできてしまう。固定 URL
+# リストもページの内容や遷移先までは制限しない。
+#
+# そこで「最初の URL の検証を積み増す」のではなく、撮影プロセスの通信経路
+# そのものをこのローカル転送プロキシへ強制する（Chromium は
+# `--proxy-server={proxy}` + `--proxy-bypass-list=<-loopback>`）。宛先ホストを
+# 都度 `_resolve_public_addresses` で検証し、検証で得た IP （ホスト名の再解決
+# はしない。DNS リバインディング対策）へ直接接続する。非公開アドレスは
+# CONNECT・HTTP フォワードのいずれも 403 で拒否する。
+#
+# 正直に書いておくべき限界（README にも記載）:
+#   - UDP（WebRTC/STUN・QUIC 等）はこのプロキシを経由しないため制限できない
+#   - `file:` 等プロキシの対象外のスキームは制限できない
+#   - エンジンがプロキシ設定を無視・迂回する実装だった場合は防げない
+#     （`capture_one` は `{proxy}` を使わないテンプレートでの実行を既定で
+#     拒否する fail-closed 側の対策を別途持つ）
+#   - プロキシは認証なしで loopback にバインドするため、実行中は同じホスト上の
+#     他プロセスからも到達できる（開発機でのローカル実行を前提とし、認証・
+#     TLS 終端までは実装しない。将来必要になれば追加のユーザー承認事項とする）
+#   - 宛先の到達可否のみをフィルタし、TLS で暗号化された CONNECT トンネルの
+#     中身（実際にどの URL が取得されたか等）までは検査しない
+
+
+def _split_host_port(hostport: str, default_port: int) -> tuple[str, int]:
+    """`host:port` / `[ipv6]:port` / `host`（ポート省略）を分解する。"""
+    if hostport.startswith("["):
+        end = hostport.find("]")
+        if end == -1:
+            raise SnapshotError(f"malformed IPv6 host: {hostport!r}")
+        host = hostport[1:end]
+        rest = hostport[end + 1 :]
+        if rest.startswith(":"):
+            try:
+                return host, int(rest[1:])
+            except ValueError as exc:
+                raise SnapshotError(f"malformed port in {hostport!r}") from exc
+        return host, default_port
+    if ":" in hostport:
+        host, _, port_str = hostport.rpartition(":")
+        try:
+            return host, int(port_str)
+        except ValueError as exc:
+            raise SnapshotError(f"malformed port in {hostport!r}") from exc
+    return hostport, default_port
+
+
+def _connect_to_first_verified_address(addresses: list[tuple[str, int]], timeout: float) -> socket.socket:
+    """検証済みアドレスへ順に接続を試み、最初に成功したソケットを返す。
+
+    ホスト名は使わず `_resolve_public_addresses` が返した IP へ直接接続する
+    （DNS リバインディング対策。ここで再度ホスト名を解決しない）。
+    """
+    last_exc: OSError | None = None
+    for addr, port in addresses:
+        try:
+            return socket.create_connection((addr, port), timeout=timeout)
+        except OSError as exc:
+            last_exc = exc
+    raise SnapshotError(f"could not connect to any resolved address: {last_exc}")
+
+
+class _ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
+    """宛先を検証してから中継する、撮影プロセス専用のローカル転送プロキシハンドラ。
+
+    `CONNECT`（https 用トンネル）と、絶対 URI 形式の `GET`/`HEAD`/`POST`
+    （http 用フォワード）のみに対応する。origin-form のリクエストや他メソッドは
+    `BaseHTTPRequestHandler` の既定動作で 501 になる。1 接続につき 1 リクエスト
+    のみを扱い、`Connection: close` を強制する（keep-alive の複雑さを避ける）。
+    """
+
+    protocol_version = "HTTP/1.0"
+    timeout = PROXY_IDLE_TIMEOUT_SEC
+    server_version = "fandhe-filtering-proxy/0.1"
+    # `BaseHTTPRequestHandler`（`socketserver.StreamRequestHandler`）は既定で
+    # `rfile` をバッファリングする。CONNECT のヘッダ直後にクライアントが
+    # 追加データ（TLS ClientHello 等）を続けて送ると、そのバイトはこの
+    # バッファに残ったまま `_relay` の生ソケット read には現れず、トンネルの
+    # 先頭が欠落しうる。`rbufsize = 0` でバッファリングを無効化する。
+    rbufsize = 0
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        # 標準エラーへ大量にログを出さない（呼び出し元の撮影ログと混在させない）。
+        pass
+
+    def _deny_if_not_public(self, host: str | None, port: int) -> list[tuple[str, int]] | None:
+        if port not in PROXY_ALLOWED_PORTS:
+            self.send_error(403, f"port {port} is not allowed by the filtering proxy")
+            return None
+        try:
+            return _resolve_public_addresses(host, port, context=f"proxy target {host}:{port}")
+        except SnapshotError as exc:
+            self.send_error(403, str(exc))
+            return None
+
+    def do_CONNECT(self) -> None:  # noqa: N802
+        try:
+            host, port = _split_host_port(self.path, 443)
+        except SnapshotError as exc:
+            self.send_error(400, str(exc))
+            return
+        addresses = self._deny_if_not_public(host, port)
+        if addresses is None:
+            return
+        try:
+            upstream = _connect_to_first_verified_address(addresses, PROXY_IDLE_TIMEOUT_SEC)
+        except SnapshotError as exc:
+            self.send_error(502, str(exc))
+            return
+        try:
+            self.send_response(200, "Connection Established")
+            self.end_headers()
+            self._relay(self.connection, upstream)
+        finally:
+            upstream.close()
+
+    def _relay(self, client_sock: socket.socket, upstream_sock: socket.socket) -> None:
+        """CONNECT トンネル確立後、クライアント・upstream 間を双方向に中継する。"""
+        client_sock.setblocking(False)
+        upstream_sock.setblocking(False)
+        total = 0
+        sockets = [client_sock, upstream_sock]
+        while True:
+            try:
+                readable, _, _ = select.select(sockets, [], [], PROXY_IDLE_TIMEOUT_SEC)
+            except OSError:
+                return
+            if not readable:
+                return  # アイドルタイムアウト
+            for sock in readable:
+                other = upstream_sock if sock is client_sock else client_sock
+                try:
+                    data = sock.recv(65536)
+                except OSError:
+                    return
+                if not data:
+                    return
+                total += len(data)
+                if total > PROXY_MAX_BYTES_PER_CONNECTION:
+                    return
+                try:
+                    other.sendall(data)
+                except OSError:
+                    return
+
+    def _forward(self, method: str) -> None:
+        parsed = urlparse(self.path)
+        if parsed.scheme != "http" or not parsed.hostname:
+            self.send_error(400, "proxy requires an absolute-form http URL in the request line")
+            return
+        host = parsed.hostname
+        try:
+            # `parsed.port` はポート部が範囲外・非数値だと `ValueError` を送出する
+            # （例: 撮影対象ページが `<img src="http://x:99999/">` を持つ場合）。
+            # 未捕捉のまま伝播させるとハンドラスレッドが異常終了し、既定の
+            # `handle_error` が撮影ログへトレースバックを撒き散らす。
+            port = parsed.port or 80
+        except ValueError:
+            self.send_error(400, "invalid port in request-target")
+            return
+
+        if any(key.lower() == "transfer-encoding" for key in self.headers.keys()):
+            self.send_error(400, "chunked request bodies are not supported by this proxy")
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            self.send_error(400, "invalid Content-Length")
+            return
+        if content_length < 0 or content_length > PROXY_MAX_REQUEST_BODY_BYTES:
+            self.send_error(413, "request body too large")
+            return
+
+        addresses = self._deny_if_not_public(host, port)
+        if addresses is None:
+            return
+
+        body = self.rfile.read(content_length) if content_length else b""
+
+        target_path = parsed.path or "/"
+        if parsed.query:
+            target_path += "?" + parsed.query
+
+        outgoing_headers = []
+        for key in self.headers.keys():
+            lower = key.lower()
+            if lower in {
+                "proxy-connection",
+                "connection",
+                "keep-alive",
+                "proxy-authorization",
+                "proxy-authenticate",
+                "transfer-encoding",
+            }:
+                continue
+            outgoing_headers.append(f"{key}: {self.headers[key]}")
+        outgoing_headers.append("Connection: close")
+        request_bytes = (
+            f"{method} {target_path} HTTP/1.1\r\n" + "\r\n".join(outgoing_headers) + "\r\n\r\n"
+        ).encode("latin-1", errors="replace") + body
+
+        try:
+            upstream = _connect_to_first_verified_address(addresses, PROXY_IDLE_TIMEOUT_SEC)
+        except SnapshotError as exc:
+            self.send_error(502, str(exc))
+            return
+        try:
+            upstream.settimeout(PROXY_IDLE_TIMEOUT_SEC)
+            upstream.sendall(request_bytes)
+            total = 0
+            while True:
+                chunk = upstream.recv(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > PROXY_MAX_BYTES_PER_CONNECTION:
+                    break
+                self.connection.sendall(chunk)
+        except OSError:
+            pass
+        finally:
+            upstream.close()
+        self.close_connection = True
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._forward("GET")
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._forward("HEAD")
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._forward("POST")
+
+    def handle_one_request(self) -> None:
+        # 1 接続 1 リクエストに固定する（keep-alive を実装しない簡略化）。
+        super().handle_one_request()
+        self.close_connection = True
+
+
+class _FilteringProxyServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """接続ごとにスレッドを割り当てるプロキシサーバー。同時接続数を上限で制御する。
+
+    `process_request`（accept ループ側で同期的に呼ばれる）で
+    `threading.BoundedSemaphore` を取得してから `ThreadingMixIn` の実装へ委譲し、
+    新規スレッドを立てる。上限に達している間は accept ループ自体をブロックさせ、
+    無制限にスレッドを増やさない（DoS 対策）。取得したセマフォは、実際の処理を
+    行うスレッド（`process_request_thread`）の終了時に解放する。
+
+    注意（`stop_filtering_proxy` から `shutdown()` を呼ぶ際）: 全 64 スロットが
+    使用中のときに `shutdown()` を呼ぶと、accept ループは `process_request` の
+    `semaphore.acquire()` でブロックしたままになり、既存の接続が終わる
+    （またはアイドルタイムアウトで打ち切られる。最悪 `PROXY_IDLE_TIMEOUT_SEC`
+    秒）まで停止が完了しない。撮影プロセス自体は `finally`（`capture_one`）で
+    既に終了しているのが通常のため実運用上は問題にならないが、次に読む人が
+    再発見しなくて済むよう明記しておく。
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._connection_semaphore = threading.BoundedSemaphore(PROXY_MAX_CONNECTIONS)
+
+    def process_request(self, request: socket.socket, client_address: Any) -> None:
+        self._connection_semaphore.acquire()
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request: socket.socket, client_address: Any) -> None:
+        try:
+            self.finish_request(request, client_address)
+        except Exception:  # noqa: BLE001 - 1 接続の異常でサーバー全体を落とさない
+            self.handle_error(request, client_address)
+        finally:
+            self.shutdown_request(request)
+            self._connection_semaphore.release()
+
+    def handle_error(self, request: socket.socket, client_address: Any) -> None:
+        # 既定実装はフルトレースバックを標準エラーへ出力する。撮影対象の
+        # ページ（信頼できない外部入力）が誘発しうるエラーで撮影ログを
+        # 埋め尽くさないよう、要点だけの 1 行に絞る。
+        exc = sys.exc_info()[1]
+        print(f"filtering proxy: error handling request from {client_address}: {exc}", file=sys.stderr)
+
+
+def start_filtering_proxy() -> tuple[_FilteringProxyServer, threading.Thread, str]:
+    """撮影プロセス専用のローカル転送プロキシを起動し、`(server, thread, proxy_url)` を返す。
+
+    `main` がキャプチャループの前に呼び出し、`finally` で必ず `stop_filtering_proxy`
+    を呼んで停止する。`127.0.0.1` の空きポート（`0` 指定）にバインドするため、
+    複数プロセスの同時実行でも衝突しない。
+    """
+    server = _FilteringProxyServer((PROXY_BIND_HOST, 0), _ProxyRequestHandler)
+    host, port = server.server_address[:2]
+    thread = threading.Thread(target=server.serve_forever, name="filtering-proxy", daemon=True)
+    thread.start()
+    return server, thread, f"http://{host}:{port}"
+
+
+def stop_filtering_proxy(server: _FilteringProxyServer, thread: threading.Thread) -> None:
+    """`start_filtering_proxy` が起動したプロキシを止める。"""
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=PROXY_IDLE_TIMEOUT_SEC)
+
+
 # --- PNG ヘッダ検証 ------------------------------------------------------
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
+# 有効な (color_type, 許可される bit_depth 集合, 1 ピクセルあたりのチャンネル数)。
+# PNG 仕様（RFC 2083 相当）が定める組み合わせのみを許可する。
+_PNG_COLOR_TYPE_INFO: dict[int, tuple[set[int], int]] = {
+    0: ({1, 2, 4, 8, 16}, 1),  # グレースケール
+    2: ({8, 16}, 3),  # RGB
+    3: ({1, 2, 4, 8}, 1),  # パレット
+    4: ({8, 16}, 2),  # グレースケール + アルファ
+    6: ({8, 16}, 4),  # RGBA
+}
+
+
+def _expected_raw_size(width: int, height: int, color_type: int, bit_depth: int, interlace: int) -> int:
+    """IHDR の値から、フィルタバイトを含む展開後の生データサイズ（バイト）を計算する。
+
+    `read_png_size` が IDAT を展開した結果の妥当性（解凍できるだけでなく画像
+    サイズと矛盾しないこと）を検証するために使う（codex P1）。インターレース
+    （Adam7）は 7 パスそれぞれが独立した行を持つため、パスごとに計算して
+    合算する。
+    """
+    info = _PNG_COLOR_TYPE_INFO.get(color_type)
+    if info is None:
+        raise PngError(f"unsupported PNG color type: {color_type}")
+    allowed_depths, channels = info
+    if bit_depth not in allowed_depths:
+        raise PngError(f"invalid bit depth {bit_depth} for color type {color_type}")
+
+    def row_bytes(w: int) -> int:
+        return (w * channels * bit_depth + 7) // 8
+
+    if interlace == 0:
+        return height * (1 + row_bytes(width))
+    if interlace != 1:
+        raise PngError(f"unsupported PNG interlace method: {interlace}")
+
+    # Adam7: (x_start, y_start, x_step, y_step) の 7 パス。
+    total = 0
+    for x_start, y_start, x_step, y_step in (
+        (0, 0, 8, 8),
+        (4, 0, 8, 8),
+        (0, 4, 4, 8),
+        (2, 0, 4, 4),
+        (0, 2, 2, 4),
+        (1, 0, 2, 2),
+        (0, 1, 1, 2),
+    ):
+        pass_w = max(0, (width - x_start + x_step - 1) // x_step)
+        pass_h = max(0, (height - y_start + y_step - 1) // y_step)
+        if pass_w == 0 or pass_h == 0:
+            continue
+        total += pass_h * (1 + row_bytes(pass_w))
+    return total
+
+
 def read_png_size(path: Path) -> tuple[int, int]:
-    """PNG のシグネチャ・チャンク構造を検証し、IHDR の (width, height) を返す。
+    """PNG のシグネチャ・チャンク構造・IDAT の展開可否を検証し、IHDR の (width, height) を返す。
 
     撮影プロセスがクラッシュ・途中終了して壊れた PNG を残した場合でも、寸法だけが
     偶然一致すれば `capture_one` が "ok" と誤判定してしまう（codex P1）。そこで
     先頭 33 バイトの IHDR だけでなく、シグネチャ直後から全チャンクを順に走査し、
     各チャンクの CRC32（`zlib.crc32`）を検証しつつ末尾が `IEND` チャンクで
     ちょうど終わっている（トレイリングの欠落・余剰データが無い）ことまで確認する。
-    IDAT のピクセルデータそのものの deflate 展開・画素比較までは行わない
-    （全体の内容比較は #54 の measure_ssim.py が担う。REPAIR-3）。
+
+    さらに、IHDR と IEND だけが揃っていて IDAT が無い（＝画素データが存在しない）
+    ファイルや、IDAT はあっても zlib として展開できない・展開結果が IHDR の
+    寸法と矛盾するファイルを "ok" と誤判定しないよう、IDAT チャンクを連結して
+    `zlib.decompressobj` で逐次展開し、Adler-32 検証（`decompressobj` が内部で
+    行う）を含めて完走することと、展開後のバイト数が IHDR から計算した期待値と
+    一致することまで確認する（codex P1 再指摘）。画素の内容比較（SSIM 等）は
+    引き続き #54 の measure_ssim.py が担う（REPAIR-3）。
+
+    展開後サイズは IHDR の値から `MAX_PNG_RAW_BYTES` 超過を検知した時点で
+    打ち切り、細工した IHDR（巨大な width/height）による解凍爆弾を防ぐ。
 
     エンジンが暴走・破損して巨大な PNG を書き出した場合に `read_bytes()` で
     無制限にメモリへ確保しないよう、内容を読む前に `stat` でサイズを確認し
@@ -503,8 +930,13 @@ def read_png_size(path: Path) -> tuple[int, int]:
 
     width: int | None = None
     height: int | None = None
+    color_type: int | None = None
+    bit_depth: int | None = None
+    interlace: int | None = None
+    idat_chunks: list[bytes] = []
     offset = len(PNG_SIGNATURE)
     seen_iend = False
+    seen_non_idat_after_idat = False
     while offset < len(data):
         if offset + 8 > len(data):
             raise PngError(f"truncated PNG chunk header: {path}")
@@ -528,14 +960,32 @@ def read_png_size(path: Path) -> tuple[int, int]:
                 raise PngError(f"IHDR chunk too short: {path}")
             (width,) = struct.unpack(">I", chunk_data[0:4])
             (height,) = struct.unpack(">I", chunk_data[4:8])
+            bit_depth = chunk_data[8]
+            color_type = chunk_data[9]
+            compression_method = chunk_data[10]
+            filter_method = chunk_data[11]
+            interlace = chunk_data[12]
+            if compression_method != 0:
+                raise PngError(f"unsupported PNG compression method: {compression_method}")
+            if filter_method != 0:
+                raise PngError(f"unsupported PNG filter method: {filter_method}")
+        elif chunk_type == b"IDAT":
+            if width is None:
+                raise PngError(f"IDAT chunk before IHDR: {path}")
+            if seen_non_idat_after_idat:
+                raise PngError(f"non-contiguous IDAT chunks: {path}")
+            idat_chunks.append(chunk_data)
         elif chunk_type == b"IEND":
             seen_iend = True
             offset = crc_end
             break
+        else:
+            if idat_chunks:
+                seen_non_idat_after_idat = True
 
         offset = crc_end
 
-    if width is None or height is None:
+    if width is None or height is None or bit_depth is None or color_type is None or interlace is None:
         raise PngError(f"missing IHDR chunk: {path}")
     if not seen_iend:
         raise PngError(f"missing IEND chunk (truncated PNG): {path}")
@@ -543,6 +993,42 @@ def read_png_size(path: Path) -> tuple[int, int]:
         raise PngError(f"trailing data after IEND chunk: {path}")
     if width == 0 or height == 0:
         raise PngError(f"PNG has zero width or height: {path}")
+    if not idat_chunks:
+        raise PngError(f"missing IDAT chunk (no pixel data): {path}")
+
+    expected_raw_size = _expected_raw_size(width, height, color_type, bit_depth, interlace)
+    if expected_raw_size > MAX_PNG_RAW_BYTES:
+        raise PngError(
+            f"IHDR declares a decompressed size ({expected_raw_size} bytes) exceeding the "
+            f"{MAX_PNG_RAW_BYTES} byte limit: {path}"
+        )
+
+    decompressor = zlib.decompressobj()
+    decoded_size = 0
+    try:
+        for chunk_data in idat_chunks:
+            remaining = chunk_data
+            while remaining:
+                # 64 KiB ずつ展開し、期待サイズを超えた時点で即座に打ち切る
+                # （解凍爆弾対策。IHDR 由来の期待値を信用しすぎないための二重の
+                # 歯止め）。
+                decoded = decompressor.decompress(remaining, 65536)
+                decoded_size += len(decoded)
+                if decoded_size > expected_raw_size:
+                    raise PngError(f"IDAT decompresses larger than the IHDR-derived size: {path}")
+                remaining = decompressor.unconsumed_tail
+        decoded_size += len(decompressor.flush())
+    except zlib.error as exc:
+        raise PngError(f"IDAT is not valid zlib data (corrupted PNG): {path}: {exc}") from exc
+
+    if not decompressor.eof or decompressor.unused_data:
+        raise PngError(f"IDAT stream does not end cleanly (corrupted PNG): {path}")
+    if decoded_size != expected_raw_size:
+        raise PngError(
+            f"decompressed IDAT size {decoded_size} does not match the IHDR-derived size "
+            f"{expected_raw_size}: {path}"
+        )
+
     return width, height
 
 
@@ -617,11 +1103,21 @@ def capture_one(
     timeout_sec: float,
     allow_file_url: bool,
     dry_run: bool,
+    proxy_url: str | None = None,
+    allow_unproxied_engine: bool = False,
 ) -> dict[str, Any]:
     """1 サイト × 1 エンジンの撮影を実行し、結果レコード（dict）を返す。
 
     `dry_run=True` の場合は実際のプロセス実行・ファイル書き込み（スナップショット取得を
     含む）を一切行わず、展開済みコマンドだけを含む結果を返す（out-dir 配下には何も作らない）。
+
+    `proxy_url` は `start_filtering_proxy` が起動したローカル転送プロキシの
+    URL（`http://127.0.0.1:<port>`）。テンプレートが `{proxy}` を使う場合のみ
+    `values["proxy"]` へ渡す。`allow_unproxied_engine=True` を明示しない限り、
+    実行時（非 dry-run）に `{proxy}` を使わないテンプレートでの撮影は拒否する
+    （codex P0 再指摘: 最初の URL だけの検証では、撮影プロセス自身が読み込む
+    サブリソースやリダイレクト先を制限できないため、通信経路そのものを
+    プロキシへ強制することを既定にする）。
     """
     out_path = out_dir / engine / f"{site.site_id}.png"
     # `resolve()` した出力先が out-dir 配下にあることを確認する（パストラバーサル対策）。
@@ -633,6 +1129,7 @@ def capture_one(
     needs_url = template_uses(template, "url")
     needs_user_data_dir = template_uses(template, "user_data_dir")
     needs_chromium_bin = template_uses(template, "chromium_bin")
+    needs_proxy = template_uses(template, "proxy")
 
     values: dict[str, str] = {
         "url": site.url,
@@ -653,6 +1150,14 @@ def capture_one(
             else:
                 raise CaptureError("chromium binary could not be resolved")
         values["chromium_bin"] = chromium_bin
+
+    if needs_proxy:
+        if dry_run:
+            values["proxy"] = proxy_url if proxy_url is not None else "<proxy>"
+        else:
+            if proxy_url is None:
+                raise CaptureError("template uses {proxy} but capture_one was not given a proxy_url")
+            values["proxy"] = proxy_url
 
     if dry_run:
         if needs_user_data_dir:
@@ -686,6 +1191,20 @@ def capture_one(
             values["user_data_dir"] = user_data_dir
 
         argv = expand_template(template, values)
+
+        if not needs_proxy and not allow_unproxied_engine:
+            # fail-closed: `{proxy}` を使わないテンプレートは、撮影プロセスの
+            # 通信経路を一切フィルタしないまま実プロセスを起動することになる
+            # （codex P0 再指摘）。`--allow-unproxied-engine` はネットワークを
+            # 完全に遮断した環境やテスト専用の意図的なオプトインに限る。
+            return _skip_result(
+                site,
+                engine,
+                argv,
+                "refusing to launch an engine without routing its traffic through the "
+                "filtering proxy; add {proxy} to the command template or pass "
+                "--allow-unproxied-engine for network-isolated test environments only",
+            )
 
         if needs_html:
             # `snapshots/<site_id>.html` の保存先が out-dir 配下にあることを
@@ -1004,6 +1523,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow file: URLs when fetching {html_path} snapshots (test fixtures only).",
     )
+    parser.add_argument(
+        "--allow-unproxied-engine",
+        action="store_true",
+        help=(
+            "Allow launching an engine whose command template does not use {proxy} "
+            "(the local filtering proxy). Only for network-isolated test environments; "
+            "without a proxy, the engine's own subresource/redirect traffic is not "
+            "filtered for SSRF."
+        ),
+    )
     return parser
 
 
@@ -1059,29 +1588,44 @@ def main(argv: list[str] | None = None) -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
     snapshots_dir = out_dir / "snapshots"
 
+    # `{proxy}` を使うテンプレート（既定 Chromium テンプレートを含む）向けに、
+    # 撮影プロセスの全通信を宛先フィルタするローカル転送プロキシを起動する
+    # （codex P0 再指摘）。`--dry-run` はプロセスを実行しないため起動しない。
+    proxy_server: _FilteringProxyServer | None = None
+    proxy_thread: threading.Thread | None = None
+    proxy_url: str | None = None
+    if not args.dry_run:
+        proxy_server, proxy_thread, proxy_url = start_filtering_proxy()
+
     captures: list[dict[str, Any]] = []
     try:
-        for engine in engines:
-            template = templates[engine]
-            for site in sites:
-                record = capture_one(
-                    site,
-                    engine,
-                    template,
-                    out_dir=out_dir,
-                    snapshots_dir=snapshots_dir,
-                    chromium_bin=chromium_bin if engine == "chromium" else None,
-                    width=viewport["width"],
-                    height=viewport["height"],
-                    settle_ms=args.settle_ms,
-                    timeout_sec=args.timeout_sec,
-                    allow_file_url=args.allow_file_url,
-                    dry_run=args.dry_run,
-                )
-                captures.append(record)
-    except CaptureError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        try:
+            for engine in engines:
+                template = templates[engine]
+                for site in sites:
+                    record = capture_one(
+                        site,
+                        engine,
+                        template,
+                        out_dir=out_dir,
+                        snapshots_dir=snapshots_dir,
+                        chromium_bin=chromium_bin if engine == "chromium" else None,
+                        width=viewport["width"],
+                        height=viewport["height"],
+                        settle_ms=args.settle_ms,
+                        timeout_sec=args.timeout_sec,
+                        allow_file_url=args.allow_file_url,
+                        dry_run=args.dry_run,
+                        proxy_url=proxy_url,
+                        allow_unproxied_engine=args.allow_unproxied_engine,
+                    )
+                    captures.append(record)
+        except CaptureError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    finally:
+        if proxy_server is not None and proxy_thread is not None:
+            stop_filtering_proxy(proxy_server, proxy_thread)
 
     if args.dry_run:
         for record in captures:
