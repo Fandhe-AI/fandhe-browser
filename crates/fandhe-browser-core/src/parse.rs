@@ -27,15 +27,15 @@
 //!
 //! # 呼び出し文脈
 //!
-//! `fetch`（#36）が取得した HTML 文字列・バイト列を受け取り、`dom`（#39）が
-//! 追加する走査 API・`query`（#41）が使う arena を構築する前段を担う。
-//! 公開する要素名アクセサの形（atom で返すか `&str` で返すか）は #39 に委ねる。
+//! `fetch`（#36）が取得した HTML 文字列・バイト列を受け取り、`dom`（TASK-24.5・
+//! #39）が提供する走査 API・要素名アクセサ（[`crate::dom::Document::local_name`]
+//! 等）・`query`（#41）が使う arena を構築する前段を担う。
 //!
 //! # スコープ外（別 Issue）
 //!
 //! 文字コード検出（`CORE-5` (7)）・Shadow DOM（`CORE-5` (5)。
 //! `allow_declarative_shadow_roots` を常に `false` として無効化）・
-//! `<option>` の選択値解決（`CORE-5` (4)）・DOM の走査 API（#39）はスコープ外。
+//! `<option>` の選択値解決（`CORE-5` (4)）はスコープ外。
 
 use crate::dom::{Attribute, Document, Node, NodeData, NodeId, QuirksMode};
 use crate::error::{Error, ParseError, Result};
@@ -945,19 +945,6 @@ impl TreeSink for ArenaSink {
         // Shadow DOM は本 crate のスコープ外（`CORE-5` (5)）のため、宣言的
         // shadow root の付与を常に拒否する。
         false
-    }
-}
-
-// `NodeId` に crate 内からのみ構築・インデックス取得を許す薄いヘルパーを
-// 追加する（`dom` モジュール本体の走査 API とは独立に、本モジュールが
-// arena を組み立てるためだけに使う）。
-impl NodeId {
-    const fn new(index: usize) -> Self {
-        NodeId(index)
-    }
-
-    const fn index(self) -> usize {
-        self.0
     }
 }
 
