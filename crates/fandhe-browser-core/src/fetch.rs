@@ -43,7 +43,7 @@
 //! - gzip 等の展開・HTTP/2・プロキシ設定: 挙動の決定性を優先し、`no_proxy()`
 //!   で環境変数のプロキシ設定を無視する
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -368,10 +368,23 @@ fn is_disallowed_ipv4(v4: Ipv4Addr) -> bool {
         || octets[0] >= 224 // 224.0.0.0/4 マルチキャスト + 240.0.0.0/4 予約済み
 }
 
+/// IPv6 アドレスが非推奨のサイトローカルブロック `fec0::/10`
+/// （RFC 3879 で非推奨だが到達可能な環境が残る内部アドレス）に属するかを
+/// 判定する。`std::net::Ipv6Addr` にはこの判定の安定 API が無い
+/// （`is_unique_local` は現行の `fc00::/7` のみを対象とし `fec0::/10` を
+/// カバーしない）ため、先頭 10 ビット（`segments()[0] & 0xffc0 == 0xfec0`）
+/// を直接検査する（CORE-1。#36 PR #430 コードレビュー指摘）。
+fn is_ipv6_site_local(v6: Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xffc0) == 0xfec0
+}
+
 /// [`IpAddr`] が内部アドレス（ループバック・プライベートアドレス等）か
 /// どうかを判定する（[`SafeResolver`] から使う）。IPv6 の v4-mapped
 /// アドレス（`::ffff:a.b.c.d`）は埋め込まれた IPv4 アドレスとして判定し、
-/// v4 側の分類をすり抜けられないようにする。
+/// v4 側の分類をすり抜けられないようにする。IP リテラル指定経路
+/// （[`url_ip_literal`]）・DNS 解決経路（[`SafeResolver::resolve`]）の
+/// 双方がこの関数を経由するため、ここで拒否対象を追加すれば両経路に
+/// 反映される。
 fn is_disallowed_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_disallowed_ipv4(v4),
@@ -380,6 +393,7 @@ fn is_disallowed_address(ip: IpAddr) -> bool {
                 || v6.is_unspecified()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
+                || is_ipv6_site_local(v6)
                 || v6.to_ipv4_mapped().is_some_and(is_disallowed_ipv4)
         }
     }
@@ -997,7 +1011,9 @@ mod tests {
     }
 
     /// CORE-1（#36。PR #430 コードレビュー指摘）: `is_disallowed_address` は
-    /// IPv6 のループバック・ユニークローカル・リンクローカル、および
+    /// IPv6 のループバック・ユニークローカル・リンクローカル・非推奨の
+    /// サイトローカル（`fec0::/10`。PR #430 コードレビュー指摘。RFC 3879 で
+    /// 非推奨だが到達可能な環境が残るため引き続き拒否する）、および
     /// v4-mapped アドレス（`::ffff:127.0.0.1`）に埋め込まれた IPv4 側の
     /// 分類のいずれもすり抜けない。
     #[test]
@@ -1007,6 +1023,8 @@ mod tests {
             "::",               // unspecified
             "fc00::1",          // unique local
             "fe80::1",          // unicast link-local
+            "fec0::1",          // 非推奨サイトローカル（fec0::/10 の先頭）
+            "feff:ffff::1",     // 非推奨サイトローカル（fec0::/10 の末尾）
             "::ffff:127.0.0.1", // v4-mapped loopback
             "::ffff:10.0.0.1",  // v4-mapped private
         ];
