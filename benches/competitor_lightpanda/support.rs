@@ -427,28 +427,33 @@ pub const FIXTURE_TABLE: &[(&str, &str, &str)] = &[
 /// （`validate_mcp_response`）でありさえすれば遷移成功とみなしており、
 /// 対象ブラウザが実際にはそのページへ遷移していなくても（例えば直前の
 /// ページに留まったまま）、直前のページの `html`/`tree` を当該 fixture の
-/// 成功サンプルとして記録できてしまっていた。MCP 側に「現在の URL」を
-/// 取得する専用 API があるとは限らないためそれには依存せず、各ページの
-/// `<title>` テキスト（`FIXTURE_TABLE` の既存コンテンツにすでに存在する、
-/// fixture ごとに固有のテキストを流用する。fixture ファイル自体への変更は
-/// 不要）を、`goto` 後に取得した `html`・`tree` の応答本文それぞれが
-/// 含んでいるかを確認する材料として使う。`<title>` は「html」（生の
-/// マークアップに近い表現なら文字列としてそのまま含まれる）・「tree」
-/// （アクセシビリティツリーの文脈でも文書のアクセシブルネームとして
-/// 表れ得る）のどちらでも見つかる可能性が高い要素として選んだ
-/// （コーディネーター指示: 「tree に可視テキストが載る前提が成り立たない
-/// なら、tree 側は title やアクセシブルネームなど tree に確実に現れる
-/// 要素で検証する」）。
+/// 成功サンプルとして記録できてしまっていた。
 ///
+/// レビュー指摘（Codex P1・measure.rs:1505 / Cursor Medium・support.rs:452。
+/// PR #442 再々々々々々々々々々々レビュー）: 当初は各ページの `<title>`
+/// テキストをマーカーに使っていたが、`<title>` は `<head>` にしか存在せず、
+/// アクセシビリティツリー（`tree`）に現れる保証が無い（多くのアクセシビリ
+/// ティツリー実装は文書の `accessible name` を `<title>` から採ることは
+/// あるが、それは実装依存であり保証ではない）ため、実ブラウザでは
+/// `tree` 側の検証が常に失敗し得た。マーカーは `<body>` 内の可視見出し
+/// （各 fixture 既存の `<h1>`）のテキストに変更した。見出し要素は
+/// アクセシビリティツリーで heading ロールのノード名として確実に表れる
+/// （WAI-ARIA のロールマッピング）ため、`tree` 側でも見つかる可能性が
+/// 高い。MCP 側に「現在の URL」を取得する専用 API があるとは限らないため
+/// それには依存せず、`goto` 後に取得した `html`・`tree` の応答本文それぞれ
+/// が、このマーカーを含んでいるかを確認する材料として使う。
+///
+/// マーカーが `<body>` 内の見出し要素のテキストとして実在すること（`<head>`
+/// 内のみの出現は不可）は `fixture_markers_appear_as_body_heading_text` が、
 /// マーカー同士が互いの部分文字列にならないこと（一意性）は
 /// `fixture_markers_are_mutually_exclusive` が保証する。fixture を
 /// 追加・削除した場合は、対応するマーカーもここへ追加・削除すること
 /// （`fixture_table_and_markers_cover_the_same_paths` が両テーブルの
 /// パス集合の一致を検証する）。
 pub const FIXTURE_MARKERS: &[(&str, &str)] = &[
-    ("/article.html", "Sample Article"),
-    ("/listing.html", "Sample Listing"),
-    ("/form.html", "Sample Form"),
+    ("/article.html", "A Short Note on Static Fixtures"),
+    ("/listing.html", "Sample Item Listing"),
+    ("/form.html", "Sample Sign-in Form"),
 ];
 
 /// リクエストパスに完全一致する [`FIXTURE_MARKERS`] のマーカー文字列を返す。
@@ -2144,16 +2149,48 @@ mod tests {
         );
     }
 
+    // レビュー指摘（Codex P1・measure.rs:1505 / Cursor Medium・support.rs:452。
+    // PR #442 再々々々々々々々々々々レビュー）: マーカーが単に fixture の
+    // どこかに出現するだけでは不十分（`<title>`（`<head>` 内）にしか無い
+    // 文字列は、アクセシビリティツリーに現れる保証が無いため）。マーカーが
+    // `<body>` 内の見出し要素（`<h1>`）のテキストとして実在すること、かつ
+    // `<head>` 内には（見出しタグとしては）現れないことを確認する。
     #[test]
-    fn fixture_markers_appear_in_their_own_fixture_content() {
+    fn fixture_markers_appear_as_body_heading_text() {
         for (path, _content_type, content) in FIXTURE_TABLE {
             let marker = fixture_marker(path).unwrap_or_else(|| {
                 panic!("no marker registered for {path} (see fixture_table_and_markers_cover_the_same_paths)")
             });
+            let heading_tag = format!("<h1>{marker}</h1>");
+
+            let body_start = content
+                .find("<body")
+                .unwrap_or_else(|| panic!("fixture {path} has no <body> tag"));
+            let body_end = content
+                .find("</body>")
+                .unwrap_or_else(|| panic!("fixture {path} has no </body> tag"));
             assert!(
-                content.contains(marker),
-                "fixture {path} does not contain its own marker {marker:?}"
+                body_end > body_start,
+                "fixture {path}: </body> appears before <body>"
             );
+            let body = &content[body_start..body_end];
+            assert!(
+                body.contains(&heading_tag),
+                "fixture {path}: marker {marker:?} must appear as the text of a heading \
+                 element (expected to find {heading_tag:?}) inside <body>; a marker that only \
+                 exists in <head> (e.g. <title>) is not guaranteed to appear in an \
+                 accessibility tree"
+            );
+
+            if let (Some(head_start), Some(head_end)) =
+                (content.find("<head>"), content.find("</head>"))
+            {
+                let head = &content[head_start..head_end];
+                assert!(
+                    !head.contains(&heading_tag),
+                    "fixture {path}: the marker heading tag must live in <body>, not <head>"
+                );
+            }
         }
     }
 

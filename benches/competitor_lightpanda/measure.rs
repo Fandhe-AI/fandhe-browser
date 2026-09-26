@@ -1494,11 +1494,22 @@ pub fn measure_token_reduction(
         // MCP 側に「現在の URL」を取得する専用 API があるとは限らないため
         // それには依存せず、`html`・`tree` の応答内容そのものに、この
         // fixture 固有の一意なマーカー（`crate::support::fixture_marker`。
-        // 各ページの `<title>`）が含まれているかを確認する。html・tree の
-        // どちらか一方でも欠けていれば、直前のページのままである・遷移に
-        // 失敗した等の疑いがあるため、その試行を計測失敗にする
-        // （黙って直前のページの内容を当該 fixture の成功サンプルとして
-        // 記録しない）。
+        // 各ページ `<body>` 内の可視見出し `<h1>` のテキスト）が含まれて
+        // いるかを確認する。
+        //
+        // レビュー指摘（Codex P1・measure.rs:1505 / Cursor Medium・
+        // support.rs:452。PR #442 再々々々々々々々々々々レビュー）: 当初は
+        // `<title>` テキストをマーカーにしていたが、`<title>` は `<head>`
+        // にしか存在せずアクセシビリティツリー（`tree`）に現れる保証が
+        // 無いため、実ブラウザでは `tree` 側の検証が常に失敗し得た
+        // （`support::FIXTURE_MARKERS` のドキュメント参照）。見出し要素
+        // （heading ロール）はアクセシビリティツリーに確実に名前として
+        // 表れるため、マーカーを `<h1>` のテキストへ変更した。
+        //
+        // html・tree のどちらか一方でも欠けていれば、直前のページの
+        // ままである・遷移に失敗した等の疑いがあるため、その試行を計測
+        // 失敗にする（黙って直前のページの内容を当該 fixture の成功
+        // サンプルとして記録しない）。
         if !html.contains(marker) {
             failed.push(format!(
                 "{url}: goto navigation could not be verified: html response does not contain the fixture marker {marker:?}"

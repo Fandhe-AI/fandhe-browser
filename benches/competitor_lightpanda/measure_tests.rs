@@ -136,8 +136,9 @@ fn run_fake_cdp(args: &[String], valid: bool) {
 /// `html`/`tree` の応答文字数は [`HTML_TEXT_LEN`]/[`TREE_TEXT_LEN`] に固定し、
 /// トークン削減率（`AISNAP-1`）の期待値を具体値で検証できるようにする
 /// （coding-rust.md「テスト」: 「期待値は具体値で書く」）。それぞれの
-/// テキストは「その `goto` が最後に指した fixture のマーカー」（各ページの
-/// `<title>`。`support::fixture_marker`） + 埋め草文字で固定長にした文字列にする。
+/// テキストは「その `goto` が最後に指した fixture のマーカー」（各ページ
+/// `<body>` 内の見出し `<h1>` のテキスト。`support::fixture_marker`） + 埋め草
+/// 文字で固定長にした文字列にする。
 ///
 /// `stale` が `true` の場合、`goto` を受けてもマーカーを更新しない（最初の
 /// `goto` のマーカーを使い続ける）ことで、「2 件目以降の `goto` の後も
