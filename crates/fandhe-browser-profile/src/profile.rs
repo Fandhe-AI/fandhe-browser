@@ -104,7 +104,12 @@ pub enum DataKind {
 impl DataKind {
     /// 全データ種別を列挙する（`Profile::open` の作成ループ、`data_dir` の
     /// テスト、#179 の隔離テストが共有する一覧）。
-    pub const ALL: [DataKind; 4] = [
+    ///
+    /// スライスで公開する（固定長配列 `[DataKind; N]` にしない）。`N` は
+    /// 公開シグネチャの一部になるため、配列のままだと将来バリアントを
+    /// 追加した際に呼び出し元の型が変わり、`#[non_exhaustive]`（REPAIR-4）が
+    /// 意図する非破壊性と矛盾する（PR #437 レビュー指摘を反映）。
+    pub const ALL: &'static [DataKind] = &[
         DataKind::Cookies,
         DataKind::Storage,
         DataKind::Cache,
@@ -157,13 +162,18 @@ impl Profile {
     ///   ディレクトリ以外として存在する場合 [`ProfileError::InvalidLayout`]
     ///   （symlink 先のパーミッションを変更しないよう、chmod より前に検査する）
     pub fn open(root: impl AsRef<Path>) -> Result<Profile, ProfileError> {
-        let root = root.as_ref().to_path_buf();
+        // `Path::components()` を経由して再構築し、末尾区切り文字（例:
+        // "root/"）を除去する。Unix の `lstat` は末尾に区切り文字が付いた
+        // パスだと最終要素が symlink でも実体をたどってしまうため、
+        // 末尾区切り文字が残ったままだと `ensure_real_directory` の
+        // symlink 検出をすり抜ける（PR #437 Bugbot 指摘）。
+        let root: PathBuf = root.as_ref().components().collect();
 
         std::fs::create_dir_all(&root)?;
         ensure_real_directory(&root)?;
         set_dir_permissions_0700(&root)?;
 
-        for kind in DataKind::ALL {
+        for kind in DataKind::ALL.iter().copied() {
             let path = root.join(kind.dir_name());
             std::fs::create_dir_all(&path)?;
             ensure_real_directory(&path)?;
@@ -211,12 +221,48 @@ fn ensure_real_directory(path: &Path) -> Result<(), ProfileError> {
 
 /// Unix ではディレクトリのパーミッションを `0o700` に設定する。
 ///
-/// Windows は POSIX パーミッションを持たないため何もしない（ACL による
-/// 隔離は将来課題。coding-rust.md「クロスプラットフォーム」で OS 固有処理を
+/// `ensure_real_directory`（`lstat` 相当）による事前検査と、パス文字列を
+/// 経由する chmod の間には、書き込み可能な第三者がディレクトリを symlink へ
+/// 差し替える TOCTOU の隙が生じる（PR #437 レビュー指摘。`libc` 等の追加
+/// 依存を要する `O_NOFOLLOW` + `fchmod` は dependency-policy.md によりここでは
+/// 使えないため、代わりに `std::fs::File::open` でディレクトリの fd を取得し、
+/// `lstat` で確認した (dev, ino) と fd の `fstat` 結果が一致することを検証
+/// してから、その fd に対して `set_permissions`（`fchmod` 相当）を呼ぶ。
+/// `open` から `fchmod` までは同一 fd に対する操作になるため、検査後の
+/// 差し替えが window を残さない。
+///
+/// Windows は POSIX パーミッションを持たないため何もしない。ACL による
+/// 隔離は本 crate の未実装範囲（`XOS-7`〜`XOS-10`。TASK-50（50.1）・#176 の
+/// スコープ外。coding-rust.md「クロスプラットフォーム」で OS 固有処理を
 /// `cfg(target_os = ...)` に局所化する方針に従う）。
 #[cfg(unix)]
 fn set_dir_permissions_0700(path: &Path) -> Result<(), ProfileError> {
-    std::fs::set_permissions(path, Permissions::from_mode(0o700))?;
+    use std::os::unix::fs::MetadataExt;
+
+    let link_meta = std::fs::symlink_metadata(path)?;
+    if link_meta.is_symlink() || !link_meta.is_dir() {
+        return Err(ProfileError::InvalidLayout {
+            path: path.to_path_buf(),
+            reason: "path is a symlink or not a directory",
+        });
+    }
+
+    // ディレクトリは `File::open` で読み取り用にオープンできる（Unix では
+    // ディレクトリの内容を読む権限が無くても open 自体は成功する）。
+    let dir = std::fs::File::open(path)?;
+    let fd_meta = dir.metadata()?;
+
+    // 直前の `symlink_metadata` が指したのと同一の実体かどうかを
+    // (dev, ino) で確認する。異なれば、検査後にパスが差し替えられた
+    // （symlink や別ディレクトリに置き換えられた）とみなして拒否する。
+    if (fd_meta.dev(), fd_meta.ino()) != (link_meta.dev(), link_meta.ino()) {
+        return Err(ProfileError::InvalidLayout {
+            path: path.to_path_buf(),
+            reason: "directory was replaced between the symlink check and permission change",
+        });
+    }
+
+    dir.set_permissions(Permissions::from_mode(0o700))?;
     Ok(())
 }
 
@@ -271,7 +317,7 @@ mod tests {
     fn prof_1_data_dir_matches_root_join() {
         let tmp = TempDir::new();
         let profile = Profile::open(tmp.path()).expect("open は成功する");
-        for kind in DataKind::ALL {
+        for kind in DataKind::ALL.iter().copied() {
             assert_eq!(profile.data_dir(kind), tmp.path().join(kind.dir_name()));
         }
     }
@@ -379,6 +425,46 @@ mod tests {
         assert_eq!(mode, 0o755);
     }
 
+    /// PROF-1（Unix 固有）: `root` に末尾区切り文字を付けても、`root` が
+    /// symlink であることの検出をすり抜けない（PR #437 Bugbot 指摘の
+    /// 回帰テスト）。末尾に `/` が付いたパスは `lstat` が symlink を
+    /// たどって実体を返すため、正規化せずに `symlink_metadata` へ渡すと
+    /// 検査が無効化される。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_open_rejects_root_symlink_with_trailing_slash() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let tmp = TempDir::new();
+        let root = tmp.path();
+        let parent = root.parent().expect("親ディレクトリが存在する");
+        std::fs::create_dir_all(parent).expect("親ディレクトリの作成");
+
+        let external = TempDir::new();
+        std::fs::create_dir_all(external.path()).expect("外部ディレクトリの作成");
+        std::fs::set_permissions(external.path(), Permissions::from_mode(0o755))
+            .expect("外部ディレクトリのパーミッション設定");
+
+        symlink(external.path(), root).expect("symlink 作成");
+
+        // root の文字列表現に末尾区切り文字を付けて渡す。
+        let root_with_trailing_slash = format!("{}/", root.display());
+        let err = Profile::open(&root_with_trailing_slash)
+            .expect_err("末尾に / を付けても symlink なら失敗する");
+        assert!(matches!(
+            err,
+            ProfileError::InvalidLayout { path, .. } if path == root
+        ));
+
+        // symlink 先のパーミッションが chmod で変更されていないことを確認する。
+        let mode = std::fs::metadata(external.path())
+            .expect("外部ディレクトリの metadata 取得")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
     /// PROF-1（Unix 固有）: ルートと 4 サブディレクトリのパーミッションが
     /// `0o700` になる（網羅的な検証は #179 が行う。ここでは最小限を確認する）。
     #[cfg(unix)]
@@ -394,7 +480,7 @@ mod tests {
             & 0o777;
         assert_eq!(root_mode, 0o700);
 
-        for kind in DataKind::ALL {
+        for kind in DataKind::ALL.iter().copied() {
             let mode = std::fs::metadata(profile.data_dir(kind))
                 .expect("サブディレクトリの metadata 取得")
                 .permissions()

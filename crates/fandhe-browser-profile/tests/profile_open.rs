@@ -62,7 +62,7 @@ fn prof_1_open_creates_all_data_subdirectories() {
 
     let profile = Profile::open(&root).expect("open は成功する");
 
-    for kind in DataKind::ALL {
+    for kind in DataKind::ALL.iter().copied() {
         let dir = profile.data_dir(kind);
         assert!(
             dir.is_dir(),
@@ -85,7 +85,7 @@ fn prof_1_reopen_after_drop_succeeds() {
 
     let reopened = Profile::open(&root).expect("再 open も成功する");
     assert_eq!(reopened.root(), root.as_path());
-    for kind in DataKind::ALL {
+    for kind in DataKind::ALL.iter().copied() {
         assert!(reopened.data_dir(kind).is_dir());
     }
 }

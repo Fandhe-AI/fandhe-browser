@@ -21,6 +21,10 @@
 //! - プロファイル削除処理（`PROF-5`、TASK-53）
 //! - 並行アクセス時のデータ分離（`PROF-2`・`PROF-3`、TASK-51・TASK-52）
 //! - クロスプラットフォーム advisory lock の 3 OS 確認（`PROF-1`、TASK-54）
+//! - Windows での ACL によるアクセス制限（`XOS-7`〜`XOS-10`。Unix の
+//!   パーミッション 0o700 相当の隔離を Windows でも実現する。TASK-50・#176
+//!   では意図的にスコープ外とした。新規依存が必要になるため、導入時は
+//!   dependency-policy.md に従いユーザー承認を経る）
 
 pub mod profile;
 
