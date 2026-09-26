@@ -31,7 +31,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,6 +42,7 @@ use crate::support::{
     json_escape, kill_process_group, looks_like_browser_readiness_response, lookup_fixture, median,
     parse_content_length, parse_http_request_line, parse_http_status, parse_json,
     port_conflict_error, reduction_pct, require_bin, token_reduction_gate, validate_mcp_response,
+    wait_with_deadline,
 };
 // `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
 // 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
@@ -63,7 +64,9 @@ const FIXTURE_MAX_CONNECTIONS: u64 = 10_000;
 // `pub(crate)`: 結合テスト（`measure_tests.rs`）がヘッダ行数上限を超える
 // リクエストを実際に送るテストで、上限値そのものを参照する。
 pub(crate) const FIXTURE_MAX_HEADER_LINES: u32 = 64;
-const FIXTURE_IO_TIMEOUT: Duration = Duration::from_secs(5);
+// `pub(crate)`: 結合テスト（`measure_tests.rs`）が slow-loris テストの
+// 送信間隔・アサーション上限を、この値を基準に決めるために参照する。
+pub(crate) const FIXTURE_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const FIXTURE_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// readiness probe・MCP 呼び出しそれぞれの外部入力（応答行）に許す最大長。
@@ -116,9 +119,19 @@ pub struct Target {
 ///
 /// 接続受付はバックグラウンドスレッドで行い、`Drop` で `stop` フラグを立てて
 /// スレッドの終了を待つ（プロセス終了時にリスナーを残さない）。
+///
+/// このサーバーの実際のクライアントは計測対象のブラウザ（`goto` で HTTP
+/// GET する側）であり、ベンチ自身（テストコード）ではない。対象ブラウザは
+/// 複数の接続を同時に開き得るため、接続ごとにスレッドを立てて処理する
+/// （[`fixture_accept_loop`] 参照）。何も送らない接続（preconnect 等）が
+/// 1 本詰まっても、他の接続の配信を止めないようにするための構成である。
 pub(crate) struct FixtureServer {
     pub(crate) port: u16,
     stop: Arc<AtomicBool>,
+    /// 現在処理中の接続数。[`fixture_accept_loop`] が同時接続数の上限判定に
+    /// 使い、`Drop` は個々の接続スレッドの `JoinHandle` を保持しない代わりに
+    /// この値が 0 になるのを有界のポーリングで待つ。
+    active_connections: Arc<AtomicUsize>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -143,12 +156,15 @@ impl FixtureServer {
             .map_err(|e| format!("set_nonblocking failed: {e}"))?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
+        let active_connections = Arc::new(AtomicUsize::new(0));
+        let active_connections_for_thread = Arc::clone(&active_connections);
         let handle = std::thread::spawn(move || {
-            fixture_accept_loop(listener, stop_for_thread);
+            fixture_accept_loop(listener, stop_for_thread, active_connections_for_thread);
         });
         Ok(Self {
             port,
             stop,
+            active_connections,
             handle: Some(handle),
         })
     }
@@ -160,33 +176,90 @@ impl Drop for FixtureServer {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+        // 各接続は [`fixture_accept_loop`] がスレッドごとに処理し、個々の
+        // `JoinHandle` は保持していないため直接 join できない。各接続には
+        // 接続ごとの絶対期限（`FIXTURE_IO_TIMEOUT` + エラー応答用の猶予）が
+        // あるため、無期限に待つのではなく有界のポーリングで
+        // `active_connections` が 0 になるのを待つ（時間切れなら諦めて返る。
+        // 個々の接続スレッド自身の期限にはこの待機と無関係に到達する）。
+        let wait_deadline = Instant::now() + FIXTURE_IO_TIMEOUT + Duration::from_secs(5);
+        while self.active_connections.load(Ordering::SeqCst) > 0 && Instant::now() < wait_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
+
+/// 同時に処理する fixture 接続数の上限。thread-per-connection にしても
+/// スレッドを無制限に増やさないための上限（coding-rust.md「長さ・件数を
+/// 上限検証」）。超過した接続は処理せず即座に閉じる。
+const FIXTURE_MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
+/// `listener.accept()` の一時的なエラー（fd の瞬間的な枯渇等）を許容する
+/// 連続回数の上限。1 回のエラーで即座にループを止めると、一時的な障害でも
+/// サーバー全体が停止してしまうため、上限に達するまでは継続する。
+const FIXTURE_ACCEPT_ERROR_LIMIT: u32 = 100;
 
 /// [`FixtureServer::start`] が生成する accept ループ本体。
 ///
 /// `stop` が立つまで `listener.accept()` をポーリングし、接続ごとに
-/// [`handle_fixture_connection`] を同期的に処理する（ベンチ自身が唯一の
-/// クライアントであるためシングルスレッドで十分。並行処理はしない）。
-fn fixture_accept_loop(listener: TcpListener, stop: Arc<AtomicBool>) {
+/// スレッドを立てて [`handle_fixture_connection`] を処理する（実際の
+/// クライアントは計測対象のブラウザであり複数接続を同時に開き得るため、
+/// シングルスレッド処理にはしない）。`active_connections` が
+/// [`FIXTURE_MAX_CONCURRENT_CONNECTIONS`] に達している間は、新規接続を
+/// 処理せず即座に閉じる。
+fn fixture_accept_loop(
+    listener: TcpListener,
+    stop: Arc<AtomicBool>,
+    active_connections: Arc<AtomicUsize>,
+) {
     let mut served: u64 = 0;
+    let mut consecutive_accept_errors: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
+                consecutive_accept_errors = 0;
                 served += 1;
-                // 接続数に上限を設け、
-                // 想定外の大量接続でサーバーが無制限に処理し続けないようにする。
+                // 接続数に上限を設け、想定外の大量接続でサーバーが無制限に
+                // 処理し続けないようにする。
                 if served > FIXTURE_MAX_CONNECTIONS {
                     break;
                 }
-                handle_fixture_connection(stream);
+                let previous = active_connections.fetch_add(1, Ordering::SeqCst);
+                if previous >= FIXTURE_MAX_CONCURRENT_CONNECTIONS {
+                    // 同時接続数の上限を超えた分はスレッドを増やさず、
+                    // 応答せずに即座に閉じる（`drop(stream)`）。
+                    active_connections.fetch_sub(1, Ordering::SeqCst);
+                    drop(stream);
+                    continue;
+                }
+                let active_connections_for_thread = Arc::clone(&active_connections);
+                // `std::thread::spawn` はスレッド生成に失敗すると panic する
+                // （coding-rust.md「ライブラリコードでは panic させない」）。
+                // 外部入力（大量の同時接続）に応じて増減するスレッド生成の
+                // 経路であるため、`Builder::spawn` で `Result` として扱い、
+                // 失敗時はこの接続だけを諦めてループを継続する。
+                let spawn_result = std::thread::Builder::new().spawn(move || {
+                    handle_fixture_connection(stream);
+                    active_connections_for_thread.fetch_sub(1, Ordering::SeqCst);
+                });
+                if spawn_result.is_err() {
+                    active_connections.fetch_sub(1, Ordering::SeqCst);
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(FIXTURE_ACCEPT_POLL_INTERVAL);
             }
-            // listener 自体のエラー（fd 枯渇等）はループを止める。`stop` の
-            // 検知漏れでプロセスが終了できなくなることを避ける。
-            Err(_) => break,
+            Err(_) => {
+                // listener 自体の一時的なエラー（fd の瞬間的な枯渇等）では
+                // 即座にループを止めず、連続回数の上限に達するまで継続する。
+                // 上限に達したら、`stop` の検知漏れでプロセスが終了できなく
+                // なることを避けるためループを止める。
+                consecutive_accept_errors += 1;
+                if consecutive_accept_errors >= FIXTURE_ACCEPT_ERROR_LIMIT {
+                    break;
+                }
+                std::thread::sleep(FIXTURE_ACCEPT_POLL_INTERVAL);
+            }
         }
     }
 }
@@ -381,6 +454,13 @@ fn write_fixture_response(
 /// 極力パイプを保持し続けないようにする。
 struct ChildGuard(Child);
 
+/// `ChildGuard::drop` が `wait` に許す期限。`kill_process_group`/
+/// `Child::kill` の後は通常すぐに終了するはずだが、OS がシグナル配送・
+/// プロセス終了を遅延させる異常系でも `Drop` が無期限にブロックしない
+/// ようにする（コンストラクタは `Drop::drop` からしか呼ばれない想定の
+/// 内部専用定数）。
+const CHILD_GUARD_WAIT_DEADLINE: Duration = Duration::from_secs(10);
+
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         // `Drop` は戻り値を呼び出し元へ返せないため、ここに限り
@@ -388,7 +468,10 @@ impl Drop for ChildGuard {
         // 無条件に行う既存のフォールバックのままにする。
         let _ = kill_process_group(self.0.id());
         let _ = self.0.kill();
-        let _ = self.0.wait();
+        // 無期限の `wait()` ではなく、期限付きの `wait_with_deadline` を
+        // 使う（`kill` 済みのプロセスが何らかの理由で終了を検知できない
+        // 異常系でも `Drop` 自体が無期限にブロックしないようにする）。
+        let _ = wait_with_deadline(&mut self.0, CHILD_GUARD_WAIT_DEADLINE);
     }
 }
 
@@ -458,8 +541,25 @@ fn spawn_and_wait_ready(
     // 汎用メッセージでは、readiness に失敗した実際の原因（接続拒否・
     // 不正な応答形式・chunked デコード失敗等）が分からない）。
     let mut last_error = "no probe attempt was made".to_string();
+    // `last_error` が実際の probe 結果（成功しなかった応答・失敗理由）から
+    // 得られたものかどうか。プレースホルダのままなら「有意な理由」とは
+    // 扱わない。
+    let mut has_probe_result = false;
     loop {
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "timeout waiting for readiness probe (last error: {last_error})"
+            ));
+        }
+        // 残り時間が 1 回の probe 試行の期限（`PROBE_ATTEMPT_TIMEOUT`）に
+        // 満たない場合、この後の `probe_once` はほぼ確実に「期限切れで
+        // 読み書きに失敗した」という情報量の無いエラーを返し、それまでに
+        // 記録した本来の失敗理由（不正なチャンク長等）を上書きしてしまう。
+        // 既に有意な理由を記録済みなら、無駄な最終試行をせずここで
+        // タイムアウトとして確定させる（テストで観測された、9 回中 2 回の
+        // フレークの原因）。
+        if remaining < PROBE_ATTEMPT_TIMEOUT && has_probe_result {
             return Err(format!(
                 "timeout waiting for readiness probe (last error: {last_error})"
             ));
@@ -489,9 +589,17 @@ fn spawn_and_wait_ready(
                 last_error = format!(
                     "response did not look like browser readiness (status {status}, body {truncated:?})"
                 );
+                has_probe_result = true;
             }
             Err(e) => {
-                last_error = e;
+                // 外側の期限をちょうど使い切ったタイミングでの失敗は、
+                // 情報量の無い「期限切れ」である可能性が高い。既に有意な
+                // 理由を記録済みなら、それを上書きしない（上のループ先頭の
+                // チェックをすり抜けた残りわずかなケースの保険）。
+                if Instant::now() < deadline || !has_probe_result {
+                    last_error = e;
+                    has_probe_result = true;
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(2));
@@ -501,11 +609,17 @@ fn spawn_and_wait_ready(
 /// readiness probe の応答本文に許す上限バイト数。相手プロセス（別プロセスの
 /// 誤応答も含む）が不正・大量の応答を返し続けても無制限に確保しないための
 /// 上限（coding-rust.md「長さ・件数を上限検証」）。
-const PROBE_BODY_MAX_BYTES: usize = 64 * 1024;
+///
+/// `pub(crate)`: 結合テスト（`measure_tests.rs`）が `probe_once` の上限
+/// 超過ケースを直接検証する際に参照する。
+pub(crate) const PROBE_BODY_MAX_BYTES: usize = 64 * 1024;
 
 /// readiness probe 1 回あたりに許す時間。`outer_deadline`（呼び出し元の
 /// readiness 全体の期限）の残り時間がこれより短ければ、そちらを優先する。
-const PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(200);
+///
+/// `pub(crate)`: 結合テスト（`measure_tests.rs`）が `probe_once` を直接
+/// 呼ぶ際の `outer_deadline` を組み立てるために参照する。
+pub(crate) const PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// [`reprobe_after_kill`] が同じポートへ再接続を試みる際の期限。
 /// `TcpStream::connect_timeout` は接続拒否（誰も listen していない）なら
@@ -558,7 +672,14 @@ fn reprobe_after_kill(port: u16) -> bool {
 /// （部分的な本文をそのまま使わない）。`Content-Length` も
 /// `Transfer-Encoding: chunked` も無い場合は、読み取りエラーを失敗として
 /// 扱いつつ EOF まで読む。
-fn probe_once(port: u16, request: &str, outer_deadline: Instant) -> Result<(u16, String), String> {
+/// `pub(crate)`: `competitor_lightpanda_measure`（`measure_tests.rs`）の
+/// 単体テストが、`Content-Length`/`Transfer-Encoding` の境界ケース
+/// （併存・矛盾等）をループバックソケット越しに直接検証する。
+pub(crate) fn probe_once(
+    port: u16,
+    request: &str,
+    outer_deadline: Instant,
+) -> Result<(u16, String), String> {
     let probe_timeout =
         PROBE_ATTEMPT_TIMEOUT.min(outer_deadline.saturating_duration_since(Instant::now()));
     if probe_timeout.is_zero() {
@@ -719,14 +840,26 @@ fn probe_once(port: u16, request: &str, outer_deadline: Instant) -> Result<(u16,
 /// `Transfer-Encoding: chunked` の本文を読む（[`probe_once`] からのみ呼ぶ）。
 ///
 /// RFC 9112 §7.1 のチャンク形式（16 進のチャンクサイズ行。`;` 以降の
-/// チャンク拡張は無視する。チャンクデータに続く CRLF・サイズ 0 のチャンクと
+/// チャンク拡張は無視する。チャンクデータに続く改行・サイズ 0 のチャンクと
 /// それに続くトレーラー部）を厳密に読む。不正なチャンクサイズ行・
-/// チャンクデータ読み取り前の EOF・チャンクデータ直後の CRLF 欠落・
+/// チャンクデータ読み取り前の EOF・チャンクデータ直後の改行欠落・
 /// `max_bytes` を超える累積本文サイズは、いずれも `Err` にする（部分的に
 /// 読めた本文を成功として使わない）。トレーラー行数は
 /// [`FIXTURE_MAX_HEADER_LINES`] で上限を設ける（無制限に送り続けられて
-///占有され続けることを防ぐ。coding-rust.md「長さ・件数を上限検証」）。
-fn read_chunked_body<R: BufRead>(reader: &mut R, max_bytes: usize) -> Result<Vec<u8>, String> {
+/// 占有され続けることを防ぐ。coding-rust.md「長さ・件数を上限検証」）。
+///
+/// 改行の基準: RFC 9112 は CRLF を要求するが、このファイル内の行読み取り
+/// （[`read_complete_line`]。「一部クライアントは LF のみを送るため」）と
+/// 統一し、チャンクサイズ行・トレーラー行・チャンクデータ直後の区切りの
+/// いずれも CRLF と裸の LF の両方を許容する（[`read_chunk_terminator`]
+/// 参照）。
+///
+/// `pub(crate)`: `competitor_lightpanda_measure`（`measure_tests.rs`）の
+/// 単体テストがループバックソケット経由で境界ケースを直接検証する。
+pub(crate) fn read_chunked_body<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     loop {
         let mut size_line = String::new();
@@ -734,10 +867,17 @@ fn read_chunked_body<R: BufRead>(reader: &mut R, max_bytes: usize) -> Result<Vec
             .map_err(|e| format!("chunk size line read failed: {e}"))?;
         let size_line = size_line.trim_end_matches(['\r', '\n']);
         // チャンク拡張（`;` 以降。例: `1a;foo=bar`）はサイズの解釈に使わない
-        // ため読み捨てる。
-        let size_field = size_line.split(';').next().unwrap_or("");
+        // ため読み捨てる。BWS（オプションの空白）を許すため前後の空白を
+        // 落としてから検証する。
+        let size_field = size_line.split(';').next().unwrap_or("").trim();
         if size_field.is_empty() {
             return Err("empty chunk size".to_string());
+        }
+        // `usize::from_str_radix` は符号付き型と同じ構文解析を経由し `+`
+        // 接頭辞を許してしまう（例: `"+1a"` が `Ok(26)` になる）ため、
+        // 16 進数字のみで構成されることを明示的に確認してから解釈する。
+        if !size_field.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("invalid chunk size: {size_field:?}"));
         }
         let size = usize::from_str_radix(size_field, 16)
             .map_err(|_| format!("invalid chunk size: {size_field:?}"))?;
@@ -769,15 +909,40 @@ fn read_chunked_body<R: BufRead>(reader: &mut R, max_bytes: usize) -> Result<Vec
             .read_exact(&mut chunk)
             .map_err(|e| format!("chunk data read failed (size={size}): {e}"))?;
         body.extend_from_slice(&chunk);
-        let mut crlf = [0u8; 2];
-        reader
-            .read_exact(&mut crlf)
-            .map_err(|e| format!("chunk trailing CRLF read failed: {e}"))?;
-        if &crlf != b"\r\n" {
-            return Err(format!("chunk not terminated by CRLF (got {crlf:?})"));
-        }
+        read_chunk_terminator(reader)?;
     }
     Ok(body)
+}
+
+/// チャンクデータ直後の改行を読む。CRLF（RFC 9112 準拠）・裸の LF
+/// （[`read_chunked_body`] のドキュメント参照。このファイル内の行読み取り
+/// と同じ寛容さで統一する）のいずれかだけを受理する。それ以外（`\r` の後に
+/// `\n` が続かない等）は `Err` にする。
+fn read_chunk_terminator<R: BufRead>(reader: &mut R) -> Result<(), String> {
+    let mut first = [0u8; 1];
+    reader
+        .read_exact(&mut first)
+        .map_err(|e| format!("chunk trailing newline read failed: {e}"))?;
+    match first[0] {
+        b'\n' => Ok(()),
+        b'\r' => {
+            let mut second = [0u8; 1];
+            reader
+                .read_exact(&mut second)
+                .map_err(|e| format!("chunk trailing newline read failed: {e}"))?;
+            if second[0] == b'\n' {
+                Ok(())
+            } else {
+                Err(format!(
+                    "chunk not terminated by CRLF or LF (got {:?} {:?})",
+                    first[0], second[0]
+                ))
+            }
+        }
+        other => Err(format!(
+            "chunk not terminated by CRLF or LF (got {other:?})"
+        )),
+    }
 }
 
 /// `BufRead::read_line` 相当だが、外部プロセスの応答を無制限に信用せず
@@ -862,6 +1027,17 @@ pub(crate) fn read_line_bounded<R: BufRead>(
 }
 
 /// cold start（`PERF-3`）: `trials` 回起動し、readiness までの時間の中央値（ms）を返す。
+///
+/// Windows の既知の制約: readiness probe（`probe_once`）は
+/// `TcpStream::connect_timeout` で対象プロセスが bind したポートへ接続する
+/// が、Windows では「まだ何も listen していないポートへの接続」の失敗
+/// （`WSAECONNREFUSED` 相当の即時拒否ではなく、TCP レベルの再試行を挟んで
+/// 検出される場合がある）に 1 秒以上かかることがある。これは
+/// `connect_timeout` の指定時間より短くても発生し得る OS 側の挙動であり、
+/// このベンチのコードでは制御できない。対象プロセスの実際の起動が速くても、
+/// 最初の 1〜数回の probe 試行がこの遅延の影響を受け、cold start の測定値が
+/// 実態よりわずかに水増しされる可能性がある（`PROBE_ATTEMPT_TIMEOUT` の
+/// 短い間隔でポーリングを繰り返すため、遅延は最大でも数回分に留まる）。
 pub fn measure_cold_start(target: &Target, trials: usize) -> Outcome {
     let bin = match require_bin(
         target.bin.as_ref(),
@@ -871,8 +1047,7 @@ pub fn measure_cold_start(target: &Target, trials: usize) -> Outcome {
         Ok(bin) => bin,
         Err(skipped) => return skipped,
     };
-    // cold start は `serve_args` だけを使うため、`mcp_args_error` は無視する
-    // 。
+    // cold start は `serve_args` だけを使うため、`mcp_args_error` は無視する。
     if let Some(outcome) = arg_error_gate(target.serve_args_error.as_deref(), target.name) {
         return outcome;
     }
@@ -1030,7 +1205,7 @@ fn measure_binary_size(target: &Target) -> Outcome {
     };
     match std::fs::metadata(bin) {
         Ok(meta) if meta.is_file() => Outcome::Value(meta.len() as f64),
-        // line 398。`fs::metadata` はディレクトリにも成功し
+        // `fs::metadata` はディレクトリにも成功し
         // `len()` がディレクトリエントリサイズ等の無意味な値を返すため、
         // `<PREFIX>_BIN` に誤ってディレクトリを指定した場合に異常値が
         // そのまま `binarySizeBytes` として出力され得た。通常ファイルで
@@ -1040,15 +1215,16 @@ fn measure_binary_size(target: &Target) -> Outcome {
     }
 }
 
-/// stdout 読み取りスレッドが呼び出し側との間に持つ行キューの上限件数。
-/// `MAX_LINE_BYTES`（1 行あたりの上限）だけでは、外部プロセスが応答を
-/// 読ませないまま大量の行を送り続けた場合にキューが無制限に伸びメモリを
-/// 枯渇させ得る。`mpsc::sync_channel` で
-/// 容量を区切り、溢れたら読み取りスレッドを止めて `overflowed` を立てる。
-/// 256 件（最悪 256 × `MAX_LINE_BYTES` = 256MiB）は、正常系での
-/// `notifications/message` 等のログ行バーストを誤検知しない余裕を持たせつつ、
-/// 無制限確保にはしない上限として選んだ値。
-const MCP_STDOUT_QUEUE_CAPACITY: usize = 256;
+/// stdout 読み取りスレッドが呼び出し側との間に持つ行キューの合計バイト数の
+/// 上限。`MAX_LINE_BYTES`（1 行あたりの上限）だけでは、外部プロセスが応答を
+/// 読ませないまま大量の短い行を送り続けた場合にキュー全体のメモリ使用量を
+/// 抑えられない（行数で上限を切っても、1 行あたりのサイズが小さければ
+/// 合計バイト数は行数の上限とは無関係に膨らみ得る）ため、行数ではなく
+/// 実際にキューに滞留しているバイト数の合計（`McpClient::queued_bytes`）で
+/// 上限を判定する。溢れたら読み取りスレッドを止めて `overflowed` を立てる。
+/// 64MiB は、正常系での `notifications/message` 等のログ行バーストを
+/// 誤検知しない余裕を持たせつつ、無制限確保にはしない上限として選んだ値。
+const MCP_STDOUT_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// `McpClient::notify` の書き込みタイムアウト。
 /// `notify` は応答を待たないが、書き込み自体（`write_with_deadline`）は
@@ -1071,24 +1247,27 @@ struct McpClient {
     /// `recv_timeout` が正しくタイムアウトする（無期限に隠れてブロックしない）。
     stdin: Arc<Mutex<std::process::ChildStdin>>,
     rx: mpsc::Receiver<String>,
+    /// キューに滞留している行の合計バイト数。読み取りスレッドが行を送信
+    /// するたびに加算し、`call`/`notify` が `rx` から受け取るたびに
+    /// （その行の長さ分）減算する（[`MCP_STDOUT_QUEUE_MAX_BYTES`] 参照）。
+    queued_bytes: Arc<AtomicUsize>,
     next_id: u64,
     /// 読み取りスレッドがキュー容量超過を検知した際に立てるフラグ。
     /// `call` はこれを見て、無制限にキューを溜め込む代わりに
     /// 計測をエラー終了させる。
     overflowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// 読み取りスレッドが `read_line_bounded` からエラー（`InvalidData`
-    /// （`MAX_LINE_BYTES` 到達・改行未検出、または不正な UTF-8。レビュー
-    /// 指摘 P1・P2）・`UnexpectedEof`を含む、あらゆる種別）を受け取った際に
-    /// その内容を記録するスロット。`call` はこれを見て、切り詰められた／
-    /// 文字化けした／未完了の行を無視したまま待ち続けるのではなく明示的に
-    /// エラー終了させる。
+    /// 読み取りスレッドが行の読み取り・解析に失敗した際にその理由を記録する
+    /// スロット。対象は `read_line_bounded` からのエラー（`InvalidData`
+    /// （`MAX_LINE_BYTES` 到達・改行未検出・不正な UTF-8）・`UnexpectedEof`
+    /// を含む、あらゆる I/O エラー種別）に加え、行として読めても JSON として
+    /// 解析できなかった場合（`spawn` 参照）も同じスロットに記録する。`call`
+    /// はこれを見て、切り詰められた／文字化けした／未完了／非 JSON の行を
+    /// 無視したまま待ち続けるのではなく明示的にエラー終了させる。
     ///
-    /// 以前は `AtomicBool` で「エラーが
-    /// あったかどうか」だけを記録し、`InvalidData`・`UnexpectedEof` 以外の
-    /// I/O エラー種別（`ConnectionReset` 等）は無条件の `Err(_) => break`
-    /// に落ちて記録されずスレッドが静かに終了していた。`Mutex<Option<String>>`
-    /// にして、どの種別のエラーであっても実際のメッセージを記録するように
-    /// した。
+    /// `Mutex<Option<String>>` にすることで、エラーの種別を問わず実際の
+    /// メッセージを記録する（`AtomicBool` で「エラーの有無」だけを見る
+    /// 設計だと、種別ごとに個別の記録経路を用意し忘れた場合にスレッドが
+    /// 記録なしで静かに終了し得る）。
     line_read_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
@@ -1096,16 +1275,27 @@ impl McpClient {
     fn spawn(bin: &PathBuf, args: &[String]) -> Result<Self, String> {
         let mut command = Command::new(bin);
         apply_new_process_group(&mut command);
-        let mut child = command
+        let child = command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("spawn failed: {e}"))?;
-        let stdin = Arc::new(Mutex::new(child.stdin.take().ok_or("no stdin")?));
-        let stdout = child.stdout.take().ok_or("no stdout")?;
-        let (tx, rx) = mpsc::sync_channel::<String>(MCP_STDOUT_QUEUE_CAPACITY);
+        // spawn 直後、他の操作（`stdin`/`stdout` の take 等）より先に
+        // `ChildGuard` へ包む。`take()` が失敗する経路（`?`）があっても、
+        // それ以降の早期 return で子プロセスをリークさせない
+        // （`Stdio::piped()` を指定しているため通常は起こらないが、防御的に
+        // 保証する）。
+        let mut guard = ChildGuard(child);
+        let stdin = Arc::new(Mutex::new(guard.0.stdin.take().ok_or("no stdin")?));
+        let stdout = guard.0.stdout.take().ok_or("no stdout")?;
+        // 行数ではなく合計バイト数でキューの上限を判定するため、チャンネル
+        // 自体には容量を設けず（`mpsc::channel`）、`queued_bytes` で
+        // バックプレッシャーをかける（`MCP_STDOUT_QUEUE_MAX_BYTES` 参照）。
+        let (tx, rx) = mpsc::channel::<String>();
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let queued_bytes_for_thread = Arc::clone(&queued_bytes);
         let overflowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let overflowed_writer = std::sync::Arc::clone(&overflowed);
         let line_read_error = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -1126,24 +1316,45 @@ impl McpClient {
                         // スレッドを止め、`call`/`notify` 側へ明示的に
                         // 伝える（fail-closed。coding-rust.md「外部入力の
                         // 経路では明示的に処理する」）。
-                        if let Err(e) = parse_json(line.trim()) {
+                        //
+                        // `line` の末尾には `read_line_bounded` が読んだ改行
+                        // （`\r\n` または `\n`）がそのまま残っている。
+                        // `str::trim`（Unicode の空白全般を対象にする）では
+                        // なく `trim_end_matches(['\r', '\n'])` で末尾の改行
+                        // だけを取り除く。`trim` を使うと、`parse_json` 自身が
+                        // 拒否する RFC 8259 外の空白（例: U+00A0）が行の
+                        // 先頭・末尾にあった場合にそれを黙って取り除いて
+                        // しまい、本来 `parse_json` が弾くべき不正な行を
+                        // 通してしまう経路になり得る。空行（改行のみの行）は
+                        // 取り除いた結果が空文字列になり、`parse_json` が
+                        // `UnexpectedEnd` で拒否するため、他の非 JSON 行と
+                        // 同じく即エラーとして扱う（読み飛ばさない）。
+                        let trimmed = line.trim_end_matches(['\r', '\n']);
+                        if let Err(e) = parse_json(trimmed) {
                             if let Ok(mut reason) = line_read_error_writer.lock() {
                                 *reason = Some(format!("mcp stdout line is not valid JSON: {e:?}"));
                             }
                             break;
                         }
-                        match tx.try_send(line) {
-                            Ok(()) => {}
-                            Err(mpsc::TrySendError::Full(_)) => {
-                                // キュー容量超過: 消費側が追いつけていない、
-                                // または相手プロセスが応答を読ませず出力し
-                                // 続けている。無制限に溜め込まず読み取りを
-                                // 止め、呼び出し側へは `overflowed` 経由で
-                                // エラーとして伝える。
-                                overflowed_writer.store(true, std::sync::atomic::Ordering::SeqCst);
-                                break;
-                            }
-                            Err(mpsc::TrySendError::Disconnected(_)) => break,
+                        let line_len = line.len();
+                        let new_total = queued_bytes_for_thread
+                            .fetch_add(line_len, Ordering::SeqCst)
+                            + line_len;
+                        if new_total > MCP_STDOUT_QUEUE_MAX_BYTES {
+                            // キュー容量超過: 消費側が追いつけていない、
+                            // または相手プロセスが応答を読ませず出力し
+                            // 続けている。無制限に溜め込まず読み取りを
+                            // 止め、呼び出し側へは `overflowed` 経由で
+                            // エラーとして伝える。この行自体は送信しない
+                            // （加算した分を戻す）。
+                            queued_bytes_for_thread.fetch_sub(line_len, Ordering::SeqCst);
+                            overflowed_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+                            break;
+                        }
+                        if tx.send(line).is_err() {
+                            // 受信側（`McpClient`）が drop 済み（呼び出し元が
+                            // 既に諦めている）。
+                            break;
                         }
                     }
                     Err(e) => {
@@ -1171,9 +1382,10 @@ impl McpClient {
             // 返るようになる。
         });
         Ok(Self {
-            guard: ChildGuard(child),
+            guard,
             stdin,
             rx,
+            queued_bytes,
             next_id: 1,
             overflowed,
             line_read_error,
@@ -1275,14 +1487,20 @@ impl McpClient {
     }
 
     /// JSON-RPC 呼び出しを 1 件送り、`id` が一致する応答を待つ
-    /// （タイムアウト内に一致しなければ `Err`。他 id の応答・パース不能行は
-    /// 読み捨てて継続する。外部プロセスの応答を untrusted として扱う）。
+    /// （タイムアウト内に一致しなければ `Err`。他 id の応答（サーバーからの
+    /// リクエスト・通知を含む）は読み捨てて継続する。JSON として解析
+    /// できない行は、この関数に届く前に読み取りスレッド側で検知して
+    /// 読み取り自体を止める（`spawn` 参照。パース不能行を読み飛ばして
+    /// 待ち続けることはしない。外部プロセスの応答を untrusted として
+    /// 扱う）。
     ///
     /// `id` が一致しても JSON-RPC の `error` フィールドが立っている、または
     /// `tools/call` 結果の `result.isError` が `true` の応答は失敗として
-    /// `Err` を返す（呼び出し元 `measure_token_reduction` はエラー応答を
-    /// そのサイトの skip として扱うため、ここで成功と誤判定すると
-    /// トークン削減率の計測に失敗レスポンスの本文が混入する）。
+    /// `Err` を返す（呼び出し元 `measure_token_reduction` は、いずれかの
+    /// サイトでこのエラーが起きると、そのサイトを `failed` に記録した上で
+    /// 計測全体を `Outcome::Error` にする。一部失敗を隠した測定値を
+    /// `Value` として返すことはない。ここで成功と誤判定すると、失敗
+    /// レスポンスの本文がトークン削減率の計測に混入する）。
     ///
     /// `timeout` は書き込み（`write_with_deadline`）から応答待ちまでの
     /// 呼び出し全体に適用する（以前は書き込みに
@@ -1305,7 +1523,7 @@ impl McpClient {
         loop {
             if self.overflowed.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(format!(
-                    "{method}: mcp stdout queue exceeded {MCP_STDOUT_QUEUE_CAPACITY} lines, aborting"
+                    "{method}: mcp stdout queue exceeded {MCP_STDOUT_QUEUE_MAX_BYTES} bytes, aborting"
                 ));
             }
             if let Some(reason) = Self::line_read_error_reason(&self.line_read_error) {
@@ -1325,11 +1543,17 @@ impl McpClient {
             // 紛らわしいメッセージになり得た。ここで明示的に区別し、
             // 「channel の切断を検知して即時に返す」ことを保証する。
             let line = match self.rx.recv_timeout(remaining) {
-                Ok(line) => line,
+                Ok(line) => {
+                    // 受信した分だけキューの合計バイト数を減らす
+                    // （`MCP_STDOUT_QUEUE_MAX_BYTES` によるバックプレッシャーの
+                    // 対になる減算。読み取りスレッド側の加算と対応する）。
+                    self.queued_bytes.fetch_sub(line.len(), Ordering::SeqCst);
+                    line
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if self.overflowed.load(std::sync::atomic::Ordering::SeqCst) {
                         return Err(format!(
-                            "{method}: mcp stdout queue exceeded {MCP_STDOUT_QUEUE_CAPACITY} lines, aborting"
+                            "{method}: mcp stdout queue exceeded {MCP_STDOUT_QUEUE_MAX_BYTES} bytes, aborting"
                         ));
                     }
                     if let Some(reason) = Self::line_read_error_reason(&self.line_read_error) {
@@ -1346,7 +1570,7 @@ impl McpClient {
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if self.overflowed.load(std::sync::atomic::Ordering::SeqCst) {
                         return Err(format!(
-                            "{method}: mcp stdout queue exceeded {MCP_STDOUT_QUEUE_CAPACITY} lines, aborting"
+                            "{method}: mcp stdout queue exceeded {MCP_STDOUT_QUEUE_MAX_BYTES} bytes, aborting"
                         ));
                     }
                     if let Some(reason) = Self::line_read_error_reason(&self.line_read_error) {
@@ -1362,25 +1586,35 @@ impl McpClient {
             // はずだが、その不変条件が崩れても panic はせず読み飛ばす
             // （fail-closed。coding-rust.md「外部入力の経路では unwrap を
             // 使わず明示的に処理する」）。
-            let Ok(value) = parse_json(line.trim()) else {
+            // 読み取りスレッド側（`spawn`）と同じ理由で `trim` ではなく
+            // `trim_end_matches(['\r', '\n'])` を使う。
+            let Ok(value) = parse_json(line.trim_end_matches(['\r', '\n'])) else {
                 continue;
             };
             // id が一致しない応答（他の呼び出しの応答等）は読み捨てて
-            // 次の行を待つ。
-            if value.get("id").and_then(JsonValue::as_f64) != Some(id as f64) {
+            // 次の行を待つ。JSON-RPC 2.0 では、対象プロセスがサーバーから
+            // クライアントへ向けたリクエスト（例: `ping`）を送ることも
+            // あり、その場合も `id`・`method` の両方を持つ。そのような
+            // メッセージは `method` を持つため「応答」ではなく「対象からの
+            // リクエスト」であり、`id` の値がこちらの発行した id と
+            // たまたま一致し得る（双方が独立に採番するため id 空間が
+            // 分離されていない）。`method` を持つメッセージは応答として
+            // 扱わず読み捨てる（対象からのリクエストへの応答自体は、この
+            // ベンチが必要とする範囲では行わない）。
+            let has_method = value.get("method").and_then(JsonValue::as_str).is_some();
+            if has_method || value.get("id").and_then(JsonValue::as_f64) != Some(id as f64) {
                 continue;
             }
-            // `result` が `null`・`{}` でも
-            // `isError` さえ立っていなければ成功として扱っていたため、
-            // `goto` のように本文を確認しない呼び出しでは、ページ遷移に
-            // 失敗した応答をそのまま成功と誤判定し得た（続く `html`・
-            // `tree` が別ページの結果として計測される）。JSON-RPC 2.0 の
-            // 封筒（`jsonrpc`・`id`・`error`/`result` の排他）と、
+            // `result` が `null`・`{}` でも `isError` さえ立っていなければ
+            // 成功として扱ってしまうと、`goto` のように本文を確認しない
+            // 呼び出しでは、ページ遷移に失敗した応答をそのまま成功と誤判定
+            // し得る（続く `html`・`tree` が別ページの結果として計測される）。
+            // JSON-RPC 2.0 の封筒（`jsonrpc`・`id`・`error`/`result` の排他）と、
             // `method` ごとに要求される `result` の最小限の形
-            // （`tools/call` は空でない `content` 配列・各要素の `type`・
-            // `isError` の型など）を `validate_mcp_response`（support.rs。
-            // 純粋関数）で検証してから、`error`/`isError` の実際の失敗判定へ
-            // 進む。
+            // （`tools/call` は `content` が配列であること・各要素の `type`・
+            // `isError` の型など。`content` は MCP 2025-06-18 の仕様どおり
+            // 空配列も許す）を `validate_mcp_response`（support.rs。純粋関数）
+            // で検証してから、`error`/`isError` の実際の失敗判定へ進む。
             if let Err(reason) = validate_mcp_response(&value, id as f64, method) {
                 return Err(format!("{method}: invalid response: {reason}"));
             }
@@ -1425,11 +1659,10 @@ impl McpClient {
 /// `content` 内のどの項目にも `text` が無く連結結果が空文字列になる場合は
 /// 抽出失敗として `None` を返す（panic はさせない）。
 ///
-/// line 569。以前は欠落時に空文字列を返しており、
-/// `html` が非空で `tree` の抽出に失敗しただけのケースが
-/// `tree_tok=0` の正常計測（削減率 100%）として記録されてしまっていた。
-/// 呼び出し元 `measure_token_reduction` は `None` を抽出失敗として扱い、
-/// そのサイトを成功サンプルに含めない。
+/// 欠落時に空文字列を返してしまうと、`html` が非空で `tree` の抽出に
+/// 失敗しただけのケースが `tree_tok=0` の正常計測（削減率 100%）として
+/// 記録されてしまう。呼び出し元 `measure_token_reduction` は `None` を
+/// 抽出失敗として扱い、そのサイトを成功サンプルに含めない。
 fn extract_text(value: &JsonValue) -> Option<String> {
     let content = value.get("result").and_then(|r| r.get("content"))?;
     let mut out = String::new();
@@ -1497,7 +1730,7 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
         drop(client.guard);
         return Outcome::Error(format!("{}: mcp initialize failed: {e}", target.name));
     }
-    // line 747。送信失敗を握りつぶすと、初期化未完了のまま
+    // 送信失敗を握りつぶすと、初期化未完了のまま
     // 後続の `goto` 等の計測へ進み、真因（初期化通知の送信失敗）とは別の
     // エラーとして誤って報告され得る。送信失敗は直ちに `Outcome::Error` で
     // 返す（fail-closed。coding-rust.md「外部入力の経路では unwrap を使わず
@@ -1510,12 +1743,12 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
         ));
     }
 
-    // line 555。以前は goto・html・tree の失敗サイトを
-    // 無言で `continue` して除外し、残ったサイトだけの中央値を
-    // `measured` として返していたため、既定 5 サイト中 1 サイトしか
-    // 成功しなくても代表値であるかのように報告され得た。失敗したサイトと
-    // 理由を `failed` に記録し、1 件でも完走できなければ `Outcome::Error`
-    // にして「一部失敗を隠した測定値」を返さない（fail-closed）。
+    // goto・html・tree の失敗サイトを無言で除外し、残ったサイトだけの
+    // 中央値を「代表値」として報告してしまうと、既定のサイトのうち 1 件
+    // しか成功しなくても正常な計測であるかのように見えてしまう。失敗した
+    // サイトと理由を `failed` に記録し、1 件でも完走できなければ
+    // `Outcome::Error` にして「一部失敗を隠した測定値」を返さない
+    // （fail-closed）。
     let mut reductions = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     for (url, marker) in &sites {
@@ -1651,7 +1884,7 @@ pub fn run_all(targets: &[Target], trials: usize) -> (String, u8) {
     };
 
     let mut body = String::from("{\n");
-    // // 全計測項目の `Outcome` をここへ集め、`bench_exit_code` へ一括で渡す
+    // 全計測項目の `Outcome` をここへ集め、`bench_exit_code` へ一括で渡す
     // （`Outcome::is_error` は support.rs 内限定のため、判定自体は
     // `bench_exit_code` 側に閉じる）。
     let mut outcomes: Vec<Outcome> = Vec::new();

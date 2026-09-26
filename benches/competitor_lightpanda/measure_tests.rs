@@ -32,6 +32,7 @@ mod support;
 
 use std::io::{BufRead, Read, Write};
 use std::net::TcpListener;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use measure::{Target, measure_cold_start, measure_token_reduction, run_all};
@@ -437,6 +438,14 @@ fn run_fake_mcp_non_json_line() {
 /// 1 行書いてから孫の終了を待つ（OS シェル（`sh`）に頼らず、テストバイナリ
 /// 自身の再実行だけで 3 OS 共通に子・孫プロセスを作る。
 /// `kill_process_group_kills_descendant_process_cross_platform` が使う）。
+///
+/// 孫の標準出力にはこのプロセス自身の標準出力（＝呼び出し元テストへの
+/// パイプ）を継承させる（`Stdio::inherit()`）。これにより孫も、このパイプの
+/// 書き込み側を保持し続ける。呼び出し元は kill 前後でこのパイプから読み
+/// 続け、EOF に達するかどうかで「子・孫の両方が終了したか」を外部コマンド
+/// （`kill -0`・`tasklist` 等）を使わずに 3 OS 共通で判定できる
+/// （[`process_is_alive`] 参照。外部コマンドの失敗・タイムアウトを
+/// 「死んでいる」と誤判定する経路自体をなくす）。
 fn run_fake_sleep_parent() {
     let current_exe = std::env::current_exe().expect("current_exe");
     let mut command = std::process::Command::new(&current_exe);
@@ -449,7 +458,7 @@ fn run_fake_sleep_parent() {
         .arg(FAKE_ROLE_FLAG)
         .arg("sleep-grandchild")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::null());
     let mut grandchild = command.spawn().expect("spawn sleep-grandchild");
     println!("{}", grandchild.id());
@@ -500,6 +509,24 @@ fn run_test_cases() {
     kill_process_group_kills_descendant_process_cross_platform();
     eprintln!("case: wait_with_deadline_kills_descendant_process_cross_platform");
     wait_with_deadline_kills_descendant_process_cross_platform();
+    eprintln!("case: read_chunked_body_decodes_chunk_extension");
+    read_chunked_body_decodes_chunk_extension();
+    eprintln!("case: read_chunked_body_skips_trailer_headers");
+    read_chunked_body_skips_trailer_headers();
+    eprintln!("case: read_chunked_body_rejects_size_exceeding_limit");
+    read_chunked_body_rejects_size_exceeding_limit();
+    eprintln!("case: read_chunked_body_rejects_missing_terminator_after_chunk_data");
+    read_chunked_body_rejects_missing_terminator_after_chunk_data();
+    eprintln!("case: read_chunked_body_accepts_bare_lf_terminators");
+    read_chunked_body_accepts_bare_lf_terminators();
+    eprintln!("case: read_chunked_body_rejects_plus_prefixed_size");
+    read_chunked_body_rejects_plus_prefixed_size();
+    eprintln!("case: read_chunked_body_accepts_bws_around_extension_separator");
+    read_chunked_body_accepts_bws_around_extension_separator();
+    eprintln!("case: probe_once_rejects_content_length_and_transfer_encoding_together");
+    probe_once_rejects_content_length_and_transfer_encoding_together();
+    eprintln!("case: probe_once_rejects_conflicting_content_length_values");
+    probe_once_rejects_conflicting_content_length_values();
     eprintln!("competitor_lightpanda_measure: all cases passed");
 }
 
@@ -713,9 +740,9 @@ fn cold_start_invalid_readiness_response_is_error_with_exit_code_one() {
     }
 }
 
-/// ケース 3: fake MCP（`mcp-disconnect`）が改行を送らないまま標準出力を
-/// 閉じる場合、`initialize` 呼び出し（20 秒のタイムアウト）が即時に
-/// `Outcome::Error` になり、20 秒を待たないことを経過時間で確認する。
+/// ケース 3（AISNAP-1）: fake MCP（`mcp-disconnect`）が改行を送らないまま
+/// 標準出力を閉じる場合、`initialize` 呼び出し（20 秒のタイムアウト）が
+/// 即時に `Outcome::Error` になり、20 秒を待たないことを経過時間で確認する。
 fn mcp_disconnect_without_newline_fails_immediately() {
     let current_exe = std::env::current_exe().expect("current_exe");
     let target = Target {
@@ -754,8 +781,9 @@ fn mcp_disconnect_without_newline_fails_immediately() {
     );
 }
 
-/// ケース 4: 対象バイナリが未設定（`bin: None`）の場合、4 項目すべてが
-/// `skipped` になり、終了コードが `0` になることを確認する。
+/// ケース 4（PERF-1/PERF-3/PERF-6/AISNAP-1）: 対象バイナリが未設定
+/// （`bin: None`）の場合、4 項目すべてが `skipped` になり、終了コードが
+/// `0` になることを確認する。
 fn unconfigured_target_is_skipped_with_exit_code_zero() {
     let target = Target {
         name: "unconfigured",
@@ -794,7 +822,8 @@ fn unconfigured_target_is_skipped_with_exit_code_zero() {
     );
 }
 
-/// ケース 5: fake MCP（`mcp-stale`）が `goto` を受けてもマーカーを更新せず、
+/// ケース 5（AISNAP-1）: fake MCP（`mcp-stale`）が `goto` を受けてもマーカーを
+/// 更新せず、
 /// 常に 1 件目のページ（`/article.html`）の内容を返し続ける場合、`goto` の
 /// JSON-RPC 応答自体は形式上妥当でも、2 件目以降の fixture
 /// （`/listing.html`・`/form.html`）については `html`/`tree` にその
@@ -1076,35 +1105,223 @@ fn fixture_server_direct_requests_behave_as_documented() {
     slow_loris_request_does_not_hang(port);
 }
 
-/// リクエスト行を 1 バイトずつ間隔を空けて送り続け（slow-loris）、
-/// fixture サーバーの接続全体の絶対期限（`DeadlineReader`）で確実に
-/// 打ち切られる（テスト自体が無期限にブロックしない）ことを確認する。
+/// PERF-3/AISNAP-1: リクエスト行を 1 バイトずつ間隔を空けて送り続け
+/// （slow-loris）、fixture サーバーの接続全体の絶対期限
+/// （`DeadlineReader`）で確実に打ち切られる（テスト自体が無期限に
+/// ブロックしない）ことを確認する。
 fn slow_loris_request_does_not_hang(port: u16) {
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    // クライアント側の読み取り期限は、サーバーの接続絶対期限
+    // （`FIXTURE_IO_TIMEOUT`）を大きく超えて余裕を持たせる（応答を待つ側が
+    // 先にタイムアウトして「ハングしなかった」ことを誤検知しないため）。
+    let client_read_timeout = measure::FIXTURE_IO_TIMEOUT + Duration::from_secs(10);
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(client_read_timeout))
         .expect("set_read_timeout");
     let bytes = b"GET /article.html HTTP/1.1\r\n\r\n";
+    // 1 バイトずつの合計送信時間が `FIXTURE_IO_TIMEOUT` を確実に超える間隔
+    // にする（送り切れてしまうと、サーバー側の接続絶対期限を検証した
+    // ことにならない）。
+    let interval = (measure::FIXTURE_IO_TIMEOUT / bytes.len() as u32) + Duration::from_millis(50);
     let start = Instant::now();
+    let mut write_failed = false;
     for &b in bytes {
-        // サーバー側の接続全体の期限を確実に超えるよう、十分な間隔を空けて
-        // 送る。書き込み失敗（サーバーが期限で接続を閉じた）はここで検知
-        // でき、その時点でループを終える。
+        // 書き込み失敗（サーバーが期限で接続を閉じた）はここで検知でき、
+        // その時点でループを終える。
         if stream.write_all(&[b]).is_err() {
+            write_failed = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(interval);
     }
     let mut reader = std::io::BufReader::new(stream);
     let mut status_line = String::new();
-    // `Ok(0)`（サーバーが接続を閉じた）・`Err`（リセット等）のいずれも、
-    // 「ハングしなかった」ことの確認としては十分なため区別しない。
-    let _ = reader.read_line(&mut status_line);
+    let read_result = reader.read_line(&mut status_line);
     let elapsed = start.elapsed();
+
+    // 「ハングしなかった」だけでなく、実際にサーバー側の接続絶対期限で
+    // 打ち切られたことまで確認する。期待する結果は次のいずれか:
+    // (1) 送信完了前に書き込みが失敗した（サーバーが先に接続を閉じた）、
+    // (2) 応答が読めた場合は、それが `408 Request Timeout` であること
+    //     （送信を完遂できてしまった場合でも、期限切れとして扱われている
+    //     ことを status line で確認する）、
+    // (3) 応答本体を読む前に接続が閉じられた（`Ok(0)`）。
+    match read_result {
+        Ok(0) => {
+            // 接続が閉じられた（応答なし、または応答済みで close された）。
+        }
+        Ok(_) => {
+            assert_eq!(
+                support::parse_http_status(&status_line),
+                Some(408),
+                "a slow-loris request should be rejected with 408 once the server's deadline elapses, got status line {status_line:?}"
+            );
+        }
+        Err(e) => {
+            assert!(
+                write_failed || e.kind() != std::io::ErrorKind::TimedOut,
+                "the client should not need to hit its own read timeout; the server should have closed the connection well before that: {e}"
+            );
+        }
+    }
+
+    // 経過時間が `FIXTURE_IO_TIMEOUT` に妥当な猶予（`DeadlineReader::
+    // extend_deadline` のエラー応答用猶予・スケジューリング遅延分）を
+    // 足した範囲に収まることを確認する（サーバーが期限を大幅に超えて
+    // 接続を保持し続けていないこと）。
+    let max_elapsed = measure::FIXTURE_IO_TIMEOUT + Duration::from_secs(5);
     assert!(
-        elapsed < Duration::from_secs(30),
-        "a slow-loris connection should be cut off by the server's absolute connection deadline, not hang indefinitely: {elapsed:?}"
+        elapsed < max_elapsed,
+        "a slow-loris connection should be cut off around the server's absolute connection deadline ({:?}), took {elapsed:?}",
+        measure::FIXTURE_IO_TIMEOUT
     );
+}
+
+/// PERF-3: `Transfer-Encoding: chunked` のチャンク拡張（`;` 以降）を無視して
+/// 本文を正しく復元することを確認する（RFC 9112 §7.1.1）。
+fn read_chunked_body_decodes_chunk_extension() {
+    let input = b"5;ext=ignored\r\nhello\r\n0\r\n\r\n";
+    let mut reader = std::io::BufReader::new(&input[..]);
+    let body = measure::read_chunked_body(&mut reader, 1024).expect("should decode");
+    assert_eq!(body, b"hello");
+}
+
+/// PERF-3: 最終チャンク（サイズ 0）の後のトレーラー部を空行まで読み飛ばし、
+/// 本文には影響しないことを確認する。
+fn read_chunked_body_skips_trailer_headers() {
+    let input = b"5\r\nhello\r\n0\r\nX-Trailer: value\r\n\r\n";
+    let mut reader = std::io::BufReader::new(&input[..]);
+    let body = measure::read_chunked_body(&mut reader, 1024).expect("should decode");
+    assert_eq!(body, b"hello");
+}
+
+/// PERF-3: 累積本文サイズが上限を超えるチャンクは、読み取りを試みず失敗に
+/// する（黙って上限まで切り詰めて成功として扱わない）。
+fn read_chunked_body_rejects_size_exceeding_limit() {
+    let input = b"a\r\n0123456789\r\n0\r\n\r\n"; // 10 バイトのチャンク。
+    let mut reader = std::io::BufReader::new(&input[..]);
+    let result = measure::read_chunked_body(&mut reader, 5);
+    match result {
+        Err(e) => assert!(
+            e.contains("exceeds"),
+            "error should mention the size limit: {e}"
+        ),
+        Ok(body) => panic!("expected an error for a chunk exceeding the limit, got {body:?}"),
+    }
+}
+
+/// PERF-3: チャンクデータ直後に CRLF/LF が続かない場合は失敗にする（部分的に
+/// 読めたデータを成功として使わない）。
+fn read_chunked_body_rejects_missing_terminator_after_chunk_data() {
+    let input = b"5\r\nhelloXX0\r\n\r\n";
+    let mut reader = std::io::BufReader::new(&input[..]);
+    let result = measure::read_chunked_body(&mut reader, 1024);
+    match result {
+        Err(e) => assert!(
+            e.contains("not terminated"),
+            "error should mention the missing terminator: {e}"
+        ),
+        Ok(body) => panic!("expected an error for a missing chunk terminator, got {body:?}"),
+    }
+}
+
+/// PERF-3: チャンクサイズ行の裸の LF 終端（CRLF ではなく LF のみ）を
+/// 受理することを確認する（`read_complete_line` と統一した寛容さ）。
+fn read_chunked_body_accepts_bare_lf_terminators() {
+    let input = b"5\nhello\n0\n\n";
+    let mut reader = std::io::BufReader::new(&input[..]);
+    let body = measure::read_chunked_body(&mut reader, 1024).expect("should decode with bare LF");
+    assert_eq!(body, b"hello");
+}
+
+/// PERF-3: `+` 接頭辞付きのチャンクサイズ（16 進数字以外を含む）を拒否する
+/// （`usize::from_str_radix` が符号を許容してしまう経路を明示的な文字種
+/// チェックで塞ぐ）。
+fn read_chunked_body_rejects_plus_prefixed_size() {
+    let input = b"+1a\r\nx";
+    let mut reader = std::io::BufReader::new(&input[..]);
+    let result = measure::read_chunked_body(&mut reader, 1024);
+    match result {
+        Err(e) => assert!(
+            e.contains("invalid chunk size"),
+            "error should mention the invalid chunk size: {e}"
+        ),
+        Ok(body) => panic!("expected an error for a '+'-prefixed chunk size, got {body:?}"),
+    }
+}
+
+/// PERF-3: チャンクサイズ行の BWS（オプションの空白。例:
+/// `5 ;ext=1`）を許容し、拡張の前後の空白がサイズ解釈を壊さないことを
+/// 確認する。
+fn read_chunked_body_accepts_bws_around_extension_separator() {
+    let input = b"5 ;ext=1\r\nhello\r\n0\r\n\r\n";
+    let mut reader = std::io::BufReader::new(&input[..]);
+    let body = measure::read_chunked_body(&mut reader, 1024).expect("should decode with BWS");
+    assert_eq!(body, b"hello");
+}
+
+/// 1 回だけ接続を受け付け、リクエストを読み捨てて `response` をそのまま
+/// 書き込んで閉じる使い捨てのサーバーを起動する（`probe_once` の
+/// `Content-Length`/`Transfer-Encoding` の境界ケースを直接検証するために
+/// 使う）。
+fn spawn_one_shot_response_server(response: &'static [u8]) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut discard = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut discard);
+            let _ = stream.write_all(response);
+            let _ = stream.flush();
+        }
+    });
+    port
+}
+
+/// PERF-3: `Content-Length` と `Transfer-Encoding: chunked` が両方存在する
+/// 応答は、本文の実際の境界をどちらの基準で解釈すべきか判断できないため
+/// probe 失敗にする（RFC 9112 §6.1 の勧告どおり無視して進めるのではなく、
+/// このベンチでは fail-closed にする）。
+fn probe_once_rejects_content_length_and_transfer_encoding_together() {
+    let response: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    let port = spawn_one_shot_response_server(response);
+    let result = measure::probe_once(
+        port,
+        "GET /json/version HTTP/1.1\r\n\r\n",
+        Instant::now() + Duration::from_secs(5),
+    );
+    match result {
+        Err(e) => assert!(
+            e.contains("both Content-Length and Transfer-Encoding"),
+            "error should mention the conflicting headers: {e}"
+        ),
+        Ok((status, body)) => panic!(
+            "expected an error for Content-Length + Transfer-Encoding together, got status={status} body={body:?}"
+        ),
+    }
+}
+
+/// PERF-3: 同じ `Content-Length` ヘッダーが複数回現れて値が食い違う場合、
+/// どちらの値を信じるべきか判断できないため probe 失敗にする。
+fn probe_once_rejects_conflicting_content_length_values() {
+    let response: &'static [u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!";
+    let port = spawn_one_shot_response_server(response);
+    let result = measure::probe_once(
+        port,
+        "GET /json/version HTTP/1.1\r\n\r\n",
+        Instant::now() + Duration::from_secs(5),
+    );
+    match result {
+        Err(e) => assert!(
+            e.contains("conflicting Content-Length"),
+            "error should mention the conflicting Content-Length values: {e}"
+        ),
+        Ok((status, body)) => panic!(
+            "expected an error for conflicting Content-Length values, got status={status} body={body:?}"
+        ),
+    }
 }
 
 /// ループバック TCP 接続の両端（サーバー側・クライアント側）を返す
@@ -1131,15 +1348,19 @@ fn read_line_bounded_rejects_over_limit_lines() {
     let mut reader = std::io::BufReader::new(server);
     let mut out = String::new();
     let result = measure::read_line_bounded(&mut reader, &mut out);
-    assert!(
-        result.is_err(),
-        "expected an error for a line exceeding MAX_LINE_BYTES, got {result:?}"
-    );
+    match &result {
+        Err(e) => assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::InvalidData,
+            "expected InvalidData for a line exceeding MAX_LINE_BYTES, got {result:?}"
+        ),
+        Ok(_) => panic!("expected an error for a line exceeding MAX_LINE_BYTES, got {result:?}"),
+    }
     let _ = sender.join();
 }
 
-/// `read_line_bounded` は不正な UTF-8 バイト列を含む行を（`from_utf8_lossy`
-/// で置換せず）エラーにする。
+/// PERF-3/AISNAP-1: `read_line_bounded` は不正な UTF-8 バイト列を含む行を
+/// （`from_utf8_lossy` で置換せず）エラーにする。
 fn read_line_bounded_rejects_invalid_utf8() {
     let (server, mut client) = loopback_pair();
     let sender = std::thread::spawn(move || {
@@ -1150,16 +1371,21 @@ fn read_line_bounded_rejects_invalid_utf8() {
     let mut reader = std::io::BufReader::new(server);
     let mut out = String::new();
     let result = measure::read_line_bounded(&mut reader, &mut out);
-    assert!(
-        result.is_err(),
-        "expected an error for invalid UTF-8 bytes, got {result:?}"
-    );
+    match &result {
+        Err(e) => assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::InvalidData,
+            "expected InvalidData for invalid UTF-8 bytes, got {result:?}"
+        ),
+        Ok(_) => panic!("expected an error for invalid UTF-8 bytes, got {result:?}"),
+    }
     let _ = sender.join();
 }
 
-/// `read_line_bounded` は、1 バイト以上読んだ後に改行へ達する前に接続が
-/// 閉じた（行が途中で切れた）場合、`ErrorKind::UnexpectedEof` にする
-/// （改行なしの断片を「1 行読めた」として扱わない）。
+/// PERF-3/AISNAP-1: `read_line_bounded` は、1 バイト以上読んだ後に改行へ
+/// 達する前に接続が閉じた（行が途中で切れた）場合、
+/// `ErrorKind::UnexpectedEof` にする（改行なしの断片を「1 行読めた」として
+/// 扱わない）。
 fn read_line_bounded_rejects_mid_line_eof() {
     let (server, mut client) = loopback_pair();
     let sender = std::thread::spawn(move || {
@@ -1179,12 +1405,83 @@ fn read_line_bounded_rejects_mid_line_eof() {
     let _ = sender.join();
 }
 
+/// [`spawn_pipe_reader`] がバックグラウンドスレッドから送るイベント。
+#[derive(Debug)]
+enum PipeEvent {
+    /// 最初の行（`run_fake_sleep_parent` が書く孫の PID）。
+    Line(String),
+    /// パイプの書き込み側が全て閉じた（＝子・孫の両方が終了した）。
+    Eof,
+}
+
+/// 子プロセスの標準出力パイプを読み、最初の 1 行を [`PipeEvent::Line`] で
+/// 送ったあとは、以後の出力を読み捨てながら EOF を監視して
+/// [`PipeEvent::Eof`] を送るバックグラウンドスレッドを起動する。
+///
+/// `kill_process_group_kills_descendant_process_cross_platform` が、外部
+/// コマンド（`kill -0`・`tasklist` 等）に頼らず 3 OS 共通で「子・孫の両方が
+/// 終了したか」を判定するために使う（[`run_fake_sleep_parent`] のドキュメント
+/// 参照。孫にもこのパイプの書き込み側を継承させているため、子だけが終了
+/// しても孫が生きていれば EOF に達しない）。
+fn spawn_pipe_reader(stdout: std::process::ChildStdout) -> mpsc::Receiver<PipeEvent> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => {
+                let _ = tx.send(PipeEvent::Eof);
+                return;
+            }
+            Ok(_) => {
+                let _ = tx.send(PipeEvent::Line(line.trim().to_string()));
+            }
+        }
+        // 孫の PID 行を読んだ後、`run_fake_sleep_parent`/
+        // `run_fake_sleep_grandchild` はこのパイプへそれ以上書き込まない
+        // 前提のため、以後は EOF（子・孫の両方が終了し、書き込み側の
+        // 複製が全て閉じたこと）だけを監視する。
+        let mut buf = [0u8; 64];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    let _ = tx.send(PipeEvent::Eof);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => {
+                    let _ = tx.send(PipeEvent::Eof);
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// `rx` から `wait` の間に届いたイベントを見て、パイプが EOF に達した
+/// （＝死んだ）とみなせるかを判定する。読み取りスレッドの終了に伴う
+/// 送信側の drop（`Disconnected`）も EOF と同義に扱う。タイムアウト
+/// （まだ何も届いていない）は「まだ生きている」ことを意味し、`false`
+/// にする（外部コマンドの失敗・タイムアウトを安易に「死んでいる」と
+/// 判定しない契約）。
+fn pipe_indicates_dead(rx: &mpsc::Receiver<PipeEvent>, wait: Duration) -> bool {
+    matches!(
+        rx.recv_timeout(wait),
+        Ok(PipeEvent::Eof) | Err(mpsc::RecvTimeoutError::Disconnected)
+    )
+}
+
 /// PERF-3/PERF-6: `kill_process_group` が対象プロセスの子だけでなく孫も
 /// 終了させることを、テストバイナリ自身の再実行によって 3 OS 共通の方法で
-/// 確認する（OS シェルの構文差異に依存しない。`cfg(unix)` に限定しない。
-/// unix は `kill -0`、Windows は `tasklist` を、いずれも
-/// `support::run_with_deadline`/`support::wait_with_deadline` 経由で外部
-/// コマンドを実行して使う）。
+/// 確認する（OS シェルの構文差異に依存しない。`cfg(unix)` に限定しない）。
+///
+/// 生死判定は外部コマンド（`kill -0`・`tasklist` 等）に頼らない。孫にも
+/// 子の標準出力パイプの書き込み側を継承させ（[`run_fake_sleep_parent`]
+/// 参照）、そのパイプが EOF に達するかどうかで判定する
+/// （[`spawn_pipe_reader`]・[`pipe_indicates_dead`]）。外部コマンドの
+/// spawn 失敗・タイムアウトを「死んでいる」と誤判定する経路が構造的に
+/// 無くなる。
 fn kill_process_group_kills_descendant_process_cross_platform() {
     let current_exe = std::env::current_exe().expect("current_exe");
     let mut command = std::process::Command::new(&current_exe);
@@ -1199,14 +1496,16 @@ fn kill_process_group_kills_descendant_process_cross_platform() {
     let child_pid = child.id();
 
     let stdout = child.stdout.take().expect("child stdout");
-    let mut reader = std::io::BufReader::new(stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read grandchild pid");
-    let grandchild_pid: u32 = line.trim().parse().expect("parse grandchild pid");
+    let rx = spawn_pipe_reader(stdout);
+    let grandchild_pid: u32 = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(PipeEvent::Line(pid_str)) => pid_str.parse().expect("parse grandchild pid"),
+        other => panic!("expected the grandchild pid line, got a different event: {other:?}"),
+    };
+    let _ = grandchild_pid; // ログ・デバッグ用途以外では未使用。
 
     assert!(
-        process_is_alive(grandchild_pid),
-        "grandchild (pid={grandchild_pid}) should be alive before kill_process_group"
+        !pipe_indicates_dead(&rx, Duration::from_millis(300)),
+        "the pipe should not be at EOF yet; the child and grandchild should both be alive before kill_process_group"
     );
 
     let kill_result = support::kill_process_group(child_pid);
@@ -1217,58 +1516,17 @@ fn kill_process_group_kills_descendant_process_cross_platform() {
     );
 
     // シグナル配送／プロセスツリー終了から実際の終了までの短い遅延を許容する。
-    let mut alive = true;
+    let mut dead = false;
     for _ in 0..50 {
-        if !process_is_alive(grandchild_pid) {
-            alive = false;
+        if pipe_indicates_dead(&rx, Duration::from_millis(100)) {
+            dead = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(100));
     }
     assert!(
-        !alive,
-        "grandchild (pid={grandchild_pid}) should be dead after kill_process_group (not just the direct child)"
+        dead,
+        "the pipe should reach EOF after kill_process_group, meaning both the child and the grandchild have exited (not just the direct child)"
     );
-}
-
-#[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
-    let mut command = std::process::Command::new("kill");
-    command
-        .args(["-0", &pid.to_string()])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    support::run_with_deadline(command, Duration::from_secs(5))
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(windows)]
-fn process_is_alive(pid: u32) -> bool {
-    let mut command = std::process::Command::new("tasklist");
-    command
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let mut child = match command.spawn() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let status = match support::wait_with_deadline(&mut child, Duration::from_secs(5)) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    if !status.success() {
-        return false;
-    }
-    let mut output = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_end(&mut output);
-    }
-    let text = String::from_utf8_lossy(&output);
-    text.contains(&format!("\"{pid}\""))
 }
 
 /// PERF-3/PERF-6: `wait_with_deadline` が期限を大幅に超えて生存し続ける
@@ -1291,10 +1549,15 @@ fn wait_with_deadline_kills_descendant_process_cross_platform() {
     let result = support::wait_with_deadline(&mut child, Duration::from_millis(300));
     let elapsed = start.elapsed();
 
-    assert!(
-        result.is_err(),
-        "expected a timeout error for a process sleeping much longer than the deadline, got {result:?}"
-    );
+    match &result {
+        Err(e) => assert!(
+            e.contains("did not exit"),
+            "expected a message mentioning the process did not exit in time, got {result:?}"
+        ),
+        Ok(status) => panic!(
+            "expected a timeout error for a process sleeping much longer than the deadline, got Ok({status:?})"
+        ),
+    }
     assert!(
         elapsed < Duration::from_secs(10),
         "wait_with_deadline should return soon after the deadline, took {elapsed:?}"

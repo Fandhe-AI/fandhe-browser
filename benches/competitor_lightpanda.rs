@@ -103,23 +103,15 @@ const MAX_ARGS_COUNT: usize = 64;
 /// `<PREFIX>_SERVE_ARGS` / `<PREFIX>_MCP_ARGS` を読み取り、上限検証してから
 /// `split_args` へ渡す（外部入力。coding-rust.md「長さ・件数を上限検証」）。
 fn args_from_env(env_prefix: &str, var_suffix: &str, default: &str) -> Result<Vec<String>, String> {
-    match std::env::var(format!("{env_prefix}_{var_suffix}")) {
-        Ok(raw) => {
-            if raw.len() > MAX_ARGS_ENV_BYTES {
-                return Err(format!(
-                    "{env_prefix}_{var_suffix} exceeds {MAX_ARGS_ENV_BYTES} bytes"
-                ));
-            }
-            let args = support::split_args(&raw);
-            if args.len() > MAX_ARGS_COUNT {
-                return Err(format!(
-                    "{env_prefix}_{var_suffix} has more than {MAX_ARGS_COUNT} args"
-                ));
-            }
-            Ok(args)
-        }
-        Err(_) => Ok(support::split_args(default)),
-    }
+    let var_name = format!("{env_prefix}_{var_suffix}");
+    let raw = std::env::var_os(&var_name);
+    support::parse_args_env_value(
+        &var_name,
+        raw.as_deref(),
+        default,
+        MAX_ARGS_ENV_BYTES,
+        MAX_ARGS_COUNT,
+    )
 }
 
 /// `<PREFIX>_BIN` を読み取り、[`support::resolve_bin_value`]（純粋関数。

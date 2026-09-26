@@ -230,6 +230,43 @@ pub fn split_args(env: &str) -> Vec<String> {
     env.split_whitespace().map(str::to_string).collect()
 }
 
+/// `<PREFIX>_SERVE_ARGS`/`<PREFIX>_MCP_ARGS` の生の値を起動引数へ解決する
+/// 純粋関数（`competitor_lightpanda.rs` の `args_from_env` から呼ばれる。
+/// [`resolve_bin_value`]・[`parse_trial_count`] と同じ理由で `std::env` に
+/// 触れない形にする）。
+///
+/// 未設定（`raw` が `None`）は `default` を分割した結果を返す。設定
+/// されているのに解決できない場合（非 UTF-8・バイト数上限超過・分割後の
+/// 引数個数上限超過）は黙って既定値へフォールバックせず `Err` にする
+/// （誤設定に気づけないまま意図しない引数で起動しないことを優先する。
+/// coding-rust.md「外部入力の経路では明示的に処理する」）。
+///
+/// [`parse_trial_count`] と同じ理由で `#[allow(dead_code)]` を付ける
+/// （`competitor_lightpanda_measure` からは到達不能）。
+#[allow(dead_code)]
+pub fn parse_args_env_value(
+    var_name: &str,
+    raw: Option<&std::ffi::OsStr>,
+    default: &str,
+    max_bytes: usize,
+    max_count: usize,
+) -> Result<Vec<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(split_args(default));
+    };
+    let Some(raw) = raw.to_str() else {
+        return Err(format!("{var_name} is not valid UTF-8"));
+    };
+    if raw.len() > max_bytes {
+        return Err(format!("{var_name} exceeds {max_bytes} bytes"));
+    }
+    let args = split_args(raw);
+    if args.len() > max_count {
+        return Err(format!("{var_name} has more than {max_count} args"));
+    }
+    Ok(args)
+}
+
 /// 計測 1 件の結果。成功しなかった場合も理由を残し「実装済みを装わない」
 /// （coding-rust.md「公開 API」・REPAIR-4 相当の方針をベンチ出力にも適用）。
 ///
@@ -630,7 +667,28 @@ pub fn resolve_bin_value(
     if trimmed.is_empty() {
         return (None, Some(format!("{var_name} is set but empty")));
     }
-    let path = PathBuf::from(trimmed);
+    let raw_path = PathBuf::from(trimmed);
+    // 区切り文字を含まない名前（例: `lightpanda`）だと、`fs::metadata` は
+    // cwd を基準に解決するが、`Command::new` はそのような名前を PATH 検索
+    // する（`execvp`/Windows のサーチパス相当）ため、両者が異なるファイルを
+    // 指し得る（起動できたのにサイズ計測できない、またはその逆）。
+    // `std::path::absolute`（cwd との結合のみ行い、シンボリックリンク解決や
+    // 存在確認はしない）で区切り文字を含む絶対パスに正規化し、以後は
+    // 起動（`Command::new`）・サイズ計測（`fs::metadata`）の両方でこの
+    // 同じ絶対パスを使うことで、`Command::new` が PATH 検索へフォール
+    // バックする経路自体をなくす。
+    let path = match std::path::absolute(&raw_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                None,
+                Some(format!(
+                    "{var_name} ({}) could not be made absolute: {e}",
+                    raw_path.display()
+                )),
+            );
+        }
+    };
     match std::fs::metadata(&path) {
         Ok(meta) if meta.is_file() => (Some(path), None),
         Ok(_) => (
@@ -1005,29 +1063,42 @@ fn normalize_timeout_error(err: std::io::Error) -> std::io::Error {
 
 impl Read for DeadlineReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "deadline exceeded while reading",
-            ));
+        loop {
+            let remaining = self.deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "deadline exceeded while reading",
+                ));
+            }
+            self.stream.set_read_timeout(Some(remaining))?;
+            match self.stream.read(buf).map_err(normalize_timeout_error) {
+                // シグナル配送等による `EINTR` は失敗ではない（std の他の
+                // I/O 実装が内部でリトライするのと同じ扱い）。期限は
+                // ループ先頭で毎回再確認するため、無期限リトライにはならない。
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
         }
-        self.stream.set_read_timeout(Some(remaining))?;
-        self.stream.read(buf).map_err(normalize_timeout_error)
     }
 }
 
 impl Write for DeadlineReader {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "deadline exceeded while writing",
-            ));
+        loop {
+            let remaining = self.deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "deadline exceeded while writing",
+                ));
+            }
+            self.stream.set_write_timeout(Some(remaining))?;
+            match self.stream.write(buf).map_err(normalize_timeout_error) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
         }
-        self.stream.set_write_timeout(Some(remaining))?;
-        self.stream.write(buf).map_err(normalize_timeout_error)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1085,8 +1156,7 @@ impl JsonValue {
         }
     }
 
-    /// `Bool` のときだけ中身を返す。`result.isError` の型検証に使う
-    /// 。
+    /// `Bool` のときだけ中身を返す。`result.isError` の型検証に使う。
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             JsonValue::Bool(b) => Some(*b),
@@ -1113,7 +1183,8 @@ impl JsonValue {
 /// `tree` を別ページの結果として計測する経路になり得た）。ここで
 /// JSON-RPC 2.0 の封筒（`jsonrpc`・`id`・`error`/`result` の排他）と、
 /// `method` ごとに要求される `result` の最小限の形を検証する
-/// （`tools/call` は `content` が空でない配列で各要素に `type` を持ち、
+/// （`tools/call` は `content` が配列（MCP 2025-06-18 の仕様どおり空配列も
+/// 許す）で各要素に `type` を持ち、
 /// `type == "text"` なら `text` が文字列であること・`isError` があるなら
 /// bool であることまで。`initialize` は `result` がオブジェクトで、
 /// `protocolVersion` が文字列・`capabilities` がオブジェクトであることまで
@@ -1987,7 +2058,7 @@ mod tests {
         assert_eq!(parse_http_request_line("GET /path NOT-HTTP/1.1"), None);
     }
 
-    // // `HTTP/` で始まるだけの不正なバージョン表記（`HTTP/potato` 等）を
+    // `HTTP/` で始まるだけの不正なバージョン表記（`HTTP/potato` 等）を
     // 許してしまわないことを確認する。
     #[test]
     fn parse_http_request_line_rejects_malformed_version() {
@@ -2101,6 +2172,61 @@ mod tests {
         assert!(parse_trial_count(Some(&raw), 5, 20).is_err());
     }
 
+    #[test]
+    fn parse_args_env_value_absent_uses_default() {
+        assert_eq!(
+            parse_args_env_value(
+                "LIGHTPANDA_SERVE_ARGS",
+                None,
+                "serve --port {port}",
+                4096,
+                64
+            ),
+            Ok(vec![
+                "serve".to_string(),
+                "--port".to_string(),
+                "{port}".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_args_env_value_valid_value_is_split() {
+        let raw = std::ffi::OsString::from("mcp --flag");
+        assert_eq!(
+            parse_args_env_value("LIGHTPANDA_MCP_ARGS", Some(&raw), "mcp", 4096, 64),
+            Ok(vec!["mcp".to_string(), "--flag".to_string()])
+        );
+    }
+
+    // 非 UTF-8 は黙って既定値へフォールバックせず `Err` にする（誤設定を
+    // 「未設定」と区別する）。
+    #[cfg(unix)]
+    #[test]
+    fn parse_args_env_value_non_utf8_is_an_error() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(&[0xff, 0xfe]).to_os_string();
+        let result = parse_args_env_value("LIGHTPANDA_SERVE_ARGS", Some(&raw), "serve", 4096, 64);
+        assert!(
+            result.is_err(),
+            "non-UTF-8 SERVE_ARGS should be an error, not silently fall back to the default"
+        );
+    }
+
+    #[test]
+    fn parse_args_env_value_exceeds_byte_limit_is_an_error() {
+        let raw = std::ffi::OsString::from("a".repeat(10));
+        assert!(parse_args_env_value("LIGHTPANDA_SERVE_ARGS", Some(&raw), "serve", 4, 64).is_err());
+    }
+
+    #[test]
+    fn parse_args_env_value_exceeds_count_limit_is_an_error() {
+        let raw = std::ffi::OsString::from("a b c d e");
+        assert!(
+            parse_args_env_value("LIGHTPANDA_SERVE_ARGS", Some(&raw), "serve", 4096, 2).is_err()
+        );
+    }
+
     // `<PREFIX>_BIN` 未設定（`raw: None`）は既存の「バイナリ未設定は
     // Skipped」契約を保つため `(None, None)` にする。
     #[test]
@@ -2132,6 +2258,40 @@ mod tests {
             bin_error
                 .expect("expected error")
                 .contains("could not be accessed")
+        );
+    }
+
+    // 区切り文字を含まない名前（例: `lightpanda`）は cwd 相対に解決され、
+    // 返る `bin` は絶対パスになる（`Command::new` が PATH 検索へ
+    // フォールバックしないよう、以後の起動・サイズ計測ですべて同じ絶対
+    // パスを使うための契約）。
+    #[test]
+    fn resolve_bin_value_relative_name_is_resolved_to_an_absolute_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-bench-resolve-bin-value-relative-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let file_name = "fandhe-bench-resolve-bin-value-relative-bin";
+        std::fs::write(dir.join(file_name), b"stub").expect("write temp file");
+
+        let original_cwd = std::env::current_dir().expect("current_dir");
+        std::env::set_current_dir(&dir).expect("set_current_dir");
+        let raw = std::ffi::OsString::from(file_name);
+        let result = resolve_bin_value("LIGHTPANDA_BIN", Some(&raw));
+        std::env::set_current_dir(&original_cwd).expect("restore current_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (bin, bin_error) = result;
+        assert_eq!(bin_error, None);
+        let bin = bin.expect("expected a resolved path");
+        assert!(
+            bin.is_absolute(),
+            "a name without a path separator should resolve to an absolute path: {bin:?}"
+        );
+        assert!(
+            bin.ends_with(file_name),
+            "the absolute path should still end with the original file name: {bin:?}"
         );
     }
 
@@ -2170,10 +2330,10 @@ mod tests {
         );
     }
 
-    // `kill_process_group`（`unsafe`・実際の
-    // プロセス操作を伴うため、この crate root では単体テストできない）が
-    // 使う「終了ステータスから成功／失敗を判定する」ロジック自体は
-    // 実プロセスを起動して検証できる。
+    // `kill_process_group` が使う「終了ステータスから成功／失敗を判定する」
+    // ロジック（`unsafe` は使わない。`kill_process_group` 自体の単体テストは
+    // 本ファイルの `kill_process_group_kills_child_and_grandchild` を参照）を
+    // 実プロセスを起動して単独で検証する。
     #[test]
     fn exit_status_to_result_success_is_ok() {
         #[cfg(unix)]
@@ -2225,12 +2385,12 @@ mod tests {
     /// 終了していることを 3 OS CI で実証する。孫の PID は子の標準出力
     /// から受け取る。
     ///
-    /// 注記: このサンドボックス環境では、プロセスグループへのシグナル
-    /// 配送自体が制限されている可能性がある（過去のレビュー対応で、
-    /// 直接の子への `kill`（正の PID）は機能するが、プロセスグループ
-    /// 宛て（負の PID）のシグナル配送だけがサンドボックスの制約で
-    /// 機能しない事例を確認済み）。このテストはアサーションを弱めず、
-    /// 実際に子・孫の両方が終了していることを要求する。ローカルの
+    /// 注記: 一部のサンドボックス環境では、プロセスグループへのシグナル
+    /// 配送自体が制限されている場合がある（直接の子への `kill`（正の
+    /// PID）は機能するが、プロセスグループ宛て（負の PID）のシグナル
+    /// 配送だけがサンドボックスの制約で機能しない環境を確認済み）。この
+    /// テストはアサーションを弱めず、実際に子・孫の両方が終了していることを
+    /// 要求する。ローカルの
     /// サンドボックスで（環境起因で）失敗する場合は、その旨をそのまま
     /// 報告し、macOS・Linux の CI（`ci.md`「3 OS CI」）での結果に判断を
     /// 委ねる。
@@ -2778,7 +2938,7 @@ mod tests {
         assert_eq!(validate_mcp_response(&value, 1.0, "initialize"), Ok(()));
     }
 
-    // // 「initialize や tools/list など、ほかの MCP 呼び出しの応答の形も
+    // 「initialize や tools/list など、ほかの MCP 呼び出しの応答の形も
     // 同じ方針で確認する」ため、`initialize` は空の `result: {}` を
     // 成功と誤判定してはいけない（`tools/call` の `result: {}` を拒否する
     // のと同じ理由付け）。
