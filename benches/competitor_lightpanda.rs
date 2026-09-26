@@ -74,9 +74,10 @@ use std::time::{Duration, Instant};
 
 use support::{
     DeadlineReader, JsonValue, Outcome, approx_tokens, arg_error_gate, bench_exit_code,
-    expand_args, http_status_for_io_error, json_escape, looks_like_browser_readiness_response,
-    lookup_fixture, median, parse_http_request_line, parse_http_status, parse_json, reduction_pct,
-    require_bin, split_args, token_reduction_gate, validate_local_bench_url, validate_mcp_response,
+    content_length_exceeds_limit, expand_args, http_status_for_io_error, json_escape,
+    looks_like_browser_readiness_response, lookup_fixture, median, parse_http_request_line,
+    parse_http_status, parse_json, reduction_pct, require_bin, split_args, token_reduction_gate,
+    validate_local_bench_url, validate_mcp_response,
 };
 // `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
 // 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
@@ -300,23 +301,34 @@ fn fixture_accept_loop(listener: TcpListener, stop: Arc<AtomicBool>) {
 ///
 /// レビュー指摘 P1（Codex。PR #442 再々々々レビュー・
 /// competitor_lightpanda.rs:352）: `read_line_bounded` はバイト単位で読み、
-/// 相手が改行を送る前に接続を閉じると、それまでに読めた分だけを
-/// `Ok(n)`（`n > 0`）で返す。呼び出し側がこれを「1 行読めた」として
+/// 以前は相手が改行を送る前に接続を閉じても、それまでに読めた分だけを
+/// `Ok(n)`（`n > 0`）で返していた。呼び出し側がこれを「1 行読めた」として
 /// 扱うと、ヘッダ終端（空行）へ到達しないまま後続処理（`lookup_fixture`
-/// による 200 応答）へ進み得た。改行で終わっていない場合は
-/// `ErrorKind::UnexpectedEof` として扱い、呼び出し元が必ず接続を
-/// 400/408 で終了できるようにする。
+/// による 200 応答）へ進み得た。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々々々々レビュー・
+/// competitor_lightpanda.rs:1039）: この「改行で終わらない行は
+/// `UnexpectedEof`」という契約自体は `read_line_bounded` 側へ集約した
+/// （fixture サーバー・probe・MCP のすべての呼び出し元で一貫させるため。
+/// 同関数のドキュメント参照）。この `read_complete_line` は
+/// fixture サーバー・probe が使う薄いラッパーで、`read_line_bounded` が
+/// 返す `Ok(0)`（＝ストリームの正常終端。MCP はこれを「もう応答が無い」
+/// という正常なシグナルとして扱うが、fixture サーバー・probe は
+/// 「リクエスト行・ヘッダ行を 1 行も受け取れなかった」ことを意味するため
+/// 常に失敗として扱う）を `Err` へ変換する。
 fn read_complete_line<R: BufRead>(reader: &mut R, out: &mut String) -> std::io::Result<()> {
     match read_line_bounded(reader, out) {
         Ok(0) => Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "connection closed before a line was received",
         )),
-        Ok(_) if !out.ends_with('\n') => Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "connection closed before the line was terminated",
-        )),
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            // `read_line_bounded` の契約により、ここに到達する `Ok(_)` は
+            // 必ず改行で終わる完全な行である（改行前に EOF に達した場合は
+            // 既に `Err(UnexpectedEof)` になっている）。
+            debug_assert!(out.ends_with('\n'));
+            Ok(())
+        }
         Err(e) => Err(e),
     }
 }
@@ -743,6 +755,20 @@ fn probe_once(port: u16, request: &str, outer_deadline: Instant) -> Option<(u16,
     // EOF・エラーが起きた場合は `break` で打ち切って部分的な本文を
     // そのまま使っていた（本文が途中で切れた応答を成功として扱い得た）。
     // ここではどちらも probe 失敗（`None`）にする。
+    //
+    // レビュー指摘 P2（Codex。PR #442 再々々々々々々レビュー・
+    // competitor_lightpanda.rs:756）: `Content-Length` が
+    // `PROBE_BODY_MAX_BYTES` を超える場合、以前は `len.min(...)` で
+    // 上限まで黙って切り詰め、その範囲だけ読めれば成功として扱っていた
+    // （＝サーバーが実際に宣言した長さの応答を確認しないまま probe
+    // 成功と判定し得た）。ここでは `len` が上限を超えた時点で読み取りを
+    // 試みず即座に probe 失敗（`None`）にする。`Content-Length` が無い
+    // 分岐（EOF まで読む）でも、読めたバイト数が上限を超えたら「切り詰めて
+    // 使う」のではなく probe 失敗にする（同種の「上限で黙って切り詰めて
+    // 成功扱い」をここでも避ける）。
+    if content_length_exceeds_limit(content_length, PROBE_BODY_MAX_BYTES) {
+        return None;
+    }
     let mut body = Vec::new();
     match content_length {
         Some(len) => {
@@ -752,8 +778,7 @@ fn probe_once(port: u16, request: &str, outer_deadline: Instant) -> Option<(u16,
             // `Content-Length` に届く前に応答が途中で切れたケースを
             // 取りこぼさず失敗にできる。読み取りエラー（`DeadlineReader`
             // 経由のタイムアウトを含む）も同様に `Err` になる。
-            let to_read = len.min(PROBE_BODY_MAX_BYTES);
-            let mut buf = vec![0u8; to_read];
+            let mut buf = vec![0u8; len];
             reader.read_exact(&mut buf).ok()?;
             body = buf;
         }
@@ -766,7 +791,9 @@ fn probe_once(port: u16, request: &str, outer_deadline: Instant) -> Option<(u16,
                     Ok(n) => {
                         body.extend_from_slice(&buf[..n]);
                         if body.len() > PROBE_BODY_MAX_BYTES {
-                            break;
+                            // 上限超過分をそのまま「読めた分だけ」の
+                            // 成功として使わず、probe 失敗にする。
+                            return None;
                         }
                     }
                     // タイムアウトを含む読み取りエラーは失敗として扱う
@@ -804,12 +831,39 @@ fn probe_once(port: u16, request: &str, outer_deadline: Instant) -> Option<(u16,
 /// 正常なトークン削減率として出力し得た。`String::from_utf8` で厳密に
 /// 変換し、失敗したら `ErrorKind::InvalidData` で計測エラーにする
 /// （呼び出し元は他の `Err` 経路と同様に扱えばよく、個別対応は不要）。
+///
+/// 契約（レビュー指摘 P1。Codex。PR #442 再々々々々々レビュー・
+/// competitor_lightpanda.rs:1039）: 「改行で終わる行を 1 本読めた」場合
+/// だけ `Ok(len)`（`len > 0`）を返す。ストリームが 1 バイトも読まずに
+/// 終端した場合（前の呼び出しまでに完結した行を読み終え、次の行が
+/// 存在しないことを示す正常な終端）だけ `Ok(0)` を返す。それ以外
+/// （1 バイト以上読んだが改行に達する前に EOF に達した = 行が途中で
+/// 切れた）は `ErrorKind::UnexpectedEof` で `Err` にする。以前はこの
+/// ケースを `Ok(len)`（改行なしの断片をそのまま返す）としていたため、
+/// この関数を直接呼ぶ MCP stdout 読み取りスレッドが、途中で切れた行を
+/// 完全な応答として読み取りキューへ送り得た（`read_complete_line` を
+/// 経由する呼び出し元――fixture サーバー・probe――は既にこの区別を
+/// 呼び出し側で行っていたが、直接呼ぶ呼び出し元と食い違っていた）。
+/// この契約をここ 1 箇所に集約することで、fixture サーバー・probe・MCP
+/// のすべての呼び出し元で一貫させる。
 fn read_line_bounded<R: BufRead>(reader: &mut R, out: &mut String) -> std::io::Result<usize> {
     let mut buf = Vec::new();
     loop {
         let mut byte = [0u8; 1];
         if reader.read(&mut byte)? == 0 {
-            break;
+            if buf.is_empty() {
+                // 前の行までで完結しており、次の行が無いままストリームが
+                // 正常終端した（呼び出し元にとって「もう読むものが無い」
+                // ことを示す）。
+                *out = String::new();
+                return Ok(0);
+            }
+            // 1 バイト以上読んだが改行に達する前に接続が切れた。
+            // 「行が完結した」とはみなさず明示的に失敗させる。
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "stream ended before the line was terminated by a newline",
+            ));
         }
         buf.push(byte[0]);
         if byte[0] == b'\n' {
@@ -1008,9 +1062,12 @@ struct McpClient {
     /// 計測をエラー終了させる。
     overflowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 読み取りスレッドが `read_line_bounded` の `InvalidData`（`MAX_LINE_BYTES`
-    /// 到達・改行未検出、または不正な UTF-8。レビュー指摘 P1・P2）を検知した
-    /// 際に立てるフラグ。`call` はこれを見て、切り詰められた／文字化けした
-    /// 行を無視したまま待ち続けるのではなく明示的にエラー終了させる。
+    /// 到達・改行未検出、または不正な UTF-8。レビュー指摘 P1・P2）、または
+    /// `UnexpectedEof`（改行に達する前に子プロセスが標準出力を閉じた。
+    /// レビュー指摘 P1。Codex。PR #442 再々々々々々レビュー・
+    /// competitor_lightpanda.rs:1039）を検知した際に立てるフラグ。`call` は
+    /// これを見て、切り詰められた／文字化けした／未完了の行を無視したまま
+    /// 待ち続けるのではなく明示的にエラー終了させる。
     line_read_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -1050,16 +1107,27 @@ impl McpClient {
                         }
                         Err(mpsc::TrySendError::Disconnected(_)) => break,
                     },
-                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::InvalidData
+                            || e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
                         // `MAX_LINE_BYTES` に達し改行未検出のまま打ち切られた行
-                        // （レビュー指摘 P1）、または不正な UTF-8（レビュー指摘
-                        // P2。Codex。PR #442 再々々々々レビュー・
+                        // （レビュー指摘 P1）、不正な UTF-8（レビュー指摘 P2。
+                        // Codex。PR #442 再々々々々レビュー・
                         // competitor_lightpanda.rs:585: `from_utf8_lossy` の
                         // 置換で偶然妥当な JSON に化ける経路を避けるため、
-                        // `read_line_bounded` を厳密な UTF-8 変換にした）。
-                        // どちらも切り詰められた／文字化けした断片を正常応答
-                        // として扱わせず、読み取りを止めて `call` 側へ明示的に
-                        // 伝える。
+                        // `read_line_bounded` を厳密な UTF-8 変換にした）、
+                        // または改行に達する前に子プロセスが標準出力を閉じた
+                        // （`UnexpectedEof`。レビュー指摘 P1。Codex。PR #442
+                        // 再々々々々々レビュー・competitor_lightpanda.rs:1039:
+                        // 以前は `read_line_bounded` がこのケースでも
+                        // 改行なしの断片を `Ok` で返しており、この
+                        // `Err(_) => break`（当時は無条件で握りつぶす分岐）に
+                        // 落ちずそのまま応答キューへ送られ得た。契約変更後は
+                        // ここへ来るため、明示的に `line_read_error` を立てて
+                        // `call` 側へ伝える）。いずれも切り詰められた／
+                        // 文字化けした／未完了の断片を正常応答として扱わせず、
+                        // 読み取りを止めて `call` 側へ明示的に伝える。
                         line_read_error_writer.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
@@ -1191,7 +1259,7 @@ impl McpClient {
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
                 return Err(format!(
-                    "{method}: mcp response line could not be decoded (exceeded {MAX_LINE_BYTES} bytes without newline, or contained invalid UTF-8), aborting"
+                    "{method}: mcp response line could not be decoded (exceeded {MAX_LINE_BYTES} bytes without newline, contained invalid UTF-8, or the child closed stdout before the line was newline-terminated), aborting"
                 ));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1211,7 +1279,7 @@ impl McpClient {
                         .load(std::sync::atomic::Ordering::SeqCst)
                     {
                         return Err(format!(
-                            "{method}: mcp response line could not be decoded (exceeded {MAX_LINE_BYTES} bytes without newline, or contained invalid UTF-8), aborting"
+                            "{method}: mcp response line could not be decoded (exceeded {MAX_LINE_BYTES} bytes without newline, contained invalid UTF-8, or the child closed stdout before the line was newline-terminated), aborting"
                         ));
                     }
                     return Err(format!("timeout waiting for response to {method}"));

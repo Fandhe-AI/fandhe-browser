@@ -509,6 +509,21 @@ pub fn http_status_for_io_error(kind: std::io::ErrorKind) -> (u16, &'static str)
     }
 }
 
+/// readiness probe が受け取った `Content-Length` が、読み取りに許す上限
+/// （`competitor_lightpanda.rs` の `PROBE_BODY_MAX_BYTES`）を超えているかを
+/// 判定する。
+///
+/// レビュー指摘 P2（Codex。PR #442 再々々々々々々レビュー・
+/// competitor_lightpanda.rs:756）: 以前は `Content-Length` が上限を超えて
+/// いても `len.min(max_bytes)` で黙って切り詰め、その範囲だけ読めれば
+/// probe 成功として扱っていた（サーバーが実際に宣言した長さの応答を
+/// 確認しないまま成功と判定し得た）。呼び出し元（`probe_once`）は、この
+/// 関数が `true` を返したら読み取りを試みず即座に probe 失敗にする契約
+/// とする（「上限で黙って切り詰めて成功扱いする」経路を無くす）。
+pub fn content_length_exceeds_limit(content_length: Option<usize>, max_bytes: usize) -> bool {
+    content_length.is_some_and(|len| len > max_bytes)
+}
+
 /// `TcpStream` を包み、`read`/`write` のたびに残り時間を
 /// `set_read_timeout`/`set_write_timeout` へ反映することで、個々の
 /// 呼び出しではなく「この接続・この probe」全体に対する絶対期限
@@ -546,6 +561,26 @@ impl DeadlineReader {
     }
 }
 
+/// OS のソケットタイムアウトに由来する `io::Error` を、共通の
+/// `ErrorKind::TimedOut` へ正規化する。
+///
+/// レビュー指摘（Cursor。PR #442 再々々々々々々レビュー・
+/// competitor_lightpanda.rs:1893。macOS CI 失敗）: unix のブロッキング
+/// ソケットは `set_read_timeout`/`set_write_timeout` の期限切れで
+/// `ErrorKind::WouldBlock` を返す（Linux では `TimedOut` を返すため、
+/// この違いに気づかれにくい）。`DeadlineReader` 呼び出し側（
+/// `deadline_reader_cuts_off_slow_loris_sender` 等）が `TimedOut` だけを
+/// 期待していると macOS で失敗する。`DeadlineReader::read`/`write` の
+/// 時点でこの 2 つを区別なく `TimedOut` へ正規化し、以降の呼び出し元
+/// （fixture サーバー・probe・`support::http_status_for_io_error` 等）が
+/// OS 差異を意識せずに済むようにする。
+fn normalize_timeout_error(err: std::io::Error) -> std::io::Error {
+    match err.kind() {
+        std::io::ErrorKind::WouldBlock => std::io::Error::new(std::io::ErrorKind::TimedOut, err),
+        _ => err,
+    }
+}
+
 impl Read for DeadlineReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
@@ -556,7 +591,7 @@ impl Read for DeadlineReader {
             ));
         }
         self.stream.set_read_timeout(Some(remaining))?;
-        self.stream.read(buf)
+        self.stream.read(buf).map_err(normalize_timeout_error)
     }
 }
 
@@ -570,7 +605,7 @@ impl Write for DeadlineReader {
             ));
         }
         self.stream.set_write_timeout(Some(remaining))?;
-        self.stream.write(buf)
+        self.stream.write(buf).map_err(normalize_timeout_error)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1523,6 +1558,27 @@ mod tests {
         );
     }
 
+    // レビュー指摘 P2（Codex。PR #442 再々々々々々々レビュー・
+    // competitor_lightpanda.rs:756）: `Content-Length` が読み取り上限を
+    // 超える場合は `min` で黙って切り詰めず probe 失敗にする契約を、
+    // `probe_once` が呼ぶこの純粋関数の単体テストとして確認する。
+    #[test]
+    fn content_length_exceeds_limit_true_when_over() {
+        assert!(content_length_exceeds_limit(Some(65), 64));
+    }
+
+    #[test]
+    fn content_length_exceeds_limit_false_when_within_or_equal() {
+        assert!(!content_length_exceeds_limit(Some(64), 64));
+        assert!(!content_length_exceeds_limit(Some(1), 64));
+        assert!(!content_length_exceeds_limit(Some(0), 64));
+    }
+
+    #[test]
+    fn content_length_exceeds_limit_false_when_absent() {
+        assert!(!content_length_exceeds_limit(None, 64));
+    }
+
     // レビュー指摘 P0・P1（Codex。PR #442 再々レビュー・
     // competitor_lightpanda.rs:338/352）: fixture はコンパイル時に埋め込んだ
     // 固定テーブルの完全一致だけで引くため、シンボリックリンク・TOCTOU・
@@ -1879,12 +1935,20 @@ mod tests {
         // 個々の `read` は（`DeadlineReader` により毎回残り時間へ短縮
         // されるとはいえ）データが来れば成功し得るため、`TimedOut` に
         // 達するまでループする。
+        //
+        // レビュー指摘（Cursor。PR #442 再々々々々々々レビュー）: 送信側
+        // （slow-loris スレッド）は接続を close しない前提のため、
+        // `Ok(0)`（相手の正常な close）に達することは無いはずである。
+        // 万一到達した場合はテストの前提が崩れている（実装の変更漏れ等）
+        // ことを示すので、無限ループにせず `panic!` で明示的に失敗させる
+        // （`Ok(0)` を単に無視して回り続けると、slow-loris の送信が尽きた
+        // 後もタイムアウトへ到達せず無限ループし得た）。
         let last_result = loop {
             match reader.read(&mut buf) {
-                Ok(n) => {
-                    let _ = n;
-                    continue;
-                }
+                Ok(0) => panic!(
+                    "slow-loris sender must not close the connection; got EOF instead of a timeout"
+                ),
+                Ok(_) => continue,
                 Err(e) => break e.kind(),
             }
         };
@@ -1940,5 +2004,38 @@ mod tests {
         );
 
         let _ = handle.join();
+    }
+
+    // レビュー指摘（Cursor。PR #442 再々々々々々々レビュー・
+    // competitor_lightpanda.rs:1893。macOS CI 失敗）: unix のブロッキング
+    // ソケットはタイムアウト時に `WouldBlock` を返すことがある（macOS）が、
+    // `DeadlineReader` の利用側は OS 差異を意識せず `TimedOut` だけを
+    // 見ればよいようにする。`normalize_timeout_error` がその正規化を
+    // 一貫して行うことを確認する。
+    #[test]
+    fn normalize_timeout_error_maps_would_block_to_timed_out() {
+        let err = std::io::Error::new(std::io::ErrorKind::WouldBlock, "would block");
+        assert_eq!(
+            normalize_timeout_error(err).kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn normalize_timeout_error_preserves_already_timed_out() {
+        let err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        assert_eq!(
+            normalize_timeout_error(err).kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn normalize_timeout_error_preserves_unrelated_errors() {
+        let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        assert_eq!(
+            normalize_timeout_error(err).kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
     }
 }
