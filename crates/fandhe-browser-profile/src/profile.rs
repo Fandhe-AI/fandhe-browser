@@ -35,6 +35,18 @@
 //!
 //! 上記が未実装のため、`Profile::open` は同一プロファイルへの二重 open を
 //! 拒否しない（#178 で解消するまでの既知の制約）。
+//!
+//! `Profile::root`・`Profile::data_dir` が返す `Path` は表示・ログ用に限る
+//! （PR #437 P1 レビュー指摘: `open` で検証した実体とは無関係にパス文字列を
+//! 再解決してしまうと、`open` から `data_dir` 呼び出しまでの間にルートや
+//! サブディレクトリが symlink へ差し替えられた場合、検証済みの実体とは
+//! 別の場所を指してしまう。相対パスを渡した場合は作業ディレクトリの変更
+//! でも参照先が変わり得る）。境界判定やファイル操作は unix 限定の
+//! `Profile::root_fd`・`Profile::data_dir_fd` が返す検証済みハンドルを
+//! 起点に `openat` 系 API で行う契約とする。後続タスク（Cookie・Storage 等
+//! の実データ操作）はこの契約に従う。Windows はハンドル基準 API を持たず
+//! （ACL 隔離が未実装で `open` 自体が `Unsupported` になるため）、この契約は
+//! unix 限定である。
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -42,14 +54,17 @@ use std::path::{Path, PathBuf};
 // unix ではディレクトリハンドル（fd）基準の openat/mkdirat/fchmod を使い、
 // パス文字列の再解決に伴う TOCTOU（symlink 差し替え競合。PR #437 レビュー
 // 指摘）を解消する（ユーザー承認済み・2026-09-26。dependency-policy.md）。
-// `Component` は `open_dir_all_verified` の走査でのみ使うため、Windows
-// ビルドで unused import（`-D warnings`）にならないよう unix 限定にする。
-#[cfg(unix)]
-use rustix::fd::OwnedFd;
+// `Component` は unix 限定の走査でのみ使うため、Windows ビルドで
+// unused import（`-D warnings`）にならないよう unix 限定にする。
+// `AsFd`/`BorrowedFd`/`OwnedFd` は std のものをそのまま使う（rustix は
+// "std" feature 有効時にこれらを再エクスポートするのみで型は同一のため、
+// 公開 API のシグネチャを std 型で表現できる）。
 #[cfg(unix)]
 use rustix::fs::{CWD, Mode, OFlags};
 #[cfg(unix)]
 use rustix::io::Errno;
+#[cfg(unix)]
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 #[cfg(unix)]
 use std::path::Component;
 
@@ -175,16 +190,39 @@ impl DataKind {
     }
 }
 
+/// unix 限定: [`Profile::open`] が検証したルート直下の 4 サブディレクトリの
+/// ハンドル（fd）。フィールドをデータ種別ごとに明示することで、
+/// [`DataKind`] にバリアントが追加された際にコンパイラがフィールド追加・
+/// `Profile::data_dir_fd` の match 追加を強制する（`Vec` 等で動的に持つより
+/// REPAIR の「非破壊だが取りこぼしを機械的に検出できる」性質を保てる）。
+#[cfg(unix)]
+#[derive(Debug)]
+struct DataDirFds {
+    cookies: OwnedFd,
+    storage: OwnedFd,
+    cache: OwnedFd,
+    history: OwnedFd,
+}
+
 /// プロファイル（ユーザーデータディレクトリ）を表す型。
 ///
-/// フィールドは非公開の `root: PathBuf` のみ持つ。#178 が `profile.lock` の
-/// `File` ハンドルをここへ追加してもフィールド構成の変更が呼び出し元に
-/// 見えないよう、`Clone`/`Copy` は derive しない（`Debug` のみ導出する）。
-/// プロセス内にグローバル状態を持たず、値として受け渡しする設計
-/// （TASK-50・PoC-7 の設計を踏襲）。
+/// `root: PathBuf` は表示・ログ用（[`Profile::root`]・[`Profile::data_dir`]
+/// 参照）。unix ではこれに加えて `open` 時に検証済みのディレクトリハンドル
+/// （`root_fd`・`data_fds`）を保持し、`Drop` まで生存させる。ハンドルを
+/// 保持せずパスだけを保存すると、`open` から後続のファイル操作までの間に
+/// ルートやサブディレクトリが symlink へ差し替えられた場合、パスの再解決が
+/// 検証済みの実体とは別の場所を指してしまう（PR #437 P1 レビュー指摘）。
+/// `Clone`/`Copy` は derive しない（`Debug` のみ導出する。fd の二重所有を
+/// 防ぐため）。プロセス内にグローバル状態を持たず、値として受け渡しする
+/// 設計（TASK-50・PoC-7 の設計を踏襲）。`OwnedFd` は `Send`/`Sync` のため、
+/// 本構造体も自動導出で `Send`/`Sync` になる。
 #[derive(Debug)]
 pub struct Profile {
     root: PathBuf,
+    #[cfg(unix)]
+    root_fd: OwnedFd,
+    #[cfg(unix)]
+    data_fds: DataDirFds,
 }
 
 impl Profile {
@@ -238,8 +276,18 @@ impl Profile {
             // （PR #437 Bugbot 指摘）。
             let root: PathBuf = root.as_ref().components().collect();
 
-            // ファイルシステムのルート（または CWD）から `root` まで、
-            // 1 要素ずつディレクトリハンドル（fd）を辿りながら作成する。
+            // 相対パスを渡された場合、ここで一度だけ `std::env::current_dir`
+            // 基準の絶対パスへ変換して `Profile` に保存する。変換しないまま
+            // 保存すると、`open` 呼び出し後にプロセスの作業ディレクトリが
+            // 変わった際、`root()`/`data_dir()` が返すパスの意味も変わって
+            // しまう（PR #437 P1 レビュー指摘）。`std::path::absolute` は
+            // シンボリックリンクを解決せず、絶対パスはそのまま返す
+            // （相対パスのみ `current_dir()` を前置する）ため、直後に行う
+            // ハンドル基準の走査（`open_dir_all_verified`）の結果と矛盾しない。
+            let root = std::path::absolute(&root)?;
+
+            // ファイルシステムのルート（絶対パスなので必ず "/"）から `root`
+            // まで、1 要素ずつディレクトリハンドル（fd）を辿りながら作成する。
             // `create_dir_all` のようにパス全体を一括でカーネルへ渡さず、
             // 前段で得たハンドルを次段の `openat`/`mkdirat` の起点として
             // 使うため、判定と作成・chmod の間でパス文字列を再解決する
@@ -247,28 +295,135 @@ impl Profile {
             let root_fd = open_dir_all_verified(&root)?;
             set_dir_permissions_0700(&root_fd)?;
 
-            for kind in DataKind::ALL.iter().copied() {
+            // 4 データ種別のハンドルを開く。`DataDirFds` の各フィールドに
+            // 対応させるため、`DataKind::ALL` をループする代わりに 1 種別
+            // ずつ明示する（[`DataDirFds`] のフィールド追加をコンパイラに
+            // 強制させるため）。
+            let open_data_dir = |kind: DataKind| -> Result<OwnedFd, ProfileError> {
                 let path = root.join(kind.dir_name());
                 let dir_fd = open_or_create_child_dir(&root_fd, kind.dir_name().as_ref(), &path)?;
                 set_dir_permissions_0700(&dir_fd)?;
-            }
+                Ok(dir_fd)
+            };
+            let data_fds = DataDirFds {
+                cookies: open_data_dir(DataKind::Cookies)?,
+                storage: open_data_dir(DataKind::Storage)?,
+                cache: open_data_dir(DataKind::Cache)?,
+                history: open_data_dir(DataKind::History)?,
+            };
 
-            Ok(Profile { root })
+            Ok(Profile {
+                root,
+                root_fd,
+                data_fds,
+            })
         }
     }
 
-    /// プロファイルルートのパスを返す。
+    /// プロファイルルートのパスを返す（表示・ログ用）。
+    ///
+    /// このパスを再度 `open`/`symlink_metadata` 等で解決すると、`open` 時に
+    /// 検証した実体と異なるものを指す可能性がある（PR #437 P1 レビュー指摘。
+    /// モジュール doc 参照）。境界判定やファイル操作には unix 限定の
+    /// [`Profile::root_fd`] を使う。
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// 指定したデータ種別のディレクトリパス（`root/<dir_name>`）を返す。
+    /// 指定したデータ種別のディレクトリパス（`root/<dir_name>`）を返す
+    /// （表示・ログ用）。
     ///
-    /// パスの生成のみを行い、存在確認はしない（存在は `open` 内で
-    /// 保証済みの前提。ルート配下検証は #177 が個別のパス生成箇所へ
-    /// 差し込む）。
+    /// パスの生成のみを行い、存在確認はしない。このパスを再度解決する
+    /// ファイル操作は行わないこと（[`Profile::root`] と同じ理由。PR #437 P1
+    /// レビュー指摘）。境界判定やファイル操作には unix 限定の
+    /// [`Profile::data_dir_fd`] を使う。
     pub fn data_dir(&self, kind: DataKind) -> PathBuf {
         self.root.join(kind.dir_name())
+    }
+
+    /// unix 限定: `open` が検証済みのプロファイルルートのディレクトリ
+    /// ハンドルを返す。
+    ///
+    /// 後続タスク（Cookie・Storage 等の実データ操作）は、このハンドルを
+    /// `openat`/`mkdirat`/`unlinkat` 系 API の `dirfd` として使うことで、
+    /// [`Profile::root`] が返すパスを再解決せずに境界内へアクセスできる
+    /// （PR #437 P1 レビュー指摘）。
+    #[cfg(unix)]
+    pub fn root_fd(&self) -> BorrowedFd<'_> {
+        self.root_fd.as_fd()
+    }
+
+    /// unix 限定: `open` が検証済みの、指定データ種別ディレクトリのハンドルを
+    /// 返す。
+    ///
+    /// [`Profile::root_fd`] と同様、後続タスクのファイル操作はこのハンドルを
+    /// `openat` 系 API の `dirfd` として使う契約とする。
+    #[cfg(unix)]
+    pub fn data_dir_fd(&self, kind: DataKind) -> BorrowedFd<'_> {
+        match kind {
+            DataKind::Cookies => self.data_fds.cookies.as_fd(),
+            DataKind::Storage => self.data_fds.storage.as_fd(),
+            DataKind::Cache => self.data_fds.cache.as_fd(),
+            DataKind::History => self.data_fds.history.as_fd(),
+        }
+    }
+
+    /// unix 限定: 指定データ種別ディレクトリ直下に `name` という名前の
+    /// ファイルを作成（既存なら開く）する最小のヘルパー。
+    ///
+    /// [`Profile::data_dir_fd`] が返すハンドルを起点に `openat` するため、
+    /// `open` から本呼び出しまでの間にディレクトリが symlink へ差し替え
+    /// られていてもリンク先へは作成しない（PR #437 P1 レビュー指摘）。
+    /// `OFlags::NOFOLLOW` により、`name` の位置に symlink が存在する場合も
+    /// リンク先を辿らず [`ProfileError::InvalidLayout`] で拒否する。
+    ///
+    /// `name` はディレクトリ区切り文字を含まない単一の要素であることを
+    /// 要求する（`..`・`a/b` 等は [`ProfileError::InvalidLayout`] で拒否し、
+    /// `dir_fd` を起点にした名前解決であってもパストラバーサルを許さない。
+    /// security.md「プロファイル境界」）。
+    ///
+    /// 既存ファイルは truncate せず、パーミッションも変更しない（本関数は
+    /// 骨格であり、実データの書式・ロック方針は後続タスクが決める。
+    /// REPAIR-3）。
+    ///
+    /// 戻り値の `File` は独立したハンドルであり、`Profile`（延いては
+    /// `root_fd`/`data_dir_fd`）を drop した後も有効なまま使い続けられる
+    /// （逆に、`Profile` を drop すると `root_fd`/`data_fds` のディレクトリ
+    /// ハンドルは閉じるが、既に返した `File` には影響しない）。
+    #[cfg(unix)]
+    pub fn create_file_in(
+        &self,
+        kind: DataKind,
+        name: &std::ffi::OsStr,
+    ) -> Result<std::fs::File, ProfileError> {
+        // `name` が単一の通常コンポーネントであることを検証する。区切り
+        // 文字・`.`・`..`・空文字はすべて `Component::Normal` 以外になるか、
+        // 複数コンポーネントに分解されるため拒否できる。
+        let mut components = Path::new(name).components();
+        let is_single_normal_component = matches!(components.next(), Some(Component::Normal(n)) if n == name)
+            && components.next().is_none();
+        if !is_single_normal_component {
+            return Err(ProfileError::InvalidLayout {
+                path: self.data_dir(kind).join(name),
+                reason: "file name must be a single path component without separators or '..'",
+            });
+        }
+
+        let dir_fd = self.data_dir_fd(kind);
+        let flags = OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mode = Mode::RUSR | Mode::WUSR;
+        let owned = rustix::fs::openat(dir_fd, name, flags, mode).map_err(|err| match err {
+            Errno::LOOP => ProfileError::InvalidLayout {
+                path: self.data_dir(kind).join(name),
+                reason: "file name is a symlink, refusing to follow",
+            },
+            Errno::NOTDIR => ProfileError::InvalidLayout {
+                path: self.data_dir(kind).join(name),
+                reason: "path exists but is not a regular file",
+            },
+            other => ProfileError::Io(other.into()),
+        })?;
+        Ok(std::fs::File::from(owned))
     }
 }
 
@@ -797,6 +952,156 @@ mod tests {
             !external.path().join("profile-root").exists(),
             "境界外にディレクトリが作成されてはならない"
         );
+    }
+
+    /// PROF-1（Unix 固有）: `Profile` は `Send`・`Sync`（`OwnedFd` フィールドが
+    /// 両方を満たすことの回帰テスト。core の `core_1_error_is_send_sync_static`
+    /// と同型。PR #437 P1 レビュー指摘: ハンドルを追加してもこの性質を壊さない
+    /// ことを機械的に確認する）。
+    #[test]
+    fn prof_1_profile_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Profile>();
+    }
+
+    /// PROF-1（Unix 固有）: `open` 後にルートを別の実体（symlink）へ差し替えても、
+    /// `create_file_in` はハンドル基準で判定した実ディレクトリ側へファイルを
+    /// 作成する。`data_dir` が返すパス（パス再解決の起点）を辿ると symlink 先へ
+    /// 書き込んでしまうところ、`root_fd`/`data_dir_fd` を起点にした
+    /// `create_file_in` はそれを回避することを確認する（PR #437 P1 レビュー
+    /// 指摘の本丸）。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_create_file_in_uses_handle_not_re_resolved_path_after_root_is_replaced() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new();
+        let profile_path = tmp.path().join("profile");
+        let profile = Profile::open(&profile_path).expect("open は成功する");
+
+        // `open` が返したハンドルは維持したまま、ルートパスを real_root へ
+        // 退避し、元の位置には外部ディレクトリへの symlink を置く。
+        let real_root = tmp.path().join("real-root");
+        std::fs::rename(&profile_path, &real_root).expect("ルートの退避");
+        let external = TempDir::new();
+        std::fs::create_dir_all(external.path()).expect("外部ディレクトリの作成");
+        symlink(external.path(), &profile_path).expect("symlink 作成");
+
+        let file = profile
+            .create_file_in(DataKind::Cookies, std::ffi::OsStr::new("session"))
+            .expect("ハンドル基準で作成できる");
+        drop(file);
+
+        // ハンドル基準のため、ファイルは退避前の実ディレクトリ（real_root）側に
+        // 作られる。パスを再解決した場合に書き込まれるはずの symlink 先
+        // （external）には何も作られない。
+        assert!(
+            real_root
+                .join(DataKind::Cookies.dir_name())
+                .join("session")
+                .is_file(),
+            "検証済みの実ディレクトリ側にファイルが作られていない"
+        );
+        assert!(
+            !external
+                .path()
+                .join(DataKind::Cookies.dir_name())
+                .join("session")
+                .exists(),
+            "symlink 差し替え後の再解決先にファイルが作られてはならない"
+        );
+        // `data_dir` はパス再解決用であり、差し替え後は symlink 先を指す
+        // （表示用 API であることの裏付け。ファイル操作には使わない契約）。
+        assert!(
+            !profile
+                .data_dir(DataKind::Cookies)
+                .join("session")
+                .is_file(),
+            "data_dir が返すパスを再解決した場所にはファイルが存在しないはず"
+        );
+    }
+
+    /// PROF-1（Unix 固有）: `root/cookies` 配下のファイル名位置に dangling
+    /// symlink があると、`create_file_in` は `InvalidLayout` で拒否し、
+    /// リンク先には何も作られない（`OFlags::NOFOLLOW` の直接確認）。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_create_file_in_fails_on_dangling_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new();
+        let profile = Profile::open(tmp.path()).expect("open は成功する");
+
+        let external = TempDir::new();
+        let dangling_target = external.path().join("never-created");
+        let file_path = tmp
+            .path()
+            .join(DataKind::Cookies.dir_name())
+            .join("session");
+        symlink(&dangling_target, &file_path).expect("symlink 作成");
+
+        let err = profile
+            .create_file_in(DataKind::Cookies, std::ffi::OsStr::new("session"))
+            .expect_err("symlink なら失敗する");
+        assert!(matches!(err, ProfileError::InvalidLayout { .. }));
+        assert!(
+            !dangling_target.exists(),
+            "symlink のリンク先にファイルが作成されてはならない"
+        );
+    }
+
+    /// PROF-1（Unix 固有）: `create_file_in` はディレクトリ区切り文字や `..`
+    /// を含む名前を単一コンポーネントとして拒否し、パストラバーサルを許さない
+    /// （security.md「プロファイル境界」。`dir_fd` を起点にした `openat` でも
+    /// `name` 自体に `/`・`..` が含まれれば境界外へ解決されてしまうため）。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_create_file_in_rejects_multi_component_names() {
+        let tmp = TempDir::new();
+        let profile = Profile::open(tmp.path()).expect("open は成功する");
+
+        for name in ["../escape", "a/b", ".."] {
+            let err = profile
+                .create_file_in(DataKind::Cookies, std::ffi::OsStr::new(name))
+                .expect_err("複数コンポーネント・'..' は拒否される");
+            assert!(
+                matches!(err, ProfileError::InvalidLayout { .. }),
+                "{name:?} が拒否されなかった"
+            );
+        }
+
+        // 境界外（プロファイルルートの親）に何も作られていないこと。
+        assert!(!tmp.path().join("escape").exists());
+    }
+
+    /// PROF-1（Unix 固有）: 相対パスで `open` しても、`root()` は絶対パスを
+    /// 返す（作業ディレクトリが後から変わっても `root`/`data_dir` の意味が
+    /// 変わらないようにするため。PR #437 P1 レビュー指摘）。
+    ///
+    /// `std::env::set_current_dir` はプロセス全体に効き、他の（並行実行される）
+    /// テストと干渉して flaky になり得るため使わない。代わりに現在の作業
+    /// ディレクトリ（cargo が crate ルートに設定する、書き込み可能な既知の
+    /// ディレクトリ）配下に一意名の相対パスを渡し、`std::path::absolute` が
+    /// それを `current_dir()` 基準で絶対化した結果と一致することを確認する。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_open_with_relative_path_stores_absolute_root() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = format!("fandhe-profile-relative-test-{}-{n}", std::process::id());
+        struct RemoveOnDrop(PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let cwd = std::env::current_dir().expect("current_dir の取得");
+        let expected_root = cwd.join(&name);
+        let _cleanup = RemoveOnDrop(expected_root.clone());
+
+        let profile = Profile::open(&name).expect("相対パスでも open できる");
+
+        assert!(profile.root().is_absolute(), "root が絶対パスでない");
+        assert_eq!(profile.root(), expected_root.as_path());
     }
 
     /// PROF-1（Windows 固有）: ACL 隔離が未実装のため、`open` は常に
