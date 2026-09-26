@@ -5,7 +5,7 @@
 //! HTTP/1.1 応答を返すテストサーバーだけを使う（CI の決定性のため）。
 //! #36（TASK-24.2）で用意した最低限（タイムアウト・リダイレクト上限・
 //! 本文上限・scheme 拒否・内部アドレス拒否・正常系）に加え、本ファイルは
-//! #37（TASK-24.3）でタイムアウト（本文受信中）・リダイレクト（相対
+//! #37（TASK-24.3・MS-1）でタイムアウト（本文受信中）・リダイレクト（相対
 //! `Location`・userinfo 除去・`Location` 欠如の 3xx）・異常系（接続断・
 //! 不正な応答・truncated body・接続拒否・秘密情報除去）・本文上限の境界
 //! （ちょうど・+1・chunked）・送信前拒否（scheme・内部 IP リテラルの
@@ -502,7 +502,7 @@ async fn core_1_fetch_rejects_ipv4_literal_loopback_by_default() {
     );
 }
 
-/// CORE-1（#37。TASK-24.3）: 全体タイムアウトは、応答ヘッダ受信後・本文
+/// CORE-1（#37。TASK-24.3・MS-1）: 全体タイムアウトは、応答ヘッダ受信後・本文
 /// ストリーミング中の沈黙でも打ち切る（`core_1_fetch_errors_on_timeout`
 /// はヘッダ受信前の沈黙のみを確認していたため、`chunk()` のエラー経路
 /// （`map_reqwest_error` の `is_timeout()` 分岐）をここで補強する）。
@@ -535,7 +535,7 @@ async fn core_1_fetch_errors_on_timeout_during_body_streaming() {
     );
 }
 
-/// CORE-1（#37。TASK-24.3）: `max_redirects` を超えるリダイレクトは
+/// CORE-1（#37。TASK-24.3・MS-1）: `max_redirects` を超えるリダイレクトは
 /// `Error::TooManyRedirects` になり、サーバーへの到達回数は
 /// `max_redirects + 1`（初回 + 追跡した `max_redirects` 回）で打ち切られる
 /// （`attempt.previous().len() > max_redirects` の判定を「追跡した回数」で
@@ -596,7 +596,7 @@ async fn core_1_fetch_too_many_redirects_request_count() {
     );
 }
 
-/// CORE-1（#37。TASK-24.3）: 相対パスの `Location`（`/next`）を基準 URL に
+/// CORE-1（#37。TASK-24.3・MS-1）: 相対パスの `Location`（`/next`）を基準 URL に
 /// 対して解決してから追跡し、`final_url()` が絶対 URL の追跡先と一致する。
 #[tokio::test]
 async fn core_1_fetch_follows_relative_location_and_reports_final_url() {
@@ -644,16 +644,45 @@ async fn core_1_fetch_follows_relative_location_and_reports_final_url() {
     assert_eq!(ok.final_url(), format!("http://127.0.0.1:{port}/next"));
 }
 
-/// CORE-1（#37。TASK-24.3）: リダイレクト元 URL に含まれる userinfo
-/// （`user:pass@host`）は `final_url()` から常に取り除かれる
-/// （security.md 秘密情報混入防止）。
+/// CORE-1（#37。TASK-24.3・MS-1）: リダイレクト元 URL に含まれる userinfo
+/// （`user:pass@host`）は、リダイレクト追跡後の `final_url()` からも常に
+/// 取り除かれる（security.md 秘密情報混入防止）。相対 `Location` への
+/// リダイレクトは authority（userinfo を含む）を引き継いで解決される
+/// ため、初回リクエストへ 200 を返すだけでは追跡後の挙動を検証できない。
+/// 302 + 相対 `Location` で追跡先へ導き、そこで 200 を返す構成にする。
 #[tokio::test]
 async fn core_1_fetch_strips_userinfo_from_final_url() {
-    let port = spawn_loopback_server(|mut stream| {
-        drain_request_head(&mut stream);
-        let head = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n";
-        let _ = stream.write_all(head.as_bytes());
-        let _ = stream.write_all(b"ok");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let port = listener.local_addr().expect("local_addr").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let mut stream = stream;
+                let mut buf = [0u8; 1024];
+                let mut data = Vec::new();
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            data.extend_from_slice(&buf[..n]);
+                            if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let request_line = String::from_utf8_lossy(&data);
+                if request_line.starts_with("GET /next ") {
+                    let head = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(b"ok");
+                } else {
+                    let body = "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(body.as_bytes());
+                }
+            });
+        }
     });
 
     let fetcher = Fetcher::new(loopback_allowed_options()).expect("Fetcher::new が失敗しないこと");
@@ -662,12 +691,14 @@ async fn core_1_fetch_strips_userinfo_from_final_url() {
         .get(&format!("http://user:dummy-secret@127.0.0.1:{port}/"))
         .await
         .expect("userinfo 付き URL の取得は成功するはず");
-    assert_eq!(ok.final_url(), format!("http://127.0.0.1:{port}/"));
+    assert_eq!(ok.status(), 200);
+    assert_eq!(ok.body(), b"ok");
+    assert_eq!(ok.final_url(), format!("http://127.0.0.1:{port}/next"));
     assert!(!ok.final_url().contains("dummy-secret"));
     assert!(!ok.final_url().contains('@'));
 }
 
-/// CORE-1（#37。TASK-24.3）: `Location` ヘッダを伴わない 3xx 応答は
+/// CORE-1（#37。TASK-24.3・MS-1）: `Location` ヘッダを伴わない 3xx 応答は
 /// リダイレクトとして扱われず、そのまま `Ok` として返る
 /// （`status()` がそのステータスコードになる）。
 #[tokio::test]
@@ -687,7 +718,7 @@ async fn core_1_fetch_returns_3xx_without_location_as_ok() {
     assert_eq!(ok.status(), 302);
 }
 
-/// CORE-1（#37。TASK-24.3）: リクエストヘッダを読み切った後に応答を送らず
+/// CORE-1（#37。TASK-24.3・MS-1）: リクエストヘッダを読み切った後に応答を送らず
 /// 接続を閉じたサーバーへの取得は `Error::Network` になる。
 #[tokio::test]
 async fn core_1_fetch_network_error_when_server_closes_without_response() {
@@ -708,7 +739,7 @@ async fn core_1_fetch_network_error_when_server_closes_without_response() {
     );
 }
 
-/// CORE-1（#37。TASK-24.3）: HTTP として解釈できない応答（ステータス行が
+/// CORE-1（#37。TASK-24.3・MS-1）: HTTP として解釈できない応答（ステータス行が
 /// 存在しない）を返すサーバーへの取得は `Error::Network` になる。
 #[tokio::test]
 async fn core_1_fetch_network_error_on_malformed_response() {
@@ -729,7 +760,7 @@ async fn core_1_fetch_network_error_on_malformed_response() {
     );
 }
 
-/// CORE-1（#37。TASK-24.3）: `Content-Length` で宣言した本文サイズより
+/// CORE-1（#37。TASK-24.3・MS-1）: `Content-Length` で宣言した本文サイズより
 /// 少ないバイト数だけ送って接続を閉じた場合（truncated body）は
 /// `Error::Network` になる。
 #[tokio::test]
@@ -754,7 +785,7 @@ async fn core_1_fetch_network_error_on_truncated_body() {
     );
 }
 
-/// CORE-1（#37。TASK-24.3）: 接続を受け付けるプロセスが存在しないポートへの
+/// CORE-1（#37。TASK-24.3・MS-1）: 接続を受け付けるプロセスが存在しないポートへの
 /// 取得は `Error::Network`（接続拒否）になる。Windows の SYN 再送で
 /// 数秒かかり得るため、タイムアウトは既定（30 秒）を維持する。
 #[tokio::test]
@@ -775,7 +806,7 @@ async fn core_1_fetch_network_error_on_connection_refused() {
     );
 }
 
-/// CORE-1（#37。TASK-24.3・security.md 秘密情報混入防止）:
+/// CORE-1（#37。TASK-24.3・MS-1・security.md 秘密情報混入防止）:
 /// `Error::Network` の `message` は、取得元 URL に含まれる userinfo・
 /// クエリパラメータの秘密情報を含まない（`reqwest::Error::without_url()`
 /// の契約確認）。メッセージ全文の一致は reqwest 更新で壊れやすいため
@@ -809,7 +840,7 @@ async fn core_1_fetch_network_error_does_not_leak_secrets_in_message() {
     }
 }
 
-/// CORE-1（#37。TASK-24.3）: `Content-Length` がちょうど `max_body_bytes` と
+/// CORE-1（#37。TASK-24.3・MS-1）: `Content-Length` がちょうど `max_body_bytes` と
 /// 等しい応答は `Ok` になり、`body()` の長さも一致する（事前検査の境界値）。
 #[tokio::test]
 async fn core_1_fetch_ok_when_content_length_equals_max_body_bytes() {
@@ -832,7 +863,7 @@ async fn core_1_fetch_ok_when_content_length_equals_max_body_bytes() {
     assert_eq!(ok.body().len(), LIMIT);
 }
 
-/// CORE-1（#37。TASK-24.3）: `Content-Length` ヘッダを持たない
+/// CORE-1（#37。TASK-24.3・MS-1）: `Content-Length` ヘッダを持たない
 /// close-delimited body で、ちょうど `max_body_bytes` バイトなら `Ok`、
 /// 1 バイト超えると `Error::ResponseTooLarge` になる（ストリーミング検査の
 /// 境界値。事前検査ではなく逐次検査側の境界を確認する）。
@@ -882,7 +913,7 @@ async fn core_1_fetch_rejects_streamed_body_one_byte_over_max_body_bytes() {
     );
 }
 
-/// CORE-1（#37。TASK-24.3）: `Transfer-Encoding: chunked` で送られた本文が
+/// CORE-1（#37。TASK-24.3・MS-1）: `Transfer-Encoding: chunked` で送られた本文が
 /// `max_body_bytes` を超える場合も `Error::ResponseTooLarge` になる
 /// （`Content-Length` を持たないもう一つの実応答形状のストリーミング検査）。
 /// 上限内では連結後の本文が具体値で一致することも併せて確認する。
@@ -912,7 +943,7 @@ async fn core_1_fetch_rejects_oversized_chunked_body() {
     );
 }
 
-/// CORE-1（#37。TASK-24.3）: 上限内の chunked 本文は連結後の本文が具体値で
+/// CORE-1（#37。TASK-24.3・MS-1）: 上限内の chunked 本文は連結後の本文が具体値で
 /// 一致する（chunked デコード自体の回帰検出）。
 #[tokio::test]
 async fn core_1_fetch_ok_reassembles_chunked_body() {
@@ -935,7 +966,7 @@ async fn core_1_fetch_ok_reassembles_chunked_body() {
     assert_eq!(ok.body(), b"hello world");
 }
 
-/// CORE-1（#37。TASK-24.3）: `http`/`https` 以外の scheme はネットワークに
+/// CORE-1（#37。TASK-24.3・MS-1）: `http`/`https` 以外の scheme はネットワークに
 /// 触れずに送信前で拒否される（テーブル駆動。`core_1_fetch_rejects_non_http_scheme`
 /// の `file:` 単体を拡張し、拒否対象 scheme を網羅する）。
 #[tokio::test]
@@ -961,7 +992,7 @@ async fn core_1_fetch_rejects_disallowed_schemes_before_send() {
     }
 }
 
-/// CORE-1（#37。TASK-24.3・security.md 「SSRF」）: 内部アドレスの IP
+/// CORE-1（#37。TASK-24.3・MS-1・security.md 「SSRF」）: 内部アドレスの IP
 /// リテラル host（IPv6 ループバック・リンクローカルのメタデータサービス
 /// アドレス・プライベートアドレス・WHATWG の 10 進/16 進正規化表記）は、
 /// いずれも正規化後の表示形（`is_disallowed_address` が判定に使う

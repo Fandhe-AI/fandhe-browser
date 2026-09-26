@@ -1186,7 +1186,7 @@ mod tests {
         }
     }
 
-    /// CORE-1（#37。TASK-24.3）: `FetchOptions::default()`（`FetchOptions::new()`
+    /// CORE-1（#37。TASK-24.3・MS-1）: `FetchOptions::default()`（`FetchOptions::new()`
     /// と同義）が具体値の既定値を返す（REPAIR-4「戻り値は具体値で書く」の
     /// 単体確認。既存の結合テストはこれらの既定値を前提にするだけで、値
     /// そのものは検証していなかった）。
@@ -1210,7 +1210,7 @@ mod tests {
         );
     }
 
-    /// CORE-1（#37。TASK-24.3）: 各 `with_*` ビルダーが対応フィールドを
+    /// CORE-1（#37。TASK-24.3・MS-1）: 各 `with_*` ビルダーが対応フィールドを
     /// 指定した具体値に設定する（他のフィールドは既定値のまま変わらない）。
     #[test]
     fn core_1_fetch_options_builders_set_fields() {
@@ -1228,7 +1228,7 @@ mod tests {
         assert!(options.allow_private_network_access);
     }
 
-    /// CORE-1（#37。TASK-24.3）: `FetchOptions::validate` はゼロ値の
+    /// CORE-1（#37。TASK-24.3・MS-1）: `FetchOptions::validate` はゼロ値の
     /// `timeout`・`connect_timeout`・`max_body_bytes` それぞれについて
     /// `Error::InvalidInput` を返し、`message` にフィールド名を含む
     /// （既存の結合テスト `core_1_fetcher_new_rejects_zero_*` はバリアントの
@@ -1257,7 +1257,7 @@ mod tests {
         }
     }
 
-    /// CORE-1（#37。TASK-24.3）: `reject_disallowed_scheme` は `http`/`https`
+    /// CORE-1（#37。TASK-24.3・MS-1）: `reject_disallowed_scheme` は `http`/`https`
     /// を許可し、それ以外（`file`・`data`・`javascript`・`ftp`・`ws`・`about`）
     /// を `Error::DisallowedScheme { scheme }` として拒否する
     /// （テーブル駆動。security.md「SSRF」）。
@@ -1292,7 +1292,7 @@ mod tests {
         }
     }
 
-    /// CORE-1（#37。TASK-24.3）: `reject_disallowed_address` は
+    /// CORE-1（#37。TASK-24.3・MS-1）: `reject_disallowed_address` は
     /// `allow_private_network_access` の値で挙動を切り替える。
     /// - `false`（既定）: ループバック IP リテラルを `DisallowedAddress` で拒否
     /// - `true`（opt-in）: 同じループバック IP リテラルを許可
