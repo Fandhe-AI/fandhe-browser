@@ -211,9 +211,9 @@ impl Profile {
             // ディレクトリを一切作成せず即座に拒否する（fail-closed。
             // 上記モジュール doc・`ProfileError::Unsupported` 参照）。
             let _ = root;
-            return Err(ProfileError::Unsupported {
+            Err(ProfileError::Unsupported {
                 reason: "ACL-based directory isolation is not implemented on this platform yet (tracked by XOS-7..XOS-10); refusing to create a profile with inherited, unrestricted permissions",
-            });
+            })
         }
 
         #[cfg(unix)]
