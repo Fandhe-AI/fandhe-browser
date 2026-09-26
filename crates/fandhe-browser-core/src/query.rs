@@ -901,30 +901,33 @@ mod tests {
     /// 無限ループに陥らず必ず終了する（[`Document::ancestors`] の
     /// `node_count` 上限打ち切りを [`any_ancestor_matches`] が継承すること
     /// の回帰テスト。Cursor Bugbot 指摘: 手動ループでは `node_count` 上限が
-    /// なく循環 arena で無限ループし得た）。
+    /// なく循環 arena で無限ループし得た。レビュー指摘: PR #439
+    /// discussion_r4111177871 — 以前の実装は循環を実際には構築せず通常の
+    /// `parse` 結果を照合するだけだったため、この回帰を検出できなかった）。
     ///
     /// `parse_document` は循環を作らないため、通常の HTML 文書を構築した
-    /// 後で `Document` を再構築し、内部の `parent` リンクを手作業で循環に
-    /// 書き換える（本テスト専用。`dom` の公開 API のみでは循環を作れない
-    /// ため、`Debug` 出力から祖先を検証するのではなく `query_selector_all`
-    /// が有限時間で戻ることそのものを確認する）。
+    /// 後で `Document::nodes`（`pub(crate)`。同一 crate の `dom.rs` の
+    /// `core_1_corrupted_cyclic_arena_traversal_terminates` と同じ手法）を
+    /// 直接書き換え、`span` 要素の `parent` を自分自身に向けて実際に
+    /// 循環させる。`any_ancestor_matches` はこの `span` を起点に
+    /// `Document::ancestors` を辿るため、循環を実際に構築せずには
+    /// `remaining_steps` 打ち切りへの依存を回帰させられない。
     #[test]
     fn core_1_cyclic_parent_link_does_not_infinite_loop() {
-        // 循環を作るには arena 内部の `parent` フィールドへ直接書き込む
-        // 必要があるが、`dom::Node` は非公開フィールドのため本 crate 外
-        // からは操作できない。ここでは `Document::ancestors` 自身が
-        // `node_count` 歩で打ち切る契約を持つこと（dom.rs のテスト）に加え、
-        // `any_ancestor_matches` がその契約をそのまま使う実装になっている
-        // こと（本ファイルの実装。手動ループを再実装していない）を担保する
-        // 回帰として、深いネスト＋子孫結合子の連鎖が有限時間で終わることを
-        // 確認する（`core_1_descendant_backtracking_does_not_explode_with_deep_nesting`
-        // と合わせて、`any_ancestor_matches` が `Document::ancestors` の
-        // `remaining_steps` 打ち切りに依存している経路を回帰させる）。
-        let doc = parse("<div><p><span>x</span></p></div>");
+        let mut doc = parse("<div><p><span>x</span></p></div>");
         let root = doc.root();
+        let span = find_by_local_name(&doc, root, "span");
+        // `span` の親を自分自身に書き換え、実際に循環した `parent` リンクを
+        // 作る（`nodes`/`Node::parent`/`NodeId::index` はいずれも
+        // `pub(crate)` で同一 crate から直接操作できる）。
+        doc.nodes[span.index()].parent = Some(span);
+
         let started = std::time::Instant::now();
+        // `span` からの祖先探索は循環に陥るため `div` へ到達できず、
+        // 一致件数は 0 になる。ここで確認したいのは件数そのものより、
+        // `node_count` 打ち切りにより有限時間で `Ok` が返ることである。
         let results = query_all(&doc, root, &selectors("div span"));
-        assert_eq!(results.len(), 1);
+        assert_eq!(results.len(), 0);
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
