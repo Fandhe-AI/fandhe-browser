@@ -136,4 +136,5 @@ spec `docs/spec/04-behavior/self-repair-design.md`「crate 間の依存方向と
 | permissions | ワークフロー・ジョブの `permissions` が最小権限で明示されているか | P0 |
 | secrets の扱い | secrets が `pull_request` イベントのログへ出力されていないか | P0 |
 | CI パイプライン本体（`ci.yml`・`release.yml`） | `ci.yml` は TASK-55.2（Issue #59）で `push`（main）/`pull_request` トリガーを有効化済み（`workflow_dispatch` は手動再実行用に併存）。`release.yml` は crates.io 公開用の意図的設計として引き続き `workflow_dispatch` 限定。`ci.yml` への変更では、3 OS matrix（Linux・macOS・Windows）を備えているか、本リポに存在しない `make` ターゲット・`scripts/` を前提にした（vector-db 由来のような）ジョブが混入していないかを確認する | P1 |
-| 依存監査パイプライン | 対象サイト群の互換性回帰チェック・`cargo-deny` を含む本格 CI パイプラインは検討中（REPAIR-8）。導入時は本節・`.claude/rules/ci.md` の更新を伴っているか | P2 |
+| 依存監査パイプライン | `cargo-deny` を含む本格 CI パイプラインは検討中（REPAIR-8）。導入時は本節・`.claude/rules/ci.md` の更新を伴っているか | P2 |
+| 対象サイト群の回帰チェック | TASK-9.2（Issue #339・REPAIR-8）で `compat-regression` ジョブ導入済み（`harness/compat-regression/check-matrix.sh`。閾値 70%・COMPAT-1/COMPAT-4）。実マトリクス `harness/compat-practical/results/matrix.json`（TASK-71.3・Issue #312 が生成予定）が未導入のため `--allow-missing` 運用中（ファイル不在時は `::warning::` を出して exit 0）。`ci.yml`・`Makefile` の変更では `--allow-missing` の削除条件（#312 完了）が守られているか確認する | P2 |
