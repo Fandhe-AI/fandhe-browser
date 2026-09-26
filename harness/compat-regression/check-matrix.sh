@@ -131,8 +131,8 @@ if ! SCHEMA_ERR=$(jq -r --arg key "$KEY" '
       "each entry requires a non-empty string id"
     elif (([.[].id] | length) != ([.[].id] | unique | length)) then
       "duplicate id detected in matrix"
-    elif ([.[] | select((.cat? | type) != "string")] | length) > 0 then
-      "each entry requires a string cat"
+    elif ([.[] | select((.cat? | type) != "string" or (.cat | length) == 0)] | length) > 0 then
+      "each entry requires a non-empty string cat"
     elif ([.[] | select((.[$key]? | type) != "boolean")] | length) > 0 then
       ("each entry requires a boolean field: " + $key)
     elif ([.[] | select(has("chromium") and ((.chromium | type) != "boolean"))] | length) > 0 then
@@ -218,9 +218,11 @@ fi
 # 検出されずに通過してしまう。TASK-9.2 レビュー指摘。--categories 側で既に
 # 判定済みの値は重複判定を避けるため除外する）。
 if [ "$ALL_CATEGORIES" -eq 1 ]; then
-  DISCOVERED=$(jq -r '[.[].cat] | unique | .[]' "$MATRIX")
+  # jq の出力は Windows ネイティブ実行時に CRLF になりうるため、cat 値の末尾に
+  # \r が残ると judge_category 内の select(.cat == $cat) がマトリクス内の値と
+  # 一致しなくなり total=0 のまま判定漏れになる（TASK-9.2 レビュー指摘）。
+  DISCOVERED=$(jq -r '[.[].cat] | unique | .[]' "$MATRIX" | tr -d '\r')
   while IFS= read -r cat; do
-    [ -n "$cat" ] || continue
     already_judged=0
     if [ -n "$CATEGORIES" ]; then
       for done_cat in "${CAT_LIST[@]}"; do

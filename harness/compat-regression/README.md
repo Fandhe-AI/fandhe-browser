@@ -26,7 +26,7 @@ Issue #68・人間担当）。そのため `.github/workflows/ci.yml`・`Makefil
 | フィールド | 型 | 必須 | 説明 |
 | ---------- | -- | ---- | ---- |
 | `id` | 非空文字列 | 必須 | サイト・ケースの識別子。配列内で重複不可 |
-| `cat` | 文字列 | 必須 | `static` / `spa` / `lazy` / `form` / `table` 等の類型（PoC-9 の分類を踏襲。値自体は任意の文字列として扱う） |
+| `cat` | 文字列 | 必須 | `static` / `spa` / `lazy` / `form` / `table` 等の類型（PoC-9 の分類を踏襲。値自体は任意の非空文字列として扱う。空文字列はスキーマ違反として拒否する） |
 | `<key>` | boolean | 必須 | 動作可否。既定のキー名は `fandhe_browser_core`（`--key` で変更可） |
 | `chromium` | boolean | 任意 | 参考値（比較用の Chromium 実測）。判定には使わない |
 

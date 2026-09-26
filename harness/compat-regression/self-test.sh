@@ -112,6 +112,12 @@ expect_exit "duplicate id" 2 --matrix "$FIXTURES/duplicate-id.json"
 expect_exit "empty array" 2 --matrix "$FIXTURES/empty.json"
 expect_exit "missing category entries" 2 --matrix "$FIXTURES/missing-category.json" --categories static,spa,form
 
+# 空文字列の cat はスキーマ違反として拒否する（COMPAT-1 レビュー指摘。空文字列を
+# 許容したまま --all-categories の走査で無条件に skip すると、cat: "" の失敗
+# ケースが類型別判定から漏れて回帰ゲートを通過してしまう）。
+expect_exit "empty cat rejected" 2 --matrix "$FIXTURES/empty-cat.json"
+expect_exit "empty cat rejected with all-categories" 2 --matrix "$FIXTURES/empty-cat.json" --all-categories
+
 expect_exit "file not found without allow-missing" 2 --matrix "$FIXTURES/does-not-exist.json"
 expect_exit "file not found with allow-missing" 0 --matrix "$FIXTURES/does-not-exist.json" --allow-missing
 expect_contains "$LAST_OUTPUT" "::warning::" "allow-missing warning annotation"
