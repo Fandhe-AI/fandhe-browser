@@ -62,17 +62,31 @@
 //! 複雑セレクタの照合は右から左へバックトラックしながら行う（右端の複合
 //! セレクタから照合し、子結合子は親を辿り、子孫結合子は祖先を順に試す）。
 //! 再帰は複合セレクタのインデックス方向のみに限り（最大
-//! [`crate::selector::MAX_COMPOUNDS_PER_COMPLEX`] 段）、祖先・子孫方向は
-//! [`Document::ancestors`]・[`Document::descendants`] のイテレータで走査する
-//! （`node_count` で打ち切られるため、壊れた arena・深いネストでもスタック
-//! オーバーフローせず必ず停止する。security.md「不安全な設計」対策）。
-//! 最悪計算量は O(候補要素数 × 深さ × 複合セレクタ数) で、候補要素数は
-//! `ParseOptions::max_nodes` に、複合セレクタ数は `selector` モジュールの
-//! 上限（[`crate::selector::MAX_SELECTORS_PER_LIST`] 等）に、それぞれ縛られる。
-//! bloom filter・top-down DP 等による高速化は本モジュールのスコープ外
+//! [`crate::selector::MAX_COMPOUNDS_PER_COMPLEX`] 段）、祖先方向は
+//! [`any_ancestor_matches`] が反復（非再帰）で走査するため、文書の深さに
+//! 対する再帰は積まない（壊れた arena・深いネストでもスタックオーバー
+//! フローせず必ず停止する。security.md「不安全な設計」対策）。
+//!
+//! 子孫結合子は複数の祖先を試すバックトラックを伴うため、単純に毎回祖先を
+//! 辿り直すと、深いネストに `a b c d ...` のように子孫結合子を連ねた
+//! セレクタを左端で不一致にした場合、祖先の組み合わせ数に対して指数的に
+//! 探索が膨れる（PR #439 レビュー指摘・discussion_r4111107367）。これを
+//! 避けるため [`MatchCache`] で `(selector_idx, ノード, up_to)` 単位の
+//! 部分問題をメモ化し、[`query_selector_all`]・[`query_selector`] は
+//! すべての候補要素にわたって 1 つの `MatchCache` を共有する（候補ごとに
+//! 使い捨てると祖先の判定結果を候補数だけ再計算してしまうため）。
+//! これにより最悪計算量は O(候補要素数 × セレクタ内の複合セレクタ数) に
+//! 収まり、文書の深さに対して指数的には増えない。候補要素数は
+//! `ParseOptions::max_nodes` に、複合セレクタ数・セレクタ数は `selector`
+//! モジュールの上限（[`crate::selector::MAX_COMPOUNDS_PER_COMPLEX`]・
+//! [`crate::selector::MAX_SELECTORS_PER_LIST`]）に、それぞれ縛られる
+//! （`MatchCache` のメモリ使用量もこれらの上限で抑えられる）。
+//! bloom filter 等によるさらなる高速化は本モジュールのスコープ外
 //! （REPAIR-3: 将来課題として明記する）。
 //!
 //! 対応 ID: `CORE-1`・TASK-24（24.10）・MS-1。
+
+use std::collections::HashMap;
 
 use crate::dom::{Document, NodeId, QuirksMode};
 use crate::error::Result;
@@ -159,17 +173,55 @@ fn match_attribute(
     }
 }
 
-/// `element` が `complex` に一致するかを、右端の複合セレクタから左へ
-/// バックトラックしながら判定する。
+/// 子孫結合子（[`Combinator::Descendant`]）の祖先バックトラックを
+/// メモ化するためのキャッシュ（DoS 対策。[`list_matches`] のドキュメント
+/// 参照）。1 回の `query_selector_all` / `query_selector` / `element_matches`
+/// 呼び出しの間だけ生存し、呼び出しをまたいで再利用しない（`Document` の
+/// 変更を考慮しなくてよいようにするため）。
+///
+/// - `chain`: `(selector_idx, node のインデックス, up_to)` →
+///   「`node` 自身が `up_to` から左側の連鎖に一致するか」の判定結果
+///   （[`matches_compound_chain`]）。
+/// - `ancestor`: `(selector_idx, node のインデックス, up_to)` →
+///   「`node` の祖先（要素のみ）のいずれかが `up_to` から左側の連鎖に
+///   一致するか」の判定結果（[`any_ancestor_matches`]）。
+///
+/// `selector_idx` は `SelectorList::selectors()` 内での位置で、複合セレクタ
+/// の構造（`rest` の中身）はセレクタごとに異なるため、添字だけでは
+/// 異なるセレクタ間でキーが衝突しうる（`up_to` はあくまで添字であって
+/// 複合セレクタの内容そのものではない）。`selector_idx` をキーに含めて
+/// セレクタ単位で名前空間を分けることでこれを避ける。
+struct MatchCache {
+    chain: HashMap<(usize, usize, Option<usize>), bool>,
+    ancestor: HashMap<(usize, usize, Option<usize>), bool>,
+}
+
+impl MatchCache {
+    fn new() -> Self {
+        Self {
+            chain: HashMap::new(),
+            ancestor: HashMap::new(),
+        }
+    }
+}
+
+/// `element` が `complex`（`selectors` 内で `selector_idx` 番目）に一致
+/// するかを、右端の複合セレクタから左へバックトラックしながら判定する。
 ///
 /// 呼び出し前提: `element` は [`Document::is_element`] を満たすノードである
 /// こと。
-fn complex_matches(document: &Document, element: NodeId, complex: &ComplexSelector) -> bool {
+fn complex_matches(
+    document: &Document,
+    element: NodeId,
+    complex: &ComplexSelector,
+    selector_idx: usize,
+    cache: &mut MatchCache,
+) -> bool {
     // `rest` の最後の添字を「次に照合する複合セレクタ」として
     // `matches_compound_chain` に渡す。`rest` が空（`checked_sub` が `None`）
     // なら `first` 自身が右端になる。
     let up_to = complex.rest().len().checked_sub(1);
-    matches_compound_chain(document, element, complex, up_to)
+    matches_compound_chain(document, element, complex, up_to, selector_idx, cache)
 }
 
 /// `node` が、`up_to`（`rest` の添字。`None` なら `first`）が指す複合セレクタ
@@ -183,14 +235,42 @@ fn complex_matches(document: &Document, element: NodeId, complex: &ComplexSelect
 ///
 /// 再帰は `up_to` を単調に減らすだけなので、深さは高々
 /// `complex.rest().len()`（≤ [`crate::selector::MAX_COMPOUNDS_PER_COMPLEX`]）
-/// に収まり、文書の深さには比例しない（祖先方向は
-/// [`Document::ancestors`] のイテレータで走査するため、こちらも文書の深さ分
-/// の再帰を積まない）。
+/// に収まり、文書の深さには比例しない（祖先方向は [`any_ancestor_matches`]
+/// が反復（非再帰）で走査するため、こちらも文書の深さ分の再帰を積まない）。
+///
+/// 判定結果は `cache.chain` に `(selector_idx, node のインデックス, up_to)`
+/// をキーに記録する（[`MatchCache`] のドキュメント参照。DoS 対策の
+/// メモ化）。
 fn matches_compound_chain(
     document: &Document,
     node: NodeId,
     complex: &ComplexSelector,
     up_to: Option<usize>,
+    selector_idx: usize,
+    cache: &mut MatchCache,
+) -> bool {
+    let cache_key = (selector_idx, node.index(), up_to);
+    if let Some(&cached) = cache.chain.get(&cache_key) {
+        return cached;
+    }
+
+    let result =
+        matches_compound_chain_uncached(document, node, complex, up_to, selector_idx, cache);
+    cache.chain.insert(cache_key, result);
+    result
+}
+
+/// [`matches_compound_chain`] のキャッシュ未命中時の本体。祖先探索
+/// （子孫結合子）・親探索（子結合子）で再帰する際は必ず
+/// [`matches_compound_chain`]（キャッシュ経由）を呼び、直接自分自身を
+/// 呼ばない（メモ化を素通りさせないため）。
+fn matches_compound_chain_uncached(
+    document: &Document,
+    node: NodeId,
+    complex: &ComplexSelector,
+    up_to: Option<usize>,
+    selector_idx: usize,
+    cache: &mut MatchCache,
 ) -> bool {
     let Some(index) = up_to else {
         return compound_matches(document, node, complex.first());
@@ -214,29 +294,132 @@ fn matches_compound_chain(
                 return false;
             };
             document.is_element(parent)
-                && matches_compound_chain(document, parent, complex, next_up_to)
+                && matches_compound_chain(
+                    document,
+                    parent,
+                    complex,
+                    next_up_to,
+                    selector_idx,
+                    cache,
+                )
         }
-        Combinator::Descendant => document
-            .ancestors(node)
-            .filter(|&ancestor| document.is_element(ancestor))
-            .any(|ancestor| matches_compound_chain(document, ancestor, complex, next_up_to)),
+        Combinator::Descendant => {
+            any_ancestor_matches(document, node, complex, next_up_to, selector_idx, cache)
+        }
     }
+}
+
+/// `node` の祖先（[`Document::is_element`] を満たすもののみ）のいずれかが、
+/// `up_to` から左側の複合セレクタ連鎖に一致するかを判定する
+/// （[`Combinator::Descendant`] の照合本体）。
+///
+/// 素朴な実装（各祖先ごとに [`matches_compound_chain`] を再帰的に試す）は、
+/// 深くネストした文書に子孫結合子を連ねたセレクタ（例:
+/// `.missing div div div ...`）を照合すると、祖先の組み合わせを指数的に
+/// 探索してしまう（security.md「不安全な設計」・AGENTS.md
+/// 「リソース上限」対策）。本関数は代わりに祖先の並びを 1 度だけ反復で
+/// 遡り、各ノードでの判定結果を `cache.ancestor` に記録することで、
+/// 同一 `(selector_idx, ノード, up_to)` の部分問題を高々 1 回しか計算しない
+/// （`Document::ancestors` を使わずここで反復する理由: 祖先ごとに
+/// キャッシュへ書き込みながら遡る必要があるため）。
+///
+/// これにより `element_matches` / `query_selector_all` 1 回あたりの
+/// 計算量は O(文書のノード数 × セレクタ内の複合セレクタ数) に収まり、
+/// 文書の深さに対して指数的には増えない。反復（非再帰）で遡るため、
+/// 文書がどれだけ深くネストしていてもスタックオーバーフローしない。
+///
+/// 漸化式: `any_ancestor_matches(X) = matches_compound_chain(parent(X))
+/// || any_ancestor_matches(parent(X))`。各祖先 `parent` について、まず
+/// `matches_compound_chain(parent)`（`parent` 自身が一致するか）を必ず
+/// 先に確認してから `cache.ancestor`（`parent` の「さらに祖先」が一致
+/// するか）を参照する。この順序を逆にすると、`parent` 自身の一致を
+/// 確認しないまま `cache.ancestor` の既知の値（多くは他ノードの探索で
+/// 先に確定した `false`）だけで打ち切ってしまい、本来一致するはずの
+/// 深いノードを誤って不一致と判定する（`matches_compound_chain` 自身も
+/// `cache.chain` でメモ化されているため、この呼び出し自体のコストは
+/// 償却 O(1)）。
+fn any_ancestor_matches(
+    document: &Document,
+    node: NodeId,
+    complex: &ComplexSelector,
+    up_to: Option<usize>,
+    selector_idx: usize,
+    cache: &mut MatchCache,
+) -> bool {
+    let start_key = (selector_idx, node.index(), up_to);
+    if let Some(&cached) = cache.ancestor.get(&start_key) {
+        return cached;
+    }
+
+    // 遡った要素祖先を記録し、結果が確定した後にまとめてキャッシュへ
+    // 書き込む（途中でキャッシュ済みの祖先に到達した場合は、その祖先より
+    // 手前（今回遡った分）も同じ結果になる）。
+    let mut visited = Vec::new();
+    let mut current = node;
+    let result = loop {
+        let Some(parent) = document.parent(current) else {
+            break false;
+        };
+        if !document.is_element(parent) {
+            // 要素でない祖先（例: DocumentFragment）は候補にならないが、
+            // その先の祖先は候補になりうるため遡りを継続する。
+            current = parent;
+            continue;
+        }
+
+        // `parent` 自身が一致するかを必ず先に確認する（上記ドキュメント
+        // 参照）。`cache.chain` 経由でメモ化されるため、`parent` がすでに
+        // 他の探索で確認済みなら実質 O(1) で戻る。
+        if matches_compound_chain(document, parent, complex, up_to, selector_idx, cache) {
+            break true;
+        }
+        // `parent` 自身は不一致。`parent` のさらに祖先の判定がすでに
+        // 分かっていれば、その値がここでの結果にもなる
+        // （`any_ancestor_matches(node) = false || any_ancestor_matches(parent)`）。
+        let parent_key = (selector_idx, parent.index(), up_to);
+        if let Some(&cached) = cache.ancestor.get(&parent_key) {
+            break cached;
+        }
+        visited.push(parent);
+        current = parent;
+    };
+
+    for ancestor in visited {
+        cache
+            .ancestor
+            .insert((selector_idx, ancestor.index(), up_to), result);
+    }
+    cache.ancestor.insert(start_key, result);
+    result
 }
 
 /// `element` がセレクタリストの少なくとも 1 個の [`ComplexSelector`] に
 /// 一致するかを判定する。
-fn list_matches(document: &Document, element: NodeId, selectors: &SelectorList) -> bool {
+///
+/// `cache` は呼び出し元（[`element_matches`]・[`query_selector_all`]・
+/// [`query_selector`]）が用意し、複数の候補要素にわたって共有する
+/// （DoS 対策のメモ化を候補間でも効かせるため。[`MatchCache`] 参照）。
+fn list_matches(
+    document: &Document,
+    element: NodeId,
+    selectors: &SelectorList,
+    cache: &mut MatchCache,
+) -> bool {
     selectors
         .selectors()
         .iter()
-        .any(|complex| complex_matches(document, element, complex))
+        .enumerate()
+        .any(|(selector_idx, complex)| {
+            complex_matches(document, element, complex, selector_idx, cache)
+        })
 }
 
 /// `element` が `selectors` に一致するかどうかを判定する（`Element.matches()`
 /// 相当）。`element` が要素でない場合や範囲外の場合は `false` を返す
 /// （panic しない）。
 pub fn element_matches(document: &Document, element: NodeId, selectors: &SelectorList) -> bool {
-    document.is_element(element) && list_matches(document, element, selectors)
+    let mut cache = MatchCache::new();
+    document.is_element(element) && list_matches(document, element, selectors, &mut cache)
 }
 
 /// `scope` の子孫要素のうち `selectors` に一致するものを、文書順・重複なしで
@@ -244,15 +427,21 @@ pub fn element_matches(document: &Document, element: NodeId, selectors: &Selecto
 ///
 /// scope の意味論・照合規則はモジュール doc を参照。一致がなければ空の
 /// `Vec` を返す（panic しない）。
+///
+/// `MatchCache` は呼び出し 1 回分をすべての候補要素で共有する（候補ごとに
+/// 使い捨てると、祖先ノードの判定結果を候補の数だけ再計算してしまい、
+/// メモ化の効果が薄れる。[`MatchCache`] のドキュメント参照）。
 pub fn query_selector_all(
     document: &Document,
     scope: NodeId,
     selectors: &SelectorList,
 ) -> Vec<NodeId> {
+    let mut cache = MatchCache::new();
     document
         .descendants(scope)
         .filter(|&candidate| {
-            document.is_element(candidate) && list_matches(document, candidate, selectors)
+            document.is_element(candidate)
+                && list_matches(document, candidate, selectors, &mut cache)
         })
         .collect()
 }
@@ -267,8 +456,9 @@ pub fn query_selector(
     scope: NodeId,
     selectors: &SelectorList,
 ) -> Option<NodeId> {
+    let mut cache = MatchCache::new();
     document.descendants(scope).find(|&candidate| {
-        document.is_element(candidate) && list_matches(document, candidate, selectors)
+        document.is_element(candidate) && list_matches(document, candidate, selectors, &mut cache)
     })
 }
 
@@ -616,6 +806,57 @@ mod tests {
         let results = query_selector_all(&doc, root, &selectors("div span"));
         assert_eq!(results.len(), 1);
         assert_eq!(doc.local_name(results[0]), Some("span"));
+    }
+
+    /// CORE-1: 子孫結合子（`Combinator::Descendant`）を
+    /// [`crate::selector::MAX_COMPOUNDS_PER_COMPLEX`] まで連ねたセレクタを
+    /// 深くネストした（かつ左端で必ず不一致になる）文書に照合しても、
+    /// `matches_compound_chain` のメモ化により祖先の組み合わせを
+    /// 指数的に探索せず短時間で完了する（DoS 対策の回帰テスト。
+    /// レビュー指摘: PR #439 discussion_r4111107367）。メモ化なしの実装では
+    /// この規模でも実用的な時間内に終わらない。
+    #[test]
+    fn core_1_descendant_backtracking_does_not_explode_with_deep_nesting() {
+        const DEPTH: usize = 2_000;
+        // 子孫結合子を最大数まで連ね、先頭（左端）を文書中に存在しない
+        // クラス名にすることで、素朴なバックトラック実装だと不一致確定
+        // までに祖先の組み合わせを総当たりしてしまう入力にする。
+        let compound_count = crate::selector::MAX_COMPOUNDS_PER_COMPLEX;
+        let selector_text = std::iter::once(".missing")
+            .chain(std::iter::repeat_n("div", compound_count - 1))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let mut input = String::with_capacity(DEPTH * 5 + 20);
+        for _ in 0..DEPTH {
+            input.push_str("<div>");
+        }
+        input.push_str("<span>x</span>");
+        let options = ParseOptions::default().with_max_nodes(usize::MAX);
+        let doc = parse_document(&input, &options)
+            .expect("深いネストでも成功する")
+            .document;
+        let root = doc.root();
+
+        let started = std::time::Instant::now();
+        let results = query_selector_all(&doc, root, &selectors(&selector_text));
+        // `.missing` が文書中に存在しないため必ず不一致になる。
+        assert_eq!(results.len(), 0);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "メモ化なしの指数的バックトラックが疑われる（所要時間: {:?}）",
+            started.elapsed()
+        );
+
+        // 常に `false` を返すだけの壊れたメモ化ではこのテストを検出できない
+        // ため、実際に一致が発生するケースも同じ規模で確認する（先頭を
+        // `div`（文書中に存在する）にし、`.missing` を使わない）。
+        let matching_selector = vec!["div"; compound_count].join(" ");
+        let matching_results = query_selector_all(&doc, root, &selectors(&matching_selector));
+        // 深さ `DEPTH` の `div` の連なりのうち、`compound_count` 個の `div`
+        // 連鎖を子孫方向に満たせるのは、根から `compound_count - 1` 個目
+        // より深い各 `div`（`DEPTH - (compound_count - 1)` 個）である。
+        assert_eq!(matching_results.len(), DEPTH - (compound_count - 1));
     }
 
     /// CORE-1: `&str` 版は `parse_selector_list` のエラーをそのまま返す。
