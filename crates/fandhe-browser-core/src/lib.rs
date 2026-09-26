@@ -22,7 +22,9 @@
 //! 子孫を辿るイテレータ）・要素/属性アクセサ・`text_content` の本実装を持つ
 //! （セレクタ照合はスコープ外。REPAIR-3: 実装済みを装わない）。
 //! `selector`（TASK-24.7・#41）は CSS セレクタの
-//! サブセットをパースする本実装を持つ。`query` は TASK-24.10（#418）で本実装を行う。
+//! サブセットをパースする本実装を持つ。`query`（TASK-24.10・#418）は
+//! `selector` の AST を `dom::Document` に照合し、`querySelector`/
+//! `querySelectorAll`/`Element.matches()` 相当の API を提供する本実装を持つ。
 //! JS 実行スタブとの境界は TASK-24（24.9・Issue #43）で `js_stub` モジュールとして
 //! 追加した。関数本体（[`js_stub::execute_js_stub`]）は常にエラーを返すスタブであり、
 //! TASK-30（Issue #143・ビヘイビア `JS-2`）で `fandhe-browser-js` の実装へ置換される。
@@ -49,4 +51,7 @@ pub use fetch::{FetchOptions, FetchResponse, Fetcher};
 pub use parse::{
     ParseDiagnostics, ParseErrorPolicy, ParseOptions, ParsedDocument, parse_document,
     parse_document_bytes,
+};
+pub use query::{
+    element_matches, query_selector, query_selector_all, query_selector_all_str, query_selector_str,
 };

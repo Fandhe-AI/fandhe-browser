@@ -3,7 +3,8 @@
 //! 役割: `query`（TASK-24.10・Issue #418）が自作 DOM（TASK-24.5・#39）へ
 //! 照合する前段として、セレクタ文字列を型付きの AST に変換する。DOM への
 //! 照合そのもの・`query_selector` / `query_selector_all` 相当の API は
-//! 本モジュールの対象外であり、#418 が本モジュールの出力を入力として使う。
+//! 本モジュールの対象外であり、`query` モジュール（[`crate::query`]）が
+//! 本モジュールの出力を入力として使う。
 //! 将来は `cdp`（`DOM.querySelector` 系）・`ai`（簡約 DOM 抽出）からも
 //! 間接的に使われる想定である。
 //!
@@ -17,7 +18,7 @@
 //! （`[a=v]` / `[a="v"]` / `[a='v']`）・子孫結合子（空白）・子結合子（`>`）・
 //! カンマ区切りのセレクタリスト。
 //!
-//! 照合契約（TASK-24.10・REPAIR-3・`#418` が実装する）: AST（[`CompoundSelector::type_name`]・
+//! 照合契約（TASK-24.10・`#418`・[`crate::query`] が実装する）: AST（[`CompoundSelector::type_name`]・
 //! [`AttributeSelector::name`]）には入力の表記をそのまま保持し、本モジュールでは
 //! 大文字小文字の正規化を行わない。`dom::Data::Element` は html5ever の
 //! `QualName` を保持するため、SVG の `foreignObject`・`viewBox` のような
