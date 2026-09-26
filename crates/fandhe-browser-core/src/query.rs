@@ -1212,7 +1212,7 @@ mod tests {
     fn core_1_compound_selector_partial_failure() {
         let doc = parse(
             r#"<!DOCTYPE html>
-            <div id="main">
+            <div id="main" class="container">
                 <a id="match" class="link" href="/x">a</a>
             </div>"#,
         );
@@ -1228,8 +1228,10 @@ mod tests {
                 ("a.missing", &[]),
                 // 持っていない属性。
                 ("a.link[target]", &[]),
-                // id・クラスの複合セレクタで id が異なる div には一致しない。
-                ("div#main.other", &[]),
+                // 型名・クラスは一致するが id のみ異なるため、id 不一致
+                // だけを理由に空になることを検証する
+                // （`div` は一致・`.container` も持つが `#other` を持たない）。
+                ("div#other.container", &[]),
             ],
         );
     }
