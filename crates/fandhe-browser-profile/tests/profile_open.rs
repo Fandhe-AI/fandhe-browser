@@ -4,6 +4,14 @@
 //! パーミッション・隔離の網羅的な確認は TASK-50（50.4）・#179 が本ファイルへ
 //! 追加する前提のため、本ファイルはそのまま拡張できるよう別ファイルへ
 //! 分割しない。
+//!
+//! Windows では ACL 隔離が未実装のため `Profile::open` は常に
+//! `ProfileError::Unsupported` を返す（`XOS-7`〜`XOS-10`。PR #437 レビュー
+//! 指摘への対応）。本ファイルの受入テストは実際にディレクトリが作られる
+//! ことを検証する内容のため Unix 専用とし、Windows 側の契約は
+//! `src/profile.rs` の `#[cfg(windows)]` テストで確認する。
+
+#![cfg(unix)]
 
 use fandhe_browser_profile::{DataKind, Profile};
 use std::path::{Path, PathBuf};
@@ -12,8 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// テスト用の一時ディレクトリ。drop 時に再帰削除する（tempfile 等の外部
-/// 依存は追加しない方針。dependency-policy.md）。3 OS で動く前提で
-/// `std::env::temp_dir()` を使う。
+/// 依存は追加しない方針。dependency-policy.md）。
 struct TempDir {
     path: PathBuf,
 }
@@ -21,7 +28,14 @@ struct TempDir {
 impl TempDir {
     fn new() -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        // `std::env::temp_dir()` を `canonicalize` した基点から組み立てる。
+        // macOS では `/var` が `/private/var` への OS 標準 symlink であり、
+        // 正規化しないと `Profile::open` の厳格な symlink 検証（PR #437
+        // レビュー指摘）が「意図しない既存の symlink」として弾いてしまう。
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let path = base.join(format!(
             "fandhe-profile-open-test-{}-{n}",
             std::process::id()
         ));
