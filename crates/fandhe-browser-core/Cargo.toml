@@ -3,9 +3,9 @@
 # REPAIR-1（TASK-1（旧サブ番号 1.2）・MS-1）: workspace 分割の一環として
 # `fandhe-browser-core` の空 skeleton を追加する。本 crate は fetch・HTML パース・
 # DOM・query・CSSOM・config・可観測性を担う（CLAUDE.md のリポジトリ構成参照）。
-# 本 PR の受け入れ条件は `cargo build -p fandhe-browser-core` が成功することのみで、
-# 機能実装は含まない。fetch/parse/dom/query の本実装は TASK-24（ビヘイビア `CORE-1`）
-# で行う。
+# `fetch` モジュールの本実装（TASK-24.2・Issue #36・ビヘイビア `CORE-1`）で
+# reqwest・rustls への依存を追加した（Issue #35 で採用承認済み）。parse/dom/query
+# の本実装は後続タスクで行う。
 
 [package]
 name = "fandhe-browser-core"
@@ -17,5 +17,13 @@ license.workspace = true
 # （`make check-publish-private` が機械的に検証する）。
 publish.workspace = true
 
-# 依存最小方針（dependency-policy.md）に従い、雛形段階では新規依存を追加しない。
+# 依存最小方針（dependency-policy.md）: `fetch`（TASK-24.2・#36）が使う
+# HTTP クライアントのみを追加する。Issue #35 で採用承認済み・`=x.y.z` 完全固定
+# （root `[workspace.dependencies]` に集約し、ここでは `{ workspace = true }` で
+# 参照する）。
 [dependencies]
+reqwest = { workspace = true }
+rustls = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

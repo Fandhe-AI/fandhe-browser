@@ -4,8 +4,12 @@
 //! `query`（TASK-24.7・#41）の各モジュールは、本モジュールが定義する [`Error`] /
 //! [`Result`] を戻り値の共通土台として使う想定（TASK-24（24.1）・ビヘイビア
 //! `CORE-1`）。`unsafe` は使わず、`thiserror`/`anyhow` 等の外部依存も追加しない
-//! （dependency-policy.md の依存最小方針。`Cargo.toml` の `[dependencies]` は
-//! 引き続き空のまま）。
+//! （dependency-policy.md の依存最小方針）。`fetch` 本実装（TASK-24.2・#36）に
+//! 伴い `Cargo.toml` の `[dependencies]` へ `reqwest`・`rustls`（Issue #35 で
+//! 採用承認済み）を追加したが、本モジュールはそれらの型を公開 API に漏らさず、
+//! 汎用的な [`Error`] バリアントへ写像する（coding-rust.md「JS エンジンは
+//! トレイト抽象越しに」と同様、外部クレートの具象型を上位 crate へ漏らさない
+//! 方針を fetch にも適用する）。
 //!
 //! 呼び出し元は `fandhe-browser-ai`・`fandhe-browser-cdp` 等の上位 crate（本
 //! crate から一方向に依存される）や、本 crate 内の各モジュール（`js_stub` を
@@ -17,6 +21,7 @@
 //! できる構造にする）。
 
 use std::fmt;
+use std::time::Duration;
 
 /// `fandhe-browser-core` の各モジュール（fetch/parse/dom/query）が返すエラー。
 ///
@@ -60,6 +65,66 @@ pub enum Error {
         /// 避けるため。security.md）。
         message: String,
     },
+    /// `fetch::Fetcher::get`（TASK-24.2・#36・CORE-1）が、`FetchOptions` の
+    /// 全体タイムアウト・接続タイムアウトを超過した場合に返す。
+    Timeout {
+        /// 超過した上限値（`FetchOptions::timeout` または `connect_timeout`）。
+        limit: Duration,
+    },
+    /// `fetch::Fetcher::get` が、`FetchOptions::max_redirects` を超える
+    /// リダイレクトを検出した場合に返す（security.md「不安全な設計」:
+    /// 無限リダイレクトの上限検証）。
+    TooManyRedirects {
+        /// 許可した最大リダイレクト回数。
+        limit: usize,
+    },
+    /// `fetch::Fetcher::get` が、`FetchOptions::max_body_bytes` を超える
+    /// レスポンス本文を検出した場合に返す。`Content-Length` ヘッダによる
+    /// 事前検査・ストリーミング読み込み中の逐次検査の両方で使う
+    /// （security.md「不安全な設計」: 巨大レスポンスへの上限検証）。
+    ResponseTooLarge {
+        /// 許可した最大バイト数。
+        limit: u64,
+    },
+    /// `fetch::Fetcher::get` が、`http`/`https` 以外の scheme（`file:` 等）
+    /// への要求・リダイレクトを検出した場合に返す（security.md「SSRF」）。
+    DisallowedScheme {
+        /// 拒否した scheme 名のみを保持する。URL 全体（userinfo・パス等の
+        /// 秘匿情報を含み得る）はここへ埋め込まない。
+        scheme: String,
+    },
+    /// `fetch::Fetcher::get` が、`FetchOptions::allow_private_network_access`
+    /// が `false`（既定）のときに、取得先または各リダイレクト先（DNS 名の
+    /// 解決結果・IP リテラル host のいずれか）がループバック・プライベート
+    /// アドレス等の内部アドレスであると判定した場合に返す（security.md
+    /// 「SSRF」）。DNS 名は `fetch::SafeResolver`、IP リテラル host は
+    /// `fetch::reject_disallowed_address` が、初回リクエスト・リダイレクト先
+    /// の双方で検証するため、この 1 variant で両方の経路をカバーする。
+    DisallowedAddress {
+        /// 拒否した解決先の IP アドレス文字列のみを保持する。ホスト名・
+        /// URL 全体（userinfo・パス等）はここへ埋め込まない。
+        address: String,
+    },
+    /// `fetch::Fetcher::get` が、同時実行できる DNS 解決スレッド数の上限
+    /// （`fetch::resolve_blocking` が管理するプロセス全体のカウンタ）に
+    /// 達しているときに返す。`fetch::SafeResolver::resolve` は名前解決の
+    /// たびに専用の OS スレッドを生成するため、外部から多数の異なる URL を
+    /// 取得させられる経路では、上限を設けないと DNS 応答遅延に比例して
+    /// スレッド・メモリが無制限に増える（security.md「不安全な設計」。
+    /// PR #430 コードレビュー指摘 P0）。
+    TooManyConcurrentDnsResolutions {
+        /// 許可した同時実行数の上限。
+        limit: usize,
+    },
+    /// `fetch::Fetcher` の内部 HTTP クライアント（`reqwest`）が返したエラーを
+    /// 写像したもの。`reqwest::Error` は公開 API に出さず（外部クレートの
+    /// 具象型を上位 crate へ漏らさない方針）、`without_url()` を通した後の
+    /// メッセージのみを保持する（URL の userinfo・クエリを含めないため。
+    /// security.md 秘密情報混入防止）。
+    Network {
+        /// `reqwest::Error` の `without_url()` 後の Display 文字列。
+        message: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -71,6 +136,23 @@ impl fmt::Display for Error {
             Error::JsExecutionUnavailable { message } => {
                 write!(f, "JS execution unavailable: {message}")
             }
+            Error::Timeout { limit } => write!(f, "request timed out after {limit:?}"),
+            Error::TooManyRedirects { limit } => {
+                write!(f, "too many redirects (limit: {limit})")
+            }
+            Error::ResponseTooLarge { limit } => {
+                write!(f, "response body exceeds limit of {limit} bytes")
+            }
+            Error::DisallowedScheme { scheme } => {
+                write!(f, "disallowed URL scheme: {scheme}")
+            }
+            Error::DisallowedAddress { address } => {
+                write!(f, "disallowed target address: {address}")
+            }
+            Error::TooManyConcurrentDnsResolutions { limit } => {
+                write!(f, "too many concurrent DNS resolutions (limit: {limit})")
+            }
+            Error::Network { message } => write!(f, "network error: {message}"),
         }
     }
 }
@@ -81,7 +163,14 @@ impl std::error::Error for Error {
             Error::Io(source) => Some(source),
             Error::InvalidInput { .. }
             | Error::Unsupported { .. }
-            | Error::JsExecutionUnavailable { .. } => None,
+            | Error::JsExecutionUnavailable { .. }
+            | Error::Timeout { .. }
+            | Error::TooManyRedirects { .. }
+            | Error::ResponseTooLarge { .. }
+            | Error::DisallowedScheme { .. }
+            | Error::DisallowedAddress { .. }
+            | Error::TooManyConcurrentDnsResolutions { .. }
+            | Error::Network { .. } => None,
         }
     }
 }
@@ -204,5 +293,90 @@ mod tests {
             std::error::Error::source(&err).map(ToString::to_string),
             None::<String>
         );
+    }
+
+    /// CORE-1（TASK-24.2・#36）: `Error::Timeout` の `Display` が上限値を含む。
+    #[test]
+    fn core_1_display_timeout_variant() {
+        let err = Error::Timeout {
+            limit: Duration::from_millis(200),
+        };
+        assert_eq!(err.to_string(), "request timed out after 200ms");
+    }
+
+    /// CORE-1（TASK-24.2・#36）: `Error::TooManyRedirects` の `Display` が
+    /// 上限回数を含む。
+    #[test]
+    fn core_1_display_too_many_redirects_variant() {
+        let err = Error::TooManyRedirects { limit: 3 };
+        assert_eq!(err.to_string(), "too many redirects (limit: 3)");
+    }
+
+    /// CORE-1（TASK-24.2・#36）: `Error::ResponseTooLarge` の `Display` が
+    /// 上限バイト数を含む。
+    #[test]
+    fn core_1_display_response_too_large_variant() {
+        let err = Error::ResponseTooLarge { limit: 1024 };
+        assert_eq!(err.to_string(), "response body exceeds limit of 1024 bytes");
+    }
+
+    /// CORE-1（TASK-24.2・#36）: `Error::DisallowedScheme` の `Display` が
+    /// scheme 名のみを含み、URL 全体は含まない。
+    #[test]
+    fn core_1_display_disallowed_scheme_variant() {
+        let err = Error::DisallowedScheme {
+            scheme: "file".to_string(),
+        };
+        assert_eq!(err.to_string(), "disallowed URL scheme: file");
+    }
+
+    /// CORE-1（TASK-24.2・#36）: `Error::DisallowedAddress` の `Display` が
+    /// アドレスのみを含む。
+    #[test]
+    fn core_1_display_disallowed_address_variant() {
+        let err = Error::DisallowedAddress {
+            address: "127.0.0.1".to_string(),
+        };
+        assert_eq!(err.to_string(), "disallowed target address: 127.0.0.1");
+    }
+
+    /// CORE-1（TASK-24.2・#36）: `Error::Network` の `Display` がメッセージを
+    /// 含む。
+    #[test]
+    fn core_1_display_network_variant() {
+        let err = Error::Network {
+            message: "connection refused".to_string(),
+        };
+        assert_eq!(err.to_string(), "network error: connection refused");
+    }
+
+    /// CORE-1（TASK-24.2・#36）: 新規バリアントは連鎖する内部エラーを持たない
+    /// ため `source()` が `None` を返す。
+    #[test]
+    fn core_1_source_is_none_for_fetch_variants() {
+        let variants = [
+            Error::Timeout {
+                limit: Duration::from_secs(30),
+            },
+            Error::TooManyRedirects { limit: 10 },
+            Error::ResponseTooLarge {
+                limit: 16 * 1024 * 1024,
+            },
+            Error::DisallowedScheme {
+                scheme: "data".to_string(),
+            },
+            Error::DisallowedAddress {
+                address: "10.0.0.1".to_string(),
+            },
+            Error::Network {
+                message: "boom".to_string(),
+            },
+        ];
+        for variant in &variants {
+            assert_eq!(
+                std::error::Error::source(variant).map(ToString::to_string),
+                None::<String>
+            );
+        }
     }
 }
