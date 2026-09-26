@@ -330,6 +330,22 @@ struct ArenaSink {
     /// 上限超過後に払い出す次のオーバーフローハンドル（[`FIRST_OVERFLOW_ID`]
     /// から降順）。実ノードを持たないため、対応する arena エントリは存在しない。
     next_overflow_id: Cell<usize>,
+    /// 直近に解決した「兄弟ノード → その親の `children` 内での位置」を 1 件だけ
+    /// 覚える 1 スロットキャッシュ（`(sibling, position)`）。
+    ///
+    /// foster parenting（`<table>` 直前へテキストを繰り返し挿入する経路。
+    /// [`Self::insert_before`]・`append_before_sibling` の `find_prev`）は
+    /// 呼び出しのたびに同じ `<table>` ノードを `sibling` として位置探索するため、
+    /// 外部 HTML の兄弟数に応じて呼び出し回数分の線形探索が重なり二乗時間になる
+    /// （P1 レビュー指摘。PR #431
+    /// <https://github.com/Fandhe-AI/fandhe-browser/pull/431#discussion_r4110398582>）。
+    /// 直近 1 件をここに残すことで、同じ `sibling` への 2 回目以降の探索を
+    /// O(1) に落とす。`ArenaSink` はパース専用の内部型で、完成後に外へ返す
+    /// `Document`（`dom.rs` の Send + Sync 契約）には含まれないため、
+    /// `Node` 側に `Cell` を持たせずに済む。キャッシュが古い（他の変更で
+    /// ずれた）場合は参照時に不一致を検知して線形探索へフォールバックするため、
+    /// 返す位置の正しさ自体は損なわれない。
+    last_sibling_pos: Cell<Option<(NodeId, usize)>>,
     max_nodes: usize,
     max_recorded_errors: usize,
     strict: bool,
@@ -351,6 +367,7 @@ impl ArenaSink {
             poison: Cell::new(false),
             limit_exceeded: Cell::new(false),
             next_overflow_id: Cell::new(FIRST_OVERFLOW_ID),
+            last_sibling_pos: Cell::new(None),
             // `options.max_nodes == 0` は `parse_document`/`parse_document_bytes`
             // が `Err(ParseError::InvalidMaxNodes)` として呼び出し前に拒否する
             // ため、ここに到達する値は常に 1 以上（REPAIR-6 P1 レビュー指摘：
@@ -419,6 +436,28 @@ impl ArenaSink {
         }
     }
 
+    /// `sibling` が `parent` の `children` 内で占める位置を返す。
+    ///
+    /// [`Self::last_sibling_pos`] にキャッシュされた `(sibling, pos)` が
+    /// `parent.children[pos] == sibling` を満たせばそれを O(1) で使い、
+    /// 未設定・他ノードの挿入や削除でずれて不一致になっていればその場で
+    /// 線形探索してキャッシュを更新する（フィールドのドキュメントコメント
+    /// 参照。P1 レビュー指摘。PR #431
+    /// <https://github.com/Fandhe-AI/fandhe-browser/pull/431#discussion_r4110398582>）。
+    /// キャッシュが古い場合でも線形探索へフォールバックするだけで、返す位置の
+    /// 正しさ自体は損なわれない。
+    fn sibling_position(&self, parent: &Node, sibling: NodeId) -> Option<usize> {
+        let cached = self.last_sibling_pos.get();
+        let pos = cached
+            .filter(|&(cached_sibling, pos)| {
+                cached_sibling == sibling && parent.children.get(pos) == Some(&sibling)
+            })
+            .map(|(_, pos)| pos)
+            .or_else(|| parent.children.iter().position(|&c| c == sibling))?;
+        self.last_sibling_pos.set(Some((sibling, pos)));
+        Some(pos)
+    }
+
     /// `child` を（既存の親から detach したうえで）`parent` の最後の子として
     /// 付け直す。
     fn append_child(nodes: &mut [Node], parent: NodeId, child: NodeId) {
@@ -434,20 +473,29 @@ impl ArenaSink {
     /// `new_node` を（既存の親から detach したうえで）`sibling` の直前へ挿入する。
     /// `sibling` に親がない場合（html5ever の契約上発生しない想定外経路）は
     /// 何もしない。
-    fn insert_before(nodes: &mut [Node], sibling: NodeId, new_node: NodeId) {
+    fn insert_before(&self, nodes: &mut [Node], sibling: NodeId, new_node: NodeId) {
         Self::detach(nodes, new_node);
         let Some(parent_id) = nodes.get(sibling.index()).and_then(|n| n.parent) else {
             return;
         };
+        let insert_pos = nodes
+            .get(parent_id.index())
+            .and_then(|parent| self.sibling_position(parent, sibling));
         if let Some(parent) = nodes.get_mut(parent_id.index()) {
-            let pos = parent.children.iter().position(|&c| c == sibling);
-            match pos {
+            match insert_pos {
                 Some(pos) => parent.children.insert(pos, new_node),
                 None => parent.children.push(new_node),
             }
         }
         if let Some(new_node_ref) = nodes.get_mut(new_node.index()) {
             new_node_ref.parent = Some(parent_id);
+        }
+        // `sibling` は挿入により実際に 1 つ後ろへずれた場合のみキャッシュを
+        // 更新する（`insert_pos` が見つからず末尾へ push した場合、`sibling`
+        // は別の親配下にいるため動いていない。次回参照時は不一致を検知して
+        // 再探索にフォールバックする）。
+        if let Some(pos) = insert_pos {
+            self.last_sibling_pos.set(Some((sibling, pos + 1)));
         }
     }
 
@@ -697,15 +745,15 @@ impl TreeSink for ArenaSink {
                     |nodes| {
                         let parent_id = nodes.get(sibling.index()).and_then(|n| n.parent)?;
                         let parent = nodes.get(parent_id.index())?;
-                        let pos = parent.children.iter().position(|&c| c == sibling)?;
+                        let pos = self.sibling_position(parent, sibling)?;
                         pos.checked_sub(1)
                             .and_then(|i| parent.children.get(i).copied())
                     },
-                    |nodes, id| Self::insert_before(nodes, sibling, id),
+                    |nodes, id| self.insert_before(nodes, sibling, id),
                 );
             }
             NodeOrText::AppendNode(child_id) => {
-                Self::insert_before(&mut nodes, sibling, child_id);
+                self.insert_before(&mut nodes, sibling, child_id);
             }
         }
     }
@@ -1236,6 +1284,41 @@ mod tests {
             element_local_name(doc, body_node.children[1]).as_deref(),
             Some("table")
         );
+    }
+
+    /// CORE-1: `<table>` の直前に多数の兄弟要素が存在する状態で `<table>` 直下へ
+    /// テキストが foster parenting されても、探索位置キャッシュ
+    /// （`ArenaSink::last_sibling_pos`）を挟まない場合と同じ木構造になる
+    /// （P1 レビュー指摘の回帰防止。PR #431
+    /// <https://github.com/Fandhe-AI/fandhe-browser/pull/431#discussion_r4110398582>）。
+    /// `<table>` を `sibling` とする `insert_before`／位置探索は、`<table>` の
+    /// 手前に多数の兄弟（`<p>` 64 個）がある場合ほど線形探索のコストが高く、
+    /// キャッシュが正しく機能しないと結果が壊れる経路を通る。
+    #[test]
+    fn core_1_foster_parenting_before_table_with_many_preceding_siblings() {
+        let preceding: String = (0..64).map(|i| format!("<p>p{i}</p>")).collect();
+        let input =
+            format!("<!DOCTYPE html><html><body>{preceding}<table>text</table></body></html>");
+        let parsed = parse_document(&input, &ParseOptions::default()).expect("Recover では Ok");
+        let doc = &parsed.document;
+        let html = find_child_element(doc, doc.root(), "html").unwrap();
+        let body = find_child_element(doc, html, "body").unwrap();
+        let body_node = doc.node(body).unwrap();
+        // 64 個の `<p>` の直後に、foster parenting されたテキストノードが
+        // `<table>` の直前へ挿入され、その後に `<table>` 自身が続く。
+        assert_eq!(body_node.children.len(), 64 + 1 + 1);
+        for i in 0..64 {
+            assert_eq!(
+                element_local_name(doc, body_node.children[i]).as_deref(),
+                Some("p")
+            );
+        }
+        assert_eq!(
+            text_of(doc, body_node.children[64]).as_deref(),
+            Some("text")
+        );
+        let table = body_node.children[65];
+        assert_eq!(element_local_name(doc, table).as_deref(), Some("table"));
     }
 
     /// CORE-1: 重複する `<html>` の属性は first-wins（`add_attrs_if_missing`
