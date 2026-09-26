@@ -131,6 +131,12 @@ impl ParseOptions {
     }
 
     /// ノード数上限を設定する。
+    ///
+    /// `0` はここではエラーにならない（ビルダーメソッドは `Self` を返す
+    /// 非 `Result` 契約のため）。`0` を指定した状態で
+    /// [`parse_document`]・[`parse_document_bytes`] を呼ぶと
+    /// `Err(ParseError::InvalidMaxNodes)` になる（arena は `Document`
+    /// ルート用に最低 1 ノードを要するため。REPAIR-6 P1 レビュー指摘）。
     pub fn with_max_nodes(mut self, max_nodes: usize) -> Self {
         self.max_nodes = max_nodes;
         self
@@ -199,6 +205,9 @@ pub struct ParsedDocument {
 ///
 /// [`parse` モジュールのドキュメント](self) の「エラーポリシー」を参照。
 pub fn parse_document(input: &str, options: &ParseOptions) -> Result<ParsedDocument> {
+    if options.max_nodes == 0 {
+        return Err(Error::Parse(ParseError::InvalidMaxNodes { requested: 0 }));
+    }
     if input.len() > options.max_input_bytes {
         return Err(Error::Parse(ParseError::InputTooLarge {
             len: input.len(),
@@ -235,6 +244,15 @@ pub fn parse_document(input: &str, options: &ParseOptions) -> Result<ParsedDocum
 ///
 /// [`parse` モジュールのドキュメント](self) の「エラーポリシー」を参照。
 pub fn parse_document_bytes(input: &[u8], options: &ParseOptions) -> Result<ParsedDocument> {
+    // オプション検証（`max_nodes`）を入力検証より先に行う。`parse_document`
+    // 側でも同じ検査をするが、`InvalidUtf8`/`InputTooLarge` を先に返すと
+    // 「同じ `options` で `parse_document` を呼ぶと `InvalidMaxNodes` に
+    // なるのに、このエントリポイントでは別のエラーが先に返る」という
+    // 呼び出し元にとって非直感的な分岐が生まれるため、ここでも明示的に
+    // チェックする（REPAIR-6 P1 レビュー指摘）。
+    if options.max_nodes == 0 {
+        return Err(Error::Parse(ParseError::InvalidMaxNodes { requested: 0 }));
+    }
     if input.len() > options.max_input_bytes {
         return Err(Error::Parse(ParseError::InputTooLarge {
             len: input.len(),
@@ -333,8 +351,14 @@ impl ArenaSink {
             poison: Cell::new(false),
             limit_exceeded: Cell::new(false),
             next_overflow_id: Cell::new(FIRST_OVERFLOW_ID),
-            // RESERVED_NODE_COUNT 未満だと Document すら確保できず直ちに
-            // 矛盾するため、最低でもその分は確保できるようにする。
+            // `options.max_nodes == 0` は `parse_document`/`parse_document_bytes`
+            // が `Err(ParseError::InvalidMaxNodes)` として呼び出し前に拒否する
+            // ため、ここに到達する値は常に 1 以上（REPAIR-6 P1 レビュー指摘：
+            // 以前はここで黙って `RESERVED_NODE_COUNT` へ引き上げており、
+            // 公開 API が受け取った上限と実際の適用上限が乖離していた）。
+            // `.max(RESERVED_NODE_COUNT)` は不変条件が壊れた場合の多重防御
+            // として残す（`ArenaSink::new` を将来 `parse_document` 以外から
+            // 直接呼ぶ経路が増えても Document すら確保できない状態にはしない）。
             max_nodes: options.max_nodes.max(RESERVED_NODE_COUNT),
             max_recorded_errors: options.max_recorded_errors,
             strict: matches!(options.error_policy, ParseErrorPolicy::Strict),
@@ -457,6 +481,31 @@ impl ArenaSink {
             },
         });
         place(nodes, id);
+    }
+
+    /// `node` の子をすべて `new_parent` の末尾へまとめて付け替える
+    /// （[`TreeSink::reparent_children`] 実装から呼ばれる）。`append_child`
+    /// を子ごとに繰り返すと、各回の [`Self::detach`] が元の親（`node`）の
+    /// `children` 全体を `retain` で線形走査するため、子数 N に対し
+    /// O(N^2) になる（REPAIR-6 P1 レビュー指摘）。本関数は `node.children`
+    /// を丸ごと取り出して親ポインタだけを一括更新するため、子数に比例する
+    /// （O(N)）処理になる。
+    fn move_all_children(nodes: &mut [Node], node: NodeId, new_parent: NodeId) {
+        let children = match nodes.get_mut(node.index()) {
+            Some(n) => std::mem::take(&mut n.children),
+            None => return,
+        };
+        if children.is_empty() {
+            return;
+        }
+        for &child in &children {
+            if let Some(child_node) = nodes.get_mut(child.index()) {
+                child_node.parent = Some(new_parent);
+            }
+        }
+        if let Some(parent_node) = nodes.get_mut(new_parent.index()) {
+            parent_node.children.extend(children);
+        }
     }
 }
 
@@ -776,9 +825,15 @@ impl TreeSink for ArenaSink {
             Some(NodeData::Element {
                 attrs: existing, ..
             }) => {
+                // 属性名の集合を作ってから照合する。候補ごとに `existing` を
+                // `iter().any` で線形探索すると、重複した `<html>` タグ等で
+                // 大量の属性候補が渡された場合に属性数 N に対し O(N^2) になる
+                // （REPAIR-6 P1 レビュー指摘）。`HashSet` により属性数に
+                // ほぼ比例する処理にする。
+                let mut existing_names: std::collections::HashSet<QualName> =
+                    existing.iter().map(|e| e.name.clone()).collect();
                 for attr in attrs {
-                    let already_present = existing.iter().any(|e| e.name == attr.name);
-                    if !already_present {
+                    if existing_names.insert(attr.name.clone()) {
                         existing.push(Attribute {
                             name: attr.name,
                             value: attr.value.to_string(),
@@ -818,13 +873,7 @@ impl TreeSink for ArenaSink {
                 return;
             }
         };
-        let children = nodes
-            .get(node.index())
-            .map(|n| n.children.clone())
-            .unwrap_or_default();
-        for child in children {
-            Self::append_child(&mut nodes, *new_parent, child);
-        }
+        Self::move_all_children(&mut nodes, *node, *new_parent);
     }
 
     fn is_mathml_annotation_xml_integration_point(&self, target: &NodeId) -> bool {
@@ -992,6 +1041,39 @@ mod tests {
                 assert_eq!(limit, 5);
             }
             other => panic!("NodeLimitExceeded を期待したが {other:?} だった"),
+        }
+    }
+
+    /// CORE-1: `with_max_nodes(0)` は黙って `1` へ引き上げず
+    /// `Err(InvalidMaxNodes)` になる（公開 API が受け取った上限と実際の
+    /// 適用上限の乖離を防ぐ。REPAIR-6 P1 レビュー指摘）。
+    #[test]
+    fn core_1_rejects_zero_max_nodes() {
+        let options = ParseOptions::default().with_max_nodes(0);
+        let input = "<p>hi</p>";
+        let err = parse_document(input, &options).expect_err("max_nodes(0) は Err");
+        match err {
+            Error::Parse(ParseError::InvalidMaxNodes { requested }) => {
+                assert_eq!(requested, 0);
+            }
+            other => panic!("InvalidMaxNodes を期待したが {other:?} だった"),
+        }
+    }
+
+    /// CORE-1: `parse_document_bytes` でも `max_nodes(0)` は
+    /// `InvalidMaxNodes` になる（`InvalidUtf8` より優先。両エントリポイントで
+    /// 同じ `options` を渡したときの分岐を一貫させる。REPAIR-6 P1 レビュー
+    /// 指摘）。
+    #[test]
+    fn core_1_rejects_zero_max_nodes_bytes_before_invalid_utf8() {
+        let options = ParseOptions::default().with_max_nodes(0);
+        let invalid_utf8: &[u8] = &[0xff, 0xfe];
+        let err = parse_document_bytes(invalid_utf8, &options).expect_err("max_nodes(0) は Err");
+        match err {
+            Error::Parse(ParseError::InvalidMaxNodes { requested }) => {
+                assert_eq!(requested, 0);
+            }
+            other => panic!("InvalidMaxNodes を期待したが {other:?} だった"),
         }
     }
 

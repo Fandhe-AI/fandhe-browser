@@ -123,6 +123,16 @@ pub enum ParseError {
         /// 適用された上限値。
         limit: usize,
     },
+    /// `ParseOptions::with_max_nodes` に `0` が指定された。
+    ///
+    /// arena は `Document` ルート用に最低 1 ノードを要するため `0` は
+    /// 構築不能であり、黙って `1` へ引き上げる（公開 API が受け取った上限と
+    /// 実際に適用される上限が乖離する）代わりに明示的に拒否する
+    /// （REPAIR-6 P1 レビュー指摘）。
+    InvalidMaxNodes {
+        /// 呼び出し元が指定した値（常に `0`）。
+        requested: usize,
+    },
     /// `ParseErrorPolicy::Strict` 指定時に、回復可能なパースエラーが
     /// 1 件以上検出された（既定の `Recover` ポリシーではこの代わりに
     /// `Ok` を返し、診断情報として報告する）。
@@ -155,6 +165,13 @@ impl fmt::Display for ParseError {
             }
             ParseError::NodeLimitExceeded { limit } => {
                 write!(f, "node limit of {limit} exceeded during parsing")
+            }
+            ParseError::InvalidMaxNodes { requested } => {
+                write!(
+                    f,
+                    "invalid max_nodes: {requested} (must be at least 1; the arena always \
+                     needs one node for the Document root)"
+                )
             }
             ParseError::Malformed {
                 error_count,
@@ -312,6 +329,11 @@ mod tests {
         assert_eq!(
             ParseError::NodeLimitExceeded { limit: 5 }.to_string(),
             "node limit of 5 exceeded during parsing"
+        );
+        assert_eq!(
+            ParseError::InvalidMaxNodes { requested: 0 }.to_string(),
+            "invalid max_nodes: 0 (must be at least 1; the arena always needs one node for the \
+             Document root)"
         );
         assert_eq!(
             ParseError::Malformed {
