@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>設定フォーム</title>
+</head>
+<body>
+<form id="prefs" method="post" action="/prefs">
+<input type="radio" name="plan" value="free">
+<input type="radio" name="plan" value="pro" checked>
+<input type="radio" name="plan" value="team">
+<input type="checkbox" name="notify_email" value="on" checked>
+<input type="checkbox" name="notify_sms" value="on">
+<textarea name="bio">よろしくお願いします。</textarea>
+<button type="submit">保存</button>
+</form>
+</body>
+</html>

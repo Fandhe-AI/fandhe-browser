@@ -1,0 +1,316 @@
+//! CORE-1（`core-dom.md`。代表タスクの成功率 70% 以上）を、ローカルフィクスチャ
+//! （`harness/compat_fixtures/`）に対して再測定するための結合テスト
+//! （TASK-26（26.1）・Issue #136・MS-3）。
+//!
+//! `examples/compat_tasks/tasks.rs` を `#[path]` で取り込み、CLI
+//! （`cargo run -p fandhe-browser-core --example compat_tasks -- local`）と
+//! 同じ実行・判定ロジックを使う。これにより「スクリプトが実際に動く」ことを
+//! `cargo test --workspace`（3 OS CI）で常時確認する。
+//!
+//! 成功率レポート（`docs/design/core1-success-rate.md`）の作成は TASK-26.2
+//! （Issue #137）が本テストの対象外として担う。
+
+#[path = "../examples/compat_tasks/tasks.rs"]
+mod tasks;
+
+use tasks::{
+    Category, Expected, Outcome, Status, TARGET_RATE, TaskKind, judge, run_task, sanitize_sample,
+};
+
+fn parse_fixture(bytes: &[u8]) -> fandhe_browser_core::Document {
+    fandhe_browser_core::parse_document_bytes(bytes, &fandhe_browser_core::ParseOptions::default())
+        .expect("ローカルフィクスチャは既知の UTF-8 HTML であり、パースは必ず成功する")
+        .document
+}
+
+/// CORE-1・TASK-26（26.1）: 静的類型の各フィクスチャが期待どおりの値を
+/// 抽出できることを、タスク ID 付きで具体値検証する。
+#[test]
+fn core_1_static_fixtures_extract_expected_values() {
+    for task in tasks::LOCAL_TASKS
+        .iter()
+        .filter(|t| t.category == Category::Static)
+    {
+        let document = parse_fixture(task.fixture);
+        let outcome = run_task(&document, task.kind, task.selector)
+            .unwrap_or_else(|_| panic!("{}: セレクタは対応サブセット内のはず", task.id));
+        let status = judge(&outcome, task.expected);
+        assert_eq!(
+            status,
+            Status::Ok,
+            "{}: 期待値と一致するはず（実際の outcome: {outcome:?}）",
+            task.id
+        );
+    }
+}
+
+/// CORE-1・TASK-26（26.1）: SSR/SPA 静的類型の各フィクスチャが期待どおりの
+/// 値を抽出できることを、タスク ID 付きで具体値検証する。
+#[test]
+fn core_1_ssr_spa_static_fixtures_extract_expected_values() {
+    for task in tasks::LOCAL_TASKS
+        .iter()
+        .filter(|t| t.category == Category::SsrSpaStatic)
+    {
+        let document = parse_fixture(task.fixture);
+        let outcome = run_task(&document, task.kind, task.selector)
+            .unwrap_or_else(|_| panic!("{}: セレクタは対応サブセット内のはず", task.id));
+        let status = judge(&outcome, task.expected);
+        assert_eq!(
+            status,
+            Status::Ok,
+            "{}: 期待値と一致するはず（実際の outcome: {outcome:?}）",
+            task.id
+        );
+    }
+}
+
+/// CORE-1・TASK-26（26.1）: `tasks::run_local` を通した類型別成功率が
+/// CORE-1 の目標値（70% 以上）を満たし、かつ件数が具体値どおりであることを
+/// 検証する（静的 8/8・SSR/SPA 静的 5/5。フィクスチャ表と揃える）。
+#[test]
+fn core_1_local_success_rate_meets_target_per_category() {
+    let results = tasks::run_local();
+    let (static_summary, ssr_spa_summary) = tasks::summarize(&results);
+
+    assert_eq!(static_summary.attempted, 8, "静的類型は 8 タスクのはず");
+    assert_eq!(
+        static_summary.reachable, 8,
+        "ローカルフィクスチャは全件パース可能なはず"
+    );
+    assert_eq!(static_summary.success, 8, "静的類型は全件成功するはず");
+    assert!(
+        static_summary.rate() >= TARGET_RATE,
+        "静的類型の成功率が目標未達: {}",
+        static_summary.rate()
+    );
+
+    assert_eq!(
+        ssr_spa_summary.attempted, 5,
+        "SSR/SPA 静的類型は 5 タスクのはず"
+    );
+    assert_eq!(ssr_spa_summary.reachable, 5);
+    assert_eq!(
+        ssr_spa_summary.success, 5,
+        "SSR/SPA 静的類型は全件成功するはず"
+    );
+    assert!(
+        ssr_spa_summary.rate() >= TARGET_RATE,
+        "SSR/SPA 静的類型の成功率が目標未達: {}",
+        ssr_spa_summary.rate()
+    );
+}
+
+/// CORE-1・TASK-26（26.1）: CSR シェル（X01）は空の結果になり、
+/// `Category::Excluded` として類型別の分母（`Summary`）に含まれないことを
+/// 検証する（PoC-2 の扱いに合わせる。JS 統合後の再評価は TASK-30・JS-2）。
+#[test]
+fn core_1_csr_shell_is_excluded_and_empty() {
+    let task = tasks::LOCAL_TASKS
+        .iter()
+        .find(|t| t.id == "X01")
+        .expect("X01 は LOCAL_TASKS に含まれるはず");
+    assert_eq!(task.category, Category::Excluded);
+
+    let document = parse_fixture(task.fixture);
+    let outcome = run_task(&document, task.kind, task.selector).expect("セレクタは解析できるはず");
+    assert_eq!(outcome, Outcome::Values(Vec::new()));
+    assert_eq!(judge(&outcome, task.expected), Status::ExpectedEmpty);
+
+    let results = tasks::run_local();
+    let (static_summary, ssr_spa_summary) = tasks::summarize(&results);
+    assert_eq!(static_summary.attempted + ssr_spa_summary.attempted, 13);
+}
+
+/// CORE-1・TASK-26（26.1）: フォーム値の組み立て（harness 専用の計測補助
+/// 関数。CORE-5 (4)・未判定）が、checked の checkbox・選択された radio を
+/// 含め、unchecked・disabled を除外することを検証する（S03・P03 の
+/// フィクスチャで確認する）。
+#[test]
+fn core_1_form_values_resolve_checked_and_skip_disabled() {
+    let login = tasks::LOCAL_TASKS
+        .iter()
+        .find(|t| t.id == "S03")
+        .expect("S03 は LOCAL_TASKS に含まれるはず");
+    let document = parse_fixture(login.fixture);
+    let outcome = run_task(&document, login.kind, login.selector).expect("form#login は解析できる");
+    assert_eq!(
+        outcome,
+        Outcome::Pairs(vec![
+            ("username".to_string(), "user".to_string()),
+            ("password".to_string(), "dummy-password".to_string()),
+            ("csrf_token".to_string(), "tok-123".to_string()),
+            ("remember".to_string(), "on".to_string()),
+        ])
+    );
+
+    let prefs = tasks::LOCAL_TASKS
+        .iter()
+        .find(|t| t.id == "P03")
+        .expect("P03 は LOCAL_TASKS に含まれるはず");
+    let document = parse_fixture(prefs.fixture);
+    let outcome = run_task(&document, prefs.kind, prefs.selector).expect("form#prefs は解析できる");
+    assert_eq!(
+        outcome,
+        Outcome::Pairs(vec![
+            ("plan".to_string(), "pro".to_string()),
+            ("notify_email".to_string(), "on".to_string()),
+            ("bio".to_string(), "よろしくお願いします。".to_string()),
+        ])
+    );
+}
+
+/// CORE-1・TASK-26（26.1）: `sanitize_sample` が ANSI エスケープ等の制御文字を
+/// 除去し、マルチバイト文字の境界を保ったまま切り詰めることを検証する
+/// （実サイトモードで取得したテキストを端末へ出す前に必ず通す。
+/// security.md「不安全な設計」端末インジェクション対策）。
+#[test]
+fn core_1_sanitize_sample_strips_control_chars_and_truncates() {
+    assert_eq!(sanitize_sample("a\u{1b}[31mb"), "a[31mb");
+
+    let long_text: String = std::iter::repeat_n('あ', 90).collect();
+    let sanitized = sanitize_sample(&long_text);
+    let expected: String = std::iter::repeat_n('あ', 80).chain(['…']).collect();
+    assert_eq!(sanitized, expected);
+    assert!(sanitized.chars().count() <= 81);
+}
+
+/// [`Expected`] を実際に使うことを確認する（`clippy --all-targets` が
+/// テスト側で `Expected::NonEmpty` 等の未使用 variant を dead code 扱い
+/// しないようにする。`main.rs` の実サイトモードで使う variant を
+/// ここでも軽く確認しておく）。
+#[test]
+fn core_1_expected_non_empty_matches_any_non_empty_outcome() {
+    let outcome = Outcome::Values(vec!["x".to_string()]);
+    assert_eq!(judge(&outcome, Expected::NonEmpty), Status::Ok);
+    let empty = Outcome::Values(Vec::new());
+    assert_eq!(judge(&empty, Expected::NonEmpty), Status::UnexpectedEmpty);
+}
+
+/// CORE-1・TASK-26（26.1）・PR #458 レビュー指摘（P1）の回帰: 要素数だけで
+/// `Expected::NonEmpty` を判定すると、見出しなどが空文字・空白のみでも
+/// `Status::Ok` になり成功率を過大評価してしまう。正規化後に内容のある値が
+/// 1 件も無い `Values` は `Status::UnexpectedEmpty` になることを確認する。
+#[test]
+fn core_1_expected_non_empty_rejects_whitespace_only_outcome() {
+    let blank_values = Outcome::Values(vec!["".to_string(), "   ".to_string()]);
+    assert_eq!(
+        judge(&blank_values, Expected::NonEmpty),
+        Status::UnexpectedEmpty
+    );
+
+    let empty_pairs: Outcome = Outcome::Pairs(Vec::new());
+    assert_eq!(
+        judge(&empty_pairs, Expected::NonEmpty),
+        Status::UnexpectedEmpty
+    );
+}
+
+/// CORE-1・TASK-26（26.1）・PR #458 レビュー指摘（P1・Bugbot）の回帰:
+/// `Pairs`（`Form` タスク）で value の非空を要求すると、実サイトのログイン
+/// フォームに典型的な「name はあるが value が空のデフォルト値を持つ
+/// named field」の抽出成功が `Status::UnexpectedEmpty` に誤判定され、
+/// CORE-1 の抽出成功率を過小評価してしまう。`collect_form_values` は
+/// name が空の要素を除外して pair を積むため、`Pairs` に要素が
+/// 1 件以上あること自体が意味のある抽出成功を表すことを確認する。
+#[test]
+fn core_1_expected_non_empty_accepts_empty_value_named_form_field() {
+    let empty_value_pairs = Outcome::Pairs(vec![("username".to_string(), String::new())]);
+    assert_eq!(judge(&empty_value_pairs, Expected::NonEmpty), Status::Ok);
+
+    let blank_value_pairs = Outcome::Pairs(vec![("username".to_string(), "  ".to_string())]);
+    assert_eq!(judge(&blank_value_pairs, Expected::NonEmpty), Status::Ok);
+
+    let meaningful_pairs = Outcome::Pairs(vec![
+        ("username".to_string(), String::new()),
+        ("email".to_string(), "a@example.com".to_string()),
+    ]);
+    assert_eq!(judge(&meaningful_pairs, Expected::NonEmpty), Status::Ok);
+}
+
+/// CORE-1・TASK-26（26.1）: `Category::label`/`Status::label`（CLI 出力の
+/// 整形。`main.rs` の `local`/`real` 両モードが使う）と、実サイトモード限定の
+/// `Status::Http`/`Status::FetchError` variant を検証する。`tasks.rs` は
+/// example とテストの両方でコンパイルされるため、どちらか一方でしか使わない
+/// 項目があると `clippy --all-targets -D warnings` が dead code として
+/// 検出する。ここで検証することで、`main.rs` 専用の項目もテスト対象に含める。
+#[test]
+fn core_1_category_and_status_labels_format_for_cli_output() {
+    assert_eq!(Category::Static.label(), "static");
+    assert_eq!(Category::SsrSpaStatic.label(), "ssr_spa_static");
+    assert_eq!(Category::Excluded.label(), "excluded");
+
+    assert_eq!(Status::Ok.label(), "ok");
+    assert_eq!(Status::Mismatch.label(), "mismatch");
+    assert_eq!(Status::ExpectedEmpty.label(), "expected-empty");
+    assert_eq!(Status::UnexpectedEmpty.label(), "unexpected-empty");
+    assert_eq!(Status::SelectorUnsupported.label(), "selector-unsupported");
+    assert_eq!(Status::ParseError.label(), "parse-error");
+    // 以下 2 variant は `main.rs` の実サイトモード（`fetch_and_run`）専用。
+    assert_eq!(Status::Http(404).label(), "http-404");
+    assert_eq!(
+        Status::FetchError("request-failed").label(),
+        "fetch-error:request-failed"
+    );
+    assert!(!Status::Http(404).is_reachable());
+    assert!(!Status::FetchError("request-failed").is_reachable());
+}
+
+/// CORE-1・TASK-26（26.1）: `ParseError`/`QueryError` は HTML の取得自体には
+/// 成功しているため `is_reachable` は true とし、成功率の分母（reachable）に
+/// 含めたうえで失敗として計上する（PR #458 レビュー指摘。取得失敗
+/// （`Http`/`FetchError`）と同様に分母から除外すると、core 自体のパース・
+/// 照合失敗が CORE-1 の失敗件数から漏れ、成功率を過大評価してしまう）。
+#[test]
+fn core_1_parse_and_query_error_count_as_reachable_failures() {
+    assert!(Status::ParseError.is_reachable());
+    assert!(Status::QueryError.is_reachable());
+    assert!(!Status::ParseError.is_success());
+    assert!(!Status::QueryError.is_success());
+
+    let results = vec![
+        tasks::TaskResult {
+            id: "T-OK",
+            category: Category::Static,
+            kind: TaskKind::Texts,
+            status: Status::Ok,
+            sample: String::new(),
+        },
+        tasks::TaskResult {
+            id: "T-PARSE-ERROR",
+            category: Category::Static,
+            kind: TaskKind::Texts,
+            status: Status::ParseError,
+            sample: String::new(),
+        },
+        tasks::TaskResult {
+            id: "T-QUERY-ERROR",
+            category: Category::Static,
+            kind: TaskKind::Texts,
+            status: Status::QueryError,
+            sample: String::new(),
+        },
+    ];
+    let (static_summary, _ssr_spa_summary) = tasks::summarize(&results);
+    // 3 件とも試行（attempted）・分母（reachable）に含まれ、成功
+    // （success）は Ok の 1 件のみ。分母を 1（Ok のみ）にしてしまうと
+    // 成功率が 100% になり、パース・照合失敗を見逃す。
+    assert_eq!(static_summary.attempted, 3);
+    assert_eq!(static_summary.reachable, 3);
+    assert_eq!(static_summary.success, 1);
+    assert!((static_summary.rate() - (1.0 / 3.0)).abs() < f64::EPSILON);
+}
+
+/// CORE-1・TASK-26（26.1）: `run_local` が返す [`tasks::TaskResult`] の
+/// `id`/`kind`/`sample` フィールド（CLI の出力行が使う）を検証する。
+#[test]
+fn core_1_local_task_result_exposes_id_kind_and_sample() {
+    let results = tasks::run_local();
+    let s01 = results
+        .iter()
+        .find(|r| r.id == "S01")
+        .expect("S01 は run_local の結果に含まれるはず");
+    assert_eq!(s01.kind, TaskKind::Texts);
+    assert_eq!(s01.status, Status::Ok);
+    assert_eq!(s01.sample, "Rust の非同期ランタイム入門 | 相田 藍子");
+}
