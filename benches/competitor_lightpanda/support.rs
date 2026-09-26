@@ -12,6 +12,14 @@
 //! テストから到達させる必要がある（到達しない関数・フィールドは dead_code エラーに
 //! なる。unused であっても `pub` は免除されない）。
 //!
+//! 例外的に [`DeadlineReader`] だけは実ソケット I/O を行う（`TcpStream` を
+//! 包む）。外部プロセス（対象バイナリ）を起動せずローカルの loopback
+//! ソケットだけで動作を検証できるため、単体テスト（slow-loris 相手の
+//! 全体期限打ち切り等）もこのファイルに置く（レビュー指摘。コーディネーター
+//! 指示。PR #442 再々々々々々レビュー: fixture サーバー・readiness probe の
+//! 両方で場当たり的に `set_read_timeout` を設定するのではなく、共通の
+//! プリミティブへ統一する）。
+//!
 //! `AISNAP-1`（MCP トークン削減率）計測は、任意の外部 URL
 //! （`COMPETITOR_BENCH_SITES`）ではなく、リポジトリに同梱した静的 fixture
 //! （外部参照を含まない自作コンテンツ。[`FIXTURE_TABLE`]）だけを対象にする
@@ -30,7 +38,10 @@
 //! （security.md「SSRF」）。
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
+use std::time::Instant;
 
 // `reqwest`（`fandhe-browser-core` の既存依存。ホストする crate の
 // `Cargo.toml` 参照）は `url::Url` を `reqwest::Url` として re-export している。
@@ -495,6 +506,75 @@ pub fn http_status_for_io_error(kind: std::io::ErrorKind) -> (u16, &'static str)
     match kind {
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => (408, "Request Timeout"),
         _ => (400, "Bad Request"),
+    }
+}
+
+/// `TcpStream` を包み、`read`/`write` のたびに残り時間を
+/// `set_read_timeout`/`set_write_timeout` へ反映することで、個々の
+/// 呼び出しではなく「この接続・この probe」全体に対する絶対期限
+/// （`Instant`）を守らせる `Read`/`Write` 実装。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々々々々レビュー・
+/// competitor_lightpanda.rs:364/682/711）: `set_read_timeout` は 1 回の
+/// `read` 呼び出しにしか効かない。相手が 1 バイトずつ小分けに送り続ける
+/// （slow-loris 型）と、個々の `read` は毎回タイムアウト内に完了して
+/// しまうため、`BufRead::read_line` 相当の呼び出し全体としては無期限に
+/// 時間を消費し得た。fixture サーバーの接続 1 本・readiness probe の
+/// 1 回それぞれで場当たり的にタイムアウトを設定し直すのではなく、この
+/// 1 つのプリミティブに統一する（`competitor_lightpanda.rs` の
+/// `handle_fixture_connection`・`probe_once` の両方がこれ経由でのみ
+/// ソケットを読み書きする）。`read`/`write` のたびに
+/// `deadline.saturating_duration_since(Instant::now())` を計算し、
+/// 残りが 0 なら実際には OS の `read`/`write` を呼ばず
+/// `ErrorKind::TimedOut` を返す。`write_all`（`Write` トレイトの
+/// デフォルト実装が `write` を繰り返し呼ぶ）もこの仕組みに自動的に
+/// 従うため、書き込み側も同じプリミティブで期限を守る（レビュー指摘:
+/// 「書き込み側も同様に確認し、必要なら `set_write_timeout` とあわせて
+/// 期限を守らせる」）。
+///
+/// この型だけは実ソケット I/O を行う（モジュールドキュメント参照）。
+/// 外部プロセスを起動せずローカルの loopback ソケットだけで
+/// 動作を検証できるため、単体テストもこのファイルに置く。
+pub struct DeadlineReader {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl DeadlineReader {
+    pub fn new(stream: TcpStream, deadline: Instant) -> Self {
+        Self { stream, deadline }
+    }
+}
+
+impl Read for DeadlineReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "deadline exceeded while reading",
+            ));
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buf)
+    }
+}
+
+impl Write for DeadlineReader {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "deadline exceeded while writing",
+            ));
+        }
+        self.stream.set_write_timeout(Some(remaining))?;
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
     }
 }
 
@@ -1009,6 +1089,8 @@ mod tests {
     // （`[[test]]` ターゲット（`cargo test`）としての単独ビルドでは実際に使われる）。
     #[allow(unused_imports)]
     use super::*;
+    #[allow(unused_imports)]
+    use std::time::Duration;
 
     // PERF-3・PERF-6: median は cold start / RSS の複数試行から代表値を出す。
     #[test]
@@ -1761,5 +1843,102 @@ mod tests {
         )
         .expect("valid json");
         assert_eq!(validate_mcp_response(&value, 1.0, "tools/call"), Ok(()));
+    }
+
+    // レビュー指摘 P1（Codex。PR #442 再々々々々々レビュー・
+    // competitor_lightpanda.rs:364/682/711）: `set_read_timeout` は 1 回の
+    // `read` にしか効かないため、1 バイトずつ送る相手（slow-loris）は
+    // 個々の `read` を毎回タイムアウト直前に完了させることで、呼び出し
+    // 全体を無期限に専有し得た。`DeadlineReader` が接続全体の絶対期限で
+    // 打ち切ることを、実際の loopback ソケットで確認する。
+    #[test]
+    fn deadline_reader_cuts_off_slow_loris_sender() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            // 1 バイトずつ、`DeadlineReader` の期限より長い間隔で送り続ける
+            // （slow-loris）。テスト側の `DeadlineReader` が期限で打ち切る
+            // ことを検証するため、送信側は本テストの期限（200ms）よりも
+            // 十分長く粘る。
+            for _ in 0..50 {
+                if socket.write_all(b"A").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+
+        let stream = TcpStream::connect(addr).expect("connect");
+        let deadline_duration = Duration::from_millis(200);
+        let deadline = Instant::now() + deadline_duration;
+        let mut reader = DeadlineReader::new(stream, deadline);
+
+        let start = Instant::now();
+        let mut buf = [0u8; 4096];
+        // 個々の `read` は（`DeadlineReader` により毎回残り時間へ短縮
+        // されるとはいえ）データが来れば成功し得るため、`TimedOut` に
+        // 達するまでループする。
+        let last_result = loop {
+            match reader.read(&mut buf) {
+                Ok(n) => {
+                    let _ = n;
+                    continue;
+                }
+                Err(e) => break e.kind(),
+            }
+        };
+        let elapsed = start.elapsed();
+
+        assert_eq!(last_result, std::io::ErrorKind::TimedOut);
+        // 送信側は 50 回 × 50ms = 2.5 秒粘るが、`DeadlineReader` は
+        // 接続全体の期限（200ms）で打ち切るため、実測時間がそれを大幅に
+        // 超えないことを確認する（多少のオーバーヘッドは許容する）。
+        assert!(
+            elapsed < deadline_duration * 5,
+            "DeadlineReader should cut off around the deadline, took {elapsed:?}"
+        );
+
+        // ソケットを閉じてから送信側スレッドの終了を待つ。閉じないと
+        // 送信側は（誰も読んでいなくても）OS の送信バッファへ書き込み
+        // 続けてしまい、全 50 回分（2.5 秒）の `sleep` を律儀に消化して
+        // からでないと `join` が返らず、テストが不必要に長くなる。
+        drop(reader);
+        let _ = handle.join();
+    }
+
+    // レビュー指摘 P1（Codex。PR #442 再々々々々々レビュー・
+    // competitor_lightpanda.rs:711）: 宣言された長さに届く前に応答が
+    // 途中で切れた場合、それまでに読めた断片を成功として扱ってはいけない。
+    // `probe_once`（competitor_lightpanda.rs）はこの検証を
+    // `Read::read_exact` に委ねているため、ここでは `DeadlineReader` 越しの
+    // `read_exact` が早期 EOF を確実に `Err` にすることを確認する。
+    #[test]
+    fn deadline_reader_read_exact_fails_on_truncated_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            // 宣言された長さ（10 バイト）より短い 3 バイトだけ送って閉じる。
+            let _ = socket.write_all(b"abc");
+            drop(socket);
+        });
+
+        let stream = TcpStream::connect(addr).expect("connect");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut reader = DeadlineReader::new(stream, deadline);
+
+        let mut buf = [0u8; 10];
+        let result = reader.read_exact(&mut buf);
+        assert!(
+            result.is_err(),
+            "truncated body must not be treated as a complete read"
+        );
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+
+        let _ = handle.join();
     }
 }

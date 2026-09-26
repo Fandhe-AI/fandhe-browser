@@ -73,10 +73,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use support::{
-    JsonValue, Outcome, approx_tokens, arg_error_gate, bench_exit_code, expand_args,
-    http_status_for_io_error, json_escape, looks_like_browser_readiness_response, lookup_fixture,
-    median, parse_http_request_line, parse_http_status, parse_json, reduction_pct, require_bin,
-    split_args, token_reduction_gate, validate_local_bench_url, validate_mcp_response,
+    DeadlineReader, JsonValue, Outcome, approx_tokens, arg_error_gate, bench_exit_code,
+    expand_args, http_status_for_io_error, json_escape, looks_like_browser_readiness_response,
+    lookup_fixture, median, parse_http_request_line, parse_http_status, parse_json, reduction_pct,
+    require_bin, split_args, token_reduction_gate, validate_local_bench_url, validate_mcp_response,
 };
 // `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
 // 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
@@ -324,9 +324,9 @@ fn read_complete_line<R: BufRead>(reader: &mut R, out: &mut String) -> std::io::
 /// `handle_fixture_connection` から、読み取りエラーを
 /// `support::http_status_for_io_error` で分類して応答し接続を終える
 /// ための小さなヘルパー。
-fn respond_with_io_error(stream: &mut TcpStream, err: &std::io::Error) {
+fn respond_with_io_error(writer: &mut DeadlineReader, err: &std::io::Error) {
     let (status, reason) = http_status_for_io_error(err.kind());
-    let _ = write_fixture_response(stream, status, reason, PLAIN_TEXT, b"", true);
+    let _ = write_fixture_response(writer, status, reason, PLAIN_TEXT, b"", true);
 }
 
 /// fixture サーバーへの 1 接続を処理する。
@@ -353,7 +353,7 @@ fn respond_with_io_error(stream: &mut TcpStream, err: &std::io::Error) {
 /// ループを抜けるだけで後続の 200 応答へ進み得た。読み取りが完了しなかった
 /// 経路はすべて [`respond_with_io_error`] で 400/408 を返してから接続を
 /// 終了する。
-fn handle_fixture_connection(mut stream: TcpStream) {
+fn handle_fixture_connection(stream: TcpStream) {
     // レビュー指摘（advisor。PR #442 再レビュー後の追加指摘）: macOS（XNU）・
     // Windows（Winsock）では accept したソケットが listener のノンブロッキング
     // 状態を継承する（Linux の accept4 は継承しない）。継承されたままだと
@@ -361,21 +361,33 @@ fn handle_fixture_connection(mut stream: TcpStream) {
     // 返し、リクエスト到着前に 400 を返してしまう。ブロッキングへ明示的に
     // 戻すことで 3 OS で同じ挙動にする（coding-rust.md「クロスプラットフォーム」）。
     let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(FIXTURE_IO_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(FIXTURE_IO_TIMEOUT));
 
-    let mut reader = BufReader::new(match stream.try_clone() {
+    // レビュー指摘 P1（Codex。PR #442 再々々々々々レビュー・
+    // competitor_lightpanda.rs:364）: 接続 1 本ごとの絶対期限を
+    // [`DeadlineReader`]（読み取り・書き込みの両方をこの 1 つのプリミティブ
+    // 経由でのみ行う）へ通し、1 バイトずつ送る相手（slow-loris）でも
+    // 接続全体の処理が `FIXTURE_IO_TIMEOUT` を超えないようにする。
+    let deadline = Instant::now() + FIXTURE_IO_TIMEOUT;
+
+    // 読み取り用（`BufReader` で包む）と書き込み用で、同じソケットの
+    // 別ハンドル（`try_clone`）をそれぞれ独立した `DeadlineReader` として
+    // 使う（`BufReader` に包むと内部の型へ書き込み目的で直接アクセスできない
+    // ため）。どちらも同じ `deadline`（`Instant`。`Copy`）を共有する。
+    let read_half = match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
-    });
+    };
+    let mut reader = BufReader::new(DeadlineReader::new(read_half, deadline));
+    let mut writer = DeadlineReader::new(stream, deadline);
+
     let mut line = String::new();
     if let Err(e) = read_complete_line(&mut reader, &mut line) {
-        respond_with_io_error(&mut stream, &e);
+        respond_with_io_error(&mut writer, &e);
         return;
     }
 
     let Some((method, path)) = parse_http_request_line(&line) else {
-        let _ = write_fixture_response(&mut stream, 400, "Bad Request", PLAIN_TEXT, b"", true);
+        let _ = write_fixture_response(&mut writer, 400, "Bad Request", PLAIN_TEXT, b"", true);
         return;
     };
     // レビュー指摘（コーディネーター指示。PR #442 再々々々レビュー）:
@@ -386,7 +398,7 @@ fn handle_fixture_connection(mut stream: TcpStream) {
     let is_head = method == "HEAD";
     if method != "GET" && !is_head {
         let _ = write_fixture_response(
-            &mut stream,
+            &mut writer,
             405,
             "Method Not Allowed",
             PLAIN_TEXT,
@@ -408,7 +420,7 @@ fn handle_fixture_connection(mut stream: TcpStream) {
     let mut header_lines_seen = 0u32;
     loop {
         if header_lines_seen >= FIXTURE_MAX_HEADER_LINES {
-            let _ = write_fixture_response(&mut stream, 400, "Bad Request", PLAIN_TEXT, b"", true);
+            let _ = write_fixture_response(&mut writer, 400, "Bad Request", PLAIN_TEXT, b"", true);
             return;
         }
         header_lines_seen += 1;
@@ -417,7 +429,7 @@ fn handle_fixture_connection(mut stream: TcpStream) {
             Ok(()) if header_line == "\r\n" || header_line == "\n" => break,
             Ok(()) => continue,
             Err(e) => {
-                respond_with_io_error(&mut stream, &e);
+                respond_with_io_error(&mut writer, &e);
                 return;
             }
         }
@@ -426,7 +438,7 @@ fn handle_fixture_connection(mut stream: TcpStream) {
     match lookup_fixture(&path) {
         Some((content_type, content)) => {
             let _ = write_fixture_response(
-                &mut stream,
+                &mut writer,
                 200,
                 "OK",
                 content_type,
@@ -435,7 +447,7 @@ fn handle_fixture_connection(mut stream: TcpStream) {
             );
         }
         None => {
-            let _ = write_fixture_response(&mut stream, 404, "Not Found", PLAIN_TEXT, b"", true);
+            let _ = write_fixture_response(&mut writer, 404, "Not Found", PLAIN_TEXT, b"", true);
         }
     }
 }
@@ -450,9 +462,11 @@ const PLAIN_TEXT: &str = "text/plain; charset=utf-8";
 ///
 /// `write_body` が `false`（`HEAD` リクエストへの応答）でも
 /// `Content-Length` は `body.len()`（`GET` したときの実際の長さ）にする
-/// （HTTP のセマンティクス）。
+/// （HTTP のセマンティクス）。`writer`（[`DeadlineReader`]）経由でのみ
+/// 書き込むことで、接続の絶対期限を守る（レビュー指摘 P1。Codex。
+/// PR #442 再々々々々々レビュー・competitor_lightpanda.rs:364）。
 fn write_fixture_response(
-    stream: &mut TcpStream,
+    writer: &mut DeadlineReader,
     status: u16,
     reason: &str,
     content_type: &str,
@@ -463,11 +477,11 @@ fn write_fixture_response(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(header.as_bytes())?;
+    writer.write_all(header.as_bytes())?;
     if write_body {
-        stream.write_all(body)?;
+        writer.write_all(body)?;
     }
-    stream.flush()
+    writer.flush()
 }
 
 /// 起動する `Command` に「新しいプロセスグループ」を設定する。
@@ -624,7 +638,7 @@ fn spawn_and_wait_ready(
             Ok(None) => {}
             Err(e) => return Err(format!("try_wait failed: {e}")),
         }
-        match probe_once(port, &request) {
+        match probe_once(port, &request, deadline) {
             Some((status, body))
                 if (200..300).contains(&status) && looks_like_browser_readiness_response(&body) =>
             {
@@ -640,26 +654,50 @@ fn spawn_and_wait_ready(
 /// 上限（coding-rust.md「長さ・件数を上限検証」）。
 const PROBE_BODY_MAX_BYTES: usize = 64 * 1024;
 
+/// readiness probe 1 回あたりに許す時間。`outer_deadline`（呼び出し元の
+/// readiness 全体の期限）の残り時間がこれより短ければ、そちらを優先する
+/// （レビュー指摘: 「probe の期限は外側の readiness 期限の残り時間を
+/// 超えないようにする」）。
+const PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// readiness probe を 1 回だけ試す。ステータス行と本文を返す。接続失敗・
-/// 応答不正（不正な UTF-8 を含む）はいずれも `None`（呼び出し側がポーリングを
-/// 継続する。panic させない）。
+/// 応答不正（不正な UTF-8 を含む）・タイムアウトはいずれも `None`
+/// （呼び出し側がポーリングを継続する。panic させない）。
 ///
 /// レビュー指摘 Medium（Cursor。PR #442 再々々々々レビュー・
 /// competitor_lightpanda.rs:486-535）: 以前はステータス行のみを見ており、
 /// ポート再利用で別プロセスが応答してもステータスが 2xx なら readiness と
 /// 誤認し得た。本文まで読み、呼び出し元が
 /// [`looks_like_browser_readiness_response`] で検証できるようにする。
-fn probe_once(port: u16, request: &str) -> Option<(u16, String)> {
-    let mut stream = TcpStream::connect_timeout(
-        &format!("127.0.0.1:{port}").parse().ok()?,
-        Duration::from_millis(200),
-    )
-    .ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .ok()?;
-    stream.write_all(request.as_bytes()).ok()?;
-    let mut reader = BufReader::new(stream);
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々々々々レビュー・
+/// competitor_lightpanda.rs:682/711）: この probe 1 回の読み取りは
+/// [`DeadlineReader`] を通し、`outer_deadline` を超えない絶対期限
+/// （`PROBE_ATTEMPT_TIMEOUT` とどちらか短い方）で統一的に区切る。
+/// `Content-Length` 分を読み切る前に EOF・エラー（タイムアウトを含む）が
+/// 起きた場合は、読めた断片を [`looks_like_browser_readiness_response`]
+/// に渡さず probe 失敗（`None`）として扱う（以前は `break` して部分的な
+/// 本文をそのまま検証に回していた）。`Content-Length` が無い場合も、
+/// 読み取りエラー（タイムアウトを含む）は失敗として扱い、正常な EOF
+/// （`Ok(0)`）だけを本文終端とみなす。
+fn probe_once(port: u16, request: &str, outer_deadline: Instant) -> Option<(u16, String)> {
+    let probe_timeout =
+        PROBE_ATTEMPT_TIMEOUT.min(outer_deadline.saturating_duration_since(Instant::now()));
+    if probe_timeout.is_zero() {
+        return None;
+    }
+    let deadline = Instant::now() + probe_timeout;
+
+    let stream =
+        TcpStream::connect_timeout(&format!("127.0.0.1:{port}").parse().ok()?, probe_timeout)
+            .ok()?;
+    let mut deadline_stream = DeadlineReader::new(stream, deadline);
+    // 書き込み・読み取りの両方を同じ `DeadlineReader`（`Read`・`Write` の
+    // 両方を実装する）経由で行う。書き込み後、そのまま `BufReader` に
+    // 包んで読み取りへ移る（`BufReader` はどんな `Read` 実装も受け付ける
+    // ため、内部の `TcpStream` を取り出し直す必要が無い）。
+    deadline_stream.write_all(request.as_bytes()).ok()?;
+    let mut reader = BufReader::new(deadline_stream);
     let mut status_line = String::new();
     read_line_bounded(&mut reader, &mut status_line).ok()?;
     let status = parse_http_status(&status_line)?;
@@ -695,29 +733,35 @@ fn probe_once(port: u16, request: &str) -> Option<(u16, String)> {
     // `Content-Length` を無視して常に EOF まで（＝読み取りタイムアウトまで）
     // 読んでいたため、相手が `Connection: close` を要求されても接続を
     // 保持し続ける HTTP/1.1 実装だと、毎回の readiness probe に
-    // タイムアウト分（200ms）の遅延が系統的に乗り、cold start（`PERF-3`）の
+    // タイムアウト分の遅延が系統的に乗り、cold start（`PERF-3`）の
     // 計測値を実態より水増しし得た。`Content-Length` が分かればちょうど
     // その長さだけ読み、無ければ（ヘッダに含まれない応答向けの
     // フォールバックとして）以前と同じ EOF までの読み取りに戻す。
+    //
+    // レビュー指摘 P1（Codex。PR #442 再々々々々々レビュー・
+    // competitor_lightpanda.rs:711）: `Content-Length` 分を読み切る前に
+    // EOF・エラーが起きた場合は `break` で打ち切って部分的な本文を
+    // そのまま使っていた（本文が途中で切れた応答を成功として扱い得た）。
+    // ここではどちらも probe 失敗（`None`）にする。
     let mut body = Vec::new();
     match content_length {
         Some(len) => {
+            // `Read::read_exact` は指定したバッファをちょうど埋め切る前に
+            // EOF に達すると `ErrorKind::UnexpectedEof` を返す（部分的に
+            // 読めた分をそのまま `Ok` として返すことはない）ため、宣言された
+            // `Content-Length` に届く前に応答が途中で切れたケースを
+            // 取りこぼさず失敗にできる。読み取りエラー（`DeadlineReader`
+            // 経由のタイムアウトを含む）も同様に `Err` になる。
             let to_read = len.min(PROBE_BODY_MAX_BYTES);
             let mut buf = vec![0u8; to_read];
-            let mut read_total = 0usize;
-            while read_total < to_read {
-                match reader.read(&mut buf[read_total..]) {
-                    Ok(0) => break,
-                    Ok(n) => read_total += n,
-                    Err(_) => break,
-                }
-            }
-            body.extend_from_slice(&buf[..read_total]);
+            reader.read_exact(&mut buf).ok()?;
+            body = buf;
         }
         None => {
             let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
+                    // 正常な EOF（`Ok(0)`）だけを本文終端とみなす。
                     Ok(0) => break,
                     Ok(n) => {
                         body.extend_from_slice(&buf[..n]);
@@ -725,7 +769,10 @@ fn probe_once(port: u16, request: &str) -> Option<(u16, String)> {
                             break;
                         }
                     }
-                    Err(_) => break,
+                    // タイムアウトを含む読み取りエラーは失敗として扱う
+                    // （以前は `break` して、それまでに読めた断片を
+                    // そのまま使っていた）。
+                    Err(_) => return None,
                 }
             }
         }
