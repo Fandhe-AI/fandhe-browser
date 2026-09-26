@@ -55,18 +55,23 @@ CLI の出力（タブ区切り: `id / category / kind / status / sample`）に�
 | `expected-empty` | 結果が期待どおり空だった（対象外タスクの記録用。分母に含めない） |
 | `unexpected-empty` | 非空を期待したが空だった（`real` モード用） |
 | `selector-unsupported` | セレクタが本 crate の対応サブセット外（harness 側の定義ミス。CORE-1 の抽出失敗とは区別する） |
-| `http-<code>` | 取得先が 2xx 以外を返した（`real` モード用。分母から除く） |
+| `http-<code>` | 取得先が 2xx 以外を返した（`real` モード用。取得自体に失敗しており分母から除く） |
 | `fetch-error:<種別>` | 取得自体に失敗した（`real` モード用。分母から除く。`<種別>`: `timeout` / `too-many-redirects` / `response-too-large` / `disallowed-scheme` / `disallowed-address` / `too-many-dns-resolutions` / `network` / `other`） |
-| `parse-error` | HTML のパースに失敗した（`real` モード用。分母から除く） |
-| `query-error` | セレクタは解析できたが照合中に内部エラーが発生した（例: `MatchCacheLimitExceeded`。`selector-unsupported` とは区別する。分母から除く） |
+| `parse-error` | HTML のパースに失敗した（`real` モード用。core crate 自体の不具合のため CORE-1 の失敗として分母に含める） |
+| `query-error` | セレクタは解析できたが照合中に内部エラーが発生した（例: `MatchCacheLimitExceeded`。`selector-unsupported` とは区別する。core crate 自体の不具合のため CORE-1 の失敗として分母に含める） |
 
 ## 分母の違い（attempted / reachable）
 
-`attempted` はタスクの試行数、`reachable` は取得・パースに成功して比較まで
-たどり着けた数。`real` モードで HTTP エラー・fetch エラー・パースエラーに
-なったタスクは `attempted` には数えるが `reachable`・成功率の分母には含めない
-（そもそも比較できなかったため）。`local` モードはネットワークを使わないため
-`attempted == reachable` になる。
+`attempted` はタスクの試行数、`reachable` は HTML の取得に成功して比較まで
+たどり着けた数（`Status::is_reachable`）。`real` モードで HTTP エラー・
+fetch エラーになったタスクはそもそも比較できなかったため `attempted` には
+数えるが `reachable`・成功率の分母には含めない。一方、HTML の取得自体には
+成功した `parse-error`（core のパース失敗）・`query-error`（core の照合
+失敗）は core crate 自体の不具合であり CORE-1 の失敗として扱う必要がある
+ため `reachable` の分母に含めたうえで失敗として計上する（取得失敗と同様に
+除外すると、パース・照合の失敗が分母から抜け落ち、成功率を過大評価して
+しまう）。`local` モードはネットワークを使わないため `attempted == reachable`
+になる。
 
 `excluded`（`Category::Excluded`。CSR シェル `ssr_spa_static/06-csr-shell.html`）
 は類型別の成功率の分母に一切含めず、出力の最後に別行で件数のみ表示する
