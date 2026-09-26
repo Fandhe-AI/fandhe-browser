@@ -19,7 +19,8 @@
 //! `TreeSink` を自作実装し、HTML 文字列・バイト列から `dom::Document`（arena）を
 //! 構築する本実装を持つ。`dom`（TASK-24.5・#39）は arena の型定義
 //! （[`dom::Document`]・[`dom::Node`] 等）のみを持ち、走査 API はまだ実装していない
-//! （REPAIR-3: 実装済みを装わない）。`query` は TASK-24.7（#41）で本実装を行う。
+//! （REPAIR-3: 実装済みを装わない）。`selector`（TASK-24.7・#41）は CSS セレクタの
+//! サブセットをパースする本実装を持つ。`query` は TASK-24.10（#418）で本実装を行う。
 //! JS 実行スタブとの境界は TASK-24（24.9・Issue #43）で `js_stub` モジュールとして
 //! 追加した。関数本体（[`js_stub::execute_js_stub`]）は常にエラーを返すスタブであり、
 //! TASK-30（Issue #143・ビヘイビア `JS-2`）で `fandhe-browser-js` の実装へ置換される。
@@ -36,6 +37,7 @@ pub mod js_stub;
 pub mod parse;
 pub mod query;
 pub mod render;
+pub mod selector;
 
 pub use error::{Error, ParseError, Result};
 pub use fetch::{FetchOptions, FetchResponse, Fetcher};

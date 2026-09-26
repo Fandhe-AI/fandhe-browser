@@ -3,4 +3,5 @@
 //! `dom` モジュールの走査 API を使って要素を検索し、`cdp`（`DOM.querySelector`
 //! 等）や `ai`（簡約 DOM 抽出）から呼ばれる想定（TASK-24（24.1）・ビヘイビア
 //! `CORE-1`）。本 PR ではモジュールを公開するのみで型・関数は未実装
-//! （REPAIR-3: 実装済みを装わない）。本実装は TASK-24.7（Issue #41）で行う。
+//! （REPAIR-3: 実装済みを装わない）。本実装は TASK-24.10（Issue #418）で行い、
+//! `selector::SelectorList`（TASK-24.7・#41 で解析した AST）を入力に使う。

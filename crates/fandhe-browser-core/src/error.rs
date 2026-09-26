@@ -1,13 +1,15 @@
 //! `fandhe-browser-core` 全体で共有するエラー型。
 //!
 //! `fetch`（TASK-24.2・#36）・`parse`（TASK-24.4・#38）・`dom`（TASK-24.5・#39）・
-//! `query`（TASK-24.7・#41）の各モジュールは、本モジュールが定義する [`Error`] /
-//! [`Result`] を戻り値の共通土台として使う想定（TASK-24（24.1）・ビヘイビア
-//! `CORE-1`）。`unsafe` は使わず、`thiserror`/`anyhow` 等の外部依存も追加しない
-//! （dependency-policy.md の依存最小方針）。`Cargo.toml` の `[dependencies]` には
-//! `parse` が使う `html5ever = "=0.40.1"`（TASK-24.4・#38）と、`fetch` 本実装
-//! （TASK-24.2・#36）に伴う `reqwest`・`rustls`（いずれも Issue #35 で採用
-//! 承認済み）がある。本モジュール（[`Error`] / [`ParseError`]）はそれらの型を
+//! `selector`（TASK-24.7・#41）・`query`（TASK-24.10・#418）の各モジュールは、
+//! 本モジュールが定義する [`Error`] / [`Result`] を戻り値の共通土台として
+//! 使う想定（TASK-24（24.1）・ビヘイビア `CORE-1`）。`unsafe` は使わず、
+//! `thiserror`/`anyhow` 等の外部依存も追加しない（dependency-policy.md の
+//! 依存最小方針）。`Cargo.toml` の `[dependencies]` には `parse` が使う
+//! `html5ever = "=0.40.1"`（TASK-24.4・#38）と、`fetch` 本実装（TASK-24.2・
+//! #36）に伴う `reqwest`・`rustls`（いずれも Issue #35 で採用承認済み）が
+//! あり、`selector`・`query`（TASK-24.7/24.10・#41/#418）は追加依存なしで
+//! 実装する。本モジュール（[`Error`] / [`ParseError`]）はそれらの型を
 //! バリアントの内部表現に漏らさず、汎用的な variant へ写像する（coding-rust.md
 //! 「JS エンジンはトレイト抽象越しに」と同様、外部クレートの具象型を上位 crate へ
 //! 漏らさない方針を fetch/parse のエラー表現にも適用する）。`dom`（TASK-24.5・
@@ -18,10 +20,10 @@
 //! crate から一方向に依存される）や、本 crate 内の各モジュール（`js_stub` を
 //! 含む。TASK-24（24.9）・#43）を想定する。
 //!
-//! バリアントは現時点では汎用的なものに留め、fetch/parse/dom/query の各実装
-//! （#36/#38/#39/#41）が固有のケース（HTTP ステータス・パースエラー位置等）を
-//! 追加できるよう `#[non_exhaustive]` にしてある（REPAIR-4: 戻り値は将来拡張
-//! できる構造にする）。
+//! バリアントは現時点では汎用的なものに留め、fetch/parse/dom/selector/query
+//! の各実装（#36/#38/#39/#41/#418）が固有のケース（HTTP ステータス・パース
+//! エラー位置等）を追加できるよう `#[non_exhaustive]` にしてある
+//! （REPAIR-4: 戻り値は将来拡張できる構造にする）。
 
 use std::fmt;
 use std::time::Duration;
