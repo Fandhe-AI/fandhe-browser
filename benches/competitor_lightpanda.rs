@@ -63,20 +63,20 @@
 #[path = "competitor_lightpanda/support.rs"]
 mod support;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use support::{
     JsonValue, Outcome, approx_tokens, arg_error_gate, bench_exit_code, expand_args,
-    http_status_for_io_error, json_escape, lookup_fixture, median, parse_http_request_line,
-    parse_http_status, parse_json, reduction_pct, require_bin, split_args, token_reduction_gate,
-    validate_local_bench_url, validate_mcp_response,
+    http_status_for_io_error, json_escape, looks_like_browser_readiness_response, lookup_fixture,
+    median, parse_http_request_line, parse_http_status, parse_json, reduction_pct, require_bin,
+    split_args, token_reduction_gate, validate_local_bench_url, validate_mcp_response,
 };
 // `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
 // 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
@@ -470,12 +470,77 @@ fn write_fixture_response(
     stream.flush()
 }
 
+/// 起動する `Command` に「新しいプロセスグループ」を設定する。
+///
+/// レビュー指摘 P1（Codex。PR #442 再々々々々レビュー・
+/// competitor_lightpanda.rs:827）: 対象プロセス（ブラウザ）が起動した
+/// 子孫プロセスが stdin パイプの読み取り側を継承していると、直接の子だけを
+/// `kill` してもパイプが閉じずベンチ全体が止まり得る。プロセスグループ
+/// 単位で起動しておき、タイムアウト時に [`kill_process_group`] でグループ
+/// ごと終了させることで、子孫がパイプを保持し続ける経路を塞ぐ（#435 と
+/// 同じ方針）。unix は `process_group(0)`（`setpgid(0,0)` 相当。std 1.64 で
+/// 安定化。子プロセス自身を新しいプロセスグループのリーダーにする。
+/// これによりプロセスグループ ID は子プロセスの PID と一致する）、
+/// Windows は `CREATE_NEW_PROCESS_GROUP` を使う。いずれも `unsafe`・新規
+/// 依存なしで `std::os::{unix,windows}::process::CommandExt` の安定 API
+/// だけで実装する。
+#[cfg(unix)]
+fn apply_new_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn apply_new_process_group(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    // Win32 `CREATE_NEW_PROCESS_GROUP`（0x00000200）。`windows-sys` 等の
+    // FFI 依存を新規に増やさないため、広く安定した定数値を直接埋め込む。
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
+/// `pid` が属するプロセスグループ全体を強制終了する。
+///
+/// [`apply_new_process_group`] で子プロセス自身をグループリーダーにして
+/// いるため（unix はグループ ID が `pid` と一致する）、グループへ
+/// シグナルを送れば子孫プロセスも含めて終了できる。ただし std には
+/// unix の `killpg`・Windows のプロセスツリー終了に相当する API が無く、
+/// `unsafe`・新規依存（`libc`/`windows-sys` 等）も使えないため、実際の
+/// 終了は OS 標準の外部コマンド（unix: `kill -KILL -<pid>`、Windows:
+/// `taskkill /T /F`）に委ねる。これらのコマンドが使えない環境では
+/// この関数は何もできず、子孫プロセスがパイプを保持し続ける可能性が
+/// 残る（std のみでの実装の限界。将来 `libc` 等の依存追加が承認されれば
+/// `killpg`/`TerminateJobObject` 直呼びに置き換えられる）。
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-KILL", &format!("-{pid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(windows)]
+fn kill_process_group(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// 子プロセスを確実に終了させる guard。早期 `return`（`?`）経路でも
 /// `Drop` で `kill` + `wait` する（`wait` を省くとゾンビプロセスが残る）。
+/// [`kill_process_group`] も合わせて呼び、子孫プロセスが起動していても
+/// 極力パイプを保持し続けないようにする（レビュー指摘 P1。PR #442
+/// 再々々々々レビュー・competitor_lightpanda.rs:827）。
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
+        kill_process_group(self.0.id());
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -484,6 +549,16 @@ impl Drop for ChildGuard {
 /// 空きポートを 1 つ確保して返す（`127.0.0.1:0` に bind して即座に解放する）。
 /// 固定ポートにすると並列実行される他ベンチ・他 issue の worktree と衝突するため
 /// 使わない。
+///
+/// レビュー指摘 Medium（Cursor。PR #442 再々々々々レビュー・
+/// competitor_lightpanda.rs:486-535）: リスナーを解放してから子プロセスを
+/// 起動するまでの間に別プロセスが同じポートを奪える TOCTOU が残る
+/// （bind して保持したまま子へ引き継ぐには、子プロセス側がソケット
+/// 継承（`SO_REUSEPORT`・fd 引き渡し等）に対応している必要があり、対象は
+/// 任意の外部バイナリのため前提にできない）。この関数自体では対処せず、
+/// 呼び出し元 `spawn_and_wait_ready` 側で「ポートが空いているか」ではなく
+/// 「応答しているのが自分の子プロセスらしいか」を検証する
+/// （[`looks_like_browser_readiness_response`]・`Child::try_wait` 参照）。
 fn reserve_port() -> Result<u16, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind failed: {e}"))?;
     listener
@@ -497,6 +572,17 @@ fn reserve_port() -> Result<u16, String> {
 ///
 /// `PERF-3`（cold start）が使う。相手プロセスをシェル経由で起動しない
 /// （`Command::new` + 分割済み引数。security.md「インジェクション」対策）。
+///
+/// レビュー指摘 Medium（Cursor。PR #442 再々々々々レビュー・
+/// competitor_lightpanda.rs:486-535）: `reserve_port` の TOCTOU により、
+/// 別プロセスが同じポートで先に応答し得る。ここでは (1) 毎回のポーリングで
+/// `Child::try_wait` により子プロセスがまだ生きていることを確認し、
+/// 既に終了していれば別プロセスの応答を拾う前に打ち切る、(2) 応答本文が
+/// ブラウザらしい形（JSON オブジェクト）であることを
+/// [`looks_like_browser_readiness_response`] で確認する、の 2 点を追加した。
+/// 子プロセスが実際にそのポートを bind していることまでは確認できていない
+/// （std だけでは OS 非依存にソケットの所有プロセスを調べる手段が無い。
+/// `looks_like_browser_readiness_response` のドキュメント参照）。
 fn spawn_and_wait_ready(
     bin: &PathBuf,
     args: &[String],
@@ -509,14 +595,16 @@ fn spawn_and_wait_ready(
     // （起点を後ろにずらすと実行ファイルのロード時間が計測から漏れ、
     // cold start が実態より系統的に短く出る）。
     let start = Instant::now();
-    let child = Command::new(bin)
+    let mut command = Command::new(bin);
+    apply_new_process_group(&mut command);
+    let child = command
         .args(&expanded)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("spawn failed: {e}"))?;
-    let guard = ChildGuard(child);
+    let mut guard = ChildGuard(child);
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let request = format!(
@@ -526,8 +614,20 @@ fn spawn_and_wait_ready(
         if Instant::now() >= deadline {
             return Err("timeout waiting for readiness probe".to_string());
         }
+        // レビュー指摘 Medium（Cursor）: 子プロセスが既に終了しているのに
+        // ポートへの応答（＝別プロセスの応答の可能性）だけを見て readiness
+        // と誤認しないよう、まず生存を確認する。
+        match guard.0.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!("child exited before becoming ready: {status}"));
+            }
+            Ok(None) => {}
+            Err(e) => return Err(format!("try_wait failed: {e}")),
+        }
         match probe_once(port, &request) {
-            Some(status) if (200..300).contains(&status) => {
+            Some((status, body))
+                if (200..300).contains(&status) && looks_like_browser_readiness_response(&body) =>
+            {
                 return Ok((guard, port, start.elapsed()));
             }
             _ => std::thread::sleep(Duration::from_millis(2)),
@@ -535,9 +635,21 @@ fn spawn_and_wait_ready(
     }
 }
 
-/// readiness probe を 1 回だけ試す。接続失敗・応答不正はいずれも `None`
-/// （呼び出し側がポーリングを継続する。panic させない）。
-fn probe_once(port: u16, request: &str) -> Option<u16> {
+/// readiness probe の応答本文に許す上限バイト数。相手プロセス（別プロセスの
+/// 誤応答も含む）が不正・大量の応答を返し続けても無制限に確保しないための
+/// 上限（coding-rust.md「長さ・件数を上限検証」）。
+const PROBE_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// readiness probe を 1 回だけ試す。ステータス行と本文を返す。接続失敗・
+/// 応答不正（不正な UTF-8 を含む）はいずれも `None`（呼び出し側がポーリングを
+/// 継続する。panic させない）。
+///
+/// レビュー指摘 Medium（Cursor。PR #442 再々々々々レビュー・
+/// competitor_lightpanda.rs:486-535）: 以前はステータス行のみを見ており、
+/// ポート再利用で別プロセスが応答してもステータスが 2xx なら readiness と
+/// 誤認し得た。本文まで読み、呼び出し元が
+/// [`looks_like_browser_readiness_response`] で検証できるようにする。
+fn probe_once(port: u16, request: &str) -> Option<(u16, String)> {
     let mut stream = TcpStream::connect_timeout(
         &format!("127.0.0.1:{port}").parse().ok()?,
         Duration::from_millis(200),
@@ -548,9 +660,82 @@ fn probe_once(port: u16, request: &str) -> Option<u16> {
         .ok()?;
     stream.write_all(request.as_bytes()).ok()?;
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    read_line_bounded(&mut reader, &mut line).ok()?;
-    parse_http_status(&line)
+    let mut status_line = String::new();
+    read_line_bounded(&mut reader, &mut status_line).ok()?;
+    let status = parse_http_status(&status_line)?;
+    // ヘッダ行を空行（終端）まで読み飛ばし、`Content-Length` があれば覚えて
+    // おく。読み取りが完了しなかった（タイムアウト・接続断・不正な行）
+    // 場合は、本文の検証まで進めないため `None`（呼び出し元はポーリングを
+    // 継続する）。
+    //
+    // レビュー指摘（advisor。PR #442 再々々々々レビュー後の追加指摘）:
+    // 行数に上限が無いと、ポートを奪った別プロセスがヘッダ行を送り続ける
+    // ことで `probe_once` を長時間占有し得る（`fixture_accept_loop` の
+    // `FIXTURE_MAX_HEADER_LINES` と同じ理由）。同じ上限を再利用する。
+    let mut content_length: Option<usize> = None;
+    let mut header_lines_seen = 0u32;
+    loop {
+        if header_lines_seen >= FIXTURE_MAX_HEADER_LINES {
+            return None;
+        }
+        header_lines_seen += 1;
+        let mut header_line = String::new();
+        read_complete_line(&mut reader, &mut header_line).ok()?;
+        if header_line == "\r\n" || header_line == "\n" {
+            break;
+        }
+        if let Some(value) = header_line
+            .to_ascii_lowercase()
+            .strip_prefix("content-length:")
+        {
+            content_length = value.trim().parse::<usize>().ok();
+        }
+    }
+    // レビュー指摘（advisor。PR #442 再々々々々レビュー後の追加指摘）:
+    // `Content-Length` を無視して常に EOF まで（＝読み取りタイムアウトまで）
+    // 読んでいたため、相手が `Connection: close` を要求されても接続を
+    // 保持し続ける HTTP/1.1 実装だと、毎回の readiness probe に
+    // タイムアウト分（200ms）の遅延が系統的に乗り、cold start（`PERF-3`）の
+    // 計測値を実態より水増しし得た。`Content-Length` が分かればちょうど
+    // その長さだけ読み、無ければ（ヘッダに含まれない応答向けの
+    // フォールバックとして）以前と同じ EOF までの読み取りに戻す。
+    let mut body = Vec::new();
+    match content_length {
+        Some(len) => {
+            let to_read = len.min(PROBE_BODY_MAX_BYTES);
+            let mut buf = vec![0u8; to_read];
+            let mut read_total = 0usize;
+            while read_total < to_read {
+                match reader.read(&mut buf[read_total..]) {
+                    Ok(0) => break,
+                    Ok(n) => read_total += n,
+                    Err(_) => break,
+                }
+            }
+            body.extend_from_slice(&buf[..read_total]);
+        }
+        None => {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        body.extend_from_slice(&buf[..n]);
+                        if body.len() > PROBE_BODY_MAX_BYTES {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    // レビュー指摘 P2（Codex。PR #442 再々々々レビュー・
+    // competitor_lightpanda.rs:585）と同じ理由付けで、本文も厳密な UTF-8
+    // 変換にする（`from_utf8_lossy` による文字化けが偶然妥当な JSON へ
+    // 変わり、別プロセスの応答をブラウザらしいと誤判定する経路を避ける）。
+    let body_str = String::from_utf8(body).ok()?;
+    Some((status, body_str))
 }
 
 /// `BufRead::read_line` 相当だが、外部プロセスの応答を無制限に信用せず
@@ -564,6 +749,14 @@ fn probe_once(port: u16, request: &str) -> Option<u16> {
 /// `ErrorKind::InvalidData` で明示的に失敗させ、呼び出し側に「この行は
 /// 読み取れなかった」ことを伝える（coding-rust.md「外部入力の経路では
 /// 明示的に処理する」）。
+///
+/// レビュー指摘 P2（Codex。PR #442 再々々々々レビュー・
+/// competitor_lightpanda.rs:585）: 以前は `String::from_utf8_lossy` で
+/// 不正なバイト列を置換文字（U+FFFD）へ書き換えていたため、置換後の
+/// 文字列がたまたま妥当な JSON になると、元の応答とは異なる内容を
+/// 正常なトークン削減率として出力し得た。`String::from_utf8` で厳密に
+/// 変換し、失敗したら `ErrorKind::InvalidData` で計測エラーにする
+/// （呼び出し元は他の `Err` 経路と同様に扱えばよく、個別対応は不要）。
 fn read_line_bounded<R: BufRead>(reader: &mut R, out: &mut String) -> std::io::Result<usize> {
     let mut buf = Vec::new();
     loop {
@@ -582,8 +775,17 @@ fn read_line_bounded<R: BufRead>(reader: &mut R, out: &mut String) -> std::io::R
             ));
         }
     }
-    *out = String::from_utf8_lossy(&buf).into_owned();
-    Ok(buf.len())
+    let len = buf.len();
+    match String::from_utf8(buf) {
+        Ok(s) => {
+            *out = s;
+            Ok(len)
+        }
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("line contains invalid UTF-8: {e}"),
+        )),
+    }
 }
 
 /// cold start（`PERF-3`）: `trials` 回起動し、readiness までの時間の中央値（ms）を返す。
@@ -628,6 +830,15 @@ fn sample_rss_kb(pid: u32) -> Option<u64> {
     if !out.status.success() {
         return None;
     }
+    // レビュー指摘 P2（Codex。PR #442 再々々々々レビュー・
+    // competitor_lightpanda.rs:585）: 他の `from_utf8_lossy` 使用箇所も
+    // 確認した。ここは `parse_ps_rss_kb`（`out.trim().parse::<u64>()`）で
+    // 数字列としてのみ解釈するため、`from_utf8_lossy` の置換文字（U+FFFD）
+    // が混入しても `parse::<u64>()` が失敗して `None` になるだけで、
+    // 「文字化けが偶然別の妥当な値に化ける」経路にはならない（`read_line_bounded`
+    // の JSON 応答のように、置換後の文字列が別の意味を持つ妥当な値として
+    // 解釈され得るケースとは異なる）。そのため、ここは厳密な UTF-8 変換に
+    // 変える必要はないと判断した。
     parse_ps_rss_kb(&String::from_utf8_lossy(&out.stdout))
 }
 
@@ -734,7 +945,15 @@ const NOTIFY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// （パイプに読み取りタイムアウトが無いため、スレッド + チャンネルで模す）。
 struct McpClient {
     guard: ChildGuard,
-    stdin: std::process::ChildStdin,
+    /// `Arc<Mutex<_>>` にする理由（レビュー指摘 P1。Codex。PR #442
+    /// 再々々々々レビュー・competitor_lightpanda.rs:827）: `write_with_deadline`
+    /// はタイムアウト時に書き込みスレッドを detach し（`join` しない）、
+    /// 以後の呼び出しでも同じ `ChildStdin` を再利用できるようにするため、
+    /// 所有権を一方的に奪う（`&mut ChildStdin`/`Option::take`）方式ではなく
+    /// 共有できる `Arc<Mutex<ChildStdin>>` にする。detach したスレッドが
+    /// 書き込みを続けている間に次の呼び出しが来ても、ロック待ちで
+    /// `recv_timeout` が正しくタイムアウトする（無期限に隠れてブロックしない）。
+    stdin: Arc<Mutex<std::process::ChildStdin>>,
     rx: mpsc::Receiver<String>,
     next_id: u64,
     /// 読み取りスレッドがキュー容量超過を検知した際に立てるフラグ。
@@ -742,28 +961,30 @@ struct McpClient {
     /// 計測をエラー終了させる。
     overflowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 読み取りスレッドが `read_line_bounded` の `InvalidData`（`MAX_LINE_BYTES`
-    /// 到達・改行未検出）を検知した際に立てるフラグ（レビュー指摘 P1）。
-    /// `call` はこれを見て、切り詰められた行を無視したまま待ち続けるのではなく
-    /// 明示的にエラー終了させる。
-    line_too_long: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 到達・改行未検出、または不正な UTF-8。レビュー指摘 P1・P2）を検知した
+    /// 際に立てるフラグ。`call` はこれを見て、切り詰められた／文字化けした
+    /// 行を無視したまま待ち続けるのではなく明示的にエラー終了させる。
+    line_read_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl McpClient {
     fn spawn(bin: &PathBuf, args: &[String]) -> Result<Self, String> {
-        let mut child = Command::new(bin)
+        let mut command = Command::new(bin);
+        apply_new_process_group(&mut command);
+        let mut child = command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("spawn failed: {e}"))?;
-        let stdin = child.stdin.take().ok_or("no stdin")?;
+        let stdin = Arc::new(Mutex::new(child.stdin.take().ok_or("no stdin")?));
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let (tx, rx) = mpsc::sync_channel::<String>(MCP_STDOUT_QUEUE_CAPACITY);
         let overflowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let overflowed_writer = std::sync::Arc::clone(&overflowed);
-        let line_too_long = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let line_too_long_writer = std::sync::Arc::clone(&line_too_long);
+        let line_read_error = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let line_read_error_writer = std::sync::Arc::clone(&line_read_error);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
@@ -784,9 +1005,15 @@ impl McpClient {
                     },
                     Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                         // `MAX_LINE_BYTES` に達し改行未検出のまま打ち切られた行
-                        // （レビュー指摘 P1）。切り詰められた断片を正常応答として
-                        // 扱わせず、読み取りを止めて `call` 側へ明示的に伝える。
-                        line_too_long_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+                        // （レビュー指摘 P1）、または不正な UTF-8（レビュー指摘
+                        // P2。Codex。PR #442 再々々々々レビュー・
+                        // competitor_lightpanda.rs:585: `from_utf8_lossy` の
+                        // 置換で偶然妥当な JSON に化ける経路を避けるため、
+                        // `read_line_bounded` を厳密な UTF-8 変換にした）。
+                        // どちらも切り詰められた／文字化けした断片を正常応答
+                        // として扱わせず、読み取りを止めて `call` 側へ明示的に
+                        // 伝える。
+                        line_read_error_writer.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
                     Err(_) => break,
@@ -799,26 +1026,47 @@ impl McpClient {
             rx,
             next_id: 1,
             overflowed,
-            line_too_long,
+            line_read_error,
         })
     }
 
     /// 書き込み中に相手プロセスが標準入力を読まずパイプが満杯になっても
     /// 無期限にブロックしないよう、`deadline` までに `write_all` + `flush` が
-    /// 終わらなければ子プロセスを `kill` して待ち構えているスレッドを
-    /// 解放する（レビュー指摘 P1（PR #442）。子プロセスの標準入力（パイプ）
-    /// には OS レベルの書き込みタイムアウトが無いため、実際の書き込みは
-    /// `std::thread::scope` の子スレッドへ切り出し、`mpsc` の
-    /// `recv_timeout` で待つ。タイムアウト時は `child.kill()` で
-    /// 子プロセスの読み取り側を閉じ、ブロックしている `write_all` を
-    /// `BrokenPipe` で解放してからスレッドの終了（送信）を待つ
-    /// （`thread::scope` はスコープ終了時に生成した全スレッドの
-    /// join を待つため、解放せずに抜けようとすると結局無期限に
-    /// ブロックする）。
+    /// 終わらなければタイムアウトとして扱う。子プロセスの標準入力
+    /// （パイプ）には OS レベルの書き込みタイムアウトが無いため、実際の
+    /// 書き込みは別スレッドへ切り出し、`mpsc` の `recv_timeout` で待つ。
+    ///
+    /// レビュー指摘 P1（Codex。PR #442 再々々々々レビュー・
+    /// competitor_lightpanda.rs:827）: 以前は `std::thread::scope` を使い、
+    /// タイムアウト時に直接の子プロセスだけを `kill` したあと、書き込み
+    /// スレッドからの送信を `rx.recv()`（期限なし）で待っていた。対象
+    /// プロセス（ブラウザ）が起動した子孫プロセスが stdin パイプの
+    /// 読み取り側を継承していると、直接の子を終了してもパイプが閉じず、
+    /// `write_all` が解放されないままベンチ全体が無期限に止まり得た
+    /// （`thread::scope` はスコープ終了時に生成した全スレッドの join を
+    /// 待つ仕組みのため、この `rx.recv()` を省いても結局スコープを抜ける
+    /// ところで同じだけ待たされる）。
+    ///
+    /// 対処: (1) [`apply_new_process_group`] で子プロセスをプロセスグループの
+    /// リーダーとして起動しておき、タイムアウト時は [`kill_process_group`]
+    /// でグループ全体（子孫を含む）の終了を試み、直接の子は std の
+    /// `Child::kill`（外部コマンドに依存しない、確実に効く床）でも
+    /// 終了させる。`kill_process_group` は外部コマンド依存で、環境によっては
+    /// 効かない（子孫が生き残る）ことがあり得るため、`Child::kill` を
+    /// 省略しない（そのドキュメント参照。この 2 段構えにより、少なくとも
+    /// 直接の子プロセスは確実に終了する）。(2) 書き込みは `thread::scope`
+    /// ではなく `'static` な `thread::spawn`（detach 可能）へ切り替え、
+    /// タイムアウト時はスレッドの終了を待たずに `Err` を返す。パイプが
+    /// 閉じれば detach したスレッドの `write_all` も `BrokenPipe` 等で
+    /// 自然に終了するが、閉じ切らない環境ではそのスレッドがプロセス終了
+    /// までリークし得る。`stdin` を `Arc<Mutex<_>>` で共有するのは、
+    /// detach したスレッドが書き込みを続けていても、次回の呼び出しが
+    /// ロック取得待ちで正しく `recv_timeout` によりタイムアウトできる
+    /// ようにするため（`McpClient::stdin` のドキュメント参照）。
     fn write_with_deadline(
-        stdin: &mut std::process::ChildStdin,
+        stdin: &Arc<Mutex<std::process::ChildStdin>>,
         child: &mut Child,
-        data: &[u8],
+        data: Vec<u8>,
         deadline: Instant,
     ) -> Result<(), String> {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -826,23 +1074,35 @@ impl McpClient {
             return Err("write timed out before starting (deadline already elapsed)".to_string());
         }
         let (tx, rx) = mpsc::channel();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let result = stdin.write_all(data).and_then(|()| stdin.flush());
-                let _ = tx.send(result);
-            });
-            match rx.recv_timeout(remaining) {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(format!("write failed: {e}")),
-                Err(_) => {
-                    let _ = child.kill();
-                    // 書き込みスレッドが `BrokenPipe` 等で終わり `tx.send` する
-                    // のを待つ（join のためにスレッドの終了を確定させる）。
-                    let _ = rx.recv();
-                    Err("write timed out, child process killed".to_string())
-                }
+        let stdin_for_thread = Arc::clone(stdin);
+        std::thread::spawn(move || {
+            let mut guard = match stdin_for_thread.lock() {
+                Ok(guard) => guard,
+                // 他スレッド（前回タイムアウトした detach 済みスレッド）が
+                // panic しつつロックを保持したまま終了した場合。書き込み
+                // 自体は続行を試みる（fail-closed に倒すよりは、通常経路の
+                // 継続を優先する）。
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let result = guard.write_all(&data).and_then(|()| guard.flush());
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(format!("write failed: {e}")),
+            Err(_) => {
+                // `kill_process_group` は外部コマンド（`kill`/`taskkill`）に
+                // 依存し、実行環境によっては失敗し得る（ドキュメント参照）。
+                // それだけに頼らず、std の `Child::kill`（直接の子）も必ず
+                // 呼ぶ。子孫プロセスがパイプを保持していると直接の子だけの
+                // `kill` では解放されないが、少なくとも直接の子は確実に
+                // 終了させる床として残す（レビュー指摘。PR #442
+                // 再々々々々レビュー・advisor 追加指摘）。
+                kill_process_group(child.id());
+                let _ = child.kill();
+                Err("write timed out, process group killed".to_string())
             }
-        })
+        }
     }
 
     /// JSON-RPC 呼び出しを 1 件送り、`id` が一致する応答を待つ
@@ -866,9 +1126,9 @@ impl McpClient {
         );
         let deadline = Instant::now() + timeout;
         Self::write_with_deadline(
-            &mut self.stdin,
+            &self.stdin,
             &mut self.guard.0,
-            request.as_bytes(),
+            request.into_bytes(),
             deadline,
         )
         .map_err(|e| format!("{method}: {e}"))?;
@@ -879,9 +1139,12 @@ impl McpClient {
                     "{method}: mcp stdout queue exceeded {MCP_STDOUT_QUEUE_CAPACITY} lines, aborting"
                 ));
             }
-            if self.line_too_long.load(std::sync::atomic::Ordering::SeqCst) {
+            if self
+                .line_read_error
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 return Err(format!(
-                    "{method}: mcp response line exceeded {MAX_LINE_BYTES} bytes without newline, aborting"
+                    "{method}: mcp response line could not be decoded (exceeded {MAX_LINE_BYTES} bytes without newline, or contained invalid UTF-8), aborting"
                 ));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -896,9 +1159,12 @@ impl McpClient {
                             "{method}: mcp stdout queue exceeded {MCP_STDOUT_QUEUE_CAPACITY} lines, aborting"
                         ));
                     }
-                    if self.line_too_long.load(std::sync::atomic::Ordering::SeqCst) {
+                    if self
+                        .line_read_error
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
                         return Err(format!(
-                            "{method}: mcp response line exceeded {MAX_LINE_BYTES} bytes without newline, aborting"
+                            "{method}: mcp response line could not be decoded (exceeded {MAX_LINE_BYTES} bytes without newline, or contained invalid UTF-8), aborting"
                         ));
                     }
                     return Err(format!("timeout waiting for response to {method}"));
@@ -958,13 +1224,8 @@ impl McpClient {
     fn notify(&mut self, method: &str, params: &str) -> Result<(), String> {
         let line = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\",\"params\":{params}}}\n");
         let deadline = Instant::now() + NOTIFY_WRITE_TIMEOUT;
-        Self::write_with_deadline(
-            &mut self.stdin,
-            &mut self.guard.0,
-            line.as_bytes(),
-            deadline,
-        )
-        .map_err(|e| format!("{method}: {e}"))
+        Self::write_with_deadline(&self.stdin, &mut self.guard.0, line.into_bytes(), deadline)
+            .map_err(|e| format!("{method}: {e}"))
     }
 }
 

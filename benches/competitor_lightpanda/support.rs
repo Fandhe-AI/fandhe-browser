@@ -102,6 +102,54 @@ pub fn parse_http_status(line: &str) -> Option<u16> {
     code.parse::<u16>().ok()
 }
 
+/// readiness probe の応答本文に含まれていれば「CDP `/json/version` らしい」
+/// と判定するフィールド名（大小文字を区別しない）。
+///
+/// `fandhe-browser-cdp` crate が対象とする CDP プロトコルの
+/// `Browser`/`Protocol-Version` に加え、Chromium 系 CDP 実装が一般的に返す
+/// `webSocketDebuggerUrl`・`User-Agent`・`V8-Version`・`WebKit-Version` も
+/// 許容する（`fandhe-browser-cli` は未実装で確定した応答形が無いため、
+/// 単一のフィールド名に絞らず既知の候補を並べる）。
+const READINESS_RESPONSE_FIELDS: &[&str] = &[
+    "browser",
+    "protocol-version",
+    "websocketdebuggerurl",
+    "user-agent",
+    "v8-version",
+    "webkit-version",
+];
+
+/// readiness probe の応答本文が「起動した子プロセス（ブラウザ）からの
+/// 応答らしいか」を判定する。
+///
+/// レビュー指摘 Medium（Cursor。PR #442 再々々々々レビュー・
+/// competitor_lightpanda.rs:486-535）: `reserve_port` は bind したリスナーを
+/// 即座に drop してから子プロセスを起動するため、その間に別プロセスが
+/// 同じポートを奪える TOCTOU が残る。ポートが「空いているか」ではなく
+/// 「応答している内容が期待するブラウザらしいか」を検証することで、
+/// 無関係なプロセスの応答を子プロセスの readiness と誤認する可能性を
+/// 下げる。CDP の `/json/version` は JSON オブジェクトで
+/// [`READINESS_RESPONSE_FIELDS`] のいずれかのフィールドを持つのが
+/// 一般的なため、本文が JSON オブジェクトであり、かつそのいずれかの
+/// キー（大小文字を区別しない）を持つことを要求する（レビュー指摘
+/// advisor 追加指摘: 「JSON オブジェクトでありさえすれば `{}` でも通る」
+/// のは弱すぎるため、少なくとも 1 つの既知フィールドを要求するよう
+/// 強化した）。ステータス行だけで判定していた以前の実装より強いが、
+/// 別プロセスがたまたま同じ形の JSON を返す場合までは排除できない
+/// （呼び出し元 `spawn_and_wait_ready` の `Child::try_wait` による生存
+/// 確認と組み合わせた best-effort。完全な防止には子プロセスが実際に
+/// そのポートを bind していることの確認が要るが、std だけでは OS
+/// 非依存にソケットの所有プロセスを調べる手段が無く、`unsafe`・新規
+/// 依存なしでは実装しない）。
+pub fn looks_like_browser_readiness_response(body: &str) -> bool {
+    let Ok(JsonValue::Object(fields)) = parse_json(body) else {
+        return false;
+    };
+    fields
+        .keys()
+        .any(|key| READINESS_RESPONSE_FIELDS.contains(&key.to_ascii_lowercase().as_str()))
+}
+
 /// unix `ps -o rss= -p <pid>` の標準出力（キロバイト単位の数値のみ・前後に空白を
 /// 含み得る）を解釈する。
 ///
@@ -1016,6 +1064,44 @@ mod tests {
         assert_eq!(parse_http_status(""), None);
         assert_eq!(parse_http_status("HTTP/1.1"), None);
         assert_eq!(parse_http_status("HTTP/1.1 abc"), None);
+    }
+
+    // レビュー指摘 Medium（Cursor。PR #442 再々々々々レビュー・
+    // competitor_lightpanda.rs:486-535）: readiness probe の応答本文が
+    // ブラウザ（CDP `/json/version`）らしい形かどうかで、別プロセスの
+    // 応答をポート再利用によって誤って readiness と判定しないようにする。
+    #[test]
+    fn looks_like_browser_readiness_response_accepts_known_cdp_fields() {
+        assert!(looks_like_browser_readiness_response(
+            r#"{"Browser":"Lightpanda/1.0","webSocketDebuggerUrl":"ws://x"}"#
+        ));
+        assert!(looks_like_browser_readiness_response(
+            r#"{"Protocol-Version":"1.3"}"#
+        ));
+        // フィールド名の大小文字は区別しない。
+        assert!(looks_like_browser_readiness_response(r#"{"browser":"x"}"#));
+    }
+
+    // レビュー指摘（advisor 追加指摘）: JSON オブジェクトでありさえすれば
+    // `{}` でも通ってしまうのは弱すぎるため、既知フィールドを 1 つも
+    // 持たないオブジェクトは拒否することを確認する。
+    #[test]
+    fn looks_like_browser_readiness_response_rejects_object_without_known_fields() {
+        assert!(!looks_like_browser_readiness_response(r#"{}"#));
+        assert!(!looks_like_browser_readiness_response(r#"{"status":"ok"}"#));
+    }
+
+    #[test]
+    fn looks_like_browser_readiness_response_rejects_non_object() {
+        assert!(!looks_like_browser_readiness_response("not json"));
+        assert!(!looks_like_browser_readiness_response(""));
+        assert!(!looks_like_browser_readiness_response("[]"));
+        assert!(!looks_like_browser_readiness_response("42"));
+        assert!(!looks_like_browser_readiness_response("null"));
+        assert!(!looks_like_browser_readiness_response("\"just a string\""));
+        assert!(!looks_like_browser_readiness_response(
+            "<html>not json</html>"
+        ));
     }
 
     // PERF-6: parse_ps_rss_kb は unix の `ps -o rss=` 出力を解釈する
