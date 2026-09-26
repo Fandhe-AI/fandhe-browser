@@ -40,8 +40,28 @@ servoshell 等）は TASK-36（#50。Linux 実機での検証、人間が担当�
 python3 harness/render-screenshot/capture_screenshots.py \
   --out-dir /path/to/out \
   --engines servo,chromium \
-  --servo-cmd '["servo_embed_poc", "{html_path}", "{out}"]'
+  --servo-cmd '[
+    "servoshell", "--headless", "--window-size", "{width}x{height}",
+    "--output", "{out}",
+    "--pref", "network_http_proxy_uri={proxy}",
+    "--pref", "network_https_proxy_uri={proxy}",
+    "--pref", "network_http_no_proxy=",
+    "{url}"
+  ]'
 ```
+
+`--pref network_http_proxy_uri={proxy}` / `network_https_proxy_uri={proxy}` は
+servoshell（TASK-36 で確定するオプション名に合わせて読み替える想定）に
+ローカル転送プロキシを設定する preference で、`--servo-cmd` のテンプレートに
+`{proxy}` を含めない限り撮影自体が拒否される（`--allow-unproxied-engine` を
+付けない限り。下記「ローカル転送プロキシによる撮影プロセスの全通信フィルタ」
+参照）ため、このように必ず含める必要がある。`network_http_no_proxy=` は
+loopback 等をプロキシ除外にしないための明示（servoshell の既定値は空文字列
+で無条件にプロキシを使うが、preference ファイルで上書きされていないことを
+はっきりさせるため明示的に空を渡す）。**これらの preference を実機の
+servoshell バイナリが実際に強制することまでは本ハーネスから検証していない**
+（TASK-36／#50・#55 の人間による実機検証の範囲。詳細は下記「Servo
+（servoshell）のプロキシ対応について」）。
 
 Chromium 側はローカルに `chromium` / `chromium-browser` / `google-chrome` の
 いずれかがあれば自動検出される（`--chromium-bin` で明示指定も可能）。

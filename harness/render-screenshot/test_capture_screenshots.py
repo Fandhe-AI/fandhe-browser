@@ -265,6 +265,40 @@ def _raw_pixels(width: int, height: int, *, channels: int = 3) -> bytes:
     return b"".join(bytes([0]) + pixel_row for _ in range(height))
 
 
+class _FakeDecompressor:
+    """`zlib.decompressobj` の差し替え用フェイク（Cursor Bugbot 再指摘のテスト向け）。
+
+    展開結果を `planned_outputs` として事前に用意し、`decompress()` が
+    呼ばれるたびに `max_length` を守って払い出す（1 回で払い出しきれなければ
+    残りを次回の呼び出しへ持ち越す。実際の `zlib.decompressobj` の
+    `max_length` の挙動を単純化して模す）。`flush()` が呼ばれたら
+    `AssertionError` で検出する（本来 `read_png_size` は `flush()` を
+    一切使わないはずのため）。
+    """
+
+    def __init__(self, planned_outputs: list[bytes]) -> None:
+        self._planned = list(planned_outputs)
+        self._current = b""
+        self.eof = False
+        self.unconsumed_tail = b""
+        self.unused_data = b""
+        self.flush_called = False
+
+    def decompress(self, data: bytes, max_length: int = 0) -> bytes:  # noqa: ARG002
+        if not self._current and self._planned:
+            self._current = self._planned.pop(0)
+        limit = max_length if max_length > 0 else len(self._current)
+        out = self._current[:limit]
+        self._current = self._current[limit:]
+        if not self._current and not self._planned:
+            self.eof = True
+        return out
+
+    def flush(self) -> bytes:
+        self.flush_called = True
+        raise AssertionError("flush() must not be called (unbounded output)")
+
+
 class ReadPngSizeTest(unittest.TestCase):
     """RENDER-5 / TASK-37.1: PNG ヘッダ検証（シグネチャ・IHDR・IDAT 展開）。"""
 
@@ -444,6 +478,43 @@ class ReadPngSizeTest(unittest.TestCase):
             )
             result_width, result_height = cs.read_png_size(path)
             self.assertEqual((result_width, result_height), (width, height))
+
+    def test_final_flush_never_calls_unbounded_decompressobj_flush(self) -> None:
+        # Cursor Bugbot 再指摘: IDAT 展開の途中は `decompress(..., 65536)` で
+        # 出力量を制限しているが、最後に呼んでいた `decompressobj.flush()` は
+        # `max_length` を取らず無制限に出力を返すため、そこだけ解凍爆弾対策の
+        # 外側に残っていた。`zlib.decompressobj` を差し替え、実際の展開処理を
+        # `flush()` を一度も呼ばずに完走できることを確認する
+        # （`_FakeDecompressor.flush` は呼ばれたら即座に検出できるようにする）。
+        width, height = 4, 4
+        expected = cs._expected_raw_size(width, height, color_type=2, bit_depth=8, interlace=0)
+        # 1 回目の `decompress()` 呼び出し（IDAT の実データを渡す main loop）
+        # では期待サイズの一部だけを返し、`eof` にはまだ到達しない。残りは
+        # 「フラッシュ相当」の呼び出し（`decompress(b"", allowance)`）でのみ
+        # 出せるようにし、末尾処理が `max_length` 付きで行われることを検証する。
+        fake = _FakeDecompressor([b"\x00" * (expected // 2), b"\x00" * (expected - expected // 2)])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fake-decode.png"
+            path.write_bytes(_build_png(width, height, [b"dummy-idat-bytes"]))
+            with mock.patch.object(cs.zlib, "decompressobj", return_value=fake):
+                result_width, result_height = cs.read_png_size(path)
+        self.assertEqual((result_width, result_height), (width, height))
+        self.assertFalse(fake.flush_called)
+
+    def test_final_flush_tail_is_bounded_by_expected_size(self) -> None:
+        # 上のテストの対照実験: 末尾側（`decompress(b"", allowance)`）で
+        # IHDR 由来の期待サイズを超える出力が出た場合も、途中経路と同じく
+        # `PngError` として検出できることを確認する。
+        width, height = 4, 4
+        expected = cs._expected_raw_size(width, height, color_type=2, bit_depth=8, interlace=0)
+        fake = _FakeDecompressor([b"\x00" * (expected // 2), b"\x00" * (expected + 1)])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fake-decode-bomb.png"
+            path.write_bytes(_build_png(width, height, [b"dummy-idat-bytes"]))
+            with mock.patch.object(cs.zlib, "decompressobj", return_value=fake):
+                with self.assertRaises(cs.PngError):
+                    cs.read_png_size(path)
+        self.assertFalse(fake.flush_called)
 
 
 class _Resp(io.BytesIO):
@@ -1117,6 +1188,86 @@ class ProcessTreeKillTest(unittest.TestCase):
                     break
                 time.sleep(0.05)
             self.assertTrue(gone, f"grandchild pid {grandchild_pid} is still alive after timeout handling")
+
+    @unittest.skipUnless(sys.platform != "win32", "os.killpg によるプロセスグループ終了は POSIX 専用")
+    def test_keyboard_interrupt_during_wait_still_kills_process_tree(self) -> None:
+        # Cursor Medium 再指摘: エンジンを新しいセッション／プロセスグループで
+        # 起動しているため、端末の割り込み（Ctrl-C）はエンジン自身には届かない。
+        # 旧実装は `_kill_process_tree` を `subprocess.TimeoutExpired` の場合
+        # にしか呼んでおらず、`wait` 中に `KeyboardInterrupt` 等の他の例外が
+        # 発生すると後片付けをしないまま伝播してしまい、孫プロセスが残った
+        # ままローカル転送プロキシが停止し `user_data_dir` が削除される
+        # （プロセスがまだファイルを掴んだままのことがある）。`wait` の 1 回目の
+        # 呼び出し中に `KeyboardInterrupt` が起きてもプロセスツリーを終了して
+        # から再送出することを確認する。
+        import os as os_module  # noqa: PLC0415
+
+        real_wait = cs.subprocess.Popen.wait
+        call_count = {"n": 0}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "grandchild.pid"
+
+            def fake_wait(self_proc, timeout=None):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    # 孫プロセスを起動して PID ファイルへ書き出すだけの時間を
+                    # 与えてから割り込む（実際に処理が進み始めた後に Ctrl-C
+                    # される状況を模す）。
+                    deadline = time.monotonic() + 3
+                    while not pid_file.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    raise KeyboardInterrupt("simulated interrupt during capture")
+                return real_wait(self_proc, timeout=timeout)
+
+            site = cs.Site(
+                site_id="interrupted", url="https://example.invalid", category="static", catalog_id="z1"
+            )
+            with mock.patch.object(cs.subprocess.Popen, "wait", fake_wait):
+                with self.assertRaises(KeyboardInterrupt):
+                    cs.capture_one(
+                        site,
+                        "servo",
+                        [
+                            sys.executable,
+                            str(FAKE_ENGINE),
+                            "--mode",
+                            "spawn-grandchild",
+                            "--out",
+                            "{out}",
+                            "--pid-file",
+                            str(pid_file),
+                        ],
+                        out_dir=Path(tmp),
+                        snapshots_dir=Path(tmp) / "snapshots",
+                        chromium_bin=None,
+                        width=1280,
+                        height=800,
+                        settle_ms=1000,
+                        timeout_sec=30,
+                        allow_file_url=False,
+                        dry_run=False,
+                        allow_unproxied_engine=True,
+                    )
+
+            deadline = time.monotonic() + 5
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(pid_file.exists(), "grandchild did not write its PID in time")
+            grandchild_pid = int(pid_file.read_text(encoding="utf-8"))
+
+            deadline = time.monotonic() + 2
+            gone = False
+            while time.monotonic() < deadline:
+                try:
+                    os_module.kill(grandchild_pid, 0)
+                except ProcessLookupError:
+                    gone = True
+                    break
+                time.sleep(0.05)
+            self.assertTrue(
+                gone, f"grandchild pid {grandchild_pid} is still alive after KeyboardInterrupt handling"
+            )
 
 
 class InjectBaseHrefTest(unittest.TestCase):

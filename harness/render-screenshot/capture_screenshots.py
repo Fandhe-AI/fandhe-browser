@@ -1078,7 +1078,26 @@ def read_png_size(path: Path) -> tuple[int, int]:
                 if decoded_size > expected_raw_size:
                     raise PngError(f"IDAT decompresses larger than the IHDR-derived size: {path}")
                 remaining = decompressor.unconsumed_tail
-        decoded_size += len(decompressor.flush())
+        # 全 IDAT を入力し終えた後も、最終ブロック確定のため追加の出力が
+        # バッファに残っていることがある。`decompressobj.flush()` は残りを
+        # 無制限に返す（`max_length` を取らない）ため使わず、代わりに
+        # `max_length` 付きの `decompress(b"", ...)` を `eof` になるか進捗が
+        # 止まるまで繰り返す（Cursor Bugbot 再指摘: `flush()` だけが解凍爆弾
+        # 対策の外側に残っていた）。`allowance` は残り許容量ちょうど + 1 とし、
+        # 1 バイトでも超過すれば検出できるようにする。
+        while not decompressor.eof:
+            allowance = expected_raw_size - decoded_size + 1
+            if allowance <= 0:
+                raise PngError(f"IDAT decompresses larger than the IHDR-derived size: {path}")
+            decoded = decompressor.decompress(b"", allowance)
+            if not decoded:
+                # `eof` に達しないまま出力が止まった場合、ストリームが
+                # 途中で切れている（続きの入力バイトが必要だが IDAT は
+                # 使い切った）。無限ループにせずここで打ち切る。
+                break
+            decoded_size += len(decoded)
+            if decoded_size > expected_raw_size:
+                raise PngError(f"IDAT decompresses larger than the IHDR-derived size: {path}")
     except zlib.error as exc:
         raise PngError(f"IDAT is not valid zlib data (corrupted PNG): {path}: {exc}") from exc
 
@@ -1167,6 +1186,22 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         pass
+
+
+def _raise_keyboard_interrupt_on_sigterm(signum: int, frame: object) -> None:  # noqa: ARG001
+    """SIGTERM を `KeyboardInterrupt` に変換する signal handler（Cursor Medium 再指摘）。
+
+    既定では SIGTERM はハンドラなしで即座にプロセスを終了させ、Python の
+    `except`/`finally` を経由しないため、撮影中の子プロセス（と、新しい
+    セッション／プロセスグループで起動しているためシグナルが自動では届かない
+    その子孫）・`user_data_dir`・ローカル転送プロキシの後片付けが一切行われ
+    ない。`KeyboardInterrupt` を送出することで、Ctrl-C（SIGINT）と同じ後片付け
+    経路（`capture_one` の `except BaseException` → `_kill_process_tree`、
+    `main` の `finally` → `stop_filtering_proxy`）に合流させる。signal handler
+    は Python ではメインスレッドでしか登録できないため、`main` はメイン
+    スレッドで実行されている場合のみ登録する。
+    """
+    raise KeyboardInterrupt("received SIGTERM")
 
 
 def _count_common_ok_sites(captures: list[dict[str, Any]], engines: list[str]) -> int:
@@ -1409,6 +1444,18 @@ def capture_one(
                     _kill_process_tree(proc)
                     exit_code = None
                     timed_out = True
+                except BaseException:
+                    # `KeyboardInterrupt`（Ctrl-C）・`SystemExit` 等、タイムアウト
+                    # 以外の理由で `wait` が中断された場合も、プロセスツリーを
+                    # 終了してから再送出する（Cursor Medium 再指摘）。エンジンは
+                    # `_process_group_popen_kwargs` で新しいセッション／
+                    # プロセスグループとして起動しているため、端末の割り込み
+                    # （SIGINT）はこのプロセスグループには届かない。ここで
+                    # 後片付けせずに例外を伝播させると、エンジンの子孫プロセスが
+                    # 残ったままローカル転送プロキシが停止し、`user_data_dir` の
+                    # 削除（このあとの `finally`）だけが先に走ってしまう。
+                    _kill_process_tree(proc)
+                    raise
             duration_ms = int((time.monotonic() - start) * 1000)
             stderr_tail = _read_tail(stderr_path, STDERR_TAIL_CHARS)
             engine_missing = False
@@ -1724,6 +1771,17 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dry_run:
         proxy_server, proxy_thread, proxy_url = start_filtering_proxy()
 
+    # SIGTERM を Ctrl-C（SIGINT/KeyboardInterrupt）と同じ後片付け経路に合流させる
+    # （Cursor Medium 再指摘）。signal handler はメインスレッドでしか登録できない
+    # ため、`main` がメインスレッド以外（将来 GUI やテストランナーに組み込まれる
+    # 場合等）から呼ばれても失敗させない。
+    previous_sigterm_handler: Any = None
+    if threading.current_thread() is threading.main_thread():
+        try:
+            previous_sigterm_handler = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt_on_sigterm)
+        except (ValueError, OSError):
+            previous_sigterm_handler = None
+
     captures: list[dict[str, Any]] = []
     try:
         try:
@@ -1751,6 +1809,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
     finally:
+        if previous_sigterm_handler is not None:
+            try:
+                signal.signal(signal.SIGTERM, previous_sigterm_handler)
+            except (ValueError, OSError):
+                pass
         if proxy_server is not None and proxy_thread is not None:
             stop_filtering_proxy(proxy_server, proxy_thread)
 
