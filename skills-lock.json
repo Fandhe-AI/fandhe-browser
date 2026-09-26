@@ -119,7 +119,7 @@
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/init-claude/SKILL.md",
-      "computedHash": "72c270245ac63019102e3cac66332c5eb924c40d32e9e88c29d2df0ee1b12573"
+      "computedHash": "54ea7a690f653abef79ec0c35f01afa03e866327c1bc5b57c58abcb168eaafc7"
     },
     "lefthook": {
       "source": "Fandhe-AI/agent-reference-skills",
@@ -149,13 +149,13 @@
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/setup-repo-guards/SKILL.md",
-      "computedHash": "577872b5c00dff7ef02e1814895e58b629785c9c8fcd9d6409a5e84b8ff0e577"
+      "computedHash": "698385fe147fe6d97d77175de34514fa832b6db6332ce011718006bc7f62e1c8"
     },
     "update-claude": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/update-claude/SKILL.md",
-      "computedHash": "9a7243eb654ea1bf569fd7ce659b072e684149cd71544af8aeeb4a763097668e"
+      "computedHash": "fcf8be9747cdaf5ab97ef8b9370188f4f397d50179e9316322d4fd4c8092f591"
     },
     "update-docs": {
       "source": "Fandhe-AI/agent-cli-skills",
