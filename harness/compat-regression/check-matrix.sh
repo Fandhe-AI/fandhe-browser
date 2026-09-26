@@ -248,24 +248,26 @@ fi
 # 検出されずに通過してしまう。TASK-9.2 レビュー指摘。--categories 側で既に
 # 判定済みの値は重複判定を避けるため除外する）。
 if [ "$ALL_CATEGORIES" -eq 1 ]; then
-  # README.md のスキーマは "cat" に任意の非空文字列（改行・CR・NUL を含む）を
-  # 許容する。改行区切り（tr -d '\r' で CR のみ除去）はもちろん、NUL 区切りでも
-  # 値そのものに \u0000 エスケープ（実体は NUL 文字）や改行が含まれていれば、
-  # その区切り文字と衝突して複数の別カテゴリへ分割されてしまう（例:
-  # "static\u0000spa" が区切り文字と誤認され static / spa の 2 カテゴリに
-  # 分裂し、元のカテゴリが閾値未満でも見逃し得る。COMPAT-1 の類型別回帰検出に
-  # 反する。codex review 指摘・Windows self-test 失敗, PR #452）。値の中に
-  # 現れ得ない安全な区切りは存在しないため、区切り文字方式そのものをやめる。
-  # jq の既定（非 -r）出力は 1 値 1 行で、各値は JSON 文字列としてエスケープ
-  # 済み（改行は \n、CR は \r、NUL は \u0000 という 1〜6 文字の ASCII 表記に
-  # なり、生の制御文字は出力に現れない）ため、値の中身に関わらず行区切りで
-  # 安全に読み取れる。読み取った行はそのまま `jq -r .` へ再度通して JSON
-  # デコードし、元の値（改行・CR・NUL を含む）を復元してから judge_category
-  # （--arg 経由で jq へ渡すためシェル上の値に制御文字が残っていても安全）に渡す。
-  # Windows ネイティブ実行時の CRLF 変換対策として行末の \r（生バイト）のみを
-  # 一律除去する（JSON エスケープされた \r は "\" + "r" の 2 文字であり対象外）。
-  while IFS= read -r cat_json; do
-    cat=$(jq -r '.' <<<"$cat_json")
+  # README.md のスキーマは "cat" に任意の非空文字列（改行・CR を含む）を許容
+  # する。上のスキーマ検証で NUL（\u0000）を含む cat は既に exit 2 で拒否済み
+  # のため、ここに到達する cat 値には NUL が絶対に含まれない。したがって NUL
+  # を区切り文字に使っても実データと衝突しない（"foo\u0000bar" のような値は
+  # スキーマ検証で弾かれるため、区切りの NUL と値中の NUL が混同されることは
+  # ない）。
+  #
+  # 直前の実装は行区切り（jq の既定出力は 1 値 1 行、JSON エスケープ済み）で
+  # 読み取った行を `cat=$(jq -r '.' <<<"$cat_json")` でデコードしていたが、
+  # コマンド置換 `$(...)` は出力の「末尾の」改行をすべて剥ぎ取る仕様のため、
+  # デコード後の値自体が末尾改行を含む場合（例: "spa\n"）その改行が失われ、
+  # 末尾に改行の無い同名カテゴリ（例: "spa"）と誤って同一視されてしまう
+  # （codex review 指摘 discussion_r4111644746, Windows self-test 失敗, PR
+  # #452）。埋め込み改行（"weird\ncase" のように文字列の途中にある改行）は
+  # コマンド置換で失われないため self-test の既存ケースでは検出できなかった。
+  #
+  # `read -r -d ''` はプロセス置換からの入力を NUL バイトまで無加工で読み取り、
+  # コマンド置換を経由しないため、値の中身（先頭・末尾・埋め込みのいずれの
+  # 改行・CR も）を一切変更せず judge_category へ渡せる。
+  while IFS= read -r -d '' cat; do
     already_judged=0
     if [ -n "$CATEGORIES" ]; then
       for done_cat in "${CAT_LIST[@]}"; do
@@ -278,7 +280,7 @@ if [ "$ALL_CATEGORIES" -eq 1 ]; then
     if [ "$already_judged" -eq 0 ]; then
       judge_category "$cat"
     fi
-  done < <(jq -c '[.[].cat] | unique | .[]' "$MATRIX" | tr -d '\r')
+  done < <(jq -j '[.[].cat] | unique | .[] | . + "\u0000"' "$MATRIX")
 fi
 
 if [ "$FAIL" -eq 1 ]; then

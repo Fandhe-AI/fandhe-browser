@@ -121,6 +121,27 @@ if grep -qE "^category (weird|case): passed=0 total=0" <<<"$LAST_OUTPUT"; then
 fi
 CASES=$((CASES + 1))
 
+# cat 値が末尾に改行を含む場合（例: "spa\n"）、コマンド置換 `$(...)` が出力の
+# 末尾改行を剥ぎ取ってしまうと、末尾改行の無い別カテゴリ（"spa"）と誤って
+# 同一視され、両者が誤結合されて集計されてしまう（codex review 指摘
+# discussion_r4111644746, Windows self-test 失敗, PR #452）。上のケース
+# （embedded newline）はコマンド置換で失われないため検出できず、この
+# trailing newline のケースでのみ再現する。誤結合された場合、期待される
+# 「spa\n」（passed=1 total=4）と「spa」（passed=1 total=1）が
+# 「spa」（passed=2 total=5）1 本に化けるため、それぞれの具体値まで比較する。
+expect_exit "cat value with a trailing newline is not merged with the same name without it" 1 \
+  --matrix "$FIXTURES/trailing-newline-cat.json" --all-categories
+expect_contains "$LAST_OUTPUT" $'category spa\n: passed=1 total=4 threshold=70 result=FAIL' \
+  "trailing-newline cat value keeps its own count"
+expect_contains "$LAST_OUTPUT" "category spa: passed=1 total=1 threshold=70 result=PASS" \
+  "plain spa cat value is not merged with the trailing-newline one"
+if grep -qE "^category spa: passed=2 total=5" <<<"$LAST_OUTPUT"; then
+  echo "FAIL [trailing newline cat merged]: trailing-newline cat value was merged with plain 'spa'" >&2
+  echo "  output: $LAST_OUTPUT" >&2
+  FAILURES=$((FAILURES + 1))
+fi
+CASES=$((CASES + 1))
+
 # cat 値に NUL 文字（\u0000）を含む場合はスキーマ検証で明示的に拒否する
 # （codex review 指摘, PR #452。bash の変数・コマンド置換は NUL を保持できず、
 # --all-categories の列挙・判定を通すと "static\u0000spa" が "staticspa" 相当に
