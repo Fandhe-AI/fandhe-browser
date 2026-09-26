@@ -1,0 +1,8 @@
+[
+  { "id": "t1", "cat": "static", "fandhe_browser_core": true, "chromium": true },
+  { "id": "t2", "cat": "static", "fandhe_browser_core": true, "chromium": true }
+]
+[
+  { "id": "t3", "cat": "static", "fandhe_browser_core": false, "chromium": true },
+  { "id": "t4", "cat": "static", "fandhe_browser_core": false, "chromium": true }
+]

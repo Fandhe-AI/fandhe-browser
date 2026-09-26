@@ -1,0 +1,7 @@
+[
+  { "id": "n1", "cat": "weird\ncase", "fandhe_browser_core": true, "chromium": true },
+  { "id": "n2", "cat": "weird\ncase", "fandhe_browser_core": false, "chromium": true },
+  { "id": "n3", "cat": "weird\ncase", "fandhe_browser_core": false, "chromium": true },
+  { "id": "n4", "cat": "weird\ncase", "fandhe_browser_core": false, "chromium": true },
+  { "id": "n5", "cat": "static", "fandhe_browser_core": true, "chromium": true }
+]

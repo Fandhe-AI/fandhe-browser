@@ -40,7 +40,8 @@ fandhe-browser/
 │   ├── fandhe-browser-profile/    #   プロファイル分離
 │   ├── fandhe-browser-cli/        #   CLI
 │   └── fandhe-browser-mcp/        #   MCP 参照プラグイン（別バイナリ）
-├── tests/ / benches/ / harness/   #（予定）結合テスト・ベンチ・互換性テストハーネス
+├── tests/ / benches/              #（予定）結合テスト・ベンチ
+├── harness/                       # 互換性テストハーネス。compat-regression/（TASK-9.2・対象サイト群の動作率回帰チェック）実装済み
 ├── docs/
 │   ├── design/                    # 設計ドキュメント（public。render-feature-gate.md 等）
 │   └── spec/                      # fandhe-browser-spec submodule（private・要アクセス権）
