@@ -30,12 +30,14 @@ fn core_1_query_selector_all_from_outside_crate_article() {
     let root = doc.root();
 
     let title = parse_selector_list(".title").expect(".title は解析できるはず");
-    let titles = query_selector_all(&doc, root, &title);
+    let titles = query_selector_all(&doc, root, &title).expect("キャッシュ上限に達しない");
     assert_eq!(titles.len(), 1);
     assert_eq!(doc.text_content(titles[0]).as_deref(), Some("見出し"));
 
     let byline = parse_selector_list("article > p.byline").expect("解析できるはず");
-    let first = query_selector(&doc, root, &byline).expect("著者行が見つかるはず");
+    let first = query_selector(&doc, root, &byline)
+        .expect("キャッシュ上限に達しない")
+        .expect("著者行が見つかるはず");
     assert_eq!(doc.text_content(first).as_deref(), Some("著者: Alice"));
 }
 
@@ -51,11 +53,11 @@ fn core_1_query_selector_all_from_outside_crate_table() {
     let root = doc.root();
 
     let rows = parse_selector_list("tr").expect("解析できるはず");
-    let row_ids = query_selector_all(&doc, root, &rows);
+    let row_ids = query_selector_all(&doc, root, &rows).expect("キャッシュ上限に達しない");
     assert_eq!(row_ids.len(), 2);
 
     let cells = parse_selector_list("td").expect("解析できるはず");
-    let cell_ids = query_selector_all(&doc, root, &cells);
+    let cell_ids = query_selector_all(&doc, root, &cells).expect("キャッシュ上限に達しない");
     let values: Vec<String> = cell_ids
         .iter()
         .map(|&id| doc.text_content(id).unwrap_or_default())
@@ -77,7 +79,7 @@ fn core_1_query_selector_all_from_outside_crate_navigation() {
     let root = doc.root();
 
     let links = parse_selector_list("nav a[href]").expect("解析できるはず");
-    let link_ids = query_selector_all(&doc, root, &links);
+    let link_ids = query_selector_all(&doc, root, &links).expect("キャッシュ上限に達しない");
     assert_eq!(link_ids.len(), 2);
     let hrefs: Vec<Option<&str>> = link_ids
         .iter()
@@ -99,14 +101,18 @@ fn core_1_query_selector_and_element_matches_from_outside_crate_form() {
     let root = doc.root();
 
     let checkbox = parse_selector_list("[type=checkbox]").expect("解析できるはず");
-    let checkbox_id = query_selector(&doc, root, &checkbox).expect("チェックボックスが見つかる");
+    let checkbox_id = query_selector(&doc, root, &checkbox)
+        .expect("キャッシュ上限に達しない")
+        .expect("チェックボックスが見つかる");
     assert_eq!(doc.attribute(checkbox_id, "name"), Some("agree"));
 
     let text_selector = parse_selector_list("input[type=text]").expect("解析できるはず");
-    assert!(!element_matches(&doc, checkbox_id, &text_selector));
+    assert!(!element_matches(&doc, checkbox_id, &text_selector).expect("キャッシュ上限に達しない"));
 
     let checkbox_selector = parse_selector_list("input[type=checkbox]").expect("解析できるはず");
-    assert!(element_matches(&doc, checkbox_id, &checkbox_selector));
+    assert!(
+        element_matches(&doc, checkbox_id, &checkbox_selector).expect("キャッシュ上限に達しない")
+    );
 }
 
 /// CORE-1: 一致がなければ `query_selector_all` は空、`query_selector` は
@@ -116,6 +122,13 @@ fn core_1_no_match_from_outside_crate() {
     let doc = parse("<div></div>");
     let root = doc.root();
     let selectors = parse_selector_list("span").expect("解析できるはず");
-    assert!(query_selector_all(&doc, root, &selectors).is_empty());
-    assert_eq!(query_selector(&doc, root, &selectors), None);
+    assert!(
+        query_selector_all(&doc, root, &selectors)
+            .expect("キャッシュ上限に達しない")
+            .is_empty()
+    );
+    assert_eq!(
+        query_selector(&doc, root, &selectors).expect("キャッシュ上限に達しない"),
+        None
+    );
 }

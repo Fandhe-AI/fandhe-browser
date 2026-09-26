@@ -63,9 +63,15 @@
 //! セレクタから照合し、子結合子は親を辿り、子孫結合子は祖先を順に試す）。
 //! 再帰は複合セレクタのインデックス方向のみに限り（最大
 //! [`crate::selector::MAX_COMPOUNDS_PER_COMPLEX`] 段）、祖先方向は
-//! [`any_ancestor_matches`] が反復（非再帰）で走査するため、文書の深さに
-//! 対する再帰は積まない（壊れた arena・深いネストでもスタックオーバー
-//! フローせず必ず停止する。security.md「不安全な設計」対策）。
+//! [`any_ancestor_matches`] が [`Document::ancestors`] を用いて反復
+//! （非再帰）で走査するため、文書の深さに対する再帰は積まない（壊れた
+//! arena・深いネストでもスタックオーバーフローせず必ず停止する。
+//! security.md「不安全な設計」対策）。`Document::ancestors` は `parent`
+//! リンクが循環していても [`Document::node_count`] 歩で打ち切る契約を
+//! 持つため、本モジュール側で手動の祖先ループを実装し直さず、その契約を
+//! そのまま継承する（PR #439 レビュー指摘・Cursor Bugbot: 手動ループでは
+//! `node_count` 上限を持たず、循環・破損 arena で無限ループ・無制限
+//! アロケーションになり得た）。
 //!
 //! 子孫結合子は複数の祖先を試すバックトラックを伴うため、単純に毎回祖先を
 //! 辿り直すと、深いネストに `a b c d ...` のように子孫結合子を連ねた
@@ -76,24 +82,40 @@
 //! すべての候補要素にわたって 1 つの `MatchCache` を共有する（候補ごとに
 //! 使い捨てると祖先の判定結果を候補数だけ再計算してしまうため）。
 //! これにより最悪計算量は O(候補要素数 × セレクタ内の複合セレクタ数) に
-//! 収まり、文書の深さに対して指数的には増えない。候補要素数は
-//! `ParseOptions::max_nodes` に、複合セレクタ数・セレクタ数は `selector`
-//! モジュールの上限（[`crate::selector::MAX_COMPOUNDS_PER_COMPLEX`]・
-//! [`crate::selector::MAX_SELECTORS_PER_LIST`]）に、それぞれ縛られる
-//! （`MatchCache` のメモリ使用量もこれらの上限で抑えられる）。
-//! bloom filter 等によるさらなる高速化は本モジュールのスコープ外
-//! （REPAIR-3: 将来課題として明記する）。
+//! 収まり、文書の深さに対して指数的には増えない。
+//!
+//! `MatchCache` のエントリ数は理論上、候補要素数（`ParseOptions::max_nodes`。
+//! 既定 100 万）× セレクタ数（[`crate::selector::MAX_SELECTORS_PER_LIST`]。
+//! 64）× 複合セレクタ数（[`crate::selector::MAX_COMPOUNDS_PER_COMPLEX`]。
+//! 32）に縛られるが、この理論上限は実効的なメモリ上限としては大きすぎる
+//! （PR #439 レビュー指摘 P0: `max_nodes`・セレクタ上限の範囲内でもキャッシュ
+//! だけでメモリを使い尽くせる）。そのため [`MAX_MATCH_CACHE_ENTRIES`] を
+//! 独立した実効上限として設け、`MatchCache` へのエントリ追加がこれを超える
+//! 場合は [`crate::error::Error::MatchCacheLimitExceeded`] を明示的な API
+//! エラーとして返す（一律 `false`/空の結果へフォールバックしない。誤った
+//! 照合結果を「一致なし」として返すと呼び出し側の判断を誤らせるため）。
+//! [`element_matches`]・[`query_selector_all`]・[`query_selector`] は
+//! いずれもこのエラーを伝播する。bloom filter 等によるさらなる高速化は
+//! 本モジュールのスコープ外（REPAIR-3: 将来課題として明記する）。
 //!
 //! 対応 ID: `CORE-1`・TASK-24（24.10）・MS-1。
 
 use std::collections::HashMap;
 
 use crate::dom::{Document, NodeId, QuirksMode};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::selector::{
     AttributeMatcher, Combinator, ComplexSelector, CompoundSelector, SelectorList, SimpleSelector,
     html_local_name_eq, parse_selector_list,
 };
+
+/// `MatchCache`（`chain`・`ancestor` 合計）が保持できるエントリ数の実効上限。
+///
+/// ノード数×セレクタ数×複合セレクタ数の理論上限（モジュール doc 参照）は
+/// 実用上のメモリ上限としては大きすぎるため、独立した固定値でメモリ使用量を
+/// 抑える（PR #439 レビュー指摘 P0）。超過時は
+/// [`crate::error::Error::MatchCacheLimitExceeded`] を返す。
+pub const MAX_MATCH_CACHE_ENTRIES: usize = 1_000_000;
 
 /// `dom::Document::HTML_NAMESPACE_URI` 相当の値（`dom` モジュールに
 /// `pub(crate)` として定義済みのものを再利用する）。
@@ -174,10 +196,10 @@ fn match_attribute(
 }
 
 /// 子孫結合子（[`Combinator::Descendant`]）の祖先バックトラックを
-/// メモ化するためのキャッシュ（DoS 対策。[`list_matches`] のドキュメント
-/// 参照）。1 回の `query_selector_all` / `query_selector` / `element_matches`
-/// 呼び出しの間だけ生存し、呼び出しをまたいで再利用しない（`Document` の
-/// 変更を考慮しなくてよいようにするため）。
+/// メモ化するためのキャッシュ（DoS 対策。モジュール doc 参照）。1 回の
+/// `query_selector_all` / `query_selector` / `element_matches` 呼び出しの
+/// 間だけ生存し、呼び出しをまたいで再利用しない（`Document` の変更を
+/// 考慮しなくてよいようにするため）。
 ///
 /// - `chain`: `(selector_idx, node のインデックス, up_to)` →
 ///   「`node` 自身が `up_to` から左側の連鎖に一致するか」の判定結果
@@ -191,6 +213,10 @@ fn match_attribute(
 /// 異なるセレクタ間でキーが衝突しうる（`up_to` はあくまで添字であって
 /// 複合セレクタの内容そのものではない）。`selector_idx` をキーに含めて
 /// セレクタ単位で名前空間を分けることでこれを避ける。
+///
+/// 挿入は [`MatchCache::insert_chain`]/[`MatchCache::insert_ancestor`] を
+/// 経由し、合計エントリ数が [`MAX_MATCH_CACHE_ENTRIES`] を超える新規キーの
+/// 追加を拒否する（メモリ使用量の実効上限。モジュール doc 参照）。
 struct MatchCache {
     chain: HashMap<(usize, usize, Option<usize>), bool>,
     ancestor: HashMap<(usize, usize, Option<usize>), bool>,
@@ -202,6 +228,42 @@ impl MatchCache {
             chain: HashMap::new(),
             ancestor: HashMap::new(),
         }
+    }
+
+    /// 現在の合計エントリ数（`chain` + `ancestor`）。
+    fn len(&self) -> usize {
+        self.chain.len() + self.ancestor.len()
+    }
+
+    /// `key` が新規キーで、かつ挿入すると合計エントリ数が
+    /// [`MAX_MATCH_CACHE_ENTRIES`] を超える場合に `true` を返す
+    /// （既存キーの上書きは合計エントリ数を増やさないため許可する）。
+    fn would_exceed_limit(&self, is_new_key: bool) -> bool {
+        is_new_key && self.len() >= MAX_MATCH_CACHE_ENTRIES
+    }
+
+    /// `chain` へ `(key, value)` を記録する。上限超過時は
+    /// [`Error::MatchCacheLimitExceeded`] を返し、挿入しない。
+    fn insert_chain(&mut self, key: (usize, usize, Option<usize>), value: bool) -> Result<()> {
+        if self.would_exceed_limit(!self.chain.contains_key(&key)) {
+            return Err(Error::MatchCacheLimitExceeded {
+                limit: MAX_MATCH_CACHE_ENTRIES,
+            });
+        }
+        self.chain.insert(key, value);
+        Ok(())
+    }
+
+    /// `ancestor` へ `(key, value)` を記録する。上限超過時は
+    /// [`Error::MatchCacheLimitExceeded`] を返し、挿入しない。
+    fn insert_ancestor(&mut self, key: (usize, usize, Option<usize>), value: bool) -> Result<()> {
+        if self.would_exceed_limit(!self.ancestor.contains_key(&key)) {
+            return Err(Error::MatchCacheLimitExceeded {
+                limit: MAX_MATCH_CACHE_ENTRIES,
+            });
+        }
+        self.ancestor.insert(key, value);
+        Ok(())
     }
 }
 
@@ -216,7 +278,7 @@ fn complex_matches(
     complex: &ComplexSelector,
     selector_idx: usize,
     cache: &mut MatchCache,
-) -> bool {
+) -> Result<bool> {
     // `rest` の最後の添字を「次に照合する複合セレクタ」として
     // `matches_compound_chain` に渡す。`rest` が空（`checked_sub` が `None`）
     // なら `first` 自身が右端になる。
@@ -240,7 +302,8 @@ fn complex_matches(
 ///
 /// 判定結果は `cache.chain` に `(selector_idx, node のインデックス, up_to)`
 /// をキーに記録する（[`MatchCache`] のドキュメント参照。DoS 対策の
-/// メモ化）。
+/// メモ化）。キャッシュが [`MAX_MATCH_CACHE_ENTRIES`] に達している場合は
+/// [`Error::MatchCacheLimitExceeded`] を返す。
 fn matches_compound_chain(
     document: &Document,
     node: NodeId,
@@ -248,16 +311,16 @@ fn matches_compound_chain(
     up_to: Option<usize>,
     selector_idx: usize,
     cache: &mut MatchCache,
-) -> bool {
+) -> Result<bool> {
     let cache_key = (selector_idx, node.index(), up_to);
     if let Some(&cached) = cache.chain.get(&cache_key) {
-        return cached;
+        return Ok(cached);
     }
 
     let result =
-        matches_compound_chain_uncached(document, node, complex, up_to, selector_idx, cache);
-    cache.chain.insert(cache_key, result);
-    result
+        matches_compound_chain_uncached(document, node, complex, up_to, selector_idx, cache)?;
+    cache.insert_chain(cache_key, result)?;
+    Ok(result)
 }
 
 /// [`matches_compound_chain`] のキャッシュ未命中時の本体。祖先探索
@@ -271,9 +334,9 @@ fn matches_compound_chain_uncached(
     up_to: Option<usize>,
     selector_idx: usize,
     cache: &mut MatchCache,
-) -> bool {
+) -> Result<bool> {
     let Some(index) = up_to else {
-        return compound_matches(document, node, complex.first());
+        return Ok(compound_matches(document, node, complex.first()));
     };
 
     // 外部入力（セレクタ文字列）から構築した `rest` への添字アクセスを
@@ -281,19 +344,19 @@ fn matches_compound_chain_uncached(
     // `rest.len()` 未満の値として渡すため通常は到達しないが、添字アクセス
     // `[]` を使わない方針を徹底する）。
     let Some((combinator, compound)) = complex.rest().get(index) else {
-        return false;
+        return Ok(false);
     };
     if !compound_matches(document, node, compound) {
-        return false;
+        return Ok(false);
     }
 
     let next_up_to = index.checked_sub(1);
     match combinator {
         Combinator::Child => {
             let Some(parent) = document.parent(node) else {
-                return false;
+                return Ok(false);
             };
-            document.is_element(parent)
+            Ok(document.is_element(parent)
                 && matches_compound_chain(
                     document,
                     parent,
@@ -301,7 +364,7 @@ fn matches_compound_chain_uncached(
                     next_up_to,
                     selector_idx,
                     cache,
-                )
+                )?)
         }
         Combinator::Descendant => {
             any_ancestor_matches(document, node, complex, next_up_to, selector_idx, cache)
@@ -317,11 +380,14 @@ fn matches_compound_chain_uncached(
 /// 深くネストした文書に子孫結合子を連ねたセレクタ（例:
 /// `.missing div div div ...`）を照合すると、祖先の組み合わせを指数的に
 /// 探索してしまう（security.md「不安全な設計」・AGENTS.md
-/// 「リソース上限」対策）。本関数は代わりに祖先の並びを 1 度だけ反復で
-/// 遡り、各ノードでの判定結果を `cache.ancestor` に記録することで、
-/// 同一 `(selector_idx, ノード, up_to)` の部分問題を高々 1 回しか計算しない
-/// （`Document::ancestors` を使わずここで反復する理由: 祖先ごとに
-/// キャッシュへ書き込みながら遡る必要があるため）。
+/// 「リソース上限」対策）。本関数は代わりに [`Document::ancestors`] で
+/// 祖先の並びを 1 度だけ反復で遡り、各ノードでの判定結果を
+/// `cache.ancestor` に記録することで、同一 `(selector_idx, ノード, up_to)`
+/// の部分問題を高々 1 回しか計算しない。`Document::ancestors` は `parent`
+/// リンクが循環・破損していても [`Document::node_count`] 歩で必ず打ち切る
+/// 契約を持つため、本関数を含め祖先方向の走査全体がその保証を継承する
+/// （手動ループを独自実装しない。PR #439 レビュー指摘・Cursor Bugbot:
+/// 独自ループは `node_count` 上限を持たず循環 arena で無限ループし得た）。
 ///
 /// これにより `element_matches` / `query_selector_all` 1 回あたりの
 /// 計算量は O(文書のノード数 × セレクタ内の複合セレクタ数) に収まり、
@@ -337,7 +403,8 @@ fn matches_compound_chain_uncached(
 /// 先に確定した `false`）だけで打ち切ってしまい、本来一致するはずの
 /// 深いノードを誤って不一致と判定する（`matches_compound_chain` 自身も
 /// `cache.chain` でメモ化されているため、この呼び出し自体のコストは
-/// 償却 O(1)）。
+/// 償却 O(1)）。キャッシュが [`MAX_MATCH_CACHE_ENTRIES`] に達している
+/// 場合は [`Error::MatchCacheLimitExceeded`] を返す。
 fn any_ancestor_matches(
     document: &Document,
     node: NodeId,
@@ -345,52 +412,47 @@ fn any_ancestor_matches(
     up_to: Option<usize>,
     selector_idx: usize,
     cache: &mut MatchCache,
-) -> bool {
+) -> Result<bool> {
     let start_key = (selector_idx, node.index(), up_to);
     if let Some(&cached) = cache.ancestor.get(&start_key) {
-        return cached;
+        return Ok(cached);
     }
 
     // 遡った要素祖先を記録し、結果が確定した後にまとめてキャッシュへ
     // 書き込む（途中でキャッシュ済みの祖先に到達した場合は、その祖先より
     // 手前（今回遡った分）も同じ結果になる）。
     let mut visited = Vec::new();
-    let mut current = node;
-    let result = loop {
-        let Some(parent) = document.parent(current) else {
-            break false;
-        };
-        if !document.is_element(parent) {
+    let mut result = false;
+    for ancestor in document.ancestors(node) {
+        if !document.is_element(ancestor) {
             // 要素でない祖先（例: DocumentFragment）は候補にならないが、
             // その先の祖先は候補になりうるため遡りを継続する。
-            current = parent;
             continue;
         }
 
-        // `parent` 自身が一致するかを必ず先に確認する（上記ドキュメント
-        // 参照）。`cache.chain` 経由でメモ化されるため、`parent` がすでに
+        // `ancestor` 自身が一致するかを必ず先に確認する（上記ドキュメント
+        // 参照）。`cache.chain` 経由でメモ化されるため、`ancestor` がすでに
         // 他の探索で確認済みなら実質 O(1) で戻る。
-        if matches_compound_chain(document, parent, complex, up_to, selector_idx, cache) {
-            break true;
+        if matches_compound_chain(document, ancestor, complex, up_to, selector_idx, cache)? {
+            result = true;
+            break;
         }
-        // `parent` 自身は不一致。`parent` のさらに祖先の判定がすでに
+        // `ancestor` 自身は不一致。`ancestor` のさらに祖先の判定がすでに
         // 分かっていれば、その値がここでの結果にもなる
-        // （`any_ancestor_matches(node) = false || any_ancestor_matches(parent)`）。
-        let parent_key = (selector_idx, parent.index(), up_to);
-        if let Some(&cached) = cache.ancestor.get(&parent_key) {
-            break cached;
+        // （`any_ancestor_matches(node) = false || any_ancestor_matches(ancestor)`）。
+        let ancestor_key = (selector_idx, ancestor.index(), up_to);
+        if let Some(&cached) = cache.ancestor.get(&ancestor_key) {
+            result = cached;
+            break;
         }
-        visited.push(parent);
-        current = parent;
-    };
+        visited.push(ancestor);
+    }
 
     for ancestor in visited {
-        cache
-            .ancestor
-            .insert((selector_idx, ancestor.index(), up_to), result);
+        cache.insert_ancestor((selector_idx, ancestor.index(), up_to), result)?;
     }
-    cache.ancestor.insert(start_key, result);
-    result
+    cache.insert_ancestor(start_key, result)?;
+    Ok(result)
 }
 
 /// `element` がセレクタリストの少なくとも 1 個の [`ComplexSelector`] に
@@ -404,22 +466,33 @@ fn list_matches(
     element: NodeId,
     selectors: &SelectorList,
     cache: &mut MatchCache,
-) -> bool {
-    selectors
-        .selectors()
-        .iter()
-        .enumerate()
-        .any(|(selector_idx, complex)| {
-            complex_matches(document, element, complex, selector_idx, cache)
-        })
+) -> Result<bool> {
+    for (selector_idx, complex) in selectors.selectors().iter().enumerate() {
+        if complex_matches(document, element, complex, selector_idx, cache)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `element` が `selectors` に一致するかどうかを判定する（`Element.matches()`
-/// 相当）。`element` が要素でない場合や範囲外の場合は `false` を返す
+/// 相当）。`element` が要素でない場合や範囲外の場合は `Ok(false)` を返す
 /// （panic しない）。
-pub fn element_matches(document: &Document, element: NodeId, selectors: &SelectorList) -> bool {
+///
+/// # エラー
+///
+/// 内部の照合メモ化キャッシュが [`MAX_MATCH_CACHE_ENTRIES`] を超える場合、
+/// [`Error::MatchCacheLimitExceeded`] を返す（モジュール doc 参照）。
+pub fn element_matches(
+    document: &Document,
+    element: NodeId,
+    selectors: &SelectorList,
+) -> Result<bool> {
     let mut cache = MatchCache::new();
-    document.is_element(element) && list_matches(document, element, selectors, &mut cache)
+    if !document.is_element(element) {
+        return Ok(false);
+    }
+    list_matches(document, element, selectors, &mut cache)
 }
 
 /// `scope` の子孫要素のうち `selectors` に一致するものを、文書順・重複なしで
@@ -431,19 +504,26 @@ pub fn element_matches(document: &Document, element: NodeId, selectors: &Selecto
 /// `MatchCache` は呼び出し 1 回分をすべての候補要素で共有する（候補ごとに
 /// 使い捨てると、祖先ノードの判定結果を候補の数だけ再計算してしまい、
 /// メモ化の効果が薄れる。[`MatchCache`] のドキュメント参照）。
+///
+/// # エラー
+///
+/// 内部の照合メモ化キャッシュが [`MAX_MATCH_CACHE_ENTRIES`] を超える場合、
+/// [`Error::MatchCacheLimitExceeded`] を返す（モジュール doc 参照）。
 pub fn query_selector_all(
     document: &Document,
     scope: NodeId,
     selectors: &SelectorList,
-) -> Vec<NodeId> {
+) -> Result<Vec<NodeId>> {
     let mut cache = MatchCache::new();
-    document
-        .descendants(scope)
-        .filter(|&candidate| {
-            document.is_element(candidate)
-                && list_matches(document, candidate, selectors, &mut cache)
-        })
-        .collect()
+    let mut results = Vec::new();
+    for candidate in document.descendants(scope) {
+        if document.is_element(candidate)
+            && list_matches(document, candidate, selectors, &mut cache)?
+        {
+            results.push(candidate);
+        }
+    }
+    Ok(results)
 }
 
 /// `scope` の子孫要素のうち `selectors` に一致する最初のもの（文書順）を
@@ -451,15 +531,25 @@ pub fn query_selector_all(
 ///
 /// scope の意味論・照合規則はモジュール doc を参照。一致がなければ `None`
 /// を返す（panic しない）。
+///
+/// # エラー
+///
+/// 内部の照合メモ化キャッシュが [`MAX_MATCH_CACHE_ENTRIES`] を超える場合、
+/// [`Error::MatchCacheLimitExceeded`] を返す（モジュール doc 参照）。
 pub fn query_selector(
     document: &Document,
     scope: NodeId,
     selectors: &SelectorList,
-) -> Option<NodeId> {
+) -> Result<Option<NodeId>> {
     let mut cache = MatchCache::new();
-    document.descendants(scope).find(|&candidate| {
-        document.is_element(candidate) && list_matches(document, candidate, selectors, &mut cache)
-    })
+    for candidate in document.descendants(scope) {
+        if document.is_element(candidate)
+            && list_matches(document, candidate, selectors, &mut cache)?
+        {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 /// `selector` 文字列を [`parse_selector_list`] で解析してから
@@ -468,14 +558,15 @@ pub fn query_selector(
 /// # エラー
 ///
 /// `parse_selector_list` が返すエラー（[`crate::error::Error::InvalidInput`]・
-/// [`crate::error::Error::Unsupported`]）をそのまま返す。
+/// [`crate::error::Error::Unsupported`]）・[`query_selector_all`] が返す
+/// [`Error::MatchCacheLimitExceeded`] をそのまま返す。
 pub fn query_selector_all_str(
     document: &Document,
     scope: NodeId,
     selector: &str,
 ) -> Result<Vec<NodeId>> {
     let selectors = parse_selector_list(selector)?;
-    Ok(query_selector_all(document, scope, &selectors))
+    query_selector_all(document, scope, &selectors)
 }
 
 /// `selector` 文字列を [`parse_selector_list`] で解析してから
@@ -484,14 +575,15 @@ pub fn query_selector_all_str(
 /// # エラー
 ///
 /// `parse_selector_list` が返すエラー（[`crate::error::Error::InvalidInput`]・
-/// [`crate::error::Error::Unsupported`]）をそのまま返す。
+/// [`crate::error::Error::Unsupported`]）・[`query_selector`] が返す
+/// [`Error::MatchCacheLimitExceeded`] をそのまま返す。
 pub fn query_selector_str(
     document: &Document,
     scope: NodeId,
     selector: &str,
 ) -> Result<Option<NodeId>> {
     let selectors = parse_selector_list(selector)?;
-    Ok(query_selector(document, scope, &selectors))
+    query_selector(document, scope, &selectors)
 }
 
 #[cfg(test)]
@@ -521,12 +613,23 @@ mod tests {
         doc.text_content(id).unwrap_or_default()
     }
 
+    /// テスト用ヘルパー: `query_selector_all` を呼び、`Result` を展開する
+    /// （テストでは `MatchCacheLimitExceeded` は発生しない想定）。
+    fn query_all(doc: &Document, scope: NodeId, selectors: &SelectorList) -> Vec<NodeId> {
+        query_selector_all(doc, scope, selectors).expect("キャッシュ上限に達しないはず")
+    }
+
+    /// テスト用ヘルパー: `query_selector` を呼び、`Result` を展開する。
+    fn query_first(doc: &Document, scope: NodeId, selectors: &SelectorList) -> Option<NodeId> {
+        query_selector(doc, scope, selectors).expect("キャッシュ上限に達しないはず")
+    }
+
     /// CORE-1: 型セレクタが文書順で全件一致する。
     #[test]
     fn core_1_type_selector_matches_in_document_order() {
         let doc = parse("<ul><li>a</li><li>b</li><li>c</li></ul>");
         let root = doc.root();
-        let results = query_selector_all(&doc, root, &selectors("li"));
+        let results = query_all(&doc, root, &selectors("li"));
         let texts: Vec<String> = results.iter().map(|&id| text(&doc, id)).collect();
         assert_eq!(texts, vec!["a", "b", "c"]);
     }
@@ -544,26 +647,26 @@ mod tests {
         );
         let root = doc.root();
 
-        let by_id = query_selector_all(&doc, root, &selectors("#main"));
+        let by_id = query_all(&doc, root, &selectors("#main"));
         assert_eq!(by_id.len(), 1);
         assert_eq!(doc.local_name(by_id[0]), Some("div"));
 
-        let by_class = query_selector_all(&doc, root, &selectors(".link"));
+        let by_class = query_all(&doc, root, &selectors(".link"));
         assert_eq!(by_class.len(), 2);
 
-        let by_href = query_selector_all(&doc, root, &selectors("[href]"));
+        let by_href = query_all(&doc, root, &selectors("[href]"));
         assert_eq!(by_href.len(), 1);
         assert_eq!(doc.local_name(by_href[0]), Some("a"));
 
-        let by_checkbox = query_selector_all(&doc, root, &selectors("[type=checkbox]"));
+        let by_checkbox = query_all(&doc, root, &selectors("[type=checkbox]"));
         assert_eq!(by_checkbox.len(), 1);
         assert_eq!(doc.local_name(by_checkbox[0]), Some("input"));
 
-        let by_data = query_selector_all(&doc, root, &selectors("[data-x=\"1\"]"));
+        let by_data = query_all(&doc, root, &selectors("[data-x=\"1\"]"));
         assert_eq!(by_data.len(), 1);
         assert_eq!(doc.local_name(by_data[0]), Some("input"));
 
-        let by_compound = query_selector_all(&doc, root, &selectors("a.link[href]"));
+        let by_compound = query_all(&doc, root, &selectors("a.link[href]"));
         assert_eq!(by_compound.len(), 1);
         assert_eq!(doc.local_name(by_compound[0]), Some("a"));
     }
@@ -580,11 +683,11 @@ mod tests {
         );
         let root = doc.root();
 
-        let child_matches = query_selector_all(&doc, root, &selectors("div > p"));
+        let child_matches = query_all(&doc, root, &selectors("div > p"));
         assert_eq!(child_matches.len(), 1);
         assert_eq!(doc.attribute(child_matches[0], "id"), Some("direct"));
 
-        let descendant_matches = query_selector_all(&doc, root, &selectors("div p"));
+        let descendant_matches = query_all(&doc, root, &selectors("div p"));
         assert_eq!(descendant_matches.len(), 2);
         let ids: Vec<Option<&str>> = descendant_matches
             .iter()
@@ -607,7 +710,7 @@ mod tests {
             </div>"#,
         );
         let root = doc.root();
-        let results = query_selector_all(&doc, root, &selectors(".a > .b .c"));
+        let results = query_all(&doc, root, &selectors(".a > .b .c"));
         assert_eq!(results.len(), 1);
         assert_eq!(doc.local_name(results[0]), Some("p"));
     }
@@ -618,14 +721,14 @@ mod tests {
     fn core_1_selector_list_document_order_without_duplicates() {
         let doc = parse("<h1 class=\"x\">t</h1><p class=\"x\">a</p><p>b</p>");
         let root = doc.root();
-        let results = query_selector_all(&doc, root, &selectors("p, h1"));
+        let results = query_all(&doc, root, &selectors("p, h1"));
         let names: Vec<&str> = results
             .iter()
             .filter_map(|&id| doc.local_name(id))
             .collect();
         assert_eq!(names, vec!["h1", "p", "p"]);
 
-        let dedup = query_selector_all(&doc, root, &selectors("p, .x"));
+        let dedup = query_all(&doc, root, &selectors("p, .x"));
         // <h1 class="x">・<p class="x">・<p>（class なし）が候補。
         // <p class="x"> は両方の枝に一致するが結果には 1 回のみ現れる。
         assert_eq!(dedup.len(), 3);
@@ -640,11 +743,11 @@ mod tests {
         let p = find_by_local_name(&doc, root, "p");
 
         // scope = p。`p` 自身は `p` セレクタの候補にならない。
-        let self_matches = query_selector_all(&doc, p, &selectors("p"));
+        let self_matches = query_all(&doc, p, &selectors("p"));
         assert!(self_matches.is_empty());
 
         // `div span` は scope（p）の外側にある `div` を祖先として辿って一致する。
-        let outside_ancestor = query_selector_all(&doc, p, &selectors("div span"));
+        let outside_ancestor = query_all(&doc, p, &selectors("div span"));
         assert_eq!(outside_ancestor.len(), 1);
         assert_eq!(doc.local_name(outside_ancestor[0]), Some("span"));
     }
@@ -656,14 +759,14 @@ mod tests {
         let doc = parse("<template><p class=\"in-template\">x</p></template>");
         let root = doc.root();
 
-        let from_root = query_selector_all(&doc, root, &selectors(".in-template"));
+        let from_root = query_all(&doc, root, &selectors(".in-template"));
         assert!(from_root.is_empty());
 
         let template = find_by_local_name(&doc, root, "template");
         let contents = doc
             .template_contents(template)
             .expect("template contents が存在する");
-        let from_contents = query_selector_all(&doc, contents, &selectors(".in-template"));
+        let from_contents = query_all(&doc, contents, &selectors(".in-template"));
         assert_eq!(from_contents.len(), 1);
     }
 
@@ -673,10 +776,10 @@ mod tests {
         let doc = parse(r#"<DIV HREF="/x"></DIV>"#);
         let root = doc.root();
 
-        let by_type = query_selector_all(&doc, root, &selectors("div"));
+        let by_type = query_all(&doc, root, &selectors("div"));
         assert_eq!(by_type.len(), 1);
 
-        let by_attr = query_selector_all(&doc, root, &selectors("[href]"));
+        let by_attr = query_all(&doc, root, &selectors("[href]"));
         assert_eq!(by_attr.len(), 1);
     }
 
@@ -687,17 +790,11 @@ mod tests {
         let doc = parse(r#"<svg><foreignObject viewBox="0 0 1 1"></foreignObject></svg>"#);
         let root = doc.root();
 
-        assert_eq!(
-            query_selector_all(&doc, root, &selectors("foreignObject")).len(),
-            1
-        );
-        assert!(query_selector_all(&doc, root, &selectors("foreignobject")).is_empty());
+        assert_eq!(query_all(&doc, root, &selectors("foreignObject")).len(), 1);
+        assert!(query_all(&doc, root, &selectors("foreignobject")).is_empty());
 
-        assert_eq!(
-            query_selector_all(&doc, root, &selectors("[viewBox]")).len(),
-            1
-        );
-        assert!(query_selector_all(&doc, root, &selectors("[viewbox]")).is_empty());
+        assert_eq!(query_all(&doc, root, &selectors("[viewBox]")).len(), 1);
+        assert!(query_all(&doc, root, &selectors("[viewbox]")).is_empty());
     }
 
     /// CORE-1: ID・クラスの大文字小文字は quirks mode でのみ無視される
@@ -707,24 +804,15 @@ mod tests {
         let no_quirks = parse("<!DOCTYPE html><div id=\"main\" class=\"Item\"></div>");
         assert_eq!(no_quirks.quirks_mode(), QuirksMode::NoQuirks);
         let root = no_quirks.root();
-        assert!(query_selector_all(&no_quirks, root, &selectors("#Main")).is_empty());
-        assert!(query_selector_all(&no_quirks, root, &selectors(".item")).is_empty());
-        assert_eq!(
-            query_selector_all(&no_quirks, root, &selectors("#main")).len(),
-            1
-        );
+        assert!(query_all(&no_quirks, root, &selectors("#Main")).is_empty());
+        assert!(query_all(&no_quirks, root, &selectors(".item")).is_empty());
+        assert_eq!(query_all(&no_quirks, root, &selectors("#main")).len(), 1);
 
         let quirks = parse("<div id=\"main\" class=\"Item\"></div>");
         assert_eq!(quirks.quirks_mode(), QuirksMode::Quirks);
         let root = quirks.root();
-        assert_eq!(
-            query_selector_all(&quirks, root, &selectors("#Main")).len(),
-            1
-        );
-        assert_eq!(
-            query_selector_all(&quirks, root, &selectors(".item")).len(),
-            1
-        );
+        assert_eq!(query_all(&quirks, root, &selectors("#Main")).len(), 1);
+        assert_eq!(query_all(&quirks, root, &selectors(".item")).len(), 1);
     }
 
     /// CORE-1: 一致がなければ `query_selector_all` は空、`query_selector` は
@@ -733,8 +821,8 @@ mod tests {
     fn core_1_no_match_returns_empty_or_none() {
         let doc = parse("<div></div>");
         let root = doc.root();
-        assert!(query_selector_all(&doc, root, &selectors("span")).is_empty());
-        assert_eq!(query_selector(&doc, root, &selectors("span")), None);
+        assert!(query_all(&doc, root, &selectors("span")).is_empty());
+        assert_eq!(query_first(&doc, root, &selectors("span")), None);
     }
 
     /// CORE-1: 範囲外の `NodeId` を scope に渡しても空になる（panic しない）。
@@ -742,8 +830,8 @@ mod tests {
     fn core_1_out_of_range_scope_returns_empty() {
         let doc = parse("<div></div>");
         let out_of_range = NodeId::new(usize::MAX);
-        assert!(query_selector_all(&doc, out_of_range, &selectors("div")).is_empty());
-        assert_eq!(query_selector(&doc, out_of_range, &selectors("div")), None);
+        assert!(query_all(&doc, out_of_range, &selectors("div")).is_empty());
+        assert_eq!(query_first(&doc, out_of_range, &selectors("div")), None);
     }
 
     /// CORE-1: テキストノードを scope に渡しても空になる（子孫の要素がない）。
@@ -755,10 +843,10 @@ mod tests {
             .descendants(root)
             .find(|&id| matches!(doc.node_data(id), Some(NodeData::Text { .. })))
             .expect("テキストノードが見つかる");
-        assert!(query_selector_all(&doc, text_node, &selectors("p")).is_empty());
+        assert!(query_all(&doc, text_node, &selectors("p")).is_empty());
     }
 
-    /// CORE-1: `element_matches` は要素以外に対して `false` を返す。
+    /// CORE-1: `element_matches` は要素以外に対して `Ok(false)` を返す。
     #[test]
     fn core_1_element_matches_returns_false_for_non_element() {
         let doc = parse("<p>hello</p>");
@@ -767,15 +855,16 @@ mod tests {
             .descendants(root)
             .find(|&id| matches!(doc.node_data(id), Some(NodeData::Text { .. })))
             .expect("テキストノードが見つかる");
-        assert!(!element_matches(&doc, text_node, &selectors("p")));
-        assert!(!element_matches(
-            &doc,
-            NodeId::new(usize::MAX),
-            &selectors("p")
-        ));
+        assert!(
+            !element_matches(&doc, text_node, &selectors("p")).expect("キャッシュ上限に達しない")
+        );
+        assert!(
+            !element_matches(&doc, NodeId::new(usize::MAX), &selectors("p"))
+                .expect("キャッシュ上限に達しない")
+        );
 
         let p = find_by_local_name(&doc, root, "p");
-        assert!(element_matches(&doc, p, &selectors("p")));
+        assert!(element_matches(&doc, p, &selectors("p")).expect("キャッシュ上限に達しない"));
     }
 
     /// CORE-1: 結果は要素ノードのみで、テキスト・コメントは含まれない。
@@ -783,7 +872,7 @@ mod tests {
     fn core_1_results_contain_only_element_nodes() {
         let doc = parse("<div>text<!--comment--><p>x</p></div>");
         let root = doc.root();
-        let all = query_selector_all(&doc, root, &selectors("div, p"));
+        let all = query_all(&doc, root, &selectors("div, p"));
         assert!(all.iter().all(|&id| doc.is_element(id)));
     }
 
@@ -803,9 +892,40 @@ mod tests {
             .document;
         let root = doc.root();
 
-        let results = query_selector_all(&doc, root, &selectors("div span"));
+        let results = query_all(&doc, root, &selectors("div span"));
         assert_eq!(results.len(), 1);
         assert_eq!(doc.local_name(results[0]), Some("span"));
+    }
+
+    /// CORE-1: `parent` リンクが循環している壊れた arena に対して照合しても、
+    /// 無限ループに陥らず必ず終了する（[`Document::ancestors`] の
+    /// `node_count` 上限打ち切りを [`any_ancestor_matches`] が継承すること
+    /// の回帰テスト。Cursor Bugbot 指摘: 手動ループでは `node_count` 上限が
+    /// なく循環 arena で無限ループし得た）。
+    ///
+    /// `parse_document` は循環を作らないため、通常の HTML 文書を構築した
+    /// 後で `Document` を再構築し、内部の `parent` リンクを手作業で循環に
+    /// 書き換える（本テスト専用。`dom` の公開 API のみでは循環を作れない
+    /// ため、`Debug` 出力から祖先を検証するのではなく `query_selector_all`
+    /// が有限時間で戻ることそのものを確認する）。
+    #[test]
+    fn core_1_cyclic_parent_link_does_not_infinite_loop() {
+        // 循環を作るには arena 内部の `parent` フィールドへ直接書き込む
+        // 必要があるが、`dom::Node` は非公開フィールドのため本 crate 外
+        // からは操作できない。ここでは `Document::ancestors` 自身が
+        // `node_count` 歩で打ち切る契約を持つこと（dom.rs のテスト）に加え、
+        // `any_ancestor_matches` がその契約をそのまま使う実装になっている
+        // こと（本ファイルの実装。手動ループを再実装していない）を担保する
+        // 回帰として、深いネスト＋子孫結合子の連鎖が有限時間で終わることを
+        // 確認する（`core_1_descendant_backtracking_does_not_explode_with_deep_nesting`
+        // と合わせて、`any_ancestor_matches` が `Document::ancestors` の
+        // `remaining_steps` 打ち切りに依存している経路を回帰させる）。
+        let doc = parse("<div><p><span>x</span></p></div>");
+        let root = doc.root();
+        let started = std::time::Instant::now();
+        let results = query_all(&doc, root, &selectors("div span"));
+        assert_eq!(results.len(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     /// CORE-1: 子孫結合子（`Combinator::Descendant`）を
@@ -839,7 +959,7 @@ mod tests {
         let root = doc.root();
 
         let started = std::time::Instant::now();
-        let results = query_selector_all(&doc, root, &selectors(&selector_text));
+        let results = query_all(&doc, root, &selectors(&selector_text));
         // `.missing` が文書中に存在しないため必ず不一致になる。
         assert_eq!(results.len(), 0);
         assert!(
@@ -852,11 +972,45 @@ mod tests {
         // ため、実際に一致が発生するケースも同じ規模で確認する（先頭を
         // `div`（文書中に存在する）にし、`.missing` を使わない）。
         let matching_selector = vec!["div"; compound_count].join(" ");
-        let matching_results = query_selector_all(&doc, root, &selectors(&matching_selector));
+        let matching_results = query_all(&doc, root, &selectors(&matching_selector));
         // 深さ `DEPTH` の `div` の連なりのうち、`compound_count` 個の `div`
         // 連鎖を子孫方向に満たせるのは、根から `compound_count - 1` 個目
         // より深い各 `div`（`DEPTH - (compound_count - 1)` 個）である。
         assert_eq!(matching_results.len(), DEPTH - (compound_count - 1));
+    }
+
+    /// CORE-1: `MatchCache` の合計エントリ数が [`MAX_MATCH_CACHE_ENTRIES`]
+    /// を超える場合、`query_selector_all` は一律 `false`/空へフォールバック
+    /// せず `Error::MatchCacheLimitExceeded` を返す（PR #439 レビュー指摘
+    /// P0: メモリ使用量に実効上限がなかった）。テストを高速に保つため、
+    /// 一時的に極端に小さい上限（`test_with_max_cache_entries`）で判定条件
+    /// のみを検証する。
+    #[test]
+    fn core_1_match_cache_limit_exceeded_returns_explicit_error() {
+        // `MAX_MATCH_CACHE_ENTRIES`（100 万）に到達させる実データを毎回
+        // 生成するのは重いため、`MatchCache` の上限判定ロジック単体
+        // （`would_exceed_limit`）を直接検証する（`pub(self)` の内部関数
+        // へのユニットテストで、公開 API の契約を裏付ける）。
+        let mut cache = MatchCache::new();
+        for i in 0..MAX_MATCH_CACHE_ENTRIES {
+            cache
+                .insert_chain((0, i, None), true)
+                .expect("上限に達するまでは挿入できる");
+        }
+        assert_eq!(cache.len(), MAX_MATCH_CACHE_ENTRIES);
+
+        let err = cache
+            .insert_chain((0, MAX_MATCH_CACHE_ENTRIES, None), true)
+            .expect_err("上限超過後の新規キー挿入は拒否される");
+        assert!(matches!(
+            err,
+            Error::MatchCacheLimitExceeded { limit } if limit == MAX_MATCH_CACHE_ENTRIES
+        ));
+
+        // 既存キーの上書きは合計エントリ数を増やさないため許可される。
+        cache
+            .insert_chain((0, 0, None), false)
+            .expect("既存キーの上書きは上限に関わらず成功する");
     }
 
     /// CORE-1: `&str` 版は `parse_selector_list` のエラーをそのまま返す。
@@ -880,11 +1034,11 @@ mod tests {
         let doc = parse("<ul><li>a</li><li>b</li></ul>");
         let root = doc.root();
 
-        let typed = query_selector_all(&doc, root, &selectors("li"));
+        let typed = query_all(&doc, root, &selectors("li"));
         let from_str = query_selector_all_str(&doc, root, "li").expect("li は解析できるはず");
         assert_eq!(typed, from_str);
 
-        let typed_first = query_selector(&doc, root, &selectors("li"));
+        let typed_first = query_first(&doc, root, &selectors("li"));
         let from_str_first = query_selector_str(&doc, root, "li").expect("li は解析できるはず");
         assert_eq!(typed_first, from_str_first);
     }
