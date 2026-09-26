@@ -329,8 +329,12 @@ servoshell 系（TASK-36 で確定したオプション名に合わせて読み�
 `viewport` と不一致・エンジンバイナリ不在等でプロセスを起動できなかった場合を含む）/
 `timeout` / `skipped`（`{html_path}` のスナップショット取得に失敗した場合）のいずれか。
 `partial` キーは `--engines` で 1 エンジンのみを指定した実行にのみ付く。
-`input` は `"url"`（テンプレートが `{url}` を直接使う）または `"snapshot"`
-（`{html_path}` 経由でスナップショットを使う）で、`--dry-run` の結果では `null`。
+`input` は `"url"`（テンプレートが `{url}` を直接使う）・`"snapshot"`
+（`{html_path}` 経由でスナップショットを使う）・`"snapshot+url"`
+（`{html_path}` と `{url}` を両方使うテンプレートで、エンジンへスナップショットの
+パスと元 URL の両方が渡っている場合。codex P2: 併用時に `"snapshot"` のまま
+にすると実態と食い違い、撮影条件の判別を誤る）のいずれかで、`--dry-run` の
+結果では `null`。
 `--out-dir` を使い回す再実行では、実行前に前回の PNG を必ず削除してから撮影する
 （プロセスが PNG を出力しなくても前回分の残置ファイルで `ok` 誤判定にならない）。
 
@@ -420,6 +424,14 @@ python3 -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
   超えないことを確認し、展開中も 64 KiB 刻みで期待値超過を検知した時点で
   打ち切る（画素データが存在しない・破損しているファイルを "ok" と誤判定
   しない。codex P1）
+- `sites.json` の `viewport.width`/`height` は `[1, 10000]`（`MIN_VIEWPORT`〜
+  `MAX_VIEWPORT`）の範囲だけでなく、`load_sites` の時点でこの viewport が
+  生成しうる PNG の最悪ケース（RGBA・16bit。PNG が許す最大のチャンネル数・
+  ビット深度）の展開後サイズが `MAX_PNG_RAW_BYTES`（256 MiB）を超えないことも
+  確認する。範囲内でも、例えば 10000x10000 は非圧縮で約 400 MiB になり
+  `read_png_size` が必ず `failed` にしてしまうため、load 時点で拒否する
+  （正方形の viewport ではおおよそ 5790 角までが実質的な上限になる。既定の
+  1280x800 は最悪ケースでも約 7.8 MiB で上限に遠く及ばない。codex P2）
 - `--timeout-sec` / `--settle-ms` / `--min-sites` は有限かつ範囲内の値のみを
   受け付け、`nan` / `inf` / 0 以下 / 極端に大きい値は起動時に拒否する
 - 撮影用の一時 `--user-data-dir`（Chromium）はテンプレート展開・スナップショット

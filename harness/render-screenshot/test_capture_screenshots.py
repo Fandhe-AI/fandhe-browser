@@ -170,6 +170,35 @@ class LoadSitesTest(unittest.TestCase):
             with self.assertRaises(cs.SiteListError):
                 cs.load_sites(path, min_sites=5)
 
+    def test_rejects_viewport_whose_worst_case_png_exceeds_max_png_raw_bytes(self) -> None:
+        # codex P2: `MIN_VIEWPORT`〜`MAX_VIEWPORT`（1〜10000）の範囲は許可して
+        # いても、`read_png_size`（`MAX_PNG_RAW_BYTES` = 256 MiB）が展開後
+        # サイズで拒否する組み合わせでは、撮影が成功しても検証段階で必ず
+        # `failed` になる（10000x10000 の RGBA は非圧縮で約 400 MiB）。
+        # 範囲内だが解凍後サイズが大きすぎる viewport は load 時点で拒否する。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sites.json"
+            write_sites_json(
+                path,
+                [make_site(f"ok-{i}") for i in range(5)],
+                viewport={"width": 10000, "height": 10000},
+            )
+            with self.assertRaises(cs.SiteListError):
+                cs.load_sites(path, min_sites=5)
+
+    def test_accepts_default_viewport_well_under_max_png_raw_bytes(self) -> None:
+        # 上のテストとの対照実験: 既定の 1280x800 のような通常の viewport は
+        # 新しい検証で拒否されないことを確認する（回帰防止）。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sites.json"
+            write_sites_json(
+                path,
+                [make_site(f"ok-{i}") for i in range(5)],
+                viewport={"width": 1280, "height": 800},
+            )
+            viewport, _sites = cs.load_sites(path, min_sites=5)
+            self.assertEqual(viewport, {"width": 1280, "height": 800})
+
 
 class CountCommonOkSitesTest(unittest.TestCase):
     """RENDER-5 / TASK-37.1: `_count_common_ok_sites`（両エンジン共通 ok 件数。codex P1）。
@@ -2094,6 +2123,39 @@ class DirectNavigationAllowlistTest(unittest.TestCase):
                     proxy_url="http://127.0.0.1:1",
                 )
             self.assertEqual(record["status"], "ok")
+            # codex P2: `{html_path}` と `{url}` を併用するテンプレートでは、
+            # エンジンへ実際に両方が渡っているのに `input` が `"snapshot"` の
+            # ままだと、結果 JSON を読む後続処理（#54 の measure_ssim.py 等）が
+            # 撮影条件を誤認する。併用時であることが分かる値になっていることを
+            # 確認する。
+            self.assertEqual(record["input"], "snapshot+url")
+
+    def test_input_is_snapshot_only_when_template_uses_only_html_path(self) -> None:
+        # 上のテストとの対照実験: `{html_path}` のみのテンプレートでは従来どおり
+        # `"snapshot"` のままであることを確認する（既存契約を変えない）。
+        with tempfile.TemporaryDirectory() as tmp:
+            site = cs.Site(
+                site_id="html-only", url="https://example.invalid/a", category="static", catalog_id="z1"
+            )
+            with mock.patch.object(cs, "fetch_snapshot", return_value=None):
+                record = cs.capture_one(
+                    site,
+                    "chromium",
+                    [sys.executable, str(FAKE_ENGINE), "--out", "{out}", "--html", "{html_path}"],
+                    out_dir=Path(tmp),
+                    snapshots_dir=Path(tmp) / "snapshots",
+                    chromium_bin=None,
+                    width=1280,
+                    height=800,
+                    settle_ms=1000,
+                    timeout_sec=5,
+                    allow_file_url=False,
+                    dry_run=False,
+                    allow_unproxied_engine=True,
+                    proxy_url="http://127.0.0.1:1",
+                )
+            self.assertEqual(record["status"], "ok")
+            self.assertEqual(record["input"], "snapshot")
 
 
 class DefaultChromiumTemplateTest(unittest.TestCase):

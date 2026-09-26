@@ -242,6 +242,20 @@ def load_sites(
         raise SiteListError(f"viewport width out of range [{MIN_VIEWPORT}, {MAX_VIEWPORT}]")
     if not isinstance(height, int) or not (MIN_VIEWPORT <= height <= MAX_VIEWPORT):
         raise SiteListError(f"viewport height out of range [{MIN_VIEWPORT}, {MAX_VIEWPORT}]")
+    # codex P2: `MIN_VIEWPORT`〜`MAX_VIEWPORT` の範囲自体は許可していても、
+    # `read_png_size`（`MAX_PNG_RAW_BYTES` = 256 MiB）が展開後サイズで拒否する
+    # 組み合わせでは、撮影が成功しても検証段階で必ず `failed` になる
+    # （例: 10000x10000 の RGBA は非圧縮で約 400 MiB）。RGBA 16bit（PNG が
+    # 許す最大のチャンネル数・ビット深度）を最悪ケースとして
+    # `_expected_raw_size` で見積もり、この viewport で撮った PNG が
+    # `read_png_size` を通過しうることを load 時点で確認する。
+    worst_case_raw_size = _expected_raw_size(width, height, color_type=6, bit_depth=16, interlace=0)
+    if worst_case_raw_size > MAX_PNG_RAW_BYTES:
+        raise SiteListError(
+            f"viewport {width}x{height} could produce a decompressed PNG up to "
+            f"{worst_case_raw_size} bytes, exceeding the {MAX_PNG_RAW_BYTES} byte "
+            "limit enforced by read_png_size; choose a smaller viewport"
+        )
 
     raw_sites = data.get("sites")
     if not isinstance(raw_sites, list) or not raw_sites:
@@ -1333,7 +1347,20 @@ def capture_one(
     # （P1: 再実行時の残置ファイル誤判定対策）。
     out_path.unlink(missing_ok=True)
 
-    input_kind = "snapshot" if needs_html else "url"
+    # codex P2: `{html_path}` と `{url}` を併用するテンプレート（エンジンへ
+    # スナップショットのパスと元 URL の両方を渡すもの）では、実際には両方が
+    # エンジンに渡っているにもかかわらず `"snapshot"` としてしまうと、
+    # 結果 JSON の `input`（README が撮影条件の判別契約として説明する値）が
+    # 実態と食い違い、後続の比較処理（#54 の measure_ssim.py 等）が撮影条件を
+    # 誤認しうる。併用時は既存の 2 値のいずれとも異なる `"snapshot+url"` を
+    # 用いる（既存の `"url"`/`"snapshot"`/`null` の意味は変えない追加的な値
+    # にとどめ、まだ実装されていない #54 側との互換性の判断もしやすくする）。
+    if needs_html and needs_url:
+        input_kind = "snapshot+url"
+    elif needs_html:
+        input_kind = "snapshot"
+    else:
+        input_kind = "url"
     user_data_dir: str | None = None
     try:
         if needs_user_data_dir:
