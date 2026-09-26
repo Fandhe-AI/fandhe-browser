@@ -40,3 +40,36 @@ rustls = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+# TASK-84.1（Issue #211・ビヘイビア PERF-1・PERF-3・PERF-6・AISNAP-1）:
+# Lightpanda 比較ベンチスクリプトのホスト先。ルート Cargo.toml は仮想 manifest
+# （`members = ["crates/*"]`）でありベンチを直接ホストできず、`fandhe-browser-cli`
+# （TASK-41.5・Issue #174）は未作成のため、現時点で実ビルドを持つ唯一の member
+# である本 crate を暫定ホストとする（TASK-27 が計測する CORE-2/3/4 の所有者でも
+# ある）。`path` は workspace ルート直下の `benches/` を指す相対パスで、依存の
+# 追加ではない（新規外部依存なし。dependency-policy.md の対象外）。
+# `fandhe-browser-cli` 追加後はそちらへ移設すること。
+[[bench]]
+name = "competitor_lightpanda"
+path = "../../benches/competitor_lightpanda.rs"
+harness = false
+
+[[test]]
+name = "competitor_lightpanda_support"
+path = "../../benches/competitor_lightpanda/support.rs"
+
+# レビュー指摘（コーディネーター指示。PR #442 再々々々々々々々々レビュー・
+# crates/fandhe-browser-core/Cargo.toml:57）: AGENTS.md「ユニットテストと
+# 結合テストの併置」に基づき、fixture サーバーの起動・対象プロセスとの
+# 通信・計測結果・終了コードまでを通す結合テストを追加する（対象:
+# PERF-3・PERF-6・AISNAP-1）。対象バイナリを模したローカルプロセスは
+# このテストバイナリ自身の再実行（`std::env::current_exe()`）で実現し、
+# 役割は `--fandhe-fake-role` 引数で渡す。fake MCP は stdout に
+# JSON-RPC 応答の行だけを書く契約のため、libtest ハーネスの出力
+# （"running N tests" 等）が混入しないよう `harness = false` にし、
+# `measure_tests.rs` 自身が独自の `main` でケースを順に実行する
+# （`measure_tests.rs` 冒頭のドキュメント参照）。
+[[test]]
+name = "competitor_lightpanda_measure"
+path = "../../benches/competitor_lightpanda/measure_tests.rs"
+harness = false

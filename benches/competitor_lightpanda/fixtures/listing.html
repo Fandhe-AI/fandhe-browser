@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<!--
+  competitor_lightpanda ベンチ用の自作フィクスチャ（TASK-84.1・Issue #211）。
+  一覧・カード形式のページ構造を模した新規作成コンテンツ。外部サイトの
+  複製ではなく、外部参照（http(s):// や // で始まる src/href）も含まない。
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sample Listing</title>
+</head>
+<body>
+<header>
+<h1>Sample Item Listing</h1>
+</header>
+<main>
+<section aria-label="items">
+<ul>
+<li>
+<h2>First Item</h2>
+<p>A short description of the first sample item used only for local
+benchmarking.</p>
+<a href="#first-item-details">Details</a>
+</li>
+<li>
+<h2>Second Item</h2>
+<p>A short description of the second sample item, distinct from the
+first so the page has some varied text content.</p>
+<a href="#second-item-details">Details</a>
+</li>
+<li>
+<h2>Third Item</h2>
+<p>A short description of the third sample item, included to give the
+listing a realistic length.</p>
+<a href="#third-item-details">Details</a>
+</li>
+</ul>
+</section>
+<section id="first-item-details">
+<h3>First Item Details</h3>
+<p>Additional local-only text for the first item.</p>
+</section>
+<section id="second-item-details">
+<h3>Second Item Details</h3>
+<p>Additional local-only text for the second item.</p>
+</section>
+<section id="third-item-details">
+<h3>Third Item Details</h3>
+<p>Additional local-only text for the third item.</p>
+</section>
+</main>
+<footer>
+<p>End of sample listing fixture.</p>
+</footer>
+</body>
+</html>
