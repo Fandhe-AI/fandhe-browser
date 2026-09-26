@@ -267,17 +267,32 @@ impl std::error::Error for DisallowedAddressMarker {}
 /// `pub(crate)` のため名指しできず、同じ具象型を直接綴る）。
 type DnsBoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// IPv4 アドレスがループバック・プライベート・リンクローカル・未指定・
-/// ブロードキャスト・ドキュメント用のいずれかに該当するかを判定する
-/// （security.md「SSRF」: 内部アドレスの無検証アクセスを避けるための
-/// 分類。すべて `std` の安定 API のみを使う）。
+/// IPv4 アドレスが一般公開向けの到達性を持たない特殊用途アドレスかを
+/// 判定する（security.md「SSRF」）。
+///
+/// `std::net::Ipv4Addr` の安定 API（`is_loopback`・`is_private` 等）は
+/// IANA の "IANA IPv4 Special-Purpose Address Registry" の一部しか
+/// カバーしない（共有アドレス空間 `100.64.0.0/10`・ベンチマーク用
+/// `198.18.0.0/15` 等が抜け落ちる）ため、それらだけでは内部・非公開
+/// アドレスの一部を許可してしまう。ここでは「一般公開アドレスとして
+/// 到達を許可してよい」を明確に定義し、レジストリに列挙された特殊用途
+/// ブロックを漏れなく列挙することでその補集合（= 拒否対象）を判定する
+/// （個別分類の enum ではなく既知ブロックの網羅的な denylist で
+/// allowlist と同義の判定にする）。
 fn is_disallowed_ipv4(v4: Ipv4Addr) -> bool {
-    v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-        || v4.is_documentation()
+    let octets = v4.octets();
+    v4.is_loopback() // 127.0.0.0/8
+        || v4.is_private() // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+        || v4.is_link_local() // 169.254.0.0/16
+        || v4.is_unspecified() // 0.0.0.0
+        || v4.is_broadcast() // 255.255.255.255
+        || v4.is_documentation() // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+        || octets[0] == 0 // 0.0.0.0/8 ("this network")
+        || (octets[0] == 100 && (64..=127).contains(&octets[1])) // 100.64.0.0/10 共有アドレス空間（CGN）
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // 192.0.0.0/24 IETF Protocol Assignments
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99) // 192.88.99.0/24 6to4 Relay Anycast
+        || (octets[0] == 198 && (18..=19).contains(&octets[1])) // 198.18.0.0/15 ベンチマーク用
+        || octets[0] >= 224 // 224.0.0.0/4 マルチキャスト + 240.0.0.0/4 予約済み
 }
 
 /// [`IpAddr`] が内部アドレス（ループバック・プライベートアドレス等）か
@@ -306,13 +321,18 @@ fn is_disallowed_address(ip: IpAddr) -> bool {
 /// 「SSRF」）を満たす。host が IP リテラルの場合は DNS を介さずそのまま
 /// 検証される（`std::net::ToSocketAddrs` が IP リテラルをそのまま返すため）。
 ///
-/// DNS 解決は `std::net::ToSocketAddrs`（システムの getaddrinfo）を直接
-/// await 前の非同期ブロック内で同期呼び出しする。本 crate は tokio を直接の
-/// 依存に持たない（`fandhe-browser-core/Cargo.toml`: tokio は結合テスト用の
+/// DNS 解決は `std::net::ToSocketAddrs`（システムの getaddrinfo）を使うが、
+/// これは同期 API であるため、そのまま非同期ブロック内で直接呼び出すと
+/// DNS が遅延・停止した際に呼び出し元の tokio ワーカースレッドを占有し、
+/// 他タスクの実行や `FetchOptions::connect_timeout`/`timeout` の計時までも
+/// 止めてしまう（security.md「不安全な設計」）。本 crate は tokio を直接の
+/// 依存に持たない契約（`fandhe-browser-core/Cargo.toml`: tokio は結合テスト用の
 /// dev-dependency のみ。dependency-policy.md によりユーザー承認なしに
-/// 依存を追加できない）ため、reqwest 既定の `GaiResolver` のような
-/// `spawn_blocking` へのオフロードは行わない。DNS 解決のレイテンシは
-/// `FetchOptions::connect_timeout` の範囲内に収まる前提の妥協である。
+/// ランタイム依存へ昇格できない）ため、`tokio::task::spawn_blocking` は
+/// 使えない。代わりに [`resolve_blocking`] が `std::thread::spawn` で
+/// 解決専用の OS スレッドへオフロードし、[`BlockingDnsFuture`]（`std` のみで
+/// 組んだ最小限の oneshot future）で非同期に結果を受け取ることで、
+/// 呼び出し元の非同期ランタイムのスレッドをブロックしない。
 struct SafeResolver {
     allow_private_network_access: bool,
 }
@@ -322,12 +342,7 @@ impl Resolve for SafeResolver {
         let allow_private_network_access = self.allow_private_network_access;
         let host = name.as_str().to_string();
         Box::pin(async move {
-            // ポートは `reqwest` が URL 由来の値で上書きする契約（`Resolve`
-            // のドキュメント）のため、ここでは 0 を渡す。
-            let addrs: Vec<SocketAddr> = (host.as_str(), 0u16)
-                .to_socket_addrs()
-                .map_err(|source| Box::new(source) as DnsBoxError)?
-                .collect();
+            let addrs = resolve_blocking(host).await?;
             if !allow_private_network_access
                 && let Some(addr) = addrs.iter().find(|addr| is_disallowed_address(addr.ip()))
             {
@@ -336,6 +351,78 @@ impl Resolve for SafeResolver {
             Ok(Box::new(addrs.into_iter()) as Addrs)
         })
     }
+}
+
+/// [`resolve_blocking`] の完了通知を保持する内部状態。
+///
+/// `result` と `waker` を同一の `Mutex` の下に置くことで、送信側
+/// （解決スレッド）と受信側（[`BlockingDnsFuture::poll`]）のどちらが先に
+/// 実行されても「結果を書き込んだのに waker が未登録で wake が失われる」
+/// レースを起こさない（両者とも同じロックを取ってから読み書きするため）。
+struct BlockingDnsInner {
+    result: Option<std::result::Result<Vec<SocketAddr>, DnsBoxError>>,
+    waker: Option<std::task::Waker>,
+}
+
+/// `host` を専用スレッドで解決した結果を運ぶ、`std` のみで組んだ最小限の
+/// oneshot future（[`SafeResolver::resolve`] 用。tokio 非依存の理由は
+/// [`SafeResolver`] のドキュメント参照）。
+struct BlockingDnsFuture(Arc<std::sync::Mutex<BlockingDnsInner>>);
+
+impl std::future::Future for BlockingDnsFuture {
+    type Output = std::result::Result<Vec<SocketAddr>, DnsBoxError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut inner = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(result) = inner.result.take() {
+            return std::task::Poll::Ready(result);
+        }
+        inner.waker = Some(cx.waker().clone());
+        std::task::Poll::Pending
+    }
+}
+
+/// `host` の名前解決（`std::net::ToSocketAddrs`）を専用の OS スレッドで
+/// 実行し、[`BlockingDnsFuture`] で非同期に結果を返す。ポートは `reqwest`
+/// が URL 由来の値で上書きする契約（`Resolve` のドキュメント）のため、
+/// ここでは 0 を渡す。スレッド生成自体が失敗した場合（OS リソース枯渇等）
+/// もエラーとして返し、`panic`/`unwrap` はしない。
+fn resolve_blocking(host: String) -> BlockingDnsFuture {
+    let state = Arc::new(std::sync::Mutex::new(BlockingDnsInner {
+        result: None,
+        waker: None,
+    }));
+    let spawn_result = std::thread::Builder::new()
+        .name("fandhe-browser-dns-resolve".to_string())
+        .spawn({
+            let state = Arc::clone(&state);
+            move || {
+                let outcome = (host.as_str(), 0u16)
+                    .to_socket_addrs()
+                    .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
+                    .map_err(|source| Box::new(source) as DnsBoxError);
+                let mut inner = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                inner.result = Some(outcome);
+                if let Some(waker) = inner.waker.take() {
+                    waker.wake();
+                }
+            }
+        });
+    if let Err(source) = spawn_result {
+        let mut inner = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.result = Some(Err(Box::new(source) as DnsBoxError));
+    }
+    BlockingDnsFuture(state)
 }
 
 impl Fetcher {
@@ -747,6 +834,30 @@ mod tests {
         }
     }
 
+    /// CORE-1（#36。PR #430 コードレビュー指摘。SSRF P0 再指摘）:
+    /// `is_disallowed_address` は `std::net::Ipv4Addr` の安定 API が
+    /// カバーしない特殊用途ブロック（共有アドレス空間・ベンチマーク用等）
+    /// も内部アドレスとして拒否する（`is_disallowed_ipv4` のドキュメント
+    /// 参照）。
+    #[test]
+    fn core_1_is_disallowed_address_detects_ipv4_special_purpose_blocks() {
+        let disallowed = [
+            "100.64.0.1",      // 100.64.0.0/10 共有アドレス空間（CGN）
+            "100.127.255.254", // 100.64.0.0/10 の範囲末尾
+            "198.18.0.1",      // 198.18.0.0/15 ベンチマーク用
+            "198.19.255.254",  // 198.18.0.0/15 の範囲末尾
+            "192.0.0.1",       // 192.0.0.0/24 IETF Protocol Assignments
+            "192.88.99.1",     // 192.88.99.0/24 6to4 Relay Anycast
+            "224.0.0.1",       // マルチキャスト
+            "240.0.0.1",       // 予約済み
+            "0.0.0.1",         // 0.0.0.0/8 ("this network")
+        ];
+        for addr in disallowed {
+            let ip: IpAddr = addr.parse().expect("valid IPv4 literal");
+            assert!(is_disallowed_address(ip), "{addr} should be disallowed");
+        }
+    }
+
     /// CORE-1（#36。PR #430 コードレビュー指摘）: `is_disallowed_address` は
     /// グローバルに到達可能な IPv4 アドレスを内部アドレスとして誤判定しない。
     #[test]
@@ -827,6 +938,37 @@ mod tests {
         assert_eq!(
             addrs.next().map(|addr| addr.ip()),
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+    }
+
+    /// CORE-1（#36。PR #430 コードレビュー指摘 P1）: `resolve_blocking` は
+    /// `std::net::ToSocketAddrs` による同期 DNS 解決を非同期に完了させ、
+    /// 成功時は解決結果（`SocketAddr` の一覧）を返す（[`SafeResolver`] の
+    /// ドキュメント「解決専用の OS スレッドへオフロードする」の機能確認）。
+    #[tokio::test]
+    async fn core_1_resolve_blocking_resolves_ip_literal_host() {
+        let addrs = resolve_blocking("127.0.0.1".to_string())
+            .await
+            .expect("127.0.0.1 の解決は成功するはず");
+        assert!(
+            addrs
+                .iter()
+                .any(|addr| addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "127.0.0.1 の解決結果に自身のアドレスが含まれるはず: {addrs:?}"
+        );
+    }
+
+    /// CORE-1（#36。PR #430 コードレビュー指摘 P1）: `resolve_blocking` は
+    /// 解決に失敗した場合（存在しない/不正な host）も `panic` せず `Err` を
+    /// 返す（[`SafeResolver::resolve`] が `?` でそのまま伝播する経路の確認）。
+    #[tokio::test]
+    async fn core_1_resolve_blocking_returns_err_on_resolution_failure() {
+        // 空文字列 host は `ToSocketAddrs` の解決に失敗する（ポート指定なし
+        // のタプル形式では host 部の構文検証が先に働く）。
+        let result = resolve_blocking(String::new()).await;
+        assert!(
+            result.is_err(),
+            "空文字列 host の解決は Err になるはず: {result:?}"
         );
     }
 }
