@@ -105,52 +105,55 @@ fi
 CASES=$((CASES + 1))
 expect_contains "$LAST_OUTPUT" "category static: passed=3 total=3 threshold=70 result=PASS" "all-categories discovers static too"
 
-# cat 値に改行を含む場合、--all-categories のカテゴリ発見が改行区切りで壊れて
-# 別カテゴリへ分割されないことを確認する（codex review 指摘, PR #452。改行を
-# 含む cat 値「weird\ncase」の 4 件（passed=1）が 1 つのカテゴリとして集計され、
-# 分割後の "weird"（0 件）"case"（0 件）へ分かれて total=0 のまま見逃されないこと
-# を、集計結果の具体値まで比較して検証する）。
-expect_exit "cat value containing a newline is not split during --all-categories discovery" 1 \
+# cat 値に改行を含む場合、スキーマ検証（^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$）で
+# 明示的に拒否することを確認する（codex review 指摘, PR #452）。制限前は
+# 「weird\ncase」を 1 カテゴリとして正しく集計できることを検証していたが、
+# label をそのまま CI ログへ echo する judge() 経由で改行以降が GitHub Actions
+# のワークフローコマンドとして誤解釈され得るため、cat の文字種そのものを
+# 制限する方針に変更した（スキーマエラーで拒否するのが正しい挙動になった）。
+expect_exit "cat value containing a newline is rejected by schema validation" 2 \
+  --matrix "$FIXTURES/newline-cat.json"
+expect_contains "$LAST_OUTPUT" "cat must match" "newline cat rejected by the charset schema rule"
+expect_exit "cat value containing a newline is rejected with all-categories" 2 \
   --matrix "$FIXTURES/newline-cat.json" --all-categories
-expect_contains "$LAST_OUTPUT" $'category weird\ncase: passed=1 total=4 threshold=70 result=FAIL' \
-  "newline-containing cat value judged as a single category with correct counts"
-if grep -qE "^category (weird|case): passed=0 total=0" <<<"$LAST_OUTPUT"; then
-  echo "FAIL [newline cat not split]: cat value was split into separate zero-count categories" >&2
-  echo "  output: $LAST_OUTPUT" >&2
-  FAILURES=$((FAILURES + 1))
-fi
-CASES=$((CASES + 1))
 
-# cat 値が末尾に改行を含む場合（例: "spa\n"）、コマンド置換 `$(...)` が出力の
-# 末尾改行を剥ぎ取ってしまうと、末尾改行の無い別カテゴリ（"spa"）と誤って
-# 同一視され、両者が誤結合されて集計されてしまう（codex review 指摘
-# discussion_r4111644746, Windows self-test 失敗, PR #452）。上のケース
-# （embedded newline）はコマンド置換で失われないため検出できず、この
-# trailing newline のケースでのみ再現する。誤結合された場合、期待される
-# 「spa\n」（passed=1 total=4）と「spa」（passed=1 total=1）が
-# 「spa」（passed=2 total=5）1 本に化けるため、それぞれの具体値まで比較する。
-expect_exit "cat value with a trailing newline is not merged with the same name without it" 1 \
+# cat 値が末尾に改行を含む場合（例: "spa\n"）も同じスキーマ検証で拒否される
+# ことを確認する（codex review 指摘 discussion_r4111644746, Windows self-test
+# 失敗, PR #452）。jq の正規表現エンジン（Oniguruma）は "$" が末尾改行の直前にも
+# マッチするため、アンカーには "\A"/"\z" を使う必要がある（"^...$" のままだと
+# "spa\n" がスキーマを通過してしまう。実測で確認済み）。
+expect_exit "cat value with a trailing newline is rejected by schema validation" 2 \
+  --matrix "$FIXTURES/trailing-newline-cat.json"
+expect_contains "$LAST_OUTPUT" "cat must match" "trailing-newline cat rejected by the charset schema rule"
+expect_exit "cat value with a trailing newline is rejected with all-categories" 2 \
   --matrix "$FIXTURES/trailing-newline-cat.json" --all-categories
-expect_contains "$LAST_OUTPUT" $'category spa\n: passed=1 total=4 threshold=70 result=FAIL' \
-  "trailing-newline cat value keeps its own count"
-expect_contains "$LAST_OUTPUT" "category spa: passed=1 total=1 threshold=70 result=PASS" \
-  "plain spa cat value is not merged with the trailing-newline one"
-if grep -qE "^category spa: passed=2 total=5" <<<"$LAST_OUTPUT"; then
-  echo "FAIL [trailing newline cat merged]: trailing-newline cat value was merged with plain 'spa'" >&2
-  echo "  output: $LAST_OUTPUT" >&2
-  FAILURES=$((FAILURES + 1))
-fi
-CASES=$((CASES + 1))
 
-# cat 値に NUL 文字（\u0000）を含む場合はスキーマ検証で明示的に拒否する
+# cat 値に NUL 文字（\u0000）を含む場合も同じスキーマ検証で拒否する
 # （codex review 指摘, PR #452。bash の変数・コマンド置換は NUL を保持できず、
 # --all-categories の列挙・判定を通すと "static\u0000spa" が "staticspa" 相当に
 # 化けて誤ったカテゴリへ結合され得るため、静かな誤判定ではなく exit 2 の
 # 診断可能なエラーにする）。
 expect_exit "cat value containing NUL is rejected by schema validation" 2 \
   --matrix "$FIXTURES/nul-cat.json"
+expect_contains "$LAST_OUTPUT" "cat must match" "NUL cat rejected by the charset schema rule"
 expect_exit "cat value containing NUL is rejected with all-categories" 2 \
   --matrix "$FIXTURES/nul-cat.json" --all-categories
+
+# cat 値が許可文字種（英数字・`.`・`_`・`-`、先頭は英数字、64 文字以内）に
+# 一致する限り、`.`・`_`・`-` を含んでいても --all-categories で正しく発見・
+# 集計できることを確認する（許可文字種の境界を実データで検証する）。
+expect_exit "cat value with allowed punctuation is judged correctly" 0 \
+  --matrix "$FIXTURES/punctuation-cat.json" --all-categories
+expect_contains "$LAST_OUTPUT" "category lazy-load.v2_x: passed=3 total=3 threshold=70 result=PASS" \
+  "punctuation cat value keeps its own count"
+
+# --categories も cat と同じ文字種制限に従うことを確認する（記号なしの
+# 単純な値は不合格系フィクスチャで既に検証済みのため、ここでは記号を含む
+# 値が使用エラーになることを確認する）。
+expect_exit "categories value with disallowed character is rejected" 2 \
+  --matrix "$FIXTURES/pass.json" --categories 'static spa'
+expect_exit "categories value starting with punctuation is rejected" 2 \
+  --matrix "$FIXTURES/pass.json" --categories '-static'
 
 # --- 入力・使用エラー系（exit 2） ---
 

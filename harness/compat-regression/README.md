@@ -26,7 +26,7 @@ Issue #68・人間担当）。そのため `.github/workflows/ci.yml`・`Makefil
 | フィールド | 型 | 必須 | 説明 |
 | ---------- | -- | ---- | ---- |
 | `id` | 非空文字列 | 必須 | サイト・ケースの識別子。配列内で重複不可 |
-| `cat` | 文字列 | 必須 | `static` / `spa` / `lazy` / `form` / `table` 等の類型（PoC-9 の分類を踏襲。値自体は任意の非空文字列として扱う。空文字列・NUL 文字（`\u0000`）を含む値はスキーマ違反として拒否する。NUL は bash の変数・コマンド置換が保持できず、`--all-categories` の列挙・判定で別カテゴリへ誤結合し得るため） |
+| `cat` | 文字列 | 必須 | `static` / `spa` / `lazy` / `form` / `table` 等の類型（PoC-9 の分類を踏襲）。`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`（英数字・`.`・`_`・`-`、先頭は英数字、64 文字以内）に一致しない値（空文字列・改行・NUL・その他制御文字を含む）はスキーマ違反として拒否する。この値は `judge()` の label としてそのまま CI ログへ `echo` されるため、改行や制御文字を許すと GitHub Actions のワークフローコマンド（`::add-mask::` 等）として誤解釈されるおそれがある（codex review 指摘, PR #452）。NUL は bash の変数・コマンド置換が保持できず `--all-categories` の列挙・判定で別カテゴリへ誤結合し得る点も同時に塞ぐ |
 | `<key>` | boolean | 必須 | 動作可否。既定のキー名は `fandhe_browser_core`（`--key` で変更可） |
 | `chromium` | boolean | 任意 | 参考値（比較用の Chromium 実測）。判定には使わない |
 
@@ -51,8 +51,8 @@ harness/compat-regression/check-matrix.sh \
 - `--matrix`: マトリクス JSON のパス（必須）
 - `--threshold`: 全体・各類型に共通の合格閾値（既定 70。0〜100 の整数のみ・先頭ゼロ不可（bash の 8 進数解釈を避けるため）。`passed * 100 >= threshold * total` で判定し、閾値ちょうどは合格）
 - `--key`: 判定に使う boolean フィールド名（既定 `fandhe_browser_core`）
-- `--categories`: 個別にも 70% 以上を要求する `cat` 値の CSV（例: `static,spa,form`）。列挙した類型のエントリが 0 件なら使用エラー（exit 2）。列挙した類型が「必ずマトリクスに存在すること」を保証する用途
-- `--all-categories`: `--categories` の CSV に加え、マトリクス内に実在する **全ての** `cat` 値を判定対象にする。`cat` はスキーマ上任意の文字列を許すため、`--categories` の固定 CSV だけでは呼び出し側が列挙し忘れた類型（例: `lazy`・`table`）が閾値未満でも検出されずに通過し得る（COMPAT-1 が要求する類型別回帰検出の抜け）。CI・`make check-compat-regression` はこのフラグを付けて呼び出す
+- `--categories`: 個別にも 70% 以上を要求する `cat` 値の CSV（例: `static,spa,form`）。各値は `cat` と同じ `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` に一致すること（不一致は使用エラー exit 2）。列挙した類型のエントリが 0 件なら使用エラー（exit 2）。列挙した類型が「必ずマトリクスに存在すること」を保証する用途
+- `--all-categories`: `--categories` の CSV に加え、マトリクス内に実在する **全ての** `cat` 値を判定対象にする。`--categories` の固定 CSV だけでは呼び出し側が列挙し忘れた類型（例: `lazy`・`table`）が閾値未満でも検出されずに通過し得る（COMPAT-1 が要求する類型別回帰検出の抜け）。CI・`make check-compat-regression` はこのフラグを付けて呼び出す
 - `--allow-missing`: `--matrix` のファイルが存在しない場合に `::warning::` を出して exit 0 にする（実マトリクス未導入期間の暫定運用。上記「実マトリクスは未導入」参照）
 
 ## 終了コード

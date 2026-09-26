@@ -90,8 +90,12 @@ if ! [[ "$KEY" =~ ^[A-Za-z0-9_]+$ ]]; then
   echo "error: --key must match ^[A-Za-z0-9_]+\$ (got: $KEY)" >&2
   exit 2
 fi
-if [ -n "$CATEGORIES" ] && ! [[ "$CATEGORIES" =~ ^[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*$ ]]; then
-  echo "error: --categories must match ^[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*\$ (got: $CATEGORIES)" >&2
+# マトリクス側の cat 値と同じ文字種（英数字・`.`・`_`・`-`、先頭は英数字、64 文字
+# 以内）に揃える。ここが cat 側より狭いと、マトリクスに合法に存在し得る cat 値
+# （例: "lazy-load"）を --categories で指定できなくなる（PR #452 レビュー指摘）。
+CATEGORY_ITEM_RE='[A-Za-z0-9][A-Za-z0-9._-]{0,63}'
+if [ -n "$CATEGORIES" ] && ! [[ "$CATEGORIES" =~ ^${CATEGORY_ITEM_RE}(,${CATEGORY_ITEM_RE})*$ ]]; then
+  echo "error: --categories must be a comma-separated list of values matching ^${CATEGORY_ITEM_RE}\$" >&2
   exit 2
 fi
 
@@ -154,15 +158,18 @@ if ! SCHEMA_ERR=$(jq -r --arg key "$KEY" '
       "duplicate id detected in matrix"
     elif ([.[] | select((.cat? | type) != "string" or (.cat | length) == 0)] | length) > 0 then
       "each entry requires a non-empty string cat"
-    elif ([.[] | select((.cat? | type) == "string" and (.cat | contains("\u0000")))] | length) > 0 then
-      # NUL 文字（\u0000）を含む cat は JSON としては合法だが、bash の変数・
-      # コマンド置換は NUL を保持できない（C 文字列前提のため代入時に切り詰め
-      # られる。実測で確認済み）。--all-categories の列挙・判定は cat 値を
-      # 一度 bash 変数へ格納するため、NUL を含む値は別カテゴリへの誤結合
-      # （例: "static\u0000spa" が "staticspa" 相当に化ける）を起こし得る
-      # （codex review 指摘, PR #452）。スキーマ検証の時点で明確な理由と共に
-      # 拒否し、静かな誤判定ではなく exit 2 の診断可能なエラーにする。
-      "cat must not contain NUL characters (\\u0000): unsupported by the shell-based matrix tool"
+    elif ([.[] | select((.cat? | type) == "string" and ((.cat | test("\\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\\z")) | not))] | length) > 0 then
+      # cat は英数字・`.`・`_`・`-` のみ、先頭は英数字、64 文字以内に制限する
+      # （codex review 指摘, PR #452）。制限前は任意の非空文字列を許していたため、
+      # 改行・NUL・制御文字を含む cat 値を label に埋め込んでそのまま `echo` する
+      # judge() 経由で、改行以降が GitHub Actions のワークフロー
+      # コマンド（`::add-mask::`・`::stop-commands::` 等）として CI ログで解釈
+      # されるおそれがあった。あわせて NUL を含む値は bash の変数・コマンド置換
+      # で保持できず（C 文字列前提で切り詰められる）、--all-categories の列挙・
+      # 判定で別カテゴリへ誤結合し得た。安全な文字種への制限はこれらを一括で
+      # 塞ぐ（"\\A"・"\\z" を使うのは、Oniguruma の "$" が末尾改行の直前にも
+      # マッチし "spa\n" のような値を通してしまうため。実測で確認済み）。
+      "cat must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ (newlines, NUL, and other control characters are rejected to avoid CI log / workflow-command injection)"
     elif ([.[] | select((.[$key]? | type) != "boolean")] | length) > 0 then
       ("each entry requires a boolean field: " + $key)
     elif ([.[] | select(has("chromium") and ((.chromium | type) != "boolean"))] | length) > 0 then
@@ -170,7 +177,7 @@ if ! SCHEMA_ERR=$(jq -r --arg key "$KEY" '
     else
       empty
     end
-  ' "$MATRIX" 2>&1); then
+  ' "$MATRIX" 2>&1 | tr -d '\r'); then
   echo "error: failed to parse matrix as JSON: $SCHEMA_ERR" >&2
   exit 2
 fi
@@ -248,26 +255,14 @@ fi
 # 検出されずに通過してしまう。TASK-9.2 レビュー指摘。--categories 側で既に
 # 判定済みの値は重複判定を避けるため除外する）。
 if [ "$ALL_CATEGORIES" -eq 1 ]; then
-  # README.md のスキーマは "cat" に任意の非空文字列（改行・CR を含む）を許容
-  # する。上のスキーマ検証で NUL（\u0000）を含む cat は既に exit 2 で拒否済み
-  # のため、ここに到達する cat 値には NUL が絶対に含まれない。したがって NUL
-  # を区切り文字に使っても実データと衝突しない（"foo\u0000bar" のような値は
-  # スキーマ検証で弾かれるため、区切りの NUL と値中の NUL が混同されることは
-  # ない）。
-  #
-  # 直前の実装は行区切り（jq の既定出力は 1 値 1 行、JSON エスケープ済み）で
-  # 読み取った行を `cat=$(jq -r '.' <<<"$cat_json")` でデコードしていたが、
-  # コマンド置換 `$(...)` は出力の「末尾の」改行をすべて剥ぎ取る仕様のため、
-  # デコード後の値自体が末尾改行を含む場合（例: "spa\n"）その改行が失われ、
-  # 末尾に改行の無い同名カテゴリ（例: "spa"）と誤って同一視されてしまう
-  # （codex review 指摘 discussion_r4111644746, Windows self-test 失敗, PR
-  # #452）。埋め込み改行（"weird\ncase" のように文字列の途中にある改行）は
-  # コマンド置換で失われないため self-test の既存ケースでは検出できなかった。
-  #
-  # `read -r -d ''` はプロセス置換からの入力を NUL バイトまで無加工で読み取り、
-  # コマンド置換を経由しないため、値の中身（先頭・末尾・埋め込みのいずれの
-  # 改行・CR も）を一切変更せず judge_category へ渡せる。
-  while IFS= read -r -d '' cat; do
+  # 上のスキーマ検証で cat は ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ に制限済みのため、
+  # 改行・CR・NUL を一切含み得ない。したがってプロセス置換からの出力を通常の
+  # 行区切りで読んでも、埋め込み改行による誤分割（"weird\ncase" が別カテゴリへ
+  # 分かれる）やコマンド置換の末尾改行剥ぎ取りによる誤結合（"spa\n" と "spa" の
+  # 混同）は起こり得ない（従来は cat に任意の非空文字列を許していたためこれらの
+  # 対策として NUL 区切り読み取りを使っていたが、スキーマ制限により不要になった。
+  # codex review 指摘, PR #452）。
+  while IFS= read -r cat; do
     already_judged=0
     if [ -n "$CATEGORIES" ]; then
       for done_cat in "${CAT_LIST[@]}"; do
@@ -280,7 +275,11 @@ if [ "$ALL_CATEGORIES" -eq 1 ]; then
     if [ "$already_judged" -eq 0 ]; then
       judge_category "$cat"
     fi
-  done < <(jq -j '[.[].cat] | unique | .[] | . + "\u0000"' "$MATRIX")
+  # jq は Windows ネイティブ実行時に行区切りとして CRLF を出す場合があり、
+  # 残った \r が cat 値に混入すると同名カテゴリ（例: "spa" と "spa\r"）が
+  # 誤って別カテゴリとして扱われる（windows-latest self-test 失敗の原因。
+  # PR #452）。`tr -d '\r'` で除去してから 1 行 1 値として読む。
+  done < <(jq -r '[.[].cat] | unique | .[]' "$MATRIX" | tr -d '\r')
 fi
 
 if [ "$FAIL" -eq 1 ]; then
