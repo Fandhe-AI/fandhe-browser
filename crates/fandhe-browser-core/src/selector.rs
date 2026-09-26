@@ -17,6 +17,14 @@
 //! （`[a=v]` / `[a="v"]` / `[a='v']`）・子孫結合子（空白）・子結合子（`>`）・
 //! カンマ区切りのセレクタリスト。
 //!
+//! 照合契約（TASK-24.10・REPAIR-3・`#418` が実装する）: AST（[`CompoundSelector::type_name`]・
+//! [`AttributeSelector::name`]）には入力の表記をそのまま保持し、本モジュールでは
+//! 大文字小文字の正規化を行わない。`dom::Data::Element` は html5ever の
+//! `QualName` を保持するため、SVG の `foreignObject`・`viewBox` のような
+//! 大文字小文字混在の名前は元の表記のままでないと復元できない。照合時は
+//! HTML 名前空間の要素・属性に限り ASCII 大文字小文字を区別せず、それ以外
+//! （SVG・MathML 等）の名前空間では区別する（[`html_local_name_eq`] 参照）。
+//!
 //! 対象外の構文（`Error::Unsupported` を返す）: `*`（全称セレクタ）・
 //! 疑似クラス / 疑似要素（`:`・`::`）・隣接 / 一般兄弟結合子（`+` / `~`）・
 //! 名前空間（`|`）・`=` 以外の属性演算子（`~=` `|=` `^=` `$=` `*=`）・
@@ -134,7 +142,12 @@ pub struct CompoundSelector {
 }
 
 impl CompoundSelector {
-    /// 型名（ASCII 小文字に正規化済み）。型セレクタを持たない場合は `None`。
+    /// 型名（入力の表記のまま。大文字小文字の正規化はしない）。
+    /// 型セレクタを持たない場合は `None`。
+    ///
+    /// 照合時（`#418`）は HTML 名前空間の要素に限り ASCII 大文字小文字を
+    /// 無視して比較する（[`html_local_name_eq`] 参照）。SVG の
+    /// `foreignObject` のような非 HTML 名前空間の名前は完全一致で比較する。
     pub fn type_name(&self) -> Option<&str> {
         self.type_name.as_deref()
     }
@@ -170,10 +183,26 @@ pub enum SimpleSelector {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AttributeSelector {
-    /// 属性名（ASCII 小文字に正規化済み）。
+    /// 属性名（入力の表記のまま。大文字小文字の正規化はしない）。
+    ///
+    /// 照合時（`#418`）は HTML 名前空間の要素に限り ASCII 大文字小文字を
+    /// 無視して比較する（[`html_local_name_eq`] 参照）。SVG の `viewBox`
+    /// のような非 HTML 名前空間の属性名は完全一致で比較する。
     pub name: String,
     /// 照合方法。
     pub matcher: AttributeMatcher,
+}
+
+/// HTML 名前空間における要素名・属性名の比較ヘルパー
+/// （ASCII 大文字小文字を区別しない）。
+///
+/// [`CompoundSelector::type_name`]・[`AttributeSelector::name`] は入力の
+/// 表記をそのまま保持しているため、HTML 名前空間の要素・属性と照合する際は
+/// このヘルパーを使う。SVG・MathML 等の非 HTML 名前空間では通常の完全一致
+/// （`==`）で比較すること（モジュール doc の照合契約を参照。実装は
+/// `query`・TASK-24.10・#418）。
+pub fn html_local_name_eq(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
 }
 
 /// 属性セレクタの照合方法。
@@ -285,6 +314,12 @@ fn parse_ident(cursor: &mut Cursor<'_>) -> Result<String> {
             .get(next_offset..)
             .and_then(|s| s.chars().next());
         match next {
+            // `-\...` はハイフンで始まるエスケープ済み識別子として文法上は
+            // 正当だが、本モジュールはエスケープ全般を未対応としている
+            // （モジュール doc）。他のエスケープ経路（先頭・継続ループの
+            // `\`）と同じく `Unsupported` にして契約を統一する
+            // （PR #432 レビュー指摘）。
+            Some('\\') => return Err(unsupported_at(next_offset, "escape")),
             Some(c) if is_ident_start_or_hyphen(c) => {}
             _ => return Err(invalid_input_at(start_offset, "invalid identifier")),
         }
@@ -353,7 +388,6 @@ fn parse_attribute_selector(cursor: &mut Cursor<'_>) -> Result<AttributeSelector
         Some('\\') => return Err(unsupported_at(name_offset, "escape")),
         _ => return Err(invalid_input_at(name_offset, "expected attribute name")),
     };
-    let name = name.to_ascii_lowercase();
 
     cursor.skip_whitespace();
 
@@ -412,7 +446,7 @@ fn parse_compound_selector(cursor: &mut Cursor<'_>) -> Result<CompoundSelector> 
         && is_ident_start_or_hyphen(c)
     {
         let ident = parse_ident(cursor)?;
-        type_name = Some(ident.to_ascii_lowercase());
+        type_name = Some(ident);
     }
 
     loop {
@@ -918,24 +952,56 @@ mod tests {
         assert_eq!(list.selectors(), &[simple_type("div")]);
     }
 
-    /// CORE-1: 型名・属性名は ASCII 小文字に正規化される。
+    /// CORE-1: 型名・属性名は入力の表記のまま保持され、正規化されない
+    /// （SVG の `foreignObject`・`viewBox` のような大文字小文字混在の名前を
+    /// AST から復元できるようにするため。照合時の大文字小文字の扱いは
+    /// `html_local_name_eq`・`#418` が担う）。
     #[test]
-    fn core_1_normalizes_type_and_attribute_name_case() {
+    fn core_1_preserves_type_and_attribute_name_case() {
         let list = parse_selector_list("DIV").expect("DIV は解析できるはず");
-        assert_eq!(list.selectors(), &[simple_type("div")]);
+        assert_eq!(list.selectors(), &[simple_type("DIV")]);
 
         let list = parse_selector_list("[HREF]").expect("[HREF] は解析できるはず");
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: None,
                 simple_selectors: vec![SimpleSelector::Attribute(AttributeSelector {
-                    name: "href".to_string(),
+                    name: "HREF".to_string(),
                     matcher: AttributeMatcher::Exists,
                 })],
             },
             rest: Vec::new(),
         };
         assert_eq!(list.selectors(), &[expected]);
+    }
+
+    /// CORE-1: SVG の `foreignObject`（型名）・`viewBox`（属性名）のような
+    /// 大文字小文字混在の名前が、そのままの表記で AST に保持される
+    /// （PR #432 レビュー指摘: html5ever の `QualName` からの復元に必要）。
+    #[test]
+    fn core_1_preserves_svg_mixed_case_names() {
+        let list = parse_selector_list("foreignObject[viewBox]")
+            .expect("foreignObject[viewBox] は解析できるはず");
+        let expected = ComplexSelector {
+            first: CompoundSelector {
+                type_name: Some("foreignObject".to_string()),
+                simple_selectors: vec![SimpleSelector::Attribute(AttributeSelector {
+                    name: "viewBox".to_string(),
+                    matcher: AttributeMatcher::Exists,
+                })],
+            },
+            rest: Vec::new(),
+        };
+        assert_eq!(list.selectors(), &[expected]);
+    }
+
+    /// CORE-1: `html_local_name_eq` は ASCII 大文字小文字を無視して
+    /// 比較する（HTML 名前空間での照合契約）。
+    #[test]
+    fn core_1_html_local_name_eq_is_ascii_case_insensitive() {
+        assert!(html_local_name_eq("DIV", "div"));
+        assert!(html_local_name_eq("viewBox", "viewbox"));
+        assert!(!html_local_name_eq("div", "span"));
     }
 
     /// CORE-1: クラス・ID は大文字小文字を区別したまま保持される。
@@ -1018,6 +1084,12 @@ mod tests {
             "[a=v i]",
             ".a\\:b",
             "&",
+            // ハイフンで始まるエスケープ済み識別子（文法上は正当だが、本
+            // モジュールはエスケープ全般を未対応としている。PR #432
+            // レビュー指摘: 先頭・継続ループの `\` と同じ Unsupported に
+            // すること）。
+            "-\\a",
+            ".-\\a",
         ];
         for input in unsupported_inputs {
             let err = parse_selector_list(input)
