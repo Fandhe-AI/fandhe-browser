@@ -47,7 +47,7 @@ cargo test --workspace
 | ID | 種別 | 対象 | 内容 | 規模見積 |
 | -- | ---- | ---- | ---- | -------- |
 | R-1 | 新機能追加（PoC-10 T-1 相当） | core / `dom.rs`（+ `lib.rs` の再エクスポート） | 要素ノードだけを文書順に返す `Document::element_children(id)` と、そのイテレータ型 `ElementChildren` を追加する（DOM の `ParentNode.children` 相当） | 0.5〜1h（既存 `Children` イテレータの流用で完結） |
-| R-2 | 既存機能拡張（T-2 相当） | core / `dom.rs` | `class_names` を土台に `Document::has_class(id, name)` を追加する。no-quirks / limited-quirks では大文字小文字を区別し、`QuirksMode::Quirks` のときだけ ASCII 大文字小文字を区別しない（Selectors / DOM 仕様の quirks mode 規定） | 約 1h |
+| R-2 | 既存機能拡張（T-2 相当） | core / `dom.rs` | `class_names` を土台に `Document::has_class(id, name)` を追加する。DOM の `classList.contains` 相当の汎用 API として、quirks mode に関わらず常に厳密一致（大文字小文字を区別する）とする。quirks mode 依存のクラス名照合（ASCII 大文字小文字を区別しない）はセレクタ側の関心事として本候補では扱わない（下記「候補詳細」参照） | 約 1h |
 | R-3 | バグ修正・注入バグ（T-3 相当） | core / `dom.rs` | 試行用ブランチで `Document::text_content` の Element 分岐に「最初の Text 子孫を読み飛ばす」オフバイワンを注入し、改修担当は既存テストの失敗だけを手がかりに原因を特定して修正する | 約 0.5h |
 | R-4 | 仕様追加・既存 API 拡張（T-4 相当） | core / `fetch.rs` | `FetchResponse` に、Content-Type ヘッダを WHATWG MIME Sniffing の「parse a MIME type」のサブセットで解析した構造化型 `MimeType`（`#[non_exhaustive]`・`type_()` / `subtype()` / `essence()`）を返す `mime_type()` を追加する。パラメータ（charset を含む）は保持しない | 約 1h |
 | R-5 | 診断の構造化（T-5 相当） | core / `parse.rs` | `ParseDiagnostics` に、行番号付きの構造化エントリ（`ParseDiagnosticEntry { line: u64, message: String }`・`#[non_exhaustive]`）の列を追加する。html5ever の `TreeSink::set_current_line` フックで現在行を保持し、`parse_error` で行番号を付けて記録する。既存の `messages` は互換のため残す | 1.5〜2h |
@@ -73,11 +73,12 @@ cargo test --workspace
 
 ### R-2: `has_class`
 
+- `Document::has_class` は `classList.contains` 相当の汎用 DOM API であり、`class_names` が返す個々のクラス名との比較は quirks mode を問わず常に厳密一致（ASCII 大文字小文字を区別する）とする。DOM 側の汎用照合とセレクタ照合を同一メソッドに混在させない（セレクタ仕様の quirks mode 規定はクラスセレクタの照合規則であり、`Document` の汎用 API の契約ではないため）
 - `<!DOCTYPE html><p class="Foo bar">` で、`has_class(p,"Foo")` と `has_class(p,"bar")` は true、`has_class(p,"foo")` は false
-- doctype なし（quirks mode）の `<p class="Foo">` では `has_class(p,"foo")` が true
-- limited-quirks を返す doctype（例: XHTML 1.0 Transitional の public id）では区別する
+- doctype なし（quirks mode）の `<p class="Foo">` でも `has_class(p,"foo")` は false のまま（quirks mode でも大文字小文字を区別しない扱いにしない）
 - 非要素・範囲外 ID・空文字列の `name` は false
 - テスト名は `core_1_has_class_*`
+- **quirks mode を考慮したクラス名照合（セレクタの `.foo` がクラスセレクタとして quirks mode 下で ASCII 大文字小文字を区別せず照合する規定。Selectors 仕様）は本候補のスコープ外とし、`query`/セレクタ照合の実装（#418・#257）側で `has_class` とは別の専用照合関数として計画する**
 
 ### R-3: `text_content` のオフバイワン注入
 
