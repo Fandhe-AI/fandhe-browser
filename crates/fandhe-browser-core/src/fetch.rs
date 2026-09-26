@@ -22,6 +22,11 @@
 //!   あるため、呼び出し側が明示的に opt-in できるようにする
 //! - 外部入力の経路（レスポンスヘッダ・本文）で `unwrap`/`expect`/添字アクセス
 //!   を使わない
+//! - DNS 解決（[`SafeResolver`]）は名前解決のたびに専用の OS スレッドを
+//!   生成するため、同時実行数に [`MAX_CONCURRENT_DNS_RESOLUTIONS`] の上限を
+//!   設け、上限到達時は新規スレッドを生成せず
+//!   [`crate::Error::TooManyConcurrentDnsResolutions`] を返す（PR #430
+//!   コードレビュー指摘 P0: 無制限なスレッド生成による DoS を防ぐ）
 //!
 //! 本実装は async API（[`Fetcher::get`]）のみを提供し、`reqwest::blocking` は
 //! 使わない（tokio ランタイム内から呼ぶと panic するため。CDP サーバー
@@ -255,6 +260,74 @@ struct DisallowedAddressMarker {
     address: IpAddr,
 }
 
+/// 同時に起動できる DNS 解決専用スレッド（[`resolve_blocking`]）の上限。
+///
+/// `SafeResolver::resolve` は名前解決のたびに `resolve_blocking` を呼び、
+/// 都度専用の OS スレッドを新規生成する。外部から多数の異なる URL を
+/// 取得させられる経路（`cdp` の `Page.navigate` 等）では、DNS 応答が
+/// 遅延・停止してもこの同期呼び出しは中断されないため、上限を設けないと
+/// スレッド・メモリが無制限に増える（security.md「不安全な設計」。
+/// PR #430 コードレビュー指摘 P0）。値はプロセス全体で共有するリソース
+/// 上限の経験則的な固定値であり、`FetchOptions` のフィールドにはしない
+/// （`Fetcher` インスタンスごとに変えられると、複数の `Fetcher` を生成
+/// された場合に上限の意味が失われるため）。
+const MAX_CONCURRENT_DNS_RESOLUTIONS: usize = 64;
+
+/// 現在実行中の DNS 解決スレッド数。プロセス全体で共有し、
+/// [`resolve_blocking`] がスレッド生成前に
+/// [`try_acquire_dns_resolution_slot`] で確保、スレッド完了時に
+/// [`release_dns_resolution_slot`] で解放する。
+static ACTIVE_DNS_RESOLUTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// 実行中の DNS 解決スレッド数が [`MAX_CONCURRENT_DNS_RESOLUTIONS`] 未満で
+/// あれば 1 枠確保する（CAS ループ）。確保できた場合のみ `true` を返す。
+/// 呼び出し元（[`resolve_blocking`]）は、スレッド生成に成功した場合・
+/// 失敗した場合のいずれの経路でも必ず [`release_dns_resolution_slot`] を
+/// 呼んで解放する契約を守る。
+fn try_acquire_dns_resolution_slot() -> bool {
+    use std::sync::atomic::Ordering;
+    let mut current = ACTIVE_DNS_RESOLUTIONS.load(Ordering::Relaxed);
+    loop {
+        if current >= MAX_CONCURRENT_DNS_RESOLUTIONS {
+            return false;
+        }
+        match ACTIVE_DNS_RESOLUTIONS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// [`try_acquire_dns_resolution_slot`] で確保した枠を解放する。
+fn release_dns_resolution_slot() {
+    ACTIVE_DNS_RESOLUTIONS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// [`resolve_blocking`] が同時実行の DNS 解決スレッド上限
+/// （[`MAX_CONCURRENT_DNS_RESOLUTIONS`]）に達したときに埋め込む非公開
+/// マーカー。`DisallowedAddressMarker` と同じ downcast の仕組み
+/// （[`map_reqwest_error`]）で [`Error::TooManyConcurrentDnsResolutions`]
+/// へ書き換える（PR #430 コードレビュー指摘 P0）。
+#[derive(Debug)]
+struct TooManyDnsResolutionsMarker;
+
+impl std::fmt::Display for TooManyDnsResolutionsMarker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "too many concurrent DNS resolutions (limit: {MAX_CONCURRENT_DNS_RESOLUTIONS})"
+        )
+    }
+}
+
+impl std::error::Error for TooManyDnsResolutionsMarker {}
+
 impl std::fmt::Display for DisallowedAddressMarker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "disallowed target address: {}", self.address)
@@ -393,11 +466,46 @@ impl std::future::Future for BlockingDnsFuture {
 /// が URL 由来の値で上書きする契約（`Resolve` のドキュメント）のため、
 /// ここでは 0 を渡す。スレッド生成自体が失敗した場合（OS リソース枯渇等）
 /// もエラーとして返し、`panic`/`unwrap` はしない。
+///
+/// - 空文字列 host は明示的に拒否する。Unix/macOS の `getaddrinfo` は
+///   空文字列に対して `Err` を返すが、Windows は同じ空文字列に対して
+///   ローカルインターフェースのアドレス群を返す（`Err` にならない）ため、
+///   OS の解決結果に処理を委ねると 3 OS で挙動が食い違う（CI 実測。
+///   PR #430・ci.md「3 OS 一級対応」）。OS の意味論差を吸収し、3 OS で
+///   同一の `Err` 挙動にするため、スレッド生成前にここで判定する
+/// - 同時実行の DNS 解決スレッド数が [`MAX_CONCURRENT_DNS_RESOLUTIONS`]
+///   に達している場合、新規スレッドを生成せず [`TooManyDnsResolutionsMarker`]
+///   を伴う `Err` を返す（PR #430 コードレビュー指摘 P0。security.md
+///   「不安全な設計」）
 fn resolve_blocking(host: String) -> BlockingDnsFuture {
     let state = Arc::new(std::sync::Mutex::new(BlockingDnsInner {
         result: None,
         waker: None,
     }));
+
+    if host.is_empty() {
+        {
+            let mut inner = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inner.result = Some(Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "empty DNS host",
+            )) as DnsBoxError));
+        }
+        return BlockingDnsFuture(state);
+    }
+
+    if !try_acquire_dns_resolution_slot() {
+        {
+            let mut inner = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inner.result = Some(Err(Box::new(TooManyDnsResolutionsMarker) as DnsBoxError));
+        }
+        return BlockingDnsFuture(state);
+    }
+
     let spawn_result = std::thread::Builder::new()
         .name("fandhe-browser-dns-resolve".to_string())
         .spawn({
@@ -407,6 +515,7 @@ fn resolve_blocking(host: String) -> BlockingDnsFuture {
                     .to_socket_addrs()
                     .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
                     .map_err(|source| Box::new(source) as DnsBoxError);
+                release_dns_resolution_slot();
                 let mut inner = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -417,6 +526,7 @@ fn resolve_blocking(host: String) -> BlockingDnsFuture {
             }
         });
     if let Err(source) = spawn_result {
+        release_dns_resolution_slot();
         let mut inner = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -694,6 +804,10 @@ fn reject_unresolved_disallowed_redirect(response: &reqwest::Response) -> Result
 ///   [`Error::DisallowedAddress`] に写像する（`reqwest` は DNS リゾルバの
 ///   エラーを `DnsError`（`source()` で内側のエラーへ連鎖する）でラップして
 ///   返すため、`RedirectMarker` と同じ走査ループで検出できる）
+/// - [`resolve_blocking`] が同時実行の DNS 解決スレッド上限に達したエラーは、
+///   同じ走査で [`TooManyDnsResolutionsMarker`] へ `downcast_ref` できれば
+///   [`Error::TooManyConcurrentDnsResolutions`] に写像する（PR #430
+///   コードレビュー指摘 P0）
 /// - それ以外は `without_url()` で URL（userinfo・クエリを含み得る）を
 ///   取り除いたメッセージを [`Error::Network`] に詰める（外部型
 ///   `reqwest::Error` 自体は保持しない）
@@ -722,6 +836,11 @@ fn map_reqwest_error(source: reqwest::Error, options: &FetchOptions) -> Error {
         if let Some(marker) = err.downcast_ref::<DisallowedAddressMarker>() {
             return Error::DisallowedAddress {
                 address: marker.address.to_string(),
+            };
+        }
+        if err.downcast_ref::<TooManyDnsResolutionsMarker>().is_some() {
+            return Error::TooManyConcurrentDnsResolutions {
+                limit: MAX_CONCURRENT_DNS_RESOLUTIONS,
             };
         }
         cause = err.source();
@@ -783,6 +902,14 @@ impl FetchResponse {
 mod tests {
     use super::*;
     use std::net::Ipv6Addr;
+
+    /// [`ACTIVE_DNS_RESOLUTIONS`]（プロセス全体で共有するグローバル状態）に
+    /// 依存するテスト同士を直列化するためのテスト専用ロック。`cargo test`
+    /// は同一バイナリ内のテストを既定で並列実行するため、このロックなしで
+    /// 同時実行数の上限到達を検証すると、他の DNS 解決テストが偶発的に
+    /// 上限超過と誤判定されてフレーキーになる（PR #430 コードレビュー
+    /// 指摘 P0 の回帰テストを安定させるため）。
+    static DNS_CONCURRENCY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// CORE-1（#36。PR #430 コードレビュー指摘）: `url_ip_literal` が IPv4
     /// リテラル host を `IpAddr` として取り出す。
@@ -906,7 +1033,14 @@ mod tests {
     /// ため、この単体テストは「接続の種類（初回かリダイレクト先か）に関係
     /// なく同一の判定になる」ことをリゾルバ単体で保証する。
     #[tokio::test]
+    // DNS_CONCURRENCY_TEST_LOCK は `#[tokio::test]` の既定（単一スレッド
+    // ランタイム）で、同一テスト内に他タスクが存在しないため await を挟んでも
+    // デッドロックしない（テスト間の直列化のみが目的）。
+    #[allow(clippy::await_holding_lock)]
     async fn core_1_safe_resolver_rejects_loopback_by_default() {
+        let _guard = DNS_CONCURRENCY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let resolver = SafeResolver {
             allow_private_network_access: false,
         };
@@ -926,7 +1060,14 @@ mod tests {
     /// `allow_private_network_access == true` のとき、同じループバックの
     /// host を許可する（opt-in の単体確認）。
     #[tokio::test]
+    // DNS_CONCURRENCY_TEST_LOCK は `#[tokio::test]` の既定（単一スレッド
+    // ランタイム）で、同一テスト内に他タスクが存在しないため await を挟んでも
+    // デッドロックしない（テスト間の直列化のみが目的）。
+    #[allow(clippy::await_holding_lock)]
     async fn core_1_safe_resolver_allows_loopback_when_opted_in() {
+        let _guard = DNS_CONCURRENCY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let resolver = SafeResolver {
             allow_private_network_access: true,
         };
@@ -946,7 +1087,14 @@ mod tests {
     /// 成功時は解決結果（`SocketAddr` の一覧）を返す（[`SafeResolver`] の
     /// ドキュメント「解決専用の OS スレッドへオフロードする」の機能確認）。
     #[tokio::test]
+    // DNS_CONCURRENCY_TEST_LOCK は `#[tokio::test]` の既定（単一スレッド
+    // ランタイム）で、同一テスト内に他タスクが存在しないため await を挟んでも
+    // デッドロックしない（テスト間の直列化のみが目的）。
+    #[allow(clippy::await_holding_lock)]
     async fn core_1_resolve_blocking_resolves_ip_literal_host() {
+        let _guard = DNS_CONCURRENCY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let addrs = resolve_blocking("127.0.0.1".to_string())
             .await
             .expect("127.0.0.1 の解決は成功するはず");
@@ -958,17 +1106,65 @@ mod tests {
         );
     }
 
-    /// CORE-1（#36。PR #430 コードレビュー指摘 P1）: `resolve_blocking` は
-    /// 解決に失敗した場合（存在しない/不正な host）も `panic` せず `Err` を
-    /// 返す（[`SafeResolver::resolve`] が `?` でそのまま伝播する経路の確認）。
+    /// CORE-1（#36。PR #430 コードレビュー指摘 P1・Windows CI 失敗の修正）:
+    /// `resolve_blocking` は空文字列 host を明示的に拒否し `Err` を返す
+    /// （`panic` しない。[`SafeResolver::resolve`] が `?` でそのまま伝播する
+    /// 経路の確認）。Unix/macOS の `getaddrinfo` は空文字列 host に対して
+    /// `Err` を返すが、Windows は同じ入力に対してローカルインターフェース
+    /// のアドレス群を返すため、OS の解決結果に委ねると 3 OS で挙動が
+    /// 食い違う（`resolve_blocking` のドキュメント参照）。この明示チェックに
+    /// より 3 OS で同一の `Err` になることをここで確認する。
     #[tokio::test]
+    // DNS_CONCURRENCY_TEST_LOCK は `#[tokio::test]` の既定（単一スレッド
+    // ランタイム）で、同一テスト内に他タスクが存在しないため await を挟んでも
+    // デッドロックしない（テスト間の直列化のみが目的）。
+    #[allow(clippy::await_holding_lock)]
     async fn core_1_resolve_blocking_returns_err_on_resolution_failure() {
-        // 空文字列 host は `ToSocketAddrs` の解決に失敗する（ポート指定なし
-        // のタプル形式では host 部の構文検証が先に働く）。
+        let _guard = DNS_CONCURRENCY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let result = resolve_blocking(String::new()).await;
         assert!(
             result.is_err(),
             "空文字列 host の解決は Err になるはず: {result:?}"
         );
+    }
+
+    /// CORE-1（#36。PR #430 コードレビュー指摘 P0）: 同時実行の DNS 解決数が
+    /// 上限（[`MAX_CONCURRENT_DNS_RESOLUTIONS`]）に達している間、
+    /// `resolve_blocking` は新規スレッドを生成せず、
+    /// `TooManyDnsResolutionsMarker`（`downcast_ref` で判別できるマーカー）
+    /// を伴う `Err` を即座に返す（無制限なスレッド生成による DoS を防ぐ。
+    /// security.md「不安全な設計」）。
+    #[tokio::test]
+    // DNS_CONCURRENCY_TEST_LOCK は `#[tokio::test]` の既定（単一スレッド
+    // ランタイム）で、同一テスト内に他タスクが存在しないため await を挟んでも
+    // デッドロックしない（テスト間の直列化のみが目的）。
+    #[allow(clippy::await_holding_lock)]
+    async fn core_1_resolve_blocking_rejects_when_concurrency_limit_reached() {
+        let _guard = DNS_CONCURRENCY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut acquired = 0usize;
+        while try_acquire_dns_resolution_slot() {
+            acquired += 1;
+        }
+        assert_eq!(
+            acquired, MAX_CONCURRENT_DNS_RESOLUTIONS,
+            "テスト開始時点で他の枠が確保されていないはず"
+        );
+
+        let result = resolve_blocking("127.0.0.1".to_string()).await;
+        match result {
+            Ok(addrs) => panic!("上限到達時は解決を試みないはず: {addrs:?}"),
+            Err(err) => assert!(
+                err.downcast_ref::<TooManyDnsResolutionsMarker>().is_some(),
+                "unexpected error: {err}"
+            ),
+        }
+
+        for _ in 0..acquired {
+            release_dns_resolution_slot();
+        }
     }
 }

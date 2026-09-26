@@ -105,6 +105,17 @@ pub enum Error {
         /// URL 全体（userinfo・パス等）はここへ埋め込まない。
         address: String,
     },
+    /// `fetch::Fetcher::get` が、同時実行できる DNS 解決スレッド数の上限
+    /// （`fetch::resolve_blocking` が管理するプロセス全体のカウンタ）に
+    /// 達しているときに返す。`fetch::SafeResolver::resolve` は名前解決の
+    /// たびに専用の OS スレッドを生成するため、外部から多数の異なる URL を
+    /// 取得させられる経路では、上限を設けないと DNS 応答遅延に比例して
+    /// スレッド・メモリが無制限に増える（security.md「不安全な設計」。
+    /// PR #430 コードレビュー指摘 P0）。
+    TooManyConcurrentDnsResolutions {
+        /// 許可した同時実行数の上限。
+        limit: usize,
+    },
     /// `fetch::Fetcher` の内部 HTTP クライアント（`reqwest`）が返したエラーを
     /// 写像したもの。`reqwest::Error` は公開 API に出さず（外部クレートの
     /// 具象型を上位 crate へ漏らさない方針）、`without_url()` を通した後の
@@ -138,6 +149,9 @@ impl fmt::Display for Error {
             Error::DisallowedAddress { address } => {
                 write!(f, "disallowed target address: {address}")
             }
+            Error::TooManyConcurrentDnsResolutions { limit } => {
+                write!(f, "too many concurrent DNS resolutions (limit: {limit})")
+            }
             Error::Network { message } => write!(f, "network error: {message}"),
         }
     }
@@ -155,6 +169,7 @@ impl std::error::Error for Error {
             | Error::ResponseTooLarge { .. }
             | Error::DisallowedScheme { .. }
             | Error::DisallowedAddress { .. }
+            | Error::TooManyConcurrentDnsResolutions { .. }
             | Error::Network { .. } => None,
         }
     }
