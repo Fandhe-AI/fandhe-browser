@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>ログイン</title>
+</head>
+<body>
+<form id="login" method="post" action="/login">
+<input type="text" name="username" value="user">
+<input type="password" name="password" value="dummy-password">
+<input type="hidden" name="csrf_token" value="tok-123">
+<input type="checkbox" name="remember" value="on" checked>
+<input type="checkbox" name="newsletter" value="on">
+<input type="text" name="disabled_field" value="ignored" disabled>
+<button type="submit">ログイン</button>
+</form>
+</body>
+</html>
