@@ -154,6 +154,15 @@ if ! SCHEMA_ERR=$(jq -r --arg key "$KEY" '
       "duplicate id detected in matrix"
     elif ([.[] | select((.cat? | type) != "string" or (.cat | length) == 0)] | length) > 0 then
       "each entry requires a non-empty string cat"
+    elif ([.[] | select((.cat? | type) == "string" and (.cat | contains("\u0000")))] | length) > 0 then
+      # NUL 文字（\u0000）を含む cat は JSON としては合法だが、bash の変数・
+      # コマンド置換は NUL を保持できない（C 文字列前提のため代入時に切り詰め
+      # られる。実測で確認済み）。--all-categories の列挙・判定は cat 値を
+      # 一度 bash 変数へ格納するため、NUL を含む値は別カテゴリへの誤結合
+      # （例: "static\u0000spa" が "staticspa" 相当に化ける）を起こし得る
+      # （codex review 指摘, PR #452）。スキーマ検証の時点で明確な理由と共に
+      # 拒否し、静かな誤判定ではなく exit 2 の診断可能なエラーにする。
+      "cat must not contain NUL characters (\\u0000): unsupported by the shell-based matrix tool"
     elif ([.[] | select((.[$key]? | type) != "boolean")] | length) > 0 then
       ("each entry requires a boolean field: " + $key)
     elif ([.[] | select(has("chromium") and ((.chromium | type) != "boolean"))] | length) > 0 then
@@ -239,16 +248,24 @@ fi
 # 検出されずに通過してしまう。TASK-9.2 レビュー指摘。--categories 側で既に
 # 判定済みの値は重複判定を避けるため除外する）。
 if [ "$ALL_CATEGORIES" -eq 1 ]; then
-  # README.md のスキーマは "cat" に任意の非空文字列（改行・CR を含む）を
-  # 許容する。改行区切りで jq 出力を読み `tr -d '\r'` で CR を除去する方式では、
-  # 改行や CR を含む有効な cat 値がその場で複数の別カテゴリへ分割されてしまい、
-  # 元の値のまま judge_category に渡らない（同名の分割後カテゴリが存在すると、
-  # 元のカテゴリが閾値未満でも見逃し得る。COMPAT-1 の類型別回帰検出に反する。
-  # codex review 指摘, PR #452）。NUL 区切り（jq -j で改行を一切挿入させず、
-  # 明示的に \u0000 のみを区切りとして付与）で読み取り、値の中身（改行・CR
-  # 含む）を無加工のまま judge_category へ渡す。NUL は bash のコマンド置換
-  # ($(...)) を経由すると保持できないため、プロセス置換で直接読む。
-  while IFS= read -r -d '' cat; do
+  # README.md のスキーマは "cat" に任意の非空文字列（改行・CR・NUL を含む）を
+  # 許容する。改行区切り（tr -d '\r' で CR のみ除去）はもちろん、NUL 区切りでも
+  # 値そのものに \u0000 エスケープ（実体は NUL 文字）や改行が含まれていれば、
+  # その区切り文字と衝突して複数の別カテゴリへ分割されてしまう（例:
+  # "static\u0000spa" が区切り文字と誤認され static / spa の 2 カテゴリに
+  # 分裂し、元のカテゴリが閾値未満でも見逃し得る。COMPAT-1 の類型別回帰検出に
+  # 反する。codex review 指摘・Windows self-test 失敗, PR #452）。値の中に
+  # 現れ得ない安全な区切りは存在しないため、区切り文字方式そのものをやめる。
+  # jq の既定（非 -r）出力は 1 値 1 行で、各値は JSON 文字列としてエスケープ
+  # 済み（改行は \n、CR は \r、NUL は \u0000 という 1〜6 文字の ASCII 表記に
+  # なり、生の制御文字は出力に現れない）ため、値の中身に関わらず行区切りで
+  # 安全に読み取れる。読み取った行はそのまま `jq -r .` へ再度通して JSON
+  # デコードし、元の値（改行・CR・NUL を含む）を復元してから judge_category
+  # （--arg 経由で jq へ渡すためシェル上の値に制御文字が残っていても安全）に渡す。
+  # Windows ネイティブ実行時の CRLF 変換対策として行末の \r（生バイト）のみを
+  # 一律除去する（JSON エスケープされた \r は "\" + "r" の 2 文字であり対象外）。
+  while IFS= read -r cat_json; do
+    cat=$(jq -r '.' <<<"$cat_json")
     already_judged=0
     if [ -n "$CATEGORIES" ]; then
       for done_cat in "${CAT_LIST[@]}"; do
@@ -261,7 +278,7 @@ if [ "$ALL_CATEGORIES" -eq 1 ]; then
     if [ "$already_judged" -eq 0 ]; then
       judge_category "$cat"
     fi
-  done < <(jq -j '[.[].cat] | unique | .[] | . + "\u0000"' "$MATRIX")
+  done < <(jq -c '[.[].cat] | unique | .[]' "$MATRIX" | tr -d '\r')
 fi
 
 if [ "$FAIL" -eq 1 ]; then

@@ -121,6 +121,16 @@ if grep -qE "^category (weird|case): passed=0 total=0" <<<"$LAST_OUTPUT"; then
 fi
 CASES=$((CASES + 1))
 
+# cat 値に NUL 文字（\u0000）を含む場合はスキーマ検証で明示的に拒否する
+# （codex review 指摘, PR #452。bash の変数・コマンド置換は NUL を保持できず、
+# --all-categories の列挙・判定を通すと "static\u0000spa" が "staticspa" 相当に
+# 化けて誤ったカテゴリへ結合され得るため、静かな誤判定ではなく exit 2 の
+# 診断可能なエラーにする）。
+expect_exit "cat value containing NUL is rejected by schema validation" 2 \
+  --matrix "$FIXTURES/nul-cat.json"
+expect_exit "cat value containing NUL is rejected with all-categories" 2 \
+  --matrix "$FIXTURES/nul-cat.json" --all-categories
+
 # --- 入力・使用エラー系（exit 2） ---
 
 expect_exit "malformed non-boolean" 2 --matrix "$FIXTURES/malformed-non-boolean.json"
