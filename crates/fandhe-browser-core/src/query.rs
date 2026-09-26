@@ -46,8 +46,8 @@
 //!   大文字小文字を無視して照合する。`Document::attribute` の契約どおり）。
 //!   `Exists` は値の有無、`Equals` は値の完全一致（大文字小文字を区別する）
 //!   で判定する。HTML 仕様の「値を大文字小文字無視で比較する属性」
-//!   （`type`・`lang` 等）への対応は本モジュールのスコープ外（REPAIR-3:
-//!   実装済みを装わない。必要になった段階で別 Issue で拡張する）。
+//!   （`type`・`lang` 等）への対応は本モジュールの範囲外（下記「本モジュールの
+//!   範囲外」節を参照）。
 //!
 //! # 文書順・重複排除
 //!
@@ -95,10 +95,16 @@
 //! エラーとして返す（一律 `false`/空の結果へフォールバックしない。誤った
 //! 照合結果を「一致なし」として返すと呼び出し側の判断を誤らせるため）。
 //! [`element_matches`]・[`query_selector_all`]・[`query_selector`] は
-//! いずれもこのエラーを伝播する。bloom filter 等によるさらなる高速化は
-//! 本モジュールのスコープ外（REPAIR-3: 将来課題として明記する）。
+//! いずれもこのエラーを伝播する。
 //!
 //! 対応 ID: `CORE-1`・TASK-24（24.10）・MS-1。
+//!
+//! ## 本モジュールの範囲外（将来仕様。REPAIR-3: 実装済みを装わない）
+//!
+//! - HTML 仕様の「値を大文字小文字無視で比較する属性」（`type`・`lang` 等）
+//!   への対応（ビヘイビア `CORE-1`。対応 TASK・MS 未定・spec 側で未割当）
+//! - bloom filter 等によるさらなる高速化（ビヘイビア `CORE-1`。
+//!   対応 TASK・MS 未定・spec 側で未割当）
 
 use std::collections::HashMap;
 
@@ -1044,5 +1050,313 @@ mod tests {
         let typed_first = query_first(&doc, root, &selectors("li"));
         let from_str_first = query_selector_str(&doc, root, "li").expect("li は解析できるはず");
         assert_eq!(typed_first, from_str_first);
+    }
+
+    /// テスト用ヘルパー: `results` に含まれる各要素の `id` 属性値を文書順に
+    /// 並べて返す（TASK-24（24.8）・MS-1・Issue #42）。件数だけの assert ではなく
+    /// 具体的な id 列で結果を比較できるようにする。`id` を持たない要素は
+    /// 番兵文字列 `"<none>"` にする（実在の id 値と衝突しない前提で、
+    /// テスト fixture では常に検索対象の要素に一意な id を振る）。
+    fn ids<'a>(doc: &'a Document, results: &[NodeId]) -> Vec<&'a str> {
+        results
+            .iter()
+            .map(|&id| doc.attribute(id, "id").unwrap_or("<none>"))
+            .collect()
+    }
+
+    /// テスト用ヘルパー: `(セレクタ, 期待する id 列)` の表を順に検証する
+    /// （TASK-24（24.8）・MS-1・Issue #42）。失敗時にどのセレクタで落ちたかが
+    /// わかるよう、`assert_eq!` にセレクタ文字列を含める。
+    fn assert_query_ids(doc: &Document, scope: NodeId, cases: &[(&str, &[&str])]) {
+        for &(selector_text, expected) in cases {
+            let results = query_all(doc, scope, &selectors(selector_text));
+            let actual = ids(doc, &results);
+            assert_eq!(
+                actual, expected,
+                "selector {selector_text:?} の結果が一致しない"
+            );
+        }
+    }
+
+    /// CORE-1: 型セレクタは一致する要素すべてを文書順で返し、存在しない
+    /// 型名は空になる（TASK-24（24.8）・MS-1・Issue #42）。
+    #[test]
+    fn core_1_type_selector_match_and_mismatch() {
+        let doc = parse(
+            r#"<!DOCTYPE html>
+            <ul>
+                <li id="a">a</li>
+                <li id="b">b</li>
+                <li id="c">c</li>
+            </ul>"#,
+        );
+        let root = doc.root();
+        assert_query_ids(&doc, root, &[("li", &["a", "b", "c"]), ("article", &[])]);
+    }
+
+    /// CORE-1: ID セレクタは一致する id を持つ要素だけを返し、他の id・
+    /// 存在しない id は一致しない。同じ id が複数の要素に付いている場合、
+    /// `query_selector_all` は両方を文書順で返し、`query_selector` は
+    /// 先頭の要素を返す（TASK-24（24.8）・MS-1・Issue #42）。
+    #[test]
+    fn core_1_id_selector_match_and_mismatch() {
+        let doc = parse(
+            r#"<!DOCTYPE html>
+            <div id="main">
+                <span id="dup">x</span>
+                <span id="dup">y</span>
+            </div>"#,
+        );
+        let root = doc.root();
+
+        assert_query_ids(&doc, root, &[("#main", &["main"]), ("#other", &[])]);
+
+        let dup_all = query_all(&doc, root, &selectors("#dup"));
+        assert_eq!(ids(&doc, &dup_all), vec!["dup", "dup"]);
+        let texts: Vec<String> = dup_all.iter().map(|&id| text(&doc, id)).collect();
+        assert_eq!(texts, vec!["x", "y"]);
+
+        let dup_first =
+            query_first(&doc, root, &selectors("#dup")).expect("先頭の #dup が見つかるはず");
+        assert_eq!(text(&doc, dup_first), "x");
+    }
+
+    /// CORE-1: クラスセレクタはトークン単位で照合する（前方一致では
+    /// 一致しない・空白区切りのクラス値のどのトークンにも一致する・複合
+    /// クラスセレクタは全クラスを持つ要素だけに一致する。TASK-24（24.8）・
+    /// MS-1・Issue #42）。
+    #[test]
+    fn core_1_class_selector_token_semantics() {
+        let doc = parse(
+            "<!DOCTYPE html>\n\
+             <div id=\"both\" class=\"link primary\"></div>\n\
+             <div id=\"onlylink\" class=\"link\"></div>\n\
+             <div id=\"whitespace\" class=\"a\tb\nc\"></div>\n\
+             <div id=\"upper\" class=\"Primary\"></div>",
+        );
+        let root = doc.root();
+
+        assert_query_ids(
+            &doc,
+            root,
+            &[
+                (".primary", &["both"]),
+                // `.lin` は `link` の前方一致に過ぎず、クラストークンとして
+                // 一致しないため空になる。
+                (".lin", &[]),
+                (".link.primary", &["both"]),
+                (".b", &["whitespace"]),
+                (".c", &["whitespace"]),
+                // NoQuirks（doctype あり）なのでクラス名の大文字小文字を
+                // 区別し、`.Primary` の要素は `.primary` に一致しない。
+                (".Primary", &["upper"]),
+            ],
+        );
+    }
+
+    /// CORE-1: 属性の有無セレクタ（`[href]`）は同じタグでも属性を持つ要素
+    /// だけを返す（TASK-24（24.8）・MS-1・Issue #42）。
+    #[test]
+    fn core_1_attribute_exists_match_and_mismatch() {
+        let doc = parse(
+            r#"<!DOCTYPE html>
+            <a id="withhref" href="/x">link</a>
+            <a id="withouthref">no href</a>"#,
+        );
+        let root = doc.root();
+        assert_query_ids(&doc, root, &[("[href]", &["withhref"])]);
+    }
+
+    /// CORE-1: 属性値の完全一致セレクタ（`[name=value]`）は引用符の有無に
+    /// 関わらず同じ結果になり、値が異なる要素・大文字小文字が異なる値には
+    /// 一致しない（値の比較は大文字小文字を区別するという現状の契約の
+    /// 固定。query.rs モジュール doc の「属性値の完全一致」節参照。
+    /// REPAIR-3: HTML 仕様上の大文字小文字無視属性への対応はスコープ外
+    /// のまま。TASK-24（24.8）・MS-1・Issue #42）。
+    #[test]
+    fn core_1_attribute_equals_match_and_mismatch() {
+        let doc = parse(
+            r#"<!DOCTYPE html>
+            <input id="checkbox" type="checkbox">
+            <input id="textinput" type="text">
+            <div id="emptydata" data-x=""></div>
+            <div id="titled" title="a b"></div>"#,
+        );
+        let root = doc.root();
+
+        let unquoted = ids(&doc, &query_all(&doc, root, &selectors("[type=checkbox]")));
+        let double_quoted = ids(
+            &doc,
+            &query_all(&doc, root, &selectors("[type=\"checkbox\"]")),
+        );
+        let single_quoted = ids(
+            &doc,
+            &query_all(&doc, root, &selectors("[type='checkbox']")),
+        );
+        assert_eq!(unquoted, vec!["checkbox"]);
+        assert_eq!(unquoted, double_quoted);
+        assert_eq!(unquoted, single_quoted);
+
+        assert_query_ids(
+            &doc,
+            root,
+            &[
+                ("[type=text]", &["textinput"]),
+                ("[data-x=\"\"]", &["emptydata"]),
+                ("[title=\"a b\"]", &["titled"]),
+                // 属性値の大文字小文字は区別するため、実際の値と大文字違い
+                // の `CHECKBOX` は一致しない。
+                ("[type=CHECKBOX]", &[]),
+            ],
+        );
+    }
+
+    /// CORE-1: 複合セレクタは構成する単純セレクタ・型名がすべて一致した
+    /// 要素だけに一致し、いずれか 1 つでも満たさなければ空になる
+    /// （TASK-24（24.8）・MS-1・Issue #42）。
+    #[test]
+    fn core_1_compound_selector_partial_failure() {
+        let doc = parse(
+            r#"<!DOCTYPE html>
+            <div id="main" class="container">
+                <a id="match" class="link" href="/x">a</a>
+            </div>"#,
+        );
+        let root = doc.root();
+        assert_query_ids(
+            &doc,
+            root,
+            &[
+                ("a.link[href]", &["match"]),
+                // 型名が異なる。
+                ("span.link[href]", &[]),
+                // 持っていないクラス。
+                ("a.missing", &[]),
+                // 持っていない属性。
+                ("a.link[target]", &[]),
+                // 型名・クラスは一致するが id のみ異なるため、id 不一致
+                // だけを理由に空になることを検証する
+                // （`div` は一致・`.container` も持つが `#other` を持たない）。
+                ("div#other.container", &[]),
+            ],
+        );
+    }
+
+    /// CORE-1: 子結合子（`div > span`）は直接の子にしか一致せず、孫要素
+    /// には一致しない。子孫結合子（`div span`）は孫要素にも一致する
+    /// （TASK-24（24.8）・MS-1・Issue #42）。
+    #[test]
+    fn core_1_child_combinator_rejects_grandchild() {
+        let doc = parse(
+            r#"<!DOCTYPE html>
+            <div><section><span id="grandchild">x</span></section></div>"#,
+        );
+        let root = doc.root();
+        assert_query_ids(
+            &doc,
+            root,
+            &[("div > span", &[]), ("div span", &["grandchild"])],
+        );
+    }
+
+    /// CORE-1: セレクタリストに複数の複合セレクタが混在していても、
+    /// `query_selector` は記述順ではなく文書順で最初に現れる要素を返す
+    /// （TASK-24（24.8）・MS-1・Issue #42）。
+    #[test]
+    fn core_1_query_selector_returns_first_in_document_order() {
+        let doc = parse(r#"<!DOCTYPE html><h1 id="heading">t</h1><p id="para">a</p>"#);
+        let root = doc.root();
+        // セレクタの記述順は `p, h1` だが、文書順で先に現れるのは `h1`。
+        let first = query_first(&doc, root, &selectors("p, h1")).expect("一致するはず");
+        assert_eq!(doc.attribute(first, "id"), Some("heading"));
+    }
+
+    /// CORE-1: `element_matches` はセレクタの種類ごとに true / false の両方
+    /// を具体的に確認する（TASK-24（24.8）・MS-1・Issue #42）。
+    #[test]
+    fn core_1_element_matches_per_selector_kind() {
+        let doc = parse(
+            r#"<!DOCTYPE html>
+            <div id="wrap"><a id="t" class="link" href="/x">link</a></div>"#,
+        );
+        let root = doc.root();
+        let a = find_by_local_name(&doc, root, "a");
+
+        let cases: &[(&str, bool)] = &[
+            ("a", true),
+            ("span", false),
+            ("#t", true),
+            ("#u", false),
+            (".link", true),
+            (".other", false),
+            ("[href]", true),
+            ("[target]", false),
+            ("[href=\"/x\"]", true),
+            ("[href=\"/y\"]", false),
+            ("div > a", true),
+            ("section > a", false),
+            ("div a", true),
+            ("section a", false),
+            ("span, a", true),
+        ];
+        for &(selector_text, expected) in cases {
+            let actual = element_matches(&doc, a, &selectors(selector_text))
+                .expect("キャッシュ上限に達しない");
+            assert_eq!(
+                actual, expected,
+                "selector {selector_text:?} の element_matches が一致しない"
+            );
+        }
+    }
+
+    /// CORE-1・PoC-2 移植: クラスセレクタで一致がない場合
+    /// `query_selector` は `None` を返す（`docs/spec` の PoC-2
+    /// `select_first_returns_none_when_no_match` 相当。型セレクタ版は
+    /// `core_1_no_match_returns_empty_or_none` で確認済みのため、ここでは
+    /// クラスセレクタ版を追加する。TASK-24（24.8）・MS-1・Issue #42）。
+    #[test]
+    fn core_1_poc2_select_first_returns_none_for_class_selector() {
+        let doc = parse("<div></div>");
+        let root = doc.root();
+        assert_eq!(query_first(&doc, root, &selectors(".missing")), None);
+    }
+
+    /// CORE-1・PoC-2 移植: `query_selector` で見つけた要素から `dom` の
+    /// アクセサ（`local_name`・`attribute`・`class_names`・`text_content`）
+    /// で属性・テキストを取り出せる（`docs/spec` の PoC-2
+    /// `select_extracts_attributes` 相当。PoC の `ElementInfo` のような
+    /// 高レベル helper は query モジュールのスコープ外なので、dom
+    /// アクセサを直接組み合わせて確認する。TASK-24（24.8）・MS-1・Issue #42）。
+    #[test]
+    fn core_1_poc2_select_extracts_attributes() {
+        let doc = parse(r#"<a href="https://example.com" class="link">click</a>"#);
+        let root = doc.root();
+        let a = query_first(&doc, root, &selectors("a")).expect("a 要素が見つかるはず");
+
+        assert_eq!(doc.local_name(a), Some("a"));
+        assert_eq!(doc.attribute(a, "href"), Some("https://example.com"));
+        let classes: Vec<&str> = doc.class_names(a).collect();
+        assert_eq!(classes, vec!["link"]);
+        assert_eq!(text(&doc, a), "click");
+    }
+
+    /// CORE-1・PoC-2 移植: 不正なセレクタ構文は `query_selector_all_str`・
+    /// `parse_selector_list` の両方でエラーになる（`docs/spec` の PoC-2
+    /// `compile_selector_rejects_invalid_syntax` 相当）。先頭の `:` は
+    /// 疑似クラスの分岐に入るため `Error::Unsupported` になる（現状の
+    /// 実装の挙動を `matches!` で具体的に固定する。TASK-24（24.8）・
+    /// MS-1・Issue #42）。
+    #[test]
+    fn core_1_poc2_compile_selector_rejects_invalid_syntax() {
+        let doc = parse("<div></div>");
+        let root = doc.root();
+
+        let err = query_selector_all_str(&doc, root, ":::not-a-selector:::")
+            .expect_err("不正なセレクタ構文はエラーになるはず");
+        assert!(matches!(err, Error::Unsupported { .. }));
+
+        let err = parse_selector_list(":::not-a-selector:::")
+            .expect_err("不正なセレクタ構文はエラーになるはず");
+        assert!(matches!(err, Error::Unsupported { .. }));
     }
 }
