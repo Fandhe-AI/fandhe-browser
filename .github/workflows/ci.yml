@@ -8,7 +8,9 @@ name: CI
 # 変更は TASK-55.3（Issue #60）で完了済み。3 OS matrix 対応（.claude/rules/ci.md）は
 # rust-ci ジョブで対応済み（TASK-55.1・Issue #58）。lint-docs は引き続き
 # ubuntu-latest 単独実行。clippy -D warnings ゲート（fail-closed）の明文化は
-# TASK-5.2（#32・REPAIR-6）を参照
+# TASK-5.2（#32・REPAIR-6）を参照。TASK-7（#335・REPAIR-6）が求める
+# 「clippy 警告 0 件の維持確認」も、下記 rust-ci・rust-ci-default-features の
+# 同ゲートで担保する（新規ジョブ追加ではなく既存ゲートの明文化）
 on:
   workflow_dispatch:
   pull_request:
@@ -83,6 +85,8 @@ jobs:
   # 上記 3 OS で実行し、警告が 1 件でもあれば非ゼロ終了する。`rust-base-ci-complete`
   # は他ジョブと同様に `needs.clippy.result` を検査するため、clippy 失敗時は
   # `rust-ci (<os>) / rust-base-ci-complete` 自体が fail-closed で失敗する。
+  # TASK-7（#335・REPAIR-6）の「警告 0 件維持確認」の CI ゲートを兼ねる
+  # （--all-features 構成側。確認記録は #335 の PR 本文を参照）。
   #
   # 3 OS 一級対応（.claude/rules/ci.md・XOS-1・TASK-55.1）: Linux・macOS・Windows の
   # ネイティブ runner で rust-base-ci（fmt/clippy/test/deny）をそれぞれ実行する。
@@ -158,6 +162,8 @@ jobs:
   # Actions が単一コマンドステップの末尾に付与する `exit $LASTEXITCODE` 相当の
   # 挙動により終了コードが伝播し、他 OS と同様に fail-closed で機能する
   # （`shell:` 明示指定は不要。誤って追加修正しないこと）。
+  # TASK-7（#335・REPAIR-6）の「警告 0 件維持確認」の CI ゲートを兼ねる
+  # （既定 feature 構成側。確認記録は #335 の PR 本文を参照）。
   rust-ci-default-features:
     strategy:
       fail-fast: false
