@@ -17,5 +17,12 @@ license.workspace = true
 # （`make check-publish-private` が機械的に検証する）。
 publish.workspace = true
 
-# 依存最小方針（dependency-policy.md）に従い、雛形段階では新規依存を追加しない。
+# 依存最小方針（dependency-policy.md）に従い、新規依存の追加はユーザー承認制
+# （dependency-policy.md）。html5ever は Issue #35（2026-09-25 承認済み）で
+# 「scraper は推移的に selectors/cssparser（MPL-2.0）を core の既定ビルドへ
+# 持ち込むため不採用、html5ever を単体で使い TreeSink・DOM・セレクタ照合は
+# 自作する」と決定された唯一の許可依存（TASK-24（24.4）・#38）。
+# markup5ever・tendril 等の推移的依存は直接依存に追加せず、`html5ever::*` の
+# 再エクスポート経由でのみ使う（parse.rs 冒頭コメント参照）。
 [dependencies]
+html5ever = "=0.40.1"
