@@ -152,7 +152,7 @@ cargo test --workspace
 
 ### 試行時の基準・前提差分
 
-- **新ベースライン**: 本記録の基準コミット `6edf250` から `origin/main` は `15e728dd93ed31928a769f43763659208fcad642`（TASK-2.2 実施時点）まで進んでいる。差分として #434（fetch テスト整備）・#439（セレクタ照合と query API）がマージ済み、#37・#418 は CLOSED、#40・#220 は本記録作成時点と変わらず OPEN のまま（`gh issue view 220` で再確認済み）。`query.rs` に quirks mode 対応の `id_or_class_eq` が追加されているが、R-2 の `has_class`（常に厳密一致・quirks mode 非依存）とは別 API のため衝突しない
+- **新ベースライン**: 本記録の基準コミット `6edf250` から `origin/main` は `15e728dd93ed31928a769f43763659208fcad642`（TASK-2.2 実施時点）まで進んでいる。差分として #434（fetch テスト整備）・#439（セレクタ照合と query API）がマージ済み、#37・#418 は CLOSED。#40 は本記録の基となる試行実施後（本コミット作成前の 2026-09-26 12:25:46 UTC）に #438（parse/dom の結合テスト整備）でクローズ済みで、`15e728d`（TASK-2.2 実施時点の到達点）には既に取り込まれている。#220 は本記録作成時点で OPEN のまま（`gh issue view 220` で再確認済み）。`query.rs` に quirks mode 対応の `id_or_class_eq` が追加されているが、R-2 の `has_class`（常に厳密一致・quirks mode 非依存）とは別 API のため衝突しない
 - **ベースラインゲート**: 上記コミットの detached worktree で `cargo fmt --all --check`・`cargo clippy --workspace --all-targets -- -D warnings`・`cargo test --workspace` を実行し、いずれも通過（test 222 passed / 0 failed）。各候補の trial worktree はこのベースラインから分岐する
 - **対象 API の未実装確認**: `element_children`／`has_class`（`dom.rs`）・`mime_type`（`fetch.rs`）・`set_current_line` 実装（`parse.rs`）は、上記ベースライン時点で `git grep` によりいずれも未実装であることを確認済み（試行の前提が崩れていない）
 - **R-3 保留の扱い**: 「引き渡し手順（差分の追跡不可能化）」（実施要領）が要求する独立環境（`.git` を持たないか `main`／`origin/main` の refs・オブジェクトへ到達できない環境）・`origin` へのネットワーク経路遮断を、本セッション（単一マシン・元リポジトリと `.git` を共有する worktree 群）では用意・検証できない。そのため候補としては選定済みだが試行しない。注入箇所・注入方法はそもそも選定・記載していない（本記録・PR・コミットのいずれにも残っていない）。REPAIR-2 の「3 件以上で単独到達」要件は R-1・R-2・R-4・R-5 の 4 件で満たしている。#324（人間判定）向けの対応事項: R-3 を実施する場合は、元リポジトリと `.git`（refs・オブジェクト）を共有しない隔離環境と、`origin` への到達を遮断したネットワーク構成を別途用意する必要がある
