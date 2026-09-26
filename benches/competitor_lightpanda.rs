@@ -396,7 +396,13 @@ fn measure_binary_size(target: &Target) -> Outcome {
         return Outcome::Skipped(format!("{}: binary path not configured", target.name));
     };
     match std::fs::metadata(bin) {
-        Ok(meta) => Outcome::Value(meta.len() as f64),
+        Ok(meta) if meta.is_file() => Outcome::Value(meta.len() as f64),
+        // レビュー指摘 P2: line 398。`fs::metadata` はディレクトリにも成功し
+        // `len()` がディレクトリエントリサイズ等の無意味な値を返すため、
+        // `<PREFIX>_BIN` に誤ってディレクトリを指定した場合に異常値が
+        // そのまま `binarySizeBytes` として出力され得た。通常ファイルで
+        // ないことを検出したら計測失敗として扱う。
+        Ok(_) => Outcome::Error(format!("{}: bin path is not a regular file", target.name)),
         Err(e) => Outcome::Error(format!("{}: metadata failed: {e}", target.name)),
     }
 }
@@ -525,9 +531,17 @@ impl McpClient {
                         .unwrap_or("unknown error");
                     return Err(format!("{method}: rpc error: {message}"));
                 }
-                let is_error = value
-                    .get("result")
-                    .and_then(|r| r.get("isError"))
+                let Some(result) = value.get("result") else {
+                    // レビュー指摘 P1: line 535。`error` も `result.isError` も
+                    // 無いが `result` 自体が欠けている応答（プロトコル逸脱・
+                    // 実質失敗）を、id 一致のみで成功扱いにしていた。
+                    // `result` 欠如は不正な応答として `Err` にし、
+                    // 呼び出し元 `measure_token_reduction` の
+                    // 失敗サイト集計（`failed` への記録）へ回す。
+                    return Err(format!("{method}: response missing result field"));
+                };
+                let is_error = result
+                    .get("isError")
                     .is_some_and(|v| matches!(v, JsonValue::Bool(true)));
                 if is_error {
                     return Err(format!("{method}: tool call reported isError"));
