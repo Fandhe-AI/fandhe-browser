@@ -31,11 +31,12 @@
 //! #39）が提供する走査 API・要素名アクセサ（[`crate::dom::Document::local_name`]
 //! 等）・`query`（#41）が使う arena を構築する前段を担う。
 //!
-//! # スコープ外（別 Issue）
+//! ## 本モジュールの範囲外（将来仕様。REPAIR-3: 実装済みを装わない）
 //!
-//! 文字コード検出（`CORE-5` (7)）・Shadow DOM（`CORE-5` (5)。
-//! `allow_declarative_shadow_roots` を常に `false` として無効化）・
-//! `<option>` の選択値解決（`CORE-5` (4)）はスコープ外。
+//! - 文字コード検出（ビヘイビア `CORE-5` (7)・`TASK-25`・`MS-3`）
+//! - Shadow DOM（ビヘイビア `CORE-5` (5)・`TASK-25`・`MS-3`。
+//!   `allow_declarative_shadow_roots` を常に `false` として無効化）
+//! - `<option>` の選択値解決（ビヘイビア `CORE-5` (4)・`TASK-25`・`MS-3`）
 
 use crate::dom::{Attribute, Document, Node, NodeData, NodeId, QuirksMode};
 use crate::error::{Error, ParseError, Result};
@@ -113,10 +114,10 @@ impl Default for ParseOptions {
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
             max_nodes: DEFAULT_MAX_NODES,
             max_recorded_errors: DEFAULT_MAX_RECORDED_ERRORS,
-            // 本 crate は現時点で JS を実行しない（`js_stub`。JS-2・TASK-30 で
-            // 差し替え予定）。スクレイピング用途では `<noscript>` の中身を
-            // 要素として取れる方が有用なため、html5ever の既定（true）とは
-            // 逆に false とする。JS 統合時（TASK-30）に見直す。
+            // 本 crate は現時点で JS を実行しない（`js_stub`。`JS-2`・`TASK-30`・
+            // `MS-3` で差し替え予定）。スクレイピング用途では `<noscript>` の
+            // 中身を要素として取れる方が有用なため、html5ever の既定（true）とは
+            // 逆に false とする。JS 統合時（`TASK-30`・`MS-3`）に見直す。
             scripting_enabled: false,
             error_policy: ParseErrorPolicy::Recover,
         }

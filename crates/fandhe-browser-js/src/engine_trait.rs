@@ -20,9 +20,9 @@
 //! 本モジュールではなく、crate の `tests/conformance.rs`（結合テスト）に
 //! ある。
 //!
-//! [`EngineKind`] の文字列表現（設定ファイルの `"v8"`/`"boa"` との相互
-//! 変換・未同梱時のエラーメッセージ整形）は TASK-91.2（Issue #215）で
-//! 確定するため、本 Issue では先取りしない。
+//! 簡易実装: [`EngineKind`] の文字列表現（設定ファイルの `"v8"`/`"boa"` との
+//! 相互変換・未同梱時のエラーメッセージ整形）は `TASK-91`（91.2・`MS-3`・
+//! Issue #215）で確定するため、本 Issue では先取りしない。
 
 /// 本 crate が抽象化対象とする JS エンジンの種別。
 ///
@@ -82,8 +82,9 @@ pub fn bundled_engines() -> &'static [EngineKind] {
 /// （coding-rust.md「JS エンジンはトレイト抽象越しに使い、V8 / boa の具象型
 /// を上位 crate へ漏らさない」）。`docs/spec/03-poc/js-engine-comparison` の
 /// PoC-3 で実測した「文字列 in/out・数値 out」の形状をカバーする最小構成
-/// であり、オブジェクト・配列等の複合値は必要になった時点（TASK-29/32）で
-/// variant を追加する（過剰設計を避ける。REPAIR-3）。将来の variant 追加が
+/// であり、簡易実装（現在の制限: オブジェクト・配列等の複合値は表現できない。
+/// 必要になった時点（`TASK-29`/`TASK-32`・`MS-3`）で variant を追加する
+/// （過剰設計を避ける。REPAIR-3）。将来の variant 追加が
 /// 破壊的変更にならないよう `#[non_exhaustive]` を付ける（`JsEngineError`・
 /// `CreateEngineError` と同じ理由づけ。`EngineKind` が spec で V8・Boa の
 /// 2 種に固定されているのとは事情が異なる）。
@@ -120,11 +121,12 @@ pub type NativeFn = Box<dyn FnMut(&[JsValue]) -> Result<JsValue, JsEngineError>>
 
 /// [`JsEngine::evaluate_script`] の実行制御オプション（TASK-28.3・`JS-1`）。
 ///
-/// 現時点ではフィールドを持たない（機能があるように見せない。REPAIR-3）。
-/// タイムアウト等の無限ループ対策（OWASP「不安全な設計」・A04）は
-/// TASK-29／TASK-30 で本構造体にフィールドを追加して実装する差し込み口
-/// として用意する。`#[non_exhaustive]` を付け、フィールド追加が破壊的
-/// 変更にならないようにする。
+/// 簡易実装（現在の制限: 現時点ではフィールドを持たず、タイムアウト等の
+/// 無限ループ対策〔OWASP「不安全な設計」・A04〕を指定する手段がない。
+/// 機能があるように見せない。REPAIR-3）。タイムアウトは
+/// `TASK-29`／`TASK-30`（`MS-3`）で本構造体にフィールドを追加して実装する
+/// 差し込み口として用意する。`#[non_exhaustive]` を付け、フィールド追加が
+/// 破壊的変更にならないようにする。
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct EvaluateOptions {}
@@ -213,9 +215,10 @@ pub enum CreateEngineError {
         bundled: &'static [EngineKind],
     },
     /// 指定した種別は同梱されている（feature は有効）が、具象実装がまだ
-    /// 存在しない（V8: TASK-29 / boa: TASK-32 の完了待ち）。実装済みを
-    /// 装わない（REPAIR-3）ための一時的なバリアントであり、TASK-29/32
-    /// 完了後は該当する種別についてこのバリアントを返さなくなる。
+    /// 存在しない（V8: `TASK-29` / boa: `TASK-32`（いずれも `MS-3`）の
+    /// 完了待ち）。実装済みを装わない（REPAIR-3）ための一時的なバリアント
+    /// であり、`TASK-29`/`TASK-32`（`MS-3`）完了後は該当する種別について
+    /// このバリアントを返さなくなる。
     NotYetImplemented {
         /// 呼び出し元が要求した種別。
         requested: EngineKind,
@@ -225,9 +228,9 @@ pub enum CreateEngineError {
 impl std::fmt::Display for CreateEngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            // EngineKind の文字列表現（設定ファイルの "v8"/"boa" との相互
-            // 変換）は TASK-91.2（Issue #215）で確定するため、ここでは
-            // Debug 表現（{:?}）を暫定的に使う。
+            // 簡易実装: EngineKind の文字列表現（設定ファイルの "v8"/"boa" との
+            // 相互変換）は TASK-91（91.2・MS-3・Issue #215）で確定するため、
+            // ここでは Debug 表現（{:?}）を暫定的に使う。
             Self::NotBundled { requested, bundled } => {
                 write!(
                     f,
@@ -250,22 +253,23 @@ impl std::error::Error for CreateEngineError {}
 /// （`js-engine.md` 決定5「種別からトレイトオブジェクトを生成する関数」。
 /// TASK-28.3・`JS-1`）。
 ///
-/// 呼び出し元（将来）: `fandhe-browser-core` が TASK-30 で設定
+/// 呼び出し元（将来）: `fandhe-browser-core` が `TASK-30`（`MS-3`）で設定
 /// （`[js] engine`）が選択した種別からトレイトオブジェクトを得る際に使う。
 ///
-/// **契約**: 同梱していない種別（[`bundled_engines`] に含まれない）には
-/// [`CreateEngineError::NotBundled`] を返す（本 Issue の受け入れ条件）。
-/// 同梱していても具象実装がまだ無い間は
-/// [`CreateEngineError::NotYetImplemented`] を返す（TASK-29/32 完了後に
-/// 対応する分岐が `Ok` を返すよう置き換わる）。成功したかのような値
-/// （ダミーの [`JsEngine`] 実装）を返す「成功を一律に返すフォールバック」
-/// は行わない（security.md「偽装・回避機能の禁止」）。
+/// スタブ（現在の制限: 同梱している種別に対しても常にエラーを返し、実際の
+/// エンジンは生成しない）。**契約**: 同梱していない種別（[`bundled_engines`]
+/// に含まれない）には [`CreateEngineError::NotBundled`] を返す（本 Issue の
+/// 受け入れ条件）。同梱していても具象実装がまだ無い間は
+/// [`CreateEngineError::NotYetImplemented`] を返す（`TASK-29`/`TASK-32`
+/// （`MS-3`）完了後に対応する分岐が `Ok` を返すよう置き換わる）。成功した
+/// かのような値（ダミーの [`JsEngine`] 実装）を返す「成功を一律に返す
+/// フォールバック」は行わない（security.md「偽装・回避機能の禁止」）。
 ///
 /// 同梱判定は [`bundled_engines`] を再利用し、本関数内で独自の feature 分岐
 /// を持たない。`match kind { .. }` に `#[cfg(feature = ...)]` を付けない
 /// ことで、両 feature 同時有効時に `_` 分岐が `unreachable_patterns` になる
-/// 事故を避ける（TASK-29/32 でこの `match` の各アームを具象エンジン生成に
-/// 置き換える際も同じ構造を保つ）。
+/// 事故を避ける（`TASK-29`/`TASK-32`（`MS-3`）でこの `match` の各アームを
+/// 具象エンジン生成に置き換える際も同じ構造を保つ）。
 pub fn create_engine(kind: EngineKind) -> Result<Box<dyn JsEngine>, CreateEngineError> {
     if !bundled_engines().contains(&kind) {
         return Err(CreateEngineError::NotBundled {
