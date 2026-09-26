@@ -39,8 +39,12 @@
 
 ## 書式と配置
 
-- **crate・モジュール単位の未実装**は crate 直下の `//!` に `# スタブについて` の見出しを立て、
+- **crate 単位の未実装**は crate 直下（`lib.rs`）の `//!` に `# スタブについて` の見出しを立て、
   未実装項目を「項目（ビヘイビア ID、TASK-n）」の箇条書きで並べる
+- **モジュール単位の未実装**は crate 直下にまとめず、当該モジュールファイルの入口（`//!`）に同じ
+  `# スタブについて` の見出しを立てて記載する（`code-comment-style.md` が求める「モジュールの入口」
+  から文脈が読めることを優先する。crate 直下と当該モジュールの双方に記載範囲が重なる場合は、
+  crate 直下では対象モジュール名を挙げるに留め、詳細は当該モジュールの `//!` 側に置く）
 - **Issue スコープ外として意図的に見送った箇所**は `## 本 Issue（#N）の範囲外（将来仕様。REPAIR-3: 実装済みを装わない）`
   の見出しを立て、同様に箇条書きで示す
 - **関数・型単位**の未実装・簡易実装は `///` に「スタブ」「簡易実装」と明記し、置換先の TASK-n を書く
@@ -55,12 +59,12 @@
 ```rust
 //! # スタブについて
 //!
-//! 本ファイルは crate の雛形（TASK-1（1.7）・MS-1・ビヘイビア `REPAIR-1`）であり、
+//! 本ファイルは crate の雛形（`TASK-1`（1.7）・`MS-1`・ビヘイビア `REPAIR-1`）であり、
 //! 以下はいずれも未実装。実装済みを装う公開 API・ダミー実装は置かない
 //! （`code-comment-style.md`・REPAIR-3）。
 //!
-//! - プロファイル削除処理（`PROF-5`、TASK-53）
-//! - クロスプラットフォーム advisory lock（`PROF-1`、TASK-54）
+//! - プロファイル削除処理（`PROF-5`、`TASK-53`）
+//! - クロスプラットフォーム advisory lock（`PROF-1`、`TASK-54`）
 ```
 
 ### 例 2: 常にエラーを返すスタブ関数（`#[non_exhaustive]` の戻り値型）
@@ -71,24 +75,24 @@
 /// JS 実行結果を表す型。
 ///
 /// 本スタブでは値を生成しないが、将来拡張できる構造にしてある（REPAIR-4）。
-/// TASK-30（MS-3・#143）で実際の実行結果を保持するフィールドが追加される想定。
+/// `TASK-30`（`MS-3`・#143）で実際の実行結果を保持するフィールドが追加される想定。
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsExecutionOutput {
     pub value: String,
 }
 
-/// JS 実行のスタブ境界（CORE-1・TASK-24（24.9）・MS-1・Issue #43）。
+/// JS 実行のスタブ境界（CORE-1・`TASK-24`（24.9）・`MS-1`・Issue #43）。
 ///
 /// 常にエラーを返す設計（`js-engine.md` JS-2 が明示的に名指しする関数）。
-/// `fandhe-browser-js`（TASK-28・MS-3）の統合・TASK-30（MS-3・Issue #143）での
+/// `fandhe-browser-js`（`TASK-28`・`MS-3`）の統合・`TASK-30`（`MS-3`・Issue #143）での
 /// V8 実呼び出しへの置換まで、呼び出し元には「未実装」を明示するエラーを
 /// 返し、成功を装わない。
 pub fn execute_js_stub(script: &str) -> crate::Result<JsExecutionOutput> {
     let _ = script;
     Err(crate::Error::JsExecutionUnavailable {
         message: "JS execution is not implemented yet \
-                   (js_stub boundary; replaced by fandhe-browser-js per JS-2/TASK-30)"
+                   (js_stub boundary; replaced by fandhe-browser-js per JS-2/`TASK-30`)"
             .to_string(),
     })
 }
@@ -99,7 +103,7 @@ pub fn execute_js_stub(script: &str) -> crate::Result<JsExecutionOutput> {
 ```rust
 /// レスポンス本文を UTF-8 として非可逆変換した文字列（不正なバイト列は
 /// 置換文字に置き換える）。厳密な文字コード判定（`charset` ヘッダ・
-/// meta タグ由来。ビヘイビア `CORE-5` (7)・TASK-25・MS-3）は範囲外の将来仕様であり、
+/// meta タグ由来。ビヘイビア `CORE-5` (7)・`TASK-25`・`MS-3`）は範囲外の将来仕様であり、
 /// これは参考用の簡易変換に留まる。
 pub fn body_text_lossy(&self) -> String {
     String::from_utf8_lossy(&self.body).into_owned()
@@ -111,8 +115,8 @@ crate・モジュール単位でスコープ外の項目をまとめる場合は
 ```rust
 //! ## 本 Issue（#36）の範囲外（将来仕様。REPAIR-3: 実装済みを装わない）
 //!
-//! - Cookie セッション維持（ビヘイビア `CORE-5` (8)・TASK-25・MS-3）
-//! - 文字コード判定（ビヘイビア `CORE-5` (7)・TASK-25・MS-3）: 本文は常にバイト列で返す
+//! - Cookie セッション維持（ビヘイビア `CORE-5` (8)・`TASK-25`・`MS-3`）
+//! - 文字コード判定（ビヘイビア `CORE-5` (7)・`TASK-25`・`MS-3`）: 本文は常にバイト列で返す
 ```
 
 ### 例 4: 悪い例と良い例の対比
@@ -130,7 +134,7 @@ pub fn evaluate(script: &str) -> bool {
 OK（書き直し。エラーで未実装を明示し、ID・TASK-n・目指す挙動を書く）:
 
 ```rust
-/// スクリプト評価のスタブ（`JS-2`・TASK-30・MS-3・Issue #143）。
+/// スクリプト評価のスタブ（`JS-2`・`TASK-30`・`MS-3`・Issue #143）。
 ///
 /// 現状は常にエラーを返す。将来は `fandhe-browser-js` 経由で V8 に評価させ、
 /// 評価結果を [`JsExecutionOutput`] として返す設計に置き換わる。
