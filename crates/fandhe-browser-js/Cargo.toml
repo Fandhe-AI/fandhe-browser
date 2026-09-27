@@ -17,6 +17,16 @@ publish.workspace = true
 [dependencies]
 v8 = { workspace = true, optional = true }
 
+# JS ワーカーの子プロセスが自身へ OS のメモリ上限を掛けるための依存（TASK-29・
+# Issue #503。ユーザー承認 2026-09-28）。いずれも `js-v8` feature からのみ有効化し、
+# 既定ビルドの依存グラフには含めない。unix は RLIMIT_DATA（rustix の safe な
+# `setrlimit`）、Windows は Job Object（win32job の safe ラッパ）を使う。
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+win32job = { workspace = true, optional = true }
+
 # feature 名は docs/spec/04-behavior/js-engine.md（JS-1）「JS エンジンの
 # 切替方式」2. の設計（js-v8 = ["dep:v8"]・js-boa = ["dep:boa_engine"]）に
 # 対応する（TASK-28.1 が予約枠として定義し、本 TASK-29.1 で `js-v8` を
@@ -34,7 +44,7 @@ v8 = { workspace = true, optional = true }
 # 引き続き `dep:` 接頭辞なしのプレースホルダのままにする。
 [features]
 default = []
-js-v8 = ["dep:v8"]
+js-v8 = ["dep:v8", "dep:rustix", "dep:win32job"]
 js-boa = []
 
 # JS プロセス分離（TASK-29・Issue #503 設計書 §3.1・§7 W6）の結合テスト。
