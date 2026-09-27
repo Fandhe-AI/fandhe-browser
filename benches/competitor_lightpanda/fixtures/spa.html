@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<!--
+  competitor_lightpanda ベンチ用の自作フィクスチャ（TASK-84.4・Issue #461）。
+  PoC-13（docs/spec/03-poc/browser-landscape-2026）の React 公式サイト相当の
+  SSR 済み SPA の構造（header・nav・hero・機能紹介カード・footer、hydration
+  データを模した JSON、DOM を変更しないインラインスクリプト）を模して新規に
+  作成した。外部サイトの HTML・テキスト・スクリプトを複製したものではない。
+  外部参照（http(s):// や // で始まる src/href、サブリソース参照）は含めない
+  （support.rs の fixtures_contain_no_external_references テストが検証する）。
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Build Interfaces from Components</title>
+<script type="application/json" id="__APP_DATA__">
+{"page":"home","locale":"en","features":[{"id":"components","title":"Composable components"},{"id":"declarative","title":"Declarative views"},{"id":"portable","title":"Learn once, write anywhere"}]}
+</script>
+</head>
+<body>
+<div id="root">
+<header>
+<nav>
+<a href="#features">Features</a>
+<a href="#get-started">Get started</a>
+</nav>
+</header>
+<main>
+<section id="hero">
+<h1>Build Interfaces from Components</h1>
+<p>A self-authored fixture that mimics the shape of a server-rendered
+single-page application: a hydration data blob, a small non-mutating inline
+script, and a handful of feature cards.</p>
+</section>
+<section id="features">
+<article class="card">
+<h2>Composable components</h2>
+<p>Views are built from small, reusable pieces with their own state.</p>
+</article>
+<article class="card">
+<h2>Declarative views</h2>
+<p>You describe what the interface should look like for a given state.</p>
+</article>
+<article class="card">
+<h2>Learn once, write anywhere</h2>
+<p>The same component model applies across many rendering targets.</p>
+</article>
+</section>
+<section id="get-started">
+<h2>Get started</h2>
+<p>This fixture never fetches, opens a socket, or mutates the DOM; it only
+defines a couple of pure helper functions to resemble a hydrated bundle.</p>
+</section>
+</main>
+<footer>
+<p>End of sample single-page application fixture.</p>
+</footer>
+</div>
+<script>
+function formatFeatureCount(count) {
+  return count + " features";
+}
+function pickLocale(locales) {
+  return locales.length > 0 ? locales[0] : "en";
+}
+</script>
+</body>
+</html>
