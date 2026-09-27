@@ -1178,15 +1178,40 @@ const MAX_TREE_STABILIZE_PASSES: usize = 4;
 /// 得られた pid 集合（順序無視）が一致するまで（＝その 2 回の走査の間に
 /// 新しい子孫が現れなかったことの確認）繰り返すことで、走査中に生まれた
 /// 子孫の見落としを低減する。`MAX_TREE_STABILIZE_PASSES` に達しても安定
-/// しない場合は、対象が継続的にプロセスを生成し続けていると判断し、最後に
-/// 得られた（最も新しい）pid 集合をそのまま返す（走査を無限に続けない
-/// fail-safe。完全な保証ではなく、あくまで安定するまで数回観測し直す
-/// ベストエフォートの緩和策である）。
+/// しない場合は、対象が継続的にプロセスを生成し続けていると判断し
+/// `None` を返す（TASK-84.2・Issue #212 のレビュー指摘対応）。
+///
+/// 以前は上限到達時に最後に得られた pid 一覧をそのまま成功値として
+/// 返していたが、継続的に子プロセスを生成し続ける対象では、その一覧に
+/// 含まれない子孫の RSS が呼び出し元 `sample_process_tree_rss_kb` の
+/// 合算から漏れ、実際には目標未達でも `perf6_comparison` が `"met"` を
+/// 誤って返し得た。安定しない＝走査結果を信頼できないことを意味するため、
+/// 不完全な pid 一覧を目標判定に使わせず `None`（`sample_process_tree_rss_kb`
+/// 経由で `measure_idle_rss` を `Outcome::Error` にする）で計測エラーとして
+/// 扱う。
 #[cfg(unix)]
 fn collect_stable_process_tree_pids(root_pid: u32) -> Option<Vec<u32>> {
-    let mut previous = collect_process_tree_pids(root_pid)?;
-    for _ in 0..MAX_TREE_STABILIZE_PASSES {
-        let current = collect_process_tree_pids(root_pid)?;
+    stabilize_pid_scan(
+        || collect_process_tree_pids(root_pid),
+        MAX_TREE_STABILIZE_PASSES,
+    )
+}
+
+/// `collect_stable_process_tree_pids` の走査ループを、走査手段（`scan`）を
+/// 差し替え可能にして切り出したもの。実運用は `collect_process_tree_pids`
+/// を `scan` に渡すが、`measure_tests.rs`（`pub(crate)` として同一クレート
+/// から直接呼べる）はプロセスを実際に fork せずとも決定的な pid 集合列を
+/// 返すクロージャで安定／非安定の両経路（TASK-84.2・Issue #212 のレビュー
+/// 指摘対応: 非安定時は `None` を返し、目標判定に不完全な pid 一覧を渡さ
+/// ない）を検証できる。
+#[cfg(unix)]
+pub(crate) fn stabilize_pid_scan(
+    mut scan: impl FnMut() -> Option<Vec<u32>>,
+    max_passes: usize,
+) -> Option<Vec<u32>> {
+    let mut previous = scan()?;
+    for _ in 0..max_passes {
+        let current = scan()?;
         let mut previous_sorted = previous.clone();
         let mut current_sorted = current.clone();
         previous_sorted.sort_unstable();
@@ -1196,7 +1221,7 @@ fn collect_stable_process_tree_pids(root_pid: u32) -> Option<Vec<u32>> {
         }
         previous = current;
     }
-    Some(previous)
+    None
 }
 
 /// アイドル RSS（`PERF-6`）: 起動して安定させたあと、対象プロセスの RSS

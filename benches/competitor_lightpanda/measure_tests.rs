@@ -527,6 +527,16 @@ fn run_test_cases() {
     probe_once_rejects_content_length_and_transfer_encoding_together();
     eprintln!("case: probe_once_rejects_conflicting_content_length_values");
     probe_once_rejects_conflicting_content_length_values();
+    // `measure::stabilize_pid_scan`（プロセスツリー走査の安定判定ループ）
+    // 自体は `#[cfg(unix)]` 限定（windows はプロセスツリー全体の RSS 合計を
+    // 読まないため使わない。TASK-84.5）なので、呼び出しもここで揃える。
+    #[cfg(unix)]
+    {
+        eprintln!("case: stabilize_pid_scan_returns_none_when_never_stable");
+        stabilize_pid_scan_returns_none_when_never_stable();
+        eprintln!("case: stabilize_pid_scan_returns_some_once_two_scans_match");
+        stabilize_pid_scan_returns_some_once_two_scans_match();
+    }
     eprintln!("competitor_lightpanda_measure: all cases passed");
 }
 
@@ -1426,6 +1436,54 @@ fn probe_once_rejects_conflicting_content_length_values() {
             "expected an error for conflicting Content-Length values, got status={status} body={body:?}"
         ),
     }
+}
+
+/// TASK-84.2・Issue #212 のレビュー指摘対応（プロセスツリー走査の安定判定）:
+/// `measure::stabilize_pid_scan`（`measure::collect_stable_process_tree_pids`
+/// が内部で使う走査ループの本体。`scan` を差し替え可能にして切り出した
+/// もの）に、常に前回と異なる pid 集合を返すクロージャを渡すと、対象が
+/// 継続的に子プロセスを生成し続けて走査結果が一度も安定しない状況を
+/// フォーク実行なしに再現できる。この場合は最後に得られた pid 一覧を
+/// 「成功扱い」で返してはならず（呼び出し元 `sample_process_tree_rss_kb`
+/// 経由で不完全な RSS 合計が `perf6_comparison` に渡り、実際には目標未達
+/// でも `"met"` を誤って返し得る）、`None` を返して計測エラーへ倒す
+/// （`measure_idle_rss` が `None` を `Outcome::Error` にする）契約を検証する。
+#[cfg(unix)]
+fn stabilize_pid_scan_returns_none_when_never_stable() {
+    let mut next_pid: u32 = 1;
+    let mut scan = || {
+        // 呼ぶたびに集合を 1 要素ずつ増やし、直前の走査と一致することが
+        // 決してない列を作る（フォーク数が単調に増え続ける異常系の模擬）。
+        next_pid += 1;
+        Some((1..=next_pid).collect::<Vec<u32>>())
+    };
+    let result = measure::stabilize_pid_scan(&mut scan, 4);
+    assert_eq!(
+        result, None,
+        "a pid scan that never repeats two scans in a row must be treated as unstable (None), \
+         not as success with the latest (incomplete) pid set"
+    );
+}
+
+/// 上と対になる正常系: 2 回連続で同じ pid 集合（順序が異なっていても）が
+/// 得られた時点で `Some` を返す（`collect_stable_process_tree_pids` の
+/// 「順序無視で比較する」契約を確認する）。
+#[cfg(unix)]
+fn stabilize_pid_scan_returns_some_once_two_scans_match() {
+    let mut calls = vec![
+        vec![1, 2, 3],    // 1 回目: 初期走査。
+        vec![1, 2, 3, 4], // 2 回目: 新しい子孫が増えていて 1 回目と不一致。
+        vec![4, 3, 2, 1], // 3 回目: 2 回目と要素は同じで順序だけ異なる → 安定とみなす。
+        vec![9, 9, 9],    // 4 回目以降は呼ばれないはずの値（呼ばれたら不一致で検出できる）。
+    ]
+    .into_iter();
+    let mut scan = || calls.next();
+    let result = measure::stabilize_pid_scan(&mut scan, 4);
+    assert_eq!(
+        result,
+        Some(vec![4, 3, 2, 1]),
+        "once two consecutive scans agree (ignoring order), the loop must stop and return that pid set"
+    );
 }
 
 /// ループバック TCP 接続の両端（サーバー側・クライアント側）を返す
