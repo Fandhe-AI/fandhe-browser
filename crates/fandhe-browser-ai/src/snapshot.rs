@@ -16,10 +16,15 @@
 //!
 //! - role（役割）算出: TASK-11.3（Issue #72）
 //! - accessible name（アクセシブルネーム）算出: TASK-11.4（Issue #73）
-//! - state（状態）算出: TASK-11.5（Issue #74）
+//! - state（状態）算出: TASK-11.5（Issue #74）で実装済み（[`state`] モジュール・
+//!   [`state::compute_state`]）。ただし DOM 構築時にこの関数を呼び出す配線は
+//!   まだない（呼び出しの組み込みは TASK-11.7・Issue #76 が担う）
 //! - ref（role + name シグネチャによる再特定要求。`AISNAP-10`）: TASK-11.6（Issue #75）
 //! - DOM から `Snapshot` へのツリー構築統合: TASK-11.7（Issue #76）
 //! - ユニットテスト一式: TASK-11.8（Issue #77）
+
+pub mod state;
+pub use state::{CheckedState, State, compute_state};
 
 /// 方式 B 簡約ツリーの 1 ノード（`AISNAP-1`・`TASK-11`・`MS-2`）。
 ///
@@ -37,10 +42,11 @@
 ///   `AISNAP-10`）が決める
 /// - `children`: DOM の親子関係に対応する子ノード。構築は
 ///   TASK-11.7（Issue #76）が担う
+/// - `state`: 要素の状態（`disabled`・`checked`）。算出は
+///   [`state::compute_state`]（TASK-11.5・Issue #74）が担う。`Node::new` の
+///   既定値は `State::default()`（`disabled: false`・`checked: None`）
 ///
-/// `state`（状態）フィールドは本 Issue では追加しない。TASK-11.5
-/// （Issue #74）が追加する。`#[non_exhaustive]` により、フィールドの追加は
-/// 破壊的変更にならない。
+/// `#[non_exhaustive]` により、今後のフィールド追加は破壊的変更にならない。
 ///
 /// 拡張方針: 表・一覧類型のノードには TASK-12（`AISNAP-2`）で `header`
 /// （ヘッダ列）・`rows`（圧縮 1 行表現の行）・`truncated_rows`（省略した
@@ -67,16 +73,21 @@ pub struct Node {
     pub r#ref: Option<String>,
     /// DOM の親子関係に対応する子ノード。構築は TASK-11.7（Issue #76）。
     pub children: Vec<Node>,
+    /// 要素の状態（`disabled`・`checked`）。算出は
+    /// [`state::compute_state`]（TASK-11.5・Issue #74）。
+    pub state: State,
 }
 
 impl Node {
-    /// role・name を指定して `Node` を作る（`ref` は `None`、`children` は空）。
+    /// role・name を指定して `Node` を作る（`ref` は `None`、`children` は空、
+    /// `state` は `State::default()`）。
     pub fn new(role: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             role: role.into(),
             name: name.into(),
             r#ref: None,
             children: Vec::new(),
+            state: State::default(),
         }
     }
 
@@ -84,6 +95,13 @@ impl Node {
     #[must_use]
     pub fn with_ref(mut self, r: impl Into<String>) -> Self {
         self.r#ref = Some(r.into());
+        self
+    }
+
+    /// `state` を設定した `Node` を返す（ビルダー）。
+    #[must_use]
+    pub fn with_state(mut self, state: State) -> Self {
+        self.state = state;
         self
     }
 
@@ -127,15 +145,30 @@ impl Snapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{Node, Snapshot};
+    use super::{CheckedState, Node, Snapshot, State};
 
-    /// `AISNAP-1`（TASK-11.2・Issue #71）: `Node::new` が role・name を
-    /// 設定し、`ref` は `None`、`children` は空になること。
+    /// `AISNAP-1`（TASK-11.2・Issue #71、`state` の既定値は TASK-11.5・
+    /// Issue #74）: `Node::new` が role・name を設定し、`ref` は `None`、
+    /// `children` は空、`state` は `State::default()` になること。
     #[test]
     fn aisnap_1_node_new_sets_role_name_and_defaults() {
         let node = Node::new("heading", "Example Domain");
         assert_eq!(node.role, "heading");
         assert_eq!(node.name, "Example Domain");
+        assert_eq!(node.r#ref, None);
+        assert_eq!(node.children.len(), 0);
+        assert_eq!(node.state, State::default());
+    }
+
+    /// `AISNAP-1`（TASK-11.5・Issue #74）: `with_state` が `state` を
+    /// 設定し、他のフィールドの既定値は変えないこと。
+    #[test]
+    fn aisnap_1_node_with_state_sets_state() {
+        let state = State::default()
+            .with_disabled(true)
+            .with_checked(Some(CheckedState::Checked));
+        let node = Node::new("checkbox", "同意する").with_state(state.clone());
+        assert_eq!(node.state, state);
         assert_eq!(node.r#ref, None);
         assert_eq!(node.children.len(), 0);
     }
