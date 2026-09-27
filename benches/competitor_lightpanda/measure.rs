@@ -38,17 +38,18 @@ use std::time::{Duration, Instant};
 
 use crate::support::{
     DeadlineReader, JsonValue, Outcome, apply_new_process_group, approx_tokens, arg_error_gate,
-    bench_exit_code, content_length_exceeds_limit, expand_args, http_status_for_io_error,
-    json_escape, kill_process_group, looks_like_browser_readiness_response, lookup_fixture, median,
-    parse_content_length, parse_http_request_line, parse_http_status, parse_json,
-    port_conflict_error, reduction_pct, require_bin, token_reduction_gate, validate_mcp_response,
-    wait_with_deadline,
+    bench_exit_code, content_length_exceeds_limit, expand_args, fixture_kind,
+    http_status_for_io_error, json_escape, kill_process_group,
+    looks_like_browser_readiness_response, lookup_fixture, median, parse_content_length,
+    parse_http_request_line, parse_http_status, parse_json, port_conflict_error, reduction_pct,
+    require_bin, token_reduction_gate, validate_mcp_response, wait_with_deadline,
 };
-// `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
-// 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
-// 警告が `-D warnings`（ci.md「3 OS CI」）で fail するため cfg で分離する。
+// `parse_pgrep_pids`・`sum_ps_rss_kb_lines` は unix 専用の
+// `sample_process_group_rss_kb`（下記 `#[cfg(unix)]`）が呼ぶ。無条件 import
+// のままだと Windows ビルドで未使用になり `unused_imports` 警告が
+// `-D warnings`（ci.md「3 OS CI」）で fail するため cfg で分離する。
 #[cfg(unix)]
-use crate::support::parse_ps_rss_kb;
+use crate::support::{parse_pgrep_pids, sum_ps_rss_kb_lines};
 
 /// fixture 配信サーバーの各種上限（coding-rust.md「長さ・件数を上限検証」）。
 /// ローカル専用のベンチ補助サーバーだが、想定外の大量・低速接続で
@@ -1083,33 +1084,73 @@ pub fn measure_cold_start(target: &Target, trials: usize) -> Outcome {
     }
 }
 
-/// アイドル RSS（`PERF-6`）: 起動して安定させたあと `ps -o rss=` で単一プロセスの
-/// RSS（KB）を読む。Windows は `ps` が無いため `Unsupported` を返す
-/// （実装計画どおり。`parse_ps_rss_kb` は unix 専用経路でのみ呼ぶ）。
+/// アイドル RSS（`PERF-6`）: 起動して安定させたあと、対象プロセスが属する
+/// プロセスグループ全体（自身 + 子孫）の RSS 合計（KB）を読む。Windows は
+/// `ps`/`pgrep` が無いため `Unsupported` を返す（`measure_idle_rss` 参照。
+/// `parse_pgrep_pids`・`sum_ps_rss_kb_lines` は unix 専用経路でのみ呼ぶ）。
+///
+/// TASK-84.2・Issue #212 のレビュー指摘対応: 以前は `guard.0.id()`（直接の
+/// 子プロセス 1 つ）だけを `ps -o rss= -p <pid>` で読んでいたため、対象が
+/// さらに子プロセスを使う実装だと、そのメモリを含めずに `PERF-6` 判定
+/// （`support::perf6_comparison`。基準値は Chromium の**プロセスツリー全体**
+/// のアイドル RSS）へ渡してしまい、実際には目標未達でも `"met"` を誤って
+/// 返し得た。`apply_new_process_group`（`spawn_and_wait_ready` が起動時に
+/// 適用。子プロセス自身を新しいプロセスグループのリーダーにするため、
+/// プロセスグループ ID は子プロセスの PID と一致する）が作るプロセス
+/// グループ全体を対象にすることで、[`kill_process_group`] が子・孫を
+/// まとめて終了できるのと同じ範囲を RSS 計測でも数え上げ、Chromium 側の
+/// 計測範囲（プロセスツリー全体）に揃える。
 #[cfg(unix)]
-fn sample_rss_kb(pid: u32) -> Option<u64> {
-    // `ps -o rss=` の出力は数字列のみで数十バイトに収まる。想定外に大量の
-    // 出力を返す環境でも無制限に確保しないための上限
-    // （coding-rust.md「長さ・件数を上限検証」）。
-    const MAX_PS_OUTPUT_BYTES: usize = 4096;
-    let mut command = Command::new("ps");
-    command.args(["-o", "rss=", "-p", &pid.to_string()]);
-    let (status, stdout) = crate::support::run_capturing_output_with_deadline(
-        command,
+fn sample_process_group_rss_kb(pgid: u32) -> Option<u64> {
+    // `pgrep -g <pgid>` の出力は pid の一覧のみで通常数バイト〜数十バイト。
+    // `MAX_TREE_PIDS` を超える異常なプロセス数の場合は打ち切ってエラーに
+    // する（coding-rust.md「長さ・件数を上限検証してからアロケーションに
+    // 使う」）。
+    const MAX_PGREP_OUTPUT_BYTES: usize = 4096;
+    const MAX_TREE_PIDS: usize = 256;
+    let mut pgrep_command = Command::new("pgrep");
+    pgrep_command.args(["-g", &pgid.to_string()]);
+    let (pgrep_status, pgrep_stdout) = crate::support::run_capturing_output_with_deadline(
+        pgrep_command,
+        crate::support::EXTERNAL_COMMAND_DEADLINE,
+        MAX_PGREP_OUTPUT_BYTES,
+    )
+    .ok()?;
+    // `pgrep` は一致するプロセスが無いと終了コード 1 を返す。起動直後の
+    // 対象プロセス自身が消えている想定外の状態のため、`sample_process_group_rss_kb`
+    // （旧実装）の `ps` 失敗時と同じく `None`（呼び出し元が Error 化）にする。
+    if !pgrep_status.success() {
+        return None;
+    }
+    let pids = parse_pgrep_pids(&String::from_utf8_lossy(&pgrep_stdout), MAX_TREE_PIDS)?;
+    if pids.is_empty() {
+        return None;
+    }
+    // `ps -p` はカンマ区切りで複数 pid を受け付ける（POSIX・GNU・BSD 共通）。
+    // 1 行 1 プロセスで RSS が出力されるため `sum_ps_rss_kb_lines` で合計する。
+    let pid_list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    // 1 pid あたり最大 10 桁 + カンマ想定で `MAX_TREE_PIDS` 件分の出力を
+    // 十分収められる上限（`ps` 出力は数字列のみのため通常はこれよりずっと
+    // 小さい）。
+    const MAX_PS_OUTPUT_BYTES: usize = 8192;
+    let mut ps_command = Command::new("ps");
+    ps_command.args(["-o", "rss=", "-p", &pid_list]);
+    let (ps_status, ps_stdout) = crate::support::run_capturing_output_with_deadline(
+        ps_command,
         crate::support::EXTERNAL_COMMAND_DEADLINE,
         MAX_PS_OUTPUT_BYTES,
     )
     .ok()?;
-    if !status.success() {
+    if !ps_status.success() {
         return None;
     }
-    // `parse_ps_rss_kb`（`out.trim().parse::<u64>()`）は数字列としてのみ
-    // 解釈するため、`from_utf8_lossy` の置換文字（U+FFFD）が混入しても
-    // `parse::<u64>()` が失敗して `None` になるだけで、「文字化けが偶然
-    // 別の妥当な値に化ける」経路にはならない（MCP 応答の JSON のように、
-    // 置換後の文字列が別の意味を持つ妥当な値として解釈され得るケースとは
-    // 異なる）。そのため厳密な UTF-8 変換にする必要はない。
-    parse_ps_rss_kb(&String::from_utf8_lossy(&stdout))
+    // `from_utf8_lossy` で足りる理由は旧 `sample_process_group_rss_kb` と同じ
+    // （置換文字混入時は `parse::<u64>()` が失敗して `None` になるだけ）。
+    sum_ps_rss_kb_lines(&String::from_utf8_lossy(&ps_stdout))
 }
 
 #[cfg(unix)]
@@ -1132,10 +1173,13 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
         match spawn_and_wait_ready(bin, &target.serve_args) {
             Ok((guard, port, _elapsed)) => {
                 std::thread::sleep(Duration::from_millis(500));
-                // `ps` の失敗（プロセス早期終了・パース不能出力）を黙って
-                // 捨てず即座に Error 化する。
+                // `ps`/`pgrep` の失敗（プロセス早期終了・パース不能出力）を
+                // 黙って捨てず即座に Error 化する。`apply_new_process_group`
+                // により対象プロセス自身のプロセスグループ ID は自身の pid と
+                // 一致するため、そのままプロセスグループ全体の RSS 合計
+                // （子孫を含む。PERF-6・Issue #212 のレビュー指摘対応）を読む。
                 let pid = guard.0.id();
-                let rss = sample_rss_kb(pid);
+                let rss = sample_process_group_rss_kb(pid);
                 // `drop(guard)` は `kill_process_group`/`Child::kill` で
                 // プロセス（グループ）を終了させ、`wait` で完全な終了を
                 // 確認してから返る。その後に再 probe することで、
@@ -1155,7 +1199,7 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
                     Some(rss) => samples.push(rss as f64),
                     None => {
                         return Outcome::Error(format!(
-                            "{}: idle RSS trial failed: `ps` sampling failed for pid {pid}",
+                            "{}: idle RSS trial failed: process group RSS sampling failed for pgid {pid}",
                             target.name
                         ));
                     }
@@ -1704,7 +1748,7 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
     // 登録されている（`support.rs` の
     // `fixture_table_and_markers_cover_the_same_paths` が保証する）ため、
     // ここで `unwrap_or("")` にせず明示的に内部不整合として扱う。
-    let mut sites: Vec<(String, &'static str)> =
+    let mut sites: Vec<(String, &'static str, &'static str)> =
         Vec::with_capacity(crate::support::FIXTURE_TABLE.len());
     for (page, _content_type, _content) in crate::support::FIXTURE_TABLE {
         let Some(marker) = crate::support::fixture_marker(page) else {
@@ -1713,7 +1757,23 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
                 target.name
             ));
         };
-        sites.push((crate::support::fixture_url(fixture_port, page), marker));
+        // `kind` は結果の `eprintln!`（サイトごとの削減率）に添える類型名
+        // （`AISNAP-1`・TASK-84.4。`FIXTURE_KINDS` のドキュメント参照）。
+        // `FIXTURE_TABLE` の全パスに対応する類型が必ず登録されていることは
+        // `support.rs` の `fixture_table_and_kinds_list_the_same_paths_in_order`
+        // が保証するため、ここでも内部不整合として明示的に扱う
+        // （`unwrap_or` で黙って埋め合わせない）。
+        let Some((kind, _poc13_site)) = fixture_kind(page) else {
+            return Outcome::Error(format!(
+                "{}: internal error: no fixture kind registered for {page}",
+                target.name
+            ));
+        };
+        sites.push((
+            crate::support::fixture_url(fixture_port, page),
+            marker,
+            kind,
+        ));
     }
 
     let mut client = match McpClient::spawn(bin, &target.mcp_args) {
@@ -1751,7 +1811,7 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
     // （fail-closed）。
     let mut reductions = Vec::new();
     let mut failed: Vec<String> = Vec::new();
-    for (url, marker) in &sites {
+    for (url, marker, kind) in &sites {
         let goto_params = format!(
             "{{\"name\":\"goto\",\"arguments\":{{\"url\":\"{}\"}}}}",
             json_escape(url)
@@ -1831,7 +1891,14 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
         let html_tok = approx_tokens(html.chars().count());
         let tree_tok = approx_tokens(tree.chars().count());
         match reduction_pct(html_tok as f64, tree_tok as f64) {
-            Some(pct) => reductions.push(pct),
+            Some(pct) => {
+                // 類型ごとの実測値を stderr へ出す（TASK-84.4・AISNAP-1）。
+                // 結果 JSON の `sites`（`run_all`）は静的な構成情報のみで
+                // 実測値を持たないため、実際の削減率を確認できる経路は
+                // ここだけになる。
+                eprintln!("token reduction [{kind}] ({url}): {pct}");
+                reductions.push(pct);
+            }
             None => failed.push(format!("{url}: reduction_pct undefined (html_tok=0)")),
         }
     }
@@ -1948,9 +2015,10 @@ pub fn run_all(
 
         // `PERF-6` 目標（Chromium 比 85% 以上のアイドル RSS 削減。
         // `crate::support::PERF6_TARGET_PCT`）との比較（TASK-84.2・Issue #212）。
-        // 判定対象は `idle_rss`（この対象のアイドル RSS 計測結果）そのもの
-        // であり、`bench_exit_code` の判定対象には含めない（`perf6_comparison`
-        // ドキュメント参照）。
+        // 判定対象は `idle_rss`（この対象のアイドル RSS 計測結果。
+        // `sample_process_group_rss_kb` によりプロセスグループ全体の RSS
+        // 合計に揃えてある）そのものであり、`bench_exit_code` の判定対象には
+        // 含めない（`perf6_comparison` ドキュメント参照）。
         let perf6 = crate::support::perf6_comparison(
             chromium_idle_rss_kb,
             &idle_rss,
@@ -1958,22 +2026,25 @@ pub fn run_all(
         );
         eprintln!("PERF-6 comparison: {perf6}");
 
-        // `sitesCount`: `tokenReductionPct` の対象として構成されている
-        // fixture の件数（`support::FIXTURE_TABLE` は記事・一覧・フォームの
-        // 3 類型のみ）。計測の成否とは独立の値であり、`tokenReductionPct` が
-        // `skipped`/`error` のときも `FIXTURE_TABLE` の件数を返す。
-        // `docs/spec/03-poc/browser-landscape-2026`（PoC-13。5 類型）と
-        // 対象ページの種類・件数が異なるため、この値を添えて
-        // `tokenReductionPct` を PoC-13 の実測値と直接比較しないことを
-        // 結果からも判別できるようにする（モジュールドキュメント参照）。
+        // `sitesCount`・`sites`: `tokenReductionPct` の対象として構成
+        // されている fixture の件数・類型一覧（`support::FIXTURE_TABLE`・
+        // `support::FIXTURE_KINDS`。TASK-84.4 で PoC-13 相当の 5 類型へ
+        // 拡張した）。いずれも計測の成否とは独立の静的な構成情報であり、
+        // `tokenReductionPct` が `skipped`/`error` のときも出力する。
+        // `docs/spec/03-poc/browser-landscape-2026`（PoC-13）と類型は
+        // 揃えたが、fixture は自作の小規模静的コンテンツでありライブ
+        // ページを転載していないため、`tokenReductionPct` を PoC-13 の
+        // 実測値と直接比較しないことを結果からも判別できるようにする
+        // （モジュールドキュメント・`support::FIXTURE_KINDS` 参照）。
         body.push_str(&format!(
-            "  \"{}\": {{\"binarySizeBytes\":{},\"coldStartMs\":{},\"idleRssKb\":{},\"tokenReductionPct\":{},\"sitesCount\":{},\"perf6\":{}}}",
+            "  \"{}\": {{\"binarySizeBytes\":{},\"coldStartMs\":{},\"idleRssKb\":{},\"tokenReductionPct\":{},\"sitesCount\":{},\"sites\":{},\"perf6\":{}}}",
             json_escape(target.name),
             binary_size.to_json(),
             cold_start.to_json(),
             idle_rss.to_json(),
             token_reduction.to_json(),
             crate::support::FIXTURE_TABLE.len(),
+            fixture_sites_json(),
             perf6,
         ));
         if i + 1 < targets.len() {
@@ -1991,4 +2062,28 @@ pub fn run_all(
     let outcome_refs: Vec<&Outcome> = outcomes.iter().collect();
     let exit_code = bench_exit_code(&outcome_refs);
     (body, exit_code)
+}
+
+/// [`crate::support::FIXTURE_KINDS`] を順に走査し、`run_all` が結果 JSON へ
+/// 添える `sites` 配列の本文（`[{"path":...,"kind":...,"poc13Site":...}, ...]`）
+/// を組み立てる。
+///
+/// `FIXTURE_KINDS` は `&'static str` の固定テーブルであり実行時入力を含まない
+/// が、JSON 文字列として埋め込む際は他の文字列出力（`Outcome::to_json` 等）
+/// と同じ経路（[`json_escape`]）に統一する（TASK-84.4・AISNAP-1）。
+fn fixture_sites_json() -> String {
+    let mut out = String::from("[");
+    for (i, (path, kind, poc13_site)) in crate::support::FIXTURE_KINDS.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"path\":\"{}\",\"kind\":\"{}\",\"poc13Site\":\"{}\"}}",
+            json_escape(path),
+            json_escape(kind),
+            json_escape(poc13_site),
+        ));
+    }
+    out.push(']');
+    out
 }
