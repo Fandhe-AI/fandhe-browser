@@ -121,8 +121,7 @@ const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
 ///
 /// 上限に近づくと [`near_heap_limit_callback`] が呼ばれ、
 /// `terminate_execution` で実行中の JS を打ち切ったうえで、V8 が GC・
-/// 終了処理を完了できるよう上限を一時的に広げる（広げる量には
-/// [`MAX_HEAP_LIMIT_GROWTH_BYTES`] の上限があり、無制限には広げない）。
+/// 終了処理を完了できるよう上限を一時的に広げて返す。
 /// [`V8Engine::evaluate_script`] はこの打ち切りを検知すると、広げた上限を
 /// `remove_near_heap_limit_callback` で本定数（または
 /// `#[cfg(test)]` の [`V8Engine::new_with_heap_limit_for_test`] に渡した
@@ -135,19 +134,67 @@ const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
 /// コールバック定義 1 か所のみ、`data` ポインタは参照しない）。詳細は
 /// [`near_heap_limit_callback`] のドキュメントコメントを参照。
 ///
+/// # 上限を広げる量に累積の上限を設けない理由（codex 再指摘 P0 対応）
+///
+/// 以前の実装は「1 回の発火で広げる量」（4 MiB）に加えて「累積で広げて
+/// よい総量」にも上限（32 MiB）を設けていた。この累積上限は 2 つの理由で
+/// 不十分だった。
+///
+/// 1. V8 のソース（`src/heap/heap.cc` の `Heap::CollectAllAvailableGarbage`・
+///    `Heap::CheckHeapLimitReached`）を読むと、`terminate_execution` に
+///    よる割り込み検査を挟まない単発の巨大確保（1 回のネイティブ呼び出し
+///    で完結する確保。`Array.prototype.fill` 等）に対しては、近接
+///    コールバックが呼ばれる機会は 1 回の GC シリーズあたり高々 2 回
+///    （開始直後に 1 回・GC 試行を使い切った直後にもう 1 回）しかない。
+///    2 回とも「今の上限をわずかに広げる」だけでは、実際に必要な確保量
+///    （数十〜数百 MiB）に届かないまま `ReachedHeapLimit()` が真のままとなり、
+///    `terminate_execution` の打ち切りが効くより前に
+///    `FatalProcessOutOfMemory("Reached heap limit")` でプロセスが abort
+///    する
+/// 2. 累積上限に達した後の呼び出しで上限を広げずに返すと、V8 は
+///    「コールバックが進展させられなかった」と判断し、即座に
+///    `FatalProcessOutOfMemory` へ進む（[coding-rust.md] 参照。ヘッダー
+///    `v8-isolate.h` のコメント「If the garbage collections do not help
+///    and the callback does not increase the limit, then V8 will crash」）
+///
+/// 実機検証（`v8_engine::tests::js_1_v8_single_huge_allocation_does_not_abort_process`
+/// を、1 回の発火で「現在の上限を倍加する」旧方式に一時的に戻して実行）で、
+/// `new Array(10 * 1024 * 1024).fill(1.5)`（80 MiB 相当の単発確保。テスト用
+/// ヒープ上限 16 MiB に対し、旧方式の 2 回の倍加では 64 MiB までしか
+/// 届かない）が実際にプロセスを abort（`Fatal JavaScript out of memory:
+/// Reached heap limit`）させることを確認した。
+///
+/// そこで [`near_heap_limit_callback`] は、呼ばれるたびに必ず
+/// [`HEAP_LIMIT_EMERGENCY_HEADROOM_BYTES`] という大きな固定量を無条件に
+/// 加える。無制限なメモリ確保（OWASP A04）が起きない根拠は主に、V8 自身が
+/// 持つ単発確保の絶対上限である: `String`/`Array` は V8 内部の最大長を
+/// 超えると確保自体が `RangeError` になり、コールバックが呼ばれ続ける
+/// 状況そのものが終わる。加えて、`Heap::InvokeNearHeapLimitCallback` は
+/// コールバックの戻り値を `std::min(heap_limit,
+/// kAllocatorLimitOnMaxOldGenerationSize)` でクランプするため（`heap.h`）、
+/// 本定数が返す値の大きさそのものが実際の一時的なメモリ上限を無制限に
+/// するわけではない。ただしこのクランプ値
+/// （`Heap::kAllocatorLimitOnMaxOldGenerationSize`）は
+/// `V8_COMPRESS_POINTERS`（ポインタ圧縮）が有効なビルドでのみケージ
+/// サイズに固定され、無効なビルドでは `size_t` の最大値（実質クランプ
+/// なし）になる。本 crate が使う prebuilt な `v8` crate（`=152.2.0`）の
+/// ビルド構成でポインタ圧縮が有効かどうかは確認していないため、この
+/// クランプは「効いていれば追加の安全弁になる」という補助的な根拠に
+/// 留め、主たる抑止根拠としては扱わない。`terminate_execution` の
+/// 打ち切りは、この一時的な超過が収まったうえで次の割り込みチェック
+/// ポイントに到達した時点で効く。
+///
 /// # 残る既知の制限（実装済みを装わない。REPAIR-3）
 ///
-/// - `terminate_execution` は「打ち切り要求」であり、要求から実際に実行が
-///   止まるまでの間にもヒープ確保は続きうる。要求後に一時的に広げた上限
-///   （[`MAX_HEAP_LIMIT_GROWTH_BYTES`] まで）を使い切ってもなお確保が
-///   続く極端な入力に対しては、最終的に V8 の既定の OOM 処理（プロセスの
-///   終了）に委ねる以外の手段が現状ない。少なくとも「通常はプロセスが
-///   終了せず `Err` で打ち切れる」ことを目標にした緩和であり、あらゆる
-///   入力に対する完全な保証ではない
+/// - 一時的な超過が収まる範囲は「次の割り込みチェックポイントまでに
+///   実行される個々の確保それぞれ」であり、その合計ではない。単発の
+///   確保 1 回あたりは上記の V8 組み込み上限に収まるが、割り込み検査を
+///   挟まずに複数回の大きな確保を連続して行うコード（例: 1 つの式の中で
+///   複数の大きな配列を確保する）に対しては、次の割り込みチェック
+///   ポイントに到達するまでの間に確保される合計量はその回数分だけ増える
 /// - 上限復元（`remove_near_heap_limit_callback` → 再登録）は
 ///   [`V8Engine::evaluate_script`] の呼び出しが正常に戻ってきた場合にのみ
-///   行われる。呼び出し自体がプロセスクラッシュ等で戻らないケースは
-///   上記の残存リスクと同じ
+///   行われる
 /// - `remove_near_heap_limit_callback` に渡す上限（`self.heap_limit_bytes`）
 ///   は「希望値」であり、v8 crate のドキュメントによれば、その時点の
 ///   実ヒープサイズが希望値を上回っていた場合は、実ヒープサイズに対して
@@ -168,22 +215,21 @@ const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
 ///   「スレッド安全性」節が定める手順に従う）
 const MAX_ISOLATE_HEAP_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
 
-/// [`near_heap_limit_callback`] が 1 回の発火で一時的に広げるヒープ上限の
-/// 増分（バイト。Issue #508）。
+/// [`near_heap_limit_callback`] が呼ばれるたびに無条件で加える、上限の
+/// 広げ幅（バイト。Issue #508・codex 再指摘 P0 対応）。
 ///
-/// V8 が `terminate_execution` の要求を受けてから実際に実行を止め、GC・
-/// 終了処理を完了できるだけの、最小限の余地を与える値（Deno の
-/// `near_heap_limit_callback` 実装と同様の考え方）。
-const HEAP_LIMIT_GROWTH_INCREMENT_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
-
-/// [`near_heap_limit_callback`] が累積で広げてよいヒープ上限の総量
-/// （バイト。Issue #508 受け入れ条件「広げる量に上限を設け、無制限に
-/// 広げない」）。
-///
-/// [`V8Engine::evaluate_script`] が打ち切りを検知して上限を復元する
-/// （[`MAX_ISOLATE_HEAP_BYTES`] のドキュメントコメント参照）たびに、
-/// 広げた量の集計（[`HEAP_LIMIT_GROWTH_USED`]）は 0 へリセットされる。
-const MAX_HEAP_LIMIT_GROWTH_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+/// `MAX_ISOLATE_HEAP_BYTES` のドキュメントコメント「上限を広げる量に
+/// 累積の上限を設けない理由」に書いたとおり、V8 は単発の巨大確保に対して
+/// コールバックを呼ぶ機会を高々 1〜2 回しか与えないため、1 回あたりの
+/// 広げ幅は「たいていの単発確保を 1 回で確実にカバーできる」だけの
+/// 大きさが必要である。1 TiB という値自体に特別な意味はなく、
+/// [`near_heap_limit_callback`] のドキュメントコメントに書いた
+/// `Heap::kAllocatorLimitOnMaxOldGenerationSize` によるクランプ（効いて
+/// いる場合）や V8 組み込みの `String`/`Array` 最大長比べて十分大きい値を
+/// 選んでいる。実機検証（`v8_engine::tests::js_1_v8_single_huge_allocation_does_not_abort_process`。
+/// テスト用ヒープ上限 16 MiB・単発 80 MiB 相当の確保）では、この値で
+/// abort せずに `Err` を返せることを確認済み。
+const HEAP_LIMIT_EMERGENCY_HEADROOM_BYTES: usize = 1 << 40; // 1 TiB
 
 /// [`value_to_js_value`] が文字列型の評価結果を [`JsValue::String`] へ
 /// 変換する際に許容する最大文字数（UTF-16 コード単位。`v8::String::length`
@@ -277,12 +323,6 @@ thread_local! {
     /// [`near_heap_limit_callback`]（`extern "C"` 境界を越えて panic
     /// できない）から安全に書き込める。
     static HEAP_LIMIT_REACHED: Cell<bool> = const { Cell::new(false) };
-
-    /// [`near_heap_limit_callback`] がこれまでに広げた合計量（バイト。
-    /// Issue #508）。[`MAX_HEAP_LIMIT_GROWTH_BYTES`] を超えて広げない
-    /// ための累積カウンタ。[`V8Engine::evaluate_script`] が打ち切りを
-    /// 検知して上限を復元するたびに 0 へリセットする。
-    static HEAP_LIMIT_GROWTH_USED: Cell<usize> = const { Cell::new(0) };
 }
 
 /// ヒープ使用量が上限に近づいたときに V8 から呼ばれるコールバック
@@ -306,9 +346,9 @@ thread_local! {
 ///   が `add_near_heap_limit_callback` に渡す `data` は常に
 ///   `std::ptr::null_mut()` であり、本関数もそれを前提に仮引数を無視する
 ///   だけで、デリファレンスも `data` からの状態復元も行わない。Isolate の
-///   操作口・上限到達フラグ・広げた量の累計は、`data` 経由ではなく
-///   [`HEAP_LIMIT_ISOLATE_HANDLE`]・[`HEAP_LIMIT_REACHED`]・
-///   [`HEAP_LIMIT_GROWTH_USED`] というスレッドローカル変数から取得する
+///   操作口・上限到達フラグは、`data` 経由ではなく
+///   [`HEAP_LIMIT_ISOLATE_HANDLE`]・[`HEAP_LIMIT_REACHED`] という
+///   スレッドローカル変数から取得する
 /// - **呼び出しスレッドの前提**: V8 はこのコールバックを、コールバックを
 ///   登録した Isolate の実行スレッド上（GC のチェックポイント）でのみ
 ///   呼ぶ。本モジュールは [`V8_ISOLATE_ACTIVE`] により同一スレッドに
@@ -341,17 +381,18 @@ unsafe extern "C" fn near_heap_limit_callback(
         }
     });
 
-    // V8 が GC・終了処理を完了できるよう、上限を一時的に広げる。累積の
-    // 広げ幅が `MAX_HEAP_LIMIT_GROWTH_BYTES` に達したら、それ以上は
-    // 広げず現在の上限をそのまま返す（無制限膨張の防止。Issue #508
-    // 受け入れ条件）。
-    HEAP_LIMIT_GROWTH_USED.with(|growth_used| {
-        let used = growth_used.get();
-        let remaining = MAX_HEAP_LIMIT_GROWTH_BYTES.saturating_sub(used);
-        let grant = HEAP_LIMIT_GROWTH_INCREMENT_BYTES.min(remaining);
-        growth_used.set(used + grant);
-        current_heap_limit.saturating_add(grant)
-    })
+    // V8 が GC・終了処理を完了できるよう、上限を一時的に広げて返す。
+    // codex 再指摘 P0 対応: 本コールバックは呼ばれるたびに必ず上限を
+    // 広げなければならない（本モジュール冒頭 `MAX_ISOLATE_HEAP_BYTES` の
+    // ドキュメントコメント「上限を広げる量に累積の上限を設けない理由」
+    // 参照）。広げなかった場合、V8 は `terminate_execution` の打ち切りを
+    // 待たずに `FatalProcessOutOfMemory`（プロセスの abort）へ進む。
+    // [`HEAP_LIMIT_EMERGENCY_HEADROOM_BYTES`] という大きな固定量を無条件に
+    // 加える（同定数のドキュメントコメント参照。単発の巨大確保に対して
+    // コールバックが呼ばれる機会は高々 1〜2 回しかないため、倍加方式では
+    // 小さい現在値からでは実際に必要な量まで届かないことを実機検証で確認
+    // 済み）。オーバーフローによる折り返しを避けるため飽和加算を使う。
+    current_heap_limit.saturating_add(HEAP_LIMIT_EMERGENCY_HEADROOM_BYTES)
 }
 
 /// V8 の Platform 初期化を冪等に行う（AC-1: 何度呼んでも panic しない）。
@@ -532,7 +573,6 @@ impl V8Engine {
         let isolate_handle = isolate.thread_safe_handle();
         HEAP_LIMIT_ISOLATE_HANDLE.with(|handle| *handle.borrow_mut() = Some(isolate_handle));
         HEAP_LIMIT_REACHED.with(|reached| reached.set(false));
-        HEAP_LIMIT_GROWTH_USED.with(|growth_used| growth_used.set(0));
         isolate.add_near_heap_limit_callback(near_heap_limit_callback, std::ptr::null_mut());
 
         let context = {
@@ -671,7 +711,6 @@ impl V8Engine {
                 .remove_near_heap_limit_callback(near_heap_limit_callback, self.heap_limit_bytes);
             self.isolate
                 .add_near_heap_limit_callback(near_heap_limit_callback, std::ptr::null_mut());
-            HEAP_LIMIT_GROWTH_USED.with(|growth_used| growth_used.set(0));
 
             // タイムアウトや構文エラー等、`result` が別の理由の `Err`（や
             // まれに `Ok`）を作っていた場合でも、ヒープ上限到達という
@@ -1277,6 +1316,120 @@ mod tests {
             }
             other => panic!("expected EvaluationFailed for an oversized result, got: {other:?}"),
         }
+    }
+
+    /// JS-1・`TASK-29`・Issue #508 の回帰確認（codex 再指摘 P0 対応）:
+    /// 割り込みチェックを挟まない単発の巨大確保（1 回のネイティブ呼び出し
+    /// で一気にヒープを消費する入力）でも、プロセスが abort せず
+    /// [`JsEngineError::ResourceLimitExceeded`] が返り、その後もエンジン
+    /// が使い続けられること。
+    ///
+    /// 手元検証では、本修正前（コミット f13470a・累積上限 32 MiB あり）の
+    /// コードで `new Array(50 * 1024 * 1024).fill(1.5)`（400 MiB 相当。
+    /// 本テストのサイズを高速化のため縮小する前の値）を評価すると、実際に
+    /// `Fatal JavaScript out of memory: Reached heap limit` により
+    /// プロセスが abort（SIGTRAP/`FatalProcessOutOfMemory`）することを
+    /// 確認した。原因は、旧実装が累積の広げ幅が
+    /// `MAX_HEAP_LIMIT_GROWTH_BYTES`（32 MiB）に達すると、それ以上は
+    /// コールバックが上限を広げずに返していたこと。V8 は近接コールバックが
+    /// 呼ばれるたびに必ず上限を広げることを前提にしており、広げなかった
+    /// 場合は `terminate_execution` の打ち切りを待たずに
+    /// `FatalProcessOutOfMemory` へ進む。
+    ///
+    /// 「毎回必ず上限を広げるが、広げ幅は現在の上限を倍加する」という
+    /// 中間案も手元検証した結果、本テストの入力（10 MiB 要素・80 MiB
+    /// 相当）で abort した（V8 のソース（`src/heap/heap.cc`）を読むと、
+    /// 単発の巨大確保に対して近接コールバックが呼ばれる機会は 1 回の GC
+    /// シリーズあたり高々 2 回しかなく、テスト用ヒープ上限 16 MiB からの
+    /// 倍加では 2 回でも 64 MiB までしか届かないため）。そこで本修正は、
+    /// 呼ばれるたびに [`HEAP_LIMIT_EMERGENCY_HEADROOM_BYTES`] という
+    /// 大きな固定量を無条件に加える方式にした（詳細は同定数・
+    /// `MAX_ISOLATE_HEAP_BYTES` のドキュメントコメントを参照）。
+    #[test]
+    fn js_1_v8_single_huge_allocation_does_not_abort_process() {
+        const TEST_HEAP_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+        let mut engine = V8Engine::new_with_heap_limit_for_test(TEST_HEAP_LIMIT_BYTES)
+            .expect("no other V8Engine is active on this thread");
+
+        // 80 MiB 相当の単発確保（doubles の配列。テスト用ヒープ上限
+        // （16 MiB）＋旧実装の累積成長上限（32 MiB）の合計＝48 MiB を
+        // 上回るサイズにし、かつテストを高速に保つため必要最小限の
+        // 大きさに抑える。`.fill` は 1 回のネイティブ呼び出しの中で完結
+        // し、JS バイトコードの割り込みチェックポイントを経由しないため、
+        // `terminate_execution` が打ち切りを効かせられるのは呼び出しが
+        // 完了した後になる）。
+        let script = "new Array(10 * 1024 * 1024).fill(1.5)";
+        match engine.evaluate_script(script, &EvaluateOptions::default()) {
+            Err(JsEngineError::ResourceLimitExceeded(msg)) => {
+                assert!(
+                    msg.contains("heap") && msg.contains(&TEST_HEAP_LIMIT_BYTES.to_string()),
+                    "expected a message about the heap limit ({TEST_HEAP_LIMIT_BYTES} bytes), got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected ResourceLimitExceeded for a single huge allocation, got: {other:?}"
+            ),
+        }
+
+        // プロセスが生きていて（abort していなければこの行に到達する）、
+        // エンジンが使い続けられること。
+        let result = engine
+            .evaluate_script("40 + 2", &EvaluateOptions::default())
+            .expect("engine must remain usable after a single huge allocation is rejected");
+        assert_eq!(result, JsValue::Number(42.0));
+    }
+
+    /// JS-1・`TASK-29`・Issue #509 の回帰確認: ヒープ上限到達時に
+    /// `globalThis` へ巨大なオブジェクトを保持したまま打ち切られた場合、
+    /// 上限自体は復元されるがヒープの**中身**（`globalThis` 経由で参照
+    /// され続ける巨大オブジェクト）は消されずに残ることを、打ち切り後の
+    /// 読み出しで具体値（配列長 > 0）として確認する（`MAX_ISOLATE_HEAP_BYTES`
+    /// のドキュメントコメント「残る既知の制限」との整合）。また、追加の
+    /// メモリを要求しない単純な評価（`40 + 2`）は、この巨大オブジェクトを
+    /// 保持したままでも成功することも確認する（Issue #509 受け入れ条件
+    /// 「打ち切り後に次の評価が成功する」）。
+    #[test]
+    fn js_1_v8_retained_globalthis_object_after_heap_limit_reached() {
+        const TEST_HEAP_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+        let mut engine = V8Engine::new_with_heap_limit_for_test(TEST_HEAP_LIMIT_BYTES)
+            .expect("no other V8Engine is active on this thread");
+
+        // 上限へ確実に到達させつつ、確保した配列を `globalThis` へ
+        // 残す（`chunks` はループを抜けた後もスコープに残らないと
+        // 打ち切り後に GC される可能性があるため、明示的に `globalThis`
+        // へ代入して参照を保つ）。
+        let script = "globalThis.retained = []; \
+             while (true) { globalThis.retained.push(new Array(1e6).fill(0)); }";
+        match engine.evaluate_script(script, &EvaluateOptions::default()) {
+            Err(JsEngineError::ResourceLimitExceeded(_)) => {}
+            other => panic!(
+                "expected ResourceLimitExceeded while retaining a large globalThis object, got: {other:?}"
+            ),
+        }
+
+        // ヒープの中身（`globalThis.retained`）は打ち切り後も残っている
+        // こと。参照自体が消えていれば `undefined` になり `length` は
+        // 読めない。
+        let retained_length = engine
+            .evaluate_script("globalThis.retained.length", &EvaluateOptions::default())
+            .expect("the retained array must still be reachable via globalThis after the cutoff");
+        match retained_length {
+            JsValue::Number(length) => {
+                assert!(
+                    length > 0.0,
+                    "expected the retained array to be non-empty, got length {length}"
+                );
+            }
+            other => panic!("expected a Number for globalThis.retained.length, got: {other:?}"),
+        }
+
+        // メモリを追加要求しない単純な評価は、巨大オブジェクトを保持した
+        // ままでも成功すること（打ち切り後もエンジンが使い続けられる。
+        // Issue #509 受け入れ条件）。
+        let result = engine
+            .evaluate_script("40 + 2", &EvaluateOptions::default())
+            .expect("a small evaluation must still succeed while a large object is retained");
+        assert_eq!(result, JsValue::Number(42.0));
     }
 
     /// JS-1・`TASK-29`・Issue #506/#508/#509/#510 の回帰確認: ヒープ上限に
