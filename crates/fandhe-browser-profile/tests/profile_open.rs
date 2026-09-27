@@ -1,5 +1,5 @@
 //! `Profile::open`・`Profile::create_file_in` の公開 API を通した受入基準
-//! 確認（TASK-50（50.1）・#176、TASK-50（50.4）・#179、ビヘイビア `PROF-1`）。
+//! 確認（TASK-50（50.1）・#176、TASK-50（50.4）・#179、ビヘイビア `PROF-1`、MS-3）。
 //!
 //! `PROF-1` は「ルートの `cookies/`・`storage/`・`cache/`・`history/` の
 //! 4 サブディレクトリ構成、Linux/macOS ではパーミッション 700、Cookie・
@@ -103,6 +103,14 @@ fn collect_regular_files(root: &Path) -> BTreeSet<PathBuf> {
                     .strip_prefix(root)
                     .unwrap_or_else(|e| panic!("{path:?} は {root:?} 配下ではない: {e}"));
                 out.insert(relative.to_path_buf());
+            } else {
+                // FIFO・ソケット・デバイスファイル等、通常ファイル・
+                // ディレクトリ・symlink のいずれでもない想定外のエントリ。
+                // 受入基準 B（4 サブディレクトリの外に何も書かれていない
+                // こと）を完全に確認するため、黙って無視せず検出する。
+                panic!(
+                    "想定外のエントリ種別を検出した（通常ファイル・ディレクトリ・symlink 以外）: {path:?}"
+                );
             }
         }
     }
@@ -325,10 +333,23 @@ fn prof_1_each_data_kind_is_written_only_under_its_subdirectory() {
 
         expected.insert(PathBuf::from(kind.dir_name()).join(name));
     }
+    // `DataKind::ALL` を使わず、PROF-1 が定める 4 サブディレクトリ名を
+    // 独立に固定する。`expected` の構築自体が `DataKind::ALL` を走査して
+    // 作られているため、`DataKind::ALL.len()` を期待値の算出にも使うと、
+    // 将来 `ALL` から種別が漏れても両者が揃って縮み検出できない
+    // （codex review 指摘 P2 対応）。
+    let expected_dir_names: BTreeSet<&str> = ["cookies", "storage", "cache", "history"]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        expected_dir_names.len(),
+        4,
+        "PROF-1 が定めるサブディレクトリは cookies/storage/cache/history の 4 種"
+    );
     assert_eq!(
         expected.len(),
-        DataKind::ALL.len() + 1,
-        "期待集合の要素数が DataKind::ALL の数＋1（profile.lock）と一致しない \
+        expected_dir_names.len() + 1,
+        "期待集合の要素数が PROF-1 の 4 種＋1（profile.lock）と一致しない \
          （kind の追加漏れを検出するための固定チェック）"
     );
 
