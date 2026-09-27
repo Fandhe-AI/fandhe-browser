@@ -106,13 +106,7 @@ pub(crate) const MAX_FRAME_PAYLOAD_PARENT_TO_CHILD: usize = 1_048_576 + 65_536;
 /// [`super::process_engine`]（W4）が子 → 親のフレーム読み取りに使う上限
 /// （ペイロードのバイト数。設計書 §3.5）。結果文字列の上限（1M UTF-16
 /// 単位。UTF-8 では最悪 3 MiB）に余裕（64 KiB）を足した値。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "W4（process_engine.rs）から使われるまで未使用（REPAIR-3）"
-    )
-)]
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) const MAX_FRAME_PAYLOAD_CHILD_TO_PARENT: usize = 3 * 1_048_576 + 65_536;
 
 /// エラーメッセージのペイロードに許容する最大バイト数（4 KiB。設計書
@@ -163,54 +157,24 @@ pub(crate) enum ProtocolError {
     /// 値のデコード時に、未知の [`JsValue`] タグバイトを受け取った
     /// （[`decode_js_value`]。W4（process_engine.rs）から使われるまで
     /// 未構築）。
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "W4（process_engine.rs）が decode_js_value を使うまで未構築（REPAIR-3）"
-        )
-    )]
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     InvalidValueTag(u8),
     /// 真偽値の表現が `0`/`1` のどちらでもなかった（[`decode_js_value`]。
     /// W4 から使われるまで未構築）。
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "W4（process_engine.rs）が decode_js_value を使うまで未構築（REPAIR-3）"
-        )
-    )]
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     InvalidBoolByte(u8),
     /// 未知の [`ErrorKind`] タグバイト（[`decode_error`]。W4 から使われる
     /// まで未構築）。
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "W4（process_engine.rs）が decode_error を使うまで未構築（REPAIR-3）"
-        )
-    )]
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     InvalidErrorKind(u8),
     /// 未知のエンジン種別バイト（`Hello` フレームの `engine` フィールド。
     /// [`decode_hello`]。W4 から使われるまで未構築）。
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "W4（process_engine.rs）が decode_hello を使うまで未構築（REPAIR-3）"
-        )
-    )]
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     InvalidEngineByte(u8),
     /// ペイロードが期待する長さに満たない（切り詰められている。
     /// [`decode_js_value`]/[`decode_hello`]/[`decode_error`]。W4 から
     /// 使われるまで未構築）。
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "W4（process_engine.rs）が decode_* を使うまで未構築（REPAIR-3）"
-        )
-    )]
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     Truncated,
     /// 文字列として解釈すべきバイト列が不正な UTF-8 だった
     /// （[`decode_evaluate`]。`super::worker` が親からの `Evaluate`
@@ -412,13 +376,7 @@ pub(crate) fn encode_js_value(value: &JsValue, out: &mut Vec<u8>) -> Result<(), 
 ///
 /// 呼び出し元（将来）: `super::process_engine`（W4）が子からの `Result`
 /// フレームをデコードする際に使う。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "W4（process_engine.rs）から使われるまで未使用（REPAIR-3）"
-    )
-)]
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn decode_js_value(buf: &[u8]) -> Result<(JsValue, usize), ProtocolError> {
     let tag = *buf.first().ok_or(ProtocolError::Truncated)?;
     match tag {
@@ -476,13 +434,7 @@ pub(crate) fn encode_hello(protocol_version: u16, engine: EngineKind) -> Vec<u8>
 ///
 /// 呼び出し元（将来）: `super::process_engine`（W4）がハンドシェイクで
 /// 子からの `Hello` フレームをデコードする際に使う。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "W4（process_engine.rs）から使われるまで未使用（REPAIR-3）"
-    )
-)]
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn decode_hello(payload: &[u8]) -> Result<(u16, EngineKind), ProtocolError> {
     let version_bytes: [u8; 2] = payload
         .get(0..2)
@@ -505,13 +457,7 @@ pub(crate) fn decode_hello(payload: &[u8]) -> Result<(u16, EngineKind), Protocol
 ///
 /// 呼び出し元（将来）: `super::process_engine`（W4）が子へ評価対象の
 /// スクリプトを送る際に使う。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "W4（process_engine.rs）から使われるまで未使用（REPAIR-3）"
-    )
-)]
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn encode_evaluate(script: &str) -> Vec<u8> {
     script.as_bytes().to_vec()
 }
@@ -559,13 +505,7 @@ impl ErrorKind {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "W4（process_engine.rs）が decode_error を使うまで未使用（REPAIR-3）"
-        )
-    )]
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     fn from_byte(byte: u8) -> Result<Self, ProtocolError> {
         match byte {
             0 => Ok(Self::Evaluation),
@@ -595,13 +535,7 @@ pub(crate) fn encode_error(kind: ErrorKind, message: &str) -> Vec<u8> {
 ///
 /// 呼び出し元（将来）: `super::process_engine`（W4）が子からの `Error`
 /// フレームをデコードする際に使う。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "W4（process_engine.rs）から使われるまで未使用（REPAIR-3）"
-    )
-)]
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn decode_error(payload: &[u8]) -> Result<(ErrorKind, String), ProtocolError> {
     let kind_byte = *payload.first().ok_or(ProtocolError::Truncated)?;
     let kind = ErrorKind::from_byte(kind_byte)?;

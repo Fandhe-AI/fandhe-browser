@@ -57,15 +57,21 @@ mod worker_protocol;
 #[cfg(feature = "js-v8")]
 mod worker;
 // 子プロセスへの親側プロキシ（TASK-29・Issue #503 設計書 §3.2〜§3.4・
-// §7 W4）。`create_engine` への配線は TASK-29.6（Issue #157）、実際の
-// 子プロセスを起動する結合テストは `tests/v8_worker.rs`（W6）で行うため、
-// それまでは（テストビルドも含め）lib 本体からは一切未使用（REPAIR-3）。
+// §7 W4）。`create_engine` への配線は TASK-29.6（Issue #157）で行う。
+//
+// `pub` にする理由: `tests/v8_worker.rs`（`harness = false`。W6）は結合
+// テストであり、別クレートとしてコンパイルされるため `pub(crate)` の
+// 項目を参照できない。テスト専用の入口（`V8ProcessEngine`・
+// `new`/`new_for_test`/`evaluate_script`/`send_raw_frame_for_test`・
+// `WorkerSpawnConfigForTest`）だけを最小限 `pub` にする必要があり、
+// そのためにはモジュール自体も `pub` にする必要がある（`doc(hidden)` を
+// 併用し、公開 API ドキュメントには出さない）。`V8ProcessEngine` は
+// `Child`・パイプ・チャネルしか保持せず `v8` crate の型を一切参照しない
+// ため、coding-rust.md「V8 / boa の具象型を上位 crate へ漏らさない」には
+// 抵触しない。
 #[cfg(feature = "js-v8")]
-#[expect(
-    dead_code,
-    reason = "TASK-29.6（Issue #157）の配線・W6 の結合テストが来るまで未使用（REPAIR-3）"
-)]
-mod process_engine;
+#[doc(hidden)]
+pub mod process_engine;
 
 pub use engine_trait::{
     CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsEngineError, JsValue, NativeFn,

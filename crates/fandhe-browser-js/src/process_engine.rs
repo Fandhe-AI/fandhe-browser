@@ -186,20 +186,71 @@ impl Drop for WorkerHandle {
     }
 }
 
+/// テスト専用: 子プロセスの起動条件を上書きする（Issue #503 設計書
+/// §7 W6「テスト用に小さいヒープ上限を渡す経路（テスト専用。本番では
+/// 無効）」・「ハンドシェイク失敗」の検証に使う）。
+///
+/// 本番の [`V8ProcessEngine::new`] は常に既定値（`Default::default()`。
+/// 本番のヒープ上限・プロトコルバージョン）を使う。この構造体は
+/// `tests/v8_worker.rs`（`harness = false`。W6）が
+/// [`V8ProcessEngine::new_for_test`] 経由でのみ使う想定であり、本 crate の
+/// 他のコードは触らない。
+///
+/// `#[doc(hidden)]` を付けたうえで `pub` にする理由: `tests/v8_worker.rs`
+/// は結合テスト（別クレートとしてコンパイルされる）であり、`pub(crate)`
+/// の項目を参照できない。テスト専用の入口だけを最小限 `pub` にする
+/// （[coding-rust.md] の「JS エンジンはトレイト抽象越しに使い、V8 の
+/// 具象型を上位 crate へ漏らさない」という制約は、`V8ProcessEngine` が
+/// `Child`・パイプ・チャネルしか保持せず `v8` crate の型を一切参照しない
+/// ため抵触しない）。
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct WorkerSpawnConfigForTest {
+    /// 子へ `super::worker::TEST_HEAP_LIMIT_ENV_VAR` として渡すヒープ
+    /// 上限（バイト）。`None` の場合は渡さない（本番と同じ既定値になる）。
+    pub heap_limit_bytes: Option<usize>,
+    /// 子へ渡すプロトコルバージョンの上書き値（ハンドシェイク失敗を
+    /// 決定的に再現するためのテスト専用経路）。`None` の場合は
+    /// [`worker_protocol::PROTOCOL_VERSION`] を使う。
+    pub protocol_version_override: Option<u16>,
+}
+
 /// JS 評価を子プロセスへ分離して提供するエンジン（`JS-1`・Issue #503）。
 ///
 /// 子・パイプしか保持しないため `Send` にできる（設計書 §3.2。将来
 /// core・tokio と統合するときに有利になる）。
-pub(crate) struct V8ProcessEngine {
+///
+/// `#[doc(hidden)] pub` である理由は [`WorkerSpawnConfigForTest`] の
+/// ドキュメントコメントを参照。`TASK-29.6`（Issue #157）で
+/// `create_engine` から配線し、`impl JsEngine for V8ProcessEngine` を
+/// 追加する（本 Issue の時点では inherent メソッドに留める）。
+#[doc(hidden)]
+pub struct V8ProcessEngine {
     worker: Option<WorkerHandle>,
+    spawn_config: WorkerSpawnConfigForTest,
 }
 
 impl V8ProcessEngine {
     /// 子プロセスを遅延生成する構成で初期化する（設計書 §3.1「遅延
     /// 起動」。PERF-6・PERF-7・CORE-3 を守るため、生成時点ではまだ子を
-    /// 起動しない）。
-    pub(crate) fn new() -> Self {
-        Self { worker: None }
+    /// 起動しない）。常に本番の既定値（ヒープ上限・プロトコルバージョン）
+    /// を使う。
+    #[doc(hidden)]
+    pub fn new() -> Self {
+        Self {
+            worker: None,
+            spawn_config: WorkerSpawnConfigForTest::default(),
+        }
+    }
+
+    /// [`V8ProcessEngine::new`] と同じだが、[`WorkerSpawnConfigForTest`]
+    /// で子プロセスの起動条件を上書きできる（テスト専用。W6）。
+    #[doc(hidden)]
+    pub fn new_for_test(spawn_config: WorkerSpawnConfigForTest) -> Self {
+        Self {
+            worker: None,
+            spawn_config,
+        }
     }
 
     /// スクリプトを評価する（`JS-1`「スクリプト評価」）。
@@ -215,7 +266,8 @@ impl V8ProcessEngine {
     /// `_options` は現時点で未使用（[`EvaluateOptions`] は空構造体。
     /// `engine_trait.rs` 参照）。`TASK-29.6` で `impl JsEngine` へ集約する
     /// 際、トレイトのシグネチャとそのまま揃えるために受け取っておく。
-    pub(crate) fn evaluate_script(
+    #[doc(hidden)]
+    pub fn evaluate_script(
         &mut self,
         script: &str,
         _options: &EvaluateOptions,
@@ -231,7 +283,7 @@ impl V8ProcessEngine {
 
         let mut worker = match self.worker.take() {
             Some(worker) => worker,
-            None => Self::spawn_worker()?,
+            None => self.spawn_worker()?,
         };
 
         let (outcome, keep_worker) = Self::send_evaluate_and_await(&mut worker, script);
@@ -245,8 +297,38 @@ impl V8ProcessEngine {
         outcome
     }
 
+    /// テスト専用: 子プロセスの stdin へ生バイト列をそのまま書き込む
+    /// （プロトコル違反を注入する結合テスト用。設計書 §7 W6）。子が
+    /// 未起動なら、この呼び出しで起動する（[`Self::evaluate_script`] と
+    /// 同じ遅延起動の作法）。
+    #[doc(hidden)]
+    pub fn send_raw_frame_for_test(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if self.worker.is_none() {
+            self.worker = Some(self.spawn_worker().map_err(|err| {
+                std::io::Error::other(format!(
+                    "failed to spawn the JS worker process for a test: {err}"
+                ))
+            })?);
+        }
+        // `expect` ではなく `if let` で取り出す: 直前で `Some` を保証
+        // しているが、外部入力を扱う経路の作法（unwrap/expect を避ける。
+        // coding-rust.md）に合わせて明示的に処理する。
+        let Some(worker) = self.worker.as_mut() else {
+            return Err(std::io::Error::other(
+                "JS worker process is unexpectedly absent after spawning",
+            ));
+        };
+        let Some(stdin) = worker.stdin.as_mut() else {
+            return Err(std::io::Error::other(
+                "JS worker process stdin is already closed",
+            ));
+        };
+        stdin.write_all(bytes)?;
+        stdin.flush()
+    }
+
     /// 子プロセスを起動し、ハンドシェイク（`Hello` の受信）まで完了させる。
-    fn spawn_worker() -> Result<WorkerHandle, JsEngineError> {
+    fn spawn_worker(&self) -> Result<WorkerHandle, JsEngineError> {
         // 設計書 §3.1「再帰の防止」: 自分自身が既にワーカーとして起動
         // されている場合は、さらに子を起動しない。通常の cli 経路では
         // `run_js_worker_if_requested` がワーカーモードのまま `main` を
@@ -264,10 +346,23 @@ impl V8ProcessEngine {
         let mut command = Command::new(&exe);
         // 秘密情報を含みうる環境変数を子へ渡さない（設計書 §3.4）。
         command.env_clear();
+        let protocol_version = self
+            .spawn_config
+            .protocol_version_override
+            .unwrap_or(worker_protocol::PROTOCOL_VERSION);
         command.env(
             worker_protocol::MARKER_ENV_VAR,
-            worker_protocol::PROTOCOL_VERSION.to_string(),
+            protocol_version.to_string(),
         );
+        if let Some(heap_limit_bytes) = self.spawn_config.heap_limit_bytes {
+            // テスト専用（Issue #503 設計書 §7 W6）。本番の `new()` は
+            // `spawn_config.heap_limit_bytes` が常に `None` のため、この
+            // 環境変数は本番の子プロセスには渡らない。
+            command.env(
+                super::worker::TEST_HEAP_LIMIT_ENV_VAR,
+                heap_limit_bytes.to_string(),
+            );
+        }
         #[cfg(windows)]
         {
             // Windows のプロセス生成に必要（`SystemRoot` が無いと子が
