@@ -5,31 +5,34 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# 依存は追加しない（依存最小方針・TASK-1（1.3）のスコープは雛形のみ）。
-# V8（rusty_v8）/ boa（boa_engine）の具体的な依存追加は TASK-29（V8）/
-# TASK-32（boa）でユーザー承認を経て行う（dependency-policy.md）。
+# V8（rusty_v8 = crates.io の `v8` crate）は TASK-29（29.1）・JS-1 で
+# Issue #151（2026-09-25 承認）に従い追加した（dependency-policy.md）。
+# `optional = true` として `js-v8` feature 経由でのみ有効化し、既定ビルド
+# （`default = []`）の依存グラフには含めない（RENDER-1 の Servo 隔離と
+# 同じ考え方。3 OS 一級対応の既定ビルドを軽量に保つ）。
+#
+# boa（boa_engine）の具体的な依存追加は TASK-32（Issue #165）でユーザー
+# 承認を経て行う（dependency-policy.md）。それまで `js-boa` は
+# プレースホルダ feature のまま残す。
 [dependencies]
+v8 = { workspace = true, optional = true }
 
 # feature 名は docs/spec/04-behavior/js-engine.md（JS-1）「JS エンジンの
 # 切替方式」2. の設計（js-v8 = ["dep:v8"]・js-boa = ["dep:boa_engine"]）に
-# 対応する予約枠（TASK-28.1）。
+# 対応する（TASK-28.1 が予約枠として定義し、本 TASK-29.1 で `js-v8` を
+# 実依存へ結合した）。
 #
-# Cargo の `dep:` 接頭辞 feature は、対応する optional 依存が
-# [dependencies] に存在しないと、その feature が無効なままでも
-# manifest 解析自体（cargo build/check/metadata/test）が失敗する
-# （実測で確認済み。エラーメッセージ:
-# 「feature `js-boa` includes `dep:boa_engine`, but `boa_engine` is not
-# listed as a dependency」）。
-# そのため「dep: 接頭辞で宣言する」ことと「実依存をまだ追加しない」ことは
-# 現行 Cargo の下では両立できない。依存追加はユーザー承認制
-# （dependency-policy.md）であるため、本 crate は当面 `dep:` 接頭辞なしの
-# プレースホルダ feature のみを宣言し、依存には結び付けない
-# （実装済みを装わない。REPAIR-3）。
+# `js-v8` は `dep:v8` と結合済みだが、`v8` crate を呼び出す具象実装
+# （`JsEngine` トレイトの V8 実装）はまだない。`create_engine`
+# （`engine_trait.rs`）は `js-v8` 有効時も `CreateEngineError::NotYetImplemented`
+# を返し続ける（実装済みを装わない。REPAIR-3）。具象実装は TASK-29 の
+# 後続サブタスクで追加する。
 #
-# `dep:v8` / `dep:boa_engine` への書き換えは、対応する optional 依存
-# （v8 crate は TASK-29、boa_engine crate は TASK-32）をユーザー承認済みの
-# 完全固定バージョン（`=x.y.z`）で追加するタイミングと同時に行う。
+# `js-boa` は Cargo の制約（`dep:` 接頭辞 feature は対応する optional
+# 依存が [dependencies] に無いと feature が無効でも manifest 解析自体が
+# 失敗する）により、`boa_engine` を追加する TASK-32（Issue #165）まで
+# 引き続き `dep:` 接頭辞なしのプレースホルダのままにする。
 [features]
 default = []
-js-v8 = []
+js-v8 = ["dep:v8"]
 js-boa = []
