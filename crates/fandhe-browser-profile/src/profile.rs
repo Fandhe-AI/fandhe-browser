@@ -7,20 +7,12 @@
 //! MS-3「基盤層・JS エンジン・プロファイル・OS 差異吸収層」）。
 //!
 //! 本モジュールの責務はルートディレクトリと、データ種別ごとに分離した
-//! 4 つのサブディレクトリ（[`DataKind`] の 4 種）の作成に限る。以下は
-//! 後続タスクが本モジュールへ差し込む契約であり、本モジュールは実装済みを
-//! 装わない（REPAIR-3・code-comment-style.md）。
+//! 4 つのサブディレクトリ（[`DataKind`] の 4 種）の作成、および
+//! パストラバーサル防止（[`sanitize_component`]・[`assert_within_root`]。
+//! `PROF-4`、TASK-50（50.2）・#177）に限る。以下は後続タスクが本モジュールへ
+//! 差し込む契約であり、本モジュールは実装済みを装わない（REPAIR-3・
+//! code-comment-style.md）。
 //!
-//! - 相対パス（`..` 等）を用いたルート配下検証（`assert_within_root` 等。
-//!   `PROF-4`、TASK-50（50.2）・#177）。本モジュールは unix では
-//!   `rustix` の `openat`/`mkdirat`（ディレクトリハンドル基準の作成。下記
-//!   `open_or_create_child_dir` 参照）により、ファイルシステムのルートから
-//!   `root` に至るまでの各パス要素が symlink でないことを検証するが、任意の
-//!   相対パス文字列の正規化・境界判定は行わない。この検証により、呼び出し元は
-//!   `root` に至る経路上に symlink を含まない実体パスを渡す必要がある
-//!   （macOS の `/var`・一部 Linux ディストリビューションの `/home` のような
-//!   OS 標準 symlink を経由する場合は事前に `canonicalize` する運用を要する。
-//!   #177 で境界定義が固まった際に見直しうる制約）
 //! - `profile.lock`（`std::fs::File::try_lock`）による二重 open の拒否
 //!   （`PROF-1`、TASK-50（50.3）・#178。#175 の決定により `fs2` は使わない）
 //! - プロファイル削除処理（`PROF-5`、TASK-53）
@@ -35,6 +27,19 @@
 //!
 //! 上記が未実装のため、`Profile::open` は同一プロファイルへの二重 open を
 //! 拒否しない（#178 で解消するまでの既知の制約）。
+//!
+//! [`assert_within_root`] は字句判定のみで、`canonicalize`・`exists` 等で
+//! ファイルシステムに対して再解決しない（[`assert_within_root`] の doc
+//! 参照）。境界検証は「コンポーネント単位の拒否（[`sanitize_component`]）＋
+//! 字句判定（[`assert_within_root`]）」と「symlink に対するハンドル基準の
+//! `openat`（`open_or_create_child_dir`・[`Profile::create_file_in`]）」の
+//! 二層で成り立つ。本モジュールは unix ではこのハンドル基準の作成により、
+//! ファイルシステムのルートから `root` に至るまでの各パス要素が symlink
+//! でないことを検証する。この検証により、呼び出し元は `root` に至る経路上に
+//! symlink を含まない実体パスを渡す必要がある（macOS の `/var`・一部
+//! Linux ディストリビューションの `/home` のような OS 標準 symlink を経由
+//! する場合は事前に `canonicalize` する運用を要する。字句判定を採用した
+//! ため今後も残る制約である）。
 //!
 //! `Profile::root`・`Profile::data_dir` が返す `Path` は表示・ログ用に限る
 //! （PR #437 P1 レビュー指摘: `open` で検証した実体とは無関係にパス文字列を
@@ -65,7 +70,9 @@ use rustix::fs::{CWD, Mode, OFlags};
 use rustix::io::Errno;
 #[cfg(unix)]
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-#[cfg(unix)]
+// `sanitize_component`・`assert_within_root`（PROF-4、TASK-50（50.2）・#177）は
+// 純粋なパス処理で unix 限定ではないため、Windows でも使う。cfg で unix に
+// 限定すると Windows ビルドで未使用（`-D warnings`）になる。
 use std::path::Component;
 
 /// プロファイルディレクトリ構築に失敗した際のエラー。
@@ -73,8 +80,9 @@ use std::path::Component;
 /// `fandhe-browser-core::error::Error` と同様、自前で `Display`・
 /// `std::error::Error`・`From<io::Error>` を実装する（`thiserror` 等の
 /// 外部依存は追加しない。dependency-policy.md）。`#[non_exhaustive]` により、
-/// `assert_within_root`（#177）・ロック（#178）が新規バリアントを追加しても
-/// 非破壊にする（REPAIR-4）。
+/// ロック（#178）が新規バリアントを追加しても非破壊にする（REPAIR-4）。
+/// `InvalidComponent`・`OutsideRoot`（`PROF-4`、TASK-50（50.2）・#177）は
+/// 本バージョンで追加済み。
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ProfileError {
@@ -110,6 +118,29 @@ pub enum ProfileError {
         /// 未対応の理由を示す英語メッセージ。
         reason: &'static str,
     },
+    /// [`sanitize_component`] がパスコンポーネントとして不正と判定した入力を
+    /// 拒否する場合に返す（`PROF-4`、TASK-50（50.2）・#177）。
+    ///
+    /// 生の入力（untrusted なドメイン名・キー名）はフィールドに保持しない。
+    /// エラー値をそのままログ・レスポンスへ流用しても、攻撃者が与えた
+    /// 任意長の文字列をコピーする確保やログ汚染を招かないため（security.md
+    /// 「OWASP Top 10 観点」の不安全な設計対策）。
+    InvalidComponent {
+        /// 拒否理由を示す英語メッセージ。
+        reason: &'static str,
+    },
+    /// [`assert_within_root`] が、組み立てたパスがプロファイルルート配下に
+    /// 収まらないと判定した場合に返す（`PROF-4`、TASK-50（50.2）・#177）。
+    ///
+    /// `root`・`candidate` は呼び出し元が構築した表示用のパスであり、
+    /// ファイルシステムに対して検証済みの実体ではない（[`assert_within_root`]
+    /// の doc 参照。字句判定のみで `canonicalize`/`exists` は行わない）。
+    OutsideRoot {
+        /// 比較対象としたプロファイルルート。
+        root: PathBuf,
+        /// ルート配下に収まらないと判定された候補パス。
+        candidate: PathBuf,
+    },
 }
 
 impl fmt::Display for ProfileError {
@@ -125,6 +156,17 @@ impl fmt::Display for ProfileError {
                     "profile isolation unsupported on this platform: {reason}"
                 )
             }
+            ProfileError::InvalidComponent { reason } => {
+                write!(f, "invalid path component: {reason}")
+            }
+            ProfileError::OutsideRoot { root, candidate } => {
+                write!(
+                    f,
+                    "path {} is outside profile root {}",
+                    candidate.display(),
+                    root.display()
+                )
+            }
         }
     }
 }
@@ -135,6 +177,8 @@ impl std::error::Error for ProfileError {
             ProfileError::Io(source) => Some(source),
             ProfileError::InvalidLayout { .. } => None,
             ProfileError::Unsupported { .. } => None,
+            ProfileError::InvalidComponent { .. } => None,
+            ProfileError::OutsideRoot { .. } => None,
         }
     }
 }
@@ -190,6 +234,156 @@ impl DataKind {
     }
 }
 
+/// [`sanitize_component`] を通過した、単一のパスコンポーネントであることが
+/// 保証された値（`PROF-4`、TASK-50（50.2）・#177）。
+///
+/// フィールドを非公開にし、`sanitize_component` を経由しないと構築できない
+/// ようにすることで「検証済みであること」を型で表す（REPAIR-4・coding-rust.md
+/// 「公開 API」: フラットな文字列で済ませない）。`Profile::create_file_in`
+/// （現状唯一の書き込み API）と、Cookie・Storage 等の実データ操作を担う後続
+/// タスク（TASK-51 以降）が、ここで検証したコンポーネントを `Path::join` の
+/// 引数として使う契約とする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SafeComponent<'a>(&'a std::ffi::OsStr);
+
+impl<'a> SafeComponent<'a> {
+    /// 検証済みのコンポーネントを `&OsStr` として返す。
+    pub fn as_os_str(&self) -> &'a std::ffi::OsStr {
+        self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for SafeComponent<'_> {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0
+    }
+}
+
+impl AsRef<Path> for SafeComponent<'_> {
+    fn as_ref(&self) -> &Path {
+        Path::new(self.0)
+    }
+}
+
+/// プロファイル配下でファイル・ディレクトリ名として使う 1 要素を検証する
+/// （`PROF-4`、TASK-50（50.2）・#177）。
+///
+/// `Profile::create_file_in` から、Cookie・Storage 等の実データ操作を担う
+/// 後続タスク（TASK-51 以降）まで共有する入口。ドメイン名・キー名のような
+/// untrusted な外部入力は、パスへ組み込む前に必ず本関数を通す
+/// （security.md「プロファイル境界」）。以下のいずれかに該当すれば拒否する。
+///
+/// - 空文字列、または 255 バイト（`NAME_MAX` 相当）を超える
+/// - `/`・`\`（unix の `Path::components` は `\` を区切り文字として扱わない
+///   ため、3 OS で挙動を揃えるために明示的に拒否する）・NUL バイトを含む
+/// - `..` を部分文字列として含む（`a..b` のような値も保守的に拒否する）
+/// - `.` と完全に一致する
+/// - `Path::new(raw).components()` が単一の `Component::Normal(raw)` に
+///   一致しない（Windows の `C:foo` のようなドライブ相対パスを弾く）
+///
+/// 戻り値は [`SafeComponent`]（REPAIR-4: 真偽値・フラットな文字列で返さない）。
+pub fn sanitize_component(raw: &std::ffi::OsStr) -> Result<SafeComponent<'_>, ProfileError> {
+    let bytes = raw.as_encoded_bytes();
+
+    if bytes.is_empty() {
+        return Err(ProfileError::InvalidComponent {
+            reason: "path component must not be empty",
+        });
+    }
+    // 長さ検証を他の走査より先に行う（coding-rust.md「長さ・件数を上限検証
+    // してからアロケーションに使う」。以降の走査は最大 255 バイトに収まる）。
+    if bytes.len() > 255 {
+        return Err(ProfileError::InvalidComponent {
+            reason: "path component exceeds 255 bytes",
+        });
+    }
+    if bytes.contains(&b'/') {
+        return Err(ProfileError::InvalidComponent {
+            reason: "path component must not contain '/'",
+        });
+    }
+    if bytes.contains(&b'\\') {
+        return Err(ProfileError::InvalidComponent {
+            reason: "path component must not contain '\\'",
+        });
+    }
+    if bytes.contains(&0u8) {
+        return Err(ProfileError::InvalidComponent {
+            reason: "path component must not contain a NUL byte",
+        });
+    }
+    if bytes.windows(2).any(|pair| pair == b"..") {
+        return Err(ProfileError::InvalidComponent {
+            reason: "path component must not contain '..'",
+        });
+    }
+    if bytes == b"." {
+        return Err(ProfileError::InvalidComponent {
+            reason: "path component must not be '.'",
+        });
+    }
+
+    let mut components = Path::new(raw).components();
+    let is_single_normal_component = matches!(components.next(), Some(Component::Normal(n)) if n == raw)
+        && components.next().is_none();
+    if !is_single_normal_component {
+        return Err(ProfileError::InvalidComponent {
+            reason: "path component must resolve to a single normal component",
+        });
+    }
+
+    Ok(SafeComponent(raw))
+}
+
+/// `candidate` がプロファイルルート `root` の配下にあることを字句的に検証
+/// する（`PROF-4`、TASK-50（50.2）・#177）。
+///
+/// **字句判定のみであり、ファイルシステム上の実体は再検証しない**
+/// （`canonicalize`・`exists`・`metadata` を一切呼ばない。REPAIR-3:
+/// 実装済みを装わない）。PoC-7（`docs/spec/03-poc/profile-isolation/
+/// profile-proto`）は `canonicalize()`/`exists()` で解決してから比較する
+/// 実装だったが、本 crate は `root()`/`data_dir()` を表示専用とし、実際の
+/// 操作は `root_fd`/`data_dir_fd` を起点にした `openat` + `NOFOLLOW`
+/// （[`open_or_create_child_dir`]・[`Profile::create_file_in`]）で行う契約
+/// （PR #437 レビュー指摘の TOCTOU 解消）のため、ここでパス文字列を
+/// ファイルシステムに対して解決し直すとその契約が崩れる。symlink に対する
+/// 防御はハンドル基準の `openat` 層が担い、本関数は「組み立てたパス文字列が
+/// `..` 等でルート外を指していないか」だけを見る。
+///
+/// 判定手順:
+/// 1. `candidate.strip_prefix(root)` が失敗すれば `Err`（`/tmp/prof` と
+///    `/tmp/prof2/x` のような兄弟プレフィクスは一致しない）
+/// 2. 残りのパスが空なら `Err`（ルート自身は書き込み先として認めない）
+/// 3. 残りのコンポーネントがすべて `Component::Normal` でなければ `Err`
+///    （`ParentDir`・`RootDir`・`Prefix`・先頭の `CurDir` を拒否する。
+///    シンボリックリンクが絡むと `..` の字句的な解決は意味が曖昧になるため、
+///    `ParentDir` を解決して許容する方式は採らない）
+///
+/// 大文字小文字を区別しない OS（Windows・macOS 既定）では、大文字小文字だけが
+/// 異なるパスを「ルート外」と判定し得る（拒否側に倒れるため安全側の制約。
+/// coding-rust.md「クロスプラットフォーム」）。
+pub fn assert_within_root(root: &Path, candidate: &Path) -> Result<(), ProfileError> {
+    let outside_root = || ProfileError::OutsideRoot {
+        root: root.to_path_buf(),
+        candidate: candidate.to_path_buf(),
+    };
+
+    let rest = candidate.strip_prefix(root).map_err(|_| outside_root())?;
+
+    let mut components = rest.components().peekable();
+    if components.peek().is_none() {
+        // ルート自身（`rest` が空）は書き込み先として認めない。
+        return Err(outside_root());
+    }
+    for component in components {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(outside_root());
+        }
+    }
+
+    Ok(())
+}
+
 /// unix 限定: [`Profile::open`] が検証したルート直下の 4 サブディレクトリの
 /// ハンドル（fd）。フィールドをデータ種別ごとに明示することで、
 /// [`DataKind`] にバリアントが追加された際にコンパイラがフィールド追加・
@@ -234,8 +428,10 @@ impl Profile {
     /// `0o700` へ締め直す副作用がある（`PROF-1` が要求する挙動）。例えば
     /// ホームディレクトリを誤って `root` に指定すると、そのディレクトリの
     /// モードが変わる点に注意（呼び出し元が正しいプロファイルルートを
-    /// 渡す前提。相対パスの境界検証は #177 の `assert_within_root` が担当し、
-    /// 本関数はまだ持たない）。
+    /// 渡す前提。`root` 自体の妥当性検証は本関数の範囲外であり、
+    /// [`assert_within_root`]（`PROF-4`・#177）はここで検証済みの `root` を
+    /// 基点に、その配下で組み立てたパスがルート外を指していないかを
+    /// 検証する役割を担う）。
     ///
     /// まだ `profile.lock` を取らないため、本関数は同一プロファイルへの
     /// 二重 open を拒否しない（REPAIR-3。#178 で解消する）。
@@ -381,10 +577,12 @@ impl Profile {
     /// Cursor Low 指摘: `O_RDWR` でディレクトリを開くと `EISDIR` になり、
     /// 以前は `InvalidLayout` ではなく `Io` に分類されていた）。
     ///
-    /// `name` はディレクトリ区切り文字を含まない単一の要素であることを
-    /// 要求する（`..`・`a/b` 等は [`ProfileError::InvalidLayout`] で拒否し、
+    /// `name` は [`sanitize_component`] を通過した単一の要素であることを
+    /// 要求する（`..`・`a/b` 等は [`ProfileError::InvalidComponent`] で拒否し、
     /// `dir_fd` を起点にした名前解決であってもパストラバーサルを許さない。
-    /// security.md「プロファイル境界」）。
+    /// security.md「プロファイル境界」）。組み立てた表示用パスはさらに
+    /// [`assert_within_root`] でプロファイルルート配下に収まることを再確認
+    /// する（コンポーネント単位の拒否に続く二重防御。PROF-4・#177）。
     ///
     /// `openat` には `OFlags::NONBLOCK` を付ける。`name` の位置に FIFO が
     /// あると、`NONBLOCK` なしでは相手側が読み書きのため open するまで
@@ -422,19 +620,15 @@ impl Profile {
         kind: DataKind,
         name: &std::ffi::OsStr,
     ) -> Result<std::fs::File, ProfileError> {
-        // `name` が単一の通常コンポーネントであることを検証する。区切り
-        // 文字・`.`・`..`・空文字はすべて `Component::Normal` 以外になるか、
-        // 複数コンポーネントに分解されるため拒否できる。
-        let mut components = Path::new(name).components();
-        let is_single_normal_component = matches!(components.next(), Some(Component::Normal(n)) if n == name)
-            && components.next().is_none();
-        if !is_single_normal_component {
-            return Err(ProfileError::InvalidLayout {
-                path: self.data_dir(kind).join(name),
-                reason: "file name must be a single path component without separators or '..'",
-            });
-        }
-        let display_path = self.data_dir(kind).join(name);
+        // 1 層目: コンポーネント単位の拒否（PROF-4）。
+        let safe_name = sanitize_component(name)?;
+        let display_path = self.data_dir(kind).join(safe_name);
+
+        // 2 層目: 組み立てたパスがルート配下に収まるかを字句的に再確認する
+        // （PROF-4。`display_path` はルート直下のデータディレクトリのさらに
+        // 1 階層下のため通常は自明に真だが、`data_dir`/`join` の組み立てを
+        // 変更した際の回帰を検出する境界検証として維持する）。
+        assert_within_root(&self.root, &display_path)?;
 
         let dir_fd = self.data_dir_fd(kind);
         // `NONBLOCK` は FIFO 越しの open ブロックを避けるためだけに付ける
@@ -442,7 +636,7 @@ impl Profile {
         let flags =
             OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
         let create_mode = Mode::RUSR | Mode::WUSR;
-        let owned = rustix::fs::openat(dir_fd, name, flags, create_mode)
+        let owned = rustix::fs::openat(dir_fd, safe_name.as_os_str(), flags, create_mode)
             .map_err(|err| classify_file_open_error(&display_path, err))?;
 
         // 実体を確認する。ここで拒否する場合、`owned` はこのスコープを
@@ -1150,7 +1344,7 @@ mod tests {
                 .create_file_in(DataKind::Cookies, std::ffi::OsStr::new(name))
                 .expect_err("複数コンポーネント・'..' は拒否される");
             assert!(
-                matches!(err, ProfileError::InvalidLayout { .. }),
+                matches!(err, ProfileError::InvalidComponent { .. }),
                 "{name:?} が拒否されなかった"
             );
         }
@@ -1315,6 +1509,144 @@ mod tests {
         assert!(
             !tmp.path().exists(),
             "ACL 隔離を実装できないプラットフォームではディレクトリを作成しない"
+        );
+    }
+
+    /// PROF-4: PoC-7（`docs/spec/03-poc/profile-isolation/profile-proto`）が
+    /// 使ったパストラバーサル入力 9 種を `sanitize_component` がすべて拒否する。
+    #[test]
+    fn prof_4_sanitize_component_rejects_poc7_traversal_inputs() {
+        for input in [
+            "../../../etc",
+            "..",
+            "a/../../b",
+            "/etc/passwd",
+            "sub/dir",
+            "../escape",
+            "a/b",
+            "..",
+            "",
+        ] {
+            let err = sanitize_component(std::ffi::OsStr::new(input))
+                .expect_err(&format!("{input:?} は拒否される"));
+            assert!(
+                matches!(err, ProfileError::InvalidComponent { .. }),
+                "{input:?} が InvalidComponent で拒否されなかった"
+            );
+        }
+    }
+
+    /// PROF-4: PoC-7 の入力に加え、`sanitize_component` が追加で拒否すべき
+    /// 入力（`.`・`\`・NUL・`..` の部分文字列・256 バイト超過）を確認する。
+    #[test]
+    fn prof_4_sanitize_component_rejects_extra_unsafe_inputs() {
+        let too_long = "a".repeat(256);
+        let with_backslash = "a\\b";
+        let with_nul = "a\0b";
+        let embedded_dotdot = "a..b";
+
+        for input in [".", with_backslash, with_nul, embedded_dotdot, &too_long] {
+            let err = sanitize_component(std::ffi::OsStr::new(input))
+                .expect_err(&format!("{input:?} は拒否される"));
+            assert!(
+                matches!(err, ProfileError::InvalidComponent { .. }),
+                "{input:?} が InvalidComponent で拒否されなかった"
+            );
+        }
+    }
+
+    /// PROF-4: 通常の名前（255 バイト丁度を含む）は `sanitize_component` を
+    /// 通過し、`as_os_str()` が入力と一致する。
+    #[test]
+    fn prof_4_sanitize_component_accepts_plain_names() {
+        let exactly_255 = "a".repeat(255);
+        for input in ["example.com", "kv.json", "cookie_1", exactly_255.as_str()] {
+            let safe = sanitize_component(std::ffi::OsStr::new(input))
+                .unwrap_or_else(|_| panic!("{input:?} は許可される"));
+            assert_eq!(safe.as_os_str(), std::ffi::OsStr::new(input));
+        }
+    }
+
+    /// PROF-4: `assert_within_root` は字句判定のみを行い、ルート外を指す
+    /// パス（`..` を含む組み立て・兄弟プレフィクス・ルート自身）を `Err` で
+    /// 拒否する。ファイルシステムには一切触れないため、`root` は実在しない
+    /// パスで組み立てる。
+    #[test]
+    fn prof_4_assert_within_root_rejects_outside_paths() {
+        let root = std::env::temp_dir().join("fandhe-prof4-root");
+        let sibling_root = std::env::temp_dir().join("fandhe-prof4-root2");
+
+        let cases: Vec<PathBuf> = vec![
+            PathBuf::from("/etc/passwd"),
+            root.join("..").join("x"),
+            root.join("a").join("..").join("..").join("b"),
+            sibling_root.join("x"),
+            root.clone(),
+        ];
+
+        for candidate in cases {
+            let err = assert_within_root(&root, &candidate)
+                .expect_err(&format!("{candidate:?} はルート外と判定される"));
+            assert!(
+                matches!(err, ProfileError::OutsideRoot { .. }),
+                "{candidate:?} が OutsideRoot で拒否されなかった"
+            );
+        }
+    }
+
+    /// PROF-4: ルート配下の通常パスは `assert_within_root` を通過する。
+    #[test]
+    fn prof_4_assert_within_root_accepts_paths_under_root() {
+        let root = std::env::temp_dir().join("fandhe-prof4-root");
+
+        for candidate in [
+            root.join("cookies").join("a.json"),
+            root.join("cache").join("x"),
+        ] {
+            assert_within_root(&root, &candidate)
+                .unwrap_or_else(|_| panic!("{candidate:?} はルート配下として許可される"));
+        }
+    }
+
+    /// PROF-4（Unix 固有）: `create_file_in` は PoC-7 の 9 入力（空文字列含む）
+    /// をすべて拒否し、プロファイルルート外に何も作らない（PoC-7 と同じ
+    /// 「境界外への書き込み 0 件」の具体値 assert）。
+    #[cfg(unix)]
+    #[test]
+    fn prof_4_create_file_in_rejects_all_traversal_inputs_and_writes_nothing_outside() {
+        let tmp = TempDir::new();
+        let profile_path = tmp.path().join("profile");
+        let profile = Profile::open(&profile_path).expect("open は成功する");
+
+        for name in [
+            "../../../etc",
+            "..",
+            "a/../../b",
+            "/etc/passwd",
+            "sub/dir",
+            "../escape",
+            "a/b",
+            "",
+        ] {
+            for kind in [DataKind::Cookies, DataKind::Storage] {
+                let err = profile
+                    .create_file_in(kind, std::ffi::OsStr::new(name))
+                    .expect_err(&format!("{name:?} は {kind:?} でも拒否される"));
+                assert!(
+                    matches!(err, ProfileError::InvalidComponent { .. }),
+                    "{name:?} / {kind:?} が InvalidComponent で拒否されなかった"
+                );
+            }
+        }
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("一時ディレクトリの読み取り")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read_dir エントリの取得");
+        assert_eq!(
+            entries.len(),
+            1,
+            "プロファイルルート（profile）以外にエントリが作られてはならない: {entries:?}"
         );
     }
 }
