@@ -39,6 +39,13 @@ targets = [
 # コメント付きで記録し、レビューを必須とする。
 version = 2
 ignore = [
+  # RUSTSEC-2024-0436（`paste` unmaintained。脆弱性ではない）。
+  # `v8`（TASK-29.1・#152・Issue #151 承認）が直接依存する proc-macro crate で、
+  # コンパイル時にしか使われず実行時コードを含まない。上流（denoland/rusty_v8）
+  # には `paste` をやめた版がまだ無く、本リポ側で個別に差し替えることはできない。
+  # 解消予定: 上流 v8 が `paste` 依存をやめた版へ追従した時点でこの ignore を
+  # 外す（追跡先: #152・TASK-29 親 #139）。
+  { id = "RUSTSEC-2024-0436", reason = "paste は v8 crate の直接依存の proc-macro（unmaintained のみで脆弱性ではなく実行時コードを含まない）。上流に修正版がなく解消は #152/TASK-29(#139) で追跡する" },
 ]
 
 [licenses]

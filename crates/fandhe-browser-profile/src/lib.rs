@@ -11,15 +11,17 @@
 //!
 //! `Profile::open(root)` はルートディレクトリと 4 つのデータ種別ディレクトリの
 //! 作成・Unix でのパーミッション 700 設定までを実装済み（TASK-50（50.1）・#176）。
-//! `profile.lock`（`std::fs::File::try_lock`）による二重 open の拒否も
+//! パストラバーサル防止（`sanitize_component`・`assert_within_root`。`PROF-4`、
+//! TASK-50（50.2）・#177）も実装済みで、コンポーネント単位の拒否（字句検査）
+//! と組み立てたパスの字句判定の二重防御に加え、Unix ではハンドル基準の
+//! `openat` + `NOFOLLOW` が symlink への書き込みを防ぐ（`Profile::create_file_in`
+//! 参照）。`profile.lock`（`std::fs::File::try_lock`）による二重 open の拒否も
 //! 実装済み（`PROF-1`、TASK-50（50.3）・#178。std のロックが 3 OS の advisory
 //! lock を既にカバーするため、TASK-54 が想定していた `fs2`/`fs4`/`fd-lock`
 //! への置換は不要であり、残るのは 3 OS 実機での確認のみ。#175 の決定により
 //! `fs2` は使わない）。以下はいずれも未実装であり、実装済みを装う公開 API・
 //! ダミー実装は置かない。
 //!
-//! - パストラバーサル防止・ルート配下検証（`assert_within_root` 等。`PROF-4`、
-//!   TASK-50（50.2）・#177）
 //! - パーミッション・隔離の網羅的なテスト（TASK-50（50.4）・#179）
 //! - プロファイル削除処理（`PROF-5`、TASK-53）
 //! - 並行アクセス時のデータ分離（`PROF-2`・`PROF-3`、TASK-51・TASK-52）
@@ -34,4 +36,6 @@ pub mod profile;
 
 mod lock;
 
-pub use profile::{DataKind, Profile, ProfileError};
+pub use profile::{
+    DataKind, Profile, ProfileError, SafeComponent, assert_within_root, sanitize_component,
+};

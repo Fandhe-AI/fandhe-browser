@@ -89,6 +89,21 @@ tokio = { version = "=1.53.1", default-features = false, features = [
   "macros",
 ] }
 
+# TASK-29（29.1）・JS-1・MS-3: 既定 JS エンジン V8（rusty_v8 = crates.io の
+# `v8` crate）。Issue #151（TASK-29.hdep）でユーザー承認済み（2026-09-25）。
+# ライセンス MIT（crate 自体）。prebuilt static lib に内包される V8
+# 本体（BSD-3-Clause）・libc++（Apache-2.0 WITH LLVM-exception）・
+# ICU（Unicode-3.0）は permissive だが cargo-deny の対象外のため、帰属表示は
+# TASK-76（NOTICE）で扱う。既定では build.rs が GitHub Releases から
+# prebuilt（denoland/rusty_v8）をダウンロードしてリンクする方式で、
+# ソースビルドは行わない（bindgen/libclang 不要）。既定 feature
+# `use_custom_libcxx` は明示的に維持する（外すと libstdc++ への動的リンクに
+# 切り替わり、3 OS 一級対応（ci.md）の前提が崩れるため）。
+# 使用箇所は `fandhe-browser-js`（feature `js-v8`）のみで、既定ビルド
+# （`js-v8` 無効）の依存グラフには含まれない（`cargo tree` で確認。RENDER-1
+# の Servo 隔離と同様の考え方）。
+v8 = { version = "=152.2.0" }
+
 [profile.release]
 # release ビルドは panic 発生時に unwind せず即座に中断する前提
 # （coding-rust.md「release は panic = "abort" 前提のため catch_unwind に頼らない」）。
