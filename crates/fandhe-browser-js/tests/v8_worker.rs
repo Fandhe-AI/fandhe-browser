@@ -54,6 +54,10 @@ fn main() -> ExitCode {
         "case: js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceeded"
     );
     js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceeded();
+    eprintln!(
+        "case: js_1_repeated_short_evaluations_accumulating_array_buffers_hit_resource_limit"
+    );
+    js_1_repeated_short_evaluations_accumulating_array_buffers_hit_resource_limit();
     #[cfg(target_os = "linux")]
     {
         eprintln!("case: js_1_linux_child_process_has_rlimit_data_set");
@@ -397,4 +401,58 @@ fn js_1_linux_child_process_has_rlimit_data_set() {
         fields[4], "2147483648",
         "hard RLIMIT_DATA mismatch: {data_size_line:?}"
     );
+}
+
+/// codex・Cursor Bugbot レビュー指摘 #503 P0「短い評価を繰り返して
+/// `ArrayBuffer` をグローバル変数に溜め込むと、上限を超えても検出され
+/// ない」の回帰テスト: 1 回 1 回は小さくすぐ終わる評価
+/// （`chunks.push(new Uint8Array(1e7).fill(1))`。無限ループを含まない）
+/// を `evaluate_script` 呼び出しごとに繰り返すと、継続的なメモリ監視
+/// スレッド（応答直後の同期確認・次回呼び出し前の確認を含む）が
+/// どこかの呼び出しで `ResourceLimitExceeded` を返し、その次の評価は
+/// 新しい Context で成功すること。
+fn js_1_repeated_short_evaluations_accumulating_array_buffers_hit_resource_limit() {
+    let mut engine = V8ProcessEngine::new();
+    engine
+        .evaluate_script(
+            "globalThis.chunks = []; chunks.length",
+            &EvaluateOptions::default(),
+        )
+        .unwrap_or_else(|err| panic!("initializing the accumulator must succeed: {err}"));
+
+    // 320 MiB のしきい値に対し、1 回 10 MiB。80 回（800 MiB 相当）まで
+    // 繰り返せば、しきい値超過が検出されないままでは通らないはずである。
+    const MAX_ITERATIONS: usize = 80;
+    let mut hit_limit = false;
+    for i in 0..MAX_ITERATIONS {
+        match engine.evaluate_script(
+            "chunks.push(new Uint8Array(1e7).fill(1)); chunks.length",
+            &EvaluateOptions::default(),
+        ) {
+            Ok(_) => continue,
+            Err(JsEngineError::ResourceLimitExceeded(msg)) => {
+                assert!(
+                    msg.contains("context was discarded"),
+                    "repeated small allocations must discard the context, got: {msg}"
+                );
+                hit_limit = true;
+                break;
+            }
+            other => panic!("iteration {i}: expected Ok or ResourceLimitExceeded, got: {other:?}"),
+        }
+    }
+    assert!(
+        hit_limit,
+        "expected to hit the parent's RSS monitoring threshold within {MAX_ITERATIONS} \
+         repeated 10 MiB allocations, but every evaluation succeeded"
+    );
+
+    // 次の評価は新しい子・新しい Context で成功し、以前の `chunks` は
+    // もう見えないこと。
+    let result = engine
+        .evaluate_script("typeof chunks", &EvaluateOptions::default())
+        .unwrap_or_else(|err| {
+            panic!("engine must recover with a fresh child after hitting the limit: {err}")
+        });
+    assert_eq!(result, JsValue::String("undefined".to_string()));
 }

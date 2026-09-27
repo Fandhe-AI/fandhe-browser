@@ -59,7 +59,7 @@
 //! | OS | 強制方法 | 強さ |
 //! |---|---|---|
 //! | Linux | `RLIMIT_DATA`（[`enforce_child_memory_limit`]。`rustix::process::setrlimit`。上限 [`LINUX_RLIMIT_DATA_CEILING_BYTES`]＝2 GiB） | **OS がある程度強制するが、厳密な上限としては機能しない**。`RLIMIT_DATA` は匿名 `MAP_PRIVATE` の `mmap`（大きな `ArrayBuffer` の backing store が実際に使う経路。glibc malloc は既定のしきい値 128 KiB を超える確保を `mmap` に回す）にも、実際に触れていない仮想予約にも適用される（`setrlimit(2)` の「data segment のみ」という古い説明は、匿名 mmap を会計に含めない実装を前提にしており、本 crate が対象とする現行 Linux カーネルの挙動とは異なる）。しかし V8 自身の `CodeRange` 予約だけで数百 MiB（アーキテクチャ依存。実測は上記のとおり）を消費するため、[`HEAP_EXTERNAL_ALLOWANCE_BYTES`] 相当の小さい値には設定できず、実質的な防御は親側の RSS 監視に委ねている |
-//! | Windows | Job Object（[`enforce_child_memory_limit`]。`win32job` の `limit_working_memory`。`JOB_OBJECT_LIMIT_WORKINGSET`。上限 [`WINDOWS_WORKING_SET_MAX_BYTES`]） | **OS の関与はあるが部分的（未実機検証）**。承認済みの `win32job =2.0.3` が公開する安全な API には、コミットチャージの上限を超えたらプロセスを強制終了する本来の `ProcessMemoryLimit` 相当（`JOB_OBJECT_LIMIT_PROCESS_MEMORY`/`JOB_OBJECT_LIMIT_JOB_MEMORY`）を設定する手段が無い（`ExtendedLimitInfo` が内部に持つ `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` は `pub(crate)` で本 crate からは触れず、`unsafe` を追加してまで構造体を直接書き換えることは本対応の制約「`unsafe` の追加は都度承認」に反するため行わない）。`JOB_OBJECT_LIMIT_WORKINGSET` は物理メモリの常駐量（working set）を trim させるだけで、コミットチャージそのものを止めたりプロセスを終了させたりしない。したがって Windows も実質的に親側の RSS 監視が主たる防衛線であり、Job 自体は working set を trim させる補助的な効果に留まる。真の `ProcessMemoryLimit` を得るには `win32job` の対応バージョンへの更新（ユーザー承認が必要）か `unsafe` な直接呼び出し（同様に承認が必要）のいずれかが要る。**本実装は Windows 実機・CI での検証ができていない**（開発環境が Windows ではないため）。`assign_current_process` が Windows のホスト型 CI（既に別の Job に属している場合がある）で失敗する可能性が残る |
+//! | Windows | Job Object（[`enforce_child_memory_limit`]。`win32job` の `limit_working_memory`。`JOB_OBJECT_LIMIT_WORKINGSET`。上限 [`WINDOWS_WORKING_SET_MAX_BYTES`]） | **OS の関与はあるが部分的（未実機検証）**。承認済みの `win32job =2.0.3` が公開する安全な API には、コミットチャージの上限を超えたらプロセスを強制終了する本来の `ProcessMemoryLimit` 相当（`JOB_OBJECT_LIMIT_PROCESS_MEMORY`/`JOB_OBJECT_LIMIT_JOB_MEMORY`）を設定する手段が無い（`ExtendedLimitInfo` が内部に持つ `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` は `pub(crate)` で本 crate からは触れず、`unsafe` を追加してまで構造体を直接書き換えることは本対応の制約「`unsafe` の追加は都度承認」に反するため行わない）。`JOB_OBJECT_LIMIT_WORKINGSET` は物理メモリの常駐量（working set）を trim させるだけで、コミットチャージそのものを止めたりプロセスを終了させたりしない。したがって Windows も実質的に親側の RSS 監視が主たる防衛線であり、Job 自体は working set を trim させる補助的な効果に留まる。真の `ProcessMemoryLimit` を得るには `win32job` の対応バージョンへの更新（ユーザー承認が必要）か `unsafe` な直接呼び出し（同様に承認が必要）のいずれかが要る。Windows 版 3 OS CI（`js-v8` feature 込み）は Job の作成・`assign_current_process`・子プロセスの起動を含めて通っている（2026-09-28 時点）が、これは「経路がエラーにならず動く」ことの確認であり、working set 上限が実際に機能してメモリを trim させる（＝限界まで確保して trim を観測する）ところまでは検証できていない。開発環境が Windows ではないため、本 crate 側でその種の実機検証はできていない |
 //! | macOS | 無し | **親側の RSS 監視のみ**。本実装時にこの macOS 環境で実機検証したところ、`RLIMIT_DATA`・`RLIMIT_AS`・`RLIMIT_RSS` はいずれも `setrlimit(2)` の呼び出し自体が `EINVAL` で失敗した（「上限をかけたが効かない」ではなく「そもそも設定できない」）。Job Object 相当の OS 機構も無い。したがって [`enforce_child_memory_limit`] は macOS では何もせず常に成功を返し（呼び出そうとしても確実に失敗するため、fail-closed にすると macOS 上で子プロセスが常に起動できなくなってしまう）、実際の防御は親側の RSS 監視だけに委ねる |
 //!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
@@ -78,7 +78,9 @@
 //!   [`enforce_child_memory_limit`] 自体の失敗は fail-closed（評価を
 //!   始めずに終了）であり、起動時強制と監視とで fail-open/fail-closed の
 //!   扱いが異なることに注意
-//! - Windows 側の実装は実機・CI で未検証（上表参照）
+//! - Windows 側の working set 上限の実効性（trim が実際に発動するか）は
+//!   未検証。CI では経路（Job の作成・割り当て・子プロセスの起動）が
+//!   エラーなく動くことまでは確認済み（上表参照）
 
 use std::time::Duration;
 
@@ -173,21 +175,44 @@ const WASM_MEMORY_PAGE_BYTES: u64 = 64 * 1024;
 /// `HEAP_EXTERNAL_ALLOWANCE_BYTES / WASM_MEMORY_PAGE_BYTES` = 2048 ページ。
 const WASM_MAX_MEM_PAGES: u64 = HEAP_EXTERNAL_ALLOWANCE_BYTES / WASM_MEMORY_PAGE_BYTES;
 
+/// [`enforce_child_memory_limit`] が成功した際に返すガード（codex
+/// レビュー指摘 #503 P1「`enforce_via_job_object` が Job をローカル変数の
+/// まま返しているため、関数を抜けた時点でハンドルが閉じてしまう」
+/// 対応）。
+///
+/// Windows では Win32 の Job Object はハンドルへの参照が無くなると
+/// 閉じられ、`assign_current_process` で設定した working set 上限が
+/// 維持される保証が無くなる。呼び出し元（`super::worker::worker_main`）
+/// は、このガードを子プロセスの寿命いっぱい（`worker_main` 関数の
+/// スコープの終わりまで）保持しなければならない。
+///
+/// Linux（`setrlimit`）・macOS（何もしない）では追加のハンドルを必要と
+/// しないため、このガードは中身を持たないユニット型として振る舞う。
+#[must_use = "drop するとメモリ上限が失われる場合がある（Windows）。プロセスの寿命いっぱい保持すること"]
+pub(crate) struct ChildMemoryLimitGuard {
+    #[cfg(target_os = "windows")]
+    _job: win32job::Job,
+}
+
 /// 子プロセス自身に OS のメモリ上限を設定する（起動直後・V8 初期化前に
-/// 呼ぶ契約。`super::worker::worker_main` 参照）。
+/// 呼ぶ契約。`super::worker::worker_main` 参照）。戻り値の
+/// [`ChildMemoryLimitGuard`] は、呼び出し元が子プロセスの寿命いっぱい
+/// 保持しなければならない（ドキュメントコメント参照）。
 ///
 /// 失敗した場合は fail-closed（呼び出し元は評価を始めずに終了する）。
 /// 親（`super::process_engine`）はハンドシェイク未達として検出し、
 /// `EngineUnavailable` へ変換する。OS ごとの強制の強さはモジュール冒頭
 /// の表を参照（macOS は常に成功を返し、実際の防御は行わない）。
-pub(crate) fn enforce_child_memory_limit() -> Result<(), String> {
+pub(crate) fn enforce_child_memory_limit() -> Result<ChildMemoryLimitGuard, String> {
     #[cfg(target_os = "linux")]
     {
-        enforce_via_rlimit_data()
+        enforce_via_rlimit_data()?;
+        Ok(ChildMemoryLimitGuard {})
     }
     #[cfg(target_os = "windows")]
     {
-        enforce_via_job_object()
+        let job = enforce_via_job_object()?;
+        Ok(ChildMemoryLimitGuard { _job: job })
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
@@ -195,7 +220,7 @@ pub(crate) fn enforce_child_memory_limit() -> Result<(), String> {
         // 参照）。ここで `RLIMIT_DATA` 等を試みても確実に失敗するだけで
         // あり、fail-closed にすると当該 OS で子プロセスが常に起動でき
         // なくなってしまうため、何もせず成功を返す。
-        Ok(())
+        Ok(ChildMemoryLimitGuard {})
     }
 }
 
@@ -217,14 +242,18 @@ fn enforce_via_rlimit_data() -> Result<(), String> {
 
 /// Windows: Job Object を作成し、working set 上限を
 /// [`WINDOWS_WORKING_SET_MAX_BYTES`] に設定したうえで自分自身（呼び出し
-/// プロセス）を割り当てる。`win32job` は Win32 API を隠蔽した safe
-/// ラッパのため `unsafe` を追加しない。
+/// プロセス）を割り当て、その `Job` を呼び出し元へ返す（codex レビュー
+/// 指摘 #503 P1 対応。呼び出し元がこの `Job` を保持し続けないと、
+/// ハンドルが閉じて上限が失われうる。[`ChildMemoryLimitGuard`] 参照）。
+/// `win32job` は Win32 API を隠蔽した safe ラッパのため `unsafe` を
+/// 追加しない。
 ///
 /// working set 上限が実際にはコミットチャージの上限にならないことは
 /// モジュール冒頭の表を参照（既知の制限。実装済みを装わない。REPAIR-3）。
-/// 本関数は Windows 実機・CI で未検証である（同表参照）。
+/// working set 上限の実効性（trim の発動）は未検証である（同表参照。
+/// Windows 版 3 OS CI ではこの関数がエラーなく完走することは確認済み）。
 #[cfg(target_os = "windows")]
-fn enforce_via_job_object() -> Result<(), String> {
+fn enforce_via_job_object() -> Result<win32job::Job, String> {
     use win32job::{ExtendedLimitInfo, Job};
 
     let mut info = ExtendedLimitInfo::new();
@@ -236,7 +265,8 @@ fn enforce_via_job_object() -> Result<(), String> {
     let job = Job::create_with_limit_info(&info)
         .map_err(|err| format!("failed to create a Windows Job Object: {err}"))?;
     job.assign_current_process()
-        .map_err(|err| format!("failed to assign this process to the Job Object: {err}"))
+        .map_err(|err| format!("failed to assign this process to the Job Object: {err}"))?;
+    Ok(job)
 }
 
 /// wasm の単一メモリインスタンスに [`WASM_MAX_MEM_PAGES`] を上限として

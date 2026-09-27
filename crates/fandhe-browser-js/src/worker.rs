@@ -123,10 +123,21 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
     // OS のメモリ上限を設定する（codex レビュー指摘 #503 P0「ヒープ外
     // メモリが無制限」対応。`super::resource_limits` のドキュメント
     // コメント参照）。失敗したら評価を始めずに終了する（fail-closed）。
-    if let Err(err) = super::resource_limits::enforce_child_memory_limit() {
-        eprintln!("fandhe-browser-js worker: failed to enforce the child memory limit: {err}");
-        return ExitCode::FAILURE;
-    }
+    //
+    // 戻り値の `_memory_limit_guard` は `worker_main` 関数のスコープが
+    // 終わるまで（＝子プロセスがこの後の評価ループを終えて終了する
+    // まで）保持し続ける必要がある（codex レビュー指摘 #503 P1
+    // 「Job をローカル変数のまま返しているためハンドルが閉じてしまう」
+    // 対応。`ChildMemoryLimitGuard` のドキュメントコメント参照。`_` を
+    // 先頭に付けた名前にすることで「未使用」の警告を避けつつ、値
+    // そのものはこの関数の終わりまで drop されない）。
+    let _memory_limit_guard = match super::resource_limits::enforce_child_memory_limit() {
+        Ok(guard) => guard,
+        Err(err) => {
+            eprintln!("fandhe-browser-js worker: failed to enforce the child memory limit: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // 環境変数は untrusted な入力（`TEST_HEAP_LIMIT_ENV_VAR` のドキュメント
     // コメント参照）。`test_heap_limit_from_env_value` が読み取った直後に
