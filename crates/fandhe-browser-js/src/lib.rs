@@ -22,11 +22,19 @@
 //! 同梱されていない種別には `NotBundled`（詳細は [`engine_trait`] を参照）
 //! を返す。以下は未実装（実装済みを装わない。REPAIR-3）。
 //!
-//! - V8 の具象実装（`JS-1`、`TASK-29`、`MS-3`）
+//! - V8 の具象実装（`JS-1`、`TASK-29`、`MS-3`）: Platform/Isolate 初期化
+//!   （`29.2`）のみ実装済み。`JsEngine` 実装・`create_engine` への配線は
+//!   `29.3`〜`29.6`
 //! - boa の具象実装（`JS-1`、`TASK-32`、`MS-3`）
 //! - core への統合（`js_stub` の置換。`JS-2`、`TASK-30`、`MS-3`）
 
 pub mod engine_trait;
+// V8（`rusty_v8`）の Platform/Isolate 初期化（TASK-29.2）を担う非公開
+// モジュール。具象型を上位 crate へ漏らさないため `pub` を付けず、
+// `pub use` もしない（AC-2・coding-rust.md「JS エンジンはトレイト抽象
+// 越しに使い、V8 / boa の具象型を上位 crate へ漏らさない」）。
+#[cfg(feature = "js-v8")]
+mod v8_engine;
 
 pub use engine_trait::{
     CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsEngineError, JsValue, NativeFn,
