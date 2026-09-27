@@ -182,7 +182,8 @@ pub fn looks_like_browser_readiness_response(body: &str) -> bool {
 /// 含み得る）を解釈する。
 ///
 /// アイドル RSS 計測（`PERF-6`）が unix でのみ呼ぶ（Windows は
-/// `Unsupported`。実装計画 3.2 節）。空文字列・数値でない出力は `None` を返す。
+/// [`parse_tasklist_mem_kb`]・`tasklist` を使う。TASK-84.5）。空文字列・
+/// 数値でない出力は `None` を返す。
 ///
 /// 呼び出し元（`measure.rs` の `sample_rss_kb`）が
 /// `#[cfg(unix)]` 限定のため、この関数自体も `#[cfg(unix)]` にする。
@@ -191,6 +192,61 @@ pub fn looks_like_browser_readiness_response(body: &str) -> bool {
 #[cfg(unix)]
 pub fn parse_ps_rss_kb(out: &str) -> Option<u64> {
     out.trim().parse::<u64>().ok()
+}
+
+/// Windows `tasklist /FI "PID eq <pid>" /FO CSV /NH` の標準出力（ヘッダ無し
+/// CSV 1 行。列は Image Name, PID, Session Name, Session#, Mem Usage）から
+/// Mem Usage 列（ワーキングセット。KB 単位）を取り出す。
+///
+/// アイドル RSS 計測（`PERF-6`）の Windows 経路（`measure.rs` の
+/// `sample_rss_kb`）が呼ぶ（TASK-84.5）。Microsoft Learn の `tasklist`
+/// リファレンスによれば Mem Usage 列はプロセスのワーキングセットサイズを
+/// 表す。`tasklist` の出力は untrusted な外部コマンド出力として扱い、
+/// `.get()` によるフィールド数検証・PID の一致確認・ASCII 数字のみの抽出を
+/// 行う（coding-rust.md「外部入力の経路」）。添字アクセス（`[]`）は使わない。
+///
+/// 桁区切り文字はロケールによって `,`（en-US）・`.`（de-DE）・半角/全角
+/// スペース・NBSP 等に変わるため、区切り文字での分割ではなく ASCII 数字
+/// だけを拾う方式にする。`from_utf8_lossy` の置換文字（U+FFFD）が混じっても
+/// 数字フィルタで落ちるため、別の妥当な値に化ける経路にはならない
+/// （`parse_ps_rss_kb` の呼び出し元コメントと同じ論法）。
+///
+/// PID が一致しない行（`tasklist` が別プロセスの情報を返した場合や、
+/// `INFO: No tasks are running ...`（ロケールにより翻訳される）のような
+/// メッセージ行）は `None` にする。呼び出し側はこれを計測失敗
+/// （`Outcome::Error`）として扱う。
+///
+/// unix ネイティブビルドの本番経路（`measure.rs` の `sample_rss_kb`）からは
+/// 到達しない（windows 版 `sample_rss_kb` からのみ呼ばれる）が、単体テストは
+/// cfg で絞らず 3 OS すべてで走らせたい（パーサー自体は OS に依存しない
+/// 純粋関数のため）。`competitor_lightpanda`（`[[bench]]`）・
+/// `competitor_lightpanda_measure`（`harness = false` の `[[test]]`。
+/// `#[test]` 本体が実際には使われない）の unix ビルドでは到達不能になるため
+/// `#[cfg_attr(not(windows), allow(dead_code))]` を付ける（`split_args` と
+/// 同種の対応。理由は同関数のコメント参照）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn parse_tasklist_mem_kb(out: &str, pid: u32) -> Option<u64> {
+    let line = out.lines().find(|line| !line.trim().is_empty())?;
+    let trimmed = line.trim();
+    // 先頭・末尾の `"` を取り除いてから `","` で分割する。Windows の
+    // ファイル名には `"` を含められないため、クォートの中に区切りが
+    // 紛れ込む心配はない。
+    let inner = trimmed.strip_prefix('"').unwrap_or(trimmed);
+    let inner = inner.strip_suffix('"').unwrap_or(inner);
+    let fields: Vec<&str> = inner.split("\",\"").collect();
+    if fields.len() != 5 {
+        return None;
+    }
+    let field_pid = fields.get(1).copied()?;
+    if field_pid.trim().parse::<u32>().ok()? != pid {
+        return None;
+    }
+    let mem_field = fields.get(4).copied()?;
+    let digits: String = mem_field.chars().filter(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u64>().ok()
 }
 
 /// テンプレート引数中の `{port}` プレースホルダを実ポート番号へ展開する。
@@ -278,10 +334,13 @@ pub fn parse_args_env_value(
 pub enum Outcome {
     Value(f64),
     Skipped(String),
-    // Windows（`cfg(windows)` 版の `measure_idle_rss`）でのみ構築される
-    // バリアント。Linux/macOS ネイティブビルドではこのバリアントを構築する
-    // コード経路が存在しないため dead_code 警告が出るが、3 OS CI
-    // （ci.md）の各ネイティブランナーでは Windows ビルド時に使われる。
+    // 将来、OS やプラットフォームの制約で計測できない項目を表すための
+    // 予約バリアント。TASK-84.5（アイドル RSS の Windows 実装。`tasklist`
+    // 経由）でこのバリアントを構築していた最後の経路が無くなったため、
+    // 現時点ではどの OS からもこのバリアントを構築するコード経路が
+    // 存在しない（dead_code 警告を `#[allow(dead_code)]` で抑止する）。
+    // JSON の status 語彙（`"unsupported"`）と `bench_exit_code`・
+    // `to_json` の既存契約を保つため、バリアント自体は削除しない。
     #[allow(dead_code)]
     Unsupported(String),
     Error(String),
@@ -330,7 +389,8 @@ impl Outcome {
 /// `main` が常に正常終了すると、自動計測が失敗した実行を成功と誤判定し得る。
 /// `main` の終了コード契約: 1 件でも計測失敗（`Outcome::Error`）があれば
 /// 非ゼロ（`1`）で終了する。対象バイナリ未設定による `Outcome::Skipped`・
-/// Windows 未対応による `Outcome::Unsupported` のみの場合は `0` で終了する
+/// 特定の計測がプラットフォームの制約で行えないことによる
+/// `Outcome::Unsupported` のみの場合は `0` で終了する
 /// （JSON は失敗の有無に関わらず必ず stdout へ出力する）。`main`（`[[bench]]`
 /// ターゲット）は `std::process::ExitCode` を返す契約のため `u8` で返す。
 pub fn bench_exit_code(outcomes: &[&Outcome]) -> u8 {
@@ -476,7 +536,7 @@ pub fn lookup_fixture(request_path: &str) -> Option<(&'static str, &'static str)
 /// coding-rust.md「外部入力の経路では明示的に処理する」）。この判定は
 /// OS に依存しない（`bin`・`bin_error` の値だけで決まる）ため、
 /// `measure_cold_start`・`measure_binary_size`・`measure_token_reduction`・
-/// `#[cfg(unix)]`/`#[cfg(windows)]` 両方の `measure_idle_rss`・
+/// `measure_idle_rss`（unix/windows 共通の 1 関数。TASK-84.5）・
 /// [`token_reduction_gate`] がすべてこの 1 関数を通して判定することで、
 /// 個別に同じ分岐を書いて食い違いを生む余地をなくす。`Result` にして
 /// `bin` そのものを返すことで、呼び出し側は
@@ -775,15 +835,12 @@ pub fn run_with_deadline(
 
 /// `command` の stdout を上限付きで採取しつつ、完了を期限付きで待つ。
 ///
-/// `ps` のような出力の小さいローカルコマンド専用（`measure.rs` の
-/// `sample_rss_kb` が使う）。`max_stdout_bytes` を超える出力は切り捨てて
-/// 読み続ける（無制限確保を避ける。coding-rust.md「長さ・件数を上限検証
-/// してからアロケーションに使う」）。stdin は `Stdio::null()` に固定する
-/// （呼び出し元からの入力を渡す用途を持たない）。
-///
-/// `sample_rss_kb`（unix 専用。`ps` を使う）からのみ呼ばれるため
-/// `#[cfg(unix)]` にする（Windows ビルドでは dead_code になる）。
-#[cfg(unix)]
+/// `ps`/`tasklist` のような出力の小さいローカルコマンド専用（`measure.rs`
+/// の unix/windows 両方の `sample_rss_kb` が使う。TASK-84.5）。
+/// `max_stdout_bytes` を超える出力は切り捨てて読み続ける（無制限確保を
+/// 避ける。coding-rust.md「長さ・件数を上限検証してからアロケーションに
+/// 使う」）。stdin は `Stdio::null()` に固定する（呼び出し元からの入力を
+/// 渡す用途を持たない）。
 pub fn run_capturing_output_with_deadline(
     mut command: std::process::Command,
     deadline: Duration,
@@ -1803,6 +1860,106 @@ mod tests {
         assert_eq!(parse_ps_rss_kb("not a number"), None);
     }
 
+    // PERF-6: parse_tasklist_mem_kb は Windows の
+    // `tasklist /FI "PID eq <pid>" /FO CSV /NH` 出力を解釈する。呼び出し元
+    // （`measure.rs` の windows 版 `sample_rss_kb`）は Windows 専用だが、
+    // このパーサー自体は cfg で絞らず 3 OS すべてで単体テストする
+    // （`#[cfg_attr(not(windows), allow(dead_code))]` の理由は関数定義側の
+    // コメント参照）。
+    #[test]
+    fn parse_tasklist_mem_kb_en_us_thousands_separator() {
+        assert_eq!(
+            parse_tasklist_mem_kb(r#""x.exe","1234","Console","1","12,345 K""#, 1234),
+            Some(12345)
+        );
+    }
+
+    #[test]
+    fn parse_tasklist_mem_kb_de_de_thousands_separator() {
+        assert_eq!(
+            parse_tasklist_mem_kb(r#""x.exe","1234","Console","1","12.345 K""#, 1234),
+            Some(12345)
+        );
+    }
+
+    #[test]
+    fn parse_tasklist_mem_kb_space_thousands_separator() {
+        // 半角スペースと NBSP（U+00A0）のどちらも桁区切りとして扱われる
+        // ロケールがある。ASCII 数字だけを拾う実装ではどちらも同じ結果になる。
+        assert_eq!(
+            parse_tasklist_mem_kb(r#""x.exe","1234","Console","1","12 345 K""#, 1234),
+            Some(12345)
+        );
+        assert_eq!(
+            parse_tasklist_mem_kb(
+                "\"x.exe\",\"1234\",\"Console\",\"1\",\"12\u{a0}345 K\"",
+                1234
+            ),
+            Some(12345)
+        );
+    }
+
+    #[test]
+    fn parse_tasklist_mem_kb_no_separator() {
+        assert_eq!(
+            parse_tasklist_mem_kb(r#""x.exe","1234","Console","1","987 K""#, 1234),
+            Some(987)
+        );
+    }
+
+    #[test]
+    fn parse_tasklist_mem_kb_pid_mismatch_is_none() {
+        assert_eq!(
+            parse_tasklist_mem_kb(r#""x.exe","1234","Console","1","12,345 K""#, 9999),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_tasklist_mem_kb_no_matching_process_is_none() {
+        // PID 一致行が無いとき、`tasklist` は終了コード 0 のまま
+        // このような情報メッセージ（ロケールにより翻訳される）だけを出す。
+        assert_eq!(
+            parse_tasklist_mem_kb(
+                "INFO: No tasks are running which match the specified criteria.",
+                1234
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_tasklist_mem_kb_empty_is_none() {
+        assert_eq!(parse_tasklist_mem_kb("", 1234), None);
+    }
+
+    #[test]
+    fn parse_tasklist_mem_kb_too_few_fields_is_none() {
+        assert_eq!(
+            parse_tasklist_mem_kb(r#""x.exe","1234","Console""#, 1234),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_tasklist_mem_kb_no_digits_in_mem_field_is_none() {
+        assert_eq!(
+            parse_tasklist_mem_kb(r#""x.exe","1234","Console","1","N/A""#, 1234),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_tasklist_mem_kb_overflow_is_none() {
+        assert_eq!(
+            parse_tasklist_mem_kb(
+                r#""x.exe","1234","Console","1","99999999999999999999999 K""#,
+                1234
+            ),
+            None
+        );
+    }
+
     #[test]
     fn expand_args_replaces_port_placeholder() {
         let template = vec![
@@ -2573,6 +2730,36 @@ mod tests {
         assert_eq!(stdout.len(), 4);
     }
 
+    /// windows 版 `sample_rss_kb` が使う経路。`sh`/`printf` の代わりに
+    /// `cmd /C echo` で stdout 採取を確認する。
+    #[cfg(windows)]
+    #[test]
+    fn run_capturing_output_with_deadline_captures_stdout_windows() {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "echo hello"]);
+        let (status, stdout) =
+            run_capturing_output_with_deadline(command, std::time::Duration::from_secs(5), 4096)
+                .expect("run succeeds");
+        assert!(status.success());
+        // `cmd /C echo` は改行（CRLF）付きで出力するため、末尾の空白類を
+        // 落としてから比較する。
+        assert_eq!(String::from_utf8_lossy(&stdout).trim(), "hello");
+    }
+
+    /// `max_stdout_bytes` を超える出力は Windows でも切り詰める
+    /// （coding-rust.md「長さ・件数を上限検証」）。
+    #[cfg(windows)]
+    #[test]
+    fn run_capturing_output_with_deadline_caps_stdout_length_windows() {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "echo 0123456789"]);
+        let (status, stdout) =
+            run_capturing_output_with_deadline(command, std::time::Duration::from_secs(5), 4)
+                .expect("run succeeds");
+        assert!(status.success());
+        assert_eq!(stdout.len(), 4);
+    }
+
     // `Content-Length` が読み取り上限を
     // 超える場合は `min` で黙って切り詰めず probe 失敗にする契約を、
     // `probe_once` が呼ぶこの純粋関数の単体テストとして確認する。
@@ -2826,12 +3013,10 @@ mod tests {
         }
     }
 
-    // `measure_idle_rss` の Windows 版が `target.bin` を確認せず常に
-    // `Outcome::Unsupported` を返すと、「対象バイナリ未設定なら全計測項目が
-    // Skipped」という契約に反する。OS に依存しないこの判定を共通関数として
-    // 検証する（`measure_cold_start`・`measure_binary_size`・unix/windows
-    // 両方の `measure_idle_rss`・[`token_reduction_gate`] がすべてこの関数を
-    // 通す）。
+    // 対象バイナリ未設定なら全計測項目が `Outcome::Skipped` になるという
+    // 契約を、OS に依存しない共通関数として検証する（`measure_cold_start`・
+    // `measure_binary_size`・`measure_idle_rss`（unix/windows 共通の 1 関数。
+    // TASK-84.5）・[`token_reduction_gate`] がすべてこの関数を通す）。
     #[test]
     fn require_bin_none_is_skipped() {
         match require_bin(None, None, "fandhe-browser") {
