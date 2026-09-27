@@ -37,16 +37,33 @@
 //! # スレッド安全性
 //!
 //! [`V8Engine`] は内部に `v8::OwnedIsolate` を持つため `!Send` である。
-//! Isolate は生成したスレッドの中だけで使う。同じスレッドで複数の
-//! `OwnedIsolate` を持つ場合は、生成と逆の順序で drop しなければならない
-//! （v8 152.2.0 の `OwnedIsolate::Drop` が `assert!` で検査する）。
-//! そのため本モジュールは 1 つの `V8Engine` が `OwnedIsolate` を
-//! ちょうど 1 つだけ持つ構造に留める。
+//! Isolate は生成したスレッドの中だけで使う。v8 152.2.0 の
+//! `OwnedIsolate::Drop` は、同じスレッドに 2 つ以上の `OwnedIsolate` が
+//! 存在する場合に「生成と逆の順序」以外で drop されると `assert!` で
+//! panic する（呼び出し側が破棄順序を守ることを前提にした挙動）。
+//! ライブラリコードは呼び出し側の作法に依存して panic してはならない
+//! （[coding-rust.md](../../../.claude/rules/coding-rust.md)）ため、
+//! 本モジュールは [`V8_ISOLATE_ACTIVE`] というスレッドローカルな
+//! フラグで「同一スレッドで `V8Engine` を同時に 2 つ以上生成できない」
+//! ことを構造的に強制する。同時に 1 つしか存在し得なければ、逆順制約が
+//! 問題になる状況自体が発生しない。既に 1 つ存在するスレッドで
+//! [`V8Engine::new`] を呼んだ場合は panic ではなく
+//! [`IsolateAlreadyActiveOnThread`] エラーを返す。
 
+use std::cell::Cell;
 use std::sync::Once;
 
 /// プロセス内で V8 の Platform 初期化を 1 回だけ実行するためのフラグ。
 static V8_INIT: Once = Once::new();
+
+thread_local! {
+    /// このスレッド上に生存中の [`V8Engine`]（＝`v8::OwnedIsolate`）が
+    /// 既にあるかどうか。[`V8Engine::new`] で確保し [`V8Engine`] の
+    /// `Drop` で解放することで、同一スレッドでの `OwnedIsolate` の
+    /// 同時複数保持を防ぎ、破棄順序の `assert!` panic を型・構造レベルで
+    /// 起こり得なくする（本モジュール冒頭「スレッド安全性」節）。
+    static V8_ISOLATE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
 
 /// V8 の Platform 初期化を冪等に行う（AC-1: 何度呼んでも panic しない）。
 ///
@@ -106,11 +123,35 @@ pub(crate) fn ensure_v8_initialized() {
     )
 )]
 pub(crate) struct V8Engine {
-    /// v8 の実行コンテキストを保持する Isolate 本体。ちょうど 1 つだけ
-    /// 持つことで、`OwnedIsolate` の drop 順制約（生成と逆順であること）
-    /// を型の構造だけで単純に満たす。
+    /// v8 の実行コンテキストを保持する Isolate 本体。[`V8_ISOLATE_ACTIVE`]
+    /// により同一スレッドでは常に高々 1 つしか生存しないため、
+    /// `OwnedIsolate` の drop 順制約（生成と逆順であること）が問題になる
+    /// 状況自体が起こらない。
     isolate: v8::OwnedIsolate,
 }
+
+/// 同一スレッド上に既に別の [`V8Engine`]（`OwnedIsolate`）が存在するため、
+/// 新しい [`V8Engine`] を生成できないことを表すエラー。
+///
+/// v8 152.2.0 の `OwnedIsolate::Drop` は、同一スレッドに複数の
+/// `OwnedIsolate` が存在する状態で破棄順序（生成と逆順）を誤ると
+/// `assert!` で panic する。本モジュールはそもそも同一スレッドでの
+/// 複数同時生成を許さない構造にすることでこれを避けており、本エラーは
+/// その構造上の制約を呼び出し側へ `Result` として明示的に伝える
+/// （ライブラリコードは panic させない。[coding-rust.md] 参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IsolateAlreadyActiveOnThread;
+
+impl std::fmt::Display for IsolateAlreadyActiveOnThread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "a V8Engine (v8::OwnedIsolate) is already active on this thread; \
+             drop it before creating another one",
+        )
+    }
+}
+
+impl std::error::Error for IsolateAlreadyActiveOnThread {}
 
 #[cfg_attr(
     not(test),
@@ -128,10 +169,26 @@ impl V8Engine {
     /// 呼び出し前に必ず初期化が済んでいる。エンジン生成時のエラー変換
     /// （[`super::engine_trait::CreateEngineError`] との対応）は
     /// `create_engine` への配線（`TASK-29.6`）で扱う。
-    pub(crate) fn new() -> Self {
+    ///
+    /// 同一スレッドで既に別の `V8Engine` が生存している場合は
+    /// [`IsolateAlreadyActiveOnThread`] を返す（`OwnedIsolate` の
+    /// drop 順序制約による panic を防ぐため。本モジュール冒頭
+    /// 「スレッド安全性」節）。
+    pub(crate) fn new() -> Result<Self, IsolateAlreadyActiveOnThread> {
         ensure_v8_initialized();
+        let acquired = V8_ISOLATE_ACTIVE.with(|active| {
+            if active.get() {
+                false
+            } else {
+                active.set(true);
+                true
+            }
+        });
+        if !acquired {
+            return Err(IsolateAlreadyActiveOnThread);
+        }
         let isolate = v8::Isolate::new(v8::CreateParams::default());
-        Self { isolate }
+        Ok(Self { isolate })
     }
 
     /// この Isolate のヒープ統計から総ヒープサイズ（バイト）を返す。
@@ -142,6 +199,14 @@ impl V8Engine {
     #[cfg(test)]
     pub(crate) fn total_heap_size(&mut self) -> usize {
         self.isolate.get_heap_statistics().total_heap_size()
+    }
+}
+
+impl Drop for V8Engine {
+    /// このスレッドの [`V8_ISOLATE_ACTIVE`] フラグを解放し、以後
+    /// このスレッドで新しい `V8Engine` を生成できるようにする。
+    fn drop(&mut self) {
+        V8_ISOLATE_ACTIVE.with(|active| active.set(false));
     }
 }
 
@@ -178,7 +243,7 @@ mod tests {
     #[test]
     fn js_1_v8_isolate_can_be_created_repeatedly() {
         for _ in 0..3 {
-            let mut engine = V8Engine::new();
+            let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
             let heap_size = engine.total_heap_size();
             assert!(
                 heap_size > 0,
@@ -186,6 +251,26 @@ mod tests {
             );
             drop(engine);
         }
+    }
+
+    /// JS-1・TASK-29.2: 同一スレッドで前の `V8Engine` を drop する前に
+    /// 2 つ目を生成しようとすると、panic ではなく
+    /// `IsolateAlreadyActiveOnThread` を返すこと。`OwnedIsolate` の
+    /// drop 順序制約による panic を型レベルで避けていることの検証。
+    #[test]
+    fn js_1_v8_engine_new_rejects_second_isolate_on_same_thread() {
+        let first = V8Engine::new().expect("first V8Engine must succeed");
+
+        match V8Engine::new() {
+            Ok(_) => panic!("a second V8Engine must not be created on the same thread"),
+            Err(err) => assert_eq!(err, IsolateAlreadyActiveOnThread),
+        }
+
+        drop(first);
+
+        // 先に drop すれば再び生成できる（フラグが解放されていること）。
+        let third = V8Engine::new();
+        assert!(third.is_ok());
     }
 
     /// JS-1・TASK-29.2: 複数スレッドから同時に初期化・Isolate 生成を
@@ -199,7 +284,8 @@ mod tests {
             .map(|_| {
                 std::thread::spawn(|| {
                     ensure_v8_initialized();
-                    let mut engine = V8Engine::new();
+                    let mut engine =
+                        V8Engine::new().expect("each thread has its own V8_ISOLATE_ACTIVE flag");
                     engine.total_heap_size()
                 })
             })
