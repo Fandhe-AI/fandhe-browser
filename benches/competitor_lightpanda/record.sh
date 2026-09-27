@@ -149,8 +149,20 @@ fi
 # （../competitor_lightpanda.rs モジュールドキュメントの終了コード契約
 # 参照）。壊れた・空の出力を履歴へ追記して汚さないよう、"トップレベルが
 # JSON オブジェクトであること" を明示的に検証する。
-if ! jq -e 'type == "object"' "$TMP_OUTPUT" >/dev/null 2>&1; then
-  echo "error: bench output is not a single JSON object; not appending to history" >&2
+#
+# `jq -e 'type == "object"'`（スラープなし）は入力中の JSON 値を 1 つずつ
+# 個別に評価し、`-e` の終了コードは*最後の*出力値の真偽だけで決まる。
+# そのため配列の後にオブジェクトが続くような複数値混在の出力（例:
+# `[1,2]\n{"a":1}`）でも、最後の値（オブジェクト）が真になり誤って通過
+# してしまう。その後の `--slurpfile`（下記）は全件を配列として読み込み
+# `$result[0]`（先頭の値。この例では配列）を履歴へ記録するため、検証を
+# 通過したはずのオブジェクトではなく無関係な先頭の値が保存され得た
+# （TASK-84.2・Issue #212 のレビュー指摘対応）。
+# `-s`（slurp）で全件を読み込んだ配列の長さが 1、かつその唯一の要素が
+# オブジェクトであることを併せて検証することで、「ちょうど 1 個の JSON
+# オブジェクトだけが出力されている」ことを件数と型の両方で保証する。
+if ! jq -e -s 'length == 1 and (.[0] | type) == "object"' "$TMP_OUTPUT" >/dev/null 2>&1; then
+  echo "error: bench output is not exactly one JSON object; not appending to history" >&2
   echo "  (this can happen when the bench's own configuration is invalid; see the bench's stderr output)" >&2
   exit 2
 fi

@@ -144,6 +144,24 @@ printf '[]' >"$ARRAY_JSON"
 expect_exit "non-object JSON is rejected" 2 \
   --history "$HISTORY" --input "$ARRAY_JSON"
 
+# 配列に続けてオブジェクトが並ぶ複数 JSON 値混在の出力（TASK-84.2・
+# Issue #212 のレビュー指摘対応の回帰テスト）: スラープなしの
+# `jq -e 'type == "object"'` は各値を個別に評価し、最後の値（オブジェクト）
+# の真偽だけで判定してしまうため、以前はこの入力を誤って通過させ、
+# `--slurpfile` が先頭の配列を履歴へ記録していた。「ちょうど 1 個の JSON
+# オブジェクトだけであること」を件数と型の両方で検証することで拒否する。
+MULTI_JSON="$WORKDIR/multi-value.json"
+printf '[1,2]\n{"fandhe-browser":{}}\n' >"$MULTI_JSON"
+BEFORE=$(line_count)
+expect_exit "array followed by object (multiple JSON values) is rejected" 2 \
+  --history "$HISTORY" --input "$MULTI_JSON"
+AFTER=$(line_count)
+if [ "$AFTER" != "$BEFORE" ]; then
+  echo "FAIL [multi-value JSON line count]: expected unchanged ($BEFORE), got $AFTER" >&2
+  FAILURES=$((FAILURES + 1))
+fi
+CASES=$((CASES + 1))
+
 # --- (f) --history の拡張子違い・シンボリックリンクは使用エラー ---
 expect_exit "history with wrong extension is rejected" 2 \
   --history "$WORKDIR/history.txt" --input "$FIXTURES/all-skipped.json"

@@ -37,10 +37,12 @@
 //! `"perf6"` フィールド: 各対象の `idleRssKb` と上記基準値から
 //! `PERF-6`（Chromium 比 85% 以上のアイドル RSS 削減。
 //! `support::PERF6_TARGET_PCT`）目標との比較を `{"status":...}` 形式で返す
-//! （`support::perf6_comparison`）。`fandhe-browser` 側は単一プロセスの RSS
-//! のみを計測する（本ファイルのアイドル RSS の節を参照。プロセスツリー全体
-//! の計測ではない）ため、`PERF-6` の判定対象は実質的に `fandhe-browser` 側
-//! であり、Lightpanda 行の `"perf6"` は同じ基準値に対する参考値に過ぎない。
+//! （`support::perf6_comparison`）。`idleRssKb` 側は対象プロセスが属する
+//! **プロセスグループ全体**（自身 + 子孫プロセス。`measure::measure_idle_rss`
+//! の `sample_process_group_rss_kb` 参照）の RSS 合計であり、Chromium 側の
+//! 基準値（プロセスツリー全体）と計測範囲を揃えてある（対象が子プロセスを
+//! 使う実装であっても、そのメモリを除外したまま `"met"` を誤って返さない
+//! ため。TASK-84.2・Issue #212 のレビュー指摘対応）。
 //! `"below_target"`（目標未達）は計測結果の一種であり計測失敗ではないため、
 //! 下記の終了コード契約には影響しない（`bench_exit_code` の判定対象に含め
 //! ない）。

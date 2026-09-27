@@ -315,19 +315,55 @@ pub fn looks_like_browser_readiness_response(body: &str) -> bool {
         .any(|key| READINESS_RESPONSE_FIELDS.contains(&key.to_ascii_lowercase().as_str()))
 }
 
-/// unix `ps -o rss= -p <pid>` の標準出力（キロバイト単位の数値のみ・前後に空白を
-/// 含み得る）を解釈する。
+/// `pgrep -g <pgid>`（1 行 1 pid）の標準出力をパースし、`u32` の一覧として
+/// 返す（`measure.rs` の `sample_process_group_rss_kb` が使う。PERF-6。
+/// TASK-84.2・Issue #212 のレビュー指摘対応: 対象プロセスがさらに子プロセスを
+/// 使う場合に備え、直接の子 1 プロセスだけでなく [`apply_new_process_group`]
+/// が同じプロセスグループへまとめた子孫全体を数え上げてから RSS を合計する
+/// ため、まず `pgrep` でメンバー pid の一覧を得る）。
 ///
-/// アイドル RSS 計測（`PERF-6`）が unix でのみ呼ぶ（Windows は
-/// `Unsupported`。実装計画 3.2 節）。空文字列・数値でない出力は `None` を返す。
-///
-/// 呼び出し元（`measure.rs` の `sample_rss_kb`）が
-/// `#[cfg(unix)]` 限定のため、この関数自体も `#[cfg(unix)]` にする。
-/// 無条件公開のままだと Windows ネイティブビルドで到達不能になり
-/// `dead_code` 警告が `-D warnings`（ci.md「3 OS CI」）で fail する。
+/// 空行は無視する。数値でない行が 1 つでもあれば出力全体を信頼できないと
+/// みなし `None` を返す（coding-rust.md「外部入力の経路では明示的に処理する」）。
+/// `max_pids` を超える件数の行があれば同様に `None` を返す（無制限な
+/// コマンドライン構築・アロケーションを避ける。coding-rust.md「長さ・件数を
+/// 上限検証してからアロケーションに使う」）。
 #[cfg(unix)]
-pub fn parse_ps_rss_kb(out: &str) -> Option<u64> {
-    out.trim().parse::<u64>().ok()
+pub fn parse_pgrep_pids(out: &str, max_pids: usize) -> Option<Vec<u32>> {
+    let mut pids = Vec::new();
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if pids.len() >= max_pids {
+            return None;
+        }
+        pids.push(trimmed.parse::<u32>().ok()?);
+    }
+    Some(pids)
+}
+
+/// `ps -o rss= -p <pid1,pid2,...>`（1 行 1 プロセスの RSS）の標準出力を
+/// パースして合計する（KB 単位。`measure.rs` の `sample_process_group_rss_kb`
+/// が使う。プロセスグループ内の全メンバー分の行を合計する）。
+///
+/// 空行は無視する。数値でない行が 1 つでもあれば全体を信頼できないとみなし
+/// `None` を返す（`parse_pgrep_pids` と同じ fail-closed 方針）。1 行も
+/// 数値が無かった場合（対象プロセスが `pgrep` 実行後 `ps` 実行前に全滅した等）
+/// も `None` にする（合計 0 を「計測成功で RSS が 0KB」と区別する）。
+#[cfg(unix)]
+pub fn sum_ps_rss_kb_lines(out: &str) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut any = false;
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        total = total.saturating_add(trimmed.parse::<u64>().ok()?);
+        any = true;
+    }
+    any.then_some(total)
 }
 
 /// テンプレート引数中の `{port}` プレースホルダを実ポート番号へ展開する。
@@ -930,7 +966,7 @@ const EXTERNAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// spawn 済みの子プロセスの終了を期限付きで待つ。期限超過時は `kill` して
 /// から `wait` する（`wait` を省くとゾンビプロセスが残る）。
 ///
-/// [`kill_process_group`]・`measure.rs` の `sample_rss_kb` が使う共通
+/// [`kill_process_group`]・`measure.rs` の `sample_process_group_rss_kb` が使う共通
 /// プリミティブ。`try_wait` によるポーリングは、`Command::status()` の
 /// ような無期限ブロッキング待機を避けるための唯一の手段（std には
 /// 期限付き `wait` が無く、`unsafe`・新規依存も使えない）。
@@ -976,12 +1012,12 @@ pub fn run_with_deadline(
 /// `command` の stdout を上限付きで採取しつつ、完了を期限付きで待つ。
 ///
 /// `ps` のような出力の小さいローカルコマンド専用（`measure.rs` の
-/// `sample_rss_kb` が使う）。`max_stdout_bytes` を超える出力は切り捨てて
+/// `sample_process_group_rss_kb` が使う）。`max_stdout_bytes` を超える出力は切り捨てて
 /// 読み続ける（無制限確保を避ける。coding-rust.md「長さ・件数を上限検証
 /// してからアロケーションに使う」）。stdin は `Stdio::null()` に固定する
 /// （呼び出し元からの入力を渡す用途を持たない）。
 ///
-/// `sample_rss_kb`（unix 専用。`ps` を使う）からのみ呼ばれるため
+/// `sample_process_group_rss_kb`（unix 専用。`ps` を使う）からのみ呼ばれるため
 /// `#[cfg(unix)]` にする（Windows ビルドでは dead_code になる）。
 #[cfg(unix)]
 pub fn run_capturing_output_with_deadline(
@@ -2150,19 +2186,70 @@ mod tests {
         ));
     }
 
-    // PERF-6: parse_ps_rss_kb は unix の `ps -o rss=` 出力を解釈する
-    // （関数定義が `#[cfg(unix)]` のため、テストも合わせて限定する）。
+    // PERF-6（TASK-84.2・Issue #212 のレビュー指摘対応）: `parse_pgrep_pids`・
+    // `sum_ps_rss_kb_lines` はプロセスグループ全体の RSS 合計
+    // （`measure.rs` の `sample_process_group_rss_kb`）が使う純粋関数。
     #[cfg(unix)]
     #[test]
-    fn parse_ps_rss_kb_basic() {
-        assert_eq!(parse_ps_rss_kb("  12345\n"), Some(12345));
+    fn parse_pgrep_pids_basic() {
+        assert_eq!(
+            parse_pgrep_pids("100\n101\n202\n", 16),
+            Some(vec![100, 101, 202])
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn parse_ps_rss_kb_invalid_is_none() {
-        assert_eq!(parse_ps_rss_kb(""), None);
-        assert_eq!(parse_ps_rss_kb("not a number"), None);
+    fn parse_pgrep_pids_ignores_blank_lines() {
+        assert_eq!(
+            parse_pgrep_pids("100\n\n  \n202\n", 16),
+            Some(vec![100, 202])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_pgrep_pids_empty_output_is_empty_vec() {
+        // `pgrep` の終了コードは呼び出し元（`sample_process_group_rss_kb`）が
+        // 先に判定するため、この関数自体は空文字列を「0 件」として受け付ける。
+        assert_eq!(parse_pgrep_pids("", 16), Some(vec![]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_pgrep_pids_invalid_line_is_none() {
+        assert_eq!(parse_pgrep_pids("100\nnot-a-pid\n", 16), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_pgrep_pids_over_limit_is_none() {
+        assert_eq!(parse_pgrep_pids("1\n2\n3\n", 2), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sum_ps_rss_kb_lines_basic() {
+        assert_eq!(sum_ps_rss_kb_lines("100\n200\n300\n"), Some(600));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sum_ps_rss_kb_lines_ignores_blank_lines() {
+        assert_eq!(sum_ps_rss_kb_lines("100\n\n  \n200\n"), Some(300));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sum_ps_rss_kb_lines_all_blank_is_none() {
+        assert_eq!(sum_ps_rss_kb_lines(""), None);
+        assert_eq!(sum_ps_rss_kb_lines("\n  \n"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sum_ps_rss_kb_lines_invalid_line_is_none() {
+        assert_eq!(sum_ps_rss_kb_lines("100\nnot-a-number\n"), None);
     }
 
     #[test]
@@ -2843,7 +2930,7 @@ mod tests {
     /// PERF-3/PERF-6: `wait_with_deadline` は期限を超えて生存し続ける
     /// 子プロセスを kill し、期限を大きく超えて（テストでは 30 秒）
     /// ブロックしないことを確認する（[`kill_process_group`]・
-    /// `measure.rs` の `sample_rss_kb` が使う共通プリミティブ）。
+    /// `measure.rs` の `sample_process_group_rss_kb` が使う共通プリミティブ）。
     #[cfg(unix)]
     #[test]
     fn wait_with_deadline_kills_process_that_outlives_the_deadline() {
@@ -2907,7 +2994,7 @@ mod tests {
         assert!(status.success());
     }
 
-    /// `run_capturing_output_with_deadline` は `sample_rss_kb` が使う経路。
+    /// `run_capturing_output_with_deadline` は `sample_process_group_rss_kb` が使う経路。
     /// stdout を採取しつつ期限内に完了することを確認する。
     #[cfg(unix)]
     #[test]
