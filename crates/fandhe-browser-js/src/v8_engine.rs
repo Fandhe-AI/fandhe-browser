@@ -768,6 +768,39 @@ impl V8Engine {
         // 複製してから切り詰めるのではなく、`v8_string_prefix_lossy` で
         // 取り出しの段階から [`MAX_ERROR_MESSAGE_EXTRACT_BYTES`] までしか
         // V8 側の文字列を複製しないようにする。
+        //
+        // codex 再指摘 P0 対応（PR #503）: `throw { toString() { while
+        // (true) {} } }` のように、投げられた値のユーザー定義
+        // `toString`/getter/`Symbol.toPrimitive` が無限ループになりうる。
+        // 本クロージャはユーザー定義コードを一切実行しない経路だけを使う:
+        //
+        // - `tc.message()`（`v8::Message::Get`/`GetLineNumber`）は V8
+        //   内部で `EnterV8NoScriptNoExceptionScope` を通る（v8 152.2.0
+        //   の `src/api/api.cc` で確認済み。スクリプト実行を許さない
+        //   スコープ）ため、呼び出し時点でユーザーコードを実行しない。
+        //   スロー時に副作用なしで組み立てられた表示用文字列を読み出す
+        //   だけである（実機検証で `toString`/getter/`Symbol.toPrimitive`
+        //   のいずれも呼ばれないことを確認済み。回帰テスト参照）
+        // - `tc.exception()` しか無い場合、投げられた値がオブジェクト
+        //   （`is_object()`）であれば `to_string`（ECMA-262 の ToString
+        //   抽象操作）を呼ばない。オブジェクトの ToString は
+        //   ToPrimitive 経由でユーザー定義の `toString`/`valueOf`/
+        //   `Symbol.toPrimitive` を呼びうるため。オブジェクトでない
+        //   場合（文字列・数値・真偽値・`null`・`undefined`）は
+        //   ToString がユーザーコードを経由しない組み込み操作のため
+        //   安全に呼べる
+        //
+        // 実装済みを装わない（REPAIR-3）: 手元検証では、本モジュールの
+        // `TryCatch` は既定で `capture_message` が有効（v8 152.2.0
+        // `TryCatch` のコンストラクタで既定 `true`）であるため、
+        // `tc.message()` は本 crate が実際に評価するどの入力に対しても
+        // 常に `Some` を返し、`tc.exception()` 側の分岐（この
+        // `is_object()` によるガード）に到達するケースを実際には再現
+        // できなかった。したがって、この分岐の修正は主に「将来
+        // `tc.message()` が `None` になる経路が生じた場合の防御」であり、
+        // 本 PR の時点で実際に到達可能な脆弱性を塞いだことを示す再現
+        // テストは書けていない（回帰テストは「ハングしない」ことを
+        // 確認するに留まる。詳細は同テストのドキュメントコメント参照）
         let extract_message = || -> String {
             let raw = if let Some(message) = tc.message() {
                 let text =
@@ -777,9 +810,21 @@ impl V8Engine {
                     None => text,
                 }
             } else if let Some(exception) = tc.exception() {
-                match exception.to_string(&tc) {
-                    Some(s) => v8_string_prefix_lossy(&tc, s, MAX_ERROR_MESSAGE_EXTRACT_BYTES),
-                    None => "unknown script error".to_string(),
+                if exception.is_object() {
+                    // オブジェクトの文字列表現は計算しない（上記のとおり
+                    // ユーザーコードの実行を避けるため）。型名だけを
+                    // 報告する（文字列化に成功したかのように装わない。
+                    // security.md「偽装・回避機能の禁止」）。
+                    let type_name = exception.type_of(&tc).to_rust_string_lossy(&tc);
+                    format!(
+                        "an object of type '{type_name}' was thrown; its string \
+                         representation was not computed to avoid executing user-defined code"
+                    )
+                } else {
+                    match exception.to_string(&tc) {
+                        Some(s) => v8_string_prefix_lossy(&tc, s, MAX_ERROR_MESSAGE_EXTRACT_BYTES),
+                        None => "unknown script error".to_string(),
+                    }
                 }
             } else {
                 "unknown script error".to_string()
@@ -812,6 +857,17 @@ impl V8Engine {
         // 生存させたまま関数を抜けると、次回の呼び出し中に前回のタイム
         // アウトが誤発火しうるため、打ち切り・非打ち切りのどちらの経路
         // でも必ず呼ぶ。
+        //
+        // codex 再指摘 P0 対応（PR #503）: コンパイル・実行が失敗した
+        // 分岐では、本関数は `extract_message()` の呼び出しが終わった
+        // 「後」に呼ぶ（呼び出し順序を変えた。以前は `finish_watchdog` を
+        // 先に呼んでから `extract_message()` を呼んでいたため、監視
+        // スレッドが既に停止した状態で `extract_message()` がユーザー
+        // コードを実行すると `SCRIPT_EXECUTION_TIMEOUT` の打ち切りが
+        // 効かなくなっていた）。`extract_message` はユーザー定義コードを
+        // 実行しない設計にしている（同クロージャのコメント参照）が、
+        // 万一その前提が崩れていても、監視スレッドがまだ生きていれば
+        // `terminate_execution` で打ち切れるようにする多重の安全策。
         let finish_watchdog =
             |done_tx: mpsc::Sender<()>, watchdog: std::thread::JoinHandle<()>| -> bool {
                 let _ = done_tx.send(());
@@ -849,18 +905,28 @@ impl V8Engine {
             None => {
                 // コンパイル段階で打ち切られた場合も、実行段階の打ち切りと
                 // 同じ `JsEngineError::EvaluationFailed` を返す（呼び出し側
-                // から見て打ち切り理由の扱いを変えない）。
+                // から見て打ち切り理由の扱いを変えない）。`extract_message`
+                // を監視スレッドが生きている間に呼ぶ（`finish_watchdog` の
+                // ドキュメントコメント参照）。
+                let message = extract_message();
                 let was_terminated = finish_watchdog(done_tx, watchdog);
                 let message = if was_terminated {
                     timeout_message("compilation")
                 } else {
-                    extract_message()
+                    message
                 };
                 return Err(JsEngineError::EvaluationFailed(message));
             }
         };
 
         let run_result = compiled.run(&tc);
+        // `extract_message` を監視スレッドが生きている間に呼ぶ
+        // （`finish_watchdog` のドキュメントコメント参照）。失敗して
+        // いない場合は呼ぶ必要がなく、副作用も無いため呼ばない。
+        let message = match &run_result {
+            Some(_) => None,
+            None => Some(extract_message()),
+        };
         let was_terminated = finish_watchdog(done_tx, watchdog);
 
         let result = match run_result {
@@ -869,7 +935,7 @@ impl V8Engine {
                 let message = if was_terminated {
                     timeout_message("execution")
                 } else {
-                    extract_message()
+                    message.expect("message is Some because run_result is None")
                 };
                 return Err(JsEngineError::EvaluationFailed(message));
             }
@@ -1297,6 +1363,111 @@ mod tests {
             .evaluate_script("1 + 1", &EvaluateOptions::default())
             .expect("engine must remain usable after a timeout");
         assert_eq!(result, JsValue::Number(2.0));
+    }
+
+    /// JS-1・PR #503 の codex 再指摘 P0 の回帰確認: 投げられた値の
+    /// ユーザー定義 `toString` が無限ループでも、エラーメッセージの
+    /// 取り出し処理がハングせず、[`SCRIPT_EXECUTION_TIMEOUT`] 相当の
+    /// 時間で `Err` を返すこと。所要時間を具体値で確認し（タイムアウト
+    /// の 2 倍を上限とする）、ハングしていないことを直接示す。
+    ///
+    /// 実装済みを装わない（REPAIR-3）: 手元検証では、既定の
+    /// `capture_message`（`v8::TryCatch` のドキュメントコメント参照）に
+    /// より `tc.message()` が常に `Some` を返すため、この入力は修正前の
+    /// コードでも（`tc.exception().to_string()` の分岐に到達せず）実際
+    /// にはハングしなかった。したがって本テストは「修正で実際に直った
+    /// ハングの再現」ではなく、「この入力に対してハングしないこと」の
+    /// 回帰確認である。
+    #[test]
+    fn js_1_v8_thrown_object_with_hanging_tostring_does_not_hang() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let started = std::time::Instant::now();
+        let result = engine.evaluate_script(
+            "throw { toString() { while (true) {} } }",
+            &EvaluateOptions::default(),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SCRIPT_EXECUTION_TIMEOUT * 2,
+            "evaluate_script must not hang past twice the timeout, took {elapsed:?}"
+        );
+        assert!(
+            matches!(result, Err(JsEngineError::EvaluationFailed(_))),
+            "expected EvaluationFailed for a thrown object with a hanging toString, got: {result:?}"
+        );
+
+        // 打ち切り後もエンジンが使い続けられること。
+        let result = engine
+            .evaluate_script("40 + 2", &EvaluateOptions::default())
+            .expect("engine must remain usable after a hanging toString is cut off");
+        assert_eq!(result, JsValue::Number(42.0));
+    }
+
+    /// JS-1・PR #503 の codex 再指摘 P0 の回帰確認: 投げられた plain
+    /// object（`Error.prototype` を継承しない）の `message` プロパティの
+    /// getter が無限ループでもハングしないこと。本 crate は投げられた値が
+    /// オブジェクトであれば `to_string` 自体を呼ばないため、この getter は
+    /// 呼ばれない。
+    ///
+    /// 実装済みを装わない（REPAIR-3）: 手元検証では、この入力
+    /// （plain object）に対する V8 のメッセージ生成は getter を呼ばず
+    /// "Uncaught #<Object>" のような一般的な文言になり、修正前のコードでも
+    /// ハングは再現できなかった。`Error` インスタンス自体の `message`
+    /// プロパティを getter に差し替えた入力（`var e = new Error("x");
+    /// Object.defineProperty(e, "message", { get() { while (true) {} } });
+    /// throw e;`）——つまり `Error.prototype.toString` が本来 `.message`
+    /// を読み出す経路——でも同様に、修正前のコードで "Uncaught Error" が
+    /// 返り getter は呼ばれずハングしなかった（V8 のメッセージ生成自体が
+    /// 副作用なしの経路のみを使うため）。
+    #[test]
+    fn js_1_v8_thrown_object_with_hanging_message_getter_does_not_hang() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let started = std::time::Instant::now();
+        let result = engine.evaluate_script(
+            "throw { get message() { while (true) {} } }",
+            &EvaluateOptions::default(),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SCRIPT_EXECUTION_TIMEOUT * 2,
+            "evaluate_script must not hang past twice the timeout, took {elapsed:?}"
+        );
+        assert!(
+            matches!(result, Err(JsEngineError::EvaluationFailed(_))),
+            "expected EvaluationFailed for a thrown object with a hanging message getter, got: {result:?}"
+        );
+
+        let result = engine
+            .evaluate_script("40 + 2", &EvaluateOptions::default())
+            .expect("engine must remain usable after a hanging getter is cut off");
+        assert_eq!(result, JsValue::Number(42.0));
+    }
+
+    /// JS-1・PR #503 の codex 再指摘 P0 の回帰確認: 投げられた値の
+    /// `Symbol.toPrimitive` が無限ループでもハングしないこと（ECMA-262 の
+    /// ToPrimitive/ToString 抽象操作を経由しうる、もう 1 つの経路）。
+    #[test]
+    fn js_1_v8_thrown_object_with_hanging_to_primitive_does_not_hang() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let started = std::time::Instant::now();
+        let result = engine.evaluate_script(
+            "throw { [Symbol.toPrimitive]() { while (true) {} } }",
+            &EvaluateOptions::default(),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SCRIPT_EXECUTION_TIMEOUT * 2,
+            "evaluate_script must not hang past twice the timeout, took {elapsed:?}"
+        );
+        assert!(
+            matches!(result, Err(JsEngineError::EvaluationFailed(_))),
+            "expected EvaluationFailed for a thrown object with a hanging Symbol.toPrimitive, got: {result:?}"
+        );
+
+        let result = engine
+            .evaluate_script("40 + 2", &EvaluateOptions::default())
+            .expect("engine must remain usable after a hanging Symbol.toPrimitive is cut off");
+        assert_eq!(result, JsValue::Number(42.0));
     }
 
     /// JS-1・codex レビュー指摘 #154 P1 の回帰確認: 評価結果の文字列が
