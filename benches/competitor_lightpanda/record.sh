@@ -28,8 +28,10 @@ Usage: record.sh --history <path.jsonl> [--input <file>] [--bench-exit-code <n>]
 
   --history <path>        Path to the JSONL history file to append to (required, must end in .jsonl).
   --input <file>          Read bench result JSON from this file instead of running `cargo bench`.
-                           When given, --bench-exit-code should also be given (default: 0).
+                           When given without --bench-exit-code, the exit code is derived from the
+                           result (1 if any target has a metric with status "error", else 0).
   --bench-exit-code <n>   The exit code the bench run produced (only meaningful with --input).
+                           Must be consistent with the result's error status, or the run is rejected.
   --source local|ci       Where this run happened (default: local). Recorded as "source" in the JSONL line.
 EOF
 }
@@ -68,6 +70,16 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+# --bench-exit-code をユーザーが明示的に渡したかどうかを、後段の
+# デフォルト代入（`--input` 時の暫定値 0）より前に記録しておく。
+# `--input` かつ未指定の場合のみ結果 JSON から終了コードを導出し（下記）、
+# それ以外（明示指定・または `cargo bench` 実行時の実際の終了コード）は
+# 導出値との整合性を検証する対象にする。
+BENCH_EXIT_CODE_EXPLICIT=false
+if [ -n "$BENCH_EXIT_CODE" ]; then
+  BENCH_EXIT_CODE_EXPLICIT=true
+fi
 
 if [ -z "$HISTORY" ]; then
   echo "error: --history is required" >&2
@@ -221,6 +233,42 @@ if ! jq -e -s "$SCHEMA_CHECK" "$TMP_OUTPUT" >/dev/null 2>&1; then
   echo "error: bench output is not exactly one JSON object matching the expected schema; not appending to history" >&2
   echo "  (expected: {\"<target>\": {binarySizeBytes, coldStartMs, idleRssKb, tokenReductionPct, sitesCount, perf6}, ...}; each metric's status must be measured/skipped/unsupported/error with the fields that status requires; see README.md 'スキーマ')" >&2
   echo "  (this can happen when the bench's own configuration is invalid; see the bench's stderr output)" >&2
+  exit 2
+fi
+
+# 上記までのスキーマ検証は各フィールドの形だけを見ており、`--bench-exit-code`
+# と結果の中身が食い違っていても素通しする。`--input` で `--bench-exit-code`
+# を省略すると常に 0 になっていたため、例えば同梱の error-exit.json
+# （coldStartMs が "error"）を終了コード省略で渡すと `benchExitCode: 0` の
+# 行が追記され、失敗した計測を成功として記録してしまっていた（実装済みを
+# 装う。AGENTS.md「品質ゲートの破壊」に反する。TASK-84.2・Issue #212 の
+# レビュー指摘対応）。
+#
+# `../competitor_lightpanda.rs` の終了コード契約（`support::bench_exit_code`）
+# は「対象ごとの binarySizeBytes/coldStartMs/idleRssKb/tokenReductionPct の
+# いずれかが status=="error" なら 1、それ以外（skipped/unsupported のみ）は
+# 0」で決まる（`measure.rs` の `run_all` が `outcomes` へ集めるのはこの 4
+# フィールドのみで、`perf6` は判定対象に含めない。`perf6_comparison` の
+# ドキュメント参照。below_target は計測結果の一種であり失敗ではないため、
+# `perf6` 側にも exit code への影響はない）。この契約に従って結果 JSON から
+# 期待される終了コードを導出する。
+#
+# `--bench-exit-code` を省略した場合（`--input` 経由のみ。実行時の暫定値は
+# 上記で 0 にしていた）はこの導出値をそのまま使う。明示的に指定された場合
+# （`--bench-exit-code` 経由、または `cargo bench` を実行した場合の実際の
+# 終了コード）は導出値と一致することを確認し、一致しなければ「結果とその
+# 終了コードが矛盾している」壊れた入力とみなし、追記せずエラー（exit 2）に
+# する。
+DERIVE_EXIT_CODE_CHECK='
+  def target_has_error:
+    ([.binarySizeBytes, .coldStartMs, .idleRssKb, .tokenReductionPct] | any(.status == "error"));
+  if (.[0] | [.[]] | any(target_has_error)) then 1 else 0 end
+'
+DERIVED_EXIT_CODE=$(jq -r -s "$DERIVE_EXIT_CODE_CHECK" "$TMP_OUTPUT" | tr -d '\r')
+if [ -n "$INPUT" ] && [ "$BENCH_EXIT_CODE_EXPLICIT" = "false" ]; then
+  BENCH_EXIT_CODE="$DERIVED_EXIT_CODE"
+elif [ "$BENCH_EXIT_CODE" != "$DERIVED_EXIT_CODE" ]; then
+  echo "error: --bench-exit-code ($BENCH_EXIT_CODE) is inconsistent with the result (a target's status implies exit code $DERIVED_EXIT_CODE); not appending to history" >&2
   exit 2
 fi
 

@@ -140,6 +140,47 @@ if [ "$(line_count)" != "5" ]; then
 fi
 CASES=$((CASES + 1))
 
+# --- (d') 終了コードと結果の整合性検証（TASK-84.2・Issue #212 のレビュー
+# 指摘対応の回帰テスト）。`--bench-exit-code` 省略時に常に 0 になっていた
+# ため、error-exit.json（coldStartMs が "error"）を終了コード省略で渡すと
+# 失敗した計測が benchExitCode 0（成功）として記録されてしまっていた ---
+
+# error を含む結果 + 終了コード省略: 結果から 1 を導出し、その値で追記・
+# 伝播する（レビュー指摘そのものの再現ケース。省略時に 0 を仮定して
+# 記録しないことの確認）。
+expect_exit "error result with omitted --bench-exit-code derives 1" 1 \
+  --history "$HISTORY" --input "$FIXTURES/error-exit.json" --source ci
+LAST_LINE=$(tail -n 1 "$HISTORY")
+BENCH_EXIT=$(printf '%s' "$LAST_LINE" | jq -r '.benchExitCode' | tr -d '\r')
+if [ "$BENCH_EXIT" != "1" ]; then
+  echo "FAIL [derived benchExitCode]: expected 1, got $BENCH_EXIT" >&2
+  FAILURES=$((FAILURES + 1))
+fi
+CASES=$((CASES + 1))
+
+# error を含む結果 + 明示的に 0: 「error を含むのに 0」を明示指定で再現した
+# ケースとして、同様に矛盾した入力とみなし拒否し追記しない。
+BEFORE=$(line_count)
+expect_exit "error result with explicit --bench-exit-code 0 is rejected" 2 \
+  --history "$HISTORY" --input "$FIXTURES/error-exit.json" --bench-exit-code 0
+AFTER=$(line_count)
+if [ "$AFTER" != "$BEFORE" ]; then
+  echo "FAIL [error+explicit-0 line count]: expected unchanged ($BEFORE), got $AFTER" >&2
+  FAILURES=$((FAILURES + 1))
+fi
+CASES=$((CASES + 1))
+
+# error を含まない結果 + 明示的に非ゼロ: 同様に矛盾した入力として拒否する。
+BEFORE=$(line_count)
+expect_exit "error-free result with explicit --bench-exit-code 1 is rejected" 2 \
+  --history "$HISTORY" --input "$FIXTURES/measured-met.json" --bench-exit-code 1
+AFTER=$(line_count)
+if [ "$AFTER" != "$BEFORE" ]; then
+  echo "FAIL [no-error+explicit-1 line count]: expected unchanged ($BEFORE), got $AFTER" >&2
+  FAILURES=$((FAILURES + 1))
+fi
+CASES=$((CASES + 1))
+
 # --- (e) 不正 JSON: 追記されず exit 2 ---
 INVALID_JSON="$WORKDIR/invalid.json"
 printf '{not valid json' >"$INVALID_JSON"
