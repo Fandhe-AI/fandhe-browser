@@ -155,7 +155,38 @@ const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
 ///   `FatalProcessOutOfMemory` に至るかは本 crate 側では制御できない。
 ///   子プロセスへの分離は「その超過分がホストへ波及しない」ことを保証
 ///   するものであり、「子プロセス自身の異常終了を防ぐ」ものではない
-const MAX_ISOLATE_HEAP_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
+pub(crate) const MAX_ISOLATE_HEAP_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
+
+/// テスト専用のヒープ上限（[`super::worker::TEST_HEAP_LIMIT_ENV_VAR`]・
+/// [`super::process_engine::WorkerSpawnConfigForTest::heap_limit_bytes`]）
+/// に許す最小値（バイト。codex レビュー指摘 #503 P0「テスト専用経路が
+/// 本番の上限を上回れてしまう」対応の一部）。
+///
+/// この下限を設けず `0` や極端に小さい値をそのまま
+/// `v8::CreateParams::heap_limits` へ渡すと、Isolate 生成直後に
+/// ヒープが尽きて実質どんなスクリプトも評価できなくなる（意図した
+/// 「小さいが動作はする」テスト用ヒープにならない）。1 MiB は
+/// [`MAX_SCRIPT_SOURCE_BYTES`]（スクリプト本体の入力上限）と同じ大きさで
+/// あり、単純なスクリプトを評価できる実用上の下限として選んだ。
+const MIN_TEST_HEAP_LIMIT_BYTES: usize = 1_048_576; // 1 MiB
+
+/// テスト専用経路（`super::worker` の環境変数・`super::process_engine` の
+/// [`super::process_engine::WorkerSpawnConfigForTest`]）で要求された
+/// ヒープ上限を、本番の既定値（[`MAX_ISOLATE_HEAP_BYTES`]）を超えない
+/// 範囲へクランプする（codex レビュー指摘 #503 P0 対応）。
+///
+/// テスト専用経路は「本番の既定値より小さいヒープで OOM を素早く
+/// 再現する」ことだけを目的とし、既定値を上回る値を指定できてはならない
+/// （AGENTS.md「リソース上限」P0）。この関数を**親側**
+/// （`process_engine::spawn_worker` が子へ渡す環境変数を組み立てる際）と
+/// **子側**（`worker::worker_main` が環境変数を読み取った直後）の
+/// 両方で呼ぶことで、親を経由しない直接起動（環境変数を直接設定した
+/// 起動）に対しても子プロセス自身が上限を超えられないことを保証する
+/// （多層防御。子側の環境変数は untrusted な入力として扱う。
+/// coding-rust.md「外部入力」節）。
+pub(crate) fn clamp_test_heap_limit_bytes(requested_bytes: usize) -> usize {
+    requested_bytes.clamp(MIN_TEST_HEAP_LIMIT_BYTES, MAX_ISOLATE_HEAP_BYTES)
+}
 
 /// [`value_to_js_value`] が文字列型の評価結果を [`JsValue::String`] へ
 /// 変換する際に許容する最大文字数（UTF-16 コード単位。`v8::String::length`
@@ -810,6 +841,38 @@ mod tests {
         assert!(
             major.parse::<u32>().is_ok(),
             "v8 version major component must be numeric, got: {major}"
+        );
+    }
+
+    /// codex レビュー指摘 #503 P0: テスト専用のヒープ上限は、本番の
+    /// 既定値（[`MAX_ISOLATE_HEAP_BYTES`]。128 MiB）を上回る値を要求しても
+    /// 既定値そのものへクランプされ、それを超えないこと。
+    #[test]
+    fn js_1_clamp_test_heap_limit_bytes_never_exceeds_production_default() {
+        assert_eq!(
+            clamp_test_heap_limit_bytes(MAX_ISOLATE_HEAP_BYTES),
+            MAX_ISOLATE_HEAP_BYTES
+        );
+        assert_eq!(
+            clamp_test_heap_limit_bytes(MAX_ISOLATE_HEAP_BYTES + 1),
+            MAX_ISOLATE_HEAP_BYTES
+        );
+        assert_eq!(
+            clamp_test_heap_limit_bytes(usize::MAX),
+            MAX_ISOLATE_HEAP_BYTES
+        );
+    }
+
+    /// codex レビュー指摘 #503 P0: `0` や極端に小さい値は、実用上動作する
+    /// 最小値（[`MIN_TEST_HEAP_LIMIT_BYTES`]）まで引き上げられ、無効な
+    /// 値がそのまま `v8::CreateParams::heap_limits` へ渡ることはないこと。
+    #[test]
+    fn js_1_clamp_test_heap_limit_bytes_enforces_a_floor() {
+        assert_eq!(clamp_test_heap_limit_bytes(0), MIN_TEST_HEAP_LIMIT_BYTES);
+        assert_eq!(clamp_test_heap_limit_bytes(1), MIN_TEST_HEAP_LIMIT_BYTES);
+        assert_eq!(
+            clamp_test_heap_limit_bytes(MIN_TEST_HEAP_LIMIT_BYTES),
+            MIN_TEST_HEAP_LIMIT_BYTES
         );
     }
 

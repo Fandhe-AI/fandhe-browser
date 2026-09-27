@@ -51,7 +51,38 @@ use super::worker_protocol::{self, ErrorKind, ProtocolError, tag};
 /// 子プロセス側には存在しないため、本番では常に既定のヒープ上限
 /// （[`V8Engine::new`]）が使われる。値が未設定または `usize` として
 /// 解釈できない場合も既定値を使う。
+///
+/// この環境変数の値は untrusted な入力として扱う（coding-rust.md
+/// 「外部入力」節）: 親（`super::process_engine`）を経由せずこの
+/// プロセスを直接起動し、既定値（[`super::v8_engine::MAX_ISOLATE_HEAP_BYTES`]）
+/// を超える値を指定することで本番の上限を回避しようとする経路を防ぐため、
+/// [`super::v8_engine::clamp_test_heap_limit_bytes`] で読み取り直後に
+/// クランプする（codex レビュー指摘 #503 P0 対応。親側のクランプ
+/// （[`super::process_engine::WorkerSpawnConfigForTest::heap_limit_bytes`]）
+/// と合わせた多層防御であり、どちらか一方が壊れても上限は保たれる）。
 pub(crate) const TEST_HEAP_LIMIT_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER_HEAP_LIMIT_BYTES";
+
+/// [`TEST_HEAP_LIMIT_ENV_VAR`] の生の値（未設定なら `None`）から、実際に
+/// [`V8Engine::new_with_heap_limit`] へ渡すヒープ上限を決める（codex
+/// レビュー指摘 #503 P0 対応）。
+///
+/// 純粋関数として切り出す理由: [`worker_main`] は環境変数・stdio に直接
+/// 触れるため単体テストしづらい。パース・クランプだけを本関数に
+/// 切り出すことで、子プロセスが受け取る値を untrusted な入力として扱う
+/// クランプ処理（[`super::v8_engine::clamp_test_heap_limit_bytes`]）を、
+/// 実プロセスを起動せずに具体値で検証できる（`tests` モジュール参照。
+/// 親側のクランプ（`super::process_engine::spawn_worker`）とは独立した
+/// 経路であり、親を経由しない直接起動に対する防御になっていることを
+/// この関数単体のテストで確認する）。
+///
+/// - 値が無い、または `usize` として解釈できない場合は `None`（既定の
+///   ヒープ上限を使う。[`V8Engine::new`]）
+/// - 解釈できた場合は [`super::v8_engine::clamp_test_heap_limit_bytes`] で
+///   クランプした値を返す（本番の既定値を超えられず、下限も満たす）
+fn test_heap_limit_from_env_value(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .map(super::v8_engine::clamp_test_heap_limit_bytes)
+}
 
 /// [`super::dispatch_worker`] から呼ばれる、子プロセスモードの本体
 /// （`js-v8` feature 有効時）。
@@ -81,9 +112,12 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let heap_limit_override = std::env::var(TEST_HEAP_LIMIT_ENV_VAR)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok());
+    // 環境変数は untrusted な入力（`TEST_HEAP_LIMIT_ENV_VAR` のドキュメント
+    // コメント参照）。`test_heap_limit_from_env_value` が読み取った直後に
+    // クランプすることで、親を経由しない直接起動でも本番の上限
+    // （`MAX_ISOLATE_HEAP_BYTES`）を超えられない。
+    let heap_limit_override =
+        test_heap_limit_from_env_value(std::env::var(TEST_HEAP_LIMIT_ENV_VAR).ok().as_deref());
     let engine_result = match heap_limit_override {
         Some(bytes) => V8Engine::new_with_heap_limit(bytes),
         None => V8Engine::new(),
@@ -254,6 +288,36 @@ mod tests {
         let truncated = truncate_for_wire(&message);
         assert!(truncated.len() <= worker_protocol::MAX_ERROR_MESSAGE_BYTES);
         assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    /// codex レビュー指摘 #503 P0: 親を経由しない直接起動で
+    /// [`TEST_HEAP_LIMIT_ENV_VAR`] に本番の既定値（128 MiB =
+    /// 134,217,728 バイト）を大きく超える値を渡しても、子プロセス自身が
+    /// 既定値へクランプすること（実プロセス・stdio を介さず、値の変換
+    /// 経路だけを具体値で検証する）。
+    #[test]
+    fn js_1_test_heap_limit_from_env_value_clamps_an_oversized_direct_value() {
+        // 4 GiB。本番の既定値（128 MiB）を大きく超える。
+        assert_eq!(
+            test_heap_limit_from_env_value(Some("4294967296")),
+            Some(134_217_728)
+        );
+    }
+
+    /// codex レビュー指摘 #503 P0: `0` を直接渡しても、実用上動作する
+    /// 最小値（1 MiB = 1,048,576 バイト）まで引き上げられること。
+    #[test]
+    fn js_1_test_heap_limit_from_env_value_raises_zero_to_the_floor() {
+        assert_eq!(test_heap_limit_from_env_value(Some("0")), Some(1_048_576));
+    }
+
+    /// codex レビュー指摘 #503 P0: `usize` として解釈できない値・値が
+    /// 未設定の場合は `None`（既定のヒープ上限を使う経路）になること。
+    #[test]
+    fn js_1_test_heap_limit_from_env_value_falls_back_to_default_on_invalid_or_missing_input() {
+        assert_eq!(test_heap_limit_from_env_value(Some("not-a-number")), None);
+        assert_eq!(test_heap_limit_from_env_value(Some("")), None);
+        assert_eq!(test_heap_limit_from_env_value(None), None);
     }
 
     /// JS-1・Issue #503 W5: `JsEngineError::Timeout` は `ErrorKind::Timeout`

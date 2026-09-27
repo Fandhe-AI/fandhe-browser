@@ -218,6 +218,16 @@ impl Drop for WorkerHandle {
 pub struct WorkerSpawnConfigForTest {
     /// 子へ `super::worker::TEST_HEAP_LIMIT_ENV_VAR` として渡すヒープ
     /// 上限（バイト）。`None` の場合は渡さない（本番と同じ既定値になる）。
+    ///
+    /// **下げることしかできない**（codex レビュー指摘 #503 P0 対応）:
+    /// 本番の既定値（[`super::v8_engine::MAX_ISOLATE_HEAP_BYTES`]。128 MiB）
+    /// を上回る値を指定しても、[`super::v8_engine::clamp_test_heap_limit_bytes`]
+    /// により既定値へクランプされる（`spawn_worker` が環境変数を組み立てる
+    /// 直前に適用する）。下限側も同関数がクランプする（`0` や極端に小さい
+    /// 値を渡しても、実用上動作する最小値まで引き上げられる。詳細は同関数の
+    /// ドキュメントコメント参照）。子プロセス側（`super::worker`）でも
+    /// 同じクランプを独立に適用しており、親を経由しない直接起動に対する
+    /// 防御になっている（多層防御）。
     pub heap_limit_bytes: Option<usize>,
     /// 子へ渡すプロトコルバージョンの上書き値（ハンドシェイク失敗を
     /// 決定的に再現するためのテスト専用経路）。`None` の場合は
@@ -368,9 +378,16 @@ impl V8ProcessEngine {
             // テスト専用（Issue #503 設計書 §7 W6）。本番の `new()` は
             // `spawn_config.heap_limit_bytes` が常に `None` のため、この
             // 環境変数は本番の子プロセスには渡らない。
+            //
+            // 本番の既定値を超える値を子へ渡せないよう、環境変数を
+            // 組み立てる直前にクランプする（`WorkerSpawnConfigForTest::
+            // heap_limit_bytes` のドキュメントコメント参照。codex レビュー
+            // 指摘 #503 P0 対応）。
+            let clamped_heap_limit_bytes =
+                super::v8_engine::clamp_test_heap_limit_bytes(heap_limit_bytes);
             command.env(
                 super::worker::TEST_HEAP_LIMIT_ENV_VAR,
-                heap_limit_bytes.to_string(),
+                clamped_heap_limit_bytes.to_string(),
             );
         }
         #[cfg(windows)]

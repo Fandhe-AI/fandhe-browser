@@ -46,6 +46,10 @@ fn main() -> ExitCode {
     js_1_handshake_failure_is_engine_unavailable();
     eprintln!("case: js_1_protocol_violation_discards_context_and_recovers");
     js_1_protocol_violation_discards_context_and_recovers();
+    eprintln!("case: js_1_oversized_test_heap_limit_is_clamped_to_the_production_default");
+    js_1_oversized_test_heap_limit_is_clamped_to_the_production_default();
+    eprintln!("case: js_1_undersized_test_heap_limit_is_raised_to_a_working_floor");
+    js_1_undersized_test_heap_limit_is_raised_to_a_working_floor();
     eprintln!("v8_worker: all cases passed");
     ExitCode::SUCCESS
 }
@@ -206,4 +210,75 @@ fn js_1_protocol_violation_discards_context_and_recovers() {
             panic!("engine must recover with a fresh child after a protocol violation: {err}")
         });
     assert_eq!(result, JsValue::Number(42.0));
+}
+
+/// codex レビュー指摘 #503 P0 の回帰テスト観点 1「既定値より大きい値を
+/// 指定しても、実効の上限が本番の既定値（128 MiB）を超えないこと」:
+/// テスト専用の `heap_limit_bytes` に本番の既定値を大きく上回る値
+/// （`OVERSIZED_TEST_HEAP_LIMIT_BYTES`）を指定しても、
+/// `WorkerSpawnConfigForTest::heap_limit_bytes` のドキュメントコメントが
+/// 説明するクランプ（`fandhe_browser_js::process_engine::spawn_worker` が
+/// 子へ渡す前に適用）により本番の既定値へ切り下げられ、本番と同じ
+/// ヒープ枯渇スクリプトが `SCRIPT_EXECUTION_TIMEOUT`（2 秒）の実行時間内で
+/// `ResourceLimitExceeded` になること（`Timeout` にならないこと）を確認
+/// する。クランプが効いていなければ、要求どおりの巨大なヒープが Isolate
+/// に設定され、同じスクリプトは 2 秒以内には枯渇せずに実行時間ベースの
+/// `Timeout` になりうる。
+///
+/// **本テストは実時間ベースであり、`v8_engine::tests::
+/// js_1_clamp_test_heap_limit_bytes_never_exceeds_production_default`
+/// ほど決定的ではない**（実装済みを装わない。REPAIR-3）。128 MiB への
+/// 到達が極端に遅い実行環境では `Timeout` になり誤って失敗しうる。
+/// 1 チャンクを 1e7 要素（約 80 MiB 相当の書き込み）にすることで、
+/// 128 MiB への到達に要する反復回数を数回に抑え、フレーク耐性を
+/// 高めている。
+fn js_1_oversized_test_heap_limit_is_clamped_to_the_production_default() {
+    // 本番の既定値（128 MiB）を大きく超える要求値。クランプされていれば
+    // 実効の上限は 128 MiB のまま変わらない。
+    const OVERSIZED_TEST_HEAP_LIMIT_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4 GiB
+    let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
+        heap_limit_bytes: Some(OVERSIZED_TEST_HEAP_LIMIT_BYTES),
+        protocol_version_override: None,
+    });
+
+    let oom_script = "var chunks = []; while (true) { chunks.push(new Array(1e7).fill(0)); }";
+    match engine.evaluate_script(oom_script, &EvaluateOptions::default()) {
+        Err(JsEngineError::ResourceLimitExceeded(msg)) => {
+            assert!(
+                msg.contains("context was discarded"),
+                "clamped OOM must discard the context, got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected ResourceLimitExceeded within the timeout because the requested heap \
+             limit ({OVERSIZED_TEST_HEAP_LIMIT_BYTES} bytes) must be clamped down to the \
+             production default (128 MiB); an unclamped 4 GiB heap would instead hit the \
+             execution timeout first, got: {other:?}"
+        ),
+    }
+}
+
+/// codex レビュー指摘 #503 P0 の回帰テスト観点 2「`0` や極端に小さい値は
+/// 下限まで引き上げられ、無効な値がそのまま子の V8 Isolate へ渡らない
+/// こと」: `heap_limit_bytes: Some(0)` を要求しても、クランプにより
+/// 実用上動作する最小値まで引き上げられ、トリビアルな評価が成功する
+/// こと。クランプが無ければ `v8::CreateParams::heap_limits(0, 0)` に近い
+/// 状態になり、Isolate 生成直後の永続 `Context` 生成の時点でヒープが
+/// 尽きて子プロセスが起動時に fatal OOM で終了し、ハンドシェイクにすら
+/// 到達できないはずである。
+fn js_1_undersized_test_heap_limit_is_raised_to_a_working_floor() {
+    let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
+        heap_limit_bytes: Some(0),
+        protocol_version_override: None,
+    });
+
+    let result = engine
+        .evaluate_script("1 + 1", &EvaluateOptions::default())
+        .unwrap_or_else(|err| {
+            panic!(
+                "a heap_limit_bytes request of 0 must be clamped up to a working floor instead \
+                 of being passed through as-is, but evaluation failed: {err}"
+            )
+        });
+    assert_eq!(result, JsValue::Number(2.0));
 }
