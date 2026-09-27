@@ -129,8 +129,11 @@ else
   set -e
 fi
 
-if ! [[ "$BENCH_EXIT_CODE" =~ ^[0-9]+$ ]]; then
-  echo "error: --bench-exit-code must be a non-negative integer (got: $BENCH_EXIT_CODE)" >&2
+# 先頭ゼロ（`007` 等）は bash の 8 進数リテラルと誤読されるおそれがあるため
+# 拒否し、終了コードの有効範囲（POSIX の 0-255）に収める
+# （harness/compat-regression/check-matrix.sh の --threshold 検証と同じ方針）。
+if ! [[ "$BENCH_EXIT_CODE" =~ ^(0|[1-9][0-9]{0,2})$ ]] || [ "$BENCH_EXIT_CODE" -gt 255 ]; then
+  echo "error: --bench-exit-code must be an integer between 0 and 255 with no leading zero (got: $BENCH_EXIT_CODE)" >&2
   exit 2
 fi
 
@@ -157,7 +160,11 @@ fi
 # にはせず、記録自体は続行する。git 管理外の一時 checkout 等でも動かすため）。
 GIT_COMMIT="${GITHUB_SHA:-}"
 if [ -z "$GIT_COMMIT" ]; then
-  GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || true)"
+  # git は Windows ネイティブ実行時に CRLF を出力しうる（jq と同じ既知の挙動。
+  # harness/compat-regression/check-matrix.sh 冒頭コメント・PR #452 参照）。
+  # 末尾の \r を除去してから 40 桁 hex 判定する（除去し忘れると Windows でだけ
+  # 正当なコミットハッシュが常に "unknown" 扱いになる）。
+  GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null | tr -d '\r' || true)"
 fi
 if ! [[ "$GIT_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
   GIT_COMMIT="unknown"
@@ -188,7 +195,13 @@ fi
 
 # jq --arg/--argjson で全ての値を渡し、シェルでの文字列連結を一切しない
 # （jq インジェクション対策。harness/compat-regression/check-matrix.sh と
-# 同じ方針。security.md「インジェクション」）。
+# 同じ方針。security.md「インジェクション」）。jq は Windows ネイティブ
+# 実行時に CRLF を出力しうる（check-matrix.sh 冒頭コメント・PR #452 と同じ
+# 既知の挙動）ため、`tr -d '\r'` を挟んで末尾の \r を除去してから履歴へ
+# 追記する（除去し忘れると history.jsonl の各行に \r が混入し、
+# coding-rust.md「内部データファイルの改行は LF 固定」に反する）。
+# `set -o pipefail`（冒頭）済みのため、jq の非ゼロ終了は tr を挟んでも
+# パイプライン全体の失敗として検出できる。
 if ! LINE=$(jq -c -n \
   --argjson schemaVersion 1 \
   --arg recordedAt "$RECORDED_AT" \
@@ -209,7 +222,7 @@ if ! LINE=$(jq -c -n \
     runId: $runId,
     benchExitCode: $benchExitCode,
     result: $result[0]
-  }' 2>&1); then
+  }' 2>&1 | tr -d '\r'); then
   echo "error: failed to build the JSONL line: $LINE" >&2
   exit 2
 fi

@@ -71,13 +71,16 @@ if [ "$(line_count)" != "1" ]; then
 fi
 CASES=$((CASES + 1))
 LAST_LINE=$(tail -n 1 "$HISTORY")
-STATUS=$(printf '%s' "$LAST_LINE" | jq -r '.result."fandhe-browser".perf6.status')
+# jq は Windows ネイティブ実行時に CRLF を出力しうる（harness/compat-regression/
+# check-matrix.sh 冒頭コメント・PR #452 と同じ既知の挙動）。以降の全ての jq 抽出
+# 結果は `tr -d '\r'` で末尾の \r を除去してから文字列比較する。
+STATUS=$(printf '%s' "$LAST_LINE" | jq -r '.result."fandhe-browser".perf6.status' | tr -d '\r')
 if [ "$STATUS" != "skipped" ]; then
   echo "FAIL [all-skipped perf6 status]: expected skipped, got $STATUS" >&2
   FAILURES=$((FAILURES + 1))
 fi
 CASES=$((CASES + 1))
-SOURCE_VALUE=$(printf '%s' "$LAST_LINE" | jq -r '.source')
+SOURCE_VALUE=$(printf '%s' "$LAST_LINE" | jq -r '.source' | tr -d '\r')
 if [ "$SOURCE_VALUE" != "ci" ]; then
   echo "FAIL [all-skipped source]: expected ci, got $SOURCE_VALUE" >&2
   FAILURES=$((FAILURES + 1))
@@ -88,7 +91,7 @@ CASES=$((CASES + 1))
 expect_exit "measured-met appends and exits 0" 0 \
   --history "$HISTORY" --input "$FIXTURES/measured-met.json" --source local
 LAST_LINE=$(tail -n 1 "$HISTORY")
-VERDICT=$(printf '%s' "$LAST_LINE" | jq -r '.result."fandhe-browser".perf6.verdict')
+VERDICT=$(printf '%s' "$LAST_LINE" | jq -r '.result."fandhe-browser".perf6.verdict' | tr -d '\r')
 if [ "$VERDICT" != "met" ]; then
   echo "FAIL [measured-met verdict]: expected met, got $VERDICT" >&2
   FAILURES=$((FAILURES + 1))
@@ -99,7 +102,7 @@ CASES=$((CASES + 1))
 expect_exit "measured-below appends and exits 0" 0 \
   --history "$HISTORY" --input "$FIXTURES/measured-below.json" --source local
 LAST_LINE=$(tail -n 1 "$HISTORY")
-VERDICT=$(printf '%s' "$LAST_LINE" | jq -r '.result."fandhe-browser".perf6.verdict')
+VERDICT=$(printf '%s' "$LAST_LINE" | jq -r '.result."fandhe-browser".perf6.verdict' | tr -d '\r')
 if [ "$VERDICT" != "below_target" ]; then
   echo "FAIL [measured-below verdict]: expected below_target, got $VERDICT" >&2
   FAILURES=$((FAILURES + 1))
@@ -110,7 +113,7 @@ CASES=$((CASES + 1))
 expect_exit "bench exit 1 is appended and propagated" 1 \
   --history "$HISTORY" --input "$FIXTURES/error-exit.json" --bench-exit-code 1 --source ci
 LAST_LINE=$(tail -n 1 "$HISTORY")
-BENCH_EXIT=$(printf '%s' "$LAST_LINE" | jq -r '.benchExitCode')
+BENCH_EXIT=$(printf '%s' "$LAST_LINE" | jq -r '.benchExitCode' | tr -d '\r')
 if [ "$BENCH_EXIT" != "1" ]; then
   echo "FAIL [bench exit 1 benchExitCode]: expected 1, got $BENCH_EXIT" >&2
   FAILURES=$((FAILURES + 1))
@@ -174,7 +177,12 @@ if [ "$NEW_COUNT" != "$((FINAL_COUNT + 1))" ]; then
 fi
 CASES=$((CASES + 1))
 while IFS= read -r line; do
-  SCHEMA=$(printf '%s' "$line" | jq -e '.schemaVersion == 1')
+  # `jq -e` は述語が false のとき exit 1 になる。`set -e` 下でそのまま呼ぶと
+  # スキーマ不一致（本来 FAIL として報告したいケース）でスクリプト自体が
+  # 中断してしまうため、`set +e`/`set -e` で一時的に無効化してから判定する。
+  set +e
+  SCHEMA=$(printf '%s' "$line" | jq -e '.schemaVersion == 1' 2>&1 | tr -d '\r')
+  set -e
   if [ "$SCHEMA" != "true" ]; then
     echo "FAIL [schemaVersion check]: line did not satisfy schemaVersion==1: $line" >&2
     FAILURES=$((FAILURES + 1))

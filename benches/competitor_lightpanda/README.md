@@ -46,7 +46,9 @@ bash record.sh --history results/history.jsonl [--input <file>] [--bench-exit-co
 ## 記録先
 
 - `results/history.jsonl`（コミットする。1 行 = 1 回の実行。追記専用。手で
-  編集しない）
+  編集しない。このファイル自体は未生成で、初回の `make bench-record`
+  実行時に作られる。`results/` には空ディレクトリをコミットできないための
+  `.gitkeep` のみを置いている）
 - CI アーティファクト（`.github/workflows/bench-competitor.yml`。
   `workflow_dispatch` と毎週の定期実行。3 OS matrix。90 日保持）。CI では
   上記の限界により対象バイナリがなく `skipped` の行が積み上がるだけだが、
