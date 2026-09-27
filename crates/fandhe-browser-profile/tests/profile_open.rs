@@ -33,6 +33,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// PROF-1 が定める `DataKind` ごとの固定ディレクトリ名。`kind.dir_name()`
+/// を一切呼ばず、本体実装（`src/profile.rs` の `dir_name()`）から独立して
+/// ここに固定する。受入基準 B（隔離）の各テストはこのテーブルだけを期待値の
+/// 発生源とし、実測（`profile.create_file_in`・`profile.data_dir`）とだけ
+/// 突き合わせる。こうしないと、期待値・実測値の両方を `kind.dir_name()`
+/// 経由で生成することになり、例えば `Cookies` と `Storage` の対応が
+/// 入れ替わっても両者が揃って入れ替わるため検出できない
+/// （codex review 指摘 P1 対応。#501 スレッド PRRT_kwDOUov33c6mYIOz）。
+/// `DataKind` は `#[non_exhaustive]` のためテスト crate から網羅 `match` は
+/// 書けず、固定テーブルで代替する。
+const PROF_1_LAYOUT: &[(DataKind, &str)] = &[
+    (DataKind::Cookies, "cookies"),
+    (DataKind::Storage, "storage"),
+    (DataKind::Cache, "cache"),
+    (DataKind::History, "history"),
+];
+
 /// テスト用の一時ディレクトリ。drop 時に再帰削除する（tempfile 等の外部
 /// 依存は追加しない方針。dependency-policy.md）。
 struct TempDir {
@@ -318,11 +335,28 @@ fn prof_1_each_data_kind_is_written_only_under_its_subdirectory() {
     let profile = Profile::open(&root).expect("open は成功する");
     let name = "data.bin";
 
+    // `PROF_1_LAYOUT`（`kind.dir_name()` を呼ばない固定テーブル）だけを
+    // 期待値の発生源とする。`DataKind::ALL` の集合と一致することも確認し、
+    // 将来 `ALL` にバリアントが追加・削除されてもテーブルとの乖離を検出する
+    // （codex review 指摘 P1・P2 対応。#501 スレッド PRRT_kwDOUov33c6mYIOz）。
+    // `DataKind` は `Ord` を実装しないため `HashSet`（`Eq + Hash` のみ要求）
+    // で集合比較する。
+    let layout_kinds: std::collections::HashSet<DataKind> =
+        PROF_1_LAYOUT.iter().map(|(k, _)| *k).collect();
+    let all_kinds: std::collections::HashSet<DataKind> = DataKind::ALL.iter().copied().collect();
+    assert_eq!(
+        layout_kinds, all_kinds,
+        "PROF_1_LAYOUT と DataKind::ALL の種別集合が一致しない（種別の追加漏れ）"
+    );
+
     let mut expected = BTreeSet::new();
     expected.insert(PathBuf::from("profile.lock"));
 
-    for kind in DataKind::ALL.iter().copied() {
-        let marker = format!("marker-{}", kind.dir_name());
+    for &(kind, dir_name) in PROF_1_LAYOUT {
+        // マーカー・期待パスはテーブルの固定文字列 `dir_name` から作る。
+        // `kind.dir_name()` は使わない（実装側の対応が入れ替わっても
+        // 期待値は追随しない）。書き込みは実装（`create_file_in`）を通す。
+        let marker = format!("marker-{dir_name}");
         let mut file = profile
             .create_file_in(kind, std::ffi::OsStr::new(name))
             .unwrap_or_else(|e| panic!("{kind:?} へのファイル作成が失敗した: {e:?}"));
@@ -331,16 +365,21 @@ fn prof_1_each_data_kind_is_written_only_under_its_subdirectory() {
         file.sync_all()
             .unwrap_or_else(|e| panic!("{kind:?} の sync_all が失敗した: {e}"));
 
-        expected.insert(PathBuf::from(kind.dir_name()).join(name));
+        expected.insert(PathBuf::from(dir_name).join(name));
+
+        // `data_dir(kind)` がテーブルの固定名と直接一致することを確認する。
+        // これが、`dir_name()` の対応入替（例: Cookies⇔Storage）を検出する
+        // 直接のチェック（期待値・実測値のどちらも同じ `dir_name()` を経由
+        // させないための核心部分）。
+        assert_eq!(
+            profile.data_dir(kind),
+            root.join(dir_name),
+            "{kind:?} の data_dir が PROF_1_LAYOUT の固定名 {dir_name:?} と一致しない \
+             （dir_name() の対応入替を検出する）"
+        );
     }
-    // `DataKind::ALL` を使わず、PROF-1 が定める 4 サブディレクトリ名を
-    // 独立に固定する。`expected` の構築自体が `DataKind::ALL` を走査して
-    // 作られているため、`DataKind::ALL.len()` を期待値の算出にも使うと、
-    // 将来 `ALL` から種別が漏れても両者が揃って縮み検出できない
-    // （codex review 指摘 P2 対応）。
-    let expected_dir_names: BTreeSet<&str> = ["cookies", "storage", "cache", "history"]
-        .into_iter()
-        .collect();
+
+    let expected_dir_names: BTreeSet<&str> = PROF_1_LAYOUT.iter().map(|(_, n)| *n).collect();
     assert_eq!(
         expected_dir_names.len(),
         4,
@@ -353,14 +392,14 @@ fn prof_1_each_data_kind_is_written_only_under_its_subdirectory() {
          （kind の追加漏れを検出するための固定チェック）"
     );
 
-    // ルート直下の実際のディレクトリ名一覧を、PROF-1 が定める固定文字列
-    // リストと集合として直接比較する。`expected`（通常ファイルの集合）は
-    // `DataKind::ALL`／`kind.dir_name()` から生成しているため、例えば
-    // `cookies` が別名に変わっても `expected` 側の期待値も追随して変わって
-    // しまい検出できない。またファイルの集合比較だけでは、4 サブディレクトリ
-    // の外に作られた「空の」余分なディレクトリを検出できない
-    // （codex review 指摘 P1 対応。この比較はディレクトリ名のみを対象とし、
-    // 個々のファイル配置の妥当性は上記 `expected`/`actual` の比較で確認する）。
+    // ルート直下の実際のディレクトリ名一覧を、PROF_1_LAYOUT の固定文字列
+    // リストと集合として直接比較する。`expected`（通常ファイルの集合）も
+    // 同じ固定テーブルから生成しているため、実装側の `dir_name()` が別名を
+    // 返すようになった場合はここで検出できる。またファイルの集合比較だけ
+    // では、4 サブディレクトリの外に作られた「空の」余分なディレクトリを
+    // 検出できない（codex review 指摘 P1 対応。この比較はディレクトリ名の
+    // みを対象とし、個々のファイル配置の妥当性は上記 `expected`/`actual`
+    // の比較で確認する）。
     let actual_dir_names: BTreeSet<String> = std::fs::read_dir(&root)
         .unwrap_or_else(|e| panic!("read_dir({root:?}) が失敗した: {e}"))
         .map(|entry| entry.unwrap_or_else(|e| panic!("{root:?} の read_dir 走査失敗: {e}")))
@@ -390,11 +429,15 @@ fn prof_1_each_data_kind_is_written_only_under_its_subdirectory() {
          意図しない場所への書き込みを検出する）"
     );
 
-    for kind in DataKind::ALL.iter().copied() {
-        let path = profile.data_dir(kind).join(name);
+    for &(kind, dir_name) in PROF_1_LAYOUT {
+        // 読み取り先はテーブルの固定パス（`root.join(dir_name)`）から
+        // 直接組み立てる。`profile.data_dir(kind)` 経由にすると、書き込み
+        // 側と同じ（入れ替わり得る）関数を読み取り側にも使うことになり、
+        // 対応入替を再び見逃してしまう（codex review 指摘 P1 対応）。
+        let path = root.join(dir_name).join(name);
         let content =
             std::fs::read(&path).unwrap_or_else(|e| panic!("{path:?} の読み込みが失敗した: {e}"));
-        let expected_marker = format!("marker-{}", kind.dir_name());
+        let expected_marker = format!("marker-{dir_name}");
         assert_eq!(
             content,
             expected_marker.as_bytes(),
@@ -418,17 +461,23 @@ fn prof_1_data_dir_listing_contains_only_its_own_files() {
     let root = tmp.path().join("profile");
     let profile = Profile::open(&root).expect("open は成功する");
 
-    for kind in DataKind::ALL.iter().copied() {
-        let file_name = format!("{}-only.bin", kind.dir_name());
+    // ファイル名・読み取り先はいずれも `PROF_1_LAYOUT` の固定文字列から
+    // 独立に組み立てる。`kind.dir_name()`／`profile.data_dir(kind)` の
+    // どちらも使わないことで、実装側の対応入替（例: Cookies⇔Storage）を
+    // 検出できるようにする（codex review 指摘 P1 対応。#501 スレッド
+    // PRRT_kwDOUov33c6mYIOz）。
+    for &(kind, dir_name) in PROF_1_LAYOUT {
+        let file_name = format!("{dir_name}-only.bin");
         profile
             .create_file_in(kind, std::ffi::OsStr::new(&file_name))
             .unwrap_or_else(|e| panic!("{kind:?} へのファイル作成が失敗した: {e:?}"));
     }
 
-    for kind in DataKind::ALL.iter().copied() {
-        let expected_name = format!("{}-only.bin", kind.dir_name());
-        let names: BTreeSet<String> = std::fs::read_dir(profile.data_dir(kind))
-            .unwrap_or_else(|e| panic!("{:?} の read_dir が失敗した: {e}", profile.data_dir(kind)))
+    for &(kind, dir_name) in PROF_1_LAYOUT {
+        let expected_name = format!("{dir_name}-only.bin");
+        let dir = root.join(dir_name);
+        let names: BTreeSet<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{dir:?} の read_dir が失敗した: {e}"))
             .map(|entry| {
                 entry
                     .unwrap_or_else(|e| panic!("read_dir エントリ取得が失敗した: {e}"))
@@ -441,8 +490,8 @@ fn prof_1_data_dir_listing_contains_only_its_own_files() {
         expected_names.insert(expected_name);
         assert_eq!(
             names, expected_names,
-            "{kind:?} のディレクトリ一覧に他 kind のファイルが混ざっている、\
-             または自身のファイルが見当たらない"
+            "{kind:?}（固定ディレクトリ名 {dir_name:?}）の一覧に他 kind のファイルが \
+             混ざっている、または自身のファイルが見当たらない"
         );
     }
 }
