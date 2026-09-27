@@ -35,6 +35,20 @@ pub mod engine_trait;
 // 越しに使い、V8 / boa の具象型を上位 crate へ漏らさない」）。
 #[cfg(feature = "js-v8")]
 mod v8_engine;
+// JS 評価用の子プロセスと stdio でやり取りするバイナリプロトコルの
+// フレーミング・コーデック（TASK-29・Issue #503「JS プロセス分離」
+// 設計書 §3.5・§7 W2）。`v8` crate に依存しない（`js-v8` feature の
+// 有無に関わらずコンパイル・テストできる）。子プロセス側の入口・親側の
+// プロキシ（W3・W4 で追加）が消費するまでは lib 本体から未使用のため、
+// 非テストビルドでは `dead_code` の期待を宣言する（REPAIR-3）。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "W3（worker.rs）・W4（process_engine.rs）から使われるまで lib 本体からは未使用（REPAIR-3）"
+    )
+)]
+mod worker_protocol;
 
 pub use engine_trait::{
     CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsEngineError, JsValue, NativeFn,
