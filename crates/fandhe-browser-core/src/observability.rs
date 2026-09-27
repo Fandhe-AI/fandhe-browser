@@ -325,6 +325,39 @@ mod tests {
         assert_eq!(OperationKind::JsStub.as_str(), "js_stub");
     }
 
+    /// `REPAIR-9`: `FailureKind::as_str` が全 13 種別で安定した文字列を返す。
+    /// ログ出力契約の本体であり、将来のタイポ（例:
+    /// `too_many_concurrent_dns_resolutions` の誤記）を CI で検出するため
+    /// 全 variant を具体値で検証する（coding-rust.md「期待値は具体値で書く」）。
+    #[test]
+    fn repair_9_failure_kind_as_str_is_stable() {
+        assert_eq!(FailureKind::Io.as_str(), "io");
+        assert_eq!(FailureKind::InvalidInput.as_str(), "invalid_input");
+        assert_eq!(FailureKind::Unsupported.as_str(), "unsupported");
+        assert_eq!(
+            FailureKind::JsExecutionUnavailable.as_str(),
+            "js_execution_unavailable"
+        );
+        assert_eq!(FailureKind::Parse.as_str(), "parse");
+        assert_eq!(FailureKind::Timeout.as_str(), "timeout");
+        assert_eq!(FailureKind::TooManyRedirects.as_str(), "too_many_redirects");
+        assert_eq!(FailureKind::ResponseTooLarge.as_str(), "response_too_large");
+        assert_eq!(FailureKind::DisallowedScheme.as_str(), "disallowed_scheme");
+        assert_eq!(
+            FailureKind::DisallowedAddress.as_str(),
+            "disallowed_address"
+        );
+        assert_eq!(
+            FailureKind::TooManyConcurrentDnsResolutions.as_str(),
+            "too_many_concurrent_dns_resolutions"
+        );
+        assert_eq!(FailureKind::Network.as_str(), "network");
+        assert_eq!(
+            FailureKind::MatchCacheLimitExceeded.as_str(),
+            "match_cache_limit_exceeded"
+        );
+    }
+
     /// `REPAIR-9`: 成功レコードのシリアライズ結果が期待する JSON 文字列と
     /// 完全一致する。
     #[test]
