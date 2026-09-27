@@ -9,14 +9,28 @@
 //!
 //! # スタブについて
 //!
-//! 本モジュールは Platform/Isolate の初期化のみを担う。以下は未実装
+//! 本モジュールは Platform/Isolate の初期化（29.2）に加え、[`V8Engine`] の
+//! 永続 Context を使ったスクリプト評価（[`V8Engine::evaluate_script`]。
+//! `TASK-29.3`・Issue #154）を実装済みである。以下は未実装
 //! （実装済みを装わない。REPAIR-3）。
 //!
-//! - [`super::engine_trait::JsEngine`] の実装（`TASK-29.3`〜`29.5`）
+//! - [`super::engine_trait::JsEngine`] トレイトへの集約（`TASK-29.6`）。
+//!   本モジュールは同トレイトと同じシグネチャの inherent メソッドとして
+//!   `evaluate_script` を提供するに留め、`impl JsEngine for V8Engine` は
+//!   まだ書かない（29.4「グローバル関数注入」・29.5「DOM 風バインディング」
+//!   と並行して進めるため、共有の impl ブロックを編集し合うコンフリクトを
+//!   避ける）
+//! - グローバル関数注入・DOM 風オブジェクトバインディング（`TASK-29.4`・
+//!   `29.5`）
+//! - `create_engine`（`engine_trait.rs`）への配線（`TASK-29.6`・`29.7`）。
+//!   配線すると `tests/conformance.rs` の同梱エンジン向けコンフォーマンス
+//!   テスト（注入・バインディングの契約検証を含む）が V8 に対しても走る
+//!   ため、29.4・29.5 の完了を待つ
 //! - `v8` 由来のエラーを共通エラー型へ変換する仕組み（`TASK-29.6`）
 //! - ヒープ上限（`near_heap_limit_callback`）・実行タイムアウトの導入
 //!   （[`super::engine_trait::EvaluateOptions`] の拡張と合わせて
-//!   `TASK-29.3` 以降 / `TASK-30`（`MS-3`）で扱う）
+//!   `TASK-30`（`MS-3`）で扱う。[`V8Engine::evaluate_script`] のドキュメント
+//!   コメントも参照）
 //!
 //! # プロセス全体の初期化について
 //!
@@ -52,6 +66,17 @@
 
 use std::cell::Cell;
 use std::sync::Once;
+
+use super::engine_trait::{EvaluateOptions, JsEngineError, JsValue};
+
+/// [`V8Engine::evaluate_script`] が生成する例外メッセージの上限文字数
+/// （UTF-8 文字数。`chars().count()` で判定する）。
+///
+/// V8 の例外メッセージには JS 側が任意の長さの文字列を投げられる
+/// （例: `throw 'a'.repeat(1e7)`）。上限を設けずに `JsEngineError` へ
+/// 詰めるとエラー値・ログが際限なく肥大化しうるため切り詰める
+/// （OWASP A04「不安全な設計」・security.md）。
+const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
 
 /// プロセス内で V8 の Platform 初期化を 1 回だけ実行するためのフラグ。
 static V8_INIT: Once = Once::new();
@@ -123,6 +148,19 @@ pub(crate) fn ensure_v8_initialized() {
     )
 )]
 pub(crate) struct V8Engine {
+    /// 29.4（グローバル関数注入）・29.5（DOM 風バインディング）・本 Issue の
+    /// 評価呼び出しが共有する、永続的な単一の V8 Context（`JS-1`。
+    /// `js-engine.md`「文字列 in/out・数値 out」の PoC-3 相当を、呼び出しの
+    /// たびに使い捨てる Context ではなく 1 つの Context の中で行うことで、
+    /// [`V8Engine::evaluate_script`] を繰り返し呼んでもグローバル変数や
+    /// 注入した関数が引き継がれる（29.7 に向けた前提）。
+    ///
+    /// **フィールド宣言順が重要**: `isolate` より前に置くこと。Rust は
+    /// フィールドを宣言順に drop するため、`context`（`isolate` を指す
+    /// `v8::Global`）を先に破棄してから `isolate` を破棄する必要がある。
+    /// 逆順にすると、`Global::drop` が既に破棄済みの Isolate に触れる
+    /// ことになり不正な状態になる。
+    context: v8::Global<v8::Context>,
     /// v8 の実行コンテキストを保持する Isolate 本体。[`V8_ISOLATE_ACTIVE`]
     /// により同一スレッドでは常に高々 1 つしか生存しないため、
     /// `OwnedIsolate` の drop 順制約（生成と逆順であること）が問題になる
@@ -174,6 +212,10 @@ impl V8Engine {
     /// [`IsolateAlreadyActiveOnThread`] を返す（`OwnedIsolate` の
     /// drop 順序制約による panic を防ぐため。本モジュール冒頭
     /// 「スレッド安全性」節）。
+    ///
+    /// Isolate の生成に続けて、[`evaluate_script`](Self::evaluate_script)
+    /// 等が使い回す永続 Context を 1 つ生成し、`v8::Global` へ昇格して
+    /// 保持する（`V8Engine::context` のドキュメントコメント参照）。
     pub(crate) fn new() -> Result<Self, IsolateAlreadyActiveOnThread> {
         ensure_v8_initialized();
         let acquired = V8_ISOLATE_ACTIVE.with(|active| {
@@ -187,8 +229,14 @@ impl V8Engine {
         if !acquired {
             return Err(IsolateAlreadyActiveOnThread);
         }
-        let isolate = v8::Isolate::new(v8::CreateParams::default());
-        Ok(Self { isolate })
+        let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+        let context = {
+            let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+            let scope = scope.init();
+            let context = v8::Context::new(&scope, Default::default());
+            v8::Global::new(&scope, context)
+        };
+        Ok(Self { context, isolate })
     }
 
     /// この Isolate のヒープ統計から総ヒープサイズ（バイト）を返す。
@@ -199,6 +247,164 @@ impl V8Engine {
     #[cfg(test)]
     pub(crate) fn total_heap_size(&mut self) -> usize {
         self.isolate.get_heap_statistics().total_heap_size()
+    }
+
+    /// スクリプトを評価し、結果を [`JsValue`] で返す（`JS-1`「スクリプト
+    /// 評価」・`TASK-29.3`・Issue #154）。
+    ///
+    /// [`super::engine_trait::JsEngine::evaluate_script`] と同じシグネチャの
+    /// inherent メソッドとして実装する（モジュール冒頭「スタブについて」。
+    /// トレイト実装への集約は `TASK-29.6`）。呼び出しのたびに
+    /// [`V8Engine::context`]（永続 Context）へ入り直すため、`var`/グローバル
+    /// 変数などのスクリプト間状態は評価をまたいで引き継がれる。
+    ///
+    /// # 現在の制限（実装済みを装わない。REPAIR-3）
+    ///
+    /// - 実行タイムアウト・ヒープ上限が無い。無限ループのスクリプト
+    ///   （例: `while (true) {}`）を渡すと本メソッドは戻らない。
+    ///   `TASK-30`（`MS-3`）で [`EvaluateOptions`] にフィールドを追加し、
+    ///   `v8::IsolateHandle::terminate_execution` /
+    ///   `near_heap_limit_callback` を使って対処する差し込み口として、
+    ///   引数 `options` を今のうちから受け取っている
+    /// - microtask checkpoint は行わない（`Promise` を使うスクリプトの
+    ///   挙動は未定義。同じく `TASK-30` 以降で扱う）
+    /// - 評価結果が [`JsValue`] の variant で表現できない場合（object・
+    ///   array・function・symbol・bigint 等）は `Err` を返す。文字列化して
+    ///   成功したかのように返す（例: `[object Object]`）ことはしない
+    ///   （security.md「偽装・回避機能の禁止」）。`JsValue` は
+    ///   `#[non_exhaustive]` であり、必要になった時点で variant を追加する
+    ///   （`TASK-29.7`/`TASK-30`）
+    pub(crate) fn evaluate_script(
+        &mut self,
+        script: &str,
+        _options: &EvaluateOptions,
+    ) -> Result<JsValue, JsEngineError> {
+        // 外部入力（スクリプト文字列）の経路。長さを検証してからアロケー
+        // ションに使う（coding-rust.md）。V8 の `MAX_LENGTH` は UTF-16
+        // コード単位数の上限であり、UTF-8 のバイト長は常にそれ以上になる
+        // ため、`script.len()`（バイト長）での比較は保守的（厳しめ）な
+        // 判定になる。
+        if script.len() > v8::String::MAX_LENGTH {
+            return Err(JsEngineError::EvaluationFailed(
+                "script source exceeds the maximum length supported by V8".to_string(),
+            ));
+        }
+
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let mut scope = scope.init();
+        let context = v8::Local::new(&scope, &self.context);
+        let scope = &mut v8::ContextScope::new(&mut scope, context);
+        // 構文エラーも捕捉するため、コンパイルの前に TryCatch を開く。
+        let tc = std::pin::pin!(v8::TryCatch::new(scope));
+        let tc = tc.init();
+
+        // JS-1: `tc` の例外情報から、切り詰め済みのエラーメッセージ文字列を
+        // 作る。コンパイル失敗・実行失敗の両方の分岐から呼ぶため、`tc` を
+        // 参照キャプチャするクロージャにする（`tc` の具象型は v8 crate 側の
+        // 多重の生存期間パラメータを持ち、フリー関数として書き下すよりも
+        // 呼び出し側での型推論に任せた方が単純になる）。
+        let extract_message = || -> String {
+            let raw = if let Some(message) = tc.message() {
+                let text = message.get(&tc).to_rust_string_lossy(&tc);
+                match message.get_line_number(&tc) {
+                    Some(line) => format!("{text} (line {line})"),
+                    None => text,
+                }
+            } else if let Some(exception) = tc.exception() {
+                exception.to_rust_string_lossy(&tc)
+            } else {
+                "unknown script error".to_string()
+            };
+            truncate_error_message(raw)
+        };
+
+        let source = match v8::String::new(&tc, script) {
+            Some(source) => source,
+            None => {
+                return Err(JsEngineError::EvaluationFailed(
+                    "failed to allocate script source string".to_string(),
+                ));
+            }
+        };
+
+        let compiled = match v8::Script::compile(&tc, source, None) {
+            Some(compiled) => compiled,
+            None => return Err(JsEngineError::EvaluationFailed(extract_message())),
+        };
+
+        let result = match compiled.run(&tc) {
+            Some(result) => result,
+            None => {
+                let message = if tc.has_terminated() {
+                    "script execution was terminated".to_string()
+                } else {
+                    extract_message()
+                };
+                return Err(JsEngineError::EvaluationFailed(message));
+            }
+        };
+
+        value_to_js_value(&tc, result)
+    }
+}
+
+/// [`V8Engine::evaluate_script`] のエラーメッセージ文字列を
+/// [`MAX_ERROR_MESSAGE_CHARS`] 文字に切り詰める。切り詰めた場合は末尾に
+/// `"..."` を付ける。文字境界（Unicode scalar value）単位で切るため
+/// `chars()` を使う（バイト単位の添字アクセスは文字境界を壊しうる）。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "TASK-29.3/29.6 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
+    )
+)]
+fn truncate_error_message(message: String) -> String {
+    if message.chars().count() <= MAX_ERROR_MESSAGE_CHARS {
+        return message;
+    }
+    let truncated: String = message.chars().take(MAX_ERROR_MESSAGE_CHARS).collect();
+    format!("{truncated}...")
+}
+
+/// V8 のスクリプト評価結果（`Local<Value>`）を、エンジン非依存の
+/// [`JsValue`] へ変換する（`JS-1`・`TASK-29.3`）。
+///
+/// 簡易実装（現在の制限: オブジェクト・配列・関数・シンボル・BigInt 等の
+/// 複合値は [`JsValue`] の variant が無いため `Err` にする。`JsValue` は
+/// `#[non_exhaustive]` であり、必要になった時点で `TASK-29.7`/`TASK-30` で
+/// variant を追加する。過剰設計を避ける。REPAIR-3）。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "TASK-29.3/29.6 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
+    )
+)]
+fn value_to_js_value(
+    scope: &v8::PinScope<'_, '_>,
+    value: v8::Local<v8::Value>,
+) -> Result<JsValue, JsEngineError> {
+    if value.is_undefined() {
+        Ok(JsValue::Undefined)
+    } else if value.is_null() {
+        Ok(JsValue::Null)
+    } else if value.is_boolean() {
+        Ok(JsValue::Bool(value.boolean_value(scope)))
+    } else if value.is_number() {
+        match value.number_value(scope) {
+            Some(number) => Ok(JsValue::Number(number)),
+            None => Err(JsEngineError::EvaluationFailed(
+                "failed to convert V8 number result to f64".to_string(),
+            )),
+        }
+    } else if value.is_string() {
+        Ok(JsValue::String(value.to_rust_string_lossy(scope)))
+    } else {
+        let type_name = value.type_of(scope).to_rust_string_lossy(scope);
+        Err(JsEngineError::EvaluationFailed(format!(
+            "evaluation result of type '{type_name}' is not representable as JsValue"
+        )))
     }
 }
 
@@ -297,6 +503,170 @@ mod tests {
                 heap_size > 0,
                 "isolate created from a worker thread must report a nonzero heap size"
             );
+        }
+    }
+
+    /// JS-1・TASK-29.3: 算術式を評価し、`JsValue::Number` で受け取れること
+    /// （受け入れ条件「単純な JS 式を評価できる」）。
+    #[test]
+    fn js_1_v8_evaluate_arithmetic() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let result = engine
+            .evaluate_script("1 + 2 * 3", &EvaluateOptions::default())
+            .expect("arithmetic expression must evaluate successfully");
+        assert_eq!(result, JsValue::Number(7.0));
+    }
+
+    /// JS-1・TASK-29.3: 文字列式（連結）を評価し、`JsValue::String` で
+    /// 受け取れること。
+    #[test]
+    fn js_1_v8_evaluate_string_concat() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let result = engine
+            .evaluate_script("'fandhe' + '-' + 'browser'", &EvaluateOptions::default())
+            .expect("string concatenation must evaluate successfully");
+        assert_eq!(result, JsValue::String("fandhe-browser".to_string()));
+    }
+
+    /// JS-1・TASK-29.3: `true`/`null`/`undefined` の各リテラルが対応する
+    /// `JsValue` variant に変換されること。
+    #[test]
+    fn js_1_v8_evaluate_primitive_literals() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        assert_eq!(
+            engine
+                .evaluate_script("true", &EvaluateOptions::default())
+                .expect("boolean literal must evaluate successfully"),
+            JsValue::Bool(true)
+        );
+        assert_eq!(
+            engine
+                .evaluate_script("null", &EvaluateOptions::default())
+                .expect("null literal must evaluate successfully"),
+            JsValue::Null
+        );
+        assert_eq!(
+            engine
+                .evaluate_script("undefined", &EvaluateOptions::default())
+                .expect("undefined literal must evaluate successfully"),
+            JsValue::Undefined
+        );
+    }
+
+    /// JS-1・TASK-29.3: 構文エラーは panic ではなく
+    /// `Err(JsEngineError::EvaluationFailed(..))` を返すこと（受け入れ条件
+    /// AC-2）。メッセージに V8 由来の `SyntaxError` を含むことを確認する。
+    #[test]
+    fn js_1_v8_evaluate_syntax_error_returns_err() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        match engine.evaluate_script("1 +", &EvaluateOptions::default()) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert!(
+                    msg.contains("SyntaxError"),
+                    "expected a SyntaxError message, got: {msg}"
+                );
+            }
+            other => panic!("expected EvaluationFailed for a syntax error, got: {other:?}"),
+        }
+    }
+
+    /// JS-1・TASK-29.3: 実行時例外（`throw`）も panic ではなく
+    /// `Err(JsEngineError::EvaluationFailed(..))` を返すこと（AC-2）。
+    #[test]
+    fn js_1_v8_evaluate_runtime_exception_returns_err() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        match engine.evaluate_script("throw new Error('boom')", &EvaluateOptions::default()) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert!(
+                    msg.contains("boom"),
+                    "expected message to contain the thrown error text, got: {msg}"
+                );
+            }
+            other => panic!("expected EvaluationFailed for a runtime exception, got: {other:?}"),
+        }
+    }
+
+    /// JS-1・TASK-29.3: エラーの後もエンジンが使い続けられること（`TryCatch`
+    /// がリークせず、次の評価に影響しないことの確認）。
+    #[test]
+    fn js_1_v8_engine_usable_after_error() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        assert!(
+            engine
+                .evaluate_script("throw new Error('boom')", &EvaluateOptions::default())
+                .is_err()
+        );
+        let result = engine
+            .evaluate_script("40 + 2", &EvaluateOptions::default())
+            .expect("engine must remain usable after a prior evaluation error");
+        assert_eq!(result, JsValue::Number(42.0));
+    }
+
+    /// JS-1・TASK-29.3: 永続 Context を使うため、`var` で定義した変数が
+    /// 別の評価呼び出しをまたいで参照できること（29.4 の前提となる挙動）。
+    #[test]
+    fn js_1_v8_context_state_persists_across_evaluations() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        engine
+            .evaluate_script("var x = 1;", &EvaluateOptions::default())
+            .expect("variable declaration must evaluate successfully");
+        let result = engine
+            .evaluate_script("x + 1", &EvaluateOptions::default())
+            .expect("previously declared variable must still be visible");
+        assert_eq!(result, JsValue::Number(2.0));
+    }
+
+    /// JS-1・TASK-29.3: `JsValue` の variant で表現できない結果（オブジェ
+    /// クト等）は、文字列化して成功を装うのではなく `Err` を返すこと
+    /// （security.md「偽装・回避機能の禁止」）。
+    #[test]
+    fn js_1_v8_evaluate_unsupported_result_type_returns_err() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        match engine.evaluate_script("({})", &EvaluateOptions::default()) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert!(
+                    msg.contains("object"),
+                    "expected message to mention the unsupported type, got: {msg}"
+                );
+            }
+            other => {
+                panic!("expected EvaluationFailed for an unsupported result type, got: {other:?}")
+            }
+        }
+    }
+
+    /// JS-1・TASK-29.3: 巨大な例外メッセージが [`MAX_ERROR_MESSAGE_CHARS`]
+    /// 文字に切り詰められること（OWASP A04 対策の回帰確認）。
+    #[test]
+    fn js_1_v8_error_message_is_truncated() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        match engine.evaluate_script("throw 'a'.repeat(100000)", &EvaluateOptions::default()) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert!(
+                    msg.chars().count() <= MAX_ERROR_MESSAGE_CHARS + 3,
+                    "message must be truncated to at most {} chars (+3 for the ellipsis), got {} chars",
+                    MAX_ERROR_MESSAGE_CHARS,
+                    msg.chars().count()
+                );
+            }
+            other => {
+                panic!("expected EvaluationFailed for a thrown oversized string, got: {other:?}")
+            }
+        }
+    }
+
+    /// JS-1・TASK-29.2/29.3: 生成・評価・drop を繰り返しても、`context`
+    /// フィールドの drop 順（`isolate` より前）が正しく保たれ、クラッシュ
+    /// しないことの回帰確認（`V8Engine` 構造体のドキュメントコメント参照）。
+    #[test]
+    fn js_1_v8_engine_drop_with_context_does_not_crash() {
+        for _ in 0..3 {
+            let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+            let result = engine
+                .evaluate_script("1 + 1", &EvaluateOptions::default())
+                .expect("evaluation must succeed before drop");
+            assert_eq!(result, JsValue::Number(2.0));
+            drop(engine);
         }
     }
 }
