@@ -583,7 +583,11 @@ fn successful_measurement_path_reports_measured_values_and_exit_code_zero() {
         .expect("metadata")
         .len() as f64;
 
-    let (body, exit_code) = run_all(&[target], 1);
+    // PERF-6 目標比較（TASK-84.2・Issue #212）: 基準値ありで `run_all` を
+    // 呼び、idleRssKb が測定できた（unix）場合に "perf6" が基準値を反映した
+    // "measured" になることを確認する。
+    const CHROMIUM_IDLE_RSS_KB: u64 = 1_048_576;
+    let (body, exit_code) = run_all(&[target], 1, Some(CHROMIUM_IDLE_RSS_KB));
     let value = parse_json(&body).expect("run_all output should be valid JSON");
     let report = value
         .get("fake-browser")
@@ -660,6 +664,35 @@ fn successful_measurement_path_reports_measured_values_and_exit_code_zero() {
         assert!(
             idle_rss_value < 1024.0 * 1024.0,
             "idleRssKb should be well under 1GiB for a local self-exec process (PERF-6): {idle_rss_value}"
+        );
+    }
+
+    // PERF-6 目標比較（TASK-84.2・Issue #212）: idleRssKb の計測状況を
+    // "perf6" がそのまま反映することを確認する。unix では実測値に対する
+    // 判定（"measured"・baselineKb が渡した基準値と一致）、Windows では
+    // idleRssKb が unsupported のためそのまま unsupported を引き継ぐ。
+    let perf6 = report.get("perf6").expect("perf6 field");
+    if cfg!(windows) {
+        assert_eq!(
+            perf6.get("status").and_then(JsonValue::as_str),
+            Some("unsupported"),
+            "perf6 should mirror idleRssKb's unsupported status on Windows: {body}"
+        );
+    } else {
+        assert_eq!(
+            perf6.get("status").and_then(JsonValue::as_str),
+            Some("measured"),
+            "perf6 should be measured when a baseline is configured and idleRssKb succeeded: {body}"
+        );
+        assert_eq!(
+            perf6.get("baselineKb").and_then(JsonValue::as_f64),
+            Some(CHROMIUM_IDLE_RSS_KB as f64),
+            "perf6 baselineKb should equal the CHROMIUM_IDLE_RSS_KB passed to run_all: {body}"
+        );
+        let verdict = perf6.get("verdict").and_then(JsonValue::as_str);
+        assert!(
+            verdict == Some("met") || verdict == Some("below_target"),
+            "perf6 verdict should be either met or below_target: {body}"
         );
     }
 
@@ -795,7 +828,11 @@ fn unconfigured_target_is_skipped_with_exit_code_zero() {
         mcp_args_error: None,
     };
 
-    let (body, exit_code) = run_all(&[target], 1);
+    // 基準値を渡さない（`None`）: PERF-6 目標比較（TASK-84.2・Issue #212）は
+    // `CHROMIUM_IDLE_RSS_KB` 未設定時と同じ経路になり、idleRssKb 自体が
+    // "skipped"（対象バイナリ未設定）でも "perf6" は基準値未設定の理由で
+    // "skipped" になることを確認する（idleRssKb 側の理由とは別の固定メッセージ）。
+    let (body, exit_code) = run_all(&[target], 1, None);
     let value = parse_json(&body).expect("run_all output should be valid JSON");
     let report = value
         .get("unconfigured")
@@ -816,6 +853,22 @@ fn unconfigured_target_is_skipped_with_exit_code_zero() {
             "{field} should be skipped when the target binary is not configured: {body}"
         );
     }
+    assert_eq!(
+        report
+            .get("perf6")
+            .and_then(|v| v.get("status"))
+            .and_then(JsonValue::as_str),
+        Some("skipped"),
+        "perf6 should be skipped when CHROMIUM_IDLE_RSS_KB is not configured: {body}"
+    );
+    assert_eq!(
+        report
+            .get("perf6")
+            .and_then(|v| v.get("reason"))
+            .and_then(JsonValue::as_str),
+        Some("CHROMIUM_IDLE_RSS_KB not set"),
+        "perf6 skip reason should explain the missing baseline: {body}"
+    );
     assert_eq!(
         exit_code, 0,
         "exit code should be 0 when every measurement is skipped: {body}"

@@ -1,0 +1,16 @@
+{
+  "fandhe-browser": {
+    "binarySizeBytes": { "status": "measured", "value": 6624592 },
+    "coldStartMs": { "status": "measured", "value": 42.5 },
+    "idleRssKb": { "status": "measured", "value": 17300 },
+    "tokenReductionPct": { "status": "measured", "value": 96.68 },
+    "sitesCount": 3,
+    "perf6": {
+      "status": "measured",
+      "baselineKb": 81306,
+      "reductionPct": 78.72243767572019,
+      "targetPct": 85,
+      "verdict": "below_target"
+    }
+  }
+}

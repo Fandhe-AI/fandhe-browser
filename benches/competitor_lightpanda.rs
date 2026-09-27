@@ -23,6 +23,28 @@
 //!   （未設定時の既定値は `mcp`）
 //! - `COMPETITOR_BENCH_TRIALS`: cold start / RSS の試行回数（既定 5・上限 20）
 //!
+//! `CHROMIUM_IDLE_RSS_KB`（`PERF-6` 目標比較の基準値。TASK-84.2・Issue #212）:
+//! Chromium ヘッドレス 1 インスタンスの**プロセスツリー全体**のアイドル RSS
+//! 実測値（KB 単位の正の整数。上限 104,857,600 = 100GiB 相当）を渡す。未設定
+//! なら各対象の結果 JSON の `"perf6"` は `"skipped"` になる（既定値は埋め込ま
+//! ない。実測せずに数値を仮定すると `REPAIR-3`「実装済みを装わない」に反する
+//! ため）。推奨する実測の目安として PoC-1 の Chromium ベースライン（約
+//! 79.4MB・約 81306 KB）を参考値として挙げるに留める（`docs/design/
+//! perf-6-decision.md`）。不正値（非 UTF-8・非数値・`0`・上限超過）は
+//! [`trial_count`] と同じ fail-closed 方針で、計測を試みずに JSON を出さず
+//! 終了コード `1` で終了する（[`chromium_baseline_kb`] 参照）。
+//!
+//! `"perf6"` フィールド: 各対象の `idleRssKb` と上記基準値から
+//! `PERF-6`（Chromium 比 85% 以上のアイドル RSS 削減。
+//! `support::PERF6_TARGET_PCT`）目標との比較を `{"status":...}` 形式で返す
+//! （`support::perf6_comparison`）。`fandhe-browser` 側は単一プロセスの RSS
+//! のみを計測する（本ファイルのアイドル RSS の節を参照。プロセスツリー全体
+//! の計測ではない）ため、`PERF-6` の判定対象は実質的に `fandhe-browser` 側
+//! であり、Lightpanda 行の `"perf6"` は同じ基準値に対する参考値に過ぎない。
+//! `"below_target"`（目標未達）は計測結果の一種であり計測失敗ではないため、
+//! 下記の終了コード契約には影響しない（`bench_exit_code` の判定対象に含め
+//! ない）。
+//!
 //! `AISNAP-1`（MCP トークン削減率）計測が `goto` する対象: 計測対象ブラウザは
 //! 接続時に名前を再解決でき、公開 URL からのリダイレクトにも追従し得るため、
 //! 事前の URL 検証をいくら積み増しても実際の接続先（内部アドレスに到達しない
@@ -94,6 +116,11 @@ use measure::Target;
 const DEFAULT_TRIALS: usize = 5;
 const MAX_TRIALS: usize = 20;
 
+/// `CHROMIUM_IDLE_RSS_KB`（外部入力）に許す上限（100GiB 相当。
+/// coding-rust.md「長さ・件数を上限検証してからアロケーションに使う」の
+/// 精神を数値入力にも適用。TASK-84.2・Issue #212）。
+const MAX_CHROMIUM_IDLE_RSS_KB: u64 = 104_857_600;
+
 /// `<PREFIX>_SERVE_ARGS` / `<PREFIX>_MCP_ARGS`（外部入力）に許す上限。
 /// `split_args` へ渡す前にバイト数・分割後の引数個数を検証し、巨大な
 /// 環境変数によるメモリ過剰消費を防ぐ。
@@ -163,6 +190,22 @@ fn trial_count() -> Result<usize, String> {
     )
 }
 
+/// `CHROMIUM_IDLE_RSS_KB` を環境変数から読み取る（`PERF-6` 比較の基準値。
+/// TASK-84.2・Issue #212）。
+///
+/// 未設定なら `Ok(None)`（`measure::run_all` が各対象の `"perf6"` を
+/// `skipped` にする）。不正値（非 UTF-8・非数値・`0`・上限超過）は
+/// [`trial_count`] と同じ fail-closed 方針で `Err` にする（推奨する実測対象:
+/// レンダリング無効の fandhe-browser と比較する Chromium ヘッドレス
+/// 1 インスタンスのプロセスツリー全体のアイドル RSS。参考値は PoC-1 の
+/// 約 79.4MB〔約 81306 KB〕。判断記録: `docs/design/perf-6-decision.md`）。
+fn chromium_baseline_kb() -> Result<Option<u64>, String> {
+    support::parse_chromium_baseline_kb(
+        std::env::var_os("CHROMIUM_IDLE_RSS_KB").as_deref(),
+        MAX_CHROMIUM_IDLE_RSS_KB,
+    )
+}
+
 fn main() -> std::process::ExitCode {
     let trials = match trial_count() {
         Ok(trials) => trials,
@@ -171,6 +214,16 @@ fn main() -> std::process::ExitCode {
             // 生成する計測結果 JSON の対象がない。モジュールドキュメントの
             // 終了コード契約（計測結果 JSON を伴う 0/1）とは別に、起動時の
             // 設定エラーとして stderr へ出し非ゼロで終了する。
+            eprintln!("competitor_lightpanda: invalid configuration: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let chromium_idle_rss_kb = match chromium_baseline_kb() {
+        Ok(v) => v,
+        Err(e) => {
+            // trial_count と同じ契約: 計測を一切試みる前の設定エラーとして
+            // JSON を出さず非ゼロで終了する（record.sh 側が「不正な基準値では
+            // 履歴を汚さない」ことをこの終了コードで判定する。TASK-84.2）。
             eprintln!("competitor_lightpanda: invalid configuration: {e}");
             return std::process::ExitCode::FAILURE;
         }
@@ -190,7 +243,7 @@ fn main() -> std::process::ExitCode {
         ),
     ];
 
-    let (body, exit_code) = measure::run_all(&targets, trials);
+    let (body, exit_code) = measure::run_all(&targets, trials, chromium_idle_rss_kb);
 
     // 終了コードを決める前に必ず JSON を出力する（モジュールドキュメントの
     // 終了コード契約参照。呼び出し側が失敗時も結果 JSON を取得できるようにする）。

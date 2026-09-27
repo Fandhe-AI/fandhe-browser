@@ -1864,7 +1864,22 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
 /// `../competitor_lightpanda.rs` の `main`（環境変数から実対象を構築する）と、
 /// `measure_tests.rs` の結合テスト（対象バイナリを模したローカルプロセスを
 /// `targets` に指定する）の両方から呼ぶ、計測の唯一のエントリポイント。
-pub fn run_all(targets: &[Target], trials: usize) -> (String, u8) {
+///
+/// `chromium_idle_rss_kb`: `CHROMIUM_IDLE_RSS_KB`（`main` が
+/// [`crate::support::parse_chromium_baseline_kb`] で解析済み）由来の
+/// Chromium ヘッドレス 1 インスタンス（プロセスツリー全体）のアイドル RSS
+/// 基準値（KB）。`None`（未設定）なら各対象の結果 JSON の `"perf6"` は
+/// `skipped` になる（TASK-84.2・Issue #212）。各対象の `idleRssKb` と
+/// この基準値から [`crate::support::perf6_comparison`]（純粋関数。
+/// `PERF-6` 目標値は [`crate::support::PERF6_TARGET_PCT`]）が判定した結果を
+/// `"perf6"` として添える。`below_target`（目標未達）は計測結果の一種であり
+/// 計測失敗ではないため、[`bench_exit_code`] の判定対象には含めない
+/// （`../competitor_lightpanda.rs` モジュールドキュメントの終了コード契約参照）。
+pub fn run_all(
+    targets: &[Target],
+    trials: usize,
+    chromium_idle_rss_kb: Option<u64>,
+) -> (String, u8) {
     // `AISNAP-1` 計測は外部
     // URL を一切使わず、ここで起動するローカル fixture サーバーだけを
     // 対象にする（モジュールドキュメント参照）。両方の `target` で
@@ -1931,6 +1946,18 @@ pub fn run_all(targets: &[Target], trials: usize) -> (String, u8) {
         };
         eprintln!("token reduction (%): {}", token_reduction.to_json());
 
+        // `PERF-6` 目標（Chromium 比 85% 以上のアイドル RSS 削減。
+        // `crate::support::PERF6_TARGET_PCT`）との比較（TASK-84.2・Issue #212）。
+        // 判定対象は `idle_rss`（この対象のアイドル RSS 計測結果）そのもの
+        // であり、`bench_exit_code` の判定対象には含めない（`perf6_comparison`
+        // ドキュメント参照）。
+        let perf6 = crate::support::perf6_comparison(
+            chromium_idle_rss_kb,
+            &idle_rss,
+            crate::support::PERF6_TARGET_PCT,
+        );
+        eprintln!("PERF-6 comparison: {perf6}");
+
         // `sitesCount`: `tokenReductionPct` の対象として構成されている
         // fixture の件数（`support::FIXTURE_TABLE` は記事・一覧・フォームの
         // 3 類型のみ）。計測の成否とは独立の値であり、`tokenReductionPct` が
@@ -1940,13 +1967,14 @@ pub fn run_all(targets: &[Target], trials: usize) -> (String, u8) {
         // `tokenReductionPct` を PoC-13 の実測値と直接比較しないことを
         // 結果からも判別できるようにする（モジュールドキュメント参照）。
         body.push_str(&format!(
-            "  \"{}\": {{\"binarySizeBytes\":{},\"coldStartMs\":{},\"idleRssKb\":{},\"tokenReductionPct\":{},\"sitesCount\":{}}}",
+            "  \"{}\": {{\"binarySizeBytes\":{},\"coldStartMs\":{},\"idleRssKb\":{},\"tokenReductionPct\":{},\"sitesCount\":{},\"perf6\":{}}}",
             json_escape(target.name),
             binary_size.to_json(),
             cold_start.to_json(),
             idle_rss.to_json(),
             token_reduction.to_json(),
             crate::support::FIXTURE_TABLE.len(),
+            perf6,
         ));
         if i + 1 < targets.len() {
             body.push(',');

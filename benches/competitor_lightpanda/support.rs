@@ -82,6 +82,143 @@ pub fn reduction_pct(baseline: f64, value: f64) -> Option<f64> {
     Some((1.0 - value / baseline) * 100.0)
 }
 
+/// `PERF-6` の確定目標値（Chromium 比 85% 以上のアイドル RSS 削減）。
+/// 判断記録: `docs/design/perf-6-decision.md`（参考実測値は PoC-9 の 92.3%）。
+/// TASK-84（84.2）・Issue #212 でこの目標値との比較を [`perf6_comparison`] が
+/// 計算し、`competitor_lightpanda.rs`（`main`）の結果 JSON へ `"perf6"` として
+/// 添える。`measure.rs` の `run_all` がこの定数を直接参照して
+/// `perf6_comparison` を呼ぶため、`competitor_lightpanda`（`[[bench]]`）・
+/// `competitor_lightpanda_measure`（`[[test]]`。`measure.rs` を含む）の
+/// 両方から到達するが、`competitor_lightpanda_support`（support.rs 単体を
+/// コンパイルし `measure.rs` を含まない `[[test]]`）では本ファイル末尾の
+/// 単体テストからのみ到達するため、[`split_args`] と同じ理由で
+/// `#[allow(dead_code)]` を付ける。
+#[allow(dead_code)]
+pub const PERF6_TARGET_PCT: f64 = 85.0;
+
+/// `CHROMIUM_IDLE_RSS_KB`（外部入力）の生の値を Chromium 基準値（KB）へ
+/// 解決する純粋関数（`competitor_lightpanda.rs` の `main` から呼ばれる。
+/// [`parse_trial_count`] と同じ理由で `std::env` に触れない形にする）。
+///
+/// 未設定（`raw` が `None`）は `Ok(None)`（[`perf6_comparison`] 側が
+/// `"skipped"` を返す）。設定されているのに解決できない場合（非 UTF-8・
+/// 空文字列・非数値・符号付き・小数・`0`・`max` 超過）は黙って `None` へ
+/// フォールバックせず `Err` にする（[`parse_trial_count`] と同じ
+/// fail-closed 方針。coding-rust.md「外部入力の経路では明示的に処理する」）。
+/// `max` には 100GiB 相当（`104_857_600` KB）を渡す想定で、無制限な巨大
+/// 数値によるオーバーフロー・非現実的な基準値の混入を防ぐ
+/// （coding-rust.md「長さ・件数を上限検証してからアロケーションに使う」の
+/// 精神を数値入力にも適用）。
+///
+/// [`parse_trial_count`] と同じ理由で `#[allow(dead_code)]` を付ける
+/// （`competitor_lightpanda_measure` からは到達不能）。
+#[allow(dead_code)]
+pub fn parse_chromium_baseline_kb(
+    raw: Option<&std::ffi::OsStr>,
+    max: u64,
+) -> Result<Option<u64>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let Some(raw) = raw.to_str() else {
+        return Err("CHROMIUM_IDLE_RSS_KB is not valid UTF-8".to_string());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("CHROMIUM_IDLE_RSS_KB is set but empty".to_string());
+    }
+    // `str::parse::<u64>` は先頭 `+` を許容してしまう（例: "+100"）ため、
+    // 数字以外の文字を含まないことを先に検証する（符号・小数点混入の防止。
+    // [`parse_trial_count`] は `usize::parse` の既定挙動に任せているが、
+    // ここでは基準値という性質上、より厳格な形式検証を行う）。
+    if !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "CHROMIUM_IDLE_RSS_KB ({trimmed:?}) is not a valid unsigned integer"
+        ));
+    }
+    let n: u64 = trimmed
+        .parse()
+        .map_err(|_| format!("CHROMIUM_IDLE_RSS_KB ({trimmed:?}) is not a valid integer"))?;
+    if n == 0 {
+        return Err("CHROMIUM_IDLE_RSS_KB must be greater than 0".to_string());
+    }
+    if n > max {
+        return Err(format!("CHROMIUM_IDLE_RSS_KB ({n}) must be at most {max}"));
+    }
+    Ok(Some(n))
+}
+
+/// アイドル RSS の計測結果（[`Outcome`]）と Chromium 基準値（KB）から、
+/// `PERF-6`（Chromium 比 85% 以上のアイドル RSS 削減）目標との比較を
+/// `{"status":...}` 形式の JSON 断片として返す（`measure.rs` の `run_all` が
+/// 各対象の結果へ `"perf6"` として添える。[`Outcome::to_json`] と同じ
+/// 手書きシリアライズ方針）。
+///
+/// - 基準値が `None`（`CHROMIUM_IDLE_RSS_KB` 未設定）:
+///   `{"status":"skipped","reason":"CHROMIUM_IDLE_RSS_KB not set"}`
+/// - `idle_rss` が `Outcome::Value` かつ基準値ありのとき: 削減率
+///   （[`reduction_pct`]）を計算し、`target_pct` 以上なら `"met"`、
+///   未満なら `"below_target"` にする（削減率が計算できない
+///   ―― `reduction_pct` が `None` を返す状況は基準値・実測値がともに
+///   ここでは正当な `u64`/正の `f64` であり理論上起こらないが、内部不変条件が
+///   崩れた場合でも panic せず `"error"` にする。coding-rust.md「外部入力の
+///   経路では unwrap を使わず明示的に処理する」の精神を内部不変条件にも
+///   適用する方針は同ファイルの `run_all` コメントに合わせる）
+/// - `idle_rss` が `Outcome::Skipped`/`Outcome::Unsupported`/`Outcome::Error`
+///   のとき: 判定不能のためその `status`・理由をそのまま引き継ぐ（`met`/
+///   `below_target` は「実際に計測できた」ときの結果であり、計測できな
+///   かった場合まで `below_target` にすると「計測は失敗したが目標未達だった」
+///   という誤った含意になるため区別する）
+///
+/// `below_target` は計測結果の一種であり計測失敗ではないため、この関数の
+/// 戻り値は `bench_exit_code`（終了コード契約）の判定対象に含めない
+/// （`competitor_lightpanda.rs` モジュールドキュメント参照）。
+///
+/// [`PERF6_TARGET_PCT`] と同じ理由（`measure.rs` の `run_all` から到達する
+/// ため `competitor_lightpanda`・`competitor_lightpanda_measure` では
+/// dead code にならないが、`competitor_lightpanda_support` では本ファイル
+/// 末尾の単体テストからのみ到達する）で `#[allow(dead_code)]` を付ける。
+#[allow(dead_code)]
+pub fn perf6_comparison(baseline_kb: Option<u64>, idle_rss: &Outcome, target_pct: f64) -> String {
+    let Some(baseline_kb) = baseline_kb else {
+        return "{\"status\":\"skipped\",\"reason\":\"CHROMIUM_IDLE_RSS_KB not set\"}".to_string();
+    };
+    match idle_rss {
+        Outcome::Value(value) => match reduction_pct(baseline_kb as f64, *value) {
+            Some(pct) => {
+                let verdict = if pct >= target_pct {
+                    "met"
+                } else {
+                    "below_target"
+                };
+                format!(
+                    "{{\"status\":\"measured\",\"baselineKb\":{baseline_kb},\"reductionPct\":{pct},\"targetPct\":{target_pct},\"verdict\":\"{verdict}\"}}"
+                )
+            }
+            None => "{\"status\":\"error\",\"reason\":\"could not compute reduction percentage\"}"
+                .to_string(),
+        },
+        Outcome::Skipped(reason) => {
+            format!(
+                "{{\"status\":\"skipped\",\"reason\":\"{}\"}}",
+                json_escape(reason)
+            )
+        }
+        Outcome::Unsupported(reason) => {
+            format!(
+                "{{\"status\":\"unsupported\",\"reason\":\"{}\"}}",
+                json_escape(reason)
+            )
+        }
+        Outcome::Error(reason) => {
+            format!(
+                "{{\"status\":\"error\",\"reason\":\"{}\"}}",
+                json_escape(reason)
+            )
+        }
+    }
+}
+
 /// 文字数から近似トークン数を見積もる（`ceil(chars / 4)`）。
 ///
 /// `AISNAP-1` のトークン削減率計測で使う近似式（PoC-1 の `measure-chromium` と
@@ -1673,6 +1810,168 @@ mod tests {
     #[test]
     fn reduction_pct_negative_baseline_is_none() {
         assert_eq!(reduction_pct(-1.0, 20.0), None);
+    }
+
+    // PERF-6（TASK-84.2・Issue #212）: `CHROMIUM_IDLE_RSS_KB` の解析。
+    // [`parse_trial_count`] のテストと同じ形式（fail-closed の各分岐を
+    // 具体値で確認する）。
+
+    #[test]
+    fn parse_chromium_baseline_kb_absent_is_none() {
+        assert_eq!(parse_chromium_baseline_kb(None, 100), Ok(None));
+    }
+
+    #[test]
+    fn parse_chromium_baseline_kb_valid_value() {
+        let raw = std::ffi::OsString::from("81306");
+        assert_eq!(
+            parse_chromium_baseline_kb(Some(&raw), 104_857_600),
+            Ok(Some(81306))
+        );
+    }
+
+    #[test]
+    fn parse_chromium_baseline_kb_empty_is_an_error() {
+        let raw = std::ffi::OsString::from("");
+        assert_eq!(
+            parse_chromium_baseline_kb(Some(&raw), 100),
+            Err("CHROMIUM_IDLE_RSS_KB is set but empty".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_chromium_baseline_kb_zero_is_an_error() {
+        let raw = std::ffi::OsString::from("0");
+        assert_eq!(
+            parse_chromium_baseline_kb(Some(&raw), 100),
+            Err("CHROMIUM_IDLE_RSS_KB must be greater than 0".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_chromium_baseline_kb_above_max_is_an_error() {
+        let raw = std::ffi::OsString::from("200");
+        assert_eq!(
+            parse_chromium_baseline_kb(Some(&raw), 100),
+            Err("CHROMIUM_IDLE_RSS_KB (200) must be at most 100".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_chromium_baseline_kb_negative_sign_is_rejected() {
+        let raw = std::ffi::OsString::from("-5");
+        assert_eq!(
+            parse_chromium_baseline_kb(Some(&raw), 100),
+            Err("CHROMIUM_IDLE_RSS_KB (\"-5\") is not a valid unsigned integer".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_chromium_baseline_kb_leading_plus_is_rejected() {
+        // `u64::parse` は先頭 `+` を許すため、数字以外の文字を先に弾く検証が
+        // 無いと "+100" が 100 として通ってしまう（意図しない入力形式の
+        // サイレント受理を防ぐ）。
+        let raw = std::ffi::OsString::from("+100");
+        assert_eq!(
+            parse_chromium_baseline_kb(Some(&raw), 100),
+            Err("CHROMIUM_IDLE_RSS_KB (\"+100\") is not a valid unsigned integer".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_chromium_baseline_kb_decimal_is_rejected() {
+        let raw = std::ffi::OsString::from("1.5");
+        assert_eq!(
+            parse_chromium_baseline_kb(Some(&raw), 100),
+            Err("CHROMIUM_IDLE_RSS_KB (\"1.5\") is not a valid unsigned integer".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_chromium_baseline_kb_non_numeric_is_an_error() {
+        let raw = std::ffi::OsString::from("abc");
+        assert_eq!(
+            parse_chromium_baseline_kb(Some(&raw), 100),
+            Err("CHROMIUM_IDLE_RSS_KB (\"abc\") is not a valid unsigned integer".to_string())
+        );
+    }
+
+    // PERF-6 目標比較（[`perf6_comparison`]）。基準値・実測値は丸めた値を選び、
+    // 浮動小数点の表示差異（末尾の `.0` 有無）が具体値比較に混入しないように
+    // する（`85.0` は Rust の `{}` フォーマットで `85` と表示される）。
+
+    #[test]
+    fn perf6_comparison_baseline_missing_is_skipped() {
+        assert_eq!(
+            perf6_comparison(None, &Outcome::Value(100.0), PERF6_TARGET_PCT),
+            r#"{"status":"skipped","reason":"CHROMIUM_IDLE_RSS_KB not set"}"#
+        );
+    }
+
+    #[test]
+    fn perf6_comparison_below_target() {
+        // (1 - 850/1000) * 100 = 15.000000000000002（浮動小数点演算の丸め
+        // 誤差。`reduction_pct` の実装をそのまま反映する）< 85.0 → below_target
+        assert_eq!(
+            perf6_comparison(Some(1000), &Outcome::Value(850.0), PERF6_TARGET_PCT),
+            r#"{"status":"measured","baselineKb":1000,"reductionPct":15.000000000000002,"targetPct":85,"verdict":"below_target"}"#
+        );
+    }
+
+    #[test]
+    fn perf6_comparison_met() {
+        // (1 - 100/1000) * 100 = 90.0 >= 85.0 → met
+        assert_eq!(
+            perf6_comparison(Some(1000), &Outcome::Value(100.0), PERF6_TARGET_PCT),
+            r#"{"status":"measured","baselineKb":1000,"reductionPct":90,"targetPct":85,"verdict":"met"}"#
+        );
+    }
+
+    #[test]
+    fn perf6_comparison_exact_boundary_is_met() {
+        // (1 - 150/1000) * 100 = 85.0 == 85.0 → met（境界はちょうど合格）
+        assert_eq!(
+            perf6_comparison(Some(1000), &Outcome::Value(150.0), PERF6_TARGET_PCT),
+            r#"{"status":"measured","baselineKb":1000,"reductionPct":85,"targetPct":85,"verdict":"met"}"#
+        );
+    }
+
+    #[test]
+    fn perf6_comparison_unsupported_is_passed_through() {
+        assert_eq!(
+            perf6_comparison(
+                Some(1000),
+                &Outcome::Unsupported(
+                    "idle RSS measurement is not supported on Windows".to_string()
+                ),
+                PERF6_TARGET_PCT
+            ),
+            r#"{"status":"unsupported","reason":"idle RSS measurement is not supported on Windows"}"#
+        );
+    }
+
+    #[test]
+    fn perf6_comparison_skipped_rss_is_passed_through() {
+        assert_eq!(
+            perf6_comparison(
+                Some(1000),
+                &Outcome::Skipped("FANDHE_BROWSER_BIN not set".to_string()),
+                PERF6_TARGET_PCT
+            ),
+            r#"{"status":"skipped","reason":"FANDHE_BROWSER_BIN not set"}"#
+        );
+    }
+
+    #[test]
+    fn perf6_comparison_error_rss_is_passed_through() {
+        assert_eq!(
+            perf6_comparison(
+                Some(1000),
+                &Outcome::Error("failed to launch target binary".to_string()),
+                PERF6_TARGET_PCT
+            ),
+            r#"{"status":"error","reason":"failed to launch target binary"}"#
+        );
     }
 
     // AISNAP-1: approx_tokens はトークン削減率計測の近似式。
