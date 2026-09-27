@@ -165,33 +165,43 @@ const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
 /// Reached heap limit`）させることを確認した。
 ///
 /// そこで [`near_heap_limit_callback`] は、呼ばれるたびに必ず
-/// [`HEAP_LIMIT_EMERGENCY_HEADROOM_BYTES`] という大きな固定量を無条件に
-/// 加える。無制限なメモリ確保（OWASP A04）が起きない根拠は主に、V8 自身が
-/// 持つ単発確保の絶対上限である: `String`/`Array` は V8 内部の最大長を
-/// 超えると確保自体が `RangeError` になり、コールバックが呼ばれ続ける
-/// 状況そのものが終わる。加えて、`Heap::InvokeNearHeapLimitCallback` は
-/// コールバックの戻り値を `std::min(heap_limit,
-/// kAllocatorLimitOnMaxOldGenerationSize)` でクランプするため（`heap.h`）、
-/// 本定数が返す値の大きさそのものが実際の一時的なメモリ上限を無制限に
-/// するわけではない。ただしこのクランプ値
-/// （`Heap::kAllocatorLimitOnMaxOldGenerationSize`）は
-/// `V8_COMPRESS_POINTERS`（ポインタ圧縮）が有効なビルドでのみケージ
-/// サイズに固定され、無効なビルドでは `size_t` の最大値（実質クランプ
-/// なし）になる。本 crate が使う prebuilt な `v8` crate（`=152.2.0`）の
-/// ビルド構成でポインタ圧縮が有効かどうかは確認していないため、この
-/// クランプは「効いていれば追加の安全弁になる」という補助的な根拠に
-/// 留め、主たる抑止根拠としては扱わない。`terminate_execution` の
-/// 打ち切りは、この一時的な超過が収まったうえで次の割り込みチェック
-/// ポイントに到達した時点で効く。
+/// [`HEAP_LIMIT_EMERGENCY_HEADROOM_BYTES`] という固定量を無条件に加える。
+/// 無制限なメモリ確保（OWASP A04）が起きない根拠は、V8 自身が持つ単発
+/// 確保の絶対上限である。`String`/`Array` は V8 内部の最大長を超えると
+/// 確保自体が `RangeError` になり、コールバックが呼ばれ続ける状況そのもの
+/// が終わる（この最大長から [`HEAP_LIMIT_EMERGENCY_HEADROOM_BYTES`] の
+/// 値を導いている。詳細は同定数のドキュメントコメントを参照）。
+/// `terminate_execution` の打ち切りは、この一時的な超過が収まったうえで
+/// 次の割り込みチェックポイントに到達した時点で効く。
+///
+/// # 実効的なメモリ上限（具体値。ユーザー承認: 「V8 の最大オブジェクト長で
+/// 上限を決める」案）
+///
+/// 通常時のヒープ上限は本定数（既定 128 MiB）だが、[`near_heap_limit_callback`]
+/// が 1 回発火するたびに一時的に [`HEAP_LIMIT_EMERGENCY_HEADROOM_BYTES`]
+/// （2 GiB）だけ上限が広がる。1 回の「割り込みチェックを挟まない単発の
+/// 確保」に対して V8 が近接コールバックを呼ぶ機会は、1 回の GC シリーズ
+/// あたり高々 2 回（上記「上限を広げる量に累積の上限を設けない理由」の
+/// 冒頭の項目を参照）であるため、単発の確保 1 回あたりの実効的な一時
+/// 上限は **128 MiB + 2 GiB × 2 = 4,224 MiB（約 4.125 GiB）に収まる**。
+/// [`HEAP_LIMIT_EMERGENCY_HEADROOM_BYTES`] は V8 の単発確保の絶対上限
+/// （2 進の `FixedDoubleArray` で 1 GiB）の 2 倍であるため、V8 が受け付け
+/// うるどの単発確保（1 回の `Array.prototype.fill`・文字列連結等）に
+/// 対しても、1 回の発火で確保に十分な上限を必ず供給できる。
 ///
 /// # 残る既知の制限（実装済みを装わない。REPAIR-3）
 ///
-/// - 一時的な超過が収まる範囲は「次の割り込みチェックポイントまでに
-///   実行される個々の確保それぞれ」であり、その合計ではない。単発の
-///   確保 1 回あたりは上記の V8 組み込み上限に収まるが、割り込み検査を
-///   挟まずに複数回の大きな確保を連続して行うコード（例: 1 つの式の中で
-///   複数の大きな配列を確保する）に対しては、次の割り込みチェック
-///   ポイントに到達するまでの間に確保される合計量はその回数分だけ増える
+/// - 上記の「単発の確保 1 回あたり」という頭打ちは、1 つの JS 文の中で
+///   割り込みチェックを挟まずに**複数回**の大きな確保を連続して行う
+///   コード（例: `var a = big(); var b = big(); var c = big();` の
+///   ように、個々の代入文の間には通常の割り込みチェックが挟まる想定だが、
+///   1 つの式の中で `[big(), big(), big()]` のように並べる、または
+///   ループの 1 反復の中で複数回確保するなど）に対しては理論上の頭打ちを
+///   示せていない（正直に書く。REPAIR-3）。次の割り込みチェックポイント
+///   に到達するまでの間に確保される合計量は、そのような確保の回数分だけ
+///   際限なく増えうる。この残存リスクは、[`MAX_SCRIPT_SOURCE_BYTES`]
+///   による入力サイズ上限（1 回の評価で書けるコード量そのものの上限）が
+///   間接的な緩和策になる
 /// - 上限復元（`remove_near_heap_limit_callback` → 再登録）は
 ///   [`V8Engine::evaluate_script`] の呼び出しが正常に戻ってきた場合にのみ
 ///   行われる
@@ -216,20 +226,36 @@ const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
 const MAX_ISOLATE_HEAP_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
 
 /// [`near_heap_limit_callback`] が呼ばれるたびに無条件で加える、上限の
-/// 広げ幅（バイト。Issue #508・codex 再指摘 P0 対応）。
+/// 広げ幅（バイト。Issue #508・codex 再指摘 P0 対応。ユーザー承認: 「V8
+/// の最大オブジェクト長で上限を決める」案）。
 ///
 /// `MAX_ISOLATE_HEAP_BYTES` のドキュメントコメント「上限を広げる量に
 /// 累積の上限を設けない理由」に書いたとおり、V8 は単発の巨大確保に対して
 /// コールバックを呼ぶ機会を高々 1〜2 回しか与えないため、1 回あたりの
-/// 広げ幅は「たいていの単発確保を 1 回で確実にカバーできる」だけの
-/// 大きさが必要である。1 TiB という値自体に特別な意味はなく、
-/// [`near_heap_limit_callback`] のドキュメントコメントに書いた
-/// `Heap::kAllocatorLimitOnMaxOldGenerationSize` によるクランプ（効いて
-/// いる場合）や V8 組み込みの `String`/`Array` 最大長比べて十分大きい値を
-/// 選んでいる。実機検証（`v8_engine::tests::js_1_v8_single_huge_allocation_does_not_abort_process`。
+/// 広げ幅は「V8 が受け付けうる単発確保 1 回の最大量を 1 回で確実に
+/// カバーできる」だけの大きさが必要である。推測ではなく、使用している
+/// `v8` crate（`=152.2.0`）に同梱される V8 のソースで確認した、次の
+/// 2 つの「V8 上のヒープオブジェクト 1 個が取りうる最大バイト数」を比較
+/// して大きい方を採用する:
+///
+/// - two-byte `String`（`v8::String::kMaxLength`。
+///   `v8/include/v8-primitive.h` 129〜130 行。64-bit ビルドでは
+///   `(1 << 29) - 24` = 536,870,888 文字）× 2 バイト（UTF-16 コード
+///   単位）= 1,073,741,776 バイト
+/// - `FixedDoubleArray`（`v8::internal::kMaxFixedArrayCapacity`。
+///   `v8/src/objects/fixed-array-base.h` 22〜23 行。
+///   `128 * 1024 * 1024` = 134,217,728 要素）× 8 バイト（倍精度浮動
+///   小数点数 1 個）= 1,073,741,824 バイト（ちょうど 1 GiB）
+///
+/// 後者（`FixedDoubleArray`）がわずかに大きい。この 1 GiB
+/// （1,073,741,824 バイト）に、GC・V8 内部処理が使う余裕として同じ量を
+/// 加えた 2 GiB を採用する（余裕の 1 GiB という配分自体に理論的根拠は
+/// ない。実機検証で十分だったことのみ確認済み）。
+///
+/// 実機検証（`v8_engine::tests::js_1_v8_single_huge_allocation_does_not_abort_process`。
 /// テスト用ヒープ上限 16 MiB・単発 80 MiB 相当の確保）では、この値で
 /// abort せずに `Err` を返せることを確認済み。
-const HEAP_LIMIT_EMERGENCY_HEADROOM_BYTES: usize = 1 << 40; // 1 TiB
+const HEAP_LIMIT_EMERGENCY_HEADROOM_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 /// [`value_to_js_value`] が文字列型の評価結果を [`JsValue::String`] へ
 /// 変換する際に許容する最大文字数（UTF-16 コード単位。`v8::String::length`
@@ -1523,8 +1549,7 @@ mod tests {
             .expect("no other V8Engine is active on this thread");
 
         // 80 MiB 相当の単発確保（doubles の配列。テスト用ヒープ上限
-        // （16 MiB）＋旧実装の累積成長上限（32 MiB）の合計＝48 MiB を
-        // 上回るサイズにし、かつテストを高速に保つため必要最小限の
+        // （16 MiB）を上回りつつ、テストを高速に保つため必要最小限の
         // 大きさに抑える。`.fill` は 1 回のネイティブ呼び出しの中で完結
         // し、JS バイトコードの割り込みチェックポイントを経由しないため、
         // `terminate_execution` が打ち切りを効かせられるのは呼び出しが
@@ -1547,6 +1572,111 @@ mod tests {
         let result = engine
             .evaluate_script("40 + 2", &EvaluateOptions::default())
             .expect("engine must remain usable after a single huge allocation is rejected");
+        assert_eq!(result, JsValue::Number(42.0));
+    }
+
+    /// JS-1・`TASK-29`・Issue #508 の回帰確認（codex 再指摘 P0 対応。ヒープ
+    /// 上限を V8 の最大オブジェクト長由来の固定値へ変更した後の検証）:
+    /// `near_heap_limit_callback` が単発確保に対して呼ばれる回数分
+    /// （高々 2 回）で確保できる上限
+    /// （[`MAX_ISOLATE_HEAP_BYTES`] のドキュメントコメント「実効的な
+    /// メモリ上限」参照）を実際に超える単発確保でも、プロセスが abort
+    /// せず [`JsEngineError::ResourceLimitExceeded`] を返すこと。
+    #[test]
+    fn js_1_v8_single_huge_allocation_within_effective_ceiling_does_not_abort_process() {
+        const TEST_HEAP_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+        let mut engine = V8Engine::new_with_heap_limit_for_test(TEST_HEAP_LIMIT_BYTES)
+            .expect("no other V8Engine is active on this thread");
+
+        // V8 が受け付けうる単発確保の絶対上限（`FixedDoubleArray` の
+        // 最大長ちょうど。134,217,728 要素 × 8 バイト = 1 GiB）での確保。
+        // [`HEAP_LIMIT_EMERGENCY_HEADROOM_BYTES`]（2 GiB）は 1 回の発火
+        // でこの量を十分にカバーする設計であることを、実機で確認する。
+        let script = "new Array(134217728).fill(1.5)";
+        match engine.evaluate_script(script, &EvaluateOptions::default()) {
+            Err(JsEngineError::ResourceLimitExceeded(_)) => {}
+            other => panic!(
+                "expected ResourceLimitExceeded for an allocation at V8's max single-object \
+                 size, got: {other:?}"
+            ),
+        }
+
+        // 到達したヒープサイズが、実効的な一時上限（`MAX_ISOLATE_HEAP_BYTES`
+        // のドキュメントコメント「実効的なメモリ上限」参照。単発確保
+        // 1 回あたり 128 MiB + 2 GiB × 2 = 4,224 MiB）の範囲に収まって
+        // いること。`total_heap_size` は GC の実行状況で変動しうるため、
+        // 上限には余裕を持たせる（本テストは 16 MiB のテスト用上限を使う
+        // ため、実効的な上限も 16 MiB + 2 GiB × 2 になる）。
+        const EFFECTIVE_CEILING_BYTES: usize =
+            TEST_HEAP_LIMIT_BYTES + HEAP_LIMIT_EMERGENCY_HEADROOM_BYTES * 2;
+        let heap_size = engine.total_heap_size();
+        assert!(
+            heap_size <= EFFECTIVE_CEILING_BYTES,
+            "heap size must stay within the documented effective ceiling: \
+             {heap_size} bytes > {EFFECTIVE_CEILING_BYTES} bytes"
+        );
+
+        // プロセスが生きていて、エンジンが使い続けられること。
+        let result = engine
+            .evaluate_script("40 + 2", &EvaluateOptions::default())
+            .expect("engine must remain usable after a max-sized single allocation is rejected");
+        assert_eq!(result, JsValue::Number(42.0));
+    }
+
+    /// JS-1・`TASK-29`・Issue #508 の回帰確認: V8 の組み込み上限
+    /// （`String::kMaxLength`）を超える文字列確保は、ヒープ上限の設定に
+    /// 関わらず（プロセスをまったく巻き込まずに）常に `RangeError` で
+    /// `EvaluationFailed` になること。この検証はヒープサイズに依存しない
+    /// （`v8::String::kMaxLength` を超える長さの要求はアプリケーション側の
+    /// ヒープ上限を確認する前に拒否される。実機検証で 2 ミリ秒未満で完了
+    /// することを確認済み）。
+    #[test]
+    fn js_1_v8_string_exceeding_max_length_returns_range_error() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        // `String::kMaxLength`（64-bit で 536,870,888 文字）を超える長さ
+        // （2**30 = 1,073,741,824 文字）を要求する。
+        match engine.evaluate_script("'x'.repeat(2**30)", &EvaluateOptions::default()) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert!(
+                    msg.contains("RangeError"),
+                    "expected a RangeError message, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected EvaluationFailed with a RangeError for a string exceeding the max \
+                 length, got: {other:?}"
+            ),
+        }
+
+        let result = engine
+            .evaluate_script("40 + 2", &EvaluateOptions::default())
+            .expect("engine must remain usable after a RangeError");
+        assert_eq!(result, JsValue::Number(42.0));
+    }
+
+    /// JS-1・`TASK-29`・Issue #508 の回帰確認: 配列の最大長（`2**32 - 1`。
+    /// ECMA-262 の仕様上の上限）を超える長さの指定は、ヒープ確保を試みる
+    /// 前に `RangeError` になること。文字列の場合と同様、ヒープサイズに
+    /// 依存しない。
+    #[test]
+    fn js_1_v8_array_exceeding_max_length_returns_range_error() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        match engine.evaluate_script("new Array(2**32)", &EvaluateOptions::default()) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert!(
+                    msg.contains("RangeError"),
+                    "expected a RangeError message, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected EvaluationFailed with a RangeError for an array exceeding the max \
+                 length, got: {other:?}"
+            ),
+        }
+
+        let result = engine
+            .evaluate_script("40 + 2", &EvaluateOptions::default())
+            .expect("engine must remain usable after a RangeError");
         assert_eq!(result, JsValue::Number(42.0));
     }
 
