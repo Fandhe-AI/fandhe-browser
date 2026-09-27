@@ -31,6 +31,7 @@
 //! Context が破棄される場合、メッセージに "context was discarded" を
 //! 含める（security.md「偽装・回避機能の禁止」──状態が失われたことを
 //! 隠さない）。
+//!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
 //! - 子への書き込み（`Evaluate` フレームの送信）は呼び出しスレッドで
@@ -43,11 +44,20 @@
 //!   コメント参照）。OS 側の制限（Linux の RLIMIT_DATA、Windows の
 //!   Job Object）は後続の Issue で扱う
 //! - macOS には子のメモリ使用量を強制する手段が無い
-//! - 子はセキュリティ上のサンドボックスではない。資源（クラッシュ・
-//!   メモリ）の分離だけを提供する
+//! - 子はセキュリティ上のサンドボックスではない。同じユーザー権限で動作し、
+//!   seccomp 等も使わない。得られるのはクラッシュ・メモリの資源分離
+//!   だけである
 //! - stderr の文言（`Fatal JavaScript out of memory`/`Fatal process out
 //!   of memory`）による `ResourceLimitExceeded` の判定はヒューリスティック
 //!   であり、V8 のバージョン更新でメッセージが変われば壊れうる
+//! - [`super::v8_engine`] の `SCRIPT_EXECUTION_TIMEOUT` のドキュメント
+//!   コメントが記す既知の制限（「`v8::Script::compile` 自体は
+//!   `terminate_execution` では打ち切られない場合がある」）は、本モジュール
+//!   の [`EVALUATE_RECV_TIMEOUT`] による強制 `kill`（[`WorkerHandle::drop`]
+//!   と同じ「stdin を閉じる→待つ→kill→wait」の手順は踏まず、応答待ちの
+//!   `recv_timeout` が切れた時点で直ちに `kill` する）で解消される。
+//!   コンパイルがどれだけ長くかかっても、子プロセスごと強制終了できる
+//!   ため、呼び出しスレッドが戻ってこないことはない
 
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
