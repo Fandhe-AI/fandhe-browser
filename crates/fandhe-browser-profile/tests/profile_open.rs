@@ -13,7 +13,7 @@
 
 #![cfg(unix)]
 
-use fandhe_browser_profile::{DataKind, Profile};
+use fandhe_browser_profile::{DataKind, Profile, ProfileError};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -87,8 +87,8 @@ fn prof_1_open_creates_all_data_subdirectories() {
 }
 
 /// PROF-1: 一度 `Profile` を drop してから同じルートへ再度 `open` しても
-/// 成功する（#178 でロックが入っても、2 つのハンドルを同時に持たない本
-/// テストの形は壊れない前提）。
+/// 成功する（`profile.lock` は drop 時にアンロックされるため、2 つの
+/// ハンドルを同時に持たない本テストの形は成立する）。
 #[test]
 fn prof_1_reopen_after_drop_succeeds() {
     let tmp = TempDir::new();
@@ -102,4 +102,33 @@ fn prof_1_reopen_after_drop_succeeds() {
     for kind in DataKind::ALL.iter().copied() {
         assert!(reopened.data_dir(kind).is_dir());
     }
+}
+
+/// 受入基準 1（PROF-1、TASK-50（50.3）・#178）: 同じルートへ二重に `open`
+/// すると、公開 API だけを通して `ProfileError::Locked` が返る。
+#[test]
+fn prof_1_double_open_same_root_returns_locked_error() {
+    let tmp = TempDir::new();
+    let root = tmp.path().join("profile");
+
+    let first = Profile::open(&root).expect("1 回目の open は成功する");
+    let err = Profile::open(&root).expect_err("2 回目の open はロックで失敗する");
+    assert!(matches!(err, ProfileError::Locked { .. }));
+
+    drop(first);
+}
+
+/// PROF-1（TASK-50（50.3）・#178）: ルートが異なれば同時に `open` できる
+/// （`profile.lock` はルートごとに独立している）。
+#[test]
+fn prof_1_open_different_roots_concurrently_succeeds() {
+    let tmp = TempDir::new();
+    let root_a = tmp.path().join("profile-a");
+    let root_b = tmp.path().join("profile-b");
+
+    let profile_a = Profile::open(&root_a).expect("profile-a の open は成功する");
+    let profile_b = Profile::open(&root_b).expect("profile-b の open は成功する");
+
+    assert_eq!(profile_a.root(), root_a.as_path());
+    assert_eq!(profile_b.root(), root_b.as_path());
 }

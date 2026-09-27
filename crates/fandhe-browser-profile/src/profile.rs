@@ -13,8 +13,6 @@
 //! 差し込む契約であり、本モジュールは実装済みを装わない（REPAIR-3・
 //! code-comment-style.md）。
 //!
-//! - `profile.lock`（`std::fs::File::try_lock`）による二重 open の拒否
-//!   （`PROF-1`、TASK-50（50.3）・#178。#175 の決定により `fs2` は使わない）
 //! - プロファイル削除処理（`PROF-5`、TASK-53）
 //! - 並行アクセス時のデータ分離（`PROF-2`・`PROF-3`、TASK-51・TASK-52）
 //! - Windows での ACL によるアクセス制限（`XOS-7`〜`XOS-10`）。実装がないため
@@ -25,8 +23,11 @@
 //!   ハンドル相対（`FILE_FLAG_OPEN_REPARSE_POINT` 等）で作成する要件を
 //!   引き継ぐ（REPAIR-3）
 //!
-//! 上記が未実装のため、`Profile::open` は同一プロファイルへの二重 open を
-//! 拒否しない（#178 で解消するまでの既知の制約）。
+//! `Profile::open` はルート直下の `profile.lock` に advisory lock を取ることで
+//! 同一プロファイルへの二重 open を拒否する（`PROF-1`、TASK-50（50.3）・#178。
+//! ロック処理本体は本モジュールから分離した [`crate::lock`] を参照。#175 の
+//! 決定により `fs2` 等の追加依存は使わず、std の `File::try_lock` のみで
+//! 実装する）。
 //!
 //! [`assert_within_root`] は字句判定のみで、`canonicalize`・`exists` 等で
 //! ファイルシステムに対して再解決しない（[`assert_within_root`] の doc
@@ -75,13 +76,17 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 // 限定すると Windows ビルドで未使用（`-D warnings`）になる。
 use std::path::Component;
 
+#[cfg(unix)]
+use crate::lock::{self, LOCK_FILE_NAME};
+
 /// プロファイルディレクトリ構築に失敗した際のエラー。
 ///
 /// `fandhe-browser-core::error::Error` と同様、自前で `Display`・
 /// `std::error::Error`・`From<io::Error>` を実装する（`thiserror` 等の
 /// 外部依存は追加しない。dependency-policy.md）。`#[non_exhaustive]` により、
-/// ロック（#178）が新規バリアントを追加しても非破壊にする（REPAIR-4）。
-/// `InvalidComponent`・`OutsideRoot`（`PROF-4`、TASK-50（50.2）・#177）は
+/// `assert_within_root`（#177）・ロック（#178）が新規バリアントを追加しても
+/// 非破壊にする（REPAIR-4）。`InvalidComponent`・`OutsideRoot`（`PROF-4`、
+/// TASK-50（50.2）・#177）・`Locked`（`PROF-1`、TASK-50（50.3）・#178）は
 /// 本バージョンで追加済み。
 #[derive(Debug)]
 #[non_exhaustive]
@@ -117,6 +122,14 @@ pub enum ProfileError {
     Unsupported {
         /// 未対応の理由を示す英語メッセージ。
         reason: &'static str,
+    },
+    /// 別の `Profile`（同一プロセスの別インスタンス、または別プロセス）が
+    /// 既に `profile.lock` を保持しているため `open` を拒否する場合に返す
+    /// （`PROF-1`、TASK-50（50.3）・#178。ロック取得の詳細は [`crate::lock`]
+    /// を参照）。
+    Locked {
+        /// ロックを取得しようとしたパス（`root/profile.lock`）。
+        path: PathBuf,
     },
     /// [`sanitize_component`] がパスコンポーネントとして不正と判定した入力を
     /// 拒否する場合に返す（`PROF-4`、TASK-50（50.2）・#177）。
@@ -156,6 +169,13 @@ impl fmt::Display for ProfileError {
                     "profile isolation unsupported on this platform: {reason}"
                 )
             }
+            ProfileError::Locked { path } => {
+                write!(
+                    f,
+                    "profile is already in use: lock is held on {}",
+                    path.display()
+                )
+            }
             ProfileError::InvalidComponent { reason } => {
                 write!(f, "invalid path component: {reason}")
             }
@@ -177,6 +197,7 @@ impl std::error::Error for ProfileError {
             ProfileError::Io(source) => Some(source),
             ProfileError::InvalidLayout { .. } => None,
             ProfileError::Unsupported { .. } => None,
+            ProfileError::Locked { .. } => None,
             ProfileError::InvalidComponent { .. } => None,
             ProfileError::OutsideRoot { .. } => None,
         }
@@ -417,6 +438,12 @@ pub struct Profile {
     root_fd: OwnedFd,
     #[cfg(unix)]
     data_fds: DataDirFds,
+    // フィールドは宣言順に drop されるため、ロックは他のハンドルより後、
+    // 最後に解放される。一度も読まないため `_` を付けて dead_code を避ける
+    // （`ProfileLock` は `Drop` でアンロックする副作用のためだけに保持する。
+    // PROF-1、TASK-50（50.3）・#178）。
+    #[cfg(unix)]
+    _lock: lock::ProfileLock,
 }
 
 impl Profile {
@@ -433,8 +460,12 @@ impl Profile {
     /// 基点に、その配下で組み立てたパスがルート外を指していないかを
     /// 検証する役割を担う）。
     ///
-    /// まだ `profile.lock` を取らないため、本関数は同一プロファイルへの
-    /// 二重 open を拒否しない（REPAIR-3。#178 で解消する）。
+    /// ルート直下の `profile.lock` に advisory lock（std `File::try_lock`）を
+    /// 取ることで、同一プロファイルへの二重 open を拒否する（`PROF-1`、
+    /// TASK-50（50.3）・#178。ロック取得の詳細は [`crate::lock`] を参照）。
+    /// 副作用として `root/profile.lock`（モード `0o600`）を作成し、`Profile`
+    /// を drop した後もこのファイル自体は残り続ける（unlink しない理由は
+    /// [`crate::lock`] のモジュール doc を参照）。
     ///
     /// Windows では現時点で ACL による隔離を実装していないため、常に
     /// [`ProfileError::Unsupported`] を返す（何も作成しない。`XOS-7`〜
@@ -450,6 +481,9 @@ impl Profile {
     ///   symlink、またはディレクトリ以外として存在する場合
     ///   [`ProfileError::InvalidLayout`]（symlink 先のパーミッションを
     ///   変更しないよう、chmod より前に検査する）
+    /// - 既に別の `Profile` が同じルートの `profile.lock` を保持している場合
+    ///   [`ProfileError::Locked`]（この場合データ種別ディレクトリは一切
+    ///   作成・変更しない）
     /// - Windows など ACL 隔離が未実装のプラットフォームでは常に
     ///   [`ProfileError::Unsupported`]
     pub fn open(root: impl AsRef<Path>) -> Result<Profile, ProfileError> {
@@ -491,6 +525,22 @@ impl Profile {
             let root_fd = open_dir_all_verified(&root)?;
             set_dir_permissions_0700(&root_fd)?;
 
+            // ロックファイルはデータ種別ディレクトリを作成する前に取得する。
+            // ロック取得に失敗した（= 既に別の Profile が開いている）2 回目の
+            // opener は、以降の行に到達せずここで返るため、data dir 側には
+            // 一切触れない。ハンドル基準の `open_verified_regular_file` で
+            // 開くため、`root_fd` を検証済みの所有者比較の起点として使う
+            // （symlink・ハードリンク・他ユーザー所有ファイルは拒否する。
+            // security.md「プロファイル境界」）。
+            let lock_display_path = root.join(LOCK_FILE_NAME);
+            let lock_file = open_verified_regular_file(
+                root_fd.as_fd(),
+                root_fd.as_fd(),
+                LOCK_FILE_NAME.as_ref(),
+                lock_display_path.clone(),
+            )?;
+            let profile_lock = lock::try_acquire(lock_file, &lock_display_path)?;
+
             // 4 データ種別のハンドルを開く。`DataDirFds` の各フィールドに
             // 対応させるため、`DataKind::ALL` をループする代わりに 1 種別
             // ずつ明示する（[`DataDirFds`] のフィールド追加をコンパイラに
@@ -512,6 +562,7 @@ impl Profile {
                 root,
                 root_fd,
                 data_fds,
+                _lock: profile_lock,
             })
         }
     }
@@ -630,56 +681,110 @@ impl Profile {
         // 変更した際の回帰を検出する境界検証として維持する）。
         assert_within_root(&self.root, &display_path)?;
 
-        let dir_fd = self.data_dir_fd(kind);
-        // `NONBLOCK` は FIFO 越しの open ブロックを避けるためだけに付ける
-        // （下記で実体確認後に解除する）。
-        let flags =
-            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
-        let create_mode = Mode::RUSR | Mode::WUSR;
-        let owned = rustix::fs::openat(dir_fd, safe_name.as_os_str(), flags, create_mode)
-            .map_err(|err| classify_file_open_error(&display_path, err))?;
-
-        // 実体を確認する。ここで拒否する場合、`owned` はこのスコープを
-        // 抜ける際に drop され、FIFO・デバイス等を握ったまま放置しない。
-        let file_stat = rustix::fs::fstat(&owned).map_err(|err| ProfileError::Io(err.into()))?;
-        if !rustix::fs::FileType::from_raw_mode(file_stat.st_mode).is_file() {
-            return Err(ProfileError::InvalidLayout {
-                path: display_path,
-                reason: "path exists but is not a regular file",
-            });
-        }
-
-        // 所有者を検証済みのプロファイルルートと比較する（`geteuid` の
-        // 代わり。上記 doc 参照）。
-        let root_stat =
-            rustix::fs::fstat(&self.root_fd).map_err(|err| ProfileError::Io(err.into()))?;
-        if file_stat.st_uid != root_stat.st_uid {
-            return Err(ProfileError::InvalidLayout {
-                path: display_path,
-                reason: "file owner does not match the profile root owner",
-            });
-        }
-
-        // ハードリンク経由で境界外の実体へ書き込ませる攻撃を防ぐ。
-        if file_stat.st_nlink != 1 {
-            return Err(ProfileError::InvalidLayout {
-                path: display_path,
-                reason: "file has multiple hard links, refusing to write through a shared inode",
-            });
-        }
-
-        // ここまでの検証を通過した通常ファイルのみパーミッションを締める。
-        rustix::fs::fchmod(&owned, create_mode).map_err(|err| ProfileError::Io(err.into()))?;
-
-        // `NONBLOCK` を解除する（通常ファイルの I/O には影響しないが、
-        // フラグを元の意図どおりに戻しておく）。
-        let current_flags =
-            rustix::fs::fcntl_getfl(&owned).map_err(|err| ProfileError::Io(err.into()))?;
-        rustix::fs::fcntl_setfl(&owned, current_flags.difference(OFlags::NONBLOCK))
-            .map_err(|err| ProfileError::Io(err.into()))?;
-
-        Ok(std::fs::File::from(owned))
+        // 実体の検証・パーミッション締め直しは `open_verified_regular_file`
+        // （#178 で切り出し。ロックファイルの作成と共有する）に委譲する。
+        // 所有者比較の基準は常に検証済みのプロファイルルート（`root_fd`）。
+        open_verified_regular_file(self.data_dir_fd(kind), self.root_fd(), name, display_path)
     }
+}
+
+/// `dir_fd` 配下に `name` という名前の通常ファイルを作成（既存なら開く）し、
+/// 実体を検証したうえでパーミッション `0o600` に締め直す。
+///
+/// [`Profile::create_file_in`]（データ種別ディレクトリ配下のファイル作成）と
+/// [`Profile::open`]（`profile.lock` の作成。#178・TASK-50（50.3））が共有する
+/// ハンドル基準の作成経路。`dir_fd` はこの関数の呼び出し元が既に検証済みの
+/// ディレクトリハンドルであることを前提とし、`owner_fd` はそのファイルの
+/// 所有者が一致すべき基準（通常は [`Profile::root_fd`]、または `profile.lock`
+/// 自身のように `dir_fd` と同じ）を渡す。
+///
+/// `OFlags::NOFOLLOW` により、`name` の位置に symlink が存在する場合は
+/// リンク先を辿らず [`ProfileError::InvalidLayout`] で拒否する（`ELOOP`）。
+/// ディレクトリ（`EISDIR`）や、対象が非ディレクトリを経由しようとした場合
+/// （`ENOTDIR`）も同様に拒否する（PR #437 再レビュー Cursor Low 指摘: `O_RDWR`
+/// でディレクトリを開くと `EISDIR` になり、以前は `InvalidLayout` ではなく
+/// `Io` に分類されていた）。
+///
+/// `openat` には `OFlags::NONBLOCK` を付ける。`name` の位置に FIFO があると、
+/// `NONBLOCK` なしでは相手側が読み書きのため open するまで `openat` 自体が
+/// ブロックし得るため（PR #437 再レビュー Codex P1 指摘）。`NONBLOCK` を
+/// 付けると FIFO の open 自体は（相手側の有無に関わらず）即座に成功する
+/// （`ENXIO` にはならない）ため、成功したハンドルを直後の `fstat` で検査する
+/// 「成功 → 検査 → 拒否」の流れになる。通常ファイルでなければ（FIFO・デバイス・
+/// ソケット等）そのハンドルを閉じて [`ProfileError::InvalidLayout`] で拒否する。
+///
+/// 通常ファイルであることを確認した後、以下も併せて検証し、いずれかに
+/// 該当すれば拒否する（PR #437 再レビュー Codex P0 指摘: 既存ファイルを
+/// 無条件に信用して書き込むとプロファイル分離が成立しない）。
+///
+/// - 所有者 uid が `owner_fd` の所有者と異なる（`geteuid` は rustix の
+///   `process` feature が要り依存を増やすため使わず、検証済みハンドルの
+///   所有者との比較で代替する）
+/// - ハードリンク数（`st_nlink`）が 1 でない（境界外の実体を指すハードリンク
+///   経由で、書き込みが別の場所へも及ぶことを防ぐ）
+///
+/// 検証を通過した通常ファイルのみ、`fchmod` でパーミッションを `0o600` へ
+/// 締め直す（既存ファイルが他ユーザーから読める権限のまま Cookie・ロック
+/// ファイル等を書き込む事故を防ぐ）。最後に `NONBLOCK` を解除する（通常
+/// ファイルの I/O には本来影響しないが、呼び出し元が `fcntl` でフラグを
+/// 確認した際に驚かせないよう、明示的に元へ戻す）。
+///
+/// 戻り値の `File` は独立したハンドルであり、`dir_fd`/`owner_fd` の元になった
+/// 値（`Profile`）を drop した後も有効なまま使い続けられる。
+#[cfg(unix)]
+fn open_verified_regular_file(
+    dir_fd: BorrowedFd<'_>,
+    owner_fd: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+    display_path: PathBuf,
+) -> Result<std::fs::File, ProfileError> {
+    // `NONBLOCK` は FIFO 越しの open ブロックを避けるためだけに付ける
+    // （下記で実体確認後に解除する）。
+    let flags =
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    let create_mode = Mode::RUSR | Mode::WUSR;
+    let owned = rustix::fs::openat(dir_fd, name, flags, create_mode)
+        .map_err(|err| classify_file_open_error(&display_path, err))?;
+
+    // 実体を確認する。ここで拒否する場合、`owned` はこのスコープを
+    // 抜ける際に drop され、FIFO・デバイス等を握ったまま放置しない。
+    let file_stat = rustix::fs::fstat(&owned).map_err(|err| ProfileError::Io(err.into()))?;
+    if !rustix::fs::FileType::from_raw_mode(file_stat.st_mode).is_file() {
+        return Err(ProfileError::InvalidLayout {
+            path: display_path,
+            reason: "path exists but is not a regular file",
+        });
+    }
+
+    // 所有者を検証済みの基準ハンドルと比較する（`geteuid` の代わり。
+    // 上記 doc 参照）。
+    let owner_stat = rustix::fs::fstat(owner_fd).map_err(|err| ProfileError::Io(err.into()))?;
+    if file_stat.st_uid != owner_stat.st_uid {
+        return Err(ProfileError::InvalidLayout {
+            path: display_path,
+            reason: "file owner does not match the profile root owner",
+        });
+    }
+
+    // ハードリンク経由で境界外の実体へ書き込ませる攻撃を防ぐ。
+    if file_stat.st_nlink != 1 {
+        return Err(ProfileError::InvalidLayout {
+            path: display_path,
+            reason: "file has multiple hard links, refusing to write through a shared inode",
+        });
+    }
+
+    // ここまでの検証を通過した通常ファイルのみパーミッションを締める。
+    rustix::fs::fchmod(&owned, create_mode).map_err(|err| ProfileError::Io(err.into()))?;
+
+    // `NONBLOCK` を解除する（通常ファイルの I/O には影響しないが、
+    // フラグを元の意図どおりに戻しておく）。
+    let current_flags =
+        rustix::fs::fcntl_getfl(&owned).map_err(|err| ProfileError::Io(err.into()))?;
+    rustix::fs::fcntl_setfl(&owned, current_flags.difference(OFlags::NONBLOCK))
+        .map_err(|err| ProfileError::Io(err.into()))?;
+
+    Ok(std::fs::File::from(owned))
 }
 
 /// `openat`/`mkdirat` に渡す共通フラグ。既存ディレクトリを開く場合も
@@ -1495,6 +1600,114 @@ mod tests {
 
         assert!(profile.root().is_absolute(), "root が絶対パスでない");
         assert_eq!(profile.root(), expected_root.as_path());
+    }
+
+    /// PROF-1（Unix 固有）: 既に開いている `Profile` があるルートへ再度
+    /// `open` すると `ProfileError::Locked { path }` になり、`path` は
+    /// `root/profile.lock` と一致する（TASK-50（50.3）・#178 の受入基準 1）。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_open_twice_same_root_fails_with_locked() {
+        let tmp = TempDir::new();
+        let root = tmp.path().to_path_buf();
+
+        let first = Profile::open(&root).expect("1 回目の open は成功する");
+        let err = Profile::open(&root).expect_err("2 回目の open は失敗する");
+        assert!(matches!(
+            err,
+            ProfileError::Locked { path } if path == root.join(lock::LOCK_FILE_NAME)
+        ));
+
+        drop(first);
+    }
+
+    /// PROF-1（Unix 固有）: `open` が作成する `profile.lock` は通常ファイルで
+    /// モードが `0o600` である。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_open_creates_lock_file_with_mode_0600() {
+        let tmp = TempDir::new();
+        let profile = Profile::open(tmp.path()).expect("open は成功する");
+
+        let lock_path = tmp.path().join(lock::LOCK_FILE_NAME);
+        let metadata = std::fs::metadata(&lock_path).expect("lock ファイルの metadata 取得");
+        assert!(metadata.is_file(), "profile.lock が通常ファイルでない");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        drop(profile);
+    }
+
+    /// PROF-1（Unix 固有）: `profile.lock` の位置が symlink だと `open` は
+    /// `InvalidLayout` で拒否し、symlink 先には何も作成・変更しない
+    /// （[`open_verified_regular_file`] の `OFlags::NOFOLLOW` の直接確認）。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_open_fails_when_lock_file_is_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new();
+        std::fs::create_dir_all(tmp.path()).expect("ルート作成");
+
+        let external = TempDir::new();
+        let dangling_target = external.path().join("never-created");
+        let lock_path = tmp.path().join(lock::LOCK_FILE_NAME);
+        symlink(&dangling_target, &lock_path).expect("symlink 作成");
+
+        let err = Profile::open(tmp.path()).expect_err("lock ファイルが symlink なら失敗する");
+        assert!(matches!(err, ProfileError::InvalidLayout { .. }));
+        assert!(
+            !dangling_target.exists(),
+            "symlink のリンク先にファイルが作成されてはならない"
+        );
+
+        // ロック取得より前に拒否されるため、データ種別ディレクトリは
+        // 作られていない（`Profile::open` の手順どおり: ロック取得 → data dir
+        // 作成の順であることの確認）。
+        for kind in DataKind::ALL.iter().copied() {
+            assert!(
+                !tmp.path().join(kind.dir_name()).exists(),
+                "{:?} 用ディレクトリが作られてはならない",
+                kind
+            );
+        }
+    }
+
+    /// PROF-1（Unix 固有）: `profile.lock` の位置がディレクトリだと `open` は
+    /// `InvalidLayout` で拒否する（`create_file_in` の
+    /// `prof_1_create_file_in_fails_when_name_is_a_directory` と同型）。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_open_fails_when_lock_file_is_a_directory() {
+        let tmp = TempDir::new();
+        std::fs::create_dir_all(tmp.path()).expect("ルート作成");
+        std::fs::create_dir(tmp.path().join(lock::LOCK_FILE_NAME)).expect("ディレクトリの作成");
+
+        let err = Profile::open(tmp.path()).expect_err("lock がディレクトリなら失敗する");
+        assert!(matches!(err, ProfileError::InvalidLayout { .. }));
+    }
+
+    /// PROF-1（Unix 固有）: 2 回目の `open` がロック取得に失敗した場合、
+    /// 既存のデータ種別ディレクトリを再作成・変更しない（`Profile::open` の
+    /// 手順「ロック取得 → data dir 作成」の順序を、既存ディレクトリを一つ
+    /// 消しておくことで確認する）。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_second_open_does_not_create_data_dirs() {
+        let tmp = TempDir::new();
+        let root = tmp.path().to_path_buf();
+
+        let first = Profile::open(&root).expect("1 回目の open は成功する");
+        let cache_path = root.join(DataKind::Cache.dir_name());
+        std::fs::remove_dir_all(&cache_path).expect("cache ディレクトリの削除");
+
+        let err = Profile::open(&root).expect_err("2 回目の open は失敗する");
+        assert!(matches!(err, ProfileError::Locked { .. }));
+        assert!(
+            !cache_path.exists(),
+            "ロック取得に失敗した場合は data dir を再作成してはならない"
+        );
+
+        drop(first);
     }
 
     /// PROF-1（Windows 固有）: ACL 隔離が未実装のため、`open` は常に

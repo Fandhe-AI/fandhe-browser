@@ -45,9 +45,13 @@ use crate::support::{
     require_bin, token_reduction_gate, validate_mcp_response, wait_with_deadline,
 };
 // `parse_pgrep_pids`・`sum_ps_rss_kb_lines` は unix 専用の
-// `sample_process_group_rss_kb`（下記 `#[cfg(unix)]`）が呼ぶ。無条件 import
-// のままだと Windows ビルドで未使用になり `unused_imports` 警告が
-// `-D warnings`（ci.md「3 OS CI」）で fail するため cfg で分離する。
+// `sample_process_group_rss_kb`（下記 `#[cfg(unix)]`）が呼ぶ。`parse_tasklist_mem_kb`
+// は windows 専用の `sample_rss_kb`（下記 `#[cfg(windows)]`）が呼ぶ。無条件
+// import のままだと反対側の OS ビルドで未使用になり `unused_imports` 警告が
+// `-D warnings`（ci.md「3 OS CI」）で fail するため cfg で分離する
+// （TASK-84.2・TASK-84.5・PERF-6・Issue #212）。
+#[cfg(windows)]
+use crate::support::parse_tasklist_mem_kb;
 #[cfg(unix)]
 use crate::support::{parse_pgrep_pids, sum_ps_rss_kb_lines};
 
@@ -1084,22 +1088,25 @@ pub fn measure_cold_start(target: &Target, trials: usize) -> Outcome {
     }
 }
 
-/// アイドル RSS（`PERF-6`）: 起動して安定させたあと、対象プロセスが属する
-/// プロセスグループ全体（自身 + 子孫）の RSS 合計（KB）を読む。Windows は
-/// `ps`/`pgrep` が無いため `Unsupported` を返す（`measure_idle_rss` 参照。
-/// `parse_pgrep_pids`・`sum_ps_rss_kb_lines` は unix 専用経路でのみ呼ぶ）。
+/// アイドル RSS（`PERF-6`）: 起動して安定させたあと、対象プロセスの RSS
+/// （KB）を読む。unix は対象プロセスが属するプロセスグループ全体
+/// （自身 + 子孫）の RSS 合計、windows は対象プロセス単体のワーキング
+/// セット相当の値を読む（`measure_idle_rss` 参照）。
 ///
-/// TASK-84.2・Issue #212 のレビュー指摘対応: 以前は `guard.0.id()`（直接の
-/// 子プロセス 1 つ）だけを `ps -o rss= -p <pid>` で読んでいたため、対象が
-/// さらに子プロセスを使う実装だと、そのメモリを含めずに `PERF-6` 判定
-/// （`support::perf6_comparison`。基準値は Chromium の**プロセスツリー全体**
-/// のアイドル RSS）へ渡してしまい、実際には目標未達でも `"met"` を誤って
-/// 返し得た。`apply_new_process_group`（`spawn_and_wait_ready` が起動時に
-/// 適用。子プロセス自身を新しいプロセスグループのリーダーにするため、
-/// プロセスグループ ID は子プロセスの PID と一致する）が作るプロセス
-/// グループ全体を対象にすることで、[`kill_process_group`] が子・孫を
-/// まとめて終了できるのと同じ範囲を RSS 計測でも数え上げ、Chromium 側の
-/// 計測範囲（プロセスツリー全体）に揃える。
+/// TASK-84.2・Issue #212 のレビュー指摘対応（unix 側）: 以前は
+/// `guard.0.id()`（直接の子プロセス 1 つ）だけを `ps -o rss= -p <pid>` で
+/// 読んでいたため、対象がさらに子プロセスを使う実装だと、そのメモリを
+/// 含めずに `PERF-6` 判定（`support::perf6_comparison`。基準値は Chromium の
+/// **プロセスツリー全体**のアイドル RSS）へ渡してしまい、実際には目標未達
+/// でも `"met"` を誤って返し得た。`apply_new_process_group`
+/// （`spawn_and_wait_ready` が起動時に適用。子プロセス自身を新しい
+/// プロセスグループのリーダーにするため、プロセスグループ ID は子プロセス
+/// の PID と一致する）が作るプロセスグループ全体を対象にすることで、
+/// [`kill_process_group`] が子・孫をまとめて終了できるのと同じ範囲を RSS
+/// 計測でも数え上げ、Chromium 側の計測範囲（プロセスツリー全体）に揃える。
+/// windows は `tasklist` にプロセスツリー全体を安全に数え上げる標準的な
+/// 手段が無いため（`unsafe`・新規依存を避ける方針。TASK-84.5）、対象
+/// プロセス単体の計測（`sample_rss_kb`・[`parse_tasklist_mem_kb`]）に留める。
 #[cfg(unix)]
 fn sample_process_group_rss_kb(pgid: u32) -> Option<u64> {
     // `pgrep -g <pgid>` の出力は pid の一覧のみで通常数バイト〜数十バイト。
@@ -1153,7 +1160,35 @@ fn sample_process_group_rss_kb(pgid: u32) -> Option<u64> {
     sum_ps_rss_kb_lines(&String::from_utf8_lossy(&ps_stdout))
 }
 
-#[cfg(unix)]
+/// windows 版 `sample_rss_kb`。`tasklist` の標準出力は OEM コードページで
+/// 出るが、[`parse_tasklist_mem_kb`] が使うのは ASCII 数字だけなので
+/// （関数側のコメント参照）、unix 版と同様に `from_utf8_lossy` で十分。
+#[cfg(windows)]
+fn sample_rss_kb(pid: u32) -> Option<u64> {
+    // `tasklist` の CSV 1 行は数百バイト程度に収まる。unix の `ps` 版と
+    // 同じ考え方で無制限確保を避ける上限を設ける
+    // （coding-rust.md「長さ・件数を上限検証」）。
+    const MAX_TASKLIST_OUTPUT_BYTES: usize = 4096;
+    let mut command = Command::new("tasklist");
+    command.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
+    let (status, stdout) = crate::support::run_capturing_output_with_deadline(
+        command,
+        crate::support::EXTERNAL_COMMAND_DEADLINE,
+        MAX_TASKLIST_OUTPUT_BYTES,
+    )
+    .ok()?;
+    if !status.success() {
+        return None;
+    }
+    parse_tasklist_mem_kb(&String::from_utf8_lossy(&stdout), pid)
+}
+
+/// アイドル RSS（`PERF-6`）計測本体。`sample_rss_kb` の OS 差異
+/// （unix: `ps`／Windows: `tasklist`）を吸収した先の共通フロー。
+/// 以前は unix/windows で別関数に分けており、Windows 版は
+/// `target.bin` を確認せず常に `Outcome::Unsupported` を返すバグを持って
+/// いた。`require_bin` による `Skipped`/`Error` の判定を 1 か所に保つため
+/// 1 本の関数へ統合した（TASK-84.5）。
 fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
     let bin = match require_bin(
         target.bin.as_ref(),
@@ -1173,13 +1208,18 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
         match spawn_and_wait_ready(bin, &target.serve_args) {
             Ok((guard, port, _elapsed)) => {
                 std::thread::sleep(Duration::from_millis(500));
-                // `ps`/`pgrep` の失敗（プロセス早期終了・パース不能出力）を
-                // 黙って捨てず即座に Error 化する。`apply_new_process_group`
-                // により対象プロセス自身のプロセスグループ ID は自身の pid と
-                // 一致するため、そのままプロセスグループ全体の RSS 合計
-                // （子孫を含む。PERF-6・Issue #212 のレビュー指摘対応）を読む。
+                // `sample_process_group_rss_kb`/`sample_rss_kb` の失敗
+                // （プロセス早期終了・パース不能出力）を黙って捨てず即座に
+                // Error 化する。unix は `apply_new_process_group` により
+                // 対象プロセス自身のプロセスグループ ID が自身の pid と
+                // 一致することを利用し、そのままプロセスグループ全体の RSS
+                // 合計（子孫を含む。PERF-6・Issue #212 のレビュー指摘対応）
+                // を読む。windows は対象プロセス単体を読む（TASK-84.5）。
                 let pid = guard.0.id();
+                #[cfg(unix)]
                 let rss = sample_process_group_rss_kb(pid);
+                #[cfg(windows)]
+                let rss = sample_rss_kb(pid);
                 // `drop(guard)` は `kill_process_group`/`Child::kill` で
                 // プロセス（グループ）を終了させ、`wait` で完全な終了を
                 // 確認してから返る。その後に再 probe することで、
@@ -1199,7 +1239,7 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
                     Some(rss) => samples.push(rss as f64),
                     None => {
                         return Outcome::Error(format!(
-                            "{}: idle RSS trial failed: process group RSS sampling failed for pgid {pid}",
+                            "{}: idle RSS trial failed: RSS sampling failed for pid {pid}",
                             target.name
                         ));
                     }
@@ -1214,27 +1254,6 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
         Some(v) => Outcome::Value(v),
         None => Outcome::Error(format!("{}: no idle RSS samples", target.name)),
     }
-}
-
-#[cfg(windows)]
-fn measure_idle_rss(target: &Target, _trials: usize) -> Outcome {
-    // `target.bin` を確認せず常に
-    // `Outcome::Unsupported` を返していたため、`<PREFIX>_BIN` が未設定でも
-    // `idleRssKb` だけ `unsupported` になり「対象バイナリ未設定なら全計測が
-    // Skipped」という契約に反していた。他の計測関数（`measure_cold_start`・
-    // `measure_binary_size`・unix 版 `measure_idle_rss`）と同じ判定を
-    // `require_bin`（support.rs。OS に依存しない純粋関数）で先に行う。
-    if let Err(skipped) = require_bin(
-        target.bin.as_ref(),
-        target.bin_error.as_deref(),
-        target.name,
-    ) {
-        return skipped;
-    }
-    Outcome::Unsupported(format!(
-        "{}: idle RSS measurement uses unix `ps`, unsupported on Windows (PERF-6)",
-        target.name
-    ))
 }
 
 /// バイナリサイズ（`PERF-1`）: 対象実行ファイルの `fs::metadata` によるバイト数。

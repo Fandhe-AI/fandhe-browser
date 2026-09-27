@@ -572,11 +572,11 @@ fn fake_target(name: &'static str) -> Target {
 }
 
 /// ケース 1（正常系）: `PERF-1`（バイナリサイズ）・`PERF-3`（cold start）・
-/// `PERF-6`（idle RSS。Windows は `Unsupported`）・`AISNAP-1`（トークン削減率）
-/// のすべてが `measured`（Windows の `idleRssKb` のみ `unsupported`）になり、
-/// `run_all` の終了コードが `0` になることを、fixture サーバーの起動から
-/// 対象プロセス（fake CDP・fake MCP。ともにこのテストバイナリ自身の再実行）
-/// との通信・計測結果・終了コードまで通しで検証する。
+/// `PERF-6`（idle RSS。3 OS 共通で `measured`。TASK-84.5）・`AISNAP-1`
+/// （トークン削減率）のすべてが `measured` になり、`run_all` の終了コードが
+/// `0` になることを、fixture サーバーの起動から対象プロセス（fake CDP・
+/// fake MCP。ともにこのテストバイナリ自身の再実行）との通信・計測結果・
+/// 終了コードまで通しで検証する。
 fn successful_measurement_path_reports_measured_values_and_exit_code_zero() {
     let target = fake_target("fake-browser");
     let expected_binary_size = std::fs::metadata(std::env::current_exe().expect("current_exe"))
@@ -638,34 +638,26 @@ fn successful_measurement_path_reports_measured_values_and_exit_code_zero() {
 
     let idle_rss = report.get("idleRssKb").expect("idleRssKb field");
     let idle_rss_status = idle_rss.get("status").and_then(JsonValue::as_str);
-    if cfg!(windows) {
-        assert_eq!(
-            idle_rss_status,
-            Some("unsupported"),
-            "idleRssKb should be unsupported on Windows (PERF-6): {body}"
-        );
-    } else {
-        assert_eq!(
-            idle_rss_status,
-            Some("measured"),
-            "idleRssKb should be measured on unix (PERF-6): {body}"
-        );
-        let idle_rss_value = idle_rss
-            .get("value")
-            .and_then(JsonValue::as_f64)
-            .expect("idleRssKb value");
-        assert!(
-            idle_rss_value > 0.0,
-            "idleRssKb should be a positive KB value: {idle_rss_value}"
-        );
-        // 上限は 1GiB 相当（1024 * 1024 KB）。テストバイナリ自身の
-        // アイドル RSS がこれを超えることは通常無く、`ps` の出力誤読等の
-        // 明らかな異常値を検知するための緩い妥当性チェック（PERF-6）。
-        assert!(
-            idle_rss_value < 1024.0 * 1024.0,
-            "idleRssKb should be well under 1GiB for a local self-exec process (PERF-6): {idle_rss_value}"
-        );
-    }
+    assert_eq!(
+        idle_rss_status,
+        Some("measured"),
+        "idleRssKb should be measured on all 3 OSes (PERF-6): {body}"
+    );
+    let idle_rss_value = idle_rss
+        .get("value")
+        .and_then(JsonValue::as_f64)
+        .expect("idleRssKb value");
+    assert!(
+        idle_rss_value > 0.0,
+        "idleRssKb should be a positive KB value: {idle_rss_value}"
+    );
+    // 上限は 1GiB 相当（1024 * 1024 KB）。テストバイナリ自身の
+    // アイドル RSS がこれを超えることは通常無く、`ps`/`tasklist` の出力誤読等の
+    // 明らかな異常値を検知するための緩い妥当性チェック（PERF-6）。
+    assert!(
+        idle_rss_value < 1024.0 * 1024.0,
+        "idleRssKb should be well under 1GiB for a local self-exec process (PERF-6): {idle_rss_value}"
+    );
 
     // PERF-6 目標比較（TASK-84.2・Issue #212）: idleRssKb の計測状況を
     // "perf6" がそのまま反映することを確認する。unix では実測値に対する
