@@ -33,6 +33,11 @@
 //! `DisabledRenderer`（TASK-33（33.3）・issue #47）を含む。`fandhe-browser-render`
 //! （Servo）側の本実装・`AppState` への配線は含まない（別 issue の担当。render
 //! モジュールの doc コメントを参照）。
+//! [`observability`] モジュールは TASK-10（10.1・Issue #219・ビヘイビア
+//! `REPAIR-9`）で、`fetch`/`parse`/`dom`/`query`/`js_stub` 各モジュールの
+//! 操作計測が共通で使うレコード型（[`observability::OperationRecord`] 等）を
+//! 追加した。各モジュールへの計測の組み込み・出力先の確定は含まない
+//! （モジュール doc コメント・Issue #218 を参照）。
 //!
 //! # スタブについて
 //!
@@ -41,11 +46,14 @@
 //!
 //! - [`js_stub`]（`JS-2`・`TASK-30`・`MS-3`）
 //! - [`render::DisabledRenderer`]（`RENDER-1`・`TASK-33`/`TASK-38`・`MS-1`/`MS-4`）
+//! - [`observability::OperationRecord::to_json_line`]（`REPAIR-9`・`TASK-10（10.1）`・
+//!   `MS-4`。出力形式は Issue #218 で未確定な暫定エンコーダ）
 
 pub mod dom;
 pub mod error;
 pub mod fetch;
 pub mod js_stub;
+pub mod observability;
 pub mod parse;
 pub mod query;
 pub mod render;
@@ -56,6 +64,7 @@ pub use dom::{
 };
 pub use error::{Error, ParseError, Result};
 pub use fetch::{FetchOptions, FetchResponse, Fetcher};
+pub use observability::{FailureKind, OperationKind, OperationOutcome, OperationRecord};
 pub use parse::{
     ParseDiagnostics, ParseErrorPolicy, ParseOptions, ParsedDocument, parse_document,
     parse_document_bytes,
