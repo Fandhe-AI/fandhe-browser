@@ -170,8 +170,40 @@ fi
 # `tokenReductionPct`（いずれも文字列の `status` を持つオブジェクト）・
 # `sitesCount`（数値）・`perf6`（文字列の `status` を持つオブジェクト）を
 # 全て持つこと）まで検証し、対象キーの欠落・型違いは追記せずエラーにする。
+#
+# 上記もなお `status` が文字列であることしか見ておらず、例えば
+# `{"status":"measured"}`（値・基準値・判定を欠く）を `idleRssKb` や
+# `perf6` に指定しても検証を通過し、壊れた行が履歴へ追記されてしまう
+# （TASK-84.2・Issue #212 のレビュー指摘対応）。`status` の許可値を
+# `measured`/`skipped`/`unsupported`/`error` の 4 つに限定し、`status` ごとに
+# 実装（`benches/competitor_lightpanda/support.rs` の `Outcome::to_json`・
+# `perf6_comparison`）が実際に出力するフィールドまで検証する。
+# `binarySizeBytes`/`coldStartMs`/`idleRssKb`/`tokenReductionPct` は
+# `measured` のとき数値の `value` を、それ以外（`skipped`/`unsupported`/
+# `error`）のとき文字列の `reason` を必須とする。`perf6` は `measured` のとき
+# 数値の `baselineKb`/`reductionPct`/`targetPct` と `met`/`below_target` の
+# いずれかの `verdict` を、それ以外のとき文字列の `reason` を必須とする
+# （README.md「`perf6` フィールド」参照）。
 SCHEMA_CHECK='
-  def valid_metric: (type == "object") and has("status") and (.status | type == "string");
+  def valid_reason: (.reason | type == "string");
+  def valid_metric: (type == "object") and
+    (
+      (.status == "measured" and (.value | type == "number"))
+      or (.status == "skipped" and valid_reason)
+      or (.status == "unsupported" and valid_reason)
+      or (.status == "error" and valid_reason)
+    );
+  def valid_perf6: (type == "object") and
+    (
+      (.status == "measured"
+        and (.baselineKb | type == "number")
+        and (.reductionPct | type == "number")
+        and (.targetPct | type == "number")
+        and (.verdict == "met" or .verdict == "below_target"))
+      or (.status == "skipped" and valid_reason)
+      or (.status == "unsupported" and valid_reason)
+      or (.status == "error" and valid_reason)
+    );
   def valid_target: (type == "object")
     and ((["binarySizeBytes", "coldStartMs", "idleRssKb", "tokenReductionPct", "sitesCount", "perf6"] - keys) | length == 0)
     and (.binarySizeBytes | valid_metric)
@@ -179,7 +211,7 @@ SCHEMA_CHECK='
     and (.idleRssKb | valid_metric)
     and (.tokenReductionPct | valid_metric)
     and (.sitesCount | type == "number")
-    and (.perf6 | valid_metric);
+    and (.perf6 | valid_perf6);
   length == 1
     and (.[0] | type) == "object"
     and (.[0] | length > 0)
@@ -187,7 +219,7 @@ SCHEMA_CHECK='
 '
 if ! jq -e -s "$SCHEMA_CHECK" "$TMP_OUTPUT" >/dev/null 2>&1; then
   echo "error: bench output is not exactly one JSON object matching the expected schema; not appending to history" >&2
-  echo "  (expected: {\"<target>\": {binarySizeBytes, coldStartMs, idleRssKb, tokenReductionPct, sitesCount, perf6}, ...}; see README.md 'スキーマ')" >&2
+  echo "  (expected: {\"<target>\": {binarySizeBytes, coldStartMs, idleRssKb, tokenReductionPct, sitesCount, perf6}, ...}; each metric's status must be measured/skipped/unsupported/error with the fields that status requires; see README.md 'スキーマ')" >&2
   echo "  (this can happen when the bench's own configuration is invalid; see the bench's stderr output)" >&2
   exit 2
 fi

@@ -109,6 +109,21 @@ if [ "$VERDICT" != "below_target" ]; then
 fi
 CASES=$((CASES + 1))
 
+# --- (c') measured-unsupported: idleRssKb/perf6 が unsupported でも
+# 追記され exit 0（Windows の idleRssKb 実測値と PERF-6 基準値の計測範囲が
+# 食い違う場合の正当な出力。TASK-84.2・Issue #212 のレビュー指摘対応で
+# status の許可値を絞ったため、unsupported の正例が無いと enum の
+# typo（例: "unsupported" を弾いてしまう回帰）を検出できない） ---
+expect_exit "measured-unsupported appends and exits 0" 0 \
+  --history "$HISTORY" --input "$FIXTURES/measured-unsupported.json" --source local
+LAST_LINE=$(tail -n 1 "$HISTORY")
+PERF6_STATUS=$(printf '%s' "$LAST_LINE" | jq -r '.result."fandhe-browser".perf6.status' | tr -d '\r')
+if [ "$PERF6_STATUS" != "unsupported" ]; then
+  echo "FAIL [measured-unsupported perf6 status]: expected unsupported, got $PERF6_STATUS" >&2
+  FAILURES=$((FAILURES + 1))
+fi
+CASES=$((CASES + 1))
+
 # --- (d) bench exit 1 の入力: 追記したうえで exit 1 を伝播する ---
 expect_exit "bench exit 1 is appended and propagated" 1 \
   --history "$HISTORY" --input "$FIXTURES/error-exit.json" --bench-exit-code 1 --source ci
@@ -119,8 +134,8 @@ if [ "$BENCH_EXIT" != "1" ]; then
   FAILURES=$((FAILURES + 1))
 fi
 CASES=$((CASES + 1))
-if [ "$(line_count)" != "4" ]; then
-  echo "FAIL [line count after 4 successful appends]: expected 4, got $(line_count)" >&2
+if [ "$(line_count)" != "5" ]; then
+  echo "FAIL [line count after 5 successful appends]: expected 5, got $(line_count)" >&2
   FAILURES=$((FAILURES + 1))
 fi
 CASES=$((CASES + 1))
@@ -186,6 +201,76 @@ expect_exit "target missing a required field (perf6) is rejected" 2 \
 AFTER=$(line_count)
 if [ "$AFTER" != "$BEFORE" ]; then
   echo "FAIL [missing field line count]: expected unchanged ($BEFORE), got $AFTER" >&2
+  FAILURES=$((FAILURES + 1))
+fi
+CASES=$((CASES + 1))
+
+# status が文字列であることしか見ない検証では、値・基準値・判定を欠いた
+# `{"status":"measured"}` を idleRssKb にそのまま指定しても通過し、壊れた
+# 行が履歴へ追記されてしまっていた（TASK-84.2・Issue #212 のレビュー指摘
+# 対応の回帰テスト）。status ごとの必須フィールドまで検証することで拒否する。
+MEASURED_NO_VALUE_JSON="$WORKDIR/measured-no-value.json"
+printf '{"fandhe-browser":{"binarySizeBytes":{"status":"skipped","reason":"x"},"coldStartMs":{"status":"skipped","reason":"x"},"idleRssKb":{"status":"measured"},"tokenReductionPct":{"status":"skipped","reason":"x"},"sitesCount":3,"perf6":{"status":"skipped","reason":"x"}}}' >"$MEASURED_NO_VALUE_JSON"
+BEFORE=$(line_count)
+expect_exit "measured metric missing value is rejected" 2 \
+  --history "$HISTORY" --input "$MEASURED_NO_VALUE_JSON"
+AFTER=$(line_count)
+if [ "$AFTER" != "$BEFORE" ]; then
+  echo "FAIL [measured metric missing value line count]: expected unchanged ($BEFORE), got $AFTER" >&2
+  FAILURES=$((FAILURES + 1))
+fi
+CASES=$((CASES + 1))
+
+# skipped/unsupported/error は reason（文字列）を必須とする。欠落は拒否する。
+SKIPPED_NO_REASON_JSON="$WORKDIR/skipped-no-reason.json"
+printf '{"fandhe-browser":{"binarySizeBytes":{"status":"skipped"},"coldStartMs":{"status":"skipped","reason":"x"},"idleRssKb":{"status":"skipped","reason":"x"},"tokenReductionPct":{"status":"skipped","reason":"x"},"sitesCount":3,"perf6":{"status":"skipped","reason":"x"}}}' >"$SKIPPED_NO_REASON_JSON"
+BEFORE=$(line_count)
+expect_exit "skipped metric missing reason is rejected" 2 \
+  --history "$HISTORY" --input "$SKIPPED_NO_REASON_JSON"
+AFTER=$(line_count)
+if [ "$AFTER" != "$BEFORE" ]; then
+  echo "FAIL [skipped metric missing reason line count]: expected unchanged ($BEFORE), got $AFTER" >&2
+  FAILURES=$((FAILURES + 1))
+fi
+CASES=$((CASES + 1))
+
+# 未知の status（許可値 measured/skipped/unsupported/error 以外）は拒否する。
+UNKNOWN_STATUS_JSON="$WORKDIR/unknown-status.json"
+printf '{"fandhe-browser":{"binarySizeBytes":{"status":"skipped","reason":"x"},"coldStartMs":{"status":"skipped","reason":"x"},"idleRssKb":{"status":"bogus","reason":"x"},"tokenReductionPct":{"status":"skipped","reason":"x"},"sitesCount":3,"perf6":{"status":"skipped","reason":"x"}}}' >"$UNKNOWN_STATUS_JSON"
+BEFORE=$(line_count)
+expect_exit "unknown status value is rejected" 2 \
+  --history "$HISTORY" --input "$UNKNOWN_STATUS_JSON"
+AFTER=$(line_count)
+if [ "$AFTER" != "$BEFORE" ]; then
+  echo "FAIL [unknown status line count]: expected unchanged ($BEFORE), got $AFTER" >&2
+  FAILURES=$((FAILURES + 1))
+fi
+CASES=$((CASES + 1))
+
+# perf6 が measured のとき baselineKb/reductionPct/targetPct/verdict を必須
+# とする。verdict が met/below_target 以外なら拒否する。
+PERF6_BAD_VERDICT_JSON="$WORKDIR/perf6-bad-verdict.json"
+printf '{"fandhe-browser":{"binarySizeBytes":{"status":"measured","value":1},"coldStartMs":{"status":"measured","value":1},"idleRssKb":{"status":"measured","value":1},"tokenReductionPct":{"status":"measured","value":1},"sitesCount":3,"perf6":{"status":"measured","baselineKb":1000,"reductionPct":50,"targetPct":85,"verdict":"maybe"}}}' >"$PERF6_BAD_VERDICT_JSON"
+BEFORE=$(line_count)
+expect_exit "perf6 with an unknown verdict is rejected" 2 \
+  --history "$HISTORY" --input "$PERF6_BAD_VERDICT_JSON"
+AFTER=$(line_count)
+if [ "$AFTER" != "$BEFORE" ]; then
+  echo "FAIL [perf6 bad verdict line count]: expected unchanged ($BEFORE), got $AFTER" >&2
+  FAILURES=$((FAILURES + 1))
+fi
+CASES=$((CASES + 1))
+
+# perf6 が measured のとき baselineKb 欠落（reductionPct/targetPct/verdict は
+# あっても）は拒否する。
+PERF6_NO_BASELINE_JSON="$WORKDIR/perf6-no-baseline.json"
+printf '{"fandhe-browser":{"binarySizeBytes":{"status":"measured","value":1},"coldStartMs":{"status":"measured","value":1},"idleRssKb":{"status":"measured","value":1},"tokenReductionPct":{"status":"measured","value":1},"sitesCount":3,"perf6":{"status":"measured","reductionPct":50,"targetPct":85,"verdict":"met"}}}' >"$PERF6_NO_BASELINE_JSON"
+BEFORE=$(line_count)
+expect_exit "perf6 measured missing baselineKb is rejected" 2 \
+  --history "$HISTORY" --input "$PERF6_NO_BASELINE_JSON"
+AFTER=$(line_count)
+if [ "$AFTER" != "$BEFORE" ]; then
+  echo "FAIL [perf6 no baseline line count]: expected unchanged ($BEFORE), got $AFTER" >&2
   FAILURES=$((FAILURES + 1))
 fi
 CASES=$((CASES + 1))
