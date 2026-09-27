@@ -44,13 +44,14 @@ use crate::support::{
     parse_http_request_line, parse_http_status, parse_json, port_conflict_error, reduction_pct,
     require_bin, token_reduction_gate, validate_mcp_response, wait_with_deadline,
 };
-// `parse_ps_rss_kb`/`parse_tasklist_mem_kb` はそれぞれ unix/windows 専用の
-// `sample_rss_kb`（下記 `#[cfg(unix)]`/`#[cfg(windows)]`）が呼ぶ。無条件
-// import のままだと反対側の OS ビルドで未使用になり `unused_imports` 警告が
-// `-D warnings`（ci.md「3 OS CI」）で fail するため cfg で分離する
-// （TASK-84.5・PERF-6）。
+// `parse_pgrep_pids` は unix 専用の `pgrep_children`（下記 `#[cfg(unix)]`）が
+// 呼ぶ。`parse_tasklist_mem_kb` は windows 専用の `sample_rss_kb`
+// （下記 `#[cfg(windows)]`）が呼ぶ。無条件 import のままだと反対側の OS
+// ビルドで未使用になり `unused_imports` 警告が `-D warnings`
+// （ci.md「3 OS CI」）で fail するため cfg で分離する
+// （TASK-84.2・TASK-84.5・PERF-6・Issue #212）。
 #[cfg(unix)]
-use crate::support::parse_ps_rss_kb;
+use crate::support::parse_pgrep_pids;
 #[cfg(windows)]
 use crate::support::parse_tasklist_mem_kb;
 
@@ -1087,36 +1088,195 @@ pub fn measure_cold_start(target: &Target, trials: usize) -> Outcome {
     }
 }
 
-/// アイドル RSS（`PERF-6`）: 起動して安定させたあと単一プロセスのワーキング
-/// セット相当の値（KB）を読む。unix は `ps -o rss=`（[`parse_ps_rss_kb`]）、
-/// Windows は `tasklist /FI "PID eq <pid>" /FO CSV /NH`
-/// （[`parse_tasklist_mem_kb`]）に委ねる（TASK-84.5。`unsafe`・新規依存を
-/// 使わず OS 標準コマンドの出力をパースする方針は `kill_process_group` と
-/// 同じ）。
+/// プロセスツリーの pid 一覧構築（`sample_process_tree_rss_kb` が使う）で
+/// 数え上げる pid 数の上限。`pgrep` 1 回あたりの出力バイト上限
+/// （`PGREP_CHILDREN_MAX_OUTPUT_BYTES`）ともこの値を前提に決めてある
+/// （coding-rust.md「長さ・件数を上限検証してからアロケーションに使う」）。
 #[cfg(unix)]
-fn sample_rss_kb(pid: u32) -> Option<u64> {
-    // `ps -o rss=` の出力は数字列のみで数十バイトに収まる。想定外に大量の
-    // 出力を返す環境でも無制限に確保しないための上限
-    // （coding-rust.md「長さ・件数を上限検証」）。
-    const MAX_PS_OUTPUT_BYTES: usize = 4096;
-    let mut command = Command::new("ps");
-    command.args(["-o", "rss=", "-p", &pid.to_string()]);
+const MAX_TREE_PIDS: usize = 256;
+
+/// `pid` の直接の子プロセス一覧を `pgrep -P <pid>` で取得する
+/// （`sample_process_tree_rss_kb` の BFS が使う）。
+///
+/// `pgrep -P` は一致する子プロセスが無いと終了コード 1 を返す（子がいない
+/// リーフノードは正常な終端であり失敗ではないため空の一覧にする）。それ
+/// 以外の非 0 終了・起動失敗は呼び出し元で `None` 扱いにする
+/// （fail-closed。coding-rust.md「外部入力の経路では明示的に処理する」）。
+#[cfg(unix)]
+fn pgrep_children(pid: u32) -> Option<Vec<u32>> {
+    // `pgrep -P <pid>` の出力は pid の一覧のみで通常数バイト〜数十バイト。
+    const MAX_PGREP_OUTPUT_BYTES: usize = 4096;
+    let mut command = Command::new("pgrep");
+    command.args(["-P", &pid.to_string()]);
     let (status, stdout) = crate::support::run_capturing_output_with_deadline(
         command,
+        crate::support::EXTERNAL_COMMAND_DEADLINE,
+        MAX_PGREP_OUTPUT_BYTES,
+    )
+    .ok()?;
+    if !status.success() {
+        return match status.code() {
+            Some(1) => Some(Vec::new()),
+            _ => None,
+        };
+    }
+    parse_pgrep_pids(&String::from_utf8_lossy(&stdout), MAX_TREE_PIDS)
+}
+
+/// `root_pid` を起点に `ppid` チェーンを幅優先で辿り、プロセスツリー全体
+/// （自身 + 子・孫・…）の pid 一覧を返す（`sample_process_tree_rss_kb` が
+/// 使う）。
+///
+/// TASK-84.2・Issue #212 のレビュー指摘対応: 以前は `pgrep -g <pgid>`
+/// （`apply_new_process_group` が作る同一プロセスグループのメンバー）で
+/// 代用していたが、対象の子孫が `setpgid` 等で別のプロセスグループへ
+/// 移ると数え漏れ、実際には目標未達でも `PERF-6` 判定
+/// （`support::perf6_comparison`）が `"met"` を誤って返し得た。`ppid` を
+/// 直接辿る本方式はプロセスグループの変更に影響されない。`MAX_TREE_PIDS`
+/// を超える異常なツリーサイズは打ち切って `None`（呼び出し元が Error 化）
+/// にする。
+#[cfg(unix)]
+fn collect_process_tree_pids(root_pid: u32) -> Option<Vec<u32>> {
+    let mut pids = vec![root_pid];
+    let mut frontier = vec![root_pid];
+    while let Some(parent) = frontier.pop() {
+        for child in pgrep_children(parent)? {
+            if pids.contains(&child) {
+                continue;
+            }
+            if pids.len() >= MAX_TREE_PIDS {
+                return None;
+            }
+            pids.push(child);
+            frontier.push(child);
+        }
+    }
+    Some(pids)
+}
+
+/// `collect_process_tree_pids` を安定するまで（連続 2 回の全走査が同じ pid
+/// 集合を返すまで）繰り返す上限回数。1 回の走査だけでは、走査中に新しく
+/// 生まれた子孫を数え漏れる可能性がある（下記
+/// `collect_stable_process_tree_pids` のドキュメント参照）ため複数回走査
+/// するが、対象が継続的に子プロセスを生成し続ける異常系で無限に走査し
+/// 続けないよう上限を設ける（coding-rust.md「長さ・件数を上限検証」）。
+#[cfg(unix)]
+const MAX_TREE_STABILIZE_PASSES: usize = 4;
+
+/// `collect_process_tree_pids` を複数回実行し、pid 集合が連続 2 回一致する
+/// （= 走査中に新しい子孫が生まれなくなり安定した）まで走査し直す
+/// （`sample_process_tree_rss_kb` が使う）。
+///
+/// TASK-84.2・Issue #212 のレビュー指摘対応: `collect_process_tree_pids` は
+/// 各親 pid に対して `pgrep -P` を 1 度しか呼ばない 1 回限りの幅優先探索の
+/// ため、ある親を調べ終えた直後（探索がすでに他の枝へ進んだ後）にその親が
+/// 新しい子プロセスを起動すると、その子孫は今回の走査では見つからない。
+/// 1 回の走査結果をそのまま `ps` の RSS 合算に渡すと、対象が実行中に
+/// プロセスを増やす実装だった場合に一部の子孫を計測から取りこぼし、
+/// `PERF-6` 判定（`support::perf6_comparison`）が実際には目標未達でも
+/// `"met"` を誤って返し得る。本関数は独立した全体走査を連続 2 回実行し、
+/// 得られた pid 集合（順序無視）が一致するまで（＝その 2 回の走査の間に
+/// 新しい子孫が現れなかったことの確認）繰り返すことで、走査中に生まれた
+/// 子孫の見落としを低減する。`MAX_TREE_STABILIZE_PASSES` に達しても安定
+/// しない場合は、対象が継続的にプロセスを生成し続けていると判断し
+/// `None` を返す（TASK-84.2・Issue #212 のレビュー指摘対応）。
+///
+/// 以前は上限到達時に最後に得られた pid 一覧をそのまま成功値として
+/// 返していたが、継続的に子プロセスを生成し続ける対象では、その一覧に
+/// 含まれない子孫の RSS が呼び出し元 `sample_process_tree_rss_kb` の
+/// 合算から漏れ、実際には目標未達でも `perf6_comparison` が `"met"` を
+/// 誤って返し得た。安定しない＝走査結果を信頼できないことを意味するため、
+/// 不完全な pid 一覧を目標判定に使わせず `None`（`sample_process_tree_rss_kb`
+/// 経由で `measure_idle_rss` を `Outcome::Error` にする）で計測エラーとして
+/// 扱う。
+#[cfg(unix)]
+fn collect_stable_process_tree_pids(root_pid: u32) -> Option<Vec<u32>> {
+    stabilize_pid_scan(
+        || collect_process_tree_pids(root_pid),
+        MAX_TREE_STABILIZE_PASSES,
+    )
+}
+
+/// `collect_stable_process_tree_pids` の走査ループを、走査手段（`scan`）を
+/// 差し替え可能にして切り出したもの。実運用は `collect_process_tree_pids`
+/// を `scan` に渡すが、`measure_tests.rs`（`pub(crate)` として同一クレート
+/// から直接呼べる）はプロセスを実際に fork せずとも決定的な pid 集合列を
+/// 返すクロージャで安定／非安定の両経路（TASK-84.2・Issue #212 のレビュー
+/// 指摘対応: 非安定時は `None` を返し、目標判定に不完全な pid 一覧を渡さ
+/// ない）を検証できる。
+#[cfg(unix)]
+pub(crate) fn stabilize_pid_scan(
+    mut scan: impl FnMut() -> Option<Vec<u32>>,
+    max_passes: usize,
+) -> Option<Vec<u32>> {
+    let mut previous = scan()?;
+    for _ in 0..max_passes {
+        let current = scan()?;
+        let mut previous_sorted = previous.clone();
+        let mut current_sorted = current.clone();
+        previous_sorted.sort_unstable();
+        current_sorted.sort_unstable();
+        if previous_sorted == current_sorted {
+            return Some(current);
+        }
+        previous = current;
+    }
+    None
+}
+
+/// アイドル RSS（`PERF-6`）: 起動して安定させたあと、対象プロセスの RSS
+/// （KB）を読む。unix は対象プロセスのプロセスツリー全体
+/// （自身 + 子孫。`collect_process_tree_pids` 参照）の RSS 合計、windows は
+/// 対象プロセス単体のワーキングセット相当の値を読む（`measure_idle_rss`
+/// 参照）。
+///
+/// TASK-84.2・Issue #212 のレビュー指摘対応（unix 側）: 以前は
+/// `guard.0.id()`（直接の子プロセス 1 つ）だけを `ps -o rss= -p <pid>` で
+/// 読んでいたため、対象がさらに子プロセスを使う実装だと、そのメモリを
+/// 含めずに `PERF-6` 判定（`support::perf6_comparison`。基準値は Chromium の
+/// **プロセスツリー全体**のアイドル RSS）へ渡してしまい、実際には目標未達
+/// でも `"met"` を誤って返し得た。windows は `tasklist` にプロセスツリー
+/// 全体を安全に数え上げる標準的な手段が無いため（`unsafe`・新規依存を
+/// 避ける方針。TASK-84.5）、対象プロセス単体の計測
+/// （`sample_rss_kb`・[`parse_tasklist_mem_kb`]）に留める。pid 集合の取得は
+/// `collect_process_tree_pids` の 1 回走査ではなく
+/// `collect_stable_process_tree_pids`（安定するまで複数回走査）を使う
+/// （走査中に生まれた子孫の見落とし対策。同 Issue のレビュー指摘対応）。
+#[cfg(unix)]
+fn sample_process_tree_rss_kb(root_pid: u32) -> Option<u64> {
+    let pids = collect_stable_process_tree_pids(root_pid)?;
+    if pids.is_empty() {
+        return None;
+    }
+    // `ps -p` はカンマ区切りで複数 pid を受け付ける（POSIX・GNU・BSD 共通）。
+    let pid_list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    // 1 pid あたり最大 10 桁 + カンマ想定で `MAX_TREE_PIDS` 件分の出力を
+    // 十分収められる上限（`ps` 出力は数字列のみのため通常はこれよりずっと
+    // 小さい）。
+    const MAX_PS_OUTPUT_BYTES: usize = 8192;
+    let mut ps_command = Command::new("ps");
+    ps_command.args(["-o", "rss=", "-p", &pid_list]);
+    let (ps_status, ps_stdout) = crate::support::run_capturing_output_with_deadline(
+        ps_command,
         crate::support::EXTERNAL_COMMAND_DEADLINE,
         MAX_PS_OUTPUT_BYTES,
     )
     .ok()?;
-    if !status.success() {
+    if !ps_status.success() {
         return None;
     }
-    // `parse_ps_rss_kb`（`out.trim().parse::<u64>()`）は数字列としてのみ
-    // 解釈するため、`from_utf8_lossy` の置換文字（U+FFFD）が混入しても
-    // `parse::<u64>()` が失敗して `None` になるだけで、「文字化けが偶然
-    // 別の妥当な値に化ける」経路にはならない（MCP 応答の JSON のように、
-    // 置換後の文字列が別の意味を持つ妥当な値として解釈され得るケースとは
-    // 異なる）。そのため厳密な UTF-8 変換にする必要はない。
-    parse_ps_rss_kb(&String::from_utf8_lossy(&stdout))
+    // `collect_process_tree_pids`（`pgrep`）で確定した pid が、この `ps`
+    // 実行までに終了しているとその行が出力されない。`sum_ps_rss_kb_lines`
+    // だけだと残りの行を「合計成功」として黙って返してしまう（レビュー
+    // 指摘対応。TASK-84.2・Issue #212）ため、要求した pid 数と実際の行数の
+    // 一致を検証する `sum_ps_rss_kb_lines_checked` を使う。`from_utf8_lossy`
+    // で足りる理由は旧 `sample_process_group_rss_kb` と同じ（置換文字混入時
+    // は `parse::<u64>()` が失敗して `None` になるだけ）。
+    crate::support::sum_ps_rss_kb_lines_checked(&String::from_utf8_lossy(&ps_stdout), pids.len())
 }
 
 /// windows 版 `sample_rss_kb`。`tasklist` の標準出力は OEM コードページで
@@ -1167,9 +1327,16 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
         match spawn_and_wait_ready(bin, &target.serve_args) {
             Ok((guard, port, _elapsed)) => {
                 std::thread::sleep(Duration::from_millis(500));
-                // `sample_rss_kb` の失敗（プロセス早期終了・パース不能出力）
-                // を黙って捨てず即座に Error 化する。
+                // `sample_process_tree_rss_kb`/`sample_rss_kb` の失敗
+                // （プロセス早期終了・パース不能出力）を黙って捨てず即座に
+                // Error 化する。unix は `ppid` チェーンを辿ってプロセス
+                // ツリー全体の RSS 合計（子孫を含む。PERF-6・Issue #212 の
+                // レビュー指摘対応）を読む。windows は対象プロセス単体を
+                // 読む（TASK-84.5）。
                 let pid = guard.0.id();
+                #[cfg(unix)]
+                let rss = sample_process_tree_rss_kb(pid);
+                #[cfg(windows)]
                 let rss = sample_rss_kb(pid);
                 // `drop(guard)` は `kill_process_group`/`Child::kill` で
                 // プロセス（グループ）を終了させ、`wait` で完全な終了を
@@ -1901,7 +2068,22 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
 /// `../competitor_lightpanda.rs` の `main`（環境変数から実対象を構築する）と、
 /// `measure_tests.rs` の結合テスト（対象バイナリを模したローカルプロセスを
 /// `targets` に指定する）の両方から呼ぶ、計測の唯一のエントリポイント。
-pub fn run_all(targets: &[Target], trials: usize) -> (String, u8) {
+///
+/// `chromium_idle_rss_kb`: `CHROMIUM_IDLE_RSS_KB`（`main` が
+/// [`crate::support::parse_chromium_baseline_kb`] で解析済み）由来の
+/// Chromium ヘッドレス 1 インスタンス（プロセスツリー全体）のアイドル RSS
+/// 基準値（KB）。`None`（未設定）なら各対象の結果 JSON の `"perf6"` は
+/// `skipped` になる（TASK-84.2・Issue #212）。各対象の `idleRssKb` と
+/// この基準値から [`crate::support::perf6_comparison`]（純粋関数。
+/// `PERF-6` 目標値は [`crate::support::PERF6_TARGET_PCT`]）が判定した結果を
+/// `"perf6"` として添える。`below_target`（目標未達）は計測結果の一種であり
+/// 計測失敗ではないため、[`bench_exit_code`] の判定対象には含めない
+/// （`../competitor_lightpanda.rs` モジュールドキュメントの終了コード契約参照）。
+pub fn run_all(
+    targets: &[Target],
+    trials: usize,
+    chromium_idle_rss_kb: Option<u64>,
+) -> (String, u8) {
     // `AISNAP-1` 計測は外部
     // URL を一切使わず、ここで起動するローカル fixture サーバーだけを
     // 対象にする（モジュールドキュメント参照）。両方の `target` で
@@ -1968,6 +2150,42 @@ pub fn run_all(targets: &[Target], trials: usize) -> (String, u8) {
         };
         eprintln!("token reduction (%): {}", token_reduction.to_json());
 
+        // `PERF-6` 目標（Chromium 比 85% 以上のアイドル RSS 削減。
+        // `crate::support::PERF6_TARGET_PCT`）との比較（TASK-84.2・Issue #212）。
+        // 判定対象は `idle_rss`（この対象のアイドル RSS 計測結果。unix は
+        // `sample_process_tree_rss_kb` によりプロセスツリー全体の RSS 合計に
+        // 揃えてある）そのものであり、`bench_exit_code` の判定対象には
+        // 含めない（`perf6_comparison` ドキュメント参照）。
+        //
+        // windows は `idleRssKb` 自体は実測できる（TASK-84.5）が、対象
+        // プロセス単体のワーキングセットしか読めない一方、
+        // `chromium_idle_rss_kb`（基準値）は Chromium の**プロセスツリー
+        // 全体**のアイドル RSS のため、両者は計測範囲が食い違い数値上の
+        // 比較が成立しない（`idleRssKb` が小さく出るだけで「削減できた」
+        // わけではない）。レビュー指摘対応（TASK-84.2・Issue #212）として、
+        // Windows では実測値をそのまま `perf6_comparison` へ渡さず
+        // `Outcome::Unsupported` に差し替えて「比較不能」を明示する
+        // （`idleRssKb` フィールド自体の実測値はこの差し替えの影響を受け
+        // ない。`Skipped`/`Unsupported`/`Error` はそのまま素通しする）。
+        let perf6_idle_rss = if cfg!(windows) {
+            match idle_rss.clone() {
+                Outcome::Value(_) => Outcome::Unsupported(
+                    "PERF-6 comparison is unsupported on Windows: idleRssKb measures only \
+                     the direct child process while the baseline is a full process-tree total"
+                        .to_string(),
+                ),
+                other => other,
+            }
+        } else {
+            idle_rss.clone()
+        };
+        let perf6 = crate::support::perf6_comparison(
+            chromium_idle_rss_kb,
+            &perf6_idle_rss,
+            crate::support::PERF6_TARGET_PCT,
+        );
+        eprintln!("PERF-6 comparison: {perf6}");
+
         // `sitesCount`・`sites`: `tokenReductionPct` の対象として構成
         // されている fixture の件数・類型一覧（`support::FIXTURE_TABLE`・
         // `support::FIXTURE_KINDS`。TASK-84.4 で PoC-13 相当の 5 類型へ
@@ -1979,7 +2197,7 @@ pub fn run_all(targets: &[Target], trials: usize) -> (String, u8) {
         // 実測値と直接比較しないことを結果からも判別できるようにする
         // （モジュールドキュメント・`support::FIXTURE_KINDS` 参照）。
         body.push_str(&format!(
-            "  \"{}\": {{\"binarySizeBytes\":{},\"coldStartMs\":{},\"idleRssKb\":{},\"tokenReductionPct\":{},\"sitesCount\":{},\"sites\":{}}}",
+            "  \"{}\": {{\"binarySizeBytes\":{},\"coldStartMs\":{},\"idleRssKb\":{},\"tokenReductionPct\":{},\"sitesCount\":{},\"sites\":{},\"perf6\":{}}}",
             json_escape(target.name),
             binary_size.to_json(),
             cold_start.to_json(),
@@ -1987,6 +2205,7 @@ pub fn run_all(targets: &[Target], trials: usize) -> (String, u8) {
             token_reduction.to_json(),
             crate::support::FIXTURE_TABLE.len(),
             fixture_sites_json(),
+            perf6,
         ));
         if i + 1 < targets.len() {
             body.push(',');

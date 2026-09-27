@@ -527,6 +527,16 @@ fn run_test_cases() {
     probe_once_rejects_content_length_and_transfer_encoding_together();
     eprintln!("case: probe_once_rejects_conflicting_content_length_values");
     probe_once_rejects_conflicting_content_length_values();
+    // `measure::stabilize_pid_scan`（プロセスツリー走査の安定判定ループ）
+    // 自体は `#[cfg(unix)]` 限定（windows はプロセスツリー全体の RSS 合計を
+    // 読まないため使わない。TASK-84.5）なので、呼び出しもここで揃える。
+    #[cfg(unix)]
+    {
+        eprintln!("case: stabilize_pid_scan_returns_none_when_never_stable");
+        stabilize_pid_scan_returns_none_when_never_stable();
+        eprintln!("case: stabilize_pid_scan_returns_some_once_two_scans_match");
+        stabilize_pid_scan_returns_some_once_two_scans_match();
+    }
     eprintln!("competitor_lightpanda_measure: all cases passed");
 }
 
@@ -583,7 +593,11 @@ fn successful_measurement_path_reports_measured_values_and_exit_code_zero() {
         .expect("metadata")
         .len() as f64;
 
-    let (body, exit_code) = run_all(&[target], 1);
+    // PERF-6 目標比較（TASK-84.2・Issue #212）: 基準値ありで `run_all` を
+    // 呼び、idleRssKb が測定できた（unix）場合に "perf6" が基準値を反映した
+    // "measured" になることを確認する。
+    const CHROMIUM_IDLE_RSS_KB: u64 = 1_048_576;
+    let (body, exit_code) = run_all(&[target], 1, Some(CHROMIUM_IDLE_RSS_KB));
     let value = parse_json(&body).expect("run_all output should be valid JSON");
     let report = value
         .get("fake-browser")
@@ -654,6 +668,39 @@ fn successful_measurement_path_reports_measured_values_and_exit_code_zero() {
         idle_rss_value < 1024.0 * 1024.0,
         "idleRssKb should be well under 1GiB for a local self-exec process (PERF-6): {idle_rss_value}"
     );
+
+    // PERF-6 目標比較（TASK-84.2・Issue #212）: unix では idleRssKb の
+    // 実測値に対する判定（"measured"・baselineKb が渡した基準値と一致）を
+    // 確認する。Windows は idleRssKb 自体は実測できる（TASK-84.5。上記の
+    // "measured" アサーションと同じ）が、対象プロセス単体しか読めず
+    // `CHROMIUM_IDLE_RSS_KB`（プロセスツリー全体の基準値）と計測範囲が
+    // 食い違うため、`measure::run_all` が数値比較をせず "perf6" を
+    // "unsupported" にする（idleRssKb の実測値そのものは影響を受けない。
+    // レビュー指摘対応。TASK-84.2・Issue #212）。
+    let perf6 = report.get("perf6").expect("perf6 field");
+    if cfg!(windows) {
+        assert_eq!(
+            perf6.get("status").and_then(JsonValue::as_str),
+            Some("unsupported"),
+            "perf6 should be unsupported on Windows due to idleRssKb/baseline scope mismatch: {body}"
+        );
+    } else {
+        assert_eq!(
+            perf6.get("status").and_then(JsonValue::as_str),
+            Some("measured"),
+            "perf6 should be measured when a baseline is configured and idleRssKb succeeded: {body}"
+        );
+        assert_eq!(
+            perf6.get("baselineKb").and_then(JsonValue::as_f64),
+            Some(CHROMIUM_IDLE_RSS_KB as f64),
+            "perf6 baselineKb should equal the CHROMIUM_IDLE_RSS_KB passed to run_all: {body}"
+        );
+        let verdict = perf6.get("verdict").and_then(JsonValue::as_str);
+        assert!(
+            verdict == Some("met") || verdict == Some("below_target"),
+            "perf6 verdict should be either met or below_target: {body}"
+        );
+    }
 
     // `tree` は fake MCP が実際に HTTP GET した fixture の `<h1>` 見出しを
     // 含む簡約テキストにする（`run_fake_mcp` 参照）ため、期待する削減率は
@@ -825,7 +872,11 @@ fn unconfigured_target_is_skipped_with_exit_code_zero() {
         mcp_args_error: None,
     };
 
-    let (body, exit_code) = run_all(&[target], 1);
+    // 基準値を渡さない（`None`）: PERF-6 目標比較（TASK-84.2・Issue #212）は
+    // `CHROMIUM_IDLE_RSS_KB` 未設定時と同じ経路になり、idleRssKb 自体が
+    // "skipped"（対象バイナリ未設定）でも "perf6" は基準値未設定の理由で
+    // "skipped" になることを確認する（idleRssKb 側の理由とは別の固定メッセージ）。
+    let (body, exit_code) = run_all(&[target], 1, None);
     let value = parse_json(&body).expect("run_all output should be valid JSON");
     let report = value
         .get("unconfigured")
@@ -861,6 +912,22 @@ fn unconfigured_target_is_skipped_with_exit_code_zero() {
             .map(Vec::len),
         Some(5),
         "sites should be reported even when every measurement is skipped: {body}"
+    );
+    assert_eq!(
+        report
+            .get("perf6")
+            .and_then(|v| v.get("status"))
+            .and_then(JsonValue::as_str),
+        Some("skipped"),
+        "perf6 should be skipped when CHROMIUM_IDLE_RSS_KB is not configured: {body}"
+    );
+    assert_eq!(
+        report
+            .get("perf6")
+            .and_then(|v| v.get("reason"))
+            .and_then(JsonValue::as_str),
+        Some("CHROMIUM_IDLE_RSS_KB not set"),
+        "perf6 skip reason should explain the missing baseline: {body}"
     );
     assert_eq!(
         exit_code, 0,
@@ -1369,6 +1436,54 @@ fn probe_once_rejects_conflicting_content_length_values() {
             "expected an error for conflicting Content-Length values, got status={status} body={body:?}"
         ),
     }
+}
+
+/// TASK-84.2・Issue #212 のレビュー指摘対応（プロセスツリー走査の安定判定）:
+/// `measure::stabilize_pid_scan`（`measure::collect_stable_process_tree_pids`
+/// が内部で使う走査ループの本体。`scan` を差し替え可能にして切り出した
+/// もの）に、常に前回と異なる pid 集合を返すクロージャを渡すと、対象が
+/// 継続的に子プロセスを生成し続けて走査結果が一度も安定しない状況を
+/// フォーク実行なしに再現できる。この場合は最後に得られた pid 一覧を
+/// 「成功扱い」で返してはならず（呼び出し元 `sample_process_tree_rss_kb`
+/// 経由で不完全な RSS 合計が `perf6_comparison` に渡り、実際には目標未達
+/// でも `"met"` を誤って返し得る）、`None` を返して計測エラーへ倒す
+/// （`measure_idle_rss` が `None` を `Outcome::Error` にする）契約を検証する。
+#[cfg(unix)]
+fn stabilize_pid_scan_returns_none_when_never_stable() {
+    let mut next_pid: u32 = 1;
+    let mut scan = || {
+        // 呼ぶたびに集合を 1 要素ずつ増やし、直前の走査と一致することが
+        // 決してない列を作る（フォーク数が単調に増え続ける異常系の模擬）。
+        next_pid += 1;
+        Some((1..=next_pid).collect::<Vec<u32>>())
+    };
+    let result = measure::stabilize_pid_scan(&mut scan, 4);
+    assert_eq!(
+        result, None,
+        "a pid scan that never repeats two scans in a row must be treated as unstable (None), \
+         not as success with the latest (incomplete) pid set"
+    );
+}
+
+/// 上と対になる正常系: 2 回連続で同じ pid 集合（順序が異なっていても）が
+/// 得られた時点で `Some` を返す（`collect_stable_process_tree_pids` の
+/// 「順序無視で比較する」契約を確認する）。
+#[cfg(unix)]
+fn stabilize_pid_scan_returns_some_once_two_scans_match() {
+    let mut calls = vec![
+        vec![1, 2, 3],    // 1 回目: 初期走査。
+        vec![1, 2, 3, 4], // 2 回目: 新しい子孫が増えていて 1 回目と不一致。
+        vec![4, 3, 2, 1], // 3 回目: 2 回目と要素は同じで順序だけ異なる → 安定とみなす。
+        vec![9, 9, 9],    // 4 回目以降は呼ばれないはずの値（呼ばれたら不一致で検出できる）。
+    ]
+    .into_iter();
+    let mut scan = || calls.next();
+    let result = measure::stabilize_pid_scan(&mut scan, 4);
+    assert_eq!(
+        result,
+        Some(vec![4, 3, 2, 1]),
+        "once two consecutive scans agree (ignoring order), the loop must stop and return that pid set"
+    );
 }
 
 /// ループバック TCP 接続の両端（サーバー側・クライアント側）を返す

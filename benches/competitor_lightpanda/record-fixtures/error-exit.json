@@ -1,0 +1,10 @@
+{
+  "fandhe-browser": {
+    "binarySizeBytes": { "status": "measured", "value": 6624592 },
+    "coldStartMs": { "status": "error", "reason": "fandhe-browser: readiness probe timed out" },
+    "idleRssKb": { "status": "skipped", "reason": "fandhe-browser: cold start failed" },
+    "tokenReductionPct": { "status": "skipped", "reason": "fandhe-browser: cold start failed" },
+    "sitesCount": 3,
+    "perf6": { "status": "skipped", "reason": "fandhe-browser: cold start failed" }
+  }
+}

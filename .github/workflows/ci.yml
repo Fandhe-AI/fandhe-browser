@@ -254,6 +254,48 @@ jobs:
             --allow-missing
 
   # --------------------------------------------------
+  # bench-record-selftest（competitor_lightpanda ベンチ記録スクリプトの自己テスト）
+  # --------------------------------------------------
+  # TASK-84.2（Issue #212）: competitor_lightpanda ベンチ（TASK-84.1・#211）の
+  # 結果を時系列で記録する record.sh（benches/competitor_lightpanda/record.sh）
+  # の自己テスト（self-test.sh）を実行する。合成 fixture（record-fixtures/）に
+  # 対して `--input` 経由で実行するため cargo を使わず高速に回せる
+  # （benches/competitor_lightpanda/README.md 参照）。
+  #
+  # 本ジョブは record.sh 自体（引数検証・JSONL 追記ロジック・終了コード伝播）
+  # の回帰検出が目的で、実際のベンチ実行・実測値の記録（bench-competitor.yml が
+  # 別途 workflow_dispatch・毎週の定期実行で担う）とは分離する。
+  #
+  # 3 OS 一級対応（.claude/rules/ci.md・XOS-1）に合わせ 3 OS matrix で実行する。
+  # compat-regression ジョブと同じ理由で shell: bash を明示する。
+  #
+  # branch protection の必須チェックへ追加する場合は OS 数分
+  # （`bench-record-selftest (ubuntu-latest)` / `(macos-latest)` /
+  # `(windows-latest)` の 3 件）を登録する必要がある（ユーザー作業）。
+  bench-record-selftest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: jq の導入確認
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "error: jq is required but was not found on PATH" >&2
+            exit 1
+          fi
+      - name: record.sh 自己テスト
+        run: bash benches/competitor_lightpanda/self-test.sh
+
+  # --------------------------------------------------
   # deny-license-reject（cargo-deny の許可外ライセンス reject negative test）
   # --------------------------------------------------
   # TASK-9.1（#338・REPAIR-8）: 受入基準 2（許可外ライセンスが混入したら fail

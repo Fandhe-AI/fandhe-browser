@@ -1,0 +1,13 @@
+{
+  "fandhe-browser": {
+    "binarySizeBytes": { "status": "measured", "value": 6624592 },
+    "coldStartMs": { "status": "measured", "value": 42.5 },
+    "idleRssKb": { "status": "unsupported", "reason": "fandhe-browser: idle RSS is not supported on this OS" },
+    "tokenReductionPct": { "status": "measured", "value": 96.68 },
+    "sitesCount": 3,
+    "perf6": {
+      "status": "unsupported",
+      "reason": "fandhe-browser: idleRssKb measures only the target process on Windows, which cannot be compared to the process-tree-wide baseline"
+    }
+  }
+}

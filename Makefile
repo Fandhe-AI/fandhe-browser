@@ -477,7 +477,7 @@ endif
 # workspace 作成前・render crate 追加前の CI を壊さない。docker-ci は make ci を
 # 呼ぶため自動的にこの検証を含む。
 .PHONY: ci
-ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-publish-private test test-rendering deny check-deny-license-reject check-compat-regression ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-publish-private test test-rendering deny check-deny-license-reject check-compat-regression check-bench-record ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 対象サイト群の動作率回帰チェック（TASK-9.2・REPAIR-8。harness/compat-regression/README.md 参照）
@@ -503,6 +503,34 @@ check-compat-regression: ## 対象サイト群の動作率マトリクスに対�
 		--categories static,spa,form \
 		--all-categories \
 		--allow-missing
+
+# --------------------------------------------------
+# competitor_lightpanda ベンチの継続実行結果記録（TASK-84.2・Issue #212。
+# benches/competitor_lightpanda/README.md 参照）
+# --------------------------------------------------
+
+# `cargo bench` を実行し、結果を results/history.jsonl へ追記する。実測値を
+# 得るには LIGHTPANDA_BIN・FANDHE_BROWSER_BIN・CHROMIUM_IDLE_RSS_KB を
+# 事前に export しておくこと（未設定の対象は skipped になる。
+# benches/competitor_lightpanda/README.md「現状の限界」参照）。
+.PHONY: bench-record
+bench-record: ## competitor_lightpanda ベンチを実行し結果を時系列で記録する
+	@command -v jq >/dev/null 2>&1 || { \
+		echo "NG: jq が未導入のため bench-record を実行できません" >&2; \
+		exit 1; \
+	}
+	bash benches/competitor_lightpanda/record.sh \
+		--history benches/competitor_lightpanda/results/history.jsonl \
+		--source local
+
+# record.sh の自己テスト（合成 fixture。cargo を実行しないため高速）。
+.PHONY: check-bench-record
+check-bench-record: ## competitor_lightpanda 記録スクリプトの自己テスト
+	@command -v jq >/dev/null 2>&1 || { \
+		echo "NG: jq が未導入のため check-bench-record を実行できません" >&2; \
+		exit 1; \
+	}
+	bash benches/competitor_lightpanda/self-test.sh
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）

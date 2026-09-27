@@ -1,5 +1,5 @@
 {
-  "_comment": "editorconfig-checker の除外設定。CI は Fandhe-AI/actions/lint-docs reusable workflow（editorconfig ジョブ）が本ファイルを参照する。upstream 配布のスキル実体（修正先は agent-cli-skills）・private submodule・作業ディレクトリを除外する。Exclude は正規表現。IndentSize 検査は Markdown の継続行・設定ファイルの 2 スペース慣行（YAML/JSON 系）と [*] indent_size = 4 が構造的に衝突するため無効化する（indent_style・final newline・trailing whitespace の検査は維持）。",
+  "_comment": "editorconfig-checker の除外設定。CI は Fandhe-AI/actions/lint-docs reusable workflow（editorconfig ジョブ）が本ファイルを参照する。upstream 配布のスキル実体（修正先は agent-cli-skills）・private submodule・作業ディレクトリを除外する。Exclude は正規表現。IndentSize 検査は Markdown の継続行・設定ファイルの 2 スペース慣行（YAML/JSON 系）と [*] indent_size = 4 が構造的に衝突するため無効化する（indent_style・final newline・trailing whitespace の検査は維持）。benches/competitor_lightpanda/results/.gitkeep は空の記録先ディレクトリを git に残すためだけの 0 バイトファイルで、insert_final_newline 検査の対象外にする（TASK-84.2・Issue #212）。",
   "Disable": {
     "IndentSize": true
   },
@@ -9,6 +9,7 @@
     "^\\.agents/skills/",
     "^docs/spec/",
     "^LICENSE-APACHE$",
-    "^LICENSE-MIT$"
+    "^LICENSE-MIT$",
+    "^benches/competitor_lightpanda/results/\\.gitkeep$"
   ]
 }

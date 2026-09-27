@@ -1,0 +1,80 @@
+name: Bench Competitor
+
+# TASK-84.2（Issue #212）: competitor_lightpanda ベンチ（TASK-84.1・#211。
+# PERF-1・PERF-3・PERF-6・AISNAP-1）を定期的に実行し、結果を CI アーティファクト
+# として保存する（benches/competitor_lightpanda/README.md「記録先」参照）。
+#
+# 現状の限界（README.md に同じ記載）: fandhe-browser-cli（TASK-41.5）が未実装で
+# Lightpanda のバイナリも用意していないため、本ワークフローの実行では
+# lightpanda・fandhe-browser の両方が skipped になる。CHROMIUM_IDLE_RSS_KB も
+# まだ与えていない（PERF-6 比較は skipped のまま）。対象バイナリの導入・
+# 配線は別 Issue（benches/competitor_lightpanda/README.md「現状の限界」・
+# PR 本文「対象外」参照）。本ワークフローは記録パイプライン自体の継続的な
+# 動作確認と、対象バイナリ導入後にそのまま実測値を記録できる土台を提供する。
+#
+# ci.yml とは分離する理由: ci.yml の on: に schedule を足すと全ジョブが cron
+# 起動時にも実行されてしまう。定期実行はこのワークフローに閉じ、
+# ci.yml 側には bench-record-selftest（record.sh 自体の自己テスト。cargo を
+# 使わず高速）だけを置く。
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 毎週月曜 03:00 UTC。cargo bench を含むため ci.yml の PR/push 起動には含めない。
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      # `run:` へ `${{ }}` 式を直接埋め込まず、env 経由で渡す
+      # （security.md「インジェクション」観点。matrix.os も同様にファイル名へ
+      # 埋め込む箇所は env 経由にする）。
+      MATRIX_OS: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: jq の導入確認
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "error: jq is required but was not found on PATH" >&2
+            exit 1
+          fi
+      # stable（rust-toolchain.toml の channel = "stable" を単一真実源として追従）
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - name: competitor_lightpanda ベンチを実行し記録する
+        # LIGHTPANDA_BIN・FANDHE_BROWSER_BIN・CHROMIUM_IDLE_RSS_KB は現時点で
+        # 未設定（上記コメント参照）。record.sh はベンチの終了コードをそのまま
+        # 返すため、両対象が skipped の場合は exit 0 になる想定。
+        run: |
+          bash benches/competitor_lightpanda/record.sh \
+            --history "$RUNNER_TEMP/competitor-bench-${MATRIX_OS}.jsonl" \
+            --source ci
+      - name: アーティファクトへ保存
+        # ベンチが Outcome::Error で非ゼロ終了しても、それまでに record.sh が
+        # 追記した行は記録として残す価値があるため if: always() にする。
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: competitor-bench-${{ matrix.os }}
+          path: ${{ runner.temp }}/competitor-bench-${{ matrix.os }}.jsonl
+          retention-days: 90
+          if-no-files-found: error

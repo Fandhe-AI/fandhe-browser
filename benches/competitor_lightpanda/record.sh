@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+#
+# competitor_lightpanda ベンチ（PERF-1・PERF-3・PERF-6・AISNAP-1。TASK-84.1・
+# Issue #211）の結果を時系列で JSONL へ追記する記録スクリプト（TASK-84.2・
+# Issue #212）。ベンチ本体は結果 JSON を stdout に出すだけで記録先を持たない
+# ため（../competitor_lightpanda.rs 参照）、本スクリプトが実行（または
+# --input で既存の JSON を読み込み）→ 検証 → 実行環境のメタデータで包んで
+# JSONL の 1 行として追記する、までを担う。
+#
+# harness/compat-regression/check-matrix.sh・self-test.sh と同じ方針（bash +
+# jq のみ。新規 Cargo 依存・新規サードパーティ action は追加しない。
+# dependency-policy.md）で、3 OS（Linux/macOS/Windows の git-bash）で同一に
+# 動くことを前提にする。
+#
+# 呼び出し元: Makefile の bench-record / check-bench-record ターゲット、
+# .github/workflows/bench-competitor.yml（定期実行）。
+#
+# 現状の限界（REPAIR-3「実装済みを装わない」）: fandhe-browser-cli
+# （TASK-41.5）が未実装で CI に対象バイナリが無いため、CI 実行では
+# lightpanda・fandhe-browser の両方が skipped になり、実際の数値は記録
+# されない。数値を記録できるのは対象バイナリを用意したローカル・計測マシンで
+# 実行したときに限る（benches/competitor_lightpanda/README.md 参照）。
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: record.sh --history <path.jsonl> [--input <file>] [--bench-exit-code <n>] [--source local|ci]
+
+  --history <path>        Path to the JSONL history file to append to (required, must end in .jsonl).
+  --input <file>          Read bench result JSON from this file instead of running `cargo bench`.
+                           When given without --bench-exit-code, the exit code is derived from the
+                           result (1 if any target has a metric with status "error", else 0).
+  --bench-exit-code <n>   The exit code the bench run produced (only meaningful with --input).
+                           Must be consistent with the result's error status, or the run is rejected.
+  --source local|ci       Where this run happened (default: local). Recorded as "source" in the JSONL line.
+EOF
+}
+
+HISTORY=""
+INPUT=""
+BENCH_EXIT_CODE=""
+SOURCE="local"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --history)
+      [ $# -ge 2 ] || { echo "error: --history requires a value" >&2; usage; exit 2; }
+      HISTORY="$2"
+      shift 2
+      ;;
+    --input)
+      [ $# -ge 2 ] || { echo "error: --input requires a value" >&2; usage; exit 2; }
+      INPUT="$2"
+      shift 2
+      ;;
+    --bench-exit-code)
+      [ $# -ge 2 ] || { echo "error: --bench-exit-code requires a value" >&2; usage; exit 2; }
+      BENCH_EXIT_CODE="$2"
+      shift 2
+      ;;
+    --source)
+      [ $# -ge 2 ] || { echo "error: --source requires a value" >&2; usage; exit 2; }
+      SOURCE="$2"
+      shift 2
+      ;;
+    *)
+      echo "error: unknown argument: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+# --bench-exit-code をユーザーが明示的に渡したかどうかを、後段の
+# デフォルト代入（`--input` 時の暫定値 0）より前に記録しておく。
+# `--input` かつ未指定の場合のみ結果 JSON から終了コードを導出し（下記）、
+# それ以外（明示指定・または `cargo bench` 実行時の実際の終了コード）は
+# 導出値との整合性を検証する対象にする。
+BENCH_EXIT_CODE_EXPLICIT=false
+if [ -n "$BENCH_EXIT_CODE" ]; then
+  BENCH_EXIT_CODE_EXPLICIT=true
+fi
+
+if [ -z "$HISTORY" ]; then
+  echo "error: --history is required" >&2
+  usage
+  exit 2
+fi
+if [[ "$HISTORY" != *.jsonl ]]; then
+  echo "error: --history must end in .jsonl (got: $HISTORY)" >&2
+  exit 2
+fi
+if [ -L "$HISTORY" ]; then
+  # シンボリックリンク経由で記録先の外へ書き込む経路を作らない
+  # （security.md「プロファイル境界」の精神を記録先パスにも適用）。
+  echo "error: --history must not be a symlink: $HISTORY" >&2
+  exit 2
+fi
+HISTORY_DIR="$(dirname -- "$HISTORY")"
+if [ ! -d "$HISTORY_DIR" ]; then
+  echo "error: parent directory of --history does not exist: $HISTORY_DIR" >&2
+  exit 2
+fi
+if [ -n "$SOURCE" ] && [ "$SOURCE" != "local" ] && [ "$SOURCE" != "ci" ]; then
+  echo "error: --source must be 'local' or 'ci' (got: $SOURCE)" >&2
+  exit 2
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "error: jq is required but was not found on PATH" >&2
+  exit 2
+fi
+
+# 自前で作った一時ファイルだけを trap で削除する（--input で渡された
+# ファイルは呼び出し元の所有物であり、本スクリプトが削除してはならない。
+# 一時ファイル配置規則: cwd や --history のディレクトリではなく OS の
+# 一時ディレクトリを使う）。
+OWN_TMP_OUTPUT=""
+cleanup() {
+  if [ -n "$OWN_TMP_OUTPUT" ] && [ -f "$OWN_TMP_OUTPUT" ]; then
+    rm -f "$OWN_TMP_OUTPUT"
+  fi
+}
+trap cleanup EXIT
+
+if [ -n "$INPUT" ]; then
+  if [ ! -f "$INPUT" ]; then
+    echo "error: --input file not found: $INPUT" >&2
+    exit 2
+  fi
+  TMP_OUTPUT="$INPUT"
+  if [ -z "$BENCH_EXIT_CODE" ]; then
+    BENCH_EXIT_CODE=0
+  fi
+else
+  TMP_OUTPUT=$(mktemp "${TMPDIR:-/tmp}/competitor-lightpanda-bench.XXXXXX")
+  OWN_TMP_OUTPUT="$TMP_OUTPUT"
+  set +e
+  cargo bench -q -p fandhe-browser-core --bench competitor_lightpanda >"$TMP_OUTPUT"
+  BENCH_EXIT_CODE=$?
+  set -e
+fi
+
+# 先頭ゼロ（`007` 等）は bash の 8 進数リテラルと誤読されるおそれがあるため
+# 拒否し、終了コードの有効範囲（POSIX の 0-255）に収める
+# （harness/compat-regression/check-matrix.sh の --threshold 検証と同じ方針）。
+if ! [[ "$BENCH_EXIT_CODE" =~ ^(0|[1-9][0-9]{0,2})$ ]] || [ "$BENCH_EXIT_CODE" -gt 255 ]; then
+  echo "error: --bench-exit-code must be an integer between 0 and 255 with no leading zero (got: $BENCH_EXIT_CODE)" >&2
+  exit 2
+fi
+
+# 入力サイズの上限（無制限な巨大ファイルによる jq への過大入力・DoS を防ぐ。
+# coding-rust.md「長さ・件数を上限検証してからアロケーションに使う」）。
+SIZE=$(wc -c <"$TMP_OUTPUT" | tr -d '[:space:]')
+if [ "$SIZE" -gt 1048576 ]; then
+  echo "error: bench output exceeds the 1 MiB size limit ($SIZE bytes); not appending to history" >&2
+  exit 2
+fi
+
+# ベンチが失敗（設定エラー等）すると JSON を一切出さないことがある
+# （../competitor_lightpanda.rs モジュールドキュメントの終了コード契約
+# 参照）。壊れた・空の出力を履歴へ追記して汚さないよう、"トップレベルが
+# JSON オブジェクトであること" を明示的に検証する。
+#
+# `jq -e 'type == "object"'`（スラープなし）は入力中の JSON 値を 1 つずつ
+# 個別に評価し、`-e` の終了コードは*最後の*出力値の真偽だけで決まる。
+# そのため配列の後にオブジェクトが続くような複数値混在の出力（例:
+# `[1,2]\n{"a":1}`）でも、最後の値（オブジェクト）が真になり誤って通過
+# してしまう。その後の `--slurpfile`（下記）は全件を配列として読み込み
+# `$result[0]`（先頭の値。この例では配列）を履歴へ記録するため、検証を
+# 通過したはずのオブジェクトではなく無関係な先頭の値が保存され得た
+# （TASK-84.2・Issue #212 のレビュー指摘対応）。
+# `-s`（slurp）で全件を読み込んだ配列の長さが 1、かつその唯一の要素が
+# オブジェクトであることを併せて検証することで、「ちょうど 1 個の JSON
+# オブジェクトだけが出力されている」ことを件数と型の両方で保証する。
+#
+# 上記は「JSON オブジェクトが 1 個」であることしか見ておらず、`{}` の
+# ような空オブジェクトや、対象キーが欠落・型違いの壊れた出力もそのまま
+# 履歴へ追記されてしまう（TASK-84.2・Issue #212 のレビュー指摘対応）。
+# README.md「スキーマ（JSONL）」が定める `result` の形（`{"<target>": {...}}`
+# で、各 target が `binarySizeBytes`/`coldStartMs`/`idleRssKb`/
+# `tokenReductionPct`（いずれも文字列の `status` を持つオブジェクト）・
+# `sitesCount`（数値）・`perf6`（文字列の `status` を持つオブジェクト）を
+# 全て持つこと）まで検証し、対象キーの欠落・型違いは追記せずエラーにする。
+#
+# 上記もなお `status` が文字列であることしか見ておらず、例えば
+# `{"status":"measured"}`（値・基準値・判定を欠く）を `idleRssKb` や
+# `perf6` に指定しても検証を通過し、壊れた行が履歴へ追記されてしまう
+# （TASK-84.2・Issue #212 のレビュー指摘対応）。`status` の許可値を
+# `measured`/`skipped`/`unsupported`/`error` の 4 つに限定し、`status` ごとに
+# 実装（`benches/competitor_lightpanda/support.rs` の `Outcome::to_json`・
+# `perf6_comparison`）が実際に出力するフィールドまで検証する。
+# `binarySizeBytes`/`coldStartMs`/`idleRssKb`/`tokenReductionPct` は
+# `measured` のとき数値の `value` を、それ以外（`skipped`/`unsupported`/
+# `error`）のとき文字列の `reason` を必須とする。`perf6` は `measured` のとき
+# 数値の `baselineKb`/`reductionPct`/`targetPct` と `met`/`below_target` の
+# いずれかの `verdict` を、それ以外のとき文字列の `reason` を必須とする
+# （README.md「`perf6` フィールド」参照）。
+SCHEMA_CHECK='
+  def valid_reason: (.reason | type == "string");
+  def valid_metric: (type == "object") and
+    (
+      (.status == "measured" and (.value | type == "number"))
+      or (.status == "skipped" and valid_reason)
+      or (.status == "unsupported" and valid_reason)
+      or (.status == "error" and valid_reason)
+    );
+  def valid_perf6: (type == "object") and
+    (
+      (.status == "measured"
+        and (.baselineKb | type == "number")
+        and (.reductionPct | type == "number")
+        and (.targetPct | type == "number")
+        and (.verdict == "met" or .verdict == "below_target"))
+      or (.status == "skipped" and valid_reason)
+      or (.status == "unsupported" and valid_reason)
+      or (.status == "error" and valid_reason)
+    );
+  def valid_target: (type == "object")
+    and ((["binarySizeBytes", "coldStartMs", "idleRssKb", "tokenReductionPct", "sitesCount", "perf6"] - keys) | length == 0)
+    and (.binarySizeBytes | valid_metric)
+    and (.coldStartMs | valid_metric)
+    and (.idleRssKb | valid_metric)
+    and (.tokenReductionPct | valid_metric)
+    and (.sitesCount | type == "number")
+    and (.perf6 | valid_perf6);
+  length == 1
+    and (.[0] | type) == "object"
+    and (.[0] | length > 0)
+    and (.[0] | [.[]] | all(valid_target))
+'
+if ! jq -e -s "$SCHEMA_CHECK" "$TMP_OUTPUT" >/dev/null 2>&1; then
+  echo "error: bench output is not exactly one JSON object matching the expected schema; not appending to history" >&2
+  echo "  (expected: {\"<target>\": {binarySizeBytes, coldStartMs, idleRssKb, tokenReductionPct, sitesCount, perf6}, ...}; each metric's status must be measured/skipped/unsupported/error with the fields that status requires; see README.md 'スキーマ')" >&2
+  echo "  (this can happen when the bench's own configuration is invalid; see the bench's stderr output)" >&2
+  exit 2
+fi
+
+# 上記までのスキーマ検証は各フィールドの形だけを見ており、`--bench-exit-code`
+# と結果の中身が食い違っていても素通しする。`--input` で `--bench-exit-code`
+# を省略すると常に 0 になっていたため、例えば同梱の error-exit.json
+# （coldStartMs が "error"）を終了コード省略で渡すと `benchExitCode: 0` の
+# 行が追記され、失敗した計測を成功として記録してしまっていた（実装済みを
+# 装う。AGENTS.md「品質ゲートの破壊」に反する。TASK-84.2・Issue #212 の
+# レビュー指摘対応）。
+#
+# `../competitor_lightpanda.rs` の終了コード契約（`support::bench_exit_code`）
+# は「対象ごとの binarySizeBytes/coldStartMs/idleRssKb/tokenReductionPct の
+# いずれかが status=="error" なら 1、それ以外（skipped/unsupported のみ）は
+# 0」で決まる（`measure.rs` の `run_all` が `outcomes` へ集めるのはこの 4
+# フィールドのみで、`perf6` は判定対象に含めない。`perf6_comparison` の
+# ドキュメント参照。below_target は計測結果の一種であり失敗ではないため、
+# `perf6` 側にも exit code への影響はない）。この契約に従って結果 JSON から
+# 期待される終了コードを導出する。
+#
+# `--bench-exit-code` を省略した場合（`--input` 経由のみ。実行時の暫定値は
+# 上記で 0 にしていた）はこの導出値をそのまま使う。明示的に指定された場合
+# （`--bench-exit-code` 経由、または `cargo bench` を実行した場合の実際の
+# 終了コード）は導出値と一致することを確認し、一致しなければ「結果とその
+# 終了コードが矛盾している」壊れた入力とみなし、追記せずエラー（exit 2）に
+# する。
+DERIVE_EXIT_CODE_CHECK='
+  def target_has_error:
+    ([.binarySizeBytes, .coldStartMs, .idleRssKb, .tokenReductionPct] | any(.status == "error"));
+  if (.[0] | [.[]] | any(target_has_error)) then 1 else 0 end
+'
+DERIVED_EXIT_CODE=$(jq -r -s "$DERIVE_EXIT_CODE_CHECK" "$TMP_OUTPUT" | tr -d '\r')
+if [ -n "$INPUT" ] && [ "$BENCH_EXIT_CODE_EXPLICIT" = "false" ]; then
+  BENCH_EXIT_CODE="$DERIVED_EXIT_CODE"
+elif [ "$BENCH_EXIT_CODE" != "$DERIVED_EXIT_CODE" ]; then
+  echo "error: --bench-exit-code ($BENCH_EXIT_CODE) is inconsistent with the result (a target's status implies exit code $DERIVED_EXIT_CODE); not appending to history" >&2
+  exit 2
+fi
+
+# gitCommit: CI では GITHUB_SHA、それ以外は git rev-parse HEAD を使う。
+# 取得できない・40 桁 hex に一致しない場合は "unknown" にする（fail-closed
+# にはせず、記録自体は続行する。git 管理外の一時 checkout 等でも動かすため）。
+GIT_COMMIT="${GITHUB_SHA:-}"
+if [ -z "$GIT_COMMIT" ]; then
+  # git は Windows ネイティブ実行時に CRLF を出力しうる（jq と同じ既知の挙動。
+  # harness/compat-regression/check-matrix.sh 冒頭コメント・PR #452 参照）。
+  # 末尾の \r を除去してから 40 桁 hex 判定する（除去し忘れると Windows でだけ
+  # 正当なコミットハッシュが常に "unknown" 扱いになる）。
+  GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null | tr -d '\r' || true)"
+fi
+if ! [[ "$GIT_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  GIT_COMMIT="unknown"
+fi
+
+RECORDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# OS/arch は `uname` で取得し、既知の値へ正規化する。既知でない値はそのまま
+# 小文字化して残す（未知環境でも記録自体は続行する。fail-closed にしない）。
+UNAME_S="$(uname -s)"
+case "$UNAME_S" in
+  Linux*) OS="linux" ;;
+  Darwin*) OS="darwin" ;;
+  MINGW* | MSYS* | CYGWIN*) OS="windows" ;;
+  *) OS="$(printf '%s' "$UNAME_S" | tr '[:upper:]' '[:lower:]')" ;;
+esac
+UNAME_M="$(uname -m)"
+case "$UNAME_M" in
+  x86_64 | amd64) ARCH="x86_64" ;;
+  arm64 | aarch64) ARCH="aarch64" ;;
+  *) ARCH="$(printf '%s' "$UNAME_M" | tr '[:upper:]' '[:lower:]')" ;;
+esac
+
+RUN_ID_ARGS=(--argjson runId null)
+if [ -n "${GITHUB_RUN_ID:-}" ]; then
+  RUN_ID_ARGS=(--arg runId "$GITHUB_RUN_ID")
+fi
+
+# jq --arg/--argjson で全ての値を渡し、シェルでの文字列連結を一切しない
+# （jq インジェクション対策。harness/compat-regression/check-matrix.sh と
+# 同じ方針。security.md「インジェクション」）。jq は Windows ネイティブ
+# 実行時に CRLF を出力しうる（check-matrix.sh 冒頭コメント・PR #452 と同じ
+# 既知の挙動）ため、`tr -d '\r'` を挟んで末尾の \r を除去してから履歴へ
+# 追記する（除去し忘れると history.jsonl の各行に \r が混入し、
+# coding-rust.md「内部データファイルの改行は LF 固定」に反する）。
+# `set -o pipefail`（冒頭）済みのため、jq の非ゼロ終了は tr を挟んでも
+# パイプライン全体の失敗として検出できる。
+if ! LINE=$(jq -c -n \
+  --argjson schemaVersion 1 \
+  --arg recordedAt "$RECORDED_AT" \
+  --arg gitCommit "$GIT_COMMIT" \
+  --arg os "$OS" \
+  --arg arch "$ARCH" \
+  --arg source "$SOURCE" \
+  --argjson benchExitCode "$BENCH_EXIT_CODE" \
+  --slurpfile result "$TMP_OUTPUT" \
+  "${RUN_ID_ARGS[@]}" \
+  '{
+    schemaVersion: $schemaVersion,
+    recordedAt: $recordedAt,
+    gitCommit: $gitCommit,
+    os: $os,
+    arch: $arch,
+    source: $source,
+    runId: $runId,
+    benchExitCode: $benchExitCode,
+    result: $result[0]
+  }' 2>&1 | tr -d '\r'); then
+  echo "error: failed to build the JSONL line: $LINE" >&2
+  exit 2
+fi
+
+printf '%s\n' "$LINE" >>"$HISTORY"
+echo "recorded to $HISTORY"
+
+exit "$BENCH_EXIT_CODE"

@@ -1,0 +1,10 @@
+{
+  "fandhe-browser": {
+    "binarySizeBytes": { "status": "skipped", "reason": "FANDHE_BROWSER_BIN not set" },
+    "coldStartMs": { "status": "skipped", "reason": "FANDHE_BROWSER_BIN not set" },
+    "idleRssKb": { "status": "skipped", "reason": "FANDHE_BROWSER_BIN not set" },
+    "tokenReductionPct": { "status": "skipped", "reason": "FANDHE_BROWSER_BIN not set" },
+    "sitesCount": 3,
+    "perf6": { "status": "skipped", "reason": "CHROMIUM_IDLE_RSS_KB not set" }
+  }
+}
