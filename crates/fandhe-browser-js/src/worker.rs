@@ -184,31 +184,24 @@ fn evaluate_and_respond(
 /// `match` は既知の全 variant を網羅すれば `_` 分岐は不要になる
 /// （`#[non_exhaustive]` が制限するのは他 crate からの網羅性判定のみ）。
 ///
-/// タイムアウトかどうかは、[`V8Engine::evaluate_script`] が生成する
-/// メッセージの文言（`"... timeout ..."`。`v8_engine.rs` の
-/// `SCRIPT_EXECUTION_TIMEOUT` のドキュメントコメント参照）で判別する。
-/// 専用の `JsEngineError` variant を `v8_engine` 側へ足さなかったのは、
-/// `TASK-29.6` でトレイトへ集約するまで同モジュールのエラー型を変えない
-/// ため（`v8_engine.rs` モジュール冒頭「スタブについて」）。
+/// タイムアウトは [`JsEngineError::Timeout`] variant で直接判別する
+/// （Issue #503 W5。以前はメッセージの文言（`"... timeout ..."`）で
+/// 判別していたが、専用 variant を追加したため文言ヒューリスティックは
+/// 不要になった）。
 ///
-/// `JsEngineError::ResourceLimitExceeded` は現在の `v8_engine`
-/// 実装からは返らない（ヒープ上限到達はプロセスの fatal OOM に一本化
-/// した。`v8_engine.rs` の `MAX_ISOLATE_HEAP_BYTES` のドキュメント
-/// コメント参照）が、`enum` が存在する以上 `match` を尽くす必要がある
-/// ため、防御的に「評価失敗」として扱う分岐を用意する（実際に到達する
-/// 経路は無い。実装済みを装わない。REPAIR-3）。
+/// `JsEngineError::ResourceLimitExceeded`・`JsEngineError::EngineUnavailable`
+/// は現在の `v8_engine`（子プロセスの中で動く評価本体）実装からは返らない
+/// （ヒープ上限到達はこのプロセス自体の fatal OOM に一本化し、
+/// `EngineUnavailable` は親側 `process_engine.rs` だけが構築する variant
+/// のため）。`enum` が存在する以上 `match` を尽くす必要があるため、
+/// 防御的に「評価失敗」として扱う分岐を用意する（実際に到達する経路は
+/// 無い。実装済みを装わない。REPAIR-3）。
 fn classify_evaluation_error(err: &JsEngineError) -> (ErrorKind, String) {
     match err {
-        JsEngineError::EvaluationFailed(msg) => {
-            let kind = if msg.contains("timeout") {
-                ErrorKind::Timeout
-            } else {
-                ErrorKind::Evaluation
-            };
-            (kind, truncate_for_wire(msg))
-        }
+        JsEngineError::EvaluationFailed(msg) => (ErrorKind::Evaluation, truncate_for_wire(msg)),
         JsEngineError::BindingFailed(msg) => (ErrorKind::Binding, truncate_for_wire(msg)),
-        JsEngineError::ResourceLimitExceeded(msg) => {
+        JsEngineError::Timeout(msg) => (ErrorKind::Timeout, truncate_for_wire(msg)),
+        JsEngineError::ResourceLimitExceeded(msg) | JsEngineError::EngineUnavailable(msg) => {
             (ErrorKind::Evaluation, truncate_for_wire(msg))
         }
     }
@@ -259,12 +252,13 @@ mod tests {
         assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
     }
 
-    /// JS-1・Issue #503: `EvaluationFailed` はメッセージにタイムアウトの
-    /// 文言を含む場合のみ `ErrorKind::Timeout` になり、それ以外は
-    /// `ErrorKind::Evaluation` になること。
+    /// JS-1・Issue #503 W5: `JsEngineError::Timeout` は `ErrorKind::Timeout`
+    /// に、`EvaluationFailed`（構文エラー等）は `ErrorKind::Evaluation` に
+    /// なること（専用 variant による判別。文言ヒューリスティックは
+    /// 使わない）。
     #[test]
     fn js_1_classify_evaluation_error_distinguishes_timeout_from_other_evaluation_failures() {
-        let (kind, _) = classify_evaluation_error(&JsEngineError::EvaluationFailed(
+        let (kind, _) = classify_evaluation_error(&JsEngineError::Timeout(
             "script execution exceeded the 2 second timeout and was terminated".to_string(),
         ));
         assert_eq!(kind, ErrorKind::Timeout);
@@ -275,9 +269,9 @@ mod tests {
         assert_eq!(kind, ErrorKind::Evaluation);
     }
 
-    /// JS-1・Issue #503: `BindingFailed`/`ResourceLimitExceeded` も
-    /// `match` が尽くしていること（コンパイル時の網羅性チェックに加え、
-    /// 具体値でも確認する）。
+    /// JS-1・Issue #503: `BindingFailed`/`ResourceLimitExceeded`/
+    /// `EngineUnavailable` も `match` が尽くしていること（コンパイル時の
+    /// 網羅性チェックに加え、具体値でも確認する）。
     #[test]
     fn js_1_classify_evaluation_error_handles_binding_and_resource_limit_variants() {
         let (kind, message) =
@@ -289,6 +283,11 @@ mod tests {
             classify_evaluation_error(&JsEngineError::ResourceLimitExceeded("oom".to_string()));
         assert_eq!(kind, ErrorKind::Evaluation);
         assert_eq!(message, "oom");
+
+        let (kind, message) =
+            classify_evaluation_error(&JsEngineError::EngineUnavailable("gone".to_string()));
+        assert_eq!(kind, ErrorKind::Evaluation);
+        assert_eq!(message, "gone");
     }
 
     /// JS-1・Issue #503: 未知のプロトコルバージョン文字列は Hello を

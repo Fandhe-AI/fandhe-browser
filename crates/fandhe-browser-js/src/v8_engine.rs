@@ -207,7 +207,7 @@ const MAX_RESULT_STRING_UTF16_UNITS: usize = 1_048_576; // 約 1M 文字（2 MiB
 /// 含まれる」ことであり、「コンパイル処理自体を強制的に打ち切れる」こと
 /// ではない。[`MAX_SCRIPT_SOURCE_BYTES`] による入力サイズ上限が、
 /// コンパイル時間そのものに対する現状の主な緩和策である。
-const SCRIPT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const SCRIPT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// プロセス内で V8 の Platform 初期化を 1 回だけ実行するためのフラグ。
 static V8_INIT: Once = Once::new();
@@ -643,17 +643,22 @@ impl V8Engine {
             Some(compiled) => compiled,
             None => {
                 // コンパイル段階で打ち切られた場合も、実行段階の打ち切りと
-                // 同じ `JsEngineError::EvaluationFailed` を返す（呼び出し側
-                // から見て打ち切り理由の扱いを変えない）。`extract_message`
-                // を監視スレッドが生きている間に呼ぶ（`finish_watchdog` の
-                // ドキュメントコメント参照）。
+                // 同じ扱いにする（呼び出し側から見て打ち切り理由の扱いを
+                // 変えない）。`extract_message` を監視スレッドが生きている
+                // 間に呼ぶ（`finish_watchdog` のドキュメントコメント参照）。
+                //
+                // Issue #503 W5: タイムアウトによる打ち切りは
+                // `JsEngineError::Timeout` を返す（構文エラー等の
+                // `EvaluationFailed` と呼び出し側が判別できるようにする。
+                // 子プロセス分離後は、この打ち切りでも子プロセス自体は
+                // 生き続け Context も残るため（`super::process_engine` が
+                // 検出する「子の watchdog による打ち切り」に対応）、
+                // メッセージに "context was discarded" は含めない。
                 let message = extract_message();
                 let was_terminated = finish_watchdog(done_tx, watchdog);
-                let message = if was_terminated {
-                    timeout_message("compilation")
-                } else {
-                    message
-                };
+                if was_terminated {
+                    return Err(JsEngineError::Timeout(timeout_message("compilation")));
+                }
                 return Err(JsEngineError::EvaluationFailed(message));
             }
         };
@@ -671,10 +676,12 @@ impl V8Engine {
         let result = match run_result {
             Some(result) => result,
             None => {
-                let message = if was_terminated {
-                    timeout_message("execution")
-                } else {
-                    message.expect("message is Some because run_result is None")
+                if was_terminated {
+                    return Err(JsEngineError::Timeout(timeout_message("execution")));
+                }
+                let message = match message {
+                    Some(message) => message,
+                    None => "unknown script error".to_string(),
                 };
                 return Err(JsEngineError::EvaluationFailed(message));
             }
@@ -1058,13 +1065,13 @@ mod tests {
     fn js_1_v8_evaluate_infinite_loop_times_out() {
         let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
         match engine.evaluate_script("while (true) {}", &EvaluateOptions::default()) {
-            Err(JsEngineError::EvaluationFailed(msg)) => {
+            Err(JsEngineError::Timeout(msg)) => {
                 assert!(
                     msg.contains("timeout"),
                     "expected a timeout message, got: {msg}"
                 );
             }
-            other => panic!("expected EvaluationFailed for an infinite loop, got: {other:?}"),
+            other => panic!("expected Timeout for an infinite loop, got: {other:?}"),
         }
         // タイムアウト後もエンジンが使い続けられること（`terminate_execution`
         // の解除（`cancel_terminate_execution`）が効いていることの確認）。
@@ -1280,7 +1287,7 @@ mod tests {
         engine.thread_safe_handle_for_test().terminate_execution();
 
         match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
-            Err(JsEngineError::EvaluationFailed(msg)) => {
+            Err(JsEngineError::Timeout(msg)) => {
                 // 実測結果を具体値で固定する（REPAIR-3。手元検証と一致しない
                 // 実装変更が入った場合にこのテストが検知する）: `1 + 1` 程度の
                 // 小さいスクリプトでは `v8::Script::compile` は打ち切られず
@@ -1291,9 +1298,9 @@ mod tests {
                     "expected an execution-stage timeout message, got: {msg}"
                 );
             }
-            other => panic!(
-                "expected EvaluationFailed due to a pending termination request, got: {other:?}"
-            ),
+            other => {
+                panic!("expected Timeout due to a pending termination request, got: {other:?}")
+            }
         }
         // 打ち切り後もエンジンが使い続けられること（`cancel_terminate_execution`
         // が効いていることの確認）。
@@ -1330,15 +1337,15 @@ mod tests {
         engine.thread_safe_handle_for_test().terminate_execution();
 
         match engine.evaluate_script(&large_script, &EvaluateOptions::default()) {
-            Err(JsEngineError::EvaluationFailed(msg)) => {
+            Err(JsEngineError::Timeout(msg)) => {
                 assert!(
                     msg.contains("execution exceeded"),
                     "expected an execution-stage timeout message, got: {msg}"
                 );
             }
-            other => panic!(
-                "expected EvaluationFailed due to a pending termination request, got: {other:?}"
-            ),
+            other => {
+                panic!("expected Timeout due to a pending termination request, got: {other:?}")
+            }
         }
         let result = engine
             .evaluate_script("40 + 2", &EvaluateOptions::default())

@@ -19,14 +19,18 @@
 //!   [`STDERR_TAIL_CAPACITY_BYTES`] バイトをリングバッファへ保持する。
 //!   読み続けないとパイプが詰まって子が止まるため必須（設計書 §3.3）
 //!
-//! # エラー変換（現在の暫定措置。実装済みを装わない。REPAIR-3）
+//! # エラー変換（設計書 §3.3 の対応表。`TASK-29`・Issue #503 W5）
 //!
-//! `JsEngineError` は現時点で `EvaluationFailed`/`BindingFailed`/
-//! `ResourceLimitExceeded` の 3 variant のみを持つ。タイムアウト・
-//! 子プロセスの異常終了を専用の variant（`Timeout`・`EngineUnavailable`）
-//! で表す変更は `TASK-29`（Issue #503 設計書 §7 W5）で行う。本 Issue の
-//! 時点では、これらの状況も `EvaluationFailed` のメッセージ文言で表す。
+//! | 状況 | 変換先 | Context |
+//! |---|---|---|
+//! | 子の watchdog による打ち切り（`Error{kind=Timeout}`） | [`JsEngineError::Timeout`] | 残る |
+//! | 応答待ちの期限切れで親が `kill` した | [`JsEngineError::Timeout`] | 破棄（メッセージに明示） |
+//! | 応答前に EOF になり、stderr に `Fatal ... out of memory` がある | [`JsEngineError::ResourceLimitExceeded`] | 破棄（ヒューリスティック） |
+//! | それ以外の異常終了・プロトコル違反・起動失敗 | [`JsEngineError::EngineUnavailable`] | 破棄 |
 //!
+//! Context が破棄される場合、メッセージに "context was discarded" を
+//! 含める（security.md「偽装・回避機能の禁止」──状態が失われたことを
+//! 隠さない）。
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
 //! - 子への書き込み（`Evaluate` フレームの送信）は呼び出しスレッドで
@@ -51,17 +55,20 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::engine_trait::{JsEngineError, JsValue};
+use super::engine_trait::{EvaluateOptions, JsEngineError, JsValue};
 use super::worker_protocol::{self, ErrorKind, tag};
 
 /// ハンドシェイク（`Hello` フレームの受信）を待つ上限時間（設計書
 /// §3.1「5 秒でタイムアウト」）。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 1 回の評価応答を待つ上限時間（設計書 §3.3「`recv_timeout(2 秒+1 秒)`」。
-/// 子の実行時間監視（[`super::v8_engine`] の `SCRIPT_EXECUTION_TIMEOUT`。
-/// 2 秒）に、IPC 往復・OS スケジューリングの猶予として 1 秒を足す）。
-const EVALUATE_RECV_TIMEOUT: Duration = Duration::from_secs(3);
+/// 1 回の評価応答を待つ上限時間（設計書 §3.3「`recv_timeout(2 秒+1 秒)`」）。
+/// 子の実行時間監視（[`super::v8_engine::SCRIPT_EXECUTION_TIMEOUT`]）に、
+/// IPC 往復・OS スケジューリングの猶予として 1 秒を足す。定数同士の
+/// 演算のため `const` のまま計算でき、`v8_engine.rs` 側の値が変わっても
+/// この余裕（1 秒）は追随する。
+const EVALUATE_RECV_TIMEOUT: Duration =
+    super::v8_engine::SCRIPT_EXECUTION_TIMEOUT.saturating_add(Duration::from_secs(1));
 
 /// 子の `Drop` 時、stdin を閉じてから強制終了するまでに正常終了を待つ
 /// 上限時間（設計書 §3.2「1 秒だけ `try_wait` で待つ」）。
@@ -107,6 +114,30 @@ impl WorkerHandle {
             Ok(tail) => String::from_utf8_lossy(&tail).into_owned(),
             Err(_) => String::new(),
         }
+    }
+
+    /// 子の終了を確定させ（`wait`）、stderr drain スレッドが EOF まで
+    /// 読み切るのを待って（`join`）から、stderr の末尾をスナップショット
+    /// する。
+    ///
+    /// **`wait` → `join` → スナップショットの順序が必須**: `wait` が
+    /// 返った時点では子の stderr 書き込み端は閉じているが、drain
+    /// スレッドがまだ最後のチャンク（`Fatal JavaScript out of memory`
+    /// を含みうる）を読み切っているとは限らない。`join` の前に
+    /// スナップショットすると、負荷の高い CI 環境では fatal メッセージを
+    /// 取りこぼし、`ResourceLimitExceeded` になるべきところが
+    /// `EngineUnavailable` に誤判定されうる。
+    ///
+    /// 呼び出し前提: 子は既に終了しているか、これから終了する（`wait`
+    /// 自体が終了を待つ）。呼び出し元がこの前提を保証する（例:
+    /// `Ok(ReaderEvent::Eof)` は子がストリームを閉じた合図であり、
+    /// 通常は既に終了しているか、まもなく終了する）。
+    fn reap_and_collect_stderr(&mut self) -> String {
+        let _ = self.child.wait();
+        if let Some(handle) = self.stderr_thread.take() {
+            let _ = handle.join();
+        }
+        self.stderr_tail_snapshot()
     }
 
     /// stderr の末尾に、ヒープ上限到達を示す V8 の fatal メッセージが
@@ -180,7 +211,15 @@ impl V8ProcessEngine {
     /// 場合、次回の呼び出しで新しい子プロセスを自動的に起動し直す
     /// （本メソッドが `self.worker` を都度 `take`/設定し直す構造その
     /// ものが、この「次回に新しい子を起動し直す」動作を実現する）。
-    pub(crate) fn evaluate_script(&mut self, script: &str) -> Result<JsValue, JsEngineError> {
+    ///
+    /// `_options` は現時点で未使用（[`EvaluateOptions`] は空構造体。
+    /// `engine_trait.rs` 参照）。`TASK-29.6` で `impl JsEngine` へ集約する
+    /// 際、トレイトのシグネチャとそのまま揃えるために受け取っておく。
+    pub(crate) fn evaluate_script(
+        &mut self,
+        script: &str,
+        _options: &EvaluateOptions,
+    ) -> Result<JsValue, JsEngineError> {
         // 外部入力（スクリプト文字列）の経路。子を起動する前に検査する
         // （coding-rust.md「外部入力」節）。
         if script.len() > worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD {
@@ -214,7 +253,7 @@ impl V8ProcessEngine {
         // 続けさせることはないが、ライブラリとして誤って組み込まれた
         // 場合の多重防御として確認する。
         if std::env::var(worker_protocol::MARKER_ENV_VAR).is_ok() {
-            return Err(JsEngineError::EvaluationFailed(
+            return Err(JsEngineError::EngineUnavailable(
                 "refusing to spawn a nested JS worker process: this process is itself running \
                  as a worker"
                     .to_string(),
@@ -242,24 +281,24 @@ impl V8ProcessEngine {
         command.stderr(Stdio::piped());
 
         let mut child = command.spawn().map_err(|err| {
-            JsEngineError::EvaluationFailed(format!(
+            JsEngineError::EngineUnavailable(format!(
                 "failed to spawn the JS worker process ({}): {err}",
                 exe.display()
             ))
         })?;
 
         let stdin = child.stdin.take().ok_or_else(|| {
-            JsEngineError::EvaluationFailed(
+            JsEngineError::EngineUnavailable(
                 "JS worker process was spawned without a stdin pipe".to_string(),
             )
         })?;
         let mut stdout = child.stdout.take().ok_or_else(|| {
-            JsEngineError::EvaluationFailed(
+            JsEngineError::EngineUnavailable(
                 "JS worker process was spawned without a stdout pipe".to_string(),
             )
         })?;
         let mut stderr = child.stderr.take().ok_or_else(|| {
-            JsEngineError::EvaluationFailed(
+            JsEngineError::EngineUnavailable(
                 "JS worker process was spawned without a stderr pipe".to_string(),
             )
         })?;
@@ -332,13 +371,13 @@ impl V8ProcessEngine {
                     }
                     Ok((version, _engine)) => {
                         worker.terminate_now();
-                        Err(JsEngineError::EvaluationFailed(format!(
+                        Err(JsEngineError::EngineUnavailable(format!(
                             "JS worker process reported unsupported protocol version {version}"
                         )))
                     }
                     Err(err) => {
                         worker.terminate_now();
-                        Err(JsEngineError::EvaluationFailed(format!(
+                        Err(JsEngineError::EngineUnavailable(format!(
                             "JS worker process sent a malformed Hello frame: {err}"
                         )))
                     }
@@ -346,32 +385,35 @@ impl V8ProcessEngine {
             }
             Ok(ReaderEvent::Frame(other_tag, _)) => {
                 worker.terminate_now();
-                Err(JsEngineError::EvaluationFailed(format!(
+                Err(JsEngineError::EngineUnavailable(format!(
                     "JS worker process sent an unexpected frame (tag {other_tag}) before Hello"
                 )))
             }
             Ok(ReaderEvent::Eof) => {
-                let tail = worker.stderr_tail_snapshot();
-                worker.terminate_now();
-                Err(JsEngineError::EvaluationFailed(format!(
+                // 子は既にストリームを閉じている（終了済みか、まもなく
+                // 終了する）ため、kill を挟まずに直接 reap する
+                // （`reap_and_collect_stderr` のドキュメントコメント
+                // 「wait → join → スナップショットの順序が必須」参照）。
+                let tail = worker.reap_and_collect_stderr();
+                Err(JsEngineError::EngineUnavailable(format!(
                     "JS worker process exited before completing the handshake; stderr: {tail}"
                 )))
             }
             Ok(ReaderEvent::Invalid(desc)) => {
                 worker.terminate_now();
-                Err(JsEngineError::EvaluationFailed(format!(
+                Err(JsEngineError::EngineUnavailable(format!(
                     "JS worker process sent a malformed frame during the handshake: {desc}"
                 )))
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 worker.terminate_now();
-                Err(JsEngineError::EvaluationFailed(
+                Err(JsEngineError::EngineUnavailable(
                     "JS worker process handshake timed out".to_string(),
                 ))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 worker.terminate_now();
-                Err(JsEngineError::EvaluationFailed(
+                Err(JsEngineError::EngineUnavailable(
                     "JS worker process handshake channel disconnected unexpectedly".to_string(),
                 ))
             }
@@ -423,10 +465,14 @@ impl V8ProcessEngine {
             ))),
         };
         if let Err(err) = write_result {
-            let tail = worker.stderr_tail_snapshot();
+            // 子は既に死んでいる可能性が高い（broken pipe 等）。kill は
+            // 冪等（既に終了したプロセスへの kill はエラーを返すだけで
+            // 副作用は無い）ため、まず kill してから reap する
+            // （`reap_and_collect_stderr` の順序前提を満たす）。
             worker.terminate_now();
+            let tail = worker.reap_and_collect_stderr();
             return (
-                Err(JsEngineError::EvaluationFailed(format!(
+                Err(JsEngineError::EngineUnavailable(format!(
                     "failed to send the script to the JS worker process (it may have crashed): \
                      {err}; stderr: {tail}; context was discarded"
                 ))),
@@ -441,7 +487,7 @@ impl V8ProcessEngine {
                     Err(err) => {
                         worker.terminate_now();
                         (
-                            Err(JsEngineError::EvaluationFailed(format!(
+                            Err(JsEngineError::EngineUnavailable(format!(
                                 "JS worker process sent a malformed Result frame: {err}; context \
                                  was discarded"
                             ))),
@@ -452,10 +498,10 @@ impl V8ProcessEngine {
             }
             Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::ERROR => {
                 match worker_protocol::decode_error(&payload) {
-                    // 子の watchdog による打ち切り。Context は残る
-                    // （設計書 §3.3 の表の 1 行目）。
+                    // 子の watchdog による打ち切り。子プロセスは生き続け、
+                    // Context も残る（設計書 §3.3 の表の 1 行目）。
                     Ok((ErrorKind::Timeout, message)) => (
-                        Err(JsEngineError::EvaluationFailed(format!(
+                        Err(JsEngineError::Timeout(format!(
                             "script execution timed out inside the JS worker process: {message}"
                         ))),
                         true,
@@ -469,7 +515,7 @@ impl V8ProcessEngine {
                     Err(err) => {
                         worker.terminate_now();
                         (
-                            Err(JsEngineError::EvaluationFailed(format!(
+                            Err(JsEngineError::EngineUnavailable(format!(
                                 "JS worker process sent a malformed Error frame: {err}; context \
                                  was discarded"
                             ))),
@@ -481,7 +527,7 @@ impl V8ProcessEngine {
             Ok(ReaderEvent::Frame(other_tag, _)) => {
                 worker.terminate_now();
                 (
-                    Err(JsEngineError::EvaluationFailed(format!(
+                    Err(JsEngineError::EngineUnavailable(format!(
                         "JS worker process sent an unexpected frame (tag {other_tag}); context \
                          was discarded"
                     ))),
@@ -489,8 +535,9 @@ impl V8ProcessEngine {
                 )
             }
             Ok(ReaderEvent::Eof) => {
-                let _ = worker.child.wait();
-                let tail = worker.stderr_tail_snapshot();
+                // 子は既にストリームを閉じている（終了済みか、まもなく
+                // 終了する）ため、kill を挟まずに直接 reap する。
+                let tail = worker.reap_and_collect_stderr();
                 let discarded_note =
                     "context was discarded; the next evaluation runs in a fresh context";
                 if WorkerHandle::stderr_indicates_oom(&tail) {
@@ -503,7 +550,7 @@ impl V8ProcessEngine {
                     )
                 } else {
                     (
-                        Err(JsEngineError::EvaluationFailed(format!(
+                        Err(JsEngineError::EngineUnavailable(format!(
                             "JS worker process terminated unexpectedly before responding; \
                              {discarded_note}; stderr: {tail}"
                         ))),
@@ -514,7 +561,7 @@ impl V8ProcessEngine {
             Ok(ReaderEvent::Invalid(desc)) => {
                 worker.terminate_now();
                 (
-                    Err(JsEngineError::EvaluationFailed(format!(
+                    Err(JsEngineError::EngineUnavailable(format!(
                         "JS worker process sent a malformed frame: {desc}; context was discarded"
                     ))),
                     false,
@@ -523,7 +570,7 @@ impl V8ProcessEngine {
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 worker.terminate_now();
                 (
-                    Err(JsEngineError::EvaluationFailed(
+                    Err(JsEngineError::Timeout(
                         "script evaluation exceeded the JS worker deadline and the process was \
                          killed; context was discarded; the next evaluation runs in a fresh \
                          context"
@@ -535,7 +582,7 @@ impl V8ProcessEngine {
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 worker.terminate_now();
                 (
-                    Err(JsEngineError::EvaluationFailed(
+                    Err(JsEngineError::EngineUnavailable(
                         "JS worker process communication channel disconnected unexpectedly; \
                          context was discarded"
                             .to_string(),
