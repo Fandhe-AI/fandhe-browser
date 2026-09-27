@@ -27,8 +27,15 @@
 //!   （`super::process_engine` のドキュメントコメント参照）
 //! - 本モジュールは孤児プロセス化を防ぐため、stdin を読み続けることで
 //!   親の生死を検出する。親が終了すれば stdin が EOF になり、本モジュール
-//!   は正常終了する（設計書 §3.2「孤児の防止」）。Job Object・PDEATHSIG
-//!   のような OS 固有の仕組みには依存しない
+//!   は正常終了する（設計書 §3.2「孤児の防止」）。**孤児の防止には**
+//!   Job Object・PDEATHSIG のような OS 固有の仕組みには依存しない（下記
+//!   のとおり Job Object 自体はメモリ上限の目的で Windows でのみ使う）
+//! - ヒープ外メモリ（`ArrayBuffer` の backing store 等）にも
+//!   [`super::resource_limits::enforce_child_memory_limit`] が起動直後・
+//!   V8 初期化前に OS 側の上限を設定する（Linux の `RLIMIT_DATA`・
+//!   Windows の Job Object working set 上限。設定に失敗したら評価を
+//!   始めずに終了する）。OS ごとの強制の強さ・既知の制限は
+//!   `super::resource_limits` のドキュメントコメントを参照
 //! - 本プロセスはセキュリティ上のサンドボックスではない。親と同じ
 //!   ユーザー権限で動作し、seccomp 等の権限制限も行わない。得られるのは
 //!   クラッシュ・メモリの資源分離だけである（`super::process_engine` の
@@ -109,6 +116,15 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
              (this binary implements version {})",
             worker_protocol::PROTOCOL_VERSION
         );
+        return ExitCode::FAILURE;
+    }
+
+    // V8 を初期化する（ひいては Isolate を生成する）前に、自分自身へ
+    // OS のメモリ上限を設定する（codex レビュー指摘 #503 P0「ヒープ外
+    // メモリが無制限」対応。`super::resource_limits` のドキュメント
+    // コメント参照）。失敗したら評価を始めずに終了する（fail-closed）。
+    if let Err(err) = super::resource_limits::enforce_child_memory_limit() {
+        eprintln!("fandhe-browser-js worker: failed to enforce the child memory limit: {err}");
         return ExitCode::FAILURE;
     }
 

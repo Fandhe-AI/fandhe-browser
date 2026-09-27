@@ -26,6 +26,7 @@
 //! | 子の watchdog による打ち切り（`Error{kind=Timeout}`） | [`JsEngineError::Timeout`] | 残る |
 //! | 応答待ちの期限切れで親が `kill` した | [`JsEngineError::Timeout`] | 破棄（メッセージに明示） |
 //! | 応答前に EOF になり、stderr に `Fatal ... out of memory` がある | [`JsEngineError::ResourceLimitExceeded`] | 破棄（ヒューリスティック） |
+//! | 応答待ちのあいだ、親の RSS 監視（[`super::resource_limits`]）が子の RSS の超過を検出した | [`JsEngineError::ResourceLimitExceeded`] | 破棄（メッセージに実測 RSS を明示。codex レビュー指摘 #503 P0 対応） |
 //! | それ以外の異常終了・プロトコル違反・起動失敗 | [`JsEngineError::EngineUnavailable`] | 破棄 |
 //!
 //! Context が破棄される場合、メッセージに "context was discarded" を
@@ -39,11 +40,19 @@
 //!   OS のパイプバッファが尽きると書き込みがブロックしうる（通常運用
 //!   では子は常に stdin を読み続けるため起こらない想定だが、理論上の
 //!   残存リスクとして記録する）
-//! - ヒープ外メモリ（`ArrayBuffer` の backing store 等）の上限は子の
-//!   中に無い（[`super::v8_engine`] の `MAX_ISOLATE_HEAP_BYTES` ドキュメント
-//!   コメント参照）。OS 側の制限（Linux の RLIMIT_DATA、Windows の
-//!   Job Object）は後続の Issue で扱う
-//! - macOS には子のメモリ使用量を強制する手段が無い
+//! - ヒープ外メモリ（`ArrayBuffer` の backing store 等）には
+//!   [`super::resource_limits`] が子側の OS 別強制（Linux の
+//!   `RLIMIT_DATA`・Windows の Job Object working set 上限）と親側の
+//!   RSS 監視による多層防御を設けている（codex レビュー指摘 #503 P0
+//!   対応）。ただし実測の結果、子側の OS 別強制はいずれも厳密な上限には
+//!   ならず（Linux は V8 の `CodeRange` 仮想アドレス予約のため小さい値に
+//!   設定できない・Windows は working set の trim にしかならない）、
+//!   **3 OS 共通で親側の RSS 監視が主たる防衛線**である。詳細・実測値は
+//!   `super::resource_limits` のドキュメントコメント「OS ごとの強制の
+//!   強さ」節を参照
+//! - macOS には子のメモリ使用量を OS 側で強制する手段が無く
+//!   （`super::resource_limits` の実機検証結果を参照）、親側の RSS 監視
+//!   だけに頼る
 //! - 子はセキュリティ上のサンドボックスではない。同じユーザー権限で動作し、
 //!   seccomp 等も使わない。得られるのはクラッシュ・メモリの資源分離
 //!   だけである
@@ -347,6 +356,16 @@ impl V8ProcessEngine {
         stdin.flush()
     }
 
+    /// テスト専用: 現在保持している子プロセスの PID を返す（子が未起動
+    /// なら `None`）。codex レビュー指摘 #503 P0「ヒープ外メモリが無制限」
+    /// 対応の回帰テストが、Linux で `/proc/<pid>/limits` から実際に
+    /// `RLIMIT_DATA` が設定されていることを確認するために使う
+    /// （`super::resource_limits` のドキュメントコメント参照）。
+    #[doc(hidden)]
+    pub fn worker_pid_for_test(&self) -> Option<u32> {
+        self.worker.as_ref().map(|worker| worker.child.id())
+    }
+
     /// 子プロセスを起動し、ハンドシェイク（`Hello` の受信）まで完了させる。
     fn spawn_worker(&self) -> Result<WorkerHandle, JsEngineError> {
         // 設計書 §3.1「再帰の防止」: 自分自身が既にワーカーとして起動
@@ -602,96 +621,19 @@ impl V8ProcessEngine {
             );
         }
 
-        match worker.frame_rx.recv_timeout(EVALUATE_RECV_TIMEOUT) {
-            Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::RESULT => {
-                match worker_protocol::decode_js_value(&payload) {
-                    Ok((value, _consumed)) => (Ok(value), true),
-                    Err(err) => {
-                        worker.terminate_now();
-                        (
-                            Err(JsEngineError::EngineUnavailable(format!(
-                                "JS worker process sent a malformed Result frame: {err}; context \
-                                 was discarded"
-                            ))),
-                            false,
-                        )
-                    }
-                }
-            }
-            Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::ERROR => {
-                match worker_protocol::decode_error(&payload) {
-                    // 子の watchdog による打ち切り。子プロセスは生き続け、
-                    // Context も残る（設計書 §3.3 の表の 1 行目）。
-                    Ok((ErrorKind::Timeout, message)) => (
-                        Err(JsEngineError::Timeout(format!(
-                            "script execution timed out inside the JS worker process: {message}"
-                        ))),
-                        true,
-                    ),
-                    Ok((ErrorKind::Evaluation, message)) => {
-                        (Err(JsEngineError::EvaluationFailed(message)), true)
-                    }
-                    Ok((ErrorKind::Binding, message)) => {
-                        (Err(JsEngineError::BindingFailed(message)), true)
-                    }
-                    Err(err) => {
-                        worker.terminate_now();
-                        (
-                            Err(JsEngineError::EngineUnavailable(format!(
-                                "JS worker process sent a malformed Error frame: {err}; context \
-                                 was discarded"
-                            ))),
-                            false,
-                        )
-                    }
-                }
-            }
-            Ok(ReaderEvent::Frame(other_tag, _)) => {
+        // 応答を待つあいだ、`super::resource_limits::RSS_POLL_INTERVAL`
+        // 刻みで `recv_timeout` を繰り返し、その合間に子の RSS を監視する
+        // （codex レビュー指摘 #503 P0「ヒープ外メモリが無制限」対応の
+        // 親側監視。`super::resource_limits` のドキュメントコメント
+        // 参照）。全体の期限は変えず、`EVALUATE_RECV_TIMEOUT` に達したら
+        // 従来どおり `Timeout` として扱う。
+        let deadline = Instant::now() + EVALUATE_RECV_TIMEOUT;
+        let child_pid = worker.child.id();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 worker.terminate_now();
-                (
-                    Err(JsEngineError::EngineUnavailable(format!(
-                        "JS worker process sent an unexpected frame (tag {other_tag}); context \
-                         was discarded"
-                    ))),
-                    false,
-                )
-            }
-            Ok(ReaderEvent::Eof) => {
-                // 子は既にストリームを閉じている（終了済みか、まもなく
-                // 終了する）ため、kill を挟まずに直接 reap する。
-                let tail = worker.reap_and_collect_stderr();
-                let discarded_note =
-                    "context was discarded; the next evaluation runs in a fresh context";
-                if WorkerHandle::stderr_indicates_oom(&tail) {
-                    (
-                        Err(JsEngineError::ResourceLimitExceeded(format!(
-                            "script execution exceeded the isolate heap limit and the JS worker \
-                             process terminated; {discarded_note}; stderr: {tail}"
-                        ))),
-                        false,
-                    )
-                } else {
-                    (
-                        Err(JsEngineError::EngineUnavailable(format!(
-                            "JS worker process terminated unexpectedly before responding; \
-                             {discarded_note}; stderr: {tail}"
-                        ))),
-                        false,
-                    )
-                }
-            }
-            Ok(ReaderEvent::Invalid(desc)) => {
-                worker.terminate_now();
-                (
-                    Err(JsEngineError::EngineUnavailable(format!(
-                        "JS worker process sent a malformed frame: {desc}; context was discarded"
-                    ))),
-                    false,
-                )
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                worker.terminate_now();
-                (
+                return (
                     Err(JsEngineError::Timeout(
                         "script evaluation exceeded the JS worker deadline and the process was \
                          killed; context was discarded; the next evaluation runs in a fresh \
@@ -699,18 +641,137 @@ impl V8ProcessEngine {
                             .to_string(),
                     )),
                     false,
-                )
+                );
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                worker.terminate_now();
-                (
-                    Err(JsEngineError::EngineUnavailable(
-                        "JS worker process communication channel disconnected unexpectedly; \
-                         context was discarded"
-                            .to_string(),
-                    )),
-                    false,
-                )
+            let wait_slice = remaining.min(super::resource_limits::RSS_POLL_INTERVAL);
+
+            match worker.frame_rx.recv_timeout(wait_slice) {
+                Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::RESULT => {
+                    return match worker_protocol::decode_js_value(&payload) {
+                        Ok((value, _consumed)) => (Ok(value), true),
+                        Err(err) => {
+                            worker.terminate_now();
+                            (
+                                Err(JsEngineError::EngineUnavailable(format!(
+                                    "JS worker process sent a malformed Result frame: {err}; \
+                                     context was discarded"
+                                ))),
+                                false,
+                            )
+                        }
+                    };
+                }
+                Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::ERROR => {
+                    return match worker_protocol::decode_error(&payload) {
+                        // 子の watchdog による打ち切り。子プロセスは生き続け、
+                        // Context も残る（設計書 §3.3 の表の 1 行目）。
+                        Ok((ErrorKind::Timeout, message)) => (
+                            Err(JsEngineError::Timeout(format!(
+                                "script execution timed out inside the JS worker process: \
+                                 {message}"
+                            ))),
+                            true,
+                        ),
+                        Ok((ErrorKind::Evaluation, message)) => {
+                            (Err(JsEngineError::EvaluationFailed(message)), true)
+                        }
+                        Ok((ErrorKind::Binding, message)) => {
+                            (Err(JsEngineError::BindingFailed(message)), true)
+                        }
+                        Err(err) => {
+                            worker.terminate_now();
+                            (
+                                Err(JsEngineError::EngineUnavailable(format!(
+                                    "JS worker process sent a malformed Error frame: {err}; \
+                                     context was discarded"
+                                ))),
+                                false,
+                            )
+                        }
+                    };
+                }
+                Ok(ReaderEvent::Frame(other_tag, _)) => {
+                    worker.terminate_now();
+                    return (
+                        Err(JsEngineError::EngineUnavailable(format!(
+                            "JS worker process sent an unexpected frame (tag {other_tag}); \
+                             context was discarded"
+                        ))),
+                        false,
+                    );
+                }
+                Ok(ReaderEvent::Eof) => {
+                    // 子は既にストリームを閉じている（終了済みか、まもなく
+                    // 終了する）ため、kill を挟まずに直接 reap する。
+                    let tail = worker.reap_and_collect_stderr();
+                    let discarded_note =
+                        "context was discarded; the next evaluation runs in a fresh context";
+                    return if WorkerHandle::stderr_indicates_oom(&tail) {
+                        (
+                            Err(JsEngineError::ResourceLimitExceeded(format!(
+                                "script execution exceeded the isolate heap limit and the JS \
+                                 worker process terminated; {discarded_note}; stderr: {tail}"
+                            ))),
+                            false,
+                        )
+                    } else {
+                        (
+                            Err(JsEngineError::EngineUnavailable(format!(
+                                "JS worker process terminated unexpectedly before responding; \
+                                 {discarded_note}; stderr: {tail}"
+                            ))),
+                            false,
+                        )
+                    };
+                }
+                Ok(ReaderEvent::Invalid(desc)) => {
+                    worker.terminate_now();
+                    return (
+                        Err(JsEngineError::EngineUnavailable(format!(
+                            "JS worker process sent a malformed frame: {desc}; context was \
+                             discarded"
+                        ))),
+                        false,
+                    );
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    worker.terminate_now();
+                    return (
+                        Err(JsEngineError::EngineUnavailable(
+                            "JS worker process communication channel disconnected unexpectedly; \
+                             context was discarded"
+                                .to_string(),
+                        )),
+                        false,
+                    );
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // このポーリング刻みでは応答が来なかった。全体の期限
+                    // にはまだ達していない（達していれば上のチェックで
+                    // 先に `return` している）。子の RSS を確認し、
+                    // 上限を超えていれば kill する（`super::resource_limits`
+                    // のドキュメントコメント「親側の RSS 監視」参照）。
+                    // RSS の取得に失敗した場合は fail-open で次のポーリング
+                    // へ進む（`read_child_rss_bytes` のドキュメントコメント
+                    // 参照）。
+                    if let Some(rss_bytes) = super::resource_limits::read_child_rss_bytes(child_pid)
+                        && rss_bytes > super::resource_limits::MAX_CHILD_RSS_BYTES
+                    {
+                        worker.terminate_now();
+                        let tail = worker.reap_and_collect_stderr();
+                        return (
+                            Err(JsEngineError::ResourceLimitExceeded(format!(
+                                "JS worker process RSS ({rss_bytes} bytes) exceeded the parent's \
+                                 monitoring threshold ({} bytes) while waiting for the \
+                                 evaluation response; context was discarded; stderr: {tail}",
+                                super::resource_limits::MAX_CHILD_RSS_BYTES
+                            ))),
+                            false,
+                        );
+                    }
+                    // まだしきい値以下（または監視できなかった）。次の
+                    // ポーリング刻みへ進む。
+                }
             }
         }
     }

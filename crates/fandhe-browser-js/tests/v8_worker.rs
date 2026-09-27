@@ -50,6 +50,15 @@ fn main() -> ExitCode {
     js_1_oversized_test_heap_limit_is_clamped_to_the_production_default();
     eprintln!("case: js_1_undersized_test_heap_limit_is_raised_to_a_working_floor");
     js_1_undersized_test_heap_limit_is_raised_to_a_working_floor();
+    eprintln!(
+        "case: js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceeded"
+    );
+    js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceeded();
+    #[cfg(target_os = "linux")]
+    {
+        eprintln!("case: js_1_linux_child_process_has_rlimit_data_set");
+        js_1_linux_child_process_has_rlimit_data_set();
+    }
     eprintln!("v8_worker: all cases passed");
     ExitCode::SUCCESS
 }
@@ -281,4 +290,111 @@ fn js_1_undersized_test_heap_limit_is_raised_to_a_working_floor() {
             )
         });
     assert_eq!(result, JsValue::Number(2.0));
+}
+
+/// codex レビュー指摘 #503 P0「ヒープ外メモリが無制限」の回帰テスト
+/// 観点「大きな `ArrayBuffer` を確保して触ると `ResourceLimitExceeded`
+/// になり、次の評価が新しい Context で成功すること」: `Uint8Array` の
+/// backing store は V8 のヒープ外（[`v8_engine`] の `MAX_ISOLATE_HEAP_BYTES`。
+/// 本テストは既定値の 128 MiB のまま）に確保されるため、`chunks` 配列
+/// 自体が保持する参照は小さく、V8 の Isolate ヒープ上限には触れない。
+/// それでも際限のない確保は、**3 OS 共通で**親側の RSS 監視
+/// （`resource_limits::MAX_CHILD_RSS_BYTES`。320 MiB）による強制終了と
+/// して検出され、`JsEngineError::ResourceLimitExceeded` になる
+/// （メッセージに "context was discarded" を含む）。Linux の
+/// `RLIMIT_DATA`（`resource_limits::enforce_via_rlimit_data`。2 GiB）は
+/// V8 の `CodeRange` 仮想アドレス予約だけで数百 MiB を要するため小さい
+/// 値には設定できず（`resource_limits` のドキュメントコメント参照）、
+/// RSS 監視のしきい値よりはるかに大きい。したがって本テストの範囲では
+/// RSS 監視が先に発動し、`RLIMIT_DATA` はここでは働かない
+/// （際限のない確保をどこまでも許さないための、より緩い最終防衛線に
+/// 留まる）。
+fn js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceeded() {
+    let mut engine = V8ProcessEngine::new();
+    engine
+        .evaluate_script("var before_oom = 555;", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("marker declaration must evaluate successfully: {err}"));
+
+    // 1 チャンク 10 MiB の `Uint8Array` を確保して実際に書き込み（`fill`
+    // でページをタッチし、仮想アドレス空間の予約だけで済ませない）、
+    // 参照を保持し続ける。ヒープ外の RSS を素早く積み上げ、親の RSS
+    // 監視しきい値（`MAX_CHILD_RSS_BYTES`。320 MiB）に
+    // `SCRIPT_EXECUTION_TIMEOUT`（2 秒）の実行時間内で到達させることを
+    // 狙う（`RLIMIT_DATA`＝2 GiB はこのテストの範囲では発動しない。
+    // 上のドキュメントコメント参照）。
+    let oom_script = "var chunks = []; while (true) { chunks.push(new Uint8Array(1e7).fill(1)); }";
+    match engine.evaluate_script(oom_script, &EvaluateOptions::default()) {
+        Err(JsEngineError::ResourceLimitExceeded(msg)) => {
+            assert!(
+                msg.contains("context was discarded"),
+                "heap-external OOM must discard the context, got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected ResourceLimitExceeded for an ArrayBuffer backing-store exhaustion, got: \
+             {other:?}"
+        ),
+    }
+
+    let result = engine
+        .evaluate_script("40 + 2", &EvaluateOptions::default())
+        .unwrap_or_else(|err| {
+            panic!("engine must recover with a fresh child after heap-external OOM: {err}")
+        });
+    assert_eq!(result, JsValue::Number(42.0));
+
+    match engine.evaluate_script("before_oom", &EvaluateOptions::default()) {
+        Err(JsEngineError::EvaluationFailed(msg)) => {
+            assert!(
+                msg.contains("before_oom") || msg.contains("ReferenceError"),
+                "expected a ReferenceError for a variable from the discarded context, got: {msg}"
+            );
+        }
+        other => {
+            panic!("expected the pre-OOM variable to be gone in the fresh context, got: {other:?}")
+        }
+    }
+}
+
+/// codex レビュー指摘 #503 P0 の回帰テスト観点「Linux では `RLIMIT_DATA`
+/// が実際に設定されていることを確認する」: `/proc/<pid>/limits` の
+/// "Max data size" 行の soft/hard 値が、`resource_limits` モジュールが
+/// 設定する上限（2 GiB＝2,147,483,648 バイト）と一致すること。
+///
+/// 子に `getrlimit` の結果を返させるテスト用の経路は設けず（設計書 §7
+/// の指示どおり）、親から `/proc/<pid>/limits` を直接読む
+/// （`V8ProcessEngine::worker_pid_for_test` 経由）。
+#[cfg(target_os = "linux")]
+fn js_1_linux_child_process_has_rlimit_data_set() {
+    let mut engine = V8ProcessEngine::new();
+    engine
+        .evaluate_script("1 + 1", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("a trivial evaluation must succeed: {err}"));
+
+    let pid = engine
+        .worker_pid_for_test()
+        .expect("a worker must be running after a successful evaluation");
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits"))
+        .unwrap_or_else(|err| panic!("failed to read /proc/{pid}/limits: {err}"));
+
+    let data_size_line = limits
+        .lines()
+        .find(|line| line.starts_with("Max data size"))
+        .unwrap_or_else(|| panic!("expected a \"Max data size\" line in:\n{limits}"));
+    // 例: "Max data size             2147483648           2147483648           bytes"
+    let fields: Vec<&str> = data_size_line.split_whitespace().collect();
+    // ["Max", "data", "size", "<soft>", "<hard>", "bytes"]
+    assert_eq!(
+        fields.len(),
+        6,
+        "unexpected \"Max data size\" line format: {data_size_line:?}"
+    );
+    assert_eq!(
+        fields[3], "2147483648",
+        "soft RLIMIT_DATA mismatch: {data_size_line:?}"
+    );
+    assert_eq!(
+        fields[4], "2147483648",
+        "hard RLIMIT_DATA mismatch: {data_size_line:?}"
+    );
 }

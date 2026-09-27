@@ -146,10 +146,13 @@ const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
 /// # 残る既知の制限（実装済みを装わない。REPAIR-3）
 ///
 /// - この上限は V8 が管理するヒープだけに効く。`ArrayBuffer` の
-///   backing store 等、ヒープ外のメモリ確保は本上限の対象外であり、
-///   子プロセスの中では上限なしのままである（OS 側の制限は後続の Issue
-///   で扱う。`super::worker`・`super::process_engine` のドキュメント
-///   コメントを参照）
+///   backing store 等、ヒープ外のメモリ確保は本上限の対象外である。
+///   ヒープ外メモリには [`super::resource_limits`] が OS 側の上限
+///   （Linux の `RLIMIT_DATA`・Windows の Job Object working set 上限）と
+///   親側の RSS 監視による多層防御を別途設けている（codex レビュー
+///   指摘 #503 P0 対応。OS ごとの強制の強さは同モジュールのドキュメント
+///   コメントの表を参照。特に macOS は OS 側の強制手段が無く、親側の
+///   監視のみに頼る）
 /// - 1 つの評価の中で、割り込みチェックを挟まずに複数回の大きな確保を
 ///   連続して行うコードが、ヒープ上限をどれだけ超過してから
 ///   `FatalProcessOutOfMemory` に至るかは本 crate 側では制御できない。
@@ -290,6 +293,11 @@ thread_local! {
 /// protected 版への切替を再検討する。
 pub(crate) fn ensure_v8_initialized() {
     V8_INIT.call_once(|| {
+        // フラグは Platform 初期化より前にしか反映されないため、
+        // `initialize_platform` の前に設定する（codex レビュー指摘 #503
+        // P0「ヒープ外メモリが無制限」対応の一部。wasm メモリの上限。
+        // `super::resource_limits` のドキュメントコメント参照）。
+        super::resource_limits::configure_wasm_memory_flag();
         let platform = v8::new_unprotected_default_platform(0, false).make_shared();
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();

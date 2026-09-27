@@ -36,6 +36,12 @@ pub mod engine_trait;
 // 抽象越しに使い、V8 / boa の具象型を上位 crate へ漏らさない」）。
 #[cfg(feature = "js-v8")]
 mod v8_engine;
+// 子プロセスのヒープ外メモリに OS 側の上限を掛ける（TASK-29・Issue #503
+// 設計書 §5・codex レビュー指摘 #503 P0 対応）。[`worker`]（子側の起動時
+// 強制）と [`process_engine`]（親側の RSS 監視）の両方から使う非公開
+// モジュール。
+#[cfg(feature = "js-v8")]
+mod resource_limits;
 // JS 評価用の子プロセスと stdio でやり取りするバイナリプロトコルの
 // フレーミング・コーデック（TASK-29・Issue #503「JS プロセス分離」
 // 設計書 §3.5・§7 W2）。`v8` crate に依存しない（`js-v8` feature の
