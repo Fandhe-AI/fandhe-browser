@@ -38,13 +38,22 @@
 //! 自己診断・アップデート確認等、本ベンチが把握・制御できないもの）は
 //! この保証の対象外である。
 //!
-//! fixture の内容: 記事・一覧・フォームの 3 類型のみ（`support::FIXTURE_TABLE`）。
-//! `docs/spec/03-poc/browser-landscape-2026`（PoC-13）の実測（5 類型・
-//! トークン削減率 75.1%）とは対象ページの種類・件数が異なるため、本ベンチの
-//! `tokenReductionPct` を PoC-13 の数値と直接比較しない。結果 JSON には
-//! `tokenReductionPct` を計測しようとした対象として構成されている fixture の
-//! 件数（`sitesCount`。計測の成否とは独立。`skipped`/`error` のときも
-//! `FIXTURE_TABLE` の件数を返す）も出力する。
+//! fixture の内容: 記事・一覧・フォーム・最小ページ・SPA の 5 類型
+//! （`support::FIXTURE_TABLE`。TASK-84.4・Issue #461 で PoC-13 相当の
+//! 5 類型へ拡張した）。`docs/spec/03-poc/browser-landscape-2026`（PoC-13
+//! 「結果 3」）が計測した代表 5 サイト（example.com・Wikipedia article・
+//! Hacker News・login form・React official site）と類型を揃えている
+//! （対応表は `support::FIXTURE_KINDS`）。ただし fixture はすべて本ベンチ用に
+//! 自作した小規模静的コンテンツでありライブページを転載していないため、
+//! 本ベンチの `tokenReductionPct` を PoC-13 の実測値（単純平均 75.1%）と
+//! 直接比較しない（近似トークン数と gpt-tokenizer の違い・中央値と単純平均の
+//! 違いも含む。詳細は `support::FIXTURE_KINDS` のドキュメント参照）。結果
+//! JSON には `tokenReductionPct` を計測しようとした対象として構成されている
+//! fixture の件数（`sitesCount`）と、各 fixture の類型・PoC-13 対応サイト
+//! （`sites`）を出力する（いずれも計測の成否とは独立。`skipped`/`error` の
+//! ときも `FIXTURE_TABLE`/`FIXTURE_KINDS` の内容をそのまま返す）。fixture
+//! ごとの実測削減率は stderr（`token reduction [<kind>] (<url>): <pct>`）へ
+//! 出す。
 //!
 //! アイドル RSS（`PERF-6`）: `ps -o rss=` で読むのは起動した直接の子
 //! プロセスの RSS のみ。`<PREFIX>_BIN` が実体をラップして別プロセスとして
