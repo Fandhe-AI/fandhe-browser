@@ -56,6 +56,16 @@ mod worker_protocol;
 // として動作できる。
 #[cfg(feature = "js-v8")]
 mod worker;
+// 子プロセスへの親側プロキシ（TASK-29・Issue #503 設計書 §3.2〜§3.4・
+// §7 W4）。`create_engine` への配線は TASK-29.6（Issue #157）、実際の
+// 子プロセスを起動する結合テストは `tests/v8_worker.rs`（W6）で行うため、
+// それまでは（テストビルドも含め）lib 本体からは一切未使用（REPAIR-3）。
+#[cfg(feature = "js-v8")]
+#[expect(
+    dead_code,
+    reason = "TASK-29.6（Issue #157）の配線・W6 の結合テストが来るまで未使用（REPAIR-3）"
+)]
+mod process_engine;
 
 pub use engine_trait::{
     CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsEngineError, JsValue, NativeFn,
