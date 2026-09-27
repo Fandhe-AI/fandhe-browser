@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!--
+  competitor_lightpanda ベンチ用の自作フィクスチャ（TASK-84.4・Issue #461）。
+  PoC-13（docs/spec/03-poc/browser-landscape-2026）の example.com 相当の
+  最小ページ枠を模して新規に作成した（example.com / IANA の文言は逐語で
+  使わない）。外部サイトの HTML・テキストを複製したものではない。
+  外部参照（http(s):// や // で始まる src/href）は含めない
+  （support.rs の fixtures_contain_no_external_references テストが検証する）。
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Minimal Placeholder Page</title>
+</head>
+<body>
+<main>
+<h1>Minimal Placeholder Page</h1>
+<p id="about">This is a self-authored, minimal single-page fixture used only to
+benchmark how much a browser's simplified DOM/accessibility snapshot reduces
+the number of tokens compared to raw HTML. It has no navigation, styling, or
+external resources.</p>
+<p>You can read more about this fixture's purpose in the <a href="#about">about
+section above</a>.</p>
+</main>
+</body>
+</html>

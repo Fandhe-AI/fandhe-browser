@@ -679,12 +679,50 @@ fn successful_measurement_path_reports_measured_values_and_exit_code_zero() {
 
     // `sitesCount` は `tokenReductionPct` の対象として構成されている
     // fixture の件数（`support::FIXTURE_TABLE`。計測の成否とは独立）。
-    // PoC-13（5 類型）と比較しないための注記を結果からも判別できるように
-    // する（モジュールドキュメント参照）。
+    // TASK-84.4（Issue #461）で PoC-13 相当の 5 類型へ拡張した。
     assert_eq!(
         report.get("sitesCount").and_then(JsonValue::as_f64),
-        Some(3.0),
+        Some(5.0),
         "sitesCount should equal the number of fixtures in FIXTURE_TABLE: {body}"
+    );
+
+    // `sites` は `support::FIXTURE_KINDS` と同じ順序で類型・PoC-13 対応
+    // サイトを列挙する（AISNAP-1・TASK-84.4）。順序込みで具体値と一致する
+    // ことを確認する（coding-rust.md「テスト」: 「期待値は具体値で書く」）。
+    let sites = report
+        .get("sites")
+        .and_then(JsonValue::as_array)
+        .expect("sites should be a JSON array");
+    let kinds: Vec<&str> = sites
+        .iter()
+        .map(|s| {
+            s.get("kind")
+                .and_then(JsonValue::as_str)
+                .expect("each site should have a kind")
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["article", "listing", "form", "minimal", "spa"],
+        "sites should list the 5 PoC-13-matched kinds in FIXTURE_KINDS order: {body}"
+    );
+    let spa_site = sites
+        .iter()
+        .find(|s| s.get("kind").and_then(JsonValue::as_str) == Some("spa"))
+        .expect("sites should contain the spa kind");
+    assert_eq!(
+        spa_site.get("poc13Site").and_then(JsonValue::as_str),
+        Some("React official site"),
+        "the spa fixture's poc13Site should match FIXTURE_KINDS: {body}"
+    );
+    let minimal_site = sites
+        .iter()
+        .find(|s| s.get("kind").and_then(JsonValue::as_str) == Some("minimal"))
+        .expect("sites should contain the minimal kind");
+    assert_eq!(
+        minimal_site.get("poc13Site").and_then(JsonValue::as_str),
+        Some("example.com"),
+        "the minimal fixture's poc13Site should match FIXTURE_KINDS: {body}"
     );
 
     assert_eq!(
@@ -808,6 +846,22 @@ fn unconfigured_target_is_skipped_with_exit_code_zero() {
             "{field} should be skipped when the target binary is not configured: {body}"
         );
     }
+    // `sitesCount`/`sites` は計測の成否と独立の静的な構成情報であり、
+    // `tokenReductionPct` が `skipped` でも出力される（TASK-84.4・
+    // 回帰防止）。
+    assert_eq!(
+        report.get("sitesCount").and_then(JsonValue::as_f64),
+        Some(5.0),
+        "sitesCount should be reported even when every measurement is skipped: {body}"
+    );
+    assert_eq!(
+        report
+            .get("sites")
+            .and_then(JsonValue::as_array)
+            .map(Vec::len),
+        Some(5),
+        "sites should be reported even when every measurement is skipped: {body}"
+    );
     assert_eq!(
         exit_code, 0,
         "exit code should be 0 when every measurement is skipped: {body}"
@@ -818,9 +872,10 @@ fn unconfigured_target_is_skipped_with_exit_code_zero() {
 /// 更新せず、
 /// 常に 1 件目のページ（`/article.html`）の内容を返し続ける場合、`goto` の
 /// JSON-RPC 応答自体は形式上妥当でも、2 件目以降の fixture
-/// （`/listing.html`・`/form.html`）については `html`/`tree` にその
-/// fixture 自身のマーカーが含まれないため、内容ベースの検証
-/// によって計測失敗（`Outcome::Error`）になることを確認する。
+/// （TASK-84.4 で 5 件へ拡張済み。`/listing.html`・`/form.html`・
+/// `/minimal.html`・`/spa.html`）については `html`/`tree` にその fixture
+/// 自身のマーカーが含まれないため、内容ベースの検証によって計測失敗
+/// （`Outcome::Error`）になることを確認する。
 fn stale_mcp_response_after_second_goto_is_error() {
     let current_exe = std::env::current_exe().expect("current_exe");
     let target = Target {

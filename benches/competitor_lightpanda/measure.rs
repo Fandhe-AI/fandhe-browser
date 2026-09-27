@@ -38,11 +38,11 @@ use std::time::{Duration, Instant};
 
 use crate::support::{
     DeadlineReader, JsonValue, Outcome, apply_new_process_group, approx_tokens, arg_error_gate,
-    bench_exit_code, content_length_exceeds_limit, expand_args, http_status_for_io_error,
-    json_escape, kill_process_group, looks_like_browser_readiness_response, lookup_fixture, median,
-    parse_content_length, parse_http_request_line, parse_http_status, parse_json,
-    port_conflict_error, reduction_pct, require_bin, token_reduction_gate, validate_mcp_response,
-    wait_with_deadline,
+    bench_exit_code, content_length_exceeds_limit, expand_args, fixture_kind,
+    http_status_for_io_error, json_escape, kill_process_group,
+    looks_like_browser_readiness_response, lookup_fixture, median, parse_content_length,
+    parse_http_request_line, parse_http_status, parse_json, port_conflict_error, reduction_pct,
+    require_bin, token_reduction_gate, validate_mcp_response, wait_with_deadline,
 };
 // `parse_ps_rss_kb`/`parse_tasklist_mem_kb` はそれぞれ unix/windows 専用の
 // `sample_rss_kb`（下記 `#[cfg(unix)]`/`#[cfg(windows)]`）が呼ぶ。無条件
@@ -1718,7 +1718,7 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
     // 登録されている（`support.rs` の
     // `fixture_table_and_markers_cover_the_same_paths` が保証する）ため、
     // ここで `unwrap_or("")` にせず明示的に内部不整合として扱う。
-    let mut sites: Vec<(String, &'static str)> =
+    let mut sites: Vec<(String, &'static str, &'static str)> =
         Vec::with_capacity(crate::support::FIXTURE_TABLE.len());
     for (page, _content_type, _content) in crate::support::FIXTURE_TABLE {
         let Some(marker) = crate::support::fixture_marker(page) else {
@@ -1727,7 +1727,23 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
                 target.name
             ));
         };
-        sites.push((crate::support::fixture_url(fixture_port, page), marker));
+        // `kind` は結果の `eprintln!`（サイトごとの削減率）に添える類型名
+        // （`AISNAP-1`・TASK-84.4。`FIXTURE_KINDS` のドキュメント参照）。
+        // `FIXTURE_TABLE` の全パスに対応する類型が必ず登録されていることは
+        // `support.rs` の `fixture_table_and_kinds_list_the_same_paths_in_order`
+        // が保証するため、ここでも内部不整合として明示的に扱う
+        // （`unwrap_or` で黙って埋め合わせない）。
+        let Some((kind, _poc13_site)) = fixture_kind(page) else {
+            return Outcome::Error(format!(
+                "{}: internal error: no fixture kind registered for {page}",
+                target.name
+            ));
+        };
+        sites.push((
+            crate::support::fixture_url(fixture_port, page),
+            marker,
+            kind,
+        ));
     }
 
     let mut client = match McpClient::spawn(bin, &target.mcp_args) {
@@ -1765,7 +1781,7 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
     // （fail-closed）。
     let mut reductions = Vec::new();
     let mut failed: Vec<String> = Vec::new();
-    for (url, marker) in &sites {
+    for (url, marker, kind) in &sites {
         let goto_params = format!(
             "{{\"name\":\"goto\",\"arguments\":{{\"url\":\"{}\"}}}}",
             json_escape(url)
@@ -1845,7 +1861,14 @@ pub fn measure_token_reduction(target: &Target, fixture_port: u16) -> Outcome {
         let html_tok = approx_tokens(html.chars().count());
         let tree_tok = approx_tokens(tree.chars().count());
         match reduction_pct(html_tok as f64, tree_tok as f64) {
-            Some(pct) => reductions.push(pct),
+            Some(pct) => {
+                // 類型ごとの実測値を stderr へ出す（TASK-84.4・AISNAP-1）。
+                // 結果 JSON の `sites`（`run_all`）は静的な構成情報のみで
+                // 実測値を持たないため、実際の削減率を確認できる経路は
+                // ここだけになる。
+                eprintln!("token reduction [{kind}] ({url}): {pct}");
+                reductions.push(pct);
+            }
             None => failed.push(format!("{url}: reduction_pct undefined (html_tok=0)")),
         }
     }
@@ -1945,22 +1968,25 @@ pub fn run_all(targets: &[Target], trials: usize) -> (String, u8) {
         };
         eprintln!("token reduction (%): {}", token_reduction.to_json());
 
-        // `sitesCount`: `tokenReductionPct` の対象として構成されている
-        // fixture の件数（`support::FIXTURE_TABLE` は記事・一覧・フォームの
-        // 3 類型のみ）。計測の成否とは独立の値であり、`tokenReductionPct` が
-        // `skipped`/`error` のときも `FIXTURE_TABLE` の件数を返す。
-        // `docs/spec/03-poc/browser-landscape-2026`（PoC-13。5 類型）と
-        // 対象ページの種類・件数が異なるため、この値を添えて
-        // `tokenReductionPct` を PoC-13 の実測値と直接比較しないことを
-        // 結果からも判別できるようにする（モジュールドキュメント参照）。
+        // `sitesCount`・`sites`: `tokenReductionPct` の対象として構成
+        // されている fixture の件数・類型一覧（`support::FIXTURE_TABLE`・
+        // `support::FIXTURE_KINDS`。TASK-84.4 で PoC-13 相当の 5 類型へ
+        // 拡張した）。いずれも計測の成否とは独立の静的な構成情報であり、
+        // `tokenReductionPct` が `skipped`/`error` のときも出力する。
+        // `docs/spec/03-poc/browser-landscape-2026`（PoC-13）と類型は
+        // 揃えたが、fixture は自作の小規模静的コンテンツでありライブ
+        // ページを転載していないため、`tokenReductionPct` を PoC-13 の
+        // 実測値と直接比較しないことを結果からも判別できるようにする
+        // （モジュールドキュメント・`support::FIXTURE_KINDS` 参照）。
         body.push_str(&format!(
-            "  \"{}\": {{\"binarySizeBytes\":{},\"coldStartMs\":{},\"idleRssKb\":{},\"tokenReductionPct\":{},\"sitesCount\":{}}}",
+            "  \"{}\": {{\"binarySizeBytes\":{},\"coldStartMs\":{},\"idleRssKb\":{},\"tokenReductionPct\":{},\"sitesCount\":{},\"sites\":{}}}",
             json_escape(target.name),
             binary_size.to_json(),
             cold_start.to_json(),
             idle_rss.to_json(),
             token_reduction.to_json(),
             crate::support::FIXTURE_TABLE.len(),
+            fixture_sites_json(),
         ));
         if i + 1 < targets.len() {
             body.push(',');
@@ -1977,4 +2003,28 @@ pub fn run_all(targets: &[Target], trials: usize) -> (String, u8) {
     let outcome_refs: Vec<&Outcome> = outcomes.iter().collect();
     let exit_code = bench_exit_code(&outcome_refs);
     (body, exit_code)
+}
+
+/// [`crate::support::FIXTURE_KINDS`] を順に走査し、`run_all` が結果 JSON へ
+/// 添える `sites` 配列の本文（`[{"path":...,"kind":...,"poc13Site":...}, ...]`）
+/// を組み立てる。
+///
+/// `FIXTURE_KINDS` は `&'static str` の固定テーブルであり実行時入力を含まない
+/// が、JSON 文字列として埋め込む際は他の文字列出力（`Outcome::to_json` 等）
+/// と同じ経路（[`json_escape`]）に統一する（TASK-84.4・AISNAP-1）。
+fn fixture_sites_json() -> String {
+    let mut out = String::from("[");
+    for (i, (path, kind, poc13_site)) in crate::support::FIXTURE_KINDS.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"path\":\"{}\",\"kind\":\"{}\",\"poc13Site\":\"{}\"}}",
+            json_escape(path),
+            json_escape(kind),
+            json_escape(poc13_site),
+        ));
+    }
+    out.push(']');
+    out
 }

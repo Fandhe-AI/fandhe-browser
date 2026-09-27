@@ -447,8 +447,16 @@ pub fn fixture_url(port: u16, path: &'static str) -> String {
 /// `include_str!` でバイナリへ埋め込み、パスからの検索をこの固定テーブルの
 /// 完全一致だけにすることで、シンボリックリンク・TOCTOU・サイズ超過が
 /// 構造的に起こらないようにする（実行時のファイル I/O 自体をなくす）。
-/// fixture を追加・削除した場合は [`fixtures_contain_no_external_references`]
-/// にも反映すること。
+/// fixture を追加・削除した場合は [`fixtures_contain_no_external_references`]・
+/// [`FIXTURE_KINDS`] にも反映すること。
+///
+/// TASK-84.4（Issue #461）で 5 件へ拡張した。5 類型（記事・一覧・フォーム・
+/// 最小ページ・SPA）は `docs/spec/03-poc/browser-landscape-2026`（PoC-13。
+/// 対象ビヘイビア `AISNAP-1`）が計測した代表 5 サイトと類型を揃えている
+/// （対応表は [`FIXTURE_KINDS`] のドキュメント参照）。ただし本 fixture は
+/// すべて自作の小規模静的コンテンツであり、ライブページを転載したもの
+/// ではないため、`tokenReductionPct` の値を PoC-13 の実測値と直接比較
+/// しない（差異の詳細は [`FIXTURE_KINDS`] のドキュメント参照）。
 pub const FIXTURE_TABLE: &[(&str, &str, &str)] = &[
     (
         "/article.html",
@@ -465,7 +473,60 @@ pub const FIXTURE_TABLE: &[(&str, &str, &str)] = &[
         "text/html; charset=utf-8",
         include_str!("fixtures/form.html"),
     ),
+    (
+        "/minimal.html",
+        "text/html; charset=utf-8",
+        include_str!("fixtures/minimal.html"),
+    ),
+    (
+        "/spa.html",
+        "text/html; charset=utf-8",
+        include_str!("fixtures/spa.html"),
+    ),
 ];
+
+/// [`FIXTURE_TABLE`] の各パスに対応する類型メタデータ
+/// `(パス, 類型名, PoC-13 の対応サイト)`。`FIXTURE_TABLE` と同じ順に並べる
+/// （`fixture_table_and_kinds_list_the_same_paths_in_order` が順序込みで
+/// 一致することを検証する）。
+///
+/// `AISNAP-1`・TASK-84（84.4）・PoC-13 対応。`docs/spec/03-poc/browser-landscape-2026`
+/// （PoC-13「結果 3」）が計測した代表 5 サイトとの対応:
+///
+/// | fixture パス | 類型 | PoC-13 の対応サイト |
+/// | ------------ | ---- | -------------------- |
+/// | `/article.html` | `article` | Wikipedia article |
+/// | `/listing.html` | `listing` | Hacker News |
+/// | `/form.html` | `form` | login form |
+/// | `/minimal.html` | `minimal` | example.com |
+/// | `/spa.html` | `spa` | React official site |
+///
+/// 直接比較できない理由（`tokenReductionPct` を PoC-13 の 75.1% と単純比較
+/// しないこと。モジュールドキュメントにも記載）:
+/// - fixture は本ベンチ用に自作した小規模な静的コンテンツであり、PoC-13 が
+///   対象にしたライブページとは内容・分量が異なる（転載はしていない）
+/// - 近似トークン数（[`approx_tokens`]。`ceil(chars / 4)`）と PoC-13 が使う
+///   gpt-tokenizer は異なる近似である
+/// - 本ベンチは複数試行の中央値（[`median`]）を採るが、PoC-13 は単純平均を
+///   使う
+pub const FIXTURE_KINDS: &[(&str, &str, &str)] = &[
+    ("/article.html", "article", "Wikipedia article"),
+    ("/listing.html", "listing", "Hacker News"),
+    ("/form.html", "form", "login form"),
+    ("/minimal.html", "minimal", "example.com"),
+    ("/spa.html", "spa", "React official site"),
+];
+
+/// リクエストパスに完全一致する [`FIXTURE_KINDS`] の `(類型名, PoC-13 の
+/// 対応サイト)` を返す。`measure.rs` の `measure_token_reduction`・`run_all`
+/// が結果へ類型名を添えるために使う。[`lookup_fixture`] と同じく完全一致
+/// だけで引く。
+pub fn fixture_kind(request_path: &str) -> Option<(&'static str, &'static str)> {
+    FIXTURE_KINDS
+        .iter()
+        .find(|(path, _, _)| *path == request_path)
+        .map(|(_, kind, poc13_site)| (*kind, *poc13_site))
+}
 
 /// [`FIXTURE_TABLE`] の各パスに対応する、`AISNAP-1` 計測（`measure.rs` の
 /// `measure_token_reduction`）が「`goto` が実際にそのページへ遷移できたか」
@@ -501,6 +562,8 @@ pub const FIXTURE_MARKERS: &[(&str, &str)] = &[
     ("/article.html", "A Short Note on Static Fixtures"),
     ("/listing.html", "Sample Item Listing"),
     ("/form.html", "Sample Sign-in Form"),
+    ("/minimal.html", "Minimal Placeholder Page"),
+    ("/spa.html", "Build Interfaces from Components"),
 ];
 
 /// リクエストパスに完全一致する [`FIXTURE_MARKERS`] のマーカー文字列を返す。
@@ -2926,6 +2989,69 @@ mod tests {
     #[test]
     fn fixture_marker_unknown_path_is_none() {
         assert_eq!(fixture_marker("/does-not-exist.html"), None);
+    }
+
+    // AISNAP-1: `FIXTURE_TABLE` と `FIXTURE_KINDS` は同じ順序でパスを列挙する
+    // 契約（`FIXTURE_KINDS` のドキュメント参照）。順序がずれると
+    // `measure.rs` が結果 JSON へ出す `sites` の並びが `FIXTURE_TABLE` の
+    // 実際の計測順と食い違う。
+    #[test]
+    fn fixture_table_and_kinds_list_the_same_paths_in_order() {
+        let table_paths: Vec<&str> = FIXTURE_TABLE.iter().map(|(path, _, _)| *path).collect();
+        let kind_paths: Vec<&str> = FIXTURE_KINDS.iter().map(|(path, _, _)| *path).collect();
+        assert_eq!(
+            table_paths, kind_paths,
+            "FIXTURE_TABLE and FIXTURE_KINDS must list the same paths in the same order"
+        );
+    }
+
+    // AISNAP-1: 類型名は結果 JSON へそのまま埋め込む静的値なので、JSON
+    // 文字列として安全な文字集合（`[a-z0-9-]+`）に限定し、互いに重複しない
+    // ことを確認する（`measure.rs` の `fixture_sites_json` が
+    // `json_escape` 経由で埋め込む前提を固定する）。
+    #[test]
+    fn fixture_kinds_are_unique_and_json_safe() {
+        let kinds: Vec<&str> = FIXTURE_KINDS.iter().map(|(_, kind, _)| *kind).collect();
+        for kind in &kinds {
+            assert!(
+                !kind.is_empty()
+                    && kind
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "fixture kind {kind:?} must match [a-z0-9-]+"
+            );
+        }
+        let unique: std::collections::BTreeSet<&str> = kinds.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            kinds.len(),
+            "fixture kinds must be unique: {kinds:?}"
+        );
+    }
+
+    // AISNAP-1・TASK-84.4（Issue #461）: PoC-13 相当の 5 類型と正確に一致する
+    // ことを具体値で固定する（coding-rust.md「テスト」: 「期待値は具体値で
+    // 書く」）。
+    #[test]
+    fn fixture_table_has_five_kinds_matching_poc13() {
+        let kinds: Vec<&str> = FIXTURE_KINDS.iter().map(|(_, kind, _)| *kind).collect();
+        assert_eq!(kinds, ["article", "listing", "form", "minimal", "spa"]);
+    }
+
+    #[test]
+    fn fixture_kind_unknown_path_is_none() {
+        assert_eq!(fixture_kind("/does-not-exist.html"), None);
+    }
+
+    // AISNAP-1: `measure_tests.rs` の fake MCP（`extract_h1`）は fixture の
+    // `<h1>` がちょうど 1 つであることを前提にした簡易的な文字列検索を行う。
+    // fixture を追加した際にこの前提が崩れていないかを固定する。
+    #[test]
+    fn fixtures_have_exactly_one_h1() {
+        for (path, _content_type, content) in FIXTURE_TABLE {
+            let count = content.matches("<h1").count();
+            assert_eq!(count, 1, "fixture {path} must contain exactly one <h1");
+        }
     }
 
     // fixture は
