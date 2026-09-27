@@ -49,7 +49,32 @@ use std::io::{self, Read, Write};
 
 use super::engine_trait::{EngineKind, JsValue};
 
+/// 子プロセスモードを起動する環境変数名（設計書 §3.1）。値は
+/// [`PROTOCOL_VERSION`] と同じ形式（`u16` の文字列表現）のプロトコル
+/// バージョンであることを子プロセス（[`super::worker`]）が検証する。
+///
+/// 呼び出し元（将来）: [`super::run_js_worker_if_requested`]（`lib.rs`）が
+/// `js-v8` feature の有無に関わらずこの環境変数の存在を確認する
+/// （設計書 §3.1「フックを呼ばないホストへの対策」）。[`super::process_engine`]
+/// （W4）はこの環境変数へ [`PROTOCOL_VERSION`] を設定して子プロセスを
+/// 起動する。
+pub(crate) const MARKER_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER";
+
+/// 本 crate が実装しているワーカープロトコルのバージョン（設計書 §3.1）。
+/// [`super::worker`]（`js-v8` feature 有効時のみ）が実際に検証・送信に
+/// 使う。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+pub(crate) const PROTOCOL_VERSION: u16 = 1;
+
 /// フレームの `tag` バイトの値。
+///
+/// `HELLO`/`EVALUATE`/`RESULT`/`ERROR`/`SHUTDOWN` は [`super::worker`]
+/// （`js-v8` feature 有効時のみ存在）から使われる。`js-v8` feature が
+/// 無効なビルドでは非テスト時に未使用になるため `allow` を宣言する
+/// （`expect` ではなく `allow` にする理由: 個々の未配線項目
+/// （`decode_js_value` 等）の `expect(dead_code)` と異なるスコープに
+/// 独立して付けるための整理。REPAIR-3）。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) mod tag {
     /// 子 → 親。ハンドシェイク（[`super::encode_hello`]）。
     pub(crate) const HELLO: u8 = 1;
@@ -73,19 +98,30 @@ pub(crate) mod tag {
 /// [`super::process_engine`] が親 → 子のフレーム読み取りに使う上限
 /// （ペイロードのバイト数。タグ 1 バイトを含まない。設計書 §3.5）。
 /// [`super::worker`] のスクリプト長上限（`MAX_SCRIPT_SOURCE_BYTES`。1 MiB）
-/// に余裕（64 KiB）を足した値。
+/// に余裕（64 KiB）を足した値。[`super::worker`] が実際に読み取りへ使う
+/// （`js-v8` feature 有効時のみ）。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) const MAX_FRAME_PAYLOAD_PARENT_TO_CHILD: usize = 1_048_576 + 65_536;
 
-/// [`super::worker`] が子 → 親のフレーム読み取りに使う上限（ペイロードの
-/// バイト数。設計書 §3.5）。結果文字列の上限（1M UTF-16 単位。UTF-8 では
-/// 最悪 3 MiB）に余裕（64 KiB）を足した値。
+/// [`super::process_engine`]（W4）が子 → 親のフレーム読み取りに使う上限
+/// （ペイロードのバイト数。設計書 §3.5）。結果文字列の上限（1M UTF-16
+/// 単位。UTF-8 では最悪 3 MiB）に余裕（64 KiB）を足した値。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "W4（process_engine.rs）から使われるまで未使用（REPAIR-3）"
+    )
+)]
 pub(crate) const MAX_FRAME_PAYLOAD_CHILD_TO_PARENT: usize = 3 * 1_048_576 + 65_536;
 
 /// エラーメッセージのペイロードに許容する最大バイト数（4 KiB。設計書
 /// §3.5）。[`encode_error`] を呼ぶ側が送信前に切り詰める（本モジュールは
 /// 切り詰め自体は行わない。呼び出し元が既存の
 /// `MAX_ERROR_MESSAGE_CHARS`/`truncate_error_message` 相当の上限を適用
-/// 済みであることを前提とする）。
+/// 済みであることを前提とする）。[`super::worker`] が実際に使う
+/// （`js-v8` feature 有効時のみ）。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
 
 /// フレーム・値のデコードに失敗したことを表すエラー（`JS-1`・`TASK-29`・
@@ -96,25 +132,91 @@ pub(crate) const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
 /// （設計書 §3.5「プロトコル違反は子を kill する」）。
 #[derive(Debug)]
 pub(crate) enum ProtocolError {
-    /// 下層の I/O エラー（読み取り・書き込み失敗）。
+    /// 下層の I/O エラー（読み取り・書き込み失敗。[`write_frame`]・
+    /// [`read_frame`] が返す。`js-v8` feature 有効時のみ非テストで構築
+    /// されうる）。
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     Io(io::Error),
-    /// フレーム長が 0（タグバイト自体が存在しない）。
+    /// フレーム長が 0（タグバイト自体が存在しない。[`read_frame`]。
+    /// `js-v8` feature 有効時のみ非テストで構築されうる）。
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     EmptyFrame,
-    /// ペイロード長が呼び出し側の指定した上限を超えた。
+    /// ペイロード長が呼び出し側の指定した上限を超えた（[`read_frame`]。
+    /// `js-v8` feature 有効時のみ非テストで構築されうる）。
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     FrameTooLarge { len: usize, max: usize },
-    /// 未知の tag バイト。
+    /// 未知の tag バイト。呼び出し元（`super::worker`・
+    /// `super::process_engine`）がタグの意味解釈をした結果として構築する
+    /// 想定であり、`read_frame` 自体はタグの妥当性を検証しない
+    /// （テストのみが構築する。§7 W3 時点では `super::worker` 側の
+    /// 不明タグ処理は独自のエラーメッセージで済ませており、本 variant は
+    /// 未構築のまま）。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "呼び出し側がタグの意味解釈をした結果として構築する想定の variant。\
+                      現時点では未構築（REPAIR-3）"
+        )
+    )]
     UnknownTag(u8),
-    /// 値のデコード時に、未知の [`JsValue`] タグバイトを受け取った。
+    /// 値のデコード時に、未知の [`JsValue`] タグバイトを受け取った
+    /// （[`decode_js_value`]。W4（process_engine.rs）から使われるまで
+    /// 未構築）。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "W4（process_engine.rs）が decode_js_value を使うまで未構築（REPAIR-3）"
+        )
+    )]
     InvalidValueTag(u8),
-    /// 真偽値の表現が `0`/`1` のどちらでもなかった。
+    /// 真偽値の表現が `0`/`1` のどちらでもなかった（[`decode_js_value`]。
+    /// W4 から使われるまで未構築）。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "W4（process_engine.rs）が decode_js_value を使うまで未構築（REPAIR-3）"
+        )
+    )]
     InvalidBoolByte(u8),
-    /// 未知の [`ErrorKind`] タグバイト。
+    /// 未知の [`ErrorKind`] タグバイト（[`decode_error`]。W4 から使われる
+    /// まで未構築）。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "W4（process_engine.rs）が decode_error を使うまで未構築（REPAIR-3）"
+        )
+    )]
     InvalidErrorKind(u8),
-    /// 未知のエンジン種別バイト（`Hello` フレームの `engine` フィールド）。
+    /// 未知のエンジン種別バイト（`Hello` フレームの `engine` フィールド。
+    /// [`decode_hello`]。W4 から使われるまで未構築）。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "W4（process_engine.rs）が decode_hello を使うまで未構築（REPAIR-3）"
+        )
+    )]
     InvalidEngineByte(u8),
-    /// ペイロードが期待する長さに満たない（切り詰められている）。
+    /// ペイロードが期待する長さに満たない（切り詰められている。
+    /// [`decode_js_value`]/[`decode_hello`]/[`decode_error`]。W4 から
+    /// 使われるまで未構築）。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "W4（process_engine.rs）が decode_* を使うまで未構築（REPAIR-3）"
+        )
+    )]
     Truncated,
-    /// 文字列として解釈すべきバイト列が不正な UTF-8 だった。
+    /// 文字列として解釈すべきバイト列が不正な UTF-8 だった
+    /// （[`decode_evaluate`]。`super::worker` が親からの `Evaluate`
+    /// フレームを検証する際に構築する。`js-v8` feature 有効時のみ非
+    /// テストで構築されうる）。
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     InvalidUtf8,
 }
 
@@ -159,6 +261,10 @@ impl From<io::Error> for ProtocolError {
 /// 状態で EOF に達した場合**（＝フレームの途中で相手が終了した異常な
 /// 状態）を区別して返す。前者は `Ok(false)`、後者は
 /// [`io::ErrorKind::UnexpectedEof`] の `Err` にする。
+///
+/// [`read_frame`] からのみ呼ばれる（`js-v8` feature 有効時のみ非テストで
+/// 到達する）。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 fn read_exact_or_clean_eof(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<bool> {
     let mut filled = 0usize;
     while filled < buf.len() {
@@ -184,7 +290,9 @@ fn read_exact_or_clean_eof(reader: &mut impl Read, buf: &mut [u8]) -> io::Result
 ///
 /// 呼び出し側（`super::worker`・`super::process_engine`）がフレームごとに
 /// `flush` することを想定し、本関数自体は `flush` しない（複数フレームを
-/// まとめて `flush` したい呼び出し側の裁量に委ねる）。
+/// まとめて `flush` したい呼び出し側の裁量に委ねる）。`js-v8` feature
+/// 有効時のみ非テストで [`super::worker`] から使われる。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn write_frame(
     writer: &mut impl Write,
     tag: u8,
@@ -225,7 +333,9 @@ pub(crate) fn write_frame(
 /// [`MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`]、子から親は
 /// [`MAX_FRAME_PAYLOAD_CHILD_TO_PARENT`]）。ペイロードを確保する**前**に
 /// 検査するため、上限超過を主張するフレームに対して実際のメモリ確保は
-/// 発生しない（OWASP A04「不安全な設計」対策）。
+/// 発生しない（OWASP A04「不安全な設計」対策）。`js-v8` feature 有効時
+/// のみ非テストで [`super::worker`] から使われる。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn read_frame(
     reader: &mut impl Read,
     max_payload_len: usize,
@@ -266,7 +376,9 @@ pub(crate) fn read_frame(
 ///
 /// `JsValue` は `#[non_exhaustive]` だが、本 crate の内側からの `match` は
 /// 既知の全 variant を網羅すれば `_` 分岐は不要（`#[non_exhaustive]` が
-/// 制限するのは他 crate からの網羅性判定のみ）。
+/// 制限するのは他 crate からの網羅性判定のみ）。`js-v8` feature 有効時
+/// のみ非テストで [`super::worker`] から使われる。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn encode_js_value(value: &JsValue, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
     match value {
         JsValue::Undefined => out.push(0),
@@ -297,6 +409,16 @@ pub(crate) fn encode_js_value(value: &JsValue, out: &mut Vec<u8>) -> Result<(), 
 /// [`encode_js_value`] の逆変換。`buf` の先頭から 1 つの [`JsValue`] を
 /// 読み取り、値と消費したバイト数を返す（将来 `Vec<JsValue>` を連結して
 /// 読む際に、消費量から次の値の開始位置を計算できるようにするため）。
+///
+/// 呼び出し元（将来）: `super::process_engine`（W4）が子からの `Result`
+/// フレームをデコードする際に使う。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "W4（process_engine.rs）から使われるまで未使用（REPAIR-3）"
+    )
+)]
 pub(crate) fn decode_js_value(buf: &[u8]) -> Result<(JsValue, usize), ProtocolError> {
     let tag = *buf.first().ok_or(ProtocolError::Truncated)?;
     match tag {
@@ -338,6 +460,8 @@ pub(crate) fn decode_js_value(buf: &[u8]) -> Result<(JsValue, usize), ProtocolEr
 /// [`tag::HELLO`] フレームのペイロードを組み立てる。
 ///
 /// 表現: `u16 LE protocol_version` ＋ `u8 engine`（0=V8, 1=Boa）。
+/// `js-v8` feature 有効時のみ非テストで [`super::worker`] から使われる。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn encode_hello(protocol_version: u16, engine: EngineKind) -> Vec<u8> {
     let mut out = Vec::with_capacity(3);
     out.extend_from_slice(&protocol_version.to_le_bytes());
@@ -349,6 +473,16 @@ pub(crate) fn encode_hello(protocol_version: u16, engine: EngineKind) -> Vec<u8>
 }
 
 /// [`encode_hello`] の逆変換。
+///
+/// 呼び出し元（将来）: `super::process_engine`（W4）がハンドシェイクで
+/// 子からの `Hello` フレームをデコードする際に使う。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "W4（process_engine.rs）から使われるまで未使用（REPAIR-3）"
+    )
+)]
 pub(crate) fn decode_hello(payload: &[u8]) -> Result<(u16, EngineKind), ProtocolError> {
     let version_bytes: [u8; 2] = payload
         .get(0..2)
@@ -368,11 +502,24 @@ pub(crate) fn decode_hello(payload: &[u8]) -> Result<(u16, EngineKind), Protocol
 /// [`tag::EVALUATE`] フレームのペイロードを組み立てる（スクリプト全文の
 /// UTF-8 バイト列そのもの。フレーム長で境界が定まるため追加の長さ
 /// プレフィックスは持たない）。
+///
+/// 呼び出し元（将来）: `super::process_engine`（W4）が子へ評価対象の
+/// スクリプトを送る際に使う。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "W4（process_engine.rs）から使われるまで未使用（REPAIR-3）"
+    )
+)]
 pub(crate) fn encode_evaluate(script: &str) -> Vec<u8> {
     script.as_bytes().to_vec()
 }
 
-/// [`encode_evaluate`] の逆変換。
+/// [`encode_evaluate`] の逆変換。`js-v8` feature 有効時のみ非テストで
+/// [`super::worker`] から使われる（親からの `Evaluate` フレームを検証
+/// する経路）。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn decode_evaluate(payload: &[u8]) -> Result<String, ProtocolError> {
     std::str::from_utf8(payload)
         .map(str::to_string)
@@ -384,18 +531,18 @@ pub(crate) fn decode_evaluate(payload: &[u8]) -> Result<String, ProtocolError> {
 ///
 /// 呼び出し元（`super::process_engine`）はこれを
 /// [`super::engine_trait::JsEngineError`] へ変換する（W5 で対応表を実装
-/// する）。
+/// する）。子プロセス側（`super::worker`。`js-v8` feature 有効時のみ）は
+/// 既に評価失敗の分類にこの型を使っている。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) enum ErrorKind {
     /// スクリプト評価が失敗した（構文エラー・実行時例外）。
     Evaluation,
-    /// グローバル関数・DOM 風オブジェクトの登録に失敗した（予約。
-    /// `TASK-29.4`/`29.5` 以降で子プロセス側に同種の失敗経路が入った
-    /// 際に使う）。
-    #[allow(
-        dead_code,
-        reason = "本 Issue では tag 番号同様に variant のみ予約する（REPAIR-3）"
-    )]
+    /// グローバル関数・DOM 風オブジェクトの登録に失敗した
+    /// （[`JsEngineError::BindingFailed`] に対応。現状の
+    /// `super::worker` は登録処理自体を持たないため、この分岐に実際には
+    /// 到達しない。`TASK-29.4`/`29.5` 以降で子プロセス側に登録処理が
+    /// 入った際に使われる想定）。
     Binding,
     /// 子の監視スレッド（watchdog）が実行時間の上限で打ち切った
     /// （設計書 §3.3 の表「子の watchdog が打ち切った」行）。
@@ -403,6 +550,7 @@ pub(crate) enum ErrorKind {
 }
 
 impl ErrorKind {
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     fn to_byte(self) -> u8 {
         match self {
             Self::Evaluation => 0,
@@ -411,6 +559,13 @@ impl ErrorKind {
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "W4（process_engine.rs）が decode_error を使うまで未使用（REPAIR-3）"
+        )
+    )]
     fn from_byte(byte: u8) -> Result<Self, ProtocolError> {
         match byte {
             0 => Ok(Self::Evaluation),
@@ -426,7 +581,9 @@ impl ErrorKind {
 /// 表現: `u8 kind`（[`ErrorKind::to_byte`]）＋ `message` の UTF-8 バイト列
 /// （フレーム長で境界が定まる）。呼び出し側が送信前に
 /// [`MAX_ERROR_MESSAGE_BYTES`] へ切り詰め済みであることを前提とする
-/// （本関数自体は切り詰めない）。
+/// （本関数自体は切り詰めない）。`js-v8` feature 有効時のみ非テストで
+/// [`super::worker`] から使われる。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn encode_error(kind: ErrorKind, message: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + message.len());
     out.push(kind.to_byte());
@@ -435,6 +592,16 @@ pub(crate) fn encode_error(kind: ErrorKind, message: &str) -> Vec<u8> {
 }
 
 /// [`encode_error`] の逆変換。
+///
+/// 呼び出し元（将来）: `super::process_engine`（W4）が子からの `Error`
+/// フレームをデコードする際に使う。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "W4（process_engine.rs）から使われるまで未使用（REPAIR-3）"
+    )
+)]
 pub(crate) fn decode_error(payload: &[u8]) -> Result<(ErrorKind, String), ProtocolError> {
     let kind_byte = *payload.first().ok_or(ProtocolError::Truncated)?;
     let kind = ErrorKind::from_byte(kind_byte)?;
@@ -727,6 +894,13 @@ mod tests {
             3 * 1_048_576 + 65_536,
             "child-to-parent limit must be 3 MiB + 64 KiB"
         );
+    }
+
+    /// JS-1: 環境変数名・プロトコルバージョンの具体値（設計書 §3.1）。
+    #[test]
+    fn js_1_marker_env_var_and_protocol_version_have_the_documented_values() {
+        assert_eq!(MARKER_ENV_VAR, "FANDHE_BROWSER_JS_WORKER");
+        assert_eq!(PROTOCOL_VERSION, 1);
     }
 
     /// JS-1: 想定される tag 値が予約分も含め重複しないこと（プロトコル

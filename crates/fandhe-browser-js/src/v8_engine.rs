@@ -270,16 +270,9 @@ pub(crate) fn ensure_v8_initialized() {
 /// `evaluate_script` 等の inherent メソッドは `TASK-29.3`〜`29.5` で順次
 /// 追加するが、[`super::engine_trait::JsEngine`] トレイトへの集約
 /// （`impl JsEngine for V8Engine`）は `TASK-29.6` で行う（モジュール冒頭
-/// 「スタブについて」）ため、本 Issue の時点では lib 本体から生成されない
-/// （`create_engine` 未配線。§スコープ境界）。テストからのみ使われるので、
-/// `cfg(not(test))` の場合に `dead_code` の期待を宣言する。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "TASK-29.6/29.7 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
-    )
-)]
+/// 「スタブについて」）。lib 本体からは [`super::worker`]（Issue #503・
+/// JS プロセス分離。W3）が子プロセスの中でだけ生成する
+/// （`create_engine` への配線は引き続き未配線。§スコープ境界）。
 pub(crate) struct V8Engine {
     /// 29.4（グローバル関数注入）・29.5（DOM 風バインディング）・本 Issue の
     /// 評価呼び出しが共有する、永続的な単一の V8 Context（`JS-1`。
@@ -324,13 +317,6 @@ impl std::fmt::Display for IsolateAlreadyActiveOnThread {
 
 impl std::error::Error for IsolateAlreadyActiveOnThread {}
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "TASK-29.6/29.7 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
-    )
-)]
 impl V8Engine {
     /// V8 の初期化（[`ensure_v8_initialized`]）を確実に行ったうえで、
     /// 新しい Isolate を生成する。
@@ -702,13 +688,6 @@ impl V8Engine {
 /// [`MAX_ERROR_MESSAGE_CHARS`] 文字に切り詰める。切り詰めた場合は末尾に
 /// `"..."` を付ける。文字境界（Unicode scalar value）単位で切るため
 /// `chars()` を使う（バイト単位の添字アクセスは文字境界を壊しうる）。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "TASK-29.6/29.7 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
-    )
-)]
 fn truncate_error_message(message: String) -> String {
     if message.chars().count() <= MAX_ERROR_MESSAGE_CHARS {
         return message;
@@ -727,13 +706,6 @@ fn truncate_error_message(message: String) -> String {
 /// `max_bytes` を超える範囲を複製させない。`WriteFlags::kReplaceInvalidUtf8`
 /// を指定するため、マルチバイト文字の途中でバッファが尽きても不正な
 /// UTF-8 にはならない。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "TASK-29.6/29.7 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
-    )
-)]
 fn v8_string_prefix_lossy(
     scope: &v8::Isolate,
     value: v8::Local<v8::String>,
@@ -758,13 +730,6 @@ fn v8_string_prefix_lossy(
 /// 複合値は [`JsValue`] の variant が無いため `Err` にする。`JsValue` は
 /// `#[non_exhaustive]` であり、必要になった時点で `TASK-29.7`/`TASK-30` で
 /// variant を追加する。過剰設計を避ける。REPAIR-3）。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "TASK-29.6/29.7 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
-    )
-)]
 fn value_to_js_value(
     scope: &v8::PinScope<'_, '_>,
     value: v8::Local<v8::Value>,

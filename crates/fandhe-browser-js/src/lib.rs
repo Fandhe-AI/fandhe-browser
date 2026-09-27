@@ -29,28 +29,73 @@
 //! - core への統合（`js_stub` の置換。`JS-2`、`TASK-30`、`MS-3`）
 
 pub mod engine_trait;
-// V8（`rusty_v8`）の Platform/Isolate 初期化（TASK-29.2）を担う非公開
-// モジュール。具象型を上位 crate へ漏らさないため `pub` を付けず、
-// `pub use` もしない（AC-2・coding-rust.md「JS エンジンはトレイト抽象
-// 越しに使い、V8 / boa の具象型を上位 crate へ漏らさない」）。
+// V8（`rusty_v8`）の Platform/Isolate 初期化（TASK-29.2）と、
+// [`worker`] が子プロセスの中で使うスクリプト評価本体（TASK-29.3）を
+// 担う非公開モジュール。具象型を上位 crate へ漏らさないため `pub` を
+// 付けず、`pub use` もしない（AC-2・coding-rust.md「JS エンジンはトレイト
+// 抽象越しに使い、V8 / boa の具象型を上位 crate へ漏らさない」）。
 #[cfg(feature = "js-v8")]
 mod v8_engine;
 // JS 評価用の子プロセスと stdio でやり取りするバイナリプロトコルの
 // フレーミング・コーデック（TASK-29・Issue #503「JS プロセス分離」
 // 設計書 §3.5・§7 W2）。`v8` crate に依存しない（`js-v8` feature の
-// 有無に関わらずコンパイル・テストできる）。子プロセス側の入口・親側の
-// プロキシ（W3・W4 で追加）が消費するまでは lib 本体から未使用のため、
-// 非テストビルドでは `dead_code` の期待を宣言する（REPAIR-3）。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "W3（worker.rs）・W4（process_engine.rs）から使われるまで lib 本体からは未使用（REPAIR-3）"
-    )
-)]
+// 有無に関わらずコンパイル・テストできる）。[`MARKER_ENV_VAR`] 相当の
+// 定数は [`run_js_worker_if_requested`] から feature の有無に関わらず
+// 参照するが、フレームのエンコード・デコード関数群は [`worker`]
+// （`js-v8` feature 有効時のみ）からしか使われないため、`js-v8` 無効かつ
+// 非テストビルドでは引き続き `dead_code` の期待を宣言する（REPAIR-3）。
+// `js-v8` feature 無効時は本モジュールの大半（フレームのエンコード・
+// デコード関数群）が非テストビルドで未使用になる。項目ごとの
+// `dead_code` 抑制は `worker_protocol.rs` 側で個別に宣言する
+// （モジュール直下へまとめて属性を付けると、`decode_js_value` 等の
+// 個別 `expect(dead_code)` が外側の属性に握りつぶされて
+// `unfulfilled_lint_expectations` になるため。REPAIR-3）。
 mod worker_protocol;
+// JS 評価を行う子プロセスの入口（TASK-29・Issue #503 設計書 §3.1・
+// §7 W3）。`js-v8` feature 有効時のみ、実際に V8 を組み込んだ子プロセス
+// として動作できる。
+#[cfg(feature = "js-v8")]
+mod worker;
 
 pub use engine_trait::{
     CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsEngineError, JsValue, NativeFn,
     bundled_engines, create_engine,
 };
+
+/// この呼び出しが JS 評価用の子プロセスとして起動されたものかどうかを
+/// 判定する（`JS-1`・`TASK-29`・Issue #503「JS プロセス分離」設計書
+/// §3.1・§7 W3）。
+///
+/// 呼び出し元（将来）: `fandhe-browser-core` が `pub use` で再エクスポート
+/// し（`TASK-30`）、`fandhe-browser-cli` の `main` が tokio ランタイム・
+/// ロギング・設定読み込みより**前**に呼ぶ契約（`TASK-41`）。
+///
+/// 環境変数 [`worker_protocol::MARKER_ENV_VAR`]
+/// （`FANDHE_BROWSER_JS_WORKER`）が設定されていなければ `None` を返し、
+/// 呼び出し元は通常どおり処理を続ける（設計書 §3.1「フックを呼ばない
+/// ホストへの対策」）。設定されている場合は子プロセスとして動作し、
+/// プロセスの終了コードを返す（呼び出し元は `main` からそのまま
+/// `return` することを想定する）。
+///
+/// `js-v8` feature が無効なビルドでこの環境変数が設定されていた場合、
+/// このバイナリは子プロセスとして機能できないため
+/// `ExitCode::FAILURE` を返す（成功を一律に返すフォールバックはしない。
+/// security.md「偽装・回避機能の禁止」）。
+pub fn run_js_worker_if_requested() -> Option<std::process::ExitCode> {
+    let marker_value = std::env::var(worker_protocol::MARKER_ENV_VAR).ok()?;
+    Some(dispatch_worker(&marker_value))
+}
+
+#[cfg(feature = "js-v8")]
+fn dispatch_worker(marker_value: &str) -> std::process::ExitCode {
+    worker::worker_main(marker_value)
+}
+
+#[cfg(not(feature = "js-v8"))]
+fn dispatch_worker(_marker_value: &str) -> std::process::ExitCode {
+    eprintln!(
+        "fandhe-browser-js worker: this binary was not built with the js-v8 feature and \
+         cannot run as a JS evaluation worker"
+    );
+    std::process::ExitCode::FAILURE
+}
