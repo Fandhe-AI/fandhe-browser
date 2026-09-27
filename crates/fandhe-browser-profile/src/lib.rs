@@ -19,7 +19,9 @@
 //! 実装済み（`PROF-1`、TASK-50（50.3）・#178。std のロックが 3 OS の advisory
 //! lock を既にカバーするため、TASK-54 が想定していた `fs2`/`fs4`/`fd-lock`
 //! への置換は不要であり、#175 の決定により `fs2` は使わない）。3 OS の CI 上で
-//! 別プロセスからのロック競合が実際に検出されることも確認済み
+//! 別プロセスからのロック競合が実際に検出されることは、本結合テストが
+//! 3 OS matrix（`.github/workflows/ci.yml`）で全 crate 対象に実行される
+//! ことで担保する
 //! （`tests/lock_cross_platform.rs`、`PROF-1`、TASK-54（54.3）・#193。std
 //! レベルの確認は 3 OS 共通、`Profile::open` 経由の確認は Unix 限定。Windows
 //! で `Profile::open` 経由の確認をするには下記の `XOS-7`〜`XOS-10` の実装が
