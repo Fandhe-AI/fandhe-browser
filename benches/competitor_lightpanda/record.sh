@@ -161,8 +161,33 @@ fi
 # `-s`（slurp）で全件を読み込んだ配列の長さが 1、かつその唯一の要素が
 # オブジェクトであることを併せて検証することで、「ちょうど 1 個の JSON
 # オブジェクトだけが出力されている」ことを件数と型の両方で保証する。
-if ! jq -e -s 'length == 1 and (.[0] | type) == "object"' "$TMP_OUTPUT" >/dev/null 2>&1; then
-  echo "error: bench output is not exactly one JSON object; not appending to history" >&2
+#
+# 上記は「JSON オブジェクトが 1 個」であることしか見ておらず、`{}` の
+# ような空オブジェクトや、対象キーが欠落・型違いの壊れた出力もそのまま
+# 履歴へ追記されてしまう（TASK-84.2・Issue #212 のレビュー指摘対応）。
+# README.md「スキーマ（JSONL）」が定める `result` の形（`{"<target>": {...}}`
+# で、各 target が `binarySizeBytes`/`coldStartMs`/`idleRssKb`/
+# `tokenReductionPct`（いずれも文字列の `status` を持つオブジェクト）・
+# `sitesCount`（数値）・`perf6`（文字列の `status` を持つオブジェクト）を
+# 全て持つこと）まで検証し、対象キーの欠落・型違いは追記せずエラーにする。
+SCHEMA_CHECK='
+  def valid_metric: (type == "object") and has("status") and (.status | type == "string");
+  def valid_target: (type == "object")
+    and ((["binarySizeBytes", "coldStartMs", "idleRssKb", "tokenReductionPct", "sitesCount", "perf6"] - keys) | length == 0)
+    and (.binarySizeBytes | valid_metric)
+    and (.coldStartMs | valid_metric)
+    and (.idleRssKb | valid_metric)
+    and (.tokenReductionPct | valid_metric)
+    and (.sitesCount | type == "number")
+    and (.perf6 | valid_metric);
+  length == 1
+    and (.[0] | type) == "object"
+    and (.[0] | length > 0)
+    and (.[0] | [.[]] | all(valid_target))
+'
+if ! jq -e -s "$SCHEMA_CHECK" "$TMP_OUTPUT" >/dev/null 2>&1; then
+  echo "error: bench output is not exactly one JSON object matching the expected schema; not appending to history" >&2
+  echo "  (expected: {\"<target>\": {binarySizeBytes, coldStartMs, idleRssKb, tokenReductionPct, sitesCount, perf6}, ...}; see README.md 'スキーマ')" >&2
   echo "  (this can happen when the bench's own configuration is invalid; see the bench's stderr output)" >&2
   exit 2
 fi

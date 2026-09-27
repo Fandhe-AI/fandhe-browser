@@ -162,6 +162,34 @@ if [ "$AFTER" != "$BEFORE" ]; then
 fi
 CASES=$((CASES + 1))
 
+# 空オブジェクト・スキーマ欠落は「JSON オブジェクトが 1 個」の検証だけでは
+# 通過してしまっていた（TASK-84.2・Issue #212 のレビュー指摘対応の回帰
+# テスト）。README.md が定める対象キー・型を検証することで拒否する。
+EMPTY_OBJECT_JSON="$WORKDIR/empty-object.json"
+printf '{}' >"$EMPTY_OBJECT_JSON"
+BEFORE=$(line_count)
+expect_exit "empty object is rejected" 2 \
+  --history "$HISTORY" --input "$EMPTY_OBJECT_JSON"
+AFTER=$(line_count)
+if [ "$AFTER" != "$BEFORE" ]; then
+  echo "FAIL [empty object line count]: expected unchanged ($BEFORE), got $AFTER" >&2
+  FAILURES=$((FAILURES + 1))
+fi
+CASES=$((CASES + 1))
+
+# 対象キーは揃っているが必須フィールド（perf6）が欠落している出力も拒否する。
+MISSING_FIELD_JSON="$WORKDIR/missing-field.json"
+printf '{"fandhe-browser":{"binarySizeBytes":{"status":"skipped","reason":"x"},"coldStartMs":{"status":"skipped","reason":"x"},"idleRssKb":{"status":"skipped","reason":"x"},"tokenReductionPct":{"status":"skipped","reason":"x"},"sitesCount":3}}' >"$MISSING_FIELD_JSON"
+BEFORE=$(line_count)
+expect_exit "target missing a required field (perf6) is rejected" 2 \
+  --history "$HISTORY" --input "$MISSING_FIELD_JSON"
+AFTER=$(line_count)
+if [ "$AFTER" != "$BEFORE" ]; then
+  echo "FAIL [missing field line count]: expected unchanged ($BEFORE), got $AFTER" >&2
+  FAILURES=$((FAILURES + 1))
+fi
+CASES=$((CASES + 1))
+
 # --- (f) --history の拡張子違い・シンボリックリンクは使用エラー ---
 expect_exit "history with wrong extension is rejected" 2 \
   --history "$WORKDIR/history.txt" --input "$FIXTURES/all-skipped.json"

@@ -1154,6 +1154,51 @@ fn collect_process_tree_pids(root_pid: u32) -> Option<Vec<u32>> {
     Some(pids)
 }
 
+/// `collect_process_tree_pids` を安定するまで（連続 2 回の全走査が同じ pid
+/// 集合を返すまで）繰り返す上限回数。1 回の走査だけでは、走査中に新しく
+/// 生まれた子孫を数え漏れる可能性がある（下記
+/// `collect_stable_process_tree_pids` のドキュメント参照）ため複数回走査
+/// するが、対象が継続的に子プロセスを生成し続ける異常系で無限に走査し
+/// 続けないよう上限を設ける（coding-rust.md「長さ・件数を上限検証」）。
+#[cfg(unix)]
+const MAX_TREE_STABILIZE_PASSES: usize = 4;
+
+/// `collect_process_tree_pids` を複数回実行し、pid 集合が連続 2 回一致する
+/// （= 走査中に新しい子孫が生まれなくなり安定した）まで走査し直す
+/// （`sample_process_tree_rss_kb` が使う）。
+///
+/// TASK-84.2・Issue #212 のレビュー指摘対応: `collect_process_tree_pids` は
+/// 各親 pid に対して `pgrep -P` を 1 度しか呼ばない 1 回限りの幅優先探索の
+/// ため、ある親を調べ終えた直後（探索がすでに他の枝へ進んだ後）にその親が
+/// 新しい子プロセスを起動すると、その子孫は今回の走査では見つからない。
+/// 1 回の走査結果をそのまま `ps` の RSS 合算に渡すと、対象が実行中に
+/// プロセスを増やす実装だった場合に一部の子孫を計測から取りこぼし、
+/// `PERF-6` 判定（`support::perf6_comparison`）が実際には目標未達でも
+/// `"met"` を誤って返し得る。本関数は独立した全体走査を連続 2 回実行し、
+/// 得られた pid 集合（順序無視）が一致するまで（＝その 2 回の走査の間に
+/// 新しい子孫が現れなかったことの確認）繰り返すことで、走査中に生まれた
+/// 子孫の見落としを低減する。`MAX_TREE_STABILIZE_PASSES` に達しても安定
+/// しない場合は、対象が継続的にプロセスを生成し続けていると判断し、最後に
+/// 得られた（最も新しい）pid 集合をそのまま返す（走査を無限に続けない
+/// fail-safe。完全な保証ではなく、あくまで安定するまで数回観測し直す
+/// ベストエフォートの緩和策である）。
+#[cfg(unix)]
+fn collect_stable_process_tree_pids(root_pid: u32) -> Option<Vec<u32>> {
+    let mut previous = collect_process_tree_pids(root_pid)?;
+    for _ in 0..MAX_TREE_STABILIZE_PASSES {
+        let current = collect_process_tree_pids(root_pid)?;
+        let mut previous_sorted = previous.clone();
+        let mut current_sorted = current.clone();
+        previous_sorted.sort_unstable();
+        current_sorted.sort_unstable();
+        if previous_sorted == current_sorted {
+            return Some(current);
+        }
+        previous = current;
+    }
+    Some(previous)
+}
+
 /// アイドル RSS（`PERF-6`）: 起動して安定させたあと、対象プロセスの RSS
 /// （KB）を読む。unix は対象プロセスのプロセスツリー全体
 /// （自身 + 子孫。`collect_process_tree_pids` 参照）の RSS 合計、windows は
@@ -1168,10 +1213,13 @@ fn collect_process_tree_pids(root_pid: u32) -> Option<Vec<u32>> {
 /// でも `"met"` を誤って返し得た。windows は `tasklist` にプロセスツリー
 /// 全体を安全に数え上げる標準的な手段が無いため（`unsafe`・新規依存を
 /// 避ける方針。TASK-84.5）、対象プロセス単体の計測
-/// （`sample_rss_kb`・[`parse_tasklist_mem_kb`]）に留める。
+/// （`sample_rss_kb`・[`parse_tasklist_mem_kb`]）に留める。pid 集合の取得は
+/// `collect_process_tree_pids` の 1 回走査ではなく
+/// `collect_stable_process_tree_pids`（安定するまで複数回走査）を使う
+/// （走査中に生まれた子孫の見落とし対策。同 Issue のレビュー指摘対応）。
 #[cfg(unix)]
 fn sample_process_tree_rss_kb(root_pid: u32) -> Option<u64> {
-    let pids = collect_process_tree_pids(root_pid)?;
+    let pids = collect_stable_process_tree_pids(root_pid)?;
     if pids.is_empty() {
         return None;
     }
