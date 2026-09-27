@@ -107,3 +107,4 @@ submit/button/reset/file/image は除外する。**`<select>` は対象外**
 - `real` モードの終了コードは常に 0（ネットワーク依存で非決定的なため、
   CI 判定には使わない値）。70% 達成可否は出力の `rate=`/`met`|`not-met`
   列を読んで判断する
+- 測定結果・判定は [`docs/design/core1-success-rate.md`](../../docs/design/core1-success-rate.md) に記録した
