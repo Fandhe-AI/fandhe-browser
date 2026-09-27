@@ -2341,6 +2341,12 @@ mod tests {
         assert_eq!(sum_ps_rss_kb_lines("100\nnot-a-number\n"), None);
     }
 
+    // `sum_ps_rss_kb_lines_checked` 本体が `#[cfg(unix)]`（Windows は
+    // `parse_tasklist_mem_kb` 経路を使うため未使用・`dead_code` 回避。
+    // TASK-84.5）のため、これらのテストも同じ cfg で揃える。揃えないと
+    // Windows ビルドで「configured out（cfg(unix) で除外済み）の関数を
+    // 呼んでいる」E0425 になりビルドが通らない（PR #498 レビュー指摘対応）。
+    #[cfg(unix)]
     #[test]
     fn sum_ps_rss_kb_lines_checked_count_matches() {
         assert_eq!(sum_ps_rss_kb_lines_checked("100\n200\n300\n", 3), Some(600));
@@ -2349,16 +2355,19 @@ mod tests {
     /// `pgrep` で確定した pid 数より `ps` の出力行数が少ない場合
     /// （対象プロセスが `pgrep` 後 `ps` 前に終了したレース）は、残りの行だけ
     /// を合計せず `None` にする（TASK-84.2・Issue #212 のレビュー指摘対応）。
+    #[cfg(unix)]
     #[test]
     fn sum_ps_rss_kb_lines_checked_short_count_is_none() {
         assert_eq!(sum_ps_rss_kb_lines_checked("100\n200\n", 3), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn sum_ps_rss_kb_lines_checked_empty_is_none() {
         assert_eq!(sum_ps_rss_kb_lines_checked("", 0), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn sum_ps_rss_kb_lines_checked_invalid_line_is_none() {
         assert_eq!(sum_ps_rss_kb_lines_checked("100\nnot-a-number\n", 2), None);
