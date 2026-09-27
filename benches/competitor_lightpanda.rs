@@ -4,8 +4,9 @@
 //! （PoC-13）の Node.js 計測スクリプト（`measure-lp.mjs`・`mcp_snapshot.mjs`）
 //! を移植し、Lightpanda と fandhe-browser（`fandhe-browser-cli` 未実装のため
 //! 現状は計測対象なしで skip する）を対象に、バイナリサイズ（`PERF-1`）・
-//! cold start（`PERF-3`）・アイドル RSS（`PERF-6`。Windows は未対応）・
-//! MCP レスポンスのトークン削減率（`AISNAP-1`）を計測する。
+//! cold start（`PERF-3`）・アイドル RSS（`PERF-6`。unix は `ps`、Windows は
+//! `tasklist` に委ねる。TASK-84.5）・MCP レスポンスのトークン削減率
+//! （`AISNAP-1`）を計測する。
 //!
 //! `cargo bench --bench competitor_lightpanda`（暫定ホストは
 //! `fandhe-browser-core`。crate 側 `Cargo.toml` のコメント参照）で実行する。
@@ -55,10 +56,11 @@
 //! ごとの実測削減率は stderr（`token reduction [<kind>] (<url>): <pct>`）へ
 //! 出す。
 //!
-//! アイドル RSS（`PERF-6`）: `ps -o rss=` で読むのは起動した直接の子
-//! プロセスの RSS のみ。`<PREFIX>_BIN` が実体をラップして別プロセスとして
-//! 起動するラッパースクリプト等の場合、実際にメモリを使う実体プロセスの
-//! RSS を捕捉できない。
+//! アイドル RSS（`PERF-6`）: unix は `ps -o rss=`、Windows は
+//! `tasklist /FI "PID eq <pid>" /FO CSV /NH`（TASK-84.5）で読むのは、いずれも
+//! 起動した直接の子プロセスの RSS（ワーキングセット）のみ。`<PREFIX>_BIN`
+//! が実体をラップして別プロセスとして起動するラッパースクリプト等の場合、
+//! 実際にメモリを使う実体プロセスの RSS を捕捉できない。
 //!
 //! `AISNAP-1` の `goto` 成功判定（`support::FIXTURE_MARKERS`）: 各 fixture の
 //! `<body>` 内見出し（`<h1>`）のテキストが `html`・`tree` の両方に含まれる
@@ -70,8 +72,9 @@
 //! 終了コード契約: JSON は必ず stdout へ出力したうえで、いずれかの計測項目が
 //! `Outcome::Error`（対象バイナリの起動失敗・MCP 呼び出し失敗等）になった
 //! 場合は終了コード `1` で終了する。対象バイナリ未設定による
-//! `Outcome::Skipped`・Windows 未対応による `Outcome::Unsupported` のみの
-//! 場合は `0` で終了する。試行回数（`COMPETITOR_BENCH_TRIALS`）が不正な
+//! `Outcome::Skipped`・特定の計測がプラットフォームの制約で行えないことに
+//! よる `Outcome::Unsupported` のみの場合は `0` で終了する。試行回数
+//! （`COMPETITOR_BENCH_TRIALS`）が不正な
 //! 場合は、計測を一切試みずに JSON を出力しないまま終了コード `1` で終了する
 //! （[`trial_count`] 参照）。自動計測（CI 等）の呼び出し側はこの終了コードで
 //! 成功・失敗を判定できる。
