@@ -353,6 +353,36 @@ fn prof_1_each_data_kind_is_written_only_under_its_subdirectory() {
          （kind の追加漏れを検出するための固定チェック）"
     );
 
+    // ルート直下の実際のディレクトリ名一覧を、PROF-1 が定める固定文字列
+    // リストと集合として直接比較する。`expected`（通常ファイルの集合）は
+    // `DataKind::ALL`／`kind.dir_name()` から生成しているため、例えば
+    // `cookies` が別名に変わっても `expected` 側の期待値も追随して変わって
+    // しまい検出できない。またファイルの集合比較だけでは、4 サブディレクトリ
+    // の外に作られた「空の」余分なディレクトリを検出できない
+    // （codex review 指摘 P1 対応。この比較はディレクトリ名のみを対象とし、
+    // 個々のファイル配置の妥当性は上記 `expected`/`actual` の比較で確認する）。
+    let actual_dir_names: BTreeSet<String> = std::fs::read_dir(&root)
+        .unwrap_or_else(|e| panic!("read_dir({root:?}) が失敗した: {e}"))
+        .map(|entry| entry.unwrap_or_else(|e| panic!("{root:?} の read_dir 走査失敗: {e}")))
+        .filter(|entry| {
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path)
+                .unwrap_or_else(|e| panic!("symlink_metadata({path:?}) が失敗した: {e}"));
+            if meta.file_type().is_symlink() {
+                panic!("ルート直下に想定外の symlink を検出した（辿らない）: {path:?}");
+            }
+            meta.is_dir()
+        })
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    let expected_dir_names_owned: BTreeSet<String> =
+        expected_dir_names.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        actual_dir_names, expected_dir_names_owned,
+        "ルート直下のディレクトリ名一覧が PROF-1 の cookies/storage/cache/history と \
+         一致しない（名前変更・余分な空ディレクトリの混入を検出する）"
+    );
+
     let actual = collect_regular_files(&root);
     assert_eq!(
         actual, expected,
