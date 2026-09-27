@@ -1027,6 +1027,7 @@ async fn core_1_fetch_rejects_internal_ip_literals_before_send() {
 
     let cases = [
         ("http://[::1]:1/", "::1"),
+        ("http://[ff02::1]:1/", "ff02::1"), // IPv6 マルチキャスト（#464）
         (
             "http://169.254.169.254/latest/meta-data/",
             "169.254.169.254",

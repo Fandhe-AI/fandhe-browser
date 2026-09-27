@@ -383,10 +383,13 @@ fn is_ipv6_site_local(v6: Ipv6Addr) -> bool {
 /// [`IpAddr`] が内部アドレス（ループバック・プライベートアドレス等）か
 /// どうかを判定する（[`SafeResolver`] から使う）。IPv6 の v4-mapped
 /// アドレス（`::ffff:a.b.c.d`）は埋め込まれた IPv4 アドレスとして判定し、
-/// v4 側の分類をすり抜けられないようにする。IP リテラル指定経路
-/// （[`url_ip_literal`]）・DNS 解決経路（[`SafeResolver::resolve`]）の
-/// 双方がこの関数を経由するため、ここで拒否対象を追加すれば両経路に
-/// 反映される。
+/// v4 側の分類をすり抜けられないようにする。マルチキャスト（`ff00::/8`）は
+/// IPv4 側の `224.0.0.0/4`（[`is_disallowed_ipv4`]）に対応する拒否対象で、
+/// `std::net::Ipv6Addr::is_multicast` の安定 API で判定する（CORE-1・
+/// TASK-24.2・#464。IPv4 側にあった判定が IPv6 側に抜けていた分の追補）。
+/// IP リテラル指定経路（[`url_ip_literal`]）・DNS 解決経路
+/// （[`SafeResolver::resolve`]）の双方がこの関数を経由するため、ここで
+/// 拒否対象を追加すれば両経路に反映される。
 fn is_disallowed_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_disallowed_ipv4(v4),
@@ -396,6 +399,7 @@ fn is_disallowed_address(ip: IpAddr) -> bool {
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
                 || is_ipv6_site_local(v6)
+                || v6.is_multicast() // ff00::/8 マルチキャスト
                 || v6.to_ipv4_mapped().is_some_and(is_disallowed_ipv4)
         }
     }
@@ -1013,12 +1017,14 @@ mod tests {
         }
     }
 
-    /// CORE-1（#36。PR #430 コードレビュー指摘）: `is_disallowed_address` は
-    /// IPv6 のループバック・ユニークローカル・リンクローカル・非推奨の
-    /// サイトローカル（`fec0::/10`。PR #430 コードレビュー指摘。RFC 3879 で
-    /// 非推奨だが到達可能な環境が残るため引き続き拒否する）、および
-    /// v4-mapped アドレス（`::ffff:127.0.0.1`）に埋め込まれた IPv4 側の
-    /// 分類のいずれもすり抜けない。
+    /// CORE-1（#36。PR #430 コードレビュー指摘。#464 でマルチキャストを追補）:
+    /// `is_disallowed_address` は IPv6 のループバック・ユニークローカル・
+    /// リンクローカル・非推奨のサイトローカル（`fec0::/10`。PR #430
+    /// コードレビュー指摘。RFC 3879 で非推奨だが到達可能な環境が残るため
+    /// 引き続き拒否する）・マルチキャスト（`ff00::/8`。#464。スコープ
+    /// （link-local/site-local/global）によらず拒否する）、および
+    /// v4-mapped アドレス（`::ffff:127.0.0.1`・`::ffff:224.0.0.1`）に
+    /// 埋め込まれた IPv4 側の分類のいずれもすり抜けない。
     #[test]
     fn core_1_is_disallowed_address_detects_ipv6_categories() {
         let disallowed = [
@@ -1028,8 +1034,12 @@ mod tests {
             "fe80::1",          // unicast link-local
             "fec0::1",          // 非推奨サイトローカル（fec0::/10 の先頭）
             "feff:ffff::1",     // 非推奨サイトローカル（fec0::/10 の末尾）
+            "ff02::1",          // マルチキャスト（link-local scope）
+            "ff05::2",          // マルチキャスト（site-local scope）
+            "ff0e::1",          // マルチキャスト（global scope）
             "::ffff:127.0.0.1", // v4-mapped loopback
             "::ffff:10.0.0.1",  // v4-mapped private
+            "::ffff:224.0.0.1", // v4-mapped マルチキャスト（#464）
         ];
         for addr in disallowed {
             let ip: IpAddr = addr.parse().expect("valid IPv6 literal");
@@ -1043,6 +1053,36 @@ mod tests {
     fn core_1_is_disallowed_address_allows_global_ipv6() {
         let ip: IpAddr = "2606:4700:4700::1111".parse().expect("valid IPv6 literal");
         assert!(!is_disallowed_address(ip), "global IPv6 should be allowed");
+    }
+
+    /// CORE-1（#464）: `SafeResolver::resolve` は
+    /// `allow_private_network_access == false`（既定）のとき、host が
+    /// IPv6 マルチキャストの IP リテラルであれば
+    /// `DisallowedAddressMarker`（`downcast_ref` で判別できるマーカー）を
+    /// 返す。`(&str, u16)::to_socket_addrs` は IPv6 リテラルを getaddrinfo に
+    /// 渡さずそのまま解析するため、ネットワークに依存せず 3 OS で安定する
+    /// （DNS 解決経路も `is_disallowed_address` の判定を必ず通ることの確認。
+    /// [`is_disallowed_address`] のドキュメント参照）。
+    #[tokio::test]
+    // DNS_CONCURRENCY_TEST_LOCK は `#[tokio::test]` の既定（単一スレッド
+    // ランタイム）で、同一テスト内に他タスクが存在しないため await を挟んでも
+    // デッドロックしない（テスト間の直列化のみが目的）。
+    #[allow(clippy::await_holding_lock)]
+    async fn core_1_safe_resolver_rejects_ipv6_multicast_by_default() {
+        let _guard = DNS_CONCURRENCY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let resolver = SafeResolver {
+            allow_private_network_access: false,
+        };
+        let name: Name = "ff02::1".parse().expect("valid resolver name");
+        match resolver.resolve(name).await {
+            Ok(_) => panic!("既定では IPv6 マルチキャストの解決結果は拒否されるはず"),
+            Err(err) => assert!(
+                err.downcast_ref::<DisallowedAddressMarker>().is_some(),
+                "unexpected error: {err}"
+            ),
+        }
     }
 
     /// CORE-1（#36。PR #430 コードレビュー指摘）: `SafeResolver::resolve` は
