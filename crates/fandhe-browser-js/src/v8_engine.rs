@@ -12,8 +12,9 @@
 //!
 //! 本モジュールは Platform/Isolate の初期化（29.2）に加え、[`V8Engine`] の
 //! 永続 Context を使ったスクリプト評価（[`V8Engine::evaluate_script`]。
-//! `TASK-29.3`・Issue #154）を実装済みである。以下は未実装
-//! （実装済みを装わない。REPAIR-3）。
+//! `TASK-29.3`・Issue #154）と、実行時間・入力サイズ・結果サイズの
+//! リソース上限（AGENTS.md「リソース上限」P0・codex レビュー指摘 #154
+//! 対応）を実装済みである。以下は未実装（実装済みを装わない。REPAIR-3）。
 //!
 //! - [`super::engine_trait::JsEngine`] トレイトへの集約（`TASK-29.6`）。
 //!   本モジュールは同トレイトと同じシグネチャの inherent メソッドとして
@@ -28,10 +29,14 @@
 //!   テスト（注入・バインディングの契約検証を含む）が V8 に対しても走る
 //!   ため、29.4・29.5 の完了を待つ
 //! - `v8` 由来のエラーを共通エラー型へ変換する仕組み（`TASK-29.6`）
-//! - ヒープ上限（`near_heap_limit_callback`）・実行タイムアウトの導入
-//!   （[`super::engine_trait::EvaluateOptions`] の拡張と合わせて
-//!   `TASK-30`（`MS-3`）で扱う。[`V8Engine::evaluate_script`] のドキュメント
-//!   コメントも参照）
+//! - ヒープ上限到達時の穏当な `Err` 化（`near_heap_limit_callback` に
+//!   よるグレースフルな終了）。[`MAX_ISOLATE_HEAP_BYTES`] のドキュメント
+//!   コメントに理由を記載（コールバック型が `unsafe extern "C" fn` で
+//!   あり、本 Issue の時点では新規 `unsafe` の承認を得られないため見送り。
+//!   `TASK-30` で扱う）
+//! - 実行時間・入力サイズ・結果サイズの上限値を呼び出し側から調整する
+//!   経路（[`super::engine_trait::EvaluateOptions`] の拡張。`TASK-30`
+//!   （`MS-3`）で扱う。現状は本モジュールの定数で固定値を使う）
 //!
 //! # プロセス全体の初期化について
 //!
@@ -67,6 +72,8 @@
 
 use std::cell::Cell;
 use std::sync::Once;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use super::engine_trait::{EvaluateOptions, JsEngineError, JsValue};
 
@@ -78,6 +85,76 @@ use super::engine_trait::{EvaluateOptions, JsEngineError, JsValue};
 /// 詰めるとエラー値・ログが際限なく肥大化しうるため切り詰める
 /// （OWASP A04「不安全な設計」・security.md）。
 const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
+
+/// [`V8Engine::evaluate_script`] が例外メッセージを V8 から取り出す際に
+/// 使う一時バッファの最大バイト数（`JS-1`・codex レビュー指摘 #154 P1
+/// 対応）。
+///
+/// 従来は `to_rust_string_lossy` で V8 文字列全体を Rust の `String` へ
+/// 複製してから [`truncate_error_message`] で切り詰めていたため、巨大な
+/// 文字列を throw された場合に切り詰め前の一時的なメモリ消費を防げな
+/// かった。[`v8_string_prefix_lossy`] が `v8::String::write_utf8_v2` で
+/// この上限までしか V8 側の文字列を読み出さないようにすることで、
+/// 取り出しの段階から上限を掛ける。UTF-8 は 1 文字最大 4 バイトのため
+/// [`MAX_ERROR_MESSAGE_CHARS`]（文字数）に対して余裕を持たせたバイト数
+/// にする。
+const MAX_ERROR_MESSAGE_EXTRACT_BYTES: usize = MAX_ERROR_MESSAGE_CHARS * 4;
+
+/// [`V8Engine::evaluate_script`] に渡すスクリプト文字列に許容する最大
+/// バイト数（`JS-1`・codex レビュー指摘 #154 P0 対応）。
+///
+/// 以前は `v8::String::MAX_LENGTH`（V8 が UTF-16 文字列として内部的に
+/// 表現できる上限であり、アプリケーション側の入力サイズ上限ではない）と
+/// 比較していたため、実質的に無制限のスクリプトを受け付けてしまって
+/// いた。本定数はアプリケーション側で明示的に定めた実効的な上限
+/// （OWASP A04「不安全な設計」対策。security.md）。
+const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
+
+/// [`V8Engine::new`] が生成する Isolate に設定するヒープサイズの上限
+/// （バイト。`JS-1`・codex レビュー指摘 #154 P0 対応）。
+///
+/// `v8::CreateParams::heap_limits` で V8 に伝える実効的な上限。これにより
+/// 1 つの Isolate が確保できるヒープが際限なく増え続けることはなくなる
+/// （OWASP A04「不安全な設計」対策）。
+///
+/// # 既知の制限（実装済みを装わない。REPAIR-3）
+///
+/// 上限到達時に評価を穏当に `Err` として終了させるには
+/// `v8::Isolate::add_near_heap_limit_callback` にコールバックを登録する
+/// 必要があるが、そのコールバック型 `NearHeapLimitCallback` は
+/// `unsafe extern "C" fn` であり、登録すると本モジュールに新たに
+/// `unsafe` を追加することになる。`unsafe` の新規追加はユーザー承認を
+/// 要する（[coding-rust.md](../../../.claude/rules/coding-rust.md)・
+/// security.md）ため、本 Issue（自動修正）の時点ではこの承認を得られず
+/// 見送る。上限到達時は V8 の既定の OOM 処理（Isolate・プロセスの終了）
+/// に委ねる。少なくとも 1 Isolate あたりのヒープ使用量には上限が付き、
+/// 無制限なメモリ枯渇（DoS）は防げる。穏当な `Err` 化はユーザー承認を
+/// 得たうえで `TASK-30` で扱う。
+const MAX_ISOLATE_HEAP_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
+
+/// [`value_to_js_value`] が文字列型の評価結果を [`JsValue::String`] へ
+/// 変換する際に許容する最大文字数（UTF-16 コード単位。`v8::String::length`
+/// の単位。`JS-1`・codex レビュー指摘 #154 P1 対応）。
+///
+/// `to_rust_string_lossy` は変換前に V8 側の文字列全体を複製するため、
+/// JS が巨大な文字列を返すとその複製コストを入力サイズ検査では防げない。
+/// 変換前に `v8::String::length`（文字列を複製しない問い合わせ）で長さを
+/// 確認し、上限超過時は変換せず `Err` を返す。結果を無断で切り詰めて
+/// 返すと呼び出し元へ実際とは異なる値を渡すことになる（偽装として
+/// 作用しうる）ため、切り詰めではなく `Err` にする
+/// （security.md「偽装・回避機能の禁止」）。
+const MAX_RESULT_STRING_UTF16_UNITS: usize = 1_048_576; // 約 1M 文字（2 MiB 相当）
+
+/// スクリプト評価に許容する実行時間の上限（`JS-1`・codex レビュー指摘
+/// #154 P0 対応）。
+///
+/// [`V8Engine::evaluate_script`] は `compiled.run` を呼ぶ直前に監視用
+/// スレッドを起動し、この時間内に評価が完了しなければ
+/// `v8::IsolateHandle::terminate_execution`（他スレッドから安全に呼べる
+/// API）で強制終了する。`while (true) {}` のような無限ループを渡されても
+/// 呼び出しスレッドが戻らなくなることを防ぐ（AGENTS.md「リソース上限」
+/// P0・OWASP A04「不安全な設計」対策）。
+const SCRIPT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// プロセス内で V8 の Platform 初期化を 1 回だけ実行するためのフラグ。
 static V8_INIT: Once = Once::new();
@@ -219,6 +296,10 @@ impl V8Engine {
     /// Isolate の生成に続けて、[`evaluate_script`](Self::evaluate_script)
     /// 等が使い回す永続 Context を 1 つ生成し、`v8::Global` へ昇格して
     /// 保持する（`V8Engine::context` のドキュメントコメント参照）。
+    ///
+    /// Isolate には [`MAX_ISOLATE_HEAP_BYTES`] をヒープ上限として設定する
+    /// （`JS-1`・codex レビュー指摘 #154 P0 対応。制限事項は同定数の
+    /// ドキュメントコメントを参照）。
     pub(crate) fn new() -> Result<Self, IsolateAlreadyActiveOnThread> {
         ensure_v8_initialized();
         let acquired = V8_ISOLATE_ACTIVE.with(|active| {
@@ -232,7 +313,8 @@ impl V8Engine {
         if !acquired {
             return Err(IsolateAlreadyActiveOnThread);
         }
-        let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+        let create_params = v8::CreateParams::default().heap_limits(0, MAX_ISOLATE_HEAP_BYTES);
+        let mut isolate = v8::Isolate::new(create_params);
         let context = {
             let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
             let scope = scope.init();
@@ -261,16 +343,30 @@ impl V8Engine {
     /// [`V8Engine::context`]（永続 Context）へ入り直すため、`var`/グローバル
     /// 変数などのスクリプト間状態は評価をまたいで引き継がれる。
     ///
+    /// # リソース上限（AGENTS.md「リソース上限」P0。codex レビュー指摘
+    /// #154 対応）
+    ///
+    /// - 入力サイズ: [`MAX_SCRIPT_SOURCE_BYTES`] を超えるスクリプト文字列
+    ///   は評価前に `Err` を返す
+    /// - ヒープサイズ: Isolate 生成時（[`V8Engine::new`]）に
+    ///   [`MAX_ISOLATE_HEAP_BYTES`] を上限として設定する。上限到達時の
+    ///   挙動の制限事項は同定数のドキュメントコメントを参照
+    /// - 実行時間: [`SCRIPT_EXECUTION_TIMEOUT`] を超えて完了しない評価は
+    ///   `v8::IsolateHandle::terminate_execution` で強制終了し `Err` を
+    ///   返す。`while (true) {}` のような無限ループでも呼び出しスレッドは
+    ///   戻る
+    /// - 結果サイズ: 文字列型の評価結果は [`MAX_RESULT_STRING_UTF16_UNITS`]
+    ///   を超える場合、変換前に `Err` を返す（[`value_to_js_value`]）
+    ///
+    /// これらの上限値は現状すべて本モジュールの定数で固定しており、
+    /// `_options`（[`EvaluateOptions`]）からは調整できない。呼び出し側が
+    /// 上限値を指定できるようにする拡張は `TASK-30`（`MS-3`）で扱う
+    /// （モジュール冒頭「スタブについて」）。
+    ///
     /// # 現在の制限（実装済みを装わない。REPAIR-3）
     ///
-    /// - 実行タイムアウト・ヒープ上限が無い。無限ループのスクリプト
-    ///   （例: `while (true) {}`）を渡すと本メソッドは戻らない。
-    ///   `TASK-30`（`MS-3`）で [`EvaluateOptions`] にフィールドを追加し、
-    ///   `v8::IsolateHandle::terminate_execution` /
-    ///   `near_heap_limit_callback` を使って対処する差し込み口として、
-    ///   引数 `options` を今のうちから受け取っている
     /// - microtask checkpoint は行わない（`Promise` を使うスクリプトの
-    ///   挙動は未定義。同じく `TASK-30` 以降で扱う）
+    ///   挙動は未定義。`TASK-30` 以降で扱う）
     /// - 評価結果が [`JsValue`] の variant で表現できない場合（object・
     ///   array・function・symbol・bigint 等）は `Err` を返す。文字列化して
     ///   成功したかのように返す（例: `[object Object]`）ことはしない
@@ -283,15 +379,21 @@ impl V8Engine {
         _options: &EvaluateOptions,
     ) -> Result<JsValue, JsEngineError> {
         // 外部入力（スクリプト文字列）の経路。長さを検証してからアロケー
-        // ションに使う（coding-rust.md）。V8 の `MAX_LENGTH` は UTF-16
-        // コード単位数の上限であり、UTF-8 のバイト長は常にそれ以上になる
-        // ため、`script.len()`（バイト長）での比較は保守的（厳しめ）な
-        // 判定になる。
-        if script.len() > v8::String::MAX_LENGTH {
-            return Err(JsEngineError::EvaluationFailed(
-                "script source exceeds the maximum length supported by V8".to_string(),
-            ));
+        // ションに使う（coding-rust.md）。[`MAX_SCRIPT_SOURCE_BYTES`] は
+        // アプリケーション側で定めた実効的な上限（同定数のドキュメント
+        // コメント参照。codex レビュー指摘 #154 P0 対応）。
+        if script.len() > MAX_SCRIPT_SOURCE_BYTES {
+            return Err(JsEngineError::EvaluationFailed(format!(
+                "script source exceeds the maximum supported length of {MAX_SCRIPT_SOURCE_BYTES} bytes"
+            )));
         }
+
+        // タイムアウト監視スレッド（後述）から呼び出す `IsolateHandle` は
+        // `self.isolate` を可変借用する `scope`/`tc` より前に取得する
+        // （`Isolate::thread_safe_handle` は `&self` のみで済み、
+        // Send + Sync な `v8::IsolateHandle` を返すため、`self` を可変借用
+        // したままの別スレッドへの受け渡しにはならない）。
+        let isolate_handle = self.isolate.thread_safe_handle();
 
         let scope = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
         let mut scope = scope.init();
@@ -306,15 +408,23 @@ impl V8Engine {
         // 参照キャプチャするクロージャにする（`tc` の具象型は v8 crate 側の
         // 多重の生存期間パラメータを持ち、フリー関数として書き下すよりも
         // 呼び出し側での型推論に任せた方が単純になる）。
+        // codex レビュー指摘 #154 P1: 例外全文を `to_rust_string_lossy` で
+        // 複製してから切り詰めるのではなく、`v8_string_prefix_lossy` で
+        // 取り出しの段階から [`MAX_ERROR_MESSAGE_EXTRACT_BYTES`] までしか
+        // V8 側の文字列を複製しないようにする。
         let extract_message = || -> String {
             let raw = if let Some(message) = tc.message() {
-                let text = message.get(&tc).to_rust_string_lossy(&tc);
+                let text =
+                    v8_string_prefix_lossy(&tc, message.get(&tc), MAX_ERROR_MESSAGE_EXTRACT_BYTES);
                 match message.get_line_number(&tc) {
                     Some(line) => format!("{text} (line {line})"),
                     None => text,
                 }
             } else if let Some(exception) = tc.exception() {
-                exception.to_rust_string_lossy(&tc)
+                match exception.to_string(&tc) {
+                    Some(s) => v8_string_prefix_lossy(&tc, s, MAX_ERROR_MESSAGE_EXTRACT_BYTES),
+                    None => "unknown script error".to_string(),
+                }
             } else {
                 "unknown script error".to_string()
             };
@@ -335,11 +445,45 @@ impl V8Engine {
             None => return Err(JsEngineError::EvaluationFailed(extract_message())),
         };
 
-        let result = match compiled.run(&tc) {
+        // codex レビュー指摘 #154 P0: `compiled.run` に終了期限がなく、
+        // `while (true) {}` のような入力で呼び出しスレッドが戻らなく
+        // なっていた。別スレッドで [`SCRIPT_EXECUTION_TIMEOUT`] を計測し、
+        // その時間内に `run` が完了しなければ `terminate_execution` で
+        // 強制終了する。`run` が先に完了すれば `done_tx` の送信で監視
+        // スレッドを即座に終わらせる。
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if done_rx.recv_timeout(SCRIPT_EXECUTION_TIMEOUT).is_err() {
+                isolate_handle.terminate_execution();
+            }
+        });
+
+        let run_result = compiled.run(&tc);
+
+        // `run` の完了を監視スレッドへ伝え、必ず join してから戻る
+        // （監視スレッドを生存させたまま関数を抜けると、次回の
+        // `evaluate_script` 呼び出し中に前回のタイムアウトが誤発火
+        // しうる）。送信・join の失敗は監視スレッド側が既に終了して
+        // いる場合のみで無害。
+        let _ = done_tx.send(());
+        let _ = watchdog.join();
+        // `cancel_terminate_execution` を呼ぶと `has_terminated` が false に
+        // 戻ってしまうため、解除より先に判定結果を読み取っておく。
+        let was_terminated = tc.has_terminated();
+        // タイムアウトで `terminate_execution` が呼ばれていた場合に備え、
+        // 次回以降の評価に影響しないよう解除する（呼ばれていなければ
+        // no-op）。`&self` のみで呼べるため `tc`/`scope` の可変借用とは
+        // 競合しない。
+        tc.cancel_terminate_execution();
+
+        let result = match run_result {
             Some(result) => result,
             None => {
-                let message = if tc.has_terminated() {
-                    "script execution was terminated".to_string()
+                let message = if was_terminated {
+                    format!(
+                        "script execution exceeded the {} second timeout and was terminated",
+                        SCRIPT_EXECUTION_TIMEOUT.as_secs()
+                    )
                 } else {
                     extract_message()
                 };
@@ -368,6 +512,40 @@ fn truncate_error_message(message: String) -> String {
     }
     let truncated: String = message.chars().take(MAX_ERROR_MESSAGE_CHARS).collect();
     format!("{truncated}...")
+}
+
+/// V8 の文字列を、`max_bytes` までの UTF-8 バイト列に限定して Rust の
+/// `String` へ変換する（`JS-1`・codex レビュー指摘 #154 P1 対応）。
+///
+/// `v8::String::to_rust_string_lossy` は変換前に V8 側の文字列全体を
+/// 複製するため、巨大な文字列（例外メッセージ等）に対しては呼び出しの
+/// 時点で一時的なメモリ消費を抑えられない。本関数は
+/// `v8::String::write_utf8_v2` で固定長バッファへ直接書き込み、V8 側に
+/// `max_bytes` を超える範囲を複製させない。`WriteFlags::kReplaceInvalidUtf8`
+/// を指定するため、マルチバイト文字の途中でバッファが尽きても不正な
+/// UTF-8 にはならない。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "TASK-29.6/29.7 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
+    )
+)]
+fn v8_string_prefix_lossy(
+    scope: &v8::Isolate,
+    value: v8::Local<v8::String>,
+    max_bytes: usize,
+) -> String {
+    let mut buffer = vec![0u8; max_bytes];
+    let written = value.write_utf8_v2(
+        scope,
+        &mut buffer,
+        v8::WriteFlags::kReplaceInvalidUtf8,
+        None,
+    );
+    buffer.truncate(written);
+    String::from_utf8(buffer)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
 }
 
 /// V8 のスクリプト評価結果（`Local<Value>`）を、エンジン非依存の
@@ -402,7 +580,22 @@ fn value_to_js_value(
             )),
         }
     } else if value.is_string() {
-        Ok(JsValue::String(value.to_rust_string_lossy(scope)))
+        // codex レビュー指摘 #154 P1: `to_rust_string_lossy` は変換前に
+        // V8 側の文字列全体を複製する。`v8::String::length`（複製を伴わない
+        // 問い合わせ）で長さを確認し、上限超過時は変換自体を行わず `Err`
+        // を返す（結果を無断で切り詰めると誤った値を返すことになるため、
+        // 切り詰めではなく `Err` にする。security.md「偽装・回避機能の禁止」）。
+        match value.to_string(scope) {
+            Some(s) if s.length() > MAX_RESULT_STRING_UTF16_UNITS => {
+                Err(JsEngineError::EvaluationFailed(format!(
+                    "string result exceeds the maximum supported length of {MAX_RESULT_STRING_UTF16_UNITS} UTF-16 code units"
+                )))
+            }
+            Some(s) => Ok(JsValue::String(s.to_rust_string_lossy(scope))),
+            None => Err(JsEngineError::EvaluationFailed(
+                "failed to convert V8 string result to a UTF-16 string".to_string(),
+            )),
+        }
     } else {
         let type_name = value.type_of(scope).to_rust_string_lossy(scope);
         Err(JsEngineError::EvaluationFailed(format!(
@@ -670,6 +863,65 @@ mod tests {
                 .expect("evaluation must succeed before drop");
             assert_eq!(result, JsValue::Number(2.0));
             drop(engine);
+        }
+    }
+
+    /// JS-1・codex レビュー指摘 #154 P0 の回帰確認: [`MAX_SCRIPT_SOURCE_BYTES`]
+    /// を超えるスクリプト文字列は評価せず `Err` を返すこと。
+    #[test]
+    fn js_1_v8_evaluate_oversized_script_returns_err() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let oversized_script = "1".repeat(MAX_SCRIPT_SOURCE_BYTES + 1);
+        match engine.evaluate_script(&oversized_script, &EvaluateOptions::default()) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert!(
+                    msg.contains("maximum supported length"),
+                    "expected a message about the input size limit, got: {msg}"
+                );
+            }
+            other => panic!("expected EvaluationFailed for an oversized script, got: {other:?}"),
+        }
+    }
+
+    /// JS-1・codex レビュー指摘 #154 P0 の回帰確認: `while (true) {}` の
+    /// ような無限ループが [`SCRIPT_EXECUTION_TIMEOUT`] で強制終了され、
+    /// 呼び出しスレッドが戻ってくること（AGENTS.md「リソース上限」）。
+    #[test]
+    fn js_1_v8_evaluate_infinite_loop_times_out() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        match engine.evaluate_script("while (true) {}", &EvaluateOptions::default()) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert!(
+                    msg.contains("timeout"),
+                    "expected a timeout message, got: {msg}"
+                );
+            }
+            other => panic!("expected EvaluationFailed for an infinite loop, got: {other:?}"),
+        }
+        // タイムアウト後もエンジンが使い続けられること（`terminate_execution`
+        // の解除（`cancel_terminate_execution`）が効いていることの確認）。
+        let result = engine
+            .evaluate_script("1 + 1", &EvaluateOptions::default())
+            .expect("engine must remain usable after a timeout");
+        assert_eq!(result, JsValue::Number(2.0));
+    }
+
+    /// JS-1・codex レビュー指摘 #154 P1 の回帰確認: 評価結果の文字列が
+    /// [`MAX_RESULT_STRING_UTF16_UNITS`] を超える場合、変換せず `Err` を
+    /// 返すこと（切り詰めて成功を装わない。security.md「偽装・回避機能の
+    /// 禁止」）。
+    #[test]
+    fn js_1_v8_evaluate_oversized_result_string_returns_err() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let script = format!("'a'.repeat({})", MAX_RESULT_STRING_UTF16_UNITS + 1);
+        match engine.evaluate_script(&script, &EvaluateOptions::default()) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert!(
+                    msg.contains("UTF-16"),
+                    "expected a message about the result size limit, got: {msg}"
+                );
+            }
+            other => panic!("expected EvaluationFailed for an oversized result, got: {other:?}"),
         }
     }
 }
