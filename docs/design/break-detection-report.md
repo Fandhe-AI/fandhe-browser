@@ -35,7 +35,8 @@ REPAIR-5 は、意図的な破壊的変更 3 種（オフバイワン・checkbox
    2. `git diff --stat` / `git diff` で変更が 1 ファイル・該当行だけであることを確認する
    3. `cargo test -p fandhe-browser-core --test break_detection --no-fail-fast` を実行し、終了コード・失敗テスト名・`left`/`right` またはパニックメッセージを記録する
    4. `git checkout -- <file>` で復元し、`git status --porcelain` が空であることを確認する
-4. 実行環境: `rustc 1.98.1`（`48a229cea` 2026-09-01）・`cargo 1.98.1`・Linux（x86_64）
+4. 9 件すべての注入・復元が完了した後、手順 2 を再実行し、`crates/fandhe-browser-core/tests/break_detection.rs` の 11 件すべてが `ok` に戻ることを確認する
+5. 実行環境: `rustc 1.98.1`（`48a229cea` 2026-09-01）・`cargo 1.98.1`・Linux（x86_64）
 
 ## 結果一覧表
 
@@ -63,7 +64,7 @@ REPAIR-5 は、意図的な破壊的変更 3 種（オフバイワン・checkbox
 
 **検出率 3/3 = 100%（注入単位 9/9 = 100%）**
 
-各注入の復元後は `git status --porcelain` が空であることを都度確認した（復元漏れがないことの確認）。加えて、各注入の `cargo test` 実行結果で「その注入が対象とする失敗テスト以外の残り 10 件（または 9 件）が `ok`」であったことが、直前の注入が正しく復元されていたことを裏付けている。9 件すべての注入・復元が完了した時点で `cargo test -p fandhe-browser-core --test break_detection` を再実行し、11 件すべてが `ok` に戻ることを最終確認した（「検証方法」参照）。
+各注入の復元後は `git status --porcelain` が空であることを都度確認した（復元漏れがないことの確認）。加えて、各注入の `cargo test` 実行結果で「その注入が対象とする失敗テスト以外の残り 10 件（または 9 件）が `ok`」であったことが、直前の注入が正しく復元されていたことを裏付けている。9 件すべての注入・復元が完了した時点で `cargo test -p fandhe-browser-core --test break_detection` を再実行し、11 件すべてが `ok` に戻ることを最終確認した（「検証手順」参照）。
 
 ## PoC-10 との対応と差異
 
