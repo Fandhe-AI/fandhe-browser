@@ -44,11 +44,15 @@ use crate::support::{
     parse_http_request_line, parse_http_status, parse_json, port_conflict_error, reduction_pct,
     require_bin, token_reduction_gate, validate_mcp_response, wait_with_deadline,
 };
-// `parse_ps_rss_kb` は unix 専用の `sample_rss_kb`（下記 `#[cfg(unix)]`）が
-// 呼ぶ。無条件 import のままだと Windows ビルドで未使用になり `unused_imports`
-// 警告が `-D warnings`（ci.md「3 OS CI」）で fail するため cfg で分離する。
+// `parse_ps_rss_kb`/`parse_tasklist_mem_kb` はそれぞれ unix/windows 専用の
+// `sample_rss_kb`（下記 `#[cfg(unix)]`/`#[cfg(windows)]`）が呼ぶ。無条件
+// import のままだと反対側の OS ビルドで未使用になり `unused_imports` 警告が
+// `-D warnings`（ci.md「3 OS CI」）で fail するため cfg で分離する
+// （TASK-84.5・PERF-6）。
 #[cfg(unix)]
 use crate::support::parse_ps_rss_kb;
+#[cfg(windows)]
+use crate::support::parse_tasklist_mem_kb;
 
 /// fixture 配信サーバーの各種上限（coding-rust.md「長さ・件数を上限検証」）。
 /// ローカル専用のベンチ補助サーバーだが、想定外の大量・低速接続で
@@ -1083,9 +1087,12 @@ pub fn measure_cold_start(target: &Target, trials: usize) -> Outcome {
     }
 }
 
-/// アイドル RSS（`PERF-6`）: 起動して安定させたあと `ps -o rss=` で単一プロセスの
-/// RSS（KB）を読む。Windows は `ps` が無いため `Unsupported` を返す
-/// （実装計画どおり。`parse_ps_rss_kb` は unix 専用経路でのみ呼ぶ）。
+/// アイドル RSS（`PERF-6`）: 起動して安定させたあと単一プロセスのワーキング
+/// セット相当の値（KB）を読む。unix は `ps -o rss=`（[`parse_ps_rss_kb`]）、
+/// Windows は `tasklist /FI "PID eq <pid>" /FO CSV /NH`
+/// （[`parse_tasklist_mem_kb`]）に委ねる（TASK-84.5。`unsafe`・新規依存を
+/// 使わず OS 標準コマンドの出力をパースする方針は `kill_process_group` と
+/// 同じ）。
 #[cfg(unix)]
 fn sample_rss_kb(pid: u32) -> Option<u64> {
     // `ps -o rss=` の出力は数字列のみで数十バイトに収まる。想定外に大量の
@@ -1112,7 +1119,35 @@ fn sample_rss_kb(pid: u32) -> Option<u64> {
     parse_ps_rss_kb(&String::from_utf8_lossy(&stdout))
 }
 
-#[cfg(unix)]
+/// windows 版 `sample_rss_kb`。`tasklist` の標準出力は OEM コードページで
+/// 出るが、[`parse_tasklist_mem_kb`] が使うのは ASCII 数字だけなので
+/// （関数側のコメント参照）、unix 版と同様に `from_utf8_lossy` で十分。
+#[cfg(windows)]
+fn sample_rss_kb(pid: u32) -> Option<u64> {
+    // `tasklist` の CSV 1 行は数百バイト程度に収まる。unix の `ps` 版と
+    // 同じ考え方で無制限確保を避ける上限を設ける
+    // （coding-rust.md「長さ・件数を上限検証」）。
+    const MAX_TASKLIST_OUTPUT_BYTES: usize = 4096;
+    let mut command = Command::new("tasklist");
+    command.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
+    let (status, stdout) = crate::support::run_capturing_output_with_deadline(
+        command,
+        crate::support::EXTERNAL_COMMAND_DEADLINE,
+        MAX_TASKLIST_OUTPUT_BYTES,
+    )
+    .ok()?;
+    if !status.success() {
+        return None;
+    }
+    parse_tasklist_mem_kb(&String::from_utf8_lossy(&stdout), pid)
+}
+
+/// アイドル RSS（`PERF-6`）計測本体。`sample_rss_kb` の OS 差異
+/// （unix: `ps`／Windows: `tasklist`）を吸収した先の共通フロー。
+/// 以前は unix/windows で別関数に分けており、Windows 版は
+/// `target.bin` を確認せず常に `Outcome::Unsupported` を返すバグを持って
+/// いた。`require_bin` による `Skipped`/`Error` の判定を 1 か所に保つため
+/// 1 本の関数へ統合した（TASK-84.5）。
 fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
     let bin = match require_bin(
         target.bin.as_ref(),
@@ -1132,8 +1167,8 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
         match spawn_and_wait_ready(bin, &target.serve_args) {
             Ok((guard, port, _elapsed)) => {
                 std::thread::sleep(Duration::from_millis(500));
-                // `ps` の失敗（プロセス早期終了・パース不能出力）を黙って
-                // 捨てず即座に Error 化する。
+                // `sample_rss_kb` の失敗（プロセス早期終了・パース不能出力）
+                // を黙って捨てず即座に Error 化する。
                 let pid = guard.0.id();
                 let rss = sample_rss_kb(pid);
                 // `drop(guard)` は `kill_process_group`/`Child::kill` で
@@ -1155,7 +1190,7 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
                     Some(rss) => samples.push(rss as f64),
                     None => {
                         return Outcome::Error(format!(
-                            "{}: idle RSS trial failed: `ps` sampling failed for pid {pid}",
+                            "{}: idle RSS trial failed: RSS sampling failed for pid {pid}",
                             target.name
                         ));
                     }
@@ -1170,27 +1205,6 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
         Some(v) => Outcome::Value(v),
         None => Outcome::Error(format!("{}: no idle RSS samples", target.name)),
     }
-}
-
-#[cfg(windows)]
-fn measure_idle_rss(target: &Target, _trials: usize) -> Outcome {
-    // `target.bin` を確認せず常に
-    // `Outcome::Unsupported` を返していたため、`<PREFIX>_BIN` が未設定でも
-    // `idleRssKb` だけ `unsupported` になり「対象バイナリ未設定なら全計測が
-    // Skipped」という契約に反していた。他の計測関数（`measure_cold_start`・
-    // `measure_binary_size`・unix 版 `measure_idle_rss`）と同じ判定を
-    // `require_bin`（support.rs。OS に依存しない純粋関数）で先に行う。
-    if let Err(skipped) = require_bin(
-        target.bin.as_ref(),
-        target.bin_error.as_deref(),
-        target.name,
-    ) {
-        return skipped;
-    }
-    Outcome::Unsupported(format!(
-        "{}: idle RSS measurement uses unix `ps`, unsupported on Windows (PERF-6)",
-        target.name
-    ))
 }
 
 /// バイナリサイズ（`PERF-1`）: 対象実行ファイルの `fs::metadata` によるバイト数。
