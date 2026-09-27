@@ -30,10 +30,12 @@
 //!   ため、29.4・29.5 の完了を待つ
 //! - `v8` 由来のエラーを共通エラー型へ変換する仕組み（`TASK-29.6`）
 //! - ヒープ上限到達時の穏当な `Err` 化（`near_heap_limit_callback` に
-//!   よるグレースフルな終了）。[`MAX_ISOLATE_HEAP_BYTES`] のドキュメント
-//!   コメントに理由を記載（コールバック型が `unsafe extern "C" fn` で
-//!   あり、本 Issue の時点では新規 `unsafe` の承認を得られないため見送り。
-//!   `TASK-30` で扱う）
+//!   よるグレースフルな終了）。現状はヒープ上限（[`MAX_ISOLATE_HEAP_BYTES`]）
+//!   に到達すると V8 の既定の OOM 処理によりプロセスが終了する既知の制約
+//!   がある（コールバック型が `unsafe extern "C" fn` であり、本モジュールで
+//!   新規に `unsafe` を追加する承認をまだ得ていないため見送り）。詳細・
+//!   トレードオフは [`MAX_ISOLATE_HEAP_BYTES`] のドキュメントコメントを
+//!   参照。穏当な `Err` 化は Issue #506 で扱う
 //! - 実行時間・入力サイズ・結果サイズの上限値を呼び出し側から調整する
 //!   経路（[`super::engine_trait::EvaluateOptions`] の拡張。`TASK-30`
 //!   （`MS-3`）で扱う。現状は本モジュールの定数で固定値を使う）
@@ -117,7 +119,7 @@ const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
 /// 1 つの Isolate が確保できるヒープが際限なく増え続けることはなくなる
 /// （OWASP A04「不安全な設計」対策）。
 ///
-/// # 既知の制限（実装済みを装わない。REPAIR-3）
+/// # 既知の制限（実装済みを装わない。REPAIR-3。PR #503 レビュー指摘 P0）
 ///
 /// 上限到達時に評価を穏当に `Err` として終了させるには
 /// `v8::Isolate::add_near_heap_limit_callback` にコールバックを登録する
@@ -126,10 +128,17 @@ const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
 /// `unsafe` を追加することになる。`unsafe` の新規追加はユーザー承認を
 /// 要する（[coding-rust.md](../../../.claude/rules/coding-rust.md)・
 /// security.md）ため、本 Issue（自動修正）の時点ではこの承認を得られず
-/// 見送る。上限到達時は V8 の既定の OOM 処理（Isolate・プロセスの終了）
-/// に委ねる。少なくとも 1 Isolate あたりのヒープ使用量には上限が付き、
-/// 無制限なメモリ枯渇（DoS）は防げる。穏当な `Err` 化はユーザー承認を
-/// 得たうえで `TASK-30` で扱う。
+/// 見送る。
+///
+/// **したがって、この上限に到達した場合、現状は `Err` を返さずプロセス
+/// 全体が終了する**（V8 の既定の OOM ハンドラの挙動。Isolate 単位での
+/// グレースフルな終了ではない）。呼び出し側（core・cdp 等）は、この
+/// 既知の制約を踏まえて JS 評価をプロセス分離するか、上限到達の影響範囲
+/// を許容できる形で運用する必要がある。少なくとも 1 Isolate あたりの
+/// ヒープ使用量には上限が付くため、無制限なメモリ枯渇（DoS）は防げるが、
+/// 上限到達時のプロセス終了自体は防げない。`near_heap_limit_callback`
+/// によるグレースフルな `Err` 化、またはプロセス隔離による緩和は
+/// Issue #506（ユーザー承認事項: 新規 `unsafe` の追加可否）で扱う。
 const MAX_ISOLATE_HEAP_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
 
 /// [`value_to_js_value`] が文字列型の評価結果を [`JsValue::String`] へ
@@ -145,15 +154,43 @@ const MAX_ISOLATE_HEAP_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
 /// （security.md「偽装・回避機能の禁止」）。
 const MAX_RESULT_STRING_UTF16_UNITS: usize = 1_048_576; // 約 1M 文字（2 MiB 相当）
 
-/// スクリプト評価に許容する実行時間の上限（`JS-1`・codex レビュー指摘
-/// #154 P0 対応）。
+/// スクリプト評価（コンパイル・実行の両方）に許容する時間の上限
+/// （`JS-1`・codex レビュー指摘 #154 P0 対応・PR #503 レビュー指摘 P1
+/// 対応）。
 ///
-/// [`V8Engine::evaluate_script`] は `compiled.run` を呼ぶ直前に監視用
-/// スレッドを起動し、この時間内に評価が完了しなければ
+/// [`V8Engine::evaluate_script`] は `v8::Script::compile` を呼ぶ**前**に
+/// 監視用スレッドを起動し、この時間内にコンパイル・実行が完了しなければ
 /// `v8::IsolateHandle::terminate_execution`（他スレッドから安全に呼べる
 /// API）で強制終了する。`while (true) {}` のような無限ループを渡されても
 /// 呼び出しスレッドが戻らなくなることを防ぐ（AGENTS.md「リソース上限」
 /// P0・OWASP A04「不安全な設計」対策）。
+///
+/// # コンパイル自体は打ち切られない場合がある（実装済みを装わない。REPAIR-3）
+///
+/// V8 の `TerminateExecution` は「スタックガードの割り込み要求」であり、
+/// JS の実行（バイトコード実行）中のチェックポイントで効く。パーサは
+/// 別の上限（割り込みで書き換わらない `real_climit`）を参照するため、
+/// `v8::Script::compile` 自体はこの割り込みでは中断されない可能性が高い。
+///
+/// 本 crate の手元検証（`v8_engine::tests::js_1_v8_pending_termination_before_compile_is_handled`・
+/// `js_1_v8_pending_termination_before_compile_of_max_sized_script_is_handled`）
+/// では、監視スレッドとの実時間のレースに頼る代わりに、
+/// `v8::Script::compile` を呼ぶ**前**に同期的に `terminate_execution` を
+/// 呼んでおき（＝「コンパイル開始時点で既に終了要求が保留されている」
+/// 状況を決定的に再現し）、[`MAX_SCRIPT_SOURCE_BYTES`] 相当（1 MiB）まで
+/// の大きさのスクリプトで検証した。結果は一貫して、コンパイルは打ち切
+/// られずに完了し、保留されていた終了要求はその後の `compiled.run` の
+/// 開始時点で効いた（[`V8Engine::evaluate_script`] が返すエラーメッセー
+/// ジが "execution exceeded ... timeout" になり、"compilation exceeded"
+/// にはならなかった）。「コンパイル処理そのものに極端に時間がかかる
+/// 入力」（構文解析自体が長時間かかるスクリプト）は本 crate では作れて
+/// おらず、そのような入力に対する実時間ベースでの打ち切りは未検証。
+///
+/// したがって本定数が保証するのは「監視の起点をコンパイル開始前に
+/// 早めたことで、コンパイルに要する時間もタイムアウト計測の対象時間に
+/// 含まれる」ことであり、「コンパイル処理自体を強制的に打ち切れる」こと
+/// ではない。[`MAX_SCRIPT_SOURCE_BYTES`] による入力サイズ上限が、
+/// コンパイル時間そのものに対する現状の主な緩和策である。
 const SCRIPT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// プロセス内で V8 の Platform 初期化を 1 回だけ実行するためのフラグ。
@@ -334,6 +371,22 @@ impl V8Engine {
         self.isolate.get_heap_statistics().total_heap_size()
     }
 
+    /// この Isolate に対して他スレッドから安全に呼べる
+    /// `v8::IsolateHandle` を返す（テスト専用の窓口。PR #503 レビュー指摘
+    /// P1 の回帰テスト用）。
+    ///
+    /// テストからこれを使って [`evaluate_script`](Self::evaluate_script) の
+    /// 呼び出し**前**に `terminate_execution` を呼んでおくことで、
+    /// 「コンパイル開始時点で既に終了要求が保留されている」状況を、
+    /// 監視スレッドの起動タイミングに依存しない決定的な形で再現できる
+    /// （バックグラウンドスレッドとのレース待ちに頼ると、`1 + 1` のような
+    /// 極小スクリプトは監視スレッドがスケジュールされるより先に完了し
+    /// うるため、タイムアウトを再現できずテストがフレークする）。
+    #[cfg(test)]
+    pub(crate) fn thread_safe_handle_for_test(&self) -> v8::IsolateHandle {
+        self.isolate.thread_safe_handle()
+    }
+
     /// スクリプトを評価し、結果を [`JsValue`] で返す（`JS-1`「スクリプト
     /// 評価」・`TASK-29.3`・Issue #154）。
     ///
@@ -343,6 +396,8 @@ impl V8Engine {
     /// [`V8Engine::context`]（永続 Context）へ入り直すため、`var`/グローバル
     /// 変数などのスクリプト間状態は評価をまたいで引き継がれる。
     ///
+    /// タイムアウトは [`SCRIPT_EXECUTION_TIMEOUT`]（固定値）を使う。
+    ///
     /// # リソース上限（AGENTS.md「リソース上限」P0。codex レビュー指摘
     /// #154 対応）
     ///
@@ -351,10 +406,14 @@ impl V8Engine {
     /// - ヒープサイズ: Isolate 生成時（[`V8Engine::new`]）に
     ///   [`MAX_ISOLATE_HEAP_BYTES`] を上限として設定する。上限到達時の
     ///   挙動の制限事項は同定数のドキュメントコメントを参照
-    /// - 実行時間: [`SCRIPT_EXECUTION_TIMEOUT`] を超えて完了しない評価は
-    ///   `v8::IsolateHandle::terminate_execution` で強制終了し `Err` を
-    ///   返す。`while (true) {}` のような無限ループでも呼び出しスレッドは
-    ///   戻る
+    /// - 実行時間: 監視は `v8::Script::compile` の**前**から始まり、
+    ///   [`SCRIPT_EXECUTION_TIMEOUT`] を超えると
+    ///   `v8::IsolateHandle::terminate_execution` で打ち切って `Err` を
+    ///   返す。ただし打ち切りが実際に効くのは `compiled.run`（実行）段階
+    ///   であり、`v8::Script::compile` 自体は中断されない（1 MiB までの
+    ///   スクリプトで実測。詳細は [`SCRIPT_EXECUTION_TIMEOUT`] のドキュメ
+    ///   ントコメントを参照）。`while (true) {}` のような無限ループでも
+    ///   呼び出しスレッドは戻る
     /// - 結果サイズ: 文字列型の評価結果は [`MAX_RESULT_STRING_UTF16_UNITS`]
     ///   を超える場合、変換前に `Err` を返す（[`value_to_js_value`]）
     ///
@@ -431,59 +490,87 @@ impl V8Engine {
             truncate_error_message(raw)
         };
 
-        let source = match v8::String::new(&tc, script) {
-            Some(source) => source,
-            None => {
-                return Err(JsEngineError::EvaluationFailed(
-                    "failed to allocate script source string".to_string(),
-                ));
-            }
-        };
-
-        let compiled = match v8::Script::compile(&tc, source, None) {
-            Some(compiled) => compiled,
-            None => return Err(JsEngineError::EvaluationFailed(extract_message())),
-        };
-
-        // codex レビュー指摘 #154 P0: `compiled.run` に終了期限がなく、
-        // `while (true) {}` のような入力で呼び出しスレッドが戻らなく
-        // なっていた。別スレッドで [`SCRIPT_EXECUTION_TIMEOUT`] を計測し、
-        // その時間内に `run` が完了しなければ `terminate_execution` で
-        // 強制終了する。`run` が先に完了すれば `done_tx` の送信で監視
-        // スレッドを即座に終わらせる。
+        // PR #503 レビュー指摘 P1: 監視スレッドをコンパイル開始「前」に
+        // 起動する。以前は `compiled.run` の直前に起動していたため、
+        // 最大 [`MAX_SCRIPT_SOURCE_BYTES`] のスクリプトの構文解析・
+        // コンパイルにかかる時間がタイムアウト計測の対象外だった。
+        // ここで起動しておけば、後続のコンパイル・実行のどちらの段階で
+        // [`SCRIPT_EXECUTION_TIMEOUT`] を超えても `terminate_execution` が
+        // 発火する（同定数のドキュメントコメント「コンパイル自体は打ち
+        // 切られない場合がある」も参照）。
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let watchdog = std::thread::spawn(move || {
             if done_rx.recv_timeout(SCRIPT_EXECUTION_TIMEOUT).is_err() {
                 isolate_handle.terminate_execution();
             }
         });
+        // 監視スレッドへ完了を伝えて join し、`terminate_execution` が
+        // 発火していたかどうかを読み取ってから解除する。コンパイル失敗・
+        // 実行失敗のどちらの打ち切りでも同じ手順（送信 → join →
+        // `has_terminated` → `cancel_terminate_execution`）を踏む必要が
+        // あるため、`done_tx`/`watchdog` を消費するクロージャにまとめる
+        // （呼び出しは高々 1 回。`tc` は共有参照でキャプチャする）。
+        // `cancel_terminate_execution` を呼ぶと `has_terminated` が false に
+        // 戻ってしまうため、解除より先に判定結果を読み取る。監視スレッドを
+        // 生存させたまま関数を抜けると、次回の呼び出し中に前回のタイム
+        // アウトが誤発火しうるため、打ち切り・非打ち切りのどちらの経路
+        // でも必ず呼ぶ。
+        let finish_watchdog =
+            |done_tx: mpsc::Sender<()>, watchdog: std::thread::JoinHandle<()>| -> bool {
+                let _ = done_tx.send(());
+                let _ = watchdog.join();
+                let was_terminated = tc.has_terminated();
+                tc.cancel_terminate_execution();
+                was_terminated
+            };
+
+        let source = match v8::String::new(&tc, script) {
+            Some(source) => source,
+            None => {
+                finish_watchdog(done_tx, watchdog);
+                return Err(JsEngineError::EvaluationFailed(
+                    "failed to allocate script source string".to_string(),
+                ));
+            }
+        };
+
+        // 打ち切り済みかどうかに応じたタイムアウトメッセージを組み立てる。
+        // `stage`（"compilation"/"execution"）でどちらの段階の打ち切りかを
+        // 呼び出し側・テストが判別できるようにする（PR #503 レビュー
+        // 指摘 P1 の回帰テストがこの文言差で判別する）。
+        let timeout_message = |stage: &str| -> String {
+            format!(
+                "script {stage} exceeded the {} second timeout and was terminated",
+                SCRIPT_EXECUTION_TIMEOUT.as_secs_f64()
+            )
+        };
+
+        let compile_result = v8::Script::compile(&tc, source, None);
+
+        let compiled = match compile_result {
+            Some(compiled) => compiled,
+            None => {
+                // コンパイル段階で打ち切られた場合も、実行段階の打ち切りと
+                // 同じ `JsEngineError::EvaluationFailed` を返す（呼び出し側
+                // から見て打ち切り理由の扱いを変えない）。
+                let was_terminated = finish_watchdog(done_tx, watchdog);
+                let message = if was_terminated {
+                    timeout_message("compilation")
+                } else {
+                    extract_message()
+                };
+                return Err(JsEngineError::EvaluationFailed(message));
+            }
+        };
 
         let run_result = compiled.run(&tc);
-
-        // `run` の完了を監視スレッドへ伝え、必ず join してから戻る
-        // （監視スレッドを生存させたまま関数を抜けると、次回の
-        // `evaluate_script` 呼び出し中に前回のタイムアウトが誤発火
-        // しうる）。送信・join の失敗は監視スレッド側が既に終了して
-        // いる場合のみで無害。
-        let _ = done_tx.send(());
-        let _ = watchdog.join();
-        // `cancel_terminate_execution` を呼ぶと `has_terminated` が false に
-        // 戻ってしまうため、解除より先に判定結果を読み取っておく。
-        let was_terminated = tc.has_terminated();
-        // タイムアウトで `terminate_execution` が呼ばれていた場合に備え、
-        // 次回以降の評価に影響しないよう解除する（呼ばれていなければ
-        // no-op）。`&self` のみで呼べるため `tc`/`scope` の可変借用とは
-        // 競合しない。
-        tc.cancel_terminate_execution();
+        let was_terminated = finish_watchdog(done_tx, watchdog);
 
         let result = match run_result {
             Some(result) => result,
             None => {
                 let message = if was_terminated {
-                    format!(
-                        "script execution exceeded the {} second timeout and was terminated",
-                        SCRIPT_EXECUTION_TIMEOUT.as_secs()
-                    )
+                    timeout_message("execution")
                 } else {
                     extract_message()
                 };
@@ -923,5 +1010,123 @@ mod tests {
             }
             other => panic!("expected EvaluationFailed for an oversized result, got: {other:?}"),
         }
+    }
+
+    /// JS-1・PR #503 レビュー指摘 P1 の回帰確認: `v8::Script::compile` の
+    /// 呼び出し時点で既に `terminate_execution` による終了要求が保留されて
+    /// いる場合に、評価がタイムアウトとして `Err` を返し、かつその後も
+    /// エンジンが使い続けられること。
+    ///
+    /// 監視スレッドの起動タイミングとのレースで再現しようとすると
+    /// （例: `Duration::ZERO` を渡して監視スレッドの即時発火を期待する）、
+    /// `1 + 1` のような極小スクリプトは監視スレッドが実際にスケジュール
+    /// されるより先に完了しうるためフレークする（手元検証で確認済み）。
+    /// そこで [`V8Engine::thread_safe_handle_for_test`] を使い、
+    /// `evaluate_script` の呼び出し**前**に同期的に `terminate_execution`
+    /// を呼んでおくことで、レースに頼らず決定的に「コンパイル開始時点で
+    /// 終了要求が保留済み」の状況を作る。
+    ///
+    /// 手元検証では、この状態で `evaluate_script` を呼ぶと
+    /// `v8::Script::compile` 自体は成功し（V8 のパーサは
+    /// `TerminateExecution` の割り込みを検査しないため。
+    /// [`SCRIPT_EXECUTION_TIMEOUT`] のドキュメントコメント参照）、保留
+    /// されていた終了要求はその後の `compiled.run` の開始時点で効いた。
+    #[test]
+    fn js_1_v8_pending_termination_before_compile_is_handled() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        engine.thread_safe_handle_for_test().terminate_execution();
+
+        match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                // 実測結果を具体値で固定する（REPAIR-3。手元検証と一致しない
+                // 実装変更が入った場合にこのテストが検知する）: `1 + 1` 程度の
+                // 小さいスクリプトでは `v8::Script::compile` は打ち切られず
+                // 完了し、保留されていた終了要求は `compiled.run` の開始時点
+                // で効く。したがって "execution" 段階のメッセージになる。
+                assert!(
+                    msg.contains("execution exceeded"),
+                    "expected an execution-stage timeout message, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected EvaluationFailed due to a pending termination request, got: {other:?}"
+            ),
+        }
+        // 打ち切り後もエンジンが使い続けられること（`cancel_terminate_execution`
+        // が効いていることの確認）。
+        let result = engine
+            .evaluate_script("40 + 2", &EvaluateOptions::default())
+            .expect("engine must remain usable after a pending termination request");
+        assert_eq!(result, JsValue::Number(42.0));
+    }
+
+    /// JS-1・PR #503 レビュー指摘 P1 の回帰確認（コンパイル時間そのものが
+    /// タイムアウト計測対象になるかの決定的な検証）:
+    /// [`MAX_SCRIPT_SOURCE_BYTES`] 相当の大きさのスクリプトに対して
+    /// 終了要求を保留した状態で評価しても、
+    /// `js_1_v8_pending_termination_before_compile_is_handled` と同じく
+    /// "execution" 段階のメッセージになること。
+    ///
+    /// 本 crate の手元検証では、許容される最大サイズ（1 MiB）のスクリプト
+    /// でも V8 のコンパイルは打ち切られず完了した（このテストが
+    /// "compilation" を返すよう変化した場合、コンパイル自体が打ち切り
+    /// 可能になったことを意味する。その際は
+    /// [`SCRIPT_EXECUTION_TIMEOUT`]・`evaluate_script` のドキュメント
+    /// コメントの「コンパイル自体は打ち切られない場合がある」という
+    /// 前提を見直す必要がある）。コンパイルにかかる実時間そのものの
+    /// タイムアウト到達（無限ループ実行と違い、決定的に遅い入力を作る
+    /// 手段がない）は、この保留終了要求による検証で代替する。
+    #[test]
+    fn js_1_v8_pending_termination_before_compile_of_max_sized_script_is_handled() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let statement = "var a=1;";
+        assert_eq!(MAX_SCRIPT_SOURCE_BYTES % statement.len(), 0);
+        let large_script = statement.repeat(MAX_SCRIPT_SOURCE_BYTES / statement.len());
+        assert_eq!(large_script.len(), MAX_SCRIPT_SOURCE_BYTES);
+
+        engine.thread_safe_handle_for_test().terminate_execution();
+
+        match engine.evaluate_script(&large_script, &EvaluateOptions::default()) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert!(
+                    msg.contains("execution exceeded"),
+                    "expected an execution-stage timeout message, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected EvaluationFailed due to a pending termination request, got: {other:?}"
+            ),
+        }
+        let result = engine
+            .evaluate_script("40 + 2", &EvaluateOptions::default())
+            .expect("engine must remain usable after a pending termination request");
+        assert_eq!(result, JsValue::Number(42.0));
+    }
+
+    /// JS-1・PR #503 レビュー指摘 P1 の回帰確認: 構文エラーによるコンパイル
+    /// 失敗（`terminate_execution` は発火していない）でも、新しい監視スレッド
+    /// の起動位置（コンパイル前）・後始末（送信・join・`has_terminated`・
+    /// `cancel_terminate_execution`）が正しく機能し、`SyntaxError` を含む
+    /// メッセージが得られ、その後もエンジンが使い続けられること。
+    #[test]
+    fn js_1_v8_syntax_error_still_reports_syntax_error_after_watchdog_refactor() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        match engine.evaluate_script("1 +", &EvaluateOptions::default()) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert!(
+                    msg.contains("SyntaxError"),
+                    "expected a SyntaxError message, got: {msg}"
+                );
+                assert!(
+                    !msg.contains("timeout"),
+                    "a syntax error must not be reported as a timeout, got: {msg}"
+                );
+            }
+            other => panic!("expected EvaluationFailed for a syntax error, got: {other:?}"),
+        }
+        let result = engine
+            .evaluate_script("1 + 1", &EvaluateOptions::default())
+            .expect("engine must remain usable after a compile-time syntax error");
+        assert_eq!(result, JsValue::Number(2.0));
     }
 }
