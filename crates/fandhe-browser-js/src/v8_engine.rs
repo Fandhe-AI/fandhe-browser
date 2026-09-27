@@ -3,9 +3,10 @@
 //! （`JS-1`・TASK-29（29.2）・MS-3・Issue #153）。
 //!
 //! 呼び出し元（将来）: [`super::engine_trait::create_engine`] の
-//! `EngineKind::V8` 分岐（TASK-29.3/29.6 で配線する）。上位 crate（core・
-//! TASK-30）は [`super::engine_trait::JsEngine`] トレイト越しにだけ使い、
-//! 本モジュールの型を直接見ない（`pub` を付けず crate 内に閉じる。AC-2）。
+//! `EngineKind::V8` 分岐（TASK-29.6/29.7 で配線する。§スタブについて）。
+//! 上位 crate（core・TASK-30）は [`super::engine_trait::JsEngine`]
+//! トレイト越しにだけ使い、本モジュールの型を直接見ない
+//! （`pub` を付けず crate 内に閉じる。AC-2）。
 //!
 //! # スタブについて
 //!
@@ -136,15 +137,17 @@ pub(crate) fn ensure_v8_initialized() {
 
 /// V8 の Isolate を 1 つ保持する（`JS-1`・TASK-29.2）。
 ///
-/// [`super::engine_trait::JsEngine`] の実装は `TASK-29.3`〜`29.5` で追加する
-/// ため、本 Issue の時点では lib 本体から生成されない
+/// `evaluate_script` 等の inherent メソッドは `TASK-29.3`〜`29.5` で順次
+/// 追加するが、[`super::engine_trait::JsEngine`] トレイトへの集約
+/// （`impl JsEngine for V8Engine`）は `TASK-29.6` で行う（モジュール冒頭
+/// 「スタブについて」）ため、本 Issue の時点では lib 本体から生成されない
 /// （`create_engine` 未配線。§スコープ境界）。テストからのみ使われるので、
 /// `cfg(not(test))` の場合に `dead_code` の期待を宣言する。
 #[cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "TASK-29.3/29.6 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
+        reason = "TASK-29.6/29.7 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
     )
 )]
 pub(crate) struct V8Engine {
@@ -195,7 +198,7 @@ impl std::error::Error for IsolateAlreadyActiveOnThread {}
     not(test),
     expect(
         dead_code,
-        reason = "TASK-29.3/29.6 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
+        reason = "TASK-29.6/29.7 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
     )
 )]
 impl V8Engine {
@@ -356,7 +359,7 @@ impl V8Engine {
     not(test),
     expect(
         dead_code,
-        reason = "TASK-29.3/29.6 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
+        reason = "TASK-29.6/29.7 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
     )
 )]
 fn truncate_error_message(message: String) -> String {
@@ -378,7 +381,7 @@ fn truncate_error_message(message: String) -> String {
     not(test),
     expect(
         dead_code,
-        reason = "TASK-29.3/29.6 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
+        reason = "TASK-29.6/29.7 で create_engine から配線されるまで lib 本体からは未使用（REPAIR-3）"
     )
 )]
 fn value_to_js_value(
