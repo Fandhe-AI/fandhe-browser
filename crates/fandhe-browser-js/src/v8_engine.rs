@@ -12,9 +12,11 @@
 //!
 //! 本モジュールは Platform/Isolate の初期化（29.2）に加え、[`V8Engine`] の
 //! 永続 Context を使ったスクリプト評価（[`V8Engine::evaluate_script`]。
-//! `TASK-29.3`・Issue #154）と、実行時間・入力サイズ・結果サイズの
-//! リソース上限（AGENTS.md「リソース上限」P0・codex レビュー指摘 #154
-//! 対応）を実装済みである。以下は未実装（実装済みを装わない。REPAIR-3）。
+//! `TASK-29.3`・Issue #154）と、実行時間・入力サイズ・結果サイズ・
+//! ヒープサイズのリソース上限（AGENTS.md「リソース上限」P0・codex レビュー
+//! 指摘 #154・#503 対応。ヒープ上限到達時の `Err` 化は Issue #506・#508・
+//! #509・#510）を実装済みである。以下は未実装（実装済みを装わない。
+//! REPAIR-3）。
 //!
 //! - [`super::engine_trait::JsEngine`] トレイトへの集約（`TASK-29.6`）。
 //!   本モジュールは同トレイトと同じシグネチャの inherent メソッドとして
@@ -29,16 +31,9 @@
 //!   テスト（注入・バインディングの契約検証を含む）が V8 に対しても走る
 //!   ため、29.4・29.5 の完了を待つ
 //! - `v8` 由来のエラーを共通エラー型へ変換する仕組み（`TASK-29.6`）
-//! - ヒープ上限到達時の穏当な `Err` 化（`near_heap_limit_callback` に
-//!   よるグレースフルな終了）。現状はヒープ上限（[`MAX_ISOLATE_HEAP_BYTES`]）
-//!   に到達すると V8 の既定の OOM 処理によりプロセスが終了する既知の制約
-//!   がある（コールバック型が `unsafe extern "C" fn` であり、本モジュールで
-//!   新規に `unsafe` を追加する承認をまだ得ていないため見送り）。詳細・
-//!   トレードオフは [`MAX_ISOLATE_HEAP_BYTES`] のドキュメントコメントを
-//!   参照。穏当な `Err` 化は Issue #506 で扱う
-//! - 実行時間・入力サイズ・結果サイズの上限値を呼び出し側から調整する
-//!   経路（[`super::engine_trait::EvaluateOptions`] の拡張。`TASK-30`
-//!   （`MS-3`）で扱う。現状は本モジュールの定数で固定値を使う）
+//! - 実行時間・入力サイズ・結果サイズ・ヒープサイズの上限値を呼び出し側
+//!   から調整する経路（[`super::engine_trait::EvaluateOptions`] の拡張。
+//!   `TASK-30`（`MS-3`）で扱う。現状は本モジュールの定数で固定値を使う）
 //!
 //! # プロセス全体の初期化について
 //!
@@ -52,9 +47,12 @@
 //! - dispose 後は再初期化できない（v8 152.2.0 の制約）ため、テストや
 //!   将来の複数回利用（cli の再起動なしの再初期化等）と相性が悪い
 //!
-//! `unsafe` は本モジュールでは使わない（`dispose` に触れないため）。
-//! 新たに `unsafe` が必要になった場合は実装を止めてユーザーへ報告する
-//! （security.md「`unsafe` の新規追加はユーザー承認を得る」）。
+//! `dispose` に関する `unsafe` は本モジュールでは使わない。本モジュール
+//! 唯一の `unsafe` は [`near_heap_limit_callback`]（`unsafe extern "C" fn`。
+//! Issue #507 でユーザーが承認した範囲: コールバック定義 1 か所のみ、
+//! `data` ポインタは参照しない設計）であり、それ以外に新たに `unsafe` が
+//! 必要になった場合は実装を止めてユーザーへ報告する（security.md
+//! 「`unsafe` の新規追加はユーザー承認を得る」）。
 //!
 //! # スレッド安全性
 //!
@@ -72,7 +70,7 @@
 //! [`V8Engine::new`] を呼んだ場合は panic ではなく
 //! [`IsolateAlreadyActiveOnThread`] エラーを返す。
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::Once;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -119,27 +117,73 @@ const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
 /// 1 つの Isolate が確保できるヒープが際限なく増え続けることはなくなる
 /// （OWASP A04「不安全な設計」対策）。
 ///
-/// # 既知の制限（実装済みを装わない。REPAIR-3。PR #503 レビュー指摘 P0）
+/// # ヒープ上限到達時の挙動（Issue #506・#508・#509。案 A・#507 で承認）
 ///
-/// 上限到達時に評価を穏当に `Err` として終了させるには
-/// `v8::Isolate::add_near_heap_limit_callback` にコールバックを登録する
-/// 必要があるが、そのコールバック型 `NearHeapLimitCallback` は
-/// `unsafe extern "C" fn` であり、登録すると本モジュールに新たに
-/// `unsafe` を追加することになる。`unsafe` の新規追加はユーザー承認を
-/// 要する（[coding-rust.md](../../../.claude/rules/coding-rust.md)・
-/// security.md）ため、本 Issue（自動修正）の時点ではこの承認を得られず
-/// 見送る。
+/// 上限に近づくと [`near_heap_limit_callback`] が呼ばれ、
+/// `terminate_execution` で実行中の JS を打ち切ったうえで、V8 が GC・
+/// 終了処理を完了できるよう上限を一時的に広げる（広げる量には
+/// [`MAX_HEAP_LIMIT_GROWTH_BYTES`] の上限があり、無制限には広げない）。
+/// [`V8Engine::evaluate_script`] はこの打ち切りを検知すると、広げた上限を
+/// `remove_near_heap_limit_callback` で本定数（または
+/// `#[cfg(test)]` の [`V8Engine::new_with_heap_limit_for_test`] に渡した
+/// テスト用の値）へ戻したうえでコールバックを再登録し、
+/// [`JsEngineError::ResourceLimitExceeded`] を返す。同じエンジンで次の
+/// 評価を続けられる（#509 受け入れ条件）。
 ///
-/// **したがって、この上限に到達した場合、現状は `Err` を返さずプロセス
-/// 全体が終了する**（V8 の既定の OOM ハンドラの挙動。Isolate 単位での
-/// グレースフルな終了ではない）。呼び出し側（core・cdp 等）は、この
-/// 既知の制約を踏まえて JS 評価をプロセス分離するか、上限到達の影響範囲
-/// を許容できる形で運用する必要がある。少なくとも 1 Isolate あたりの
-/// ヒープ使用量には上限が付くため、無制限なメモリ枯渇（DoS）は防げるが、
-/// 上限到達時のプロセス終了自体は防げない。`near_heap_limit_callback`
-/// によるグレースフルな `Err` 化、またはプロセス隔離による緩和は
-/// Issue #506（ユーザー承認事項: 新規 `unsafe` の追加可否）で扱う。
+/// コールバック自体は `unsafe extern "C" fn`（`NearHeapLimitCallback`）で
+/// あり、本モジュール唯一の `unsafe` 追加箇所（#507 で承認された範囲:
+/// コールバック定義 1 か所のみ、`data` ポインタは参照しない）。詳細は
+/// [`near_heap_limit_callback`] のドキュメントコメントを参照。
+///
+/// # 残る既知の制限（実装済みを装わない。REPAIR-3）
+///
+/// - `terminate_execution` は「打ち切り要求」であり、要求から実際に実行が
+///   止まるまでの間にもヒープ確保は続きうる。要求後に一時的に広げた上限
+///   （[`MAX_HEAP_LIMIT_GROWTH_BYTES`] まで）を使い切ってもなお確保が
+///   続く極端な入力に対しては、最終的に V8 の既定の OOM 処理（プロセスの
+///   終了）に委ねる以外の手段が現状ない。少なくとも「通常はプロセスが
+///   終了せず `Err` で打ち切れる」ことを目標にした緩和であり、あらゆる
+///   入力に対する完全な保証ではない
+/// - 上限復元（`remove_near_heap_limit_callback` → 再登録）は
+///   [`V8Engine::evaluate_script`] の呼び出しが正常に戻ってきた場合にのみ
+///   行われる。呼び出し自体がプロセスクラッシュ等で戻らないケースは
+///   上記の残存リスクと同じ
+/// - `remove_near_heap_limit_callback` に渡す上限（`self.heap_limit_bytes`）
+///   は「希望値」であり、v8 crate のドキュメントによれば、その時点の
+///   実ヒープサイズが希望値を上回っていた場合は、実ヒープサイズに対して
+///   可能な最小の上限へ復元される（希望値そのものには戻らない）。
+///   [`JsEngineError::ResourceLimitExceeded`] のエラーメッセージが報告
+///   するのは実際に復元された値ではなく、この「希望値」（設定値）である
+/// - 復元されるのはヒープ**上限**（と近接コールバックの登録）だけであり、
+///   ヒープの**中身**は戻さない。`terminate_execution` が打ち切るのは
+///   スクリプトの実行だけで、永続 Context（[`V8Engine::context`]）に
+///   スクリプトが作ったグローバル変数（大きな配列等）は打ち切り後も
+///   残る。したがって上限到達直後の Isolate は、上限自体は元へ戻って
+///   いても既にヒープの大部分を使用済みの状態であり、直後に別の重い
+///   スクリプトを評価すると再び上限へ到達しやすい。呼び出し側
+///   （core・cdp 等）が「クリーンな状態から再開したい」場合は、
+///   [`JsEngineError::ResourceLimitExceeded`] を受け取った時点で
+///   `V8Engine` を drop し、新しい `V8Engine` を作り直すことを推奨する
+///   （同一スレッドでの再生成は [`V8Engine::new`] のドキュメントコメント
+///   「スレッド安全性」節が定める手順に従う）
 const MAX_ISOLATE_HEAP_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
+
+/// [`near_heap_limit_callback`] が 1 回の発火で一時的に広げるヒープ上限の
+/// 増分（バイト。Issue #508）。
+///
+/// V8 が `terminate_execution` の要求を受けてから実際に実行を止め、GC・
+/// 終了処理を完了できるだけの、最小限の余地を与える値（Deno の
+/// `near_heap_limit_callback` 実装と同様の考え方）。
+const HEAP_LIMIT_GROWTH_INCREMENT_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
+/// [`near_heap_limit_callback`] が累積で広げてよいヒープ上限の総量
+/// （バイト。Issue #508 受け入れ条件「広げる量に上限を設け、無制限に
+/// 広げない」）。
+///
+/// [`V8Engine::evaluate_script`] が打ち切りを検知して上限を復元する
+/// （[`MAX_ISOLATE_HEAP_BYTES`] のドキュメントコメント参照）たびに、
+/// 広げた量の集計（[`HEAP_LIMIT_GROWTH_USED`]）は 0 へリセットされる。
+const MAX_HEAP_LIMIT_GROWTH_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
 /// [`value_to_js_value`] が文字列型の評価結果を [`JsValue::String`] へ
 /// 変換する際に許容する最大文字数（UTF-16 コード単位。`v8::String::length`
@@ -203,6 +247,111 @@ thread_local! {
     /// 同時複数保持を防ぎ、破棄順序の `assert!` panic を型・構造レベルで
     /// 起こり得なくする（本モジュール冒頭「スレッド安全性」節）。
     static V8_ISOLATE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+thread_local! {
+    /// [`near_heap_limit_callback`] が使う、この Isolate に対して他
+    /// スレッドから安全に呼べる操作口（Issue #508）。
+    ///
+    /// コールバックは `data` ポインタを経由した状態受け渡しをしない
+    /// （#507 で承認された範囲: ポインタを参照しない設計）ため、代わりに
+    /// スレッドローカル変数でコールバックと [`V8Engine`] の間の状態を
+    /// 受け渡す。本モジュールは Isolate が生成されたスレッドと JS が
+    /// 実行されるスレッドが常に同一である前提（冒頭「スレッド安全性」節・
+    /// [`V8_ISOLATE_ACTIVE`]）であり、V8 も本コールバックを Isolate の
+    /// 実行スレッド上でだけ呼ぶため、スレッドローカルで安全に対応付けが
+    /// できる。`RefCell::borrow_mut` を呼ぶのは
+    /// [`V8Engine::new_with_heap_limit`]（Isolate 生成直後に `Some` を
+    /// 設定）と [`V8Engine`] の `Drop`（Isolate 破棄に伴い `None` へ戻す）
+    /// の 2 か所のみで、どちらも JS が実行されていない区間（＝
+    /// [`near_heap_limit_callback`] が発火しうる区間の外）でしか呼ばれない
+    /// ため、[`near_heap_limit_callback`] 側の `borrow()` と競合しない
+    /// （panic しない）。
+    static HEAP_LIMIT_ISOLATE_HANDLE: RefCell<Option<v8::IsolateHandle>> =
+        const { RefCell::new(None) };
+
+    /// [`near_heap_limit_callback`] が発火したかどうか（Issue #508・
+    /// #509）。[`V8Engine::evaluate_script`] は評価の前にこれを `false` へ
+    /// リセットし、評価後に読み取ってヒープ上限到達由来の打ち切りかどうか
+    /// を判別する。`Cell<bool>` は `get`/`set` が panic しないため、
+    /// [`near_heap_limit_callback`]（`extern "C"` 境界を越えて panic
+    /// できない）から安全に書き込める。
+    static HEAP_LIMIT_REACHED: Cell<bool> = const { Cell::new(false) };
+
+    /// [`near_heap_limit_callback`] がこれまでに広げた合計量（バイト。
+    /// Issue #508）。[`MAX_HEAP_LIMIT_GROWTH_BYTES`] を超えて広げない
+    /// ための累積カウンタ。[`V8Engine::evaluate_script`] が打ち切りを
+    /// 検知して上限を復元するたびに 0 へリセットする。
+    static HEAP_LIMIT_GROWTH_USED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// ヒープ使用量が上限に近づいたときに V8 から呼ばれるコールバック
+/// （`JS-1`・`TASK-29`・Issue #506・#508・PR #503 レビュー指摘 P0 対応）。
+///
+/// V8 は「もうすぐヒープ上限に達する」タイミングでこのコールバックを
+/// 呼び、戻り値を新しいヒープ上限として採用する。何もしなければ V8 の
+/// 既定の OOM 処理（プロセスの終了）に進んでしまうため、本コールバックは
+/// (1) `terminate_execution` で実行中の JS を打ち切り、(2) V8 が GC・
+/// 終了処理を完了できるだけの余地を一時的に与える、という Deno と同様の
+/// 方式を取る（#507 で決定した案 A）。
+///
+/// # SAFETY
+///
+/// `unsafe extern "C" fn` は [`v8::NearHeapLimitCallback`] の呼び出し
+/// 規約（FFI 境界）を満たすために必要であり、Issue #507 でユーザーが
+/// 承認した、本モジュール唯一の `unsafe` 追加箇所である。以下の不変条件を
+/// 維持すること:
+///
+/// - **`data` ポインタを参照しない**: [`V8Engine::new_with_heap_limit`]
+///   が `add_near_heap_limit_callback` に渡す `data` は常に
+///   `std::ptr::null_mut()` であり、本関数もそれを前提に仮引数を無視する
+///   だけで、デリファレンスも `data` からの状態復元も行わない。Isolate の
+///   操作口・上限到達フラグ・広げた量の累計は、`data` 経由ではなく
+///   [`HEAP_LIMIT_ISOLATE_HANDLE`]・[`HEAP_LIMIT_REACHED`]・
+///   [`HEAP_LIMIT_GROWTH_USED`] というスレッドローカル変数から取得する
+/// - **呼び出しスレッドの前提**: V8 はこのコールバックを、コールバックを
+///   登録した Isolate の実行スレッド上（GC のチェックポイント）でのみ
+///   呼ぶ。本モジュールは [`V8_ISOLATE_ACTIVE`] により同一スレッドに
+///   Isolate が高々 1 つしか存在しないことを保証しているため、本関数が
+///   読み書きするスレッドローカル変数は常にその 1 つの Isolate に対応する
+///   値になる
+/// - **panic させない**: `extern "C"` 境界を越えた unwind は未定義動作に
+///   なりうる。本関数が使う API（`Cell::get`/`set`・`RefCell::borrow`）は
+///   いずれも通常運用で panic しない（`Cell` は常に panic しない。
+///   `RefCell::borrow` は「同時に `borrow_mut` が生きていない」ことが
+///   条件であり、[`HEAP_LIMIT_ISOLATE_HANDLE`] のドキュメントコメントに
+///   書いたとおり `borrow_mut` は JS が実行されていない区間（Isolate の
+///   生成・破棄時）にしか呼ばれないため、本関数の `borrow()` と競合しない）
+unsafe extern "C" fn near_heap_limit_callback(
+    _data: *mut std::ffi::c_void,
+    current_heap_limit: usize,
+    _initial_heap_limit: usize,
+) -> usize {
+    HEAP_LIMIT_REACHED.with(|reached| reached.set(true));
+
+    // 他スレッドから安全に呼べる操作口を使い、実行中の JS を打ち切る
+    // （タイムアウトの監視スレッドと同じ `terminate_execution`）。
+    // `IsolateHandle` は Isolate が未生成／破棄済みでも安全に呼べる
+    // no-op になるよう設計されている（v8 crate の `IsolateHandleInner`
+    // が、破棄時に内部ポインタを null へ戻したうえでミューテックスごしに
+    // アクセスするため）。
+    HEAP_LIMIT_ISOLATE_HANDLE.with(|handle| {
+        if let Some(handle) = handle.borrow().as_ref() {
+            handle.terminate_execution();
+        }
+    });
+
+    // V8 が GC・終了処理を完了できるよう、上限を一時的に広げる。累積の
+    // 広げ幅が `MAX_HEAP_LIMIT_GROWTH_BYTES` に達したら、それ以上は
+    // 広げず現在の上限をそのまま返す（無制限膨張の防止。Issue #508
+    // 受け入れ条件）。
+    HEAP_LIMIT_GROWTH_USED.with(|growth_used| {
+        let used = growth_used.get();
+        let remaining = MAX_HEAP_LIMIT_GROWTH_BYTES.saturating_sub(used);
+        let grant = HEAP_LIMIT_GROWTH_INCREMENT_BYTES.min(remaining);
+        growth_used.set(used + grant);
+        current_heap_limit.saturating_add(grant)
+    })
 }
 
 /// V8 の Platform 初期化を冪等に行う（AC-1: 何度呼んでも panic しない）。
@@ -283,6 +432,13 @@ pub(crate) struct V8Engine {
     /// `OwnedIsolate` の drop 順制約（生成と逆順であること）が問題になる
     /// 状況自体が起こらない。
     isolate: v8::OwnedIsolate,
+    /// この Isolate に設定したヒープ上限（バイト。Issue #508・#509）。
+    /// 本番は常に [`MAX_ISOLATE_HEAP_BYTES`] だが、
+    /// `#[cfg(test)]` の [`V8Engine::new_with_heap_limit_for_test`] は
+    /// テストを高速化するためより小さい値を渡せる（Issue #510）。
+    /// [`near_heap_limit_callback`] が発火して上限を一時的に広げた後、
+    /// [`V8Engine::evaluate_script`] がこの値へ復元する。
+    heap_limit_bytes: usize,
 }
 
 /// 同一スレッド上に既に別の [`V8Engine`]（`OwnedIsolate`）が存在するため、
@@ -335,9 +491,25 @@ impl V8Engine {
     /// 保持する（`V8Engine::context` のドキュメントコメント参照）。
     ///
     /// Isolate には [`MAX_ISOLATE_HEAP_BYTES`] をヒープ上限として設定する
-    /// （`JS-1`・codex レビュー指摘 #154 P0 対応。制限事項は同定数の
+    /// （`JS-1`・codex レビュー指摘 #154 P0 対応。上限到達時の挙動は同定数の
     /// ドキュメントコメントを参照）。
     pub(crate) fn new() -> Result<Self, IsolateAlreadyActiveOnThread> {
+        Self::new_with_heap_limit(MAX_ISOLATE_HEAP_BYTES)
+    }
+
+    /// [`V8Engine::new`] と同じだが、ヒープ上限をテストから指定できる
+    /// （Issue #510: ヒープ上限到達の回帰テストを、本番の 128 MiB より
+    /// 小さい上限で高速に走らせるための入口。本番経路（[`V8Engine::new`]）
+    /// は常に [`MAX_ISOLATE_HEAP_BYTES`] を使うため `pub` にしない）。
+    #[cfg(test)]
+    pub(crate) fn new_with_heap_limit_for_test(
+        heap_limit_bytes: usize,
+    ) -> Result<Self, IsolateAlreadyActiveOnThread> {
+        Self::new_with_heap_limit(heap_limit_bytes)
+    }
+
+    /// [`V8Engine::new`]／[`V8Engine::new_with_heap_limit_for_test`] の本体。
+    fn new_with_heap_limit(heap_limit_bytes: usize) -> Result<Self, IsolateAlreadyActiveOnThread> {
         ensure_v8_initialized();
         let acquired = V8_ISOLATE_ACTIVE.with(|active| {
             if active.get() {
@@ -350,15 +522,30 @@ impl V8Engine {
         if !acquired {
             return Err(IsolateAlreadyActiveOnThread);
         }
-        let create_params = v8::CreateParams::default().heap_limits(0, MAX_ISOLATE_HEAP_BYTES);
+        let create_params = v8::CreateParams::default().heap_limits(0, heap_limit_bytes);
         let mut isolate = v8::Isolate::new(create_params);
+
+        // Issue #508: ヒープ上限到達コールバックが参照するスレッドローカル
+        // 状態を、コールバックを登録する前に初期化する。`terminate_execution`
+        // が安全に呼べる操作口を渡すだけで、Isolate 本体への生ポインタは
+        // 渡さない（[`near_heap_limit_callback`] の SAFETY 節参照）。
+        let isolate_handle = isolate.thread_safe_handle();
+        HEAP_LIMIT_ISOLATE_HANDLE.with(|handle| *handle.borrow_mut() = Some(isolate_handle));
+        HEAP_LIMIT_REACHED.with(|reached| reached.set(false));
+        HEAP_LIMIT_GROWTH_USED.with(|growth_used| growth_used.set(0));
+        isolate.add_near_heap_limit_callback(near_heap_limit_callback, std::ptr::null_mut());
+
         let context = {
             let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
             let scope = scope.init();
             let context = v8::Context::new(&scope, Default::default());
             v8::Global::new(&scope, context)
         };
-        Ok(Self { context, isolate })
+        Ok(Self {
+            context,
+            isolate,
+            heap_limit_bytes,
+        })
     }
 
     /// この Isolate のヒープ統計から総ヒープサイズ（バイト）を返す。
@@ -404,8 +591,10 @@ impl V8Engine {
     /// - 入力サイズ: [`MAX_SCRIPT_SOURCE_BYTES`] を超えるスクリプト文字列
     ///   は評価前に `Err` を返す
     /// - ヒープサイズ: Isolate 生成時（[`V8Engine::new`]）に
-    ///   [`MAX_ISOLATE_HEAP_BYTES`] を上限として設定する。上限到達時の
-    ///   挙動の制限事項は同定数のドキュメントコメントを参照
+    ///   [`MAX_ISOLATE_HEAP_BYTES`] を上限として設定する。上限に近づくと
+    ///   [`JsEngineError::ResourceLimitExceeded`] を返し、次回の評価にも
+    ///   使い続けられる（挙動の詳細は同定数のドキュメントコメントを参照。
+    ///   Issue #506・#508・#509）
     /// - 実行時間: 監視は `v8::Script::compile` の**前**から始まり、
     ///   [`SCRIPT_EXECUTION_TIMEOUT`] を超えると
     ///   `v8::IsolateHandle::terminate_execution` で打ち切って `Err` を
@@ -435,7 +624,7 @@ impl V8Engine {
     pub(crate) fn evaluate_script(
         &mut self,
         script: &str,
-        _options: &EvaluateOptions,
+        options: &EvaluateOptions,
     ) -> Result<JsValue, JsEngineError> {
         // 外部入力（スクリプト文字列）の経路。長さを検証してからアロケー
         // ションに使う（coding-rust.md）。[`MAX_SCRIPT_SOURCE_BYTES`] は
@@ -447,16 +636,85 @@ impl V8Engine {
             )));
         }
 
-        // タイムアウト監視スレッド（後述）から呼び出す `IsolateHandle` は
-        // `self.isolate` を可変借用する `scope`/`tc` より前に取得する
-        // （`Isolate::thread_safe_handle` は `&self` のみで済み、
-        // Send + Sync な `v8::IsolateHandle` を返すため、`self` を可変借用
-        // したままの別スレッドへの受け渡しにはならない）。
-        let isolate_handle = self.isolate.thread_safe_handle();
+        // Issue #508/#509: この評価呼び出し中にヒープ上限コールバックが
+        // 発火したかどうかを判別するため、呼び出し前にフラグをリセット
+        // する（前回の評価が正常に終わっていれば既に `false` のはずだが、
+        // ここで明示的にリセットして呼び出しごとの独立性を保証する）。
+        HEAP_LIMIT_REACHED.with(|reached| reached.set(false));
 
-        let scope = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let result = Self::evaluate_in_isolate(&mut self.isolate, &self.context, script, options);
+
+        // [`Self::evaluate_in_isolate`] が確保していた `v8::HandleScope`/
+        // `TryCatch` はここまでにすべて破棄されているため、`self.isolate`
+        // への独立した可変アクセスができる（本メソッドを 2 段に分けている
+        // 理由。[`Self::evaluate_in_isolate`] のドキュメントコメント参照）。
+        if HEAP_LIMIT_REACHED.with(Cell::get) {
+            // ヒープ上限コールバックが発火した際に呼んだ
+            // `terminate_execution`（[`near_heap_limit_callback`]）の
+            // 終了要求を解除する。[`Self::evaluate_in_isolate`] 内の
+            // `finish_watchdog` が呼ぶ `cancel_terminate_execution` は
+            // その時点までに発火した分しか解除できず、`value_to_js_value`
+            // の変換処理中など、そこより後にコールバックが発火した場合は
+            // 終了要求が解除されないまま残る。解除し忘れると、次回の
+            // `evaluate_script` 呼び出しが理由もなく即座に「タイムアウトで
+            // 打ち切られた」ことになってしまう。`IsolateHandle` の
+            // `cancel_terminate_execution` と異なり `Isolate` 自身の
+            // メソッドで、`&self` のみで呼べる。
+            self.isolate.cancel_terminate_execution();
+
+            // 上限を一時的に広げていた分を破棄し、元の上限
+            // （`self.heap_limit_bytes`）に戻したうえでコールバックを
+            // 再登録する（次回の評価に備える。Issue #509 受け入れ条件
+            // 「打ち切り後に一時的に広げた上限が元に戻り、次の評価が
+            // 成功する」）。
+            self.isolate
+                .remove_near_heap_limit_callback(near_heap_limit_callback, self.heap_limit_bytes);
+            self.isolate
+                .add_near_heap_limit_callback(near_heap_limit_callback, std::ptr::null_mut());
+            HEAP_LIMIT_GROWTH_USED.with(|growth_used| growth_used.set(0));
+
+            // タイムアウトや構文エラー等、`result` が別の理由の `Err`（や
+            // まれに `Ok`）を作っていた場合でも、ヒープ上限到達という
+            // より根本的な打ち切り理由を優先して報告する（呼び出し側が
+            // 本当の打ち切り理由を判別できるようにする。security.md
+            // 「偽装・回避機能の禁止」──実際とは異なる理由・結果を返さ
+            // ない）。
+            return Err(JsEngineError::ResourceLimitExceeded(format!(
+                "script execution was terminated because the isolate heap approached its {}-byte limit",
+                self.heap_limit_bytes
+            )));
+        }
+
+        result
+    }
+
+    /// [`V8Engine::evaluate_script`] のコンパイル・実行本体（`JS-1`・
+    /// `TASK-29.3`・Issue #154）。
+    ///
+    /// `&mut self` を取らず Isolate・Context を直接受け取るのは、
+    /// [`V8Engine::evaluate_script`] が本関数の呼び出し後（＝ここで確保
+    /// する `v8::HandleScope`/`TryCatch` 等、`isolate` を可変借用する値が
+    /// すべて破棄された後）に `self.isolate` へ独立にアクセスして、
+    /// ヒープ上限コールバックの上限復元・再登録（Issue #509）を行う
+    /// 必要があるため（本関数の内部で `&mut self.isolate` を借用し続けた
+    /// まま `self` の他メソッド・フィールドへアクセスすることは Rust の
+    /// 借用規則上できない）。
+    fn evaluate_in_isolate(
+        isolate: &mut v8::OwnedIsolate,
+        context: &v8::Global<v8::Context>,
+        script: &str,
+        _options: &EvaluateOptions,
+    ) -> Result<JsValue, JsEngineError> {
+        // タイムアウト監視スレッド（後述）から呼び出す `IsolateHandle` は
+        // `isolate` を可変借用する `scope`/`tc` より前に取得する
+        // （`Isolate::thread_safe_handle` は `&self` のみで済み、
+        // Send + Sync な `v8::IsolateHandle` を返すため、`isolate` を
+        // 可変借用したままの別スレッドへの受け渡しにはならない）。
+        let isolate_handle = isolate.thread_safe_handle();
+
+        let scope = std::pin::pin!(v8::HandleScope::new(isolate));
         let mut scope = scope.init();
-        let context = v8::Local::new(&scope, &self.context);
+        let context = v8::Local::new(&scope, context);
         let scope = &mut v8::ContextScope::new(&mut scope, context);
         // 構文エラーも捕捉するため、コンパイルの前に TryCatch を開く。
         let tc = std::pin::pin!(v8::TryCatch::new(scope));
@@ -694,8 +952,17 @@ fn value_to_js_value(
 impl Drop for V8Engine {
     /// このスレッドの [`V8_ISOLATE_ACTIVE`] フラグを解放し、以後
     /// このスレッドで新しい `V8Engine` を生成できるようにする。
+    ///
+    /// あわせて、ヒープ上限コールバック（Issue #508）が使うスレッド
+    /// ローカルの [`HEAP_LIMIT_ISOLATE_HANDLE`] を `None` に戻す。この
+    /// Isolate は破棄されるため、次に同じスレッドで別の `V8Engine` が
+    /// 生成されるまでの間、古い（破棄済みの）Isolate への操作口が
+    /// スレッドローカルに残り続けることを避ける（`IsolateHandle` 自体は
+    /// 破棄済み Isolate に対しても安全な no-op になるため必須ではないが、
+    /// 古い状態を残さないための後始末）。
     fn drop(&mut self) {
         V8_ISOLATE_ACTIVE.with(|active| active.set(false));
+        HEAP_LIMIT_ISOLATE_HANDLE.with(|handle| *handle.borrow_mut() = None);
     }
 }
 
@@ -1010,6 +1277,72 @@ mod tests {
             }
             other => panic!("expected EvaluationFailed for an oversized result, got: {other:?}"),
         }
+    }
+
+    /// JS-1・`TASK-29`・Issue #506/#508/#509/#510 の回帰確認: ヒープ上限に
+    /// 近づく JS（大きな配列の確保を繰り返す無限ループ）を評価すると、
+    /// プロセスが終了せず [`JsEngineError::ResourceLimitExceeded`] が
+    /// 具体的に返ること。テストを高速化するため、本番の
+    /// [`MAX_ISOLATE_HEAP_BYTES`]（128 MiB）ではなく
+    /// [`V8Engine::new_with_heap_limit_for_test`] で小さいヒープ上限を
+    /// 使う（Issue #510 受け入れ条件「テストの所要時間が CI で許容できる
+    /// 範囲に収まっている」）。ヒープ確保は [`SCRIPT_EXECUTION_TIMEOUT`]
+    /// （2 秒）より十分速く上限に到達するため、タイムアウトではなく
+    /// ヒープ上限到達由来のエラーになることを確認できる。
+    ///
+    /// 同じ重いスクリプトを 2 回続けて評価することで、打ち切り後に
+    /// コールバックが再登録されていること（Issue #509 の核心）も検証する。
+    /// 再登録されていなければ、2 回目は V8 の既定の OOM 処理（プロセス
+    /// 終了）に進んでしまい `Err` を返せないため、元の P0（#507・#506）が
+    /// 再発したことになる。
+    #[test]
+    fn js_1_v8_heap_limit_exceeded_returns_resource_limit_exceeded_err() {
+        // V8 の空 Isolate 自体が数 MiB のベースラインヒープを使うため、
+        // 極端に小さい値にすると Isolate 生成・Context 生成の時点で
+        // 上限に触れてしまい、テストが意図と異なる形で不安定になる。
+        // 手元検証で安定した値として 16 MiB を使う。
+        const TEST_HEAP_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+        let mut engine = V8Engine::new_with_heap_limit_for_test(TEST_HEAP_LIMIT_BYTES)
+            .expect("no other V8Engine is active on this thread");
+
+        // 1 要素 8 バイト（倍精度浮動小数点数）の配列を繰り返し確保し続け、
+        // ヒープ上限へ到達させる。`while (true)` にしているのは、上限
+        // 到達前にループが終わって `Ok` を返す余地をなくすため
+        // （`terminate_execution` によって早期に打ち切られる前提）。
+        let script = "var chunks = []; \
+             while (true) { chunks.push(new Array(1e6).fill(0)); }";
+
+        match engine.evaluate_script(script, &EvaluateOptions::default()) {
+            Err(JsEngineError::ResourceLimitExceeded(msg)) => {
+                assert!(
+                    msg.contains("heap") && msg.contains(&TEST_HEAP_LIMIT_BYTES.to_string()),
+                    "expected a message about the heap limit ({TEST_HEAP_LIMIT_BYTES} bytes), got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected ResourceLimitExceeded for a heap-limit-exceeding script, got: {other:?}"
+            ),
+        }
+
+        // Issue #509 受け入れ条件の核心: 打ち切り後にコールバックが
+        // 再登録されていること。再登録されていなければ、2 本目の重い
+        // スクリプトは V8 の既定の OOM 処理（プロセス終了）に進んでしまい
+        // `Err` を返せない（元の P0 が再発する）。同じスクリプトをもう一度
+        // 評価しても `ResourceLimitExceeded` が返ることで再登録を確認する。
+        match engine.evaluate_script(script, &EvaluateOptions::default()) {
+            Err(JsEngineError::ResourceLimitExceeded(_)) => {}
+            other => panic!(
+                "expected the re-registered callback to fire again on a second heavy script, got: {other:?}"
+            ),
+        }
+
+        // 打ち切り後もエンジンが使い続けられること（Issue #509 受け入れ
+        // 条件「打ち切り後に一時的に広げた上限が元に戻り、次の評価が
+        // 成功する」）。
+        let result = engine
+            .evaluate_script("40 + 2", &EvaluateOptions::default())
+            .expect("engine must remain usable after a heap limit is exceeded");
+        assert_eq!(result, JsValue::Number(42.0));
     }
 
     /// JS-1・PR #503 レビュー指摘 P1 の回帰確認: `v8::Script::compile` の

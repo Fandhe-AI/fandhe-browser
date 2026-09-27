@@ -143,10 +143,31 @@ pub struct EvaluateOptions {}
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum JsEngineError {
-    /// スクリプト評価が失敗した（構文エラー・実行時例外等）。
+    /// スクリプト評価が失敗した（構文エラー・実行時例外・タイムアウトに
+    /// よる打ち切り等）。
     EvaluationFailed(String),
     /// グローバル関数・DOM 風オブジェクトの登録に失敗した。
     BindingFailed(String),
+    /// スクリプト評価がリソース上限（現状はヒープ上限）に到達したために
+    /// 打ち切られた（`JS-1`・Issue #506・#508・#509）。
+    ///
+    /// [`EvaluationFailed`](Self::EvaluationFailed)（タイムアウト・構文
+    /// エラー・実行時例外）とは別の variant にすることで、呼び出し側
+    /// （core・cdp 等）がヒープ上限到達由来の打ち切りを判別できるように
+    /// する（呼び出し側がリトライ・エンジン再生成等、他の打ち切り理由
+    /// とは異なる対応を選べるようにするため。security.md「偽装・回避
+    /// 機能の禁止」──実際の打ち切り理由をひとまとめにして隠さない）。
+    /// V8 実装（`v8_engine.rs`）はこの打ち切りの後もエンジンを使い続け
+    /// られるよう上限を復元するが、`boa` 実装（`TASK-32`）が同じ形で
+    /// 復元できるとは限らないため、`JsEngine` トレイトの契約としては
+    /// 「打ち切り後にエンジンが使い続けられるかどうかは実装依存」とする。
+    ///
+    /// V8 実装では、上限は元に戻るがヒープの中身（打ち切られたスクリプト
+    /// が作ったグローバル変数等）はそのまま残るため、直後の評価が再び
+    /// 同じエラーになりやすい。クリーンな状態から再開したい呼び出し側は
+    /// エンジンを作り直すことを検討する（詳細は `v8_engine.rs` の
+    /// `MAX_ISOLATE_HEAP_BYTES` のドキュメントコメントを参照）。
+    ResourceLimitExceeded(String),
 }
 
 impl std::fmt::Display for JsEngineError {
@@ -154,6 +175,9 @@ impl std::fmt::Display for JsEngineError {
         match self {
             Self::EvaluationFailed(msg) => write!(f, "script evaluation failed: {msg}"),
             Self::BindingFailed(msg) => write!(f, "binding registration failed: {msg}"),
+            Self::ResourceLimitExceeded(msg) => {
+                write!(f, "script evaluation exceeded a resource limit: {msg}")
+            }
         }
     }
 }
