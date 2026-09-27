@@ -315,12 +315,16 @@ pub fn looks_like_browser_readiness_response(body: &str) -> bool {
         .any(|key| READINESS_RESPONSE_FIELDS.contains(&key.to_ascii_lowercase().as_str()))
 }
 
-/// `pgrep -g <pgid>`（1 行 1 pid）の標準出力をパースし、`u32` の一覧として
-/// 返す（`measure.rs` の `sample_process_group_rss_kb` が使う。PERF-6。
+/// `pgrep -P <ppid>`（1 行 1 pid。指定した親 pid の直接の子一覧）の標準出力を
+/// パースし、`u32` の一覧として返す（`measure.rs` の
+/// `sample_process_tree_rss_kb`/`pgrep_children` が使う。PERF-6。
 /// TASK-84.2・Issue #212 のレビュー指摘対応: 対象プロセスがさらに子プロセスを
-/// 使う場合に備え、直接の子 1 プロセスだけでなく [`apply_new_process_group`]
-/// が同じプロセスグループへまとめた子孫全体を数え上げてから RSS を合計する
-/// ため、まず `pgrep` でメンバー pid の一覧を得る）。
+/// 使う場合に備え、直接の子 1 プロセスだけでなく ppid チェーンで辿った
+/// プロセスツリー全体を数え上げてから RSS を合計する。以前は
+/// `pgrep -g <pgid>`（同一プロセスグループのメンバー）で代用していたが、
+/// 対象の子孫が `setpgid` 等で別のプロセスグループへ移ると数え漏れる
+/// ため、`ppid` を直接辿る方式に変更した。同じ出力書式（1 行 1 pid）を
+/// 解釈する本関数はそのまま流用する）。
 ///
 /// 空行は無視する。数値でない行が 1 つでもあれば出力全体を信頼できないと
 /// みなし `None` を返す（coding-rust.md「外部入力の経路では明示的に処理する」）。
@@ -328,7 +332,7 @@ pub fn looks_like_browser_readiness_response(body: &str) -> bool {
 /// コマンドライン構築・アロケーションを避ける。coding-rust.md「長さ・件数を
 /// 上限検証してからアロケーションに使う」）。
 ///
-/// 呼び出し元（`measure.rs` の `sample_process_group_rss_kb`）が
+/// 呼び出し元（`measure.rs` の `sample_process_tree_rss_kb`）が
 /// `#[cfg(unix)]` 限定のため、この関数自体も `#[cfg(unix)]` にする。
 /// 無条件公開のままだと Windows ネイティブビルドで到達不能になり
 /// `dead_code` 警告が `-D warnings`（ci.md「3 OS CI」）で fail する。
@@ -351,8 +355,8 @@ pub fn parse_pgrep_pids(out: &str, max_pids: usize) -> Option<Vec<u32>> {
 }
 
 /// `ps -o rss= -p <pid1,pid2,...>`（1 行 1 プロセスの RSS）の標準出力を
-/// パースして合計する（KB 単位。`measure.rs` の `sample_process_group_rss_kb`
-/// が使う。プロセスグループ内の全メンバー分の行を合計する）。
+/// パースして合計する（KB 単位。[`sum_ps_rss_kb_lines_checked`] が使う。
+/// プロセスツリー内の全メンバー分の行を合計する）。
 ///
 /// 空行は無視する。数値でない行が 1 つでもあれば全体を信頼できないとみなし
 /// `None` を返す（`parse_pgrep_pids` と同じ fail-closed 方針）。1 行も
@@ -371,6 +375,25 @@ pub fn sum_ps_rss_kb_lines(out: &str) -> Option<u64> {
         any = true;
     }
     any.then_some(total)
+}
+
+/// [`sum_ps_rss_kb_lines`] の上位版。`measure.rs` の
+/// `sample_process_tree_rss_kb` が実際に使う経路はこちら。`pgrep -P` の
+/// BFS でプロセスツリーの pid 一覧を確定させた直後に対象プロセスが終了
+/// すると、その後の `ps -o rss= -p <pid1,pid2,...>` は消えた pid の行を
+/// 出力しない。`sum_ps_rss_kb_lines` はそれに気付かず残りの行だけを
+/// 「合計成功」として返してしまう（TASK-84.2・Issue #212 のレビュー指摘
+/// 対応）。要求した pid 数（`expected_count`）と実際に出力された行数
+/// （空行を除く）が一致するかを先に検証し、一致しない場合は「一部だけ
+/// 計測できた不完全な合計」を黙って返さず `None`（呼び出し元が
+/// `Outcome::Error` にする）にする。
+#[cfg(unix)]
+pub fn sum_ps_rss_kb_lines_checked(out: &str, expected_count: usize) -> Option<u64> {
+    let actual_count = out.lines().map(str::trim).filter(|l| !l.is_empty()).count();
+    if actual_count == 0 || actual_count != expected_count {
+        return None;
+    }
+    sum_ps_rss_kb_lines(out)
 }
 
 /// Windows `tasklist /FI "PID eq <pid>" /FO CSV /NH` の標準出力（ヘッダ無し
@@ -509,18 +532,18 @@ pub fn parse_args_env_value(
 /// および JSON 出力（[`Outcome::to_json`]）に使う。純粋関数群と同じ
 /// `support.rs` に置くことで、[`bench_exit_code`] のテスト（`Skipped`/
 /// `Unsupported` のみでは `0`、`Error` を含むと非ゼロ）を副作用なしに書ける。
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Outcome {
     Value(f64),
     Skipped(String),
-    // 将来、OS やプラットフォームの制約で計測できない項目を表すための
-    // 予約バリアント。TASK-84.5（アイドル RSS の Windows 実装。`tasklist`
-    // 経由）でこのバリアントを構築していた最後の経路が無くなったため、
-    // 現時点ではどの OS からもこのバリアントを構築するコード経路が
-    // 存在しない（dead_code 警告を `#[allow(dead_code)]` で抑止する）。
-    // JSON の status 語彙（`"unsupported"`）と `bench_exit_code`・
-    // `to_json` の既存契約を保つため、バリアント自体は削除しない。
-    #[allow(dead_code)]
+    // TASK-84.5（アイドル RSS の Windows 実装。`tasklist` 経由）で一時的に
+    // このバリアントを構築するコード経路が無くなっていたが、TASK-84.2・
+    // Issue #212 のレビュー指摘対応（Windows の `idleRssKb` が対象プロセス
+    // 単体のみを計測するのに対し `PERF-6` 基準値はプロセスツリー全体で
+    // あり、両者は数値上比較できない）により、`measure::run_all` が
+    // Windows では `idleRssKb` 実測値を `perf6_comparison` へそのまま渡さず
+    // このバリアントへ差し替えて「比較不能」を明示する形で再び使うように
+    // なった（`Clone` はその差し替えのために必要）。
     Unsupported(String),
     Error(String),
 }
@@ -2252,8 +2275,9 @@ mod tests {
     }
 
     // PERF-6（TASK-84.2・Issue #212 のレビュー指摘対応）: `parse_pgrep_pids`・
-    // `sum_ps_rss_kb_lines` はプロセスグループ全体の RSS 合計
-    // （`measure.rs` の `sample_process_group_rss_kb`）が使う純粋関数。
+    // `sum_ps_rss_kb_lines`・`sum_ps_rss_kb_lines_checked` はプロセスツリー
+    // 全体の RSS 合計（`measure.rs` の `sample_process_tree_rss_kb`）が
+    // 使う純粋関数。
     #[cfg(unix)]
     #[test]
     fn parse_pgrep_pids_basic() {
@@ -2315,6 +2339,29 @@ mod tests {
     #[test]
     fn sum_ps_rss_kb_lines_invalid_line_is_none() {
         assert_eq!(sum_ps_rss_kb_lines("100\nnot-a-number\n"), None);
+    }
+
+    #[test]
+    fn sum_ps_rss_kb_lines_checked_count_matches() {
+        assert_eq!(sum_ps_rss_kb_lines_checked("100\n200\n300\n", 3), Some(600));
+    }
+
+    /// `pgrep` で確定した pid 数より `ps` の出力行数が少ない場合
+    /// （対象プロセスが `pgrep` 後 `ps` 前に終了したレース）は、残りの行だけ
+    /// を合計せず `None` にする（TASK-84.2・Issue #212 のレビュー指摘対応）。
+    #[test]
+    fn sum_ps_rss_kb_lines_checked_short_count_is_none() {
+        assert_eq!(sum_ps_rss_kb_lines_checked("100\n200\n", 3), None);
+    }
+
+    #[test]
+    fn sum_ps_rss_kb_lines_checked_empty_is_none() {
+        assert_eq!(sum_ps_rss_kb_lines_checked("", 0), None);
+    }
+
+    #[test]
+    fn sum_ps_rss_kb_lines_checked_invalid_line_is_none() {
+        assert_eq!(sum_ps_rss_kb_lines_checked("100\nnot-a-number\n", 2), None);
     }
 
     // PERF-6: parse_tasklist_mem_kb は Windows の

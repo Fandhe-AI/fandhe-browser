@@ -44,16 +44,16 @@ use crate::support::{
     parse_http_request_line, parse_http_status, parse_json, port_conflict_error, reduction_pct,
     require_bin, token_reduction_gate, validate_mcp_response, wait_with_deadline,
 };
-// `parse_pgrep_pids`・`sum_ps_rss_kb_lines` は unix 専用の
-// `sample_process_group_rss_kb`（下記 `#[cfg(unix)]`）が呼ぶ。`parse_tasklist_mem_kb`
-// は windows 専用の `sample_rss_kb`（下記 `#[cfg(windows)]`）が呼ぶ。無条件
-// import のままだと反対側の OS ビルドで未使用になり `unused_imports` 警告が
-// `-D warnings`（ci.md「3 OS CI」）で fail するため cfg で分離する
+// `parse_pgrep_pids` は unix 専用の `pgrep_children`（下記 `#[cfg(unix)]`）が
+// 呼ぶ。`parse_tasklist_mem_kb` は windows 専用の `sample_rss_kb`
+// （下記 `#[cfg(windows)]`）が呼ぶ。無条件 import のままだと反対側の OS
+// ビルドで未使用になり `unused_imports` 警告が `-D warnings`
+// （ci.md「3 OS CI」）で fail するため cfg で分離する
 // （TASK-84.2・TASK-84.5・PERF-6・Issue #212）。
+#[cfg(unix)]
+use crate::support::parse_pgrep_pids;
 #[cfg(windows)]
 use crate::support::parse_tasklist_mem_kb;
-#[cfg(unix)]
-use crate::support::{parse_pgrep_pids, sum_ps_rss_kb_lines};
 
 /// fixture 配信サーバーの各種上限（coding-rust.md「長さ・件数を上限検証」）。
 /// ローカル専用のベンチ補助サーバーだが、想定外の大量・低速接続で
@@ -1088,53 +1088,94 @@ pub fn measure_cold_start(target: &Target, trials: usize) -> Outcome {
     }
 }
 
+/// プロセスツリーの pid 一覧構築（`sample_process_tree_rss_kb` が使う）で
+/// 数え上げる pid 数の上限。`pgrep` 1 回あたりの出力バイト上限
+/// （`PGREP_CHILDREN_MAX_OUTPUT_BYTES`）ともこの値を前提に決めてある
+/// （coding-rust.md「長さ・件数を上限検証してからアロケーションに使う」）。
+#[cfg(unix)]
+const MAX_TREE_PIDS: usize = 256;
+
+/// `pid` の直接の子プロセス一覧を `pgrep -P <pid>` で取得する
+/// （`sample_process_tree_rss_kb` の BFS が使う）。
+///
+/// `pgrep -P` は一致する子プロセスが無いと終了コード 1 を返す（子がいない
+/// リーフノードは正常な終端であり失敗ではないため空の一覧にする）。それ
+/// 以外の非 0 終了・起動失敗は呼び出し元で `None` 扱いにする
+/// （fail-closed。coding-rust.md「外部入力の経路では明示的に処理する」）。
+#[cfg(unix)]
+fn pgrep_children(pid: u32) -> Option<Vec<u32>> {
+    // `pgrep -P <pid>` の出力は pid の一覧のみで通常数バイト〜数十バイト。
+    const MAX_PGREP_OUTPUT_BYTES: usize = 4096;
+    let mut command = Command::new("pgrep");
+    command.args(["-P", &pid.to_string()]);
+    let (status, stdout) = crate::support::run_capturing_output_with_deadline(
+        command,
+        crate::support::EXTERNAL_COMMAND_DEADLINE,
+        MAX_PGREP_OUTPUT_BYTES,
+    )
+    .ok()?;
+    if !status.success() {
+        return match status.code() {
+            Some(1) => Some(Vec::new()),
+            _ => None,
+        };
+    }
+    parse_pgrep_pids(&String::from_utf8_lossy(&stdout), MAX_TREE_PIDS)
+}
+
+/// `root_pid` を起点に `ppid` チェーンを幅優先で辿り、プロセスツリー全体
+/// （自身 + 子・孫・…）の pid 一覧を返す（`sample_process_tree_rss_kb` が
+/// 使う）。
+///
+/// TASK-84.2・Issue #212 のレビュー指摘対応: 以前は `pgrep -g <pgid>`
+/// （`apply_new_process_group` が作る同一プロセスグループのメンバー）で
+/// 代用していたが、対象の子孫が `setpgid` 等で別のプロセスグループへ
+/// 移ると数え漏れ、実際には目標未達でも `PERF-6` 判定
+/// （`support::perf6_comparison`）が `"met"` を誤って返し得た。`ppid` を
+/// 直接辿る本方式はプロセスグループの変更に影響されない。`MAX_TREE_PIDS`
+/// を超える異常なツリーサイズは打ち切って `None`（呼び出し元が Error 化）
+/// にする。
+#[cfg(unix)]
+fn collect_process_tree_pids(root_pid: u32) -> Option<Vec<u32>> {
+    let mut pids = vec![root_pid];
+    let mut frontier = vec![root_pid];
+    while let Some(parent) = frontier.pop() {
+        for child in pgrep_children(parent)? {
+            if pids.contains(&child) {
+                continue;
+            }
+            if pids.len() >= MAX_TREE_PIDS {
+                return None;
+            }
+            pids.push(child);
+            frontier.push(child);
+        }
+    }
+    Some(pids)
+}
+
 /// アイドル RSS（`PERF-6`）: 起動して安定させたあと、対象プロセスの RSS
-/// （KB）を読む。unix は対象プロセスが属するプロセスグループ全体
-/// （自身 + 子孫）の RSS 合計、windows は対象プロセス単体のワーキング
-/// セット相当の値を読む（`measure_idle_rss` 参照）。
+/// （KB）を読む。unix は対象プロセスのプロセスツリー全体
+/// （自身 + 子孫。`collect_process_tree_pids` 参照）の RSS 合計、windows は
+/// 対象プロセス単体のワーキングセット相当の値を読む（`measure_idle_rss`
+/// 参照）。
 ///
 /// TASK-84.2・Issue #212 のレビュー指摘対応（unix 側）: 以前は
 /// `guard.0.id()`（直接の子プロセス 1 つ）だけを `ps -o rss= -p <pid>` で
 /// 読んでいたため、対象がさらに子プロセスを使う実装だと、そのメモリを
 /// 含めずに `PERF-6` 判定（`support::perf6_comparison`。基準値は Chromium の
 /// **プロセスツリー全体**のアイドル RSS）へ渡してしまい、実際には目標未達
-/// でも `"met"` を誤って返し得た。`apply_new_process_group`
-/// （`spawn_and_wait_ready` が起動時に適用。子プロセス自身を新しい
-/// プロセスグループのリーダーにするため、プロセスグループ ID は子プロセス
-/// の PID と一致する）が作るプロセスグループ全体を対象にすることで、
-/// [`kill_process_group`] が子・孫をまとめて終了できるのと同じ範囲を RSS
-/// 計測でも数え上げ、Chromium 側の計測範囲（プロセスツリー全体）に揃える。
-/// windows は `tasklist` にプロセスツリー全体を安全に数え上げる標準的な
-/// 手段が無いため（`unsafe`・新規依存を避ける方針。TASK-84.5）、対象
-/// プロセス単体の計測（`sample_rss_kb`・[`parse_tasklist_mem_kb`]）に留める。
+/// でも `"met"` を誤って返し得た。windows は `tasklist` にプロセスツリー
+/// 全体を安全に数え上げる標準的な手段が無いため（`unsafe`・新規依存を
+/// 避ける方針。TASK-84.5）、対象プロセス単体の計測
+/// （`sample_rss_kb`・[`parse_tasklist_mem_kb`]）に留める。
 #[cfg(unix)]
-fn sample_process_group_rss_kb(pgid: u32) -> Option<u64> {
-    // `pgrep -g <pgid>` の出力は pid の一覧のみで通常数バイト〜数十バイト。
-    // `MAX_TREE_PIDS` を超える異常なプロセス数の場合は打ち切ってエラーに
-    // する（coding-rust.md「長さ・件数を上限検証してからアロケーションに
-    // 使う」）。
-    const MAX_PGREP_OUTPUT_BYTES: usize = 4096;
-    const MAX_TREE_PIDS: usize = 256;
-    let mut pgrep_command = Command::new("pgrep");
-    pgrep_command.args(["-g", &pgid.to_string()]);
-    let (pgrep_status, pgrep_stdout) = crate::support::run_capturing_output_with_deadline(
-        pgrep_command,
-        crate::support::EXTERNAL_COMMAND_DEADLINE,
-        MAX_PGREP_OUTPUT_BYTES,
-    )
-    .ok()?;
-    // `pgrep` は一致するプロセスが無いと終了コード 1 を返す。起動直後の
-    // 対象プロセス自身が消えている想定外の状態のため、`sample_process_group_rss_kb`
-    // （旧実装）の `ps` 失敗時と同じく `None`（呼び出し元が Error 化）にする。
-    if !pgrep_status.success() {
-        return None;
-    }
-    let pids = parse_pgrep_pids(&String::from_utf8_lossy(&pgrep_stdout), MAX_TREE_PIDS)?;
+fn sample_process_tree_rss_kb(root_pid: u32) -> Option<u64> {
+    let pids = collect_process_tree_pids(root_pid)?;
     if pids.is_empty() {
         return None;
     }
     // `ps -p` はカンマ区切りで複数 pid を受け付ける（POSIX・GNU・BSD 共通）。
-    // 1 行 1 プロセスで RSS が出力されるため `sum_ps_rss_kb_lines` で合計する。
     let pid_list = pids
         .iter()
         .map(u32::to_string)
@@ -1155,9 +1196,14 @@ fn sample_process_group_rss_kb(pgid: u32) -> Option<u64> {
     if !ps_status.success() {
         return None;
     }
-    // `from_utf8_lossy` で足りる理由は旧 `sample_process_group_rss_kb` と同じ
-    // （置換文字混入時は `parse::<u64>()` が失敗して `None` になるだけ）。
-    sum_ps_rss_kb_lines(&String::from_utf8_lossy(&ps_stdout))
+    // `collect_process_tree_pids`（`pgrep`）で確定した pid が、この `ps`
+    // 実行までに終了しているとその行が出力されない。`sum_ps_rss_kb_lines`
+    // だけだと残りの行を「合計成功」として黙って返してしまう（レビュー
+    // 指摘対応。TASK-84.2・Issue #212）ため、要求した pid 数と実際の行数の
+    // 一致を検証する `sum_ps_rss_kb_lines_checked` を使う。`from_utf8_lossy`
+    // で足りる理由は旧 `sample_process_group_rss_kb` と同じ（置換文字混入時
+    // は `parse::<u64>()` が失敗して `None` になるだけ）。
+    crate::support::sum_ps_rss_kb_lines_checked(&String::from_utf8_lossy(&ps_stdout), pids.len())
 }
 
 /// windows 版 `sample_rss_kb`。`tasklist` の標準出力は OEM コードページで
@@ -1208,16 +1254,15 @@ fn measure_idle_rss(target: &Target, trials: usize) -> Outcome {
         match spawn_and_wait_ready(bin, &target.serve_args) {
             Ok((guard, port, _elapsed)) => {
                 std::thread::sleep(Duration::from_millis(500));
-                // `sample_process_group_rss_kb`/`sample_rss_kb` の失敗
+                // `sample_process_tree_rss_kb`/`sample_rss_kb` の失敗
                 // （プロセス早期終了・パース不能出力）を黙って捨てず即座に
-                // Error 化する。unix は `apply_new_process_group` により
-                // 対象プロセス自身のプロセスグループ ID が自身の pid と
-                // 一致することを利用し、そのままプロセスグループ全体の RSS
-                // 合計（子孫を含む。PERF-6・Issue #212 のレビュー指摘対応）
-                // を読む。windows は対象プロセス単体を読む（TASK-84.5）。
+                // Error 化する。unix は `ppid` チェーンを辿ってプロセス
+                // ツリー全体の RSS 合計（子孫を含む。PERF-6・Issue #212 の
+                // レビュー指摘対応）を読む。windows は対象プロセス単体を
+                // 読む（TASK-84.5）。
                 let pid = guard.0.id();
                 #[cfg(unix)]
-                let rss = sample_process_group_rss_kb(pid);
+                let rss = sample_process_tree_rss_kb(pid);
                 #[cfg(windows)]
                 let rss = sample_rss_kb(pid);
                 // `drop(guard)` は `kill_process_group`/`Child::kill` で
@@ -2034,13 +2079,36 @@ pub fn run_all(
 
         // `PERF-6` 目標（Chromium 比 85% 以上のアイドル RSS 削減。
         // `crate::support::PERF6_TARGET_PCT`）との比較（TASK-84.2・Issue #212）。
-        // 判定対象は `idle_rss`（この対象のアイドル RSS 計測結果。
-        // `sample_process_group_rss_kb` によりプロセスグループ全体の RSS
-        // 合計に揃えてある）そのものであり、`bench_exit_code` の判定対象には
+        // 判定対象は `idle_rss`（この対象のアイドル RSS 計測結果。unix は
+        // `sample_process_tree_rss_kb` によりプロセスツリー全体の RSS 合計に
+        // 揃えてある）そのものであり、`bench_exit_code` の判定対象には
         // 含めない（`perf6_comparison` ドキュメント参照）。
+        //
+        // windows は `idleRssKb` 自体は実測できる（TASK-84.5）が、対象
+        // プロセス単体のワーキングセットしか読めない一方、
+        // `chromium_idle_rss_kb`（基準値）は Chromium の**プロセスツリー
+        // 全体**のアイドル RSS のため、両者は計測範囲が食い違い数値上の
+        // 比較が成立しない（`idleRssKb` が小さく出るだけで「削減できた」
+        // わけではない）。レビュー指摘対応（TASK-84.2・Issue #212）として、
+        // Windows では実測値をそのまま `perf6_comparison` へ渡さず
+        // `Outcome::Unsupported` に差し替えて「比較不能」を明示する
+        // （`idleRssKb` フィールド自体の実測値はこの差し替えの影響を受け
+        // ない。`Skipped`/`Unsupported`/`Error` はそのまま素通しする）。
+        let perf6_idle_rss = if cfg!(windows) {
+            match idle_rss.clone() {
+                Outcome::Value(_) => Outcome::Unsupported(
+                    "PERF-6 comparison is unsupported on Windows: idleRssKb measures only \
+                     the direct child process while the baseline is a full process-tree total"
+                        .to_string(),
+                ),
+                other => other,
+            }
+        } else {
+            idle_rss.clone()
+        };
         let perf6 = crate::support::perf6_comparison(
             chromium_idle_rss_kb,
-            &idle_rss,
+            &perf6_idle_rss,
             crate::support::PERF6_TARGET_PCT,
         );
         eprintln!("PERF-6 comparison: {perf6}");

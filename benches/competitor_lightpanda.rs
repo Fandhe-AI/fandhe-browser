@@ -38,12 +38,17 @@
 //! `"perf6"` フィールド: 各対象の `idleRssKb` と上記基準値から
 //! `PERF-6`（Chromium 比 85% 以上のアイドル RSS 削減。
 //! `support::PERF6_TARGET_PCT`）目標との比較を `{"status":...}` 形式で返す
-//! （`support::perf6_comparison`）。`idleRssKb` 側は対象プロセスが属する
-//! **プロセスグループ全体**（自身 + 子孫プロセス。`measure::measure_idle_rss`
-//! の `sample_process_group_rss_kb` 参照）の RSS 合計であり、Chromium 側の
-//! 基準値（プロセスツリー全体）と計測範囲を揃えてある（対象が子プロセスを
-//! 使う実装であっても、そのメモリを除外したまま `"met"` を誤って返さない
-//! ため。TASK-84.2・Issue #212 のレビュー指摘対応）。
+//! （`support::perf6_comparison`）。unix の `idleRssKb` は対象プロセスの
+//! **プロセスツリー全体**（自身 + 子孫プロセス。`ppid` チェーンを辿って
+//! 合算する。`measure::measure_idle_rss` の `sample_process_tree_rss_kb`
+//! 参照）の RSS 合計であり、Chromium 側の基準値（プロセスツリー全体）と
+//! 計測範囲を揃えてある（対象が子プロセスを使う実装であっても、そのメモリ
+//! を除外したまま `"met"` を誤って返さないため。TASK-84.2・Issue #212 の
+//! レビュー指摘対応）。windows の `idleRssKb` は対象プロセス単体しか
+//! 読めず（`measure::measure_idle_rss` の `sample_rss_kb` 参照。
+//! TASK-84.5）基準値と計測範囲が食い違うため、実測できていても
+//! `"perf6"` は数値比較をせず `"unsupported"` になる（`idleRssKb` フィールド
+//! 自体の値には影響しない。TASK-84.2・Issue #212 のレビュー指摘対応）。
 //! `"below_target"`（目標未達）は計測結果の一種であり計測失敗ではないため、
 //! 下記の終了コード契約には影響しない（`bench_exit_code` の判定対象に含め
 //! ない）。
@@ -80,11 +85,14 @@
 //! ごとの実測削減率は stderr（`token reduction [<kind>] (<url>): <pct>`）へ
 //! 出す。
 //!
-//! アイドル RSS（`PERF-6`）: unix は `ps -o rss=`、Windows は
-//! `tasklist /FI "PID eq <pid>" /FO CSV /NH`（TASK-84.5）で読むのは、いずれも
-//! 起動した直接の子プロセスの RSS（ワーキングセット）のみ。`<PREFIX>_BIN`
+//! アイドル RSS（`PERF-6`）: unix は起動した対象プロセスのプロセスツリー
+//! 全体（自身 + 子孫。`pgrep -P` で `ppid` チェーンを辿り、`ps -o rss=` で
+//! 合算する）の RSS 合計を読む。windows は `tasklist /FI "PID eq <pid>"
+//! /FO CSV /NH`（TASK-84.5）で起動した直接の子プロセスの RSS
+//! （ワーキングセット）のみを読む（プロセスツリー全体を安全に数え上げる
+//! 標準的な手段が無いため。`unsafe`・新規依存を避ける方針）。`<PREFIX>_BIN`
 //! が実体をラップして別プロセスとして起動するラッパースクリプト等の場合、
-//! 実際にメモリを使う実体プロセスの RSS を捕捉できない。
+//! windows では実際にメモリを使う実体プロセスの RSS を捕捉できない。
 //!
 //! `AISNAP-1` の `goto` 成功判定（`support::FIXTURE_MARKERS`）: 各 fixture の
 //! `<body>` 内見出し（`<h1>`）のテキストが `html`・`tree` の両方に含まれる

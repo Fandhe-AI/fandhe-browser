@@ -659,16 +659,20 @@ fn successful_measurement_path_reports_measured_values_and_exit_code_zero() {
         "idleRssKb should be well under 1GiB for a local self-exec process (PERF-6): {idle_rss_value}"
     );
 
-    // PERF-6 目標比較（TASK-84.2・Issue #212）: idleRssKb の計測状況を
-    // "perf6" がそのまま反映することを確認する。unix では実測値に対する
-    // 判定（"measured"・baselineKb が渡した基準値と一致）、Windows では
-    // idleRssKb が unsupported のためそのまま unsupported を引き継ぐ。
+    // PERF-6 目標比較（TASK-84.2・Issue #212）: unix では idleRssKb の
+    // 実測値に対する判定（"measured"・baselineKb が渡した基準値と一致）を
+    // 確認する。Windows は idleRssKb 自体は実測できる（TASK-84.5。上記の
+    // "measured" アサーションと同じ）が、対象プロセス単体しか読めず
+    // `CHROMIUM_IDLE_RSS_KB`（プロセスツリー全体の基準値）と計測範囲が
+    // 食い違うため、`measure::run_all` が数値比較をせず "perf6" を
+    // "unsupported" にする（idleRssKb の実測値そのものは影響を受けない。
+    // レビュー指摘対応。TASK-84.2・Issue #212）。
     let perf6 = report.get("perf6").expect("perf6 field");
     if cfg!(windows) {
         assert_eq!(
             perf6.get("status").and_then(JsonValue::as_str),
             Some("unsupported"),
-            "perf6 should mirror idleRssKb's unsupported status on Windows: {body}"
+            "perf6 should be unsupported on Windows due to idleRssKb/baseline scope mismatch: {body}"
         );
     } else {
         assert_eq!(

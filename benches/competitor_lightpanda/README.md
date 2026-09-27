@@ -15,9 +15,14 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
   実測値を記録できるのは対象バイナリ（`LIGHTPANDA_BIN`・
   `FANDHE_BROWSER_BIN`）を用意したローカル・計測マシンで実行したときに限る
 - `PERF-6` が求める Chromium 側の基準値は**プロセスツリー全体**のアイドル
-  RSS だが、本ベンチの `idleRssKb` は起動した**直接の子プロセス 1 つ分**の
-  RSS しか計測しない（`../competitor_lightpanda.rs` モジュールドキュメント
-  「アイドル RSS」参照）。そのため `CHROMIUM_IDLE_RSS_KB` には、別途
+  RSS。本ベンチの `idleRssKb` は unix では対象プロセスのプロセスツリー
+  全体（自身 + 子孫。`ppid` チェーンを辿って合算する）の RSS 合計だが、
+  Windows は `tasklist` にプロセスツリー全体を安全に数え上げる標準的な
+  手段が無いため**直接の子プロセス 1 つ分**の RSS しか計測しない
+  （`../competitor_lightpanda.rs` モジュールドキュメント「アイドル RSS」・
+  TASK-84.5 参照）。Windows は計測範囲が基準値と食い違うため、`perf6` は
+  `idleRssKb` の実測値があっても数値比較をせず `unsupported` になる
+  （下記「`perf6` フィールド」参照）。`CHROMIUM_IDLE_RSS_KB` には、別途
   計測したプロセスツリー全体の実測値を渡す運用にする（既定値は埋め込まない）
 
 ## 運用（ローカルでの実測・記録）
@@ -87,7 +92,7 @@ bash record.sh --history results/history.jsonl [--input <file>] [--bench-exit-co
 | -------- | ---- |
 | `measured` | `baselineKb`・`reductionPct`・`targetPct`（85）・`verdict`（`met`/`below_target`）を含む |
 | `skipped` | `CHROMIUM_IDLE_RSS_KB` 未設定、または対象の `idleRssKb` 自体が `skipped`（対象バイナリ未設定） |
-| `unsupported` | `idleRssKb` が `unsupported`（Windows） |
+| `unsupported` | `idleRssKb` が `unsupported`、または Windows で `idleRssKb` は実測できたが計測範囲（対象プロセス単体）が基準値（プロセスツリー全体）と食い違い比較不能 |
 | `error` | `idleRssKb` が `error`（対象の起動失敗等） |
 
 `verdict: "below_target"` は「計測はできたが目標未達だった」ことを表す計測
