@@ -41,13 +41,21 @@ notice() {
 }
 
 # $1=検査ラベル, $2=cargo tree の標準出力
-# 一致があれば NG メッセージと一致行を標準エラーへ出して 1 を返す
-# （`| grep -q .` で挟むことで set -e 下でも「一致なし」を異常終了させない）。
+# 一致があれば NG メッセージと一致行を標準エラーへ出して 1 を返す。
+#
+# パイプ（`printf ... | grep ... | grep -q .`）は使わない。`set -o pipefail` 下では
+# パイプの終了ステータスが「右端の非ゼロ終了コマンド」になる仕様のため、一致行数が
+# パイプバッファ（約 64KB）を超えると後段の `grep -q .` が最初の 1 致で早期終了して
+# パイプを閉じ、前段の `grep -Ei` が SIGPIPE (141) を受ける。このとき `grep -q .`
+# 自体は「一致あり」で正常終了（0）するにもかかわらず、パイプ全体の終了ステータスは
+# 141 になり、`if` 条件が偽と評価されて「一致なし（OK）」に誤判定される
+# （Servo が大量に混入するほど検出をすり抜ける fail-open。Issue #465 レビュー指摘）。
+# ヒアストリング（`<<<`）は追加のプロセスをパイプで挟まないため、この問題が起きない。
 detect() {
   local label="$1" out="$2"
-  if printf '%s\n' "$out" | grep -Ei "$PATTERN" | grep -q .; then
+  if grep -Eqi -- "$PATTERN" <<<"$out"; then
     echo "NG: ${label} の依存グラフに Servo 系クレートが含まれています" >&2
-    printf '%s\n' "$out" | grep -Ei "$PATTERN" >&2
+    grep -Ei -- "$PATTERN" <<<"$out" >&2
     return 1
   fi
   echo "OK: ${label} の依存グラフに Servo 系クレートは含まれていません"
@@ -79,6 +87,32 @@ self_test() {
     failures=$((failures + 1))
   else
     echo "OK(self-test): 無関係な行だけの場合は誤検出しませんでした"
+  fi
+
+  # 大量一致時の fail-open 回帰テスト（Issue #465 レビュー指摘）。
+  # パイプバッファ（約 64KB）を超える一致行数を再現するため、bash 組み込みの
+  # for ループで合成する（`yes | head` 等の外部コマンドをパイプで挟むと同じ
+  # SIGPIPE 経路を踏みかねないため使わない）。
+  local big_servo="" big_clean="" i
+  for ((i = 0; i < 3000; i++)); do
+    big_servo+="├── servo_dep_${i} v0.0.1 (crates/some/long/synthetic/path/for/buffer)"$'\n'
+  done
+  for ((i = 0; i < 3000; i++)); do
+    big_clean+="├── tokio_dep_${i} v1.0.0 (crates/some/long/synthetic/path/for/buffer)"$'\n'
+  done
+
+  if detect "self-test(大量servo混入)" "$big_servo" >/dev/null 2>&1; then
+    echo "NG(self-test): 大量の servo 混入行を検出できませんでした（fail-open 回帰）" >&2
+    failures=$((failures + 1))
+  else
+    echo "OK(self-test): 大量の servo 混入行を正しく検出しました"
+  fi
+
+  if ! detect "self-test(大量の無関係な行)" "$big_clean" >/dev/null 2>&1; then
+    echo "NG(self-test): 大量の無関係な行だけなのに誤検出しました" >&2
+    failures=$((failures + 1))
+  else
+    echo "OK(self-test): 大量の無関係な行だけの場合は誤検出しませんでした"
   fi
 
   if [ "$failures" -ne 0 ]; then
