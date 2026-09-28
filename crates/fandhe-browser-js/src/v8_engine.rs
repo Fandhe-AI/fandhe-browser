@@ -1152,6 +1152,52 @@ fn new_native_proxy_function<'s>(
         .build(scope)
 }
 
+/// [`native_proxy_callback`] が引数列の合計エンコード後サイズを見積もる
+/// ための補助関数（`JS-1`・Issue #511・codex レビュー指摘 #533 P0）。
+///
+/// [`value_to_js_value`] は文字列を [`v8::String::to_rust_string_lossy`]
+/// で Rust の `String` へ複製する。最大 [`worker_protocol::MAX_NATIVE_CALL_ARGS`]
+/// （64）個の引数それぞれが最大 [`MAX_RESULT_STRING_UTF16_UNITS`] 相当の
+/// 文字列でありうるため、合計サイズを検証する前に全件を複製すると、
+/// [`worker_protocol::encode_native_call`] が合計サイズ超過を検出する前に
+/// 大量のプロセスメモリを確保してしまう
+/// （security.md「外部入力は長さ・件数を上限検証してからアロケーションに
+/// 使う」）。本関数は [`v8::String::utf8_length`]（文字列内容の複製を
+/// 伴わない問い合わせ）だけを使って、[`worker_protocol::encode_js_value`]
+/// が実際に書き込むバイト数（タグ 1 バイト＋種別ごとの値）を見積もる。
+///
+/// 表現形式は [`worker_protocol::encoded_js_value_len`] と手作業で
+/// 同期する必要がある（変更時は両方を更新すること）。
+/// `js_1_native_proxy_function_rejects_oversized_argument_payload_without_calling_transport`
+/// が、複数引数の合計サイズが上限を超えるケースで transport が呼ばれない
+/// ことを確認している。
+///
+/// 表現できない値（object・function 等）は `0` を返す。そうした値は
+/// 呼び出し元（[`native_proxy_callback`]）の後段で必ず [`value_to_js_value`]
+/// が `Err`（変換不可）にし、transport を呼ぶ前に弾くため、サイズ見積もりに
+/// 含めなくても DoS 対策としては安全である。
+fn native_call_arg_encoded_len(scope: &v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> usize {
+    if value.is_undefined() || value.is_null() {
+        1
+    } else if value.is_boolean() {
+        2
+    } else if value.is_number() {
+        9
+    } else if value.is_string() {
+        match value.to_string(scope) {
+            // タグ 1 バイト＋長さプレフィックス（u32）4 バイト＋ UTF-8
+            // バイト列。`worker_protocol::encoded_js_value_len` の
+            // `JsValue::String` 分岐と一致させる。
+            Some(s) => 1usize
+                .saturating_add(4)
+                .saturating_add(s.utf8_length(scope)),
+            None => 0,
+        }
+    } else {
+        0
+    }
+}
+
 /// [`new_native_proxy_function`] が生成する関数の本体（`JS-1`・
 /// Issue #511）。
 ///
@@ -1218,6 +1264,41 @@ fn native_proxy_callback(
         let exception = v8::Exception::range_error(scope, message);
         scope.throw_exception(exception);
         return;
+    }
+
+    // codex レビュー指摘 #533 P0: 件数（上記）を確認しただけでは、1 引数
+    // あたり最大 ~1 MiB の文字列を渡すことで合計サイズの DoS を防げない。
+    // `value_to_js_value`（複製を伴う）を呼ぶ**前**に、複製を伴わない
+    // [`native_call_arg_encoded_len`] で合計サイズを見積もり、
+    // [`worker_protocol::encode_native_call`] と同じ上限
+    // （`MAX_FRAME_PAYLOAD_CHILD_TO_PARENT`）で検証する。
+    let mut estimated_total_size: usize = 8; // id（4B）＋ argc（4B）。encode_native_call と揃える
+    for i in 0..argc {
+        let encoded_len = native_call_arg_encoded_len(scope, args.get(i));
+        let Some(next_total) = estimated_total_size.checked_add(encoded_len) else {
+            let Some(message) = v8::String::new(
+                scope,
+                "native call argument payload size overflowed while estimating",
+            ) else {
+                return;
+            };
+            let exception = v8::Exception::range_error(scope, message);
+            scope.throw_exception(exception);
+            return;
+        };
+        estimated_total_size = next_total;
+        if estimated_total_size > worker_protocol::MAX_FRAME_PAYLOAD_CHILD_TO_PARENT {
+            let text = format!(
+                "native call argument payload is too large: estimated {estimated_total_size} bytes exceeds the maximum of {} bytes",
+                worker_protocol::MAX_FRAME_PAYLOAD_CHILD_TO_PARENT
+            );
+            let Some(message) = v8::String::new(scope, &text) else {
+                return;
+            };
+            let exception = v8::Exception::range_error(scope, message);
+            scope.throw_exception(exception);
+            return;
+        }
     }
 
     let mut js_args = Vec::with_capacity(argc as usize);
@@ -2130,6 +2211,57 @@ mod tests {
             result.expect("evaluation must succeed"),
             JsValue::Bool(true)
         );
+    }
+
+    /// JS-1・Issue #511・codex レビュー指摘 #533 P0: 引数の**件数**は
+    /// [`worker_protocol::MAX_NATIVE_CALL_ARGS`] 以内でも、合計エンコード後
+    /// サイズが [`worker_protocol::MAX_FRAME_PAYLOAD_CHILD_TO_PARENT`] を
+    /// 超える場合は `RangeError` になり、transport は呼ばれないこと。
+    ///
+    /// 各文字列は [`MAX_RESULT_STRING_UTF16_UNITS`]（1M UTF-16 単位）以内
+    /// だが、4 引数分（各 900,000 バイトの ASCII 文字列）の合計は
+    /// `MAX_FRAME_PAYLOAD_CHILD_TO_PARENT`（3 MiB + 64 KiB）を超える。
+    /// `transport` が一度も呼ばれないことを確認することで、合計サイズの
+    /// 検証が `value_to_js_value`（V8 文字列の複製）より前に効いている
+    /// ことを間接的に確認する（複製後にしか検証していなければ、この
+    /// テストサイズでは複製自体は成功してしまい、区別できなくなる）。
+    #[test]
+    fn js_1_native_proxy_function_rejects_oversized_argument_payload_without_calling_transport() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        engine
+            .install_native_proxy_global("hostAdd", 1)
+            .expect("installing the proxy function must succeed");
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(0usize));
+        struct CountingTransport {
+            calls: std::rc::Rc<std::cell::RefCell<usize>>,
+        }
+        impl NativeCallTransport for CountingTransport {
+            fn call(
+                &mut self,
+                _id: u32,
+                _args: &[JsValue],
+            ) -> Result<NativeReturn, NativeCallFailure> {
+                *self.calls.borrow_mut() += 1;
+                Ok(NativeReturn::Ok(JsValue::Undefined))
+            }
+        }
+        engine.set_native_call_transport(Box::new(CountingTransport {
+            calls: calls.clone(),
+        }));
+
+        let result = engine.evaluate_script(
+            "try { \
+                 const s = 'a'.repeat(900000); \
+                 hostAdd(s, s, s, s); \
+                 'no-throw' \
+             } catch (e) { e instanceof RangeError }",
+            &EvaluateOptions::default(),
+        );
+        assert_eq!(
+            result.expect("evaluation must succeed"),
+            JsValue::Bool(true)
+        );
+        assert_eq!(*calls.borrow(), 0, "transport must not be called");
     }
 
     /// JS-1・Issue #511: transport が未設定のときは `Error` が投げられる

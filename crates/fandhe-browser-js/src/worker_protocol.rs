@@ -701,8 +701,13 @@ pub(crate) fn encode_native_call(id: u32, args: &[JsValue]) -> Result<Vec<u8>, P
 /// 表現は [`encode_js_value`] のドキュメントコメントと一致させる
 /// （`u8 tag` ＋ 種別ごとの値）。`String` の長さ検証（`u32` に収まるか）も
 /// [`encode_js_value`] と同じ基準で行う。
+///
+/// `pub(crate)`: [`super::v8_engine`] の `native_call_arg_encoded_len`
+/// （複製を伴わない V8 側の見積もり。codex レビュー指摘 #533 P0 対応）の
+/// ドキュメンテーションコメントから参照する。表現形式（タグ 1 バイト＋
+/// 種別ごとの値）は手作業で同期する必要がある。
 #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
-fn encoded_js_value_len(value: &JsValue) -> Result<usize, ProtocolError> {
+pub(crate) fn encoded_js_value_len(value: &JsValue) -> Result<usize, ProtocolError> {
     match value {
         JsValue::Undefined | JsValue::Null => Ok(1),
         JsValue::Bool(_) => Ok(2),
