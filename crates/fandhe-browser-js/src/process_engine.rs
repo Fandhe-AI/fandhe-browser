@@ -42,7 +42,7 @@
 //! | 子の watchdog による打ち切り（`Error{kind=Timeout}`） | [`JsEngineError::Timeout`] | 残る |
 //! | 応答待ち・書き込み待ちの期限切れで親が `kill` した | [`JsEngineError::Timeout`] | 破棄（メッセージに明示） |
 //! | 応答前に EOF になり、stderr に `Fatal ... out of memory` がある | [`JsEngineError::ResourceLimitExceeded`] | 破棄（ヒューリスティック） |
-//! | メモリ監視スレッドが RSS 超過を検出して子を `kill` した（評価中・書き込み中・待機中いずれも） | [`JsEngineError::ResourceLimitExceeded`] | 破棄（メッセージに実測 RSS を明示。書き込み中に `kill` された場合の broken pipe も正しくここへ分類する。[`resource_limit_or_else`]。codex・Bugbot レビュー指摘 #503 P0/P1 対応） |
+//! | メモリ監視スレッドが RSS 超過を検出して子を `kill` した（評価中・書き込み中・待機中いずれも） | [`JsEngineError::ResourceLimitExceeded`] | 破棄（メッセージに実測 RSS を明示。書き込み中に `kill` された場合の broken pipe も正しくここへ分類する。[`discard_context_error`]。codex・Bugbot レビュー指摘 #503 P0/P1 対応） |
 //! | 応答（Result/Error）受信直後の同期確認で RSS 超過が判明した | [`JsEngineError::ResourceLimitExceeded`] | 破棄（せっかく得られた応答を握りつぶす。同上） |
 //! | それ以外の異常終了・プロトコル違反・起動失敗 | [`JsEngineError::EngineUnavailable`] | 破棄 |
 //!
@@ -60,18 +60,17 @@
 //!   対応）。ただし実測の結果、子側の OS 別強制はいずれも厳密な上限には
 //!   ならず（Linux は V8 の `CodeRange` 仮想アドレス予約のため小さい値に
 //!   設定できない・Windows は working set の trim にしかならない）、
-//!   **3 OS 共通で親側の RSS 監視が主たる防衛線**である。詳細・実測値は
+//!   **Linux・macOS では親側の監視が主たる防衛線、Windows では子側の
+//!   OS 強制（`ProcessMemoryLimit`）が主導する**。詳細・実測値は
 //!   `super::resource_limits` のドキュメントコメント「OS ごとの強制の
 //!   強さ」節を参照
 //! - macOS には子のメモリ使用量を OS 側で強制する手段が無く
 //!   （`super::resource_limits` の実機検証結果を参照）、親側の RSS 監視
 //!   だけに頼る
 //! - 応答直後の同期的な RSS 確認（[`apply_post_response_rss_check`]）は
-//!   呼び出しスレッド上で `read_child_rss_bytes` を 1 回だけ呼ぶ。
-//!   Windows では `ps` 相当が PowerShell の起動を伴うため、この 1 回の
-//!   呼び出しだけで数百ミリ秒の遅延が評価のたびに乗りうる（実機・CI
-//!   未検証。`super::resource_limits::RSS_POLL_INTERVAL` の Windows 向け
-//!   ドキュメントコメント参照）
+//!   呼び出しスレッド上で `read_child_rss_bytes` を 1 回だけ呼ぶ。Windows
+//!   は `GetProcessMemoryInfo`（psapi.dll の直接呼び出し）を使うため、
+//!   PowerShell 起動のようなプロセス生成コストは無い
 //! - 子はセキュリティ上のサンドボックスではない。同じユーザー権限で動作し、
 //!   seccomp 等も使わない。得られるのはクラッシュ・メモリの資源分離
 //!   だけである
@@ -143,12 +142,45 @@ enum ReaderEvent {
     Invalid(String),
 }
 
+/// `child`（と `pid`）から、[`super::resource_limits::read_child_rss_bytes`]
+/// に渡す [`super::resource_limits::ChildMemoryProbe`] を得る。
+///
+/// Windows では `std::process::Child` のハンドルを
+/// `std::os::windows::io::AsRawHandle` で取得して使う（ユーザー承認
+/// 2026-09-28「ハンドルは std の Child から AsRawHandle で得る」）。
+/// `Mutex` のロックは値を読み取るあいだだけ保持し、その後すぐ解放する
+/// （ハンドルの値そのものは `Child` が生存し続ける限り有効であり、
+/// `Child` は呼び出し元の `WorkerHandle` が解放されるまで生存すること
+/// を、この関数の呼び出し元が保証する）。Linux・macOS では pid をそのまま
+/// 使う（`OpenProcess` 相当の追加のシステムコールが要らない）。
+fn child_memory_probe(
+    child: &Arc<Mutex<Child>>,
+    pid: u32,
+) -> Option<super::resource_limits::ChildMemoryProbe> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let guard = child.lock().ok()?;
+        Some(guard.as_raw_handle())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = child;
+        Some(pid)
+    }
+}
+
 /// 子の寿命のあいだ、評価中か待機中かに関わらず RSS を継続的に監視する
 /// 専任スレッド（codex・Cursor Bugbot レビュー指摘 #503 P0 対応）。
 ///
 /// 呼び出し元（`WorkerHandle`）が [`MemoryMonitor::spawn`] で生成し、
 /// [`WorkerHandle::drop`] で必ず [`MemoryMonitor::stop_and_join`] を
-/// 呼んで止める（子の寿命を超えて監視スレッドが残り続けることはない）。
+/// 呼んで止めようとする。通常は速やかに停止するが、
+/// `stop_and_join` は無期限には待たない（期限内に停止しなければ
+/// detach する。同メソッドのドキュメントコメント参照）ため、まれに
+/// 監視スレッドが子プロセスの `Drop` より後まで生き残ることがある
+/// （その場合でも `stop` フラグは既に立っており、次に処理が返って
+/// きた時点で必ず終了する）。
 struct MemoryMonitor {
     /// 監視スレッドへ停止を伝えるフラグ。
     stop: Arc<AtomicBool>,
@@ -202,7 +234,10 @@ impl MemoryMonitor {
                 // 進む（`read_child_rss_bytes` のドキュメントコメント
                 // 参照。監視は多層防御の 1 つであり、一時的な取得失敗の
                 // たびに子を kill すると正常な評価まで巻き込む）。
-                let Some(rss_bytes) = super::resource_limits::read_child_rss_bytes(pid) else {
+                let Some(probe) = child_memory_probe(&child, pid) else {
+                    continue;
+                };
+                let Some(rss_bytes) = super::resource_limits::read_child_rss_bytes(probe) else {
                     continue;
                 };
                 if rss_bytes <= threshold_bytes {
@@ -247,11 +282,33 @@ impl MemoryMonitor {
 
     /// 監視スレッドに停止を伝え、終了を待つ（`WorkerHandle::drop` から
     /// 呼ぶ。子の寿命を超えて監視スレッドが残らないことを保証する）。
+    ///
+    /// `std::thread::JoinHandle` には期限付き `join` が無いため、実際の
+    /// `join` は使い捨てのヘルパースレッドへ委ね、その完了通知だけを
+    /// 期限付きで待つ（codex/Bugbot レビュー指摘 #503 P1「stop_and_join
+    /// が無期限に止まりうる」対応。監視スレッドが `read_child_rss_bytes`
+    /// の中でブロックしている最悪ケース（macOS の `ps` 呼び出し等）でも、
+    /// この呼び出し自体は [`STOP_JOIN_TIMEOUT`] 以内に必ず戻る）。期限内に
+    /// 完了通知が来なければ、ヘルパースレッドを待たずに戻る（監視スレッド
+    /// は detach された状態で継続し、いずれ自然に終了する。既に `stop`
+    /// は立ててあるため、次にブロックが解けたポーリング機会には必ず
+    /// 抜ける。監視スレッドが detach 後に kill 済みの子へ触れても、
+    /// `read_child_rss_bytes` は「プロセスが存在しない」を意味する
+    /// エラーとして扱い `None` を返すだけであり、panic はしない
+    /// （`read_child_rss_bytes` のドキュメントコメント参照））。
     fn stop_and_join(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.thread.take() {
+        let Some(handle) = self.thread.take() else {
+            return;
+        };
+
+        const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
             let _ = handle.join();
-        }
+            let _ = done_tx.send(());
+        });
+        let _ = done_rx.recv_timeout(STOP_JOIN_TIMEOUT);
     }
 }
 
@@ -799,23 +856,35 @@ impl V8ProcessEngine {
                     }
                     Ok((version, _engine)) => {
                         worker.terminate_now();
-                        Err(JsEngineError::EngineUnavailable(format!(
-                            "JS worker process reported unsupported protocol version {version}"
-                        )))
+                        let tail = worker.reap_and_collect_stderr();
+                        Err(handshake_discard_error(&worker, &tail, || {
+                            JsEngineError::EngineUnavailable(format!(
+                                "JS worker process reported unsupported protocol version \
+                                 {version}; stderr: {tail}"
+                            ))
+                        }))
                     }
                     Err(err) => {
                         worker.terminate_now();
-                        Err(JsEngineError::EngineUnavailable(format!(
-                            "JS worker process sent a malformed Hello frame: {err}"
-                        )))
+                        let tail = worker.reap_and_collect_stderr();
+                        Err(handshake_discard_error(&worker, &tail, || {
+                            JsEngineError::EngineUnavailable(format!(
+                                "JS worker process sent a malformed Hello frame: {err}; stderr: \
+                                 {tail}"
+                            ))
+                        }))
                     }
                 }
             }
             Ok(ReaderEvent::Frame(other_tag, _)) => {
                 worker.terminate_now();
-                Err(JsEngineError::EngineUnavailable(format!(
-                    "JS worker process sent an unexpected frame (tag {other_tag}) before Hello"
-                )))
+                let tail = worker.reap_and_collect_stderr();
+                Err(handshake_discard_error(&worker, &tail, || {
+                    JsEngineError::EngineUnavailable(format!(
+                        "JS worker process sent an unexpected frame (tag {other_tag}) before \
+                         Hello; stderr: {tail}"
+                    ))
+                }))
             }
             Ok(ReaderEvent::Eof) => {
                 // 子は既にストリームを閉じている（終了済みか、まもなく
@@ -823,27 +892,41 @@ impl V8ProcessEngine {
                 // （`reap_and_collect_stderr` のドキュメントコメント
                 // 「wait → join → スナップショットの順序が必須」参照）。
                 let tail = worker.reap_and_collect_stderr();
-                Err(JsEngineError::EngineUnavailable(format!(
-                    "JS worker process exited before completing the handshake; stderr: {tail}"
-                )))
+                Err(handshake_discard_error(&worker, &tail, || {
+                    JsEngineError::EngineUnavailable(format!(
+                        "JS worker process exited before completing the handshake; stderr: \
+                         {tail}"
+                    ))
+                }))
             }
             Ok(ReaderEvent::Invalid(desc)) => {
                 worker.terminate_now();
-                Err(JsEngineError::EngineUnavailable(format!(
-                    "JS worker process sent a malformed frame during the handshake: {desc}"
-                )))
+                let tail = worker.reap_and_collect_stderr();
+                Err(handshake_discard_error(&worker, &tail, || {
+                    JsEngineError::EngineUnavailable(format!(
+                        "JS worker process sent a malformed frame during the handshake: {desc}; \
+                         stderr: {tail}"
+                    ))
+                }))
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 worker.terminate_now();
-                Err(JsEngineError::EngineUnavailable(
-                    "JS worker process handshake timed out".to_string(),
-                ))
+                let tail = worker.reap_and_collect_stderr();
+                Err(handshake_discard_error(&worker, &tail, || {
+                    JsEngineError::EngineUnavailable(format!(
+                        "JS worker process handshake timed out; stderr: {tail}"
+                    ))
+                }))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 worker.terminate_now();
-                Err(JsEngineError::EngineUnavailable(
-                    "JS worker process handshake channel disconnected unexpectedly".to_string(),
-                ))
+                let tail = worker.reap_and_collect_stderr();
+                Err(handshake_discard_error(&worker, &tail, || {
+                    JsEngineError::EngineUnavailable(format!(
+                        "JS worker process handshake channel disconnected unexpectedly; stderr: \
+                         {tail}"
+                    ))
+                }))
             }
         }
     }
@@ -911,7 +994,7 @@ impl V8ProcessEngine {
         let Some(stdin_tx) = worker.stdin_tx.as_ref() else {
             worker.terminate_now();
             let tail = worker.reap_and_collect_stderr();
-            let err = resource_limit_or_else(worker, &tail, || {
+            let err = discard_context_error(worker, &tail, || {
                 JsEngineError::EngineUnavailable(format!(
                     "JS worker process stdin is already closed; stderr: {tail}"
                 ))
@@ -925,7 +1008,7 @@ impl V8ProcessEngine {
             // あるため、そちらを優先して判定する（advisor 指摘 B 対応）。
             worker.terminate_now();
             let tail = worker.reap_and_collect_stderr();
-            let err = resource_limit_or_else(worker, &tail, || {
+            let err = discard_context_error(worker, &tail, || {
                 JsEngineError::EngineUnavailable(format!(
                     "JS worker process writer thread is no longer running; stderr: {tail}"
                 ))
@@ -950,7 +1033,7 @@ impl V8ProcessEngine {
                 // タイミングでも `EngineUnavailable` に誤判定しない）。
                 worker.terminate_now();
                 let tail = worker.reap_and_collect_stderr();
-                let converted = resource_limit_or_else(worker, &tail, || {
+                let converted = discard_context_error(worker, &tail, || {
                     JsEngineError::EngineUnavailable(format!(
                         "failed to send the script to the JS worker process (it may have \
                          crashed): {err}; stderr: {tail}; context was discarded"
@@ -964,22 +1047,25 @@ impl V8ProcessEngine {
                 // 指摘 #503 P1 対応）。kill すれば子の stdin 読み取り端が
                 // 消え、ブロックしていた書き込みは broken pipe で解放
                 // される（writer スレッドは `WorkerHandle::drop` で
-                // 後始末される）。
+                // 後始末される）。監視スレッドが同じタイミングで RSS
+                // 超過を検出していた場合はそちらを優先する（Bugbot
+                // レビュー指摘 #503 対応。全経路で `discard_context_error`
+                // を通す）。
                 worker.terminate_now();
-                return (
-                    Err(JsEngineError::Timeout(
+                let tail = worker.reap_and_collect_stderr();
+                let err = discard_context_error(worker, &tail, || {
+                    JsEngineError::Timeout(format!(
                         "sending the script to the JS worker process exceeded the deadline and \
-                         the process was killed; context was discarded; the next evaluation \
-                         runs in a fresh context"
-                            .to_string(),
-                    )),
-                    false,
-                );
+                         the process was killed; the next evaluation runs in a fresh context; \
+                         stderr: {tail}"
+                    ))
+                });
+                return (Err(err), false);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 worker.terminate_now();
                 let tail = worker.reap_and_collect_stderr();
-                let err = resource_limit_or_else(worker, &tail, || {
+                let err = discard_context_error(worker, &tail, || {
                     JsEngineError::EngineUnavailable(format!(
                         "JS worker process writer thread disconnected unexpectedly; stderr: \
                          {tail}"
@@ -996,13 +1082,14 @@ impl V8ProcessEngine {
                     Ok((value, _consumed)) => (Ok(value), true),
                     Err(err) => {
                         worker.terminate_now();
-                        (
-                            Err(JsEngineError::EngineUnavailable(format!(
-                                "JS worker process sent a malformed Result frame: {err}; context \
-                                 was discarded"
-                            ))),
-                            false,
-                        )
+                        let tail = worker.reap_and_collect_stderr();
+                        let converted = discard_context_error(worker, &tail, || {
+                            JsEngineError::EngineUnavailable(format!(
+                                "JS worker process sent a malformed Result frame: {err}; stderr: \
+                                 {tail}"
+                            ))
+                        });
+                        (Err(converted), false)
                     }
                 };
                 apply_post_response_rss_check(worker, outcome, keep)
@@ -1025,112 +1112,102 @@ impl V8ProcessEngine {
                     }
                     Err(err) => {
                         worker.terminate_now();
-                        (
-                            Err(JsEngineError::EngineUnavailable(format!(
-                                "JS worker process sent a malformed Error frame: {err}; context \
-                                 was discarded"
-                            ))),
-                            false,
-                        )
+                        let tail = worker.reap_and_collect_stderr();
+                        let converted = discard_context_error(worker, &tail, || {
+                            JsEngineError::EngineUnavailable(format!(
+                                "JS worker process sent a malformed Error frame: {err}; stderr: \
+                                 {tail}"
+                            ))
+                        });
+                        (Err(converted), false)
                     }
                 };
                 apply_post_response_rss_check(worker, outcome, keep)
             }
             Ok(ReaderEvent::Frame(other_tag, _)) => {
                 worker.terminate_now();
-                (
-                    Err(JsEngineError::EngineUnavailable(format!(
-                        "JS worker process sent an unexpected frame (tag {other_tag}); context \
-                         was discarded"
-                    ))),
-                    false,
-                )
+                let tail = worker.reap_and_collect_stderr();
+                let err = discard_context_error(worker, &tail, || {
+                    JsEngineError::EngineUnavailable(format!(
+                        "JS worker process sent an unexpected frame (tag {other_tag}); stderr: \
+                         {tail}"
+                    ))
+                });
+                (Err(err), false)
             }
             Ok(ReaderEvent::Eof) => {
                 // 子は既にストリームを閉じている（終了済みか、まもなく
                 // 終了する）ため、kill を挟まずに直接 reap する。
                 let tail = worker.reap_and_collect_stderr();
-                let discarded_note =
-                    "context was discarded; the next evaluation runs in a fresh context";
-                if let Some(rss_bytes) = worker.memory_monitor.take_killed_rss() {
-                    // メモリ監視スレッドが RSS 超過を検出して kill した
-                    // ことが判明した（codex・Bugbot レビュー指摘 #503 P0
-                    // 対応）。stderr のヒューリスティックより優先する
-                    // （`kill` はシグナルであり、V8 の fatal ハンドラが
-                    // 走るとは限らないため、stderr に手掛かりが残らない
-                    // ことがある）。
-                    (
-                        Err(JsEngineError::ResourceLimitExceeded(format!(
-                            "JS worker process RSS ({rss_bytes} bytes) exceeded the parent's \
-                             monitoring threshold ({} bytes) and was killed; {discarded_note}; \
-                             stderr: {tail}",
-                            super::resource_limits::MAX_CHILD_RSS_BYTES
-                        ))),
-                        false,
-                    )
-                } else if WorkerHandle::stderr_indicates_oom(&tail) {
-                    (
-                        Err(JsEngineError::ResourceLimitExceeded(format!(
+                // `discard_context_error` は監視スレッドが RSS 超過で
+                // `kill` していた場合を最優先で判定する（`kill` は
+                // シグナルであり、V8 の fatal ハンドラが走るとは限らない
+                // ため、stderr に手掛かりが残らないことがある。stderr
+                // ヒューリスティックより優先する。codex・Bugbot レビュー
+                // 指摘 #503 P0 対応）。監視スレッドの `kill` でなければ、
+                // stderr のヒューリスティック（V8 自身の fatal メッセージ）
+                // で判定する。
+                let err = discard_context_error(worker, &tail, || {
+                    if WorkerHandle::stderr_indicates_oom(&tail) {
+                        JsEngineError::ResourceLimitExceeded(format!(
                             "script execution exceeded the isolate heap limit and the JS worker \
-                             process terminated; {discarded_note}; stderr: {tail}"
-                        ))),
-                        false,
-                    )
-                } else {
-                    (
-                        Err(JsEngineError::EngineUnavailable(format!(
+                             process terminated; stderr: {tail}"
+                        ))
+                    } else {
+                        JsEngineError::EngineUnavailable(format!(
                             "JS worker process terminated unexpectedly before responding; \
-                             {discarded_note}; stderr: {tail}"
-                        ))),
-                        false,
-                    )
-                }
+                             stderr: {tail}"
+                        ))
+                    }
+                });
+                (Err(err), false)
             }
             Ok(ReaderEvent::Invalid(desc)) => {
                 worker.terminate_now();
-                (
-                    Err(JsEngineError::EngineUnavailable(format!(
-                        "JS worker process sent a malformed frame: {desc}; context was discarded"
-                    ))),
-                    false,
-                )
+                let tail = worker.reap_and_collect_stderr();
+                let err = discard_context_error(worker, &tail, || {
+                    JsEngineError::EngineUnavailable(format!(
+                        "JS worker process sent a malformed frame: {desc}; stderr: {tail}"
+                    ))
+                });
+                (Err(err), false)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 worker.terminate_now();
-                (
-                    Err(JsEngineError::Timeout(
+                let tail = worker.reap_and_collect_stderr();
+                let err = discard_context_error(worker, &tail, || {
+                    JsEngineError::Timeout(format!(
                         "script evaluation exceeded the JS worker deadline and the process was \
-                         killed; context was discarded; the next evaluation runs in a fresh \
-                         context"
-                            .to_string(),
-                    )),
-                    false,
-                )
+                         killed; the next evaluation runs in a fresh context; stderr: {tail}"
+                    ))
+                });
+                (Err(err), false)
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 worker.terminate_now();
-                (
-                    Err(JsEngineError::EngineUnavailable(
+                let tail = worker.reap_and_collect_stderr();
+                let err = discard_context_error(worker, &tail, || {
+                    JsEngineError::EngineUnavailable(format!(
                         "JS worker process communication channel disconnected unexpectedly; \
-                         context was discarded"
-                            .to_string(),
-                    )),
-                    false,
-                )
+                         stderr: {tail}"
+                    ))
+                });
+                (Err(err), false)
             }
         }
     }
 }
 
-/// `worker`（既に `terminate_now` 済みで、`tail` は `reap_and_collect_stderr`
-/// の結果）について、メモリ監視スレッドが RSS 超過で `kill` していた
-/// ことが判明した場合は `ResourceLimitExceeded` を、そうでなければ
-/// `fallback()` の結果をそのまま返す（advisor レビュー指摘 B 対応:
-/// 書き込み失敗・writer スレッドの切断が、実は監視スレッドの `kill` に
-/// よる broken pipe だった場合に `EngineUnavailable` へ誤帰属させない。
-/// 書き込み中に `kill` されるタイミングでも `ResourceLimitExceeded` に
-/// 正しく分類できるようにする）。
-fn resource_limit_or_else(
+/// `spawn_worker` のハンドシェイク段階で子を破棄する経路が使う（Cursor
+/// Bugbot レビュー指摘 #503「Monitor kills misclassified」対応。「子を
+/// 破棄するすべての経路で take_killed_rss を先に確認する」契約を
+/// ハンドシェイク段階にも適用する）。
+///
+/// [`discard_context_error`] と異なり "context was discarded" は
+/// **付けない**: ハンドシェイク中はまだ `Hello` すら受信しておらず、
+/// 呼び出し元が使える Context が一度も存在しないため、「破棄された」と
+/// 述べるのは不正確である（実装済みを装わない。REPAIR-3）。
+fn handshake_discard_error(
     worker: &WorkerHandle,
     tail: &str,
     fallback: impl FnOnce() -> JsEngineError,
@@ -1138,11 +1215,64 @@ fn resource_limit_or_else(
     match worker.memory_monitor.take_killed_rss() {
         Some(rss_bytes) => JsEngineError::ResourceLimitExceeded(format!(
             "JS worker process RSS ({rss_bytes} bytes) exceeded the parent's monitoring \
-             threshold ({} bytes) and was killed; context was discarded; the next evaluation \
-             runs in a fresh context; stderr: {tail}",
+             threshold ({} bytes) and was killed during the handshake; stderr: {tail}",
             super::resource_limits::MAX_CHILD_RSS_BYTES
         )),
         None => fallback(),
+    }
+}
+
+/// 子を破棄する（`keep_worker = false` にする）**すべての**経路の末尾で
+/// 呼び、エラーメッセージを次の 2 点で仕上げる（Cursor Bugbot レビュー
+/// 指摘 #503「Monitor kills misclassified」「Discarded-context errors
+/// omit required phrase」対応。1 箇所へ集約する）。
+///
+/// 1. メモリ監視スレッドが RSS 超過で既に `kill` していた場合、渡された
+///    `fallback` を使わず `ResourceLimitExceeded` へ差し替える
+///    （読み取り・書き込み・プロトコル違反・期限切れなど、`kill` の
+///    「本当の理由」が RSS 超過だったケースを、経路ごとに異なる
+///    `EngineUnavailable`/`Timeout` へ誤って分類させない）。
+/// 2. それ以外の場合は `fallback()` をそのまま使うが、本モジュールの
+///    契約（エラー変換表。「Context が破棄される場合、メッセージに
+///    "context was discarded" を含める」）どおり、文言が抜けていれば
+///    ここで補う（呼び出し側が書き忘れても壊れない）。
+///
+/// 呼び出し前提: `worker` は既に `terminate_now`（または監視スレッドに
+/// よる `kill`）で終了させてあり、`tail` はその後 `reap_and_collect_stderr`
+/// で得た stderr の末尾である。
+fn discard_context_error(
+    worker: &WorkerHandle,
+    tail: &str,
+    fallback: impl FnOnce() -> JsEngineError,
+) -> JsEngineError {
+    if let Some(rss_bytes) = worker.memory_monitor.take_killed_rss() {
+        return JsEngineError::ResourceLimitExceeded(format!(
+            "JS worker process RSS ({rss_bytes} bytes) exceeded the parent's monitoring \
+             threshold ({} bytes) and was killed; context was discarded; the next evaluation \
+             runs in a fresh context; stderr: {tail}",
+            super::resource_limits::MAX_CHILD_RSS_BYTES
+        ));
+    }
+    ensure_discarded_phrase(fallback())
+}
+
+/// エラーメッセージに "context was discarded" が含まれていなければ
+/// 追記する（[`discard_context_error`] が呼ぶ内部ヘルパー。Cursor Bugbot
+/// レビュー指摘 #503「Discarded-context errors omit required phrase」
+/// 対応）。
+fn ensure_discarded_phrase(err: JsEngineError) -> JsEngineError {
+    const PHRASE: &str = "context was discarded";
+    match err {
+        JsEngineError::EngineUnavailable(msg) if !msg.contains(PHRASE) => {
+            JsEngineError::EngineUnavailable(format!("{msg}; {PHRASE}"))
+        }
+        JsEngineError::Timeout(msg) if !msg.contains(PHRASE) => {
+            JsEngineError::Timeout(format!("{msg}; {PHRASE}"))
+        }
+        JsEngineError::ResourceLimitExceeded(msg) if !msg.contains(PHRASE) => {
+            JsEngineError::ResourceLimitExceeded(format!("{msg}; {PHRASE}"))
+        }
+        other => other,
     }
 }
 
@@ -1164,7 +1294,10 @@ fn apply_post_response_rss_check(
     if !keep_worker {
         return (outcome, keep_worker);
     }
-    let Some(rss_bytes) = super::resource_limits::read_child_rss_bytes(worker.pid) else {
+    let Some(probe) = child_memory_probe(&worker.child, worker.pid) else {
+        return (outcome, keep_worker);
+    };
+    let Some(rss_bytes) = super::resource_limits::read_child_rss_bytes(probe) else {
         return (outcome, keep_worker);
     };
     if rss_bytes <= super::resource_limits::MAX_CHILD_RSS_BYTES {
@@ -1198,6 +1331,25 @@ mod tests {
     /// 依存しない代役の「子プロセス」として起動する。書き込みタイムアウト
     /// ・reap タイムアウト・メモリ監視のように、V8 の Hello/Evaluate
     /// フレームに依存しない挙動だけを検証したいテストで使う。
+    ///
+    /// **`ping.exe` を `cmd /C` 越しに起動しない**（Windows 版 3 OS CI の
+    /// 実失敗から判明。run 36341069374）: `cmd /C ping -n 31 127.0.0.1`
+    /// は `cmd.exe` が `ping.exe` を子プロセスとして起動する。
+    /// `Child::kill` は直接の子（`cmd.exe`）だけを `TerminateProcess`
+    /// し、孫の `ping.exe` は終了させない。Windows では既定で子プロセスは
+    /// 親の終了と連動して終了しない（Job Object 等で明示しない限り）ため、
+    /// 取り残された `ping.exe` が stdout/stderr の書き込み端を
+    /// （`cmd.exe` から継承したハンドルとして）保持し続け、reader/stderr
+    /// スレッドが EOF を検出できなくなる。実際にこのテストは Windows CI
+    /// で `ping -n 31`（約 31 秒）がすべて完了するまで固まった
+    /// （`REAP_WAIT_TIMEOUT` の 1 秒ではなく、観測値は約 30 秒）。
+    /// `ping.exe` を `cmd` を介さず直接 `spawn` すれば、`kill` は
+    /// `ping.exe` 自身を直接終了させるため、この問題は起こらない
+    /// （PowerShell の `Start-Sleep` も候補だったが、標準入力を pipe で
+    /// 渡した場合に入力形式の自動判定で stdin を読みにいく可能性があり、
+    /// `js_1_write_to_a_stalled_child_is_bounded_by_a_deadline_and_kills_the_child`
+    /// が前提とする「子は stdin を一切読まない」という性質を壊しうる
+    /// ため避ける）。
     fn spawn_long_lived_child_for_test() -> Child {
         #[cfg(unix)]
         {
@@ -1211,13 +1363,13 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            Command::new("cmd")
-                .args(["/C", "ping", "-n", "31", "127.0.0.1"])
+            Command::new("ping")
+                .args(["-n", "31", "127.0.0.1"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .expect("failed to spawn a long-lived process for the test")
+                .expect("failed to spawn `ping` for the test")
         }
     }
 
@@ -1367,5 +1519,105 @@ mod tests {
             "expected the still-running child to have been killed by reap_and_collect_stderr's \
              deadline fallback"
         );
+    }
+
+    /// Cursor Bugbot レビュー指摘 #503「Monitor kills misclassified」の
+    /// 単体テスト: 監視スレッドが RSS 超過を検出して既に記録していた
+    /// 場合、`discard_context_error` は渡された `fallback` を無視し、
+    /// 実測 RSS を含む `ResourceLimitExceeded` を返すこと（具体値
+    /// 12,345,678 を使い、メッセージにその数値が現れることを確認する）。
+    #[test]
+    fn js_1_discard_context_error_reclassifies_monitor_kills_as_resource_limit_exceeded() {
+        let child = spawn_long_lived_child_for_test();
+        let mut worker =
+            WorkerHandle::from_child(child).expect("failed to build a test WorkerHandle");
+
+        // 監視スレッドが RSS 超過を検出して記録した状態を、実際に
+        // しきい値へ到達させずに直接再現する（`killed_rss_bytes` は
+        // 同一モジュール内のため private フィールドへ直接アクセスできる）。
+        *worker
+            .memory_monitor
+            .killed_rss_bytes
+            .lock()
+            .expect("killed_rss_bytes mutex must not be poisoned") = Some(12_345_678);
+
+        let err = discard_context_error(&worker, "irrelevant stderr tail", || {
+            JsEngineError::Timeout(
+                "must not be used because the monitor already killed".to_string(),
+            )
+        });
+        match err {
+            JsEngineError::ResourceLimitExceeded(msg) => {
+                assert!(
+                    msg.contains("12345678"),
+                    "expected the exact observed RSS (12345678) in the message, got: {msg}"
+                );
+                assert!(
+                    msg.contains("context was discarded"),
+                    "expected the required phrase, got: {msg}"
+                );
+            }
+            other => panic!("expected ResourceLimitExceeded, got: {other:?}"),
+        }
+        worker.terminate_now();
+    }
+
+    /// Cursor Bugbot レビュー指摘 #503「Monitor kills misclassified」の
+    /// 単体テスト: 監視スレッドが何も記録していない場合、
+    /// `discard_context_error` は `fallback` の結果をそのまま使う
+    /// （ただし次のテストが検証する "context was discarded" の補完は
+    /// 別途行う）。
+    #[test]
+    fn js_1_discard_context_error_uses_fallback_when_no_monitor_kill_recorded() {
+        let child = spawn_long_lived_child_for_test();
+        let mut worker =
+            WorkerHandle::from_child(child).expect("failed to build a test WorkerHandle");
+
+        let err = discard_context_error(&worker, "some stderr", || {
+            JsEngineError::EngineUnavailable("boom".to_string())
+        });
+        match err {
+            JsEngineError::EngineUnavailable(msg) => {
+                assert_eq!(msg, "boom; context was discarded");
+            }
+            other => panic!("expected EngineUnavailable, got: {other:?}"),
+        }
+        worker.terminate_now();
+    }
+
+    /// Cursor Bugbot レビュー指摘 #503「Discarded-context errors omit
+    /// required phrase」の単体テスト: `ensure_discarded_phrase` が
+    /// `EngineUnavailable`・`Timeout`・`ResourceLimitExceeded` のすべてに
+    /// 文言を補完し、既に含まれている場合は重複させない（具体値で
+    /// assert する）。
+    #[test]
+    fn js_1_ensure_discarded_phrase_appends_missing_phrase_for_all_discard_variants() {
+        match ensure_discarded_phrase(JsEngineError::EngineUnavailable("boom".to_string())) {
+            JsEngineError::EngineUnavailable(msg) => {
+                assert_eq!(msg, "boom; context was discarded");
+            }
+            other => panic!("expected EngineUnavailable, got: {other:?}"),
+        }
+        match ensure_discarded_phrase(JsEngineError::Timeout("slow".to_string())) {
+            JsEngineError::Timeout(msg) => {
+                assert_eq!(msg, "slow; context was discarded");
+            }
+            other => panic!("expected Timeout, got: {other:?}"),
+        }
+        match ensure_discarded_phrase(JsEngineError::ResourceLimitExceeded("oom".to_string())) {
+            JsEngineError::ResourceLimitExceeded(msg) => {
+                assert_eq!(msg, "oom; context was discarded");
+            }
+            other => panic!("expected ResourceLimitExceeded, got: {other:?}"),
+        }
+        // 既に文言が含まれる場合は重複させない。
+        match ensure_discarded_phrase(JsEngineError::EngineUnavailable(
+            "boom; context was discarded".to_string(),
+        )) {
+            JsEngineError::EngineUnavailable(msg) => {
+                assert_eq!(msg, "boom; context was discarded");
+            }
+            other => panic!("expected EngineUnavailable, got: {other:?}"),
+        }
     }
 }

@@ -17,12 +17,14 @@
 //!   へ変換する）
 //! - **子側（V8 初期化前）**: wasm の単一メモリインスタンスに上限を掛ける
 //!   （[`configure_wasm_memory_flag`]）
-//! - **親側（評価の応答待ちのあいだ）**: 子の RSS を定期的に監視し、
-//!   上限を超えたら kill する（[`read_child_rss_bytes`]。
-//!   `super::process_engine::send_evaluate_and_await` から呼ぶ）。**すべての
-//!   OS でこれが主たる防衛線**であり、下記の子側の OS 別強制はその補助
-//!   （効けば早期に検出できるが、効かなくても親の監視が最終的に捕まえる）
-//!   にすぎない（実測に基づく判断。理由は次節）
+//! - **親側（子の寿命のあいだ継続的に）**: 子のメモリ使用量を定期的に
+//!   監視し、上限を超えたら kill する（[`read_child_rss_bytes`]。
+//!   `super::process_engine::MemoryMonitor` が子の寿命いっぱい動かす
+//!   専任スレッドから、また応答直後・次回評価前にも同期的に呼ぶ）。
+//!   **子の異常終了（Linux）・確保の失敗（Windows）・OS 側の手段が無い
+//!   場合（macOS）のいずれであっても、`ResourceLimitExceeded` への
+//!   分類と子の作り直しは最終的にこの親側の監視・確認が行う**（実測に
+//!   基づく判断。理由は次節）
 //!
 //! # OS ごとの強制の強さ（実装済みを装わない。REPAIR-3）
 //!
@@ -58,31 +60,38 @@
 //!
 //! | OS | 強制方法 | 強さ |
 //! |---|---|---|
-//! | Linux | `RLIMIT_DATA`（[`enforce_child_memory_limit`]。`rustix::process::setrlimit`。上限 [`LINUX_RLIMIT_DATA_CEILING_BYTES`]＝2 GiB） | **OS がある程度強制するが、厳密な上限としては機能しない**。`RLIMIT_DATA` は匿名 `MAP_PRIVATE` の `mmap`（大きな `ArrayBuffer` の backing store が実際に使う経路。glibc malloc は既定のしきい値 128 KiB を超える確保を `mmap` に回す）にも、実際に触れていない仮想予約にも適用される（`setrlimit(2)` の「data segment のみ」という古い説明は、匿名 mmap を会計に含めない実装を前提にしており、本 crate が対象とする現行 Linux カーネルの挙動とは異なる）。しかし V8 自身の `CodeRange` 予約だけで数百 MiB（アーキテクチャ依存。実測は上記のとおり）を消費するため、[`HEAP_EXTERNAL_ALLOWANCE_BYTES`] 相当の小さい値には設定できず、実質的な防御は親側の RSS 監視に委ねている |
-//! | Windows | Job Object（[`enforce_child_memory_limit`]。`win32job` の `limit_working_memory`。`JOB_OBJECT_LIMIT_WORKINGSET`。上限 [`WINDOWS_WORKING_SET_MAX_BYTES`]） | **OS の関与はあるが部分的（未実機検証）**。承認済みの `win32job =2.0.3` が公開する安全な API には、コミットチャージの上限を超えたらプロセスを強制終了する本来の `ProcessMemoryLimit` 相当（`JOB_OBJECT_LIMIT_PROCESS_MEMORY`/`JOB_OBJECT_LIMIT_JOB_MEMORY`）を設定する手段が無い（`ExtendedLimitInfo` が内部に持つ `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` は `pub(crate)` で本 crate からは触れず、`unsafe` を追加してまで構造体を直接書き換えることは本対応の制約「`unsafe` の追加は都度承認」に反するため行わない）。`JOB_OBJECT_LIMIT_WORKINGSET` は物理メモリの常駐量（working set）を trim させるだけで、コミットチャージそのものを止めたりプロセスを終了させたりしない。したがって Windows も実質的に親側の RSS 監視が主たる防衛線であり、Job 自体は working set を trim させる補助的な効果に留まる。真の `ProcessMemoryLimit` を得るには `win32job` の対応バージョンへの更新（ユーザー承認が必要）か `unsafe` な直接呼び出し（同様に承認が必要）のいずれかが要る。Windows 版 3 OS CI（`js-v8` feature 込み）は Job の作成・`assign_current_process`・子プロセスの起動を含めて通っている（2026-09-28 時点）が、これは「経路がエラーにならず動く」ことの確認であり、working set 上限が実際に機能してメモリを trim させる（＝限界まで確保して trim を観測する）ところまでは検証できていない。開発環境が Windows ではないため、本 crate 側でその種の実機検証はできていない |
+//! | Linux | `RLIMIT_DATA`（[`enforce_child_memory_limit`]。`rustix::process::setrlimit`。上限 [`LINUX_RLIMIT_DATA_CEILING_BYTES`]＝2 GiB） | **OS がある程度強制するが、厳密な上限としては機能しない**。`RLIMIT_DATA` は匿名 `MAP_PRIVATE` の `mmap`（大きな `ArrayBuffer` の backing store が実際に使う経路。glibc malloc は既定のしきい値 128 KiB を超える確保を `mmap` に回す）にも、実際に触れていない仮想予約にも適用される（`setrlimit(2)` の「data segment のみ」という古い説明は、匿名 mmap を会計に含めない実装を前提にしており、本 crate が対象とする現行 Linux カーネルの挙動とは異なる）。しかし V8 自身の `CodeRange` 予約だけで数百 MiB（アーキテクチャ依存。実測は上記のとおり）を消費するため、[`HEAP_EXTERNAL_ALLOWANCE_BYTES`] 相当の小さい値には設定できず、実質的な防御は親側の監視に委ねている |
+//! | Windows | Job Object（[`enforce_child_memory_limit`]。`windows-sys` で Win32 API を直接呼ぶ。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`。上限 [`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`]＝384 MiB） | **OS がコミットの天井を強制するが、天井を超えても子プロセスは終了しない**。当初は `win32job =2.0.3` の安全な API（`limit_working_memory`／`JOB_OBJECT_LIMIT_WORKINGSET`）を使っていたが、これは物理メモリの常駐量（working set）を trim させるだけでコミットチャージの上限にはならないという P0 指摘（codex）を受け、`win32job` の使用をやめて `windows-sys` で Win32 API を直接呼ぶ実装に切り替えた（ユーザー承認 2026-09-28。承認された unsafe の範囲は本モジュールの `windows_job` サブモジュール・`read_rss_windows` に限定）。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`／`ProcessMemoryLimit` は Linux の `kill` ベースの強制とは性質が異なり、コミットチャージが上限を超えると**その先の確保が失敗するだけ**である（`VirtualAlloc`/`HeapAlloc` 相当が失敗を返す。プロセス自体は生き続ける）。V8 の既定の `ArrayBuffer::Allocator` はこの失敗を GC を挟んで再試行したうえで、最終的に catchable な `RangeError: Array buffer allocation failed` を投げる。したがって Windows でも「際限のない確保だけは OS が食い止める」ことは実現できるが、`ResourceLimitExceeded` への分類・子の破棄・作り直しは、これまでどおり親側の監視（[`read_child_rss_bytes`] が返す `PrivateUsage`。working set ではなくコミット量を見るように変更した）が担う（[`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`] のドキュメントコメントが説明するとおり、`MAX_CHILD_RSS_BYTES` より 64 MiB 大きい値にしているのはこのため）。この Windows 専用実装（windows-sys 版）は本コミット時点では未検証であり、CI の Windows ランナーでの確認を前提とする（回帰テスト参照）|
 //! | macOS | 無し | **親側の RSS 監視のみ**。本実装時にこの macOS 環境で実機検証したところ、`RLIMIT_DATA`・`RLIMIT_AS`・`RLIMIT_RSS` はいずれも `setrlimit(2)` の呼び出し自体が `EINVAL` で失敗した（「上限をかけたが効かない」ではなく「そもそも設定できない」）。Job Object 相当の OS 機構も無い。したがって [`enforce_child_memory_limit`] は macOS では何もせず常に成功を返し（呼び出そうとしても確実に失敗するため、fail-closed にすると macOS 上で子プロセスが常に起動できなくなってしまう）、実際の防御は親側の RSS 監視だけに委ねる |
 //!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
-//! - **主たる防御は 3 OS 共通で親側の RSS 監視であり、子側の OS 別強制は
-//!   いずれも補助に留まる**（Linux は `CodeRange` 予約のため厳密な上限に
-//!   できない。Windows は working set の trim にしかならない。macOS は
-//!   OS 側の手段が無い）
-//! - 親側の RSS 監視は [`RSS_POLL_INTERVAL`] の分だけ後追いになる。1 回の
+//! - **`ResourceLimitExceeded` への分類・子の作り直しは、3 OS 共通で
+//!   最終的に親側の監視が担う**。子側の OS 別強制（Linux の
+//!   `RLIMIT_DATA`・Windows の `ProcessMemoryLimit`）は「際限のない
+//!   確保だけは食い止める」ところまでしか行わない。Linux は
+//!   `CodeRange` 予約のため厳密な上限にできない。Windows は上限到達時に
+//!   確保を失敗させるだけで子プロセスを終了させない（上表参照）。
+//!   macOS は OS 側の手段が無い
+//! - 親側の監視は [`RSS_POLL_INTERVAL`] の分だけ後追いになる。1 回の
 //!   JS 実行が割り込みチェックを挟まずにポーリング間隔内で大量に確保
 //!   すると、実際のピークメモリは一時的に [`MAX_CHILD_RSS_BYTES`] を
 //!   超えてから検出・終了する
-//! - RSS 取得（`/proc/<pid>/status`・`ps`・PowerShell の `Get-Process`）に
-//!   失敗した場合は監視を諦めてそのポーリング回だけスキップする
-//!   （fail-open。[`read_child_rss_bytes`] のドキュメントコメント参照）。
-//!   [`enforce_child_memory_limit`] 自体の失敗は fail-closed（評価を
-//!   始めずに終了）であり、起動時強制と監視とで fail-open/fail-closed の
-//!   扱いが異なることに注意
-//! - Windows 側の working set 上限の実効性（trim が実際に発動するか）は
-//!   未検証。CI では経路（Job の作成・割り当て・子プロセスの起動）が
-//!   エラーなく動くことまでは確認済み（上表参照）
+//! - メモリ使用量の取得（`/proc/<pid>/status`・`ps`・
+//!   `GetProcessMemoryInfo`）に失敗した場合は監視を諦めてそのポーリング
+//!   回だけスキップする（fail-open。[`read_child_rss_bytes`] のドキュメント
+//!   コメント参照）。[`enforce_child_memory_limit`] 自体の失敗は
+//!   fail-closed（評価を始めずに終了）であり、起動時強制と監視とで
+//!   fail-open/fail-closed の扱いが異なることに注意
+//! - Windows の `ProcessMemoryLimit`・`GetProcessMemoryInfo` を使う
+//!   windows-sys 版の実装は、本コミット時点では実機・CI での検証が
+//!   できていない（開発環境が Windows ではないため。上表参照）
 
+#[cfg(target_os = "macos")]
+use std::io::Read;
 use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 /// [`super::v8_engine`] の `MAX_ISOLATE_HEAP_BYTES`（V8 の Isolate ヒープ
 /// 上限。128 MiB）に加えて、ヒープ外メモリ（`ArrayBuffer` の backing
@@ -109,37 +118,32 @@ const HEAP_EXTERNAL_ALLOWANCE_BYTES: u64 = 128 * 1024 * 1024;
 /// [`HEAP_EXTERNAL_ALLOWANCE_BYTES`]（128 MiB）の合計 256 MiB に対し、
 /// RSS には共有ライブラリ・コード領域・スレッドスタックなど V8 の
 /// ヒープ／backing store 以外の分も乗るため、誤検知を避ける余裕として
-/// 64 MiB を上乗せする（合計 320 MiB）。**3 OS 共通で主たる防衛線**
-/// （モジュール冒頭のドキュメントコメント参照）であるため、
+/// 64 MiB を上乗せする（合計 320 MiB）。`ResourceLimitExceeded` への
+/// 分類・子の作り直しは 3 OS 共通で最終的にこのしきい値に基づく親側の
+/// 監視が担う（モジュール冒頭のドキュメントコメント参照）。
 /// [`RSS_POLL_INTERVAL`] のドキュメントコメントが説明する「後追い」の
 /// 限界とあわせて運用する。
 ///
-/// [`LINUX_RLIMIT_DATA_CEILING_BYTES`]・[`WINDOWS_WORKING_SET_MAX_BYTES`]
-/// とは意図的に値を分離している（本モジュールのドキュメントコメント
-/// 「OS ごとの強制の強さ」節の実測結果を参照）。
+/// [`LINUX_RLIMIT_DATA_CEILING_BYTES`]・[`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`]
+/// とは意図的に値を分離している（Linux は本モジュールのドキュメント
+/// コメント「OS ごとの強制の強さ」節の実測結果を参照。Windows は
+/// [`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`] のドキュメントコメントが説明
+/// するとおり、本しきい値より 64 MiB 大きい値にしている）。
 pub(crate) const MAX_CHILD_RSS_BYTES: u64 = super::v8_engine::MAX_ISOLATE_HEAP_BYTES as u64
     + HEAP_EXTERNAL_ALLOWANCE_BYTES
     + 64 * 1024 * 1024;
 
-/// 親が子の RSS をポーリングする間隔。50〜100 ミリ秒の範囲で、監視の
-/// 追随性（短いほど検出が速い）と監視自体のコスト（`ps`・PowerShell の
-/// 起動を伴う OS では特に、短すぎると監視自体が負荷になる）の折衷として
+/// 親が子のメモリ使用量をポーリングする間隔。50〜100 ミリ秒の範囲で、
+/// 監視の追随性（短いほど検出が速い）と監視自体のコスト（`ps` の起動を
+/// 伴う macOS では特に、短すぎると監視自体が負荷になる）の折衷として
 /// 75 ミリ秒を選んだ。
 ///
-/// **Windows だけ 500 ミリ秒にしている**（[`read_rss_windows`] が
-/// PowerShell プロセスを都度起動するため。PowerShell の起動コストは
-/// 200〜500 ミリ秒程度かかることがあり、75 ミリ秒間隔で呼ぶと
-/// 「評価の応答待ちスレッドが PowerShell の起動待ちで塞がれ、数十〜
-/// 百ミリ秒程度で終わる通常のスクリプト評価まで大きく遅延させる」
-/// 問題が生じる。設計書の指示（「Windows は監視を省略するか軽いものでよい」）
-/// に従い、Windows では監視の追随性より評価のレイテンシを優先し、
-/// ポーリング間隔を緩める（本 crate の開発環境が Windows ではないため
-/// 実機で計測はできておらず、この値は PowerShell 起動コストの一般的な
-/// 目安に基づく見積もりである）。
-#[cfg(not(target_os = "windows"))]
+/// 3 OS 共通の値にしている: 以前は Windows だけ PowerShell の起動
+/// コストを理由に 500 ミリ秒にしていたが、Windows の監視を
+/// `GetProcessMemoryInfo`（psapi.dll の直接呼び出し。プロセス起動を
+/// 伴わない）へ切り替えたことで、その理由が無くなった
+/// （[`read_rss_windows`] 参照）。
 pub(crate) const RSS_POLL_INTERVAL: Duration = Duration::from_millis(75);
-#[cfg(target_os = "windows")]
-pub(crate) const RSS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Linux の `RLIMIT_DATA`（soft/hard 両方）に設定する上限（バイト。
 /// 2 GiB）。[`MAX_CHILD_RSS_BYTES`]（320 MiB）とは意図的に値を分離して
@@ -156,13 +160,42 @@ pub(crate) const RSS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 #[cfg(target_os = "linux")]
 const LINUX_RLIMIT_DATA_CEILING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Windows の Job Object working set 上限（バイト。512 MiB）。working set
-/// の trim にしか効かない（モジュール冒頭の表参照）ため、
-/// [`MAX_CHILD_RSS_BYTES`] より緩めの値にして、正常なスクリプト評価が
-/// working set の trim に巻き込まれて過度に遅くなることを避ける。実際の
-/// メモリ上限としての強制は親側の RSS 監視が担う。
+/// Windows の Job Object `ProcessMemoryLimit`（コミットメモリ上限。
+/// バイト）。codex レビュー指摘 #503 P0「Windows では working set の
+/// 上限と監視だけではコミット量を制限できない」対応で、working set の
+/// trim ではなく、コミットチャージの上限を課す本来の
+/// `JOB_OBJECT_LIMIT_PROCESS_MEMORY` を使う。
+///
+/// **[`MAX_CHILD_RSS_BYTES`]（親側の監視しきい値。320 MiB）とは意図的に
+/// 別の値にし、64 MiB の余裕を載せている**（合計 384 MiB）。理由:
+/// `JOB_OBJECT_LIMIT_PROCESS_MEMORY` は Linux の `RLIMIT_DATA` や
+/// `kill` とは異なり、上限を超えたら**プロセスを終了させるのではなく、
+/// その先の確保（`VirtualAlloc`/`HeapAlloc` 相当）を失敗させる**だけで
+/// ある。V8 の既定の `ArrayBuffer::Allocator` はこの確保失敗を GC を
+/// 挟んで再試行したうえで、最終的に catchable な
+/// `RangeError: Array buffer allocation failed` を投げる（プロセスは
+/// 終了しない）。仮に本値を [`MAX_CHILD_RSS_BYTES`] と同じ 320 MiB に
+/// 揃えると、コミット量がちょうど 320 MiB 付近で確保が失敗して
+/// `RangeError` が飛び、親側の RSS 監視（`read_child_rss_bytes` が返す
+/// `PrivateUsage`）もその時点でちょうど 320 MiB 以下（`>` 判定を満たさ
+/// ない）にとどまってしまい、`ResourceLimitExceeded` に分類されず
+/// `EvaluationFailed` のまま Context が生き残ってしまう（際限のない
+/// 確保を許してしまう回帰）。64 MiB の余裕（テストが使う 1 チャンク
+/// 10 MiB より大きい）を持たせることで、OS が確保を拒み始めた後も
+/// コミット量は [`MAX_CHILD_RSS_BYTES`] を確実に上回った状態になり、
+/// 親側の監視（応答直後の同期確認・継続監視のいずれか）が
+/// `ResourceLimitExceeded` として検出できる。
+///
+/// 親側の監視も Windows では `GetProcessMemoryInfo` の `PrivateUsage`
+/// （コミット量）を見るように変更した（[`read_rss_windows`]）ため、
+/// 子側の OS 強制と親側の監視は同じ指標を見る。Linux（`CodeRange`
+/// 予約のため厳密な上限にできない）とは異なり、Windows では OS が
+/// コミットの天井を実際に強制する。ただし「天井に達したら確保が失敗
+/// する」だけであり、プロセスの終了・`ResourceLimitExceeded` への分類・
+/// 子の作り直しは、これまでどおり親側の監視が担う（実装済みを装わない。
+/// REPAIR-3）。
 #[cfg(target_os = "windows")]
-const WINDOWS_WORKING_SET_MAX_BYTES: usize = 512 * 1024 * 1024;
+const WINDOWS_PROCESS_MEMORY_LIMIT_BYTES: usize = (MAX_CHILD_RSS_BYTES + 64 * 1024 * 1024) as usize;
 
 /// wasm の 1 ページのバイト数（V8 の仕様で固定。64 KiB）。
 const WASM_MEMORY_PAGE_BYTES: u64 = 64 * 1024;
@@ -181,8 +214,8 @@ const WASM_MAX_MEM_PAGES: u64 = HEAP_EXTERNAL_ALLOWANCE_BYTES / WASM_MEMORY_PAGE
 /// 対応）。
 ///
 /// Windows では Win32 の Job Object はハンドルへの参照が無くなると
-/// 閉じられ、`assign_current_process` で設定した working set 上限が
-/// 維持される保証が無くなる。呼び出し元（`super::worker::worker_main`）
+/// 閉じられ、`AssignProcessToJobObject` で設定した `ProcessMemoryLimit`
+/// が維持される保証が無くなる。呼び出し元（`super::worker::worker_main`）
 /// は、このガードを子プロセスの寿命いっぱい（`worker_main` 関数の
 /// スコープの終わりまで）保持しなければならない。
 ///
@@ -191,7 +224,7 @@ const WASM_MAX_MEM_PAGES: u64 = HEAP_EXTERNAL_ALLOWANCE_BYTES / WASM_MEMORY_PAGE
 #[must_use = "drop するとメモリ上限が失われる場合がある（Windows）。プロセスの寿命いっぱい保持すること"]
 pub(crate) struct ChildMemoryLimitGuard {
     #[cfg(target_os = "windows")]
-    _job: win32job::Job,
+    _job: windows_job::JobHandle,
 }
 
 /// 子プロセス自身に OS のメモリ上限を設定する（起動直後・V8 初期化前に
@@ -211,7 +244,7 @@ pub(crate) fn enforce_child_memory_limit() -> Result<ChildMemoryLimitGuard, Stri
     }
     #[cfg(target_os = "windows")]
     {
-        let job = enforce_via_job_object()?;
+        let job = windows_job::create_and_assign(WINDOWS_PROCESS_MEMORY_LIMIT_BYTES)?;
         Ok(ChildMemoryLimitGuard { _job: job })
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -240,33 +273,110 @@ fn enforce_via_rlimit_data() -> Result<(), String> {
     })
 }
 
-/// Windows: Job Object を作成し、working set 上限を
-/// [`WINDOWS_WORKING_SET_MAX_BYTES`] に設定したうえで自分自身（呼び出し
-/// プロセス）を割り当て、その `Job` を呼び出し元へ返す（codex レビュー
-/// 指摘 #503 P1 対応。呼び出し元がこの `Job` を保持し続けないと、
-/// ハンドルが閉じて上限が失われうる。[`ChildMemoryLimitGuard`] 参照）。
-/// `win32job` は Win32 API を隠蔽した safe ラッパのため `unsafe` を
-/// 追加しない。
+/// Windows: Job Object の作成・`ProcessMemoryLimit` の設定・自プロセスの
+/// 割り当てを Win32 API を直接呼んで行う（codex レビュー指摘 #503 P0
+/// 「Windows では working set の上限と監視だけではコミット量を制限
+/// できない」対応）。
 ///
-/// working set 上限が実際にはコミットチャージの上限にならないことは
-/// モジュール冒頭の表を参照（既知の制限。実装済みを装わない。REPAIR-3）。
-/// working set 上限の実効性（trim の発動）は未検証である（同表参照。
-/// Windows 版 3 OS CI ではこの関数がエラーなく完走することは確認済み）。
+/// `win32job =2.0.3` の安全な公開 API では
+/// `JOB_OBJECT_LIMIT_PROCESS_MEMORY`/`ProcessMemoryLimit` を設定できない
+/// （`ExtendedLimitInfo` が内部に持つ `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`
+/// が `pub(crate)` のため）。そのため `win32job` の使用をやめ、
+/// `windows-sys` で Win32 API を直接呼ぶ（ユーザー承認 2026-09-28。
+/// 依存・unsafe の追加はこの用途に限定）。`unsafe` はいずれも最小の
+/// ブロックにし、`// SAFETY:` を付す。
 #[cfg(target_os = "windows")]
-fn enforce_via_job_object() -> Result<win32job::Job, String> {
-    use win32job::{ExtendedLimitInfo, Job};
+mod windows_job {
+    use std::ptr;
 
-    let mut info = ExtendedLimitInfo::new();
-    // working set の下限は、通常のトリビアルなスクリプト評価に必要な
-    // 常駐メモリを OS がすぐ再確保しなくて済む程度の値（16 MiB）にする。
-    const MIN_WORKING_SET_BYTES: usize = 16 * 1024 * 1024;
-    info.limit_working_memory(MIN_WORKING_SET_BYTES, WINDOWS_WORKING_SET_MAX_BYTES);
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    let job = Job::create_with_limit_info(&info)
-        .map_err(|err| format!("failed to create a Windows Job Object: {err}"))?;
-    job.assign_current_process()
-        .map_err(|err| format!("failed to assign this process to the Job Object: {err}"))?;
-    Ok(job)
+    /// Job Object のハンドルを保持し、`Drop` で `CloseHandle` する
+    /// （[`super::ChildMemoryLimitGuard`] がこれを子プロセスの寿命
+    /// いっぱい保持する）。
+    pub(super) struct JobHandle(HANDLE);
+
+    impl Drop for JobHandle {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` は `CreateJobObjectW` が返した有効な
+            // HANDLE であり、`JobHandle` はこの型を通じてのみ生成される
+            // （`create_and_assign` 参照）ため、二重に close されることは
+            // ない。プロセス終了時に一度だけ呼ばれる。
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// 匿名の Job Object を作成し、`ProcessMemoryLimit`（コミットメモリ
+    /// 上限）を `limit_bytes` に設定したうえで、現在のプロセスをその
+    /// Job へ割り当てる。
+    ///
+    /// working set の上限（旧実装の `win32job` 版）ではなく、コミット
+    /// チャージの上限を超えたらプロセスを強制終了する
+    /// `JOB_OBJECT_LIMIT_PROCESS_MEMORY` を使う（モジュール冒頭の表
+    /// 「OS ごとの強制の強さ」参照）。
+    pub(super) fn create_and_assign(limit_bytes: usize) -> Result<JobHandle, String> {
+        // SAFETY: 第 1 引数（セキュリティ属性）・第 2 引数（名前）に
+        // null を渡し、名前無しの匿名 Job を作る（本プロセス専用であり
+        // 他プロセスから `OpenJobObject` で参照される想定が無いため）。
+        // 戻り値の HANDLE は失敗時に null になり、直後に検査する。
+        let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        if handle.is_null() {
+            return Err(format!(
+                "CreateJobObjectW failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // 生成直後に `JobHandle` へ包む: これ以降の早期 return（`?`）でも
+        // `Drop` が `CloseHandle` を呼び、ハンドルをリークしない。
+        let job = JobHandle(handle);
+
+        // `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` は `Default` を実装して
+        // いる（数値フィールドのみの POD 構造体）ため、`unsafe` な
+        // ゼロ初期化は不要（承認された unsafe の範囲を Win32 呼び出しに
+        // 限定する）。
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        info.ProcessMemoryLimit = limit_bytes;
+
+        // SAFETY: `job.0` は直前で作成した有効な Job ハンドル。`info` は
+        // 正しいサイズで初期化済みのローカル変数であり、この呼び出しの
+        // 間だけ有効な参照として渡す（呼び出し後は使わない）。
+        let ok = unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(format!(
+                "SetInformationJobObject failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        // SAFETY: `GetCurrentProcess` は疑似ハンドル（`CloseHandle` 不要。
+        // プロセスの生存期間中ずっと有効）を返す。`job.0` は有効な Job
+        // ハンドル。
+        let ok = unsafe { AssignProcessToJobObject(job.0, GetCurrentProcess()) };
+        if ok == 0 {
+            return Err(format!(
+                "AssignProcessToJobObject failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        Ok(job)
+    }
 }
 
 /// wasm の単一メモリインスタンスに [`WASM_MAX_MEM_PAGES`] を上限として
@@ -281,33 +391,52 @@ pub(crate) fn configure_wasm_memory_flag() {
     v8::V8::set_flags_from_string(&format!("--wasm-max-mem-pages={WASM_MAX_MEM_PAGES}"));
 }
 
-/// 子プロセスの RSS（常駐メモリ量。バイト）を取得する（親側の監視。
+/// [`read_child_rss_bytes`] が受け取る、子プロセスを指し示す値。
+///
+/// Windows だけ Linux/macOS と異なり pid ではなく `HANDLE` を使う
+/// （ユーザー承認 2026-09-28「ハンドルは std の `Child` から
+/// `AsRawHandle` で得る」）。`GetProcessMemoryInfo` は pid ではなく
+/// ハンドルを要求する Win32 API であり、`OpenProcess` で pid から
+/// ハンドルを作り直す（追加の unsafe 呼び出しが要る）よりも、
+/// 呼び出し元が既に持っている `std::process::Child` のハンドルを
+/// そのまま使うほうが単純で、承認された unsafe の範囲にも収まる。
+#[cfg(target_os = "windows")]
+pub(crate) type ChildMemoryProbe = windows_sys::Win32::Foundation::HANDLE;
+#[cfg(not(target_os = "windows"))]
+pub(crate) type ChildMemoryProbe = u32;
+
+/// 子プロセスのメモリ使用量（バイト）を取得する（親側の監視。
 /// `super::process_engine::send_evaluate_and_await` から評価の応答待ちの
-/// あいだ定期的に呼ばれる）。
+/// あいだ定期的に呼ばれる）。Linux は RSS（`/proc/<pid>/status` の
+/// `VmRSS`）、macOS は RSS（`ps` の `rss`）、**Windows はコミット量
+/// （`GetProcessMemoryInfo` の `PrivateUsage`）**を見る（codex レビュー
+/// 指摘 #503 P0「Windows では working set の上限と監視だけではコミット
+/// 量を制限できない」対応。working set ベースの `WorkingSet64` から
+/// 変更した）。
 ///
 /// 取得に失敗した場合は `None` を返す（fail-open。理由: 親側の RSS 監視は
 /// 3 OS 共通の主たる防衛線であるが、それでも取得失敗のたびに子を kill
-/// すると、`/proc` や `ps`・PowerShell が一時的に応答しないだけで正常な
-/// 評価まで巻き込んで打ち切ってしまう。呼び出し元は `None` を「そのポー
-/// リング回は監視できなかった」として扱い、次のポーリングで再試行する。
-/// 全体の期限（`super::process_engine::EVALUATE_RECV_TIMEOUT`）は別途
-/// 効いているため、監視が効かない期間が無限に続くことはない）。
-pub(crate) fn read_child_rss_bytes(pid: u32) -> Option<u64> {
+/// すると、`/proc` や `ps`・`GetProcessMemoryInfo` が一時的に応答しない
+/// だけで正常な評価まで巻き込んで打ち切ってしまう。呼び出し元は `None`
+/// を「そのポーリング回は監視できなかった」として扱い、次のポーリングで
+/// 再試行する。全体の期限（`super::process_engine::EVALUATE_RECV_TIMEOUT`）
+/// は別途効いているため、監視が効かない期間が無限に続くことはない）。
+pub(crate) fn read_child_rss_bytes(probe: ChildMemoryProbe) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        read_rss_linux(pid)
+        read_rss_linux(probe)
     }
     #[cfg(target_os = "macos")]
     {
-        read_rss_macos(pid)
+        read_rss_macos(probe)
     }
     #[cfg(target_os = "windows")]
     {
-        read_rss_windows(pid)
+        read_rss_windows(probe)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        let _ = pid;
+        let _ = probe;
         None
     }
 }
@@ -326,44 +455,103 @@ fn read_rss_linux(pid: u32) -> Option<u64> {
     None
 }
 
+/// `ps` の起動から終了まで待つ上限時間（codex レビュー指摘 #503 P1・
+/// Cursor Bugbot レビュー指摘「RSS helper can block worker Drop」対応）。
+/// 通常の `ps -o rss= -p <pid>` は数十ミリ秒で完了するが、期限を設けず
+/// `Child::wait`（`output()` 相当）で待つと、システムが極端に高負荷な
+/// 状況で `ps` 自体がハングした場合に監視スレッドが無期限にブロックし、
+/// [`super::process_engine::MemoryMonitor::stop_and_join`] の期限付き
+/// 待ちだけでは detach された監視スレッドがいつまでも残り続ける（軽微だが
+/// 望ましくない）。500 ミリ秒は通常の `ps` 実行時間に対して十分な余裕を
+/// 持たせつつ、ハング時の影響を短く抑える値である。
+#[cfg(target_os = "macos")]
+const PS_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// macOS: `ps -o rss= -p <pid>` の出力（キロバイト単位）を読む。macOS には
 /// Linux の `/proc` に相当する軽量な読み取り経路が無いため、外部コマンド
 /// を都度起動する（モジュール冒頭の表が説明するとおり、macOS では本関数
 /// が唯一の防衛線であるため、コストより確実性を優先する）。
+///
+/// `ps` の起動から終了までを [`PS_TIMEOUT`] の期限付きで待つ（期限なしの
+/// `Command::output` は使わない。理由は [`PS_TIMEOUT`] のドキュメント
+/// コメント参照）。期限を過ぎたら `ps` プロセスを `kill` してから `wait`
+/// し、`None` を返す（fail-open。呼び出し元のドキュメントコメント参照）。
 #[cfg(target_os = "macos")]
 fn read_rss_macos(pid: u32) -> Option<u64> {
-    let output = std::process::Command::new("ps")
+    let mut child = std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+
+    let deadline = Instant::now() + PS_TIMEOUT;
+    let mut exit_status = None;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => break,
+        }
+    }
+    let Some(exit_status) = exit_status else {
+        // 期限内に終わらなかった。`ps` を待たずに諦める（fail-open）が、
+        // プロセスは残さない。
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    if !exit_status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+
+    let mut stdout = child.stdout.take()?;
+    let mut text = String::new();
+    stdout.read_to_string(&mut text).ok()?;
     let kib: u64 = text.trim().parse().ok()?;
     Some(kib.saturating_mul(1024))
 }
 
-/// Windows: PowerShell の `Get-Process` で `WorkingSet64`（バイト単位）を
-/// 読む。Job の working set 上限（[`enforce_via_job_object`]）が実際には
-/// コミットチャージを止めないため（モジュール冒頭の表参照）、Windows でも
-/// 本関数による監視を有効にする。
+/// Windows: `GetProcessMemoryInfo`（`psapi.dll`）で `PrivateUsage`
+/// （コミット量。バイト単位）を読む。以前は PowerShell の `Get-Process`
+/// （`WorkingSet64`）を都度起動していたが、Win32 API を直接呼ぶことで
+/// プロセス起動コストが無くなり、かつ子側の OS 強制
+/// （[`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`]。コミット量の上限）と同じ
+/// 指標を見られるようになった（codex レビュー指摘 #503 P0 対応）。
+///
+/// `probe` は `std::process::Child` から
+/// `std::os::windows::io::AsRawHandle::as_raw_handle` で得たハンドルを
+/// 想定する（ユーザー承認 2026-09-28）。呼び出し元（`super::process_engine`）
+/// が `Child` の生存を保証する。
 #[cfg(target_os = "windows")]
-fn read_rss_windows(pid: u32) -> Option<u64> {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!("(Get-Process -Id {pid}).WorkingSet64"),
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+fn read_rss_windows(probe: ChildMemoryProbe) -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+
+    // SAFETY: `probe` は呼び出し元が保証する、生きている（または直前まで
+    // 生きていた）子プロセスの有効なハンドル。`GetProcessMemoryInfo` は
+    // 拡張版（`_EX`）フィールドを埋めるために `cb` に拡張構造体の
+    // サイズを渡す契約であり（Win32 の標準的な作法）、`counters` は
+    // その分の領域を持つローカル変数へのポインタとして、この呼び出しの
+    // 間だけ有効な可変参照を渡す。
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            probe,
+            (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast::<PROCESS_MEMORY_COUNTERS>(),
+            counters.cb,
+        )
+    };
+    if ok == 0 {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.trim().parse().ok()
+    Some(counters.PrivateUsage as u64)
 }
 
 #[cfg(test)]
@@ -379,6 +567,21 @@ mod tests {
         assert_eq!(WASM_MAX_MEM_PAGES, 2048);
     }
 
+    /// advisor レビュー指摘（advisor がレビューした codex P0 対応の一部）:
+    /// Windows の `ProcessMemoryLimit` は `MAX_CHILD_RSS_BYTES`（320 MiB）
+    /// と**同じ値にしてはならない**（`JOB_OBJECT_LIMIT_PROCESS_MEMORY` は
+    /// 上限到達時にプロセスを終了させず確保を失敗させるだけのため、
+    /// 同じ値だと親側の監視が `>` 判定を満たせず検出できない回帰が
+    /// 起こる。[`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`] のドキュメント
+    /// コメント参照）。64 MiB の余裕を載せた 384 MiB であることを固定
+    /// する。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn js_1_windows_process_memory_limit_has_margin_over_the_monitoring_threshold() {
+        assert_eq!(WINDOWS_PROCESS_MEMORY_LIMIT_BYTES, 384 * 1024 * 1024);
+        assert!(WINDOWS_PROCESS_MEMORY_LIMIT_BYTES as u64 > MAX_CHILD_RSS_BYTES);
+    }
+
     /// codex レビュー指摘 #503 P0: Linux の `RLIMIT_DATA` 上限が実測に
     /// 基づく 2 GiB であること（本モジュールのドキュメントコメント
     /// 「OS ごとの強制の強さ」節の実測値の約 2.7 倍の安全マージン）。
@@ -392,6 +595,15 @@ mod tests {
     /// こと（`read_child_rss_bytes` が実プラットフォームで実際に機能する
     /// ことの最小限の確認。子プロセスを起動する結合テストは
     /// `tests/v8_worker.rs` 側で行う）。
+    ///
+    /// Windows は `ChildMemoryProbe` が pid ではなく `HANDLE` であり、
+    /// 本テストのために新たな `unsafe` 呼び出し（例:
+    /// `GetCurrentProcess`）を追加することは承認された unsafe の範囲外
+    /// になるため、本テストは Windows では実行しない。Windows での
+    /// `read_rss_windows`（`GetProcessMemoryInfo`）の確認は、実際に
+    /// 子プロセスを起動する `tests/v8_worker.rs` の結合テスト
+    /// （既存の生産コード経路である `child_memory_probe` を通す）で行う。
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn js_1_read_child_rss_bytes_reports_a_nonzero_value_for_the_current_process() {
         let pid = std::process::id();
@@ -399,6 +611,30 @@ mod tests {
         assert!(
             rss.is_some_and(|bytes| bytes > 0),
             "expected a nonzero RSS for the current process, got: {rss:?}"
+        );
+    }
+
+    /// codex レビュー指摘 #503 P1・Cursor Bugbot レビュー指摘「RSS helper
+    /// can block worker Drop」の回帰テスト（可能な範囲で）: macOS の
+    /// `ps` 呼び出しが、通常のケース（現在のプロセス自身。必ず存在する
+    /// pid）で [`PS_TIMEOUT`]（500 ミリ秒）に対して十分な余裕を持って
+    /// 完了すること。`ps` がハングする状況そのものは決定的に再現でき
+    /// ないため、通常時に期限内で戻ることの確認に留める。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn js_1_read_rss_macos_returns_well_within_the_timeout_for_a_live_process() {
+        let pid = std::process::id();
+        let started = Instant::now();
+        let rss = read_rss_macos(pid);
+        let elapsed = started.elapsed();
+        assert!(
+            rss.is_some_and(|bytes| bytes > 0),
+            "expected a nonzero RSS for the current process, got: {rss:?}"
+        );
+        assert!(
+            elapsed < PS_TIMEOUT,
+            "expected `ps` to complete well within PS_TIMEOUT ({PS_TIMEOUT:?}) for a live \
+             process, took: {elapsed:?}"
         );
     }
 }

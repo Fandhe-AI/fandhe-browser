@@ -63,6 +63,13 @@ fn main() -> ExitCode {
         eprintln!("case: js_1_linux_child_process_has_rlimit_data_set");
         js_1_linux_child_process_has_rlimit_data_set();
     }
+    #[cfg(target_os = "windows")]
+    {
+        eprintln!(
+            "case: js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation"
+        );
+        js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation();
+    }
     eprintln!("v8_worker: all cases passed");
     ExitCode::SUCCESS
 }
@@ -455,4 +462,69 @@ fn js_1_repeated_short_evaluations_accumulating_array_buffers_hit_resource_limit
             panic!("engine must recover with a fresh child after hitting the limit: {err}")
         });
     assert_eq!(result, JsValue::String("undefined".to_string()));
+}
+
+/// codex レビュー指摘 #503 P0「Windows では working set の上限と監視だけ
+/// ではコミット量を制限できない」の回帰テスト観点「Windows の
+/// `ProcessMemoryLimit` で、大きな `ArrayBuffer` を確保すると
+/// `ResourceLimitExceeded` になり、次の評価が新しい Context で成功する
+/// こと」。
+///
+/// 本テストはローカル（開発環境が Windows ではない）では実行されず、
+/// CI の Windows ランナーでの確認を前提とする（`#[cfg(target_os =
+/// "windows")]` かつ `main` から Windows でだけ呼ばれる）。子は
+/// `enforce_child_memory_limit` により起動直後に Job Object の
+/// `ProcessMemoryLimit`（`resource_limits::WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`。
+/// 384 MiB）を自身へ設定済みである。ただし `JOB_OBJECT_LIMIT_PROCESS_MEMORY`
+/// は Linux の `kill` ベースの強制とは異なり、**上限到達時にプロセスを
+/// 終了させるのではなく、その先の確保を失敗させるだけ**である
+/// （V8 は確保失敗を GC 付きで再試行したうえ、最終的に catchable な
+/// `RangeError` を投げる。詳細は `resource_limits` の
+/// `WINDOWS_PROCESS_MEMORY_LIMIT_BYTES` のドキュメントコメント参照）。
+/// 際限のない確保はこの OS 側の天井で頭打ちになり、コミット量が
+/// `MAX_CHILD_RSS_BYTES`（320 MiB）を上回った状態が続くため、親側の
+/// `PrivateUsage` 監視（応答直後の同期確認・継続監視のいずれか）が
+/// 最終的に検出して `ResourceLimitExceeded` へ分類し、子を作り直す
+/// （観測可能な結果としては、他 OS 向けの
+/// `js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceeded`
+/// と同じ `ResourceLimitExceeded` になる）。
+#[cfg(target_os = "windows")]
+fn js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation() {
+    let mut engine = V8ProcessEngine::new();
+    engine
+        .evaluate_script("var before_oom = 777;", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("marker declaration must evaluate successfully: {err}"));
+
+    let oom_script = "var chunks = []; while (true) { chunks.push(new Uint8Array(1e7).fill(1)); }";
+    match engine.evaluate_script(oom_script, &EvaluateOptions::default()) {
+        Err(JsEngineError::ResourceLimitExceeded(msg)) => {
+            assert!(
+                msg.contains("context was discarded"),
+                "heap-external OOM on Windows must discard the context, got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected ResourceLimitExceeded for an ArrayBuffer backing-store exhaustion on \
+             Windows, got: {other:?}"
+        ),
+    }
+
+    let result = engine
+        .evaluate_script("40 + 2", &EvaluateOptions::default())
+        .unwrap_or_else(|err| {
+            panic!("engine must recover with a fresh child after heap-external OOM: {err}")
+        });
+    assert_eq!(result, JsValue::Number(42.0));
+
+    match engine.evaluate_script("before_oom", &EvaluateOptions::default()) {
+        Err(JsEngineError::EvaluationFailed(msg)) => {
+            assert!(
+                msg.contains("before_oom") || msg.contains("ReferenceError"),
+                "expected a ReferenceError for a variable from the discarded context, got: {msg}"
+            );
+        }
+        other => {
+            panic!("expected the pre-OOM variable to be gone in the fresh context, got: {other:?}")
+        }
+    }
 }
