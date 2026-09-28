@@ -108,8 +108,22 @@ const MAX_LABELS: usize = 16;
 /// ことで、この処理量を定数（`MAX_LABELS_SCANNED` 件分の
 /// `collect_label_text` 呼び出し）で頭打ちにする。[`MAX_LABELS`] の
 /// 何倍か（空・空白だけの label がある程度混ざっていても、後続の名前
-/// 入り label まで届くだけの余裕を持たせる）に設定する。上限に達した
-/// 時点で以降の label は未走査のまま切り捨て、`truncated` に反映する。
+/// 入り label まで届くだけの余裕を持たせる）に設定する。
+///
+/// 上限に達した時点で以降の label は未走査のまま切り捨てる。この時点で
+/// 寄与する label を 1 つも見つけていなければ（[`MAX_LABELS_SCANNED`] 件
+/// すべてが空・空白だけの label だった場合）、[`label_name`] は
+/// `None`（「寄与する label が無い」＝次点の `title`/`placeholder` へ
+/// フォールバックしてよい）ではなく、`truncated: true` を立てた空の
+/// `AccessibleName`（`source: NameSource::None`）を返す。呼び出し元は
+/// これを `Some` として受け取るため次点へフォールバックせず、実際には
+/// 走査上限より後ろに名前入りの label が存在するかもしれない（＝
+/// 「名前なし」と確定できない）状態を、誤って `title`/`placeholder` の
+/// 値へすり替えずに呼び出し元へ伝える（`AISNAP-1`・PR #567 レビュー
+/// 指摘の P1 再修正: 空・空白だけの label が [`MAX_LABELS_SCANNED`] 件
+/// 先行すると、それより後ろの唯一の名前入り label に到達できないまま
+/// `matched_labels == 0` で `None` が返り、誤って `title`/`placeholder`
+/// へフォールバックしていた不具合の修正）。
 const MAX_LABELS_SCANNED: usize = MAX_LABELS * 4;
 
 /// accessible name の出所（`AISNAP-1`）。
@@ -155,8 +169,10 @@ pub struct AccessibleName {
     pub text: String,
     /// 算出に使った出所。
     pub source: NameSource,
-    /// [`MAX_NAME_CHARS`]（文字数上限）または [`MAX_LABELS`]（label 数上限）
-    /// により、入力の一部を切り捨てたかどうか。
+    /// [`MAX_NAME_CHARS`]（文字数上限）・[`MAX_LABELS`]（label 数上限）・
+    /// [`MAX_LABELS_SCANNED`]（label 走査総数の上限。寄与する label を
+    /// 1 つも見つけられないまま打ち切られた場合は `text` が空のまま
+    /// `true` になる）のいずれかにより、入力の一部を切り捨てたかどうか。
     pub truncated: bool,
 }
 
@@ -723,8 +739,21 @@ impl<'doc> NameIndex<'doc> {
 /// の数は [`MAX_LABELS`] を上限とし、超えた分は切り捨てて `truncated` に
 /// 反映する（**上限は寄与する label だけを数える**: 空・空白だけの label
 /// が上限枠を占めて、後続の名前入り label を誤って切り捨てないようにする
-/// ため。PR #567 レビュー指摘の P1 修正）。`target` がラベル付け不可、
-/// または寄与する label が 1 つも無ければ `None`。
+/// ため。PR #567 レビュー指摘の P1 修正）。`target` がラベル付け不可なら
+/// `None`。
+///
+/// 寄与する label が 1 つも見つからなかった場合の戻り値は 2 通りに分かれる
+/// （PR #567 レビュー指摘の P1 再修正）。
+/// - 関連付く label を [`MAX_LABELS_SCANNED`] に達する前にすべて走査し
+///   終え、それでも寄与するものが無かった場合: `None`（「本当に名前が
+///   無い」。呼び出し元は `title`/`placeholder` 等の次点へフォール
+///   バックしてよい）
+/// - [`MAX_LABELS_SCANNED`] に達して打ち切られ、寄与する label を 1 つも
+///   見つけられないまま終わった場合: `Some` の空の `AccessibleName`
+///   （`source: NameSource::None`・`truncated: true`）。走査しきれて
+///   いない以上「本当に名前が無い」とは確定できないため、`None` とは
+///   区別し、呼び出し元が次点へフォールバックしないようにする
+///   （[`MAX_LABELS_SCANNED`] のドキュメンテーションコメント参照）。
 fn label_name(doc: &Document, index: &NameIndex, target: NodeId) -> Option<AccessibleName> {
     if !is_labelable(doc, target) {
         return None;
@@ -735,6 +764,12 @@ fn label_name(doc: &Document, index: &NameIndex, target: NodeId) -> Option<Acces
     let mut buf = NameBuffer::new();
     let mut matched_labels = 0usize;
     let mut labels_truncated = false;
+    // `labels_scanned >= MAX_LABELS_SCANNED` により、寄与する label を
+    // 1 つも見つけないまま走査を打ち切ったかどうか。`matched_labels == 0`
+    // と併せて「本当に名前が無い」のか「走査しきれておらず未確定」なのか
+    // を区別するために使う（[`MAX_LABELS_SCANNED`] のドキュメンテーション
+    // コメント参照。PR #567 レビュー指摘の P1 再修正）。
+    let mut scan_cut_before_match = false;
 
     for (labels_scanned, &label) in labels.iter().enumerate() {
         if labels_scanned >= MAX_LABELS_SCANNED {
@@ -742,6 +777,7 @@ fn label_name(doc: &Document, index: &NameIndex, target: NodeId) -> Option<Acces
             // 打ち切られる（[`MAX_LABELS_SCANNED`] 参照）。以降の label は
             // 未走査のまま切り捨てるため truncated を立てる。
             labels_truncated = true;
+            scan_cut_before_match = matched_labels == 0;
             break;
         }
 
@@ -763,6 +799,15 @@ fn label_name(doc: &Document, index: &NameIndex, target: NodeId) -> Option<Acces
     }
 
     if matched_labels == 0 {
+        if scan_cut_before_match {
+            // 走査上限に達したために寄与する label を 1 つも見つけられ
+            // なかった。まだ走査していない label の中に名前入りのものが
+            // あるかもしれず「本当に名前が無い」とは確定できないため、
+            // `None`（次点の `title`/`placeholder` へのフォールバックを
+            // 許す）ではなく `truncated: true` を立てた空の名前を返し、
+            // 呼び出し元にフォールバックさせない。
+            return Some(AccessibleName::default().with_truncated(true));
+        }
         return None;
     }
 
@@ -1856,8 +1901,10 @@ mod tests {
     ///
     /// 走査上限より前に実際に寄与する label（`"先頭"`）を 1 つ置くことで、
     /// 打ち切りが発生しても `truncated` が呼び出し元まで伝わることを
-    /// 確認する（寄与する label が 1 つも無いまま `label_name` が `None`
-    /// を返すと `truncated` の情報自体が失われるため）。
+    /// 確認する。寄与する label が 1 つも無いまま走査が打ち切られた場合
+    /// （`truncated` が失われずに伝わることの確認）は、後続の
+    /// [`aisnap_1_max_labels_scanned_before_any_match_does_not_fall_back`]
+    /// を参照（PR #567 レビュー指摘の P1 再修正）。
     #[test]
     fn aisnap_1_max_labels_scanned_bounds_empty_label_scan() {
         let mut html = String::from(r#"<label for="x">先頭</label>"#);
@@ -1870,6 +1917,52 @@ mod tests {
         assert_eq!(result.text, "先頭");
         assert_eq!(result.source, NameSource::Label);
         assert!(result.truncated);
+    }
+
+    /// PR #567 レビュー指摘の P1 再修正（回帰テスト）: 寄与する label が
+    /// 1 つも無いまま [`MAX_LABELS_SCANNED`] 件で走査が打ち切られた場合、
+    /// それより後ろにある唯一の名前入り label へ到達できなくても
+    /// `title` 属性へ誤ってフォールバックしない。旧実装は
+    /// `matched_labels == 0` を「本当に名前が無い」と同一視して `None` を
+    /// 返し、`input_name` の `.or_else(|| title_name(..))` が `title` の
+    /// 値を確定してしまっていた。
+    #[test]
+    fn aisnap_1_max_labels_scanned_before_any_match_does_not_fall_back() {
+        let mut html = String::new();
+        for _ in 0..MAX_LABELS_SCANNED {
+            html.push_str(r#"<label for="x">   </label>"#);
+        }
+        html.push_str(
+            r#"<label for="x">届かないはずの名前</label><input id="x" title="使われないはず">"#,
+        );
+
+        let result = name(&html, "input");
+        assert_ne!(
+            result.text, "使われないはず",
+            "走査打ち切りで名前不確定のまま title へフォールバックしてはならない"
+        );
+        assert_eq!(result.text, "");
+        assert_eq!(result.source, NameSource::None);
+        assert!(result.truncated);
+    }
+
+    /// PR #567 レビュー指摘の P1 再修正（回帰テスト・負例）: 走査上限
+    /// （[`MAX_LABELS_SCANNED`]）未満の個数の空・空白だけの label しか
+    /// 無く、名前入りの label も存在しない場合は、従来どおり `title` へ
+    /// 正しくフォールバックする（打ち切り時の特別扱いが、通常の
+    /// 「名前が本当に無い」ケースまで壊していないことの確認）。
+    #[test]
+    fn aisnap_1_few_empty_labels_without_scan_cutoff_still_falls_back_to_title() {
+        let mut html = String::new();
+        for _ in 0..3 {
+            html.push_str(r#"<label for="x">   </label>"#);
+        }
+        html.push_str(r#"<input id="x" title="title の名前">"#);
+
+        let result = name(&html, "input");
+        assert_eq!(result.text, "title の名前");
+        assert_eq!(result.source, NameSource::Title);
+        assert!(!result.truncated);
     }
 
     /// PR #567 レビュー指摘の P1 修正: `for` 属性を持たない包含
