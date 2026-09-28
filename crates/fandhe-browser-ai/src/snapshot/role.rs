@@ -1,0 +1,677 @@
+//! `snapshot::Node::role` フィールドの算出ロジック（`AISNAP-1`・`TASK-11.3`・
+//! `MS-2`・Issue #72）。本ファイルは TASK-11.3.1（Issue #541）が担う骨格と
+//! 代表要素のみを実装する。
+//!
+//! 呼び出し文脈: 現時点では呼び出し元がない。DOM から `Snapshot`/`Node` を
+//! 構築する TASK-11.7（Issue #76）が、ツリー構築時に要素ごとへ
+//! [`compute_role`] を呼ぶ想定である（実装済みを装わない。REPAIR-3）。
+//!
+//! # スコープ（TASK-11.3.1・Issue #541）
+//!
+//! 本実装が算出するのは次の 2 つのみである。
+//!
+//! - 明示 role: `role` 属性のトークンのうち、WAI-ARIA 1.2 の具象 role
+//!   （abstract role を除く）の許可リストに一致する最初の 1 つ
+//! - 暗黙 role: HTML-AAM（ARIA in HTML）の代表要素（button・link・heading・
+//!   table 系・list 系・`th`・`img` 等。下記対応表）からの role
+//!
+//! 算出は content attribute だけを見る静的算出であり、JS による動的な
+//! role の変更（IDL 属性・`Element.setAttribute` 呼び出し）は扱わない。
+//!
+//! 以下は本 Issue（TASK-11.3.1）のスコープ外とし、後続タスクへ引き継ぐ
+//! （実装済みを装わない。REPAIR-3）。
+//!
+//! - `input[type]` ごとの role の対応表（password を含む全 type）
+//!   → TASK-11.3.2（Issue #542）
+//! - `select`（`multiple`・`size`）の role → TASK-11.3.3（Issue #543）
+//! - `header`/`footer`/`aside` の、sectioning 祖先（`role` 属性で指定した
+//!   祖先も含む）による role の切り替え → TASK-11.3.3（Issue #543）
+//! - `none`/`presentation` の競合解決（フォーカス可能な要素・グローバル
+//!   ARIA 属性を持つ場合は `role` 属性の指定を無視する規則）
+//! - role の必須コンテキスト（required context role）の検証
+//! - DPub/Graphics ARIA モジュールの role
+//! - `section` の `region` 昇格（accessible name を持つときのみ `region`
+//!   になる規則。accessible name の算出自体が TASK-11.4・Issue #73 の範囲）
+//! - `th`/`td` の表文脈による完全な判定（`scope` が無い `th` を位置で
+//!   行見出し・列見出し・セルに振り分ける処理、`td` が `gridcell` になる
+//!   文脈）。本実装は `th` を `scope` 属性のみで判定する簡易実装である
+//! - `isDataLeaf`（表・一覧類型の葉ノード判定。`AISNAP-3`・TASK-13）
+//!
+//! # PoC との違い
+//!
+//! `docs/spec/03-poc/ai-interface-token-reduction/proto/reduce.mjs` の
+//! `roleOf`（PoC-4）は `label` 要素を一律 `"text"` としているが、本実装は
+//! HTML-AAM に従い、`label` は対応表に無いため `generic`（Fallback）になる。
+
+use fandhe_browser_core::dom::{Document, NodeData, NodeId};
+
+/// HTML 名前空間の URI。`core::dom::HTML_NAMESPACE_URI` は `pub(crate)` で
+/// crate 外から使えないため、本モジュール用にローカルへ定義する
+/// （[`super::state`] と同じ理由。`core` の公開 API は変更しない。
+/// 共通化は TASK-11.7 以降のフォローアップとする）。
+const HTML_NAMESPACE_URI: &str = "http://www.w3.org/1999/xhtml";
+
+/// WAI-ARIA 1.2 の具象 role（concrete role）の許可リスト（出典: WAI-ARIA 1.2
+/// §5.4 Definition of Roles の role 一覧）。
+///
+/// abstract role（`command`・`composite`・`input`・`landmark`・`range`・
+/// `roletype`・`section`・`sectionhead`・`select`・`structure`・`widget`・
+/// `window`）は含めない。`role` 属性の値をこの許可リストと照合し、一致する
+/// 最初のトークンだけを採用する（[`explicit_role`] の設計。WAI-ARIA 1.2 の
+/// role フォールバック規則）。
+const KNOWN_ROLES: &[&str] = &[
+    "alert",
+    "alertdialog",
+    "application",
+    "article",
+    "banner",
+    "blockquote",
+    "button",
+    "caption",
+    "cell",
+    "checkbox",
+    "code",
+    "columnheader",
+    "combobox",
+    "complementary",
+    "contentinfo",
+    "definition",
+    "deletion",
+    "dialog",
+    "directory",
+    "document",
+    "emphasis",
+    "feed",
+    "figure",
+    "form",
+    "generic",
+    "grid",
+    "gridcell",
+    "group",
+    "heading",
+    "img",
+    "insertion",
+    "link",
+    "list",
+    "listbox",
+    "listitem",
+    "log",
+    "main",
+    "marquee",
+    "math",
+    "meter",
+    "menu",
+    "menubar",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "navigation",
+    "none",
+    "note",
+    "option",
+    "paragraph",
+    "presentation",
+    "progressbar",
+    "radio",
+    "radiogroup",
+    "region",
+    "row",
+    "rowgroup",
+    "rowheader",
+    "scrollbar",
+    "search",
+    "searchbox",
+    "separator",
+    "slider",
+    "spinbutton",
+    "status",
+    "strong",
+    "subscript",
+    "superscript",
+    "switch",
+    "tab",
+    "table",
+    "tablist",
+    "tabpanel",
+    "term",
+    "textbox",
+    "time",
+    "timer",
+    "toolbar",
+    "tooltip",
+    "tree",
+    "treegrid",
+    "treeitem",
+];
+
+/// role の算出根拠（`AISNAP-1`・`TASK-11.3`）。
+///
+/// AI エージェントが「作者の明示指定」と「ブラウザの既定解釈」を区別できる
+/// よう、算出元を残す。`#[non_exhaustive]` により、将来の根拠追加
+/// （例: CSS `appearance` からの推定）が非破壊で済む（REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RoleSource {
+    /// `role` 属性の有効なトークンを採用した。
+    Explicit,
+    /// HTML-AAM に基づく要素・属性からの暗黙 role。
+    Implicit,
+    /// 対応表に該当せず `generic` にフォールバックした。
+    Fallback,
+}
+
+/// 算出済みの role（`AISNAP-1`・`TASK-11.3`）。[`compute_role`] の戻り値。
+///
+/// フィールドを private にしアクセサ（[`ComputedRole::as_str`]・
+/// [`ComputedRole::source`]）経由で読ませることで、将来 role の内部表現
+/// （例: 複数トークンの保持）を変えても呼び出し側を壊さずに済む（REPAIR-4）。
+/// `#[non_exhaustive]` も同じ理由で付ける。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ComputedRole {
+    role: &'static str,
+    source: RoleSource,
+}
+
+impl ComputedRole {
+    /// role トークンを返す（例: `"button"`・`"heading"`）。
+    ///
+    /// `snapshot::Node::role` へ詰める際は `as_str().to_string()` とする
+    /// 想定（配線は TASK-11.7・Issue #76 が担う）。
+    pub fn as_str(&self) -> &'static str {
+        self.role
+    }
+
+    /// role の算出根拠を返す。
+    pub fn source(&self) -> RoleSource {
+        self.source
+    }
+
+    fn explicit(role: &'static str) -> Self {
+        Self {
+            role,
+            source: RoleSource::Explicit,
+        }
+    }
+
+    fn implicit(role: &'static str) -> Self {
+        Self {
+            role,
+            source: RoleSource::Implicit,
+        }
+    }
+
+    fn fallback() -> Self {
+        Self {
+            role: "generic",
+            source: RoleSource::Fallback,
+        }
+    }
+}
+
+/// `id` が HTML 名前空間の要素で local name が `name`（ASCII 大文字小文字を
+/// 区別しない）と一致するかどうかを返す。[`super::state`] の同名 private
+/// helper と同じ判定規則（共通化は TASK-11.7 以降のフォローアップ。
+/// 本 Issue では `state.rs` を変更しない）。
+fn is_html_element_named(doc: &Document, id: NodeId, name: &str) -> bool {
+    doc.namespace_url(id) == Some(HTML_NAMESPACE_URI)
+        && doc
+            .local_name(id)
+            .is_some_and(|local| local.eq_ignore_ascii_case(name))
+}
+
+/// `th` 要素の暗黙 role を返す（`scope` の値が `row`/`rowgroup` なら
+/// `rowheader`、それ以外は `columnheader`）。`scope` の照合は大文字小文字を
+/// 区別しない。
+///
+/// 簡易実装: HTML-AAM の表文脈による完全な判定（`scope` が無い `th` を
+/// 位置で行見出し・列見出しに振り分ける処理）は TASK-11.3.3（Issue #543）
+/// の範囲であり、本実装は `scope` 属性の値のみで判定する。
+fn implicit_role_for_th(doc: &Document, id: NodeId) -> ComputedRole {
+    let is_row_scope = doc.attribute(id, "scope").is_some_and(|value| {
+        value.eq_ignore_ascii_case("row") || value.eq_ignore_ascii_case("rowgroup")
+    });
+    if is_row_scope {
+        ComputedRole::implicit("rowheader")
+    } else {
+        ComputedRole::implicit("columnheader")
+    }
+}
+
+/// `img` 要素の暗黙 role を返す。`alt=""`（空文字列。属性自体が無い場合は
+/// 含まない）なら装飾画像として `none`、それ以外（`alt` 省略を含む）は
+/// `img`。
+fn implicit_role_for_img(doc: &Document, id: NodeId) -> ComputedRole {
+    if doc.attribute(id, "alt") == Some("") {
+        ComputedRole::implicit("none")
+    } else {
+        ComputedRole::implicit("img")
+    }
+}
+
+/// `a`/`area` 要素の暗黙 role を返す。`href` があれば `link`、無ければ
+/// （リンクとして機能しないため）`generic`（Fallback）。
+fn implicit_role_for_hyperlink(doc: &Document, id: NodeId) -> ComputedRole {
+    if doc.attribute(id, "href").is_some() {
+        ComputedRole::implicit("link")
+    } else {
+        ComputedRole::fallback()
+    }
+}
+
+/// HTML-AAM（ARIA in HTML）の対応表に基づき、要素 `id` の暗黙 role を
+/// 算出する（本モジュール doc「スコープ」節の対応表。TASK-11.3.1 が扱う
+/// 代表要素のみ）。
+///
+/// `id` が HTML 名前空間の要素でない場合（SVG/MathML 等）、または対応表に
+/// 該当しない場合は `generic`（Fallback）を返す。
+///
+/// 拡張点: 分岐は 1 つの `match` 相当の連鎖に集約してあり、後続 Issue が
+/// 分岐を追加する箇所を以下にコメントで示す。
+fn implicit_role(doc: &Document, id: NodeId) -> ComputedRole {
+    let named = |name: &str| is_html_element_named(doc, id, name);
+
+    if named("a") || named("area") {
+        return implicit_role_for_hyperlink(doc, id);
+    }
+    if named("button") {
+        return ComputedRole::implicit("button");
+    }
+    // `input` → TASK-11.3.2（Issue #542）が `implicit_role_for_input` を
+    // 追加してここに分岐を足す。それまでは対応表に無い要素として generic
+    // （Fallback）になる。
+    // `select` → TASK-11.3.3（Issue #543）が `implicit_role_for_select` を
+    // 追加してここに分岐を足す。それまでは generic（Fallback）になる。
+    if named("option") {
+        return ComputedRole::implicit("option");
+    }
+    if named("textarea") {
+        return ComputedRole::implicit("textbox");
+    }
+    const HEADINGS: [&str; 6] = ["h1", "h2", "h3", "h4", "h5", "h6"];
+    if HEADINGS.iter().any(|tag| named(tag)) {
+        return ComputedRole::implicit("heading");
+    }
+    if named("table") {
+        return ComputedRole::implicit("table");
+    }
+    if named("thead") || named("tbody") || named("tfoot") {
+        return ComputedRole::implicit("rowgroup");
+    }
+    if named("tr") {
+        return ComputedRole::implicit("row");
+    }
+    if named("td") {
+        return ComputedRole::implicit("cell");
+    }
+    if named("th") {
+        return implicit_role_for_th(doc, id);
+    }
+    if named("ul") || named("ol") || named("menu") {
+        return ComputedRole::implicit("list");
+    }
+    if named("li") {
+        return ComputedRole::implicit("listitem");
+    }
+    if named("nav") {
+        return ComputedRole::implicit("navigation");
+    }
+    if named("main") {
+        return ComputedRole::implicit("main");
+    }
+    // `aside` → TASK-11.3.3（Issue #543）が sectioning 祖先による判定
+    // （`header`/`footer` と同じ判定規則）を追加してここに分岐を足す。
+    // それまでは generic（Fallback）になる。
+    if named("form") {
+        return ComputedRole::implicit("form");
+    }
+    if named("article") {
+        return ComputedRole::implicit("article");
+    }
+    // `header`/`footer` → TASK-11.3.3（Issue #543）が sectioning 祖先
+    // （`role` 属性で指定した祖先も含む）による `banner`/`contentinfo` と
+    // `generic` の切り替えを追加してここに分岐を足す。それまでは対応表に
+    // 無い要素として generic（Fallback）になる。
+    if named("img") {
+        return implicit_role_for_img(doc, id);
+    }
+    if named("p") {
+        return ComputedRole::implicit("paragraph");
+    }
+    if named("hr") {
+        return ComputedRole::implicit("separator");
+    }
+    if named("fieldset") {
+        return ComputedRole::implicit("group");
+    }
+    if named("dialog") {
+        return ComputedRole::implicit("dialog");
+    }
+    // `section` は accessible name を持つときだけ `region` になる
+    // （HTML-AAM）。accessible name の算出は TASK-11.4・Issue #73 の範囲の
+    // ため、本 Issue では常に generic を返す（module doc「スコープ外」）。
+    ComputedRole::fallback()
+}
+
+/// `role` 属性の値から、有効な明示 role を算出する。
+///
+/// WAI-ARIA のフォールバック規則に従い、空白区切りのトークン列を先頭から
+/// 走査し、[`KNOWN_ROLES`]（abstract role を除く具象 role の許可リスト）に
+/// 一致する最初のトークンを採用する。大文字小文字は区別しない
+/// （`role="Button"` も `button` として受け付ける）。有効なトークンが
+/// 無ければ `None`（暗黙 role へフォールバックさせる）を返す。
+///
+/// 返すのは許可リスト側の `&'static str` である。属性値の文字列（外部の
+/// HTML に由来する untrusted 入力）はそのまま出力へ流さない。
+///
+/// `role` 属性は名前空間を問わず見る（SVG 要素でも有効）。
+fn explicit_role(doc: &Document, id: NodeId) -> Option<ComputedRole> {
+    let value = doc.attribute(id, "role")?;
+    value
+        .split_ascii_whitespace()
+        .find_map(|token| {
+            KNOWN_ROLES
+                .iter()
+                .find(|known| token.eq_ignore_ascii_case(known))
+        })
+        .map(|known| ComputedRole::explicit(known))
+}
+
+/// `doc` のノード `id` から role を算出する（`AISNAP-1`・`TASK-11.3`・
+/// `TASK-11.3.1`・Issue #541）。
+///
+/// - ドキュメントルート（[`Document::root`]）は `Some("document", Implicit)`。
+///   spec の想定 JSON でルートが `role: "document"` になっているため
+///   （`AISNAP-1`）
+/// - 要素は必ず `Some`（明示 role → 暗黙 role → `generic` フォールバックの
+///   順。本 Issue の時点では暗黙 role は代表要素のみに対応し、それ以外は
+///   generic になる。TASK-11.3.2・11.3.3 が分岐を追加する）
+/// - テキスト・コメント・doctype 等の非要素、範囲外の `id` は `None`。
+///   これらは role を持たず [`super::Node`] にもならないので「無い」を
+///   そのまま返す（[`super::state::compute_state`] が範囲外・対象外に
+///   既定値を返すのとは契約が異なる。role には「要素以外の既定値」に
+///   ふさわしいトークンが無いため）。
+pub fn compute_role(doc: &Document, id: NodeId) -> Option<ComputedRole> {
+    match doc.node_data(id)? {
+        NodeData::Document => Some(ComputedRole::implicit("document")),
+        NodeData::Element { .. } => {
+            Some(explicit_role(doc, id).unwrap_or_else(|| implicit_role(doc, id)))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ComputedRole, RoleSource, compute_role};
+    use fandhe_browser_core::dom::{Document, NodeId};
+    use fandhe_browser_core::parse::{ParseOptions, parse_document};
+    use fandhe_browser_core::query::query_selector_str;
+
+    /// テスト入力の HTML をパースし、CSS セレクタで対象要素を 1 つ特定する。
+    /// [`super::super::state`] のテストヘルパと同じ形。
+    fn parse_and_select(html: &str, selector: &str) -> (Document, NodeId) {
+        let parsed =
+            parse_document(html, &ParseOptions::default()).expect("テスト入力は必ず成功する");
+        let doc = parsed.document;
+        let root = doc.root();
+        let target = query_selector_str(&doc, root, selector)
+            .expect("セレクタは解釈できる")
+            .expect("対象要素が見つかる");
+        (doc, target)
+    }
+
+    fn assert_role(role: Option<ComputedRole>, expected: &str, source: RoleSource) {
+        let role = role.expect("role が算出される");
+        assert_eq!(role.as_str(), expected);
+        assert_eq!(role.source(), source);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `document` ルートは
+    /// `"document"`/Implicit になる。
+    #[test]
+    fn aisnap_1_document_root_is_document() {
+        let parsed =
+            parse_document("<p>text</p>", &ParseOptions::default()).expect("パースは成功する");
+        let doc = parsed.document;
+        let root = doc.root();
+        assert_role(compute_role(&doc, root), "document", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `button` 要素は `"button"`/Implicit。
+    #[test]
+    fn aisnap_1_button_is_button() {
+        let (doc, id) = parse_and_select("<button>送信</button>", "button");
+        assert_role(compute_role(&doc, id), "button", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `href` を持つ `a` は `"link"`。
+    #[test]
+    fn aisnap_1_anchor_with_href_is_link() {
+        let (doc, id) = parse_and_select(r##"<a href="#">more</a>"##, "a");
+        assert_role(compute_role(&doc, id), "link", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `href` の無い `a` はリンクとして
+    /// 機能しないため `"generic"`/Fallback。
+    #[test]
+    fn aisnap_1_anchor_without_href_is_generic() {
+        let (doc, id) = parse_and_select("<a>more</a>", "a");
+        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `href` を持つ `area` は `"link"`。
+    #[test]
+    fn aisnap_1_area_with_href_is_link() {
+        let (doc, id) = parse_and_select(
+            r##"<map><area href="#" shape="rect" coords="0,0,1,1"></map>"##,
+            "area",
+        );
+        assert_role(compute_role(&doc, id), "link", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `h1`〜`h6` はすべて `"heading"`。
+    #[test]
+    fn aisnap_1_headings_are_heading() {
+        let (doc, id) = parse_and_select("<h1>title</h1>", "h1");
+        assert_role(compute_role(&doc, id), "heading", RoleSource::Implicit);
+        let (doc, id) = parse_and_select("<h6>title</h6>", "h6");
+        assert_role(compute_role(&doc, id), "heading", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: table 系要素が対応表どおりの role
+    /// になる（`table`/`rowgroup`/`row`/`columnheader`/`cell`）。
+    #[test]
+    fn aisnap_1_table_elements() {
+        let html = r#"<table><thead><tr><th>H</th></tr></thead>
+            <tbody><tr><td>D</td></tr></tbody></table>"#;
+        let (doc, table) = parse_and_select(html, "table");
+        assert_role(compute_role(&doc, table), "table", RoleSource::Implicit);
+        let (doc, thead) = parse_and_select(html, "thead");
+        assert_role(compute_role(&doc, thead), "rowgroup", RoleSource::Implicit);
+        let (doc, tr) = parse_and_select(html, "thead tr");
+        assert_role(compute_role(&doc, tr), "row", RoleSource::Implicit);
+        let (doc, th) = parse_and_select(html, "th");
+        assert_role(compute_role(&doc, th), "columnheader", RoleSource::Implicit);
+        let (doc, td) = parse_and_select(html, "td");
+        assert_role(compute_role(&doc, td), "cell", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `<th scope="row">` は
+    /// `"rowheader"`。
+    #[test]
+    fn aisnap_1_th_scope_row_is_rowheader() {
+        let (doc, id) = parse_and_select(
+            "<table><tbody><tr><th scope=\"row\">H</th></tr></tbody></table>",
+            "th",
+        );
+        assert_role(compute_role(&doc, id), "rowheader", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `<th scope="rowgroup">` も
+    /// `"rowheader"`（大文字小文字は区別しない）。
+    #[test]
+    fn aisnap_1_th_scope_rowgroup_is_rowheader() {
+        let (doc, id) = parse_and_select(
+            "<table><tbody><tr><th scope=\"rowgroup\">H</th></tr></tbody></table>",
+            "th",
+        );
+        assert_role(compute_role(&doc, id), "rowheader", RoleSource::Implicit);
+
+        let (doc, id) = parse_and_select(
+            "<table><tbody><tr><th scope=\"ROW\">H</th></tr></tbody></table>",
+            "th",
+        );
+        assert_role(compute_role(&doc, id), "rowheader", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `ul`/`ol`/`menu` は `"list"`、
+    /// `li` は `"listitem"`。
+    #[test]
+    fn aisnap_1_list_elements() {
+        let (doc, ul) = parse_and_select("<ul><li>a</li></ul>", "ul");
+        assert_role(compute_role(&doc, ul), "list", RoleSource::Implicit);
+        let (doc, ol) = parse_and_select("<ol><li>a</li></ol>", "ol");
+        assert_role(compute_role(&doc, ol), "list", RoleSource::Implicit);
+        let (doc, menu) = parse_and_select("<menu><li>a</li></menu>", "menu");
+        assert_role(compute_role(&doc, menu), "list", RoleSource::Implicit);
+        let (doc, li) = parse_and_select("<ul><li>a</li></ul>", "li");
+        assert_role(compute_role(&doc, li), "listitem", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `nav`/`main`/`article`/`form`/
+    /// `p`/`hr`/`fieldset`/`dialog`/`option`/`textarea` の暗黙 role。
+    #[test]
+    fn aisnap_1_other_representative_elements() {
+        let (doc, id) = parse_and_select("<nav>menu</nav>", "nav");
+        assert_role(compute_role(&doc, id), "navigation", RoleSource::Implicit);
+
+        let (doc, id) = parse_and_select("<main>content</main>", "main");
+        assert_role(compute_role(&doc, id), "main", RoleSource::Implicit);
+
+        let (doc, id) = parse_and_select("<article>post</article>", "article");
+        assert_role(compute_role(&doc, id), "article", RoleSource::Implicit);
+
+        let (doc, id) = parse_and_select("<form></form>", "form");
+        assert_role(compute_role(&doc, id), "form", RoleSource::Implicit);
+
+        let (doc, id) = parse_and_select("<p>text</p>", "p");
+        assert_role(compute_role(&doc, id), "paragraph", RoleSource::Implicit);
+
+        let (doc, id) = parse_and_select("<hr>", "hr");
+        assert_role(compute_role(&doc, id), "separator", RoleSource::Implicit);
+
+        let (doc, id) = parse_and_select("<fieldset></fieldset>", "fieldset");
+        assert_role(compute_role(&doc, id), "group", RoleSource::Implicit);
+
+        let (doc, id) = parse_and_select("<dialog></dialog>", "dialog");
+        assert_role(compute_role(&doc, id), "dialog", RoleSource::Implicit);
+
+        let (doc, id) = parse_and_select("<select><option>a</option></select>", "option");
+        assert_role(compute_role(&doc, id), "option", RoleSource::Implicit);
+
+        let (doc, id) = parse_and_select("<textarea></textarea>", "textarea");
+        assert_role(compute_role(&doc, id), "textbox", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `img` は `"img"`、`alt=""` は
+    /// `"none"`、`alt` 省略は `"img"`。
+    #[test]
+    fn aisnap_1_img_roles() {
+        let (doc, id) = parse_and_select(r#"<img src="a.png" alt="猫">"#, "img");
+        assert_role(compute_role(&doc, id), "img", RoleSource::Implicit);
+
+        let (doc, id) = parse_and_select(r#"<img src="a.png" alt="">"#, "img");
+        assert_role(compute_role(&doc, id), "none", RoleSource::Implicit);
+
+        let (doc, id) = parse_and_select(r#"<img src="a.png">"#, "img");
+        assert_role(compute_role(&doc, id), "img", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: 明示 role（`role` 属性）が
+    /// 暗黙 role より優先される。
+    #[test]
+    fn aisnap_1_explicit_role_wins() {
+        let (doc, id) = parse_and_select(r#"<div role="button">x</div>"#, "div");
+        assert_role(compute_role(&doc, id), "button", RoleSource::Explicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: 複数トークンのうち、許可リストに
+    /// 最初に一致するものを採用する。
+    #[test]
+    fn aisnap_1_explicit_role_first_valid_token() {
+        let (doc, id) = parse_and_select(r#"<div role="foo button">x</div>"#, "div");
+        assert_role(compute_role(&doc, id), "button", RoleSource::Explicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `role` 属性値の大文字小文字は
+    /// 区別しない。
+    #[test]
+    fn aisnap_1_explicit_role_case_insensitive() {
+        let (doc, id) = parse_and_select(r#"<div role="Button">x</div>"#, "div");
+        assert_role(compute_role(&doc, id), "button", RoleSource::Explicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: 前後に空白を含む `role` 属性値
+    /// からもトークンを抽出できる。
+    #[test]
+    fn aisnap_1_explicit_role_trims_whitespace() {
+        let (doc, id) = parse_and_select(r#"<div role="  button  ">x</div>"#, "div");
+        assert_role(compute_role(&doc, id), "button", RoleSource::Explicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: 有効なトークンが無ければ暗黙
+    /// role へフォールバックする。
+    #[test]
+    fn aisnap_1_explicit_role_unknown_falls_back_to_implicit() {
+        let (doc, id) = parse_and_select(r#"<div role="foo">x</div>"#, "div");
+        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: 空の `role=""` は有効なトークンが
+    /// 無いため暗黙 role へ進む。
+    #[test]
+    fn aisnap_1_explicit_role_empty_falls_back_to_implicit() {
+        let (doc, id) = parse_and_select(r#"<button role="">x</button>"#, "button");
+        assert_role(compute_role(&doc, id), "button", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: abstract role（例: `landmark`）は
+    /// 許可リストに含まれないため、有効な `role` 指定として扱わない。
+    #[test]
+    fn aisnap_1_abstract_role_is_not_accepted() {
+        let (doc, id) = parse_and_select(r#"<button role="landmark">x</button>"#, "button");
+        assert_role(compute_role(&doc, id), "button", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `role` 属性は要素の暗黙 role を
+    /// 上書きできる。
+    #[test]
+    fn aisnap_1_explicit_role_overrides_element_role() {
+        let (doc, id) = parse_and_select(r##"<a href="#" role="tab">x</a>"##, "a");
+        assert_role(compute_role(&doc, id), "tab", RoleSource::Explicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: テキストノードは role を持たず
+    /// `None`。
+    #[test]
+    fn aisnap_1_text_node_has_no_role() {
+        let parsed =
+            parse_document("<p>text</p>", &ParseOptions::default()).expect("パースは成功する");
+        let doc = parsed.document;
+        let root = doc.root();
+        let p = query_selector_str(&doc, root, "p")
+            .expect("セレクタは解釈できる")
+            .expect("p 要素が見つかる");
+        let text_node = doc.first_child(p).expect("p の子にテキストノードがある");
+        assert_eq!(compute_role(&doc, text_node), None);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: 対応表に無い要素（SVG）は
+    /// `"generic"`/Fallback。
+    #[test]
+    fn aisnap_1_svg_is_generic_fallback() {
+        let (doc, id) = parse_and_select("<svg><circle/></svg>", "svg");
+        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+    }
+}
