@@ -401,6 +401,15 @@ fn normalized_input_type(doc: &Document, id: NodeId) -> String {
 /// `label` の子孫のテキストを収集し、`out` へ HTML ASCII 空白の連続を
 /// 1 個の区切りへ畳みながら追記する（`AISNAP-1`）。
 ///
+/// テキストノードに加え、子孫 `img` 要素の `alt` 属性値も同じ折り畳み対象
+/// として取り込む（PR #567 レビュー指摘の P1 修正）。HTML-AAM の
+/// accessible name from content 計算はテキスト代替を持つ埋め込み要素
+/// （`img` 等）の代替テキストをテキストノードと同列に扱うため、
+/// `<label for="q"><img alt="検索"></label>` のような画像だけの label でも
+/// 名前が失われないようにする。`img` に `alt` 属性が無ければ何も追加しない
+/// （`alt=""` も同様に何も追加しない）。`img` は子要素を持たないため、
+/// `alt` を追加した後はその子孫を辿らない。
+///
 /// `script`・`style`・`noscript`・`template` のサブツリーは除外する。
 /// `exclude`（関連付け先のコントロール自身）のサブツリーも除外する
 /// （埋め込みコントロールの値の扱いは TASK-11.4.3・#546 のスコープ）。
@@ -454,26 +463,14 @@ fn collect_label_text(doc: &Document, label: NodeId, exclude: NodeId, out: &mut 
 
         match doc.node_data(current) {
             Some(NodeData::Text { contents }) => {
-                for c in contents.chars() {
-                    if is_ascii_whitespace(c) {
-                        if !out.is_empty() {
-                            pending_space = true;
-                        }
-                        continue;
-                    }
-                    if pending_space {
-                        if normalized_chars >= NORMALIZED_LABEL_TEXT_CHAR_LIMIT {
-                            break 'walk;
-                        }
-                        out.push(' ');
-                        normalized_chars += 1;
-                        pending_space = false;
-                    }
-                    if normalized_chars >= NORMALIZED_LABEL_TEXT_CHAR_LIMIT {
-                        break 'walk;
-                    }
-                    out.push(c);
-                    normalized_chars += 1;
+                if fold_chars_into(
+                    contents.chars(),
+                    out,
+                    &mut normalized_chars,
+                    &mut pending_space,
+                    NORMALIZED_LABEL_TEXT_CHAR_LIMIT,
+                ) {
+                    break 'walk;
                 }
             }
             Some(NodeData::Element { .. }) => {
@@ -483,11 +480,68 @@ fn collect_label_text(doc: &Document, label: NodeId, exclude: NodeId, out: &mut 
                 {
                     continue;
                 }
+                if is_html_element_named(doc, current, "img") {
+                    // `img` はテキスト代替（`alt`）を子孫テキストの代わりに
+                    // 使う（上のドキュメンテーションコメント参照）。`img` は
+                    // 子要素を持たないため `stack` へは積まない。
+                    if let Some(alt) = doc.attribute(current, "alt")
+                        && fold_chars_into(
+                            alt.chars(),
+                            out,
+                            &mut normalized_chars,
+                            &mut pending_space,
+                            NORMALIZED_LABEL_TEXT_CHAR_LIMIT,
+                        )
+                    {
+                        break 'walk;
+                    }
+                    continue;
+                }
                 stack.extend(doc.children(current).rev());
             }
             _ => {}
         }
     }
+}
+
+/// [`collect_label_text`] のテキスト折り畳み本体（`AISNAP-1`・PR #567
+/// レビュー指摘の P1 修正）。テキストノードの内容・`img` の `alt` 属性値の
+/// 両方から同じ規則（HTML ASCII 空白の連続を 1 個へ畳む）で `out` へ
+/// 追記できるよう共有する。`normalized_chars`・`pending_space` は呼び出し元
+/// が同じバッファに対して連続する複数ノード分を通して保持する状態であり、
+/// このヘルパーはその状態を更新するだけで新規に作らない。
+///
+/// 戻り値: `limit`（折り畳み後の文字数上限）に達したら `true`
+/// （呼び出し元は `'walk` ループを打ち切る）。
+fn fold_chars_into(
+    chars: impl Iterator<Item = char>,
+    out: &mut String,
+    normalized_chars: &mut usize,
+    pending_space: &mut bool,
+    limit: usize,
+) -> bool {
+    for c in chars {
+        if is_ascii_whitespace(c) {
+            if !out.is_empty() {
+                *pending_space = true;
+            }
+            continue;
+        }
+        if *pending_space {
+            if *normalized_chars >= limit {
+                return true;
+            }
+            out.push(' ');
+            *normalized_chars += 1;
+            *pending_space = false;
+        }
+        if *normalized_chars >= limit {
+            return true;
+        }
+        out.push(c);
+        *normalized_chars += 1;
+    }
+    false
 }
 
 /// `doc` 全体で 1 回だけ構築する、accessible name 算出用の索引
@@ -499,24 +553,35 @@ fn collect_label_text(doc: &Document, label: NodeId, exclude: NodeId, out: &mut 
 /// `label`→対象コントロールの関連付けを文書につき 1 回の走査で構築し、
 /// 以降の `label_name` 呼び出しをハッシュマップの参照だけに抑える。
 ///
-/// 構築は [`build`](Self::build) で行う。フィールドは非公開（本ファイル
-/// 内の実装詳細）。`id` 索引（属性値 → 文書順で最初に一致した要素）は
-/// `label`→対象コントロールの関連付けを解決するためだけに使う中間結果
-/// であり、解決後は不要になるため構築後は保持しない。
-pub struct NameIndex {
+/// 構築は [`build`](Self::build) で行う。`labels_by_target` フィールドは
+/// 非公開（本ファイル内の実装詳細）。`id` 索引（属性値 → 文書順で最初に
+/// 一致した要素）は `label`→対象コントロールの関連付けを解決するためだけに
+/// 使う中間結果であり、解決後は不要になるため構築後は保持しない。
+///
+/// `doc` フィールドは構築元の文書への参照を保持する。[`NodeId`] は文書内の
+/// 番号（arena インデックス）に過ぎず文書をまたいだ一意性を持たないため、
+/// 構築元と異なる文書の `NodeId` を渡すと `labels_by_target` が無関係の
+/// 要素に一致し、誤ったラベルを適用しかねない（PR #567 レビュー指摘の P2
+/// 修正）。ライフタイム `'doc` で `NameIndex` に構築元の文書を型として
+/// 結び付け、[`compute_name_with_index`] 側で `doc` 引数との同一性
+/// （`std::ptr::eq`）を検証することで、この誤用を実行時に検出する。
+pub struct NameIndex<'doc> {
+    /// 構築元の文書（[`compute_name_with_index`] が渡された `doc` と
+    /// 同一かどうかの検証に使う）。
+    doc: &'doc Document,
     /// ラベル付け可能な対象コントロール → 関連付く `<label>` の文書順
     /// リスト（`for` 属性による関連付け・label による包含の両方を含む）。
     labels_by_target: HashMap<NodeId, Vec<NodeId>>,
 }
 
-impl NameIndex {
+impl<'doc> NameIndex<'doc> {
     /// `doc` を 1 回走査して [`NameIndex`] を構築する。
     ///
     /// 呼び出し文脈: 単発の [`compute_name`] は毎回これを内部で構築する
     /// （簡易版）。文書中の複数要素へ繰り返し名前を算出する呼び出し元
     /// （TASK-11.7 のツリー構築等）は、文書ごとに本関数を 1 回だけ呼び、
     /// 結果を [`compute_name_with_index`] へ使い回すこと。
-    pub fn build(doc: &Document) -> Self {
+    pub fn build(doc: &'doc Document) -> Self {
         // 文書順で辿った `<label>` 要素の一覧（`for` 属性の有無を問わない）。
         // 各 label を最終的に `labels_by_target` へ積む順序を、対象の
         // 解決方式（`for` 属性か包含か）によらず文書順のまま保つために使う
@@ -635,7 +700,10 @@ impl NameIndex {
             }
         }
 
-        Self { labels_by_target }
+        Self {
+            doc,
+            labels_by_target,
+        }
     }
 }
 
@@ -846,9 +914,16 @@ pub fn compute_name(doc: &Document, id: NodeId) -> AccessibleName {
 /// 構築し、同じ文書の要素ごとに使い回すことを想定する（文書ごとに
 /// 索引を再構築すると [`compute_name`] と同じ計算量に戻ってしまうため、
 /// ループの外側で 1 回だけ構築すること）。`doc` と `index` は同じ文書から
-/// 構築したものでなければならない（異なる文書の組み合わせは未定義の
-/// 挙動ではなく、単に一致する要素が見つからず `None`/既定値になる）。
+/// 構築したものでなければならない。[`NodeId`] は文書内の番号に過ぎず
+/// 別文書の `NodeId` と衝突しうるため、異なる文書の組み合わせを渡すと
+/// `labels_by_target` が無関係の要素に一致し**誤ったラベルを適用しうる**
+/// （PR #567 レビュー指摘の P2 修正・修正前の状態）。本関数はその誤用を
+/// 実行時に検出し、`doc` と `index` の構築元が同一でなければ（`ptr::eq`
+/// による同一性検証）名前なし（[`AccessibleName::default`]）を返す。
 pub fn compute_name_with_index(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName {
+    if !std::ptr::eq(doc, index.doc) {
+        return AccessibleName::default();
+    }
     if !doc.is_element(id) {
         return AccessibleName::default();
     }
@@ -1123,6 +1198,82 @@ mod tests {
             result,
             AccessibleName {
                 text: "同意する".to_string(),
+                source: NameSource::Label,
+                truncated: false,
+            }
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.2・#545・PR #567 レビュー指摘の P1 修正）:
+    /// `label` 内が `img` だけの場合（`for` 関連付け）、`img` の `alt` が
+    /// 名前として使われる（画像ラベルの入力名が失われない）。
+    #[test]
+    fn aisnap_1_label_for_img_alt_is_collected() {
+        let result = name(
+            r#"<label for="q"><img alt="検索"></label><input id="q">"#,
+            "input",
+        );
+        assert_eq!(
+            result,
+            AccessibleName {
+                text: "検索".to_string(),
+                source: NameSource::Label,
+                truncated: false,
+            }
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.2・#545・PR #567 レビュー指摘の P1 修正）:
+    /// `label` 内が `img` だけの場合（包含）でも `alt` が名前として使われる。
+    #[test]
+    fn aisnap_1_label_wrapping_img_alt_is_collected() {
+        let result = name(
+            r#"<label><img alt="検索"><input type="checkbox"></label>"#,
+            "input",
+        );
+        assert_eq!(
+            result,
+            AccessibleName {
+                text: "検索".to_string(),
+                source: NameSource::Label,
+                truncated: false,
+            }
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.2・#545・PR #567 レビュー指摘の P1 修正）:
+    /// `label` 内のテキストと `img` の `alt` が両方ある場合、文書順に
+    /// テキストノードと同列に連結される（区切りの空白は挿入しない。
+    /// 隣接するテキストノード同士を連結する扱いと同じ規則）。
+    #[test]
+    fn aisnap_1_label_text_and_img_alt_are_concatenated_in_order() {
+        let result = name(
+            r#"<label for="q">前<img alt="中">後</label><input id="q">"#,
+            "input",
+        );
+        assert_eq!(
+            result,
+            AccessibleName {
+                text: "前中後".to_string(),
+                source: NameSource::Label,
+                truncated: false,
+            }
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.2・#545・PR #567 レビュー指摘の P1 修正）:
+    /// `label` 内にテキストと `alt=""` の `img` が両方ある場合、`img` は
+    /// 何も追加しない（末尾に余分な空白が残らない）。
+    #[test]
+    fn aisnap_1_label_text_with_empty_img_alt_has_no_trailing_space() {
+        let result = name(
+            r#"<label for="q">名前<img alt=""></label><input id="q">"#,
+            "input",
+        );
+        assert_eq!(
+            result,
+            AccessibleName {
+                text: "名前".to_string(),
                 source: NameSource::Label,
                 truncated: false,
             }
@@ -1578,6 +1729,43 @@ mod tests {
                 "selector={selector}"
             );
         }
+    }
+
+    /// AISNAP-1（TASK-11.4.2・#545・PR #567 レビュー指摘の P2 修正）:
+    /// 構築元と異なる文書の `NodeId` を `compute_name_with_index` へ渡すと、
+    /// `NodeId` が文書内の番号に過ぎず両文書で衝突しても、無関係な文書の
+    /// ラベルが誤って適用されず名前なしになる（修正前は `labels_by_target`
+    /// が一致し、`doc_b` の label テキストが `doc_a` の要素に誤って
+    /// 適用されていた）。
+    #[test]
+    fn aisnap_1_compute_name_with_index_rejects_mismatched_document() {
+        use super::{NameIndex, compute_name_with_index};
+
+        // 構造を揃えることで、両文書で同じ `NodeId`（arena インデックス）が
+        // 同じ構造上の位置を指すようにする（衝突を意図的に起こす）。
+        let html_a = r#"<label for="x">A用の名前</label><input id="x">"#;
+        let html_b = r#"<label for="x">B用の名前</label><input id="x">"#;
+        let parsed_a =
+            parse_document(html_a, &ParseOptions::default()).expect("テスト入力は必ず成功する");
+        let parsed_b =
+            parse_document(html_b, &ParseOptions::default()).expect("テスト入力は必ず成功する");
+        let doc_a = parsed_a.document;
+        let doc_b = parsed_b.document;
+        let root_a = doc_a.root();
+        let target_a = query_selector_str(&doc_a, root_a, "input")
+            .expect("セレクタは解釈できる")
+            .expect("対象要素が見つかる");
+
+        // 前提確認: `doc_a` 単体では期待どおり `A用の名前` が算出できる。
+        assert_eq!(compute_name(&doc_a, target_a).text, "A用の名前");
+
+        let index_b = NameIndex::build(&doc_b);
+        let result = compute_name_with_index(&doc_a, &index_b, target_a);
+        assert_eq!(
+            result,
+            AccessibleName::default(),
+            "異なる文書から構築した index を渡すと名前なしになるべき（B の名前が誤って適用されてはならない）"
+        );
     }
 
     // --- 深いネスト ---
