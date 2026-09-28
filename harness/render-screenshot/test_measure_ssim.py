@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import struct
 import sys
@@ -631,6 +632,40 @@ class LoadBboxesTest(unittest.TestCase):
                 ms.load_bboxes(path)
 
 
+class BboxIsStaleTest(unittest.TestCase):
+    """RENDER-5 / TASK-37.2: `_bbox_is_stale`（Codex P1 対応。再撮影で PNG だけが
+    更新された場合に古い bbox を混入させない mtime ヒューリスティック）。"""
+
+    def test_bbox_older_than_png_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bbox_path = Path(tmp) / "site.bboxes.json"
+            png_path = Path(tmp) / "site.png"
+            bbox_path.write_text("{}", encoding="utf-8")
+            png_path.write_bytes(b"png")
+            # bbox 側の更新時刻を PNG より明確に古くする（再撮影で PNG だけが
+            # 更新された状況を模す）。
+            old = bbox_path.stat().st_mtime - 3600
+            os.utime(bbox_path, (old, old))
+            self.assertTrue(ms._bbox_is_stale(bbox_path, png_path))
+
+    def test_bbox_newer_than_or_equal_to_png_is_not_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            png_path = Path(tmp) / "site.png"
+            bbox_path = Path(tmp) / "site.bboxes.json"
+            png_path.write_bytes(b"png")
+            bbox_path.write_text("{}", encoding="utf-8")
+            self.assertFalse(ms._bbox_is_stale(bbox_path, png_path))
+
+    def test_stat_failure_is_not_stale(self) -> None:
+        # stat 自体の失敗（レース等）は `load_bboxes` 等の別経路が扱うため、
+        # ここでは stale 扱いにしない（fail-closed の二重適用を避ける）。
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "does-not-exist.bboxes.json"
+            png_path = Path(tmp) / "site.png"
+            png_path.write_bytes(b"png")
+            self.assertFalse(ms._bbox_is_stale(missing, png_path))
+
+
 class CompareBboxesTest(unittest.TestCase):
     """RENDER-5 / TASK-37.2: `compare_bboxes`（±5% 判定・一致率。§2.4）。"""
 
@@ -993,6 +1028,37 @@ class MainIntegrationTest(unittest.TestCase):
             result = json.loads((capture_dir / "measure-result.json").read_text(encoding="utf-8"))
             self.assertEqual(result["summary"]["passing_sites"], 4)
             self.assertEqual(result["summary"]["verdict"], "below_threshold")
+
+    def test_stale_bbox_from_previous_capture_does_not_pass(self) -> None:
+        # Codex P1 対応: 撮影側は再実行時に PNG を削除するが bbox JSON は
+        # 削除しないため、同じ capture-dir で再撮影すると今回の PNG と前回の
+        # bbox を突き合わせてしまう可能性があった。bbox のファイル更新時刻が
+        # 対応する PNG より古ければ stale として不合格にすることを確認する。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            site_id = "s0"
+            (capture_dir / "chromium").mkdir(parents=True, exist_ok=True)
+            (capture_dir / "servo").mkdir(parents=True, exist_ok=True)
+            elements = [{"id": f"e{i}", "x": 0, "y": 0, "width": 10, "height": 10} for i in range(5)]
+            self._write_bboxes(capture_dir, "chromium", site_id, elements)
+            self._write_bboxes(capture_dir, "servo", site_id, elements)
+            # bbox 側の更新時刻を明確に過去へ巻き戻し、「前回撮影時の bbox」を模す。
+            old = (capture_dir / "chromium" / f"{site_id}.bboxes.json").stat().st_mtime - 3600
+            os.utime(capture_dir / "chromium" / f"{site_id}.bboxes.json", (old, old))
+            os.utime(capture_dir / "servo" / f"{site_id}.bboxes.json", (old, old))
+
+            # bbox より後に（＝再撮影として）PNG を書き出す。SSIM は一致するよう
+            # `identical=True` にし、境界ボックスの stale 判定だけを見る。
+            self._make_site_pngs(capture_dir, site_id, identical=True)
+            self._write_capture_result(capture_dir, [site_id])
+
+            exit_code = ms.main(["--capture-dir", str(capture_dir), "--min-sites", "1"])
+            self.assertEqual(exit_code, 1)
+            result = json.loads((capture_dir / "measure-result.json").read_text(encoding="utf-8"))
+            site_result = result["sites"][0]
+            self.assertFalse(site_result["passed"])
+            self.assertEqual(site_result["bbox"]["status"], "error")
+            self.assertIn("stale", site_result["bbox"]["reason"])
 
     def test_invalid_capture_result_exits_two(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

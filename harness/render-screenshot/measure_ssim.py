@@ -152,9 +152,21 @@ def load_capture_result(
         raise CaptureResultError(
             f"capture-result.json exceeds the {MAX_CAPTURE_RESULT_BYTES} byte limit"
         )
+    # `stat` での確認後に非信頼ファイルが拡大・差し替えられる TOCTOU を防ぐため、
+    # 読み込み自体も上限 + 1 バイトに制限し、実際に読んだ長さを検証する
+    # （`capture_screenshots._load_sites` と同じ方針。codex レビュー指摘）。
     try:
-        text = result_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
+        with result_path.open("rb") as fh:
+            raw_bytes = fh.read(MAX_CAPTURE_RESULT_BYTES + 1)
+    except OSError as exc:
+        raise CaptureResultError(f"failed to read capture-result.json: {exc}") from exc
+    if len(raw_bytes) > MAX_CAPTURE_RESULT_BYTES:
+        raise CaptureResultError(
+            f"capture-result.json exceeds the {MAX_CAPTURE_RESULT_BYTES} byte limit"
+        )
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
         # UTF-8 として不正なバイト列（`UnicodeDecodeError`）は `OSError` の
         # サブクラスではなく素通りしていた（Bugbot 指摘）。壊れた
         # capture-result.json も未処理例外で落とさず `CaptureResultError`
@@ -263,10 +275,16 @@ def _read_png_chunks(path: Path) -> tuple[int, int, int, int, bytes]:
         raise PngDecodeError(f"PNG file exceeds the {cs.MAX_PNG_BYTES} byte limit: {path}")
     if path.is_symlink():
         raise PngDecodeError(f"refusing to follow symlink: {path}")
+    # `stat` での確認後に非信頼ファイルが拡大・差し替えられる TOCTOU を防ぐため、
+    # 読み込み自体も上限 + 1 バイトに制限し、実際に読んだ長さを検証する
+    # （`capture_screenshots._load_sites` と同じ方針。codex レビュー指摘）。
     try:
-        data = path.read_bytes()
+        with path.open("rb") as fh:
+            data = fh.read(cs.MAX_PNG_BYTES + 1)
     except OSError as exc:
         raise PngDecodeError(f"failed to read PNG file: {path}: {exc}") from exc
+    if len(data) > cs.MAX_PNG_BYTES:
+        raise PngDecodeError(f"PNG file exceeds the {cs.MAX_PNG_BYTES} byte limit: {path}")
 
     if len(data) < len(cs.PNG_SIGNATURE) or data[: len(cs.PNG_SIGNATURE)] != cs.PNG_SIGNATURE:
         raise PngDecodeError(f"invalid PNG signature: {path}")
@@ -671,9 +689,19 @@ def load_bboxes(path: Path) -> dict[str, dict[str, float]] | None:
         raise BboxError(f"failed to stat bbox file: {path}: {exc}") from exc
     if size > MAX_BBOX_FILE_BYTES:
         raise BboxError(f"bbox file exceeds the {MAX_BBOX_FILE_BYTES} byte limit: {path}")
+    # `stat` での確認後に非信頼ファイルが拡大・差し替えられる TOCTOU を防ぐため、
+    # 読み込み自体も上限 + 1 バイトに制限し、実際に読んだ長さを検証する
+    # （`capture_screenshots._load_sites` と同じ方針。codex レビュー指摘）。
     try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
+        with path.open("rb") as fh:
+            raw_bytes = fh.read(MAX_BBOX_FILE_BYTES + 1)
+    except OSError as exc:
+        raise BboxError(f"failed to read bbox file: {path}: {exc}") from exc
+    if len(raw_bytes) > MAX_BBOX_FILE_BYTES:
+        raise BboxError(f"bbox file exceeds the {MAX_BBOX_FILE_BYTES} byte limit: {path}")
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
         # capture-result.json の読み込みと同じ理由（Bugbot 指摘）で
         # `UnicodeDecodeError` も明示的に `BboxError` へ変換する。
         raise BboxError(f"failed to read bbox file: {path}: {exc}") from exc
@@ -830,6 +858,30 @@ def compare_bboxes(
     }
 
 
+def _bbox_is_stale(bbox_path: Path, png_path: Path) -> bool:
+    """bbox JSON が対応する PNG より古い（＝再撮影で PNG だけが更新された）かを判定する。
+
+    `capture_screenshots.py`（#53）は `--out-dir` を使い回す再実行時に PNG を
+    削除してから新しい PNG を書き出すが、`<engine>/<site_id>.bboxes.json`
+    （境界ボックス抽出。TASK-36/38 の成果として本スクリプトの外側で用意される
+    別ファイルであり、この撮影パイプラインの管轄外）は自動的に更新される
+    保証がない。そのため `measure_site` は固定名で無条件にこの bbox を
+    読み込むと、今回の PNG と前回撮影時点の bbox を突き合わせてしまう
+    （Codex P1 指摘）。bbox JSON に撮影を紐づける識別子が入力契約に無い現状では、
+    ファイル更新時刻（bbox が PNG より古い）をヒューリスティックに使い、
+    古い可能性がある bbox を `stale` として不合格側へ倒す（§2.6 の
+    fail-closed 方針。完全な保証ではないが、無検証で混入させるより安全）。
+    """
+    try:
+        bbox_mtime = bbox_path.stat().st_mtime
+        png_mtime = png_path.stat().st_mtime
+    except OSError:
+        # stat に失敗した場合は他の経路（load_bboxes 等）が別途エラーとして
+        # 扱うため、ここでは stale 扱いにしない（fail-closed の二重適用を避ける）。
+        return False
+    return bbox_mtime < png_mtime
+
+
 # --- サイト単位の計測・出力 ----------------------------------------------------
 
 
@@ -861,7 +913,30 @@ def measure_site(
             "reason": str(exc),
         }
     else:
-        bbox_result = compare_bboxes(ref_bboxes, tgt_bboxes, viewport)
+        stale_reasons: list[str] = []
+        if ref_bboxes is not None and _bbox_is_stale(ref_bbox_path, chromium_png):
+            stale_reasons.append(
+                f"{REFERENCE_ENGINE} bbox file is older than its PNG "
+                "(likely stale from a previous capture)"
+            )
+        if tgt_bboxes is not None and _bbox_is_stale(tgt_bbox_path, servo_png):
+            stale_reasons.append(
+                f"{TARGET_ENGINE} bbox file is older than its PNG "
+                "(likely stale from a previous capture)"
+            )
+        if stale_reasons:
+            bbox_result = {
+                "status": "error",
+                "matched": 0,
+                "total": 0,
+                "rate": None,
+                "passed": False,
+                "elements": [],
+                "warnings": [],
+                "reason": "; ".join(stale_reasons),
+            }
+        else:
+            bbox_result = compare_bboxes(ref_bboxes, tgt_bboxes, viewport)
 
     passed = (
         ssim_result["status"] == "measured"
