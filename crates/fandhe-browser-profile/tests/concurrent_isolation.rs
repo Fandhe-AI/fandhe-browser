@@ -136,16 +136,25 @@ fn validate_config(config: &HarnessConfig) {
 ///    する。`Barrier::new(config.profiles)` はスコープ内で参照を共有する
 ///    （`Arc` は不要）。
 /// 2. 各ワーカー `i` は `base.join("profile-{i}")` に `Profile::open` する。
-///    **open の成否に関わらず `barrier.wait()` をちょうど 1 回呼ぶ**。open が
-///    失敗したワーカーが wait せずに return すると、残りのワーカーが
-///    永久にブロックする（libtest にはテスト単位のタイムアウトがないため、
-///    ここが deadlock の最大の危険箇所になる）。open が失敗したワーカーは
-///    wait の後で `OpenFailed` を返す。この不変条件は `Profile::open` が
-///    パニックせず `Result` を返すこと（coding-rust.md「ライブラリコードでは
-///    `Result` を返し、panic させない」）を前提にしている。`open` 自体が
-///    パニックした場合はこの wait に到達できず、残りのワーカーがブロック
-///    したままになる（52.2 が検出したい `Panicked` そのものではなく、
-///    ハーネス側の deadlock として現れる点に注意）。
+///    **open の成否・panic の有無に関わらず `barrier.wait()` をちょうど 1 回
+///    呼ぶ**。open が失敗（`Err`）したワーカーが wait せずに return すると、
+///    残りのワーカーが永久にブロックする（libtest にはテスト単位の
+///    タイムアウトがないため、ここが deadlock の最大の危険箇所になる）。
+///    `Profile::open` は `Result` を返し panic しない契約
+///    （coding-rust.md「ライブラリコードでは `Result` を返し、panic
+///    させない」）だが、ハーネスはその契約破りを検出対象そのものとして
+///    扱う（PROF-3 は「競合による panic/クラッシュ 0 件」を要求するため、
+///    `open` 側の契約違反もハーネスが `Panicked` として報告できなければ
+///    ならない）。そのため `Profile::open` の呼び出しは
+///    `std::panic::catch_unwind` で包み、panic した場合も
+///    `barrier.wait()` を必ず経由してから `Panicked` を返す
+///    （#184 レビュー指摘。この `catch_unwind` はハーネス〔テストコード〕
+///    による panic 捕捉であり、release ビルドで `panic = "abort"` になる
+///    ライブラリコード〔`src/`〕には適用しない。coding-rust.md の
+///    「release は `panic = "abort"` 前提のため `catch_unwind` に頼らない」
+///    はライブラリコードの話で、本ファイルは test プロファイル〔unwind〕
+///    でのみビルドされるため矛盾しない）。open が失敗（`Err`）したワーカーは
+///    wait の後で `OpenFailed` を返す。
 /// 3. 書き込みは `DataKind::ALL` を順に巡回しながら `writes_per_profile` 回
 ///    行う。1 回の書き込みは
 ///    `create_file_in` → `set_len(0)`（過去の内容の残留を防ぐ。
@@ -173,15 +182,34 @@ fn run_concurrent_writes(base: &Path, config: &HarnessConfig) -> Vec<WorkerOutco
                 let writes_per_profile = config.writes_per_profile;
                 let root = base.join(format!("profile-{index}"));
                 scope.spawn(move || -> WorkerOutcome {
-                    let profile = match Profile::open(&root) {
-                        Ok(profile) => profile,
-                        Err(err) => {
+                    // `Profile::open` の panic（契約違反）を捕捉する。
+                    // 捕捉せずに panic させると、このワーカーは
+                    // `barrier.wait()` へ到達できず、残りのワーカーが
+                    // 永久にブロックする（#184 レビュー指摘）。
+                    let open_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            Profile::open(&root)
+                        }));
+
+                    let profile = match open_result {
+                        Ok(Ok(profile)) => profile,
+                        Ok(Err(err)) => {
                             // open に失敗しても、他のワーカーを deadlock
                             // させないため必ず wait する。
                             barrier.wait();
                             return WorkerOutcome::OpenFailed {
                                 index,
                                 error: err.to_string(),
+                            };
+                        }
+                        Err(payload) => {
+                            // open 自体が panic した場合も、他のワーカーを
+                            // deadlock させないため必ず wait してから
+                            // `Panicked` として報告する。
+                            barrier.wait();
+                            return WorkerOutcome::Panicked {
+                                index,
+                                message: panic_message(&payload),
                             };
                         }
                     };
