@@ -194,6 +194,21 @@ if [ "$BIN_COUNT" -eq 0 ]; then
   exit 2
 fi
 
+# cargo build の compiler-artifact は依存 crate のビルドも含めて全て流れてくる
+# ため、`.executable != null` だけで絞ると依存の build script（build-script-build
+# 等。これも "kind": ["custom-build"] の実行ファイルとして .executable を持つ）
+# まで拾ってしまい、それらのサイズで誤って不合格・出力の package/bin ラベルが
+# 実体と一致しなくなる（codex / cursor レビュー指摘, PR #563）。cargo metadata
+# の package id で対象 package に限定し、target.kind に "bin" を含むものだけを
+# 対象とする。
+PKG_ID=$(printf '%s' "$METADATA" | jq -r --arg pkg "$PACKAGE" '
+    [.packages[] | select(.name == $pkg) | .id] | first
+  ' | tr -d '\r')
+if [ -z "$PKG_ID" ] || [ "$PKG_ID" = "null" ]; then
+  echo "error: failed to resolve package id for $PACKAGE from cargo metadata" >&2
+  exit 2
+fi
+
 # `--message-format=json-render-diagnostics` は rustc の診断表示形式を変えるだけで、
 # cargo 自身のステータス行（`   Compiling foo v0.1.0`・`    Finished release ...`）は
 # 依然プレーンテキストのまま stderr へ出る。2>&1 で BUILD_JSON に混ぜると、cold
@@ -210,11 +225,39 @@ fi
 
 # jq は不正行を無視せず全体を落とすため、compiler-artifact 以外の行（診断メッセージ
 # 等）が混じっても `select` で無視できるよう `-c` ではなく通常の行区切り出力を使う。
-mapfile -t EXECUTABLES < <(
+# .package_id で対象 package に限定し、.target.kind に "bin" を含むものだけを
+# 実行ファイル候補にする（依存の build script 混入対策。上記 PKG_ID 参照）。
+#
+# jq をパイプの右辺にしたままプロセス置換 `< <(...)` へ渡すと、途中で jq が
+# 失敗しても非ゼロ終了がプロセス置換に握り潰され、途中まで解析できた分だけで
+# 後続の件数確認（0 件チェック）を通過し「一部だけ判定して合格」と誤認しうる
+# （codex / cursor レビュー指摘, PR #563）。jq の出力をコマンド置換 `$(...)` で
+# 直接受け取り、`if ! ...` でその終了コードを明示的に確認してから使う。
+if ! EXTRACTED=$(
   printf '%s\n' "$BUILD_JSON" \
-    | jq -r 'select(.reason? == "compiler-artifact" and (.executable? != null)) | .executable' \
-    | tr -d '\r'
-)
+    | jq -r --arg pkgid "$PKG_ID" '
+        select(.reason? == "compiler-artifact"
+          and (.executable? != null)
+          and (.package_id? == $pkgid)
+          and ((.target.kind? // []) | index("bin")))
+        | .executable
+      '
+); then
+  echo "error: failed to parse 'cargo build' JSON output for package $PACKAGE (jq failed)" >&2
+  exit 2
+fi
+EXTRACTED=$(printf '%s' "$EXTRACTED" | tr -d '\r')
+
+# `mapfile`/`readarray` は bash 4 以降の組み込みで、macOS（GitHub Actions
+# macos-latest 含む）が同梱する /bin/bash 3.2 には存在せず command not found
+# になる（cursor レビュー指摘, PR #563。compat-regression の while-read 方式に
+# 合わせる）。3 OS で同一に動く `while IFS= read -r` ループへ置き換える。
+EXECUTABLES=()
+while IFS= read -r exe_line; do
+  [ -n "$exe_line" ] && EXECUTABLES+=("$exe_line")
+done <<EXECUTABLES_EOF
+$EXTRACTED
+EXECUTABLES_EOF
 if [ "${#EXECUTABLES[@]}" -eq 0 ]; then
   echo "error: no executable found in 'cargo build' output for package $PACKAGE" >&2
   exit 2
