@@ -71,7 +71,8 @@
 //! ことを構造的に強制する。同時に 1 つしか存在し得なければ、逆順制約が
 //! 問題になる状況自体が発生しない。既に 1 つ存在するスレッドで
 //! [`V8Engine::new`] を呼んだ場合は panic ではなく
-//! [`IsolateAlreadyActiveOnThread`] エラーを返す。
+//! [`JsEngineError::BindingFailed`]（[`IsolateAlreadyActiveOnThread`] の
+//! メッセージを含む）エラーを返す。
 
 use std::cell::Cell;
 use std::sync::Once;
@@ -390,7 +391,14 @@ impl V8Engine {
     /// 指摘 #503 P0「macOS の JS ワーカーに強制的なメモリ上限がない」
     /// 対応。`super::resource_limits::new_bounded_array_buffer_allocator`
     /// のドキュメントコメント参照）。
-    pub(crate) fn new() -> Result<Self, IsolateAlreadyActiveOnThread> {
+    ///
+    /// 戻り値のエラー型が [`JsEngineError`] である理由:
+    /// [`IsolateAlreadyActiveOnThread`]（同一スレッドでの二重生成）に
+    /// 加えて、WebAssembly の無効化検証に失敗した場合
+    /// （[`JsEngineError::BindingFailed`]。codex レビュー指摘 #503 P1
+    /// 「WebAssembly の無効化失敗を見逃している」対応）もこの関数の
+    /// 呼び出し元へ伝える必要があるため。
+    pub(crate) fn new() -> Result<Self, JsEngineError> {
         Self::new_with_heap_limit(MAX_ISOLATE_HEAP_BYTES)
     }
 
@@ -401,9 +409,7 @@ impl V8Engine {
     /// テスト専用のヒープ上限（環境変数経由。本番では無効）を子プロセスの
     /// 中で使う際、および本モジュールの回帰テストがヒープ上限到達を高速に
     /// 再現する際に、この関数を直接呼ぶ（Issue #510 の経緯を引き継ぐ）。
-    pub(crate) fn new_with_heap_limit(
-        heap_limit_bytes: usize,
-    ) -> Result<Self, IsolateAlreadyActiveOnThread> {
+    pub(crate) fn new_with_heap_limit(heap_limit_bytes: usize) -> Result<Self, JsEngineError> {
         ensure_v8_initialized();
         let acquired = V8_ISOLATE_ACTIVE.with(|active| {
             if active.get() {
@@ -414,54 +420,106 @@ impl V8Engine {
             }
         });
         if !acquired {
-            return Err(IsolateAlreadyActiveOnThread);
+            return Err(JsEngineError::BindingFailed(
+                IsolateAlreadyActiveOnThread.to_string(),
+            ));
         }
         let create_params = v8::CreateParams::default()
             .heap_limits(0, heap_limit_bytes)
             .array_buffer_allocator(super::resource_limits::new_bounded_array_buffer_allocator());
         let mut isolate = v8::Isolate::new(create_params);
 
-        let context = {
-            let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
-            let mut scope = scope.init();
-            let context = v8::Context::new(&scope, Default::default());
-            {
-                // WebAssembly を無効化する（codex レビュー指摘 #503 P0
-                // 「macOS の JS ワーカーに強制的なメモリ上限がない」対応。
-                // ユーザー承認 2026-09-28）。V8 152.2.0 にはこの版のグローバル
-                // 露出を切り替える単一フラグが無い（`v8/src/flags/
-                // flag-definitions.h` に `expose_wasm` 相当のフラグが存在
-                // しないことを実機で確認済み）ため、生成直後の Context の
-                // グローバルオブジェクトから
-                // `WebAssembly` を上書きして到達不能にする。`delete` ではなく
-                // `undefined` への代入にしているのは、削除には対象プロパティが
-                // configurable であることが必要だが、代入は writable であれば
-                // 足りる（一般に組み込みグローバルは configurable かつ
-                // writable だが、writable の方が要求が弱く確実）ため。
-                let scope = &mut v8::ContextScope::new(&mut scope, context);
-                let global = context.global(scope);
-                if let Some(key) = v8::String::new(scope, "WebAssembly") {
-                    let key: v8::Local<v8::Value> = key.into();
-                    let undefined: v8::Local<v8::Value> = v8::undefined(scope).into();
-                    // advisor 指摘: 戻り値（代入できたか）を確認していない
-                    // ため、失敗時は `WebAssembly` グローバルがそのまま
-                    // 残り得る（対応前の状態への後退。実装済みを装わない。
-                    // REPAIR-3）。ここで panic や `Result` 化はしない
-                    // （本対応が前提とする「通常の V8 グローバルオブジェクトの
-                    // プロパティは既定で writable」という一般的な挙動が
-                    // 崩れる状況は、本 crate が制御しない V8 のビルド設定に
-                    // 依存するため）が、その万一の失敗時に無制限の wasm
-                    // メモリ確保という抜け穴を残さないよう、多層防御として
-                    // `super::resource_limits::configure_wasm_max_mem_pages_flag`
-                    // （単一メモリインスタンスへの上限。対応前から存在した
-                    // 手段）を `ensure_v8_initialized` で引き続き設定して
-                    // いる。
-                    let _ = global.set(scope, key, undefined);
-                }
+        let context = match Self::new_context_with_wasm_disabled(&mut isolate) {
+            Ok(context) => context,
+            Err(err) => {
+                // Isolate 生成には成功したが、この後 `Self` を組み立てず
+                // 早期リターンするため `Drop for V8Engine`（フラグ解放）が
+                // 走らない。ここで明示的にフラグを戻す（`isolate` 自体は
+                // このスコープを抜ける際に通常どおり drop される）。
+                V8_ISOLATE_ACTIVE.with(|active| active.set(false));
+                return Err(err);
             }
-            v8::Global::new(&scope, context)
         };
         Ok(Self { context, isolate })
+    }
+
+    /// [`V8Engine::new_with_heap_limit`] の本体のうち、Context 生成と
+    /// WebAssembly 無効化・検証だけを切り出したもの（早期リターンが
+    /// 絡む制御フローを読みやすくするため）。
+    ///
+    /// WebAssembly の無効化（`WebAssembly` グローバルを `undefined` へ
+    /// 上書き）は、(1) 上書き自体の戻り値が `Some(true)` であること、
+    /// (2) 上書き後に改めて `WebAssembly` を読み出し、`undefined` に
+    /// なっていること、の両方を確認する（codex レビュー指摘 #503 P1
+    /// 「`global.set` の戻り値を確認していないため、上書きに失敗しても
+    /// `WebAssembly` が到達可能なまま起動しうる」対応）。どちらかが
+    /// 満たされなければ、無制限の wasm メモリ確保という抜け穴を残さない
+    /// よう、Isolate を起動せず [`JsEngineError::BindingFailed`] を返す
+    /// （fail-closed。実装済みを装わない。REPAIR-3）。
+    fn new_context_with_wasm_disabled(
+        isolate: &mut v8::OwnedIsolate,
+    ) -> Result<v8::Global<v8::Context>, JsEngineError> {
+        let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+        let mut scope = scope.init();
+        let context = v8::Context::new(&scope, Default::default());
+        {
+            // WebAssembly を無効化する（codex レビュー指摘 #503 P0「macOS
+            // の JS ワーカーに強制的なメモリ上限がない」対応。ユーザー
+            // 承認 2026-09-28）。V8 152.2.0 にはこの版のグローバル露出を
+            // 切り替える単一フラグが無い（`v8/src/flags/flag-definitions.h`
+            // に `expose_wasm` 相当のフラグが存在しないことを実機で確認
+            // 済み）ため、生成直後の Context のグローバルオブジェクトから
+            // `WebAssembly` を上書きして到達不能にする。`delete` ではなく
+            // `undefined` への代入にしているのは、削除には対象プロパティが
+            // configurable であることが必要だが、代入は writable であれば
+            // 足りる（一般に組み込みグローバルは configurable かつ
+            // writable だが、writable の方が要求が弱く確実）ため。
+            let scope = &mut v8::ContextScope::new(&mut scope, context);
+            let global = context.global(scope);
+            let Some(key) = v8::String::new(scope, "WebAssembly") else {
+                return Err(JsEngineError::BindingFailed(
+                    "failed to allocate the \"WebAssembly\" property key string while \
+                     disabling WebAssembly"
+                        .to_string(),
+                ));
+            };
+            let key: v8::Local<v8::Value> = key.into();
+            let undefined: v8::Local<v8::Value> = v8::undefined(scope).into();
+
+            // codex レビュー指摘 #503 P1「`global.set` の戻り値を確認して
+            // いないため、上書きに失敗しても `WebAssembly` が到達可能な
+            // まま起動しうる」対応: 戻り値が `Some(true)` であることを
+            // 確認する。V8 の `Object::Set` は「代入できたか」を
+            // `Maybe<bool>` で返す契約であり、`None`（例外発生）・
+            // `Some(false)`（strict mode 相当で失敗を無視せず伝える値。
+            // 通常のグローバルへの代入では起こらないはずだが、本 crate が
+            // 制御しない V8 のビルド設定・将来のバージョンでの挙動変化に
+            // 備える）のいずれでも、無効化に失敗したとみなし fail-closed
+            // にする。
+            if global.set(scope, key, undefined) != Some(true) {
+                return Err(JsEngineError::BindingFailed(
+                    "failed to overwrite the \"WebAssembly\" global property with undefined \
+                     (Object::Set did not report success)"
+                        .to_string(),
+                ));
+            }
+
+            // 上書きの戻り値だけに頼らず、実際に読み出して `undefined` に
+            // なっていることも確認する（`Set` が成功を報告しても、
+            // getter/setter の組み合わせ次第では読み出し値が異なりうる
+            // ため、二重に確認する。実装済みを装わない。REPAIR-3）。
+            match global.get(scope, key) {
+                Some(value) if value.is_undefined() => {}
+                other => {
+                    return Err(JsEngineError::BindingFailed(format!(
+                        "\"WebAssembly\" global property is not undefined after the overwrite \
+                         (read back: {other:?}); refusing to start the isolate with \
+                         WebAssembly potentially still reachable"
+                    )));
+                }
+            }
+        }
+        Ok(v8::Global::new(&scope, context))
     }
 
     /// この Isolate のヒープ統計から総ヒープサイズ（バイト）を返す。
@@ -951,15 +1009,19 @@ mod tests {
 
     /// JS-1・TASK-29.2: 同一スレッドで前の `V8Engine` を drop する前に
     /// 2 つ目を生成しようとすると、panic ではなく
-    /// `IsolateAlreadyActiveOnThread` を返すこと。`OwnedIsolate` の
-    /// drop 順序制約による panic を型レベルで避けていることの検証。
+    /// `JsEngineError::BindingFailed`（[`IsolateAlreadyActiveOnThread`] の
+    /// メッセージを含む）を返すこと。`OwnedIsolate` の drop 順序制約に
+    /// よる panic を型レベルで避けていることの検証。
     #[test]
     fn js_1_v8_engine_new_rejects_second_isolate_on_same_thread() {
         let first = V8Engine::new().expect("first V8Engine must succeed");
 
         match V8Engine::new() {
             Ok(_) => panic!("a second V8Engine must not be created on the same thread"),
-            Err(err) => assert_eq!(err, IsolateAlreadyActiveOnThread),
+            Err(JsEngineError::BindingFailed(msg)) => {
+                assert_eq!(msg, IsolateAlreadyActiveOnThread.to_string());
+            }
+            Err(other) => panic!("expected BindingFailed, got: {other:?}"),
         }
 
         drop(first);
