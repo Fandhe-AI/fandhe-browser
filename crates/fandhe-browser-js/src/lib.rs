@@ -67,14 +67,19 @@ mod worker;
 //
 // `pub` にする理由: `tests/v8_worker.rs`（`harness = false`。W6）は結合
 // テストであり、別クレートとしてコンパイルされるため `pub(crate)` の
-// 項目を参照できない。テスト専用の入口（`V8ProcessEngine`・
-// `new`/`new_for_test`/`evaluate_script`/`send_raw_frame_for_test`・
-// `WorkerSpawnConfigForTest`）だけを最小限 `pub` にする必要があり、
-// そのためにはモジュール自体も `pub` にする必要がある（`doc(hidden)` を
-// 併用し、公開 API ドキュメントには出さない）。`V8ProcessEngine` は
-// `Child`・パイプ・チャネルしか保持せず `v8` crate の型を一切参照しない
-// ため、coding-rust.md「V8 / boa の具象型を上位 crate へ漏らさない」には
-// 抵触しない。
+// 項目を参照できない。`V8ProcessEngine`・`new`・`evaluate_script` は
+// 本番ビルド（`test-support` feature 無効）でも `#[doc(hidden)] pub` の
+// まま残す（`TASK-29.6` で `create_engine` から配線するための本番 API の
+// 一部であり、テスト専用ではない）。一方、テスト専用の入口
+// （`new_for_test`・`send_raw_frame_for_test`・`worker_pid_for_test`・
+// `max_script_source_bytes_for_test`・`max_raw_frame_bytes_for_test`・
+// `WorkerSpawnConfigForTest`）は feature `test-support` が有効なときだけ
+// `pub` になり、無効時（本番ビルドを含む既定の `js-v8` ビルド）は crate
+// 外から名前を一切付けられない（Issue #528・TASK-29・`JS-1`。詳細は
+// `process_engine.rs` の各項目のドキュメントコメント参照）。
+// `V8ProcessEngine` は `Child`・パイプ・チャネルしか保持せず `v8` crate の
+// 型を一切参照しないため、coding-rust.md「V8 / boa の具象型を上位 crate
+// へ漏らさない」には抵触しない。
 #[cfg(feature = "js-v8")]
 #[doc(hidden)]
 pub mod process_engine;
@@ -92,7 +97,7 @@ pub use engine_trait::{
 /// し（`TASK-30`）、`fandhe-browser-cli` の `main` が tokio ランタイム・
 /// ロギング・設定読み込みより**前**に呼ぶ契約（`TASK-41`）。
 ///
-/// 環境変数 [`worker_protocol::MARKER_ENV_VAR`]
+/// 環境変数 `worker_protocol::MARKER_ENV_VAR`
 /// （`FANDHE_BROWSER_JS_WORKER`）が設定されていなければ `None` を返し、
 /// 呼び出し元は通常どおり処理を続ける（設計書 §3.1「フックを呼ばない
 /// ホストへの対策」）。設定されている場合は子プロセスとして動作し、
@@ -103,6 +108,23 @@ pub use engine_trait::{
 /// このバイナリは子プロセスとして機能できないため
 /// `ExitCode::FAILURE` を返す（成功を一律に返すフォールバックはしない。
 /// security.md「偽装・回避機能の禁止」）。
+///
+/// # スレッドに関する不変条件（`JS-1`・`TASK-29`・Issue #520）
+///
+/// 子プロセスモード（`js-v8` feature 有効時）では、この関数から
+/// `worker::worker_main` を経て V8 の Platform 初期化・Isolate 生成まで、
+/// **呼び出しスレッドの上で直線的に**進む。子プロセスの中の
+/// `worker_main` は V8 の Platform を protected 版（thread-isolated
+/// allocation 有効）で要求する（`v8_engine::ensure_v8_initialized_with`
+/// 参照）ため、Isolate に入れるのは Platform 初期化を行ったスレッド
+/// （＝この関数を呼んだスレッド）とその子孫だけである（PKU を持つ
+/// x86-64 Linux での protected Platform の制約）。
+///
+/// したがって、この関数を呼ぶ側（`TASK-41` の cli `main`）は、
+/// **本関数を呼ぶより前に**別スレッドを作ってそこから V8 の Isolate に
+/// 入るような構成にしてはならない。tokio ランタイム・ロギング等より
+/// 前に本関数を呼ぶという既存の契約（上記「呼び出し元」節）は、この
+/// 不変条件を満たすための前提でもある。
 pub fn run_js_worker_if_requested() -> Option<std::process::ExitCode> {
     let marker_value = std::env::var(worker_protocol::MARKER_ENV_VAR).ok()?;
     Some(dispatch_worker(&marker_value))

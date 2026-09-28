@@ -36,17 +36,37 @@
 //!   Windows の Job Object working set 上限。設定に失敗したら評価を
 //!   始めずに終了する）。OS ごとの強制の強さ・既知の制限は
 //!   `super::resource_limits` のドキュメントコメントを参照
+//! - Linux 限定でさらに、`enforce_child_memory_limit` より前に
+//!   [`super::resource_limits::prefer_child_as_oom_victim`] を呼び、
+//!   `/proc/self/oom_score_adj` を最大値へ設定する（`JS-1`・`TASK-29`・
+//!   Issue #516）。これは確保量の上限ではなく、システム全体が
+//!   メモリ逼迫した際に OOM killer が親より先にこの子を殺すようにする
+//!   優先度のヒントである。失敗しても fail-closed にはせず、stderr へ
+//!   警告を出して評価の準備を続行する（既知の制限として記録する。
+//!   procfs が使えない環境要因に限られ、他の防御には影響しない）
 //! - 本プロセスはセキュリティ上のサンドボックスではない。親と同じ
 //!   ユーザー権限で動作し、seccomp 等の権限制限も行わない。得られるのは
 //!   クラッシュ・メモリの資源分離だけである（`super::process_engine` の
 //!   ドキュメントコメント参照）
+//! - V8 の Platform は protected 版（thread-isolated allocation 有効）で
+//!   初期化する（`JS-1`・`TASK-29`・Issue #520。[`worker_main`] 内、
+//!   `enforce_child_memory_limit()` の後・`V8Engine::new*` の前で
+//!   [`super::v8_engine::ensure_v8_initialized_with`] を呼ぶ）。本
+//!   プロセスは単一スレッドで初期化から Isolate 生成まで進むため、
+//!   protected 版が要求する「Isolate に入るのは `V8::initialize()` を
+//!   呼んだスレッドの子孫だけ」という制約に抵触しない。子プロセスは
+//!   親と同じユーザー権限で動くため効果は限定的だが、V8 内部のメモリ
+//!   破壊に対する多層防御が 1 つ増える（同 Issue のドキュメントコメント
+//!   参照。テストプロセス内の経路は引き続き unprotected のままにする
+//!   理由は [`super::v8_engine::ensure_v8_initialized_with`] のドキュメント
+//!   コメント参照）
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
-use super::engine_trait::{EngineKind, EvaluateOptions, JsEngineError};
-use super::v8_engine::V8Engine;
-use super::worker_protocol::{self, ErrorKind, ProtocolError, tag};
+use super::engine_trait::{EngineKind, EvaluateOptions, JsEngineError, JsValue};
+use super::v8_engine::{NativeCallFailure, NativeCallTransport, V8Engine};
+use super::worker_protocol::{self, ErrorKind, NativeReturn, ProtocolError, tag};
 
 /// テスト専用: 子プロセスの V8 Isolate に設定するヒープ上限（バイト）を
 /// 上書きする環境変数（Issue #503 設計書 §7 W6「テスト用に小さいヒープ
@@ -65,8 +85,12 @@ use super::worker_protocol::{self, ErrorKind, ProtocolError, tag};
 /// を超える値を指定することで本番の上限を回避しようとする経路を防ぐため、
 /// [`super::v8_engine::clamp_test_heap_limit_bytes`] で読み取り直後に
 /// クランプする（codex レビュー指摘 #503 P0 対応。親側のクランプ
-/// （[`super::process_engine::WorkerSpawnConfigForTest::heap_limit_bytes`]）
-/// と合わせた多層防御であり、どちらか一方が壊れても上限は保たれる）。
+/// （`super::process_engine::WorkerSpawnConfigForTest::heap_limit_bytes`。
+/// 型自体は feature `test-support` の有無に関わらず常に存在するが、
+/// `test-support` 無効時は非公開 `use` により process_engine モジュール外
+/// （本モジュールを含む他モジュール）から不可視になるためリンクにできない。
+/// Issue #528）と合わせた多層防御であり、どちらか一方が壊れても上限は
+/// 保たれる）。
 pub(crate) const TEST_HEAP_LIMIT_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER_HEAP_LIMIT_BYTES";
 
 /// テスト専用: 子プロセスが送る `Hello` フレームのエンジン種別を
@@ -113,6 +137,90 @@ fn test_heap_limit_from_env_value(raw: Option<&str>) -> Option<usize> {
         .map(super::v8_engine::clamp_test_heap_limit_bytes)
 }
 
+/// stdio 越しに親と一問一答する [`NativeCallTransport`] 実装（`JS-1`・
+/// `TASK-29`・Issue #511）。
+///
+/// 呼び出し元: [`worker_main`] が `V8Engine::set_native_call_transport` で
+/// 本番の子プロセスへ配線する。`R`/`W` をジェネリックにしているのは、
+/// テストが実プロセス・実 stdio を介さず `Cursor<Vec<u8>>` で往復を検証
+/// できるようにするため（`tests` モジュール参照）。
+///
+/// 呼び出し先で本番が使う実際のハンドル（[`worker_main`]）は、ループ本体と
+/// 同じ `io::stdin()`/`io::stdout()`（呼び出しごとにロックする `Stdin`/
+/// `Stdout`）である。`StdinLock`/`StdoutLock` を関数スコープで握り続けると、
+/// 評価中に本トランスポートが同じ stdin/stdout を読み書きしようとした際に
+/// 再入不能なロックで永久にブロックする（デッドロック）。[`worker_main`]
+/// はこの理由でループ全体を通して `lock()` を保持しない（同関数の
+/// ドキュメントコメント参照）。
+pub(crate) struct StdioTransport<R, W> {
+    reader: R,
+    writer: W,
+}
+
+impl<R, W> StdioTransport<R, W> {
+    pub(crate) fn new(reader: R, writer: W) -> Self {
+        Self { reader, writer }
+    }
+}
+
+impl<R: Read, W: Write> NativeCallTransport for StdioTransport<R, W> {
+    /// `NativeCall` を送り、`NativeReturn` が届くまでブロックする
+    /// （一問一答）。
+    ///
+    /// - 送信前に件数・フレームサイズを検証し、上限超過は
+    ///   [`NativeCallFailure::Rejected`]（非 fatal。JS へ `RangeError` を
+    ///   投げるだけで、子・親のプロセス・接続は生き続ける）にする
+    /// - それ以外（I/O エラー・EOF・想定外の tag・デコード失敗）は
+    ///   [`NativeCallFailure::Fatal`] にする（一問一答の契約違反。
+    ///   [`super::v8_engine::native_proxy_callback`] がこれを見て評価を
+    ///   打ち切り、このプロセスを終了させる）
+    fn call(&mut self, id: u32, args: &[JsValue]) -> Result<NativeReturn, NativeCallFailure> {
+        let payload = match worker_protocol::encode_native_call(id, args) {
+            Ok(payload) => payload,
+            Err(err) => return Err(NativeCallFailure::Rejected(err.to_string())),
+        };
+        if payload.len() > worker_protocol::MAX_FRAME_PAYLOAD_CHILD_TO_PARENT {
+            return Err(NativeCallFailure::Rejected(format!(
+                "native call payload of {} bytes exceeds the {}-byte limit",
+                payload.len(),
+                worker_protocol::MAX_FRAME_PAYLOAD_CHILD_TO_PARENT
+            )));
+        }
+
+        if let Err(err) = send_frame(&mut self.writer, tag::NATIVE_CALL, &payload) {
+            return Err(NativeCallFailure::Fatal(format!(
+                "failed to send NativeCall: {err}"
+            )));
+        }
+
+        let frame = match worker_protocol::read_frame(
+            &mut self.reader,
+            worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD,
+        ) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                return Err(NativeCallFailure::Fatal(
+                    "parent closed the connection while awaiting a NativeReturn".to_string(),
+                ));
+            }
+            Err(err) => {
+                return Err(NativeCallFailure::Fatal(format!(
+                    "protocol violation while awaiting a NativeReturn: {err}"
+                )));
+            }
+        };
+        let (frame_tag, payload) = frame;
+        if frame_tag != tag::NATIVE_RETURN {
+            return Err(NativeCallFailure::Fatal(format!(
+                "expected a NativeReturn frame but received tag {frame_tag} \
+                 (native call is a strict one-question-one-answer protocol)"
+            )));
+        }
+        worker_protocol::decode_native_return(&payload)
+            .map_err(|err| NativeCallFailure::Fatal(format!("invalid NativeReturn: {err}")))
+    }
+}
+
 /// [`super::dispatch_worker`] から呼ばれる、子プロセスモードの本体
 /// （`js-v8` feature 有効時）。
 ///
@@ -141,6 +249,29 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Linux 限定: V8 の初期化・メモリ上限設定より前に、自分自身を OOM
+    // killer の優先対象にする（`JS-1`・`TASK-29`・Issue #516）。上限を
+    // 課すものではなく、システム全体がメモリ逼迫した際に親（ホスト）
+    // より先にこの子が殺される側になるようにするヒントに過ぎない
+    // （`super::resource_limits` のドキュメントコメント「OS ごとの
+    // 強制の強さ」節参照）。書き込みが失敗しても fail-closed にはせず、
+    // 警告を出して評価の準備を続行する（procfs が使えない環境要因に
+    // 限られ、他の防御には影響しないため。判断の理由は
+    // `super::resource_limits::prefer_child_as_oom_victim` のドキュメント
+    // コメント参照）。
+    //
+    // 警告メッセージは、親（`super::process_engine::WorkerHandle::
+    // stderr_indicates_oom`）が `ResourceLimitExceeded` への分類に使う
+    // 文字列（"Fatal JavaScript out of memory"・"Fatal process out of
+    // memory"）を含めない（誤って OOM と分類されるのを防ぐため）。
+    #[cfg(target_os = "linux")]
+    if let Err(err) = super::resource_limits::prefer_child_as_oom_victim() {
+        eprintln!(
+            "fandhe-browser-js worker: warning: failed to set oom_score_adj \
+             (continuing without OOM-killer preference): {err}"
+        );
+    }
+
     // V8 を初期化する（ひいては Isolate を生成する）前に、自分自身へ
     // OS のメモリ上限を設定する（codex レビュー指摘 #503 P0「ヒープ外
     // メモリが無制限」対応。`super::resource_limits` のドキュメント
@@ -161,6 +292,38 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
         }
     };
 
+    // V8 の Platform を protected 版（thread-isolated allocation 有効）で
+    // 初期化する（`JS-1`・`TASK-29`・Issue #520）。この子プロセスは
+    // `main`（`run_js_worker_if_requested` 経由）から本関数まで単一
+    // スレッドで直線的に進み、Isolate に入るのもこのスレッドだけである
+    // ため、`v8_engine::ensure_v8_initialized_with` のドキュメントコメント
+    // が述べる「子孫スレッド制約」に抵触しない。呼ぶ位置は
+    // `enforce_child_memory_limit()` の**後**（OS 側の上限を先に掛ける
+    // 順序を保つ）・`V8Engine::new*` の**前**（Isolate 生成より前に
+    // Platform を確定させる）にする。
+    //
+    // プロトコルバージョン検証の早期 return より**必ず下**に置くこと。
+    // `js_1_worker_main_rejects_unsupported_protocol_version` 等の
+    // ユニットテストはテストプロセス内で `worker_main` を直接呼ぶため、
+    // これより上で protected 初期化を呼ぶとテストプロセスが protected に
+    // なってしまう（他のテストスレッドが PKU ホストで `SEGV_PKUERR` に
+    // なりうる。実装者への注意。Issue #520 実装計画）。
+    let actual_platform =
+        super::v8_engine::ensure_v8_initialized_with(super::v8_engine::V8PlatformKind::Protected);
+    if actual_platform != super::v8_engine::V8PlatformKind::Protected {
+        // 正規の子プロセスでは起こり得ない（このプロセスは V8 の Platform
+        // をまだ初期化していないはずのため）。想定外の経路（テスト用の
+        // 直接呼び出し等）で先に unprotected 初期化が行われていたことを
+        // 示す。保護が有効であるかのように装わず、診断を出して評価は
+        // 継続する（unprotected のままでも従来と同じ安全水準であり、
+        // fail-closed で止める必要はない。security.md「偽装・回避機能の
+        // 禁止」）。
+        eprintln!(
+            "fandhe-browser-js worker: V8 platform was already initialized as {actual_platform:?}; \
+             thread-isolated allocation is not active"
+        );
+    }
+
     // 環境変数は untrusted な入力（`TEST_HEAP_LIMIT_ENV_VAR` のドキュメント
     // コメント参照）。`test_heap_limit_from_env_value` が読み取った直後に
     // クランプすることで、親を経由しない直接起動でも本番の上限
@@ -179,8 +342,15 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
         }
     };
 
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+    // JS-1・Issue #511: 逆方向 RPC の transport を配線する（Hello を送る前。
+    // 評価が始まる前に必ず設定済みにしておく）。`io::stdin()`/`io::stdout()`
+    // は呼び出しごとにロックする（`StdioTransport` のドキュメントコメント
+    // 参照）。ループ側もこの後は `StdinLock`/`StdoutLock` を関数スコープで
+    // 保持しない（旧実装は保持しており、評価中に本 transport が同じ
+    // stdin を読もうとするとデッドロックしていた）。
+    engine.set_native_call_transport(Box::new(StdioTransport::new(io::stdin(), io::stdout())));
+
+    let mut stdout = io::stdout();
 
     // Hello は Isolate・永続 Context の生成に成功した後にだけ送る
     // （設計書 §3.1「Hello を送るのは V8Engine::new() が成功した後」。
@@ -207,8 +377,12 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let stdin = io::stdin();
-    let mut stdin = stdin.lock();
+    // JS-1・Issue #511: `StdinLock`/`StdoutLock` をこのループのスコープで
+    // 保持し続けない（`StdioTransport` のドキュメントコメント参照）。
+    // `io::stdin()` は呼び出しごとにロックする `Read` 実装であり、内部の
+    // バッファは `Stdin` 自身（mutex の内側）に保持されるため、読み取り
+    // 途中のデータが失われることはない。
+    let mut stdin = io::stdin();
 
     loop {
         let frame = match worker_protocol::read_frame(
@@ -239,9 +413,25 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                if let Err(err) = evaluate_and_respond(&mut engine, &script, &mut stdout) {
-                    eprintln!("fandhe-browser-js worker: failed to send a response frame: {err}");
-                    return ExitCode::FAILURE;
+                match evaluate_and_respond(&mut engine, &script, &mut stdout) {
+                    Ok(RespondOutcome::Responded) => {}
+                    Ok(RespondOutcome::NativeCallProtocolViolation(message)) => {
+                        // JS-1・Issue #511: 逆方向 RPC が fatal
+                        // （プロトコル違反・EOF・I/O エラー）で終わった。
+                        // 応答フレームは送らない（`evaluate_and_respond` の
+                        // ドキュメントコメント参照）。親はこれを EOF として
+                        // 検出し `EngineUnavailable` へ変換する。
+                        eprintln!(
+                            "fandhe-browser-js worker: native call protocol violation: {message}"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "fandhe-browser-js worker: failed to send a response frame: {err}"
+                        );
+                        return ExitCode::FAILURE;
+                    }
                 }
             }
             tag::SHUTDOWN => return ExitCode::SUCCESS,
@@ -253,29 +443,62 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
     }
 }
 
-/// 1 件の `Evaluate` を処理し、`Result`/`Error` フレームを書き返す。
+/// [`evaluate_and_respond`] の結果（`JS-1`・Issue #511）。
+///
+/// `Result<(), ProtocolError>` のままでは「応答フレームを送った（正常）」と
+/// 「逆方向 RPC の fatal を検出したため応答フレームを送らなかった（異常。
+/// プロセスを終了させる）」を呼び出し元が区別できないため、専用の enum に
+/// する（coding-rust.md「戻り値は将来拡張できる構造を持つ型にする」）。
+enum RespondOutcome {
+    /// `Result`/`Error` フレームを送信した（通常経路）。
+    Responded,
+    /// 逆方向 RPC が fatal で終わったため、応答フレームを送らなかった
+    /// （[`worker_main`] がこれを見てプロセスを終了させる）。
+    NativeCallProtocolViolation(String),
+}
+
+/// 1 件の `Evaluate` を処理し、`Result`/`Error` フレームを書き返す
+/// （`JS-1`・Issue #503・#511）。
 ///
 /// 戻り値の `Err` はフレームの送信自体（I/O）が失敗したことを表す。
-/// 評価そのものの失敗は `Error` フレームとして正常に送信し、`Ok(())` を
-/// 返す（設計書 §3.2「タイムアウトでは子は死なず、Context もそのまま
-/// 残る」。呼び出しループはこの後も継続する）。
+/// 評価そのものの失敗は `Error` フレームとして正常に送信し、
+/// `Ok(RespondOutcome::Responded)` を返す（設計書 §3.2「タイムアウトでは
+/// 子は死なず、Context もそのまま残る」。呼び出しループはこの後も継続
+/// する）。
+///
+/// # 逆方向 RPC の fatal 確認（Issue #511）
+///
+/// 評価の直後・応答フレームを送信する**前**に
+/// [`V8Engine::take_native_call_fatal`] を確認する。これを
+/// `finish_watchdog`（`v8_engine.rs`）の判定より優先する理由: fatal 時は
+/// `terminate_execution` を呼んでいるため `evaluate_script` の戻り値だけを
+/// 見ると `has_terminated()` が真になり `JsEngineError::Timeout` に誤分類
+/// されうる。`Some` の場合は `Result`/`Error` のどちらも送らず
+/// `RespondOutcome::NativeCallProtocolViolation` を返す（呼び出し元が
+/// プロセスを終了させる。親はこれを EOF として検出し `EngineUnavailable`
+/// へ変換する。`super::process_engine` を参照）。
 fn evaluate_and_respond(
     engine: &mut V8Engine,
     script: &str,
     stdout: &mut impl Write,
-) -> Result<(), ProtocolError> {
-    match engine.evaluate_script(script, &EvaluateOptions::default()) {
+) -> Result<RespondOutcome, ProtocolError> {
+    let evaluation = engine.evaluate_script(script, &EvaluateOptions::default());
+    if let Some(fatal) = engine.take_native_call_fatal() {
+        return Ok(RespondOutcome::NativeCallProtocolViolation(fatal));
+    }
+    match evaluation {
         Ok(value) => {
             let mut payload = Vec::new();
             worker_protocol::encode_js_value(&value, &mut payload)?;
-            send_frame(stdout, tag::RESULT, &payload)
+            send_frame(stdout, tag::RESULT, &payload)?;
         }
         Err(err) => {
             let (kind, message) = classify_evaluation_error(&err);
             let payload = worker_protocol::encode_error(kind, &message);
-            send_frame(stdout, tag::ERROR, &payload)
+            send_frame(stdout, tag::ERROR, &payload)?;
         }
     }
+    Ok(RespondOutcome::Responded)
 }
 
 /// [`JsEngineError`] を [`ErrorKind`] と、[`worker_protocol::MAX_ERROR_MESSAGE_BYTES`]
@@ -437,5 +660,95 @@ mod tests {
     fn js_1_worker_main_rejects_non_numeric_protocol_version() {
         let exit_code = worker_main("not-a-version");
         assert_eq!(exit_code, ExitCode::FAILURE);
+    }
+
+    /// JS-1・Issue #511: `StdioTransport::call` が、期待どおりの
+    /// `NativeCall` フレームを書き込み、事前に符号化した `NativeReturn` を
+    /// 正しく読み取れること（実 stdio・実子プロセスを介さない往復確認）。
+    #[test]
+    fn js_1_stdio_transport_round_trips_a_native_call() {
+        let mut response = Vec::new();
+        worker_protocol::write_frame(
+            &mut response,
+            tag::NATIVE_RETURN,
+            &worker_protocol::encode_native_return(&NativeReturn::Ok(JsValue::Number(42.0)))
+                .expect("encode must succeed"),
+        )
+        .expect("write must succeed");
+
+        let mut written = Vec::new();
+        let mut transport = StdioTransport::new(io::Cursor::new(response), &mut written);
+        let result = transport
+            .call(7, &[JsValue::Number(1.0), JsValue::String("x".to_string())])
+            .expect("call must succeed");
+        assert_eq!(result, NativeReturn::Ok(JsValue::Number(42.0)));
+
+        let mut expected = Vec::new();
+        worker_protocol::write_frame(
+            &mut expected,
+            tag::NATIVE_CALL,
+            &worker_protocol::encode_native_call(
+                7,
+                &[JsValue::Number(1.0), JsValue::String("x".to_string())],
+            )
+            .expect("encode must succeed"),
+        )
+        .expect("write must succeed");
+        assert_eq!(written, expected);
+    }
+
+    /// JS-1・Issue #511: 親が読み取り側を閉じた（EOF）場合は `Fatal` を
+    /// 返すこと。
+    #[test]
+    fn js_1_stdio_transport_call_is_fatal_on_eof() {
+        let mut transport = StdioTransport::new(io::Cursor::new(Vec::<u8>::new()), Vec::new());
+        assert!(matches!(
+            transport.call(1, &[]),
+            Err(NativeCallFailure::Fatal(_))
+        ));
+    }
+
+    /// JS-1・Issue #511: `NATIVE_RETURN` 以外の想定外のタグは `Fatal` を
+    /// 返すこと（一問一答の違反）。
+    #[test]
+    fn js_1_stdio_transport_call_is_fatal_on_unexpected_tag() {
+        let mut response = Vec::new();
+        worker_protocol::write_frame(&mut response, tag::EVALUATE, b"1 + 1")
+            .expect("write must succeed");
+        let mut transport = StdioTransport::new(io::Cursor::new(response), Vec::new());
+        assert!(matches!(
+            transport.call(1, &[]),
+            Err(NativeCallFailure::Fatal(_))
+        ));
+    }
+
+    /// JS-1・Issue #511: フレーム長が上限を超える応答は `Fatal` を返すこと。
+    #[test]
+    fn js_1_stdio_transport_call_is_fatal_on_oversized_frame() {
+        let max = worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD;
+        let mut response = Vec::new();
+        let len_with_tag = u32::try_from(max + 2).expect("fits in u32");
+        response.extend_from_slice(&len_with_tag.to_le_bytes());
+        let mut transport = StdioTransport::new(io::Cursor::new(response), Vec::new());
+        assert!(matches!(
+            transport.call(1, &[]),
+            Err(NativeCallFailure::Fatal(_))
+        ));
+    }
+
+    /// JS-1・Issue #511: 引数の件数・合計サイズが上限を超える場合は
+    /// `Rejected` になり、何も書き込まれないこと。
+    #[test]
+    fn js_1_stdio_transport_call_rejects_too_many_args_without_writing() {
+        let mut written = Vec::new();
+        let mut transport = StdioTransport::new(io::Cursor::new(Vec::<u8>::new()), &mut written);
+        let args: Vec<JsValue> = (0..(worker_protocol::MAX_NATIVE_CALL_ARGS + 1))
+            .map(|_| JsValue::Undefined)
+            .collect();
+        assert!(matches!(
+            transport.call(1, &args),
+            Err(NativeCallFailure::Rejected(_))
+        ));
+        assert!(written.is_empty(), "nothing must be written on rejection");
     }
 }

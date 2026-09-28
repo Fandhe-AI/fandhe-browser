@@ -20,11 +20,14 @@
 //!   （[`encode_evaluate`]）
 //! - [`tag::RESULT`]: 子 → 親。評価結果（[`encode_js_value`]）
 //! - [`tag::ERROR`]: 子 → 親。評価失敗（[`encode_error`]）
-//! - [`tag::NATIVE_CALL`]・[`tag::NATIVE_RETURN`]: 逆方向 RPC
-//!   （グローバル関数注入・DOM 風バインディングの子プロセス対応。
-//!   `TASK-29.4`/`29.5` 以降の別 Issue でペイロード形式を定める）。
-//!   本 Issue では tag 番号の予約のみ行い、エンコード・デコード関数は
-//!   実装しない（実装済みを装わない。REPAIR-3）
+//! - [`tag::NATIVE_CALL`]: 子 → 親。逆方向 RPC の呼び出し（グローバル関数
+//!   注入・DOM 風バインディングの子プロセス対応。`u32 id` ＋ 引数列。
+//!   [`encode_native_call`]/[`decode_native_call`]。`JS-1`・`TASK-29`・
+//!   Issue #511）
+//! - [`tag::NATIVE_RETURN`]: 親 → 子。逆方向 RPC の戻り値
+//!   （[`NativeReturn`]。[`encode_native_return`]/[`decode_native_return`]。
+//!   Issue #511）。親側の dispatch（`NativeFn` の実行・本フレームの送信）は
+//!   別 Issue（#526）で追加する
 //! - [`tag::SHUTDOWN`]: 親 → 子。ペイロードなし
 //!
 //! # 検証方針（外部入力として扱う。coding-rust.md「外部入力」節）
@@ -84,12 +87,11 @@ pub(crate) mod tag {
     pub(crate) const RESULT: u8 = 3;
     /// 子 → 親。評価失敗（[`super::encode_error`]）。
     pub(crate) const ERROR: u8 = 4;
-    /// 予約: 子 → 親。逆方向 RPC（グローバル関数注入・DOM 風バインディング。
-    /// `TASK-29.4`/`29.5` 以降の別 Issue でペイロード形式を定める）。
-    #[allow(dead_code, reason = "本 Issue では tag 番号の予約のみ行う（REPAIR-3）")]
+    /// 子 → 親。逆方向 RPC の呼び出し（[`super::encode_native_call`]。
+    /// `super::v8_engine` のプロキシ関数が送る）。
     pub(crate) const NATIVE_CALL: u8 = 5;
-    /// 予約: 親 → 子。逆方向 RPC の戻り値。
-    #[allow(dead_code, reason = "本 Issue では tag 番号の予約のみ行う（REPAIR-3）")]
+    /// 親 → 子。逆方向 RPC の戻り値（[`super::encode_native_return`]。
+    /// 親側の送信は別 Issue（#526）で追加する）。
     pub(crate) const NATIVE_RETURN: u8 = 6;
     /// 親 → 子。ペイロードなし。
     pub(crate) const SHUTDOWN: u8 = 7;
@@ -117,6 +119,17 @@ pub(crate) const MAX_FRAME_PAYLOAD_CHILD_TO_PARENT: usize = 3 * 1_048_576 + 65_5
 /// （`js-v8` feature 有効時のみ）。
 #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
+
+/// [`encode_native_call`]/[`decode_native_call`] が受け付ける引数の最大件数
+/// （`JS-1`・`TASK-29`・Issue #511）。
+///
+/// DoS 対策の件数上限（OWASP A04「不安全な設計」・security.md）。
+/// [`decode_native_call`] は `argc` をこの定数と比較してから
+/// `Vec::with_capacity` する（確保前検証。巨大な `argc` を主張するフレーム
+/// でも実際にはメモリを確保しない）。`print`・`dom.setText` 等（PoC-3
+/// 相当）の用途には十分な値として選んだ。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+pub(crate) const MAX_NATIVE_CALL_ARGS: usize = 64;
 
 /// フレーム・値のデコードに失敗したことを表すエラー（`JS-1`・`TASK-29`・
 /// Issue #503）。
@@ -188,6 +201,29 @@ pub(crate) enum ProtocolError {
     /// テストで構築されうる）。
     #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     InvalidUtf8,
+    /// [`encode_native_call`] に渡した引数の件数が [`MAX_NATIVE_CALL_ARGS`]
+    /// を超えていた（`JS-1`・Issue #511）。
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    TooManyNativeCallArgs { count: usize, max: usize },
+    /// [`decode_native_return`] が未知の status バイト（0=Ok, 1=Err 以外）を
+    /// 受け取った（`JS-1`・Issue #511）。
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    InvalidNativeReturnStatus(u8),
+    /// [`decode_native_return`] の Err ペイロード（エラーメッセージ）が
+    /// [`MAX_ERROR_MESSAGE_BYTES`] を超えていた（`JS-1`・Issue #511）。
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    ErrorMessageTooLong { len: usize, max: usize },
+    /// [`encode_native_call`] の引数列をエンコードした場合の合計サイズが
+    /// [`MAX_FRAME_PAYLOAD_CHILD_TO_PARENT`] を超える（`JS-1`・Issue #511・
+    /// codex レビュー指摘 #533 P0）。
+    ///
+    /// 引数の**件数**は [`MAX_NATIVE_CALL_ARGS`]（[`TooManyNativeCallArgs`]）
+    /// で別途検証済みだが、1 引数あたり最大 ~1 MiB の文字列を渡せるため、
+    /// 件数の検証だけでは合計バイト数の DoS を防げない。`encode_native_call`
+    /// は `out` へ追記する**前**に合計サイズを checked 演算で積算し、この
+    /// 上限を超えた時点で確保・追記を一切行わずに本エラーを返す。
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    NativeCallPayloadTooLarge { size: usize, max: usize },
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -217,6 +253,23 @@ impl std::fmt::Display for ProtocolError {
                  (trailing bytes)"
             ),
             Self::InvalidUtf8 => write!(f, "worker protocol payload is not valid UTF-8"),
+            Self::TooManyNativeCallArgs { count, max } => write!(
+                f,
+                "worker protocol NativeCall has {count} arguments, exceeding the {max}-argument limit"
+            ),
+            Self::InvalidNativeReturnStatus(byte) => write!(
+                f,
+                "worker protocol NativeReturn status byte {byte} is neither 0 (Ok) nor 1 (Err)"
+            ),
+            Self::ErrorMessageTooLong { len, max } => write!(
+                f,
+                "worker protocol NativeReturn error message of {len} bytes exceeds the \
+                 {max}-byte limit"
+            ),
+            Self::NativeCallPayloadTooLarge { size, max } => write!(
+                f,
+                "worker protocol NativeCall payload of {size} bytes exceeds the {max}-byte limit"
+            ),
         }
     }
 }
@@ -579,6 +632,250 @@ pub(crate) fn decode_error(payload: &[u8]) -> Result<(ErrorKind, String), Protoc
     Ok((kind, message.to_string()))
 }
 
+/// [`tag::NATIVE_CALL`] フレームのペイロードを組み立てる（子 → 親。`JS-1`・
+/// `TASK-29`・Issue #511）。
+///
+/// 表現: `u32 LE id` ＋ `u32 LE argc` ＋ `argc` 個の [`JsValue`]
+/// （[`encode_js_value`] の自己区切り形式を連結したもの）。
+///
+/// 呼び出し元: [`super::v8_engine`] のプロキシ関数コールバック
+/// （`native_proxy_callback`）が、子プロセス内で JS からホスト関数が呼ばれた
+/// ことを親へ伝える際に使う。`args.len()` が [`MAX_NATIVE_CALL_ARGS`] を
+/// 超える場合は送信前に `Err` を返す（DoS 対策。確保前検証は呼び出し側の
+/// 責務ではなく、本関数自体が引数個数を検証してから追記する）。
+///
+/// 件数の検証に加え、`out` へ追記する**前**に各引数のエンコード後サイズを
+/// [`encoded_js_value_len`] で checked 演算により積算し、
+/// [`MAX_FRAME_PAYLOAD_CHILD_TO_PARENT`]（`NativeCall` は子 → 親フレーム）
+/// を超えた時点で確保・追記を一切行わずに `Err` を返す（codex レビュー
+/// 指摘 #533 P0「サイズ検証前に全件確保している」対応。呼び出し元
+/// （[`super::worker::StdioTransport::call`]）は本関数が返した `Vec` の
+/// 長さを送信直前に再確認するが、その時点ではすでに確保が終わっている
+/// ため、DoS 対策としては確保前の本検証が主たる防御線になる）。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+pub(crate) fn encode_native_call(id: u32, args: &[JsValue]) -> Result<Vec<u8>, ProtocolError> {
+    if args.len() > MAX_NATIVE_CALL_ARGS {
+        return Err(ProtocolError::TooManyNativeCallArgs {
+            count: args.len(),
+            max: MAX_NATIVE_CALL_ARGS,
+        });
+    }
+    let argc = u32::try_from(args.len()).map_err(|_| ProtocolError::TooManyNativeCallArgs {
+        count: args.len(),
+        max: MAX_NATIVE_CALL_ARGS,
+    })?;
+
+    // `id`（4 バイト）＋ `argc`（4 バイト）のヘッダ分から積算を始め、
+    // 各引数のエンコード後サイズを `Vec::with_capacity` の前に確定させる。
+    let mut total_size: usize = 8;
+    for arg in args {
+        let encoded_len = encoded_js_value_len(arg)?;
+        total_size = total_size.checked_add(encoded_len).ok_or(
+            ProtocolError::NativeCallPayloadTooLarge {
+                size: usize::MAX,
+                max: MAX_FRAME_PAYLOAD_CHILD_TO_PARENT,
+            },
+        )?;
+        if total_size > MAX_FRAME_PAYLOAD_CHILD_TO_PARENT {
+            return Err(ProtocolError::NativeCallPayloadTooLarge {
+                size: total_size,
+                max: MAX_FRAME_PAYLOAD_CHILD_TO_PARENT,
+            });
+        }
+    }
+
+    let mut out = Vec::with_capacity(total_size);
+    out.extend_from_slice(&id.to_le_bytes());
+    out.extend_from_slice(&argc.to_le_bytes());
+    for arg in args {
+        encode_js_value(arg, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// [`encode_js_value`] が `value` に対して実際に追記するバイト数を、
+/// 確保・追記の**前**に計算する（[`encode_native_call`] が合計サイズを
+/// 検証してから `Vec::with_capacity` するために使う補助関数。`JS-1`・
+/// Issue #511・codex レビュー指摘 #533）。
+///
+/// 表現は [`encode_js_value`] のドキュメントコメントと一致させる
+/// （`u8 tag` ＋ 種別ごとの値）。`String` の長さ検証（`u32` に収まるか）も
+/// [`encode_js_value`] と同じ基準で行う。
+///
+/// `pub(crate)`: [`super::v8_engine`] の `native_call_arg_encoded_len`
+/// （複製を伴わない V8 側の見積もり。codex レビュー指摘 #533 P0 対応）の
+/// ドキュメンテーションコメントから参照する。表現形式（タグ 1 バイト＋
+/// 種別ごとの値）は手作業で同期する必要がある。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+pub(crate) fn encoded_js_value_len(value: &JsValue) -> Result<usize, ProtocolError> {
+    match value {
+        JsValue::Undefined | JsValue::Null => Ok(1),
+        JsValue::Bool(_) => Ok(2),
+        JsValue::Number(_) => Ok(9),
+        JsValue::String(s) => {
+            u32::try_from(s.len()).map_err(|_| {
+                ProtocolError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "worker protocol string value is too large to encode a u32 length",
+                ))
+            })?;
+            1usize
+                .checked_add(4)
+                .and_then(|n| n.checked_add(s.len()))
+                .ok_or(ProtocolError::NativeCallPayloadTooLarge {
+                    size: usize::MAX,
+                    max: MAX_FRAME_PAYLOAD_CHILD_TO_PARENT,
+                })
+        }
+    }
+}
+
+/// [`encode_native_call`] の逆変換（親側で使う。`JS-1`・Issue #511）。
+///
+/// 呼び出し元（将来）: `super::process_engine` の親側 dispatch（`NativeFn`
+/// の実行と [`NativeReturn`] の返信。別 Issue #526）。
+///
+/// `argc` を [`MAX_NATIVE_CALL_ARGS`] と比較してから `Vec::with_capacity`
+/// する（外部入力である `argc` を信用してそのまま確保に使わない。
+/// coding-rust.md「外部入力」節・OWASP A04）。読み終えて末尾にバイトが
+/// 余っていれば [`ProtocolError::TrailingBytes`] を返す。
+///
+/// 親側 dispatch（#526）が実装されるまでは `js-v8` の有無に関わらず
+/// 呼び出し元が存在しない（本番経路では常に dead code）。
+#[allow(
+    dead_code,
+    reason = "親側 dispatch（#526）から呼ばれるまで未配線。REPAIR-3"
+)]
+pub(crate) fn decode_native_call(payload: &[u8]) -> Result<(u32, Vec<JsValue>), ProtocolError> {
+    let id_bytes: [u8; 4] = payload
+        .get(0..4)
+        .ok_or(ProtocolError::Truncated)?
+        .try_into()
+        .map_err(|_| ProtocolError::Truncated)?;
+    let id = u32::from_le_bytes(id_bytes);
+
+    let argc_bytes: [u8; 4] = payload
+        .get(4..8)
+        .ok_or(ProtocolError::Truncated)?
+        .try_into()
+        .map_err(|_| ProtocolError::Truncated)?;
+    let argc = u32::from_le_bytes(argc_bytes) as usize;
+    if argc > MAX_NATIVE_CALL_ARGS {
+        return Err(ProtocolError::TooManyNativeCallArgs {
+            count: argc,
+            max: MAX_NATIVE_CALL_ARGS,
+        });
+    }
+
+    let mut args = Vec::with_capacity(argc);
+    let mut offset = 8usize;
+    for _ in 0..argc {
+        let remaining = payload.get(offset..).ok_or(ProtocolError::Truncated)?;
+        let (value, consumed) = decode_js_value(remaining)?;
+        args.push(value);
+        offset = offset
+            .checked_add(consumed)
+            .ok_or(ProtocolError::Truncated)?;
+    }
+    if offset != payload.len() {
+        return Err(ProtocolError::TrailingBytes {
+            expected: offset,
+            actual: payload.len(),
+        });
+    }
+    Ok((id, args))
+}
+
+/// [`tag::NATIVE_RETURN`] フレームが表す逆方向 RPC の戻り値（親 → 子。
+/// `JS-1`・`TASK-29`・Issue #511）。
+///
+/// 呼び出し元（将来）: `super::process_engine` の親側 dispatch（`Ok` は
+/// `NativeFn` の戻り値、`Err` は `NativeFn` の実行失敗・呼び出し規約違反を
+/// 表す。別 Issue #526）。子側（[`super::v8_engine`] のプロキシ関数）は
+/// [`decode_native_return`] でこれを読み、`Ok` は JS の戻り値へ、`Err` は
+/// JS の例外（`try`/`catch` で捕捉可能）へ変換する。
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+pub(crate) enum NativeReturn {
+    /// `NativeFn` の呼び出しが成功した。
+    Ok(JsValue),
+    /// `NativeFn` の呼び出しが失敗した（エラーメッセージ）。
+    Err(String),
+}
+
+/// [`NativeReturn`] のペイロードを組み立てる（親側で使う。`JS-1`・
+/// Issue #511）。
+///
+/// 表現: `u8 status`（0=Ok, 1=Err）＋ 本体（Ok は 1 つの [`JsValue`]、Err は
+/// 残り全部を UTF-8 のエラーメッセージとして扱う）。
+///
+/// 呼び出し元（将来）: `super::process_engine`（別 Issue #526）。送信前に
+/// [`super::worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`] 以内・
+/// エラーメッセージを [`MAX_ERROR_MESSAGE_BYTES`] 以内に収める責務は
+/// 呼び出し側が負う（本関数自体は上限を課さない。#526 への申し送り）。
+///
+/// 親側 dispatch（#526）が実装されるまでは `js-v8` の有無に関わらず
+/// 呼び出し元が存在しない（本番経路では常に dead code）。
+#[allow(
+    dead_code,
+    reason = "親側 dispatch（#526）から呼ばれるまで未配線。REPAIR-3"
+)]
+pub(crate) fn encode_native_return(value: &NativeReturn) -> Result<Vec<u8>, ProtocolError> {
+    let mut out = Vec::new();
+    match value {
+        NativeReturn::Ok(value) => {
+            out.push(0);
+            encode_js_value(value, &mut out)?;
+        }
+        NativeReturn::Err(message) => {
+            out.push(1);
+            out.extend_from_slice(message.as_bytes());
+        }
+    }
+    Ok(out)
+}
+
+/// [`encode_native_return`] の逆変換（子側で使う。`JS-1`・Issue #511）。
+///
+/// 呼び出し元: [`super::v8_engine`] のプロキシ関数コールバックが、親からの
+/// 応答を JS の戻り値・例外へ変換する前に呼ぶ。
+///
+/// - `status = 0`（Ok）: ペイロードの残り全体をちょうど 1 つの [`JsValue`]
+///   として消費すること。末尾に余分なバイトがあれば
+///   [`ProtocolError::TrailingBytes`] を返す
+/// - `status = 1`（Err）: 残り全部を UTF-8 のエラーメッセージとして読む。
+///   [`MAX_ERROR_MESSAGE_BYTES`] を超える場合は `from_utf8` を試みる**前**に
+///   [`ProtocolError::ErrorMessageTooLong`] を返す（外部入力の長さを検証
+///   してから文字列変換に使う。coding-rust.md「外部入力」節）
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+pub(crate) fn decode_native_return(payload: &[u8]) -> Result<NativeReturn, ProtocolError> {
+    let status = *payload.first().ok_or(ProtocolError::Truncated)?;
+    let body = payload.get(1..).ok_or(ProtocolError::Truncated)?;
+    match status {
+        0 => {
+            let (value, consumed) = decode_js_value(body)?;
+            if consumed != body.len() {
+                return Err(ProtocolError::TrailingBytes {
+                    expected: consumed,
+                    actual: body.len(),
+                });
+            }
+            Ok(NativeReturn::Ok(value))
+        }
+        1 => {
+            if body.len() > MAX_ERROR_MESSAGE_BYTES {
+                return Err(ProtocolError::ErrorMessageTooLong {
+                    len: body.len(),
+                    max: MAX_ERROR_MESSAGE_BYTES,
+                });
+            }
+            let message = std::str::from_utf8(body).map_err(|_| ProtocolError::InvalidUtf8)?;
+            Ok(NativeReturn::Err(message.to_string()))
+        }
+        other => Err(ProtocolError::InvalidNativeReturnStatus(other)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,10 +1160,170 @@ mod tests {
             ProtocolError::InvalidEngineByte(9),
             ProtocolError::Truncated,
             ProtocolError::InvalidUtf8,
+            ProtocolError::TooManyNativeCallArgs { count: 10, max: 5 },
+            ProtocolError::InvalidNativeReturnStatus(9),
+            ProtocolError::ErrorMessageTooLong { len: 10, max: 5 },
+            ProtocolError::NativeCallPayloadTooLarge { size: 10, max: 5 },
         ];
         for err in errors {
             assert!(!err.to_string().is_empty());
         }
+    }
+
+    /// JS-1・Issue #511: `NativeCall` の往復（0 引数・複数引数・`id` が
+    /// `u32::MAX` のケースを含む）で、id・引数列が一致すること。
+    #[test]
+    fn js_1_native_call_round_trip() {
+        let cases: Vec<(u32, Vec<JsValue>)> = vec![
+            (0, vec![]),
+            (
+                7,
+                vec![
+                    JsValue::Number(1.0),
+                    JsValue::String("x".to_string()),
+                    JsValue::Bool(true),
+                    JsValue::Null,
+                    JsValue::Undefined,
+                ],
+            ),
+            (u32::MAX, vec![JsValue::Number(-1.0)]),
+        ];
+        for (id, args) in cases {
+            let encoded = encode_native_call(id, &args).expect("encode must succeed");
+            let (decoded_id, decoded_args) =
+                decode_native_call(&encoded).expect("decode must succeed");
+            assert_eq!(decoded_id, id);
+            assert_eq!(decoded_args, args);
+        }
+    }
+
+    /// JS-1・Issue #511: 引数の件数が上限を超える場合、`encode_native_call`
+    /// は `Err` を返すこと。
+    #[test]
+    fn js_1_encode_native_call_rejects_too_many_args() {
+        let args: Vec<JsValue> = (0..(MAX_NATIVE_CALL_ARGS + 1))
+            .map(|_| JsValue::Undefined)
+            .collect();
+        assert!(matches!(
+            encode_native_call(1, &args),
+            Err(ProtocolError::TooManyNativeCallArgs { .. })
+        ));
+    }
+
+    /// codex レビュー指摘 #533 P0: 引数の件数は `MAX_NATIVE_CALL_ARGS`
+    /// 以内でも、合計サイズが `MAX_FRAME_PAYLOAD_CHILD_TO_PARENT` を
+    /// 超える場合は `encode_native_call` が確保前に `Err` を返すこと。
+    /// （1 引数あたり約 1 MiB の文字列を複数渡し、件数の上限には収まるが
+    /// 合計サイズの上限は超える状況を再現する。）
+    #[test]
+    fn js_1_encode_native_call_rejects_oversized_payload_before_building_output() {
+        // 1 MiB の文字列を 4 個（計 4 MiB）渡す。件数（4）は
+        // `MAX_NATIVE_CALL_ARGS`（64）以内だが、合計サイズは
+        // `MAX_FRAME_PAYLOAD_CHILD_TO_PARENT`（3 MiB + 64 KiB）を超える。
+        let one_mib_string = "a".repeat(1024 * 1024);
+        let args: Vec<JsValue> = (0..4)
+            .map(|_| JsValue::String(one_mib_string.clone()))
+            .collect();
+        match encode_native_call(1, &args) {
+            Err(ProtocolError::NativeCallPayloadTooLarge { size, max }) => {
+                assert!(size > MAX_FRAME_PAYLOAD_CHILD_TO_PARENT);
+                assert_eq!(max, MAX_FRAME_PAYLOAD_CHILD_TO_PARENT);
+            }
+            other => panic!("expected NativeCallPayloadTooLarge, got {other:?}"),
+        }
+    }
+
+    /// JS-1・Issue #511・OWASP A04: `argc` が `MAX_NATIVE_CALL_ARGS` を
+    /// 超えると主張するフレームは、実際には確保する前に `Err` を返すこと。
+    /// `argc = u32::MAX` を主張しつつ本体を一切持たないペイロードで検証する
+    /// （実装が誤って `Vec::with_capacity(u32::MAX)` を呼べば OOM で abort
+    /// するため、正常終了すること自体が「確保前に検証した」ことの証拠になる）。
+    #[test]
+    fn js_1_decode_native_call_rejects_oversized_argc_before_allocating() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes()); // id
+        payload.extend_from_slice(&u32::MAX.to_le_bytes()); // argc（主張のみ）
+        match decode_native_call(&payload) {
+            Err(ProtocolError::TooManyNativeCallArgs { count, max }) => {
+                assert_eq!(count, u32::MAX as usize);
+                assert_eq!(max, MAX_NATIVE_CALL_ARGS);
+            }
+            other => panic!("expected TooManyNativeCallArgs, got: {other:?}"),
+        }
+    }
+
+    /// JS-1・Issue #511: 末尾に余分なバイトが付いた `NativeCall` ペイロードは
+    /// `Err(TrailingBytes)` を返すこと。
+    #[test]
+    fn js_1_decode_native_call_rejects_trailing_bytes() {
+        let mut payload = encode_native_call(1, &[JsValue::Bool(true)]).expect("encode");
+        payload.push(0xff);
+        assert!(matches!(
+            decode_native_call(&payload),
+            Err(ProtocolError::TrailingBytes { .. })
+        ));
+    }
+
+    /// JS-1・Issue #511: 引数列が途中で切り詰められた `NativeCall` ペイロードは
+    /// `Err(Truncated)` を返すこと（添字アクセスで panic しないことの確認）。
+    #[test]
+    fn js_1_decode_native_call_rejects_truncated_args() {
+        let mut payload = encode_native_call(1, &[JsValue::Number(1.0)]).expect("encode");
+        payload.truncate(payload.len() - 1);
+        assert!(matches!(
+            decode_native_call(&payload),
+            Err(ProtocolError::Truncated)
+        ));
+    }
+
+    /// JS-1・Issue #511: `NativeReturn::Ok`/`Err` の往復（マルチバイトの
+    /// エラーメッセージを含む）。
+    #[test]
+    fn js_1_native_return_round_trip() {
+        let ok = NativeReturn::Ok(JsValue::String("結果".to_string()));
+        let encoded = encode_native_return(&ok).expect("encode must succeed");
+        assert_eq!(decode_native_return(&encoded).expect("decode"), ok);
+
+        let err = NativeReturn::Err("エラーが発生しました".to_string());
+        let encoded = encode_native_return(&err).expect("encode must succeed");
+        assert_eq!(decode_native_return(&encoded).expect("decode"), err);
+    }
+
+    /// JS-1・Issue #511: `decode_native_return` の拒否ケース（未知の
+    /// status・Ok の末尾に余分なバイト・不正な UTF-8・上限を超える
+    /// メッセージ・空のペイロード）。
+    #[test]
+    fn js_1_decode_native_return_rejects_invalid_payloads() {
+        assert!(matches!(
+            decode_native_return(&[9]),
+            Err(ProtocolError::InvalidNativeReturnStatus(9))
+        ));
+        assert!(matches!(
+            decode_native_return(&[]),
+            Err(ProtocolError::Truncated)
+        ));
+
+        let mut ok_with_trailing =
+            encode_native_return(&NativeReturn::Ok(JsValue::Bool(true))).expect("encode");
+        ok_with_trailing.push(0xff);
+        assert!(matches!(
+            decode_native_return(&ok_with_trailing),
+            Err(ProtocolError::TrailingBytes { .. })
+        ));
+
+        let mut invalid_utf8 = vec![1u8];
+        invalid_utf8.extend_from_slice(&[0xff, 0xfe]);
+        assert!(matches!(
+            decode_native_return(&invalid_utf8),
+            Err(ProtocolError::InvalidUtf8)
+        ));
+
+        let mut too_long = vec![1u8];
+        too_long.extend(std::iter::repeat_n(b'a', MAX_ERROR_MESSAGE_BYTES + 1));
+        assert!(matches!(
+            decode_native_return(&too_long),
+            Err(ProtocolError::ErrorMessageTooLong { .. })
+        ));
     }
 
     /// JS-1: エラーメッセージのペイロード上限が 4 KiB であること（設計書
