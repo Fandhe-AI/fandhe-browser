@@ -169,6 +169,65 @@ fn task_91_1_load_rejects_root_normalizing_to_config_dir() {
     ));
 }
 
+/// TASK-91（91.1）・PROF-6: 設定ファイルの親ディレクトリ配下を指す絶対
+/// `root` は受理される（`task_91_1_absolute_root_is_used_as_is` の境界検証
+/// 追加後の回帰防止。Issue #538 P0 レビュー指摘対応）。
+#[test]
+fn task_91_1_absolute_root_under_config_dir_is_accepted() {
+    let dir = TempDir::new();
+    let absolute_root = dir.path().join("nested").join("profiles");
+    let toml_source = format!("[profile]\nroot = {absolute_root:?}\n");
+    let config_path = dir.write_config(&toml_source);
+
+    let config = Config::load(&config_path).expect("設定ファイルの配下を指す絶対パスは受理される");
+
+    assert_eq!(config.profile().root(), Some(absolute_root.as_path()));
+}
+
+/// TASK-91（91.1）・PROF-6: 設定ファイルのディレクトリ**外**を指す絶対 `root`
+/// は拒否される（Issue #538 P0 レビュー指摘: `resolves_to_zero_depth`
+/// 相当の検証は絶対パスを対象外にしていたため、`root = "/任意の既存
+/// ディレクトリ"` が受理されてしまっていた）。
+#[test]
+fn task_91_1_absolute_root_outside_config_dir_is_rejected() {
+    let dir = TempDir::new();
+    let outside = TempDir::new();
+    let toml_source = format!("[profile]\nroot = {:?}\n", outside.path());
+    let config_path = dir.write_config(&toml_source);
+
+    let err = Config::load(&config_path)
+        .expect_err("設定ファイルのディレクトリ外を指す絶対パスは拒否される");
+
+    assert!(matches!(
+        err,
+        Error::Config(ConfigError::InvalidValue {
+            key: "profile.root",
+            ..
+        })
+    ));
+}
+
+/// TASK-91（91.1）・PROF-6: 絶対 `root` が設定ファイルのディレクトリ自体と
+/// 完全一致する場合も拒否される（`root = "."` の相対版に相当する絶対パスの
+/// 抜け穴。Issue #538 P0 レビュー指摘対応）。
+#[test]
+fn task_91_1_absolute_root_equal_to_config_dir_is_rejected() {
+    let dir = TempDir::new();
+    let toml_source = format!("[profile]\nroot = {:?}\n", dir.path());
+    let config_path = dir.write_config(&toml_source);
+
+    let err = Config::load(&config_path)
+        .expect_err("設定ファイル自身のディレクトリを指す絶対パスは拒否される");
+
+    assert!(matches!(
+        err,
+        Error::Config(ConfigError::InvalidValue {
+            key: "profile.root",
+            ..
+        })
+    ));
+}
+
 /// TASK-91（91.1）: 非 UTF-8 バイト列は `InvalidUtf8` になる。
 #[test]
 fn task_91_1_non_utf8_file_is_invalid_utf8_error() {

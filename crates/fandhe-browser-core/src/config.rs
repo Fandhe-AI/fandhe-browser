@@ -42,9 +42,28 @@
 //! `Path::join` のみで組み立てる（coding-rust.md クロスプラットフォーム）。
 //! [`Config::load`] は `root` が相対パスの場合、設定ファイルの**親ディレクトリ**
 //! を基準に解決する（CWD 依存を避けるため）。`~` 展開・環境変数展開は行わない。
-//! パストラバーサル・symlink 検証はここでは行わず、
-//! `fandhe-browser-profile::Profile::open`（TASK-50・#177 のハンドル基準検証）
-//! に委ねる（二重実装しない）。
+//!
+//! `profile.root` は設定ファイルの親ディレクトリ配下に限定する（Issue #538 P0
+//! レビュー指摘: `fandhe-browser-profile::Profile::open` は渡された `root` の
+//! 許容範囲を検証せず、そのまま権限変更・ロックファイル作成・子ディレクトリ
+//! 作成を行う契約であり〔`Profile::open` の doc 参照〕、字句上の脱出防止を
+//! 同関数へ委ねる従来の想定は誤りだった）。検証は 2 段構成で、いずれも
+//! 副作用が起きる前（[`Config::load`] が `Config` を返すより前）に行う。
+//!
+//! 1. 相対パスの字句上の脱出（`..`・`profiles/..`・`.` 等、途中で深さが
+//!    負になる場合も含む）を [`ProfileConfig::from_raw`]（文字列のみを扱う
+//!    [`Config::from_toml_str`] からも呼ばれるため、ファイルパスなしで判定
+//!    できる範囲に限る）で拒否する
+//! 2. 絶対パスを設定ファイルの親ディレクトリ配下に限定する検証を
+//!    [`Config::load`] で行う（ファイルパスを知っているのは `load` のみの
+//!    ため。字句正規化〔`..`・`.` の畳み込み〕はするが `canonicalize`・
+//!    `exists` は呼ばずファイルシステムには触れない）
+//!
+//! symlink に対する防御はこの層では行わず、
+//! `fandhe-browser-profile::Profile::open`（TASK-50・#177）が担うハンドル
+//! 基準（`openat` + `NOFOLLOW`）の走査に委ねる（二重実装しない）。つまり
+//! 「許容範囲内かどうか」は config クレートが、「範囲内の各要素が symlink
+//! でないか」は profile クレートが受け持つ、という役割分担になる。
 //!
 //! # リソース上限
 //!
@@ -129,12 +148,47 @@ impl Config {
 
         if let Some(root) = config.profile.root.take() {
             let resolved = if root.is_absolute() {
+                // 絶対パスは設定ファイルの親ディレクトリ配下に限定する
+                // （Issue #538 P0 レビュー指摘）。`ProfileConfig::from_raw` の
+                // 字句判定（`resolves_outside_or_at_base_dir`）は絶対パスを
+                // 対象外にしているため、ファイルパスを知っている本関数でのみ
+                // 検証できる。`Profile::open` へ渡す前（副作用の前）に拒否する。
+                let base_dir = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                let base_abs = std::path::absolute(base_dir).map_err(|source| {
+                    Error::from(ConfigError::Io {
+                        message: format!(
+                            "failed to resolve config directory {}: {source}",
+                            base_dir.display()
+                        ),
+                    })
+                })?;
+                let base_abs = normalize_lexically(&base_abs);
+                let root_abs = normalize_lexically(&root);
+
+                if !is_lexically_within(&base_abs, &root_abs) {
+                    return Err(Error::from(ConfigError::InvalidValue {
+                        key: "profile.root",
+                        message: format!(
+                            "profile.root {:?} must resolve to a location under the \
+                             config file's directory ({})",
+                            truncate_for_message(&root.display().to_string()),
+                            base_abs.display()
+                        ),
+                    }));
+                }
+
                 root
             } else {
                 // 設定ファイルの親ディレクトリ基準で解決する（CWD 非依存）。
                 // `path` がファイル名のみ（親コンポーネントなし）の場合、
                 // `parent()` は `Some("")` を返しうるため `join` にそのまま
-                // 委ね、空パス相対（= CWD 相対）として扱う。
+                // 委ね、空パス相対（= CWD 相対）として扱う。相対パスの
+                // 字句上の脱出は `ProfileConfig::from_raw` が既に拒否済み
+                // のため、ここで組み立てた結果は常に設定ファイルの親
+                // ディレクトリ配下に収まる。
                 path.parent().unwrap_or_else(|| Path::new("")).join(&root)
             };
             config.profile.root = Some(resolved);
@@ -187,21 +241,25 @@ impl ProfileConfig {
                 let candidate = PathBuf::from(&root);
                 // `Config::load` は相対パスを設定ファイルの親ディレクトリへ
                 // `Path::join` する（正規化しない）。ここで字句上
-                // （ファイルシステムに触れず）正規化した結果が「移動なし」
-                // （深さ 0）になる値（`.`・`profiles/..` 等）は、結合後の実体が
-                // 設定ファイルの親ディレクトリ自体を指す。`Profile::open`
-                // （TASK-50・#177）はそのディレクトリの権限変更・子ディレクトリ
-                // 作成・ロック取得を行う契約のため、設定ファイルを置いた
-                // ディレクトリへの意図しない副作用を防ぐためここで拒否する
-                // （security.md「不安全な設計」・プロファイル境界。上位への
-                // 脱出（`..` 等）自体の検証は二重実装せず `Profile::open` の
-                // ハンドル基準検証に委ねる。モジュール doc「パス解決」参照）。
-                if resolves_to_zero_depth(&candidate) {
+                // （ファイルシステムに触れず）正規化した結果、設定ファイルの
+                // 親ディレクトリ自体を指す（深さ 0。`.`・`profiles/..` 等）か、
+                // それより上位へ脱出する（深さが負になる。`..`・`a/../..` 等）
+                // 値は拒否する（Issue #538: 当初は上位への脱出自体の検証を
+                // 二重実装せず `Profile::open` のハンドル基準検証に委ねる
+                // 想定だったが、`Profile::open` は `root` の許容範囲を検証
+                // しない契約〔同関数の doc 参照〕であるため、ここで拒否しないと
+                // 検証されないまま `Profile::open` の副作用（権限変更・子
+                // ディレクトリ作成・ロック取得）に渡ってしまう。security.md
+                // 「不安全な設計」・プロファイル境界。絶対パスの限定は
+                // ファイルパスを知っている `Config::load` 側で行う。モジュール
+                // doc「パス解決」参照）。
+                if resolves_outside_or_at_base_dir(&candidate) {
                     return Err(Error::from(ConfigError::InvalidValue {
                         key: "profile.root",
                         message: format!(
                             "profile.root {:?} must not resolve to the config file's own \
-                             directory (e.g. \".\" or \"profiles/..\")",
+                             directory or an ancestor of it (e.g. \".\", \"profiles/..\", \
+                             or \"..\")",
                             truncate_for_message(&root)
                         ),
                     }));
@@ -272,15 +330,17 @@ impl IsolationStrength {
 }
 
 /// `path` が字句上（ファイルシステムへ触れずコンポーネント解析のみで）
-/// 「移動なし」（深さ 0）に正規化されるかを判定する。
+/// 基準ディレクトリ自体（深さ 0）、またはそれより上位（深さが途中で負に
+/// なる）に正規化されるかを判定する（Issue #538 P0 レビュー指摘対応）。
 ///
 /// `.`（`CurDir` のみ）や `profiles/..`（`Normal` 1 個と `ParentDir` 1 個が
-/// 相殺）のように、結合先の基準ディレクトリそのものを指す値を検出するために
-/// `ProfileConfig::from_raw` から呼ばれる。絶対パス（`RootDir`/`Prefix` を含む）
-/// は対象外として `false` を返す。基準より上位へ脱出するパス（例: `".."`　や
-/// `"a/../.."`）も `false` を返す（脱出自体の妥当性検証はここで二重実装せず
-/// `Profile::open` のハンドル基準検証に委ねる。モジュール doc「パス解決」参照）。
-fn resolves_to_zero_depth(path: &Path) -> bool {
+/// 相殺）のように基準ディレクトリそのものを指す値、および `".."`・
+/// `"a/../.."` のように基準ディレクトリより上位へ脱出する値の両方を検出する
+/// ために `ProfileConfig::from_raw` から呼ばれる。絶対パス（`RootDir`/
+/// `Prefix` を含む）は対象外として `false` を返す（このパスパターンには
+/// 「基準ディレクトリ相対の深さ」という概念が適用できないため。絶対パスの
+/// 限定は `Config::load` が別途行う。モジュール doc「パス解決」参照）。
+fn resolves_outside_or_at_base_dir(path: &Path) -> bool {
     use std::path::Component;
 
     let mut depth: i64 = 0;
@@ -292,10 +352,72 @@ fn resolves_to_zero_depth(path: &Path) -> bool {
             Component::RootDir | Component::Prefix(_) => return false,
         }
         if depth < 0 {
-            return false;
+            return true;
         }
     }
-    depth == 0
+    depth <= 0
+}
+
+/// パスをファイルシステムへ一切触れずに字句正規化する（`.` を除去し、
+/// `..` を直前の `Normal` 要素と相殺する）。
+///
+/// [`Config::load`] が絶対 `root` を設定ファイルの親ディレクトリ配下に
+/// 限定する検証（Issue #538 P0 レビュー指摘）の前処理として使う。
+/// `std::path::absolute`（呼び出し元が事前に適用する）は絶対パスをそのまま
+/// 返すだけで `..`/`.` を畳み込まないため、比較の前に本関数で正規化する。
+/// ルート（`RootDir`/`Prefix`）より上位へ脱出する `..` は、実際の OS の
+/// パス解決と同様にルート自身へ留める（捨てる）。`canonicalize`・`exists`
+/// は呼ばない（symlink 解決は `fandhe-browser-profile::Profile::open` に
+/// 委ねる。モジュール doc「パス解決」参照）。
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match result.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    result.pop();
+                }
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {
+                    // ルートより上位へは脱出しない（OS のパス解決と同様に
+                    // ルート自身に留める）。
+                }
+                _ => {
+                    result.push("..");
+                }
+            },
+            other => result.push(other.as_os_str()),
+        }
+    }
+    result
+}
+
+/// `candidate`（字句正規化済みの絶対パス）が `base`（同じく字句正規化済みの
+/// 絶対パス）の配下（`base` 自身は含まない）にあるかを字句上で判定する。
+///
+/// [`Config::load`] が絶対 `root` を設定ファイルの親ディレクトリ配下に
+/// 限定する検証（Issue #538 P0 レビュー指摘）で使う。
+/// `fandhe-browser-profile::assert_within_root` と同じ判定方針（`base` 自身
+/// は許可しない・残りのコンポーネントがすべて `Normal` であること）だが、
+/// crate 間の依存方向（core は profile に依存してよいが、本チェックは
+/// 単純な字句比較のみで新規依存を要しないため導入しない。coding-rust.md
+/// 「crate 構成と境界」）に配慮し、config crate 内で完結させる。大文字小文字を
+/// 区別しない OS では、大文字小文字だけが異なるパスを「範囲外」と判定し得る
+/// （拒否側に倒れるため安全側の制約。coding-rust.md「クロスプラットフォーム」）。
+fn is_lexically_within(base: &Path, candidate: &Path) -> bool {
+    use std::path::Component;
+
+    let Ok(rest) = candidate.strip_prefix(base) else {
+        return false;
+    };
+
+    let mut components = rest.components().peekable();
+    if components.peek().is_none() {
+        return false;
+    }
+    components.all(|component| matches!(component, Component::Normal(_)))
 }
 
 /// エラーメッセージへ反響する外部入力由来の文字列を切り詰める
@@ -552,15 +674,36 @@ mod tests {
         ));
     }
 
-    /// TASK-91（91.1）: 基準より上位へ脱出するだけの値（`".."`）は、この層
-    /// では「設定ファイルのディレクトリ自体」には該当しないため拒否しない
-    /// （脱出自体の検証は `Profile::open` に委ねる方針。モジュール doc
-    /// 「パス解決」参照）。
+    /// TASK-91（91.1）・PROF-6: 基準より上位へ脱出する値（`".."`）は拒否
+    /// される（Issue #538 P0 レビュー指摘の回帰防止。当初は `Profile::open`
+    /// への委譲を想定していたが、同関数は `root` の許容範囲を検証しない
+    /// 契約のためここで拒否する）。
     #[test]
-    fn task_91_1_root_parent_traversal_is_not_rejected_here() {
-        let config = Config::from_toml_str("[profile]\nroot = '..'\n")
-            .expect("\"..\" 自体はこの層では拒否しない");
-        assert_eq!(config.profile().root(), Some(Path::new("..")));
+    fn task_91_1_root_parent_traversal_is_rejected() {
+        let err = Config::from_toml_str("[profile]\nroot = '..'\n")
+            .expect_err("\"..\" は基準ディレクトリより上位へ脱出するため拒否される");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::InvalidValue {
+                key: "profile.root",
+                ..
+            })
+        ));
+    }
+
+    /// TASK-91（91.1）・PROF-6: 途中で深さが負になる値（`"a/../.."`）も
+    /// 拒否される（Issue #538 P0 レビュー指摘の回帰防止）。
+    #[test]
+    fn task_91_1_root_negative_depth_midway_is_rejected() {
+        let err = Config::from_toml_str("[profile]\nroot = 'a/../..'\n")
+            .expect_err("\"a/../..\" は途中で基準より上位へ脱出するため拒否される");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::InvalidValue {
+                key: "profile.root",
+                ..
+            })
+        ));
     }
 
     /// TASK-91（91.1）: 通常の相対パス（`profiles/default`）は引き続き
