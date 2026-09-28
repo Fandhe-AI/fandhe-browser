@@ -200,8 +200,8 @@ jobs:
   # --------------------------------------------------
   # render-isolation（既定ビルドの依存グラフに Servo 系クレートが混入していないことの検証）
   # --------------------------------------------------
-  # TASK-34.1（Issue #465・RENDER-1・MS-1）: `make check-render-isolation`
-  # （Makefile L285 付近）はこれまで CI から未実行のローカル専用ゲートだった。
+  # TASK-34.1（Issue #465・RENDER-1・MS-1）: `make check-render-isolation` は
+  # これまで CI から未実行のローカル専用ゲートだった。
   # 判定ロジックの正本 scripts/check-render-isolation.sh（Makefile と共有）を
   # ここで直接実行し、PR で Servo 系が既定ビルドの依存グラフへ混入したら
   # fail-closed で検出する。

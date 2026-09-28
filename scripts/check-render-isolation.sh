@@ -109,7 +109,12 @@ WORKSPACE_MEMBERS="$(find crates -mindepth 2 -maxdepth 2 -name 'Cargo.toml' -not
 if [ -z "$WORKSPACE_MEMBERS" ]; then
   notice "skip: fandhe-browser-render 以外の member crate が無いため workspace 検査をスキップ"
 else
-  if ! OUT_A=$(cargo tree --workspace -e normal,build,dev --exclude fandhe-browser-render "${CARGO_TREE_LOCKED_ARGS[@]}" 2>/dev/null); then
+  # 標準出力だけを判定対象にし、標準エラーはそのまま通す（2>&1 で合流させない）。
+  # fandhe-browser-render が未作成の段階では「excluded package(s) ... not found」
+  # の警告が標準エラーへ出るのみで終了コードは 0・標準出力には現れないため
+  # （Makefile 旧実装からの継承挙動）、素通しすることで cargo tree 自体の失敗
+  # 原因（--locked のロック不整合等）もログから読み取れるようにする。
+  if ! OUT_A=$(cargo tree --workspace -e normal,build,dev --exclude fandhe-browser-render "${CARGO_TREE_LOCKED_ARGS[@]+"${CARGO_TREE_LOCKED_ARGS[@]}"}"); then
     echo "NG: cargo tree（workspace）の実行に失敗しました" >&2
     STATUS=1
   else
@@ -121,7 +126,7 @@ fi
 if [ ! -f crates/fandhe-browser-cli/Cargo.toml ]; then
   notice "skip: crates/fandhe-browser-cli/Cargo.toml が未追加のため cli 既定 feature 検査をスキップ（#174 完了後に自動で有効化）"
 else
-  if ! OUT_B=$(cargo tree -p fandhe-browser-cli -e normal,build,dev "${CARGO_TREE_LOCKED_ARGS[@]}" 2>/dev/null); then
+  if ! OUT_B=$(cargo tree -p fandhe-browser-cli -e normal,build,dev "${CARGO_TREE_LOCKED_ARGS[@]+"${CARGO_TREE_LOCKED_ARGS[@]}"}"); then
     echo "NG: cargo tree（fandhe-browser-cli）の実行に失敗しました" >&2
     STATUS=1
   else
