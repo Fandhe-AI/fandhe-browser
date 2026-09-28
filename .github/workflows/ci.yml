@@ -425,11 +425,17 @@ jobs:
           bash harness/binary-size/check-binary-size.sh \
             --package "$BINARY_SIZE_PACKAGE" \
             --limit "$BINARY_SIZE_LIMIT_BYTES" | tee "$out" || status=$?
+          # "::notice::" 等のワークフローコマンドはステップの stdout/stderr からのみ
+          # 解釈され、$GITHUB_STEP_SUMMARY へのリダイレクト内では単なる markdown
+          # テキストとして扱われ発火しない。そのため notice の echo はサマリー用の
+          # ブレースグループの外（本来の stdout）に出す（Issue #467 レビュー指摘）。
+          if grep -q '^skip:' "$out"; then
+            echo "::notice::binary-size: fandhe-browser-cli crate not yet added to workspace (#174) — gate is dormant"
+          fi
           {
             echo "### Binary size ($RUNNER_OS)"
             echo
             if grep -q '^skip:' "$out"; then
-              echo "::notice::binary-size: fandhe-browser-cli crate not yet added to workspace (#174) — gate is dormant"
               echo "skip: fandhe-browser-cli crate 未追加（#174）のため判定を skip した"
             elif grep -q '^binary-size:' "$out"; then
               echo "| host | package | bin | bytes | limit | result |"
