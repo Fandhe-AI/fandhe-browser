@@ -44,14 +44,49 @@
 //! | 応答前に EOF になり、stderr に `Fatal ... out of memory` がある | [`JsEngineError::ResourceLimitExceeded`] | 破棄（ヒューリスティック） |
 //! | メモリ監視スレッドが RSS 超過を検出して子を `kill` した（評価中・書き込み中・待機中いずれも） | [`JsEngineError::ResourceLimitExceeded`] | 破棄（メッセージに実測 RSS を明示。書き込み中に `kill` された場合の broken pipe も正しくここへ分類する。`discard_context_error`。codex・Bugbot レビュー指摘 #503 P0/P1 対応） |
 //! | 応答（Result/Error）受信直後の同期確認で RSS 超過が判明した | [`JsEngineError::ResourceLimitExceeded`] | 破棄（せっかく得られた応答を握りつぶす。同上） |
+//! | 子から不正な `NativeCall` フレームを受け取った（デコード失敗・未登録 id） | [`JsEngineError::EngineUnavailable`] | 破棄（`dispatch_native_call`・`TASK-29`・Issue #526） |
+//! | `NativeFn` の実行終了後、評価開始時の期限を過ぎていた | [`JsEngineError::Timeout`] | 破棄（`NativeReturn` を送らずに `kill` する。`TASK-29`・Issue #526） |
 //! | それ以外の異常終了・プロトコル違反・起動失敗 | [`JsEngineError::EngineUnavailable`] | 破棄 |
 //!
 //! Context が破棄される場合、メッセージに "context was discarded" を
 //! 含める（security.md「偽装・回避機能の禁止」──状態が失われたことを
 //! 隠さない）。
 //!
+//! # 親側 `NativeCall` dispatch（`TASK-29`・Issue #526）
+//!
+//! 子から `NATIVE_CALL`（[`worker_protocol::tag::NATIVE_CALL`]）フレームが
+//! 届くと、[`V8ProcessEngine::native_fns`] に登録済みの [`NativeFn`] を
+//! 実行し、結果を `NATIVE_RETURN` フレームとして送り返す（[`dispatch_native_call`]
+//! ・[`V8ProcessEngine::send_evaluate_and_await`]）。本番の登録 API（親→子の
+//! 登録フレームを含む）は別 Issue（#155）が担い、本 Issue の時点ではテスト
+//! 専用の登録経路（[`V8ProcessEngine::register_native_function_for_test`]。
+//! feature `test-support` 限定）だけを提供する。子の再起動時の再登録は
+//! 別 Issue（#527）。
+//!
+//! `NativeFn` の実行時間は、評価開始時に 1 度だけ計算する期限
+//! （[`EVALUATE_RECV_TIMEOUT`]）に含まれる（受け入れ条件: `NativeFn` が
+//! 実行に長くかかるほど、全体の評価がその期限に近づく）。親は
+//! `NativeFn` の呼び出し中は他に何もできない（同期実行。`NativeFn` は
+//! `Send` ではないため別スレッドへ移せない）ため、期限の確認ができるのは
+//! `NativeFn` から戻った直後だけである。戻った時点で既に期限を過ぎていれば、
+//! `NATIVE_RETURN` を送らずに子を `kill` し `JsEngineError::Timeout` を返す
+//! （`NativeFn` の実行が 2 秒（[`super::v8_engine::SCRIPT_EXECUTION_TIMEOUT`]）
+//! 以上 3 秒（[`EVALUATE_RECV_TIMEOUT`]）未満であれば、返信を受けた子の
+//! watchdog が先に発火し `Error{kind=Timeout}` を返す。3 秒以上であれば
+//! 親の期限が先に `kill` する）。
+//!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
+//! - 親は実行中の [`NativeFn`] を中断できない（呼び出しスレッド上で同期
+//!   実行するため。`NativeFn` が戻らなければ `evaluate_script` も戻らない。
+//!   `TASK-29`・Issue #526）
+//! - release ビルドは `panic = "abort"` のため、[`NativeFn`] が panic すると
+//!   ホストプロセスごと終了する。`catch_unwind` は使わない（release では
+//!   機能しない前提のため）。panic させないのは `NativeFn` を実装する
+//!   呼び出し元の責務である
+//! - [`NativeFn`] へ渡す引数は子から届く値（JS 由来）であり、untrusted な
+//!   入力として検証するのは `NativeFn` を実装する側の責務である
+//!   （`engine_trait.rs` の [`NativeFn`] ドキュメントコメント参照）
 //! - ヒープ外メモリ（`ArrayBuffer` の backing store 等）には
 //!   `super::resource_limits` が子側の OS 別強制（Linux の
 //!   `RLIMIT_DATA`・Windows の Job Object working set 上限）と親側の
@@ -93,8 +128,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::engine_trait::{EngineKind, EvaluateOptions, JsEngineError, JsValue};
-use super::worker_protocol::{self, ErrorKind, tag};
+use super::engine_trait::{EngineKind, EvaluateOptions, JsEngineError, JsValue, NativeFn};
+use super::worker_protocol::{self, ErrorKind, NativeReturn, tag};
 
 /// ハンドシェイク（`Hello` フレームの受信）を待つ上限時間（設計書
 /// §3.1「5 秒でタイムアウト」）。
@@ -112,6 +147,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 時間の両方をこの 1 つの期限で管理する（`send_evaluate_and_await` が
 /// 評価開始時に 1 度だけ期限を計算し、書き込み待ち・応答待ちの両方で
 /// 「残り時間」を使い回す）。
+///
+/// `NativeCall` の往復（`TASK-29`・Issue #526）もこの期限に含まれる:
+/// `NativeFn` の実行時間・`NATIVE_RETURN` の書き込み待ちのいずれも、この
+/// 1 つの期限を使い回す（`dispatch_native_call`・[`write_frame_with_deadline`]
+/// のドキュメントコメント参照。期限を延長する経路は無い）。
 const EVALUATE_RECV_TIMEOUT: Duration =
     super::v8_engine::SCRIPT_EXECUTION_TIMEOUT.saturating_add(Duration::from_secs(1));
 
@@ -130,6 +170,26 @@ const REAP_WAIT_TIMEOUT: Duration = GRACEFUL_SHUTDOWN_TIMEOUT;
 
 /// stderr の末尾を保持するバイト数（設計書 §3.5「stderr: 末尾 16 KiB」）。
 const STDERR_TAIL_CAPACITY_BYTES: usize = 16 * 1024;
+
+/// [`V8ProcessEngine::native_fns`] に登録できる [`NativeFn`] の最大件数
+/// （`TASK-29`・Issue #526）。
+///
+/// 登録 id は `Vec` の添字（`u32`）であり、外部から任意の件数を要求
+/// できる経路ではない（現時点で唯一の登録経路は
+/// [`V8ProcessEngine::register_native_function_for_test`]。feature
+/// `test-support` 限定）が、本番の登録 API（#155）が親→子の登録フレームを
+/// 経由するようになった際に無制限確保の経路にならないよう、先に上限を
+/// 設けておく（coding-rust.md「長さ・件数を上限検証してからアロケーション
+/// に使う」）。`print`・`dom.setText` 等（PoC-3 相当）のグローバル関数
+/// 注入・DOM 風バインディングの用途には十分な値として選んだ
+/// （[`worker_protocol::MAX_NATIVE_CALL_ARGS`] と同じ考え方）。
+///
+/// 現時点で登録経路は
+/// [`V8ProcessEngine::register_native_function_for_test`]（feature
+/// `test-support` 限定）のみのため、本番のみ（`test-support` 無効）の
+/// ビルドでは未使用になる。
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+const MAX_NATIVE_FUNCTIONS: usize = 1024;
 
 /// reader スレッドが評価呼び出し側へ届けるイベント。
 enum ReaderEvent {
@@ -841,6 +901,21 @@ mod spawn_config {
         /// 指定しても、`spawn_worker` が `MemoryMonitor` を起動する直前に
         /// `min(要求値, MAX_CHILD_RSS_BYTES)` へクランプする。
         pub rss_threshold_bytes_override: Option<u64>,
+        /// 子の起動直後（Hello を送る前）に事前登録させる逆方向 RPC
+        /// プロキシの一覧（`name`・`id` の組。`TASK-29`・Issue #526）。
+        /// 空なら何もしない（本番の `new()` は常に空のため、本番の子には
+        /// 影響しない）。
+        ///
+        /// 受け入れ条件 2（親側の `NativeCall` dispatch が子の watchdog に
+        /// 含まれること）は、プロキシを登録した**実際の子プロセス**で
+        /// しか検証できない。本番の登録フレーム（#155）が実装されるまでの
+        /// 代替経路として、`spawn_worker` がこの一覧を
+        /// `super::worker::TEST_NATIVE_PROXIES_ENV_VAR` へ組み立てて渡す
+        /// （空なら環境変数自体を渡さない。空かどうかの確認自体は feature
+        /// の有無に関わらず行い、環境変数名への参照だけを
+        /// `#[cfg(feature = "test-support")]` で個別に gate する。
+        /// `heap_limit_bytes` 等、他のフィールドと同じ作法）。
+        pub native_proxies_for_test: Vec<(String, u32)>,
     }
 }
 
@@ -858,8 +933,12 @@ use spawn_config::WorkerSpawnConfigForTest;
 
 /// JS 評価を子プロセスへ分離して提供するエンジン（`JS-1`・Issue #503）。
 ///
-/// 子・パイプしか保持しないため `Send` にできる（設計書 §3.2。将来
-/// core・tokio と統合するときに有利になる）。
+/// **`!Send` である**（`TASK-29`・Issue #526。以前のドキュメントコメントは
+/// 「子・パイプしか保持しないため `Send` にできる」としていたが、
+/// [`native_fns`](Self::native_fns) に保持する [`NativeFn`] が `Send` では
+/// ない（`engine_trait.rs` の [`NativeFn`] ドキュメントコメント参照。V8 の
+/// `Isolate` がスレッド固有であることに合わせた設計）ため、これを保持する
+/// 本構造体自体も `Send` にはできない）。
 ///
 /// `#[doc(hidden)] pub` である理由: `tests/v8_worker.rs`（結合テスト。
 /// 別クレートとしてコンパイルされる）が feature `test-support` 有効時に
@@ -874,6 +953,20 @@ use spawn_config::WorkerSpawnConfigForTest;
 pub struct V8ProcessEngine {
     worker: Option<WorkerHandle>,
     spawn_config: WorkerSpawnConfigForTest,
+    /// 親側の `NativeCall` dispatch が実行する [`NativeFn`] の登録一覧
+    /// （`TASK-29`・Issue #526）。登録 id は本 `Vec` の添字（`u32` へ変換
+    /// して使う）であり、子から届く `NativeCall` フレームの `id` と対応
+    /// づける（[`dispatch_native_call`] 参照）。[`MAX_NATIVE_FUNCTIONS`]
+    /// を超えて登録することはできない
+    /// （[`register_native_function_for_test`](Self::register_native_function_for_test)
+    /// が検証する）。
+    ///
+    /// 本番の登録 API（親→子の登録フレームを含む）は別 Issue（#155）で
+    /// 追加する。それまでは
+    /// [`register_native_function_for_test`](Self::register_native_function_for_test)
+    /// （feature `test-support` 限定）だけが登録経路であり、本番の
+    /// `new()` では常に空のままである。
+    native_fns: Vec<NativeFn>,
 }
 
 impl V8ProcessEngine {
@@ -886,6 +979,7 @@ impl V8ProcessEngine {
         Self {
             worker: None,
             spawn_config: WorkerSpawnConfigForTest::default(),
+            native_fns: Vec::new(),
         }
     }
 
@@ -898,7 +992,40 @@ impl V8ProcessEngine {
         Self {
             worker: None,
             spawn_config,
+            native_fns: Vec::new(),
         }
+    }
+
+    /// テスト専用: [`NativeFn`] を登録し、割り当てた id を返す（`TASK-29`・
+    /// Issue #526）。
+    ///
+    /// 本番の登録 API（親→子の登録フレームを含む）は別 Issue（#155）で
+    /// 追加する。本メソッドはそれまでの間、結合テスト
+    /// （`tests/v8_worker.rs`）が親側の `NativeCall` dispatch
+    /// （[`dispatch_native_call`]）を検証するための唯一の登録経路であり、
+    /// `#[doc(hidden)] pub`（feature `test-support` 限定）とする。
+    ///
+    /// [`MAX_NATIVE_FUNCTIONS`] を超えて登録しようとした場合は
+    /// [`JsEngineError::BindingFailed`] を返す（確保前検証。coding-rust.md
+    /// 「長さ・件数を上限検証してからアロケーションに使う」）。
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn register_native_function_for_test(
+        &mut self,
+        func: NativeFn,
+    ) -> Result<u32, JsEngineError> {
+        if self.native_fns.len() >= MAX_NATIVE_FUNCTIONS {
+            return Err(JsEngineError::BindingFailed(format!(
+                "cannot register more than {MAX_NATIVE_FUNCTIONS} native functions"
+            )));
+        }
+        let id = u32::try_from(self.native_fns.len()).map_err(|_| {
+            JsEngineError::BindingFailed(
+                "native function registry index does not fit in a u32".to_string(),
+            )
+        })?;
+        self.native_fns.push(func);
+        Ok(id)
     }
 
     /// スクリプトを評価する（`JS-1`「スクリプト評価」）。
@@ -968,7 +1095,8 @@ impl V8ProcessEngine {
             return Err(ensure_discarded_phrase(err));
         }
 
-        let (outcome, keep_worker) = Self::send_evaluate_and_await(&mut worker, script);
+        let (outcome, keep_worker) =
+            Self::send_evaluate_and_await(&mut worker, script, &mut self.native_fns);
         if keep_worker {
             self.worker = Some(worker);
         }
@@ -1137,6 +1265,26 @@ impl V8ProcessEngine {
             // `super::worker` 側では読まず、変数の有無だけを見る。
             command.env(super::worker::TEST_HELLO_EXTRA_BYTE_ENV_VAR, "1");
         }
+        if !self.spawn_config.native_proxies_for_test.is_empty() {
+            // テスト専用（`TASK-29`・Issue #526）。本番の `new()` は常に
+            // 空のため、この環境変数は本番の子プロセスには渡らない。
+            // `TEST_NATIVE_PROXIES_ENV_VAR` 自体は feature `test-support`
+            // でのみ存在するため、参照だけをここで gate する
+            // （`native_proxies_for_test` フィールドの「空かどうか」の
+            // 確認は feature の有無に関わらず行う。空でない値を
+            // `test-support` 無効ビルドへ渡す経路は存在しない）。
+            #[cfg(feature = "test-support")]
+            {
+                let value = self
+                    .spawn_config
+                    .native_proxies_for_test
+                    .iter()
+                    .map(|(name, id)| format!("{name}={id}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                command.env(super::worker::TEST_NATIVE_PROXIES_ENV_VAR, value);
+            }
+        }
         #[cfg(windows)]
         {
             // Windows のプロセス生成に必要（`SystemRoot` が無いと子が
@@ -1220,10 +1368,10 @@ impl V8ProcessEngine {
             Ok(ReaderEvent::Frame(other_tag, _)) => {
                 // `NATIVE_CALL`（tag 5）はハンドシェイク前には来ないはず
                 // （送信は子側の永続 Context が評価中に限られる。§3.1）。
-                // 親側の `NATIVE_CALL` dispatch 自体は別 Issue（#526）で
-                // 追加するが、ハンドシェイク段階で受け取った場合はそれでも
-                // プロトコル違反として fail-closed に kill する（本分岐は
-                // #526 完了後も変わらない）。
+                // 親側の `NATIVE_CALL` dispatch（`dispatch_native_call`。
+                // `TASK-29`・Issue #526）は評価中に届いた場合の経路であり、
+                // ハンドシェイク段階で受け取った場合はプロトコル違反として
+                // fail-closed に kill する。
                 worker.terminate_now();
                 let tail = worker.reap_and_collect_stderr();
                 Err(handshake_discard_error(&worker, &tail, || {
@@ -1306,263 +1454,440 @@ impl V8ProcessEngine {
         })
     }
 
-    /// `Evaluate` フレームを送り、応答（`Result`/`Error`/異常終了）を
-    /// 待つ。戻り値の 2 つ目は「この `worker` を保持し続けてよいか」を
-    /// 表す（`false` の場合、呼び出し元が `worker` を drop し、次回は
-    /// 新しい子を起動し直す）。
+    /// `Evaluate` フレームを送り、応答（`Result`/`Error`/`NativeCall`/
+    /// 異常終了）を待つ。戻り値の 2 つ目は「この `worker` を保持し続けて
+    /// よいか」を表す（`false` の場合、呼び出し元が `worker` を drop し、
+    /// 次回は新しい子を起動し直す）。
     ///
-    /// 書き込み・応答待ちの両方を、評価開始時に 1 度だけ計算する
-    /// 期限（[`EVALUATE_RECV_TIMEOUT`]）で管理する（codex レビュー指摘
-    /// #503 P1「書き込みが呼び出しスレッドで同期的に実行され、パイプが
-    /// 満杯だと期限も kill も効かない」対応。書き込み自体は writer
+    /// 書き込み・応答待ち・`NativeCall` の往復すべてを、評価開始時に
+    /// 1 度だけ計算する期限（[`EVALUATE_RECV_TIMEOUT`]）で管理する（codex
+    /// レビュー指摘 #503 P1「書き込みが呼び出しスレッドで同期的に実行され、
+    /// パイプが満杯だと期限も kill も効かない」対応。書き込み自体は writer
     /// スレッドへ委譲し、このスレッドは `write_ack_rx` を期限付きで
-    /// 待つだけにする）。
+    /// 待つだけにする。書き込み処理は [`write_frame_with_deadline`] へ
+    /// 抽出し、`Evaluate` の送信・`NativeReturn` の返信の両方で使う）。
+    ///
+    /// `native_fns` は [`V8ProcessEngine::native_fns`] の可変借用
+    /// （`TASK-29`・Issue #526）。子から `NATIVE_CALL` フレームが届くたびに
+    /// [`dispatch_native_call`] でここから `NativeFn` を実行し、
+    /// `NATIVE_RETURN` を返信してから次のフレームを待つ（受け入れ条件 1）。
     fn send_evaluate_and_await(
         worker: &mut WorkerHandle,
         script: &str,
+        native_fns: &mut [NativeFn],
     ) -> (Result<JsValue, JsEngineError>, bool) {
         let deadline = Instant::now() + EVALUATE_RECV_TIMEOUT;
 
         let payload = worker_protocol::encode_evaluate(script);
-        let mut frame_bytes = Vec::new();
-        // インメモリの `Vec<u8>` への書き込みは実質失敗しないが、
-        // `write_frame` のシグネチャ（`impl Write`）に合わせて `Result`
-        // を扱う（`coding-rust.md`「外部入力」節。ここでの `payload` は
-        // 呼び出し元のスクリプト文字列に由来する外部入力である）。
-        if let Err(err) = worker_protocol::write_frame(&mut frame_bytes, tag::EVALUATE, &payload) {
-            return (
-                Err(JsEngineError::EngineUnavailable(format!(
-                    "failed to encode the Evaluate frame: {err}"
-                ))),
-                true,
-            );
-        }
-
-        let Some(stdin_tx) = worker.stdin_tx.as_ref() else {
-            worker.terminate_now();
-            let tail = worker.reap_and_collect_stderr();
-            let err = discard_context_error(worker, &tail, || {
-                JsEngineError::EngineUnavailable(format!(
-                    "JS worker process stdin is already closed; stderr: {tail}"
-                ))
-            });
-            return (Err(err), false);
-        };
-        if stdin_tx.send(frame_bytes).is_err() {
-            // writer スレッドが既に終了している（stdin が既に閉じている
-            // 等）。子は既に死んでいる可能性が高い。監視スレッドが RSS
-            // 超過で kill した直後（stdin 側が先に閉じる）である可能性も
-            // あるため、そちらを優先して判定する（advisor 指摘 B 対応）。
-            worker.terminate_now();
-            let tail = worker.reap_and_collect_stderr();
-            let err = discard_context_error(worker, &tail, || {
-                JsEngineError::EngineUnavailable(format!(
-                    "JS worker process writer thread is no longer running; stderr: {tail}"
-                ))
-            });
+        if let Err(err) =
+            write_frame_with_deadline(worker, tag::EVALUATE, &payload, deadline, "the script")
+        {
             return (Err(err), false);
         }
 
-        let write_wait = deadline.saturating_duration_since(Instant::now());
-        match worker.write_ack_rx.recv_timeout(write_wait) {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                // 子は既に死んでいる可能性が高い（broken pipe 等）。kill
-                // は冪等（既に終了したプロセスへの kill はエラーを返す
-                // だけで副作用は無い）ため、まず kill してから reap する
-                // （`reap_and_collect_stderr` の順序前提を満たす）。
-                //
-                // このブロークンパイプは、監視スレッドが RSS 超過を検出
-                // して子を kill した直後（子の stdin 読み取り端が閉じ、
-                // writer スレッドの書き込みが失敗する）にも起こりうる。
-                // その場合は原因を正しく `ResourceLimitExceeded` に帰属
-                // させる（advisor 指摘 B 対応。書き込み中に kill される
-                // タイミングでも `EngineUnavailable` に誤判定しない）。
-                worker.terminate_now();
-                let tail = worker.reap_and_collect_stderr();
-                let converted = discard_context_error(worker, &tail, || {
-                    JsEngineError::EngineUnavailable(format!(
-                        "failed to send the script to the JS worker process (it may have \
-                         crashed): {err}; stderr: {tail}; context was discarded"
-                    ))
-                });
-                return (Err(converted), false);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // 書き込みが期限内に終わらなかった（パイプが満杯で
-                // writer スレッドがブロックしている等。codex レビュー
-                // 指摘 #503 P1 対応）。kill すれば子の stdin 読み取り端が
-                // 消え、ブロックしていた書き込みは broken pipe で解放
-                // される（writer スレッドは `WorkerHandle::drop` で
-                // 後始末される）。監視スレッドが同じタイミングで RSS
-                // 超過を検出していた場合はそちらを優先する（Bugbot
-                // レビュー指摘 #503 対応。全経路で `discard_context_error`
-                // を通す）。
-                worker.terminate_now();
-                let tail = worker.reap_and_collect_stderr();
-                let err = discard_context_error(worker, &tail, || {
-                    JsEngineError::Timeout(format!(
-                        "sending the script to the JS worker process exceeded the deadline and \
-                         the process was killed; the next evaluation runs in a fresh context; \
-                         stderr: {tail}"
-                    ))
-                });
-                return (Err(err), false);
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                worker.terminate_now();
-                let tail = worker.reap_and_collect_stderr();
-                let err = discard_context_error(worker, &tail, || {
-                    JsEngineError::EngineUnavailable(format!(
-                        "JS worker process writer thread disconnected unexpectedly; stderr: \
-                         {tail}"
-                    ))
-                });
-                return (Err(err), false);
-            }
-        }
-
-        let recv_wait = deadline.saturating_duration_since(Instant::now());
-        match worker.frame_rx.recv_timeout(recv_wait) {
-            Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::RESULT => {
-                let (outcome, keep) = match worker_protocol::decode_js_value(&payload) {
-                    // codex レビュー指摘 #503 P1「decode_js_value が返す
-                    // 消費バイト数を捨てている」対応: `Result` フレームの
-                    // ペイロードは常にちょうど 1 つの `JsValue` でなければ
-                    // ならない契約であり（`decode_js_value` 自体は複数値の
-                    // 連結読み取りにも使える汎用関数のため、単体では
-                    // 「1 つだけ」を強制しない）、消費バイト数が
-                    // ペイロード全体の長さと一致しなければ、末尾に余分な
-                    // バイトが付いたプロトコル違反として扱う。
-                    Ok((value, consumed)) if consumed == payload.len() => (Ok(value), true),
-                    Ok((_value, consumed)) => {
+        loop {
+            let recv_wait = deadline.saturating_duration_since(Instant::now());
+            match worker.frame_rx.recv_timeout(recv_wait) {
+                Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::RESULT => {
+                    let (outcome, keep) = match worker_protocol::decode_js_value(&payload) {
+                        // codex レビュー指摘 #503 P1「decode_js_value が返す
+                        // 消費バイト数を捨てている」対応: `Result` フレームの
+                        // ペイロードは常にちょうど 1 つの `JsValue` でなければ
+                        // ならない契約であり（`decode_js_value` 自体は複数値の
+                        // 連結読み取りにも使える汎用関数のため、単体では
+                        // 「1 つだけ」を強制しない）、消費バイト数が
+                        // ペイロード全体の長さと一致しなければ、末尾に余分な
+                        // バイトが付いたプロトコル違反として扱う。
+                        Ok((value, consumed)) if consumed == payload.len() => (Ok(value), true),
+                        Ok((_value, consumed)) => {
+                            worker.terminate_now();
+                            let tail = worker.reap_and_collect_stderr();
+                            let converted = discard_context_error(worker, &tail, || {
+                                JsEngineError::EngineUnavailable(format!(
+                                    "JS worker process sent a Result frame with {} trailing \
+                                     bytes after the decoded value ({consumed} of {} bytes \
+                                     consumed); stderr: {tail}",
+                                    payload.len() - consumed,
+                                    payload.len()
+                                ))
+                            });
+                            (Err(converted), false)
+                        }
+                        Err(err) => {
+                            worker.terminate_now();
+                            let tail = worker.reap_and_collect_stderr();
+                            let converted = discard_context_error(worker, &tail, || {
+                                JsEngineError::EngineUnavailable(format!(
+                                    "JS worker process sent a malformed Result frame: {err}; \
+                                     stderr: {tail}"
+                                ))
+                            });
+                            (Err(converted), false)
+                        }
+                    };
+                    return apply_post_response_rss_check(worker, outcome, keep);
+                }
+                Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::ERROR => {
+                    let (outcome, keep) = match worker_protocol::decode_error(&payload) {
+                        // 子の watchdog による打ち切り。子プロセスは生き続け、
+                        // Context も残る（設計書 §3.3 の表の 1 行目）。
+                        Ok((ErrorKind::Timeout, message)) => (
+                            Err(JsEngineError::Timeout(format!(
+                                "script execution timed out inside the JS worker process: \
+                                 {message}"
+                            ))),
+                            true,
+                        ),
+                        Ok((ErrorKind::Evaluation, message)) => {
+                            (Err(JsEngineError::EvaluationFailed(message)), true)
+                        }
+                        Ok((ErrorKind::Binding, message)) => {
+                            (Err(JsEngineError::BindingFailed(message)), true)
+                        }
+                        Err(err) => {
+                            worker.terminate_now();
+                            let tail = worker.reap_and_collect_stderr();
+                            let converted = discard_context_error(worker, &tail, || {
+                                JsEngineError::EngineUnavailable(format!(
+                                    "JS worker process sent a malformed Error frame: {err}; \
+                                     stderr: {tail}"
+                                ))
+                            });
+                            (Err(converted), false)
+                        }
+                    };
+                    return apply_post_response_rss_check(worker, outcome, keep);
+                }
+                Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::NATIVE_CALL => {
+                    // `JS-1`・`TASK-29`・Issue #526: 子側のプロキシ関数
+                    // （`v8_engine::native_proxy_callback`）が呼ばれた。
+                    // `NativeFn` を実行し、結果を `NATIVE_RETURN` として
+                    // 返信してから次のフレームを待つ（一問一答。
+                    // `worker::StdioTransport::call` の契約と対になる）。
+                    let native_return_payload = match dispatch_native_call(native_fns, &payload) {
+                        Ok(bytes) => bytes,
+                        Err(violation) => {
+                            worker.terminate_now();
+                            let tail = worker.reap_and_collect_stderr();
+                            let err = discard_context_error(worker, &tail, || {
+                                JsEngineError::EngineUnavailable(format!(
+                                    "JS worker process sent an invalid NativeCall frame \
+                                     ({violation}); stderr: {tail}"
+                                ))
+                            });
+                            return (Err(err), false);
+                        }
+                    };
+                    // 受け入れ条件 2: `NativeFn` の実行時間もこの評価全体の
+                    // 期限に含める。`NativeFn` から戻った直後、期限を
+                    // 過ぎていれば `NATIVE_RETURN` を送らずに kill する
+                    // （実行に 2 秒以上 3 秒未満かかった場合は、返信を
+                    // 受けた子の watchdog が先に発火し `Error{Timeout}` を
+                    // 返す。3 秒以上ならここで先に打ち切る）。
+                    if Instant::now() >= deadline {
                         worker.terminate_now();
                         let tail = worker.reap_and_collect_stderr();
-                        let converted = discard_context_error(worker, &tail, || {
-                            JsEngineError::EngineUnavailable(format!(
-                                "JS worker process sent a Result frame with {} trailing bytes \
-                                 after the decoded value ({consumed} of {} bytes consumed); \
-                                 stderr: {tail}",
-                                payload.len() - consumed,
-                                payload.len()
+                        let err = discard_context_error(worker, &tail, || {
+                            JsEngineError::Timeout(format!(
+                                "a native function invoked by the JS worker process exceeded \
+                                 the evaluation deadline; stderr: {tail}"
                             ))
                         });
-                        (Err(converted), false)
+                        return (Err(err), false);
                     }
-                    Err(err) => {
-                        worker.terminate_now();
-                        let tail = worker.reap_and_collect_stderr();
-                        let converted = discard_context_error(worker, &tail, || {
-                            JsEngineError::EngineUnavailable(format!(
-                                "JS worker process sent a malformed Result frame: {err}; stderr: \
-                                 {tail}"
-                            ))
-                        });
-                        (Err(converted), false)
+                    if let Err(err) = write_frame_with_deadline(
+                        worker,
+                        tag::NATIVE_RETURN,
+                        &native_return_payload,
+                        deadline,
+                        "the native call result",
+                    ) {
+                        return (Err(err), false);
                     }
-                };
-                apply_post_response_rss_check(worker, outcome, keep)
-            }
-            Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::ERROR => {
-                let (outcome, keep) = match worker_protocol::decode_error(&payload) {
-                    // 子の watchdog による打ち切り。子プロセスは生き続け、
-                    // Context も残る（設計書 §3.3 の表の 1 行目）。
-                    Ok((ErrorKind::Timeout, message)) => (
-                        Err(JsEngineError::Timeout(format!(
-                            "script execution timed out inside the JS worker process: {message}"
-                        ))),
-                        true,
-                    ),
-                    Ok((ErrorKind::Evaluation, message)) => {
-                        (Err(JsEngineError::EvaluationFailed(message)), true)
-                    }
-                    Ok((ErrorKind::Binding, message)) => {
-                        (Err(JsEngineError::BindingFailed(message)), true)
-                    }
-                    Err(err) => {
-                        worker.terminate_now();
-                        let tail = worker.reap_and_collect_stderr();
-                        let converted = discard_context_error(worker, &tail, || {
-                            JsEngineError::EngineUnavailable(format!(
-                                "JS worker process sent a malformed Error frame: {err}; stderr: \
-                                 {tail}"
-                            ))
-                        });
-                        (Err(converted), false)
-                    }
-                };
-                apply_post_response_rss_check(worker, outcome, keep)
-            }
-            Ok(ReaderEvent::Frame(other_tag, _)) => {
-                // JS-1・Issue #511: 子は `NATIVE_CALL`（tag 5）を送りうる
-                // （子側のプロキシ関数が呼ばれた場合）。親側の dispatch
-                // （`NativeFn` の実行・`NATIVE_RETURN` の返信）は別 Issue
-                // （#526）で追加する。それまでは `NATIVE_CALL` を含む
-                // あらゆる想定外のタグをプロトコル違反として扱い、
-                // fail-closed に子を kill する（本番の子は #155 完了まで
-                // プロキシを登録する手段が無いため、この分岐には到達しない）。
-                worker.terminate_now();
-                let tail = worker.reap_and_collect_stderr();
-                let err = discard_context_error(worker, &tail, || {
-                    JsEngineError::EngineUnavailable(format!(
-                        "JS worker process sent an unexpected frame (tag {other_tag}); stderr: \
-                         {tail}"
-                    ))
-                });
-                (Err(err), false)
-            }
-            Ok(ReaderEvent::Eof) => {
-                // 子は既にストリームを閉じている（終了済みか、まもなく
-                // 終了する）ため、kill を挟まずに直接 reap する。
-                //
-                // `discard_context_error` が「監視スレッドの RSS 超過
-                // kill」「stderr の V8 fatal OOM メッセージ」の両方を
-                // `fallback` より先に判定する（同関数のドキュメントコメント
-                // 参照。codex・Bugbot レビュー指摘 #503 対応）ため、この
-                // `fallback` は「どちらの証拠も無かった場合」にだけ使われる。
-                let tail = worker.reap_and_collect_stderr();
-                let err = discard_context_error(worker, &tail, || {
-                    JsEngineError::EngineUnavailable(format!(
-                        "JS worker process terminated unexpectedly before responding; stderr: \
-                         {tail}"
-                    ))
-                });
-                (Err(err), false)
-            }
-            Ok(ReaderEvent::Invalid(desc)) => {
-                worker.terminate_now();
-                let tail = worker.reap_and_collect_stderr();
-                let err = discard_context_error(worker, &tail, || {
-                    JsEngineError::EngineUnavailable(format!(
-                        "JS worker process sent a malformed frame: {desc}; stderr: {tail}"
-                    ))
-                });
-                (Err(err), false)
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                worker.terminate_now();
-                let tail = worker.reap_and_collect_stderr();
-                let err = discard_context_error(worker, &tail, || {
-                    JsEngineError::Timeout(format!(
-                        "script evaluation exceeded the JS worker deadline and the process was \
-                         killed; the next evaluation runs in a fresh context; stderr: {tail}"
-                    ))
-                });
-                (Err(err), false)
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                worker.terminate_now();
-                let tail = worker.reap_and_collect_stderr();
-                let err = discard_context_error(worker, &tail, || {
-                    JsEngineError::EngineUnavailable(format!(
-                        "JS worker process communication channel disconnected unexpectedly; \
-                         stderr: {tail}"
-                    ))
-                });
-                (Err(err), false)
+                    continue;
+                }
+                Ok(ReaderEvent::Frame(other_tag, _)) => {
+                    // 親が受け取るはずのないタグ（`HELLO`・`EVALUATE`・
+                    // `SHUTDOWN` 等）。`RESULT`・`ERROR`・`NATIVE_CALL` は
+                    // 上の分岐で扱い済みのため、ここに来るのは純粋な
+                    // プロトコル違反である。fail-closed に子を kill する。
+                    worker.terminate_now();
+                    let tail = worker.reap_and_collect_stderr();
+                    let err = discard_context_error(worker, &tail, || {
+                        JsEngineError::EngineUnavailable(format!(
+                            "JS worker process sent an unexpected frame (tag {other_tag}); \
+                             stderr: {tail}"
+                        ))
+                    });
+                    return (Err(err), false);
+                }
+                Ok(ReaderEvent::Eof) => {
+                    // 子は既にストリームを閉じている（終了済みか、まもなく
+                    // 終了する）ため、kill を挟まずに直接 reap する。
+                    //
+                    // `discard_context_error` が「監視スレッドの RSS 超過
+                    // kill」「stderr の V8 fatal OOM メッセージ」の両方を
+                    // `fallback` より先に判定する（同関数のドキュメントコメント
+                    // 参照。codex・Bugbot レビュー指摘 #503 対応）ため、この
+                    // `fallback` は「どちらの証拠も無かった場合」にだけ使われる。
+                    let tail = worker.reap_and_collect_stderr();
+                    let err = discard_context_error(worker, &tail, || {
+                        JsEngineError::EngineUnavailable(format!(
+                            "JS worker process terminated unexpectedly before responding; \
+                             stderr: {tail}"
+                        ))
+                    });
+                    return (Err(err), false);
+                }
+                Ok(ReaderEvent::Invalid(desc)) => {
+                    worker.terminate_now();
+                    let tail = worker.reap_and_collect_stderr();
+                    let err = discard_context_error(worker, &tail, || {
+                        JsEngineError::EngineUnavailable(format!(
+                            "JS worker process sent a malformed frame: {desc}; stderr: {tail}"
+                        ))
+                    });
+                    return (Err(err), false);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    worker.terminate_now();
+                    let tail = worker.reap_and_collect_stderr();
+                    let err = discard_context_error(worker, &tail, || {
+                        JsEngineError::Timeout(format!(
+                            "script evaluation exceeded the JS worker deadline and the process \
+                             was killed; the next evaluation runs in a fresh context; stderr: \
+                             {tail}"
+                        ))
+                    });
+                    return (Err(err), false);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    worker.terminate_now();
+                    let tail = worker.reap_and_collect_stderr();
+                    let err = discard_context_error(worker, &tail, || {
+                        JsEngineError::EngineUnavailable(format!(
+                            "JS worker process communication channel disconnected \
+                             unexpectedly; stderr: {tail}"
+                        ))
+                    });
+                    return (Err(err), false);
+                }
             }
         }
     }
+}
+
+/// [`V8ProcessEngine::send_evaluate_and_await`] から、`Evaluate` の送信と
+/// `NativeReturn` の返信の両方で使う書き込み処理（`stdin_tx` の有無・
+/// `send` の失敗・ack の `Ok(Err)`・`Timeout`・`Disconnected` の 4 分岐）を
+/// 抽出したもの（`TASK-29`・Issue #526）。
+///
+/// `frame_tag`・`payload` を [`worker_protocol::write_frame`] でフレーミング
+/// してから writer スレッドへ渡し、`deadline` までに書き込み完了の通知
+/// （`write_ack_rx`）を待つ。**失敗した場合は必ず子を `kill` → reap →
+/// [`discard_context_error`] を通す**（フレーミング自体の失敗を含む。
+/// 呼び出し元は本関数が `Err` を返したら常に `(Err(e), false)` を返す）。
+/// `what` はエラーメッセージに埋め込む短い句（例: "the script"・"the
+/// native call result"）。
+fn write_frame_with_deadline(
+    worker: &mut WorkerHandle,
+    frame_tag: u8,
+    payload: &[u8],
+    deadline: Instant,
+    what: &str,
+) -> Result<(), JsEngineError> {
+    let mut frame_bytes = Vec::new();
+    // インメモリの `Vec<u8>` への書き込みは実質失敗しないが、
+    // `write_frame` のシグネチャ（`impl Write`）に合わせて `Result` を
+    // 扱う（coding-rust.md「外部入力」節。`payload` はスクリプト文字列・
+    // `NativeFn` の戻り値に由来する外部入力である）。
+    if let Err(err) = worker_protocol::write_frame(&mut frame_bytes, frame_tag, payload) {
+        worker.terminate_now();
+        let tail = worker.reap_and_collect_stderr();
+        return Err(discard_context_error(worker, &tail, || {
+            JsEngineError::EngineUnavailable(format!(
+                "failed to encode {what} as a frame: {err}; stderr: {tail}"
+            ))
+        }));
+    }
+
+    let Some(stdin_tx) = worker.stdin_tx.as_ref() else {
+        worker.terminate_now();
+        let tail = worker.reap_and_collect_stderr();
+        return Err(discard_context_error(worker, &tail, || {
+            JsEngineError::EngineUnavailable(format!(
+                "JS worker process stdin is already closed while sending {what}; stderr: {tail}"
+            ))
+        }));
+    };
+    if stdin_tx.send(frame_bytes).is_err() {
+        // writer スレッドが既に終了している（stdin が既に閉じている
+        // 等）。子は既に死んでいる可能性が高い。監視スレッドが RSS
+        // 超過で kill した直後（stdin 側が先に閉じる）である可能性も
+        // あるため、そちらを優先して判定する（advisor 指摘 B 対応。
+        // `discard_context_error` が優先順位を持つ）。
+        worker.terminate_now();
+        let tail = worker.reap_and_collect_stderr();
+        return Err(discard_context_error(worker, &tail, || {
+            JsEngineError::EngineUnavailable(format!(
+                "JS worker process writer thread is no longer running while sending {what}; \
+                 stderr: {tail}"
+            ))
+        }));
+    }
+
+    let write_wait = deadline.saturating_duration_since(Instant::now());
+    match worker.write_ack_rx.recv_timeout(write_wait) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            // 子は既に死んでいる可能性が高い（broken pipe 等）。kill は
+            // 冪等（既に終了したプロセスへの kill はエラーを返すだけで
+            // 副作用は無い）ため、まず kill してから reap する
+            // （`reap_and_collect_stderr` の順序前提を満たす）。
+            worker.terminate_now();
+            let tail = worker.reap_and_collect_stderr();
+            Err(discard_context_error(worker, &tail, || {
+                JsEngineError::EngineUnavailable(format!(
+                    "failed to send {what} to the JS worker process (it may have crashed): \
+                     {err}; stderr: {tail}; context was discarded"
+                ))
+            }))
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // 書き込みが期限内に終わらなかった（パイプが満杯で writer
+            // スレッドがブロックしている等。codex レビュー指摘 #503 P1
+            // 対応）。kill すれば子の stdin 読み取り端が消え、ブロック
+            // していた書き込みは broken pipe で解放される（writer
+            // スレッドは `WorkerHandle::drop` で後始末される）。
+            worker.terminate_now();
+            let tail = worker.reap_and_collect_stderr();
+            Err(discard_context_error(worker, &tail, || {
+                JsEngineError::Timeout(format!(
+                    "sending {what} to the JS worker process exceeded the deadline and the \
+                     process was killed; the next evaluation runs in a fresh context; stderr: \
+                     {tail}"
+                ))
+            }))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            worker.terminate_now();
+            let tail = worker.reap_and_collect_stderr();
+            Err(discard_context_error(worker, &tail, || {
+                JsEngineError::EngineUnavailable(format!(
+                    "JS worker process writer thread disconnected unexpectedly while sending \
+                     {what}; stderr: {tail}"
+                ))
+            }))
+        }
+    }
+}
+
+/// [`dispatch_native_call`] が検出した、子から届いた `NATIVE_CALL`
+/// フレームのプロトコル違反（`TASK-29`・Issue #526）。
+///
+/// coding-rust.md「戻り値は将来拡張できる構造を持つ型にする」に従い、
+/// 違反の種類を判別できる enum にする（真偽値・フラットな文字列にしない）。
+/// 呼び出し元（`send_evaluate_and_await`）はいずれの variant もプロトコル
+/// 違反として子を kill する（両者を区別してリトライ等を行う想定は無いが、
+/// エラーメッセージで原因を明示するために分けている）。
+#[derive(Debug)]
+enum NativeDispatchViolation {
+    /// [`worker_protocol::decode_native_call`] がペイロードのデコードに
+    /// 失敗した（不正なバイト列・引数件数の上限超過等）。
+    DecodeFailed(worker_protocol::ProtocolError),
+    /// `id` に対応する [`NativeFn`] が登録されていない。`id` は子側
+    /// （`v8_engine::native_proxy_callback`）が `data()` に設定したもので
+    /// あり、JS 側から任意の値を選べるものではない。登録内容との食い違いは
+    /// JS の実行時エラーではなく内部の不整合（または子プロセスの異常）と
+    /// みなし、fail-closed に扱う。
+    UnknownId { id: u32 },
+}
+
+impl std::fmt::Display for NativeDispatchViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DecodeFailed(err) => write!(f, "failed to decode the NativeCall frame: {err}"),
+            Self::UnknownId { id } => write!(f, "no native function is registered for id {id}"),
+        }
+    }
+}
+
+/// 子から届いた 1 件の `NATIVE_CALL` フレームを処理する純粋関数
+/// （`TASK-29`・Issue #526）。戻り値は成功時に送信する `NATIVE_RETURN`
+/// フレームのペイロード。
+///
+/// 呼び出し元: [`V8ProcessEngine::send_evaluate_and_await`]。
+///
+/// 1. [`worker_protocol::decode_native_call`] でペイロードをデコードする。
+///    失敗したら [`NativeDispatchViolation::DecodeFailed`] を返す
+/// 2. `id` に対応する `native_fns` の要素を [`<[_]>::get_mut`] で取る
+///    （添字アクセスは使わない。coding-rust.md「外部入力」節）。無ければ
+///    [`NativeDispatchViolation::UnknownId`] を返す
+/// 3. `NativeFn` を実行する。`Ok(v)` なら [`NativeReturn::Ok`]、`Err(e)` なら
+///    [`NativeReturn::Err`]（`e` は [`JsEngineError`]。メッセージを
+///    [`worker_protocol::truncate_for_wire`] で
+///    [`worker_protocol::MAX_ERROR_MESSAGE_BYTES`] 以内へ切り詰めてから
+///    送る。子側の `decode_native_return` は上限超過の `Err` を fatal として
+///    拒否するため、送信前に切り詰める必要がある）
+/// 4. [`encode_bounded_native_return`] で、上限内に収まることを保証した
+///    バイト列へ符号化する
+///
+/// # 既知の制限（実装済みを装わない。REPAIR-3）
+///
+/// - `NativeFn` の実行は呼び出しスレッド上で同期的に行う。中断する手段は
+///   無く、`NativeFn` が戻らなければ本関数も戻らない（呼び出し元
+///   `send_evaluate_and_await` が評価全体の期限切れを確認できるのは、
+///   本関数から戻った**後**だけである）
+/// - release ビルドは `panic = "abort"` のため、`NativeFn` が panic すると
+///   ホストプロセスごと終了する。`catch_unwind` は使わない（release では
+///   機能しない前提のため）。panic させないのは `NativeFn` を実装する
+///   呼び出し元の責務である
+/// - `args` は子から届く値（JS 由来）であり、untrusted な入力として
+///   検証するのは `NativeFn` を実装する側の責務である
+///   （`engine_trait.rs` の [`NativeFn`] ドキュメントコメント参照）
+fn dispatch_native_call(
+    native_fns: &mut [NativeFn],
+    payload: &[u8],
+) -> Result<Vec<u8>, NativeDispatchViolation> {
+    let (id, args) = worker_protocol::decode_native_call(payload)
+        .map_err(NativeDispatchViolation::DecodeFailed)?;
+    // `id` は子が `data()` に設定した `u32`。`usize` への変換が失敗する
+    // ことは現実的な対象プラットフォームでは起こらないが、外部入力の
+    // 経路であるため `unwrap`/`expect` は使わず、変換に失敗した場合は
+    // 「対応する登録が無い」と同じ扱いにする。
+    let idx = usize::try_from(id).unwrap_or(usize::MAX);
+    let Some(native_fn) = native_fns.get_mut(idx) else {
+        return Err(NativeDispatchViolation::UnknownId { id });
+    };
+    let native_return = match native_fn(&args) {
+        Ok(value) => NativeReturn::Ok(value),
+        Err(err) => NativeReturn::Err(worker_protocol::truncate_for_wire(&err.to_string())),
+    };
+    Ok(encode_bounded_native_return(&native_return))
+}
+
+/// [`dispatch_native_call`] が組み立てた [`NativeReturn`] を、送信可能な
+/// バイト列へ符号化する（`TASK-29`・Issue #526）。
+///
+/// 符号化に失敗した場合、または結果が
+/// [`worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`] を超える場合は、
+/// 黙って切り詰めず、必ず上限内に収まる固定文言の [`NativeReturn::Err`] へ
+/// 差し替えてから符号化し直す（上限超過を明示するエラーにする。
+/// security.md「偽装・回避機能の禁止」）。フォールバック自体の符号化が
+/// 失敗することは実質無いが、`unwrap`/`expect` は使わず空の `Vec`
+/// （子側は `Truncated` として拒否し、既存の経路でプロトコル違反として
+/// 扱われる）にフォールバックする。
+fn encode_bounded_native_return(value: &NativeReturn) -> Vec<u8> {
+    if let Ok(bytes) = worker_protocol::encode_native_return(value)
+        && bytes.len() <= worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD
+    {
+        return bytes;
+    }
+    let fallback = NativeReturn::Err(format!(
+        "native function result exceeds the maximum supported frame size of {} bytes",
+        worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD
+    ));
+    worker_protocol::encode_native_return(&fallback).unwrap_or_default()
 }
 
 /// [`MonitorKillReason`] を、破棄時のエラーへ変換する（`context_suffix`
@@ -1807,6 +2132,138 @@ fn apply_post_response_rss_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `TASK-29`・Issue #526: 登録件数の上限が具体値どおりであること
+    /// （回帰確認。`register_native_function_for_test` は feature
+    /// `test-support` でのみ存在するため、値自体の確認はここで行う）。
+    #[test]
+    fn js_1_max_native_functions_is_1024() {
+        assert_eq!(MAX_NATIVE_FUNCTIONS, 1024);
+    }
+
+    /// `TASK-29`・Issue #526: 成功経路。登録済みの `NativeFn` が呼ばれ、
+    /// 受け取った引数がそのまま反映された [`NativeReturn::Ok`] を返すこと。
+    #[test]
+    fn js_1_dispatch_native_call_invokes_the_registered_native_fn() {
+        let seen_args: std::rc::Rc<std::cell::RefCell<Vec<JsValue>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen_args_for_closure = std::rc::Rc::clone(&seen_args);
+        let mut native_fns: Vec<NativeFn> = vec![Box::new(move |args: &[JsValue]| {
+            *seen_args_for_closure.borrow_mut() = args.to_vec();
+            Ok(JsValue::Number(42.0))
+        })];
+
+        let payload = worker_protocol::encode_native_call(
+            0,
+            &[JsValue::Number(1.0), JsValue::String("a".to_string())],
+        )
+        .expect("encode must succeed");
+        let result_payload =
+            dispatch_native_call(&mut native_fns, &payload).expect("dispatch must succeed");
+
+        assert_eq!(
+            worker_protocol::decode_native_return(&result_payload).expect("decode must succeed"),
+            NativeReturn::Ok(JsValue::Number(42.0))
+        );
+        assert_eq!(
+            *seen_args.borrow(),
+            vec![JsValue::Number(1.0), JsValue::String("a".to_string())]
+        );
+    }
+
+    /// `TASK-29`・Issue #526: `NativeFn` が `Err` を返した場合、
+    /// [`NativeReturn::Err`] になり、長いメッセージは
+    /// [`worker_protocol::MAX_ERROR_MESSAGE_BYTES`] 以内（文字境界を壊さない）
+    /// に切り詰められること。
+    #[test]
+    fn js_1_dispatch_native_call_truncates_an_oversized_error_message() {
+        let long_message = "a".repeat(worker_protocol::MAX_ERROR_MESSAGE_BYTES + 100);
+        let mut native_fns: Vec<NativeFn> = vec![Box::new({
+            let long_message = long_message.clone();
+            move |_args: &[JsValue]| Err(JsEngineError::EvaluationFailed(long_message.clone()))
+        })];
+        let payload = worker_protocol::encode_native_call(0, &[]).expect("encode must succeed");
+
+        let result_payload =
+            dispatch_native_call(&mut native_fns, &payload).expect("dispatch must succeed");
+        match worker_protocol::decode_native_return(&result_payload).expect("decode must succeed") {
+            NativeReturn::Err(message) => {
+                assert!(message.len() <= worker_protocol::MAX_ERROR_MESSAGE_BYTES);
+                assert!(std::str::from_utf8(message.as_bytes()).is_ok());
+            }
+            other => panic!("expected NativeReturn::Err, got: {other:?}"),
+        }
+    }
+
+    /// `TASK-29`・Issue #526: 未登録の `id` は
+    /// [`NativeDispatchViolation::UnknownId`] になること。
+    #[test]
+    fn js_1_dispatch_native_call_rejects_unknown_id() {
+        let mut native_fns: Vec<NativeFn> = Vec::new();
+        let payload = worker_protocol::encode_native_call(7, &[]).expect("encode must succeed");
+        assert!(matches!(
+            dispatch_native_call(&mut native_fns, &payload),
+            Err(NativeDispatchViolation::UnknownId { id: 7 })
+        ));
+    }
+
+    /// `TASK-29`・Issue #526: 壊れたペイロード（途中で切れたもの）は
+    /// [`NativeDispatchViolation::DecodeFailed`] になること（添字アクセスで
+    /// panic しないことの確認）。
+    #[test]
+    fn js_1_dispatch_native_call_rejects_truncated_payload() {
+        let mut native_fns: Vec<NativeFn> = vec![Box::new(|_: &[JsValue]| Ok(JsValue::Undefined))];
+        let payload = [0u8, 1u8, 2u8]; // id・argc のどちらの u32 も揃わない
+        assert!(matches!(
+            dispatch_native_call(&mut native_fns, &payload),
+            Err(NativeDispatchViolation::DecodeFailed(_))
+        ));
+    }
+
+    /// `TASK-29`・Issue #526: 余分な末尾バイトが付いたペイロードも
+    /// `DecodeFailed` になること（`decode_native_call` の
+    /// `TrailingBytes` 検証を通じて拒否される）。
+    #[test]
+    fn js_1_dispatch_native_call_rejects_payload_with_trailing_bytes() {
+        let mut native_fns: Vec<NativeFn> = vec![Box::new(|_: &[JsValue]| Ok(JsValue::Undefined))];
+        let mut payload = worker_protocol::encode_native_call(0, &[]).expect("encode must succeed");
+        payload.push(0xff);
+        assert!(matches!(
+            dispatch_native_call(&mut native_fns, &payload),
+            Err(NativeDispatchViolation::DecodeFailed(_))
+        ));
+    }
+
+    /// `TASK-29`・Issue #526: 結果の符号化後サイズが
+    /// [`worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`] を超える場合、
+    /// 送信ペイロードが上限以内の `NativeReturn::Err` に差し替わること
+    /// （黙って切り詰めず、明示的なエラーにする）。
+    #[test]
+    fn js_1_encode_bounded_native_return_replaces_oversized_results_with_a_bounded_error() {
+        let oversized = "x".repeat(worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD + 1024);
+        let value = NativeReturn::Ok(JsValue::String(oversized));
+
+        let bytes = encode_bounded_native_return(&value);
+        assert!(bytes.len() <= worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD);
+        match worker_protocol::decode_native_return(&bytes).expect("decode must succeed") {
+            NativeReturn::Err(message) => {
+                assert!(message.contains("exceeds the maximum supported frame size"));
+            }
+            other => panic!("expected NativeReturn::Err, got: {other:?}"),
+        }
+    }
+
+    /// `TASK-29`・Issue #526: 上限以内の結果はそのまま符号化されること
+    /// （回帰確認）。
+    #[test]
+    fn js_1_encode_bounded_native_return_keeps_small_results_untouched() {
+        let value = NativeReturn::Ok(JsValue::Number(1.0));
+        let bytes = encode_bounded_native_return(&value);
+        assert_eq!(
+            worker_protocol::decode_native_return(&bytes).expect("decode must succeed"),
+            value
+        );
+    }
 
     /// テスト専用: `sleep`（Unix）／`ping`（Windows）を、V8 プロトコルに
     /// 依存しない代役の「子プロセス」として起動する。書き込みタイムアウト
