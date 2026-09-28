@@ -15,28 +15,41 @@
 //!   `super::worker::worker_main` から呼ぶ）。設定に失敗したら評価を
 //!   始めずに終了する（fail-closed。呼び出し元が `EngineUnavailable`
 //!   へ変換する）
-//! - **子側（Isolate 生成時）**: `ArrayBuffer` の backing store（`new
-//!   ArrayBuffer(...)`・`new Uint8Array(...)` 等がヒープ外に確保する
-//!   実体）の確保量を数え、合計が
+//! - **子側（Isolate 生成時）**: `ArrayBuffer`／`SharedArrayBuffer` の
+//!   backing store（`new ArrayBuffer(...)`・`new Uint8Array(...)` 等が
+//!   ヒープ外に確保する実体）の確保量を数え、合計が
 //!   [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`] を超える確保を拒否する独自
 //!   アロケータを V8 の `CreateParams::array_buffer_allocator` に渡す
 //!   （[`new_bounded_array_buffer_allocator`]。codex レビュー指摘 #503
 //!   P0「macOS の JS ワーカーに強制的なメモリ上限がない」対応。ユーザー
-//!   承認 2026-09-28。`v8` crate 152.2.0 の `new_rust_allocator` を使う。
-//!   3 OS 共通で効く点が、OS 側の手段が無い macOS にとって特に重要
-//!   ── OS に頼らず V8 自身のレベルで確保経路を塞ぐため）
+//!   承認 2026-09-28。`v8` crate 152.2.0 の `new_rust_allocator` を使う）。
+//!   **既知の抜け穴（実測済み。実装済みを装わない。REPAIR-3）**:
+//!   resizable `ArrayBuffer`（`new ArrayBuffer(len, { maxByteLength })`。
+//!   `resize()` の呼び出し有無に関わらず、`maxByteLength` を指定した
+//!   時点で）・growable `SharedArrayBuffer`（`grow()`）は、V8 の
+//!   `ArrayBuffer::Allocator` インターフェースの `Reallocate`（`v8` crate
+//!   152.2.0 の `RustAllocatorVtable` には `reallocate` 相当のフックが
+//!   存在せず、本アロケータで上書きできない）を経由する別の確保方式
+//!   （`AllocationMode::kReservation` 相当）を使うため、この上限を
+//!   完全に回避できることを実機で確認した。resizable ではない通常の
+//!   `ArrayBuffer`／`SharedArrayBuffer`・`ArrayBuffer.prototype.transfer`
+//!   は本アロケータの `Allocate`／`Free` を経由し、上限が正しく効く
+//!   （同じく実機で確認済み）
 //! - **子側（Context 生成直後）**: WebAssembly を無効化する
 //!   （`super::v8_engine::V8Engine::new_with_heap_limit` が Context の
 //!   グローバルオブジェクトの `WebAssembly` プロパティを `undefined` へ
-//!   上書きする）。wasm のメモリは上記の `ArrayBuffer` アロケータを
-//!   通らない別経路であり、この上限の対象外になってしまうため、経路
-//!   ごと塞ぐ。V8 152.2.0 にはこの版のグローバル露出を切り替える単一
-//!   フラグ（`--no-expose-wasm` 等）が存在しないため、フラグではなく
-//!   Context 生成直後のグローバルオブジェクト操作で行う（詳細は
-//!   `V8Engine::new_with_heap_limit` の実装コメント参照）。この操作は
-//!   戻り値（代入できたか）を確認していないため、多層防御として
-//!   [`configure_wasm_max_mem_pages_flag`]（単一メモリインスタンスへの
-//!   上限。wasm 無効化の前から存在した手段）も引き続き設定する
+//!   上書きし、上書きの成否（戻り値・読み出し直し）を確認したうえで
+//!   検証に失敗すれば Isolate 生成自体を `JsEngineError::BindingFailed`
+//!   で失敗させる。codex レビュー指摘 #503 P1「WebAssembly の無効化失敗
+//!   を見逃している」対応）。wasm のメモリは上記の `ArrayBuffer`
+//!   アロケータを通らない別経路であり、この上限の対象外になって
+//!   しまうため、経路ごと塞ぐ。V8 152.2.0 にはこの版のグローバル露出を
+//!   切り替える単一フラグ（`--no-expose-wasm` 等）が存在しないため、
+//!   フラグではなく Context 生成直後のグローバルオブジェクト操作で行う
+//!   （詳細は `V8Engine::new_with_heap_limit` の実装コメント参照）。
+//!   多層防御として [`configure_wasm_max_mem_pages_flag`]（単一メモリ
+//!   インスタンスへの上限。wasm 無効化の前から存在した手段）も引き続き
+//!   設定する
 //! - **親側（子の寿命のあいだ継続的に）**: 子のメモリ使用量を定期的に
 //!   監視し、上限を超えたら kill する（[`read_child_rss_bytes`]。
 //!   `super::process_engine::MemoryMonitor` が子の寿命いっぱい動かす
@@ -95,7 +108,7 @@
 //! |---|---|---|
 //! | Linux | `RLIMIT_DATA`（[`enforce_child_memory_limit`]。`rustix::process::setrlimit`。上限 [`LINUX_RLIMIT_DATA_CEILING_BYTES`]＝2 GiB）＋[`new_bounded_array_buffer_allocator`]（`ArrayBuffer` 確保の上限。3 OS 共通） | **OS がある程度強制するが、厳密な上限としては機能しない**。`RLIMIT_DATA` は匿名 `MAP_PRIVATE` の `mmap`（大きな `ArrayBuffer` の backing store が実際に使う経路。glibc malloc は既定のしきい値 128 KiB を超える確保を `mmap` に回す）にも、実際に触れていない仮想予約にも適用される（`setrlimit(2)` の「data segment のみ」という古い説明は、匿名 mmap を会計に含めない実装を前提にしており、本 crate が対象とする現行 Linux カーネルの挙動とは異なる）。しかし V8 自身の `CodeRange` 予約だけで数百 MiB（アーキテクチャ依存。実測は上記のとおり）を消費するため、[`HEAP_EXTERNAL_ALLOWANCE_BYTES`] 相当の小さい値には設定できず、`RLIMIT_DATA` 単体では実質的な防御を親側の監視に委ねていた。**`ArrayBuffer` の確保だけは、この `RLIMIT_DATA` の限界とは無関係に、V8 自身のレベル（[`new_bounded_array_buffer_allocator`]）で [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`] を確実に強制する** |
 //! | Windows | Job Object（[`enforce_child_memory_limit`]。`windows-sys` で Win32 API を直接呼ぶ。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`。上限 [`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`]＝384 MiB）＋[`new_bounded_array_buffer_allocator`]（`ArrayBuffer` 確保の上限。3 OS 共通） | **OS がコミットの天井を強制するが、天井を超えても子プロセスは終了しない**。当初は `win32job =2.0.3` の安全な API（`limit_working_memory`／`JOB_OBJECT_LIMIT_WORKINGSET`）を使っていたが、これは物理メモリの常駐量（working set）を trim させるだけでコミットチャージの上限にはならないという P0 指摘（codex）を受け、`win32job` の使用をやめて `windows-sys` で Win32 API を直接呼ぶ実装に切り替えた（ユーザー承認 2026-09-28。承認された unsafe の範囲は本モジュールの `windows_job` サブモジュール・`read_rss_windows` に限定）。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`／`ProcessMemoryLimit` は Linux の `kill` ベースの強制とは性質が異なり、コミットチャージが上限を超えると**その先の確保が失敗するだけ**である（`VirtualAlloc`/`HeapAlloc` 相当が失敗を返す。プロセス自体は生き続ける）。ただし本対応（codex レビュー指摘 #503 P0「macOS の JS ワーカーに強制的なメモリ上限がない」）以降、V8 の既定の `ArrayBuffer::Allocator` は使わず [`new_bounded_array_buffer_allocator`] に置き換えたため、`ArrayBuffer` の確保は通常 [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`]（128 MiB）でこのアロケータ自身が拒否し、Job Object のコミット上限（384 MiB）に到達する事態は基本的に起こらない（到達しうるのは `ArrayBuffer` 以外の確保。その場合も引き続き親側の監視（[`read_child_rss_bytes`] が返す `PrivateUsage`。working set ではなくコミット量を見るように変更した）が `ResourceLimitExceeded` への分類・子の破棄・作り直しを担う）。この Windows 専用実装（windows-sys 版）は本コミット時点では未検証であり、CI の Windows ランナーでの確認を前提とする（回帰テスト参照）|
-//! | macOS | OS 側の手段は無い（[`enforce_child_memory_limit`] は何もしない）。ただし [`new_bounded_array_buffer_allocator`]（`ArrayBuffer` 確保の上限。3 OS 共通で有効）と WebAssembly 無効化（`super::v8_engine::V8Engine::new_with_heap_limit`。3 OS 共通で有効）が、OS に頼らず V8 自身のレベルでヒープ外メモリの主要な確保経路を塞ぐ | **OS によるプロセス単位の強制は無いが、ヒープ外メモリの 2 大確保経路（`ArrayBuffer`・wasm）は V8 自身のレベルで塞がれている**。本実装時にこの macOS 環境で実機検証したところ、`RLIMIT_DATA`・`RLIMIT_AS`・`RLIMIT_RSS` はいずれも `setrlimit(2)` の呼び出し自体が `EINVAL` で失敗した（「上限をかけたが効かない」ではなく「そもそも設定できない」）。Job Object 相当の OS 機構も無い。したがって [`enforce_child_memory_limit`] は macOS では何もせず常に成功を返す（呼び出そうとしても確実に失敗するため、fail-closed にすると macOS 上で子プロセスが常に起動できなくなってしまう）。残る確保経路（V8 自身のコード領域・snapshot・Rust ホストバイナリの通常の確保等）は、引き続き親側の RSS 監視だけに委ねる |
+//! | macOS | OS 側の手段は無い（[`enforce_child_memory_limit`] は何もしない）。[`new_bounded_array_buffer_allocator`]（resizable ではない `ArrayBuffer`／`SharedArrayBuffer` の確保上限。3 OS 共通で有効）と WebAssembly 無効化（`super::v8_engine::V8Engine::new_with_heap_limit`。3 OS 共通で有効）が、OS に頼らず V8 自身のレベルでヒープ外メモリの一部の確保経路を狭める | **OS によるプロセス単位の強制は無く、`ArrayBuffer` アロケータ・WebAssembly 無効化も部分的な防御にとどまる**（resizable `ArrayBuffer`／growable `SharedArrayBuffer`・`ArrayBuffer` アロケータ・wasm 無効化のいずれの対象にもならない native な確保は、この防御を経由せず素通りする。[`new_bounded_array_buffer_allocator`] のドキュメントコメント「既知の抜け穴」参照）。本実装時にこの macOS 環境で実機検証したところ、`RLIMIT_DATA`・`RLIMIT_AS`・`RLIMIT_RSS` はいずれも `setrlimit(2)` の呼び出し自体が `EINVAL` で失敗した（「上限をかけたが効かない」ではなく「そもそも設定できない」）。Job Object 相当の OS 機構も無い。したがって [`enforce_child_memory_limit`] は macOS では何もせず常に成功を返す（呼び出そうとしても確実に失敗するため、fail-closed にすると macOS 上で子プロセスが常に起動できなくなってしまう）。残る確保経路（resizable `ArrayBuffer`／growable `SharedArrayBuffer`・V8 自身のコード領域・snapshot・Rust ホストバイナリの通常の確保等）は、引き続き親側の RSS 監視だけに委ねる（macOS では、これが唯一の防衛線であることに変わりはない） |
 //!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
@@ -105,17 +118,22 @@
 //!   確保だけは食い止める」ところまでしか行わない。Linux は
 //!   `CodeRange` 予約のため厳密な上限にできない。Windows は上限到達時に
 //!   確保を失敗させるだけで子プロセスを終了させない（上表参照）。
-//!   macOS は OS 側の手段が無い（[`new_bounded_array_buffer_allocator`]・
-//!   WebAssembly 無効化は OS に頼らず V8 自身のレベルで強制するため、
-//!   この限りではない。次点参照）
-//! - **[`new_bounded_array_buffer_allocator`] が拒否した確保は
-//!   `RangeError`（catchable な例外）としてスクリプトへ返るだけで、
-//!   子プロセスは終了しない**。子は生き続け、Context もそのまま残る
-//!   （`ResourceLimitExceeded` ではなく `EvaluationFailed` に分類される。
-//!   `MAX_ARRAY_BUFFER_ALLOCATION_BYTES` は「この 1 プロセスが確保できる
-//!   `ArrayBuffer` の合計」を制限するものであり、際限のない繰り返し確保
-//!   そのものは防ぐが、それを理由に子を作り直したい場合は、これまでどおり
-//!   親側の RSS 監視が `ResourceLimitExceeded` として検出する
+//!   macOS は OS 側の手段が無い。[`new_bounded_array_buffer_allocator`]・
+//!   WebAssembly 無効化は OS に頼らず V8 自身のレベルで確保を狭めるが、
+//!   次点が説明するとおり全経路を塞ぐものではなく、macOS における
+//!   最終的な防衛線は今なお親側の RSS 監視である
+//! - **[`new_bounded_array_buffer_allocator`] は resizable
+//!   `ArrayBuffer`／growable `SharedArrayBuffer` を対象にできない**
+//!   （実機で確認済み。同関数のドキュメントコメント「既知の抜け穴」
+//!   参照）。resizable ではない `ArrayBuffer`／`SharedArrayBuffer` の
+//!   確保がこの上限で拒否された場合は `RangeError`（catchable な例外）
+//!   としてスクリプトへ返るだけで、子プロセスは終了しない。子は生き
+//!   続け、Context もそのまま残る（`ResourceLimitExceeded` ではなく
+//!   `EvaluationFailed` に分類される。`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`
+//!   は「この 1 プロセスが確保できる、resizable ではない `ArrayBuffer`／
+//!   `SharedArrayBuffer` の合計」を制限するものであり、それを理由に子を
+//!   作り直したい場合は、これまでどおり親側の RSS 監視が
+//!   `ResourceLimitExceeded` として検出する
 //! - WebAssembly は本対応で完全に無効化した
 //!   （`super::v8_engine::V8Engine::new_with_heap_limit`）。
 //!   `wasm` のメモリは [`new_bounded_array_buffer_allocator`] を通らない
@@ -777,6 +795,37 @@ static BOUNDED_ARRAY_BUFFER_ALLOCATOR_VTABLE: v8::RustAllocatorVtable<
 /// 1 か所と、上記 4 つの vtable 関数の内部（`std::alloc` の
 /// `alloc`/`alloc_zeroed`/`dealloc`・`Arc::from_raw` による handle の
 /// 復元）に限定される。
+///
+/// # 既知の抜け穴（実装済みを装わない。REPAIR-3。実機で確認済み）
+///
+/// **resizable `ArrayBuffer`（`new ArrayBuffer(len, { maxByteLength })`）
+/// と growable `SharedArrayBuffer`（`new SharedArrayBuffer(len,
+/// { maxByteLength })`）は、この上限の対象にならない**。`maxByteLength`
+/// を指定した時点で（`resize()`／`grow()` の呼び出し有無に関わらず）、
+/// V8 は本アロケータの `Allocate`／`AllocateUninitialized`／`Free` を
+/// 経由しない別の確保方式（`v8::ArrayBuffer::Allocator::AllocationMode`
+/// の `kReservation` に相当すると見られる、`maxByteLength` 分の仮想
+/// アドレス空間を先行予約する方式）を使う。`v8` crate 152.2.0 の
+/// `RustAllocatorVtable` には `Reallocate`（この予約方式が経由する
+/// はずの仮想関数）に対応するフックが無く、Rust 側から上書きできない
+/// ため、本アロケータではこの経路を検出も拒否もできない。実測では、
+/// 190 MiB の resizable `ArrayBuffer`（`maxByteLength` 200 MiB）・
+/// growable `SharedArrayBuffer` の確保・拡張がいずれも
+/// [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`]（128 MiB）を超えて成功する
+/// ことを確認した。一方、resizable ではない通常の `ArrayBuffer`／
+/// `SharedArrayBuffer`、および `ArrayBuffer.prototype.transfer` は
+/// 本アロケータの `Allocate`／`Free` を経由し、上限が正しく効くことも
+/// 実測で確認済み（`tests/v8_worker.rs` の回帰テスト参照）。
+///
+/// V8 152.2.0 の `v8/src/flags/flag-definitions.h` には resizable
+/// `ArrayBuffer`／growable `SharedArrayBuffer`（`rab_gsab`・`resizable`・
+/// `growable` のいずれのキーワードでも）を無効化するフラグは存在しない
+/// （実機で確認済み）。したがって、この抜け穴を V8 レベルで完全に塞ぐ
+/// 手段は本対応の時点では見つかっておらず、**macOS ではこの経路からの
+/// メモリ膨張は、引き続き親側の RSS 監視（[`MAX_CHILD_RSS_BYTES`]）
+/// だけが検出する**（Linux・Windows は、この経路であっても OS 側の
+/// プロセス単位の強制（`RLIMIT_DATA`・`ProcessMemoryLimit`）が別途
+/// 効く）。
 pub(crate) fn new_bounded_array_buffer_allocator() -> v8::UniqueRef<v8::Allocator> {
     let state = Arc::new(BoundedArrayBufferAllocatorState {
         allocated_bytes: AtomicUsize::new(0),
