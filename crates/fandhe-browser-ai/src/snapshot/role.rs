@@ -56,6 +56,7 @@
 //! `roleOf`（PoC-4）は `label` 要素を一律 `"text"` としているが、本実装は
 //! HTML-AAM に従い、`label` は対応表に無いため `generic`（Fallback）になる。
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use fandhe_browser_core::dom::{Document, NodeData, NodeId};
@@ -261,6 +262,16 @@ fn implicit_role_for_th(doc: &Document, id: NodeId) -> ComputedRole {
 /// （最初の一致で resolve する、というブラウザの一般的な `getElementById`
 /// 挙動に合わせる）。
 ///
+/// 参照先要素が「空でないテキストを持つか」の判定結果も、対象 [`NodeId`]
+/// ごとに `has_non_empty_text` フィールドで文書単位にキャッシュする
+/// （PR #566 レビュー指摘 P0。多数の `aria-labelledby` が同じ大きな要素を
+/// 参照する外部 HTML で、[`compute_role`] 呼び出しのたびに `doc.text_content`
+/// が対象の全子孫を再走査しテキスト全体を複製すると二乗規模のコストになる
+/// ため、判定結果だけを保持し文字列は複製しない）。`RefCell` は
+/// [`compute_role`] が `&IdIndex` としてのみ受け取る（可変参照を要求しない）
+/// 契約を保つために使う内部可変性で、単一スレッド上の逐次呼び出しのみを
+/// 想定する（`Send`/`Sync` は要求しない）。
+///
 /// 可視性: [`build_id_index`] とあわせて `pub` にし、[`super::snapshot`]
 /// クレートルートから再エクスポートしている。DOM から `Snapshot` を構築する
 /// TASK-11.7（Issue #76）が、文書 1 つにつき 1 回だけ索引を作り、要素ごとの
@@ -268,7 +279,55 @@ fn implicit_role_for_th(doc: &Document, id: NodeId) -> ComputedRole {
 /// （PR #566 レビュー指摘 P1。`compute_role` 内で毎回索引を作り直すと
 /// 呼び出し回数 × 文書サイズの二乗規模の走査量になるため、索引の構築を
 /// スナップショット構築側へ引き上げた）。
-pub type IdIndex<'a> = HashMap<&'a str, NodeId>;
+#[derive(Debug, Default)]
+pub struct IdIndex<'a> {
+    by_id: HashMap<&'a str, NodeId>,
+    has_non_empty_text: RefCell<HashMap<NodeId, bool>>,
+}
+
+impl<'a> IdIndex<'a> {
+    /// `target` が空でないテキストを持つかどうかを返す。判定結果は `self`
+    /// にキャッシュされ、同じ `target` への 2 回目以降の呼び出しは
+    /// 再走査しない（[`IdIndex`] のドキュメントコメント参照）。
+    fn has_non_empty_text(&self, doc: &Document, target: NodeId) -> bool {
+        if let Some(&cached) = self.has_non_empty_text.borrow().get(&target) {
+            return cached;
+        }
+        let result = element_has_non_empty_text(doc, target);
+        self.has_non_empty_text.borrow_mut().insert(target, result);
+        result
+    }
+}
+
+/// `id` の `textContent` 相当のテキストに、空白以外の文字が 1 つでも
+/// 含まれるかどうかを返す（[`Document::text_content`] と等価な判定だが、
+/// 判定に必要な最初の非空白文字が見つかった時点で走査を打ち切り、
+/// `String` へ複製しない。[`IdIndex::has_non_empty_text`] からのみ使う）。
+///
+/// 判定規則は [`Document::text_content`] と揃える: Text/Comment/
+/// ProcessingInstruction は自身のデータを、Element/DocumentFragment は
+/// 子孫の Text ノードのみを見る（[`Document::descendants`] を使い再帰しない）。
+fn element_has_non_empty_text(doc: &Document, id: NodeId) -> bool {
+    let has_non_whitespace = |text: &str| text.chars().any(|c| !c.is_whitespace());
+    match doc.node_data(id) {
+        Some(NodeData::Text { contents } | NodeData::Comment { contents }) => {
+            has_non_whitespace(contents)
+        }
+        Some(NodeData::ProcessingInstruction { data, .. }) => has_non_whitespace(data),
+        Some(NodeData::Element { .. } | NodeData::DocumentFragment) => {
+            doc.descendants(id).any(|descendant| {
+                matches!(
+                    doc.node_data(descendant),
+                    Some(NodeData::Text { contents }) if has_non_whitespace(contents)
+                )
+            })
+        }
+        // `NodeData` は `#[non_exhaustive]`。Document/Doctype・範囲外 ID・
+        // 将来追加されるバリアントはいずれもテキストを持たないとみなす
+        // （[`Document::text_content`] が `None` を返す場合と同じ扱い）。
+        _ => false,
+    }
+}
 
 /// [`IdIndex`] を構築する。[`Document`] は id 索引を持たないため、
 /// `doc.root()` から [`Document::descendants`] で全要素を 1 回だけ走査する
@@ -279,13 +338,16 @@ pub type IdIndex<'a> = HashMap<&'a str, NodeId>;
 /// [`compute_role`] の全呼び出しへ使い回すこと（[`IdIndex`] のドキュメント
 /// コメント参照）。
 pub fn build_id_index(doc: &Document) -> IdIndex<'_> {
-    let mut index = IdIndex::new();
+    let mut by_id = HashMap::new();
     for node in doc.descendants(doc.root()) {
         if let Some(node_id) = doc.attribute(node, "id") {
-            index.entry(node_id).or_insert(node);
+            by_id.entry(node_id).or_insert(node);
         }
     }
-    index
+    IdIndex {
+        by_id,
+        has_non_empty_text: RefCell::new(HashMap::new()),
+    }
 }
 
 /// `aria-labelledby` の値（空白区切りの ID 列）のうち、`doc` 内に実在し、
@@ -297,13 +359,17 @@ pub fn build_id_index(doc: &Document) -> IdIndex<'_> {
 /// テキストが空（例: `<span id="x"></span>`）の場合は、accessible name を
 /// 持ちえないため名前のヒントとして扱わない（PR #566 レビュー指摘 P1。
 /// 「参照先が存在する」だけでは `has_name_hint` を真にしない）。
+///
+/// 参照先ごとの判定結果は [`IdIndex`] に文書単位でキャッシュされ、
+/// `doc.text_content` によるテキスト全体の複製は行わない（PR #566
+/// レビュー指摘 P0。[`IdIndex::has_non_empty_text`] 参照）。
 fn labelledby_references_named_element(doc: &Document, id: NodeId, index: &IdIndex<'_>) -> bool {
     doc.attribute(id, "aria-labelledby").is_some_and(|value| {
         value.split_ascii_whitespace().any(|token| {
             index
+                .by_id
                 .get(token)
-                .and_then(|&target| doc.text_content(target))
-                .is_some_and(|text| !text.trim().is_empty())
+                .is_some_and(|&target| index.has_non_empty_text(doc, target))
         })
     })
 }
@@ -874,6 +940,45 @@ mod tests {
             "none",
             RoleSource::Implicit,
         );
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘 P0）: 同じ
+    /// 参照先を多数の `aria-labelledby` が指しても（[`IdIndex`] のキャッシュ
+    /// 経由で）毎回正しく判定できる。参照先はネストした子孫に空白のみの
+    /// テキストノードと実テキストを両方持たせ、[`element_has_non_empty_text`]
+    /// が子孫全体（直下の子だけでなく孫）を見ることも確認する。
+    #[test]
+    fn aisnap_1_labelledby_cache_is_reused_across_many_references() {
+        let html = concat!(
+            r#"<div id="caption"><span>  </span><em>検索</em></div>"#,
+            r#"<form aria-labelledby="caption"></form>"#,
+            r#"<img src="a.png" alt="" aria-labelledby="caption">"#,
+            r#"<img src="b.png" alt="" aria-labelledby="caption">"#,
+            r#"<img src="c.png" alt="" aria-labelledby="caption">"#,
+        );
+        let parsed = parse_document(html, &ParseOptions::default()).expect("パースは成功する");
+        let doc = parsed.document;
+        let root = doc.root();
+        let id_index = build_id_index(&doc);
+
+        let form = query_selector_str(&doc, root, "form")
+            .expect("セレクタは解釈できる")
+            .expect("form 要素が見つかる");
+        assert_role(
+            compute_role(&doc, form, &id_index),
+            "form",
+            RoleSource::Implicit,
+        );
+
+        let images = query_selector_all_str(&doc, root, "img").expect("セレクタは解釈できる");
+        assert_eq!(images.len(), 3, "img 要素は 3 つ選択できる");
+        for image in images {
+            assert_role(
+                compute_role(&doc, image, &id_index),
+                "img",
+                RoleSource::Implicit,
+            );
+        }
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: 参照先が
