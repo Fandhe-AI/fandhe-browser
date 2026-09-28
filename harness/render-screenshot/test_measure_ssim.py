@@ -14,6 +14,7 @@ import random
 import struct
 import sys
 import tempfile
+import threading
 import unittest
 import zlib
 from pathlib import Path
@@ -336,6 +337,47 @@ class DecodePngGrayTest(unittest.TestCase):
             with self.assertRaises(ms.PngDecodeError) as ctx:
                 ms.decode_png_gray(path)
             self.assertIn("trailing data after the zlib stream end", str(ctx.exception))
+
+    def test_rejects_trailing_data_after_eof_with_large_output_without_hanging(self) -> None:
+        # codex/review 指摘（P0・PR #532 discussion_r4126569503）: 展開結果が
+        # 65536 バイトを超え、zlib ストリームの後ろに余剰バイトがある IDAT では、
+        # 旧実装は `decompressor.eof` が真になっても `unconsumed_tail` に余剰
+        # バイトが残り続け、`remaining` が空にならず展開ループが無限に続いて
+        # いた（非信頼 PNG による DoS）。ここでは実際に 65536 バイトを超える
+        # 展開結果を作り、別スレッドで実行して有限時間内に `PngDecodeError` で
+        # 終わることを確認する（無限ループへ後退した場合はスレッドが
+        # タイムアウトまで生き残ったままとなり、テストが失敗する）。
+        width, height = 300, 300  # gray・1 channel: 301 * 300 = 90300 bytes > 65536
+        data = build_png(
+            width,
+            height,
+            lambda x, y: (0,),
+            color_type=0,
+            extra_idat_suffix=b"garbage-after-zlib-eof-" * 4,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.png"
+            path.write_bytes(data)
+
+            outcome: dict[str, BaseException | None] = {}
+
+            def run() -> None:
+                try:
+                    ms.decode_png_gray(path)
+                except BaseException as exc:  # noqa: BLE001 (スレッド境界で例外を持ち帰るため意図的に広く捕捉)
+                    outcome["exc"] = exc
+                else:
+                    outcome["exc"] = None
+
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            thread.join(timeout=10)
+            self.assertFalse(
+                thread.is_alive(),
+                "decode_png_gray should not hang on post-eof trailing IDAT data (DoS regression)",
+            )
+            self.assertIsInstance(outcome.get("exc"), ms.PngDecodeError)
+            self.assertIn("trailing data after the zlib stream end", str(outcome["exc"]))
 
     def test_rejects_decompression_bomb(self) -> None:
         # IHDR は巨大な寸法を宣言するが IDAT はごく小さい zlib ストリーム

@@ -514,15 +514,31 @@ def _read_png_chunks(path: Path) -> tuple[int, int, int, int, bytes]:
 
     decompressor = zlib.decompressobj()
     decoded = bytearray()
+    trailing_after_eof = False
     try:
         for chunk in idat_chunks:
             remaining = chunk
             while remaining:
+                if decompressor.eof:
+                    # zlib ストリームは既に終端しているのに IDAT のバイト列がまだ
+                    # 残っている（同一チャンク内の余剰、または後続 IDAT チャンク）。
+                    # eof 到達後は decompress() が同じ入力を消費せず空バイト列を
+                    # 返し続けるため、ここで打ち切らないと remaining が減らず
+                    # 無限ループになる（非信頼 PNG による DoS。CVE 相当の zlib
+                    # 誤用パターン）。打ち切って下の trailing 拒否へ回す。
+                    trailing_after_eof = True
+                    break
                 piece = decompressor.decompress(remaining, 65536)
                 decoded += piece
                 if len(decoded) > expected_raw:
                     raise PngDecodeError(f"IDAT decompresses larger than the IHDR-derived size: {path}")
                 remaining = decompressor.unconsumed_tail
+            if trailing_after_eof:
+                break
+        if trailing_after_eof:
+            raise PngDecodeError(
+                f"trailing data after the zlib stream end in IDAT: {path}"
+            )
         while not decompressor.eof:
             allowance = expected_raw - len(decoded) + 1
             if allowance <= 0:
