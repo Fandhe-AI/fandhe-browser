@@ -26,17 +26,24 @@
 //! - `select`（`multiple`・`size`）の role → TASK-11.3.3（Issue #543）
 //! - `header`/`footer`/`aside` の、sectioning 祖先（`role` 属性で指定した
 //!   祖先も含む）による role の切り替え → TASK-11.3.3（Issue #543）
-//! - `none`/`presentation` の競合解決（フォーカス可能な要素・グローバル
-//!   ARIA 属性を持つ場合は `role` 属性の指定を無視する規則）
+//! - `none`/`presentation` の競合解決の完全な判定（[`explicit_role`] は
+//!   フォーカス可能性・グローバル ARIA 属性の簡易判定（`tabindex` 属性の
+//!   有無・代表的な対話要素・`aria-` 接頭辞の属性有無）による近似のみを
+//!   行う。`disabled`/`hidden` 等によるフォーカス可能性の除外、WAI-ARIA
+//!   1.2 §6.4 のグローバル状態・プロパティの正確な一覧との照合、
+//!   presentation の子孫への継承は扱わない。PR #566 レビュー指摘）
 //! - role の必須コンテキスト（required context role）の検証
 //! - DPub/Graphics ARIA モジュールの role
 //! - `section` の `region` 昇格（accessible name を持つときのみ `region`
 //!   になる規則。accessible name の算出自体が TASK-11.4・Issue #73 の範囲）
 //! - `form`・`img` の完全な accessible name 算出。`aria-labelledby` が
-//!   指す要素のテキストやネイティブラベリング機構までを含めた判定は
-//!   TASK-11.4・Issue #73 の範囲であり、本実装は `aria-label`/
-//!   `aria-labelledby` 属性の非空値の有無だけを見る簡易 hint
-//!   （[`has_name_hint`]）に留める
+//!   指す要素の実テキストの連結・空白正規化・ネイティブラベリング機構
+//!   （`label` 要素等）・`title` 属性まで含めた優先順位付き判定は
+//!   TASK-11.4・Issue #73 の範囲であり、本実装は `aria-label` の非空値の
+//!   有無、または `aria-labelledby` が指す ID が文書内に実在するかどうか
+//!   だけを見る簡易 hint（[`has_name_hint`]）に留める（PR #566 レビュー
+//!   指摘を受け、参照先未解決の `aria-labelledby` は名前ヒントに含めない
+//!   よう修正済み）
 //! - `th`/`td` の表文脈による完全な判定（`scope` が無い `th` を位置で
 //!   行見出し・列見出し・セルに振り分ける処理、`td` が `gridcell` になる
 //!   文脈）。本実装は `th` を `scope` 属性のみで判定する簡易実装である
@@ -243,21 +250,54 @@ fn implicit_role_for_th(doc: &Document, id: NodeId) -> ComputedRole {
     }
 }
 
-/// 属性値のみを見る簡易な「名前ヒント」判定。`aria-labelledby`・
-/// `aria-label` のいずれかが空でない値を持つかどうかを返す。
+/// `doc` 内に `id` content attribute の値が `target` と一致する要素が
+/// 存在するかどうかを返す（`aria-labelledby` の IDREF 解決用）。
+///
+/// [`Document`] は id 索引を持たないため、`doc.root()` から
+/// [`Document::descendants`] で全要素を走査する（`node_count` で上限打ち切り
+/// 済みのため無制限走査にはならない。security.md「不安全な設計」対策）。
+/// 複数要素が同じ `id` を持つ不正な HTML では最初に見つかった要素を採用する
+/// （最初の一致で resolve する、というブラウザの一般的な `getElementById`
+/// 挙動に合わせる）。
+fn element_with_id_exists(doc: &Document, target: &str) -> bool {
+    doc.descendants(doc.root())
+        .any(|node| doc.attribute(node, "id") == Some(target))
+}
+
+/// `aria-labelledby` の値（空白区切りの ID 列）のうち、`doc` 内に実在する
+/// 要素を指すトークンが 1 つでもあるかどうかを返す。
+///
+/// 参照先が存在しない IDREF（例: `aria-labelledby="missing"`）は、それが
+/// 指す要素のテキストを持ちえないため名前のヒントとして扱わない
+/// （PR #566 レビュー指摘。`has_name_hint` 参照）。
+fn labelledby_references_existing_element(doc: &Document, id: NodeId) -> bool {
+    doc.attribute(id, "aria-labelledby").is_some_and(|value| {
+        value
+            .split_ascii_whitespace()
+            .any(|token| element_with_id_exists(doc, token))
+    })
+}
+
+/// 属性値のみを見る簡易な「名前ヒント」判定。次のいずれかが成り立てば
+/// 名前を持つとみなす。
+///
+/// - `aria-label` が空でない値を持つ
+/// - `aria-labelledby` が、`doc` 内に実在する要素を指す ID を 1 つ以上含む
+///   （[`labelledby_references_existing_element`]。参照先未解決の IDREF は
+///   名前のヒントとして扱わない）
 ///
 /// 簡易実装: WAI-ARIA の accessible name 算出アルゴリズム（`aria-labelledby`
 /// が指す要素の実テキスト・ネイティブラベリング機構（`label` 要素等）・
 /// `title` 属性まで含めた優先順位付き算出）は TASK-11.4（Issue #73）の
-/// 範囲であり、本実装はここでは `aria-label`/`aria-labelledby` 属性の
-/// 非空値の有無だけを見る hint に留める（[`implicit_role_for_img`]・
-/// `form` の暗黙 role 判定から利用）。
+/// 範囲であり、本実装は参照先の「存在」までしか見ない（実テキストの連結・
+/// 空白正規化・`aria-label` との優先順位づけは行わない。
+/// [`implicit_role_for_img`]・`form` の暗黙 role 判定から利用）。
 fn has_name_hint(doc: &Document, id: NodeId) -> bool {
     let non_empty = |attr: &str| {
         doc.attribute(id, attr)
             .is_some_and(|value| !value.trim().is_empty())
     };
-    non_empty("aria-label") || non_empty("aria-labelledby")
+    non_empty("aria-label") || labelledby_references_existing_element(doc, id)
 }
 
 /// `img` 要素の暗黙 role を返す。`alt=""`（空文字列。属性自体が無い場合は
@@ -384,6 +424,41 @@ fn implicit_role(doc: &Document, id: NodeId) -> ComputedRole {
     ComputedRole::fallback()
 }
 
+/// ネイティブに（`tabindex` 属性なしで）フォーカス可能な HTML 要素かどうかを
+/// 判定する。[`is_presentation_conflict`] からのみ使う簡易判定であり、
+/// disabled・`hidden` 等による除外は見ない（フォーカス可能性の完全な判定は
+/// 本 Issue のスコープ外。下記コメント参照）。
+fn is_natively_focusable_element(doc: &Document, id: NodeId) -> bool {
+    let named = |name: &str| is_html_element_named(doc, id, name);
+    if (named("a") || named("area")) && doc.attribute(id, "href").is_some() {
+        return true;
+    }
+    named("button") || named("input") || named("select") || named("textarea")
+}
+
+/// `id` が「フォーカス可能」または「グローバル ARIA 状態・プロパティ」を
+/// 持つかどうかを返す（WAI-ARIA 1.2 の presentation/none 競合解決規則の
+/// 判定に使う）。
+///
+/// 簡易実装: フォーカス可能性は `tabindex` 属性の有無（値の妥当性は見ない）
+/// と、代表的なネイティブ対話要素（[`is_natively_focusable_element`]。
+/// `disabled`・`hidden` 等による除外は考慮しない）だけで判定する。
+/// グローバル ARIA 属性は `aria-` 接頭辞を持つ属性の有無で近似する
+/// （WAI-ARIA 1.2 §6.4 の正確な一覧との照合はしない。`aria-hidden` も
+/// 含める。完全な判定は TASK-11.3.3・Issue #543 以降のフォローアップとする
+/// ）。
+fn has_focus_or_global_aria(doc: &Document, id: NodeId) -> bool {
+    if doc.attribute(id, "tabindex").is_some() {
+        return true;
+    }
+    if is_natively_focusable_element(doc, id) {
+        return true;
+    }
+    doc.attributes(id)
+        .iter()
+        .any(|attr| attr.name.ns.is_empty() && attr.name.local.starts_with("aria-"))
+}
+
 /// `role` 属性の値から、有効な明示 role を算出する。
 ///
 /// WAI-ARIA のフォールバック規則に従い、空白区切りのトークン列を先頭から
@@ -392,20 +467,27 @@ fn implicit_role(doc: &Document, id: NodeId) -> ComputedRole {
 /// （`role="Button"` も `button` として受け付ける）。有効なトークンが
 /// 無ければ `None`（暗黙 role へフォールバックさせる）を返す。
 ///
+/// 採用したトークンが `none`/`presentation` で、かつ要素がフォーカス可能
+/// または グローバル ARIA 状態・プロパティを持つ場合（[`has_focus_or_global_aria`]）
+/// は、WAI-ARIA の presentation/none 競合解決規則に従い `role` 属性の指定を
+/// 無視し `None`（暗黙 role へフォールバック）を返す（PR #566 レビュー指摘。
+/// 操作対象の要素から role を消してしまわないため）。
+///
 /// 返すのは許可リスト側の `&'static str` である。属性値の文字列（外部の
 /// HTML に由来する untrusted 入力）はそのまま出力へ流さない。
 ///
 /// `role` 属性は名前空間を問わず見る（SVG 要素でも有効）。
 fn explicit_role(doc: &Document, id: NodeId) -> Option<ComputedRole> {
     let value = doc.attribute(id, "role")?;
-    value
-        .split_ascii_whitespace()
-        .find_map(|token| {
-            KNOWN_ROLES
-                .iter()
-                .find(|known| token.eq_ignore_ascii_case(known))
-        })
-        .map(|known| ComputedRole::explicit(known))
+    let token = value.split_ascii_whitespace().find_map(|token| {
+        KNOWN_ROLES
+            .iter()
+            .find(|known| token.eq_ignore_ascii_case(known))
+    })?;
+    if (*token == "none" || *token == "presentation") && has_focus_or_global_aria(doc, id) {
+        return None;
+    }
+    Some(ComputedRole::explicit(token))
 }
 
 /// `doc` のノード `id` から role を算出する（`AISNAP-1`・`TASK-11.3`・
@@ -618,15 +700,16 @@ mod tests {
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: `alt=""`
-    /// でも `aria-label`/`aria-labelledby` の非空値（ARIA 名のヒント）が
-    /// あれば装飾画像として `none` にせず `img` のまま扱う。
+    /// でも `aria-label` の非空値、または `aria-labelledby` が文書内に
+    /// 実在する要素を指す場合（ARIA 名のヒント）は装飾画像として `none` に
+    /// せず `img` のまま扱う。
     #[test]
     fn aisnap_1_img_empty_alt_with_aria_name_stays_img() {
         let (doc, id) = parse_and_select(r#"<img src="a.png" alt="" aria-label="説明">"#, "img");
         assert_role(compute_role(&doc, id), "img", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select(
-            r#"<img src="a.png" alt="" aria-labelledby="caption">"#,
+            r#"<span id="caption">説明</span><img src="a.png" alt="" aria-labelledby="caption">"#,
             "img",
         );
         assert_role(compute_role(&doc, id), "img", RoleSource::Implicit);
@@ -636,10 +719,25 @@ mod tests {
         assert_role(compute_role(&doc, id), "none", RoleSource::Implicit);
     }
 
+    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: 参照先が
+    /// 文書内に存在しない `aria-labelledby`（dangling IDREF）は名前の
+    /// ヒントとして扱わず、`alt=""` の `img` は `none` のままになる
+    /// （`has_name_hint` が参照先未解決でも非空値だけで名前ありと誤判定
+    /// していた不具合の修正）。
+    #[test]
+    fn aisnap_1_img_empty_alt_with_dangling_labelledby_stays_none() {
+        let (doc, id) = parse_and_select(
+            r#"<img src="a.png" alt="" aria-labelledby="missing">"#,
+            "img",
+        );
+        assert_role(compute_role(&doc, id), "none", RoleSource::Implicit);
+    }
+
     /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: 名前の
     /// ない `form` は `form` にせず `generic`（Fallback）とする
     /// （HTML-AAM。`section` の `region` 昇格と同じ規則）。名前が
-    /// `aria-label`/`aria-labelledby` で判定できる場合のみ `form` になる。
+    /// `aria-label` の非空値、または `aria-labelledby` の参照先が文書内に
+    /// 実在する場合のみ `form` になる。
     #[test]
     fn aisnap_1_form_role_requires_name() {
         let (doc, id) = parse_and_select("<form></form>", "form");
@@ -648,11 +746,23 @@ mod tests {
         let (doc, id) = parse_and_select(r#"<form aria-label="検索"></form>"#, "form");
         assert_role(compute_role(&doc, id), "form", RoleSource::Implicit);
 
-        let (doc, id) = parse_and_select(r#"<form aria-labelledby="h1"></form>"#, "form");
+        let (doc, id) = parse_and_select(
+            r#"<h1 id="h1">検索</h1><form aria-labelledby="h1"></form>"#,
+            "form",
+        );
         assert_role(compute_role(&doc, id), "form", RoleSource::Implicit);
 
         // 空白のみの aria-label はヒントとして扱わない（`generic` のまま）。
         let (doc, id) = parse_and_select(r#"<form aria-label="  "></form>"#, "form");
+        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: 参照先が
+    /// 文書内に存在しない `aria-labelledby`（dangling IDREF）を持つ `form`
+    /// は名前を持たないとみなし `generic`（Fallback）のままになる。
+    #[test]
+    fn aisnap_1_form_dangling_labelledby_stays_generic() {
+        let (doc, id) = parse_and_select(r#"<form aria-labelledby="missing"></form>"#, "form");
         assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
     }
 
@@ -718,6 +828,51 @@ mod tests {
     fn aisnap_1_explicit_role_overrides_element_role() {
         let (doc, id) = parse_and_select(r##"<a href="#" role="tab">x</a>"##, "a");
         assert_role(compute_role(&doc, id), "tab", RoleSource::Explicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）:
+    /// フォーカス可能な要素（ネイティブに対話的な `button`）には
+    /// `role="presentation"`/`role="none"` を適用できず、暗黙 role
+    /// （`button`/Implicit）へフォールバックする（presentation/none
+    /// 競合解決規則。[`has_focus_or_global_aria`]）。
+    #[test]
+    fn aisnap_1_presentation_ignored_on_focusable_button() {
+        let (doc, id) = parse_and_select(r#"<button role="presentation">x</button>"#, "button");
+        assert_role(compute_role(&doc, id), "button", RoleSource::Implicit);
+
+        let (doc, id) = parse_and_select(r#"<button role="none">x</button>"#, "button");
+        assert_role(compute_role(&doc, id), "button", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）:
+    /// `tabindex` 属性を持つ要素もフォーカス可能とみなし、
+    /// `role="presentation"` を無視して暗黙 role（`div` は対応表に無いため
+    /// `generic`/Fallback）へフォールバックする。
+    #[test]
+    fn aisnap_1_presentation_ignored_on_tabindex_element() {
+        let (doc, id) = parse_and_select(r#"<div tabindex="0" role="presentation">x</div>"#, "div");
+        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: グローバル
+    /// ARIA 属性（`aria-label`）を持つ要素も `role="none"` を無視して
+    /// 暗黙 role へフォールバックする。
+    #[test]
+    fn aisnap_1_none_ignored_on_element_with_global_aria_attribute() {
+        let (doc, id) = parse_and_select(r#"<div role="none" aria-label="x">y</div>"#, "div");
+        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: フォーカス
+    /// 可能でもグローバル ARIA 属性も持たない要素は、従来どおり
+    /// `presentation`/`none` を明示 role として採用する。
+    #[test]
+    fn aisnap_1_presentation_accepted_without_focus_or_global_aria() {
+        let (doc, id) = parse_and_select(r#"<div role="presentation">x</div>"#, "div");
+        assert_role(compute_role(&doc, id), "presentation", RoleSource::Explicit);
+
+        let (doc, id) = parse_and_select(r#"<img src="a.png" alt="" role="none">"#, "img");
+        assert_role(compute_role(&doc, id), "none", RoleSource::Explicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: テキストノードは role を持たず
