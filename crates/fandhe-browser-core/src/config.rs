@@ -56,14 +56,35 @@
 //!    できる範囲に限る）で拒否する
 //! 2. 絶対パスを設定ファイルの親ディレクトリ配下に限定する検証を
 //!    [`Config::load`] で行う（ファイルパスを知っているのは `load` のみの
-//!    ため。字句正規化〔`..`・`.` の畳み込み〕はするが `canonicalize`・
-//!    `exists` は呼ばずファイルシステムには触れない）
+//!    ため）
 //!
-//! symlink に対する防御はこの層では行わず、
-//! `fandhe-browser-profile::Profile::open`（TASK-50・#177）が担うハンドル
-//! 基準（`openat` + `NOFOLLOW`）の走査に委ねる（二重実装しない）。つまり
-//! 「許容範囲内かどうか」は config クレートが、「範囲内の各要素が symlink
-//! でないか」は profile クレートが受け持つ、という役割分担になる。
+//! 基準ディレクトリ（設定ファイルの親ディレクトリ）は `std::fs::canonicalize`
+//! で symlink 解決済みの実所在まで求めてから比較する（Issue #538 P0 再指摘:
+//! 本関数はこの直前で `File::open(path)` により設定ファイルを開いており、
+//! `File::open` は symlink を解決する。判定側だけが `path.parent()` の字句
+//! 正規化に留まっていると、`path` 自体や親ディレクトリが symlink を経由する
+//! 場合に、実際に開かれた設定ファイルの所在と判定基準が食い違い、実際の
+//! 設定ディレクトリ外を指す `root` を誤って受理し得る。`File::open` が
+//! 成功した直後の呼び出しであり対象ファイルは実在するため、`canonicalize`
+//! はこの時点まで先送りしても安全に呼べる）。
+//!
+//! 絶対 `root` 側も、基準ディレクトリと桁を揃えて比較するため
+//! [`resolve_physical_prefix`] で実在する最長の祖先まで `canonicalize` する
+//! （`root` 全体は `Profile::open` 呼び出し前は実在するとは限らないため
+//! 全体を `canonicalize` できない）。祖先を物理パスへ解決しないまま
+//! `base_abs`（symlink 解決済み）とだけ字句比較すると、symlink を経由する
+//! 環境（例: macOS の `/var` → `/private/var`）で正当な `root` まで誤って
+//! 境界外と判定してしまう（P0 修正時に見つかった副作用）。実在しない末尾の
+//! 要素は字句のまま残す（まだ存在しないため symlink になり得ない）。
+//!
+//! `root` の実在する部分に含まれる symlink はこの物理解決で境界比較に
+//! 反映されるが、「symlink を積極的に拒否する」防御そのものはこの層では
+//! 行わない。`fandhe-browser-profile::Profile::open`（TASK-50・#177）が担う
+//! ハンドル基準（`openat` + `NOFOLLOW`）の走査に委ねる（二重実装しない）。
+//! つまり
+//! 「（symlink 解決済みの）許容範囲内かどうか」は config クレートが、
+//! 「範囲内の各要素が symlink でないか」は profile クレートが受け持つ、
+//! という役割分担になる。
 //!
 //! # リソース上限
 //!
@@ -147,26 +168,46 @@ impl Config {
         let mut config = Config::from_toml_str(&text)?;
 
         if let Some(root) = config.profile.root.take() {
+            // 設定ファイルの親ディレクトリを symlink 解決済みの実所在まで
+            // 求める（Issue #538 P0 再指摘）。直前の `File::open(path)` が
+            // 成功しているため対象ファイルは実在し、ここで `canonicalize`
+            // を呼んでも「ファイルシステムに触れない」という
+            // `ProfileConfig::from_raw` の字句判定（文字列のみを扱う）との
+            // 分担は崩れない。絶対パス・相対パスいずれの分岐でも、この
+            // symlink 解決済みの `base_abs` を基準に検証・結合する
+            // （モジュール doc「パス解決」参照）。
+            let base_abs = {
+                let canonical_config_file = std::fs::canonicalize(path).map_err(|source| {
+                    Error::from(ConfigError::Io {
+                        message: format!("failed to resolve {}: {source}", path.display()),
+                    })
+                })?;
+                canonical_config_file
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .ok_or_else(|| {
+                        Error::from(ConfigError::Io {
+                            message: format!(
+                                "failed to resolve parent directory of {}",
+                                canonical_config_file.display()
+                            ),
+                        })
+                    })?
+            };
+
             let resolved = if root.is_absolute() {
                 // 絶対パスは設定ファイルの親ディレクトリ配下に限定する
                 // （Issue #538 P0 レビュー指摘）。`ProfileConfig::from_raw` の
                 // 字句判定（`resolves_outside_or_at_base_dir`）は絶対パスを
                 // 対象外にしているため、ファイルパスを知っている本関数でのみ
                 // 検証できる。`Profile::open` へ渡す前（副作用の前）に拒否する。
-                let base_dir = path
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
-                let base_abs = std::path::absolute(base_dir).map_err(|source| {
-                    Error::from(ConfigError::Io {
-                        message: format!(
-                            "failed to resolve config directory {}: {source}",
-                            base_dir.display()
-                        ),
-                    })
-                })?;
-                let base_abs = normalize_lexically(&base_abs);
-                let root_abs = normalize_lexically(&root);
+                //
+                // `base_abs` は symlink 解決済み（`canonicalize` 済み）のため、
+                // `root` 側も実在する最長の祖先まで同様に解決してから比較する
+                // （`resolve_physical_prefix`。Issue #538 P0 再指摘）。片方だけ
+                // 解決すると、symlink を経由する環境（例: macOS の `/var` →
+                // `/private/var`）で正当な `root` を誤って境界外と判定する。
+                let root_abs = resolve_physical_prefix(&root)?;
 
                 if !is_lexically_within(&base_abs, &root_abs) {
                     return Err(Error::from(ConfigError::InvalidValue {
@@ -180,49 +221,41 @@ impl Config {
                     }));
                 }
 
-                // 検証に使った字句正規化済みパス（`root_abs`）をそのまま
-                // 採用する（Issue #538 P0 レビュー再指摘）。未正規化の
-                // `root` を返すと、検証済みの最終到達点と実際に
-                // `fandhe-browser-profile::Profile::open`（TASK-50・#177）が
-                // 要素ごとに辿るパスが食い違う。例えば設定ディレクトリが
-                // `<dir>` のとき `root = "<dir>/../outside/../<dir 名>/profiles"`
-                // は字句正規化後の最終到達点こそ `<dir>/profiles`（境界内）だが、
+                // 検証に使った物理解決済みパス（`root_abs`）をそのまま採用する
+                // （Issue #538 P0 レビュー再指摘）。未解決の `root` を返すと、
+                // 検証済みの最終到達点と実際に `fandhe-browser-profile::
+                // Profile::open`（TASK-50・#177）が要素ごとに辿るパスが
+                // 食い違う。例えば設定ディレクトリが `<dir>` のとき
+                // `root = "<dir>/../outside/../<dir 名>/profiles"` は字句
+                // 正規化後の最終到達点こそ `<dir>/profiles`（境界内）だが、
                 // 未正規化のまま渡すと `Profile::open` は `outside` という
                 // 実在しない兄弟ディレクトリを経由して辿ろうとし、設定
                 // ディレクトリ外への作成につながりかねない（security.md
-                // 「不安全な設計」・プロファイル境界）。字句正規化済みの
+                // 「不安全な設計」・プロファイル境界）。物理解決済みの
                 // `root_abs` を渡すことで、境界検証と実際に使われるパスを
                 // 一致させる。
                 root_abs
             } else {
                 // 設定ファイルの親ディレクトリ基準で解決する（CWD 非依存）。
                 // `path` 自体が相対パス（例: `config/fandhe-browser.toml`）の
-                // 場合、`parent()` も相対のままとなり、そのまま `join` すると
-                // `resolved` も相対パスになってしまう。`Config::load` 完了後に
-                // 呼び出し元が CWD を変更すると、`fandhe-browser-profile::
-                // Profile::open`（TASK-50・#177）へ渡した時点で別の場所を
-                // 開いてしまい、本モジュールが掲げる「CWD 非依存」の契約
-                // （モジュール doc「パス解決」参照）を満たせない（Issue #538
-                // P1 レビュー指摘）。そのため、絶対パス分岐と同様に
-                // `std::path::absolute` で親ディレクトリを先に絶対パスへ
-                // 固定してから `root` を結合する（`canonicalize` は使わず
-                // ファイルシステムには触れない）。相対パスの字句上の脱出は
-                // `ProfileConfig::from_raw` が既に拒否済みのため、ここで
-                // 組み立てた結果は常に設定ファイルの親ディレクトリ配下に
-                // 収まる。
-                let base_dir = path
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
-                let base_abs = std::path::absolute(base_dir).map_err(|source| {
-                    Error::from(ConfigError::Io {
-                        message: format!(
-                            "failed to resolve config directory {}: {source}",
-                            base_dir.display()
-                        ),
-                    })
-                })?;
-                base_abs.join(&root)
+                // 場合でも、`base_abs`（上で `canonicalize` 済み）は既に
+                // 絶対パスかつ symlink 解決済みのため、そのまま `join` すれば
+                // `resolved` も絶対パスになる（本モジュール doc「パス解決」の
+                // 「CWD 非依存」契約を満たす）。
+                //
+                // `base_abs.join(&root)` の結果は正規化前のまま返さず、
+                // `normalize_lexically` で `..`・`.` を畳み込んでから返す
+                // （Issue #538 P1 レビュー指摘）。相対パスの字句上の脱出は
+                // `ProfileConfig::from_raw` が既に拒否済みだが、拒否済みの
+                // 値であっても `..` 自体は残り得る（例:
+                // `root = "a/../profiles"` は基準ディレクトリより上位へ
+                // 脱出しないため受理されるが、`..` を残したまま返すと
+                // `fandhe-browser-profile::Profile::open`（TASK-50・#177）が
+                // 要素ごとに辿る際、実在しない・symlink かもしれない中間
+                // ディレクトリ `a` を経由してしまう。検証に用いた最終到達点
+                // （畳み込み後のパス）と実際に渡すパスを一致させるため、
+                // 絶対パス分岐と同様にここでも正規化する。
+                normalize_lexically(&base_abs.join(&root))
             };
             config.profile.root = Some(resolved);
         }
@@ -391,17 +424,17 @@ fn resolves_outside_or_at_base_dir(path: &Path) -> bool {
     depth <= 0
 }
 
-/// パスをファイルシステムへ一切触れずに字句正規化する（`.` を除去し、
+/// パスを字句上（コンポーネント解析のみ）で正規化する（`.` を除去し、
 /// `..` を直前の `Normal` 要素と相殺する）。
 ///
-/// [`Config::load`] が絶対 `root` を設定ファイルの親ディレクトリ配下に
-/// 限定する検証（Issue #538 P0 レビュー指摘）の前処理として使う。
-/// `std::path::absolute`（呼び出し元が事前に適用する）は絶対パスをそのまま
-/// 返すだけで `..`/`.` を畳み込まないため、比較の前に本関数で正規化する。
-/// ルート（`RootDir`/`Prefix`）より上位へ脱出する `..` は、実際の OS の
-/// パス解決と同様にルート自身へ留める（捨てる）。`canonicalize`・`exists`
-/// は呼ばない（symlink 解決は `fandhe-browser-profile::Profile::open` に
-/// 委ねる。モジュール doc「パス解決」参照）。
+/// [`Config::load`] が `root`（絶対パスの場合はそれ自身、相対パスの場合は
+/// symlink 解決済みの基準ディレクトリとの結合結果）を正規化する後処理として
+/// 使う（Issue #538 P0・P1 レビュー指摘）。`root` 自体はまだ実在するとは
+/// 限らないため、ここでは `canonicalize` を呼ばず、あくまで字句上の畳み込み
+/// に留める。ルート（`RootDir`/`Prefix`）より上位へ脱出する `..` は、実際の
+/// OS のパス解決と同様にルート自身へ留める（捨てる）。`root` 自身の各要素が
+/// symlink でないかの検証は行わない（`fandhe-browser-profile::Profile::open`
+/// に委ねる。モジュール doc「パス解決」参照）。
 fn normalize_lexically(path: &Path) -> PathBuf {
     use std::path::Component;
 
@@ -425,6 +458,50 @@ fn normalize_lexically(path: &Path) -> PathBuf {
         }
     }
     result
+}
+
+/// `path`（絶対パス想定）を字句正規化したうえで、実在する最長の祖先だけ
+/// `canonicalize`（symlink 解決）し、実在しない残りの要素をその後ろへ
+/// 字句のまま結合して返す（`realpath -m` 相当）。
+///
+/// [`Config::load`] が絶対 `root`（`fandhe-browser-profile::Profile::open`
+/// 呼び出し前は実在するとは限らない）を、symlink 解決済みの設定ディレクトリ
+/// （`canonicalize` 済みの `base_abs`）と桁を揃えて比較するために使う
+/// （Issue #538 P0 再指摘）。祖先が 1 つも実在しない場合（ルート自体が
+/// 読めない等）は `canonicalize` のエラーをそのまま [`ConfigError::Io`] へ
+/// 写像する。実在しない末尾の要素は symlink になり得ないため、字句のまま
+/// 残してよい（実在する部分の symlink 解決だけで `base_abs` との比較に
+/// 十分な物理的一致が得られる）。`root` の実在する部分に symlink 自体が
+/// あるかどうかを積極的に拒否する検査はここでは行わない（モジュール doc
+/// 「パス解決」参照。`Profile::open` の責務）。
+fn resolve_physical_prefix(path: &Path) -> Result<PathBuf> {
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = normalize_lexically(path);
+
+    loop {
+        match std::fs::canonicalize(&current) {
+            Ok(mut resolved) => {
+                while let Some(part) = suffix.pop() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
+            }
+            Err(source) => {
+                let Some(file_name) = current.file_name() else {
+                    return Err(Error::from(ConfigError::Io {
+                        message: format!("failed to resolve {}: {source}", path.display()),
+                    }));
+                };
+                suffix.push(file_name.to_os_string());
+                let Some(parent) = current.parent() else {
+                    return Err(Error::from(ConfigError::Io {
+                        message: format!("failed to resolve {}: {source}", path.display()),
+                    }));
+                };
+                current = parent.to_path_buf();
+            }
+        }
+    }
 }
 
 /// `candidate`（字句正規化済みの絶対パス）が `base`（同じく字句正規化済みの

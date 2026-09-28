@@ -58,6 +58,13 @@ impl Drop for TempDir {
 
 /// TASK-91（91.1）: 一時ファイルに書いた TOML から `root`・`isolation` を
 /// 読める（Issue #214 受入基準 2 の証跡）。
+///
+/// 期待値は `dir.path()` をそのまま使わず `canonicalize()` する
+/// （Issue #538 P0 再指摘の回帰防止。`Config::load` は基準ディレクトリを
+/// `std::fs::canonicalize` で symlink 解決済みにしてから相対 `root` を
+/// 結合するため、`std::env::temp_dir()` が symlink 経由になる環境
+/// （macOS の `/var` → `/private/var`・Windows の `\\?\` 接頭辞）では
+/// `dir.path()` の字句表現と実装の返り値が一致しない）。
 #[test]
 fn task_91_1_load_reads_profile_root_and_isolation() {
     let dir = TempDir::new();
@@ -66,9 +73,13 @@ fn task_91_1_load_reads_profile_root_and_isolation() {
 
     let config = Config::load(&config_path).expect("設定ファイルを読み込める");
 
+    let canonical_dir = dir
+        .path()
+        .canonicalize()
+        .expect("一時ディレクトリを canonicalize できる");
     assert_eq!(
         config.profile().root(),
-        Some(dir.path().join("profiles/default")).as_deref()
+        Some(canonical_dir.join("profiles/default")).as_deref()
     );
     assert_eq!(
         config.profile().isolation(),
@@ -78,6 +89,9 @@ fn task_91_1_load_reads_profile_root_and_isolation() {
 
 /// TASK-91（91.1）: 相対 `root` は設定ファイルの親ディレクトリ基準で
 /// `join` された `PathBuf` になる（CWD には依存しない）。
+///
+/// 期待値の `canonicalize()` 理由は
+/// `task_91_1_load_reads_profile_root_and_isolation` を参照。
 #[test]
 fn task_91_1_relative_root_is_resolved_against_config_parent_dir() {
     let dir = TempDir::new();
@@ -85,9 +99,13 @@ fn task_91_1_relative_root_is_resolved_against_config_parent_dir() {
 
     let config = Config::load(&config_path).expect("設定ファイルを読み込める");
 
+    let canonical_dir = dir
+        .path()
+        .canonicalize()
+        .expect("一時ディレクトリを canonicalize できる");
     assert_eq!(
         config.profile().root(),
-        Some(dir.path().join("a")).as_deref()
+        Some(canonical_dir.join("a")).as_deref()
     );
 }
 
@@ -119,16 +137,13 @@ fn task_91_1_load_with_relative_path_resolves_root_to_absolute() {
     // 実在するので `canonicalize()` できる）を、`dir.path()` を
     // `canonicalize()` した上で組み立てる（Bugbot 指摘の回帰防止）。
     // `"profiles/default"` サブディレクトリ自体は作成していないため
-    // 実在せず、`root` 全体は `canonicalize()` できない。実装側は CWD
-    // 基準の絶対化に `std::path::absolute`（内部で `current_dir()`／
-    // `getcwd` を使う）を用いており、macOS では `set_current_dir` 後の
-    // `getcwd` がシンボリックリンク解決済みパス（`/private/var/...`）を
-    // 返す一方、`std::env::temp_dir()`（`dir.path()` の基点）は未解決の
-    // まま（`/var/...`）となる。両者は同じディレクトリを指すが字句表現が
-    // 異なるため、比較前に実在する祖先部分だけを `canonicalize()` して
-    // 物理パスへ揃える（実装側は symlink 解決をファイルシステムアクセス
-    // なしで行う設計方針〔モジュール doc「パス解決」参照〕のため変更
-    // しない。あくまでテストの比較方法の修正）。
+    // 実在せず、`root` 全体は `canonicalize()` できない。実装側
+    // （`Config::load`）は基準ディレクトリの絶対化に
+    // `std::fs::canonicalize`（Issue #538 P0 再指摘対応。symlink を解決する）
+    // を用いているため、macOS で `std::env::temp_dir()`（`dir.path()` の
+    // 基点）が未解決のまま（`/var/...`）でも、実装が返す `root` は解決済み
+    // （`/private/var/...`）になり、字句表現が異なる。比較前に実在する
+    // 祖先部分だけを `canonicalize()` して物理パスへ揃える。
     let canonical_dir = dir
         .path()
         .canonicalize()
@@ -174,8 +189,12 @@ fn task_91_1_load_with_relative_path_resolves_root_to_absolute() {
     assert_root_resolves_to(unaffected.as_deref().expect("root が保持されている"));
 }
 
-/// TASK-91（91.1）: 絶対 `root` はそのまま使われる（親ディレクトリで
-/// 上書きしない）。
+/// TASK-91（91.1）: 絶対 `root` は親ディレクトリで上書きされない
+/// （境界検証を通過した実在する祖先部分は `canonicalize` された物理パスで
+/// 返る。Issue #538 P0 再指摘: `base_abs` と桁を揃えるために `root` 側も
+/// 実在する祖先を物理解決するため、期待値は `absolute_root` の字句表現では
+/// なく、実在する一時ディレクトリを `canonicalize()` したうえで組み立てる。
+/// 理由は `task_91_1_load_reads_profile_root_and_isolation` 参照）。
 #[test]
 fn task_91_1_absolute_root_is_used_as_is() {
     let dir = TempDir::new();
@@ -185,7 +204,14 @@ fn task_91_1_absolute_root_is_used_as_is() {
 
     let config = Config::load(&config_path).expect("設定ファイルを読み込める");
 
-    assert_eq!(config.profile().root(), Some(absolute_root.as_path()));
+    let canonical_dir = dir
+        .path()
+        .canonicalize()
+        .expect("一時ディレクトリを canonicalize できる");
+    assert_eq!(
+        config.profile().root(),
+        Some(canonical_dir.join("elsewhere").as_path())
+    );
 }
 
 /// TASK-91（91.1）: 絶対 `root` が境界検証を通過した場合、返される
@@ -216,11 +242,17 @@ fn task_91_1_absolute_root_with_lexical_escape_is_normalized_before_return() {
 
     let config = Config::load(&config_path).expect("境界検証を通過して読み込める");
 
+    let canonical_dir = dir
+        .path()
+        .canonicalize()
+        .expect("一時ディレクトリを canonicalize できる");
     let root = config.profile().root().expect("root が解決されている");
     assert_eq!(
         root,
-        dir.path().join("profiles"),
-        "root は字句正規化済みのパスであるべき（未正規化の 'outside' を含んではならない）"
+        canonical_dir.join("profiles"),
+        "root は正規化・物理解決済みのパスであるべき（未正規化の 'outside' を含んではならない。\
+         期待値を canonicalize するのは Issue #538 P0 再指摘対応の回帰防止。\
+         理由は task_91_1_load_reads_profile_root_and_isolation 参照）"
     );
     assert!(
         !root.components().any(|c| c.as_os_str() == "outside"),
@@ -310,7 +342,16 @@ fn task_91_1_absolute_root_under_config_dir_is_accepted() {
 
     let config = Config::load(&config_path).expect("設定ファイルの配下を指す絶対パスは受理される");
 
-    assert_eq!(config.profile().root(), Some(absolute_root.as_path()));
+    // 期待値を canonicalize するのは Issue #538 P0 再指摘対応の回帰防止
+    // （理由は task_91_1_load_reads_profile_root_and_isolation 参照）。
+    let canonical_dir = dir
+        .path()
+        .canonicalize()
+        .expect("一時ディレクトリを canonicalize できる");
+    assert_eq!(
+        config.profile().root(),
+        Some(canonical_dir.join("nested").join("profiles").as_path())
+    );
 }
 
 /// TASK-91（91.1）・PROF-6: 設定ファイルのディレクトリ**外**を指す絶対 `root`
@@ -367,4 +408,99 @@ fn task_91_1_non_utf8_file_is_invalid_utf8_error() {
     let err = Config::load(&config_path).expect_err("非 UTF-8 はエラーになる");
 
     assert!(matches!(err, Error::Config(ConfigError::InvalidUtf8)));
+}
+
+/// TASK-91（91.1）: `root = "a/../profiles"` は基準ディレクトリより上位へ
+/// 脱出しないため受理されるが、返される `profile.root` は字句正規化済み
+/// （`a` を含まない）でなければならない（Issue #538 P1 レビュー指摘の回帰
+/// 防止。期待値を canonicalize する理由は
+/// `task_91_1_load_reads_profile_root_and_isolation` 参照）。
+#[test]
+fn task_91_1_relative_root_with_dot_dot_is_normalized_before_return() {
+    let dir = TempDir::new();
+    let config_path = dir.write_config("[profile]\nroot = 'a/../profiles'\n");
+
+    let config = Config::load(&config_path).expect("基準ディレクトリ内に収まるため受理される");
+
+    let canonical_dir = dir
+        .path()
+        .canonicalize()
+        .expect("一時ディレクトリを canonicalize できる");
+    let root = config.profile().root().expect("root が解決されている");
+    assert_eq!(
+        root,
+        canonical_dir.join("profiles"),
+        "root は正規化済みで 'a' を含んではならない"
+    );
+    assert!(
+        !root.components().any(|c| c.as_os_str() == "a"),
+        "root に未正規化の中間要素 'a' が残っている: {root:?}"
+    );
+}
+
+/// TASK-91（91.1）・PROF-6: 設定ファイル自体が symlink 経由のディレクトリを
+/// 通って開かれる場合、境界判定は symlink 解決後の実所在で行う（Issue #538
+/// P0 再指摘の回帰防止）。
+///
+/// `dir_b/link` は `dir_a` を指す symlink。`dir_a/fandhe-browser.toml` の
+/// `root` を `dir_b`（symlink 側のディレクトリ。実際の設定ディレクトリ
+/// `dir_a` とは無関係）配下に設定すると、`dir_b/link/fandhe-browser.toml`
+/// 経由で読み込んだ場合に拒否されなければならない。字句上の
+/// `path.parent()`（`dir_b/link`）だけで判定すると誤って受理してしまう
+/// （修正前の脆弱性）。
+#[cfg(unix)]
+#[test]
+fn task_91_1_p0_root_under_symlinked_config_dir_lexical_match_is_rejected() {
+    let dir_a = TempDir::new();
+    let dir_b = TempDir::new();
+    let link_path = dir_b.path().join("link");
+    std::os::unix::fs::symlink(dir_a.path(), &link_path).expect("symlink を作成できる");
+
+    let root_under_link_dir = dir_b.path().join("profiles");
+    let toml_source = format!("[profile]\nroot = {root_under_link_dir:?}\n");
+    dir_a.write_config(&toml_source);
+
+    let config_path_via_symlink = link_path.join("fandhe-browser.toml");
+    let err = Config::load(&config_path_via_symlink).expect_err(
+        "symlink 経由の設定ディレクトリ（字句上の親）配下を指す root は、\
+         実際の設定ディレクトリ（symlink の指す先）外のため拒否される",
+    );
+
+    assert!(matches!(
+        err,
+        Error::Config(ConfigError::InvalidValue {
+            key: "profile.root",
+            ..
+        })
+    ));
+}
+
+/// TASK-91（91.1）・PROF-6: symlink 経由で開いた設定ファイルの相対 `root`
+/// は、symlink の指す実際のディレクトリ（`dir_a`）基準で解決される（Issue
+/// #538 P0 再指摘の回帰防止。symlink 側のディレクトリ `dir_b` 基準になって
+/// はならない）。
+#[cfg(unix)]
+#[test]
+fn task_91_1_p0_relative_root_via_symlinked_config_path_resolves_against_real_dir() {
+    let dir_a = TempDir::new();
+    let dir_b = TempDir::new();
+    let link_path = dir_b.path().join("link");
+    std::os::unix::fs::symlink(dir_a.path(), &link_path).expect("symlink を作成できる");
+
+    dir_a.write_config("[profile]\nroot = 'profiles'\n");
+
+    let config_path_via_symlink = link_path.join("fandhe-browser.toml");
+    let config =
+        Config::load(&config_path_via_symlink).expect("symlink 経由でも設定ファイルを読み込める");
+
+    let canonical_dir_a = dir_a
+        .path()
+        .canonicalize()
+        .expect("dir_a を canonicalize できる");
+    let root = config.profile().root().expect("root が解決されている");
+    assert_eq!(
+        root,
+        canonical_dir_a.join("profiles"),
+        "相対 root は symlink の指す実際のディレクトリ（dir_a）基準で解決されるべき"
+    );
 }
