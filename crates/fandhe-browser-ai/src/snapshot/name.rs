@@ -385,16 +385,19 @@ fn is_labelable(doc: &Document, id: NodeId) -> bool {
         .any(|name| is_html_element_named(doc, id, name))
 }
 
-/// `input` 要素 `id` の `type` 属性値を正規化して返す（前後の ASCII 空白を
-/// 除き、ASCII の大文字小文字を区別しない照合ができるよう小文字化する）。
+/// `input` 要素 `id` の `type` 属性値を正規化して返す（ASCII の大文字小文字
+/// を区別しない照合ができるよう小文字化するのみで、前後の空白は除去しない）。
 /// 属性が無い場合は空文字列（HTML の既定値である text 系として扱う）。
+///
+/// HTML Standard の `input` type キーワード照合は ASCII 大文字小文字を
+/// 区別しない完全一致であり、前後に空白を含む値（例: `type=" submit "`）は
+/// どのキーワードにも一致しない無効値として扱われ、既定の text 状態へ
+/// フォールバックする。前後の空白を除去してから照合すると
+/// `type=" submit "` を `submit` 状態、`type=" hidden "` を `hidden` 状態と
+/// 誤判定してしまう（PR #567 レビュー指摘の P1 修正）。
 fn normalized_input_type(doc: &Document, id: NodeId) -> String {
     doc.attribute(id, "type")
-        .map(|value| {
-            value
-                .trim_matches(|c: char| c.is_ascii_whitespace())
-                .to_ascii_lowercase()
-        })
+        .map(|value| value.to_ascii_lowercase())
         .unwrap_or_default()
 }
 
@@ -1407,16 +1410,42 @@ mod tests {
         assert_eq!(result, AccessibleName::default());
     }
 
-    /// AISNAP-1（TASK-11.4.2・#545）: `type` の大文字小文字・前後の空白を
-    /// 無視して正規化する。
+    /// AISNAP-1（TASK-11.4.2・#545）: `type` の大文字小文字は区別せず
+    /// 正規化する（前後空白は除去しない。PR #567 レビュー指摘の P1 修正）。
     #[test]
-    fn aisnap_1_input_type_is_normalized() {
+    fn aisnap_1_input_type_case_is_normalized() {
         let result = name(
-            r##"<label for="x"> CheckBox </label><input type=" CHECKBOX " id="x">"##,
+            r##"<label for="x"> CheckBox </label><input type="CHECKBOX" id="x">"##,
             "input",
         );
         assert_eq!(result.text, "CheckBox");
         assert_eq!(result.source, NameSource::Label);
+    }
+
+    /// AISNAP-1（TASK-11.4.2・#545・PR #567 レビュー指摘の P1 修正）:
+    /// `type` 前後に空白がある値（`type=" hidden "`）は HTML Standard の
+    /// キーワード照合に一致しない無効値として text 状態にフォールバック
+    /// する。前後空白を除去して `hidden` と誤判定すると label があっても
+    /// 名前なしになってしまうが、正しくは label から名前を得られる。
+    #[test]
+    fn aisnap_1_input_type_with_surrounding_whitespace_is_invalid_value() {
+        let result = name(
+            r##"<label for="x">トークン</label><input type=" hidden " id="x">"##,
+            "input",
+        );
+        assert_eq!(result.text, "トークン");
+        assert_eq!(result.source, NameSource::Label);
+    }
+
+    /// AISNAP-1（TASK-11.4.2・#545・PR #567 レビュー指摘の P1 修正）:
+    /// `type=" submit "` も前後空白を含むため無効値 → text 状態として
+    /// 扱い、label が無ければ `submit` の既定ラベル "Submit" ではなく
+    /// `placeholder` から名前を取る（text 系専用の折り込み先）。
+    #[test]
+    fn aisnap_1_input_type_submit_with_whitespace_falls_back_to_placeholder() {
+        let result = name(r##"<input type=" submit " placeholder="送信">"##, "input");
+        assert_eq!(result.text, "送信");
+        assert_eq!(result.source, NameSource::Placeholder);
     }
 
     /// AISNAP-1（TASK-11.4.2・#545）: label の `script`/`style` サブ
