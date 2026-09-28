@@ -10,9 +10,15 @@
 use fandhe_browser_core::{Config, ConfigError, Error, IsolationStrength};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// プロセス全体の CWD を変更するテストが互いに競合しないようにする
+/// ロック（`std::env::set_current_dir` はプロセス単位の状態のため。
+/// `cargo test` は既定で同一バイナリ内のテストを並列実行する）。
+static CWD_LOCK: Mutex<()> = Mutex::new(());
 
 /// テスト用の一時ディレクトリ。drop 時に再帰削除する。
 struct TempDir {
@@ -82,6 +88,49 @@ fn task_91_1_relative_root_is_resolved_against_config_parent_dir() {
     assert_eq!(
         config.profile().root(),
         Some(dir.path().join("a")).as_deref()
+    );
+}
+
+/// TASK-91（91.1）: `path` 自体を相対パス（`fandhe-browser.toml` のような
+/// ファイル名のみ）で `Config::load` へ渡した場合でも、解決後の
+/// `profile.root` は絶対パスになる（Issue #538 P1 レビュー指摘の回帰防止。
+/// 相対 `path` の親ディレクトリをそのまま `join` すると解決結果も相対の
+/// ままになり、`Config::load` 完了後に呼び出し元が CWD を変更すると
+/// `Profile::open` が別の場所を開いてしまう）。
+#[test]
+fn task_91_1_load_with_relative_path_resolves_root_to_absolute() {
+    let _guard = CWD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = TempDir::new();
+    dir.write_config("[profile]\nroot = 'profiles/default'\n");
+
+    let original_cwd = std::env::current_dir().expect("CWD を取得できる");
+    std::env::set_current_dir(dir.path()).expect("テスト用ディレクトリへ CWD を移せる");
+
+    let load_result = std::panic::catch_unwind(|| {
+        Config::load(Path::new("fandhe-browser.toml")).expect("相対パスの設定ファイルを読み込める")
+    });
+
+    std::env::set_current_dir(&original_cwd).expect("元の CWD へ戻せる");
+    let config = load_result.expect("Config::load がパニックしない");
+
+    let root = config.profile().root().expect("root が解決されている");
+    assert!(
+        root.is_absolute(),
+        "root は絶対パスに解決されるべき: {root:?}"
+    );
+    assert_eq!(root, dir.path().join("profiles/default"));
+
+    // CWD を設定ファイル読み込み後に変更しても、解決済みの root は
+    // 変わらない（CWD 非依存の契約）。
+    let another_dir = TempDir::new();
+    std::env::set_current_dir(another_dir.path()).expect("別ディレクトリへ CWD を移せる");
+    let unaffected = config.profile().root().map(Path::to_path_buf);
+    std::env::set_current_dir(&original_cwd).expect("元の CWD へ戻せる");
+    assert_eq!(
+        unaffected.as_deref(),
+        Some(dir.path().join("profiles/default")).as_deref()
     );
 }
 

@@ -183,13 +183,33 @@ impl Config {
                 root
             } else {
                 // 設定ファイルの親ディレクトリ基準で解決する（CWD 非依存）。
-                // `path` がファイル名のみ（親コンポーネントなし）の場合、
-                // `parent()` は `Some("")` を返しうるため `join` にそのまま
-                // 委ね、空パス相対（= CWD 相対）として扱う。相対パスの
-                // 字句上の脱出は `ProfileConfig::from_raw` が既に拒否済み
-                // のため、ここで組み立てた結果は常に設定ファイルの親
-                // ディレクトリ配下に収まる。
-                path.parent().unwrap_or_else(|| Path::new("")).join(&root)
+                // `path` 自体が相対パス（例: `config/fandhe-browser.toml`）の
+                // 場合、`parent()` も相対のままとなり、そのまま `join` すると
+                // `resolved` も相対パスになってしまう。`Config::load` 完了後に
+                // 呼び出し元が CWD を変更すると、`fandhe-browser-profile::
+                // Profile::open`（TASK-50・#177）へ渡した時点で別の場所を
+                // 開いてしまい、本モジュールが掲げる「CWD 非依存」の契約
+                // （モジュール doc「パス解決」参照）を満たせない（Issue #538
+                // P1 レビュー指摘）。そのため、絶対パス分岐と同様に
+                // `std::path::absolute` で親ディレクトリを先に絶対パスへ
+                // 固定してから `root` を結合する（`canonicalize` は使わず
+                // ファイルシステムには触れない）。相対パスの字句上の脱出は
+                // `ProfileConfig::from_raw` が既に拒否済みのため、ここで
+                // 組み立てた結果は常に設定ファイルの親ディレクトリ配下に
+                // 収まる。
+                let base_dir = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                let base_abs = std::path::absolute(base_dir).map_err(|source| {
+                    Error::from(ConfigError::Io {
+                        message: format!(
+                            "failed to resolve config directory {}: {source}",
+                            base_dir.display()
+                        ),
+                    })
+                })?;
+                base_abs.join(&root)
             };
             config.profile.root = Some(resolved);
         }
