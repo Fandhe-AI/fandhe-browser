@@ -871,6 +871,27 @@ class CompareBboxesTest(unittest.TestCase):
         self.assertEqual(result["status"], "not_measured")
         self.assertFalse(result["passed"])
 
+    def test_missing_servo_bbox_file_is_not_measured(self) -> None:
+        # Codex レビュー指摘 P1: `target=None`（Servo 側 bbox ファイル不在）を
+        # 空の辞書と同一視すると `status` が `measured` になり、README が
+        # 定義する「ファイル不在は not_measured」という入力契約に反する。
+        # reference は正常な bbox を渡し、target のみ `None` にして区別する。
+        ref = {"a": {"x": 0, "y": 0, "width": 10, "height": 10}}
+        result = ms.compare_bboxes(ref, None, self.VIEWPORT)
+        self.assertEqual(result["status"], "not_measured")
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["elements"], [])
+
+    def test_empty_servo_bbox_is_measured_not_not_measured(self) -> None:
+        # target ファイルが存在するが elements が 0 件（空の辞書）の場合は、
+        # ファイル不在（`not_measured`）とは区別し、全要素不一致の `measured`
+        # として扱う。
+        ref = {"a": {"x": 0, "y": 0, "width": 10, "height": 10}}
+        result = ms.compare_bboxes(ref, {}, self.VIEWPORT)
+        self.assertEqual(result["status"], "measured")
+        self.assertEqual(result["matched"], 0)
+        self.assertFalse(result["passed"])
+
     def test_empty_reference_is_error(self) -> None:
         result = ms.compare_bboxes({}, {}, self.VIEWPORT)
         self.assertEqual(result["status"], "error")

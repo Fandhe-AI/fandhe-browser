@@ -949,10 +949,27 @@ def compare_bboxes(
             "reason": f"{REFERENCE_ENGINE} bbox has zero elements",
         }
 
+    if target is None:
+        # ファイル不在（`load_bboxes` が `None` を返した）場合は、要素 0 件の
+        # 辞書（ファイルは存在するが elements が空）と区別して `not_measured`
+        # を返す。ここを区別しないと「未計測」と「通常の不一致（空 elements）」
+        # が `status: "measured"` に丸められ、後続の利用者が両者を判別
+        # できなくなる（Codex レビュー指摘 P1。README の入力契約: ファイル
+        # 不在は not_measured）。
+        return {
+            "status": "not_measured",
+            "matched": 0,
+            "total": 0,
+            "rate": None,
+            "passed": False,
+            "elements": [],
+            "warnings": [],
+            "reason": f"{TARGET_ENGINE} bbox file is missing",
+        }
+
     warnings: list[str] = []
-    target = target or {}
     if not target:
-        warnings.append(f"{TARGET_ENGINE} bbox file is missing or empty; treating all elements as unmatched")
+        warnings.append(f"{TARGET_ENGINE} bbox has zero elements; treating all elements as unmatched")
 
     vw = viewport["width"]
     vh = viewport["height"]

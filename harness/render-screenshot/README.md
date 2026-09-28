@@ -594,8 +594,10 @@ SSIM 計算の画素数上限は `MAX_SSIM_PIXELS`（2560x1600）で、超過し
 `sites[].status` は `measured`（両エンジンの PNG が揃っていた）/ `skipped`
 （`capture-result.json` の時点でペアにならなかった。`reason` に理由）。
 `ssim.status` は `measured` / `error`（デコード失敗・寸法不一致・SSIM 窓未満・
-画素数上限超過）。`bbox.status` は `measured` / `not_measured`（Chromium 側の
-bbox ファイルが無い）/ `error`（JSON 不正・Chromium 側の要素が 0 件等）。
+画素数上限超過）。`bbox.status` は `measured` / `not_measured`（Chromium・Servo
+いずれかの bbox ファイルが無い）/ `error`（JSON 不正・Chromium 側の要素が 0
+件等）。Servo 側ファイルが存在するが要素 0 件の場合は `not_measured` ではなく
+`measured`（全要素不一致）として扱い、両者を区別する。
 `sites[].passed` は `ssim.passed and bbox.passed`（両方 `measured` かつ閾値
 以上の場合のみ true。`not_measured`・`error` は fail-closed で不合格）。
 
