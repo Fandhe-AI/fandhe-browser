@@ -315,10 +315,44 @@ impl MemoryMonitor {
                 }
 
                 let Some(usage_bytes) = probe(&child, pid) else {
-                    // メモリ使用量の取得に失敗した。単発の失敗は
-                    // fail-open（次のポーリングで再試行）にするが、
-                    // 連続で [`MAX_CONSECUTIVE_PROBE_FAILURES`] 回失敗
-                    // したら、監視そのものが機能していないとみなして
+                    // メモリ使用量の取得に失敗した。プローブ失敗の原因は
+                    // 大きく 2 つに分かれる:
+                    //
+                    // 1. 監視そのものが機能していない（`ps` が PATH に
+                    //    無い等）。子は生きたままなので、連続失敗を
+                    //    数えて fail-closed にする意味がある。
+                    // 2. 子が V8 の fatal OOM 等で**既に終了している**。
+                    //    この場合 `/proc`・`ps`・`GetProcessMemoryInfo`
+                    //    は「プロセスが存在しない」ことを理由に `None` を
+                    //    返すのが正常な挙動であり、監視が壊れたわけでは
+                    //    ない（Cursor Bugbot レビュー指摘 #503「fail-closed
+                    //    の経路が、子がすでに終了している場合のプローブ
+                    //    失敗も『監視できない』と数えている」対応）。
+                    //    ここで `ProbeUnavailable` を記録すると、
+                    //    `discard_context_error` がこれを「なぜ落ちたか」の
+                    //    理由として扱ってしまい、本来の OOM による
+                    //    `ResourceLimitExceeded` が `EngineUnavailable` に
+                    //    誤分類される（本レビュー指摘の症状そのもの）。
+                    //
+                    // そのため、プローブ失敗のたびにまず子が既に終了して
+                    // いないかを確認する。終了していれば、この監視スレッド
+                    // の役目は既に終わっている（子の終了理由の判定は
+                    // `send_evaluate_and_await` 側の stderr ヒューリスティック
+                    // に譲る）ため、`kill_reason` を記録せず静かに終了する
+                    // （連続失敗としても数えない）。
+                    let already_exited = child
+                        .lock()
+                        .ok()
+                        .and_then(|mut guard| guard.try_wait().ok())
+                        .flatten()
+                        .is_some();
+                    if already_exited {
+                        return;
+                    }
+
+                    // 単発の失敗は fail-open（次のポーリングで再試行）に
+                    // するが、連続で [`MAX_CONSECUTIVE_PROBE_FAILURES`] 回
+                    // 失敗したら、監視そのものが機能していないとみなして
                     // fail-closed にする（codex レビュー指摘 #503 P0
                     // 対応。`MAX_CONSECUTIVE_PROBE_FAILURES` のドキュメント
                     // コメント参照）。
@@ -1315,27 +1349,18 @@ impl V8ProcessEngine {
             Ok(ReaderEvent::Eof) => {
                 // 子は既にストリームを閉じている（終了済みか、まもなく
                 // 終了する）ため、kill を挟まずに直接 reap する。
+                //
+                // `discard_context_error` が「監視スレッドの RSS 超過
+                // kill」「stderr の V8 fatal OOM メッセージ」の両方を
+                // `fallback` より先に判定する（同関数のドキュメントコメント
+                // 参照。codex・Bugbot レビュー指摘 #503 対応）ため、この
+                // `fallback` は「どちらの証拠も無かった場合」にだけ使われる。
                 let tail = worker.reap_and_collect_stderr();
-                // `discard_context_error` は監視スレッドが RSS 超過で
-                // `kill` していた場合を最優先で判定する（`kill` は
-                // シグナルであり、V8 の fatal ハンドラが走るとは限らない
-                // ため、stderr に手掛かりが残らないことがある。stderr
-                // ヒューリスティックより優先する。codex・Bugbot レビュー
-                // 指摘 #503 P0 対応）。監視スレッドの `kill` でなければ、
-                // stderr のヒューリスティック（V8 自身の fatal メッセージ）
-                // で判定する。
                 let err = discard_context_error(worker, &tail, || {
-                    if WorkerHandle::stderr_indicates_oom(&tail) {
-                        JsEngineError::ResourceLimitExceeded(format!(
-                            "script execution exceeded the isolate heap limit and the JS worker \
-                             process terminated; stderr: {tail}"
-                        ))
-                    } else {
-                        JsEngineError::EngineUnavailable(format!(
-                            "JS worker process terminated unexpectedly before responding; \
-                             stderr: {tail}"
-                        ))
-                    }
+                    JsEngineError::EngineUnavailable(format!(
+                        "JS worker process terminated unexpectedly before responding; stderr: \
+                         {tail}"
+                    ))
                 });
                 (Err(err), false)
             }
@@ -1460,12 +1485,46 @@ fn discard_context_error(
     tail: &str,
     fallback: impl FnOnce() -> JsEngineError,
 ) -> JsEngineError {
-    if let Some(reason) = worker.memory_monitor.take_kill_reason() {
+    let kill_reason = worker.memory_monitor.take_kill_reason();
+    const KILL_CONTEXT_SUFFIX: &str = "and was killed; the next evaluation runs in a fresh context";
+
+    // 判定順（Cursor Bugbot レビュー指摘 #503「fail-closed の経路が、
+    // 子がすでに終了している場合のプローブ失敗も『監視できない』と
+    // 数えている」対応。監視スレッド側で「子が既に終了していれば
+    // `ProbeUnavailable` を記録しない」対策を入れたが（`spawn_with_threshold_and_probe`
+    // 参照）、監視スレッドと `send_evaluate_and_await` は別スレッドで
+    // 進むため、完全な排他は無い。ここでも多層防御として優先順位を
+    // 設ける）:
+    //
+    // 1. 監視スレッドが実測 RSS 超過を記録していた（`ResourceLimitExceeded`）
+    //    ── 最も直接的な証拠であり、最優先で使う。
+    // 2. stderr に V8 自身の fatal OOM メッセージが残っている
+    //    （[`WorkerHandle::stderr_indicates_oom`]）── 1 が無くても、子
+    //    自身が「ヒープ上限に達した」と報告している場合はそれを信じる。
+    //    これを `ProbeUnavailable` より先に見る理由: 実際には OOM で
+    //    落ちたのに、監視スレッドが（子の終了検出との競合で）
+    //    `ProbeUnavailable` を記録してしまうケースが万一残っていても、
+    //    stderr の一次情報のほうが「監視ができなかった」という二次的な
+    //    事実より優先されるべきだから。
+    // 3. 上記のいずれでもなければ、監視スレッドが記録した理由
+    //    （この時点では `ProbeUnavailable` のみ）を使う。
+    // 4. それも無ければ呼び出し元の `fallback` を使う。
+    if let Some(MonitorKillReason::ResourceLimitExceeded(bytes)) = kill_reason {
         let err = monitor_kill_reason_to_error(
-            reason,
+            MonitorKillReason::ResourceLimitExceeded(bytes),
             tail,
-            "and was killed; the next evaluation runs in a fresh context",
+            KILL_CONTEXT_SUFFIX,
         );
+        return ensure_discarded_phrase(err);
+    }
+    if WorkerHandle::stderr_indicates_oom(tail) {
+        return ensure_discarded_phrase(JsEngineError::ResourceLimitExceeded(format!(
+            "script execution exceeded the isolate heap limit and the JS worker process \
+             terminated; stderr: {tail}"
+        )));
+    }
+    if let Some(reason) = kill_reason {
+        let err = monitor_kill_reason_to_error(reason, tail, KILL_CONTEXT_SUFFIX);
         return ensure_discarded_phrase(err);
     }
     ensure_discarded_phrase(fallback())
@@ -1585,6 +1644,35 @@ mod tests {
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("failed to spawn `ping` for the test")
+        }
+    }
+
+    /// [`spawn_long_lived_child_for_test`] と対になる、すぐに終了する
+    /// 代役の「子プロセス」（Cursor Bugbot レビュー指摘 #503「fail-closed
+    /// の経路が、子がすでに終了している場合のプローブ失敗も『監視できない』
+    /// と数えている」の回帰テスト専用。V8 の fatal OOM で子が終了した
+    /// 状況を、実際に OOM を起こさずに「子が既に終了している」という
+    /// 性質だけ再現するために使う）。
+    fn spawn_short_lived_child_for_test() -> Child {
+        #[cfg(unix)]
+        {
+            Command::new("sleep")
+                .arg("0")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("failed to spawn a short-lived test child")
+        }
+        #[cfg(windows)]
+        {
+            Command::new("cmd")
+                .args(["/C", "exit 0"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("failed to spawn a short-lived test child")
         }
     }
 
@@ -1712,6 +1800,66 @@ mod tests {
              repeated probe failures (fail-closed)"
         );
         drop(guard);
+
+        monitor.stop_and_join();
+    }
+
+    /// Cursor Bugbot レビュー指摘 #503「fail-closed の経路が、子がすでに
+    /// 終了している場合のプローブ失敗も『監視できない』と数えている」の
+    /// 単体テスト: 子が（V8 の fatal OOM 等で）**既に終了している**状態で
+    /// プローブが `None` を返し続けても、`MonitorKillReason::ProbeUnavailable`
+    /// を記録しないこと（＝連続失敗として数えず、静かに監視を終える）。
+    /// 実際の OOM を起こす代わりに、すぐに終了する代役の子プロセス
+    /// （[`spawn_short_lived_child_for_test`]）と、常に `None` を返す
+    /// フェイクのプローブを組み合わせて、症状（子の終了検出より前に
+    /// プローブ失敗が連続してカウントされる）を決定的に再現する。
+    #[test]
+    fn js_1_memory_monitor_does_not_record_probe_unavailable_after_child_already_exited() {
+        let child = spawn_short_lived_child_for_test();
+        let pid = child.id();
+        let child = Arc::new(Mutex::new(child));
+
+        // 子が実際に終了するまで待つ（`sleep 0`／`cmd /C exit 0` は
+        // ほぼ即座に終了するはずである）。
+        let exit_deadline = Instant::now() + Duration::from_secs(5);
+        let mut already_exited = false;
+        while Instant::now() < exit_deadline {
+            let mut guard = child.lock().expect("child mutex must not be poisoned");
+            if matches!(guard.try_wait(), Ok(Some(_))) {
+                already_exited = true;
+                break;
+            }
+            drop(guard);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            already_exited,
+            "expected the short-lived test child to have exited before the monitor starts"
+        );
+
+        // しきい値は `u64::MAX`（超過では kill させない）、プローブは
+        // 常に `None`（実際の `ps`／`/proc` が「プロセスが存在しない」を
+        // 理由に返す `None` を模す）。
+        let mut monitor = MemoryMonitor::spawn_with_threshold_and_probe(
+            Arc::clone(&child),
+            pid,
+            u64::MAX,
+            Box::new(|_child, _pid| None),
+        );
+
+        // `MAX_CONSECUTIVE_PROBE_FAILURES` 回分のポーリング間隔を大幅に
+        // 超えて待ち、fail-closed が発火するだけの時間を与える。
+        std::thread::sleep(
+            super::super::resource_limits::RSS_POLL_INTERVAL * (MAX_CONSECUTIVE_PROBE_FAILURES + 3),
+        );
+
+        let kill_reason = monitor.take_kill_reason();
+        assert!(
+            kill_reason.is_none(),
+            "a probe failure against an already-exited child must not be recorded as \
+             ProbeUnavailable (the monitor should recognize the child has exited and stop \
+             silently instead of miscounting it as a broken probe), got: {kill_reason:?}"
+        );
 
         monitor.stop_and_join();
     }
@@ -1917,6 +2065,54 @@ mod tests {
             other => panic!("expected EngineUnavailable, got: {other:?}"),
         }
         worker.terminate_now();
+    }
+
+    /// Cursor Bugbot レビュー指摘 #503「fail-closed の経路が、子がすでに
+    /// 終了している場合のプローブ失敗も『監視できない』と数えている」の
+    /// 単体テスト（防御その 2）: 監視スレッドが競合により
+    /// `ProbeUnavailable` を記録してしまっていても、stderr に V8 の
+    /// fatal OOM メッセージが残っていれば、`discard_context_error` は
+    /// `ResourceLimitExceeded` を返すこと（`EngineUnavailable` にしない）。
+    /// `monitor_kill_reason_to_error`・`discard_context_error` のドキュメント
+    /// コメントに書いた優先順位（1. 実測 RSS 超過 2. stderr の OOM
+    /// メッセージ 3. ProbeUnavailable 4. fallback）のうち、2 が 3 より
+    /// 優先されることを具体値で確認する。
+    #[test]
+    fn js_1_discard_context_error_prefers_stderr_oom_evidence_over_probe_unavailable() {
+        let child = spawn_long_lived_child_for_test();
+        let worker = WorkerHandle::from_child(child).expect("failed to build a test WorkerHandle");
+
+        // 監視スレッドが（本来なら起きてほしくない競合により）
+        // `ProbeUnavailable` を記録してしまった状態を直接再現する。
+        *worker
+            .memory_monitor
+            .kill_reason
+            .lock()
+            .expect("kill_reason mutex must not be poisoned") =
+            Some(MonitorKillReason::ProbeUnavailable {
+                consecutive_failures: MAX_CONSECUTIVE_PROBE_FAILURES,
+            });
+
+        let stderr_tail = "Fatal JavaScript out of memory: Reached heap limit";
+        let err = discard_context_error(&worker, stderr_tail, || {
+            JsEngineError::Timeout("must not be used because stderr shows OOM evidence".to_string())
+        });
+        match err {
+            JsEngineError::ResourceLimitExceeded(msg) => {
+                assert!(
+                    msg.contains("heap limit"),
+                    "expected the message to describe the heap limit being exceeded, got: {msg}"
+                );
+                assert!(
+                    msg.contains("context was discarded"),
+                    "expected the required phrase, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected ResourceLimitExceeded (stderr OOM evidence must win over a \
+                 ProbeUnavailable kill_reason), got: {other:?}"
+            ),
+        }
     }
 
     /// Cursor Bugbot レビュー指摘 #503「Discarded-context errors omit
