@@ -1687,6 +1687,10 @@ impl V8ProcessEngine {
 /// （`write_ack_rx`）を待つ。**失敗した場合は必ず子を `kill` → reap →
 /// [`discard_context_error`] を通す**（フレーミング自体の失敗を含む。
 /// 呼び出し元は本関数が `Err` を返したら常に `(Err(e), false)` を返す）。
+/// フレーミング自体の失敗（実質到達不能）まで kill 対象にしているのは、
+/// 複数の書き込み失敗経路をこの関数へ統合した結果であり、「エンコード
+/// 失敗は子の責任」という設計判断を表すものではない（経路ごとの理由は
+/// 各分岐のコメントを参照）。
 /// `what` はエラーメッセージに埋め込む短い句（例: "the script"・"the
 /// native call result"）。
 fn write_frame_with_deadline(
@@ -1701,6 +1705,17 @@ fn write_frame_with_deadline(
     // `write_frame` のシグネチャ（`impl Write`）に合わせて `Result` を
     // 扱う（coding-rust.md「外部入力」節。`payload` はスクリプト文字列・
     // `NativeFn` の戻り値に由来する外部入力である）。
+    //
+    // このブランチに到達した場合も他の失敗経路と同じく kill → reap →
+    // `discard_context_error` を通す（Err を返したら呼び出し元は常に
+    // `(Err(e), false)` にする関数の契約に合わせる）。子は何も悪いことを
+    // していないため本来は `keep_worker=true` にしたい経路だが、
+    // `send_evaluate_and_await` が個別に持っていた書き込み処理を
+    // `write_frame_with_deadline` へ統合した際（TASK-29・Issue #526）に
+    // 生じた副作用であり、意図した設計判断ではない。エンコード対象は
+    // 呼び出し前に検証済みの script 文字列・`NativeReturn` であり実質
+    // 到達不能のため、区別のための複雑化は見送っている（コードレビュー
+    // 指摘）。
     if let Err(err) = worker_protocol::write_frame(&mut frame_bytes, frame_tag, payload) {
         worker.terminate_now();
         let tail = worker.reap_and_collect_stderr();
