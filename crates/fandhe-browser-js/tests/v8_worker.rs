@@ -692,6 +692,34 @@ fn js_1_linux_child_process_has_rlimit_data_set() {
     );
 }
 
+/// procfs への書き込み可否を、このテストプロセス自身の
+/// `/proc/self/oom_score_adj` で確認する（PR #535 レビュー指摘 P1
+/// 対応。threadId: `PRRT_kwDOUov33c6mqTb_`）。
+///
+/// `prefer_child_as_oom_victim`（`resource_limits.rs`）は procfs へ
+/// 書き込めない環境（読み取り専用ファイルシステム等）では警告を出して
+/// 評価を続行する契約であり（`worker.rs` の呼び出し箇所参照）、fail-closed
+/// にはしない。したがって
+/// [`js_1_linux_child_process_has_oom_score_adj_set`] が子の
+/// `oom_score_adj` を無条件に `1000` と期待すると、procfs 書き込み不可の
+/// 環境では「仕様どおり警告を出して続行した」だけの正常なワーカーに
+/// 対してテストが失敗してしまう。読んだ現在値をそのまま書き戻す
+/// （no-op）ことで副作用なく書き込み可否だけを判定する。
+#[cfg(target_os = "linux")]
+fn can_write_oom_score_adj_for_self() -> bool {
+    use std::io::Write as _;
+
+    let path = "/proc/self/oom_score_adj";
+    let Ok(current) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(current.trim().as_bytes()))
+        .is_ok()
+}
+
 /// `JS-1`・`TASK-29`・Issue #516: 子プロセスが起動直後・V8 初期化前に
 /// `/proc/self/oom_score_adj` へ `1000` を書き込んでいること。親から
 /// `/proc/<pid>/oom_score_adj` を読んで確認する
@@ -706,6 +734,17 @@ fn js_1_linux_child_process_has_rlimit_data_set() {
 /// （`js_1_write_oom_score_adj_writes_the_value_to_the_given_path` 等）が
 /// 担う。本テストは「子プロセスの実行結果として値が 1000 になっている」
 /// ことを、実際のプロセス起動を通して確認する回帰テストである。
+///
+/// procfs への書き込みが許容されない環境（読み取り専用ファイルシステム
+/// 等）では `prefer_child_as_oom_victim` が警告を出して評価を継続する
+/// 契約になっており（`worker.rs`・`resource_limits.rs` 参照）、その場合
+/// 子の `oom_score_adj` は初期値のまま `1000` にならない。この環境要因と
+/// 実装バグを区別するため、値が `1000` でなかった場合は
+/// [`can_write_oom_score_adj_for_self`] でこのテストプロセス自身の
+/// procfs 書き込み可否を確認し、書き込めない環境であればフォールバック
+/// 経路として許容する（書き込める環境なのに `1000` でなければ実装の
+/// 回帰としてテスト失敗のままにする。PR #535 レビュー指摘 P1 対応。
+/// threadId: `PRRT_kwDOUov33c6mqTb_`）。
 ///
 /// 実際に OOM killer が発火してこの子が優先的に選ばれることの再現は
 /// 環境依存のため対象外とする（`resource_limits` モジュールのドキュメント
@@ -723,10 +762,15 @@ fn js_1_linux_child_process_has_oom_score_adj_set() {
     let value = std::fs::read_to_string(format!("/proc/{pid}/oom_score_adj"))
         .unwrap_or_else(|err| panic!("failed to read /proc/{pid}/oom_score_adj: {err}"));
 
-    assert_eq!(
-        value.trim(),
-        "1000",
-        "expected the child's oom_score_adj to be set to 1000"
+    if value.trim() == "1000" {
+        return;
+    }
+
+    assert!(
+        !can_write_oom_score_adj_for_self(),
+        "the child's oom_score_adj was not set to 1000 even though this environment \
+         allows writing to /proc/self/oom_score_adj, got: {:?}",
+        value.trim()
     );
 }
 
