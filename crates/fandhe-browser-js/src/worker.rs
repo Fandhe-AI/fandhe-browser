@@ -40,6 +40,18 @@
 //!   ユーザー権限で動作し、seccomp 等の権限制限も行わない。得られるのは
 //!   クラッシュ・メモリの資源分離だけである（`super::process_engine` の
 //!   ドキュメントコメント参照）
+//! - V8 の Platform は protected 版（thread-isolated allocation 有効）で
+//!   初期化する（`JS-1`・`TASK-29`・Issue #520。[`worker_main`] 内、
+//!   `enforce_child_memory_limit()` の後・`V8Engine::new*` の前で
+//!   [`super::v8_engine::ensure_v8_initialized_with`] を呼ぶ）。本
+//!   プロセスは単一スレッドで初期化から Isolate 生成まで進むため、
+//!   protected 版が要求する「Isolate に入るのは `V8::initialize()` を
+//!   呼んだスレッドの子孫だけ」という制約に抵触しない。子プロセスは
+//!   親と同じユーザー権限で動くため効果は限定的だが、V8 内部のメモリ
+//!   破壊に対する多層防御が 1 つ増える（同 Issue のドキュメントコメント
+//!   参照。テストプロセス内の経路は引き続き unprotected のままにする
+//!   理由は [`super::v8_engine::ensure_v8_initialized_with`] のドキュメント
+//!   コメント参照）
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -160,6 +172,38 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // V8 の Platform を protected 版（thread-isolated allocation 有効）で
+    // 初期化する（`JS-1`・`TASK-29`・Issue #520）。この子プロセスは
+    // `main`（`run_js_worker_if_requested` 経由）から本関数まで単一
+    // スレッドで直線的に進み、Isolate に入るのもこのスレッドだけである
+    // ため、`v8_engine::ensure_v8_initialized_with` のドキュメントコメント
+    // が述べる「子孫スレッド制約」に抵触しない。呼ぶ位置は
+    // `enforce_child_memory_limit()` の**後**（OS 側の上限を先に掛ける
+    // 順序を保つ）・`V8Engine::new*` の**前**（Isolate 生成より前に
+    // Platform を確定させる）にする。
+    //
+    // プロトコルバージョン検証の早期 return より**必ず下**に置くこと。
+    // `js_1_worker_main_rejects_unsupported_protocol_version` 等の
+    // ユニットテストはテストプロセス内で `worker_main` を直接呼ぶため、
+    // これより上で protected 初期化を呼ぶとテストプロセスが protected に
+    // なってしまう（他のテストスレッドが PKU ホストで `SEGV_PKUERR` に
+    // なりうる。実装者への注意。Issue #520 実装計画）。
+    let actual_platform =
+        super::v8_engine::ensure_v8_initialized_with(super::v8_engine::V8PlatformKind::Protected);
+    if actual_platform != super::v8_engine::V8PlatformKind::Protected {
+        // 正規の子プロセスでは起こり得ない（このプロセスは V8 の Platform
+        // をまだ初期化していないはずのため）。想定外の経路（テスト用の
+        // 直接呼び出し等）で先に unprotected 初期化が行われていたことを
+        // 示す。保護が有効であるかのように装わず、診断を出して評価は
+        // 継続する（unprotected のままでも従来と同じ安全水準であり、
+        // fail-closed で止める必要はない。security.md「偽装・回避機能の
+        // 禁止」）。
+        eprintln!(
+            "fandhe-browser-js worker: V8 platform was already initialized as {actual_platform:?}; \
+             thread-isolated allocation is not active"
+        );
+    }
 
     // 環境変数は untrusted な入力（`TEST_HEAP_LIMIT_ENV_VAR` のドキュメント
     // コメント参照）。`test_heap_limit_from_env_value` が読み取った直後に

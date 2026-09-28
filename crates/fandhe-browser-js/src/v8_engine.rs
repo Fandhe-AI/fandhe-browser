@@ -75,7 +75,7 @@
 //! メッセージを含む）エラーを返す。
 
 use std::cell::Cell;
-use std::sync::Once;
+use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -244,8 +244,25 @@ const MAX_RESULT_STRING_UTF16_UNITS: usize = 1_048_576; // 約 1M 文字（2 MiB
 /// コンパイル時間そのものに対する現状の主な緩和策である。
 pub(crate) const SCRIPT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// プロセス内で V8 の Platform 初期化を 1 回だけ実行するためのフラグ。
-static V8_INIT: Once = Once::new();
+/// V8 の Platform が protected 版（thread-isolated allocation 有効）か
+/// unprotected 版かを表す（`JS-1`・`TASK-29`・Issue #520）。
+///
+/// - `Protected`: `v8::new_default_platform` で作った Platform。PKU を
+///   持つ x86-64 Linux では、`V8::initialize()` を呼んだスレッドの
+///   子孫スレッドだけが Isolate に入れる（子孫でないスレッドが入ると
+///   `SIGSEGV`／`SEGV_PKUERR`）
+/// - `Unprotected`: `v8::new_unprotected_default_platform` で作った
+///   Platform。上記の制約が無い代わりに thread-isolated allocation が
+///   無効になる
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum V8PlatformKind {
+    Protected,
+    Unprotected,
+}
+
+/// プロセス内で実際に選ばれた V8 Platform の種別（[`ensure_v8_initialized_with`]
+/// が 1 回だけ書き込む）。
+static V8_PLATFORM: OnceLock<V8PlatformKind> = OnceLock::new();
 
 thread_local! {
     /// このスレッド上に生存中の [`V8Engine`]（＝`v8::OwnedIsolate`）が
@@ -257,43 +274,67 @@ thread_local! {
 }
 
 /// V8 の Platform 初期化を冪等に行う（AC-1: 何度呼んでも panic しない）。
+/// [`ensure_v8_initialized_with`] に [`V8PlatformKind::Unprotected`] を
+/// 渡す薄いラッパーであり、戻り値（実際に選ばれた種別）は捨てる。
 ///
-/// `std::sync::Once` により、同一プロセス内での 2 回目以降の呼び出しは
-/// 何もしない。複数スレッドから同時に呼ばれても `Once` が直列化するため、
-/// 競合状態にはならない。
+/// [`V8Engine::new_with_heap_limit`] はこの関数を経由するため、子プロセス
+/// （`super::worker`）の中で `worker_main` が先に
+/// [`ensure_v8_initialized_with`]`(Protected)` を呼んでいれば、ここでの
+/// 呼び出しは「既に初期化済みなので何もしない」（先に呼んだ側が勝つ。
+/// [`ensure_v8_initialized_with`] のドキュメントコメント参照）。
+pub(crate) fn ensure_v8_initialized() {
+    ensure_v8_initialized_with(V8PlatformKind::Unprotected);
+}
+
+/// V8 の Platform 初期化を冪等に行い、実際に選ばれた [`V8PlatformKind`]
+/// を返す（`JS-1`・`TASK-29`・Issue #520。AC-1: 何度呼んでも panic しない）。
 ///
-/// 戻り値は `()` とする。`v8::V8::initialize_platform` /
-/// `v8::V8::initialize` には失敗を表す戻り値が無く（呼び出し順序を誤ると
-/// panic するのみ）、本関数は「1 回だけ・正しい順序で」呼ぶことを `Once`
-/// で構造的に保証するため、`Result` で装う必要がない。
+/// [`std::sync::OnceLock::get_or_init`] により、同一プロセス内で実際に
+/// 初期化処理を実行するのは最初の 1 回だけで、以後の呼び出しはその
+/// 呼び出しが返した種別をそのまま返す（**先に呼んだ側が要求した種別が
+/// プロセス全体で確定する**。`requested` を渡しても、既に別の種別で
+/// 初期化済みなら戻り値はその既存の種別になる。呼び出し元は戻り値を
+/// 見て「要求どおりになったか」を確認すること。REPAIR-4: 真偽値や `()`
+/// でなく、実際の状態を伝える列挙型を返す）。
 ///
-/// `call_once` のクロージャ内で v8 初期化 API が panic すると `Once` は
-/// poison されるが、本関数はここでしか呼ばれず、かつ呼び出し順序
+/// `get_or_init` のクロージャ内で v8 初期化 API が panic した場合、
+/// `OnceLock` は `Once` と異なり *poison しない*。未初期化のまま残り、
+/// 次の呼び出しで再度初期化を試みる（`std::sync::OnceLock` のドキュメント
+/// 参照）。本関数はここでしか初期化処理を呼ばず、かつ呼び出し順序
 /// （`initialize_platform` → `initialize`）を守っているため、通常の
 /// 実行経路では panic しない。
 ///
-/// # Platform の選択（`new_unprotected_default_platform` を使う理由）
+/// # Platform の選択（呼び出し元ごとに種別を分ける理由）
 ///
-/// v8 152.2.0 の `V8::initialize()` のドキュメントによれば、PKU
-/// （メモリ保護キー）を持つ x86-64 Linux では、`V8::initialize()` より
-/// **前に**作られたスレッドが Isolate に入ると `SIGSEGV`
-/// （`SEGV_PKUERR`）になりうる。この制約は `new_default_platform`
-/// （protected 版）が持つ。
+/// v8 152.2.0 の `new_default_platform`（protected 版）のドキュメントに
+/// よれば、PKU（メモリ保護キー）を持つ x86-64 Linux では、
+/// `V8::initialize()` を呼んだスレッドの**子孫でない**スレッドが
+/// Isolate に入ると `SIGSEGV`（`SEGV_PKUERR`）になりうる。
 ///
-/// 本 crate 側ではスレッドの生成順を保証できない。`cargo test` の
-/// テストハーネスはテスト本体より前にテストスレッドを作り、結合テスト
-/// （`tests/conformance.rs`）は `cfg(test)` を付けずに lib をビルドする。
-/// 本番でも core/cdp の非同期ランタイムのワーカースレッドが V8 初期化より
-/// 先に作られる可能性がある。
+/// **本 crate の呼び出し元（テストプロセス内）ではスレッドの生成順を
+/// 保証できない。** `cargo test` のテストハーネスはテスト本体より前に
+/// テストスレッドを作り、結合テスト（`tests/conformance.rs`）は
+/// `cfg(test)` を付けずに lib をビルドする。こうした経路は常に
+/// [`V8PlatformKind::Unprotected`]（[`ensure_v8_initialized`] 経由）を
+/// 要求する。**呼んではならない**: テストプロセス内のテスト（本モジュール
+/// の `#[test]`・`tests/conformance.rs` 等）から本関数へ
+/// [`V8PlatformKind::Protected`] を渡すこと。一度 protected で初期化
+/// されると、そのプロセスの他のテストスレッドが PKU ホストで
+/// `SEGV_PKUERR` になりうる不安定なテストになる（実装者への注意。
+/// Issue #520 実装計画）。
 ///
-/// protected 版を使うと実行時に `SIGSEGV` で落ちる経路ができてしまうため、
-/// 可用性を優先して `new_unprotected_default_platform` を採用する
-/// （trade-off: thread-isolated allocation によるセキュリティ強化が
-/// 無効になる）。将来、cli の `main`（`TASK-41`）が他のスレッドを作る前に
-/// 本関数を呼ぶ契約を確立できれば、`TASK-30`（core 統合）と合わせて
-/// protected 版への切替を再検討する。
-pub(crate) fn ensure_v8_initialized() {
-    V8_INIT.call_once(|| {
+/// 一方、**子プロセス**（`super::worker::worker_main`）は自分の
+/// スレッド構成を完全に制御できる: `main` の先頭
+/// （[`super::run_js_worker_if_requested`]）から `worker_main` まで
+/// 単一スレッドで直線的に進み、V8 初期化も Isolate 生成も同じスレッドで
+/// 行う（`super::worker` のモジュールドキュメント・
+/// [`super::run_js_worker_if_requested`] の契約ドキュメント参照）。
+/// この前提が保たれる限り protected 版を要求しても
+/// `SIGSEGV` にならないため、`worker_main` は
+/// [`V8PlatformKind::Protected`] を要求し、thread-isolated allocation
+/// による多層防御を得る。
+pub(crate) fn ensure_v8_initialized_with(requested: V8PlatformKind) -> V8PlatformKind {
+    *V8_PLATFORM.get_or_init(|| {
         // フラグは Platform 初期化より前にしか反映されないため、
         // `initialize_platform` の前に設定する（codex レビュー指摘 #503
         // P0「ヒープ外メモリが無制限」対応の一部。wasm の単一メモリ
@@ -307,10 +348,16 @@ pub(crate) fn ensure_v8_initialized() {
         // 初期化関数では扱えない）。この関数が設定するページ数上限は、
         // その主たる対策が失敗した場合の多層防御である。
         super::resource_limits::configure_wasm_max_mem_pages_flag();
-        let platform = v8::new_unprotected_default_platform(0, false).make_shared();
+        let platform = match requested {
+            V8PlatformKind::Protected => v8::new_default_platform(0, false).make_shared(),
+            V8PlatformKind::Unprotected => {
+                v8::new_unprotected_default_platform(0, false).make_shared()
+            }
+        };
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
-    });
+        requested
+    })
 }
 
 /// V8 の Isolate を 1 つ保持する（`JS-1`・TASK-29.2）。
@@ -940,6 +987,13 @@ mod tests {
     /// しないこと（AC-1）。副作用として V8 が実際に初期化されたことを、
     /// バージョン文字列が取得でき、先頭要素が数値として解釈できることで
     /// 具体的に確認する。
+    ///
+    /// **`V8PlatformKind::Protected` を渡さないこと**: このテストは
+    /// テストプロセス内（libtest のワーカースレッド）で動く。protected
+    /// 版はテストプロセスの他のスレッドが PKU ホストで `SEGV_PKUERR` に
+    /// なりうるため、[`ensure_v8_initialized`]（＝常に `Unprotected`）
+    /// だけを使う（`JS-1`・`TASK-29`・Issue #520 実装計画「実装者への
+    /// 注意」）。
     #[test]
     fn js_1_v8_initialization_is_idempotent() {
         ensure_v8_initialized();
@@ -956,6 +1010,27 @@ mod tests {
             major.parse::<u32>().is_ok(),
             "v8 version major component must be numeric, got: {major}"
         );
+    }
+
+    /// `JS-1`・`TASK-29`・Issue #520: `ensure_v8_initialized_with` に
+    /// `Unprotected` を渡すと、戻り値がその種別であること。続けて
+    /// `ensure_v8_initialized()`（内部的には同じ関数へ `Unprotected` を
+    /// 渡すのと同じ）を呼んでも、種別は `Unprotected` のまま変わらない
+    /// こと（先に呼んだ側が勝つ。`OnceLock` は最初の呼び出しの結果だけを
+    /// 保持する）。
+    ///
+    /// `Protected` は本テストでは絶対に要求しない（上記
+    /// `js_1_v8_initialization_is_idempotent` のドキュメントコメント
+    /// 参照）。
+    #[test]
+    fn js_1_ensure_v8_initialized_with_unprotected_reports_unprotected() {
+        let first = ensure_v8_initialized_with(V8PlatformKind::Unprotected);
+        assert_eq!(first, V8PlatformKind::Unprotected);
+
+        ensure_v8_initialized();
+
+        let second = ensure_v8_initialized_with(V8PlatformKind::Unprotected);
+        assert_eq!(second, V8PlatformKind::Unprotected);
     }
 
     /// codex レビュー指摘 #503 P0: テスト専用のヒープ上限は、本番の
@@ -1032,10 +1107,11 @@ mod tests {
     }
 
     /// JS-1・TASK-29.2: 複数スレッドから同時に初期化・Isolate 生成を
-    /// 行っても、`Once` による直列化と unprotected Platform の採用により
-    /// panic・クラッシュしないこと（AC-1）。`cargo test` は既定で複数の
-    /// テストを並列実行するため、他のテストと合わせて実行されること
-    /// 自体もこの検証の一部になる。
+    /// 行っても、`OnceLock` による直列化と unprotected Platform の採用
+    /// （本テストは [`ensure_v8_initialized`] だけを使い、`Protected` は
+    /// 要求しない）により panic・クラッシュしないこと（AC-1）。
+    /// `cargo test` は既定で複数のテストを並列実行するため、他のテストと
+    /// 合わせて実行されること自体もこの検証の一部になる。
     #[test]
     fn js_1_v8_initialization_and_isolate_creation_from_multiple_threads() {
         let handles: Vec<_> = (0..4)
