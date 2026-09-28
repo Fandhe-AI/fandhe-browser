@@ -164,6 +164,12 @@ def load_capture_result(
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
         raise CaptureResultError(f"invalid JSON in capture-result.json: {exc}") from exc
+    except RecursionError as exc:
+        # 深くネストした JSON（非信頼入力）は `json.loads` の再帰的パースで
+        # `RecursionError` を送出しうる。`main` の 1 サイト単位のエラー処理
+        # 経路（`CaptureResultError`）を通さず計測プロセス全体を落とさないため
+        # 変換する（codex レビュー指摘。§2.6 の fail-closed 方針と同じ扱い）。
+        raise CaptureResultError(f"capture-result.json JSON nesting too deep: {exc}") from exc
 
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
         raise CaptureResultError("capture-result.json: unsupported or missing schema_version")
@@ -678,6 +684,11 @@ def load_bboxes(path: Path) -> dict[str, dict[str, float]] | None:
         # `json` の桁数上限で `ValueError` になることがあるため、
         # `JSONDecodeError` と合わせて `BboxError` に変換する（§2.6）。
         raise BboxError(f"invalid bbox JSON: {path}: {exc}") from exc
+    except RecursionError as exc:
+        # capture-result.json と同じ理由（codex レビュー指摘）で、深くネストした
+        # bbox JSON による `RecursionError` も `BboxError` へ変換し、1 サイト
+        # 単位のエラー処理（`measure_site` の部分失敗処理）を経由させる。
+        raise BboxError(f"bbox JSON nesting too deep: {path}: {exc}") from exc
 
     if not isinstance(payload, dict):
         raise BboxError(f"bbox JSON must be an object: {path}")
@@ -706,7 +717,15 @@ def load_bboxes(path: Path) -> dict[str, dict[str, float]] | None:
             # bool は int のサブクラスなので isinstance(v, (int, float)) より先に弾く。
             if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
                 raise BboxError(f"bbox element {eid!r}: {key} must be a number: {path}")
-            value = float(raw_value)
+            try:
+                value = float(raw_value)
+            except OverflowError as exc:
+                # JSON の `int` は桁数上限内であれば読み込めるが、極端に大きい
+                # 整数（例: 400 桁）は `float()` 変換で `OverflowError` を
+                # 送出する。`BboxError` へ変換しないと `measure_site` の
+                # 1 サイト単位の部分失敗処理を経由せず計測プロセス全体が
+                # 未処理例外で終了する（codex レビュー指摘。§2.6）。
+                raise BboxError(f"bbox element {eid!r}: {key} out of range: {path}") from exc
             if not math.isfinite(value) or abs(value) > MAX_BBOX_VALUE_ABS:
                 raise BboxError(f"bbox element {eid!r}: {key} out of range: {path}")
             values[key] = value

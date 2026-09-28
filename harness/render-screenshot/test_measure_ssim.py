@@ -601,6 +601,35 @@ class LoadBboxesTest(unittest.TestCase):
             with self.assertRaises(ms.BboxError):
                 ms.load_bboxes(path)
 
+    def test_rejects_overflow_integer_value(self) -> None:
+        # codex レビュー指摘（P1）: `x`/`y`/`width`/`height` が JSON の `int`
+        # としては読み込める桁数（`json` の桁数上限未満）でも、`float()` 変換で
+        # `OverflowError` を送出しうる巨大整数（400 桁）だと未処理例外で
+        # `measure_site` の部分失敗処理を経由せず落ちていた。`BboxError` へ
+        # 変換されることを確認する。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, {})
+            huge_int = "9" * 400
+            path.write_text(
+                f'{{"schema_version": 1, "elements": [{{"id": "a", "x": {huge_int}, "y": 0, '
+                '"width": 1, "height": 1}]}',
+                encoding="utf-8",
+            )
+            with self.assertRaises(ms.BboxError):
+                ms.load_bboxes(path)
+
+    def test_rejects_deeply_nested_json_without_crashing(self) -> None:
+        # codex レビュー指摘（P1）: 深くネストした bbox JSON は `json.loads` が
+        # `RecursionError` を送出しうるが、`BboxError` へ変換されず未処理例外
+        # として計測プロセス全体を止めていた。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "chromium" / "site.bboxes.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            depth = 200_000
+            path.write_text("[" * depth + "]" * depth, encoding="utf-8")
+            with self.assertRaises(ms.BboxError):
+                ms.load_bboxes(path)
+
 
 class CompareBboxesTest(unittest.TestCase):
     """RENDER-5 / TASK-37.2: `compare_bboxes`（±5% 判定・一致率。§2.4）。"""
@@ -826,6 +855,19 @@ class LoadCaptureResultTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             capture_dir = Path(tmp)
             (capture_dir / "capture-result.json").write_bytes(b"\xff\xfe\x00invalid-utf8")
+            with self.assertRaises(ms.CaptureResultError):
+                ms.load_capture_result(capture_dir)
+
+    def test_rejects_deeply_nested_json_without_crashing(self) -> None:
+        # codex レビュー指摘（P1）: 深くネストした capture-result.json は
+        # `json.loads` が `RecursionError` を送出しうるが、`CaptureResultError`
+        # へ変換されず未処理例外として計測プロセス全体を止めていた。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            depth = 200_000
+            (capture_dir / "capture-result.json").write_text(
+                "[" * depth + "]" * depth, encoding="utf-8"
+            )
             with self.assertRaises(ms.CaptureResultError):
                 ms.load_capture_result(capture_dir)
 
