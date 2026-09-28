@@ -128,6 +128,47 @@ fn task_91_1_oversized_file_is_too_large_error() {
     ));
 }
 
+/// TASK-91（91.1）・PROF-6: `root = "."` は設定ファイルの親ディレクトリ
+/// 自体を指すため `Config::load` でも拒否される（Issue #538 レビュー指摘の
+/// 回帰防止。`Profile::open`（TASK-50）が解決後のルートへ権限変更・子
+/// ディレクトリ作成・ロック取得を行う契約のため、設定ファイルを置いた
+/// ディレクトリへの意図しない副作用を防ぐ）。
+#[test]
+fn task_91_1_load_rejects_root_pointing_to_config_dir() {
+    let dir = TempDir::new();
+    let config_path = dir.write_config("[profile]\nroot = '.'\n");
+
+    let err = Config::load(&config_path).expect_err("\".\" は Config::load でも拒否される");
+
+    assert!(matches!(
+        err,
+        Error::Config(ConfigError::InvalidValue {
+            key: "profile.root",
+            ..
+        })
+    ));
+}
+
+/// TASK-91（91.1）・PROF-6: `root = "profiles/.."` は正規化すると設定
+/// ファイルの親ディレクトリ自体を指すため `Config::load` でも拒否される
+/// （Issue #538 レビュー指摘の回帰防止）。
+#[test]
+fn task_91_1_load_rejects_root_normalizing_to_config_dir() {
+    let dir = TempDir::new();
+    let config_path = dir.write_config("[profile]\nroot = 'profiles/..'\n");
+
+    let err = Config::load(&config_path)
+        .expect_err("\"profiles/..\" は正規化後に設定ファイルの親ディレクトリを指す");
+
+    assert!(matches!(
+        err,
+        Error::Config(ConfigError::InvalidValue {
+            key: "profile.root",
+            ..
+        })
+    ));
+}
+
 /// TASK-91（91.1）: 非 UTF-8 バイト列は `InvalidUtf8` になる。
 #[test]
 fn task_91_1_non_utf8_file_is_invalid_utf8_error() {

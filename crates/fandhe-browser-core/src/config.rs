@@ -184,7 +184,29 @@ impl ProfileConfig {
                         message: "profile.root must not be empty".to_string(),
                     }));
                 }
-                Some(PathBuf::from(root))
+                let candidate = PathBuf::from(&root);
+                // `Config::load` は相対パスを設定ファイルの親ディレクトリへ
+                // `Path::join` する（正規化しない）。ここで字句上
+                // （ファイルシステムに触れず）正規化した結果が「移動なし」
+                // （深さ 0）になる値（`.`・`profiles/..` 等）は、結合後の実体が
+                // 設定ファイルの親ディレクトリ自体を指す。`Profile::open`
+                // （TASK-50・#177）はそのディレクトリの権限変更・子ディレクトリ
+                // 作成・ロック取得を行う契約のため、設定ファイルを置いた
+                // ディレクトリへの意図しない副作用を防ぐためここで拒否する
+                // （security.md「不安全な設計」・プロファイル境界。上位への
+                // 脱出（`..` 等）自体の検証は二重実装せず `Profile::open` の
+                // ハンドル基準検証に委ねる。モジュール doc「パス解決」参照）。
+                if resolves_to_zero_depth(&candidate) {
+                    return Err(Error::from(ConfigError::InvalidValue {
+                        key: "profile.root",
+                        message: format!(
+                            "profile.root {:?} must not resolve to the config file's own \
+                             directory (e.g. \".\" or \"profiles/..\")",
+                            truncate_for_message(&root)
+                        ),
+                    }));
+                }
+                Some(candidate)
             }
             None => None,
         };
@@ -247,6 +269,33 @@ impl IsolationStrength {
             })),
         }
     }
+}
+
+/// `path` が字句上（ファイルシステムへ触れずコンポーネント解析のみで）
+/// 「移動なし」（深さ 0）に正規化されるかを判定する。
+///
+/// `.`（`CurDir` のみ）や `profiles/..`（`Normal` 1 個と `ParentDir` 1 個が
+/// 相殺）のように、結合先の基準ディレクトリそのものを指す値を検出するために
+/// `ProfileConfig::from_raw` から呼ばれる。絶対パス（`RootDir`/`Prefix` を含む）
+/// は対象外として `false` を返す。基準より上位へ脱出するパス（例: `".."`　や
+/// `"a/../.."`）も `false` を返す（脱出自体の妥当性検証はここで二重実装せず
+/// `Profile::open` のハンドル基準検証に委ねる。モジュール doc「パス解決」参照）。
+fn resolves_to_zero_depth(path: &Path) -> bool {
+    use std::path::Component;
+
+    let mut depth: i64 = 0;
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir => depth -= 1,
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+        if depth < 0 {
+            return false;
+        }
+    }
+    depth == 0
 }
 
 /// エラーメッセージへ反響する外部入力由来の文字列を切り詰める
@@ -470,6 +519,57 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// TASK-91（91.1）・PROF-6: `root = "."` は設定ファイルの親ディレクトリ
+    /// 自体を指すため拒否される（Issue #538 レビュー指摘の回帰防止）。
+    #[test]
+    fn task_91_1_root_current_dir_is_rejected() {
+        let err = Config::from_toml_str("[profile]\nroot = '.'\n")
+            .expect_err("\".\" は設定ファイルのディレクトリ自体を指すためエラーになる");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::InvalidValue {
+                key: "profile.root",
+                ..
+            })
+        ));
+    }
+
+    /// TASK-91（91.1）・PROF-6: `root = "profiles/.."` は正規化すると
+    /// 設定ファイルの親ディレクトリ自体を指すため拒否される
+    /// （Issue #538 レビュー指摘の回帰防止）。
+    #[test]
+    fn task_91_1_root_normalizing_to_current_dir_is_rejected() {
+        let err = Config::from_toml_str("[profile]\nroot = 'profiles/..'\n")
+            .expect_err("\"profiles/..\" は正規化後に設定ファイルの親ディレクトリを指す");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::InvalidValue {
+                key: "profile.root",
+                ..
+            })
+        ));
+    }
+
+    /// TASK-91（91.1）: 基準より上位へ脱出するだけの値（`".."`）は、この層
+    /// では「設定ファイルのディレクトリ自体」には該当しないため拒否しない
+    /// （脱出自体の検証は `Profile::open` に委ねる方針。モジュール doc
+    /// 「パス解決」参照）。
+    #[test]
+    fn task_91_1_root_parent_traversal_is_not_rejected_here() {
+        let config = Config::from_toml_str("[profile]\nroot = '..'\n")
+            .expect("\"..\" 自体はこの層では拒否しない");
+        assert_eq!(config.profile().root(), Some(Path::new("..")));
+    }
+
+    /// TASK-91（91.1）: 通常の相対パス（`profiles/default`）は引き続き
+    /// 受理される（回帰防止）。
+    #[test]
+    fn task_91_1_root_normal_relative_path_is_accepted() {
+        let config = Config::from_toml_str("[profile]\nroot = 'profiles/default'\n")
+            .expect("通常の相対パスは受理される");
+        assert_eq!(config.profile().root(), Some(Path::new("profiles/default")));
     }
 
     /// TASK-91（91.1）: 型違い（`root` が文字列でない）は構文エラーになる。
