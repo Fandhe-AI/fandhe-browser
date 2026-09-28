@@ -524,21 +524,66 @@ fn open_profile_pair(tmp: &TempDir) -> (Profile, Profile) {
     (profile_a, profile_b)
 }
 
-/// `root` 配下の 4 データディレクトリ（[`ISOLATION_LAYOUT`]）だけを走査し、
-/// 相対パスと内容の組を集める。`root` 直下の `profile.lock` はこの走査の
-/// 対象外（4 データディレクトリの中を見るだけで、`root` 自身は見ない）。
+/// `root` 直下で `Profile::open` が作る固定エントリ名（データディレクトリ 4
+/// 種に加え、`crate::lock::LOCK_FILE_NAME` は本体実装から独立して固定する
+/// ため文字列で持つ。[`ISOLATION_LAYOUT`] と同じ理由）。
+const ROOT_LOCK_FILE_NAME: &str = "profile.lock";
+
+/// `root` 配下を走査し、相対パスと内容の組を集める。
+///
+/// - ルート直下は `ROOT_LOCK_FILE_NAME`（`profile.lock`）と
+///   [`ISOLATION_LAYOUT`] が定める 4 データディレクトリだけが存在してよい。
+///   それ以外のエントリ（相手アカウントのデータが誤った場所に書かれた
+///   ものを含む）が見つかったら panic する（fail-closed。相手のデータが
+///   データディレクトリの外に漏れているケースを走査対象外にして見逃さない）。
+/// - 4 データディレクトリはいずれも欠落を許さない。`Profile::open` は
+///   常にこの 4 つを作る契約であり、欠落は「空のスナップショット」ではなく
+///   異常（テスト環境か本体側の想定外の状態）として panic する（fail-closed。
+///   欠落を 0 件に丸めると漏洩判定側が「両者とも空だから漏洩なし」と
+///   誤認しうる）。
+/// - 各データディレクトリ自身が symlink の場合も panic する
+///   （[`collect_regular_files`] の symlink 拒否は子エントリにしか
+///   適用されないため、走査開始ディレクトリはここで別途
+///   `symlink_metadata` により検証する）。
 ///
 /// symlink・通常ファイル/ディレクトリ以外のエントリを見つけたら panic する
 /// （fail-closed。`Profile` が symlink を作らない契約である以上、見つかった
 /// 場合はテスト環境か本体側の想定外の状態であり、0 件に丸めて見逃さない）。
 /// 読み込むファイルサイズは [`MAX_PAYLOAD_LEN`] を上限として検証する。
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let known_dir_names: std::collections::BTreeSet<&str> =
+        ISOLATION_LAYOUT.iter().map(|&(_, name)| name).collect();
+
+    let root_entries =
+        std::fs::read_dir(root).unwrap_or_else(|e| panic!("read_dir({root:?}) が失敗した: {e}"));
+    for entry in root_entries {
+        let entry = entry.unwrap_or_else(|e| panic!("{root:?} の read_dir 走査に失敗した: {e}"));
+        let path = entry.path();
+        let name = entry.file_name();
+        if name == OsStr::new(ROOT_LOCK_FILE_NAME) {
+            continue;
+        }
+        match name.to_str() {
+            Some(name_str) if known_dir_names.contains(name_str) => {}
+            _ => panic!(
+                "root 直下に想定外のエントリを検出した（相手アカウントのデータが誤った場所に書かれていないか要確認）: {path:?}"
+            ),
+        }
+    }
+
     let mut out = BTreeMap::new();
     for &(_, dir_name) in ISOLATION_LAYOUT {
         let dir = root.join(dir_name);
-        if dir.exists() {
-            collect_regular_files(&dir, root, &mut out);
+        let meta = std::fs::symlink_metadata(&dir).unwrap_or_else(|e| {
+            panic!("必須のデータディレクトリが欠落している（空のスナップショット扱いにしない）: {dir:?} ({e})")
+        });
+        if meta.file_type().is_symlink() {
+            panic!("走査開始ディレクトリが symlink になっている（辿らない）: {dir:?}");
         }
+        if !meta.is_dir() {
+            panic!("走査開始ディレクトリが通常ディレクトリではない: {dir:?}");
+        }
+        collect_regular_files(&dir, root, &mut out);
     }
     out
 }
