@@ -6,7 +6,7 @@
 //! 時点では inherent メソッドとして `evaluate_script` を提供するに
 //! 留める。設計書 §7「案 X」4）。
 //!
-//! [`V8ProcessEngine`] は 1 つの子プロセス（[`super::worker`] を
+//! [`V8ProcessEngine`] は 1 つの子プロセス（`super::worker` を
 //! `FANDHE_BROWSER_JS_WORKER` 環境変数で起動したもの）を遅延生成し、
 //! 寿命のあいだ持ち続ける。子は同じ実行ファイルを自己再実行する
 //! （専用のワーカーバイナリを持たない。設計書 §3.1）。
@@ -26,10 +26,10 @@
 //! - **reader スレッド**: 子の stdout からフレームを読み、`mpsc` 経由で
 //!   評価呼び出し側へ届ける
 //! - **stderr drain スレッド**: 子の stderr を読み続け、末尾
-//!   [`STDERR_TAIL_CAPACITY_BYTES`] バイトをリングバッファへ保持する。
+//!   `STDERR_TAIL_CAPACITY_BYTES` バイトをリングバッファへ保持する。
 //!   読み続けないとパイプが詰まって子が止まるため必須（設計書 §3.3）
-//! - **メモリ監視スレッド**（[`MemoryMonitor`]）: 子の寿命のあいだ
-//!   （評価中か待機中かに関わらず）[`super::resource_limits::RSS_POLL_INTERVAL`]
+//! - **メモリ監視スレッド**（`MemoryMonitor`）: 子の寿命のあいだ
+//!   （評価中か待機中かに関わらず）`super::resource_limits::RSS_POLL_INTERVAL`
 //!   ごとに子の RSS を確認し続け、しきい値を超えたらこのスレッドが
 //!   自ら `kill` する（codex・Cursor Bugbot レビュー指摘 #503 P0「RSS の
 //!   確認が `recv_timeout` の時間切れ分岐でしか行われておらず、短い
@@ -42,7 +42,7 @@
 //! | 子の watchdog による打ち切り（`Error{kind=Timeout}`） | [`JsEngineError::Timeout`] | 残る |
 //! | 応答待ち・書き込み待ちの期限切れで親が `kill` した | [`JsEngineError::Timeout`] | 破棄（メッセージに明示） |
 //! | 応答前に EOF になり、stderr に `Fatal ... out of memory` がある | [`JsEngineError::ResourceLimitExceeded`] | 破棄（ヒューリスティック） |
-//! | メモリ監視スレッドが RSS 超過を検出して子を `kill` した（評価中・書き込み中・待機中いずれも） | [`JsEngineError::ResourceLimitExceeded`] | 破棄（メッセージに実測 RSS を明示。書き込み中に `kill` された場合の broken pipe も正しくここへ分類する。[`discard_context_error`]。codex・Bugbot レビュー指摘 #503 P0/P1 対応） |
+//! | メモリ監視スレッドが RSS 超過を検出して子を `kill` した（評価中・書き込み中・待機中いずれも） | [`JsEngineError::ResourceLimitExceeded`] | 破棄（メッセージに実測 RSS を明示。書き込み中に `kill` された場合の broken pipe も正しくここへ分類する。`discard_context_error`。codex・Bugbot レビュー指摘 #503 P0/P1 対応） |
 //! | 応答（Result/Error）受信直後の同期確認で RSS 超過が判明した | [`JsEngineError::ResourceLimitExceeded`] | 破棄（せっかく得られた応答を握りつぶす。同上） |
 //! | それ以外の異常終了・プロトコル違反・起動失敗 | [`JsEngineError::EngineUnavailable`] | 破棄 |
 //!
@@ -53,9 +53,9 @@
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
 //! - ヒープ外メモリ（`ArrayBuffer` の backing store 等）には
-//!   [`super::resource_limits`] が子側の OS 別強制（Linux の
+//!   `super::resource_limits` が子側の OS 別強制（Linux の
 //!   `RLIMIT_DATA`・Windows の Job Object working set 上限）と親側の
-//!   RSS 監視（[`MemoryMonitor`]。子の寿命のあいだ継続的に動作する）に
+//!   RSS 監視（`MemoryMonitor`。子の寿命のあいだ継続的に動作する）に
 //!   よる多層防御を設けている（codex・Bugbot レビュー指摘 #503 P0
 //!   対応）。ただし実測の結果、子側の OS 別強制はいずれも厳密な上限には
 //!   ならず（Linux は V8 の `CodeRange` 仮想アドレス予約のため小さい値に
@@ -67,7 +67,7 @@
 //! - macOS には子のメモリ使用量を OS 側で強制する手段が無く
 //!   （`super::resource_limits` の実機検証結果を参照）、親側の RSS 監視
 //!   だけに頼る
-//! - 応答直後の同期的な RSS 確認（[`apply_post_response_rss_check`]）は
+//! - 応答直後の同期的な RSS 確認（`apply_post_response_rss_check`）は
 //!   呼び出しスレッド上で `read_child_rss_bytes` を 1 回だけ呼ぶ。Windows
 //!   は `GetProcessMemoryInfo`（psapi.dll の直接呼び出し）を使うため、
 //!   PowerShell 起動のようなプロセス生成コストは無い
@@ -77,10 +77,10 @@
 //! - stderr の文言（`Fatal JavaScript out of memory`/`Fatal process out
 //!   of memory`）による `ResourceLimitExceeded` の判定はヒューリスティック
 //!   であり、V8 のバージョン更新でメッセージが変われば壊れうる
-//! - [`super::v8_engine`] の `SCRIPT_EXECUTION_TIMEOUT` のドキュメント
+//! - `super::v8_engine` の `SCRIPT_EXECUTION_TIMEOUT` のドキュメント
 //!   コメントが記す既知の制限（「`v8::Script::compile` 自体は
 //!   `terminate_execution` では打ち切られない場合がある」）は、本モジュール
-//!   の [`EVALUATE_RECV_TIMEOUT`] による強制 `kill`（[`WorkerHandle::drop`]
+//!   の `EVALUATE_RECV_TIMEOUT` による強制 `kill`（`WorkerHandle::drop`
 //!   と同じ「stdin を閉じる→待つ→kill→wait」の手順は踏まず、応答待ちの
 //!   `recv_timeout` が切れた時点で直ちに `kill` する）で解消される。
 //!   コンパイルがどれだけ長くかかっても、子プロセスごと強制終了できる

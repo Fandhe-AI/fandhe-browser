@@ -92,7 +92,7 @@ pub use engine_trait::{
 /// し（`TASK-30`）、`fandhe-browser-cli` の `main` が tokio ランタイム・
 /// ロギング・設定読み込みより**前**に呼ぶ契約（`TASK-41`）。
 ///
-/// 環境変数 [`worker_protocol::MARKER_ENV_VAR`]
+/// 環境変数 `worker_protocol::MARKER_ENV_VAR`
 /// （`FANDHE_BROWSER_JS_WORKER`）が設定されていなければ `None` を返し、
 /// 呼び出し元は通常どおり処理を続ける（設計書 §3.1「フックを呼ばない
 /// ホストへの対策」）。設定されている場合は子プロセスとして動作し、
