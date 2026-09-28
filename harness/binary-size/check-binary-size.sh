@@ -177,13 +177,22 @@ PKG_FOUND=$(printf '%s' "$METADATA" | jq -r --arg pkg "$PACKAGE" '
     [.packages[] | select(.name == $pkg)] | length
   ' | tr -d '\r')
 if [ "$PKG_FOUND" -eq 0 ]; then
-  # 実装対象の cli crate（fandhe-browser-cli）は TASK-41.5（Issue #174）が
-  # 追加予定でまだ workspace に存在しない。「計測対象が無い」ことは「計測して
-  # 上限を超えた」こととは別状態として扱い、Makefile の HAS_MEMBERS 判定と
-  # 同じ方針で skip（exit 0）にする。#174 で package が追加された時点で
-  # 自動的にこの分岐を通らなくなり、以後は本判定が fail-closed で効く。
-  echo "skip: package $PACKAGE not found in workspace (enabled after #174 adds fandhe-browser-cli)"
-  exit 0
+  # 既定 package（fandhe-browser-cli）に限り skip する。実装対象の cli crate は
+  # TASK-41.5（Issue #174）が追加予定でまだ workspace に存在しないため、
+  # 「計測対象が無い」ことは「計測して上限を超えた」こととは別状態として扱い、
+  # Makefile の HAS_MEMBERS 判定と同じ方針で skip（exit 0）にする。#174 で
+  # package が追加された時点で自動的にこの分岐を通らなくなり、以後は本判定が
+  # fail-closed で効く。
+  # `--package` / `BINARY_SIZE_PACKAGE` で既定値以外を明示指定した場合まで
+  # skip すると、package 名の誤記・設定のずれで検査が「未導入のためスキップ」
+  # として静かに通過してしまう（codex レビュー指摘, PR #563）。既定値以外は
+  # 「指定した package が見つからない」入力・使用エラーとして exit 2 にする。
+  if [ "$PACKAGE" = "fandhe-browser-cli" ]; then
+    echo "skip: package $PACKAGE not found in workspace (enabled after #174 adds fandhe-browser-cli)"
+    exit 0
+  fi
+  echo "error: package $PACKAGE not found in workspace (check --package / BINARY_SIZE_PACKAGE for a typo)" >&2
+  exit 2
 fi
 
 BIN_COUNT=$(printf '%s' "$METADATA" | jq -r --arg pkg "$PACKAGE" '

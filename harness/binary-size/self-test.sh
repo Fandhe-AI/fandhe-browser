@@ -91,8 +91,16 @@ expect_exit "file and package mutually exclusive" 2 --file "$F100" --package foo
 # --- package モード（ビルドしない経路のみ。cargo と Cargo.toml が必要）。---
 
 if command -v cargo >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/../../Cargo.toml" ]; then
-  expect_exit "nonexistent package skips" 0 --package this-package-does-not-exist --limit 200
-  expect_contains "$LAST_OUTPUT" "skip:" "nonexistent package reports skip:"
+  # 既定 package（fandhe-browser-cli。TASK-41.5・Issue #174 が追加予定でまだ
+  # workspace に存在しない）の不在に限り skip（exit 0）とする。既定値以外を
+  # 明示指定して見つからない場合は package 名の誤記・設定のずれを「未導入の
+  # ためスキップ」として握りつぶさないよう exit 2 にする（codex レビュー
+  # 指摘, PR #563）。
+  expect_exit "default package (fandhe-browser-cli) absence skips" 0 --package fandhe-browser-cli --limit 200
+  expect_contains "$LAST_OUTPUT" "skip:" "default package absence reports skip:"
+
+  expect_exit "non-default nonexistent package is a usage error" 2 --package this-package-does-not-exist --limit 200
+  expect_contains "$LAST_OUTPUT" "not found in workspace" "non-default nonexistent package reports error"
 
   # fandhe-browser-core は lib のみで bin target を持たないため、metadata
   # 確認の時点で bin target 不在エラー（exit 2）になり、ビルドは走らない

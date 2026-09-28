@@ -12,8 +12,12 @@ SSOT（`docs/spec` の `04-behavior/`）を参照すること
 
 本 Issue の時点で workspace に `fandhe-browser-cli` crate は無い（TASK-41.5・
 Issue #174 が追加予定）。そのため `check-binary-size.sh --package
-fandhe-browser-cli` は「package が見つからない」として `skip:` を出し exit 0
-になる（回帰ゲートは実質的に無効）。
+fandhe-browser-cli`（既定 package）は「package が見つからない」として `skip:`
+を出し exit 0 になる（回帰ゲートは実質的に無効）。この skip は既定 package
+（`fandhe-browser-cli`）の不在に限定される。`--package` / `BINARY_SIZE_PACKAGE`
+で既定値以外を明示指定した場合に package が見つからないときは、誤記・設定の
+ずれを「未導入のためスキップ」として握りつぶさないよう exit 2（入力・使用
+エラー）にする。
 
 **skip の解除条件**: #174 が `crates/fandhe-browser-cli/` を追加すると、
 `cargo metadata` に package が現れるようになり、このスクリプトは自動的に
@@ -101,9 +105,9 @@ harness/binary-size/check-binary-size.sh \
 
 | exit | 意味 |
 | ---- | ---- |
-| 0 | 合格（すべてのバイナリが上限以下）、または package モードで対象 package が workspace に無い（`skip:`） |
+| 0 | 合格（すべてのバイナリが上限以下）、または package モードで既定 package（`fandhe-browser-cli`）が workspace に無い（`skip:`） |
 | 1 | 不合格（1 つ以上のバイナリが上限を超えた） |
-| 2 | 入力・使用エラー（引数不正・`--limit`/`--host`/`--bin`/`--package` の形式不正・ファイル不在・`cargo`/`jq`/`rustc` 未導入・`cargo metadata`/`cargo build` 失敗・bin target 不在・実行ファイル抽出結果 0 件） |
+| 2 | 入力・使用エラー（引数不正・`--limit`/`--host`/`--bin`/`--package` の形式不正・ファイル不在・`cargo`/`jq`/`rustc` 未導入・`cargo metadata`/`cargo build` 失敗・既定値以外の package が workspace に無い・bin target 不在・実行ファイル抽出結果 0 件） |
 
 サイズが上限ちょうど（`bytes == limit`）は合格（「超えたら」fail）。
 
