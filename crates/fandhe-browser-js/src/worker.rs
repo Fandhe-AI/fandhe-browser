@@ -36,6 +36,14 @@
 //!   Windows の Job Object working set 上限。設定に失敗したら評価を
 //!   始めずに終了する）。OS ごとの強制の強さ・既知の制限は
 //!   `super::resource_limits` のドキュメントコメントを参照
+//! - Linux 限定でさらに、`enforce_child_memory_limit` より前に
+//!   [`super::resource_limits::prefer_child_as_oom_victim`] を呼び、
+//!   `/proc/self/oom_score_adj` を最大値へ設定する（`JS-1`・`TASK-29`・
+//!   Issue #516）。これは確保量の上限ではなく、システム全体が
+//!   メモリ逼迫した際に OOM killer が親より先にこの子を殺すようにする
+//!   優先度のヒントである。失敗しても fail-closed にはせず、stderr へ
+//!   警告を出して評価の準備を続行する（既知の制限として記録する。
+//!   procfs が使えない環境要因に限られ、他の防御には影響しない）
 //! - 本プロセスはセキュリティ上のサンドボックスではない。親と同じ
 //!   ユーザー権限で動作し、seccomp 等の権限制限も行わない。得られるのは
 //!   クラッシュ・メモリの資源分離だけである（`super::process_engine` の
@@ -227,6 +235,29 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
             worker_protocol::PROTOCOL_VERSION
         );
         return ExitCode::FAILURE;
+    }
+
+    // Linux 限定: V8 の初期化・メモリ上限設定より前に、自分自身を OOM
+    // killer の優先対象にする（`JS-1`・`TASK-29`・Issue #516）。上限を
+    // 課すものではなく、システム全体がメモリ逼迫した際に親（ホスト）
+    // より先にこの子が殺される側になるようにするヒントに過ぎない
+    // （`super::resource_limits` のドキュメントコメント「OS ごとの
+    // 強制の強さ」節参照）。書き込みが失敗しても fail-closed にはせず、
+    // 警告を出して評価の準備を続行する（procfs が使えない環境要因に
+    // 限られ、他の防御には影響しないため。判断の理由は
+    // `super::resource_limits::prefer_child_as_oom_victim` のドキュメント
+    // コメント参照）。
+    //
+    // 警告メッセージは、親（`super::process_engine::WorkerHandle::
+    // stderr_indicates_oom`）が `ResourceLimitExceeded` への分類に使う
+    // 文字列（"Fatal JavaScript out of memory"・"Fatal process out of
+    // memory"）を含めない（誤って OOM と分類されるのを防ぐため）。
+    #[cfg(target_os = "linux")]
+    if let Err(err) = super::resource_limits::prefer_child_as_oom_victim() {
+        eprintln!(
+            "fandhe-browser-js worker: warning: failed to set oom_score_adj \
+             (continuing without OOM-killer preference): {err}"
+        );
     }
 
     // V8 を初期化する（ひいては Isolate を生成する）前に、自分自身へ
