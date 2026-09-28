@@ -17,6 +17,17 @@ publish.workspace = true
 [dependencies]
 v8 = { workspace = true, optional = true }
 
+# JS ワーカーの子プロセスが自身へ OS のメモリ上限を掛けるための依存（TASK-29・
+# Issue #503。ユーザー承認 2026-09-28）。いずれも `js-v8` feature からのみ有効化し、
+# 既定ビルドの依存グラフには含めない。unix は RLIMIT_DATA（rustix の safe な
+# `setrlimit`）、Windows は Job Object（Win32 API を windows-sys で直接呼ぶ。unsafe は
+# Win32 呼び出しに限定。ユーザー承認 2026-09-28）を使う。
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, optional = true }
+
 # feature 名は docs/spec/04-behavior/js-engine.md（JS-1）「JS エンジンの
 # 切替方式」2. の設計（js-v8 = ["dep:v8"]・js-boa = ["dep:boa_engine"]）に
 # 対応する（TASK-28.1 が予約枠として定義し、本 TASK-29.1 で `js-v8` を
@@ -34,5 +45,21 @@ v8 = { workspace = true, optional = true }
 # 引き続き `dep:` 接頭辞なしのプレースホルダのままにする。
 [features]
 default = []
-js-v8 = ["dep:v8"]
+js-v8 = ["dep:v8", "dep:rustix", "dep:windows-sys"]
 js-boa = []
+
+# JS プロセス分離（TASK-29・Issue #503 設計書 §3.1・§7 W6）の結合テスト。
+# このテストバイナリ自身が自己再実行の対象になる（`main` の先頭で
+# `fandhe_browser_js::run_js_worker_if_requested` を呼び、環境変数
+# `FANDHE_BROWSER_JS_WORKER` が設定されていれば子プロセス役に徹する）。
+# fake MCP の前例（`crates/fandhe-browser-core/Cargo.toml:67-73`）と同じ
+# 理由で `harness = false` にする: 子プロセス役のときの stdout は
+# `super::worker_protocol` のフレーム専用であり、通常の libtest ハーネスが
+# stdout へ書く "running N tests" 等の文字列が混入すると、親（テスト本体）
+# 側のフレーム読み取りが壊れる。`js-v8` feature が無効なビルドでは
+# `V8ProcessEngine`（`process_engine` モジュール）自体が存在しないため
+# `required-features` で除外する。
+[[test]]
+name = "v8_worker"
+harness = false
+required-features = ["js-v8"]

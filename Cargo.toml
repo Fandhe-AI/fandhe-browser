@@ -58,8 +58,13 @@ fandhe-browser-render = { path = "crates/fandhe-browser-render" }
 # TOCTOU（symlink 差し替え競合。PR #437 レビュー指摘）を解消するために使う。
 # ユーザー承認済み（2026-09-26）。Windows 側では使わない（unix 限定の
 # target dependency として crate 側へ登録する）。
+# `process` feature は TASK-29（Issue #503・JS-1）で追加した（ユーザー承認
+# 2026-09-28）。JS ワーカーの子プロセスが自身に RLIMIT_DATA を設定し、V8 ヒープ外
+# メモリ（ArrayBuffer の backing store 等）にも OS 側の上限を掛けるために使う
+# （`rustix::process::setrlimit` は safe API のため unsafe を追加しない）。
 rustix = { version = "=1.1.5", default-features = false, features = [
   "fs",
+  "process",
   "std",
 ] }
 
@@ -103,6 +108,20 @@ tokio = { version = "=1.53.1", default-features = false, features = [
 # （`js-v8` 無効）の依存グラフには含まれない（`cargo tree` で確認。RENDER-1
 # の Servo 隔離と同様の考え方）。
 v8 = { version = "=152.2.0" }
+
+# TASK-29（Issue #503・JS-1）: Windows で JS ワーカーの子プロセスに OS 強制の
+# コミットメモリ上限（Job Object の ProcessMemoryLimit）を掛け、親側で子の
+# コミット量（PrivateUsage）を取得するために Win32 API を直接呼ぶ。win32job の
+# safe API では ProcessMemoryLimit を設定できないため（ExtendedLimitInfo の内部が
+# pub(crate)）。unsafe はこの Win32 呼び出しに限定する（ユーザー承認 2026-09-28）。
+# 既に推移依存として Cargo.lock にある 0.61.2 を直接固定する。
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+] }
 
 [profile.release]
 # release ビルドは panic 発生時に unwind せず即座に中断する前提

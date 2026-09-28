@@ -143,10 +143,66 @@ pub struct EvaluateOptions {}
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum JsEngineError {
-    /// スクリプト評価が失敗した（構文エラー・実行時例外等）。
+    /// スクリプト評価が失敗した（構文エラー・実行時例外・タイムアウトに
+    /// よる打ち切り等）。
     EvaluationFailed(String),
     /// グローバル関数・DOM 風オブジェクトの登録に失敗した。
     BindingFailed(String),
+    /// スクリプト評価がリソース上限（現状はヒープ上限）に到達したために
+    /// 打ち切られた（`JS-1`・Issue #506・#508・#509・#503）。
+    ///
+    /// [`EvaluationFailed`](Self::EvaluationFailed)（構文エラー・実行時
+    /// 例外）や [`Timeout`](Self::Timeout)（実行時間の上限）とは別の
+    /// variant にすることで、呼び出し側（core・cdp 等）がヒープ上限到達
+    /// 由来の打ち切りを判別できるようにする（呼び出し側がリトライ・
+    /// エンジン再生成等、他の打ち切り理由とは異なる対応を選べるように
+    /// するため。security.md「偽装・回避機能の禁止」──実際の打ち切り
+    /// 理由をひとまとめにして隠さない）。
+    ///
+    /// # V8 実装（子プロセス分離後。Issue #503）における意味
+    ///
+    /// 以前（案 A・Issue #507）は、同一プロセス内でヒープ上限を一時的に
+    /// 広げて打ち切りを検知し、上限を元に戻して**同じエンジンを使い
+    /// 続けられる**ようにしていた。現在（案 X・Issue #503）は、V8 の
+    /// Isolate を子プロセスの中でだけ生成し、ヒープ上限に達すると
+    /// その子プロセスが V8 の既定の fatal OOM で終了する。親
+    /// （`process_engine.rs`。`js-v8` feature 有効時のみ・非公開）は
+    /// この終了を検出して本 variant へ変換するが、**そのときには子の
+    /// 状態（Context・グローバル変数）は失われている**。呼び出し側は
+    /// 次の評価が新しいコンテキストで行われることを前提にする（メッセージ
+    /// 文言に "context was discarded" を含める。security.md「偽装・
+    /// 回避機能の禁止」──状態が失われたことを隠さない）。「打ち切り後に
+    /// エンジンが使い続けられるかどうかは実装依存」という `JsEngine`
+    /// トレイトの契約自体は変わらないが、V8 実装での具体的な意味は
+    /// 「同じプロセス内で状態が残る」から「新しい子プロセス・新しい
+    /// コンテキストで再開する」へ変わった。
+    ResourceLimitExceeded(String),
+    /// スクリプト評価が実行時間の上限を超えたために打ち切られた
+    /// （`JS-1`・Issue #503）。
+    ///
+    /// [`EvaluationFailed`](Self::EvaluationFailed)（構文エラー・実行時
+    /// 例外）とは別の variant にすることで、呼び出し側がタイムアウトを
+    /// 判別できるようにする。V8 実装（子プロセス分離後）では、打ち切り
+    /// 理由によってエンジンの状態が変わる:
+    ///
+    /// - 子の監視スレッド（watchdog）による打ち切り（`v8_engine.rs` の
+    ///   `SCRIPT_EXECUTION_TIMEOUT`）: 子プロセスは生き続け、Context も
+    ///   残る（従来と同じ挙動）
+    ///   - Context が残る場合、メッセージに "context was discarded" は
+    ///     含まれない
+    /// - 親が応答待ちの期限切れで子プロセスを `kill` した場合
+    ///   （`process_engine.rs` の応答待ちタイムアウト）: 子プロセスごと
+    ///   終了させるため、Context は失われる
+    ///   - この場合はメッセージに "context was discarded" を含める
+    Timeout(String),
+    /// 子プロセスの異常終了・プロトコル違反・起動失敗など、エンジンが
+    /// 一時的に利用できない状態になったことを表す（`JS-1`・Issue #503）。
+    ///
+    /// V8 実装（子プロセス分離後）でのみ発生しうる。子プロセスの
+    /// クラッシュ・プロトコル違反を検出した場合、コンテキストは失われ、
+    /// 次回の評価で新しい子プロセスが自動的に起動される（メッセージに
+    /// "context was discarded" を含める）。
+    EngineUnavailable(String),
 }
 
 impl std::fmt::Display for JsEngineError {
@@ -154,6 +210,13 @@ impl std::fmt::Display for JsEngineError {
         match self {
             Self::EvaluationFailed(msg) => write!(f, "script evaluation failed: {msg}"),
             Self::BindingFailed(msg) => write!(f, "binding registration failed: {msg}"),
+            Self::ResourceLimitExceeded(msg) => {
+                write!(f, "script evaluation exceeded a resource limit: {msg}")
+            }
+            Self::Timeout(msg) => write!(f, "script evaluation timed out: {msg}"),
+            Self::EngineUnavailable(msg) => {
+                write!(f, "js engine is temporarily unavailable: {msg}")
+            }
         }
     }
 }
