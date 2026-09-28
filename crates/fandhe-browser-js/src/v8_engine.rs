@@ -111,7 +111,7 @@ const MAX_ERROR_MESSAGE_EXTRACT_BYTES: usize = MAX_ERROR_MESSAGE_CHARS * 4;
 /// 比較していたため、実質的に無制限のスクリプトを受け付けてしまって
 /// いた。本定数はアプリケーション側で明示的に定めた実効的な上限
 /// （OWASP A04「不安全な設計」対策。security.md）。
-const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
+pub(crate) const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
 
 /// [`V8Engine::new`] が生成する Isolate に設定するヒープサイズの上限
 /// （バイト。`JS-1`・codex レビュー指摘 #154 P0 対応・Issue #503 JS

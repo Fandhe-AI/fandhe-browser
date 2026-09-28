@@ -69,6 +69,28 @@ use super::worker_protocol::{self, ErrorKind, ProtocolError, tag};
 /// と合わせた多層防御であり、どちらか一方が壊れても上限は保たれる）。
 pub(crate) const TEST_HEAP_LIMIT_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER_HEAP_LIMIT_BYTES";
 
+/// テスト専用: 子プロセスが送る `Hello` フレームのエンジン種別を
+/// 上書きする環境変数（codex レビュー指摘 #503 P1「Hello のエンジン
+/// 種別を無視している」の回帰テストが、実際の子プロセスに
+/// `EngineKind::Boa` を名乗らせて親側の拒否を確認するために使う）。
+/// 値が `"boa"` のときだけ `EngineKind::Boa` を使い、それ以外（未設定を
+/// 含む）は常に本番と同じ `EngineKind::V8` を送る。
+///
+/// [`TEST_HEAP_LIMIT_ENV_VAR`] と同様、本番の起動経路
+/// （[`super::process_engine`]）は `env_clear()` した状態で子プロセスを
+/// 起動するため、この環境変数を明示的に渡さない限り本番では常に
+/// `EngineKind::V8` のままである。
+pub(crate) const TEST_HELLO_ENGINE_OVERRIDE_ENV_VAR: &str =
+    "FANDHE_BROWSER_JS_WORKER_HELLO_ENGINE_OVERRIDE";
+
+/// テスト専用: 子プロセスが送る `Hello` フレームの末尾に、余分な 1
+/// バイトを付け足す環境変数（codex レビュー指摘 #503 P1「decode_hello が
+/// 末尾の余分なバイトを拒否していない」の回帰テストが、実際の子プロセス
+/// に長さの違う `Hello` を送らせて親側の拒否を確認するために使う）。値が
+/// 存在すれば（内容は問わない）付け足し、未設定なら本番と同じ 3 バイト
+/// ちょうどの `Hello` を送る。
+pub(crate) const TEST_HELLO_EXTRA_BYTE_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER_HELLO_EXTRA_BYTE";
+
 /// [`TEST_HEAP_LIMIT_ENV_VAR`] の生の値（未設定なら `None`）から、実際に
 /// [`V8Engine::new_with_heap_limit`] へ渡すヒープ上限を決める（codex
 /// レビュー指摘 #503 P0 対応）。
@@ -164,8 +186,22 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
     // （設計書 §3.1「Hello を送るのは V8Engine::new() が成功した後」。
     // 親から見て Hello の到達＝「子のエンジンが評価可能な状態になった」
     // ことを意味する）。
-    let hello_payload =
-        worker_protocol::encode_hello(worker_protocol::PROTOCOL_VERSION, EngineKind::V8);
+    //
+    // `TEST_HELLO_ENGINE_OVERRIDE_ENV_VAR`・`TEST_HELLO_EXTRA_BYTE_ENV_VAR`
+    // は codex レビュー指摘 #503 P1 の回帰テスト専用の分岐であり、
+    // 本番の起動経路（`env_clear()` される）では常に未設定のため
+    // 到達しない。
+    let hello_engine = if std::env::var(TEST_HELLO_ENGINE_OVERRIDE_ENV_VAR).as_deref() == Ok("boa")
+    {
+        EngineKind::Boa
+    } else {
+        EngineKind::V8
+    };
+    let mut hello_payload =
+        worker_protocol::encode_hello(worker_protocol::PROTOCOL_VERSION, hello_engine);
+    if std::env::var(TEST_HELLO_EXTRA_BYTE_ENV_VAR).is_ok() {
+        hello_payload.push(0xff);
+    }
     if let Err(err) = send_frame(&mut stdout, tag::HELLO, &hello_payload) {
         eprintln!("fandhe-browser-js worker: failed to send Hello: {err}");
         return ExitCode::FAILURE;

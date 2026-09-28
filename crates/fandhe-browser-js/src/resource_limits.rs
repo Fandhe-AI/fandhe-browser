@@ -25,6 +25,19 @@
 //!   場合（macOS）のいずれであっても、`ResourceLimitExceeded` への
 //!   分類と子の作り直しは最終的にこの親側の監視・確認が行う**（実測に
 //!   基づく判断。理由は次節）
+//! - **親側（監視そのものが壊れた場合）**: `read_child_rss_bytes` が
+//!   連続で失敗し続けると（`ps` が `PATH` に無い・実行できない等）、
+//!   監視は事実上ずっと `None` を返し続け、上限が事実上なくなる（codex
+//!   レビュー指摘 #503 P0）。`super::process_engine::MemoryMonitor` は
+//!   連続失敗の回数を数え、
+//!   [`super::process_engine::MAX_CONSECUTIVE_PROBE_FAILURES`]（3 回）に
+//!   達したら fail-closed（子を `kill` し、以後の評価を
+//!   `JsEngineError::EngineUnavailable` にする）に倒す。単発の失敗は
+//!   引き続き fail-open（次のポーリングで再試行）のままである
+//!
+//! macOS の `ps` は `PATH` に依存せず絶対パス（[`PS_ABSOLUTE_PATH`]）で
+//! 起動する（codex レビュー指摘 #503 P0 対応。`PATH` に `ps` が無い・
+//! 別の実行ファイルが先に解決される等の環境差による取得不能を避ける）。
 //!
 //! # OS ごとの強制の強さ（実装済みを装わない。REPAIR-3）
 //!
@@ -78,10 +91,14 @@
 //!   すると、実際のピークメモリは一時的に [`MAX_CHILD_RSS_BYTES`] を
 //!   超えてから検出・終了する
 //! - メモリ使用量の取得（`/proc/<pid>/status`・`ps`・
-//!   `GetProcessMemoryInfo`）に失敗した場合は監視を諦めてそのポーリング
-//!   回だけスキップする（fail-open。[`read_child_rss_bytes`] のドキュメント
-//!   コメント参照）。[`enforce_child_memory_limit`] 自体の失敗は
-//!   fail-closed（評価を始めずに終了）であり、起動時強制と監視とで
+//!   `GetProcessMemoryInfo`）が単発で失敗した場合は監視を諦めてその
+//!   ポーリング回だけスキップする（fail-open。[`read_child_rss_bytes`]
+//!   のドキュメントコメント参照）。ただし
+//!   [`super::process_engine::MAX_CONSECUTIVE_PROBE_FAILURES`] 回
+//!   連続で失敗した場合は fail-closed に切り替わる（codex レビュー指摘
+//!   #503 P0 対応。`super::process_engine::MonitorKillReason` 参照）。
+//!   [`enforce_child_memory_limit`] 自体の失敗は最初から fail-closed
+//!   （評価を始めずに終了）であり、起動時強制と監視とで
 //!   fail-open/fail-closed の扱いが異なることに注意
 //! - Windows の `ProcessMemoryLimit`・`GetProcessMemoryInfo` を使う
 //!   windows-sys 版の実装は、本コミット時点では実機・CI での検証が
@@ -422,13 +439,16 @@ pub(crate) type ChildMemoryProbe = u32;
 /// 量を制限できない」対応。working set ベースの `WorkingSet64` から
 /// 変更した）。
 ///
-/// 取得に失敗した場合は `None` を返す（fail-open。理由: 親側の RSS 監視は
-/// 3 OS 共通の主たる防衛線であるが、それでも取得失敗のたびに子を kill
-/// すると、`/proc` や `ps`・`GetProcessMemoryInfo` が一時的に応答しない
-/// だけで正常な評価まで巻き込んで打ち切ってしまう。呼び出し元は `None`
-/// を「そのポーリング回は監視できなかった」として扱い、次のポーリングで
-/// 再試行する。全体の期限（`super::process_engine::EVALUATE_RECV_TIMEOUT`）
-/// は別途効いているため、監視が効かない期間が無限に続くことはない）。
+/// 取得に失敗した場合は `None` を返す（呼び出し元の単発の判断としては
+/// fail-open。理由: それでも取得失敗のたびに子を kill すると、`/proc` や
+/// `ps`・`GetProcessMemoryInfo` が一時的に応答しないだけで正常な評価まで
+/// 巻き込んで打ち切ってしまう）。ただし呼び出し元
+/// （`super::process_engine::MemoryMonitor`）は連続失敗の回数を数えて
+/// おり、[`super::process_engine::MAX_CONSECUTIVE_PROBE_FAILURES`] 回
+/// 連続で `None` が続いた場合は fail-closed に切り替える（codex レビュー
+/// 指摘 #503 P0「`ps` を起動できない場合、監視が `None` を返し続ける
+/// だけで上限が事実上なくなる」対応。単発の判断は fail-open、繰り返しの
+/// 判断は fail-closed という 2 段構えになっている）。
 pub(crate) fn read_child_rss_bytes(probe: ChildMemoryProbe) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -475,10 +495,22 @@ fn read_rss_linux(pid: u32) -> Option<u64> {
 #[cfg(target_os = "macos")]
 const PS_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// `ps` の絶対パス（codex レビュー指摘 #503 P0「`ps` を PATH に依存させず
+/// 絶対パスで起動する」対応）。`PATH` に `ps` が無い・別の実行ファイルが
+/// 先に見つかる等の環境差に左右されないよう、macOS が標準で `ps` を
+/// 置く場所を直接指定する。万一この経路に `ps` が存在しない環境（通常の
+/// macOS では起こらない）では `spawn()` 自体が失敗し、
+/// [`read_rss_macos`] は `None` を返す（呼び出し元の
+/// [`super::process_engine::MemoryMonitor`] が連続失敗を数え、
+/// fail-closed に倒す。同モジュールのドキュメントコメント参照）。
+#[cfg(target_os = "macos")]
+const PS_ABSOLUTE_PATH: &str = "/bin/ps";
+
 /// macOS: `ps -o rss= -p <pid>` の出力（キロバイト単位）を読む。macOS には
 /// Linux の `/proc` に相当する軽量な読み取り経路が無いため、外部コマンド
 /// を都度起動する（モジュール冒頭の表が説明するとおり、macOS では本関数
-/// が唯一の防衛線であるため、コストより確実性を優先する）。
+/// が唯一の防衛線であるため、コストより確実性を優先する）。`ps` は
+/// [`PS_ABSOLUTE_PATH`]（絶対パス）で起動し、`PATH` の設定には依存しない。
 ///
 /// `ps` の起動から終了までを [`PS_TIMEOUT`] の期限付きで待つ（期限なしの
 /// `Command::output` は使わない。理由は [`PS_TIMEOUT`] のドキュメント
@@ -486,7 +518,7 @@ const PS_TIMEOUT: Duration = Duration::from_millis(500);
 /// し、`None` を返す（fail-open。呼び出し元のドキュメントコメント参照）。
 #[cfg(target_os = "macos")]
 fn read_rss_macos(pid: u32) -> Option<u64> {
-    let mut child = std::process::Command::new("ps")
+    let mut child = std::process::Command::new(PS_ABSOLUTE_PATH)
         .args(["-o", "rss=", "-p", &pid.to_string()])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

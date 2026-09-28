@@ -44,6 +44,12 @@ fn main() -> ExitCode {
     js_1_oom_returns_resource_limit_exceeded_and_next_eval_uses_fresh_context();
     eprintln!("case: js_1_handshake_failure_is_engine_unavailable");
     js_1_handshake_failure_is_engine_unavailable();
+    eprintln!("case: js_1_handshake_rejects_hello_naming_a_different_engine");
+    js_1_handshake_rejects_hello_naming_a_different_engine();
+    eprintln!("case: js_1_handshake_rejects_hello_with_wrong_length");
+    js_1_handshake_rejects_hello_with_wrong_length();
+    eprintln!("case: js_1_oversized_script_is_rejected_without_spawning_a_child");
+    js_1_oversized_script_is_rejected_without_spawning_a_child();
     eprintln!("case: js_1_protocol_violation_discards_context_and_recovers");
     js_1_protocol_violation_discards_context_and_recovers();
     eprintln!("case: js_1_oversized_test_heap_limit_is_clamped_to_the_production_default");
@@ -138,6 +144,8 @@ fn js_1_oom_returns_resource_limit_exceeded_and_next_eval_uses_fresh_context() {
     let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
         heap_limit_bytes: Some(TEST_HEAP_LIMIT_BYTES),
         protocol_version_override: None,
+        hello_wrong_engine_for_test: false,
+        hello_extra_byte_for_test: false,
     });
     engine
         .evaluate_script("var before_oom = 999;", &EvaluateOptions::default())
@@ -182,6 +190,8 @@ fn js_1_handshake_failure_is_engine_unavailable() {
     let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
         heap_limit_bytes: None,
         protocol_version_override: Some(9999),
+        hello_wrong_engine_for_test: false,
+        hello_extra_byte_for_test: false,
     });
 
     match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
@@ -190,6 +200,99 @@ fn js_1_handshake_failure_is_engine_unavailable() {
             panic!("expected EngineUnavailable for an unsupported protocol version, got: {other:?}")
         }
     }
+}
+
+/// codex レビュー指摘 #503 P1「Hello のエンジン種別を無視している」の
+/// 結合テスト: 実際の子プロセスに `EngineKind::Boa` を名乗らせると
+/// （[`WorkerSpawnConfigForTest::hello_wrong_engine_for_test`]。子は
+/// 本物の V8 の Hello・ハンドシェイク手順をそのまま踏んだ上でエンジン
+/// バイトだけを差し替える）、親はこれをハンドシェイク失敗として拒否し、
+/// [`JsEngineError::EngineUnavailable`] を返すこと。
+fn js_1_handshake_rejects_hello_naming_a_different_engine() {
+    let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
+        heap_limit_bytes: None,
+        protocol_version_override: None,
+        hello_wrong_engine_for_test: true,
+        hello_extra_byte_for_test: false,
+    });
+
+    match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
+        Err(JsEngineError::EngineUnavailable(msg)) => {
+            assert!(
+                msg.contains("Boa"),
+                "expected the message to mention the unexpected engine kind (Boa), got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected EngineUnavailable for a Hello naming an unexpected engine kind, \
+             got: {other:?}"
+        ),
+    }
+}
+
+/// codex レビュー指摘 #503 P1「decode_hello が末尾の余分なバイトを
+/// 拒否していない」の結合テスト: 実際の子プロセスが送る `Hello` の末尾
+/// に余分な 1 バイトを付け足させると（[`WorkerSpawnConfigForTest::hello_extra_byte_for_test`]）、
+/// 親は黙って先頭 3 バイトだけを解釈せず、ハンドシェイク失敗として拒否
+/// して [`JsEngineError::EngineUnavailable`] を返すこと。
+fn js_1_handshake_rejects_hello_with_wrong_length() {
+    let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
+        heap_limit_bytes: None,
+        protocol_version_override: None,
+        hello_wrong_engine_for_test: false,
+        hello_extra_byte_for_test: true,
+    });
+
+    match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
+        Err(JsEngineError::EngineUnavailable(msg)) => {
+            assert!(
+                msg.contains("malformed Hello"),
+                "expected the message to report a malformed Hello frame, got: {msg}"
+            );
+        }
+        other => {
+            panic!("expected EngineUnavailable for a Hello with trailing bytes, got: {other:?}")
+        }
+    }
+}
+
+/// codex レビュー指摘 #503 P1「親は MAX_FRAME_PAYLOAD_PARENT_TO_CHILD
+/// （1 MiB+64 KiB）まで受け付けるが、子は MAX_SCRIPT_SOURCE_BYTES
+/// （1 MiB）までしか受け付けない」の回帰テスト: 上限を 1 バイト超える
+/// スクリプトは、子プロセスを一切起動せずに
+/// [`JsEngineError::EvaluationFailed`] として拒否されること
+/// （`worker_pid_for_test()` が `None` のままであることで、子が
+/// 起動されていないことを確認する）。
+fn js_1_oversized_script_is_rejected_without_spawning_a_child() {
+    let mut engine = V8ProcessEngine::new();
+    assert_eq!(
+        engine.worker_pid_for_test(),
+        None,
+        "no child should be spawned before the first evaluate_script call"
+    );
+
+    let max_len = V8ProcessEngine::max_script_source_bytes_for_test();
+    let oversized_script = "1".repeat(max_len + 1);
+
+    match engine.evaluate_script(&oversized_script, &EvaluateOptions::default()) {
+        Err(JsEngineError::EvaluationFailed(msg)) => {
+            assert!(
+                msg.contains(&max_len.to_string()),
+                "expected the message to mention the maximum supported length ({max_len}), \
+                 got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected EvaluationFailed for a script exceeding the maximum supported length, \
+             got: {other:?}"
+        ),
+    }
+
+    assert_eq!(
+        engine.worker_pid_for_test(),
+        None,
+        "the oversized script must be rejected before spawning a child process"
+    );
 }
 
 /// JS-1・Issue #503 W6 観点 6「プロトコル違反」: 子の stdin へ未知の tag
@@ -259,6 +362,8 @@ fn js_1_oversized_test_heap_limit_is_clamped_to_the_production_default() {
     let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
         heap_limit_bytes: Some(OVERSIZED_TEST_HEAP_LIMIT_BYTES),
         protocol_version_override: None,
+        hello_wrong_engine_for_test: false,
+        hello_extra_byte_for_test: false,
     });
 
     let oom_script = "var chunks = []; while (true) { chunks.push(new Array(1e7).fill(0)); }";
@@ -290,6 +395,8 @@ fn js_1_undersized_test_heap_limit_is_raised_to_a_working_floor() {
     let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
         heap_limit_bytes: Some(0),
         protocol_version_override: None,
+        hello_wrong_engine_for_test: false,
+        hello_extra_byte_for_test: false,
     });
 
     let result = engine

@@ -93,7 +93,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::engine_trait::{EvaluateOptions, JsEngineError, JsValue};
+use super::engine_trait::{EngineKind, EvaluateOptions, JsEngineError, JsValue};
 use super::worker_protocol::{self, ErrorKind, tag};
 
 /// ハンドシェイク（`Hello` フレームの受信）を待つ上限時間（設計書
@@ -174,8 +174,59 @@ fn child_memory_probe(
     }
 }
 
-/// 子の寿命のあいだ、評価中か待機中かに関わらず RSS を継続的に監視する
-/// 専任スレッド（codex・Cursor Bugbot レビュー指摘 #503 P0 対応）。
+/// [`MemoryMonitor`] が子のメモリ使用量を取得する際に呼ぶ関数の型
+/// （[`MemoryMonitor::spawn_with_threshold_and_probe`] が受け取る。
+/// clippy `type_complexity` 対応で型エイリアスに切り出した）。
+type MemoryProbeFn = Box<dyn Fn(&Arc<Mutex<Child>>, u32) -> Option<u64> + Send>;
+
+/// [`MemoryMonitor`] が実際に使う、本番のメモリ使用量取得（[`child_memory_probe`]
+/// ＋ [`super::resource_limits::read_child_rss_bytes`] の組み合わせ）。
+/// 単体テストは、この関数の代わりに常に `None` を返す・N 回目まで
+/// `None` を返す等のフェイク実装を注入できる
+/// （[`MemoryMonitor::spawn_with_threshold_and_probe`] 参照。codex レビュー
+/// 指摘 #503 P0「取得失敗を注入する経路を `#[cfg(test)]` で用意する」
+/// 対応。テスト専用の分岐を関数内に増やすのではなく、関数そのものを
+/// 差し替え可能にすることで、本番経路のコードを変えずに検証できる）。
+fn default_memory_probe(child: &Arc<Mutex<Child>>, pid: u32) -> Option<u64> {
+    let probe = child_memory_probe(child, pid)?;
+    super::resource_limits::read_child_rss_bytes(probe)
+}
+
+/// 監視スレッドが子を `kill` した理由（codex レビュー指摘 #503 P0
+/// 「メモリ使用量の取得ができなくなったときは fail-closed にする」対応
+/// で、既存の「RSS 超過」に加えて「監視自体が壊れて確認できなくなった」
+/// という別の理由を区別できるようにする）。
+#[derive(Debug, Clone, Copy)]
+enum MonitorKillReason {
+    /// メモリ使用量がしきい値を超えたことを実際に確認できた（従来どおり。
+    /// 値は観測したバイト数）。
+    ResourceLimitExceeded(u64),
+    /// メモリ使用量の取得（Linux の `/proc` 読み取り・macOS の `ps`・
+    /// Windows の `GetProcessMemoryInfo`）が
+    /// [`MAX_CONSECUTIVE_PROBE_FAILURES`] 回連続で失敗した。
+    /// **メモリ使用量が実際に超過したかどうかは分からない**（監視その
+    /// ものが機能していない状態）。
+    ProbeUnavailable { consecutive_failures: u32 },
+}
+
+/// メモリ使用量の取得が連続して何回失敗したら fail-closed（子を kill し、
+/// 以後の評価をエラーにする）にするか（codex レビュー指摘 #503 P0
+/// 「macOS で `ps` を起動できない場合、監視が `None` を返し続けるだけで
+/// 上限が事実上なくなる」対応）。
+///
+/// 1 回だけの失敗で fail-closed にすると、`ps`・`GetProcessMemoryInfo`
+/// の一時的な失敗（システム負荷等）で正常な評価まで巻き込んでしまう
+/// （[`default_memory_probe`] 呼び出し元のドキュメントコメント
+/// 「fail-open」の説明を参照）。3 回連続（[`super::resource_limits::RSS_POLL_INTERVAL`]
+/// が既定 75 ミリ秒であるため、合計で最大 225 ミリ秒程度）は、単発の
+/// 一時的な失敗を吸収しつつ、`ps` が PATH に無い・実行ファイルが
+/// 見つからない等の恒常的な失敗（＝監視が事実上機能しない状態）は
+/// 数百ミリ秒以内に検出できる値として選んだ。
+const MAX_CONSECUTIVE_PROBE_FAILURES: u32 = 3;
+
+/// 子の寿命のあいだ、評価中か待機中かに関わらずメモリ使用量を継続的に
+/// 監視する専任スレッド（codex・Cursor Bugbot レビュー指摘 #503 P0
+/// 対応）。
 ///
 /// 呼び出し元（`WorkerHandle`）が [`MemoryMonitor::spawn`] で生成し、
 /// [`WorkerHandle::drop`] で必ず [`MemoryMonitor::stop_and_join`] を
@@ -188,37 +239,66 @@ fn child_memory_probe(
 struct MemoryMonitor {
     /// 監視スレッドへ停止を伝えるフラグ。
     stop: Arc<AtomicBool>,
-    /// 監視スレッドが RSS 超過を検出して `kill` した場合、そのときの
-    /// RSS（バイト）を記録する。`None` は「まだ検出していない」。
-    /// 呼び出し側は [`MemoryMonitor::take_killed_rss`] で消費する。
-    killed_rss_bytes: Arc<Mutex<Option<u64>>>,
+    /// 監視スレッドが子を `kill` した場合、その理由を記録する。`None` は
+    /// 「まだ kill していない」。呼び出し側は
+    /// [`MemoryMonitor::take_kill_reason`] で消費する。
+    kill_reason: Arc<Mutex<Option<MonitorKillReason>>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl MemoryMonitor {
-    /// 監視スレッドを起動する（本番のしきい値
-    /// [`super::resource_limits::MAX_CHILD_RSS_BYTES`] を使う）。
+    /// 監視スレッドを起動する（本番のしきい値・本番のメモリ使用量取得
+    /// 経路を使う）。
     fn spawn(child: Arc<Mutex<Child>>, pid: u32) -> Self {
-        Self::spawn_with_threshold(child, pid, super::resource_limits::MAX_CHILD_RSS_BYTES)
+        Self::spawn_with_threshold_and_probe(
+            child,
+            pid,
+            super::resource_limits::MAX_CHILD_RSS_BYTES,
+            Box::new(default_memory_probe),
+        )
     }
 
     /// [`MemoryMonitor::spawn`] の本体。しきい値を呼び出し元から指定
     /// できる（単体テストが、実プロセスの RSS を人為的に膨らませずに
     /// 「しきい値超過」を確実に再現するため、極端に小さいしきい値を
-    /// 渡せるようにする。`tests` モジュール参照）。`child` は `kill`
-    /// するために共有し、`pid` は RSS を読み取るために使う
+    /// 渡せるようにする。`tests` モジュール参照）。本番のメモリ使用量
+    /// 取得経路（[`default_memory_probe`]）を使う。
+    #[cfg(test)]
+    fn spawn_with_threshold(child: Arc<Mutex<Child>>, pid: u32, threshold_bytes: u64) -> Self {
+        Self::spawn_with_threshold_and_probe(
+            child,
+            pid,
+            threshold_bytes,
+            Box::new(default_memory_probe),
+        )
+    }
+
+    /// [`MemoryMonitor::spawn`]／`MemoryMonitor::spawn_with_threshold`
+    /// （`#[cfg(test)]` 専用）の本体。`probe` を呼び出し元から差し替えられる
+    /// （codex レビュー指摘
+    /// #503 P0「取得失敗を注入する経路を `#[cfg(test)]` で用意する」
+    /// 対応。単体テストは常に `None` を返す・N 回目まで `None` を返す等の
+    /// フェイクを渡すことで、実際の `ps`／`/proc`／`GetProcessMemoryInfo`
+    /// を壊さずに fail-closed の挙動を決定的に検証できる）。`child` は
+    /// `kill` するために共有し、`pid` は `probe` に渡す
     /// （[`std::process::Child::id`] はプロセスの寿命のあいだ不変の
     /// ため、`Mutex` 越しに毎回取得し直す必要はない）。
-    fn spawn_with_threshold(child: Arc<Mutex<Child>>, pid: u32, threshold_bytes: u64) -> Self {
+    fn spawn_with_threshold_and_probe(
+        child: Arc<Mutex<Child>>,
+        pid: u32,
+        threshold_bytes: u64,
+        probe: MemoryProbeFn,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let killed_rss_bytes = Arc::new(Mutex::new(None));
+        let kill_reason = Arc::new(Mutex::new(None));
         let stop_for_thread = Arc::clone(&stop);
-        let killed_for_thread = Arc::clone(&killed_rss_bytes);
+        let kill_reason_for_thread = Arc::clone(&kill_reason);
 
         let thread = std::thread::spawn(move || {
             // `stop` の確認は `RSS_POLL_INTERVAL` より高い頻度で行い、
             // `Drop` 時の停止を早める（厳密な間隔でなくてよい）。
             const STOP_CHECK_GRANULARITY: Duration = Duration::from_millis(10);
+            let mut consecutive_probe_failures: u32 = 0;
             loop {
                 let mut waited = Duration::ZERO;
                 while waited < super::resource_limits::RSS_POLL_INTERVAL {
@@ -234,29 +314,42 @@ impl MemoryMonitor {
                     return;
                 }
 
-                // RSS の取得に失敗した場合は fail-open で次のポーリングへ
-                // 進む（`read_child_rss_bytes` のドキュメントコメント
-                // 参照。監視は多層防御の 1 つであり、一時的な取得失敗の
-                // たびに子を kill すると正常な評価まで巻き込む）。
-                let Some(probe) = child_memory_probe(&child, pid) else {
-                    continue;
+                let Some(usage_bytes) = probe(&child, pid) else {
+                    // メモリ使用量の取得に失敗した。単発の失敗は
+                    // fail-open（次のポーリングで再試行）にするが、
+                    // 連続で [`MAX_CONSECUTIVE_PROBE_FAILURES`] 回失敗
+                    // したら、監視そのものが機能していないとみなして
+                    // fail-closed にする（codex レビュー指摘 #503 P0
+                    // 対応。`MAX_CONSECUTIVE_PROBE_FAILURES` のドキュメント
+                    // コメント参照）。
+                    consecutive_probe_failures += 1;
+                    if consecutive_probe_failures < MAX_CONSECUTIVE_PROBE_FAILURES {
+                        continue;
+                    }
+                    if let Ok(mut reason) = kill_reason_for_thread.lock() {
+                        *reason = Some(MonitorKillReason::ProbeUnavailable {
+                            consecutive_failures: consecutive_probe_failures,
+                        });
+                    }
+                    if let Ok(mut child) = child.lock() {
+                        let _ = child.kill();
+                    }
+                    return;
                 };
-                let Some(rss_bytes) = super::resource_limits::read_child_rss_bytes(probe) else {
-                    continue;
-                };
-                if rss_bytes <= threshold_bytes {
+                consecutive_probe_failures = 0;
+                if usage_bytes <= threshold_bytes {
                     continue;
                 }
 
                 // 状態の記録を kill より先に行う（advisor 指摘。`kill`
                 // すると reader スレッドがほぼ即座に `Eof` を検出しうる
                 // ため、先に kill してしまうと `send_evaluate_and_await`
-                // 側が `take_killed_rss` を確認する前に `Eof` へ到達し、
+                // 側が `take_kill_reason` を確認する前に `Eof` へ到達し、
                 // 「なぜ落ちたか」の理由を stderr ヒューリスティックの
-                // 誤判定に譲ってしまう競合が起きる。「この RSS だから
+                // 誤判定に譲ってしまう競合が起きる。「この使用量だから
                 // kill を決めた」という順序のほうが実態にも即している）。
-                if let Ok(mut killed) = killed_for_thread.lock() {
-                    *killed = Some(rss_bytes);
+                if let Ok(mut reason) = kill_reason_for_thread.lock() {
+                    *reason = Some(MonitorKillReason::ResourceLimitExceeded(usage_bytes));
                 }
                 if let Ok(mut child) = child.lock() {
                     let _ = child.kill();
@@ -268,17 +361,17 @@ impl MemoryMonitor {
 
         Self {
             stop,
-            killed_rss_bytes,
+            kill_reason,
             thread: Some(thread),
         }
     }
 
-    /// 監視スレッドが記録した「RSS 超過で `kill` した」状態を取り出す
+    /// 監視スレッドが記録した「子を `kill` した」状態を取り出す
     /// （取り出すと消費され、以後は `None` になる。呼び出し元がこの値を
     /// 元にエラーへ変換した後、別の呼び出し元が同じ状態を二重に消費して
     /// 矛盾したメッセージを出さないようにするため）。
-    fn take_killed_rss(&self) -> Option<u64> {
-        self.killed_rss_bytes
+    fn take_kill_reason(&self) -> Option<MonitorKillReason> {
+        self.kill_reason
             .lock()
             .ok()
             .and_then(|mut guard| guard.take())
@@ -632,6 +725,17 @@ pub struct WorkerSpawnConfigForTest {
     /// 決定的に再現するためのテスト専用経路）。`None` の場合は
     /// [`worker_protocol::PROTOCOL_VERSION`] を使う。
     pub protocol_version_override: Option<u16>,
+    /// `true` にすると、子へ [`super::worker::TEST_HELLO_ENGINE_OVERRIDE_ENV_VAR`]
+    /// を渡し、子が `Hello` で `EngineKind::Boa` を名乗るようにする（codex
+    /// レビュー指摘 #503 P1「Hello のエンジン種別を無視している」の回帰
+    /// テスト専用。実際の子プロセスに別のエンジン種別を名乗らせて、親
+    /// （`spawn_worker`）が拒否することを確認する）。
+    pub hello_wrong_engine_for_test: bool,
+    /// `true` にすると、子へ [`super::worker::TEST_HELLO_EXTRA_BYTE_ENV_VAR`]
+    /// を渡し、子が送る `Hello` の末尾に余分な 1 バイトを付け足させる
+    /// （codex レビュー指摘 #503 P1「decode_hello が末尾の余分なバイトを
+    /// 拒否していない」の回帰テスト専用）。
+    pub hello_extra_byte_for_test: bool,
 }
 
 /// JS 評価を子プロセスへ分離して提供するエンジン（`JS-1`・Issue #503）。
@@ -699,11 +803,22 @@ impl V8ProcessEngine {
         _options: &EvaluateOptions,
     ) -> Result<JsValue, JsEngineError> {
         // 外部入力（スクリプト文字列）の経路。子を起動する前に検査する
-        // （coding-rust.md「外部入力」節）。
-        if script.len() > worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD {
+        // （coding-rust.md「外部入力」節）。codex レビュー指摘 #503 P1
+        // 「親は MAX_FRAME_PAYLOAD_PARENT_TO_CHILD（1 MiB+64 KiB）まで
+        // 受け付けるが、子は MAX_SCRIPT_SOURCE_BYTES（1 MiB）までしか
+        // 受け付けない」対応: 親の事前検証を子の実効的な上限
+        // （`super::v8_engine::MAX_SCRIPT_SOURCE_BYTES`）に揃える。
+        // `MAX_FRAME_PAYLOAD_PARENT_TO_CHILD` はフレームのタグ・長さ
+        // プレフィックス分の余白を含むプロトコル上の上限であり、
+        // アプリケーション側の実効的な入力上限とは別物である
+        // （`worker_protocol.rs` のドキュメントコメント参照）。ここで
+        // 弾いておけば、子を起動して書き込みを試みたあとに子側の
+        // `V8Engine::evaluate_script` が同じ理由で `EvaluationFailed`
+        // を返す（＝子プロセスを 1 つ無駄に起動する）ことを避けられる。
+        if script.len() > super::v8_engine::MAX_SCRIPT_SOURCE_BYTES {
             return Err(JsEngineError::EvaluationFailed(format!(
                 "script source exceeds the maximum supported length of {} bytes",
-                worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD
+                super::v8_engine::MAX_SCRIPT_SOURCE_BYTES
             )));
         }
 
@@ -713,18 +828,14 @@ impl V8ProcessEngine {
         };
 
         // codex・Bugbot レビュー指摘 #503 P0: 前回の評価から今回の
-        // 呼び出しまでのあいだ（待機中）に、監視スレッドが RSS 超過で
-        // 既に `kill` していないかを確認する。
-        if let Some(rss_bytes) = worker.memory_monitor.take_killed_rss() {
+        // 呼び出しまでのあいだ（待機中）に、監視スレッドが既に `kill`
+        // していないかを確認する。
+        if let Some(reason) = worker.memory_monitor.take_kill_reason() {
             let tail = worker.reap_and_collect_stderr();
+            let err = monitor_kill_reason_to_error(reason, &tail, "while idle between evaluations");
             // `worker` はここで drop され（`self.worker` へ戻さない）、
             // 次回の呼び出しで新しい子を起動し直す。
-            return Err(JsEngineError::ResourceLimitExceeded(format!(
-                "JS worker process RSS ({rss_bytes} bytes) exceeded the parent's monitoring \
-                 threshold ({} bytes) while idle between evaluations; context was discarded; \
-                 stderr: {tail}",
-                super::resource_limits::MAX_CHILD_RSS_BYTES
-            )));
+            return Err(ensure_discarded_phrase(err));
         }
 
         let (outcome, keep_worker) = Self::send_evaluate_and_await(&mut worker, script);
@@ -788,6 +899,17 @@ impl V8ProcessEngine {
         self.worker.as_ref().map(|worker| worker.pid)
     }
 
+    /// テスト専用: [`evaluate_script`](Self::evaluate_script) が事前検証
+    /// に使うスクリプト長上限（バイト）を返す。codex レビュー指摘 #503
+    /// P1「親は子より大きい入力を受け付ける」の回帰テストが、`tests/`
+    /// 配下の結合テスト（別クレート）から `super::v8_engine::MAX_SCRIPT_SOURCE_BYTES`
+    /// （`pub(crate)`）へ直接アクセスできないため、定数の値だけを最小限
+    /// 公開する（`v8` crate の型は一切介さない）。
+    #[doc(hidden)]
+    pub fn max_script_source_bytes_for_test() -> usize {
+        super::v8_engine::MAX_SCRIPT_SOURCE_BYTES
+    }
+
     /// 子プロセスを起動し、ハンドシェイク（`Hello` の受信）まで完了させる。
     fn spawn_worker(&self) -> Result<WorkerHandle, JsEngineError> {
         // 設計書 §3.1「再帰の防止」: 自分自身が既にワーカーとして起動
@@ -831,6 +953,17 @@ impl V8ProcessEngine {
                 clamped_heap_limit_bytes.to_string(),
             );
         }
+        if self.spawn_config.hello_wrong_engine_for_test {
+            // テスト専用（codex レビュー指摘 #503 P1）。本番の `new()` は
+            // 常に `false` のため、この環境変数は本番の子プロセスには
+            // 渡らない。
+            command.env(super::worker::TEST_HELLO_ENGINE_OVERRIDE_ENV_VAR, "boa");
+        }
+        if self.spawn_config.hello_extra_byte_for_test {
+            // テスト専用（codex レビュー指摘 #503 P1）。値の内容は
+            // `super::worker` 側では読まず、変数の有無だけを見る。
+            command.env(super::worker::TEST_HELLO_EXTRA_BYTE_ENV_VAR, "1");
+        }
         #[cfg(windows)]
         {
             // Windows のプロセス生成に必要（`SystemRoot` が無いと子が
@@ -855,8 +988,26 @@ impl V8ProcessEngine {
         match worker.frame_rx.recv_timeout(HANDSHAKE_TIMEOUT) {
             Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::HELLO => {
                 match worker_protocol::decode_hello(&payload) {
-                    Ok((version, _engine)) if version == worker_protocol::PROTOCOL_VERSION => {
+                    Ok((version, engine))
+                        if version == worker_protocol::PROTOCOL_VERSION
+                            && engine == EngineKind::V8 =>
+                    {
                         Ok(worker)
+                    }
+                    Ok((version, engine)) if version == worker_protocol::PROTOCOL_VERSION => {
+                        // codex レビュー指摘 #503 P1「Hello のエンジン種別を
+                        // 無視している」対応: 本 crate（`V8ProcessEngine`）は
+                        // V8 の子プロセス専用であり、`Boa` を名乗る `Hello`
+                        // は起動した実行ファイル・プロトコルの取り違えを
+                        // 疑うべき異常事態である。
+                        worker.terminate_now();
+                        let tail = worker.reap_and_collect_stderr();
+                        Err(handshake_discard_error(&worker, &tail, || {
+                            JsEngineError::EngineUnavailable(format!(
+                                "JS worker process reported unexpected engine kind {engine:?} \
+                                 (expected V8); stderr: {tail}"
+                            ))
+                        }))
                     }
                     Ok((version, _engine)) => {
                         worker.terminate_now();
@@ -1083,7 +1234,29 @@ impl V8ProcessEngine {
         match worker.frame_rx.recv_timeout(recv_wait) {
             Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::RESULT => {
                 let (outcome, keep) = match worker_protocol::decode_js_value(&payload) {
-                    Ok((value, _consumed)) => (Ok(value), true),
+                    // codex レビュー指摘 #503 P1「decode_js_value が返す
+                    // 消費バイト数を捨てている」対応: `Result` フレームの
+                    // ペイロードは常にちょうど 1 つの `JsValue` でなければ
+                    // ならない契約であり（`decode_js_value` 自体は複数値の
+                    // 連結読み取りにも使える汎用関数のため、単体では
+                    // 「1 つだけ」を強制しない）、消費バイト数が
+                    // ペイロード全体の長さと一致しなければ、末尾に余分な
+                    // バイトが付いたプロトコル違反として扱う。
+                    Ok((value, consumed)) if consumed == payload.len() => (Ok(value), true),
+                    Ok((_value, consumed)) => {
+                        worker.terminate_now();
+                        let tail = worker.reap_and_collect_stderr();
+                        let converted = discard_context_error(worker, &tail, || {
+                            JsEngineError::EngineUnavailable(format!(
+                                "JS worker process sent a Result frame with {} trailing bytes \
+                                 after the decoded value ({consumed} of {} bytes consumed); \
+                                 stderr: {tail}",
+                                payload.len() - consumed,
+                                payload.len()
+                            ))
+                        });
+                        (Err(converted), false)
+                    }
                     Err(err) => {
                         worker.terminate_now();
                         let tail = worker.reap_and_collect_stderr();
@@ -1202,9 +1375,51 @@ impl V8ProcessEngine {
     }
 }
 
+/// [`MonitorKillReason`] を、破棄時のエラーへ変換する（`context_suffix`
+/// は呼び出し元の文脈を表す短い句。例: "during the handshake"・"and was
+/// killed"）。
+///
+/// **`ResourceLimitExceeded`・`EngineUnavailable` のどちらを使うかは
+/// 理由ごとに固定している**（codex レビュー指摘 #503 P0「エラーの種別は
+/// 理由が分かる文言を付けた EngineUnavailable、または
+/// ResourceLimitExceeded のどちらか」対応。選んだ理由をここに書く）:
+///
+/// - [`MonitorKillReason::ResourceLimitExceeded`][]: メモリ使用量の超過を
+///   実際に観測できたため、そのまま `ResourceLimitExceeded` にする
+///   （偽装ではない。実測値が根拠にある）。
+/// - [`MonitorKillReason::ProbeUnavailable`][]: メモリ使用量の取得自体が
+///   連続で失敗しており、**実際に超過したかどうかは分からない**。
+///   ここで `ResourceLimitExceeded` を名乗ると、超過を検出したかのように
+///   偽装することになり security.md「偽装・回避機能の禁止」に反する。
+///   「監視という前提が壊れたため安全側に倒して終了させた」という
+///   `EngineUnavailable`（＝エンジンを一時的に使えないものとして扱う）が
+///   実態に即した分類である。
+fn monitor_kill_reason_to_error(
+    reason: MonitorKillReason,
+    tail: &str,
+    context_suffix: &str,
+) -> JsEngineError {
+    match reason {
+        MonitorKillReason::ResourceLimitExceeded(bytes) => {
+            JsEngineError::ResourceLimitExceeded(format!(
+                "JS worker process memory usage ({bytes} bytes) exceeded the parent's \
+                 monitoring threshold ({} bytes) {context_suffix}; stderr: {tail}",
+                super::resource_limits::MAX_CHILD_RSS_BYTES
+            ))
+        }
+        MonitorKillReason::ProbeUnavailable {
+            consecutive_failures,
+        } => JsEngineError::EngineUnavailable(format!(
+            "JS worker process memory monitoring failed {consecutive_failures} consecutive \
+             times (memory usage could not be verified); the child was killed as a \
+             fail-closed precaution {context_suffix}; stderr: {tail}"
+        )),
+    }
+}
+
 /// `spawn_worker` のハンドシェイク段階で子を破棄する経路が使う（Cursor
 /// Bugbot レビュー指摘 #503「Monitor kills misclassified」対応。「子を
-/// 破棄するすべての経路で take_killed_rss を先に確認する」契約を
+/// 破棄するすべての経路で take_kill_reason を先に確認する」契約を
 /// ハンドシェイク段階にも適用する）。
 ///
 /// [`discard_context_error`] と異なり "context was discarded" は
@@ -1216,12 +1431,8 @@ fn handshake_discard_error(
     tail: &str,
     fallback: impl FnOnce() -> JsEngineError,
 ) -> JsEngineError {
-    match worker.memory_monitor.take_killed_rss() {
-        Some(rss_bytes) => JsEngineError::ResourceLimitExceeded(format!(
-            "JS worker process RSS ({rss_bytes} bytes) exceeded the parent's monitoring \
-             threshold ({} bytes) and was killed during the handshake; stderr: {tail}",
-            super::resource_limits::MAX_CHILD_RSS_BYTES
-        )),
+    match worker.memory_monitor.take_kill_reason() {
+        Some(reason) => monitor_kill_reason_to_error(reason, tail, "during the handshake"),
         None => fallback(),
     }
 }
@@ -1231,10 +1442,10 @@ fn handshake_discard_error(
 /// 指摘 #503「Monitor kills misclassified」「Discarded-context errors
 /// omit required phrase」対応。1 箇所へ集約する）。
 ///
-/// 1. メモリ監視スレッドが RSS 超過で既に `kill` していた場合、渡された
-///    `fallback` を使わず `ResourceLimitExceeded` へ差し替える
-///    （読み取り・書き込み・プロトコル違反・期限切れなど、`kill` の
-///    「本当の理由」が RSS 超過だったケースを、経路ごとに異なる
+/// 1. メモリ監視スレッドが既に `kill` していた場合、渡された `fallback`
+///    を使わず [`monitor_kill_reason_to_error`] へ差し替える（読み取り・
+///    書き込み・プロトコル違反・期限切れなど、`kill` の「本当の理由」が
+///    監視スレッドにあったケースを、経路ごとに異なる
 ///    `EngineUnavailable`/`Timeout` へ誤って分類させない）。
 /// 2. それ以外の場合は `fallback()` をそのまま使うが、本モジュールの
 ///    契約（エラー変換表。「Context が破棄される場合、メッセージに
@@ -1249,13 +1460,13 @@ fn discard_context_error(
     tail: &str,
     fallback: impl FnOnce() -> JsEngineError,
 ) -> JsEngineError {
-    if let Some(rss_bytes) = worker.memory_monitor.take_killed_rss() {
-        return JsEngineError::ResourceLimitExceeded(format!(
-            "JS worker process RSS ({rss_bytes} bytes) exceeded the parent's monitoring \
-             threshold ({} bytes) and was killed; context was discarded; the next evaluation \
-             runs in a fresh context; stderr: {tail}",
-            super::resource_limits::MAX_CHILD_RSS_BYTES
-        ));
+    if let Some(reason) = worker.memory_monitor.take_kill_reason() {
+        let err = monitor_kill_reason_to_error(
+            reason,
+            tail,
+            "and was killed; the next evaluation runs in a fresh context",
+        );
+        return ensure_discarded_phrase(err);
     }
     ensure_discarded_phrase(fallback())
 }
@@ -1314,7 +1525,7 @@ fn apply_post_response_rss_check(
     // 既に破棄した子について二重にエラーメッセージを出さないように
     // するため。子は既に `terminate_now` で終了させているため、監視
     // スレッドが独自に検出しても実害は無い）。
-    let _ = worker.memory_monitor.take_killed_rss();
+    let _ = worker.memory_monitor.take_kill_reason();
     let tail = worker.reap_and_collect_stderr();
     (
         Err(JsEngineError::ResourceLimitExceeded(format!(
@@ -1395,19 +1606,26 @@ mod tests {
         let mut monitor = MemoryMonitor::spawn_with_threshold(Arc::clone(&child), pid, 1);
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut killed_rss = None;
+        let mut killed_reason = None;
         while Instant::now() < deadline {
-            if let Some(rss) = monitor.take_killed_rss() {
-                killed_rss = Some(rss);
+            if let Some(reason) = monitor.take_kill_reason() {
+                killed_reason = Some(reason);
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(
-            killed_rss.is_some_and(|rss| rss > 0),
-            "expected the memory monitor to kill the idle child (no evaluation ever ran) and \
-             record a nonzero RSS, got: {killed_rss:?}"
-        );
+        match killed_reason {
+            Some(MonitorKillReason::ResourceLimitExceeded(rss)) => {
+                assert!(
+                    rss > 0,
+                    "expected the memory monitor to record a nonzero RSS, got: {rss}"
+                );
+            }
+            other => panic!(
+                "expected the memory monitor to kill the idle child (no evaluation ever ran) \
+                 with ResourceLimitExceeded, got: {other:?}"
+            ),
+        }
 
         let mut guard = child.lock().expect("child mutex must not be poisoned");
         let wait_deadline = Instant::now() + Duration::from_secs(5);
@@ -1426,6 +1644,117 @@ mod tests {
         drop(guard);
 
         monitor.stop_and_join();
+    }
+
+    /// codex レビュー指摘 #503 P0「macOS で `ps` を起動できない場合、
+    /// 監視が `None` を返し続けるだけで上限が事実上なくなる」の単体
+    /// テスト: 実際の `ps`／`/proc`／`GetProcessMemoryInfo` を壊さず、
+    /// 常に `None` を返すフェイクの取得経路を注入して、
+    /// [`MAX_CONSECUTIVE_PROBE_FAILURES`] 回連続で失敗した時点で
+    /// fail-closed（子を `kill` し、理由を [`MonitorKillReason::ProbeUnavailable`]
+    /// として記録）になることを確認する。しきい値超過（`ResourceLimitExceeded`）
+    /// とは異なる理由で kill されることを区別できているかどうかも
+    /// あわせて検証する。
+    #[test]
+    fn js_1_memory_monitor_kills_after_consecutive_probe_failures() {
+        let child = spawn_long_lived_child_for_test();
+        let pid = child.id();
+        let child = Arc::new(Mutex::new(child));
+
+        // しきい値は `u64::MAX`（絶対に超過しない）にして、
+        // 「取得の失敗」だけが kill の原因になることを確実にする。
+        let mut monitor = MemoryMonitor::spawn_with_threshold_and_probe(
+            Arc::clone(&child),
+            pid,
+            u64::MAX,
+            Box::new(|_child, _pid| None),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut killed_reason = None;
+        while Instant::now() < deadline {
+            if let Some(reason) = monitor.take_kill_reason() {
+                killed_reason = Some(reason);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        match killed_reason {
+            Some(MonitorKillReason::ProbeUnavailable {
+                consecutive_failures,
+            }) => {
+                assert_eq!(
+                    consecutive_failures, MAX_CONSECUTIVE_PROBE_FAILURES,
+                    "expected exactly MAX_CONSECUTIVE_PROBE_FAILURES consecutive failures to be \
+                     recorded before the fail-closed kill, got: {consecutive_failures}"
+                );
+            }
+            other => panic!(
+                "expected the memory monitor to kill the child after repeated probe failures \
+                 with ProbeUnavailable (not ResourceLimitExceeded, since the threshold was never \
+                 exceeded), got: {other:?}"
+            ),
+        }
+
+        let mut guard = child.lock().expect("child mutex must not be poisoned");
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        let mut exited = false;
+        while Instant::now() < wait_deadline {
+            if matches!(guard.try_wait(), Ok(Some(_))) {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            exited,
+            "expected the child to have exited after the memory monitor killed it due to \
+             repeated probe failures (fail-closed)"
+        );
+        drop(guard);
+
+        monitor.stop_and_join();
+    }
+
+    /// codex レビュー指摘 #503 P0（上記テストと対）: `ProbeUnavailable`
+    /// による kill は `discard_context_error` を通すと
+    /// `JsEngineError::EngineUnavailable`（`ResourceLimitExceeded` では
+    /// ない）へ変換されること。メモリ超過を確認できていない以上、
+    /// 「しきい値を超えたと確認した」と偽らないようにする設計判断
+    /// （[`monitor_kill_reason_to_error`] のドキュメントコメント参照。
+    /// security.md「偽装・回避機能の禁止」に対応）を回帰させる。
+    #[test]
+    fn js_1_discard_context_error_reclassifies_probe_unavailable_as_engine_unavailable() {
+        let child = spawn_long_lived_child_for_test();
+        let worker = WorkerHandle::from_child(child).expect("failed to build a test WorkerHandle");
+
+        *worker
+            .memory_monitor
+            .kill_reason
+            .lock()
+            .expect("kill_reason mutex must not be poisoned") =
+            Some(MonitorKillReason::ProbeUnavailable {
+                consecutive_failures: MAX_CONSECUTIVE_PROBE_FAILURES,
+            });
+
+        let err = discard_context_error(&worker, "irrelevant stderr tail", || {
+            JsEngineError::Timeout(
+                "must not be used because the monitor already killed".to_string(),
+            )
+        });
+        match err {
+            JsEngineError::EngineUnavailable(msg) => {
+                assert!(
+                    msg.contains(&MAX_CONSECUTIVE_PROBE_FAILURES.to_string()),
+                    "expected the consecutive failure count in the message, got: {msg}"
+                );
+                assert!(
+                    msg.contains("context was discarded"),
+                    "expected the required phrase, got: {msg}"
+                );
+            }
+            other => panic!("expected EngineUnavailable, got: {other:?}"),
+        }
     }
 
     /// codex レビュー指摘 #503 P1「`write_frame`・`flush` が呼び出し
@@ -1537,13 +1866,14 @@ mod tests {
             WorkerHandle::from_child(child).expect("failed to build a test WorkerHandle");
 
         // 監視スレッドが RSS 超過を検出して記録した状態を、実際に
-        // しきい値へ到達させずに直接再現する（`killed_rss_bytes` は
-        // 同一モジュール内のため private フィールドへ直接アクセスできる）。
+        // しきい値へ到達させずに直接再現する（`kill_reason` は同一
+        // モジュール内のため private フィールドへ直接アクセスできる）。
         *worker
             .memory_monitor
-            .killed_rss_bytes
+            .kill_reason
             .lock()
-            .expect("killed_rss_bytes mutex must not be poisoned") = Some(12_345_678);
+            .expect("kill_reason mutex must not be poisoned") =
+            Some(MonitorKillReason::ResourceLimitExceeded(12_345_678));
 
         let err = discard_context_error(&worker, "irrelevant stderr tail", || {
             JsEngineError::Timeout(

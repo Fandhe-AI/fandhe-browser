@@ -176,6 +176,12 @@ pub(crate) enum ProtocolError {
     /// 使われるまで未構築）。
     #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     Truncated,
+    /// ペイロードが期待する長さを超えている（末尾に余分なバイトが
+    /// 付いている。[`decode_hello`] のように、フレーム全体を 1 つの
+    /// 固定長値として解釈する箇所で構築する。codex レビュー指摘 #503
+    /// P1「decode_hello が末尾の余分なバイトを拒否していない」対応）。
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    TrailingBytes { expected: usize, actual: usize },
     /// 文字列として解釈すべきバイト列が不正な UTF-8 だった
     /// （[`decode_evaluate`]。`super::worker` が親からの `Evaluate`
     /// フレームを検証する際に構築する。`js-v8` feature 有効時のみ非
@@ -205,6 +211,11 @@ impl std::fmt::Display for ProtocolError {
                 write!(f, "worker protocol engine byte {byte} is unknown")
             }
             Self::Truncated => write!(f, "worker protocol payload is truncated"),
+            Self::TrailingBytes { expected, actual } => write!(
+                f,
+                "worker protocol payload has {actual} bytes but only {expected} were expected \
+                 (trailing bytes)"
+            ),
             Self::InvalidUtf8 => write!(f, "worker protocol payload is not valid UTF-8"),
         }
     }
@@ -436,6 +447,22 @@ pub(crate) fn encode_hello(protocol_version: u16, engine: EngineKind) -> Vec<u8>
 /// 子からの `Hello` フレームをデコードする際に使う。
 #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn decode_hello(payload: &[u8]) -> Result<(u16, EngineKind), ProtocolError> {
+    // `Hello` は常にちょうど 3 バイト（`u16` の version＋`u8` の engine）の
+    // 固定長フレームであり、他の値が後ろに連結される設計ではない。
+    // 末尾に余分なバイトがあれば黙って無視せず拒否する（codex レビュー
+    // 指摘 #503 P1「decode_hello が末尾の余分なバイトを拒否していない」
+    // 対応。`decode_js_value` のように複数値の連結読み取りに使う関数とは
+    // 契約が異なる）。
+    const HELLO_PAYLOAD_LEN: usize = 3;
+    if payload.len() < HELLO_PAYLOAD_LEN {
+        return Err(ProtocolError::Truncated);
+    }
+    if payload.len() > HELLO_PAYLOAD_LEN {
+        return Err(ProtocolError::TrailingBytes {
+            expected: HELLO_PAYLOAD_LEN,
+            actual: payload.len(),
+        });
+    }
     let version_bytes: [u8; 2] = payload
         .get(0..2)
         .ok_or(ProtocolError::Truncated)?
@@ -535,6 +562,14 @@ pub(crate) fn encode_error(kind: ErrorKind, message: &str) -> Vec<u8> {
 ///
 /// 呼び出し元（将来）: `super::process_engine`（W4）が子からの `Error`
 /// フレームをデコードする際に使う。
+///
+/// **末尾の余分なバイトを拒否する必要が無い**（codex レビュー指摘 #503
+/// P1「decode_js_value が返す消費バイト数を捨てている」と同じ観点での
+/// 確認。`decode_hello`・`decode_js_value` の呼び出し元とは異なり対応は
+/// 不要）: `message` は「`kind` の 1 バイトより後ろの残り全部」として
+/// 定義されており（長さプレフィックスを持たない）、`payload.len()` を
+/// 常に過不足なく消費する。末尾に余分なバイトが付く余地自体が無い
+/// （不正な内容であれば `InvalidUtf8` として拒否される）。
 #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn decode_error(payload: &[u8]) -> Result<(ErrorKind, String), ProtocolError> {
     let kind_byte = *payload.first().ok_or(ProtocolError::Truncated)?;
@@ -744,6 +779,36 @@ mod tests {
             decode_hello(&payload),
             Err(ProtocolError::InvalidEngineByte(99))
         ));
+    }
+
+    /// codex レビュー指摘 #503 P1「decode_hello が末尾の余分なバイトを
+    /// 拒否していない」の単体テスト: 3 バイトより短いペイロードは
+    /// `Truncated`、3 バイトより長い（末尾に余分なバイトが付いた）
+    /// ペイロードは `TrailingBytes` として明示的に拒否されること
+    /// （黙って先頭 3 バイトだけを解釈して残りを無視しないことの確認）。
+    #[test]
+    fn js_1_decode_hello_rejects_wrong_length_payloads() {
+        let too_short = encode_hello(1, EngineKind::V8);
+        let too_short = &too_short[..too_short.len() - 1];
+        assert!(
+            matches!(decode_hello(too_short), Err(ProtocolError::Truncated)),
+            "a payload shorter than the fixed 3-byte Hello must be rejected as Truncated"
+        );
+
+        let mut too_long = encode_hello(1, EngineKind::V8);
+        too_long.push(0xff);
+        assert!(
+            matches!(
+                decode_hello(&too_long),
+                Err(ProtocolError::TrailingBytes {
+                    expected: 3,
+                    actual: 4,
+                })
+            ),
+            "a payload longer than the fixed 3-byte Hello must be rejected as TrailingBytes, \
+             got: {:?}",
+            decode_hello(&too_long)
+        );
     }
 
     /// JS-1: `Evaluate` フレームの往復。
