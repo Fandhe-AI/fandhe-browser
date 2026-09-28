@@ -93,6 +93,25 @@ const MAX_NAME_CHARS: usize = 120;
 /// する不具合があった。[`label_name`] を参照）。
 const MAX_LABELS: usize = 16;
 
+/// `label_name` が 1 回の呼び出しで実際に走査（[`collect_label_text`] を
+/// 呼び出す）する label の総数の上限（`AISNAP-1`）。
+///
+/// [`MAX_LABELS`] は「名前に寄与した label の数」だけを数える上限であり、
+/// 寄与しない（空・空白だけの）label はこの上限の対象外である。この
+/// ため、1 つの対象コントロールに `for` 属性で大量の空・空白だけの
+/// `<label>` を関連付けると、[`MAX_LABELS`] にはいつまでも達しないまま
+/// `collect_label_text` の呼び出し（文書走査を伴う）が際限なく増え続け、
+/// 処理量が外部入力（label の個数）に比例して無制限に増大する
+/// （security.md「不安全な設計」対策。PR #567 レビュー指摘の P1 修正）。
+///
+/// 本定数は「寄与したかどうかに関わらず走査した label の総数」を打ち切る
+/// ことで、この処理量を定数（`MAX_LABELS_SCANNED` 件分の
+/// `collect_label_text` 呼び出し）で頭打ちにする。[`MAX_LABELS`] の
+/// 何倍か（空・空白だけの label がある程度混ざっていても、後続の名前
+/// 入り label まで届くだけの余裕を持たせる）に設定する。上限に達した
+/// 時点で以降の label は未走査のまま切り捨て、`truncated` に反映する。
+const MAX_LABELS_SCANNED: usize = MAX_LABELS * 4;
+
 /// accessible name の出所（`AISNAP-1`）。
 ///
 /// バリアントは本 Issue（TASK-11.4.2）が実装する HTML ネイティブの出所の
@@ -379,14 +398,8 @@ fn normalized_input_type(doc: &Document, id: NodeId) -> String {
         .unwrap_or_default()
 }
 
-/// `label` の子孫のうち、文書順で最初のラベル付け可能な要素（[`is_labelable`]）
-/// を返す（label による包含の判定に使う）。
-fn first_labelable_descendant(doc: &Document, label: NodeId) -> Option<NodeId> {
-    doc.descendants(label).find(|&id| is_labelable(doc, id))
-}
-
-/// `label` の子孫のテキストを収集し、`out` へ生のまま（HTML 空白の
-/// 折り畳み前）追記する（`AISNAP-1`）。
+/// `label` の子孫のテキストを収集し、`out` へ HTML ASCII 空白の連続を
+/// 1 個の区切りへ畳みながら追記する（`AISNAP-1`）。
 ///
 /// `script`・`style`・`noscript`・`template` のサブツリーは除外する。
 /// `exclude`（関連付け先のコントロール自身）のサブツリーも除外する
@@ -395,28 +408,41 @@ fn first_labelable_descendant(doc: &Document, label: NodeId) -> Option<NodeId> {
 /// で上限することで、深いネスト・壊れたリンクがあっても必ず停止する
 /// （security.md「不安全な設計」対策）。
 ///
-/// 1 つの巨大な `Text` ノードだけで `out` が無制限に肥大化しないよう、
-/// [`RAW_LABEL_TEXT_BYTE_LIMIT`] で追記するバイト数も打ち切る（超えた分は
-/// 最終的に [`NameBuffer`] 側の [`MAX_NAME_CHARS`] でどのみち捨てられる
-/// ため、それ以上集める必要がない。PR #567 レビュー指摘）。
+/// **前提**: `out` は呼び出し時点で空文字列であること（呼び出し元の
+/// [`label_name`] は毎回新規の `String` を渡す）。
 ///
-/// 呼び出し元（[`label_name`]）は、この生テキストを [`has_non_whitespace`]
-/// で「この label が名前に寄与するか」の判定に使ったうえで、寄与する場合
-/// のみ [`NameBuffer::push_str`] へ渡して空白を折り畳む。
+/// 上限判定は**折り畳み後**の文字数（[`NORMALIZED_LABEL_TEXT_CHAR_LIMIT`]）
+/// で行う。折り畳み前の生バイト数で打ち切ると、名前本体の前に大量の
+/// HTML 空白がある label で本体が上限に達する前に収集されず、
+/// `label_name` が本体を「空」と誤判定して次点（`title` 等）へ誤って
+/// フォールバックしてしまう（PR #567 レビュー指摘の P1 修正）。折り畳み後
+/// も [`MAX_NAME_CHARS`] に収まらない分はどのみち [`NameBuffer`] 側で
+/// 捨てられるため、それ以上集める必要はない。
+///
+/// 呼び出し元（[`label_name`]）は、この折り畳み済みテキストを
+/// [`has_non_whitespace`] で「この label が名前に寄与するか」の判定に
+/// 使ったうえで、寄与する場合のみ [`NameBuffer::push_str`] へ渡す
+/// （`push_str` 自体も空白折り畳みを行うため二重になるが、こちらの折り
+/// 畳みは「上限判定を正しくする」ためのものであり、`push_str` 側の
+/// 折り畳みは「複数 label 間の区切り」を扱うためのもので責務が異なる）。
 ///
 /// #544 の `collect_text`（`aria-labelledby` の参照先向け）とは別名にする
 /// （役割が異なる: こちらは label→コントロールの関連付け専用）。将来
 /// 両者を統合できる余地があることを、後続タスク（#546）へ申し送る。
 fn collect_label_text(doc: &Document, label: NodeId, exclude: NodeId, out: &mut String) {
     const SKIPPED_SUBTREES: [&str; 4] = ["script", "style", "noscript", "template"];
-    // `MAX_NAME_CHARS` に収まらない分はどのみち捨てられるため、生テキスト
-    // はその数倍（マルチバイト文字・空白の折り畳みの余裕分）までしか集めない。
-    const RAW_LABEL_TEXT_BYTE_LIMIT: usize = MAX_NAME_CHARS * 4;
+    // 折り畳み後の文字数の上限（マルチバイト文字・複数 label 分の余裕を
+    // 見込み `MAX_NAME_CHARS` の数倍を確保する）。
+    const NORMALIZED_LABEL_TEXT_CHAR_LIMIT: usize = MAX_NAME_CHARS * 4;
+
+    debug_assert!(out.is_empty(), "collect_label_text は空の out を前提とする");
 
     let mut stack: Vec<NodeId> = doc.children(label).rev().collect();
     let mut remaining_steps = doc.node_count();
+    let mut normalized_chars = 0usize;
+    let mut pending_space = false;
 
-    while let Some(current) = stack.pop() {
+    'walk: while let Some(current) = stack.pop() {
         if remaining_steps == 0 {
             break;
         }
@@ -428,19 +454,26 @@ fn collect_label_text(doc: &Document, label: NodeId, exclude: NodeId, out: &mut 
 
         match doc.node_data(current) {
             Some(NodeData::Text { contents }) => {
-                if out.len() >= RAW_LABEL_TEXT_BYTE_LIMIT {
-                    continue;
-                }
-                let remaining = RAW_LABEL_TEXT_BYTE_LIMIT - out.len();
-                if contents.len() <= remaining {
-                    out.push_str(contents);
-                } else {
-                    // 上限に収まる範囲だけ、文字境界を壊さずに切り出す。
-                    let mut end = remaining.min(contents.len());
-                    while end > 0 && !contents.is_char_boundary(end) {
-                        end -= 1;
+                for c in contents.chars() {
+                    if is_ascii_whitespace(c) {
+                        if !out.is_empty() {
+                            pending_space = true;
+                        }
+                        continue;
                     }
-                    out.push_str(&contents[..end]);
+                    if pending_space {
+                        if normalized_chars >= NORMALIZED_LABEL_TEXT_CHAR_LIMIT {
+                            break 'walk;
+                        }
+                        out.push(' ');
+                        normalized_chars += 1;
+                        pending_space = false;
+                    }
+                    if normalized_chars >= NORMALIZED_LABEL_TEXT_CHAR_LIMIT {
+                        break 'walk;
+                    }
+                    out.push(c);
+                    normalized_chars += 1;
                 }
             }
             Some(NodeData::Element { .. }) => {
@@ -484,32 +517,118 @@ impl NameIndex {
     /// （TASK-11.7 のツリー構築等）は、文書ごとに本関数を 1 回だけ呼び、
     /// 結果を [`compute_name_with_index`] へ使い回すこと。
     pub fn build(doc: &Document) -> Self {
+        // 文書順で辿った `<label>` 要素の一覧（`for` 属性の有無を問わない）。
+        // 各 label を最終的に `labels_by_target` へ積む順序を、対象の
+        // 解決方式（`for` 属性か包含か）によらず文書順のまま保つために使う
+        // （包含由来の解決は下の単一走査中に即座に行い、`for` 属性由来の
+        // 解決は走査完了後に `ids_by_value` を使って行うため、解決の
+        // タイミングが異なる 2 種類を後から正しい順序でマージする必要が
+        // ある）。
+        let mut label_order: Vec<NodeId> = Vec::new();
+        // `for` 属性を持つ label（値が空文字列でないもの）。対象は
+        // `ids_by_value` が完成してから解決する（対象の `id` が文書中で
+        // label より後に現れる場合があるため）。
+        let mut for_labels: Vec<(NodeId, String)> = Vec::new();
+        // 包含（wrapping）による解決結果。単一走査中に確定する。
+        let mut wrap_targets: HashMap<NodeId, NodeId> = HashMap::new();
         let mut ids_by_value: HashMap<String, NodeId> = HashMap::new();
-        let mut label_candidates: Vec<NodeId> = Vec::new();
 
-        // 1 回の文書走査で「id 索引」と「label 要素の一覧」を同時に集める。
-        for node in doc.descendants(doc.root()) {
-            if let Some(id_value) = doc.attribute(node, "id")
-                && !id_value.is_empty()
-            {
-                // 文書順で先に見つかったものだけを残す（重複 id は先頭優先）。
-                ids_by_value.entry(id_value.to_string()).or_insert(node);
-            }
-            if is_html_element_named(doc, node, "label") {
-                label_candidates.push(node);
+        // 単一走査で「id 索引」「label の一覧・`for` 値」「包含による
+        // label→対象の解決」を同時に行う（`AISNAP-1`・PR #567 レビュー
+        // 指摘の P1 修正）。
+        //
+        // 包含の解決は、祖先方向に開いたまま（まだ最初のラベル付け可能な
+        // 子孫が見つかっていない）`<label>` をスタック（`open_wrapping`）
+        // で追跡し、ラベル付け可能な要素へ入った時点でスタック中の未解決
+        // label を**まとめて**解決する（1 つの要素が複数の入れ子 label に
+        // とって同時に「最初のラベル付け可能な子孫」になり得るため）。
+        // 各 label は解決された時点でスタックから外れ、二度と更新されない
+        // ため、この解決処理の総コストは label 数に比例する（1 label
+        // あたり高々 1 回の解決）。旧実装は label ごとに
+        // `doc.descendants(label)` で子孫を再走査しており、入れ子の
+        // `<label>` が多い文書で文書サイズに対し二乗の計算量になっていた
+        // （PR #567 レビュー指摘の P1 修正）。
+        //
+        // 走査自体は列挙型 `Visit::{Enter, Exit}` を明示スタックに積む
+        // 反復的な行きがけ／帰りがけ走査で行う（`Exit` により「この
+        // ノードの子孫を辿り終えた」タイミングを検出できる。`open_wrapping`
+        // の末尾がその `Exit` のノードと一致すれば、対象が見つからないまま
+        // 子孫を辿り終えた label としてスタックから外し、関連付けなし
+        // （`None`）のまま捨てる）。
+        enum Visit {
+            Enter(NodeId),
+            Exit(NodeId),
+        }
+
+        let mut stack: Vec<Visit> = vec![Visit::Enter(doc.root())];
+        let mut open_wrapping: Vec<NodeId> = Vec::new();
+        let mut remaining_steps = doc.node_count();
+
+        while let Some(visit) = stack.pop() {
+            match visit {
+                Visit::Exit(node) => {
+                    if open_wrapping.last() == Some(&node) {
+                        // 子孫を辿り終えてもラベル付け可能な対象が見つから
+                        // なかった包含 label。関連付けなしとして捨てる。
+                        open_wrapping.pop();
+                    }
+                    continue;
+                }
+                Visit::Enter(node) => {
+                    if remaining_steps == 0 {
+                        break;
+                    }
+                    remaining_steps -= 1;
+
+                    if let Some(id_value) = doc.attribute(node, "id")
+                        && !id_value.is_empty()
+                    {
+                        // 文書順で先に見つかったものだけを残す（重複 id は先頭優先）。
+                        ids_by_value.entry(id_value.to_string()).or_insert(node);
+                    }
+
+                    if is_html_element_named(doc, node, "label") {
+                        label_order.push(node);
+                        // `for` 属性が指定されている場合（値が空文字列でも）
+                        // は、対象をその id 一致でのみ判定し、包含
+                        // （wrapping）へはフォールバックしない（HTML
+                        // Standard の labeled control 規則。`for=""` は
+                        // 「どの要素にも関連付かない」ことを意味する）。
+                        match doc.attribute(node, "for") {
+                            Some(for_value) if !for_value.is_empty() => {
+                                for_labels.push((node, for_value.to_string()));
+                            }
+                            Some(_) => {}
+                            None => open_wrapping.push(node),
+                        }
+                    } else if is_labelable(doc, node) && !open_wrapping.is_empty() {
+                        // 現在開いている（未解決の）包含 label は、すべて
+                        // この要素を「文書順で最初のラベル付け可能な子孫」
+                        // として同時に解決する。
+                        for &label in &open_wrapping {
+                            wrap_targets.insert(label, node);
+                        }
+                        open_wrapping.clear();
+                    }
+
+                    stack.push(Visit::Exit(node));
+                    stack.extend(doc.children(node).rev().map(Visit::Enter));
+                }
             }
         }
 
         let mut labels_by_target: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-        for label in label_candidates {
-            // `for` 属性が指定されている場合（値が空文字列でも）は、対象を
-            // その id 一致でのみ判定し、包含（wrapping）へはフォールバック
-            // しない（HTML Standard の labeled control 規則。`for=""` は
-            // 「どの要素にも関連付かない」ことを意味する）。
-            let target = match doc.attribute(label, "for") {
-                Some(for_value) if !for_value.is_empty() => ids_by_value.get(for_value).copied(),
-                Some(_) => None,
-                None => first_labelable_descendant(doc, label),
+        let for_targets: HashMap<NodeId, Option<NodeId>> = for_labels
+            .into_iter()
+            .map(|(label, for_value)| (label, ids_by_value.get(&for_value).copied()))
+            .collect();
+
+        // `label_order`（文書順）を 1 回だけ辿り、解決方式によらず正しい
+        // 文書順で `labels_by_target` へ積む。
+        for label in label_order {
+            let target = match for_targets.get(&label) {
+                Some(target) => *target,
+                None => wrap_targets.get(&label).copied(),
             };
             if let Some(target) = target {
                 labels_by_target.entry(target).or_default().push(label);
@@ -546,7 +665,15 @@ fn label_name(doc: &Document, index: &NameIndex, target: NodeId) -> Option<Acces
     let mut matched_labels = 0usize;
     let mut labels_truncated = false;
 
-    for &label in labels {
+    for (labels_scanned, &label) in labels.iter().enumerate() {
+        if labels_scanned >= MAX_LABELS_SCANNED {
+            // 寄与したかどうかに関わらず、走査した label の総数がここで
+            // 打ち切られる（[`MAX_LABELS_SCANNED`] 参照）。以降の label は
+            // 未走査のまま切り捨てるため truncated を立てる。
+            labels_truncated = true;
+            break;
+        }
+
         let mut label_text = String::new();
         collect_label_text(doc, label, target, &mut label_text);
         if !has_non_whitespace(&label_text) {
@@ -730,7 +857,9 @@ pub fn compute_name_with_index(doc: &Document, index: &NameIndex, id: NodeId) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{AccessibleName, MAX_LABELS, MAX_NAME_CHARS, NameSource, compute_name};
+    use super::{
+        AccessibleName, MAX_LABELS, MAX_LABELS_SCANNED, MAX_NAME_CHARS, NameSource, compute_name,
+    };
     use fandhe_browser_core::dom::{Document, NodeId};
     use fandhe_browser_core::parse::{ParseOptions, parse_document};
     use fandhe_browser_core::query::query_selector_str;
@@ -1478,5 +1607,97 @@ mod tests {
         let result = compute_name(&doc, input);
         assert_eq!(result.text, "奥の名前");
         assert_eq!(result.source, NameSource::Label);
+    }
+
+    // --- PR #567 レビュー指摘の P1 修正（回帰テスト） ---
+
+    /// PR #567 レビュー指摘の P1 修正: label 本体の前に、折り畳み前の生
+    /// バイト数で 480 バイトを超える HTML 空白があっても、本体
+    /// （非空白テキスト）が失われず名前として使われる。旧実装は生バイト数
+    /// で上限判定していたため、本体に到達する前に打ち切られ、`label` から
+    /// 空の名前が確定して `title` へ誤ってフォールバックしていた。
+    #[test]
+    fn aisnap_1_label_long_leading_whitespace_does_not_lose_trailing_name() {
+        let mut html = String::from(r#"<label for="x">"#);
+        // タブ 1000 個（1 バイト/文字）。旧実装の折り畳み前バイト上限
+        // （`MAX_NAME_CHARS * 4 = 480`）を大きく超える。
+        html.push_str(&"\t".repeat(1000));
+        html.push_str("実際の名前");
+        html.push_str(r#"</label><input id="x" title="使われないはず">"#);
+
+        let result = name(&html, "input");
+        assert_eq!(result.text, "実際の名前");
+        assert_eq!(result.source, NameSource::Label);
+    }
+
+    /// PR #567 レビュー指摘の P1 修正: `MAX_LABELS`（名前に寄与した label
+    /// の数）には大量の空・空白だけの label を並べても達しないが、
+    /// [`MAX_LABELS_SCANNED`] により走査自体（`collect_label_text` の呼び
+    /// 出し回数）は定数で打ち切られる。走査上限より後ろに置いた名前入り
+    /// label には到達できず、`truncated` が立つ（外部入力の label 数に
+    /// 比例して処理量が無制限に増え続けないことの確認）。
+    ///
+    /// 走査上限より前に実際に寄与する label（`"先頭"`）を 1 つ置くことで、
+    /// 打ち切りが発生しても `truncated` が呼び出し元まで伝わることを
+    /// 確認する（寄与する label が 1 つも無いまま `label_name` が `None`
+    /// を返すと `truncated` の情報自体が失われるため）。
+    #[test]
+    fn aisnap_1_max_labels_scanned_bounds_empty_label_scan() {
+        let mut html = String::from(r#"<label for="x">先頭</label>"#);
+        for _ in 0..MAX_LABELS_SCANNED {
+            html.push_str(r#"<label for="x">   </label>"#);
+        }
+        html.push_str(r#"<label for="x">届かないはずの名前</label><input id="x">"#);
+
+        let result = name(&html, "input");
+        assert_eq!(result.text, "先頭");
+        assert_eq!(result.source, NameSource::Label);
+        assert!(result.truncated);
+    }
+
+    /// PR #567 レビュー指摘の P1 修正: `for` 属性を持たない包含
+    /// （wrapping）label が深く入れ子になっていても、`NameIndex::build`
+    /// は文書サイズに対して線形時間で完了する（旧実装は label ごとに
+    /// `doc.descendants` で子孫を再走査しており、入れ子数に対して二乗
+    /// 時間になっていた）。
+    #[test]
+    fn aisnap_1_nested_wrapping_labels_build_is_linear_not_quadratic() {
+        use std::time::Instant;
+
+        use super::NameIndex;
+
+        const DEPTH: usize = 4_000;
+        let mut html = String::new();
+        for _ in 0..DEPTH {
+            html.push_str("<label>");
+        }
+        html.push_str(r#"<input id="x">"#);
+        for _ in 0..DEPTH {
+            html.push_str("</label>");
+        }
+
+        let options = ParseOptions::default().with_max_nodes(usize::MAX);
+        let parsed = parse_document(&html, &options).expect("深いネストでも成功する");
+        let doc = parsed.document;
+
+        let started = Instant::now();
+        let index = NameIndex::build(&doc);
+        let elapsed = started.elapsed();
+        // 二乗時間への退行なら DEPTH=4,000 は著しく遅くなる。線形なら
+        // 十分速く終わるはずなので、余裕を持った上限で退行を検知する。
+        assert!(
+            elapsed.as_secs() < 5,
+            "NameIndex::build が遅すぎる（{elapsed:?}）。O(n^2) への退行の疑い"
+        );
+
+        // 構築結果も使えること（クラッシュ・無限ループしないことに加えて
+        // 妥当な結果を返すこと）を確認する。
+        let root = doc.root();
+        let input = query_selector_str(&doc, root, "input")
+            .expect("セレクタは解釈できる")
+            .expect("input 要素が見つかる");
+        let result = super::compute_name_with_index(&doc, &index, input);
+        // すべての label が空要素（テキストなし）のため名前には寄与しない。
+        assert!(result.is_empty());
     }
 }
