@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import struct
 import sys
@@ -133,7 +134,14 @@ def _resolve_capture_png(capture_dir: Path, png_rel: Any, engine: str, site_id: 
             f"site_id={site_id!r}, got {png_rel!r}"
         )
     full = capture_dir / candidate
-    if full.is_symlink():
+    # `full.is_symlink()` はパス末尾の要素（PNG ファイル自体）しか検査しない。
+    # `candidate` は `<engine>/<site_id>.png` に固定済みのため、中間要素は
+    # エンジンディレクトリ（`full.parent`）のみだが、そこが symlink
+    # （例: `servo` -> `chromium`）になっていると、PNG 自体は symlink で
+    # なくても解決後は capture-dir 内の別ファイル（別エンジンの PNG）を
+    # 指してしまい、同一ファイル同士の比較で SSIM が機械的に 1 になる
+    # （codex レビュー指摘 P1）。エンジンディレクトリの symlink も拒否する。
+    if full.is_symlink() or full.parent.is_symlink():
         raise CaptureResultError(f"refusing to follow symlink: {full}")
     resolved_capture_dir = capture_dir.resolve()
     if not full.resolve().is_relative_to(resolved_capture_dir):
@@ -216,6 +224,29 @@ def load_capture_result(
         raise CaptureResultError("capture-result.json: invalid viewport width/height")
     viewport_out: dict[str, int] = {"width": vw, "height": vh}
 
+    # `sites`（`capture_screenshots.write_result` が撮影対象として宣言した
+    # 代表サイト一覧。`{"id": ..., "url": ..., "category": ..., "catalog_id":
+    # ...}` の形。#53 の契約）を検証し、宣言された site_id の集合を作る。
+    # `captures` だけを見て `sites` との対応を確認しないと、`sites: []`
+    # （撮影対象が 0 件）でも任意の `site_id` の撮影ペアを受け入れてしまい、
+    # RENDER-5 が求める「代表サイト」の判定契約から外れたサイトまで
+    # `passing_sites` に算入できてしまう（codex レビュー指摘 P1）。
+    raw_sites = payload.get("sites")
+    if not isinstance(raw_sites, list):
+        raise CaptureResultError("capture-result.json: 'sites' must be a list")
+    if len(raw_sites) > cs.MAX_SITES:
+        raise CaptureResultError("capture-result.json: too many declared sites")
+    declared_site_ids: set[str] = set()
+    for site_entry in raw_sites:
+        if not isinstance(site_entry, dict):
+            raise CaptureResultError("capture-result.json: each 'sites' entry must be an object")
+        declared_id = site_entry.get("id")
+        if not isinstance(declared_id, str) or not cs.SITE_ID_RE.match(declared_id):
+            raise CaptureResultError(f"capture-result.json: invalid site id in 'sites': {declared_id!r}")
+        if declared_id in declared_site_ids:
+            raise CaptureResultError(f"capture-result.json: duplicate site id in 'sites': {declared_id}")
+        declared_site_ids.add(declared_id)
+
     captures = payload.get("captures")
     if not isinstance(captures, list):
         raise CaptureResultError("capture-result.json: 'captures' must be a list")
@@ -253,6 +284,14 @@ def load_capture_result(
     pairs: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     for site_id, by_engine in sorted(by_site.items()):
+        if site_id not in declared_site_ids:
+            skipped.append(
+                {
+                    "site_id": site_id,
+                    "reason": "site_id not declared in capture-result.json 'sites'",
+                }
+            )
+            continue
         if site_id in duplicate_sites:
             skipped.append(
                 {
@@ -283,6 +322,24 @@ def load_capture_result(
             tgt_png = _resolve_capture_png(capture_dir, tgt_entry.get("png"), TARGET_ENGINE, site_id)
         except CaptureResultError as exc:
             skipped.append({"site_id": site_id, "reason": str(exc)})
+            continue
+        # symlink 拒否（`_resolve_capture_png`）に加え、2 エンジンの PNG が
+        # 実体として同一ファイルでないことも直接確認する（防御の多重化）。
+        # `Path.resolve()` の一致比較はハードリンク（同一 inode・別パス）を
+        # 検出できないため、`os.path.samefile`（inode 比較）を使う。
+        try:
+            same_file = os.path.samefile(ref_png, tgt_png)
+        except OSError:
+            same_file = False
+        if same_file:
+            skipped.append(
+                {
+                    "site_id": site_id,
+                    "reason": (
+                        f"{REFERENCE_ENGINE}/{TARGET_ENGINE} 'png' resolve to the same file"
+                    ),
+                }
+            )
             continue
         pairs.append({"site_id": site_id, "chromium_png": ref_png, "servo_png": tgt_png})
 
@@ -719,7 +776,14 @@ def load_bboxes(path: Path) -> dict[str, dict[str, float]] | None:
     """
     if not path.exists():
         return None
-    if path.is_symlink():
+    # `path.is_symlink()` は末尾の要素（bbox JSON ファイル自体）しか検査しない。
+    # `path` は呼び出し元（`measure_site`）が常に `<capture_dir>/<engine>/
+    # <site_id>.bboxes.json` の形で組み立てるため、中間要素はエンジン
+    # ディレクトリ（`path.parent`）のみだが、そこが symlink（例: `servo` ->
+    # `chromium`）になっていると、bbox ファイル自体は symlink でなくても
+    # capture-dir 内の別エンジンの bbox を読んでしまう（codex レビュー
+    # 指摘 P1 と同種。PNG 側の `_resolve_capture_png` と同じ対策）。
+    if path.is_symlink() or path.parent.is_symlink():
         raise BboxError(f"refusing to follow symlink: {path}")
     try:
         size = path.stat().st_size

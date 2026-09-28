@@ -592,6 +592,26 @@ class LoadBboxesTest(unittest.TestCase):
             with self.assertRaises(ms.BboxError):
                 ms.load_bboxes(link)
 
+    def test_refuses_symlinked_engine_directory(self) -> None:
+        # codex レビュー指摘（P1）: `path.is_symlink()` は bbox ファイル自体
+        # しか検査しないため、`servo` のようなエンジンディレクトリ自体が
+        # 別ディレクトリへの symlink になっていると、capture-dir 外（または
+        # 別エンジン）の bbox JSON を無検証で読んでしまう。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp) / "cap"
+            capture_dir.mkdir()
+            real_engine_dir = Path(tmp) / "outside_engine"
+            real_engine_dir.mkdir()
+            target = real_engine_dir / "a.bboxes.json"
+            target.write_text(json.dumps({"schema_version": 1, "elements": []}), encoding="utf-8")
+            linked_engine_dir = capture_dir / "servo"
+            try:
+                linked_engine_dir.symlink_to(real_engine_dir, target_is_directory=True)
+            except OSError:
+                self.skipTest("symlink creation is not permitted in this environment")
+            with self.assertRaises(ms.BboxError):
+                ms.load_bboxes(capture_dir / "servo" / "a.bboxes.json")
+
     def test_rejects_invalid_utf8_without_crashing(self) -> None:
         # Cursor Bugbot 指摘（Medium）: `UnicodeDecodeError` を `BboxError`
         # へ変換せず素通りしていないことを確認する。
@@ -753,12 +773,30 @@ class CompareBboxesTest(unittest.TestCase):
 class LoadCaptureResultTest(unittest.TestCase):
     """RENDER-5 / TASK-37.2: `load_capture_result`（capture-result.json の検証・ペア判定）。"""
 
-    def _write_result(self, capture_dir: Path, captures: list[dict], viewport: dict | None = None) -> None:
+    def _write_result(
+        self,
+        capture_dir: Path,
+        captures: list[dict],
+        viewport: dict | None = None,
+        sites: list[dict] | None = None,
+    ) -> None:
+        # `sites` を明示しない呼び出し（大半の既存テスト）は、`captures` に
+        # 現れる有効な site_id をそのまま「宣言された代表サイト」として自動
+        # 補完する。各テストの主眼（symlink・重複エントリ・png パス検証等）
+        # と無関係な `sites`/`captures` 対応検証（`test_rejects_capture_...`
+        # 系）で個々に落ちないようにするため。
+        if sites is None:
+            auto_ids: list[str] = []
+            for entry in captures:
+                site_id = entry.get("site_id")
+                if isinstance(site_id, str) and cs.SITE_ID_RE.match(site_id) and site_id not in auto_ids:
+                    auto_ids.append(site_id)
+            sites = [{"id": site_id} for site_id in auto_ids]
         payload = {
             "schema_version": 1,
             "generated_at": "2026-01-01T00:00:00Z",
             "viewport": viewport or {"width": 1280, "height": 800},
-            "sites": [],
+            "sites": sites,
             "captures": captures,
         }
         (capture_dir / "capture-result.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -997,6 +1035,112 @@ class LoadCaptureResultTest(unittest.TestCase):
             self.assertEqual(pairs, [])
             self.assertEqual(len(skipped), 1)
             self.assertEqual(skipped[0]["site_id"], "b")
+
+    def test_rejects_capture_not_declared_in_sites(self) -> None:
+        # codex レビュー指摘（P1）: `load_capture_result` は `captures` だけを
+        # 検証し、同じ JSON の `sites`（撮影対象として宣言された代表サイト
+        # 一覧）との対応を確認していなかった。`sites: []` でも任意の
+        # `site_id` の撮影ペアを受け入れ `passing_sites` に算入できてしまう。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            (capture_dir / "chromium").mkdir()
+            (capture_dir / "servo").mkdir()
+            (capture_dir / "chromium" / "a.png").write_bytes(b"x")
+            (capture_dir / "servo" / "a.png").write_bytes(b"x")
+            self._write_result(
+                capture_dir,
+                [
+                    self._capture_entry("a", "chromium", "ok", "chromium/a.png"),
+                    self._capture_entry("a", "servo", "ok", "servo/a.png"),
+                ],
+                sites=[],  # 撮影対象として宣言されたサイトが 0 件。
+            )
+            viewport, pairs, skipped = ms.load_capture_result(capture_dir)
+            self.assertEqual(pairs, [])
+            self.assertEqual(len(skipped), 1)
+            self.assertEqual(skipped[0]["site_id"], "a")
+            self.assertIn("not declared", skipped[0]["reason"])
+
+    def test_sites_not_a_list_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            self._write_result(capture_dir, [], sites="not-a-list")  # type: ignore[arg-type]
+            with self.assertRaises(ms.CaptureResultError):
+                ms.load_capture_result(capture_dir)
+
+    def test_sites_entry_invalid_id_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            self._write_result(capture_dir, [], sites=[{"id": "Not Valid!"}])
+            with self.assertRaises(ms.CaptureResultError):
+                ms.load_capture_result(capture_dir)
+
+    def test_sites_entry_not_an_object_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            self._write_result(capture_dir, [], sites=["a"])  # type: ignore[list-item]
+            with self.assertRaises(ms.CaptureResultError):
+                ms.load_capture_result(capture_dir)
+
+    def test_duplicate_site_ids_in_sites_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            self._write_result(capture_dir, [], sites=[{"id": "a"}, {"id": "a"}])
+            with self.assertRaises(ms.CaptureResultError):
+                ms.load_capture_result(capture_dir)
+
+    def test_rejects_png_via_symlinked_engine_directory(self) -> None:
+        # codex レビュー指摘（P1）: `full.is_symlink()` は PNG 自体しか検査
+        # しないため、`servo` ディレクトリ自体を `chromium` への symlink に
+        # すると、両エントリの `png` は symlink ではなくても解決後は同一
+        # ファイルを指し、capture-dir 内に収まったまま SSIM が機械的に 1 に
+        # なってしまう。エンジンディレクトリの symlink を拒否する。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            chromium_dir = capture_dir / "chromium"
+            chromium_dir.mkdir()
+            (chromium_dir / "a.png").write_bytes(b"x")
+            servo_dir = capture_dir / "servo"
+            try:
+                servo_dir.symlink_to(chromium_dir, target_is_directory=True)
+            except OSError:
+                self.skipTest("symlink creation is not permitted in this environment")
+            self._write_result(
+                capture_dir,
+                [
+                    self._capture_entry("a", "chromium", "ok", "chromium/a.png"),
+                    self._capture_entry("a", "servo", "ok", "servo/a.png"),
+                ],
+            )
+            viewport, pairs, skipped = ms.load_capture_result(capture_dir)
+            self.assertEqual(pairs, [])
+            self.assertEqual(len(skipped), 1)
+            self.assertEqual(skipped[0]["site_id"], "a")
+
+    def test_rejects_pair_resolving_to_the_same_file(self) -> None:
+        # symlink 検査をすり抜ける経路（例: ハードリンク）の防御多重化として、
+        # 解決後の chromium/servo PNG が同一ファイルの場合も拒否する。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            (capture_dir / "chromium").mkdir()
+            (capture_dir / "servo").mkdir()
+            shared = capture_dir / "chromium" / "a.png"
+            shared.write_bytes(b"x")
+            try:
+                os.link(shared, capture_dir / "servo" / "a.png")
+            except OSError:
+                self.skipTest("hard link creation is not permitted in this environment")
+            self._write_result(
+                capture_dir,
+                [
+                    self._capture_entry("a", "chromium", "ok", "chromium/a.png"),
+                    self._capture_entry("a", "servo", "ok", "servo/a.png"),
+                ],
+            )
+            viewport, pairs, skipped = ms.load_capture_result(capture_dir)
+            self.assertEqual(pairs, [])
+            self.assertEqual(len(skipped), 1)
+            self.assertEqual(skipped[0]["site_id"], "a")
 
 
 class WriteResultTest(unittest.TestCase):
