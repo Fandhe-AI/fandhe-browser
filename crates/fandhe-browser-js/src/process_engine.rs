@@ -1568,6 +1568,31 @@ fn apply_post_response_rss_check(
     if !keep_worker {
         return (outcome, keep_worker);
     }
+
+    // 監視スレッドが、応答フレームの到達とほぼ同時に上限超過を検出して
+    // 子を `kill` している場合を最優先で確認する（codex レビュー指摘
+    // #503 P1「メモリ上限超過で子が終了しても評価結果を成功として
+    // 返し得る」対応）。この確認を後回しにして、この関数自身の同期的な
+    // プローブ（`child_memory_probe`／`read_child_rss_bytes`）だけに
+    // 頼ると、監視スレッドの `kill` によって子が既に終了しているため
+    // プローブが `None` を返し、「異常なし」と誤認して `outcome`
+    // （評価成功、または `Timeout`/`EvaluationFailed`/`BindingFailed`
+    // のように子を生かしたまま扱うつもりだったエラー）をそのまま
+    // 返してしまう。呼び出し元には成功（または誤った種類のエラー）が
+    // 通知される一方で Context は既に失われており、次回の評価で初めて
+    // エラーになる（security.md「偽装・回避機能の禁止」に抵触する
+    // 「実際には破棄された Context を、使えるものとして返す」挙動）。
+    if let Some(reason) = worker.memory_monitor.take_kill_reason() {
+        worker.terminate_now();
+        let tail = worker.reap_and_collect_stderr();
+        let err = monitor_kill_reason_to_error(
+            reason,
+            &tail,
+            "immediately after responding; the next evaluation runs in a fresh context",
+        );
+        return (Err(ensure_discarded_phrase(err)), false);
+    }
+
     let Some(probe) = child_memory_probe(&worker.child, worker.pid) else {
         return (outcome, keep_worker);
     };
@@ -2111,6 +2136,98 @@ mod tests {
             other => panic!(
                 "expected ResourceLimitExceeded (stderr OOM evidence must win over a \
                  ProbeUnavailable kill_reason), got: {other:?}"
+            ),
+        }
+    }
+
+    /// codex レビュー指摘 #503 P1「メモリ上限超過で子が終了しても評価
+    /// 結果を成功として返し得る」の単体テスト: 監視スレッドが応答フレーム
+    /// の到達とほぼ同時に上限超過を検出して既に `kill` していた場合、
+    /// `apply_post_response_rss_check` は（この関数自身の同期プローブが
+    /// 「子が既に居ない」ことにより `None` を返すため見た目上は無害に
+    /// 見えても）`outcome` がたとえ `Ok`（評価成功）であっても、それを
+    /// 握りつぶして `ResourceLimitExceeded` を返し、`keep_worker` を
+    /// `false` にすること。
+    #[test]
+    fn js_1_apply_post_response_rss_check_discards_success_when_monitor_already_killed() {
+        let child = spawn_long_lived_child_for_test();
+        let mut worker =
+            WorkerHandle::from_child(child).expect("failed to build a test WorkerHandle");
+
+        // 監視スレッドが RSS 超過を検出して既に kill 済みの状態を、
+        // 実際にしきい値へ到達させずに直接再現する（他のテストと同様の
+        // 手法。`kill_reason` は同一モジュール内のため private フィールド
+        // へ直接アクセスできる）。
+        *worker
+            .memory_monitor
+            .kill_reason
+            .lock()
+            .expect("kill_reason mutex must not be poisoned") =
+            Some(MonitorKillReason::ResourceLimitExceeded(999_999_999));
+
+        let success_outcome = Ok(JsValue::Number(42.0));
+        let (outcome, keep) = apply_post_response_rss_check(&mut worker, success_outcome, true);
+
+        assert!(
+            !keep,
+            "the worker must not be kept when the monitor thread had already killed it"
+        );
+        match outcome {
+            Err(JsEngineError::ResourceLimitExceeded(msg)) => {
+                assert!(
+                    msg.contains("999999999"),
+                    "expected the exact observed RSS (999999999) in the message, got: {msg}"
+                );
+                assert!(
+                    msg.contains("context was discarded"),
+                    "expected the required phrase, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected a successful evaluation result to be discarded and replaced with \
+                 ResourceLimitExceeded once the monitor thread's kill is observed, got: {other:?}"
+            ),
+        }
+    }
+
+    /// 上記テストと対（codex レビュー指摘 #503 P1 の同じ観点）: `outcome`
+    /// が（子を生かしたまま扱うつもりだった）`EvaluationFailed` のような
+    /// エラーであっても、監視スレッドが既に `kill` していれば、それを
+    /// `ResourceLimitExceeded` へ差し替えること。
+    #[test]
+    fn js_1_apply_post_response_rss_check_discards_keep_alive_error_when_monitor_already_killed() {
+        let child = spawn_long_lived_child_for_test();
+        let mut worker =
+            WorkerHandle::from_child(child).expect("failed to build a test WorkerHandle");
+
+        *worker
+            .memory_monitor
+            .kill_reason
+            .lock()
+            .expect("kill_reason mutex must not be poisoned") =
+            Some(MonitorKillReason::ResourceLimitExceeded(123_456));
+
+        let keep_alive_error_outcome = Err(JsEngineError::EvaluationFailed(
+            "ReferenceError: x is not defined".to_string(),
+        ));
+        let (outcome, keep) =
+            apply_post_response_rss_check(&mut worker, keep_alive_error_outcome, true);
+
+        assert!(
+            !keep,
+            "the worker must not be kept when the monitor thread had already killed it"
+        );
+        match outcome {
+            Err(JsEngineError::ResourceLimitExceeded(msg)) => {
+                assert!(
+                    msg.contains("123456"),
+                    "expected the exact observed RSS (123456) in the message, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected a keep-alive-style error (EvaluationFailed) to be discarded and \
+                 replaced with ResourceLimitExceeded once the monitor thread's kill is observed, \
+                 got: {other:?}"
             ),
         }
     }
