@@ -107,7 +107,7 @@
 //! | OS | 強制方法 | 強さ |
 //! |---|---|---|
 //! | Linux | `RLIMIT_DATA`（[`enforce_child_memory_limit`]。`rustix::process::setrlimit`。上限 [`LINUX_RLIMIT_DATA_CEILING_BYTES`]＝2 GiB）＋[`new_bounded_array_buffer_allocator`]（`ArrayBuffer` 確保の上限。3 OS 共通） | **OS がある程度強制するが、厳密な上限としては機能しない**。`RLIMIT_DATA` は匿名 `MAP_PRIVATE` の `mmap`（大きな `ArrayBuffer` の backing store が実際に使う経路。glibc malloc は既定のしきい値 128 KiB を超える確保を `mmap` に回す）にも、実際に触れていない仮想予約にも適用される（`setrlimit(2)` の「data segment のみ」という古い説明は、匿名 mmap を会計に含めない実装を前提にしており、本 crate が対象とする現行 Linux カーネルの挙動とは異なる）。しかし V8 自身の `CodeRange` 予約だけで数百 MiB（アーキテクチャ依存。実測は上記のとおり）を消費するため、[`HEAP_EXTERNAL_ALLOWANCE_BYTES`] 相当の小さい値には設定できず、`RLIMIT_DATA` 単体では実質的な防御を親側の監視に委ねていた。**`ArrayBuffer` の確保だけは、この `RLIMIT_DATA` の限界とは無関係に、V8 自身のレベル（[`new_bounded_array_buffer_allocator`]）で [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`] を確実に強制する** |
-//! | Windows | Job Object（[`enforce_child_memory_limit`]。`windows-sys` で Win32 API を直接呼ぶ。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`。上限 [`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`]＝384 MiB）＋[`new_bounded_array_buffer_allocator`]（`ArrayBuffer` 確保の上限。3 OS 共通） | **OS がコミットの天井を強制するが、天井を超えても子プロセスは終了しない**。当初は `win32job =2.0.3` の安全な API（`limit_working_memory`／`JOB_OBJECT_LIMIT_WORKINGSET`）を使っていたが、これは物理メモリの常駐量（working set）を trim させるだけでコミットチャージの上限にはならないという P0 指摘（codex）を受け、`win32job` の使用をやめて `windows-sys` で Win32 API を直接呼ぶ実装に切り替えた（ユーザー承認 2026-09-28。承認された unsafe の範囲は本モジュールの `windows_job` サブモジュール・`read_rss_windows` に限定）。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`／`ProcessMemoryLimit` は Linux の `kill` ベースの強制とは性質が異なり、コミットチャージが上限を超えると**その先の確保が失敗するだけ**である（`VirtualAlloc`/`HeapAlloc` 相当が失敗を返す。プロセス自体は生き続ける）。ただし本対応（codex レビュー指摘 #503 P0「macOS の JS ワーカーに強制的なメモリ上限がない」）以降、V8 の既定の `ArrayBuffer::Allocator` は使わず [`new_bounded_array_buffer_allocator`] に置き換えたため、`ArrayBuffer` の確保は通常 [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`]（128 MiB）でこのアロケータ自身が拒否し、Job Object のコミット上限（384 MiB）に到達する事態は基本的に起こらない（到達しうるのは `ArrayBuffer` 以外の確保。その場合も引き続き親側の監視（[`read_child_rss_bytes`] が返す `PrivateUsage`。working set ではなくコミット量を見るように変更した）が `ResourceLimitExceeded` への分類・子の破棄・作り直しを担う）。この Windows 専用実装（windows-sys 版）は本コミット時点では未検証であり、CI の Windows ランナーでの確認を前提とする（回帰テスト参照）|
+//! | Windows | Job Object（[`enforce_child_memory_limit`]。`windows-sys` で Win32 API を直接呼ぶ。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`。上限 [`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`]＝384 MiB）＋[`new_bounded_array_buffer_allocator`]（`ArrayBuffer` 確保の上限。3 OS 共通） | **OS がコミットの天井を強制するが、天井を超えても子プロセスは終了しない**。当初は `win32job =2.0.3` の安全な API（`limit_working_memory`／`JOB_OBJECT_LIMIT_WORKINGSET`）を使っていたが、これは物理メモリの常駐量（working set）を trim させるだけでコミットチャージの上限にはならないという P0 指摘（codex）を受け、`win32job` の使用をやめて `windows-sys` で Win32 API を直接呼ぶ実装に切り替えた（ユーザー承認 2026-09-28。承認された unsafe の範囲は本モジュールの `windows_job` サブモジュール・`read_rss_windows` に限定）。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`／`ProcessMemoryLimit` は Linux の `kill` ベースの強制とは性質が異なり、コミットチャージが上限を超えると**その先の確保が失敗するだけ**である（`VirtualAlloc`/`HeapAlloc` 相当が失敗を返す。プロセス自体は生き続ける）。ただし本対応（codex レビュー指摘 #503 P0「macOS の JS ワーカーに強制的なメモリ上限がない」）以降、V8 の既定の `ArrayBuffer::Allocator` は使わず [`new_bounded_array_buffer_allocator`] に置き換えたため、`ArrayBuffer` の確保は通常 [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`]（128 MiB）でこのアロケータ自身が拒否し、Job Object のコミット上限（384 MiB）に到達する事態は基本的に起こらない（到達しうるのは `ArrayBuffer` 以外の確保。その場合も引き続き親側の監視（[`read_child_rss_bytes`] が返す `PrivateUsage`。working set ではなくコミット量を見るように変更した）が `ResourceLimitExceeded` への分類・子の破棄・作り直しを担う）。この Windows 専用実装（windows-sys 版）のうち、Job Object の作成・`ProcessMemoryLimit` の設定・自プロセスの割り当て（[`enforce_child_memory_limit`]。子プロセス起動そのものが成立すること）と、`GetProcessMemoryInfo` による `PrivateUsage` 監視（[`read_rss_windows`]）は、3 OS CI の Windows ランナー（`rust-ci (windows-latest)`）上での結合テスト（`tests/v8_worker.rs` の Windows 専用ケースを含む全ケース）で検証している。ただし `js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation` は RSS しきい値を意図的に下げて親側の監視（`PrivateUsage` 監視）を先に発動させる構成であり（テスト自身のドキュメントコメント参照）、`JOB_OBJECT_LIMIT_PROCESS_MEMORY`（384 MiB）到達時に OS が実際に確保を拒否する経路そのものを再現・検証するテストは無い（実装済みを装わない。REPAIR-3。codex レビュー指摘 #529）|
 //! | macOS | OS 側の手段は無い（[`enforce_child_memory_limit`] は何もしない）。[`new_bounded_array_buffer_allocator`]（resizable ではない `ArrayBuffer`／`SharedArrayBuffer` の確保上限。3 OS 共通で有効）と WebAssembly 無効化（`super::v8_engine::V8Engine::new_with_heap_limit`。3 OS 共通で有効）が、OS に頼らず V8 自身のレベルでヒープ外メモリの一部の確保経路を狭める | **OS によるプロセス単位の強制は無く、`ArrayBuffer` アロケータ・WebAssembly 無効化も部分的な防御にとどまる**（resizable `ArrayBuffer`／growable `SharedArrayBuffer`・`ArrayBuffer` アロケータ・wasm 無効化のいずれの対象にもならない native な確保は、この防御を経由せず素通りする。[`new_bounded_array_buffer_allocator`] のドキュメントコメント「既知の抜け穴」参照）。本実装時にこの macOS 環境で実機検証したところ、`RLIMIT_DATA`・`RLIMIT_AS`・`RLIMIT_RSS` はいずれも `setrlimit(2)` の呼び出し自体が `EINVAL` で失敗した（「上限をかけたが効かない」ではなく「そもそも設定できない」）。Job Object 相当の OS 機構も無い。したがって [`enforce_child_memory_limit`] は macOS では何もせず常に成功を返す（呼び出そうとしても確実に失敗するため、fail-closed にすると macOS 上で子プロセスが常に起動できなくなってしまう）。残る確保経路（resizable `ArrayBuffer`／growable `SharedArrayBuffer`・V8 自身のコード領域・snapshot・Rust ホストバイナリの通常の確保等）は、引き続き親側の RSS 監視だけに委ねる（macOS では、これが唯一の防衛線であることに変わりはない） |
 //!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
@@ -134,6 +134,14 @@
 //!   `SharedArrayBuffer` の合計」を制限するものであり、それを理由に子を
 //!   作り直したい場合は、これまでどおり親側の RSS 監視が
 //!   `ResourceLimitExceeded` として検出する
+//! - **再評価の条件（Fandhe-AI/fandhe-browser#518・2026-09-28 オーナー
+//!   判断「macOS は多層防御で受容する」参照）**: 上記の resizable
+//!   `ArrayBuffer`／growable `SharedArrayBuffer` の残存経路は、`v8` crate
+//!   の `RustAllocatorVtable` に `Reallocate`（または同等の再確保フック）
+//!   が追加された場合、あるいは `kReservation` 相当の予約型確保を
+//!   制御する手段・フラグが `v8` crate 側に入った場合は、
+//!   [`new_bounded_array_buffer_allocator`] の実装（および本節・
+//!   「OS ごとの強制の強さ」節の macOS の記述）を再評価する
 //! - WebAssembly は本対応で完全に無効化した
 //!   （`super::v8_engine::V8Engine::new_with_heap_limit`）。
 //!   `wasm` のメモリは [`new_bounded_array_buffer_allocator`] を通らない
@@ -159,8 +167,12 @@
 //!   （評価を始めずに終了）であり、起動時強制と監視とで
 //!   fail-open/fail-closed の扱いが異なることに注意
 //! - Windows の `ProcessMemoryLimit`・`GetProcessMemoryInfo` を使う
-//!   windows-sys 版の実装は、本コミット時点では実機・CI での検証が
-//!   できていない（開発環境が Windows ではないため。上表参照）
+//!   windows-sys 版の実装は、開発環境が Windows ではないため実機での
+//!   手元検証はできていない。Job Object の作成・割り当てが成立すること
+//!   と `GetProcessMemoryInfo` による `PrivateUsage` 監視は 3 OS CI の
+//!   Windows ランナーでの結合テストにより検証しているが、
+//!   `JOB_OBJECT_LIMIT_PROCESS_MEMORY`（384 MiB）到達時に OS が実際に
+//!   確保を拒否する経路そのものを検証するテストは無い（上表参照）
 
 use std::alloc::{Layout, alloc, alloc_zeroed, dealloc};
 use std::ffi::c_void;
@@ -363,10 +375,14 @@ const WASM_MEMORY_PAGE_BYTES: u64 = 64 * 1024;
 /// **多層防御としてのみ機能する**（advisor 指摘。codex レビュー指摘
 /// #503 P0「macOS の JS ワーカーに強制的なメモリ上限がない」対応で
 /// WebAssembly を無効化した（`v8_engine::V8Engine::new_with_heap_limit`
-/// が Context 生成直後に `WebAssembly` グローバルを上書きする）際、この
-/// 上書きが**失敗しても**（戻り値は確認していない。同関数の実装コメント
-/// 参照）、無制限の wasm メモリ確保という抜け穴を残さないための保険と
-/// して、対応前から存在したこの上限フラグを引き続き設定する）。
+/// が Context 生成直後に `WebAssembly` グローバルを上書きする）。この
+/// 上書きは戻り値の確認・上書き後の読み出し直しの両方で成否を検証し、
+/// 検証に失敗すれば Isolate 生成自体を失敗させる（fail-closed。
+/// `v8_engine::V8Engine::new_context_with_wasm_disabled` 参照。codex
+/// レビュー指摘 #503 P1「WebAssembly の無効化失敗を見逃している」対応）
+/// ため、通常運用でこの上書きが失敗したまま見逃されることはない。本
+/// フラグは、それでもなお無制限の wasm メモリ確保という抜け穴を残さない
+/// ための保険として、対応前から存在した上限フラグを引き続き設定する）。
 const WASM_MAX_MEM_PAGES: u64 = HEAP_EXTERNAL_ALLOWANCE_BYTES / WASM_MEMORY_PAGE_BYTES;
 
 /// [`WASM_MAX_MEM_PAGES`] を V8 のフラグとして設定する（V8 152.2.0 の
@@ -826,6 +842,13 @@ static BOUNDED_ARRAY_BUFFER_ALLOCATOR_VTABLE: v8::RustAllocatorVtable<
 /// だけが検出する**（Linux・Windows は、この経路であっても OS 側の
 /// プロセス単位の強制（`RLIMIT_DATA`・`ProcessMemoryLimit`）が別途
 /// 効く）。
+///
+/// **再評価の条件**（Fandhe-AI/fandhe-browser#518・2026-09-28 オーナー
+/// 判断「macOS は多層防御で受容する」参照）: `v8` crate の
+/// `RustAllocatorVtable` に `Reallocate` 相当のフックが加わった場合、
+/// または `kReservation` 相当の予約型確保（resizable `ArrayBuffer`／
+/// growable `SharedArrayBuffer` が経由する確保方式）を制御する手段・
+/// フラグが `v8` crate 側に入った場合は、この残存経路を再評価する。
 pub(crate) fn new_bounded_array_buffer_allocator() -> v8::UniqueRef<v8::Allocator> {
     let state = Arc::new(BoundedArrayBufferAllocatorState {
         allocated_bytes: AtomicUsize::new(0),
