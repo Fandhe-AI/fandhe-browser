@@ -1025,6 +1025,21 @@ class LoadCaptureResultTest(unittest.TestCase):
             with self.assertRaises(ms.CaptureResultError):
                 ms.load_capture_result(capture_dir)
 
+    def test_rejects_huge_integer_literal_without_crashing(self) -> None:
+        # codex レビュー指摘（P1）: 桁数上限を超える整数リテラルは `json.loads`
+        # が `ValueError` を送出するが、`load_bboxes` と異なり
+        # `load_capture_result` は `JSONDecodeError`・`RecursionError` しか
+        # 変換していなかったため未処理例外で終了コード 2 の契約を破っていた。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            huge_int = "9" * 5000
+            (capture_dir / "capture-result.json").write_text(
+                f'{{"schema_version": 1, "viewport": {huge_int}}}',
+                encoding="utf-8",
+            )
+            with self.assertRaises(ms.CaptureResultError):
+                ms.load_capture_result(capture_dir)
+
     def test_invalid_viewport_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             capture_dir = Path(tmp)

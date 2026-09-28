@@ -202,7 +202,11 @@ def load_capture_result(
         raise CaptureResultError(f"failed to read capture-result.json: {exc}") from exc
     try:
         payload = json.loads(text)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, ValueError) as exc:
+        # 巨大な整数リテラル（桁数上限超過）は `json` の実装上 `ValueError` に
+        # なることがある（`load_bboxes` と同じ理由。codex レビュー指摘）。
+        # `JSONDecodeError` と合わせて `CaptureResultError` に変換し、
+        # `main` の 1 サイト単位のエラー処理経路（終了コード 2）を通す。
         raise CaptureResultError(f"invalid JSON in capture-result.json: {exc}") from exc
     except RecursionError as exc:
         # 深くネストした JSON（非信頼入力）は `json.loads` の再帰的パースで
