@@ -108,6 +108,23 @@ pub use engine_trait::{
 /// このバイナリは子プロセスとして機能できないため
 /// `ExitCode::FAILURE` を返す（成功を一律に返すフォールバックはしない。
 /// security.md「偽装・回避機能の禁止」）。
+///
+/// # スレッドに関する不変条件（`JS-1`・`TASK-29`・Issue #520）
+///
+/// 子プロセスモード（`js-v8` feature 有効時）では、この関数から
+/// `worker::worker_main` を経て V8 の Platform 初期化・Isolate 生成まで、
+/// **呼び出しスレッドの上で直線的に**進む。子プロセスの中の
+/// `worker_main` は V8 の Platform を protected 版（thread-isolated
+/// allocation 有効）で要求する（`v8_engine::ensure_v8_initialized_with`
+/// 参照）ため、Isolate に入れるのは Platform 初期化を行ったスレッド
+/// （＝この関数を呼んだスレッド）とその子孫だけである（PKU を持つ
+/// x86-64 Linux での protected Platform の制約）。
+///
+/// したがって、この関数を呼ぶ側（`TASK-41` の cli `main`）は、
+/// **本関数を呼ぶより前に**別スレッドを作ってそこから V8 の Isolate に
+/// 入るような構成にしてはならない。tokio ランタイム・ロギング等より
+/// 前に本関数を呼ぶという既存の契約（上記「呼び出し元」節）は、この
+/// 不変条件を満たすための前提でもある。
 pub fn run_js_worker_if_requested() -> Option<std::process::ExitCode> {
     let marker_value = std::env::var(worker_protocol::MARKER_ENV_VAR).ok()?;
     Some(dispatch_worker(&marker_value))
