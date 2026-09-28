@@ -105,6 +105,36 @@ pub enum JsValue {
     String(String),
 }
 
+/// [`NativeFn`] 呼び出し 1 回に紐づく実行コンテキスト（`TASK-29`・
+/// Issue #526・codex レビュー指摘「`NativeFn` が戻らない場合に評価期限が
+/// 機能しない」対応）。
+///
+/// 親（`super::process_engine::V8ProcessEngine`）は `NativeFn` を呼び出し
+/// スレッド上で同期実行する（`NativeFn` が `Send` ではなく、V8 の
+/// `Isolate`/`HandleScope` がスレッド固有であるため別スレッドへ移せない。
+/// 下記 [`NativeFn`] のドキュメントコメント参照）。そのため親は実行中の
+/// `NativeFn` を外部から中断する手段を持たず、期限切れを確認できるのは
+/// `NativeFn` から戻った直後だけである（`super::process_engine`
+/// モジュールドキュメントの「親側 `NativeCall` dispatch」節参照）。
+///
+/// 本構造体は、呼び出し元が計算済みの評価期限を `NativeFn` 自身へ伝え、
+/// `NativeFn` が自発的に処理を打ち切れるようにするための協調的な手段
+/// である（強制はできない。`NativeFn` がこれを無視して戻らない場合の
+/// 挙動は変わらない）。`Instant` を直接引数にしないのは、将来
+/// フィールドを追加できる構造にするため（coding-rust.md「戻り値は
+/// 将来拡張できる構造を持つ型にする」と同じ考え方を、引数型にも
+/// 適用する）。
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct NativeCallContext {
+    /// この呼び出しが属する評価全体の期限。呼び出し元
+    /// （`super::process_engine::send_evaluate_and_await`）が評価開始時に
+    /// 1 度だけ計算した値であり、`NativeFn` の実行時間もこの期限に含まれる。
+    /// `NativeFn` はこの時刻を超えないよう自身の処理を打ち切ることが
+    /// 望ましい（強制ではない。上記構造体ドキュメント参照）。
+    pub deadline: std::time::Instant,
+}
+
 /// [`JsEngine::inject_global_function`]・[`JsEngine::bind_dom_like_object`]
 /// が受け取る Rust ネイティブ関数の型（TASK-28.3・`JS-1`）。
 ///
@@ -113,13 +143,15 @@ pub enum JsValue {
 /// `dom.getText`/`dom.count` 相当）。呼び出し元（将来: `fandhe-browser-core`
 /// の TASK-30）は、この関数へ渡す引数が外部入力（プラグイン入出力・ネット
 /// ワーク取得データ由来）である場合、untrusted な入力として検証する責務を
-/// 負う（security.md「プラグイン境界」）。
+/// 負う（security.md「プラグイン境界」）。第 2 引数の [`NativeCallContext`]
+/// は呼び出し元が計算した評価期限を伝える（`TASK-29`・Issue #526）。
 ///
 /// `Send`/`Sync` 境界は付けない。V8 の `Isolate`/`HandleScope` はスレッド
 /// 固有であり、境界を付けると V8 実装（TASK-29）が満たせなくなるため
 /// （`js-engine.md`「選択はプロセス起動時に1回」が定める、エンジンの実行が
 /// プロセス内で単一スレッドに閉じる前提に対応する）。
-pub type NativeFn = Box<dyn FnMut(&[JsValue]) -> Result<JsValue, JsEngineError>>;
+pub type NativeFn =
+    Box<dyn FnMut(&[JsValue], &NativeCallContext) -> Result<JsValue, JsEngineError>>;
 
 /// [`JsEngine::evaluate_script`] の実行制御オプション（TASK-28.3・`JS-1`）。
 ///

@@ -191,8 +191,8 @@ fn js_1_create_engine_contract_is_empty_by_default() {
 mod conformance_checks {
     use super::IMPLEMENTED_ENGINES;
     use fandhe_browser_js::{
-        CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsEngineError, JsValue, NativeFn,
-        bundled_engines, create_engine,
+        CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsEngineError, JsValue,
+        NativeCallContext, NativeFn, bundled_engines, create_engine,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -369,7 +369,7 @@ mod conformance_checks {
         // print: Rust 側が呼び出し引数を記録できること（PoC-3 の print 相当）。
         let printed: Rc<RefCell<Vec<JsValue>>> = Rc::new(RefCell::new(Vec::new()));
         let printed_for_closure = Rc::clone(&printed);
-        let print_fn: NativeFn = Box::new(move |args: &[JsValue]| {
+        let print_fn: NativeFn = Box::new(move |args: &[JsValue], _ctx: &NativeCallContext| {
             printed_for_closure.borrow_mut().extend_from_slice(args);
             Ok(JsValue::Undefined)
         });
@@ -387,11 +387,13 @@ mod conformance_checks {
 
         // add: 戻り値が JS へ往復すること。添字アクセスは使わず get() で取り出す
         // （coding-rust.md「外部入力の経路では添字アクセスを使わない」の手本）。
-        let add_fn: NativeFn = Box::new(|args: &[JsValue]| match (args.first(), args.get(1)) {
-            (Some(JsValue::Number(a)), Some(JsValue::Number(b))) => Ok(JsValue::Number(a + b)),
-            _ => Err(JsEngineError::BindingFailed(
-                "add expects two numbers".into(),
-            )),
+        let add_fn: NativeFn = Box::new(|args: &[JsValue], _ctx: &NativeCallContext| {
+            match (args.first(), args.get(1)) {
+                (Some(JsValue::Number(a)), Some(JsValue::Number(b))) => Ok(JsValue::Number(a + b)),
+                _ => Err(JsEngineError::BindingFailed(
+                    "add expects two numbers".into(),
+                )),
+            }
         });
         engine
             .inject_global_function("add", add_fn)
@@ -404,8 +406,9 @@ mod conformance_checks {
         // ネイティブ関数側のエラーが評価結果へ伝播すること。具体バリアントは
         // エンジン実装依存の余地があるため、ここでは「成功値を返さない」
         // （is_err）ことのみを確認する。
-        let failing_fn: NativeFn =
-            Box::new(|_args: &[JsValue]| Err(JsEngineError::BindingFailed("always fails".into())));
+        let failing_fn: NativeFn = Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| {
+            Err(JsEngineError::BindingFailed("always fails".into()))
+        });
         engine
             .inject_global_function("alwaysFails", failing_fn)
             .unwrap_or_else(|err| panic!("[{kind:?}] injecting alwaysFails failed: {err}"));
@@ -425,30 +428,36 @@ mod conformance_checks {
 
         let set_text_fn: NativeFn = {
             let store = Rc::clone(&store);
-            Box::new(move |args: &[JsValue]| match (args.first(), args.get(1)) {
-                (Some(JsValue::String(id)), Some(JsValue::String(text))) => {
-                    store.borrow_mut().insert(id.clone(), text.clone());
-                    Ok(JsValue::Undefined)
+            Box::new(move |args: &[JsValue], _ctx: &NativeCallContext| {
+                match (args.first(), args.get(1)) {
+                    (Some(JsValue::String(id)), Some(JsValue::String(text))) => {
+                        store.borrow_mut().insert(id.clone(), text.clone());
+                        Ok(JsValue::Undefined)
+                    }
+                    _ => Err(JsEngineError::BindingFailed(
+                        "setText expects (id, text) strings".into(),
+                    )),
                 }
-                _ => Err(JsEngineError::BindingFailed(
-                    "setText expects (id, text) strings".into(),
-                )),
             })
         };
         let get_text_fn: NativeFn = {
             let store = Rc::clone(&store);
-            Box::new(move |args: &[JsValue]| match args.first() {
-                Some(JsValue::String(id)) => Ok(JsValue::String(
-                    store.borrow().get(id).cloned().unwrap_or_default(),
-                )),
-                _ => Err(JsEngineError::BindingFailed(
-                    "getText expects an id string".into(),
-                )),
-            })
+            Box::new(
+                move |args: &[JsValue], _ctx: &NativeCallContext| match args.first() {
+                    Some(JsValue::String(id)) => Ok(JsValue::String(
+                        store.borrow().get(id).cloned().unwrap_or_default(),
+                    )),
+                    _ => Err(JsEngineError::BindingFailed(
+                        "getText expects an id string".into(),
+                    )),
+                },
+            )
         };
         let count_fn: NativeFn = {
             let store = Rc::clone(&store);
-            Box::new(move |_args: &[JsValue]| Ok(JsValue::Number(store.borrow().len() as f64)))
+            Box::new(move |_args: &[JsValue], _ctx: &NativeCallContext| {
+                Ok(JsValue::Number(store.borrow().len() as f64))
+            })
         };
 
         engine

@@ -65,10 +65,14 @@
 //!
 //! `NativeFn` の実行時間は、評価開始時に 1 度だけ計算する期限
 //! （[`EVALUATE_RECV_TIMEOUT`]）に含まれる（受け入れ条件: `NativeFn` が
-//! 実行に長くかかるほど、全体の評価がその期限に近づく）。親は
-//! `NativeFn` の呼び出し中は他に何もできない（同期実行。`NativeFn` は
-//! `Send` ではないため別スレッドへ移せない）ため、期限の確認ができるのは
-//! `NativeFn` から戻った直後だけである。戻った時点で既に期限を過ぎていれば、
+//! 実行に長くかかるほど、全体の評価がその期限に近づく）。この期限は
+//! [`super::engine_trait::NativeCallContext`] 経由で `NativeFn` 自身にも
+//! 渡す（codex レビュー指摘「`NativeFn` が戻らない場合に評価期限が機能
+//! しない」対応。`NativeFn` が協調的に自身の処理を打ち切れるようにする
+//! ためであり、強制する手段ではない）。親は `NativeFn` の呼び出し中は
+//! 他に何もできない（同期実行。`NativeFn` は `Send` ではないため別
+//! スレッドへ移せない）ため、期限の確認ができるのは `NativeFn` から
+//! 戻った直後だけである。戻った時点で既に期限を過ぎていれば、
 //! `NATIVE_RETURN` を送らずに子を `kill` し `JsEngineError::Timeout` を返す
 //! （`NativeFn` の実行が 2 秒（[`super::v8_engine::SCRIPT_EXECUTION_TIMEOUT`]）
 //! 以上 3 秒（[`EVALUATE_RECV_TIMEOUT`]）未満であれば、返信を受けた子の
@@ -77,9 +81,14 @@
 //!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
-//! - 親は実行中の [`NativeFn`] を中断できない（呼び出しスレッド上で同期
-//!   実行するため。`NativeFn` が戻らなければ `evaluate_script` も戻らない。
-//!   `TASK-29`・Issue #526）
+//! - 親は実行中の [`NativeFn`] を強制的に中断する手段を持たない（呼び出し
+//!   スレッド上で同期実行するため。`NativeFn` が `Send` ではなく、V8 の
+//!   `Isolate`/`HandleScope` がスレッド固有であるため別スレッドへ移せない。
+//!   `unsafe` で `Send` 境界を回避する対応はユーザー承認（`unsafe` の
+//!   新規追加）を要する設計判断であり本 Issue の範囲では行わない）。
+//!   `NativeCallContext` で評価期限を伝えるのは協調的な手段に留まり、
+//!   `NativeFn` がこれを無視して戻らなければ `evaluate_script` も戻らない
+//!   （`TASK-29`・Issue #526）
 //! - release ビルドは `panic = "abort"` のため、[`NativeFn`] が panic すると
 //!   ホストプロセスごと終了する。`catch_unwind` は使わない（release では
 //!   機能しない前提のため）。panic させないのは `NativeFn` を実装する
@@ -128,7 +137,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::engine_trait::{EngineKind, EvaluateOptions, JsEngineError, JsValue, NativeFn};
+use super::engine_trait::{
+    EngineKind, EvaluateOptions, JsEngineError, JsValue, NativeCallContext, NativeFn,
+};
 use super::worker_protocol::{self, ErrorKind, NativeReturn, tag};
 
 /// ハンドシェイク（`Hello` フレームの受信）を待つ上限時間（設計書
@@ -1564,20 +1575,21 @@ impl V8ProcessEngine {
                     // `NativeFn` を実行し、結果を `NATIVE_RETURN` として
                     // 返信してから次のフレームを待つ（一問一答。
                     // `worker::StdioTransport::call` の契約と対になる）。
-                    let native_return_payload = match dispatch_native_call(native_fns, &payload) {
-                        Ok(bytes) => bytes,
-                        Err(violation) => {
-                            worker.terminate_now();
-                            let tail = worker.reap_and_collect_stderr();
-                            let err = discard_context_error(worker, &tail, || {
-                                JsEngineError::EngineUnavailable(format!(
-                                    "JS worker process sent an invalid NativeCall frame \
+                    let native_return_payload =
+                        match dispatch_native_call(native_fns, &payload, deadline) {
+                            Ok(bytes) => bytes,
+                            Err(violation) => {
+                                worker.terminate_now();
+                                let tail = worker.reap_and_collect_stderr();
+                                let err = discard_context_error(worker, &tail, || {
+                                    JsEngineError::EngineUnavailable(format!(
+                                        "JS worker process sent an invalid NativeCall frame \
                                      ({violation}); stderr: {tail}"
-                                ))
-                            });
-                            return (Err(err), false);
-                        }
-                    };
+                                    ))
+                                });
+                                return (Err(err), false);
+                            }
+                        };
                     // 受け入れ条件 2: `NativeFn` の実行時間もこの評価全体の
                     // 期限に含める。`NativeFn` から戻った直後、期限を
                     // 過ぎていれば `NATIVE_RETURN` を送らずに kill する
@@ -1838,9 +1850,14 @@ impl std::fmt::Display for NativeDispatchViolation {
 /// 2. `id` に対応する `native_fns` の要素を [`<[_]>::get_mut`] で取る
 ///    （添字アクセスは使わない。coding-rust.md「外部入力」節）。無ければ
 ///    [`NativeDispatchViolation::UnknownId`] を返す
-/// 3. `NativeFn` を実行する。`Ok(v)` なら [`NativeReturn::Ok`]、`Err(e)` なら
-///    [`NativeReturn::Err`]（`e` は [`JsEngineError`]。メッセージを
-///    [`worker_protocol::truncate_for_wire`] で
+/// 3. `NativeFn` を実行する。呼び出し元（`send_evaluate_and_await`）が
+///    評価開始時に計算した `deadline` を [`NativeCallContext`] に載せて
+///    渡す（`TASK-29`・Issue #526・codex レビュー指摘「`NativeFn` が戻ら
+///    ない場合に評価期限が機能しない」対応。`NativeFn` が協調的に期限を
+///    確認できるようにするための引数であり、下記「既知の制限」が示す
+///    とおり強制する手段ではない）。`Ok(v)` なら [`NativeReturn::Ok`]、
+///    `Err(e)` なら [`NativeReturn::Err`]（`e` は [`JsEngineError`]。
+///    メッセージを [`worker_protocol::truncate_for_wire`] で
 ///    [`worker_protocol::MAX_ERROR_MESSAGE_BYTES`] 以内へ切り詰めてから
 ///    送る。子側の `decode_native_return` は上限超過の `Err` を fatal として
 ///    拒否するため、送信前に切り詰める必要がある）
@@ -1850,9 +1867,15 @@ impl std::fmt::Display for NativeDispatchViolation {
 /// # 既知の制限（実装済みを装わない。REPAIR-3）
 ///
 /// - `NativeFn` の実行は呼び出しスレッド上で同期的に行う。中断する手段は
-///   無く、`NativeFn` が戻らなければ本関数も戻らない（呼び出し元
-///   `send_evaluate_and_await` が評価全体の期限切れを確認できるのは、
-///   本関数から戻った**後**だけである）
+///   無い（`NativeFn` が `Send` ではなく、V8 の `Isolate`/`HandleScope` が
+///   スレッド固有であるため別スレッドへ移せない。`unsafe` で `Send` 境界
+///   を回避する・トレイトへ `Send` を付ける対応は、どちらもユーザー承認
+///   （`unsafe` の新規追加・破壊的 API 変更）を要する設計判断であり本
+///   Issue の範囲では行わない）。呼び出し元へ協調的な期限を伝える
+///   [`NativeCallContext`] を渡すが、`NativeFn` がこれを無視して戻らな
+///   ければ本関数も戻らない（呼び出し元 `send_evaluate_and_await` が
+///   評価全体の期限切れを確認できるのは、本関数から戻った**後**だけで
+///   ある）
 /// - release ビルドは `panic = "abort"` のため、`NativeFn` が panic すると
 ///   ホストプロセスごと終了する。`catch_unwind` は使わない（release では
 ///   機能しない前提のため）。panic させないのは `NativeFn` を実装する
@@ -1863,6 +1886,7 @@ impl std::fmt::Display for NativeDispatchViolation {
 fn dispatch_native_call(
     native_fns: &mut [NativeFn],
     payload: &[u8],
+    deadline: Instant,
 ) -> Result<Vec<u8>, NativeDispatchViolation> {
     let (id, args) = worker_protocol::decode_native_call(payload)
         .map_err(NativeDispatchViolation::DecodeFailed)?;
@@ -1874,7 +1898,7 @@ fn dispatch_native_call(
     let Some(native_fn) = native_fns.get_mut(idx) else {
         return Err(NativeDispatchViolation::UnknownId { id });
     };
-    let native_return = match native_fn(&args) {
+    let native_return = match native_fn(&args, &NativeCallContext { deadline }) {
         Ok(value) => NativeReturn::Ok(value),
         Err(err) => NativeReturn::Err(worker_protocol::truncate_for_wire(&err.to_string())),
     };
@@ -1884,18 +1908,25 @@ fn dispatch_native_call(
 /// [`dispatch_native_call`] が組み立てた [`NativeReturn`] を、送信可能な
 /// バイト列へ符号化する（`TASK-29`・Issue #526）。
 ///
-/// 符号化に失敗した場合、または結果が
-/// [`worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`] を超える場合は、
-/// 黙って切り詰めず、必ず上限内に収まる固定文言の [`NativeReturn::Err`] へ
-/// 差し替えてから符号化し直す（上限超過を明示するエラーにする。
-/// security.md「偽装・回避機能の禁止」）。フォールバック自体の符号化が
-/// 失敗することは実質無いが、`unwrap`/`expect` は使わず空の `Vec`
-/// （子側は `Truncated` として拒否し、既存の経路でプロトコル違反として
-/// 扱われる）にフォールバックする。
+/// [`worker_protocol::encoded_native_return_len`] で、実際に符号化する
+/// **前**に符号化後の長さを計算し、
+/// [`worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`] 以内であることを
+/// 確認してから [`worker_protocol::encode_native_return`] を呼ぶ（coding-rust.md
+/// 「長さ・件数を上限検証してからアロケーションに使う」。大きな
+/// `JsValue::String` を返す `NativeFn` であっても、上限超過が判明した
+/// 時点では実際の値の確保・複製を伴う符号化をまだ行っていない。codex
+/// レビュー指摘「`NativeReturn` のサイズを確保前に検証する」対応）。
+/// 長さ計算に失敗した場合（`String` 長が `u32` に収まらない等）、または
+/// 上限を超える場合は、黙って切り詰めず、必ず上限内に収まる固定文言の
+/// [`NativeReturn::Err`] へ差し替えてから符号化する（上限超過を明示する
+/// エラーにする。security.md「偽装・回避機能の禁止」）。フォールバック
+/// 自体の符号化が失敗することは実質無いが、`unwrap`/`expect` は使わず
+/// 空の `Vec`（子側は `Truncated` として拒否し、既存の経路でプロトコル
+/// 違反として扱われる）にフォールバックする。
 fn encode_bounded_native_return(value: &NativeReturn) -> Vec<u8> {
-    if let Ok(bytes) = worker_protocol::encode_native_return(value)
-        && bytes.len() <= worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD
-    {
+    let fits_within_limit = worker_protocol::encoded_native_return_len(value)
+        .is_ok_and(|len| len <= worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD);
+    if fits_within_limit && let Ok(bytes) = worker_protocol::encode_native_return(value) {
         return bytes;
     }
     let fallback = NativeReturn::Err(format!(
@@ -2163,18 +2194,24 @@ mod tests {
         let seen_args: std::rc::Rc<std::cell::RefCell<Vec<JsValue>>> =
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let seen_args_for_closure = std::rc::Rc::clone(&seen_args);
-        let mut native_fns: Vec<NativeFn> = vec![Box::new(move |args: &[JsValue]| {
-            *seen_args_for_closure.borrow_mut() = args.to_vec();
-            Ok(JsValue::Number(42.0))
-        })];
+        let mut native_fns: Vec<NativeFn> = vec![Box::new(
+            move |args: &[JsValue], _ctx: &NativeCallContext| {
+                *seen_args_for_closure.borrow_mut() = args.to_vec();
+                Ok(JsValue::Number(42.0))
+            },
+        )];
 
         let payload = worker_protocol::encode_native_call(
             0,
             &[JsValue::Number(1.0), JsValue::String("a".to_string())],
         )
         .expect("encode must succeed");
-        let result_payload =
-            dispatch_native_call(&mut native_fns, &payload).expect("dispatch must succeed");
+        let result_payload = dispatch_native_call(
+            &mut native_fns,
+            &payload,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("dispatch must succeed");
 
         assert_eq!(
             worker_protocol::decode_native_return(&result_payload).expect("decode must succeed"),
@@ -2183,6 +2220,34 @@ mod tests {
         assert_eq!(
             *seen_args.borrow(),
             vec![JsValue::Number(1.0), JsValue::String("a".to_string())]
+        );
+    }
+
+    /// `TASK-29`・Issue #526・codex レビュー指摘「`NativeFn` が戻らない
+    /// 場合に評価期限が機能しない」対応: `dispatch_native_call` に渡した
+    /// `deadline` が、そのまま [`NativeCallContext::deadline`] として
+    /// `NativeFn` へ届くこと（`NativeFn` が協調的に期限を確認するための
+    /// 契約が実際に機能していることの回帰確認）。
+    #[test]
+    fn js_1_dispatch_native_call_passes_the_deadline_via_native_call_context() {
+        let seen_deadline: std::rc::Rc<std::cell::Cell<Option<Instant>>> =
+            std::rc::Rc::new(std::cell::Cell::new(None));
+        let seen_deadline_for_closure = std::rc::Rc::clone(&seen_deadline);
+        let mut native_fns: Vec<NativeFn> = vec![Box::new(
+            move |_args: &[JsValue], ctx: &NativeCallContext| {
+                seen_deadline_for_closure.set(Some(ctx.deadline));
+                Ok(JsValue::Undefined)
+            },
+        )];
+        let payload = worker_protocol::encode_native_call(0, &[]).expect("encode must succeed");
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        dispatch_native_call(&mut native_fns, &payload, deadline).expect("dispatch must succeed");
+
+        assert_eq!(
+            seen_deadline.get(),
+            Some(deadline),
+            "the NativeFn must observe the exact deadline passed to dispatch_native_call"
         );
     }
 
@@ -2195,12 +2260,18 @@ mod tests {
         let long_message = "a".repeat(worker_protocol::MAX_ERROR_MESSAGE_BYTES + 100);
         let mut native_fns: Vec<NativeFn> = vec![Box::new({
             let long_message = long_message.clone();
-            move |_args: &[JsValue]| Err(JsEngineError::EvaluationFailed(long_message.clone()))
+            move |_args: &[JsValue], _ctx: &NativeCallContext| {
+                Err(JsEngineError::EvaluationFailed(long_message.clone()))
+            }
         })];
         let payload = worker_protocol::encode_native_call(0, &[]).expect("encode must succeed");
 
-        let result_payload =
-            dispatch_native_call(&mut native_fns, &payload).expect("dispatch must succeed");
+        let result_payload = dispatch_native_call(
+            &mut native_fns,
+            &payload,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("dispatch must succeed");
         match worker_protocol::decode_native_return(&result_payload).expect("decode must succeed") {
             NativeReturn::Err(message) => {
                 assert!(message.len() <= worker_protocol::MAX_ERROR_MESSAGE_BYTES);
@@ -2217,7 +2288,11 @@ mod tests {
         let mut native_fns: Vec<NativeFn> = Vec::new();
         let payload = worker_protocol::encode_native_call(7, &[]).expect("encode must succeed");
         assert!(matches!(
-            dispatch_native_call(&mut native_fns, &payload),
+            dispatch_native_call(
+                &mut native_fns,
+                &payload,
+                Instant::now() + Duration::from_secs(30)
+            ),
             Err(NativeDispatchViolation::UnknownId { id: 7 })
         ));
     }
@@ -2227,10 +2302,17 @@ mod tests {
     /// panic しないことの確認）。
     #[test]
     fn js_1_dispatch_native_call_rejects_truncated_payload() {
-        let mut native_fns: Vec<NativeFn> = vec![Box::new(|_: &[JsValue]| Ok(JsValue::Undefined))];
+        let mut native_fns: Vec<NativeFn> =
+            vec![Box::new(|_: &[JsValue], _ctx: &NativeCallContext| {
+                Ok(JsValue::Undefined)
+            })];
         let payload = [0u8, 1u8, 2u8]; // id・argc のどちらの u32 も揃わない
         assert!(matches!(
-            dispatch_native_call(&mut native_fns, &payload),
+            dispatch_native_call(
+                &mut native_fns,
+                &payload,
+                Instant::now() + Duration::from_secs(30)
+            ),
             Err(NativeDispatchViolation::DecodeFailed(_))
         ));
     }
@@ -2240,11 +2322,18 @@ mod tests {
     /// `TrailingBytes` 検証を通じて拒否される）。
     #[test]
     fn js_1_dispatch_native_call_rejects_payload_with_trailing_bytes() {
-        let mut native_fns: Vec<NativeFn> = vec![Box::new(|_: &[JsValue]| Ok(JsValue::Undefined))];
+        let mut native_fns: Vec<NativeFn> =
+            vec![Box::new(|_: &[JsValue], _ctx: &NativeCallContext| {
+                Ok(JsValue::Undefined)
+            })];
         let mut payload = worker_protocol::encode_native_call(0, &[]).expect("encode must succeed");
         payload.push(0xff);
         assert!(matches!(
-            dispatch_native_call(&mut native_fns, &payload),
+            dispatch_native_call(
+                &mut native_fns,
+                &payload,
+                Instant::now() + Duration::from_secs(30)
+            ),
             Err(NativeDispatchViolation::DecodeFailed(_))
         ));
     }

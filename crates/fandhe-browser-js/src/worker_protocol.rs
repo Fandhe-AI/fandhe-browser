@@ -799,6 +799,44 @@ pub(crate) enum NativeReturn {
     Err(String),
 }
 
+/// [`encode_native_return`] が `value` に対して実際に追記するバイト数を、
+/// 確保・追記の**前**に計算する（[`super::process_engine::encode_bounded_native_return`]
+/// が、上限超過を確保してから検出するのではなく、確保**前**に上限超過を
+/// 検出できるようにするための補助関数。[`encoded_js_value_len`] と同じ
+/// 考え方を `NativeReturn` に適用する。`JS-1`・`TASK-29`・Issue #526・
+/// codex レビュー指摘「`NativeReturn` のサイズを確保前に検証する」対応）。
+///
+/// 表現は [`encode_native_return`] のドキュメントコメントと一致させる
+/// （`u8 status` ＋ 本体）。`Ok` は `1（status バイト）+
+/// encoded_js_value_len(value)`、`Err` は `1（status バイト）+
+/// message.len()` を、どちらも `checked_add` で計算する
+/// （`NativeReturn::Err` の `String` は事前に
+/// [`truncate_for_wire`]（[`MAX_ERROR_MESSAGE_BYTES`] 以内）を通す前提の
+/// ため現実的にはオーバーフローしないが、外部入力由来のサイズ計算である
+/// ため `checked_add` を使う。coding-rust.md「外部入力」節）。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+pub(crate) fn encoded_native_return_len(value: &NativeReturn) -> Result<usize, ProtocolError> {
+    match value {
+        NativeReturn::Ok(value) => {
+            let value_len = encoded_js_value_len(value)?;
+            1usize
+                .checked_add(value_len)
+                .ok_or(ProtocolError::NativeCallPayloadTooLarge {
+                    size: usize::MAX,
+                    max: MAX_FRAME_PAYLOAD_PARENT_TO_CHILD,
+                })
+        }
+        NativeReturn::Err(message) => {
+            1usize
+                .checked_add(message.len())
+                .ok_or(ProtocolError::NativeCallPayloadTooLarge {
+                    size: usize::MAX,
+                    max: MAX_FRAME_PAYLOAD_PARENT_TO_CHILD,
+                })
+        }
+    }
+}
+
 /// [`NativeReturn`] のペイロードを組み立てる（親側で使う。`JS-1`・
 /// Issue #511）。
 ///
@@ -808,8 +846,10 @@ pub(crate) enum NativeReturn {
 /// 呼び出し元: `super::process_engine::dispatch_native_call`。送信前に
 /// [`super::worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`] 以内・
 /// エラーメッセージを [`MAX_ERROR_MESSAGE_BYTES`] 以内に収める責務は
-/// 呼び出し側が負う（本関数自体は上限を課さない。`dispatch_native_call`
-/// のドキュメントコメント参照）。
+/// 呼び出し側が負う（本関数自体は上限を課さない。呼び出し側は
+/// [`encoded_native_return_len`] で確保前に長さを検証してから本関数を
+/// 呼ぶ。`dispatch_native_call`・`encode_bounded_native_return` の
+/// ドキュメントコメント参照）。
 #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn encode_native_return(value: &NativeReturn) -> Result<Vec<u8>, ProtocolError> {
     let mut out = Vec::new();
@@ -1300,6 +1340,38 @@ mod tests {
         let err = NativeReturn::Err("エラーが発生しました".to_string());
         let encoded = encode_native_return(&err).expect("encode must succeed");
         assert_eq!(decode_native_return(&encoded).expect("decode"), err);
+    }
+
+    /// `TASK-29`・Issue #526・codex レビュー指摘「`NativeReturn` のサイズを
+    /// 確保前に検証する」対応: [`encoded_native_return_len`] が
+    /// [`encode_native_return`] の実際の出力長と一致すること（`Ok`・`Err`
+    /// の両方）。呼び出し元（`super::process_engine::encode_bounded_native_return`）
+    /// は、この一致を前提に「符号化する前に上限超過を判定できる」ため、
+    /// 2 つの計算が乖離しないことを回帰確認する。
+    #[test]
+    fn js_1_encoded_native_return_len_matches_encode_native_return_for_ok_and_err() {
+        let cases = vec![
+            NativeReturn::Ok(JsValue::Undefined),
+            NativeReturn::Ok(JsValue::Null),
+            NativeReturn::Ok(JsValue::Bool(true)),
+            NativeReturn::Ok(JsValue::Number(42.0)),
+            NativeReturn::Ok(JsValue::String("結果".to_string())),
+            NativeReturn::Err(String::new()),
+            NativeReturn::Err("エラーが発生しました".to_string()),
+        ];
+        for case in cases {
+            let expected_len = encode_native_return(&case)
+                .unwrap_or_else(|err| panic!("encode must succeed for {case:?}: {err}"))
+                .len();
+            let computed_len = encoded_native_return_len(&case).unwrap_or_else(|err| {
+                panic!("length computation must succeed for {case:?}: {err}")
+            });
+            assert_eq!(
+                computed_len, expected_len,
+                "encoded_native_return_len must match encode_native_return's actual output \
+                 length for {case:?}"
+            );
+        }
     }
 
     /// JS-1・Issue #511: `decode_native_return` の拒否ケース（未知の

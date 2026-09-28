@@ -28,7 +28,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use fandhe_browser_js::process_engine::{V8ProcessEngine, WorkerSpawnConfigForTest};
-use fandhe_browser_js::{EvaluateOptions, JsEngineError, JsValue, NativeFn};
+use fandhe_browser_js::{EvaluateOptions, JsEngineError, JsValue, NativeCallContext, NativeFn};
 
 /// `super::v8_engine::SCRIPT_EXECUTION_TIMEOUT`（子の watchdog。`pub(crate)`
 /// で本クレート外からは参照できない）の値を、本結合テストの目的
@@ -972,7 +972,7 @@ fn engine_with_one_native_fn_for_test(
 fn js_1_native_call_round_trip_returns_value_and_records_args() {
     let seen_args: Rc<RefCell<Vec<JsValue>>> = Rc::new(RefCell::new(Vec::new()));
     let seen_args_for_closure = Rc::clone(&seen_args);
-    let native_fn: NativeFn = Box::new(move |args: &[JsValue]| {
+    let native_fn: NativeFn = Box::new(move |args: &[JsValue], _ctx: &NativeCallContext| {
         *seen_args_for_closure.borrow_mut() = args.to_vec();
         Ok(JsValue::Number(42.0))
     });
@@ -1004,8 +1004,9 @@ fn js_1_native_call_round_trip_returns_value_and_records_args() {
 /// `try`/`catch` で捕捉でき、メッセージが一致し、続く評価で Context
 /// （グローバル変数）が残っていること。
 fn js_1_native_call_err_is_catchable_and_context_survives() {
-    let native_fn: NativeFn =
-        Box::new(|_args: &[JsValue]| Err(JsEngineError::EvaluationFailed("boom".to_string())));
+    let native_fn: NativeFn = Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| {
+        Err(JsEngineError::EvaluationFailed("boom".to_string()))
+    });
     let (mut engine, id) = engine_with_one_native_fn_for_test(
         native_fn,
         WorkerSpawnConfigForTest {
@@ -1049,7 +1050,7 @@ fn js_1_native_call_err_is_catchable_and_context_survives() {
 /// 短く）ブロックさせ、`Ok` ではなく子の watchdog 由来の `Timeout` になる
 /// こと、Context は残ることを確認する。
 fn js_1_native_call_duration_is_included_in_the_watchdog_timeout() {
-    let native_fn: NativeFn = Box::new(|_args: &[JsValue]| {
+    let native_fn: NativeFn = Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| {
         std::thread::sleep(CHILD_WATCHDOG_TIMEOUT + Duration::from_millis(300));
         Ok(JsValue::Number(1.0))
     });
@@ -1106,7 +1107,7 @@ fn js_1_native_call_duration_is_included_in_the_watchdog_timeout() {
 /// `Timeout`（"context was discarded" を含む）を返すこと。次の評価は
 /// 新しい子で成功すること（前の状態は消えている）。
 fn js_1_native_call_exceeding_evaluate_deadline_discards_context() {
-    let native_fn: NativeFn = Box::new(|_args: &[JsValue]| {
+    let native_fn: NativeFn = Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| {
         std::thread::sleep(PARENT_EVALUATE_DEADLINE + Duration::from_millis(300));
         Ok(JsValue::Number(1.0))
     });
