@@ -162,8 +162,12 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
-if ! METADATA=$(cargo metadata --no-deps --format-version 1 2>&1); then
-  echo "error: cargo metadata failed: $METADATA" >&2
+# cargo metadata の JSON は常に stdout のみへ出る（警告・診断は stderr）。
+# 2>&1 で混ぜると warning 行が JSON へ混入して jq のパースが壊れるため、
+# stdout だけを METADATA に取り込み、stderr はそのまま呼び出し元の端末 /
+# CI ログへ流す（cargo build 側の同種の修正と同じ方針。レビュー指摘対応）。
+if ! METADATA=$(cargo metadata --no-deps --format-version 1); then
+  echo "error: cargo metadata failed (see stderr above)" >&2
   exit 2
 fi
 
@@ -190,9 +194,17 @@ if [ "$BIN_COUNT" -eq 0 ]; then
   exit 2
 fi
 
-if ! BUILD_JSON=$(cargo build --release -p "$PACKAGE" --message-format=json-render-diagnostics 2>&1); then
-  echo "error: cargo build --release -p $PACKAGE failed:" >&2
-  echo "$BUILD_JSON" >&2
+# `--message-format=json-render-diagnostics` は rustc の診断表示形式を変えるだけで、
+# cargo 自身のステータス行（`   Compiling foo v0.1.0`・`    Finished release ...`）は
+# 依然プレーンテキストのまま stderr へ出る。2>&1 で BUILD_JSON に混ぜると、cold
+# build（Compiling 行が先に来る）で jq のパースが 1 行目から失敗して停止し、
+# `< <(...)` のプロセス置換がその非ゼロ終了を握り潰すため「実行ファイル 0 件」に
+# 化けて原因不明の誤検知になる（warm cache では Compiling 行が出ないか artifact 行
+# より前に来ないことがあるため偶然通ってしまう）。JSON は常に stdout のみへ出る
+# ため、stdout だけを BUILD_JSON に取り込み、stderr はそのまま呼び出し元の端末 /
+# CI ログへ流す（レビュー指摘対応）。
+if ! BUILD_JSON=$(cargo build --release -p "$PACKAGE" --message-format=json-render-diagnostics); then
+  echo "error: cargo build --release -p $PACKAGE failed (see stderr above)" >&2
   exit 2
 fi
 
