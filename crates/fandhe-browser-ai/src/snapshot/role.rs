@@ -56,7 +56,6 @@
 //! `roleOf`（PoC-4）は `label` 要素を一律 `"text"` としているが、本実装は
 //! HTML-AAM に従い、`label` は対応表に無いため `generic`（Fallback）になる。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use fandhe_browser_core::dom::{Document, NodeData, NodeId};
@@ -262,15 +261,16 @@ fn implicit_role_for_th(doc: &Document, id: NodeId) -> ComputedRole {
 /// （最初の一致で resolve する、というブラウザの一般的な `getElementById`
 /// 挙動に合わせる）。
 ///
-/// 参照先要素が「空でないテキストを持つか」の判定結果も、対象 [`NodeId`]
-/// ごとに `has_non_empty_text` フィールドで文書単位にキャッシュする
-/// （PR #566 レビュー指摘 P0。多数の `aria-labelledby` が同じ大きな要素を
-/// 参照する外部 HTML で、[`compute_role`] 呼び出しのたびに `doc.text_content`
-/// が対象の全子孫を再走査しテキスト全体を複製すると二乗規模のコストになる
-/// ため、判定結果だけを保持し文字列は複製しない）。`RefCell` は
-/// [`compute_role`] が `&IdIndex` としてのみ受け取る（可変参照を要求しない）
-/// 契約を保つために使う内部可変性で、単一スレッド上の逐次呼び出しのみを
-/// 想定する（`Send`/`Sync` は要求しない）。
+/// 参照先要素が「空でないテキストを持つか」の判定結果は、[`build_id_index`]
+/// が文書全体を 1 回だけ走査して全ノード分をあらかじめ求め、
+/// `has_non_empty_text` フィールドへ保持する（PR #566 レビュー指摘 P0。
+/// 対象ごとに `doc.text_content` 相当の子孫再走査を都度行う実装では、
+/// 入れ子の要素それぞれに `id` を振って別々の `aria-labelledby` から
+/// 参照する外部 HTML で、各階層の子孫走査が共有されず合計で二乗規模の
+/// 走査量になる。[`compute_has_non_empty_text_map`] が文書順の逆順走査で
+/// 子の判定結果から親の判定結果を定数時間で求めるため、対象ごとの再走査を
+/// せず文書全体を 1 回走査するだけで済む）。事前に一括計算するため
+/// `compute_role` へ `&IdIndex` のまま（可変参照を要求せず）渡せる。
 ///
 /// 可視性: [`build_id_index`] とあわせて `pub` にし、[`super::snapshot`]
 /// クレートルートから再エクスポートしている。DOM から `Snapshot` を構築する
@@ -282,57 +282,68 @@ fn implicit_role_for_th(doc: &Document, id: NodeId) -> ComputedRole {
 #[derive(Debug, Default)]
 pub struct IdIndex<'a> {
     by_id: HashMap<&'a str, NodeId>,
-    has_non_empty_text: RefCell<HashMap<NodeId, bool>>,
+    has_non_empty_text: HashMap<NodeId, bool>,
 }
 
-impl<'a> IdIndex<'a> {
-    /// `target` が空でないテキストを持つかどうかを返す。判定結果は `self`
-    /// にキャッシュされ、同じ `target` への 2 回目以降の呼び出しは
-    /// 再走査しない（[`IdIndex`] のドキュメントコメント参照）。
-    fn has_non_empty_text(&self, doc: &Document, target: NodeId) -> bool {
-        if let Some(&cached) = self.has_non_empty_text.borrow().get(&target) {
-            return cached;
-        }
-        let result = element_has_non_empty_text(doc, target);
-        self.has_non_empty_text.borrow_mut().insert(target, result);
-        result
+impl IdIndex<'_> {
+    /// `target` が空でないテキストを持つかどうかを返す。判定結果は
+    /// [`build_id_index`] が事前に計算済みで、本関数は参照するだけ
+    /// （[`IdIndex`] のドキュメントコメント参照）。索引構築後に追加・削除
+    /// されたノード ID（起こりえないが、範囲外 ID を渡された場合を含む）は
+    /// テキストを持たないとみなす。
+    fn has_non_empty_text(&self, target: NodeId) -> bool {
+        self.has_non_empty_text
+            .get(&target)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
-/// `id` の `textContent` 相当のテキストに、空白以外の文字が 1 つでも
-/// 含まれるかどうかを返す（[`Document::text_content`] と等価な判定だが、
-/// 判定に必要な最初の非空白文字が見つかった時点で走査を打ち切り、
-/// `String` へ複製しない。[`IdIndex::has_non_empty_text`] からのみ使う）。
+/// 文書内の全ノードについて「空でないテキストを持つか」を 1 回の走査で
+/// 求める（[`build_id_index`] から呼ばれる。[`IdIndex`] のドキュメント
+/// コメント参照）。
 ///
-/// 判定規則は [`Document::text_content`] と揃える: Text/Comment/
-/// ProcessingInstruction は自身のデータを、Element/DocumentFragment は
-/// 子孫の Text ノードのみを見る（[`Document::descendants`] を使い再帰しない）。
-fn element_has_non_empty_text(doc: &Document, id: NodeId) -> bool {
+/// [`Document::descendants`] が返す文書順（前順）の並びを逆順に処理する
+/// ことで、あるノードの子孫は必ずそのノードより先に結果が確定する
+/// （前順では子孫がノードの後に現れるため、逆順ではノードより前に来る）。
+/// これにより Element/DocumentFragment の判定を「直接の子の判定結果の
+/// 論理和」という定数時間の操作で済ませられ、対象ごとに子孫を再走査する
+/// 必要がない。判定規則は [`Document::text_content`] と揃える:
+/// Text/Comment/ProcessingInstruction は自身のデータを、Element/
+/// DocumentFragment は子孫の Text ノードの有無を見る。
+fn compute_has_non_empty_text_map(doc: &Document) -> HashMap<NodeId, bool> {
     let has_non_whitespace = |text: &str| text.chars().any(|c| !c.is_whitespace());
-    match doc.node_data(id) {
-        Some(NodeData::Text { contents } | NodeData::Comment { contents }) => {
-            has_non_whitespace(contents)
-        }
-        Some(NodeData::ProcessingInstruction { data, .. }) => has_non_whitespace(data),
-        Some(NodeData::Element { .. } | NodeData::DocumentFragment) => {
-            doc.descendants(id).any(|descendant| {
-                matches!(
-                    doc.node_data(descendant),
-                    Some(NodeData::Text { contents }) if has_non_whitespace(contents)
-                )
-            })
-        }
-        // `NodeData` は `#[non_exhaustive]`。Document/Doctype・範囲外 ID・
-        // 将来追加されるバリアントはいずれもテキストを持たないとみなす
-        // （[`Document::text_content`] が `None` を返す場合と同じ扱い）。
-        _ => false,
+    let root = doc.root();
+    let mut order = Vec::with_capacity(doc.node_count());
+    order.push(root);
+    order.extend(doc.descendants(root));
+
+    let mut result = HashMap::with_capacity(order.len());
+    for &node in order.iter().rev() {
+        let has_text = match doc.node_data(node) {
+            Some(NodeData::Text { contents } | NodeData::Comment { contents }) => {
+                has_non_whitespace(contents)
+            }
+            Some(NodeData::ProcessingInstruction { data, .. }) => has_non_whitespace(data),
+            Some(NodeData::Element { .. } | NodeData::DocumentFragment) => doc
+                .children(node)
+                .any(|child| result.get(&child).copied().unwrap_or(false)),
+            // `NodeData` は `#[non_exhaustive]`。Document/Doctype・
+            // 将来追加されるバリアントはいずれもテキストを持たないとみなす
+            // （[`Document::text_content`] が `None` を返す場合と同じ扱い）。
+            _ => false,
+        };
+        result.insert(node, has_text);
     }
+    result
 }
 
 /// [`IdIndex`] を構築する。[`Document`] は id 索引を持たないため、
 /// `doc.root()` から [`Document::descendants`] で全要素を 1 回だけ走査する
 /// （`node_count` で上限打ち切り済みのため無制限走査にはならない。
-/// security.md「不安全な設計」対策）。
+/// security.md「不安全な設計」対策）。あわせて [`compute_has_non_empty_text_map`]
+/// で全ノード分の「空でないテキストを持つか」も文書全体 1 回の走査で
+/// 求めておく（PR #566 レビュー指摘 P0。対象ごとの再走査を避ける）。
 ///
 /// 呼び出し元は文書 1 つにつき本関数を 1 回だけ呼び、返した [`IdIndex`] を
 /// [`compute_role`] の全呼び出しへ使い回すこと（[`IdIndex`] のドキュメント
@@ -346,7 +357,7 @@ pub fn build_id_index(doc: &Document) -> IdIndex<'_> {
     }
     IdIndex {
         by_id,
-        has_non_empty_text: RefCell::new(HashMap::new()),
+        has_non_empty_text: compute_has_non_empty_text_map(doc),
     }
 }
 
@@ -360,16 +371,17 @@ pub fn build_id_index(doc: &Document) -> IdIndex<'_> {
 /// 持ちえないため名前のヒントとして扱わない（PR #566 レビュー指摘 P1。
 /// 「参照先が存在する」だけでは `has_name_hint` を真にしない）。
 ///
-/// 参照先ごとの判定結果は [`IdIndex`] に文書単位でキャッシュされ、
-/// `doc.text_content` によるテキスト全体の複製は行わない（PR #566
-/// レビュー指摘 P0。[`IdIndex::has_non_empty_text`] 参照）。
+/// 参照先ごとの判定結果は [`IdIndex`] が [`build_id_index`] 時点で文書全体
+/// 1 回の走査から事前計算済みであり、`doc.text_content` によるテキスト
+/// 全体の複製や対象ごとの再走査は行わない（PR #566 レビュー指摘 P0。
+/// [`IdIndex::has_non_empty_text`] 参照）。
 fn labelledby_references_named_element(doc: &Document, id: NodeId, index: &IdIndex<'_>) -> bool {
     doc.attribute(id, "aria-labelledby").is_some_and(|value| {
         value.split_ascii_whitespace().any(|token| {
             index
                 .by_id
                 .get(token)
-                .is_some_and(|&target| index.has_non_empty_text(doc, target))
+                .is_some_and(|&target| index.has_non_empty_text(target))
         })
     })
 }
@@ -979,6 +991,63 @@ mod tests {
                 RoleSource::Implicit,
             );
         }
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘 P0）:
+    /// 「同じ参照先を多数の `aria-labelledby` が指す」場合だけでなく、
+    /// 「入れ子になった別々の要素それぞれに `id` を振り、それぞれを別の
+    /// `aria-labelledby` から参照する」場合でも短時間で完了することの
+    /// 回帰テスト。参照先ごとに `doc.descendants` で子孫を再走査する
+    /// 実装（[`IdIndex`] 導入前の旧実装）では、各階層の走査が共有されず
+    /// 合計で O(N²) になる（`query.rs` の
+    /// `core_1_descendant_backtracking_does_not_explode_with_deep_nesting`
+    /// と同じ手法でタイムボックスする）。
+    #[test]
+    fn aisnap_1_nested_distinct_labelledby_targets_do_not_explode_with_deep_nesting() {
+        const DEPTH: usize = 4_000;
+        // 深さ `DEPTH` の入れ子要素それぞれに一意な `id` を振り、最内周に
+        // だけ実テキストを 1 つ置く。各階層の要素を、外側に並べた別々の
+        // `img[aria-labelledby]` から参照することで、参照先ごとに子孫全体を
+        // 再走査する素朴な実装では階層が深いほど 1 回の走査が長くなり、
+        // 合計コストが O(N²) になる入力にする。
+        let mut html = String::with_capacity(DEPTH * 40);
+        for depth in 0..DEPTH {
+            html.push_str(&format!(r#"<div id="n{depth}">"#));
+        }
+        html.push_str("text");
+        for _ in 0..DEPTH {
+            html.push_str("</div>");
+        }
+        for depth in 0..DEPTH {
+            html.push_str(&format!(
+                r#"<img src="{depth}.png" alt="" aria-labelledby="n{depth}">"#
+            ));
+        }
+
+        let options = ParseOptions::default().with_max_nodes(usize::MAX);
+        let doc = parse_document(&html, &options)
+            .expect("深いネストでも成功する")
+            .document;
+        let root = doc.root();
+
+        let started = std::time::Instant::now();
+        let id_index = build_id_index(&doc);
+        let images = query_selector_all_str(&doc, root, "img").expect("セレクタは解釈できる");
+        assert_eq!(images.len(), DEPTH, "img 要素は DEPTH 個選択できる");
+        for image in images {
+            // 各 `img` の参照先（`n{depth}`）は最内周のテキストを子孫に持つ
+            // ため、いずれも名前ヒントありと判定され `img`（Implicit）になる。
+            assert_role(
+                compute_role(&doc, image, &id_index),
+                "img",
+                RoleSource::Implicit,
+            );
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "対象ごとの子孫再走査による O(N²) が疑われる（所要時間: {:?}）",
+            started.elapsed()
+        );
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: 参照先が
