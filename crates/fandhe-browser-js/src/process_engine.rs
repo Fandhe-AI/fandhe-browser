@@ -1176,6 +1176,12 @@ impl V8ProcessEngine {
                 }
             }
             Ok(ReaderEvent::Frame(other_tag, _)) => {
+                // `NATIVE_CALL`（tag 5）はハンドシェイク前には来ないはず
+                // （送信は子側の永続 Context が評価中に限られる。§3.1）。
+                // 親側の `NATIVE_CALL` dispatch 自体は別 Issue（#526）で
+                // 追加するが、ハンドシェイク段階で受け取った場合はそれでも
+                // プロトコル違反として fail-closed に kill する（本分岐は
+                // #526 完了後も変わらない）。
                 worker.terminate_now();
                 let tail = worker.reap_and_collect_stderr();
                 Err(handshake_discard_error(&worker, &tail, || {
@@ -1446,6 +1452,13 @@ impl V8ProcessEngine {
                 apply_post_response_rss_check(worker, outcome, keep)
             }
             Ok(ReaderEvent::Frame(other_tag, _)) => {
+                // JS-1・Issue #511: 子は `NATIVE_CALL`（tag 5）を送りうる
+                // （子側のプロキシ関数が呼ばれた場合）。親側の dispatch
+                // （`NativeFn` の実行・`NATIVE_RETURN` の返信）は別 Issue
+                // （#526）で追加する。それまでは `NATIVE_CALL` を含む
+                // あらゆる想定外のタグをプロトコル違反として扱い、
+                // fail-closed に子を kill する（本番の子は #155 完了まで
+                // プロキシを登録する手段が無いため、この分岐には到達しない）。
                 worker.terminate_now();
                 let tail = worker.reap_and_collect_stderr();
                 let err = discard_context_error(worker, &tail, || {
