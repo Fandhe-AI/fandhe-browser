@@ -234,6 +234,44 @@ class DecodePngGrayTest(unittest.TestCase):
             with self.assertRaises(ms.PngDecodeError):
                 ms.decode_png_gray(path)
 
+    def test_rejects_pixel_count_over_ssim_limit_before_decompression(self) -> None:
+        # RENDER-5 / codex・Bugbot 指摘（P0/Medium）: 画素数上限は IDAT の
+        # 展開・配列確保より前、IHDR の寸法だけで検証されなければならない。
+        # ここでは IDAT に検証を通過しないゴミバイト列を置き、それでも
+        # （zlib エラーではなく）画素数上限の `PngDecodeError` で弾かれる
+        # ことを確認する（=上限チェックが展開より先に効いている証拠）。
+        big_w, big_h = 3000, 3000  # 9,000,000 > MAX_SSIM_PIXELS (2560*1600)
+        ihdr = struct.pack(">IIBBBBB", big_w, big_h, 8, 2, 0, 0, 0)
+        data = (
+            cs.PNG_SIGNATURE
+            + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", b"not a valid zlib stream")
+            + _chunk(b"IEND", b"")
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.png"
+            path.write_bytes(data)
+            with self.assertRaises(ms.PngDecodeError) as ctx:
+                ms.decode_png_gray(path)
+            self.assertIn("exceeds", str(ctx.exception))
+
+    def test_rejects_corrupt_zlib_stream_without_crashing(self) -> None:
+        # RENDER-5 / Cursor Bugbot 指摘（High）: IDAT の CRC は正しいが zlib
+        # ストリームとして不正な場合、`zlib.error` が未処理のまま漏れず
+        # `PngDecodeError` に変換されることを確認する。
+        ihdr = struct.pack(">IIBBBBB", 4, 4, 8, 2, 0, 0, 0)
+        data = (
+            cs.PNG_SIGNATURE
+            + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", b"\x78\x9c" + b"\xff" * 16)
+            + _chunk(b"IEND", b"")
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.png"
+            path.write_bytes(data)
+            with self.assertRaises(ms.PngDecodeError):
+                ms.decode_png_gray(path)
+
     def test_rejects_decompression_bomb(self) -> None:
         # IHDR は巨大な寸法を宣言するが IDAT はごく小さい zlib ストリーム
         # （解凍爆弾の簡易再現）。展開後サイズ上限 `cs.MAX_PNG_RAW_BYTES` の
@@ -364,7 +402,7 @@ class MeasureSsimPairTest(unittest.TestCase):
             p2 = Path(tmp) / "b.png"
             p1.write_bytes(build_png(10, 10, rgb_pixel, color_type=2))
             p2.write_bytes(build_png(10, 12, rgb_pixel, color_type=2))
-            result = ms._measure_ssim_pair(p1, p2)
+            result = ms._measure_ssim_pair(p1, p2, {"width": 10, "height": 10})
             self.assertEqual(result["status"], "error")
             self.assertIsNone(result["value"])
             self.assertFalse(result["passed"])
@@ -379,9 +417,23 @@ class MeasureSsimPairTest(unittest.TestCase):
             with mock.patch.object(
                 ms, "decode_png_gray", return_value=(big_w, big_h, [0] * (big_w * big_h))
             ):
-                result = ms._measure_ssim_pair(p1, p2)
+                result = ms._measure_ssim_pair(p1, p2, {"width": big_w, "height": big_h})
             self.assertEqual(result["status"], "error")
             self.assertIn("exceeds", result["reason"])
+
+    def test_viewport_mismatch_is_error(self) -> None:
+        # RENDER-5 / Bugbot 指摘: 両 PNG の寸法が一致していても、宣言された
+        # viewport と食い違う場合は撮影条件不一致として error を返す。
+        with tempfile.TemporaryDirectory() as tmp:
+            p1 = Path(tmp) / "a.png"
+            p2 = Path(tmp) / "b.png"
+            p1.write_bytes(build_png(10, 10, rgb_pixel, color_type=2))
+            p2.write_bytes(build_png(10, 10, rgb_pixel, color_type=2))
+            result = ms._measure_ssim_pair(p1, p2, {"width": 20, "height": 20})
+            self.assertEqual(result["status"], "error")
+            self.assertIsNone(result["value"])
+            self.assertFalse(result["passed"])
+            self.assertIn("viewport", result["reason"])
 
     def test_measured_pass_and_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -389,7 +441,7 @@ class MeasureSsimPairTest(unittest.TestCase):
             same_b = Path(tmp) / "b.png"
             same_a.write_bytes(build_png(12, 12, rgb_pixel, color_type=2))
             same_b.write_bytes(build_png(12, 12, rgb_pixel, color_type=2))
-            passing = ms._measure_ssim_pair(same_a, same_b)
+            passing = ms._measure_ssim_pair(same_a, same_b, {"width": 12, "height": 12})
             self.assertEqual(passing["status"], "measured")
             self.assertTrue(passing["passed"])
 
@@ -400,7 +452,7 @@ class MeasureSsimPairTest(unittest.TestCase):
             noisy_b.write_bytes(
                 build_png(12, 12, lambda x, y: tuple(rng.randint(0, 255) for _ in range(3)), color_type=2)
             )
-            failing = ms._measure_ssim_pair(noisy_a, noisy_b)
+            failing = ms._measure_ssim_pair(noisy_a, noisy_b, {"width": 12, "height": 12})
             self.assertEqual(failing["status"], "measured")
             self.assertFalse(failing["passed"])
 
@@ -538,6 +590,16 @@ class LoadBboxesTest(unittest.TestCase):
                 self.skipTest("symlink creation is not permitted in this environment")
             with self.assertRaises(ms.BboxError):
                 ms.load_bboxes(link)
+
+    def test_rejects_invalid_utf8_without_crashing(self) -> None:
+        # Cursor Bugbot 指摘（Medium）: `UnicodeDecodeError` を `BboxError`
+        # へ変換せず素通りしていないことを確認する。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "chromium" / "site.bboxes.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"\xff\xfe\x00invalid-utf8")
+            with self.assertRaises(ms.BboxError):
+                ms.load_bboxes(path)
 
 
 class CompareBboxesTest(unittest.TestCase):
@@ -758,6 +820,15 @@ class LoadCaptureResultTest(unittest.TestCase):
             with self.assertRaises(ms.CaptureResultError):
                 ms.load_capture_result(capture_dir)
 
+    def test_rejects_invalid_utf8_without_crashing(self) -> None:
+        # Cursor Bugbot 指摘（Medium）: capture-result.json 側も同様に
+        # `UnicodeDecodeError` を `CaptureResultError` へ変換する。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            (capture_dir / "capture-result.json").write_bytes(b"\xff\xfe\x00invalid-utf8")
+            with self.assertRaises(ms.CaptureResultError):
+                ms.load_capture_result(capture_dir)
+
     def test_invalid_viewport_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             capture_dir = Path(tmp)
@@ -834,7 +905,10 @@ class MainIntegrationTest(unittest.TestCase):
         payload = {
             "schema_version": 1,
             "generated_at": "2026-01-01T00:00:00Z",
-            "viewport": {"width": 1280, "height": 800},
+            # `_make_site_pngs` が生成する PNG は 12x12（テスト高速化のため）。
+            # `_measure_ssim_pair` が PNG 寸法と viewport の一致を要求する
+            # ようになったため（Bugbot 指摘）、ここも実際の PNG 寸法に揃える。
+            "viewport": {"width": 12, "height": 12},
             "sites": [{"id": s, "url": f"https://example.invalid/{s}", "category": "static", "catalog_id": s} for s in site_ids],
             "captures": captures,
         }

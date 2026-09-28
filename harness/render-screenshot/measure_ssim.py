@@ -154,7 +154,11 @@ def load_capture_result(
         )
     try:
         text = result_path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # UTF-8 として不正なバイト列（`UnicodeDecodeError`）は `OSError` の
+        # サブクラスではなく素通りしていた（Bugbot 指摘）。壊れた
+        # capture-result.json も未処理例外で落とさず `CaptureResultError`
+        # として扱う（§2.6 の設計制約と同じ fail-closed 方針）。
         raise CaptureResultError(f"failed to read capture-result.json: {exc}") from exc
     try:
         payload = json.loads(text)
@@ -307,6 +311,16 @@ def _read_png_chunks(path: Path) -> tuple[int, int, int, int, bytes]:
             interlace = cdata[12]
             if width == 0 or height == 0:
                 raise PngDecodeError(f"PNG has zero width or height: {path}")
+            # IHDR の寸法だけで判明する画素数上限を、IDAT の展開・逆フィルタ用
+            # バッファ確保（`decoded = bytearray()`・`_unfilter_scanlines` の
+            # `out`/`decode_png_gray` の `gray` 等）より前に検証する。上限超過
+            # 画像を複数渡された場合に大きなメモリを確保してからプロセスが
+            # 終了する DoS を防ぐ（coding-rust.md「長さ・件数を上限検証してから
+            # アロケーションに使う」）。
+            if width * height > MAX_SSIM_PIXELS:
+                raise PngDecodeError(
+                    f"pixel count {width * height} exceeds the {MAX_SSIM_PIXELS} limit: {path}"
+                )
             if compression != 0:
                 raise PngDecodeError(f"unsupported PNG compression method: {path}")
             if filter_method != 0:
@@ -356,24 +370,30 @@ def _read_png_chunks(path: Path) -> tuple[int, int, int, int, bytes]:
 
     decompressor = zlib.decompressobj()
     decoded = bytearray()
-    for chunk in idat_chunks:
-        remaining = chunk
-        while remaining:
-            piece = decompressor.decompress(remaining, 65536)
+    try:
+        for chunk in idat_chunks:
+            remaining = chunk
+            while remaining:
+                piece = decompressor.decompress(remaining, 65536)
+                decoded += piece
+                if len(decoded) > expected_raw:
+                    raise PngDecodeError(f"IDAT decompresses larger than the IHDR-derived size: {path}")
+                remaining = decompressor.unconsumed_tail
+        while not decompressor.eof:
+            allowance = expected_raw - len(decoded) + 1
+            if allowance <= 0:
+                raise PngDecodeError(f"IDAT decompresses larger than the IHDR-derived size: {path}")
+            piece = decompressor.decompress(b"", allowance)
+            if not piece:
+                raise PngDecodeError(f"truncated compressed stream (unexpected end of IDAT): {path}")
             decoded += piece
             if len(decoded) > expected_raw:
                 raise PngDecodeError(f"IDAT decompresses larger than the IHDR-derived size: {path}")
-            remaining = decompressor.unconsumed_tail
-    while not decompressor.eof:
-        allowance = expected_raw - len(decoded) + 1
-        if allowance <= 0:
-            raise PngDecodeError(f"IDAT decompresses larger than the IHDR-derived size: {path}")
-        piece = decompressor.decompress(b"", allowance)
-        if not piece:
-            raise PngDecodeError(f"truncated compressed stream (unexpected end of IDAT): {path}")
-        decoded += piece
-        if len(decoded) > expected_raw:
-            raise PngDecodeError(f"IDAT decompresses larger than the IHDR-derived size: {path}")
+    except zlib.error as exc:
+        # 破損した IDAT（zlib ストリームとして不正）は `PngDecodeError` へ変換し、
+        # `_measure_ssim_pair` の `status: "error"` 経路へ乗せる（1 ファイルの
+        # 破損で実行全体が未処理例外で落ちないようにする。§2.6 の設計制約）。
+        raise PngDecodeError(f"corrupt PNG zlib stream: {path}: {exc}") from exc
     if len(decoded) != expected_raw:
         raise PngDecodeError(
             f"decompressed size mismatch (got {len(decoded)}, expected {expected_raw}): {path}"
@@ -563,12 +583,19 @@ def compute_ssim(w: int, h: int, a: list[int], b: list[int]) -> float:
     return total / count
 
 
-def _measure_ssim_pair(reference_png: Path, target_png: Path) -> dict[str, Any]:
+def _measure_ssim_pair(
+    reference_png: Path, target_png: Path, viewport: dict[str, int]
+) -> dict[str, Any]:
     """基準（Chromium）・対象（Servo）の PNG ペアから SSIM を算出する。
 
     寸法不一致・デコード失敗・SSIM 窓に満たない画像・画素数上限超過は
     例外を外へ漏らさず `status: "error"` として返す（1 サイトの異常で
     実行全体を止めないため。§2.6 の設計制約）。
+    `viewport` は `capture-result.json` が宣言した撮影時の viewport
+    （`load_capture_result` が検証済み）で、両 PNG の寸法一致だけでなく
+    撮影条件どおりの寸法かも照合する。撮影後に両 PNG が同じ誤った寸法へ
+    差し替わっていた場合、寸法一致のみのチェックでは検出できないため
+    （Bugbot 指摘）。
     """
     try:
         rw, rh, ref_gray = decode_png_gray(reference_png)
@@ -581,6 +608,17 @@ def _measure_ssim_pair(reference_png: Path, target_png: Path) -> dict[str, Any]:
             "value": None,
             "passed": False,
             "reason": f"dimension mismatch: {REFERENCE_ENGINE} {rw}x{rh} vs {TARGET_ENGINE} {tw}x{th}",
+        }
+    vw = viewport["width"]
+    vh = viewport["height"]
+    if (rw, rh) != (vw, vh):
+        return {
+            "status": "error",
+            "value": None,
+            "passed": False,
+            "reason": (
+                f"PNG dimensions {rw}x{rh} do not match the declared viewport {vw}x{vh}"
+            ),
         }
     if rw < SSIM_WINDOW or rh < SSIM_WINDOW:
         return {
@@ -629,7 +667,9 @@ def load_bboxes(path: Path) -> dict[str, dict[str, float]] | None:
         raise BboxError(f"bbox file exceeds the {MAX_BBOX_FILE_BYTES} byte limit: {path}")
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # capture-result.json の読み込みと同じ理由（Bugbot 指摘）で
+        # `UnicodeDecodeError` も明示的に `BboxError` へ変換する。
         raise BboxError(f"failed to read bbox file: {path}: {exc}") from exc
     try:
         payload = json.loads(text, parse_constant=_reject_non_finite_constant)
@@ -783,7 +823,7 @@ def measure_site(
     サイト合格は `ssim.passed and bbox.passed`（両方 `measured` かつ閾値以上）
     の場合のみで、`not_measured`・`error` は不合格として扱う（fail-closed）。
     """
-    ssim_result = _measure_ssim_pair(chromium_png, servo_png)
+    ssim_result = _measure_ssim_pair(chromium_png, servo_png, viewport)
 
     ref_bbox_path = capture_dir / REFERENCE_ENGINE / f"{site_id}.bboxes.json"
     tgt_bbox_path = capture_dir / TARGET_ENGINE / f"{site_id}.bboxes.json"
