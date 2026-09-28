@@ -67,14 +67,19 @@ mod worker;
 //
 // `pub` にする理由: `tests/v8_worker.rs`（`harness = false`。W6）は結合
 // テストであり、別クレートとしてコンパイルされるため `pub(crate)` の
-// 項目を参照できない。テスト専用の入口（`V8ProcessEngine`・
-// `new`/`new_for_test`/`evaluate_script`/`send_raw_frame_for_test`・
-// `WorkerSpawnConfigForTest`）だけを最小限 `pub` にする必要があり、
-// そのためにはモジュール自体も `pub` にする必要がある（`doc(hidden)` を
-// 併用し、公開 API ドキュメントには出さない）。`V8ProcessEngine` は
-// `Child`・パイプ・チャネルしか保持せず `v8` crate の型を一切参照しない
-// ため、coding-rust.md「V8 / boa の具象型を上位 crate へ漏らさない」には
-// 抵触しない。
+// 項目を参照できない。`V8ProcessEngine`・`new`・`evaluate_script` は
+// 本番ビルド（`test-support` feature 無効）でも `#[doc(hidden)] pub` の
+// まま残す（`TASK-29.6` で `create_engine` から配線するための本番 API の
+// 一部であり、テスト専用ではない）。一方、テスト専用の入口
+// （`new_for_test`・`send_raw_frame_for_test`・`worker_pid_for_test`・
+// `max_script_source_bytes_for_test`・`max_raw_frame_bytes_for_test`・
+// `WorkerSpawnConfigForTest`）は feature `test-support` が有効なときだけ
+// `pub` になり、無効時（本番ビルドを含む既定の `js-v8` ビルド）は crate
+// 外から名前を一切付けられない（Issue #528・TASK-29・`JS-1`。詳細は
+// `process_engine.rs` の各項目のドキュメントコメント参照）。
+// `V8ProcessEngine` は `Child`・パイプ・チャネルしか保持せず `v8` crate の
+// 型を一切参照しないため、coding-rust.md「V8 / boa の具象型を上位 crate
+// へ漏らさない」には抵触しない。
 #[cfg(feature = "js-v8")]
 #[doc(hidden)]
 pub mod process_engine;

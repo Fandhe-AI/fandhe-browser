@@ -65,8 +65,10 @@ use super::worker_protocol::{self, ErrorKind, ProtocolError, tag};
 /// を超える値を指定することで本番の上限を回避しようとする経路を防ぐため、
 /// [`super::v8_engine::clamp_test_heap_limit_bytes`] で読み取り直後に
 /// クランプする（codex レビュー指摘 #503 P0 対応。親側のクランプ
-/// （[`super::process_engine::WorkerSpawnConfigForTest::heap_limit_bytes`]）
-/// と合わせた多層防御であり、どちらか一方が壊れても上限は保たれる）。
+/// （`super::process_engine::WorkerSpawnConfigForTest::heap_limit_bytes`。
+/// feature `test-support`（Issue #528）有効時のみ存在するためリンクに
+/// できない）と合わせた多層防御であり、どちらか一方が壊れても上限は
+/// 保たれる）。
 pub(crate) const TEST_HEAP_LIMIT_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER_HEAP_LIMIT_BYTES";
 
 /// テスト専用: 子プロセスが送る `Hello` フレームのエンジン種別を

@@ -16,6 +16,11 @@
 //! フレーム専用であり、通常の libtest ハーネスが書く "running N tests"
 //! 等の文字列が混入すると親側のフレーム読み取りが壊れるため、
 //! `harness = false` にしている。
+//!
+//! `process_engine::V8ProcessEngine` のテスト専用入口（`new_for_test` 等）
+//! は feature `test-support` を有効にしたときだけ存在する（Issue #528・
+//! TASK-29・`JS-1`）。実行コマンド:
+//! `cargo test -p fandhe-browser-js --features test-support`。
 
 use std::process::ExitCode;
 
