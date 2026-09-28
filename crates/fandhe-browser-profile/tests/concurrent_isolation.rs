@@ -118,12 +118,12 @@ enum WorkerOutcome {
 fn validate_config(config: &HarnessConfig) {
     assert!(
         config.profiles >= MIN_CONCURRENCY,
-        "PROF-3 requires at least {MIN_CONCURRENCY} concurrent profiles, got {}",
+        "PROF-3 は並行プロファイル数を {MIN_CONCURRENCY} 以上要求する（got: {}）",
         config.profiles
     );
     assert!(
         config.writes_per_profile > 0,
-        "writes_per_profile must be greater than zero"
+        "writes_per_profile は 1 以上である必要がある"
     );
 }
 
@@ -150,9 +150,11 @@ fn validate_config(config: &HarnessConfig) {
 ///    行う。1 回の書き込みは
 ///    `create_file_in` → `set_len(0)`（過去の内容の残留を防ぐ。
 ///    `create_file_in` は `RDWR|CREATE` で開くため切り詰めない） →
-///    `seek(Start(0))` → `write_all` → `sync_data`（同期の失敗も書き込み
-///    失敗として扱う）の順に行う。失敗しても打ち切らず `write_errors` に
-///    記録し、件数を正確に数える。
+///    `seek(Start(0))` → `write_all` の順に行う。52.2 が読み戻すのは
+///    同一プロセス内（同じページキャッシュ）のため `sync_data` によるディスク
+///    同期は不要と判断し、行わない（3 OS CI・特に macOS での所要時間を
+///    抑えるため。#184 レビュー指摘）。失敗しても打ち切らず
+///    `write_errors` に記録し、件数を正確に数える。
 /// 4. 全ハンドルを `join()` する。パニックは伝播させず `Panicked` として記録
 ///    する。テストは dev/test プロファイル（unwind）でビルドされるため、
 ///    `[profile.release]` の `panic = "abort"` はここには効かない。スレッドの
@@ -264,7 +266,6 @@ fn write_once(profile: &Profile, kind: DataKind, payload: &[u8]) -> Result<(), S
     file.seek(SeekFrom::Start(0))
         .map_err(|err| err.to_string())?;
     file.write_all(payload).map_err(|err| err.to_string())?;
-    file.sync_data().map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -419,7 +420,7 @@ fn prof_3_harness_supports_more_than_minimum_concurrency() {
 /// 呼び出し元に判断を委ねるより安全側（より厳密な方）である `panic!` で
 /// 即座に打ち切る設計を選んだ。
 #[test]
-#[should_panic(expected = "PROF-3 requires at least 5 concurrent profiles")]
+#[should_panic(expected = "PROF-3 は並行プロファイル数を 5 以上要求する")]
 fn prof_3_harness_rejects_concurrency_below_minimum() {
     let tmp = TempDir::new();
     let config = HarnessConfig {
@@ -430,4 +431,73 @@ fn prof_3_harness_rejects_concurrency_below_minimum() {
     // 並行数の検証は書き込みより前に行われるため、実際にワーカーを走らせる
     // 前に panic する。
     let _ = run_concurrent_writes(tmp.path(), &config);
+}
+
+/// `PROF-3`・TASK-52（52.1）・#184: `Profile::open` に失敗したワーカーが
+/// `barrier.wait()` を経て `OpenFailed` を返し、他のワーカーを deadlock
+/// させずに `Completed` として完走させられること。§T2 のドキュメント
+/// コメントが「deadlock の最大の危険箇所」と明記する経路（open 失敗後の
+/// `barrier.wait()`）を実際に踏む。`profile-0` の root パスをあらかじめ
+/// 通常ファイルとして作っておくことで、`Profile::open` を
+/// `Err(ProfileError::InvalidLayout)` にする
+/// （`src/profile.rs` の `prof_1_open_fails_when_root_is_a_file` と同じ手法）。
+#[test]
+fn prof_3_harness_open_failure_does_not_deadlock_other_workers() {
+    let tmp = TempDir::new();
+    std::fs::create_dir_all(tmp.path()).expect("ベースディレクトリの作成");
+    let failing_root = tmp.path().join("profile-0");
+    std::fs::write(&failing_root, b"not a directory").expect("root 用ファイルの作成");
+
+    let config = HarnessConfig {
+        profiles: PROFILE_COUNT,
+        writes_per_profile: WRITES_PER_PROFILE,
+    };
+
+    // このテストが（タイムアウトせず）完走すること自体が、open 失敗した
+    // ワーカーが他のワーカーを deadlock させないことの証明になる。
+    let outcomes = run_concurrent_writes(tmp.path(), &config);
+
+    assert_eq!(outcomes.len(), PROFILE_COUNT, "outcome の件数が想定と違う");
+
+    for (expected_index, outcome) in outcomes.into_iter().enumerate() {
+        if expected_index == 0 {
+            match outcome {
+                WorkerOutcome::OpenFailed { index, error } => {
+                    assert_eq!(index, 0, "open 失敗ワーカーの index が想定と違う");
+                    assert!(!error.is_empty(), "エラーメッセージが空");
+                }
+                WorkerOutcome::Completed(report) => {
+                    panic!(
+                        "worker 0 は open 失敗するはずが Completed で返った（index={}）",
+                        report.index
+                    )
+                }
+                WorkerOutcome::Panicked { index, message } => {
+                    panic!("worker {index} が想定外に panic した: {message}")
+                }
+            }
+        } else {
+            match outcome {
+                WorkerOutcome::Completed(report) => {
+                    assert_eq!(report.index, expected_index);
+                    assert_eq!(report.writes_attempted, WRITES_PER_PROFILE);
+                    assert_eq!(
+                        report.writes_succeeded, WRITES_PER_PROFILE,
+                        "worker {expected_index}: writes_succeeded が想定と違う"
+                    );
+                    assert!(
+                        report.write_errors.is_empty(),
+                        "worker {expected_index}: write_errors が空でない: {:?}",
+                        report.write_errors
+                    );
+                }
+                WorkerOutcome::OpenFailed { index, error } => {
+                    panic!("worker {index} open failed: {error}")
+                }
+                WorkerOutcome::Panicked { index, message } => {
+                    panic!("worker {index} panicked: {message}")
+                }
+            }
+        }
+    }
 }
