@@ -213,6 +213,17 @@ pub(crate) enum ProtocolError {
     /// [`MAX_ERROR_MESSAGE_BYTES`] を超えていた（`JS-1`・Issue #511）。
     #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     ErrorMessageTooLong { len: usize, max: usize },
+    /// [`encode_native_call`] の引数列をエンコードした場合の合計サイズが
+    /// [`MAX_FRAME_PAYLOAD_CHILD_TO_PARENT`] を超える（`JS-1`・Issue #511・
+    /// codex レビュー指摘 #533 P0）。
+    ///
+    /// 引数の**件数**は [`MAX_NATIVE_CALL_ARGS`]（[`TooManyNativeCallArgs`]）
+    /// で別途検証済みだが、1 引数あたり最大 ~1 MiB の文字列を渡せるため、
+    /// 件数の検証だけでは合計バイト数の DoS を防げない。`encode_native_call`
+    /// は `out` へ追記する**前**に合計サイズを checked 演算で積算し、この
+    /// 上限を超えた時点で確保・追記を一切行わずに本エラーを返す。
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    NativeCallPayloadTooLarge { size: usize, max: usize },
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -254,6 +265,10 @@ impl std::fmt::Display for ProtocolError {
                 f,
                 "worker protocol NativeReturn error message of {len} bytes exceeds the \
                  {max}-byte limit"
+            ),
+            Self::NativeCallPayloadTooLarge { size, max } => write!(
+                f,
+                "worker protocol NativeCall payload of {size} bytes exceeds the {max}-byte limit"
             ),
         }
     }
@@ -628,6 +643,15 @@ pub(crate) fn decode_error(payload: &[u8]) -> Result<(ErrorKind, String), Protoc
 /// ことを親へ伝える際に使う。`args.len()` が [`MAX_NATIVE_CALL_ARGS`] を
 /// 超える場合は送信前に `Err` を返す（DoS 対策。確保前検証は呼び出し側の
 /// 責務ではなく、本関数自体が引数個数を検証してから追記する）。
+///
+/// 件数の検証に加え、`out` へ追記する**前**に各引数のエンコード後サイズを
+/// [`encoded_js_value_len`] で checked 演算により積算し、
+/// [`MAX_FRAME_PAYLOAD_CHILD_TO_PARENT`]（`NativeCall` は子 → 親フレーム）
+/// を超えた時点で確保・追記を一切行わずに `Err` を返す（codex レビュー
+/// 指摘 #533 P0「サイズ検証前に全件確保している」対応。呼び出し元
+/// （[`super::worker::StdioTransport::call`]）は本関数が返した `Vec` の
+/// 長さを送信直前に再確認するが、その時点ではすでに確保が終わっている
+/// ため、DoS 対策としては確保前の本検証が主たる防御線になる）。
 #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn encode_native_call(id: u32, args: &[JsValue]) -> Result<Vec<u8>, ProtocolError> {
     if args.len() > MAX_NATIVE_CALL_ARGS {
@@ -640,13 +664,65 @@ pub(crate) fn encode_native_call(id: u32, args: &[JsValue]) -> Result<Vec<u8>, P
         count: args.len(),
         max: MAX_NATIVE_CALL_ARGS,
     })?;
-    let mut out = Vec::new();
+
+    // `id`（4 バイト）＋ `argc`（4 バイト）のヘッダ分から積算を始め、
+    // 各引数のエンコード後サイズを `Vec::with_capacity` の前に確定させる。
+    let mut total_size: usize = 8;
+    for arg in args {
+        let encoded_len = encoded_js_value_len(arg)?;
+        total_size = total_size.checked_add(encoded_len).ok_or(
+            ProtocolError::NativeCallPayloadTooLarge {
+                size: usize::MAX,
+                max: MAX_FRAME_PAYLOAD_CHILD_TO_PARENT,
+            },
+        )?;
+        if total_size > MAX_FRAME_PAYLOAD_CHILD_TO_PARENT {
+            return Err(ProtocolError::NativeCallPayloadTooLarge {
+                size: total_size,
+                max: MAX_FRAME_PAYLOAD_CHILD_TO_PARENT,
+            });
+        }
+    }
+
+    let mut out = Vec::with_capacity(total_size);
     out.extend_from_slice(&id.to_le_bytes());
     out.extend_from_slice(&argc.to_le_bytes());
     for arg in args {
         encode_js_value(arg, &mut out)?;
     }
     Ok(out)
+}
+
+/// [`encode_js_value`] が `value` に対して実際に追記するバイト数を、
+/// 確保・追記の**前**に計算する（[`encode_native_call`] が合計サイズを
+/// 検証してから `Vec::with_capacity` するために使う補助関数。`JS-1`・
+/// Issue #511・codex レビュー指摘 #533）。
+///
+/// 表現は [`encode_js_value`] のドキュメントコメントと一致させる
+/// （`u8 tag` ＋ 種別ごとの値）。`String` の長さ検証（`u32` に収まるか）も
+/// [`encode_js_value`] と同じ基準で行う。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+fn encoded_js_value_len(value: &JsValue) -> Result<usize, ProtocolError> {
+    match value {
+        JsValue::Undefined | JsValue::Null => Ok(1),
+        JsValue::Bool(_) => Ok(2),
+        JsValue::Number(_) => Ok(9),
+        JsValue::String(s) => {
+            u32::try_from(s.len()).map_err(|_| {
+                ProtocolError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "worker protocol string value is too large to encode a u32 length",
+                ))
+            })?;
+            1usize
+                .checked_add(4)
+                .and_then(|n| n.checked_add(s.len()))
+                .ok_or(ProtocolError::NativeCallPayloadTooLarge {
+                    size: usize::MAX,
+                    max: MAX_FRAME_PAYLOAD_CHILD_TO_PARENT,
+                })
+        }
+    }
 }
 
 /// [`encode_native_call`] の逆変換（親側で使う。`JS-1`・Issue #511）。
@@ -1082,6 +1158,7 @@ mod tests {
             ProtocolError::TooManyNativeCallArgs { count: 10, max: 5 },
             ProtocolError::InvalidNativeReturnStatus(9),
             ProtocolError::ErrorMessageTooLong { len: 10, max: 5 },
+            ProtocolError::NativeCallPayloadTooLarge { size: 10, max: 5 },
         ];
         for err in errors {
             assert!(!err.to_string().is_empty());
@@ -1126,6 +1203,29 @@ mod tests {
             encode_native_call(1, &args),
             Err(ProtocolError::TooManyNativeCallArgs { .. })
         ));
+    }
+
+    /// codex レビュー指摘 #533 P0: 引数の件数は `MAX_NATIVE_CALL_ARGS`
+    /// 以内でも、合計サイズが `MAX_FRAME_PAYLOAD_CHILD_TO_PARENT` を
+    /// 超える場合は `encode_native_call` が確保前に `Err` を返すこと。
+    /// （1 引数あたり約 1 MiB の文字列を複数渡し、件数の上限には収まるが
+    /// 合計サイズの上限は超える状況を再現する。）
+    #[test]
+    fn js_1_encode_native_call_rejects_oversized_payload_before_building_output() {
+        // 1 MiB の文字列を 4 個（計 4 MiB）渡す。件数（4）は
+        // `MAX_NATIVE_CALL_ARGS`（64）以内だが、合計サイズは
+        // `MAX_FRAME_PAYLOAD_CHILD_TO_PARENT`（3 MiB + 64 KiB）を超える。
+        let one_mib_string = "a".repeat(1024 * 1024);
+        let args: Vec<JsValue> = (0..4)
+            .map(|_| JsValue::String(one_mib_string.clone()))
+            .collect();
+        match encode_native_call(1, &args) {
+            Err(ProtocolError::NativeCallPayloadTooLarge { size, max }) => {
+                assert!(size > MAX_FRAME_PAYLOAD_CHILD_TO_PARENT);
+                assert_eq!(max, MAX_FRAME_PAYLOAD_CHILD_TO_PARENT);
+            }
+            other => panic!("expected NativeCallPayloadTooLarge, got {other:?}"),
+        }
     }
 
     /// JS-1・Issue #511・OWASP A04: `argc` が `MAX_NATIVE_CALL_ARGS` を
