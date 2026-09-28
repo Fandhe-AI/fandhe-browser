@@ -65,8 +65,12 @@ use super::worker_protocol::{self, ErrorKind, NativeReturn, ProtocolError, tag};
 /// を超える値を指定することで本番の上限を回避しようとする経路を防ぐため、
 /// [`super::v8_engine::clamp_test_heap_limit_bytes`] で読み取り直後に
 /// クランプする（codex レビュー指摘 #503 P0 対応。親側のクランプ
-/// （[`super::process_engine::WorkerSpawnConfigForTest::heap_limit_bytes`]）
-/// と合わせた多層防御であり、どちらか一方が壊れても上限は保たれる）。
+/// （`super::process_engine::WorkerSpawnConfigForTest::heap_limit_bytes`。
+/// 型自体は feature `test-support` の有無に関わらず常に存在するが、
+/// `test-support` 無効時は非公開 `use` により process_engine モジュール外
+/// （本モジュールを含む他モジュール）から不可視になるためリンクにできない。
+/// Issue #528）と合わせた多層防御であり、どちらか一方が壊れても上限は
+/// 保たれる）。
 pub(crate) const TEST_HEAP_LIMIT_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER_HEAP_LIMIT_BYTES";
 
 /// テスト専用: 子プロセスが送る `Hello` フレームのエンジン種別を
