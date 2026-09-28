@@ -1055,6 +1055,31 @@ impl V8ProcessEngine {
         self.worker.as_ref().map(|worker| worker.pid)
     }
 
+    /// テスト専用: 子プロセスの「起動＋ハンドシェイク」だけを行い、
+    /// スクリプト評価は行わない（`TASK-29`・Issue #555・`CORE-3`・
+    /// `PERF-6`・`PERF-7`）。`crates/fandhe-browser-js/benches/
+    /// worker_spawn_latency.rs`（Issue #555）が、この呼び出し全体の
+    /// 所要時間を計測してレイテンシの実測に使う。
+    ///
+    /// 計測区間は `spawn_worker` 呼び出し（`Command::spawn` による
+    /// fork/exec・`env_clear`）から、子の Platform/Isolate 初期化・
+    /// 永続 Context 生成・`Hello` フレームの送信・親側での受信と
+    /// decode・検証完了までを含む（本ファイル内の `spawn_worker` の
+    /// ドキュメントコメント参照。private のため intra-doc link は張らない）。
+    ///
+    /// 既に子プロセスを保持している場合は二重起動せず何もしない
+    /// （[`Self::evaluate_script`] と同じ「子が無ければ起動する」遅延
+    /// 起動の作法に合わせる）。feature `test-support` 有効時のみ存在する
+    /// （Issue #528 と同じ隔離方針）。
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn spawn_worker_for_test(&mut self) -> Result<(), JsEngineError> {
+        if self.worker.is_none() {
+            self.worker = Some(self.spawn_worker()?);
+        }
+        Ok(())
+    }
+
     /// テスト専用: [`evaluate_script`](Self::evaluate_script) が事前検証
     /// に使うスクリプト長上限（バイト）を返す。codex レビュー指摘 #503
     /// P1「親は子より大きい入力を受け付ける」の回帰テストが、`tests/`
