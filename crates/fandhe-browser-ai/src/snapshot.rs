@@ -33,7 +33,7 @@
 
 pub mod name;
 pub mod state;
-pub use name::{AccessibleName, NameSource, compute_name};
+pub use name::{AccessibleName, NameIndex, NameSource, compute_name, compute_name_with_index};
 pub use state::{CheckedState, State, compute_state};
 
 /// 方式 B 簡約ツリーの 1 ノード（`AISNAP-1`・`TASK-11`・`MS-2`）。

@@ -16,8 +16,14 @@
 //! - `fieldset`→`legend`・`table`→`caption`・`figure`→`figcaption`・SVG の
 //!   `<title>`・`aria-describedby`: 担当 Issue 未確定（out-of-scope-tracking
 //!   に従いユーザー承認を得てから追跡する）
-//! - `id` 索引化による走査コスト削減・DOM から `Snapshot`/`Node` への
-//!   ツリー構築配線: TASK-11.7（Issue #76）
+//! - DOM から `Snapshot`/`Node` へのツリー構築配線: TASK-11.7（Issue #76）。
+//!   `id`/`label` の索引化自体は本ファイルが [`NameIndex`] として提供する
+//!   （PR #567 レビュー指摘: 要素ごとに文書全体を再走査すると計算量が
+//!   二乗になるため）。TASK-11.7 は文書ごとに [`NameIndex::build`] を
+//!   **1 回だけ**呼び、要素ごとには [`compute_name_with_index`] を使う
+//!   ことで、文書走査を索引構築の 1 回に抑える（[`compute_name`] は単発
+//!   呼び出し向けの簡易版で、内部で毎回 `NameIndex` を構築するため複数
+//!   要素へ連続して使うと同じ問題が再発する）。
 //!
 //! 本モジュールは #544（TASK-11.4.1）と同じ公開型の形（`AccessibleName`・
 //! `NameSource`・`NameBuffer` の構造）に揃えてある。両 Issue は同一ファイル
@@ -28,8 +34,9 @@
 //! 装わないため）。
 //!
 //! 呼び出し文脈: 現時点では呼び出し元がない。DOM から `Snapshot`/`Node` を
-//! 構築する TASK-11.7（Issue #76）が、ツリー構築時に要素ごとへ
-//! [`compute_name`] を呼ぶ想定である（実装済みを装わない。REPAIR-3）。
+//! 構築する TASK-11.7（Issue #76）が、文書ごとに [`NameIndex::build`] を
+//! 1 回呼んだうえで、ツリー構築時に要素ごとへ [`compute_name_with_index`]
+//! を呼ぶ想定である（実装済みを装わない。REPAIR-3）。
 //!
 //! # HTML-AAM による要素ごとの算出順序
 //!
@@ -59,6 +66,8 @@
 //! ラベル付け可能な要素が対象と同じ場合）で判定する。詳細は
 //! [`label_name`] を参照。
 
+use std::collections::HashMap;
+
 use fandhe_browser_core::dom::{Document, NodeData, NodeId};
 
 use super::state::is_html_element_named;
@@ -76,6 +85,12 @@ const MAX_NAME_CHARS: usize = 120;
 /// 外部入力の HTML に大量の `<label for="...">` を並べられても、文書走査を
 /// 定数個で打ち切るための上限（security.md「不安全な設計」対策）。超えた
 /// 分は切り捨て、`truncated` へ反映する（黙って捨てない）。
+///
+/// この上限は「名前に実際に寄与した（テキストが空でない）label の数」を
+/// 数える（PR #567 レビュー指摘の P1 修正: 空・空白だけの label が上限枠を
+/// 占めてしまうと、それより後にある名前入りの label が切り捨てられ、
+/// 結果として空の名前が確定して `title` 等の次点へ誤ってフォールバック
+/// する不具合があった。[`label_name`] を参照）。
 const MAX_LABELS: usize = 16;
 
 /// accessible name の出所（`AISNAP-1`）。
@@ -364,21 +379,14 @@ fn normalized_input_type(doc: &Document, id: NodeId) -> String {
         .unwrap_or_default()
 }
 
-/// `doc` 全体を文書順に走査し、`id_value` と `id` 属性が完全一致する
-/// （大文字小文字を区別する）**最初**の要素を返す（重複 `id` は先頭を
-/// 採用する HTML の規則）。
-fn first_element_with_id(doc: &Document, id_value: &str) -> Option<NodeId> {
-    doc.descendants(doc.root())
-        .find(|&candidate| doc.attribute(candidate, "id") == Some(id_value))
-}
-
 /// `label` の子孫のうち、文書順で最初のラベル付け可能な要素（[`is_labelable`]）
 /// を返す（label による包含の判定に使う）。
 fn first_labelable_descendant(doc: &Document, label: NodeId) -> Option<NodeId> {
     doc.descendants(label).find(|&id| is_labelable(doc, id))
 }
 
-/// `label` の子孫のテキストを `buf` へ集める（`AISNAP-1`）。
+/// `label` の子孫のテキストを収集し、`out` へ生のまま（HTML 空白の
+/// 折り畳み前）追記する（`AISNAP-1`）。
 ///
 /// `script`・`style`・`noscript`・`template` のサブツリーは除外する。
 /// `exclude`（関連付け先のコントロール自身）のサブツリーも除外する
@@ -387,11 +395,23 @@ fn first_labelable_descendant(doc: &Document, label: NodeId) -> Option<NodeId> {
 /// で上限することで、深いネスト・壊れたリンクがあっても必ず停止する
 /// （security.md「不安全な設計」対策）。
 ///
+/// 1 つの巨大な `Text` ノードだけで `out` が無制限に肥大化しないよう、
+/// [`RAW_LABEL_TEXT_BYTE_LIMIT`] で追記するバイト数も打ち切る（超えた分は
+/// 最終的に [`NameBuffer`] 側の [`MAX_NAME_CHARS`] でどのみち捨てられる
+/// ため、それ以上集める必要がない。PR #567 レビュー指摘）。
+///
+/// 呼び出し元（[`label_name`]）は、この生テキストを [`has_non_whitespace`]
+/// で「この label が名前に寄与するか」の判定に使ったうえで、寄与する場合
+/// のみ [`NameBuffer::push_str`] へ渡して空白を折り畳む。
+///
 /// #544 の `collect_text`（`aria-labelledby` の参照先向け）とは別名にする
 /// （役割が異なる: こちらは label→コントロールの関連付け専用）。将来
 /// 両者を統合できる余地があることを、後続タスク（#546）へ申し送る。
-fn collect_label_text(doc: &Document, label: NodeId, exclude: NodeId, buf: &mut NameBuffer) {
+fn collect_label_text(doc: &Document, label: NodeId, exclude: NodeId, out: &mut String) {
     const SKIPPED_SUBTREES: [&str; 4] = ["script", "style", "noscript", "template"];
+    // `MAX_NAME_CHARS` に収まらない分はどのみち捨てられるため、生テキスト
+    // はその数倍（マルチバイト文字・空白の折り畳みの余裕分）までしか集めない。
+    const RAW_LABEL_TEXT_BYTE_LIMIT: usize = MAX_NAME_CHARS * 4;
 
     let mut stack: Vec<NodeId> = doc.children(label).rev().collect();
     let mut remaining_steps = doc.node_count();
@@ -407,7 +427,22 @@ fn collect_label_text(doc: &Document, label: NodeId, exclude: NodeId, buf: &mut 
         }
 
         match doc.node_data(current) {
-            Some(NodeData::Text { contents }) => buf.push_str(contents),
+            Some(NodeData::Text { contents }) => {
+                if out.len() >= RAW_LABEL_TEXT_BYTE_LIMIT {
+                    continue;
+                }
+                let remaining = RAW_LABEL_TEXT_BYTE_LIMIT - out.len();
+                if contents.len() <= remaining {
+                    out.push_str(contents);
+                } else {
+                    // 上限に収まる範囲だけ、文字境界を壊さずに切り出す。
+                    let mut end = remaining.min(contents.len());
+                    while end > 0 && !contents.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    out.push_str(&contents[..end]);
+                }
+            }
             Some(NodeData::Element { .. }) => {
                 if SKIPPED_SUBTREES
                     .iter()
@@ -422,53 +457,100 @@ fn collect_label_text(doc: &Document, label: NodeId, exclude: NodeId, buf: &mut 
     }
 }
 
+/// `doc` 全体で 1 回だけ構築する、accessible name 算出用の索引
+/// （`AISNAP-1`・PR #567 レビュー指摘の P1 修正）。
+///
+/// `label_name` が対象要素ごとに文書全体を再走査すると、TASK-11.7（#76）
+/// でツリー構築時に要素ごと [`compute_name_with_index`] を呼んだ場合に
+/// 計算量が文書サイズの二乗になる。本構造体は `id` 索引と
+/// `label`→対象コントロールの関連付けを文書につき 1 回の走査で構築し、
+/// 以降の `label_name` 呼び出しをハッシュマップの参照だけに抑える。
+///
+/// 構築は [`build`](Self::build) で行う。フィールドは非公開（本ファイル
+/// 内の実装詳細）。`id` 索引（属性値 → 文書順で最初に一致した要素）は
+/// `label`→対象コントロールの関連付けを解決するためだけに使う中間結果
+/// であり、解決後は不要になるため構築後は保持しない。
+pub struct NameIndex {
+    /// ラベル付け可能な対象コントロール → 関連付く `<label>` の文書順
+    /// リスト（`for` 属性による関連付け・label による包含の両方を含む）。
+    labels_by_target: HashMap<NodeId, Vec<NodeId>>,
+}
+
+impl NameIndex {
+    /// `doc` を 1 回走査して [`NameIndex`] を構築する。
+    ///
+    /// 呼び出し文脈: 単発の [`compute_name`] は毎回これを内部で構築する
+    /// （簡易版）。文書中の複数要素へ繰り返し名前を算出する呼び出し元
+    /// （TASK-11.7 のツリー構築等）は、文書ごとに本関数を 1 回だけ呼び、
+    /// 結果を [`compute_name_with_index`] へ使い回すこと。
+    pub fn build(doc: &Document) -> Self {
+        let mut ids_by_value: HashMap<String, NodeId> = HashMap::new();
+        let mut label_candidates: Vec<NodeId> = Vec::new();
+
+        // 1 回の文書走査で「id 索引」と「label 要素の一覧」を同時に集める。
+        for node in doc.descendants(doc.root()) {
+            if let Some(id_value) = doc.attribute(node, "id")
+                && !id_value.is_empty()
+            {
+                // 文書順で先に見つかったものだけを残す（重複 id は先頭優先）。
+                ids_by_value.entry(id_value.to_string()).or_insert(node);
+            }
+            if is_html_element_named(doc, node, "label") {
+                label_candidates.push(node);
+            }
+        }
+
+        let mut labels_by_target: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for label in label_candidates {
+            // `for` 属性が指定されている場合（値が空文字列でも）は、対象を
+            // その id 一致でのみ判定し、包含（wrapping）へはフォールバック
+            // しない（HTML Standard の labeled control 規則。`for=""` は
+            // 「どの要素にも関連付かない」ことを意味する）。
+            let target = match doc.attribute(label, "for") {
+                Some(for_value) if !for_value.is_empty() => ids_by_value.get(for_value).copied(),
+                Some(_) => None,
+                None => first_labelable_descendant(doc, label),
+            };
+            if let Some(target) = target {
+                labels_by_target.entry(target).or_default().push(label);
+            }
+        }
+
+        Self { labels_by_target }
+    }
+}
+
 /// `target` に関連付く `<label>` 要素から accessible name を算出する
 /// （HTML Standard の labeled control 規則。`AISNAP-1`）。
 ///
-/// `doc` を文書順に 1 回走査し、各 `<label>` について次のいずれかで
-/// `target` との関連付けを判定する。
+/// `index`（[`NameIndex`]）を使い、`target` に関連付く label の一覧を
+/// ハッシュマップ参照 1 回で取得する（文書の再走査はしない。PR #567
+/// レビュー指摘の P1 修正）。関連付けの判定規則自体は [`NameIndex::build`]
+/// を参照。
 ///
-/// - `for` 属性がある場合: その値と、文書順で最初に一致する `id` を持つ
-///   要素が `target` 自身であり、かつ `target` がラベル付け可能
-///   （[`is_labelable`]）なときに関連付く（`for=""` や `target` が `id` を
-///   持たない場合は関連付かない）
-/// - `for` 属性が無い場合: label の子孫のうち文書順で最初のラベル付け
-///   可能な要素（[`first_labelable_descendant`]）が `target` と同じときに
-///   関連付く
-///
-/// 関連付いた label のテキストを文書順に、区切りを挟んでつなげる。
-/// 関連付ける label の数は [`MAX_LABELS`] を上限とし、超えた分は切り捨てて
-/// `truncated` に反映する。`target` がラベル付け不可、または関連付く
-/// label が 1 つも無い、またはテキストが空なら `None`。
-fn label_name(doc: &Document, target: NodeId) -> Option<AccessibleName> {
+/// 関連付いた label のうち、テキストが空・空白だけでなく実際に名前へ
+/// 寄与するものだけを文書順に、区切りを挟んでつなげる。関連付ける label
+/// の数は [`MAX_LABELS`] を上限とし、超えた分は切り捨てて `truncated` に
+/// 反映する（**上限は寄与する label だけを数える**: 空・空白だけの label
+/// が上限枠を占めて、後続の名前入り label を誤って切り捨てないようにする
+/// ため。PR #567 レビュー指摘の P1 修正）。`target` がラベル付け不可、
+/// または寄与する label が 1 つも無ければ `None`。
+fn label_name(doc: &Document, index: &NameIndex, target: NodeId) -> Option<AccessibleName> {
     if !is_labelable(doc, target) {
         return None;
     }
 
-    let target_id = doc.attribute(target, "id").filter(|id| !id.is_empty());
-    // 対象要素の id が文書で最初に現れる同じ id かどうかを 1 度だけ判定する
-    // （label ごとに first_element_with_id を呼び直さない。§3.5 の要求）。
-    let target_is_first_with_its_id =
-        target_id.is_some_and(|id| first_element_with_id(doc, id) == Some(target));
+    let labels = index.labels_by_target.get(&target)?;
 
     let mut buf = NameBuffer::new();
     let mut matched_labels = 0usize;
     let mut labels_truncated = false;
 
-    for label in doc.descendants(doc.root()) {
-        if !is_html_element_named(doc, label, "label") {
-            continue;
-        }
-
-        // `for` 属性が指定されている場合（値が空文字列でも）は、対象を
-        // その id 一致でのみ判定し、包含（wrapping）へはフォールバック
-        // しない（HTML Standard の labeled control 規則。`for=""` は
-        // 「どの要素にも関連付かない」ことを意味する）。
-        let matches = match doc.attribute(label, "for") {
-            Some(for_value) => target_is_first_with_its_id && target_id == Some(for_value),
-            None => first_labelable_descendant(doc, label) == Some(target),
-        };
-        if !matches {
+    for &label in labels {
+        let mut label_text = String::new();
+        collect_label_text(doc, label, target, &mut label_text);
+        if !has_non_whitespace(&label_text) {
+            // 名前に寄与しない label は MAX_LABELS の対象に数えない。
             continue;
         }
 
@@ -479,17 +561,17 @@ fn label_name(doc: &Document, target: NodeId) -> Option<AccessibleName> {
         matched_labels += 1;
 
         buf.push_separator();
-        collect_label_text(doc, label, target, &mut buf);
+        buf.push_str(&label_text);
     }
 
     if matched_labels == 0 {
         return None;
     }
 
+    // 寄与する label を 1 つ以上数えた時点で `buf` には非空白文字が
+    // 最低 1 文字は入っているため（`NameBuffer` は空でない先頭 1 文字を
+    // 上限に関わらず必ず受け付ける）、`buf.finish` が空になることはない。
     let mut result = buf.finish(NameSource::Label);
-    if result.is_empty() {
-        return None;
-    }
     if labels_truncated {
         result.truncated = true;
     }
@@ -501,7 +583,7 @@ fn label_name(doc: &Document, target: NodeId) -> Option<AccessibleName> {
 ///
 /// `type` ごとの節分けは本モジュール冒頭のドキュメンテーションコメント
 /// 「HTML-AAM による要素ごとの算出順序」の表を参照。
-fn input_name(doc: &Document, id: NodeId) -> AccessibleName {
+fn input_name(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName {
     match normalized_input_type(doc, id).as_str() {
         "hidden" => AccessibleName::default(),
         // checkbox/radio に加え、text 系の節（本モジュール冒頭の表）に
@@ -511,15 +593,15 @@ fn input_name(doc: &Document, id: NodeId) -> AccessibleName {
         // ない）に従う。`type` 省略・未知の値だけは HTML の既定である
         // text 系として扱い、下の `_` 節（`placeholder` を含む）へ渡す。
         "checkbox" | "radio" | "range" | "color" | "date" | "datetime-local" | "month" | "week"
-        | "time" | "file" => label_name(doc, id)
+        | "time" | "file" => label_name(doc, index, id)
             .or_else(|| title_name(doc, id))
             .unwrap_or_default(),
-        "button" => label_name(doc, id)
+        "button" => label_name(doc, index, id)
             .or_else(|| value_attr_name(doc, id))
             .or_else(|| title_name(doc, id))
             .unwrap_or_default(),
         ty @ ("submit" | "reset") => {
-            if let Some(name) = label_name(doc, id) {
+            if let Some(name) = label_name(doc, index, id) {
                 return name;
             }
             if let Some(name) = value_attr_name(doc, id) {
@@ -537,7 +619,7 @@ fn input_name(doc: &Document, id: NodeId) -> AccessibleName {
             title_name(doc, id).unwrap_or_default()
         }
         "image" => {
-            if let Some(name) = label_name(doc, id) {
+            if let Some(name) = label_name(doc, index, id) {
                 return name;
             }
             if let Some(name) = attr_name(doc, id, "alt", NameSource::Alt) {
@@ -553,7 +635,7 @@ fn input_name(doc: &Document, id: NodeId) -> AccessibleName {
         // text/password/search/tel/url/email/number、`type` 省略・未知の
         // 値は HTML の既定（text 系コントロール）として扱う
         // （state.rs の `compute_checked` と同じ既定値の扱い方）。
-        _ => label_name(doc, id)
+        _ => label_name(doc, index, id)
             .or_else(|| title_name(doc, id))
             .or_else(|| placeholder_name(doc, id))
             .unwrap_or_default(),
@@ -561,8 +643,9 @@ fn input_name(doc: &Document, id: NodeId) -> AccessibleName {
 }
 
 /// `doc` の要素 `id` から、HTML ネイティブの出所のみで accessible name を
-/// 算出する（`AISNAP-1`・TASK-11.4.2）。`compute_name` の主経路。
-fn native_name(doc: &Document, id: NodeId) -> AccessibleName {
+/// 算出する（`AISNAP-1`・TASK-11.4.2）。`compute_name`/`compute_name_with_index`
+/// の主経路。
+fn native_name(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName {
     if is_html_element_named(doc, id, "img") {
         return img_name(doc, id);
     }
@@ -570,10 +653,10 @@ fn native_name(doc: &Document, id: NodeId) -> AccessibleName {
         return area_name(doc, id);
     }
     if is_html_element_named(doc, id, "input") {
-        return input_name(doc, id);
+        return input_name(doc, index, id);
     }
     if is_html_element_named(doc, id, "textarea") {
-        return label_name(doc, id)
+        return label_name(doc, index, id)
             .or_else(|| title_name(doc, id))
             .or_else(|| placeholder_name(doc, id))
             .unwrap_or_default();
@@ -581,7 +664,7 @@ fn native_name(doc: &Document, id: NodeId) -> AccessibleName {
     if is_html_element_named(doc, id, "button") {
         // ネイティブ <button> 要素自身の子孫テキストへのフォールバックは
         // TASK-11.4.3（#546）のスコープ（実装済みを装わない。REPAIR-3）。
-        return label_name(doc, id)
+        return label_name(doc, index, id)
             .or_else(|| title_name(doc, id))
             .unwrap_or_default();
     }
@@ -590,7 +673,7 @@ fn native_name(doc: &Document, id: NodeId) -> AccessibleName {
         || is_html_element_named(doc, id, "output")
         || is_html_element_named(doc, id, "progress")
     {
-        return label_name(doc, id)
+        return label_name(doc, index, id)
             .or_else(|| title_name(doc, id))
             .unwrap_or_default();
     }
@@ -612,14 +695,37 @@ fn native_name(doc: &Document, id: NodeId) -> AccessibleName {
 /// [`super::state::compute_state`] と同じ「範囲外・対象外は `None`/既定値」の
 /// 契約に合わせる）。
 ///
+/// # 計算量についての注意（PR #567 レビュー指摘の P1 修正）
+///
+/// 本関数は呼び出しのたびに [`NameIndex::build`] で索引を新規構築する
+/// **単発呼び出し向けの簡易版**である。1 つの文書の複数要素へ連続して
+/// 名前を算出する呼び出し元（TASK-11.7 のツリー構築等）がこれを要素ごとに
+/// 呼ぶと、索引構築が要素数だけ繰り返され計算量が文書サイズの二乗になる。
+/// そのような呼び出し元は、文書ごとに [`NameIndex::build`] を 1 回だけ
+/// 呼び、要素ごとには [`compute_name_with_index`] を使うこと。
+///
 /// 呼び出し文脈: 現時点では呼び出し元がない。TASK-11.7（Issue #76）が
 /// DOM から `Snapshot`/`Node` を構築する際、算出結果の `text` を
 /// [`super::Node::name`] へ格納する想定である。
 pub fn compute_name(doc: &Document, id: NodeId) -> AccessibleName {
+    let index = NameIndex::build(doc);
+    compute_name_with_index(doc, &index, id)
+}
+
+/// [`compute_name`] の索引再利用版（`AISNAP-1`・PR #567 レビュー指摘の
+/// P1 修正）。
+///
+/// `index` は呼び出し元が `doc` について [`NameIndex::build`] で 1 回だけ
+/// 構築し、同じ文書の要素ごとに使い回すことを想定する（文書ごとに
+/// 索引を再構築すると [`compute_name`] と同じ計算量に戻ってしまうため、
+/// ループの外側で 1 回だけ構築すること）。`doc` と `index` は同じ文書から
+/// 構築したものでなければならない（異なる文書の組み合わせは未定義の
+/// 挙動ではなく、単に一致する要素が見つからず `None`/既定値になる）。
+pub fn compute_name_with_index(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName {
     if !doc.is_element(id) {
         return AccessibleName::default();
     }
-    native_name(doc, id)
+    native_name(doc, index, id)
 }
 
 #[cfg(test)]
@@ -1272,6 +1378,77 @@ mod tests {
             result.text.chars().filter(|&c| c == 'a').count(),
             MAX_LABELS
         );
+    }
+
+    /// AISNAP-1（TASK-11.4.2・#545）: `MAX_LABELS` を超える数の label が
+    /// 関連付いていても、そのうち空・空白だけの label は上限枠を占めない。
+    /// 空の label が `MAX_LABELS` 個続いた後に名前入りの label が続く場合、
+    /// その名前を切り捨てず取得できる（PR #567 レビュー指摘の P1 回帰
+    /// テスト: 従来は空の label が上限を使い切り、後続の実名が失われた
+    /// うえ `title` 等へ誤ってフォールバックしていた）。
+    #[test]
+    fn aisnap_1_empty_labels_do_not_consume_max_labels_budget() {
+        let mut html = String::new();
+        for _ in 0..MAX_LABELS {
+            html.push_str(r#"<label for="x">   </label>"#);
+        }
+        html.push_str(r#"<label for="x">本当の名前</label><input id="x" title="使われないはず">"#);
+        let result = name(&html, "input");
+        assert_eq!(result.text, "本当の名前");
+        assert_eq!(result.source, NameSource::Label);
+        assert!(!result.truncated);
+    }
+
+    /// AISNAP-1（TASK-11.4.2・#545）: 寄与する label が `MAX_LABELS` を
+    /// 超えるときは、間に空・空白だけの label が挟まっていても正しく
+    /// `truncated` が立つ（寄与する label だけを数える、という仕様の
+    /// 反対側の境界）。
+    #[test]
+    fn aisnap_1_max_labels_counts_only_contributing_labels() {
+        let mut html = String::new();
+        for _ in 0..(MAX_LABELS + 1) {
+            html.push_str(r#"<label for="x">a</label><label for="x">   </label>"#);
+        }
+        html.push_str(r#"<input id="x">"#);
+        let result = name(&html, "input");
+        assert!(result.truncated);
+        assert_eq!(
+            result.text.chars().filter(|&c| c == 'a').count(),
+            MAX_LABELS
+        );
+    }
+
+    // --- NameIndex（複数要素での索引再利用） ---
+
+    /// AISNAP-1（TASK-11.4.2・#545）: `NameIndex::build` を 1 回だけ構築し
+    /// `compute_name_with_index` を複数要素へ使い回しても、各要素は
+    /// `compute_name`（単発版）と同じ結果になる（PR #567 レビュー指摘の
+    /// P1 修正: 索引を使った経路が単発経路と食い違わないことの確認）。
+    #[test]
+    fn aisnap_1_compute_name_with_index_matches_single_shot_for_each_element() {
+        use super::{NameIndex, compute_name_with_index};
+
+        let html = r#"
+            <label for="a">名前A</label><input type="checkbox" id="a">
+            <label>名前B <input type="checkbox" id="b"></label>
+            <input type="text" id="c" title="タイトルC">
+        "#;
+        let parsed =
+            parse_document(html, &ParseOptions::default()).expect("テスト入力は必ず成功する");
+        let doc = parsed.document;
+        let root = doc.root();
+        let index = NameIndex::build(&doc);
+
+        for selector in ["input#a", "input#b", "input#c"] {
+            let target = query_selector_str(&doc, root, selector)
+                .expect("セレクタは解釈できる")
+                .expect("対象要素が見つかる");
+            assert_eq!(
+                compute_name_with_index(&doc, &index, target),
+                compute_name(&doc, target),
+                "selector={selector}"
+            );
+        }
     }
 
     // --- 深いネスト ---
