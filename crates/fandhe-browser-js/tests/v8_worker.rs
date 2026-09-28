@@ -104,6 +104,8 @@ fn main() -> ExitCode {
     {
         eprintln!("case: js_1_linux_child_process_has_rlimit_data_set");
         js_1_linux_child_process_has_rlimit_data_set();
+        eprintln!("case: js_1_linux_child_process_has_oom_score_adj_set");
+        js_1_linux_child_process_has_oom_score_adj_set();
     }
     #[cfg(target_os = "windows")]
     {
@@ -687,6 +689,44 @@ fn js_1_linux_child_process_has_rlimit_data_set() {
     assert_eq!(
         fields[4], "2147483648",
         "hard RLIMIT_DATA mismatch: {data_size_line:?}"
+    );
+}
+
+/// `JS-1`・`TASK-29`・Issue #516: 子プロセスが起動直後・V8 初期化前に
+/// `/proc/self/oom_score_adj` へ `1000` を書き込んでいること。親から
+/// `/proc/<pid>/oom_score_adj` を読んで確認する
+/// （`V8ProcessEngine::worker_pid_for_test` 経由。`js_1_linux_child_process_has_rlimit_data_set`
+/// と同じ形）。
+///
+/// 親プロセス自身が既に `oom_score_adj=1000` で動いている環境（この値を
+/// 継承しているだけの可能性がある）では、この結合テストだけでは
+/// 「実際に書き込んだ」ことと「継承しただけ」を区別できない。書き込みの
+/// 仕組みそのもの（既存のファイルへ値を書けること・存在しないパスでは
+/// エラーになること）は `resource_limits` モジュールの単体テスト
+/// （`js_1_write_oom_score_adj_writes_the_value_to_the_given_path` 等）が
+/// 担う。本テストは「子プロセスの実行結果として値が 1000 になっている」
+/// ことを、実際のプロセス起動を通して確認する回帰テストである。
+///
+/// 実際に OOM killer が発火してこの子が優先的に選ばれることの再現は
+/// 環境依存のため対象外とする（`resource_limits` モジュールのドキュメント
+/// コメント「既知の制限」参照）。
+#[cfg(target_os = "linux")]
+fn js_1_linux_child_process_has_oom_score_adj_set() {
+    let mut engine = V8ProcessEngine::new();
+    engine
+        .evaluate_script("1 + 1", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("a trivial evaluation must succeed: {err}"));
+
+    let pid = engine
+        .worker_pid_for_test()
+        .expect("a worker must be running after a successful evaluation");
+    let value = std::fs::read_to_string(format!("/proc/{pid}/oom_score_adj"))
+        .unwrap_or_else(|err| panic!("failed to read /proc/{pid}/oom_score_adj: {err}"));
+
+    assert_eq!(
+        value.trim(),
+        "1000",
+        "expected the child's oom_score_adj to be set to 1000"
     );
 }
 

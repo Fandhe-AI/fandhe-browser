@@ -106,7 +106,7 @@
 //!
 //! | OS | 強制方法 | 強さ |
 //! |---|---|---|
-//! | Linux | `RLIMIT_DATA`（[`enforce_child_memory_limit`]。`rustix::process::setrlimit`。上限 [`LINUX_RLIMIT_DATA_CEILING_BYTES`]＝2 GiB）＋[`new_bounded_array_buffer_allocator`]（`ArrayBuffer` 確保の上限。3 OS 共通） | **OS がある程度強制するが、厳密な上限としては機能しない**。`RLIMIT_DATA` は匿名 `MAP_PRIVATE` の `mmap`（大きな `ArrayBuffer` の backing store が実際に使う経路。glibc malloc は既定のしきい値 128 KiB を超える確保を `mmap` に回す）にも、実際に触れていない仮想予約にも適用される（`setrlimit(2)` の「data segment のみ」という古い説明は、匿名 mmap を会計に含めない実装を前提にしており、本 crate が対象とする現行 Linux カーネルの挙動とは異なる）。しかし V8 自身の `CodeRange` 予約だけで数百 MiB（アーキテクチャ依存。実測は上記のとおり）を消費するため、[`HEAP_EXTERNAL_ALLOWANCE_BYTES`] 相当の小さい値には設定できず、`RLIMIT_DATA` 単体では実質的な防御を親側の監視に委ねていた。**`ArrayBuffer` の確保だけは、この `RLIMIT_DATA` の限界とは無関係に、V8 自身のレベル（[`new_bounded_array_buffer_allocator`]）で [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`] を確実に強制する** |
+//! | Linux | `RLIMIT_DATA`（[`enforce_child_memory_limit`]。`rustix::process::setrlimit`。上限 [`LINUX_RLIMIT_DATA_CEILING_BYTES`]＝2 GiB）＋[`new_bounded_array_buffer_allocator`]（`ArrayBuffer` 確保の上限。3 OS 共通）＋`/proc/self/oom_score_adj`（[`prefer_child_as_oom_victim`]。`JS-1`・`TASK-29`・Issue #516。値は [`LINUX_OOM_SCORE_ADJ_VALUE`]＝1000＝カーネルの最大値） | **OS がある程度強制するが、厳密な上限としては機能しない**。`RLIMIT_DATA` は匿名 `MAP_PRIVATE` の `mmap`（大きな `ArrayBuffer` の backing store が実際に使う経路。glibc malloc は既定のしきい値 128 KiB を超える確保を `mmap` に回す）にも、実際に触れていない仮想予約にも適用される（`setrlimit(2)` の「data segment のみ」という古い説明は、匿名 mmap を会計に含めない実装を前提にしており、本 crate が対象とする現行 Linux カーネルの挙動とは異なる）。しかし V8 自身の `CodeRange` 予約だけで数百 MiB（アーキテクチャ依存。実測は上記のとおり）を消費するため、[`HEAP_EXTERNAL_ALLOWANCE_BYTES`] 相当の小さい値には設定できず、`RLIMIT_DATA` 単体では実質的な防御を親側の監視に委ねていた。**`ArrayBuffer` の確保だけは、この `RLIMIT_DATA` の限界とは無関係に、V8 自身のレベル（[`new_bounded_array_buffer_allocator`]）で [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`] を確実に強制する**。**`oom_score_adj` は上限ではなく優先度のヒントに過ぎない**: プロセス単位の確保上限を課すものではなく、システム全体がメモリ逼迫した際に Linux の OOM killer がどのプロセスを殺すかの優先度を、非特権プロセスでも常に許される範囲（引き上げ）で最大まで上げ、親（ホスト）より先にこの子が選ばれるようにするだけである |
 //! | Windows | Job Object（[`enforce_child_memory_limit`]。`windows-sys` で Win32 API を直接呼ぶ。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`。上限 [`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`]＝384 MiB）＋[`new_bounded_array_buffer_allocator`]（`ArrayBuffer` 確保の上限。3 OS 共通） | **OS がコミットの天井を強制するが、天井を超えても子プロセスは終了しない**。当初は `win32job =2.0.3` の安全な API（`limit_working_memory`／`JOB_OBJECT_LIMIT_WORKINGSET`）を使っていたが、これは物理メモリの常駐量（working set）を trim させるだけでコミットチャージの上限にはならないという P0 指摘（codex）を受け、`win32job` の使用をやめて `windows-sys` で Win32 API を直接呼ぶ実装に切り替えた（ユーザー承認 2026-09-28。承認された unsafe の範囲は本モジュールの `windows_job` サブモジュール・`read_rss_windows` に限定）。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`／`ProcessMemoryLimit` は Linux の `kill` ベースの強制とは性質が異なり、コミットチャージが上限を超えると**その先の確保が失敗するだけ**である（`VirtualAlloc`/`HeapAlloc` 相当が失敗を返す。プロセス自体は生き続ける）。ただし本対応（codex レビュー指摘 #503 P0「macOS の JS ワーカーに強制的なメモリ上限がない」）以降、V8 の既定の `ArrayBuffer::Allocator` は使わず [`new_bounded_array_buffer_allocator`] に置き換えたため、`ArrayBuffer` の確保は通常 [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`]（128 MiB）でこのアロケータ自身が拒否し、Job Object のコミット上限（384 MiB）に到達する事態は基本的に起こらない（到達しうるのは `ArrayBuffer` 以外の確保。その場合も引き続き親側の監視（[`read_child_rss_bytes`] が返す `PrivateUsage`。working set ではなくコミット量を見るように変更した）が `ResourceLimitExceeded` への分類・子の破棄・作り直しを担う）。この Windows 専用実装（windows-sys 版）のうち、Job Object の作成・`ProcessMemoryLimit` の設定・自プロセスの割り当て（[`enforce_child_memory_limit`]。子プロセス起動そのものが成立すること）と、`GetProcessMemoryInfo` による `PrivateUsage` 監視（[`read_rss_windows`]）は、3 OS CI の Windows ランナー（`rust-ci (windows-latest)`）上での結合テスト（`tests/v8_worker.rs` の Windows 専用ケースを含む全ケース）で検証している。ただし `js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation` は RSS しきい値を意図的に下げて親側の監視（`PrivateUsage` 監視）を先に発動させる構成であり（テスト自身のドキュメントコメント参照）、`JOB_OBJECT_LIMIT_PROCESS_MEMORY`（384 MiB）到達時に OS が実際に確保を拒否する経路そのものを再現・検証するテストは無い（実装済みを装わない。REPAIR-3。codex レビュー指摘 #529）|
 //! | macOS | OS 側の手段は無い（[`enforce_child_memory_limit`] は何もしない）。[`new_bounded_array_buffer_allocator`]（resizable ではない `ArrayBuffer`／`SharedArrayBuffer` の確保上限。3 OS 共通で有効）と WebAssembly 無効化（`super::v8_engine::V8Engine::new_with_heap_limit`。3 OS 共通で有効）が、OS に頼らず V8 自身のレベルでヒープ外メモリの一部の確保経路を狭める | **OS によるプロセス単位の強制は無く、`ArrayBuffer` アロケータ・WebAssembly 無効化も部分的な防御にとどまる**（resizable `ArrayBuffer`／growable `SharedArrayBuffer`・`ArrayBuffer` アロケータ・wasm 無効化のいずれの対象にもならない native な確保は、この防御を経由せず素通りする。[`new_bounded_array_buffer_allocator`] のドキュメントコメント「既知の抜け穴」参照）。本実装時にこの macOS 環境で実機検証したところ、`RLIMIT_DATA`・`RLIMIT_AS`・`RLIMIT_RSS` はいずれも `setrlimit(2)` の呼び出し自体が `EINVAL` で失敗した（「上限をかけたが効かない」ではなく「そもそも設定できない」）。Job Object 相当の OS 機構も無い。したがって [`enforce_child_memory_limit`] は macOS では何もせず常に成功を返す（呼び出そうとしても確実に失敗するため、fail-closed にすると macOS 上で子プロセスが常に起動できなくなってしまう）。残る確保経路（resizable `ArrayBuffer`／growable `SharedArrayBuffer`・V8 自身のコード領域・snapshot・Rust ホストバイナリの通常の確保等）は、引き続き親側の RSS 監視だけに委ねる（macOS では、これが唯一の防衛線であることに変わりはない） |
 //!
@@ -173,11 +173,23 @@
 //!   Windows ランナーでの結合テストにより検証しているが、
 //!   `JOB_OBJECT_LIMIT_PROCESS_MEMORY`（384 MiB）到達時に OS が実際に
 //!   確保を拒否する経路そのものを検証するテストは無い（上表参照）
+//! - **[`prefer_child_as_oom_victim`]（Linux の `oom_score_adj`）は
+//!   フォールバックしない**（`JS-1`・`TASK-29`・Issue #516）。procfs が
+//!   使えない環境（未マウント・読み取り専用等）では書き込みが失敗し、
+//!   子は OOM killer の優先対象にならない。この場合
+//!   `super::worker::worker_main` は stderr に警告を出すだけで評価の
+//!   準備を続行する（fail-closed にしない。既知の制限として記録する
+//!   だけで、他の防御（`RLIMIT_DATA`・`ArrayBuffer` アロケータ・親の
+//!   RSS 監視）は一切影響を受けない）。また、実際に OOM killer が
+//!   発火してこの子が選ばれて終了することは検証していない（環境依存の
+//!   ため対象外。回帰テストが確認するのは値の書き込みそのものに留まる）
 
 use std::alloc::{Layout, alloc, alloc_zeroed, dealloc};
 use std::ffi::c_void;
 #[cfg(target_os = "macos")]
 use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -302,6 +314,72 @@ fn compute_rlimit_data_target(existing_hard_limit: Option<u64>) -> u64 {
         Some(hard) => hard.min(LINUX_RLIMIT_DATA_CEILING_BYTES),
         None => LINUX_RLIMIT_DATA_CEILING_BYTES,
     }
+}
+
+/// Linux カーネルが受け付ける `oom_score_adj` の最大値（`JS-1`・
+/// `TASK-29`・Issue #516）。子はこのプロセスの中で untrusted な JS を
+/// 評価するため、システム全体がメモリ逼迫した際、OOM killer が親
+/// （ホスト）より先にこの子を殺す対象として選ぶよう、最大値まで
+/// 引き上げる。
+///
+/// **これは「際限のない確保への上限」ではなく「複数プロセスのうち
+/// どれを殺すかの優先度ヒント」である**（実装済みを装わない。
+/// REPAIR-3）。実際の上限は引き続き [`LINUX_RLIMIT_DATA_CEILING_BYTES`]
+/// （`RLIMIT_DATA`）・[`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`]（`ArrayBuffer`
+/// アロケータ）・[`MAX_CHILD_RSS_BYTES`]（親側の RSS 監視）が担う。
+/// `oom_score_adj` の引き上げは非特権プロセスでも常に許される操作
+/// （`CAP_SYS_RESOURCE` が必要なのは引き下げのみ）であるため、
+/// [`prefer_child_as_oom_victim`] は失敗要因が procfs 側の環境要因に
+/// 限られる。
+#[cfg(target_os = "linux")]
+const LINUX_OOM_SCORE_ADJ_VALUE: i32 = 1000;
+
+/// 指定した `path`（子プロセス自身の `/proc/self/oom_score_adj` を想定）
+/// へ `value` を書き込む（[`prefer_child_as_oom_victim`] の I/O 部分を
+/// 純粋に近い形へ切り出し、単体テストで一時ファイルに対して検証できる
+/// ようにする）。
+///
+/// `create` は付けない（procfs に実在しないファイルを新規作成しては
+/// ならないため。単体テストは事前に空ファイルを用意してから呼ぶ）。
+/// 書き込みに失敗しても、別のパス（旧 `/proc/self/oom_adj`）や別の値への
+/// 再試行は行わない（受入基準「フォールバックしない」。既知の制限として
+/// 呼び出し元が警告を出して続行する。理由は
+/// [`prefer_child_as_oom_victim`] のドキュメントコメント参照）。
+#[cfg(target_os = "linux")]
+fn write_oom_score_adj(path: &Path, value: i32) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|err| format!("failed to open {path:?} to set oom_score_adj to {value}: {err}"))?;
+    file.write_all(value.to_string().as_bytes())
+        .map_err(|err| format!("failed to write oom_score_adj={value} to {path:?}: {err}"))
+}
+
+/// 子プロセス自身を OOM killer の優先対象にする（起動直後・V8 初期化前に
+/// `super::worker::worker_main` から呼ぶ契約。`JS-1`・`TASK-29`・
+/// Issue #516）。`/proc/self/oom_score_adj` へ
+/// [`LINUX_OOM_SCORE_ADJ_VALUE`]（1000）を書き込む。
+///
+/// 失敗した場合は `Err` を返すのみで、[`enforce_child_memory_limit`]
+/// とは異なり fail-closed にはしない（呼び出し元が警告を出して評価の
+/// 準備を続行する）。**理由**: `oom_score_adj` の引き上げは非特権でも
+/// 常に許されるため、現実的な失敗要因は procfs が未マウント・読み取り
+/// 専用などの環境要因に限られる。これは「際限のない確保を防ぐ」上限
+/// ではなく「逼迫時にどちらを殺すか」のヒントに過ぎず、失敗しても
+/// `RLIMIT_DATA`・`ArrayBuffer` アロケータ・親の RSS 監視という他の防御は
+/// 一切影響を受けない。fail-closed にすると、procfs が使えない特殊な
+/// サンドボックス環境で子プロセスが常に起動できなくなるだけで、
+/// セキュリティ上の得は無い（`enforce_child_memory_limit` の macOS 分岐
+/// と同じ判断。モジュール冒頭のドキュメントコメント参照）。
+#[cfg(target_os = "linux")]
+pub(crate) fn prefer_child_as_oom_victim() -> Result<(), String> {
+    write_oom_score_adj(
+        Path::new("/proc/self/oom_score_adj"),
+        LINUX_OOM_SCORE_ADJ_VALUE,
+    )
 }
 
 /// Windows の Job Object `ProcessMemoryLimit`（コミットメモリ上限。
@@ -1293,6 +1371,71 @@ mod tests {
             elapsed < PS_TIMEOUT,
             "expected `ps` to complete well within PS_TIMEOUT ({PS_TIMEOUT:?}) for a live \
              process, took: {elapsed:?}"
+        );
+    }
+
+    /// `JS-1`・`TASK-29`・Issue #516: [`LINUX_OOM_SCORE_ADJ_VALUE`] が
+    /// カーネルの `oom_score_adj` 最大値（1000）であること。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn js_1_linux_oom_score_adj_value_is_the_kernel_maximum() {
+        assert_eq!(LINUX_OOM_SCORE_ADJ_VALUE, 1000);
+    }
+
+    /// `JS-1`・`TASK-29`・Issue #516: [`write_oom_score_adj`] が既存の
+    /// ファイルへ値をそのまま書き込むこと。実際の `/proc/self/oom_score_adj`
+    /// には書き込まない（`cargo test` のランナー自身の設定を変えて
+    /// しまうため）。`std::env::temp_dir()` 配下に pid とテスト名を含む
+    /// 一意なパスで空ファイルを用意してから書き込む。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn js_1_write_oom_score_adj_writes_the_value_to_the_given_path() {
+        let path = std::env::temp_dir().join(format!(
+            "fandhe-browser-js-oom-score-adj-test-{}-writes.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&path, "")
+            .unwrap_or_else(|err| panic!("failed to create the test fixture file {path:?}: {err}"));
+
+        let result = write_oom_score_adj(&path, 1000);
+
+        // 成否に関わらず片付ける（best effort）。
+        let read_back = std::fs::read_to_string(&path).ok();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(
+            read_back.as_deref(),
+            Some("1000"),
+            "expected the file to contain the written value"
+        );
+    }
+
+    /// `JS-1`・`TASK-29`・Issue #516: 書き込み先の親ディレクトリが
+    /// 存在しない場合は `Err` になり、メッセージにそのパスを含むこと。
+    /// ファイルが新規作成されないこと（`create` を付けていないこと）も
+    /// あわせて確認する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn js_1_write_oom_score_adj_reports_an_error_for_a_missing_path() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "fandhe-browser-js-oom-score-adj-test-{}-missing-dir",
+                std::process::id()
+            ))
+            .join("oom_score_adj");
+
+        let result = write_oom_score_adj(&path, 1000);
+
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+        let message = result.unwrap_err();
+        assert!(
+            message.contains(&format!("{path:?}")),
+            "expected the error message to mention the path {path:?}, got: {message}"
+        );
+        assert!(
+            !path.exists(),
+            "write_oom_score_adj must not create a new file (no `create` option)"
         );
     }
 }
