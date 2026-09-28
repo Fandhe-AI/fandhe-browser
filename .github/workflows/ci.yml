@@ -332,3 +332,119 @@ jobs:
           toolchain: stable
       - name: make check-deny-license-reject
         run: make check-deny-license-reject
+
+  # --------------------------------------------------
+  # binary-size（feature 無効時のリリースバイナリサイズ検査を CI へ組込み）
+  # --------------------------------------------------
+  # TASK-34.3（#467・RENDER-2。基準は CORE-2 と同じ「Chromium 比 80% 以上
+  # 削減」）。判定本体は harness/binary-size/（TASK-34.2・#466 で導入。契約は
+  # 同ディレクトリの README.md を参照）。
+  #
+  # self-test を先に実行する理由: 上限超過時に確実に exit 1 になることの証跡を
+  # 毎回ジョブログへ残すため（compat-regression・deny-license-reject と同じ
+  # fail-closed 性の考え方。REPAIR-5・REPAIR-8）。
+  #
+  # 現時点で workspace に fandhe-browser-cli crate が無い（TASK-41.5・#174 が
+  # 追加予定）ため、実判定ステップは `skip:` を出して exit 0 になる（休眠
+  # 状態。harness/binary-size/README.md「計測対象はまだ存在しない」参照）。
+  # #174 がこの crate を追加すると、本ファイルを変更しなくても自動的に実
+  # ビルド・判定の経路（fail-closed）へ入る。
+  #
+  # make を使わない理由: windows-latest に make がある保証がなく、既存の
+  # 3 OS ジョブ（compat-regression・bench-record-selftest）はどれもスクリプト
+  # を直接呼んでいる（make を使う deny-license-reject は ubuntu 単独ジョブ）。
+  # cache を使わない理由: 現状はビルド自体が起きず（上記 skip）、
+  # windows-latest には cache prune の既知問題がある（rust-ci ジョブの
+  # コメント参照）。#174 後のビルド時間増加への cache 導入は別途検討する。
+  #
+  # 上限値・package 名は Makefile の BINARY_SIZE_LIMIT_BYTES /
+  # BINARY_SIZE_PACKAGE を単一真実源とし、ここでは値を重複定義しない
+  # （行頭固定の正規表現で 1 件だけ抽出する。0 件・2 件以上は fail-closed）。
+  #
+  # branch protection の必須チェックに加える場合は OS 数分
+  # （`binary-size (ubuntu-latest)` / `(macos-latest)` / `(windows-latest)`
+  # の 3 件）を登録する必要がある（ユーザー作業。本変更の対象外）。
+  binary-size:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # #174 適用後はリリースビルドが走るため rust-ci-default-features と同値にする
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      # stable（rust-toolchain.toml の channel = "stable" を単一真実源として追従）。
+      # self-test の package モードのケースに cargo、スクリプト本体に rustc -vV が必要
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - name: jq の導入確認
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "error: jq is required but was not found on PATH" >&2
+            exit 1
+          fi
+      - name: Makefile から上限値・package 名を抽出
+        id: config
+        run: |
+          # Windows（git-bash）の CRLF を落としてから行頭固定の正規表現で照合する。
+          # 0 件（書式変更・削除）・2 件以上（曖昧）はいずれも fail-closed にする。
+          normalized="$(tr -d '\r' < Makefile)"
+          limit_re='^BINARY_SIZE_LIMIT_BYTES \?= ([0-9]{1,15})$'
+          package_re='^BINARY_SIZE_PACKAGE \?= ([A-Za-z0-9._-]{1,64})$'
+          limit_matches="$(printf '%s\n' "$normalized" | grep -cE "$limit_re" || true)"
+          package_matches="$(printf '%s\n' "$normalized" | grep -cE "$package_re" || true)"
+          if [ "$limit_matches" -ne 1 ]; then
+            echo "::error::BINARY_SIZE_LIMIT_BYTES not found exactly once in Makefile (found: $limit_matches)" >&2
+            exit 1
+          fi
+          if [ "$package_matches" -ne 1 ]; then
+            echo "::error::BINARY_SIZE_PACKAGE not found exactly once in Makefile (found: $package_matches)" >&2
+            exit 1
+          fi
+          limit="$(printf '%s\n' "$normalized" | sed -nE "s/$limit_re/\\1/p")"
+          package="$(printf '%s\n' "$normalized" | sed -nE "s/$package_re/\\1/p")"
+          echo "limit_bytes=$limit" >> "$GITHUB_OUTPUT"
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+      - name: 自己テスト（fixture による上限超過 fail の証跡確認）
+        run: bash harness/binary-size/self-test.sh
+      - name: feature 無効時のリリースバイナリサイズ検査
+        env:
+          BINARY_SIZE_LIMIT_BYTES: ${{ steps.config.outputs.limit_bytes }}
+          BINARY_SIZE_PACKAGE: ${{ steps.config.outputs.package }}
+        run: |
+          out="$(mktemp)"
+          trap 'rm -f "$out"' EXIT
+          status=0
+          bash harness/binary-size/check-binary-size.sh \
+            --package "$BINARY_SIZE_PACKAGE" \
+            --limit "$BINARY_SIZE_LIMIT_BYTES" | tee "$out" || status=$?
+          {
+            echo "### Binary size ($RUNNER_OS)"
+            echo
+            if grep -q '^skip:' "$out"; then
+              echo "::notice::binary-size: fandhe-browser-cli crate not yet added to workspace (#174) — gate is dormant"
+              echo "skip: fandhe-browser-cli crate 未追加（#174）のため判定を skip した"
+            elif grep -q '^binary-size:' "$out"; then
+              echo "| host | package | bin | bytes | limit | result |"
+              echo "| ---- | ------- | --- | ----- | ----- | ------ |"
+              grep '^binary-size:' "$out" | while IFS= read -r line; do
+                host="$(printf '%s\n' "$line" | sed -nE 's/.*host=([A-Za-z0-9._-]{1,64}).*/\1/p')"
+                package="$(printf '%s\n' "$line" | sed -nE 's/.*package=([A-Za-z0-9._-]{1,64}).*/\1/p')"
+                bin="$(printf '%s\n' "$line" | sed -nE 's/.*bin=([A-Za-z0-9._-]{1,64}).*/\1/p')"
+                bytes="$(printf '%s\n' "$line" | sed -nE 's/.*bytes=([0-9]{1,20}).*/\1/p')"
+                limit="$(printf '%s\n' "$line" | sed -nE 's/.*limit=([0-9]{1,20}).*/\1/p')"
+                result="$(printf '%s\n' "$line" | sed -nE 's/.*result=(pass|fail).*/\1/p')"
+                echo "| $host | $package | $bin | $bytes | $limit | $result |"
+              done
+            else
+              echo "(no binary-size / skip output was produced; check-binary-size.sh exited with a usage/build error)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
