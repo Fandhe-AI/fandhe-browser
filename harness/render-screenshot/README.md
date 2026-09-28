@@ -504,7 +504,12 @@ python3 harness/render-screenshot/measure_ssim.py \
 
 - `id` は `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` に一致し重複不可。`x`/`y`/`width`/
   `height` は有限の数値（`bool` は不可）で絶対値 1e6 以下、`width`/`height` は
-  0 以上。要素数は 100 以下（PoC-6 が想定する 5〜10 件から外れる場合は警告のみ）
+  0 以上。要素数は 100 以下。PoC-6 が想定する 5〜10 件から外れる場合は警告を
+  出すが、Chromium 側（reference）の要素数が `BBOX_MIN_ELEMENTS_FOR_PASS`
+  （既定 5）未満のときは警告に加えて一致率に関わらずそのサイトを**不合格**
+  として扱う（fail-closed。要素数が 1 件でも一致すれば合格になってしまう
+  のを防ぐため）。5 件以上 10 件超（100 件以下）は警告のみで合否判定には
+  影響しない
 - ファイルが存在しない場合、そのサイトの bbox 判定は `not_measured`（サイト
   不合格）になる。エンジン側で bbox を書き出す仕組みができるまでの既定挙動
 - bbox JSON は対応する PNG より**新しい** mtime で書き出すこと。`measure_ssim.py`
@@ -523,6 +528,9 @@ viewport 寸法（`x` 系は width、`y` 系は height）の ±5% 以内かで�
 要素数 ÷ Chromium 側の要素数」。Servo 側に無い `id` は不一致、Servo 側にしか
 無い `id` は無視して警告のみ出す。Chromium 側の要素が 0 件の場合は判定不能
 として `error` を返す。80% 以上（例: 8/10）で合格、未満（例: 7/10）で不合格。
+ただし Chromium 側の要素数が `BBOX_MIN_ELEMENTS_FOR_PASS`（既定 5）未満の
+場合は、この一致率に関わらず不合格になる（前述の境界ボックスの入力契約を
+参照）。
 
 ### SSIM の算出パラメータ（他ツールの値と比較するには揃える必要がある）
 
