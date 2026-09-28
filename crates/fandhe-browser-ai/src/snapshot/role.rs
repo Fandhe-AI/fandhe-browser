@@ -37,12 +37,13 @@
 //! - `section` の `region` 昇格（accessible name を持つときのみ `region`
 //!   になる規則。accessible name の算出自体が TASK-11.4・Issue #73 の範囲）
 //! - `form`・`img` の完全な accessible name 算出。`aria-labelledby` が
-//!   指す要素の実テキストの連結・空白正規化・ネイティブラベリング機構
+//!   指す複数要素の実テキストの連結・空白正規化・ネイティブラベリング機構
 //!   （`label` 要素等）・`title` 属性まで含めた優先順位付き判定は
 //!   TASK-11.4・Issue #73 の範囲であり、本実装は `aria-label` の非空値の
-//!   有無、または `aria-labelledby` が指す ID が文書内に実在するかどうか
-//!   だけを見る簡易 hint（[`has_name_hint`]）に留める（PR #566 レビュー
-//!   指摘を受け、参照先未解決の `aria-labelledby` は名前ヒントに含めない
+//!   有無、または `aria-labelledby` が指す ID のいずれかが文書内に実在し
+//!   空でないテキストを持つかどうかだけを見る簡易 hint
+//!   （[`has_name_hint`]）に留める（PR #566 レビュー指摘を受け、参照先
+//!   未解決・参照先が空要素の `aria-labelledby` は名前ヒントに含めない
 //!   よう修正済み）
 //! - `th`/`td` の表文脈による完全な判定（`scope` が無い `th` を位置で
 //!   行見出し・列見出し・セルに振り分ける処理、`td` が `gridcell` になる
@@ -54,6 +55,8 @@
 //! `docs/spec/03-poc/ai-interface-token-reduction/proto/reduce.mjs` の
 //! `roleOf`（PoC-4）は `label` 要素を一律 `"text"` としているが、本実装は
 //! HTML-AAM に従い、`label` は対応表に無いため `generic`（Fallback）になる。
+
+use std::collections::HashMap;
 
 use fandhe_browser_core::dom::{Document, NodeData, NodeId};
 
@@ -250,31 +253,46 @@ fn implicit_role_for_th(doc: &Document, id: NodeId) -> ComputedRole {
     }
 }
 
-/// `doc` 内に `id` content attribute の値が `target` と一致する要素が
-/// 存在するかどうかを返す（`aria-labelledby` の IDREF 解決用）。
-///
-/// [`Document`] は id 索引を持たないため、`doc.root()` から
-/// [`Document::descendants`] で全要素を走査する（`node_count` で上限打ち切り
-/// 済みのため無制限走査にはならない。security.md「不安全な設計」対策）。
+/// `doc` 内の `id` content attribute → 要素の [`NodeId`] の索引。
+/// `aria-labelledby` の IDREF 解決で、トークンごとに文書全体を再走査
+/// しないよう、[`build_id_index`] で 1 回だけ構築して使い回す
+/// （PR #566 レビュー指摘 P0。二乗規模の走査量になるのを防ぐ）。
 /// 複数要素が同じ `id` を持つ不正な HTML では最初に見つかった要素を採用する
 /// （最初の一致で resolve する、というブラウザの一般的な `getElementById`
 /// 挙動に合わせる）。
-fn element_with_id_exists(doc: &Document, target: &str) -> bool {
-    doc.descendants(doc.root())
-        .any(|node| doc.attribute(node, "id") == Some(target))
+type IdIndex<'a> = HashMap<&'a str, NodeId>;
+
+/// [`IdIndex`] を構築する。[`Document`] は id 索引を持たないため、
+/// `doc.root()` から [`Document::descendants`] で全要素を 1 回だけ走査する
+/// （`node_count` で上限打ち切り済みのため無制限走査にはならない。
+/// security.md「不安全な設計」対策）。
+fn build_id_index(doc: &Document) -> IdIndex<'_> {
+    let mut index = IdIndex::new();
+    for node in doc.descendants(doc.root()) {
+        if let Some(node_id) = doc.attribute(node, "id") {
+            index.entry(node_id).or_insert(node);
+        }
+    }
+    index
 }
 
-/// `aria-labelledby` の値（空白区切りの ID 列）のうち、`doc` 内に実在する
-/// 要素を指すトークンが 1 つでもあるかどうかを返す。
+/// `aria-labelledby` の値（空白区切りの ID 列）のうち、`doc` 内に実在し、
+/// かつ空でないテキストを持つ要素を指すトークンが 1 つでもあるかどうかを
+/// 返す。`index` は呼び出し元が [`build_id_index`] で 1 回だけ構築した
+/// ものを渡し、複数トークン・複数呼び出しにまたがって使い回す。
 ///
-/// 参照先が存在しない IDREF（例: `aria-labelledby="missing"`）は、それが
-/// 指す要素のテキストを持ちえないため名前のヒントとして扱わない
-/// （PR #566 レビュー指摘。`has_name_hint` 参照）。
-fn labelledby_references_existing_element(doc: &Document, id: NodeId) -> bool {
+/// 参照先が存在しない IDREF（例: `aria-labelledby="missing"`）や、参照先の
+/// テキストが空（例: `<span id="x"></span>`）の場合は、accessible name を
+/// 持ちえないため名前のヒントとして扱わない（PR #566 レビュー指摘 P1。
+/// 「参照先が存在する」だけでは `has_name_hint` を真にしない）。
+fn labelledby_references_named_element(doc: &Document, id: NodeId, index: &IdIndex<'_>) -> bool {
     doc.attribute(id, "aria-labelledby").is_some_and(|value| {
-        value
-            .split_ascii_whitespace()
-            .any(|token| element_with_id_exists(doc, token))
+        value.split_ascii_whitespace().any(|token| {
+            index
+                .get(token)
+                .and_then(|&target| doc.text_content(target))
+                .is_some_and(|text| !text.trim().is_empty())
+        })
     })
 }
 
@@ -282,22 +300,32 @@ fn labelledby_references_existing_element(doc: &Document, id: NodeId) -> bool {
 /// 名前を持つとみなす。
 ///
 /// - `aria-label` が空でない値を持つ
-/// - `aria-labelledby` が、`doc` 内に実在する要素を指す ID を 1 つ以上含む
-///   （[`labelledby_references_existing_element`]。参照先未解決の IDREF は
-///   名前のヒントとして扱わない）
+/// - `aria-labelledby` が、`doc` 内に実在し空でないテキストを持つ要素を
+///   指す ID を 1 つ以上含む（[`labelledby_references_named_element`]。
+///   参照先未解決の IDREF・参照先が空要素の場合は名前のヒントとして
+///   扱わない）
 ///
 /// 簡易実装: WAI-ARIA の accessible name 算出アルゴリズム（`aria-labelledby`
-/// が指す要素の実テキスト・ネイティブラベリング機構（`label` 要素等）・
-/// `title` 属性まで含めた優先順位付き算出）は TASK-11.4（Issue #73）の
-/// 範囲であり、本実装は参照先の「存在」までしか見ない（実テキストの連結・
-/// 空白正規化・`aria-label` との優先順位づけは行わない。
-/// [`implicit_role_for_img`]・`form` の暗黙 role 判定から利用）。
+/// が指す複数要素のテキストの連結・空白正規化・ネイティブラベリング機構
+/// （`label` 要素等）・`title` 属性まで含めた優先順位付き算出）は
+/// TASK-11.4（Issue #73）の範囲であり、本実装は参照先が「空でないテキストを
+/// 持つか」までしか見ない（複数参照先の連結・`aria-label` との優先順位づけは
+/// 行わない。[`implicit_role_for_img`]・`form` の暗黙 role 判定から利用）。
 fn has_name_hint(doc: &Document, id: NodeId) -> bool {
     let non_empty = |attr: &str| {
         doc.attribute(id, attr)
             .is_some_and(|value| !value.trim().is_empty())
     };
-    non_empty("aria-label") || labelledby_references_existing_element(doc, id)
+    if non_empty("aria-label") {
+        return true;
+    }
+    // `aria-labelledby` が無い要素で索引構築コストを払わないよう、
+    // 属性の有無を先に確認してから索引を 1 回だけ構築する。
+    if doc.attribute(id, "aria-labelledby").is_none() {
+        return false;
+    }
+    let index = build_id_index(doc);
+    labelledby_references_named_element(doc, id, &index)
 }
 
 /// `img` 要素の暗黙 role を返す。`alt=""`（空文字列。属性自体が無い場合は
@@ -733,6 +761,20 @@ mod tests {
         assert_role(compute_role(&doc, id), "none", RoleSource::Implicit);
     }
 
+    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘 P1）: 参照先
+    /// の要素は文書内に実在するが空でないテキストを持たない
+    /// `aria-labelledby`（例: `<span id="x"></span>`）は名前のヒントとして
+    /// 扱わず、`alt=""` の `img` は `none` のままになる（「参照先が存在する」
+    /// だけで名前ありと誤判定しない）。
+    #[test]
+    fn aisnap_1_img_empty_alt_with_empty_labelledby_target_stays_none() {
+        let (doc, id) = parse_and_select(
+            r#"<span id="caption"></span><img src="a.png" alt="" aria-labelledby="caption">"#,
+            "img",
+        );
+        assert_role(compute_role(&doc, id), "none", RoleSource::Implicit);
+    }
+
     /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: 名前の
     /// ない `form` は `form` にせず `generic`（Fallback）とする
     /// （HTML-AAM。`section` の `region` 昇格と同じ規則）。名前が
@@ -763,6 +805,20 @@ mod tests {
     #[test]
     fn aisnap_1_form_dangling_labelledby_stays_generic() {
         let (doc, id) = parse_and_select(r#"<form aria-labelledby="missing"></form>"#, "form");
+        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘 P1）: 参照先
+    /// の要素は文書内に実在するが空でないテキストを持たない
+    /// `aria-labelledby`（例: `<span id="x"></span>`）は名前のヒントとして
+    /// 扱わず、`form` は名前を持たないとみなし `generic`（Fallback）のまま
+    /// になる。
+    #[test]
+    fn aisnap_1_form_empty_labelledby_target_stays_generic() {
+        let (doc, id) = parse_and_select(
+            r#"<span id="x"></span><form aria-labelledby="x"></form>"#,
+            "form",
+        );
         assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
     }
 
