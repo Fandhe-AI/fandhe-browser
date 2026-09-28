@@ -195,6 +195,56 @@ class DecodePngGrayTest(unittest.TestCase):
             with self.assertRaises(ms.PngDecodeError):
                 ms.decode_png_gray(path)
 
+    def test_accepts_plte_chunk_in_truecolor(self) -> None:
+        # Bugbot 指摘: PLTE は color type 2/6（truecolor・truecolor+alpha）では
+        # 任意（減色表示用の推奨パレット）であり、画素データは IDAT の RGB(A)
+        # そのものを使う。未対応の critical chunk を一律 fatal 扱いにしていた
+        # 従来実装では、正当な PLTE を含むこれらの PNG まで `PngDecodeError`
+        # になっていた。
+        width, height = 8, 8
+        plte = bytes([0, 0, 0, 255, 255, 255])
+        png_bytes = build_png(width, height, rgb_pixel, color_type=2)
+        # `build_png` は IHDR の直後に IDAT を置くため、その境目へ PLTE を
+        # 挿入する（IHDR チャンクの長さは固定 13 バイト + オーバーヘッド 12）。
+        ihdr_chunk_len = 12 + 13
+        insert_at = len(cs.PNG_SIGNATURE) + ihdr_chunk_len
+        patched = png_bytes[:insert_at] + _chunk(b"PLTE", plte) + png_bytes[insert_at:]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.png"
+            path.write_bytes(patched)
+            w, h, gray = ms.decode_png_gray(path)
+            self.assertEqual((w, h), (width, height))
+            self.assertEqual(len(gray), width * height)
+
+    def test_accepts_plte_chunk_in_truecolor_alpha(self) -> None:
+        width, height = 8, 8
+        plte = bytes([0, 0, 0, 255, 255, 255])
+        png_bytes = build_png(width, height, lambda x, y: (*rgb_pixel(x, y), 255), color_type=6)
+        ihdr_chunk_len = 12 + 13
+        insert_at = len(cs.PNG_SIGNATURE) + ihdr_chunk_len
+        patched = png_bytes[:insert_at] + _chunk(b"PLTE", plte) + png_bytes[insert_at:]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.png"
+            path.write_bytes(patched)
+            w, h, gray = ms.decode_png_gray(path)
+            self.assertEqual((w, h), (width, height))
+            self.assertEqual(len(gray), width * height)
+
+    def test_rejects_plte_chunk_in_grayscale(self) -> None:
+        # 仕様上 PLTE は grayscale/grayscale+alpha（color type 0/4）では不正。
+        # truecolor 系のみを許容対象とし、それ以外は従来どおり fatal のまま。
+        width, height = 8, 8
+        plte = bytes([0, 0, 0, 255, 255, 255])
+        png_bytes = build_png(width, height, gray_pixel, color_type=0)
+        ihdr_chunk_len = 12 + 13
+        insert_at = len(cs.PNG_SIGNATURE) + ihdr_chunk_len
+        patched = png_bytes[:insert_at] + _chunk(b"PLTE", plte) + png_bytes[insert_at:]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.png"
+            path.write_bytes(patched)
+            with self.assertRaises(ms.PngDecodeError):
+                ms.decode_png_gray(path)
+
     def test_rejects_interlaced(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "a.png"
@@ -768,6 +818,37 @@ class CompareBboxesTest(unittest.TestCase):
     def test_empty_reference_is_error(self) -> None:
         result = ms.compare_bboxes({}, {}, self.VIEWPORT)
         self.assertEqual(result["status"], "error")
+
+    def test_single_element_full_match_does_not_pass(self) -> None:
+        # codex レビュー指摘 P2: 基準側の要素が 1 件だけでも完全一致すると
+        # rate=1.0 になり、5〜10 件を想定する PoC-6 の合格基準から外れたまま
+        # `passed=True` になっていた。`BBOX_MIN_ELEMENTS_FOR_PASS` 未満の
+        # 要素数では一致率 100% でも不合格として扱う。
+        ref = {"a": {"x": 0, "y": 0, "width": 100, "height": 100}}
+        tgt = {"a": {"x": 0, "y": 0, "width": 100, "height": 100}}
+        result = ms.compare_bboxes(ref, tgt, self.VIEWPORT)
+        self.assertEqual(result["matched"], 1)
+        self.assertEqual(result["rate"], 1.0)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("only 1 element" in w for w in result["warnings"]))
+
+    def test_four_elements_full_match_does_not_pass(self) -> None:
+        # 境界値: `BBOX_MIN_ELEMENTS_FOR_PASS`（5）のちょうど 1 件手前でも
+        # 不合格のままであることを確認する。
+        ref = {f"e{i}": {"x": 0, "y": 0, "width": 10, "height": 10} for i in range(4)}
+        tgt = {f"e{i}": {"x": 0, "y": 0, "width": 10, "height": 10} for i in range(4)}
+        result = ms.compare_bboxes(ref, tgt, self.VIEWPORT)
+        self.assertEqual(result["rate"], 1.0)
+        self.assertFalse(result["passed"])
+
+    def test_five_elements_full_match_passes(self) -> None:
+        # 境界値: `BBOX_MIN_ELEMENTS_FOR_PASS`（5）ちょうどなら通常どおり
+        # 一致率のみで合否判定される。
+        ref = {f"e{i}": {"x": 0, "y": 0, "width": 10, "height": 10} for i in range(5)}
+        tgt = {f"e{i}": {"x": 0, "y": 0, "width": 10, "height": 10} for i in range(5)}
+        result = ms.compare_bboxes(ref, tgt, self.VIEWPORT)
+        self.assertEqual(result["rate"], 1.0)
+        self.assertTrue(result["passed"])
 
 
 class LoadCaptureResultTest(unittest.TestCase):

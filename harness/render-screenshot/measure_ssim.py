@@ -60,6 +60,12 @@ SSIM_MIN = 0.90
 BBOX_RATE_MIN = 0.80
 BBOX_TOLERANCE = 0.05
 DEFAULT_MIN_SITES = 5
+# PoC-6 が想定する主要要素数の下限（5〜10 件）。基準（Chromium）側の
+# 境界ボックス要素数がこれを下回る場合、一致率が 80% 以上でもサイト合格
+# としない（codex レビュー指摘 P2: 要素 1 件だけの一致で rate=1.0・
+# passed=true になり、5 サイト分揃えば meets_threshold に到達できてしまう
+# のを防ぐ）。
+BBOX_MIN_ELEMENTS_FOR_PASS = 5
 
 # 非信頼入力（capture-result.json・bbox JSON）のサイズ上限。無制限確保による
 # DoS を防ぐ（security.md OWASP A04・coding-rust.md「長さ・件数の上限検証」）。
@@ -456,6 +462,21 @@ def _read_png_chunks(path: Path) -> tuple[int, int, int, int, bytes]:
             seen_iend = True
             offset = crc_end
             break
+        elif ctype == b"PLTE":
+            # PLTE は color type 3（パレット。§2.7 で非対応）では必須だが、
+            # truecolor / truecolor+alpha（color type 2/6）では PNG 仕様上
+            # 任意（減色表示用の推奨パレット）であり、画素データは PLTE の
+            # 有無に関わらず IDAT の RGB(A) 値そのもの。従来は未対応の
+            # critical chunk を一律 fatal 扱いにしており、正当な PLTE を
+            # 含む truecolor/RGBA PNG まで `PngDecodeError` にしていた
+            # （Bugbot 指摘）。color_type が確定済み（IHDR は最初のチャンクと
+            # して既に検証済み）の 2/6 のときのみ許容し、内容は使わず読み
+            # 飛ばす。grayscale 系（0/4。仕様上 PLTE 不可）・color_type
+            # 未確定の場合は従来どおり fatal のまま（fail-closed）とする。
+            if color_type not in (2, 6):
+                raise PngDecodeError(
+                    f"PLTE chunk is not allowed for color_type={color_type}: {path}"
+                )
         else:
             if ctype[0:1].isupper():
                 raise PngDecodeError(f"unknown critical chunk {ctype!r}: {path}")
@@ -948,12 +969,23 @@ def compare_bboxes(
 
     total = len(reference)
     rate = matched / total
+    # 一致率だけで合格判定すると、基準側の要素数が少ない（極端には 1 件）
+    # 場合でも 1 件一致するだけで rate=1.0 になり、PoC-6 が意図する
+    # 「主要要素の 80% 以上が一致」という判定から外れて合格してしまう
+    # （codex レビュー指摘 P2）。要素数が `BBOX_MIN_ELEMENTS_FOR_PASS`
+    # 未満のサイトは、一致率に関わらず不合格として扱う（fail-closed）。
+    insufficient_elements = total < BBOX_MIN_ELEMENTS_FOR_PASS
+    if insufficient_elements:
+        warnings.append(
+            f"reference has only {total} element(s) (< {BBOX_MIN_ELEMENTS_FOR_PASS}); "
+            "treating as not passed regardless of match rate"
+        )
     return {
         "status": "measured",
         "matched": matched,
         "total": total,
         "rate": rate,
-        "passed": rate >= BBOX_RATE_MIN,
+        "passed": rate >= BBOX_RATE_MIN and not insufficient_elements,
         "elements": elements,
         "warnings": warnings,
         "reason": None,
