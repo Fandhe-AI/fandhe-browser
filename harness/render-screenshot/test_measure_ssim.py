@@ -323,6 +323,20 @@ class DecodePngGrayTest(unittest.TestCase):
             with self.assertRaises(ms.PngDecodeError):
                 ms.decode_png_gray(path)
 
+    def test_rejects_trailing_data_after_zlib_stream_end_in_idat(self) -> None:
+        # codex/review 指摘（P1・PR #532 discussion_r4126465186）: zlib ストリーム
+        # （`decompressor.eof`）終端後に IDAT 内へ余分な圧縮データを連結しても、
+        # 正しい画素データの展開サイズ自体は変わらず一致してしまう。
+        # `unused_data` を検証せず measured 採用しないことを確認する。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.png"
+            path.write_bytes(
+                build_png(4, 4, rgb_pixel, color_type=2, extra_idat_suffix=b"garbage-after-zlib-eof")
+            )
+            with self.assertRaises(ms.PngDecodeError) as ctx:
+                ms.decode_png_gray(path)
+            self.assertIn("trailing data after the zlib stream end", str(ctx.exception))
+
     def test_rejects_decompression_bomb(self) -> None:
         # IHDR は巨大な寸法を宣言するが IDAT はごく小さい zlib ストリーム
         # （解凍爆弾の簡易再現）。展開後サイズ上限 `cs.MAX_PNG_RAW_BYTES` の

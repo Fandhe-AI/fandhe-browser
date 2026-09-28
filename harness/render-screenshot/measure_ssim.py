@@ -533,6 +533,14 @@ def _read_png_chunks(path: Path) -> tuple[int, int, int, int, bytes]:
             decoded += piece
             if len(decoded) > expected_raw:
                 raise PngDecodeError(f"IDAT decompresses larger than the IHDR-derived size: {path}")
+        # zlib ストリーム終端（`eof`）後に残るデータは `unused_data` に蓄積される。
+        # 正しい画素データの直後に余分な圧縮データを連結した壊れた PNG は、
+        # 展開サイズだけ見れば一致し得るため、ここで明示的に拒否する
+        # （非信頼 PNG を検証してから計測する契約。§2.6 の設計制約）。
+        if decompressor.unused_data:
+            raise PngDecodeError(
+                f"trailing data after the zlib stream end in IDAT: {path}"
+            )
     except zlib.error as exc:
         # 破損した IDAT（zlib ストリームとして不正）は `PngDecodeError` へ変換し、
         # `_measure_ssim_pair` の `status: "error"` 経路へ乗せる（1 ファイルの
