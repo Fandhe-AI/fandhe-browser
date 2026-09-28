@@ -29,7 +29,7 @@
 
 pub mod role;
 pub mod state;
-pub use role::{ComputedRole, RoleSource, compute_role};
+pub use role::{ComputedRole, IdIndex, RoleSource, build_id_index, compute_role};
 pub use state::{CheckedState, State, compute_state};
 
 /// 方式 B 簡約ツリーの 1 ノード（`AISNAP-1`・`TASK-11`・`MS-2`）。

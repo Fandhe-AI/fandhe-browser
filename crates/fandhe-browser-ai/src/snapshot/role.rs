@@ -260,13 +260,25 @@ fn implicit_role_for_th(doc: &Document, id: NodeId) -> ComputedRole {
 /// 複数要素が同じ `id` を持つ不正な HTML では最初に見つかった要素を採用する
 /// （最初の一致で resolve する、というブラウザの一般的な `getElementById`
 /// 挙動に合わせる）。
-type IdIndex<'a> = HashMap<&'a str, NodeId>;
+///
+/// 可視性: [`build_id_index`] とあわせて `pub` にし、[`super::snapshot`]
+/// クレートルートから再エクスポートしている。DOM から `Snapshot` を構築する
+/// TASK-11.7（Issue #76）が、文書 1 つにつき 1 回だけ索引を作り、要素ごとの
+/// [`compute_role`] 呼び出し全てへ共有インデックスとして渡す想定
+/// （PR #566 レビュー指摘 P1。`compute_role` 内で毎回索引を作り直すと
+/// 呼び出し回数 × 文書サイズの二乗規模の走査量になるため、索引の構築を
+/// スナップショット構築側へ引き上げた）。
+pub type IdIndex<'a> = HashMap<&'a str, NodeId>;
 
 /// [`IdIndex`] を構築する。[`Document`] は id 索引を持たないため、
 /// `doc.root()` から [`Document::descendants`] で全要素を 1 回だけ走査する
 /// （`node_count` で上限打ち切り済みのため無制限走査にはならない。
 /// security.md「不安全な設計」対策）。
-fn build_id_index(doc: &Document) -> IdIndex<'_> {
+///
+/// 呼び出し元は文書 1 つにつき本関数を 1 回だけ呼び、返した [`IdIndex`] を
+/// [`compute_role`] の全呼び出しへ使い回すこと（[`IdIndex`] のドキュメント
+/// コメント参照）。
+pub fn build_id_index(doc: &Document) -> IdIndex<'_> {
     let mut index = IdIndex::new();
     for node in doc.descendants(doc.root()) {
         if let Some(node_id) = doc.attribute(node, "id") {
@@ -305,13 +317,18 @@ fn labelledby_references_named_element(doc: &Document, id: NodeId, index: &IdInd
 ///   参照先未解決の IDREF・参照先が空要素の場合は名前のヒントとして
 ///   扱わない）
 ///
+/// `id_index` は呼び出し元（[`compute_role`]）が受け取った索引をそのまま
+/// 渡す。本関数では索引を構築しない（PR #566 レビュー指摘 P1。要素ごとに
+/// [`build_id_index`] を呼ぶと文書全体を再走査してしまい、`aria-labelledby`
+/// を持つ要素が多い文書で二乗規模の走査量になる）。
+///
 /// 簡易実装: WAI-ARIA の accessible name 算出アルゴリズム（`aria-labelledby`
 /// が指す複数要素のテキストの連結・空白正規化・ネイティブラベリング機構
 /// （`label` 要素等）・`title` 属性まで含めた優先順位付き算出）は
 /// TASK-11.4（Issue #73）の範囲であり、本実装は参照先が「空でないテキストを
 /// 持つか」までしか見ない（複数参照先の連結・`aria-label` との優先順位づけは
 /// 行わない。[`implicit_role_for_img`]・`form` の暗黙 role 判定から利用）。
-fn has_name_hint(doc: &Document, id: NodeId) -> bool {
+fn has_name_hint(doc: &Document, id: NodeId, id_index: &IdIndex<'_>) -> bool {
     let non_empty = |attr: &str| {
         doc.attribute(id, attr)
             .is_some_and(|value| !value.trim().is_empty())
@@ -319,22 +336,20 @@ fn has_name_hint(doc: &Document, id: NodeId) -> bool {
     if non_empty("aria-label") {
         return true;
     }
-    // `aria-labelledby` が無い要素で索引構築コストを払わないよう、
-    // 属性の有無を先に確認してから索引を 1 回だけ構築する。
     if doc.attribute(id, "aria-labelledby").is_none() {
         return false;
     }
-    let index = build_id_index(doc);
-    labelledby_references_named_element(doc, id, &index)
+    labelledby_references_named_element(doc, id, id_index)
 }
 
 /// `img` 要素の暗黙 role を返す。`alt=""`（空文字列。属性自体が無い場合は
 /// 含まない）は装飾画像として `none` になるが、[`has_name_hint`] が示す
 /// ARIA 名（`aria-label`/`aria-labelledby`）を持つ場合はその意図を優先し
 /// `img` のまま扱う（HTML-AAM。ARIA 名がある画像を装飾画像として消さない
-/// ため）。それ以外（`alt` 省略を含む）は `img`。
-fn implicit_role_for_img(doc: &Document, id: NodeId) -> ComputedRole {
-    if doc.attribute(id, "alt") == Some("") && !has_name_hint(doc, id) {
+/// ため）。それ以外（`alt` 省略を含む）は `img`。`id_index` は
+/// [`has_name_hint`] へそのまま渡す共有索引。
+fn implicit_role_for_img(doc: &Document, id: NodeId, id_index: &IdIndex<'_>) -> ComputedRole {
+    if doc.attribute(id, "alt") == Some("") && !has_name_hint(doc, id, id_index) {
         ComputedRole::implicit("none")
     } else {
         ComputedRole::implicit("img")
@@ -358,9 +373,12 @@ fn implicit_role_for_hyperlink(doc: &Document, id: NodeId) -> ComputedRole {
 /// `id` が HTML 名前空間の要素でない場合（SVG/MathML 等）、または対応表に
 /// 該当しない場合は `generic`（Fallback）を返す。
 ///
+/// `id_index` は呼び出し元（[`compute_role`]）が受け取った共有索引で、
+/// `form` の名前ヒント判定（[`has_name_hint`]）へそのまま渡す。
+///
 /// 拡張点: 分岐は 1 つの `match` 相当の連鎖に集約してあり、後続 Issue が
 /// 分岐を追加する箇所を以下にコメントで示す。
-fn implicit_role(doc: &Document, id: NodeId) -> ComputedRole {
+fn implicit_role(doc: &Document, id: NodeId, id_index: &IdIndex<'_>) -> ComputedRole {
     let named = |name: &str| is_html_element_named(doc, id, name);
 
     if named("a") || named("area") {
@@ -421,7 +439,7 @@ fn implicit_role(doc: &Document, id: NodeId) -> ComputedRole {
     // までを含めた完全な accessible name 算出は TASK-11.4（Issue #73）の
     // 範囲。名前が無い/判定できない場合はここで return せず下の
     // フォールバックへ流し `generic` にする。
-    if named("form") && has_name_hint(doc, id) {
+    if named("form") && has_name_hint(doc, id, id_index) {
         return ComputedRole::implicit("form");
     }
     if named("article") {
@@ -432,7 +450,7 @@ fn implicit_role(doc: &Document, id: NodeId) -> ComputedRole {
     // `generic` の切り替えを追加してここに分岐を足す。それまでは対応表に
     // 無い要素として generic（Fallback）になる。
     if named("img") {
-        return implicit_role_for_img(doc, id);
+        return implicit_role_for_img(doc, id, id_index);
     }
     if named("p") {
         return ComputedRole::implicit("paragraph");
@@ -532,11 +550,18 @@ fn explicit_role(doc: &Document, id: NodeId) -> Option<ComputedRole> {
 ///   そのまま返す（[`super::state::compute_state`] が範囲外・対象外に
 ///   既定値を返すのとは契約が異なる。role には「要素以外の既定値」に
 ///   ふさわしいトークンが無いため）。
-pub fn compute_role(doc: &Document, id: NodeId) -> Option<ComputedRole> {
+///
+/// `id_index` は呼び出し元が [`build_id_index`] で **文書 1 つにつき 1 回**
+/// 構築し、その文書に属する要素への `compute_role` 呼び出し全てで
+/// 使い回すこと（DOM から `Snapshot` を構築する TASK-11.7・Issue #76 は、
+/// ツリー構築の入口で 1 回構築してから各要素へ渡す想定）。呼び出しのたびに
+/// 索引を作り直すと、`aria-labelledby` を持つ要素が N 個ある文書で
+/// 合計 O(N²) の走査量になる（PR #566 レビュー指摘 P1）。
+pub fn compute_role(doc: &Document, id: NodeId, id_index: &IdIndex<'_>) -> Option<ComputedRole> {
     match doc.node_data(id)? {
         NodeData::Document => Some(ComputedRole::implicit("document")),
         NodeData::Element { .. } => {
-            Some(explicit_role(doc, id).unwrap_or_else(|| implicit_role(doc, id)))
+            Some(explicit_role(doc, id).unwrap_or_else(|| implicit_role(doc, id, id_index)))
         }
         _ => None,
     }
@@ -544,10 +569,18 @@ pub fn compute_role(doc: &Document, id: NodeId) -> Option<ComputedRole> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComputedRole, RoleSource, compute_role};
+    use super::{ComputedRole, RoleSource, build_id_index, compute_role};
     use fandhe_browser_core::dom::{Document, NodeId};
     use fandhe_browser_core::parse::{ParseOptions, parse_document};
-    use fandhe_browser_core::query::query_selector_str;
+    use fandhe_browser_core::query::{query_selector_all_str, query_selector_str};
+
+    /// テスト用の `compute_role` 薄いラッパー。呼び出し元（本番コードでは
+    /// TASK-11.7・Issue #76 のツリー構築）が文書 1 つにつき 1 回だけ
+    /// [`build_id_index`] を呼ぶ契約（[`compute_role`] のドキュメンテーション
+    /// コメント参照）をテストでも守るため、`doc` から索引を作ってから渡す。
+    fn role_of(doc: &Document, id: NodeId) -> Option<ComputedRole> {
+        compute_role(doc, id, &build_id_index(doc))
+    }
 
     /// テスト入力の HTML をパースし、CSS セレクタで対象要素を 1 つ特定する。
     /// [`super::super::state`] のテストヘルパと同じ形。
@@ -576,21 +609,21 @@ mod tests {
             parse_document("<p>text</p>", &ParseOptions::default()).expect("パースは成功する");
         let doc = parsed.document;
         let root = doc.root();
-        assert_role(compute_role(&doc, root), "document", RoleSource::Implicit);
+        assert_role(role_of(&doc, root), "document", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: `button` 要素は `"button"`/Implicit。
     #[test]
     fn aisnap_1_button_is_button() {
         let (doc, id) = parse_and_select("<button>送信</button>", "button");
-        assert_role(compute_role(&doc, id), "button", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "button", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: `href` を持つ `a` は `"link"`。
     #[test]
     fn aisnap_1_anchor_with_href_is_link() {
         let (doc, id) = parse_and_select(r##"<a href="#">more</a>"##, "a");
-        assert_role(compute_role(&doc, id), "link", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "link", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: `href` の無い `a` はリンクとして
@@ -598,7 +631,7 @@ mod tests {
     #[test]
     fn aisnap_1_anchor_without_href_is_generic() {
         let (doc, id) = parse_and_select("<a>more</a>", "a");
-        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: `href` を持つ `area` は `"link"`。
@@ -608,16 +641,16 @@ mod tests {
             r##"<map><area href="#" shape="rect" coords="0,0,1,1"></map>"##,
             "area",
         );
-        assert_role(compute_role(&doc, id), "link", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "link", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: `h1`〜`h6` はすべて `"heading"`。
     #[test]
     fn aisnap_1_headings_are_heading() {
         let (doc, id) = parse_and_select("<h1>title</h1>", "h1");
-        assert_role(compute_role(&doc, id), "heading", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "heading", RoleSource::Implicit);
         let (doc, id) = parse_and_select("<h6>title</h6>", "h6");
-        assert_role(compute_role(&doc, id), "heading", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "heading", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: table 系要素が対応表どおりの role
@@ -627,15 +660,15 @@ mod tests {
         let html = r#"<table><thead><tr><th>H</th></tr></thead>
             <tbody><tr><td>D</td></tr></tbody></table>"#;
         let (doc, table) = parse_and_select(html, "table");
-        assert_role(compute_role(&doc, table), "table", RoleSource::Implicit);
+        assert_role(role_of(&doc, table), "table", RoleSource::Implicit);
         let (doc, thead) = parse_and_select(html, "thead");
-        assert_role(compute_role(&doc, thead), "rowgroup", RoleSource::Implicit);
+        assert_role(role_of(&doc, thead), "rowgroup", RoleSource::Implicit);
         let (doc, tr) = parse_and_select(html, "thead tr");
-        assert_role(compute_role(&doc, tr), "row", RoleSource::Implicit);
+        assert_role(role_of(&doc, tr), "row", RoleSource::Implicit);
         let (doc, th) = parse_and_select(html, "th");
-        assert_role(compute_role(&doc, th), "columnheader", RoleSource::Implicit);
+        assert_role(role_of(&doc, th), "columnheader", RoleSource::Implicit);
         let (doc, td) = parse_and_select(html, "td");
-        assert_role(compute_role(&doc, td), "cell", RoleSource::Implicit);
+        assert_role(role_of(&doc, td), "cell", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: `<th scope="row">` は
@@ -646,7 +679,7 @@ mod tests {
             "<table><tbody><tr><th scope=\"row\">H</th></tr></tbody></table>",
             "th",
         );
-        assert_role(compute_role(&doc, id), "rowheader", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "rowheader", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: `<th scope="rowgroup">` も
@@ -657,13 +690,13 @@ mod tests {
             "<table><tbody><tr><th scope=\"rowgroup\">H</th></tr></tbody></table>",
             "th",
         );
-        assert_role(compute_role(&doc, id), "rowheader", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "rowheader", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select(
             "<table><tbody><tr><th scope=\"ROW\">H</th></tr></tbody></table>",
             "th",
         );
-        assert_role(compute_role(&doc, id), "rowheader", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "rowheader", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: `ul`/`ol`/`menu` は `"list"`、
@@ -671,13 +704,13 @@ mod tests {
     #[test]
     fn aisnap_1_list_elements() {
         let (doc, ul) = parse_and_select("<ul><li>a</li></ul>", "ul");
-        assert_role(compute_role(&doc, ul), "list", RoleSource::Implicit);
+        assert_role(role_of(&doc, ul), "list", RoleSource::Implicit);
         let (doc, ol) = parse_and_select("<ol><li>a</li></ol>", "ol");
-        assert_role(compute_role(&doc, ol), "list", RoleSource::Implicit);
+        assert_role(role_of(&doc, ol), "list", RoleSource::Implicit);
         let (doc, menu) = parse_and_select("<menu><li>a</li></menu>", "menu");
-        assert_role(compute_role(&doc, menu), "list", RoleSource::Implicit);
+        assert_role(role_of(&doc, menu), "list", RoleSource::Implicit);
         let (doc, li) = parse_and_select("<ul><li>a</li></ul>", "li");
-        assert_role(compute_role(&doc, li), "listitem", RoleSource::Implicit);
+        assert_role(role_of(&doc, li), "listitem", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: `nav`/`main`/`article`/
@@ -686,31 +719,31 @@ mod tests {
     #[test]
     fn aisnap_1_other_representative_elements() {
         let (doc, id) = parse_and_select("<nav>menu</nav>", "nav");
-        assert_role(compute_role(&doc, id), "navigation", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "navigation", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select("<main>content</main>", "main");
-        assert_role(compute_role(&doc, id), "main", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "main", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select("<article>post</article>", "article");
-        assert_role(compute_role(&doc, id), "article", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "article", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select("<p>text</p>", "p");
-        assert_role(compute_role(&doc, id), "paragraph", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "paragraph", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select("<hr>", "hr");
-        assert_role(compute_role(&doc, id), "separator", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "separator", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select("<fieldset></fieldset>", "fieldset");
-        assert_role(compute_role(&doc, id), "group", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "group", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select("<dialog></dialog>", "dialog");
-        assert_role(compute_role(&doc, id), "dialog", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "dialog", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select("<select><option>a</option></select>", "option");
-        assert_role(compute_role(&doc, id), "option", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "option", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select("<textarea></textarea>", "textarea");
-        assert_role(compute_role(&doc, id), "textbox", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "textbox", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: `img` は `"img"`、`alt=""` は
@@ -718,13 +751,13 @@ mod tests {
     #[test]
     fn aisnap_1_img_roles() {
         let (doc, id) = parse_and_select(r#"<img src="a.png" alt="猫">"#, "img");
-        assert_role(compute_role(&doc, id), "img", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "img", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select(r#"<img src="a.png" alt="">"#, "img");
-        assert_role(compute_role(&doc, id), "none", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "none", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select(r#"<img src="a.png">"#, "img");
-        assert_role(compute_role(&doc, id), "img", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "img", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: `alt=""`
@@ -734,17 +767,17 @@ mod tests {
     #[test]
     fn aisnap_1_img_empty_alt_with_aria_name_stays_img() {
         let (doc, id) = parse_and_select(r#"<img src="a.png" alt="" aria-label="説明">"#, "img");
-        assert_role(compute_role(&doc, id), "img", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "img", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select(
             r#"<span id="caption">説明</span><img src="a.png" alt="" aria-labelledby="caption">"#,
             "img",
         );
-        assert_role(compute_role(&doc, id), "img", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "img", RoleSource::Implicit);
 
         // 空白のみの ARIA 名はヒントとして扱わない（`none` のまま）。
         let (doc, id) = parse_and_select(r#"<img src="a.png" alt="" aria-label="  ">"#, "img");
-        assert_role(compute_role(&doc, id), "none", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "none", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: 参照先が
@@ -758,7 +791,7 @@ mod tests {
             r#"<img src="a.png" alt="" aria-labelledby="missing">"#,
             "img",
         );
-        assert_role(compute_role(&doc, id), "none", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "none", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘 P1）: 参照先
@@ -772,7 +805,7 @@ mod tests {
             r#"<span id="caption"></span><img src="a.png" alt="" aria-labelledby="caption">"#,
             "img",
         );
-        assert_role(compute_role(&doc, id), "none", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "none", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: 名前の
@@ -783,20 +816,64 @@ mod tests {
     #[test]
     fn aisnap_1_form_role_requires_name() {
         let (doc, id) = parse_and_select("<form></form>", "form");
-        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
 
         let (doc, id) = parse_and_select(r#"<form aria-label="検索"></form>"#, "form");
-        assert_role(compute_role(&doc, id), "form", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "form", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select(
             r#"<h1 id="h1">検索</h1><form aria-labelledby="h1"></form>"#,
             "form",
         );
-        assert_role(compute_role(&doc, id), "form", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "form", RoleSource::Implicit);
 
         // 空白のみの aria-label はヒントとして扱わない（`generic` のまま）。
         let (doc, id) = parse_and_select(r#"<form aria-label="  "></form>"#, "form");
-        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘 P1）:
+    /// [`build_id_index`] を文書につき 1 回だけ構築し、`aria-labelledby` を
+    /// 持つ複数要素（`form`・`img`）への [`compute_role`] 呼び出しへ
+    /// 同じ索引を共有しても、要素ごとに正しい名前ヒント判定になること
+    /// （`compute_role` が要素ごとに索引を再構築していた旧実装の O(N²)
+    /// 走査を、呼び出し元で 1 回構築した索引の共有に修正したことの回帰
+    /// テスト）。
+    #[test]
+    fn aisnap_1_compute_role_shares_one_id_index_across_multiple_elements() {
+        let html = concat!(
+            r#"<h1 id="caption">検索</h1>"#,
+            r#"<form aria-labelledby="caption"></form>"#,
+            r#"<img src="a.png" alt="" aria-labelledby="caption">"#,
+            r#"<img src="b.png" alt="" aria-labelledby="missing">"#,
+        );
+        let parsed = parse_document(html, &ParseOptions::default()).expect("パースは成功する");
+        let doc = parsed.document;
+        let root = doc.root();
+        let id_index = build_id_index(&doc);
+
+        let form = query_selector_str(&doc, root, "form")
+            .expect("セレクタは解釈できる")
+            .expect("form 要素が見つかる");
+        assert_role(
+            compute_role(&doc, form, &id_index),
+            "form",
+            RoleSource::Implicit,
+        );
+
+        let images = query_selector_all_str(&doc, root, "img").expect("セレクタは解釈できる");
+        // `img` は 2 つ存在する前提（`aria-labelledby` の解決先あり/なし）。
+        assert_eq!(images.len(), 2, "img 要素は 2 つ選択できる");
+        assert_role(
+            compute_role(&doc, images[0], &id_index),
+            "img",
+            RoleSource::Implicit,
+        );
+        assert_role(
+            compute_role(&doc, images[1], &id_index),
+            "none",
+            RoleSource::Implicit,
+        );
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: 参照先が
@@ -805,7 +882,7 @@ mod tests {
     #[test]
     fn aisnap_1_form_dangling_labelledby_stays_generic() {
         let (doc, id) = parse_and_select(r#"<form aria-labelledby="missing"></form>"#, "form");
-        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘 P1）: 参照先
@@ -819,7 +896,7 @@ mod tests {
             r#"<span id="x"></span><form aria-labelledby="x"></form>"#,
             "form",
         );
-        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: 明示 role（`role` 属性）が
@@ -827,7 +904,7 @@ mod tests {
     #[test]
     fn aisnap_1_explicit_role_wins() {
         let (doc, id) = parse_and_select(r#"<div role="button">x</div>"#, "div");
-        assert_role(compute_role(&doc, id), "button", RoleSource::Explicit);
+        assert_role(role_of(&doc, id), "button", RoleSource::Explicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: 複数トークンのうち、許可リストに
@@ -835,7 +912,7 @@ mod tests {
     #[test]
     fn aisnap_1_explicit_role_first_valid_token() {
         let (doc, id) = parse_and_select(r#"<div role="foo button">x</div>"#, "div");
-        assert_role(compute_role(&doc, id), "button", RoleSource::Explicit);
+        assert_role(role_of(&doc, id), "button", RoleSource::Explicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: `role` 属性値の大文字小文字は
@@ -843,7 +920,7 @@ mod tests {
     #[test]
     fn aisnap_1_explicit_role_case_insensitive() {
         let (doc, id) = parse_and_select(r#"<div role="Button">x</div>"#, "div");
-        assert_role(compute_role(&doc, id), "button", RoleSource::Explicit);
+        assert_role(role_of(&doc, id), "button", RoleSource::Explicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: 前後に空白を含む `role` 属性値
@@ -851,7 +928,7 @@ mod tests {
     #[test]
     fn aisnap_1_explicit_role_trims_whitespace() {
         let (doc, id) = parse_and_select(r#"<div role="  button  ">x</div>"#, "div");
-        assert_role(compute_role(&doc, id), "button", RoleSource::Explicit);
+        assert_role(role_of(&doc, id), "button", RoleSource::Explicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: 有効なトークンが無ければ暗黙
@@ -859,7 +936,7 @@ mod tests {
     #[test]
     fn aisnap_1_explicit_role_unknown_falls_back_to_implicit() {
         let (doc, id) = parse_and_select(r#"<div role="foo">x</div>"#, "div");
-        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: 空の `role=""` は有効なトークンが
@@ -867,7 +944,7 @@ mod tests {
     #[test]
     fn aisnap_1_explicit_role_empty_falls_back_to_implicit() {
         let (doc, id) = parse_and_select(r#"<button role="">x</button>"#, "button");
-        assert_role(compute_role(&doc, id), "button", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "button", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: abstract role（例: `landmark`）は
@@ -875,7 +952,7 @@ mod tests {
     #[test]
     fn aisnap_1_abstract_role_is_not_accepted() {
         let (doc, id) = parse_and_select(r#"<button role="landmark">x</button>"#, "button");
-        assert_role(compute_role(&doc, id), "button", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "button", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: `role` 属性は要素の暗黙 role を
@@ -883,7 +960,7 @@ mod tests {
     #[test]
     fn aisnap_1_explicit_role_overrides_element_role() {
         let (doc, id) = parse_and_select(r##"<a href="#" role="tab">x</a>"##, "a");
-        assert_role(compute_role(&doc, id), "tab", RoleSource::Explicit);
+        assert_role(role_of(&doc, id), "tab", RoleSource::Explicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）:
@@ -894,10 +971,10 @@ mod tests {
     #[test]
     fn aisnap_1_presentation_ignored_on_focusable_button() {
         let (doc, id) = parse_and_select(r#"<button role="presentation">x</button>"#, "button");
-        assert_role(compute_role(&doc, id), "button", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "button", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select(r#"<button role="none">x</button>"#, "button");
-        assert_role(compute_role(&doc, id), "button", RoleSource::Implicit);
+        assert_role(role_of(&doc, id), "button", RoleSource::Implicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）:
@@ -907,7 +984,7 @@ mod tests {
     #[test]
     fn aisnap_1_presentation_ignored_on_tabindex_element() {
         let (doc, id) = parse_and_select(r#"<div tabindex="0" role="presentation">x</div>"#, "div");
-        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: グローバル
@@ -916,7 +993,7 @@ mod tests {
     #[test]
     fn aisnap_1_none_ignored_on_element_with_global_aria_attribute() {
         let (doc, id) = parse_and_select(r#"<div role="none" aria-label="x">y</div>"#, "div");
-        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: フォーカス
@@ -925,10 +1002,10 @@ mod tests {
     #[test]
     fn aisnap_1_presentation_accepted_without_focus_or_global_aria() {
         let (doc, id) = parse_and_select(r#"<div role="presentation">x</div>"#, "div");
-        assert_role(compute_role(&doc, id), "presentation", RoleSource::Explicit);
+        assert_role(role_of(&doc, id), "presentation", RoleSource::Explicit);
 
         let (doc, id) = parse_and_select(r#"<img src="a.png" alt="" role="none">"#, "img");
-        assert_role(compute_role(&doc, id), "none", RoleSource::Explicit);
+        assert_role(role_of(&doc, id), "none", RoleSource::Explicit);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: テキストノードは role を持たず
@@ -943,7 +1020,7 @@ mod tests {
             .expect("セレクタは解釈できる")
             .expect("p 要素が見つかる");
         let text_node = doc.first_child(p).expect("p の子にテキストノードがある");
-        assert_eq!(compute_role(&doc, text_node), None);
+        assert_eq!(role_of(&doc, text_node), None);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: 対応表に無い要素（SVG）は
@@ -951,6 +1028,6 @@ mod tests {
     #[test]
     fn aisnap_1_svg_is_generic_fallback() {
         let (doc, id) = parse_and_select("<svg><circle/></svg>", "svg");
-        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
     }
 }
