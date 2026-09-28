@@ -109,13 +109,6 @@ tokio = { version = "=1.53.1", default-features = false, features = [
 # の Servo 隔離と同様の考え方）。
 v8 = { version = "=152.2.0" }
 
-# TASK-29（Issue #503・JS-1）: Windows で JS ワーカーの子プロセスが自身を Job
-# Object へ所属させ、プロセス単位のコミットメモリ上限（ProcessMemoryLimit）を
-# OS に強制させるために使う。Win32 FFI を内部に隠蔽した safe ラッパのため、
-# 本リポ側に unsafe を追加しない。MIT OR Apache-2.0。ユーザー承認 2026-09-28。
-# windows（0.61）・thiserror（1.x）を推移依存として引き込む（windows 限定）。
-win32job = { version = "=2.0.3" }
-
 # TASK-29（Issue #503・JS-1）: Windows で JS ワーカーの子プロセスに OS 強制の
 # コミットメモリ上限（Job Object の ProcessMemoryLimit）を掛け、親側で子の
 # コミット量（PrivateUsage）を取得するために Win32 API を直接呼ぶ。win32job の
