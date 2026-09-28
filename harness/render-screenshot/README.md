@@ -10,8 +10,9 @@ SSIM 0.90 以上・主要レイアウト要素の境界ボックスの 80% 以�
 「両エンジンで同じ条件（viewport・待ち時間）の PNG を揃えて取得する」部分のみで、
 比較そのもの（SSIM・境界ボックス算出）と実機での合否判定は別 Issue の範囲になる。
 
-- SSIM・境界ボックスの算出: #54（TASK-37.2）。`measure_ssim.py` が本ディレクトリに
-  追加され、`capture-result.json`（下記スキーマ）を入力として読む想定
+- SSIM・境界ボックスの算出: `measure_ssim.py`（TASK-37.2。#54 で実装済み）が
+  `capture-result.json`（下記スキーマ）を入力として読み、サイトごとの SSIM 値と
+  境界ボックス一致率を算出する（下記「`measure_ssim.py`: SSIM・境界ボックス比較」参照）
 - Linux 実機での測定と合否判定: #55（TASK-37.h1。人間が担当）
 
 ### spec パスからの読み替え
@@ -296,7 +297,7 @@ servoshell 系（TASK-36 で確定したオプション名に合わせて読み�
 
 ## 結果 JSON（`capture-result.json`）のスキーマ
 
-`schema_version: 1`。#54（TASK-37.2）の `measure_ssim.py` が読む入力契約。
+`schema_version: 1`。`measure_ssim.py`（TASK-37.2）が読む入力契約。
 
 ```json
 {
@@ -459,9 +460,153 @@ python3 -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
   場合も例外を伝播させず `failed` として記録し、他サイト・他エンジンの撮影と
   `capture-result.json` の書き出しを継続する
 
+## `measure_ssim.py`: SSIM・境界ボックス比較（TASK-37.2）
+
+`RENDER-5`（関連: `MEAS-3`）/ MS-1 対応。`capture_screenshots.py` が書き出した
+`capture-result.json` と両エンジンの PNG を読み、サイトごとに SSIM 値と境界
+ボックス一致率を数値で算出し、RENDER-5 の判定基準（後述）と機械的に比較した
+結果を `<capture-dir>/measure-result.json` へ書き出す。
+
+**これは閾値との機械的な比較に過ぎない。実機（Linux）で撮影した PNG に対する
+RENDER-5 / MEAS-3 の最終合否判定は #55（TASK-37.h1。人間が担当）が行う。**
+本スクリプトの `verdict` を実機合格の証跡として扱わないこと（REPAIR-3）。
+
+### 使い方
+
+```bash
+python3 harness/render-screenshot/measure_ssim.py \
+  --capture-dir /path/to/out \
+  --min-sites 5
+```
+
+`--capture-dir` は `capture_screenshots.py --out-dir` の出力先。`--min-sites`
+（既定 5）以上のサイトが「SSIM 0.90 以上 かつ 境界ボックス一致率 80% 以上」を
+満たせば終了コード 0、満たさなければ 1、`--capture-dir`・`capture-result.json`
+の不正は 2 を返す（`capture_screenshots.py` と同じ終了コード体系）。
+
+### 境界ボックスの入力契約（範囲外: 抽出処理そのもの）
+
+境界ボックスの**抽出**（Chromium の CDP `DOM.getBoxModel` 等・Servo 側の API）は
+本スクリプトの範囲外であり、TASK-36/38 の成果次第でまだ決まっていない。
+本スクリプトはエンジンごとの**入力契約**だけを定義する:
+`<capture-dir>/<engine>/<site_id>.bboxes.json`
+
+```json
+{
+  "schema_version": 1,
+  "elements": [
+    { "id": "header", "x": 0, "y": 0, "width": 1280, "height": 64 }
+  ]
+}
+```
+
+- `id` は `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` に一致し重複不可。`x`/`y`/`width`/
+  `height` は有限の数値（`bool` は不可）で絶対値 1e6 以下、`width`/`height` は
+  0 以上。要素数は 100 以下（PoC-6 が想定する 5〜10 件から外れる場合は警告のみ）
+- ファイルが存在しない場合、そのサイトの bbox 判定は `not_measured`（サイト
+  不合格）になる。エンジン側で bbox を書き出す仕組みができるまでの既定挙動
+
+### ±5%・80% の解釈（#55 で確認する解釈）
+
+Chromium を基準（reference）、Servo を対象（target）とする。要素 1 件の一致
+判定は 4 辺（`x`・`x+width`・`y`・`y+height`）それぞれのずれが、対応する軸の
+viewport 寸法（`x` 系は width、`y` 系は height）の ±5% 以内かで行う。ちょうど
+5% は一致とする（浮動小数誤差は `1e-9` の加算で吸収）。一致率は「一致した
+要素数 ÷ Chromium 側の要素数」。Servo 側に無い `id` は不一致、Servo 側にしか
+無い `id` は無視して警告のみ出す。Chromium 側の要素が 0 件の場合は判定不能
+として `error` を返す。80% 以上（例: 8/10）で合格、未満（例: 7/10）で不合格。
+
+### SSIM の算出パラメータ（他ツールの値と比較するには揃える必要がある）
+
+Wang et al. 2004 の SSIM。グレースケール化は BT.601 の整数近似
+`Y = (299R+587G+114B+500)//1000`。アルファチャンネルがある場合は不透明な白
+（255）の上に合成してから輝度を計算する。窓は 7x7 一様窓・パディングなし
+（valid 窓のみ）・母分散/母共分散、`K1=0.01`・`K2=0.03`・`L=255`。全窓の平均
+（mean SSIM）を採用する。これらのパラメータが異なる SSIM 実装（scikit-image
+等）とは数値が一致しない可能性があるため、他ツールと比較する場合はパラメータ
+を揃えること。
+
+### 対応する PNG 形式・上限
+
+bit depth 8・非インターレース・color type 0/2/4/6（グレースケール・RGB・
+グレースケール+アルファ・RGBA）のみに対応する。16bit・パレット（color type
+3）・Adam7 インターレースは `PngDecodeError` で明示的に拒否する（実機の
+エンジンがこれらの形式を出力した場合は #55 で追加対応を検討する）。
+SSIM 計算の画素数上限は `MAX_SSIM_PIXELS`（2560x1600）で、超過したサイトは
+`error` になる（純 Python 実装が現実的な時間で処理できる範囲に収めるため）。
+
+### 出力スキーマ（`measure-result.json`）
+
+```json
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-28T00:00:00Z",
+  "reference_engine": "chromium",
+  "target_engine": "servo",
+  "viewport": { "width": 1280, "height": 800 },
+  "thresholds": { "ssim_min": 0.9, "bbox_rate_min": 0.8, "bbox_tolerance": 0.05, "min_sites": 5 },
+  "ssim_method": {
+    "window": 7, "window_shape": "uniform", "padding": "none",
+    "covariance": "population", "luma": "bt601-int", "alpha": "composite-over-white"
+  },
+  "sites": [
+    {
+      "site_id": "a1-wikipedia",
+      "status": "measured",
+      "reason": null,
+      "ssim": { "status": "measured", "value": 0.93, "passed": true, "reason": null },
+      "bbox": {
+        "status": "measured", "matched": 8, "total": 10, "rate": 0.8, "passed": true,
+        "elements": [
+          { "id": "header", "max_deviation_ratio": 0.01, "within_tolerance": true, "missing_in_target": false }
+        ],
+        "warnings": [],
+        "reason": null
+      },
+      "passed": true
+    }
+  ],
+  "summary": {
+    "pair_count": 5,
+    "passing_sites": 5,
+    "verdict": "meets_threshold",
+    "note": "mechanical threshold comparison; not a hardware-verified result (see issue #55)"
+  }
+}
+```
+
+`sites[].status` は `measured`（両エンジンの PNG が揃っていた）/ `skipped`
+（`capture-result.json` の時点でペアにならなかった。`reason` に理由）。
+`ssim.status` は `measured` / `error`（デコード失敗・寸法不一致・SSIM 窓未満・
+画素数上限超過）。`bbox.status` は `measured` / `not_measured`（Chromium 側の
+bbox ファイルが無い）/ `error`（JSON 不正・Chromium 側の要素が 0 件等）。
+`sites[].passed` は `ssim.passed and bbox.passed`（両方 `measured` かつ閾値
+以上の場合のみ true。`not_measured`・`error` は fail-closed で不合格）。
+
+### セキュリティ上の注意
+
+非信頼入力は `capture-result.json`・PNG ファイル・bbox JSON の 3 つ（いずれも
+エンジンの出力や第三者が作ったファイルであり得る前提）。`capture-result.json`
+の `png` フィールドは capture-dir 配下の相対パスのみを許可し（絶対パス・`..`・
+symlink を拒否）、PNG・bbox JSON も symlink を拒否したうえで読み込む。
+ファイルサイズ（`capture-result.json` 4 MiB・bbox JSON 1 MiB）・bbox 要素数
+（100）・PNG のチャンク数（`capture_screenshots.MAX_PNG_CHUNKS`）・展開後サイズ
+（`capture_screenshots.MAX_PNG_RAW_BYTES`）・SSIM の画素数（`MAX_SSIM_PIXELS`）に
+上限を設け、無制限確保による DoS（OWASP A04）を防ぐ。bbox JSON の数値は
+`NaN`/`Infinity`・巨大な指数表記・巨大整数リテラルを拒否し、`Fraction`/
+`Decimal` へ生トークンを渡さない。PNG は 1 回目の検証（`capture_one` 実行時の
+`read_png_size`）を信用せず、2 回目の読み込みでも CRC・チャンク構造・展開後
+サイズを自前で再検証する（TOCTOU 対策）。シェル実行・`eval`・`subprocess` は
+使わない。
+
 ## スコープ外・申し送り
 
 - 実機（Linux）での Servo・Chromium の撮影と合否判定: #55（人間が担当）
-- SSIM・境界ボックスの算出: #54（TASK-37.2）
+- 境界ボックスの抽出処理（Chromium の CDP `DOM.getBoxModel` 等・Servo 側の API。
+  TASK-36/38 の成果次第）と、サイトごとの対象要素（5〜10 件）の選定
+- ±5% と 80% の解釈、および SSIM のパラメータ（上記「`measure_ssim.py`」の
+  各節に記載）を #55（実機での測定・合否判定）で確認・確定してもらうこと
+- 16bit・パレット・インターレースの PNG への対応（実機のエンジンがそうした
+  形式を出力した場合）
 - `make ci` / `.github/workflows/ci.yml` への本ハーネスのテスト組み込み: 未実施
   （後続候補として PR に記載）
