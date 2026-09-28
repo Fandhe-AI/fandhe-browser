@@ -292,8 +292,8 @@ mod windows_job {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
+        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -338,13 +338,21 @@ mod windows_job {
         // `Drop` が `CloseHandle` を呼び、ハンドルをリークしない。
         let job = JobHandle(handle);
 
-        // `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` は `Default` を実装して
+        // `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`（と
+        // `JOBOBJECT_BASIC_LIMIT_INFORMATION`）は `Default` を実装して
         // いる（数値フィールドのみの POD 構造体）ため、`unsafe` な
         // ゼロ初期化は不要（承認された unsafe の範囲を Win32 呼び出しに
-        // 限定する）。
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
-        info.ProcessMemoryLimit = limit_bytes;
+        // 限定する）。フィールド構文で必要な 2 箇所だけを埋め、残りは
+        // `..Default::default()` に任せる（clippy
+        // `field_reassign_with_default` 対応）。
+        let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+            BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                LimitFlags: JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+                ..Default::default()
+            },
+            ProcessMemoryLimit: limit_bytes,
+            ..Default::default()
+        };
 
         // SAFETY: `job.0` は直前で作成した有効な Job ハンドル。`info` は
         // 正しいサイズで初期化済みのローカル変数であり、この呼び出しの
@@ -532,8 +540,10 @@ fn read_rss_windows(probe: ChildMemoryProbe) -> Option<u64> {
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
     };
 
-    let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
-    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
 
     // SAFETY: `probe` は呼び出し元が保証する、生きている（または直前まで
     // 生きていた）子プロセスの有効なハンドル。`GetProcessMemoryInfo` は

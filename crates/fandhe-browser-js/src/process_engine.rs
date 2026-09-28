@@ -160,6 +160,10 @@ fn child_memory_probe(
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::io::AsRawHandle;
+        // Windows では pid ではなくハンドルを使うため、`pid` 引数は
+        // 使わない（Linux・macOS 向けの分岐と同じシグネチャに揃えるため
+        // 残している）。
+        let _ = pid;
         let guard = child.lock().ok()?;
         Some(guard.as_raw_handle())
     }
