@@ -116,6 +116,20 @@ v8 = { version = "=152.2.0" }
 # windows（0.61）・thiserror（1.x）を推移依存として引き込む（windows 限定）。
 win32job = { version = "=2.0.3" }
 
+# TASK-29（Issue #503・JS-1）: Windows で JS ワーカーの子プロセスに OS 強制の
+# コミットメモリ上限（Job Object の ProcessMemoryLimit）を掛け、親側で子の
+# コミット量（PrivateUsage）を取得するために Win32 API を直接呼ぶ。win32job の
+# safe API では ProcessMemoryLimit を設定できないため（ExtendedLimitInfo の内部が
+# pub(crate)）。unsafe はこの Win32 呼び出しに限定する（ユーザー承認 2026-09-28）。
+# 既に推移依存として Cargo.lock にある 0.61.2 を直接固定する。
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+] }
+
 [profile.release]
 # release ビルドは panic 発生時に unwind せず即座に中断する前提
 # （coding-rust.md「release は panic = "abort" 前提のため catch_unwind に頼らない」）。
