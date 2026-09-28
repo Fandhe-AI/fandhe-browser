@@ -162,7 +162,7 @@ pub(crate) const MAX_CHILD_RSS_BYTES: u64 = super::v8_engine::MAX_ISOLATE_HEAP_B
 /// （[`read_rss_windows`] 参照）。
 pub(crate) const RSS_POLL_INTERVAL: Duration = Duration::from_millis(75);
 
-/// Linux の `RLIMIT_DATA`（soft/hard 両方）に設定する上限（バイト。
+/// Linux の `RLIMIT_DATA`（soft/hard 両方）に設定したい上限（バイト。
 /// 2 GiB）。[`MAX_CHILD_RSS_BYTES`]（320 MiB）とは意図的に値を分離して
 /// いる。理由・実測値はモジュール冒頭のドキュメントコメント「OS ごとの
 /// 強制の強さ」節を参照（V8 の `CodeRange` 仮想アドレス予約だけで
@@ -174,8 +174,60 @@ pub(crate) const RSS_POLL_INTERVAL: Duration = Duration::from_millis(75);
 /// 極端なプロセス全体のメモリ膨張だけは食い止める最終防衛線」として
 /// 機能する。通常の攻撃的なスクリプトは、この上限に達するはるか手前で
 /// 親側の RSS 監視（[`MAX_CHILD_RSS_BYTES`]）に捕まる想定である。
+///
+/// **これは「引き上げたい」上限であり、実際に設定する値ではない**
+/// （codex レビュー指摘 #503 P1「既存の RLIMIT_DATA を超える hard limit
+/// を設定しない」対応）。Linux の子プロセスは親の `RLIMIT_DATA` を
+/// 継承するため、親の hard limit が本値より小さい環境（コンテナ・
+/// systemd の `LimitDATA=` 等で既に制限されている場合）では、非特権
+/// プロセスは hard limit を**引き上げられない**（`setrlimit(2)` は
+/// `CAP_SYS_RESOURCE` が無い限り hard limit の引き上げを許さない）。
+/// そのため実際に設定する値は、[`compute_rlimit_data_target`] が
+/// 「既存の hard limit と本値の小さいほう」として計算する（既存の hard
+/// limit が無制限なら本値をそのまま使う）。この計算により、本関数は
+/// 既存の hard limit を**下げる方向にしか変更しない**ため、非特権
+/// プロセスでも常に成功する。
 #[cfg(target_os = "linux")]
 const LINUX_RLIMIT_DATA_CEILING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// [`enforce_via_rlimit_data`] が実際に `RLIMIT_DATA` の soft/hard 両方に
+/// 設定する値を、既存の hard limit（`getrlimit` で取得した
+/// [`rustix::process::Rlimit::maximum`]）から計算する（codex レビュー
+/// 指摘 #503 P1 対応。純粋関数として切り出し、実際に `setrlimit` を
+/// 呼ばずに単体テストできるようにする）。
+///
+/// - 既存の hard limit が無制限（`None`）なら [`LINUX_RLIMIT_DATA_CEILING_BYTES`]
+///   をそのまま使う。
+/// - 既存の hard limit が [`LINUX_RLIMIT_DATA_CEILING_BYTES`] 以上なら、
+///   [`LINUX_RLIMIT_DATA_CEILING_BYTES`] まで**下げる**（本モジュールが
+///   前提とする「V8 の `CodeRange` 予約を許すが、際限のない膨張だけは
+///   防ぐ」設計に合わせるため。既存の hard limit をそのまま使い続けると、
+///   本モジュールの想定より緩い上限になってしまう）。
+/// - 既存の hard limit がそれより小さいなら、既存の hard limit を
+///   そのまま使う（引き上げない。非特権プロセスでも `setrlimit` が
+///   成功することを最優先する）。
+///
+/// **既存の hard limit が、V8 の `CodeRange` 予約（実測で x86_64 約
+/// 762 MiB）すら満たせないほど小さい環境の扱い**: そのまま設定すると、
+/// この後の V8 初期化（`super::v8_engine::V8Engine::new` 相当）が
+/// `RLIMIT_DATA` 到達によりクラッシュし、子プロセスは `Hello` を送らずに
+/// 終了する。これは意図的な挙動である（fail-closed。実装済みを装わない。
+/// REPAIR-3）: 本関数は「既存の環境制約の範囲内で、できるだけ V8 が
+/// 動く上限を設定する」ことしかできず、環境自体が V8 の実行に必要な
+/// メモリを許していない場合にまで動作を保証することはできない。親
+/// （`super::process_engine::spawn_worker`）はこれを「`Hello` 受信前に
+/// 子プロセスが終了した」ハンドシェイク失敗として検出し、
+/// `JsEngineError::EngineUnavailable` に変換する（既存の経路。本対応で
+/// 新設したものではない）。呼び出し元には「このプロセスでは動かせない」
+/// ことが明確なエラーとして伝わり、`ResourceLimitExceeded` を検出したと
+/// 偽ることはない。
+#[cfg(target_os = "linux")]
+fn compute_rlimit_data_target(existing_hard_limit: Option<u64>) -> u64 {
+    match existing_hard_limit {
+        Some(hard) => hard.min(LINUX_RLIMIT_DATA_CEILING_BYTES),
+        None => LINUX_RLIMIT_DATA_CEILING_BYTES,
+    }
+}
 
 /// Windows の Job Object `ProcessMemoryLimit`（コミットメモリ上限。
 /// バイト）。codex レビュー指摘 #503 P0「Windows では working set の
@@ -274,19 +326,32 @@ pub(crate) fn enforce_child_memory_limit() -> Result<ChildMemoryLimitGuard, Stri
     }
 }
 
-/// Linux: `RLIMIT_DATA` の soft/hard 両方を [`LINUX_RLIMIT_DATA_CEILING_BYTES`]
-/// に設定する。`rustix::process::setrlimit` は safe API のため `unsafe` を
-/// 追加しない。
+/// Linux: `RLIMIT_DATA` の soft/hard 両方を、既存の hard limit を超えない
+/// 値（[`compute_rlimit_data_target`]）に設定する。`rustix::process::
+/// getrlimit`・`setrlimit` は safe API のため `unsafe` を追加しない
+/// （codex レビュー指摘 #503 P1「既存の RLIMIT_DATA を超える hard limit
+/// を設定しない」対応。既存の hard limit を取得せずに固定値
+/// [`LINUX_RLIMIT_DATA_CEILING_BYTES`] へ引き上げようとすると、親（この
+/// プロセスを起動したシェル・コンテナランタイム・systemd 等）が既に
+/// より厳しい hard limit を設定している環境で、非特権プロセスには
+/// 許されない「hard limit の引き上げ」を試みることになり `setrlimit`
+/// が失敗して子プロセスが評価を始めずに終了してしまう）。
 #[cfg(target_os = "linux")]
 fn enforce_via_rlimit_data() -> Result<(), String> {
-    use rustix::process::{Resource, Rlimit, setrlimit};
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 
+    let existing = getrlimit(Resource::Data);
+    let target = compute_rlimit_data_target(existing.maximum);
     let limit = Rlimit {
-        current: Some(LINUX_RLIMIT_DATA_CEILING_BYTES),
-        maximum: Some(LINUX_RLIMIT_DATA_CEILING_BYTES),
+        current: Some(target),
+        maximum: Some(target),
     };
     setrlimit(Resource::Data, limit).map_err(|err| {
-        format!("failed to set RLIMIT_DATA to {LINUX_RLIMIT_DATA_CEILING_BYTES} bytes: {err}")
+        format!(
+            "failed to set RLIMIT_DATA to {target} bytes (existing hard limit: \
+             {:?}): {err}",
+            existing.maximum
+        )
     })
 }
 
@@ -631,6 +696,48 @@ mod tests {
     #[test]
     fn js_1_linux_rlimit_data_ceiling_matches_the_documented_value() {
         assert_eq!(LINUX_RLIMIT_DATA_CEILING_BYTES, 2 * 1024 * 1024 * 1024);
+    }
+
+    /// codex レビュー指摘 #503 P1「既存の RLIMIT_DATA を超える hard limit
+    /// を設定しない」の単体テスト: `compute_rlimit_data_target` が、
+    /// 既存の hard limit の 3 パターン（無制限・上限より大きい・上限より
+    /// 小さい）それぞれで、期待どおりの具体値を返すこと。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn js_1_compute_rlimit_data_target_never_exceeds_the_existing_hard_limit() {
+        // 既存の hard limit が無制限（`None`）: 本来の上限（2 GiB）を
+        // そのまま使う。
+        assert_eq!(
+            compute_rlimit_data_target(None),
+            LINUX_RLIMIT_DATA_CEILING_BYTES
+        );
+
+        // 既存の hard limit が本来の上限より大きい（例: 4 GiB）:
+        // 本来の上限（2 GiB）まで下げる。既存の hard limit をそのまま
+        // 使うと、本モジュールが前提とする「際限のない膨張だけは防ぐ」
+        // という設計より緩い上限になってしまうため。
+        let larger_hard_limit = 4 * 1024 * 1024 * 1024;
+        assert_eq!(
+            compute_rlimit_data_target(Some(larger_hard_limit)),
+            LINUX_RLIMIT_DATA_CEILING_BYTES
+        );
+
+        // 既存の hard limit が本来の上限より小さい（例: 512 MiB。
+        // コンテナ・systemd 等で既により厳しい制限がある環境を模す）:
+        // 既存の hard limit をそのまま使う（引き上げない。非特権
+        // プロセスでも `setrlimit` が確実に成功することを優先する）。
+        let smaller_hard_limit = 512 * 1024 * 1024;
+        assert_eq!(
+            compute_rlimit_data_target(Some(smaller_hard_limit)),
+            smaller_hard_limit
+        );
+
+        // 既存の hard limit がちょうど本来の上限と同じ場合: そのまま
+        // 使う（境界値）。
+        assert_eq!(
+            compute_rlimit_data_target(Some(LINUX_RLIMIT_DATA_CEILING_BYTES)),
+            LINUX_RLIMIT_DATA_CEILING_BYTES
+        );
     }
 
     /// codex レビュー指摘 #503 P0: 現在のプロセス自身の RSS を取得できる
