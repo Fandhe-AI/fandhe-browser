@@ -180,7 +180,20 @@ impl Config {
                     }));
                 }
 
-                root
+                // 検証に使った字句正規化済みパス（`root_abs`）をそのまま
+                // 採用する（Issue #538 P0 レビュー再指摘）。未正規化の
+                // `root` を返すと、検証済みの最終到達点と実際に
+                // `fandhe-browser-profile::Profile::open`（TASK-50・#177）が
+                // 要素ごとに辿るパスが食い違う。例えば設定ディレクトリが
+                // `<dir>` のとき `root = "<dir>/../outside/../<dir 名>/profiles"`
+                // は字句正規化後の最終到達点こそ `<dir>/profiles`（境界内）だが、
+                // 未正規化のまま渡すと `Profile::open` は `outside` という
+                // 実在しない兄弟ディレクトリを経由して辿ろうとし、設定
+                // ディレクトリ外への作成につながりかねない（security.md
+                // 「不安全な設計」・プロファイル境界）。字句正規化済みの
+                // `root_abs` を渡すことで、境界検証と実際に使われるパスを
+                // 一致させる。
+                root_abs
             } else {
                 // 設定ファイルの親ディレクトリ基準で解決する（CWD 非依存）。
                 // `path` 自体が相対パス（例: `config/fandhe-browser.toml`）の

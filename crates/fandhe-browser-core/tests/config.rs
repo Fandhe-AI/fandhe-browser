@@ -115,12 +115,55 @@ fn task_91_1_load_with_relative_path_resolves_root_to_absolute() {
     std::env::set_current_dir(&original_cwd).expect("元の CWD へ戻せる");
     let config = load_result.expect("Config::load がパニックしない");
 
+    // 期待する祖先ディレクトリ（設定ファイルの親＝一時ディレクトリ自体。
+    // 実在するので `canonicalize()` できる）を、`dir.path()` を
+    // `canonicalize()` した上で組み立てる（Bugbot 指摘の回帰防止）。
+    // `"profiles/default"` サブディレクトリ自体は作成していないため
+    // 実在せず、`root` 全体は `canonicalize()` できない。実装側は CWD
+    // 基準の絶対化に `std::path::absolute`（内部で `current_dir()`／
+    // `getcwd` を使う）を用いており、macOS では `set_current_dir` 後の
+    // `getcwd` がシンボリックリンク解決済みパス（`/private/var/...`）を
+    // 返す一方、`std::env::temp_dir()`（`dir.path()` の基点）は未解決の
+    // まま（`/var/...`）となる。両者は同じディレクトリを指すが字句表現が
+    // 異なるため、比較前に実在する祖先部分だけを `canonicalize()` して
+    // 物理パスへ揃える（実装側は symlink 解決をファイルシステムアクセス
+    // なしで行う設計方針〔モジュール doc「パス解決」参照〕のため変更
+    // しない。あくまでテストの比較方法の修正）。
+    let canonical_dir = dir
+        .path()
+        .canonicalize()
+        .expect("一時ディレクトリを canonicalize できる");
+
+    let assert_root_resolves_to = |root: &Path| {
+        assert!(
+            root.is_absolute(),
+            "root は絶対パスに解決されるべき: {root:?}"
+        );
+        assert_eq!(
+            root.file_name(),
+            Some(std::ffi::OsStr::new("default")),
+            "root の末尾要素は 'default' であるべき: {root:?}"
+        );
+        assert_eq!(
+            root.parent().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("profiles")),
+            "root の親要素は 'profiles' であるべき: {root:?}"
+        );
+        let ancestor = root
+            .parent()
+            .and_then(Path::parent)
+            .expect("root は <一時ディレクトリ>/profiles/default の形をしている");
+        assert_eq!(
+            ancestor
+                .canonicalize()
+                .expect("root の祖先（一時ディレクトリ自体）は実在し canonicalize できる"),
+            canonical_dir,
+            "root の祖先は設定ファイルの親ディレクトリと物理的に一致するべき: {root:?}"
+        );
+    };
+
     let root = config.profile().root().expect("root が解決されている");
-    assert!(
-        root.is_absolute(),
-        "root は絶対パスに解決されるべき: {root:?}"
-    );
-    assert_eq!(root, dir.path().join("profiles/default"));
+    assert_root_resolves_to(root);
 
     // CWD を設定ファイル読み込み後に変更しても、解決済みの root は
     // 変わらない（CWD 非依存の契約）。
@@ -128,10 +171,7 @@ fn task_91_1_load_with_relative_path_resolves_root_to_absolute() {
     std::env::set_current_dir(another_dir.path()).expect("別ディレクトリへ CWD を移せる");
     let unaffected = config.profile().root().map(Path::to_path_buf);
     std::env::set_current_dir(&original_cwd).expect("元の CWD へ戻せる");
-    assert_eq!(
-        unaffected.as_deref(),
-        Some(dir.path().join("profiles/default")).as_deref()
-    );
+    assert_root_resolves_to(unaffected.as_deref().expect("root が保持されている"));
 }
 
 /// TASK-91（91.1）: 絶対 `root` はそのまま使われる（親ディレクトリで
@@ -146,6 +186,46 @@ fn task_91_1_absolute_root_is_used_as_is() {
     let config = Config::load(&config_path).expect("設定ファイルを読み込める");
 
     assert_eq!(config.profile().root(), Some(absolute_root.as_path()));
+}
+
+/// TASK-91（91.1）: 絶対 `root` が境界検証を通過した場合、返される
+/// `profile.root` は字句正規化済みのパスになる（Issue #538 P0 レビュー
+/// 再指摘の回帰防止）。`<dir>/../outside/../<dir 名>/profiles` は字句上の
+/// 最終到達点こそ `<dir>/profiles`（設定ディレクトリ配下）で境界検証は
+/// 通過するが、未正規化のまま返すと
+/// `fandhe-browser-profile::Profile::open`（TASK-50・#177）が要素ごとに
+/// 辿った際、実在しない兄弟ディレクトリ `outside` を経由しようとして
+/// 設定ディレクトリ外に作成しかねない。返り値が正規化済みで `outside` を
+/// 含まないことを確認する。
+#[test]
+fn task_91_1_absolute_root_with_lexical_escape_is_normalized_before_return() {
+    let dir = TempDir::new();
+    let dir_name = dir
+        .path()
+        .file_name()
+        .expect("一時ディレクトリ名を取得できる");
+    let unnormalized_root = dir
+        .path()
+        .join("..")
+        .join("outside")
+        .join("..")
+        .join(dir_name)
+        .join("profiles");
+    let toml_source = format!("[profile]\nroot = {unnormalized_root:?}\n");
+    let config_path = dir.write_config(&toml_source);
+
+    let config = Config::load(&config_path).expect("境界検証を通過して読み込める");
+
+    let root = config.profile().root().expect("root が解決されている");
+    assert_eq!(
+        root,
+        dir.path().join("profiles"),
+        "root は字句正規化済みのパスであるべき（未正規化の 'outside' を含んではならない）"
+    );
+    assert!(
+        !root.components().any(|c| c.as_os_str() == "outside"),
+        "root に未正規化の中間要素 'outside' が残っている: {root:?}"
+    );
 }
 
 /// TASK-91（91.1）: 存在しないファイルは `ConfigError::Io` になる。
