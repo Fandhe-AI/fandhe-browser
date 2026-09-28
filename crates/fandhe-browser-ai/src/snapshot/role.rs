@@ -32,6 +32,11 @@
 //! - DPub/Graphics ARIA モジュールの role
 //! - `section` の `region` 昇格（accessible name を持つときのみ `region`
 //!   になる規則。accessible name の算出自体が TASK-11.4・Issue #73 の範囲）
+//! - `form`・`img` の完全な accessible name 算出。`aria-labelledby` が
+//!   指す要素のテキストやネイティブラベリング機構までを含めた判定は
+//!   TASK-11.4・Issue #73 の範囲であり、本実装は `aria-label`/
+//!   `aria-labelledby` 属性の非空値の有無だけを見る簡易 hint
+//!   （[`has_name_hint`]）に留める
 //! - `th`/`td` の表文脈による完全な判定（`scope` が無い `th` を位置で
 //!   行見出し・列見出し・セルに振り分ける処理、`td` が `gridcell` になる
 //!   文脈）。本実装は `th` を `scope` 属性のみで判定する簡易実装である
@@ -238,11 +243,30 @@ fn implicit_role_for_th(doc: &Document, id: NodeId) -> ComputedRole {
     }
 }
 
+/// 属性値のみを見る簡易な「名前ヒント」判定。`aria-labelledby`・
+/// `aria-label` のいずれかが空でない値を持つかどうかを返す。
+///
+/// 簡易実装: WAI-ARIA の accessible name 算出アルゴリズム（`aria-labelledby`
+/// が指す要素の実テキスト・ネイティブラベリング機構（`label` 要素等）・
+/// `title` 属性まで含めた優先順位付き算出）は TASK-11.4（Issue #73）の
+/// 範囲であり、本実装はここでは `aria-label`/`aria-labelledby` 属性の
+/// 非空値の有無だけを見る hint に留める（[`implicit_role_for_img`]・
+/// `form` の暗黙 role 判定から利用）。
+fn has_name_hint(doc: &Document, id: NodeId) -> bool {
+    let non_empty = |attr: &str| {
+        doc.attribute(id, attr)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    non_empty("aria-label") || non_empty("aria-labelledby")
+}
+
 /// `img` 要素の暗黙 role を返す。`alt=""`（空文字列。属性自体が無い場合は
-/// 含まない）なら装飾画像として `none`、それ以外（`alt` 省略を含む）は
-/// `img`。
+/// 含まない）は装飾画像として `none` になるが、[`has_name_hint`] が示す
+/// ARIA 名（`aria-label`/`aria-labelledby`）を持つ場合はその意図を優先し
+/// `img` のまま扱う（HTML-AAM。ARIA 名がある画像を装飾画像として消さない
+/// ため）。それ以外（`alt` 省略を含む）は `img`。
 fn implicit_role_for_img(doc: &Document, id: NodeId) -> ComputedRole {
-    if doc.attribute(id, "alt") == Some("") {
+    if doc.attribute(id, "alt") == Some("") && !has_name_hint(doc, id) {
         ComputedRole::implicit("none")
     } else {
         ComputedRole::implicit("img")
@@ -322,7 +346,14 @@ fn implicit_role(doc: &Document, id: NodeId) -> ComputedRole {
     // `aside` → TASK-11.3.3（Issue #543）が sectioning 祖先による判定
     // （`header`/`footer` と同じ判定規則）を追加してここに分岐を足す。
     // それまでは generic（Fallback）になる。
-    if named("form") {
+    // `form` は HTML-AAM で accessible name を持つ場合に限り `form` になる
+    // （`section` の `region` 昇格と同じ規則）。[`has_name_hint`] は
+    // `aria-label`/`aria-labelledby` の非空値だけを見る簡易判定であり、
+    // `aria-labelledby` が指す要素のテキストやネイティブラベリング機構
+    // までを含めた完全な accessible name 算出は TASK-11.4（Issue #73）の
+    // 範囲。名前が無い/判定できない場合はここで return せず下の
+    // フォールバックへ流し `generic` にする。
+    if named("form") && has_name_hint(doc, id) {
         return ComputedRole::implicit("form");
     }
     if named("article") {
@@ -539,8 +570,9 @@ mod tests {
         assert_role(compute_role(&doc, li), "listitem", RoleSource::Implicit);
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: `nav`/`main`/`article`/`form`/
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `nav`/`main`/`article`/
     /// `p`/`hr`/`fieldset`/`dialog`/`option`/`textarea` の暗黙 role。
+    /// `form` は別途 [`aisnap_1_form_role_requires_name`] で扱う。
     #[test]
     fn aisnap_1_other_representative_elements() {
         let (doc, id) = parse_and_select("<nav>menu</nav>", "nav");
@@ -551,9 +583,6 @@ mod tests {
 
         let (doc, id) = parse_and_select("<article>post</article>", "article");
         assert_role(compute_role(&doc, id), "article", RoleSource::Implicit);
-
-        let (doc, id) = parse_and_select("<form></form>", "form");
-        assert_role(compute_role(&doc, id), "form", RoleSource::Implicit);
 
         let (doc, id) = parse_and_select("<p>text</p>", "p");
         assert_role(compute_role(&doc, id), "paragraph", RoleSource::Implicit);
@@ -586,6 +615,45 @@ mod tests {
 
         let (doc, id) = parse_and_select(r#"<img src="a.png">"#, "img");
         assert_role(compute_role(&doc, id), "img", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: `alt=""`
+    /// でも `aria-label`/`aria-labelledby` の非空値（ARIA 名のヒント）が
+    /// あれば装飾画像として `none` にせず `img` のまま扱う。
+    #[test]
+    fn aisnap_1_img_empty_alt_with_aria_name_stays_img() {
+        let (doc, id) = parse_and_select(r#"<img src="a.png" alt="" aria-label="説明">"#, "img");
+        assert_role(compute_role(&doc, id), "img", RoleSource::Implicit);
+
+        let (doc, id) = parse_and_select(
+            r#"<img src="a.png" alt="" aria-labelledby="caption">"#,
+            "img",
+        );
+        assert_role(compute_role(&doc, id), "img", RoleSource::Implicit);
+
+        // 空白のみの ARIA 名はヒントとして扱わない（`none` のまま）。
+        let (doc, id) = parse_and_select(r#"<img src="a.png" alt="" aria-label="  ">"#, "img");
+        assert_role(compute_role(&doc, id), "none", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: 名前の
+    /// ない `form` は `form` にせず `generic`（Fallback）とする
+    /// （HTML-AAM。`section` の `region` 昇格と同じ規則）。名前が
+    /// `aria-label`/`aria-labelledby` で判定できる場合のみ `form` になる。
+    #[test]
+    fn aisnap_1_form_role_requires_name() {
+        let (doc, id) = parse_and_select("<form></form>", "form");
+        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
+
+        let (doc, id) = parse_and_select(r#"<form aria-label="検索"></form>"#, "form");
+        assert_role(compute_role(&doc, id), "form", RoleSource::Implicit);
+
+        let (doc, id) = parse_and_select(r#"<form aria-labelledby="h1"></form>"#, "form");
+        assert_role(compute_role(&doc, id), "form", RoleSource::Implicit);
+
+        // 空白のみの aria-label はヒントとして扱わない（`generic` のまま）。
+        let (doc, id) = parse_and_select(r#"<form aria-label="  "></form>"#, "form");
+        assert_role(compute_role(&doc, id), "generic", RoleSource::Fallback);
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: 明示 role（`role` 属性）が
