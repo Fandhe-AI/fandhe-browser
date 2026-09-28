@@ -54,6 +54,29 @@ expect_contains() {
   fi
 }
 
+# expect_exit と同じだが、checker を実 workspace（$SCRIPT_DIR/../..）ではなく
+# 指定ディレクトリを CWD にして起動する（`cargo metadata` は CWD 基準のため）。
+# $1=dir, $2=case name, $3=expected exit code, remaining=checker args
+expect_exit_in() {
+  local dir="$1" name="$2" expected="$3"
+  shift 3
+  CASES=$((CASES + 1))
+  local out status
+  set +e
+  out=$(cd "$dir" && bash "$CHECKER" "$@" 2>&1)
+  status=$?
+  set -e
+  if [ "$status" -ne "$expected" ]; then
+    echo "FAIL [$name]: expected exit $expected, got $status" >&2
+    echo "  output: $out" >&2
+    FAILURES=$((FAILURES + 1))
+    LAST_OUTPUT=""
+    return
+  fi
+  echo "ok [$name]: exit=$status"
+  LAST_OUTPUT="$out"
+}
+
 # --- 判定モード（--file）。合成ファイルは head -c /dev/zero で作る（truncate は
 # macOS 標準に無いため使わない。3.5 節）。---
 
@@ -91,12 +114,22 @@ expect_exit "file and package mutually exclusive" 2 --file "$F100" --package foo
 # --- package モード（ビルドしない経路のみ。cargo と Cargo.toml が必要）。---
 
 if command -v cargo >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/../../Cargo.toml" ]; then
-  # 既定 package（fandhe-browser-cli。TASK-41.5・Issue #174 が追加予定でまだ
-  # workspace に存在しない）の不在に限り skip（exit 0）とする。既定値以外を
-  # 明示指定して見つからない場合は package 名の誤記・設定のずれを「未導入の
-  # ためスキップ」として握りつぶさないよう exit 2 にする（codex レビュー
-  # 指摘, PR #563）。
-  expect_exit "default package (fandhe-browser-cli) absence skips" 0 --package fandhe-browser-cli --limit 200
+  # 既定 package（fandhe-browser-cli。TASK-41.5・Issue #174 が追加予定）の
+  # 不在に限り skip（exit 0）とする経路を検証する。実 workspace（$SCRIPT_DIR/
+  # ../..）を直接使うと #174 で fandhe-browser-cli が追加された時点でこの
+  # ケースが実ビルド・実サイズ判定（--limit 200）へ落ちて恒常的に fail する
+  # （codex / Bugbot レビュー指摘, PR #563:「Self-test breaks when CLI
+  # lands」）。member を持たない孤立 fixture workspace を都度生成し、そこを
+  # CWD にして起動することで、実 workspace の状態（cli crate の有無）に
+  # 左右されず「package 不在時は skip」という契約自体を恒久的に検証する。
+  FIXTURE_NO_CLI="$TMPDIR_SELF/fixture-no-cli"
+  mkdir -p "$FIXTURE_NO_CLI"
+  cat >"$FIXTURE_NO_CLI/Cargo.toml" <<'EOF'
+[workspace]
+members = []
+EOF
+
+  expect_exit_in "$FIXTURE_NO_CLI" "default package (fandhe-browser-cli) absence skips" 0 --package fandhe-browser-cli --limit 200
   expect_contains "$LAST_OUTPUT" "skip:" "default package absence reports skip:"
 
   expect_exit "non-default nonexistent package is a usage error" 2 --package this-package-does-not-exist --limit 200
