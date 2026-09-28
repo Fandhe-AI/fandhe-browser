@@ -163,8 +163,11 @@ pub(crate) const MAX_ISOLATE_HEAP_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
 
 /// テスト専用のヒープ上限（[`super::worker::TEST_HEAP_LIMIT_ENV_VAR`]・
 /// `super::process_engine::WorkerSpawnConfigForTest::heap_limit_bytes`。
-/// 後者は feature `test-support`（Issue #528）有効時のみ存在するため
-/// リンクにできない）に許す最小値（バイト。codex レビュー指摘 #503 P0
+/// 後者の型自体は feature `test-support` の有無に関わらず常に存在する
+/// （本番の `spawn_worker` が非公開フィールドとして参照するため cfg で
+/// 消せない）が、`test-support` 無効時は非公開 `use` で再エクスポートされ
+/// crate 外から不可視になるためリンクにできない。Issue #528）に許す
+/// 最小値（バイト。codex レビュー指摘 #503 P0
 /// 「テスト専用経路が本番の上限を上回れてしまう」対応の一部）。
 ///
 /// この下限を設けず `0` や極端に小さい値をそのまま
@@ -176,8 +179,10 @@ pub(crate) const MAX_ISOLATE_HEAP_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
 const MIN_TEST_HEAP_LIMIT_BYTES: usize = 1_048_576; // 1 MiB
 
 /// テスト専用経路（`super::worker` の環境変数・`super::process_engine` の
-/// `WorkerSpawnConfigForTest`。feature `test-support`（Issue #528）有効時
-/// のみ存在するためリンクにできない）で要求されたヒープ上限を、本番の
+/// `WorkerSpawnConfigForTest`。型自体は feature `test-support` の有無に
+/// 関わらず常に存在するが、`test-support` 無効時は非公開 `use` により
+/// crate 外から不可視になるためリンクにできない。Issue #528）で要求された
+/// ヒープ上限を、本番の
 /// 既定値（[`MAX_ISOLATE_HEAP_BYTES`]）を超えない範囲へクランプする
 /// （codex レビュー指摘 #503 P0 対応）。
 ///
