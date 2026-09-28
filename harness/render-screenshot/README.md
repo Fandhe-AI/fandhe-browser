@@ -507,6 +507,12 @@ python3 harness/render-screenshot/measure_ssim.py \
   0 以上。要素数は 100 以下（PoC-6 が想定する 5〜10 件から外れる場合は警告のみ）
 - ファイルが存在しない場合、そのサイトの bbox 判定は `not_measured`（サイト
   不合格）になる。エンジン側で bbox を書き出す仕組みができるまでの既定挙動
+- bbox JSON は対応する PNG より**新しい** mtime で書き出すこと。`measure_ssim.py`
+  はファイル更新時刻を手がかりに、bbox が対応する PNG より古い場合は前回撮影
+  時点の bbox が混入した可能性がある `stale` として不合格（`error`）にする
+  （`_bbox_is_stale`。fail-closed 方針）。抽出処理の実装順序（例: PNG 撮影より
+  先に bbox.json を書き出す）によっては、内容が正しい bbox でも自動的に不合格
+  になるため注意する
 
 ### ±5%・80% の解釈（#55 で確認する解釈）
 
