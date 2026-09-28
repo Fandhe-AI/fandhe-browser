@@ -95,6 +95,8 @@ pub enum FailureKind {
     Network,
     /// [`Error::MatchCacheLimitExceeded`] に対応。
     MatchCacheLimitExceeded,
+    /// [`Error::Config`] に対応（TASK-91（91.1）・Issue #214）。
+    Config,
 }
 
 impl FailureKind {
@@ -114,6 +116,7 @@ impl FailureKind {
             FailureKind::TooManyConcurrentDnsResolutions => "too_many_concurrent_dns_resolutions",
             FailureKind::Network => "network",
             FailureKind::MatchCacheLimitExceeded => "match_cache_limit_exceeded",
+            FailureKind::Config => "config",
         }
     }
 }
@@ -143,6 +146,7 @@ impl From<&Error> for FailureKind {
             }
             Error::Network { .. } => FailureKind::Network,
             Error::MatchCacheLimitExceeded { .. } => FailureKind::MatchCacheLimitExceeded,
+            Error::Config(_) => FailureKind::Config,
         }
     }
 }
