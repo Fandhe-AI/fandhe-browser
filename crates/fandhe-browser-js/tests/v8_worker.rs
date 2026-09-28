@@ -74,6 +74,8 @@ fn main() -> ExitCode {
     js_1_handshake_rejects_hello_with_wrong_length();
     eprintln!("case: js_1_oversized_script_is_rejected_without_spawning_a_child");
     js_1_oversized_script_is_rejected_without_spawning_a_child();
+    eprintln!("case: js_1_send_raw_frame_for_test_rejects_oversized_input");
+    js_1_send_raw_frame_for_test_rejects_oversized_input();
     eprintln!("case: js_1_protocol_violation_discards_context_and_recovers");
     js_1_protocol_violation_discards_context_and_recovers();
     eprintln!("case: js_1_oversized_test_heap_limit_is_clamped_to_the_production_default");
@@ -330,6 +332,44 @@ fn js_1_oversized_script_is_rejected_without_spawning_a_child() {
         engine.worker_pid_for_test(),
         None,
         "the oversized script must be rejected before spawning a child process"
+    );
+}
+
+/// codex レビュー指摘 #503 P0「`send_raw_frame_for_test` が `bytes` を
+/// 長さ検証なしで `to_vec()` しており、無制限の確保経路になる」の回帰
+/// テスト: 上限（[`V8ProcessEngine::max_raw_frame_bytes_for_test`]）を
+/// 1 バイト超える入力は、複製（`to_vec()`）される前に拒否され、子
+/// プロセスも起動されないこと。
+fn js_1_send_raw_frame_for_test_rejects_oversized_input() {
+    let mut engine = V8ProcessEngine::new();
+    assert_eq!(
+        engine.worker_pid_for_test(),
+        None,
+        "no child should be spawned before the first send_raw_frame_for_test call"
+    );
+
+    let max_len = V8ProcessEngine::max_raw_frame_bytes_for_test();
+    let oversized_frame = vec![0u8; max_len + 1];
+
+    match engine.send_raw_frame_for_test(&oversized_frame) {
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&max_len.to_string()),
+                "expected the message to mention the maximum supported length ({max_len}), \
+                 got: {msg}"
+            );
+        }
+        Ok(()) => panic!(
+            "expected an oversized raw frame ({} bytes, limit {max_len}) to be rejected",
+            oversized_frame.len()
+        ),
+    }
+
+    assert_eq!(
+        engine.worker_pid_for_test(),
+        None,
+        "the oversized raw frame must be rejected before spawning a child process"
     );
 }
 

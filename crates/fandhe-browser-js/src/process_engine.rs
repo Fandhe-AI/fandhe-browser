@@ -742,6 +742,20 @@ impl Drop for WorkerHandle {
     }
 }
 
+/// [`V8ProcessEngine::send_raw_frame_for_test`] が受け付ける生バイト列の
+/// 上限（バイト。codex レビュー指摘 #503 P0「`bytes` を長さ検証なしで
+/// `to_vec()` しており、無制限の確保経路になる」対応）。
+///
+/// この関数は「親から子への 1 フレーム」を模して生バイト列をそのまま
+/// 子の stdin へ書き込むテスト専用の入口であり、その実効的な上限は
+/// [`worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`]（親から子への
+/// 1 フレームのペイロード上限）に、フレームヘッダー分（`u32` の長さ
+/// プレフィックス 4 バイト＋`u8` のタグ 1 バイト＝5 バイト）の余裕を
+/// 足した値にする。呼び出し元（`tests/v8_worker.rs`）が意図的に破損した
+/// フレーム（プロトコル違反の注入）を送る際も、実際に送るバイト数は
+/// 数バイト〜数十バイト程度であり、この上限に触れることはない。
+const MAX_RAW_FRAME_BYTES_FOR_TEST: usize = worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD + 5;
+
 /// テスト専用: 子プロセスの起動条件を上書きする（Issue #503 設計書
 /// §7 W6「テスト用に小さいヒープ上限を渡す経路（テスト専用。本番では
 /// 無効）」・「ハンドシェイク失敗」の検証に使う）。
@@ -936,8 +950,30 @@ impl V8ProcessEngine {
     /// 未起動なら、この呼び出しで起動する（[`Self::evaluate_script`] と
     /// 同じ遅延起動の作法）。書き込みは本番経路と同じく writer スレッド
     /// 経由で行い、[`HANDSHAKE_TIMEOUT`] を上限に完了を待つ。
+    ///
+    /// `#[cfg(test)]` を付けられない理由: `tests/v8_worker.rs` は別クレート
+    /// としてコンパイルされる結合テストであり、`#[cfg(test)]` の項目を
+    /// 参照できない（[`WorkerSpawnConfigForTest`] のドキュメントコメント
+    /// と同じ事情）。そのため、テスト専用の入口であっても本番ビルドに
+    /// 含まれる `#[doc(hidden)] pub` にせざるを得ず、外部入力と同様に
+    /// `bytes` の長さを検証する（codex レビュー指摘 #503 P0「`bytes` を
+    /// 長さ検証なしで `to_vec()` しており、無制限の確保経路になる」
+    /// 対応）。
     #[doc(hidden)]
     pub fn send_raw_frame_for_test(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        // 複製（`to_vec()`）の前に長さを検証する（coding-rust.md「長さ・
+        // 件数を上限検証してからアロケーションに使う」）。上限は、この
+        // 関数が模す「親から子への 1 フレーム」の実効的な最大長
+        // （[`worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`] ＋
+        // フレームヘッダー分。[`MAX_RAW_FRAME_BYTES_FOR_TEST`] 参照）に
+        // 揃える。
+        if bytes.len() > MAX_RAW_FRAME_BYTES_FOR_TEST {
+            return Err(std::io::Error::other(format!(
+                "raw frame for a test exceeds the maximum supported length of \
+                 {MAX_RAW_FRAME_BYTES_FOR_TEST} bytes (got {} bytes)",
+                bytes.len()
+            )));
+        }
         if self.worker.is_none() {
             self.worker = Some(self.spawn_worker().map_err(|err| {
                 std::io::Error::other(format!(
@@ -990,6 +1026,19 @@ impl V8ProcessEngine {
     #[doc(hidden)]
     pub fn max_script_source_bytes_for_test() -> usize {
         super::v8_engine::MAX_SCRIPT_SOURCE_BYTES
+    }
+
+    /// テスト専用: [`send_raw_frame_for_test`](Self::send_raw_frame_for_test)
+    /// が受け付ける生バイト列の上限（バイト）を返す。codex レビュー指摘
+    /// #503 P0「`send_raw_frame_for_test` が `bytes` を長さ検証なしで
+    /// `to_vec()` しており、無制限の確保経路になる」の回帰テストが、
+    /// [`max_script_source_bytes_for_test`](Self::max_script_source_bytes_for_test)
+    /// と同じ理由（`tests/` 配下の結合テストは別クレートであり、
+    /// `MAX_RAW_FRAME_BYTES_FOR_TEST`（非 `pub`）へ直接アクセスできない）
+    /// で、定数の値だけを最小限公開する。
+    #[doc(hidden)]
+    pub fn max_raw_frame_bytes_for_test() -> usize {
+        MAX_RAW_FRAME_BYTES_FOR_TEST
     }
 
     /// 子プロセスを起動し、ハンドシェイク（`Hello` の受信）まで完了させる。
