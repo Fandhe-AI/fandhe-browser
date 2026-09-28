@@ -15,8 +15,9 @@
 //! `TASK-29.3`・Issue #154）と、実行時間・入力サイズ・結果サイズ・
 //! ヒープサイズのリソース上限（AGENTS.md「リソース上限」P0・codex レビュー
 //! 指摘 #154・#503 対応。ヒープ上限到達時の `Err` 化は Issue #506・#508・
-//! #509・#510）を実装済みである。以下は未実装（実装済みを装わない。
-//! REPAIR-3）。
+//! #509・#510）に加え、逆方向 RPC（`NativeCall`）の**子側**（プロキシ関数の
+//! 生成・呼び出し・fatal 時の打ち切り。`TASK-29`・Issue #511）を実装済み
+//! である。以下は未実装（実装済みを装わない。REPAIR-3）。
 //!
 //! - [`super::engine_trait::JsEngine`] トレイトへの集約（`TASK-29.6`）。
 //!   本モジュールは同トレイトと同じシグネチャの inherent メソッドとして
@@ -24,8 +25,16 @@
 //!   まだ書かない（29.4「グローバル関数注入」・29.5「DOM 風バインディング」
 //!   と並行して進めるため、共有の impl ブロックを編集し合うコンフリクトを
 //!   避ける）
-//! - グローバル関数注入・DOM 風オブジェクトバインディング（`TASK-29.4`・
-//!   `29.5`）
+//! - 親→子の登録フレームを受け取って
+//!   [`V8Engine::install_native_proxy_global`] を実際に呼ぶ経路
+//!   （`TASK-29.4`「グローバル関数注入」・Issue #155）・DOM 風オブジェクト
+//!   バインディング（`TASK-29.5`・Issue #156）。本モジュールが用意するのは
+//!   プロキシ関数の生成・呼び出し本体までであり、親からの登録フレーム
+//!   自体は未配線
+//! - 親側の `NativeCall` dispatch（`NativeFn` の実行・`NativeReturn` の
+//!   返信。`super::process_engine`・Issue #526）
+//! - 子の再起動時に、以前登録していたプロキシ関数・bind 済みオブジェクトを
+//!   再登録する処理（Issue #512）
 //! - `create_engine`（`engine_trait.rs`）への配線（`TASK-29.6`・`29.7`）。
 //!   配線すると `tests/conformance.rs` の同梱エンジン向けコンフォーマンス
 //!   テスト（注入・バインディングの契約検証を含む）が V8 に対しても走る
@@ -80,6 +89,63 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use super::engine_trait::{EvaluateOptions, JsEngineError, JsValue};
+use super::worker_protocol::{self, NativeReturn};
+
+/// [`install_native_proxy_global`](V8Engine::install_native_proxy_global) が
+/// 受け付ける関数名の最大バイト数（`JS-1`・`TASK-29`・Issue #511）。
+///
+/// グローバルオブジェクトへ登録するプロパティ名は外部入力（親からの登録
+/// フレーム由来。#155）として扱い、無制限の長さの文字列で
+/// `v8::String::new` を呼ばないよう、確保前に上限を検査する
+/// （coding-rust.md「外部入力」節・OWASP A04）。
+const MAX_NATIVE_PROXY_NAME_BYTES: usize = 256;
+
+/// 子プロセス側から親プロセスへ逆方向 RPC（`NativeCall`）を送り、
+/// [`NativeReturn`] が届くまで**同期的にブロックする**窓口（`JS-1`・
+/// `TASK-29`・Issue #511）。
+///
+/// 呼び出し元: [`native_proxy_callback`]（本モジュール）が、JS から
+/// プロキシ関数が呼ばれるたびに呼ぶ。実装は [`super::worker`] の
+/// `StdioTransport`（stdio 越しに親と一問一答する）を想定するが、本
+/// モジュールはその具象型に依存しない（テストでは台本どおりに応答する
+/// 偽の実装を使う）。
+///
+/// スレッド安全性: [`V8Engine`] が `!Send` であるのと同様、本トレイトの
+/// 実装も単一スレッド（Isolate を保持するスレッド）でのみ使われる前提で
+/// よい（`Send`/`Sync` 境界を付けない）。
+pub(crate) trait NativeCallTransport {
+    /// `id` で識別されるホスト関数を `args` を渡して呼び出し、応答が
+    /// 届くまでブロックする。
+    fn call(&mut self, id: u32, args: &[JsValue]) -> Result<NativeReturn, NativeCallFailure>;
+}
+
+/// [`NativeCallTransport::call`] が失敗した際の分類（`JS-1`・Issue #511）。
+#[derive(Debug)]
+pub(crate) enum NativeCallFailure {
+    /// 送信前に拒否した（非 fatal。呼び出し元は JS の `RangeError` として
+    /// 投げる。子・親のプロセス・接続は生き続ける）。
+    Rejected(String),
+    /// プロトコル違反・EOF・I/O エラー（fatal。呼び出し元は評価を打ち切り、
+    /// このプロセス自体を終了させる。[`V8Engine::take_native_call_fatal`]
+    /// のドキュメントコメント参照）。
+    Fatal(String),
+}
+
+/// [`V8Engine`] の Isolate スロットに設定する、逆方向 RPC の状態
+/// （`JS-1`・Issue #511）。
+///
+/// [`V8Engine::new_with_heap_limit`] が必ず（`transport: None` の状態で）
+/// 設定するため、[`native_proxy_callback`] からの `get_slot_mut` は常に
+/// `Some` を返す。V8 のコールバック（`fn`。クロージャ不可）へ transport を
+/// 届けるための橋渡し役。
+struct NativeCallBridge {
+    /// 実際の送受信を担う実装（[`super::worker::StdioTransport`] 等）。
+    /// `None` のうちはプロキシ関数を呼んでも `Error` を投げる。
+    transport: Option<Box<dyn NativeCallTransport>>,
+    /// [`NativeCallFailure::Fatal`] を検出した際のメッセージ
+    /// （[`V8Engine::take_native_call_fatal`] 参照）。
+    fatal: Option<String>,
+}
 
 /// [`V8Engine::evaluate_script`] が生成する例外メッセージの上限文字数
 /// （UTF-8 文字数。`chars().count()` で判定する）。
@@ -440,6 +506,14 @@ impl V8Engine {
                 return Err(err);
             }
         };
+        // 逆方向 RPC（`JS-1`・Issue #511）の橋渡し役を必ず設定する。
+        // `native_proxy_callback` の `get_slot_mut` が常に `Some` を返す
+        // ことをこの時点で保証する（プロキシ関数がまだ 1 つも登録されて
+        // いなくても、Isolate 生成直後からこの不変条件を保つ）。
+        isolate.set_slot(NativeCallBridge {
+            transport: None,
+            fatal: None,
+        });
         Ok(Self { context, isolate })
     }
 
@@ -613,7 +687,116 @@ impl V8Engine {
             )));
         }
 
+        // JS-1・Issue #511: 逆方向 RPC の呼び出し中に fatal
+        // （[`NativeCallFailure::Fatal`]）が記録済みなら、この Context は
+        // 既に使い物にならない（`terminate_execution` 済みで、後続の JS
+        // からのホスト呼び出しも失敗し続ける）。新しい評価を始めず
+        // `Err` を返す（fail-closed。実装済みを装わない。REPAIR-3）。
+        if let Some(message) = self
+            .isolate
+            .get_slot::<NativeCallBridge>()
+            .and_then(|bridge| bridge.fatal.clone())
+        {
+            return Err(JsEngineError::EngineUnavailable(format!(
+                "a previous native call ended the worker protocol connection; \
+                 context was discarded: {message}"
+            )));
+        }
+
         Self::evaluate_in_isolate(&mut self.isolate, &self.context, script, options)
+    }
+
+    /// この Isolate に、子プロセス（[`super::worker`]）が親と通信するための
+    /// [`NativeCallTransport`] 実装を設定する（`JS-1`・Issue #511）。
+    ///
+    /// 呼び出し元: `super::worker::worker_main` が、Hello を送る前
+    /// （エンジン生成の直後）に一度だけ呼ぶ。テストでは台本どおりに応答
+    /// する偽の実装を渡す。
+    pub(crate) fn set_native_call_transport(&mut self, transport: Box<dyn NativeCallTransport>) {
+        if let Some(bridge) = self.isolate.get_slot_mut::<NativeCallBridge>() {
+            bridge.transport = Some(transport);
+        }
+    }
+
+    /// 直近の [`NativeCallTransport::call`] が [`NativeCallFailure::Fatal`]
+    /// を返していれば、そのメッセージを取り出す（`JS-1`・Issue #511）。
+    ///
+    /// 呼び出し元: `super::worker::evaluate_and_respond` が、評価の直後・
+    /// 応答フレームを送信する**前**に呼ぶ。`Some` の場合、呼び出し元は
+    /// 通常の `Result`/`Error` フレームを送らず、プロトコル違反として
+    /// プロセスを終了させる（親はこれを EOF として検出し
+    /// `EngineUnavailable` へ変換する。`super::process_engine` を参照）。
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    pub(crate) fn take_native_call_fatal(&mut self) -> Option<String> {
+        self.isolate
+            .get_slot_mut::<NativeCallBridge>()
+            .and_then(|bridge| bridge.fatal.take())
+    }
+
+    /// 永続 Context のグローバルスコープへ、逆方向 RPC のプロキシ関数を
+    /// `name` という名前で登録する（`JS-1`・`TASK-29`・Issue #511）。
+    ///
+    /// 呼び出し元（将来）: 親からの登録フレーム（#155）を受け取った
+    /// [`super::worker`] が、注入すべきグローバル関数ごとに一意な `id` を
+    /// 割り当てて呼ぶ。それまでは本番経路から呼ばれない
+    /// （`#155` 完了までの間、プロキシを登録する手段が本番に無いため）。
+    ///
+    /// `name` は外部入力（親からの登録フレーム由来）として検証する:
+    /// 空文字列・[`MAX_NATIVE_PROXY_NAME_BYTES`] 超過はいずれも `Err` にする
+    /// （coding-rust.md「外部入力」節）。`global.set` の戻り値が
+    /// `Some(true)` であることも確認する（`Self::new_context_with_wasm_disabled`
+    /// と同じ考え方。戻り値を確認せず「登録できたと装う」ことをしない。
+    /// security.md「偽装・回避機能の禁止」）。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "親→子の登録フレーム（#155）から呼ばれるまで未配線。\
+                      REPAIR-3"
+        )
+    )]
+    pub(crate) fn install_native_proxy_global(
+        &mut self,
+        name: &str,
+        id: u32,
+    ) -> Result<(), JsEngineError> {
+        if name.is_empty() {
+            return Err(JsEngineError::BindingFailed(
+                "native proxy function name must not be empty".to_string(),
+            ));
+        }
+        if name.len() > MAX_NATIVE_PROXY_NAME_BYTES {
+            return Err(JsEngineError::BindingFailed(format!(
+                "native proxy function name exceeds the maximum supported length of \
+                 {MAX_NATIVE_PROXY_NAME_BYTES} bytes"
+            )));
+        }
+
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let mut scope = scope.init();
+        let context = v8::Local::new(&scope, &self.context);
+        let scope = &mut v8::ContextScope::new(&mut scope, context);
+
+        let Some(function) = new_native_proxy_function(scope, id) else {
+            return Err(JsEngineError::BindingFailed(
+                "failed to create the native proxy function".to_string(),
+            ));
+        };
+        let Some(key) = v8::String::new(scope, name) else {
+            return Err(JsEngineError::BindingFailed(
+                "failed to allocate the native proxy function name string".to_string(),
+            ));
+        };
+        let global = context.global(scope);
+        let key: v8::Local<v8::Value> = key.into();
+        let value: v8::Local<v8::Value> = function.into();
+        if global.set(scope, key, value) != Some(true) {
+            return Err(JsEngineError::BindingFailed(format!(
+                "failed to register the native proxy function {name:?} on the global object \
+                 (Object::Set did not report success)"
+            )));
+        }
+        Ok(())
     }
 
     /// [`V8Engine::evaluate_script`] のコンパイル・実行本体（`JS-1`・
@@ -921,6 +1104,201 @@ fn value_to_js_value(
         Err(JsEngineError::EvaluationFailed(format!(
             "evaluation result of type '{type_name}' is not representable as JsValue"
         )))
+    }
+}
+
+/// [`JsValue`] を V8 の値へ変換する（`JS-1`・Issue #511）。
+///
+/// [`value_to_js_value`] の逆方向。逆方向 RPC の戻り値
+/// （[`NativeReturn::Ok`]）を JS 側の関数呼び出し結果へ変換する際に
+/// [`native_proxy_callback`] から使う。`JsValue` の全 variant を扱えるため
+/// `Option` を返す（`v8::String::new`・`v8::Number::new` は理論上
+/// アロケーション失敗で `None` を返しうる）。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+fn js_value_to_v8_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: &JsValue,
+) -> Option<v8::Local<'s, v8::Value>> {
+    Some(match value {
+        JsValue::Undefined => v8::undefined(scope).into(),
+        JsValue::Null => v8::null(scope).into(),
+        JsValue::Bool(b) => v8::Boolean::new(scope, *b).into(),
+        JsValue::Number(n) => v8::Number::new(scope, *n).into(),
+        JsValue::String(s) => v8::String::new(scope, s)?.into(),
+    })
+}
+
+/// [`V8Engine::install_native_proxy_global`] が生成する、逆方向 RPC の
+/// プロキシ関数を作る（`JS-1`・Issue #511）。
+///
+/// `data` には `id` の数値だけを載せる（`External`・生ポインタは使わない。
+/// 計画書 §3.2「data には数値 ID だけを入れる」）。子プロセスの再起動時に
+/// 同じ `id` で登録し直せば、V8 側のポインタ寿命を気にせず再現できる
+/// （#155・#512 が担う）。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "V8Engine::install_native_proxy_global 経由で #155 完了後に配線される。REPAIR-3"
+    )
+)]
+fn new_native_proxy_function<'s>(
+    scope: &v8::PinScope<'s, '_>,
+    id: u32,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let data: v8::Local<v8::Value> = v8::Integer::new_from_unsigned(scope, id).into();
+    v8::Function::builder(native_proxy_callback)
+        .data(data)
+        .build(scope)
+}
+
+/// [`new_native_proxy_function`] が生成する関数の本体（`JS-1`・
+/// Issue #511）。
+///
+/// JS からこの関数が呼ばれるたびに、次の手順を踏む:
+///
+/// 1. `data()` から `id`（`u32`）を取り出す（数値以外なら `TypeError`）
+/// 2. 引数の個数が [`worker_protocol::MAX_NATIVE_CALL_ARGS`] を超える場合は
+///    transport を呼ばずに `RangeError` を投げる
+/// 3. 各引数を [`super::v8_engine::value_to_js_value`] 相当の変換で
+///    [`JsValue`] へ変換する（表現できない値は `TypeError`。文字列化して
+///    送らない。security.md「偽装・回避機能の禁止」）
+/// 4. Isolate スロットの [`NativeCallBridge`] を取り、`fatal` が既にあれば
+///    `terminate_execution` して打ち切る。無ければ transport を呼ぶ
+///    （可変借用は呼び出しの間だけに限定し、その後 V8 の値を作る前に
+///    解放する）
+/// 5. 結果を JS の戻り値・例外へ変換する（[`NativeCallFailure::Fatal`] は
+///    `bridge.fatal` に記録したうえで `terminate_execution` する。この
+///    終了要求は JS の `try`/`catch` では捕捉できない）
+///
+/// # watchdog との関係
+///
+/// 本コールバックでブロックしている時間も
+/// [`SCRIPT_EXECUTION_TIMEOUT`] に含まれる（`evaluate_in_isolate` の
+/// 監視スレッドは呼び出し元のスタックを区別しない）。ネイティブ呼び出し
+/// 中に watchdog が発火した場合は、本コールバックから戻った時点で V8 が
+/// 打ち切る。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "V8Engine::install_native_proxy_global 経由で #155 完了後に配線される。REPAIR-3"
+    )
+)]
+fn native_proxy_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    // `data()` は必ず `new_native_proxy_function` が設定した
+    // `v8::Integer::new_from_unsigned` の値であるはずだが、コールバックの
+    // 型契約自体は呼び出し元が壊せる余地を排除しない（外部入力として
+    // 扱う。coding-rust.md「外部入力」節）。`is_uint32()` で型を確認して
+    // から `uint32_value()`（変換）を呼ぶ。
+    let data = args.data();
+    let Some(id) = data.is_uint32().then(|| data.uint32_value(scope)).flatten() else {
+        let Some(message) = v8::String::new(scope, "native proxy function data is not a uint32")
+        else {
+            return;
+        };
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    };
+
+    let argc = args.length();
+    if argc < 0 || argc as usize > worker_protocol::MAX_NATIVE_CALL_ARGS {
+        let text = format!(
+            "native call accepts at most {} arguments, got {argc}",
+            worker_protocol::MAX_NATIVE_CALL_ARGS
+        );
+        let Some(message) = v8::String::new(scope, &text) else {
+            return;
+        };
+        let exception = v8::Exception::range_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    }
+
+    let mut js_args = Vec::with_capacity(argc as usize);
+    for i in 0..argc {
+        match value_to_js_value(scope, args.get(i)) {
+            Ok(value) => js_args.push(value),
+            Err(err) => {
+                let Some(message) = v8::String::new(scope, &err.to_string()) else {
+                    return;
+                };
+                let exception = v8::Exception::type_error(scope, message);
+                scope.throw_exception(exception);
+                return;
+            }
+        }
+    }
+
+    // Isolate スロットの可変借用はこのブロックの中だけに限定する
+    // （transport 呼び出しの結果を使って V8 の値を作る前に解放する）。
+    let outcome = {
+        let Some(bridge) = scope.get_slot_mut::<NativeCallBridge>() else {
+            let Some(message) = v8::String::new(scope, "native call bridge is not initialized")
+            else {
+                return;
+            };
+            let exception = v8::Exception::error(scope, message);
+            scope.throw_exception(exception);
+            return;
+        };
+        if let Some(fatal) = bridge.fatal.clone() {
+            let _ = fatal;
+            scope.terminate_execution();
+            return;
+        }
+        let Some(transport) = bridge.transport.as_mut() else {
+            let Some(message) = v8::String::new(scope, "native call transport is not configured")
+            else {
+                return;
+            };
+            let exception = v8::Exception::error(scope, message);
+            scope.throw_exception(exception);
+            return;
+        };
+        transport.call(id, &js_args)
+    };
+
+    match outcome {
+        Ok(NativeReturn::Ok(value)) => {
+            let Some(v8_value) = js_value_to_v8_value(scope, &value) else {
+                let Some(message) = v8::String::new(
+                    scope,
+                    "failed to convert the native call result to a V8 value",
+                ) else {
+                    return;
+                };
+                let exception = v8::Exception::error(scope, message);
+                scope.throw_exception(exception);
+                return;
+            };
+            rv.set(v8_value);
+        }
+        Ok(NativeReturn::Err(message)) => {
+            let Some(message) = v8::String::new(scope, &message) else {
+                return;
+            };
+            let exception = v8::Exception::error(scope, message);
+            scope.throw_exception(exception);
+        }
+        Err(NativeCallFailure::Rejected(message)) => {
+            let Some(message) = v8::String::new(scope, &message) else {
+                return;
+            };
+            let exception = v8::Exception::range_error(scope, message);
+            scope.throw_exception(exception);
+        }
+        Err(NativeCallFailure::Fatal(message)) => {
+            if let Some(bridge) = scope.get_slot_mut::<NativeCallBridge>() {
+                bridge.fatal = Some(message);
+            }
+            scope.terminate_execution();
+        }
     }
 }
 
@@ -1559,5 +1937,233 @@ mod tests {
             .evaluate_script("1 + 1", &EvaluateOptions::default())
             .expect("engine must remain usable after a compile-time syntax error");
         assert_eq!(result, JsValue::Number(2.0));
+    }
+
+    /// JS-1・Issue #511: テスト専用の [`NativeCallTransport`]。台本
+    /// （`script`）どおりの応答を順番に返し、実際に呼ばれた `(id, args)` を
+    /// `calls` に記録する。実 stdio・実子プロセスを介さず、逆方向 RPC の
+    /// 呼び出し契約（V8 の値変換・エラー分類・fatal 時の挙動）だけを検証
+    /// するために使う。
+    struct ScriptedTransport {
+        script: std::collections::VecDeque<Result<NativeReturn, NativeCallFailure>>,
+        calls: Vec<(u32, Vec<JsValue>)>,
+    }
+
+    impl NativeCallTransport for ScriptedTransport {
+        fn call(&mut self, id: u32, args: &[JsValue]) -> Result<NativeReturn, NativeCallFailure> {
+            self.calls.push((id, args.to_vec()));
+            self.script
+                .pop_front()
+                .unwrap_or(Err(NativeCallFailure::Fatal(
+                    "ScriptedTransport script exhausted".to_string(),
+                )))
+        }
+    }
+
+    /// JS-1・Issue #511: プロキシ関数を登録して呼ぶと、transport が期待した
+    /// `(id, args)` を受け取り、[`NativeReturn::Ok`] が JS 側の評価結果に
+    /// なること。
+    #[test]
+    fn js_1_native_proxy_function_calls_transport_and_returns_ok_value() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        engine
+            .install_native_proxy_global("hostAdd", 7)
+            .expect("installing the proxy function must succeed");
+
+        type RecordedCalls = std::rc::Rc<std::cell::RefCell<Vec<(u32, Vec<JsValue>)>>>;
+        let calls: RecordedCalls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        struct RecordingTransport {
+            calls: RecordedCalls,
+        }
+        impl NativeCallTransport for RecordingTransport {
+            fn call(
+                &mut self,
+                id: u32,
+                args: &[JsValue],
+            ) -> Result<NativeReturn, NativeCallFailure> {
+                self.calls.borrow_mut().push((id, args.to_vec()));
+                Ok(NativeReturn::Ok(JsValue::Number(42.0)))
+            }
+        }
+        engine.set_native_call_transport(Box::new(RecordingTransport {
+            calls: calls.clone(),
+        }));
+
+        let result = engine
+            .evaluate_script("hostAdd(1, 'x')", &EvaluateOptions::default())
+            .expect("native call must succeed");
+        assert_eq!(result, JsValue::Number(42.0));
+        assert_eq!(
+            *calls.borrow(),
+            vec![(
+                7,
+                vec![JsValue::Number(1.0), JsValue::String("x".to_string())]
+            )]
+        );
+    }
+
+    /// JS-1・Issue #511: [`NativeReturn::Err`] は JS の例外になり、
+    /// `try`/`catch` で捕捉できること。
+    #[test]
+    fn js_1_native_proxy_function_err_return_becomes_a_catchable_exception() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        engine
+            .install_native_proxy_global("hostAdd", 1)
+            .expect("installing the proxy function must succeed");
+        engine.set_native_call_transport(Box::new(ScriptedTransport {
+            script: std::collections::VecDeque::from([Ok(NativeReturn::Err("boom".to_string()))]),
+            calls: Vec::new(),
+        }));
+
+        let result = engine
+            .evaluate_script(
+                "try { hostAdd(); 'unreachable' } catch (e) { e.message }",
+                &EvaluateOptions::default(),
+            )
+            .expect("evaluation itself must succeed (the exception is caught in JS)");
+        assert_eq!(result, JsValue::String("boom".to_string()));
+    }
+
+    /// JS-1・Issue #511: [`NativeCallFailure::Fatal`] のとき、
+    /// `terminate_execution` により評価自体が打ち切られ（JS の
+    /// `try`/`catch` では捕捉できない）、[`V8Engine::take_native_call_fatal`]
+    /// が `Some` になり、以後の評価は `Err` を返すこと。
+    #[test]
+    fn js_1_native_proxy_function_fatal_terminates_execution_and_marks_the_engine_unusable() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        engine
+            .install_native_proxy_global("hostAdd", 1)
+            .expect("installing the proxy function must succeed");
+        engine.set_native_call_transport(Box::new(ScriptedTransport {
+            script: std::collections::VecDeque::from([Err(NativeCallFailure::Fatal(
+                "connection lost".to_string(),
+            ))]),
+            calls: Vec::new(),
+        }));
+
+        // `terminate_execution` はスケジュールされるだけで、割り込みチェック
+        // （ループの backedge・関数呼び出し等）を経て初めて実際の中断が
+        // 効く。`hostAdd()` の直後に平文の式を置くだけでは割り込み
+        // チェックポイントが無く中断が観測できない場合があるため、
+        // 直後に `while` ループを置いて確実にチェックポイントを踏ませる。
+        let result = engine.evaluate_script(
+            "try { hostAdd(); while (true) {} } catch (e) { 'swallowed' }",
+            &EvaluateOptions::default(),
+        );
+        assert!(
+            result.is_err(),
+            "a fatal native call must not be swallowed by JS try/catch, got: {result:?}"
+        );
+
+        // `take_native_call_fatal` で取り出す**前**に、fatal が記録されて
+        // いる間は新しい評価を始めないこと（`evaluate_script` 冒頭の
+        // fail-closed 確認）を先に確認する。
+        match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
+            Err(JsEngineError::EngineUnavailable(msg)) => {
+                assert!(msg.contains("context was discarded"));
+            }
+            other => panic!("expected EngineUnavailable after a fatal native call, got: {other:?}"),
+        }
+
+        let fatal = engine
+            .take_native_call_fatal()
+            .expect("fatal message must be recorded");
+        assert!(fatal.contains("connection lost"));
+    }
+
+    /// JS-1・Issue #511: 表現できない引数（object）は `TypeError` になり、
+    /// transport は呼ばれないこと（送信前に検証する。security.md）。
+    #[test]
+    fn js_1_native_proxy_function_rejects_unrepresentable_argument_without_calling_transport() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        engine
+            .install_native_proxy_global("hostAdd", 1)
+            .expect("installing the proxy function must succeed");
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(0usize));
+        struct CountingTransport {
+            calls: std::rc::Rc<std::cell::RefCell<usize>>,
+        }
+        impl NativeCallTransport for CountingTransport {
+            fn call(
+                &mut self,
+                _id: u32,
+                _args: &[JsValue],
+            ) -> Result<NativeReturn, NativeCallFailure> {
+                *self.calls.borrow_mut() += 1;
+                Ok(NativeReturn::Ok(JsValue::Undefined))
+            }
+        }
+        engine.set_native_call_transport(Box::new(CountingTransport {
+            calls: calls.clone(),
+        }));
+
+        let result = engine.evaluate_script(
+            "try { hostAdd({}); 'no-throw' } catch (e) { e instanceof TypeError }",
+            &EvaluateOptions::default(),
+        );
+        assert_eq!(
+            result.expect("evaluation must succeed"),
+            JsValue::Bool(true)
+        );
+        assert_eq!(*calls.borrow(), 0, "transport must not be called");
+    }
+
+    /// JS-1・Issue #511: 引数の個数が上限を超える場合は `RangeError` になり、
+    /// transport は呼ばれないこと。
+    #[test]
+    fn js_1_native_proxy_function_rejects_too_many_arguments_without_calling_transport() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        engine
+            .install_native_proxy_global("hostAdd", 1)
+            .expect("installing the proxy function must succeed");
+        engine.set_native_call_transport(Box::new(ScriptedTransport {
+            script: std::collections::VecDeque::new(),
+            calls: Vec::new(),
+        }));
+
+        let too_many_args = "0,".repeat(worker_protocol::MAX_NATIVE_CALL_ARGS + 1);
+        let script = format!(
+            "try {{ hostAdd({too_many_args}0); 'no-throw' }} catch (e) {{ e instanceof RangeError }}"
+        );
+        let result = engine.evaluate_script(&script, &EvaluateOptions::default());
+        assert_eq!(
+            result.expect("evaluation must succeed"),
+            JsValue::Bool(true)
+        );
+    }
+
+    /// JS-1・Issue #511: transport が未設定のときは `Error` が投げられる
+    /// こと。
+    #[test]
+    fn js_1_native_proxy_function_without_transport_throws_an_error() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        engine
+            .install_native_proxy_global("hostAdd", 1)
+            .expect("installing the proxy function must succeed");
+
+        let result = engine.evaluate_script(
+            "try { hostAdd(); 'no-throw' } catch (e) { e instanceof Error }",
+            &EvaluateOptions::default(),
+        );
+        assert_eq!(
+            result.expect("evaluation must succeed"),
+            JsValue::Bool(true)
+        );
+    }
+
+    /// JS-1・Issue #511: 関数名の検証（空文字列・上限超過）が
+    /// `BindingFailed` を返すこと。
+    #[test]
+    fn js_1_install_native_proxy_global_rejects_invalid_names() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        assert!(matches!(
+            engine.install_native_proxy_global("", 1),
+            Err(JsEngineError::BindingFailed(_))
+        ));
+        let too_long = "a".repeat(MAX_NATIVE_PROXY_NAME_BYTES + 1);
+        assert!(matches!(
+            engine.install_native_proxy_global(&too_long, 1),
+            Err(JsEngineError::BindingFailed(_))
+        ));
     }
 }
