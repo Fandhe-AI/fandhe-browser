@@ -1389,6 +1389,57 @@ class MainIntegrationTest(unittest.TestCase):
             self.assertEqual(by_site["good"]["ssim"]["status"], "measured")
             self.assertEqual(by_site["bad"]["ssim"]["status"], "error")
 
+    def test_rejects_bbox_pair_resolving_to_the_same_file(self) -> None:
+        # RENDER-5 / TASK-37.2 codex レビュー指摘 P1 対応: chromium/servo の
+        # bbox JSON がハードリンクで同一 inode を指していても、`load_bboxes` の
+        # symlink 拒否だけではすり抜けてしまい、内容が同一のため一致率 1.0 で
+        # 誤って合格になっていた。PNG 側の `os.path.samefile` 検査（
+        # `test_rejects_pair_resolving_to_the_same_file`）と対になる防御が
+        # bbox 側にも効くことを確認する。SSIM は measured になる条件（PNG は
+        # 別ファイル・同一内容）にして、bbox だけが error になることを見る。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            site_id = "s0"
+            self._make_site_pngs(capture_dir, site_id, identical=True)
+            elements = [{"id": f"e{i}", "x": 0, "y": 0, "width": 10, "height": 10} for i in range(5)]
+            self._write_bboxes(capture_dir, "chromium", site_id, elements)
+            shared = capture_dir / "chromium" / f"{site_id}.bboxes.json"
+            try:
+                os.link(shared, capture_dir / "servo" / f"{site_id}.bboxes.json")
+            except OSError:
+                self.skipTest("hard link creation is not permitted in this environment")
+            self._write_capture_result(capture_dir, [site_id])
+
+            exit_code = ms.main(["--capture-dir", str(capture_dir), "--min-sites", "1"])
+            self.assertEqual(exit_code, 1)
+            result = json.loads((capture_dir / "measure-result.json").read_text(encoding="utf-8"))
+            site = result["sites"][0]
+            self.assertEqual(site["ssim"]["status"], "measured")
+            self.assertEqual(site["bbox"]["status"], "error")
+            self.assertFalse(site["bbox"]["passed"])
+            self.assertIn("same file", site["bbox"]["reason"])
+            self.assertFalse(site["passed"])
+
+    def test_bbox_pair_with_identical_content_but_distinct_files_passes(self) -> None:
+        # 上のハードリンク拒否が過剰検出でないことの確認: 内容がバイト単位で
+        # 同一でも、別ファイル（別 inode）の bbox JSON なら合格すること。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            site_id = "s0"
+            self._make_site_pngs(capture_dir, site_id, identical=True)
+            elements = [{"id": f"e{i}", "x": 0, "y": 0, "width": 10, "height": 10} for i in range(5)]
+            self._write_bboxes(capture_dir, "chromium", site_id, elements)
+            self._write_bboxes(capture_dir, "servo", site_id, elements)
+            self._write_capture_result(capture_dir, [site_id])
+
+            exit_code = ms.main(["--capture-dir", str(capture_dir), "--min-sites", "1"])
+            self.assertEqual(exit_code, 0)
+            result = json.loads((capture_dir / "measure-result.json").read_text(encoding="utf-8"))
+            site = result["sites"][0]
+            self.assertEqual(site["bbox"]["status"], "measured")
+            self.assertTrue(site["bbox"]["passed"])
+            self.assertTrue(site["passed"])
+
     def test_missing_bbox_file_is_not_measured_and_fails_site(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             capture_dir = Path(tmp)

@@ -1047,18 +1047,44 @@ def measure_site(
             "reason": str(exc),
         }
     else:
+        # PNG 側（`_resolve_capture_png` 呼び出し元）には `os.path.samefile` による
+        # 同一ファイル検査があるが、bbox 側には無かった（codex レビュー指摘 P1）。
+        # `load_bboxes` の symlink 拒否は末尾要素と親ディレクトリの symlink しか
+        # 防げず、ハードリンク（同一 inode・別パス）はすり抜けて 2 エンジン分の
+        # bbox として両方読めてしまい、内容が同一になるため一致率 1.0 で誤って
+        # 合格になる。stale 判定より前に置き、エラーの優先順位を決定的にする。
+        bbox_same_file = False
+        if ref_bboxes is not None and tgt_bboxes is not None:
+            try:
+                bbox_same_file = os.path.samefile(ref_bbox_path, tgt_bbox_path)
+            except OSError:
+                bbox_same_file = False
+
         stale_reasons: list[str] = []
-        if ref_bboxes is not None and _bbox_is_stale(ref_bbox_path, chromium_png):
-            stale_reasons.append(
-                f"{REFERENCE_ENGINE} bbox file is older than its PNG "
-                "(likely stale from a previous capture)"
-            )
-        if tgt_bboxes is not None and _bbox_is_stale(tgt_bbox_path, servo_png):
-            stale_reasons.append(
-                f"{TARGET_ENGINE} bbox file is older than its PNG "
-                "(likely stale from a previous capture)"
-            )
-        if stale_reasons:
+        if not bbox_same_file:
+            if ref_bboxes is not None and _bbox_is_stale(ref_bbox_path, chromium_png):
+                stale_reasons.append(
+                    f"{REFERENCE_ENGINE} bbox file is older than its PNG "
+                    "(likely stale from a previous capture)"
+                )
+            if tgt_bboxes is not None and _bbox_is_stale(tgt_bbox_path, servo_png):
+                stale_reasons.append(
+                    f"{TARGET_ENGINE} bbox file is older than its PNG "
+                    "(likely stale from a previous capture)"
+                )
+
+        if bbox_same_file:
+            bbox_result = {
+                "status": "error",
+                "matched": 0,
+                "total": 0,
+                "rate": None,
+                "passed": False,
+                "elements": [],
+                "warnings": [],
+                "reason": f"{REFERENCE_ENGINE}/{TARGET_ENGINE} bbox files resolve to the same file",
+            }
+        elif stale_reasons:
             bbox_result = {
                 "status": "error",
                 "matched": 0,

@@ -598,8 +598,10 @@ symlink を拒否）、PNG・bbox JSON も symlink を拒否したうえで読�
 `NaN`/`Infinity`・巨大な指数表記・巨大整数リテラルを拒否し、`Fraction`/
 `Decimal` へ生トークンを渡さない。PNG は 1 回目の検証（`capture_one` 実行時の
 `read_png_size`）を信用せず、2 回目の読み込みでも CRC・チャンク構造・展開後
-サイズを自前で再検証する（TOCTOU 対策）。シェル実行・`eval`・`subprocess` は
-使わない。
+サイズを自前で再検証する（TOCTOU 対策）。PNG・bbox JSON のいずれのペアも、
+symlink 拒否に加えて `os.path.samefile`（inode 比較）で chromium/servo 側が
+同一ファイル（ハードリンク等）でないことを検証し、比較が成立しないまま
+誤って合格させない。シェル実行・`eval`・`subprocess` は使わない。
 
 ## スコープ外・申し送り
 
