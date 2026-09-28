@@ -743,10 +743,20 @@ impl V8Engine {
     ///
     /// `name` は外部入力（親からの登録フレーム由来）として検証する:
     /// 空文字列・[`MAX_NATIVE_PROXY_NAME_BYTES`] 超過はいずれも `Err` にする
-    /// （coding-rust.md「外部入力」節）。`global.set` の戻り値が
-    /// `Some(true)` であることも確認する（`Self::new_context_with_wasm_disabled`
-    /// と同じ考え方。戻り値を確認せず「登録できたと装う」ことをしない。
-    /// security.md「偽装・回避機能の禁止」）。
+    /// （coding-rust.md「外部入力」節）。
+    ///
+    /// グローバルへの登録には `Object::set`（ECMA-262 の `[[Set]]`）ではなく
+    /// `Object::create_data_property`（`[[DefineOwnProperty]]`）を使う。
+    /// 永続 Context は登録時点で既にページの JS を実行済みの可能性があり、
+    /// `name` と同名のアクセサプロパティ（`set` だけ持ち、代入を握りつぶす
+    /// もの）が `globalThis` 上に存在しうる。`Object::set` はその setter を
+    /// 実行したうえで戻り値 `Some(true)`（代入操作自体の成功）を返すため、
+    /// setter が値を保存しなくても「登録成功」に見えてしまう
+    /// （codex レビュー指摘 P1・PR #533）。`create_data_property` は
+    /// アクセサを経由せず直接データプロパティを定義する（対象が
+    /// non-configurable なアクセサの場合は `Some(false)` を返し失敗する）
+    /// ため、setter を実行してしまう余地も、登録に失敗したのに成功したと
+    /// 装う余地もない（security.md「偽装・回避機能の禁止」）。
     #[cfg_attr(
         not(test),
         expect(
@@ -788,12 +798,12 @@ impl V8Engine {
             ));
         };
         let global = context.global(scope);
-        let key: v8::Local<v8::Value> = key.into();
+        let key: v8::Local<v8::Name> = key.into();
         let value: v8::Local<v8::Value> = function.into();
-        if global.set(scope, key, value) != Some(true) {
+        if global.create_data_property(scope, key, value) != Some(true) {
             return Err(JsEngineError::BindingFailed(format!(
                 "failed to register the native proxy function {name:?} on the global object \
-                 (Object::Set did not report success)"
+                 (Object::CreateDataProperty did not report success)"
             )));
         }
         Ok(())
@@ -2295,6 +2305,66 @@ mod tests {
         let too_long = "a".repeat(MAX_NATIVE_PROXY_NAME_BYTES + 1);
         assert!(matches!(
             engine.install_native_proxy_global(&too_long, 1),
+            Err(JsEngineError::BindingFailed(_))
+        ));
+    }
+
+    /// JS-1・Issue #511・PR #533 codex レビュー指摘 P1: `globalThis` に
+    /// 同名の setter アクセサ（代入を握りつぶし値を保存しない）が既に
+    /// 存在していても、登録後に実際にプロキシ関数を呼び出せること。
+    /// `Object::set` はこの setter を実行したうえで代入操作自体の成功
+    /// （`Some(true)`）を返すため、戻り値だけを見ると「登録成功」に
+    /// 見えてしまう。`Object::create_data_property` はアクセサを経由せず
+    /// データプロパティを直接定義するため、この誤認が起きない。
+    #[test]
+    fn js_1_install_native_proxy_global_overwrites_configurable_setter_only_property() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        engine
+            .evaluate_script(
+                "Object.defineProperty(globalThis, 'hostAdd', {\
+                     set() { /* 値を保存せず握りつぶす */ },\
+                     get() { return 'stubbed'; },\
+                     configurable: true,\
+                 }); true;",
+                &EvaluateOptions::default(),
+            )
+            .expect("defining the hostile accessor must succeed");
+
+        engine
+            .install_native_proxy_global("hostAdd", 3)
+            .expect("create_data_property must overwrite the configurable accessor");
+
+        engine.set_native_call_transport(Box::new(ScriptedTransport {
+            script: std::collections::VecDeque::from([Ok(NativeReturn::Ok(JsValue::Number(9.0)))]),
+            calls: Vec::new(),
+        }));
+        let result = engine
+            .evaluate_script("hostAdd()", &EvaluateOptions::default())
+            .expect("the proxy function must be reachable after overwriting the accessor");
+        assert_eq!(result, JsValue::Number(9.0));
+    }
+
+    /// JS-1・Issue #511・PR #533 codex レビュー指摘 P1: `globalThis` に
+    /// 同名の non-configurable なプロパティが既に存在する場合、
+    /// `create_data_property` は上書きに失敗して `Some(false)` を返すため、
+    /// `install_native_proxy_global` は「登録できた」と装わず
+    /// `BindingFailed` を返すこと（security.md「偽装・回避機能の禁止」）。
+    #[test]
+    fn js_1_install_native_proxy_global_rejects_non_configurable_existing_property() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        engine
+            .evaluate_script(
+                "Object.defineProperty(globalThis, 'hostAdd', {\
+                     value: 'frozen',\
+                     configurable: false,\
+                     writable: false,\
+                 }); true;",
+                &EvaluateOptions::default(),
+            )
+            .expect("defining the non-configurable property must succeed");
+
+        assert!(matches!(
+            engine.install_native_proxy_global("hostAdd", 4),
             Err(JsEngineError::BindingFailed(_))
         ));
     }
