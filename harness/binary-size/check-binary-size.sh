@@ -76,6 +76,15 @@ if [ -n "$FILE" ] && [ -n "$PACKAGE" ]; then
   usage
   exit 2
 fi
+# --bin は --file モード専用の契約（README.md の Usage 参照。package モードは
+# 対象 package の bin target をすべて判定する仕様のため、--bin を渡されても
+# 黙って無視すると「指定した 1 個だけを計測した」と CLI 利用者に誤認させる。
+# codex レビュー指摘, PR #563）。
+if [ -n "$PACKAGE" ] && [ -n "$BIN" ]; then
+  echo "error: --bin is only valid with --file (--package judges every bin target of the package)" >&2
+  usage
+  exit 2
+fi
 
 # 上限値は 1-15 桁の 10 進数のみ許可し、0 は拒否する（bash の算術比較が
 # オーバーフローしないようにするための桁数制限。README.md 参照）。
@@ -173,8 +182,17 @@ fi
 
 # $pkg は jq の --arg で渡し、フィルタ文字列へ連結しない（jq インジェクション
 # 対策。security.md「インジェクション」観点。compat-regression と同じ方針）。
+#
+# `.packages[]` を名前だけで照合すると、workspace 外の依存に同名 package が
+# 存在する場合に指定した workspace package と異なる ID を拾いうる
+# （`--no-deps` により通常は workspace member のみが `.packages[]` に載るが、
+# 将来 `--no-deps` を外す変更が入っても取り違えないよう、`.workspace_members`
+# に id が含まれる package だけへ明示的に限定する。codex レビュー指摘, PR
+# #563）。
 PKG_FOUND=$(printf '%s' "$METADATA" | jq -r --arg pkg "$PACKAGE" '
-    [.packages[] | select(.name == $pkg)] | length
+    .workspace_members as $wm
+    | [.packages[] | select(.name == $pkg) | select(.id as $id | $wm | index($id) != null)]
+    | length
   ' | tr -d '\r')
 if [ "$PKG_FOUND" -eq 0 ]; then
   # 既定 package（fandhe-browser-cli）に限り skip する。実装対象の cli crate は
@@ -194,12 +212,11 @@ if [ "$PKG_FOUND" -eq 0 ]; then
   echo "error: package $PACKAGE not found in workspace (check --package / BINARY_SIZE_PACKAGE for a typo)" >&2
   exit 2
 fi
-
-BIN_COUNT=$(printf '%s' "$METADATA" | jq -r --arg pkg "$PACKAGE" '
-    [.packages[] | select(.name == $pkg) | .targets[] | select(.kind | index("bin"))] | length
-  ' | tr -d '\r')
-if [ "$BIN_COUNT" -eq 0 ]; then
-  echo "error: package $PACKAGE has no bin target" >&2
+# cargo は同一 workspace 内で同名 package を許さないため通常起こり得ないが、
+# 上記の workspace_members 限定フィルタが 2 件以上一致した場合は前提が崩れて
+# いる（cargo の挙動変化等）ため、誤った ID を選ばず fail-closed にする。
+if [ "$PKG_FOUND" -gt 1 ]; then
+  echo "error: multiple workspace members named $PACKAGE found in cargo metadata (ambiguous; cargo should reject duplicate package names within one workspace)" >&2
   exit 2
 fi
 
@@ -208,13 +225,23 @@ fi
 # 等。これも "kind": ["custom-build"] の実行ファイルとして .executable を持つ）
 # まで拾ってしまい、それらのサイズで誤って不合格・出力の package/bin ラベルが
 # 実体と一致しなくなる（codex / cursor レビュー指摘, PR #563）。cargo metadata
-# の package id で対象 package に限定し、target.kind に "bin" を含むものだけを
-# 対象とする。
+# の package id（上記と同じ workspace member 限定フィルタで解決）で対象
+# package に限定し、target.kind に "bin" を含むものだけを対象とする。
 PKG_ID=$(printf '%s' "$METADATA" | jq -r --arg pkg "$PACKAGE" '
-    [.packages[] | select(.name == $pkg) | .id] | first
+    .workspace_members as $wm
+    | [.packages[] | select(.name == $pkg) | select(.id as $id | $wm | index($id) != null) | .id]
+    | first
   ' | tr -d '\r')
 if [ -z "$PKG_ID" ] || [ "$PKG_ID" = "null" ]; then
   echo "error: failed to resolve package id for $PACKAGE from cargo metadata" >&2
+  exit 2
+fi
+
+BIN_COUNT=$(printf '%s' "$METADATA" | jq -r --arg pkgid "$PKG_ID" '
+    [.packages[] | select(.id == $pkgid) | .targets[] | select(.kind | index("bin"))] | length
+  ' | tr -d '\r')
+if [ "$BIN_COUNT" -eq 0 ]; then
+  echo "error: package $PACKAGE has no bin target" >&2
   exit 2
 fi
 
