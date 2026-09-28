@@ -27,6 +27,30 @@ use fandhe_browser_js::{EvaluateOptions, JsEngineError, JsValue};
 /// 128 MiB では OOM の再現に長い時間がかかるため、高速化のため縮小する。
 const TEST_HEAP_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
+/// テスト用に小さくした親側 RSS 監視のしきい値（バイト。48 MiB）。
+///
+/// codex レビュー指摘 #503 P0「macOS の JS ワーカーに強制的なメモリ上限
+/// がない」対応で、V8 の `ArrayBuffer` backing store 確保に独自の上限
+/// （`resource_limits::MAX_ARRAY_BUFFER_ALLOCATION_BYTES`。128 MiB）を
+/// 設けたことに伴い、この定数を導入する前に「`ArrayBuffer` を際限なく
+/// 確保して本番の RSS 監視しきい値（320 MiB）に実際に到達させる」ことで
+/// 親側の RSS 監視を検証していた既存のテストが、その手段を失った
+/// （`ArrayBuffer` の確保が 128 MiB で `RangeError` になり、320 MiB には
+/// 決して到達しなくなったため）。
+///
+/// RSS 監視という仕組みそのものの検証を保つため、`ArrayBuffer` の上限を
+/// テストのために引き上げるのではなく（引き上げは、検証したい安全機構
+/// 自体を回避する経路になり得るため避ける。`WorkerSpawnConfigForTest`
+/// の他のテスト専用フィールドと同じ「下げることしかできない」原則を
+/// 保つ）、RSS 監視のしきい値を本番の値より小さくする
+/// （`WorkerSpawnConfigForTest::rss_threshold_bytes_override`）ことで、
+/// `ArrayBuffer` の上限（128 MiB）に到達するよりずっと手前で RSS 監視が
+/// 先に発動するようにする。本モジュールのドキュメントコメントが説明する
+/// 起動直後の RSS 実測値（10〜25 MiB 程度）に対して十分な余裕を持たせ
+/// （通常の評価がこのしきい値に誤って触れないように）、かつ数回の
+/// 10 MiB チャンク確保で確実に超えられる値として 48 MiB を選んだ。
+const TEST_RSS_THRESHOLD_BYTES: u64 = 48 * 1024 * 1024;
+
 fn main() -> ExitCode {
     // 最優先: このプロセスが子プロセスとして起動されたものであれば、
     // ワーカーとして動作してそのまま終了する（設計書 §3.1）。
@@ -56,6 +80,16 @@ fn main() -> ExitCode {
     js_1_oversized_test_heap_limit_is_clamped_to_the_production_default();
     eprintln!("case: js_1_undersized_test_heap_limit_is_raised_to_a_working_floor");
     js_1_undersized_test_heap_limit_is_raised_to_a_working_floor();
+    eprintln!(
+        "case: js_1_oversized_array_buffer_is_rejected_as_range_error_without_discarding_context"
+    );
+    js_1_oversized_array_buffer_is_rejected_as_range_error_without_discarding_context();
+    eprintln!(
+        "case: js_1_array_buffer_allocator_counter_does_not_leak_across_repeated_allocate_and_free"
+    );
+    js_1_array_buffer_allocator_counter_does_not_leak_across_repeated_allocate_and_free();
+    eprintln!("case: js_1_web_assembly_global_is_undefined");
+    js_1_web_assembly_global_is_undefined();
     eprintln!(
         "case: js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceeded"
     );
@@ -146,6 +180,7 @@ fn js_1_oom_returns_resource_limit_exceeded_and_next_eval_uses_fresh_context() {
         protocol_version_override: None,
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
+        rss_threshold_bytes_override: None,
     });
     engine
         .evaluate_script("var before_oom = 999;", &EvaluateOptions::default())
@@ -192,6 +227,7 @@ fn js_1_handshake_failure_is_engine_unavailable() {
         protocol_version_override: Some(9999),
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
+        rss_threshold_bytes_override: None,
     });
 
     match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
@@ -214,6 +250,7 @@ fn js_1_handshake_rejects_hello_naming_a_different_engine() {
         protocol_version_override: None,
         hello_wrong_engine_for_test: true,
         hello_extra_byte_for_test: false,
+        rss_threshold_bytes_override: None,
     });
 
     match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
@@ -241,6 +278,7 @@ fn js_1_handshake_rejects_hello_with_wrong_length() {
         protocol_version_override: None,
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: true,
+        rss_threshold_bytes_override: None,
     });
 
     match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
@@ -364,6 +402,7 @@ fn js_1_oversized_test_heap_limit_is_clamped_to_the_production_default() {
         protocol_version_override: None,
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
+        rss_threshold_bytes_override: None,
     });
 
     let oom_script = "var chunks = []; while (true) { chunks.push(new Array(1e7).fill(0)); }";
@@ -397,6 +436,7 @@ fn js_1_undersized_test_heap_limit_is_raised_to_a_working_floor() {
         protocol_version_override: None,
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
+        rss_threshold_bytes_override: None,
     });
 
     let result = engine
@@ -410,36 +450,129 @@ fn js_1_undersized_test_heap_limit_is_raised_to_a_working_floor() {
     assert_eq!(result, JsValue::Number(2.0));
 }
 
+/// codex レビュー指摘 #503 P0「macOS の JS ワーカーに強制的なメモリ上限
+/// がない」の回帰テスト観点「上限を超える `ArrayBuffer` は `RangeError`
+/// （`EvaluationFailed`）になり、子プロセスは生きたまま Context も保た
+/// れる（直後の評価が成功する）」:
+/// `resource_limits::MAX_ARRAY_BUFFER_ALLOCATION_BYTES`（128 MiB）を
+/// 1 MiB 超える単発の確保は、際限のない繰り返し（`js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceeded`
+/// が検証する RSS 監視の経路）を経ずに、V8 自身のレベル
+/// （`resource_limits::new_bounded_array_buffer_allocator`）で即座に
+/// 拒否されること。`ResourceLimitExceeded`（子を破棄して作り直す）とは
+/// 異なり、`EvaluationFailed` は子・Context を破棄しない契約であるため、
+/// 直後の評価が同じ Context（`before_limit` が見える）で成功することも
+/// あわせて確認する。
+fn js_1_oversized_array_buffer_is_rejected_as_range_error_without_discarding_context() {
+    let mut engine = V8ProcessEngine::new();
+    engine
+        .evaluate_script("var before_limit = 111;", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("marker declaration must evaluate successfully: {err}"));
+
+    // 128 MiB + 1 MiB。`MAX_ARRAY_BUFFER_ALLOCATION_BYTES` を確実に
+    // 超える単発の確保。
+    const OVERSIZED_BYTES: u64 = 128 * 1024 * 1024 + 1024 * 1024;
+    let oversized_script = format!("new ArrayBuffer({OVERSIZED_BYTES})");
+    match engine.evaluate_script(&oversized_script, &EvaluateOptions::default()) {
+        Err(JsEngineError::EvaluationFailed(msg)) => {
+            assert!(
+                msg.contains("RangeError"),
+                "expected a RangeError for an allocation exceeding \
+                 MAX_ARRAY_BUFFER_ALLOCATION_BYTES, got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected EvaluationFailed(RangeError) for an oversized single ArrayBuffer \
+             allocation, got: {other:?}"
+        ),
+    }
+
+    // Context が保たれていること（`before_limit` がまだ見える。子プロセスも
+    // 生きたまま同じ子を使い続ける）。
+    let result = engine
+        .evaluate_script("before_limit", &EvaluateOptions::default())
+        .unwrap_or_else(|err| {
+            panic!(
+                "the RangeError from an oversized ArrayBuffer must not discard the context: {err}"
+            )
+        });
+    assert_eq!(result, JsValue::Number(111.0));
+}
+
+/// codex レビュー指摘 #503 P0「macOS の JS ワーカーに強制的なメモリ上限
+/// がない」の回帰テスト観点「上限以下の確保と解放（GC）を繰り返しても、
+/// カウンタが漏れずに再び確保できる」: `resource_limits::
+/// MAX_ARRAY_BUFFER_ALLOCATION_BYTES`（128 MiB）に対し、1 回 8 MiB の
+/// `ArrayBuffer` を確保しては参照を手放す（`a = null`）ループを、
+/// 単純合計で上限の何倍にもなる回数（40 回。8 MiB × 40 ＝ 320 MiB）
+/// 繰り返す。カウンタが解放時に正しく減っていれば、V8 の外部メモリ
+/// 圧力に基づく GC が不要になった `ArrayBuffer` を回収し続けるため、
+/// 一度も `RangeError` にならずに完走する。カウンタが漏れていれば
+/// （解放を数えていなければ）、40 回に到達するよりずっと前
+/// （128 MiB ÷ 8 MiB ＝ 16 回目前後）に `RangeError` になるはずである。
+fn js_1_array_buffer_allocator_counter_does_not_leak_across_repeated_allocate_and_free() {
+    let mut engine = V8ProcessEngine::new();
+    let script = "for (let i = 0; i < 40; i++) { let a = new ArrayBuffer(8 * 1024 * 1024); a = null; } \"done\"";
+    let result = engine
+        .evaluate_script(script, &EvaluateOptions::default())
+        .unwrap_or_else(|err| {
+            panic!(
+                "40 iterations of allocate-then-drop (8 MiB each; 320 MiB cumulative if the \
+                 allocator's counter leaked, well over the 128 MiB limit) must all succeed if \
+                 `free` correctly returns bytes to the counter, got: {err}"
+            )
+        });
+    assert_eq!(result, JsValue::String("done".to_string()));
+}
+
+/// codex レビュー指摘 #503 P0「macOS の JS ワーカーに強制的なメモリ上限
+/// がない」の回帰テスト観点「WebAssembly を無効化する」:
+/// `typeof WebAssembly` が `"undefined"` になること
+/// （`v8_engine::V8Engine::new_with_heap_limit` が Context 生成直後に
+/// `WebAssembly` グローバルを上書きする。詳細は同関数の実装コメント
+/// 参照）。
+fn js_1_web_assembly_global_is_undefined() {
+    let mut engine = V8ProcessEngine::new();
+    let result = engine
+        .evaluate_script("typeof WebAssembly", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("evaluating typeof WebAssembly must succeed: {err}"));
+    assert_eq!(result, JsValue::String("undefined".to_string()));
+}
+
 /// codex レビュー指摘 #503 P0「ヒープ外メモリが無制限」の回帰テスト
 /// 観点「大きな `ArrayBuffer` を確保して触ると `ResourceLimitExceeded`
 /// になり、次の評価が新しい Context で成功すること」: `Uint8Array` の
 /// backing store は V8 のヒープ外（[`v8_engine`] の `MAX_ISOLATE_HEAP_BYTES`。
 /// 本テストは既定値の 128 MiB のまま）に確保されるため、`chunks` 配列
 /// 自体が保持する参照は小さく、V8 の Isolate ヒープ上限には触れない。
-/// それでも際限のない確保は、**3 OS 共通で**親側の RSS 監視
-/// （`resource_limits::MAX_CHILD_RSS_BYTES`。320 MiB）による強制終了と
-/// して検出され、`JsEngineError::ResourceLimitExceeded` になる
-/// （メッセージに "context was discarded" を含む）。Linux の
-/// `RLIMIT_DATA`（`resource_limits::enforce_via_rlimit_data`。2 GiB）は
-/// V8 の `CodeRange` 仮想アドレス予約だけで数百 MiB を要するため小さい
-/// 値には設定できず（`resource_limits` のドキュメントコメント参照）、
-/// RSS 監視のしきい値よりはるかに大きい。したがって本テストの範囲では
-/// RSS 監視が先に発動し、`RLIMIT_DATA` はここでは働かない
-/// （際限のない確保をどこまでも許さないための、より緩い最終防衛線に
-/// 留まる）。
+///
+/// **`WorkerSpawnConfigForTest::rss_threshold_bytes_override`
+/// （[`TEST_RSS_THRESHOLD_BYTES`]。48 MiB）を使う**（同定数のドキュメント
+/// コメント参照）: codex レビュー指摘 #503 P0「macOS の JS ワーカーに
+/// 強制的なメモリ上限がない」対応で導入した
+/// `resource_limits::new_bounded_array_buffer_allocator`（128 MiB）が、
+/// 本番のしきい値（`resource_limits::MAX_CHILD_RSS_BYTES`。320 MiB）へ
+/// 到達するよりずっと手前で `RangeError` を投げてしまうため、本番の
+/// しきい値のままでは際限のない確保を続けさせられない。RSS 監視の
+/// しきい値を下げることで、`ArrayBuffer` の上限（128 MiB）に到達する
+/// よりずっと手前で親側の RSS 監視が先に発動するようにする。
 fn js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceeded() {
-    let mut engine = V8ProcessEngine::new();
+    let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
+        heap_limit_bytes: None,
+        protocol_version_override: None,
+        hello_wrong_engine_for_test: false,
+        hello_extra_byte_for_test: false,
+        rss_threshold_bytes_override: Some(TEST_RSS_THRESHOLD_BYTES),
+    });
     engine
         .evaluate_script("var before_oom = 555;", &EvaluateOptions::default())
         .unwrap_or_else(|err| panic!("marker declaration must evaluate successfully: {err}"));
 
     // 1 チャンク 10 MiB の `Uint8Array` を確保して実際に書き込み（`fill`
     // でページをタッチし、仮想アドレス空間の予約だけで済ませない）、
-    // 参照を保持し続ける。ヒープ外の RSS を素早く積み上げ、親の RSS
-    // 監視しきい値（`MAX_CHILD_RSS_BYTES`。320 MiB）に
-    // `SCRIPT_EXECUTION_TIMEOUT`（2 秒）の実行時間内で到達させることを
-    // 狙う（`RLIMIT_DATA`＝2 GiB はこのテストの範囲では発動しない。
-    // 上のドキュメントコメント参照）。
+    // 参照を保持し続ける。ヒープ外の RSS を素早く積み上げ、下げた RSS
+    // 監視しきい値（[`TEST_RSS_THRESHOLD_BYTES`]。48 MiB）に数チャンクで
+    // 到達させる（`ArrayBuffer` の上限は 128 MiB のため、まだ十分な
+    // 余裕がある段階で RSS 監視が先に発動する）。
     let oom_script = "var chunks = []; while (true) { chunks.push(new Uint8Array(1e7).fill(1)); }";
     match engine.evaluate_script(oom_script, &EvaluateOptions::default()) {
         Err(JsEngineError::ResourceLimitExceeded(msg)) => {
@@ -525,8 +658,18 @@ fn js_1_linux_child_process_has_rlimit_data_set() {
 /// スレッド（応答直後の同期確認・次回呼び出し前の確認を含む）が
 /// どこかの呼び出しで `ResourceLimitExceeded` を返し、その次の評価は
 /// 新しい Context で成功すること。
+///
+/// [`js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceeded`]
+/// と同じ理由で `WorkerSpawnConfigForTest::rss_threshold_bytes_override`
+/// （[`TEST_RSS_THRESHOLD_BYTES`]。48 MiB）を使う。
 fn js_1_repeated_short_evaluations_accumulating_array_buffers_hit_resource_limit() {
-    let mut engine = V8ProcessEngine::new();
+    let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
+        heap_limit_bytes: None,
+        protocol_version_override: None,
+        hello_wrong_engine_for_test: false,
+        hello_extra_byte_for_test: false,
+        rss_threshold_bytes_override: Some(TEST_RSS_THRESHOLD_BYTES),
+    });
     engine
         .evaluate_script(
             "globalThis.chunks = []; chunks.length",
@@ -534,9 +677,11 @@ fn js_1_repeated_short_evaluations_accumulating_array_buffers_hit_resource_limit
         )
         .unwrap_or_else(|err| panic!("initializing the accumulator must succeed: {err}"));
 
-    // 320 MiB のしきい値に対し、1 回 10 MiB。80 回（800 MiB 相当）まで
-    // 繰り返せば、しきい値超過が検出されないままでは通らないはずである。
-    const MAX_ITERATIONS: usize = 80;
+    // [`TEST_RSS_THRESHOLD_BYTES`]（48 MiB）に対し、1 回 10 MiB。10 回
+    // （100 MiB 相当。`ArrayBuffer` の上限である 128 MiB にはまだ余裕を
+    // 残す）まで繰り返せば、しきい値超過が検出されないままでは通らない
+    // はずである。
+    const MAX_ITERATIONS: usize = 10;
     let mut hit_limit = false;
     for i in 0..MAX_ITERATIONS {
         match engine.evaluate_script(
@@ -572,32 +717,38 @@ fn js_1_repeated_short_evaluations_accumulating_array_buffers_hit_resource_limit
 }
 
 /// codex レビュー指摘 #503 P0「Windows では working set の上限と監視だけ
-/// ではコミット量を制限できない」の回帰テスト観点「Windows の
-/// `ProcessMemoryLimit` で、大きな `ArrayBuffer` を確保すると
-/// `ResourceLimitExceeded` になり、次の評価が新しい Context で成功する
-/// こと」。
+/// ではコミット量を制限できない」の回帰テスト観点「Windows で、大きな
+/// `ArrayBuffer` を確保すると `ResourceLimitExceeded` になり、次の評価が
+/// 新しい Context で成功すること」。
 ///
 /// 本テストはローカル（開発環境が Windows ではない）では実行されず、
 /// CI の Windows ランナーでの確認を前提とする（`#[cfg(target_os =
-/// "windows")]` かつ `main` から Windows でだけ呼ばれる）。子は
-/// `enforce_child_memory_limit` により起動直後に Job Object の
-/// `ProcessMemoryLimit`（`resource_limits::WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`。
-/// 384 MiB）を自身へ設定済みである。ただし `JOB_OBJECT_LIMIT_PROCESS_MEMORY`
-/// は Linux の `kill` ベースの強制とは異なり、**上限到達時にプロセスを
-/// 終了させるのではなく、その先の確保を失敗させるだけ**である
-/// （V8 は確保失敗を GC 付きで再試行したうえ、最終的に catchable な
-/// `RangeError` を投げる。詳細は `resource_limits` の
-/// `WINDOWS_PROCESS_MEMORY_LIMIT_BYTES` のドキュメントコメント参照）。
-/// 際限のない確保はこの OS 側の天井で頭打ちになり、コミット量が
-/// `MAX_CHILD_RSS_BYTES`（320 MiB）を上回った状態が続くため、親側の
-/// `PrivateUsage` 監視（応答直後の同期確認・継続監視のいずれか）が
-/// 最終的に検出して `ResourceLimitExceeded` へ分類し、子を作り直す
-/// （観測可能な結果としては、他 OS 向けの
+/// "windows")]` かつ `main` から Windows でだけ呼ばれる）。
+///
+/// [`js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceeded`]
+/// と同じ理由で `WorkerSpawnConfigForTest::rss_threshold_bytes_override`
+/// （[`TEST_RSS_THRESHOLD_BYTES`]。48 MiB）を使う: codex レビュー指摘
+/// #503 P0「macOS の JS ワーカーに強制的なメモリ上限がない」対応で導入
+/// した `resource_limits::new_bounded_array_buffer_allocator`（128 MiB）
+/// が、Windows の Job Object の `ProcessMemoryLimit`（`resource_limits::
+/// WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`。384 MiB）へ到達するよりずっと
+/// 手前で `RangeError` を投げるようになったため、本番のしきい値のまま
+/// では Job Object のコミット上限に基づく確保失敗（V8 が GC 付きで再試行
+/// したうえで `RangeError` を投げる経路）を再現できない。RSS 監視の
+/// しきい値を下げることで、`ArrayBuffer` の上限（128 MiB）に到達する
+/// よりずっと手前で親側の RSS 監視（`PrivateUsage`）が先に発動するように
+/// する（観測可能な結果としては、他 OS 向けの
 /// `js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceeded`
 /// と同じ `ResourceLimitExceeded` になる）。
 #[cfg(target_os = "windows")]
 fn js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation() {
-    let mut engine = V8ProcessEngine::new();
+    let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
+        heap_limit_bytes: None,
+        protocol_version_override: None,
+        hello_wrong_engine_for_test: false,
+        hello_extra_byte_for_test: false,
+        rss_threshold_bytes_override: Some(TEST_RSS_THRESHOLD_BYTES),
+    });
     engine
         .evaluate_script("var before_oom = 777;", &EvaluateOptions::default())
         .unwrap_or_else(|err| panic!("marker declaration must evaluate successfully: {err}"));

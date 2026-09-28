@@ -228,7 +228,7 @@ const MAX_CONSECUTIVE_PROBE_FAILURES: u32 = 3;
 /// 監視する専任スレッド（codex・Cursor Bugbot レビュー指摘 #503 P0
 /// 対応）。
 ///
-/// 呼び出し元（`WorkerHandle`）が [`MemoryMonitor::spawn`] で生成し、
+/// 呼び出し元（`WorkerHandle`）が [`MemoryMonitor::spawn_with_threshold`] で生成し、
 /// [`WorkerHandle::drop`] で必ず [`MemoryMonitor::stop_and_join`] を
 /// 呼んで止めようとする。通常は速やかに停止するが、
 /// `stop_and_join` は無期限には待たない（期限内に停止しなければ
@@ -247,23 +247,20 @@ struct MemoryMonitor {
 }
 
 impl MemoryMonitor {
-    /// 監視スレッドを起動する（本番のしきい値・本番のメモリ使用量取得
-    /// 経路を使う）。
-    fn spawn(child: Arc<Mutex<Child>>, pid: u32) -> Self {
-        Self::spawn_with_threshold_and_probe(
-            child,
-            pid,
-            super::resource_limits::MAX_CHILD_RSS_BYTES,
-            Box::new(default_memory_probe),
-        )
-    }
-
-    /// [`MemoryMonitor::spawn`] の本体。しきい値を呼び出し元から指定
-    /// できる（単体テストが、実プロセスの RSS を人為的に膨らませずに
-    /// 「しきい値超過」を確実に再現するため、極端に小さいしきい値を
-    /// 渡せるようにする。`tests` モジュール参照）。本番のメモリ使用量
-    /// 取得経路（[`default_memory_probe`]）を使う。
-    #[cfg(test)]
+    /// 監視スレッドを起動する（呼び出し元が指定したしきい値・本番の
+    /// メモリ使用量取得経路を使う）。
+    ///
+    /// しきい値を固定引数にしていない理由: 本番の
+    /// `spawn_worker`（[`super::resource_limits::MAX_CHILD_RSS_BYTES`]。
+    /// 320 MiB を渡す）と、`WorkerSpawnConfigForTest::rss_threshold_bytes_override`
+    /// 経由のテスト（それより小さい値を渡す。codex レビュー指摘 #503 P0
+    /// 「macOS の JS ワーカーに強制的なメモリ上限がない」対応で
+    /// `ArrayBuffer` 確保に上限を設けたことに伴い、既存の結合テストが
+    /// RSS 監視自体の検証という本来の意図を保てなくなった問題への
+    /// 対応）と、単体テスト（`tests` モジュール。しきい値超過を人為的に
+    /// 再現するため極端に小さい値を渡す）の 3 者が、いずれもこの単一の
+    /// 関数を経由して呼び出し元から具体的なしきい値を指定できる必要が
+    /// あるため。
     fn spawn_with_threshold(child: Arc<Mutex<Child>>, pid: u32, threshold_bytes: u64) -> Self {
         Self::spawn_with_threshold_and_probe(
             child,
@@ -273,9 +270,8 @@ impl MemoryMonitor {
         )
     }
 
-    /// [`MemoryMonitor::spawn`]／`MemoryMonitor::spawn_with_threshold`
-    /// （`#[cfg(test)]` 専用）の本体。`probe` を呼び出し元から差し替えられる
-    /// （codex レビュー指摘
+    /// [`MemoryMonitor::spawn_with_threshold`] の本体。`probe` を呼び出し元
+    /// から差し替えられる（codex レビュー指摘
     /// #503 P0「取得失敗を注入する経路を `#[cfg(test)]` で用意する」
     /// 対応。単体テストは常に `None` を返す・N 回目まで `None` を返す等の
     /// フェイクを渡すことで、実際の `ps`／`/proc`／`GetProcessMemoryInfo`
@@ -467,6 +463,13 @@ struct WorkerHandle {
     stderr_tail: Arc<Mutex<Vec<u8>>>,
     stderr_thread: Option<std::thread::JoinHandle<()>>,
     memory_monitor: MemoryMonitor,
+    /// [`memory_monitor`](Self::memory_monitor) に渡したのと同じ RSS
+    /// しきい値（バイト）。[`apply_post_response_rss_check`] が応答直後の
+    /// 同期確認で使う（`MemoryMonitor` 自身はしきい値を外部から読み出せる
+    /// API を持たないため、`WorkerHandle` 側にも複製して保持する）。
+    /// `WorkerSpawnConfigForTest::rss_threshold_bytes_override` のドキュメント
+    /// コメント参照。
+    rss_threshold_bytes: u64,
 }
 
 impl WorkerHandle {
@@ -474,13 +477,28 @@ impl WorkerHandle {
     /// いること）から `WorkerHandle` を組み立てる（writer・reader・
     /// stderr drain・メモリ監視の各スレッドを起動する）。
     ///
-    /// `spawn_worker`（本番。自己再実行した V8 ワーカー）と、
     /// `tests` モジュールの単体テスト（`sleep` 等の代役プロセスを使い、
     /// V8 プロトコルに依存しない書き込みタイムアウト・reap タイムアウト
-    /// の挙動だけを検証する）の両方から使う共通の組み立てロジック
-    /// （codex・Cursor Bugbot レビュー指摘 #503 の回帰テストのため、
-    /// 本番と同じスレッド構成を単体テストでも使えるようにする）。
-    fn from_child(mut child: Child) -> Result<Self, JsEngineError> {
+    /// の挙動だけを検証する）専用の入口。本番の既定しきい値
+    /// （[`super::resource_limits::MAX_CHILD_RSS_BYTES`]）を使う
+    /// [`WorkerHandle::from_child_with_rss_threshold`] への薄いラッパー。
+    ///
+    /// 本番（`spawn_worker`）はしきい値を差し替えられる必要がある
+    /// （`WorkerSpawnConfigForTest::rss_threshold_bytes_override` 参照）
+    /// ため、直接 [`WorkerHandle::from_child_with_rss_threshold`] を呼ぶ。
+    #[cfg(test)]
+    fn from_child(child: Child) -> Result<Self, JsEngineError> {
+        Self::from_child_with_rss_threshold(child, super::resource_limits::MAX_CHILD_RSS_BYTES)
+    }
+
+    /// [`WorkerHandle::from_child`] の本体。RSS 監視のしきい値を呼び出し元
+    /// から指定できる（`spawn_worker` が
+    /// `WorkerSpawnConfigForTest::rss_threshold_bytes_override` を渡す際に
+    /// 使う。同フィールドのドキュメントコメント参照）。
+    fn from_child_with_rss_threshold(
+        mut child: Child,
+        rss_threshold_bytes: u64,
+    ) -> Result<Self, JsEngineError> {
         let stdin = child.stdin.take().ok_or_else(|| {
             JsEngineError::EngineUnavailable(
                 "JS worker process was spawned without a stdin pipe".to_string(),
@@ -572,7 +590,8 @@ impl WorkerHandle {
             })
         };
 
-        let memory_monitor = MemoryMonitor::spawn(Arc::clone(&child), pid);
+        let memory_monitor =
+            MemoryMonitor::spawn_with_threshold(Arc::clone(&child), pid, rss_threshold_bytes);
 
         Ok(WorkerHandle {
             child,
@@ -585,6 +604,7 @@ impl WorkerHandle {
             stderr_tail,
             stderr_thread: Some(stderr_thread),
             memory_monitor,
+            rss_threshold_bytes,
         })
     }
 
@@ -770,6 +790,29 @@ pub struct WorkerSpawnConfigForTest {
     /// （codex レビュー指摘 #503 P1「decode_hello が末尾の余分なバイトを
     /// 拒否していない」の回帰テスト専用）。
     pub hello_extra_byte_for_test: bool,
+    /// 親側の RSS 監視（継続監視・応答直後の同期確認の両方）が使う
+    /// しきい値の上書き値（バイト）。`None` の場合は
+    /// [`super::resource_limits::MAX_CHILD_RSS_BYTES`]（320 MiB）を使う
+    /// （codex レビュー指摘 #503 P0「macOS の JS ワーカーに強制的な
+    /// メモリ上限がない」対応で `ArrayBuffer` 確保に独自の上限
+    /// （[`super::resource_limits::MAX_ARRAY_BUFFER_ALLOCATION_BYTES`]。
+    /// 128 MiB）を設けたことに伴う回帰テスト専用の経路。この上限の
+    /// 導入前は、`ArrayBuffer` を際限なく確保するスクリプトで実プロセスの
+    /// RSS を本番のしきい値（320 MiB）まで実際に押し上げて RSS 監視を
+    /// 検証していたが、`ArrayBuffer` の確保自体が 128 MiB で
+    /// `RangeError` になるようになったため、その手段が使えなくなった。
+    /// RSS 監視という仕組みそのものの検証を保つため、`ArrayBuffer` の
+    /// 上限をテストのために引き上げるのではなく（引き上げは、検証したい
+    /// 安全機構自体を回避する経路になり得るため避ける）、RSS 監視の
+    /// しきい値を**本番の値より小さくする**ことだけを許す（下げることしか
+    /// できない。`heap_limit_bytes` と同じ「テスト専用の上書きは安全側
+    /// にしか動かせない」原則）。
+    ///
+    /// **下げることしかできない**: 本番の既定値
+    /// （[`super::resource_limits::MAX_CHILD_RSS_BYTES`]）を上回る値を
+    /// 指定しても、`spawn_worker` が `MemoryMonitor` を起動する直前に
+    /// `min(要求値, MAX_CHILD_RSS_BYTES)` へクランプする。
+    pub rss_threshold_bytes_override: Option<u64>,
 }
 
 /// JS 評価を子プロセスへ分離して提供するエンジン（`JS-1`・Issue #503）。
@@ -866,7 +909,12 @@ impl V8ProcessEngine {
         // していないかを確認する。
         if let Some(reason) = worker.memory_monitor.take_kill_reason() {
             let tail = worker.reap_and_collect_stderr();
-            let err = monitor_kill_reason_to_error(reason, &tail, "while idle between evaluations");
+            let err = monitor_kill_reason_to_error(
+                reason,
+                &tail,
+                "while idle between evaluations",
+                worker.rss_threshold_bytes,
+            );
             // `worker` はここで drop され（`self.worker` へ戻さない）、
             // 次回の呼び出しで新しい子を起動し直す。
             return Err(ensure_discarded_phrase(err));
@@ -1017,7 +1065,20 @@ impl V8ProcessEngine {
             ))
         })?;
 
-        let mut worker = WorkerHandle::from_child(child)?;
+        // codex レビュー指摘 #503 P0「macOS の JS ワーカーに強制的なメモリ
+        // 上限がない」対応で `ArrayBuffer` 確保に独自の上限を設けたことに
+        // 伴い、既存の RSS 監視の回帰テストが本来の意図（RSS 監視自体の
+        // 検証）を保てるよう、テストだけがしきい値を下げられるようにする
+        // （`WorkerSpawnConfigForTest::rss_threshold_bytes_override` の
+        // ドキュメントコメント参照。本番の `new()` は常に `None` のため、
+        // 本番の子には影響しない）。**下げることしかできない**: 要求値を
+        // 本番の既定値（`MAX_CHILD_RSS_BYTES`）でクランプする。
+        let rss_threshold_bytes = self
+            .spawn_config
+            .rss_threshold_bytes_override
+            .map(|requested| requested.min(super::resource_limits::MAX_CHILD_RSS_BYTES))
+            .unwrap_or(super::resource_limits::MAX_CHILD_RSS_BYTES);
+        let mut worker = WorkerHandle::from_child_with_rss_threshold(child, rss_threshold_bytes)?;
 
         match worker.frame_rx.recv_timeout(HANDSHAKE_TIMEOUT) {
             Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::HELLO => {
@@ -1402,7 +1463,12 @@ impl V8ProcessEngine {
 
 /// [`MonitorKillReason`] を、破棄時のエラーへ変換する（`context_suffix`
 /// は呼び出し元の文脈を表す短い句。例: "during the handshake"・"and was
-/// killed"）。
+/// killed"。`threshold_bytes` はメッセージに含める、実際に使われた RSS
+/// 監視のしきい値。本番は常に
+/// [`super::resource_limits::MAX_CHILD_RSS_BYTES`] だが、
+/// `WorkerSpawnConfigForTest::rss_threshold_bytes_override` を使う
+/// テストではそれより小さい値になりうるため、呼び出し元
+/// （`worker.rss_threshold_bytes`）から渡してもらう）。
 ///
 /// **`ResourceLimitExceeded`・`EngineUnavailable` のどちらを使うかは
 /// 理由ごとに固定している**（codex レビュー指摘 #503 P0「エラーの種別は
@@ -1423,13 +1489,13 @@ fn monitor_kill_reason_to_error(
     reason: MonitorKillReason,
     tail: &str,
     context_suffix: &str,
+    threshold_bytes: u64,
 ) -> JsEngineError {
     match reason {
         MonitorKillReason::ResourceLimitExceeded(bytes) => {
             JsEngineError::ResourceLimitExceeded(format!(
                 "JS worker process memory usage ({bytes} bytes) exceeded the parent's \
-                 monitoring threshold ({} bytes) {context_suffix}; stderr: {tail}",
-                super::resource_limits::MAX_CHILD_RSS_BYTES
+                 monitoring threshold ({threshold_bytes} bytes) {context_suffix}; stderr: {tail}"
             ))
         }
         MonitorKillReason::ProbeUnavailable {
@@ -1457,7 +1523,12 @@ fn handshake_discard_error(
     fallback: impl FnOnce() -> JsEngineError,
 ) -> JsEngineError {
     match worker.memory_monitor.take_kill_reason() {
-        Some(reason) => monitor_kill_reason_to_error(reason, tail, "during the handshake"),
+        Some(reason) => monitor_kill_reason_to_error(
+            reason,
+            tail,
+            "during the handshake",
+            worker.rss_threshold_bytes,
+        ),
         None => fallback(),
     }
 }
@@ -1514,6 +1585,7 @@ fn discard_context_error(
             MonitorKillReason::ResourceLimitExceeded(bytes),
             tail,
             KILL_CONTEXT_SUFFIX,
+            worker.rss_threshold_bytes,
         );
         return ensure_discarded_phrase(err);
     }
@@ -1524,7 +1596,12 @@ fn discard_context_error(
         )));
     }
     if let Some(reason) = kill_reason {
-        let err = monitor_kill_reason_to_error(reason, tail, KILL_CONTEXT_SUFFIX);
+        let err = monitor_kill_reason_to_error(
+            reason,
+            tail,
+            KILL_CONTEXT_SUFFIX,
+            worker.rss_threshold_bytes,
+        );
         return ensure_discarded_phrase(err);
     }
     ensure_discarded_phrase(fallback())
@@ -1589,6 +1666,7 @@ fn apply_post_response_rss_check(
             reason,
             &tail,
             "immediately after responding; the next evaluation runs in a fresh context",
+            worker.rss_threshold_bytes,
         );
         return (Err(ensure_discarded_phrase(err)), false);
     }
@@ -1599,7 +1677,7 @@ fn apply_post_response_rss_check(
     let Some(rss_bytes) = super::resource_limits::read_child_rss_bytes(probe) else {
         return (outcome, keep_worker);
     };
-    if rss_bytes <= super::resource_limits::MAX_CHILD_RSS_BYTES {
+    if rss_bytes <= worker.rss_threshold_bytes {
         return (outcome, keep_worker);
     }
 
@@ -1616,7 +1694,7 @@ fn apply_post_response_rss_check(
             "JS worker process RSS ({rss_bytes} bytes) exceeded the parent's monitoring \
              threshold ({} bytes) immediately after responding; context was discarded; stderr: \
              {tail}",
-            super::resource_limits::MAX_CHILD_RSS_BYTES
+            worker.rss_threshold_bytes
         ))),
         false,
     )

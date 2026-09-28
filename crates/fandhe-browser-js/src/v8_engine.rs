@@ -295,9 +295,17 @@ pub(crate) fn ensure_v8_initialized() {
     V8_INIT.call_once(|| {
         // フラグは Platform 初期化より前にしか反映されないため、
         // `initialize_platform` の前に設定する（codex レビュー指摘 #503
-        // P0「ヒープ外メモリが無制限」対応の一部。wasm メモリの上限。
-        // `super::resource_limits` のドキュメントコメント参照）。
-        super::resource_limits::configure_wasm_memory_flag();
+        // P0「ヒープ外メモリが無制限」対応の一部。wasm の単一メモリ
+        // インスタンスへの上限。`super::resource_limits` のドキュメント
+        // コメント参照）。
+        //
+        // WebAssembly を無効化する主たる対策は、ここではなく Context
+        // 生成直後（[`V8Engine::new_with_heap_limit`]）のグローバル
+        // オブジェクト上書きで行う（V8 152.2.0 にはグローバル露出を
+        // 切り替える単一フラグが存在しないため、フラグベースのこの
+        // 初期化関数では扱えない）。この関数が設定するページ数上限は、
+        // その主たる対策が失敗した場合の多層防御である。
+        super::resource_limits::configure_wasm_max_mem_pages_flag();
         let platform = v8::new_unprotected_default_platform(0, false).make_shared();
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
@@ -377,7 +385,11 @@ impl V8Engine {
     ///
     /// Isolate には [`MAX_ISOLATE_HEAP_BYTES`] をヒープ上限として設定する
     /// （`JS-1`・codex レビュー指摘 #154 P0 対応。上限到達時の挙動は同定数の
-    /// ドキュメントコメントを参照）。
+    /// ドキュメントコメントを参照）。加えて、`ArrayBuffer` の backing
+    /// store 確保量に独自の上限を課すアロケータを設定する（codex レビュー
+    /// 指摘 #503 P0「macOS の JS ワーカーに強制的なメモリ上限がない」
+    /// 対応。`super::resource_limits::new_bounded_array_buffer_allocator`
+    /// のドキュメントコメント参照）。
     pub(crate) fn new() -> Result<Self, IsolateAlreadyActiveOnThread> {
         Self::new_with_heap_limit(MAX_ISOLATE_HEAP_BYTES)
     }
@@ -404,13 +416,49 @@ impl V8Engine {
         if !acquired {
             return Err(IsolateAlreadyActiveOnThread);
         }
-        let create_params = v8::CreateParams::default().heap_limits(0, heap_limit_bytes);
+        let create_params = v8::CreateParams::default()
+            .heap_limits(0, heap_limit_bytes)
+            .array_buffer_allocator(super::resource_limits::new_bounded_array_buffer_allocator());
         let mut isolate = v8::Isolate::new(create_params);
 
         let context = {
             let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
-            let scope = scope.init();
+            let mut scope = scope.init();
             let context = v8::Context::new(&scope, Default::default());
+            {
+                // WebAssembly を無効化する（codex レビュー指摘 #503 P0
+                // 「macOS の JS ワーカーに強制的なメモリ上限がない」対応。
+                // ユーザー承認 2026-09-28）。V8 152.2.0 にはこの版のグローバル
+                // 露出を切り替える単一フラグが無い（`v8/src/flags/
+                // flag-definitions.h` に `expose_wasm` 相当のフラグが存在
+                // しないことを実機で確認済み）ため、生成直後の Context の
+                // グローバルオブジェクトから
+                // `WebAssembly` を上書きして到達不能にする。`delete` ではなく
+                // `undefined` への代入にしているのは、削除には対象プロパティが
+                // configurable であることが必要だが、代入は writable であれば
+                // 足りる（一般に組み込みグローバルは configurable かつ
+                // writable だが、writable の方が要求が弱く確実）ため。
+                let scope = &mut v8::ContextScope::new(&mut scope, context);
+                let global = context.global(scope);
+                if let Some(key) = v8::String::new(scope, "WebAssembly") {
+                    let key: v8::Local<v8::Value> = key.into();
+                    let undefined: v8::Local<v8::Value> = v8::undefined(scope).into();
+                    // advisor 指摘: 戻り値（代入できたか）を確認していない
+                    // ため、失敗時は `WebAssembly` グローバルがそのまま
+                    // 残り得る（対応前の状態への後退。実装済みを装わない。
+                    // REPAIR-3）。ここで panic や `Result` 化はしない
+                    // （本対応が前提とする「通常の V8 グローバルオブジェクトの
+                    // プロパティは既定で writable」という一般的な挙動が
+                    // 崩れる状況は、本 crate が制御しない V8 のビルド設定に
+                    // 依存するため）が、その万一の失敗時に無制限の wasm
+                    // メモリ確保という抜け穴を残さないよう、多層防御として
+                    // `super::resource_limits::configure_wasm_max_mem_pages_flag`
+                    // （単一メモリインスタンスへの上限。対応前から存在した
+                    // 手段）を `ensure_v8_initialized` で引き続き設定して
+                    // いる。
+                    let _ = global.set(scope, key, undefined);
+                }
+            }
             v8::Global::new(&scope, context)
         };
         Ok(Self { context, isolate })

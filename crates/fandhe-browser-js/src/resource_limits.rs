@@ -15,8 +15,28 @@
 //!   `super::worker::worker_main` から呼ぶ）。設定に失敗したら評価を
 //!   始めずに終了する（fail-closed。呼び出し元が `EngineUnavailable`
 //!   へ変換する）
-//! - **子側（V8 初期化前）**: wasm の単一メモリインスタンスに上限を掛ける
-//!   （[`configure_wasm_memory_flag`]）
+//! - **子側（Isolate 生成時）**: `ArrayBuffer` の backing store（`new
+//!   ArrayBuffer(...)`・`new Uint8Array(...)` 等がヒープ外に確保する
+//!   実体）の確保量を数え、合計が
+//!   [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`] を超える確保を拒否する独自
+//!   アロケータを V8 の `CreateParams::array_buffer_allocator` に渡す
+//!   （[`new_bounded_array_buffer_allocator`]。codex レビュー指摘 #503
+//!   P0「macOS の JS ワーカーに強制的なメモリ上限がない」対応。ユーザー
+//!   承認 2026-09-28。`v8` crate 152.2.0 の `new_rust_allocator` を使う。
+//!   3 OS 共通で効く点が、OS 側の手段が無い macOS にとって特に重要
+//!   ── OS に頼らず V8 自身のレベルで確保経路を塞ぐため）
+//! - **子側（Context 生成直後）**: WebAssembly を無効化する
+//!   （`super::v8_engine::V8Engine::new_with_heap_limit` が Context の
+//!   グローバルオブジェクトの `WebAssembly` プロパティを `undefined` へ
+//!   上書きする）。wasm のメモリは上記の `ArrayBuffer` アロケータを
+//!   通らない別経路であり、この上限の対象外になってしまうため、経路
+//!   ごと塞ぐ。V8 152.2.0 にはこの版のグローバル露出を切り替える単一
+//!   フラグ（`--no-expose-wasm` 等）が存在しないため、フラグではなく
+//!   Context 生成直後のグローバルオブジェクト操作で行う（詳細は
+//!   `V8Engine::new_with_heap_limit` の実装コメント参照）。この操作は
+//!   戻り値（代入できたか）を確認していないため、多層防御として
+//!   [`configure_wasm_max_mem_pages_flag`]（単一メモリインスタンスへの
+//!   上限。wasm 無効化の前から存在した手段）も引き続き設定する
 //! - **親側（子の寿命のあいだ継続的に）**: 子のメモリ使用量を定期的に
 //!   監視し、上限を超えたら kill する（[`read_child_rss_bytes`]。
 //!   `super::process_engine::MemoryMonitor` が子の寿命いっぱい動かす
@@ -73,9 +93,9 @@
 //!
 //! | OS | 強制方法 | 強さ |
 //! |---|---|---|
-//! | Linux | `RLIMIT_DATA`（[`enforce_child_memory_limit`]。`rustix::process::setrlimit`。上限 [`LINUX_RLIMIT_DATA_CEILING_BYTES`]＝2 GiB） | **OS がある程度強制するが、厳密な上限としては機能しない**。`RLIMIT_DATA` は匿名 `MAP_PRIVATE` の `mmap`（大きな `ArrayBuffer` の backing store が実際に使う経路。glibc malloc は既定のしきい値 128 KiB を超える確保を `mmap` に回す）にも、実際に触れていない仮想予約にも適用される（`setrlimit(2)` の「data segment のみ」という古い説明は、匿名 mmap を会計に含めない実装を前提にしており、本 crate が対象とする現行 Linux カーネルの挙動とは異なる）。しかし V8 自身の `CodeRange` 予約だけで数百 MiB（アーキテクチャ依存。実測は上記のとおり）を消費するため、[`HEAP_EXTERNAL_ALLOWANCE_BYTES`] 相当の小さい値には設定できず、実質的な防御は親側の監視に委ねている |
-//! | Windows | Job Object（[`enforce_child_memory_limit`]。`windows-sys` で Win32 API を直接呼ぶ。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`。上限 [`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`]＝384 MiB） | **OS がコミットの天井を強制するが、天井を超えても子プロセスは終了しない**。当初は `win32job =2.0.3` の安全な API（`limit_working_memory`／`JOB_OBJECT_LIMIT_WORKINGSET`）を使っていたが、これは物理メモリの常駐量（working set）を trim させるだけでコミットチャージの上限にはならないという P0 指摘（codex）を受け、`win32job` の使用をやめて `windows-sys` で Win32 API を直接呼ぶ実装に切り替えた（ユーザー承認 2026-09-28。承認された unsafe の範囲は本モジュールの `windows_job` サブモジュール・`read_rss_windows` に限定）。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`／`ProcessMemoryLimit` は Linux の `kill` ベースの強制とは性質が異なり、コミットチャージが上限を超えると**その先の確保が失敗するだけ**である（`VirtualAlloc`/`HeapAlloc` 相当が失敗を返す。プロセス自体は生き続ける）。V8 の既定の `ArrayBuffer::Allocator` はこの失敗を GC を挟んで再試行したうえで、最終的に catchable な `RangeError: Array buffer allocation failed` を投げる。したがって Windows でも「際限のない確保だけは OS が食い止める」ことは実現できるが、`ResourceLimitExceeded` への分類・子の破棄・作り直しは、これまでどおり親側の監視（[`read_child_rss_bytes`] が返す `PrivateUsage`。working set ではなくコミット量を見るように変更した）が担う（[`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`] のドキュメントコメントが説明するとおり、`MAX_CHILD_RSS_BYTES` より 64 MiB 大きい値にしているのはこのため）。この Windows 専用実装（windows-sys 版）は本コミット時点では未検証であり、CI の Windows ランナーでの確認を前提とする（回帰テスト参照）|
-//! | macOS | 無し | **親側の RSS 監視のみ**。本実装時にこの macOS 環境で実機検証したところ、`RLIMIT_DATA`・`RLIMIT_AS`・`RLIMIT_RSS` はいずれも `setrlimit(2)` の呼び出し自体が `EINVAL` で失敗した（「上限をかけたが効かない」ではなく「そもそも設定できない」）。Job Object 相当の OS 機構も無い。したがって [`enforce_child_memory_limit`] は macOS では何もせず常に成功を返し（呼び出そうとしても確実に失敗するため、fail-closed にすると macOS 上で子プロセスが常に起動できなくなってしまう）、実際の防御は親側の RSS 監視だけに委ねる |
+//! | Linux | `RLIMIT_DATA`（[`enforce_child_memory_limit`]。`rustix::process::setrlimit`。上限 [`LINUX_RLIMIT_DATA_CEILING_BYTES`]＝2 GiB）＋[`new_bounded_array_buffer_allocator`]（`ArrayBuffer` 確保の上限。3 OS 共通） | **OS がある程度強制するが、厳密な上限としては機能しない**。`RLIMIT_DATA` は匿名 `MAP_PRIVATE` の `mmap`（大きな `ArrayBuffer` の backing store が実際に使う経路。glibc malloc は既定のしきい値 128 KiB を超える確保を `mmap` に回す）にも、実際に触れていない仮想予約にも適用される（`setrlimit(2)` の「data segment のみ」という古い説明は、匿名 mmap を会計に含めない実装を前提にしており、本 crate が対象とする現行 Linux カーネルの挙動とは異なる）。しかし V8 自身の `CodeRange` 予約だけで数百 MiB（アーキテクチャ依存。実測は上記のとおり）を消費するため、[`HEAP_EXTERNAL_ALLOWANCE_BYTES`] 相当の小さい値には設定できず、`RLIMIT_DATA` 単体では実質的な防御を親側の監視に委ねていた。**`ArrayBuffer` の確保だけは、この `RLIMIT_DATA` の限界とは無関係に、V8 自身のレベル（[`new_bounded_array_buffer_allocator`]）で [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`] を確実に強制する** |
+//! | Windows | Job Object（[`enforce_child_memory_limit`]。`windows-sys` で Win32 API を直接呼ぶ。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`。上限 [`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`]＝384 MiB）＋[`new_bounded_array_buffer_allocator`]（`ArrayBuffer` 確保の上限。3 OS 共通） | **OS がコミットの天井を強制するが、天井を超えても子プロセスは終了しない**。当初は `win32job =2.0.3` の安全な API（`limit_working_memory`／`JOB_OBJECT_LIMIT_WORKINGSET`）を使っていたが、これは物理メモリの常駐量（working set）を trim させるだけでコミットチャージの上限にはならないという P0 指摘（codex）を受け、`win32job` の使用をやめて `windows-sys` で Win32 API を直接呼ぶ実装に切り替えた（ユーザー承認 2026-09-28。承認された unsafe の範囲は本モジュールの `windows_job` サブモジュール・`read_rss_windows` に限定）。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`／`ProcessMemoryLimit` は Linux の `kill` ベースの強制とは性質が異なり、コミットチャージが上限を超えると**その先の確保が失敗するだけ**である（`VirtualAlloc`/`HeapAlloc` 相当が失敗を返す。プロセス自体は生き続ける）。ただし本対応（codex レビュー指摘 #503 P0「macOS の JS ワーカーに強制的なメモリ上限がない」）以降、V8 の既定の `ArrayBuffer::Allocator` は使わず [`new_bounded_array_buffer_allocator`] に置き換えたため、`ArrayBuffer` の確保は通常 [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`]（128 MiB）でこのアロケータ自身が拒否し、Job Object のコミット上限（384 MiB）に到達する事態は基本的に起こらない（到達しうるのは `ArrayBuffer` 以外の確保。その場合も引き続き親側の監視（[`read_child_rss_bytes`] が返す `PrivateUsage`。working set ではなくコミット量を見るように変更した）が `ResourceLimitExceeded` への分類・子の破棄・作り直しを担う）。この Windows 専用実装（windows-sys 版）は本コミット時点では未検証であり、CI の Windows ランナーでの確認を前提とする（回帰テスト参照）|
+//! | macOS | OS 側の手段は無い（[`enforce_child_memory_limit`] は何もしない）。ただし [`new_bounded_array_buffer_allocator`]（`ArrayBuffer` 確保の上限。3 OS 共通で有効）と WebAssembly 無効化（`super::v8_engine::V8Engine::new_with_heap_limit`。3 OS 共通で有効）が、OS に頼らず V8 自身のレベルでヒープ外メモリの主要な確保経路を塞ぐ | **OS によるプロセス単位の強制は無いが、ヒープ外メモリの 2 大確保経路（`ArrayBuffer`・wasm）は V8 自身のレベルで塞がれている**。本実装時にこの macOS 環境で実機検証したところ、`RLIMIT_DATA`・`RLIMIT_AS`・`RLIMIT_RSS` はいずれも `setrlimit(2)` の呼び出し自体が `EINVAL` で失敗した（「上限をかけたが効かない」ではなく「そもそも設定できない」）。Job Object 相当の OS 機構も無い。したがって [`enforce_child_memory_limit`] は macOS では何もせず常に成功を返す（呼び出そうとしても確実に失敗するため、fail-closed にすると macOS 上で子プロセスが常に起動できなくなってしまう）。残る確保経路（V8 自身のコード領域・snapshot・Rust ホストバイナリの通常の確保等）は、引き続き親側の RSS 監視だけに委ねる |
 //!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
@@ -85,7 +105,27 @@
 //!   確保だけは食い止める」ところまでしか行わない。Linux は
 //!   `CodeRange` 予約のため厳密な上限にできない。Windows は上限到達時に
 //!   確保を失敗させるだけで子プロセスを終了させない（上表参照）。
-//!   macOS は OS 側の手段が無い
+//!   macOS は OS 側の手段が無い（[`new_bounded_array_buffer_allocator`]・
+//!   WebAssembly 無効化は OS に頼らず V8 自身のレベルで強制するため、
+//!   この限りではない。次点参照）
+//! - **[`new_bounded_array_buffer_allocator`] が拒否した確保は
+//!   `RangeError`（catchable な例外）としてスクリプトへ返るだけで、
+//!   子プロセスは終了しない**。子は生き続け、Context もそのまま残る
+//!   （`ResourceLimitExceeded` ではなく `EvaluationFailed` に分類される。
+//!   `MAX_ARRAY_BUFFER_ALLOCATION_BYTES` は「この 1 プロセスが確保できる
+//!   `ArrayBuffer` の合計」を制限するものであり、際限のない繰り返し確保
+//!   そのものは防ぐが、それを理由に子を作り直したい場合は、これまでどおり
+//!   親側の RSS 監視が `ResourceLimitExceeded` として検出する
+//! - WebAssembly は本対応で完全に無効化した
+//!   （`super::v8_engine::V8Engine::new_with_heap_limit`）。
+//!   `wasm` のメモリは [`new_bounded_array_buffer_allocator`] を通らない
+//!   別経路であり、対応前は個別の上限（`--wasm-max-mem-pages`）を
+//!   掛けていたが、上限を掛けても経路自体は残るため、経路ごと塞ぐ判断に
+//!   変更した。**Web 互換の制約**: `WebAssembly` グローバルが常に
+//!   `undefined` になり、`.wasm` を扱うスクリプトは動作しない（本 crate が
+//!   対象とする用途は現時点で通常の JS 評価であり、TASK-30（core 統合）
+//!   以降で wasm サポートが必要になった場合は、この無効化の是非を含めて
+//!   ユーザーへ再度判断を仰ぐ）
 //! - 親側の監視は [`RSS_POLL_INTERVAL`] の分だけ後追いになる。1 回の
 //!   JS 実行が割り込みチェックを挟まずにポーリング間隔内で大量に確保
 //!   すると、実際のピークメモリは一時的に [`MAX_CHILD_RSS_BYTES`] を
@@ -104,8 +144,13 @@
 //!   windows-sys 版の実装は、本コミット時点では実機・CI での検証が
 //!   できていない（開発環境が Windows ではないため。上表参照）
 
+use std::alloc::{Layout, alloc, alloc_zeroed, dealloc};
+use std::ffi::c_void;
 #[cfg(target_os = "macos")]
 use std::io::Read;
+use std::ptr::NonNull;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::time::Instant;
@@ -266,16 +311,64 @@ fn compute_rlimit_data_target(existing_hard_limit: Option<u64>) -> u64 {
 #[cfg(target_os = "windows")]
 const WINDOWS_PROCESS_MEMORY_LIMIT_BYTES: usize = (MAX_CHILD_RSS_BYTES + 64 * 1024 * 1024) as usize;
 
+/// [`new_bounded_array_buffer_allocator`] が拒否するまでに確保できる
+/// `ArrayBuffer` backing store の合計バイト数（codex レビュー指摘 #503
+/// P0「macOS の JS ワーカーに強制的なメモリ上限がない」対応。ユーザー
+/// 承認 2026-09-28）。
+///
+/// [`HEAP_EXTERNAL_ALLOWANCE_BYTES`]（128 MiB）と同じ値にしている理由:
+/// この定数は元々「V8 の Isolate ヒープ上限（128 MiB）に加えて許容する
+/// ヒープ外メモリの上乗せ分」として定義されており、`ArrayBuffer` の
+/// backing store はその主要な内訳の 1 つである。同じ予算をそのまま
+/// `ArrayBuffer` 専用の強制上限として使うことで、
+/// [`super::v8_engine::MAX_ISOLATE_HEAP_BYTES`]（128 MiB）＋本定数
+/// （128 MiB）＝256 MiB が、[`MAX_CHILD_RSS_BYTES`]（親側の RSS 監視
+/// しきい値。320 MiB）を 64 MiB 下回る状態を保てる。V8 自身のコード
+/// 領域・snapshot・Rust ホストバイナリの通常の確保等（この上限の対象
+/// 外）にその 64 MiB の余裕を割り当てる設計である。
+pub(crate) const MAX_ARRAY_BUFFER_ALLOCATION_BYTES: usize = HEAP_EXTERNAL_ALLOWANCE_BYTES as usize;
+
+/// [`new_bounded_array_buffer_allocator`] が確保に使うアラインメント
+/// （バイト）。`Float64Array`・SIMD 演算等が要求しうる最大アラインメント
+/// を満たすため、一般的な malloc 実装が保証する 16 バイトに合わせる。
+const ARRAY_BUFFER_ALLOCATION_ALIGN: usize = 16;
+
 /// wasm の 1 ページのバイト数（V8 の仕様で固定。64 KiB）。
 const WASM_MEMORY_PAGE_BYTES: u64 = 64 * 1024;
 
-/// wasm の単一メモリインスタンスに許す最大ページ数。
-/// [`HEAP_EXTERNAL_ALLOWANCE_BYTES`]（128 MiB）と同じ予算を割り当てる
-/// （wasm のメモリも V8 のヒープ外に確保されるため。wasm のメモリは V8 の
-/// `CodeRange` 予約とは別の会計であり、Linux の `RLIMIT_DATA` の実効値を
-/// 左右する問題とは無関係に、この値をそのまま使える）。
-/// `HEAP_EXTERNAL_ALLOWANCE_BYTES / WASM_MEMORY_PAGE_BYTES` = 2048 ページ。
+/// wasm の単一メモリインスタンスに許す最大ページ数
+/// （`--wasm-max-mem-pages=<N>`。[`configure_wasm_max_mem_pages_flag`]
+/// 参照）。[`HEAP_EXTERNAL_ALLOWANCE_BYTES`]（128 MiB）と同じ予算を
+/// 割り当てる。`HEAP_EXTERNAL_ALLOWANCE_BYTES / WASM_MEMORY_PAGE_BYTES`
+/// ＝ 2048 ページ。
+///
+/// **多層防御としてのみ機能する**（advisor 指摘。codex レビュー指摘
+/// #503 P0「macOS の JS ワーカーに強制的なメモリ上限がない」対応で
+/// WebAssembly を無効化した（`v8_engine::V8Engine::new_with_heap_limit`
+/// が Context 生成直後に `WebAssembly` グローバルを上書きする）際、この
+/// 上書きが**失敗しても**（戻り値は確認していない。同関数の実装コメント
+/// 参照）、無制限の wasm メモリ確保という抜け穴を残さないための保険と
+/// して、対応前から存在したこの上限フラグを引き続き設定する）。
 const WASM_MAX_MEM_PAGES: u64 = HEAP_EXTERNAL_ALLOWANCE_BYTES / WASM_MEMORY_PAGE_BYTES;
+
+/// [`WASM_MAX_MEM_PAGES`] を V8 のフラグとして設定する（V8 152.2.0 の
+/// `v8/src/flags/flag-definitions.h` に定義された `wasm_max_mem_pages`
+/// フラグに対応。コマンドライン形式は `--wasm-max-mem-pages=<N>`）。
+///
+/// **`v8::V8::initialize_platform` より前に呼ぶ契約**（フラグは V8 の
+/// 初期化前にしか反映されない。`super::v8_engine::ensure_v8_initialized`
+/// 参照）。
+///
+/// WebAssembly を無効化する主たる対策（`v8_engine::V8Engine::
+/// new_with_heap_limit` の `WebAssembly` グローバル上書き）とは独立した
+/// 多層防御である（[`WASM_MAX_MEM_PAGES`] のドキュメントコメント参照）。
+/// V8 152.2.0 には WebAssembly のグローバル露出そのものを切り替える
+/// 単一フラグ（`--no-expose-wasm` 等）が存在しない（実機で確認済み）
+/// ため、単一メモリインスタンスへの上限という、対応前から存在した
+/// 手段をそのまま残す。
+pub(crate) fn configure_wasm_max_mem_pages_flag() {
+    v8::V8::set_flags_from_string(&format!("--wasm-max-mem-pages={WASM_MAX_MEM_PAGES}"));
+}
 
 /// [`enforce_child_memory_limit`] が成功した際に返すガード（codex
 /// レビュー指摘 #503 P1「`enforce_via_job_object` が Job をローカル変数の
@@ -469,16 +562,237 @@ mod windows_job {
     }
 }
 
-/// wasm の単一メモリインスタンスに [`WASM_MAX_MEM_PAGES`] を上限として
-/// 設定する（V8 152.2.0 の `v8/src/flags/flag-definitions.h` に定義された
-/// `wasm_max_mem_pages` フラグに対応。コマンドライン形式は
-/// `--wasm-max-mem-pages=<N>`）。
+/// [`new_rust_allocator`](v8::new_rust_allocator) に渡す、`ArrayBuffer`
+/// backing store の確保量をカウントする内部状態（codex レビュー指摘
+/// #503 P0「macOS の JS ワーカーに強制的なメモリ上限がない」対応。
+/// ユーザー承認 2026-09-28）。
 ///
-/// **`v8::V8::initialize_platform` より前に呼ぶ契約**（フラグは V8 の
-/// 初期化前にしか反映されない。`super::v8_engine::ensure_v8_initialized`
-/// 参照）。
-pub(crate) fn configure_wasm_memory_flag() {
-    v8::V8::set_flags_from_string(&format!("--wasm-max-mem-pages={WASM_MAX_MEM_PAGES}"));
+/// `Arc` で包んで [`new_bounded_array_buffer_allocator`] から
+/// `Arc::into_raw` で渡し、V8 がこのアロケータ（延いては Isolate）を
+/// 破棄する際に呼ぶ `drop` vtable 関数（[`bounded_array_buffer_drop`]）
+/// で `Arc::from_raw` により復元して解放する。`Send + Sync` は
+/// `AtomicUsize` と `usize` のみで構成されるため自動的に満たされ、
+/// `new_rust_allocator` が要求する `T: Sized + Send + Sync + 'static`
+/// 境界を満たす。
+struct BoundedArrayBufferAllocatorState {
+    /// 現在確保済みの合計バイト数。
+    allocated_bytes: AtomicUsize,
+    /// 確保を拒否し始める上限（バイト）。
+    limit_bytes: usize,
+}
+
+/// `counter` に `additional` バイトを加算しても `limit` を超えない場合に
+/// 限り、実際に加算する（`compare_exchange_weak` によるリトライで、
+/// 複数スレッドからの同時呼び出しでも競合を起こさない。`RustAllocatorVtable`
+/// のドキュメントコメントが「アロケータはスレッドセーフでなければ
+/// ならない」と要求しているため）。加算後の合計が `usize` で表現できない
+/// 場合（オーバーフロー）も拒否する。
+fn try_reserve(counter: &AtomicUsize, additional: usize, limit: usize) -> bool {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let Some(new_total) = current.checked_add(additional) else {
+            return false;
+        };
+        if new_total > limit {
+            return false;
+        }
+        match counter.compare_exchange_weak(current, new_total, Ordering::AcqRel, Ordering::Relaxed)
+        {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// [`try_reserve`] で加算した分を減算する（`free` から呼ぶ）。
+fn release_reservation(counter: &AtomicUsize, amount: usize) {
+    // `fetch_sub` は `amount` がカウンタの現在値を超えると（V8 の契約
+    // 違反や本関数のバグにより）アンダーフローして wrap するが、
+    // `fetch_update` と `saturating_sub` を使い、万一そのような呼び出しが
+    // あっても 0 未満にはならず fail-closed（カウンタが 0 に留まり、以後の
+    // 確保はより厳しく制限される側に倒れる）にする。advisor 指摘（V8 の
+    // 契約はこれを防ぐはずだが、契約違反時にも安全側に倒す多層防御）。
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(amount))
+    });
+}
+
+/// `len == 0` の確保要求に対して返す、非 null かつ整列済みのダミー
+/// ポインタ（`std::alloc::alloc`／`alloc_zeroed` はサイズ 0 の `Layout`
+/// を渡すと未定義動作になるため、実際の確保を行わずに済ませる）。
+/// `NonNull::dangling` は確保を伴わない安全な操作であり、このポインタを
+/// 通じて実際にメモリを読み書きすることは無い契約（`len == 0` の
+/// backing store には触れる場所が無い）ため、`free` 側でも対応する
+/// `len == 0` の分岐でこのポインタを `dealloc` しない。
+fn zero_length_allocation() -> *mut c_void {
+    NonNull::<u8>::dangling().as_ptr() as *mut c_void
+}
+
+/// `len` バイトを [`ARRAY_BUFFER_ALLOCATION_ALIGN`] 揃えで確保する
+/// （`zeroed` が `true` なら `alloc_zeroed`、そうでなければ `alloc`）。
+/// 上限超過・`Layout` 生成失敗（`len` が大きすぎて整列後のサイズが
+/// `isize::MAX` を超える等）・OS 側の確保失敗のいずれでも `null` を
+/// 返す（V8 はこれを `RangeError: Array buffer allocation failed` に
+/// 変換する。呼び出し元の 2 つの vtable 関数から共有するロジックを
+/// ここへ集約する）。
+fn bounded_alloc(
+    state: &BoundedArrayBufferAllocatorState,
+    len: usize,
+    zeroed: bool,
+) -> *mut c_void {
+    if len == 0 {
+        return zero_length_allocation();
+    }
+    let Ok(layout) = Layout::from_size_align(len, ARRAY_BUFFER_ALLOCATION_ALIGN) else {
+        return std::ptr::null_mut();
+    };
+    if !try_reserve(&state.allocated_bytes, len, state.limit_bytes) {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `layout` has a non-zero size (`len != 0`, checked above) and
+    // `ARRAY_BUFFER_ALLOCATION_ALIGN` is a compile-time constant power of
+    // two, so `layout` is a valid `Layout` for `alloc`/`alloc_zeroed`. The
+    // returned pointer (if non-null) is freed exactly once, by
+    // `bounded_array_buffer_free` reconstructing the identical `Layout`
+    // from the same `len` (see that function's SAFETY comment).
+    let ptr = unsafe {
+        if zeroed {
+            alloc_zeroed(layout)
+        } else {
+            alloc(layout)
+        }
+    };
+    if ptr.is_null() {
+        // OS 側の確保自体が失敗した。カウンタへ加算した分を戻す。
+        release_reservation(&state.allocated_bytes, len);
+    }
+    ptr as *mut c_void
+}
+
+/// [`v8::RustAllocatorVtable::allocate`] の実体: ゼロ初期化した
+/// `len` バイトを確保する。
+///
+/// # SAFETY
+/// V8 は `handle` として、[`new_bounded_array_buffer_allocator`] が
+/// `v8::new_rust_allocator` に渡した生ポインタ（`Arc::into_raw` の
+/// 戻り値）を指す参照を渡す。そのポインタは、対応する `Allocator` が
+/// 破棄されて [`bounded_array_buffer_drop`] が呼ばれるまで有効であり、
+/// V8 はその期間中いつでも本関数を呼びうる（`allocate`/
+/// `allocate_uninitialized`/`free` の呼び出し順序に制約は無い）ため、
+/// `&BoundedArrayBufferAllocatorState` として参照する操作は常に安全。
+/// パニックしうる処理は含まない（`extern "C"` 境界を越えて巻き戻ると
+/// 未定義動作になるため）。
+unsafe extern "C" fn bounded_array_buffer_allocate(
+    handle: &BoundedArrayBufferAllocatorState,
+    len: usize,
+) -> *mut c_void {
+    bounded_alloc(handle, len, true)
+}
+
+/// [`v8::RustAllocatorVtable::allocate_uninitialized`] の実体:
+/// ゼロ初期化しない `len` バイトを確保する。
+///
+/// # SAFETY
+/// [`bounded_array_buffer_allocate`] の SAFETY コメントと同じ。
+unsafe extern "C" fn bounded_array_buffer_allocate_uninitialized(
+    handle: &BoundedArrayBufferAllocatorState,
+    len: usize,
+) -> *mut c_void {
+    bounded_alloc(handle, len, false)
+}
+
+/// [`v8::RustAllocatorVtable::free`] の実体: `bounded_array_buffer_allocate`／
+/// `bounded_array_buffer_allocate_uninitialized` が返したポインタを解放し、
+/// カウンタから `len` を減算する。
+///
+/// # SAFETY
+/// V8 の `Allocator` 契約により、`data`・`len` は同じアロケータの
+/// `Allocate`／`AllocateUninitialized` が過去に返した・受け取ったポインタ
+/// と長さの組が、変更されずにそのまま渡される（`BackingStore` が
+/// 内部で保持する）。したがって `Layout::from_size_align(len,
+/// ARRAY_BUFFER_ALLOCATION_ALIGN)` は確保時と同一の `Layout` を再現し、
+/// `dealloc` は確保時と対になる呼び出しになる。`len == 0` の場合は
+/// `bounded_array_buffer_allocate{,_uninitialized}` が実際には確保して
+/// いない（[`zero_length_allocation`] 参照）ため、対応してここでも
+/// `dealloc` を呼ばない。`handle` の有効性は
+/// [`bounded_array_buffer_allocate`] の SAFETY コメントと同じ。
+unsafe extern "C" fn bounded_array_buffer_free(
+    handle: &BoundedArrayBufferAllocatorState,
+    data: *mut c_void,
+    len: usize,
+) {
+    if len == 0 {
+        return;
+    }
+    let Ok(layout) = Layout::from_size_align(len, ARRAY_BUFFER_ALLOCATION_ALIGN) else {
+        // 確保時に同じ計算が成功しているはずであり、原理的に到達しない
+        // （`bounded_alloc` は `Layout` 生成に失敗したら確保自体を行わない
+        // ため、その場合は `free` が呼ばれることも無い）。パニックせず、
+        // 何もせずに返す（`extern "C"` 境界内でパニックしないため）。
+        return;
+    };
+    // SAFETY: 上記のとおり、`data` は同じ `len` で行われた確保の戻り値
+    // そのものであり、`layout` はその確保時と同一である。
+    unsafe { dealloc(data as *mut u8, layout) };
+    release_reservation(&handle.allocated_bytes, len);
+}
+
+/// [`v8::RustAllocatorVtable::drop`] の実体: `handle` の所有権を取り戻して
+/// 解放する。
+///
+/// # SAFETY
+/// `handle` は [`new_bounded_array_buffer_allocator`] が `Arc::into_raw`
+/// で生成した生ポインタであり、V8 はこの `drop` をちょうど 1 回、
+/// `Allocator`（延いてはこの `handle`）を破棄するときにだけ呼ぶ
+/// （`v8::new_rust_allocator` の契約）。`Arc::from_raw` は「`into_raw` で
+/// 得たポインタを、対応する 1 回だけ `from_raw` に渡す」契約を満たす
+/// ことが呼び出し元の責務であり、本関数がその唯一の呼び出し箇所である
+/// ため、二重解放・use-after-free は起こらない。
+unsafe extern "C" fn bounded_array_buffer_drop(handle: *const BoundedArrayBufferAllocatorState) {
+    // SAFETY: 上記のとおり。
+    let state = unsafe { Arc::from_raw(handle) };
+    drop(state);
+}
+
+/// [`bounded_array_buffer_allocate`]・[`bounded_array_buffer_allocate_uninitialized`]・
+/// [`bounded_array_buffer_free`]・[`bounded_array_buffer_drop`] をまとめた
+/// vtable。`'static` な単一のインスタンスを全 Isolate で共有する
+/// （`handle` 側だけが Isolate ごとに異なる）。
+static BOUNDED_ARRAY_BUFFER_ALLOCATOR_VTABLE: v8::RustAllocatorVtable<
+    BoundedArrayBufferAllocatorState,
+> = v8::RustAllocatorVtable {
+    allocate: bounded_array_buffer_allocate,
+    allocate_uninitialized: bounded_array_buffer_allocate_uninitialized,
+    free: bounded_array_buffer_free,
+    drop: bounded_array_buffer_drop,
+};
+
+/// `ArrayBuffer` backing store の確保量を [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`]
+/// までに制限する `v8::Allocator` を新規生成する（codex レビュー指摘
+/// #503 P0「macOS の JS ワーカーに強制的なメモリ上限がない」対応。
+/// ユーザー承認 2026-09-28。`v8::CreateParams::array_buffer_allocator`
+/// へ渡す契約。呼び出し元: `super::v8_engine::V8Engine::new_with_heap_limit`）。
+///
+/// 承認された `unsafe` はここでの `v8::new_rust_allocator` 呼び出し
+/// 1 か所と、上記 4 つの vtable 関数の内部（`std::alloc` の
+/// `alloc`/`alloc_zeroed`/`dealloc`・`Arc::from_raw` による handle の
+/// 復元）に限定される。
+pub(crate) fn new_bounded_array_buffer_allocator() -> v8::UniqueRef<v8::Allocator> {
+    let state = Arc::new(BoundedArrayBufferAllocatorState {
+        allocated_bytes: AtomicUsize::new(0),
+        limit_bytes: MAX_ARRAY_BUFFER_ALLOCATION_BYTES,
+    });
+    // SAFETY: `Arc::into_raw(state)` produces a pointer that stays valid
+    // (the `Arc`'s heap allocation is not freed) until exactly one
+    // matching `Arc::from_raw` call reclaims it. That call is
+    // `bounded_array_buffer_drop`, which V8 guarantees to call exactly
+    // once when the returned `Allocator` is destroyed (see its own SAFETY
+    // comment). `BOUNDED_ARRAY_BUFFER_ALLOCATOR_VTABLE` is `'static` and
+    // its four functions match the handle type
+    // (`BoundedArrayBufferAllocatorState`) exactly, satisfying
+    // `new_rust_allocator`'s documented contract ("the caller must ensure
+    // that `handle` is valid and matches what `vtable` expects").
+    unsafe { v8::new_rust_allocator(Arc::into_raw(state), &BOUNDED_ARRAY_BUFFER_ALLOCATOR_VTABLE) }
 }
 
 /// [`read_child_rss_bytes`] が受け取る、子プロセスを指し示す値。
@@ -665,13 +979,136 @@ fn read_rss_windows(probe: ChildMemoryProbe) -> Option<u64> {
 mod tests {
     use super::*;
 
-    /// codex レビュー指摘 #503 P0: RSS しきい値（320 MiB）・wasm ページ数
-    /// （2048）が、ドキュメントコメントが説明する根拠どおりの具体値で
-    /// あること。
+    /// codex レビュー指摘 #503 P0: RSS しきい値（320 MiB）・
+    /// `ArrayBuffer` 確保の合計上限（128 MiB）が、ドキュメントコメントが
+    /// 説明する根拠どおりの具体値であること。ヒープ上限＋本上限が
+    /// RSS しきい値を 64 MiB 下回ることも確認する（`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`
+    /// のドキュメントコメントが説明する予算配分）。
     #[test]
     fn js_1_memory_budget_constants_match_documented_values() {
         assert_eq!(MAX_CHILD_RSS_BYTES, 320 * 1024 * 1024);
+        assert_eq!(MAX_ARRAY_BUFFER_ALLOCATION_BYTES, 128 * 1024 * 1024);
         assert_eq!(WASM_MAX_MEM_PAGES, 2048);
+        let heap_plus_array_buffer =
+            super::super::v8_engine::MAX_ISOLATE_HEAP_BYTES + MAX_ARRAY_BUFFER_ALLOCATION_BYTES;
+        assert_eq!(
+            heap_plus_array_buffer as u64,
+            MAX_CHILD_RSS_BYTES - 64 * 1024 * 1024
+        );
+    }
+
+    /// テスト専用の [`BoundedArrayBufferAllocatorState`] を作る（`Arc` へは
+    /// 包まない。単体テストは vtable 関数を直接呼ぶだけであり、
+    /// `v8::new_rust_allocator` を経由しないため `Arc::into_raw`／
+    /// `Arc::from_raw` の対応関係を気にする必要が無い）。
+    fn test_allocator_state(limit_bytes: usize) -> BoundedArrayBufferAllocatorState {
+        BoundedArrayBufferAllocatorState {
+            allocated_bytes: AtomicUsize::new(0),
+            limit_bytes,
+        }
+    }
+
+    /// codex レビュー指摘 #503 P0 の単体テスト: 上限以下の確保は成功し、
+    /// カウンタが確保量ぶん増え、`free` で確保量ぶん減ることを確認する。
+    #[test]
+    fn js_1_bounded_array_buffer_allocator_tracks_allocate_and_free() {
+        let state = test_allocator_state(1024);
+
+        // SAFETY: `state` は本テスト内でのみ参照され、`allocate`／`free`
+        // の呼び出しは他のどのスレッドとも競合しない。`len`（64）は
+        // `state.limit_bytes`（1024）を超えない。
+        let ptr = unsafe { bounded_array_buffer_allocate(&state, 64) };
+        assert!(!ptr.is_null(), "allocation within the limit must succeed");
+        assert_eq!(state.allocated_bytes.load(Ordering::SeqCst), 64);
+
+        // SAFETY: `ptr` は直前の `bounded_array_buffer_allocate(&state, 64)`
+        // の戻り値そのものであり、`len` も同じ 64 を渡している。
+        unsafe { bounded_array_buffer_free(&state, ptr, 64) };
+        assert_eq!(
+            state.allocated_bytes.load(Ordering::SeqCst),
+            0,
+            "free must return the reserved bytes to the counter"
+        );
+    }
+
+    /// codex レビュー指摘 #503 P0 の単体テスト: 上限をちょうど使い切る
+    /// 確保は成功し、さらに 1 バイトでも超える確保は拒否される（境界値）。
+    /// 拒否された確保はカウンタを変化させないことも確認する。
+    #[test]
+    fn js_1_bounded_array_buffer_allocator_rejects_allocation_exceeding_the_limit() {
+        let state = test_allocator_state(128);
+
+        // SAFETY: 上記テストと同様、単一スレッドからの呼び出しであり
+        // `len` は `state.limit_bytes` と一致する（境界値）。
+        let ptr = unsafe { bounded_array_buffer_allocate_uninitialized(&state, 128) };
+        assert!(
+            !ptr.is_null(),
+            "an allocation exactly at the limit must succeed"
+        );
+        assert_eq!(state.allocated_bytes.load(Ordering::SeqCst), 128);
+
+        // SAFETY: 直前の確保の戻り値・長さと対応する解放。
+        unsafe { bounded_array_buffer_free(&state, ptr, 128) };
+        assert_eq!(state.allocated_bytes.load(Ordering::SeqCst), 0);
+
+        // SAFETY: `len`（129）は解放されない（`null` が返るため）。
+        let rejected = unsafe { bounded_array_buffer_allocate(&state, 129) };
+        assert!(
+            rejected.is_null(),
+            "an allocation exceeding the limit by even 1 byte must be rejected"
+        );
+        assert_eq!(
+            state.allocated_bytes.load(Ordering::SeqCst),
+            0,
+            "a rejected allocation must not change the counter"
+        );
+    }
+
+    /// codex レビュー指摘 #503 P0 の単体テスト: `len == 0` の確保は
+    /// カウンタを変化させず、非 null のポインタを返す（`std::alloc` の
+    /// サイズ 0 `Layout` を避ける分岐。`free` に `len == 0` で渡しても
+    /// panic せず、カウンタも変化しないこと）。
+    #[test]
+    fn js_1_bounded_array_buffer_allocator_handles_zero_length_without_counting() {
+        let state = test_allocator_state(0);
+
+        // SAFETY: `len == 0` は実際の確保を行わない特別扱いであり、
+        // `state.limit_bytes`（0）にも抵触しない。
+        let ptr = unsafe { bounded_array_buffer_allocate(&state, 0) };
+        assert!(
+            !ptr.is_null(),
+            "a zero-length allocation must return a non-null sentinel pointer"
+        );
+        assert_eq!(state.allocated_bytes.load(Ordering::SeqCst), 0);
+
+        // SAFETY: `len == 0` で確保したポインタを、同じ `len == 0` で
+        // 解放する。
+        unsafe { bounded_array_buffer_free(&state, ptr, 0) };
+        assert_eq!(state.allocated_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    /// codex レビュー指摘 #503 P0 の単体テスト: 上限に達した後でも、
+    /// 解放してから再度確保すれば成功する（カウンタが漏れなく戻ることの
+    /// 確認。`tests/v8_worker.rs` の結合テストが確認する「GC を挟んだ
+    /// 繰り返し確保」の土台となる単体レベルの保証）。
+    #[test]
+    fn js_1_bounded_array_buffer_allocator_can_reallocate_after_freeing() {
+        let state = test_allocator_state(64);
+
+        for _ in 0..5 {
+            // SAFETY: 各イテレーションで直前の確保を解放してから次を
+            // 行うため、常に高々 1 つの生存中の確保しか無い。
+            let ptr = unsafe { bounded_array_buffer_allocate(&state, 64) };
+            assert!(
+                !ptr.is_null(),
+                "re-allocation after freeing must succeed repeatedly, not just once"
+            );
+            assert_eq!(state.allocated_bytes.load(Ordering::SeqCst), 64);
+
+            // SAFETY: 直前の確保の戻り値・長さと対応する解放。
+            unsafe { bounded_array_buffer_free(&state, ptr, 64) };
+            assert_eq!(state.allocated_bytes.load(Ordering::SeqCst), 0);
+        }
     }
 
     /// advisor レビュー指摘（advisor がレビューした codex P0 対応の一部）:
