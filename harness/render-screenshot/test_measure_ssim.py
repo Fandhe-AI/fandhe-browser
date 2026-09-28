@@ -927,6 +927,77 @@ class LoadCaptureResultTest(unittest.TestCase):
             with self.assertRaises(ms.CaptureResultError):
                 ms.load_capture_result(capture_dir)
 
+    def test_rejects_duplicate_site_engine_entries(self) -> None:
+        # codex レビュー指摘（P1）: 同じ site_id・engine のエントリが複数あると
+        # 後勝ちで上書きされ、先に failed・後に ok が来た不正な結果を正常な
+        # ペアとして計測できてしまう。重複が見つかった site_id は無条件に
+        # skipped 扱いにし、pairs に混入させない。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            (capture_dir / "chromium").mkdir()
+            (capture_dir / "servo").mkdir()
+            (capture_dir / "chromium" / "a.png").write_bytes(b"x")
+            (capture_dir / "servo" / "a.png").write_bytes(b"x")
+            self._write_result(
+                capture_dir,
+                [
+                    self._capture_entry("a", "chromium", "failed", None),
+                    self._capture_entry("a", "chromium", "ok", "chromium/a.png"),
+                    self._capture_entry("a", "servo", "ok", "servo/a.png"),
+                ],
+            )
+            viewport, pairs, skipped = ms.load_capture_result(capture_dir)
+            self.assertEqual(pairs, [])
+            self.assertEqual(len(skipped), 1)
+            self.assertEqual(skipped[0]["site_id"], "a")
+            self.assertIn("duplicate", skipped[0]["reason"])
+
+    def test_rejects_png_path_from_another_engine(self) -> None:
+        # codex レビュー指摘（P1）: `_resolve_capture_png` は capture-dir 内に
+        # 収まることだけを確認していたため、servo のエントリに chromium の
+        # PNG パスを指定でき、同一ファイル同士の SSIM が機械的に 1 になって
+        # しまっていた。各エントリの png は `<engine>/<site_id>.png` に
+        # 限定し、他エンジン・他サイトのファイルを参照できないことを確認する。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            (capture_dir / "chromium").mkdir()
+            (capture_dir / "servo").mkdir()
+            (capture_dir / "chromium" / "a.png").write_bytes(b"chromium-bytes")
+            self._write_result(
+                capture_dir,
+                [
+                    self._capture_entry("a", "chromium", "ok", "chromium/a.png"),
+                    # servo のエントリが chromium の PNG を指す不正な入力。
+                    self._capture_entry("a", "servo", "ok", "chromium/a.png"),
+                ],
+            )
+            viewport, pairs, skipped = ms.load_capture_result(capture_dir)
+            self.assertEqual(pairs, [])
+            self.assertEqual(len(skipped), 1)
+            self.assertEqual(skipped[0]["site_id"], "a")
+
+    def test_rejects_png_path_from_another_site(self) -> None:
+        """同じ engine 内でも他 site_id の PNG を指すエントリは拒否する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            (capture_dir / "chromium").mkdir()
+            (capture_dir / "servo").mkdir()
+            (capture_dir / "chromium" / "a.png").write_bytes(b"x")
+            (capture_dir / "chromium" / "b.png").write_bytes(b"x")
+            (capture_dir / "servo" / "b.png").write_bytes(b"x")
+            self._write_result(
+                capture_dir,
+                [
+                    # site_id "b" の chromium エントリが site_id "a" の PNG を指す。
+                    self._capture_entry("b", "chromium", "ok", "chromium/a.png"),
+                    self._capture_entry("b", "servo", "ok", "servo/b.png"),
+                ],
+            )
+            viewport, pairs, skipped = ms.load_capture_result(capture_dir)
+            self.assertEqual(pairs, [])
+            self.assertEqual(len(skipped), 1)
+            self.assertEqual(skipped[0]["site_id"], "b")
+
 
 class WriteResultTest(unittest.TestCase):
     """RENDER-5 / TASK-37.2: `write_result`（symlink 追随防止。#53 と同じ問題）。"""

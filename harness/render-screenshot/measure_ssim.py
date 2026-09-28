@@ -105,11 +105,19 @@ class BboxError(MeasureError):
 # --- capture-result.json の読み込み -----------------------------------------
 
 
-def _resolve_capture_png(capture_dir: Path, png_rel: Any) -> Path:
+def _resolve_capture_png(capture_dir: Path, png_rel: Any, engine: str, site_id: str) -> Path:
     """`captures[].png`（`capture_dir` からの相対パス）を検証して絶対パスへ解決する。
 
     パストラバーサル・symlink 経由での capture-dir 外参照を拒否する
     （security.md「プロファイル境界」と同じ考え方を capture-dir に適用）。
+    加えて `capture_screenshots.write_result`（#53）が常に
+    `<engine>/<site_id>.png`（`_capture_one` の `out_path = out_dir / engine /
+    f"{site.site_id}.png"`）という固定レイアウトで書き出す契約を逆に検証し、
+    このエントリが宣言する `engine`/`site_id` に対応する PNG 以外は拒否する。
+    これを検証しないと、Servo エントリに Chromium の PNG パス（capture-dir 内の
+    別ファイル）を指定でき、同一ファイル同士の比較になって SSIM が機械的に 1 に
+    なってしまう（codex レビュー指摘 P1: PNG パスを撮影エンジンとサイトに
+    対応付けて検証する）。
     """
     if not isinstance(png_rel, str) or not png_rel:
         raise CaptureResultError(f"'png' must be a non-empty string: {png_rel!r}")
@@ -118,6 +126,12 @@ def _resolve_capture_png(capture_dir: Path, png_rel: Any) -> Path:
         raise CaptureResultError(f"'png' must be a relative path: {png_rel}")
     if any(part == ".." for part in candidate.parts):
         raise CaptureResultError(f"'png' must not contain '..': {png_rel}")
+    expected = Path(engine) / f"{site_id}.png"
+    if candidate != expected:
+        raise CaptureResultError(
+            f"'png' must be {expected.as_posix()!r} for engine={engine!r} "
+            f"site_id={site_id!r}, got {png_rel!r}"
+        )
     full = capture_dir / candidate
     if full.is_symlink():
         raise CaptureResultError(f"refusing to follow symlink: {full}")
@@ -209,6 +223,15 @@ def load_capture_result(
         raise CaptureResultError("capture-result.json: too many capture entries")
 
     by_site: dict[str, dict[str, dict[str, Any]]] = {}
+    # (site_id, engine) の重複エントリを検出するための集合。`by_site` の
+    # 辞書代入だけでは同じキーへの 2 回目の書き込みが 1 回目を無条件に
+    # 上書きしてしまい、例えば同じ site_id・engine で先に `failed`・後に `ok`
+    # が来た不正な capture-result.json を正常なペアとして計測できてしまう
+    # （codex レビュー指摘 P1: 重複する撮影エントリを後勝ちで採用しない）。
+    # そのため重複が見つかった (site_id, engine) は `duplicate_sites` に
+    # 記録し、後段でそのサイト全体を無条件に不合格（skipped）にする。
+    seen_site_engine: set[tuple[str, str]] = set()
+    duplicate_sites: set[str] = set()
     for entry in captures:
         if not isinstance(entry, dict):
             continue
@@ -221,11 +244,26 @@ def load_capture_result(
             continue
         if not isinstance(engine, str) or not isinstance(status, str):
             continue
+        key = (site_id, engine)
+        if key in seen_site_engine:
+            duplicate_sites.add(site_id)
+        seen_site_engine.add(key)
         by_site.setdefault(site_id, {})[engine] = entry
 
     pairs: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     for site_id, by_engine in sorted(by_site.items()):
+        if site_id in duplicate_sites:
+            skipped.append(
+                {
+                    "site_id": site_id,
+                    "reason": (
+                        "duplicate capture entries for the same site_id/engine pair "
+                        "in capture-result.json"
+                    ),
+                }
+            )
+            continue
         ref_entry = by_engine.get(REFERENCE_ENGINE)
         tgt_entry = by_engine.get(TARGET_ENGINE)
         ref_ok = ref_entry is not None and ref_entry.get("status") == "ok"
@@ -241,8 +279,8 @@ def load_capture_result(
             )
             continue
         try:
-            ref_png = _resolve_capture_png(capture_dir, ref_entry.get("png"))
-            tgt_png = _resolve_capture_png(capture_dir, tgt_entry.get("png"))
+            ref_png = _resolve_capture_png(capture_dir, ref_entry.get("png"), REFERENCE_ENGINE, site_id)
+            tgt_png = _resolve_capture_png(capture_dir, tgt_entry.get("png"), TARGET_ENGINE, site_id)
         except CaptureResultError as exc:
             skipped.append({"site_id": site_id, "reason": str(exc)})
             continue
