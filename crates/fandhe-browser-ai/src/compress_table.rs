@@ -541,6 +541,11 @@ fn cell_text(doc: &Document, cell: NodeId) -> (String, bool) {
                     }
                     let needed = 1 + usize::from(pending_space);
                     if count + needed > MAX_CELL_TEXT_CHARS {
+                        // 区切りの空白が境界に収まる場合は、空白まで残してから切り詰める
+                        // （境界 40 文字目を空白分も含めて使い切る）。
+                        if pending_space && count < MAX_CELL_TEXT_CHARS {
+                            out.push(' ');
+                        }
                         out.push('…');
                         truncated = true;
                         break 'walk;
@@ -1038,6 +1043,15 @@ mod tests {
         assert!(!r.rows[1].truncated);
         assert_eq!(r.rows[2].text, format!("{}…", "あ".repeat(40)));
         assert!(r.rows[2].truncated);
+    }
+
+    /// AISNAP-2（TASK-12.3）: 境界直前の空白は 40 文字目として残してから切り詰める。
+    #[test]
+    fn aisnap_2_compress_rows_keeps_space_at_boundary() {
+        let cell = format!("{} b", "a".repeat(39));
+        let r = rows_of(&format!("<table><tr><td>{cell}</table>"), "table");
+        assert_eq!(r.rows[0].text, format!("{} …", "a".repeat(39)));
+        assert!(r.rows[0].truncated);
     }
 
     /// AISNAP-2（TASK-12.3）: hidden・script 等の除外。
