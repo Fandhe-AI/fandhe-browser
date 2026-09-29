@@ -103,9 +103,12 @@ pub trait ProfileStore {
     /// プロファイルを削除する。
     ///
     /// 既定実装は fail-closed で [`ProfileError::Unsupported`] を返し、成功を装わない
-    /// （`PROF-5`・REPAIR-3）。#188（TASK-53（53.2））が置き換える。`Profile` を値で
-    /// 受け取るのは、ロック保持者だけが削除できるようにするため。
-    fn delete(&self, profile: Profile) -> Result<(), ProfileError> {
+    /// （`PROF-5`・REPAIR-3）。#188（TASK-53（53.2））が置き換える。`Profile` を借用で
+    /// 受け取るのは、ロック保持者だけが削除できるようにするためと、削除失敗時に
+    /// 呼び出し側が `Profile`（と `profile.lock`）を保持し続けられるようにするため
+    /// （値渡しだと失敗時にロックが解放され、他プロセスが同一プロファイルを開ける。
+    /// `PROF-1`）。成功時のロック解放の扱いは #188 が定める。
+    fn delete(&self, profile: &Profile) -> Result<(), ProfileError> {
         let _ = profile;
         Err(ProfileError::Unsupported {
             reason: "profile deletion is not implemented yet (tracked by PROF-5 / TASK-53)",
@@ -227,7 +230,7 @@ mod tests {
             resolved: ResolvedRoot::new(tmp.0.clone(), RootSource::OsDefault),
         };
         let profile = store.open_or_create().unwrap();
-        match store.delete(profile) {
+        match store.delete(&profile) {
             Err(ProfileError::Unsupported { reason }) => {
                 assert_eq!(
                     reason,
@@ -237,5 +240,11 @@ mod tests {
             other => panic!("expected Unsupported, got {:?}", other),
         }
         assert!(tmp.0.is_dir());
+        // 失敗後もロックは保持されたまま（PROF-1）: 別ハンドルの open は Locked になる。
+        assert!(matches!(
+            Profile::open(&tmp.0),
+            Err(ProfileError::Locked { .. })
+        ));
+        drop(profile);
     }
 }
