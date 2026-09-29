@@ -38,9 +38,12 @@ cargo test --workspace
 ```bash
 make lint-rendering   # cargo clippy --workspace --all-targets --features rendering -- -D warnings
 make test-rendering   # cargo test --workspace --features rendering
-make check-render-isolation   # cargo tree --workspace -e normal,build,dev --exclude fandhe-browser-render で
-                               # 既定ビルド（feature なし）の依存グラフに Servo 系クレートが含まれないことを確認
+make check-render-isolation   # scripts/check-render-isolation.sh を実行し、既定ビルド（feature なし）
+                               # の依存グラフと fandhe-browser-cli の既定 feature（cli 未追加の間は skip。
+                               # TASK-41.5・#174）に Servo 系クレートが含まれないことを確認
 ```
+
+CI では `render-isolation` ジョブ（TASK-34.1・#465・3 OS matrix）が同じ `scripts/check-render-isolation.sh` を PR ごとに実行する。
 
 ### ライセンス検査
 
