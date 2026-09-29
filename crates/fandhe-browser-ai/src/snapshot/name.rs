@@ -45,9 +45,12 @@
 //!   呼び出し向けの簡易版で、内部で毎回 `NameIndex` を構築するため複数
 //!   要素へ連続して使うと同じ問題が再発する）。
 //!
-//! 走査量の上限: 子孫走査は 1 回あたり [`MAX_CONTENT_STEPS`]、文書全体では
-//! [`NameIndex`] の予算（[`CONTENT_STEP_BUDGET_FACTOR`]）で頭打ちにし、打ち切りは
-//! `truncated` で伝える。`input[type=password]` の `value` は名前へ取り込まない。
+//! 走査量の上限: 子孫走査は 1 回あたり [`MAX_CONTENT_STEPS`] で頭打ちにし、
+//! 打ち切りは `truncated` で伝える。上限は要素ごとに固定で、共有索引の
+//! 呼び出し順に結果が依存しない（[`compute_name`] と
+//! [`compute_name_with_index`] は同じ結果を返す）。文書全体の総量は
+//! 最悪 `node_count * MAX_CONTENT_STEPS` で、`node_count` はパーサーの
+//! ノード数上限（`ParseOptions::max_nodes`）で抑えられる。`input[type=password]` の `value` は名前へ取り込まない。
 //!
 //! 呼び出し文脈: 現時点では呼び出し元がない。DOM から `Snapshot`/`Node` を
 //! 構築する TASK-11.7（Issue #76）が、文書ごとに [`NameIndex::build`] を
@@ -173,16 +176,11 @@ const MAX_LABELS_SCANNED: usize = MAX_LABELS * 4;
 ///
 /// 行・セル・リンク・見出しなど content role の要素はすべて自分の部分木を
 /// 走査するため、入れ子では走査量の総和が文書サイズの二乗になりうる。1 回あたりを
-/// 定数で打ち切り（security.md「不安全な設計」対策）、文書全体の総量は
-/// [`CONTENT_STEP_BUDGET_FACTOR`] の予算で抑える。打ち切ったら `truncated` を立てる。
+/// 定数で打ち切る（security.md「不安全な設計」対策）。上限は要素ごとに固定で、
+/// 共有索引を使う呼び出しの順序に結果が依存しない（PR #574 レビュー指摘）。
+/// 文書全体の総量は最悪 `node_count * 本値` で、パーサーのノード数上限で
+/// 抑えられる。打ち切ったら `truncated` を立てる。
 const MAX_CONTENT_STEPS: usize = 1024;
-
-/// [`NameIndex`] が 1 文書につき許す name from content 走査の総ステップ予算の係数
-/// （`AISNAP-1`・TASK-11.4.3）。予算は
-/// `node_count * 本値 + `[`MAX_CONTENT_STEPS`]。1 回あたりの上限だけでは最悪
-/// `node_count * MAX_CONTENT_STEPS` になるため、文書全体の走査量を線形に抑える。
-/// 使い切った後の対象は寄与なしとして `truncated` を立てる。
-const CONTENT_STEP_BUDGET_FACTOR: usize = 4;
 
 /// `aria-labelledby` で名前に**寄与した**（正規化後のテキストが空でない）
 /// 参照先の数の上限（`AISNAP-1`・TASK-11.4.1）。
@@ -254,7 +252,7 @@ pub struct AccessibleName {
     /// 算出に使った出所。
     pub source: NameSource,
     /// [`MAX_NAME_CHARS`]（文字数上限）・[`MAX_CONTENT_STEPS`]（子孫走査 1 回あたりの
-    /// ステップ上限）・[`CONTENT_STEP_BUDGET_FACTOR`]（文書全体の子孫走査予算）・
+    /// ステップ上限）・
     /// 子孫走査の折り畳み後文字数上限・[`MAX_LABELS`]（label 数上限）・
     /// [`MAX_LABELS_SCANNED`]（label 走査総数の上限）・[`MAX_IDREFS`]
     /// （`aria-labelledby` の寄与参照先数の上限）・[`MAX_IDREFS_SCANNED`]
@@ -838,8 +836,6 @@ pub struct NameIndex<'doc> {
     /// 文書順で最初の HTML 名前空間の `<title>` 要素（文書ルートの名前用。
     /// SVG の `<title>` は含めない）。構築時の単一走査で記録する。
     first_title: Option<NodeId>,
-    /// name from content 走査の残りステップ予算（[`CONTENT_STEP_BUDGET_FACTOR`]）。
-    content_steps_left: Cell<usize>,
 }
 
 impl<'doc> NameIndex<'doc> {
@@ -1000,11 +996,6 @@ impl<'doc> NameIndex<'doc> {
             uncached_scans_left: Cell::new(MAX_UNCACHED_REFERENT_SCANS),
             first_scans_left: Cell::new(MAX_CACHEABLE_REFERENT_SCANS),
             first_title,
-            content_steps_left: Cell::new(
-                doc.node_count()
-                    .saturating_mul(CONTENT_STEP_BUDGET_FACTOR)
-                    .saturating_add(MAX_CONTENT_STEPS),
-            ),
         }
     }
 }
@@ -1078,6 +1069,13 @@ fn label_name(doc: &Document, index: &NameIndex, target: NodeId) -> Option<Acces
         // 文字数上限での打ち切りを伝える（黙って捨てない）。
         labels_truncated |= scan.cut;
         if !has_non_whitespace(&label_text) {
+            if scan.cut {
+                // 走査が打ち切られて文字を得られなかった label は、打ち切り
+                // 位置より後ろに本文があるかもしれず「名前なし」と確定できない
+                // （PR #574 レビュー指摘）。寄与する label が最後まで 0 件なら
+                // 次点へフォールバックさせない。
+                scan_cut_before_match = true;
+            }
             // 名前に寄与しない label は MAX_LABELS の対象に数えない。
             continue;
         }
@@ -1149,31 +1147,24 @@ fn allows_name_from_content(doc: &Document, id: NodeId) -> bool {
 /// 対象要素自身の子孫テキストから accessible name を算出する（name from
 /// content。accname 1.2 の 2F。`AISNAP-1`・TASK-11.4.3）。
 ///
-/// 走査は 1 回あたり [`MAX_CONTENT_STEPS`]、文書全体では [`NameIndex`] の予算
-/// （[`CONTENT_STEP_BUDGET_FACTOR`]）で頭打ちにする。戻り値の契約は
+/// 走査は 1 回あたり [`MAX_CONTENT_STEPS`] で頭打ちにする（要素ごとに固定で、
+/// 呼び出し順に依存しない）。戻り値の契約は
 /// [`label_name`] と同じ:
 /// - テキストあり: `Some`（`source: Content`。打ち切りがあれば `truncated`）
 /// - テキストなし・打ち切りなし: `None`（次点の `title` へフォールバックしてよい）
 /// - テキストなし・打ち切りあり: `Some` の空の名前（`truncated: true`。走査しきれて
 ///   いない以上「名前なし」と確定できないため `title` へフォールバックさせない）
-fn content_name(doc: &Document, index: &NameIndex, id: NodeId) -> Option<AccessibleName> {
-    let max_steps = MAX_CONTENT_STEPS.min(index.content_steps_left.get());
+fn content_name(doc: &Document, id: NodeId) -> Option<AccessibleName> {
     let mut text = String::new();
     let scan = collect_content_text(
         doc,
         id,
         id,
         ContentWalk {
-            max_steps,
+            max_steps: MAX_CONTENT_STEPS,
             include_hidden: false,
         },
         &mut text,
-    );
-    index.content_steps_left.set(
-        index
-            .content_steps_left
-            .get()
-            .saturating_sub(scan.steps_used),
     );
 
     let mut buf = NameBuffer::new();
@@ -1359,6 +1350,12 @@ fn aria_labelledby_name(
         };
         truncated |= cut;
         if !has_non_whitespace(&text) {
+            if cut {
+                // 参照先の走査が打ち切られて文字を得られなかった場合は名前が
+                // 未確定のため、寄与が 0 件のまま終われば次の命名規則へ
+                // フォールバックさせない（PR #574 レビュー指摘）。
+                scan_cut_before_match = true;
+            }
             continue;
         }
         if matched >= MAX_IDREFS {
@@ -1470,7 +1467,7 @@ fn native_name(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName 
     if is_html_element_named(doc, id, "button") {
         // HTML-AAM の button 節: label → 子孫テキスト → title。
         return label_name(doc, index, id)
-            .or_else(|| content_name(doc, index, id))
+            .or_else(|| content_name(doc, id))
             .or_else(|| title_name(doc, id))
             .unwrap_or_default();
     }
@@ -1486,7 +1483,7 @@ fn native_name(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName 
     // name from content を許す role（link・heading・cell 等）は子孫テキスト →
     // title、それ以外は title のみ（accname 2F → 2I）。
     if allows_name_from_content(doc, id) {
-        return content_name(doc, index, id)
+        return content_name(doc, id)
             .or_else(|| title_name(doc, id))
             .unwrap_or_default();
     }
@@ -3296,8 +3293,45 @@ mod tests {
             .map(|&id| compute_name_with_index(&doc, &index, id))
             .collect();
         assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        // 最も外側はステップ上限で本文に届かず、truncated の空の名前。
+        let first = results.first().expect("要素がある");
+        assert_eq!(first, &named("", NameSource::None, true));
+        // 最も内側は本文に届く（先に算出した要素に予算を奪われない）。
         let last = results.last().expect("要素がある");
-        assert_eq!(last, &named("", NameSource::None, true));
+        assert_eq!(last, &named("x", NameSource::Content, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546・PR #574 レビュー指摘）: 共有索引での
+    /// 名前は算出順に依存せず、単発の `compute_name` と一致する。
+    #[test]
+    fn aisnap_1_content_result_is_independent_of_call_order() {
+        let mut html = String::new();
+        for _ in 0..600 {
+            html.push_str(r#"<div role="button">"#);
+        }
+        html.push_str("短い");
+        for _ in 0..600 {
+            html.push_str("</div>");
+        }
+        html.push_str(r#"<button title="T">押す</button>"#);
+        let parsed = parse_document(&html, &ParseOptions::default()).expect("成功する");
+        let doc = parsed.document;
+        let ids =
+            fandhe_browser_core::query::query_selector_all_str(&doc, doc.root(), "div, button")
+                .expect("セレクタは解釈できる");
+        let expected: Vec<AccessibleName> = ids.iter().map(|&id| compute_name(&doc, id)).collect();
+        let index = NameIndex::build(&doc);
+        let mut reversed: Vec<AccessibleName> = ids
+            .iter()
+            .rev()
+            .map(|&id| compute_name_with_index(&doc, &index, id))
+            .collect();
+        reversed.reverse();
+        assert_eq!(reversed, expected);
+        assert_eq!(
+            expected.last().expect("要素がある"),
+            &named("押す", NameSource::Content, false)
+        );
     }
 
     /// AISNAP-1（TASK-11.4.3・#546）: label 経由の子孫走査が文字数上限で
