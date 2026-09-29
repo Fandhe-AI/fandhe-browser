@@ -251,7 +251,7 @@ def load_capture_result(
         if not isinstance(site_entry, dict):
             raise CaptureResultError("capture-result.json: each 'sites' entry must be an object")
         declared_id = site_entry.get("id")
-        if not isinstance(declared_id, str) or not cs.SITE_ID_RE.match(declared_id):
+        if not isinstance(declared_id, str) or not cs.SITE_ID_RE.fullmatch(declared_id):
             raise CaptureResultError(f"capture-result.json: invalid site id in 'sites': {declared_id!r}")
         if declared_id in declared_site_ids:
             raise CaptureResultError(f"capture-result.json: duplicate site id in 'sites': {declared_id}")
@@ -281,7 +281,7 @@ def load_capture_result(
         status = entry.get("status")
         # `site_id`/`engine` を辞書キーに使う前に文字列であることを確認する
         # （unhashable な値だと main 全体が落ちる。#53 レビュー指摘と同種）。
-        if not isinstance(site_id, str) or not cs.SITE_ID_RE.match(site_id):
+        if not isinstance(site_id, str) or not cs.SITE_ID_RE.fullmatch(site_id):
             continue
         if not isinstance(engine, str) or not isinstance(status, str):
             continue
@@ -359,7 +359,9 @@ def load_capture_result(
 # --- PNG デコード（グレースケール輝度への変換） -------------------------------
 
 
-def _read_png_chunks(path: Path) -> tuple[int, int, int, int, bytes]:
+def _read_png_chunks(
+    path: Path, expected_size: tuple[int, int] | None = None
+) -> tuple[int, int, int, int, bytes]:
     """PNG のチャンク構造を検証しつつ IHDR フィールドと展開済み画素データを取り出す。
 
     `capture_screenshots.read_png_size`（撮影直後に一度検証済み）とは独立した
@@ -449,6 +451,14 @@ def _read_png_chunks(path: Path) -> tuple[int, int, int, int, bytes]:
             if width * height > MAX_SSIM_PIXELS:
                 raise PngDecodeError(
                     f"pixel count {width * height} exceeds the {MAX_SSIM_PIXELS} limit: {path}"
+                )
+            # 宣言 viewport が渡された場合は IHDR の寸法を IDAT 展開前に照合し、
+            # 撮影条件と異なる寸法の PNG に純 Python の逆フィルタ処理の CPU・
+            # メモリを費やさず拒否する。
+            if expected_size is not None and (width, height) != expected_size:
+                raise PngDecodeError(
+                    f"PNG dimensions {width}x{height} do not match the declared viewport "
+                    f"{expected_size[0]}x{expected_size[1]}: {path}"
                 )
             if compression != 0:
                 raise PngDecodeError(f"unsupported PNG compression method: {path}")
@@ -630,14 +640,18 @@ def _unfilter_scanlines(raw: bytes, width: int, height: int, channels: int, path
     return bytes(out)
 
 
-def decode_png_gray(path: Path) -> tuple[int, int, list[int]]:
+def decode_png_gray(
+    path: Path, expected_size: tuple[int, int] | None = None
+) -> tuple[int, int, list[int]]:
     """PNG を読み、輝度（0〜255 の整数）の行優先配列へ変換する。
 
     グレースケール化は BT.601 の整数近似 `Y = (299R+587G+114B+500)//1000`
     （§2.5）。アルファチャンネルを持つ場合は不透明な白（255）の上に合成して
     から輝度を計算する（ブラウザのスクリーンショットは通常不透明）。
     """
-    width, height, color_type, channels, pixels = _read_png_chunks(path)
+    width, height, color_type, channels, pixels = _read_png_chunks(
+        path, expected_size
+    )
     row_len = width * channels
     gray = [0] * (width * height)
     for y in range(height):
@@ -766,8 +780,9 @@ def _measure_ssim_pair(
     （Bugbot 指摘）。
     """
     try:
-        rw, rh, ref_gray = decode_png_gray(reference_png)
-        tw, th, tgt_gray = decode_png_gray(target_png)
+        expected = (viewport["width"], viewport["height"])
+        rw, rh, ref_gray = decode_png_gray(reference_png, expected)
+        tw, th, tgt_gray = decode_png_gray(target_png, expected)
     except PngDecodeError as exc:
         return {"status": "error", "value": None, "passed": False, "reason": str(exc)}
     if (rw, rh) != (tw, th):
@@ -886,7 +901,7 @@ def load_bboxes(path: Path) -> dict[str, dict[str, float]] | None:
         if not isinstance(element, dict):
             raise BboxError(f"bbox element must be an object: {path}")
         eid = element.get("id")
-        if not isinstance(eid, str) or not BBOX_ID_RE.match(eid):
+        if not isinstance(eid, str) or not BBOX_ID_RE.fullmatch(eid):
             raise BboxError(f"invalid bbox element id: {element.get('id')!r}: {path}")
         if eid in result:
             raise BboxError(f"duplicate bbox element id: {eid}: {path}")

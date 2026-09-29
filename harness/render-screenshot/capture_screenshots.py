@@ -312,7 +312,7 @@ def load_sites(
         url = entry.get("url")
         category = entry.get("category")
         catalog_id = entry.get("catalog_id")
-        if not isinstance(site_id, str) or not SITE_ID_RE.match(site_id):
+        if not isinstance(site_id, str) or not SITE_ID_RE.fullmatch(site_id):
             raise SiteListError(f"sites[{index}].id is missing or invalid: {site_id!r}")
         if site_id.lower() in seen_ids:
             raise SiteListError(f"duplicate site id (case-insensitive): {site_id}")

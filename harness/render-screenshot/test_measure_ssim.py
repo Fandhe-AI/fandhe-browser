@@ -542,6 +542,25 @@ class MeasureSsimPairTest(unittest.TestCase):
             self.assertFalse(result["passed"])
             self.assertIn("viewport", result["reason"])
 
+    def test_viewport_mismatch_rejected_before_idat_decode(self) -> None:
+        # IHDR 寸法が宣言 viewport と異なる PNG は、IDAT の逆フィルタ処理へ
+        # 進む前に拒否する（DoS 対策）。
+        with tempfile.TemporaryDirectory() as tmp:
+            p1 = Path(tmp) / "a.png"
+            p2 = Path(tmp) / "b.png"
+            p1.write_bytes(build_png(10, 10, rgb_pixel, color_type=2))
+            p2.write_bytes(build_png(10, 10, rgb_pixel, color_type=2))
+            with mock.patch.object(ms, "_unfilter_scanlines") as unfilter:
+                result = ms._measure_ssim_pair(p1, p2, {"width": 20, "height": 20})
+            unfilter.assert_not_called()
+            self.assertEqual(result["status"], "error")
+            self.assertIn("declared viewport 20x20", result["reason"])
+
+    def test_id_regexes_reject_trailing_newline(self) -> None:
+        self.assertIsNone(cs.SITE_ID_RE.fullmatch("a\n"))
+        self.assertIsNone(ms.BBOX_ID_RE.fullmatch("a\n"))
+        self.assertIsNotNone(cs.SITE_ID_RE.fullmatch("a"))
+
     def test_measured_pass_and_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             same_a = Path(tmp) / "a.png"
