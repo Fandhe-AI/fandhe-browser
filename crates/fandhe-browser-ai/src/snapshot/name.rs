@@ -711,20 +711,8 @@ fn collect_content_text(
                 if !opts.include_hidden && is_hidden_element(doc, current) {
                     continue;
                 }
-                if let Some(label) = doc.attribute(current, "aria-label")
-                    && has_non_whitespace(label)
-                {
-                    fold!(label.chars());
-                    continue;
-                }
-                if is_html_element_named(doc, current, "img") {
-                    // `img` は `alt` を子孫テキストの代わりに使う。子要素を
-                    // 持たないため `stack` へは積まない。
-                    if let Some(alt) = doc.attribute(current, "alt") {
-                        fold!(alt.chars());
-                    }
-                    continue;
-                }
+                // accname 2C: 再帰中の埋め込みコントロール（2E）では `aria-label` を無視して
+                // コントロールの値を優先するため、`aria-label` より先に判定する。
                 if let Some((text, inner)) = embedded_control_text(
                     doc,
                     current,
@@ -736,6 +724,20 @@ fn collect_content_text(
                     fold!(text.chars());
                     if inner.cut {
                         break;
+                    }
+                    continue;
+                }
+                if let Some(label) = doc.attribute(current, "aria-label")
+                    && has_non_whitespace(label)
+                {
+                    fold!(label.chars());
+                    continue;
+                }
+                if is_html_element_named(doc, current, "img") {
+                    // `img` は `alt` を子孫テキストの代わりに使う。子要素を
+                    // 持たないため `stack` へは積まない。
+                    if let Some(alt) = doc.attribute(current, "alt") {
+                        fold!(alt.chars());
                     }
                     continue;
                 }
@@ -3171,6 +3173,19 @@ mod tests {
                 "a"
             ),
             named("ホーム", NameSource::Content, false)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: 再帰中の埋め込みコントロールでは
+    /// `aria-label` より値（accname 2E）を優先する。
+    #[test]
+    fn aisnap_1_content_embedded_control_value_beats_aria_label() {
+        assert_eq!(
+            name(
+                r#"<button>数量 <input aria-label="数量" value="5"></button>"#,
+                "button"
+            ),
+            named("数量 5", NameSource::Content, false)
         );
     }
 
