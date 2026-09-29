@@ -51,6 +51,11 @@ const MIN_CONCURRENCY: usize = 5;
 const PROFILE_COUNT: usize = 5;
 /// `PROF-3` が定める、1 プロファイルあたりの書き込み回数。
 const WRITES_PER_PROFILE: usize = 100;
+/// 他ワーカーの書き込み途中（`write_all` の最中）を混線と誤判定しないための
+/// 再読み込み回数と間隔。書き込みは通常マイクロ秒で完了するため、この窓の間に
+/// 有効な内容へ遷移しない内容だけを混線とみなす（PROF-3）。
+const SETTLE_ATTEMPTS: usize = 100;
+const SETTLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
 /// 全プロファイル・全 `DataKind` で共通のファイル名。どのワーカーも同じ
 /// 相対パス（`<kind のディレクトリ>/concurrent.dat`）へ書き込むため、52.2 で
 /// 他プロファイルのペイロードが混入していないかを検出できる。
@@ -353,8 +358,8 @@ fn write_in_place(profile: &Profile, kind: DataKind, payload: &[u8]) -> Result<(
 
 /// 書き込み直後の混線検査（`PROF-3`・#185）。自プロファイルの
 /// `<kind>/concurrent.dat` は自ワーカーだけが書くため `payload` と完全一致する
-/// はずで、他プロファイルのファイルは空（truncate 直後）か読めない（未作成）
-/// 場合を除き、自身以外のマーカー `profile-{m}:` を含まないこと。
+/// はずで、他プロファイルのファイルは空・読めない（未作成）・書き込み途中
+/// （再読み込みで有効な内容へ遷移するもの）を除き、自身以外のマーカー `profile-{m}:` を含まないこと。
 /// 未作成（`NotFound`）を許容するのは他プロファイルのファイルだけで、自
 /// プロファイルの読み取り失敗やその他の I/O エラーは指摘として記録する。
 fn check_after_write(
@@ -407,16 +412,37 @@ fn check_after_write(
                 ));
             }
         }
-        // 他プロファイルのファイルは空（truncate 直後）か、所有者が書き得る
-        // ペイロード形式に完全一致する内容のみ許容する。途中まで書かれた・
-        // 壊れた内容（他プロファイルのマーカーを含まないもの）も指摘にする。
-        if !marker_found
-            && !bytes.is_empty()
-            && !is_owner_payload(owner, kind, writes_per_profile, &text)
-        {
-            found.push(format!(
-                "profile-{owner} {kind:?}: content is not a valid payload of profile-{owner} ({text:?})"
-            ));
+        // 他プロファイルのファイルは空（作成直後）か、所有者が書き得る
+        // ペイロード形式に完全一致する内容のみ許容する。ただし所有者ワーカーが
+        // `write_all` の最中だと、途中まで書かれた内容（プレフィックス）や
+        // 旧内容との混在を読み得る（`write_all` は読み手に対して原子的で
+        // ない）。これは正常な並行実行の途中状態なので、少し待って読み直し、
+        // 有効な状態へ遷移するかを見る。待っても有効にならない内容
+        // （壊れた・所有者が書き得ない内容）だけを混線として指摘する。
+        if !marker_found && !bytes.is_empty() {
+            let mut settled = is_owner_payload(owner, kind, writes_per_profile, &text);
+            let mut last = bytes;
+            for _ in 0..SETTLE_ATTEMPTS {
+                if settled {
+                    break;
+                }
+                std::thread::sleep(SETTLE_INTERVAL);
+                match std::fs::read(&path) {
+                    Ok(again) => {
+                        let again_text = String::from_utf8_lossy(&again);
+                        settled = again.is_empty()
+                            || is_owner_payload(owner, kind, writes_per_profile, &again_text);
+                        last = again;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if !settled {
+                found.push(format!(
+                    "profile-{owner} {kind:?}: content is not a valid payload of profile-{owner} ({:?})",
+                    String::from_utf8_lossy(&last)
+                ));
+            }
         }
     }
     found
@@ -1203,7 +1229,7 @@ fn prof_3_corrupted_other_profile_content_is_detected() {
         Vec::<String>::new()
     );
 
-    // 途中まで書かれた内容・ゴミ・改行欠落は指摘になる。
+    // 待っても有効にならない途中内容・ゴミ・改行欠落は指摘になる。
     for corrupted in [
         &b"profile-1:wri"[..],
         b"garbage\n",
@@ -1219,4 +1245,32 @@ fn prof_3_corrupted_other_profile_content_is_detected() {
         assert_eq!(found.len(), 1, "{corrupted:?}: {found:?}");
         assert!(found[0].contains("not a valid payload"), "{found:?}");
     }
+}
+
+/// `PROF-3`・#185・#580 レビュー指摘: 他ワーカーの書き込み途中（プレフィックス）
+/// を観測しても、その後有効なペイロードへ遷移するなら混線と誤判定しないこと。
+#[test]
+fn prof_3_in_flight_partial_write_is_not_reported_as_mixup() {
+    let tmp = TempDir::new();
+    let kind = DataKind::ALL[0];
+    let mut profiles = Vec::new();
+    for i in 0..PROFILE_COUNT {
+        profiles.push(Profile::open(tmp.path().join(format!("profile-{i}"))).expect("open"));
+    }
+    let own = "profile-0:write-0000\n";
+    write_once(&profiles[0], kind, own.as_bytes()).expect("write");
+    write_once(&profiles[1], kind, b"profile-1:wri").expect("途中状態");
+
+    let target = tmp
+        .path()
+        .join("profile-1")
+        .join(kind.dir_name())
+        .join(TARGET_FILE_NAME);
+    let completer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(target, b"profile-1:write-0008\n").expect("完了");
+    });
+    let found = check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT, WRITES_PER_PROFILE);
+    completer.join().expect("join");
+    assert_eq!(found, Vec::<String>::new());
 }
