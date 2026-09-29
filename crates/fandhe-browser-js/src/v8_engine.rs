@@ -30,7 +30,8 @@
 //!   避ける）
 //! - DOM 風オブジェクトの handle を JS 値として往復させる変換
 //!   （オブジェクト自体を引数・戻り値にする。`JsValue::ObjectHandle` の
-//!   プロキシ化。`TASK-29.5`・Issue #156 の後続）と setter
+//!   プロキシ化。`TASK-29.5`・Issue #156 の後続）は未実装で、setter
+//!   （書き込み可能プロパティ）も未対応である
 //!
 //! DOM 風オブジェクトのプロキシ生成（[`V8Engine::install_dom_like_object`]）と
 //! 親側の dispatch は実装済み（`TASK-29.5b`・Issue #525）。

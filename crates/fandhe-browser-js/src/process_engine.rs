@@ -107,8 +107,7 @@
 //! - 子 → 親へ `ObjectHandle` を渡す経路（オブジェクト参照の往復・親の handle
 //!   照合）は未実装で、現状は fail-closed で拒否する（`TASK-29.5b` の
 //!   後続作業。REPAIR-3）。setter（書き込み可能プロパティ）も未対応。
-//!
-//!   `impl JsEngine for V8ProcessEngine`（`TASK-29.6`・Issue #157）は未実装で、
+//! - `impl JsEngine for V8ProcessEngine`（`TASK-29.6`・Issue #157）は未実装で、
 //!   トレイトの `NativeFn`（`Send` なし）と本型の [`ParentNativeFn`]（`Send`
 //!   あり）の不一致の橋渡しもそこで決める
 //! - 期限を過ぎて放棄された `NativeFn` のスレッドが `Mutex` を握ったままの
