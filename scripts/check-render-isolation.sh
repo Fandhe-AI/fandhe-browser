@@ -139,7 +139,17 @@ fi
 STATUS=0
 
 # 検査 A: workspace 全体（render crate 自身を除く）
-WORKSPACE_MEMBERS="$(find crates -mindepth 2 -maxdepth 2 -name 'Cargo.toml' -not -path 'crates/fandhe-browser-render/Cargo.toml' 2>/dev/null || true)"
+# 列挙の失敗（find の非ゼロ終了）を「member 無し」と混同しない。失敗を握りつぶすと
+# 検査 A が無言で skip されて分離ゲートが素通りする（fail-open。Issue #465 レビュー指摘）。
+# crates ディレクトリ自体が無い場合は正常な「member 無し」として空扱いにし、
+# それ以外の find 失敗は非ゼロ終了する。
+WORKSPACE_MEMBERS=""
+if [ -d crates ]; then
+  if ! WORKSPACE_MEMBERS="$(find crates -mindepth 2 -maxdepth 2 -name 'Cargo.toml' -not -path 'crates/fandhe-browser-render/Cargo.toml')"; then
+    echo "NG: workspace member の列挙（find crates）に失敗しました" >&2
+    exit 1
+  fi
+fi
 if [ -z "$WORKSPACE_MEMBERS" ]; then
   notice "skip: fandhe-browser-render 以外の member crate が無いため workspace 検査をスキップ"
 else
