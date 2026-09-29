@@ -40,8 +40,8 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Barrier, RwLock};
 use std::thread;
 
 /// `PROF-3` が定める最低並行数（「5 並行以上で複数 Profile へ同時に書き込める
@@ -143,6 +143,12 @@ fn validate_config(config: &HarnessConfig) {
         config.writes_per_profile > 0,
         "writes_per_profile は 1 以上である必要がある"
     );
+    // ペイロードの書き込み番号は 4 桁固定（`{j:04}`）で、全ペイロードを同じ
+    // 長さにする前提（`write_in_place`）。
+    assert!(
+        config.writes_per_profile <= 10_000,
+        "writes_per_profile は 10000 以下である必要がある（ペイロード長を固定するため）"
+    );
 }
 
 /// `base` 配下に `config.profiles` 個のプロファイルを作り、`Barrier` で
@@ -193,19 +199,11 @@ fn run_concurrent_writes(base: &Path, config: &HarnessConfig) -> Vec<WorkerOutco
 
     let barrier = Barrier::new(config.profiles);
     let profile_count = config.profiles;
-    // 書き込み（`set_len(0)` → `write_all`）と混線検査の読み取りを同期する
-    // RwLock。同期しないと、他ワーカーの書き込み途中（切り詰め後・書き込み
-    // 完了前）の内容を検査側が観測し、正常な書き込みを混線と誤検出する
-    // （#580 レビュー指摘）。検査自体は緩めず、書き込み区間だけを直列化する。
-    // 書き込み同士はロック区間が短く、プロファイル横断の混線検出という
-    // 本来の目的（PROF-3）は維持される。
-    let io_lock = RwLock::new(());
 
     thread::scope(|scope| {
         let handles: Vec<_> = (0..config.profiles)
             .map(|index| {
                 let barrier = &barrier;
-                let io_lock = &io_lock;
                 let writes_per_profile = config.writes_per_profile;
                 let root = base.join(format!("profile-{index}"));
                 scope.spawn(move || -> WorkerOutcome {
@@ -257,24 +255,23 @@ fn run_concurrent_writes(base: &Path, config: &HarnessConfig) -> Vec<WorkerOutco
                             continue;
                         };
                         let payload = format!("profile-{index}:write-{j:04}\n");
-                        let write_result = {
-                            // 毒化（他ワーカーの panic）は無視して続行する。
-                            let _guard = io_lock.write().unwrap_or_else(|e| e.into_inner());
-                            write_once(&profile, kind, payload.as_bytes())
-                        };
+                        // 書き込みは全ワーカー間で直列化しない（PROF-3 は並行書き込み
+                        // 時の混線検出を要求する。#580 レビュー指摘）。切り詰めを伴わない
+                        // 固定長の 1 回書き込みにして、読み取り側が空・途中内容を観測する
+                        // 窓を作らない。
+                        let write_result = write_in_place(&profile, kind, payload.as_bytes());
                         match write_result {
                             Ok(()) => {
                                 writes_succeeded += 1;
                                 // 書き込み直後に所有先・内容を検査し、後続の
                                 // 書き込みで上書きされても途中の混線を残す。
-                                // 読み取り中は他ワーカーの書き込みを止める。
-                                let _guard = io_lock.read().unwrap_or_else(|e| e.into_inner());
                                 intermediate_mixups.extend(check_after_write(
                                     base,
                                     index,
                                     kind,
                                     &payload,
                                     profile_count,
+                                    writes_per_profile,
                                 ));
                                 if let Some(slot) =
                                     last_payloads.iter_mut().find(|(k, _)| *k == kind)
@@ -342,6 +339,18 @@ fn write_once(profile: &Profile, kind: DataKind, payload: &[u8]) -> Result<(), S
     Ok(())
 }
 
+/// 固定長ペイロードを切り詰めずに先頭へ 1 回の `write_all` で上書きする。
+/// 全ペイロードは同じ長さ（`validate_config` が書き込み番号を 4 桁に制限）の
+/// ため古いバイトは残らず、`set_len(0)` による「空になる窓」も生じない。
+/// 並行ワーカーの混線検査が正常な書き込みを誤検出しないための書き込み方式。
+fn write_in_place(profile: &Profile, kind: DataKind, payload: &[u8]) -> Result<(), String> {
+    let mut file = profile
+        .create_file_in(kind, OsStr::new(TARGET_FILE_NAME))
+        .map_err(|err| err.to_string())?;
+    file.write_all(payload).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 /// 書き込み直後の混線検査（`PROF-3`・#185）。自プロファイルの
 /// `<kind>/concurrent.dat` は自ワーカーだけが書くため `payload` と完全一致する
 /// はずで、他プロファイルのファイルは空（truncate 直後）か読めない（未作成）
@@ -354,6 +363,7 @@ fn check_after_write(
     kind: DataKind,
     payload: &str,
     profile_count: usize,
+    writes_per_profile: usize,
 ) -> Vec<String> {
     let mut found = Vec::new();
     for owner in 0..profile_count {
@@ -400,7 +410,10 @@ fn check_after_write(
         // 他プロファイルのファイルは空（truncate 直後）か、所有者が書き得る
         // ペイロード形式に完全一致する内容のみ許容する。途中まで書かれた・
         // 壊れた内容（他プロファイルのマーカーを含まないもの）も指摘にする。
-        if !marker_found && !bytes.is_empty() && !is_owner_payload(owner, &text) {
+        if !marker_found
+            && !bytes.is_empty()
+            && !is_owner_payload(owner, kind, writes_per_profile, &text)
+        {
             found.push(format!(
                 "profile-{owner} {kind:?}: content is not a valid payload of profile-{owner} ({text:?})"
             ));
@@ -409,16 +422,27 @@ fn check_after_write(
     found
 }
 
-/// `text` が `owner` のワーカーが書き得るペイロード
-/// `profile-{owner}:write-{j:04}\n`（`j` は 4 桁以上の 10 進数）と完全一致するか。
-fn is_owner_payload(owner: usize, text: &str) -> bool {
+/// `text` が `owner` のワーカーが `kind` へ実際に書き得るペイロード
+/// `profile-{owner}:write-{j:04}\n` と完全一致するか。`j` はハーネスの書き込み
+/// 計画（`j < writes_per_profile` かつ `DataKind::ALL[j % len] == kind`）に
+/// 限る。計画外の番号は他プロファイルからの混入とみなす。
+fn is_owner_payload(owner: usize, kind: DataKind, writes_per_profile: usize, text: &str) -> bool {
     let Some(rest) = text.strip_prefix(&format!("profile-{owner}:write-")) else {
         return false;
     };
     let Some(digits) = rest.strip_suffix('\n') else {
         return false;
     };
-    digits.len() >= 4 && digits.bytes().all(|b| b.is_ascii_digit())
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(j) = digits.parse::<usize>() else {
+        return false;
+    };
+    let Some(kind_index) = DataKind::ALL.iter().position(|k| *k == kind) else {
+        return false;
+    };
+    j < writes_per_profile && j % DataKind::ALL.len() == kind_index
 }
 
 /// `thread::Result` の `Err` ペイロード（`Box<dyn Any + Send>`）から panic
@@ -1107,14 +1131,14 @@ fn prof_3_intermediate_mixup_is_detected_even_if_overwritten_later() {
     let own = "profile-0:write-0000\n";
     write_once(&profiles[0], kind, own.as_bytes()).expect("write");
     assert_eq!(
-        check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT),
+        check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT, WRITES_PER_PROFILE),
         Vec::<String>::new(),
         "正常時は 0 件"
     );
 
     // profile-1 のファイルへ profile-0 のペイロードが誤って書かれた状況。
     write_once(&profiles[1], kind, own.as_bytes()).expect("誤書き込み");
-    let found = check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT);
+    let found = check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT, WRITES_PER_PROFILE);
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(
         found[0].contains("contains marker of profile-0"),
@@ -1125,7 +1149,7 @@ fn prof_3_intermediate_mixup_is_detected_even_if_overwritten_later() {
     // 途中の検査結果（上の found）は残る。
     write_once(&profiles[1], kind, b"profile-1:write-0000\n").expect("正しい書き込み");
     assert_eq!(
-        check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT).len(),
+        check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT, WRITES_PER_PROFILE).len(),
         0
     );
 }
@@ -1141,7 +1165,14 @@ fn prof_3_own_file_read_failure_is_reported() {
     }
     // どのプロファイルにも未書き込み: 他プロファイルの NotFound は許容、
     // 自プロファイル（index 0）の NotFound だけが 1 件の指摘になる。
-    let found = check_after_write(tmp.path(), 0, kind, "profile-0:write-0000\n", PROFILE_COUNT);
+    let found = check_after_write(
+        tmp.path(),
+        0,
+        kind,
+        "profile-0:write-0000\n",
+        PROFILE_COUNT,
+        WRITES_PER_PROFILE,
+    );
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("failed to read"), "{found:?}");
 }
@@ -1163,19 +1194,28 @@ fn prof_3_corrupted_other_profile_content_is_detected() {
     // 空（truncate 直後）と正規ペイロードは正常。
     write_once(&profiles[1], kind, b"").expect("空書き込み");
     assert_eq!(
-        check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT),
+        check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT, WRITES_PER_PROFILE),
         Vec::<String>::new()
     );
-    write_once(&profiles[1], kind, b"profile-1:write-0007\n").expect("正規");
+    write_once(&profiles[1], kind, b"profile-1:write-0008\n").expect("正規");
     assert_eq!(
-        check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT),
+        check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT, WRITES_PER_PROFILE),
         Vec::<String>::new()
     );
 
     // 途中まで書かれた内容・ゴミ・改行欠落は指摘になる。
-    for corrupted in [&b"profile-1:wri"[..], b"garbage\n", b"profile-1:write-0007"] {
+    for corrupted in [
+        &b"profile-1:wri"[..],
+        b"garbage\n",
+        b"profile-1:write-0008",
+        // 書き込み計画外の番号（範囲外・別 kind の番号）も指摘になる。
+        b"profile-1:write-9999\n",
+        b"profile-1:write-0100\n",
+        b"profile-1:write-0007\n",
+        b"profile-1:write-10000\n",
+    ] {
         write_once(&profiles[1], kind, corrupted).expect("壊れた内容");
-        let found = check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT);
+        let found = check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT, WRITES_PER_PROFILE);
         assert_eq!(found.len(), 1, "{corrupted:?}: {found:?}");
         assert!(found[0].contains("not a valid payload"), "{found:?}");
     }
