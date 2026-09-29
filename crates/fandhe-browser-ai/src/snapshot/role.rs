@@ -1,9 +1,8 @@
 //! `snapshot::Node::role` フィールドの算出ロジックの骨格と代表要素
 //! （`AISNAP-1`・`TASK-11.3.1`・`MS-2`・Issue #541。親は TASK-11.3・Issue #72）。
 //!
-//! 呼び出し文脈: 現時点では呼び出し元がない。DOM から `Snapshot`/`Node` を
-//! 構築する TASK-11.7（Issue #76）が、ツリー構築時に要素ごとへ
-//! [`compute_role`] を呼ぶ想定である（実装済みを装わない。REPAIR-3）。
+//! 呼び出し文脈: `snapshot::build::build_snapshot`（TASK-11.7・Issue #76）が、
+//! ツリー構築時に要素ごとへ [`compute_role`] を呼ぶ。
 //!
 //! # 設計上の制約（文書を走査しない）
 //!
@@ -52,7 +51,7 @@
 //! HTML-AAM で「対応 role なし」の `color`・`date`・`datetime-local`・
 //! `month`・`time`・`week`・`file` と、非公開の `hidden` は `generic`
 //! （Fallback）とする。`hidden` を要素として `Some` で返す契約を保つためで、
-//! スナップショットからの除外はツリー構築側（TASK-11.7・Issue #76）の責務。
+//! スナップショットからの除外はツリー構築側（`build_snapshot`・TASK-11.7・Issue #76。実装済み）の責務。
 //! 欠落・空・未知の `type` は HTML Standard どおり Text 状態（`textbox`）で、
 //! `type` の照合は ASCII 大文字小文字を区別せず前後の空白を除去しない
 //! （空白を含む値はどのキーワードにも一致しない）。
@@ -239,7 +238,7 @@ impl ComputedRole {
     /// role トークンを返す（例: `"button"`・`"heading"`）。
     ///
     /// `snapshot::Node::role` へ詰める際は `as_str().to_string()` とする
-    /// 想定（配線は TASK-11.7・Issue #76 が担う）。
+    /// 想定（配線は `build_snapshot`・TASK-11.7・Issue #76 で実装済み）。
     pub fn as_str(&self) -> &'static str {
         self.role
     }

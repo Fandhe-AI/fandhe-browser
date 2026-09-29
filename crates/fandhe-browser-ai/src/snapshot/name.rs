@@ -35,7 +35,7 @@
 //! - `fieldset`→`legend`・`table`→`caption`・`figure`→`figcaption`・SVG の
 //!   `<title>`・`aria-describedby`: 担当 Issue 未確定（out-of-scope-tracking
 //!   に従いユーザー承認を得てから追跡する）
-//! - DOM から `Snapshot`/`Node` へのツリー構築配線: TASK-11.7（Issue #76）。
+//! - DOM から `Snapshot`/`Node` へのツリー構築配線: TASK-11.7（Issue #76）で実装済み（`build.rs`）。
 //!   `id`/`label` の索引化自体は本ファイルが [`NameIndex`] として提供する
 //!   （PR #567 レビュー指摘: 要素ごとに文書全体を再走査すると計算量が
 //!   二乗になるため）。`aria-labelledby` の IDREF 解決も同じ索引の `id`
@@ -52,10 +52,9 @@
 //! 最悪 `node_count * MAX_CONTENT_STEPS` で、`node_count` はパーサーの
 //! ノード数上限（`ParseOptions::max_nodes`）で抑えられる。`input[type=password]` の `value` は名前へ取り込まない。
 //!
-//! 呼び出し文脈: 現時点では呼び出し元がない。DOM から `Snapshot`/`Node` を
-//! 構築する TASK-11.7（Issue #76）が、文書ごとに [`NameIndex::build`] を
-//! 1 回呼んだうえで、ツリー構築時に要素ごとへ [`compute_name_with_index`]
-//! を呼ぶ想定である（実装済みを装わない。REPAIR-3）。
+//! 呼び出し文脈: `snapshot::build::build_snapshot`（TASK-11.7・Issue #76）が、
+//! 文書ごとに [`NameIndex::build`] を 1 回呼んだうえで、ツリー構築時に要素ごとへ
+//! [`compute_name_with_index`] を呼ぶ。
 //!
 //! # HTML-AAM による要素ごとの算出順序
 //!
@@ -497,7 +496,7 @@ fn is_labelable(doc: &Document, id: NodeId) -> bool {
 /// フォールバックする。前後の空白を除去してから照合すると
 /// `type=" submit "` を `submit` 状態、`type=" hidden "` を `hidden` 状態と
 /// 誤判定してしまう（PR #567 レビュー指摘の P1 修正）。
-fn normalized_input_type(doc: &Document, id: NodeId) -> String {
+pub(super) fn normalized_input_type(doc: &Document, id: NodeId) -> String {
     doc.attribute(id, "type")
         .map(|value| value.to_ascii_lowercase())
         .unwrap_or_default()
@@ -528,12 +527,12 @@ struct ContentScan {
 }
 
 /// `script`・`style`・`noscript`・`template` は名前の計算に寄与しない。
-const SKIPPED_SUBTREES: [&str; 4] = ["script", "style", "noscript", "template"];
+pub(super) const SKIPPED_SUBTREES: [&str; 4] = ["script", "style", "noscript", "template"];
 
 /// 要素が `hidden` 属性を持つか、`aria-hidden` が（HTML 空白の trim・ASCII
 /// 大文字小文字無視で）`"true"` かを返す（accname 2A。CSS による非表示は
 /// スタイル未評価のため対象外）。
-fn is_hidden_element(doc: &Document, id: NodeId) -> bool {
+pub(super) fn is_hidden_element(doc: &Document, id: NodeId) -> bool {
     if doc.attribute(id, "hidden").is_some() {
         return true;
     }
@@ -1594,9 +1593,8 @@ fn native_name(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName 
 /// そのような呼び出し元は、文書ごとに [`NameIndex::build`] を 1 回だけ
 /// 呼び、要素ごとには [`compute_name_with_index`] を使うこと。
 ///
-/// 呼び出し文脈: 現時点では呼び出し元がない。TASK-11.7（Issue #76）が
-/// DOM から `Snapshot`/`Node` を構築する際、算出結果の `text` を
-/// [`super::Node::name`] へ格納する想定である。
+/// 呼び出し文脈: 単体算出用。ツリー構築（TASK-11.7・Issue #76）は本関数ではなく
+/// [`compute_name_with_index`] を使い、`text` を [`super::Node::name`] へ格納する。
 pub fn compute_name(doc: &Document, id: NodeId) -> AccessibleName {
     let index = NameIndex::build(doc);
     compute_name_with_index(doc, &index, id)

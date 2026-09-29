@@ -41,8 +41,8 @@
 //! TASK-11.4.2（Issue #545）で accessible name のうち HTML ネイティブの
 //! ラベル付け分を実装し、TASK-11.4.1（Issue #544）で ARIA 分、
 //! TASK-11.4.3（Issue #546）で子孫テキストと文書ルートの `<title>` を実装した
-//! （[`snapshot::compute_name`]）。ツリー構築への組み込みはまだ未実装
-//! （実装済みを装わない。REPAIR-3）。今後、以下のタスクで段階的に実装する：
+//! （[`snapshot::compute_name`]）。ツリー構築への組み込みは TASK-11.7（Issue #76）で実装した
+//! （[`snapshot::build_snapshot`]。簡約は未実装）。今後、以下のタスクで段階的に実装する：
 //!
 //! - 役割ベース DOM 簡約表現の中核実装（本 crate の中心機能。[`snapshot`]
 //!   モジュール。`AISNAP-1`、`TASK-11`、`MS-2`。公開型は定義済み
@@ -51,8 +51,8 @@
 //!   accessible name のネイティブ分・ARIA 分・子孫テキスト分は実装済み
 //!   （TASK-11.4.2・Issue #545、TASK-11.4.1・Issue #544、TASK-11.4.3・
 //!   Issue #546）、ref 生成器は実装済み（TASK-11.6・Issue #75）。
-//!   残作業は TASK-11.3.2・11.3.3・11.7・11.8
-//!   （Issue #542・#543・#76・#77））
+//!   ツリー構築統合は実装済み（TASK-11.7・Issue #76）。
+//!   残作業は TASK-11.3.2・11.3.3・11.8（Issue #542・#543・#77））
 //! - `/ai/*` ルータ向けスナップショット API（`AISNAP-6`・`AISNAP-14`・`CDP-1`
 //!   （API 単体動作は `AISNAP-7`）、`TASK-19`（単体動作確認は `TASK-20`）、
 //!   `MS-4`）
