@@ -38,6 +38,9 @@
 //! - DOM から `Snapshot` へのツリー構築統合（[`role::compute_role`]・
 //!   [`state::compute_state`] の呼び出し組み込みを含む）: TASK-11.7（Issue #76）で
 //!   実装済み（[`build_snapshot`]。generic の折り畳み等の簡約は未実装）
+//! - データ葉（`isDataLeaf`）の判定結果の反映: TASK-13.3（`AISNAP-3`・Issue #88）で
+//!   実装済み（[`Node::data_leaf`]。算出は [`crate::data_leaf::classify_data_leaf`]。
+//!   印を付けるだけで、簡約・剪定への利用は後続タスク）
 //! - ユニットテスト一式: TASK-11.8（Issue #77）で実装済み（代表フィクスチャ 3 種の
 //!   結合テスト `tests/snapshot.rs`）
 
@@ -46,6 +49,7 @@ pub mod element_ref;
 pub mod name;
 pub mod role;
 pub mod state;
+pub use crate::data_leaf::DataLeafKind;
 pub use build::{MAX_TREE_DEPTH, SnapshotError, build_snapshot};
 pub use element_ref::{ElementRef, RefAllocator, RefError, ref_signature};
 pub use name::{AccessibleName, NameIndex, NameSource, compute_name, compute_name_with_index};
@@ -77,6 +81,10 @@ pub use state::{CheckedState, State, compute_state};
 /// - `state`: 要素の状態（`disabled`・`checked`）。算出は
 ///   [`state::compute_state`]（TASK-11.5・Issue #74）が担う。`Node::new` の
 ///   既定値は `State::default()`（`disabled: false`・`checked: None`）
+/// - `data_leaf`: 非インタラクティブなデータ値（表セル・価格クラス要素）と判定した
+///   根拠。`None` はデータ葉でない。判定は [`crate::data_leaf::classify_data_leaf`]
+///   （`AISNAP-3`・TASK-13.3・Issue #88）。role や ref には影響させない
+///   （ref の安定性。`AISNAP-10`）
 ///
 /// `#[non_exhaustive]` により、今後のフィールド追加は破壊的変更にならない。
 ///
@@ -109,11 +117,14 @@ pub struct Node {
     /// 要素の状態（`disabled`・`checked`）。算出は
     /// [`state::compute_state`]（TASK-11.5・Issue #74）。
     pub state: State,
+    /// データ葉と判定した根拠。`None` はデータ葉でない。
+    /// 判定は [`crate::data_leaf::classify_data_leaf`]（`AISNAP-3`・TASK-13.3・Issue #88）。
+    pub data_leaf: Option<DataLeafKind>,
 }
 
 impl Node {
     /// role・name を指定して `Node` を作る（`ref` は `None`、`children` は空、
-    /// `state` は `State::default()`）。
+    /// `state` は `State::default()`、`data_leaf` は `None`）。
     pub fn new(role: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             role: role.into(),
@@ -121,6 +132,7 @@ impl Node {
             r#ref: None,
             children: Vec::new(),
             state: State::default(),
+            data_leaf: None,
         }
     }
 
@@ -135,6 +147,13 @@ impl Node {
     #[must_use]
     pub fn with_state(mut self, state: State) -> Self {
         self.state = state;
+        self
+    }
+
+    /// `data_leaf` に根拠 `kind` を設定した `Node` を返す（ビルダー。`AISNAP-3`）。
+    #[must_use]
+    pub fn with_data_leaf(mut self, kind: DataLeafKind) -> Self {
+        self.data_leaf = Some(kind);
         self
     }
 
@@ -191,7 +210,7 @@ impl Snapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckedState, Node, Snapshot, State};
+    use super::{CheckedState, DataLeafKind, Node, Snapshot, State};
 
     /// `AISNAP-1`（TASK-11.2・Issue #71、`state` の既定値は TASK-11.5・
     /// Issue #74）: `Node::new` が role・name を設定し、`ref` は `None`、
@@ -201,6 +220,18 @@ mod tests {
         let node = Node::new("heading", "Example Domain");
         assert_eq!(node.role, "heading");
         assert_eq!(node.name, "Example Domain");
+        assert_eq!(node.r#ref, None);
+        assert_eq!(node.children.len(), 0);
+        assert_eq!(node.state, State::default());
+        assert_eq!(node.data_leaf, None);
+    }
+
+    /// `AISNAP-3`（TASK-13.3・Issue #88）: `with_data_leaf` が `data_leaf` だけを
+    /// 設定し、他のフィールドの既定値は変えないこと。
+    #[test]
+    fn aisnap_3_node_with_data_leaf_sets_kind() {
+        let node = Node::new("cell", "80").with_data_leaf(DataLeafKind::TableCell);
+        assert_eq!(node.data_leaf, Some(DataLeafKind::TableCell));
         assert_eq!(node.r#ref, None);
         assert_eq!(node.children.len(), 0);
         assert_eq!(node.state, State::default());

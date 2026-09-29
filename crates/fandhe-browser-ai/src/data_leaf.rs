@@ -12,8 +12,8 @@
 //!
 //! # スタブについて（REPAIR-3）
 //!
-//! 現時点では呼び出し元がない。TASK-13.3（Issue #88）が
-//! `snapshot` のノード構築へ組み込む予定である。実装済みなのは `td`/`th` と
+//! `snapshot::build::build_snapshot` から呼ばれ、結果は `Node::data_leaf` に入る
+//! （TASK-13.3・Issue #88。簡約・剪定への利用は後続）。判定規則として実装済みなのは `td`/`th` と
 //! 価格クラス名パターン（TASK-13.2・Issue #87）で、地の文・引用文への拡充は
 //! TASK-15（Issue #99・#100。`AISNAP-11`）で実装する。
 //!
@@ -27,7 +27,7 @@ const HTML_NAMESPACE_URI: &str = "http://www.w3.org/1999/xhtml";
 
 /// データ葉と判定した根拠（`AISNAP-3`）。
 ///
-/// `#[non_exhaustive]` により、TASK-13.2 の価格パターン等の追加が非破壊になる
+/// `#[non_exhaustive]` により、将来の判定根拠（TASK-15 の拡充等）の追加が非破壊になる
 /// （REPAIR-4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -79,7 +79,7 @@ fn is_html_element_named(doc: &Document, id: NodeId, name: &str) -> bool {
 /// 次に HTML 要素で `class` 属性全体に価格系パターンを部分一致で含み、かつ
 /// 子要素を持たなければ [`DataLeafKind::PriceClass`]。
 /// 非要素・ドキュメントルート・対象外の要素・範囲外の `NodeId` は `None`
-/// （panic しない）。TASK-13.3 の snapshot 構築から呼ばれる予定。
+/// （panic しない）。`snapshot::build::build_snapshot` が要素ごとに呼ぶ（TASK-13.3・Issue #88）。
 pub fn classify_data_leaf(doc: &Document, id: NodeId) -> Option<DataLeafKind> {
     if is_html_element_named(doc, id, "td") || is_html_element_named(doc, id, "th") {
         Some(DataLeafKind::TableCell)

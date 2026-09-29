@@ -3,7 +3,8 @@
 //!
 //! 役割: 算出部品（[`super::role::compute_role`]・
 //! [`super::name::compute_name_with_index`]・[`super::state::compute_state`]・
-//! [`super::element_ref::RefAllocator`]）を 1 回の DOM 走査へ統合する。
+//! [`super::element_ref::RefAllocator`]・[`crate::data_leaf::classify_data_leaf`]）を
+//! 1 回の DOM 走査へ統合する。
 //!
 //! 呼び出し文脈: 将来 `cli` 層の配線を経由して `cdp` の `/ai/snapshot`
 //! （TASK-19・`AISNAP-6`/`AISNAP-7`）から呼ばれる。`ai` は `cdp` に依存しない。
@@ -15,6 +16,8 @@
 //! - 次の要素はサブツリーごと省略し、子孫の繰り上げはしない（DOM の親子関係と
 //!   ネストを一致させるため）: `head`・`script`・`style`・`noscript`・`template`・
 //!   `hidden` 属性または `aria-hidden="true"` の要素・`input[type=hidden]`。
+//! - データ葉（表セル・価格クラス要素。`AISNAP-3`・TASK-13.3・Issue #88）は
+//!   `Node::data_leaf` へ印を付けるだけで、role・ref・剪定・打ち切りには使わない。
 //! - generic の折り畳み・`none`/`presentation` の除去・空ノードの剪定は行わない
 //!   （トークン削減は後続タスク。`AISNAP-1`・`AISNAP-2`）。
 //! - ルート以外の全要素に ref を振る（対話可能な要素への絞り込みは後続タスク）。
@@ -25,6 +28,8 @@
 use std::fmt;
 
 use fandhe_browser_core::dom::{Children, Document, NodeId};
+
+use crate::data_leaf::classify_data_leaf;
 
 use super::element_ref::{ElementRef, ElementSignature, RefAllocator, RefError};
 use super::name::{
@@ -173,9 +178,10 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
             sig = sig.with_scope(scope);
         }
         let elem_ref = refs.allocate_signature(&sig)?;
-        let node = Node::new(role, name)
+        let mut node = Node::new(role, name)
             .with_ref(elem_ref.to_ref_string())
             .with_state(compute_state(doc, child));
+        node.data_leaf = classify_data_leaf(doc, child);
         stack.push(Frame {
             node,
             children: doc.children(child),
@@ -188,6 +194,7 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
 #[cfg(test)]
 mod tests {
     use super::{MAX_TREE_DEPTH, build_snapshot};
+    use crate::data_leaf::DataLeafKind;
     use crate::snapshot::{CheckedState, Node, Snapshot};
     use fandhe_browser_core::parse::{ParseOptions, parse_document};
 
@@ -302,6 +309,56 @@ mod tests {
         let s = snap("<body><button>送信</button></body>");
         assert_eq!(s.tree.name, "");
         assert_eq!(child(child(child(&s.tree, 0), 0), 0).name, "送信");
+    }
+
+    /// AISNAP-3: 表セル・価格クラス要素にだけ data_leaf が付く（TASK-13.3・Issue #88）。
+    #[test]
+    fn aisnap_3_build_snapshot_reflects_data_leaf() {
+        let s = snap(
+            "<body><table><tr><th>名前</th><td>80</td><td><a href=\"/x\">詳細</a></td></tr></table>\
+             <div class=\"price\"><span class=\"price\">1</span></div><span>plain</span></body>",
+        );
+        assert_eq!(s.tree.data_leaf, None);
+        let kinds: Vec<(&str, &str, Option<DataLeafKind>)> = all_nodes(&s.tree)
+            .into_iter()
+            .map(|n| (n.role.as_str(), n.name.as_str(), n.data_leaf))
+            .collect();
+        let tc = Some(DataLeafKind::TableCell);
+        assert!(kinds.contains(&("columnheader", "名前", tc)), "{kinds:?}");
+        assert!(kinds.contains(&("cell", "80", tc)), "{kinds:?}");
+        assert!(kinds.contains(&("cell", "詳細", tc)), "{kinds:?}");
+        assert!(kinds.contains(&("link", "詳細", None)), "{kinds:?}");
+        assert!(
+            kinds.contains(&("generic", "", Some(DataLeafKind::PriceClass))),
+            "{kinds:?}"
+        );
+        assert!(kinds.contains(&("generic", "", None)), "{kinds:?}");
+        let price_leaves = kinds
+            .iter()
+            .filter(|k| k.2 == Some(DataLeafKind::PriceClass))
+            .count();
+        assert_eq!(price_leaves, 1);
+        // 外側の price div は子要素を持つのでデータ葉ではない。
+        let outer = all_nodes(&s.tree)
+            .into_iter()
+            .find(|n| {
+                n.role == "generic"
+                    && n.children.len() == 1
+                    && n.children.iter().all(|c| c.data_leaf.is_some())
+            })
+            .expect("外側の div がある");
+        assert_eq!(outer.data_leaf, None);
+    }
+
+    /// AISNAP-3/AISNAP-10: data_leaf の付与は ref を変えない（TASK-13.3・Issue #88）。
+    #[test]
+    fn aisnap_3_data_leaf_does_not_change_refs() {
+        let with_class = snap("<body><span class=\"price\">1</span></body>");
+        let without = snap("<body><span class=\"plain\">1</span></body>");
+        let span = |s: &Snapshot| child(child(child(&s.tree, 0), 0), 0).clone();
+        assert_eq!(span(&with_class).r#ref, span(&without).r#ref);
+        assert_eq!(span(&with_class).data_leaf, Some(DataLeafKind::PriceClass));
+        assert_eq!(span(&without).data_leaf, None);
     }
 
     fn is_ref_shape(r: &str) -> bool {
