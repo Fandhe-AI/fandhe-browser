@@ -45,11 +45,21 @@ use crate::render::{DisabledRenderer, Renderer};
 /// 文字コード判定（`CORE-5`・本モジュールの範囲外）を終えた文字列を渡す。
 /// 将来のフィールド追加（ステータスコード等。`REPAIR-4`）に備え `#[non_exhaustive]`
 /// とし、フィールドは非公開とする。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct NavigationResult {
     url: String,
     html: String,
+}
+
+impl fmt::Debug for NavigationResult {
+    /// ページ HTML をログへ漏らさないよう、HTML は長さだけを出力する（`AppState` の方針と揃える）。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NavigationResult")
+            .field("url", &self.url)
+            .field("html_len", &self.html.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl NavigationResult {
@@ -125,10 +135,25 @@ impl std::error::Error for StateError {}
 /// [`AppState`] が内包する。`Profile::open` が使えない OS でも単体で生成・テストできるよう
 /// 別型に切り出している。cdp の `Page.navigate` ハンドラが [`Self::begin_navigation`] →
 /// 取得 → [`Self::commit_navigation`] の順で呼び、ai は [`Self::latest`] で読む想定。
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct NavigationState {
     latest: Mutex<Option<Arc<NavigationResult>>>,
     generation: AtomicU64,
+}
+
+impl fmt::Debug for NavigationState {
+    /// 直近結果の HTML を出さないため、世代と結果の有無だけを出力する。
+    /// ロック競合・poison 時に待たないよう `try_lock` で判定する。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let has_result = match self.latest.try_lock() {
+            Ok(g) => Some(g.is_some()),
+            Err(_) => None,
+        };
+        f.debug_struct("NavigationState")
+            .field("generation", &self.generation.load(Ordering::SeqCst))
+            .field("has_result", &has_result)
+            .finish_non_exhaustive()
+    }
 }
 
 impl NavigationState {
@@ -272,6 +297,20 @@ mod tests {
     use super::*;
 
     fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn aisnap6_debug_output_hides_html() {
+        let r = NavigationResult::new("https://example.com/", "<p>secret-body</p>");
+        let d = format!("{r:?}");
+        assert!(d.contains("html_len: 18"), "{d}");
+        assert!(!d.contains("secret-body"), "{d}");
+        let s = NavigationState::new();
+        let g = s.begin_navigation().unwrap();
+        s.commit_navigation(g, r).unwrap();
+        let d = format!("{s:?}");
+        assert!(d.contains("has_result: Some(true)"), "{d}");
+        assert!(!d.contains("secret-body"), "{d}");
+    }
 
     #[test]
     fn aisnap6_navigation_state_starts_empty() {
