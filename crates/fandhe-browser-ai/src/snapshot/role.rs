@@ -157,6 +157,8 @@ const KNOWN_ROLES: &[&str] = &[
 /// deprecated を含めて偽陽性側に倒しても、暗黙 role が残るだけで安全。
 const GLOBAL_ARIA_ATTRIBUTES: &[&str] = &[
     "aria-atomic",
+    "aria-braillelabel",
+    "aria-brailleroledescription",
     "aria-busy",
     "aria-controls",
     "aria-current",
@@ -633,6 +635,19 @@ mod tests {
             "div",
             "presentation",
             RoleSource::Explicit,
+        );
+        // ARIA 1.2 の点字系グローバル属性も競合解決の対象になる
+        check(
+            r#"<div role="presentation" aria-braillelabel="x">x</div>"#,
+            "div",
+            "generic",
+            RoleSource::Fallback,
+        );
+        check(
+            r#"<div role="none" aria-brailleroledescription="x">x</div>"#,
+            "div",
+            "generic",
+            RoleSource::Fallback,
         );
     }
 
