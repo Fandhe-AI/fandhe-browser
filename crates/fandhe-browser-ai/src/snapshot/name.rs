@@ -77,6 +77,7 @@
 //! ラベル付け可能な要素が対象と同じ場合）で判定する。詳細は
 //! [`label_name`] を参照。
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use fandhe_browser_core::dom::{Document, NodeData, NodeId};
@@ -90,6 +91,21 @@ use super::state::is_html_element_named;
 /// 外部入力（HTML の属性値・テキスト）から無制限に文字列を組み立てない
 /// ための上限（security.md「不安全な設計」対策）。
 const MAX_NAME_CHARS: usize = 120;
+
+/// 1 断片（label・`aria-labelledby` の参照先）から折り畳み後に集めるテキストの
+/// 文字数上限。マルチバイト文字・複数断片分の余裕を見込み [`MAX_NAME_CHARS`] の
+/// 数倍を確保する。これを超える分は集めない（[`MAX_NAME_CHARS`] < 本値のため、
+/// 超過した断片は [`NameBuffer`] 側で必ず `truncated` になり、切り詰めは
+/// 結果へ伝わる）。
+const NORMALIZED_LABEL_TEXT_CHAR_LIMIT: usize = MAX_NAME_CHARS * 4;
+
+/// [`NameIndex`] が 1 文書につき許す、キャッシュ不能な `aria-labelledby` 参照先
+/// 部分木の走査回数の上限（`AISNAP-1`・TASK-11.4.1）。参照先が対象要素自身を
+/// 含む場合、テキストが対象ごとに変わるためキャッシュできない。多数の対象が
+/// 同じ大きな部分木に含まれ、かつそれを参照する構成で文書全体の走査量が二乗に
+/// なるのを防ぐ（security.md「不安全な設計」対策）。超過時は該当参照先を
+/// 寄与なしとして扱い `truncated` を立てる。
+const MAX_UNCACHED_REFERENT_SCANS: usize = 256;
 
 /// 1 つのコントロールに関連付ける `<label>` の数の上限（`AISNAP-1`）。
 ///
@@ -494,10 +510,6 @@ fn normalized_input_type(doc: &Document, id: NodeId) -> String {
 /// 子孫テキストの再帰的な名前算出への拡張は TASK-11.4.3（#546）が担う。
 fn collect_label_text(doc: &Document, label: NodeId, exclude: NodeId, out: &mut String) {
     const SKIPPED_SUBTREES: [&str; 4] = ["script", "style", "noscript", "template"];
-    // 折り畳み後の文字数の上限（マルチバイト文字・複数 label 分の余裕を
-    // 見込み `MAX_NAME_CHARS` の数倍を確保する）。
-    const NORMALIZED_LABEL_TEXT_CHAR_LIMIT: usize = MAX_NAME_CHARS * 4;
-
     debug_assert!(out.is_empty(), "collect_label_text は空の out を前提とする");
 
     let mut stack: Vec<NodeId> = doc.children(label).rev().collect();
@@ -630,6 +642,13 @@ pub struct NameIndex<'doc> {
     /// `id` 属性値 → 文書順で最初に一致した要素（空の値は登録しない。
     /// 大文字小文字を区別して照合する）。`aria-labelledby` の IDREF 解決用。
     ids: HashMap<&'doc str, NodeId>,
+    /// `aria-labelledby` の参照先 → 折り畳み済みテキストのキャッシュ。
+    /// 対象要素を含まない参照先だけを登録する（部分木の走査を参照先ごとに
+    /// 文書につき 1 回へ抑える。各値は [`NORMALIZED_LABEL_TEXT_CHAR_LIMIT`]
+    /// 文字以内）。
+    referent_cache: RefCell<HashMap<NodeId, String>>,
+    /// キャッシュ不能な参照先走査の残り回数（[`MAX_UNCACHED_REFERENT_SCANS`]）。
+    uncached_scans_left: Cell<usize>,
 }
 
 impl<'doc> NameIndex<'doc> {
@@ -762,6 +781,8 @@ impl<'doc> NameIndex<'doc> {
             doc,
             labels_by_target,
             ids: ids_by_value,
+            referent_cache: RefCell::new(HashMap::new()),
+            uncached_scans_left: Cell::new(MAX_UNCACHED_REFERENT_SCANS),
         }
     }
 }
@@ -871,8 +892,8 @@ fn aria_label_name(doc: &Document, id: NodeId) -> Option<AccessibleName> {
     attr_name(doc, id, "aria-label", NameSource::AriaLabel)
 }
 
-/// `aria-labelledby` の参照先 `referent` から名前の断片テキストを集めて
-/// `out`（空文字列）へ追記する（`AISNAP-1`・TASK-11.4.1）。
+/// `aria-labelledby` の参照先 `referent` の名前の断片テキストを返す
+/// （`AISNAP-1`・TASK-11.4.1）。
 ///
 /// 優先順: 参照先自身の `aria-label`（空白以外を含む場合。accname 2C）→
 /// 参照先が `img` の場合その `alt`（参照先自身は子孫走査の対象外で `alt` が
@@ -880,20 +901,91 @@ fn aria_label_name(doc: &Document, id: NodeId) -> Option<AccessibleName> {
 /// `aria-labelledby` は辿らない（連鎖・循環を構造的に避ける）。`target`
 /// （名前を算出している要素）の部分木は子孫走査から除外する（参照先が
 /// 対象を含む場合に対象の値・内容を取り込まないため）。
-fn referent_text(doc: &Document, referent: NodeId, target: NodeId, out: &mut String) {
+///
+/// 属性値も含め、折り畳み後 [`NORMALIZED_LABEL_TEXT_CHAR_LIMIT`] 文字までしか
+/// `String` へ取り込まない（属性長に比例したメモリ確保を避ける）。
+///
+/// 対象を含まない参照先は結果を [`NameIndex`] にキャッシュし、同じ参照先を
+/// 多数の対象が参照しても部分木走査は 1 回で済ませる。対象を含む参照先は
+/// キャッシュできないため [`MAX_UNCACHED_REFERENT_SCANS`] で総回数を頭打ちにし、
+/// 使い切った後は `None`（呼び出し元は寄与なし＋`truncated` として扱う）。
+fn referent_text(
+    doc: &Document,
+    index: &NameIndex,
+    referent: NodeId,
+    target: NodeId,
+) -> Option<String> {
+    if let Some(cached) = index.referent_cache.borrow().get(&referent) {
+        return Some(cached.clone());
+    }
+
+    let contains_target = is_ancestor_or_self(doc, referent, target);
+    if contains_target {
+        let left = index.uncached_scans_left.get();
+        if left == 0 {
+            return None;
+        }
+        index.uncached_scans_left.set(left - 1);
+    }
+
+    let mut out = String::new();
+    scan_referent(doc, referent, target, &mut out);
+    if !contains_target {
+        index
+            .referent_cache
+            .borrow_mut()
+            .insert(referent, out.clone());
+    }
+    Some(out)
+}
+
+/// [`referent_text`] の走査本体（キャッシュ・予算を含まない）。
+fn scan_referent(doc: &Document, referent: NodeId, target: NodeId, out: &mut String) {
     if let Some(label) = doc.attribute(referent, "aria-label")
         && has_non_whitespace(label)
     {
-        out.push_str(label);
+        fold_attr_bounded(label, out);
         return;
     }
     if is_html_element_named(doc, referent, "img")
         && let Some(alt) = doc.attribute(referent, "alt")
     {
-        out.push_str(alt);
+        fold_attr_bounded(alt, out);
         return;
     }
     collect_label_text(doc, referent, target, out);
+}
+
+/// 属性値 `value` を空白折り畳みしながら、折り畳み後
+/// [`NORMALIZED_LABEL_TEXT_CHAR_LIMIT`] 文字までを `out`（空）へ取り込む。
+fn fold_attr_bounded(value: &str, out: &mut String) {
+    let mut normalized_chars = 0usize;
+    let mut pending_space = false;
+    fold_chars_into(
+        value.chars(),
+        out,
+        &mut normalized_chars,
+        &mut pending_space,
+        NORMALIZED_LABEL_TEXT_CHAR_LIMIT,
+    );
+}
+
+/// `ancestor` が `node` 自身またはその祖先かどうかを返す。親リンクを
+/// [`Document::node_count`] 回まで辿って必ず停止する。
+fn is_ancestor_or_self(doc: &Document, ancestor: NodeId, node: NodeId) -> bool {
+    let mut current = Some(node);
+    let mut remaining = doc.node_count();
+    while let Some(id) = current {
+        if id == ancestor {
+            return true;
+        }
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
+        current = doc.parent(id);
+    }
+    false
 }
 
 /// `aria-labelledby` から accessible name を算出する（accname 1.2 step 2B。
@@ -934,8 +1026,15 @@ fn aria_labelledby_name(
         let Some(&referent) = index.ids.get(token) else {
             continue;
         };
-        let mut text = String::new();
-        referent_text(doc, referent, target, &mut text);
+        let Some(text) = referent_text(doc, index, referent, target) else {
+            // 走査予算を使い切った参照先は内容を確定できないため、寄与なしと
+            // して扱い切り詰めを伝える（`MAX_UNCACHED_REFERENT_SCANS`）。
+            truncated = true;
+            if matched == 0 {
+                scan_cut_before_match = true;
+            }
+            continue;
+        };
         if !has_non_whitespace(&text) {
             continue;
         }
@@ -1136,7 +1235,8 @@ pub fn compute_name_with_index(doc: &Document, index: &NameIndex, id: NodeId) ->
 mod tests {
     use super::{
         AccessibleName, MAX_IDREFS, MAX_IDREFS_SCANNED, MAX_LABELS, MAX_LABELS_SCANNED,
-        MAX_NAME_CHARS, NameSource, compute_name,
+        MAX_NAME_CHARS, MAX_UNCACHED_REFERENT_SCANS, NameIndex, NameSource, compute_name,
+        compute_name_with_index,
     };
     use fandhe_browser_core::dom::{Document, NodeId};
     use fandhe_browser_core::parse::{ParseOptions, parse_document};
@@ -2432,5 +2532,75 @@ mod tests {
             "input",
         );
         assert_eq!(result, AccessibleName::default());
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 参照先の巨大な `aria-label` は折り畳み後の上限で取り込みを止め、名前は `MAX_NAME_CHARS` で切り詰められ `truncated: true` になる。
+    #[test]
+    fn aisnap_1_aria_labelledby_huge_referent_aria_label_bounded() {
+        let huge = "あ".repeat(100_000);
+        let html =
+            format!(r#"<div id="r" aria-label="{huge}"></div><p id="t" aria-labelledby="r">x</p>"#);
+        let result = name(&html, "p#t");
+        assert_eq!(
+            result,
+            named(
+                &"あ".repeat(MAX_NAME_CHARS),
+                NameSource::AriaLabelledBy,
+                true
+            )
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 対象を含まない同一参照先を多数の対象が参照しても、共有索引で同じ結果を返す（参照先テキストはキャッシュされる）。
+    #[test]
+    fn aisnap_1_aria_labelledby_shared_referent_cached() {
+        let mut html = String::from(r#"<div id="big">共有<b>見出し</b></div>"#);
+        for _ in 0..2000 {
+            html.push_str(r#"<p aria-labelledby="big">x</p>"#);
+        }
+        let parsed = parse_document(&html, &ParseOptions::default()).expect("成功する");
+        let doc = parsed.document;
+        let targets = fandhe_browser_core::query::query_selector_all_str(&doc, doc.root(), "p")
+            .expect("セレクタは解釈できる");
+        assert_eq!(targets.len(), 2000);
+        let index = NameIndex::build(&doc);
+        for id in targets {
+            assert_eq!(
+                compute_name_with_index(&doc, &index, id),
+                named("共有見出し", NameSource::AriaLabelledBy, false)
+            );
+        }
+        assert_eq!(index.referent_cache.borrow().len(), 1);
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 対象を含む参照先（キャッシュ不能）の走査は文書全体で `MAX_UNCACHED_REFERENT_SCANS` 回まで。超過後は空の名前 + `truncated: true`。
+    #[test]
+    fn aisnap_1_aria_labelledby_uncached_scan_budget() {
+        let mut html = String::from(r#"<div id="big">見出し"#);
+        for _ in 0..(MAX_UNCACHED_REFERENT_SCANS + 5) {
+            html.push_str(r#"<input aria-labelledby="big">"#);
+        }
+        html.push_str("</div>");
+        let parsed = parse_document(&html, &ParseOptions::default()).expect("成功する");
+        let doc = parsed.document;
+        let targets = fandhe_browser_core::query::query_selector_all_str(&doc, doc.root(), "input")
+            .expect("セレクタは解釈できる");
+        let index = NameIndex::build(&doc);
+        let names: Vec<AccessibleName> = targets
+            .iter()
+            .map(|&id| compute_name_with_index(&doc, &index, id))
+            .collect();
+        assert_eq!(
+            names.first(),
+            Some(&named("見出し", NameSource::AriaLabelledBy, false))
+        );
+        assert_eq!(
+            names.get(MAX_UNCACHED_REFERENT_SCANS - 1),
+            Some(&named("見出し", NameSource::AriaLabelledBy, false))
+        );
+        assert_eq!(
+            names.get(MAX_UNCACHED_REFERENT_SCANS),
+            Some(&named("", NameSource::None, true))
+        );
     }
 }
