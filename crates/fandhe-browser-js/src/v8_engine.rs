@@ -102,7 +102,7 @@ use super::worker_protocol::{self, NativeReturn};
 /// フレーム由来。#155）として扱い、無制限の長さの文字列で
 /// `v8::String::new` を呼ばないよう、確保前に上限を検査する
 /// （coding-rust.md「外部入力」節・OWASP A04）。
-const MAX_NATIVE_PROXY_NAME_BYTES: usize = 256;
+pub(crate) const MAX_NATIVE_PROXY_NAME_BYTES: usize = 256;
 
 /// 子プロセス側から親プロセスへ逆方向 RPC（`NativeCall`）を送り、
 /// [`NativeReturn`] が届くまで**同期的にブロックする**窓口（`JS-1`・
