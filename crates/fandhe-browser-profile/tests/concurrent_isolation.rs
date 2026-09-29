@@ -40,8 +40,8 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Barrier, RwLock};
 use std::thread;
 
 /// `PROF-3` が定める最低並行数（「5 並行以上で複数 Profile へ同時に書き込める
@@ -193,11 +193,19 @@ fn run_concurrent_writes(base: &Path, config: &HarnessConfig) -> Vec<WorkerOutco
 
     let barrier = Barrier::new(config.profiles);
     let profile_count = config.profiles;
+    // 書き込み（`set_len(0)` → `write_all`）と混線検査の読み取りを同期する
+    // RwLock。同期しないと、他ワーカーの書き込み途中（切り詰め後・書き込み
+    // 完了前）の内容を検査側が観測し、正常な書き込みを混線と誤検出する
+    // （#580 レビュー指摘）。検査自体は緩めず、書き込み区間だけを直列化する。
+    // 書き込み同士はロック区間が短く、プロファイル横断の混線検出という
+    // 本来の目的（PROF-3）は維持される。
+    let io_lock = RwLock::new(());
 
     thread::scope(|scope| {
         let handles: Vec<_> = (0..config.profiles)
             .map(|index| {
                 let barrier = &barrier;
+                let io_lock = &io_lock;
                 let writes_per_profile = config.writes_per_profile;
                 let root = base.join(format!("profile-{index}"));
                 scope.spawn(move || -> WorkerOutcome {
@@ -249,11 +257,18 @@ fn run_concurrent_writes(base: &Path, config: &HarnessConfig) -> Vec<WorkerOutco
                             continue;
                         };
                         let payload = format!("profile-{index}:write-{j:04}\n");
-                        match write_once(&profile, kind, payload.as_bytes()) {
+                        let write_result = {
+                            // 毒化（他ワーカーの panic）は無視して続行する。
+                            let _guard = io_lock.write().unwrap_or_else(|e| e.into_inner());
+                            write_once(&profile, kind, payload.as_bytes())
+                        };
+                        match write_result {
                             Ok(()) => {
                                 writes_succeeded += 1;
                                 // 書き込み直後に所有先・内容を検査し、後続の
                                 // 書き込みで上書きされても途中の混線を残す。
+                                // 読み取り中は他ワーカーの書き込みを止める。
+                                let _guard = io_lock.read().unwrap_or_else(|e| e.into_inner());
                                 intermediate_mixups.extend(check_after_write(
                                     base,
                                     index,
