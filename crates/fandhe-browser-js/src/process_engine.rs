@@ -1523,7 +1523,17 @@ impl V8ProcessEngine {
 
         loop {
             let recv_wait = deadline.saturating_duration_since(Instant::now());
-            match worker.frame_rx.recv_timeout(recv_wait) {
+            // codex レビュー指摘（P1）対応: `recv_timeout(Duration::ZERO)` は
+            // キューに残っているフレームを返せるため、期限後に届いていた
+            // `RESULT` を成功として返したり `NATIVE_CALL` の `NativeFn` を
+            // 新たに実行したりしてしまう。受信結果の種類を問わず、フレームを
+            // 処理する前に期限を判定し、期限切れなら子を破棄して `Timeout`
+            // を返す（`Timeout` 分岐と同じ扱い）。
+            let received = match worker.frame_rx.recv_timeout(recv_wait) {
+                Ok(_) if Instant::now() >= deadline => Err(mpsc::RecvTimeoutError::Timeout),
+                other => other,
+            };
+            match received {
                 Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::RESULT => {
                     let (outcome, keep) = match worker_protocol::decode_js_value(&payload) {
                         // codex レビュー指摘 #503 P1「decode_js_value が返す
