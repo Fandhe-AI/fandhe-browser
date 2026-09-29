@@ -539,7 +539,7 @@ struct ContentScan {
 }
 
 /// `script`・`style`・`noscript`・`template` は名前の計算に寄与しない。
-pub(super) const SKIPPED_SUBTREES: [&str; 4] = ["script", "style", "noscript", "template"];
+pub(crate) const SKIPPED_SUBTREES: [&str; 4] = ["script", "style", "noscript", "template"];
 
 /// 要素が `hidden` 属性を持つか、`aria-hidden` が（HTML 空白の trim・ASCII
 /// 大文字小文字無視で）`"true"` かを返す（accname 2A。CSS による非表示は

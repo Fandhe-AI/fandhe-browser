@@ -11,10 +11,10 @@
 //! （TASK-12.5・Issue #83）が table/list ごとに [`detect_regular_structure`] を
 //! 呼び、TASK-12.2（#80）・12.3（#81）・12.4（#82）が結果の
 //! [`RegularStructure::header_cells`]・[`RegularStructure::body_rows`] を再走査
-//! なしで使う想定である。ヘッダの個別 ref 付与は実装済み
-//! （[`assign_header_refs`]・`TASK-12.2`・Issue #80。統合前のため呼び出し元は
-//! 無い）。行の圧縮表現・`truncated_rows` 注記・統合は未実装（実装済みを装わない。
-//! REPAIR-3）。
+//! なしで使う想定である。データ行の圧縮 1 行表現は実装済み
+//! （[`compress_rows`]・TASK-12.3・Issue #81。統合前のため呼び出し元なし）。
+//! ヘッダの個別 ref 付与も実装済み（[`assign_header_refs`]・TASK-12.2・Issue #80）。
+//! `truncated_rows` 注記・統合は未実装（実装済みを装わない。REPAIR-3）。
 //!
 //! # 判定規則（table）
 //!
@@ -37,11 +37,11 @@
 //! 閉じるため複製している）。
 
 use crate::snapshot::element_ref::ElementSignature;
-use crate::snapshot::name::is_hidden_element;
+use crate::snapshot::name::{SKIPPED_SUBTREES, is_hidden_element};
 use crate::snapshot::{
     ElementRef, NameIndex, RefAllocator, RefError, compute_name_with_index, compute_role,
 };
-use fandhe_browser_core::dom::{Document, NodeId};
+use fandhe_browser_core::dom::{Document, NodeData, NodeId};
 
 /// HTML 名前空間の URI。`core` 側の定義が `pub(crate)` のためローカルに持つ。
 const HTML_NAMESPACE_URI: &str = "http://www.w3.org/1999/xhtml";
@@ -403,6 +403,185 @@ pub fn detect_regular_structure(doc: &Document, id: NodeId) -> TableDetection {
     }
 }
 
+// ---- データ行の圧縮 1 行表現（TASK-12.3・Issue #81） ----
+
+/// 圧縮表現に含めるデータ行の上限（`AISNAP-2` の「先頭 20 行」・PoC-4 の
+/// `MAX_TABLE_ROWS`）。
+pub const MAX_TABLE_ROWS: usize = 20;
+
+/// 1 セルあたりの文字数上限（`char` 単位。PoC-4 の `slice(0, 40)`）。
+/// 超えた場合は末尾に `…` を付ける。
+pub const MAX_CELL_TEXT_CHARS: usize = 40;
+
+/// セルの区切り（spec の想定スキーマ `"セル1 | セル2"`）。
+const CELL_SEPARATOR: &str = " | ";
+
+/// 1 セルの走査で訪問するノード数の上限（巨大・敵対的なセルでの CPU 消費対策）。
+const MAX_CELL_SCAN_STEPS: usize = 1024;
+
+/// 1 セルの走査で読む文字数（空白を含む）の上限。空白のみの巨大な単一テキスト
+/// ノードはノード数・出力文字数の上限のどちらにも達しないため別枠で打ち切る。
+const MAX_CELL_SCAN_CHARS: usize = 4096;
+
+/// 圧縮した 1 データ行（`AISNAP-2`・`TASK-12.3`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CompressedRow {
+    /// 元の `tr`/`li` 要素（行 ref 付与側が再走査なしで使えるよう保持する）。
+    pub row: NodeId,
+    /// セル文字列を `" | "` で連結した 1 行表現。
+    pub text: String,
+    /// いずれかのセルが上限（文字数・走査ステップ）で切り詰められたか。
+    pub truncated: bool,
+}
+
+/// [`compress_rows`] の結果。
+///
+/// `truncated_rows`（20 行を超えた件数）は TASK-12.4（Issue #82）がここへ
+/// フィールドを足す想定で、`#[non_exhaustive]` により非破壊で拡張できる。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct CompressedRows {
+    /// 先頭から最大 [`MAX_TABLE_ROWS`] 行（文書順）。
+    pub rows: Vec<CompressedRow>,
+}
+
+/// 規則的と判定済みの構造から、データ行を先頭 [`MAX_TABLE_ROWS`] 行まで
+/// 1 行 1 文字列へ圧縮する（`AISNAP-2`・`TASK-12.3`・Issue #81）。
+///
+/// 呼び出し文脈: 現時点では呼び出し元は無い。TASK-12.5（Issue #83）の
+/// `build_snapshot` 統合が、[`detect_regular_structure`] が `Regular` を返した
+/// 表・一覧に対して呼ぶ想定。
+///
+/// - Table は行 `tr` 直下の `td`/`th` を文書順に `" | "` で連結する。空セルは
+///   空文字列にして列位置を保つ。`colspan` 分の空セル埋めはしない（セル数基準）
+/// - List は `li` 自身を 1 セルとする
+/// - `hidden`/`aria-hidden="true"` の行、およびそれらを祖先（`tbody`・表自身を含む）に
+///   持つ行は除外し、20 行の予算も消費しない
+/// - セル文字列は `hidden`/`aria-hidden="true"` 配下と `script`/`style`/
+///   `noscript`/`template` を除き、HTML 空白と U+00A0 を 1 つの半角スペースへ
+///   畳んで trim し、[`MAX_CELL_TEXT_CHARS`] 文字で切る。走査は
+///   [`MAX_CELL_SCAN_STEPS`] ノード・[`MAX_CELL_SCAN_CHARS`] 文字で打ち切る。CSS による非表示はスタイル未評価
+///   のため対象外
+/// - ヘッダ行・`tfoot` 行は含めない（`footer_rows` の扱いは統合時に決める。保留）
+/// - 20 行を超えた件数はここでは返さない（TASK-12.4・Issue #82）
+/// - セル内に `" | "` が含まれると区切りが曖昧になる（エスケープの要否は
+///   出力形式が決まる統合時に判断する既知の制約）
+pub fn compress_rows(doc: &Document, structure: &RegularStructure) -> CompressedRows {
+    let mut rows = Vec::with_capacity(structure.body_rows.len().min(MAX_TABLE_ROWS));
+    // 非表示の行・祖先（`tbody`・表自身・その外側を含む）の行は除外してから
+    // 20 行の予算を数える（`build_snapshot` の非表示サブツリー除外に合わせる）。
+    let visible_rows = structure.body_rows.iter().copied().filter(|&row| {
+        !is_hidden_element(doc, row) && !doc.ancestors(row).any(|a| is_hidden_element(doc, a))
+    });
+    for row in visible_rows.take(MAX_TABLE_ROWS) {
+        let cells: Vec<NodeId> = match structure.kind {
+            StructureKind::Table => doc
+                .children(row)
+                .filter(|&c| is_html(doc, c, "td") || is_html(doc, c, "th"))
+                .take(MAX_COLUMNS)
+                .collect(),
+            // List と将来の種別は行要素自身を 1 セルとする。
+            _ => vec![row],
+        };
+        let mut text = String::new();
+        let mut truncated = false;
+        for (i, cell) in cells.into_iter().enumerate() {
+            if i > 0 {
+                text.push_str(CELL_SEPARATOR);
+            }
+            let (cell_text, cut) = cell_text(doc, cell);
+            text.push_str(&cell_text);
+            truncated |= cut;
+        }
+        rows.push(CompressedRow {
+            row,
+            text,
+            truncated,
+        });
+    }
+    CompressedRows { rows }
+}
+
+/// HTML の空白（ASCII 空白）または U+00A0 か。
+fn is_cell_space(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\x0C' | '\r' | ' ' | '\u{A0}')
+}
+
+/// セルの表示テキストを有界に取り出す（戻り値は（文字列, 切り詰めたか））。
+/// 明示スタックの DFS で再帰せず、`text_content` のような全文連結もしない。
+fn cell_text(doc: &Document, cell: NodeId) -> (String, bool) {
+    let mut out = String::new();
+    let mut count = 0usize;
+    let mut pending_space = false;
+    let mut truncated = false;
+    if doc.is_element(cell) && is_hidden_element(doc, cell) {
+        return (out, false);
+    }
+    let mut stack = vec![cell];
+    let mut steps = 0usize;
+    let mut scanned = 0usize;
+    'walk: while let Some(id) = stack.pop() {
+        steps += 1;
+        if steps > MAX_CELL_SCAN_STEPS {
+            truncated = true;
+            break;
+        }
+        match doc.node_data(id) {
+            Some(NodeData::Text { contents }) => {
+                for c in contents.chars() {
+                    scanned += 1;
+                    if scanned > MAX_CELL_SCAN_CHARS {
+                        truncated = true;
+                        break 'walk;
+                    }
+                    if is_cell_space(c) {
+                        pending_space = !out.is_empty();
+                        continue;
+                    }
+                    let needed = 1 + usize::from(pending_space);
+                    if count + needed > MAX_CELL_TEXT_CHARS {
+                        // 区切りの空白が境界に収まる場合は、空白まで残してから切り詰める
+                        // （境界 40 文字目を空白分も含めて使い切る）。
+                        if pending_space && count < MAX_CELL_TEXT_CHARS {
+                            out.push(' ');
+                        }
+                        out.push('…');
+                        truncated = true;
+                        break 'walk;
+                    }
+                    if pending_space {
+                        out.push(' ');
+                        pending_space = false;
+                    }
+                    out.push(c);
+                    count += needed;
+                }
+            }
+            Some(NodeData::Element { .. }) => {
+                if id != cell
+                    && (SKIPPED_SUBTREES.iter().any(|n| is_html(doc, id, n))
+                        || is_hidden_element(doc, id))
+                {
+                    continue;
+                }
+                // 訪問済み（steps）＋未訪問（stack）の総量を MAX_CELL_SCAN_STEPS 以内に
+                // 保つため、残り予算を超える子は積まずに打ち切る（未訪問ノードの累積による
+                // メモリ DoS 対策）。
+                let budget = MAX_CELL_SCAN_STEPS.saturating_sub(steps + stack.len());
+                let mut kids: Vec<NodeId> = doc.children(id).take(budget + 1).collect();
+                if kids.len() > budget {
+                    kids.truncate(budget);
+                    truncated = true;
+                }
+                stack.extend(kids.into_iter().rev());
+            }
+            _ => {}
+        }
+    }
+    (out, truncated)
+}
+
 // ---------------------------------------------------------------------------
 // ヘッダ行の個別 ref 付与（TASK-12.2・Issue #80）
 // ---------------------------------------------------------------------------
@@ -746,6 +925,201 @@ mod tests {
             detect_regular_structure(&doc, doc.root()),
             TableDetection::Irregular(IrregularReason::NotTableOrList)
         );
+    }
+
+    // ---- TASK-12.3（Issue #81）行圧縮 ----
+
+    fn rows_of(html: &str, sel: &str) -> CompressedRows {
+        let doc = parse(html);
+        let s = match detect_regular_structure(&doc, select(&doc, sel)) {
+            TableDetection::Regular(s) => s,
+            other => panic!("規則的を期待したが {other:?}"),
+        };
+        compress_rows(&doc, &s)
+    }
+
+    fn texts(r: &CompressedRows) -> Vec<&str> {
+        r.rows.iter().map(|x| x.text.as_str()).collect()
+    }
+
+    fn table_html(n: usize, thead: bool) -> String {
+        let mut h = String::from("<table>");
+        if thead {
+            h.push_str("<thead><tr><th>a<th>b</thead><tbody>");
+        }
+        for i in 1..=n {
+            h.push_str(&format!("<tr><td>r{i}a<td>r{i}b"));
+        }
+        h.push_str("</table>");
+        h
+    }
+
+    /// AISNAP-2（TASK-12.3・Issue #81）: 21 行以上でも先頭 20 行のみ（受入基準）。
+    #[test]
+    fn aisnap_2_compress_rows_limits_to_20() {
+        let doc = parse(&table_html(21, true));
+        let s = match detect_regular_structure(&doc, select(&doc, "table")) {
+            TableDetection::Regular(s) => s,
+            other => panic!("{other:?}"),
+        };
+        let r = compress_rows(&doc, &s);
+        assert_eq!(r.rows.len(), 20);
+        assert_eq!(r.rows[0].text, "r1a | r1b");
+        assert_eq!(r.rows[19].text, "r20a | r20b");
+        assert_eq!(r.rows[5].row, s.body_rows[5]);
+    }
+
+    /// AISNAP-2（TASK-12.3）: thead なし 100 行・境界（20 行・3 行・ヘッダのみ）。
+    #[test]
+    fn aisnap_2_compress_rows_boundaries() {
+        let r = rows_of(&table_html(100, false), "table");
+        assert_eq!(r.rows.len(), 20);
+        assert_eq!(r.rows[19].text, "r20a | r20b");
+        assert_eq!(rows_of(&table_html(20, true), "table").rows.len(), 20);
+        let r3 = rows_of(&table_html(3, true), "table");
+        assert_eq!(texts(&r3), ["r1a | r1b", "r2a | r2b", "r3a | r3b"]);
+        let h = rows_of("<table><tr><th>a<th>b</table>", "table");
+        assert!(h.rows.is_empty());
+    }
+
+    /// AISNAP-2（TASK-12.3）: ヘッダ行・tfoot 行は含めない。
+    #[test]
+    fn aisnap_2_compress_rows_excludes_header_and_footer() {
+        let r = rows_of(
+            "<table><thead><tr><th>H1<th>H2</thead><tbody><tr><td>x<td>y</tbody>\
+             <tfoot><tr><td>F1<td>F2</tfoot></table>",
+            "table",
+        );
+        assert_eq!(texts(&r), ["x | y"]);
+    }
+
+    /// AISNAP-2（TASK-12.3）: ul/ol は li 1 つが 1 行。
+    #[test]
+    fn aisnap_2_compress_rows_list() {
+        let mut ul = String::from("<ul>");
+        for i in 1..=25 {
+            ul.push_str(&format!("<li>item{i}"));
+        }
+        ul.push_str("</ul>");
+        let r = rows_of(&ul, "ul");
+        assert_eq!(r.rows.len(), 20);
+        assert_eq!(r.rows[0].text, "item1");
+        assert_eq!(r.rows[19].text, "item20");
+        let ol = rows_of("<ol><li>a<li>b</ol>", "ol");
+        assert_eq!(texts(&ol), ["a", "b"]);
+    }
+
+    /// AISNAP-2（TASK-12.3）: 空白の畳み込み・空セル・colspan 行。
+    #[test]
+    fn aisnap_2_compress_rows_whitespace_and_empty_cells() {
+        let r = rows_of(
+            "<table><tr><td>  foo <b>bar</b>\n baz </td><td>&nbsp;</td></tr></table>",
+            "table",
+        );
+        assert_eq!(texts(&r), ["foo bar baz | "]);
+        let e = rows_of("<table><tr><td>a<td><td>c</tr></table>", "table");
+        assert_eq!(texts(&e), ["a |  | c"]);
+        let c = rows_of(
+            "<table><tr><td colspan=2>x<td>sub</tr><tr><td>p<td>q<td>r</table>",
+            "table",
+        );
+        // 列数は colspan 込みで 3 のため規則的。セル数基準で 2 セルになる。
+        assert_eq!(texts(&c), ["x | sub", "p | q | r"]);
+    }
+
+    /// AISNAP-2（TASK-12.3）: セル文字列の 40 文字切り詰め（多バイト含む）。
+    #[test]
+    fn aisnap_2_compress_rows_truncates_cell() {
+        let long = "a".repeat(41);
+        let exact = "b".repeat(40);
+        let ja = "あ".repeat(45);
+        let r = rows_of(
+            &format!("<table><tr><td>{long}<tr><td>{exact}<tr><td>{ja}</table>"),
+            "table",
+        );
+        assert_eq!(r.rows[0].text, format!("{}…", "a".repeat(40)));
+        assert!(r.rows[0].truncated);
+        assert_eq!(r.rows[1].text, exact);
+        assert!(!r.rows[1].truncated);
+        assert_eq!(r.rows[2].text, format!("{}…", "あ".repeat(40)));
+        assert!(r.rows[2].truncated);
+    }
+
+    /// AISNAP-2（TASK-12.3）: 境界直前の空白は 40 文字目として残してから切り詰める。
+    #[test]
+    fn aisnap_2_compress_rows_keeps_space_at_boundary() {
+        let cell = format!("{} b", "a".repeat(39));
+        let r = rows_of(&format!("<table><tr><td>{cell}</table>"), "table");
+        assert_eq!(r.rows[0].text, format!("{} …", "a".repeat(39)));
+        assert!(r.rows[0].truncated);
+    }
+
+    /// AISNAP-2（TASK-12.3）: hidden・script 等の除外。
+    #[test]
+    fn aisnap_2_compress_rows_skips_hidden_and_script() {
+        let r = rows_of(
+            "<table><tr><td>a<script>x</script><span hidden>h</span>\
+             <span aria-hidden=true>z</span>b</td><td hidden>q</table>",
+            "table",
+        );
+        assert_eq!(texts(&r), ["ab | "]);
+    }
+
+    /// AISNAP-2（TASK-12.3）: 非表示の行・tbody・表は除外され、20 行の予算も消費しない。
+    #[test]
+    fn aisnap_2_compress_rows_skips_hidden_rows() {
+        let r = rows_of(
+            "<table><tr><td>a<tr hidden><td>h1<tr aria-hidden=true><td>h2\
+             <tbody hidden><tr><td>h3</tbody><tbody><tr><td>b</table>",
+            "table",
+        );
+        assert_eq!(texts(&r), ["a", "b"]);
+        let mut h = String::from("<table>");
+        for i in 0..25 {
+            h.push_str(&format!("<tr hidden><td>x{i}"));
+        }
+        for i in 0..21 {
+            h.push_str(&format!("<tr><td>v{i}"));
+        }
+        h.push_str("</table>");
+        let r = rows_of(&h, "table");
+        assert_eq!(r.rows.len(), 20);
+        assert_eq!(texts(&r)[0], "v0");
+        let r = rows_of("<table aria-hidden=true><tr><td>a</table>", "table");
+        assert!(r.rows.is_empty());
+    }
+
+    /// AISNAP-2（TASK-12.3）: 走査ステップ上限で打ち切り panic しない。
+    #[test]
+    fn aisnap_2_compress_rows_scan_step_limit() {
+        let spans = "<span></span>".repeat(2000);
+        let r = rows_of(&format!("<table><tr><td>{spans}tail</table>"), "table");
+        assert_eq!(r.rows[0].text, "");
+        assert!(r.rows[0].truncated);
+    }
+
+    /// AISNAP-2（TASK-12.3）: 各階層に大量の兄弟を持つ入れ子でも、未訪問ノードを含む
+    /// 総量が上限内に収まり打ち切られる（スタック無制限成長の回帰防止）。
+    #[test]
+    fn aisnap_2_compress_rows_scan_stack_bounded_wide_nesting() {
+        let mut h = String::from("<table><tr><td>");
+        for _ in 0..30 {
+            h.push_str("<div>");
+            h.push_str(&"<i></i>".repeat(500));
+        }
+        h.push_str("tail</table>");
+        let r = rows_of(&h, "table");
+        assert_eq!(r.rows[0].text, "");
+        assert!(r.rows[0].truncated);
+    }
+
+    /// AISNAP-2（TASK-12.3）: 空白のみの巨大テキストノードも文字数上限で打ち切る。
+    #[test]
+    fn aisnap_2_compress_rows_scan_char_limit_whitespace() {
+        let ws = " ".repeat(MAX_CELL_SCAN_CHARS * 4);
+        let r = rows_of(&format!("<table><tr><td>{ws}tail</table>"), "table");
+        assert_eq!(r.rows[0].text, "");
+        assert!(r.rows[0].truncated);
     }
 
     // ---- TASK-12.2（Issue #80）ヘッダ ref 付与 ----
