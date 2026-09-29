@@ -51,11 +51,6 @@ const MIN_CONCURRENCY: usize = 5;
 const PROFILE_COUNT: usize = 5;
 /// `PROF-3` が定める、1 プロファイルあたりの書き込み回数。
 const WRITES_PER_PROFILE: usize = 100;
-/// 他ワーカーの書き込み途中（`write_all` の最中）を混線と誤判定しないための
-/// 再読み込み回数と間隔。書き込みは通常マイクロ秒で完了するため、この窓の間に
-/// 有効な内容へ遷移しない内容だけを混線とみなす（PROF-3）。
-const SETTLE_ATTEMPTS: usize = 100;
-const SETTLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
 /// 全プロファイル・全 `DataKind` で共通のファイル名。どのワーカーも同じ
 /// 相対パス（`<kind のディレクトリ>/concurrent.dat`）へ書き込むため、52.2 で
 /// 他プロファイルのペイロードが混入していないかを検出できる。
@@ -412,63 +407,66 @@ fn check_after_write(
                 ));
             }
         }
-        // 他プロファイルのファイルは空（作成直後）か、所有者が書き得る
-        // ペイロード形式に完全一致する内容のみ許容する。ただし所有者ワーカーが
-        // `write_all` の最中だと、途中まで書かれた内容（プレフィックス）や
-        // 旧内容との混在を読み得る（`write_all` は読み手に対して原子的で
-        // ない）。これは正常な並行実行の途中状態なので、少し待って読み直し、
-        // 有効な状態へ遷移するかを見る。待っても有効にならない内容
-        // （壊れた・所有者が書き得ない内容）だけを混線として指摘する。
-        if !marker_found && !bytes.is_empty() {
-            let mut settled = is_owner_payload(owner, kind, writes_per_profile, &text);
-            let mut last = bytes;
-            for _ in 0..SETTLE_ATTEMPTS {
-                if settled {
-                    break;
-                }
-                std::thread::sleep(SETTLE_INTERVAL);
-                match std::fs::read(&path) {
-                    Ok(again) => {
-                        let again_text = String::from_utf8_lossy(&again);
-                        settled = again.is_empty()
-                            || is_owner_payload(owner, kind, writes_per_profile, &again_text);
-                        last = again;
-                    }
-                    Err(_) => break,
-                }
-            }
-            if !settled {
-                found.push(format!(
-                    "profile-{owner} {kind:?}: content is not a valid payload of profile-{owner} ({:?})",
-                    String::from_utf8_lossy(&last)
-                ));
-            }
+        // 他プロファイルのファイルは、所有者の書き込み計画から説明できる内容
+        // だけを許容する（`is_owner_payload_or_in_flight`）。待って読み直す
+        // ことはしない: 読み直しで正常化すると、後続の書き込みで上書きされる
+        // 途中の混線を取り消してしまうため、1 回の観測で判定する。
+        if !marker_found && !is_owner_payload_or_in_flight(owner, kind, writes_per_profile, &bytes)
+        {
+            found.push(format!(
+                "profile-{owner} {kind:?}: content is not a valid payload of profile-{owner} ({text:?})"
+            ));
         }
     }
     found
 }
 
-/// `text` が `owner` のワーカーが `kind` へ実際に書き得るペイロード
-/// `profile-{owner}:write-{j:04}\n` と完全一致するか。`j` はハーネスの書き込み
-/// 計画（`j < writes_per_profile` かつ `DataKind::ALL[j % len] == kind`）に
-/// 限る。計画外の番号は他プロファイルからの混入とみなす。
-fn is_owner_payload(owner: usize, kind: DataKind, writes_per_profile: usize, text: &str) -> bool {
-    let Some(rest) = text.strip_prefix(&format!("profile-{owner}:write-")) else {
-        return false;
-    };
-    let Some(digits) = rest.strip_suffix('\n') else {
-        return false;
-    };
-    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
+/// `bytes` が、`owner` のワーカーが `kind` へ実際に書き得るペイロード
+/// `profile-{owner}:write-{j:04}\n` の書き込み計画（`j < writes_per_profile`
+/// かつ `DataKind::ALL[j % len] == kind`）から説明できる内容か。
+/// 許容するのは次のとおり。
+///
+/// - 空（ファイル作成直後）
+/// - 計画内ペイロードの完全一致
+/// - `write_in_place` の `write_all` が読み手に対して原子的でないために
+///   観測し得る途中状態: 計画内ペイロードの先頭 `k` バイトと、別（または同じ）
+///   計画内ペイロードの `k` バイト目以降の連結（作成直後は先頭 `k` バイトのみ）
+///
+/// 計画外の番号・別 kind の番号・壊れた内容・他プロファイルのペイロードは
+/// 許容しない（混線として指摘する）。
+fn is_owner_payload_or_in_flight(
+    owner: usize,
+    kind: DataKind,
+    writes_per_profile: usize,
+    bytes: &[u8],
+) -> bool {
+    if bytes.is_empty() {
+        return true;
     }
-    let Ok(j) = digits.parse::<usize>() else {
-        return false;
-    };
     let Some(kind_index) = DataKind::ALL.iter().position(|k| *k == kind) else {
         return false;
     };
-    j < writes_per_profile && j % DataKind::ALL.len() == kind_index
+    let plan: Vec<String> = (0..writes_per_profile)
+        .filter(|j| j % DataKind::ALL.len() == kind_index)
+        .map(|j| format!("profile-{owner}:write-{j:04}\n"))
+        .collect();
+    let Some(full_len) = plan.first().map(String::len) else {
+        return false;
+    };
+    if bytes.len() > full_len {
+        return false;
+    }
+    // 先頭 k バイトは計画内のいずれかの先頭と、残りは（あれば）計画内の
+    // いずれかの末尾と一致する。k == bytes.len() は作成直後の途中状態。
+    (0..=bytes.len()).any(|k| {
+        let (head, tail) = bytes.split_at(k);
+        let head_ok = plan.iter().any(|p| p.as_bytes().starts_with(head));
+        let tail_ok = tail.is_empty()
+            || plan
+                .iter()
+                .any(|q| q.len() == full_len && q.as_bytes().get(k..) == Some(tail));
+        head_ok && tail_ok
+    })
 }
 
 /// `thread::Result` の `Err` ペイロード（`Box<dyn Any + Send>`）から panic
@@ -1204,7 +1202,7 @@ fn prof_3_own_file_read_failure_is_reported() {
 }
 
 /// `PROF-3`・#185（陰性対照）: 他プロファイルのファイルに、他プロファイルの
-/// マーカーを含まない壊れた・途中までの内容があっても指摘されること。
+/// マーカーを含まない壊れた内容があっても指摘されること。
 /// 空・所有者の正規ペイロードは許容される。
 #[test]
 fn prof_3_corrupted_other_profile_content_is_detected() {
@@ -1229,11 +1227,12 @@ fn prof_3_corrupted_other_profile_content_is_detected() {
         Vec::<String>::new()
     );
 
-    // 待っても有効にならない途中内容・ゴミ・改行欠落は指摘になる。
+    // ゴミ・書き込み計画から説明できない内容は指摘になる。
     for corrupted in [
-        &b"profile-1:wri"[..],
-        b"garbage\n",
-        b"profile-1:write-0008",
+        &b"garbage\n"[..],
+        b"profile-1:wrote-0008\n",
+        b"profile-1:write-0008\n\n",
+        b"profile-1:write-0x08\n",
         // 書き込み計画外の番号（範囲外・別 kind の番号）も指摘になる。
         b"profile-1:write-9999\n",
         b"profile-1:write-0100\n",
@@ -1247,30 +1246,49 @@ fn prof_3_corrupted_other_profile_content_is_detected() {
     }
 }
 
-/// `PROF-3`・#185・#580 レビュー指摘: 他ワーカーの書き込み途中（プレフィックス）
-/// を観測しても、その後有効なペイロードへ遷移するなら混線と誤判定しないこと。
+/// `PROF-3`・#185・#580 レビュー指摘: `write_all` の途中状態（作成直後の
+/// プレフィックス、旧内容との混在）は 1 回の観測で正常と判定され、計画外の
+/// 内容は待たずに混線と判定されること（読み直しで異常を取り消さない）。
 #[test]
-fn prof_3_in_flight_partial_write_is_not_reported_as_mixup() {
-    let tmp = TempDir::new();
+fn prof_3_in_flight_states_are_accepted_and_foreign_states_are_rejected() {
     let kind = DataKind::ALL[0];
-    let mut profiles = Vec::new();
-    for i in 0..PROFILE_COUNT {
-        profiles.push(Profile::open(tmp.path().join(format!("profile-{i}"))).expect("open"));
+    // kind 0 の計画は write-0000, 0004, 0008, ...（`DataKind::ALL` の長さで巡回）。
+    for ok in [
+        &b""[..],
+        b"profile-1:wri",
+        b"profile-1:write-0004",
+        b"profile-1:write-0004\n",
+        b"profile-1:write-0096\n",
+        // 旧 0004 の上へ新 0008 を先頭 18 バイト書いた時点は旧内容と同じ、
+        // 先頭 19 バイトなら "…write-000" + 旧末尾 "4\n" となり 0004 と一致する。
+        b"profile-1:write-0000\n",
+    ] {
+        assert!(
+            is_owner_payload_or_in_flight(1, kind, WRITES_PER_PROFILE, ok),
+            "{:?}",
+            String::from_utf8_lossy(ok)
+        );
     }
-    let own = "profile-0:write-0000\n";
-    write_once(&profiles[0], kind, own.as_bytes()).expect("write");
-    write_once(&profiles[1], kind, b"profile-1:wri").expect("途中状態");
-
-    let target = tmp
-        .path()
-        .join("profile-1")
-        .join(kind.dir_name())
-        .join(TARGET_FILE_NAME);
-    let completer = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(target, b"profile-1:write-0008\n").expect("完了");
-    });
-    let found = check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT, WRITES_PER_PROFILE);
-    completer.join().expect("join");
-    assert_eq!(found, Vec::<String>::new());
+    // 桁ごとの混在: 新 0012 の先頭 19 バイト（"…write-001"）+ 旧 0008 の末尾
+    // 2 バイト（"8\n"）= 0018 は計画外（18 % 4 != 0）。だが途中状態としては
+    // 起こり得るため、計画内の 0016 と同様に 1 桁ずつの混在は許容する。
+    assert!(is_owner_payload_or_in_flight(
+        1,
+        kind,
+        WRITES_PER_PROFILE,
+        b"profile-1:write-0018\n"
+    ));
+    for ng in [
+        &b"profile-1:write-0001\n"[..],
+        b"profile-1:write-0100\n",
+        b"profile-2:write-0004\n",
+        b"profile-1:write-0004\nX",
+        b"garbage",
+    ] {
+        assert!(
+            !is_owner_payload_or_in_flight(1, kind, WRITES_PER_PROFILE, ng),
+            "{:?}",
+            String::from_utf8_lossy(ng)
+        );
+    }
 }
