@@ -109,13 +109,16 @@ fn parse_kib_line(line: &str) -> Option<(&str, u64)> {
         return None;
     }
     let value_part = rest.trim();
-    let digits = value_part
-        .strip_suffix("kB")
-        .map(str::trim)
-        .unwrap_or(value_part);
     // `kB` 以外の単位（`smaps_rollup` は通常 kB 固定だが、想定外の単位が
-    // 混ざっていたら数値として解釈できずに `None` へ落ちる）。
-    let value: u64 = digits.split_whitespace().next()?.parse().ok()?;
+    // 混ざっていたら `strip_suffix` が失敗し `None` へ落ちる。fail-closed
+    // のため、末尾に余分なトークンが残っている行（例: `"100 MB"`・
+    // `"100 kB extra"`）も同様に `None` にする）。
+    let digits = value_part.strip_suffix("kB")?.trim();
+    let mut tokens = digits.split_whitespace();
+    let value: u64 = tokens.next()?.parse().ok()?;
+    if tokens.next().is_some() {
+        return None;
+    }
     Some((key, value))
 }
 

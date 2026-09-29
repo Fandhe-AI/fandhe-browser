@@ -73,14 +73,31 @@ fn parse_smaps_rollup_empty_text_returns_none() {
     assert_eq!(parse_smaps_rollup(""), None);
 }
 
-/// `kB` 以外の単位や余分な空白が混じる行でも、`Rss`/`Pss` が解釈できれば
-/// 破綻しない（余分な空白は `trim`・`split_whitespace` で吸収される）。
+/// 余分な空白が混じる行でも、`Rss`/`Pss` が解釈できれば破綻しない
+/// （余分な空白は `trim`・`split_whitespace` で吸収される）。
 #[test]
 fn parse_smaps_rollup_extra_whitespace_still_parses() {
     let text = "  Rss:    100   kB  \nPss:50kB\n";
     let rollup = parse_smaps_rollup(text).expect("空白の揺れがあっても解釈できる");
     assert_eq!(rollup.rss_kib, 100);
     assert_eq!(rollup.pss_kib, 50);
+}
+
+/// `kB` 以外の単位（例: `MB`）が付いた行は fail-closed で `None` に
+/// 落ちる。`Rss` 行自体が解釈できないため `parse_smaps_rollup` 全体が
+/// `None` になる（想定外の単位を無条件で受理しない。REPAIR-3）。
+#[test]
+fn parse_smaps_rollup_non_kb_unit_returns_none() {
+    let text = "Rss: 100 MB\nPss: 50 kB\n";
+    assert_eq!(parse_smaps_rollup(text), None);
+}
+
+/// `kB` の後に余分なトークンが残る行（想定外の形式）は fail-closed で
+/// `None` に落ちる。
+#[test]
+fn parse_smaps_rollup_trailing_garbage_after_kb_returns_none() {
+    let text = "Rss: 100 kB extra\nPss: 50 kB\n";
+    assert_eq!(parse_smaps_rollup(text), None);
 }
 
 /// `summarize_kib`: 1..=5 で median 3。

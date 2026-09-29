@@ -582,12 +582,16 @@ mod linux_impl {
             let parent_pss_at_peak = summarize_kib(&self.parent_pss_at_peak_kib)
                 .ok_or_else(|| "no parentPssAtPeak samples were collected".to_string())?;
             let samples_per_eval = summarize_kib(&self.samples_per_eval)
-                .ok_or_else(|| "no samplesPerEval samples were collected".to_string())?;
+                .ok_or_else(|| "no samplesPerEvalCount samples were collected".to_string())?;
 
+            // `samplesPerEvalCount` はトップレベルの `"unit":"KiB"` とは
+            // 無関係（サンプリング回数というカウントであり、KiB 量ではない）。
+            // 誤読を防ぐため、KiB 量のフィールド（`childPeakRss` 等）と
+            // 区別できる名前にする。
             Ok(format!(
                 "{{\"childPeakRss\":{child_peak_rss},\"childPssAtPeak\":{child_pss_at_peak},\
                  \"parentRssAtPeak\":{parent_rss_at_peak},\"parentPssAtPeak\":{parent_pss_at_peak},\
-                 \"samplesPerEval\":{samples_per_eval}}}",
+                 \"samplesPerEvalCount\":{samples_per_eval}}}",
                 child_peak_rss = summary_json(&child_peak_rss),
                 child_pss_at_peak = summary_json(&child_pss_at_peak),
                 parent_rss_at_peak = summary_json(&parent_rss_at_peak),
