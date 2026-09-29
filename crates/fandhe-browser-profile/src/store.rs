@@ -11,8 +11,9 @@
 //!   [`ProfileStore::open_or_create`] が [`ProfileError::InvalidLayout`] で拒否する
 //! - ルート経路上の symlink の検証は [`Profile::open`] がハンドル基準で行う
 //!   （`PROF-1`・`PROF-4`）。macOS の `/var` のような OS 標準の symlink を含む
-//!   パスは、[`Profile::open`] の doc と同様に事前の `canonicalize` が必要
-//!   （[`OsDefaultStore`] は既存の祖先を実体パスへ解決してから返す）
+//!   パス（Linux の `/home` 等も含む）は、[`Profile::open`] の doc と同様に事前の
+//!   `canonicalize` が必要（[`OsDefaultStore`] は OS 標準の基点ディレクトリ
+//!   （`$HOME` 等）だけを実体パスへ解決し、アプリ用の固定サフィックスは解決しない）
 //!
 //! ## スタブについて（`code-comment-style.md`・REPAIR-3）
 //!
@@ -155,52 +156,33 @@ impl OsDefaultStore {
 
 impl ProfileStore for OsDefaultStore {
     fn resolve_root(&self) -> Result<ResolvedRoot, ProfileError> {
-        let path = platform_default_root(&|key| std::env::var_os(key))?;
+        let (base, tail) = platform_default_parts(&|key| std::env::var_os(key))?;
         Ok(ResolvedRoot::new(
-            canonicalize_base(&path),
+            canonicalize_base(&base).join(tail),
             RootSource::OsDefault,
         ))
     }
 }
 
-/// OS 標準のトップレベル symlink エイリアス（別名 → 実体）。macOS の `/var`・`/tmp`・
-/// `/etc` は OS が `/private/...` への symlink として提供する。他 OS は空（何も解決しない）。
-#[cfg(target_os = "macos")]
-const OS_STANDARD_ALIASES: &[(&str, &str)] = &[
-    ("/var", "/private/var"),
-    ("/tmp", "/private/tmp"),
-    ("/etc", "/private/etc"),
-];
-#[cfg(not(target_os = "macos"))]
-const OS_STANDARD_ALIASES: &[(&str, &str)] = &[];
-
-/// 基点先頭の OS 標準エイリアスだけを実体パスへ置き換える（`XOS-7`・`PROF-1`・`PROF-4`）。
-fn canonicalize_base(path: &Path) -> PathBuf {
-    let aliases: Vec<(&Path, &Path)> = OS_STANDARD_ALIASES
-        .iter()
-        .map(|(alias, real)| (Path::new(*alias), Path::new(*real)))
-        .collect();
-    canonicalize_base_with(path, &aliases)
-}
-
-/// `aliases`（別名, 実体）のうち、パス先頭が別名に一致し、かつ別名を実際に
-/// `canonicalize` した結果が宣言された実体と一致するものだけ置き換える。
+/// OS 標準の基点ディレクトリ（`$HOME`・`$XDG_DATA_HOME`・`%LOCALAPPDATA%`）を
+/// 実体パスへ解決する（`XOS-7`・`PROF-1`・`PROF-4`）。
 ///
-/// [`Profile::open`] は祖先の symlink を拒否する（`PROF-1`・`PROF-4`）。任意の祖先
-/// symlink を解決すると、環境変数で指した先へ拒否を迂回して書き込めてしまうため
-/// （プロファイル境界の迂回）、OS 標準エイリアス以外の symlink は解決せず
-/// [`Profile::open`] の拒否に委ねる（境界を検証できない symlink は fail-closed）。
-/// 別名が想定どおりの実体を指さない場合も置き換えない。
-fn canonicalize_base_with(path: &Path, aliases: &[(&Path, &Path)]) -> PathBuf {
-    for (alias, real) in aliases {
-        let Ok(rest) = path.strip_prefix(alias) else {
-            continue;
-        };
-        if alias.canonicalize().is_ok_and(|resolved| resolved == *real) {
-            return real.join(rest);
-        }
+/// [`Profile::open`] は祖先の symlink を拒否する（`PROF-1`・`PROF-4`）が、macOS の
+/// `/var` や Linux の `/home`、`$HOME` 自体が symlink の環境では、OS 標準の経路でも
+/// 祖先に symlink が含まれる。そこで信頼できる基点（環境変数で利用者自身が指定する
+/// ディレクトリ）だけを `canonicalize` する。基点に付けるアプリ用サフィックス
+/// （`.local/share/<app>` 等）は呼び出し側が解決後に連結するため解決されず、
+/// サフィックス内の symlink は従来どおり [`Profile::open`] が拒否する
+/// （プロファイル境界は弱めない）。基点が存在しない・解決できない場合と Unix 以外
+/// （Windows の `canonicalize` は verbatim パスを返し、かつ [`Profile::open`] が
+/// 未対応）では、そのまま返して [`Profile::open`] の検証に委ねる。
+fn canonicalize_base(base: &Path) -> PathBuf {
+    if cfg!(unix)
+        && let Ok(resolved) = base.canonicalize()
+    {
+        return resolved;
     }
-    path.to_path_buf()
+    base.to_path_buf()
 }
 
 /// 環境変数の値をベースディレクトリとして採用できるか検証する。
@@ -220,12 +202,17 @@ fn usable_base(value: Option<OsString>) -> Option<PathBuf> {
 
 /// XDG 系（macOS 以外の Unix）の既定ルート。`env` は環境変数の参照関数（テスト注入用）。
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
-fn resolve_xdg<F: Fn(&str) -> Option<OsString>>(env: &F) -> Result<PathBuf, ProfileError> {
+fn resolve_xdg<F: Fn(&str) -> Option<OsString>>(
+    env: &F,
+) -> Result<(PathBuf, PathBuf), ProfileError> {
     if let Some(data_home) = usable_base(env("XDG_DATA_HOME")) {
-        return Ok(data_home.join(APP_DIR_NAME));
+        return Ok((data_home, PathBuf::from(APP_DIR_NAME)));
     }
     match usable_base(env("HOME")) {
-        Some(home) => Ok(home.join(".local").join("share").join(APP_DIR_NAME)),
+        Some(home) => Ok((
+            home,
+            PathBuf::from(".local").join("share").join(APP_DIR_NAME),
+        )),
         None => Err(ProfileError::DefaultRootUnavailable {
             reason: "neither XDG_DATA_HOME nor HOME is set to an absolute path",
         }),
@@ -234,12 +221,16 @@ fn resolve_xdg<F: Fn(&str) -> Option<OsString>>(env: &F) -> Result<PathBuf, Prof
 
 /// macOS の既定ルート。XDG 系の変数は参照しない。
 #[cfg(any(target_os = "macos", test))]
-fn resolve_macos<F: Fn(&str) -> Option<OsString>>(env: &F) -> Result<PathBuf, ProfileError> {
+fn resolve_macos<F: Fn(&str) -> Option<OsString>>(
+    env: &F,
+) -> Result<(PathBuf, PathBuf), ProfileError> {
     match usable_base(env("HOME")) {
-        Some(home) => Ok(home
-            .join("Library")
-            .join("Application Support")
-            .join(APP_DIR_NAME)),
+        Some(home) => Ok((
+            home,
+            PathBuf::from("Library")
+                .join("Application Support")
+                .join(APP_DIR_NAME),
+        )),
         None => Err(ProfileError::DefaultRootUnavailable {
             reason: "HOME is not set to an absolute path",
         }),
@@ -248,44 +239,46 @@ fn resolve_macos<F: Fn(&str) -> Option<OsString>>(env: &F) -> Result<PathBuf, Pr
 
 /// Windows の既定ルート。`USERPROFILE` 等へはフォールバックしない。
 #[cfg(any(windows, test))]
-fn resolve_windows<F: Fn(&str) -> Option<OsString>>(env: &F) -> Result<PathBuf, ProfileError> {
+fn resolve_windows<F: Fn(&str) -> Option<OsString>>(
+    env: &F,
+) -> Result<(PathBuf, PathBuf), ProfileError> {
     match usable_base(env("LOCALAPPDATA")) {
-        Some(local) => Ok(local.join(APP_DIR_NAME)),
+        Some(local) => Ok((local, PathBuf::from(APP_DIR_NAME))),
         None => Err(ProfileError::DefaultRootUnavailable {
             reason: "LOCALAPPDATA is not set to an absolute path",
         }),
     }
 }
 
-/// 実行中の OS に対応する解決規則へ振り分ける。
+/// 実行中の OS に対応する解決規則へ振り分け、（基点, アプリ用サフィックス）を返す。
 #[cfg(target_os = "macos")]
-fn platform_default_root<F: Fn(&str) -> Option<OsString>>(
+fn platform_default_parts<F: Fn(&str) -> Option<OsString>>(
     env: &F,
-) -> Result<PathBuf, ProfileError> {
+) -> Result<(PathBuf, PathBuf), ProfileError> {
     resolve_macos(env)
 }
 
-/// 実行中の OS に対応する解決規則へ振り分ける。
+/// 実行中の OS に対応する解決規則へ振り分け、（基点, アプリ用サフィックス）を返す。
 #[cfg(all(unix, not(target_os = "macos")))]
-fn platform_default_root<F: Fn(&str) -> Option<OsString>>(
+fn platform_default_parts<F: Fn(&str) -> Option<OsString>>(
     env: &F,
-) -> Result<PathBuf, ProfileError> {
+) -> Result<(PathBuf, PathBuf), ProfileError> {
     resolve_xdg(env)
 }
 
-/// 実行中の OS に対応する解決規則へ振り分ける。
+/// 実行中の OS に対応する解決規則へ振り分け、（基点, アプリ用サフィックス）を返す。
 #[cfg(windows)]
-fn platform_default_root<F: Fn(&str) -> Option<OsString>>(
+fn platform_default_parts<F: Fn(&str) -> Option<OsString>>(
     env: &F,
-) -> Result<PathBuf, ProfileError> {
+) -> Result<(PathBuf, PathBuf), ProfileError> {
     resolve_windows(env)
 }
 
 /// 実行中の OS に対応する解決規則へ振り分ける（既定値の定義がない OS）。
 #[cfg(not(any(unix, windows)))]
-fn platform_default_root<F: Fn(&str) -> Option<OsString>>(
+fn platform_default_parts<F: Fn(&str) -> Option<OsString>>(
     _env: &F,
-) -> Result<PathBuf, ProfileError> {
+) -> Result<(PathBuf, PathBuf), ProfileError> {
     Err(ProfileError::DefaultRootUnavailable {
         reason: "no OS default profile location is defined for this platform",
     })
@@ -440,7 +433,12 @@ mod tests {
         p.as_os_str().to_os_string()
     }
 
-    fn unavailable(r: Result<PathBuf, ProfileError>) -> &'static str {
+    fn joined(r: Result<(PathBuf, PathBuf), ProfileError>) -> PathBuf {
+        let (base, tail) = r.unwrap();
+        base.join(tail)
+    }
+
+    fn unavailable(r: Result<(PathBuf, PathBuf), ProfileError>) -> &'static str {
         match r {
             Err(ProfileError::DefaultRootUnavailable { reason }) => reason,
             other => panic!("expected DefaultRootUnavailable, got {other:?}"),
@@ -452,7 +450,7 @@ mod tests {
     fn xos_7_xdg_uses_xdg_data_home() {
         let xdg = abs("xdg-data");
         let env = env_of(&[("XDG_DATA_HOME", os(&xdg)), ("HOME", os(&abs("home")))]);
-        assert_eq!(resolve_xdg(&env).unwrap(), xdg.join("fandhe-browser"));
+        assert_eq!(joined(resolve_xdg(&env)), xdg.join("fandhe-browser"));
     }
 
     /// XOS-7: XDG_DATA_HOME が空・相対・`..` 含みなら HOME の `.local/share` へ。
@@ -467,10 +465,10 @@ mod tests {
         ];
         for bad in bad_values {
             let env = env_of(&[("XDG_DATA_HOME", bad), ("HOME", os(&home))]);
-            assert_eq!(resolve_xdg(&env).unwrap(), expected);
+            assert_eq!(joined(resolve_xdg(&env)), expected);
         }
         let env = env_of(&[("HOME", os(&home))]);
-        assert_eq!(resolve_xdg(&env).unwrap(), expected);
+        assert_eq!(joined(resolve_xdg(&env)), expected);
     }
 
     /// XOS-7: XDG_DATA_HOME も HOME も使えなければ fail-closed。
@@ -493,7 +491,7 @@ mod tests {
         let home = abs("mac-home");
         let env = env_of(&[("HOME", os(&home)), ("XDG_DATA_HOME", os(&abs("ignored")))]);
         assert_eq!(
-            resolve_macos(&env).unwrap(),
+            joined(resolve_macos(&env)),
             home.join("Library")
                 .join("Application Support")
                 .join("fandhe-browser")
@@ -519,7 +517,7 @@ mod tests {
     fn xos_7_windows_uses_local_app_data() {
         let local = abs("local-app-data");
         let env = env_of(&[("LOCALAPPDATA", os(&local))]);
-        assert_eq!(resolve_windows(&env).unwrap(), local.join("fandhe-browser"));
+        assert_eq!(joined(resolve_windows(&env)), local.join("fandhe-browser"));
     }
 
     /// XOS-7: Windows で LOCALAPPDATA が未設定・空・相対ならエラー（HOME 等へ落とさない）。
@@ -544,7 +542,7 @@ mod tests {
         let xdg = abs("dispatch-xdg");
         let env = env_of(&[("XDG_DATA_HOME", os(&xdg))]);
         assert_eq!(
-            platform_default_root(&env).unwrap(),
+            joined(platform_default_parts(&env)),
             xdg.join("fandhe-browser")
         );
     }
@@ -556,7 +554,7 @@ mod tests {
         let home = abs("dispatch-home");
         let env = env_of(&[("HOME", os(&home))]);
         assert_eq!(
-            platform_default_root(&env).unwrap(),
+            joined(platform_default_parts(&env)),
             home.join("Library")
                 .join("Application Support")
                 .join("fandhe-browser")
@@ -570,7 +568,7 @@ mod tests {
         let local = abs("dispatch-local");
         let env = env_of(&[("LOCALAPPDATA", os(&local))]);
         assert_eq!(
-            platform_default_root(&env).unwrap(),
+            joined(platform_default_parts(&env)),
             local.join("fandhe-browser")
         );
     }
@@ -601,53 +599,62 @@ mod tests {
         );
     }
 
-    /// XOS-7・PROF-1: OS 標準エイリアスだけ実体へ解決し、任意の祖先 symlink は解決しない。
+    /// XOS-7・PROF-1: 基点が symlink 経由（Linux の `/home` 等）でも実体へ解決され開ける。
+    /// 基点が存在しなければそのまま返す。
     #[cfg(unix)]
     #[test]
-    fn xos_7_canonicalize_base_resolves_only_declared_aliases() {
+    fn xos_7_canonicalize_base_resolves_symlinked_base() {
         let tmp = TempDir::new();
         let real = tmp.0.join("real");
-        std::fs::create_dir_all(real.join("data")).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
         let link = tmp.0.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let other = tmp.0.join("other");
-        std::os::unix::fs::symlink(&real, &other).unwrap();
 
-        let aliases: Vec<(&Path, &Path)> = vec![(link.as_path(), real.as_path())];
-        // 宣言済みエイリアスは実体へ置き換わり、`Profile::open` が開ける。
-        let root = canonicalize_base_with(&link.join("data").join("fandhe-browser"), &aliases);
-        assert_eq!(root, real.join("data").join("fandhe-browser"));
+        let base = canonicalize_base(&link);
+        assert_eq!(base, real);
+        let root = base.join(".local").join("share").join("fandhe-browser");
         assert!(Profile::open(&root).is_ok());
-        // 宣言外の祖先 symlink はそのまま返り、`Profile::open` が拒否する。
-        let via_other = other.join("data").join("fandhe-browser");
-        let unresolved = canonicalize_base_with(&via_other, &aliases);
-        assert_eq!(unresolved, via_other);
-        assert!(matches!(
-            Profile::open(&unresolved),
-            Err(ProfileError::InvalidLayout { .. })
-        ));
-        // 宣言と実体が食い違うエイリアスは置き換えない。
-        let wrong = tmp.0.join("wrong");
-        let bad: Vec<(&Path, &Path)> = vec![(link.as_path(), wrong.as_path())];
-        let p = link.join("data").join("fandhe-browser");
-        assert_eq!(canonicalize_base_with(&p, &bad), p);
+
+        let missing = tmp.0.join("missing");
+        assert_eq!(canonicalize_base(&missing), missing);
     }
 
-    /// PROF-1: 末尾のアプリディレクトリが symlink なら解決せず、`Profile::open` が拒否する。
+    /// PROF-1: 基点配下のアプリ用サフィックスが symlink なら解決されず、
+    /// `Profile::open` が拒否する（基点だけを解決しサフィックスは検証に委ねる）。
     #[cfg(unix)]
     #[test]
-    fn prof_1_canonicalize_base_keeps_symlinked_leaf_rejected() {
+    fn prof_1_symlinked_suffix_stays_rejected() {
         let tmp = TempDir::new();
+        let base = tmp.0.join("home");
         let target = tmp.0.join("elsewhere");
+        std::fs::create_dir_all(&base).unwrap();
         std::fs::create_dir_all(&target).unwrap();
-        let leaf = tmp.0.join("fandhe-browser");
+        let leaf = base.join("fandhe-browser");
         std::os::unix::fs::symlink(&target, &leaf).unwrap();
 
-        let root = canonicalize_base(&leaf);
+        let root = canonicalize_base(&base).join("fandhe-browser");
         assert_eq!(root, leaf);
         assert!(matches!(
             Profile::open(&root),
             Err(ProfileError::InvalidLayout { .. })
         ));
+    }
+
+    /// XOS-7: `$XDG_DATA_HOME` 自体が symlink でも `OsDefaultStore` 相当の解決で
+    /// プロファイルを開ける（Linux で `$HOME` が symlink の環境の再現）。
+    #[cfg(unix)]
+    #[test]
+    fn xos_7_symlinked_data_home_opens_profile() {
+        let tmp = TempDir::new();
+        let real = tmp.0.join("real-data");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.0.join("link-data");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let env = env_of(&[("XDG_DATA_HOME", os(&link))]);
+        let (base, tail) = resolve_xdg(&env).unwrap();
+        let root = canonicalize_base(&base).join(tail);
+        assert_eq!(root, real.join("fandhe-browser"));
+        assert!(Profile::open(&root).is_ok());
     }
 }
