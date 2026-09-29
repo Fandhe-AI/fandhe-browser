@@ -28,7 +28,11 @@
 //! 前提）。パーミッション（ルート・4 サブディレクトリの `0o700`）・データ隔離
 //! （各データ種別の書き込みが対応するサブディレクトリ配下にだけ置かれること）
 //! の網羅的な確認も実装済み（TASK-50（50.4）・#179、
-//! `crates/fandhe-browser-profile/tests/profile_open.rs`）。プロファイル削除
+//! `crates/fandhe-browser-profile/tests/profile_open.rs`）。並行アクセス時の
+//! データ分離は新規コードではなくデータディレクトリ分離（`PROF-6`）自体で
+//! 成立し、`PROF-2`（TASK-51・#182）は `tests/isolation.rs`、`PROF-3`
+//! （TASK-52・#184・#185）は `tests/concurrent_isolation.rs` が Unix 上で
+//! 確認する（Windows は下記 `XOS-7`〜`XOS-10` の実装後の課題）。プロファイル削除
 //! （`Profile::delete`。`PROF-5`、TASK-53（53.2）・#188）も実装済み。以下はいずれも
 //! 未実装であり、実装済みを装う公開 API・ダミー実装は置かない。
 //!
@@ -38,7 +42,6 @@
 //!   による上書きは #203。`Profile::delete` は `self` を消費するが
 //!   `ProfileStore::delete` は `&Profile` を取るため、トレイト契約の見直しが
 //!   要る（既定実装は `Unsupported` を返す）
-//! - 並行アクセス時のデータ分離（`PROF-2`・`PROF-3`、TASK-51・TASK-52）
 //! - Windows での ACL によるアクセス制限（`XOS-7`〜`XOS-10`。Unix の
 //!   パーミッション 0o700 相当の隔離を Windows でも実現する。TASK-50・#176
 //!   では意図的にスコープ外とした。新規依存が必要になるため、導入時は

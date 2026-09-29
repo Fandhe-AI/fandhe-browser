@@ -14,7 +14,6 @@
 //! 差し込む契約であり、本モジュールは実装済みを装わない（REPAIR-3・
 //! code-comment-style.md）。
 //!
-//! - 並行アクセス時のデータ分離（`PROF-2`・`PROF-3`、TASK-51・TASK-52）
 //! - Windows での ACL によるアクセス制限（`XOS-7`〜`XOS-10`）。実装がないため
 //!   `Profile::open` は Windows では常に `Err(ProfileError::Unsupported)` を
 //!   返し、既定 ACL のまま機密データを書き込む偽装成功を避ける（security.md
@@ -22,6 +21,10 @@
 //!   Windows へは移植しておらず、XOS-7〜XOS-10 実装時にパス文字列でなく
 //!   ハンドル相対（`FILE_FLAG_OPEN_REPARSE_POINT` 等）で作成する要件を
 //!   引き継ぐ（REPAIR-3）
+//!
+//! 並行アクセス時のデータ分離はデータディレクトリ分離（`PROF-6`）自体で成立し、
+//! `PROF-2`（`tests/isolation.rs`）・`PROF-3`（`tests/concurrent_isolation.rs`。
+//! TASK-51・TASK-52）が Unix 上で確認する。
 //!
 //! `Profile::open` はルート直下の `profile.lock` に advisory lock を取ることで
 //! 同一プロファイルへの二重 open を拒否する（`PROF-1`、TASK-50（50.3）・#178。
@@ -746,6 +749,11 @@ impl Profile {
     ///    すり替わりは起きない）
     /// 4. 退避ルートを `rmdir` してからロックを解放する
     ///
+    /// 原子的な NOREPLACE rename（Linux の `renameat2`・Apple 系の
+    /// `renameatx_np`）が使えない環境・ファイルシステムでは、確認後 rename の
+    /// フォールバックをせず、何も消さずに [`ProfileError::Unsupported`] を返す
+    /// （fail-closed。同名の空ディレクトリを競合で置換しないため。`PROF-5`）。
+    ///
     /// 部分削除の契約: 手順 1 の検証を通った後に起きる競合・I/O 障害（走査中の
     /// 他プロセスによる差し替え・ディスク障害等）では、削除が一部進んだ状態で
     /// エラーになり得る。この場合、退避は元の名前へ戻すが、既に消えたエントリは
@@ -850,6 +858,12 @@ impl Profile {
                     return Err(ProfileError::InvalidLayout {
                         path: root,
                         reason: "deletion staging name already exists",
+                    });
+                }
+                Err(err) if is_atomic_rename_unsupported(err) => {
+                    // 何も移動・削除していない（検証は読み取りのみ）。
+                    return Err(ProfileError::Unsupported {
+                        reason: "atomic no-replace rename is not available on this platform or filesystem; refusing to delete the profile",
                     });
                 }
                 Err(err) => return Err(ProfileError::Io(err.into())),
@@ -1026,30 +1040,28 @@ impl Profile {
 }
 
 /// 親ディレクトリ `parent_fd` 内で `from` を `to` へ、既存エントリを上書き
-/// せずに rename する（[`Profile::delete`] の退避・復元用）。
+/// せずに rename する（[`Profile::delete`] の退避・[`remove_verified_dir_at`]
+/// の一意名退避用）。
 ///
-/// Linux / Android / Apple 系では原子的な NOREPLACE rename で行う。
-/// 非対応のファイルシステム（`EINVAL` / `ENOTSUP`）・その他の unix では確認後
-/// rename へフォールバックする（確認と rename の間の競合は残る。`PROF-5`）。
-/// そのため宛先が呼び出し側で一意に生成した名前（他者が同名を作らない）の
-/// 場合にのみ使う。通常の rename はディレクトリ移動先が空ディレクトリ以外なら
-/// 失敗するため、競合で置換され得るのは同名の空ディレクトリに限られる。元の名前へ戻す用途は [`rename_noreplace_atomic`] を使う。
+/// 原子的な NOREPLACE rename（[`rename_noreplace_atomic`]）のみを使い、使えない
+/// 環境（その他の unix・非対応 FS。`EINVAL` / `ENOSYS` / `ENOTSUP`）では
+/// 確認後 rename へフォールバックせずそのままエラーを返す。フォールバックは
+/// 確認と rename の間に別プロセスが同名の空ディレクトリを作ると置換して
+/// しまうため（PR #582 P0）。呼び出し側は [`is_atomic_rename_unsupported`] で
+/// 判定して fail-closed（[`ProfileError::Unsupported`]）にする（`PROF-5`）。
 #[cfg(unix)]
 fn rename_noreplace(
     parent_fd: BorrowedFd<'_>,
     from: &std::ffi::OsStr,
     to: &std::ffi::OsStr,
 ) -> Result<(), Errno> {
-    match rename_noreplace_atomic(parent_fd, from, to) {
-        Err(Errno::INVAL | Errno::NOSYS | Errno::NOTSUP) => {}
-        other => return other,
-    }
-    match rustix::fs::statat(parent_fd, to, AtFlags::SYMLINK_NOFOLLOW) {
-        Err(Errno::NOENT) => {}
-        Ok(_) => return Err(Errno::EXIST),
-        Err(err) => return Err(err),
-    }
-    rustix::fs::renameat(parent_fd, from, parent_fd, to)
+    rename_noreplace_atomic(parent_fd, from, to)
+}
+
+/// 原子的 NOREPLACE rename が使えないことを示す errno か。
+#[cfg(unix)]
+fn is_atomic_rename_unsupported(err: Errno) -> bool {
+    matches!(err, Errno::INVAL | Errno::NOSYS | Errno::NOTSUP)
 }
 
 /// 原子的な `RENAME_NOREPLACE`（Linux / Android）・`RENAME_EXCL`（macOS 等
@@ -1227,6 +1239,11 @@ fn remove_verified_dir_at(
     match rename_noreplace(parent_fd, name, &fresh) {
         Ok(()) => {}
         Err(Errno::NOENT) => return Ok(false),
+        Err(err) if is_atomic_rename_unsupported(err) => {
+            return Err(ProfileError::Unsupported {
+                reason: "atomic no-replace rename is not available on this platform or filesystem; refusing to delete the profile",
+            });
+        }
         Err(err) => return Err(ProfileError::Io(err.into())),
     }
     let restore = || {
@@ -2721,6 +2738,19 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    /// `PROF-5`（PR #582 P0）: 原子的 rename が使えない errno のみを
+    /// Unsupported 扱いにし、EXIST 等の通常エラーは含めない。
+    #[cfg(unix)]
+    #[test]
+    fn prof_5_atomic_rename_unsupported_errno_classification() {
+        for e in [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP] {
+            assert!(is_atomic_rename_unsupported(e));
+        }
+        for e in [Errno::EXIST, Errno::NOENT, Errno::ACCESS] {
+            assert!(!is_atomic_rename_unsupported(e));
+        }
     }
 
     /// `PROF-5`: `rename_noreplace` は既存エントリ（空ディレクトリ含む）を上書きしない。

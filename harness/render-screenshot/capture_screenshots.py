@@ -32,6 +32,7 @@ import json
 import math
 import os
 import re
+import secrets
 import select
 import signal
 import shutil
@@ -312,7 +313,7 @@ def load_sites(
         url = entry.get("url")
         category = entry.get("category")
         catalog_id = entry.get("catalog_id")
-        if not isinstance(site_id, str) or not SITE_ID_RE.match(site_id):
+        if not isinstance(site_id, str) or not SITE_ID_RE.fullmatch(site_id):
             raise SiteListError(f"sites[{index}].id is missing or invalid: {site_id!r}")
         if site_id.lower() in seen_ids:
             raise SiteListError(f"duplicate site id (case-insensitive): {site_id}")
@@ -379,7 +380,7 @@ def resolve_chromium_bin(explicit: str | None) -> str | None:
 
 
 def _write_bytes_nofollow(path: Path, data: bytes) -> None:
-    """`path` がシンボリックリンクなら追随せず拒否し、通常ファイルとして書き込む。
+    """`path` がシンボリックリンクなら拒否し、一時ファイル＋rename で通常ファイルとして置換する。
 
     `--out-dir` を使い回す再実行で `snapshots/<site_id>.html`（や結果 JSON）が
     既に外部ファイルへの symlink になっていた場合、素朴な `Path.write_bytes` は
@@ -393,14 +394,28 @@ def _write_bytes_nofollow(path: Path, data: bytes) -> None:
     """
     if path.is_symlink():
         raise OSError(f"refusing to write through an existing symlink: {path}")
-    # `O_NOFOLLOW` は Linux/macOS でのみ存在する（Windows では 0 扱い）。
+    # 既存ファイルを `O_TRUNC` で開き直すと、ハードリンクで別ディレクトリの
+    # ファイルと inode を共有している場合にリンク先の内容まで破壊してしまう
+    # （codex P0）。同一ディレクトリに新規の一時ファイルを `O_EXCL` で作って
+    # 書き込み、`os.replace` で名前だけを差し替える。差し替えで旧 inode は
+    # 名前から外れるだけなので、他のハードリンクの内容は変わらない。
+    # `O_EXCL` は一時名の事前作成 symlink も追随せず拒否する。
     # `O_BINARY`（Windows のみ）は CRT のテキストモード（`\n` を `\r\n` へ変換する
     # 挙動）を抑止し、内部データファイルの改行は LF 固定という規約
     # （coding-rust.md）を Windows でも保つ。
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
-    fd = os.open(path, flags, 0o600)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(data)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    fd = os.open(tmp_path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 # --- `{html_path}` 用スナップショット取得 --------------------------------
