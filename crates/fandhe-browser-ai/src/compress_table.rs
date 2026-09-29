@@ -560,10 +560,13 @@ fn cell_text(doc: &Document, cell: NodeId) -> (String, bool) {
                 {
                     continue;
                 }
-                let mut kids: Vec<NodeId> =
-                    doc.children(id).take(MAX_CELL_SCAN_STEPS + 1).collect();
-                if kids.len() > MAX_CELL_SCAN_STEPS {
-                    kids.truncate(MAX_CELL_SCAN_STEPS);
+                // 訪問済み（steps）＋未訪問（stack）の総量を MAX_CELL_SCAN_STEPS 以内に
+                // 保つため、残り予算を超える子は積まずに打ち切る（未訪問ノードの累積による
+                // メモリ DoS 対策）。
+                let budget = MAX_CELL_SCAN_STEPS.saturating_sub(steps + stack.len());
+                let mut kids: Vec<NodeId> = doc.children(id).take(budget + 1).collect();
+                if kids.len() > budget {
+                    kids.truncate(budget);
                     truncated = true;
                 }
                 stack.extend(kids.into_iter().rev());
@@ -1077,6 +1080,21 @@ mod tests {
     fn aisnap_2_compress_rows_scan_step_limit() {
         let spans = "<span></span>".repeat(2000);
         let r = rows_of(&format!("<table><tr><td>{spans}tail</table>"), "table");
+        assert_eq!(r.rows[0].text, "");
+        assert!(r.rows[0].truncated);
+    }
+
+    /// AISNAP-2（TASK-12.3）: 各階層に大量の兄弟を持つ入れ子でも、未訪問ノードを含む
+    /// 総量が上限内に収まり打ち切られる（スタック無制限成長の回帰防止）。
+    #[test]
+    fn aisnap_2_compress_rows_scan_stack_bounded_wide_nesting() {
+        let mut h = String::from("<table><tr><td>");
+        for _ in 0..30 {
+            h.push_str("<div>");
+            h.push_str(&"<i></i>".repeat(500));
+        }
+        h.push_str("tail</table>");
+        let r = rows_of(&h, "table");
         assert_eq!(r.rows[0].text, "");
         assert!(r.rows[0].truncated);
     }
