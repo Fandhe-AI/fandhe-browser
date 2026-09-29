@@ -1383,8 +1383,8 @@ fn remove_dir_contents_at(
 /// ルートと同じマウントに属するかを開かずに判定する（`PROF-5`）。
 ///
 /// デバイスが異なれば別マウント。Linux で両方の `mnt_id` を取得できる場合は
-/// 同一デバイス上の bind mount も検出する（取得できない旧カーネルでは
-/// `st_dev` のみで判定する。ディレクトリ側は [`same_mount`] が fail-closed）。
+/// 同一デバイス上の bind mount も検出する。ID を取得できない場合は判定
+/// できないため `false`（fail-closed。ディレクトリ側の [`same_mount`] と同じ）。
 #[cfg(unix)]
 fn entry_on_root_mount(
     dir_fd: BorrowedFd<'_>,
@@ -1404,12 +1404,15 @@ fn entry_on_root_mount(
                 if dev != root_mount.dev {
                     return Ok(false);
                 }
+                // ID が揃わなければ bind mount を識別できないため fail-closed
+                // （[`same_mount`] と同じ方針。PR #582 P1）。
                 if sx.stx_mask & rustix::fs::StatxFlags::MNT_ID.bits() != 0
                     && let Some(root_id) = root_mount.mnt_id
                 {
-                    return Ok(sx.stx_mnt_id == root_id);
+                    Ok(sx.stx_mnt_id == root_id)
+                } else {
+                    Ok(false)
                 }
-                Ok(true)
             }
             Err(Errno::NOENT) => Ok(true),
             Err(err) => Err(ProfileError::Io(err.into())),
