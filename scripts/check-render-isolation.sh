@@ -148,7 +148,7 @@ else
   # の警告が標準エラーへ出るのみで終了コードは 0・標準出力には現れないため
   # （Makefile 旧実装からの継承挙動）、素通しすることで cargo tree 自体の失敗
   # 原因（--locked のロック不整合等）もログから読み取れるようにする。
-  if ! OUT_A=$(cargo tree --workspace -e normal,build,dev --exclude fandhe-browser-render "${CARGO_TREE_LOCKED_ARGS[@]+"${CARGO_TREE_LOCKED_ARGS[@]}"}"); then
+  if ! OUT_A=$(cargo tree --workspace -e normal,build,dev --exclude fandhe-browser-render ${CARGO_TREE_LOCKED_ARGS[@]+"${CARGO_TREE_LOCKED_ARGS[@]}"}); then
     echo "NG: cargo tree（workspace）の実行に失敗しました" >&2
     STATUS=1
   else
@@ -160,7 +160,7 @@ fi
 if [ ! -f crates/fandhe-browser-cli/Cargo.toml ]; then
   notice "skip: crates/fandhe-browser-cli/Cargo.toml が未追加のため cli 既定 feature 検査をスキップ（#174 完了後に自動で有効化）"
 else
-  if ! OUT_B=$(cargo tree -p fandhe-browser-cli -e normal,build,dev "${CARGO_TREE_LOCKED_ARGS[@]+"${CARGO_TREE_LOCKED_ARGS[@]}"}"); then
+  if ! OUT_B=$(cargo tree -p fandhe-browser-cli -e normal,build,dev ${CARGO_TREE_LOCKED_ARGS[@]+"${CARGO_TREE_LOCKED_ARGS[@]}"}); then
     echo "NG: cargo tree（fandhe-browser-cli）の実行に失敗しました" >&2
     STATUS=1
   else
