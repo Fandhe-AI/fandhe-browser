@@ -1262,6 +1262,7 @@ fn js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_li
         protocol_version_override: None,
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
+        native_proxies_for_test: Vec::new(),
         rss_threshold_bytes_override: None,
         windows_process_memory_limit_bytes_override: Some(LOWERED_JOB_LIMIT_BYTES),
     });
