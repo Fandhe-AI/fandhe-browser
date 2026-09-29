@@ -550,7 +550,8 @@ fn is_hidden_element(doc: &Document, id: NodeId) -> bool {
 /// - テキスト系 `input`（`type` 省略・未知を含む）→ `value`。`password` は
 ///   平文がスナップショットへ漏れないよう**取り込まない**
 /// - `select` → `selected` 属性を持つ最初の `option`、無ければ最初の `option` の
-///   テキスト（探索は `max_steps` を消費する）
+///   テキスト（探索は `max_steps` の半分までを消費し、残りは候補のテキスト収集に
+///   確保する。探索が上限に達したら最初の `option` を採用し `cut` を立てる）
 ///
 /// `aria-valuetext` や range の値は未実装（担当 Issue 未確定）。
 fn embedded_control_text(
@@ -592,8 +593,12 @@ fn embedded_control_text(
         let mut stack: Vec<NodeId> = doc.children(id).rev().collect();
         let mut first: Option<NodeId> = None;
         let mut chosen: Option<NodeId> = None;
+        // 選択状態の探索へ予算の半分までを割り当て、残りは選択候補のテキスト収集へ
+        // 確保する。後続の `option` が大量でも、確定済みの候補（最初の `option`）の
+        // 名前が予算枯渇で失われないようにする（PR #574 レビュー指摘）。
+        let scan_limit = max_steps - max_steps / 2;
         while let Some(current) = stack.pop() {
-            if scan.steps_used >= max_steps {
+            if scan.steps_used >= scan_limit {
                 scan.cut = true;
                 break;
             }
@@ -3280,6 +3285,19 @@ mod tests {
             "button",
         );
         assert_eq!(r, named("先", NameSource::Content, true));
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546・PR #574 レビュー指摘）: 未選択の `select` で
+    /// 後続の `option` が大量にあっても、最初の `option` のテキストは予算を
+    /// 残して収集され、名前が空にならない（truncated は立つ）。
+    #[test]
+    fn aisnap_1_content_select_default_option_survives_many_options() {
+        let options = "<option>x</option>".repeat(MAX_CONTENT_STEPS + 10);
+        let html = format!("<button>数量 <select><option>初期</option>{options}</select></button>");
+        assert_eq!(
+            name(&html, "button"),
+            named("数量 初期", NameSource::Content, true)
+        );
     }
 
     /// AISNAP-1（TASK-11.4.3・#546）: 文書全体の予算。content role の深い
