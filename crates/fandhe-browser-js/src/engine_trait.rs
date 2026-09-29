@@ -142,8 +142,8 @@ pub enum JsValue {
     /// だけを保持する。
     ///
     /// 簡易実装（REPAIR-3）: 現時点では型とワイヤ表現の定義のみで、V8 の値
-    /// との相互変換（プロキシオブジェクト化）は Issue #525（`TASK-29.5b`）
-    /// で実装する。それまで `V8Engine` は本 variant を V8 値へ変換せず、
+    /// との相互変換（プロキシオブジェクト化）は `TASK-29.5b` の後続作業
+    /// で実装する（DOM 風オブジェクト自体の bind・dispatch は実装済み）。それまで `V8Engine` は本 variant を V8 値へ変換せず、
     /// JS 側で catch できる `Error` として表面化させる。
     ObjectHandle(ObjectHandle),
 }
@@ -155,7 +155,7 @@ pub enum JsValue {
 ///   `NATIVE_CALL`/`REGISTER_GLOBAL_FUNCTION` が使う `u32`）は **別の名前
 ///   空間** であり、相互に流用しない
 /// - 子から届いた handle ID は untrusted。親は自分の登録簿と照合し、未登録の
-///   ID を拒否する契約とする（照合の実装は Issue #525）
+///   ID を拒否する契約とする（照合の実装は `TASK-29.5b` の後続作業）
 /// - 生の `u32` ではなく型で区別する（REPAIR-4）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectHandle(u32);
@@ -395,8 +395,8 @@ pub trait JsEngine {
     /// バインディング」。PoC-3 の `dom.setText`/`dom.getText`/`dom.count`
     /// 相当）。
     ///
-    /// 子プロセス版で子が起動し直された際の登録し直しは未対応
-    /// （#525 = `TASK-29.5b` で対応予定。Issue #527）。
+    /// 子プロセス版は子の再起動時に登録順どおり再登録する
+    /// （`V8ProcessEngine::bind_dom_like_object`。`TASK-29.5b`）。
     fn bind_dom_like_object(
         &mut self,
         name: &str,
