@@ -915,21 +915,28 @@ fn referent_text(
     referent: NodeId,
     target: NodeId,
 ) -> Option<String> {
-    if let Some(cached) = index.referent_cache.borrow().get(&referent) {
+    let contains_target = is_ancestor_or_self(doc, referent, target);
+
+    // 対象を含まない参照先だけがキャッシュを共有できる。対象を含む参照先は
+    // 対象の部分木を除外して走査する必要があり、結果が対象ごとに異なるため、
+    // キャッシュ（他の対象で作った断片）を読まない（`compute_name` と一致させる）。
+    if !contains_target && let Some(cached) = index.referent_cache.borrow().get(&referent) {
         return Some(cached.clone());
     }
 
-    let contains_target = is_ancestor_or_self(doc, referent, target);
-    if contains_target {
-        let left = index.uncached_scans_left.get();
-        if left == 0 {
-            return None;
-        }
-        index.uncached_scans_left.set(left - 1);
-    }
-
     let mut out = String::new();
-    scan_referent(doc, referent, target, &mut out);
+    // 参照先自身の `aria-label` / `img` の `alt` は部分木を走査せず対象にも
+    // 依存しないため、走査予算を消費しない。
+    if !scan_referent_own_text(doc, referent, &mut out) {
+        if contains_target {
+            let left = index.uncached_scans_left.get();
+            if left == 0 {
+                return None;
+            }
+            index.uncached_scans_left.set(left - 1);
+        }
+        collect_label_text(doc, referent, target, &mut out);
+    }
     if !contains_target {
         index
             .referent_cache
@@ -939,21 +946,23 @@ fn referent_text(
     Some(out)
 }
 
-/// [`referent_text`] の走査本体（キャッシュ・予算を含まない）。
-fn scan_referent(doc: &Document, referent: NodeId, target: NodeId, out: &mut String) {
+/// [`referent_text`] の補助。参照先自身の属性（`aria-label`、`img` の `alt`）から
+/// 名前の断片を `out` へ取り込めたら `true`（部分木の走査は不要）。
+/// 対象要素に依存しないため走査予算の対象外。
+fn scan_referent_own_text(doc: &Document, referent: NodeId, out: &mut String) -> bool {
     if let Some(label) = doc.attribute(referent, "aria-label")
         && has_non_whitespace(label)
     {
         fold_attr_bounded(label, out);
-        return;
+        return true;
     }
     if is_html_element_named(doc, referent, "img")
         && let Some(alt) = doc.attribute(referent, "alt")
     {
         fold_attr_bounded(alt, out);
-        return;
+        return true;
     }
-    collect_label_text(doc, referent, target, out);
+    false
 }
 
 /// 属性値 `value` を空白折り畳みしながら、折り畳み後
@@ -2602,5 +2611,51 @@ mod tests {
             names.get(MAX_UNCACHED_REFERENT_SCANS),
             Some(&named("", NameSource::None, true))
         );
+    }
+    /// AISNAP-1（TASK-11.4.1・#544）: 参照先の外側の要素が先に作ったキャッシュを、参照先の内側の要素が再利用しない（共有索引でも `compute_name` と一致する）。
+    #[test]
+    fn aisnap_1_aria_labelledby_cache_not_reused_for_inner_target() {
+        let html = r#"<span id="o" aria-labelledby="r"></span><div id="r">名前<button id="b" aria-labelledby="r">送信</button></div>"#;
+        let parsed = parse_document(html, &ParseOptions::default()).expect("成功する");
+        let doc = parsed.document;
+        let find = |sel: &str| {
+            fandhe_browser_core::query::query_selector_all_str(&doc, doc.root(), sel)
+                .expect("セレクタは解釈できる")
+                .first()
+                .copied()
+                .expect("要素が存在する")
+        };
+        let (outer, button) = (find("span#o"), find("button#b"));
+        let index = NameIndex::build(&doc);
+        let _ = compute_name_with_index(&doc, &index, outer);
+        assert_eq!(
+            compute_name_with_index(&doc, &index, button),
+            compute_name(&doc, button)
+        );
+        assert_eq!(
+            compute_name_with_index(&doc, &index, button),
+            named("名前", NameSource::AriaLabelledBy, false)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 対象を含む参照先でも、参照先自身の `aria-label` を読むだけなら走査予算を消費しない。
+    #[test]
+    fn aisnap_1_aria_labelledby_own_label_does_not_consume_budget() {
+        let mut html = String::from(r#"<div id="big" aria-label="共有">"#);
+        for _ in 0..(MAX_UNCACHED_REFERENT_SCANS + 5) {
+            html.push_str(r#"<input aria-labelledby="big">"#);
+        }
+        html.push_str("</div>");
+        let parsed = parse_document(&html, &ParseOptions::default()).expect("成功する");
+        let doc = parsed.document;
+        let targets = fandhe_browser_core::query::query_selector_all_str(&doc, doc.root(), "input")
+            .expect("セレクタは解釈できる");
+        let index = NameIndex::build(&doc);
+        for id in targets {
+            assert_eq!(
+                compute_name_with_index(&doc, &index, id),
+                named("共有", NameSource::AriaLabelledBy, false)
+            );
+        }
     }
 }
