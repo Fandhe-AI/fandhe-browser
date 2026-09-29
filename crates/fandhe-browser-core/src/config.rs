@@ -195,68 +195,47 @@ impl Config {
                     })?
             };
 
-            let resolved = if root.is_absolute() {
-                // 絶対パスは設定ファイルの親ディレクトリ配下に限定する
-                // （Issue #538 P0 レビュー指摘）。`ProfileConfig::from_raw` の
-                // 字句判定（`resolves_outside_or_at_base_dir`）は絶対パスを
-                // 対象外にしているため、ファイルパスを知っている本関数でのみ
-                // 検証できる。`Profile::open` へ渡す前（副作用の前）に拒否する。
-                //
-                // `base_abs` は symlink 解決済み（`canonicalize` 済み）のため、
-                // `root` 側も実在する最長の祖先まで同様に解決してから比較する
-                // （`resolve_physical_prefix`。Issue #538 P0 再指摘）。片方だけ
-                // 解決すると、symlink を経由する環境（例: macOS の `/var` →
-                // `/private/var`）で正当な `root` を誤って境界外と判定する。
-                let root_abs = resolve_physical_prefix(&root)?;
-
-                if !is_lexically_within(&base_abs, &root_abs) {
-                    return Err(Error::from(ConfigError::InvalidValue {
-                        key: "profile.root",
-                        message: format!(
-                            "profile.root {:?} must resolve to a location under the \
-                             config file's directory ({})",
-                            truncate_for_message(&root.display().to_string()),
-                            base_abs.display()
-                        ),
-                    }));
-                }
-
-                // 検証に使った物理解決済みパス（`root_abs`）をそのまま採用する
-                // （Issue #538 P0 レビュー再指摘）。未解決の `root` を返すと、
-                // 検証済みの最終到達点と実際に `fandhe-browser-profile::
-                // Profile::open`（TASK-50・#177）が要素ごとに辿るパスが
-                // 食い違う。例えば設定ディレクトリが `<dir>` のとき
-                // `root = "<dir>/../outside/../<dir 名>/profiles"` は字句
-                // 正規化後の最終到達点こそ `<dir>/profiles`（境界内）だが、
-                // 未正規化のまま渡すと `Profile::open` は `outside` という
-                // 実在しない兄弟ディレクトリを経由して辿ろうとし、設定
-                // ディレクトリ外への作成につながりかねない（security.md
-                // 「不安全な設計」・プロファイル境界）。物理解決済みの
-                // `root_abs` を渡すことで、境界検証と実際に使われるパスを
-                // 一致させる。
-                root_abs
+            // 絶対パスはそのまま、相対パスは設定ファイルの親ディレクトリ基準
+            // （CWD 非依存）で結合してから、両分岐とも同じ境界検証を通す
+            // （Issue #538 再指摘: 相対分岐にも検証を適用し、絶対・相対で
+            // symlink・Windows の `RootDir` のみ / `Prefix` のみのパスの扱いを
+            // 揃える）。Windows では `/outside`・`C:outside` は
+            // `Path::is_absolute()` が false のため相対分岐に入るが、
+            // `PathBuf::push`（`join`）は前者を基準のドライブ直下、後者を基準
+            // 全体の置換として扱うため、結合結果は設定ディレクトリ外になり得る。
+            // 結合後の物理解決済みパスを `is_lexically_within` で検証することで
+            // これを拒否する。
+            //
+            // `base_abs` は symlink 解決済み（`canonicalize` 済み）のため、
+            // 結合結果も実在する最長の祖先まで同様に解決してから比較する
+            // （`resolve_physical_prefix`）。片方だけ解決すると、symlink を
+            // 経由する環境（例: macOS の `/var` → `/private/var`）で正当な
+            // `root` を誤って境界外と判定する。`..`・`.` は
+            // `resolve_physical_prefix` 内の字句正規化で畳み込まれる。
+            let joined = if root.is_absolute() {
+                root.clone()
             } else {
-                // 設定ファイルの親ディレクトリ基準で解決する（CWD 非依存）。
-                // `path` 自体が相対パス（例: `config/fandhe-browser.toml`）の
-                // 場合でも、`base_abs`（上で `canonicalize` 済み）は既に
-                // 絶対パスかつ symlink 解決済みのため、そのまま `join` すれば
-                // `resolved` も絶対パスになる（本モジュール doc「パス解決」の
-                // 「CWD 非依存」契約を満たす）。
-                //
-                // `base_abs.join(&root)` の結果は正規化前のまま返さず、
-                // `normalize_lexically` で `..`・`.` を畳み込んでから返す
-                // （Issue #538 P1 レビュー指摘）。相対パスの字句上の脱出は
-                // `ProfileConfig::from_raw` が既に拒否済みだが、拒否済みの
-                // 値であっても `..` 自体は残り得る（例:
-                // `root = "a/../profiles"` は基準ディレクトリより上位へ
-                // 脱出しないため受理されるが、`..` を残したまま返すと
-                // `fandhe-browser-profile::Profile::open`（TASK-50・#177）が
-                // 要素ごとに辿る際、実在しない・symlink かもしれない中間
-                // ディレクトリ `a` を経由してしまう。検証に用いた最終到達点
-                // （畳み込み後のパス）と実際に渡すパスを一致させるため、
-                // 絶対パス分岐と同様にここでも正規化する。
-                normalize_lexically(&base_abs.join(&root))
+                base_abs.join(&root)
             };
+            let resolved = resolve_physical_prefix(&joined)?;
+
+            if !is_lexically_within(&base_abs, &resolved) {
+                return Err(Error::from(ConfigError::InvalidValue {
+                    key: "profile.root",
+                    message: format!(
+                        "profile.root {:?} must resolve to a location under the \
+                         config file's directory ({})",
+                        truncate_for_message(&root.display().to_string()),
+                        base_abs.display()
+                    ),
+                }));
+            }
+
+            // 検証に使った物理解決済みパス（`resolved`）をそのまま採用する。
+            // 未解決のパスを返すと、検証済みの最終到達点と
+            // `fandhe-browser-profile::Profile::open`（TASK-50・#177）が
+            // 要素ごとに辿るパスが食い違う（`..` 経由の実在しない兄弟
+            // ディレクトリ・設定ディレクトリ内 symlink 経由の外部到達）。
             config.profile.root = Some(resolved);
         }
 

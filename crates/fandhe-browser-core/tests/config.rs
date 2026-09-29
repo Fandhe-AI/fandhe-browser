@@ -504,3 +504,50 @@ fn task_91_1_p0_relative_root_via_symlinked_config_path_resolves_against_real_di
         "相対 root は symlink の指す実際のディレクトリ（dir_a）基準で解決されるべき"
     );
 }
+
+/// TASK-91（91.1）・PROF-6: 設定ディレクトリ内の symlink を経由して外部へ
+/// 出る相対 `root` は、絶対パス分岐と同様に拒否される（Issue #538 指摘:
+/// 相対・絶対で symlink の扱いを揃える）。
+#[cfg(unix)]
+#[test]
+fn task_91_1_relative_root_through_symlink_to_outside_is_rejected() {
+    let config_dir = TempDir::new();
+    let outside = TempDir::new();
+    std::os::unix::fs::symlink(outside.path(), config_dir.path().join("link"))
+        .expect("symlink を作成できる");
+
+    let config_path = config_dir.write_config("[profile]\nroot = 'link/profiles'\n");
+    let err = Config::load(&config_path)
+        .expect_err("symlink 経由で設定ディレクトリ外へ出る root は拒否される");
+    assert!(matches!(
+        err,
+        Error::Config(ConfigError::InvalidValue {
+            key: "profile.root",
+            ..
+        })
+    ));
+}
+
+/// TASK-91（91.1）・PROF-6: Windows では `/x`（RootDir のみ）・`C:x`
+/// （Prefix のみ）・UNC は `is_absolute()` が false のまま `join` で基準を
+/// 置換し得るため、設定ディレクトリ外として拒否される（Issue #538 指摘）。
+#[cfg(windows)]
+#[test]
+fn task_91_1_windows_rooted_or_prefixed_relative_root_is_rejected() {
+    for value in ["/x", "C:x", "//server/share"] {
+        let dir = TempDir::new();
+        let config_path = dir.write_config(&format!("[profile]\nroot = '{value}'\n"));
+        let err =
+            Config::load(&config_path).expect_err("設定ディレクトリ外を指す root は拒否される");
+        assert!(
+            matches!(
+                err,
+                Error::Config(ConfigError::InvalidValue {
+                    key: "profile.root",
+                    ..
+                })
+            ),
+            "{value}: InvalidValue(profile.root) が返るべき: {err:?}"
+        );
+    }
+}
