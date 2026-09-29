@@ -237,6 +237,7 @@ version = "0.1.0"
 name = "fandhe-browser-core"
 version = "0.1.0"
 dependencies = [
+ "fandhe-browser-profile",
  "html5ever",
  "reqwest",
  "rustls",

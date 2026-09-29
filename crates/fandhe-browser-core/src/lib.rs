@@ -2,8 +2,9 @@
 //!
 //! fetch（ネットワーク取得）・HTML パース・DOM・query（DOM 探索）・CSSOM・
 //! config（設定）・可観測性（ログ・トレーシング）・描画機能への境界（[`render`]）を
-//! 担う crate。将来的には `fandhe-browser-js`（workspace 内 crate に依存しない
-//! 下位 crate）に依存する想定。`Cargo.toml` の `[dependencies]` には
+//! 担う crate。`fandhe-browser-profile`（`state` モジュールが `Profile` を保持する。
+//! TASK-41.1・#169。workspace 内 path 依存）に依存し、将来的には `fandhe-browser-js`
+//! にも依存する想定（AGENTS.md「crate 間の許可依存」: js・profile）。`Cargo.toml` の `[dependencies]` には
 //! `html5ever = "=0.40.1"`（Issue #35 承認済み・TASK-24.4・#38）と reqwest・
 //! rustls（同じく Issue #35 承認済み・TASK-24.2・#36）を持つ。他の依存追加は
 //! 該当タスクで dependency-policy.md のユーザー承認制に従って行う。
@@ -31,8 +32,10 @@
 //! [`render`] モジュールは TASK-33（サブタスク 33.2・ビヘイビア `RENDER-1`）で追加した
 //! 描画トレイトの定義に加え、feature `rendering` 無効時に用いる既定実装
 //! `DisabledRenderer`（TASK-33（33.3）・issue #47）を含む。`fandhe-browser-render`
-//! （Servo）側の本実装・`AppState` への配線は含まない（別 issue の担当。render
+//! （Servo）側の本実装・cli による具象実装の注入は含まない（別 issue の担当。render
 //! モジュールの doc コメントを参照）。
+//! [`state`] モジュール（TASK-41.1・#169・`CDP-1`・`AISNAP-6`）は cdp と ai が共有する
+//! 共通状態 [`state::AppState`]（`Profile`・描画ハンドル・ナビゲート状態）を定義する。
 //! [`observability`] モジュールは TASK-10（10.1・Issue #219・ビヘイビア
 //! `REPAIR-9`）で、`fetch`/`parse`/`dom`/`query`/`js_stub` 各モジュールの
 //! 操作計測が共通で使うレコード型（[`observability::OperationRecord`] 等）を
@@ -58,6 +61,7 @@ pub mod parse;
 pub mod query;
 pub mod render;
 pub mod selector;
+pub mod state;
 
 pub use dom::{
     Ancestors, Attribute, Children, Descendants, Document, Node, NodeData, NodeId, QuirksMode,
@@ -72,3 +76,4 @@ pub use parse::{
 pub use query::{
     element_matches, query_selector, query_selector_all, query_selector_all_str, query_selector_str,
 };
+pub use state::{AppState, NavigationGeneration, NavigationResult, NavigationState, StateError};
