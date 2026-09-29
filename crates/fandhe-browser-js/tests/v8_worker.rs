@@ -131,6 +131,10 @@ fn main() -> ExitCode {
     js_1_native_call_exceeding_evaluate_deadline_discards_context();
     eprintln!("case: js_1_native_call_with_unknown_id_discards_context_and_recovers");
     js_1_native_call_with_unknown_id_discards_context_and_recovers();
+    eprintln!("case: js_1_host_registered_native_fn_is_reinstalled_after_worker_respawn");
+    js_1_host_registered_native_fn_is_reinstalled_after_worker_respawn();
+    eprintln!("case: js_1_registering_native_fn_while_worker_is_running_is_rejected");
+    js_1_registering_native_fn_while_worker_is_running_is_rejected();
     #[cfg(target_os = "linux")]
     {
         eprintln!("case: js_1_linux_child_process_has_rlimit_data_set");
@@ -971,15 +975,16 @@ fn js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation() {
 }
 /// `new_for_test` で子プロセスの構成を作りつつ、`register_native_function_for_test`
 /// で親側に `NativeFn` を 1 つ登録する（`TASK-29`・Issue #526）。呼び出し元
-/// は `spawn_config.native_proxies_for_test` に同じ id で子側のプロキシ名を
-/// 渡しておく。戻り値はエンジンと、実際に割り当てられた id。
+/// は `name` をホスト登録簿へ渡す（子への登録は `spawn_worker` が登録簿から
+/// 行う。Issue #527）。戻り値はエンジンと、実際に割り当てられた id。
 fn engine_with_one_native_fn_for_test(
+    name: &str,
     native_fn: ParentNativeFn,
     spawn_config: WorkerSpawnConfigForTest,
 ) -> (V8ProcessEngine, u32) {
     let mut engine = V8ProcessEngine::new_for_test(spawn_config);
     let id = engine
-        .register_native_function_for_test(native_fn)
+        .register_native_function_for_test(name, native_fn)
         .unwrap_or_else(|err| panic!("registering a native function must succeed: {err}"));
     (engine, id)
 }
@@ -997,6 +1002,7 @@ fn js_1_native_call_round_trip_returns_value_and_records_args() {
     });
 
     let (mut engine, id) = engine_with_one_native_fn_for_test(
+        "f",
         native_fn,
         WorkerSpawnConfigForTest {
             heap_limit_bytes: None,
@@ -1004,7 +1010,7 @@ fn js_1_native_call_round_trip_returns_value_and_records_args() {
             hello_wrong_engine_for_test: false,
             hello_extra_byte_for_test: false,
             rss_threshold_bytes_override: None,
-            native_proxies_for_test: vec![("f".to_string(), 0)],
+            native_proxies_for_test: Vec::new(),
             windows_process_memory_limit_bytes_override: None,
         },
     );
@@ -1028,6 +1034,7 @@ fn js_1_native_call_err_is_catchable_and_context_survives() {
         Err(JsEngineError::EvaluationFailed("boom".to_string()))
     });
     let (mut engine, id) = engine_with_one_native_fn_for_test(
+        "f",
         native_fn,
         WorkerSpawnConfigForTest {
             heap_limit_bytes: None,
@@ -1035,7 +1042,7 @@ fn js_1_native_call_err_is_catchable_and_context_survives() {
             hello_wrong_engine_for_test: false,
             hello_extra_byte_for_test: false,
             rss_threshold_bytes_override: None,
-            native_proxies_for_test: vec![("f".to_string(), 0)],
+            native_proxies_for_test: Vec::new(),
             windows_process_memory_limit_bytes_override: None,
         },
     );
@@ -1076,6 +1083,7 @@ fn js_1_native_call_duration_is_included_in_the_watchdog_timeout() {
         Ok(JsValue::Number(1.0))
     });
     let (mut engine, id) = engine_with_one_native_fn_for_test(
+        "f",
         native_fn,
         WorkerSpawnConfigForTest {
             heap_limit_bytes: None,
@@ -1083,7 +1091,7 @@ fn js_1_native_call_duration_is_included_in_the_watchdog_timeout() {
             hello_wrong_engine_for_test: false,
             hello_extra_byte_for_test: false,
             rss_threshold_bytes_override: None,
-            native_proxies_for_test: vec![("f".to_string(), 0)],
+            native_proxies_for_test: Vec::new(),
             windows_process_memory_limit_bytes_override: None,
         },
     );
@@ -1134,6 +1142,7 @@ fn js_1_native_call_exceeding_evaluate_deadline_discards_context() {
         Ok(JsValue::Number(1.0))
     });
     let (mut engine, id) = engine_with_one_native_fn_for_test(
+        "f",
         native_fn,
         WorkerSpawnConfigForTest {
             heap_limit_bytes: None,
@@ -1141,7 +1150,7 @@ fn js_1_native_call_exceeding_evaluate_deadline_discards_context() {
             hello_wrong_engine_for_test: false,
             hello_extra_byte_for_test: false,
             rss_threshold_bytes_override: None,
-            native_proxies_for_test: vec![("f".to_string(), 0)],
+            native_proxies_for_test: Vec::new(),
             windows_process_memory_limit_bytes_override: None,
         },
     );
@@ -1214,6 +1223,114 @@ fn js_1_native_call_with_unknown_id_discards_context_and_recovers() {
         .evaluate_script("1 + 1", &EvaluateOptions::default())
         .unwrap_or_else(|err| panic!("engine must recover with a fresh child: {err}"));
     assert_eq!(result, JsValue::Number(2.0));
+}
+
+/// `TASK-29`・Issue #527: 子が破棄されて起動し直されると、ホストが登録した
+/// 注入関数は新しい子へ登録し直される。スクリプトが作った状態は登録し直され
+/// ない（失われたことがメッセージで明示される）。
+fn js_1_host_registered_native_fn_is_reinstalled_after_worker_respawn() {
+    let native_fn: ParentNativeFn =
+        Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| Ok(JsValue::Number(42.0)));
+    let (mut engine, _id) = engine_with_one_native_fn_for_test(
+        "f",
+        native_fn,
+        WorkerSpawnConfigForTest {
+            heap_limit_bytes: None,
+            protocol_version_override: None,
+            hello_wrong_engine_for_test: false,
+            hello_extra_byte_for_test: false,
+            rss_threshold_bytes_override: None,
+            native_proxies_for_test: Vec::new(),
+            windows_process_memory_limit_bytes_override: None,
+        },
+    );
+    let first = engine
+        .evaluate_script("f()", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("the first call must succeed: {err}"));
+    assert_eq!(first, JsValue::Number(42.0));
+    engine
+        .evaluate_script("var before = 1;", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("marker declaration must succeed: {err}"));
+    let pid_before = engine
+        .worker_pid_for_test()
+        .expect("a worker must be running");
+
+    // 未知のタグ（200）のフレームでプロトコル違反を起こす。
+    let mut malformed_frame = Vec::new();
+    malformed_frame.extend_from_slice(&1u32.to_le_bytes());
+    malformed_frame.push(200);
+    engine
+        .send_raw_frame_for_test(&malformed_frame)
+        .unwrap_or_else(|err| panic!("writing the malformed frame must succeed: {err}"));
+
+    match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
+        Err(JsEngineError::EngineUnavailable(msg)) => {
+            assert!(
+                msg.contains("context was discarded")
+                    && msg.contains("the next evaluation runs in a fresh context"),
+                "the discard message must state both facts, got: {msg}"
+            );
+        }
+        other => panic!("expected EngineUnavailable after a protocol violation, got: {other:?}"),
+    }
+
+    let again = engine
+        .evaluate_script("f()", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("f must be reinstalled in the new child: {err}"));
+    assert_eq!(again, JsValue::Number(42.0));
+    let pid_after = engine
+        .worker_pid_for_test()
+        .expect("a new worker must be running");
+    assert_ne!(pid_after, pid_before, "the worker must have been respawned");
+
+    match engine.evaluate_script("before", &EvaluateOptions::default()) {
+        Err(JsEngineError::EvaluationFailed(msg)) => {
+            assert!(
+                msg.contains("ReferenceError"),
+                "script state must not be reinstalled, got: {msg}"
+            );
+        }
+        other => panic!("expected ReferenceError for lost script state, got: {other:?}"),
+    }
+}
+
+/// `TASK-29`・Issue #527: 子が稼働中の登録は拒否され（稼働中の子への即時登録は
+/// #155）、既存の登録は使い続けられる。
+fn js_1_registering_native_fn_while_worker_is_running_is_rejected() {
+    let native_fn: ParentNativeFn =
+        Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| Ok(JsValue::Number(42.0)));
+    let (mut engine, _id) = engine_with_one_native_fn_for_test(
+        "f",
+        native_fn,
+        WorkerSpawnConfigForTest {
+            heap_limit_bytes: None,
+            protocol_version_override: None,
+            hello_wrong_engine_for_test: false,
+            hello_extra_byte_for_test: false,
+            rss_threshold_bytes_override: None,
+            native_proxies_for_test: Vec::new(),
+            windows_process_memory_limit_bytes_override: None,
+        },
+    );
+    engine
+        .spawn_worker_for_test()
+        .unwrap_or_else(|err| panic!("spawning the worker must succeed: {err}"));
+
+    let other_fn: ParentNativeFn =
+        Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| Ok(JsValue::Number(1.0)));
+    match engine.register_native_function_for_test("g", other_fn) {
+        Err(JsEngineError::BindingFailed(msg)) => assert_eq!(
+            msg,
+            "cannot register a native function while the JS worker process is running; \
+             live registration is not implemented yet"
+        ),
+        other => panic!("expected BindingFailed while the worker is running, got: {other:?}"),
+    }
+
+    let result = engine
+        .evaluate_script("f()", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("the existing registration must keep working: {err}"));
+    assert_eq!(result, JsValue::Number(42.0));
 }
 
 /// Job Object の上限を下げた検証で使う上限値（112 MiB）。

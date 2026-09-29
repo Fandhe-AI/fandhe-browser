@@ -132,18 +132,27 @@ pub(crate) const TEST_HELLO_EXTRA_BYTE_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER
 /// `WorkerSpawnConfigForTest::native_proxies_for_test` 経由で設定する）。
 /// #155 完了後、本番の登録フレーム処理と併存させるか置き換えるかは
 /// 別途判断する。
+///
+/// 値は、親がエンジンの寿命のあいだ保持するホスト登録簿
+/// （`V8ProcessEngine::host_bindings`）と
+/// `WorkerSpawnConfigForTest::native_proxies_for_test` から、子を起動する
+/// たび（初回・再起動の両方）に組み立て直される（`TASK-29`・Issue #527）。
 #[cfg(feature = "test-support")]
 pub(crate) const TEST_NATIVE_PROXIES_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER_TEST_NATIVE_PROXIES";
 
 /// [`TEST_NATIVE_PROXIES_ENV_VAR`] に許す最大の値の長さ（バイト）。
 /// DoS 対策の上限（外部入力を解析する前に検査する。coding-rust.md「外部
 /// 入力」節）。
-#[cfg(feature = "test-support")]
-const MAX_TEST_NATIVE_PROXIES_ENV_VAR_BYTES: usize = 4096;
+///
+/// 親（`super::process_engine`）が環境変数の値を組み立てる際にも同じ上限を
+/// 使うため、feature に関わらず存在させる（`TASK-29`・Issue #527）。
+pub(crate) const MAX_TEST_NATIVE_PROXIES_ENV_VAR_BYTES: usize = 4096;
 
 /// [`TEST_NATIVE_PROXIES_ENV_VAR`] に許す最大の登録件数。
-#[cfg(feature = "test-support")]
-const MAX_TEST_NATIVE_PROXIES: usize = 16;
+///
+/// 親が値を組み立てる際にも同じ上限を使うため、feature に関わらず存在
+/// させる（`TASK-29`・Issue #527）。
+pub(crate) const MAX_TEST_NATIVE_PROXIES: usize = 16;
 
 /// [`TEST_NATIVE_PROXIES_ENV_VAR`] の生の値を `(name, id)` の列へ解析する
 /// （`JS-1`・`TASK-29`・Issue #526）。

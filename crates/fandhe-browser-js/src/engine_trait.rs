@@ -342,12 +342,19 @@ pub trait JsEngine {
 
     /// グローバルスコープに Rust ネイティブ関数を 1 つ注入する（`JS-1`
     /// 「グローバル関数注入」。PoC-3 の `print` 相当）。
+    ///
+    /// 子プロセス版の実装では、子が破棄されて起動し直された際にホストが
+    /// 登録した分は新しい子へ登録し直される。スクリプトが作った状態は
+    /// 失われる（`JS-1`・`TASK-29`・Issue #527）。
     fn inject_global_function(&mut self, name: &str, func: NativeFn) -> Result<(), JsEngineError>;
 
     /// 名前付きの DOM 風オブジェクト（複数のネイティブメソッドを持つ）を
     /// グローバルスコープにバインドする（`JS-1`「DOM 風オブジェクトへの
     /// バインディング」。PoC-3 の `dom.setText`/`dom.getText`/`dom.count`
     /// 相当）。
+    ///
+    /// 子プロセス版で子が起動し直された際の登録し直しは未対応
+    /// （#525 = `TASK-29.5b` で対応予定。Issue #527）。
     fn bind_dom_like_object(
         &mut self,
         name: &str,

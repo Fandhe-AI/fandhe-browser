@@ -61,7 +61,31 @@
 //! 登録フレームを含む）は別 Issue（#155）が担い、本 Issue の時点ではテスト
 //! 専用の登録経路（[`V8ProcessEngine::register_native_function_for_test`]。
 //! feature `test-support` 限定）だけを提供する。子の再起動時の再登録は
-//! 別 Issue（#527）。
+//! 次節のとおり Issue #527 で扱う。
+//!
+//! # 子の再起動と登録し直し（`TASK-29`・Issue #527）
+//!
+//! 子が OOM・クラッシュ・`kill`・プロトコル違反で破棄されると、次の
+//! [`V8ProcessEngine::evaluate_script`] が新しい子を起動する。このとき:
+//!
+//! - **登録し直すもの**: ホストが登録した注入関数の「グローバル名と id」
+//!   （`V8ProcessEngine::host_bindings`。エンジンの寿命のあいだ親が保持
+//!   する）。子の起動（初回・再起動とも）のたびに
+//!   `child_native_proxies_env_value` が登録簿から値を組み立てて新しい子へ
+//!   渡す（子への登録の唯一の入口。#155 はこの関数の中身を登録フレームの
+//!   送信へ置き換える）。親側の `native_fns`（id から [`NativeFn`] への
+//!   対応）はもともとエンジンに残る
+//! - **登録し直さないもの**: スクリプトが作ったグローバル変数・関数・状態
+//!   のすべて。失われたことは、破棄時のエラーメッセージ（"context was
+//!   discarded" と "the next evaluation runs in a fresh context"）で
+//!   明示する（security.md「偽装・回避機能の禁止」）
+//!
+//! 本番の `new()` 経由のエンジンには #155 まで登録経路が無いため、この
+//! 節の挙動が変えるのはテスト専用経路（feature `test-support`）だけである。
+//! 子が稼働中の間の登録は拒否する（稼働中の子への即時登録は #155 の担当）。
+//! DOM 風オブジェクト（`bind_dom_like_object`）の登録し直しは未対応で、
+//! 前提の #524・#525（`TASK-29.5a`・`TASK-29.5b`）で登録簿へ種別を足して
+//! 同じ差し込み口から扱う。
 //!
 //! `NativeFn` の実行時間は、評価開始時に 1 度だけ計算する期限
 //! （[`EVALUATE_RECV_TIMEOUT`]）に含まれる。この期限は
@@ -79,6 +103,12 @@
 //!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
+//! - 本番の登録経路（親→子の登録フレーム・稼働中の子への即時登録）は
+//!   #155 まで存在しない。DOM 風オブジェクトの再登録は #525 で対応する
+//!   （Issue #527）
+//! - 期限を過ぎて放棄された `NativeFn` のスレッドが `Mutex` を握ったままの
+//!   登録は、子を再起動しても `try_lock` に失敗し続けて JS 側へエラーを
+//!   返す（再起動しても直らない。Issue #527）
 //! - 期限を超えて戻らない `NativeFn` のスレッドは強制終了できず、戻るか
 //!   プロセスが終了するまで残る。ただしホスト全体の生存数は
 //!   `MAX_LIVE_NATIVE_THREADS`（64）で強制的に頭打ちにし、超過した呼び出し
@@ -1006,6 +1036,18 @@ pub use spawn_config::WorkerSpawnConfigForTest;
 #[cfg(not(feature = "test-support"))]
 use spawn_config::WorkerSpawnConfigForTest;
 
+/// ホストが登録したグローバル関数の名前と id（`TASK-29`・Issue #527）。
+///
+/// [`V8ProcessEngine`] がエンジンの寿命のあいだ保持し、`spawn_worker` が
+/// 子を起動するたびに `child_native_proxies_env_value` 経由で新しい子へ
+/// 登録し直す。`id` は `V8ProcessEngine::native_fns` の添字と対応する。
+/// DOM 風オブジェクトの登録は未対応で、#525（`TASK-29.5b`）が種別を足す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostBinding {
+    name: String,
+    id: u32,
+}
+
 /// JS 評価を子プロセスへ分離して提供するエンジン（`JS-1`・Issue #503）。
 ///
 /// 親側に登録するネイティブ関数は [`ParentNativeFn`]（`Send`）で、
@@ -1039,6 +1081,10 @@ pub struct V8ProcessEngine {
     /// （feature `test-support` 限定）だけが登録経路であり、本番の
     /// `new()` では常に空のままである。
     native_fns: Vec<NativeEntry>,
+    /// ホストが登録した注入関数の名前と id の登録簿（`TASK-29`・Issue #527）。
+    /// `worker` を破棄しても残り、次に起動する子へ `spawn_worker` が
+    /// 登録し直す（`native_fns` と同じ寿命）。
+    host_bindings: Vec<HostBinding>,
 }
 
 impl V8ProcessEngine {
@@ -1052,6 +1098,7 @@ impl V8ProcessEngine {
             worker: None,
             spawn_config: WorkerSpawnConfigForTest::default(),
             native_fns: Vec::new(),
+            host_bindings: Vec::new(),
         }
     }
 
@@ -1065,27 +1112,44 @@ impl V8ProcessEngine {
             worker: None,
             spawn_config,
             native_fns: Vec::new(),
+            host_bindings: Vec::new(),
         }
     }
 
-    /// テスト専用: [`NativeFn`] を登録し、割り当てた id を返す（`TASK-29`・
-    /// Issue #526）。
+    /// テスト専用: グローバル関数 `name` として [`NativeFn`] を登録し、
+    /// 割り当てた id を返す（`TASK-29`・Issue #526・#527）。
     ///
     /// 本番の登録 API（親→子の登録フレームを含む）は別 Issue（#155）で
     /// 追加する。本メソッドはそれまでの間、結合テスト
     /// （`tests/v8_worker.rs`）が親側の `NativeCall` dispatch
-    /// （[`dispatch_native_call`]）を検証するための唯一の登録経路であり、
-    /// `#[doc(hidden)] pub`（feature `test-support` 限定）とする。
+    /// （[`dispatch_native_call`]）と子の再起動時の登録し直しを検証する
+    /// ための唯一の登録経路であり、`#[doc(hidden)] pub`（feature
+    /// `test-support` 限定）とする。登録した名前と id はエンジンの寿命の
+    /// あいだ保持され、子を起動するたび（初回・再起動）に登録し直される。
     ///
-    /// [`MAX_NATIVE_FUNCTIONS`] を超えて登録しようとした場合は
-    /// [`JsEngineError::BindingFailed`] を返す（確保前検証。coding-rust.md
-    /// 「長さ・件数を上限検証してからアロケーションに使う」）。
+    /// 次のいずれかなら [`JsEngineError::BindingFailed`] を返し、何も登録
+    /// しない（確保前検証・fail-closed）:
+    ///
+    /// - 子が稼働中（稼働中の子への即時登録は #155 の担当。子が破棄されて
+    ///   いなければ登録できない）
+    /// - `name` が空・長すぎる・`,`・`=`・NUL を含む（環境変数で子へ渡す際の
+    ///   区切りを壊すため。#155 で登録フレームへ置き換えたら見直す）・
+    ///   既存の登録と重複する
+    /// - 件数が [`MAX_NATIVE_FUNCTIONS`] または子へ渡せる上限を超える
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn register_native_function_for_test(
         &mut self,
+        name: &str,
         func: ParentNativeFn,
     ) -> Result<u32, JsEngineError> {
+        if self.worker.is_some() {
+            return Err(JsEngineError::BindingFailed(
+                "cannot register a native function while the JS worker process is running; \
+                 live registration is not implemented yet"
+                    .to_string(),
+            ));
+        }
         if self.native_fns.len() >= MAX_NATIVE_FUNCTIONS {
             return Err(JsEngineError::BindingFailed(format!(
                 "cannot register more than {MAX_NATIVE_FUNCTIONS} native functions"
@@ -1096,7 +1160,17 @@ impl V8ProcessEngine {
                 "native function registry index does not fit in a u32".to_string(),
             )
         })?;
+        validate_new_host_binding(
+            &self.host_bindings,
+            &self.spawn_config.native_proxies_for_test,
+            name,
+            id,
+        )?;
         self.native_fns.push(Arc::new(Mutex::new(func)));
+        self.host_bindings.push(HostBinding {
+            name: name.to_string(),
+            id,
+        });
         Ok(id)
     }
 
@@ -1362,24 +1436,23 @@ impl V8ProcessEngine {
             // `super::worker` 側では読まず、変数の有無だけを見る。
             command.env(super::worker::TEST_HELLO_EXTRA_BYTE_ENV_VAR, "1");
         }
-        if !self.spawn_config.native_proxies_for_test.is_empty() {
-            // テスト専用（`TASK-29`・Issue #526）。本番の `new()` は常に
-            // 空のため、この環境変数は本番の子プロセスには渡らない。
-            // `TEST_NATIVE_PROXIES_ENV_VAR` 自体は feature `test-support`
-            // でのみ存在するため、参照だけをここで gate する
-            // （`native_proxies_for_test` フィールドの「空かどうか」の
-            // 確認は feature の有無に関わらず行う。空でない値を
-            // `test-support` 無効ビルドへ渡す経路は存在しない）。
+        // 子への注入関数の登録の唯一の入口（初回・再起動とも。Issue #527）。
+        if let Some(value) = child_native_proxies_env_value(
+            &self.host_bindings,
+            &self.spawn_config.native_proxies_for_test,
+        )? {
             #[cfg(feature = "test-support")]
+            command.env(super::worker::TEST_NATIVE_PROXIES_ENV_VAR, value);
+            #[cfg(not(feature = "test-support"))]
             {
-                let value = self
-                    .spawn_config
-                    .native_proxies_for_test
-                    .iter()
-                    .map(|(name, id)| format!("{name}={id}"))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                command.env(super::worker::TEST_NATIVE_PROXIES_ENV_VAR, value);
+                // 登録経路（#155）が無いビルドで空でない登録を黙って捨てない
+                // （実装済みを装わない。REPAIR-3）。
+                let _ = value;
+                return Err(JsEngineError::EngineUnavailable(
+                    "host-registered native functions cannot be installed into the JS worker \
+                     process: no registration transport is available in this build"
+                        .to_string(),
+                ));
             }
         }
         #[cfg(windows)]
@@ -2291,21 +2364,153 @@ fn discard_context_error(
     ensure_discarded_phrase(fallback())
 }
 
+/// 子へ環境変数で渡す `name=id` の組の名前として使えるかを検査する
+/// （[`validate_new_host_binding`] の一部。`,`・`=`・NUL は区切りを壊す）。
+fn validate_binding_name(name: &str) -> Result<(), JsEngineError> {
+    if name.is_empty() {
+        return Err(JsEngineError::BindingFailed(
+            "native function name must not be empty".to_string(),
+        ));
+    }
+    if name.len() > super::v8_engine::MAX_NATIVE_PROXY_NAME_BYTES {
+        return Err(JsEngineError::BindingFailed(format!(
+            "native function name exceeds the maximum supported length of {} bytes",
+            super::v8_engine::MAX_NATIVE_PROXY_NAME_BYTES
+        )));
+    }
+    if name.contains([',', '=', '\0']) {
+        return Err(JsEngineError::BindingFailed(
+            "native function name must not contain ',', '=' or NUL".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// 環境変数の値（`name=id` を `,` で連結）を組み立てる。件数は
+/// 呼び出し側が検証済みであること。
+fn join_proxies<'a>(entries: impl Iterator<Item = (&'a str, u32)>) -> String {
+    entries
+        .map(|(name, id)| format!("{name}={id}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// 新しいホスト登録（`name`・`id`）を追加してよいかを、確保（push）の前に
+/// 検証する（`register_native_function_for_test` から呼ばれる純粋関数。
+/// 子プロセスを使わずに単体テストできる。Issue #527）。
+///
+/// `existing` は登録済みの登録簿、`extra` は
+/// `WorkerSpawnConfigForTest::native_proxies_for_test`（子へ一緒に渡される
+/// 既存の経路）。名前の重複は大文字小文字を区別した完全一致で判定し、
+/// 追加後の件数・環境変数の長さが子側の上限
+/// （`MAX_TEST_NATIVE_PROXIES`・`MAX_TEST_NATIVE_PROXIES_ENV_VAR_BYTES`）を
+/// 超える場合も拒否する。
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+fn validate_new_host_binding(
+    existing: &[HostBinding],
+    extra: &[(String, u32)],
+    name: &str,
+    id: u32,
+) -> Result<(), JsEngineError> {
+    validate_binding_name(name)?;
+    let duplicate = existing.iter().any(|b| b.name == name) || extra.iter().any(|(n, _)| n == name);
+    if duplicate {
+        return Err(JsEngineError::BindingFailed(format!(
+            "native function {name:?} is already registered"
+        )));
+    }
+    let count = existing.len() + extra.len() + 1;
+    if count > super::worker::MAX_TEST_NATIVE_PROXIES {
+        return Err(JsEngineError::BindingFailed(format!(
+            "cannot register more than {} native functions into the JS worker process",
+            super::worker::MAX_TEST_NATIVE_PROXIES
+        )));
+    }
+    let value = join_proxies(
+        existing
+            .iter()
+            .map(|b| (b.name.as_str(), b.id))
+            .chain(extra.iter().map(|(n, i)| (n.as_str(), *i)))
+            .chain(std::iter::once((name, id))),
+    );
+    if value.len() > super::worker::MAX_TEST_NATIVE_PROXIES_ENV_VAR_BYTES {
+        return Err(JsEngineError::BindingFailed(format!(
+            "native function registrations exceed the maximum supported length of {} bytes",
+            super::worker::MAX_TEST_NATIVE_PROXIES_ENV_VAR_BYTES
+        )));
+    }
+    Ok(())
+}
+
+/// 子を起動するときに渡す注入関数の登録内容を組み立てる（`spawn_worker`
+/// から**毎回**呼ばれる、子への登録の唯一の入口。`TASK-29`・Issue #527）。
+///
+/// 並び順は `host_bindings`（ホスト登録簿）が先、`extra`
+/// （`native_proxies_for_test`）が後。空なら `None`（何も渡さない）。
+/// 件数・長さ・重複は登録時にも検証済みだが、多層防御として再確認し、
+/// 違反なら子を起動する前に `EngineUnavailable` を返す。#155 はこの関数の
+/// 中身を、Hello の後（`HANDSHAKE_TIMEOUT` の範囲内）の登録フレーム送信へ
+/// 置き換える。
+fn child_native_proxies_env_value(
+    host_bindings: &[HostBinding],
+    extra: &[(String, u32)],
+) -> Result<Option<String>, JsEngineError> {
+    let total = host_bindings.len() + extra.len();
+    if total == 0 {
+        return Ok(None);
+    }
+    let unavailable = |msg: String| JsEngineError::EngineUnavailable(msg);
+    if total > super::worker::MAX_TEST_NATIVE_PROXIES {
+        return Err(unavailable(format!(
+            "too many native functions to install into the JS worker process (maximum {})",
+            super::worker::MAX_TEST_NATIVE_PROXIES
+        )));
+    }
+    let entries: Vec<(&str, u32)> = host_bindings
+        .iter()
+        .map(|b| (b.name.as_str(), b.id))
+        .chain(extra.iter().map(|(n, i)| (n.as_str(), *i)))
+        .collect();
+    for (i, (name, _)) in entries.iter().enumerate() {
+        validate_binding_name(name).map_err(|e| unavailable(e.to_string()))?;
+        if entries.iter().take(i).any(|(n, _)| n == name) {
+            return Err(unavailable(format!(
+                "native function {name:?} is registered more than once"
+            )));
+        }
+    }
+    let value = join_proxies(entries.into_iter());
+    if value.len() > super::worker::MAX_TEST_NATIVE_PROXIES_ENV_VAR_BYTES {
+        return Err(unavailable(format!(
+            "native function registrations exceed the maximum supported length of {} bytes",
+            super::worker::MAX_TEST_NATIVE_PROXIES_ENV_VAR_BYTES
+        )));
+    }
+    Ok(Some(value))
+}
+
 /// エラーメッセージに "context was discarded" が含まれていなければ
 /// 追記する（[`discard_context_error`] が呼ぶ内部ヘルパー。Cursor Bugbot
 /// レビュー指摘 #503「Discarded-context errors omit required phrase」
 /// 対応）。
 fn ensure_discarded_phrase(err: JsEngineError) -> JsEngineError {
     const PHRASE: &str = "context was discarded";
+    const FRESH: &str = "the next evaluation runs in a fresh context";
+    // 失われた状態と次回の挙動の両方を必ず明示する（Issue #527）。
+    let complete = |mut msg: String| {
+        if !msg.contains(PHRASE) {
+            msg = format!("{msg}; {PHRASE}");
+        }
+        if !msg.contains(FRESH) {
+            msg = format!("{msg}; {FRESH}");
+        }
+        msg
+    };
     match err {
-        JsEngineError::EngineUnavailable(msg) if !msg.contains(PHRASE) => {
-            JsEngineError::EngineUnavailable(format!("{msg}; {PHRASE}"))
-        }
-        JsEngineError::Timeout(msg) if !msg.contains(PHRASE) => {
-            JsEngineError::Timeout(format!("{msg}; {PHRASE}"))
-        }
-        JsEngineError::ResourceLimitExceeded(msg) if !msg.contains(PHRASE) => {
-            JsEngineError::ResourceLimitExceeded(format!("{msg}; {PHRASE}"))
+        JsEngineError::EngineUnavailable(msg) => JsEngineError::EngineUnavailable(complete(msg)),
+        JsEngineError::Timeout(msg) => JsEngineError::Timeout(complete(msg)),
+        JsEngineError::ResourceLimitExceeded(msg) => {
+            JsEngineError::ResourceLimitExceeded(complete(msg))
         }
         other => other,
     }
@@ -3177,7 +3382,10 @@ mod tests {
         });
         match err {
             JsEngineError::EngineUnavailable(msg) => {
-                assert_eq!(msg, "boom; context was discarded");
+                assert_eq!(
+                    msg,
+                    "boom; context was discarded; the next evaluation runs in a fresh context"
+                );
             }
             other => panic!("expected EngineUnavailable, got: {other:?}"),
         }
@@ -3333,28 +3541,150 @@ mod tests {
     fn js_1_ensure_discarded_phrase_appends_missing_phrase_for_all_discard_variants() {
         match ensure_discarded_phrase(JsEngineError::EngineUnavailable("boom".to_string())) {
             JsEngineError::EngineUnavailable(msg) => {
-                assert_eq!(msg, "boom; context was discarded");
+                assert_eq!(
+                    msg,
+                    "boom; context was discarded; the next evaluation runs in a fresh context"
+                );
             }
             other => panic!("expected EngineUnavailable, got: {other:?}"),
         }
         match ensure_discarded_phrase(JsEngineError::Timeout("slow".to_string())) {
             JsEngineError::Timeout(msg) => {
-                assert_eq!(msg, "slow; context was discarded");
+                assert_eq!(
+                    msg,
+                    "slow; context was discarded; the next evaluation runs in a fresh context"
+                );
             }
             other => panic!("expected Timeout, got: {other:?}"),
         }
         match ensure_discarded_phrase(JsEngineError::ResourceLimitExceeded("oom".to_string())) {
             JsEngineError::ResourceLimitExceeded(msg) => {
-                assert_eq!(msg, "oom; context was discarded");
+                assert_eq!(
+                    msg,
+                    "oom; context was discarded; the next evaluation runs in a fresh context"
+                );
             }
             other => panic!("expected ResourceLimitExceeded, got: {other:?}"),
         }
         // 既に文言が含まれる場合は重複させない。
         match ensure_discarded_phrase(JsEngineError::EngineUnavailable(
-            "boom; context was discarded".to_string(),
+            "boom; context was discarded; the next evaluation runs in a fresh context".to_string(),
         )) {
             JsEngineError::EngineUnavailable(msg) => {
-                assert_eq!(msg, "boom; context was discarded");
+                assert_eq!(
+                    msg,
+                    "boom; context was discarded; the next evaluation runs in a fresh context"
+                );
+            }
+            other => panic!("expected EngineUnavailable, got: {other:?}"),
+        }
+    }
+
+    /// `ensure_discarded_phrase`: 片方の文言だけがあるときは足りない方だけを足す。
+    #[test]
+    fn js_1_ensure_discarded_phrase_appends_only_the_missing_half() {
+        match ensure_discarded_phrase(JsEngineError::EngineUnavailable(
+            "boom; context was discarded".to_string(),
+        )) {
+            JsEngineError::EngineUnavailable(msg) => assert_eq!(
+                msg,
+                "boom; context was discarded; the next evaluation runs in a fresh context"
+            ),
+            other => panic!("expected EngineUnavailable, got: {other:?}"),
+        }
+        match ensure_discarded_phrase(JsEngineError::Timeout(
+            "x and was killed; the next evaluation runs in a fresh context".to_string(),
+        )) {
+            JsEngineError::Timeout(msg) => assert_eq!(
+                msg,
+                "x and was killed; the next evaluation runs in a fresh context; \
+                 context was discarded"
+            ),
+            other => panic!("expected Timeout, got: {other:?}"),
+        }
+    }
+
+    fn hb(name: &str, id: u32) -> HostBinding {
+        HostBinding {
+            name: name.to_string(),
+            id,
+        }
+    }
+
+    fn binding_failed_msg(r: Result<(), JsEngineError>) -> String {
+        match r {
+            Err(JsEngineError::BindingFailed(msg)) => msg,
+            other => panic!("expected BindingFailed, got: {other:?}"),
+        }
+    }
+
+    /// Issue #527: 登録時検証（空・長すぎる・区切り文字・重複）。
+    #[test]
+    fn js_1_validate_new_host_binding_rejects_invalid_names() {
+        assert_eq!(
+            binding_failed_msg(validate_new_host_binding(&[], &[], "", 0)),
+            "native function name must not be empty"
+        );
+        let long = "a".repeat(super::super::v8_engine::MAX_NATIVE_PROXY_NAME_BYTES + 1);
+        assert_eq!(
+            binding_failed_msg(validate_new_host_binding(&[], &[], &long, 0)),
+            "native function name exceeds the maximum supported length of 256 bytes"
+        );
+        for bad in ["a,b", "a=b", "a\0b"] {
+            assert_eq!(
+                binding_failed_msg(validate_new_host_binding(&[], &[], bad, 0)),
+                "native function name must not contain ',', '=' or NUL"
+            );
+        }
+        assert_eq!(
+            binding_failed_msg(validate_new_host_binding(&[hb("f", 0)], &[], "f", 1)),
+            "native function \"f\" is already registered"
+        );
+        assert_eq!(
+            binding_failed_msg(validate_new_host_binding(
+                &[],
+                &[("g".to_string(), 0)],
+                "g",
+                1
+            )),
+            "native function \"g\" is already registered"
+        );
+        // 大文字小文字は区別する。
+        assert!(validate_new_host_binding(&[hb("f", 0)], &[], "F", 1).is_ok());
+    }
+
+    /// Issue #527: 件数上限（17 件目）と長さ上限。
+    #[test]
+    fn js_1_validate_new_host_binding_enforces_count_and_length_limits() {
+        let existing: Vec<HostBinding> = (0..16u32).map(|i| hb(&format!("f{i}"), i)).collect();
+        assert_eq!(
+            binding_failed_msg(validate_new_host_binding(&existing, &[], "extra", 16)),
+            "cannot register more than 16 native functions into the JS worker process"
+        );
+        // 256 バイト名 × 15 件 + 1 件で 4096 バイトを超える。
+        let existing: Vec<HostBinding> = (0..15u32).map(|i| hb(&format!("{i:0>256}"), i)).collect();
+        assert_eq!(
+            binding_failed_msg(validate_new_host_binding(
+                &existing,
+                &[],
+                &"z".repeat(256),
+                15
+            )),
+            "native function registrations exceed the maximum supported length of 4096 bytes"
+        );
+    }
+
+    /// Issue #527: 差し込み口の値の組み立て（空は None・登録簿が先）。
+    #[test]
+    fn js_1_child_native_proxies_env_value_orders_bindings_before_extra() {
+        assert_eq!(child_native_proxies_env_value(&[], &[]).expect("ok"), None);
+        let value =
+            child_native_proxies_env_value(&[hb("f", 0), hb("g", 1)], &[("h".to_string(), 7)])
+                .expect("ok");
+        assert_eq!(value.as_deref(), Some("f=0,g=1,h=7"));
+        match child_native_proxies_env_value(&[hb("f", 0)], &[("f".to_string(), 1)]) {
+            Err(JsEngineError::EngineUnavailable(msg)) => {
+                assert_eq!(msg, "native function \"f\" is registered more than once");
             }
             other => panic!("expected EngineUnavailable, got: {other:?}"),
         }
