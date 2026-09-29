@@ -669,6 +669,22 @@ fn check_payload_file(
     };
     match std::fs::symlink_metadata(&path) {
         Ok(meta) if meta.file_type().is_file() => {}
+        // 壊れた symlink（リンク先が存在しない）は `read_dir` には名前が現れる
+        // ため `check_entries` は欠損を報告できない。実体が無いので欠損として
+        // 報告し、実体のある非通常ファイル（`NotRegularFile`）と区別する。
+        Ok(meta)
+            if meta.file_type().is_symlink()
+                && matches!(
+                    std::fs::metadata(&path),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+                ) =>
+        {
+            let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+            return push(MixupDetail::MissingEntry {
+                dir,
+                name: TARGET_FILE_NAME.to_string(),
+            });
+        }
         Ok(_) => return push(MixupDetail::NotRegularFile { path }),
         // 欠落は check_entries が MissingEntry として報告済み。
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
@@ -886,6 +902,35 @@ fn prof_3_unexpected_entry_is_detected() {
     assert_eq!((m.index, m.kind), (2, Some(kind)));
     assert!(
         matches!(&m.detail, MixupDetail::UnexpectedEntry { name, .. } if name == "stray.dat"),
+        "{m}"
+    );
+}
+
+/// `PROF-3`・#185（陰性対照）: 壊れた symlink を欠損（`MissingEntry`）として
+/// 1 件だけ報告し、`NotRegularFile` とは区別する。
+#[cfg(unix)]
+#[test]
+fn prof_3_dangling_symlink_is_reported_as_missing() {
+    let tmp = TempDir::new();
+    let (_, mixups) = run_round(tmp.path());
+    assert_eq!(mixups.len(), 0, "汚染前は 0 件");
+
+    let kind = DataKind::ALL[0];
+    let path = tmp
+        .path()
+        .join("profile-3")
+        .join(kind.dir_name())
+        .join(TARGET_FILE_NAME);
+    std::fs::remove_file(&path).expect("実体の削除");
+    std::os::unix::fs::symlink(tmp.path().join("no-such-target"), &path)
+        .expect("壊れた symlink の作成");
+
+    let mixups = find_mixups(tmp.path(), PROFILE_COUNT);
+    assert_eq!(mixups.len(), 1, "{mixups:?}");
+    let m = &mixups[0];
+    assert_eq!((m.index, m.kind), (3, Some(kind)));
+    assert!(
+        matches!(&m.detail, MixupDetail::MissingEntry { name, .. } if name == TARGET_FILE_NAME),
         "{m}"
     );
 }
