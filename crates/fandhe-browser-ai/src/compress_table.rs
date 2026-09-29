@@ -456,6 +456,8 @@ pub struct CompressedRows {
 /// - Table は行 `tr` 直下の `td`/`th` を文書順に `" | "` で連結する。空セルは
 ///   空文字列にして列位置を保つ。`colspan` 分の空セル埋めはしない（セル数基準）
 /// - List は `li` 自身を 1 セルとする
+/// - `hidden`/`aria-hidden="true"` の行、およびそれらを祖先（`tbody`・表自身を含む）に
+///   持つ行は除外し、20 行の予算も消費しない
 /// - セル文字列は `hidden`/`aria-hidden="true"` 配下と `script`/`style`/
 ///   `noscript`/`template` を除き、HTML 空白と U+00A0 を 1 つの半角スペースへ
 ///   畳んで trim し、[`MAX_CELL_TEXT_CHARS`] 文字で切る。走査は
@@ -467,7 +469,12 @@ pub struct CompressedRows {
 ///   出力形式が決まる統合時に判断する既知の制約）
 pub fn compress_rows(doc: &Document, structure: &RegularStructure) -> CompressedRows {
     let mut rows = Vec::with_capacity(structure.body_rows.len().min(MAX_TABLE_ROWS));
-    for &row in structure.body_rows.iter().take(MAX_TABLE_ROWS) {
+    // 非表示の行・祖先（`tbody`・表自身・その外側を含む）の行は除外してから
+    // 20 行の予算を数える（`build_snapshot` の非表示サブツリー除外に合わせる）。
+    let visible_rows = structure.body_rows.iter().copied().filter(|&row| {
+        !is_hidden_element(doc, row) && !doc.ancestors(row).any(|a| is_hidden_element(doc, a))
+    });
+    for row in visible_rows.take(MAX_TABLE_ROWS) {
         let cells: Vec<NodeId> = match structure.kind {
             StructureKind::Table => doc
                 .children(row)
@@ -1039,6 +1046,30 @@ mod tests {
             "table",
         );
         assert_eq!(texts(&r), ["ab | "]);
+    }
+
+    /// AISNAP-2（TASK-12.3）: 非表示の行・tbody・表は除外され、20 行の予算も消費しない。
+    #[test]
+    fn aisnap_2_compress_rows_skips_hidden_rows() {
+        let r = rows_of(
+            "<table><tr><td>a<tr hidden><td>h1<tr aria-hidden=true><td>h2\
+             <tbody hidden><tr><td>h3</tbody><tbody><tr><td>b</table>",
+            "table",
+        );
+        assert_eq!(texts(&r), ["a", "b"]);
+        let mut h = String::from("<table>");
+        for i in 0..25 {
+            h.push_str(&format!("<tr hidden><td>x{i}"));
+        }
+        for i in 0..21 {
+            h.push_str(&format!("<tr><td>v{i}"));
+        }
+        h.push_str("</table>");
+        let r = rows_of(&h, "table");
+        assert_eq!(r.rows.len(), 20);
+        assert_eq!(texts(&r)[0], "v0");
+        let r = rows_of("<table aria-hidden=true><tr><td>a</table>", "table");
+        assert!(r.rows.is_empty());
     }
 
     /// AISNAP-2（TASK-12.3）: 走査ステップ上限で打ち切り panic しない。
