@@ -11,8 +11,10 @@
 //! （TASK-12.5・Issue #83）が table/list ごとに [`detect_regular_structure`] を
 //! 呼び、TASK-12.2（#80）・12.3（#81）・12.4（#82）が結果の
 //! [`RegularStructure::header_cells`]・[`RegularStructure::body_rows`] を再走査
-//! なしで使う想定である。ヘッダの個別 ref 付与・行の圧縮表現・`truncated_rows`
-//! 注記・統合は未実装（実装済みを装わない。REPAIR-3）。
+//! なしで使う想定である。ヘッダの個別 ref 付与は実装済み
+//! （[`assign_header_refs`]・`TASK-12.2`・Issue #80。統合前のため呼び出し元は
+//! 無い）。行の圧縮表現・`truncated_rows` 注記・統合は未実装（実装済みを装わない。
+//! REPAIR-3）。
 //!
 //! # 判定規則（table）
 //!
@@ -34,7 +36,10 @@
 //! あるが、共通化は統合時（TASK-12.5）に検討する（波及範囲を本モジュールに
 //! 閉じるため複製している）。
 
-use crate::snapshot::compute_role;
+use crate::snapshot::element_ref::ElementSignature;
+use crate::snapshot::{
+    ElementRef, NameIndex, RefAllocator, RefError, compute_name_with_index, compute_role,
+};
 use fandhe_browser_core::dom::{Document, NodeId};
 
 /// HTML 名前空間の URI。`core` 側の定義が `pub(crate)` のためローカルに持つ。
@@ -397,6 +402,82 @@ pub fn detect_regular_structure(doc: &Document, id: NodeId) -> TableDetection {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ヘッダ行の個別 ref 付与（TASK-12.2・Issue #80）
+// ---------------------------------------------------------------------------
+
+/// ヘッダ行 1 セル分の ref 付与結果（`AISNAP-2`・`AISNAP-10`・`TASK-12.2`）。
+///
+/// 後続の行圧縮（#81）・スキーマ統合（#83）が、再走査なしでセルと ref を
+/// 対応づけるために使う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HeaderCellRef {
+    /// `th`/`td` 要素自身（ref から DOM を再特定する用）。
+    pub cell: NodeId,
+    /// 算出した role トークン（`th` は通常 `columnheader`）。
+    pub role: String,
+    /// accessible name。
+    pub name: String,
+    /// name 算出が上限で打ち切られたか。
+    pub name_truncated: bool,
+    /// 発行した ref（文字列化は [`ElementRef::to_ref_string`]）。
+    pub elem_ref: ElementRef,
+}
+
+/// ヘッダ行の識別属性。`snapshot/build.rs` の `discriminator` のうち `th`/`td` に
+/// 該当する `id` 属性だけを見る（共通化は TASK-12.5 で検討するため複製している）。
+fn header_discriminator(doc: &Document, id: NodeId) -> Option<&str> {
+    doc.attribute(id, "id").filter(|s| !s.is_empty())
+}
+
+/// 規則的な表のヘッダ行の各セルへ個別 ref を付与する（`AISNAP-2`・`TASK-12.2`）。
+///
+/// 戻り値は `structure.header_cells` と 1:1 で同じ順序（`colspan` があっても
+/// 列数ではなくセル数）。ヘッダ行が無い表・`List` では空の `Vec` を返す。
+/// ref の scope は呼び出し側が先に発行した `table_ref`（テーブル要素自身）に
+/// 固定する。`thead`/`tr` を経由しないのは、圧縮表現ではそれらのノードが
+/// 消えるため。マークアップの包み方（`thead` の有無）で ref が変わらない。
+///
+/// 呼び出し文脈: TASK-12.5（#83）の `build_snapshot` 統合で、table ノードの ref を
+/// 発行した直後に、スナップショット全体で共有する `refs` / `index` を渡して
+/// 呼ぶ想定。現時点では呼び出し元は無い。非表示セルも `header_cells` との
+/// 対応を保つため除外しない（既知の制約）。
+///
+/// ref 発行の失敗は [`RefError`] をそのまま返す。件数は `header_cells.len()`
+/// （検出時に [`MAX_COLUMNS`] 以下へ制限済み）で上限が決まる。
+pub fn assign_header_refs(
+    doc: &Document,
+    index: &NameIndex<'_>,
+    structure: &RegularStructure,
+    table_ref: Option<ElementRef>,
+    refs: &mut RefAllocator,
+) -> Result<Vec<HeaderCellRef>, RefError> {
+    let mut out = Vec::with_capacity(structure.header_cells.len());
+    for &cell in &structure.header_cells {
+        let role = compute_role(doc, cell)
+            .map(|r| r.as_str().to_string())
+            .unwrap_or_else(|| "columnheader".to_string());
+        let name = compute_name_with_index(doc, index, cell);
+        let mut sig = ElementSignature::new(&role, &name.text);
+        if let Some(d) = header_discriminator(doc, cell) {
+            sig = sig.with_discriminator(d);
+        }
+        if let Some(t) = table_ref {
+            sig = sig.with_scope(t);
+        }
+        let elem_ref = refs.allocate_signature(&sig)?;
+        out.push(HeaderCellRef {
+            cell,
+            role,
+            name: name.text,
+            name_truncated: name.truncated,
+            elem_ref,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,5 +713,146 @@ mod tests {
             detect_regular_structure(&doc, doc.root()),
             TableDetection::Irregular(IrregularReason::NotTableOrList)
         );
+    }
+
+    // ---- TASK-12.2（Issue #80）ヘッダ ref 付与 ----
+
+    fn header_refs(
+        doc: &Document,
+        refs: &mut RefAllocator,
+        sel: &str,
+    ) -> (Vec<HeaderCellRef>, RegularStructure) {
+        let table = select(doc, sel);
+        let s = detect_regular_structure(doc, table)
+            .as_regular()
+            .expect("規則的")
+            .clone();
+        let index = NameIndex::build(doc);
+        let table_ref = refs.allocate("table", "").expect("発行できる");
+        let out = assign_header_refs(doc, &index, &s, Some(table_ref), refs).expect("成功");
+        (out, s)
+    }
+
+    fn strs(v: &[HeaderCellRef]) -> Vec<String> {
+        v.iter().map(|h| h.elem_ref.to_ref_string()).collect()
+    }
+
+    /// AISNAP-2（TASK-12.2・Issue #80）: ref 数がヘッダセル数と一致し重複しない。
+    #[test]
+    fn aisnap_2_header_refs_count_and_unique() {
+        let doc =
+            parse("<table><thead><tr><th>a<th>b<th>c</thead><tbody><tr><td>1<td>2<td>3</table>");
+        let mut refs = RefAllocator::new();
+        let (out, s) = header_refs(&doc, &mut refs, "table");
+        assert_eq!(out.len(), 3);
+        assert_eq!(s.header_cells.len(), 3);
+        assert_eq!(
+            out.iter().map(|h| h.cell).collect::<Vec<_>>(),
+            s.header_cells
+        );
+        let names: Vec<&str> = out.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+        assert!(out.iter().all(|h| h.role == "columnheader"));
+        let set: std::collections::HashSet<String> = strs(&out).into_iter().collect();
+        assert_eq!(set.len(), 3);
+    }
+
+    /// AISNAP-2（TASK-12.2）: 同名・空名ヘッダも出現番号で一意になる。
+    #[test]
+    fn aisnap_2_header_refs_same_name_unique() {
+        let doc = parse(
+            "<table><thead><tr><th>x<th>x<th>x<th></thead><tbody><tr><td>1<td>2<td>3<td>4</table>",
+        );
+        let mut refs = RefAllocator::new();
+        let (out, _) = header_refs(&doc, &mut refs, "table");
+        let set: std::collections::HashSet<String> = strs(&out).into_iter().collect();
+        assert_eq!(out.len(), 4);
+        assert_eq!(set.len(), 4);
+    }
+
+    /// AISNAP-2（TASK-12.2）: 共有アロケータ上で 2 表の同名ヘッダ ref が出現番号で一意になる。
+    #[test]
+    fn aisnap_2_header_refs_shared_allocator() {
+        let doc = parse(
+            "<table id=t1><thead><tr><th>a<th>b</thead><tbody><tr><td>1<td>2</table>\
+             <table id=t2><thead><tr><th>a<th>b</thead><tbody><tr><td>1<td>2</table>",
+        );
+        let mut refs = RefAllocator::new();
+        let (o1, _) = header_refs(&doc, &mut refs, "#t1");
+        let (o2, _) = header_refs(&doc, &mut refs, "#t2");
+        // 同名親の scope は (digest, variant) が同じため digest は一致し、
+        // 出現番号（先行順）で区別される。
+        assert_eq!(o1[0].elem_ref.digest, o2[0].elem_ref.digest);
+        assert_eq!(o1[0].elem_ref.occurrence, 1);
+        assert_eq!(o2[0].elem_ref.occurrence, 2);
+        let mut all = strs(&o1);
+        all.extend(strs(&o2));
+        let set: std::collections::HashSet<String> = all.iter().cloned().collect();
+        assert_eq!(set.len(), 4);
+    }
+
+    /// AISNAP-2（TASK-12.2）: colspan があっても出力長は header_cells.len()。
+    #[test]
+    fn aisnap_2_header_refs_colspan() {
+        let doc = parse(
+            "<table><thead><tr><th colspan=2>a<th>b</thead><tbody><tr><td>1<td>2<td>3</table>",
+        );
+        let mut refs = RefAllocator::new();
+        let (out, s) = header_refs(&doc, &mut refs, "table");
+        assert_eq!(s.column_count, 3);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// AISNAP-2（TASK-12.2）: thead の有無・データ行数に依存せず ref が安定する。
+    #[test]
+    fn aisnap_2_header_refs_stable_across_markup() {
+        let with_thead = parse("<table><thead><tr><th>a<th>b</thead><tbody><tr><td>1<td>2</table>");
+        let no_thead = parse("<table><tr><th>a<th>b<tr><td>1<td>2</table>");
+        let many_rows = parse(
+            "<table><thead><tr><th>a<th>b</thead><tbody>\
+             <tr><td>1<td>2<tr><td>3<td>4<tr><td>5<td>6<tr><td>7<td>8<tr><td>9<td>0</table>",
+        );
+        let a = strs(&header_refs(&with_thead, &mut RefAllocator::new(), "table").0);
+        let b = strs(&header_refs(&no_thead, &mut RefAllocator::new(), "table").0);
+        let c = strs(&header_refs(&many_rows, &mut RefAllocator::new(), "table").0);
+        assert_eq!(a.len(), 2);
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    /// AISNAP-2（TASK-12.2）: id 付き th は別ダイジェストで、前方挿入に影響されない。
+    #[test]
+    fn aisnap_2_header_refs_discriminator() {
+        let base = parse("<table><thead><tr><th>n<th id=k>n</thead><tbody><tr><td>1<td>2</table>");
+        let shifted = parse(
+            "<table><thead><tr><th>n<th>n<th id=k>n</thead><tbody><tr><td>1<td>2<td>3</table>",
+        );
+        let (o1, _) = header_refs(&base, &mut RefAllocator::new(), "table");
+        let (o2, _) = header_refs(&shifted, &mut RefAllocator::new(), "table");
+        assert_ne!(o1[0].elem_ref.digest, o1[1].elem_ref.digest);
+        assert_eq!(o1[1].elem_ref, o2[2].elem_ref);
+    }
+
+    /// AISNAP-2（TASK-12.2）: thead 内の td も role=cell で ref が付く。
+    #[test]
+    fn aisnap_2_header_refs_td_header() {
+        let doc = parse("<table><thead><tr><td>a<td>b</thead><tbody><tr><td>1<td>2</table>");
+        let (out, _) = header_refs(&doc, &mut RefAllocator::new(), "table");
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|h| h.role == "cell"));
+    }
+
+    /// AISNAP-2（TASK-12.2）: ヘッダ行が無い表・一覧では空。
+    #[test]
+    fn aisnap_2_header_refs_none() {
+        for (html, sel) in [
+            ("<table><tr><td>1<td>2<tr><td>3<td>4</table>", "table"),
+            ("<ul><li>a<li>b</ul>", "ul"),
+            ("<ol><li>a<li>b</ol>", "ol"),
+        ] {
+            let doc = parse(html);
+            let (out, _) = header_refs(&doc, &mut RefAllocator::new(), sel);
+            assert_eq!(out, Vec::<HeaderCellRef>::new());
+        }
     }
 }
