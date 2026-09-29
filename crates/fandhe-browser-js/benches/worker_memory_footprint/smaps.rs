@@ -99,9 +99,10 @@ pub fn parse_smaps_rollup(text: &str) -> Option<SmapsRollup> {
     })
 }
 
-/// `"Key:      1234 kB"` 形式（末尾の単位・前後の空白は任意個数）の 1 行
-/// を `(key, value_kib)` へ解釈する。形式に合わない行（アドレス範囲の
-/// 行・空行等）は `None` を返し、呼び出し側が読み飛ばす。
+/// `"Key:      1234 kB"` 形式（末尾の `kB` 単位は必須・前後の空白は
+/// 任意個数）の 1 行を `(key, value_kib)` へ解釈する。形式に合わない行
+/// （アドレス範囲の行・空行・`kB` 以外の単位・末尾に余分なトークンが
+/// 残る行等）は `None` を返し、呼び出し側が読み飛ばす。
 fn parse_kib_line(line: &str) -> Option<(&str, u64)> {
     let (key_part, rest) = line.split_once(':')?;
     let key = key_part.trim();
