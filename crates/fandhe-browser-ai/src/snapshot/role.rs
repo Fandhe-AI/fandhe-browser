@@ -104,6 +104,7 @@ const KNOWN_ROLES: &[&str] = &[
     "listitem",
     "log",
     "main",
+    "mark",
     "marquee",
     "math",
     "meter",
@@ -378,17 +379,16 @@ fn implicit_role(doc: &Document, id: NodeId) -> ComputedRole {
 /// `role` 属性の値から、有効な明示 role を算出する。
 ///
 /// 空白区切りのトークン列を先頭から走査し、[`KNOWN_ROLES`] に大文字小文字を
-/// 区別せず一致する最初のトークンを採用する。採用トークンが
+/// 区別して完全一致する最初のトークンを採用する（WAI-ARIA の role 値は
+/// 大文字小文字を区別するため `Button` は無効トークンとして読み飛ばす）。採用トークンが
 /// `none`/`presentation` で競合解決により無視される場合は `None`
 /// （暗黙 role へ）を返し、次のトークンは試さない。`role` 属性は名前空間を
 /// 問わず見る。
 fn explicit_role(doc: &Document, id: NodeId) -> Option<ComputedRole> {
     let value = doc.attribute(id, "role")?;
-    let known = value.split_ascii_whitespace().find_map(|token| {
-        KNOWN_ROLES
-            .iter()
-            .find(|known| token.eq_ignore_ascii_case(known))
-    })?;
+    let known = value
+        .split_ascii_whitespace()
+        .find_map(|token| KNOWN_ROLES.iter().find(|known| token == **known))?;
     if (*known == "none" || *known == "presentation") && ignores_presentational_role(doc, id) {
         return None;
     }
@@ -563,10 +563,23 @@ mod tests {
             "button",
             RoleSource::Explicit,
         );
+        // role 値は大文字小文字を区別する。`Button` は無効で次トークンへ委ねる。
+        check(
+            r#"<div role="Button link">x</div>"#,
+            "div",
+            "link",
+            RoleSource::Explicit,
+        );
         check(
             r#"<div role="Button">x</div>"#,
             "div",
-            "button",
+            "generic",
+            RoleSource::Fallback,
+        );
+        check(
+            r#"<div role="mark">x</div>"#,
+            "div",
+            "mark",
             RoleSource::Explicit,
         );
         check(
