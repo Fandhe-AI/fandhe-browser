@@ -79,6 +79,27 @@ VS 2026 では v143 ツールセット（`...x86.x64`）と ATL（`...ATL`）の
 
 新規導入は `winget install Microsoft.VisualStudio.2022.BuildTools --override "--add <コンポーネント ID> --passive"` の形式でも行えます。コンポーネント ID は Microsoft Learn の一覧で確認してください。
 
+### v143 ツールセットをビルドで選択する
+
+VS 2026 では、v143 を導入しても既定のツールセットは v145 のままです。Servo 組込ビルドが v143 を使うよう、ビルドを実行するシェルで v143 の開発者環境を明示的に選択します（本手順は Linux 上で作成しており、実機の Windows では未検証です）。
+
+1. 「x64 Native Tools Command Prompt」ではなく、通常の `cmd.exe` から `vcvarsall.bat` を `-vcvars_ver` 付きで呼び出します。`-vcvars_ver` には導入した v143 の版（前提の確認コマンドで表示される `14.44` 等）を `14.4` のように上位 2 桁で、または完全な版番号で指定します。
+
+   ```bat
+   rem <VS のインストール先> は vswhere で得た installationPath に置き換える
+   "<VS のインストール先>\VC\Auxiliary\Build\vcvarsall.bat" x64 -vcvars_ver=14.4
+   ```
+
+2. 同じシェルから Git Bash（`bash`）を起動して `make` を実行します。`vcvarsall.bat` が設定した環境変数（`PATH`・`INCLUDE`・`LIB`・`VCToolsVersion`）が引き継がれ、Rust の `cc` クレートや `cmake` は `PATH` 上の `cl.exe` を使います。
+3. ビルド前に、実際に使われるコンパイラが v143 であることを確認します。
+
+   ```bat
+   echo %VCToolsVersion%
+   cl
+   ```
+
+   `VCToolsVersion` が 14.30 以上 14.50 未満であり、`cl` の出力の `Version 19.4x`（14.4x に対応。v143 は 19.3x〜19.4x）であれば v143 が選択されています。`VCToolsVersion` が 14.50 以上（v145）、または `cl` が `19.5x` 以降を示す場合は、`-vcvars_ver` の指定を見直し、`vcvarsall.bat` を新しいシェルで再実行してください。
+
 ### Python と uv
 
 - Python 3 は `winget` の公式パッケージ、[python.org](https://www.python.org/downloads/windows/) の公式インストーラ、または `choco install python` で導入します。
@@ -129,6 +150,7 @@ python -m uv --version
 
 | 症状 | 原因と対処 |
 | ---- | ---------- |
+| ビルドで v145（14.50 以上）のコンパイラが使われる | v143 を導入しても既定は v145 のままです。[v143 ツールセットをビルドで選択する](#v143-ツールセットをビルドで選択する) の手順で `vcvarsall.bat -vcvars_ver=14.4` を指定し、`cl` の版を確認してください |
 | `atlbase.h` が見つからない | v143 向けではなく v145 向け ATL を入れている可能性があります。v143 向けのコンポーネントを追加してください |
 | パスが長すぎるエラー | `core.longpaths` を有効化し、`CARGO_TARGET_DIR` を短いパスにします。リポジトリも浅いパスに clone します |
 | `make` が `/bin/bash` を見つけられない | PowerShell や cmd からではなく、Git Bash など Windows 側の bash から実行してください（WSL は Linux ビルドになります） |
