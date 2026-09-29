@@ -19,7 +19,7 @@
 //! - role（役割）算出: TASK-11.3（Issue #72）
 //! - accessible name（アクセシブルネーム）算出: TASK-11.4（Issue #73）を
 //!   3 分割。ARIA 属性（`aria-labelledby`/`aria-label`）: TASK-11.4.1
-//!   （Issue #544）。HTML ネイティブのラベル付け（`alt`・`title`・
+//!   （Issue #544）で実装済み。HTML ネイティブのラベル付け（`alt`・`title`・
 //!   `value`・`placeholder`・submit/reset/image の既定ラベル・
 //!   `label[for]`・label による包含）: TASK-11.4.2（Issue #545）で実装済み。
 //!   子孫テキスト・優先順位統合・文書ルートの `<title>`: TASK-11.4.3
@@ -46,9 +46,10 @@ pub use state::{CheckedState, State, compute_state};
 ///   算出は TASK-11.3（Issue #72）が担う
 /// - `name`: accessible name。空文字列は「名前なし」を表す。
 ///   算出は TASK-11.4（Issue #73）が担う。ネイティブのラベル付け分は
-///   [`name::compute_name`]（TASK-11.4.2・Issue #545）で実装済み。
-///   ARIA・子孫テキストとの優先順位統合は TASK-11.4.1/11.4.3
-///   （Issue #544・#546）が担う
+///   [`name::compute_name`]（TASK-11.4.2・Issue #545）、ARIA 属性分は
+///   同関数の優先順位（`aria-labelledby` → `aria-label` → ネイティブ）で
+///   実装済み（TASK-11.4.1・Issue #544）。子孫テキストによる命名は
+///   TASK-11.4.3（Issue #546）が担う
 /// - `r#ref`: role + name シグネチャによる再特定要求（`AISNAP-10`）。
 ///   `None` は ref を振らないノード（例: document ルート）を表す。
 ///   値の形式（シグネチャ方式・同名要素の一意化）は TASK-11.6（Issue #75・

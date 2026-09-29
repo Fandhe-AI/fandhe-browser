@@ -1,17 +1,34 @@
 //! `snapshot::Node::name` フィールドの算出ロジック（`AISNAP-1`・`TASK-11.4`・
 //! `MS-2`）。
 //!
-//! 本ファイル（TASK-11.4.2・Issue #545）が実装するのは、accessible name の
-//! 出所のうち **HTML ネイティブのラベル付け**（`alt`・`title`・`value`・
-//! `placeholder`・submit/reset/image の既定ラベル・`label[for]`・label に
-//! よる包含）のみである。以下は本 Issue のスコープ外とし、後続タスクへ
-//! 引き継ぐ（実装済みを装わない。REPAIR-3）。
+//! 本ファイルが実装する accessible name の出所は次の 2 系統である。
 //!
-//! - ARIA 属性による明示的な命名（`aria-labelledby`・`aria-label`）:
-//!   TASK-11.4.1（Issue #544）
-//! - 子孫テキストからの名前（`button`・`a`・見出しの内容）・
-//!   `hidden`/`aria-hidden` 子孫の除外・埋め込みコントロールの値・
-//!   全体の優先順位統合・文書ルートの `<title>` による命名:
+//! - **ARIA 属性による明示的な命名**（TASK-11.4.1・Issue #544）:
+//!   `aria-labelledby`（IDREF リストの参照先テキストをトークン順に連結）と
+//!   `aria-label`。accname 1.2 の step 2B・2C に相当し、全要素で下記の
+//!   ネイティブ規則より**前**に評価する
+//! - **HTML ネイティブのラベル付け**（TASK-11.4.2・Issue #545）: `alt`・
+//!   `title`・`value`・`placeholder`・submit/reset/image の既定ラベル・
+//!   `label[for]`・label による包含
+//!
+//! 全体の算出順序は `aria-labelledby` → `aria-label` → ネイティブ
+//! （[`compute_name_with_index`]）。ただし `input[type=hidden]` は
+//! アクセシビリティツリーへ公開されないため ARIA より前に常に名前なしとする。
+//!
+//! `aria-labelledby` の参照先の扱い（#544 の範囲）: 参照先自身の
+//! `aria-label` があれば子孫テキストより優先し、参照先自身の
+//! `aria-labelledby` は辿らない（連鎖・循環を構造的に避ける）。参照先が
+//! `img` なら `alt` を使い、それ以外は子孫テキスト（テキストノードと
+//! 子孫 `img` の `alt`。`script`/`style`/`noscript`/`template` は除く）を使う。
+//!
+//! 以下は本 Issue のスコープ外とし、後続タスクへ引き継ぐ（実装済みを装わない。
+//! REPAIR-3）。
+//!
+//! - 子孫テキストからの再帰的な名前算出（`button`・`a`・見出しの内容、
+//!   参照先の子孫が持つ `aria-label` の再帰的な採用）・
+//!   `hidden`/`aria-hidden` 子孫の除外・埋め込みコントロールの値・参照先への
+//!   ネイティブ規則の完全適用（本 Issue は `img` の `alt` のみ補完）・
+//!   全体の優先順位の最終調整・文書ルートの `<title>` による命名:
 //!   TASK-11.4.3（Issue #546）
 //! - `fieldset`→`legend`・`table`→`caption`・`figure`→`figcaption`・SVG の
 //!   `<title>`・`aria-describedby`: 担当 Issue 未確定（out-of-scope-tracking
@@ -19,19 +36,12 @@
 //! - DOM から `Snapshot`/`Node` へのツリー構築配線: TASK-11.7（Issue #76）。
 //!   `id`/`label` の索引化自体は本ファイルが [`NameIndex`] として提供する
 //!   （PR #567 レビュー指摘: 要素ごとに文書全体を再走査すると計算量が
-//!   二乗になるため）。TASK-11.7 は文書ごとに [`NameIndex::build`] を
+//!   二乗になるため）。`aria-labelledby` の IDREF 解決も同じ索引の `id`
+//!   マップを使う。TASK-11.7 は文書ごとに [`NameIndex::build`] を
 //!   **1 回だけ**呼び、要素ごとには [`compute_name_with_index`] を使う
 //!   ことで、文書走査を索引構築の 1 回に抑える（[`compute_name`] は単発
 //!   呼び出し向けの簡易版で、内部で毎回 `NameIndex` を構築するため複数
 //!   要素へ連続して使うと同じ問題が再発する）。
-//!
-//! 本モジュールは #544（TASK-11.4.1）と同じ公開型の形（`AccessibleName`・
-//! `NameSource`・`NameBuffer` の構造）に揃えてある。両 Issue は同一ファイル
-//! （`name.rs`）を独立に新規追加するため、マージ時に add/add コンフリクトが
-//! 起きる見込みである。解消は後からマージする側が rebase して行い、ARIA と
-//! ネイティブの優先順位統合は TASK-11.4.3（Issue #546）が担う（本ファイルは
-//! `NameSource::AriaLabel`/`AriaLabelledBy` を追加しない。#544 の成果を
-//! 装わないため）。
 //!
 //! 呼び出し文脈: 現時点では呼び出し元がない。DOM から `Snapshot`/`Node` を
 //! 構築する TASK-11.7（Issue #76）が、文書ごとに [`NameIndex::build`] を
@@ -44,7 +54,8 @@
 //! HTML Element](https://w3c.github.io/html-aam/#accessible-name-and-description-computation)
 //! （ソース: <https://github.com/w3c/aria> の `html-aam/index.html`。各節の
 //! 見出しを下表に併記する）。下表は ARIA（`aria-label`/`aria-labelledby`）の
-//! 段を省いてある（TASK-11.4.1・#544 の担当）。
+//! 段を省いてある（全要素で ARIA の 2 段が下表より前に来る。
+//! [`compute_name_with_index`] 参照）。
 //!
 //! | 要素 | 節見出し | 出所の順序（ARIA を除く） | 空・空白だけの属性値 |
 //! | ---- | -------- | -------------------------- | -------------------- |
@@ -126,10 +137,28 @@ const MAX_LABELS: usize = 16;
 /// へフォールバックしていた不具合の修正）。
 const MAX_LABELS_SCANNED: usize = MAX_LABELS * 4;
 
+/// `aria-labelledby` で名前に**寄与した**（正規化後のテキストが空でない）
+/// 参照先の数の上限（`AISNAP-1`・TASK-11.4.1）。
+///
+/// 超えた分は切り捨てて `truncated` に反映する（黙って捨てない）。存在しない
+/// id・空の参照先はこの枠を消費しない（[`MAX_LABELS`] と同じ設計。空の
+/// 参照先が枠を占めて後ろの名前入りを落とす不具合を避ける）。
+const MAX_IDREFS: usize = 16;
+
+/// `aria-labelledby` で寄与の有無にかかわらず調べるトークン総数の上限
+/// （`AISNAP-1`・TASK-11.4.1）。
+///
+/// トークンごとに参照先の部分木を走査しうるため、外部入力（属性値の
+/// トークン数）に比例する処理量をここで頭打ちにする（security.md「不安全な
+/// 設計」対策）。寄与する参照先を 1 つも見つけないまま上限に達した場合は、
+/// [`MAX_LABELS_SCANNED`] と同じく `None` ではなく `truncated: true` の空の
+/// 名前を返し、`aria-label` 等の次点へ誤ってフォールバックしない。
+const MAX_IDREFS_SCANNED: usize = MAX_IDREFS * 4;
+
 /// accessible name の出所（`AISNAP-1`）。
 ///
-/// バリアントは本 Issue（TASK-11.4.2）が実装する HTML ネイティブの出所の
-/// みである。ARIA 属性由来（TASK-11.4.1・#544）・子孫テキスト由来
+/// ARIA 属性由来（`aria-labelledby`・`aria-label`。TASK-11.4.1・#544）と
+/// HTML ネイティブの出所（TASK-11.4.2・#545）を持つ。子孫テキスト由来
 /// （TASK-11.4.3・#546）の出所は、後続タスクが非破壊で追加する
 /// （`#[non_exhaustive]`。REPAIR-4）。
 ///
@@ -142,6 +171,10 @@ pub enum NameSource {
     /// 出所なし（accessible name が空、または未算出）。
     #[default]
     None,
+    /// `aria-labelledby` の参照先テキストにより算出した。
+    AriaLabelledBy,
+    /// `aria-label` 属性により算出した。
+    AriaLabel,
     /// `label`（`for` 属性による関連付け、または label による包含）により
     /// 算出した。
     Label,
@@ -170,9 +203,11 @@ pub struct AccessibleName {
     /// 算出に使った出所。
     pub source: NameSource,
     /// [`MAX_NAME_CHARS`]（文字数上限）・[`MAX_LABELS`]（label 数上限）・
-    /// [`MAX_LABELS_SCANNED`]（label 走査総数の上限。寄与する label を
-    /// 1 つも見つけられないまま打ち切られた場合は `text` が空のまま
-    /// `true` になる）のいずれかにより、入力の一部を切り捨てたかどうか。
+    /// [`MAX_LABELS_SCANNED`]（label 走査総数の上限）・[`MAX_IDREFS`]
+    /// （`aria-labelledby` の寄与参照先数の上限）・[`MAX_IDREFS_SCANNED`]
+    /// （同トークン走査総数の上限）。走査総数の上限は、寄与するものを
+    /// 1 つも見つけられないまま打ち切られた場合に `text` が空のまま
+    /// `true` になる。いずれかにより、入力の一部を切り捨てたかどうか。
     pub truncated: bool,
 }
 
@@ -454,9 +489,9 @@ fn normalized_input_type(doc: &Document, id: NodeId) -> String {
 /// 畳みは「上限判定を正しくする」ためのものであり、`push_str` 側の
 /// 折り畳みは「複数 label 間の区切り」を扱うためのもので責務が異なる）。
 ///
-/// #544 の `collect_text`（`aria-labelledby` の参照先向け）とは別名にする
-/// （役割が異なる: こちらは label→コントロールの関連付け専用）。将来
-/// 両者を統合できる余地があることを、後続タスク（#546）へ申し送る。
+/// `aria-labelledby` の参照先テキスト収集（[`referent_text`]・TASK-11.4.1）
+/// でも再利用する（`label` 引数は「子孫を走査する起点要素」の意味）。
+/// 子孫テキストの再帰的な名前算出への拡張は TASK-11.4.3（#546）が担う。
 fn collect_label_text(doc: &Document, label: NodeId, exclude: NodeId, out: &mut String) {
     const SKIPPED_SUBTREES: [&str; 4] = ["script", "style", "noscript", "template"];
     // 折り畳み後の文字数の上限（マルチバイト文字・複数 label 分の余裕を
@@ -574,8 +609,9 @@ fn fold_chars_into(
 ///
 /// 構築は [`build`](Self::build) で行う。`labels_by_target` フィールドは
 /// 非公開（本ファイル内の実装詳細）。`id` 索引（属性値 → 文書順で最初に
-/// 一致した要素）は `label`→対象コントロールの関連付けを解決するためだけに
-/// 使う中間結果であり、解決後は不要になるため構築後は保持しない。
+/// 一致した要素）は `label`→対象コントロールの関連付けの解決に使い、
+/// 構築後も `aria-labelledby` の IDREF 解決のために `ids` として保持する
+/// （TASK-11.4.1。参照ごとに文書を再走査しない）。
 ///
 /// `doc` フィールドは構築元の文書への参照を保持する。[`NodeId`] は文書内の
 /// 番号（arena インデックス）に過ぎず文書をまたいだ一意性を持たないため、
@@ -591,6 +627,9 @@ pub struct NameIndex<'doc> {
     /// ラベル付け可能な対象コントロール → 関連付く `<label>` の文書順
     /// リスト（`for` 属性による関連付け・label による包含の両方を含む）。
     labels_by_target: HashMap<NodeId, Vec<NodeId>>,
+    /// `id` 属性値 → 文書順で最初に一致した要素（空の値は登録しない。
+    /// 大文字小文字を区別して照合する）。`aria-labelledby` の IDREF 解決用。
+    ids: HashMap<&'doc str, NodeId>,
 }
 
 impl<'doc> NameIndex<'doc> {
@@ -615,7 +654,7 @@ impl<'doc> NameIndex<'doc> {
         let mut for_labels: Vec<(NodeId, String)> = Vec::new();
         // 包含（wrapping）による解決結果。単一走査中に確定する。
         let mut wrap_targets: HashMap<NodeId, NodeId> = HashMap::new();
-        let mut ids_by_value: HashMap<String, NodeId> = HashMap::new();
+        let mut ids_by_value: HashMap<&'doc str, NodeId> = HashMap::new();
 
         // 単一走査で「id 索引」「label の一覧・`for` 値」「包含による
         // label→対象の解決」を同時に行う（`AISNAP-1`・PR #567 レビュー
@@ -668,7 +707,7 @@ impl<'doc> NameIndex<'doc> {
                         && !id_value.is_empty()
                     {
                         // 文書順で先に見つかったものだけを残す（重複 id は先頭優先）。
-                        ids_by_value.entry(id_value.to_string()).or_insert(node);
+                        ids_by_value.entry(id_value).or_insert(node);
                     }
 
                     if is_html_element_named(doc, node, "label") {
@@ -704,7 +743,7 @@ impl<'doc> NameIndex<'doc> {
         let mut labels_by_target: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
         let for_targets: HashMap<NodeId, Option<NodeId>> = for_labels
             .into_iter()
-            .map(|(label, for_value)| (label, ids_by_value.get(&for_value).copied()))
+            .map(|(label, for_value)| (label, ids_by_value.get(for_value.as_str()).copied()))
             .collect();
 
         // `label_order`（文書順）を 1 回だけ辿り、解決方式によらず正しい
@@ -722,6 +761,7 @@ impl<'doc> NameIndex<'doc> {
         Self {
             doc,
             labels_by_target,
+            ids: ids_by_value,
         }
     }
 }
@@ -821,6 +861,107 @@ fn label_name(doc: &Document, index: &NameIndex, target: NodeId) -> Option<Acces
     Some(result)
 }
 
+/// `aria-label` 属性から accessible name を算出する（accname 1.2 step 2C。
+/// `AISNAP-1`・TASK-11.4.1）。
+///
+/// 属性が無い、または空白しか含まない場合は `None`（次の出所へフォール
+/// バックさせる）。値は [`NameBuffer`] で空白を折り畳み [`MAX_NAME_CHARS`]
+/// で切り詰める。
+fn aria_label_name(doc: &Document, id: NodeId) -> Option<AccessibleName> {
+    attr_name(doc, id, "aria-label", NameSource::AriaLabel)
+}
+
+/// `aria-labelledby` の参照先 `referent` から名前の断片テキストを集めて
+/// `out`（空文字列）へ追記する（`AISNAP-1`・TASK-11.4.1）。
+///
+/// 優先順: 参照先自身の `aria-label`（空白以外を含む場合。accname 2C）→
+/// 参照先が `img` の場合その `alt`（参照先自身は子孫走査の対象外で `alt` が
+/// 失われるための補完）→ 子孫テキスト（[`collect_label_text`]）。参照先自身の
+/// `aria-labelledby` は辿らない（連鎖・循環を構造的に避ける）。`target`
+/// （名前を算出している要素）の部分木は子孫走査から除外する（参照先が
+/// 対象を含む場合に対象の値・内容を取り込まないため）。
+fn referent_text(doc: &Document, referent: NodeId, target: NodeId, out: &mut String) {
+    if let Some(label) = doc.attribute(referent, "aria-label")
+        && has_non_whitespace(label)
+    {
+        out.push_str(label);
+        return;
+    }
+    if is_html_element_named(doc, referent, "img")
+        && let Some(alt) = doc.attribute(referent, "alt")
+    {
+        out.push_str(alt);
+        return;
+    }
+    collect_label_text(doc, referent, target, out);
+}
+
+/// `aria-labelledby` から accessible name を算出する（accname 1.2 step 2B。
+/// `AISNAP-1`・TASK-11.4.1）。
+///
+/// 属性値を HTML ASCII 空白（`split_ascii_whitespace`。`\x0B` は区切りに
+/// 含まれない）でトークン化し、トークン順（文書順ではない）に参照先の
+/// テキストを半角スペース 1 個で連結する。存在しない id・空の参照先は
+/// 飛ばし、[`MAX_IDREFS`] の枠も消費しない。同じトークンの重複は
+/// それぞれ 1 件として扱う。IDREF 解決は [`NameIndex`] のハッシュ参照
+/// だけで行い、文書を再走査しない。
+///
+/// 戻り値（[`label_name`] と同じ契約）:
+/// - 属性が無い、または寄与する参照先が 0 件で打ち切りも無い: `None`
+///   （呼び出し元は `aria-label` 等の次点へフォールバックする）
+/// - 寄与が 0 件のまま [`MAX_IDREFS_SCANNED`] で打ち切った: `Some` の空の
+///   名前（`truncated: true`。フォールバックさせない）
+/// - 寄与が 1 件以上: `source: AriaLabelledBy`。[`MAX_IDREFS`] 超過分・
+///   走査上限超過があれば `truncated: true`
+fn aria_labelledby_name(
+    doc: &Document,
+    index: &NameIndex,
+    target: NodeId,
+) -> Option<AccessibleName> {
+    let value = doc.attribute(target, "aria-labelledby")?;
+
+    let mut buf = NameBuffer::new();
+    let mut matched = 0usize;
+    let mut truncated = false;
+    let mut scan_cut_before_match = false;
+
+    for (scanned, token) in value.split_ascii_whitespace().enumerate() {
+        if scanned >= MAX_IDREFS_SCANNED {
+            truncated = true;
+            scan_cut_before_match = matched == 0;
+            break;
+        }
+        let Some(&referent) = index.ids.get(token) else {
+            continue;
+        };
+        let mut text = String::new();
+        referent_text(doc, referent, target, &mut text);
+        if !has_non_whitespace(&text) {
+            continue;
+        }
+        if matched >= MAX_IDREFS {
+            truncated = true;
+            continue;
+        }
+        matched += 1;
+        buf.push_separator();
+        buf.push_str(&text);
+    }
+
+    if matched == 0 {
+        if scan_cut_before_match {
+            return Some(AccessibleName::default().with_truncated(true));
+        }
+        return None;
+    }
+
+    let mut result = buf.finish(NameSource::AriaLabelledBy);
+    if truncated {
+        result.truncated = true;
+    }
+    Some(result)
+}
+
 /// `input` 要素（`hidden` を除く）の accessible name を算出する
 /// （HTML-AAM。ARIA 段を除く。`AISNAP-1`）。
 ///
@@ -886,8 +1027,8 @@ fn input_name(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName {
 }
 
 /// `doc` の要素 `id` から、HTML ネイティブの出所のみで accessible name を
-/// 算出する（`AISNAP-1`・TASK-11.4.2）。`compute_name`/`compute_name_with_index`
-/// の主経路。
+/// 算出する（`AISNAP-1`・TASK-11.4.2）。ARIA 属性の段は含まない
+/// （[`compute_name_with_index`] が先に評価する）。
 fn native_name(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName {
     if is_html_element_named(doc, id, "img") {
         return img_name(doc, id);
@@ -928,10 +1069,11 @@ fn native_name(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName 
 ///
 /// # スタブについて
 ///
-/// 本 Issue（TASK-11.4.2）時点で実装しているのは HTML ネイティブの
-/// ラベル付けのみである（実装済みを装わない。REPAIR-3）。本ファイル冒頭の
-/// ドキュメンテーションコメントに、後続タスクが担う出所（ARIA・子孫
-/// テキスト・優先順位統合・文書ルートの `<title>`）を列挙してある。
+/// 実装しているのは ARIA 属性（`aria-labelledby`・`aria-label`。
+/// TASK-11.4.1）と HTML ネイティブのラベル付け（TASK-11.4.2）である
+/// （実装済みを装わない。REPAIR-3）。本ファイル冒頭の
+/// ドキュメンテーションコメントに、後続タスクが担う出所（子孫テキストの
+/// 再帰的算出・文書ルートの `<title>` 等）を列挙してある。
 ///
 /// 要素以外（テキストノード等）・範囲外の `id` では `AccessibleName::default()`
 /// を返す（`Result` にはしない。`core::dom` のアクセサ群・
@@ -975,13 +1117,26 @@ pub fn compute_name_with_index(doc: &Document, index: &NameIndex, id: NodeId) ->
     if !doc.is_element(id) {
         return AccessibleName::default();
     }
+    // `input[type=hidden]` はアクセシビリティツリーへ公開されないため、
+    // ARIA 属性があっても常に名前なしとする（既存の契約を維持）。
+    if is_html_element_named(doc, id, "input") && normalized_input_type(doc, id) == "hidden" {
+        return AccessibleName::default();
+    }
+    // accname 1.2 の順序: 2B `aria-labelledby` → 2C `aria-label` → 2D ネイティブ。
+    if let Some(name) = aria_labelledby_name(doc, index, id) {
+        return name;
+    }
+    if let Some(name) = aria_label_name(doc, id) {
+        return name;
+    }
     native_name(doc, index, id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessibleName, MAX_LABELS, MAX_LABELS_SCANNED, MAX_NAME_CHARS, NameSource, compute_name,
+        AccessibleName, MAX_IDREFS, MAX_IDREFS_SCANNED, MAX_LABELS, MAX_LABELS_SCANNED,
+        MAX_NAME_CHARS, NameSource, compute_name,
     };
     use fandhe_browser_core::dom::{Document, NodeId};
     use fandhe_browser_core::parse::{ParseOptions, parse_document};
@@ -1786,6 +1941,9 @@ mod tests {
             <label for="a">名前A</label><input type="checkbox" id="a">
             <label>名前B <input type="checkbox" id="b"></label>
             <input type="text" id="c" title="タイトルC">
+            <span id="s1">参照A</span>
+            <input type="text" id="d" aria-labelledby="s1 c" aria-label="無視される">
+            <button id="e" aria-label="閉じる">x</button>
         "#;
         let parsed =
             parse_document(html, &ParseOptions::default()).expect("テスト入力は必ず成功する");
@@ -1793,7 +1951,7 @@ mod tests {
         let root = doc.root();
         let index = NameIndex::build(&doc);
 
-        for selector in ["input#a", "input#b", "input#c"] {
+        for selector in ["input#a", "input#b", "input#c", "input#d", "button#e"] {
             let target = query_selector_str(&doc, root, selector)
                 .expect("セレクタは解釈できる")
                 .expect("対象要素が見つかる");
@@ -2009,5 +2167,270 @@ mod tests {
         let result = super::compute_name_with_index(&doc, &index, input);
         // すべての label が空要素（テキストなし）のため名前には寄与しない。
         assert!(result.is_empty());
+    }
+    // --- ARIA（TASK-11.4.1・#544） ---
+
+    fn named(text: &str, source: NameSource, truncated: bool) -> AccessibleName {
+        AccessibleName {
+            text: text.to_string(),
+            source,
+            truncated,
+        }
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: `aria-label` を指定した要素はその値が名前になる。
+    #[test]
+    fn aisnap_1_aria_label_basic() {
+        let result = name(r#"<button aria-label="閉じる">×</button>"#, "button");
+        assert_eq!(result, named("閉じる", NameSource::AriaLabel, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 空白だけの `aria-label` は無視され次点へ進む。
+    #[test]
+    fn aisnap_1_aria_label_blank_falls_back_to_native() {
+        let result = name(r#"<input type="text" aria-label="  " title="題">"#, "input");
+        assert_eq!(result, named("題", NameSource::Title, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: `aria-label` の空白は畳まれ前後は除去される。
+    #[test]
+    fn aisnap_1_aria_label_whitespace_normalized() {
+        let result = name("<div aria-label=\"  a \t b\n\nc  \">x</div>", "div");
+        assert_eq!(result, named("a b c", NameSource::AriaLabel, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: `aria-label` は `label[for]` と `img` の `alt`（空を含む）より優先。
+    #[test]
+    fn aisnap_1_aria_label_beats_native() {
+        let result = name(
+            r#"<label for="i">ラベル</label><input id="i" aria-label="ARIA">"#,
+            "input",
+        );
+        assert_eq!(result, named("ARIA", NameSource::AriaLabel, false));
+        let result = name(r#"<img alt="" aria-label="ロゴ">"#, "img");
+        assert_eq!(result, named("ロゴ", NameSource::AriaLabel, false));
+        let result = name(r#"<img alt="代替" aria-label="ロゴ">"#, "img");
+        assert_eq!(result, named("ロゴ", NameSource::AriaLabel, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 上限超の `aria-label` は切り詰めて `truncated`。
+    #[test]
+    fn aisnap_1_aria_label_truncated() {
+        let long = "あ".repeat(MAX_NAME_CHARS + 1);
+        let result = name(&format!(r#"<div aria-label="{long}">x</div>"#), "div");
+        assert_eq!(
+            result,
+            named(&"あ".repeat(MAX_NAME_CHARS), NameSource::AriaLabel, true)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 複数 IDREF はトークン順（文書順ではない）に連結し、存在しない id は飛ばす。
+    #[test]
+    fn aisnap_1_aria_labelledby_token_order() {
+        let result = name(
+            r#"<span id="a">一</span><span id="b">二</span><span id="c">三</span>
+               <div id="t" aria-labelledby="c missing a b">x</div>"#,
+            "div#t",
+        );
+        assert_eq!(result, named("三 一 二", NameSource::AriaLabelledBy, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: タブ・改行区切りのトークンも分割される。
+    #[test]
+    fn aisnap_1_aria_labelledby_tab_newline_separators() {
+        let result = name(
+            "<span id=\"a\">一</span><span id=\"b\">二</span><div id=\"t\" aria-labelledby=\"a\tb\nb\">x</div>",
+            "div#t",
+        );
+        assert_eq!(result, named("一 二 二", NameSource::AriaLabelledBy, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: `aria-labelledby` は `aria-label` より優先。
+    #[test]
+    fn aisnap_1_aria_labelledby_beats_aria_label() {
+        let result = name(
+            r#"<span id="a">参照</span><div id="t" aria-labelledby="a" aria-label="直接">x</div>"#,
+            "div#t",
+        );
+        assert_eq!(result, named("参照", NameSource::AriaLabelledBy, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 全参照が無効なら `aria-label`、それも無ければネイティブへ。
+    #[test]
+    fn aisnap_1_aria_labelledby_empty_falls_back() {
+        let result = name(
+            r#"<span id="e"> </span><div id="t" aria-labelledby="nope e" aria-label="直接">x</div>"#,
+            "div#t",
+        );
+        assert_eq!(result, named("直接", NameSource::AriaLabel, false));
+        let result = name(
+            r#"<input id="t" aria-labelledby="nope" title="題">"#,
+            "input",
+        );
+        assert_eq!(result, named("題", NameSource::Title, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 参照先自身の `aria-label` が子孫テキストより優先される。
+    #[test]
+    fn aisnap_1_aria_labelledby_referent_aria_label_wins() {
+        let result = name(
+            r#"<div id="r" aria-label="ARIA側">子孫</div><p id="t" aria-labelledby="r">x</p>"#,
+            "p#t",
+        );
+        assert_eq!(result, named("ARIA側", NameSource::AriaLabelledBy, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 参照先の `aria-labelledby` は辿らない（連鎖しない）。
+    #[test]
+    fn aisnap_1_aria_labelledby_does_not_chain() {
+        let result = name(
+            r#"<span id="c">C</span><span id="b" aria-labelledby="c">B内容</span>
+               <p id="a" aria-labelledby="b">x</p>"#,
+            "p#a",
+        );
+        assert_eq!(result, named("B内容", NameSource::AriaLabelledBy, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 自己参照は自分の子孫テキストを名前とする。
+    #[test]
+    fn aisnap_1_aria_labelledby_self_reference() {
+        let result = name(
+            r#"<button id="x" aria-labelledby="x">送信</button>"#,
+            "button",
+        );
+        assert_eq!(result, named("送信", NameSource::AriaLabelledBy, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 参照先が対象を含む場合、対象の部分木は除外される。
+    #[test]
+    fn aisnap_1_aria_labelledby_referent_containing_target() {
+        let result = name(
+            r#"<div id="l">名前 <input id="t" aria-labelledby="l" value="除外"> 続き</div>"#,
+            "input",
+        );
+        assert_eq!(
+            result,
+            named("名前 続き", NameSource::AriaLabelledBy, false)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 参照先の `script`/`style` は除外、子孫 `img` の `alt` と参照先自身が `img` の `alt` は使う。
+    #[test]
+    fn aisnap_1_aria_labelledby_referent_content_rules() {
+        let result = name(
+            r#"<div id="r">本文<script>var x;</script><style>p{}</style><img alt="図"></div>
+               <p id="t" aria-labelledby="r">x</p>"#,
+            "p#t",
+        );
+        assert_eq!(result, named("本文図", NameSource::AriaLabelledBy, false));
+        let result = name(
+            r#"<img id="r" alt="画像名"><p id="t" aria-labelledby="r">x</p>"#,
+            "p#t",
+        );
+        assert_eq!(result, named("画像名", NameSource::AriaLabelledBy, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 重複 id は文書順で先頭、照合は大文字小文字を区別する。
+    #[test]
+    fn aisnap_1_aria_labelledby_duplicate_and_case_sensitive_ids() {
+        let result = name(
+            r#"<span id="a">先</span><span id="a">後</span><p id="t" aria-labelledby="a">x</p>"#,
+            "p#t",
+        );
+        assert_eq!(result, named("先", NameSource::AriaLabelledBy, false));
+        let result = name(
+            r#"<span id="a">小</span><p id="t" aria-labelledby="A" title="題">x</p>"#,
+            "p#t",
+        );
+        assert_eq!(result, named("題", NameSource::Title, false));
+    }
+
+    fn many_refs_html(referents: usize) -> String {
+        let mut html = String::new();
+        let mut ids = Vec::new();
+        for i in 0..referents {
+            html.push_str(&format!(r#"<span id="r{i}">r{i}</span>"#));
+            ids.push(format!("r{i}"));
+        }
+        html.push_str(&format!(
+            r#"<div id="t" aria-labelledby="{}">x</div>"#,
+            ids.join(" ")
+        ));
+        html
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: ちょうど `MAX_IDREFS` 件なら全件を連結し `truncated` にならない。
+    #[test]
+    fn aisnap_1_aria_labelledby_at_limit_not_truncated() {
+        let result = name(&many_refs_html(MAX_IDREFS), "div#t");
+        let expected = (0..MAX_IDREFS)
+            .map(|i| format!("r{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(result, named(&expected, NameSource::AriaLabelledBy, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: `MAX_IDREFS` を超えた分は切り捨て `truncated: true`。
+    #[test]
+    fn aisnap_1_aria_labelledby_over_limit_truncated() {
+        let result = name(&many_refs_html(MAX_IDREFS + 1), "div#t");
+        let expected = (0..MAX_IDREFS)
+            .map(|i| format!("r{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(result, named(&expected, NameSource::AriaLabelledBy, true));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 空の参照先・存在しない id は寄与枠を消費しない。
+    #[test]
+    fn aisnap_1_aria_labelledby_empty_referents_do_not_consume_limit() {
+        let mut html = String::from(r#"<span id="e0"></span><span id="e1"> </span>"#);
+        let mut tokens = vec!["e0".to_string(), "missing".to_string(), "e1".to_string()];
+        for i in 0..MAX_IDREFS {
+            html.push_str(&format!(r#"<span id="r{i}">r{i}</span>"#));
+            tokens.push(format!("r{i}"));
+        }
+        html.push_str(&format!(
+            r#"<div id="t" aria-labelledby="{}">x</div>"#,
+            tokens.join(" ")
+        ));
+        let result = name(&html, "div#t");
+        let expected = (0..MAX_IDREFS)
+            .map(|i| format!("r{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(result, named(&expected, NameSource::AriaLabelledBy, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 存在しないトークンが走査上限まで先行すると、空の名前 + `truncated: true` で確定し `aria-label` へ落ちない。
+    #[test]
+    fn aisnap_1_aria_labelledby_scan_cut_does_not_fall_back() {
+        let missing = vec!["nope"; MAX_IDREFS_SCANNED].join(" ");
+        let html = format!(
+            r#"<span id="ok">実在</span><div id="t" aria-labelledby="{missing} ok" aria-label="直接">x</div>"#
+        );
+        let result = name(&html, "div#t");
+        assert_eq!(result, named("", NameSource::None, true));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 走査上限未満の欠落トークンが先行するだけなら後ろの実在参照から名前を得る。
+    #[test]
+    fn aisnap_1_aria_labelledby_few_missing_tokens_ok() {
+        let missing = vec!["nope"; MAX_IDREFS_SCANNED - 1].join(" ");
+        let html = format!(
+            r#"<span id="ok">実在</span><div id="t" aria-labelledby="{missing} ok">x</div>"#
+        );
+        let result = name(&html, "div#t");
+        assert_eq!(result, named("実在", NameSource::AriaLabelledBy, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: `input[type=hidden]` は ARIA 属性があっても名前なし。
+    #[test]
+    fn aisnap_1_hidden_input_ignores_aria() {
+        let result = name(
+            r#"<span id="a">参照</span><input type="hidden" aria-label="x" aria-labelledby="a">"#,
+            "input",
+        );
+        assert_eq!(result, AccessibleName::default());
     }
 }
