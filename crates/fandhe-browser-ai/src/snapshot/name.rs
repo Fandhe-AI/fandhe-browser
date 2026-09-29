@@ -1278,6 +1278,17 @@ fn referent_text(
 /// （`select` の option 探索）。取り込めなければ `None`。
 /// 対象要素に依存しないため走査予算の対象外。
 fn scan_referent_own_text(doc: &Document, referent: NodeId, out: &mut String) -> Option<bool> {
+    // 参照先自身が埋め込みコントロール（accname 2E）なら、値を `aria-label` より
+    // 優先する（子孫走査側の 2E と結果を一致させる。PR #574 レビュー指摘）。
+    // 値が空で打ち切りも無い場合だけ `aria-label` / `alt` へ譲る。
+    // 参照先の label・title は未実装（担当 Issue 未確定）。
+    let embedded = embedded_control_text(doc, referent, referent, doc.node_count());
+    if let Some((text, scan)) = &embedded
+        && (has_non_whitespace(text) || scan.cut)
+    {
+        fold_attr_bounded(text, out);
+        return Some(scan.cut);
+    }
     if let Some(label) = doc.attribute(referent, "aria-label")
         && has_non_whitespace(label)
     {
@@ -1290,9 +1301,7 @@ fn scan_referent_own_text(doc: &Document, referent: NodeId, out: &mut String) ->
         fold_attr_bounded(alt, out);
         return Some(false);
     }
-    // 参照先自身が埋め込みコントロール（accname 2E）ならその値。
-    // 参照先の label・title は未実装（担当 Issue 未確定）。
-    if let Some((text, scan)) = embedded_control_text(doc, referent, referent, doc.node_count()) {
+    if let Some((text, scan)) = embedded {
         fold_attr_bounded(&text, out);
         return Some(scan.cut);
     }
@@ -3251,6 +3260,22 @@ mod tests {
                 "button"
             ),
             named("参照値", NameSource::AriaLabelledBy, false)
+        );
+        // 参照先でも値を aria-label より優先する（子孫走査と一致）。
+        assert_eq!(
+            name(
+                r#"<input id="v" value="5" aria-label="数量"><button aria-labelledby="v">x</button>"#,
+                "button"
+            ),
+            named("5", NameSource::AriaLabelledBy, false)
+        );
+        // 値が空なら参照先の aria-label へ譲る。
+        assert_eq!(
+            name(
+                r#"<input id="v" aria-label="数量"><button aria-labelledby="v">x</button>"#,
+                "button"
+            ),
+            named("数量", NameSource::AriaLabelledBy, false)
         );
         assert_eq!(
             name(
