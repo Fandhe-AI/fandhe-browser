@@ -1,0 +1,22 @@
+# fandhe-browser 設定サンプル（TASK-91 / MS-3）。
+# 読み込み・検証の仕様は crates/fandhe-browser-core/src/config.rs を参照。
+# 相対パスは、この設定ファイルの親ディレクトリを基準に解決される。
+
+[profile]
+# プロファイル保存先。設定ファイルの親ディレクトリ配下に限る
+# （絶対パス・".." による脱出は拒否される）。省略時は既定の保存先を使う。
+# root = "profiles"
+# 分離強度。現在受理される値は "data-directory"（既定）のみ。
+isolation = "data-directory"
+
+[js]
+# JS エンジン。"v8" または "boa"。省略時は同梱エンジンから v8、boa の順で選ぶ。
+# 未同梱のエンジンを指定すると設定エラーになる（別エンジンへはフォールバックしない）。
+# engine = "v8"
+
+[rendering]
+# レンダリング層（Servo）の有効化。既定は false。
+# true はレンダリング層を同梱したビルドでのみ受理される。現時点では同梱ビルドが
+# 存在しないため、true を指定すると設定エラーになる（暫定挙動。最終仕様は
+# rendering-layer.md と合わせて決定する）。
+enabled = false
