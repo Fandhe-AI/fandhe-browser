@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -777,38 +778,50 @@ class LoadBboxesTest(unittest.TestCase):
                 ms.load_bboxes(path)
 
 
-class BboxIsStaleTest(unittest.TestCase):
-    """RENDER-5 / TASK-37.2: `_bbox_is_stale`（Codex P1 対応。再撮影で PNG だけが
-    更新された場合に古い bbox を混入させない mtime ヒューリスティック）。"""
+class BboxPngBindingTest(unittest.TestCase):
+    """RENDER-5 / TASK-37.2: `_bbox_png_binding_mismatch`（Codex P1 対応。
+    mtime ではなく `png_sha256` で bbox と PNG を対応付ける。生成順序に非依存）。"""
 
-    def test_bbox_older_than_png_is_stale(self) -> None:
+    def _write(self, tmp: str, payload: dict) -> tuple[Path, Path]:
+        bbox_path = Path(tmp) / "site.bboxes.json"
+        png_path = Path(tmp) / "site.png"
+        png_path.write_bytes(b"png-bytes")
+        bbox_path.write_text(json.dumps(payload), encoding="utf-8")
+        return bbox_path, png_path
+
+    def test_matching_hash_is_accepted_regardless_of_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            bbox_path = Path(tmp) / "site.bboxes.json"
-            png_path = Path(tmp) / "site.png"
-            bbox_path.write_text("{}", encoding="utf-8")
-            png_path.write_bytes(b"png")
-            # bbox 側の更新時刻を PNG より明確に古くする（再撮影で PNG だけが
-            # 更新された状況を模す）。
-            old = bbox_path.stat().st_mtime - 3600
+            digest = hashlib.sha256(b"png-bytes").hexdigest()
+            bbox_path, png_path = self._write(tmp, {"schema_version": 1, "elements": [], "png_sha256": digest})
+            # bbox を PNG より古くしても（bbox 先行記録の正常撮影）不合格にしない。
+            old = png_path.stat().st_mtime - 3600
             os.utime(bbox_path, (old, old))
-            self.assertTrue(ms._bbox_is_stale(bbox_path, png_path))
+            self.assertIsNone(ms._bbox_png_binding_mismatch(bbox_path, png_path))
 
-    def test_bbox_newer_than_or_equal_to_png_is_not_stale(self) -> None:
+    def test_mismatched_hash_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bbox_path, png_path = self._write(
+                tmp, {"schema_version": 1, "elements": [], "png_sha256": "0" * 64}
+            )
+            reason = ms._bbox_png_binding_mismatch(bbox_path, png_path)
+            self.assertIsNotNone(reason)
+            self.assertIn("does not match", reason)
+
+    def test_malformed_hash_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bbox_path, png_path = self._write(tmp, {"schema_version": 1, "elements": [], "png_sha256": "ABC"})
+            self.assertIn("64-character", ms._bbox_png_binding_mismatch(bbox_path, png_path))
+
+    def test_missing_field_is_not_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bbox_path, png_path = self._write(tmp, {"schema_version": 1, "elements": []})
+            self.assertIsNone(ms._bbox_png_binding_mismatch(bbox_path, png_path))
+
+    def test_read_failure_is_not_reported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             png_path = Path(tmp) / "site.png"
-            bbox_path = Path(tmp) / "site.bboxes.json"
             png_path.write_bytes(b"png")
-            bbox_path.write_text("{}", encoding="utf-8")
-            self.assertFalse(ms._bbox_is_stale(bbox_path, png_path))
-
-    def test_stat_failure_is_not_stale(self) -> None:
-        # stat 自体の失敗（レース等）は `load_bboxes` 等の別経路が扱うため、
-        # ここでは stale 扱いにしない（fail-closed の二重適用を避ける）。
-        with tempfile.TemporaryDirectory() as tmp:
-            missing = Path(tmp) / "does-not-exist.bboxes.json"
-            png_path = Path(tmp) / "site.png"
-            png_path.write_bytes(b"png")
-            self.assertFalse(ms._bbox_is_stale(missing, png_path))
+            self.assertIsNone(ms._bbox_png_binding_mismatch(Path(tmp) / "nope.json", png_path))
 
 
 class CompareBboxesTest(unittest.TestCase):
@@ -1436,27 +1449,20 @@ class MainIntegrationTest(unittest.TestCase):
             self.assertEqual(result["summary"]["passing_sites"], 4)
             self.assertEqual(result["summary"]["verdict"], "below_threshold")
 
-    def test_stale_bbox_from_previous_capture_does_not_pass(self) -> None:
-        # Codex P1 対応: 撮影側は再実行時に PNG を削除するが bbox JSON は
-        # 削除しないため、同じ capture-dir で再撮影すると今回の PNG と前回の
-        # bbox を突き合わせてしまう可能性があった。bbox のファイル更新時刻が
-        # 対応する PNG より古ければ stale として不合格にすることを確認する。
+    def test_bbox_with_mismatched_png_hash_does_not_pass(self) -> None:
+        # Codex P1 対応: 再撮影で PNG だけが更新され bbox が前回のままの場合、
+        # bbox の `png_sha256` が今回の PNG と一致しないため不合格にする。
         with tempfile.TemporaryDirectory() as tmp:
             capture_dir = Path(tmp)
             site_id = "s0"
-            (capture_dir / "chromium").mkdir(parents=True, exist_ok=True)
-            (capture_dir / "servo").mkdir(parents=True, exist_ok=True)
-            elements = [{"id": f"e{i}", "x": 0, "y": 0, "width": 10, "height": 10} for i in range(5)]
-            self._write_bboxes(capture_dir, "chromium", site_id, elements)
-            self._write_bboxes(capture_dir, "servo", site_id, elements)
-            # bbox 側の更新時刻を明確に過去へ巻き戻し、「前回撮影時の bbox」を模す。
-            old = (capture_dir / "chromium" / f"{site_id}.bboxes.json").stat().st_mtime - 3600
-            os.utime(capture_dir / "chromium" / f"{site_id}.bboxes.json", (old, old))
-            os.utime(capture_dir / "servo" / f"{site_id}.bboxes.json", (old, old))
-
-            # bbox より後に（＝再撮影として）PNG を書き出す。SSIM は一致するよう
-            # `identical=True` にし、境界ボックスの stale 判定だけを見る。
             self._make_site_pngs(capture_dir, site_id, identical=True)
+            elements = [{"id": f"e{i}", "x": 0, "y": 0, "width": 10, "height": 10} for i in range(5)]
+            for engine in ("chromium", "servo"):
+                path = capture_dir / engine / f"{site_id}.bboxes.json"
+                path.write_text(
+                    json.dumps({"schema_version": 1, "elements": elements, "png_sha256": "f" * 64}),
+                    encoding="utf-8",
+                )
             self._write_capture_result(capture_dir, [site_id])
 
             exit_code = ms.main(["--capture-dir", str(capture_dir), "--min-sites", "1"])
@@ -1466,6 +1472,32 @@ class MainIntegrationTest(unittest.TestCase):
             self.assertFalse(site_result["passed"])
             self.assertEqual(site_result["bbox"]["status"], "error")
             self.assertIn("stale", site_result["bbox"]["reason"])
+
+    def test_bbox_written_before_png_with_matching_hash_passes(self) -> None:
+        # bbox 先行記録 → PNG 保存の正常な撮影順序（bbox が PNG より古い mtime）でも、
+        # `png_sha256` が一致すれば合格する（mtime に依存しない）。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            site_id = "s0"
+            self._make_site_pngs(capture_dir, site_id, identical=True)
+            elements = [{"id": f"e{i}", "x": 0, "y": 0, "width": 10, "height": 10} for i in range(5)]
+            for engine in ("chromium", "servo"):
+                png = capture_dir / engine / f"{site_id}.png"
+                digest = hashlib.sha256(png.read_bytes()).hexdigest()
+                path = capture_dir / engine / f"{site_id}.bboxes.json"
+                path.write_text(
+                    json.dumps({"schema_version": 1, "elements": elements, "png_sha256": digest}),
+                    encoding="utf-8",
+                )
+                old = png.stat().st_mtime - 3600
+                os.utime(path, (old, old))
+            self._write_capture_result(capture_dir, [site_id])
+
+            exit_code = ms.main(["--capture-dir", str(capture_dir), "--min-sites", "1"])
+            self.assertEqual(exit_code, 0)
+            result = json.loads((capture_dir / "measure-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["sites"][0]["bbox"]["status"], "measured")
+            self.assertTrue(result["sites"][0]["passed"])
 
     def test_invalid_capture_result_exits_two(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

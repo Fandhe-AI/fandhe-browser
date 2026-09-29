@@ -33,6 +33,7 @@ crate 間の公開 API 契約ではなく同一 harness ディレクトリ内で
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -1052,28 +1053,46 @@ def compare_bboxes(
     }
 
 
-def _bbox_is_stale(bbox_path: Path, png_path: Path) -> bool:
-    """bbox JSON が対応する PNG より古い（＝再撮影で PNG だけが更新された）かを判定する。
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 
-    `capture_screenshots.py`（#53）は `--out-dir` を使い回す再実行時に PNG を
-    削除してから新しい PNG を書き出すが、`<engine>/<site_id>.bboxes.json`
-    （境界ボックス抽出。TASK-36/38 の成果として本スクリプトの外側で用意される
-    別ファイルであり、この撮影パイプラインの管轄外）は自動的に更新される
-    保証がない。そのため `measure_site` は固定名で無条件にこの bbox を
-    読み込むと、今回の PNG と前回撮影時点の bbox を突き合わせてしまう
-    （Codex P1 指摘）。bbox JSON に撮影を紐づける識別子が入力契約に無い現状では、
-    ファイル更新時刻（bbox が PNG より古い）をヒューリスティックに使い、
-    古い可能性がある bbox を `stale` として不合格側へ倒す（§2.6 の
-    fail-closed 方針。完全な保証ではないが、無検証で混入させるより安全）。
+
+def _bbox_png_binding_mismatch(bbox_path: Path, png_path: Path) -> str | None:
+    """bbox JSON の任意フィールド `png_sha256` と PNG 実体の SHA-256 を照合する。
+
+    `capture_screenshots.py`（#53）の再撮影では PNG だけが差し替わり、bbox JSON
+    （TASK-36/38 の抽出処理が本スクリプトの外側で書き出す別ファイル）が前回撮影
+    のまま残る可能性がある（Codex P1 指摘）。ファイル更新時刻は bbox と PNG の
+    生成順序に依存し、正常な撮影（bbox 先行記録 → PNG 保存）を誤って落とすため
+    使わない。代わりに bbox JSON が任意で持つ `png_sha256`（対応 PNG の SHA-256
+    小文字 16 進 64 桁）で撮影と対応付ける。生成順序に依存しない検証である。
+
+    - フィールドが無い: 対応付け不能のため検証しない（`None`。後方互換）。
+    - 形式が不正・不一致: 不一致理由の文字列を返す（呼び出し側が fail-closed で
+      不合格にする）。
+    - 読み込み失敗: `load_bboxes` 等の別経路が扱うため `None`。
+    RENDER-5 / TASK-37.2。
     """
     try:
-        bbox_mtime = bbox_path.stat().st_mtime
-        png_mtime = png_path.stat().st_mtime
+        with bbox_path.open("rb") as fh:
+            raw = fh.read(MAX_BBOX_FILE_BYTES + 1)
+        payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_non_finite_constant)
+    except (OSError, ValueError, RecursionError, BboxError):
+        return None
+    if not isinstance(payload, dict) or "png_sha256" not in payload:
+        return None
+    expected = payload["png_sha256"]
+    if not isinstance(expected, str) or not _SHA256_HEX_RE.fullmatch(expected):
+        return "png_sha256 must be a 64-character lowercase hex string"
+    digest = hashlib.sha256()
+    try:
+        with png_path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
     except OSError:
-        # stat に失敗した場合は他の経路（load_bboxes 等）が別途エラーとして
-        # 扱うため、ここでは stale 扱いにしない（fail-closed の二重適用を避ける）。
-        return False
-    return bbox_mtime < png_mtime
+        return None
+    if digest.hexdigest() != expected:
+        return "png_sha256 does not match the captured PNG (stale bbox from a previous capture)"
+    return None
 
 
 # --- サイト単位の計測・出力 ----------------------------------------------------
@@ -1122,16 +1141,14 @@ def measure_site(
 
         stale_reasons: list[str] = []
         if not bbox_same_file:
-            if ref_bboxes is not None and _bbox_is_stale(ref_bbox_path, chromium_png):
-                stale_reasons.append(
-                    f"{REFERENCE_ENGINE} bbox file is older than its PNG "
-                    "(likely stale from a previous capture)"
-                )
-            if tgt_bboxes is not None and _bbox_is_stale(tgt_bbox_path, servo_png):
-                stale_reasons.append(
-                    f"{TARGET_ENGINE} bbox file is older than its PNG "
-                    "(likely stale from a previous capture)"
-                )
+            if ref_bboxes is not None:
+                mismatch = _bbox_png_binding_mismatch(ref_bbox_path, chromium_png)
+                if mismatch:
+                    stale_reasons.append(f"{REFERENCE_ENGINE} bbox: {mismatch}")
+            if tgt_bboxes is not None:
+                mismatch = _bbox_png_binding_mismatch(tgt_bbox_path, servo_png)
+                if mismatch:
+                    stale_reasons.append(f"{TARGET_ENGINE} bbox: {mismatch}")
 
         if bbox_same_file:
             bbox_result = {
