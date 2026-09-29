@@ -2,8 +2,9 @@
 //!
 //! fetch（ネットワーク取得）・HTML パース・DOM・query（DOM 探索）・CSSOM・
 //! config（設定）・可観測性（ログ・トレーシング）・描画機能への境界（[`render`]）を
-//! 担う crate。将来的には `fandhe-browser-js`（workspace 内 crate に依存しない
-//! 下位 crate）に依存する想定。`Cargo.toml` の `[dependencies]` には
+//! 担う crate。`fandhe-browser-profile`（`state` モジュールが `Profile` を保持する。
+//! TASK-41.1・#169。workspace 内 path 依存）に依存し、将来的には `fandhe-browser-js`
+//! にも依存する想定（AGENTS.md「crate 間の許可依存」: js・profile）。`Cargo.toml` の `[dependencies]` には
 //! `html5ever = "=0.40.1"`（Issue #35 承認済み・TASK-24.4・#38）と reqwest・
 //! rustls（同じく Issue #35 承認済み・TASK-24.2・#36）を持つ。他の依存追加は
 //! 該当タスクで dependency-policy.md のユーザー承認制に従って行う。
@@ -31,13 +32,21 @@
 //! [`render`] モジュールは TASK-33（サブタスク 33.2・ビヘイビア `RENDER-1`）で追加した
 //! 描画トレイトの定義に加え、feature `rendering` 無効時に用いる既定実装
 //! `DisabledRenderer`（TASK-33（33.3）・issue #47）を含む。`fandhe-browser-render`
-//! （Servo）側の本実装・`AppState` への配線は含まない（別 issue の担当。render
+//! （Servo）側の本実装・cli による具象実装の注入は含まない（別 issue の担当。render
 //! モジュールの doc コメントを参照）。
+//! [`state`] モジュール（TASK-41.1・#169・`CDP-1`・`AISNAP-6`）は cdp と ai が共有する
+//! 共通状態 [`state::AppState`]（`Profile`・描画ハンドル・ナビゲート状態）を定義する。
 //! [`observability`] モジュールは TASK-10（10.1・Issue #219・ビヘイビア
 //! `REPAIR-9`）で、`fetch`/`parse`/`dom`/`query`/`js_stub` 各モジュールの
 //! 操作計測が共通で使うレコード型（[`observability::OperationRecord`] 等）を
 //! 追加した。各モジュールへの計測の組み込み・出力先の確定は含まない
 //! （モジュール doc コメント・Issue #218 を参照）。
+//! [`config`] モジュールは TASK-91（91.1・Issue #214・対象ビヘイビアなし・
+//! 基盤タスク）で、`fandhe-browser.toml` の `[profile]` セクション
+//! （保存先・分離強度）を読み込む本実装を追加した（`toml`・`serde` は
+//! Issue #213 で承認済み）。`[js] engine`（TASK-91（91.2）・Issue #215）も
+//! 読める。`[rendering] enabled`（TASK-91（91.3）・Issue #216）も読める
+//! （未同梱ビルドでの有効化は暫定でエラー。`config` モジュール doc コメント参照）。
 //!
 //! # スタブについて
 //!
@@ -49,6 +58,7 @@
 //! - [`observability::OperationRecord::to_json_line`]（`REPAIR-9`・`TASK-10（10.1）`・
 //!   `MS-4`。出力形式は Issue #218 で未確定な暫定エンコーダ）
 
+pub mod config;
 pub mod dom;
 pub mod error;
 pub mod fetch;
@@ -58,7 +68,12 @@ pub mod parse;
 pub mod query;
 pub mod render;
 pub mod selector;
+pub mod state;
 
+pub use config::{
+    Config, ConfigError, EngineKind, IsolationStrength, JsConfig, ProfileConfig, RenderingConfig,
+    bundled_engines,
+};
 pub use dom::{
     Ancestors, Attribute, Children, Descendants, Document, Node, NodeData, NodeId, QuirksMode,
 };
@@ -72,3 +87,4 @@ pub use parse::{
 pub use query::{
     element_matches, query_selector, query_selector_all, query_selector_all_str, query_selector_str,
 };
+pub use state::{AppState, NavigationGeneration, NavigationResult, NavigationState, StateError};

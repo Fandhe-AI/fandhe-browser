@@ -21,6 +21,11 @@ license.workspace = true
 # （`make check-publish-private` が機械的に検証する）。
 publish.workspace = true
 
+# TASK-41.1（Issue #169）: `state` モジュール（共通 `AppState`）が `Profile` を保持する
+# ため `fandhe-browser-profile` への path 依存を追加した。AGENTS.md「crate 間の許可依存」
+# で core が依存してよいと定められた workspace 内 crate であり、外部（registry）依存では
+# ないため dependency-policy.md のユーザー承認の対象外（ai crate の core への path 依存が前例）。
+#
 # 依存最小方針（dependency-policy.md）に従い、新規依存の追加はユーザー承認制。
 # いずれも Issue #35（2026-09-25 承認済み）で採用が決まった依存であり、
 # `=x.y.z` 完全固定で管理する。
@@ -33,10 +38,31 @@ publish.workspace = true
 # - reqwest・rustls: `fetch`（TASK-24.2・#36）が使う HTTP クライアント。
 #   root `[workspace.dependencies]` に集約し、ここでは `{ workspace = true }` で
 #   参照する。
+# - toml・serde: `config`（TASK-91（91.1）・Issue #214）が使う TOML パーサーと
+#   (de)serialize 基盤。Issue #213（TASK-91.hdep）で承認済み（2026-09-25）。
+#   `config.rs` の doc コメントの通り、serde/toml の型は公開 API に漏らさない。
 [dependencies]
+fandhe-browser-profile = { path = "../fandhe-browser-profile" }
 html5ever = "=0.40.1"
 reqwest = { workspace = true }
 rustls = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+# fandhe-browser-js: `config` の `[js] engine` 解析（TASK-91（91.2）・Issue #215）が
+# `EngineKind`・`bundled_engines` を使う。ワークスペース内の path 依存であり
+# 外部（registry）クレートの追加ではない（spec の依存方向: js に依存するのは
+# core のみ）。js の既定 feature は `[]` のため既定ビルドの依存グラフへ v8 等を
+# 持ち込まない。`js-v8`/`js-boa` は下の `[features]` で転送する。
+fandhe-browser-js = { path = "../fandhe-browser-js" }
+
+# `JsEngineNotCompiled` のエラーメッセージが案内する `--features js-v8` /
+# `--features js-boa` を core 対象のビルドでも有効にするための feature 転送
+# （TASK-91.2・Issue #215・PR #578 レビュー指摘）。js crate の同名 feature を
+# 有効にするだけで、新規依存は増えない。既定は空のため既定ビルドの依存グラフは不変。
+[features]
+default = []
+js-v8 = ["fandhe-browser-js/js-v8"]
+js-boa = ["fandhe-browser-js/js-boa"]
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -70,4 +96,12 @@ path = "../../benches/competitor_lightpanda/support.rs"
 [[test]]
 name = "competitor_lightpanda_measure"
 path = "../../benches/competitor_lightpanda/measure_tests.rs"
+harness = false
+
+# TASK-91（91.2）・Issue #215: `[js] engine` の fail-closed 起動エラーを、子プロセス
+# の非 0 終了・stderr として検証する結合テスト。cli（TASK-41.5）未作成のため、
+# このテストバイナリ自身の再実行（`std::env::current_exe()`）で起動シーケンスを
+# 模す。親が終了コードと stderr を集計する独自 `main` を持つため `harness = false`。
+[[test]]
+name = "config_js_engine"
 harness = false

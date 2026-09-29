@@ -115,6 +115,122 @@ pub(crate) const TEST_HELLO_ENGINE_OVERRIDE_ENV_VAR: &str =
 /// ちょうどの `Hello` を送る。
 pub(crate) const TEST_HELLO_EXTRA_BYTE_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER_HELLO_EXTRA_BYTE";
 
+/// テスト専用: 子プロセスが起動直後に事前登録すべき逆方向 RPC プロキシの
+/// 一覧を渡す環境変数（`JS-1`・`TASK-29`・Issue #526）。
+///
+/// 値は `name=id` を `,` で区切った形式（例: `f=1,g=2`）。子側
+/// （[`worker_main`]）はこの値を **untrusted な外部入力**として扱い、
+/// 全体長・件数の上限を検査してから解析する（各要素の `name` の妥当性は
+/// [`super::v8_engine::V8Engine::install_native_proxy_global`] 自身が
+/// 検証する）。
+///
+/// 本番の登録は親→子の登録フレーム（Issue #155）で行う予定であり、この
+/// 環境変数は **`test-support` feature でのみ**読む（本番の起動経路
+/// （`super::process_engine::V8ProcessEngine::spawn_worker`）は
+/// `env_clear()` した状態で子を起動するため、`test-support` が有効な
+/// ビルドでも本番の `new()` 経由では値が渡らない。テストのみが
+/// `WorkerSpawnConfigForTest::native_proxies_for_test` 経由で設定する）。
+/// #155 完了後、本番の登録フレーム処理と併存させるか置き換えるかは
+/// 別途判断する。
+///
+/// 値は、親がエンジンの寿命のあいだ保持するホスト登録簿
+/// （`V8ProcessEngine::host_bindings`）と
+/// `WorkerSpawnConfigForTest::native_proxies_for_test` から、子を起動する
+/// たび（初回・再起動の両方）に組み立て直される（`TASK-29`・Issue #527）。
+#[cfg(feature = "test-support")]
+pub(crate) const TEST_NATIVE_PROXIES_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER_TEST_NATIVE_PROXIES";
+
+/// [`TEST_NATIVE_PROXIES_ENV_VAR`] に許す最大の値の長さ（バイト）。
+/// DoS 対策の上限（外部入力を解析する前に検査する。coding-rust.md「外部
+/// 入力」節）。
+///
+/// 親（`super::process_engine`）が環境変数の値を組み立てる際にも同じ上限を
+/// 使うため、feature に関わらず存在させる（`TASK-29`・Issue #527）。
+pub(crate) const MAX_TEST_NATIVE_PROXIES_ENV_VAR_BYTES: usize = 4096;
+
+/// [`TEST_NATIVE_PROXIES_ENV_VAR`] に許す最大の登録件数。
+///
+/// 親が値を組み立てる際にも同じ上限を使うため、feature に関わらず存在
+/// させる（`TASK-29`・Issue #527）。
+pub(crate) const MAX_TEST_NATIVE_PROXIES: usize = 16;
+
+/// [`TEST_NATIVE_PROXIES_ENV_VAR`] の生の値を `(name, id)` の列へ解析する
+/// （`JS-1`・`TASK-29`・Issue #526）。
+///
+/// 外部入力として扱う: 全体長・件数を確保の前に検証し、`id` は `u32` として
+/// 解析できることだけを確認する（`name` 自体の妥当性・重複チェックは
+/// 呼び出し元が `install_native_proxy_global` を呼んだ結果の `Err` に
+/// 委ねる。二重に検証しない）。
+///
+/// 値が未設定・空文字列の場合は空の `Vec`（登録なし）を返す。形式が
+/// 不正な場合は `Err` を返し、呼び出し元（[`worker_main`]）はハンドシェイク
+/// を送らずに失敗終了する（fail-closed）。
+#[cfg(feature = "test-support")]
+fn parse_test_native_proxies_env_value(raw: Option<&str>) -> Result<Vec<(String, u32)>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    if raw.len() > MAX_TEST_NATIVE_PROXIES_ENV_VAR_BYTES {
+        return Err(format!(
+            "{TEST_NATIVE_PROXIES_ENV_VAR} exceeds the maximum supported length of \
+             {MAX_TEST_NATIVE_PROXIES_ENV_VAR_BYTES} bytes"
+        ));
+    }
+    let mut proxies = Vec::new();
+    for entry in raw.split(',') {
+        if proxies.len() >= MAX_TEST_NATIVE_PROXIES {
+            return Err(format!(
+                "{TEST_NATIVE_PROXIES_ENV_VAR} has more than {MAX_TEST_NATIVE_PROXIES} entries"
+            ));
+        }
+        let Some((name, id_str)) = entry.split_once('=') else {
+            return Err(format!(
+                "{TEST_NATIVE_PROXIES_ENV_VAR} entry {entry:?} is not in name=id form"
+            ));
+        };
+        let id: u32 = id_str.trim().parse().map_err(|_| {
+            format!("{TEST_NATIVE_PROXIES_ENV_VAR} entry {entry:?} has a non-u32 id")
+        })?;
+        proxies.push((name.to_string(), id));
+    }
+    Ok(proxies)
+}
+
+/// テスト専用（Windows のみ）: 子プロセスの Job Object
+/// `ProcessMemoryLimit` を本番値（384 MiB）より**下げる**環境変数
+/// （`JS-1`・`TASK-29`・Issue #531。親側の RSS 監視が先に発動しない構成で、
+/// OS が確保を拒否する経路を検証するため）。
+///
+/// [`TEST_HEAP_LIMIT_ENV_VAR`] と同様、本番の起動経路は `env_clear()` した
+/// 状態で子を起動するため、明示的に渡さない限り本番では存在しない。値は
+/// untrusted な入力として扱い、子側で
+/// [`super::resource_limits::clamp_test_windows_process_memory_limit_bytes`]
+/// により本番値以下へクランプする（親側のクランプとは独立した多層防御）。
+#[cfg(target_os = "windows")]
+pub(crate) const TEST_WINDOWS_PROCESS_MEMORY_LIMIT_ENV_VAR: &str =
+    "FANDHE_BROWSER_JS_WORKER_WINDOWS_PROCESS_MEMORY_LIMIT_BYTES";
+
+/// 環境変数のバイト数文字列を `u64` で解釈し、`usize` に収まらない値は
+/// `usize::MAX` へ飽和させる（32 ビット環境でも `usize` 範囲外の巨大値が
+/// 解釈失敗（`None` = 既定値）にならず、後段のクランプで上限へ丸められる。
+/// 3 OS 対応・`JS-1`・`TASK-29`）。数値として解釈できなければ `None`。
+fn parse_env_bytes_saturating(value: &str) -> Option<usize> {
+    let parsed = value.trim().parse::<u64>().ok()?;
+    Some(usize::try_from(parsed).unwrap_or(usize::MAX))
+}
+
+/// [`TEST_WINDOWS_PROCESS_MEMORY_LIMIT_ENV_VAR`] の生の値から、
+/// `enforce_child_memory_limit` へ渡す上書き値を決める純粋関数。解釈
+/// できなければ `None`（本番値）、解釈できればクランプした値を返す。
+#[cfg(target_os = "windows")]
+fn test_windows_process_memory_limit_from_env_value(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(parse_env_bytes_saturating)
+        .map(super::resource_limits::clamp_test_windows_process_memory_limit_bytes)
+}
+
 /// [`TEST_HEAP_LIMIT_ENV_VAR`] の生の値（未設定なら `None`）から、実際に
 /// [`V8Engine::new_with_heap_limit`] へ渡すヒープ上限を決める（codex
 /// レビュー指摘 #503 P0 対応）。
@@ -133,7 +249,7 @@ pub(crate) const TEST_HELLO_EXTRA_BYTE_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER
 /// - 解釈できた場合は [`super::v8_engine::clamp_test_heap_limit_bytes`] で
 ///   クランプした値を返す（本番の既定値を超えられず、下限も満たす）
 fn test_heap_limit_from_env_value(raw: Option<&str>) -> Option<usize> {
-    raw.and_then(|value| value.trim().parse::<usize>().ok())
+    raw.and_then(parse_env_bytes_saturating)
         .map(super::v8_engine::clamp_test_heap_limit_bytes)
 }
 
@@ -284,13 +400,27 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
     // 対応。`ChildMemoryLimitGuard` のドキュメントコメント参照。`_` を
     // 先頭に付けた名前にすることで「未使用」の警告を避けつつ、値
     // そのものはこの関数の終わりまで drop されない）。
-    let _memory_limit_guard = match super::resource_limits::enforce_child_memory_limit() {
-        Ok(guard) => guard,
-        Err(err) => {
-            eprintln!("fandhe-browser-js worker: failed to enforce the child memory limit: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+    //
+    // Windows のテスト専用の上書き（Issue #531）は、環境変数を untrusted な
+    // 入力として読み取り直後にクランプする（本番値を超えられない）。
+    #[cfg(target_os = "windows")]
+    let windows_limit_override = test_windows_process_memory_limit_from_env_value(
+        std::env::var(TEST_WINDOWS_PROCESS_MEMORY_LIMIT_ENV_VAR)
+            .ok()
+            .as_deref(),
+    );
+    #[cfg(not(target_os = "windows"))]
+    let windows_limit_override: Option<usize> = None;
+    let _memory_limit_guard =
+        match super::resource_limits::enforce_child_memory_limit(windows_limit_override) {
+            Ok(guard) => guard,
+            Err(err) => {
+                eprintln!(
+                    "fandhe-browser-js worker: failed to enforce the child memory limit: {err}"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
 
     // V8 の Platform を protected 版（thread-isolated allocation 有効）で
     // 初期化する（`JS-1`・`TASK-29`・Issue #520）。この子プロセスは
@@ -349,6 +479,36 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
     // 保持しない（旧実装は保持しており、評価中に本 transport が同じ
     // stdin を読もうとするとデッドロックしていた）。
     engine.set_native_call_transport(Box::new(StdioTransport::new(io::stdin(), io::stdout())));
+
+    // JS-1・TASK-29・Issue #526: `test-support` ビルドに限り、結合テストが
+    // 親側 `NativeCall` dispatch を実際の子プロセスで検証できるよう、
+    // 起動直後（Hello を送る前）にプロキシを事前登録する。本番の登録
+    // フレーム（#155）が実装されるまでの代替経路であり、
+    // [`TEST_NATIVE_PROXIES_ENV_VAR`] のドキュメントコメントが述べる
+    // とおり本番の起動経路には影響しない。
+    #[cfg(feature = "test-support")]
+    {
+        let raw = std::env::var(TEST_NATIVE_PROXIES_ENV_VAR).ok();
+        match parse_test_native_proxies_env_value(raw.as_deref()) {
+            Ok(proxies) => {
+                for (name, id) in proxies {
+                    if let Err(err) = engine.install_native_proxy_global(&name, id) {
+                        eprintln!(
+                            "fandhe-browser-js worker: failed to install a test native proxy \
+                             {name:?} (id {id}): {err}"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "fandhe-browser-js worker: invalid test native proxy configuration: {err}"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     let mut stdout = io::stdout();
 
@@ -522,27 +682,21 @@ fn evaluate_and_respond(
 /// 無い。実装済みを装わない。REPAIR-3）。
 fn classify_evaluation_error(err: &JsEngineError) -> (ErrorKind, String) {
     match err {
-        JsEngineError::EvaluationFailed(msg) => (ErrorKind::Evaluation, truncate_for_wire(msg)),
-        JsEngineError::BindingFailed(msg) => (ErrorKind::Binding, truncate_for_wire(msg)),
-        JsEngineError::Timeout(msg) => (ErrorKind::Timeout, truncate_for_wire(msg)),
-        JsEngineError::ResourceLimitExceeded(msg) | JsEngineError::EngineUnavailable(msg) => {
-            (ErrorKind::Evaluation, truncate_for_wire(msg))
+        JsEngineError::EvaluationFailed(msg) => (
+            ErrorKind::Evaluation,
+            worker_protocol::truncate_for_wire(msg),
+        ),
+        JsEngineError::BindingFailed(msg) => {
+            (ErrorKind::Binding, worker_protocol::truncate_for_wire(msg))
         }
+        JsEngineError::Timeout(msg) => {
+            (ErrorKind::Timeout, worker_protocol::truncate_for_wire(msg))
+        }
+        JsEngineError::ResourceLimitExceeded(msg) | JsEngineError::EngineUnavailable(msg) => (
+            ErrorKind::Evaluation,
+            worker_protocol::truncate_for_wire(msg),
+        ),
     }
-}
-
-/// エラーメッセージを [`worker_protocol::MAX_ERROR_MESSAGE_BYTES`] まで
-/// 切り詰める（バイト単位。文字境界を壊さないよう `str::is_char_boundary`
-/// で境界を探してから切る。coding-rust.md「外部入力」節）。
-fn truncate_for_wire(message: &str) -> String {
-    if message.len() <= worker_protocol::MAX_ERROR_MESSAGE_BYTES {
-        return message.to_string();
-    }
-    let mut end = worker_protocol::MAX_ERROR_MESSAGE_BYTES;
-    while end > 0 && !message.is_char_boundary(end) {
-        end -= 1;
-    }
-    message.get(..end).unwrap_or_default().to_string()
 }
 
 /// フレームを書き込んで即座に `flush` する。子・親どちらも stdio は
@@ -557,23 +711,59 @@ fn send_frame(writer: &mut impl Write, tag: u8, payload: &[u8]) -> Result<(), Pr
 mod tests {
     use super::*;
 
-    /// JS-1・Issue #503: 上限以内のメッセージはそのまま返すこと。
+    /// JS-1・TASK-29・Issue #526: 未設定・空文字列は登録なし（空の
+    /// `Vec`）になること。
+    #[cfg(feature = "test-support")]
     #[test]
-    fn js_1_truncate_for_wire_keeps_short_messages_untouched() {
-        assert_eq!(truncate_for_wire("boom"), "boom");
+    fn js_1_parse_test_native_proxies_env_value_treats_missing_or_empty_as_no_proxies() {
+        assert_eq!(
+            parse_test_native_proxies_env_value(None).expect("must parse"),
+            Vec::new()
+        );
+        assert_eq!(
+            parse_test_native_proxies_env_value(Some("")).expect("must parse"),
+            Vec::new()
+        );
     }
 
-    /// JS-1・Issue #503: 上限を超えるメッセージは
-    /// `MAX_ERROR_MESSAGE_BYTES` 以下（かつ文字境界で切られたバイト列）に
-    /// 切り詰められること。
+    /// JS-1・TASK-29・Issue #526: `name=id` を `,` で区切った正常な値が
+    /// 順序どおりに解析されること。
+    #[cfg(feature = "test-support")]
     #[test]
-    fn js_1_truncate_for_wire_truncates_oversized_messages_at_a_char_boundary() {
-        // マルチバイト文字（3 バイトの日本語）を境界ちょうどに配置し、
-        // 境界探索が正しく機能することを確認する。
-        let message = "a".repeat(worker_protocol::MAX_ERROR_MESSAGE_BYTES - 1) + "あ" + "b";
-        let truncated = truncate_for_wire(&message);
-        assert!(truncated.len() <= worker_protocol::MAX_ERROR_MESSAGE_BYTES);
-        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    fn js_1_parse_test_native_proxies_env_value_parses_valid_entries() {
+        assert_eq!(
+            parse_test_native_proxies_env_value(Some("f=1,g=2")).expect("must parse"),
+            vec![("f".to_string(), 1), ("g".to_string(), 2)]
+        );
+    }
+
+    /// JS-1・TASK-29・Issue #526: `=` が無い要素・`u32` として解釈できない
+    /// `id` は `Err` になること（外部入力を検証してから使う）。
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn js_1_parse_test_native_proxies_env_value_rejects_malformed_entries() {
+        assert!(parse_test_native_proxies_env_value(Some("no-equals-sign")).is_err());
+        assert!(parse_test_native_proxies_env_value(Some("f=not-a-number")).is_err());
+    }
+
+    /// JS-1・TASK-29・Issue #526: 件数の上限を超える値は、確保前に `Err`
+    /// になること（DoS 対策。coding-rust.md「外部入力」節）。
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn js_1_parse_test_native_proxies_env_value_rejects_too_many_entries() {
+        let raw = (0..=MAX_TEST_NATIVE_PROXIES)
+            .map(|i| format!("f{i}={i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_test_native_proxies_env_value(Some(&raw)).is_err());
+    }
+
+    /// JS-1・TASK-29・Issue #526: 全体長の上限を超える値は `Err` になること。
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn js_1_parse_test_native_proxies_env_value_rejects_oversized_value() {
+        let raw = "f=".to_string() + &"1".repeat(MAX_TEST_NATIVE_PROXIES_ENV_VAR_BYTES + 1);
+        assert!(parse_test_native_proxies_env_value(Some(&raw)).is_err());
     }
 
     /// codex レビュー指摘 #503 P0: 親を経由しない直接起動で
@@ -604,6 +794,39 @@ mod tests {
         assert_eq!(test_heap_limit_from_env_value(Some("not-a-number")), None);
         assert_eq!(test_heap_limit_from_env_value(Some("")), None);
         assert_eq!(test_heap_limit_from_env_value(None), None);
+    }
+
+    /// Issue #531: Job Object 上限の環境変数値は、上限超過・非数値・未設定・
+    /// 範囲内のいずれも具体値で期待どおりに変換されること。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn js_1_test_windows_process_memory_limit_from_env_value_clamps_and_falls_back() {
+        assert_eq!(
+            test_windows_process_memory_limit_from_env_value(Some("4294967296")),
+            Some(384 * 1024 * 1024)
+        );
+        assert_eq!(
+            test_windows_process_memory_limit_from_env_value(Some("117440512")),
+            Some(112 * 1024 * 1024)
+        );
+        assert_eq!(
+            test_windows_process_memory_limit_from_env_value(Some("x")),
+            None
+        );
+        assert_eq!(test_windows_process_memory_limit_from_env_value(None), None);
+    }
+
+    /// 3 OS 対応: `usize` に収まらない巨大値は解釈失敗にならず `usize::MAX`
+    /// へ飽和し、数値でない値は `None` になること（32 ビット環境対応）。
+    #[test]
+    fn js_1_parse_env_bytes_saturating_saturates_and_rejects_non_numeric() {
+        assert_eq!(parse_env_bytes_saturating(" 1024 "), Some(1024));
+        assert_eq!(
+            parse_env_bytes_saturating("18446744073709551615"),
+            Some(usize::MAX)
+        );
+        assert_eq!(parse_env_bytes_saturating("18446744073709551616"), None);
+        assert_eq!(parse_env_bytes_saturating("x"), None);
     }
 
     /// JS-1・Issue #503 W5: `JsEngineError::Timeout` は `ErrorKind::Timeout`

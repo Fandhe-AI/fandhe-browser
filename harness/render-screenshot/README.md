@@ -6,12 +6,15 @@ TASK-37.1（ビヘイビア `RENDER-5`。関連: `MEAS-3`）/ MS-1 対応。
 
 RENDER-5 の判定手順は、代表 5 サイト以上で Servo と Chromium の PNG を撮り、
 SSIM 0.90 以上・主要レイアウト要素の境界ボックスの 80% 以上が位置ずれ ±5% 以内かを
-比べるというものである。本ディレクトリのスクリプトが受け持つのはそのうち
-「両エンジンで同じ条件（viewport・待ち時間）の PNG を揃えて取得する」部分のみで、
-比較そのもの（SSIM・境界ボックス算出）と実機での合否判定は別 Issue の範囲になる。
+比べるというものである。本ディレクトリのスクリプトが受け持つのは、
+「両エンジンで同じ条件（viewport・待ち時間）の PNG を揃えて取得する」部分
+（`capture_screenshots.py`）と、その結果に対する SSIM・境界ボックス比較の
+機械的な算出（`measure_ssim.py`）までで、**実機（Linux）で撮影した PNG に
+対する RENDER-5 / MEAS-3 の最終合否判定は別 Issue の範囲**になる。
 
-- SSIM・境界ボックスの算出: #54（TASK-37.2）。`measure_ssim.py` が本ディレクトリに
-  追加され、`capture-result.json`（下記スキーマ）を入力として読む想定
+- SSIM・境界ボックスの算出: `measure_ssim.py`（TASK-37.2。#54 で実装済み）が
+  `capture-result.json`（下記スキーマ）を入力として読み、サイトごとの SSIM 値と
+  境界ボックス一致率を算出する（下記「`measure_ssim.py`: SSIM・境界ボックス比較」参照）
 - Linux 実機での測定と合否判定: #55（TASK-37.h1。人間が担当）
 
 ### spec パスからの読み替え
@@ -296,7 +299,7 @@ servoshell 系（TASK-36 で確定したオプション名に合わせて読み�
 
 ## 結果 JSON（`capture-result.json`）のスキーマ
 
-`schema_version: 1`。#54（TASK-37.2）の `measure_ssim.py` が読む入力契約。
+`schema_version: 1`。`measure_ssim.py`（TASK-37.2）が読む入力契約。
 
 ```json
 {
@@ -408,8 +411,8 @@ python3 -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
 - 保存先ファイル（`snapshots/<site_id>.html`・`capture-result.json`）は
   `resolve()` 後に `--out-dir` 配下であることを確認し、既存の symlink があっても
   `O_NOFOLLOW`（`_write_bytes_nofollow`。Windows では `is_symlink()` 事前チェック）
-  でリンク先ではなく新規ファイルとして書き込む（再実行時の symlink 経由の
-  外部ファイル上書き対策）
+  でリンク先ではなく新規ファイルとして書き込む。既存ファイルは `O_TRUNC` で開かず、同一ディレクトリの一時ファイルへ書いて `os.replace` で差し替える（ハードリンク先の破壊防止）。再実行時の symlink 経由の
+  外部ファイル上書き対策
 - 撮影ごとのタイムアウト・スナップショットのサイズ上限・サイト数上限（50）・
   `stderr` 末尾 2000 文字までの保持（子プロセスの標準出力・標準エラーは
   無制限にメモリへは保持せず、`stdout` は破棄し `stderr` はテンポラリファイル
@@ -459,9 +462,177 @@ python3 -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
   場合も例外を伝播させず `failed` として記録し、他サイト・他エンジンの撮影と
   `capture-result.json` の書き出しを継続する
 
+## `measure_ssim.py`: SSIM・境界ボックス比較（TASK-37.2）
+
+`RENDER-5`（関連: `MEAS-3`）/ MS-1 対応。`capture_screenshots.py` が書き出した
+`capture-result.json` と両エンジンの PNG を読み、サイトごとに SSIM 値と境界
+ボックス一致率を数値で算出し、RENDER-5 の判定基準（後述）と機械的に比較した
+結果を `<capture-dir>/measure-result.json` へ書き出す。
+
+**これは閾値との機械的な比較に過ぎない。実機（Linux）で撮影した PNG に対する
+RENDER-5 / MEAS-3 の最終合否判定は #55（TASK-37.h1。人間が担当）が行う。**
+本スクリプトの `verdict` を実機合格の証跡として扱わないこと（REPAIR-3）。
+
+### 使い方
+
+```bash
+python3 harness/render-screenshot/measure_ssim.py \
+  --capture-dir /path/to/out \
+  --min-sites 5
+```
+
+`--capture-dir` は `capture_screenshots.py --out-dir` の出力先。`--min-sites`
+（既定 5）以上のサイトが「SSIM 0.90 以上 かつ 境界ボックス一致率 80% 以上」を
+満たせば終了コード 0、満たさなければ 1、`--capture-dir`・`capture-result.json`
+の不正は 2 を返す（`capture_screenshots.py` と同じ終了コード体系）。
+
+### 境界ボックスの入力契約（範囲外: 抽出処理そのもの）
+
+境界ボックスの**抽出**（Chromium の CDP `DOM.getBoxModel` 等・Servo 側の API）は
+本スクリプトの範囲外であり、TASK-36/38 の成果次第でまだ決まっていない。
+本スクリプトはエンジンごとの**入力契約**だけを定義する:
+`<capture-dir>/<engine>/<site_id>.bboxes.json`
+
+```json
+{
+  "schema_version": 1,
+  "png_sha256": "<対応 PNG の SHA-256（小文字 16 進 64 桁）>",
+  "elements": [
+    { "id": "header", "x": 0, "y": 0, "width": 1280, "height": 64 }
+  ]
+}
+```
+
+`png_sha256` は必須（後述）。実値の例は
+`0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef` の形式。
+
+- `id` は `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` に一致し重複不可。`x`/`y`/`width`/
+  `height` は有限の数値（`bool` は不可）で絶対値 1e6 以下、`width`/`height` は
+  0 以上。要素数は 100 以下。PoC-6 が想定する 5〜10 件から外れる場合は警告を
+  出すが、Chromium 側（reference）の要素数が `BBOX_MIN_ELEMENTS_FOR_PASS`
+  （既定 5）未満のときは警告に加えて一致率に関わらずそのサイトを**不合格**
+  として扱う（fail-closed。要素数が 1 件でも一致すれば合格になってしまう
+  のを防ぐため）。5 件以上 10 件超（100 件以下）は警告のみで合否判定には
+  影響しない
+- ファイルが存在しない場合、そのサイトの bbox 判定は `not_measured`（サイト
+  不合格）になる。エンジン側で bbox を書き出す仕組みができるまでの既定挙動
+- bbox JSON は必須フィールド `png_sha256`（対応 PNG の SHA-256・小文字 16 進
+  64 桁）を持つ。`measure_ssim.py` は PNG 実体のハッシュと照合し、
+  欠落・不一致・形式不正なら前回撮影時点の bbox が混入した `stale` として不合格
+  （`error`）にする（`_bbox_png_binding_mismatch`。fail-closed 方針）。ファイル
+  更新時刻には依存しないため、bbox 先行記録・PNG 後保存のどちらの生成順序でも
+  正しく検証できる。フィールドが無い場合も対応付け不能のため不合格にする
+  （fail-closed。再撮影で `--out-dir` を使い回しても古い bbox が今回の測定値と
+  して受理されない。抽出処理側は撮影ごとに `png_sha256` を付与すること）
+
+### ±5%・80% の解釈（#55 で確認する解釈）
+
+Chromium を基準（reference）、Servo を対象（target）とする。要素 1 件の一致
+判定は 4 辺（`x`・`x+width`・`y`・`y+height`）それぞれのずれが、対応する軸の
+viewport 寸法（`x` 系は width、`y` 系は height）の ±5% 以内かで行う。ちょうど
+5% は一致とする（浮動小数誤差は `1e-9` の加算で吸収）。一致率は「一致した
+要素数 ÷ Chromium 側の要素数」。Servo 側に無い `id` は不一致、Servo 側にしか
+無い `id` は無視して警告のみ出す。Chromium 側の要素が 0 件の場合は判定不能
+として `error` を返す。80% 以上（例: 8/10）で合格、未満（例: 7/10）で不合格。
+ただし Chromium 側の要素数が `BBOX_MIN_ELEMENTS_FOR_PASS`（既定 5）未満の
+場合は、この一致率に関わらず不合格になる（前述の境界ボックスの入力契約を
+参照）。
+
+### SSIM の算出パラメータ（他ツールの値と比較するには揃える必要がある）
+
+Wang et al. 2004 の SSIM。グレースケール化は BT.601 の整数近似
+`Y = (299R+587G+114B+500)//1000`。アルファチャンネルがある場合は不透明な白
+（255）の上に合成してから輝度を計算する。窓は 7x7 一様窓・パディングなし
+（valid 窓のみ）・母分散/母共分散、`K1=0.01`・`K2=0.03`・`L=255`。全窓の平均
+（mean SSIM）を採用する。これらのパラメータが異なる SSIM 実装（scikit-image
+等）とは数値が一致しない可能性があるため、他ツールと比較する場合はパラメータ
+を揃えること。
+
+### 対応する PNG 形式・上限
+
+bit depth 8・非インターレース・color type 0/2/4/6（グレースケール・RGB・
+グレースケール+アルファ・RGBA）のみに対応する。16bit・パレット（color type
+3）・Adam7 インターレースは `PngDecodeError` で明示的に拒否する（実機の
+エンジンがこれらの形式を出力した場合は #55 で追加対応を検討する）。
+SSIM 計算の画素数上限は `MAX_SSIM_PIXELS`（2560x1600）で、超過したサイトは
+`error` になる（純 Python 実装が現実的な時間で処理できる範囲に収めるため）。
+
+### 出力スキーマ（`measure-result.json`）
+
+```json
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-28T00:00:00Z",
+  "reference_engine": "chromium",
+  "target_engine": "servo",
+  "viewport": { "width": 1280, "height": 800 },
+  "thresholds": { "ssim_min": 0.9, "bbox_rate_min": 0.8, "bbox_tolerance": 0.05, "min_sites": 5 },
+  "ssim_method": {
+    "window": 7, "window_shape": "uniform", "padding": "none",
+    "covariance": "population", "luma": "bt601-int", "alpha": "composite-over-white"
+  },
+  "sites": [
+    {
+      "site_id": "a1-wikipedia",
+      "status": "measured",
+      "reason": null,
+      "ssim": { "status": "measured", "value": 0.93, "passed": true, "reason": null },
+      "bbox": {
+        "status": "measured", "matched": 8, "total": 10, "rate": 0.8, "passed": true,
+        "elements": [
+          { "id": "header", "max_deviation_ratio": 0.01, "within_tolerance": true, "missing_in_target": false }
+        ],
+        "warnings": [],
+        "reason": null
+      },
+      "passed": true
+    }
+  ],
+  "summary": {
+    "pair_count": 5,
+    "passing_sites": 5,
+    "verdict": "meets_threshold",
+    "note": "mechanical threshold comparison; not a hardware-verified result (see issue #55)"
+  }
+}
+```
+
+`sites[].status` は `measured`（両エンジンの PNG が揃っていた）/ `skipped`
+（`capture-result.json` の時点でペアにならなかった。`reason` に理由）。
+`ssim.status` は `measured` / `error`（デコード失敗・寸法不一致・SSIM 窓未満・
+画素数上限超過）。`bbox.status` は `measured` / `not_measured`（Chromium・Servo
+いずれかの bbox ファイルが無い）/ `error`（JSON 不正・Chromium 側の要素が 0
+件等）。Servo 側ファイルが存在するが要素 0 件の場合は `not_measured` ではなく
+`measured`（全要素不一致）として扱い、両者を区別する。
+`sites[].passed` は `ssim.passed and bbox.passed`（両方 `measured` かつ閾値
+以上の場合のみ true。`not_measured`・`error` は fail-closed で不合格）。
+
+### セキュリティ上の注意
+
+非信頼入力は `capture-result.json`・PNG ファイル・bbox JSON の 3 つ（いずれも
+エンジンの出力や第三者が作ったファイルであり得る前提）。`capture-result.json`
+の `png` フィールドは capture-dir 配下の相対パスのみを許可し（絶対パス・`..`・
+symlink を拒否）、PNG・bbox JSON も symlink を拒否したうえで読み込む。
+ファイルサイズ（`capture-result.json` 4 MiB・bbox JSON 1 MiB）・bbox 要素数
+（100）・PNG のチャンク数（`capture_screenshots.MAX_PNG_CHUNKS`）・展開後サイズ
+（`capture_screenshots.MAX_PNG_RAW_BYTES`）・SSIM の画素数（`MAX_SSIM_PIXELS`）に
+上限を設け、無制限確保による DoS（OWASP A04）を防ぐ。bbox JSON の数値は
+`NaN`/`Infinity`・巨大な指数表記・巨大整数リテラルを拒否し、`Fraction`/
+`Decimal` へ生トークンを渡さない。PNG は 1 回目の検証（`capture_one` 実行時の
+`read_png_size`）を信用せず、2 回目の読み込みでも CRC・チャンク構造・展開後
+サイズを自前で再検証する（TOCTOU 対策）。PNG・bbox JSON のいずれのペアも、
+symlink 拒否に加えて `os.path.samefile`（inode 比較）で chromium/servo 側が
+同一ファイル（ハードリンク等）でないことを検証し、比較が成立しないまま
+誤って合格させない。シェル実行・`eval`・`subprocess` は使わない。
+
 ## スコープ外・申し送り
 
 - 実機（Linux）での Servo・Chromium の撮影と合否判定: #55（人間が担当）
-- SSIM・境界ボックスの算出: #54（TASK-37.2）
+- 境界ボックスの抽出処理（Chromium の CDP `DOM.getBoxModel` 等・Servo 側の API。
+  TASK-36/38 の成果次第）と、サイトごとの対象要素（5〜10 件）の選定
+- ±5% と 80% の解釈、および SSIM のパラメータ（上記「`measure_ssim.py`」の
+  各節に記載）を #55（実機での測定・合否判定）で確認・確定してもらうこと
+- 16bit・パレット・インターレースの PNG への対応（実機のエンジンがそうした
+  形式を出力した場合）
 - `make ci` / `.github/workflows/ci.yml` への本ハーネスのテスト組み込み: 未実施
   （後続候補として PR に記載）

@@ -16,8 +16,11 @@
 //! ヒープサイズのリソース上限（AGENTS.md「リソース上限」P0・codex レビュー
 //! 指摘 #154・#503 対応。ヒープ上限到達時の `Err` 化は Issue #506・#508・
 //! #509・#510）に加え、逆方向 RPC（`NativeCall`）の**子側**（プロキシ関数の
-//! 生成・呼び出し・fatal 時の打ち切り。`TASK-29`・Issue #511）を実装済み
-//! である。以下は未実装（実装済みを装わない。REPAIR-3）。
+//! 生成・呼び出し・fatal 時の打ち切り。`TASK-29`・Issue #511）に加え、
+//! 親側の `NativeCall` dispatch（`NativeFn` の実行・`NativeReturn` の
+//! 返信。`super::process_engine::dispatch_native_call`・`TASK-29`・
+//! Issue #526）を実装済みである。以下は未実装（実装済みを装わない。
+//! REPAIR-3）。
 //!
 //! - [`super::engine_trait::JsEngine`] トレイトへの集約（`TASK-29.6`）。
 //!   本モジュールは同トレイトと同じシグネチャの inherent メソッドとして
@@ -26,13 +29,14 @@
 //!   と並行して進めるため、共有の impl ブロックを編集し合うコンフリクトを
 //!   避ける）
 //! - 親→子の登録フレームを受け取って
-//!   [`V8Engine::install_native_proxy_global`] を実際に呼ぶ経路
+//!   [`V8Engine::install_native_proxy_global`] を実際に呼ぶ本番経路
 //!   （`TASK-29.4`「グローバル関数注入」・Issue #155）・DOM 風オブジェクト
 //!   バインディング（`TASK-29.5`・Issue #156）。本モジュールが用意するのは
 //!   プロキシ関数の生成・呼び出し本体までであり、親からの登録フレーム
-//!   自体は未配線
-//! - 親側の `NativeCall` dispatch（`NativeFn` の実行・`NativeReturn` の
-//!   返信。`super::process_engine`・Issue #526）
+//!   自体は未配線（`test-support` ビルド限定の代替経路として
+//!   `super::worker::TEST_NATIVE_PROXIES_ENV_VAR` 経由の事前登録フックを
+//!   Issue #526 で追加した。#155 完了後は本番の登録フレーム処理と
+//!   併存させるか置き換えるかを別途判断する）
 //! - 子の再起動時に、以前登録していたプロキシ関数・bind 済みオブジェクトを
 //!   再登録する処理（Issue #512）
 //! - `create_engine`（`engine_trait.rs`）への配線（`TASK-29.6`・`29.7`）。
@@ -98,7 +102,7 @@ use super::worker_protocol::{self, NativeReturn};
 /// フレーム由来。#155）として扱い、無制限の長さの文字列で
 /// `v8::String::new` を呼ばないよう、確保前に上限を検査する
 /// （coding-rust.md「外部入力」節・OWASP A04）。
-const MAX_NATIVE_PROXY_NAME_BYTES: usize = 256;
+pub(crate) const MAX_NATIVE_PROXY_NAME_BYTES: usize = 256;
 
 /// 子プロセス側から親プロセスへ逆方向 RPC（`NativeCall`）を送り、
 /// [`NativeReturn`] が届くまで**同期的にブロックする**窓口（`JS-1`・
@@ -813,11 +817,11 @@ impl V8Engine {
     /// ため、setter を実行してしまう余地も、登録に失敗したのに成功したと
     /// 装う余地もない（security.md「偽装・回避機能の禁止」）。
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "test-support")),
         expect(
             dead_code,
-            reason = "親→子の登録フレーム（#155）から呼ばれるまで未配線。\
-                      REPAIR-3"
+            reason = "親→子の登録フレーム（#155）から呼ばれるまで未配線。test-support \
+                      ビルドは worker.rs のテスト専用フックから呼ばれる。REPAIR-3"
         )
     )]
     pub(crate) fn install_native_proxy_global(
@@ -1201,10 +1205,11 @@ fn js_value_to_v8_value<'s>(
 /// 同じ `id` で登録し直せば、V8 側のポインタ寿命を気にせず再現できる
 /// （#155・#512 が担う）。
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "test-support")),
     expect(
         dead_code,
-        reason = "V8Engine::install_native_proxy_global 経由で #155 完了後に配線される。REPAIR-3"
+        reason = "V8Engine::install_native_proxy_global 経由で #155 完了後に配線される。\
+                  test-support ビルドは worker.rs のテスト専用フックから呼ばれる。REPAIR-3"
     )
 )]
 fn new_native_proxy_function<'s>(
@@ -1290,10 +1295,11 @@ fn native_call_arg_encoded_len(scope: &v8::PinScope<'_, '_>, value: v8::Local<v8
 /// 中に watchdog が発火した場合は、本コールバックから戻った時点で V8 が
 /// 打ち切る。
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "test-support")),
     expect(
         dead_code,
-        reason = "V8Engine::install_native_proxy_global 経由で #155 完了後に配線される。REPAIR-3"
+        reason = "V8Engine::install_native_proxy_global 経由で #155 完了後に配線される。\
+                  test-support ビルドは worker.rs のテスト専用フックから呼ばれる。REPAIR-3"
     )
 )]
 fn native_proxy_callback(

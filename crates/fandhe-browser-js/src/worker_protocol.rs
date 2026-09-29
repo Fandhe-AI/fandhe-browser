@@ -26,8 +26,9 @@
 //!   Issue #511）
 //! - [`tag::NATIVE_RETURN`]: 親 → 子。逆方向 RPC の戻り値
 //!   （[`NativeReturn`]。[`encode_native_return`]/[`decode_native_return`]。
-//!   Issue #511）。親側の dispatch（`NativeFn` の実行・本フレームの送信）は
-//!   別 Issue（#526）で追加する
+//!   Issue #511）。親側の dispatch（`NativeFn` の実行・本フレームの送信。
+//!   `super::process_engine::dispatch_native_call`）は Issue #526 で
+//!   実装済み
 //! - [`tag::SHUTDOWN`]: 親 → 子。ペイロードなし
 //!
 //! # 検証方針（外部入力として扱う。coding-rust.md「外部入力」節）
@@ -91,7 +92,8 @@ pub(crate) mod tag {
     /// `super::v8_engine` のプロキシ関数が送る）。
     pub(crate) const NATIVE_CALL: u8 = 5;
     /// 親 → 子。逆方向 RPC の戻り値（[`super::encode_native_return`]。
-    /// 親側の送信は別 Issue（#526）で追加する）。
+    /// 親側の送信は `super::process_engine::dispatch_native_call`
+    /// が担う。Issue #526）。
     pub(crate) const NATIVE_RETURN: u8 = 6;
     /// 親 → 子。ペイロードなし。
     pub(crate) const SHUTDOWN: u8 = 7;
@@ -732,20 +734,14 @@ pub(crate) fn encoded_js_value_len(value: &JsValue) -> Result<usize, ProtocolErr
 
 /// [`encode_native_call`] の逆変換（親側で使う。`JS-1`・Issue #511）。
 ///
-/// 呼び出し元（将来）: `super::process_engine` の親側 dispatch（`NativeFn`
-/// の実行と [`NativeReturn`] の返信。別 Issue #526）。
-///
 /// `argc` を [`MAX_NATIVE_CALL_ARGS`] と比較してから `Vec::with_capacity`
 /// する（外部入力である `argc` を信用してそのまま確保に使わない。
 /// coding-rust.md「外部入力」節・OWASP A04）。読み終えて末尾にバイトが
 /// 余っていれば [`ProtocolError::TrailingBytes`] を返す。
 ///
-/// 親側 dispatch（#526）が実装されるまでは `js-v8` の有無に関わらず
-/// 呼び出し元が存在しない（本番経路では常に dead code）。
-#[allow(
-    dead_code,
-    reason = "親側 dispatch（#526）から呼ばれるまで未配線。REPAIR-3"
-)]
+/// 呼び出し元: `super::process_engine::dispatch_native_call`（`js-v8`
+/// feature 有効時のみ）。Issue #526 で実装済み。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn decode_native_call(payload: &[u8]) -> Result<(u32, Vec<JsValue>), ProtocolError> {
     let id_bytes: [u8; 4] = payload
         .get(0..4)
@@ -789,9 +785,9 @@ pub(crate) fn decode_native_call(payload: &[u8]) -> Result<(u32, Vec<JsValue>), 
 /// [`tag::NATIVE_RETURN`] フレームが表す逆方向 RPC の戻り値（親 → 子。
 /// `JS-1`・`TASK-29`・Issue #511）。
 ///
-/// 呼び出し元（将来）: `super::process_engine` の親側 dispatch（`Ok` は
+/// 呼び出し元: `super::process_engine::dispatch_native_call`（`Ok` は
 /// `NativeFn` の戻り値、`Err` は `NativeFn` の実行失敗・呼び出し規約違反を
-/// 表す。別 Issue #526）。子側（[`super::v8_engine`] のプロキシ関数）は
+/// 表す。Issue #526）。子側（[`super::v8_engine`] のプロキシ関数）は
 /// [`decode_native_return`] でこれを読み、`Ok` は JS の戻り値へ、`Err` は
 /// JS の例外（`try`/`catch` で捕捉可能）へ変換する。
 #[derive(Debug, Clone, PartialEq)]
@@ -803,23 +799,58 @@ pub(crate) enum NativeReturn {
     Err(String),
 }
 
+/// [`encode_native_return`] が `value` に対して実際に追記するバイト数を、
+/// 確保・追記の**前**に計算する（[`super::process_engine::encode_bounded_native_return`]
+/// が、上限超過を確保してから検出するのではなく、確保**前**に上限超過を
+/// 検出できるようにするための補助関数。[`encoded_js_value_len`] と同じ
+/// 考え方を `NativeReturn` に適用する。`JS-1`・`TASK-29`・Issue #526・
+/// codex レビュー指摘「`NativeReturn` のサイズを確保前に検証する」対応）。
+///
+/// 表現は [`encode_native_return`] のドキュメントコメントと一致させる
+/// （`u8 status` ＋ 本体）。`Ok` は `1（status バイト）+
+/// encoded_js_value_len(value)`、`Err` は `1（status バイト）+
+/// message.len()` を、どちらも `checked_add` で計算する
+/// （`NativeReturn::Err` の `String` は事前に
+/// [`truncate_for_wire`]（[`MAX_ERROR_MESSAGE_BYTES`] 以内）を通す前提の
+/// ため現実的にはオーバーフローしないが、外部入力由来のサイズ計算である
+/// ため `checked_add` を使う。coding-rust.md「外部入力」節）。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+pub(crate) fn encoded_native_return_len(value: &NativeReturn) -> Result<usize, ProtocolError> {
+    match value {
+        NativeReturn::Ok(value) => {
+            let value_len = encoded_js_value_len(value)?;
+            1usize
+                .checked_add(value_len)
+                .ok_or(ProtocolError::NativeCallPayloadTooLarge {
+                    size: usize::MAX,
+                    max: MAX_FRAME_PAYLOAD_PARENT_TO_CHILD,
+                })
+        }
+        NativeReturn::Err(message) => {
+            1usize
+                .checked_add(message.len())
+                .ok_or(ProtocolError::NativeCallPayloadTooLarge {
+                    size: usize::MAX,
+                    max: MAX_FRAME_PAYLOAD_PARENT_TO_CHILD,
+                })
+        }
+    }
+}
+
 /// [`NativeReturn`] のペイロードを組み立てる（親側で使う。`JS-1`・
 /// Issue #511）。
 ///
 /// 表現: `u8 status`（0=Ok, 1=Err）＋ 本体（Ok は 1 つの [`JsValue`]、Err は
 /// 残り全部を UTF-8 のエラーメッセージとして扱う）。
 ///
-/// 呼び出し元（将来）: `super::process_engine`（別 Issue #526）。送信前に
+/// 呼び出し元: `super::process_engine::dispatch_native_call`。送信前に
 /// [`super::worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`] 以内・
 /// エラーメッセージを [`MAX_ERROR_MESSAGE_BYTES`] 以内に収める責務は
-/// 呼び出し側が負う（本関数自体は上限を課さない。#526 への申し送り）。
-///
-/// 親側 dispatch（#526）が実装されるまでは `js-v8` の有無に関わらず
-/// 呼び出し元が存在しない（本番経路では常に dead code）。
-#[allow(
-    dead_code,
-    reason = "親側 dispatch（#526）から呼ばれるまで未配線。REPAIR-3"
-)]
+/// 呼び出し側が負う（本関数自体は上限を課さない。呼び出し側は
+/// [`encoded_native_return_len`] で確保前に長さを検証してから本関数を
+/// 呼ぶ。`dispatch_native_call`・`encode_bounded_native_return` の
+/// ドキュメントコメント参照）。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) fn encode_native_return(value: &NativeReturn) -> Result<Vec<u8>, ProtocolError> {
     let mut out = Vec::new();
     match value {
@@ -833,6 +864,28 @@ pub(crate) fn encode_native_return(value: &NativeReturn) -> Result<Vec<u8>, Prot
         }
     }
     Ok(out)
+}
+
+/// エラーメッセージを [`MAX_ERROR_MESSAGE_BYTES`] まで切り詰める（バイト
+/// 単位。文字境界を壊さないよう `str::is_char_boundary` で境界を探してから
+/// 切る。coding-rust.md「外部入力」節）。
+///
+/// 呼び出し元: [`super::worker`]（子側。評価失敗メッセージを `Error`
+/// フレームで送る前）と、[`super::process_engine`] の親側 dispatch
+/// （`NativeFn` が `Err` を返した場合の `NativeReturn::Err` を組み立てる
+/// 前。`JS-1`・`TASK-29`・Issue #526）の双方が使う共通の切り詰め処理
+/// （元は `worker.rs` に private 実装として存在した。両者が使う
+/// プロトコル上の制約であるため本モジュールへ移した）。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+pub(crate) fn truncate_for_wire(message: &str) -> String {
+    if message.len() <= MAX_ERROR_MESSAGE_BYTES {
+        return message.to_string();
+    }
+    let mut end = MAX_ERROR_MESSAGE_BYTES;
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.get(..end).unwrap_or_default().to_string()
 }
 
 /// [`encode_native_return`] の逆変換（子側で使う。`JS-1`・Issue #511）。
@@ -1289,6 +1342,38 @@ mod tests {
         assert_eq!(decode_native_return(&encoded).expect("decode"), err);
     }
 
+    /// `TASK-29`・Issue #526・codex レビュー指摘「`NativeReturn` のサイズを
+    /// 確保前に検証する」対応: [`encoded_native_return_len`] が
+    /// [`encode_native_return`] の実際の出力長と一致すること（`Ok`・`Err`
+    /// の両方）。呼び出し元（`super::process_engine::encode_bounded_native_return`）
+    /// は、この一致を前提に「符号化する前に上限超過を判定できる」ため、
+    /// 2 つの計算が乖離しないことを回帰確認する。
+    #[test]
+    fn js_1_encoded_native_return_len_matches_encode_native_return_for_ok_and_err() {
+        let cases = vec![
+            NativeReturn::Ok(JsValue::Undefined),
+            NativeReturn::Ok(JsValue::Null),
+            NativeReturn::Ok(JsValue::Bool(true)),
+            NativeReturn::Ok(JsValue::Number(42.0)),
+            NativeReturn::Ok(JsValue::String("結果".to_string())),
+            NativeReturn::Err(String::new()),
+            NativeReturn::Err("エラーが発生しました".to_string()),
+        ];
+        for case in cases {
+            let expected_len = encode_native_return(&case)
+                .unwrap_or_else(|err| panic!("encode must succeed for {case:?}: {err}"))
+                .len();
+            let computed_len = encoded_native_return_len(&case).unwrap_or_else(|err| {
+                panic!("length computation must succeed for {case:?}: {err}")
+            });
+            assert_eq!(
+                computed_len, expected_len,
+                "encoded_native_return_len must match encode_native_return's actual output \
+                 length for {case:?}"
+            );
+        }
+    }
+
     /// JS-1・Issue #511: `decode_native_return` の拒否ケース（未知の
     /// status・Ok の末尾に余分なバイト・不正な UTF-8・上限を超える
     /// メッセージ・空のペイロード）。
@@ -1350,6 +1435,26 @@ mod tests {
             3 * 1_048_576 + 65_536,
             "child-to-parent limit must be 3 MiB + 64 KiB"
         );
+    }
+
+    /// JS-1・Issue #503: 上限以内のメッセージはそのまま返すこと
+    /// （`worker.rs` から移設。`TASK-29`・Issue #526）。
+    #[test]
+    fn js_1_truncate_for_wire_keeps_short_messages_untouched() {
+        assert_eq!(truncate_for_wire("boom"), "boom");
+    }
+
+    /// JS-1・Issue #503: 上限を超えるメッセージは `MAX_ERROR_MESSAGE_BYTES`
+    /// 以下（かつ文字境界で切られたバイト列）に切り詰められること
+    /// （`worker.rs` から移設。`TASK-29`・Issue #526）。
+    #[test]
+    fn js_1_truncate_for_wire_truncates_oversized_messages_at_a_char_boundary() {
+        // マルチバイト文字（3 バイトの日本語）を境界ちょうどに配置し、
+        // 境界探索が正しく機能することを確認する。
+        let message = "a".repeat(MAX_ERROR_MESSAGE_BYTES - 1) + "あ" + "b";
+        let truncated = truncate_for_wire(&message);
+        assert!(truncated.len() <= MAX_ERROR_MESSAGE_BYTES);
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
     }
 
     /// JS-1: 環境変数名・プロトコルバージョンの具体値（設計書 §3.1）。
