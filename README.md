@@ -70,7 +70,7 @@ workspace と crate 骨格（`crates/fandhe-browser-*`）の実装段階です�
 ### 前提ツール
 
 - [git](https://git-scm.com/)
-- [GNU Make](https://www.gnu.org/software/make/)（`make setup`/`make ci` 等のタスク実行に必須です。Linux・macOS には標準で入っています。Windows では [Chocolatey](https://community.chocolatey.org/packages/make)・[Scoop](https://scoop.sh/) 等での導入、または WSL の利用を案内します）
+- [GNU Make](https://www.gnu.org/software/make/)（`make setup`/`make ci` 等のタスク実行に必須です。Linux・macOS には標準で入っています。Windows では [Chocolatey](https://community.chocolatey.org/packages/make)・[Scoop](https://scoop.sh/) 等での導入、または WSL の利用を案内します。`make` は Git Bash か WSL 上で実行します。Windows の詳細な導入手順は [docs/setup/windows.md](docs/setup/windows.md) を参照してください）
 - [rustup](https://rustup.rs/)（`rust-toolchain.toml` が指定する stable ツールチェーン・rustfmt・clippy を自動選択します。導入方法は rustup 公式サイトの手順を参照してください）
 - 任意: [Docker](https://www.docker.com/)（`make docker-ci` で環境非依存の検証）。[lefthook](https://github.com/evilmartians/lefthook) 本体は任意（未導入でも `make setup` が実行する `make hooks` が brew または npx（`lefthook@<固定バージョン>`）で自動導入します。brew・npx のいずれも無い環境では `make hooks`／`make setup` がエラーで停止するため、その場合は先に brew か Node.js（npx）を導入してください）
 
