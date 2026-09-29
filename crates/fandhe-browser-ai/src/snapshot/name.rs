@@ -1647,11 +1647,18 @@ fn document_title_name(doc: &Document, index: &NameIndex) -> AccessibleName {
         },
         &mut text,
     );
+    finish_title_name(&text, scan.cut)
+}
+
+/// 収集済みの `<title>` テキストと走査打ち切りフラグから文書名を確定する。
+fn finish_title_name(text: &str, scan_cut: bool) -> AccessibleName {
     let mut buf = NameBuffer::new();
-    buf.push_str(&text);
-    let truncated = scan.cut || buf.truncated;
+    buf.push_str(text);
+    // 空白だけを読み進めて走査上限で打ち切られ結果が空でも、名前が不完全で
+    // あることを `truncated` で通知する（黙って省略しない。AISNAP-1）。
+    let truncated = scan_cut || buf.truncated;
     let mut result = buf.finish(NameSource::DocumentTitle);
-    result.truncated = truncated && !result.text.is_empty();
+    result.truncated = truncated;
     result
 }
 
@@ -3668,6 +3675,15 @@ mod tests {
         let r = compute_name(&doc, doc.root());
         assert_eq!(r.text.chars().count(), MAX_NAME_CHARS);
         assert!(r.truncated);
+        // テキストに届く前に走査が打ち切られ結果が空でも truncated を立てる。
+        assert_eq!(
+            super::finish_title_name("", true),
+            named("", NameSource::None, true)
+        );
+        assert_eq!(
+            super::finish_title_name("題", false),
+            named("題", NameSource::DocumentTitle, false)
+        );
     }
 
     /// AISNAP-1（TASK-11.4.3・#546）: 共有索引版と単発版の結果が一致する。
