@@ -54,6 +54,10 @@
 //!   ツリー構築統合は実装済み（TASK-11.7・Issue #76）。
 //!   残作業は TASK-11.3.2・11.3.3（Issue #542・#543）。TASK-11.8（Issue #77）の
 //!   結合テスト一式は `tests/snapshot.rs` で実装済み）
+//! - 表・一覧の圧縮（`AISNAP-2`・`TASK-12`・`MS-2`）。規則的な行列構造の
+//!   検出ロジックは実装済み（TASK-12.1・Issue #79。[`compress_table`]）。
+//!   ヘッダ ref 付与（#80）・データ行の圧縮 1 行表現（#81）・`truncated_rows`
+//!   注記（#82）・ツリー構築への統合（#83）・回帰テスト（#84）は未実装
 //! - `/ai/*` ルータ向けスナップショット API（`AISNAP-6`・`AISNAP-14`・`CDP-1`
 //!   （API 単体動作は `AISNAP-7`）、`TASK-19`（単体動作確認は `TASK-20`）、
 //!   `MS-4`）
@@ -61,4 +65,5 @@
 //!   動的ライブラリの実行時ロードは行わない方針。security.md 参照。
 //!   `PLUG-2`、`TASK-92`、`MS-9`）
 
+pub mod compress_table;
 pub mod snapshot;
