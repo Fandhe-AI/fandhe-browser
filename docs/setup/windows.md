@@ -7,7 +7,7 @@
 Linux・macOS・Windows の 3 OS 一級対応のうち、Windows でソースからビルド・テストするための手順です。対象は 64bit（`x86_64-pc-windows-msvc`）で、32bit は対象外です。
 
 - 手順は「既定ビルド」と「Servo 組込ビルド」の 2 段に分けます
-- 本手順書は Linux 上で作成しており、実機の Windows での再現は未実施です。Windows 前提の CI 検証（TASK-56.1・#195）は現行の `.github/workflows/ci.yml` には未導入です。導入され次第、本手順書の確認コマンドを CI の判定と突き合わせます
+- 本手順書は Linux 上で作成しており、実機の Windows での再現は未実施です。既定ビルドについては、現行の `.github/workflows/ci.yml` の `rust-ci` と `rust-ci-default-features` が `windows-latest` を含む 3 OS matrix で稼働しています。一方、Servo 組込ビルドに固有の前提（v143 ツールセット・ATL・uv 等）を検証する Windows CI は未導入です（TASK-56.1・#195）。導入され次第、本手順書の確認コマンドをその判定と突き合わせます
 
 ## 現状
 
@@ -56,7 +56,7 @@ Servo を組み込む Windows ビルド（feature `rendering`）は、3 OS の�
   - 「MSVC v143 - VS 2022 C++ x64/x86 ビルドツール」
   - 「最新の v143 ビルドツール用 C++ ATL (x86 & x64)」
   - 「Windows 11 SDK」または「Windows 10 SDK」（10.0.19041.0 以上）
-- Visual Studio 2026: 既定のツールセットは v145 です。v143 ツールセットとその ATL は、サイドバイサイドのコンポーネントとして追加で導入します。CI の実測では ATL のコンポーネント ID は `Microsoft.VisualStudio.Component.VC.14.44.17.14.ATL` です。他のマイナー版の ID は Microsoft Learn のコンポーネント一覧で確認してください（本手順書では未検証）。
+- Visual Studio 2026: 既定のツールセットは v145 です。v143 ツールセットとその ATL は、サイドバイサイドのコンポーネントとして追加で導入します。CI の実測では ATL のコンポーネント ID は `Microsoft.VisualStudio.Component.VC.14.44.17.14.ATL`、対応する v143 ツールセット（MSVC 14.44）のコンポーネント ID は `Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64` です（ATL の ID と同じ `14.44.17.14` 系列で揃えます）。他のマイナー版の ID は Microsoft Learn のコンポーネント一覧で確認してください（本手順書では未検証）。
 - Servo 側が VS 2026 に対応しているかは未検証です。Servo Book「Building on Windows」の最新記述を確認してください。
 
 ### コマンドラインでの導入
@@ -66,19 +66,22 @@ Servo を組み込む Windows ビルド（feature `rendering`）は、3 OS の�
 ```powershell
 & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe" modify `
   --installPath "<VS のインストールパス>" `
+  --add Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64 `
   --add Microsoft.VisualStudio.Component.VC.14.44.17.14.ATL `
   --quiet --norestart
 ```
+
+VS 2026 では v143 ツールセット（`...x86.x64`）と ATL（`...ATL`）の両方を必ず追加します。ATL だけでは v143 のコンパイラが入らず、v145 が既定のままになります。導入後は [前提の確認コマンド](#前提の確認コマンド) で、v143 のバージョン（14.30 以上 14.50 未満）と `atlbase.h` の存在の両方を確認してください。VS 2022 の場合は、上記の「個別のコンポーネント」の選択で同じ 2 つが入ります。
 
 新規導入は `winget install Microsoft.VisualStudio.2022.BuildTools --override "--add <コンポーネント ID> --passive"` の形式でも行えます。コンポーネント ID は Microsoft Learn の一覧で確認してください。
 
 ### Python と uv
 
 - Python 3 は `winget` の公式パッケージ、[python.org](https://www.python.org/downloads/windows/) の公式インストーラ、または `choco install python` で導入します。
-- `uv` は取得したスクリプトをそのまま実行する方式（`irm ... | iex` 等）を避け、バージョンとハッシュを固定して導入します。現行の `.github/workflows/ci.yml` には固定値（`uv` のバージョン・wheel の sha256）はまだ存在しません。CI 導入（TASK-56.1・#195）までは、次の手順で自分で確認した値を固定してください。
+- `uv` は取得したスクリプトをそのまま実行する方式（`irm ... | iex` 等）を避け、バージョンとハッシュを固定して導入します。現行の `.github/workflows/ci.yml` には、Servo 向けの固定値（`uv` のバージョン・wheel の sha256）はまだ存在しません（既定ビルドの CI は `uv` を必要としません）。Servo 固有の Windows CI 導入（TASK-56.1・#195）までは、次の手順で自分で確認した値を固定してください。
   1. [PyPI の uv](https://pypi.org/project/uv/#files) で採用するバージョンを選び、Windows x86_64 向け wheel（`win_amd64`）の SHA256 を控える
   2. 控えた値で次のように導入する（`pip` の `--require-hashes` がハッシュ不一致を拒否する）
-  3. CI に固定値が導入された後は、その値へ合わせる
+  3. Servo 固有の Windows CI に固定値が導入された後は、その値へ合わせる
 
   ```powershell
   # <版> と <sha256> は PyPI で確認した値に置き換える
@@ -93,7 +96,7 @@ Servo を組み込む Windows ビルド（feature `rendering`）は、3 OS の�
 
 ## 前提の確認コマンド
 
-PowerShell で実行します。CI 導入（TASK-56.1・#195）後は、その判定と同じ内容になる想定です。
+PowerShell で実行します。Servo 固有の Windows CI（TASK-56.1・#195）が導入された後は、その判定と同じ内容になる想定です。
 
 ```powershell
 # インストール済みの全 Visual Studio を列挙し、MSVC v143（14.30 以上 14.50 未満）を探す
