@@ -41,6 +41,12 @@
 //! 操作計測が共通で使うレコード型（[`observability::OperationRecord`] 等）を
 //! 追加した。各モジュールへの計測の組み込み・出力先の確定は含まない
 //! （モジュール doc コメント・Issue #218 を参照）。
+//! [`config`] モジュールは TASK-91（91.1・Issue #214・対象ビヘイビアなし・
+//! 基盤タスク）で、`fandhe-browser.toml` の `[profile]` セクション
+//! （保存先・分離強度）を読み込む本実装を追加した（`toml`・`serde` は
+//! Issue #213 で承認済み）。`[js] engine`（TASK-91（91.2）・Issue #215）も
+//! 読める。`[rendering] enabled`（TASK-91（91.3）・Issue #216）も読める
+//! （未同梱ビルドでの有効化は暫定でエラー。`config` モジュール doc コメント参照）。
 //!
 //! # スタブについて
 //!
@@ -52,6 +58,7 @@
 //! - [`observability::OperationRecord::to_json_line`]（`REPAIR-9`・`TASK-10（10.1）`・
 //!   `MS-4`。出力形式は Issue #218 で未確定な暫定エンコーダ）
 
+pub mod config;
 pub mod dom;
 pub mod error;
 pub mod fetch;
@@ -63,6 +70,10 @@ pub mod render;
 pub mod selector;
 pub mod state;
 
+pub use config::{
+    Config, ConfigError, EngineKind, IsolationStrength, JsConfig, ProfileConfig, RenderingConfig,
+    bundled_engines,
+};
 pub use dom::{
     Ancestors, Attribute, Children, Descendants, Document, Node, NodeData, NodeId, QuirksMode,
 };

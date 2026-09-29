@@ -24,6 +24,10 @@
 //! の各実装（#36/#38/#39/#41/#418）が固有のケース（HTTP ステータス・パース
 //! エラー位置等）を追加できるよう `#[non_exhaustive]` にしてある
 //! （REPAIR-4: 戻り値は将来拡張できる構造にする）。
+//!
+//! `config`（TASK-91（91.1）・Issue #214）は [`Error::Config`] を追加し、
+//! [`crate::config::ConfigError`] を payload として保持する（`Parse`/
+//! `ParseError` と同じ「専用エラー型を variant に包む」方式）。
 
 use std::fmt;
 use std::time::Duration;
@@ -147,6 +151,10 @@ pub enum Error {
         /// 適用された上限値（`query::MAX_MATCH_CACHE_ENTRIES`）。
         limit: usize,
     },
+    /// `config` モジュール（TASK-91（91.1）・Issue #214・基盤タスクのため
+    /// 対象ビヘイビアなし）が `fandhe-browser.toml` 相当の TOML 読み込み・
+    /// 解釈に失敗した場合に返す。詳細は [`crate::config::ConfigError`] を参照。
+    Config(crate::config::ConfigError),
 }
 
 impl fmt::Display for Error {
@@ -179,6 +187,7 @@ impl fmt::Display for Error {
             Error::MatchCacheLimitExceeded { limit } => {
                 write!(f, "selector match cache exceeded limit of {limit} entries")
             }
+            Error::Config(source) => write!(f, "configuration error: {source}"),
         }
     }
 }
@@ -199,6 +208,7 @@ impl std::error::Error for Error {
             | Error::TooManyConcurrentDnsResolutions { .. }
             | Error::Network { .. }
             | Error::MatchCacheLimitExceeded { .. } => None,
+            Error::Config(source) => Some(source),
         }
     }
 }
@@ -206,6 +216,12 @@ impl std::error::Error for Error {
 impl From<ParseError> for Error {
     fn from(source: ParseError) -> Self {
         Error::Parse(source)
+    }
+}
+
+impl From<crate::config::ConfigError> for Error {
+    fn from(source: crate::config::ConfigError) -> Self {
+        Error::Config(source)
     }
 }
 
@@ -615,5 +631,41 @@ mod tests {
             std::error::Error::source(&err).map(ToString::to_string),
             None::<String>
         );
+    }
+
+    /// TASK-91（91.1）・Issue #214: `Error::Config` の `Display` が内部の
+    /// `ConfigError` メッセージを包んで表示し、`source()` が連鎖することを
+    /// 確認する。
+    #[test]
+    fn task_91_1_display_and_source_chain_for_config_variant() {
+        let source = crate::config::ConfigError::InvalidValue {
+            key: "profile.root",
+            message: "profile.root must not be empty".to_string(),
+        };
+        let err = Error::Config(source);
+        assert_eq!(
+            err.to_string(),
+            "configuration error: invalid value for \"profile.root\": profile.root must not be \
+             empty"
+        );
+        assert_eq!(
+            std::error::Error::source(&err).map(ToString::to_string),
+            Some("invalid value for \"profile.root\": profile.root must not be empty".to_string())
+        );
+    }
+
+    /// TASK-91（91.1）・Issue #214: `?` 演算子で使うための
+    /// `From<ConfigError> for Error` 変換を確認する。
+    #[test]
+    fn task_91_1_from_config_error_converts_to_config_variant() {
+        fn load() -> Result<()> {
+            Err(crate::config::ConfigError::InvalidUtf8)?
+        }
+
+        let err = load().expect_err("load は常に失敗する");
+        assert!(matches!(
+            err,
+            Error::Config(crate::config::ConfigError::InvalidUtf8)
+        ));
     }
 }

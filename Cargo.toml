@@ -123,6 +123,24 @@ windows-sys = { version = "=0.61.2", features = [
   "Win32_System_Threading",
 ] }
 
+# TASK-91（91.1）・Issue #214: `fandhe-browser.toml` の設定読み込み基盤
+# （`fandhe-browser-core::config`）が使う TOML パーサーと (de)serialize 基盤。
+# Issue #213（TASK-91.hdep）でユーザー承認済み（2026-09-25）。配置は
+# `fandhe-browser-core` のみ（config.rs の doc コメント参照。他 crate から
+# `toml`/`serde` を直接使わない）。ライセンスはいずれも MIT OR Apache-2.0。
+# `derive` feature は `RawConfig`/`RawProfile`（config.rs 内の非公開型）の
+# `#[derive(Deserialize)]` に使う。`toml` は既定 feature（`std`・`serde`・
+# `parse`・`display`）のまま使う（#213 の推移依存記録が既定 feature 前提の
+# ため、feature を絞らない）。推移的依存: `serde_core`・`serde_spanned`・
+# `toml_datetime`・`toml_parser`・`winnow`・`toml_writer`、ビルド時のみ
+# `syn`/`quote`/`proc-macro2`（serde_derive）。`serde_json` は #213 の承認
+# 範囲外のため追加しない。
+serde = { version = "=1.0.229", features = ["derive"] }
+toml = { version = "=1.1.6" }
+# Cargo はバージョン要件の build metadata（`+spec-1.1.0`）を無視するため、
+# 上記の `=1.1.6` は #213 で承認された `toml = "=1.1.6+spec-1.1.0"` と
+# 同一クレート（`toml-1.1.6+spec-1.1.0`）に解決される。
+
 [profile.release]
 # release ビルドは panic 発生時に unwind せず即座に中断する前提
 # （coding-rust.md「release は panic = "abort" 前提のため catch_unwind に頼らない」）。
