@@ -1981,6 +1981,8 @@ impl std::fmt::Display for NativeDispatchViolation {
 ///   放置されるが、同じ関数の次回呼び出しは `try_lock` 失敗で即エラーに
 ///   なり、ホスト全体でも生存スレッド数を [`MAX_LIVE_NATIVE_THREADS`]
 ///   （64）で頭打ちにする（超過分は起動せず `NativeReturn::Err`）
+/// - 期限切れ済み（呼び出し時点、およびスレッド内の関数呼び出し直前）の
+///   場合は `NativeFn` を起動しない
 /// - panic は unwind するビルド（dev・test）では専用スレッド内に閉じ、JS への
 ///   `NativeReturn::Err` になる。release は `panic = "abort"` のため
 ///   `NativeFn` が panic するとホストプロセスごと終了する（スレッド分離では
@@ -2004,6 +2006,12 @@ fn dispatch_native_call(
     let Some(entry) = native_fns.get(idx) else {
         return Err(NativeDispatchViolation::UnknownId { id });
     };
+    // 期限切れ後は `NativeFn` を起動しない。呼び出し元は既に `Timeout` として
+    // 評価を破棄する側にいるため、ここから副作用を起こしてはならない
+    // （`NativeCallContext` の契約。Issue #526・codex レビュー指摘）。
+    if Instant::now() >= deadline {
+        return Err(NativeDispatchViolation::DeadlineExceeded);
+    }
     let entry = Arc::clone(entry);
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ctx = NativeCallContext::new(deadline, Arc::clone(&cancelled));
@@ -2021,12 +2029,22 @@ fn dispatch_native_call(
         .spawn(move || {
             let _slot = slot;
             let ret = match entry.try_lock() {
-                Ok(mut func) => match func(&args, &ctx) {
-                    Ok(value) => NativeReturn::Ok(value),
-                    Err(err) => {
-                        NativeReturn::Err(worker_protocol::truncate_for_wire(&err.to_string()))
+                Ok(mut func) => {
+                    // スレッド起動・ロック取得の間に期限切れ／取り消しになった場合は
+                    // 副作用を起こさないよう、関数呼び出し直前に再確認する。
+                    if ctx.is_cancelled() || Instant::now() >= ctx.deadline {
+                        NativeReturn::Err(
+                            "the native call was cancelled before it started".to_string(),
+                        )
+                    } else {
+                        match func(&args, &ctx) {
+                            Ok(value) => NativeReturn::Ok(value),
+                            Err(err) => NativeReturn::Err(worker_protocol::truncate_for_wire(
+                                &err.to_string(),
+                            )),
+                        }
                     }
-                },
+                }
                 // 以前の呼び出しが戻らないまま保持している。待機せず即エラーにし、
                 // ブロックしたスレッドを積み上げない。
                 Err(std::sync::TryLockError::WouldBlock) => NativeReturn::Err(
@@ -2520,6 +2538,28 @@ mod tests {
             }
             other => panic!("expected NativeReturn::Err, got: {other:?}"),
         }
+    }
+
+    /// `TASK-29`・Issue #526・codex レビュー指摘: 期限切れ後は `NativeFn` を
+    /// 起動せず `DeadlineExceeded` を返すこと（副作用を起こさない）。
+    #[test]
+    fn js_1_dispatch_native_call_does_not_invoke_native_fn_after_deadline() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_for_closure = Arc::clone(&called);
+        let native_fns: Vec<NativeEntry> = vec![entry(Box::new(
+            move |_args: &[JsValue], _ctx: &NativeCallContext| -> Result<JsValue, JsEngineError> {
+                called_for_closure.store(true, std::sync::atomic::Ordering::Release);
+                Ok(JsValue::Null)
+            },
+        ))];
+        let payload = worker_protocol::encode_native_call(0, &[]).expect("encode must succeed");
+
+        let result = dispatch_native_call(&native_fns, &payload, Instant::now());
+        assert!(matches!(
+            result,
+            Err(NativeDispatchViolation::DeadlineExceeded)
+        ));
+        assert!(!called.load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// `TASK-29`・Issue #526・codex レビュー指摘: 期限切れで待機を打ち切った際、
