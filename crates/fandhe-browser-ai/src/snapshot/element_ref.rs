@@ -40,20 +40,20 @@
 //!
 //! - `discriminator`: `id`・`href`・フォーム部品の `name` など、要素自身に付く
 //!   安定した識別属性（untrusted な文字列。ダイジェストにのみ使い ref には入らない）
-//! - `scope`: 親要素の ref。ダイジェストと variant は常に、出現番号は子に
-//!   `discriminator` が無いときだけ折り込む。別コンテナの同名要素と出現番号を
-//!   共有しないための範囲指定
+//! - `scope`: 親要素の ref。親の digest と variant（出現番号は含めない）を
+//!   ダイジェストへ折り込み、別コンテナの同名要素を区別する範囲指定
 //!
-//! 子に `discriminator` がある場合に親の出現番号を折り込まないのは、子の ref が
-//! 「同じダイジェストを持つ祖先の文書順」に依存してしまい、同じ role + name の親が
-//! 前に挿入されただけで変わるのを避けるためである。逆に `discriminator` が無い子は
-//! 親の出現番号でしか区別できないため折り込む（識別属性のない同名カードそれぞれの
-//! 「Delete」ボタンが、出現番号を共有して取り違えられるのを防ぐ）。
+//! 親の出現番号を子のダイジェストへ折り込まないのは、`ElementRef.digest` を通じて
+//! 全子孫へ漏れ、同じ role + name の祖先が前に挿入されただけで識別属性を持つ子孫の
+//! ref まで変わるためである。ダイジェストは祖先の識別情報（role・name・識別属性）の
+//! 連鎖だけで決まり、文書順には依存しない。
 //!
-//! これでダイジェストが分かれる要素は、同名要素の挿入・並び替えの影響を受けない。
-//! 識別属性のない同名の親を前に挿入すると、その親と配下の識別属性のない子の ref は
-//! 文書順で一斉にずれる（原理的な限界。将来は DOM 構造ハッシュの併用を検討する）。
-//! 親側に `discriminator` を渡すと、親と子の ref は安定する。
+//! 同じ識別情報の連鎖を持つ要素（識別属性のない同名カード配下の同名ボタンや、
+//! 別カードで `href` が重複するリンク等）は同一ダイジェストになり、先行順の出現番号で
+//! 区別される。連鎖が異なる要素は、同名要素の挿入・並び替えの影響を受けない。
+//! 連鎖まで同じ要素の前へ同種の要素を挿入すると、それ以降の出現番号は一斉にずれる
+//! （原理的な限界。将来は DOM 構造ハッシュの併用を検討する）。親側に
+//! `discriminator` を渡すと、親と子の ref は安定する。
 //!
 //! # 呼び出し側の契約（TASK-11.7 向け）
 //!
@@ -132,8 +132,8 @@ pub struct ElementSignature<'a> {
     pub discriminator: Option<&'a str>,
     /// 親要素の ref。ルート直下は `None`。
     ///
-    /// ダイジェストと variant は常に、出現番号は `discriminator` が無いときだけ
-    /// シグネチャへ折り込む（理由はモジュール冒頭の「再特定の安定性」を参照）。
+    /// 親の digest と variant をシグネチャへ折り込む（出現番号は折り込まない。
+    /// 理由はモジュール冒頭の「再特定の安定性」を参照）。
     pub scope: Option<ElementRef>,
 }
 
@@ -180,12 +180,10 @@ impl<'a> ElementSignature<'a> {
                     .update(&[2])
                     .update(&sc.digest.to_le_bytes())
                     .update(&sc.variant.to_le_bytes());
-                // 子に識別属性が無いときだけ親の出現番号も折り込む。識別属性の無い
-                // 同名の親（同名カード等）の子を、出現番号の共有で取り違えないため。
-                // 識別属性があれば子は自力で区別できるので折り込まず、親の挿入の影響を避ける。
-                if self.discriminator.is_none() {
-                    h = h.update(&sc.occurrence.to_le_bytes());
-                }
+                // 親の出現番号は折り込まない。折り込むと ElementRef.digest 経由で全子孫へ
+                // 漏れ、同名祖先の挿入だけで識別属性を持つ子孫の ref まで変わるため。
+                // 同名親（識別属性なし）の子は親の (digest, variant) が同じで同一シグネチャ
+                // になり、出現番号（先行順）で区別される。
             }
         }
         h
@@ -439,7 +437,7 @@ mod tests {
         );
     }
 
-    /// `AISNAP-10`: 識別属性のない同名親の子は、親の出現番号で区別され ref が衝突しない。
+    /// `AISNAP-10`: 識別属性のない同名親の子は同一ダイジェストになり、出現番号で区別される。
     #[test]
     fn aisnap_10_undiscriminated_children_of_same_name_parents_are_distinct() {
         let mut a = RefAllocator::new();
@@ -451,20 +449,53 @@ mod tests {
             let del = ElementSignature::new("button", "Delete").with_scope(card);
             refs.push(a.allocate_signature(&del).unwrap());
         }
-        assert_ne!(refs[0].digest, refs[1].digest);
+        assert_eq!(refs[0].digest, refs[1].digest);
         assert_eq!(refs[0].occurrence, 1);
-        assert_eq!(refs[1].occurrence, 1);
+        assert_eq!(refs[1].occurrence, 2);
+        assert_ne!(s(refs[0]), s(refs[1]));
+    }
+
+    /// 識別属性を持つ子孫の ref を、カード（同名祖先）の前方挿入前後で作る。
+    /// 構造は card(識別属性なし) > section(識別属性なし) > link(識別属性 = 引数)。
+    fn nested_refs(cards: &[&str]) -> std::collections::HashMap<String, String> {
+        let mut a = RefAllocator::new();
+        let mut out = std::collections::HashMap::new();
+        for c in cards {
+            let card = a
+                .allocate_signature(&ElementSignature::new("article", "Card"))
+                .unwrap();
+            let section = a
+                .allocate_signature(&ElementSignature::new("group", "Details").with_scope(card))
+                .unwrap();
+            let link = ElementSignature::new("link", "More")
+                .with_discriminator(c)
+                .with_scope(section);
+            out.insert(c.to_string(), s(a.allocate_signature(&link).unwrap()));
+        }
+        out
+    }
+
+    /// `AISNAP-10`: 同名祖先が前に挿入されても、識別属性を持つ直接の子・孫の ref は
+    /// 変わらない（親の出現番号が digest 経由で子孫へ漏れない）。
+    #[test]
+    fn aisnap_10_ancestor_occurrence_does_not_leak_into_descendants() {
+        let before = nested_refs(&["/a", "/b"]);
+        let inserted = nested_refs(&["/new", "/a", "/b"]);
+        assert_eq!(before["/a"], inserted["/a"]);
+        assert_eq!(before["/b"], inserted["/b"]);
+        assert_ne!(before["/a"], before["/b"]);
+        assert_eq!(before["/a"], "e081f3e4f8974fb31");
+        assert_eq!(before["/b"], "e004e3575fb2b5dca");
     }
 
     /// `AISNAP-10`: 子に識別属性があれば、同じ role + name の親が前に挿入されても
-    /// 子の ref は変わらない（親の出現番号は子のダイジェストに影響しない）。
+    /// 子の ref は変わらない。
     #[test]
     fn aisnap_10_child_ref_ignores_parent_occurrence() {
         let run = |cards: &[&str]| {
             let mut a = RefAllocator::new();
             let mut out = std::collections::HashMap::new();
             for c in cards {
-                // 親は識別属性なしの同名カード。子の識別属性は c。
                 let card = a
                     .allocate_signature(&ElementSignature::new("article", "Card"))
                     .unwrap();
@@ -480,6 +511,34 @@ mod tests {
         assert_eq!(before["a"], inserted["a"]);
         assert_eq!(before["b"], inserted["b"]);
         assert_ne!(before["a"], before["b"]);
+    }
+
+    /// `AISNAP-10`: 別カードで識別属性（href）が重複する子は、同一ダイジェスト +
+    /// 出現番号で一意になる。連鎖の異なる要素の挿入では既存 ref は動かない。
+    #[test]
+    fn aisnap_10_duplicate_discriminator_across_parents_stays_unique() {
+        let links = |cards: &[(&str, &str)]| {
+            let mut a = RefAllocator::new();
+            let mut out = Vec::new();
+            for (name, href) in cards {
+                let card = a
+                    .allocate_signature(&ElementSignature::new("article", name))
+                    .unwrap();
+                let link = ElementSignature::new("link", "More")
+                    .with_discriminator(href)
+                    .with_scope(card);
+                out.push(s(a.allocate_signature(&link).unwrap()));
+            }
+            out
+        };
+        // 同名カード 2 枚が同じ href を持つ: 出現番号で一意。
+        let same = links(&[("Card", "/x"), ("Card", "/x")]);
+        assert_ne!(same[0], same[1]);
+        assert_eq!(same[1], format!("{}-2", same[0]));
+        // 別名カード（連鎖が異なる）を前に挿入しても不変。
+        let inserted = links(&[("Other", "/x"), ("Card", "/x"), ("Card", "/x")]);
+        assert_eq!(inserted[1], same[0]);
+        assert_eq!(inserted[2], same[1]);
     }
 
     /// `AISNAP-10`: role と name の境界が曖昧にならない。
