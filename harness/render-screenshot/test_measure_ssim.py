@@ -1364,6 +1364,15 @@ class LoadCaptureResultTest(unittest.TestCase):
             with self.assertRaises(ms.CaptureResultError):
                 ms.load_capture_result(capture_dir)
 
+    def test_case_variant_site_ids_in_sites_raises(self) -> None:
+        # 大文字小文字だけが異なる宣言 ID は大文字小文字非区別 FS で同一ファイルを
+        # 指すため、二重計上を避けて拒否する（codex P1・3 OS 対応）。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            self._write_result(capture_dir, [], sites=[{"id": "siteA"}, {"id": "sitea"}])
+            with self.assertRaises(ms.CaptureResultError):
+                ms.load_capture_result(capture_dir)
+
     def test_rejects_png_via_symlinked_engine_directory(self) -> None:
         # codex レビュー指摘（P1）: `full.is_symlink()` は PNG 自体しか検査
         # しないため、`servo` ディレクトリ自体を `chromium` への symlink に

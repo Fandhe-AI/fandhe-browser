@@ -248,6 +248,10 @@ def load_capture_result(
     if len(raw_sites) > cs.MAX_SITES:
         raise CaptureResultError("capture-result.json: too many declared sites")
     declared_site_ids: set[str] = set()
+    # 大文字小文字だけが異なる ID（`siteA` / `sitea`）は Windows・macOS の大文字小文字
+    # 非区別ファイルシステムでは同じ PNG・bbox を指すため、別サイトとして
+    # `passing_sites` に二重計上されないよう `load_sites` と同じく `lower()` で重複を拒否する。
+    declared_site_ids_lower: set[str] = set()
     for site_entry in raw_sites:
         if not isinstance(site_entry, dict):
             raise CaptureResultError("capture-result.json: each 'sites' entry must be an object")
@@ -256,6 +260,11 @@ def load_capture_result(
             raise CaptureResultError(f"capture-result.json: invalid site id in 'sites': {declared_id!r}")
         if declared_id in declared_site_ids:
             raise CaptureResultError(f"capture-result.json: duplicate site id in 'sites': {declared_id}")
+        if declared_id.lower() in declared_site_ids_lower:
+            raise CaptureResultError(
+                f"capture-result.json: duplicate site id in 'sites' (case-insensitive): {declared_id}"
+            )
+        declared_site_ids_lower.add(declared_id.lower())
         declared_site_ids.add(declared_id)
 
     captures = payload.get("captures")
