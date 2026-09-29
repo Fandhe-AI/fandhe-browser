@@ -10,8 +10,11 @@
 //! # スタブについて
 //!
 //! TASK-11.2（`AISNAP-1`・Issue #71）で公開型 `Snapshot`/`Node` を定義した。
-//! name・ref の算出ロジックと、DOM からのツリー構築はまだ実装しない
-//! （実装済みを装わない。REPAIR-3）。段階的に以下の Issue で実装する：
+//! state の算出ロジックは実装済み（[`state`] モジュール）。accessible
+//! name はネイティブのラベル付け分のみ実装済み（[`name`] モジュール・
+//! [`name::compute_name`]。TASK-11.4.2・Issue #545）。DOM からのツリー
+//! 構築はまだ実装しない（実装済みを装わない。REPAIR-3）。段階的に以下の
+//! Issue で実装する：
 //!
 //! - role（役割）算出: TASK-11.3（`AISNAP-1`・Issue #72）。骨格と button・
 //!   link・heading・table・list 等の代表要素は TASK-11.3.1（Issue #541）で
@@ -19,7 +22,13 @@
 //!   の対応表は TASK-11.3.2（Issue #542）、`select`・`header`/`footer`/
 //!   `aside`（sectioning 祖先判定）は TASK-11.3.3（Issue #543）が担う。
 //!   form・section・img の名前依存の昇格は担当未割り当て（role.rs の doc 参照）
-//! - accessible name（アクセシブルネーム）算出: TASK-11.4（Issue #73）
+//! - accessible name（アクセシブルネーム）算出: TASK-11.4（Issue #73）を
+//!   3 分割。ARIA 属性（`aria-labelledby`/`aria-label`）: TASK-11.4.1
+//!   （Issue #544）。HTML ネイティブのラベル付け（`alt`・`title`・
+//!   `value`・`placeholder`・submit/reset/image の既定ラベル・
+//!   `label[for]`・label による包含）: TASK-11.4.2（Issue #545）で実装済み。
+//!   子孫テキスト・優先順位統合・文書ルートの `<title>`: TASK-11.4.3
+//!   （Issue #546）
 //! - state（状態）算出: TASK-11.5（Issue #74）で実装済み（[`state`] モジュール・
 //!   [`state::compute_state`]）。ただし DOM 構築時にこの関数を呼び出す配線は
 //!   まだない（呼び出しの組み込みは TASK-11.7・Issue #76 が担う）
@@ -28,8 +37,10 @@
 //!   [`state::compute_state`] の呼び出し組み込みを含む）: TASK-11.7（Issue #76）
 //! - ユニットテスト一式: TASK-11.8（Issue #77）
 
+pub mod name;
 pub mod role;
 pub mod state;
+pub use name::{AccessibleName, NameIndex, NameSource, compute_name, compute_name_with_index};
 pub use role::{ComputedRole, RoleSource, compute_role};
 pub use state::{CheckedState, State, compute_state};
 
@@ -44,7 +55,10 @@ pub use state::{CheckedState, State, compute_state};
 ///   （Issue #541）で実装済みだが、DOM 構築時にこの関数を呼び出す配線は
 ///   まだない（本フィールドへの反映は TASK-11.7・Issue #76 が担う）
 /// - `name`: accessible name。空文字列は「名前なし」を表す。
-///   算出は TASK-11.4（Issue #73）が担う
+///   算出は TASK-11.4（Issue #73）が担う。ネイティブのラベル付け分は
+///   [`name::compute_name`]（TASK-11.4.2・Issue #545）で実装済み。
+///   ARIA・子孫テキストとの優先順位統合は TASK-11.4.1/11.4.3
+///   （Issue #544・#546）が担う
 /// - `r#ref`: role + name シグネチャによる再特定要求（`AISNAP-10`）。
 ///   `None` は ref を振らないノード（例: document ルート）を表す。
 ///   値の形式（シグネチャ方式・同名要素の一意化）は TASK-11.6（Issue #75・
@@ -75,7 +89,8 @@ pub use state::{CheckedState, State, compute_state};
 pub struct Node {
     /// ARIA role のトークン。算出は TASK-11.3（Issue #72）。
     pub role: String,
-    /// accessible name。算出は TASK-11.4（Issue #73）。
+    /// accessible name。算出は TASK-11.4（Issue #73）。ネイティブ分は
+    /// [`name::compute_name`]（TASK-11.4.2・Issue #545）で実装済み。
     pub name: String,
     /// role + name シグネチャによる再特定要求（`AISNAP-10`）。
     /// 算出は TASK-11.6（Issue #75）。
