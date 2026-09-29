@@ -457,8 +457,19 @@ fn is_cell_hidden(doc: &Document, container: NodeId, cell: NodeId) -> bool {
 /// `Vec` を返す。
 /// ref の scope は呼び出し側が先に発行した `table_ref`（テーブル要素自身）に
 /// 固定する。scope を失うと別の表の同名ヘッダが出現番号だけで区別され、表の
-/// 挿入で既存 ref が変わるため、`table_ref` は必須にして契約を型で保証する。`thead`/`tr` を経由しないのは、圧縮表現ではそれらのノードが
-/// 消えるため。マークアップの包み方（`thead` の有無）で ref が変わらない。
+/// 挿入で既存 ref が変わるため、`table_ref` は必須にして契約を型で保証する。
+/// `thead`/`tr` を経由しないのは、圧縮表現ではそれらのノードが消えるため
+/// （マークアップの包み方（`thead` の有無）で ref が変わらない）。
+///
+/// 安定性の契約: [`ElementSignature`] は scope として親 ref の `digest` と
+/// `variant` だけを折り込み、親の出現番号は折り込まない（`element_ref.rs`
+/// の `hashes` 参照。折り込むと同名祖先の挿入が全子孫の ref へ波及するため）。
+/// 従って role・name・識別属性がすべて同じ表（例: 同名 caption・同 id なしの
+/// 複数表）はヘッダの digest が一致し、ヘッダ ref は出現番号（先行順）で区別
+/// される。この場合、そのような同一シグネチャの表を文書の前方へ挿入すると、
+/// 後続表のヘッダの出現番号と ref が変わる。表ごとの ref 安定性が保証される
+/// のは、表が識別属性（`id` 等）・accessible name（caption 等）で区別できる
+/// 場合に限る（`AISNAP-2`・`AISNAP-3`）。
 ///
 /// 呼び出し文脈: TASK-12.5（#83）の `build_snapshot` 統合で、table ノードの ref を
 /// 発行した直後に、スナップショット全体で共有する `refs` / `index` を渡して
@@ -802,8 +813,9 @@ mod tests {
         let mut refs = RefAllocator::new();
         let (o1, _) = header_refs(&doc, &mut refs, "#t1");
         let (o2, _) = header_refs(&doc, &mut refs, "#t2");
-        // 同名親の scope は (digest, variant) が同じため digest は一致し、
-        // 出現番号（先行順）で区別される。
+        // 同一シグネチャの親の scope は (digest, variant) が同じため digest は一致し、
+        // 出現番号（先行順）で区別される。この契約により、前方への同一シグネチャ表の
+        // 挿入では後続表のヘッダ ref が変わる（`assign_header_refs` の安定性の契約）。
         assert_eq!(o1[0].elem_ref.digest, o2[0].elem_ref.digest);
         assert_eq!(o1[0].elem_ref.occurrence, 1);
         assert_eq!(o2[0].elem_ref.occurrence, 2);
