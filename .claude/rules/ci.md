@@ -19,7 +19,7 @@ cargo test --workspace
 
 ## 分離・構成の検証
 
-- 既定ビルドに Servo が含まれないことを `cargo tree` で検証する（RENDER-1）
+- 既定ビルドに Servo が含まれないことを `cargo tree` で検証する（RENDER-1）。判定ロジックの正本は `scripts/check-render-isolation.sh`（`make check-render-isolation` から呼ぶ薄いラッパー）で、CI では `render-isolation` ジョブ（3 OS matrix）が同スクリプトを直接実行する（TASK-34.1・Issue #465）。`fandhe-browser-cli` の既定 feature も検査対象だが、cli crate 未追加の間（TASK-41.5・#174）はスクリプトが notice を出して自動 skip する
 - ライセンス検査は `cargo deny check licenses` で行う（[licensing](./licensing.md)）
 - 対象サイト群の動作率回帰チェック（`REPAIR-8`・`COMPAT-1`・`COMPAT-4`。TASK-9.2）:
   `make check-compat-regression`（CI では `compat-regression` ジョブ）が
