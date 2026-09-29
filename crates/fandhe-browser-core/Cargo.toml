@@ -46,8 +46,17 @@ toml = { workspace = true }
 # `EngineKind`・`bundled_engines` を使う。ワークスペース内の path 依存であり
 # 外部（registry）クレートの追加ではない（spec の依存方向: js に依存するのは
 # core のみ）。js の既定 feature は `[]` のため既定ビルドの依存グラフへ v8 等を
-# 持ち込まない。`js-v8`/`js-boa` の feature 転送は TASK-30 で行う。
+# 持ち込まない。`js-v8`/`js-boa` は下の `[features]` で転送する。
 fandhe-browser-js = { path = "../fandhe-browser-js" }
+
+# `JsEngineNotCompiled` のエラーメッセージが案内する `--features js-v8` /
+# `--features js-boa` を core 対象のビルドでも有効にするための feature 転送
+# （TASK-91.2・Issue #215・PR #578 レビュー指摘）。js crate の同名 feature を
+# 有効にするだけで、新規依存は増えない。既定は空のため既定ビルドの依存グラフは不変。
+[features]
+default = []
+js-v8 = ["fandhe-browser-js/js-v8"]
+js-boa = ["fandhe-browser-js/js-boa"]
 
 [dev-dependencies]
 tokio = { workspace = true }
