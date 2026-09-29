@@ -656,6 +656,11 @@ pub struct NameIndex<'doc> {
     /// 文書につき 1 回へ抑える。各値は [`NORMALIZED_LABEL_TEXT_CHAR_LIMIT`]
     /// 文字以内）。
     referent_cache: RefCell<HashMap<NodeId, String>>,
+    /// 各ノードの入退場番号（DFS の enter/exit 時計。`(enter, exit)`）。
+    /// 祖先判定を参照ごとの親リンク走査（最悪 O(深さ)）ではなく定数時間で
+    /// 行うための索引（`aria-labelledby` を持つ深い入れ子要素が多い入力での
+    /// 二乗の処理量を防ぐ。AGENTS.md のリソース上限）。
+    spans: HashMap<NodeId, (usize, usize)>,
     /// キャッシュ不能な参照先走査の残り回数（[`MAX_UNCACHED_REFERENT_SCANS`]）。
     uncached_scans_left: Cell<usize>,
     /// キャッシュ可能な参照先の初回走査の残り回数（[`MAX_CACHEABLE_REFERENT_SCANS`]）。
@@ -663,6 +668,16 @@ pub struct NameIndex<'doc> {
 }
 
 impl<'doc> NameIndex<'doc> {
+    /// `ancestor` が `node` 自身またはその祖先かどうかを、構築時に記録した
+    /// 入退場番号の区間包含で定数時間に判定する。索引に載らないノード
+    /// （走査上限で打ち切られた分）は「含まない」として扱う。
+    fn is_ancestor_or_self(&self, ancestor: NodeId, node: NodeId) -> bool {
+        match (self.spans.get(&ancestor), self.spans.get(&node)) {
+            (Some(&(a_in, a_out)), Some(&(n_in, n_out))) => a_in <= n_in && n_out <= a_out,
+            _ => false,
+        }
+    }
+
     /// `doc` を 1 回走査して [`NameIndex`] を構築する。
     ///
     /// 呼び出し文脈: 単発の [`compute_name`] は毎回これを内部で構築する
@@ -716,10 +731,16 @@ impl<'doc> NameIndex<'doc> {
         let mut stack: Vec<Visit> = vec![Visit::Enter(doc.root())];
         let mut open_wrapping: Vec<NodeId> = Vec::new();
         let mut remaining_steps = doc.node_count();
+        let mut spans: HashMap<NodeId, (usize, usize)> = HashMap::new();
+        let mut clock = 0usize;
 
         while let Some(visit) = stack.pop() {
             match visit {
                 Visit::Exit(node) => {
+                    if let Some(span) = spans.get_mut(&node) {
+                        span.1 = clock;
+                    }
+                    clock += 1;
                     if open_wrapping.last() == Some(&node) {
                         // 子孫を辿り終えてもラベル付け可能な対象が見つから
                         // なかった包含 label。関連付けなしとして捨てる。
@@ -732,6 +753,8 @@ impl<'doc> NameIndex<'doc> {
                         break;
                     }
                     remaining_steps -= 1;
+                    spans.insert(node, (clock, usize::MAX));
+                    clock += 1;
 
                     if let Some(id_value) = doc.attribute(node, "id")
                         && !id_value.is_empty()
@@ -792,6 +815,7 @@ impl<'doc> NameIndex<'doc> {
             doc,
             labels_by_target,
             ids: ids_by_value,
+            spans,
             referent_cache: RefCell::new(HashMap::new()),
             uncached_scans_left: Cell::new(MAX_UNCACHED_REFERENT_SCANS),
             first_scans_left: Cell::new(MAX_CACHEABLE_REFERENT_SCANS),
@@ -929,7 +953,7 @@ fn referent_text(
     referent: NodeId,
     target: NodeId,
 ) -> Option<String> {
-    let contains_target = is_ancestor_or_self(doc, referent, target);
+    let contains_target = index.is_ancestor_or_self(referent, target);
 
     // 対象を含まない参照先だけがキャッシュを共有できる。対象を含む参照先は
     // 対象の部分木を除外して走査する必要があり、結果が対象ごとに異なるため、
@@ -996,24 +1020,6 @@ fn fold_attr_bounded(value: &str, out: &mut String) {
         &mut pending_space,
         NORMALIZED_LABEL_TEXT_CHAR_LIMIT,
     );
-}
-
-/// `ancestor` が `node` 自身またはその祖先かどうかを返す。親リンクを
-/// [`Document::node_count`] 回まで辿って必ず停止する。
-fn is_ancestor_or_self(doc: &Document, ancestor: NodeId, node: NodeId) -> bool {
-    let mut current = Some(node);
-    let mut remaining = doc.node_count();
-    while let Some(id) = current {
-        if id == ancestor {
-            return true;
-        }
-        if remaining == 0 {
-            return false;
-        }
-        remaining -= 1;
-        current = doc.parent(id);
-    }
-    false
 }
 
 /// `aria-labelledby` から accessible name を算出する（accname 1.2 step 2B。
@@ -2296,6 +2302,34 @@ mod tests {
         // すべての label が空要素（テキストなし）のため名前には寄与しない。
         assert!(result.is_empty());
     }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 入退場番号による祖先判定が親リンク走査と
+    /// 一致する（兄弟・子孫・自身・祖先で期待値どおり）。
+    #[test]
+    fn aisnap_1_enter_exit_span_ancestor_check_matches_tree_shape() {
+        use super::NameIndex;
+        let options = ParseOptions::default();
+        let parsed = parse_document(
+            r#"<div id="a"><p id="b"><span id="c">x</span></p><p id="d">y</p></div>"#,
+            &options,
+        )
+        .expect("パースに成功する");
+        let doc = parsed.document;
+        let index = NameIndex::build(&doc);
+        let find = |sel: &str| {
+            query_selector_str(&doc, doc.root(), sel)
+                .expect("セレクタは解釈できる")
+                .expect("要素が見つかる")
+        };
+        let (a, b, c, d) = (find("#a"), find("#b"), find("#c"), find("#d"));
+        assert!(index.is_ancestor_or_self(a, c));
+        assert!(index.is_ancestor_or_self(b, c));
+        assert!(index.is_ancestor_or_self(c, c));
+        assert!(!index.is_ancestor_or_self(c, b));
+        assert!(!index.is_ancestor_or_self(d, c));
+        assert!(!index.is_ancestor_or_self(b, d));
+    }
+
     // --- ARIA（TASK-11.4.1・#544） ---
 
     fn named(text: &str, source: NameSource, truncated: bool) -> AccessibleName {
