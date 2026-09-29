@@ -534,7 +534,13 @@ mod tests {
     /// XOS-7: 実環境での解決結果の構造（ディレクトリは作成しない）。
     #[test]
     fn xos_7_os_default_store_resolves_real_env_shape() {
-        let resolved = OsDefaultStore::new().resolve_root().unwrap();
+        // HOME / LOCALAPPDATA 等が未設定の有効な環境では契約どおり
+        // DefaultRootUnavailable になるため、その場合は形状検査を行わない。
+        let resolved = match OsDefaultStore::new().resolve_root() {
+            Ok(resolved) => resolved,
+            Err(ProfileError::DefaultRootUnavailable { .. }) => return,
+            Err(other) => panic!("unexpected error: {other:?}"),
+        };
         assert_eq!(resolved.source(), RootSource::OsDefault);
         assert!(resolved.path().is_absolute());
         assert_eq!(
