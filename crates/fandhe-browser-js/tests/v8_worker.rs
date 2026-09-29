@@ -144,6 +144,10 @@ fn main() -> ExitCode {
             "case: js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation"
         );
         js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation();
+        eprintln!(
+            "case: js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_limit"
+        );
+        js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_limit();
     }
     eprintln!("v8_worker: all cases passed");
     ExitCode::SUCCESS
@@ -217,6 +221,7 @@ fn js_1_oom_returns_resource_limit_exceeded_and_next_eval_uses_fresh_context() {
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: None,
         native_proxies_for_test: Vec::new(),
+        windows_process_memory_limit_bytes_override: None,
     });
     engine
         .evaluate_script("var before_oom = 999;", &EvaluateOptions::default())
@@ -265,6 +270,7 @@ fn js_1_handshake_failure_is_engine_unavailable() {
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: None,
         native_proxies_for_test: Vec::new(),
+        windows_process_memory_limit_bytes_override: None,
     });
 
     match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
@@ -289,6 +295,7 @@ fn js_1_handshake_rejects_hello_naming_a_different_engine() {
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: None,
         native_proxies_for_test: Vec::new(),
+        windows_process_memory_limit_bytes_override: None,
     });
 
     match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
@@ -318,6 +325,7 @@ fn js_1_handshake_rejects_hello_with_wrong_length() {
         hello_extra_byte_for_test: true,
         rss_threshold_bytes_override: None,
         native_proxies_for_test: Vec::new(),
+        windows_process_memory_limit_bytes_override: None,
     });
 
     match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
@@ -481,6 +489,7 @@ fn js_1_oversized_test_heap_limit_is_clamped_to_the_production_default() {
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: None,
         native_proxies_for_test: Vec::new(),
+        windows_process_memory_limit_bytes_override: None,
     });
 
     let oom_script = "var chunks = []; while (true) { chunks.push(new Array(1e7).fill(0)); }";
@@ -516,6 +525,7 @@ fn js_1_undersized_test_heap_limit_is_raised_to_a_working_floor() {
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: None,
         native_proxies_for_test: Vec::new(),
+        windows_process_memory_limit_bytes_override: None,
     });
 
     let result = engine
@@ -642,6 +652,7 @@ fn js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceed
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: Some(TEST_RSS_THRESHOLD_BYTES),
         native_proxies_for_test: Vec::new(),
+        windows_process_memory_limit_bytes_override: None,
     });
     engine
         .evaluate_script("var before_oom = 555;", &EvaluateOptions::default())
@@ -832,6 +843,7 @@ fn js_1_repeated_short_evaluations_accumulating_array_buffers_hit_resource_limit
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: Some(TEST_RSS_THRESHOLD_BYTES),
         native_proxies_for_test: Vec::new(),
+        windows_process_memory_limit_bytes_override: None,
     });
     engine
         .evaluate_script(
@@ -903,6 +915,12 @@ fn js_1_repeated_short_evaluations_accumulating_array_buffers_hit_resource_limit
 /// する（観測可能な結果としては、他 OS 向けの
 /// `js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceeded`
 /// と同じ `ResourceLimitExceeded` になる）。
+///
+/// **本テストは親側の RSS 監視（`PrivateUsage`）が先に発動する構成であり、
+/// Job Object の上限そのものが確保を拒否する経路は検証しない**（テスト名の
+/// `kills` は監視による kill を指す）。その経路は
+/// [`js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_limit`]
+/// が検証する（Issue #531）。
 #[cfg(target_os = "windows")]
 fn js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation() {
     let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
@@ -912,6 +930,7 @@ fn js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation() {
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: Some(TEST_RSS_THRESHOLD_BYTES),
         native_proxies_for_test: Vec::new(),
+        windows_process_memory_limit_bytes_override: None,
     });
     engine
         .evaluate_script("var before_oom = 777;", &EvaluateOptions::default())
@@ -986,6 +1005,7 @@ fn js_1_native_call_round_trip_returns_value_and_records_args() {
             hello_extra_byte_for_test: false,
             rss_threshold_bytes_override: None,
             native_proxies_for_test: vec![("f".to_string(), 0)],
+            windows_process_memory_limit_bytes_override: None,
         },
     );
     assert_eq!(id, 0, "the first registration must be assigned id 0");
@@ -1016,6 +1036,7 @@ fn js_1_native_call_err_is_catchable_and_context_survives() {
             hello_extra_byte_for_test: false,
             rss_threshold_bytes_override: None,
             native_proxies_for_test: vec![("f".to_string(), 0)],
+            windows_process_memory_limit_bytes_override: None,
         },
     );
     assert_eq!(id, 0);
@@ -1063,6 +1084,7 @@ fn js_1_native_call_duration_is_included_in_the_watchdog_timeout() {
             hello_extra_byte_for_test: false,
             rss_threshold_bytes_override: None,
             native_proxies_for_test: vec![("f".to_string(), 0)],
+            windows_process_memory_limit_bytes_override: None,
         },
     );
     assert_eq!(id, 0);
@@ -1120,6 +1142,7 @@ fn js_1_native_call_exceeding_evaluate_deadline_discards_context() {
             hello_extra_byte_for_test: false,
             rss_threshold_bytes_override: None,
             native_proxies_for_test: vec![("f".to_string(), 0)],
+            windows_process_memory_limit_bytes_override: None,
         },
     );
     assert_eq!(id, 0);
@@ -1172,6 +1195,7 @@ fn js_1_native_call_with_unknown_id_discards_context_and_recovers() {
         // 子には id 7 のプロキシを登録させるが、親には何も登録しない
         // （`native_fns` は空のまま）。
         native_proxies_for_test: vec![("f".to_string(), 7)],
+        windows_process_memory_limit_bytes_override: None,
     });
 
     match engine.evaluate_script("f()", &EvaluateOptions::default()) {
@@ -1190,4 +1214,81 @@ fn js_1_native_call_with_unknown_id_discards_context_and_recovers() {
         .evaluate_script("1 + 1", &EvaluateOptions::default())
         .unwrap_or_else(|err| panic!("engine must recover with a fresh child: {err}"));
     assert_eq!(result, JsValue::Number(2.0));
+}
+
+/// Job Object の上限を下げた検証で使う上限値（112 MiB）。
+///
+/// 単発の確保サイズ [`JOB_LIMIT_TEST_ALLOCATION_BYTES`]（120 MiB）より小さい
+/// ので、起動直後のコミット量がいくつであっても、その 1 回の確保だけで必ず
+/// 上限を超える。
+#[cfg(target_os = "windows")]
+const LOWERED_JOB_LIMIT_BYTES: usize = 112 * 1024 * 1024;
+
+/// 単発の `ArrayBuffer` 確保サイズ（120 MiB）。`resource_limits::
+/// MAX_ARRAY_BUFFER_ALLOCATION_BYTES`（128 MiB。`pub(crate)` のためここでは
+/// リテラルで書く）未満なので bounded allocator は拒否せず、親の RSS 監視
+/// しきい値（本番の 320 MiB）よりコミット量が小さいうちに Job Object の
+/// 上限（[`LOWERED_JOB_LIMIT_BYTES`]）だけが効く。
+#[cfg(target_os = "windows")]
+const JOB_LIMIT_TEST_ALLOCATION_BYTES: u64 = 120 * 1024 * 1024;
+
+/// JS-1・TASK-29・Issue #531: Windows の Job Object `ProcessMemoryLimit` を
+/// 到達可能な値まで下げると、親の RSS 監視（本番しきい値 320 MiB のまま）が
+/// 先に発動することなく、OS が確保を拒否すること。
+///
+/// 拒否の原因は次の 3 点から Job Object に絞れる: 確保サイズは bounded
+/// allocator の上限（128 MiB）未満、親の監視しきい値（320 MiB）は Job 上限
+/// （112 MiB）より大きくコミット量が届きえない、対照（既定の上限）では
+/// 同じ確保が成功する。分類は `EvaluationFailed`（`RangeError: Array buffer
+/// allocation failed`）で、子プロセス（pid）も Context も保たれる。
+///
+/// ローカル（Linux 等）では実行されず、CI の Windows ランナーで検証する。
+#[cfg(target_os = "windows")]
+fn js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_limit() {
+    let allocation_script =
+        format!("new ArrayBuffer({JOB_LIMIT_TEST_ALLOCATION_BYTES}).byteLength");
+
+    // 対照: 既定（本番の上限 384 MiB）では同じ確保が成功する。
+    let mut control = V8ProcessEngine::new();
+    let control_result = control
+        .evaluate_script(&allocation_script, &EvaluateOptions::default())
+        .unwrap_or_else(|err| {
+            panic!("the control allocation under the production Job limit must succeed: {err}")
+        });
+    assert_eq!(control_result, JsValue::Number(125_829_120.0));
+
+    let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
+        heap_limit_bytes: None,
+        protocol_version_override: None,
+        hello_wrong_engine_for_test: false,
+        hello_extra_byte_for_test: false,
+        rss_threshold_bytes_override: None,
+        windows_process_memory_limit_bytes_override: Some(LOWERED_JOB_LIMIT_BYTES),
+    });
+    engine
+        .evaluate_script("var before_job_limit = 531;", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("marker declaration must evaluate successfully: {err}"));
+    let pid_before = engine.worker_pid_for_test();
+
+    match engine.evaluate_script(&allocation_script, &EvaluateOptions::default()) {
+        Err(JsEngineError::EvaluationFailed(msg)) => {
+            assert!(
+                msg.contains("RangeError") && msg.contains("Array buffer allocation failed"),
+                "expected a RangeError from the OS-rejected allocation, got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected EvaluationFailed(RangeError) when the lowered Job Object limit rejects the allocation, got: {other:?}"
+        ),
+    }
+
+    assert_eq!(
+        engine.worker_pid_for_test(),
+        pid_before,
+        "the worker process must not be recreated after a rejected allocation"
+    );
+    let marker = engine
+        .evaluate_script("before_job_limit", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("the context must survive a rejected allocation: {err}"));
+    assert_eq!(marker, JsValue::Number(531.0));
 }

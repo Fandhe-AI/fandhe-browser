@@ -41,9 +41,11 @@ fandhe-browser/
 │   ├── fandhe-browser-cli/        #   CLI
 │   └── fandhe-browser-mcp/        #   MCP 参照プラグイン（別バイナリ）
 ├── tests/ / benches/              #（予定）結合テスト・ベンチ
+├── scripts/                       # 依存グラフ検査等のスクリプト。check-render-isolation.sh（TASK-34.1・RENDER-1）
 ├── harness/                       # 互換性テストハーネス。compat-regression/（TASK-9.2・対象サイト群の動作率回帰チェック）・binary-size/（TASK-34.2・既定 feature リリースバイナリのサイズ検査）実装済み
 ├── docs/
 │   ├── design/                    # 設計ドキュメント（public。render-feature-gate.md 等）
+│   ├── setup/                     # 環境別セットアップ手順書（windows.md）
 │   └── spec/                      # fandhe-browser-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・update-external・ci（push/pull_request で稼働・3 OS CI 対応済み）/ release（発火条件は workflow_dispatch 限定のまま）
 ├── .agents/skills/                # npx skills add の導入実体

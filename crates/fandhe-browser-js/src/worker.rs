@@ -190,6 +190,38 @@ fn parse_test_native_proxies_env_value(raw: Option<&str>) -> Result<Vec<(String,
     Ok(proxies)
 }
 
+/// テスト専用（Windows のみ）: 子プロセスの Job Object
+/// `ProcessMemoryLimit` を本番値（384 MiB）より**下げる**環境変数
+/// （`JS-1`・`TASK-29`・Issue #531。親側の RSS 監視が先に発動しない構成で、
+/// OS が確保を拒否する経路を検証するため）。
+///
+/// [`TEST_HEAP_LIMIT_ENV_VAR`] と同様、本番の起動経路は `env_clear()` した
+/// 状態で子を起動するため、明示的に渡さない限り本番では存在しない。値は
+/// untrusted な入力として扱い、子側で
+/// [`super::resource_limits::clamp_test_windows_process_memory_limit_bytes`]
+/// により本番値以下へクランプする（親側のクランプとは独立した多層防御）。
+#[cfg(target_os = "windows")]
+pub(crate) const TEST_WINDOWS_PROCESS_MEMORY_LIMIT_ENV_VAR: &str =
+    "FANDHE_BROWSER_JS_WORKER_WINDOWS_PROCESS_MEMORY_LIMIT_BYTES";
+
+/// 環境変数のバイト数文字列を `u64` で解釈し、`usize` に収まらない値は
+/// `usize::MAX` へ飽和させる（32 ビット環境でも `usize` 範囲外の巨大値が
+/// 解釈失敗（`None` = 既定値）にならず、後段のクランプで上限へ丸められる。
+/// 3 OS 対応・`JS-1`・`TASK-29`）。数値として解釈できなければ `None`。
+fn parse_env_bytes_saturating(value: &str) -> Option<usize> {
+    let parsed = value.trim().parse::<u64>().ok()?;
+    Some(usize::try_from(parsed).unwrap_or(usize::MAX))
+}
+
+/// [`TEST_WINDOWS_PROCESS_MEMORY_LIMIT_ENV_VAR`] の生の値から、
+/// `enforce_child_memory_limit` へ渡す上書き値を決める純粋関数。解釈
+/// できなければ `None`（本番値）、解釈できればクランプした値を返す。
+#[cfg(target_os = "windows")]
+fn test_windows_process_memory_limit_from_env_value(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(parse_env_bytes_saturating)
+        .map(super::resource_limits::clamp_test_windows_process_memory_limit_bytes)
+}
+
 /// [`TEST_HEAP_LIMIT_ENV_VAR`] の生の値（未設定なら `None`）から、実際に
 /// [`V8Engine::new_with_heap_limit`] へ渡すヒープ上限を決める（codex
 /// レビュー指摘 #503 P0 対応）。
@@ -208,7 +240,7 @@ fn parse_test_native_proxies_env_value(raw: Option<&str>) -> Result<Vec<(String,
 /// - 解釈できた場合は [`super::v8_engine::clamp_test_heap_limit_bytes`] で
 ///   クランプした値を返す（本番の既定値を超えられず、下限も満たす）
 fn test_heap_limit_from_env_value(raw: Option<&str>) -> Option<usize> {
-    raw.and_then(|value| value.trim().parse::<usize>().ok())
+    raw.and_then(parse_env_bytes_saturating)
         .map(super::v8_engine::clamp_test_heap_limit_bytes)
 }
 
@@ -359,13 +391,27 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
     // 対応。`ChildMemoryLimitGuard` のドキュメントコメント参照。`_` を
     // 先頭に付けた名前にすることで「未使用」の警告を避けつつ、値
     // そのものはこの関数の終わりまで drop されない）。
-    let _memory_limit_guard = match super::resource_limits::enforce_child_memory_limit() {
-        Ok(guard) => guard,
-        Err(err) => {
-            eprintln!("fandhe-browser-js worker: failed to enforce the child memory limit: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+    //
+    // Windows のテスト専用の上書き（Issue #531）は、環境変数を untrusted な
+    // 入力として読み取り直後にクランプする（本番値を超えられない）。
+    #[cfg(target_os = "windows")]
+    let windows_limit_override = test_windows_process_memory_limit_from_env_value(
+        std::env::var(TEST_WINDOWS_PROCESS_MEMORY_LIMIT_ENV_VAR)
+            .ok()
+            .as_deref(),
+    );
+    #[cfg(not(target_os = "windows"))]
+    let windows_limit_override: Option<usize> = None;
+    let _memory_limit_guard =
+        match super::resource_limits::enforce_child_memory_limit(windows_limit_override) {
+            Ok(guard) => guard,
+            Err(err) => {
+                eprintln!(
+                    "fandhe-browser-js worker: failed to enforce the child memory limit: {err}"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
 
     // V8 の Platform を protected 版（thread-isolated allocation 有効）で
     // 初期化する（`JS-1`・`TASK-29`・Issue #520）。この子プロセスは
@@ -739,6 +785,39 @@ mod tests {
         assert_eq!(test_heap_limit_from_env_value(Some("not-a-number")), None);
         assert_eq!(test_heap_limit_from_env_value(Some("")), None);
         assert_eq!(test_heap_limit_from_env_value(None), None);
+    }
+
+    /// Issue #531: Job Object 上限の環境変数値は、上限超過・非数値・未設定・
+    /// 範囲内のいずれも具体値で期待どおりに変換されること。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn js_1_test_windows_process_memory_limit_from_env_value_clamps_and_falls_back() {
+        assert_eq!(
+            test_windows_process_memory_limit_from_env_value(Some("4294967296")),
+            Some(384 * 1024 * 1024)
+        );
+        assert_eq!(
+            test_windows_process_memory_limit_from_env_value(Some("117440512")),
+            Some(112 * 1024 * 1024)
+        );
+        assert_eq!(
+            test_windows_process_memory_limit_from_env_value(Some("x")),
+            None
+        );
+        assert_eq!(test_windows_process_memory_limit_from_env_value(None), None);
+    }
+
+    /// 3 OS 対応: `usize` に収まらない巨大値は解釈失敗にならず `usize::MAX`
+    /// へ飽和し、数値でない値は `None` になること（32 ビット環境対応）。
+    #[test]
+    fn js_1_parse_env_bytes_saturating_saturates_and_rejects_non_numeric() {
+        assert_eq!(parse_env_bytes_saturating(" 1024 "), Some(1024));
+        assert_eq!(
+            parse_env_bytes_saturating("18446744073709551615"),
+            Some(usize::MAX)
+        );
+        assert_eq!(parse_env_bytes_saturating("18446744073709551616"), None);
+        assert_eq!(parse_env_bytes_saturating("x"), None);
     }
 
     /// JS-1・Issue #503 W5: `JsEngineError::Timeout` は `ErrorKind::Timeout`

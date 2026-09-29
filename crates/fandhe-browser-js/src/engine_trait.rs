@@ -20,9 +20,9 @@
 //! 本モジュールではなく、crate の `tests/conformance.rs`（結合テスト）に
 //! ある。
 //!
-//! 簡易実装: [`EngineKind`] の文字列表現（設定ファイルの `"v8"`/`"boa"` との
-//! 相互変換・未同梱時のエラーメッセージ整形）は `TASK-91`（91.2・`MS-3`・
-//! Issue #215）で確定するため、本 Issue では先取りしない。
+//! [`EngineKind`] の文字列表現（設定ファイルの `"v8"`/`"boa"` との相互変換・
+//! 対応する Cargo feature 名）は TASK-91（91.2・`MS-3`・Issue #215）で確定し、
+//! [`EngineKind::as_str`]・[`EngineKind::from_config_name`] 等として提供する。
 
 /// 本 crate が抽象化対象とする JS エンジンの種別。
 ///
@@ -35,6 +35,39 @@ pub enum EngineKind {
     V8,
     /// boa（`boa_engine`）エンジン。切替先エンジン。
     Boa,
+}
+
+impl EngineKind {
+    /// 全種別を既定選択の優先順（V8 → Boa）で並べた配列。
+    ///
+    /// `js-engine.md`「(1) 省略」の「同梱エンジンから V8 → boa の優先順で選ぶ」を
+    /// 実装する呼び出し元（core の `config`・TASK-91.2）が使う。
+    pub const ALL: [EngineKind; 2] = [EngineKind::V8, EngineKind::Boa];
+
+    /// 設定ファイル（`[js] engine`）での表記（`"v8"`/`"boa"`）を返す。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EngineKind::V8 => "v8",
+            EngineKind::Boa => "boa",
+        }
+    }
+
+    /// このエンジンを同梱する Cargo feature 名（`"js-v8"`/`"js-boa"`）を返す。
+    /// 未同梱エンジン指定時のエラーメッセージで再ビルド手順を示すために使う。
+    pub fn feature_name(self) -> &'static str {
+        match self {
+            EngineKind::V8 => "js-v8",
+            EngineKind::Boa => "js-boa",
+        }
+    }
+
+    /// 設定ファイルの表記から種別を得る。完全一致のみ受理し、大文字小文字の
+    /// 揺れ・前後空白は `None` とする（fail-closed。黙って受理しない）。
+    pub fn from_config_name(value: &str) -> Option<EngineKind> {
+        EngineKind::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == value)
+    }
 }
 
 /// この crate に「同梱」（`js-engine.md`「JS エンジンの切替方式」の用語。
@@ -162,6 +195,13 @@ impl NativeCallContext {
 /// の TASK-30）は、この関数へ渡す引数が外部入力（プラグイン入出力・ネット
 /// ワーク取得データ由来）である場合、untrusted な入力として検証する責務を
 /// 負う（security.md「プラグイン境界」）。
+///
+/// **panic 禁止（契約）**: 失敗は必ず `Err` で返す。release ビルドは
+/// `panic = "abort"` のため、`catch_unwind` でもスレッド分離でも panic を
+/// 封じ込められず、親プロセス内で実行される `NativeFn`（`process_engine` の
+/// `NativeCall` dispatch。`TASK-29`・Issue #526）が panic するとホスト
+/// プロセス全体が終了する。panic の封じ込めにはプロセス分離が必要で、
+/// 現契約の範囲外（別途設計判断）。
 ///
 /// `Send`/`Sync` 境界は付けない。V8 の `Isolate`/`HandleScope` はスレッド
 /// 固有であり、境界を付けると V8 実装（TASK-29）が満たせなくなるため
@@ -341,19 +381,27 @@ pub enum CreateEngineError {
 impl std::fmt::Display for CreateEngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            // 簡易実装: EngineKind の文字列表現（設定ファイルの "v8"/"boa" との
-            // 相互変換）は TASK-91（91.2・MS-3・Issue #215）で確定するため、
-            // ここでは Debug 表現（{:?}）を暫定的に使う。
             Self::NotBundled { requested, bundled } => {
+                let list = if bundled.is_empty() {
+                    "none".to_string()
+                } else {
+                    bundled
+                        .iter()
+                        .map(|k| k.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
                 write!(
                     f,
-                    "js engine {requested:?} is not bundled into this binary (bundled: {bundled:?})"
+                    "js engine \"{}\" is not bundled into this binary (bundled: {list})",
+                    requested.as_str()
                 )
             }
             Self::NotYetImplemented { requested } => {
                 write!(
                     f,
-                    "js engine {requested:?} is bundled but not yet implemented"
+                    "js engine \"{}\" is bundled but not yet implemented",
+                    requested.as_str()
                 )
             }
         }
@@ -399,6 +447,50 @@ pub fn create_engine(kind: EngineKind) -> Result<Box<dyn JsEngine>, CreateEngine
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TASK-91.2: 全種別の設定名・feature 名の対応表。
+    #[test]
+    fn task_91_2_engine_kind_names() {
+        assert_eq!(EngineKind::V8.as_str(), "v8");
+        assert_eq!(EngineKind::Boa.as_str(), "boa");
+        assert_eq!(EngineKind::V8.feature_name(), "js-v8");
+        assert_eq!(EngineKind::Boa.feature_name(), "js-boa");
+        assert_eq!(EngineKind::ALL, [EngineKind::V8, EngineKind::Boa]);
+    }
+
+    /// TASK-91.2: 設定名は完全一致のみ受理する。
+    #[test]
+    fn task_91_2_from_config_name_is_exact_match() {
+        assert_eq!(EngineKind::from_config_name("v8"), Some(EngineKind::V8));
+        assert_eq!(EngineKind::from_config_name("boa"), Some(EngineKind::Boa));
+        for bad in ["V8", "Boa", "quickjs", "", " v8", "v8 "] {
+            assert_eq!(EngineKind::from_config_name(bad), None, "{bad:?}");
+        }
+        for kind in EngineKind::ALL {
+            assert_eq!(EngineKind::from_config_name(kind.as_str()), Some(kind));
+        }
+    }
+
+    /// TASK-91.2: `NotBundled` の Display は設定名と同梱一覧を含む。
+    #[test]
+    fn task_91_2_not_bundled_display() {
+        let e = CreateEngineError::NotBundled {
+            requested: EngineKind::V8,
+            bundled: &[],
+        };
+        assert_eq!(
+            e.to_string(),
+            "js engine \"v8\" is not bundled into this binary (bundled: none)"
+        );
+        let e = CreateEngineError::NotBundled {
+            requested: EngineKind::V8,
+            bundled: &[EngineKind::Boa],
+        };
+        assert_eq!(
+            e.to_string(),
+            "js engine \"v8\" is not bundled into this binary (bundled: boa)"
+        );
+    }
 
     /// JS-1: feature 無し（既定ビルド）では同梱エンジンが 0 件であること。
     #[test]
