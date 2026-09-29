@@ -1230,10 +1230,13 @@ fn referent_text(
     }
 
     let mut out = String::new();
-    let mut cut = false;
     // 参照先自身の `aria-label` / `img` の `alt` は部分木を走査せず対象にも
     // 依存しないため、走査予算を消費しない。
-    if !scan_referent_own_text(doc, referent, &mut out) {
+    let cut = if let Some(own_cut) = scan_referent_own_text(doc, referent, &mut out) {
+        // 参照先自身の値を読む経路（select の選択 option 探索など）が予算で
+        // 打ち切られた場合も、不完全な値を確定値として返さないよう伝播する。
+        own_cut
+    } else {
         // 対象を含む参照先（キャッシュ不能）と含まない参照先（初回走査）で
         // 別々の文書全体予算を消費する。使い切ったら `None`（寄与なし+truncated）。
         let budget = if contains_target {
@@ -1258,8 +1261,8 @@ fn referent_text(
             },
             &mut out,
         );
-        cut = scan.cut;
-    }
+        scan.cut
+    };
     if !contains_target {
         index
             .referent_cache
@@ -1270,28 +1273,30 @@ fn referent_text(
 }
 
 /// [`referent_text`] の補助。参照先自身の属性（`aria-label`、`img` の `alt`）から
-/// 名前の断片を `out` へ取り込めたら `true`（部分木の走査は不要）。
+/// 名前の断片を `out` へ取り込めたら `Some(cut)`（部分木の走査は不要）。
+/// `cut` は参照先自身の値の読み取りが走査上限で打ち切られたか
+/// （`select` の option 探索）。取り込めなければ `None`。
 /// 対象要素に依存しないため走査予算の対象外。
-fn scan_referent_own_text(doc: &Document, referent: NodeId, out: &mut String) -> bool {
+fn scan_referent_own_text(doc: &Document, referent: NodeId, out: &mut String) -> Option<bool> {
     if let Some(label) = doc.attribute(referent, "aria-label")
         && has_non_whitespace(label)
     {
         fold_attr_bounded(label, out);
-        return true;
+        return Some(false);
     }
     if is_html_element_named(doc, referent, "img")
         && let Some(alt) = doc.attribute(referent, "alt")
     {
         fold_attr_bounded(alt, out);
-        return true;
+        return Some(false);
     }
     // 参照先自身が埋め込みコントロール（accname 2E）ならその値。
     // 参照先の label・title は未実装（担当 Issue 未確定）。
-    if let Some((text, _)) = embedded_control_text(doc, referent, referent, doc.node_count()) {
+    if let Some((text, scan)) = embedded_control_text(doc, referent, referent, doc.node_count()) {
         fold_attr_bounded(&text, out);
-        return true;
+        return Some(scan.cut);
     }
-    false
+    None
 }
 
 /// 属性値 `value` を空白折り畳みしながら、折り畳み後
@@ -2903,6 +2908,23 @@ mod tests {
         );
         let result = name(&html, "div#t");
         assert_eq!(result, named("", NameSource::None, true));
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: `aria-labelledby` の参照先が `select` で、選択 option の探索が走査上限で打ち切られたとき、最初の option を採用しつつ `truncated: true` を伝える（キャッシュ経由でも落とさない）。
+    #[test]
+    fn aisnap_1_aria_labelledby_select_referent_scan_cut_propagates_truncated() {
+        let filler = "<option></option>".repeat(200);
+        let html = format!(
+            r#"<select id="s"><option>先頭</option>{filler}<option selected>選択</option></select><p id="t1" aria-labelledby="s">a</p><p id="t2" aria-labelledby="s">b</p>"#
+        );
+        assert_eq!(
+            name(&html, "p#t1"),
+            named("先頭", NameSource::AriaLabelledBy, true)
+        );
+        assert_eq!(
+            name(&html, "p#t2"),
+            named("先頭", NameSource::AriaLabelledBy, true)
+        );
     }
 
     /// AISNAP-1（TASK-11.4.1・#544）: 走査上限未満の欠落トークンが先行するだけなら後ろの実在参照から名前を得る。
