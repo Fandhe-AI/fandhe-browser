@@ -9,22 +9,36 @@
 //! `fandhe-browser-profile::Profile::open`（TASK-50・#177）へ渡す想定
 //! （設計時点の申し送り。cli crate 側の配線は別 Issue）。
 //!
-//! # スコープ（91.1 の範囲）
+//! # スコープ（91.1・91.2 の範囲）
 //!
-//! 本 Issue（#214）で読めるのは `[profile]` セクション（保存先 `root`・分離
-//! 強度 `isolation`）のみ。兄弟 Issue が以下を追加する契約とする
-//! （REPAIR-3: 実装済みを装わない）。
+//! 読めるのは `[profile]`（保存先 `root`・分離強度 `isolation`。TASK-91（91.1）・
+//! Issue #214）と `[js]`（`engine`。TASK-91（91.2）・Issue #215）。兄弟 Issue が
+//! 以下を追加する契約とする（REPAIR-3: 実装済みを装わない）。
 //!
-//! - `[js] engine`（JS エンジン選択・fail-closed エラー。TASK-91（91.2）・
-//!   Issue #215）
 //! - `[rendering]`（レンダリング層有効化・`fandhe-browser.toml` サンプル
 //!   ファイル。TASK-91（91.3）・Issue #216）
 //!
-//! トップレベル・`[profile]` とも未知キーを `deny_unknown_fields` で拒否する
+//! トップレベル・各セクションとも未知キーを `deny_unknown_fields` で拒否する
 //! （タイプミスを黙って無視しない fail-closed 方針。security.md「不安全な
-//! 設計」）。そのため #215・#216 がマージされるまで `[js]`・`[rendering]` を
-//! 含む TOML は構文エラー（[`ConfigError::Syntax`]）になる。各兄弟 Issue は
-//! 自セクションのフィールドを非公開の `RawConfig` へ追加する責務を持つ。
+//! 設計」）。そのため #216 がマージされるまで `[rendering]` を含む TOML は
+//! 構文エラー（[`ConfigError::Syntax`]）になる。各兄弟 Issue は自セクションの
+//! フィールドを非公開の `RawConfig` へ追加する責務を持つ。
+//!
+//! # `[js] engine` の解決規則（JS-1・TASK-91.2）
+//!
+//! 同梱エンジン（Cargo feature `js-v8`/`js-boa`。`fandhe_browser_js::
+//! bundled_engines`）と設定値を照合し、設定の読み込み時に選択を確定する。
+//!
+//! 1. 省略: 同梱エンジンから V8 → boa の優先順で選ぶ。1 つも同梱されていない
+//!    ときは「エンジンなし（JS 無効）」（[`JsConfig::engine`] が `None`）で、
+//!    エラーではない
+//! 2. 同梱エンジンを指定: そのエンジンを選ぶ（V8 が同梱でも boa 指定を上書きしない）
+//! 3. 未同梱のエンジンを指定: [`ConfigError::JsEngineNotCompiled`]
+//!    （別エンジンへフォールバックしない）
+//! 4. 未知の値（大文字小文字違い含む）: [`ConfigError::UnknownJsEngine`]
+//!
+//! 同梱判定は設定読み込み時と `fandhe_browser_js::create_engine` の 2 箇所で
+//! 二重に行われる（後者は設定を経由しない呼び出しへの防御）。
 //!
 //! # serde/toml を公開 API に漏らさない方針
 //!
@@ -93,6 +107,7 @@
 //! 「不安全な設計」: 巨大ファイルによる DoS を防ぐ）。
 
 use crate::error::{Error, Result};
+pub use fandhe_browser_js::{EngineKind, bundled_engines};
 use serde::Deserialize;
 use std::fs::File;
 use std::io::Read;
@@ -107,12 +122,13 @@ pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 
 /// `fandhe-browser.toml` から読み込んだブラウザ全体の設定。
 ///
-/// `#[non_exhaustive]` により、`[js]`（Issue #215）・`[rendering]`
-/// （Issue #216）のフィールド追加を非破壊にする（REPAIR-4）。
+/// `#[non_exhaustive]` により、`[rendering]`（Issue #216）のフィールド追加を
+/// 非破壊にする（REPAIR-4）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Config {
     profile: ProfileConfig,
+    js: JsConfig,
 }
 
 impl Config {
@@ -149,7 +165,12 @@ impl Config {
         let profile =
             ProfileConfig::from_raw(raw.profile.unwrap_or_default(), allow_absolute_root)?;
 
-        Ok(Config { profile })
+        let requested = raw.js.and_then(|js| js.engine);
+        let js = JsConfig {
+            engine: resolve_engine(requested.as_deref(), bundled_engines())?,
+        };
+
+        Ok(Config { profile, js })
     }
 
     /// `path` の設定ファイルを読み込み、[`Config`] を構築する。
@@ -268,6 +289,87 @@ impl Config {
     /// プロファイル関連の設定（保存先・分離強度）を返す。
     pub fn profile(&self) -> &ProfileConfig {
         &self.profile
+    }
+
+    /// JS エンジン選択の設定（`[js] engine` の解決結果）を返す。
+    pub fn js(&self) -> &JsConfig {
+        &self.js
+    }
+}
+
+/// `[js]` セクションの設定（JS エンジン選択。TASK-91（91.2）・Issue #215・
+/// `JS-1`）。
+///
+/// `#[non_exhaustive]` により将来のフィールド追加を非破壊にする（REPAIR-4）。
+///
+/// 簡易実装（REPAIR-3）: 本型は選択結果を保持するだけで、エンジンの生成・
+/// 起動時ログ・「JS disabled」の表示は行わない。`create_engine` への配線は
+/// TASK-30（`JS-2`）、cli の起動シーケンスでの非 0 終了・表示は TASK-41
+/// （cli 未作成）の責務。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct JsConfig {
+    engine: Option<EngineKind>,
+}
+
+impl JsConfig {
+    /// 選択が確定した JS エンジン。`None` は同梱エンジンが 1 つもない
+    /// （エンジンなしビルド）ため JS が無効であることを表す。
+    pub fn engine(&self) -> Option<EngineKind> {
+        self.engine
+    }
+}
+
+impl Default for JsConfig {
+    /// `[js]` 省略時の設定。`--all-features` 等で同梱一覧が変わっても
+    /// `from_toml_str("")` と一致するよう、パーサーと同じ既定選択を使う
+    /// （derive の `None` 固定にしない）。
+    fn default() -> Self {
+        JsConfig {
+            engine: select_default_engine(bundled_engines()),
+        }
+    }
+}
+
+/// 同梱エンジンから V8 → boa の優先順（[`EngineKind::ALL`]）で既定を選ぶ。
+/// `bundled` の並び順には依存しない。空なら `None`（JS 無効）。
+fn select_default_engine(bundled: &[EngineKind]) -> Option<EngineKind> {
+    EngineKind::ALL
+        .into_iter()
+        .find(|kind| bundled.contains(kind))
+}
+
+/// `[js] engine` の設定値を同梱一覧と照合して選択を確定する
+/// （モジュール doc「`[js] engine` の解決規則」）。
+fn resolve_engine(raw: Option<&str>, bundled: &'static [EngineKind]) -> Result<Option<EngineKind>> {
+    let Some(value) = raw else {
+        return Ok(select_default_engine(bundled));
+    };
+    let Some(kind) = EngineKind::from_config_name(value) else {
+        return Err(Error::from(ConfigError::UnknownJsEngine {
+            value: truncate_for_message(value),
+            compiled: bundled,
+        }));
+    };
+    if !bundled.contains(&kind) {
+        return Err(Error::from(ConfigError::JsEngineNotCompiled {
+            requested: kind,
+            compiled: bundled,
+        }));
+    }
+    Ok(Some(kind))
+}
+
+/// 同梱一覧を `v8, boa`（空なら `none`）形式に整形する。
+fn format_engine_list(engines: &[EngineKind]) -> String {
+    if engines.is_empty() {
+        "none".to_string()
+    } else {
+        engines
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -605,6 +707,14 @@ fn truncate_for_message(value: &str) -> String {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     profile: Option<RawProfile>,
+    js: Option<RawJs>,
+}
+
+/// `[js]` セクションの生 TOML 構造（非公開）。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawJs {
+    engine: Option<String>,
 }
 
 /// `[profile]` セクションの生 TOML 構造（非公開）。
@@ -653,6 +763,22 @@ pub enum ConfigError {
         key: &'static str,
         /// 人間・AI 双方が読める英語メッセージ。
         message: String,
+    },
+    /// `[js] engine` が既知のエンジンを指しているが、このバイナリに同梱
+    /// されていない（別エンジンへはフォールバックしない。`JS-1`・TASK-91.2）。
+    JsEngineNotCompiled {
+        /// 設定で指定されたエンジン。
+        requested: EngineKind,
+        /// このバイナリに同梱されているエンジン（V8 → boa 順。空もあり得る）。
+        compiled: &'static [EngineKind],
+    },
+    /// `[js] engine` が未知の値だった（大文字小文字違い・前後空白を含む。
+    /// `JS-1`・TASK-91.2）。
+    UnknownJsEngine {
+        /// 指定された値（外部入力のため 64 文字で切り詰め済み）。
+        value: String,
+        /// このバイナリに同梱されているエンジン（V8 → boa 順。空もあり得る）。
+        compiled: &'static [EngineKind],
     },
 }
 
@@ -725,6 +851,23 @@ impl std::fmt::Display for ConfigError {
             ConfigError::InvalidValue { key, message } => {
                 write!(f, "invalid value for {key:?}: {message}")
             }
+            ConfigError::JsEngineNotCompiled {
+                requested,
+                compiled,
+            } => write!(
+                f,
+                "js engine \"{}\" is not compiled into this binary (compiled: {}); \
+                 rebuild with --features {}",
+                requested.as_str(),
+                format_engine_list(compiled),
+                requested.feature_name()
+            ),
+            ConfigError::UnknownJsEngine { value, compiled } => write!(
+                f,
+                "unknown js engine {value:?} (supported: \"v8\" (--features js-v8), \
+                 \"boa\" (--features js-boa); compiled: {})",
+                format_engine_list(compiled)
+            ),
         }
     }
 }
@@ -900,7 +1043,7 @@ mod tests {
     }
 
     /// TASK-91（91.1）: トップレベルの未知キーは `deny_unknown_fields` により
-    /// 構文エラーになる（#215・#216 未マージの間、`[js]`・`[rendering]` を
+    /// 構文エラーになる（#216 未マージの間、`[rendering]` を
     /// 含む TOML もこの経路でエラーになる）。
     #[test]
     fn task_91_1_unknown_top_level_key_is_rejected() {
@@ -975,5 +1118,127 @@ mod tests {
         // 2 行目の 'x'（バイトオフセットは日本語 3 文字分で 9、'\n' で 10）。
         let (line, column) = line_column(input, 10);
         assert_eq!((line, column), (2, 1));
+    }
+
+    /// TASK-91（91.2）: 省略時は同梱エンジンから V8 → boa の優先順で選ぶ。
+    #[test]
+    fn task_91_2_default_selection_prefers_v8_then_boa() {
+        use EngineKind::{Boa, V8};
+        assert_eq!(select_default_engine(&[]), None);
+        assert_eq!(select_default_engine(&[V8]), Some(V8));
+        assert_eq!(select_default_engine(&[Boa]), Some(Boa));
+        assert_eq!(select_default_engine(&[V8, Boa]), Some(V8));
+        assert_eq!(select_default_engine(&[Boa, V8]), Some(V8));
+    }
+
+    /// TASK-91（91.2）: 同梱エンジンの明示指定は優先順で上書きされない。
+    #[test]
+    fn task_91_2_explicit_bundled_engine_is_selected() {
+        static BOTH: [EngineKind; 2] = [EngineKind::V8, EngineKind::Boa];
+        static ONLY_V8: [EngineKind; 1] = [EngineKind::V8];
+        assert_eq!(
+            resolve_engine(Some("boa"), &BOTH).expect("boa は同梱"),
+            Some(EngineKind::Boa)
+        );
+        assert_eq!(
+            resolve_engine(Some("v8"), &ONLY_V8).expect("v8 は同梱"),
+            Some(EngineKind::V8)
+        );
+        assert_eq!(resolve_engine(None, &[]).expect("省略は許容"), None);
+    }
+
+    /// TASK-91（91.2）: 未同梱エンジンの指定は設定エラー（フォールバックしない）。
+    #[test]
+    fn task_91_2_not_compiled_engine_is_rejected() {
+        static ONLY_BOA: [EngineKind; 1] = [EngineKind::Boa];
+        let err = resolve_engine(Some("v8"), &ONLY_BOA).expect_err("v8 は未同梱");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::JsEngineNotCompiled {
+                requested: EngineKind::V8,
+                ..
+            })
+        ));
+        assert_eq!(
+            err.to_string(),
+            "configuration error: js engine \"v8\" is not compiled into this binary \
+             (compiled: boa); rebuild with --features js-v8"
+        );
+        let err = resolve_engine(Some("boa"), &[]).expect_err("boa は未同梱");
+        assert!(err.to_string().contains("(compiled: none)"), "{err}");
+        assert!(err.to_string().contains("--features js-boa"), "{err}");
+    }
+
+    /// TASK-91（91.2）: 未知の値（大文字小文字違い・空文字を含む）は設定エラー。
+    #[test]
+    fn task_91_2_unknown_engine_is_rejected() {
+        for bad in ["quickjs", "V8", ""] {
+            let err = resolve_engine(Some(bad), &[]).expect_err("未知の値はエラー");
+            assert!(
+                matches!(err, Error::Config(ConfigError::UnknownJsEngine { .. })),
+                "{bad:?}"
+            );
+            let msg = err.to_string();
+            for needle in ["\"v8\"", "\"boa\"", "--features js-v8", "--features js-boa"] {
+                assert!(msg.contains(needle), "{msg}");
+            }
+            assert!(msg.contains("compiled: none"), "{msg}");
+        }
+        let msg = resolve_engine(Some("quickjs"), &[])
+            .expect_err("未知")
+            .to_string();
+        assert!(msg.contains("\"quickjs\""), "{msg}");
+    }
+
+    /// TASK-91（91.2）: 長い未知の値は 64 文字で切り詰めて反響する。
+    #[test]
+    fn task_91_2_unknown_engine_value_is_truncated() {
+        let long = "x".repeat(100);
+        let msg = resolve_engine(Some(&long), &[])
+            .expect_err("未知")
+            .to_string();
+        assert!(msg.contains(&format!("{}...", "x".repeat(64))), "{msg}");
+        assert!(!msg.contains(&"x".repeat(65)), "{msg}");
+    }
+
+    /// TASK-91（91.2）: TOML 経由の経路。型違い・`[js]` 内の未知キーは構文エラー、
+    /// 省略・空 `[js]` は既定選択と一致する。実際の同梱一覧はビルド構成で
+    /// 変わるため、期待値を実行時に組み立てる。
+    #[test]
+    fn task_91_2_toml_paths() {
+        for bad in ["[js]\nengine = 1\n", "[js]\nengin = 'v8'\n"] {
+            let err = Config::from_toml_str(bad).expect_err("構文エラー");
+            assert!(matches!(err, Error::Config(ConfigError::Syntax { .. })));
+        }
+        let expected = select_default_engine(bundled_engines());
+        assert_eq!(
+            Config::from_toml_str("[js]\n")
+                .expect("空 [js]")
+                .js()
+                .engine(),
+            expected
+        );
+        assert_eq!(Config::default().js().engine(), expected);
+        assert_eq!(
+            Config::from_toml_str("").expect("空入力").js().engine(),
+            expected
+        );
+    }
+
+    /// TASK-91（91.2）: 実際の同梱一覧に対し、同梱エンジンは受理・未同梱は拒否。
+    #[test]
+    fn task_91_2_toml_explicit_engine_matches_bundled() {
+        for kind in EngineKind::ALL {
+            let input = format!("[js]\nengine = \"{}\"\n", kind.as_str());
+            let result = Config::from_toml_str(&input);
+            if bundled_engines().contains(&kind) {
+                assert_eq!(result.expect("同梱").js().engine(), Some(kind));
+            } else {
+                assert!(matches!(
+                    result.expect_err("未同梱"),
+                    Error::Config(ConfigError::JsEngineNotCompiled { .. })
+                ));
+            }
+        }
     }
 }
