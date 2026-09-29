@@ -120,6 +120,12 @@ impl Config {
     ///
     /// 入力長を [`MAX_CONFIG_BYTES`] で事前検証してからパースする。空文字列・
     /// `[profile]` セクション省略は既定値として扱いエラーにしない。
+    ///
+    /// 基準ディレクトリを持たないため、絶対パス・ドライブ / ルート相対
+    /// （`C:foo`・`/foo`）の `profile.root` は境界検証できず
+    /// [`ConfigError::InvalidValue`] で拒否する（設定ファイル由来の絶対 `root` は
+    /// 境界検証を伴う [`Config::load`] のみが受理する）。返る相対 `root` は
+    /// 未解決のままで、字句上の脱出のみ検証済み。
     pub fn from_toml_str(input: &str) -> Result<Config> {
         if input.len() > MAX_CONFIG_BYTES {
             return Err(Error::from(ConfigError::TooLarge {
@@ -127,10 +133,21 @@ impl Config {
             }));
         }
 
+        Config::parse_toml(input, false)
+    }
+
+    /// TOML 文字列を検証して [`Config`] へ変換する共通処理。
+    ///
+    /// `allow_absolute_root` は絶対 `profile.root` を受理するか。基準ディレクトリ
+    /// （設定ファイルの親）を知らない [`Config::from_toml_str`] は `false`、境界検証を
+    /// 続けて行う [`Config::load`] のみ `true` を渡す（Issue #538 P0 指摘: 公開 API
+    /// から絶対 `root` の境界検証を迂回させない）。
+    fn parse_toml(input: &str, allow_absolute_root: bool) -> Result<Config> {
         let raw: RawConfig = toml::from_str(input)
             .map_err(|source| Error::from(ConfigError::from_toml_de_error(input, &source)))?;
 
-        let profile = ProfileConfig::from_raw(raw.profile.unwrap_or_default())?;
+        let profile =
+            ProfileConfig::from_raw(raw.profile.unwrap_or_default(), allow_absolute_root)?;
 
         Ok(Config { profile })
     }
@@ -165,7 +182,7 @@ impl Config {
         let text =
             String::from_utf8(bytes).map_err(|_source| Error::from(ConfigError::InvalidUtf8))?;
 
-        let mut config = Config::from_toml_str(&text)?;
+        let mut config = Config::parse_toml(&text, true)?;
 
         if let Some(root) = config.profile.root.take() {
             // 設定ファイルの親ディレクトリを symlink 解決済みの実所在まで
@@ -274,7 +291,7 @@ impl ProfileConfig {
         self.isolation
     }
 
-    fn from_raw(raw: RawProfile) -> Result<ProfileConfig> {
+    fn from_raw(raw: RawProfile, allow_absolute_root: bool) -> Result<ProfileConfig> {
         let root = match raw.root {
             Some(root) => {
                 if root.is_empty() {
@@ -284,6 +301,28 @@ impl ProfileConfig {
                     }));
                 }
                 let candidate = PathBuf::from(&root);
+                // ルート・ドライブを含むパスの扱い（Issue #538 P0・P1 指摘）。
+                // 完全な絶対パスは基準ディレクトリを知る `Config::load` のみが
+                // 境界検証つきで受理する。Windows のドライブ相対（`C:foo`）・
+                // ルート相対（`/foo`）は `is_absolute()` が false でも通常の
+                // 相対パスではなく、`join` で基準を置換し得るため常に拒否する。
+                // 相対 `root` は `Normal`・`CurDir`・`ParentDir` のみで構成される。
+                let has_root_or_prefix = candidate.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::RootDir | std::path::Component::Prefix(_)
+                    )
+                });
+                if has_root_or_prefix && !(allow_absolute_root && candidate.is_absolute()) {
+                    return Err(Error::from(ConfigError::InvalidValue {
+                        key: "profile.root",
+                        message: format!(
+                            "profile.root {:?} must be a plain relative path (absolute, \
+                             drive-relative and root-relative paths are not accepted here)",
+                            truncate_for_message(&root)
+                        ),
+                    }));
+                }
                 // `Config::load` は相対パスを設定ファイルの親ディレクトリへ
                 // `Path::join` する（正規化しない）。ここで字句上
                 // （ファイルシステムに触れず）正規化した結果、設定ファイルの
@@ -298,7 +337,8 @@ impl ProfileConfig {
                 // 「不安全な設計」・プロファイル境界。絶対パスの限定は
                 // ファイルパスを知っている `Config::load` 側で行う。モジュール
                 // doc「パス解決」参照）。
-                if resolves_outside_or_at_base_dir(&candidate) {
+                // 絶対パスは `Config::load` が境界検証するため深さ判定は相対のみ。
+                if !has_root_or_prefix && resolves_outside_or_at_base_dir(&candidate) {
                     return Err(Error::from(ConfigError::InvalidValue {
                         key: "profile.root",
                         message: format!(
