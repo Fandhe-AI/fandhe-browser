@@ -47,6 +47,19 @@ windows-sys = { workspace = true, optional = true }
 default = []
 js-v8 = ["dep:v8", "dep:rustix", "dep:windows-sys"]
 js-boa = []
+# テスト専用入口（`*_for_test`）を本番ビルドから隔離する feature（Issue
+# #528・TASK-29・`JS-1`）。`process_engine` のテスト専用メソッド・
+# `WorkerSpawnConfigForTest` はこの feature が有効なときだけ crate 外から
+# 参照できる（無効時は非公開になり、名前自体を付けられない）。`js-v8` を
+# 含めているのは、テスト専用 API が `js-v8` 配下にしか存在しないため
+# （`--features test-support` だけで揃う）。
+#
+# 注意: 本 feature は利用側 crate（将来 core 等）の `[dev-dependencies]`
+# でのみ有効化すること。`[dependencies]` で有効化すると feature
+# unification により本番バイナリへテスト専用 API が再び露出する
+# （dependency-policy.md の対象外だが、本番からの隔離という本 feature の
+# 目的そのものを壊すため各 crate の Cargo.toml でも同じ注意を守る）。
+test-support = ["js-v8"]
 
 # JS プロセス分離（TASK-29・Issue #503 設計書 §3.1・§7 W6）の結合テスト。
 # このテストバイナリ自身が自己再実行の対象になる（`main` の先頭で
@@ -57,9 +70,43 @@ js-boa = []
 # `super::worker_protocol` のフレーム専用であり、通常の libtest ハーネスが
 # stdout へ書く "running N tests" 等の文字列が混入すると、親（テスト本体）
 # 側のフレーム読み取りが壊れる。`js-v8` feature が無効なビルドでは
-# `V8ProcessEngine`（`process_engine` モジュール）自体が存在しないため
-# `required-features` で除外する。
+# `V8ProcessEngine`（`process_engine` モジュール）自体が存在しないため、
+# また `js-v8` のみ（`test-support` 無効）のビルドではテスト専用入口
+# （`new_for_test` 等）自体が存在しないため、`required-features` で
+# `test-support`（`js-v8` を包含）を要求して除外する（Issue #528）。
 [[test]]
 name = "v8_worker"
 harness = false
-required-features = ["js-v8"]
+required-features = ["test-support"]
+
+# 子プロセスの「起動＋ハンドシェイク」レイテンシ実測ベンチ（TASK-29・
+# Issue #555・`CORE-3`・`PERF-6`・`PERF-7`。親 issue #519）。
+# `harness = false` の理由: このバイナリ自身が
+# `fandhe_browser_js::run_js_worker_if_requested` 経由で子プロセス役を
+# 兼ねる（`v8_worker` 結合テストと同じ作法）ため、子プロセス役のときの
+# stdout はプロトコルフレーム専用であり、libtest/`cargo bench` の既定
+# ハーネスが書く文字列が混入するとフレーム読み取りが壊れる。
+# `required-features` の理由: 計測本体が使うテスト専用入口
+# （`V8ProcessEngine::spawn_worker_for_test`・`worker_pid_for_test`）は
+# feature `test-support`（`js-v8` を包含）配下にしか存在しない（Issue
+# #528 の隔離方針）。
+[[bench]]
+name = "worker_spawn_latency"
+path = "benches/worker_spawn_latency.rs"
+harness = false
+required-features = ["test-support"]
+
+# レイテンシ集計の純関数（`benches/worker_spawn_latency/stats.rs`）の
+# ユニットテスト（TASK-29・Issue #555・`PERF-6`・`PERF-7`）。ベンチ本体
+# （`js-v8`／`test-support` 前提）とは独立に、どの feature 構成でも
+# 実行できる（`competitor_lightpanda_support` と同じ構成。新規依存・
+# 子プロセス起動を伴わないため `required-features` は付けない）。
+# `path` が `stats.rs` 本体ではなく兄弟の `stats_tests.rs` を指す理由:
+# `stats.rs` は bench 本体からも `#[path]` で取り込まれるが、bench
+# ターゲットは `--cfg test` は付くが `--test`（libtest 起動）は付かない
+# ため、`stats.rs` 側に `#[test]` 関数を同居させると bench 側の
+# コンパイルで本体が展開されず「未使用 `use`」の誤検出を招く
+# （`stats.rs` 冒頭のドキュメントコメント参照）。
+[[test]]
+name = "worker_spawn_latency_stats"
+path = "benches/worker_spawn_latency/stats_tests.rs"

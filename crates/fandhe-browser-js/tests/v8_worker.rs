@@ -16,6 +16,11 @@
 //! フレーム専用であり、通常の libtest ハーネスが書く "running N tests"
 //! 等の文字列が混入すると親側のフレーム読み取りが壊れるため、
 //! `harness = false` にしている。
+//!
+//! `process_engine::V8ProcessEngine` のテスト専用入口（`new_for_test` 等）
+//! は feature `test-support` を有効にしたときだけ存在する（Issue #528・
+//! TASK-29・`JS-1`）。実行コマンド:
+//! `cargo test -p fandhe-browser-js --features test-support`。
 
 use std::process::ExitCode;
 
@@ -104,6 +109,8 @@ fn main() -> ExitCode {
     {
         eprintln!("case: js_1_linux_child_process_has_rlimit_data_set");
         js_1_linux_child_process_has_rlimit_data_set();
+        eprintln!("case: js_1_linux_child_process_has_oom_score_adj_set");
+        js_1_linux_child_process_has_oom_score_adj_set();
     }
     #[cfg(target_os = "windows")]
     {
@@ -111,6 +118,10 @@ fn main() -> ExitCode {
             "case: js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation"
         );
         js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation();
+        eprintln!(
+            "case: js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_limit"
+        );
+        js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_limit();
     }
     eprintln!("v8_worker: all cases passed");
     ExitCode::SUCCESS
@@ -183,6 +194,7 @@ fn js_1_oom_returns_resource_limit_exceeded_and_next_eval_uses_fresh_context() {
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: None,
+        windows_process_memory_limit_bytes_override: None,
     });
     engine
         .evaluate_script("var before_oom = 999;", &EvaluateOptions::default())
@@ -230,6 +242,7 @@ fn js_1_handshake_failure_is_engine_unavailable() {
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: None,
+        windows_process_memory_limit_bytes_override: None,
     });
 
     match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
@@ -253,6 +266,7 @@ fn js_1_handshake_rejects_hello_naming_a_different_engine() {
         hello_wrong_engine_for_test: true,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: None,
+        windows_process_memory_limit_bytes_override: None,
     });
 
     match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
@@ -281,6 +295,7 @@ fn js_1_handshake_rejects_hello_with_wrong_length() {
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: true,
         rss_threshold_bytes_override: None,
+        windows_process_memory_limit_bytes_override: None,
     });
 
     match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
@@ -443,6 +458,7 @@ fn js_1_oversized_test_heap_limit_is_clamped_to_the_production_default() {
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: None,
+        windows_process_memory_limit_bytes_override: None,
     });
 
     let oom_script = "var chunks = []; while (true) { chunks.push(new Array(1e7).fill(0)); }";
@@ -477,6 +493,7 @@ fn js_1_undersized_test_heap_limit_is_raised_to_a_working_floor() {
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: None,
+        windows_process_memory_limit_bytes_override: None,
     });
 
     let result = engine
@@ -602,6 +619,7 @@ fn js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceed
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: Some(TEST_RSS_THRESHOLD_BYTES),
+        windows_process_memory_limit_bytes_override: None,
     });
     engine
         .evaluate_script("var before_oom = 555;", &EvaluateOptions::default())
@@ -690,6 +708,88 @@ fn js_1_linux_child_process_has_rlimit_data_set() {
     );
 }
 
+/// procfs への書き込み可否を、このテストプロセス自身の
+/// `/proc/self/oom_score_adj` で確認する（PR #535 レビュー指摘 P1
+/// 対応。threadId: `PRRT_kwDOUov33c6mqTb_`）。
+///
+/// `prefer_child_as_oom_victim`（`resource_limits.rs`）は procfs へ
+/// 書き込めない環境（読み取り専用ファイルシステム等）では警告を出して
+/// 評価を続行する契約であり（`worker.rs` の呼び出し箇所参照）、fail-closed
+/// にはしない。したがって
+/// [`js_1_linux_child_process_has_oom_score_adj_set`] が子の
+/// `oom_score_adj` を無条件に `1000` と期待すると、procfs 書き込み不可の
+/// 環境では「仕様どおり警告を出して続行した」だけの正常なワーカーに
+/// 対してテストが失敗してしまう。読んだ現在値をそのまま書き戻す
+/// （no-op）ことで副作用なく書き込み可否だけを判定する。
+#[cfg(target_os = "linux")]
+fn can_write_oom_score_adj_for_self() -> bool {
+    use std::io::Write as _;
+
+    let path = "/proc/self/oom_score_adj";
+    let Ok(current) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(current.trim().as_bytes()))
+        .is_ok()
+}
+
+/// `JS-1`・`TASK-29`・Issue #516: 子プロセスが起動直後・V8 初期化前に
+/// `/proc/self/oom_score_adj` へ `1000` を書き込んでいること。親から
+/// `/proc/<pid>/oom_score_adj` を読んで確認する
+/// （`V8ProcessEngine::worker_pid_for_test` 経由。`js_1_linux_child_process_has_rlimit_data_set`
+/// と同じ形）。
+///
+/// 親プロセス自身が既に `oom_score_adj=1000` で動いている環境（この値を
+/// 継承しているだけの可能性がある）では、この結合テストだけでは
+/// 「実際に書き込んだ」ことと「継承しただけ」を区別できない。書き込みの
+/// 仕組みそのもの（既存のファイルへ値を書けること・存在しないパスでは
+/// エラーになること）は `resource_limits` モジュールの単体テスト
+/// （`js_1_write_oom_score_adj_writes_the_value_to_the_given_path` 等）が
+/// 担う。本テストは「子プロセスの実行結果として値が 1000 になっている」
+/// ことを、実際のプロセス起動を通して確認する回帰テストである。
+///
+/// procfs への書き込みが許容されない環境（読み取り専用ファイルシステム
+/// 等）では `prefer_child_as_oom_victim` が警告を出して評価を継続する
+/// 契約になっており（`worker.rs`・`resource_limits.rs` 参照）、その場合
+/// 子の `oom_score_adj` は初期値のまま `1000` にならない。この環境要因と
+/// 実装バグを区別するため、値が `1000` でなかった場合は
+/// [`can_write_oom_score_adj_for_self`] でこのテストプロセス自身の
+/// procfs 書き込み可否を確認し、書き込めない環境であればフォールバック
+/// 経路として許容する（書き込める環境なのに `1000` でなければ実装の
+/// 回帰としてテスト失敗のままにする。PR #535 レビュー指摘 P1 対応。
+/// threadId: `PRRT_kwDOUov33c6mqTb_`）。
+///
+/// 実際に OOM killer が発火してこの子が優先的に選ばれることの再現は
+/// 環境依存のため対象外とする（`resource_limits` モジュールのドキュメント
+/// コメント「既知の制限」参照）。
+#[cfg(target_os = "linux")]
+fn js_1_linux_child_process_has_oom_score_adj_set() {
+    let mut engine = V8ProcessEngine::new();
+    engine
+        .evaluate_script("1 + 1", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("a trivial evaluation must succeed: {err}"));
+
+    let pid = engine
+        .worker_pid_for_test()
+        .expect("a worker must be running after a successful evaluation");
+    let value = std::fs::read_to_string(format!("/proc/{pid}/oom_score_adj"))
+        .unwrap_or_else(|err| panic!("failed to read /proc/{pid}/oom_score_adj: {err}"));
+
+    if value.trim() == "1000" {
+        return;
+    }
+
+    assert!(
+        !can_write_oom_score_adj_for_self(),
+        "the child's oom_score_adj was not set to 1000 even though this environment \
+         allows writing to /proc/self/oom_score_adj, got: {:?}",
+        value.trim()
+    );
+}
+
 /// codex・Cursor Bugbot レビュー指摘 #503 P0「短い評価を繰り返して
 /// `ArrayBuffer` をグローバル変数に溜め込むと、上限を超えても検出され
 /// ない」の回帰テスト: 1 回 1 回は小さくすぐ終わる評価
@@ -709,6 +809,7 @@ fn js_1_repeated_short_evaluations_accumulating_array_buffers_hit_resource_limit
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: Some(TEST_RSS_THRESHOLD_BYTES),
+        windows_process_memory_limit_bytes_override: None,
     });
     engine
         .evaluate_script(
@@ -780,6 +881,12 @@ fn js_1_repeated_short_evaluations_accumulating_array_buffers_hit_resource_limit
 /// する（観測可能な結果としては、他 OS 向けの
 /// `js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceeded`
 /// と同じ `ResourceLimitExceeded` になる）。
+///
+/// **本テストは親側の RSS 監視（`PrivateUsage`）が先に発動する構成であり、
+/// Job Object の上限そのものが確保を拒否する経路は検証しない**（テスト名の
+/// `kills` は監視による kill を指す）。その経路は
+/// [`js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_limit`]
+/// が検証する（Issue #531）。
 #[cfg(target_os = "windows")]
 fn js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation() {
     let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
@@ -788,6 +895,7 @@ fn js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation() {
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: Some(TEST_RSS_THRESHOLD_BYTES),
+        windows_process_memory_limit_bytes_override: None,
     });
     engine
         .evaluate_script("var before_oom = 777;", &EvaluateOptions::default())
@@ -825,4 +933,81 @@ fn js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation() {
             panic!("expected the pre-OOM variable to be gone in the fresh context, got: {other:?}")
         }
     }
+}
+
+/// Job Object の上限を下げた検証で使う上限値（112 MiB）。
+///
+/// 単発の確保サイズ [`JOB_LIMIT_TEST_ALLOCATION_BYTES`]（120 MiB）より小さい
+/// ので、起動直後のコミット量がいくつであっても、その 1 回の確保だけで必ず
+/// 上限を超える。
+#[cfg(target_os = "windows")]
+const LOWERED_JOB_LIMIT_BYTES: usize = 112 * 1024 * 1024;
+
+/// 単発の `ArrayBuffer` 確保サイズ（120 MiB）。`resource_limits::
+/// MAX_ARRAY_BUFFER_ALLOCATION_BYTES`（128 MiB。`pub(crate)` のためここでは
+/// リテラルで書く）未満なので bounded allocator は拒否せず、親の RSS 監視
+/// しきい値（本番の 320 MiB）よりコミット量が小さいうちに Job Object の
+/// 上限（[`LOWERED_JOB_LIMIT_BYTES`]）だけが効く。
+#[cfg(target_os = "windows")]
+const JOB_LIMIT_TEST_ALLOCATION_BYTES: u64 = 120 * 1024 * 1024;
+
+/// JS-1・TASK-29・Issue #531: Windows の Job Object `ProcessMemoryLimit` を
+/// 到達可能な値まで下げると、親の RSS 監視（本番しきい値 320 MiB のまま）が
+/// 先に発動することなく、OS が確保を拒否すること。
+///
+/// 拒否の原因は次の 3 点から Job Object に絞れる: 確保サイズは bounded
+/// allocator の上限（128 MiB）未満、親の監視しきい値（320 MiB）は Job 上限
+/// （112 MiB）より大きくコミット量が届きえない、対照（既定の上限）では
+/// 同じ確保が成功する。分類は `EvaluationFailed`（`RangeError: Array buffer
+/// allocation failed`）で、子プロセス（pid）も Context も保たれる。
+///
+/// ローカル（Linux 等）では実行されず、CI の Windows ランナーで検証する。
+#[cfg(target_os = "windows")]
+fn js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_limit() {
+    let allocation_script =
+        format!("new ArrayBuffer({JOB_LIMIT_TEST_ALLOCATION_BYTES}).byteLength");
+
+    // 対照: 既定（本番の上限 384 MiB）では同じ確保が成功する。
+    let mut control = V8ProcessEngine::new();
+    let control_result = control
+        .evaluate_script(&allocation_script, &EvaluateOptions::default())
+        .unwrap_or_else(|err| {
+            panic!("the control allocation under the production Job limit must succeed: {err}")
+        });
+    assert_eq!(control_result, JsValue::Number(125_829_120.0));
+
+    let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
+        heap_limit_bytes: None,
+        protocol_version_override: None,
+        hello_wrong_engine_for_test: false,
+        hello_extra_byte_for_test: false,
+        rss_threshold_bytes_override: None,
+        windows_process_memory_limit_bytes_override: Some(LOWERED_JOB_LIMIT_BYTES),
+    });
+    engine
+        .evaluate_script("var before_job_limit = 531;", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("marker declaration must evaluate successfully: {err}"));
+    let pid_before = engine.worker_pid_for_test();
+
+    match engine.evaluate_script(&allocation_script, &EvaluateOptions::default()) {
+        Err(JsEngineError::EvaluationFailed(msg)) => {
+            assert!(
+                msg.contains("RangeError") && msg.contains("Array buffer allocation failed"),
+                "expected a RangeError from the OS-rejected allocation, got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected EvaluationFailed(RangeError) when the lowered Job Object limit rejects the allocation, got: {other:?}"
+        ),
+    }
+
+    assert_eq!(
+        engine.worker_pid_for_test(),
+        pid_before,
+        "the worker process must not be recreated after a rejected allocation"
+    );
+    let marker = engine
+        .evaluate_script("before_job_limit", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("the context must survive a rejected allocation: {err}"));
+    assert_eq!(marker, JsValue::Number(531.0));
 }

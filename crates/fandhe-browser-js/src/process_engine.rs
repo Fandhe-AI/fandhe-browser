@@ -6,7 +6,7 @@
 //! 時点では inherent メソッドとして `evaluate_script` を提供するに
 //! 留める。設計書 §7「案 X」4）。
 //!
-//! [`V8ProcessEngine`] は 1 つの子プロセス（[`super::worker`] を
+//! [`V8ProcessEngine`] は 1 つの子プロセス（`super::worker` を
 //! `FANDHE_BROWSER_JS_WORKER` 環境変数で起動したもの）を遅延生成し、
 //! 寿命のあいだ持ち続ける。子は同じ実行ファイルを自己再実行する
 //! （専用のワーカーバイナリを持たない。設計書 §3.1）。
@@ -26,10 +26,10 @@
 //! - **reader スレッド**: 子の stdout からフレームを読み、`mpsc` 経由で
 //!   評価呼び出し側へ届ける
 //! - **stderr drain スレッド**: 子の stderr を読み続け、末尾
-//!   [`STDERR_TAIL_CAPACITY_BYTES`] バイトをリングバッファへ保持する。
+//!   `STDERR_TAIL_CAPACITY_BYTES` バイトをリングバッファへ保持する。
 //!   読み続けないとパイプが詰まって子が止まるため必須（設計書 §3.3）
-//! - **メモリ監視スレッド**（[`MemoryMonitor`]）: 子の寿命のあいだ
-//!   （評価中か待機中かに関わらず）[`super::resource_limits::RSS_POLL_INTERVAL`]
+//! - **メモリ監視スレッド**（`MemoryMonitor`）: 子の寿命のあいだ
+//!   （評価中か待機中かに関わらず）`super::resource_limits::RSS_POLL_INTERVAL`
 //!   ごとに子の RSS を確認し続け、しきい値を超えたらこのスレッドが
 //!   自ら `kill` する（codex・Cursor Bugbot レビュー指摘 #503 P0「RSS の
 //!   確認が `recv_timeout` の時間切れ分岐でしか行われておらず、短い
@@ -42,7 +42,7 @@
 //! | 子の watchdog による打ち切り（`Error{kind=Timeout}`） | [`JsEngineError::Timeout`] | 残る |
 //! | 応答待ち・書き込み待ちの期限切れで親が `kill` した | [`JsEngineError::Timeout`] | 破棄（メッセージに明示） |
 //! | 応答前に EOF になり、stderr に `Fatal ... out of memory` がある | [`JsEngineError::ResourceLimitExceeded`] | 破棄（ヒューリスティック） |
-//! | メモリ監視スレッドが RSS 超過を検出して子を `kill` した（評価中・書き込み中・待機中いずれも） | [`JsEngineError::ResourceLimitExceeded`] | 破棄（メッセージに実測 RSS を明示。書き込み中に `kill` された場合の broken pipe も正しくここへ分類する。[`discard_context_error`]。codex・Bugbot レビュー指摘 #503 P0/P1 対応） |
+//! | メモリ監視スレッドが RSS 超過を検出して子を `kill` した（評価中・書き込み中・待機中いずれも） | [`JsEngineError::ResourceLimitExceeded`] | 破棄（メッセージに実測 RSS を明示。書き込み中に `kill` された場合の broken pipe も正しくここへ分類する。`discard_context_error`。codex・Bugbot レビュー指摘 #503 P0/P1 対応） |
 //! | 応答（Result/Error）受信直後の同期確認で RSS 超過が判明した | [`JsEngineError::ResourceLimitExceeded`] | 破棄（せっかく得られた応答を握りつぶす。同上） |
 //! | それ以外の異常終了・プロトコル違反・起動失敗 | [`JsEngineError::EngineUnavailable`] | 破棄 |
 //!
@@ -53,9 +53,9 @@
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
 //! - ヒープ外メモリ（`ArrayBuffer` の backing store 等）には
-//!   [`super::resource_limits`] が子側の OS 別強制（Linux の
+//!   `super::resource_limits` が子側の OS 別強制（Linux の
 //!   `RLIMIT_DATA`・Windows の Job Object working set 上限）と親側の
-//!   RSS 監視（[`MemoryMonitor`]。子の寿命のあいだ継続的に動作する）に
+//!   RSS 監視（`MemoryMonitor`。子の寿命のあいだ継続的に動作する）に
 //!   よる多層防御を設けている（codex・Bugbot レビュー指摘 #503 P0
 //!   対応）。ただし実測の結果、子側の OS 別強制はいずれも厳密な上限には
 //!   ならず（Linux は V8 の `CodeRange` 仮想アドレス予約のため小さい値に
@@ -67,7 +67,7 @@
 //! - macOS には子のメモリ使用量を OS 側で強制する手段が無く
 //!   （`super::resource_limits` の実機検証結果を参照）、親側の RSS 監視
 //!   だけに頼る
-//! - 応答直後の同期的な RSS 確認（[`apply_post_response_rss_check`]）は
+//! - 応答直後の同期的な RSS 確認（`apply_post_response_rss_check`）は
 //!   呼び出しスレッド上で `read_child_rss_bytes` を 1 回だけ呼ぶ。Windows
 //!   は `GetProcessMemoryInfo`（psapi.dll の直接呼び出し）を使うため、
 //!   PowerShell 起動のようなプロセス生成コストは無い
@@ -77,10 +77,10 @@
 //! - stderr の文言（`Fatal JavaScript out of memory`/`Fatal process out
 //!   of memory`）による `ResourceLimitExceeded` の判定はヒューリスティック
 //!   であり、V8 のバージョン更新でメッセージが変われば壊れうる
-//! - [`super::v8_engine`] の `SCRIPT_EXECUTION_TIMEOUT` のドキュメント
+//! - `super::v8_engine` の `SCRIPT_EXECUTION_TIMEOUT` のドキュメント
 //!   コメントが記す既知の制限（「`v8::Script::compile` 自体は
 //!   `terminate_execution` では打ち切られない場合がある」）は、本モジュール
-//!   の [`EVALUATE_RECV_TIMEOUT`] による強制 `kill`（[`WorkerHandle::drop`]
+//!   の `EVALUATE_RECV_TIMEOUT` による強制 `kill`（`WorkerHandle::drop`
 //!   と同じ「stdin を閉じる→待つ→kill→wait」の手順は踏まず、応答待ちの
 //!   `recv_timeout` が切れた時点で直ちに `kill` する）で解消される。
 //!   コンパイルがどれだけ長くかかっても、子プロセスごと強制終了できる
@@ -742,102 +742,144 @@ impl Drop for WorkerHandle {
     }
 }
 
-/// [`V8ProcessEngine::send_raw_frame_for_test`] が受け付ける生バイト列の
-/// 上限（バイト。codex レビュー指摘 #503 P0「`bytes` を長さ検証なしで
-/// `to_vec()` しており、無制限の確保経路になる」対応）。
+/// テスト専用: [`V8ProcessEngine::send_raw_frame_for_test`] が受け付ける
+/// 生バイト列の上限（バイト。codex レビュー指摘 #503 P0「`bytes` を長さ
+/// 検証なしで `to_vec()` しており、無制限の確保経路になる」対応）。
 ///
-/// この関数は「親から子への 1 フレーム」を模して生バイト列をそのまま
-/// 子の stdin へ書き込むテスト専用の入口であり、その実効的な上限は
+/// `send_raw_frame_for_test` と同じく feature `test-support` でのみ
+/// 存在する（Issue #528）。gate しないと `js-v8` のみ（`test-support`
+/// 無効）のビルドで未使用（`dead_code`）になり、`-D warnings` で失敗する。
+///
+/// この定数は「親から子への 1 フレーム」を模して生バイト列をそのまま
+/// 子の stdin へ書き込むテスト専用の入口の上限であり、その実効的な上限は
 /// [`worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`]（親から子への
 /// 1 フレームのペイロード上限）に、フレームヘッダー分（`u32` の長さ
 /// プレフィックス 4 バイト＋`u8` のタグ 1 バイト＝5 バイト）の余裕を
 /// 足した値にする。呼び出し元（`tests/v8_worker.rs`）が意図的に破損した
 /// フレーム（プロトコル違反の注入）を送る際も、実際に送るバイト数は
 /// 数バイト〜数十バイト程度であり、この上限に触れることはない。
+#[cfg(feature = "test-support")]
 const MAX_RAW_FRAME_BYTES_FOR_TEST: usize = worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD + 5;
 
-/// テスト専用: 子プロセスの起動条件を上書きする（Issue #503 設計書
-/// §7 W6「テスト用に小さいヒープ上限を渡す経路（テスト専用。本番では
-/// 無効）」・「ハンドシェイク失敗」の検証に使う）。
-///
-/// 本番の [`V8ProcessEngine::new`] は常に既定値（`Default::default()`。
-/// 本番のヒープ上限・プロトコルバージョン）を使う。この構造体は
-/// `tests/v8_worker.rs`（`harness = false`。W6）が
-/// [`V8ProcessEngine::new_for_test`] 経由でのみ使う想定であり、本 crate の
-/// 他のコードは触らない。
-///
-/// `#[doc(hidden)]` を付けたうえで `pub` にする理由: `tests/v8_worker.rs`
-/// は結合テスト（別クレートとしてコンパイルされる）であり、`pub(crate)`
-/// の項目を参照できない。テスト専用の入口だけを最小限 `pub` にする
-/// （[coding-rust.md] の「JS エンジンはトレイト抽象越しに使い、V8 の
-/// 具象型を上位 crate へ漏らさない」という制約は、`V8ProcessEngine` が
-/// `Child`・パイプ・チャネルしか保持せず `v8` crate の型を一切参照しない
-/// ため抵触しない）。
-#[doc(hidden)]
-#[derive(Debug, Clone, Default)]
-pub struct WorkerSpawnConfigForTest {
-    /// 子へ `super::worker::TEST_HEAP_LIMIT_ENV_VAR` として渡すヒープ
-    /// 上限（バイト）。`None` の場合は渡さない（本番と同じ既定値になる）。
+// `WorkerSpawnConfigForTest` は `V8ProcessEngine` の非公開フィールド
+// （`spawn_config`）の型であり、本番の `spawn_worker` も参照するため
+// `#[cfg(feature = "test-support")]` だけでは消せない（フィールドが本番
+// ビルドにも残る。Issue #528 の方式 (a)）。非公開サブモジュールへ実体を
+// 置き、crate 内での見せ方（再エクスポートの可視性）だけを feature で
+// 切り替える: `test-support` 有効時は `pub use`（`tests/v8_worker.rs` が
+// 結合テストとして参照できるようにする）、無効時は非公開 `use`（crate 外
+// から名前を一切付けられなくする）にする。
+mod spawn_config {
+    /// テスト専用: 子プロセスの起動条件を上書きする（Issue #503 設計書
+    /// §7 W6「テスト用に小さいヒープ上限を渡す経路（テスト専用。本番では
+    /// 無効）」・「ハンドシェイク失敗」の検証に使う）。
     ///
-    /// **下げることしかできない**（codex レビュー指摘 #503 P0 対応）:
-    /// 本番の既定値（[`super::v8_engine::MAX_ISOLATE_HEAP_BYTES`]。128 MiB）
-    /// を上回る値を指定しても、[`super::v8_engine::clamp_test_heap_limit_bytes`]
-    /// により既定値へクランプされる（`spawn_worker` が環境変数を組み立てる
-    /// 直前に適用する）。下限側も同関数がクランプする（`0` や極端に小さい
-    /// 値を渡しても、実用上動作する最小値まで引き上げられる。詳細は同関数の
-    /// ドキュメントコメント参照）。子プロセス側（`super::worker`）でも
-    /// 同じクランプを独立に適用しており、親を経由しない直接起動に対する
-    /// 防御になっている（多層防御）。
-    pub heap_limit_bytes: Option<usize>,
-    /// 子へ渡すプロトコルバージョンの上書き値（ハンドシェイク失敗を
-    /// 決定的に再現するためのテスト専用経路）。`None` の場合は
-    /// [`worker_protocol::PROTOCOL_VERSION`] を使う。
-    pub protocol_version_override: Option<u16>,
-    /// `true` にすると、子へ [`super::worker::TEST_HELLO_ENGINE_OVERRIDE_ENV_VAR`]
-    /// を渡し、子が `Hello` で `EngineKind::Boa` を名乗るようにする（codex
-    /// レビュー指摘 #503 P1「Hello のエンジン種別を無視している」の回帰
-    /// テスト専用。実際の子プロセスに別のエンジン種別を名乗らせて、親
-    /// （`spawn_worker`）が拒否することを確認する）。
-    pub hello_wrong_engine_for_test: bool,
-    /// `true` にすると、子へ [`super::worker::TEST_HELLO_EXTRA_BYTE_ENV_VAR`]
-    /// を渡し、子が送る `Hello` の末尾に余分な 1 バイトを付け足させる
-    /// （codex レビュー指摘 #503 P1「decode_hello が末尾の余分なバイトを
-    /// 拒否していない」の回帰テスト専用）。
-    pub hello_extra_byte_for_test: bool,
-    /// 親側の RSS 監視（継続監視・応答直後の同期確認の両方）が使う
-    /// しきい値の上書き値（バイト）。`None` の場合は
-    /// [`super::resource_limits::MAX_CHILD_RSS_BYTES`]（320 MiB）を使う
-    /// （codex レビュー指摘 #503 P0「macOS の JS ワーカーに強制的な
-    /// メモリ上限がない」対応で `ArrayBuffer` 確保に独自の上限
-    /// （[`super::resource_limits::MAX_ARRAY_BUFFER_ALLOCATION_BYTES`]。
-    /// 128 MiB）を設けたことに伴う回帰テスト専用の経路。この上限の
-    /// 導入前は、`ArrayBuffer` を際限なく確保するスクリプトで実プロセスの
-    /// RSS を本番のしきい値（320 MiB）まで実際に押し上げて RSS 監視を
-    /// 検証していたが、`ArrayBuffer` の確保自体が 128 MiB で
-    /// `RangeError` になるようになったため、その手段が使えなくなった。
-    /// RSS 監視という仕組みそのものの検証を保つため、`ArrayBuffer` の
-    /// 上限をテストのために引き上げるのではなく（引き上げは、検証したい
-    /// 安全機構自体を回避する経路になり得るため避ける）、RSS 監視の
-    /// しきい値を**本番の値より小さくする**ことだけを許す（下げることしか
-    /// できない。`heap_limit_bytes` と同じ「テスト専用の上書きは安全側
-    /// にしか動かせない」原則）。
+    /// 本番の [`super::V8ProcessEngine::new`] は常に既定値
+    /// （`Default::default()`。本番のヒープ上限・プロトコルバージョン）を
+    /// 使う。この構造体は `tests/v8_worker.rs`（`harness = false`。W6）が
+    /// [`super::V8ProcessEngine::new_for_test`] 経由でのみ使う想定であり、
+    /// 本 crate の他のコードは触らない。
     ///
-    /// **下げることしかできない**: 本番の既定値
-    /// （[`super::resource_limits::MAX_CHILD_RSS_BYTES`]）を上回る値を
-    /// 指定しても、`spawn_worker` が `MemoryMonitor` を起動する直前に
-    /// `min(要求値, MAX_CHILD_RSS_BYTES)` へクランプする。
-    pub rss_threshold_bytes_override: Option<u64>,
+    /// feature `test-support` が有効なときだけ crate 外から参照できる
+    /// （`super`（`process_engine` モジュール）の `pub use` /
+    /// 非公開 `use` で可視性を切り替える。Issue #528・TASK-29・`JS-1`）。
+    #[derive(Debug, Clone, Default)]
+    pub struct WorkerSpawnConfigForTest {
+        /// 子へ `super::super::worker::TEST_HEAP_LIMIT_ENV_VAR` として
+        /// 渡すヒープ上限（バイト）。`None` の場合は渡さない（本番と同じ
+        /// 既定値になる）。
+        ///
+        /// **下げることしかできない**（codex レビュー指摘 #503 P0 対応）:
+        /// 本番の既定値
+        /// （[`super::super::v8_engine::MAX_ISOLATE_HEAP_BYTES`]。128 MiB）
+        /// を上回る値を指定しても、
+        /// [`super::super::v8_engine::clamp_test_heap_limit_bytes`]
+        /// により既定値へクランプされる（`spawn_worker` が環境変数を組み立てる
+        /// 直前に適用する）。下限側も同関数がクランプする（`0` や極端に小さい
+        /// 値を渡しても、実用上動作する最小値まで引き上げられる。詳細は同関数の
+        /// ドキュメントコメント参照）。子プロセス側（`super::super::worker`）でも
+        /// 同じクランプを独立に適用しており、親を経由しない直接起動に対する
+        /// 防御になっている（多層防御）。
+        pub heap_limit_bytes: Option<usize>,
+        /// 子へ渡すプロトコルバージョンの上書き値（ハンドシェイク失敗を
+        /// 決定的に再現するためのテスト専用経路）。`None` の場合は
+        /// [`super::worker_protocol::PROTOCOL_VERSION`] を使う。
+        pub protocol_version_override: Option<u16>,
+        /// `true` にすると、子へ
+        /// [`super::super::worker::TEST_HELLO_ENGINE_OVERRIDE_ENV_VAR`]
+        /// を渡し、子が `Hello` で `EngineKind::Boa` を名乗るようにする（codex
+        /// レビュー指摘 #503 P1「Hello のエンジン種別を無視している」の回帰
+        /// テスト専用。実際の子プロセスに別のエンジン種別を名乗らせて、親
+        /// （`spawn_worker`）が拒否することを確認する）。
+        pub hello_wrong_engine_for_test: bool,
+        /// `true` にすると、子へ
+        /// [`super::super::worker::TEST_HELLO_EXTRA_BYTE_ENV_VAR`]
+        /// を渡し、子が送る `Hello` の末尾に余分な 1 バイトを付け足させる
+        /// （codex レビュー指摘 #503 P1「decode_hello が末尾の余分なバイトを
+        /// 拒否していない」の回帰テスト専用）。
+        pub hello_extra_byte_for_test: bool,
+        /// 親側の RSS 監視（継続監視・応答直後の同期確認の両方）が使う
+        /// しきい値の上書き値（バイト）。`None` の場合は
+        /// [`super::super::resource_limits::MAX_CHILD_RSS_BYTES`]（320 MiB）を使う
+        /// （codex レビュー指摘 #503 P0「macOS の JS ワーカーに強制的な
+        /// メモリ上限がない」対応で `ArrayBuffer` 確保に独自の上限
+        /// （[`super::super::resource_limits::MAX_ARRAY_BUFFER_ALLOCATION_BYTES`]。
+        /// 128 MiB）を設けたことに伴う回帰テスト専用の経路。この上限の
+        /// 導入前は、`ArrayBuffer` を際限なく確保するスクリプトで実プロセスの
+        /// RSS を本番のしきい値（320 MiB）まで実際に押し上げて RSS 監視を
+        /// 検証していたが、`ArrayBuffer` の確保自体が 128 MiB で
+        /// `RangeError` になるようになったため、その手段が使えなくなった。
+        /// RSS 監視という仕組みそのものの検証を保つため、`ArrayBuffer` の
+        /// 上限をテストのために引き上げるのではなく（引き上げは、検証したい
+        /// 安全機構自体を回避する経路になり得るため避ける）、RSS 監視の
+        /// しきい値を**本番の値より小さくする**ことだけを許す（下げることしか
+        /// できない。`heap_limit_bytes` と同じ「テスト専用の上書きは安全側
+        /// にしか動かせない」原則）。
+        ///
+        /// **下げることしかできない**: 本番の既定値
+        /// （[`super::super::resource_limits::MAX_CHILD_RSS_BYTES`]）を上回る値を
+        /// 指定しても、`spawn_worker` が `MemoryMonitor` を起動する直前に
+        /// `min(要求値, MAX_CHILD_RSS_BYTES)` へクランプする。
+        pub rss_threshold_bytes_override: Option<u64>,
+        /// Windows の子プロセスの Job Object `ProcessMemoryLimit`（バイト）の
+        /// 上書き値（`JS-1`・`TASK-29`・Issue #531）。親側の RSS 監視
+        /// （`rss_threshold_bytes_override` を `None` にした本番しきい値）が
+        /// 先に発動しない構成で、OS が確保を拒否する経路を検証するための
+        /// テスト専用経路。`None` なら本番値（384 MiB）。
+        ///
+        /// **下げることしかできない**: 本番値を超える要求は `spawn_worker` が
+        /// クランプし、子（`super::super::worker`）でも独立にクランプする。
+        /// Windows 以外では無視される。
+        pub windows_process_memory_limit_bytes_override: Option<usize>,
+    }
 }
+
+// feature `test-support` 有効時: `tests/v8_worker.rs`（結合テスト。別
+// クレート）が `fandhe_browser_js::process_engine::WorkerSpawnConfigForTest`
+// として参照できるよう再公開する（`#[doc(hidden)]` で公開 API ドキュメント
+// には出さない）。
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use spawn_config::WorkerSpawnConfigForTest;
+// feature `test-support` 無効時: crate 内でだけ使えるようにし、crate 外
+// から名前を一切付けられなくする（受入基準 1。Issue #528）。
+#[cfg(not(feature = "test-support"))]
+use spawn_config::WorkerSpawnConfigForTest;
 
 /// JS 評価を子プロセスへ分離して提供するエンジン（`JS-1`・Issue #503）。
 ///
 /// 子・パイプしか保持しないため `Send` にできる（設計書 §3.2。将来
 /// core・tokio と統合するときに有利になる）。
 ///
-/// `#[doc(hidden)] pub` である理由は [`WorkerSpawnConfigForTest`] の
-/// ドキュメントコメントを参照。`TASK-29.6`（Issue #157）で
-/// `create_engine` から配線し、`impl JsEngine for V8ProcessEngine` を
-/// 追加する（本 Issue の時点では inherent メソッドに留める）。
+/// `#[doc(hidden)] pub` である理由: `tests/v8_worker.rs`（結合テスト。
+/// 別クレートとしてコンパイルされる）が feature `test-support` 有効時に
+/// `new_for_test`・`evaluate_script` 等のテスト専用入口を参照するには、
+/// 型自体も `pub` である必要がある（`pub(crate)` は別クレートから見えない）。
+/// テスト専用メソッド自体は `#[cfg(feature = "test-support")]` で個別に
+/// gate する（[`WorkerSpawnConfigForTest`] のドキュメントコメント参照）。
+/// `TASK-29.6`（Issue #157）で `create_engine` から配線し、
+/// `impl JsEngine for V8ProcessEngine` を追加する（本 Issue の時点では
+/// inherent メソッドに留める）。
 #[doc(hidden)]
 pub struct V8ProcessEngine {
     worker: Option<WorkerHandle>,
@@ -858,7 +900,9 @@ impl V8ProcessEngine {
     }
 
     /// [`V8ProcessEngine::new`] と同じだが、[`WorkerSpawnConfigForTest`]
-    /// で子プロセスの起動条件を上書きできる（テスト専用。W6）。
+    /// で子プロセスの起動条件を上書きできる（テスト専用。W6）。feature
+    /// `test-support` 有効時のみ存在する（Issue #528）。
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn new_for_test(spawn_config: WorkerSpawnConfigForTest) -> Self {
         Self {
@@ -954,11 +998,13 @@ impl V8ProcessEngine {
     /// `#[cfg(test)]` を付けられない理由: `tests/v8_worker.rs` は別クレート
     /// としてコンパイルされる結合テストであり、`#[cfg(test)]` の項目を
     /// 参照できない（[`WorkerSpawnConfigForTest`] のドキュメントコメント
-    /// と同じ事情）。そのため、テスト専用の入口であっても本番ビルドに
-    /// 含まれる `#[doc(hidden)] pub` にせざるを得ず、外部入力と同様に
-    /// `bytes` の長さを検証する（codex レビュー指摘 #503 P0「`bytes` を
+    /// と同じ事情）。その代わり feature `test-support` で gate し（Issue
+    /// #528）、本番ビルド（`test-support` 無効）からは呼べないようにする。
+    /// 多層防御として、外部入力と同様に `bytes` の長さも検証する（codex
+    /// レビュー指摘 #503 P0「`bytes` を
     /// 長さ検証なしで `to_vec()` しており、無制限の確保経路になる」
     /// 対応）。
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn send_raw_frame_for_test(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         // 複製（`to_vec()`）の前に長さを検証する（coding-rust.md「長さ・
@@ -1011,10 +1057,37 @@ impl V8ProcessEngine {
     /// なら `None`）。codex レビュー指摘 #503 P0「ヒープ外メモリが無制限」
     /// 対応の回帰テストが、Linux で `/proc/<pid>/limits` から実際に
     /// `RLIMIT_DATA` が設定されていることを確認するために使う
-    /// （`super::resource_limits` のドキュメントコメント参照）。
+    /// （`super::resource_limits` のドキュメントコメント参照）。feature
+    /// `test-support` 有効時のみ存在する（Issue #528）。
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn worker_pid_for_test(&self) -> Option<u32> {
         self.worker.as_ref().map(|worker| worker.pid)
+    }
+
+    /// テスト専用: 子プロセスの「起動＋ハンドシェイク」だけを行い、
+    /// スクリプト評価は行わない（`TASK-29`・Issue #555・`CORE-3`・
+    /// `PERF-6`・`PERF-7`）。`crates/fandhe-browser-js/benches/
+    /// worker_spawn_latency.rs`（Issue #555）が、この呼び出し全体の
+    /// 所要時間を計測してレイテンシの実測に使う。
+    ///
+    /// 計測区間は `spawn_worker` 呼び出し（`Command::spawn` による
+    /// fork/exec・`env_clear`）から、子の Platform/Isolate 初期化・
+    /// 永続 Context 生成・`Hello` フレームの送信・親側での受信と
+    /// decode・検証完了までを含む（本ファイル内の `spawn_worker` の
+    /// ドキュメントコメント参照。private のため intra-doc link は張らない）。
+    ///
+    /// 既に子プロセスを保持している場合は二重起動せず何もしない
+    /// （[`Self::evaluate_script`] と同じ「子が無ければ起動する」遅延
+    /// 起動の作法に合わせる）。feature `test-support` 有効時のみ存在する
+    /// （Issue #528 と同じ隔離方針）。
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn spawn_worker_for_test(&mut self) -> Result<(), JsEngineError> {
+        if self.worker.is_none() {
+            self.worker = Some(self.spawn_worker()?);
+        }
+        Ok(())
     }
 
     /// テスト専用: [`evaluate_script`](Self::evaluate_script) が事前検証
@@ -1022,7 +1095,9 @@ impl V8ProcessEngine {
     /// P1「親は子より大きい入力を受け付ける」の回帰テストが、`tests/`
     /// 配下の結合テスト（別クレート）から `super::v8_engine::MAX_SCRIPT_SOURCE_BYTES`
     /// （`pub(crate)`）へ直接アクセスできないため、定数の値だけを最小限
-    /// 公開する（`v8` crate の型は一切介さない）。
+    /// 公開する（`v8` crate の型は一切介さない）。feature `test-support`
+    /// 有効時のみ存在する（Issue #528）。
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn max_script_source_bytes_for_test() -> usize {
         super::v8_engine::MAX_SCRIPT_SOURCE_BYTES
@@ -1035,7 +1110,9 @@ impl V8ProcessEngine {
     /// [`max_script_source_bytes_for_test`](Self::max_script_source_bytes_for_test)
     /// と同じ理由（`tests/` 配下の結合テストは別クレートであり、
     /// `MAX_RAW_FRAME_BYTES_FOR_TEST`（非 `pub`）へ直接アクセスできない）
-    /// で、定数の値だけを最小限公開する。
+    /// で、定数の値だけを最小限公開する。feature `test-support` 有効時
+    /// のみ存在する（Issue #528）。
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn max_raw_frame_bytes_for_test() -> usize {
         MAX_RAW_FRAME_BYTES_FOR_TEST
@@ -1094,6 +1171,30 @@ impl V8ProcessEngine {
             // テスト専用（codex レビュー指摘 #503 P1）。値の内容は
             // `super::worker` 側では読まず、変数の有無だけを見る。
             command.env(super::worker::TEST_HELLO_EXTRA_BYTE_ENV_VAR, "1");
+        }
+        #[cfg(windows)]
+        {
+            if let Some(requested) = self
+                .spawn_config
+                .windows_process_memory_limit_bytes_override
+            {
+                // テスト専用（Issue #531）。本番の `new()` は常に `None`。
+                // 本番値を超えられないよう、環境変数を組み立てる直前にクランプする。
+                command.env(
+                    super::worker::TEST_WINDOWS_PROCESS_MEMORY_LIMIT_ENV_VAR,
+                    super::resource_limits::clamp_test_windows_process_memory_limit_bytes(
+                        requested,
+                    )
+                    .to_string(),
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            // Windows 専用の上書き。他 OS では効果が無いため読み捨てる。
+            let _ = self
+                .spawn_config
+                .windows_process_memory_limit_bytes_override;
         }
         #[cfg(windows)]
         {
@@ -1176,6 +1277,12 @@ impl V8ProcessEngine {
                 }
             }
             Ok(ReaderEvent::Frame(other_tag, _)) => {
+                // `NATIVE_CALL`（tag 5）はハンドシェイク前には来ないはず
+                // （送信は子側の永続 Context が評価中に限られる。§3.1）。
+                // 親側の `NATIVE_CALL` dispatch 自体は別 Issue（#526）で
+                // 追加するが、ハンドシェイク段階で受け取った場合はそれでも
+                // プロトコル違反として fail-closed に kill する（本分岐は
+                // #526 完了後も変わらない）。
                 worker.terminate_now();
                 let tail = worker.reap_and_collect_stderr();
                 Err(handshake_discard_error(&worker, &tail, || {
@@ -1446,6 +1553,13 @@ impl V8ProcessEngine {
                 apply_post_response_rss_check(worker, outcome, keep)
             }
             Ok(ReaderEvent::Frame(other_tag, _)) => {
+                // JS-1・Issue #511: 子は `NATIVE_CALL`（tag 5）を送りうる
+                // （子側のプロキシ関数が呼ばれた場合）。親側の dispatch
+                // （`NativeFn` の実行・`NATIVE_RETURN` の返信）は別 Issue
+                // （#526）で追加する。それまでは `NATIVE_CALL` を含む
+                // あらゆる想定外のタグをプロトコル違反として扱い、
+                // fail-closed に子を kill する（本番の子は #155 完了まで
+                // プロキシを登録する手段が無いため、この分岐には到達しない）。
                 worker.terminate_now();
                 let tail = worker.reap_and_collect_stderr();
                 let err = discard_context_error(worker, &tail, || {
