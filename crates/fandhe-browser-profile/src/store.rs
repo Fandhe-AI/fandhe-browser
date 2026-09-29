@@ -11,14 +11,17 @@
 //!   [`ProfileStore::open_or_create`] が [`ProfileError::InvalidLayout`] で拒否する
 //! - ルート経路上の symlink の検証は [`Profile::open`] がハンドル基準で行う
 //!   （`PROF-1`・`PROF-4`）。macOS の `/var` のような OS 標準の symlink を含む
-//!   パスは、[`Profile::open`] の doc と同様に事前の `canonicalize` が必要
+//!   パス（Linux の `/home` 等も含む）は、[`Profile::open`] の doc と同様に事前の
+//!   `canonicalize` が必要（[`OsDefaultStore`] は OS 標準の基点ディレクトリ
+//!   （`$HOME` 等）だけを実体パスへ解決し、アプリ用の固定サフィックスは解決しない）
 //!
 //! ## スタブについて（`code-comment-style.md`・REPAIR-3）
 //!
-//! 本モジュールはトレイト定義のみで、具象型は未実装である。
+//! 具象型は OS 既定パス解決の [`OsDefaultStore`] のみ実装済みである。
 //!
-//! - OS 既定パスの解決（`directories` は #200 の判断で不採用。std の環境変数で
-//!   自前解決する）: #202（TASK-60（60.3））
+//! - OS 既定パスの解決は [`OsDefaultStore`]（TASK-60（60.3）・#202）。
+//!   `directories` は #200 の判断（推移的依存 `option-ext` が MPL-2.0）で不採用と
+//!   し、std の環境変数だけで自前解決する
 //! - 明示指定による上書き（`RootSource::Explicit`。`PROF-1`）: #203（TASK-60（60.4））
 //! - 削除（`PROF-5`）: #188（TASK-53（53.2））。[`ProfileStore::delete`] の既定実装は
 //!   成功を装わず [`ProfileError::Unsupported`] を返す
@@ -27,7 +30,8 @@
 //!   [`Profile::open`] は `Unsupported` を返し、[`ProfileStore::open_or_create`] も
 //!   それをそのまま伝える
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 
 use crate::profile::{Profile, ProfileError};
 
@@ -35,7 +39,7 @@ use crate::profile::{Profile, ProfileError};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RootSource {
-    /// OS 慣習に基づく既定保存先（`XOS-7`。#202 で実装）。
+    /// OS 慣習に基づく既定保存先（`XOS-7`。[`OsDefaultStore`]）。
     OsDefault,
     /// 呼び出し元による明示指定（`PROF-1`。#203 で実装）。
     ///
@@ -114,6 +118,170 @@ pub trait ProfileStore {
             reason: "profile deletion is not implemented yet (tracked by PROF-5 / TASK-53)",
         })
     }
+}
+
+/// 既定プロファイルルートのアプリディレクトリ名（`XOS-7`）。
+///
+/// OS 慣習のデータ置き場（XDG データ・Application Support・LocalAppData）直下に
+/// この名前のディレクトリを作り、そのディレクトリ自体をプロファイルルートとする。
+pub const APP_DIR_NAME: &str = "fandhe-browser";
+
+/// OS 慣習に従って既定のプロファイルルートを解決する [`ProfileStore`]
+/// （`XOS-7`、TASK-60（60.3）・#202、MS-3）。
+///
+/// `fandhe-browser-cli`（TASK-41 で追加予定）が、明示指定がないときの保存先として
+/// 使う。解決規則（いずれも `<app>` は [`APP_DIR_NAME`]）:
+///
+/// - Linux 等（macOS 以外の Unix）: `$XDG_DATA_HOME/<app>`。未設定・空・相対パス・
+///   `..` 含みのときは XDG Base Directory 仕様どおり無視し `$HOME/.local/share/<app>`
+/// - macOS: `$HOME/Library/Application Support/<app>`
+/// - Windows: `%LOCALAPPDATA%\<app>`
+/// - 上記以外: 既定値を持たないため [`ProfileError::DefaultRootUnavailable`]
+///
+/// 必要な環境変数が使えなければ暗黙の代替先へ落とさず
+/// [`ProfileError::DefaultRootUnavailable`] を返す（fail-closed）。プロセスの環境変数は
+/// 書き換えない。明示指定による上書き（`RootSource::Explicit`）は #203（TASK-60（60.4））
+/// が担う。
+#[derive(Debug, Clone, Default)]
+pub struct OsDefaultStore {
+    _private: (),
+}
+
+impl OsDefaultStore {
+    /// 実行中の OS の慣習で既定パスを解決するストアを作る。
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ProfileStore for OsDefaultStore {
+    fn resolve_root(&self) -> Result<ResolvedRoot, ProfileError> {
+        let (base, tail) = platform_default_parts(&|key| std::env::var_os(key))?;
+        Ok(ResolvedRoot::new(
+            canonicalize_base(&base).join(tail),
+            RootSource::OsDefault,
+        ))
+    }
+}
+
+/// OS 標準の基点ディレクトリ（`$HOME`・`$XDG_DATA_HOME`・`%LOCALAPPDATA%`）を
+/// 実体パスへ解決する（`XOS-7`・`PROF-1`・`PROF-4`）。
+///
+/// [`Profile::open`] は祖先の symlink を拒否する（`PROF-1`・`PROF-4`）が、macOS の
+/// `/var` や Linux の `/home`、`$HOME` 自体が symlink の環境では、OS 標準の経路でも
+/// 祖先に symlink が含まれる。そこで信頼できる基点（環境変数で利用者自身が指定する
+/// ディレクトリ）だけを `canonicalize` する。基点に付けるアプリ用サフィックス
+/// （`.local/share/<app>` 等）は呼び出し側が解決後に連結するため解決されず、
+/// サフィックス内の symlink は従来どおり [`Profile::open`] が拒否する
+/// （プロファイル境界は弱めない）。基点が存在しない・解決できない場合と Unix 以外
+/// （Windows の `canonicalize` は verbatim パスを返し、かつ [`Profile::open`] が
+/// 未対応）では、そのまま返して [`Profile::open`] の検証に委ねる。
+fn canonicalize_base(base: &Path) -> PathBuf {
+    if cfg!(unix)
+        && let Ok(resolved) = base.canonicalize()
+    {
+        return resolved;
+    }
+    base.to_path_buf()
+}
+
+/// 環境変数の値をベースディレクトリとして採用できるか検証する。
+///
+/// 空・相対パス・`..` を含むものは採用しない（カレントディレクトリ次第で保存先が
+/// 変わる・境界外へ抜ける経路を作らないため。security.md「プロファイル境界」）。
+fn usable_base(value: Option<OsString>) -> Option<PathBuf> {
+    let path = PathBuf::from(value?);
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        return None;
+    }
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return None;
+    }
+    Some(path)
+}
+
+/// XDG 系（macOS 以外の Unix）の既定ルート。`env` は環境変数の参照関数（テスト注入用）。
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn resolve_xdg<F: Fn(&str) -> Option<OsString>>(
+    env: &F,
+) -> Result<(PathBuf, PathBuf), ProfileError> {
+    if let Some(data_home) = usable_base(env("XDG_DATA_HOME")) {
+        return Ok((data_home, PathBuf::from(APP_DIR_NAME)));
+    }
+    match usable_base(env("HOME")) {
+        Some(home) => Ok((
+            home,
+            PathBuf::from(".local").join("share").join(APP_DIR_NAME),
+        )),
+        None => Err(ProfileError::DefaultRootUnavailable {
+            reason: "neither XDG_DATA_HOME nor HOME is set to an absolute path",
+        }),
+    }
+}
+
+/// macOS の既定ルート。XDG 系の変数は参照しない。
+#[cfg(any(target_os = "macos", test))]
+fn resolve_macos<F: Fn(&str) -> Option<OsString>>(
+    env: &F,
+) -> Result<(PathBuf, PathBuf), ProfileError> {
+    match usable_base(env("HOME")) {
+        Some(home) => Ok((
+            home,
+            PathBuf::from("Library")
+                .join("Application Support")
+                .join(APP_DIR_NAME),
+        )),
+        None => Err(ProfileError::DefaultRootUnavailable {
+            reason: "HOME is not set to an absolute path",
+        }),
+    }
+}
+
+/// Windows の既定ルート。`USERPROFILE` 等へはフォールバックしない。
+#[cfg(any(windows, test))]
+fn resolve_windows<F: Fn(&str) -> Option<OsString>>(
+    env: &F,
+) -> Result<(PathBuf, PathBuf), ProfileError> {
+    match usable_base(env("LOCALAPPDATA")) {
+        Some(local) => Ok((local, PathBuf::from(APP_DIR_NAME))),
+        None => Err(ProfileError::DefaultRootUnavailable {
+            reason: "LOCALAPPDATA is not set to an absolute path",
+        }),
+    }
+}
+
+/// 実行中の OS に対応する解決規則へ振り分け、（基点, アプリ用サフィックス）を返す。
+#[cfg(target_os = "macos")]
+fn platform_default_parts<F: Fn(&str) -> Option<OsString>>(
+    env: &F,
+) -> Result<(PathBuf, PathBuf), ProfileError> {
+    resolve_macos(env)
+}
+
+/// 実行中の OS に対応する解決規則へ振り分け、（基点, アプリ用サフィックス）を返す。
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_default_parts<F: Fn(&str) -> Option<OsString>>(
+    env: &F,
+) -> Result<(PathBuf, PathBuf), ProfileError> {
+    resolve_xdg(env)
+}
+
+/// 実行中の OS に対応する解決規則へ振り分け、（基点, アプリ用サフィックス）を返す。
+#[cfg(windows)]
+fn platform_default_parts<F: Fn(&str) -> Option<OsString>>(
+    env: &F,
+) -> Result<(PathBuf, PathBuf), ProfileError> {
+    resolve_windows(env)
+}
+
+/// 実行中の OS に対応する解決規則へ振り分ける（既定値の定義がない OS）。
+#[cfg(not(any(unix, windows)))]
+fn platform_default_parts<F: Fn(&str) -> Option<OsString>>(
+    _env: &F,
+) -> Result<(PathBuf, PathBuf), ProfileError> {
+    Err(ProfileError::DefaultRootUnavailable {
+        reason: "no OS default profile location is defined for this platform",
+    })
 }
 
 #[cfg(test)]
@@ -246,5 +414,247 @@ mod tests {
             Err(ProfileError::Locked { .. })
         ));
         drop(profile);
+    }
+
+    // ---- OsDefaultStore（XOS-7・TASK-60（60.3）） ----
+
+    use std::collections::HashMap;
+
+    fn env_of(pairs: &[(&'static str, OsString)]) -> impl Fn(&str) -> Option<OsString> + use<> {
+        let map: HashMap<&'static str, OsString> = pairs.iter().cloned().collect();
+        move |key| map.get(key).cloned()
+    }
+
+    fn abs(name: &str) -> PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
+    fn os(p: &Path) -> OsString {
+        p.as_os_str().to_os_string()
+    }
+
+    fn joined(r: Result<(PathBuf, PathBuf), ProfileError>) -> PathBuf {
+        let (base, tail) = r.unwrap();
+        base.join(tail)
+    }
+
+    fn unavailable(r: Result<(PathBuf, PathBuf), ProfileError>) -> &'static str {
+        match r {
+            Err(ProfileError::DefaultRootUnavailable { reason }) => reason,
+            other => panic!("expected DefaultRootUnavailable, got {other:?}"),
+        }
+    }
+
+    /// XOS-7: XDG_DATA_HOME が絶対パスならその直下。
+    #[test]
+    fn xos_7_xdg_uses_xdg_data_home() {
+        let xdg = abs("xdg-data");
+        let env = env_of(&[("XDG_DATA_HOME", os(&xdg)), ("HOME", os(&abs("home")))]);
+        assert_eq!(joined(resolve_xdg(&env)), xdg.join("fandhe-browser"));
+    }
+
+    /// XOS-7: XDG_DATA_HOME が空・相対・`..` 含みなら HOME の `.local/share` へ。
+    #[test]
+    fn xos_7_xdg_falls_back_to_home() {
+        let home = abs("home");
+        let expected = home.join(".local").join("share").join("fandhe-browser");
+        let bad_values = [
+            OsString::new(),
+            OsString::from("relative-data"),
+            os(&abs("a").join("..").join("b")),
+        ];
+        for bad in bad_values {
+            let env = env_of(&[("XDG_DATA_HOME", bad), ("HOME", os(&home))]);
+            assert_eq!(joined(resolve_xdg(&env)), expected);
+        }
+        let env = env_of(&[("HOME", os(&home))]);
+        assert_eq!(joined(resolve_xdg(&env)), expected);
+    }
+
+    /// XOS-7: XDG_DATA_HOME も HOME も使えなければ fail-closed。
+    #[test]
+    fn xos_7_xdg_errors_without_usable_env() {
+        let env = env_of(&[("HOME", OsString::from("relative-home"))]);
+        assert_eq!(
+            unavailable(resolve_xdg(&env)),
+            "neither XDG_DATA_HOME nor HOME is set to an absolute path"
+        );
+        assert_eq!(
+            unavailable(resolve_xdg(&env_of(&[]))),
+            "neither XDG_DATA_HOME nor HOME is set to an absolute path"
+        );
+    }
+
+    /// XOS-7: macOS は Application Support。XDG_DATA_HOME は無視する。
+    #[test]
+    fn xos_7_macos_uses_application_support() {
+        let home = abs("mac-home");
+        let env = env_of(&[("HOME", os(&home)), ("XDG_DATA_HOME", os(&abs("ignored")))]);
+        assert_eq!(
+            joined(resolve_macos(&env)),
+            home.join("Library")
+                .join("Application Support")
+                .join("fandhe-browser")
+        );
+    }
+
+    /// XOS-7: macOS で HOME が無い・相対ならエラー。
+    #[test]
+    fn xos_7_macos_errors_without_home() {
+        for env in [
+            env_of(&[]),
+            env_of(&[("HOME", OsString::from("relative-home"))]),
+        ] {
+            assert_eq!(
+                unavailable(resolve_macos(&env)),
+                "HOME is not set to an absolute path"
+            );
+        }
+    }
+
+    /// XOS-7: Windows は LOCALAPPDATA 直下。
+    #[test]
+    fn xos_7_windows_uses_local_app_data() {
+        let local = abs("local-app-data");
+        let env = env_of(&[("LOCALAPPDATA", os(&local))]);
+        assert_eq!(joined(resolve_windows(&env)), local.join("fandhe-browser"));
+    }
+
+    /// XOS-7: Windows で LOCALAPPDATA が未設定・空・相対ならエラー（HOME 等へ落とさない）。
+    #[test]
+    fn xos_7_windows_errors_without_local_app_data() {
+        for env in [
+            env_of(&[("HOME", os(&abs("home")))]),
+            env_of(&[("LOCALAPPDATA", OsString::new())]),
+            env_of(&[("LOCALAPPDATA", OsString::from("relative"))]),
+        ] {
+            assert_eq!(
+                unavailable(resolve_windows(&env)),
+                "LOCALAPPDATA is not set to an absolute path"
+            );
+        }
+    }
+
+    /// XOS-7: Linux 等でディスパッチャが XDG 規則を選ぶ。
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn xos_7_dispatcher_selects_xdg() {
+        let xdg = abs("dispatch-xdg");
+        let env = env_of(&[("XDG_DATA_HOME", os(&xdg))]);
+        assert_eq!(
+            joined(platform_default_parts(&env)),
+            xdg.join("fandhe-browser")
+        );
+    }
+
+    /// XOS-7: macOS でディスパッチャが Application Support 規則を選ぶ。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn xos_7_dispatcher_selects_application_support() {
+        let home = abs("dispatch-home");
+        let env = env_of(&[("HOME", os(&home))]);
+        assert_eq!(
+            joined(platform_default_parts(&env)),
+            home.join("Library")
+                .join("Application Support")
+                .join("fandhe-browser")
+        );
+    }
+
+    /// XOS-7: Windows でディスパッチャが LOCALAPPDATA 規則を選ぶ。
+    #[cfg(windows)]
+    #[test]
+    fn xos_7_dispatcher_selects_local_app_data() {
+        let local = abs("dispatch-local");
+        let env = env_of(&[("LOCALAPPDATA", os(&local))]);
+        assert_eq!(
+            joined(platform_default_parts(&env)),
+            local.join("fandhe-browser")
+        );
+    }
+
+    /// XOS-7: 実環境での解決結果の構造（ディレクトリは作成しない）。
+    #[test]
+    fn xos_7_os_default_store_resolves_real_env_shape() {
+        // HOME / LOCALAPPDATA 等が未設定の有効な環境では契約どおり
+        // DefaultRootUnavailable になるため、その場合は形状検査を行わない。
+        let resolved = match OsDefaultStore::new().resolve_root() {
+            Ok(resolved) => resolved,
+            Err(ProfileError::DefaultRootUnavailable { .. }) => return,
+            Err(other) => panic!("unexpected error: {other:?}"),
+        };
+        assert_eq!(resolved.source(), RootSource::OsDefault);
+        assert!(resolved.path().is_absolute());
+        assert_eq!(
+            resolved.path().file_name(),
+            Some(std::ffi::OsStr::new("fandhe-browser"))
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            resolved
+                .path()
+                .parent()
+                .unwrap()
+                .ends_with("Library/Application Support")
+        );
+    }
+
+    /// XOS-7・PROF-1: 基点が symlink 経由（Linux の `/home` 等）でも実体へ解決され開ける。
+    /// 基点が存在しなければそのまま返す。
+    #[cfg(unix)]
+    #[test]
+    fn xos_7_canonicalize_base_resolves_symlinked_base() {
+        let tmp = TempDir::new();
+        let real = tmp.0.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let base = canonicalize_base(&link);
+        assert_eq!(base, real);
+        let root = base.join(".local").join("share").join("fandhe-browser");
+        assert!(Profile::open(&root).is_ok());
+
+        let missing = tmp.0.join("missing");
+        assert_eq!(canonicalize_base(&missing), missing);
+    }
+
+    /// PROF-1: 基点配下のアプリ用サフィックスが symlink なら解決されず、
+    /// `Profile::open` が拒否する（基点だけを解決しサフィックスは検証に委ねる）。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_symlinked_suffix_stays_rejected() {
+        let tmp = TempDir::new();
+        let base = tmp.0.join("home");
+        let target = tmp.0.join("elsewhere");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let leaf = base.join("fandhe-browser");
+        std::os::unix::fs::symlink(&target, &leaf).unwrap();
+
+        let root = canonicalize_base(&base).join("fandhe-browser");
+        assert_eq!(root, leaf);
+        assert!(matches!(
+            Profile::open(&root),
+            Err(ProfileError::InvalidLayout { .. })
+        ));
+    }
+
+    /// XOS-7: `$XDG_DATA_HOME` 自体が symlink でも `OsDefaultStore` 相当の解決で
+    /// プロファイルを開ける（Linux で `$HOME` が symlink の環境の再現）。
+    #[cfg(unix)]
+    #[test]
+    fn xos_7_symlinked_data_home_opens_profile() {
+        let tmp = TempDir::new();
+        let real = tmp.0.join("real-data");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.0.join("link-data");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let env = env_of(&[("XDG_DATA_HOME", os(&link))]);
+        let (base, tail) = resolve_xdg(&env).unwrap();
+        let root = canonicalize_base(&base).join(tail);
+        assert_eq!(root, real.join("fandhe-browser"));
+        assert!(Profile::open(&root).is_ok());
     }
 }

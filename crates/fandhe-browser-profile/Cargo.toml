@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "プロファイル分離 crate（fandhe-browser）。Profile 型の骨格・パストラバーサル防止ユーティリティ・advisory lock を実装（TASK-50（50.1・50.2・50.3））"
+description = "プロファイル分離 crate（fandhe-browser）。Profile 型の骨格・パストラバーサル防止ユーティリティ・advisory lock・ProfileStore と OS 慣習パス解決を実装（TASK-50（50.1・50.2・50.3）・TASK-60（60.2・60.3））"
 
 # unix 限定。ディレクトリハンドル基準の openat/mkdirat/fchmod で TOCTOU を
 # 解消するために使う（PR #437 レビュー指摘対応・ビヘイビア PROF-1）。
