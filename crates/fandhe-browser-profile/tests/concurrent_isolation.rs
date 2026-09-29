@@ -373,15 +373,37 @@ fn check_after_write(
             continue;
         }
         let text = String::from_utf8_lossy(&bytes);
+        let mut marker_found = false;
         for other in (0..profile_count).filter(|&m| m != owner) {
             if text.contains(&format!("profile-{other}:")) {
+                marker_found = true;
                 found.push(format!(
                     "profile-{owner} {kind:?}: contains marker of profile-{other} ({text:?})"
                 ));
             }
         }
+        // 他プロファイルのファイルは空（truncate 直後）か、所有者が書き得る
+        // ペイロード形式に完全一致する内容のみ許容する。途中まで書かれた・
+        // 壊れた内容（他プロファイルのマーカーを含まないもの）も指摘にする。
+        if !marker_found && !bytes.is_empty() && !is_owner_payload(owner, &text) {
+            found.push(format!(
+                "profile-{owner} {kind:?}: content is not a valid payload of profile-{owner} ({text:?})"
+            ));
+        }
     }
     found
+}
+
+/// `text` が `owner` のワーカーが書き得るペイロード
+/// `profile-{owner}:write-{j:04}\n`（`j` は 4 桁以上の 10 進数）と完全一致するか。
+fn is_owner_payload(owner: usize, text: &str) -> bool {
+    let Some(rest) = text.strip_prefix(&format!("profile-{owner}:write-")) else {
+        return false;
+    };
+    let Some(digits) = rest.strip_suffix('\n') else {
+        return false;
+    };
+    digits.len() >= 4 && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `thread::Result` の `Err` ペイロード（`Box<dyn Any + Send>`）から panic
@@ -1107,4 +1129,39 @@ fn prof_3_own_file_read_failure_is_reported() {
     let found = check_after_write(tmp.path(), 0, kind, "profile-0:write-0000\n", PROFILE_COUNT);
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("failed to read"), "{found:?}");
+}
+
+/// `PROF-3`・#185（陰性対照）: 他プロファイルのファイルに、他プロファイルの
+/// マーカーを含まない壊れた・途中までの内容があっても指摘されること。
+/// 空・所有者の正規ペイロードは許容される。
+#[test]
+fn prof_3_corrupted_other_profile_content_is_detected() {
+    let tmp = TempDir::new();
+    let kind = DataKind::ALL[0];
+    let mut profiles = Vec::new();
+    for i in 0..PROFILE_COUNT {
+        profiles.push(Profile::open(tmp.path().join(format!("profile-{i}"))).expect("open"));
+    }
+    let own = "profile-0:write-0000\n";
+    write_once(&profiles[0], kind, own.as_bytes()).expect("write");
+
+    // 空（truncate 直後）と正規ペイロードは正常。
+    write_once(&profiles[1], kind, b"").expect("空書き込み");
+    assert_eq!(
+        check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT),
+        Vec::<String>::new()
+    );
+    write_once(&profiles[1], kind, b"profile-1:write-0007\n").expect("正規");
+    assert_eq!(
+        check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT),
+        Vec::<String>::new()
+    );
+
+    // 途中まで書かれた内容・ゴミ・改行欠落は指摘になる。
+    for corrupted in [&b"profile-1:wri"[..], b"garbage\n", b"profile-1:write-0007"] {
+        write_once(&profiles[1], kind, corrupted).expect("壊れた内容");
+        let found = check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT);
+        assert_eq!(found.len(), 1, "{corrupted:?}: {found:?}");
+        assert!(found[0].contains("not a valid payload"), "{found:?}");
+    }
 }
