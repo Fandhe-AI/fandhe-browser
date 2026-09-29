@@ -60,6 +60,10 @@
 //!   データ行の圧縮 1 行表現も実装済み（TASK-12.3・Issue #81。
 //!   [`compress_table::compress_rows`]・統合前のため呼び出し元なし）。
 //!   `truncated_rows` 注記（#82）・ツリー構築への統合（#83）・回帰テスト（#84）は未実装
+//! - データ葉（非インタラクティブなデータ値）の検出（`AISNAP-3`・`TASK-13`・
+//!   `MS-2`）。`td`/`th` の検出は実装済み（TASK-13.1・Issue #86。
+//!   [`data_leaf`]）。価格クラス名パターン（#87）・snapshot 構築への統合（#88）は
+//!   未実装
 //! - `/ai/*` ルータ向けスナップショット API（`AISNAP-6`・`AISNAP-14`・`CDP-1`
 //!   （API 単体動作は `AISNAP-7`）、`TASK-19`（単体動作確認は `TASK-20`）、
 //!   `MS-4`）
@@ -68,4 +72,5 @@
 //!   `PLUG-2`、`TASK-92`、`MS-9`）
 
 pub mod compress_table;
+pub mod data_leaf;
 pub mod snapshot;
