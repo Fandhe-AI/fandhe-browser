@@ -53,10 +53,11 @@ pub struct NavigationResult {
 }
 
 impl fmt::Debug for NavigationResult {
-    /// ページ HTML をログへ漏らさないよう、HTML は長さだけを出力する（`AppState` の方針と揃える）。
+    /// URL（クエリ・フラグメントにトークン等の秘密情報を含み得る）と HTML をログへ漏らさないよう、
+    /// どちらも長さだけを出力する（`AppState` の方針と揃える。security.md の秘密情報 P0）。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NavigationResult")
-            .field("url", &self.url)
+            .field("url_len", &self.url.len())
             .field("html_len", &self.html.len())
             .finish_non_exhaustive()
     }
@@ -211,10 +212,17 @@ impl NavigationState {
         self.replace_if_current(generation, Some(Arc::new(result)))
     }
 
-    /// `about:blank` 相当として HTML と URL を同時に空にする。世代の判定は
-    /// [`Self::commit_navigation`] と同じ。
+    /// `about:blank`（URL は `about:blank`・HTML は空）へ遷移済みの結果を同時に保存する。世代の
+    /// 判定は [`Self::commit_navigation`] と同じ。
+    ///
+    /// `None` を保存しないため、[`Self::latest`] の利用者は「`about:blank` へ遷移済み」
+    /// （`Some`・`url() == "about:blank"`）と「取得中・取得失敗で結果なし」（`None`）を区別できる
+    /// （`CDP-1`・`AISNAP-6`）。
     pub fn clear_navigation(&self, generation: NavigationGeneration) -> Result<(), StateError> {
-        self.replace_if_current(generation, None)
+        self.replace_if_current(
+            generation,
+            Some(Arc::new(NavigationResult::new("about:blank", ""))),
+        )
     }
 
     /// 直近の結果を返す。ロック内では `Arc` の clone だけを行い、HTML をコピーしない。
@@ -312,7 +320,12 @@ mod tests {
         let r = NavigationResult::new("https://example.com/", "<p>secret-body</p>");
         let d = format!("{r:?}");
         assert!(d.contains("html_len: 18"), "{d}");
+        assert!(d.contains("url_len: 20"), "{d}");
         assert!(!d.contains("secret-body"), "{d}");
+        let t = NavigationResult::new("https://example.com/?token=secret-token", "");
+        let d = format!("{t:?}");
+        assert!(!d.contains("secret-token"), "{d}");
+        assert!(!d.contains("example.com"), "{d}");
         let s = NavigationState::new();
         let g = s.begin_navigation().unwrap();
         s.commit_navigation(g, r).unwrap();
@@ -380,7 +393,10 @@ mod tests {
         assert_eq!(s.latest().unwrap().url(), "https://a/");
         // begin_navigation を挟まず、保存済み結果を clear_navigation 自体が消すことを検証する。
         s.clear_navigation(g).unwrap();
-        assert!(s.latest().is_none());
+        // about:blank へ遷移済みであることが None（結果なし）と区別できる。
+        let blank = s.latest().unwrap();
+        assert_eq!(blank.url(), "about:blank");
+        assert_eq!(blank.html(), "");
         // 古い世代での clear は拒否され、新しい結果を消さない。
         let g2 = s.begin_navigation().unwrap();
         s.commit_navigation(g2, NavigationResult::new("https://b/", "b"))
