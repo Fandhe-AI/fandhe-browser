@@ -28,7 +28,10 @@
 //!   まだ書かない（29.4「グローバル関数注入」・29.5「DOM 風バインディング」
 //!   と並行して進めるため、共有の impl ブロックを編集し合うコンフリクトを
 //!   避ける）
-//! - DOM 風オブジェクトバインディング（`TASK-29.5`・Issue #156）
+//! - DOM 風オブジェクトバインディング（`TASK-29.5`・Issue #156）。型と
+//!   フレームの定義（`JsValue::ObjectHandle`・`BIND_DOM_LIKE_OBJECT`。
+//!   `TASK-29.5a`・Issue #524）のみ済みで、子のプロキシ生成・親の
+//!   dispatch は Issue #525（`TASK-29.5b`）
 //!
 //! なお、親→子の登録フレーム（`REGISTER_GLOBAL_FUNCTION`）による
 //! **グローバル関数注入**（`TASK-29.4`・Issue #155）は実装済みで、
@@ -1176,6 +1179,10 @@ fn value_to_js_value(
 /// [`native_proxy_callback`] から使う。`JsValue` の全 variant を扱えるため
 /// `Option` を返す（`v8::String::new`・`v8::Number::new` は理論上
 /// アロケーション失敗で `None` を返しうる）。
+///
+/// [`JsValue::ObjectHandle`] は Issue #525（`TASK-29.5b`）でプロキシ化する
+/// まで未対応のため `None` を返す（呼び出し元が JS の `Error` を投げる。
+/// 別の値へ黙って変換しない。REPAIR-3）。
 #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 fn js_value_to_v8_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -1187,6 +1194,7 @@ fn js_value_to_v8_value<'s>(
         JsValue::Bool(b) => v8::Boolean::new(scope, *b).into(),
         JsValue::Number(n) => v8::Number::new(scope, *n).into(),
         JsValue::String(s) => v8::String::new(scope, s)?.into(),
+        JsValue::ObjectHandle(_) => return None,
     })
 }
 
@@ -1222,7 +1230,9 @@ fn new_native_proxy_function<'s>(
 /// が実際に書き込むバイト数（タグ 1 バイト＋種別ごとの値）を見積もる。
 ///
 /// 表現形式は [`worker_protocol::encoded_js_value_len`] と手作業で
-/// 同期する必要がある（変更時は両方を更新すること）。
+/// 同期する必要がある（変更時は両方を更新すること）。V8 の値からは現時点で
+/// handle は生じない。Issue #525 で handle を引数として送れるようにする際は
+/// `encoded_js_value_len` の 5 バイト（タグ 1＋`u32` ID）と同期すること。
 /// `js_1_native_proxy_function_rejects_oversized_argument_payload_without_calling_transport`
 /// が、複数引数の合計サイズが上限を超えるケースで transport が呼ばれない
 /// ことを確認している。
@@ -2409,6 +2419,30 @@ mod tests {
             .evaluate_script("hostAdd()", &EvaluateOptions::default())
             .expect("the proxy function must be reachable after overwriting the accessor");
         assert_eq!(result, JsValue::Number(9.0));
+    }
+
+    /// JS-1・TASK-29.5a・Issue #524: 親が [`JsValue::ObjectHandle`] を返した
+    /// 場合、#525 でプロキシ化するまでは別の値へ黙って変換せず、JS 側で
+    /// catch できる `Error` になること（未対応であることを表面化させる）。
+    #[test]
+    fn js_1_native_proxy_function_surfaces_object_handle_as_catchable_error() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        engine
+            .install_native_proxy_global("hostGet", 1)
+            .expect("installing the proxy function must succeed");
+        engine.set_native_call_transport(Box::new(ScriptedTransport {
+            script: std::collections::VecDeque::from([Ok(NativeReturn::Ok(
+                JsValue::ObjectHandle(crate::engine_trait::ObjectHandle::from_raw(3)),
+            ))]),
+            calls: Vec::new(),
+        }));
+        let result = engine
+            .evaluate_script(
+                "try { hostGet(); 'no error' } catch (e) { e instanceof Error ? 'caught' : 'other' }",
+                &EvaluateOptions::default(),
+            )
+            .expect("the error must be catchable and the engine must remain usable");
+        assert_eq!(result, JsValue::String("caught".to_string()));
     }
 
     /// JS-1・Issue #511・PR #533 codex レビュー指摘 P1: `globalThis` に

@@ -86,7 +86,7 @@ pub mod process_engine;
 
 pub use engine_trait::{
     CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsEngineError, JsValue,
-    NativeCallContext, NativeFn, bundled_engines, create_engine,
+    NativeCallContext, NativeFn, ObjectHandle, bundled_engines, create_engine,
 };
 
 /// この呼び出しが JS 評価用の子プロセスとして起動されたものかどうかを

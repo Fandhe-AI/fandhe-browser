@@ -35,6 +35,13 @@
 //!   [`decode_register_global_function`]）。応答は `RESULT(Undefined)`
 //!   （成功）または `ERROR{Binding}`（登録失敗）。`JS-1`・`TASK-29.4`・
 //!   Issue #155
+//! - [`tag::BIND_DOM_LIKE_OBJECT`]: 親 → 子。DOM 風オブジェクトの bind
+//!   （handle ID・グローバル名・メンバー名と `NativeCall` ID の対応表。
+//!   [`encode_bind_dom_like_object`]/[`decode_bind_dom_like_object`]）。
+//!   応答は `RESULT(Undefined)`（成功）または `ERROR{Binding}`（失敗）。
+//!   **定義のみ**: 子の処理・親の送信は Issue #525（`TASK-29.5b`）で実装
+//!   する。それまで子が受け取った場合は未知タグ＝プロトコル違反の経路に
+//!   入る（親はまだ送らない）。`JS-1`・`TASK-29.5a`・Issue #524
 //!
 //! # 検証方針（外部入力として扱う。coding-rust.md「外部入力」節）
 //!
@@ -56,7 +63,7 @@
 
 use std::io::{self, Read, Write};
 
-use super::engine_trait::{EngineKind, JsValue};
+use super::engine_trait::{EngineKind, JsValue, ObjectHandle};
 
 /// 子プロセスモードを起動する環境変数名（設計書 §3.1）。値は
 /// [`PROTOCOL_VERSION`] と同じ形式（`u16` の文字列表現）のプロトコル
@@ -78,7 +85,12 @@ pub(crate) const MARKER_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER";
 /// （`TASK-29.4`・Issue #155）。子は未知の tag をプロトコル違反として
 /// 扱うため、バイナリの世代が混ざった場合にハンドシェイクで検出できる
 /// ようにバージョンを上げた。
-pub(crate) const PROTOCOL_VERSION: u16 = 2;
+///
+/// 3: 値タグ 5（[`JsValue::ObjectHandle`]）と親 → 子の
+/// [`tag::BIND_DOM_LIKE_OBJECT`] を追加（`TASK-29.5a`・Issue #524）。
+/// `NativeReturn`／`Result` 経由で新しい値タグが実際に流れうるため、
+/// ワイヤ形式の世代差をハンドシェイクで検出できるよう上げた。
+pub(crate) const PROTOCOL_VERSION: u16 = 3;
 
 /// フレームの `tag` バイトの値。
 ///
@@ -111,6 +123,18 @@ pub(crate) mod tag {
     /// （[`super::encode_register_global_function`]。`TASK-29.4`・
     /// Issue #155）。応答は `RESULT(Undefined)` / `ERROR{Binding}`。
     pub(crate) const REGISTER_GLOBAL_FUNCTION: u8 = 8;
+    /// 親 → 子。DOM 風オブジェクトの bind
+    /// （[`super::encode_bind_dom_like_object`]。`TASK-29.5a`・Issue #524）。
+    /// 応答は `RESULT(Undefined)` / `ERROR{Binding}`。子の処理・親の送信は
+    /// Issue #525（`TASK-29.5b`）で配線するまで未使用。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        )
+    )]
+    pub(crate) const BIND_DOM_LIKE_OBJECT: u8 = 9;
 }
 
 /// 注入するグローバル関数名の最大バイト数（`JS-1`・`TASK-29.4`・
@@ -146,6 +170,31 @@ pub(crate) const MAX_FRAME_PAYLOAD_CHILD_TO_PARENT: usize = 3 * 1_048_576 + 65_5
 /// （`js-v8` feature 有効時のみ）。
 #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 pub(crate) const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
+
+/// [`DomLikeObjectBinding`] のメンバー（メソッド・プロパティ）の最大件数
+/// （`JS-1`・`TASK-29.5a`・Issue #524）。DoS 対策として
+/// [`decode_bind_dom_like_object`] は `member_count` をこの値と比較してから
+/// 確保する。ヘッダ最大 266 B ＋ メンバー最大 263 B × 256 件 ＝ 最大
+/// 67,594 B で、[`MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`] に十分収まる。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+    )
+)]
+pub(crate) const MAX_DOM_LIKE_OBJECT_MEMBERS: usize = 256;
+
+/// [`DomLikeMember`] の名前の最大バイト数（`JS-1`・`TASK-29.5a`・Issue #524）。
+/// グローバル名の上限は [`MAX_GLOBAL_FUNCTION_NAME_BYTES`] を共用する。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+    )
+)]
+pub(crate) const MAX_DOM_LIKE_MEMBER_NAME_BYTES: usize = 256;
 
 /// [`encode_native_call`]/[`decode_native_call`] が受け付ける引数の最大件数
 /// （`JS-1`・`TASK-29`・Issue #511）。
@@ -256,6 +305,54 @@ pub(crate) enum ProtocolError {
     /// Issue #155）。
     #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     GlobalFunctionNameTooLong { len: usize, max: usize },
+    /// bind フレームのメンバー数が [`MAX_DOM_LIKE_OBJECT_MEMBERS`] を超えた
+    /// （`TASK-29.5a`・Issue #524）。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        )
+    )]
+    TooManyDomLikeMembers { count: usize, max: usize },
+    /// bind フレームのグローバル名・メンバー名が上限を超えた
+    /// （`TASK-29.5a`・Issue #524）。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        )
+    )]
+    DomLikeNameTooLong { len: usize, max: usize },
+    /// bind フレームのグローバル名・メンバー名が空（`TASK-29.5a`・Issue #524）。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        )
+    )]
+    EmptyDomLikeName,
+    /// bind フレームのメンバー種別バイトが未知（`TASK-29.5a`・Issue #524）。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        )
+    )]
+    InvalidDomLikeMemberKind(u8),
+    /// bind フレームでメンバー名が重複した（`TASK-29.5a`・Issue #524）。
+    /// untrusted な名前をメッセージへ埋め込まないため名前は保持しない。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        )
+    )]
+    DuplicateDomLikeMemberName,
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -305,6 +402,25 @@ impl std::fmt::Display for ProtocolError {
             Self::GlobalFunctionNameTooLong { len, max } => write!(
                 f,
                 "worker protocol global function name of {len} bytes exceeds the {max}-byte limit"
+            ),
+            Self::TooManyDomLikeMembers { count, max } => write!(
+                f,
+                "worker protocol DOM-like object has {count} members, exceeding the {max}-member limit"
+            ),
+            Self::DomLikeNameTooLong { len, max } => write!(
+                f,
+                "worker protocol DOM-like object name of {len} bytes exceeds the {max}-byte limit"
+            ),
+            Self::EmptyDomLikeName => {
+                write!(f, "worker protocol DOM-like object name must not be empty")
+            }
+            Self::InvalidDomLikeMemberKind(byte) => write!(
+                f,
+                "worker protocol DOM-like member kind byte {byte} is unknown"
+            ),
+            Self::DuplicateDomLikeMemberName => write!(
+                f,
+                "worker protocol DOM-like object has a duplicate member name"
             ),
         }
     }
@@ -432,11 +548,12 @@ pub(crate) fn read_frame(
 /// [`JsValue`] を、[`tag::RESULT`] フレームのペイロード（や将来の
 /// `NativeCall` 引数列）として使えるバイト列へ追記する。
 ///
-/// 表現: `u8 tag`（0=Undefined, 1=Null, 2=Bool, 3=Number, 4=String）＋
-/// 種別ごとの値（Bool は `u8`、Number は `f64 LE`、String は
-/// `u32 LE len` ＋ UTF-8 バイト列）。`String` を自己区切り（長さ明示）に
-/// しているため、将来 `Vec<JsValue>` を連結して送る際（`NativeCall`）にも
-/// そのまま再利用できる。
+/// 表現: `u8 tag`（0=Undefined, 1=Null, 2=Bool, 3=Number, 4=String,
+/// 5=ObjectHandle）＋ 種別ごとの値（Bool は `u8`、Number は `f64 LE`、
+/// String は `u32 LE len` ＋ UTF-8 バイト列、ObjectHandle は `u32 LE id`）。
+///
+/// `String` を自己区切り（長さ明示）にしているため、将来 `Vec<JsValue>` を
+/// 連結して送る際（`NativeCall`）にもそのまま再利用できる。
 ///
 /// `JsValue` は `#[non_exhaustive]` だが、本 crate の内側からの `match` は
 /// 既知の全 variant を網羅すれば `_` 分岐は不要（`#[non_exhaustive]` が
@@ -465,6 +582,10 @@ pub(crate) fn encode_js_value(value: &JsValue, out: &mut Vec<u8>) -> Result<(), 
             })?;
             out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(s.as_bytes());
+        }
+        JsValue::ObjectHandle(handle) => {
+            out.push(5);
+            out.extend_from_slice(&handle.raw().to_le_bytes());
         }
     }
     Ok(())
@@ -510,6 +631,17 @@ pub(crate) fn decode_js_value(buf: &[u8]) -> Result<(JsValue, usize), ProtocolEr
             let str_bytes = buf.get(start..end).ok_or(ProtocolError::Truncated)?;
             let s = std::str::from_utf8(str_bytes).map_err(|_| ProtocolError::InvalidUtf8)?;
             Ok((JsValue::String(s.to_string()), end))
+        }
+        5 => {
+            let id_bytes: [u8; 4] = buf
+                .get(1..5)
+                .ok_or(ProtocolError::Truncated)?
+                .try_into()
+                .map_err(|_| ProtocolError::Truncated)?;
+            Ok((
+                JsValue::ObjectHandle(ObjectHandle::from_raw(u32::from_le_bytes(id_bytes))),
+                5,
+            ))
         }
         other => Err(ProtocolError::InvalidValueTag(other)),
     }
@@ -711,6 +843,327 @@ pub(crate) fn decode_register_global_function(
     Ok((id, name.to_string()))
 }
 
+/// [`DomLikeMember`] の種別（`JS-1`・`TASK-29.5a`・Issue #524）。
+///
+/// setter（書き込み可能なプロパティ）は未対応で、将来の kind 値として
+/// 予約するのみ（REPAIR-3。デコードは未知の kind として拒否する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+    )
+)]
+pub(crate) enum DomLikeMemberKind {
+    /// メソッド。呼び出しごとに `NativeCall` を送る。
+    Method,
+    /// 読み取り専用プロパティ（getter）。参照ごとに `NativeCall` を送る。
+    Property,
+}
+
+impl DomLikeMemberKind {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        )
+    )]
+    fn to_byte(self) -> u8 {
+        match self {
+            Self::Method => 0,
+            Self::Property => 1,
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        )
+    )]
+    fn from_byte(byte: u8) -> Result<Self, ProtocolError> {
+        match byte {
+            0 => Ok(Self::Method),
+            1 => Ok(Self::Property),
+            other => Err(ProtocolError::InvalidDomLikeMemberKind(other)),
+        }
+    }
+}
+
+/// bind する DOM 風オブジェクトの 1 メンバー（`JS-1`・`TASK-29.5a`・Issue #524）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+    )
+)]
+pub(crate) struct DomLikeMember {
+    /// メンバー種別。
+    pub(crate) kind: DomLikeMemberKind,
+    /// JS 側に見せる名前。空不可・[`MAX_DOM_LIKE_MEMBER_NAME_BYTES`] 以下・
+    /// オブジェクト内で一意。子は JS のソース文字列へ連結せず
+    /// `create_data_property` 等の API で設定すること（インジェクション対策）。
+    pub(crate) name: String,
+    /// 呼び出し時に `NativeCall` で送る ID。handle ID とは別の名前空間。
+    pub(crate) native_call_id: u32,
+}
+
+/// [`tag::BIND_DOM_LIKE_OBJECT`] フレームの内容（`JS-1`・`TASK-29.5a`・
+/// Issue #524）。
+///
+/// 親（`super::process_engine`。Issue #525 で配線）が子へ送り、子の
+/// `super::worker` が受けて JS のグローバルへプロキシオブジェクトを生やす。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+    )
+)]
+pub(crate) struct DomLikeObjectBinding {
+    /// 親側 bind 済みオブジェクトの handle。
+    pub(crate) handle: ObjectHandle,
+    /// グローバルに生やす名前。空不可・[`MAX_GLOBAL_FUNCTION_NAME_BYTES`] 以下。
+    pub(crate) name: String,
+    /// メンバー一覧（[`MAX_DOM_LIKE_OBJECT_MEMBERS`] 件以下）。
+    pub(crate) members: Vec<DomLikeMember>,
+}
+
+/// bind フレームの名前 1 件を検証する（空・長さ超過を拒否）。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+    )
+)]
+fn validate_dom_like_name(name: &str, max: usize) -> Result<(), ProtocolError> {
+    if name.is_empty() {
+        return Err(ProtocolError::EmptyDomLikeName);
+    }
+    if name.len() > max {
+        return Err(ProtocolError::DomLikeNameTooLong {
+            len: name.len(),
+            max,
+        });
+    }
+    Ok(())
+}
+
+/// [`tag::BIND_DOM_LIKE_OBJECT`] フレームのペイロードを組み立てる
+/// （親 → 子。`JS-1`・`TASK-29.5a`・Issue #524）。
+///
+/// 表現（すべて LE）: `u32 handle_id` ＋ `u16 name_len` ＋ name ＋
+/// `u32 member_count` ＋ メンバー × N（`u8 kind`〔0=Method, 1=Property〕＋
+/// `u32 native_call_id` ＋ `u16 name_len` ＋ name）。
+///
+/// 空の名前・上限超過・メンバー名の重複は、確保前に検証して
+/// [`ProtocolError`] を返す。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+    )
+)]
+pub(crate) fn encode_bind_dom_like_object(
+    binding: &DomLikeObjectBinding,
+) -> Result<Vec<u8>, ProtocolError> {
+    validate_dom_like_name(&binding.name, MAX_GLOBAL_FUNCTION_NAME_BYTES)?;
+    if binding.members.len() > MAX_DOM_LIKE_OBJECT_MEMBERS {
+        return Err(ProtocolError::TooManyDomLikeMembers {
+            count: binding.members.len(),
+            max: MAX_DOM_LIKE_OBJECT_MEMBERS,
+        });
+    }
+    let member_count =
+        u32::try_from(binding.members.len()).map_err(|_| ProtocolError::TooManyDomLikeMembers {
+            count: binding.members.len(),
+            max: MAX_DOM_LIKE_OBJECT_MEMBERS,
+        })?;
+
+    let mut seen = std::collections::HashSet::with_capacity(binding.members.len());
+    // handle(4) + name_len(2) + name + member_count(4)
+    let mut total_size: usize = 4 + 2 + binding.name.len() + 4;
+    for member in &binding.members {
+        validate_dom_like_name(&member.name, MAX_DOM_LIKE_MEMBER_NAME_BYTES)?;
+        if !seen.insert(member.name.as_str()) {
+            return Err(ProtocolError::DuplicateDomLikeMemberName);
+        }
+        // kind(1) + native_call_id(4) + name_len(2) + name
+        total_size = total_size
+            .checked_add(1 + 4 + 2 + member.name.len())
+            .ok_or(ProtocolError::NativeCallPayloadTooLarge {
+                size: usize::MAX,
+                max: MAX_FRAME_PAYLOAD_PARENT_TO_CHILD,
+            })?;
+    }
+    if total_size > MAX_FRAME_PAYLOAD_PARENT_TO_CHILD {
+        return Err(ProtocolError::NativeCallPayloadTooLarge {
+            size: total_size,
+            max: MAX_FRAME_PAYLOAD_PARENT_TO_CHILD,
+        });
+    }
+
+    let mut out = Vec::with_capacity(total_size);
+    out.extend_from_slice(&binding.handle.raw().to_le_bytes());
+    push_dom_like_name(&mut out, &binding.name)?;
+    out.extend_from_slice(&member_count.to_le_bytes());
+    for member in &binding.members {
+        out.push(member.kind.to_byte());
+        out.extend_from_slice(&member.native_call_id.to_le_bytes());
+        push_dom_like_name(&mut out, &member.name)?;
+    }
+    Ok(out)
+}
+
+/// `u16 LE len` ＋ UTF-8 バイト列を追記する（長さは検証済みの前提だが
+/// `u16` に収まらなければ拒否する）。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+    )
+)]
+fn push_dom_like_name(out: &mut Vec<u8>, name: &str) -> Result<(), ProtocolError> {
+    let len = u16::try_from(name.len()).map_err(|_| ProtocolError::DomLikeNameTooLong {
+        len: name.len(),
+        max: usize::from(u16::MAX),
+    })?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
+    Ok(())
+}
+
+/// [`encode_bind_dom_like_object`] の逆変換（子側の `super::worker` が使う。
+/// 送信側を信頼しない）。
+///
+/// `member_count` を上限と比較してから `Vec::with_capacity` する。切り詰め・
+/// 不正 UTF-8・空の名前・長さ超過・未知の kind・メンバー名の重複・末尾の
+/// 余分なバイトはすべて [`ProtocolError`] にする。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+    )
+)]
+pub(crate) fn decode_bind_dom_like_object(
+    payload: &[u8],
+) -> Result<DomLikeObjectBinding, ProtocolError> {
+    let mut reader = DomLikeReader {
+        buf: payload,
+        pos: 0,
+    };
+    let handle = ObjectHandle::from_raw(reader.read_u32()?);
+    let name = reader.read_name(MAX_GLOBAL_FUNCTION_NAME_BYTES)?;
+    let member_count = reader.read_u32()? as usize;
+    if member_count > MAX_DOM_LIKE_OBJECT_MEMBERS {
+        return Err(ProtocolError::TooManyDomLikeMembers {
+            count: member_count,
+            max: MAX_DOM_LIKE_OBJECT_MEMBERS,
+        });
+    }
+    let mut members = Vec::with_capacity(member_count);
+    let mut seen = std::collections::HashSet::with_capacity(member_count);
+    for _ in 0..member_count {
+        let kind = DomLikeMemberKind::from_byte(reader.read_u8()?)?;
+        let native_call_id = reader.read_u32()?;
+        let member_name = reader.read_name(MAX_DOM_LIKE_MEMBER_NAME_BYTES)?;
+        if !seen.insert(member_name.clone()) {
+            return Err(ProtocolError::DuplicateDomLikeMemberName);
+        }
+        members.push(DomLikeMember {
+            kind,
+            name: member_name,
+            native_call_id,
+        });
+    }
+    if reader.pos != payload.len() {
+        return Err(ProtocolError::TrailingBytes {
+            expected: reader.pos,
+            actual: payload.len(),
+        });
+    }
+    Ok(DomLikeObjectBinding {
+        handle,
+        name,
+        members,
+    })
+}
+
+/// [`decode_bind_dom_like_object`] 専用の境界検査付きバイト読み取り。
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+    )
+)]
+struct DomLikeReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+    )
+)]
+impl DomLikeReader<'_> {
+    fn take(&mut self, n: usize) -> Result<&[u8], ProtocolError> {
+        let end = self.pos.checked_add(n).ok_or(ProtocolError::Truncated)?;
+        let slice = self
+            .buf
+            .get(self.pos..end)
+            .ok_or(ProtocolError::Truncated)?;
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, ProtocolError> {
+        self.take(1)?
+            .first()
+            .copied()
+            .ok_or(ProtocolError::Truncated)
+    }
+
+    fn read_u32(&mut self) -> Result<u32, ProtocolError> {
+        let bytes: [u8; 4] = self
+            .take(4)?
+            .try_into()
+            .map_err(|_| ProtocolError::Truncated)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn read_name(&mut self, max: usize) -> Result<String, ProtocolError> {
+        let len_bytes: [u8; 2] = self
+            .take(2)?
+            .try_into()
+            .map_err(|_| ProtocolError::Truncated)?;
+        let len = usize::from(u16::from_le_bytes(len_bytes));
+        if len == 0 {
+            return Err(ProtocolError::EmptyDomLikeName);
+        }
+        if len > max {
+            return Err(ProtocolError::DomLikeNameTooLong { len, max });
+        }
+        let bytes = self.take(len)?;
+        std::str::from_utf8(bytes)
+            .map(str::to_string)
+            .map_err(|_| ProtocolError::InvalidUtf8)
+    }
+}
+
 /// [`tag::NATIVE_CALL`] フレームのペイロードを組み立てる（子 → 親。`JS-1`・
 /// `TASK-29`・Issue #511）。
 ///
@@ -791,6 +1244,7 @@ pub(crate) fn encoded_js_value_len(value: &JsValue) -> Result<usize, ProtocolErr
         JsValue::Undefined | JsValue::Null => Ok(1),
         JsValue::Bool(_) => Ok(2),
         JsValue::Number(_) => Ok(9),
+        JsValue::ObjectHandle(_) => Ok(5),
         JsValue::String(s) => {
             u32::try_from(s.len()).map_err(|_| {
                 ProtocolError::Io(io::Error::new(
@@ -1109,6 +1563,8 @@ mod tests {
             JsValue::Number(-1.0),
             JsValue::String(String::new()),
             JsValue::String("fandhe-browser".to_string()),
+            JsValue::ObjectHandle(ObjectHandle::from_raw(0)),
+            JsValue::ObjectHandle(ObjectHandle::from_raw(u32::MAX)),
         ];
         for value in values {
             let mut buf = Vec::new();
@@ -1284,6 +1740,14 @@ mod tests {
             ProtocolError::EmptyFrame,
             ProtocolError::FrameTooLarge { len: 10, max: 5 },
             ProtocolError::UnknownTag(9),
+            ProtocolError::TooManyDomLikeMembers {
+                count: 300,
+                max: 256,
+            },
+            ProtocolError::DomLikeNameTooLong { len: 300, max: 256 },
+            ProtocolError::EmptyDomLikeName,
+            ProtocolError::InvalidDomLikeMemberKind(9),
+            ProtocolError::DuplicateDomLikeMemberName,
             ProtocolError::InvalidValueTag(9),
             ProtocolError::InvalidBoolByte(9),
             ProtocolError::InvalidErrorKind(9),
@@ -1601,7 +2065,7 @@ mod tests {
     #[test]
     fn js_1_marker_env_var_and_protocol_version_have_the_documented_values() {
         assert_eq!(MARKER_ENV_VAR, "FANDHE_BROWSER_JS_WORKER");
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     /// JS-1: 想定される tag 値が予約分も含め重複しないこと（プロトコル
@@ -1617,10 +2081,283 @@ mod tests {
             tag::NATIVE_RETURN,
             tag::SHUTDOWN,
             tag::REGISTER_GLOBAL_FUNCTION,
+            tag::BIND_DOM_LIKE_OBJECT,
         ];
         let mut sorted = tags.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), tags.len(), "tag values must be distinct");
+    }
+
+    // ---- TASK-29.5a・Issue #524: ObjectHandle 値・bind フレーム ----
+
+    fn sample_binding() -> DomLikeObjectBinding {
+        DomLikeObjectBinding {
+            handle: ObjectHandle::from_raw(7),
+            name: "dom".to_string(),
+            members: vec![
+                DomLikeMember {
+                    kind: DomLikeMemberKind::Method,
+                    name: "setText".to_string(),
+                    native_call_id: 100,
+                },
+                DomLikeMember {
+                    kind: DomLikeMemberKind::Property,
+                    name: "title".to_string(),
+                    native_call_id: 101,
+                },
+            ],
+        }
+    }
+
+    /// JS-1・TASK-29.5a: ObjectHandle 値のワイヤ表現が `[5, id LE 4B]`
+    /// （5 バイト固定）で、`encoded_js_value_len` とも一致すること。
+    #[test]
+    fn js_1_object_handle_value_wire_format_is_tag5_plus_u32_le() {
+        let value = JsValue::ObjectHandle(ObjectHandle::from_raw(0x0403_0201));
+        let mut buf = Vec::new();
+        encode_js_value(&value, &mut buf).expect("encode");
+        assert_eq!(buf, vec![5, 1, 2, 3, 4]);
+        assert_eq!(encoded_js_value_len(&value).expect("len"), 5);
+    }
+
+    /// JS-1・TASK-29.5a: 切り詰められた ObjectHandle 値は `Truncated`。
+    #[test]
+    fn js_1_decode_object_handle_rejects_truncated_id() {
+        for len in 1..5 {
+            let buf = [5u8, 1, 2, 3];
+            assert!(matches!(
+                decode_js_value(buf.get(..len.min(buf.len())).expect("slice")),
+                Err(ProtocolError::Truncated)
+            ));
+        }
+    }
+
+    /// JS-1・TASK-29.5a: bind フレームの往復（Method/Property 混在・0 件）。
+    #[test]
+    fn js_1_bind_dom_like_object_round_trips() {
+        let binding = sample_binding();
+        let bytes = encode_bind_dom_like_object(&binding).expect("encode");
+        assert_eq!(
+            decode_bind_dom_like_object(&bytes).expect("decode"),
+            binding
+        );
+
+        let empty = DomLikeObjectBinding {
+            handle: ObjectHandle::from_raw(u32::MAX),
+            name: "d".to_string(),
+            members: Vec::new(),
+        };
+        let bytes = encode_bind_dom_like_object(&empty).expect("encode");
+        assert_eq!(decode_bind_dom_like_object(&bytes).expect("decode"), empty);
+    }
+
+    /// JS-1・TASK-29.5a: 既知入力のバイト列を固定する（ワイヤ形式の回帰検出）。
+    #[test]
+    fn js_1_bind_dom_like_object_wire_format_is_fixed() {
+        let binding = DomLikeObjectBinding {
+            handle: ObjectHandle::from_raw(1),
+            name: "d".to_string(),
+            members: vec![DomLikeMember {
+                kind: DomLikeMemberKind::Property,
+                name: "ab".to_string(),
+                native_call_id: 0x0201,
+            }],
+        };
+        let expected: Vec<u8> = vec![
+            1, 0, 0, 0, // handle
+            1, 0, b'd', // name
+            1, 0, 0, 0, // member_count
+            1, // kind = Property
+            1, 2, 0, 0, // native_call_id
+            2, 0, b'a', b'b', // member name
+        ];
+        assert_eq!(
+            encode_bind_dom_like_object(&binding).expect("encode"),
+            expected
+        );
+    }
+
+    /// JS-1・TASK-29.5a: decode の拒否経路（空・各位置の切り詰め・不正 UTF-8・
+    /// 空の名前・長さ超過・未知の kind・重複・末尾の余分なバイト）。
+    #[test]
+    fn js_1_decode_bind_dom_like_object_rejects_invalid_payloads() {
+        let valid = encode_bind_dom_like_object(&sample_binding()).expect("encode");
+        assert!(matches!(
+            decode_bind_dom_like_object(&[]),
+            Err(ProtocolError::Truncated)
+        ));
+        for cut in 0..valid.len() {
+            let head = valid.get(..cut).expect("slice");
+            assert!(
+                decode_bind_dom_like_object(head).is_err(),
+                "truncation at {cut} must be rejected"
+            );
+        }
+
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        assert!(matches!(
+            decode_bind_dom_like_object(&trailing),
+            Err(ProtocolError::TrailingBytes { .. })
+        ));
+
+        // グローバル名（offset 6）を不正 UTF-8 にする。
+        let mut bad_global = valid.clone();
+        *bad_global.get_mut(6).expect("byte") = 0xff;
+        assert!(matches!(
+            decode_bind_dom_like_object(&bad_global),
+            Err(ProtocolError::InvalidUtf8)
+        ));
+
+        // 先頭メンバーの名前先頭バイトを不正 UTF-8 にする
+        // （4+2+3+4 + kind1+id4+len2 = 20）。
+        let mut bad_member = valid.clone();
+        *bad_member.get_mut(20).expect("byte") = 0xff;
+        assert!(matches!(
+            decode_bind_dom_like_object(&bad_member),
+            Err(ProtocolError::InvalidUtf8)
+        ));
+
+        // 空のグローバル名。
+        let mut empty_name = vec![0, 0, 0, 0, 0, 0];
+        empty_name.extend_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            decode_bind_dom_like_object(&empty_name),
+            Err(ProtocolError::EmptyDomLikeName)
+        ));
+
+        // 長すぎるグローバル名（257 B）。
+        let mut long_name = vec![0, 0, 0, 0];
+        long_name.extend_from_slice(&257u16.to_le_bytes());
+        long_name.extend(std::iter::repeat_n(b'a', 257));
+        long_name.extend_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            decode_bind_dom_like_object(&long_name),
+            Err(ProtocolError::DomLikeNameTooLong { len: 257, max: 256 })
+        ));
+
+        // 未知の kind（2・255）。kind は offset 13。
+        for kind in [2u8, 255] {
+            let mut bad_kind = valid.clone();
+            *bad_kind.get_mut(13).expect("byte") = kind;
+            assert!(matches!(
+                decode_bind_dom_like_object(&bad_kind),
+                Err(ProtocolError::InvalidDomLikeMemberKind(k)) if k == kind
+            ));
+        }
+
+        // メンバー名の重複。
+        let mut dup_bytes = Vec::new();
+        dup_bytes.extend_from_slice(&7u32.to_le_bytes());
+        dup_bytes.extend_from_slice(&[3, 0]);
+        dup_bytes.extend_from_slice(b"dom");
+        dup_bytes.extend_from_slice(&2u32.to_le_bytes());
+        for id in [100u32, 101] {
+            dup_bytes.push(0);
+            dup_bytes.extend_from_slice(&id.to_le_bytes());
+            dup_bytes.extend_from_slice(&[1, 0, b'x']);
+        }
+        assert!(matches!(
+            decode_bind_dom_like_object(&dup_bytes),
+            Err(ProtocolError::DuplicateDomLikeMemberName)
+        ));
+    }
+
+    /// JS-1・TASK-29.5a: 巨大な `member_count` を主張するフレームは確保前に
+    /// `TooManyDomLikeMembers` で拒否されること。
+    #[test]
+    fn js_1_decode_bind_dom_like_object_rejects_huge_member_count_before_allocating() {
+        let mut payload = vec![0, 0, 0, 0, 1, 0, b'd'];
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            decode_bind_dom_like_object(&payload),
+            Err(ProtocolError::TooManyDomLikeMembers { max: 256, .. })
+        ));
+    }
+
+    /// JS-1・TASK-29.5a: encode 側の拒否経路（件数超過・名前長超過・空の名前・
+    /// メンバー名の重複）。
+    #[test]
+    fn js_1_encode_bind_dom_like_object_rejects_invalid_bindings() {
+        let member = |name: &str| DomLikeMember {
+            kind: DomLikeMemberKind::Method,
+            name: name.to_string(),
+            native_call_id: 1,
+        };
+        let base = |name: &str, members: Vec<DomLikeMember>| DomLikeObjectBinding {
+            handle: ObjectHandle::from_raw(1),
+            name: name.to_string(),
+            members,
+        };
+
+        let too_many: Vec<DomLikeMember> = (0..=MAX_DOM_LIKE_OBJECT_MEMBERS)
+            .map(|i| member(&format!("m{i}")))
+            .collect();
+        assert!(matches!(
+            encode_bind_dom_like_object(&base("d", too_many)),
+            Err(ProtocolError::TooManyDomLikeMembers {
+                count: 257,
+                max: 256
+            })
+        ));
+        assert!(matches!(
+            encode_bind_dom_like_object(&base(&"a".repeat(257), vec![])),
+            Err(ProtocolError::DomLikeNameTooLong { len: 257, max: 256 })
+        ));
+        assert!(matches!(
+            encode_bind_dom_like_object(&base("", vec![])),
+            Err(ProtocolError::EmptyDomLikeName)
+        ));
+        assert!(matches!(
+            encode_bind_dom_like_object(&base("d", vec![member("")])),
+            Err(ProtocolError::EmptyDomLikeName)
+        ));
+        assert!(matches!(
+            encode_bind_dom_like_object(&base("d", vec![member(&"a".repeat(257))])),
+            Err(ProtocolError::DomLikeNameTooLong { len: 257, max: 256 })
+        ));
+        assert!(matches!(
+            encode_bind_dom_like_object(&base("d", vec![member("x"), member("x")])),
+            Err(ProtocolError::DuplicateDomLikeMemberName)
+        ));
+    }
+
+    /// JS-1・TASK-29.5a: 上限いっぱい（256 メンバー・256 B の名前）のフレームが
+    /// 往復し、長さが 67,594 B かつ親 → 子の上限以下であること。
+    #[test]
+    fn js_1_bind_dom_like_object_at_limits_round_trips_within_frame_limit() {
+        let members: Vec<DomLikeMember> = (0..MAX_DOM_LIKE_OBJECT_MEMBERS)
+            .map(|i| {
+                let suffix = format!("{i:03}");
+                let mut name = "a".repeat(MAX_DOM_LIKE_MEMBER_NAME_BYTES - suffix.len());
+                name.push_str(&suffix);
+                DomLikeMember {
+                    kind: DomLikeMemberKind::Method,
+                    name,
+                    native_call_id: u32::try_from(i).expect("fits"),
+                }
+            })
+            .collect();
+        let binding = DomLikeObjectBinding {
+            handle: ObjectHandle::from_raw(1),
+            name: "g".repeat(MAX_GLOBAL_FUNCTION_NAME_BYTES),
+            members,
+        };
+        let bytes = encode_bind_dom_like_object(&binding).expect("encode");
+        assert_eq!(bytes.len(), 67_594);
+        assert!(bytes.len() <= MAX_FRAME_PAYLOAD_PARENT_TO_CHILD);
+        assert_eq!(
+            decode_bind_dom_like_object(&bytes).expect("decode"),
+            binding
+        );
+    }
+
+    /// JS-1・TASK-29.5a: bind フレームの上限定数が doc どおりの具体値であること。
+    #[test]
+    fn js_1_dom_like_limits_have_the_documented_values() {
+        assert_eq!(MAX_DOM_LIKE_OBJECT_MEMBERS, 256);
+        assert_eq!(MAX_DOM_LIKE_MEMBER_NAME_BYTES, 256);
+        assert_eq!(tag::BIND_DOM_LIKE_OBJECT, 9);
     }
 }

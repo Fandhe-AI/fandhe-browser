@@ -1740,6 +1740,24 @@ impl V8ProcessEngine {
                         // 「1 つだけ」を強制しない）、消費バイト数が
                         // ペイロード全体の長さと一致しなければ、末尾に余分な
                         // バイトが付いたプロトコル違反として扱う。
+                        // codex レビュー指摘 #593 P1: 子が送る `ObjectHandle` は
+                        // untrusted で、親の登録簿と照合する契約
+                        // （`ObjectHandle` のドキュメント）。登録簿は Issue #525
+                        // （`TASK-29.5b`）で導入するため、それまでは子 → 親の
+                        // `ObjectHandle` を拒否する（fail-closed。未登録 ID が
+                        // 親側で bind 済みオブジェクトとして流通しない）。
+                        Ok((JsValue::ObjectHandle(handle), _)) => {
+                            worker.terminate_now();
+                            let tail = worker.reap_and_collect_stderr();
+                            let converted = discard_context_error(worker, &tail, || {
+                                JsEngineError::EngineUnavailable(format!(
+                                    "JS worker process sent an unregistered object handle \
+                                     {} in a Result frame; stderr: {tail}",
+                                    handle.raw()
+                                ))
+                            });
+                            (Err(converted), false)
+                        }
                         Ok((value, consumed)) if consumed == payload.len() => (Ok(value), true),
                         Ok((_value, consumed)) => {
                             worker.terminate_now();
@@ -2078,6 +2096,10 @@ enum NativeDispatchViolation {
     /// `NativeFn` が評価期限までに戻らなかった。プロトコル違反ではなく
     /// 期限切れであり、呼び出し元は [`JsEngineError::Timeout`] へ変換する。
     DeadlineExceeded,
+    /// 引数に [`JsValue::ObjectHandle`] が含まれていた。親の handle 登録簿
+    /// は Issue #525（`TASK-29.5b`）で導入するため、それまでは照合できない
+    /// 子発の handle を fail-closed で拒否する。
+    UnregisteredHandle { handle: u32 },
 }
 
 impl std::fmt::Display for NativeDispatchViolation {
@@ -2087,6 +2109,9 @@ impl std::fmt::Display for NativeDispatchViolation {
             Self::UnknownId { id } => write!(f, "no native function is registered for id {id}"),
             Self::DeadlineExceeded => {
                 write!(f, "the native function did not return before the deadline")
+            }
+            Self::UnregisteredHandle { handle } => {
+                write!(f, "object handle {handle} is not registered in the parent")
             }
         }
     }
@@ -2143,6 +2168,14 @@ fn dispatch_native_call(
 ) -> Result<Vec<u8>, NativeDispatchViolation> {
     let (id, args) = worker_protocol::decode_native_call(payload)
         .map_err(NativeDispatchViolation::DecodeFailed)?;
+    // 子発の `ObjectHandle` は親の登録簿（Issue #525）と照合できるまで拒否する。
+    if let Some(JsValue::ObjectHandle(handle)) =
+        args.iter().find(|v| matches!(v, JsValue::ObjectHandle(_)))
+    {
+        return Err(NativeDispatchViolation::UnregisteredHandle {
+            handle: handle.raw(),
+        });
+    }
     // `id` は子が `data()` に設定した `u32`。`usize` への変換が失敗する
     // ことは現実的な対象プラットフォームでは起こらないが、外部入力の
     // 経路であるため `unwrap`/`expect` は使わず、変換に失敗した場合は
@@ -3011,6 +3044,30 @@ mod tests {
                 Instant::now() + Duration::from_secs(30)
             ),
             Err(NativeDispatchViolation::UnknownId { id: 7 })
+        ));
+    }
+
+    /// Issue #593 P1: 子発の `ObjectHandle` 引数は登録簿が無い間拒否される。
+    #[test]
+    fn js_1_dispatch_native_call_rejects_unregistered_object_handle() {
+        let native_fns: Vec<NativeEntry> =
+            vec![entry(Box::new(|_: &[JsValue], _: &NativeCallContext| {
+                Ok(JsValue::Undefined)
+            }))];
+        let payload = worker_protocol::encode_native_call(
+            0,
+            &[JsValue::ObjectHandle(
+                crate::engine_trait::ObjectHandle::from_raw(9),
+            )],
+        )
+        .expect("encode must succeed");
+        assert!(matches!(
+            dispatch_native_call(
+                &native_fns,
+                &payload,
+                Instant::now() + Duration::from_secs(30)
+            ),
+            Err(NativeDispatchViolation::UnregisteredHandle { handle: 9 })
         ));
     }
 
