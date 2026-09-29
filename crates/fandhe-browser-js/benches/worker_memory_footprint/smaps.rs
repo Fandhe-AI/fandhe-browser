@@ -47,7 +47,8 @@ pub struct SmapsRollup {
 /// `/proc` はカーネルが生成する値だが、パーサ自身は「壊れた・想定外の
 /// 形式」を panic ではなく `None` として扱うべき外部入力として扱う）。
 ///
-/// `Rss` と `Pss` のどちらかが欠けている、数値として解釈できない、
+/// `Rss` と `Pss` のどちらかが欠けている、既知キー（`Pss_Anon` 等の
+/// 任意フィールド含む）の値が `kB` 形式の数値として解釈できない、
 /// または同じキーが重複している場合は `None` を返す（fail-closed。
 /// 0 で埋めて「計測できたふり」をしない。REPAIR-3）。
 pub fn parse_smaps_rollup(text: &str) -> Option<SmapsRollup> {
@@ -62,9 +63,14 @@ pub fn parse_smaps_rollup(text: &str) -> Option<SmapsRollup> {
     let mut swap_kib: Option<u64> = None;
 
     for line in text.lines() {
-        let Some((key, value)) = parse_kib_line(line) else {
+        // 既知キーの行だけを対象にする。未知キー・アドレス範囲の行は
+        // 読み飛ばすが、既知キーの値が不正（`Pss_Anon: 100 MB` 等）な
+        // 場合は全体を失敗させる（fail-closed。壊れた行を欠損扱いにして
+        // 計測を続けない。REPAIR-3）。
+        let Some((key_part, _)) = line.split_once(':') else {
             continue;
         };
+        let key = key_part.trim();
         // 重複キーは fail-closed（`Some` の上に無条件で上書きしない）。
         // 想定外の入力形式に対して「最初/最後の値を採用する」という
         // 暗黙のルールを持たせないための措置。
@@ -80,6 +86,7 @@ pub fn parse_smaps_rollup(text: &str) -> Option<SmapsRollup> {
             "Swap" => &mut swap_kib,
             _ => continue,
         };
+        let (_, value) = parse_kib_line(line)?;
         if slot.is_some() {
             return None;
         }
@@ -101,8 +108,8 @@ pub fn parse_smaps_rollup(text: &str) -> Option<SmapsRollup> {
 
 /// `"Key:      1234 kB"` 形式（末尾の `kB` 単位は必須・前後の空白は
 /// 任意個数）の 1 行を `(key, value_kib)` へ解釈する。形式に合わない行
-/// （アドレス範囲の行・空行・`kB` 以外の単位・末尾に余分なトークンが
-/// 残る行等）は `None` を返し、呼び出し側が読み飛ばす。
+/// （`kB` 以外の単位・末尾に余分なトークンが残る行等）は `None` を返す。
+/// 呼び出し側は既知キーの行でのみ呼び、`None` なら全体を失敗させる。
 fn parse_kib_line(line: &str) -> Option<(&str, u64)> {
     let (key_part, rest) = line.split_once(':')?;
     let key = key_part.trim();

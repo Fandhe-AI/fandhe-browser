@@ -358,11 +358,19 @@ mod linux_impl {
     fn read_smaps_rollup(path: &Path) -> Result<SmapsRollup, String> {
         let file = std::fs::File::open(path)
             .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
-        let mut limited = file.take(SMAPS_READ_CAP_BYTES as u64);
+        // 上限 + 1 バイトまで読み、上限を超えたら切断された内容を
+        // 有効な計測値として扱わずエラーにする（fail-closed）。
+        let mut limited = file.take(SMAPS_READ_CAP_BYTES as u64 + 1);
         let mut buf = Vec::new();
         limited
             .read_to_end(&mut buf)
             .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+        if buf.len() > SMAPS_READ_CAP_BYTES {
+            return Err(format!(
+                "{} exceeds the {SMAPS_READ_CAP_BYTES}-byte read cap (refusing truncated data)",
+                path.display()
+            ));
+        }
         let text =
             String::from_utf8(buf).map_err(|_| format!("{} is not valid UTF-8", path.display()))?;
         parse_smaps_rollup(&text).ok_or_else(|| {

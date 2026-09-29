@@ -101,6 +101,21 @@ fn parse_smaps_rollup_trailing_garbage_after_kb_returns_none() {
 }
 
 /// `summarize_kib`: 1..=5 で median 3。
+/// 既知の任意フィールドの値が不正（`MB` 単位）なら、Rss・Pss が正常でも
+/// 全体を失敗させる（fail-closed。REPAIR-3）。
+#[test]
+fn parse_smaps_rollup_malformed_optional_field_returns_none() {
+    let text = "Rss: 100 kB\nPss: 50 kB\nPss_Anon: 100 MB\n";
+    assert_eq!(parse_smaps_rollup(text), None);
+}
+
+/// 壊れた `Rss` 行の後に正常な `Rss` 行が続いても、不正行の時点で失敗する。
+#[test]
+fn parse_smaps_rollup_malformed_rss_then_valid_rss_returns_none() {
+    let text = "Rss: abc kB\nRss: 100 kB\nPss: 50 kB\n";
+    assert_eq!(parse_smaps_rollup(text), None);
+}
+
 #[test]
 fn summarize_kib_1_to_5_median_is_3() {
     let samples: Vec<u64> = (1..=5u64).collect();
