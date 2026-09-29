@@ -159,11 +159,24 @@ impl Config {
     /// `[profile] root` が相対パスの場合、`path` の親ディレクトリを基準に
     /// [`Path::join`] で解決する（呼び出し元の CWD に依存させないため）。
     pub fn load(path: &Path) -> Result<Config> {
-        let file = File::open(path).map_err(|source| {
+        // 境界検証の基準と実際に読むファイルを結び付ける（Issue #538 P0 指摘:
+        // `File::open(path)` の後に同じ `path` を再度 `canonicalize` すると、
+        // その間の symlink 差し替えで読んだ設定と基準ディレクトリがずれる）。
+        // 先に実所在（symlink 解決済み）を求め、その実所在を開いて、
+        // 開いたハンドルが実所在と同一ファイルであることを確認する。
+        let canonical_config_file = std::fs::canonicalize(path).map_err(|source| {
             Error::from(ConfigError::Io {
                 message: format!("failed to open {}: {source}", path.display()),
             })
         })?;
+
+        let file = File::open(&canonical_config_file).map_err(|source| {
+            Error::from(ConfigError::Io {
+                message: format!("failed to open {}: {source}", path.display()),
+            })
+        })?;
+
+        verify_same_file(&file, &canonical_config_file, path)?;
 
         let mut limited = file.take(MAX_CONFIG_BYTES as u64 + 1);
         let mut bytes = Vec::new();
@@ -193,24 +206,17 @@ impl Config {
             // 分担は崩れない。絶対パス・相対パスいずれの分岐でも、この
             // symlink 解決済みの `base_abs` を基準に検証・結合する
             // （モジュール doc「パス解決」参照）。
-            let base_abs = {
-                let canonical_config_file = std::fs::canonicalize(path).map_err(|source| {
+            let base_abs = canonical_config_file
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| {
                     Error::from(ConfigError::Io {
-                        message: format!("failed to resolve {}: {source}", path.display()),
+                        message: format!(
+                            "failed to resolve parent directory of {}",
+                            canonical_config_file.display()
+                        ),
                     })
                 })?;
-                canonical_config_file
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .ok_or_else(|| {
-                        Error::from(ConfigError::Io {
-                            message: format!(
-                                "failed to resolve parent directory of {}",
-                                canonical_config_file.display()
-                            ),
-                        })
-                    })?
-            };
 
             // 絶対パスはそのまま、相対パスは設定ファイルの親ディレクトリ基準
             // （CWD 非依存）で結合してから、両分岐とも同じ境界検証を通す
@@ -313,7 +319,20 @@ impl ProfileConfig {
                         std::path::Component::RootDir | std::path::Component::Prefix(_)
                     )
                 });
-                if has_root_or_prefix && !(allow_absolute_root && candidate.is_absolute()) {
+                // UNC・デバイス名前空間などのドライブ以外の prefix は、境界検証の
+                // ためのファイルシステムアクセス（`canonicalize`）がネットワーク
+                // 解決に及ぶため、字句段階で常に拒否する（Windows。ローカル
+                // ドライブ以外は設定ディレクトリ配下になり得ない）。
+                let has_non_disk_prefix = candidate.components().any(|c| match c {
+                    std::path::Component::Prefix(p) => !matches!(
+                        p.kind(),
+                        std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+                    ),
+                    _ => false,
+                });
+                if has_non_disk_prefix
+                    || (has_root_or_prefix && !(allow_absolute_root && candidate.is_absolute()))
+                {
                     return Err(Error::from(ConfigError::InvalidValue {
                         key: "profile.root",
                         message: format!(
@@ -441,6 +460,46 @@ fn resolves_outside_or_at_base_dir(path: &Path) -> bool {
         }
     }
     depth <= 0
+}
+
+/// 開いたハンドル `file` が `canonical`（`canonicalize` 済みの実所在）と
+/// 同一ファイルであることを確認する（open と canonicalize の間の symlink
+/// 差し替え検出。Issue #538 P0 指摘）。
+///
+/// unix では `dev`/`ino` を比較する。それ以外の OS では `path` を再度
+/// `canonicalize` した結果が `canonical` と一致することで差し替えを検出する
+/// （std に安定したファイル ID API がなく、新規依存も避けるため）。
+/// 不一致は [`ConfigError::Io`] で拒否する（fail-closed）。
+fn verify_same_file(file: &File, canonical: &Path, path: &Path) -> Result<()> {
+    let changed = || {
+        Error::from(ConfigError::Io {
+            message: format!("config file {} changed while loading", path.display()),
+        })
+    };
+    let io_err = |source: std::io::Error| {
+        Error::from(ConfigError::Io {
+            message: format!("failed to verify {}: {source}", path.display()),
+        })
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata().map_err(io_err)?;
+        let on_disk = std::fs::metadata(canonical).map_err(io_err)?;
+        if opened.dev() != on_disk.dev() || opened.ino() != on_disk.ino() {
+            return Err(changed());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        let again = std::fs::canonicalize(path).map_err(io_err)?;
+        if again != canonical {
+            return Err(changed());
+        }
+    }
+    Ok(())
 }
 
 /// パスを字句上（コンポーネント解析のみ）で正規化する（`.` を除去し、
