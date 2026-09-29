@@ -36,15 +36,15 @@ TASK-34 の成果物のうち確認記録の節。スクリプト側は `scripts
 
 ### バイナリサイズ（RENDER-2）
 
-| OS | 実測値 | 上限 | CORE-2 基準（424KB、PoC-6）との比較 |
-| -- | ------ | ---- | ---------------------------------- |
+| OS | 実測値 | 上限 | Chromium 457.4MB（PoC-2）との比較（CORE-2: 80% 以上削減） |
+| -- | ------ | ---- | ------------------------------------------------------- |
 | ubuntu | 未計測 | 91,480,000 B | 比較不可 |
 | macos | 未計測 | 91,480,000 B | 比較不可 |
 | windows | 未計測 | 91,480,000 B | 比較不可 |
 
 - **未計測の理由**: 計測対象 `fandhe-browser-cli` が未作成で、`make check-binary-size` と CI `binary-size` ジョブ（3 OS）はいずれも `skip:` で終了し休眠している。skip は合格ではない（未計測を実測済みと装わない。REPAIR-3）
 - 代替計測を採らない理由: core の example 等を測っても製品バイナリと構成が異なり、RENDER-2 の実測値と誤解されるため
-- 参考値: 424KB は `println!` のみのスタブ（Servo 未リンク）で、ゲートではなく参考下限。上限 91,480,000 B は Chromium 457.4MB（PoC-2）の 20% から導いた値（詳細は `harness/binary-size/README.md`）
+- 参考値: CORE-2 の比較基準は Chromium 実測 457.4MB（PoC-2）からの 80% 以上削減であり、424KB（PoC-6）は `println!` のみのスタブ（Servo 未リンク）の参考値でゲートではない。上限 91,480,000 B は Chromium 457.4MB（PoC-2）の 20% から導いた値（詳細は `harness/binary-size/README.md`）
 - 上限見直し（回帰予算を厳しくするか・OS 別上限にするか）: 実測値が無いため**据え置き**。#174 完了後の初回実測で判断する
 - 再計測手順: #174 マージ後に CI `binary-size` ジョブのサマリー（`binary-size: host=... bytes=... limit=... result=...`）とローカル `make check-binary-size` の結果を転記して本節を更新する。release プロファイルが CORE-2 の前提（`opt-level="z"`・`lto` 等）を未適用のため、計測値は大きめ（保守側）に出る
 
