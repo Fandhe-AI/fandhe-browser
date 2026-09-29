@@ -473,17 +473,18 @@ jobs:
           }
           $installPath = $installPath.Trim()
           $msvcRoot = Join-Path $installPath 'VC\Tools\MSVC'
-          # v143 は MSVC 14.30 以上 14.50 未満
+          # v143 のうち ATL 導入対象（ATL_V143_COMPONENT）と対になる 14.44 系のみを
+          # 検証対象にする（ATL は 14.44 固定のため、別版を選ぶと atlbase.h が見つからない）
           $v143 = @()
           if (Test-Path $msvcRoot) {
             $v143 = Get-ChildItem $msvcRoot -Directory |
               Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
-              Where-Object { [version]$_.Name -ge [version]'14.30' } |
-              Where-Object { [version]$_.Name -lt [version]'14.50' } |
+              Where-Object { [version]$_.Name -ge [version]'14.44' } |
+              Where-Object { [version]$_.Name -lt [version]'14.45' } |
               Sort-Object { [version]$_.Name } -Descending
           }
           if ($v143.Count -eq 0) {
-            Write-Host "::error::MSVC v143 toolset (14.30-14.49) not found under $msvcRoot"
+            Write-Host "::error::MSVC v143 toolset 14.44 (paired with the ATL component) not found under $msvcRoot"
             exit 1
           }
           Write-Host "VS: $installPath"
