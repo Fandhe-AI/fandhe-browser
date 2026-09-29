@@ -163,36 +163,44 @@ impl ProfileStore for OsDefaultStore {
     }
 }
 
-/// アプリディレクトリより上位（基点）の既存部分を実体パスへ解決する。
-///
-/// [`Profile::open`] は祖先の symlink を拒否する（`PROF-1`・`PROF-4`）ため、macOS の
-/// `/var` や `$HOME` 自体が symlink の環境では、環境変数由来のパスをそのまま渡すと
-/// 既定保存先が `InvalidLayout` になる。ここで既存の祖先だけを `canonicalize` し、
-/// 未作成の残りの要素と末尾のアプリディレクトリ名はそのまま結合する。
-/// 末尾のアプリディレクトリ自体は解決しないので、それが symlink であれば
-/// [`Profile::open`] が従来どおり拒否する（境界は緩めない）。解決できる祖先が
-/// 無ければ入力をそのまま返し、拒否は [`Profile::open`] に委ねる。
+/// OS 標準のトップレベル symlink エイリアス（別名 → 実体）。macOS の `/var`・`/tmp`・
+/// `/etc` は OS が `/private/...` への symlink として提供する。他 OS は空（何も解決しない）。
+#[cfg(target_os = "macos")]
+const OS_STANDARD_ALIASES: &[(&str, &str)] = &[
+    ("/var", "/private/var"),
+    ("/tmp", "/private/tmp"),
+    ("/etc", "/private/etc"),
+];
+#[cfg(not(target_os = "macos"))]
+const OS_STANDARD_ALIASES: &[(&str, &str)] = &[];
+
+/// 基点先頭の OS 標準エイリアスだけを実体パスへ置き換える（`XOS-7`・`PROF-1`・`PROF-4`）。
 fn canonicalize_base(path: &Path) -> PathBuf {
-    let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) else {
-        return path.to_path_buf();
-    };
-    let mut existing = parent;
-    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
-    loop {
-        if let Ok(real) = existing.canonicalize() {
-            let mut out = real;
-            out.extend(rest.iter().rev());
-            out.push(leaf);
-            return out;
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(up), Some(name)) => {
-                rest.push(name);
-                existing = up;
-            }
-            _ => return path.to_path_buf(),
+    let aliases: Vec<(&Path, &Path)> = OS_STANDARD_ALIASES
+        .iter()
+        .map(|(alias, real)| (Path::new(*alias), Path::new(*real)))
+        .collect();
+    canonicalize_base_with(path, &aliases)
+}
+
+/// `aliases`（別名, 実体）のうち、パス先頭が別名に一致し、かつ別名を実際に
+/// `canonicalize` した結果が宣言された実体と一致するものだけ置き換える。
+///
+/// [`Profile::open`] は祖先の symlink を拒否する（`PROF-1`・`PROF-4`）。任意の祖先
+/// symlink を解決すると、環境変数で指した先へ拒否を迂回して書き込めてしまうため
+/// （プロファイル境界の迂回）、OS 標準エイリアス以外の symlink は解決せず
+/// [`Profile::open`] の拒否に委ねる（境界を検証できない symlink は fail-closed）。
+/// 別名が想定どおりの実体を指さない場合も置き換えない。
+fn canonicalize_base_with(path: &Path, aliases: &[(&Path, &Path)]) -> PathBuf {
+    for (alias, real) in aliases {
+        let Ok(rest) = path.strip_prefix(alias) else {
+            continue;
+        };
+        if alias.canonicalize().is_ok_and(|resolved| resolved == *real) {
+            return real.join(rest);
         }
     }
+    path.to_path_buf()
 }
 
 /// 環境変数の値をベースディレクトリとして採用できるか検証する。
@@ -593,27 +601,36 @@ mod tests {
         );
     }
 
-    /// XOS-7・PROF-1: 基点が symlink 経由でも実体パスへ解決し、`Profile::open` が開ける。
+    /// XOS-7・PROF-1: OS 標準エイリアスだけ実体へ解決し、任意の祖先 symlink は解決しない。
     #[cfg(unix)]
     #[test]
-    fn xos_7_canonicalize_base_resolves_symlinked_ancestors() {
+    fn xos_7_canonicalize_base_resolves_only_declared_aliases() {
         let tmp = TempDir::new();
         let real = tmp.0.join("real");
         std::fs::create_dir_all(real.join("data")).unwrap();
         let link = tmp.0.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
+        let other = tmp.0.join("other");
+        std::os::unix::fs::symlink(&real, &other).unwrap();
 
-        // 既存の基点は実体へ、未作成の中間要素とアプリ名はそのまま結合される。
-        assert_eq!(
-            canonicalize_base(&link.join("data").join("fandhe-browser")),
-            real.join("data").join("fandhe-browser")
-        );
-        assert_eq!(
-            canonicalize_base(&link.join("missing").join("sub").join("fandhe-browser")),
-            real.join("missing").join("sub").join("fandhe-browser")
-        );
-        let root = canonicalize_base(&link.join("data").join("fandhe-browser"));
+        let aliases: Vec<(&Path, &Path)> = vec![(link.as_path(), real.as_path())];
+        // 宣言済みエイリアスは実体へ置き換わり、`Profile::open` が開ける。
+        let root = canonicalize_base_with(&link.join("data").join("fandhe-browser"), &aliases);
+        assert_eq!(root, real.join("data").join("fandhe-browser"));
         assert!(Profile::open(&root).is_ok());
+        // 宣言外の祖先 symlink はそのまま返り、`Profile::open` が拒否する。
+        let via_other = other.join("data").join("fandhe-browser");
+        let unresolved = canonicalize_base_with(&via_other, &aliases);
+        assert_eq!(unresolved, via_other);
+        assert!(matches!(
+            Profile::open(&unresolved),
+            Err(ProfileError::InvalidLayout { .. })
+        ));
+        // 宣言と実体が食い違うエイリアスは置き換えない。
+        let wrong = tmp.0.join("wrong");
+        let bad: Vec<(&Path, &Path)> = vec![(link.as_path(), wrong.as_path())];
+        let p = link.join("data").join("fandhe-browser");
+        assert_eq!(canonicalize_base_with(&p, &bad), p);
     }
 
     /// PROF-1: 末尾のアプリディレクトリが symlink なら解決せず、`Profile::open` が拒否する。
