@@ -416,6 +416,10 @@ const CELL_SEPARATOR: &str = " | ";
 /// 1 セルの走査で訪問するノード数の上限（巨大・敵対的なセルでの CPU 消費対策）。
 const MAX_CELL_SCAN_STEPS: usize = 1024;
 
+/// 1 セルの走査で読む文字数（空白を含む）の上限。空白のみの巨大な単一テキスト
+/// ノードはノード数・出力文字数の上限のどちらにも達しないため別枠で打ち切る。
+const MAX_CELL_SCAN_CHARS: usize = 4096;
+
 /// 圧縮した 1 データ行（`AISNAP-2`・`TASK-12.3`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -452,7 +456,7 @@ pub struct CompressedRows {
 /// - セル文字列は `hidden`/`aria-hidden="true"` 配下と `script`/`style`/
 ///   `noscript`/`template` を除き、HTML 空白と U+00A0 を 1 つの半角スペースへ
 ///   畳んで trim し、[`MAX_CELL_TEXT_CHARS`] 文字で切る。走査は
-///   [`MAX_CELL_SCAN_STEPS`] ノードで打ち切る。CSS による非表示はスタイル未評価
+///   [`MAX_CELL_SCAN_STEPS`] ノード・[`MAX_CELL_SCAN_CHARS`] 文字で打ち切る。CSS による非表示はスタイル未評価
 ///   のため対象外
 /// - ヘッダ行・`tfoot` 行は含めない（`footer_rows` の扱いは統合時に決める。保留）
 /// - 20 行を超えた件数はここでは返さない（TASK-12.4・Issue #82）
@@ -506,6 +510,7 @@ fn cell_text(doc: &Document, cell: NodeId) -> (String, bool) {
     }
     let mut stack = vec![cell];
     let mut steps = 0usize;
+    let mut scanned = 0usize;
     'walk: while let Some(id) = stack.pop() {
         steps += 1;
         if steps > MAX_CELL_SCAN_STEPS {
@@ -515,6 +520,11 @@ fn cell_text(doc: &Document, cell: NodeId) -> (String, bool) {
         match doc.node_data(id) {
             Some(NodeData::Text { contents }) => {
                 for c in contents.chars() {
+                    scanned += 1;
+                    if scanned > MAX_CELL_SCAN_CHARS {
+                        truncated = true;
+                        break 'walk;
+                    }
                     if is_cell_space(c) {
                         pending_space = !out.is_empty();
                         continue;
@@ -925,6 +935,15 @@ mod tests {
     fn aisnap_2_compress_rows_scan_step_limit() {
         let spans = "<span></span>".repeat(2000);
         let r = rows_of(&format!("<table><tr><td>{spans}tail</table>"), "table");
+        assert_eq!(r.rows[0].text, "");
+        assert!(r.rows[0].truncated);
+    }
+
+    /// AISNAP-2（TASK-12.3）: 空白のみの巨大テキストノードも文字数上限で打ち切る。
+    #[test]
+    fn aisnap_2_compress_rows_scan_char_limit_whitespace() {
+        let ws = " ".repeat(MAX_CELL_SCAN_CHARS * 4);
+        let r = rows_of(&format!("<table><tr><td>{ws}tail</table>"), "table");
         assert_eq!(r.rows[0].text, "");
         assert!(r.rows[0].truncated);
     }
