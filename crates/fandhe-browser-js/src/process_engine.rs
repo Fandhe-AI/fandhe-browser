@@ -84,9 +84,9 @@
 //!   明示する（security.md「偽装・回避機能の禁止」）
 //!
 //! 稼働中の子への登録も同じ登録フレームで即時に行う
-//! （[`V8ProcessEngine::inject_global_function`]）。DOM 風オブジェクト（`bind_dom_like_object`）の登録し直しは未対応で、
-//! 前提の #524・#525（`TASK-29.5a`・`TASK-29.5b`）で登録簿へ種別を足して
-//! 同じ差し込み口から扱う。
+//! （[`V8ProcessEngine::inject_global_function`]）。DOM 風オブジェクト
+//! （[`V8ProcessEngine::bind_dom_like_object`]）も同じ登録簿に種別を足して
+//! 保持し、子の再起動時に登録順どおり再登録する（`TASK-29.5b`・Issue #525）。
 //!
 //! `NativeFn` の実行時間は、評価開始時に 1 度だけ計算する期限
 //! （[`EVALUATE_RECV_TIMEOUT`]）に含まれる。この期限は
@@ -104,8 +104,10 @@
 //!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
-//! - DOM 風オブジェクトの再登録は #525 で対応する（Issue #527）。
-//!   `impl JsEngine for V8ProcessEngine`（`TASK-29.6`・Issue #157）は未実装で、
+//! - 子 → 親へ `ObjectHandle` を渡す経路（オブジェクト参照の往復・親の handle
+//!   照合）は未実装で、現状は fail-closed で拒否する（`TASK-29.5b` の
+//!   後続作業。REPAIR-3）。setter（書き込み可能プロパティ）も未対応。
+//! - `impl JsEngine for V8ProcessEngine`（`TASK-29.6`・Issue #157）は未実装で、
 //!   トレイトの `NativeFn`（`Send` なし）と本型の [`ParentNativeFn`]（`Send`
 //!   あり）の不一致の橋渡しもそこで決める
 //! - 期限を過ぎて放棄された `NativeFn` のスレッドが `Mutex` を握ったままの
@@ -167,7 +169,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::engine_trait::{EngineKind, EvaluateOptions, JsEngineError, JsValue, NativeCallContext};
+use super::engine_trait::{
+    EngineKind, EvaluateOptions, JsEngineError, JsValue, NativeCallContext, ObjectHandle,
+};
 // ドキュメントコメントのリンク解決専用（実行時には使わない）。
 #[cfg(doc)]
 use super::engine_trait::NativeFn;
@@ -1033,15 +1037,48 @@ pub use spawn_config::WorkerSpawnConfigForTest;
 #[cfg(not(feature = "test-support"))]
 use spawn_config::WorkerSpawnConfigForTest;
 
-/// ホストが登録したグローバル関数の名前と id（`TASK-29`・Issue #527）。
+/// ホストが登録したグローバル名（関数・DOM 風オブジェクト）の登録簿の 1 件
+/// （`TASK-29`・Issue #527、`TASK-29.5b`・Issue #525）。
 ///
 /// [`V8ProcessEngine`] がエンジンの寿命のあいだ保持し、`spawn_worker` が
-/// 子を起動するたびに登録フレーム経由で新しい子へ登録し直す。`id` は `V8ProcessEngine::native_fns` の添字と対応する。
-/// DOM 風オブジェクトの登録は未対応で、#525（`TASK-29.5b`）が種別を足す。
+/// 子を起動するたびに、登録した順に種別ごとのフレーム
+/// （`REGISTER_GLOBAL_FUNCTION` / `BIND_DOM_LIKE_OBJECT`）で新しい子へ
+/// 登録し直す。`id`・`native_call_id` は `V8ProcessEngine::native_fns` の
+/// 添字と対応する。
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct HostBinding {
-    name: String,
-    id: u32,
+enum HostBinding {
+    /// グローバル関数（[`V8ProcessEngine::inject_global_function`]）。
+    GlobalFunction { name: String, id: u32 },
+    /// DOM 風オブジェクト（[`V8ProcessEngine::bind_dom_like_object`]）。
+    DomLikeObject(worker_protocol::DomLikeObjectBinding),
+}
+
+impl HostBinding {
+    /// グローバルに生える名前（重複判定用）。
+    fn name(&self) -> &str {
+        match self {
+            Self::GlobalFunction { name, .. } => name,
+            Self::DomLikeObject(binding) => &binding.name,
+        }
+    }
+}
+
+/// [`V8ProcessEngine::bind_dom_like_object`] に渡す DOM 風オブジェクトの
+/// メンバー実装（`JS-1`・`TASK-29.5b`・Issue #525）。
+///
+/// `#[doc(hidden)] pub` である理由: 結合テスト（別 crate）が使えるよう
+/// にするため（[`V8ProcessEngine`] と同じ）。ワイヤ用の
+/// `worker_protocol::DomLikeMemberKind` は `pub(crate)` のため別に持つ。
+///
+/// 未実装（REPAIR-3）: 書き込み可能プロパティ（setter）。プロトコルは kind を
+/// 予約しているだけで、`#[non_exhaustive]` により後から variant を足せる。
+#[doc(hidden)]
+#[non_exhaustive]
+pub enum DomLikeMemberFn {
+    /// メソッド。JS の呼び出しごとに引数付きで呼ばれる。
+    Method(ParentNativeFn),
+    /// 読み取り専用プロパティ（getter）。参照ごとに引数 `[]` で呼ばれる。
+    Getter(ParentNativeFn),
 }
 
 /// JS 評価を子プロセスへ分離して提供するエンジン（`JS-1`・Issue #503）。
@@ -1154,13 +1191,21 @@ impl V8ProcessEngine {
             &self.spawn_config.native_proxies_for_test,
             name,
         )?;
+        validate_native_fn_capacity(self.native_fns.len(), 1)?;
 
         let mut worker = self.take_live_worker()?;
         let deadline = Instant::now() + REGISTER_ACK_TIMEOUT;
-        match register_one(&mut worker, id, name, deadline) {
+        let payload = worker_protocol::encode_register_global_function(id, name);
+        match register_one(
+            &mut worker,
+            tag::REGISTER_GLOBAL_FUNCTION,
+            &payload,
+            "a global function registration",
+            deadline,
+        ) {
             Ok(RegisterAck::Registered) => {
                 self.native_fns.push(Arc::new(Mutex::new(func)));
-                self.host_bindings.push(HostBinding {
+                self.host_bindings.push(HostBinding::GlobalFunction {
                     name: name.to_string(),
                     id,
                 });
@@ -1173,6 +1218,113 @@ impl V8ProcessEngine {
                 Err(JsEngineError::BindingFailed(message))
             }
             // `register_one` が子を破棄済み。`worker` はここで drop される。
+            Err(err) => Err(err),
+        }
+    }
+
+    /// DOM 風オブジェクトをグローバル `name` として bind する
+    /// （`JS-1`「DOM 風オブジェクトへのバインディング」・`TASK-29.5b`・
+    /// Issue #525）。
+    ///
+    /// 子の永続 Context へ、メンバーごとの逆方向 RPC プロキシを持つオブジェクト
+    /// を `BIND_DOM_LIKE_OBJECT` フレームで登録し、応答を待って
+    /// [`ObjectHandle`] を返す。JS からの `dom.method(args)` /
+    /// `dom.prop`（getter）は `NativeCall` で親へ届き、`members` の対応する
+    /// [`ParentNativeFn`] が [`dispatch_native_call`] 経由で実行される
+    /// （getter は引数 `[]`）。bind 内容はエンジンの寿命のあいだ保持され、
+    /// 子の再起動でも登録順に登録し直される（スクリプトの状態は戻らない）。
+    ///
+    /// 次のいずれかなら [`JsEngineError::BindingFailed`] を返し、登録簿を
+    /// 変更しない（fail-closed。子と Context は残る）:
+    ///
+    /// - `name`・メンバー名が空・長すぎる・メンバー名が重複・メンバー数が
+    ///   上限（256）超過
+    /// - `name` が既存のグローバル関数・DOM 風オブジェクトと重複、グローバル名の
+    ///   件数上限（[`MAX_NATIVE_FUNCTIONS`]）超過、`native_fns` の総数が
+    ///   [`MAX_NATIVE_FUNCTIONS`] を超える
+    /// - 子が拒否した（`undefined` 等 non-configurable な名前）
+    ///
+    /// 応答が想定外・期限切れ・子の異常終了なら子を破棄して
+    /// `EngineUnavailable` 等を返す（"context was discarded"）。
+    ///
+    /// 未実装（REPAIR-3）: トレイト [`super::engine_trait::JsEngine`] の
+    /// `bind_dom_like_object`（メソッドのみ・`NativeFn`）への集約は
+    /// `TASK-29.6`（Issue #157）。setter と、bind したオブジェクト自体を
+    /// JS 値として往復させる変換（`JsValue::ObjectHandle` の照合）も未対応で、
+    /// 子発の handle は引き続き fail-closed で拒否する。
+    #[doc(hidden)]
+    pub fn bind_dom_like_object(
+        &mut self,
+        name: &str,
+        members: Vec<(String, DomLikeMemberFn)>,
+    ) -> Result<ObjectHandle, JsEngineError> {
+        // 何も確保・送信する前に検証する（fail-closed）。
+        validate_new_host_binding(
+            &self.host_bindings,
+            &self.spawn_config.native_proxies_for_test,
+            name,
+        )?;
+        validate_native_fn_capacity(self.native_fns.len(), members.len())?;
+        let dom_count = self
+            .host_bindings
+            .iter()
+            .filter(|b| matches!(b, HostBinding::DomLikeObject(_)))
+            .count();
+        let handle_id = u32::try_from(dom_count).map_err(|_| {
+            JsEngineError::BindingFailed("DOM-like object handle does not fit in a u32".to_string())
+        })?;
+        let handle = ObjectHandle::from_raw(handle_id);
+        let mut wire_members = Vec::with_capacity(members.len());
+        let mut funcs = Vec::with_capacity(members.len());
+        for (member_name, member_fn) in members {
+            let native_call_id = u32::try_from(self.native_fns.len().saturating_add(funcs.len()))
+                .map_err(|_| {
+                JsEngineError::BindingFailed(
+                    "native function registry index does not fit in a u32".to_string(),
+                )
+            })?;
+            let (kind, func) = match member_fn {
+                DomLikeMemberFn::Method(f) => (worker_protocol::DomLikeMemberKind::Method, f),
+                DomLikeMemberFn::Getter(f) => (worker_protocol::DomLikeMemberKind::Property, f),
+            };
+            wire_members.push(worker_protocol::DomLikeMember {
+                kind,
+                name: member_name,
+                native_call_id,
+            });
+            funcs.push(func);
+        }
+        let binding = worker_protocol::DomLikeObjectBinding {
+            handle,
+            name: name.to_string(),
+            members: wire_members,
+        };
+        let payload = worker_protocol::encode_bind_dom_like_object(&binding)
+            .map_err(|e| JsEngineError::BindingFailed(e.to_string()))?;
+
+        let mut worker = self.take_live_worker()?;
+        let deadline = Instant::now() + REGISTER_ACK_TIMEOUT;
+        match register_one(
+            &mut worker,
+            tag::BIND_DOM_LIKE_OBJECT,
+            &payload,
+            "a DOM-like object bind",
+            deadline,
+        ) {
+            Ok(RegisterAck::Registered) => {
+                for func in funcs {
+                    self.native_fns.push(Arc::new(Mutex::new(func)));
+                }
+                self.host_bindings.push(HostBinding::DomLikeObject(binding));
+                self.worker = Some(worker);
+                Ok(handle)
+            }
+            Ok(RegisterAck::Rejected(message)) => {
+                // 登録簿は変更しない。子と Context は生きている。
+                self.worker = Some(worker);
+                Err(JsEngineError::BindingFailed(message))
+            }
+            // `register_one` が子を破棄済み。
             Err(err) => Err(err),
         }
     }
@@ -1399,7 +1551,31 @@ impl V8ProcessEngine {
         // 期限は Hello 受信後に 1 回だけ計算する。
         let deadline = Instant::now() + REGISTER_ACK_TIMEOUT;
         for binding in &self.host_bindings {
-            match register_one(&mut worker, binding.id, &binding.name, deadline)? {
+            let (frame_tag, payload, what) = match binding {
+                HostBinding::GlobalFunction { name, id } => (
+                    tag::REGISTER_GLOBAL_FUNCTION,
+                    worker_protocol::encode_register_global_function(*id, name),
+                    "a global function registration",
+                ),
+                HostBinding::DomLikeObject(dom) => {
+                    let payload = match worker_protocol::encode_bind_dom_like_object(dom) {
+                        Ok(payload) => payload,
+                        Err(err) => {
+                            // 登録時に一度 encode できた内容なので通常は到達しない。
+                            worker.terminate_now();
+                            let tail = worker.reap_and_collect_stderr();
+                            return Err(discard_context_error(&worker, &tail, || {
+                                JsEngineError::EngineUnavailable(format!(
+                                    "failed to re-encode the DOM-like object {:?}: {err}",
+                                    dom.name
+                                ))
+                            }));
+                        }
+                    };
+                    (tag::BIND_DOM_LIKE_OBJECT, payload, "a DOM-like object bind")
+                }
+            };
+            match register_one(&mut worker, frame_tag, &payload, what, deadline)? {
                 RegisterAck::Registered => {}
                 RegisterAck::Rejected(message) => {
                     // 一度成功した名前が fresh な Context で失敗するのは想定外
@@ -1408,9 +1584,9 @@ impl V8ProcessEngine {
                     let tail = worker.reap_and_collect_stderr();
                     return Err(discard_context_error(&worker, &tail, || {
                         JsEngineError::EngineUnavailable(format!(
-                            "JS worker process rejected re-registration of the global function \
+                            "JS worker process rejected re-registration of the global name \
                              {:?}: {message}; stderr: {tail}",
-                            binding.name
+                            binding.name()
                         ))
                     }));
                 }
@@ -1742,8 +1918,8 @@ impl V8ProcessEngine {
                         // バイトが付いたプロトコル違反として扱う。
                         // codex レビュー指摘 #593 P1: 子が送る `ObjectHandle` は
                         // untrusted で、親の登録簿と照合する契約
-                        // （`ObjectHandle` のドキュメント）。登録簿は Issue #525
-                        // （`TASK-29.5b`）で導入するため、それまでは子 → 親の
+                        // （`ObjectHandle` のドキュメント）。登録簿の照合（handle の往復）は
+                        // `TASK-29.5b` の後続作業で導入するため、それまでは子 → 親の
                         // `ObjectHandle` を拒否する（fail-closed。未登録 ID が
                         // 親側で bind 済みオブジェクトとして流通しない）。
                         Ok((JsValue::ObjectHandle(handle), _)) => {
@@ -2097,7 +2273,7 @@ enum NativeDispatchViolation {
     /// 期限切れであり、呼び出し元は [`JsEngineError::Timeout`] へ変換する。
     DeadlineExceeded,
     /// 引数に [`JsValue::ObjectHandle`] が含まれていた。親の handle 登録簿
-    /// は Issue #525（`TASK-29.5b`）で導入するため、それまでは照合できない
+    /// の照合は `TASK-29.5b` の後続作業で導入するため、それまでは照合できない
     /// 子発の handle を fail-closed で拒否する。
     UnregisteredHandle { handle: u32 },
 }
@@ -2168,7 +2344,7 @@ fn dispatch_native_call(
 ) -> Result<Vec<u8>, NativeDispatchViolation> {
     let (id, args) = worker_protocol::decode_native_call(payload)
         .map_err(NativeDispatchViolation::DecodeFailed)?;
-    // 子発の `ObjectHandle` は親の登録簿（Issue #525）と照合できるまで拒否する。
+    // 子発の `ObjectHandle` は親の登録簿と照合できるようになるまで（後続作業）拒否する。
     if let Some(JsValue::ObjectHandle(handle)) =
         args.iter().find(|v| matches!(v, JsValue::ObjectHandle(_)))
     {
@@ -2477,13 +2653,30 @@ fn validate_new_host_binding(
     name: &str,
 ) -> Result<(), JsEngineError> {
     validate_binding_name(name)?;
-    let duplicate = existing.iter().any(|b| b.name == name) || extra.iter().any(|(n, _)| n == name);
+    let duplicate =
+        existing.iter().any(|b| b.name() == name) || extra.iter().any(|(n, _)| n == name);
     if duplicate {
         return Err(JsEngineError::BindingFailed(format!(
             "native function {name:?} is already registered"
         )));
     }
-    if existing.len() >= MAX_NATIVE_FUNCTIONS {
+    // グローバル名の件数（子の `registered_count` 上限と同じ値）。
+    if existing.len() >= worker_protocol::MAX_REGISTERED_GLOBAL_FUNCTIONS {
+        return Err(JsEngineError::BindingFailed(format!(
+            "cannot register more than {} global names",
+            worker_protocol::MAX_REGISTERED_GLOBAL_FUNCTIONS
+        )));
+    }
+    Ok(())
+}
+
+/// `native_fns` へ `additional` 件足しても [`MAX_NATIVE_FUNCTIONS`] を超えない
+/// ことを、確保・送信の前に検証する純粋関数（`TASK-29.5b`・Issue #525）。
+///
+/// DOM 風オブジェクトは 1 個で複数の `native_fns` を使うため、グローバル名の
+/// 件数（[`validate_new_host_binding`]）とは別に総数を検査する。
+fn validate_native_fn_capacity(current: usize, additional: usize) -> Result<(), JsEngineError> {
+    if current.saturating_add(additional) > MAX_NATIVE_FUNCTIONS {
         return Err(JsEngineError::BindingFailed(format!(
             "cannot register more than {MAX_NATIVE_FUNCTIONS} native functions"
         )));
@@ -2607,25 +2800,23 @@ fn interpret_register_ack(
     }
 }
 
-/// 登録フレームを 1 件送り、応答を期限付きで待つ（`TASK-29.4`・Issue #155。
-/// [`V8ProcessEngine::inject_global_function`] と `spawn_worker` の共通部）。
+/// 登録系フレーム（`REGISTER_GLOBAL_FUNCTION` / `BIND_DOM_LIKE_OBJECT`）を
+/// 1 件送り、応答を期限付きで待つ（`TASK-29.4`・Issue #155、`TASK-29.5b`・
+/// Issue #525。[`V8ProcessEngine::inject_global_function`]・
+/// [`V8ProcessEngine::bind_dom_like_object`]・`spawn_worker` の共通部）。
+/// どちらの応答も `RESULT(Undefined)` / `ERROR{Binding}` で、
+/// [`interpret_register_ack`] が解釈する。`what` はエラーメッセージ用の名詞句。
 ///
 /// `Err` を返すときは必ず子を破棄済み（kill → reap → "context was
 /// discarded" を含むエラー）。`Ok(Rejected)` では子と Context は生きている。
 fn register_one(
     worker: &mut WorkerHandle,
-    id: u32,
-    name: &str,
+    frame_tag: u8,
+    payload: &[u8],
+    what: &'static str,
     deadline: Instant,
 ) -> Result<RegisterAck, JsEngineError> {
-    let payload = worker_protocol::encode_register_global_function(id, name);
-    write_frame_with_deadline(
-        worker,
-        tag::REGISTER_GLOBAL_FUNCTION,
-        &payload,
-        deadline,
-        "a global function registration",
-    )?;
+    write_frame_with_deadline(worker, frame_tag, payload, deadline, what)?;
 
     let recv_wait = deadline.saturating_duration_since(Instant::now());
     // 期限後にキューに残っていた応答を成功として扱わない（評価待ちと同じ扱い）。
@@ -2650,19 +2841,16 @@ fn register_one(
             let tail = worker.reap_and_collect_stderr();
             return Err(discard_context_error(worker, &tail, || {
                 JsEngineError::EngineUnavailable(format!(
-                    "JS worker process terminated unexpectedly during a global function \
-                     registration; stderr: {tail}"
+                    "JS worker process terminated unexpectedly during {what}; stderr: {tail}"
                 ))
             }));
         }
         Ok(ReaderEvent::Invalid(desc)) => (
-            format!("JS worker process sent a malformed frame during a registration: {desc}"),
+            format!("JS worker process sent a malformed frame during {what}: {desc}"),
             false,
         ),
         Err(mpsc::RecvTimeoutError::Timeout) => (
-            "global function registration exceeded the deadline and the JS worker process was \
-             killed"
-                .to_string(),
+            format!("{what} exceeded the deadline and the JS worker process was killed"),
             true,
         ),
         Err(mpsc::RecvTimeoutError::Disconnected) => (
@@ -3852,7 +4040,7 @@ mod tests {
     }
 
     fn hb(name: &str, id: u32) -> HostBinding {
-        HostBinding {
+        HostBinding::GlobalFunction {
             name: name.to_string(),
             id,
         }
@@ -3899,17 +4087,24 @@ mod tests {
         assert!(validate_new_host_binding(&[hb("f", 0)], &[], "F").is_ok());
     }
 
-    /// TASK-29.4: 件数上限（1025 件目）。
+    /// TASK-29.4・TASK-29.5b: グローバル名の件数上限と `native_fns` 総数の上限は
+    /// 別々に検査する（DOM 風オブジェクトは 1 名で複数の関数を使うため）。
     #[test]
     fn js_1_validate_new_host_binding_enforces_the_count_limit() {
-        let existing: Vec<HostBinding> = (0..MAX_NATIVE_FUNCTIONS as u32)
-            .map(|i| hb(&format!("f{i}"), i))
-            .collect();
+        let limit = worker_protocol::MAX_REGISTERED_GLOBAL_FUNCTIONS;
+        let existing: Vec<HostBinding> =
+            (0..limit as u32).map(|i| hb(&format!("f{i}"), i)).collect();
         assert_eq!(
             binding_failed_msg(validate_new_host_binding(&existing, &[], "extra")),
-            "cannot register more than 1024 native functions"
+            format!("cannot register more than {limit} global names")
         );
         assert!(validate_new_host_binding(&existing[1..], &[], "extra").is_ok());
+
+        assert!(validate_native_fn_capacity(MAX_NATIVE_FUNCTIONS - 2, 2).is_ok());
+        assert_eq!(
+            binding_failed_msg(validate_native_fn_capacity(MAX_NATIVE_FUNCTIONS - 1, 2)),
+            "cannot register more than 1024 native functions"
+        );
     }
 
     /// テスト専用の環境変数経路の値の組み立て（空は None・区切り文字は拒否）。

@@ -26,7 +26,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fandhe_browser_js::process_engine::ParentNativeFn;
+use fandhe_browser_js::process_engine::{DomLikeMemberFn, ParentNativeFn};
 use fandhe_browser_js::process_engine::{V8ProcessEngine, WorkerSpawnConfigForTest};
 use fandhe_browser_js::{EvaluateOptions, JsEngineError, JsValue, NativeCallContext};
 
@@ -161,6 +161,20 @@ fn main() -> ExitCode {
         );
         js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_limit();
     }
+    eprintln!("case: js_1_dom_like_object_method_and_property_are_callable_from_js");
+    js_1_dom_like_object_method_and_property_are_callable_from_js();
+    eprintln!("case: js_1_binding_dom_like_object_into_running_worker_keeps_context");
+    js_1_binding_dom_like_object_into_running_worker_keeps_context();
+    eprintln!("case: js_1_dom_like_object_is_reinstalled_after_worker_respawn");
+    js_1_dom_like_object_is_reinstalled_after_worker_respawn();
+    eprintln!("case: js_1_dom_like_object_name_colliding_with_global_function_is_binding_failed");
+    js_1_dom_like_object_name_colliding_with_global_function_is_binding_failed();
+    eprintln!(
+        "case: js_1_dom_like_object_with_non_configurable_name_is_binding_failed_and_keeps_worker"
+    );
+    js_1_dom_like_object_with_non_configurable_name_is_binding_failed_and_keeps_worker();
+    eprintln!("case: js_1_dom_like_member_error_is_catchable_and_keeps_context");
+    js_1_dom_like_member_error_is_catchable_and_keeps_context();
     eprintln!("v8_worker: all cases passed");
     ExitCode::SUCCESS
 }
@@ -1450,6 +1464,318 @@ fn js_1_injecting_a_duplicate_name_is_binding_failed() {
             .evaluate_script("f()", &EvaluateOptions::default())
             .unwrap_or_else(|err| panic!("the existing registration must work: {err}")),
         JsValue::Number(42.0)
+    );
+}
+
+/// テスト用: 固定値を返すメソッド実装。
+fn constant_method(value: JsValue) -> DomLikeMemberFn {
+    DomLikeMemberFn::Method(Box::new(
+        move |_args: &[JsValue], _ctx: &NativeCallContext| Ok(value.clone()),
+    ))
+}
+
+/// `TASK-29.5b`・Issue #525 受入基準 1〜3: bind した DOM 風オブジェクトの
+/// メソッド呼び出しは引数付きで、getter 参照は引数 `[]` で親の実装へ届き、
+/// 戻り値が JS へ返る。getter は読み取り専用で代入しても値は変わらない。
+fn js_1_dom_like_object_method_and_property_are_callable_from_js() {
+    let method_args: Arc<Mutex<Vec<JsValue>>> = Arc::new(Mutex::new(Vec::new()));
+    let getter_args: Arc<Mutex<Option<Vec<JsValue>>>> = Arc::new(Mutex::new(None));
+    let method_seen = Arc::clone(&method_args);
+    let getter_seen = Arc::clone(&getter_args);
+    let mut engine = V8ProcessEngine::new();
+    let handle = engine
+        .bind_dom_like_object(
+            "dom",
+            vec![
+                (
+                    "setText".to_string(),
+                    DomLikeMemberFn::Method(Box::new(
+                        move |args: &[JsValue], _ctx: &NativeCallContext| {
+                            *method_seen.lock().unwrap() = args.to_vec();
+                            Ok(JsValue::Number(args.len() as f64))
+                        },
+                    )),
+                ),
+                (
+                    "title".to_string(),
+                    DomLikeMemberFn::Getter(Box::new(
+                        move |args: &[JsValue], _ctx: &NativeCallContext| {
+                            *getter_seen.lock().unwrap() = Some(args.to_vec());
+                            Ok(JsValue::String("Hello".to_string()))
+                        },
+                    )),
+                ),
+            ],
+        )
+        .unwrap_or_else(|err| panic!("bind must succeed: {err}"));
+    let _ = handle;
+
+    let opts = EvaluateOptions::default();
+    assert_eq!(
+        engine
+            .evaluate_script("dom.setText('x', 2)", &opts)
+            .unwrap_or_else(|err| panic!("method call must succeed: {err}")),
+        JsValue::Number(2.0)
+    );
+    assert_eq!(
+        *method_args.lock().unwrap(),
+        vec![JsValue::String("x".to_string()), JsValue::Number(2.0)]
+    );
+    assert_eq!(
+        engine
+            .evaluate_script("dom.title", &opts)
+            .unwrap_or_else(|err| panic!("property read must succeed: {err}")),
+        JsValue::String("Hello".to_string())
+    );
+    assert_eq!(*getter_args.lock().unwrap(), Some(Vec::new()));
+    assert_eq!(
+        engine
+            .evaluate_script("dom.title = 'y'; dom.title", &opts)
+            .unwrap_or_else(|err| panic!("assignment must be ignored: {err}")),
+        JsValue::String("Hello".to_string())
+    );
+    assert_eq!(
+        engine
+            .evaluate_script("typeof dom.setText", &opts)
+            .unwrap_or_else(|err| panic!("typeof must succeed: {err}")),
+        JsValue::String("function".to_string())
+    );
+}
+
+/// `TASK-29.5b`・Issue #525: 起動済みの子へ bind しても Context（スクリプトの
+/// 状態）と子プロセスは保たれる。
+fn js_1_binding_dom_like_object_into_running_worker_keeps_context() {
+    let mut engine = V8ProcessEngine::new();
+    engine
+        .evaluate_script("var x = 5;", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("setup must succeed: {err}"));
+    let pid_before = engine
+        .worker_pid_for_test()
+        .expect("worker must be running");
+    engine
+        .bind_dom_like_object(
+            "dom",
+            vec![("m".to_string(), constant_method(JsValue::Number(1.0)))],
+        )
+        .unwrap_or_else(|err| panic!("bind must succeed: {err}"));
+    assert_eq!(engine.worker_pid_for_test(), Some(pid_before));
+    assert_eq!(
+        engine
+            .evaluate_script("x + dom.m()", &EvaluateOptions::default())
+            .unwrap_or_else(|err| panic!("evaluation must succeed: {err}")),
+        JsValue::Number(6.0)
+    );
+}
+
+/// `TASK-29.5b`・Issue #525・`TASK-29`・Issue #527: 子が破棄されて起動し直
+/// されると、関数と DOM 風オブジェクトは登録順に新しい子へ登録し直される。
+/// スクリプトが作った状態は戻らない。
+fn js_1_dom_like_object_is_reinstalled_after_worker_respawn() {
+    let mut engine = V8ProcessEngine::new();
+    engine
+        .inject_global_function(
+            "f",
+            Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| Ok(JsValue::Number(1.0))),
+        )
+        .unwrap_or_else(|err| panic!("inject must succeed: {err}"));
+    engine
+        .bind_dom_like_object(
+            "dom",
+            vec![
+                ("m".to_string(), constant_method(JsValue::Number(2.0))),
+                (
+                    "p".to_string(),
+                    DomLikeMemberFn::Getter(Box::new(
+                        |_args: &[JsValue], _ctx: &NativeCallContext| {
+                            Ok(JsValue::String("prop".to_string()))
+                        },
+                    )),
+                ),
+            ],
+        )
+        .unwrap_or_else(|err| panic!("bind must succeed: {err}"));
+    engine
+        .inject_global_function(
+            "g",
+            Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| Ok(JsValue::Number(3.0))),
+        )
+        .unwrap_or_else(|err| panic!("inject must succeed: {err}"));
+    engine
+        .evaluate_script("var before = 1;", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("marker declaration must succeed: {err}"));
+    let pid_before = engine
+        .worker_pid_for_test()
+        .expect("a worker must be running");
+
+    let mut malformed_frame = Vec::new();
+    malformed_frame.extend_from_slice(&1u32.to_le_bytes());
+    malformed_frame.push(200);
+    engine
+        .send_raw_frame_for_test(&malformed_frame)
+        .unwrap_or_else(|err| panic!("writing the malformed frame must succeed: {err}"));
+    match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
+        Err(JsEngineError::EngineUnavailable(msg)) => {
+            assert!(
+                msg.contains("context was discarded")
+                    && msg.contains("the next evaluation runs in a fresh context"),
+                "the discard message must state both facts, got: {msg}"
+            );
+        }
+        other => panic!("expected EngineUnavailable after a protocol violation, got: {other:?}"),
+    }
+
+    assert_eq!(
+        engine
+            .evaluate_script("f() + dom.m() + g()", &EvaluateOptions::default())
+            .unwrap_or_else(|err| panic!("bindings must be reinstalled: {err}")),
+        JsValue::Number(6.0)
+    );
+    assert_eq!(
+        engine
+            .evaluate_script("dom.p", &EvaluateOptions::default())
+            .unwrap_or_else(|err| panic!("getter must be reinstalled: {err}")),
+        JsValue::String("prop".to_string())
+    );
+    let pid_after = engine
+        .worker_pid_for_test()
+        .expect("a new worker must be running");
+    assert_ne!(pid_after, pid_before, "the worker must have been respawned");
+    match engine.evaluate_script("before", &EvaluateOptions::default()) {
+        Err(JsEngineError::EvaluationFailed(msg)) => {
+            assert!(
+                msg.contains("ReferenceError"),
+                "script state must not be reinstalled, got: {msg}"
+            );
+        }
+        other => panic!("expected ReferenceError for lost script state, got: {other:?}"),
+    }
+}
+
+/// `TASK-29.5b`・Issue #525: 既存のグローバル関数・DOM 風オブジェクトと同名の
+/// bind は `BindingFailed`（既存の登録は使えたまま。逆向きの衝突も同様）。
+fn js_1_dom_like_object_name_colliding_with_global_function_is_binding_failed() {
+    let f: ParentNativeFn =
+        Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| Ok(JsValue::Number(42.0)));
+    let mut engine = engine_with_one_native_fn_for_test("f", f, default_spawn_config());
+    match engine.bind_dom_like_object("f", vec![("m".to_string(), constant_method(JsValue::Null))])
+    {
+        Err(JsEngineError::BindingFailed(msg)) => {
+            assert_eq!(msg, "native function \"f\" is already registered");
+        }
+        other => panic!("expected BindingFailed, got: {other:?}"),
+    }
+    engine
+        .bind_dom_like_object(
+            "dom",
+            vec![("m".to_string(), constant_method(JsValue::Null))],
+        )
+        .unwrap_or_else(|err| panic!("bind must succeed: {err}"));
+    match engine.bind_dom_like_object(
+        "dom",
+        vec![("m".to_string(), constant_method(JsValue::Null))],
+    ) {
+        Err(JsEngineError::BindingFailed(_)) => {}
+        other => panic!("expected BindingFailed for a duplicate DOM name, got: {other:?}"),
+    }
+    let g: ParentNativeFn =
+        Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| Ok(JsValue::Undefined));
+    match engine.inject_global_function("dom", g) {
+        Err(JsEngineError::BindingFailed(_)) => {}
+        other => panic!("expected BindingFailed for a function named like a DOM object: {other:?}"),
+    }
+    assert_eq!(
+        engine
+            .evaluate_script("f()", &EvaluateOptions::default())
+            .unwrap_or_else(|err| panic!("the existing registration must work: {err}")),
+        JsValue::Number(42.0)
+    );
+    // 重複するメンバー名は登録前に拒否される。
+    match engine.bind_dom_like_object(
+        "dup",
+        vec![
+            ("m".to_string(), constant_method(JsValue::Null)),
+            ("m".to_string(), constant_method(JsValue::Null)),
+        ],
+    ) {
+        Err(JsEngineError::BindingFailed(_)) => {}
+        other => panic!("expected BindingFailed for duplicate members, got: {other:?}"),
+    }
+}
+
+/// `TASK-29.5b`・Issue #525: non-configurable な名前（`undefined`）の bind は
+/// `BindingFailed` になり、子は残り、登録簿に残らない（再起動に影響しない）。
+fn js_1_dom_like_object_with_non_configurable_name_is_binding_failed_and_keeps_worker() {
+    let mut engine = V8ProcessEngine::new();
+    engine
+        .evaluate_script("1", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("setup must succeed: {err}"));
+    let pid_before = engine
+        .worker_pid_for_test()
+        .expect("worker must be running");
+    match engine.bind_dom_like_object(
+        "undefined",
+        vec![("m".to_string(), constant_method(JsValue::Null))],
+    ) {
+        Err(JsEngineError::BindingFailed(_)) => {}
+        other => panic!("expected BindingFailed, got: {other:?}"),
+    }
+    assert_eq!(engine.worker_pid_for_test(), Some(pid_before));
+    engine
+        .bind_dom_like_object(
+            "ok",
+            vec![("m".to_string(), constant_method(JsValue::Number(7.0)))],
+        )
+        .unwrap_or_else(|err| panic!("a valid name must still be bindable: {err}"));
+    let mut malformed_frame = Vec::new();
+    malformed_frame.extend_from_slice(&1u32.to_le_bytes());
+    malformed_frame.push(200);
+    engine
+        .send_raw_frame_for_test(&malformed_frame)
+        .unwrap_or_else(|err| panic!("writing the malformed frame must succeed: {err}"));
+    assert!(matches!(
+        engine.evaluate_script("1", &EvaluateOptions::default()),
+        Err(JsEngineError::EngineUnavailable(_))
+    ));
+    assert_eq!(
+        engine
+            .evaluate_script("ok.m()", &EvaluateOptions::default())
+            .unwrap_or_else(|err| panic!("respawn must reinstall only good names: {err}")),
+        JsValue::Number(7.0)
+    );
+}
+
+/// `TASK-29.5b`・Issue #525: メンバー実装が `Err` を返すと JS で catch でき、
+/// Context は保たれる。
+fn js_1_dom_like_member_error_is_catchable_and_keeps_context() {
+    let mut engine = V8ProcessEngine::new();
+    engine
+        .bind_dom_like_object(
+            "dom",
+            vec![(
+                "fail".to_string(),
+                DomLikeMemberFn::Method(Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| {
+                    Err(JsEngineError::EvaluationFailed("boom".to_string()))
+                })),
+            )],
+        )
+        .unwrap_or_else(|err| panic!("bind must succeed: {err}"));
+    engine
+        .evaluate_script("var kept = 9;", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("setup must succeed: {err}"));
+    assert_eq!(
+        engine
+            .evaluate_script(
+                "try { dom.fail(); 'unreachable' } catch (e) { e.message }",
+                &EvaluateOptions::default()
+            )
+            .unwrap_or_else(|err| panic!("the exception must be catchable: {err}")),
+        JsValue::String("script evaluation failed: boom".to_string())
+    );
+    assert_eq!(
+        engine
+            .evaluate_script("kept", &EvaluateOptions::default())
+            .unwrap_or_else(|err| panic!("the context must survive: {err}")),
+        JsValue::Number(9.0)
     );
 }
 

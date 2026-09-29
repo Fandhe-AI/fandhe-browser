@@ -615,6 +615,21 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
                     }
                 }
             }
+            tag::BIND_DOM_LIKE_OBJECT => {
+                if let Err(err) = handle_bind_dom_like_object(
+                    &mut engine,
+                    &payload,
+                    &mut stdout,
+                    &mut registered_count,
+                ) {
+                    // デコード失敗（プロトコル違反）と応答送信の I/O 失敗の
+                    // どちらも Context の状態を親と揃えられないため終了する。
+                    eprintln!(
+                        "fandhe-browser-js worker: failed to handle BindDomLikeObject: {err}"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
             tag::SHUTDOWN => return ExitCode::SUCCESS,
             other => {
                 eprintln!("fandhe-browser-js worker: protocol violation: unexpected tag {other}");
@@ -706,6 +721,46 @@ fn handle_register_global_function(
     } else {
         engine.install_native_proxy_global(&name, id)
     };
+    respond_to_registration(outcome, stdout, registered_count)
+}
+
+/// `BIND_DOM_LIKE_OBJECT` フレーム 1 件を処理し、応答（成功は
+/// `RESULT(Undefined)`、bind 失敗は `ERROR{Binding}`）を書き返す
+/// （`JS-1`・`TASK-29.5b`・Issue #525）。
+///
+/// 呼び出し元: [`worker_main`] のフレームループ。親側の
+/// `V8ProcessEngine::bind_dom_like_object`（と起動時の登録し直し）が対の
+/// フレームを送る。DOM 風オブジェクト 1 個はグローバル枠 1 つとして
+/// `registered_count` に数える（グローバル関数と同じ上限
+/// [`worker_protocol::MAX_REGISTERED_GLOBAL_FUNCTIONS`]。親を信頼せず子でも
+/// 上限をかける）。`Binding` 失敗では子も Context も生きたまま。
+/// `Err` はデコード失敗（プロトコル違反）または応答送信の失敗のみ。
+fn handle_bind_dom_like_object(
+    engine: &mut V8Engine,
+    payload: &[u8],
+    stdout: &mut impl Write,
+    registered_count: &mut usize,
+) -> Result<(), ProtocolError> {
+    let binding = worker_protocol::decode_bind_dom_like_object(payload)?;
+    let outcome = if *registered_count >= worker_protocol::MAX_REGISTERED_GLOBAL_FUNCTIONS {
+        Err(JsEngineError::BindingFailed(format!(
+            "cannot register more than {} global names",
+            worker_protocol::MAX_REGISTERED_GLOBAL_FUNCTIONS
+        )))
+    } else {
+        engine.install_dom_like_object(&binding)
+    };
+    respond_to_registration(outcome, stdout, registered_count)
+}
+
+/// 登録系フレーム（関数注入・DOM 風 bind）の結果を応答フレームへ変換して
+/// 書く共通部。成功なら件数を進めて `RESULT(Undefined)`、失敗は `ERROR`
+/// （`Evaluation` 相当は防御的に `Binding` へ寄せる）。
+fn respond_to_registration(
+    outcome: Result<(), JsEngineError>,
+    stdout: &mut impl Write,
+    registered_count: &mut usize,
+) -> Result<(), ProtocolError> {
     match outcome {
         Ok(()) => {
             *registered_count += 1;
@@ -716,8 +771,8 @@ fn handle_register_global_function(
         Err(err) => {
             let (kind, message) = classify_evaluation_error(&err);
             let kind = if kind == ErrorKind::Evaluation {
-                // `install_native_proxy_global` は `BindingFailed` しか返さない
-                // 契約だが、防御的に登録失敗として扱う。
+                // install 系は `BindingFailed` しか返さない契約だが、
+                // 防御的に登録失敗として扱う。
                 ErrorKind::Binding
             } else {
                 kind
@@ -1113,6 +1168,94 @@ mod tests {
         assert!(
             handle_register_global_function(&mut engine, &[1, 2], &mut written, &mut count)
                 .is_err()
+        );
+        assert!(written.is_empty());
+    }
+
+    fn sample_bind_payload(name: &str) -> Vec<u8> {
+        use worker_protocol::{DomLikeMember, DomLikeMemberKind, DomLikeObjectBinding};
+        worker_protocol::encode_bind_dom_like_object(&DomLikeObjectBinding {
+            handle: crate::engine_trait::ObjectHandle::from_raw(0),
+            name: name.to_string(),
+            members: vec![DomLikeMember {
+                kind: DomLikeMemberKind::Method,
+                name: "m".to_string(),
+                native_call_id: 1,
+            }],
+        })
+        .expect("encode")
+    }
+
+    /// JS-1・TASK-29.5b: bind に成功すると `RESULT(Undefined)` が書かれ件数が増える。
+    #[test]
+    fn js_1_bind_dom_like_object_success_responds_with_undefined() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let mut written = Vec::new();
+        let mut count = 0usize;
+        handle_bind_dom_like_object(
+            &mut engine,
+            &sample_bind_payload("dom"),
+            &mut written,
+            &mut count,
+        )
+        .expect("handled");
+        assert_eq!(count, 1);
+        let (frame_tag, body) = read_one_response(written);
+        assert_eq!(frame_tag, tag::RESULT);
+        assert_eq!(
+            worker_protocol::decode_js_value(&body).expect("decode"),
+            (JsValue::Undefined, body.len())
+        );
+    }
+
+    /// JS-1・TASK-29.5b: 登録できない名前は `ERROR{Binding}`（件数は増えず子は生きる）。
+    #[test]
+    fn js_1_bind_dom_like_object_failure_responds_with_binding_error() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let mut written = Vec::new();
+        let mut count = 0usize;
+        handle_bind_dom_like_object(
+            &mut engine,
+            &sample_bind_payload("undefined"),
+            &mut written,
+            &mut count,
+        )
+        .expect("a binding failure is not a protocol violation");
+        assert_eq!(count, 0);
+        let (frame_tag, body) = read_one_response(written);
+        assert_eq!(frame_tag, tag::ERROR);
+        assert_eq!(
+            worker_protocol::decode_error(&body).expect("decode").0,
+            ErrorKind::Binding
+        );
+    }
+
+    /// JS-1・TASK-29.5b: 件数が上限に達していれば `ERROR{Binding}`。
+    #[test]
+    fn js_1_bind_dom_like_object_rejects_beyond_the_count_limit() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let mut written = Vec::new();
+        let mut count = worker_protocol::MAX_REGISTERED_GLOBAL_FUNCTIONS;
+        handle_bind_dom_like_object(
+            &mut engine,
+            &sample_bind_payload("dom"),
+            &mut written,
+            &mut count,
+        )
+        .expect("handled");
+        assert_eq!(count, worker_protocol::MAX_REGISTERED_GLOBAL_FUNCTIONS);
+        let (frame_tag, _) = read_one_response(written);
+        assert_eq!(frame_tag, tag::ERROR);
+    }
+
+    /// JS-1・TASK-29.5b: 壊れたペイロードはプロトコル違反として `Err`。
+    #[test]
+    fn js_1_bind_dom_like_object_malformed_payload_is_an_error() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let mut written = Vec::new();
+        let mut count = 0usize;
+        assert!(
+            handle_bind_dom_like_object(&mut engine, &[1, 2], &mut written, &mut count).is_err()
         );
         assert!(written.is_empty());
     }

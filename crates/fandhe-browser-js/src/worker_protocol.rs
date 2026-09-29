@@ -39,9 +39,8 @@
 //!   （handle ID・グローバル名・メンバー名と `NativeCall` ID の対応表。
 //!   [`encode_bind_dom_like_object`]/[`decode_bind_dom_like_object`]）。
 //!   応答は `RESULT(Undefined)`（成功）または `ERROR{Binding}`（失敗）。
-//!   **定義のみ**: 子の処理・親の送信は Issue #525（`TASK-29.5b`）で実装
-//!   する。それまで子が受け取った場合は未知タグ＝プロトコル違反の経路に
-//!   入る（親はまだ送らない）。`JS-1`・`TASK-29.5a`・Issue #524
+//!   親の送信（`process_engine`）・子の処理（`worker`）は実装済み
+//!   （`TASK-29.5b`・Issue #525）。`JS-1`・`TASK-29.5a`・Issue #524
 //!
 //! # 検証方針（外部入力として扱う。coding-rust.md「外部入力」節）
 //!
@@ -125,13 +124,13 @@ pub(crate) mod tag {
     pub(crate) const REGISTER_GLOBAL_FUNCTION: u8 = 8;
     /// 親 → 子。DOM 風オブジェクトの bind
     /// （[`super::encode_bind_dom_like_object`]。`TASK-29.5a`・Issue #524）。
-    /// 応答は `RESULT(Undefined)` / `ERROR{Binding}`。子の処理・親の送信は
-    /// Issue #525（`TASK-29.5b`）で配線するまで未使用。
+    /// 応答は `RESULT(Undefined)` / `ERROR{Binding}`。親の送信は
+    /// `process_engine`、子の処理は `worker` が担う（Issue #525）。
     #[cfg_attr(
-        not(test),
-        expect(
+        not(any(test, feature = "js-v8")),
+        allow(
             dead_code,
-            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+            reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
         )
     )]
     pub(crate) const BIND_DOM_LIKE_OBJECT: u8 = 9;
@@ -177,10 +176,10 @@ pub(crate) const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
 /// 確保する。ヘッダ最大 266 B ＋ メンバー最大 263 B × 256 件 ＝ 最大
 /// 67,594 B で、[`MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`] に十分収まる。
 #[cfg_attr(
-    not(test),
-    expect(
+    not(any(test, feature = "js-v8")),
+    allow(
         dead_code,
-        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
     )
 )]
 pub(crate) const MAX_DOM_LIKE_OBJECT_MEMBERS: usize = 256;
@@ -188,10 +187,10 @@ pub(crate) const MAX_DOM_LIKE_OBJECT_MEMBERS: usize = 256;
 /// [`DomLikeMember`] の名前の最大バイト数（`JS-1`・`TASK-29.5a`・Issue #524）。
 /// グローバル名の上限は [`MAX_GLOBAL_FUNCTION_NAME_BYTES`] を共用する。
 #[cfg_attr(
-    not(test),
-    expect(
+    not(any(test, feature = "js-v8")),
+    allow(
         dead_code,
-        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
     )
 )]
 pub(crate) const MAX_DOM_LIKE_MEMBER_NAME_BYTES: usize = 256;
@@ -308,48 +307,48 @@ pub(crate) enum ProtocolError {
     /// bind フレームのメンバー数が [`MAX_DOM_LIKE_OBJECT_MEMBERS`] を超えた
     /// （`TASK-29.5a`・Issue #524）。
     #[cfg_attr(
-        not(test),
-        expect(
+        not(any(test, feature = "js-v8")),
+        allow(
             dead_code,
-            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+            reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
         )
     )]
     TooManyDomLikeMembers { count: usize, max: usize },
     /// bind フレームのグローバル名・メンバー名が上限を超えた
     /// （`TASK-29.5a`・Issue #524）。
     #[cfg_attr(
-        not(test),
-        expect(
+        not(any(test, feature = "js-v8")),
+        allow(
             dead_code,
-            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+            reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
         )
     )]
     DomLikeNameTooLong { len: usize, max: usize },
     /// bind フレームのグローバル名・メンバー名が空（`TASK-29.5a`・Issue #524）。
     #[cfg_attr(
-        not(test),
-        expect(
+        not(any(test, feature = "js-v8")),
+        allow(
             dead_code,
-            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+            reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
         )
     )]
     EmptyDomLikeName,
     /// bind フレームのメンバー種別バイトが未知（`TASK-29.5a`・Issue #524）。
     #[cfg_attr(
-        not(test),
-        expect(
+        not(any(test, feature = "js-v8")),
+        allow(
             dead_code,
-            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+            reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
         )
     )]
     InvalidDomLikeMemberKind(u8),
     /// bind フレームでメンバー名が重複した（`TASK-29.5a`・Issue #524）。
     /// untrusted な名前をメッセージへ埋め込まないため名前は保持しない。
     #[cfg_attr(
-        not(test),
-        expect(
+        not(any(test, feature = "js-v8")),
+        allow(
             dead_code,
-            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+            reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
         )
     )]
     DuplicateDomLikeMemberName,
@@ -849,10 +848,10 @@ pub(crate) fn decode_register_global_function(
 /// 予約するのみ（REPAIR-3。デコードは未知の kind として拒否する）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
-    not(test),
-    expect(
+    not(any(test, feature = "js-v8")),
+    allow(
         dead_code,
-        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
     )
 )]
 pub(crate) enum DomLikeMemberKind {
@@ -864,10 +863,10 @@ pub(crate) enum DomLikeMemberKind {
 
 impl DomLikeMemberKind {
     #[cfg_attr(
-        not(test),
-        expect(
+        not(any(test, feature = "js-v8")),
+        allow(
             dead_code,
-            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+            reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
         )
     )]
     fn to_byte(self) -> u8 {
@@ -878,10 +877,10 @@ impl DomLikeMemberKind {
     }
 
     #[cfg_attr(
-        not(test),
-        expect(
+        not(any(test, feature = "js-v8")),
+        allow(
             dead_code,
-            reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+            reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
         )
     )]
     fn from_byte(byte: u8) -> Result<Self, ProtocolError> {
@@ -896,10 +895,10 @@ impl DomLikeMemberKind {
 /// bind する DOM 風オブジェクトの 1 メンバー（`JS-1`・`TASK-29.5a`・Issue #524）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
-    not(test),
-    expect(
+    not(any(test, feature = "js-v8")),
+    allow(
         dead_code,
-        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
     )
 )]
 pub(crate) struct DomLikeMember {
@@ -916,14 +915,14 @@ pub(crate) struct DomLikeMember {
 /// [`tag::BIND_DOM_LIKE_OBJECT`] フレームの内容（`JS-1`・`TASK-29.5a`・
 /// Issue #524）。
 ///
-/// 親（`super::process_engine`。Issue #525 で配線）が子へ送り、子の
+/// 親（`super::process_engine`。Issue #525 で配線済み）が子へ送り、子の
 /// `super::worker` が受けて JS のグローバルへプロキシオブジェクトを生やす。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
-    not(test),
-    expect(
+    not(any(test, feature = "js-v8")),
+    allow(
         dead_code,
-        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
     )
 )]
 pub(crate) struct DomLikeObjectBinding {
@@ -937,10 +936,10 @@ pub(crate) struct DomLikeObjectBinding {
 
 /// bind フレームの名前 1 件を検証する（空・長さ超過を拒否）。
 #[cfg_attr(
-    not(test),
-    expect(
+    not(any(test, feature = "js-v8")),
+    allow(
         dead_code,
-        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
     )
 )]
 fn validate_dom_like_name(name: &str, max: usize) -> Result<(), ProtocolError> {
@@ -966,10 +965,10 @@ fn validate_dom_like_name(name: &str, max: usize) -> Result<(), ProtocolError> {
 /// 空の名前・上限超過・メンバー名の重複は、確保前に検証して
 /// [`ProtocolError`] を返す。
 #[cfg_attr(
-    not(test),
-    expect(
+    not(any(test, feature = "js-v8")),
+    allow(
         dead_code,
-        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
     )
 )]
 pub(crate) fn encode_bind_dom_like_object(
@@ -1026,10 +1025,10 @@ pub(crate) fn encode_bind_dom_like_object(
 /// `u16 LE len` ＋ UTF-8 バイト列を追記する（長さは検証済みの前提だが
 /// `u16` に収まらなければ拒否する）。
 #[cfg_attr(
-    not(test),
-    expect(
+    not(any(test, feature = "js-v8")),
+    allow(
         dead_code,
-        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
     )
 )]
 fn push_dom_like_name(out: &mut Vec<u8>, name: &str) -> Result<(), ProtocolError> {
@@ -1049,10 +1048,10 @@ fn push_dom_like_name(out: &mut Vec<u8>, name: &str) -> Result<(), ProtocolError
 /// 不正 UTF-8・空の名前・長さ超過・未知の kind・メンバー名の重複・末尾の
 /// 余分なバイトはすべて [`ProtocolError`] にする。
 #[cfg_attr(
-    not(test),
-    expect(
+    not(any(test, feature = "js-v8")),
+    allow(
         dead_code,
-        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
     )
 )]
 pub(crate) fn decode_bind_dom_like_object(
@@ -1101,10 +1100,10 @@ pub(crate) fn decode_bind_dom_like_object(
 
 /// [`decode_bind_dom_like_object`] 専用の境界検査付きバイト読み取り。
 #[cfg_attr(
-    not(test),
-    expect(
+    not(any(test, feature = "js-v8")),
+    allow(
         dead_code,
-        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
     )
 )]
 struct DomLikeReader<'a> {
@@ -1113,10 +1112,10 @@ struct DomLikeReader<'a> {
 }
 
 #[cfg_attr(
-    not(test),
-    expect(
+    not(any(test, feature = "js-v8")),
+    allow(
         dead_code,
-        reason = "Issue #525（TASK-29.5b）で配線するまで未使用（REPAIR-3）"
+        reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
     )
 )]
 impl DomLikeReader<'_> {
