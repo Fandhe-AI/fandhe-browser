@@ -550,8 +550,9 @@ pub(crate) fn read_frame(
 ///
 /// 表現: `u8 tag`（0=Undefined, 1=Null, 2=Bool, 3=Number, 4=String,
 /// 5=ObjectHandle）＋ 種別ごとの値（Bool は `u8`、Number は `f64 LE`、
-/// String は `u32 LE len` ＋ UTF-8 バイト列、ObjectHandle は `u32 LE id`）。`String` を自己区切り（長さ明示）に
-/// しているため、将来 `Vec<JsValue>` を連結して送る際（`NativeCall`）にも
+/// String は `u32 LE len` ＋ UTF-8 バイト列、ObjectHandle は `u32 LE id`）。
+///
+/// `String` を自己区切り（長さ明示）にしているため、将来 `Vec<JsValue>` を連結して送る際（`NativeCall`）にも
 /// そのまま再利用できる。
 ///
 /// `JsValue` は `#[non_exhaustive]` だが、本 crate の内側からの `match` は
