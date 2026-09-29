@@ -16,8 +16,11 @@
 //! ヒープサイズのリソース上限（AGENTS.md「リソース上限」P0・codex レビュー
 //! 指摘 #154・#503 対応。ヒープ上限到達時の `Err` 化は Issue #506・#508・
 //! #509・#510）に加え、逆方向 RPC（`NativeCall`）の**子側**（プロキシ関数の
-//! 生成・呼び出し・fatal 時の打ち切り。`TASK-29`・Issue #511）を実装済み
-//! である。以下は未実装（実装済みを装わない。REPAIR-3）。
+//! 生成・呼び出し・fatal 時の打ち切り。`TASK-29`・Issue #511）に加え、
+//! 親側の `NativeCall` dispatch（`NativeFn` の実行・`NativeReturn` の
+//! 返信。`super::process_engine::dispatch_native_call`・`TASK-29`・
+//! Issue #526）を実装済みである。以下は未実装（実装済みを装わない。
+//! REPAIR-3）。
 //!
 //! - [`super::engine_trait::JsEngine`] トレイトへの集約（`TASK-29.6`）。
 //!   本モジュールは同トレイトと同じシグネチャの inherent メソッドとして
@@ -25,20 +28,25 @@
 //!   まだ書かない（29.4「グローバル関数注入」・29.5「DOM 風バインディング」
 //!   と並行して進めるため、共有の impl ブロックを編集し合うコンフリクトを
 //!   避ける）
-//! - 親→子の登録フレームを受け取って
-//!   [`V8Engine::install_native_proxy_global`] を実際に呼ぶ経路
-//!   （`TASK-29.4`「グローバル関数注入」・Issue #155）・DOM 風オブジェクト
-//!   バインディング（`TASK-29.5`・Issue #156）。本モジュールが用意するのは
-//!   プロキシ関数の生成・呼び出し本体までであり、親からの登録フレーム
-//!   自体は未配線
-//! - 親側の `NativeCall` dispatch（`NativeFn` の実行・`NativeReturn` の
-//!   返信。`super::process_engine`・Issue #526）
-//! - 子の再起動時に、以前登録していたプロキシ関数・bind 済みオブジェクトを
-//!   再登録する処理（Issue #512）
+//! - DOM 風オブジェクトの handle を JS 値として往復させる変換
+//!   （オブジェクト自体を引数・戻り値にする。`JsValue::ObjectHandle` の
+//!   プロキシ化。`TASK-29.5`・Issue #156 の後続）は未実装で、setter
+//!   （書き込み可能プロパティ）も未対応である
+//!
+//! DOM 風オブジェクトのプロキシ生成（[`V8Engine::install_dom_like_object`]）と
+//! 親側の dispatch は実装済み（`TASK-29.5b`・Issue #525）。
+//!
+//! なお、親→子の登録フレーム（`REGISTER_GLOBAL_FUNCTION`）による
+//! **グローバル関数注入**（`TASK-29.4`・Issue #155）は実装済みで、
+//! [`super::worker`] が受け取って [`V8Engine::install_native_proxy_global`]
+//! を呼ぶ。
+//!
+//! 引き続き未実装:
+//!
 //! - `create_engine`（`engine_trait.rs`）への配線（`TASK-29.6`・`29.7`）。
 //!   配線すると `tests/conformance.rs` の同梱エンジン向けコンフォーマンス
 //!   テスト（注入・バインディングの契約検証を含む）が V8 に対しても走る
-//!   ため、29.4・29.5 の完了を待つ
+//!   ため、29.5 の完了を待つ
 //! - `v8` 由来のエラーを共通エラー型へ変換する仕組み（`TASK-29.6`）
 //! - 実行時間・入力サイズ・結果サイズ・ヒープサイズの上限値を呼び出し側
 //!   から調整する経路（[`super::engine_trait::EvaluateOptions`] の拡張。
@@ -98,7 +106,8 @@ use super::worker_protocol::{self, NativeReturn};
 /// フレーム由来。#155）として扱い、無制限の長さの文字列で
 /// `v8::String::new` を呼ばないよう、確保前に上限を検査する
 /// （coding-rust.md「外部入力」節・OWASP A04）。
-const MAX_NATIVE_PROXY_NAME_BYTES: usize = 256;
+pub(crate) const MAX_NATIVE_PROXY_NAME_BYTES: usize =
+    worker_protocol::MAX_GLOBAL_FUNCTION_NAME_BYTES;
 
 /// 子プロセス側から親プロセスへ逆方向 RPC（`NativeCall`）を送り、
 /// [`NativeReturn`] が届くまで**同期的にブロックする**窓口（`JS-1`・
@@ -791,10 +800,10 @@ impl V8Engine {
     /// 永続 Context のグローバルスコープへ、逆方向 RPC のプロキシ関数を
     /// `name` という名前で登録する（`JS-1`・`TASK-29`・Issue #511）。
     ///
-    /// 呼び出し元（将来）: 親からの登録フレーム（#155）を受け取った
-    /// [`super::worker`] が、注入すべきグローバル関数ごとに一意な `id` を
-    /// 割り当てて呼ぶ。それまでは本番経路から呼ばれない
-    /// （`#155` 完了までの間、プロキシを登録する手段が本番に無いため）。
+    /// 呼び出し元: 親からの登録フレーム（`REGISTER_GLOBAL_FUNCTION`。
+    /// `TASK-29.4`・Issue #155）を受け取った [`super::worker`] が、親の
+    /// 割り当てた `id` で呼ぶ（`test-support` ビルドでは起動時の事前登録
+    /// フックからも呼ばれる）。
     ///
     /// `name` は外部入力（親からの登録フレーム由来）として検証する:
     /// 空文字列・[`MAX_NATIVE_PROXY_NAME_BYTES`] 超過はいずれも `Err` にする
@@ -812,14 +821,6 @@ impl V8Engine {
     /// non-configurable なアクセサの場合は `Some(false)` を返し失敗する）
     /// ため、setter を実行してしまう余地も、登録に失敗したのに成功したと
     /// 装う余地もない（security.md「偽装・回避機能の禁止」）。
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "親→子の登録フレーム（#155）から呼ばれるまで未配線。\
-                      REPAIR-3"
-        )
-    )]
     pub(crate) fn install_native_proxy_global(
         &mut self,
         name: &str,
@@ -859,6 +860,126 @@ impl V8Engine {
             return Err(JsEngineError::BindingFailed(format!(
                 "failed to register the native proxy function {name:?} on the global object \
                  (Object::CreateDataProperty did not report success)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 永続 Context のグローバルスコープへ、DOM 風オブジェクトのプロキシを
+    /// `binding.name` という名前で登録する（`JS-1`・`TASK-29.5b`・Issue #525）。
+    ///
+    /// 呼び出し元: 親からの `BIND_DOM_LIKE_OBJECT` フレームを受け取った
+    /// [`super::worker`] が、デコード済みの [`worker_protocol::DomLikeObjectBinding`]
+    /// を渡して呼ぶ。親側の対は `V8ProcessEngine::bind_dom_like_object`。
+    ///
+    /// 各メンバーは [`new_native_proxy_function`] が作る関数で、`native_call_id`
+    /// を `NativeCall` の `id` として親へ送る（[`native_proxy_callback`] を
+    /// そのまま再利用する。専用のコールバックは持たない）。
+    ///
+    /// - Method: 関数を `create_data_property` で設定する。
+    /// - Property: 関数を getter とするアクセサ（enumerable・non-configurable・
+    ///   setter なし）として `define_property` する。参照ごとに引数 0 個の
+    ///   `NativeCall` になる。setter が無いため、代入は sloppy mode では無視され
+    ///   strict mode では `TypeError` になる（読み取り専用）。
+    ///
+    /// オブジェクトは完全に組み立ててからグローバルへ付けるので、途中で
+    /// 失敗しても中途半端なグローバルは残らない。名前は JS ソースへ連結せず
+    /// プロパティキーとしてだけ使う（インジェクション対策）。グローバルへは
+    /// [`Self::install_native_proxy_global`] と同じ理由で `set` ではなく
+    /// `create_data_property` を使い、`Some(true)` 以外は登録失敗にする。
+    ///
+    /// `native_proxy_callback` は `this` を見ないため、
+    /// `const f = dom.setText; f('x')` も同じ `NativeCall` になる（意図した挙動）。
+    ///
+    /// 未実装（REPAIR-3）: setter・handle を JS 値として往復させる変換
+    /// （オブジェクト自体を引数・戻り値にする）。
+    pub(crate) fn install_dom_like_object(
+        &mut self,
+        binding: &worker_protocol::DomLikeObjectBinding,
+    ) -> Result<(), JsEngineError> {
+        let fail = |msg: String| JsEngineError::BindingFailed(msg);
+        // 外部入力（親からのフレーム）の多層防御としての再検証。
+        if binding.name.is_empty() {
+            return Err(fail("DOM-like object name must not be empty".to_string()));
+        }
+        if binding.name.len() > MAX_NATIVE_PROXY_NAME_BYTES {
+            return Err(fail(format!(
+                "DOM-like object name exceeds the maximum supported length of \
+                 {MAX_NATIVE_PROXY_NAME_BYTES} bytes"
+            )));
+        }
+        if binding.members.len() > worker_protocol::MAX_DOM_LIKE_OBJECT_MEMBERS {
+            return Err(fail(format!(
+                "DOM-like object has more than {} members",
+                worker_protocol::MAX_DOM_LIKE_OBJECT_MEMBERS
+            )));
+        }
+        for member in &binding.members {
+            if member.name.is_empty() {
+                return Err(fail("DOM-like member name must not be empty".to_string()));
+            }
+            if member.name.len() > worker_protocol::MAX_DOM_LIKE_MEMBER_NAME_BYTES {
+                return Err(fail(format!(
+                    "DOM-like member name exceeds the maximum supported length of {} bytes",
+                    worker_protocol::MAX_DOM_LIKE_MEMBER_NAME_BYTES
+                )));
+            }
+        }
+
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let mut scope = scope.init();
+        let context = v8::Local::new(&scope, &self.context);
+        let scope = &mut v8::ContextScope::new(&mut scope, context);
+
+        let object = v8::Object::new(scope);
+        for member in &binding.members {
+            let Some(function) = new_native_proxy_function(scope, member.native_call_id) else {
+                return Err(fail(
+                    "failed to create a DOM-like member proxy function".to_string(),
+                ));
+            };
+            let Some(key) = v8::String::new(scope, &member.name) else {
+                return Err(fail(
+                    "failed to allocate a DOM-like member name string".to_string(),
+                ));
+            };
+            let key: v8::Local<v8::Name> = key.into();
+            let defined = match member.kind {
+                worker_protocol::DomLikeMemberKind::Method => {
+                    let value: v8::Local<v8::Value> = function.into();
+                    object.create_data_property(scope, key, value)
+                }
+                worker_protocol::DomLikeMemberKind::Property => {
+                    let getter: v8::Local<v8::Value> = function.into();
+                    let setter: v8::Local<v8::Value> = v8::undefined(scope).into();
+                    let mut descriptor = v8::PropertyDescriptor::new_from_get_set(getter, setter);
+                    descriptor.set_enumerable(true);
+                    descriptor.set_configurable(false);
+                    object.define_property(scope, key, &descriptor)
+                }
+            };
+            if defined != Some(true) {
+                return Err(fail(format!(
+                    "failed to define the DOM-like member {:?} (the property definition did \
+                     not report success)",
+                    member.name
+                )));
+            }
+        }
+
+        let Some(name_key) = v8::String::new(scope, &binding.name) else {
+            return Err(fail(
+                "failed to allocate the DOM-like object name string".to_string(),
+            ));
+        };
+        let global = context.global(scope);
+        let name_key: v8::Local<v8::Name> = name_key.into();
+        let value: v8::Local<v8::Value> = object.into();
+        if global.create_data_property(scope, name_key, value) != Some(true) {
+            return Err(fail(format!(
+                "failed to register the DOM-like object {:?} on the global object \
+                 (Object::CreateDataProperty did not report success)",
+                binding.name
             )));
         }
         Ok(())
@@ -1179,6 +1300,10 @@ fn value_to_js_value(
 /// [`native_proxy_callback`] から使う。`JsValue` の全 variant を扱えるため
 /// `Option` を返す（`v8::String::new`・`v8::Number::new` は理論上
 /// アロケーション失敗で `None` を返しうる）。
+///
+/// [`JsValue::ObjectHandle`] は handle の相互変換（`TASK-29.5b` の後続作業）
+/// まで未対応のため `None` を返す（呼び出し元が JS の `Error` を投げる。
+/// 別の値へ黙って変換しない。REPAIR-3）。
 #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
 fn js_value_to_v8_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -1190,6 +1315,7 @@ fn js_value_to_v8_value<'s>(
         JsValue::Bool(b) => v8::Boolean::new(scope, *b).into(),
         JsValue::Number(n) => v8::Number::new(scope, *n).into(),
         JsValue::String(s) => v8::String::new(scope, s)?.into(),
+        JsValue::ObjectHandle(_) => return None,
     })
 }
 
@@ -1199,14 +1325,7 @@ fn js_value_to_v8_value<'s>(
 /// `data` には `id` の数値だけを載せる（`External`・生ポインタは使わない。
 /// 計画書 §3.2「data には数値 ID だけを入れる」）。子プロセスの再起動時に
 /// 同じ `id` で登録し直せば、V8 側のポインタ寿命を気にせず再現できる
-/// （#155・#512 が担う）。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "V8Engine::install_native_proxy_global 経由で #155 完了後に配線される。REPAIR-3"
-    )
-)]
+/// （登録フレーム経由の登録し直しは #155・#527 で実装済み）。
 fn new_native_proxy_function<'s>(
     scope: &v8::PinScope<'s, '_>,
     id: u32,
@@ -1232,7 +1351,9 @@ fn new_native_proxy_function<'s>(
 /// が実際に書き込むバイト数（タグ 1 バイト＋種別ごとの値）を見積もる。
 ///
 /// 表現形式は [`worker_protocol::encoded_js_value_len`] と手作業で
-/// 同期する必要がある（変更時は両方を更新すること）。
+/// 同期する必要がある（変更時は両方を更新すること）。V8 の値からは現時点で
+/// handle は生じない。handle を引数として送れるようにする際は
+/// `encoded_js_value_len` の 5 バイト（タグ 1＋`u32` ID）と同期すること。
 /// `js_1_native_proxy_function_rejects_oversized_argument_payload_without_calling_transport`
 /// が、複数引数の合計サイズが上限を超えるケースで transport が呼ばれない
 /// ことを確認している。
@@ -1289,13 +1410,6 @@ fn native_call_arg_encoded_len(scope: &v8::PinScope<'_, '_>, value: v8::Local<v8
 /// 監視スレッドは呼び出し元のスタックを区別しない）。ネイティブ呼び出し
 /// 中に watchdog が発火した場合は、本コールバックから戻った時点で V8 が
 /// 打ち切る。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "V8Engine::install_native_proxy_global 経由で #155 完了後に配線される。REPAIR-3"
-    )
-)]
 fn native_proxy_callback(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -2393,6 +2507,150 @@ mod tests {
         ));
     }
 
+    fn sample_dom_binding(name: &str) -> worker_protocol::DomLikeObjectBinding {
+        use worker_protocol::{DomLikeMember, DomLikeMemberKind};
+        worker_protocol::DomLikeObjectBinding {
+            handle: crate::engine_trait::ObjectHandle::from_raw(0),
+            name: name.to_string(),
+            members: vec![
+                DomLikeMember {
+                    kind: DomLikeMemberKind::Method,
+                    name: "setText".to_string(),
+                    native_call_id: 4,
+                },
+                DomLikeMember {
+                    kind: DomLikeMemberKind::Property,
+                    name: "title".to_string(),
+                    native_call_id: 5,
+                },
+            ],
+        }
+    }
+
+    /// JS-1・TASK-29.5b・Issue #525: メソッドは引数付きの `NativeCall`、
+    /// プロパティ参照は引数 0 個の `NativeCall` になり、プロパティは読み取り専用。
+    #[test]
+    fn js_1_install_dom_like_object_routes_method_and_property_to_native_calls() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        engine
+            .install_dom_like_object(&sample_dom_binding("dom"))
+            .expect("installing the DOM-like object must succeed");
+        engine.set_native_call_transport(Box::new(ScriptedTransport {
+            script: std::collections::VecDeque::from([
+                Ok(NativeReturn::Ok(JsValue::Number(1.0))),
+                Ok(NativeReturn::Ok(JsValue::String("T".to_string()))),
+                Ok(NativeReturn::Ok(JsValue::String("T2".to_string()))),
+            ]),
+            calls: Vec::new(),
+        }));
+        let opts = EvaluateOptions::default();
+        assert_eq!(
+            engine
+                .evaluate_script("dom.setText('x', 2)", &opts)
+                .expect("method"),
+            JsValue::Number(1.0)
+        );
+        assert_eq!(
+            engine.evaluate_script("dom.title", &opts).expect("getter"),
+            JsValue::String("T".to_string())
+        );
+        // sloppy mode の代入は無視され、getter が再度呼ばれる。
+        assert_eq!(
+            engine
+                .evaluate_script("dom.title = 'y'; dom.title", &opts)
+                .expect("assignment is ignored"),
+            JsValue::String("T2".to_string())
+        );
+        assert_eq!(
+            engine
+                .evaluate_script(
+                    "'use strict'; try { dom.title = 'z'; 'no error' } catch (e) { e.name }",
+                    &opts
+                )
+                .expect("strict assignment throws"),
+            JsValue::String("TypeError".to_string())
+        );
+        assert_eq!(
+            engine
+                .evaluate_script("typeof dom.setText + ',' + typeof dom", &opts)
+                .expect("typeof"),
+            JsValue::String("function,object".to_string())
+        );
+    }
+
+    /// JS-1・TASK-29.5b・Issue #525: 送信された `(id, args)` を記録して確認する。
+    #[test]
+    fn js_1_install_dom_like_object_sends_member_ids_and_arguments() {
+        type Calls = std::rc::Rc<std::cell::RefCell<Vec<(u32, Vec<JsValue>)>>>;
+        struct Rec(Calls);
+        impl NativeCallTransport for Rec {
+            fn call(
+                &mut self,
+                id: u32,
+                args: &[JsValue],
+            ) -> Result<NativeReturn, NativeCallFailure> {
+                self.0.borrow_mut().push((id, args.to_vec()));
+                Ok(NativeReturn::Ok(JsValue::Undefined))
+            }
+        }
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        engine
+            .install_dom_like_object(&sample_dom_binding("dom"))
+            .expect("install");
+        let calls: Calls = Calls::default();
+        engine.set_native_call_transport(Box::new(Rec(calls.clone())));
+        engine
+            .evaluate_script(
+                "dom.setText(1, 'a'); dom.title",
+                &EvaluateOptions::default(),
+            )
+            .expect("calls");
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                (
+                    4,
+                    vec![JsValue::Number(1.0), JsValue::String("a".to_string())]
+                ),
+                (5, vec![]),
+            ]
+        );
+    }
+
+    /// JS-1・TASK-29.5b・Issue #525: 名前の検証と non-configurable 名の拒否。
+    /// 失敗してもエンジンは使い続けられ、グローバルは生えない。
+    #[test]
+    fn js_1_install_dom_like_object_rejects_bad_names_and_keeps_the_engine() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        assert!(matches!(
+            engine.install_dom_like_object(&sample_dom_binding("")),
+            Err(JsEngineError::BindingFailed(_))
+        ));
+        let too_long = "a".repeat(MAX_NATIVE_PROXY_NAME_BYTES + 1);
+        assert!(matches!(
+            engine.install_dom_like_object(&sample_dom_binding(&too_long)),
+            Err(JsEngineError::BindingFailed(_))
+        ));
+        assert!(matches!(
+            engine.install_dom_like_object(&sample_dom_binding("undefined")),
+            Err(JsEngineError::BindingFailed(_))
+        ));
+        let mut bad_member = sample_dom_binding("partial");
+        if let Some(m) = bad_member.members.get_mut(1) {
+            m.name = String::new();
+        }
+        assert!(matches!(
+            engine.install_dom_like_object(&bad_member),
+            Err(JsEngineError::BindingFailed(_))
+        ));
+        assert_eq!(
+            engine
+                .evaluate_script("typeof partial", &EvaluateOptions::default())
+                .expect("engine stays usable"),
+            JsValue::String("undefined".to_string())
+        );
+    }
+
     /// JS-1・Issue #511・PR #533 codex レビュー指摘 P1: `globalThis` に
     /// 同名の setter アクセサ（代入を握りつぶし値を保存しない）が既に
     /// 存在していても、登録後に実際にプロキシ関数を呼び出せること。
@@ -2426,6 +2684,30 @@ mod tests {
             .evaluate_script("hostAdd()", &EvaluateOptions::default())
             .expect("the proxy function must be reachable after overwriting the accessor");
         assert_eq!(result, JsValue::Number(9.0));
+    }
+
+    /// JS-1・TASK-29.5a・Issue #524: 親が [`JsValue::ObjectHandle`] を返した
+    /// 場合、handle の相互変換を実装するまでは別の値へ黙って変換せず、JS 側で
+    /// catch できる `Error` になること（未対応であることを表面化させる）。
+    #[test]
+    fn js_1_native_proxy_function_surfaces_object_handle_as_catchable_error() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        engine
+            .install_native_proxy_global("hostGet", 1)
+            .expect("installing the proxy function must succeed");
+        engine.set_native_call_transport(Box::new(ScriptedTransport {
+            script: std::collections::VecDeque::from([Ok(NativeReturn::Ok(
+                JsValue::ObjectHandle(crate::engine_trait::ObjectHandle::from_raw(3)),
+            ))]),
+            calls: Vec::new(),
+        }));
+        let result = engine
+            .evaluate_script(
+                "try { hostGet(); 'no error' } catch (e) { e instanceof Error ? 'caught' : 'other' }",
+                &EvaluateOptions::default(),
+            )
+            .expect("the error must be catchable and the engine must remain usable");
+        assert_eq!(result, JsValue::String("caught".to_string()));
     }
 
     /// JS-1・Issue #511・PR #533 codex レビュー指摘 P1: `globalThis` に

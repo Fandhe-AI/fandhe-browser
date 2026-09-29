@@ -117,8 +117,9 @@ pub fn bundled_engines() -> &'static [EngineKind] {
 /// （coding-rust.md「JS エンジンはトレイト抽象越しに使い、V8 / boa の具象型
 /// を上位 crate へ漏らさない」）。`docs/spec/03-poc/js-engine-comparison` の
 /// PoC-3 で実測した「文字列 in/out・数値 out」の形状をカバーする最小構成
-/// であり、簡易実装（現在の制限: オブジェクト・配列等の複合値は表現できない。
-/// 必要になった時点（`TASK-29`/`TASK-32`・`MS-3`）で variant を追加する
+/// であり、簡易実装（現在の制限: オブジェクト・配列等の複合値は表現できない）。
+/// 親側 bind 済みオブジェクトは [`JsValue::ObjectHandle`] の参照としてのみ
+/// 表す。必要になった時点（`TASK-29`/`TASK-32`・`MS-3`）で variant を追加する
 /// （過剰設計を避ける。REPAIR-3）。将来の variant 追加が
 /// 破壊的変更にならないよう `#[non_exhaustive]` を付ける（`JsEngineError`・
 /// `CreateEngineError` と同じ理由づけ。`EngineKind` が spec で V8・Boa の
@@ -136,6 +137,88 @@ pub enum JsValue {
     Number(f64),
     /// 文字列。
     String(String),
+    /// 親側で bind 済みのオブジェクトへの参照（`JS-1`・`TASK-29.5a`・
+    /// Issue #524）。子プロセス側は実体を持たず、[`ObjectHandle`] の ID
+    /// だけを保持する。
+    ///
+    /// 簡易実装（REPAIR-3）: 現時点では型とワイヤ表現の定義のみで、V8 の値
+    /// との相互変換（プロキシオブジェクト化）は `TASK-29.5b` の後続作業
+    /// で実装する（DOM 風オブジェクト自体の bind・dispatch は実装済み）。それまで `V8Engine` は本 variant を V8 値へ変換せず、
+    /// JS 側で catch できる `Error` として表面化させる。
+    ObjectHandle(ObjectHandle),
+}
+
+/// 親側で bind 済みの DOM 風オブジェクトを指す ID（`JS-1`・`TASK-29.5a`・
+/// Issue #524）。[`JsValue::ObjectHandle`] が保持する。
+///
+/// - handle ID と `NativeCall` の ID（`worker_protocol` の
+///   `NATIVE_CALL`/`REGISTER_GLOBAL_FUNCTION` が使う `u32`）は **別の名前
+///   空間** であり、相互に流用しない
+/// - 子から届いた handle ID は untrusted。親は自分の登録簿と照合し、未登録の
+///   ID を拒否する契約とする（照合の実装は `TASK-29.5b` の後続作業）
+/// - 生の `u32` ではなく型で区別する（REPAIR-4）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjectHandle(u32);
+
+impl ObjectHandle {
+    /// 生の ID から handle を作る。ID の割り当て（親側の登録簿）は呼び出し側
+    /// の責務で、本関数は値の妥当性を検証しない。
+    pub const fn from_raw(id: u32) -> Self {
+        Self(id)
+    }
+
+    /// handle の生の ID を返す（ワイヤ表現への変換用）。
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// 親プロセス側 `NativeCall` dispatch が [`super::process_engine::ParentNativeFn`]
+/// へ渡す、呼び出し 1 回に紐づく実行コンテキスト（`TASK-29`・Issue #526）。
+///
+/// [`NativeFn`]（1 引数・従来の呼び出し規約のまま）とは別の型であり、
+/// 既存の `NativeFn` 利用者には影響しない。親は `ParentNativeFn` を専用
+/// スレッドで実行するが、実行中のスレッドを外部から強制終了する手段は
+/// 無い。そのため本構造体は次の 2 つを **協調的** に伝える。
+///
+/// - `deadline` フィールド: 評価全体の期限
+/// - `is_cancelled()`: 期限切れ・呼び出し放棄の通知。
+///   親は期限内に戻らなかった呼び出しに対し待機を打ち切る際、このフラグを
+///   立てる。`ParentNativeFn` は外部状態を更新する前・長い処理の区間ごとに
+///   確認し、`true` なら以降の副作用を行わず直ちに戻ること（戻り値は
+///   親に破棄される）。これが「期限後に処理が継続し、再試行時に旧処理と
+///   新処理が重複実行される」ことを防ぐための契約である
+///
+/// フラグを無視する `ParentNativeFn` は止められない（`process_engine`
+/// モジュールドキュメントの「既知の制限」参照）。
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct NativeCallContext {
+    /// この呼び出しが属する評価全体の期限。呼び出し元
+    /// （`super::process_engine::send_evaluate_and_await`）が評価開始時に
+    /// 1 度だけ計算した値で、実行時間もこの期限に含まれる。
+    pub deadline: std::time::Instant,
+    /// 期限切れ・放棄の通知フラグ。[`NativeCallContext::is_cancelled`] 参照。
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl NativeCallContext {
+    /// 期限と取り消しフラグから文脈を作る（親側 dispatch が使用）。
+    pub fn new(
+        deadline: std::time::Instant,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            deadline,
+            cancelled,
+        }
+    }
+
+    /// 親が当該呼び出しを放棄した（期限切れ）場合に `true`。`true` の間は
+    /// 外部状態への副作用を起こさず直ちに戻ること。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// [`JsEngine::inject_global_function`]・[`JsEngine::bind_dom_like_object`]
@@ -147,6 +230,13 @@ pub enum JsValue {
 /// の TASK-30）は、この関数へ渡す引数が外部入力（プラグイン入出力・ネット
 /// ワーク取得データ由来）である場合、untrusted な入力として検証する責務を
 /// 負う（security.md「プラグイン境界」）。
+///
+/// **panic 禁止（契約）**: 失敗は必ず `Err` で返す。release ビルドは
+/// `panic = "abort"` のため、`catch_unwind` でもスレッド分離でも panic を
+/// 封じ込められず、親プロセス内で実行される `NativeFn`（`process_engine` の
+/// `NativeCall` dispatch。`TASK-29`・Issue #526）が panic するとホスト
+/// プロセス全体が終了する。panic の封じ込めにはプロセス分離が必要で、
+/// 現契約の範囲外（別途設計判断）。
 ///
 /// `Send`/`Sync` 境界は付けない。V8 の `Isolate`/`HandleScope` はスレッド
 /// 固有であり、境界を付けると V8 実装（TASK-29）が満たせなくなるため
@@ -287,12 +377,26 @@ pub trait JsEngine {
 
     /// グローバルスコープに Rust ネイティブ関数を 1 つ注入する（`JS-1`
     /// 「グローバル関数注入」。PoC-3 の `print` 相当）。
+    ///
+    /// 子プロセス版の実装では、子が破棄されて起動し直された際にホストが
+    /// 登録した分は新しい子へ登録し直される。スクリプトが作った状態は
+    /// 失われる（`JS-1`・`TASK-29`・Issue #527）。
+    ///
+    /// 子プロセス版（`V8ProcessEngine::inject_global_function`。
+    /// `TASK-29.4`・Issue #155）は登録フレームで子へ即時に登録し、子が登録を
+    /// 拒否した場合（`undefined` 等 non-configurable な名前・重複・件数上限）は
+    /// [`JsEngineError::BindingFailed`] を返す。本トレイトへの集約と、
+    /// [`NativeFn`]（`Send` なし）と親側の `Send` 付き関数型の橋渡しは
+    /// `TASK-29.6`（Issue #157）で行う（未実装）。
     fn inject_global_function(&mut self, name: &str, func: NativeFn) -> Result<(), JsEngineError>;
 
     /// 名前付きの DOM 風オブジェクト（複数のネイティブメソッドを持つ）を
     /// グローバルスコープにバインドする（`JS-1`「DOM 風オブジェクトへの
     /// バインディング」。PoC-3 の `dom.setText`/`dom.getText`/`dom.count`
     /// 相当）。
+    ///
+    /// 子プロセス版は子の再起動時に登録順どおり再登録する
+    /// （`V8ProcessEngine::bind_dom_like_object`。`TASK-29.5b`）。
     fn bind_dom_like_object(
         &mut self,
         name: &str,

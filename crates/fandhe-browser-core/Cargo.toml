@@ -21,6 +21,11 @@ license.workspace = true
 # （`make check-publish-private` が機械的に検証する）。
 publish.workspace = true
 
+# TASK-41.1（Issue #169）: `state` モジュール（共通 `AppState`）が `Profile` を保持する
+# ため `fandhe-browser-profile` への path 依存を追加した。AGENTS.md「crate 間の許可依存」
+# で core が依存してよいと定められた workspace 内 crate であり、外部（registry）依存では
+# ないため dependency-policy.md のユーザー承認の対象外（ai crate の core への path 依存が前例）。
+#
 # 依存最小方針（dependency-policy.md）に従い、新規依存の追加はユーザー承認制。
 # いずれも Issue #35（2026-09-25 承認済み）で採用が決まった依存であり、
 # `=x.y.z` 完全固定で管理する。
@@ -37,6 +42,7 @@ publish.workspace = true
 #   (de)serialize 基盤。Issue #213（TASK-91.hdep）で承認済み（2026-09-25）。
 #   `config.rs` の doc コメントの通り、serde/toml の型は公開 API に漏らさない。
 [dependencies]
+fandhe-browser-profile = { path = "../fandhe-browser-profile" }
 html5ever = "=0.40.1"
 reqwest = { workspace = true }
 rustls = { workspace = true }

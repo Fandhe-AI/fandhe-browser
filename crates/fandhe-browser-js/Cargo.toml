@@ -110,3 +110,35 @@ required-features = ["test-support"]
 [[test]]
 name = "worker_spawn_latency_stats"
 path = "benches/worker_spawn_latency/stats_tests.rs"
+
+# 子プロセスの「アイドル時・評価中」の RSS/PSS 実測ベンチ（TASK-29・
+# Issue #557・`CORE-3`・`PERF-6`・`PERF-7`。親 issue #519。sibling:
+# `worker_spawn_latency`）。`harness = false`・`required-features` の理由は
+# `worker_spawn_latency` と同じ（このバイナリ自身が子プロセス役を兼ねる
+# ため、既定ハーネスの stdout 出力がプロトコルフレームの読み取りを
+# 壊す。計測本体が使うテスト専用入口が `test-support` 配下にしか無い）。
+# 計測（`/proc/<pid>/smaps_rollup`）自体は Linux 限定だが、他 OS でも
+# `--all-features` 付きの clippy/build 対象になるため、本体は
+# `#[cfg(target_os = "linux")]` で計測コードを隔離し、他 OS では
+# コンパイルだけ通って実行時に非 0 で終了する構成にしている
+# （`worker_memory_footprint.rs` 冒頭のドキュメントコメント参照）。
+[[bench]]
+name = "worker_memory_footprint"
+path = "benches/worker_memory_footprint.rs"
+harness = false
+required-features = ["test-support"]
+
+# `smaps_rollup` パーサ・要約統計（`benches/worker_memory_footprint/smaps.rs`）
+# のユニットテスト（TASK-29・Issue #557・`PERF-6`・`PERF-7`）。ベンチ本体
+# （`js-v8`／`test-support` 前提）とは独立に、どの feature 構成でも実行
+# できる（`worker_spawn_latency_stats` と同じ構成。新規依存・子プロセス
+# 起動・`/proc` I/O を伴わない純関数のみを対象とするため
+# `required-features` は付けない）。`path` が `smaps.rs` 本体ではなく
+# 兄弟の `smaps_tests.rs` を指す理由も `worker_spawn_latency_stats` と同じ
+# （`smaps.rs` は bench 本体からも `#[path]` で取り込まれるが、bench
+# ターゲットは `--cfg test` は付くが `--test` は付かないため、`#[test]`
+# 関数を同居させると bench 側のコンパイルで「未使用 `use`」の誤検出を
+# 招く。`smaps.rs` 冒頭のドキュメントコメント参照）。
+[[test]]
+name = "worker_memory_footprint_smaps"
+path = "benches/worker_memory_footprint/smaps_tests.rs"

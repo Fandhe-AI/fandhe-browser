@@ -6,7 +6,7 @@ ID は `RENDER-2`（基準は `CORE-2` と同じ「Chromium 比 80% 以上削減
 SSOT（`docs/spec` の `04-behavior/`）を参照すること
 （[spec-reference](../../.claude/rules/spec-reference.md)）。
 
-親 Issue #48（TASK-34）。兄弟 Issue は #465（TASK-34.1・依存グラフ検査）、#467（TASK-34.3・CI 組込み）、#468（TASK-34.4・確認記録）の 3 件。CI（GitHub Actions）への組込みは #467 が担当し、本 Issue の時点では `make ci` にも組み込まない（下記「`make ci` に含めない理由」参照）。
+親 Issue #48（TASK-34）。兄弟 Issue は #465（TASK-34.1・依存グラフ検査）、#467（TASK-34.3・CI 組込み）、#468（TASK-34.4・確認記録）の 3 件。CI（GitHub Actions）への組込みは #467（TASK-34.3）で完了し、`.github/workflows/ci.yml` の `binary-size` ジョブ（3 OS）が実行する。`make ci` には組み込まない（下記「`make ci` に含めない理由」参照）。
 
 ## 計測対象はまだ存在しない（重要）
 
@@ -49,8 +49,10 @@ package モードのビルド・判定経路へ進む（本ファイル・`Makef
   （TASK-34.4）が実測を見てから判断する
 
 `BINARY_SIZE_LIMIT_BYTES ?= ...`（`?=`）のため、環境変数や `make` 引数
-（`make check-binary-size BINARY_SIZE_LIMIT_BYTES=...`）で上書きできる。#467
-が OS ごとに調整する余地を残すための設計。
+（`make check-binary-size BINARY_SIZE_LIMIT_BYTES=...`）で上書きできる。
+現時点では OS ごとに上限を分ける必要はなく（全 OS 共通の `CORE-2` 水準）、
+`binary-size` ジョブも 3 OS で同じ値を使う。分ける必要が出た場合は #468
+（TASK-34.4）の実測後に検討する。
 
 ## 出力形式の契約（#467・#468 が読み取る）
 
@@ -124,12 +126,36 @@ make check-binary-size
 `check-compat-regression` と同じ方針で fail-closed にする（silent skip に
 しない）。
 
+## CI（`.github/workflows/ci.yml` の `binary-size` ジョブ）
+
+TASK-34.3（#467）で導入。3 OS（ubuntu/macos/windows）の各ネイティブランナーで
+実行し、`make` は使わない（windows-latest に `make` がある保証がないため。
+`compat-regression`・`bench-record-selftest` と同じ方針でスクリプトを直接
+呼ぶ）。cache も使わない（現状は package skip のためビルド自体が起きず、
+windows-latest には cache prune の既知問題があるため）。
+
+上限値・package 名は `Makefile` の `BINARY_SIZE_LIMIT_BYTES` /
+`BINARY_SIZE_PACKAGE` を単一真実源とし、ジョブ側では値を重複定義しない。
+行頭固定の正規表現でちょうど 1 件だけ抽出し、0 件（削除・書式変更）・2 件
+以上（曖昧）はいずれも `::error::` を出して fail-closed にする。
+
+self-test（`self-test.sh`）を実判定の前に毎回実行し、上限超過（合成
+201 bytes > limit 200）で確実に exit 1 になることをジョブログへ証跡として
+残す。実判定の出力（`binary-size: ...` 行、または `skip:` 行）はジョブログ
+とステップサマリー（表形式）の両方に出す。package skip の間は
+`::notice::` とサマリーへその旨を明示し、休眠状態であることを分かるように
+する。
+
+branch protection の必須チェックに加える場合は OS 数分
+（`binary-size (ubuntu-latest)` / `(macos-latest)` / `(windows-latest)` の
+3 件）を登録する必要がある（ユーザー作業）。
+
 ## `make ci` に含めない理由
 
 `make ci`（集約ターゲット）の依存には `check-binary-size` を追加していない。
 `ci:` を実行するたびにリリースビルド（`cargo build --release`）が走るとコスト
-が大きいため。GitHub Actions CI・`ci:` 集約への組込みは #467（TASK-34.3）が
-判断する。
+が大きいため（判断済み）。CI での継続的なゲートは上記 `binary-size` ジョブが
+担い、ローカルでは必要に応じて `make check-binary-size` を個別に実行する。
 
 ## 現状の限界
 
