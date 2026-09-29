@@ -13,8 +13,8 @@
 //! state の算出ロジックは実装済み（[`state`] モジュール）。accessible
 //! name はネイティブのラベル付け分のみ実装済み（[`name`] モジュール・
 //! [`name::compute_name`]。TASK-11.4.2・Issue #545）。DOM からのツリー
-//! 構築はまだ実装しない（実装済みを装わない。REPAIR-3）。段階的に以下の
-//! Issue で実装する：
+//! 構築は TASK-11.7（Issue #76）で実装済み（[`build`] モジュール・
+//! [`build_snapshot`]）。段階的に以下の Issue で実装した：
 //!
 //! - role（役割）算出: TASK-11.3（`AISNAP-1`・Issue #72）。骨格と button・
 //!   link・heading・table・list 等の代表要素は TASK-11.3.1（Issue #541）で
@@ -32,18 +32,20 @@
 //!   子孫テキスト（name from content）・優先順位統合・文書ルートの
 //!   `<title>`: TASK-11.4.3（Issue #546）で実装済み
 //! - state（状態）算出: TASK-11.5（Issue #74）で実装済み（[`state`] モジュール・
-//!   [`state::compute_state`]）。ただし DOM 構築時にこの関数を呼び出す配線は
-//!   まだない（呼び出しの組み込みは TASK-11.7・Issue #76 が担う）
+//!   [`state::compute_state`]）。[`build_snapshot`] から呼び出される（TASK-11.7・Issue #76）
 //! - ref（role + name シグネチャによる再特定要求。`AISNAP-10`）: TASK-11.6（Issue #75）で
-//!   生成器を実装済み（[`element_ref`]・[`RefAllocator`]）。木への組み込みは TASK-11.7
+//!   生成器を実装済み（[`element_ref`]・[`RefAllocator`]）。木への組み込みは [`build_snapshot`]（TASK-11.7・Issue #76）で実装済み
 //! - DOM から `Snapshot` へのツリー構築統合（[`role::compute_role`]・
-//!   [`state::compute_state`] の呼び出し組み込みを含む）: TASK-11.7（Issue #76）
+//!   [`state::compute_state`] の呼び出し組み込みを含む）: TASK-11.7（Issue #76）で
+//!   実装済み（[`build_snapshot`]。generic の折り畳み等の簡約は未実装）
 //! - ユニットテスト一式: TASK-11.8（Issue #77）
 
+pub mod build;
 pub mod element_ref;
 pub mod name;
 pub mod role;
 pub mod state;
+pub use build::{MAX_TREE_DEPTH, SnapshotError, build_snapshot};
 pub use element_ref::{ElementRef, RefAllocator, RefError, ref_signature};
 pub use name::{AccessibleName, NameIndex, NameSource, compute_name, compute_name_with_index};
 pub use role::{ComputedRole, RoleSource, compute_role};
@@ -57,8 +59,8 @@ pub use state::{CheckedState, State, compute_state};
 /// - `role`: ARIA role のトークン（例: `"document"`・`"heading"`・`"button"`）。
 ///   役割の種類は多く将来も増えるため `String` とし、enum 化しない。
 ///   算出ロジックは [`role::compute_role`]。骨格と代表要素は TASK-11.3.1
-///   （Issue #541）で実装済みだが、DOM 構築時にこの関数を呼び出す配線は
-///   まだない（本フィールドへの反映は TASK-11.7・Issue #76 が担う）
+///   （Issue #541）で実装済みだが、[`build_snapshot`] が本フィールドへ反映する
+///   （TASK-11.7・Issue #76）
 /// - `name`: accessible name。空文字列は「名前なし」を表す。
 ///   算出は TASK-11.4（Issue #73）が担う。ネイティブのラベル付け分は
 ///   [`name::compute_name`]（TASK-11.4.2・Issue #545）、ARIA 属性分は
@@ -68,9 +70,9 @@ pub use state::{CheckedState, State, compute_state};
 /// - `r#ref`: role + name シグネチャによる再特定要求（`AISNAP-10`）。
 ///   `None` は ref を振らないノード（例: document ルート）を表す。
 ///   値の形式は `e<16hex>[v<n>][-n]`（[`RefAllocator`] が発行。TASK-11.6・Issue #75・
-///   `AISNAP-10`）。木への割り当ては TASK-11.7 が担う
+///   `AISNAP-10`）。木への割り当ては [`build_snapshot`]（TASK-11.7）が担う
 /// - `children`: DOM の親子関係に対応する子ノード。構築は
-///   TASK-11.7（Issue #76）が担う
+///   [`build_snapshot`]（TASK-11.7・Issue #76）
 /// - `state`: 要素の状態（`disabled`・`checked`）。算出は
 ///   [`state::compute_state`]（TASK-11.5・Issue #74）が担う。`Node::new` の
 ///   既定値は `State::default()`（`disabled: false`・`checked: None`）
@@ -82,14 +84,14 @@ pub use state::{CheckedState, State, compute_state};
 /// 行数）を追加する予定である。実現方法（専用構造体を `Option` で持たせる
 /// 案など）は TASK-12 で決める。
 ///
-/// 呼び出し文脈: TASK-11.7（Issue #76）が `core` の DOM から構築し、
+/// 呼び出し文脈: [`build_snapshot`]（TASK-11.7・Issue #76）が `core` の DOM から構築し、
 /// 将来は `cli` 層の配線を経由して `cdp` の `/ai/snapshot` から使われる
 /// （TASK-19・`AISNAP-6`）。
 ///
-/// 不安全な設計への申し送り（TASK-11.7 向け）: `children` は再帰構造の
-/// ため、極端に深い DOM をそのままツリーにすると、構築時の再帰呼び出しや
-/// 破棄（`Drop`）でスタックオーバーフローを起こしうる。構築側で深さの
-/// 上限、またはスタックを使わない構築・破棄を検討すること。
+/// 不安全な設計への対処: `children` は再帰構造で、derive した
+/// `Drop`/`PartialEq`/`Debug`/`Clone` も再帰する。[`build_snapshot`] は反復で構築し、
+/// 深さを [`MAX_TREE_DEPTH`] に制限してスタックオーバーフローを防ぐ。手動で
+/// 深い木を組み立てる場合は呼び出し側で深さに注意すること。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Node {
@@ -101,7 +103,7 @@ pub struct Node {
     /// role + name シグネチャによる再特定要求（`AISNAP-10`）。
     /// 形式は `e<16hex>[v<n>][-n]`。生成は [`RefAllocator`]（TASK-11.6・Issue #75）。
     pub r#ref: Option<String>,
-    /// DOM の親子関係に対応する子ノード。構築は TASK-11.7（Issue #76）。
+    /// DOM の親子関係に対応する子ノード。構築は [`build_snapshot`]（TASK-11.7・Issue #76）。
     pub children: Vec<Node>,
     /// 要素の状態（`disabled`・`checked`）。算出は
     /// [`state::compute_state`]（TASK-11.5・Issue #74）。
@@ -162,14 +164,27 @@ impl Node {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Snapshot {
-    /// DOM のルートに対応するノード。構築は TASK-11.7（Issue #76）。
+    /// DOM のルートに対応するノード。構築は [`build_snapshot`]（TASK-11.7・Issue #76）。
     pub tree: Node,
+    /// 深さ上限（[`MAX_TREE_DEPTH`]）を超えるサブツリーを省略したか。
+    /// 黙って捨てないための印（`AISNAP-1`）。
+    pub truncated: bool,
 }
 
 impl Snapshot {
     /// ルートノードを指定して `Snapshot` を作る。
     pub fn new(tree: Node) -> Self {
-        Self { tree }
+        Self {
+            tree,
+            truncated: false,
+        }
+    }
+
+    /// `truncated` を設定した `Snapshot` を返す（ビルダー）。
+    #[must_use]
+    pub fn with_truncated(mut self, truncated: bool) -> Self {
+        self.truncated = truncated;
+        self
     }
 }
 

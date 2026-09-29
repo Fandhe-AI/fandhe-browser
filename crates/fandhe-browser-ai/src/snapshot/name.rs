@@ -35,7 +35,7 @@
 //! - `fieldset`→`legend`・`table`→`caption`・`figure`→`figcaption`・SVG の
 //!   `<title>`・`aria-describedby`: 担当 Issue 未確定（out-of-scope-tracking
 //!   に従いユーザー承認を得てから追跡する）
-//! - DOM から `Snapshot`/`Node` へのツリー構築配線: TASK-11.7（Issue #76）。
+//! - DOM から `Snapshot`/`Node` へのツリー構築配線: TASK-11.7（Issue #76）で実装済み（`build.rs`）。
 //!   `id`/`label` の索引化自体は本ファイルが [`NameIndex`] として提供する
 //!   （PR #567 レビュー指摘: 要素ごとに文書全体を再走査すると計算量が
 //!   二乗になるため）。`aria-labelledby` の IDREF 解決も同じ索引の `id`
@@ -46,16 +46,18 @@
 //!   要素へ連続して使うと同じ問題が再発する）。
 //!
 //! 走査量の上限: 子孫走査は 1 回あたり [`MAX_CONTENT_STEPS`] で頭打ちにし、
-//! 打ち切りは `truncated` で伝える。上限は要素ごとに固定で、共有索引の
+//! 打ち切りは `truncated` で伝える。既定の索引では上限は要素ごとに固定で、共有索引の
 //! 呼び出し順に結果が依存しない（[`compute_name`] と
 //! [`compute_name_with_index`] は同じ結果を返す）。文書全体の総量は
 //! 最悪 `node_count * MAX_CONTENT_STEPS` で、`node_count` はパーサーの
-//! ノード数上限（`ParseOptions::max_nodes`）で抑えられる。`input[type=password]` の `value` は名前へ取り込まない。
+//! ノード数上限（`ParseOptions::max_nodes`）で抑えられる。スナップショット構築
+//! （`build_snapshot`）は [`NameIndex::with_content_budget`] で索引全体の共有予算
+//! [`MAX_TOTAL_CONTENT_STEPS`] を有効にし、入れ子要素による重複走査の総量を頭打ちにする
+//! （超過後の name from content は空の名前＋`truncated`。この場合のみ算出順に依存する）。`input[type=password]` の `value` は名前へ取り込まない。
 //!
-//! 呼び出し文脈: 現時点では呼び出し元がない。DOM から `Snapshot`/`Node` を
-//! 構築する TASK-11.7（Issue #76）が、文書ごとに [`NameIndex::build`] を
-//! 1 回呼んだうえで、ツリー構築時に要素ごとへ [`compute_name_with_index`]
-//! を呼ぶ想定である（実装済みを装わない。REPAIR-3）。
+//! 呼び出し文脈: `snapshot::build::build_snapshot`（TASK-11.7・Issue #76）が、
+//! 文書ごとに [`NameIndex::build`] を 1 回呼んだうえで、ツリー構築時に要素ごとへ
+//! [`compute_name_with_index`] を呼ぶ。
 //!
 //! # HTML-AAM による要素ごとの算出順序
 //!
@@ -181,6 +183,15 @@ const MAX_LABELS_SCANNED: usize = MAX_LABELS * 4;
 /// 文書全体の総量は最悪 `node_count * 本値` で、パーサーのノード数上限で
 /// 抑えられる。打ち切ったら `truncated` を立てる。
 const MAX_CONTENT_STEPS: usize = 1024;
+
+/// 1 つの [`NameIndex`]（= 1 回のスナップショット構築）で name from content の
+/// 子孫走査に使える総ステップ数。入れ子の `heading` 等で同じ子孫を要素ごとに
+/// 再走査しても、文書全体の CPU 負荷が要素数 × [`MAX_CONTENT_STEPS`] に
+/// 膨らまないよう共有予算で頭打ちにする（AGENTS.md「リソース上限」）。
+/// 使い切った後の name from content は空の名前＋`truncated: true` を返す。
+/// 予算は [`NameIndex::with_content_budget`] で有効にした索引でのみ効き
+/// （既定は無制限）、有効時は同一索引での結果が呼び出し順に依存しうる。
+pub(super) const MAX_TOTAL_CONTENT_STEPS: usize = 1 << 21;
 
 /// `aria-labelledby` で名前に**寄与した**（正規化後のテキストが空でない）
 /// 参照先の数の上限（`AISNAP-1`・TASK-11.4.1）。
@@ -497,7 +508,7 @@ fn is_labelable(doc: &Document, id: NodeId) -> bool {
 /// フォールバックする。前後の空白を除去してから照合すると
 /// `type=" submit "` を `submit` 状態、`type=" hidden "` を `hidden` 状態と
 /// 誤判定してしまう（PR #567 レビュー指摘の P1 修正）。
-fn normalized_input_type(doc: &Document, id: NodeId) -> String {
+pub(super) fn normalized_input_type(doc: &Document, id: NodeId) -> String {
     doc.attribute(id, "type")
         .map(|value| value.to_ascii_lowercase())
         .unwrap_or_default()
@@ -528,12 +539,12 @@ struct ContentScan {
 }
 
 /// `script`・`style`・`noscript`・`template` は名前の計算に寄与しない。
-const SKIPPED_SUBTREES: [&str; 4] = ["script", "style", "noscript", "template"];
+pub(super) const SKIPPED_SUBTREES: [&str; 4] = ["script", "style", "noscript", "template"];
 
 /// 要素が `hidden` 属性を持つか、`aria-hidden` が（HTML 空白の trim・ASCII
 /// 大文字小文字無視で）`"true"` かを返す（accname 2A。CSS による非表示は
 /// スタイル未評価のため対象外）。
-fn is_hidden_element(doc: &Document, id: NodeId) -> bool {
+pub(super) fn is_hidden_element(doc: &Document, id: NodeId) -> bool {
     if doc.attribute(id, "hidden").is_some() {
         return true;
     }
@@ -877,12 +888,24 @@ pub struct NameIndex<'doc> {
     uncached_scans_left: Cell<usize>,
     /// キャッシュ可能な参照先の初回走査の残り回数（[`MAX_CACHEABLE_REFERENT_SCANS`]）。
     first_scans_left: Cell<usize>,
+    /// 子孫テキスト走査（name from content）の索引全体で共有する残りステップ数
+    /// （[`MAX_TOTAL_CONTENT_STEPS`]）。
+    content_steps_left: Cell<usize>,
     /// 文書順で最初の HTML 名前空間の `<title>` 要素（文書ルートの名前用。
     /// SVG の `<title>` は含めない）。構築時の単一走査で記録する。
     first_title: Option<NodeId>,
 }
 
 impl<'doc> NameIndex<'doc> {
+    /// 子孫テキスト走査（name from content）の索引全体の共有予算を `steps` に設定する
+    /// （`build_snapshot` 用。既定は無制限で、[`compute_name_with_index`] の
+    /// 結果が呼び出し順に依存しない性質を保つ）。
+    #[must_use]
+    pub(super) fn with_content_budget(self, steps: usize) -> Self {
+        self.content_steps_left.set(steps);
+        self
+    }
+
     /// `ancestor` が `node` 自身またはその祖先かどうかを、構築時に記録した
     /// 入退場番号の区間包含で定数時間に判定する。索引に載らないノード
     /// （走査上限で打ち切られた分）は「含まない」として扱う。
@@ -1047,6 +1070,7 @@ impl<'doc> NameIndex<'doc> {
             referent_cache: RefCell::new(HashMap::new()),
             uncached_scans_left: Cell::new(MAX_UNCACHED_REFERENT_SCANS),
             first_scans_left: Cell::new(MAX_CACHEABLE_REFERENT_SCANS),
+            content_steps_left: Cell::new(usize::MAX),
             first_title,
         }
     }
@@ -1206,18 +1230,23 @@ fn allows_name_from_content(doc: &Document, id: NodeId) -> bool {
 /// - テキストなし・打ち切りなし: `None`（次点の `title` へフォールバックしてよい）
 /// - テキストなし・打ち切りあり: `Some` の空の名前（`truncated: true`。走査しきれて
 ///   いない以上「名前なし」と確定できないため `title` へフォールバックさせない）
-fn content_name(doc: &Document, id: NodeId) -> Option<AccessibleName> {
+fn content_name(doc: &Document, index: &NameIndex, id: NodeId) -> Option<AccessibleName> {
+    // 索引（= 1 回のスナップショット構築）全体で共有する残り予算で上限する。
+    let budget = index.content_steps_left.get();
     let mut text = String::new();
     let scan = collect_content_text(
         doc,
         id,
         id,
         ContentWalk {
-            max_steps: MAX_CONTENT_STEPS,
+            max_steps: MAX_CONTENT_STEPS.min(budget),
             include_hidden: false,
         },
         &mut text,
     );
+    index
+        .content_steps_left
+        .set(budget.saturating_sub(scan.steps_used));
 
     let mut buf = NameBuffer::new();
     buf.push_str(&text);
@@ -1546,7 +1575,7 @@ fn native_name(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName 
     if is_html_element_named(doc, id, "button") {
         // HTML-AAM の button 節: label → 子孫テキスト → title。
         return label_name(doc, index, id)
-            .or_else(|| content_name(doc, id))
+            .or_else(|| content_name(doc, index, id))
             .or_else(|| title_name(doc, id))
             .unwrap_or_default();
     }
@@ -1562,7 +1591,7 @@ fn native_name(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName 
     // name from content を許す role（link・heading・cell 等）は子孫テキスト →
     // title、それ以外は title のみ（accname 2F → 2I）。
     if allows_name_from_content(doc, id) {
-        return content_name(doc, id)
+        return content_name(doc, index, id)
             .or_else(|| title_name(doc, id))
             .unwrap_or_default();
     }
@@ -1594,9 +1623,8 @@ fn native_name(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName 
 /// そのような呼び出し元は、文書ごとに [`NameIndex::build`] を 1 回だけ
 /// 呼び、要素ごとには [`compute_name_with_index`] を使うこと。
 ///
-/// 呼び出し文脈: 現時点では呼び出し元がない。TASK-11.7（Issue #76）が
-/// DOM から `Snapshot`/`Node` を構築する際、算出結果の `text` を
-/// [`super::Node::name`] へ格納する想定である。
+/// 呼び出し文脈: 単体算出用。ツリー構築（TASK-11.7・Issue #76）は本関数ではなく
+/// [`compute_name_with_index`] を使い、`text` を [`super::Node::name`] へ格納する。
 pub fn compute_name(doc: &Document, id: NodeId) -> AccessibleName {
     let index = NameIndex::build(doc);
     compute_name_with_index(doc, &index, id)
@@ -1619,11 +1647,18 @@ fn document_title_name(doc: &Document, index: &NameIndex) -> AccessibleName {
         },
         &mut text,
     );
+    finish_title_name(&text, scan.cut)
+}
+
+/// 収集済みの `<title>` テキストと走査打ち切りフラグから文書名を確定する。
+fn finish_title_name(text: &str, scan_cut: bool) -> AccessibleName {
     let mut buf = NameBuffer::new();
-    buf.push_str(&text);
-    let truncated = scan.cut || buf.truncated;
+    buf.push_str(text);
+    // 空白だけを読み進めて走査上限で打ち切られ結果が空でも、名前が不完全で
+    // あることを `truncated` で通知する（黙って省略しない。AISNAP-1）。
+    let truncated = scan_cut || buf.truncated;
     let mut result = buf.finish(NameSource::DocumentTitle);
-    result.truncated = truncated && !result.text.is_empty();
+    result.truncated = truncated;
     result
 }
 
@@ -3640,6 +3675,15 @@ mod tests {
         let r = compute_name(&doc, doc.root());
         assert_eq!(r.text.chars().count(), MAX_NAME_CHARS);
         assert!(r.truncated);
+        // テキストに届く前に走査が打ち切られ結果が空でも truncated を立てる。
+        assert_eq!(
+            super::finish_title_name("", true),
+            named("", NameSource::None, true)
+        );
+        assert_eq!(
+            super::finish_title_name("題", false),
+            named("題", NameSource::DocumentTitle, false)
+        );
     }
 
     /// AISNAP-1（TASK-11.4.3・#546）: 共有索引版と単発版の結果が一致する。

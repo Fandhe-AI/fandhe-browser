@@ -1,9 +1,8 @@
 //! `snapshot::Node::state` フィールドの算出ロジック（`AISNAP-1`・`TASK-11.5`・
 //! `MS-2`・Issue #74）。
 //!
-//! 呼び出し文脈: 現時点では呼び出し元がない。DOM から `Snapshot`/`Node` を
-//! 構築する TASK-11.7（Issue #76）が、ツリー構築時に要素ごとへ
-//! [`compute_state`] を呼ぶ想定である（実装済みを装わない。REPAIR-3）。
+//! 呼び出し文脈: `snapshot::build::build_snapshot`（TASK-11.7・Issue #76）が、
+//! ツリー構築時に要素ごとへ [`compute_state`] を呼ぶ。
 //!
 //! # スコープ
 //!
