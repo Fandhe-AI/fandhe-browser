@@ -79,8 +79,10 @@
 //!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
-//! - 期限を超えて戻らない `NativeFn` のスレッドは強制終了できず、プロセス
-//!   終了まで残る（1 評価につき最大 1 本）
+//! - 期限を超えて戻らない `NativeFn` のスレッドは強制終了できず、戻るか
+//!   プロセスが終了するまで残る。ただしホスト全体の生存数は
+//!   `MAX_LIVE_NATIVE_THREADS`（64）で強制的に頭打ちにし、超過した呼び出し
+//!   はスレッドを起動せず JS 向けのエラーにする
 //! - release ビルドは `panic = "abort"` のため、`NativeFn` が panic すると
 //!   ホストプロセスごと終了する（unwind するビルドではスレッド内に閉じる
 //!   が、release では防げない。プロセス分離が必要で別途判断を要する）。
@@ -214,6 +216,41 @@ const STDERR_TAIL_CAPACITY_BYTES: usize = 16 * 1024;
 /// ビルドでは未使用になる。
 #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 const MAX_NATIVE_FUNCTIONS: usize = 1024;
+
+/// ホストプロセス内で同時に生存できる `NativeFn` 実行スレッドの上限
+/// （`TASK-29`・Issue #526・codex レビュー指摘「期限切れの処理を
+/// ホスト内に残し続けない」対応）。
+///
+/// 期限を超えて戻らない `NativeFn` のスレッドは強制終了できないため、
+/// 評価を繰り返されると関数ごと・エンジンごとにスレッドが残りうる。
+/// 生存数をこの値で頭打ちにし、超過した呼び出しは新たにスレッドを
+/// 起動せず JS 向けの `NativeReturn::Err` にする（戻ったスレッドの
+/// 分だけ枠は自動的に空く）。
+const MAX_LIVE_NATIVE_THREADS: usize = 64;
+
+/// 生存中の `NativeFn` 実行スレッド数（[`MAX_LIVE_NATIVE_THREADS`] で制限）。
+static LIVE_NATIVE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `NativeFn` 実行スレッドの枠。drop（正常終了・unwind）で枠を返す。
+struct NativeThreadSlot<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> NativeThreadSlot<'a> {
+    /// 生存数が `max` 未満なら枠を確保する。満杯なら `None`。
+    fn try_acquire(counter: &'a std::sync::atomic::AtomicUsize, max: usize) -> Option<Self> {
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(counter))
+    }
+}
+
+impl Drop for NativeThreadSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// reader スレッドが評価呼び出し側へ届けるイベント。
 enum ReaderEvent {
@@ -1937,8 +1974,9 @@ impl std::fmt::Display for NativeDispatchViolation {
 ///   `deadline` まで待つだけにする。期限内に戻らなければ待機を打ち切り
 ///   [`NativeDispatchViolation::DeadlineExceeded`] を返す（呼び出し元が子を
 ///   kill して `Timeout` にする）。ブロックしたスレッドは強制終了できず
-///   放置される（1 評価につき最大 1 本。同じ関数の次回呼び出しは
-///   `try_lock` 失敗で即エラーになるため積み上がらない）
+///   放置されるが、同じ関数の次回呼び出しは `try_lock` 失敗で即エラーに
+///   なり、ホスト全体でも生存スレッド数を [`MAX_LIVE_NATIVE_THREADS`]
+///   （64）で頭打ちにする（超過分は起動せず `NativeReturn::Err`）
 /// - panic は unwind するビルド（dev・test）では専用スレッド内に閉じ、JS への
 ///   `NativeReturn::Err` になる。release は `panic = "abort"` のため
 ///   `NativeFn` が panic するとホストプロセスごと終了する（スレッド分離では
@@ -1964,10 +2002,19 @@ fn dispatch_native_call(
     };
     let entry = Arc::clone(entry);
     let ctx = NativeCallContext { deadline };
+    // 期限切れで残ったスレッドが積み上がらないよう、生存数に上限を設ける。
+    // 枠はスレッド内へ move し、終了（unwind 含む）まで保持する。
+    let Some(slot) = NativeThreadSlot::try_acquire(&LIVE_NATIVE_THREADS, MAX_LIVE_NATIVE_THREADS)
+    else {
+        return Ok(encode_bounded_native_return(&NativeReturn::Err(
+            "too many native function calls are still running".to_string(),
+        )));
+    };
     let (tx, rx) = mpsc::channel::<NativeReturn>();
     let spawned = std::thread::Builder::new()
         .name("fandhe-native-call".to_string())
         .spawn(move || {
+            let _slot = slot;
             let ret = match entry.try_lock() {
                 Ok(mut func) => match func(&args, &ctx) {
                     Ok(value) => NativeReturn::Ok(value),
@@ -2426,6 +2473,20 @@ mod tests {
             NativeReturn::Err(message) => assert!(message.contains("busy"), "got: {message}"),
             other => panic!("expected NativeReturn::Err, got: {other:?}"),
         }
+    }
+
+    /// `TASK-29`・Issue #526・codex レビュー指摘: 生存スレッド枠が満杯なら
+    /// 枠を確保できず、戻すと再び確保できること。
+    #[test]
+    fn js_1_native_thread_slot_is_capped_and_released_on_drop() {
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let a = NativeThreadSlot::try_acquire(&counter, 2).expect("first slot");
+        let _b = NativeThreadSlot::try_acquire(&counter, 2).expect("second slot");
+        assert!(NativeThreadSlot::try_acquire(&counter, 2).is_none());
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        drop(a);
+        assert_eq!(counter.load(Ordering::Acquire), 1);
+        assert!(NativeThreadSlot::try_acquire(&counter, 2).is_some());
     }
 
     /// `TASK-29`・Issue #526・codex レビュー指摘: panic した `NativeFn` は
