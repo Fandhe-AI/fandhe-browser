@@ -411,8 +411,8 @@ python3 -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
 - 保存先ファイル（`snapshots/<site_id>.html`・`capture-result.json`）は
   `resolve()` 後に `--out-dir` 配下であることを確認し、既存の symlink があっても
   `O_NOFOLLOW`（`_write_bytes_nofollow`。Windows では `is_symlink()` 事前チェック）
-  でリンク先ではなく新規ファイルとして書き込む（再実行時の symlink 経由の
-  外部ファイル上書き対策）
+  でリンク先ではなく新規ファイルとして書き込む。既存ファイルは `O_TRUNC` で開かず、同一ディレクトリの一時ファイルへ書いて `os.replace` で差し替える（ハードリンク先の破壊防止）。再実行時の symlink 経由の
+  外部ファイル上書き対策
 - 撮影ごとのタイムアウト・スナップショットのサイズ上限・サイト数上限（50）・
   `stderr` 末尾 2000 文字までの保持（子プロセスの標準出力・標準エラーは
   無制限にメモリへは保持せず、`stdout` は破棄し `stderr` はテンポラリファイル

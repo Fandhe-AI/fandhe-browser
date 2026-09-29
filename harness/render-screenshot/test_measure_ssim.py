@@ -1692,5 +1692,23 @@ class MainIntegrationTest(unittest.TestCase):
             self.assertFalse(site["passed"])
 
 
+class WriteResultHardlinkTest(unittest.TestCase):
+    """RENDER-5 / TASK-37.2: `write_result` がハードリンク先を破壊しない（codex P0）。"""
+
+    def test_hardlinked_measure_result_is_replaced_not_truncated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp) / "cap"
+            capture_dir.mkdir()
+            outside = Path(tmp) / "outside.json"
+            outside.write_bytes(b"keep me")
+            try:
+                os.link(outside, capture_dir / "measure-result.json")
+            except OSError:
+                self.skipTest("hardlink creation is not permitted in this environment")
+            ms.write_result(capture_dir, {"a": 1})
+            self.assertEqual(outside.read_bytes(), b"keep me")
+            self.assertEqual(json.loads((capture_dir / "measure-result.json").read_text(encoding="utf-8")), {"a": 1})
+
+
 if __name__ == "__main__":
     unittest.main()
