@@ -107,6 +107,15 @@ const NORMALIZED_LABEL_TEXT_CHAR_LIMIT: usize = MAX_NAME_CHARS * 4;
 /// 寄与なしとして扱い `truncated` を立てる。
 const MAX_UNCACHED_REFERENT_SCANS: usize = 256;
 
+/// [`NameIndex`] が 1 文書につき許す、キャッシュ可能な `aria-labelledby` 参照先
+/// 部分木の**初回**走査回数の上限（`AISNAP-1`・TASK-11.4.1）。キャッシュは同じ
+/// 参照先の再走査を防ぐが、互いに異なる id を持つ参照先がそれぞれ深い部分木を
+/// 指す入力では初回走査自体が参照先数に比例して積み上がり、文書サイズの二乗に
+/// なる。文書全体の初回走査回数（＝走査量は高々 回数 × 文書サイズ）を頭打ちに
+/// し、超過時は該当参照先を寄与なしとして扱い `truncated` を立てる
+/// （security.md「不安全な設計」対策）。キャッシュヒットは消費しない。
+const MAX_CACHEABLE_REFERENT_SCANS: usize = 256;
+
 /// 1 つのコントロールに関連付ける `<label>` の数の上限（`AISNAP-1`）。
 ///
 /// 外部入力の HTML に大量の `<label for="...">` を並べられても、文書走査を
@@ -649,6 +658,8 @@ pub struct NameIndex<'doc> {
     referent_cache: RefCell<HashMap<NodeId, String>>,
     /// キャッシュ不能な参照先走査の残り回数（[`MAX_UNCACHED_REFERENT_SCANS`]）。
     uncached_scans_left: Cell<usize>,
+    /// キャッシュ可能な参照先の初回走査の残り回数（[`MAX_CACHEABLE_REFERENT_SCANS`]）。
+    first_scans_left: Cell<usize>,
 }
 
 impl<'doc> NameIndex<'doc> {
@@ -783,6 +794,7 @@ impl<'doc> NameIndex<'doc> {
             ids: ids_by_value,
             referent_cache: RefCell::new(HashMap::new()),
             uncached_scans_left: Cell::new(MAX_UNCACHED_REFERENT_SCANS),
+            first_scans_left: Cell::new(MAX_CACHEABLE_REFERENT_SCANS),
         }
     }
 }
@@ -907,8 +919,10 @@ fn aria_label_name(doc: &Document, id: NodeId) -> Option<AccessibleName> {
 ///
 /// 対象を含まない参照先は結果を [`NameIndex`] にキャッシュし、同じ参照先を
 /// 多数の対象が参照しても部分木走査は 1 回で済ませる。対象を含む参照先は
-/// キャッシュできないため [`MAX_UNCACHED_REFERENT_SCANS`] で総回数を頭打ちにし、
-/// 使い切った後は `None`（呼び出し元は寄与なし＋`truncated` として扱う）。
+/// キャッシュできないため [`MAX_UNCACHED_REFERENT_SCANS`] で総回数を頭打ちにする。
+/// 対象を含まない参照先の初回走査も [`MAX_CACHEABLE_REFERENT_SCANS`] で文書全体の
+/// 総回数を頭打ちにする（異なる id の深い部分木を大量に参照する入力対策）。
+/// いずれも使い切った後は `None`（呼び出し元は寄与なし＋`truncated` として扱う）。
 fn referent_text(
     doc: &Document,
     index: &NameIndex,
@@ -928,13 +942,18 @@ fn referent_text(
     // 参照先自身の `aria-label` / `img` の `alt` は部分木を走査せず対象にも
     // 依存しないため、走査予算を消費しない。
     if !scan_referent_own_text(doc, referent, &mut out) {
-        if contains_target {
-            let left = index.uncached_scans_left.get();
-            if left == 0 {
-                return None;
-            }
-            index.uncached_scans_left.set(left - 1);
+        // 対象を含む参照先（キャッシュ不能）と含まない参照先（初回走査）で
+        // 別々の文書全体予算を消費する。使い切ったら `None`（寄与なし+truncated）。
+        let budget = if contains_target {
+            &index.uncached_scans_left
+        } else {
+            &index.first_scans_left
+        };
+        let left = budget.get();
+        if left == 0 {
+            return None;
         }
+        budget.set(left - 1);
         collect_label_text(doc, referent, target, &mut out);
     }
     if !contains_target {
@@ -1243,9 +1262,9 @@ pub fn compute_name_with_index(doc: &Document, index: &NameIndex, id: NodeId) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessibleName, MAX_IDREFS, MAX_IDREFS_SCANNED, MAX_LABELS, MAX_LABELS_SCANNED,
-        MAX_NAME_CHARS, MAX_UNCACHED_REFERENT_SCANS, NameIndex, NameSource, compute_name,
-        compute_name_with_index,
+        AccessibleName, MAX_CACHEABLE_REFERENT_SCANS, MAX_IDREFS, MAX_IDREFS_SCANNED, MAX_LABELS,
+        MAX_LABELS_SCANNED, MAX_NAME_CHARS, MAX_UNCACHED_REFERENT_SCANS, NameIndex, NameSource,
+        compute_name, compute_name_with_index,
     };
     use fandhe_browser_core::dom::{Document, NodeId};
     use fandhe_browser_core::parse::{ParseOptions, parse_document};
@@ -2612,6 +2631,51 @@ mod tests {
             Some(&named("", NameSource::None, true))
         );
     }
+
+    /// AISNAP-1（TASK-11.4.1・#544）: 互いに異なる id の参照先（キャッシュ可能）の初回走査も文書全体で `MAX_CACHEABLE_REFERENT_SCANS` 回まで。超過後は空の名前 + `truncated: true`、キャッシュ済みの参照先は引き続き解決できる。
+    #[test]
+    fn aisnap_1_aria_labelledby_first_scan_budget() {
+        let n = MAX_CACHEABLE_REFERENT_SCANS + 5;
+        let mut html = String::new();
+        for i in 0..n {
+            html.push_str(&format!(r#"<div id="r{i}"><p><b>見出し{i}</b></p></div>"#));
+        }
+        for i in 0..n {
+            html.push_str(&format!(r#"<input aria-labelledby="r{i}">"#));
+        }
+        // 予算切れ後でも、既にキャッシュ済みの参照先は解決できる。
+        html.push_str(r#"<input id="again" aria-labelledby="r0">"#);
+        let parsed = parse_document(&html, &ParseOptions::default()).expect("成功する");
+        let doc = parsed.document;
+        let targets = fandhe_browser_core::query::query_selector_all_str(&doc, doc.root(), "input")
+            .expect("セレクタは解釈できる");
+        let index = NameIndex::build(&doc);
+        let names: Vec<AccessibleName> = targets
+            .iter()
+            .map(|&id| compute_name_with_index(&doc, &index, id))
+            .collect();
+        assert_eq!(
+            names.get(MAX_CACHEABLE_REFERENT_SCANS - 1),
+            Some(&named(
+                &format!("見出し{}", MAX_CACHEABLE_REFERENT_SCANS - 1),
+                NameSource::AriaLabelledBy,
+                false
+            ))
+        );
+        assert_eq!(
+            names.get(MAX_CACHEABLE_REFERENT_SCANS),
+            Some(&named("", NameSource::None, true))
+        );
+        assert_eq!(
+            names.get(n),
+            Some(&named("見出し0", NameSource::AriaLabelledBy, false))
+        );
+        assert_eq!(
+            index.referent_cache.borrow().len(),
+            MAX_CACHEABLE_REFERENT_SCANS
+        );
+    }
+
     /// AISNAP-1（TASK-11.4.1・#544）: 参照先の外側の要素が先に作ったキャッシュを、参照先の内側の要素が再利用しない（共有索引でも `compute_name` と一致する）。
     #[test]
     fn aisnap_1_aria_labelledby_cache_not_reused_for_inner_target() {
