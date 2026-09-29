@@ -346,6 +346,13 @@ pub trait JsEngine {
     /// 子プロセス版の実装では、子が破棄されて起動し直された際にホストが
     /// 登録した分は新しい子へ登録し直される。スクリプトが作った状態は
     /// 失われる（`JS-1`・`TASK-29`・Issue #527）。
+    ///
+    /// 子プロセス版（`V8ProcessEngine::inject_global_function`。
+    /// `TASK-29.4`・Issue #155）は登録フレームで子へ即時に登録し、子が登録を
+    /// 拒否した場合（`undefined` 等 non-configurable な名前・重複・件数上限）は
+    /// [`JsEngineError::BindingFailed`] を返す。本トレイトへの集約と、
+    /// [`NativeFn`]（`Send` なし）と親側の `Send` 付き関数型の橋渡しは
+    /// `TASK-29.6`（Issue #157）で行う（未実装）。
     fn inject_global_function(&mut self, name: &str, func: NativeFn) -> Result<(), JsEngineError>;
 
     /// 名前付きの DOM 風オブジェクト（複数のネイティブメソッドを持つ）を
