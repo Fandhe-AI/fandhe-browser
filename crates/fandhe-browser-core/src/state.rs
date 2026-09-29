@@ -113,6 +113,9 @@ pub enum StateError {
     },
     /// 世代番号が `u64` の上限に達した。wrap による世代の取り違えを避けるため失敗させる。
     GenerationExhausted,
+    /// [`NavigationState::begin_navigation`] が払い出していない世代（初期値 0）が渡された。
+    /// begin 無しでの保存を許さないため、状態は変更しない。
+    NotStarted,
 }
 
 impl fmt::Display for StateError {
@@ -125,6 +128,7 @@ impl fmt::Display for StateError {
                 current.get()
             ),
             Self::GenerationExhausted => f.write_str("navigation generation counter exhausted"),
+            Self::NotStarted => f.write_str("navigation generation was never started"),
         }
     }
 }
@@ -202,18 +206,23 @@ impl NavigationState {
 
     /// `generation` が最新のときに限り、結果を HTML・URL 同時に原子的に保存する。
     ///
-    /// 後から新しい navigate が始まっていれば [`StateError::Superseded`] を返し、
-    /// 状態は書き換えない。
+    /// 後から新しい navigate が始まっていれば [`StateError::Superseded`] を、
+    /// 未開始の世代 0 なら [`StateError::NotStarted`] を返し、状態は書き換えない。
     pub fn commit_navigation(
         &self,
         generation: NavigationGeneration,
         result: NavigationResult,
     ) -> Result<(), StateError> {
-        self.replace_if_current(generation, Some(Arc::new(result)))
+        self.replace_if_current(generation, Arc::new(result), false)
     }
 
     /// `about:blank`（URL は `about:blank`・HTML は空）へ遷移済みの結果を同時に保存する。世代の
     /// 判定は [`Self::commit_navigation`] と同じ。
+    ///
+    /// 成功時は世代も 1 つ進める。同じ世代で進行中の取得が後から
+    /// [`Self::commit_navigation`] しても `Superseded` となり、クリア前のページが復活しない
+    /// （`CDP-1`・`AISNAP-6`）。世代を使い切っている場合は [`StateError::GenerationExhausted`]
+    /// を返し状態を変更しない。
     ///
     /// `None` を保存しないため、[`Self::latest`] の利用者は「`about:blank` へ遷移済み」
     /// （`Some`・`url() == "about:blank"`）と「取得中・取得失敗で結果なし」（`None`）を区別できる
@@ -221,7 +230,8 @@ impl NavigationState {
     pub fn clear_navigation(&self, generation: NavigationGeneration) -> Result<(), StateError> {
         self.replace_if_current(
             generation,
-            Some(Arc::new(NavigationResult::new("about:blank", ""))),
+            Arc::new(NavigationResult::new("about:blank", "")),
+            true,
         )
     }
 
@@ -233,18 +243,28 @@ impl NavigationState {
     fn replace_if_current(
         &self,
         generation: NavigationGeneration,
-        value: Option<Arc<NavigationResult>>,
+        value: Arc<NavigationResult>,
+        advance: bool,
     ) -> Result<(), StateError> {
         // 世代の判定と置き換えを同じロック内で行い、判定後の割り込みを防ぐ。
         let mut guard = self.lock();
         let current = self.current_generation();
+        if generation.get() == 0 {
+            return Err(StateError::NotStarted);
+        }
         if generation != current {
             return Err(StateError::Superseded {
                 attempted: generation,
                 current,
             });
         }
-        *guard = value;
+        if advance {
+            // ロックを保持しているため、判定から加算までに他の begin は割り込めない。
+            self.generation
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+                .map_err(|_| StateError::GenerationExhausted)?;
+        }
+        *guard = Some(value);
         Ok(())
     }
 
@@ -397,6 +417,13 @@ mod tests {
         let blank = s.latest().unwrap();
         assert_eq!(blank.url(), "about:blank");
         assert_eq!(blank.html(), "");
+        // clear は世代を進めるため、同じ世代の遅れた commit は復活させられない。
+        assert_eq!(s.current_generation().get(), g.get() + 1);
+        assert!(matches!(
+            s.commit_navigation(g, NavigationResult::new("https://a/", "a")),
+            Err(StateError::Superseded { .. })
+        ));
+        assert_eq!(s.latest().unwrap().url(), "about:blank");
         // 古い世代での clear は拒否され、新しい結果を消さない。
         let g2 = s.begin_navigation().unwrap();
         s.commit_navigation(g2, NavigationResult::new("https://b/", "b"))
@@ -404,6 +431,31 @@ mod tests {
         let g3 = s.begin_navigation().unwrap();
         assert!(s.clear_navigation(g2).is_err());
         assert_eq!(s.current_generation(), g3);
+    }
+
+    #[test]
+    fn cdp1_generation_zero_is_rejected_without_begin() {
+        let s = NavigationState::new();
+        let zero = s.current_generation();
+        assert_eq!(
+            s.commit_navigation(zero, NavigationResult::new("https://a/", "a")),
+            Err(StateError::NotStarted)
+        );
+        assert_eq!(s.clear_navigation(zero), Err(StateError::NotStarted));
+        assert!(s.latest().is_none());
+        assert_eq!(s.current_generation().get(), 0);
+        assert_eq!(
+            StateError::NotStarted.to_string(),
+            "navigation generation was never started"
+        );
+    }
+
+    #[test]
+    fn cdp1_clear_at_max_generation_is_rejected_unchanged() {
+        let s = NavigationState::with_generation(u64::MAX);
+        let g = s.current_generation();
+        assert_eq!(s.clear_navigation(g), Err(StateError::GenerationExhausted));
+        assert!(s.latest().is_none());
     }
 
     #[test]
