@@ -107,7 +107,7 @@
 //! | OS | 強制方法 | 強さ |
 //! |---|---|---|
 //! | Linux | `RLIMIT_DATA`（[`enforce_child_memory_limit`]。`rustix::process::setrlimit`。上限 [`LINUX_RLIMIT_DATA_CEILING_BYTES`]＝2 GiB）＋[`new_bounded_array_buffer_allocator`]（`ArrayBuffer` 確保の上限。3 OS 共通）＋`/proc/self/oom_score_adj`（[`prefer_child_as_oom_victim`]。`JS-1`・`TASK-29`・Issue #516。値は [`LINUX_OOM_SCORE_ADJ_VALUE`]＝1000＝カーネルの最大値） | **OS がある程度強制するが、厳密な上限としては機能しない**。`RLIMIT_DATA` は匿名 `MAP_PRIVATE` の `mmap`（大きな `ArrayBuffer` の backing store が実際に使う経路。glibc malloc は既定のしきい値 128 KiB を超える確保を `mmap` に回す）にも、実際に触れていない仮想予約にも適用される（`setrlimit(2)` の「data segment のみ」という古い説明は、匿名 mmap を会計に含めない実装を前提にしており、本 crate が対象とする現行 Linux カーネルの挙動とは異なる）。しかし V8 自身の `CodeRange` 予約だけで数百 MiB（アーキテクチャ依存。実測は上記のとおり）を消費するため、[`HEAP_EXTERNAL_ALLOWANCE_BYTES`] 相当の小さい値には設定できず、`RLIMIT_DATA` 単体では実質的な防御を親側の監視に委ねていた。**`ArrayBuffer` の確保だけは、この `RLIMIT_DATA` の限界とは無関係に、V8 自身のレベル（[`new_bounded_array_buffer_allocator`]）で [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`] を確実に強制する**。**`oom_score_adj` は上限ではなく優先度のヒントに過ぎない**: プロセス単位の確保上限を課すものではなく、システム全体がメモリ逼迫した際に Linux の OOM killer がどのプロセスを殺すかの優先度を、非特権プロセスでも常に許される範囲（引き上げ）で最大まで上げ、親（ホスト）より先にこの子が選ばれるようにするだけである |
-//! | Windows | Job Object（[`enforce_child_memory_limit`]。`windows-sys` で Win32 API を直接呼ぶ。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`。上限 [`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`]＝384 MiB）＋[`new_bounded_array_buffer_allocator`]（`ArrayBuffer` 確保の上限。3 OS 共通） | **OS がコミットの天井を強制するが、天井を超えても子プロセスは終了しない**。当初は `win32job =2.0.3` の安全な API（`limit_working_memory`／`JOB_OBJECT_LIMIT_WORKINGSET`）を使っていたが、これは物理メモリの常駐量（working set）を trim させるだけでコミットチャージの上限にはならないという P0 指摘（codex）を受け、`win32job` の使用をやめて `windows-sys` で Win32 API を直接呼ぶ実装に切り替えた（ユーザー承認 2026-09-28。承認された unsafe の範囲は本モジュールの `windows_job` サブモジュール・`read_rss_windows` に限定）。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`／`ProcessMemoryLimit` は Linux の `kill` ベースの強制とは性質が異なり、コミットチャージが上限を超えると**その先の確保が失敗するだけ**である（`VirtualAlloc`/`HeapAlloc` 相当が失敗を返す。プロセス自体は生き続ける）。ただし本対応（codex レビュー指摘 #503 P0「macOS の JS ワーカーに強制的なメモリ上限がない」）以降、V8 の既定の `ArrayBuffer::Allocator` は使わず [`new_bounded_array_buffer_allocator`] に置き換えたため、`ArrayBuffer` の確保は通常 [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`]（128 MiB）でこのアロケータ自身が拒否し、Job Object のコミット上限（384 MiB）に到達する事態は基本的に起こらない（到達しうるのは `ArrayBuffer` 以外の確保。その場合も引き続き親側の監視（[`read_child_rss_bytes`] が返す `PrivateUsage`。working set ではなくコミット量を見るように変更した）が `ResourceLimitExceeded` への分類・子の破棄・作り直しを担う）。この Windows 専用実装（windows-sys 版）のうち、Job Object の作成・`ProcessMemoryLimit` の設定・自プロセスの割り当て（[`enforce_child_memory_limit`]。子プロセス起動そのものが成立すること）と、`GetProcessMemoryInfo` による `PrivateUsage` 監視（[`read_rss_windows`]）は、3 OS CI の Windows ランナー（`rust-ci (windows-latest)`）上での結合テスト（`tests/v8_worker.rs` の Windows 専用ケースを含む全ケース）で検証している。ただし `js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation` は RSS しきい値を意図的に下げて親側の監視（`PrivateUsage` 監視）を先に発動させる構成であり（テスト自身のドキュメントコメント参照）、`JOB_OBJECT_LIMIT_PROCESS_MEMORY`（384 MiB）到達時に OS が実際に確保を拒否する経路そのものを再現・検証するテストは無い（実装済みを装わない。REPAIR-3。codex レビュー指摘 #529）|
+//! | Windows | Job Object（[`enforce_child_memory_limit`]。`windows-sys` で Win32 API を直接呼ぶ。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`。上限 [`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`]＝384 MiB）＋[`new_bounded_array_buffer_allocator`]（`ArrayBuffer` 確保の上限。3 OS 共通） | **OS がコミットの天井を強制するが、天井を超えても子プロセスは終了しない**。当初は `win32job =2.0.3` の安全な API（`limit_working_memory`／`JOB_OBJECT_LIMIT_WORKINGSET`）を使っていたが、これは物理メモリの常駐量（working set）を trim させるだけでコミットチャージの上限にはならないという P0 指摘（codex）を受け、`win32job` の使用をやめて `windows-sys` で Win32 API を直接呼ぶ実装に切り替えた（ユーザー承認 2026-09-28。承認された unsafe の範囲は本モジュールの `windows_job` サブモジュール・`read_rss_windows` に限定）。`JOB_OBJECT_LIMIT_PROCESS_MEMORY`／`ProcessMemoryLimit` は Linux の `kill` ベースの強制とは性質が異なり、コミットチャージが上限を超えると**その先の確保が失敗するだけ**である（`VirtualAlloc`/`HeapAlloc` 相当が失敗を返す。プロセス自体は生き続ける）。ただし本対応（codex レビュー指摘 #503 P0「macOS の JS ワーカーに強制的なメモリ上限がない」）以降、V8 の既定の `ArrayBuffer::Allocator` は使わず [`new_bounded_array_buffer_allocator`] に置き換えたため、`ArrayBuffer` の確保は通常 [`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`]（128 MiB）でこのアロケータ自身が拒否し、Job Object のコミット上限（384 MiB）に到達する事態は基本的に起こらない（到達しうるのは `ArrayBuffer` 以外の確保。その場合も引き続き親側の監視（[`read_child_rss_bytes`] が返す `PrivateUsage`。working set ではなくコミット量を見るように変更した）が `ResourceLimitExceeded` への分類・子の破棄・作り直しを担う）。この Windows 専用実装（windows-sys 版）のうち、Job Object の作成・`ProcessMemoryLimit` の設定・自プロセスの割り当て（[`enforce_child_memory_limit`]。子プロセス起動そのものが成立すること）と、`GetProcessMemoryInfo` による `PrivateUsage` 監視（[`read_rss_windows`]）は、3 OS CI の Windows ランナー（`rust-ci (windows-latest)`）上での結合テスト（`tests/v8_worker.rs` の Windows 専用ケースを含む全ケース）で検証している。ただし `js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation` は RSS しきい値を意図的に下げて親側の監視（`PrivateUsage` 監視）を先に発動させる構成であり（テスト自身のドキュメントコメント参照）、`JOB_OBJECT_LIMIT_PROCESS_MEMORY`（384 MiB）到達時に OS が確保を拒否する経路は、テスト専用に**下げた**上限（112 MiB）と単発 120 MiB の `ArrayBuffer` 確保で検証している（`js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_limit`。親の監視しきい値は本番の 320 MiB のまま・確保は bounded allocator の上限 128 MiB 未満なので、拒否したのは OS である。V8 は catchable な `RangeError` にして `EvaluationFailed` に分類され、子プロセスと Context は生き残る。Issue #531・codex レビュー指摘 #529）。**未検証のまま残る範囲**: 本番値 384 MiB そのものへの到達（コード経路は同じで数値だけが違う）と、`ArrayBuffer` 以外（V8 ヒープ・Rust 側の確保）が上限に達した場合の挙動（fatal OOM になり stderr 経由で `ResourceLimitExceeded` になる見込みだが検証していない。実装済みを装わない。REPAIR-3）|
 //! | macOS | OS 側の手段は無い（[`enforce_child_memory_limit`] は何もしない）。[`new_bounded_array_buffer_allocator`]（resizable ではない `ArrayBuffer`／`SharedArrayBuffer` の確保上限。3 OS 共通で有効）と WebAssembly 無効化（`super::v8_engine::V8Engine::new_with_heap_limit`。3 OS 共通で有効）が、OS に頼らず V8 自身のレベルでヒープ外メモリの一部の確保経路を狭める | **OS によるプロセス単位の強制は無く、`ArrayBuffer` アロケータ・WebAssembly 無効化も部分的な防御にとどまる**（resizable `ArrayBuffer`／growable `SharedArrayBuffer`・`ArrayBuffer` アロケータ・wasm 無効化のいずれの対象にもならない native な確保は、この防御を経由せず素通りする。[`new_bounded_array_buffer_allocator`] のドキュメントコメント「既知の抜け穴」参照）。本実装時にこの macOS 環境で実機検証したところ、`RLIMIT_DATA`・`RLIMIT_AS`・`RLIMIT_RSS` はいずれも `setrlimit(2)` の呼び出し自体が `EINVAL` で失敗した（「上限をかけたが効かない」ではなく「そもそも設定できない」）。Job Object 相当の OS 機構も無い。したがって [`enforce_child_memory_limit`] は macOS では何もせず常に成功を返す（呼び出そうとしても確実に失敗するため、fail-closed にすると macOS 上で子プロセスが常に起動できなくなってしまう）。残る確保経路（resizable `ArrayBuffer`／growable `SharedArrayBuffer`・V8 自身のコード領域・snapshot・Rust ホストバイナリの通常の確保等）は、引き続き親側の RSS 監視だけに委ねる（macOS では、これが唯一の防衛線であることに変わりはない） |
 //!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
@@ -171,8 +171,10 @@
 //!   手元検証はできていない。Job Object の作成・割り当てが成立すること
 //!   と `GetProcessMemoryInfo` による `PrivateUsage` 監視は 3 OS CI の
 //!   Windows ランナーでの結合テストにより検証しているが、
-//!   `JOB_OBJECT_LIMIT_PROCESS_MEMORY`（384 MiB）到達時に OS が実際に
-//!   確保を拒否する経路そのものを検証するテストは無い（上表参照）
+//!   `JOB_OBJECT_LIMIT_PROCESS_MEMORY` 到達時に OS が確保を拒否する経路は
+//!   テスト専用に下げた上限（112 MiB）で結合テストにより検証している
+//!   （Issue #531。上表参照）。本番値 384 MiB そのものへの到達と、
+//!   `ArrayBuffer` 以外の確保が上限に達した場合は未検証
 //! - **[`prefer_child_as_oom_victim`]（Linux の `oom_score_adj`）は
 //!   フォールバックしない**（`JS-1`・`TASK-29`・Issue #516）。procfs が
 //!   使えない環境（未マウント・読み取り専用等）では書き込みが失敗し、
@@ -416,8 +418,38 @@ pub(crate) fn prefer_child_as_oom_victim() -> Result<(), String> {
 /// する」だけであり、プロセスの終了・`ResourceLimitExceeded` への分類・
 /// 子の作り直しは、これまでどおり親側の監視が担う（実装済みを装わない。
 /// REPAIR-3）。
+///
+/// 「天井に達すると OS が確保を拒否する」経路そのものは、テスト専用に
+/// 下げた上限（[`clamp_test_windows_process_memory_limit_bytes`]）を使う
+/// 結合テスト（`tests/v8_worker.rs` の
+/// `js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_limit`。
+/// Issue #531）で検証している。本番値 384 MiB そのものへの到達は未検証。
 #[cfg(target_os = "windows")]
 const WINDOWS_PROCESS_MEMORY_LIMIT_BYTES: usize = (MAX_CHILD_RSS_BYTES + 64 * 1024 * 1024) as usize;
+
+/// テスト専用に下げられる Job Object 上限の下限（バイト。32 MiB）。
+///
+/// 安全上の不変条件ではなく、`0` のような無意味な値が
+/// `SetInformationJobObject` へ渡らないようにするための「動作可能な
+/// 最小値」（`v8_engine::MIN_TEST_HEAP_LIMIT_BYTES` と同じ位置づけ）。
+#[cfg(target_os = "windows")]
+const MIN_TEST_WINDOWS_PROCESS_MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
+/// テスト専用の Job Object 上限の要求値を、`[下限, 本番値]` へクランプする
+/// （`JS-1`・`TASK-29`・Issue #531）。
+///
+/// **下げることしかできない**: 本番値
+/// （[`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`]。384 MiB）を超える要求は本番値へ
+/// 丸められる。親（`super::process_engine::spawn_worker`）と子
+/// （`super::worker::worker_main`）の両方が独立に呼ぶ多層防御であり、
+/// テスト用の上書きで安全機構を緩められる経路を作らない。
+#[cfg(target_os = "windows")]
+pub(crate) fn clamp_test_windows_process_memory_limit_bytes(requested: usize) -> usize {
+    requested.clamp(
+        MIN_TEST_WINDOWS_PROCESS_MEMORY_LIMIT_BYTES,
+        WINDOWS_PROCESS_MEMORY_LIMIT_BYTES,
+    )
+}
 
 /// [`new_bounded_array_buffer_allocator`] が拒否するまでに確保できる
 /// `ArrayBuffer` backing store の合計バイト数（codex レビュー指摘 #503
@@ -506,19 +538,32 @@ pub(crate) struct ChildMemoryLimitGuard {
 /// [`ChildMemoryLimitGuard`] は、呼び出し元が子プロセスの寿命いっぱい
 /// 保持しなければならない（ドキュメントコメント参照）。
 ///
+/// `windows_process_memory_limit_override` は Windows 専用のテスト用上書き
+/// （`JS-1`・Issue #531。`None` なら本番値。`Some` は本番値以下へクランプ
+/// される。他 OS では無視する）。
+///
 /// 失敗した場合は fail-closed（呼び出し元は評価を始めずに終了する）。
 /// 親（`super::process_engine`）はハンドシェイク未達として検出し、
 /// `EngineUnavailable` へ変換する。OS ごとの強制の強さはモジュール冒頭
 /// の表を参照（macOS は常に成功を返し、実際の防御は行わない）。
-pub(crate) fn enforce_child_memory_limit() -> Result<ChildMemoryLimitGuard, String> {
+pub(crate) fn enforce_child_memory_limit(
+    windows_process_memory_limit_override: Option<usize>,
+) -> Result<ChildMemoryLimitGuard, String> {
     #[cfg(target_os = "linux")]
     {
+        // Windows の Job Object 上限の上書き（Issue #531）は Linux では使わない。
+        let _ = windows_process_memory_limit_override;
         enforce_via_rlimit_data()?;
         Ok(ChildMemoryLimitGuard {})
     }
     #[cfg(target_os = "windows")]
     {
-        let job = windows_job::create_and_assign(WINDOWS_PROCESS_MEMORY_LIMIT_BYTES)?;
+        // テスト専用の上書きは下げる方向にだけ効く（呼び出し側でもクランプ済み
+        // だが、ここでも再度クランプして本番値を超えられないようにする）。
+        let limit_bytes = windows_process_memory_limit_override
+            .map(clamp_test_windows_process_memory_limit_bytes)
+            .unwrap_or(WINDOWS_PROCESS_MEMORY_LIMIT_BYTES);
+        let job = windows_job::create_and_assign(limit_bytes)?;
         Ok(ChildMemoryLimitGuard { _job: job })
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -527,6 +572,7 @@ pub(crate) fn enforce_child_memory_limit() -> Result<ChildMemoryLimitGuard, Stri
         // 参照）。ここで `RLIMIT_DATA` 等を試みても確実に失敗するだけで
         // あり、fail-closed にすると当該 OS で子プロセスが常に起動でき
         // なくなってしまうため、何もせず成功を返す。
+        let _ = windows_process_memory_limit_override;
         Ok(ChildMemoryLimitGuard {})
     }
 }
@@ -1274,6 +1320,25 @@ mod tests {
     fn js_1_windows_process_memory_limit_has_margin_over_the_monitoring_threshold() {
         assert_eq!(WINDOWS_PROCESS_MEMORY_LIMIT_BYTES, 384 * 1024 * 1024);
         assert!(WINDOWS_PROCESS_MEMORY_LIMIT_BYTES as u64 > MAX_CHILD_RSS_BYTES);
+    }
+
+    /// Issue #531: テスト専用の Job Object 上限は本番値（384 MiB）を
+    /// 超えられず、下限（32 MiB）を下回らず、範囲内はそのまま通ること。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn js_1_clamp_test_windows_process_memory_limit_bytes_only_lowers() {
+        assert_eq!(
+            clamp_test_windows_process_memory_limit_bytes(usize::MAX),
+            384 * 1024 * 1024
+        );
+        assert_eq!(
+            clamp_test_windows_process_memory_limit_bytes(0),
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            clamp_test_windows_process_memory_limit_bytes(112 * 1024 * 1024),
+            112 * 1024 * 1024
+        );
     }
 
     /// codex レビュー指摘 #503 P0: Linux の `RLIMIT_DATA` 上限が実測に

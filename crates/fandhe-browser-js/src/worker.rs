@@ -115,6 +115,29 @@ pub(crate) const TEST_HELLO_ENGINE_OVERRIDE_ENV_VAR: &str =
 /// ちょうどの `Hello` を送る。
 pub(crate) const TEST_HELLO_EXTRA_BYTE_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER_HELLO_EXTRA_BYTE";
 
+/// テスト専用（Windows のみ）: 子プロセスの Job Object
+/// `ProcessMemoryLimit` を本番値（384 MiB）より**下げる**環境変数
+/// （`JS-1`・`TASK-29`・Issue #531。親側の RSS 監視が先に発動しない構成で、
+/// OS が確保を拒否する経路を検証するため）。
+///
+/// [`TEST_HEAP_LIMIT_ENV_VAR`] と同様、本番の起動経路は `env_clear()` した
+/// 状態で子を起動するため、明示的に渡さない限り本番では存在しない。値は
+/// untrusted な入力として扱い、子側で
+/// [`super::resource_limits::clamp_test_windows_process_memory_limit_bytes`]
+/// により本番値以下へクランプする（親側のクランプとは独立した多層防御）。
+#[cfg(target_os = "windows")]
+pub(crate) const TEST_WINDOWS_PROCESS_MEMORY_LIMIT_ENV_VAR: &str =
+    "FANDHE_BROWSER_JS_WORKER_WINDOWS_PROCESS_MEMORY_LIMIT_BYTES";
+
+/// [`TEST_WINDOWS_PROCESS_MEMORY_LIMIT_ENV_VAR`] の生の値から、
+/// `enforce_child_memory_limit` へ渡す上書き値を決める純粋関数。解釈
+/// できなければ `None`（本番値）、解釈できればクランプした値を返す。
+#[cfg(target_os = "windows")]
+fn test_windows_process_memory_limit_from_env_value(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .map(super::resource_limits::clamp_test_windows_process_memory_limit_bytes)
+}
+
 /// [`TEST_HEAP_LIMIT_ENV_VAR`] の生の値（未設定なら `None`）から、実際に
 /// [`V8Engine::new_with_heap_limit`] へ渡すヒープ上限を決める（codex
 /// レビュー指摘 #503 P0 対応）。
@@ -284,13 +307,27 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
     // 対応。`ChildMemoryLimitGuard` のドキュメントコメント参照。`_` を
     // 先頭に付けた名前にすることで「未使用」の警告を避けつつ、値
     // そのものはこの関数の終わりまで drop されない）。
-    let _memory_limit_guard = match super::resource_limits::enforce_child_memory_limit() {
-        Ok(guard) => guard,
-        Err(err) => {
-            eprintln!("fandhe-browser-js worker: failed to enforce the child memory limit: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+    //
+    // Windows のテスト専用の上書き（Issue #531）は、環境変数を untrusted な
+    // 入力として読み取り直後にクランプする（本番値を超えられない）。
+    #[cfg(target_os = "windows")]
+    let windows_limit_override = test_windows_process_memory_limit_from_env_value(
+        std::env::var(TEST_WINDOWS_PROCESS_MEMORY_LIMIT_ENV_VAR)
+            .ok()
+            .as_deref(),
+    );
+    #[cfg(not(target_os = "windows"))]
+    let windows_limit_override: Option<usize> = None;
+    let _memory_limit_guard =
+        match super::resource_limits::enforce_child_memory_limit(windows_limit_override) {
+            Ok(guard) => guard,
+            Err(err) => {
+                eprintln!(
+                    "fandhe-browser-js worker: failed to enforce the child memory limit: {err}"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
 
     // V8 の Platform を protected 版（thread-isolated allocation 有効）で
     // 初期化する（`JS-1`・`TASK-29`・Issue #520）。この子プロセスは
@@ -604,6 +641,26 @@ mod tests {
         assert_eq!(test_heap_limit_from_env_value(Some("not-a-number")), None);
         assert_eq!(test_heap_limit_from_env_value(Some("")), None);
         assert_eq!(test_heap_limit_from_env_value(None), None);
+    }
+
+    /// Issue #531: Job Object 上限の環境変数値は、上限超過・非数値・未設定・
+    /// 範囲内のいずれも具体値で期待どおりに変換されること。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn js_1_test_windows_process_memory_limit_from_env_value_clamps_and_falls_back() {
+        assert_eq!(
+            test_windows_process_memory_limit_from_env_value(Some("4294967296")),
+            Some(384 * 1024 * 1024)
+        );
+        assert_eq!(
+            test_windows_process_memory_limit_from_env_value(Some("117440512")),
+            Some(112 * 1024 * 1024)
+        );
+        assert_eq!(
+            test_windows_process_memory_limit_from_env_value(Some("x")),
+            None
+        );
+        assert_eq!(test_windows_process_memory_limit_from_env_value(None), None);
     }
 
     /// JS-1・Issue #503 W5: `JsEngineError::Timeout` は `ErrorKind::Timeout`
