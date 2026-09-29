@@ -78,3 +78,35 @@ test-support = ["js-v8"]
 name = "v8_worker"
 harness = false
 required-features = ["test-support"]
+
+# 子プロセスの「起動＋ハンドシェイク」レイテンシ実測ベンチ（TASK-29・
+# Issue #555・`CORE-3`・`PERF-6`・`PERF-7`。親 issue #519）。
+# `harness = false` の理由: このバイナリ自身が
+# `fandhe_browser_js::run_js_worker_if_requested` 経由で子プロセス役を
+# 兼ねる（`v8_worker` 結合テストと同じ作法）ため、子プロセス役のときの
+# stdout はプロトコルフレーム専用であり、libtest/`cargo bench` の既定
+# ハーネスが書く文字列が混入するとフレーム読み取りが壊れる。
+# `required-features` の理由: 計測本体が使うテスト専用入口
+# （`V8ProcessEngine::spawn_worker_for_test`・`worker_pid_for_test`）は
+# feature `test-support`（`js-v8` を包含）配下にしか存在しない（Issue
+# #528 の隔離方針）。
+[[bench]]
+name = "worker_spawn_latency"
+path = "benches/worker_spawn_latency.rs"
+harness = false
+required-features = ["test-support"]
+
+# レイテンシ集計の純関数（`benches/worker_spawn_latency/stats.rs`）の
+# ユニットテスト（TASK-29・Issue #555・`PERF-6`・`PERF-7`）。ベンチ本体
+# （`js-v8`／`test-support` 前提）とは独立に、どの feature 構成でも
+# 実行できる（`competitor_lightpanda_support` と同じ構成。新規依存・
+# 子プロセス起動を伴わないため `required-features` は付けない）。
+# `path` が `stats.rs` 本体ではなく兄弟の `stats_tests.rs` を指す理由:
+# `stats.rs` は bench 本体からも `#[path]` で取り込まれるが、bench
+# ターゲットは `--cfg test` は付くが `--test`（libtest 起動）は付かない
+# ため、`stats.rs` 側に `#[test]` 関数を同居させると bench 側の
+# コンパイルで本体が展開されず「未使用 `use`」の誤検出を招く
+# （`stats.rs` 冒頭のドキュメントコメント参照）。
+[[test]]
+name = "worker_spawn_latency_stats"
+path = "benches/worker_spawn_latency/stats_tests.rs"

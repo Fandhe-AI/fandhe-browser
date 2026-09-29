@@ -82,7 +82,11 @@ impl State {
 
 /// `id` が HTML 名前空間の要素で local name が `name`（ASCII 大文字小文字を
 /// 区別しない）と一致するかどうかを返す。
-fn is_html_element_named(doc: &Document, id: NodeId, name: &str) -> bool {
+///
+/// `pub(super)`: `snapshot` 配下の他モジュール（`name`。`AISNAP-1`・
+/// TASK-11.4.2・Issue #545）も同じ判定を必要とするため共用する。crate の
+/// 公開 API は変えない（`snapshot` モジュール外からは見えない）。
+pub(super) fn is_html_element_named(doc: &Document, id: NodeId, name: &str) -> bool {
     doc.namespace_url(id) == Some(HTML_NAMESPACE_URI)
         && doc
             .local_name(id)
