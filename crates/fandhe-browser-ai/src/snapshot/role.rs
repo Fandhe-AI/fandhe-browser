@@ -8,7 +8,10 @@
 //! # 設計上の制約（文書を走査しない）
 //!
 //! 本モジュールが暗黙 role を割り当てるのは、「要素自身の local name と
-//! 自身の属性だけ」で決まる要素に限る。祖先・子孫・ID 参照（`aria-labelledby`
+//! 自身の属性だけ」で決まる要素が中心である。唯一の例外は `header`/`footer`
+//! （TASK-11.3.3・Issue #543）で、祖先だけを最大
+//! [`MAX_SECTIONING_ANCESTOR_STEPS`] 段まで辿る（上限に届いた場合は
+//! `generic`（Fallback））。祖先・子孫・ID 参照（`aria-labelledby`
 //! 等）・テキスト内容は一切参照しない。1 要素あたりの計算量は O(自身の属性数)
 //! で、外部 HTML 由来の巨大 DOM でも文書全体の走査（O(N²) 化）を起こさない
 //! （coding-rust.md「長さ・件数の上限」・security.md「不安全な設計」）。
@@ -29,6 +32,10 @@
 //!      `table`・`rowgroup`・`row`・`cell`
 //!    - `th`: `scope="row"`（大文字小文字を区別しない）なら `rowheader`、
 //!      それ以外は `columnheader`
+//!    - `select`: `multiple` または `size` > 1 なら `listbox`、それ以外は
+//!      `combobox`（TASK-11.3.3・Issue #543）
+//!    - `header`/`footer`: sectioning 祖先が無ければ `banner`/`contentinfo`、
+//!      あれば `generic`（TASK-11.3.3・Issue #543）
 //!    - `ul`/`ol` → `list`、`li` → `listitem`
 //!    - ドキュメントルート → `document`
 //! 3. 上記以外は `generic`（Fallback）
@@ -56,10 +63,8 @@
 //!   （text・email・tel・url・search が対象）: `datalist` への ID 参照の
 //!   解決が要り「自身の属性だけを見る」制約に反するため未実装で、
 //!   `textbox`・`searchbox` のまま返す。担当 sub-issue は未割り当て
-//! - `select`（`multiple`/`size` による `listbox`/`combobox`）・
-//!   `header`/`footer`（祖先による `banner`/`contentinfo`）など文脈で変わる
-//!   role: TASK-11.3.3・Issue #543。現状はいずれも `generic`（Fallback）
-//! - `th` の表文脈による `cell` への降格: TASK-11.3.3・Issue #543
+//! - `th` の表文脈による `cell` への降格、`aside` の `complementary`:
+//!   担当 sub-issue は未割り当て
 //! - `form`・`section` の名前依存の昇格（`form`/`region`）と、`img` の
 //!   `alt=""` による `none`: accessible name の算出（TASK-11.4・Issue #73）
 //!   に依存するため未実装で、現状は `generic`（`img` も `generic`）。
@@ -332,7 +337,7 @@ fn implicit_role_for_hyperlink(doc: &Document, id: NodeId) -> ComputedRole {
 
 /// `th` 要素の暗黙 role を返す（`scope="row"`/`"rowgroup"` なら `rowheader`、それ以外は
 /// `columnheader`）。`scope` の照合は大文字小文字を区別しない。表の文脈
-/// による `cell` への降格は TASK-11.3.3（Issue #543）で扱う。
+/// による `cell` への降格は未実装（担当 sub-issue は未割り当て）。
 fn implicit_role_for_th(doc: &Document, id: NodeId) -> ComputedRole {
     let is_row_scope = doc.attribute(id, "scope").is_some_and(|value| {
         let value = value.trim_matches(|c: char| c.is_ascii_whitespace());
@@ -396,15 +401,148 @@ fn implicit_role_for_input(doc: &Document, id: NodeId) -> ComputedRole {
     ComputedRole::implicit("textbox")
 }
 
-/// 文脈（祖先・属性値）で role が変わる要素（`select`・`header`・`footer`）
-/// の暗黙 role。
+/// 祖先走査の最大段数（`header`/`footer` の sectioning 祖先判定用）。
 ///
-/// スタブ: TASK-11.3.3（Issue #543・`AISNAP-1`）で実装する。`select` は
-/// `multiple`/`size` による `listbox`/`combobox`、`header`/`footer` は
-/// sectioning 祖先の有無による `banner`/`contentinfo`/`generic`。それまでは
-/// `generic`（Fallback）を返す。#543 はこの関数の中身だけを差し替える。
-fn implicit_role_for_contextual(_doc: &Document, _id: NodeId) -> ComputedRole {
-    ComputedRole::fallback()
+/// 実ページの DOM の深さが 100 を超えることはまれだが、外部 HTML は極端に
+/// 深くネストできる（core の既定 `max_nodes` は 1,000,000）。上限が無いと
+/// ツリー全体の構築（TASK-11.7・Issue #76）で要素数 × 深さの O(N²) になる。
+/// 定数で打ち切ることで 1 要素あたり O(1)・全体 O(N) に収める
+/// （security.md「不安全な設計」）。
+const MAX_SECTIONING_ANCESTOR_STEPS: usize = 512;
+
+/// sectioning 祖先の判定結果（[`sectioning_scope`] の戻り値）。
+enum SectioningScope {
+    /// sectioning 要素または対応 role を持つ祖先が見つかった。
+    Scoped,
+    /// 祖先を最後まで確認し、該当する祖先が無かった。
+    TopLevel,
+    /// 上限 [`MAX_SECTIONING_ANCESTOR_STEPS`] までに判定できなかった。
+    Undetermined,
+}
+
+/// `role` 属性の最初の有効トークン（[`KNOWN_ROLES`] に大文字小文字を区別して
+/// 完全一致するもの）を返す。[`explicit_role`] と祖先の role 判定
+/// （[`sectioning_scope`]）が同じトークン規則を共有するための helper。
+fn first_known_role_token(doc: &Document, id: NodeId) -> Option<&'static str> {
+    let value = doc.attribute(id, "role")?;
+    value
+        .split_ascii_whitespace()
+        .find_map(|token| KNOWN_ROLES.iter().find(|known| token == **known))
+        .copied()
+}
+
+/// HTML の「非負整数のパース規則」（rules for parsing non-negative integers）
+/// に従い `value` を解釈する。`select` の `size` 判定
+/// （[`implicit_role_for_select`]）から呼ばれる。
+///
+/// 先頭の ASCII 空白と `+` を読み飛ばし、続く ASCII 数字を読む（後続の
+/// 非数字は無視）。桁あふれは飽和させ、panic しない。`-0` は 0、それ以外の
+/// 負数と数字で始まらない値は `None`。
+fn parse_non_negative_integer(value: &str) -> Option<u64> {
+    let mut chars = value
+        .trim_start_matches(|c: char| c.is_ascii_whitespace())
+        .chars()
+        .peekable();
+    let negative = match chars.peek() {
+        Some('-') => {
+            chars.next();
+            true
+        }
+        Some('+') => {
+            chars.next();
+            false
+        }
+        _ => false,
+    };
+    let mut result: Option<u64> = None;
+    for c in chars {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        let digit = u64::from(c.to_digit(10).unwrap_or(0));
+        result = Some(result.unwrap_or(0).saturating_mul(10).saturating_add(digit));
+    }
+    match result {
+        Some(0) => Some(0),
+        Some(_) if negative => None,
+        other => other,
+    }
+}
+
+/// `select` の暗黙 role（`AISNAP-1`・TASK-11.3.3・Issue #543）。`multiple`
+/// があるか、`size` が 1 より大きければ `listbox`、それ以外は `combobox`。
+/// 自身の属性しか読まない。
+fn implicit_role_for_select(doc: &Document, id: NodeId) -> ComputedRole {
+    let multiple = doc.attribute(id, "multiple").is_some();
+    let large_size = doc
+        .attribute(id, "size")
+        .and_then(parse_non_negative_integer)
+        .is_some_and(|size| size > 1);
+    if multiple || large_size {
+        ComputedRole::implicit("listbox")
+    } else {
+        ComputedRole::implicit("combobox")
+    }
+}
+
+/// `id` の祖先に sectioning 要素（`article`/`aside`/`main`/`nav`/`section`）
+/// または対応 role（`article`/`complementary`/`main`/`navigation`/`region`）
+/// を持つ要素があるかを、最大 [`MAX_SECTIONING_ANCESTOR_STEPS`] 段まで調べる。
+fn sectioning_scope(doc: &Document, id: NodeId) -> SectioningScope {
+    const SECTIONING: &[&str] = &["article", "aside", "main", "nav", "section"];
+    const SECTIONING_ROLES: &[&str] = &["article", "complementary", "main", "navigation", "region"];
+    let mut ancestors = doc.ancestors(id);
+    for ancestor in ancestors.by_ref().take(MAX_SECTIONING_ANCESTOR_STEPS) {
+        if !doc.is_element(ancestor) {
+            continue;
+        }
+        if SECTIONING
+            .iter()
+            .any(|name| is_html_element_named(doc, ancestor, name))
+            || first_known_role_token(doc, ancestor)
+                .is_some_and(|role| SECTIONING_ROLES.contains(&role))
+        {
+            return SectioningScope::Scoped;
+        }
+    }
+    if ancestors.next().is_some() {
+        SectioningScope::Undetermined
+    } else {
+        SectioningScope::TopLevel
+    }
+}
+
+/// `header`/`footer` の暗黙 role（`AISNAP-1`・TASK-11.3.3・Issue #543）。
+/// sectioning 祖先が無ければ `landmark`（`banner`/`contentinfo`）、あれば
+/// `generic`（Implicit）。上限までに判定できなければ、ランドマークを誤って
+/// 名乗らないよう `generic`（Fallback）を返す。
+fn implicit_role_for_header_or_footer(
+    doc: &Document,
+    id: NodeId,
+    landmark: &'static str,
+) -> ComputedRole {
+    match sectioning_scope(doc, id) {
+        SectioningScope::TopLevel => ComputedRole::implicit(landmark),
+        SectioningScope::Scoped => ComputedRole::implicit("generic"),
+        SectioningScope::Undetermined => ComputedRole::fallback(),
+    }
+}
+
+/// 文脈（祖先・属性値）で role が変わる要素（`select`・`header`・`footer`）
+/// の暗黙 role（`AISNAP-1`・TASK-11.3.3・Issue #543）。
+///
+/// [`implicit_role`] から呼ばれ、local name で `select`（combobox/listbox）・
+/// `header`（banner）・`footer`（contentinfo）へ振り分ける。
+fn implicit_role_for_contextual(doc: &Document, id: NodeId) -> ComputedRole {
+    let Some(local) = doc.local_name(id) else {
+        return ComputedRole::fallback();
+    };
+    match local.to_ascii_lowercase().as_str() {
+        "select" => implicit_role_for_select(doc, id),
+        "header" => implicit_role_for_header_or_footer(doc, id, "banner"),
+        "footer" => implicit_role_for_header_or_footer(doc, id, "contentinfo"),
+        _ => ComputedRole::fallback(),
+    }
 }
 
 /// 要素 `id` の暗黙 role を local name で振り分ける単一のディスパッチャ。
@@ -446,11 +584,8 @@ fn implicit_role(doc: &Document, id: NodeId) -> ComputedRole {
 /// （暗黙 role へ）を返し、次のトークンは試さない。`role` 属性は名前空間を
 /// 問わず見る。
 fn explicit_role(doc: &Document, id: NodeId) -> Option<ComputedRole> {
-    let value = doc.attribute(id, "role")?;
-    let known = value
-        .split_ascii_whitespace()
-        .find_map(|token| KNOWN_ROLES.iter().find(|known| token == **known))?;
-    if (*known == "none" || *known == "presentation") && ignores_presentational_role(doc, id) {
+    let known = first_known_role_token(doc, id)?;
+    if (known == "none" || known == "presentation") && ignores_presentational_role(doc, id) {
         return None;
     }
     Some(ComputedRole::explicit(known))
@@ -834,25 +969,196 @@ mod tests {
         );
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: select・header・footer は #543 で
-    /// 差し替えるまで generic（Fallback）。
+    /// AISNAP-1（TASK-11.3.3・Issue #543）: 非負整数パースの具体値。
     #[test]
-    fn aisnap_1_contextual_elements_are_placeholder_until_task_11_3_3() {
+    fn aisnap_1_parse_non_negative_integer_values() {
+        let huge = "9".repeat(30);
+        let cases: [(&str, Option<u64>); 12] = [
+            ("0", Some(0)),
+            ("2", Some(2)),
+            ("-0", Some(0)),
+            ("-1", None),
+            ("", None),
+            ("abc", None),
+            ("+2", Some(2)),
+            (" \t\n2", Some(2)),
+            ("2px", Some(2)),
+            ("\u{000B}2", None),
+            ("\u{3000}2", None),
+            (huge.as_str(), Some(u64::MAX)),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                super::parse_non_negative_integer(input),
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
+    /// AISNAP-1（TASK-11.3.3・Issue #543）: select の multiple/size。
+    #[test]
+    fn aisnap_1_select_role() {
+        let implicit = RoleSource::Implicit;
         check(
             "<select><option>a</option></select>",
             "select",
-            "generic",
-            RoleSource::Fallback,
+            "combobox",
+            implicit,
+        );
+        check("<select multiple></select>", "select", "listbox", implicit);
+        check(
+            r#"<select multiple="false"></select>"#,
+            "select",
+            "listbox",
+            implicit,
         );
         check(
-            "<header>h</header>",
+            r#"<select multiple size="1"></select>"#,
+            "select",
+            "listbox",
+            implicit,
+        );
+        let huge = "9".repeat(30);
+        let combobox = [
+            "",
+            "abc",
+            "-1",
+            "-0",
+            "0",
+            "1",
+            "\u{3000}2",
+            "\u{0662}",
+            "\u{000B}2",
+        ];
+        for size in combobox {
+            let html = format!(r#"<select size="{size}"></select>"#);
+            check(&html, "select", "combobox", implicit);
+        }
+        let listbox = ["2", " 2", "\t\n2", "+2", "0002", "2px", huge.as_str()];
+        for size in listbox {
+            let html = format!(r#"<select size="{size}"></select>"#);
+            check(&html, "select", "listbox", implicit);
+        }
+        check(
+            r#"<select role="none"></select>"#,
+            "select",
+            "combobox",
+            implicit,
+        );
+        check(
+            r#"<select multiple role="none"></select>"#,
+            "select",
+            "listbox",
+            implicit,
+        );
+        check(
+            r#"<select role="menu"></select>"#,
+            "select",
+            "menu",
+            RoleSource::Explicit,
+        );
+    }
+
+    /// AISNAP-1（TASK-11.3.3・Issue #543）: header/footer は sectioning 祖先
+    /// が無ければ banner/contentinfo。
+    #[test]
+    fn aisnap_1_header_footer_top_level() {
+        let implicit = RoleSource::Implicit;
+        check("<header>h</header>", "header", "banner", implicit);
+        check("<footer>f</footer>", "footer", "contentinfo", implicit);
+        for wrapper in [
+            "<div>{}</div>",
+            "<form>{}</form>",
+            r#"<div role="banner">{}</div>"#,
+            r#"<div role="Region">{}</div>"#,
+            "<header>{}</header>",
+        ] {
+            let inner = wrapper.replace("{}", "<footer>f</footer>");
+            check(&inner, "footer", "contentinfo", implicit);
+        }
+        check(
+            r#"<div role="Region"><header>h</header></div>"#,
+            "header",
+            "banner",
+            implicit,
+        );
+    }
+
+    /// AISNAP-1（TASK-11.3.3・Issue #543）: sectioning 祖先（要素・role）の
+    /// 下では generic（Implicit）。
+    #[test]
+    fn aisnap_1_header_footer_scoped() {
+        let implicit = RoleSource::Implicit;
+        let wrappers = [
+            "<article>{}</article>",
+            "<aside>{}</aside>",
+            "<main>{}</main>",
+            "<nav>{}</nav>",
+            "<section>{}</section>",
+            r#"<div role="article">{}</div>"#,
+            r#"<div role="complementary">{}</div>"#,
+            r#"<div role="main">{}</div>"#,
+            r#"<div role="navigation">{}</div>"#,
+            r#"<div role="region">{}</div>"#,
+            r#"<div role="foo region">{}</div>"#,
+            "<section><div><div>{}</div></div></section>",
+        ];
+        for wrapper in wrappers {
+            check(
+                &wrapper.replace("{}", "<header>h</header>"),
+                "header",
+                "generic",
+                implicit,
+            );
+            check(
+                &wrapper.replace("{}", "<footer>f</footer>"),
+                "footer",
+                "generic",
+                implicit,
+            );
+        }
+        check(
+            r#"<header role="navigation">h</header>"#,
+            "header",
+            "navigation",
+            RoleSource::Explicit,
+        );
+    }
+
+    /// AISNAP-1（TASK-11.3.3・Issue #543）: 祖先走査の上限。段数は
+    /// html・body を含む祖先の数（div の数 + 2、section を含めるなら +1）。
+    #[test]
+    fn aisnap_1_header_ancestor_limit() {
+        let nest = |divs: usize, section: bool| {
+            let open = "<div>".repeat(divs);
+            let close = "</div>".repeat(divs);
+            let (so, sc) = if section {
+                ("<section>", "</section>")
+            } else {
+                ("", "")
+            };
+            format!("{so}{open}<header>h</header>{close}{sc}")
+        };
+        // 祖先は div + body + html + Document ルートで、上限内に収まる。
+        let within = super::MAX_SECTIONING_ANCESTOR_STEPS - 4;
+        check(
+            &nest(within, false),
+            "header",
+            "banner",
+            RoleSource::Implicit,
+        );
+        check(
+            &nest(within - 1, true),
             "header",
             "generic",
-            RoleSource::Fallback,
+            RoleSource::Implicit,
         );
+        // 上限を超える深さの外側に section があっても判定できない。
+        let beyond = super::MAX_SECTIONING_ANCESTOR_STEPS + 10;
         check(
-            "<footer>f</footer>",
-            "footer",
+            &nest(beyond, true),
+            "header",
             "generic",
             RoleSource::Fallback,
         );
