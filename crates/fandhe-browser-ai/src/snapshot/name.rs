@@ -544,7 +544,7 @@ pub(super) const SKIPPED_SUBTREES: [&str; 4] = ["script", "style", "noscript", "
 /// 要素が `hidden` 属性を持つか、`aria-hidden` が（HTML 空白の trim・ASCII
 /// 大文字小文字無視で）`"true"` かを返す（accname 2A。CSS による非表示は
 /// スタイル未評価のため対象外）。
-pub(super) fn is_hidden_element(doc: &Document, id: NodeId) -> bool {
+pub(crate) fn is_hidden_element(doc: &Document, id: NodeId) -> bool {
     if doc.attribute(id, "hidden").is_some() {
         return true;
     }
