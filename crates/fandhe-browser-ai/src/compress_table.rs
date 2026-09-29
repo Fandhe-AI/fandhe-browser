@@ -37,6 +37,7 @@
 //! 閉じるため複製している）。
 
 use crate::snapshot::element_ref::ElementSignature;
+use crate::snapshot::name::is_hidden_element;
 use crate::snapshot::{
     ElementRef, NameIndex, RefAllocator, RefError, compute_name_with_index, compute_role,
 };
@@ -415,6 +416,9 @@ pub fn detect_regular_structure(doc: &Document, id: NodeId) -> TableDetection {
 pub struct HeaderCellRef {
     /// `th`/`td` 要素自身（ref から DOM を再特定する用）。
     pub cell: NodeId,
+    /// [`RegularStructure::header_cells`] 内での位置。非表示セルは出力から除外
+    /// されるため、結果の添字とは一致しない場合がある（元セルとの対応用）。
+    pub cell_index: usize,
     /// 算出した role トークン（`th` は通常 `columnheader`）。
     pub role: String,
     /// accessible name。
@@ -431,18 +435,34 @@ fn header_discriminator(doc: &Document, id: NodeId) -> Option<&str> {
     doc.attribute(id, "id").filter(|s| !s.is_empty())
 }
 
+/// セル自身、または `container`（表要素）より内側の祖先が非表示か。
+/// `build_snapshot` が非表示要素をサブツリーごと除外する規則に合わせる。
+fn is_cell_hidden(doc: &Document, container: NodeId, cell: NodeId) -> bool {
+    if is_hidden_element(doc, cell) {
+        return true;
+    }
+    doc.ancestors(cell)
+        .take_while(|&a| a != container)
+        .any(|a| is_hidden_element(doc, a))
+}
+
 /// 規則的な表のヘッダ行の各セルへ個別 ref を付与する（`AISNAP-2`・`TASK-12.2`）。
 ///
-/// 戻り値は `structure.header_cells` と 1:1 で同じ順序（`colspan` があっても
-/// 列数ではなくセル数）。ヘッダ行が無い表・`List` では空の `Vec` を返す。
+/// 戻り値は `structure.header_cells` のうち表示されるセルだけを同じ順序で並べた
+/// もの（`colspan` があっても列数ではなくセル数）。`hidden` 属性・
+/// `aria-hidden="true"` を持つセル、またはそのような祖先（表要素自身より内側）の
+/// 配下のセルは、`build_snapshot` が除外する要素と食い違わないよう ref を発行せず
+/// 出力しない。元セルとの対応は [`HeaderCellRef::cell`]・
+/// [`HeaderCellRef::cell_index`] で保つ。ヘッダ行が無い表・`List` では空の
+/// `Vec` を返す。
 /// ref の scope は呼び出し側が先に発行した `table_ref`（テーブル要素自身）に
-/// 固定する。`thead`/`tr` を経由しないのは、圧縮表現ではそれらのノードが
+/// 固定する。scope を失うと別の表の同名ヘッダが出現番号だけで区別され、表の
+/// 挿入で既存 ref が変わるため、`table_ref` は必須にして契約を型で保証する。`thead`/`tr` を経由しないのは、圧縮表現ではそれらのノードが
 /// 消えるため。マークアップの包み方（`thead` の有無）で ref が変わらない。
 ///
 /// 呼び出し文脈: TASK-12.5（#83）の `build_snapshot` 統合で、table ノードの ref を
 /// 発行した直後に、スナップショット全体で共有する `refs` / `index` を渡して
-/// 呼ぶ想定。現時点では呼び出し元は無い。非表示セルも `header_cells` との
-/// 対応を保つため除外しない（既知の制約）。
+/// 呼ぶ想定。現時点では呼び出し元は無い。
 ///
 /// ref 発行の失敗は [`RefError`] をそのまま返す。件数は `header_cells.len()`
 /// （検出時に [`MAX_COLUMNS`] 以下へ制限済み）で上限が決まる。
@@ -450,11 +470,14 @@ pub fn assign_header_refs(
     doc: &Document,
     index: &NameIndex<'_>,
     structure: &RegularStructure,
-    table_ref: Option<ElementRef>,
+    table_ref: ElementRef,
     refs: &mut RefAllocator,
 ) -> Result<Vec<HeaderCellRef>, RefError> {
     let mut out = Vec::with_capacity(structure.header_cells.len());
-    for &cell in &structure.header_cells {
+    for (cell_index, &cell) in structure.header_cells.iter().enumerate() {
+        if is_cell_hidden(doc, structure.container, cell) {
+            continue;
+        }
         let role = compute_role(doc, cell)
             .map(|r| r.as_str().to_string())
             .unwrap_or_else(|| "columnheader".to_string());
@@ -463,12 +486,11 @@ pub fn assign_header_refs(
         if let Some(d) = header_discriminator(doc, cell) {
             sig = sig.with_discriminator(d);
         }
-        if let Some(t) = table_ref {
-            sig = sig.with_scope(t);
-        }
+        sig = sig.with_scope(table_ref);
         let elem_ref = refs.allocate_signature(&sig)?;
         out.push(HeaderCellRef {
             cell,
+            cell_index,
             role,
             name: name.text,
             name_truncated: name.truncated,
@@ -729,7 +751,7 @@ mod tests {
             .clone();
         let index = NameIndex::build(doc);
         let table_ref = refs.allocate("table", "").expect("発行できる");
-        let out = assign_header_refs(doc, &index, &s, Some(table_ref), refs).expect("成功");
+        let out = assign_header_refs(doc, &index, &s, table_ref, refs).expect("成功");
         (out, s)
     }
 
@@ -854,5 +876,28 @@ mod tests {
             let (out, _) = header_refs(&doc, &mut RefAllocator::new(), sel);
             assert_eq!(out, Vec::<HeaderCellRef>::new());
         }
+    }
+
+    /// AISNAP-2（TASK-12.2）: 非表示ヘッダセルは ref を発行せず、元セルとの対応を保つ。
+    #[test]
+    fn aisnap_2_header_refs_skip_hidden() {
+        let doc = parse(
+            "<table><thead><tr><th>a<th hidden>b<th aria-hidden=true>c<th>d</thead>\
+             <tbody><tr><td>1<td>2<td>3<td>4</table>",
+        );
+        let (out, s) = header_refs(&doc, &mut RefAllocator::new(), "table");
+        assert_eq!(s.header_cells.len(), 4);
+        let names: Vec<&str> = out.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["a", "d"]);
+        assert_eq!(out.iter().map(|h| h.cell_index).collect::<Vec<_>>(), [0, 3]);
+        assert_eq!(out[1].cell, s.header_cells[3]);
+    }
+
+    /// AISNAP-2（TASK-12.2）: 非表示のヘッダ行（祖先）配下のセルも除外する。
+    #[test]
+    fn aisnap_2_header_refs_skip_hidden_row() {
+        let doc = parse("<table><thead hidden><tr><th>a<th>b</thead><tbody><tr><td>1<td>2</table>");
+        let (out, _) = header_refs(&doc, &mut RefAllocator::new(), "table");
+        assert_eq!(out, Vec::<HeaderCellRef>::new());
     }
 }
