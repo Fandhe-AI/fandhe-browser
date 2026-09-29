@@ -2,22 +2,16 @@
 //! `Profile` に並行書き込みしても、プロファイル間のデータ漏洩が 0 件」の
 //! 入力パターンと fixture を定義するモジュール。
 //!
-//! ## 本ファイルの責務と 51.2（#182）との分担
+//! ## 本ファイルの責務（51.1・#181 と 51.2・#182）
 //!
-//! 本ファイル（TASK-51.1）が持つのは次の 3 点のみ:
-//!
-//! 1. 「アカウント A・B が同じサイトへアクセスする」状況を模した入力パターン
-//!    表（[`all_cases`]。12 ケース、`P2-01`〜`P2-12`）
-//!    と、その fixture（[`TempDir`]・[`open_profile_pair`]・[`snapshot`]）
-//! 2. 漏洩の判定ロジック（[`Leak`]・[`find_leaks`]）
-//! 3. 上記 1・2 それ自体の妥当性を確認するメタテスト（`prof_2_` 接頭辞）
-//!
-//! 実際に [`fandhe_browser_profile::Profile::create_file_in`] を呼んで
-//! パターンを適用し、別スレッド・`Barrier` 同期での並行書き込みを行い、
-//! 全ケースで漏洩 0 件をアサートするのは TASK-51.2（#182）の範囲であり、
-//! 本ファイルはそれを行わない（したがって `apply_case` のような適用ヘルパーは
-//! ここでは定義しない。定義して使わないと `-D warnings` の dead_code で
-//! 落ちるため）。
+//! - 51.1: 入力パターン表（[`all_cases`]。12 ケース、`P2-01`〜`P2-12`）、
+//!   fixture（[`TempDir`]・[`open_profile_pair`]・[`snapshot`]）、漏洩判定
+//!   （[`Leak`]・[`find_leaks`]）と、それらの妥当性を確認するメタテスト
+//! - 51.2: [`run_case`] が [`fandhe_browser_profile::Profile::create_file_in`]
+//!   経由でパターンを適用し（`P2-12` は `Barrier` 同期の別スレッドで各 200 回）、
+//!   `prof_2_all_cases_have_zero_leaks` が全ケースで漏洩 0 件・最終状態の
+//!   完全一致・共通パスの内容差異をアサートする。
+//!   `prof_2_on_disk_contamination_is_detected` は実 FS 上の陰性対照
 //!
 //! ## 「漏洩」の定義（[`find_leaks`] が判定する範囲）
 //!
@@ -32,11 +26,11 @@
 //! 判定できない場合（読み込み失敗等）は panic し、0 件に丸めない
 //! （fail-closed。`coding-rust.md`）。
 //!
-//! ## `create_file_in` が `TRUNC` しないことと上書き手順（51.2 への申し送り）
+//! ## `create_file_in` が `TRUNC` しないことと上書き手順（[`write_entry`] の根拠）
 //!
 //! [`fandhe_browser_profile::Profile::create_file_in`] は
 //! `RDWR | CREATE | NOFOLLOW | CLOEXEC | NONBLOCK` で開き、`TRUNC` を
-//! 付けない。`P2-09`（上書き）を適用する 51.2 は、2 回目の書き込み前に
+//! 付けない。`P2-09`（上書き）を適用する [`write_entry`] は、2 回目の書き込み前に
 //! `File::set_len(0)` を呼んでから `write_all` する必要がある。そうしないと
 //! 1 回目の内容が末尾に残り、「最終状態 = 最後に書いた値」という
 //! `all_cases()` の期待（`steps_a` の末尾要素が最終状態）と食い違う。
@@ -52,10 +46,13 @@
 #![cfg(unix)]
 
 use fandhe_browser_profile::{DataKind, Profile, sanitize_component};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 
 /// `PROF-2` が定める、並行書き込みケース（`P2-12`）でスレッドごとに書き込む
 /// 回数（各 200 回。PoC-7 で漏洩 0 件を確認済みの回数を踏襲する）。
@@ -901,4 +898,274 @@ fn prof_2_fixture_opens_two_sibling_profiles() {
 
     assert!(snapshot(profile_a.root()).is_empty());
     assert!(snapshot(profile_b.root()).is_empty());
+}
+/// `entry` に `payload` を書き込む。`create_file_in` は `TRUNC` しないため、
+/// `set_len(0)` と先頭 seek で上書きを実現する（`P2-09` の最終状態のため）。
+/// [`run_case`] から呼ばれ、失敗は呼び出し側が `case.id` 付きで panic させる。
+fn write_entry(profile: &Profile, entry: &Entry, payload: &[u8]) -> Result<(), String> {
+    let mut file = profile
+        .create_file_in(entry.kind, OsStr::new(&entry.name))
+        .map_err(|e| format!("create_file_in({:?}, {:?}): {e}", entry.kind, entry.name))?;
+    file.set_len(0).map_err(|e| format!("set_len: {e}"))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek: {e}"))?;
+    file.write_all(payload)
+        .map_err(|e| format!("write_all: {e}"))?;
+    Ok(())
+}
+
+/// `entry` が書かれる root からの相対パス。本体の `dir_name()` ではなく
+/// [`ISOLATION_LAYOUT`] から引き、期待値を本体実装から独立させる。
+fn relative_path_of(entry: &Entry) -> PathBuf {
+    let dir = ISOLATION_LAYOUT
+        .iter()
+        .find(|(kind, _)| *kind == entry.kind)
+        .map(|(_, name)| *name)
+        .unwrap_or_else(|| panic!("ISOLATION_LAYOUT に {:?} が無い", entry.kind));
+    PathBuf::from(dir).join(&entry.name)
+}
+
+/// 並行モード（`P2-12`）の `j` 回目のペイロード。マーカーの後ろに反復番号を
+/// 付け、混入や古い内容の残留を検出できるようにする。
+fn parallel_payload(entry: &Entry, j: usize) -> Vec<u8> {
+    format!("{}:write-{j:04}", entry.payload.marker()).into_bytes()
+}
+
+/// `account` の最終状態として期待するスナップショット。書き込みが黙って失敗
+/// しても「漏洩 0 件」になる偽陽性を防ぐための完全一致の期待値。
+fn expected_final_state(case: &IsolationCase, account: Account) -> BTreeMap<PathBuf, Vec<u8>> {
+    let steps = match account {
+        Account::A => &case.steps_a,
+        Account::B => &case.steps_b,
+    };
+    let mut out = BTreeMap::new();
+    match case.mode {
+        Mode::Sequential => {
+            for step in steps {
+                out.insert(relative_path_of(step), step.payload.bytes());
+            }
+        }
+        Mode::BarrierParallel { writes_per_profile } => {
+            for j in 0..writes_per_profile {
+                if let Some(step) = steps.get(j % steps.len().max(1)) {
+                    out.insert(relative_path_of(step), parallel_payload(step, j));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 相手アカウントだけが書き、`owner` 自身は書かない相対パスの一覧。
+fn foreign_only_paths_for(case: &IsolationCase, owner: Account) -> Vec<PathBuf> {
+    let (own, other) = match owner {
+        Account::A => (&case.steps_a, &case.steps_b),
+        Account::B => (&case.steps_b, &case.steps_a),
+    };
+    let own_paths: BTreeSet<PathBuf> = own.iter().map(relative_path_of).collect();
+    let mut out: Vec<PathBuf> = other
+        .iter()
+        .map(relative_path_of)
+        .filter(|p| !own_paths.contains(p))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 1 ケースの実行結果（両プロファイルの最終スナップショットと漏洩一覧）。
+struct CaseReport {
+    snapshot_a: BTreeMap<PathBuf, Vec<u8>>,
+    snapshot_b: BTreeMap<PathBuf, Vec<u8>>,
+    leaks_a: Vec<Leak>,
+    leaks_b: Vec<Leak>,
+}
+
+/// `P2-12` の 1 スレッド分。`barrier.wait()` の直後から `writes` 回、`steps` を
+/// 巡回して書く。失敗は panic せず文字列で集める（[`run_case`] が集約して assert）。
+fn parallel_worker(
+    barrier: &Barrier,
+    profile: &Profile,
+    steps: &[Entry],
+    writes: usize,
+) -> Vec<String> {
+    barrier.wait();
+    let mut errs = Vec::new();
+    for j in 0..writes {
+        if let Some(step) = steps.get(j % steps.len().max(1))
+            && let Err(e) = write_entry(profile, step, &parallel_payload(step, j))
+        {
+            errs.push(format!("write #{j}: {e}"));
+        }
+    }
+    errs
+}
+
+/// `case` を実 `Profile` へ適用して [`CaseReport`] を返す。ケースごとに新しい
+/// [`TempDir`] を使う（名前・ルート名がケース間で重複するため）。
+/// 書き込み失敗は 0 件に丸めず `case.id` 付きで panic する（fail-closed）。
+fn run_case(case: &IsolationCase) -> CaseReport {
+    let tmp = TempDir::new();
+    let (mut profile_a, mut profile_b) = open_profile_pair(&tmp);
+    let apply = |profile: &Profile, steps: &[Entry]| {
+        for step in steps {
+            if let Err(e) = write_entry(profile, step, &step.payload.bytes()) {
+                panic!(
+                    "case {}（{}）の書き込みに失敗: {e}",
+                    case.id, case.description
+                );
+            }
+        }
+    };
+
+    match case.mode {
+        Mode::Sequential => {
+            apply(&profile_a, &case.steps_a);
+            if case.reopen_between {
+                // ロックを解放して同じ root を開き直す（再 open 後も隔離が保たれること）。
+                drop(profile_a);
+                drop(profile_b);
+                (profile_a, profile_b) = open_profile_pair(&tmp);
+            }
+            apply(&profile_b, &case.steps_b);
+        }
+        Mode::BarrierParallel { writes_per_profile } => {
+            // spawn 前に open を済ませる。barrier.wait() より前に失敗し得る処理を
+            // 置かないため、wait に到達しないスレッドによる deadlock は起きない。
+            let barrier = Barrier::new(2);
+            let (errs_a, errs_b) = thread::scope(|scope| {
+                let ha = scope.spawn(|| {
+                    parallel_worker(&barrier, &profile_a, &case.steps_a, writes_per_profile)
+                });
+                let hb = scope.spawn(|| {
+                    parallel_worker(&barrier, &profile_b, &case.steps_b, writes_per_profile)
+                });
+                (
+                    ha.join()
+                        .unwrap_or_else(|_| vec!["thread A panicked".to_string()]),
+                    hb.join()
+                        .unwrap_or_else(|_| vec!["thread B panicked".to_string()]),
+                )
+            });
+            assert!(
+                errs_a.is_empty(),
+                "case {}: A の書き込み失敗: {errs_a:?}",
+                case.id
+            );
+            assert!(
+                errs_b.is_empty(),
+                "case {}: B の書き込み失敗: {errs_b:?}",
+                case.id
+            );
+        }
+    }
+
+    let root_a = profile_a.root().to_path_buf();
+    let root_b = profile_b.root().to_path_buf();
+    drop(profile_a);
+    drop(profile_b);
+    let snapshot_a = snapshot(&root_a);
+    let snapshot_b = snapshot(&root_b);
+
+    let markers_a: Vec<&str> = case.steps_a.iter().map(|e| e.payload.marker()).collect();
+    let markers_b: Vec<&str> = case.steps_b.iter().map(|e| e.payload.marker()).collect();
+    let leaks_a = find_leaks(
+        Account::A,
+        &snapshot_a,
+        &markers_b,
+        &foreign_only_paths_for(case, Account::A),
+    );
+    let leaks_b = find_leaks(
+        Account::B,
+        &snapshot_b,
+        &markers_a,
+        &foreign_only_paths_for(case, Account::B),
+    );
+    CaseReport {
+        snapshot_a,
+        snapshot_b,
+        leaks_a,
+        leaks_b,
+    }
+}
+
+/// `PROF-2`・TASK-51（51.2）・#182: 全ケースで漏洩 0 件、最終状態が期待と完全
+/// 一致、共通パスの内容がアカウント間で異なることを確認する（受入基準の本体）。
+#[test]
+fn prof_2_all_cases_have_zero_leaks() {
+    let mut executed = 0usize;
+    for case in all_cases() {
+        let report = run_case(&case);
+        assert!(
+            report.leaks_a.is_empty() && report.leaks_b.is_empty(),
+            "case {}（{}）で漏洩を検出: A={:?} B={:?}",
+            case.id,
+            case.description,
+            report.leaks_a,
+            report.leaks_b
+        );
+        assert_eq!(
+            report.snapshot_a,
+            expected_final_state(&case, Account::A),
+            "case {}（{}）: A の最終状態が期待と異なる",
+            case.id,
+            case.description
+        );
+        assert_eq!(
+            report.snapshot_b,
+            expected_final_state(&case, Account::B),
+            "case {}（{}）: B の最終状態が期待と異なる",
+            case.id,
+            case.description
+        );
+        for (path, content_a) in &report.snapshot_a {
+            if let Some(content_b) = report.snapshot_b.get(path) {
+                assert_ne!(
+                    content_a, content_b,
+                    "case {}: 共通パス {path:?} の内容が両アカウントで同一",
+                    case.id
+                );
+            }
+        }
+        executed += 1;
+    }
+    assert_eq!(executed, EXPECTED_CASE_COUNT);
+    assert!(executed >= 10);
+}
+
+/// `PROF-2`・TASK-51（51.2）: 実 FS 上で profile A に B のマーカーと B 専用
+/// ファイルを書くと、`snapshot` → `find_leaks` が具体値で検出する（陰性対照）。
+#[test]
+fn prof_2_on_disk_contamination_is_detected() {
+    let tmp = TempDir::new();
+    let (profile_a, _profile_b) = open_profile_pair(&tmp);
+    let contaminated = entry(DataKind::Cookies, "example.com", marker("b", "p2-01"));
+    write_entry(&profile_a, &contaminated, &contaminated.payload.bytes())
+        .unwrap_or_else(|e| panic!("書き込み失敗: {e}"));
+    let b_only = entry(DataKind::Cookies, "b-only", marker("a", "x"));
+    write_entry(&profile_a, &b_only, b"unrelated").unwrap_or_else(|e| panic!("書き込み失敗: {e}"));
+
+    let snap = snapshot(profile_a.root());
+    let leaks = find_leaks(
+        Account::A,
+        &snap,
+        &["dummy-acct-b-p2-01"],
+        &[PathBuf::from("cookies").join("b-only")],
+    );
+
+    assert_eq!(
+        leaks,
+        vec![
+            Leak {
+                owner: Account::A,
+                relative_path: PathBuf::from("cookies").join("example.com"),
+                kind: LeakKind::ForeignMarker("dummy-acct-b-p2-01".to_string()),
+            },
+            Leak {
+                owner: Account::A,
+                relative_path: PathBuf::from("cookies").join("b-only"),
+                kind: LeakKind::ForeignOnlyFile,
+            },
+        ]
+    );
 }

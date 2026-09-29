@@ -1,0 +1,1367 @@
+//! config: `fandhe-browser.toml`（TOML）を読み込み、プロファイル保存先・
+//! 分離強度などブラウザ全体の設定を解釈するモジュール（TASK-91（91.1）・
+//! Issue #214。対象ビヘイビアなし・基盤タスク。MS-3）。
+//!
+//! # 呼び出し文脈
+//!
+//! `fandhe-browser-cli`（TASK-41.5・未作成）が起動時に [`Config::load`] で
+//! 設定ファイルを読み込み、得られた [`ProfileConfig`] を
+//! `fandhe-browser-profile::Profile::open`（TASK-50・#177）へ渡す想定
+//! （設計時点の申し送り。cli crate 側の配線は別 Issue）。
+//!
+//! # スコープ（91.1〜91.3 の範囲）
+//!
+//! 読めるのは `[profile]`（保存先 `root`・分離強度 `isolation`。TASK-91（91.1）・
+//! Issue #214）、`[js]`（`engine`。TASK-91（91.2）・Issue #215）、`[rendering]`
+//! （`enabled`。TASK-91（91.3）・Issue #216）。リポジトリ直下の
+//! `fandhe-browser.toml` は全セクションを説明した設定サンプルである。
+//!
+//! トップレベル・各セクションとも未知キーを `deny_unknown_fields` で拒否する
+//! （タイプミスを黙って無視しない fail-closed 方針。security.md「不安全な
+//! 設計」）。未知のキー・セクションは [`ConfigError::Syntax`] になる。
+//!
+//! # `[rendering] enabled` の解決規則（暫定・RENDER-1・TASK-91.3）
+//!
+//! 1. 省略・`enabled = false`: レンダリング層は無効（エラーではない）
+//! 2. `enabled = true` かつレンダリング層を同梱したビルド: 有効
+//! 3. `enabled = true` かつ未同梱のビルド: [`ConfigError::RenderingNotCompiled`]
+//!    （無視して無効のまま成功させない。JS エンジン未同梱と同じ fail-closed）
+//!
+//! 3 は暫定挙動であり、最終仕様は `rendering-layer.md` と合わせて決める
+//! （spec TASK-91 の記述。Issue #216 の範囲外）。現時点ではレンダリング層を
+//! リンクしたビルドが存在しない（render crate は骨組み・cli 未作成）ため、
+//! `enabled = true` は常に 3 になる。
+//!
+//! # `[js] engine` の解決規則（JS-1・TASK-91.2）
+//!
+//! 同梱エンジン（Cargo feature `js-v8`/`js-boa`。`fandhe_browser_js::
+//! bundled_engines`）と設定値を照合し、設定の読み込み時に選択を確定する。
+//!
+//! 1. 省略: 同梱エンジンから V8 → boa の優先順で選ぶ。1 つも同梱されていない
+//!    ときは「エンジンなし（JS 無効）」（[`JsConfig::engine`] が `None`）で、
+//!    エラーではない
+//! 2. 同梱エンジンを指定: そのエンジンを選ぶ（V8 が同梱でも boa 指定を上書きしない）
+//! 3. 未同梱のエンジンを指定: [`ConfigError::JsEngineNotCompiled`]
+//!    （別エンジンへフォールバックしない）
+//! 4. 未知の値（大文字小文字違い含む）: [`ConfigError::UnknownJsEngine`]
+//!
+//! 同梱判定は設定読み込み時と `fandhe_browser_js::create_engine` の 2 箇所で
+//! 二重に行われる（後者は設定を経由しない呼び出しへの防御）。
+//!
+//! # serde/toml を公開 API に漏らさない方針
+//!
+//! `error.rs` が `reqwest`/`html5ever` の具象型を公開 API に漏らさない方針と
+//! 同様に、本モジュールの公開型（[`Config`]・[`ProfileConfig`]・
+//! [`IsolationStrength`]・[`ConfigError`]）は serde/toml の derive・型を持たない。
+//! `#[derive(serde::Deserialize)]` を持つのは非公開の `RawConfig`/`RawProfile`
+//! のみで、[`Config::from_toml_str`] 内で検証しながら公開型へ変換する
+//! （coding-rust.md「JS エンジンはトレイト抽象越しに」と同じ考え方を
+//! 外部クレートの derive 型にも適用する）。
+//!
+//! # パス解決
+//!
+//! [`ProfileConfig::root`] は `PathBuf` で保持し、文字列連結ではなく
+//! `Path::join` のみで組み立てる（coding-rust.md クロスプラットフォーム）。
+//! [`Config::load`] は `root` が相対パスの場合、設定ファイルの**親ディレクトリ**
+//! を基準に解決する（CWD 依存を避けるため）。`~` 展開・環境変数展開は行わない。
+//!
+//! `profile.root` は設定ファイルの親ディレクトリ配下に限定する（Issue #538 P0
+//! レビュー指摘: `fandhe-browser-profile::Profile::open` は渡された `root` の
+//! 許容範囲を検証せず、そのまま権限変更・ロックファイル作成・子ディレクトリ
+//! 作成を行う契約であり〔`Profile::open` の doc 参照〕、字句上の脱出防止を
+//! 同関数へ委ねる従来の想定は誤りだった）。検証は 2 段構成で、いずれも
+//! 副作用が起きる前（[`Config::load`] が `Config` を返すより前）に行う。
+//!
+//! 1. 相対パスの字句上の脱出（`..`・`profiles/..`・`.` 等、途中で深さが
+//!    負になる場合も含む）を [`ProfileConfig::from_raw`]（文字列のみを扱う
+//!    [`Config::from_toml_str`] からも呼ばれるため、ファイルパスなしで判定
+//!    できる範囲に限る）で拒否する
+//! 2. 絶対パスを設定ファイルの親ディレクトリ配下に限定する検証を
+//!    [`Config::load`] で行う（ファイルパスを知っているのは `load` のみの
+//!    ため）
+//!
+//! 基準ディレクトリ（設定ファイルの親ディレクトリ）は `std::fs::canonicalize`
+//! で symlink 解決済みの実所在まで求めてから比較する（Issue #538 P0 再指摘:
+//! 本関数はこの直前で `File::open(path)` により設定ファイルを開いており、
+//! `File::open` は symlink を解決する。判定側だけが `path.parent()` の字句
+//! 正規化に留まっていると、`path` 自体や親ディレクトリが symlink を経由する
+//! 場合に、実際に開かれた設定ファイルの所在と判定基準が食い違い、実際の
+//! 設定ディレクトリ外を指す `root` を誤って受理し得る。`File::open` が
+//! 成功した直後の呼び出しであり対象ファイルは実在するため、`canonicalize`
+//! はこの時点まで先送りしても安全に呼べる）。
+//!
+//! 絶対 `root` 側も、基準ディレクトリと桁を揃えて比較するため
+//! [`resolve_physical_prefix`] で実在する最長の祖先まで `canonicalize` する
+//! （`root` 全体は `Profile::open` 呼び出し前は実在するとは限らないため
+//! 全体を `canonicalize` できない）。祖先を物理パスへ解決しないまま
+//! `base_abs`（symlink 解決済み）とだけ字句比較すると、symlink を経由する
+//! 環境（例: macOS の `/var` → `/private/var`）で正当な `root` まで誤って
+//! 境界外と判定してしまう（P0 修正時に見つかった副作用）。実在しない末尾の
+//! 要素は字句のまま残す（まだ存在しないため symlink になり得ない）。
+//!
+//! `root` の実在する部分に含まれる symlink はこの物理解決で境界比較に
+//! 反映されるが、「symlink を積極的に拒否する」防御そのものはこの層では
+//! 行わない。`fandhe-browser-profile::Profile::open`（TASK-50・#177）が担う
+//! ハンドル基準（`openat` + `NOFOLLOW`）の走査に委ねる（二重実装しない）。
+//! つまり
+//! 「（symlink 解決済みの）許容範囲内かどうか」は config クレートが、
+//! 「範囲内の各要素が symlink でないか」は profile クレートが受け持つ、
+//! という役割分担になる。
+//!
+//! # リソース上限
+//!
+//! 外部入力（設定ファイル）を無制限にアロケーションへ使わないよう、
+//! [`MAX_CONFIG_BYTES`] で読み込みサイズを事前検証する（security.md
+//! 「不安全な設計」: 巨大ファイルによる DoS を防ぐ）。
+
+use crate::error::{Error, Result};
+pub use fandhe_browser_js::{EngineKind, bundled_engines};
+use serde::Deserialize;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+/// 設定ファイルとして読み込む最大バイト数（1 MiB）。
+///
+/// 設定ファイルは通常数十〜数百行程度であり、この上限を超える入力は
+/// 誤配置・悪意ある入力のいずれかとみなし、アロケーション前に拒否する
+/// （security.md「無制限リソース確保による DoS を防ぐ」）。
+pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+
+/// `fandhe-browser.toml` から読み込んだブラウザ全体の設定。
+///
+/// `#[non_exhaustive]` により、将来のセクション追加を非破壊にする（REPAIR-4）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Config {
+    profile: ProfileConfig,
+    js: JsConfig,
+    rendering: RenderingConfig,
+}
+
+impl Config {
+    /// TOML 文字列から [`Config`] を構築する。
+    ///
+    /// 入力長を [`MAX_CONFIG_BYTES`] で事前検証してからパースする。空文字列・
+    /// `[profile]` セクション省略は既定値として扱いエラーにしない。
+    ///
+    /// 基準ディレクトリを持たないため、絶対パス・ドライブ / ルート相対
+    /// （`C:foo`・`/foo`）の `profile.root` は境界検証できず
+    /// [`ConfigError::InvalidValue`] で拒否する（設定ファイル由来の絶対 `root` は
+    /// 境界検証を伴う [`Config::load`] のみが受理する）。返る相対 `root` は
+    /// 未解決のままで、字句上の脱出のみ検証済み。
+    pub fn from_toml_str(input: &str) -> Result<Config> {
+        if input.len() > MAX_CONFIG_BYTES {
+            return Err(Error::from(ConfigError::TooLarge {
+                limit: MAX_CONFIG_BYTES,
+            }));
+        }
+
+        Config::parse_toml(input, false)
+    }
+
+    /// TOML 文字列を検証して [`Config`] へ変換する共通処理。
+    ///
+    /// `allow_absolute_root` は絶対 `profile.root` を受理するか。基準ディレクトリ
+    /// （設定ファイルの親）を知らない [`Config::from_toml_str`] は `false`、境界検証を
+    /// 続けて行う [`Config::load`] のみ `true` を渡す（Issue #538 P0 指摘: 公開 API
+    /// から絶対 `root` の境界検証を迂回させない）。
+    fn parse_toml(input: &str, allow_absolute_root: bool) -> Result<Config> {
+        let raw: RawConfig = toml::from_str(input)
+            .map_err(|source| Error::from(ConfigError::from_toml_de_error(input, &source)))?;
+
+        let profile =
+            ProfileConfig::from_raw(raw.profile.unwrap_or_default(), allow_absolute_root)?;
+
+        let requested = raw.js.and_then(|js| js.engine);
+        let js = JsConfig {
+            engine: resolve_engine(requested.as_deref(), bundled_engines())?,
+        };
+
+        let rendering = resolve_rendering(raw.rendering, RENDERING_COMPILED)?;
+
+        Ok(Config {
+            profile,
+            js,
+            rendering,
+        })
+    }
+
+    /// `path` の設定ファイルを読み込み、[`Config`] を構築する。
+    ///
+    /// [`MAX_CONFIG_BYTES`] を超えるファイルは中身を読み切る前に
+    /// [`ConfigError::TooLarge`] を返す（`Read::take` で上限+1 バイトだけ読む）。
+    /// `[profile] root` が相対パスの場合、`path` の親ディレクトリを基準に
+    /// [`Path::join`] で解決する（呼び出し元の CWD に依存させないため）。
+    pub fn load(path: &Path) -> Result<Config> {
+        // 境界検証の基準と実際に読むファイルを結び付ける（Issue #538 P0 指摘:
+        // `File::open(path)` の後に同じ `path` を再度 `canonicalize` すると、
+        // その間の symlink 差し替えで読んだ設定と基準ディレクトリがずれる）。
+        // 先に実所在（symlink 解決済み）を求め、その実所在を開いて、
+        // 開いたハンドルが実所在と同一ファイルであることを確認する。
+        let canonical_config_file = std::fs::canonicalize(path).map_err(|source| {
+            Error::from(ConfigError::Io {
+                message: format!("failed to open {}: {source}", path.display()),
+            })
+        })?;
+
+        let file = File::open(&canonical_config_file).map_err(|source| {
+            Error::from(ConfigError::Io {
+                message: format!("failed to open {}: {source}", path.display()),
+            })
+        })?;
+
+        verify_same_file(&file, &canonical_config_file, path)?;
+
+        let mut limited = file.take(MAX_CONFIG_BYTES as u64 + 1);
+        let mut bytes = Vec::new();
+        limited.read_to_end(&mut bytes).map_err(|source| {
+            Error::from(ConfigError::Io {
+                message: format!("failed to read {}: {source}", path.display()),
+            })
+        })?;
+
+        if bytes.len() > MAX_CONFIG_BYTES {
+            return Err(Error::from(ConfigError::TooLarge {
+                limit: MAX_CONFIG_BYTES,
+            }));
+        }
+
+        let text =
+            String::from_utf8(bytes).map_err(|_source| Error::from(ConfigError::InvalidUtf8))?;
+
+        let mut config = Config::parse_toml(&text, true)?;
+
+        if let Some(root) = config.profile.root.take() {
+            // 設定ファイルの親ディレクトリを symlink 解決済みの実所在まで
+            // 求める（Issue #538 P0 再指摘）。直前の `File::open(path)` が
+            // 成功しているため対象ファイルは実在し、ここで `canonicalize`
+            // を呼んでも「ファイルシステムに触れない」という
+            // `ProfileConfig::from_raw` の字句判定（文字列のみを扱う）との
+            // 分担は崩れない。絶対パス・相対パスいずれの分岐でも、この
+            // symlink 解決済みの `base_abs` を基準に検証・結合する
+            // （モジュール doc「パス解決」参照）。
+            let base_abs = canonical_config_file
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| {
+                    Error::from(ConfigError::Io {
+                        message: format!(
+                            "failed to resolve parent directory of {}",
+                            canonical_config_file.display()
+                        ),
+                    })
+                })?;
+
+            // 絶対パスはそのまま、相対パスは設定ファイルの親ディレクトリ基準
+            // （CWD 非依存）で結合してから、両分岐とも同じ境界検証を通す
+            // （Issue #538 再指摘: 相対分岐にも検証を適用し、絶対・相対で
+            // symlink・Windows の `RootDir` のみ / `Prefix` のみのパスの扱いを
+            // 揃える）。Windows では `/outside`・`C:outside` は
+            // `Path::is_absolute()` が false のため相対分岐に入るが、
+            // `PathBuf::push`（`join`）は前者を基準のドライブ直下、後者を基準
+            // 全体の置換として扱うため、結合結果は設定ディレクトリ外になり得る。
+            // 結合後の物理解決済みパスを `is_lexically_within` で検証することで
+            // これを拒否する。
+            //
+            // `base_abs` は symlink 解決済み（`canonicalize` 済み）のため、
+            // 結合結果も実在する最長の祖先まで同様に解決してから比較する
+            // （`resolve_physical_prefix`）。片方だけ解決すると、symlink を
+            // 経由する環境（例: macOS の `/var` → `/private/var`）で正当な
+            // `root` を誤って境界外と判定する。`..`・`.` は
+            // `resolve_physical_prefix` が symlink 解決と同時に処理する。
+            let joined = if root.is_absolute() {
+                root.clone()
+            } else {
+                base_abs.join(&root)
+            };
+            let resolved = resolve_physical_prefix(&joined)?;
+
+            if !is_lexically_within(&base_abs, &resolved) {
+                return Err(Error::from(ConfigError::InvalidValue {
+                    key: "profile.root",
+                    message: format!(
+                        "profile.root {:?} must resolve to a location under the \
+                         config file's directory ({})",
+                        truncate_for_message(&root.display().to_string()),
+                        base_abs.display()
+                    ),
+                }));
+            }
+
+            // 検証に使った物理解決済みパス（`resolved`）をそのまま採用する。
+            // 未解決のパスを返すと、検証済みの最終到達点と
+            // `fandhe-browser-profile::Profile::open`（TASK-50・#177）が
+            // 要素ごとに辿るパスが食い違う（`..` 経由の実在しない兄弟
+            // ディレクトリ・設定ディレクトリ内 symlink 経由の外部到達）。
+            config.profile.root = Some(resolved);
+        }
+
+        Ok(config)
+    }
+
+    /// プロファイル関連の設定（保存先・分離強度）を返す。
+    pub fn profile(&self) -> &ProfileConfig {
+        &self.profile
+    }
+
+    /// JS エンジン選択の設定（`[js] engine` の解決結果）を返す。
+    pub fn js(&self) -> &JsConfig {
+        &self.js
+    }
+
+    /// `[rendering]` セクションの設定（TASK-91（91.3）・Issue #216）。
+    pub fn rendering(&self) -> &RenderingConfig {
+        &self.rendering
+    }
+}
+
+/// `[rendering]` セクションの設定（レンダリング層の有効化。TASK-91（91.3）・
+/// Issue #216・`RENDER-1`）。
+///
+/// `#[non_exhaustive]` により将来のフィールド追加を非破壊にする（REPAIR-4）。
+///
+/// 暫定挙動（REPAIR-3）: `enabled = true` はレンダリング層を同梱したビルドでのみ
+/// 受理され、未同梱では [`ConfigError::RenderingNotCompiled`] になる。最終仕様は
+/// `rendering-layer.md` と合わせて決める（Issue #216 の範囲外）。本型は
+/// 「有効化の要求が受理された」ことを表すだけで、レンダラの生成や cli への配線は
+/// 行わない（配線は TASK-41、render の本実装は TASK-33/TASK-38）。配線される
+/// までは `render::DisabledRenderer` が常に `RenderError::RenderingDisabled` を返す。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RenderingConfig {
+    enabled: bool,
+}
+
+impl RenderingConfig {
+    /// レンダリング層の有効化が要求され、受理されたか。既定は `false`。
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+/// レンダリング層をリンクしたビルドか（暫定。RENDER-1・TASK-91.3）。
+///
+/// 現時点ではレンダリング層を同梱するビルドが存在しない（render crate は骨組みで
+/// cli は未作成）ため `false` 固定。cli（TASK-41）が feature `rendering` を core へ
+/// 転送する段階で、feature 由来の値へ置き換える（TASK-33/TASK-38）。core へ未宣言の
+/// feature を `cfg!` で参照すると `unexpected_cfgs` になるため、定数で保持する。
+const RENDERING_COMPILED: bool = false;
+
+/// `[rendering] enabled` の設定値を同梱有無と照合して確定する
+/// （モジュール doc「`[rendering] enabled` の解決規則」）。
+/// `compiled` を引数にして、同梱時の分岐も単体テストできるようにしている。
+fn resolve_rendering(raw: Option<RawRendering>, compiled: bool) -> Result<RenderingConfig> {
+    let enabled = raw.and_then(|r| r.enabled).unwrap_or(false);
+    if enabled && !compiled {
+        return Err(Error::from(ConfigError::RenderingNotCompiled));
+    }
+    Ok(RenderingConfig { enabled })
+}
+
+/// `[js]` セクションの設定（JS エンジン選択。TASK-91（91.2）・Issue #215・
+/// `JS-1`）。
+///
+/// `#[non_exhaustive]` により将来のフィールド追加を非破壊にする（REPAIR-4）。
+///
+/// 簡易実装（REPAIR-3）: 本型は選択結果を保持するだけで、エンジンの生成・
+/// 起動時ログ・「JS disabled」の表示は行わない。`create_engine` への配線は
+/// TASK-30（`JS-2`）、cli の起動シーケンスでの非 0 終了・表示は TASK-41
+/// （cli 未作成）の責務。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct JsConfig {
+    engine: Option<EngineKind>,
+}
+
+impl JsConfig {
+    /// 選択が確定した JS エンジン。`None` は同梱エンジンが 1 つもない
+    /// （エンジンなしビルド）ため JS が無効であることを表す。
+    pub fn engine(&self) -> Option<EngineKind> {
+        self.engine
+    }
+}
+
+impl Default for JsConfig {
+    /// `[js]` 省略時の設定。`--all-features` 等で同梱一覧が変わっても
+    /// `from_toml_str("")` と一致するよう、パーサーと同じ既定選択を使う
+    /// （derive の `None` 固定にしない）。
+    fn default() -> Self {
+        JsConfig {
+            engine: select_default_engine(bundled_engines()),
+        }
+    }
+}
+
+/// 同梱エンジンから V8 → boa の優先順（[`EngineKind::ALL`]）で既定を選ぶ。
+/// `bundled` の並び順には依存しない。空なら `None`（JS 無効）。
+fn select_default_engine(bundled: &[EngineKind]) -> Option<EngineKind> {
+    EngineKind::ALL
+        .into_iter()
+        .find(|kind| bundled.contains(kind))
+}
+
+/// `[js] engine` の設定値を同梱一覧と照合して選択を確定する
+/// （モジュール doc「`[js] engine` の解決規則」）。
+fn resolve_engine(raw: Option<&str>, bundled: &'static [EngineKind]) -> Result<Option<EngineKind>> {
+    let Some(value) = raw else {
+        return Ok(select_default_engine(bundled));
+    };
+    let Some(kind) = EngineKind::from_config_name(value) else {
+        return Err(Error::from(ConfigError::UnknownJsEngine {
+            value: truncate_for_message(value),
+            compiled: bundled,
+        }));
+    };
+    if !bundled.contains(&kind) {
+        return Err(Error::from(ConfigError::JsEngineNotCompiled {
+            requested: kind,
+            compiled: bundled,
+        }));
+    }
+    Ok(Some(kind))
+}
+
+/// 同梱一覧を `v8, boa`（空なら `none`）形式に整形する。
+fn format_engine_list(engines: &[EngineKind]) -> String {
+    if engines.is_empty() {
+        "none".to_string()
+    } else {
+        engines
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// `[profile]` セクションの設定（プロファイル保存先・分離強度。ビヘイビア
+/// `PROF-6` が定める既定分離強度と対応する）。
+///
+/// `#[non_exhaustive]` により将来のフィールド追加（暗号化オプション等）を
+/// 非破壊にする（REPAIR-4）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ProfileConfig {
+    root: Option<PathBuf>,
+    isolation: IsolationStrength,
+}
+
+impl ProfileConfig {
+    /// プロファイル保存先。`None` の場合、呼び出し元（`fandhe-browser-cli`
+    /// 想定）がプラットフォーム既定のディレクトリを決める
+    /// （将来仕様。プラットフォーム既定ディレクトリ解決は追加の依存が
+    /// 必要になるため本 Issue（#214）では行わない。REPAIR-3）。
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    /// プロファイルの分離強度。
+    pub fn isolation(&self) -> IsolationStrength {
+        self.isolation
+    }
+
+    fn from_raw(raw: RawProfile, allow_absolute_root: bool) -> Result<ProfileConfig> {
+        let root = match raw.root {
+            Some(root) => {
+                if root.is_empty() {
+                    return Err(Error::from(ConfigError::InvalidValue {
+                        key: "profile.root",
+                        message: "profile.root must not be empty".to_string(),
+                    }));
+                }
+                let candidate = PathBuf::from(&root);
+                // ルート・ドライブを含むパスの扱い（Issue #538 P0・P1 指摘）。
+                // 完全な絶対パスは基準ディレクトリを知る `Config::load` のみが
+                // 境界検証つきで受理する。Windows のドライブ相対（`C:foo`）・
+                // ルート相対（`/foo`）は `is_absolute()` が false でも通常の
+                // 相対パスではなく、`join` で基準を置換し得るため常に拒否する。
+                // 相対 `root` は `Normal`・`CurDir`・`ParentDir` のみで構成される。
+                let has_root_or_prefix = candidate.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::RootDir | std::path::Component::Prefix(_)
+                    )
+                });
+                // UNC・デバイス名前空間などのドライブ以外の prefix は、境界検証の
+                // ためのファイルシステムアクセス（`canonicalize`）がネットワーク
+                // 解決に及ぶため、字句段階で常に拒否する（Windows。ローカル
+                // ドライブ以外は設定ディレクトリ配下になり得ない）。
+                let has_non_disk_prefix = candidate.components().any(|c| match c {
+                    std::path::Component::Prefix(p) => !matches!(
+                        p.kind(),
+                        std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+                    ),
+                    _ => false,
+                });
+                if has_non_disk_prefix
+                    || (has_root_or_prefix && !(allow_absolute_root && candidate.is_absolute()))
+                {
+                    return Err(Error::from(ConfigError::InvalidValue {
+                        key: "profile.root",
+                        message: format!(
+                            "profile.root {:?} must be a plain relative path (absolute, \
+                             drive-relative and root-relative paths are not accepted here)",
+                            truncate_for_message(&root)
+                        ),
+                    }));
+                }
+                // `Config::load` は相対パスを設定ファイルの親ディレクトリへ
+                // `Path::join` する（正規化しない）。ここで字句上
+                // （ファイルシステムに触れず）正規化した結果、設定ファイルの
+                // 親ディレクトリ自体を指す（深さ 0。`.`・`profiles/..` 等）か、
+                // それより上位へ脱出する（深さが負になる。`..`・`a/../..` 等）
+                // 値は拒否する（Issue #538: 当初は上位への脱出自体の検証を
+                // 二重実装せず `Profile::open` のハンドル基準検証に委ねる
+                // 想定だったが、`Profile::open` は `root` の許容範囲を検証
+                // しない契約〔同関数の doc 参照〕であるため、ここで拒否しないと
+                // 検証されないまま `Profile::open` の副作用（権限変更・子
+                // ディレクトリ作成・ロック取得）に渡ってしまう。security.md
+                // 「不安全な設計」・プロファイル境界。絶対パスの限定は
+                // ファイルパスを知っている `Config::load` 側で行う。モジュール
+                // doc「パス解決」参照）。
+                // 絶対パスは `Config::load` が境界検証するため深さ判定は相対のみ。
+                if !has_root_or_prefix && resolves_outside_or_at_base_dir(&candidate) {
+                    return Err(Error::from(ConfigError::InvalidValue {
+                        key: "profile.root",
+                        message: format!(
+                            "profile.root {:?} must not resolve to the config file's own \
+                             directory or an ancestor of it (e.g. \".\", \"profiles/..\", \
+                             or \"..\")",
+                            truncate_for_message(&root)
+                        ),
+                    }));
+                }
+                Some(candidate)
+            }
+            None => None,
+        };
+
+        let isolation = match raw.isolation {
+            Some(value) => IsolationStrength::parse(&value)?,
+            None => IsolationStrength::default(),
+        };
+
+        Ok(ProfileConfig { root, isolation })
+    }
+}
+
+/// プロファイルの分離強度（ビヘイビア `PROF-6`）。
+///
+/// `#[non_exhaustive]` により、`profile` 分離（将来のオプトイン拡張）を
+/// 追加する際に非破壊にする（REPAIR-4）。現時点では
+/// [`IsolationStrength::DataDirectory`]（PROF-6 の既定: データディレクトリ
+/// 分離 + advisory lock + パーミッション 700。`fandhe-browser-profile::
+/// Profile::open`（TASK-50）が担う）の 1 variant のみを提供する。プロセス
+/// 分離（`"process"`）は spec 上「将来のオプトイン拡張」と定義されており
+/// 未実装のため、指定されると [`ConfigError::InvalidValue`] を返す
+/// （実装済みを装わない。REPAIR-3）。
+///
+/// `fandhe-browser-profile` crate がこの型を消費するようになったら、
+/// crate 間で共有する型は下位 crate へ置く規約（coding-rust.md「crate 構成と
+/// 境界」）に従い、本型を `fandhe-browser-profile` へ移設すること。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum IsolationStrength {
+    /// データディレクトリ分離 + advisory lock + パーミッション 700
+    /// （PROF-6 の既定。`fandhe-browser-profile::Profile::open` が担う）。
+    #[default]
+    DataDirectory,
+}
+
+impl IsolationStrength {
+    /// TOML の文字列表現に対応する `&'static str` を返す。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IsolationStrength::DataDirectory => "data-directory",
+        }
+    }
+
+    fn parse(value: &str) -> Result<IsolationStrength> {
+        match value {
+            "data-directory" => Ok(IsolationStrength::DataDirectory),
+            "process" => Err(Error::from(ConfigError::InvalidValue {
+                key: "profile.isolation",
+                message: "profile.isolation \"process\" is not supported yet (process \
+                          isolation is a planned opt-in; supported: data-directory)"
+                    .to_string(),
+            })),
+            other => Err(Error::from(ConfigError::InvalidValue {
+                key: "profile.isolation",
+                message: format!(
+                    "unknown profile.isolation {:?} (supported: data-directory)",
+                    truncate_for_message(other)
+                ),
+            })),
+        }
+    }
+}
+
+/// `path` が字句上（ファイルシステムへ触れずコンポーネント解析のみで）
+/// 基準ディレクトリ自体（深さ 0）、またはそれより上位（深さが途中で負に
+/// なる）に正規化されるかを判定する（Issue #538 P0 レビュー指摘対応）。
+///
+/// `.`（`CurDir` のみ）や `profiles/..`（`Normal` 1 個と `ParentDir` 1 個が
+/// 相殺）のように基準ディレクトリそのものを指す値、および `".."`・
+/// `"a/../.."` のように基準ディレクトリより上位へ脱出する値の両方を検出する
+/// ために `ProfileConfig::from_raw` から呼ばれる。絶対パス（`RootDir`/
+/// `Prefix` を含む）は対象外として `false` を返す（このパスパターンには
+/// 「基準ディレクトリ相対の深さ」という概念が適用できないため。絶対パスの
+/// 限定は `Config::load` が別途行う。モジュール doc「パス解決」参照）。
+fn resolves_outside_or_at_base_dir(path: &Path) -> bool {
+    use std::path::Component;
+
+    let mut depth: i64 = 0;
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir => depth -= 1,
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+        if depth < 0 {
+            return true;
+        }
+    }
+    depth <= 0
+}
+
+/// 開いたハンドル `file` が `canonical`（`canonicalize` 済みの実所在）と
+/// 同一ファイルであることを確認する（open と canonicalize の間の symlink
+/// 差し替え検出。Issue #538 P0 指摘）。
+///
+/// unix では `dev`/`ino` を比較する。それ以外の OS では `path` を再度
+/// `canonicalize` した結果が `canonical` と一致することで差し替えを検出する
+/// （std に安定したファイル ID API がなく、新規依存も避けるため）。
+/// 不一致は [`ConfigError::Io`] で拒否する（fail-closed）。
+fn verify_same_file(file: &File, canonical: &Path, path: &Path) -> Result<()> {
+    let changed = || {
+        Error::from(ConfigError::Io {
+            message: format!("config file {} changed while loading", path.display()),
+        })
+    };
+    let io_err = |source: std::io::Error| {
+        Error::from(ConfigError::Io {
+            message: format!("failed to verify {}: {source}", path.display()),
+        })
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata().map_err(io_err)?;
+        let on_disk = std::fs::metadata(canonical).map_err(io_err)?;
+        if opened.dev() != on_disk.dev() || opened.ino() != on_disk.ino() {
+            return Err(changed());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        let again = std::fs::canonicalize(path).map_err(io_err)?;
+        if again != canonical {
+            return Err(changed());
+        }
+    }
+    Ok(())
+}
+
+/// `path`（絶対パス想定）を先頭の要素から順に辿り、実在する要素は都度
+/// `canonicalize`（symlink 解決）しながら `..` を処理する。実在しなくなった
+/// 以降の要素は字句のまま扱う（`realpath -m` 相当）。
+///
+/// [`Config::load`] が絶対 `root`（`fandhe-browser-profile::Profile::open`
+/// 呼び出し前は実在するとは限らない）を、symlink 解決済みの設定ディレクトリ
+/// （`canonicalize` 済みの `base_abs`）と桁を揃えて比較するために使う
+/// （Issue #538 P0 再指摘）。`..` は解決済みの物理パスに対して親へ戻すため、
+/// symlink の後ろの `..` が symlink 解決前に相殺されて実到達先とずれる
+/// ことがない（Issue #538 P1 再指摘。例: `link` が外部ディレクトリを指す場合の
+/// `link/../profiles` は外部ディレクトリの親配下として判定される）。
+/// 要素が実在するのに `canonicalize` できない場合（dangling symlink・
+/// 権限不足等）は fail-closed で [`ConfigError::Io`] を返す。
+/// `root` の実在する部分に symlink 自体があるかどうかを積極的に拒否する検査は
+/// ここでは行わない（モジュール doc「パス解決」参照。`Profile::open` の責務）。
+fn resolve_physical_prefix(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let io_error = |source: std::io::Error| {
+        Error::from(ConfigError::Io {
+            message: format!("failed to resolve {}: {source}", path.display()),
+        })
+    };
+
+    let mut resolved = PathBuf::new();
+    // 実在しない（字句のまま積んだ）要素の個数。0 の間だけ実在確認・解決する。
+    let mut missing_depth: usize = 0;
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // `resolved` は物理解決済み（または実在しない字句要素）のため、
+                // 単純に親へ戻せば実際の OS のパス解決と一致する。ルートより
+                // 上位へは脱出しない（`pop` は false を返して何もしない）。
+                resolved.pop();
+                missing_depth = missing_depth.saturating_sub(1);
+            }
+            Component::Prefix(_) | Component::RootDir => resolved.push(component.as_os_str()),
+            Component::Normal(name) => {
+                resolved.push(name);
+                if missing_depth > 0 {
+                    missing_depth += 1;
+                    continue;
+                }
+                match std::fs::symlink_metadata(&resolved) {
+                    Ok(_) => {
+                        resolved = std::fs::canonicalize(&resolved).map_err(io_error)?;
+                    }
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                        missing_depth = 1;
+                    }
+                    Err(source) => return Err(io_error(source)),
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// `candidate`（字句正規化済みの絶対パス）が `base`（同じく字句正規化済みの
+/// 絶対パス）の配下（`base` 自身は含まない）にあるかを字句上で判定する。
+///
+/// [`Config::load`] が絶対 `root` を設定ファイルの親ディレクトリ配下に
+/// 限定する検証（Issue #538 P0 レビュー指摘）で使う。
+/// `fandhe-browser-profile::assert_within_root` と同じ判定方針（`base` 自身
+/// は許可しない・残りのコンポーネントがすべて `Normal` であること）だが、
+/// crate 間の依存方向（core は profile に依存してよいが、本チェックは
+/// 単純な字句比較のみで新規依存を要しないため導入しない。coding-rust.md
+/// 「crate 構成と境界」）に配慮し、config crate 内で完結させる。大文字小文字を
+/// 区別しない OS では、大文字小文字だけが異なるパスを「範囲外」と判定し得る
+/// （拒否側に倒れるため安全側の制約。coding-rust.md「クロスプラットフォーム」）。
+fn is_lexically_within(base: &Path, candidate: &Path) -> bool {
+    use std::path::Component;
+
+    let Ok(rest) = candidate.strip_prefix(base) else {
+        return false;
+    };
+
+    let mut components = rest.components().peekable();
+    if components.peek().is_none() {
+        return false;
+    }
+    components.all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// エラーメッセージへ反響する外部入力由来の文字列を切り詰める
+/// （security.md: 外部入力の反響・ログ肥大化を避ける）。
+fn truncate_for_message(value: &str) -> String {
+    const MAX_ECHO_CHARS: usize = 64;
+    if value.chars().count() <= MAX_ECHO_CHARS {
+        value.to_string()
+    } else {
+        let truncated: String = value.chars().take(MAX_ECHO_CHARS).collect();
+        format!("{truncated}...")
+    }
+}
+
+/// トップレベルの生 TOML 構造（非公開。serde の derive をここに閉じ込める）。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    profile: Option<RawProfile>,
+    js: Option<RawJs>,
+    rendering: Option<RawRendering>,
+}
+
+/// `[rendering]` セクションの生 TOML 構造（非公開）。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRendering {
+    enabled: Option<bool>,
+}
+
+/// `[js]` セクションの生 TOML 構造（非公開）。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawJs {
+    engine: Option<String>,
+}
+
+/// `[profile]` セクションの生 TOML 構造（非公開）。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProfile {
+    root: Option<String>,
+    isolation: Option<String>,
+}
+
+/// [`config`](self) モジュールが返すエラー（[`Error::Config`] の payload）。
+///
+/// `#[non_exhaustive]` により後続タスクでのバリアント追加を非破壊にする
+/// （REPAIR-4）。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ConfigError {
+    /// 設定ファイルの読み書き（実体はオープン・読み込みのみ）で発生した
+    /// I/O エラー。`std::io::Error` は具象型のまま公開せず、メッセージへ
+    /// 写像する（error.rs の方針を踏襲。パスは含めてよいが内容は含めない）。
+    Io {
+        /// 人間・AI 双方が読める英語メッセージ。
+        message: String,
+    },
+    /// 読み込み対象が [`MAX_CONFIG_BYTES`] を超えている
+    /// （アロケーション前に検査する。security.md）。
+    TooLarge {
+        /// 適用された上限（バイト数）。
+        limit: usize,
+    },
+    /// 設定ファイルが妥当な UTF-8 ではなかった。
+    InvalidUtf8,
+    /// TOML の構文エラー（未知キーの検出を含む。`deny_unknown_fields`）。
+    Syntax {
+        /// `toml::de::Error::message()` 由来の英語メッセージ。
+        message: String,
+        /// エラー位置の行番号（1 始まり）。位置が特定できない場合は `None`。
+        line: Option<usize>,
+        /// エラー位置の列番号（1 始まり）。位置が特定できない場合は `None`。
+        column: Option<usize>,
+    },
+    /// 構文的には正しいが、値が受理可能な範囲外だった
+    /// （空の `root`・未知の `isolation` 値・未対応の `"process"` 等）。
+    InvalidValue {
+        /// 問題のあったキー（例: `"profile.root"`）。
+        key: &'static str,
+        /// 人間・AI 双方が読める英語メッセージ。
+        message: String,
+    },
+    /// `[js] engine` が既知のエンジンを指しているが、このバイナリに同梱
+    /// されていない（別エンジンへはフォールバックしない。`JS-1`・TASK-91.2）。
+    JsEngineNotCompiled {
+        /// 設定で指定されたエンジン。
+        requested: EngineKind,
+        /// このバイナリに同梱されているエンジン（V8 → boa 順。空もあり得る）。
+        compiled: &'static [EngineKind],
+    },
+    /// `[js] engine` が未知の値だった（大文字小文字違い・前後空白を含む。
+    /// `JS-1`・TASK-91.2）。
+    UnknownJsEngine {
+        /// 指定された値（外部入力のため 64 文字で切り詰め済み）。
+        value: String,
+        /// このバイナリに同梱されているエンジン（V8 → boa 順。空もあり得る）。
+        compiled: &'static [EngineKind],
+    },
+    /// `[rendering] enabled = true` だが、このバイナリにレンダリング層が同梱
+    /// されていない（無視して成功させない）。暫定挙動で、最終仕様は
+    /// `rendering-layer.md` と合わせて決める（`RENDER-1`・TASK-91.3・Issue #216）。
+    RenderingNotCompiled,
+}
+
+impl ConfigError {
+    /// `toml::de::Error` を `input` と突き合わせて 1 始まりの行・列に変換し、
+    /// [`ConfigError::Syntax`] を構築する。
+    ///
+    /// `toml::de::Error` 自体は公開 API に出さない（外部クレートの具象型を
+    /// 上位 crate へ漏らさない方針）ため、必要な情報（メッセージ・位置）を
+    /// ここで取り出して汎用的な variant へ写像する。
+    fn from_toml_de_error(input: &str, source: &toml::de::Error) -> ConfigError {
+        let (line, column) = match source.span() {
+            Some(span) => {
+                let (line, column) = line_column(input, span.start);
+                (Some(line), Some(column))
+            }
+            None => (None, None),
+        };
+
+        ConfigError::Syntax {
+            message: source.message().to_string(),
+            line,
+            column,
+        }
+    }
+}
+
+/// バイトオフセット `start` を 1 始まりの (行, 列) に変換する。
+///
+/// `start` が `input` の文字境界でない場合は、直前の境界まで切り詰めてから
+/// 計算する（外部由来のオフセットを添字アクセスへそのまま使わない。
+/// coding-rust.md「外部入力の経路では添字アクセスを使わない」）。
+fn line_column(input: &str, start: usize) -> (usize, usize) {
+    let mut boundary = start.min(input.len());
+    while boundary > 0 && !input.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let prefix: &str = input.get(..boundary).unwrap_or_default();
+
+    let line = prefix.matches('\n').count() + 1;
+    let column = match prefix.rfind('\n') {
+        Some(newline_index) => match prefix.get(newline_index + 1..) {
+            Some(rest) => rest.chars().count() + 1,
+            None => 1,
+        },
+        None => prefix.chars().count() + 1,
+    };
+
+    (line, column)
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::Io { message } => write!(f, "I/O error: {message}"),
+            ConfigError::TooLarge { limit } => {
+                write!(f, "configuration file exceeds limit of {limit} bytes")
+            }
+            ConfigError::InvalidUtf8 => write!(f, "configuration file is not valid UTF-8"),
+            ConfigError::Syntax {
+                message,
+                line,
+                column,
+            } => match (line, column) {
+                (Some(line), Some(column)) => {
+                    write!(f, "syntax error at line {line}, column {column}: {message}")
+                }
+                _ => write!(f, "syntax error: {message}"),
+            },
+            ConfigError::InvalidValue { key, message } => {
+                write!(f, "invalid value for {key:?}: {message}")
+            }
+            ConfigError::JsEngineNotCompiled {
+                requested,
+                compiled,
+            } => write!(
+                f,
+                "js engine \"{}\" is not compiled into this binary (compiled: {}); \
+                 rebuild with --features {}",
+                requested.as_str(),
+                format_engine_list(compiled),
+                requested.feature_name()
+            ),
+            ConfigError::RenderingNotCompiled => write!(
+                f,
+                "rendering.enabled = true but the rendering layer is not compiled into \
+                 this binary (no build currently links it); set rendering.enabled = false"
+            ),
+            ConfigError::UnknownJsEngine { value, compiled } => write!(
+                f,
+                "unknown js engine {value:?} (supported: \"v8\" (--features js-v8), \
+                 \"boa\" (--features js-boa); compiled: {})",
+                format_engine_list(compiled)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TASK-91（91.1）: 空文字列は `Config::default()`（root `None`・
+    /// isolation `DataDirectory`）と一致する。
+    #[test]
+    fn task_91_1_empty_input_yields_default_config() {
+        let config = Config::from_toml_str("").expect("空文字列はパースできる");
+        assert_eq!(config, Config::default());
+        assert_eq!(config.profile().root(), None);
+        assert_eq!(
+            config.profile().isolation(),
+            IsolationStrength::DataDirectory
+        );
+    }
+
+    /// TASK-91（91.1）: `[profile]` のみ（キーなし）でも既定値になる。
+    #[test]
+    fn task_91_1_empty_profile_section_yields_default() {
+        let config = Config::from_toml_str("[profile]\n").expect("空 [profile] はパースできる");
+        assert_eq!(config, Config::default());
+    }
+
+    /// TASK-91（91.1）: `root` を指定すると `Some(PathBuf)` になる。
+    #[test]
+    fn task_91_1_root_is_parsed_as_path() {
+        let config = Config::from_toml_str("[profile]\nroot = 'profiles/default'\n")
+            .expect("root 指定はパースできる");
+        assert_eq!(config.profile().root(), Some(Path::new("profiles/default")));
+    }
+
+    /// TASK-91（91.1）・PROF-6: `isolation = "data-directory"` は
+    /// `IsolationStrength::DataDirectory` になる。
+    #[test]
+    fn task_91_1_isolation_data_directory_is_parsed() {
+        let config = Config::from_toml_str("[profile]\nisolation = 'data-directory'\n")
+            .expect("data-directory はパースできる");
+        assert_eq!(
+            config.profile().isolation(),
+            IsolationStrength::DataDirectory
+        );
+    }
+
+    /// TASK-91（91.1）・PROF-6: `isolation = "process"` は未対応として
+    /// 明示エラーになる（実装済みを装わない。REPAIR-3）。
+    #[test]
+    fn task_91_1_isolation_process_is_rejected_as_unsupported() {
+        let err = Config::from_toml_str("[profile]\nisolation = 'process'\n")
+            .expect_err("process は未対応エラーになる");
+        let message = err.to_string();
+        assert!(message.contains("process"), "message was: {message}");
+        assert!(message.contains("not supported"), "message was: {message}");
+    }
+
+    /// TASK-91（91.1）: 未知の `isolation` 値は指定値と受理可能な値を含む
+    /// エラーになる。
+    #[test]
+    fn task_91_1_isolation_unknown_value_is_rejected() {
+        let err = Config::from_toml_str("[profile]\nisolation = 'quickjs'\n")
+            .expect_err("未知値はエラーになる");
+        let message = err.to_string();
+        assert!(message.contains("quickjs"), "message was: {message}");
+        assert!(message.contains("data-directory"), "message was: {message}");
+    }
+
+    /// TASK-91（91.1）: 空文字列の `root` はエラーになる。
+    #[test]
+    fn task_91_1_empty_root_is_rejected() {
+        let err = Config::from_toml_str("[profile]\nroot = ''\n")
+            .expect_err("空文字列の root はエラーになる");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::InvalidValue {
+                key: "profile.root",
+                ..
+            })
+        ));
+    }
+
+    /// TASK-91（91.1）・PROF-6: `root = "."` は設定ファイルの親ディレクトリ
+    /// 自体を指すため拒否される（Issue #538 レビュー指摘の回帰防止）。
+    #[test]
+    fn task_91_1_root_current_dir_is_rejected() {
+        let err = Config::from_toml_str("[profile]\nroot = '.'\n")
+            .expect_err("\".\" は設定ファイルのディレクトリ自体を指すためエラーになる");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::InvalidValue {
+                key: "profile.root",
+                ..
+            })
+        ));
+    }
+
+    /// TASK-91（91.1）・PROF-6: `root = "profiles/.."` は正規化すると
+    /// 設定ファイルの親ディレクトリ自体を指すため拒否される
+    /// （Issue #538 レビュー指摘の回帰防止）。
+    #[test]
+    fn task_91_1_root_normalizing_to_current_dir_is_rejected() {
+        let err = Config::from_toml_str("[profile]\nroot = 'profiles/..'\n")
+            .expect_err("\"profiles/..\" は正規化後に設定ファイルの親ディレクトリを指す");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::InvalidValue {
+                key: "profile.root",
+                ..
+            })
+        ));
+    }
+
+    /// TASK-91（91.1）・PROF-6: 基準より上位へ脱出する値（`".."`）は拒否
+    /// される（Issue #538 P0 レビュー指摘の回帰防止。当初は `Profile::open`
+    /// への委譲を想定していたが、同関数は `root` の許容範囲を検証しない
+    /// 契約のためここで拒否する）。
+    #[test]
+    fn task_91_1_root_parent_traversal_is_rejected() {
+        let err = Config::from_toml_str("[profile]\nroot = '..'\n")
+            .expect_err("\"..\" は基準ディレクトリより上位へ脱出するため拒否される");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::InvalidValue {
+                key: "profile.root",
+                ..
+            })
+        ));
+    }
+
+    /// TASK-91（91.1）・PROF-6: 途中で深さが負になる値（`"a/../.."`）も
+    /// 拒否される（Issue #538 P0 レビュー指摘の回帰防止）。
+    #[test]
+    fn task_91_1_root_negative_depth_midway_is_rejected() {
+        let err = Config::from_toml_str("[profile]\nroot = 'a/../..'\n")
+            .expect_err("\"a/../..\" は途中で基準より上位へ脱出するため拒否される");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::InvalidValue {
+                key: "profile.root",
+                ..
+            })
+        ));
+    }
+
+    /// TASK-91（91.1）: 通常の相対パス（`profiles/default`）は引き続き
+    /// 受理される（回帰防止）。
+    #[test]
+    fn task_91_1_root_normal_relative_path_is_accepted() {
+        let config = Config::from_toml_str("[profile]\nroot = 'profiles/default'\n")
+            .expect("通常の相対パスは受理される");
+        assert_eq!(config.profile().root(), Some(Path::new("profiles/default")));
+    }
+
+    /// TASK-91（91.1）: 型違い（`root` が文字列でない）は構文エラーになる。
+    #[test]
+    fn task_91_1_wrong_type_for_root_is_syntax_error() {
+        let err =
+            Config::from_toml_str("[profile]\nroot = 1\n").expect_err("型違いは構文エラーになる");
+        assert!(matches!(err, Error::Config(ConfigError::Syntax { .. })));
+    }
+
+    /// TASK-91（91.1）: 型違い（`isolation` が真偽値）は構文エラーになる。
+    #[test]
+    fn task_91_1_wrong_type_for_isolation_is_syntax_error() {
+        let err = Config::from_toml_str("[profile]\nisolation = true\n")
+            .expect_err("型違いは構文エラーになる");
+        assert!(matches!(err, Error::Config(ConfigError::Syntax { .. })));
+    }
+
+    /// TASK-91（91.1）: トップレベルの未知キーは `deny_unknown_fields` により
+    /// 構文エラーになる。
+    #[test]
+    fn task_91_1_unknown_top_level_key_is_rejected() {
+        let err = Config::from_toml_str("[unknown]\nfoo = 1\n")
+            .expect_err("未知セクションはエラーになる");
+        assert!(matches!(err, Error::Config(ConfigError::Syntax { .. })));
+    }
+
+    /// TASK-91（91.1）: `[profile]` 内の未知キーは `deny_unknown_fields` により
+    /// 構文エラーになる（タイプミスの黙殺を防ぐ）。
+    #[test]
+    fn task_91_1_unknown_profile_key_is_rejected() {
+        let err =
+            Config::from_toml_str("[profile]\nrooot = 'x'\n").expect_err("未知キーはエラーになる");
+        assert!(matches!(err, Error::Config(ConfigError::Syntax { .. })));
+    }
+
+    /// TASK-91（91.1）: 構文エラーの行番号が正しく計算される（1 行目）。
+    #[test]
+    fn task_91_1_syntax_error_reports_line_one() {
+        let err = Config::from_toml_str("[profile\n").expect_err("不正な構文はエラーになる");
+        match err {
+            Error::Config(ConfigError::Syntax { line, .. }) => {
+                assert_eq!(line, Some(1));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// TASK-91（91.1）: 2 行目のエラーで行番号が 2 になる（行・列計算の検証）。
+    #[test]
+    fn task_91_1_syntax_error_on_second_line_reports_line_two() {
+        let err = Config::from_toml_str("[profile]\nroot = 1\n").expect_err("型違いはエラーになる");
+        match err {
+            Error::Config(ConfigError::Syntax { line, .. }) => {
+                assert_eq!(line, Some(2));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// TASK-91（91.1）: `MAX_CONFIG_BYTES` を超える入力は `TooLarge` になる。
+    #[test]
+    fn task_91_1_input_too_large_is_rejected() {
+        let input = "a".repeat(MAX_CONFIG_BYTES + 1);
+        let err = Config::from_toml_str(&input).expect_err("上限超過はエラーになる");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::TooLarge {
+                limit: MAX_CONFIG_BYTES
+            })
+        ));
+    }
+
+    /// TASK-91（91.1）: `Error::from(ConfigError)` の `Display` 接頭辞と
+    /// `source()` が `Some` になる。
+    #[test]
+    fn task_91_1_error_display_prefix_and_source() {
+        let err = Error::from(ConfigError::InvalidUtf8);
+        assert_eq!(
+            err.to_string(),
+            "configuration error: configuration file is not valid UTF-8"
+        );
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    /// TASK-91（91.1）: `line_column` はマルチバイト文字を含む行でも
+    /// 文字数ベースの列を返す（バイトオフセットをそのまま列にしない）。
+    #[test]
+    fn task_91_1_line_column_counts_chars_not_bytes() {
+        let input = "あいう\nx";
+        // 2 行目の 'x'（バイトオフセットは日本語 3 文字分で 9、'\n' で 10）。
+        let (line, column) = line_column(input, 10);
+        assert_eq!((line, column), (2, 1));
+    }
+
+    /// TASK-91（91.2）: 省略時は同梱エンジンから V8 → boa の優先順で選ぶ。
+    #[test]
+    fn task_91_2_default_selection_prefers_v8_then_boa() {
+        use EngineKind::{Boa, V8};
+        assert_eq!(select_default_engine(&[]), None);
+        assert_eq!(select_default_engine(&[V8]), Some(V8));
+        assert_eq!(select_default_engine(&[Boa]), Some(Boa));
+        assert_eq!(select_default_engine(&[V8, Boa]), Some(V8));
+        assert_eq!(select_default_engine(&[Boa, V8]), Some(V8));
+    }
+
+    /// TASK-91（91.2）: 同梱エンジンの明示指定は優先順で上書きされない。
+    #[test]
+    fn task_91_2_explicit_bundled_engine_is_selected() {
+        static BOTH: [EngineKind; 2] = [EngineKind::V8, EngineKind::Boa];
+        static ONLY_V8: [EngineKind; 1] = [EngineKind::V8];
+        assert_eq!(
+            resolve_engine(Some("boa"), &BOTH).expect("boa は同梱"),
+            Some(EngineKind::Boa)
+        );
+        assert_eq!(
+            resolve_engine(Some("v8"), &ONLY_V8).expect("v8 は同梱"),
+            Some(EngineKind::V8)
+        );
+        assert_eq!(resolve_engine(None, &[]).expect("省略は許容"), None);
+    }
+
+    /// TASK-91（91.2）: 未同梱エンジンの指定は設定エラー（フォールバックしない）。
+    #[test]
+    fn task_91_2_not_compiled_engine_is_rejected() {
+        static ONLY_BOA: [EngineKind; 1] = [EngineKind::Boa];
+        let err = resolve_engine(Some("v8"), &ONLY_BOA).expect_err("v8 は未同梱");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::JsEngineNotCompiled {
+                requested: EngineKind::V8,
+                ..
+            })
+        ));
+        assert_eq!(
+            err.to_string(),
+            "configuration error: js engine \"v8\" is not compiled into this binary \
+             (compiled: boa); rebuild with --features js-v8"
+        );
+        let err = resolve_engine(Some("boa"), &[]).expect_err("boa は未同梱");
+        assert!(err.to_string().contains("(compiled: none)"), "{err}");
+        assert!(err.to_string().contains("--features js-boa"), "{err}");
+    }
+
+    /// TASK-91（91.2）: 未知の値（大文字小文字違い・空文字を含む）は設定エラー。
+    #[test]
+    fn task_91_2_unknown_engine_is_rejected() {
+        for bad in ["quickjs", "V8", ""] {
+            let err = resolve_engine(Some(bad), &[]).expect_err("未知の値はエラー");
+            assert!(
+                matches!(err, Error::Config(ConfigError::UnknownJsEngine { .. })),
+                "{bad:?}"
+            );
+            let msg = err.to_string();
+            for needle in ["\"v8\"", "\"boa\"", "--features js-v8", "--features js-boa"] {
+                assert!(msg.contains(needle), "{msg}");
+            }
+            assert!(msg.contains("compiled: none"), "{msg}");
+        }
+        let msg = resolve_engine(Some("quickjs"), &[])
+            .expect_err("未知")
+            .to_string();
+        assert!(msg.contains("\"quickjs\""), "{msg}");
+    }
+
+    /// TASK-91（91.2）: 長い未知の値は 64 文字で切り詰めて反響する。
+    #[test]
+    fn task_91_2_unknown_engine_value_is_truncated() {
+        let long = "x".repeat(100);
+        let msg = resolve_engine(Some(&long), &[])
+            .expect_err("未知")
+            .to_string();
+        assert!(msg.contains(&format!("{}...", "x".repeat(64))), "{msg}");
+        assert!(!msg.contains(&"x".repeat(65)), "{msg}");
+    }
+
+    /// TASK-91（91.2）: TOML 経由の経路。型違い・`[js]` 内の未知キーは構文エラー、
+    /// 省略・空 `[js]` は既定選択と一致する。実際の同梱一覧はビルド構成で
+    /// 変わるため、期待値を実行時に組み立てる。
+    #[test]
+    fn task_91_2_toml_paths() {
+        for bad in ["[js]\nengine = 1\n", "[js]\nengin = 'v8'\n"] {
+            let err = Config::from_toml_str(bad).expect_err("構文エラー");
+            assert!(matches!(err, Error::Config(ConfigError::Syntax { .. })));
+        }
+        let expected = select_default_engine(bundled_engines());
+        assert_eq!(
+            Config::from_toml_str("[js]\n")
+                .expect("空 [js]")
+                .js()
+                .engine(),
+            expected
+        );
+        assert_eq!(Config::default().js().engine(), expected);
+        assert_eq!(
+            Config::from_toml_str("").expect("空入力").js().engine(),
+            expected
+        );
+    }
+
+    /// TASK-91（91.2）: 実際の同梱一覧に対し、同梱エンジンは受理・未同梱は拒否。
+    #[test]
+    fn task_91_2_toml_explicit_engine_matches_bundled() {
+        for kind in EngineKind::ALL {
+            let input = format!("[js]\nengine = \"{}\"\n", kind.as_str());
+            let result = Config::from_toml_str(&input);
+            if bundled_engines().contains(&kind) {
+                assert_eq!(result.expect("同梱").js().engine(), Some(kind));
+            } else {
+                assert!(matches!(
+                    result.expect_err("未同梱"),
+                    Error::Config(ConfigError::JsEngineNotCompiled { .. })
+                ));
+            }
+        }
+    }
+
+    /// TASK-91（91.3）: `[rendering]` 省略・空・`enabled = false` は無効で成功する。
+    #[test]
+    fn task_91_3_disabled_paths() {
+        for input in ["", "[rendering]\n", "[rendering]\nenabled = false\n"] {
+            let config = Config::from_toml_str(input).expect("無効は受理");
+            assert!(!config.rendering().enabled(), "{input:?}");
+            assert_eq!(config, Config::default(), "{input:?}");
+        }
+    }
+
+    /// TASK-91（91.3）: 型違い・未知キーは構文エラー。
+    #[test]
+    fn task_91_3_invalid_toml_is_syntax_error() {
+        for bad in [
+            "[rendering]\nenabled = \"yes\"\n",
+            "[rendering]\nenable = true\n",
+        ] {
+            let err = Config::from_toml_str(bad).expect_err("構文エラー");
+            assert!(matches!(err, Error::Config(ConfigError::Syntax { .. })));
+        }
+    }
+
+    /// TASK-91（91.3）: 未同梱ビルドでの `enabled = true` は設定エラー（暫定）。
+    #[test]
+    fn task_91_3_enabled_without_layer_is_rejected() {
+        let err = Config::from_toml_str("[rendering]\nenabled = true\n").expect_err("未同梱は拒否");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::RenderingNotCompiled)
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("rendering.enabled = true"), "{msg}");
+        assert!(msg.contains("not compiled"), "{msg}");
+    }
+
+    /// TASK-91（91.3）: 同梱ビルド（`compiled = true`）では有効化が受理される。
+    #[test]
+    fn task_91_3_enabled_with_layer_is_accepted() {
+        let raw = Some(RawRendering {
+            enabled: Some(true),
+        });
+        let config = resolve_rendering(raw, true).expect("同梱なら受理");
+        assert!(config.enabled());
+    }
+}
