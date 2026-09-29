@@ -31,7 +31,10 @@
 //! `crates/fandhe-browser-profile/tests/profile_open.rs`）。以下はいずれも
 //! 未実装であり、実装済みを装う公開 API・ダミー実装は置かない。
 //!
-//! - プロファイル削除処理（`PROF-5`、TASK-53）
+//! - プロファイル削除処理（`PROF-5`、TASK-53）。`store.rs` の
+//!   `ProfileStore`（`XOS-7`・TASK-60（60.2）・#201）はトレイト定義のみで、
+//!   OS 既定パス解決は #202、明示指定による上書きは #203、削除の実装は #188
+//!   で補う（`ProfileStore::delete` の既定実装は `Unsupported` を返す）
 //! - 並行アクセス時のデータ分離（`PROF-2`・`PROF-3`、TASK-51・TASK-52）
 //! - Windows での ACL によるアクセス制限（`XOS-7`〜`XOS-10`。Unix の
 //!   パーミッション 0o700 相当の隔離を Windows でも実現する。TASK-50・#176
@@ -39,9 +42,11 @@
 //!   dependency-policy.md に従いユーザー承認を経る）
 
 pub mod profile;
+pub mod store;
 
 mod lock;
 
 pub use profile::{
     DataKind, Profile, ProfileError, SafeComponent, assert_within_root, sanitize_component,
 };
+pub use store::{ProfileStore, ResolvedRoot, RootSource};
