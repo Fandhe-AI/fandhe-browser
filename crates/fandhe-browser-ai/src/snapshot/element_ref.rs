@@ -25,11 +25,20 @@
 //! 一意性はハッシュの品質に依存しない。衝突の影響は安定性が少し落ちることだけ
 //! である。FNV は暗号学的ハッシュではなく、ref は認可トークンでもない。
 //!
-//! # 既知の限界
+//! # 再特定の安定性（同名要素）
 //!
-//! 同じ role + name の要素が対象より前（文書順）に挿入されると、対象の出現番号
-//! の接尾辞がずれる。DOM 構造ハッシュの併用などによる改善は将来の課題である。
-//! 無関係な要素の挿入では ref は変わらない。
+//! 同じ role + name の要素は、出現番号だけでは前方への挿入・並び替えで別要素を
+//! 指してしまう。これを避けるため、呼び出し側は [`ElementSignature`] で要素を
+//! 区別できる安定情報を渡す。
+//!
+//! - `discriminator`: `id`・`href`・フォーム部品の `name` など、要素自身に付く
+//!   安定した識別属性（untrusted な文字列。ダイジェストにのみ使い ref には入らない）
+//! - `scope`: 親要素の ref のダイジェスト。別コンテナの同名要素と出現番号を
+//!   共有しないための範囲指定
+//!
+//! これらでダイジェストが分かれる要素は、同名要素の挿入・並び替えの影響を受けない。
+//! 識別属性も親も同じ完全に同一の要素だけは、文書順の出現番号に頼る（外形上
+//! 区別できないため原理的な限界。将来は DOM 構造ハッシュの併用を検討する）。
 //!
 //! # 呼び出し側の契約（TASK-11.7 向け）
 //!
@@ -69,12 +78,71 @@ fn fnv1a_update(mut h: u64, bytes: &[u8]) -> u64 {
 /// U+0000 が入ると曖昧になるため使わない）。64bit の結果は上位・下位の XOR で
 /// 32bit に畳み込む。
 pub fn ref_signature(role: &str, name: &str) -> u32 {
-    // usize -> u64 は 32/64bit ターゲットで情報を失わない。
-    let len = (role.len() as u64).to_le_bytes();
-    let mut h = fnv1a_update(FNV_OFFSET, &len);
-    h = fnv1a_update(h, role.as_bytes());
-    h = fnv1a_update(h, name.as_bytes());
-    ((h >> 32) as u32) ^ (h as u32)
+    ElementSignature::new(role, name).digest()
+}
+
+/// ref の元になる要素シグネチャ（`AISNAP-10`）。
+///
+/// `role`・`name` に加え、同名要素を区別する安定情報（`discriminator`・`scope`）を
+/// 任意で持つ。TASK-11.7 の木構築が DOM 属性・親 ref から組み立てる想定。
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElementSignature<'a> {
+    /// アクセシビリティ role。
+    pub role: &'a str,
+    /// アクセシブル name。
+    pub name: &'a str,
+    /// 要素自身の安定した識別属性（`id`・`href` 等）。無ければ `None`。
+    pub discriminator: Option<&'a str>,
+    /// 親要素の ref のダイジェスト（[`ElementRef::digest`]）。ルート直下は `None`。
+    pub scope: Option<u32>,
+}
+
+impl<'a> ElementSignature<'a> {
+    /// role + name のみのシグネチャを作る。
+    pub fn new(role: &'a str, name: &'a str) -> Self {
+        Self {
+            role,
+            name,
+            discriminator: None,
+            scope: None,
+        }
+    }
+
+    /// 識別属性を設定する。
+    pub fn with_discriminator(mut self, discriminator: &'a str) -> Self {
+        self.discriminator = Some(discriminator);
+        self
+    }
+
+    /// 親のダイジェストを設定する。
+    pub fn with_scope(mut self, scope: u32) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+
+    /// 32bit ダイジェストを返す。追加情報が無ければ [`ref_signature`] と同値。
+    pub fn digest(&self) -> u32 {
+        let len = (self.role.len() as u64).to_le_bytes();
+        let mut h = fnv1a_update(FNV_OFFSET, &len);
+        h = fnv1a_update(h, self.role.as_bytes());
+        h = fnv1a_update(h, self.name.as_bytes());
+        if self.discriminator.is_some() || self.scope.is_some() {
+            // 追加情報あり。name の長さを入れて name と後続の境界を固定する。
+            h = fnv1a_update(h, &[0xff]);
+            h = fnv1a_update(h, &(self.name.len() as u64).to_le_bytes());
+            if let Some(d) = self.discriminator {
+                h = fnv1a_update(h, &[1]);
+                h = fnv1a_update(h, &(d.len() as u64).to_le_bytes());
+                h = fnv1a_update(h, d.as_bytes());
+            }
+            if let Some(sc) = self.scope {
+                h = fnv1a_update(h, &[2]);
+                h = fnv1a_update(h, &sc.to_le_bytes());
+            }
+        }
+        ((h >> 32) as u32) ^ (h as u32)
+    }
 }
 
 /// 生成された ref（ダイジェストと出現番号）。`Node::ref` へは
@@ -142,7 +210,16 @@ impl RefAllocator {
     /// role + name から ref を 1 つ発行する。同じシグネチャは呼ぶたびに
     /// 出現番号が増え、必ず異なる ref を返す。
     pub fn allocate(&mut self, role: &str, name: &str) -> Result<ElementRef, RefError> {
-        self.allocate_with_digest(ref_signature(role, name))
+        self.allocate_signature(&ElementSignature::new(role, name))
+    }
+
+    /// 識別属性・親スコープ付きのシグネチャから ref を発行する。同名要素でも
+    /// 識別情報が異なれば、挿入・並び替えに影響されない ref になる。
+    pub fn allocate_signature(
+        &mut self,
+        sig: &ElementSignature<'_>,
+    ) -> Result<ElementRef, RefError> {
+        self.allocate_with_digest(sig.digest())
     }
 
     /// ダイジェストを直接指定して発行する。衝突経路のテスト用で crate 外へは出さない。
@@ -207,6 +284,45 @@ mod tests {
         let links_banner = [("generic", "banner"), ("link", "More"), ("link", "More")];
         assert_eq!(run(&links).last().unwrap(), "e94e6c69f-2");
         assert_eq!(run(&links_banner).last().unwrap(), "e94e6c69f-2");
+    }
+
+    /// `AISNAP-10`: 識別属性が違う同名要素は、前方への挿入・並び替えで ref が入れ替わらない。
+    #[test]
+    fn aisnap_10_discriminator_keeps_same_name_refs_stable() {
+        let run = |hrefs: &[&str]| {
+            let mut a = RefAllocator::new();
+            hrefs
+                .iter()
+                .map(|h| {
+                    let sig = ElementSignature::new("link", "More").with_discriminator(h);
+                    (h.to_string(), s(a.allocate_signature(&sig).unwrap()))
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let before = run(&["/a", "/b"]);
+        let inserted = run(&["/new", "/a", "/b"]);
+        let reordered = run(&["/b", "/a"]);
+        assert_eq!(before["/a"], inserted["/a"]);
+        assert_eq!(before["/b"], inserted["/b"]);
+        assert_eq!(before["/a"], reordered["/a"]);
+        assert_ne!(before["/a"], before["/b"]);
+    }
+
+    /// `AISNAP-10`: 親スコープが違えば同名要素の出現番号は共有されない。
+    #[test]
+    fn aisnap_10_scope_separates_same_name_in_different_containers() {
+        let mut a = RefAllocator::new();
+        let first = ElementSignature::new("button", "Delete").with_scope(1);
+        let second = ElementSignature::new("button", "Delete").with_scope(2);
+        let r1 = a.allocate_signature(&first).unwrap();
+        let r2 = a.allocate_signature(&second).unwrap();
+        assert_eq!(r1.occurrence, 1);
+        assert_eq!(r2.occurrence, 1);
+        assert_ne!(s(r1), s(r2));
+        assert_eq!(
+            ElementSignature::new("button", "Submit").digest(),
+            ref_signature("button", "Submit")
+        );
     }
 
     /// `AISNAP-10`: role と name の境界が曖昧にならない。
