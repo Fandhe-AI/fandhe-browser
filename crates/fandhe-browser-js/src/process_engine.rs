@@ -2,14 +2,19 @@
 //! 「JS プロセス分離」設計書 §3.2・§3.3・§3.4・§7 W4）。
 //!
 //! 呼び出し元（将来）: `TASK-29.6`（Issue #157）で `create_engine` から
-//! 配線され、`impl JsEngine for V8ProcessEngine` を追加する（本 Issue の
-//! 時点では inherent メソッドとして `evaluate_script` を提供するに
-//! 留める。設計書 §7「案 X」4）。
+//! 配線され、`impl JsEngine for V8ProcessEngine` を追加する（現時点では
+//! inherent メソッドとして `evaluate_script`・`inject_global_function` を
+//! 提供するに留める。設計書 §7「案 X」4）。
 //!
 //! [`V8ProcessEngine`] は 1 つの子プロセス（`super::worker` を
 //! `FANDHE_BROWSER_JS_WORKER` 環境変数で起動したもの）を遅延生成し、
 //! 寿命のあいだ持ち続ける。子は同じ実行ファイルを自己再実行する
 //! （専用のワーカーバイナリを持たない。設計書 §3.1）。
+//!
+//! 遅延起動のタイミングは「`new()` の後の**初回の注入または評価**」
+//! である（`TASK-29.4`・Issue #155。[`V8ProcessEngine::inject_global_function`]
+//! は登録を即時に子へ届けて成否を返すため、子が無ければ注入時に起動する）。
+//! `new()` の時点では起動しない（PERF-6・PERF-7・CORE-3）。
 //!
 //! # スレッド構成
 //!
@@ -57,11 +62,10 @@
 //! 子から `NATIVE_CALL`（[`worker_protocol::tag::NATIVE_CALL`]）フレームが
 //! 届くと、[`V8ProcessEngine::native_fns`] に登録済みの [`NativeFn`] を
 //! 実行し、結果を `NATIVE_RETURN` フレームとして送り返す（[`dispatch_native_call`]
-//! ・[`V8ProcessEngine::send_evaluate_and_await`]）。本番の登録 API（親→子の
-//! 登録フレームを含む）は別 Issue（#155）が担い、本 Issue の時点ではテスト
-//! 専用の登録経路（[`V8ProcessEngine::register_native_function_for_test`]。
-//! feature `test-support` 限定）だけを提供する。子の再起動時の再登録は
-//! 次節のとおり Issue #527 で扱う。
+//! ・[`V8ProcessEngine::send_evaluate_and_await`]）。登録は本番の注入 API
+//! [`V8ProcessEngine::inject_global_function`]（親→子の登録フレーム
+//! `REGISTER_GLOBAL_FUNCTION`。`TASK-29.4`・Issue #155）が担う。子の再起動
+//! 時の再登録は次節のとおり Issue #527 で扱う。
 //!
 //! # 子の再起動と登録し直し（`TASK-29`・Issue #527）
 //!
@@ -70,20 +74,17 @@
 //!
 //! - **登録し直すもの**: ホストが登録した注入関数の「グローバル名と id」
 //!   （`V8ProcessEngine::host_bindings`。エンジンの寿命のあいだ親が保持
-//!   する）。子の起動（初回・再起動とも）のたびに
-//!   `child_native_proxies_env_value` が登録簿から値を組み立てて新しい子へ
-//!   渡す（子への登録の唯一の入口。#155 はこの関数の中身を登録フレームの
-//!   送信へ置き換える）。親側の `native_fns`（id から [`NativeFn`] への
-//!   対応）はもともとエンジンに残る
+//!   する）。子の起動（初回・再起動とも）のたびに、`spawn_worker` が Hello
+//!   検証の直後に登録簿を 1 件ずつ登録フレームで新しい子へ送って応答を
+//!   待つ（`TASK-29.4`・Issue #155）。親側の `native_fns`（id から
+//!   [`NativeFn`] への対応）はもともとエンジンに残る
 //! - **登録し直さないもの**: スクリプトが作ったグローバル変数・関数・状態
 //!   のすべて。失われたことは、破棄時のエラーメッセージ（"context was
 //!   discarded" と "the next evaluation runs in a fresh context"）で
 //!   明示する（security.md「偽装・回避機能の禁止」）
 //!
-//! 本番の `new()` 経由のエンジンには #155 まで登録経路が無いため、この
-//! 節の挙動が変えるのはテスト専用経路（feature `test-support`）だけである。
-//! 子が稼働中の間の登録は拒否する（稼働中の子への即時登録は #155 の担当）。
-//! DOM 風オブジェクト（`bind_dom_like_object`）の登録し直しは未対応で、
+//! 稼働中の子への登録も同じ登録フレームで即時に行う
+//! （[`V8ProcessEngine::inject_global_function`]）。DOM 風オブジェクト（`bind_dom_like_object`）の登録し直しは未対応で、
 //! 前提の #524・#525（`TASK-29.5a`・`TASK-29.5b`）で登録簿へ種別を足して
 //! 同じ差し込み口から扱う。
 //!
@@ -103,9 +104,10 @@
 //!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
-//! - 本番の登録経路（親→子の登録フレーム・稼働中の子への即時登録）は
-//!   #155 まで存在しない。DOM 風オブジェクトの再登録は #525 で対応する
-//!   （Issue #527）
+//! - DOM 風オブジェクトの再登録は #525 で対応する（Issue #527）。
+//!   `impl JsEngine for V8ProcessEngine`（`TASK-29.6`・Issue #157）は未実装で、
+//!   トレイトの `NativeFn`（`Send` なし）と本型の [`ParentNativeFn`]（`Send`
+//!   あり）の不一致の橋渡しもそこで決める
 //! - 期限を過ぎて放棄された `NativeFn` のスレッドが `Mutex` を握ったままの
 //!   登録は、子を再起動しても `try_lock` に失敗し続けて JS 側へエラーを
 //!   返す（再起動しても直らない。Issue #527）
@@ -195,6 +197,11 @@ type NativeEntry = Arc<Mutex<ParentNativeFn>>;
 /// §3.1「5 秒でタイムアウト」）。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 登録フレーム 1 回分（書き込み＋応答待ちの合計。`spawn_worker` の
+/// 再登録は全件で 1 回だけ計算する）の上限時間（`TASK-29.4`・Issue #155）。
+/// ハンドシェイクと同じ値を使う。
+const REGISTER_ACK_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
+
 /// 1 回の評価（書き込み＋応答待ちの合計）に許す上限時間（設計書
 /// §3.3「`recv_timeout(2 秒+1 秒)`」）。子の実行時間監視
 /// （[`super::v8_engine::SCRIPT_EXECUTION_TIMEOUT`]）に、IPC 往復・OS
@@ -234,22 +241,12 @@ const STDERR_TAIL_CAPACITY_BYTES: usize = 16 * 1024;
 /// [`V8ProcessEngine::native_fns`] に登録できる [`NativeFn`] の最大件数
 /// （`TASK-29`・Issue #526）。
 ///
-/// 登録 id は `Vec` の添字（`u32`）であり、外部から任意の件数を要求
-/// できる経路ではない（現時点で唯一の登録経路は
-/// [`V8ProcessEngine::register_native_function_for_test`]。feature
-/// `test-support` 限定）が、本番の登録 API（#155）が親→子の登録フレームを
-/// 経由するようになった際に無制限確保の経路にならないよう、先に上限を
-/// 設けておく（coding-rust.md「長さ・件数を上限検証してからアロケーション
-/// に使う」）。`print`・`dom.setText` 等（PoC-3 相当）のグローバル関数
-/// 注入・DOM 風バインディングの用途には十分な値として選んだ
-/// （[`worker_protocol::MAX_NATIVE_CALL_ARGS`] と同じ考え方）。
-///
-/// 現時点で登録経路は
-/// [`V8ProcessEngine::register_native_function_for_test`]（feature
-/// `test-support` 限定）のみのため、本番のみ（`test-support` 無効）の
-/// ビルドでは未使用になる。
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
-const MAX_NATIVE_FUNCTIONS: usize = 1024;
+/// 登録 id は `Vec` の添字（`u32`）であり、登録 API
+/// （[`V8ProcessEngine::inject_global_function`]。`TASK-29.4`・Issue #155）が
+/// 無制限確保の経路にならないよう上限を設ける（coding-rust.md「長さ・件数を
+/// 上限検証してからアロケーションに使う」）。子が独立に検査する上限
+/// （[`worker_protocol::MAX_REGISTERED_GLOBAL_FUNCTIONS`]）と同じ値を共有する。
+const MAX_NATIVE_FUNCTIONS: usize = worker_protocol::MAX_REGISTERED_GLOBAL_FUNCTIONS;
 
 /// ホストプロセス内で同時に生存できる `NativeFn` 実行スレッドの上限
 /// （`TASK-29`・Issue #526・codex レビュー指摘「期限切れの処理を
@@ -1003,8 +1000,8 @@ mod spawn_config {
         ///
         /// 受け入れ条件 2（親側の `NativeCall` dispatch が子の watchdog に
         /// 含まれること）は、プロキシを登録した**実際の子プロセス**で
-        /// しか検証できない。本番の登録フレーム（#155）が実装されるまでの
-        /// 代替経路として、`spawn_worker` がこの一覧を
+        /// しか検証できない。親側に `NativeFn` の無い未登録 id のプロキシを
+        /// 作るテスト専用の経路として、`spawn_worker` がこの一覧を
         /// `super::worker::TEST_NATIVE_PROXIES_ENV_VAR` へ組み立てて渡す
         /// （空なら環境変数自体を渡さない。空かどうかの確認自体は feature
         /// の有無に関わらず行い、環境変数名への参照だけを
@@ -1039,8 +1036,7 @@ use spawn_config::WorkerSpawnConfigForTest;
 /// ホストが登録したグローバル関数の名前と id（`TASK-29`・Issue #527）。
 ///
 /// [`V8ProcessEngine`] がエンジンの寿命のあいだ保持し、`spawn_worker` が
-/// 子を起動するたびに `child_native_proxies_env_value` 経由で新しい子へ
-/// 登録し直す。`id` は `V8ProcessEngine::native_fns` の添字と対応する。
+/// 子を起動するたびに登録フレーム経由で新しい子へ登録し直す。`id` は `V8ProcessEngine::native_fns` の添字と対応する。
 /// DOM 風オブジェクトの登録は未対応で、#525（`TASK-29.5b`）が種別を足す。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HostBinding {
@@ -1061,7 +1057,7 @@ struct HostBinding {
 /// テスト専用メソッド自体は `#[cfg(feature = "test-support")]` で個別に
 /// gate する（[`WorkerSpawnConfigForTest`] のドキュメントコメント参照）。
 /// `TASK-29.6`（Issue #157）で `create_engine` から配線し、
-/// `impl JsEngine for V8ProcessEngine` を追加する（本 Issue の時点では
+/// `impl JsEngine for V8ProcessEngine` を追加する（現時点では
 /// inherent メソッドに留める）。
 #[doc(hidden)]
 pub struct V8ProcessEngine {
@@ -1072,14 +1068,10 @@ pub struct V8ProcessEngine {
     /// して使う）であり、子から届く `NativeCall` フレームの `id` と対応
     /// づける（[`dispatch_native_call`] 参照）。[`MAX_NATIVE_FUNCTIONS`]
     /// を超えて登録することはできない
-    /// （[`register_native_function_for_test`](Self::register_native_function_for_test)
-    /// が検証する）。
+    /// （[`inject_global_function`](Self::inject_global_function) が検証する）。
     ///
-    /// 本番の登録 API（親→子の登録フレームを含む）は別 Issue（#155）で
-    /// 追加する。それまでは
-    /// [`register_native_function_for_test`](Self::register_native_function_for_test)
-    /// （feature `test-support` 限定）だけが登録経路であり、本番の
-    /// `new()` では常に空のままである。
+    /// 登録経路は [`inject_global_function`](Self::inject_global_function)
+    /// （`TASK-29.4`・Issue #155）だけで、`new()` の直後は空である。
     native_fns: Vec<NativeEntry>,
     /// ホストが登録した注入関数の名前と id の登録簿（`TASK-29`・Issue #527）。
     /// `worker` を破棄しても残り、次に起動する子へ `spawn_worker` が
@@ -1116,45 +1108,42 @@ impl V8ProcessEngine {
         }
     }
 
-    /// テスト専用: グローバル関数 `name` として [`NativeFn`] を登録し、
-    /// 割り当てた id を返す（`TASK-29`・Issue #526・#527）。
+    /// グローバル関数 `name` として [`ParentNativeFn`] を注入する
+    /// （`JS-1`「グローバル関数注入」・`TASK-29.4`・Issue #155）。
     ///
-    /// 本番の登録 API（親→子の登録フレームを含む）は別 Issue（#155）で
-    /// 追加する。本メソッドはそれまでの間、結合テスト
-    /// （`tests/v8_worker.rs`）が親側の `NativeCall` dispatch
-    /// （[`dispatch_native_call`]）と子の再起動時の登録し直しを検証する
-    /// ための唯一の登録経路であり、`#[doc(hidden)] pub`（feature
-    /// `test-support` 限定）とする。登録した名前と id はエンジンの寿命の
-    /// あいだ保持され、子を起動するたび（初回・再起動）に登録し直される。
+    /// 子プロセスの永続 Context のグローバルスコープへ、逆方向 RPC の
+    /// プロキシ関数を登録フレーム（`REGISTER_GLOBAL_FUNCTION`）で即時に
+    /// 登録し、応答を待って成否を返す。成功した関数は JS から通常の関数
+    /// として呼べ、呼び出しは `NATIVE_CALL` で親へ届いて `func` が実行され、
+    /// 戻り値が JS へ返る（[`dispatch_native_call`]）。登録した名前と id は
+    /// エンジンの寿命のあいだ保持され、子が破棄された後の再起動でも
+    /// 登録し直される（Issue #527。スクリプトが作った状態は戻らない）。
     ///
-    /// 次のいずれかなら [`JsEngineError::BindingFailed`] を返し、何も登録
-    /// しない（確保前検証・fail-closed）:
+    /// 子が無ければこの呼び出しで起動する（`globalThis` 上で non-configurable
+    /// な名前の注入失敗を、原因から離れた後続の起動で初めて表面化させない
+    /// ため）。`new()` の時点では起動しない点は変わらない（PERF-6・PERF-7）。
     ///
-    /// - 子が稼働中（稼働中の子への即時登録は #155 の担当。子が破棄されて
-    ///   いなければ登録できない）
-    /// - `name` が空・長すぎる・`,`・`=`・NUL を含む（環境変数で子へ渡す際の
-    ///   区切りを壊すため。#155 で登録フレームへ置き換えたら見直す）・
-    ///   既存の登録と重複する
-    /// - 件数が [`MAX_NATIVE_FUNCTIONS`] または子へ渡せる上限を超える
-    #[cfg(feature = "test-support")]
+    /// 次のいずれかなら [`JsEngineError::BindingFailed`] を返し、登録簿を
+    /// 変更しない（fail-closed）。`Binding` 失敗では子と Context は残る:
+    ///
+    /// - `name` が空・長すぎる・既存の登録と重複する、件数が
+    ///   [`MAX_NATIVE_FUNCTIONS`] に達している
+    /// - 子が登録を拒否した（`undefined` 等 non-configurable な名前）
+    ///
+    /// 子の応答が想定外・期限切れ・子の異常終了なら、子を破棄して
+    /// `EngineUnavailable` 等を返す（メッセージに "context was discarded"）。
+    ///
+    /// 未実装（REPAIR-3）: トレイト [`super::engine_trait::JsEngine`] の
+    /// `inject_global_function` への集約は `TASK-29.6`（Issue #157）。
+    /// トレイトの [`NativeFn`]（`Send` なし）とここでの [`ParentNativeFn`]
+    /// （`Send` あり）の橋渡しも 29.6 で決める。
     #[doc(hidden)]
-    pub fn register_native_function_for_test(
+    pub fn inject_global_function(
         &mut self,
         name: &str,
         func: ParentNativeFn,
-    ) -> Result<u32, JsEngineError> {
-        if self.worker.is_some() {
-            return Err(JsEngineError::BindingFailed(
-                "cannot register a native function while the JS worker process is running; \
-                 live registration is not implemented yet"
-                    .to_string(),
-            ));
-        }
-        if self.native_fns.len() >= MAX_NATIVE_FUNCTIONS {
-            return Err(JsEngineError::BindingFailed(format!(
-                "cannot register more than {MAX_NATIVE_FUNCTIONS} native functions"
-            )));
-        }
+    ) -> Result<(), JsEngineError> {
+        // 何も確保・送信する前に検証する（fail-closed）。
         let id = u32::try_from(self.native_fns.len()).map_err(|_| {
             JsEngineError::BindingFailed(
                 "native function registry index does not fit in a u32".to_string(),
@@ -1164,14 +1153,52 @@ impl V8ProcessEngine {
             &self.host_bindings,
             &self.spawn_config.native_proxies_for_test,
             name,
-            id,
         )?;
-        self.native_fns.push(Arc::new(Mutex::new(func)));
-        self.host_bindings.push(HostBinding {
-            name: name.to_string(),
-            id,
-        });
-        Ok(id)
+
+        let mut worker = self.take_live_worker()?;
+        let deadline = Instant::now() + REGISTER_ACK_TIMEOUT;
+        match register_one(&mut worker, id, name, deadline) {
+            Ok(RegisterAck::Registered) => {
+                self.native_fns.push(Arc::new(Mutex::new(func)));
+                self.host_bindings.push(HostBinding {
+                    name: name.to_string(),
+                    id,
+                });
+                self.worker = Some(worker);
+                Ok(())
+            }
+            Ok(RegisterAck::Rejected(message)) => {
+                // 登録簿は変更しない。子と Context は生きている。
+                self.worker = Some(worker);
+                Err(JsEngineError::BindingFailed(message))
+            }
+            // `register_one` が子を破棄済み。`worker` はここで drop される。
+            Err(err) => Err(err),
+        }
+    }
+
+    /// 生きている子を取り出す（無ければ起動する）。待機中に監視スレッドが
+    /// RSS 超過で `kill` していた子は使わずエラーにする
+    /// （[`Self::evaluate_script`]・[`Self::inject_global_function`] 共通。
+    /// codex・Bugbot レビュー指摘 #503 P0「評価と評価の間も監視されて
+    /// いない」対応）。呼び出し元は使い終えたら `self.worker` へ戻す。
+    fn take_live_worker(&mut self) -> Result<WorkerHandle, JsEngineError> {
+        let mut worker = match self.worker.take() {
+            Some(worker) => worker,
+            None => self.spawn_worker()?,
+        };
+        if let Some(reason) = worker.memory_monitor.take_kill_reason() {
+            let tail = worker.reap_and_collect_stderr();
+            let err = monitor_kill_reason_to_error(
+                reason,
+                &tail,
+                "while idle between evaluations",
+                worker.rss_threshold_bytes,
+            );
+            // `worker` はここで drop され、次回の呼び出しで起動し直す。
+            return Err(ensure_discarded_phrase(err));
+        }
+        Ok(worker)
     }
 
     /// スクリプトを評価する（`JS-1`「スクリプト評価」）。
@@ -1220,26 +1247,8 @@ impl V8ProcessEngine {
             )));
         }
 
-        let mut worker = match self.worker.take() {
-            Some(worker) => worker,
-            None => self.spawn_worker()?,
-        };
-
-        // codex・Bugbot レビュー指摘 #503 P0: 前回の評価から今回の
-        // 呼び出しまでのあいだ（待機中）に、監視スレッドが既に `kill`
-        // していないかを確認する。
-        if let Some(reason) = worker.memory_monitor.take_kill_reason() {
-            let tail = worker.reap_and_collect_stderr();
-            let err = monitor_kill_reason_to_error(
-                reason,
-                &tail,
-                "while idle between evaluations",
-                worker.rss_threshold_bytes,
-            );
-            // `worker` はここで drop され（`self.worker` へ戻さない）、
-            // 次回の呼び出しで新しい子を起動し直す。
-            return Err(ensure_discarded_phrase(err));
-        }
+        // 待機中の kill の確認を含む（`take_live_worker`）。
+        let mut worker = self.take_live_worker()?;
 
         let (outcome, keep_worker) =
             Self::send_evaluate_and_await(&mut worker, script, &self.native_fns);
@@ -1382,8 +1391,36 @@ impl V8ProcessEngine {
         MAX_RAW_FRAME_BYTES_FOR_TEST
     }
 
-    /// 子プロセスを起動し、ハンドシェイク（`Hello` の受信）まで完了させる。
+    /// 子プロセスを起動し、ハンドシェイクの後、ホスト登録簿の注入関数を
+    /// 登録フレームで登録し直す（初回・再起動とも。`TASK-29.4`・Issue #155、
+    /// #527）。登録に失敗した子は破棄して `EngineUnavailable` を返す。
     fn spawn_worker(&self) -> Result<WorkerHandle, JsEngineError> {
+        let mut worker = self.spawn_and_handshake()?;
+        // 期限は Hello 受信後に 1 回だけ計算する。
+        let deadline = Instant::now() + REGISTER_ACK_TIMEOUT;
+        for binding in &self.host_bindings {
+            match register_one(&mut worker, binding.id, &binding.name, deadline)? {
+                RegisterAck::Registered => {}
+                RegisterAck::Rejected(message) => {
+                    // 一度成功した名前が fresh な Context で失敗するのは想定外
+                    // （子の組み込みが変わった等）。半端な状態の子を使わない。
+                    worker.terminate_now();
+                    let tail = worker.reap_and_collect_stderr();
+                    return Err(discard_context_error(&worker, &tail, || {
+                        JsEngineError::EngineUnavailable(format!(
+                            "JS worker process rejected re-registration of the global function \
+                             {:?}: {message}; stderr: {tail}",
+                            binding.name
+                        ))
+                    }));
+                }
+            }
+        }
+        Ok(worker)
+    }
+
+    /// 子プロセスを起動し、ハンドシェイク（`Hello` の受信）まで完了させる。
+    fn spawn_and_handshake(&self) -> Result<WorkerHandle, JsEngineError> {
         // 設計書 §3.1「再帰の防止」: 自分自身が既にワーカーとして起動
         // されている場合は、さらに子を起動しない。通常の cli 経路では
         // `run_js_worker_if_requested` がワーカーモードのまま `main` を
@@ -1436,21 +1473,22 @@ impl V8ProcessEngine {
             // `super::worker` 側では読まず、変数の有無だけを見る。
             command.env(super::worker::TEST_HELLO_EXTRA_BYTE_ENV_VAR, "1");
         }
-        // 子への注入関数の登録の唯一の入口（初回・再起動とも。Issue #527）。
-        if let Some(value) = child_native_proxies_env_value(
-            &self.host_bindings,
-            &self.spawn_config.native_proxies_for_test,
-        )? {
+        // テスト専用: 親側に `NativeFn` の無い未登録 id のプロキシ一覧。
+        // 本番の注入は登録フレームで行う（`spawn_worker`）。
+        if let Some(value) =
+            child_native_proxies_env_value(&self.spawn_config.native_proxies_for_test)?
+        {
             #[cfg(feature = "test-support")]
             command.env(super::worker::TEST_NATIVE_PROXIES_ENV_VAR, value);
             #[cfg(not(feature = "test-support"))]
             {
-                // 登録経路（#155）が無いビルドで空でない登録を黙って捨てない
+                // `native_proxies_for_test` は本番の `new()` では常に空で、この
+                // 分岐へは到達しない。空でない値を黙って捨てない
                 // （実装済みを装わない。REPAIR-3）。
                 let _ = value;
                 return Err(JsEngineError::EngineUnavailable(
-                    "host-registered native functions cannot be installed into the JS worker \
-                     process: no registration transport is available in this build"
+                    "test-only native proxies can only be passed to the JS worker process in \
+                     builds with the test-support feature"
                         .to_string(),
                 ));
             }
@@ -2364,24 +2402,21 @@ fn discard_context_error(
     ensure_discarded_phrase(fallback())
 }
 
-/// 子へ環境変数で渡す `name=id` の組の名前として使えるかを検査する
-/// （[`validate_new_host_binding`] の一部。`,`・`=`・NUL は区切りを壊す）。
+/// 注入するグローバル関数名として使えるかを検査する（空・長すぎるを拒否。
+/// 名前は登録フレームで子へ渡り、`create_data_property` のキーになるだけで
+/// スクリプトとして評価されないため、文字種は制限しない。`TASK-29.4`・
+/// Issue #155）。
 fn validate_binding_name(name: &str) -> Result<(), JsEngineError> {
     if name.is_empty() {
         return Err(JsEngineError::BindingFailed(
             "native function name must not be empty".to_string(),
         ));
     }
-    if name.len() > super::v8_engine::MAX_NATIVE_PROXY_NAME_BYTES {
+    if name.len() > worker_protocol::MAX_GLOBAL_FUNCTION_NAME_BYTES {
         return Err(JsEngineError::BindingFailed(format!(
             "native function name exceeds the maximum supported length of {} bytes",
-            super::v8_engine::MAX_NATIVE_PROXY_NAME_BYTES
+            worker_protocol::MAX_GLOBAL_FUNCTION_NAME_BYTES
         )));
-    }
-    if name.contains([',', '=', '\0']) {
-        return Err(JsEngineError::BindingFailed(
-            "native function name must not contain ',', '=' or NUL".to_string(),
-        ));
     }
     Ok(())
 }
@@ -2395,22 +2430,18 @@ fn join_proxies<'a>(entries: impl Iterator<Item = (&'a str, u32)>) -> String {
         .join(",")
 }
 
-/// 新しいホスト登録（`name`・`id`）を追加してよいかを、確保（push）の前に
-/// 検証する（`register_native_function_for_test` から呼ばれる純粋関数。
-/// 子プロセスを使わずに単体テストできる。Issue #527）。
+/// 新しいホスト登録（`name`）を追加してよいかを、確保・送信の前に検証する
+/// （[`V8ProcessEngine::inject_global_function`] から呼ばれる純粋関数。
+/// 子プロセスを使わずに単体テストできる。`TASK-29.4`・Issue #155）。
 ///
 /// `existing` は登録済みの登録簿、`extra` は
-/// `WorkerSpawnConfigForTest::native_proxies_for_test`（子へ一緒に渡される
-/// 既存の経路）。名前の重複は大文字小文字を区別した完全一致で判定し、
-/// 追加後の件数・環境変数の長さが子側の上限
-/// （`MAX_TEST_NATIVE_PROXIES`・`MAX_TEST_NATIVE_PROXIES_ENV_VAR_BYTES`）を
-/// 超える場合も拒否する。
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+/// `WorkerSpawnConfigForTest::native_proxies_for_test`（テスト専用の
+/// 未登録 id プロキシ）。名前の重複は大文字小文字を区別した完全一致で
+/// 判定する。件数は [`MAX_NATIVE_FUNCTIONS`] まで。
 fn validate_new_host_binding(
     existing: &[HostBinding],
     extra: &[(String, u32)],
     name: &str,
-    id: u32,
 ) -> Result<(), JsEngineError> {
     validate_binding_name(name)?;
     let duplicate = existing.iter().any(|b| b.name == name) || extra.iter().any(|(n, _)| n == name);
@@ -2419,67 +2450,47 @@ fn validate_new_host_binding(
             "native function {name:?} is already registered"
         )));
     }
-    let count = existing.len() + extra.len() + 1;
-    if count > super::worker::MAX_TEST_NATIVE_PROXIES {
+    if existing.len() >= MAX_NATIVE_FUNCTIONS {
         return Err(JsEngineError::BindingFailed(format!(
-            "cannot register more than {} native functions into the JS worker process",
-            super::worker::MAX_TEST_NATIVE_PROXIES
-        )));
-    }
-    let value = join_proxies(
-        existing
-            .iter()
-            .map(|b| (b.name.as_str(), b.id))
-            .chain(extra.iter().map(|(n, i)| (n.as_str(), *i)))
-            .chain(std::iter::once((name, id))),
-    );
-    if value.len() > super::worker::MAX_TEST_NATIVE_PROXIES_ENV_VAR_BYTES {
-        return Err(JsEngineError::BindingFailed(format!(
-            "native function registrations exceed the maximum supported length of {} bytes",
-            super::worker::MAX_TEST_NATIVE_PROXIES_ENV_VAR_BYTES
+            "cannot register more than {MAX_NATIVE_FUNCTIONS} native functions"
         )));
     }
     Ok(())
 }
 
-/// 子を起動するときに渡す注入関数の登録内容を組み立てる（`spawn_worker`
-/// から**毎回**呼ばれる、子への登録の唯一の入口。`TASK-29`・Issue #527）。
+/// テスト専用の未登録 id プロキシ（`native_proxies_for_test`）を子へ環境変数で
+/// 渡す値に組み立てる（`spawn_and_handshake` から**毎回**呼ばれる）。
 ///
-/// 並び順は `host_bindings`（ホスト登録簿）が先、`extra`
-/// （`native_proxies_for_test`）が後。空なら `None`（何も渡さない）。
-/// 件数・長さ・重複は登録時にも検証済みだが、多層防御として再確認し、
-/// 違反なら子を起動する前に `EngineUnavailable` を返す。#155 はこの関数の
-/// 中身を、Hello の後（`HANDSHAKE_TIMEOUT` の範囲内）の登録フレーム送信へ
-/// 置き換える。
+/// 環境変数の区切り（`,`・`=`）を壊す名前は拒否する（登録フレームには
+/// 掛けない制約）。空なら `None`。件数・長さ・重複は多層防御として
+/// 確認し、違反なら子を起動する前に `EngineUnavailable` を返す。
 fn child_native_proxies_env_value(
-    host_bindings: &[HostBinding],
     extra: &[(String, u32)],
 ) -> Result<Option<String>, JsEngineError> {
-    let total = host_bindings.len() + extra.len();
-    if total == 0 {
+    if extra.is_empty() {
         return Ok(None);
     }
     let unavailable = |msg: String| JsEngineError::EngineUnavailable(msg);
-    if total > super::worker::MAX_TEST_NATIVE_PROXIES {
+    if extra.len() > super::worker::MAX_TEST_NATIVE_PROXIES {
         return Err(unavailable(format!(
             "too many native functions to install into the JS worker process (maximum {})",
             super::worker::MAX_TEST_NATIVE_PROXIES
         )));
     }
-    let entries: Vec<(&str, u32)> = host_bindings
-        .iter()
-        .map(|b| (b.name.as_str(), b.id))
-        .chain(extra.iter().map(|(n, i)| (n.as_str(), *i)))
-        .collect();
-    for (i, (name, _)) in entries.iter().enumerate() {
+    for (i, (name, _)) in extra.iter().enumerate() {
         validate_binding_name(name).map_err(|e| unavailable(e.to_string()))?;
-        if entries.iter().take(i).any(|(n, _)| n == name) {
+        if name.contains([',', '=', '\0']) {
+            return Err(unavailable(
+                "native function name must not contain ',', '=' or NUL".to_string(),
+            ));
+        }
+        if extra.iter().take(i).any(|(n, _)| n == name) {
             return Err(unavailable(format!(
                 "native function {name:?} is registered more than once"
             )));
         }
     }
-    let value = join_proxies(entries.into_iter());
+    let value = join_proxies(extra.iter().map(|(n, i)| (n.as_str(), *i)));
     if value.len() > super::worker::MAX_TEST_NATIVE_PROXIES_ENV_VAR_BYTES {
         return Err(unavailable(format!(
             "native function registrations exceed the maximum supported length of {} bytes",
@@ -2489,6 +2500,155 @@ fn child_native_proxies_env_value(
     Ok(Some(value))
 }
 
+/// 登録フレームへの子の応答の解釈結果（`TASK-29.4`・Issue #155）。
+#[derive(Debug, PartialEq, Eq)]
+enum RegisterAck {
+    /// 登録に成功した（`RESULT(Undefined)`）。
+    Registered,
+    /// 子が登録を拒否した（`ERROR{Binding}`）。子と Context は生きている。
+    Rejected(String),
+}
+
+/// 登録フレームへの想定外の応答（プロトコル違反）。子は破棄する。
+#[derive(Debug, PartialEq, Eq)]
+enum RegisterAckViolation {
+    /// `RESULT` の値が `Undefined` ではない・decode できない。
+    UnexpectedResult(String),
+    /// `RESULT` の末尾に余分なバイトがある。
+    TrailingBytes { extra: usize },
+    /// `Binding` 以外の `ERROR`、または decode できない `ERROR`。
+    UnexpectedError(String),
+    /// `RESULT`・`ERROR` 以外のフレーム（`NATIVE_CALL` を含む）。
+    UnexpectedFrame(u8),
+}
+
+impl std::fmt::Display for RegisterAckViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnexpectedResult(desc) => {
+                write!(f, "unexpected Result frame for a registration: {desc}")
+            }
+            Self::TrailingBytes { extra } => {
+                write!(f, "Result frame has {extra} trailing bytes")
+            }
+            Self::UnexpectedError(desc) => {
+                write!(f, "unexpected Error frame for a registration: {desc}")
+            }
+            Self::UnexpectedFrame(tag) => {
+                write!(f, "unexpected frame (tag {tag}) for a registration")
+            }
+        }
+    }
+}
+
+/// 登録フレームへの子の応答フレームを厳密に解釈する純粋関数
+/// （真偽値ではなく enum で返す。REPAIR-4）。
+///
+/// 成功は「ちょうど `Undefined` 1 個の `RESULT`」、拒否は「kind が `Binding`
+/// の `ERROR`」のみ。それ以外はすべて違反として呼び出し元が子を破棄する。
+fn interpret_register_ack(
+    frame_tag: u8,
+    payload: &[u8],
+) -> Result<RegisterAck, RegisterAckViolation> {
+    match frame_tag {
+        tag::RESULT => match worker_protocol::decode_js_value(payload) {
+            Ok((JsValue::Undefined, consumed)) if consumed == payload.len() => {
+                Ok(RegisterAck::Registered)
+            }
+            Ok((JsValue::Undefined, consumed)) => Err(RegisterAckViolation::TrailingBytes {
+                extra: payload.len().saturating_sub(consumed),
+            }),
+            Ok((value, _)) => Err(RegisterAckViolation::UnexpectedResult(format!(
+                "expected undefined, got {value:?}"
+            ))),
+            Err(err) => Err(RegisterAckViolation::UnexpectedResult(err.to_string())),
+        },
+        tag::ERROR => match worker_protocol::decode_error(payload) {
+            Ok((ErrorKind::Binding, message)) => Ok(RegisterAck::Rejected(message)),
+            Ok((kind, message)) => Err(RegisterAckViolation::UnexpectedError(format!(
+                "kind {kind:?}: {message}"
+            ))),
+            Err(err) => Err(RegisterAckViolation::UnexpectedError(err.to_string())),
+        },
+        other => Err(RegisterAckViolation::UnexpectedFrame(other)),
+    }
+}
+
+/// 登録フレームを 1 件送り、応答を期限付きで待つ（`TASK-29.4`・Issue #155。
+/// [`V8ProcessEngine::inject_global_function`] と `spawn_worker` の共通部）。
+///
+/// `Err` を返すときは必ず子を破棄済み（kill → reap → "context was
+/// discarded" を含むエラー）。`Ok(Rejected)` では子と Context は生きている。
+fn register_one(
+    worker: &mut WorkerHandle,
+    id: u32,
+    name: &str,
+    deadline: Instant,
+) -> Result<RegisterAck, JsEngineError> {
+    let payload = worker_protocol::encode_register_global_function(id, name);
+    write_frame_with_deadline(
+        worker,
+        tag::REGISTER_GLOBAL_FUNCTION,
+        &payload,
+        deadline,
+        "a global function registration",
+    )?;
+
+    let recv_wait = deadline.saturating_duration_since(Instant::now());
+    // 期限後にキューに残っていた応答を成功として扱わない（評価待ちと同じ扱い）。
+    let received = match worker.frame_rx.recv_timeout(recv_wait) {
+        Ok(_) if Instant::now() >= deadline => Err(mpsc::RecvTimeoutError::Timeout),
+        other => other,
+    };
+    let (description, timed_out): (String, bool) = match received {
+        Ok(ReaderEvent::Frame(frame_tag, payload)) => {
+            match interpret_register_ack(frame_tag, &payload) {
+                Ok(ack) => return Ok(ack),
+                Err(violation) => (
+                    format!(
+                        "JS worker process sent an invalid registration response ({violation})"
+                    ),
+                    false,
+                ),
+            }
+        }
+        Ok(ReaderEvent::Eof) => {
+            // 子は既にストリームを閉じている。kill を挟まず reap する。
+            let tail = worker.reap_and_collect_stderr();
+            return Err(discard_context_error(worker, &tail, || {
+                JsEngineError::EngineUnavailable(format!(
+                    "JS worker process terminated unexpectedly during a global function \
+                     registration; stderr: {tail}"
+                ))
+            }));
+        }
+        Ok(ReaderEvent::Invalid(desc)) => (
+            format!("JS worker process sent a malformed frame during a registration: {desc}"),
+            false,
+        ),
+        Err(mpsc::RecvTimeoutError::Timeout) => (
+            "global function registration exceeded the deadline and the JS worker process was \
+             killed"
+                .to_string(),
+            true,
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => (
+            "JS worker process communication channel disconnected unexpectedly during a \
+             registration"
+                .to_string(),
+            false,
+        ),
+    };
+    worker.terminate_now();
+    let tail = worker.reap_and_collect_stderr();
+    Err(discard_context_error(worker, &tail, || {
+        if timed_out {
+            JsEngineError::Timeout(format!("{description}; stderr: {tail}"))
+        } else {
+            JsEngineError::EngineUnavailable(format!("{description}; stderr: {tail}"))
+        }
+    }))
+}
 /// エラーメッセージに "context was discarded" が含まれていなければ
 /// 追記する（[`discard_context_error`] が呼ぶ内部ヘルパー。Cursor Bugbot
 /// レビュー指摘 #503「Discarded-context errors omit required phrase」
@@ -2600,8 +2760,7 @@ mod tests {
     }
 
     /// `TASK-29`・Issue #526: 登録件数の上限が具体値どおりであること
-    /// （回帰確認。`register_native_function_for_test` は feature
-    /// `test-support` でのみ存在するため、値自体の確認はここで行う）。
+    /// （回帰確認）。
     #[test]
     fn js_1_max_native_functions_is_1024() {
         assert_eq!(MAX_NATIVE_FUNCTIONS, 1024);
@@ -3649,75 +3808,133 @@ mod tests {
         }
     }
 
-    /// Issue #527: 登録時検証（空・長すぎる・区切り文字・重複）。
+    fn frame_payload_undefined() -> Vec<u8> {
+        let mut out = Vec::new();
+        worker_protocol::encode_js_value(&JsValue::Undefined, &mut out).expect("encode");
+        out
+    }
+
+    /// TASK-29.4: 登録時検証（空・長すぎる・重複）。区切り文字は登録フレーム
+    /// 経由なので許可される。
     #[test]
     fn js_1_validate_new_host_binding_rejects_invalid_names() {
         assert_eq!(
-            binding_failed_msg(validate_new_host_binding(&[], &[], "", 0)),
+            binding_failed_msg(validate_new_host_binding(&[], &[], "")),
             "native function name must not be empty"
         );
         let long = "a".repeat(super::super::v8_engine::MAX_NATIVE_PROXY_NAME_BYTES + 1);
         assert_eq!(
-            binding_failed_msg(validate_new_host_binding(&[], &[], &long, 0)),
+            binding_failed_msg(validate_new_host_binding(&[], &[], &long)),
             "native function name exceeds the maximum supported length of 256 bytes"
         );
-        for bad in ["a,b", "a=b", "a\0b"] {
-            assert_eq!(
-                binding_failed_msg(validate_new_host_binding(&[], &[], bad, 0)),
-                "native function name must not contain ',', '=' or NUL"
-            );
+        for ok in ["a,b", "a=b", "a\0b"] {
+            assert!(validate_new_host_binding(&[], &[], ok).is_ok(), "{ok:?}");
         }
         assert_eq!(
-            binding_failed_msg(validate_new_host_binding(&[hb("f", 0)], &[], "f", 1)),
+            binding_failed_msg(validate_new_host_binding(&[hb("f", 0)], &[], "f")),
             "native function \"f\" is already registered"
         );
         assert_eq!(
-            binding_failed_msg(validate_new_host_binding(
-                &[],
-                &[("g".to_string(), 0)],
-                "g",
-                1
-            )),
+            binding_failed_msg(validate_new_host_binding(&[], &[("g".to_string(), 0)], "g")),
             "native function \"g\" is already registered"
         );
         // 大文字小文字は区別する。
-        assert!(validate_new_host_binding(&[hb("f", 0)], &[], "F", 1).is_ok());
+        assert!(validate_new_host_binding(&[hb("f", 0)], &[], "F").is_ok());
     }
 
-    /// Issue #527: 件数上限（17 件目）と長さ上限。
+    /// TASK-29.4: 件数上限（1025 件目）。
     #[test]
-    fn js_1_validate_new_host_binding_enforces_count_and_length_limits() {
-        let existing: Vec<HostBinding> = (0..16u32).map(|i| hb(&format!("f{i}"), i)).collect();
+    fn js_1_validate_new_host_binding_enforces_the_count_limit() {
+        let existing: Vec<HostBinding> = (0..MAX_NATIVE_FUNCTIONS as u32)
+            .map(|i| hb(&format!("f{i}"), i))
+            .collect();
         assert_eq!(
-            binding_failed_msg(validate_new_host_binding(&existing, &[], "extra", 16)),
-            "cannot register more than 16 native functions into the JS worker process"
+            binding_failed_msg(validate_new_host_binding(&existing, &[], "extra")),
+            "cannot register more than 1024 native functions"
         );
-        // 256 バイト名 × 15 件 + 1 件で 4096 バイトを超える。
-        let existing: Vec<HostBinding> = (0..15u32).map(|i| hb(&format!("{i:0>256}"), i)).collect();
-        assert_eq!(
-            binding_failed_msg(validate_new_host_binding(
-                &existing,
-                &[],
-                &"z".repeat(256),
-                15
-            )),
-            "native function registrations exceed the maximum supported length of 4096 bytes"
-        );
+        assert!(validate_new_host_binding(&existing[1..], &[], "extra").is_ok());
     }
 
-    /// Issue #527: 差し込み口の値の組み立て（空は None・登録簿が先）。
+    /// テスト専用の環境変数経路の値の組み立て（空は None・区切り文字は拒否）。
     #[test]
-    fn js_1_child_native_proxies_env_value_orders_bindings_before_extra() {
-        assert_eq!(child_native_proxies_env_value(&[], &[]).expect("ok"), None);
-        let value =
-            child_native_proxies_env_value(&[hb("f", 0), hb("g", 1)], &[("h".to_string(), 7)])
-                .expect("ok");
-        assert_eq!(value.as_deref(), Some("f=0,g=1,h=7"));
-        match child_native_proxies_env_value(&[hb("f", 0)], &[("f".to_string(), 1)]) {
+    fn js_1_child_native_proxies_env_value_only_carries_test_proxies() {
+        assert_eq!(child_native_proxies_env_value(&[]).expect("ok"), None);
+        let value = child_native_proxies_env_value(&[("h".to_string(), 7), ("i".to_string(), 8)])
+            .expect("ok");
+        assert_eq!(value.as_deref(), Some("h=7,i=8"));
+        match child_native_proxies_env_value(&[("f".to_string(), 1), ("f".to_string(), 2)]) {
             Err(JsEngineError::EngineUnavailable(msg)) => {
                 assert_eq!(msg, "native function \"f\" is registered more than once");
             }
             other => panic!("expected EngineUnavailable, got: {other:?}"),
         }
+        match child_native_proxies_env_value(&[("a,b".to_string(), 1)]) {
+            Err(JsEngineError::EngineUnavailable(msg)) => {
+                assert_eq!(msg, "native function name must not contain ',', '=' or NUL");
+            }
+            other => panic!("expected EngineUnavailable, got: {other:?}"),
+        }
+    }
+
+    /// TASK-29.4: 登録応答の解釈（成功）。
+    #[test]
+    fn js_1_interpret_register_ack_accepts_exactly_undefined() {
+        assert_eq!(
+            interpret_register_ack(tag::RESULT, &frame_payload_undefined()),
+            Ok(RegisterAck::Registered)
+        );
+    }
+
+    /// TASK-29.4: `Binding` の `ERROR` は登録失敗（子は生きている）。
+    #[test]
+    fn js_1_interpret_register_ack_maps_binding_error_to_rejected() {
+        let payload = worker_protocol::encode_error(ErrorKind::Binding, "nope");
+        assert_eq!(
+            interpret_register_ack(tag::ERROR, &payload),
+            Ok(RegisterAck::Rejected("nope".to_string()))
+        );
+    }
+
+    /// TASK-29.4: それ以外の応答はすべてプロトコル違反にする。
+    #[test]
+    fn js_1_interpret_register_ack_rejects_everything_else() {
+        // 値が違う RESULT。
+        let mut number = Vec::new();
+        worker_protocol::encode_js_value(&JsValue::Number(1.0), &mut number).expect("encode");
+        assert!(matches!(
+            interpret_register_ack(tag::RESULT, &number),
+            Err(RegisterAckViolation::UnexpectedResult(_))
+        ));
+        // 末尾に余分なバイトがある RESULT。
+        let mut trailing = frame_payload_undefined();
+        let len = trailing.len();
+        trailing.push(0);
+        assert_eq!(
+            interpret_register_ack(tag::RESULT, &trailing),
+            Err(RegisterAckViolation::TrailingBytes { extra: 1 })
+        );
+        assert_eq!(len + 1, trailing.len());
+        // decode できない RESULT。
+        assert!(matches!(
+            interpret_register_ack(tag::RESULT, &[]),
+            Err(RegisterAckViolation::UnexpectedResult(_))
+        ));
+        // Binding 以外の ERROR。
+        for kind in [ErrorKind::Evaluation, ErrorKind::Timeout] {
+            let payload = worker_protocol::encode_error(kind, "x");
+            assert!(matches!(
+                interpret_register_ack(tag::ERROR, &payload),
+                Err(RegisterAckViolation::UnexpectedError(_))
+            ));
+        }
+        // NATIVE_CALL・未知の tag。
+        assert_eq!(
+            interpret_register_ack(tag::NATIVE_CALL, &[]),
+            Err(RegisterAckViolation::UnexpectedFrame(tag::NATIVE_CALL))
+        );
+        assert_eq!(
+            interpret_register_ack(200, &[]),
+            Err(RegisterAckViolation::UnexpectedFrame(200))
+        );
     }
 }
