@@ -841,6 +841,16 @@ mod spawn_config {
         /// 指定しても、`spawn_worker` が `MemoryMonitor` を起動する直前に
         /// `min(要求値, MAX_CHILD_RSS_BYTES)` へクランプする。
         pub rss_threshold_bytes_override: Option<u64>,
+        /// Windows の子プロセスの Job Object `ProcessMemoryLimit`（バイト）の
+        /// 上書き値（`JS-1`・`TASK-29`・Issue #531）。親側の RSS 監視
+        /// （`rss_threshold_bytes_override` を `None` にした本番しきい値）が
+        /// 先に発動しない構成で、OS が確保を拒否する経路を検証するための
+        /// テスト専用経路。`None` なら本番値（384 MiB）。
+        ///
+        /// **下げることしかできない**: 本番値を超える要求は `spawn_worker` が
+        /// クランプし、子（`super::super::worker`）でも独立にクランプする。
+        /// Windows 以外では無視される。
+        pub windows_process_memory_limit_bytes_override: Option<usize>,
     }
 }
 
@@ -1161,6 +1171,30 @@ impl V8ProcessEngine {
             // テスト専用（codex レビュー指摘 #503 P1）。値の内容は
             // `super::worker` 側では読まず、変数の有無だけを見る。
             command.env(super::worker::TEST_HELLO_EXTRA_BYTE_ENV_VAR, "1");
+        }
+        #[cfg(windows)]
+        {
+            if let Some(requested) = self
+                .spawn_config
+                .windows_process_memory_limit_bytes_override
+            {
+                // テスト専用（Issue #531）。本番の `new()` は常に `None`。
+                // 本番値を超えられないよう、環境変数を組み立てる直前にクランプする。
+                command.env(
+                    super::worker::TEST_WINDOWS_PROCESS_MEMORY_LIMIT_ENV_VAR,
+                    super::resource_limits::clamp_test_windows_process_memory_limit_bytes(
+                        requested,
+                    )
+                    .to_string(),
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            // Windows 専用の上書き。他 OS では効果が無いため読み捨てる。
+            let _ = self
+                .spawn_config
+                .windows_process_memory_limit_bytes_override;
         }
         #[cfg(windows)]
         {
