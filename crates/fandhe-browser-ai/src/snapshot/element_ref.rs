@@ -12,18 +12,25 @@
 //!
 //! # 形式
 //!
-//! `e` + 8 桁の小文字 16 進ダイジェスト（例: `eeb466016`）。同じダイジェストの
-//! 2 個目以降には `-<出現番号>` を付ける（例: `e94e6c69f-2`）。使う文字は
-//! `[a-z0-9-]` のみで、name（ページ由来の untrusted な文字列）は ref に入らない。
-//! 読める形（`button:Submit` 等）にしないのは、`AISNAP-1` のトークン削減のため
-//! ref を固定長にするためである。
+//! `e` + 16 桁の小文字 16 進ダイジェスト（例: `eccfd6f8d27bb0f9b`）。同じ
+//! シグネチャの 2 個目以降には `-<出現番号>` を付ける（例: `e78faeeefec1c2870-2`）。
+//! 使う文字は `[a-z0-9-]` のみで、name（ページ由来の untrusted な文字列）は ref に
+//! 入らない。読める形（`button:Submit` 等）にしないのは、`AISNAP-1` のトークン削減の
+//! ため ref を固定長にするためである。
 //!
-//! # 一意性
+//! # 一意性と衝突
 //!
-//! 出現番号のカウンタは `(role, name)` ではなくダイジェストをキーにする。
-//! 別シグネチャが 32bit で衝突しても `eXXXXXXXX` と `eXXXXXXXX-2` になるため、
-//! 一意性はハッシュの品質に依存しない。衝突の影響は安定性が少し落ちることだけ
-//! である。FNV は暗号学的ハッシュではなく、ref は認可トークンでもない。
+//! 出現番号のカウンタはダイジェストではなくシグネチャ自身（64bit の主ダイジェスト +
+//! 独立な 64bit の検査ダイジェストの組）をキーにする。別シグネチャの主ダイジェストが
+//! 衝突しても、互いの出現番号は消費し合わない。衝突したシグネチャには最初に見た順で
+//! `variant`（1 始まり。最初のものは 0）を振り、`e<16hex>v<variant>[-<n>]` とする。
+//! これにより ref は常に一意になり、通常のページ（衝突なし）では別シグネチャの挿入で
+//! 既存要素の ref は変わらない。
+//!
+//! ただし主ダイジェストが衝突する別シグネチャを意図的に作れる敵対的ページでは、
+//! 衝突相手を先に置くことで `variant` を押し出せる。ref 全体を可逆にしない限り
+//! 一意性と順序非依存は両立しないため、影響は「その衝突ペアの安定性が落ちる」ことに
+//! 限定される。FNV は暗号学的ハッシュではなく、ref は認可トークンでもない。
 //!
 //! # 再特定の安定性（同名要素）
 //!
@@ -33,13 +40,18 @@
 //!
 //! - `discriminator`: `id`・`href`・フォーム部品の `name` など、要素自身に付く
 //!   安定した識別属性（untrusted な文字列。ダイジェストにのみ使い ref には入らない）
-//! - `scope`: 親要素の ref（ダイジェストと出現番号の両方）。別コンテナの同名要素と
-//!   出現番号を共有しないための範囲指定。同名の親が複数あっても、親の出現番号が
-//!   違えば子のダイジェストも分かれる
+//! - `scope`: 親要素の ref のうちダイジェストと variant（出現番号は含めない）。
+//!   別コンテナの同名要素と出現番号を共有しないための範囲指定
 //!
-//! これらでダイジェストが分かれる要素は、同名要素の挿入・並び替えの影響を受けない。
-//! 識別属性も親も同じ完全に同一の要素だけは、文書順の出現番号に頼る（外形上
-//! 区別できないため原理的な限界。将来は DOM 構造ハッシュの併用を検討する）。
+//! 親の出現番号を子のダイジェストへ折り込まないのは、子の ref が「同じダイジェストを
+//! 持つ祖先の文書順」に依存してしまい、子に安定した `discriminator` があっても、
+//! 同じ role + name の親が前に挿入されただけで変わるためである。
+//!
+//! これでダイジェストが分かれる要素は、同名要素の挿入・並び替えの影響を受けない。
+//! 識別属性も親のシグネチャも同じ要素（例: 識別属性のない同名カードそれぞれの中の
+//! 同名ボタン）は外形上区別できず、文書順の出現番号に頼る（原理的な限界。将来は
+//! DOM 構造ハッシュの併用を検討する）。この場合は親側に `discriminator` を渡すと
+//! 子も安定する。
 //!
 //! # 呼び出し側の契約（TASK-11.7 向け）
 //!
@@ -55,30 +67,51 @@
 use std::collections::HashMap;
 use std::fmt;
 
-/// FNV-1a 64bit の offset basis。
+/// 主ダイジェスト（FNV-1a 64bit）の offset basis。
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-/// FNV-1a 64bit の prime。
+/// 主ダイジェスト（FNV-1a 64bit）の prime。
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+/// 検査ダイジェストの offset basis（主とは独立に選んだ値）。
+const CHECK_OFFSET: u64 = 0x9e37_79b9_7f4a_7c15;
+/// 検査ダイジェストの乗数（主と異なる奇数。主の衝突が検査へ波及しにくくする）。
+const CHECK_PRIME: u64 = 0x9e37_79b1_85eb_ca87;
 
-/// FNV-1a を 1 区間ぶん進める。
-///
-/// `wrapping_mul` はハッシュ定義そのもの（mod 2^64 の乗算）であり、
-/// オーバーフローの見逃しではない。
-fn fnv1a_update(mut h: u64, bytes: &[u8]) -> u64 {
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
+/// 主・検査の 2 系統ハッシュ状態。
+#[derive(Clone, Copy)]
+struct Hashes {
+    primary: u64,
+    check: u64,
 }
 
-/// role + name のシグネチャダイジェスト（32bit）を返す純粋関数（`AISNAP-10`）。
+impl Hashes {
+    fn new() -> Self {
+        Self {
+            primary: FNV_OFFSET,
+            check: CHECK_OFFSET,
+        }
+    }
+
+    /// 両系統を 1 区間ぶん進める。
+    ///
+    /// `wrapping_mul` はハッシュ定義そのもの（mod 2^64 の乗算）であり、
+    /// オーバーフローの見逃しではない。
+    fn update(mut self, bytes: &[u8]) -> Self {
+        for &b in bytes {
+            self.primary ^= u64::from(b);
+            self.primary = self.primary.wrapping_mul(FNV_PRIME);
+            self.check ^= u64::from(b);
+            self.check = self.check.wrapping_mul(CHECK_PRIME);
+        }
+        self
+    }
+}
+
+/// role + name のシグネチャダイジェスト（64bit）を返す純粋関数（`AISNAP-10`）。
 ///
 /// 入力は `(role のバイト長: u64 LE) ++ role ++ name` と符号化し、
 /// `("ab","c")` と `("a","bc")` が別物になるようにする（NUL 区切りは name に
-/// U+0000 が入ると曖昧になるため使わない）。64bit の結果は上位・下位の XOR で
-/// 32bit に畳み込む。
-pub fn ref_signature(role: &str, name: &str) -> u32 {
+/// U+0000 が入ると曖昧になるため使わない）。
+pub fn ref_signature(role: &str, name: &str) -> u64 {
     ElementSignature::new(role, name).digest()
 }
 
@@ -95,9 +128,10 @@ pub struct ElementSignature<'a> {
     pub name: &'a str,
     /// 要素自身の安定した識別属性（`id`・`href` 等）。無ければ `None`。
     pub discriminator: Option<&'a str>,
-    /// 親要素の ref（ダイジェストと出現番号）。ルート直下は `None`。
+    /// 親要素の ref。ルート直下は `None`。
     ///
-    /// 同名の親が複数ある場合に子が衝突しないよう、出現番号も含めて扱う。
+    /// ダイジェストと variant だけをシグネチャへ折り込む（出現番号は使わない。
+    /// 理由はモジュール冒頭の「再特定の安定性」を参照）。
     pub scope: Option<ElementRef>,
 }
 
@@ -124,44 +158,52 @@ impl<'a> ElementSignature<'a> {
         self
     }
 
-    /// 32bit ダイジェストを返す。追加情報が無ければ [`ref_signature`] と同値。
-    pub fn digest(&self) -> u32 {
-        let len = (self.role.len() as u64).to_le_bytes();
-        let mut h = fnv1a_update(FNV_OFFSET, &len);
-        h = fnv1a_update(h, self.role.as_bytes());
-        h = fnv1a_update(h, self.name.as_bytes());
+    /// 主ダイジェスト・検査ダイジェストの組を返す。
+    fn hashes(&self) -> Hashes {
+        let mut h = Hashes::new().update(&(self.role.len() as u64).to_le_bytes());
+        h = h.update(self.role.as_bytes()).update(self.name.as_bytes());
         if self.discriminator.is_some() || self.scope.is_some() {
             // 追加情報あり。name の長さを入れて name と後続の境界を固定する。
-            h = fnv1a_update(h, &[0xff]);
-            h = fnv1a_update(h, &(self.name.len() as u64).to_le_bytes());
+            h = h
+                .update(&[0xff])
+                .update(&(self.name.len() as u64).to_le_bytes());
             if let Some(d) = self.discriminator {
-                h = fnv1a_update(h, &[1]);
-                h = fnv1a_update(h, &(d.len() as u64).to_le_bytes());
-                h = fnv1a_update(h, d.as_bytes());
+                h = h
+                    .update(&[1])
+                    .update(&(d.len() as u64).to_le_bytes())
+                    .update(d.as_bytes());
             }
             if let Some(sc) = self.scope {
-                h = fnv1a_update(h, &[2]);
-                h = fnv1a_update(h, &sc.digest.to_le_bytes());
-                h = fnv1a_update(h, &sc.occurrence.to_le_bytes());
+                h = h
+                    .update(&[2])
+                    .update(&sc.digest.to_le_bytes())
+                    .update(&sc.variant.to_le_bytes());
             }
         }
-        ((h >> 32) as u32) ^ (h as u32)
+        h
+    }
+
+    /// 64bit ダイジェストを返す。追加情報が無ければ [`ref_signature`] と同値。
+    pub fn digest(&self) -> u64 {
+        self.hashes().primary
     }
 }
 
-/// 生成された ref（ダイジェストと出現番号）。`Node::ref` へは
+/// 生成された ref（ダイジェスト・衝突 variant・出現番号）。`Node::ref` へは
 /// [`ElementRef::to_ref_string`] で文字列化して入れる（`AISNAP-10`）。
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ElementRef {
-    /// role + name シグネチャの 32bit ダイジェスト。
-    pub digest: u32,
-    /// 同じダイジェストの中での先行順の出現番号（1 始まり）。
+    /// role + name（+ 識別属性・親スコープ）シグネチャの 64bit ダイジェスト。
+    pub digest: u64,
+    /// 主ダイジェストが衝突した別シグネチャの区別番号（衝突なしは 0）。
+    pub variant: u32,
+    /// 同じシグネチャの中での先行順の出現番号（1 始まり）。
     pub occurrence: u32,
 }
 
 impl ElementRef {
-    /// `Node::ref` に入れる文字列（`e<8hex>` または `e<8hex>-<n>`）を返す。
+    /// `Node::ref` に入れる文字列（`e<16hex>[v<variant>][-<n>]`）を返す。
     pub fn to_ref_string(&self) -> String {
         self.to_string()
     }
@@ -169,11 +211,14 @@ impl ElementRef {
 
 impl fmt::Display for ElementRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.occurrence <= 1 {
-            write!(f, "e{:08x}", self.digest)
-        } else {
-            write!(f, "e{:08x}-{}", self.digest, self.occurrence)
+        write!(f, "e{:016x}", self.digest)?;
+        if self.variant > 0 {
+            write!(f, "v{}", self.variant)?;
         }
+        if self.occurrence > 1 {
+            write!(f, "-{}", self.occurrence)?;
+        }
+        Ok(())
     }
 }
 
@@ -181,7 +226,7 @@ impl fmt::Display for ElementRef {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefError {
-    /// 同一ダイジェストの出現番号が `u32` を超えた。
+    /// 同一シグネチャの出現番号、または衝突 variant が `u32` を超えた。
     OccurrenceOverflow,
 }
 
@@ -197,12 +242,23 @@ impl fmt::Display for RefError {
 
 impl std::error::Error for RefError {}
 
+/// 同一主ダイジェスト内の 1 シグネチャ分の状態。
+#[derive(Debug)]
+struct Slot {
+    /// 検査ダイジェスト（シグネチャの同一性判定に使う）。
+    check: u64,
+    /// 衝突 variant（最初は 0）。
+    variant: u32,
+    /// これまでに発行した出現数。
+    count: u32,
+}
+
 /// 1 スナップショット分の ref アロケータ（`AISNAP-10`）。
 ///
-/// メモリ使用量は異なるダイジェストの種類数以下で、name の長さに依存しない。
+/// メモリ使用量は異なるシグネチャの種類数に比例し、name の長さに依存しない。
 #[derive(Debug, Default)]
 pub struct RefAllocator {
-    seen: HashMap<u32, u32>,
+    seen: HashMap<u64, Vec<Slot>>,
 }
 
 impl RefAllocator {
@@ -223,15 +279,41 @@ impl RefAllocator {
         &mut self,
         sig: &ElementSignature<'_>,
     ) -> Result<ElementRef, RefError> {
-        self.allocate_with_digest(sig.digest())
+        let h = sig.hashes();
+        self.allocate_with_hashes(h.primary, h.check)
     }
 
     /// ダイジェストを直接指定して発行する。衝突経路のテスト用で crate 外へは出さない。
-    pub(crate) fn allocate_with_digest(&mut self, digest: u32) -> Result<ElementRef, RefError> {
-        let count = self.seen.entry(digest).or_insert(0);
-        let occurrence = count.checked_add(1).ok_or(RefError::OccurrenceOverflow)?;
-        *count = occurrence;
-        Ok(ElementRef { digest, occurrence })
+    pub(crate) fn allocate_with_hashes(
+        &mut self,
+        digest: u64,
+        check: u64,
+    ) -> Result<ElementRef, RefError> {
+        let slots = self.seen.entry(digest).or_default();
+        let idx = match slots.iter().position(|s| s.check == check) {
+            Some(i) => i,
+            None => {
+                let variant =
+                    u32::try_from(slots.len()).map_err(|_| RefError::OccurrenceOverflow)?;
+                slots.push(Slot {
+                    check,
+                    variant,
+                    count: 0,
+                });
+                slots.len() - 1
+            }
+        };
+        let slot = slots.get_mut(idx).ok_or(RefError::OccurrenceOverflow)?;
+        let occurrence = slot
+            .count
+            .checked_add(1)
+            .ok_or(RefError::OccurrenceOverflow)?;
+        slot.count = occurrence;
+        Ok(ElementRef {
+            digest,
+            variant: slot.variant,
+            occurrence,
+        })
     }
 }
 
@@ -244,14 +326,17 @@ mod tests {
         r.to_ref_string()
     }
 
-    /// `AISNAP-10`: FNV-1a による決定的な値（Python で独立に算出した期待値）。
+    /// `AISNAP-10`: FNV-1a 64bit による決定的な値（Python で独立に算出した期待値）。
     #[test]
     fn aisnap_10_ref_signature_is_deterministic_fnv1a() {
         let mut a = RefAllocator::new();
-        assert_eq!(s(a.allocate("button", "Submit").unwrap()), "eeb466016");
+        assert_eq!(
+            s(a.allocate("button", "Submit").unwrap()),
+            "eccfd6f8d27bb0f9b"
+        );
         assert_eq!(
             s(a.allocate("heading", "Example Domain").unwrap()),
-            "e8b103321"
+            "e287a7dcba36a4eea"
         );
     }
 
@@ -262,7 +347,14 @@ mod tests {
         let refs: Vec<String> = (0..3)
             .map(|_| s(a.allocate("link", "More").unwrap()))
             .collect();
-        assert_eq!(refs, vec!["e94e6c69f", "e94e6c69f-2", "e94e6c69f-3"]);
+        assert_eq!(
+            refs,
+            vec![
+                "e78faeeefec1c2870",
+                "e78faeeefec1c2870-2",
+                "e78faeeefec1c2870-3"
+            ]
+        );
         assert_eq!(refs.iter().collect::<HashSet<_>>().len(), 3);
     }
 
@@ -281,13 +373,13 @@ mod tests {
             ("heading", "Example Domain"),
             ("button", "Submit"),
         ];
-        assert_eq!(run(&base).last().unwrap(), "eeb466016");
-        assert_eq!(run(&with_banner).last().unwrap(), "eeb466016");
+        assert_eq!(run(&base).last().unwrap(), "eccfd6f8d27bb0f9b");
+        assert_eq!(run(&with_banner).last().unwrap(), "eccfd6f8d27bb0f9b");
 
         let links = [("link", "More"), ("link", "More")];
         let links_banner = [("generic", "banner"), ("link", "More"), ("link", "More")];
-        assert_eq!(run(&links).last().unwrap(), "e94e6c69f-2");
-        assert_eq!(run(&links_banner).last().unwrap(), "e94e6c69f-2");
+        assert_eq!(run(&links).last().unwrap(), "e78faeeefec1c2870-2");
+        assert_eq!(run(&links_banner).last().unwrap(), "e78faeeefec1c2870-2");
     }
 
     /// `AISNAP-10`: 識別属性が違う同名要素は、前方への挿入・並び替えで ref が入れ替わらない。
@@ -318,10 +410,12 @@ mod tests {
         let mut a = RefAllocator::new();
         let p1 = ElementRef {
             digest: 1,
+            variant: 0,
             occurrence: 1,
         };
         let p2 = ElementRef {
             digest: 2,
+            variant: 0,
             occurrence: 1,
         };
         let first = ElementSignature::new("button", "Delete").with_scope(p1);
@@ -337,49 +431,30 @@ mod tests {
         );
     }
 
-    /// `AISNAP-10`: 同名の親が複数あっても、親の出現番号が違えば子の ref は衝突せず、
-    /// 先頭に同名カードを挿入しても既存カードの子 ref は変わらない。
+    /// `AISNAP-10`: 子に識別属性があれば、同じ role + name の親が前に挿入されても
+    /// 子の ref は変わらない（親の出現番号は子のダイジェストに影響しない）。
     #[test]
-    fn aisnap_10_scope_includes_parent_occurrence() {
+    fn aisnap_10_child_ref_ignores_parent_occurrence() {
         let run = |cards: &[&str]| {
             let mut a = RefAllocator::new();
-            let mut out = Vec::new();
-            for id in cards {
-                let card = ElementSignature::new("article", "Card").with_discriminator(id);
-                let cr = a.allocate_signature(&card).unwrap();
-                let del = ElementSignature::new("button", "Delete").with_scope(cr);
-                out.push((id.to_string(), s(a.allocate_signature(&del).unwrap())));
+            let mut out = std::collections::HashMap::new();
+            for c in cards {
+                // 親は識別属性なしの同名カード。子の識別属性は c。
+                let card = a
+                    .allocate_signature(&ElementSignature::new("article", "Card"))
+                    .unwrap();
+                let del = ElementSignature::new("button", "Delete")
+                    .with_discriminator(c)
+                    .with_scope(card);
+                out.insert(c.to_string(), s(a.allocate_signature(&del).unwrap()));
             }
             out
         };
-        // 識別属性なしの同名親 2 つ。親の出現番号だけが違う。
-        let mut a = RefAllocator::new();
-        let c1 = a
-            .allocate_signature(&ElementSignature::new("article", "Card"))
-            .unwrap();
-        let c2 = a
-            .allocate_signature(&ElementSignature::new("article", "Card"))
-            .unwrap();
-        assert_eq!((c1.occurrence, c2.occurrence), (1, 2));
-        let d1 = a
-            .allocate_signature(&ElementSignature::new("button", "Delete").with_scope(c1))
-            .unwrap();
-        let d2 = a
-            .allocate_signature(&ElementSignature::new("button", "Delete").with_scope(c2))
-            .unwrap();
-        assert_ne!(d1.digest, d2.digest);
-        assert_eq!((d1.occurrence, d2.occurrence), (1, 1));
-        assert_ne!(s(d1), s(d2));
-
-        // 識別属性付きの親: 先頭挿入・並べ替えで既存カードの子 ref が変わらない。
         let before = run(&["a", "b"]);
         let inserted = run(&["new", "a", "b"]);
-        let find = |v: &[(String, String)], id: &str| {
-            v.iter().find(|x| x.0 == id).map(|x| x.1.clone()).unwrap()
-        };
-        assert_eq!(find(&before, "a"), find(&inserted, "a"));
-        assert_eq!(find(&before, "b"), find(&inserted, "b"));
-        assert_ne!(find(&before, "a"), find(&before, "b"));
+        assert_eq!(before["a"], inserted["a"]);
+        assert_eq!(before["b"], inserted["b"]);
+        assert_ne!(before["a"], before["b"]);
     }
 
     /// `AISNAP-10`: role と name の境界が曖昧にならない。
@@ -387,37 +462,53 @@ mod tests {
     fn aisnap_10_signature_is_unambiguous() {
         assert_ne!(ref_signature("ab", "c"), ref_signature("a", "bc"));
         let mut a = RefAllocator::new();
-        assert_eq!(s(a.allocate("ab", "c").unwrap()), "e77c98227");
-        assert_eq!(s(a.allocate("a", "bc").unwrap()), "e32a64d88");
+        assert_eq!(s(a.allocate("ab", "c").unwrap()), "e606a0cce17a38ee9");
+        assert_eq!(s(a.allocate("a", "bc").unwrap()), "eb60b96e484addb6c");
     }
 
-    /// `AISNAP-10`: ダイジェストが衝突しても ref は一意になる。
+    /// `AISNAP-10`: 主ダイジェストが衝突しても ref は一意で、先に発行した
+    /// シグネチャの出現番号は衝突相手に消費されない。
     #[test]
-    fn aisnap_10_digest_collision_still_unique() {
+    fn aisnap_10_digest_collision_still_unique_and_stable() {
         let mut a = RefAllocator::new();
-        assert_eq!(s(a.allocate_with_digest(0xdead_beef).unwrap()), "edeadbeef");
-        assert_eq!(
-            s(a.allocate_with_digest(0xdead_beef).unwrap()),
-            "edeadbeef-2"
-        );
+        let first = a.allocate_with_hashes(0xdead_beef, 1).unwrap();
+        assert_eq!(s(first), "e00000000deadbeef");
+        // 別シグネチャ（検査ダイジェストが異なる）が衝突。
+        let other = a.allocate_with_hashes(0xdead_beef, 2).unwrap();
+        assert_eq!(s(other), "e00000000deadbeefv1");
+        // 衝突相手の挿入後も、元シグネチャの 2 個目は出現番号を消費されない。
+        let again = a.allocate_with_hashes(0xdead_beef, 1).unwrap();
+        assert_eq!(s(again), "e00000000deadbeef-2");
+        let other2 = a.allocate_with_hashes(0xdead_beef, 2).unwrap();
+        assert_eq!(s(other2), "e00000000deadbeefv1-2");
     }
 
     /// `AISNAP-10`: 出現番号のあふれは panic せず Err を返し、状態を壊さない。
     #[test]
     fn aisnap_10_occurrence_overflow_returns_error() {
         let mut a = RefAllocator::new();
-        a.seen.insert(7, u32::MAX);
-        assert_eq!(a.allocate_with_digest(7), Err(RefError::OccurrenceOverflow));
-        assert_eq!(a.seen.get(&7), Some(&u32::MAX));
+        a.seen.insert(
+            7,
+            vec![Slot {
+                check: 3,
+                variant: 0,
+                count: u32::MAX,
+            }],
+        );
+        assert_eq!(
+            a.allocate_with_hashes(7, 3),
+            Err(RefError::OccurrenceOverflow)
+        );
+        assert_eq!(a.seen.get(&7).unwrap().first().unwrap().count, u32::MAX);
     }
 
-    /// `AISNAP-10`: 空 name・非 ASCII でも `e` + 8 桁 16 進になる。
+    /// `AISNAP-10`: 空 name・非 ASCII でも `e` + 16 桁 16 進になる。
     #[test]
     fn aisnap_10_empty_name_and_non_ascii() {
         let mut a = RefAllocator::new();
         for (r, n) in [("generic", ""), ("button", "送信")] {
             let text = s(a.allocate(r, n).unwrap());
-            assert_eq!(text.len(), 9);
+            assert_eq!(text.len(), 17);
             assert!(text.starts_with('e'));
             assert!(
                 text[1..]

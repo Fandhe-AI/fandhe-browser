@@ -67,7 +67,7 @@ pub use state::{CheckedState, State, compute_state};
 ///   文書ルートの `<title>` は TASK-11.4.3（Issue #546）で実装済み
 /// - `r#ref`: role + name シグネチャによる再特定要求（`AISNAP-10`）。
 ///   `None` は ref を振らないノード（例: document ルート）を表す。
-///   値の形式は `e<8hex>[-n]`（[`RefAllocator`] が発行。TASK-11.6・Issue #75・
+///   値の形式は `e<16hex>[v<n>][-n]`（[`RefAllocator`] が発行。TASK-11.6・Issue #75・
 ///   `AISNAP-10`）。木への割り当ては TASK-11.7 が担う
 /// - `children`: DOM の親子関係に対応する子ノード。構築は
 ///   TASK-11.7（Issue #76）が担う
@@ -99,7 +99,7 @@ pub struct Node {
     /// [`name::compute_name`]（TASK-11.4.2・Issue #545）で実装済み。
     pub name: String,
     /// role + name シグネチャによる再特定要求（`AISNAP-10`）。
-    /// 形式は `e<8hex>[-n]`。生成は [`RefAllocator`]（TASK-11.6・Issue #75）。
+    /// 形式は `e<16hex>[v<n>][-n]`。生成は [`RefAllocator`]（TASK-11.6・Issue #75）。
     pub r#ref: Option<String>,
     /// DOM の親子関係に対応する子ノード。構築は TASK-11.7（Issue #76）。
     pub children: Vec<Node>,
