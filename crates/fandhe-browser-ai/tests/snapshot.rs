@@ -12,13 +12,15 @@
 //! `AISNAP-10`（ref の安定性）の回帰として検出すべきである。
 //!
 //! フィクスチャの入力はコンパイル時定数で、値はすべてダミー（外部通信・実資格情報なし）。
+//! `AISNAP-3`（TASK-13.3・Issue #88）: 表セル・価格クラス要素の `data_leaf` 反映も固定する。
+//!
 //! 暫定挙動（`generic` へのフォールバック）になる landmark 等の role は
 //! 固定しないよう、`nav`・`main`・`form`・`img` 等は使わない。
 
 use std::collections::HashSet;
 
 use fandhe_browser_ai::snapshot::{
-    CheckedState, Node, Snapshot, State, build_snapshot, ref_signature,
+    CheckedState, DataLeafKind, Node, Snapshot, State, build_snapshot, ref_signature,
 };
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
 
@@ -253,9 +255,11 @@ fn aisnap_1_table_snapshot_structure() {
                             "名前点数",
                             "e3b9ec063bec3ce0d",
                             vec![
-                                n("columnheader", "名前", "e895cf72c839b312e", vec![]),
-                                n("columnheader", "点数", "e4c3266d420a99a2c", vec![]),
-                            ],
+                                    n("columnheader", "名前", "e895cf72c839b312e", vec![])
+                                        .with_data_leaf(DataLeafKind::TableCell),
+                                    n("columnheader", "点数", "e4c3266d420a99a2c", vec![])
+                                        .with_data_leaf(DataLeafKind::TableCell),
+                                ],
                         )],
                     ),
                     n(
@@ -267,9 +271,11 @@ fn aisnap_1_table_snapshot_structure() {
                             "太郎80",
                             "e603d30fc95b8b612",
                             vec![
-                                n("cell", "太郎", "e8c54b60bbb2904e5", vec![]),
-                                n("cell", "80", "eb3df38593dc1377c", vec![]),
-                            ],
+                                    n("cell", "太郎", "e8c54b60bbb2904e5", vec![])
+                                        .with_data_leaf(DataLeafKind::TableCell),
+                                    n("cell", "80", "eb3df38593dc1377c", vec![])
+                                        .with_data_leaf(DataLeafKind::TableCell),
+                                ],
                         )],
                     ),
                 ],
@@ -282,6 +288,23 @@ fn aisnap_1_table_snapshot_structure() {
     let table = child(child(child(&s.tree, 0), 0), 0);
     assert_eq!(table.role, "table");
     assert_eq!(child(child(child(table, 0), 0), 1).name, "点数");
+}
+
+/// 価格クラス要素を含むページ（landmark 系は使わない）。
+const PRICE: &str = r#"<!DOCTYPE html><html><head><title>商品</title></head><body><h1>商品</h1><p>価格: <span class="price">¥1,980</span></p><button>カートに追加</button></body></html>"#;
+
+/// `AISNAP-3`（TASK-13.3・Issue #88）: 価格 span だけが `PriceClass` になる。
+#[test]
+fn aisnap_3_price_snapshot_marks_price_leaf() {
+    let s = snap(PRICE);
+    assert_common(PRICE, &s);
+    let nodes = all_nodes(&s.tree);
+    let marked: Vec<&&Node> = nodes.iter().filter(|nd| nd.data_leaf.is_some()).collect();
+    assert_eq!(marked.len(), 1);
+    let price = marked.first().expect("価格ノードが 1 件ある");
+    assert_eq!(price.role, "generic");
+    assert_eq!(price.name, "");
+    assert_eq!(price.data_leaf, Some(DataLeafKind::PriceClass));
 }
 
 /// `AISNAP-10`（TASK-11.8・Issue #77）: 修飾子（id・name・href・親 ref）を持たない

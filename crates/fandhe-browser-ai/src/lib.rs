@@ -62,7 +62,7 @@
 //! - データ葉（非インタラクティブなデータ値）の検出（`AISNAP-3`・`TASK-13`・
 //!   `MS-2`）。`td`/`th` の検出（TASK-13.1・Issue #86）と
 //!   価格クラス名パターン（TASK-13.2・Issue #87）は実装済み（[`data_leaf`]）。
-//!   snapshot 構築への統合（#88）は未実装
+//!   snapshot 構築への統合は実装済み（TASK-13.3・Issue #88。`Node::data_leaf`）
 //! - `/ai/*` ルータ向けスナップショット API（`AISNAP-6`・`AISNAP-14`・`CDP-1`
 //!   （API 単体動作は `AISNAP-7`）、`TASK-19`（単体動作確認は `TASK-20`）、
 //!   `MS-4`）
