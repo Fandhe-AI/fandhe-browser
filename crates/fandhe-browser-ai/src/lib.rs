@@ -59,7 +59,9 @@
 //!   ヘッダ ref 付与は実装済み（TASK-12.2・Issue #80。`assign_header_refs`）。
 //!   データ行の圧縮 1 行表現も実装済み（TASK-12.3・Issue #81。
 //!   [`compress_table::compress_rows`]・統合前のため呼び出し元なし）。
-//!   `truncated_rows` 注記（#82）・ツリー構築への統合（#83）・回帰テスト（#84）は未実装
+//!   超過行数 `truncated_rows` も実装済み（TASK-12.4・Issue #82。
+//!   [`compress_table::CompressedRows`]）。ツリー構築への統合（#83）・
+//!   回帰テスト（#84）は未実装
 //! - データ葉（非インタラクティブなデータ値）の検出（`AISNAP-3`・`TASK-13`・
 //!   `MS-2`）。`td`/`th` の検出（TASK-13.1・Issue #86）と
 //!   価格クラス名パターン（TASK-13.2・Issue #87）は実装済み（[`data_leaf`]）。

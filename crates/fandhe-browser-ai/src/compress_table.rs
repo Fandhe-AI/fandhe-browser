@@ -14,7 +14,8 @@
 //! なしで使う想定である。データ行の圧縮 1 行表現は実装済み
 //! （[`compress_rows`]・TASK-12.3・Issue #81。統合前のため呼び出し元なし）。
 //! ヘッダの個別 ref 付与も実装済み（[`assign_header_refs`]・TASK-12.2・Issue #80）。
-//! `truncated_rows` 注記・統合は未実装（実装済みを装わない。REPAIR-3）。
+//! 超過行数の注記も実装済み（`CompressedRows::truncated_rows`・TASK-12.4・Issue #82）。
+//! ツリー構築への統合（TASK-12.5・Issue #83）は未実装（実装済みを装わない。REPAIR-3）。
 //!
 //! # 判定規則（table）
 //!
@@ -437,13 +438,17 @@ pub struct CompressedRow {
 
 /// [`compress_rows`] の結果。
 ///
-/// `truncated_rows`（20 行を超えた件数）は TASK-12.4（Issue #82）がここへ
-/// フィールドを足す想定で、`#[non_exhaustive]` により非破壊で拡張できる。
+/// `#[non_exhaustive]` により、フィールド追加は外部 crate に対して非破壊で行える。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct CompressedRows {
     /// 先頭から最大 [`MAX_TABLE_ROWS`] 行（文書順）。
     pub rows: Vec<CompressedRow>,
+    /// 表示対象のデータ行のうち、先頭 [`MAX_TABLE_ROWS`] 行を超えて省略した行数
+    /// （「他N行」注記の元数値。`AISNAP-2`・TASK-12.4・Issue #82）。
+    /// `rows` と同じ母集団（非表示行を除く）で数え、`tfoot` 行・セルを持たない行は含めない。
+    /// 文字列注記への整形は統合側（TASK-12.5・Issue #83）の責務。
+    pub truncated_rows: usize,
 }
 
 /// 規則的と判定済みの構造から、データ行を先頭 [`MAX_TABLE_ROWS`] 行まで
@@ -464,17 +469,18 @@ pub struct CompressedRows {
 ///   [`MAX_CELL_SCAN_STEPS`] ノード・[`MAX_CELL_SCAN_CHARS`] 文字で打ち切る。CSS による非表示はスタイル未評価
 ///   のため対象外
 /// - ヘッダ行・`tfoot` 行は含めない（`footer_rows` の扱いは統合時に決める。保留）
-/// - 20 行を超えた件数はここでは返さない（TASK-12.4・Issue #82）
+/// - 表示対象のデータ行のうち 20 行を超えた件数を `truncated_rows` に返す
+///   （非表示行・`tfoot`・ヘッダは数えない。TASK-12.4・Issue #82）
 /// - セル内に `" | "` が含まれると区切りが曖昧になる（エスケープの要否は
 ///   出力形式が決まる統合時に判断する既知の制約）
 pub fn compress_rows(doc: &Document, structure: &RegularStructure) -> CompressedRows {
     let mut rows = Vec::with_capacity(structure.body_rows.len().min(MAX_TABLE_ROWS));
     // 非表示の行・祖先（`tbody`・表自身・その外側を含む）の行は除外してから
     // 20 行の予算を数える（`build_snapshot` の非表示サブツリー除外に合わせる）。
-    let visible_rows = structure.body_rows.iter().copied().filter(|&row| {
+    let mut visible_rows = structure.body_rows.iter().copied().filter(|&row| {
         !is_hidden_element(doc, row) && !doc.ancestors(row).any(|a| is_hidden_element(doc, a))
     });
-    for row in visible_rows.take(MAX_TABLE_ROWS) {
+    for row in visible_rows.by_ref().take(MAX_TABLE_ROWS) {
         let cells: Vec<NodeId> = match structure.kind {
             StructureKind::Table => doc
                 .children(row)
@@ -500,7 +506,12 @@ pub fn compress_rows(doc: &Document, structure: &RegularStructure) -> Compressed
             truncated,
         });
     }
-    CompressedRows { rows }
+    // 予算を使い切った後の残りが「他N行」（`rows` と同じ非表示判定で数える）。
+    let truncated_rows = visible_rows.count();
+    CompressedRows {
+        rows,
+        truncated_rows,
+    }
 }
 
 /// HTML の空白（ASCII 空白）または U+00A0 か。
@@ -967,6 +978,7 @@ mod tests {
         assert_eq!(r.rows[0].text, "r1a | r1b");
         assert_eq!(r.rows[19].text, "r20a | r20b");
         assert_eq!(r.rows[5].row, s.body_rows[5]);
+        assert_eq!(r.truncated_rows, 1);
     }
 
     /// AISNAP-2（TASK-12.3）: thead なし 100 行・境界（20 行・3 行・ヘッダのみ）。
@@ -975,11 +987,39 @@ mod tests {
         let r = rows_of(&table_html(100, false), "table");
         assert_eq!(r.rows.len(), 20);
         assert_eq!(r.rows[19].text, "r20a | r20b");
-        assert_eq!(rows_of(&table_html(20, true), "table").rows.len(), 20);
+        assert_eq!(r.truncated_rows, 80);
+        let r20 = rows_of(&table_html(20, true), "table");
+        assert_eq!((r20.rows.len(), r20.truncated_rows), (20, 0));
         let r3 = rows_of(&table_html(3, true), "table");
+        assert_eq!(r3.truncated_rows, 0);
         assert_eq!(texts(&r3), ["r1a | r1b", "r2a | r2b", "r3a | r3b"]);
         let h = rows_of("<table><tr><th>a<th>b</table>", "table");
         assert!(h.rows.is_empty());
+        assert_eq!(h.truncated_rows, 0);
+    }
+
+    /// AISNAP-2（TASK-12.4・Issue #82）: 100 行で truncated_rows が 80（受入基準）。
+    #[test]
+    fn aisnap_2_truncated_rows_100_rows() {
+        for thead in [false, true] {
+            let r = rows_of(&table_html(100, thead), "table");
+            assert_eq!(r.rows.len(), 20);
+            assert_eq!(r.truncated_rows, 80);
+        }
+        assert_eq!(CompressedRows::default().truncated_rows, 0);
+    }
+
+    /// AISNAP-2（TASK-12.4・Issue #82）: tfoot 行は超過件数に含めない。
+    #[test]
+    fn aisnap_2_truncated_rows_excludes_footer() {
+        let mut h = String::from("<table><tbody>");
+        for i in 1..=25 {
+            h.push_str(&format!("<tr><td>r{i}"));
+        }
+        h.push_str("</tbody><tfoot><tr><td>f1<tr><td>f2<tr><td>f3</tfoot></table>");
+        let r = rows_of(&h, "table");
+        assert_eq!(r.rows.len(), 20);
+        assert_eq!(r.truncated_rows, 5);
     }
 
     /// AISNAP-2（TASK-12.3）: ヘッダ行・tfoot 行は含めない。
@@ -1005,8 +1045,10 @@ mod tests {
         assert_eq!(r.rows.len(), 20);
         assert_eq!(r.rows[0].text, "item1");
         assert_eq!(r.rows[19].text, "item20");
+        assert_eq!(r.truncated_rows, 5);
         let ol = rows_of("<ol><li>a<li>b</ol>", "ol");
         assert_eq!(texts(&ol), ["a", "b"]);
+        assert_eq!(ol.truncated_rows, 0);
     }
 
     /// AISNAP-2（TASK-12.3）: 空白の畳み込み・空セル・colspan 行。
@@ -1085,8 +1127,11 @@ mod tests {
         let r = rows_of(&h, "table");
         assert_eq!(r.rows.len(), 20);
         assert_eq!(texts(&r)[0], "v0");
+        // 非表示 25 行は超過件数に含めない（表示 21 行のうち 1 行のみ省略）。
+        assert_eq!(r.truncated_rows, 1);
         let r = rows_of("<table aria-hidden=true><tr><td>a</table>", "table");
         assert!(r.rows.is_empty());
+        assert_eq!(r.truncated_rows, 0);
     }
 
     /// AISNAP-2（TASK-12.3）: 走査ステップ上限で打ち切り panic しない。
