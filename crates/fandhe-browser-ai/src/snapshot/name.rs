@@ -1,7 +1,7 @@
 //! `snapshot::Node::name` フィールドの算出ロジック（`AISNAP-1`・`TASK-11.4`・
 //! `MS-2`）。
 //!
-//! 本ファイルが実装する accessible name の出所は次の 2 系統である。
+//! 本ファイルが実装する accessible name の出所は次の 3 系統である。
 //!
 //! - **ARIA 属性による明示的な命名**（TASK-11.4.1・Issue #544）:
 //!   `aria-labelledby`（IDREF リストの参照先テキストをトークン順に連結）と
@@ -10,9 +10,13 @@
 //! - **HTML ネイティブのラベル付け**（TASK-11.4.2・Issue #545）: `alt`・
 //!   `title`・`value`・`placeholder`・submit/reset/image の既定ラベル・
 //!   `label[for]`・label による包含
+//! - **子孫テキストと文書ルート**（TASK-11.4.3・Issue #546）: name-from-content
+//!   role（button・link・heading・cell 等）の子孫テキスト（accname 2F。
+//!   `hidden`/`aria-hidden="true"` の除外・子孫 `aria-label`・`img` の `alt`・
+//!   埋め込みコントロールの値を含む）と、文書ルートの最初の HTML `<title>`
 //!
 //! 全体の算出順序は `aria-labelledby` → `aria-label` → ネイティブ
-//! （[`compute_name_with_index`]）。ただし `input[type=hidden]` は
+//! （label 等 → 子孫テキスト → `title`。[`compute_name_with_index`]）。ただし `input[type=hidden]` は
 //! アクセシビリティツリーへ公開されないため ARIA より前に常に名前なしとする。
 //!
 //! `aria-labelledby` の参照先の扱い（#544 の範囲）: 参照先自身の
@@ -21,15 +25,13 @@
 //! `img` なら `alt` を使い、それ以外は子孫テキスト（テキストノードと
 //! 子孫 `img` の `alt`。`script`/`style`/`noscript`/`template` は除く）を使う。
 //!
-//! 以下は本 Issue のスコープ外とし、後続タスクへ引き継ぐ（実装済みを装わない。
-//! REPAIR-3）。
+//! 以下は未実装とし、後続へ引き継ぐ（実装済みを装わない。REPAIR-3）。
 //!
-//! - 子孫テキストからの再帰的な名前算出（`button`・`a`・見出しの内容、
-//!   参照先の子孫が持つ `aria-label` の再帰的な採用）・
-//!   `hidden`/`aria-hidden` 子孫の除外・埋め込みコントロールの値・参照先への
-//!   ネイティブ規則の完全適用（本 Issue は `img` の `alt` のみ補完）・
-//!   全体の優先順位の最終調整・文書ルートの `<title>` による命名:
-//!   TASK-11.4.3（Issue #546）
+//! - 再帰中の子孫 `aria-labelledby` の追跡・子孫の `title` フォールバック
+//!   （accname 2I の再帰適用）・`aria-valuetext`/range の値・参照先の label/`title`
+//!   の適用・CSS のブロック要素間の区切りと生成コンテンツ: 担当 Issue 未確定
+//! - `option`・`summary`・`menuitem` 等の暗黙 role が role.rs で未対応のため、
+//!   これらの要素は name from content の対象にならない（role.rs 側の課題）
 //! - `fieldset`→`legend`・`table`→`caption`・`figure`→`figcaption`・SVG の
 //!   `<title>`・`aria-describedby`: 担当 Issue 未確定（out-of-scope-tracking
 //!   に従いユーザー承認を得てから追跡する）
@@ -42,6 +44,13 @@
 //!   ことで、文書走査を索引構築の 1 回に抑える（[`compute_name`] は単発
 //!   呼び出し向けの簡易版で、内部で毎回 `NameIndex` を構築するため複数
 //!   要素へ連続して使うと同じ問題が再発する）。
+//!
+//! 走査量の上限: 子孫走査は 1 回あたり [`MAX_CONTENT_STEPS`] で頭打ちにし、
+//! 打ち切りは `truncated` で伝える。上限は要素ごとに固定で、共有索引の
+//! 呼び出し順に結果が依存しない（[`compute_name`] と
+//! [`compute_name_with_index`] は同じ結果を返す）。文書全体の総量は
+//! 最悪 `node_count * MAX_CONTENT_STEPS` で、`node_count` はパーサーの
+//! ノード数上限（`ParseOptions::max_nodes`）で抑えられる。`input[type=password]` の `value` は名前へ取り込まない。
 //!
 //! 呼び出し文脈: 現時点では呼び出し元がない。DOM から `Snapshot`/`Node` を
 //! 構築する TASK-11.7（Issue #76）が、文書ごとに [`NameIndex::build`] を
@@ -68,8 +77,8 @@
 //! | `input` `submit`/`reset` | 同上 | label → `value`（属性が**指定されている**場合。空文字列でも指定扱い） → （`value` 属性が**未指定のときだけ**）既定ラベル（`"Submit"`/`"Reset"`） → `title` → 名前なし | `value=""` は「指定あり」なので既定ラベル段を飛ばし `title` へ進む。`value` 属性が全く無いときだけ既定ラベルを使う |
 //! | `input` `image` | `input type="image"` Element Accessible Name Computation | label → `alt`（trim 後に非空の場合のみ） → `title`（非空の場合のみ） → 既定ラベル `"Submit Query"` → 名前なし | `value` 属性は本節のアルゴリズムに含まれない（仕様のコメント注記は「もし規定されるなら」という将来の余地であり、現行の算出手順には無い。本実装も `value` を使わない） |
 //! | `input` `hidden` | 本 spec に個別記載なし | 常に名前なし | `hidden` はアクセシビリティツリーへ公開されない要素のため、本実装の判断で常に空とする（W3C 未規定の部分） |
-//! | `button`（`<button>` 要素） | `button` Element Accessible Name Computation | label → `title` → 名前なし（**子孫テキストへのフォールバックは #546 のスコープ**。本 Issue は実装しない） | trim 後に空なら次点へ |
-//! | その他の要素 | 各種 Section/Grouping・Text-level 等の節（いずれも `title` のみ） | `title` → 名前なし | trim 後に空なら名前なし |
+//! | `button`（`<button>` 要素） | `button` Element Accessible Name Computation | label → 子孫テキスト（`NameSource::Content`）→ `title` → 名前なし | trim 後に空なら次点へ |
+//! | その他の要素 | 各種 Section/Grouping・Text-level 等の節 | name-from-content role（link・heading・cell 等）なら 子孫テキスト → `title`、それ以外は `title` のみ → 名前なし | trim 後に空なら名前なし |
 //!
 //! ラベル関連付け（HTML Standard の labeled control 規則。上表の「label」段）
 //! は `for` 属性（文書順で最初に一致する `id` を持つ要素が対象と同じ場合の
@@ -80,7 +89,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use fandhe_browser_core::dom::{Document, NodeData, NodeId};
+use fandhe_browser_core::dom::{Children, Document, NodeData, NodeId};
 
 use super::state::is_html_element_named;
 
@@ -129,20 +138,20 @@ const MAX_CACHEABLE_REFERENT_SCANS: usize = 256;
 /// する不具合があった。[`label_name`] を参照）。
 const MAX_LABELS: usize = 16;
 
-/// `label_name` が 1 回の呼び出しで実際に走査（[`collect_label_text`] を
+/// `label_name` が 1 回の呼び出しで実際に走査（[`collect_content_text`] を
 /// 呼び出す）する label の総数の上限（`AISNAP-1`）。
 ///
 /// [`MAX_LABELS`] は「名前に寄与した label の数」だけを数える上限であり、
 /// 寄与しない（空・空白だけの）label はこの上限の対象外である。この
 /// ため、1 つの対象コントロールに `for` 属性で大量の空・空白だけの
 /// `<label>` を関連付けると、[`MAX_LABELS`] にはいつまでも達しないまま
-/// `collect_label_text` の呼び出し（文書走査を伴う）が際限なく増え続け、
+/// `collect_content_text` の呼び出し（文書走査を伴う）が際限なく増え続け、
 /// 処理量が外部入力（label の個数）に比例して無制限に増大する
 /// （security.md「不安全な設計」対策。PR #567 レビュー指摘の P1 修正）。
 ///
 /// 本定数は「寄与したかどうかに関わらず走査した label の総数」を打ち切る
 /// ことで、この処理量を定数（`MAX_LABELS_SCANNED` 件分の
-/// `collect_label_text` 呼び出し）で頭打ちにする。[`MAX_LABELS`] の
+/// `collect_content_text` 呼び出し）で頭打ちにする。[`MAX_LABELS`] の
 /// 何倍か（空・空白だけの label がある程度混ざっていても、後続の名前
 /// 入り label まで届くだけの余裕を持たせる）に設定する。
 ///
@@ -161,6 +170,17 @@ const MAX_LABELS: usize = 16;
 /// `matched_labels == 0` で `None` が返り、誤って `title`/`placeholder`
 /// へフォールバックしていた不具合の修正）。
 const MAX_LABELS_SCANNED: usize = MAX_LABELS * 4;
+
+/// 対象要素自身の子孫（name from content。TASK-11.4.3）を 1 回走査するときに
+/// 訪問するノード数の上限（`AISNAP-1`）。
+///
+/// 行・セル・リンク・見出しなど content role の要素はすべて自分の部分木を
+/// 走査するため、入れ子では走査量の総和が文書サイズの二乗になりうる。1 回あたりを
+/// 定数で打ち切る（security.md「不安全な設計」対策）。上限は要素ごとに固定で、
+/// 共有索引を使う呼び出しの順序に結果が依存しない（PR #574 レビュー指摘）。
+/// 文書全体の総量は最悪 `node_count * 本値` で、パーサーのノード数上限で
+/// 抑えられる。打ち切ったら `truncated` を立てる。
+const MAX_CONTENT_STEPS: usize = 1024;
 
 /// `aria-labelledby` で名前に**寄与した**（正規化後のテキストが空でない）
 /// 参照先の数の上限（`AISNAP-1`・TASK-11.4.1）。
@@ -182,9 +202,9 @@ const MAX_IDREFS_SCANNED: usize = MAX_IDREFS * 4;
 
 /// accessible name の出所（`AISNAP-1`）。
 ///
-/// ARIA 属性由来（`aria-labelledby`・`aria-label`。TASK-11.4.1・#544）と
-/// HTML ネイティブの出所（TASK-11.4.2・#545）を持つ。子孫テキスト由来
-/// （TASK-11.4.3・#546）の出所は、後続タスクが非破壊で追加する
+/// ARIA 属性由来（`aria-labelledby`・`aria-label`。TASK-11.4.1・#544）、
+/// HTML ネイティブの出所（TASK-11.4.2・#545）、子孫テキストと文書ルートの
+/// `<title>`（TASK-11.4.3・#546）を持つ。将来の出所追加は非破壊
 /// （`#[non_exhaustive]`。REPAIR-4）。
 ///
 /// `bool` ではなく enum にする理由: 名前の有無だけでなく「どの規則で
@@ -214,6 +234,10 @@ pub enum NameSource {
     Title,
     /// `placeholder` 属性により算出した。
     Placeholder,
+    /// 子孫のテキスト（name from content。TASK-11.4.3）により算出した。
+    Content,
+    /// 文書ルートの最初の HTML `<title>` 要素により算出した（TASK-11.4.3）。
+    DocumentTitle,
 }
 
 /// 要素の accessible name（`AISNAP-1`）。[`super::Node::name`] の算出結果。
@@ -227,7 +251,9 @@ pub struct AccessibleName {
     pub text: String,
     /// 算出に使った出所。
     pub source: NameSource,
-    /// [`MAX_NAME_CHARS`]（文字数上限）・[`MAX_LABELS`]（label 数上限）・
+    /// [`MAX_NAME_CHARS`]（文字数上限）・[`MAX_CONTENT_STEPS`]（子孫走査 1 回あたりの
+    /// ステップ上限）・
+    /// 子孫走査の折り畳み後文字数上限・[`MAX_LABELS`]（label 数上限）・
     /// [`MAX_LABELS_SCANNED`]（label 走査総数の上限）・[`MAX_IDREFS`]
     /// （`aria-labelledby` の寄与参照先数の上限）・[`MAX_IDREFS_SCANNED`]
     /// （同トークン走査総数の上限）。走査総数の上限は、寄与するものを
@@ -477,77 +503,238 @@ fn normalized_input_type(doc: &Document, id: NodeId) -> String {
         .unwrap_or_default()
 }
 
-/// `label` の子孫のテキストを収集し、`out` へ HTML ASCII 空白の連続を
-/// 1 個の区切りへ畳みながら追記する（`AISNAP-1`）。
+/// [`collect_content_text`] の走査条件（`AISNAP-1`・TASK-11.4.3）。
 ///
-/// テキストノードに加え、子孫 `img` 要素の `alt` 属性値も同じ折り畳み対象
-/// として取り込む（PR #567 レビュー指摘の P1 修正）。HTML-AAM の
-/// accessible name from content 計算はテキスト代替を持つ埋め込み要素
-/// （`img` 等）の代替テキストをテキストノードと同列に扱うため、
-/// `<label for="q"><img alt="検索"></label>` のような画像だけの label でも
-/// 名前が失われないようにする。`img` に `alt` 属性が無ければ何も追加しない
-/// （`alt=""` も同様に何も追加しない）。`img` は子要素を持たないため、
-/// `alt` を追加した後はその子孫を辿らない。
-///
-/// `script`・`style`・`noscript`・`template` のサブツリーは除外する。
-/// `exclude`（関連付け先のコントロール自身）のサブツリーも除外する
-/// （埋め込みコントロールの値の扱いは TASK-11.4.3・#546 のスコープ）。
-/// 明示スタックで非再帰走査し、処理ステップ数を [`Document::node_count`]
-/// で上限することで、深いネスト・壊れたリンクがあっても必ず停止する
-/// （security.md「不安全な設計」対策）。
-///
-/// **前提**: `out` は呼び出し時点で空文字列であること（呼び出し元の
-/// [`label_name`] は毎回新規の `String` を渡す）。
-///
-/// 上限判定は**折り畳み後**の文字数（[`NORMALIZED_LABEL_TEXT_CHAR_LIMIT`]）
-/// で行う。折り畳み前の生バイト数で打ち切ると、名前本体の前に大量の
-/// HTML 空白がある label で本体が上限に達する前に収集されず、
-/// `label_name` が本体を「空」と誤判定して次点（`title` 等）へ誤って
-/// フォールバックしてしまう（PR #567 レビュー指摘の P1 修正）。折り畳み後
-/// も [`MAX_NAME_CHARS`] に収まらない分はどのみち [`NameBuffer`] 側で
-/// 捨てられるため、それ以上集める必要はない。
-///
-/// 呼び出し元（[`label_name`]）は、この折り畳み済みテキストを
-/// [`has_non_whitespace`] で「この label が名前に寄与するか」の判定に
-/// 使ったうえで、寄与する場合のみ [`NameBuffer::push_str`] へ渡す
-/// （`push_str` 自体も空白折り畳みを行うため二重になるが、こちらの折り
-/// 畳みは「上限判定を正しくする」ためのものであり、`push_str` 側の
-/// 折り畳みは「複数 label 間の区切り」を扱うためのもので責務が異なる）。
-///
-/// `aria-labelledby` の参照先テキスト収集（[`referent_text`]・TASK-11.4.1）
-/// でも再利用する（`label` 引数は「子孫を走査する起点要素」の意味）。
-/// 子孫テキストの再帰的な名前算出への拡張は TASK-11.4.3（#546）が担う。
-fn collect_label_text(doc: &Document, label: NodeId, exclude: NodeId, out: &mut String) {
-    const SKIPPED_SUBTREES: [&str; 4] = ["script", "style", "noscript", "template"];
-    debug_assert!(out.is_empty(), "collect_label_text は空の out を前提とする");
+/// label・`aria-labelledby` の参照先・対象要素自身の子孫（name from content）の
+/// 3 経路が同じ走査関数を共有するための差分だけを持つ非公開の引数。
+#[derive(Debug, Clone, Copy)]
+struct ContentWalk {
+    /// 訪問するノード数の上限。超えたら走査を打ち切り [`ContentScan::cut`] を立てる。
+    max_steps: usize,
+    /// `true` なら `hidden`/`aria-hidden="true"` の子孫も取り込む
+    /// （accname 2A: 直接参照された hidden な参照先の内側だけで使う）。
+    include_hidden: bool,
+}
 
-    let mut stack: Vec<NodeId> = doc.children(label).rev().collect();
-    let mut remaining_steps = doc.node_count();
+/// [`collect_content_text`] の走査結果（`AISNAP-1`・TASK-11.4.3）。
+#[derive(Debug, Clone, Copy, Default)]
+struct ContentScan {
+    /// 文字数上限（[`NORMALIZED_LABEL_TEXT_CHAR_LIMIT`]）またはステップ上限で
+    /// 入力の一部を集めずに打ち切ったか。`out` の長さからは推論できない
+    /// （ステップ上限で切れたときは文字数が少ないため）ので明示的に返す。
+    cut: bool,
+    /// 消費したステップ数（文書全体の予算の差し引きに使う）。
+    steps_used: usize,
+}
+
+/// `script`・`style`・`noscript`・`template` は名前の計算に寄与しない。
+const SKIPPED_SUBTREES: [&str; 4] = ["script", "style", "noscript", "template"];
+
+/// 要素が `hidden` 属性を持つか、`aria-hidden` が（HTML 空白の trim・ASCII
+/// 大文字小文字無視で）`"true"` かを返す（accname 2A。CSS による非表示は
+/// スタイル未評価のため対象外）。
+fn is_hidden_element(doc: &Document, id: NodeId) -> bool {
+    if doc.attribute(id, "hidden").is_some() {
+        return true;
+    }
+    doc.attribute(id, "aria-hidden").is_some_and(|value| {
+        value
+            .trim_matches(is_ascii_whitespace)
+            .eq_ignore_ascii_case("true")
+    })
+}
+
+/// 埋め込みコントロール（accname 2E）が名前へ寄与するテキストを返す
+/// （`AISNAP-1`・TASK-11.4.3）。寄与しない要素は `None`（通常の子孫走査へ進む）。
+///
+/// - テキスト系 `input`（`type` 省略・未知を含む）→ `value`。`password` は
+///   平文がスナップショットへ漏れないよう**取り込まない**
+/// - `textarea` → 子のテキスト（現在値）
+/// - `select` → `selected` 属性を持つ最初の `option`、無ければ最初の `option` の
+///   テキスト（探索は `max_steps` の半分までを消費し、残りは候補のテキスト収集に
+///   確保する。探索が上限に達したら最初の `option` を採用し `cut` を立てる）
+///
+/// `aria-valuetext` や range の値は未実装（担当 Issue 未確定）。
+fn embedded_control_text(
+    doc: &Document,
+    id: NodeId,
+    exclude: NodeId,
+    max_steps: usize,
+) -> Option<(String, ContentScan)> {
+    if is_html_element_named(doc, id, "input") {
+        if matches!(
+            normalized_input_type(doc, id).as_str(),
+            "hidden"
+                | "checkbox"
+                | "radio"
+                | "range"
+                | "color"
+                | "date"
+                | "datetime-local"
+                | "month"
+                | "week"
+                | "time"
+                | "file"
+                | "button"
+                | "submit"
+                | "reset"
+                | "image"
+                | "password"
+        ) {
+            return None;
+        }
+        let mut out = String::new();
+        if let Some(value) = doc.attribute(id, "value") {
+            fold_attr_bounded(value, &mut out);
+        }
+        return Some((out, ContentScan::default()));
+    }
+    if is_html_element_named(doc, id, "textarea") {
+        // `textarea` の現在値は子のテキスト（RCDATA）。走査は `max_steps` で有界。
+        let mut out = String::new();
+        let scan = collect_content_text(
+            doc,
+            id,
+            exclude,
+            ContentWalk {
+                max_steps,
+                include_hidden: true,
+            },
+            &mut out,
+        );
+        return Some((out, scan));
+    }
+    if is_html_element_named(doc, id, "select") {
+        let mut scan = ContentScan::default();
+        // 子ノードを事前に全件確保せず、遅延イテレータのスタックで辿る。
+        // 確保は「積んだ階層数（各 1 イテレータ）」に比例し、階層は 1 ステップ
+        // ごとにしか増えないため `scan_limit` で有界になる（入力の子数に比例しない）。
+        let mut stack: Vec<Children<'_>> = vec![doc.children(id)];
+        let mut first: Option<NodeId> = None;
+        let mut chosen: Option<NodeId> = None;
+        // 選択状態の探索へ予算の半分までを割り当て、残りは選択候補のテキスト収集へ
+        // 確保する。後続の `option` が大量でも、確定済みの候補（最初の `option`）の
+        // 名前が予算枯渇で失われないようにする（PR #574 レビュー指摘）。
+        let scan_limit = max_steps - max_steps / 2;
+        while let Some(top) = stack.last_mut() {
+            let Some(current) = top.next() else {
+                stack.pop();
+                continue;
+            };
+            if scan.steps_used >= scan_limit {
+                scan.cut = true;
+                break;
+            }
+            scan.steps_used += 1;
+            if is_html_element_named(doc, current, "option") {
+                if doc.attribute(current, "selected").is_some() {
+                    chosen = Some(current);
+                    break;
+                }
+                first.get_or_insert(current);
+            } else if doc.is_element(current) {
+                stack.push(doc.children(current));
+            }
+        }
+        let mut out = String::new();
+        if let Some(option) = chosen.or(first) {
+            let inner = collect_content_text(
+                doc,
+                option,
+                exclude,
+                ContentWalk {
+                    max_steps: max_steps.saturating_sub(scan.steps_used),
+                    include_hidden: false,
+                },
+                &mut out,
+            );
+            scan.steps_used += inner.steps_used;
+            scan.cut |= inner.cut;
+        }
+        return Some((out, scan));
+    }
+    None
+}
+
+/// `start` の子孫のテキストを収集し、`out` へ HTML ASCII 空白の連続を
+/// 1 個の区切りへ畳みながら追記する（`AISNAP-1`。TASK-11.4.2 の label 用走査を
+/// TASK-11.4.3 で name from content・参照先にも共有できるよう拡張）。
+///
+/// 呼び出し元: [`label_name`]（label の子孫）・[`referent_text`]
+/// （`aria-labelledby` の参照先）・[`content_name`]（対象要素自身の子孫）・
+/// 文書ルートの `<title>`（[`compute_name_with_index`]）。
+///
+/// 取り込む内容: テキストノード・子孫 `img` の `alt`（accname 2D の代替テキスト。
+/// 子へは降りない）・子孫の `aria-label`（空白以外を含むとき。accname 2C の
+/// 再帰適用。その部分木へは降りない）・埋め込みコントロールの値
+/// （[`embedded_control_text`]）。`script`・`style`・`noscript`・`template` と
+/// `exclude`（名前を算出している対象自身）の部分木、および
+/// [`ContentWalk::include_hidden`] が `false` のときの hidden 部分木は除外する。
+///
+/// 未実装（実装済みを装わない。REPAIR-3）: 再帰中の子孫 `aria-labelledby` の
+/// 追跡・子孫の `title` フォールバック・CSS のブロック要素間の区切り。
+///
+/// 明示スタックで非再帰に走査し、訪問数を [`ContentWalk::max_steps`] で上限する
+/// ため、深いネストでも必ず停止する（security.md「不安全な設計」対策）。
+/// 打ち切ったかどうかは戻り値の [`ContentScan::cut`] で明示的に返す。
+///
+/// **前提**: `out` は呼び出し時点で空文字列であること。
+///
+/// 上限判定は**折り畳み後**の文字数（[`NORMALIZED_LABEL_TEXT_CHAR_LIMIT`]）で
+/// 行う。生バイト数で打ち切ると、本体の前に大量の HTML 空白がある入力で本体が
+/// 収集されず「空」と誤判定され次点へ誤ってフォールバックする
+/// （PR #567 レビュー指摘の P1 修正）。
+fn collect_content_text(
+    doc: &Document,
+    start: NodeId,
+    exclude: NodeId,
+    opts: ContentWalk,
+    out: &mut String,
+) -> ContentScan {
+    debug_assert!(
+        out.is_empty(),
+        "collect_content_text は空の out を前提とする"
+    );
+
+    let mut scan = ContentScan::default();
+    // 子を全件確保せず遅延イテレータのスタックで辿る（確保は階層数に比例し、
+    // 1 ステップごとにしか増えないため `max_steps` で有界）。
+    let mut stack: Vec<Children<'_>> = vec![doc.children(start)];
     let mut normalized_chars = 0usize;
     let mut pending_space = false;
 
-    'walk: while let Some(current) = stack.pop() {
-        if remaining_steps == 0 {
+    macro_rules! fold {
+        ($chars:expr) => {
+            if fold_chars_into(
+                $chars,
+                out,
+                &mut normalized_chars,
+                &mut pending_space,
+                NORMALIZED_LABEL_TEXT_CHAR_LIMIT,
+            ) {
+                scan.cut = true;
+                break;
+            }
+        };
+    }
+
+    while let Some(top) = stack.last_mut() {
+        let Some(current) = top.next() else {
+            stack.pop();
+            continue;
+        };
+        if scan.steps_used >= opts.max_steps {
+            scan.cut = true;
             break;
         }
-        remaining_steps -= 1;
+        scan.steps_used += 1;
 
         if current == exclude {
             continue;
         }
 
         match doc.node_data(current) {
-            Some(NodeData::Text { contents }) => {
-                if fold_chars_into(
-                    contents.chars(),
-                    out,
-                    &mut normalized_chars,
-                    &mut pending_space,
-                    NORMALIZED_LABEL_TEXT_CHAR_LIMIT,
-                ) {
-                    break 'walk;
-                }
-            }
+            Some(NodeData::Text { contents }) => fold!(contents.chars()),
             Some(NodeData::Element { .. }) => {
                 if SKIPPED_SUBTREES
                     .iter()
@@ -555,31 +742,56 @@ fn collect_label_text(doc: &Document, label: NodeId, exclude: NodeId, out: &mut 
                 {
                     continue;
                 }
+                if !opts.include_hidden && is_hidden_element(doc, current) {
+                    continue;
+                }
+                // accname 2C: 再帰中の埋め込みコントロール（2E）では `aria-label` を無視して
+                // コントロールの値を優先するため、`aria-label` より先に判定する。
+                let embedded = embedded_control_text(
+                    doc,
+                    current,
+                    exclude,
+                    opts.max_steps.saturating_sub(scan.steps_used),
+                );
+                if let Some((text, inner)) = &embedded {
+                    scan.steps_used += inner.steps_used;
+                    scan.cut |= inner.cut;
+                    // 値が空で打ち切りも無いときは `aria-label` へ譲る（参照先側の
+                    // `scan_referent_own_text` と結果を一致させる）。打ち切りは
+                    // `scan.cut` へ伝播済みで、残り予算がある限り兄弟の走査は続ける。
+                    if has_non_whitespace(text) || inner.cut {
+                        fold!(text.chars());
+                        continue;
+                    }
+                }
+                if let Some(label) = doc.attribute(current, "aria-label")
+                    && has_non_whitespace(label)
+                {
+                    fold!(label.chars());
+                    continue;
+                }
+                if embedded.is_some() {
+                    // 値も `aria-label` も無い埋め込みコントロールは名前へ寄与しない
+                    // （内部の `option` 等の子孫テキストへは降りない）。
+                    continue;
+                }
                 if is_html_element_named(doc, current, "img") {
-                    // `img` はテキスト代替（`alt`）を子孫テキストの代わりに
-                    // 使う（上のドキュメンテーションコメント参照）。`img` は
-                    // 子要素を持たないため `stack` へは積まない。
-                    if let Some(alt) = doc.attribute(current, "alt")
-                        && fold_chars_into(
-                            alt.chars(),
-                            out,
-                            &mut normalized_chars,
-                            &mut pending_space,
-                            NORMALIZED_LABEL_TEXT_CHAR_LIMIT,
-                        )
-                    {
-                        break 'walk;
+                    // `img` は `alt` を子孫テキストの代わりに使う。子要素を
+                    // 持たないため `stack` へは積まない。
+                    if let Some(alt) = doc.attribute(current, "alt") {
+                        fold!(alt.chars());
                     }
                     continue;
                 }
-                stack.extend(doc.children(current).rev());
+                stack.push(doc.children(current));
             }
             _ => {}
         }
     }
+    scan
 }
 
-/// [`collect_label_text`] のテキスト折り畳み本体（`AISNAP-1`・PR #567
+/// [`collect_content_text`] のテキスト折り畳み本体（`AISNAP-1`・PR #567
 /// レビュー指摘の P1 修正）。テキストノードの内容・`img` の `alt` 属性値の
 /// 両方から同じ規則（HTML ASCII 空白の連続を 1 個へ畳む）で `out` へ
 /// 追記できるよう共有する。`normalized_chars`・`pending_space` は呼び出し元
@@ -655,7 +867,7 @@ pub struct NameIndex<'doc> {
     /// 対象要素を含まない参照先だけを登録する（部分木の走査を参照先ごとに
     /// 文書につき 1 回へ抑える。各値は [`NORMALIZED_LABEL_TEXT_CHAR_LIMIT`]
     /// 文字以内）。
-    referent_cache: RefCell<HashMap<NodeId, String>>,
+    referent_cache: RefCell<HashMap<NodeId, (String, bool)>>,
     /// 各ノードの入退場番号（DFS の enter/exit 時計。`(enter, exit)`）。
     /// 祖先判定を参照ごとの親リンク走査（最悪 O(深さ)）ではなく定数時間で
     /// 行うための索引（`aria-labelledby` を持つ深い入れ子要素が多い入力での
@@ -665,6 +877,9 @@ pub struct NameIndex<'doc> {
     uncached_scans_left: Cell<usize>,
     /// キャッシュ可能な参照先の初回走査の残り回数（[`MAX_CACHEABLE_REFERENT_SCANS`]）。
     first_scans_left: Cell<usize>,
+    /// 文書順で最初の HTML 名前空間の `<title>` 要素（文書ルートの名前用。
+    /// SVG の `<title>` は含めない）。構築時の単一走査で記録する。
+    first_title: Option<NodeId>,
 }
 
 impl<'doc> NameIndex<'doc> {
@@ -733,6 +948,7 @@ impl<'doc> NameIndex<'doc> {
         let mut remaining_steps = doc.node_count();
         let mut spans: HashMap<NodeId, (usize, usize)> = HashMap::new();
         let mut clock = 0usize;
+        let mut first_title: Option<NodeId> = None;
 
         while let Some(visit) = stack.pop() {
             match visit {
@@ -761,6 +977,18 @@ impl<'doc> NameIndex<'doc> {
                     {
                         // 文書順で先に見つかったものだけを残す（重複 id は先頭優先）。
                         ids_by_value.entry(id_value).or_insert(node);
+                    }
+
+                    // 文書タイトルは `head` 直下の `title` に限る（body 内の `title` や
+                    // 他要素配下の `title` は文書タイトルにしない。HTML Standard の
+                    // `document.title`。PR #574 レビュー指摘）。
+                    if first_title.is_none()
+                        && is_html_element_named(doc, node, "title")
+                        && doc
+                            .parent(node)
+                            .is_some_and(|parent| is_html_element_named(doc, parent, "head"))
+                    {
+                        first_title = Some(node);
                     }
 
                     if is_html_element_named(doc, node, "label") {
@@ -819,6 +1047,7 @@ impl<'doc> NameIndex<'doc> {
             referent_cache: RefCell::new(HashMap::new()),
             uncached_scans_left: Cell::new(MAX_UNCACHED_REFERENT_SCANS),
             first_scans_left: Cell::new(MAX_CACHEABLE_REFERENT_SCANS),
+            first_title,
         }
     }
 }
@@ -879,8 +1108,26 @@ fn label_name(doc: &Document, index: &NameIndex, target: NodeId) -> Option<Acces
         }
 
         let mut label_text = String::new();
-        collect_label_text(doc, label, target, &mut label_text);
+        let scan = collect_content_text(
+            doc,
+            label,
+            target,
+            ContentWalk {
+                max_steps: doc.node_count(),
+                include_hidden: false,
+            },
+            &mut label_text,
+        );
+        // 文字数上限での打ち切りを伝える（黙って捨てない）。
+        labels_truncated |= scan.cut;
         if !has_non_whitespace(&label_text) {
+            if scan.cut {
+                // 走査が打ち切られて文字を得られなかった label は、打ち切り
+                // 位置より後ろに本文があるかもしれず「名前なし」と確定できない
+                // （PR #574 レビュー指摘）。寄与する label が最後まで 0 件なら
+                // 次点へフォールバックさせない。
+                scan_cut_before_match = true;
+            }
             // 名前に寄与しない label は MAX_LABELS の対象に数えない。
             continue;
         }
@@ -918,6 +1165,71 @@ fn label_name(doc: &Document, index: &NameIndex, target: NodeId) -> Option<Acces
     Some(result)
 }
 
+/// ARIA 1.2 で「Name from: contents」を許す role かどうかを返す
+/// （`AISNAP-1`・TASK-11.4.3）。
+///
+/// role 判定は [`super::role::compute_role`] に一本化し、タグ名の独自リストは
+/// 持たない（二重管理を避ける）。`option`・`summary`・`menuitem` 等は role.rs
+/// 側が暗黙 role を未対応で `generic` を返すため、現状は content 命名されない
+/// （role.rs 側の未対応。本ファイルでは回避しない。REPAIR-3）。
+fn allows_name_from_content(doc: &Document, id: NodeId) -> bool {
+    const CONTENT_ROLES: [&str; 18] = [
+        "button",
+        "cell",
+        "checkbox",
+        "columnheader",
+        "gridcell",
+        "heading",
+        "link",
+        "menuitem",
+        "menuitemcheckbox",
+        "menuitemradio",
+        "option",
+        "radio",
+        "row",
+        "rowheader",
+        "switch",
+        "tab",
+        "tooltip",
+        "treeitem",
+    ];
+    super::role::compute_role(doc, id).is_some_and(|role| CONTENT_ROLES.contains(&role.as_str()))
+}
+
+/// 対象要素自身の子孫テキストから accessible name を算出する（name from
+/// content。accname 1.2 の 2F。`AISNAP-1`・TASK-11.4.3）。
+///
+/// 走査は 1 回あたり [`MAX_CONTENT_STEPS`] で頭打ちにする（要素ごとに固定で、
+/// 呼び出し順に依存しない）。戻り値の契約は
+/// [`label_name`] と同じ:
+/// - テキストあり: `Some`（`source: Content`。打ち切りがあれば `truncated`）
+/// - テキストなし・打ち切りなし: `None`（次点の `title` へフォールバックしてよい）
+/// - テキストなし・打ち切りあり: `Some` の空の名前（`truncated: true`。走査しきれて
+///   いない以上「名前なし」と確定できないため `title` へフォールバックさせない）
+fn content_name(doc: &Document, id: NodeId) -> Option<AccessibleName> {
+    let mut text = String::new();
+    let scan = collect_content_text(
+        doc,
+        id,
+        id,
+        ContentWalk {
+            max_steps: MAX_CONTENT_STEPS,
+            include_hidden: false,
+        },
+        &mut text,
+    );
+
+    let mut buf = NameBuffer::new();
+    buf.push_str(&text);
+    let truncated = scan.cut || buf.truncated;
+    if buf.text.is_empty() {
+        return truncated.then(|| AccessibleName::default().with_truncated(true));
+    }
+    let mut result = buf.finish(NameSource::Content);
+    result.truncated = truncated;
+    Some(result)
+}
+
 /// `aria-label` 属性から accessible name を算出する（accname 1.2 step 2C。
 /// `AISNAP-1`・TASK-11.4.1）。
 ///
@@ -933,7 +1245,7 @@ fn aria_label_name(doc: &Document, id: NodeId) -> Option<AccessibleName> {
 ///
 /// 優先順: 参照先自身の `aria-label`（空白以外を含む場合。accname 2C）→
 /// 参照先が `img` の場合その `alt`（参照先自身は子孫走査の対象外で `alt` が
-/// 失われるための補完）→ 子孫テキスト（[`collect_label_text`]）。参照先自身の
+/// 失われるための補完）→ 子孫テキスト（[`collect_content_text`]）。参照先自身の
 /// `aria-labelledby` は辿らない（連鎖・循環を構造的に避ける）。`target`
 /// （名前を算出している要素）の部分木は子孫走査から除外する（参照先が
 /// 対象を含む場合に対象の値・内容を取り込まないため）。
@@ -952,7 +1264,7 @@ fn referent_text(
     index: &NameIndex,
     referent: NodeId,
     target: NodeId,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     let contains_target = index.is_ancestor_or_self(referent, target);
 
     // 対象を含まない参照先だけがキャッシュを共有できる。対象を含む参照先は
@@ -963,49 +1275,95 @@ fn referent_text(
     }
 
     let mut out = String::new();
-    // 参照先自身の `aria-label` / `img` の `alt` は部分木を走査せず対象にも
-    // 依存しないため、走査予算を消費しない。
-    if !scan_referent_own_text(doc, referent, &mut out) {
-        // 対象を含む参照先（キャッシュ不能）と含まない参照先（初回走査）で
-        // 別々の文書全体予算を消費する。使い切ったら `None`（寄与なし+truncated）。
-        let budget = if contains_target {
-            &index.uncached_scans_left
-        } else {
-            &index.first_scans_left
-        };
+    // 対象を含む参照先（キャッシュ不能）と含まない参照先（初回走査）で
+    // 別々の文書全体予算を消費する。使い切ったら `None`（寄与なし+truncated）。
+    let budget = if contains_target {
+        &index.uncached_scans_left
+    } else {
+        &index.first_scans_left
+    };
+    let consume_budget = || {
         let left = budget.get();
         if left == 0 {
-            return None;
+            return false;
         }
         budget.set(left - 1);
-        collect_label_text(doc, referent, target, &mut out);
+        true
+    };
+    // 参照先自身の `aria-label` / `img` の `alt` / テキスト系 `input` の値は
+    // 部分木を走査せず対象にも依存しないため、走査予算を消費しない。
+    // 一方 `select` の option 探索は部分木を辿るため、1 回ごとに予算を消費し
+    // （多数の `select` × 大量の `option` で総走査量が二乗になるのを防ぐ）、
+    // 1 回あたりの走査も `MAX_CONTENT_STEPS` で頭打ちにする。
+    if is_html_element_named(doc, referent, "select") && !consume_budget() {
+        return None;
     }
+    let cut = if let Some(own_cut) = scan_referent_own_text(doc, referent, &mut out) {
+        // 参照先自身の値を読む経路（select の選択 option 探索など）が予算で
+        // 打ち切られた場合も、不完全な値を確定値として返さないよう伝播する。
+        own_cut
+    } else {
+        if !consume_budget() {
+            return None;
+        }
+        // accname 2A: 直接参照された hidden な参照先は、その hidden な子孫も
+        // 含めて寄与する（参照先の内側だけ `include_hidden`）。
+        let scan = collect_content_text(
+            doc,
+            referent,
+            target,
+            ContentWalk {
+                max_steps: doc.node_count(),
+                include_hidden: is_hidden_element(doc, referent),
+            },
+            &mut out,
+        );
+        scan.cut
+    };
     if !contains_target {
         index
             .referent_cache
             .borrow_mut()
-            .insert(referent, out.clone());
+            .insert(referent, (out.clone(), cut));
     }
-    Some(out)
+    Some((out, cut))
 }
 
 /// [`referent_text`] の補助。参照先自身の属性（`aria-label`、`img` の `alt`）から
-/// 名前の断片を `out` へ取り込めたら `true`（部分木の走査は不要）。
-/// 対象要素に依存しないため走査予算の対象外。
-fn scan_referent_own_text(doc: &Document, referent: NodeId, out: &mut String) -> bool {
+/// 名前の断片を `out` へ取り込めたら `Some(cut)`（部分木の走査は不要）。
+/// `cut` は参照先自身の値の読み取りが走査上限で打ち切られたか
+/// （`select` の option 探索）。取り込めなければ `None`。
+/// 対象要素に依存しないためキャッシュ対象。走査予算は呼び出し元（[`referent_text`]）が
+/// `select` に限り消費し、1 回あたりの走査は [`MAX_CONTENT_STEPS`] で上限する。
+fn scan_referent_own_text(doc: &Document, referent: NodeId, out: &mut String) -> Option<bool> {
+    // 参照先自身が埋め込みコントロール（accname 2E）なら、値を `aria-label` より
+    // 優先する（子孫走査側の 2E と結果を一致させる。PR #574 レビュー指摘）。
+    // 値が空で打ち切りも無い場合だけ `aria-label` / `alt` へ譲る。
+    // 参照先の label・title は未実装（担当 Issue 未確定）。
+    let embedded = embedded_control_text(doc, referent, referent, MAX_CONTENT_STEPS);
+    if let Some((text, scan)) = &embedded
+        && (has_non_whitespace(text) || scan.cut)
+    {
+        fold_attr_bounded(text, out);
+        return Some(scan.cut);
+    }
     if let Some(label) = doc.attribute(referent, "aria-label")
         && has_non_whitespace(label)
     {
         fold_attr_bounded(label, out);
-        return true;
+        return Some(false);
     }
     if is_html_element_named(doc, referent, "img")
         && let Some(alt) = doc.attribute(referent, "alt")
     {
         fold_attr_bounded(alt, out);
-        return true;
+        return Some(false);
     }
-    false
+    if let Some((text, scan)) = embedded {
+        fold_attr_bounded(&text, out);
+        return Some(scan.cut);
+    }
+    None
 }
 
 /// 属性値 `value` を空白折り畳みしながら、折り畳み後
@@ -1060,7 +1418,7 @@ fn aria_labelledby_name(
         let Some(&referent) = index.ids.get(token) else {
             continue;
         };
-        let Some(text) = referent_text(doc, index, referent, target) else {
+        let Some((text, cut)) = referent_text(doc, index, referent, target) else {
             // 走査予算を使い切った参照先は内容を確定できないため、寄与なしと
             // して扱い切り詰めを伝える（`MAX_UNCACHED_REFERENT_SCANS`）。
             truncated = true;
@@ -1069,7 +1427,14 @@ fn aria_labelledby_name(
             }
             continue;
         };
+        truncated |= cut;
         if !has_non_whitespace(&text) {
+            if cut {
+                // 参照先の走査が打ち切られて文字を得られなかった場合は名前が
+                // 未確定のため、寄与が 0 件のまま終われば次の命名規則へ
+                // フォールバックさせない（PR #574 レビュー指摘）。
+                scan_cut_before_match = true;
+            }
             continue;
         }
         if matched >= MAX_IDREFS {
@@ -1179,9 +1544,9 @@ fn native_name(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName 
             .unwrap_or_default();
     }
     if is_html_element_named(doc, id, "button") {
-        // ネイティブ <button> 要素自身の子孫テキストへのフォールバックは
-        // TASK-11.4.3（#546）のスコープ（実装済みを装わない。REPAIR-3）。
+        // HTML-AAM の button 節: label → 子孫テキスト → title。
         return label_name(doc, index, id)
+            .or_else(|| content_name(doc, id))
             .or_else(|| title_name(doc, id))
             .unwrap_or_default();
     }
@@ -1194,6 +1559,13 @@ fn native_name(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName 
             .or_else(|| title_name(doc, id))
             .unwrap_or_default();
     }
+    // name from content を許す role（link・heading・cell 等）は子孫テキスト →
+    // title、それ以外は title のみ（accname 2F → 2I）。
+    if allows_name_from_content(doc, id) {
+        return content_name(doc, id)
+            .or_else(|| title_name(doc, id))
+            .unwrap_or_default();
+    }
     title_name(doc, id).unwrap_or_default()
 }
 
@@ -1203,10 +1575,10 @@ fn native_name(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName 
 /// # スタブについて
 ///
 /// 実装しているのは ARIA 属性（`aria-labelledby`・`aria-label`。
-/// TASK-11.4.1）と HTML ネイティブのラベル付け（TASK-11.4.2）である
-/// （実装済みを装わない。REPAIR-3）。本ファイル冒頭の
-/// ドキュメンテーションコメントに、後続タスクが担う出所（子孫テキストの
-/// 再帰的算出・文書ルートの `<title>` 等）を列挙してある。
+/// TASK-11.4.1）・HTML ネイティブのラベル付け（TASK-11.4.2）・子孫テキスト
+/// と文書ルートの `<title>`（TASK-11.4.3）である。本ファイル冒頭の
+/// ドキュメンテーションコメントに、未実装の項目を列挙してある
+/// （実装済みを装わない。REPAIR-3）。
 ///
 /// 要素以外（テキストノード等）・範囲外の `id` では `AccessibleName::default()`
 /// を返す（`Result` にはしない。`core::dom` のアクセサ群・
@@ -1230,6 +1602,31 @@ pub fn compute_name(doc: &Document, id: NodeId) -> AccessibleName {
     compute_name_with_index(doc, &index, id)
 }
 
+/// 文書ルートの名前（最初の HTML `<title>` の子テキスト。`AISNAP-1`・
+/// TASK-11.4.3）。`<title>` が無ければ既定値。
+fn document_title_name(doc: &Document, index: &NameIndex) -> AccessibleName {
+    let Some(title) = index.first_title else {
+        return AccessibleName::default();
+    };
+    let mut text = String::new();
+    let scan = collect_content_text(
+        doc,
+        title,
+        title,
+        ContentWalk {
+            max_steps: doc.node_count(),
+            include_hidden: true,
+        },
+        &mut text,
+    );
+    let mut buf = NameBuffer::new();
+    buf.push_str(&text);
+    let truncated = scan.cut || buf.truncated;
+    let mut result = buf.finish(NameSource::DocumentTitle);
+    result.truncated = truncated && !result.text.is_empty();
+    result
+}
+
 /// [`compute_name`] の索引再利用版（`AISNAP-1`・PR #567 レビュー指摘の
 /// P1 修正）。
 ///
@@ -1246,6 +1643,11 @@ pub fn compute_name(doc: &Document, id: NodeId) -> AccessibleName {
 pub fn compute_name_with_index(doc: &Document, index: &NameIndex, id: NodeId) -> AccessibleName {
     if !std::ptr::eq(doc, index.doc) {
         return AccessibleName::default();
+    }
+    // 文書ルートは最初の HTML `<title>` の子テキストで命名する（AISNAP-1・
+    // TASK-11.4.3）。要素判定より前に置かないとルートに届かない。
+    if id == doc.root() {
+        return document_title_name(doc, index);
     }
     if !doc.is_element(id) {
         return AccessibleName::default();
@@ -2186,7 +2588,7 @@ mod tests {
 
     /// PR #567 レビュー指摘の P1 修正: `MAX_LABELS`（名前に寄与した label
     /// の数）には大量の空・空白だけの label を並べても達しないが、
-    /// [`MAX_LABELS_SCANNED`] により走査自体（`collect_label_text` の呼び
+    /// [`MAX_LABELS_SCANNED`] により走査自体（`collect_content_text` の呼び
     /// 出し回数）は定数で打ち切られる。走査上限より後ろに置いた名前入り
     /// label には到達できず、`truncated` が立つ（外部入力の label 数に
     /// 比例して処理量が無制限に増え続けないことの確認）。
@@ -2575,6 +2977,23 @@ mod tests {
         assert_eq!(result, named("", NameSource::None, true));
     }
 
+    /// AISNAP-1（TASK-11.4.3・#546）: `aria-labelledby` の参照先が `select` で、選択 option の探索が走査上限で打ち切られたとき、最初の option を採用しつつ `truncated: true` を伝える（キャッシュ経由でも落とさない）。
+    #[test]
+    fn aisnap_1_aria_labelledby_select_referent_scan_cut_propagates_truncated() {
+        let filler = "<option></option>".repeat(600);
+        let html = format!(
+            r#"<select id="s"><option>先頭</option>{filler}<option selected>選択</option></select><p id="t1" aria-labelledby="s">a</p><p id="t2" aria-labelledby="s">b</p>"#
+        );
+        assert_eq!(
+            name(&html, "p#t1"),
+            named("先頭", NameSource::AriaLabelledBy, true)
+        );
+        assert_eq!(
+            name(&html, "p#t2"),
+            named("先頭", NameSource::AriaLabelledBy, true)
+        );
+    }
+
     /// AISNAP-1（TASK-11.4.1・#544）: 走査上限未満の欠落トークンが先行するだけなら後ろの実在参照から名前を得る。
     #[test]
     fn aisnap_1_aria_labelledby_few_missing_tokens_ok() {
@@ -2666,6 +3085,39 @@ mod tests {
         );
     }
 
+    /// AISNAP-1（TASK-11.4.3・#546）: `select` の参照先の option 探索も初回走査予算（`MAX_CACHEABLE_REFERENT_SCANS`）を消費する。超過後は空の名前 + `truncated: true`。
+    #[test]
+    fn aisnap_1_aria_labelledby_select_referent_consumes_first_scan_budget() {
+        let n = MAX_CACHEABLE_REFERENT_SCANS + 5;
+        let mut html = String::new();
+        for i in 0..n {
+            html.push_str(&format!(
+                r#"<select id="s{i}"><option>値{i}</option></select><p id="t{i}" aria-labelledby="s{i}">x</p>"#
+            ));
+        }
+        let parsed = parse_document(&html, &ParseOptions::default()).expect("成功する");
+        let doc = parsed.document;
+        let targets = fandhe_browser_core::query::query_selector_all_str(&doc, doc.root(), "p")
+            .expect("セレクタは解釈できる");
+        let index = NameIndex::build(&doc);
+        let names: Vec<AccessibleName> = targets
+            .iter()
+            .map(|&id| compute_name_with_index(&doc, &index, id))
+            .collect();
+        assert_eq!(
+            names.get(MAX_CACHEABLE_REFERENT_SCANS - 1),
+            Some(&named(
+                &format!("値{}", MAX_CACHEABLE_REFERENT_SCANS - 1),
+                NameSource::AriaLabelledBy,
+                false
+            ))
+        );
+        assert_eq!(
+            names.get(MAX_CACHEABLE_REFERENT_SCANS),
+            Some(&named("", NameSource::None, true))
+        );
+    }
+
     /// AISNAP-1（TASK-11.4.1・#544）: 互いに異なる id の参照先（キャッシュ可能）の初回走査も文書全体で `MAX_CACHEABLE_REFERENT_SCANS` 回まで。超過後は空の名前 + `truncated: true`、キャッシュ済みの参照先は引き続き解決できる。
     #[test]
     fn aisnap_1_aria_labelledby_first_scan_budget() {
@@ -2753,6 +3205,468 @@ mod tests {
             assert_eq!(
                 compute_name_with_index(&doc, &index, id),
                 named("共有", NameSource::AriaLabelledBy, false)
+            );
+        }
+    }
+
+    // --- TASK-11.4.3（#546）: 子孫テキスト・文書ルート・優先順位の統合 ---
+
+    use super::{MAX_CONTENT_STEPS, NORMALIZED_LABEL_TEXT_CHAR_LIMIT};
+
+    /// AISNAP-1（TASK-11.4.3・#546）: 子孫テキストだけで決まる要素。
+    #[test]
+    fn aisnap_1_content_button_link_heading_role() {
+        assert_eq!(
+            name("<button>送信</button>", "button"),
+            named("送信", NameSource::Content, false)
+        );
+        assert_eq!(
+            name(r##"<a href="#">詳細</a>"##, "a"),
+            named("詳細", NameSource::Content, false)
+        );
+        assert_eq!(
+            name("<h1>  見出し\n テキスト </h1>", "h1"),
+            named("見出し テキスト", NameSource::Content, false)
+        );
+        assert_eq!(
+            name(r#"<div role="button">押す</div>"#, "div"),
+            named("押す", NameSource::Content, false)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: 表のセルは content role。href の無い
+    /// `a`（generic）は content を使わず title のみ。
+    #[test]
+    fn aisnap_1_content_table_cells_and_non_content_elements() {
+        let html = "<table><tr><th>見出しセル</th><td>データ</td></tr></table>";
+        assert_eq!(
+            name(html, "th"),
+            named("見出しセル", NameSource::Content, false)
+        );
+        assert_eq!(
+            name(html, "td"),
+            named("データ", NameSource::Content, false)
+        );
+        assert_eq!(
+            name(r#"<a title="T">本文</a>"#, "a"),
+            named("T", NameSource::Title, false)
+        );
+        assert_eq!(
+            name(r#"<div title="補足">text</div>"#, "div"),
+            named("補足", NameSource::Title, false)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: 入れ子の要素・画像 alt の連結。
+    #[test]
+    fn aisnap_1_content_nested_and_img_alt() {
+        assert_eq!(
+            name(r##"<a href="#"><img alt="ロゴ"> ホーム</a>"##, "a"),
+            named("ロゴ ホーム", NameSource::Content, false)
+        );
+        assert_eq!(
+            name("<button><span>保</span><b>存</b></button>", "button"),
+            named("保存", NameSource::Content, false)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: accname 2A。hidden / aria-hidden の
+    /// 子孫は除外する（aria-hidden は trim・大文字小文字無視）。script/style も除外。
+    #[test]
+    fn aisnap_1_content_excludes_hidden_and_script() {
+        assert_eq!(
+            name(
+                r#"<button>送信<span hidden>隠し</span><span aria-hidden=" TRUE ">x</span><script>s()</script><style>b{}</style></button>"#,
+                "button"
+            ),
+            named("送信", NameSource::Content, false)
+        );
+        assert_eq!(
+            name(
+                r#"<button>送信<span aria-hidden="false">見える</span></button>"#,
+                "button"
+            ),
+            named("送信見える", NameSource::Content, false)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: accname 2C の再帰適用。子孫の
+    /// `aria-label` を採用し、その部分木へは降りない。
+    #[test]
+    fn aisnap_1_content_descendant_aria_label() {
+        assert_eq!(
+            name(
+                r##"<a href="#"><span aria-label="ホーム">🏠<b>無視</b></span></a>"##,
+                "a"
+            ),
+            named("ホーム", NameSource::Content, false)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: 再帰中の埋め込みコントロールでは
+    /// `aria-label` より値（accname 2E）を優先する。
+    #[test]
+    fn aisnap_1_content_embedded_control_value_beats_aria_label() {
+        assert_eq!(
+            name(
+                r#"<button>数量 <input aria-label="数量" value="5"></button>"#,
+                "button"
+            ),
+            named("数量 5", NameSource::Content, false)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: 値が空の埋め込みコントロールは
+    /// `aria-label` へ譲り、`textarea` は現在値（子テキスト）を使う。
+    #[test]
+    fn aisnap_1_content_empty_control_falls_back_and_textarea_value() {
+        assert_eq!(
+            name(r#"<button><input aria-label="数量"></button>"#, "button"),
+            named("数量", NameSource::Content, false)
+        );
+        assert_eq!(
+            name(
+                r#"<button>メモ <textarea aria-label="欄">本文</textarea></button>"#,
+                "button"
+            ),
+            named("メモ 本文", NameSource::Content, false)
+        );
+        assert_eq!(
+            name(
+                r#"<button>メモ <textarea aria-label="欄"></textarea></button>"#,
+                "button"
+            ),
+            named("メモ 欄", NameSource::Content, false)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: accname 2E。埋め込みコントロールの値。
+    /// password の value は取り込まない（平文の漏えい防止）。
+    #[test]
+    fn aisnap_1_content_embedded_controls() {
+        assert_eq!(
+            name(
+                "<button>数量 <select><option>1</option><option selected>2</option></select></button>",
+                "button"
+            ),
+            named("数量 2", NameSource::Content, false)
+        );
+        assert_eq!(
+            name(
+                "<button>数量 <select><option>1</option><option>2</option></select></button>",
+                "button"
+            ),
+            named("数量 1", NameSource::Content, false)
+        );
+        assert_eq!(
+            name(r#"<button>名前 <input value="太郎"></button>"#, "button"),
+            named("名前 太郎", NameSource::Content, false)
+        );
+        assert_eq!(
+            name(
+                r#"<button>鍵 <input type="password" value="secret123"></button>"#,
+                "button"
+            ),
+            named("鍵", NameSource::Content, false)
+        );
+        assert_eq!(
+            name(
+                r#"<input id="v" value="参照値"><button aria-labelledby="v">x</button>"#,
+                "button"
+            ),
+            named("参照値", NameSource::AriaLabelledBy, false)
+        );
+        // 参照先でも値を aria-label より優先する（子孫走査と一致）。
+        assert_eq!(
+            name(
+                r#"<input id="v" value="5" aria-label="数量"><button aria-labelledby="v">x</button>"#,
+                "button"
+            ),
+            named("5", NameSource::AriaLabelledBy, false)
+        );
+        // 値が空なら参照先の aria-label へ譲る。
+        assert_eq!(
+            name(
+                r#"<input id="v" aria-label="数量"><button aria-labelledby="v">x</button>"#,
+                "button"
+            ),
+            named("数量", NameSource::AriaLabelledBy, false)
+        );
+        assert_eq!(
+            name(
+                r#"<input id="v" type="password" value="secret123"><button aria-labelledby="v" title="T">x</button>"#,
+                "button"
+            ),
+            named("x", NameSource::Content, false)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: 文字数上限の境界。ちょうど上限は
+    /// truncated でなく、1 文字超過で 120 文字・truncated。上限の境界が
+    /// 要素の境目に来ても正しい。
+    #[test]
+    fn aisnap_1_content_char_limit_boundary() {
+        let exact = "あ".repeat(MAX_NAME_CHARS);
+        let r = name(&format!("<button>{exact}</button>"), "button");
+        assert_eq!(r, named(&exact, NameSource::Content, false));
+
+        let over = "あ".repeat(MAX_NAME_CHARS + 1);
+        let r = name(&format!("<button>{over}</button>"), "button");
+        assert_eq!(r, named(&exact, NameSource::Content, true));
+
+        let half = "い".repeat(MAX_NAME_CHARS / 2);
+        let r = name(
+            &format!("<button><span>{half}</span><span>{half}</span><span>末</span></button>"),
+            "button",
+        );
+        assert_eq!(
+            r,
+            named(&"い".repeat(MAX_NAME_CHARS), NameSource::Content, true)
+        );
+        let r = name(
+            &format!("<button><span>{half}</span><span>{half}</span></button>"),
+            "button",
+        );
+        assert_eq!(r.text.chars().count(), MAX_NAME_CHARS);
+        assert!(!r.truncated);
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: ステップ上限。テキストに届く前に
+    /// 打ち切ったら title へフォールバックせず truncated の空の名前。
+    #[test]
+    fn aisnap_1_content_step_limit_does_not_fall_back_to_title() {
+        let spans = "<span></span>".repeat(MAX_CONTENT_STEPS + 10);
+        let r = name(
+            &format!(r#"<button title="T">{spans}後ろ</button>"#),
+            "button",
+        );
+        assert_eq!(r, named("", NameSource::None, true));
+
+        let r = name(
+            &format!(r#"<button title="T">先{spans}後ろ</button>"#),
+            "button",
+        );
+        assert_eq!(r, named("先", NameSource::Content, true));
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546・PR #574 レビュー指摘）: 未選択の `select` で
+    /// 後続の `option` が大量にあっても、最初の `option` のテキストは予算を
+    /// 残して収集され、名前が空にならない（truncated は立つ）。
+    #[test]
+    fn aisnap_1_content_select_default_option_survives_many_options() {
+        let options = "<option>x</option>".repeat(MAX_CONTENT_STEPS + 10);
+        let html = format!("<button>数量 <select><option>初期</option>{options}</select></button>");
+        assert_eq!(
+            name(&html, "button"),
+            named("数量 初期", NameSource::Content, true)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: 文書全体の予算。content role の深い
+    /// 入れ子を共有索引で全要素算出しても有限時間で終わり、予算超過分は
+    /// truncated になる。
+    #[test]
+    fn aisnap_1_content_document_budget_bounds_total_work() {
+        const DEPTH: usize = 3_000;
+        let mut html = String::new();
+        for _ in 0..DEPTH {
+            html.push_str(r#"<div role="button">"#);
+        }
+        html.push('x');
+        for _ in 0..DEPTH {
+            html.push_str("</div>");
+        }
+        let options = ParseOptions::default().with_max_nodes(usize::MAX);
+        let parsed = parse_document(&html, &options).expect("成功する");
+        let doc = parsed.document;
+        let targets = fandhe_browser_core::query::query_selector_all_str(&doc, doc.root(), "div")
+            .expect("セレクタは解釈できる");
+        let index = NameIndex::build(&doc);
+        let start = std::time::Instant::now();
+        let results: Vec<AccessibleName> = targets
+            .iter()
+            .map(|&id| compute_name_with_index(&doc, &index, id))
+            .collect();
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        // 最も外側はステップ上限で本文に届かず、truncated の空の名前。
+        let first = results.first().expect("要素がある");
+        assert_eq!(first, &named("", NameSource::None, true));
+        // 最も内側は本文に届く（先に算出した要素に予算を奪われない）。
+        let last = results.last().expect("要素がある");
+        assert_eq!(last, &named("x", NameSource::Content, false));
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546・PR #574 レビュー指摘）: 共有索引での
+    /// 名前は算出順に依存せず、単発の `compute_name` と一致する。
+    #[test]
+    fn aisnap_1_content_result_is_independent_of_call_order() {
+        let mut html = String::new();
+        for _ in 0..600 {
+            html.push_str(r#"<div role="button">"#);
+        }
+        html.push_str("短い");
+        for _ in 0..600 {
+            html.push_str("</div>");
+        }
+        html.push_str(r#"<button title="T">押す</button>"#);
+        let parsed = parse_document(&html, &ParseOptions::default()).expect("成功する");
+        let doc = parsed.document;
+        let ids =
+            fandhe_browser_core::query::query_selector_all_str(&doc, doc.root(), "div, button")
+                .expect("セレクタは解釈できる");
+        let expected: Vec<AccessibleName> = ids.iter().map(|&id| compute_name(&doc, id)).collect();
+        let index = NameIndex::build(&doc);
+        let mut reversed: Vec<AccessibleName> = ids
+            .iter()
+            .rev()
+            .map(|&id| compute_name_with_index(&doc, &index, id))
+            .collect();
+        reversed.reverse();
+        assert_eq!(reversed, expected);
+        assert_eq!(
+            expected.last().expect("要素がある"),
+            &named("押す", NameSource::Content, false)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: label 経由の子孫走査が文字数上限で
+    /// 打ち切られたら truncated が伝わる。
+    #[test]
+    fn aisnap_1_label_cut_propagates_truncated() {
+        let long = "あ".repeat(NORMALIZED_LABEL_TEXT_CHAR_LIMIT + 50);
+        let r = name(
+            &format!(r#"<label for="x">{long}</label><input id="x">"#),
+            "input",
+        );
+        assert_eq!(r.text.chars().count(), MAX_NAME_CHARS);
+        assert_eq!(r.source, NameSource::Label);
+        assert!(r.truncated);
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: accname 2A。参照先自身が hidden なら
+    /// その hidden な子孫も含める。参照先が hidden でなければ hidden な子孫は除外。
+    #[test]
+    fn aisnap_1_labelledby_hidden_referent() {
+        assert_eq!(
+            name(
+                r#"<span id="h" hidden>隠し<span hidden>内側</span></span><button aria-labelledby="h">x</button>"#,
+                "button"
+            ),
+            named("隠し内側", NameSource::AriaLabelledBy, false)
+        );
+        assert_eq!(
+            name(
+                r#"<span id="h">見え<span hidden>内側</span></span><button aria-labelledby="h">x</button>"#,
+                "button"
+            ),
+            named("見え", NameSource::AriaLabelledBy, false)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: ARIA → label → 子孫テキスト → title の
+    /// 優先順位の統合。
+    #[test]
+    fn aisnap_1_precedence_aria_native_content_title() {
+        assert_eq!(
+            name(
+                r#"<span id="l">参照</span><button aria-labelledby="l" aria-label="A" title="T">本文</button>"#,
+                "button"
+            ),
+            named("参照", NameSource::AriaLabelledBy, false)
+        );
+        assert_eq!(
+            name(
+                r#"<button aria-label="A" title="T">本文</button>"#,
+                "button"
+            ),
+            named("A", NameSource::AriaLabel, false)
+        );
+        assert_eq!(
+            name(
+                r#"<label for="b">L</label><button id="b" title="T">本文</button>"#,
+                "button"
+            ),
+            named("L", NameSource::Label, false)
+        );
+        assert_eq!(
+            name(r#"<button title="T">本文</button>"#, "button"),
+            named("本文", NameSource::Content, false)
+        );
+        assert_eq!(
+            name(r#"<button title="T"></button>"#, "button"),
+            named("T", NameSource::Title, false)
+        );
+        assert_eq!(
+            name(r#"<h1 title="T">見出し</h1>"#, "h1"),
+            named("見出し", NameSource::Content, false)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: 文書ルートは最初の HTML `<title>` で
+    /// 命名する。SVG の `<title>` は対象外。
+    #[test]
+    fn aisnap_1_document_root_title() {
+        let parse = |html: &str| {
+            parse_document(html, &ParseOptions::default())
+                .expect("成功する")
+                .document
+        };
+        let doc = parse("<html><head><title>  Example\n Domain </title></head></html>");
+        assert_eq!(
+            compute_name(&doc, doc.root()),
+            named("Example Domain", NameSource::DocumentTitle, false)
+        );
+        let doc = parse("<html><head></head><body>x</body></html>");
+        assert_eq!(compute_name(&doc, doc.root()), AccessibleName::default());
+        let doc = parse("<body><svg><title>図</title></svg></body>");
+        assert_eq!(compute_name(&doc, doc.root()), AccessibleName::default());
+        let doc = parse("<head><title>先</title></head><body><svg><title>図</title></svg></body>");
+        assert_eq!(
+            compute_name(&doc, doc.root()),
+            named("先", NameSource::DocumentTitle, false)
+        );
+        // body 内の HTML `<title>` は文書タイトルにしない（head 直下に限る）。
+        let doc = parse("<html><head></head><body><p><title>本文</title></p></body></html>");
+        assert_eq!(compute_name(&doc, doc.root()), AccessibleName::default());
+        let doc = parse(
+            "<html><head><title>先頭</title></head><body><div><title>後</title></div></body></html>",
+        );
+        assert_eq!(
+            compute_name(&doc, doc.root()),
+            named("先頭", NameSource::DocumentTitle, false)
+        );
+        let long = "題".repeat(MAX_NAME_CHARS + 5);
+        let doc = parse(&format!("<head><title>{long}</title></head>"));
+        let r = compute_name(&doc, doc.root());
+        assert_eq!(r.text.chars().count(), MAX_NAME_CHARS);
+        assert!(r.truncated);
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: 共有索引版と単発版の結果が一致する。
+    #[test]
+    fn aisnap_1_content_index_matches_single_shot() {
+        let html = r##"<html><head><title>T</title></head><body>
+            <button>送信</button><a href="#">詳細</a><h1 title="x">見出し</h1>
+            <table><tr><th>H</th><td>D</td></tr></table>
+            <button>数量 <select><option selected>2</option></select></button>
+        </body></html>"##;
+        let parsed = parse_document(html, &ParseOptions::default()).expect("成功する");
+        let doc = parsed.document;
+        let index = NameIndex::build(&doc);
+        let mut all = Vec::new();
+        for tag in [
+            "html", "head", "title", "body", "button", "a", "h1", "th", "td", "select",
+        ] {
+            all.extend(
+                fandhe_browser_core::query::query_selector_all_str(&doc, doc.root(), tag)
+                    .expect("セレクタは解釈できる"),
+            );
+        }
+        assert!(!all.is_empty());
+        for id in all.into_iter().chain([doc.root()]) {
+            assert_eq!(
+                compute_name_with_index(&doc, &index, id),
+                compute_name(&doc, id)
             );
         }
     }

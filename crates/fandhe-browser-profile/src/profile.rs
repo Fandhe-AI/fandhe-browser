@@ -14,7 +14,6 @@
 //! code-comment-style.md）。
 //!
 //! - プロファイル削除処理（`PROF-5`、TASK-53）
-//! - 並行アクセス時のデータ分離（`PROF-2`・`PROF-3`、TASK-51・TASK-52）
 //! - Windows での ACL によるアクセス制限（`XOS-7`〜`XOS-10`）。実装がないため
 //!   `Profile::open` は Windows では常に `Err(ProfileError::Unsupported)` を
 //!   返し、既定 ACL のまま機密データを書き込む偽装成功を避ける（security.md
@@ -22,6 +21,10 @@
 //!   Windows へは移植しておらず、XOS-7〜XOS-10 実装時にパス文字列でなく
 //!   ハンドル相対（`FILE_FLAG_OPEN_REPARSE_POINT` 等）で作成する要件を
 //!   引き継ぐ（REPAIR-3）
+//!
+//! 並行アクセス時のデータ分離はデータディレクトリ分離（`PROF-6`）自体で成立し、
+//! `PROF-2`（`tests/isolation.rs`）・`PROF-3`（`tests/concurrent_isolation.rs`。
+//! TASK-51・TASK-52）が Unix 上で確認する。
 //!
 //! `Profile::open` はルート直下の `profile.lock` に advisory lock を取ることで
 //! 同一プロファイルへの二重 open を拒否する（`PROF-1`、TASK-50（50.3）・#178。

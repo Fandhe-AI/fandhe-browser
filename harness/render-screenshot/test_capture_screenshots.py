@@ -864,6 +864,21 @@ class WriteBytesNoFollowTest(unittest.TestCase):
                 cs._write_bytes_nofollow(link, b"overwrite attempt")
             self.assertEqual(outside_target.read_text(encoding="utf-8"), "keep me")
 
+    def test_does_not_modify_hardlinked_file(self) -> None:
+        # ハードリンク先（別名の同一 inode）の内容を破壊しない（codex P0）。
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = Path(tmp) / "outside.txt"
+            outside.write_bytes(b"keep me")
+            path = Path(tmp) / "out.bin"
+            try:
+                os.link(outside, path)
+            except OSError:
+                self.skipTest("hardlink creation is not permitted in this environment")
+            cs._write_bytes_nofollow(path, b"new")
+            self.assertEqual(path.read_bytes(), b"new")
+            self.assertEqual(outside.read_bytes(), b"keep me")
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["out.bin", "outside.txt"])
+
 
 class WriteResultTest(unittest.TestCase):
     """RENDER-5 / TASK-37.1: `write_result`（`capture-result.json` の symlink 追随防止。codex P0）。"""
