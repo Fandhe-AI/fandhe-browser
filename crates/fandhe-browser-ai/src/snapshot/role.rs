@@ -21,6 +21,8 @@
 //!    要素・グローバル ARIA 属性を持つ要素では無視する
 //! 2. 暗黙 role（HTML-AAM の一部）:
 //!    - `button` → `button`
+//!    - `input`: `type` ごとの対応表（`TASK-11.3.2`・Issue #542。下記
+//!      「HTML-AAM からの逸脱方針」参照）
 //!    - `a`・`area`: `href` があれば `link`、無ければ `generic`
 //!    - `h1`〜`h6` → `heading`
 //!    - `table`・`thead`/`tbody`/`tfoot`・`tr`・`td` →
@@ -31,10 +33,29 @@
 //!    - ドキュメントルート → `document`
 //! 3. 上記以外は `generic`（Fallback）
 //!
+//! # HTML-AAM からの逸脱方針（`input[type]`・`TASK-11.3.2`・Issue #542）
+//!
+//! `input[type]` は HTML-AAM を基準とし、逸脱は次の 1 件だけである。
+//!
+//! - `type=password` は HTML-AAM では「対応 role なし」だが、`textbox`
+//!   （Implicit）を返す。主要ブラウザと Playwright が textbox を返し、AI
+//!   エージェントが入力欄を特定するには widget role が要るため。role の
+//!   算出は `value` 属性を一切読まず、値の開示とは無関係である
+//!
+//! HTML-AAM で「対応 role なし」の `color`・`date`・`datetime-local`・
+//! `month`・`time`・`week`・`file` と、非公開の `hidden` は `generic`
+//! （Fallback）とする。`hidden` を要素として `Some` で返す契約を保つためで、
+//! スナップショットからの除外はツリー構築側（TASK-11.7・Issue #76）の責務。
+//! 欠落・空・未知の `type` は HTML Standard どおり Text 状態（`textbox`）で、
+//! `type` の照合は ASCII 大文字小文字を区別せず前後の空白を除去しない
+//! （空白を含む値はどのキーワードにも一致しない）。
+//!
 //! # スコープ外（後続タスクへ引き継ぐ。実装済みを装わない。REPAIR-3）
 //!
-//! - `input[type]` の対応表: TASK-11.3.2・Issue #542。現状 `input` は
-//!   `generic`（Fallback）を返す暫定分岐である
+//! - `list` 属性（suggestions source element）による `combobox` 化
+//!   （text・email・tel・url・search が対象）: `datalist` への ID 参照の
+//!   解決が要り「自身の属性だけを見る」制約に反するため未実装で、
+//!   `textbox`・`searchbox` のまま返す。担当 sub-issue は未割り当て
 //! - `select`（`multiple`/`size` による `listbox`/`combobox`）・
 //!   `header`/`footer`（祖先による `banner`/`contentinfo`）など文脈で変わる
 //!   role: TASK-11.3.3・Issue #543。現状はいずれも `generic`（Fallback）
@@ -276,11 +297,7 @@ fn is_focusable(doc: &Document, id: NodeId) -> bool {
         return doc.attribute(id, "href").is_some();
     }
     if named("input") {
-        let hidden = doc.attribute(id, "type").is_some_and(|t| {
-            t.trim_matches(|c: char| c.is_ascii_whitespace())
-                .eq_ignore_ascii_case("hidden")
-        });
-        return !hidden;
+        return !input_type_is(doc, id, "hidden");
     }
     named("button") || named("select") || named("textarea") || named("summary")
 }
@@ -328,13 +345,55 @@ fn implicit_role_for_th(doc: &Document, id: NodeId) -> ComputedRole {
     }
 }
 
-/// `input` 要素の暗黙 role。
+/// `input` 要素の `type` 属性が `keyword` と一致するか。ASCII 大文字小文字は
+/// 区別せず、前後の空白は除去しない（HTML Standard では空白を含む値は
+/// どのキーワードにも一致せず Text 状態になる。[`super::name`] の
+/// `normalized_input_type` と同じ規則。共通化は TASK-11.7 以降）。
+fn input_type_is(doc: &Document, id: NodeId, keyword: &str) -> bool {
+    doc.attribute(id, "type")
+        .is_some_and(|value| value.eq_ignore_ascii_case(keyword))
+}
+
+/// `input` 要素の暗黙 role（`AISNAP-1`・`TASK-11.3.2`・`MS-2`・Issue #542）。
 ///
-/// スタブ: `input[type]` の対応表は TASK-11.3.2（Issue #542・`AISNAP-1`）で
-/// 実装する。それまでは `generic`（Fallback）を返す。#542 はこの関数の
-/// 中身だけを差し替える。
-fn implicit_role_for_input(_doc: &Document, _id: NodeId) -> ComputedRole {
-    ComputedRole::fallback()
+/// `type` ごとの対応表（HTML-AAM）を引く。`button`/`submit`/`reset`/`image`
+/// は `button`、`checkbox`/`radio` は同名、`range` は `slider`、`number` は
+/// `spinbutton`、`search` は `searchbox`、`text`/`email`/`tel`/`url` および
+/// 欠落・未知の値は `textbox`。逸脱として `password` も `textbox` を返す
+/// （module doc 参照。`value` は読まない）。対応 role のない `color`・日時系・
+/// `file` と `hidden` は `generic`（Fallback）。`list` 属性による `combobox`
+/// 化は未対応（module doc の「スコープ外」）。
+fn implicit_role_for_input(doc: &Document, id: NodeId) -> ComputedRole {
+    const TABLE: &[(&str, Option<&str>)] = &[
+        ("button", Some("button")),
+        ("submit", Some("button")),
+        ("reset", Some("button")),
+        ("image", Some("button")),
+        ("checkbox", Some("checkbox")),
+        ("radio", Some("radio")),
+        ("range", Some("slider")),
+        ("number", Some("spinbutton")),
+        ("search", Some("searchbox")),
+        ("password", Some("textbox")),
+        ("color", None),
+        ("date", None),
+        ("datetime-local", None),
+        ("month", None),
+        ("time", None),
+        ("week", None),
+        ("file", None),
+        ("hidden", None),
+    ];
+    for (keyword, role) in TABLE {
+        if input_type_is(doc, id, keyword) {
+            return match role {
+                Some(role) => ComputedRole::implicit(role),
+                None => ComputedRole::fallback(),
+            };
+        }
+    }
+    // text・email・tel・url・欠落・空・未知の値は Text 状態。
+    ComputedRole::implicit("textbox")
 }
 
 /// 文脈（祖先・属性値）で role が変わる要素（`select`・`header`・`footer`）
@@ -651,15 +710,127 @@ mod tests {
         );
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: `input` は #542 で差し替えるまで
-    /// generic（Fallback）。継ぎ目を固定する回帰テスト（#542 で更新する）。
+    /// AISNAP-1（TASK-11.3.2・Issue #542）: 全 type キーワードの対応表。
     #[test]
-    fn aisnap_1_input_is_placeholder_until_task_11_3_2() {
+    fn aisnap_1_input_type_table() {
+        use RoleSource::{Fallback, Implicit};
+        let cases = [
+            ("hidden", "generic", Fallback),
+            ("text", "textbox", Implicit),
+            ("search", "searchbox", Implicit),
+            ("tel", "textbox", Implicit),
+            ("url", "textbox", Implicit),
+            ("email", "textbox", Implicit),
+            ("password", "textbox", Implicit),
+            ("date", "generic", Fallback),
+            ("month", "generic", Fallback),
+            ("week", "generic", Fallback),
+            ("time", "generic", Fallback),
+            ("datetime-local", "generic", Fallback),
+            ("number", "spinbutton", Implicit),
+            ("range", "slider", Implicit),
+            ("color", "generic", Fallback),
+            ("checkbox", "checkbox", Implicit),
+            ("radio", "radio", Implicit),
+            ("file", "generic", Fallback),
+            ("submit", "button", Implicit),
+            ("image", "button", Implicit),
+            ("reset", "button", Implicit),
+            ("button", "button", Implicit),
+        ];
+        for (ty, expected, source) in cases {
+            check(
+                &format!(r#"<input type="{ty}">"#),
+                "input",
+                expected,
+                source,
+            );
+        }
+    }
+
+    /// AISNAP-1（TASK-11.3.2・Issue #542）: password は HTML-AAM からの逸脱で
+    /// textbox（Implicit）。
+    #[test]
+    fn aisnap_1_input_password_is_textbox() {
         check(
-            r#"<input type="text">"#,
+            r#"<input type="password">"#,
             "input",
-            "generic",
-            RoleSource::Fallback,
+            "textbox",
+            RoleSource::Implicit,
+        );
+    }
+
+    /// AISNAP-1（TASK-11.3.2・Issue #542）: type の正規化（欠落・未知・大文字
+    /// 小文字・空白は除去しない）。
+    #[test]
+    fn aisnap_1_input_type_normalization() {
+        let cases = [
+            ("<input>", "textbox"),
+            (r#"<input type="">"#, "textbox"),
+            (r#"<input type="unknown-type">"#, "textbox"),
+            (r#"<input type="datetime">"#, "textbox"),
+            (r#"<input type="CheckBox">"#, "checkbox"),
+            (r#"<input type="PASSWORD">"#, "textbox"),
+            (r#"<input type=" checkbox ">"#, "textbox"),
+            (r#"<input type=" submit ">"#, "textbox"),
+            (r#"<input type=" hidden ">"#, "textbox"),
+        ];
+        for (html, expected) in cases {
+            check(html, "input", expected, RoleSource::Implicit);
+        }
+    }
+
+    /// AISNAP-1（TASK-11.3.2・Issue #542）: `list` 属性は解決しない。
+    /// combobox 化は後続タスクで差し替える（現状は textbox・searchbox）。
+    #[test]
+    fn aisnap_1_input_list_attribute_not_resolved() {
+        let dl = r#"<datalist id="d"></datalist>"#;
+        check(
+            &format!(r#"<input type="text" list="d">{dl}"#),
+            "input",
+            "textbox",
+            RoleSource::Implicit,
+        );
+        check(
+            &format!(r#"<input type="search" list="d">{dl}"#),
+            "input",
+            "searchbox",
+            RoleSource::Implicit,
+        );
+    }
+
+    /// AISNAP-1（TASK-11.3.2・Issue #542）: 明示 role は input でも優先。
+    #[test]
+    fn aisnap_1_input_explicit_role_wins() {
+        check(
+            r#"<input type="checkbox" role="switch">"#,
+            "input",
+            "switch",
+            RoleSource::Explicit,
+        );
+    }
+
+    /// AISNAP-1（TASK-11.3.2・Issue #542）: input の none/presentation 競合解決。
+    /// `type=" hidden "` は Text 状態でフォーカス可能なので none を無視する。
+    #[test]
+    fn aisnap_1_input_presentational_conflict() {
+        check(
+            r#"<input type="text" role="none">"#,
+            "input",
+            "textbox",
+            RoleSource::Implicit,
+        );
+        check(
+            r#"<input type="hidden" role="none">"#,
+            "input",
+            "none",
+            RoleSource::Explicit,
+        );
+        check(
+            r#"<input type=" hidden " role="none">"#,
+            "input",
+            "textbox",
+            RoleSource::Implicit,
         );
     }
 

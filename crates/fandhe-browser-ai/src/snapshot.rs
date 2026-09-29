@@ -19,7 +19,8 @@
 //! - role（役割）算出: TASK-11.3（`AISNAP-1`・Issue #72）。骨格と button・
 //!   link・heading・table・list 等の代表要素は TASK-11.3.1（Issue #541）で
 //!   実装済み（[`role`] モジュール・[`role::compute_role`]）。`input[type]`
-//!   の対応表は TASK-11.3.2（Issue #542）、`select`・`header`/`footer`/
+//!   の対応表は TASK-11.3.2（Issue #542）で実装済み（`list` による
+//!   `combobox` 化は未対応）。`select`・`header`/`footer`/
 //!   `aside`（sectioning 祖先判定）は TASK-11.3.3（Issue #543）が担う。
 //!   form・section・img の名前依存の昇格は担当未割り当て（role.rs の doc 参照）
 //! - accessible name（アクセシブルネーム）算出: TASK-11.4（Issue #73）を
