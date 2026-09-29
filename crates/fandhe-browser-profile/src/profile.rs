@@ -732,8 +732,8 @@ impl Profile {
     /// ディレクトリの `rmdir` は、まず一意名へ rename して実体（dev/ino）を
     /// 照合してから行い、差し替えられていれば消さず戻す。走査中は祖先の連鎖
     /// 全体の `..` を確認し、境界外へ移されたサブツリーの子孫を消さない。
-    /// 元の名前への復元は原子的な `RENAME_NOREPLACE` が使える場合に限り
-    /// （非 Linux の unix 等では復元せず、保持中の fd で再削除する）、並行
+    /// 元の名前への復元は原子的な NOREPLACE rename（Linux / Apple 系）が使える場合に限り
+    /// （それ以外の unix 等では復元せず、保持中の fd で再削除する）、並行
     /// `open` の新プロファイルを上書きしない。POSIX に原子的な確認付き
     /// unlink は無いため、一意名の確認から `rmdir` までの極小の窓は残る
     /// （一意名は推測困難。同一ユーザーの書き込み権限が前提）。
@@ -926,11 +926,12 @@ impl Profile {
 /// 親ディレクトリ `parent_fd` 内で `from` を `to` へ、既存エントリを上書き
 /// せずに rename する（[`Profile::delete`] の退避・復元用）。
 ///
-/// Linux / Android では `renameat2(RENAME_NOREPLACE)` で原子的に行う。
-/// 非対応のファイルシステム（`EINVAL`）・非 Linux の unix では確認後 rename
-/// へフォールバックする（確認と rename の間の競合は残る。`PROF-5`）。
+/// Linux / Android / Apple 系では原子的な NOREPLACE rename で行う。
+/// 非対応のファイルシステム（`EINVAL` / `ENOTSUP`）・その他の unix では確認後
+/// rename へフォールバックする（確認と rename の間の競合は残る。`PROF-5`）。
 /// そのため宛先が呼び出し側で一意に生成した名前（他者が同名を作らない）の
-/// 場合にのみ使う。元の名前へ戻す用途は [`rename_noreplace_atomic`] を使う。
+/// 場合にのみ使う。通常の rename はディレクトリ移動先が空ディレクトリ以外なら
+/// 失敗するため、競合で置換され得るのは同名の空ディレクトリに限られる。元の名前へ戻す用途は [`rename_noreplace_atomic`] を使う。
 #[cfg(unix)]
 fn rename_noreplace(
     parent_fd: BorrowedFd<'_>,
@@ -938,7 +939,7 @@ fn rename_noreplace(
     to: &std::ffi::OsStr,
 ) -> Result<(), Errno> {
     match rename_noreplace_atomic(parent_fd, from, to) {
-        Err(Errno::INVAL | Errno::NOSYS) => {}
+        Err(Errno::INVAL | Errno::NOSYS | Errno::NOTSUP) => {}
         other => return other,
     }
     match rustix::fs::statat(parent_fd, to, AtFlags::SYMLINK_NOFOLLOW) {
@@ -949,8 +950,8 @@ fn rename_noreplace(
     rustix::fs::renameat(parent_fd, from, parent_fd, to)
 }
 
-/// 原子的な `RENAME_NOREPLACE` のみで rename する。使えない環境（非 Linux の
-/// unix・非対応 FS）では何もせず `NOSYS` / `INVAL` を返す（確認後 rename へ
+/// 原子的な `RENAME_NOREPLACE`（Linux / Android）・`RENAME_EXCL`（macOS 等
+/// Apple 系）のみで rename する。使えない環境（その他の unix・非対応 FS）では何もせず `NOSYS` / `INVAL` を返す（確認後 rename へ
 /// フォールバックしない。並行 `open` が作った同名の新プロファイルを上書き
 /// しないため。`PROF-5`）。
 #[cfg(unix)]
@@ -959,7 +960,9 @@ fn rename_noreplace_atomic(
     from: &std::ffi::OsStr,
     to: &std::ffi::OsStr,
 ) -> Result<(), Errno> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // Linux / Android は `renameat2(RENAME_NOREPLACE)`、Apple 系は
+    // `renameatx_np(RENAME_EXCL)`。rustix の safe API なので unsafe は増えない。
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     {
         rustix::fs::renameat_with(
             parent_fd,
@@ -969,7 +972,7 @@ fn rename_noreplace_atomic(
             rustix::fs::RenameFlags::NOREPLACE,
         )
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     {
         let _ = (parent_fd, from, to);
         Err(Errno::NOSYS)
