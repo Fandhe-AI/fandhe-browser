@@ -28,21 +28,21 @@
 //!   まだ書かない（29.4「グローバル関数注入」・29.5「DOM 風バインディング」
 //!   と並行して進めるため、共有の impl ブロックを編集し合うコンフリクトを
 //!   避ける）
-//! - 親→子の登録フレームを受け取って
-//!   [`V8Engine::install_native_proxy_global`] を実際に呼ぶ本番経路
-//!   （`TASK-29.4`「グローバル関数注入」・Issue #155）・DOM 風オブジェクト
-//!   バインディング（`TASK-29.5`・Issue #156）。本モジュールが用意するのは
-//!   プロキシ関数の生成・呼び出し本体までであり、親からの登録フレーム
-//!   自体は未配線（`test-support` ビルド限定の代替経路として
-//!   `super::worker::TEST_NATIVE_PROXIES_ENV_VAR` 経由の事前登録フックを
-//!   Issue #526 で追加した。#155 完了後は本番の登録フレーム処理と
-//!   併存させるか置き換えるかを別途判断する）
-//! - 子の再起動時に、以前登録していたプロキシ関数・bind 済みオブジェクトを
-//!   再登録する処理（Issue #512）
+//! - DOM 風オブジェクトバインディング（`TASK-29.5`・Issue #156）
+//!
+//! なお、親→子の登録フレーム（`REGISTER_GLOBAL_FUNCTION`）による
+//! **グローバル関数注入**（`TASK-29.4`・Issue #155）は実装済みで、
+//! [`super::worker`] が受け取って [`V8Engine::install_native_proxy_global`]
+//! を呼ぶ。
+//!
+//! 引き続き未実装:
+//!
+//! - 子の再起動時に、bind 済み DOM 風オブジェクトを再登録する処理
+//!   （Issue #525。グローバル関数は Issue #527・#155 で親が登録し直す）
 //! - `create_engine`（`engine_trait.rs`）への配線（`TASK-29.6`・`29.7`）。
 //!   配線すると `tests/conformance.rs` の同梱エンジン向けコンフォーマンス
 //!   テスト（注入・バインディングの契約検証を含む）が V8 に対しても走る
-//!   ため、29.4・29.5 の完了を待つ
+//!   ため、29.5 の完了を待つ
 //! - `v8` 由来のエラーを共通エラー型へ変換する仕組み（`TASK-29.6`）
 //! - 実行時間・入力サイズ・結果サイズ・ヒープサイズの上限値を呼び出し側
 //!   から調整する経路（[`super::engine_trait::EvaluateOptions`] の拡張。
@@ -102,7 +102,8 @@ use super::worker_protocol::{self, NativeReturn};
 /// フレーム由来。#155）として扱い、無制限の長さの文字列で
 /// `v8::String::new` を呼ばないよう、確保前に上限を検査する
 /// （coding-rust.md「外部入力」節・OWASP A04）。
-pub(crate) const MAX_NATIVE_PROXY_NAME_BYTES: usize = 256;
+pub(crate) const MAX_NATIVE_PROXY_NAME_BYTES: usize =
+    worker_protocol::MAX_GLOBAL_FUNCTION_NAME_BYTES;
 
 /// 子プロセス側から親プロセスへ逆方向 RPC（`NativeCall`）を送り、
 /// [`NativeReturn`] が届くまで**同期的にブロックする**窓口（`JS-1`・
@@ -795,10 +796,10 @@ impl V8Engine {
     /// 永続 Context のグローバルスコープへ、逆方向 RPC のプロキシ関数を
     /// `name` という名前で登録する（`JS-1`・`TASK-29`・Issue #511）。
     ///
-    /// 呼び出し元（将来）: 親からの登録フレーム（#155）を受け取った
-    /// [`super::worker`] が、注入すべきグローバル関数ごとに一意な `id` を
-    /// 割り当てて呼ぶ。それまでは本番経路から呼ばれない
-    /// （`#155` 完了までの間、プロキシを登録する手段が本番に無いため）。
+    /// 呼び出し元: 親からの登録フレーム（`REGISTER_GLOBAL_FUNCTION`。
+    /// `TASK-29.4`・Issue #155）を受け取った [`super::worker`] が、親の
+    /// 割り当てた `id` で呼ぶ（`test-support` ビルドでは起動時の事前登録
+    /// フックからも呼ばれる）。
     ///
     /// `name` は外部入力（親からの登録フレーム由来）として検証する:
     /// 空文字列・[`MAX_NATIVE_PROXY_NAME_BYTES`] 超過はいずれも `Err` にする
@@ -816,14 +817,6 @@ impl V8Engine {
     /// non-configurable なアクセサの場合は `Some(false)` を返し失敗する）
     /// ため、setter を実行してしまう余地も、登録に失敗したのに成功したと
     /// 装う余地もない（security.md「偽装・回避機能の禁止」）。
-    #[cfg_attr(
-        not(any(test, feature = "test-support")),
-        expect(
-            dead_code,
-            reason = "親→子の登録フレーム（#155）から呼ばれるまで未配線。test-support \
-                      ビルドは worker.rs のテスト専用フックから呼ばれる。REPAIR-3"
-        )
-    )]
     pub(crate) fn install_native_proxy_global(
         &mut self,
         name: &str,
@@ -1203,15 +1196,7 @@ fn js_value_to_v8_value<'s>(
 /// `data` には `id` の数値だけを載せる（`External`・生ポインタは使わない。
 /// 計画書 §3.2「data には数値 ID だけを入れる」）。子プロセスの再起動時に
 /// 同じ `id` で登録し直せば、V8 側のポインタ寿命を気にせず再現できる
-/// （#155・#512 が担う）。
-#[cfg_attr(
-    not(any(test, feature = "test-support")),
-    expect(
-        dead_code,
-        reason = "V8Engine::install_native_proxy_global 経由で #155 完了後に配線される。\
-                  test-support ビルドは worker.rs のテスト専用フックから呼ばれる。REPAIR-3"
-    )
-)]
+/// （登録フレーム経由の登録し直しは #155・#527 で実装済み）。
 fn new_native_proxy_function<'s>(
     scope: &v8::PinScope<'s, '_>,
     id: u32,
@@ -1294,14 +1279,6 @@ fn native_call_arg_encoded_len(scope: &v8::PinScope<'_, '_>, value: v8::Local<v8
 /// 監視スレッドは呼び出し元のスタックを区別しない）。ネイティブ呼び出し
 /// 中に watchdog が発火した場合は、本コールバックから戻った時点で V8 が
 /// 打ち切る。
-#[cfg_attr(
-    not(any(test, feature = "test-support")),
-    expect(
-        dead_code,
-        reason = "V8Engine::install_native_proxy_global 経由で #155 完了後に配線される。\
-                  test-support ビルドは worker.rs のテスト専用フックから呼ばれる。REPAIR-3"
-    )
-)]
 fn native_proxy_callback(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,

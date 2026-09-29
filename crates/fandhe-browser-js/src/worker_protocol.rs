@@ -30,6 +30,11 @@
 //!   `super::process_engine::dispatch_native_call`）は Issue #526 で
 //!   実装済み
 //! - [`tag::SHUTDOWN`]: 親 → 子。ペイロードなし
+//! - [`tag::REGISTER_GLOBAL_FUNCTION`]: 親 → 子。グローバル関数の登録
+//!   （`u32 id` ＋ name。[`encode_register_global_function`]/
+//!   [`decode_register_global_function`]）。応答は `RESULT(Undefined)`
+//!   （成功）または `ERROR{Binding}`（登録失敗）。`JS-1`・`TASK-29.4`・
+//!   Issue #155
 //!
 //! # 検証方針（外部入力として扱う。coding-rust.md「外部入力」節）
 //!
@@ -68,7 +73,12 @@ pub(crate) const MARKER_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER";
 /// [`super::worker`]（`js-v8` feature 有効時のみ）が実際に検証・送信に
 /// 使う。
 #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
-pub(crate) const PROTOCOL_VERSION: u16 = 1;
+///
+/// 2: 親 → 子の登録フレーム [`tag::REGISTER_GLOBAL_FUNCTION`] を追加
+/// （`TASK-29.4`・Issue #155）。子は未知の tag をプロトコル違反として
+/// 扱うため、バイナリの世代が混ざった場合にハンドシェイクで検出できる
+/// ようにバージョンを上げた。
+pub(crate) const PROTOCOL_VERSION: u16 = 2;
 
 /// フレームの `tag` バイトの値。
 ///
@@ -97,7 +107,22 @@ pub(crate) mod tag {
     pub(crate) const NATIVE_RETURN: u8 = 6;
     /// 親 → 子。ペイロードなし。
     pub(crate) const SHUTDOWN: u8 = 7;
+    /// 親 → 子。グローバル関数の登録
+    /// （[`super::encode_register_global_function`]。`TASK-29.4`・
+    /// Issue #155）。応答は `RESULT(Undefined)` / `ERROR{Binding}`。
+    pub(crate) const REGISTER_GLOBAL_FUNCTION: u8 = 8;
 }
+
+/// 注入するグローバル関数名の最大バイト数（`JS-1`・`TASK-29.4`・
+/// Issue #155）。親の事前検証・登録フレームの decode・子の
+/// `v8_engine` が同じ値を共有する。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+pub(crate) const MAX_GLOBAL_FUNCTION_NAME_BYTES: usize = 256;
+
+/// 注入できるグローバル関数の最大件数（親の登録簿・子の登録数の双方で
+/// 検証する。子は親を信頼しない。`JS-1`・`TASK-29.4`・Issue #155）。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+pub(crate) const MAX_REGISTERED_GLOBAL_FUNCTIONS: usize = 1024;
 
 /// [`super::process_engine`] が親 → 子のフレーム読み取りに使う上限
 /// （ペイロードのバイト数。タグ 1 バイトを含まない。設計書 §3.5）。
@@ -226,6 +251,11 @@ pub(crate) enum ProtocolError {
     /// 上限を超えた時点で確保・追記を一切行わずに本エラーを返す。
     #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
     NativeCallPayloadTooLarge { size: usize, max: usize },
+    /// [`decode_register_global_function`] の name が
+    /// [`MAX_GLOBAL_FUNCTION_NAME_BYTES`] を超えていた（`TASK-29.4`・
+    /// Issue #155）。
+    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    GlobalFunctionNameTooLong { len: usize, max: usize },
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -271,6 +301,10 @@ impl std::fmt::Display for ProtocolError {
             Self::NativeCallPayloadTooLarge { size, max } => write!(
                 f,
                 "worker protocol NativeCall payload of {size} bytes exceeds the {max}-byte limit"
+            ),
+            Self::GlobalFunctionNameTooLong { len, max } => write!(
+                f,
+                "worker protocol global function name of {len} bytes exceeds the {max}-byte limit"
             ),
         }
     }
@@ -567,10 +601,10 @@ pub(crate) enum ErrorKind {
     /// スクリプト評価が失敗した（構文エラー・実行時例外）。
     Evaluation,
     /// グローバル関数・DOM 風オブジェクトの登録に失敗した
-    /// （[`JsEngineError::BindingFailed`] に対応。現状の
-    /// `super::worker` は登録処理自体を持たないため、この分岐に実際には
-    /// 到達しない。`TASK-29.4`/`29.5` 以降で子プロセス側に登録処理が
-    /// 入った際に使われる想定）。
+    /// （[`JsEngineError::BindingFailed`] に対応）。`TASK-29.4`
+    /// （Issue #155）から、[`tag::REGISTER_GLOBAL_FUNCTION`] への応答として
+    /// 子が返す（登録に失敗しても子と Context は生きている）。DOM 風
+    /// オブジェクトの登録は `TASK-29.5` で同じ種別を使う想定。
     Binding,
     /// 子の監視スレッド（watchdog）が実行時間の上限で打ち切った
     /// （設計書 §3.3 の表「子の watchdog が打ち切った」行）。
@@ -632,6 +666,49 @@ pub(crate) fn decode_error(payload: &[u8]) -> Result<(ErrorKind, String), Protoc
     let message_bytes = payload.get(1..).ok_or(ProtocolError::Truncated)?;
     let message = std::str::from_utf8(message_bytes).map_err(|_| ProtocolError::InvalidUtf8)?;
     Ok((kind, message.to_string()))
+}
+
+/// [`tag::REGISTER_GLOBAL_FUNCTION`] フレームのペイロードを組み立てる
+/// （親 → 子。`JS-1`・`TASK-29.4`・Issue #155）。
+///
+/// 表現: `u32 LE id` ＋ `name` の UTF-8 バイト列（残り全部。長さは
+/// フレーム長で決まる）。呼び出し元: `super::process_engine` の
+/// `register_one`（`js-v8` feature 有効時のみ）。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+pub(crate) fn encode_register_global_function(id: u32, name: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + name.len());
+    out.extend_from_slice(&id.to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out
+}
+
+/// [`encode_register_global_function`] の逆変換（子側の
+/// `super::worker` が使う。送信側を信頼しない）。
+///
+/// 4 バイト未満・不正 UTF-8・空の name・[`MAX_GLOBAL_FUNCTION_NAME_BYTES`]
+/// 超の name は [`ProtocolError`] にする。
+#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+pub(crate) fn decode_register_global_function(
+    payload: &[u8],
+) -> Result<(u32, String), ProtocolError> {
+    let id_bytes: [u8; 4] = payload
+        .get(0..4)
+        .ok_or(ProtocolError::Truncated)?
+        .try_into()
+        .map_err(|_| ProtocolError::Truncated)?;
+    let id = u32::from_le_bytes(id_bytes);
+    let name_bytes = payload.get(4..).ok_or(ProtocolError::Truncated)?;
+    if name_bytes.is_empty() {
+        return Err(ProtocolError::Truncated);
+    }
+    if name_bytes.len() > MAX_GLOBAL_FUNCTION_NAME_BYTES {
+        return Err(ProtocolError::GlobalFunctionNameTooLong {
+            len: name_bytes.len(),
+            max: MAX_GLOBAL_FUNCTION_NAME_BYTES,
+        });
+    }
+    let name = std::str::from_utf8(name_bytes).map_err(|_| ProtocolError::InvalidUtf8)?;
+    Ok((id, name.to_string()))
 }
 
 /// [`tag::NATIVE_CALL`] フレームのペイロードを組み立てる（子 → 親。`JS-1`・
@@ -1411,6 +1488,69 @@ mod tests {
         ));
     }
 
+    /// JS-1・TASK-29.4: 登録件数・名前長の上限が具体値であること（親子で共有）。
+    #[test]
+    fn js_1_global_function_limits_have_the_documented_values() {
+        assert_eq!(MAX_REGISTERED_GLOBAL_FUNCTIONS, 1024);
+        assert_eq!(MAX_GLOBAL_FUNCTION_NAME_BYTES, 256);
+    }
+
+    /// JS-1・TASK-29.4: 登録フレームが往復し、id と name が具体値で戻ること。
+    #[test]
+    fn js_1_register_global_function_round_trips() {
+        let payload = encode_register_global_function(7, "hostAdd");
+        assert_eq!(&payload[..4], &7u32.to_le_bytes());
+        assert_eq!(
+            decode_register_global_function(&payload).expect("decode"),
+            (7, "hostAdd".to_string())
+        );
+    }
+
+    /// JS-1・TASK-29.4: 4 バイト未満・空の name は拒否する。
+    #[test]
+    fn js_1_register_global_function_rejects_truncated_and_empty_name() {
+        assert!(matches!(
+            decode_register_global_function(&[1, 0, 0]),
+            Err(ProtocolError::Truncated)
+        ));
+        assert!(matches!(
+            decode_register_global_function(&[]),
+            Err(ProtocolError::Truncated)
+        ));
+        assert!(matches!(
+            decode_register_global_function(&1u32.to_le_bytes()),
+            Err(ProtocolError::Truncated)
+        ));
+    }
+
+    /// JS-1・TASK-29.4: 不正 UTF-8 は拒否する。
+    #[test]
+    fn js_1_register_global_function_rejects_invalid_utf8() {
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0xff, 0xfe]);
+        assert!(matches!(
+            decode_register_global_function(&payload),
+            Err(ProtocolError::InvalidUtf8)
+        ));
+    }
+
+    /// JS-1・TASK-29.4: name はちょうど 256 バイトまで通り、257 バイトは拒否する。
+    #[test]
+    fn js_1_register_global_function_enforces_name_length_limit() {
+        let ok = "a".repeat(MAX_GLOBAL_FUNCTION_NAME_BYTES);
+        assert_eq!(
+            decode_register_global_function(&encode_register_global_function(0, &ok))
+                .expect("256 bytes is allowed")
+                .1,
+            ok
+        );
+        let long = "a".repeat(MAX_GLOBAL_FUNCTION_NAME_BYTES + 1);
+        assert!(matches!(
+            decode_register_global_function(&encode_register_global_function(0, &long)),
+            Err(ProtocolError::GlobalFunctionNameTooLong { len: 257, max: 256 })
+        ));
+    }
+
     /// JS-1: エラーメッセージのペイロード上限が 4 KiB であること（設計書
     /// §3.5 の具体値の回帰確認）。
     #[test]
@@ -1461,7 +1601,7 @@ mod tests {
     #[test]
     fn js_1_marker_env_var_and_protocol_version_have_the_documented_values() {
         assert_eq!(MARKER_ENV_VAR, "FANDHE_BROWSER_JS_WORKER");
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     /// JS-1: 想定される tag 値が予約分も含め重複しないこと（プロトコル
@@ -1476,6 +1616,7 @@ mod tests {
             tag::NATIVE_CALL,
             tag::NATIVE_RETURN,
             tag::SHUTDOWN,
+            tag::REGISTER_GLOBAL_FUNCTION,
         ];
         let mut sorted = tags.to_vec();
         sorted.sort_unstable();
