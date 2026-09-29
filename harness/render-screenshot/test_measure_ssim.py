@@ -848,11 +848,38 @@ class BboxPngBindingTest(unittest.TestCase):
             with mock.patch.object(cs, "MAX_PNG_BYTES", 4):
                 self.assertIn("byte limit", ms._bbox_png_binding_mismatch(bbox_path, png_path))
 
-    def test_read_failure_is_not_reported(self) -> None:
+    def test_bbox_reread_failure_is_reported(self) -> None:
+        """再読み込み失敗は None（不一致なし）にせず理由を返す（fail-closed）。"""
         with tempfile.TemporaryDirectory() as tmp:
             png_path = Path(tmp) / "site.png"
             png_path.write_bytes(b"png")
-            self.assertIsNone(ms._bbox_png_binding_mismatch(Path(tmp) / "nope.json", png_path))
+            reason = ms._bbox_png_binding_mismatch(Path(tmp) / "nope.json", png_path)
+            self.assertIn("failed to re-read bbox JSON", reason)
+
+    def test_bbox_invalid_json_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            png_path = Path(tmp) / "site.png"
+            png_path.write_bytes(b"png")
+            bbox_path = Path(tmp) / "site.bboxes.json"
+            bbox_path.write_text("{broken", encoding="utf-8")
+            self.assertIn(
+                "failed to re-read bbox JSON", ms._bbox_png_binding_mismatch(bbox_path, png_path)
+            )
+
+    def test_bbox_non_object_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            png_path = Path(tmp) / "site.png"
+            png_path.write_bytes(b"png")
+            bbox_path = Path(tmp) / "site.bboxes.json"
+            bbox_path.write_text("[]", encoding="utf-8")
+            self.assertIn("must be an object", ms._bbox_png_binding_mismatch(bbox_path, png_path))
+
+    def test_png_read_failure_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bbox_path = Path(tmp) / "site.bboxes.json"
+            bbox_path.write_text(json.dumps({"png_sha256": "0" * 64}), encoding="utf-8")
+            reason = ms._bbox_png_binding_mismatch(bbox_path, Path(tmp) / "missing.png")
+            self.assertIn("failed to read PNG", reason)
 
 
 class CompareBboxesTest(unittest.TestCase):

@@ -1087,17 +1087,19 @@ def _bbox_png_binding_mismatch(bbox_path: Path, png_path: Path) -> str | None:
       みなし、理由の文字列を返す（呼び出し側が fail-closed で不合格にする。
       フィールド欠落を受理すると `--out-dir` 再利用時に古い bbox を今回の
       測定値として合格判定に使えてしまう。Codex P1 指摘）。
-    - 読み込み失敗: `load_bboxes` 等の別経路が扱うため `None`。
+    - bbox JSON の再読み込み・解析失敗、PNG 読み込み失敗: 検証不能として理由を
+      返す（`None` は「対応付け検証に成功」のみを意味する。fail-closed）。
     RENDER-5 / TASK-37.2。
     """
     try:
         with bbox_path.open("rb") as fh:
             raw = fh.read(MAX_BBOX_FILE_BYTES + 1)
         payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_non_finite_constant)
-    except (OSError, ValueError, RecursionError, BboxError):
-        return None
+    except (OSError, ValueError, RecursionError, BboxError) as exc:
+        # 再読み込み失敗を「不一致なし」と解釈させない（fail-closed。Codex P1 指摘）。
+        return f"failed to re-read bbox JSON for PNG binding: {exc}"
     if not isinstance(payload, dict):
-        return None
+        return "bbox JSON must be an object (cannot bind the bbox to the captured PNG)"
     if "png_sha256" not in payload:
         return "png_sha256 is missing (cannot bind the bbox to the captured PNG)"
     expected = payload["png_sha256"]
@@ -1113,8 +1115,8 @@ def _bbox_png_binding_mismatch(bbox_path: Path, png_path: Path) -> str | None:
             return f"PNG exceeds the {cs.MAX_PNG_BYTES} byte limit (refusing to hash)"
         with png_path.open("rb") as fh:
             png_bytes = fh.read(cs.MAX_PNG_BYTES + 1)
-    except OSError:
-        return None
+    except OSError as exc:
+        return f"failed to read PNG for hashing: {exc}"
     if len(png_bytes) > cs.MAX_PNG_BYTES:
         return f"PNG exceeds the {cs.MAX_PNG_BYTES} byte limit (refusing to hash)"
     if hashlib.sha256(png_bytes).hexdigest() != expected:
