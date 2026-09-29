@@ -529,9 +529,10 @@ check-bench-record: ## competitor_lightpanda 記録スクリプトの自己テ�
 # jq 未導入時は check-compat-regression と同じ方針で fail-closed にする）。
 # self-test（合成ファイルによる判定モードの自己テスト）を先に実行してから、
 # 対象 package のリリースビルド・判定に進む。`ci:` の依存には追加しない
-# （cargo build --release のコストが大きいため。CI・`ci:` 集約への組込みは
-# #467（TASK-34.3）が判断する。harness/binary-size/README.md「make ci に
-# 含めない理由」参照）。
+# （cargo build --release のコストが大きいため。判断済み）。GitHub Actions
+# での継続的なゲートは `.github/workflows/ci.yml` の `binary-size` ジョブ
+# （TASK-34.3・#467）が 3 OS で担う。harness/binary-size/README.md「CI」
+# 「make ci に含めない理由」参照。
 .PHONY: check-binary-size
 check-binary-size: ## feature 無効（既定）のリリースバイナリサイズが CORE-2 水準の上限以下か検査する（RENDER-2）
 	@command -v jq >/dev/null 2>&1 || { \

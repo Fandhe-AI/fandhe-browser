@@ -33,6 +33,7 @@ cargo test --workspace
   `--allow-missing` を外し fail-closed（ファイル不在は exit 2）に戻す。
   スキーマ契約・終了コードは `harness/compat-regression/README.md` を参照
 - 許可外ライセンス（GPL/AGPL/LGPL/MPL-2.0・ライセンス未記載）を持つ canary を `cargo deny` が reject することを `make check-deny-license-reject` で検証する（TASK-9.1・REPAIR-8）
+- feature 無効（既定）時のリリースバイナリサイズが `RENDER-2`（基準は `CORE-2` と同じ「Chromium 比 80% 以上削減」）の上限以下かを `make check-binary-size`（CI では `binary-size` ジョブ・3 OS）で検証する（TASK-34.2・TASK-34.3）。`fandhe-browser-cli` crate が workspace に未追加の間（#174）は判定が `skip:` になり休眠状態（詳細は `harness/binary-size/README.md`）
 
 ## ワークフロー変更時の注意
 
