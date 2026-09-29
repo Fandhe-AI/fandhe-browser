@@ -1,79 +1,71 @@
-//! `snapshot::Node::role` フィールドの算出ロジック（`AISNAP-1`・`TASK-11.3`・
-//! `MS-2`・Issue #72）。本ファイルは TASK-11.3.1（Issue #541）が担う骨格と
-//! 代表要素のみを実装する。
+//! `snapshot::Node::role` フィールドの算出ロジックの骨格と代表要素
+//! （`AISNAP-1`・`TASK-11.3.1`・`MS-2`・Issue #541。親は TASK-11.3・Issue #72）。
 //!
 //! 呼び出し文脈: 現時点では呼び出し元がない。DOM から `Snapshot`/`Node` を
 //! 構築する TASK-11.7（Issue #76）が、ツリー構築時に要素ごとへ
 //! [`compute_role`] を呼ぶ想定である（実装済みを装わない。REPAIR-3）。
 //!
-//! # スコープ（TASK-11.3.1・Issue #541）
+//! # 設計上の制約（文書を走査しない）
 //!
-//! 本実装が算出するのは次の 2 つのみである。
+//! 本モジュールが暗黙 role を割り当てるのは、「要素自身の local name と
+//! 自身の属性だけ」で決まる要素に限る。祖先・子孫・ID 参照（`aria-labelledby`
+//! 等）・テキスト内容は一切参照しない。1 要素あたりの計算量は O(自身の属性数)
+//! で、外部 HTML 由来の巨大 DOM でも文書全体の走査（O(N²) 化）を起こさない
+//! （coding-rust.md「長さ・件数の上限」・security.md「不安全な設計」）。
 //!
-//! - 明示 role: `role` 属性のトークンのうち、WAI-ARIA 1.2 の具象 role
-//!   （abstract role を除く）の許可リストに一致する最初の 1 つ
-//! - 暗黙 role: HTML-AAM（ARIA in HTML）の代表要素（button・link・heading・
-//!   table 系・list 系・`th`・`img` 等。下記対応表）からの role
+//! # 算出する role
 //!
-//! 算出は content attribute だけを見る静的算出であり、JS による動的な
-//! role の変更（IDL 属性・`Element.setAttribute` 呼び出し）は扱わない。
+//! 1. 明示 role: `role` 属性のトークンのうち、WAI-ARIA 1.2 の具象 role
+//!    （abstract role を除く）の許可リストに一致する最初の 1 つ。ただし
+//!    `none`/`presentation` は ARIA 1.2 の競合解決に従い、フォーカス可能な
+//!    要素・グローバル ARIA 属性を持つ要素では無視する
+//! 2. 暗黙 role（HTML-AAM の一部）:
+//!    - `button` → `button`
+//!    - `a`・`area`: `href` があれば `link`、無ければ `generic`
+//!    - `h1`〜`h6` → `heading`
+//!    - `table`・`thead`/`tbody`/`tfoot`・`tr`・`td` →
+//!      `table`・`rowgroup`・`row`・`cell`
+//!    - `th`: `scope="row"`（大文字小文字を区別しない）なら `rowheader`、
+//!      それ以外は `columnheader`
+//!    - `ul`/`ol` → `list`、`li` → `listitem`
+//!    - ドキュメントルート → `document`
+//! 3. 上記以外は `generic`（Fallback）
 //!
-//! 以下は本 Issue（TASK-11.3.1）のスコープ外とし、後続タスクへ引き継ぐ
-//! （実装済みを装わない。REPAIR-3）。
+//! # スコープ外（後続タスクへ引き継ぐ。実装済みを装わない。REPAIR-3）
 //!
-//! - `input[type]` ごとの role の対応表（password を含む全 type）
-//!   → TASK-11.3.2（Issue #542）
-//! - `select`（`multiple`・`size`）の role → TASK-11.3.3（Issue #543）
-//! - `header`/`footer`/`aside` の、sectioning 祖先（`role` 属性で指定した
-//!   祖先も含む）による role の切り替え → TASK-11.3.3（Issue #543）
-//! - `none`/`presentation` の競合解決の完全な判定（[`explicit_role`] は
-//!   フォーカス可能性・グローバル ARIA 属性の簡易判定（`tabindex` 属性の
-//!   有無・代表的な対話要素・`aria-` 接頭辞の属性有無）による近似のみを
-//!   行う。`disabled`/`hidden` 等によるフォーカス可能性の除外、WAI-ARIA
-//!   1.2 §6.4 のグローバル状態・プロパティの正確な一覧との照合、
-//!   presentation の子孫への継承は扱わない。PR #566 レビュー指摘）
+//! - `input[type]` の対応表: TASK-11.3.2・Issue #542。現状 `input` は
+//!   `generic`（Fallback）を返す暫定分岐である
+//! - `select`（`multiple`/`size` による `listbox`/`combobox`）・
+//!   `header`/`footer`（祖先による `banner`/`contentinfo`）など文脈で変わる
+//!   role: TASK-11.3.3・Issue #543。現状はいずれも `generic`（Fallback）
+//! - `th` の表文脈による `cell` への降格: TASK-11.3.3・Issue #543
+//! - `form`・`section` の名前依存の昇格（`form`/`region`）と、`img` の
+//!   `alt=""` による `none`: accessible name の算出（TASK-11.4・Issue #73）
+//!   に依存するため未実装で、現状は `generic`（`img` も `generic`）。
+//!   これらの担当 sub-issue は未割り当て
 //! - role の必須コンテキスト（required context role）の検証
 //! - DPub/Graphics ARIA モジュールの role
-//! - `section` の `region` 昇格（accessible name を持つときのみ `region`
-//!   になる規則。accessible name の算出自体が TASK-11.4・Issue #73 の範囲）
-//! - `form`・`img` の完全な accessible name 算出。`aria-labelledby` が
-//!   指す複数要素の実テキストの連結・空白正規化・ネイティブラベリング機構
-//!   （`label` 要素等）・`title` 属性まで含めた優先順位付き判定は
-//!   TASK-11.4・Issue #73 の範囲であり、本実装は `aria-label` の非空値の
-//!   有無、または `aria-labelledby` が指す ID のいずれかが文書内に実在し
-//!   空でないテキストを持つかどうかだけを見る簡易 hint
-//!   （[`has_name_hint`]）に留める（PR #566 レビュー指摘を受け、参照先
-//!   未解決・参照先が空要素の `aria-labelledby` は名前ヒントに含めない
-//!   よう修正済み）
-//! - `th`/`td` の表文脈による完全な判定（`scope` が無い `th` を位置で
-//!   行見出し・列見出し・セルに振り分ける処理、`td` が `gridcell` になる
-//!   文脈）。本実装は `th` を `scope` 属性のみで判定する簡易実装である
-//! - `isDataLeaf`（表・一覧類型の葉ノード判定。`AISNAP-3`・TASK-13）
+//! - JS による動的な role の変更（本実装は content attribute のみを見る）
 //!
-//! # PoC との違い
-//!
-//! `docs/spec/03-poc/ai-interface-token-reduction/proto/reduce.mjs` の
-//! `roleOf`（PoC-4）は `label` 要素を一律 `"text"` としているが、本実装は
-//! HTML-AAM に従い、`label` は対応表に無いため `generic`（Fallback）になる。
-
-use std::collections::HashMap;
+//! `none`/`presentation` の競合解決は次の 2 点を意図的に保守的に簡略化する
+//! （どちらも操作対象を意味上消さない方向）。`disabled` によるフォーカス
+//! 不可は考慮しない。`tabindex` は値の妥当性を問わず、属性があればフォーカス
+//! 可能として扱う。
 
 use fandhe_browser_core::dom::{Document, NodeData, NodeId};
 
 /// HTML 名前空間の URI。`core::dom::HTML_NAMESPACE_URI` は `pub(crate)` で
 /// crate 外から使えないため、本モジュール用にローカルへ定義する
-/// （[`super::state`] と同じ理由。`core` の公開 API は変更しない。
-/// 共通化は TASK-11.7 以降のフォローアップとする）。
+/// （[`state`](super::state) と同じ理由。`core` の公開 API は変更しない）。
 const HTML_NAMESPACE_URI: &str = "http://www.w3.org/1999/xhtml";
 
-/// WAI-ARIA 1.2 の具象 role（concrete role）の許可リスト（出典: WAI-ARIA 1.2
-/// §5.4 Definition of Roles の role 一覧）。
+/// WAI-ARIA 1.2 の具象 role（concrete role）の許可リスト。
 ///
 /// abstract role（`command`・`composite`・`input`・`landmark`・`range`・
 /// `roletype`・`section`・`sectionhead`・`select`・`structure`・`widget`・
-/// `window`）は含めない。`role` 属性の値をこの許可リストと照合し、一致する
-/// 最初のトークンだけを採用する（[`explicit_role`] の設計。WAI-ARIA 1.2 の
-/// role フォールバック規則）。
+/// `window`）と DPub/Graphics モジュールの role は含めない。`role` 属性の値を
+/// この許可リストと照合し、一致する最初のトークンだけを採用する
+/// （[`explicit_role`]。任意文字列を role として下流へ通さないための境界）。
 const KNOWN_ROLES: &[&str] = &[
     "alert",
     "alertdialog",
@@ -159,11 +151,39 @@ const KNOWN_ROLES: &[&str] = &[
     "treeitem",
 ];
 
-/// role の算出根拠（`AISNAP-1`・`TASK-11.3`）。
+/// グローバル ARIA 属性（WAI-ARIA 1.2「Global States and Properties」。
+/// deprecated のものを含む）。`none`/`presentation` の競合解決で使う。
+/// deprecated を含めて偽陽性側に倒しても、暗黙 role が残るだけで安全。
+const GLOBAL_ARIA_ATTRIBUTES: &[&str] = &[
+    "aria-atomic",
+    "aria-busy",
+    "aria-controls",
+    "aria-current",
+    "aria-describedby",
+    "aria-description",
+    "aria-details",
+    "aria-disabled",
+    "aria-dropeffect",
+    "aria-errormessage",
+    "aria-flowto",
+    "aria-grabbed",
+    "aria-haspopup",
+    "aria-hidden",
+    "aria-invalid",
+    "aria-keyshortcuts",
+    "aria-label",
+    "aria-labelledby",
+    "aria-live",
+    "aria-owns",
+    "aria-relevant",
+    "aria-roledescription",
+];
+
+/// role の算出根拠（`AISNAP-1`・`TASK-11.3.1`）。
 ///
 /// AI エージェントが「作者の明示指定」と「ブラウザの既定解釈」を区別できる
-/// よう、算出元を残す。`#[non_exhaustive]` により、将来の根拠追加
-/// （例: CSS `appearance` からの推定）が非破壊で済む（REPAIR-4）。
+/// よう、算出元を残す。`#[non_exhaustive]` により、将来の根拠追加が
+/// 非破壊で済む（REPAIR-4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RoleSource {
@@ -175,12 +195,10 @@ pub enum RoleSource {
     Fallback,
 }
 
-/// 算出済みの role（`AISNAP-1`・`TASK-11.3`）。[`compute_role`] の戻り値。
+/// 算出済みの role（`AISNAP-1`・`TASK-11.3.1`）。[`compute_role`] の戻り値。
 ///
-/// フィールドを private にしアクセサ（[`ComputedRole::as_str`]・
-/// [`ComputedRole::source`]）経由で読ませることで、将来 role の内部表現
-/// （例: 複数トークンの保持）を変えても呼び出し側を壊さずに済む（REPAIR-4）。
-/// `#[non_exhaustive]` も同じ理由で付ける。
+/// フィールドを private にしアクセサ経由で読ませることで、将来 role の内部
+/// 表現を変えても呼び出し側を壊さずに済む（REPAIR-4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ComputedRole {
@@ -235,207 +253,46 @@ fn is_html_element_named(doc: &Document, id: NodeId, name: &str) -> bool {
             .is_some_and(|local| local.eq_ignore_ascii_case(name))
 }
 
-/// `th` 要素の暗黙 role を返す（`scope` の値が `row`/`rowgroup` なら
-/// `rowheader`、それ以外は `columnheader`）。`scope` の照合は大文字小文字を
-/// 区別しない。
-///
-/// 簡易実装: HTML-AAM の表文脈による完全な判定（`scope` が無い `th` を
-/// 位置で行見出し・列見出しに振り分ける処理）は TASK-11.3.3（Issue #543）
-/// の範囲であり、本実装は `scope` 属性の値のみで判定する。
-fn implicit_role_for_th(doc: &Document, id: NodeId) -> ComputedRole {
-    let is_row_scope = doc.attribute(id, "scope").is_some_and(|value| {
-        value.eq_ignore_ascii_case("row") || value.eq_ignore_ascii_case("rowgroup")
-    });
-    if is_row_scope {
-        ComputedRole::implicit("rowheader")
-    } else {
-        ComputedRole::implicit("columnheader")
+/// 要素 `id` が「ネイティブにフォーカス可能」または `tabindex` を持つか
+/// （`none`/`presentation` の競合解決 (a)）。自身の属性しか見ない。
+fn is_focusable(doc: &Document, id: NodeId) -> bool {
+    let named = |name: &str| is_html_element_named(doc, id, name);
+    if doc.attribute(id, "tabindex").is_some() {
+        return true;
     }
+    if named("a") || named("area") {
+        return doc.attribute(id, "href").is_some();
+    }
+    if named("input") {
+        let hidden = doc.attribute(id, "type").is_some_and(|t| {
+            t.trim_matches(|c: char| c.is_ascii_whitespace())
+                .eq_ignore_ascii_case("hidden")
+        });
+        return !hidden;
+    }
+    named("button") || named("select") || named("textarea") || named("summary")
 }
 
-/// `doc` 内の `id` content attribute → 要素の [`NodeId`] の索引。
-/// `aria-labelledby` の IDREF 解決で、トークンごとに文書全体を再走査
-/// しないよう、[`build_id_index`] で 1 回だけ構築して使い回す
-/// （PR #566 レビュー指摘 P0。二乗規模の走査量になるのを防ぐ）。
-/// 複数要素が同じ `id` を持つ不正な HTML では最初に見つかった要素を採用する
-/// （最初の一致で resolve する、というブラウザの一般的な `getElementById`
-/// 挙動に合わせる）。
-///
-/// 参照先要素が「空でないテキストを持つか」の判定結果は、[`build_id_index`]
-/// が文書全体を 1 回だけ走査して全ノード分をあらかじめ求め、
-/// `has_non_empty_text` フィールドへ保持する（PR #566 レビュー指摘 P0。
-/// 対象ごとに `doc.text_content` 相当の子孫再走査を都度行う実装では、
-/// 入れ子の要素それぞれに `id` を振って別々の `aria-labelledby` から
-/// 参照する外部 HTML で、各階層の子孫走査が共有されず合計で二乗規模の
-/// 走査量になる。[`compute_has_non_empty_text_map`] が文書順の逆順走査で
-/// 子の判定結果から親の判定結果を定数時間で求めるため、対象ごとの再走査を
-/// せず文書全体を 1 回走査するだけで済む）。事前に一括計算するため
-/// `compute_role` へ `&IdIndex` のまま（可変参照を要求せず）渡せる。
-///
-/// 可視性: [`build_id_index`] とあわせて `pub` にし、[`super::snapshot`]
-/// クレートルートから再エクスポートしている。DOM から `Snapshot` を構築する
-/// TASK-11.7（Issue #76）が、文書 1 つにつき 1 回だけ索引を作り、要素ごとの
-/// [`compute_role`] 呼び出し全てへ共有インデックスとして渡す想定
-/// （PR #566 レビュー指摘 P1。`compute_role` 内で毎回索引を作り直すと
-/// 呼び出し回数 × 文書サイズの二乗規模の走査量になるため、索引の構築を
-/// スナップショット構築側へ引き上げた）。
-#[derive(Debug, Default)]
-pub struct IdIndex<'a> {
-    by_id: HashMap<&'a str, NodeId>,
-    has_non_empty_text: HashMap<NodeId, bool>,
-}
-
-impl IdIndex<'_> {
-    /// `target` が空でないテキストを持つかどうかを返す。判定結果は
-    /// [`build_id_index`] が事前に計算済みで、本関数は参照するだけ
-    /// （[`IdIndex`] のドキュメントコメント参照）。索引構築後に追加・削除
-    /// されたノード ID（起こりえないが、範囲外 ID を渡された場合を含む）は
-    /// テキストを持たないとみなす。
-    fn has_non_empty_text(&self, target: NodeId) -> bool {
-        self.has_non_empty_text
-            .get(&target)
-            .copied()
-            .unwrap_or(false)
-    }
-}
-
-/// 文書内の全ノードについて「空でないテキストを持つか」を 1 回の走査で
-/// 求める（[`build_id_index`] から呼ばれる。[`IdIndex`] のドキュメント
-/// コメント参照）。
-///
-/// [`Document::descendants`] が返す文書順（前順）の並びを逆順に処理する
-/// ことで、あるノードの子孫は必ずそのノードより先に結果が確定する
-/// （前順では子孫がノードの後に現れるため、逆順ではノードより前に来る）。
-/// これにより Element/DocumentFragment の判定を「直接の子の判定結果の
-/// 論理和」という定数時間の操作で済ませられ、対象ごとに子孫を再走査する
-/// 必要がない。判定規則は [`Document::text_content`] と揃える:
-/// Text/Comment/ProcessingInstruction は自身のデータを、Element/
-/// DocumentFragment は子孫の Text ノードの有無を見る。
-fn compute_has_non_empty_text_map(doc: &Document) -> HashMap<NodeId, bool> {
-    let has_non_whitespace = |text: &str| text.chars().any(|c| !c.is_whitespace());
-    let root = doc.root();
-    let mut order = Vec::with_capacity(doc.node_count());
-    order.push(root);
-    order.extend(doc.descendants(root));
-
-    let mut result = HashMap::with_capacity(order.len());
-    for &node in order.iter().rev() {
-        let has_text = match doc.node_data(node) {
-            Some(NodeData::Text { contents } | NodeData::Comment { contents }) => {
-                has_non_whitespace(contents)
-            }
-            Some(NodeData::ProcessingInstruction { data, .. }) => has_non_whitespace(data),
-            Some(NodeData::Element { .. } | NodeData::DocumentFragment) => doc
-                .children(node)
-                .any(|child| result.get(&child).copied().unwrap_or(false)),
-            // `NodeData` は `#[non_exhaustive]`。Document/Doctype・
-            // 将来追加されるバリアントはいずれもテキストを持たないとみなす
-            // （[`Document::text_content`] が `None` を返す場合と同じ扱い）。
-            _ => false,
-        };
-        result.insert(node, has_text);
-    }
-    result
-}
-
-/// [`IdIndex`] を構築する。[`Document`] は id 索引を持たないため、
-/// `doc.root()` から [`Document::descendants`] で全要素を 1 回だけ走査する
-/// （`node_count` で上限打ち切り済みのため無制限走査にはならない。
-/// security.md「不安全な設計」対策）。あわせて [`compute_has_non_empty_text_map`]
-/// で全ノード分の「空でないテキストを持つか」も文書全体 1 回の走査で
-/// 求めておく（PR #566 レビュー指摘 P0。対象ごとの再走査を避ける）。
-///
-/// 呼び出し元は文書 1 つにつき本関数を 1 回だけ呼び、返した [`IdIndex`] を
-/// [`compute_role`] の全呼び出しへ使い回すこと（[`IdIndex`] のドキュメント
-/// コメント参照）。
-pub fn build_id_index(doc: &Document) -> IdIndex<'_> {
-    let mut by_id = HashMap::new();
-    for node in doc.descendants(doc.root()) {
-        if let Some(node_id) = doc.attribute(node, "id") {
-            by_id.entry(node_id).or_insert(node);
-        }
-    }
-    IdIndex {
-        by_id,
-        has_non_empty_text: compute_has_non_empty_text_map(doc),
-    }
-}
-
-/// `aria-labelledby` の値（空白区切りの ID 列）のうち、`doc` 内に実在し、
-/// かつ空でないテキストを持つ要素を指すトークンが 1 つでもあるかどうかを
-/// 返す。`index` は呼び出し元が [`build_id_index`] で 1 回だけ構築した
-/// ものを渡し、複数トークン・複数呼び出しにまたがって使い回す。
-///
-/// 参照先が存在しない IDREF（例: `aria-labelledby="missing"`）や、参照先の
-/// テキストが空（例: `<span id="x"></span>`）の場合は、accessible name を
-/// 持ちえないため名前のヒントとして扱わない（PR #566 レビュー指摘 P1。
-/// 「参照先が存在する」だけでは `has_name_hint` を真にしない）。
-///
-/// 参照先ごとの判定結果は [`IdIndex`] が [`build_id_index`] 時点で文書全体
-/// 1 回の走査から事前計算済みであり、`doc.text_content` によるテキスト
-/// 全体の複製や対象ごとの再走査は行わない（PR #566 レビュー指摘 P0。
-/// [`IdIndex::has_non_empty_text`] 参照）。
-fn labelledby_references_named_element(doc: &Document, id: NodeId, index: &IdIndex<'_>) -> bool {
-    doc.attribute(id, "aria-labelledby").is_some_and(|value| {
-        value.split_ascii_whitespace().any(|token| {
-            index
-                .by_id
-                .get(token)
-                .is_some_and(|&target| index.has_non_empty_text(target))
-        })
+/// 要素 `id` がグローバル ARIA 属性を 1 つ以上持つか（競合解決 (b)）。
+/// 属性一覧を 1 回走査するだけで、属性ごとの再検索はしない。
+fn has_global_aria_attribute(doc: &Document, id: NodeId) -> bool {
+    doc.attributes(id).iter().any(|attr| {
+        attr.name.ns.is_empty()
+            && GLOBAL_ARIA_ATTRIBUTES
+                .iter()
+                .any(|known| (*attr.name.local).eq_ignore_ascii_case(known))
     })
 }
 
-/// 属性値のみを見る簡易な「名前ヒント」判定。次のいずれかが成り立てば
-/// 名前を持つとみなす。
-///
-/// - `aria-label` が空でない値を持つ
-/// - `aria-labelledby` が、`doc` 内に実在し空でないテキストを持つ要素を
-///   指す ID を 1 つ以上含む（[`labelledby_references_named_element`]。
-///   参照先未解決の IDREF・参照先が空要素の場合は名前のヒントとして
-///   扱わない）
-///
-/// `id_index` は呼び出し元（[`compute_role`]）が受け取った索引をそのまま
-/// 渡す。本関数では索引を構築しない（PR #566 レビュー指摘 P1。要素ごとに
-/// [`build_id_index`] を呼ぶと文書全体を再走査してしまい、`aria-labelledby`
-/// を持つ要素が多い文書で二乗規模の走査量になる）。
-///
-/// 簡易実装: WAI-ARIA の accessible name 算出アルゴリズム（`aria-labelledby`
-/// が指す複数要素のテキストの連結・空白正規化・ネイティブラベリング機構
-/// （`label` 要素等）・`title` 属性まで含めた優先順位付き算出）は
-/// TASK-11.4（Issue #73）の範囲であり、本実装は参照先が「空でないテキストを
-/// 持つか」までしか見ない（複数参照先の連結・`aria-label` との優先順位づけは
-/// 行わない。[`implicit_role_for_img`]・`form` の暗黙 role 判定から利用）。
-fn has_name_hint(doc: &Document, id: NodeId, id_index: &IdIndex<'_>) -> bool {
-    let non_empty = |attr: &str| {
-        doc.attribute(id, attr)
-            .is_some_and(|value| !value.trim().is_empty())
-    };
-    if non_empty("aria-label") {
-        return true;
-    }
-    if doc.attribute(id, "aria-labelledby").is_none() {
-        return false;
-    }
-    labelledby_references_named_element(doc, id, id_index)
-}
-
-/// `img` 要素の暗黙 role を返す。`alt=""`（空文字列。属性自体が無い場合は
-/// 含まない）は装飾画像として `none` になるが、[`has_name_hint`] が示す
-/// ARIA 名（`aria-label`/`aria-labelledby`）を持つ場合はその意図を優先し
-/// `img` のまま扱う（HTML-AAM。ARIA 名がある画像を装飾画像として消さない
-/// ため）。それ以外（`alt` 省略を含む）は `img`。`id_index` は
-/// [`has_name_hint`] へそのまま渡す共有索引。
-fn implicit_role_for_img(doc: &Document, id: NodeId, id_index: &IdIndex<'_>) -> ComputedRole {
-    if doc.attribute(id, "alt") == Some("") && !has_name_hint(doc, id, id_index) {
-        ComputedRole::implicit("none")
-    } else {
-        ComputedRole::implicit("img")
-    }
+/// `none`/`presentation` の明示 role を無視すべきか（ARIA 1.2
+/// 「Presentational Roles Conflict Resolution」）。フォーカス可能、または
+/// グローバル ARIA 属性を持つ要素では、操作対象を消さないため無視する。
+fn ignores_presentational_role(doc: &Document, id: NodeId) -> bool {
+    is_focusable(doc, id) || has_global_aria_attribute(doc, id)
 }
 
 /// `a`/`area` 要素の暗黙 role を返す。`href` があれば `link`、無ければ
-/// （リンクとして機能しないため）`generic`（Fallback）。
+/// （リンクとして機能しないため）`generic`。
 fn implicit_role_for_hyperlink(doc: &Document, id: NodeId) -> ComputedRole {
     if doc.attribute(id, "href").is_some() {
         ComputedRole::implicit("link")
@@ -444,202 +301,103 @@ fn implicit_role_for_hyperlink(doc: &Document, id: NodeId) -> ComputedRole {
     }
 }
 
-/// HTML-AAM（ARIA in HTML）の対応表に基づき、要素 `id` の暗黙 role を
-/// 算出する（本モジュール doc「スコープ」節の対応表。TASK-11.3.1 が扱う
-/// 代表要素のみ）。
-///
-/// `id` が HTML 名前空間の要素でない場合（SVG/MathML 等）、または対応表に
-/// 該当しない場合は `generic`（Fallback）を返す。
-///
-/// `id_index` は呼び出し元（[`compute_role`]）が受け取った共有索引で、
-/// `form` の名前ヒント判定（[`has_name_hint`]）へそのまま渡す。
-///
-/// 拡張点: 分岐は 1 つの `match` 相当の連鎖に集約してあり、後続 Issue が
-/// 分岐を追加する箇所を以下にコメントで示す。
-fn implicit_role(doc: &Document, id: NodeId, id_index: &IdIndex<'_>) -> ComputedRole {
-    let named = |name: &str| is_html_element_named(doc, id, name);
+/// `th` 要素の暗黙 role を返す（`scope="row"` なら `rowheader`、それ以外は
+/// `columnheader`）。`scope` の照合は大文字小文字を区別しない。表の文脈
+/// による `cell` への降格は TASK-11.3.3（Issue #543）で扱う。
+fn implicit_role_for_th(doc: &Document, id: NodeId) -> ComputedRole {
+    let is_row_scope = doc.attribute(id, "scope").is_some_and(|value| {
+        value
+            .trim_matches(|c: char| c.is_ascii_whitespace())
+            .eq_ignore_ascii_case("row")
+    });
+    if is_row_scope {
+        ComputedRole::implicit("rowheader")
+    } else {
+        ComputedRole::implicit("columnheader")
+    }
+}
 
-    if named("a") || named("area") {
-        return implicit_role_for_hyperlink(doc, id);
-    }
-    if named("button") {
-        return ComputedRole::implicit("button");
-    }
-    // `input` → TASK-11.3.2（Issue #542）が `implicit_role_for_input` を
-    // 追加してここに分岐を足す。それまでは対応表に無い要素として generic
-    // （Fallback）になる。
-    // `select` → TASK-11.3.3（Issue #543）が `implicit_role_for_select` を
-    // 追加してここに分岐を足す。それまでは generic（Fallback）になる。
-    if named("option") {
-        return ComputedRole::implicit("option");
-    }
-    if named("textarea") {
-        return ComputedRole::implicit("textbox");
-    }
-    const HEADINGS: [&str; 6] = ["h1", "h2", "h3", "h4", "h5", "h6"];
-    if HEADINGS.iter().any(|tag| named(tag)) {
-        return ComputedRole::implicit("heading");
-    }
-    if named("table") {
-        return ComputedRole::implicit("table");
-    }
-    if named("thead") || named("tbody") || named("tfoot") {
-        return ComputedRole::implicit("rowgroup");
-    }
-    if named("tr") {
-        return ComputedRole::implicit("row");
-    }
-    if named("td") {
-        return ComputedRole::implicit("cell");
-    }
-    if named("th") {
-        return implicit_role_for_th(doc, id);
-    }
-    if named("ul") || named("ol") || named("menu") {
-        return ComputedRole::implicit("list");
-    }
-    if named("li") {
-        return ComputedRole::implicit("listitem");
-    }
-    if named("nav") {
-        return ComputedRole::implicit("navigation");
-    }
-    if named("main") {
-        return ComputedRole::implicit("main");
-    }
-    // `aside` → TASK-11.3.3（Issue #543）が sectioning 祖先による判定
-    // （`header`/`footer` と同じ判定規則）を追加してここに分岐を足す。
-    // それまでは generic（Fallback）になる。
-    // `form` は HTML-AAM で accessible name を持つ場合に限り `form` になる
-    // （`section` の `region` 昇格と同じ規則）。[`has_name_hint`] は
-    // `aria-label`/`aria-labelledby` の非空値だけを見る簡易判定であり、
-    // `aria-labelledby` が指す要素のテキストやネイティブラベリング機構
-    // までを含めた完全な accessible name 算出は TASK-11.4（Issue #73）の
-    // 範囲。名前が無い/判定できない場合はここで return せず下の
-    // フォールバックへ流し `generic` にする。
-    if named("form") && has_name_hint(doc, id, id_index) {
-        return ComputedRole::implicit("form");
-    }
-    if named("article") {
-        return ComputedRole::implicit("article");
-    }
-    // `header`/`footer` → TASK-11.3.3（Issue #543）が sectioning 祖先
-    // （`role` 属性で指定した祖先も含む）による `banner`/`contentinfo` と
-    // `generic` の切り替えを追加してここに分岐を足す。それまでは対応表に
-    // 無い要素として generic（Fallback）になる。
-    if named("img") {
-        return implicit_role_for_img(doc, id, id_index);
-    }
-    if named("p") {
-        return ComputedRole::implicit("paragraph");
-    }
-    if named("hr") {
-        return ComputedRole::implicit("separator");
-    }
-    if named("fieldset") {
-        return ComputedRole::implicit("group");
-    }
-    if named("dialog") {
-        return ComputedRole::implicit("dialog");
-    }
-    // `section` は accessible name を持つときだけ `region` になる
-    // （HTML-AAM）。accessible name の算出は TASK-11.4・Issue #73 の範囲の
-    // ため、本 Issue では常に generic を返す（module doc「スコープ外」）。
+/// `input` 要素の暗黙 role。
+///
+/// スタブ: `input[type]` の対応表は TASK-11.3.2（Issue #542・`AISNAP-1`）で
+/// 実装する。それまでは `generic`（Fallback）を返す。#542 はこの関数の
+/// 中身だけを差し替える。
+fn implicit_role_for_input(_doc: &Document, _id: NodeId) -> ComputedRole {
     ComputedRole::fallback()
 }
 
-/// ネイティブに（`tabindex` 属性なしで）フォーカス可能な HTML 要素かどうかを
-/// 判定する。[`is_presentation_conflict`] からのみ使う簡易判定であり、
-/// disabled・`hidden` 等による除外は見ない（フォーカス可能性の完全な判定は
-/// 本 Issue のスコープ外。下記コメント参照）。
-fn is_natively_focusable_element(doc: &Document, id: NodeId) -> bool {
-    let named = |name: &str| is_html_element_named(doc, id, name);
-    if (named("a") || named("area")) && doc.attribute(id, "href").is_some() {
-        return true;
-    }
-    named("button") || named("input") || named("select") || named("textarea")
+/// 文脈（祖先・属性値）で role が変わる要素（`select`・`header`・`footer`）
+/// の暗黙 role。
+///
+/// スタブ: TASK-11.3.3（Issue #543・`AISNAP-1`）で実装する。`select` は
+/// `multiple`/`size` による `listbox`/`combobox`、`header`/`footer` は
+/// sectioning 祖先の有無による `banner`/`contentinfo`/`generic`。それまでは
+/// `generic`（Fallback）を返す。#543 はこの関数の中身だけを差し替える。
+fn implicit_role_for_contextual(_doc: &Document, _id: NodeId) -> ComputedRole {
+    ComputedRole::fallback()
 }
 
-/// `id` が「フォーカス可能」または「グローバル ARIA 状態・プロパティ」を
-/// 持つかどうかを返す（WAI-ARIA 1.2 の presentation/none 競合解決規則の
-/// 判定に使う）。
+/// 要素 `id` の暗黙 role を local name で振り分ける単一のディスパッチャ。
 ///
-/// 簡易実装: フォーカス可能性は `tabindex` 属性の有無（値の妥当性は見ない）
-/// と、代表的なネイティブ対話要素（[`is_natively_focusable_element`]。
-/// `disabled`・`hidden` 等による除外は考慮しない）だけで判定する。
-/// グローバル ARIA 属性は `aria-` 接頭辞を持つ属性の有無で近似する
-/// （WAI-ARIA 1.2 §6.4 の正確な一覧との照合はしない。`aria-hidden` も
-/// 含める。完全な判定は TASK-11.3.3・Issue #543 以降のフォローアップとする
-/// ）。
-fn has_focus_or_global_aria(doc: &Document, id: NodeId) -> bool {
-    if doc.attribute(id, "tabindex").is_some() {
-        return true;
+/// 非 HTML 名前空間の要素（SVG・MathML）と対応表に無い要素は `generic`
+/// （Fallback）。後続 sub-issue（#542・#543）は分岐の中身を足すだけでよい。
+fn implicit_role(doc: &Document, id: NodeId) -> ComputedRole {
+    if doc.namespace_url(id) != Some(HTML_NAMESPACE_URI) {
+        return ComputedRole::fallback();
     }
-    if is_natively_focusable_element(doc, id) {
-        return true;
+    let Some(local) = doc.local_name(id) else {
+        return ComputedRole::fallback();
+    };
+    let local = local.to_ascii_lowercase();
+    match local.as_str() {
+        "button" => ComputedRole::implicit("button"),
+        "a" | "area" => implicit_role_for_hyperlink(doc, id),
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => ComputedRole::implicit("heading"),
+        "table" => ComputedRole::implicit("table"),
+        "thead" | "tbody" | "tfoot" => ComputedRole::implicit("rowgroup"),
+        "tr" => ComputedRole::implicit("row"),
+        "td" => ComputedRole::implicit("cell"),
+        "th" => implicit_role_for_th(doc, id),
+        "ul" | "ol" => ComputedRole::implicit("list"),
+        "li" => ComputedRole::implicit("listitem"),
+        "input" => implicit_role_for_input(doc, id),
+        "select" | "header" | "footer" => implicit_role_for_contextual(doc, id),
+        // form・section・img を含む対応表外は generic（module doc 参照）。
+        _ => ComputedRole::fallback(),
     }
-    doc.attributes(id)
-        .iter()
-        .any(|attr| attr.name.ns.is_empty() && attr.name.local.starts_with("aria-"))
 }
 
 /// `role` 属性の値から、有効な明示 role を算出する。
 ///
-/// WAI-ARIA のフォールバック規則に従い、空白区切りのトークン列を先頭から
-/// 走査し、[`KNOWN_ROLES`]（abstract role を除く具象 role の許可リスト）に
-/// 一致する最初のトークンを採用する。大文字小文字は区別しない
-/// （`role="Button"` も `button` として受け付ける）。有効なトークンが
-/// 無ければ `None`（暗黙 role へフォールバックさせる）を返す。
-///
-/// 採用したトークンが `none`/`presentation` で、かつ要素がフォーカス可能
-/// または グローバル ARIA 状態・プロパティを持つ場合（[`has_focus_or_global_aria`]）
-/// は、WAI-ARIA の presentation/none 競合解決規則に従い `role` 属性の指定を
-/// 無視し `None`（暗黙 role へフォールバック）を返す（PR #566 レビュー指摘。
-/// 操作対象の要素から role を消してしまわないため）。
-///
-/// 返すのは許可リスト側の `&'static str` である。属性値の文字列（外部の
-/// HTML に由来する untrusted 入力）はそのまま出力へ流さない。
-///
-/// `role` 属性は名前空間を問わず見る（SVG 要素でも有効）。
+/// 空白区切りのトークン列を先頭から走査し、[`KNOWN_ROLES`] に大文字小文字を
+/// 区別せず一致する最初のトークンを採用する。採用トークンが
+/// `none`/`presentation` で競合解決により無視される場合は `None`
+/// （暗黙 role へ）を返し、次のトークンは試さない。`role` 属性は名前空間を
+/// 問わず見る。
 fn explicit_role(doc: &Document, id: NodeId) -> Option<ComputedRole> {
     let value = doc.attribute(id, "role")?;
-    let token = value.split_ascii_whitespace().find_map(|token| {
+    let known = value.split_ascii_whitespace().find_map(|token| {
         KNOWN_ROLES
             .iter()
             .find(|known| token.eq_ignore_ascii_case(known))
     })?;
-    if (*token == "none" || *token == "presentation") && has_focus_or_global_aria(doc, id) {
+    if (*known == "none" || *known == "presentation") && ignores_presentational_role(doc, id) {
         return None;
     }
-    Some(ComputedRole::explicit(token))
+    Some(ComputedRole::explicit(known))
 }
 
-/// `doc` のノード `id` から role を算出する（`AISNAP-1`・`TASK-11.3`・
-/// `TASK-11.3.1`・Issue #541）。
+/// `doc` のノード `id` から role を算出する（`AISNAP-1`・`TASK-11.3.1`）。
 ///
-/// - ドキュメントルート（[`Document::root`]）は `Some("document", Implicit)`。
-///   spec の想定 JSON でルートが `role: "document"` になっているため
-///   （`AISNAP-1`）
-/// - 要素は必ず `Some`（明示 role → 暗黙 role → `generic` フォールバックの
-///   順。本 Issue の時点では暗黙 role は代表要素のみに対応し、それ以外は
-///   generic になる。TASK-11.3.2・11.3.3 が分岐を追加する）
-/// - テキスト・コメント・doctype 等の非要素、範囲外の `id` は `None`。
-///   これらは role を持たず [`super::Node`] にもならないので「無い」を
-///   そのまま返す（[`super::state::compute_state`] が範囲外・対象外に
-///   既定値を返すのとは契約が異なる。role には「要素以外の既定値」に
-///   ふさわしいトークンが無いため）。
-///
-/// `id_index` は呼び出し元が [`build_id_index`] で **文書 1 つにつき 1 回**
-/// 構築し、その文書に属する要素への `compute_role` 呼び出し全てで
-/// 使い回すこと（DOM から `Snapshot` を構築する TASK-11.7・Issue #76 は、
-/// ツリー構築の入口で 1 回構築してから各要素へ渡す想定）。呼び出しのたびに
-/// 索引を作り直すと、`aria-labelledby` を持つ要素が N 個ある文書で
-/// 合計 O(N²) の走査量になる（PR #566 レビュー指摘 P1）。
-pub fn compute_role(doc: &Document, id: NodeId, id_index: &IdIndex<'_>) -> Option<ComputedRole> {
+/// - ドキュメントルートは `Some("document", Implicit)`
+/// - 要素は必ず `Some`（明示 role → 暗黙 role → `generic` の順）
+/// - テキスト等の非要素・範囲外の `id` は `None`（role には非要素向けの
+///   既定トークンが無いため、`compute_state` の既定値返却とは契約が異なる）
+pub fn compute_role(doc: &Document, id: NodeId) -> Option<ComputedRole> {
     match doc.node_data(id)? {
         NodeData::Document => Some(ComputedRole::implicit("document")),
         NodeData::Element { .. } => {
-            Some(explicit_role(doc, id).unwrap_or_else(|| implicit_role(doc, id, id_index)))
+            Some(explicit_role(doc, id).unwrap_or_else(|| implicit_role(doc, id)))
         }
         _ => None,
     }
@@ -647,21 +405,12 @@ pub fn compute_role(doc: &Document, id: NodeId, id_index: &IdIndex<'_>) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use super::{ComputedRole, RoleSource, build_id_index, compute_role};
+    use super::{ComputedRole, RoleSource, compute_role};
     use fandhe_browser_core::dom::{Document, NodeId};
     use fandhe_browser_core::parse::{ParseOptions, parse_document};
-    use fandhe_browser_core::query::{query_selector_all_str, query_selector_str};
-
-    /// テスト用の `compute_role` 薄いラッパー。呼び出し元（本番コードでは
-    /// TASK-11.7・Issue #76 のツリー構築）が文書 1 つにつき 1 回だけ
-    /// [`build_id_index`] を呼ぶ契約（[`compute_role`] のドキュメンテーション
-    /// コメント参照）をテストでも守るため、`doc` から索引を作ってから渡す。
-    fn role_of(doc: &Document, id: NodeId) -> Option<ComputedRole> {
-        compute_role(doc, id, &build_id_index(doc))
-    }
+    use fandhe_browser_core::query::query_selector_str;
 
     /// テスト入力の HTML をパースし、CSS セレクタで対象要素を 1 つ特定する。
-    /// [`super::super::state`] のテストヘルパと同じ形。
     fn parse_and_select(html: &str, selector: &str) -> (Document, NodeId) {
         let parsed =
             parse_document(html, &ParseOptions::default()).expect("テスト入力は必ず成功する");
@@ -679,529 +428,227 @@ mod tests {
         assert_eq!(role.source(), source);
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: `document` ルートは
-    /// `"document"`/Implicit になる。
+    /// 単一要素の HTML から role を算出して検証する。
+    fn check(html: &str, selector: &str, expected: &str, source: RoleSource) {
+        let (doc, id) = parse_and_select(html, selector);
+        assert_role(compute_role(&doc, id), expected, source);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: ドキュメントルートは document。
     #[test]
-    fn aisnap_1_document_root_is_document() {
+    fn aisnap_1_document_root() {
         let parsed =
-            parse_document("<p>text</p>", &ParseOptions::default()).expect("パースは成功する");
+            parse_document("<p>x</p>", &ParseOptions::default()).expect("パースは成功する");
         let doc = parsed.document;
-        let root = doc.root();
-        assert_role(role_of(&doc, root), "document", RoleSource::Implicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: `button` 要素は `"button"`/Implicit。
-    #[test]
-    fn aisnap_1_button_is_button() {
-        let (doc, id) = parse_and_select("<button>送信</button>", "button");
-        assert_role(role_of(&doc, id), "button", RoleSource::Implicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: `href` を持つ `a` は `"link"`。
-    #[test]
-    fn aisnap_1_anchor_with_href_is_link() {
-        let (doc, id) = parse_and_select(r##"<a href="#">more</a>"##, "a");
-        assert_role(role_of(&doc, id), "link", RoleSource::Implicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: `href` の無い `a` はリンクとして
-    /// 機能しないため `"generic"`/Fallback。
-    #[test]
-    fn aisnap_1_anchor_without_href_is_generic() {
-        let (doc, id) = parse_and_select("<a>more</a>", "a");
-        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: `href` を持つ `area` は `"link"`。
-    #[test]
-    fn aisnap_1_area_with_href_is_link() {
-        let (doc, id) = parse_and_select(
-            r##"<map><area href="#" shape="rect" coords="0,0,1,1"></map>"##,
-            "area",
-        );
-        assert_role(role_of(&doc, id), "link", RoleSource::Implicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: `h1`〜`h6` はすべて `"heading"`。
-    #[test]
-    fn aisnap_1_headings_are_heading() {
-        let (doc, id) = parse_and_select("<h1>title</h1>", "h1");
-        assert_role(role_of(&doc, id), "heading", RoleSource::Implicit);
-        let (doc, id) = parse_and_select("<h6>title</h6>", "h6");
-        assert_role(role_of(&doc, id), "heading", RoleSource::Implicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: table 系要素が対応表どおりの role
-    /// になる（`table`/`rowgroup`/`row`/`columnheader`/`cell`）。
-    #[test]
-    fn aisnap_1_table_elements() {
-        let html = r#"<table><thead><tr><th>H</th></tr></thead>
-            <tbody><tr><td>D</td></tr></tbody></table>"#;
-        let (doc, table) = parse_and_select(html, "table");
-        assert_role(role_of(&doc, table), "table", RoleSource::Implicit);
-        let (doc, thead) = parse_and_select(html, "thead");
-        assert_role(role_of(&doc, thead), "rowgroup", RoleSource::Implicit);
-        let (doc, tr) = parse_and_select(html, "thead tr");
-        assert_role(role_of(&doc, tr), "row", RoleSource::Implicit);
-        let (doc, th) = parse_and_select(html, "th");
-        assert_role(role_of(&doc, th), "columnheader", RoleSource::Implicit);
-        let (doc, td) = parse_and_select(html, "td");
-        assert_role(role_of(&doc, td), "cell", RoleSource::Implicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: `<th scope="row">` は
-    /// `"rowheader"`。
-    #[test]
-    fn aisnap_1_th_scope_row_is_rowheader() {
-        let (doc, id) = parse_and_select(
-            "<table><tbody><tr><th scope=\"row\">H</th></tr></tbody></table>",
-            "th",
-        );
-        assert_role(role_of(&doc, id), "rowheader", RoleSource::Implicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: `<th scope="rowgroup">` も
-    /// `"rowheader"`（大文字小文字は区別しない）。
-    #[test]
-    fn aisnap_1_th_scope_rowgroup_is_rowheader() {
-        let (doc, id) = parse_and_select(
-            "<table><tbody><tr><th scope=\"rowgroup\">H</th></tr></tbody></table>",
-            "th",
-        );
-        assert_role(role_of(&doc, id), "rowheader", RoleSource::Implicit);
-
-        let (doc, id) = parse_and_select(
-            "<table><tbody><tr><th scope=\"ROW\">H</th></tr></tbody></table>",
-            "th",
-        );
-        assert_role(role_of(&doc, id), "rowheader", RoleSource::Implicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: `ul`/`ol`/`menu` は `"list"`、
-    /// `li` は `"listitem"`。
-    #[test]
-    fn aisnap_1_list_elements() {
-        let (doc, ul) = parse_and_select("<ul><li>a</li></ul>", "ul");
-        assert_role(role_of(&doc, ul), "list", RoleSource::Implicit);
-        let (doc, ol) = parse_and_select("<ol><li>a</li></ol>", "ol");
-        assert_role(role_of(&doc, ol), "list", RoleSource::Implicit);
-        let (doc, menu) = parse_and_select("<menu><li>a</li></menu>", "menu");
-        assert_role(role_of(&doc, menu), "list", RoleSource::Implicit);
-        let (doc, li) = parse_and_select("<ul><li>a</li></ul>", "li");
-        assert_role(role_of(&doc, li), "listitem", RoleSource::Implicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: `nav`/`main`/`article`/
-    /// `p`/`hr`/`fieldset`/`dialog`/`option`/`textarea` の暗黙 role。
-    /// `form` は別途 [`aisnap_1_form_role_requires_name`] で扱う。
-    #[test]
-    fn aisnap_1_other_representative_elements() {
-        let (doc, id) = parse_and_select("<nav>menu</nav>", "nav");
-        assert_role(role_of(&doc, id), "navigation", RoleSource::Implicit);
-
-        let (doc, id) = parse_and_select("<main>content</main>", "main");
-        assert_role(role_of(&doc, id), "main", RoleSource::Implicit);
-
-        let (doc, id) = parse_and_select("<article>post</article>", "article");
-        assert_role(role_of(&doc, id), "article", RoleSource::Implicit);
-
-        let (doc, id) = parse_and_select("<p>text</p>", "p");
-        assert_role(role_of(&doc, id), "paragraph", RoleSource::Implicit);
-
-        let (doc, id) = parse_and_select("<hr>", "hr");
-        assert_role(role_of(&doc, id), "separator", RoleSource::Implicit);
-
-        let (doc, id) = parse_and_select("<fieldset></fieldset>", "fieldset");
-        assert_role(role_of(&doc, id), "group", RoleSource::Implicit);
-
-        let (doc, id) = parse_and_select("<dialog></dialog>", "dialog");
-        assert_role(role_of(&doc, id), "dialog", RoleSource::Implicit);
-
-        let (doc, id) = parse_and_select("<select><option>a</option></select>", "option");
-        assert_role(role_of(&doc, id), "option", RoleSource::Implicit);
-
-        let (doc, id) = parse_and_select("<textarea></textarea>", "textarea");
-        assert_role(role_of(&doc, id), "textbox", RoleSource::Implicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: `img` は `"img"`、`alt=""` は
-    /// `"none"`、`alt` 省略は `"img"`。
-    #[test]
-    fn aisnap_1_img_roles() {
-        let (doc, id) = parse_and_select(r#"<img src="a.png" alt="猫">"#, "img");
-        assert_role(role_of(&doc, id), "img", RoleSource::Implicit);
-
-        let (doc, id) = parse_and_select(r#"<img src="a.png" alt="">"#, "img");
-        assert_role(role_of(&doc, id), "none", RoleSource::Implicit);
-
-        let (doc, id) = parse_and_select(r#"<img src="a.png">"#, "img");
-        assert_role(role_of(&doc, id), "img", RoleSource::Implicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: `alt=""`
-    /// でも `aria-label` の非空値、または `aria-labelledby` が文書内に
-    /// 実在する要素を指す場合（ARIA 名のヒント）は装飾画像として `none` に
-    /// せず `img` のまま扱う。
-    #[test]
-    fn aisnap_1_img_empty_alt_with_aria_name_stays_img() {
-        let (doc, id) = parse_and_select(r#"<img src="a.png" alt="" aria-label="説明">"#, "img");
-        assert_role(role_of(&doc, id), "img", RoleSource::Implicit);
-
-        let (doc, id) = parse_and_select(
-            r#"<span id="caption">説明</span><img src="a.png" alt="" aria-labelledby="caption">"#,
-            "img",
-        );
-        assert_role(role_of(&doc, id), "img", RoleSource::Implicit);
-
-        // 空白のみの ARIA 名はヒントとして扱わない（`none` のまま）。
-        let (doc, id) = parse_and_select(r#"<img src="a.png" alt="" aria-label="  ">"#, "img");
-        assert_role(role_of(&doc, id), "none", RoleSource::Implicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: 参照先が
-    /// 文書内に存在しない `aria-labelledby`（dangling IDREF）は名前の
-    /// ヒントとして扱わず、`alt=""` の `img` は `none` のままになる
-    /// （`has_name_hint` が参照先未解決でも非空値だけで名前ありと誤判定
-    /// していた不具合の修正）。
-    #[test]
-    fn aisnap_1_img_empty_alt_with_dangling_labelledby_stays_none() {
-        let (doc, id) = parse_and_select(
-            r#"<img src="a.png" alt="" aria-labelledby="missing">"#,
-            "img",
-        );
-        assert_role(role_of(&doc, id), "none", RoleSource::Implicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘 P1）: 参照先
-    /// の要素は文書内に実在するが空でないテキストを持たない
-    /// `aria-labelledby`（例: `<span id="x"></span>`）は名前のヒントとして
-    /// 扱わず、`alt=""` の `img` は `none` のままになる（「参照先が存在する」
-    /// だけで名前ありと誤判定しない）。
-    #[test]
-    fn aisnap_1_img_empty_alt_with_empty_labelledby_target_stays_none() {
-        let (doc, id) = parse_and_select(
-            r#"<span id="caption"></span><img src="a.png" alt="" aria-labelledby="caption">"#,
-            "img",
-        );
-        assert_role(role_of(&doc, id), "none", RoleSource::Implicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: 名前の
-    /// ない `form` は `form` にせず `generic`（Fallback）とする
-    /// （HTML-AAM。`section` の `region` 昇格と同じ規則）。名前が
-    /// `aria-label` の非空値、または `aria-labelledby` の参照先が文書内に
-    /// 実在する場合のみ `form` になる。
-    #[test]
-    fn aisnap_1_form_role_requires_name() {
-        let (doc, id) = parse_and_select("<form></form>", "form");
-        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
-
-        let (doc, id) = parse_and_select(r#"<form aria-label="検索"></form>"#, "form");
-        assert_role(role_of(&doc, id), "form", RoleSource::Implicit);
-
-        let (doc, id) = parse_and_select(
-            r#"<h1 id="h1">検索</h1><form aria-labelledby="h1"></form>"#,
-            "form",
-        );
-        assert_role(role_of(&doc, id), "form", RoleSource::Implicit);
-
-        // 空白のみの aria-label はヒントとして扱わない（`generic` のまま）。
-        let (doc, id) = parse_and_select(r#"<form aria-label="  "></form>"#, "form");
-        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘 P1）:
-    /// [`build_id_index`] を文書につき 1 回だけ構築し、`aria-labelledby` を
-    /// 持つ複数要素（`form`・`img`）への [`compute_role`] 呼び出しへ
-    /// 同じ索引を共有しても、要素ごとに正しい名前ヒント判定になること
-    /// （`compute_role` が要素ごとに索引を再構築していた旧実装の O(N²)
-    /// 走査を、呼び出し元で 1 回構築した索引の共有に修正したことの回帰
-    /// テスト）。
-    #[test]
-    fn aisnap_1_compute_role_shares_one_id_index_across_multiple_elements() {
-        let html = concat!(
-            r#"<h1 id="caption">検索</h1>"#,
-            r#"<form aria-labelledby="caption"></form>"#,
-            r#"<img src="a.png" alt="" aria-labelledby="caption">"#,
-            r#"<img src="b.png" alt="" aria-labelledby="missing">"#,
-        );
-        let parsed = parse_document(html, &ParseOptions::default()).expect("パースは成功する");
-        let doc = parsed.document;
-        let root = doc.root();
-        let id_index = build_id_index(&doc);
-
-        let form = query_selector_str(&doc, root, "form")
-            .expect("セレクタは解釈できる")
-            .expect("form 要素が見つかる");
         assert_role(
-            compute_role(&doc, form, &id_index),
-            "form",
-            RoleSource::Implicit,
-        );
-
-        let images = query_selector_all_str(&doc, root, "img").expect("セレクタは解釈できる");
-        // `img` は 2 つ存在する前提（`aria-labelledby` の解決先あり/なし）。
-        assert_eq!(images.len(), 2, "img 要素は 2 つ選択できる");
-        assert_role(
-            compute_role(&doc, images[0], &id_index),
-            "img",
-            RoleSource::Implicit,
-        );
-        assert_role(
-            compute_role(&doc, images[1], &id_index),
-            "none",
+            compute_role(&doc, doc.root()),
+            "document",
             RoleSource::Implicit,
         );
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘 P0）: 同じ
-    /// 参照先を多数の `aria-labelledby` が指しても（[`IdIndex`] のキャッシュ
-    /// 経由で）毎回正しく判定できる。参照先はネストした子孫に空白のみの
-    /// テキストノードと実テキストを両方持たせ、[`element_has_non_empty_text`]
-    /// が子孫全体（直下の子だけでなく孫）を見ることも確認する。
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: button・link の暗黙 role。
     #[test]
-    fn aisnap_1_labelledby_cache_is_reused_across_many_references() {
-        let html = concat!(
-            r#"<div id="caption"><span>  </span><em>検索</em></div>"#,
-            r#"<form aria-labelledby="caption"></form>"#,
-            r#"<img src="a.png" alt="" aria-labelledby="caption">"#,
-            r#"<img src="b.png" alt="" aria-labelledby="caption">"#,
-            r#"<img src="c.png" alt="" aria-labelledby="caption">"#,
-        );
-        let parsed = parse_document(html, &ParseOptions::default()).expect("パースは成功する");
-        let doc = parsed.document;
-        let root = doc.root();
-        let id_index = build_id_index(&doc);
-
-        let form = query_selector_str(&doc, root, "form")
-            .expect("セレクタは解釈できる")
-            .expect("form 要素が見つかる");
-        assert_role(
-            compute_role(&doc, form, &id_index),
-            "form",
+    fn aisnap_1_button_and_link() {
+        check(
+            "<button>b</button>",
+            "button",
+            "button",
             RoleSource::Implicit,
         );
-
-        let images = query_selector_all_str(&doc, root, "img").expect("セレクタは解釈できる");
-        assert_eq!(images.len(), 3, "img 要素は 3 つ選択できる");
-        for image in images {
-            assert_role(
-                compute_role(&doc, image, &id_index),
-                "img",
-                RoleSource::Implicit,
-            );
-        }
+        check(r#"<a href="/x">l</a>"#, "a", "link", RoleSource::Implicit);
+        check("<a>l</a>", "a", "generic", RoleSource::Fallback);
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘 P0）:
-    /// 「同じ参照先を多数の `aria-labelledby` が指す」場合だけでなく、
-    /// 「入れ子になった別々の要素それぞれに `id` を振り、それぞれを別の
-    /// `aria-labelledby` から参照する」場合でも短時間で完了することの
-    /// 回帰テスト。参照先ごとに `doc.descendants` で子孫を再走査する
-    /// 実装（[`IdIndex`] 導入前の旧実装）では、各階層の走査が共有されず
-    /// 合計で O(N²) になる（`query.rs` の
-    /// `core_1_descendant_backtracking_does_not_explode_with_deep_nesting`
-    /// と同じ手法でタイムボックスする）。
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: heading の暗黙 role。
     #[test]
-    fn aisnap_1_nested_distinct_labelledby_targets_do_not_explode_with_deep_nesting() {
-        const DEPTH: usize = 4_000;
-        // 深さ `DEPTH` の入れ子要素それぞれに一意な `id` を振り、最内周に
-        // だけ実テキストを 1 つ置く。各階層の要素を、外側に並べた別々の
-        // `img[aria-labelledby]` から参照することで、参照先ごとに子孫全体を
-        // 再走査する素朴な実装では階層が深いほど 1 回の走査が長くなり、
-        // 合計コストが O(N²) になる入力にする。
-        let mut html = String::with_capacity(DEPTH * 40);
-        for depth in 0..DEPTH {
-            html.push_str(&format!(r#"<div id="n{depth}">"#));
-        }
-        html.push_str("text");
-        for _ in 0..DEPTH {
-            html.push_str("</div>");
-        }
-        for depth in 0..DEPTH {
-            html.push_str(&format!(
-                r#"<img src="{depth}.png" alt="" aria-labelledby="n{depth}">"#
-            ));
-        }
-
-        let options = ParseOptions::default().with_max_nodes(usize::MAX);
-        let doc = parse_document(&html, &options)
-            .expect("深いネストでも成功する")
-            .document;
-        let root = doc.root();
-
-        let started = std::time::Instant::now();
-        let id_index = build_id_index(&doc);
-        let images = query_selector_all_str(&doc, root, "img").expect("セレクタは解釈できる");
-        assert_eq!(images.len(), DEPTH, "img 要素は DEPTH 個選択できる");
-        for image in images {
-            // 各 `img` の参照先（`n{depth}`）は最内周のテキストを子孫に持つ
-            // ため、いずれも名前ヒントありと判定され `img`（Implicit）になる。
-            assert_role(
-                compute_role(&doc, image, &id_index),
-                "img",
-                RoleSource::Implicit,
-            );
-        }
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "対象ごとの子孫再走査による O(N²) が疑われる（所要時間: {:?}）",
-            started.elapsed()
-        );
+    fn aisnap_1_headings() {
+        check("<h1>t</h1>", "h1", "heading", RoleSource::Implicit);
+        check("<h6>t</h6>", "h6", "heading", RoleSource::Implicit);
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: 参照先が
-    /// 文書内に存在しない `aria-labelledby`（dangling IDREF）を持つ `form`
-    /// は名前を持たないとみなし `generic`（Fallback）のままになる。
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: table 系の暗黙 role。
     #[test]
-    fn aisnap_1_form_dangling_labelledby_stays_generic() {
-        let (doc, id) = parse_and_select(r#"<form aria-labelledby="missing"></form>"#, "form");
-        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
+    fn aisnap_1_table_family() {
+        let html = "<table><thead><tr><th>h</th></tr></thead><tbody><tr><td>c</td></tr></tbody><tfoot><tr><td>f</td></tr></tfoot></table>";
+        let cases = [
+            ("table", "table"),
+            ("thead", "rowgroup"),
+            ("tbody", "rowgroup"),
+            ("tfoot", "rowgroup"),
+            ("tr", "row"),
+            ("td", "cell"),
+            ("th", "columnheader"),
+        ];
+        for (selector, expected) in cases {
+            check(html, selector, expected, RoleSource::Implicit);
+        }
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘 P1）: 参照先
-    /// の要素は文書内に実在するが空でないテキストを持たない
-    /// `aria-labelledby`（例: `<span id="x"></span>`）は名前のヒントとして
-    /// 扱わず、`form` は名前を持たないとみなし `generic`（Fallback）のまま
-    /// になる。
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `th scope=row` は大文字小文字を
+    /// 区別せず rowheader。
     #[test]
-    fn aisnap_1_form_empty_labelledby_target_stays_generic() {
-        let (doc, id) = parse_and_select(
-            r#"<span id="x"></span><form aria-labelledby="x"></form>"#,
-            "form",
-        );
-        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
+    fn aisnap_1_th_scope_row() {
+        for scope in ["row", "ROW"] {
+            let html = format!(r#"<table><tr><th scope="{scope}">h</th></tr></table>"#);
+            check(&html, "th", "rowheader", RoleSource::Implicit);
+        }
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: 明示 role（`role` 属性）が
-    /// 暗黙 role より優先される。
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: list 系の暗黙 role。
+    #[test]
+    fn aisnap_1_list_family() {
+        let html = "<ul><li>a</li></ul><ol><li>b</li></ol>";
+        check(html, "ul", "list", RoleSource::Implicit);
+        check(html, "ol", "list", RoleSource::Implicit);
+        check(html, "li", "listitem", RoleSource::Implicit);
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: 明示 role は暗黙 role より優先。
     #[test]
     fn aisnap_1_explicit_role_wins() {
-        let (doc, id) = parse_and_select(r#"<div role="button">x</div>"#, "div");
-        assert_role(role_of(&doc, id), "button", RoleSource::Explicit);
+        check(
+            r#"<div role="button">x</div>"#,
+            "div",
+            "button",
+            RoleSource::Explicit,
+        );
+        check(
+            r#"<a href="/x" role="tab">x</a>"#,
+            "a",
+            "tab",
+            RoleSource::Explicit,
+        );
+        check(
+            r#"<div role="none">x</div>"#,
+            "div",
+            "none",
+            RoleSource::Explicit,
+        );
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: 複数トークンのうち、許可リストに
-    /// 最初に一致するものを採用する。
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: 未知トークンは飛ばして最初の
+    /// 有効トークンを採用し、大文字小文字は区別しない。
     #[test]
-    fn aisnap_1_explicit_role_first_valid_token() {
-        let (doc, id) = parse_and_select(r#"<div role="foo button">x</div>"#, "div");
-        assert_role(role_of(&doc, id), "button", RoleSource::Explicit);
+    fn aisnap_1_explicit_role_token_selection() {
+        check(
+            r#"<div role="foo button">x</div>"#,
+            "div",
+            "button",
+            RoleSource::Explicit,
+        );
+        check(
+            r#"<div role="Button">x</div>"#,
+            "div",
+            "button",
+            RoleSource::Explicit,
+        );
+        check(
+            r#"<div role="foo">x</div>"#,
+            "div",
+            "generic",
+            RoleSource::Fallback,
+        );
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: `role` 属性値の大文字小文字は
-    /// 区別しない。
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: abstract role は拒否し暗黙 role。
     #[test]
-    fn aisnap_1_explicit_role_case_insensitive() {
-        let (doc, id) = parse_and_select(r#"<div role="Button">x</div>"#, "div");
-        assert_role(role_of(&doc, id), "button", RoleSource::Explicit);
+    fn aisnap_1_abstract_role_rejected() {
+        check(
+            r#"<button role="landmark">x</button>"#,
+            "button",
+            "button",
+            RoleSource::Implicit,
+        );
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: 前後に空白を含む `role` 属性値
-    /// からもトークンを抽出できる。
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: none/presentation の競合解決。
     #[test]
-    fn aisnap_1_explicit_role_trims_whitespace() {
-        let (doc, id) = parse_and_select(r#"<div role="  button  ">x</div>"#, "div");
-        assert_role(role_of(&doc, id), "button", RoleSource::Explicit);
+    fn aisnap_1_presentational_conflict_resolution() {
+        check(
+            r#"<button role="presentation">x</button>"#,
+            "button",
+            "button",
+            RoleSource::Implicit,
+        );
+        check(
+            r#"<a href="/x" role="none">x</a>"#,
+            "a",
+            "link",
+            RoleSource::Implicit,
+        );
+        check(
+            r#"<div role="presentation" aria-label="x">x</div>"#,
+            "div",
+            "generic",
+            RoleSource::Fallback,
+        );
+        check(
+            r#"<span role="none" tabindex="0">x</span>"#,
+            "span",
+            "generic",
+            RoleSource::Fallback,
+        );
+        check(
+            r#"<div role="presentation">x</div>"#,
+            "div",
+            "presentation",
+            RoleSource::Explicit,
+        );
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: 有効なトークンが無ければ暗黙
-    /// role へフォールバックする。
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `input` は #542 で差し替えるまで
+    /// generic（Fallback）。継ぎ目を固定する回帰テスト（#542 で更新する）。
     #[test]
-    fn aisnap_1_explicit_role_unknown_falls_back_to_implicit() {
-        let (doc, id) = parse_and_select(r#"<div role="foo">x</div>"#, "div");
-        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
+    fn aisnap_1_input_is_placeholder_until_task_11_3_2() {
+        check(
+            r#"<input type="text">"#,
+            "input",
+            "generic",
+            RoleSource::Fallback,
+        );
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: 空の `role=""` は有効なトークンが
-    /// 無いため暗黙 role へ進む。
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: select・header・footer は #543 で
+    /// 差し替えるまで generic（Fallback）。
     #[test]
-    fn aisnap_1_explicit_role_empty_falls_back_to_implicit() {
-        let (doc, id) = parse_and_select(r#"<button role="">x</button>"#, "button");
-        assert_role(role_of(&doc, id), "button", RoleSource::Implicit);
+    fn aisnap_1_contextual_elements_are_placeholder_until_task_11_3_3() {
+        check(
+            "<select><option>a</option></select>",
+            "select",
+            "generic",
+            RoleSource::Fallback,
+        );
+        check(
+            "<header>h</header>",
+            "header",
+            "generic",
+            RoleSource::Fallback,
+        );
+        check(
+            "<footer>f</footer>",
+            "footer",
+            "generic",
+            RoleSource::Fallback,
+        );
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: abstract role（例: `landmark`）は
-    /// 許可リストに含まれないため、有効な `role` 指定として扱わない。
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: テキストノード・範囲外 ID は None。
     #[test]
-    fn aisnap_1_abstract_role_is_not_accepted() {
-        let (doc, id) = parse_and_select(r#"<button role="landmark">x</button>"#, "button");
-        assert_role(role_of(&doc, id), "button", RoleSource::Implicit);
+    fn aisnap_1_non_element_is_none() {
+        let (doc, id) = parse_and_select("<p>text</p>", "p");
+        let text = doc.children(id).next().expect("テキスト子がある");
+        assert!(compute_role(&doc, text).is_none());
     }
 
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: `role` 属性は要素の暗黙 role を
-    /// 上書きできる。
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: 非 HTML 名前空間（SVG）は generic。
     #[test]
-    fn aisnap_1_explicit_role_overrides_element_role() {
-        let (doc, id) = parse_and_select(r##"<a href="#" role="tab">x</a>"##, "a");
-        assert_role(role_of(&doc, id), "tab", RoleSource::Explicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）:
-    /// フォーカス可能な要素（ネイティブに対話的な `button`）には
-    /// `role="presentation"`/`role="none"` を適用できず、暗黙 role
-    /// （`button`/Implicit）へフォールバックする（presentation/none
-    /// 競合解決規則。[`has_focus_or_global_aria`]）。
-    #[test]
-    fn aisnap_1_presentation_ignored_on_focusable_button() {
-        let (doc, id) = parse_and_select(r#"<button role="presentation">x</button>"#, "button");
-        assert_role(role_of(&doc, id), "button", RoleSource::Implicit);
-
-        let (doc, id) = parse_and_select(r#"<button role="none">x</button>"#, "button");
-        assert_role(role_of(&doc, id), "button", RoleSource::Implicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）:
-    /// `tabindex` 属性を持つ要素もフォーカス可能とみなし、
-    /// `role="presentation"` を無視して暗黙 role（`div` は対応表に無いため
-    /// `generic`/Fallback）へフォールバックする。
-    #[test]
-    fn aisnap_1_presentation_ignored_on_tabindex_element() {
-        let (doc, id) = parse_and_select(r#"<div tabindex="0" role="presentation">x</div>"#, "div");
-        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: グローバル
-    /// ARIA 属性（`aria-label`）を持つ要素も `role="none"` を無視して
-    /// 暗黙 role へフォールバックする。
-    #[test]
-    fn aisnap_1_none_ignored_on_element_with_global_aria_attribute() {
-        let (doc, id) = parse_and_select(r#"<div role="none" aria-label="x">y</div>"#, "div");
-        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541・PR #566 レビュー指摘）: フォーカス
-    /// 可能でもグローバル ARIA 属性も持たない要素は、従来どおり
-    /// `presentation`/`none` を明示 role として採用する。
-    #[test]
-    fn aisnap_1_presentation_accepted_without_focus_or_global_aria() {
-        let (doc, id) = parse_and_select(r#"<div role="presentation">x</div>"#, "div");
-        assert_role(role_of(&doc, id), "presentation", RoleSource::Explicit);
-
-        let (doc, id) = parse_and_select(r#"<img src="a.png" alt="" role="none">"#, "img");
-        assert_role(role_of(&doc, id), "none", RoleSource::Explicit);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: テキストノードは role を持たず
-    /// `None`。
-    #[test]
-    fn aisnap_1_text_node_has_no_role() {
-        let parsed =
-            parse_document("<p>text</p>", &ParseOptions::default()).expect("パースは成功する");
-        let doc = parsed.document;
-        let root = doc.root();
-        let p = query_selector_str(&doc, root, "p")
-            .expect("セレクタは解釈できる")
-            .expect("p 要素が見つかる");
-        let text_node = doc.first_child(p).expect("p の子にテキストノードがある");
-        assert_eq!(role_of(&doc, text_node), None);
-    }
-
-    /// AISNAP-1（TASK-11.3.1・Issue #541）: 対応表に無い要素（SVG）は
-    /// `"generic"`/Fallback。
-    #[test]
-    fn aisnap_1_svg_is_generic_fallback() {
-        let (doc, id) = parse_and_select("<svg><circle/></svg>", "svg");
-        assert_role(role_of(&doc, id), "generic", RoleSource::Fallback);
+    fn aisnap_1_svg_is_generic() {
+        check(
+            "<svg><a href=\"/x\"></a></svg>",
+            "svg",
+            "generic",
+            RoleSource::Fallback,
+        );
     }
 }

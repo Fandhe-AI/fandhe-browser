@@ -17,7 +17,8 @@
 //!   link・heading・table・list 等の代表要素は TASK-11.3.1（Issue #541）で
 //!   実装済み（[`role`] モジュール・[`role::compute_role`]）。`input[type]`
 //!   の対応表は TASK-11.3.2（Issue #542）、`select`・`header`/`footer`/
-//!   `aside`（sectioning 祖先判定）は TASK-11.3.3（Issue #543）が担う
+//!   `aside`（sectioning 祖先判定）は TASK-11.3.3（Issue #543）が担う。
+//!   form・section・img の名前依存の昇格は担当未割り当て（role.rs の doc 参照）
 //! - accessible name（アクセシブルネーム）算出: TASK-11.4（Issue #73）
 //! - state（状態）算出: TASK-11.5（Issue #74）で実装済み（[`state`] モジュール・
 //!   [`state::compute_state`]）。ただし DOM 構築時にこの関数を呼び出す配線は
@@ -29,7 +30,7 @@
 
 pub mod role;
 pub mod state;
-pub use role::{ComputedRole, IdIndex, RoleSource, build_id_index, compute_role};
+pub use role::{ComputedRole, RoleSource, compute_role};
 pub use state::{CheckedState, State, compute_state};
 
 /// 方式 B 簡約ツリーの 1 ノード（`AISNAP-1`・`TASK-11`・`MS-2`）。
