@@ -22,13 +22,13 @@
 //! TASK-29・`JS-1`）。実行コマンド:
 //! `cargo test -p fandhe-browser-js --features test-support`。
 
-use std::cell::RefCell;
 use std::process::ExitCode;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fandhe_browser_js::process_engine::ParentNativeFn;
 use fandhe_browser_js::process_engine::{V8ProcessEngine, WorkerSpawnConfigForTest};
-use fandhe_browser_js::{EvaluateOptions, JsEngineError, JsValue, NativeCallContext, NativeFn};
+use fandhe_browser_js::{EvaluateOptions, JsEngineError, JsValue, NativeCallContext};
 
 /// `super::v8_engine::SCRIPT_EXECUTION_TIMEOUT`（子の watchdog。`pub(crate)`
 /// で本クレート外からは参照できない）の値を、本結合テストの目的
@@ -955,7 +955,7 @@ fn js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation() {
 /// は `spawn_config.native_proxies_for_test` に同じ id で子側のプロキシ名を
 /// 渡しておく。戻り値はエンジンと、実際に割り当てられた id。
 fn engine_with_one_native_fn_for_test(
-    native_fn: NativeFn,
+    native_fn: ParentNativeFn,
     spawn_config: WorkerSpawnConfigForTest,
 ) -> (V8ProcessEngine, u32) {
     let mut engine = V8ProcessEngine::new_for_test(spawn_config);
@@ -967,13 +967,13 @@ fn engine_with_one_native_fn_for_test(
 
 /// `TASK-29`・Issue #526 受け入れ条件 1: 親は `NativeCall` を受け取ると、
 /// 対応する `NativeFn` を実行し、結果を `NativeReturn` として子へ返す。
-/// `NativeFn` が受け取った引数（`Rc<RefCell<..>>` で記録）と、JS 側で見える
+/// `NativeFn` が受け取った引数（`Arc<Mutex<..>>` で記録）と、JS 側で見える
 /// 戻り値の両方を確認する。
 fn js_1_native_call_round_trip_returns_value_and_records_args() {
-    let seen_args: Rc<RefCell<Vec<JsValue>>> = Rc::new(RefCell::new(Vec::new()));
-    let seen_args_for_closure = Rc::clone(&seen_args);
-    let native_fn: NativeFn = Box::new(move |args: &[JsValue], _ctx: &NativeCallContext| {
-        *seen_args_for_closure.borrow_mut() = args.to_vec();
+    let seen_args: Arc<Mutex<Vec<JsValue>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_args_for_closure = Arc::clone(&seen_args);
+    let native_fn: ParentNativeFn = Box::new(move |args: &[JsValue], _ctx: &NativeCallContext| {
+        *seen_args_for_closure.lock().unwrap() = args.to_vec();
         Ok(JsValue::Number(42.0))
     });
 
@@ -995,7 +995,7 @@ fn js_1_native_call_round_trip_returns_value_and_records_args() {
         .unwrap_or_else(|err| panic!("calling the native proxy must succeed: {err}"));
     assert_eq!(result, JsValue::Number(42.0));
     assert_eq!(
-        *seen_args.borrow(),
+        *seen_args.lock().unwrap(),
         vec![JsValue::Number(1.0), JsValue::String("a".to_string())]
     );
 }
@@ -1004,7 +1004,7 @@ fn js_1_native_call_round_trip_returns_value_and_records_args() {
 /// `try`/`catch` で捕捉でき、メッセージが一致し、続く評価で Context
 /// （グローバル変数）が残っていること。
 fn js_1_native_call_err_is_catchable_and_context_survives() {
-    let native_fn: NativeFn = Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| {
+    let native_fn: ParentNativeFn = Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| {
         Err(JsEngineError::EvaluationFailed("boom".to_string()))
     });
     let (mut engine, id) = engine_with_one_native_fn_for_test(
@@ -1050,7 +1050,7 @@ fn js_1_native_call_err_is_catchable_and_context_survives() {
 /// 短く）ブロックさせ、`Ok` ではなく子の watchdog 由来の `Timeout` になる
 /// こと、Context は残ることを確認する。
 fn js_1_native_call_duration_is_included_in_the_watchdog_timeout() {
-    let native_fn: NativeFn = Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| {
+    let native_fn: ParentNativeFn = Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| {
         std::thread::sleep(CHILD_WATCHDOG_TIMEOUT + Duration::from_millis(300));
         Ok(JsValue::Number(1.0))
     });
@@ -1107,7 +1107,7 @@ fn js_1_native_call_duration_is_included_in_the_watchdog_timeout() {
 /// `Timeout`（"context was discarded" を含む）を返すこと。次の評価は
 /// 新しい子で成功すること（前の状態は消えている）。
 fn js_1_native_call_exceeding_evaluate_deadline_discards_context() {
-    let native_fn: NativeFn = Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| {
+    let native_fn: ParentNativeFn = Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| {
         std::thread::sleep(PARENT_EVALUATE_DEADLINE + Duration::from_millis(300));
         Ok(JsValue::Number(1.0))
     });
