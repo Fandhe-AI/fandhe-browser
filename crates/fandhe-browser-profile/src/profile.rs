@@ -722,14 +722,17 @@ impl Profile {
     /// [`ProfileError::InvalidLayout`] の `path` に退避ディレクトリを載せて返す
     /// （そのパスを `open` して `delete` を再試行できる）。
     ///
-    /// 各サブディレクトリは走査前に `..` の実体が検証済みの親と一致するかを
-    /// 確認し、別プロセスに境界外へ移された場合は拒否する。
+    /// ルートは退避名が同じ実体を指し続けること、各ディレクトリは `..` が検証済み
+    /// の親と一致することを、エントリを `unlinkat` する直前ごとに確認し、別
+    /// プロセスに境界外へ移された場合は拒否する。復元・再削除の前にも退避名が
+    /// 同じ実体を指すことを確認し、差し替えられていれば何も戻さず消さない。
     ///
     /// 残る競合: 手順 1 の確認から手順 2 の `renameat` までの間にパスが差し替え
     /// られ得るが、退避後に inode を再確認し、不一致なら戻して拒否する。
     /// 非 Linux の unix 等 `RENAME_NOREPLACE` を使えない環境では退避・復元の
-    /// 確認と rename の間の競合が残る。サブディレクトリの `..` 確認から
-    /// `unlinkat` までの極小の窓も残る（同一ユーザーの書き込み権限が前提）。
+    /// 確認と rename の間の競合が残る。各確認から直後の `unlinkat`・`renameat`
+    /// までの極小の窓も残る（POSIX に原子的な確認付き unlink が無い。同一
+    /// ユーザーの書き込み権限が前提）。
     ///
     /// Windows では `open` が常に失敗するため到達しないが、成功を装わず
     /// [`ProfileError::Unsupported`] を返す（`XOS-7`〜`XOS-10`、REPAIR-3）。
@@ -793,6 +796,15 @@ impl Profile {
                 Err(err) => return Err(ProfileError::Io(err.into())),
             }
 
+            let guard = DeleteGuard {
+                parent_fd: parent_fd.as_fd(),
+                tomb_name: &tomb_name,
+                root_id: (root_stat.st_dev, root_stat.st_ino as u64),
+            };
+            let parent_st =
+                rustix::fs::fstat(&parent_fd).map_err(|err| ProfileError::Io(err.into()))?;
+            let parent_id = (parent_st.st_dev, parent_st.st_ino as u64);
+
             let result = (|| {
                 // 退避したものが検証済みの root_fd と同じ実体であることを確認する。
                 let moved = rustix::fs::statat(&parent_fd, &tomb_name, AtFlags::SYMLINK_NOFOLLOW)
@@ -804,7 +816,15 @@ impl Profile {
                     });
                 }
                 let root_mount = mount_identity(root_fd.as_fd())?;
-                remove_dir_contents_at(root_fd.as_fd(), root_mount, 0, &root, None, None)?;
+                remove_dir_contents_at(
+                    root_fd.as_fd(),
+                    root_mount,
+                    0,
+                    &root,
+                    None,
+                    Some(parent_id),
+                    &guard,
+                )?;
                 match rustix::fs::unlinkat(&parent_fd, &tomb_name, AtFlags::REMOVEDIR) {
                     Ok(()) => Ok(()),
                     Err(Errno::NOTEMPTY) => Err(ProfileError::InvalidLayout {
@@ -816,31 +836,55 @@ impl Profile {
             })();
 
             let result = if result.is_err() {
-                // 元の名前へ既存エントリを上書きせず戻す。並行 open が元の名前を
-                // 占有していて戻せない場合、退避ツリーに cookie 等が孤立しないよう
-                // 保持中の root_fd で再度の削除を試み（best effort）、それでも
-                // 残るなら退避ディレクトリのパスを載せて報告する（呼び出し元は
-                // そのパスを `Profile::open` して `delete` を再試行できる）。
-                match rename_noreplace(parent_fd.as_fd(), &tomb_name, &root_name) {
-                    Ok(()) => result,
-                    Err(_) => {
-                        let retry = mount_identity(root_fd.as_fd())
-                            .and_then(|mount| {
-                                remove_dir_contents_at(root_fd.as_fd(), mount, 0, &root, None, None)
-                            })
-                            .and_then(|()| {
-                                rustix::fs::unlinkat(&parent_fd, &tomb_name, AtFlags::REMOVEDIR)
-                                    .map_err(|err| ProfileError::Io(err.into()))
-                            });
-                        match retry {
-                            Ok(()) => Ok(()),
-                            Err(_) => Err(ProfileError::InvalidLayout {
-                                path: root
-                                    .parent()
-                                    .map(|p| p.join(&tomb_name))
-                                    .unwrap_or_else(|| PathBuf::from(&tomb_name)),
-                                reason: "profile deletion failed and the original name was re-occupied; remaining data is kept in this staging directory",
-                            }),
+                // 退避名が依然として削除対象（root_fd）の実体を指す場合に限り、
+                // 元の名前へ既存エントリを上書きせず戻す。退避名が別の実体に
+                // 差し替えられている場合は、復元も再削除も行わない（別の
+                // ディレクトリを元の名前へ戻す・root_fd 経由で元のツリーを消して
+                // 差し替え側を rmdir する事故を防ぐ。fail-closed）。
+                let tomb_path = root
+                    .parent()
+                    .map(|p| p.join(&tomb_name))
+                    .unwrap_or_else(|| PathBuf::from(&tomb_name));
+                if guard.verify_root_name().is_err() {
+                    Err(ProfileError::InvalidLayout {
+                        path: tomb_path,
+                        reason: "staging directory no longer refers to the profile being deleted; nothing was restored or removed",
+                    })
+                } else {
+                    match rename_noreplace(parent_fd.as_fd(), &tomb_name, &root_name) {
+                        Ok(()) => result,
+                        Err(_) => {
+                            // 並行 open が元の名前を占有していて戻せない。退避
+                            // ツリーに cookie 等が孤立しないよう、退避名が同じ
+                            // 実体を指すことを再確認したうえで保持中の root_fd で
+                            // 再度の削除を試み（best effort）、残るなら退避
+                            // ディレクトリのパスを載せて報告する。
+                            let retry = guard
+                                .verify_root_name()
+                                .and_then(|()| mount_identity(root_fd.as_fd()))
+                                .and_then(|mount| {
+                                    remove_dir_contents_at(
+                                        root_fd.as_fd(),
+                                        mount,
+                                        0,
+                                        &root,
+                                        None,
+                                        Some(parent_id),
+                                        &guard,
+                                    )
+                                })
+                                .and_then(|()| guard.verify_root_name())
+                                .and_then(|()| {
+                                    rustix::fs::unlinkat(&parent_fd, &tomb_name, AtFlags::REMOVEDIR)
+                                        .map_err(|err| ProfileError::Io(err.into()))
+                                });
+                            match retry {
+                                Ok(()) => Ok(()),
+                                Err(_) => Err(ProfileError::InvalidLayout {
+                                    path: tomb_path,
+                                    reason: "profile deletion failed and the original name was re-occupied; remaining data is kept in this staging directory",
+                                }),
+                            }
                         }
                     }
                 }
@@ -935,6 +979,63 @@ fn same_mount(root: MountIdentity, child: MountIdentity) -> bool {
     }
 }
 
+/// 再帰削除中、退避ルートが検証済みの親の退避名にぶら下がったままかを確認する
+/// ためのガード（[`Profile::delete`] が作り、[`remove_dir_contents_at`] へ渡す。
+/// `PROF-5`）。
+///
+/// 各ディレクトリの `..` 確認（親子関係）と併せて、ルートから走査中の
+/// ディレクトリまでの連鎖が境界内にあることを確認する。POSIX に原子的な
+/// 「確認して unlink」は無いため、確認と直後の `unlinkat` の間の極小の窓は
+/// 残る（同一ユーザーの書き込み権限が前提）。
+#[cfg(unix)]
+struct DeleteGuard<'a> {
+    parent_fd: BorrowedFd<'a>,
+    tomb_name: &'a std::ffi::OsStr,
+    root_id: (rustix::fs::Dev, u64),
+}
+
+#[cfg(unix)]
+impl DeleteGuard<'_> {
+    /// 退避名が依然として削除対象ルートと同じ実体を指すかを確認する。
+    fn verify_root_name(&self) -> Result<(), ProfileError> {
+        let st = rustix::fs::statat(self.parent_fd, self.tomb_name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| ProfileError::InvalidLayout {
+                path: PathBuf::from(self.tomb_name),
+                reason: "profile staging directory was moved or removed during deletion",
+            })?;
+        if (st.st_dev, st.st_ino as u64) != self.root_id {
+            return Err(ProfileError::InvalidLayout {
+                path: PathBuf::from(self.tomb_name),
+                reason: "profile staging directory was replaced during deletion",
+            });
+        }
+        Ok(())
+    }
+
+    /// `dir_fd` の `..` が `expected_parent` と一致し、かつルートが退避名の
+    /// ままであることを確認する。`unlinkat` の直前に呼ぶ。
+    fn verify_attached(
+        &self,
+        dir_fd: BorrowedFd<'_>,
+        expected_parent: Option<(rustix::fs::Dev, u64)>,
+        display_path: &Path,
+    ) -> Result<(), ProfileError> {
+        self.verify_root_name()?;
+        if let Some(expected) = expected_parent {
+            let up = rustix::fs::openat(dir_fd, "..", OPEN_DIR_FLAGS, Mode::empty())
+                .map_err(|err| classify_dir_open_error(display_path, err))?;
+            let st = rustix::fs::fstat(&up).map_err(|err| ProfileError::Io(err.into()))?;
+            if (st.st_dev, st.st_ino as u64) != expected {
+                return Err(ProfileError::InvalidLayout {
+                    path: display_path.to_path_buf(),
+                    reason: "profile subdirectory was moved out during deletion",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// 再帰削除の深さ上限。これを超える入れ子はスタック・fd の消費を抑えるため
 /// [`ProfileError::InvalidLayout`] で拒否する（`PROF-5`）。
 #[cfg(unix)]
@@ -959,6 +1060,7 @@ fn remove_dir_contents_at(
     display_path: &Path,
     keep: Option<&std::ffi::OsStr>,
     parent_id: Option<(rustix::fs::Dev, u64)>,
+    guard: &DeleteGuard<'_>,
 ) -> Result<(), ProfileError> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -969,19 +1071,6 @@ fn remove_dir_contents_at(
         });
     }
     for _ in 0..MAX_DELETE_PASSES {
-        // 開いた後に別プロセスがこのディレクトリを検証済みの親配下から移動して
-        // いないか、".." の実体で確認する（移動されていたら境界外を消さない）。
-        if let Some(expected) = parent_id {
-            let up = rustix::fs::openat(dir_fd, "..", OPEN_DIR_FLAGS, Mode::empty())
-                .map_err(|err| classify_dir_open_error(display_path, err))?;
-            let st = rustix::fs::fstat(&up).map_err(|err| ProfileError::Io(err.into()))?;
-            if (st.st_dev, st.st_ino as u64) != expected {
-                return Err(ProfileError::InvalidLayout {
-                    path: display_path.to_path_buf(),
-                    reason: "profile subdirectory was moved out during deletion",
-                });
-            }
-        }
         let dir = Dir::read_from(dir_fd).map_err(|err| ProfileError::Io(err.into()))?;
         let mut removed_any = false;
         for entry in dir {
@@ -1023,13 +1112,16 @@ fn remove_dir_contents_at(
                     &child_path,
                     None,
                     Some((dir_st.st_dev, dir_st.st_ino as u64)),
+                    guard,
                 )?;
                 drop(child_fd);
+                guard.verify_attached(dir_fd, parent_id, display_path)?;
                 match rustix::fs::unlinkat(dir_fd, name, AtFlags::REMOVEDIR) {
                     Ok(()) | Err(Errno::NOENT) => {}
                     Err(err) => return Err(ProfileError::Io(err.into())),
                 }
             } else {
+                guard.verify_attached(dir_fd, parent_id, display_path)?;
                 match rustix::fs::unlinkat(dir_fd, name, AtFlags::empty()) {
                     Ok(()) | Err(Errno::NOENT) => {}
                     Err(err) => return Err(ProfileError::Io(err.into())),
@@ -2298,5 +2390,38 @@ mod tests {
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from("profile")]);
         Profile::open(&root).expect("reopen after failed delete");
+    }
+
+    /// `PROF-5`: 退避名が別の実体へ差し替えられたら `DeleteGuard` が拒否する
+    /// （復元・再削除で別ディレクトリを扱わないための前提）。
+    #[cfg(unix)]
+    #[test]
+    fn prof_5_delete_guard_detects_replaced_staging_name() {
+        let tmp = TempDir::new();
+        std::fs::create_dir_all(tmp.path().join("tomb")).expect("tomb");
+        let parent_fd = open_dir_all_verified(tmp.path()).expect("parent fd");
+        let st = rustix::fs::statat(&parent_fd, "tomb", AtFlags::SYMLINK_NOFOLLOW).expect("stat");
+        let name = std::ffi::OsString::from("tomb");
+        let guard = DeleteGuard {
+            parent_fd: parent_fd.as_fd(),
+            tomb_name: &name,
+            root_id: (st.st_dev, st.st_ino as u64),
+        };
+        guard.verify_root_name().expect("same entity");
+
+        std::fs::rename(tmp.path().join("tomb"), tmp.path().join("moved")).expect("move");
+        assert!(guard.verify_root_name().is_err(), "moved away");
+        std::fs::create_dir_all(tmp.path().join("tomb")).expect("replacement");
+        let err = guard.verify_root_name().expect_err("replaced");
+        assert!(
+            matches!(
+                err,
+                ProfileError::InvalidLayout {
+                    reason: "profile staging directory was replaced during deletion",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 }
