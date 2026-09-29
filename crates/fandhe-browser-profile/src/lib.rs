@@ -32,14 +32,16 @@
 //! データ分離は新規コードではなくデータディレクトリ分離（`PROF-6`）自体で
 //! 成立し、`PROF-2`（TASK-51・#182）は `tests/isolation.rs`、`PROF-3`
 //! （TASK-52・#184・#185）は `tests/concurrent_isolation.rs` が Unix 上で
-//! 確認する（Windows は下記 `XOS-7`〜`XOS-10` の実装後の課題）。以下はいずれも
+//! 確認する（Windows は下記 `XOS-7`〜`XOS-10` の実装後の課題）。プロファイル削除
+//! （`Profile::delete`。`PROF-5`、TASK-53（53.2）・#188）も実装済み。以下はいずれも
 //! 未実装であり、実装済みを装う公開 API・ダミー実装は置かない。
 //!
-//! - プロファイル削除処理（`PROF-5`、TASK-53）。`store.rs` の
-//!   `ProfileStore`（`XOS-7`・TASK-60（60.2）・#201）と OS 慣習の既定パス解決
-//!   `OsDefaultStore`（TASK-60（60.3）・#202）は実装済み。明示指定による
-//!   上書きは #203、削除の実装は #188 で補う（`ProfileStore::delete` の
-//!   既定実装は `Unsupported` を返す）
+//! - `ProfileStore::delete`（`PROF-5`）から `Profile::delete` への接続。
+//!   `store.rs` の `ProfileStore`（`XOS-7`・TASK-60（60.2）・#201）と OS 慣習の
+//!   既定パス解決 `OsDefaultStore`（TASK-60（60.3）・#202）は実装済み。明示指定
+//!   による上書きは #203。`Profile::delete` は `self` を消費するが
+//!   `ProfileStore::delete` は `&Profile` を取るため、トレイト契約の見直しが
+//!   要る（既定実装は `Unsupported` を返す）
 //! - Windows での ACL によるアクセス制限（`XOS-7`〜`XOS-10`。Unix の
 //!   パーミッション 0o700 相当の隔離を Windows でも実現する。TASK-50・#176
 //!   では意図的にスコープ外とした。新規依存が必要になるため、導入時は
