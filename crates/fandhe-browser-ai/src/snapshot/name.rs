@@ -681,7 +681,9 @@ fn collect_content_text(
     );
 
     let mut scan = ContentScan::default();
-    let mut stack: Vec<NodeId> = doc.children(start).rev().collect();
+    // 子を全件確保せず遅延イテレータのスタックで辿る（確保は階層数に比例し、
+    // 1 ステップごとにしか増えないため `max_steps` で有界）。
+    let mut stack: Vec<Children<'_>> = vec![doc.children(start)];
     let mut normalized_chars = 0usize;
     let mut pending_space = false;
 
@@ -700,7 +702,11 @@ fn collect_content_text(
         };
     }
 
-    while let Some(current) = stack.pop() {
+    while let Some(top) = stack.last_mut() {
+        let Some(current) = top.next() else {
+            stack.pop();
+            continue;
+        };
         if scan.steps_used >= opts.max_steps {
             scan.cut = true;
             break;
