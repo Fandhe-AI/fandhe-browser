@@ -40,18 +40,20 @@
 //!
 //! - `discriminator`: `id`・`href`・フォーム部品の `name` など、要素自身に付く
 //!   安定した識別属性（untrusted な文字列。ダイジェストにのみ使い ref には入らない）
-//! - `scope`: 親要素の ref のうちダイジェストと variant（出現番号は含めない）。
-//!   別コンテナの同名要素と出現番号を共有しないための範囲指定
+//! - `scope`: 親要素の ref。ダイジェストと variant は常に、出現番号は子に
+//!   `discriminator` が無いときだけ折り込む。別コンテナの同名要素と出現番号を
+//!   共有しないための範囲指定
 //!
-//! 親の出現番号を子のダイジェストへ折り込まないのは、子の ref が「同じダイジェストを
-//! 持つ祖先の文書順」に依存してしまい、子に安定した `discriminator` があっても、
-//! 同じ role + name の親が前に挿入されただけで変わるためである。
+//! 子に `discriminator` がある場合に親の出現番号を折り込まないのは、子の ref が
+//! 「同じダイジェストを持つ祖先の文書順」に依存してしまい、同じ role + name の親が
+//! 前に挿入されただけで変わるのを避けるためである。逆に `discriminator` が無い子は
+//! 親の出現番号でしか区別できないため折り込む（識別属性のない同名カードそれぞれの
+//! 「Delete」ボタンが、出現番号を共有して取り違えられるのを防ぐ）。
 //!
 //! これでダイジェストが分かれる要素は、同名要素の挿入・並び替えの影響を受けない。
-//! 識別属性も親のシグネチャも同じ要素（例: 識別属性のない同名カードそれぞれの中の
-//! 同名ボタン）は外形上区別できず、文書順の出現番号に頼る（原理的な限界。将来は
-//! DOM 構造ハッシュの併用を検討する）。この場合は親側に `discriminator` を渡すと
-//! 子も安定する。
+//! 識別属性のない同名の親を前に挿入すると、その親と配下の識別属性のない子の ref は
+//! 文書順で一斉にずれる（原理的な限界。将来は DOM 構造ハッシュの併用を検討する）。
+//! 親側に `discriminator` を渡すと、親と子の ref は安定する。
 //!
 //! # 呼び出し側の契約（TASK-11.7 向け）
 //!
@@ -130,8 +132,8 @@ pub struct ElementSignature<'a> {
     pub discriminator: Option<&'a str>,
     /// 親要素の ref。ルート直下は `None`。
     ///
-    /// ダイジェストと variant だけをシグネチャへ折り込む（出現番号は使わない。
-    /// 理由はモジュール冒頭の「再特定の安定性」を参照）。
+    /// ダイジェストと variant は常に、出現番号は `discriminator` が無いときだけ
+    /// シグネチャへ折り込む（理由はモジュール冒頭の「再特定の安定性」を参照）。
     pub scope: Option<ElementRef>,
 }
 
@@ -178,6 +180,12 @@ impl<'a> ElementSignature<'a> {
                     .update(&[2])
                     .update(&sc.digest.to_le_bytes())
                     .update(&sc.variant.to_le_bytes());
+                // 子に識別属性が無いときだけ親の出現番号も折り込む。識別属性の無い
+                // 同名の親（同名カード等）の子を、出現番号の共有で取り違えないため。
+                // 識別属性があれば子は自力で区別できるので折り込まず、親の挿入の影響を避ける。
+                if self.discriminator.is_none() {
+                    h = h.update(&sc.occurrence.to_le_bytes());
+                }
             }
         }
         h
@@ -429,6 +437,23 @@ mod tests {
             ElementSignature::new("button", "Submit").digest(),
             ref_signature("button", "Submit")
         );
+    }
+
+    /// `AISNAP-10`: 識別属性のない同名親の子は、親の出現番号で区別され ref が衝突しない。
+    #[test]
+    fn aisnap_10_undiscriminated_children_of_same_name_parents_are_distinct() {
+        let mut a = RefAllocator::new();
+        let mut refs = Vec::new();
+        for _ in 0..2 {
+            let card = a
+                .allocate_signature(&ElementSignature::new("article", "Card"))
+                .unwrap();
+            let del = ElementSignature::new("button", "Delete").with_scope(card);
+            refs.push(a.allocate_signature(&del).unwrap());
+        }
+        assert_ne!(refs[0].digest, refs[1].digest);
+        assert_eq!(refs[0].occurrence, 1);
+        assert_eq!(refs[1].occurrence, 1);
     }
 
     /// `AISNAP-10`: 子に識別属性があれば、同じ role + name の親が前に挿入されても
