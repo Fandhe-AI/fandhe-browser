@@ -1,14 +1,28 @@
-//! 並行アクセステストハーネス（`PROF-3`・TASK-52（52.1）・#184、MS-3）。
+//! 並行アクセステスト（`PROF-3`・TASK-52（52.1・52.2）・#184・#185、MS-3）。
 //!
 //! `PROF-3` は「5 つの `Profile` インスタンスを `Barrier` で同時に開始させ、
 //! それぞれ 100 回ずつ並行に書き込んだとき、データ混線 0 件・競合による
 //! panic/クラッシュ 0 件であること」を定める（PoC-7
-//! `test_five_profiles_concurrent_no_crash_no_mixup` が土台）。本ファイルは
-//! そのハーネス機構（複数プロファイルの生成・`Barrier` による同時開始・
-//! 書き込みループ・結果の構造化収集・panic の捕捉）のみを実装し、
-//! **`PROF-3` を検証済みとは主張しない**（REPAIR-3・code-comment-style.md）。
-//! 混線 0 件・クラッシュ 0 件の assert は後続の TASK-52（52.2）・#185 が
-//! `run_concurrent_writes` の戻り値を読み戻して追加する。
+//! `test_five_profiles_concurrent_no_crash_no_mixup` が土台）。
+//!
+//! - 52.1（#184）: ハーネス機構（複数プロファイルの生成・`Barrier` による
+//!   同時開始・書き込みループ・結果の構造化収集・panic の捕捉）。
+//! - 52.2（#185）: ハーネス実行後にディスクを読み戻して混線 0 件を確認する
+//!   検出器（`find_mixups`）と、panic・open 失敗・書き込み失敗を数える
+//!   集計器（`summarize_failures`）、およびそれらが実際に異常を検出できる
+//!   ことを示す陰性対照テスト。
+//!
+//! 「混線」は次のいずれかとする。ディスクを真とし、期待値はレポートでなく
+//! 定数から独立に導出する。
+//! - 内容が期待ペイロードと一致しない（`ContentMismatch`）
+//! - 内容に他プロファイルのマーカー `profile-{k}:` が含まれる（`ForeignMarker`）
+//! - 想定外のエントリがある／想定エントリが欠けている
+//! - 通常ファイルでない（symlink 等）・読み込みに失敗した
+//!   （0 件へ丸めず fail-closed にする）
+//!
+//! プロセス全体の abort・segfault はテストバイナリごと落ちて CI が fail する
+//! ため、ここでは thread 単位の panic・open 失敗・書き込み失敗を数える。
+//! 別プロセスからの同時アクセスは対象外（`PROF-6` の将来拡張）。
 //!
 //! 本体（`src/`）は変更しない。新規外部依存も追加しない
 //! （dependency-policy.md）。
@@ -22,6 +36,7 @@
 #![cfg(unix)]
 
 use fandhe_browser_profile::{DataKind, Profile};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -86,9 +101,7 @@ struct HarnessConfig {
 
 /// 1 ワーカー（1 プロファイル）の実行結果（`PROF-3`・TASK-52（52.1））。
 ///
-/// 52.2（#185）が読み戻す情報の発生源。フィールドは本ファイルの §T1 で
-/// すべて読む（dead_code を避けるため。52.2 でしか使わない情報はここでは
-/// 定義しない）。
+/// 52.2（#185）の検出器・集計器が読み戻す情報の発生源。
 struct WorkerReport {
     index: usize,
     /// このワーカーが開いたプロファイルのルート（表示・52.2 の読み戻し用）。
@@ -314,8 +327,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 // 52.1 のテスト: ハーネスの機構確認（具体値で assert する）。
 //
 // 注意: ここでの `last_payloads` の assert はハーネスが記録した値の正しさの
-// 確認であり、ディスク上の分離（混線が起きていないか）の検証ではない。
-// ディスクの読み戻しによる混線確認は 52.2（#185）の範囲。
+// 確認であり、ディスク上の分離の検証ではない。ディスクの読み戻しによる
+// 混線確認は下の 52.2 のテスト（`prof_3_five_concurrent_profiles_*`）が行う。
 // ---------------------------------------------------------------------
 
 /// `PROF-3`・TASK-52（52.1）・#184: `PROFILE_COUNT` 個のプロファイルを
@@ -528,4 +541,385 @@ fn prof_3_harness_open_failure_does_not_deadlock_other_workers() {
             }
         }
     }
+}
+// ---------------------------------------------------------------------
+// 52.2: ディスク読み戻しによる混線検出・クラッシュ集計（`PROF-3`・#185）。
+// ---------------------------------------------------------------------
+
+/// 混線の種別。全フィールドは `Display` で読む。
+#[derive(Debug)]
+enum MixupDetail {
+    ContentMismatch { expected: String, actual: Vec<u8> },
+    ForeignMarker { foreign_index: usize },
+    UnexpectedEntry { dir: PathBuf, name: String },
+    MissingEntry { dir: PathBuf, name: String },
+    NotRegularFile { path: PathBuf },
+    ReadFailed { path: PathBuf, error: String },
+}
+
+/// 検出された混線 1 件。`index` は所有者とされるプロファイル、`kind` は
+/// 対象のデータ種別（配置検査など種別に依らないものは `None`）。
+#[derive(Debug)]
+struct Mixup {
+    index: usize,
+    kind: Option<DataKind>,
+    detail: MixupDetail,
+}
+
+impl std::fmt::Display for Mixup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "profile-{} kind={:?}: ", self.index, self.kind)?;
+        match &self.detail {
+            MixupDetail::ContentMismatch { expected, actual } => write!(
+                f,
+                "content mismatch (expected {expected:?}, actual {:?})",
+                String::from_utf8_lossy(actual)
+            ),
+            MixupDetail::ForeignMarker { foreign_index } => {
+                write!(f, "contains marker of profile-{foreign_index}")
+            }
+            MixupDetail::UnexpectedEntry { dir, name } => {
+                write!(f, "unexpected entry {name:?} in {}", dir.display())
+            }
+            MixupDetail::MissingEntry { dir, name } => {
+                write!(f, "missing entry {name:?} in {}", dir.display())
+            }
+            MixupDetail::NotRegularFile { path } => {
+                write!(f, "not a regular file: {}", path.display())
+            }
+            MixupDetail::ReadFailed { path, error } => {
+                write!(f, "read failed: {} ({error})", path.display())
+            }
+        }
+    }
+}
+
+/// `dir` 直下のエントリ名集合が `expected` とちょうど一致するか検査し、
+/// 差分を `Mixup` として `out` へ積む。読めない場合も 0 件に丸めない。
+fn check_entries(
+    dir: &Path,
+    expected: &BTreeSet<String>,
+    index: usize,
+    kind: Option<DataKind>,
+    out: &mut Vec<Mixup>,
+) {
+    let read_failed = |error: String| Mixup {
+        index,
+        kind,
+        detail: MixupDetail::ReadFailed {
+            path: dir.to_path_buf(),
+            error,
+        },
+    };
+    let mut actual = BTreeSet::new();
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(e) => {
+                        actual.insert(e.file_name().to_string_lossy().into_owned());
+                    }
+                    Err(err) => out.push(read_failed(err.to_string())),
+                }
+            }
+        }
+        Err(err) => {
+            out.push(read_failed(err.to_string()));
+            return;
+        }
+    }
+    for name in actual.difference(expected) {
+        out.push(Mixup {
+            index,
+            kind,
+            detail: MixupDetail::UnexpectedEntry {
+                dir: dir.to_path_buf(),
+                name: name.clone(),
+            },
+        });
+    }
+    for name in expected.difference(&actual) {
+        out.push(Mixup {
+            index,
+            kind,
+            detail: MixupDetail::MissingEntry {
+                dir: dir.to_path_buf(),
+                name: name.clone(),
+            },
+        });
+    }
+}
+
+/// 1 個の `<kind>/concurrent.dat` を読み戻し、期待ペイロード・他プロファイルの
+/// マーカーの有無を検査する。
+fn check_payload_file(
+    path: PathBuf,
+    index: usize,
+    kind: DataKind,
+    kind_index: usize,
+    profile_count: usize,
+    out: &mut Vec<Mixup>,
+) {
+    let mut push = |detail: MixupDetail| {
+        out.push(Mixup {
+            index,
+            kind: Some(kind),
+            detail,
+        })
+    };
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return push(MixupDetail::NotRegularFile { path }),
+        // 欠落は check_entries が MissingEntry として報告済み。
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            return push(MixupDetail::ReadFailed {
+                path,
+                error: err.to_string(),
+            });
+        }
+    }
+    let actual = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return push(MixupDetail::ReadFailed {
+                path,
+                error: err.to_string(),
+            });
+        }
+    };
+
+    let last_j = last_write_index_for_kind(kind_index, DataKind::ALL.len());
+    let expected = format!("profile-{index}:write-{last_j:04}\n");
+    let text = String::from_utf8_lossy(&actual).into_owned();
+    if actual != expected.as_bytes() {
+        push(MixupDetail::ContentMismatch { expected, actual });
+    }
+    // コロン付きで比較する（`profile-1` が `profile-10` に誤一致しない）。
+    for foreign_index in (0..profile_count).filter(|&k| k != index) {
+        if text.contains(&format!("profile-{foreign_index}:")) {
+            push(MixupDetail::ForeignMarker { foreign_index });
+        }
+    }
+}
+
+/// `base` 配下の `profile_count` 個のプロファイルをディスクから読み戻し、
+/// 混線を全件返す（`PROF-3`）。各 `<kind>/concurrent.dat` は最後の書き込み
+/// ペイロード（定数から導出）と完全一致し、他プロファイルのマーカーを含まない
+/// こと。配置（ディレクトリ構成）もちょうど期待どおりであること。
+fn find_mixups(base: &Path, profile_count: usize) -> Vec<Mixup> {
+    let mut out = Vec::new();
+
+    let base_expected: BTreeSet<String> =
+        (0..profile_count).map(|i| format!("profile-{i}")).collect();
+    check_entries(base, &base_expected, 0, None, &mut out);
+
+    let mut root_expected: BTreeSet<String> = DataKind::ALL
+        .iter()
+        .map(|k| k.dir_name().to_string())
+        .collect();
+    root_expected.insert("profile.lock".to_string());
+    let file_expected: BTreeSet<String> = BTreeSet::from([TARGET_FILE_NAME.to_string()]);
+
+    for index in 0..profile_count {
+        let root = base.join(format!("profile-{index}"));
+        check_entries(&root, &root_expected, index, None, &mut out);
+        for (kind_index, &kind) in DataKind::ALL.iter().enumerate() {
+            let dir = root.join(kind.dir_name());
+            check_entries(&dir, &file_expected, index, Some(kind), &mut out);
+            check_payload_file(
+                dir.join(TARGET_FILE_NAME),
+                index,
+                kind,
+                kind_index,
+                profile_count,
+                &mut out,
+            );
+        }
+    }
+    out
+}
+
+/// ワーカー結果の失敗集計。panic・open 失敗を `Completed` に丸めない。
+#[derive(Debug, Default)]
+struct FailureSummary {
+    panicked: Vec<(usize, String)>,
+    open_failed: Vec<(usize, String)>,
+    write_failures: Vec<(usize, Vec<String>)>,
+    short_writes: Vec<(usize, usize)>,
+}
+
+/// `outcomes` から panic・open 失敗・書き込み失敗・書き込み不足を数える。
+/// プロセス全体の abort・segfault はここへ到達せずバイナリごと fail する。
+fn summarize_failures(outcomes: &[WorkerOutcome], expected_writes: usize) -> FailureSummary {
+    let mut summary = FailureSummary::default();
+    for outcome in outcomes {
+        match outcome {
+            WorkerOutcome::Completed(report) => {
+                if !report.write_errors.is_empty() {
+                    summary
+                        .write_failures
+                        .push((report.index, report.write_errors.clone()));
+                }
+                if report.writes_succeeded != expected_writes {
+                    summary
+                        .short_writes
+                        .push((report.index, report.writes_succeeded));
+                }
+            }
+            WorkerOutcome::OpenFailed { index, error } => {
+                summary.open_failed.push((*index, error.clone()));
+            }
+            WorkerOutcome::Panicked { index, message } => {
+                summary.panicked.push((*index, message.clone()));
+            }
+        }
+    }
+    summary
+}
+
+/// 1 ラウンド分のハーネスを走らせ、`find_mixups` で混線を返す。
+fn run_round(base: &Path) -> (Vec<WorkerOutcome>, Vec<Mixup>) {
+    let config = HarnessConfig {
+        profiles: PROFILE_COUNT,
+        writes_per_profile: WRITES_PER_PROFILE,
+    };
+    let outcomes = run_concurrent_writes(base, &config);
+    let mixups = find_mixups(base, PROFILE_COUNT);
+    (outcomes, mixups)
+}
+
+/// `PROF-3`・TASK-52（52.2）・#185: 5 プロファイル × 100 回の並行書き込みで
+/// panic・open 失敗・書き込み失敗が 0 件、かつディスク上の混線が 0 件で
+/// あること。競合の検出機会を増やすため複数ラウンド繰り返す。
+#[test]
+fn prof_3_five_concurrent_profiles_have_zero_mixups_and_zero_crashes() {
+    const ROUNDS: usize = 3;
+    for round in 0..ROUNDS {
+        let tmp = TempDir::new();
+        let (outcomes, mixups) = run_round(tmp.path());
+
+        assert_eq!(outcomes.len(), PROFILE_COUNT, "round {round}: outcome 件数");
+        let summary = summarize_failures(&outcomes, WRITES_PER_PROFILE);
+        assert_eq!(summary.panicked.len(), 0, "round {round}: {summary:?}");
+        assert_eq!(summary.open_failed.len(), 0, "round {round}: {summary:?}");
+        assert_eq!(
+            summary.write_failures.len(),
+            0,
+            "round {round}: {summary:?}"
+        );
+        assert_eq!(summary.short_writes.len(), 0, "round {round}: {summary:?}");
+
+        let rendered: Vec<String> = mixups.iter().map(|m| m.to_string()).collect();
+        assert_eq!(mixups.len(), 0, "round {round}: mixups: {rendered:#?}");
+
+        // レポートの記録とディスクの内容が一致することの二重確認。
+        for outcome in &outcomes {
+            let WorkerOutcome::Completed(report) = outcome else {
+                panic!("round {round}: 完走しないワーカーがある");
+            };
+            for (kind, payload) in &report.last_payloads {
+                let path = report.root.join(kind.dir_name()).join(TARGET_FILE_NAME);
+                let on_disk = std::fs::read(&path).expect("ディスク内容の読み戻し");
+                assert_eq!(
+                    on_disk,
+                    payload.as_bytes(),
+                    "round {round}: worker {} {kind:?}",
+                    report.index
+                );
+            }
+        }
+    }
+}
+
+/// `PROF-3`・#185（陰性対照）: 他プロファイルのペイロードがディスクに
+/// 混入した場合に `find_mixups` が検出すること。
+#[test]
+fn prof_3_on_disk_mixup_is_detected() {
+    let tmp = TempDir::new();
+    let (_, mixups) = run_round(tmp.path());
+    assert_eq!(mixups.len(), 0, "汚染前は 0 件");
+
+    let kind = DataKind::ALL[0];
+    let path = tmp
+        .path()
+        .join("profile-0")
+        .join(kind.dir_name())
+        .join(TARGET_FILE_NAME);
+    std::fs::write(&path, b"profile-1:write-0000\n").expect("汚染の書き込み");
+
+    let mixups = find_mixups(tmp.path(), PROFILE_COUNT);
+    assert_eq!(mixups.len(), 2, "{mixups:?}");
+    assert!(
+        mixups.iter().all(|m| m.index == 0 && m.kind == Some(kind)),
+        "{mixups:?}"
+    );
+    assert!(
+        mixups.iter().any(|m| matches!(
+            &m.detail,
+            MixupDetail::ContentMismatch { actual, .. } if actual == b"profile-1:write-0000\n"
+        )),
+        "{mixups:?}"
+    );
+    assert!(
+        mixups
+            .iter()
+            .any(|m| matches!(m.detail, MixupDetail::ForeignMarker { foreign_index: 1 })),
+        "{mixups:?}"
+    );
+}
+
+/// `PROF-3`・#185（陰性対照）: 想定外のエントリを配置検査が 1 件だけ検出する。
+#[test]
+fn prof_3_unexpected_entry_is_detected() {
+    let tmp = TempDir::new();
+    let (_, mixups) = run_round(tmp.path());
+    assert_eq!(mixups.len(), 0, "汚染前は 0 件");
+
+    let kind = DataKind::ALL[0];
+    let dir = tmp.path().join("profile-2").join(kind.dir_name());
+    std::fs::write(dir.join("stray.dat"), b"x").expect("余分なファイルの作成");
+
+    let mixups = find_mixups(tmp.path(), PROFILE_COUNT);
+    assert_eq!(mixups.len(), 1, "{mixups:?}");
+    let m = &mixups[0];
+    assert_eq!((m.index, m.kind), (2, Some(kind)));
+    assert!(
+        matches!(&m.detail, MixupDetail::UnexpectedEntry { name, .. } if name == "stray.dat"),
+        "{m}"
+    );
+}
+
+/// `PROF-3`・#185（陰性対照）: 集計器が panic・open 失敗を数えること。
+/// 本体テストの「0 件」が空虚でないことを示す。
+#[test]
+fn prof_3_crash_summary_counts_panicked_and_open_failed() {
+    let report = |index: usize| {
+        WorkerOutcome::Completed(WorkerReport {
+            index,
+            root: PathBuf::from(format!("profile-{index}")),
+            writes_attempted: WRITES_PER_PROFILE,
+            writes_succeeded: WRITES_PER_PROFILE,
+            write_errors: Vec::new(),
+            last_payloads: Vec::new(),
+        })
+    };
+    let outcomes = vec![
+        report(0),
+        report(1),
+        WorkerOutcome::Panicked {
+            index: 2,
+            message: "boom".to_string(),
+        },
+        WorkerOutcome::OpenFailed {
+            index: 3,
+            error: "denied".to_string(),
+        },
+        report(4),
+    ];
+    let summary = summarize_failures(&outcomes, WRITES_PER_PROFILE);
+    assert_eq!(summary.panicked, vec![(2, "boom".to_string())]);
+    assert_eq!(summary.open_failed, vec![(3, "denied".to_string())]);
+    assert_eq!(summary.write_failures.len(), 0);
+    assert_eq!(summary.short_writes.len(), 0);
 }
