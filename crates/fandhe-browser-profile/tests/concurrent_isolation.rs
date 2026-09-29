@@ -331,7 +331,8 @@ fn write_once(profile: &Profile, kind: DataKind, payload: &[u8]) -> Result<(), S
 /// `<kind>/concurrent.dat` は自ワーカーだけが書くため `payload` と完全一致する
 /// はずで、他プロファイルのファイルは空（truncate 直後）か読めない（未作成）
 /// 場合を除き、自身以外のマーカー `profile-{m}:` を含まないこと。
-/// 競合中の読み取りで一時的に空・未作成になるのは正常として許容する。
+/// 未作成（`NotFound`）を許容するのは他プロファイルのファイルだけで、自
+/// プロファイルの読み取り失敗やその他の I/O エラーは指摘として記録する。
 fn check_after_write(
     base: &Path,
     index: usize,
@@ -345,8 +346,22 @@ fn check_after_write(
             .join(format!("profile-{owner}"))
             .join(kind.dir_name())
             .join(TARGET_FILE_NAME);
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            // 未作成の他プロファイルのファイルだけは正常として許容する。
+            Err(err) if owner != index && err.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            // 自プロファイルは書き込み直後で必ず存在するため、NotFound を含む
+            // あらゆる読み取り失敗を違反として記録する（後続の書き込みで
+            // 異常が消えても最終読み戻しで見逃さないため）。
+            Err(err) => {
+                found.push(format!(
+                    "profile-{owner} {kind:?}: failed to read {}: {err}",
+                    path.display()
+                ));
+                continue;
+            }
         };
         if owner == index {
             if bytes != payload.as_bytes() {
@@ -1076,4 +1091,20 @@ fn prof_3_intermediate_mixup_is_detected_even_if_overwritten_later() {
         check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT).len(),
         0
     );
+}
+
+/// `PROF-3`・#185（陰性対照）: 自プロファイルのファイルが読めない場合は
+/// 未作成の他プロファイルと違い違反として記録されること。
+#[test]
+fn prof_3_own_file_read_failure_is_reported() {
+    let tmp = TempDir::new();
+    let kind = DataKind::ALL[0];
+    for i in 0..PROFILE_COUNT {
+        Profile::open(tmp.path().join(format!("profile-{i}"))).expect("open");
+    }
+    // どのプロファイルにも未書き込み: 他プロファイルの NotFound は許容、
+    // 自プロファイル（index 0）の NotFound だけが 1 件の指摘になる。
+    let found = check_after_write(tmp.path(), 0, kind, "profile-0:write-0000\n", PROFILE_COUNT);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("failed to read"), "{found:?}");
 }
