@@ -187,10 +187,13 @@ fn run_bench(trials: u32) -> Result<BenchReport, String> {
 
         handshake_samples.push(handshake_elapsed);
 
-        // 補助指標: 同じ子で 1 回目（起動＋ハンドシェイク＋評価 1 往復）
+        // 補助指標: 同じ子に対する 1 回目（起動直後・cold な 1 往復）
         // と 2 回目（warm な 1 往復）の `evaluate_script` を測る。
-        // ハンドシェイク単体の値がもっともらしいかを裏付ける用途
-        // （目標判定には使わない）。
+        // `cold_start` は `spawn_worker_for_test()` 完了後に打つため、
+        // ここで計測しているのは「評価 1 往復」のみであり、起動・
+        // ハンドシェイクの時間は含まない（それは上の `handshake_elapsed`
+        // が別途計測している）。ハンドシェイク単体の値がもっともらしい
+        // かを裏付ける用途（目標判定には使わない）。
         let cold_start = Instant::now();
         engine
             .evaluate_script("0", &EvaluateOptions::default())
