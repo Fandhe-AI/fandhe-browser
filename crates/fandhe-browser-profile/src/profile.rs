@@ -800,6 +800,43 @@ impl Profile {
                 Err(err) => return Err(ProfileError::Io(err.into())),
             }
 
+            // 退避したものが検証済みの root_fd と同じ実体か、他の処理より先に確認する。
+            // statat から renameat までの間に元の名前が別のディレクトリへ差し替えられて
+            // いた場合、無関係なディレクトリを退避名へ移してしまっている。退避名は
+            // こちらが生成した一意名なので、原子的な NOREPLACE rename で元の名前へ
+            // 戻し（並行 open の新プロファイルは上書きしない）、何も消さず拒否する
+            // （fail-closed。`PROF-5`）。
+            match rustix::fs::statat(&parent_fd, &tomb_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(moved)
+                    if moved.st_dev == root_stat.st_dev && moved.st_ino == root_stat.st_ino => {}
+                other => {
+                    let restored =
+                        rename_noreplace_atomic(parent_fd.as_fd(), &tomb_name, &root_name).is_ok();
+                    drop(profile_lock);
+                    if other.is_err() && !restored {
+                        return Err(ProfileError::Io(
+                            other.err().map(Into::into).unwrap_or_else(|| {
+                                std::io::Error::other("staging directory check failed")
+                            }),
+                        ));
+                    }
+                    return Err(ProfileError::InvalidLayout {
+                        path: if restored {
+                            root
+                        } else {
+                            root.parent()
+                                .map(|p| p.join(&tomb_name))
+                                .unwrap_or_else(|| PathBuf::from(&tomb_name))
+                        },
+                        reason: if restored {
+                            "profile root was replaced before deletion; the replacing directory was restored and nothing was removed"
+                        } else {
+                            "profile root was replaced before deletion; the replacing directory could not be restored and is kept in this staging directory"
+                        },
+                    });
+                }
+            }
+
             let guard = DeleteGuard {
                 parent_fd: parent_fd.as_fd(),
                 tomb_name: &tomb_name,
@@ -902,9 +939,19 @@ impl Profile {
                                         &root,
                                     )
                                 });
+                            // 成功とみなすのは、全エントリの削除と退避ルートの rmdir が
+                            // 完了し、退避名がもう存在しないことを確認できた場合のみ。
+                            let gone = matches!(
+                                rustix::fs::statat(
+                                    &parent_fd,
+                                    &tomb_name,
+                                    AtFlags::SYMLINK_NOFOLLOW
+                                ),
+                                Err(Errno::NOENT)
+                            );
                             match retry {
-                                Ok(true) => Ok(()),
-                                Ok(false) | Err(_) => Err(ProfileError::InvalidLayout {
+                                Ok(true) if gone => Ok(()),
+                                Ok(_) | Err(_) => Err(ProfileError::InvalidLayout {
                                     path: tomb_path,
                                     reason: "profile deletion failed and the original name was re-occupied; remaining data is kept in this staging directory",
                                 }),
