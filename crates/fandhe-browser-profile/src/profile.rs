@@ -9,11 +9,11 @@
 //! 本モジュールの責務はルートディレクトリと、データ種別ごとに分離した
 //! 4 つのサブディレクトリ（[`DataKind`] の 4 種）の作成、および
 //! パストラバーサル防止（[`sanitize_component`]・[`assert_within_root`]。
-//! `PROF-4`、TASK-50（50.2）・#177）に限る。以下は後続タスクが本モジュールへ
+//! `PROF-4`、TASK-50（50.2）・#177）、およびプロファイル削除
+//! （[`Profile::delete`]。`PROF-5`、TASK-53（53.2）・#188）に限る。以下は後続タスクが本モジュールへ
 //! 差し込む契約であり、本モジュールは実装済みを装わない（REPAIR-3・
 //! code-comment-style.md）。
 //!
-//! - プロファイル削除処理（`PROF-5`、TASK-53）
 //! - 並行アクセス時のデータ分離（`PROF-2`・`PROF-3`、TASK-51・TASK-52）
 //! - Windows での ACL によるアクセス制限（`XOS-7`〜`XOS-10`）。実装がないため
 //!   `Profile::open` は Windows では常に `Err(ProfileError::Unsupported)` を
@@ -66,7 +66,7 @@ use std::path::{Path, PathBuf};
 // "std" feature 有効時にこれらを再エクスポートするのみで型は同一のため、
 // 公開 API のシグネチャを std 型で表現できる）。
 #[cfg(unix)]
-use rustix::fs::{CWD, Mode, OFlags};
+use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags};
 #[cfg(unix)]
 use rustix::io::Errno;
 #[cfg(unix)]
@@ -686,6 +686,191 @@ impl Profile {
         // 所有者比較の基準は常に検証済みのプロファイルルート（`root_fd`）。
         open_verified_regular_file(self.data_dir_fd(kind), self.root_fd(), name, display_path)
     }
+
+    /// プロファイルを削除する。ロックを解放したうえで、ルートディレクトリごと
+    /// 全データ（Cookie・ストレージ・キャッシュ・履歴）を消す（`PROF-5`、
+    /// TASK-53（53.2）・#188、MS-3）。値を消費するため、削除後にハンドルを
+    /// 使うことはできない。
+    ///
+    /// unix では検証済みの [`Profile::root_fd`] を起点に `openat`/`unlinkat` で
+    /// 再帰削除し、パス文字列は再解決しない（[`Profile::root`] は表示専用）。
+    /// ディレクトリは `NOFOLLOW` で開き、symlink はエントリとして unlink する
+    /// だけでリンク先へは触れない。マウントポイントはまたがず（`st_dev` の
+    /// 一致確認）、深さは `MAX_DELETE_DEPTH` で制限する。
+    ///
+    /// 処理順序:
+    ///
+    /// 1. ルートのパスが `open` 時と同じ実体を指すか `(st_dev, st_ino)` で
+    ///    確認する。不一致なら何も消さず [`ProfileError::InvalidLayout`]
+    ///    （fail-closed）
+    /// 2. `profile.lock` を保持したまま、それ以外の全エントリを消す（削除中の
+    ///    並行 open は `Locked` で拒否される）
+    /// 3. `profile.lock` を unlink してロックを解放し、ルートを `rmdir` する
+    ///
+    /// spec の「ロックを解放した上で」は最終状態（ロック解放・ルート不在）を
+    /// 表すと解釈し、削除中に並行 open でデータが作り直される競合を避けるため
+    /// 解放をルート `rmdir` の直前にしている（`PROF-5` の意図確認は spec 側の課題）。
+    ///
+    /// 残る競合: 手順 1 の確認から最後の `rmdir` までの間にパスが差し替えられ
+    /// 得るが、`rmdir` は空ディレクトリしか消せず symlink には失敗するため、
+    /// 影響は空ディレクトリ 1 つに限られる。途中で失敗した場合、`self` は消費
+    /// 済みでロックは解放され、ツリーは一部だけ消えている可能性がある。呼び出し
+    /// 元は `Profile::open` で開き直して `delete` を再試行する。
+    ///
+    /// Windows では `open` が常に失敗するため到達しないが、成功を装わず
+    /// [`ProfileError::Unsupported`] を返す（`XOS-7`〜`XOS-10`、REPAIR-3）。
+    pub fn delete(self) -> Result<(), ProfileError> {
+        #[cfg(not(unix))]
+        {
+            Err(ProfileError::Unsupported {
+                reason: "profile deletion is not supported on this platform",
+            })
+        }
+        #[cfg(unix)]
+        {
+            let Profile {
+                root,
+                root_fd,
+                data_fds,
+                _lock: profile_lock,
+            } = self;
+
+            let Some(root_name) = root.file_name().map(|n| n.to_os_string()) else {
+                return Err(ProfileError::InvalidLayout {
+                    path: root,
+                    reason: "refusing to delete a profile root without a parent directory",
+                });
+            };
+
+            // 親ハンドルは root_fd の ".." から得る（"/" から辿り直さない）。
+            let parent_fd = rustix::fs::openat(&root_fd, "..", OPEN_DIR_FLAGS, Mode::empty())
+                .map_err(|err| classify_dir_open_error(&root, err))?;
+            let root_stat =
+                rustix::fs::fstat(&root_fd).map_err(|err| ProfileError::Io(err.into()))?;
+            let named_stat = rustix::fs::statat(&parent_fd, &root_name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|err| ProfileError::Io(err.into()))?;
+            if named_stat.st_dev != root_stat.st_dev || named_stat.st_ino != root_stat.st_ino {
+                return Err(ProfileError::InvalidLayout {
+                    path: root,
+                    reason: "profile root path no longer refers to the opened profile directory",
+                });
+            }
+
+            drop(data_fds);
+            remove_dir_contents_at(
+                root_fd.as_fd(),
+                root_stat.st_dev,
+                0,
+                &root,
+                Some(LOCK_FILE_NAME.as_ref()),
+            )?;
+            match rustix::fs::unlinkat(&root_fd, LOCK_FILE_NAME, AtFlags::empty()) {
+                Ok(()) | Err(Errno::NOENT) => {}
+                Err(err) => return Err(ProfileError::Io(err.into())),
+            }
+            drop(profile_lock);
+            drop(root_fd);
+
+            match rustix::fs::unlinkat(&parent_fd, &root_name, AtFlags::REMOVEDIR) {
+                Ok(()) => Ok(()),
+                Err(Errno::NOTEMPTY) => Err(ProfileError::InvalidLayout {
+                    path: root,
+                    reason: "profile root became non-empty during deletion; it may have been reopened concurrently",
+                }),
+                Err(err) => Err(ProfileError::Io(err.into())),
+            }
+        }
+    }
+}
+
+/// 再帰削除の深さ上限。これを超える入れ子はスタック・fd の消費を抑えるため
+/// [`ProfileError::InvalidLayout`] で拒否する（`PROF-5`）。
+#[cfg(unix)]
+const MAX_DELETE_DEPTH: usize = 64;
+
+/// ディレクトリ再走査の上限回数。readdir 中の unlink は POSIX で挙動が
+/// 未規定のため、空になるまで読み直す（無限ループを避けるための上限）。
+#[cfg(unix)]
+const MAX_DELETE_PASSES: usize = 4;
+
+/// `dir_fd` 直下のエントリを（`keep` を除いて）再帰的に削除する
+/// （[`Profile::delete`] から呼ばれる。`PROF-5`）。
+///
+/// symlink・通常ファイル等は `unlinkat` でエントリとして消すだけで辿らない。
+/// ディレクトリは `NOFOLLOW` で開き、`st_dev` が `root_dev` と同じであること
+/// （マウントポイントをまたがないこと）を確認してから再帰する。
+#[cfg(unix)]
+fn remove_dir_contents_at(
+    dir_fd: BorrowedFd<'_>,
+    root_dev: rustix::fs::Dev,
+    depth: usize,
+    display_path: &Path,
+    keep: Option<&std::ffi::OsStr>,
+) -> Result<(), ProfileError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if depth > MAX_DELETE_DEPTH {
+        return Err(ProfileError::InvalidLayout {
+            path: display_path.to_path_buf(),
+            reason: "profile directory tree exceeds maximum deletion depth",
+        });
+    }
+    for _ in 0..MAX_DELETE_PASSES {
+        let dir = Dir::read_from(dir_fd).map_err(|err| ProfileError::Io(err.into()))?;
+        let mut removed_any = false;
+        for entry in dir {
+            let entry = entry.map_err(|err| ProfileError::Io(err.into()))?;
+            let name = entry.file_name();
+            let bytes = name.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            if keep.is_some_and(|k| k.as_bytes() == bytes) {
+                continue;
+            }
+            removed_any = true;
+            let is_dir = match entry.file_type() {
+                FileType::Directory => true,
+                FileType::Unknown => {
+                    let st = rustix::fs::statat(dir_fd, name, AtFlags::SYMLINK_NOFOLLOW)
+                        .map_err(|err| ProfileError::Io(err.into()))?;
+                    FileType::from_raw_mode(st.st_mode) == FileType::Directory
+                }
+                _ => false,
+            };
+            if is_dir {
+                let child_path = display_path.join(std::ffi::OsStr::from_bytes(bytes));
+                let child_fd = rustix::fs::openat(dir_fd, name, OPEN_DIR_FLAGS, Mode::empty())
+                    .map_err(|err| classify_dir_open_error(&child_path, err))?;
+                let st =
+                    rustix::fs::fstat(&child_fd).map_err(|err| ProfileError::Io(err.into()))?;
+                if st.st_dev != root_dev {
+                    return Err(ProfileError::InvalidLayout {
+                        path: child_path,
+                        reason: "refusing to cross a mount point during profile deletion",
+                    });
+                }
+                remove_dir_contents_at(child_fd.as_fd(), root_dev, depth + 1, &child_path, None)?;
+                drop(child_fd);
+                match rustix::fs::unlinkat(dir_fd, name, AtFlags::REMOVEDIR) {
+                    Ok(()) | Err(Errno::NOENT) => {}
+                    Err(err) => return Err(ProfileError::Io(err.into())),
+                }
+            } else {
+                match rustix::fs::unlinkat(dir_fd, name, AtFlags::empty()) {
+                    Ok(()) | Err(Errno::NOENT) => {}
+                    Err(err) => return Err(ProfileError::Io(err.into())),
+                }
+            }
+        }
+        if !removed_any {
+            return Ok(());
+        }
+    }
+    Err(ProfileError::InvalidLayout {
+        path: display_path.to_path_buf(),
+        reason: "profile directory kept changing during deletion",
+    })
 }
 
 /// `dir_fd` 配下に `name` という名前の通常ファイルを作成（既存なら開く）し、
@@ -1861,6 +2046,34 @@ mod tests {
             entries.len(),
             1,
             "プロファイルルート（profile）以外にエントリが作られてはならない: {entries:?}"
+        );
+    }
+
+    /// `PROF-5`: 深さ上限（`MAX_DELETE_DEPTH`）を超える入れ子は何も装わず拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn prof_5_delete_fails_when_tree_exceeds_max_depth() {
+        let tmp = TempDir::new();
+        let root = tmp.path().join("profile");
+        let profile = Profile::open(&root).expect("open");
+        // cache 直下から MAX_DELETE_DEPTH + 1 段の入れ子を作る（root が深さ 0、
+        // cache が 1 段目のため、上限超過となる）。
+        let mut deep = root.join("cache");
+        for i in 0..=MAX_DELETE_DEPTH {
+            deep.push(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).expect("deep dirs");
+
+        let err = profile.delete().expect_err("must refuse");
+        assert!(
+            matches!(
+                err,
+                ProfileError::InvalidLayout {
+                    reason: "profile directory tree exceeds maximum deletion depth",
+                    ..
+                }
+            ),
+            "got {err:?}"
         );
     }
 }
