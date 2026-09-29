@@ -174,15 +174,24 @@ impl NavigationState {
     ///
     /// `u64` を使い切った場合は wrap せず [`StateError::GenerationExhausted`] を返す。
     ///
+    /// 開始時に直近結果（前ページの URL と HTML）も無効化するため、commit されるまでの間
+    /// [`Self::latest`] は `None` を返す。
+    ///
     /// 世代の更新は結果保存（[`Self::commit_navigation`]）と同じロック内で行う。
     /// ロック無しだと、保存側の世代確認の直後に新しい navigate が始まり、古い結果が
     /// 保存されたうえで `Superseded` も返らない競合が生じる（`CDP-1`）。
     pub fn begin_navigation(&self) -> Result<NavigationGeneration, StateError> {
-        let _guard = self.lock();
-        self.generation
+        let mut guard = self.lock();
+        let next = self
+            .generation
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
             .map(|prev| NavigationGeneration(prev.saturating_add(1)))
-            .map_err(|_| StateError::GenerationExhausted)
+            .map_err(|_| StateError::GenerationExhausted)?;
+        // 前ページの結果を同じロック内で無効化する。残すと、取得中や取得失敗後に
+        // `latest()` が古いページを現在の結果として返してしまう（`CDP-1`・`AISNAP-6`）。
+        // 世代の払い出しに失敗した場合は状態を変更しない。
+        *guard = None;
+        Ok(next)
     }
 
     /// 現在の（最後に開始された）世代を返す。
@@ -370,9 +379,35 @@ mod tests {
             .unwrap();
         let g2 = s.begin_navigation().unwrap();
         assert!(s.clear_navigation(g).is_err());
+        s.commit_navigation(g2, NavigationResult::new("https://b/", "b"))
+            .unwrap();
         assert!(s.latest().is_some());
-        s.clear_navigation(g2).unwrap();
+        let g3 = s.begin_navigation().unwrap();
+        s.clear_navigation(g3).unwrap();
         assert!(s.latest().is_none());
+    }
+
+    #[test]
+    fn cdp1_begin_navigation_invalidates_previous_result() {
+        // 取得中・取得失敗後に前ページが現在結果として見えないこと（コミットされない場合を含む）。
+        let s = NavigationState::new();
+        let g1 = s.begin_navigation().unwrap();
+        s.commit_navigation(g1, NavigationResult::new("https://a/", "a"))
+            .unwrap();
+        assert_eq!(s.latest().unwrap().url(), "https://a/");
+        let g2 = s.begin_navigation().unwrap();
+        assert!(s.latest().is_none());
+        assert_eq!(s.current_generation(), g2);
+    }
+
+    #[test]
+    fn cdp1_exhausted_begin_keeps_previous_result() {
+        let s = NavigationState::with_generation(u64::MAX - 1);
+        let g = s.begin_navigation().unwrap();
+        s.commit_navigation(g, NavigationResult::new("https://a/", "a"))
+            .unwrap();
+        assert_eq!(s.begin_navigation(), Err(StateError::GenerationExhausted));
+        assert_eq!(s.latest().unwrap().url(), "https://a/");
     }
 
     #[test]
