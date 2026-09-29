@@ -260,6 +260,15 @@ fn is_focusable(doc: &Document, id: NodeId) -> bool {
     if doc.attribute(id, "tabindex").is_some() {
         return true;
     }
+    // 編集可能要素（`contenteditable` が `false` 以外）はフォーカス可能扱い。
+    // 継承による編集可否は自身の属性しか見ない方針のためここでは扱わない。
+    if doc.attribute(id, "contenteditable").is_some_and(|value| {
+        !value
+            .trim_matches(|c: char| c.is_ascii_whitespace())
+            .eq_ignore_ascii_case("false")
+    }) {
+        return true;
+    }
     if named("a") || named("area") {
         return doc.attribute(id, "href").is_some();
     }
@@ -301,14 +310,13 @@ fn implicit_role_for_hyperlink(doc: &Document, id: NodeId) -> ComputedRole {
     }
 }
 
-/// `th` 要素の暗黙 role を返す（`scope="row"` なら `rowheader`、それ以外は
+/// `th` 要素の暗黙 role を返す（`scope="row"`/`"rowgroup"` なら `rowheader`、それ以外は
 /// `columnheader`）。`scope` の照合は大文字小文字を区別しない。表の文脈
 /// による `cell` への降格は TASK-11.3.3（Issue #543）で扱う。
 fn implicit_role_for_th(doc: &Document, id: NodeId) -> ComputedRole {
     let is_row_scope = doc.attribute(id, "scope").is_some_and(|value| {
-        value
-            .trim_matches(|c: char| c.is_ascii_whitespace())
-            .eq_ignore_ascii_case("row")
+        let value = value.trim_matches(|c: char| c.is_ascii_whitespace());
+        value.eq_ignore_ascii_case("row") || value.eq_ignore_ascii_case("rowgroup")
     });
     if is_row_scope {
         ComputedRole::implicit("rowheader")
@@ -489,10 +497,28 @@ mod tests {
     /// 区別せず rowheader。
     #[test]
     fn aisnap_1_th_scope_row() {
-        for scope in ["row", "ROW"] {
+        for scope in ["row", "ROW", "rowgroup", "RowGroup"] {
             let html = format!(r#"<table><tr><th scope="{scope}">h</th></tr></table>"#);
             check(&html, "th", "rowheader", RoleSource::Implicit);
         }
+    }
+
+    /// AISNAP-1（TASK-11.3.1・Issue #541）: `contenteditable` 要素は
+    /// フォーカス可能扱いで `role="none"` を無視する。`false` は対象外。
+    #[test]
+    fn aisnap_1_contenteditable_ignores_none() {
+        check(
+            r#"<div contenteditable role="none">x</div>"#,
+            "div",
+            "generic",
+            RoleSource::Fallback,
+        );
+        check(
+            r#"<div contenteditable="false" role="none">x</div>"#,
+            "div",
+            "none",
+            RoleSource::Explicit,
+        );
     }
 
     /// AISNAP-1（TASK-11.3.1・Issue #541）: list 系の暗黙 role。
