@@ -1379,6 +1379,52 @@ fn remove_dir_contents_at(
     })
 }
 
+/// `dir_fd` 直下の非ディレクトリエントリ `name`（symlink は辿らない）が、
+/// ルートと同じマウントに属するかを開かずに判定する（`PROF-5`）。
+///
+/// デバイスが異なれば別マウント。Linux で両方の `mnt_id` を取得できる場合は
+/// 同一デバイス上の bind mount も検出する（取得できない旧カーネルでは
+/// `st_dev` のみで判定する。ディレクトリ側は [`same_mount`] が fail-closed）。
+#[cfg(unix)]
+fn entry_on_root_mount(
+    dir_fd: BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+    root_mount: MountIdentity,
+) -> Result<bool, ProfileError> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        match rustix::fs::statx(
+            dir_fd,
+            name,
+            AtFlags::SYMLINK_NOFOLLOW,
+            rustix::fs::StatxFlags::BASIC_STATS | rustix::fs::StatxFlags::MNT_ID,
+        ) {
+            Ok(sx) => {
+                let dev = rustix::fs::makedev(sx.stx_dev_major, sx.stx_dev_minor);
+                if dev != root_mount.dev {
+                    return Ok(false);
+                }
+                if sx.stx_mask & rustix::fs::StatxFlags::MNT_ID.bits() != 0
+                    && let Some(root_id) = root_mount.mnt_id
+                {
+                    return Ok(sx.stx_mnt_id == root_id);
+                }
+                Ok(true)
+            }
+            Err(Errno::NOENT) => Ok(true),
+            Err(err) => Err(ProfileError::Io(err.into())),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        match rustix::fs::statat(dir_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => Ok(st.st_dev == root_mount.dev),
+            Err(Errno::NOENT) => Ok(true),
+            Err(err) => Err(ProfileError::Io(err.into())),
+        }
+    }
+}
+
 /// 削除を始める前に、`dir_fd` 配下のツリー全体が [`remove_dir_contents_at`] で
 /// 削除できる形かを読み取り専用で検証する（[`Profile::delete`] から呼ばれる。
 /// `PROF-5`）。
@@ -1436,10 +1482,19 @@ fn validate_tree_for_delete(
             }
             _ => false,
         };
+        let child_path = display_path.join(std::ffi::OsStr::from_bytes(bytes));
         if !is_dir {
+            // ファイル・symlink 等のマウントポイント（Linux の bind mount 等）は
+            // `unlinkat` が `EBUSY` で失敗し、先に走査した他のエントリだけが
+            // 消える。開かずに `statx` / `fstatat` で事前に検出する（PR #582 P1）。
+            if !entry_on_root_mount(dir_fd, name, root_mount)? {
+                return Err(ProfileError::InvalidLayout {
+                    path: child_path,
+                    reason: "refusing to delete a mount point inside the profile",
+                });
+            }
             continue;
         }
-        let child_path = display_path.join(std::ffi::OsStr::from_bytes(bytes));
         let child_fd = rustix::fs::openat(dir_fd, name, OPEN_DIR_FLAGS, Mode::empty())
             .map_err(|err| classify_dir_open_error(&child_path, err))?;
         if !same_mount(root_mount, mount_identity(child_fd.as_fd())?) {
@@ -2758,6 +2813,23 @@ mod tests {
         profile.delete().expect_err("must refuse");
         assert!(root.join("cookies").join("c.txt").exists());
         assert!(root.join("profile.lock").exists());
+    }
+
+    /// `PROF-5`（PR #582 P1）: 同一マウント上の通常ファイル・symlink は
+    /// マウントポイントとみなさない（別マウントの検出は特権が要るため
+    /// 単体テストでは同一マウント側のみ確認する）。
+    #[cfg(unix)]
+    #[test]
+    fn prof_5_entry_on_root_mount_accepts_same_mount_entries() {
+        let tmp = TempDir::new();
+        std::fs::create_dir_all(tmp.path()).expect("dir");
+        std::fs::write(tmp.path().join("f"), b"x").expect("file");
+        std::os::unix::fs::symlink("f", tmp.path().join("l")).expect("symlink");
+        let dir_fd = open_dir_all_verified(tmp.path()).expect("dir fd");
+        let mount = mount_identity(dir_fd.as_fd()).expect("mount");
+        for name in [c"f", c"l"] {
+            assert!(entry_on_root_mount(dir_fd.as_fd(), name, mount).expect("check"));
+        }
     }
 
     /// `PROF-5`: 名前が別の空ディレクトリへ差し替えられている場合、
