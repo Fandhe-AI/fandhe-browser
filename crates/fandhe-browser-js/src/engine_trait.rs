@@ -117,8 +117,9 @@ pub fn bundled_engines() -> &'static [EngineKind] {
 /// （coding-rust.md「JS エンジンはトレイト抽象越しに使い、V8 / boa の具象型
 /// を上位 crate へ漏らさない」）。`docs/spec/03-poc/js-engine-comparison` の
 /// PoC-3 で実測した「文字列 in/out・数値 out」の形状をカバーする最小構成
-/// であり、簡易実装（現在の制限: オブジェクト・配列等の複合値は表現できない。
-/// 必要になった時点（`TASK-29`/`TASK-32`・`MS-3`）で variant を追加する
+/// であり、簡易実装（現在の制限: オブジェクト・配列等の複合値は表現できない）。
+/// 親側 bind 済みオブジェクトは [`JsValue::ObjectHandle`] の参照としてのみ
+/// 表す。必要になった時点（`TASK-29`/`TASK-32`・`MS-3`）で variant を追加する
 /// （過剰設計を避ける。REPAIR-3）。将来の variant 追加が
 /// 破壊的変更にならないよう `#[non_exhaustive]` を付ける（`JsEngineError`・
 /// `CreateEngineError` と同じ理由づけ。`EngineKind` が spec で V8・Boa の
@@ -136,6 +137,40 @@ pub enum JsValue {
     Number(f64),
     /// 文字列。
     String(String),
+    /// 親側で bind 済みのオブジェクトへの参照（`JS-1`・`TASK-29.5a`・
+    /// Issue #524）。子プロセス側は実体を持たず、[`ObjectHandle`] の ID
+    /// だけを保持する。
+    ///
+    /// 簡易実装（REPAIR-3）: 現時点では型とワイヤ表現の定義のみで、V8 の値
+    /// との相互変換（プロキシオブジェクト化）は Issue #525（`TASK-29.5b`）
+    /// で実装する。それまで `V8Engine` は本 variant を V8 値へ変換せず、
+    /// JS 側で catch できる `Error` として表面化させる。
+    ObjectHandle(ObjectHandle),
+}
+
+/// 親側で bind 済みの DOM 風オブジェクトを指す ID（`JS-1`・`TASK-29.5a`・
+/// Issue #524）。[`JsValue::ObjectHandle`] が保持する。
+///
+/// - handle ID と `NativeCall` の ID（`worker_protocol` の
+///   `NATIVE_CALL`/`REGISTER_GLOBAL_FUNCTION` が使う `u32`）は **別の名前
+///   空間** であり、相互に流用しない
+/// - 子から届いた handle ID は untrusted。親は自分の登録簿と照合し、未登録の
+///   ID を拒否する契約とする（照合の実装は Issue #525）
+/// - 生の `u32` ではなく型で区別する（REPAIR-4）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjectHandle(u32);
+
+impl ObjectHandle {
+    /// 生の ID から handle を作る。ID の割り当て（親側の登録簿）は呼び出し側
+    /// の責務で、本関数は値の妥当性を検証しない。
+    pub const fn from_raw(id: u32) -> Self {
+        Self(id)
+    }
+
+    /// handle の生の ID を返す（ワイヤ表現への変換用）。
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
 }
 
 /// 親プロセス側 `NativeCall` dispatch が [`super::process_engine::ParentNativeFn`]
