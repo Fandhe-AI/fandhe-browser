@@ -997,7 +997,7 @@ fn js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_li
             );
         }
         other => panic!(
-            "expected EvaluationFailed(RangeError) when the lowered Job Object limit rejects              the allocation, got: {other:?}"
+            "expected EvaluationFailed(RangeError) when the lowered Job Object limit rejects the allocation, got: {other:?}"
         ),
     }
 
