@@ -49,6 +49,17 @@ CARGO_DENY_VERSION := 0.20.2
 # ここには入れず、レシピ内に直書きする。
 DENY_LICENSE_REJECT_CASES := GPL-3.0-only AGPL-3.0-only LGPL-2.1-only MPL-2.0
 
+# check-binary-size（TASK-34.2・RENDER-2。harness/binary-size/README.md 参照）
+# の対象 package と上限バイト数。`?=` のため環境変数や `make` 引数で上書き
+# できる（#467 が OS ごとに調整する余地を残す）。対象 package は cli crate
+# 追加（TASK-41.5・Issue #174）まで workspace に存在せず、その間は skip
+# （exit 0）になる。上限値の根拠（CORE-2 / RENDER-2 の「Chromium 比 80% 以上
+# 削減」・Chromium 実測 457.4MB（PoC-2）の 20%・release プロファイル未整備
+# による保守側の見積り等）は harness/binary-size/README.md「上限値と根拠」を
+# 参照。
+BINARY_SIZE_PACKAGE ?= fandhe-browser-cli
+BINARY_SIZE_LIMIT_BYTES ?= 91480000
+
 .PHONY: help
 help: ## ターゲット一覧を表示する
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
@@ -507,6 +518,30 @@ check-bench-record: ## competitor_lightpanda 記録スクリプトの自己テ�
 		exit 1; \
 	}
 	bash benches/competitor_lightpanda/self-test.sh
+
+# --------------------------------------------------
+# feature 無効（既定）のリリースバイナリサイズ検査（TASK-34.2・Issue #466。
+# harness/binary-size/README.md 参照）
+# --------------------------------------------------
+
+# HAS_CARGO / HAS_MEMBERS に依存しない（対象 package が無い間は
+# check-binary-size.sh 自身が skip を判定するため。cargo 系ターゲットと同様、
+# jq 未導入時は check-compat-regression と同じ方針で fail-closed にする）。
+# self-test（合成ファイルによる判定モードの自己テスト）を先に実行してから、
+# 対象 package のリリースビルド・判定に進む。`ci:` の依存には追加しない
+# （cargo build --release のコストが大きいため。CI・`ci:` 集約への組込みは
+# #467（TASK-34.3）が判断する。harness/binary-size/README.md「make ci に
+# 含めない理由」参照）。
+.PHONY: check-binary-size
+check-binary-size: ## feature 無効（既定）のリリースバイナリサイズが CORE-2 水準の上限以下か検査する（RENDER-2）
+	@command -v jq >/dev/null 2>&1 || { \
+		echo "NG: jq が未導入のため check-binary-size を実行できません" >&2; \
+		exit 1; \
+	}
+	bash harness/binary-size/self-test.sh
+	bash harness/binary-size/check-binary-size.sh \
+		--package "$(BINARY_SIZE_PACKAGE)" \
+		--limit "$(BINARY_SIZE_LIMIT_BYTES)"
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
