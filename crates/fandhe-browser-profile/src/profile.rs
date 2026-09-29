@@ -1354,12 +1354,20 @@ fn remove_dir_contents_at(
                     guard,
                 )?;
                 guard.verify_attached(chain, display_path)?;
-                remove_verified_dir_at(
+                // 名前が既に無い（`false`）のは、走査後に別プロセスが子を移動した
+                // 可能性があり、子に残ったデータを消せていない。成功扱いにしない。
+                let removed = remove_verified_dir_at(
                     dir_fd,
                     std::ffi::OsStr::from_bytes(bytes),
                     (child_st.st_dev, child_st.st_ino as u64),
                     &child_path,
                 )?;
+                if !removed {
+                    return Err(ProfileError::InvalidLayout {
+                        path: child_path,
+                        reason: "profile subdirectory was moved or removed during deletion",
+                    });
+                }
                 drop(child_fd);
             } else {
                 guard.verify_attached(chain, display_path)?;
