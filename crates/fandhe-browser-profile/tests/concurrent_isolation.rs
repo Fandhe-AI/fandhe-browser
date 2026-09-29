@@ -351,12 +351,16 @@ fn write_in_place(profile: &Profile, kind: DataKind, payload: &[u8]) -> Result<(
     Ok(())
 }
 
-/// 書き込み直後の混線検査（`PROF-3`・#185）。自プロファイルの
-/// `<kind>/concurrent.dat` は自ワーカーだけが書くため `payload` と完全一致する
-/// はずで、他プロファイルのファイルは空・読めない（未作成）・書き込み途中
-/// （再読み込みで有効な内容へ遷移するもの）を除き、自身以外のマーカー `profile-{m}:` を含まないこと。
-/// 未作成（`NotFound`）を許容するのは他プロファイルのファイルだけで、自
-/// プロファイルの読み取り失敗やその他の I/O エラーは指摘として記録する。
+/// 書き込み直後の混線検査（`PROF-3`・#185）。全プロファイル・全 `DataKind` の
+/// `<kind>/concurrent.dat` を 1 回の観測で調べる（書いた `kind` だけでなく
+/// 他の種別も見るのは、種別を取り違えた誤書き込みが後続の正しい書き込みで
+/// 上書きされて消えるのを防ぐため）。
+///
+/// - 自プロファイルの今回の `kind`: 自ワーカーだけが書くため `payload` と
+///   完全一致し、読み取り失敗（`NotFound` 含む）は指摘にする。
+/// - それ以外: 未作成（`NotFound`）は許容する。読めた内容は、自身以外の
+///   マーカー `profile-{m}:` を含まず、所有者の書き込み計画から説明できる内容
+///   （`is_owner_payload_or_in_flight`）であること。
 fn check_after_write(
     base: &Path,
     index: usize,
@@ -367,55 +371,55 @@ fn check_after_write(
 ) -> Vec<String> {
     let mut found = Vec::new();
     for owner in 0..profile_count {
-        let path = base
-            .join(format!("profile-{owner}"))
-            .join(kind.dir_name())
-            .join(TARGET_FILE_NAME);
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            // 未作成の他プロファイルのファイルだけは正常として許容する。
-            Err(err) if owner != index && err.kind() == std::io::ErrorKind::NotFound => {
+        for scan_kind in DataKind::ALL.iter().copied() {
+            let own_current = owner == index && scan_kind == kind;
+            let path = base
+                .join(format!("profile-{owner}"))
+                .join(scan_kind.dir_name())
+                .join(TARGET_FILE_NAME);
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                // 未作成のファイルは正常として許容する（今回書いたファイルを除く）。
+                Err(err) if !own_current && err.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                // 自プロファイルの今回のファイルは書き込み直後で必ず存在する。
+                Err(err) => {
+                    found.push(format!(
+                        "profile-{owner} {scan_kind:?}: failed to read {}: {err}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
+            if own_current {
+                if bytes != payload.as_bytes() {
+                    found.push(format!(
+                        "profile-{index} {kind:?}: own file {:?} != just-written {payload:?}",
+                        String::from_utf8_lossy(&bytes)
+                    ));
+                }
                 continue;
             }
-            // 自プロファイルは書き込み直後で必ず存在するため、NotFound を含む
-            // あらゆる読み取り失敗を違反として記録する（後続の書き込みで
-            // 異常が消えても最終読み戻しで見逃さないため）。
-            Err(err) => {
-                found.push(format!(
-                    "profile-{owner} {kind:?}: failed to read {}: {err}",
-                    path.display()
-                ));
-                continue;
+            let text = String::from_utf8_lossy(&bytes);
+            let mut marker_found = false;
+            for other in (0..profile_count).filter(|&m| m != owner) {
+                if text.contains(&format!("profile-{other}:")) {
+                    marker_found = true;
+                    found.push(format!(
+                        "profile-{owner} {scan_kind:?}: contains marker of profile-{other} ({text:?})"
+                    ));
+                }
             }
-        };
-        if owner == index {
-            if bytes != payload.as_bytes() {
+            // 待って読み直すことはしない: 読み直しで正常化すると、後続の書き込みで
+            // 上書きされる途中の混線を取り消してしまうため、1 回の観測で判定する。
+            if !marker_found
+                && !is_owner_payload_or_in_flight(owner, scan_kind, writes_per_profile, &bytes)
+            {
                 found.push(format!(
-                    "profile-{index} {kind:?}: own file {:?} != just-written {payload:?}",
-                    String::from_utf8_lossy(&bytes)
-                ));
-            }
-            continue;
-        }
-        let text = String::from_utf8_lossy(&bytes);
-        let mut marker_found = false;
-        for other in (0..profile_count).filter(|&m| m != owner) {
-            if text.contains(&format!("profile-{other}:")) {
-                marker_found = true;
-                found.push(format!(
-                    "profile-{owner} {kind:?}: contains marker of profile-{other} ({text:?})"
+                    "profile-{owner} {scan_kind:?}: content is not a valid payload of profile-{owner} ({text:?})"
                 ));
             }
-        }
-        // 他プロファイルのファイルは、所有者の書き込み計画から説明できる内容
-        // だけを許容する（`is_owner_payload_or_in_flight`）。待って読み直す
-        // ことはしない: 読み直しで正常化すると、後続の書き込みで上書きされる
-        // 途中の混線を取り消してしまうため、1 回の観測で判定する。
-        if !marker_found && !is_owner_payload_or_in_flight(owner, kind, writes_per_profile, &bytes)
-        {
-            found.push(format!(
-                "profile-{owner} {kind:?}: content is not a valid payload of profile-{owner} ({text:?})"
-            ));
         }
     }
     found
@@ -1291,4 +1295,40 @@ fn prof_3_in_flight_states_are_accepted_and_foreign_states_are_rejected() {
             String::from_utf8_lossy(ng)
         );
     }
+}
+
+/// `PROF-3`・#185・#580 レビュー指摘: 書き込み直後検査が、書いた種別以外の
+/// ファイルへの誤書き込み（種別の取り違え）も、後で正しく上書きされる前に
+/// 検出すること。
+#[test]
+fn prof_3_cross_kind_misplaced_write_is_detected() {
+    let tmp = TempDir::new();
+    let kind = DataKind::ALL[0];
+    let other_kind = DataKind::ALL[1];
+    let mut profiles = Vec::new();
+    for i in 0..PROFILE_COUNT {
+        profiles.push(Profile::open(tmp.path().join(format!("profile-{i}"))).expect("open"));
+    }
+    let own = "profile-0:write-0000\n";
+    write_once(&profiles[0], kind, own.as_bytes()).expect("write");
+    assert_eq!(
+        check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT, WRITES_PER_PROFILE),
+        Vec::<String>::new()
+    );
+
+    // profile-1 の別種別ファイルへ profile-0 のペイロードが誤って書かれた状況。
+    write_once(&profiles[1], other_kind, own.as_bytes()).expect("誤書き込み");
+    let found = check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT, WRITES_PER_PROFILE);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains("contains marker of profile-0") && found[0].contains("profile-1"),
+        "{found:?}"
+    );
+
+    // 自プロファイルの別種別ファイルへの誤配置（自分のペイロードだが計画外の種別）。
+    write_once(&profiles[1], other_kind, b"profile-1:write-0001\n").expect("正しい書き込み");
+    write_once(&profiles[0], other_kind, own.as_bytes()).expect("自分の別種別への誤配置");
+    let found = check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT, WRITES_PER_PROFILE);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("not a valid payload"), "{found:?}");
 }
