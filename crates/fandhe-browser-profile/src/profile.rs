@@ -715,11 +715,21 @@ impl Profile {
     ///    すり替わりは起きない）
     /// 4. 退避ルートを `rmdir` してからロックを解放する
     ///
-    /// 途中で失敗した場合は退避を元の名前へ戻す（元の名前が空いている場合のみ）。
-    /// 呼び出し元は `Profile::open` で開き直して `delete` を再試行できる。
+    /// 退避・復元の rename は既存エントリを上書きしない（Linux では
+    /// `RENAME_NOREPLACE`）。途中で失敗した場合は退避を元の名前へ戻す。呼び出し元は
+    /// `Profile::open` で開き直して `delete` を再試行できる。元の名前が並行 `open`
+    /// に占有され戻せない場合は、保持中の fd で削除を再試行し、なお残れば
+    /// [`ProfileError::InvalidLayout`] の `path` に退避ディレクトリを載せて返す
+    /// （そのパスを `open` して `delete` を再試行できる）。
+    ///
+    /// 各サブディレクトリは走査前に `..` の実体が検証済みの親と一致するかを
+    /// 確認し、別プロセスに境界外へ移された場合は拒否する。
     ///
     /// 残る競合: 手順 1 の確認から手順 2 の `renameat` までの間にパスが差し替え
     /// られ得るが、退避後に inode を再確認し、不一致なら戻して拒否する。
+    /// 非 Linux の unix 等 `RENAME_NOREPLACE` を使えない環境では退避・復元の
+    /// 確認と rename の間の競合が残る。サブディレクトリの `..` 確認から
+    /// `unlinkat` までの極小の窓も残る（同一ユーザーの書き込み権限が前提）。
     ///
     /// Windows では `open` が常に失敗するため到達しないが、成功を装わず
     /// [`ProfileError::Unsupported`] を返す（`XOS-7`〜`XOS-10`、REPAIR-3）。
@@ -770,9 +780,11 @@ impl Profile {
                     .map(|d| d.as_nanos())
                     .unwrap_or(0)
             ));
-            match rustix::fs::statat(&parent_fd, &tomb_name, AtFlags::SYMLINK_NOFOLLOW) {
-                Err(Errno::NOENT) => {}
-                Ok(_) => {
+            // 既存エントリを上書きしない rename で退避する（確認と移動の間に
+            // 同名ディレクトリが作られても置換しない）。
+            match rename_noreplace(parent_fd.as_fd(), &root_name, &tomb_name) {
+                Ok(()) => {}
+                Err(Errno::EXIST | Errno::NOTEMPTY) => {
                     return Err(ProfileError::InvalidLayout {
                         path: root,
                         reason: "deletion staging name already exists",
@@ -780,8 +792,6 @@ impl Profile {
                 }
                 Err(err) => return Err(ProfileError::Io(err.into())),
             }
-            rustix::fs::renameat(&parent_fd, &root_name, &parent_fd, &tomb_name)
-                .map_err(|err| ProfileError::Io(err.into()))?;
 
             let result = (|| {
                 // 退避したものが検証済みの root_fd と同じ実体であることを確認する。
@@ -794,7 +804,7 @@ impl Profile {
                     });
                 }
                 let root_mount = mount_identity(root_fd.as_fd())?;
-                remove_dir_contents_at(root_fd.as_fd(), root_mount, 0, &root, None)?;
+                remove_dir_contents_at(root_fd.as_fd(), root_mount, 0, &root, None, None)?;
                 match rustix::fs::unlinkat(&parent_fd, &tomb_name, AtFlags::REMOVEDIR) {
                     Ok(()) => Ok(()),
                     Err(Errno::NOTEMPTY) => Err(ProfileError::InvalidLayout {
@@ -805,21 +815,77 @@ impl Profile {
                 }
             })();
 
-            if result.is_err() {
-                // 元の名前が空いている場合のみ戻す（既存エントリを上書きしない）。
-                if matches!(
-                    rustix::fs::statat(&parent_fd, &root_name, AtFlags::SYMLINK_NOFOLLOW),
-                    Err(Errno::NOENT)
-                ) {
-                    let _ = rustix::fs::renameat(&parent_fd, &tomb_name, &parent_fd, &root_name);
+            let result = if result.is_err() {
+                // 元の名前へ既存エントリを上書きせず戻す。並行 open が元の名前を
+                // 占有していて戻せない場合、退避ツリーに cookie 等が孤立しないよう
+                // 保持中の root_fd で再度の削除を試み（best effort）、それでも
+                // 残るなら退避ディレクトリのパスを載せて報告する（呼び出し元は
+                // そのパスを `Profile::open` して `delete` を再試行できる）。
+                match rename_noreplace(parent_fd.as_fd(), &tomb_name, &root_name) {
+                    Ok(()) => result,
+                    Err(_) => {
+                        let retry = mount_identity(root_fd.as_fd())
+                            .and_then(|mount| {
+                                remove_dir_contents_at(root_fd.as_fd(), mount, 0, &root, None, None)
+                            })
+                            .and_then(|()| {
+                                rustix::fs::unlinkat(&parent_fd, &tomb_name, AtFlags::REMOVEDIR)
+                                    .map_err(|err| ProfileError::Io(err.into()))
+                            });
+                        match retry {
+                            Ok(()) => Ok(()),
+                            Err(_) => Err(ProfileError::InvalidLayout {
+                                path: root
+                                    .parent()
+                                    .map(|p| p.join(&tomb_name))
+                                    .unwrap_or_else(|| PathBuf::from(&tomb_name)),
+                                reason: "profile deletion failed and the original name was re-occupied; remaining data is kept in this staging directory",
+                            }),
+                        }
+                    }
                 }
-            }
+            } else {
+                result
+            };
             // ロックは最後まで保持する（ここで初めて解放）。
             drop(profile_lock);
             drop(root_fd);
             result
         }
     }
+}
+
+/// 親ディレクトリ `parent_fd` 内で `from` を `to` へ、既存エントリを上書き
+/// せずに rename する（[`Profile::delete`] の退避・復元用）。
+///
+/// Linux / Android では `renameat2(RENAME_NOREPLACE)` で原子的に行う。
+/// 非対応のファイルシステム（`EINVAL`）・非 Linux の unix では確認後 rename
+/// へフォールバックする（確認と rename の間の競合は残る。`PROF-5`）。
+#[cfg(unix)]
+fn rename_noreplace(
+    parent_fd: BorrowedFd<'_>,
+    from: &std::ffi::OsStr,
+    to: &std::ffi::OsStr,
+) -> Result<(), Errno> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        match rustix::fs::renameat_with(
+            parent_fd,
+            from,
+            parent_fd,
+            to,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Err(Errno::INVAL | Errno::NOSYS) => {}
+            other => return other,
+        }
+    }
+    match rustix::fs::statat(parent_fd, to, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(Errno::NOENT) => {}
+        Ok(_) => return Err(Errno::EXIST),
+        Err(err) => return Err(err),
+    }
+    rustix::fs::renameat(parent_fd, from, parent_fd, to)
 }
 
 /// マウント境界の識別子。同一 FS 上の bind mount は `st_dev` が同じになるため、
@@ -892,6 +958,7 @@ fn remove_dir_contents_at(
     depth: usize,
     display_path: &Path,
     keep: Option<&std::ffi::OsStr>,
+    parent_id: Option<(rustix::fs::Dev, u64)>,
 ) -> Result<(), ProfileError> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -902,6 +969,19 @@ fn remove_dir_contents_at(
         });
     }
     for _ in 0..MAX_DELETE_PASSES {
+        // 開いた後に別プロセスがこのディレクトリを検証済みの親配下から移動して
+        // いないか、".." の実体で確認する（移動されていたら境界外を消さない）。
+        if let Some(expected) = parent_id {
+            let up = rustix::fs::openat(dir_fd, "..", OPEN_DIR_FLAGS, Mode::empty())
+                .map_err(|err| classify_dir_open_error(display_path, err))?;
+            let st = rustix::fs::fstat(&up).map_err(|err| ProfileError::Io(err.into()))?;
+            if (st.st_dev, st.st_ino as u64) != expected {
+                return Err(ProfileError::InvalidLayout {
+                    path: display_path.to_path_buf(),
+                    reason: "profile subdirectory was moved out during deletion",
+                });
+            }
+        }
         let dir = Dir::read_from(dir_fd).map_err(|err| ProfileError::Io(err.into()))?;
         let mut removed_any = false;
         for entry in dir {
@@ -934,7 +1014,16 @@ fn remove_dir_contents_at(
                         reason: "refusing to cross a mount point during profile deletion",
                     });
                 }
-                remove_dir_contents_at(child_fd.as_fd(), root_mount, depth + 1, &child_path, None)?;
+                let dir_st =
+                    rustix::fs::fstat(dir_fd).map_err(|err| ProfileError::Io(err.into()))?;
+                remove_dir_contents_at(
+                    child_fd.as_fd(),
+                    root_mount,
+                    depth + 1,
+                    &child_path,
+                    None,
+                    Some((dir_st.st_dev, dir_st.st_ino as u64)),
+                )?;
                 drop(child_fd);
                 match rustix::fs::unlinkat(dir_fd, name, AtFlags::REMOVEDIR) {
                     Ok(()) | Err(Errno::NOENT) => {}
@@ -2159,6 +2248,32 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    /// `PROF-5`: `rename_noreplace` は既存エントリ（空ディレクトリ含む）を上書きしない。
+    #[cfg(unix)]
+    #[test]
+    fn prof_5_rename_noreplace_does_not_overwrite_existing_dir() {
+        let tmp = TempDir::new();
+        std::fs::create_dir_all(tmp.path().join("a")).expect("a");
+        std::fs::create_dir_all(tmp.path().join("b")).expect("b");
+        std::fs::write(tmp.path().join("a").join("marker"), b"x").expect("marker");
+        let fd = open_dir_all_verified(tmp.path()).expect("dir fd");
+        let err = rename_noreplace(
+            fd.as_fd(),
+            std::ffi::OsStr::new("a"),
+            std::ffi::OsStr::new("b"),
+        )
+        .expect_err("must not overwrite");
+        assert_eq!(err, Errno::EXIST);
+        assert!(tmp.path().join("a").join("marker").exists());
+        rename_noreplace(
+            fd.as_fd(),
+            std::ffi::OsStr::new("a"),
+            std::ffi::OsStr::new("c"),
+        )
+        .expect("free name");
+        assert!(tmp.path().join("c").join("marker").exists());
     }
 
     /// `PROF-5`: 削除失敗時は退避を元の名前へ戻し、親ディレクトリに退避名を
