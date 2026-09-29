@@ -9,20 +9,28 @@
 //! `fandhe-browser-profile::Profile::open`（TASK-50・#177）へ渡す想定
 //! （設計時点の申し送り。cli crate 側の配線は別 Issue）。
 //!
-//! # スコープ（91.1・91.2 の範囲）
+//! # スコープ（91.1〜91.3 の範囲）
 //!
 //! 読めるのは `[profile]`（保存先 `root`・分離強度 `isolation`。TASK-91（91.1）・
-//! Issue #214）と `[js]`（`engine`。TASK-91（91.2）・Issue #215）。兄弟 Issue が
-//! 以下を追加する契約とする（REPAIR-3: 実装済みを装わない）。
-//!
-//! - `[rendering]`（レンダリング層有効化・`fandhe-browser.toml` サンプル
-//!   ファイル。TASK-91（91.3）・Issue #216）
+//! Issue #214）、`[js]`（`engine`。TASK-91（91.2）・Issue #215）、`[rendering]`
+//! （`enabled`。TASK-91（91.3）・Issue #216）。リポジトリ直下の
+//! `fandhe-browser.toml` は全セクションを説明した設定サンプルである。
 //!
 //! トップレベル・各セクションとも未知キーを `deny_unknown_fields` で拒否する
 //! （タイプミスを黙って無視しない fail-closed 方針。security.md「不安全な
-//! 設計」）。そのため #216 がマージされるまで `[rendering]` を含む TOML は
-//! 構文エラー（[`ConfigError::Syntax`]）になる。各兄弟 Issue は自セクションの
-//! フィールドを非公開の `RawConfig` へ追加する責務を持つ。
+//! 設計」）。未知のキー・セクションは [`ConfigError::Syntax`] になる。
+//!
+//! # `[rendering] enabled` の解決規則（暫定・RENDER-1・TASK-91.3）
+//!
+//! 1. 省略・`enabled = false`: レンダリング層は無効（エラーではない）
+//! 2. `enabled = true` かつレンダリング層を同梱したビルド: 有効
+//! 3. `enabled = true` かつ未同梱のビルド: [`ConfigError::RenderingNotCompiled`]
+//!    （無視して無効のまま成功させない。JS エンジン未同梱と同じ fail-closed）
+//!
+//! 3 は暫定挙動であり、最終仕様は `rendering-layer.md` と合わせて決める
+//! （spec TASK-91 の記述。Issue #216 の範囲外）。現時点ではレンダリング層を
+//! リンクしたビルドが存在しない（render crate は骨組み・cli 未作成）ため、
+//! `enabled = true` は常に 3 になる。
 //!
 //! # `[js] engine` の解決規則（JS-1・TASK-91.2）
 //!
@@ -122,13 +130,13 @@ pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 
 /// `fandhe-browser.toml` から読み込んだブラウザ全体の設定。
 ///
-/// `#[non_exhaustive]` により、`[rendering]`（Issue #216）のフィールド追加を
-/// 非破壊にする（REPAIR-4）。
+/// `#[non_exhaustive]` により、将来のセクション追加を非破壊にする（REPAIR-4）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Config {
     profile: ProfileConfig,
     js: JsConfig,
+    rendering: RenderingConfig,
 }
 
 impl Config {
@@ -170,7 +178,13 @@ impl Config {
             engine: resolve_engine(requested.as_deref(), bundled_engines())?,
         };
 
-        Ok(Config { profile, js })
+        let rendering = resolve_rendering(raw.rendering, RENDERING_COMPILED)?;
+
+        Ok(Config {
+            profile,
+            js,
+            rendering,
+        })
     }
 
     /// `path` の設定ファイルを読み込み、[`Config`] を構築する。
@@ -295,6 +309,54 @@ impl Config {
     pub fn js(&self) -> &JsConfig {
         &self.js
     }
+
+    /// `[rendering]` セクションの設定（TASK-91（91.3）・Issue #216）。
+    pub fn rendering(&self) -> &RenderingConfig {
+        &self.rendering
+    }
+}
+
+/// `[rendering]` セクションの設定（レンダリング層の有効化。TASK-91（91.3）・
+/// Issue #216・`RENDER-1`）。
+///
+/// `#[non_exhaustive]` により将来のフィールド追加を非破壊にする（REPAIR-4）。
+///
+/// 暫定挙動（REPAIR-3）: `enabled = true` はレンダリング層を同梱したビルドでのみ
+/// 受理され、未同梱では [`ConfigError::RenderingNotCompiled`] になる。最終仕様は
+/// `rendering-layer.md` と合わせて決める（Issue #216 の範囲外）。本型は
+/// 「有効化の要求が受理された」ことを表すだけで、レンダラの生成や cli への配線は
+/// 行わない（配線は TASK-41、render の本実装は TASK-33/TASK-38）。配線される
+/// までは `render::DisabledRenderer` が常に `RenderError::RenderingDisabled` を返す。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RenderingConfig {
+    enabled: bool,
+}
+
+impl RenderingConfig {
+    /// レンダリング層の有効化が要求され、受理されたか。既定は `false`。
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+/// レンダリング層をリンクしたビルドか（暫定。RENDER-1・TASK-91.3）。
+///
+/// 現時点ではレンダリング層を同梱するビルドが存在しない（render crate は骨組みで
+/// cli は未作成）ため `false` 固定。cli（TASK-41）が feature `rendering` を core へ
+/// 転送する段階で、feature 由来の値へ置き換える（TASK-33/TASK-38）。core へ未宣言の
+/// feature を `cfg!` で参照すると `unexpected_cfgs` になるため、定数で保持する。
+const RENDERING_COMPILED: bool = false;
+
+/// `[rendering] enabled` の設定値を同梱有無と照合して確定する
+/// （モジュール doc「`[rendering] enabled` の解決規則」）。
+/// `compiled` を引数にして、同梱時の分岐も単体テストできるようにしている。
+fn resolve_rendering(raw: Option<RawRendering>, compiled: bool) -> Result<RenderingConfig> {
+    let enabled = raw.and_then(|r| r.enabled).unwrap_or(false);
+    if enabled && !compiled {
+        return Err(Error::from(ConfigError::RenderingNotCompiled));
+    }
+    Ok(RenderingConfig { enabled })
 }
 
 /// `[js]` セクションの設定（JS エンジン選択。TASK-91（91.2）・Issue #215・
@@ -708,6 +770,14 @@ fn truncate_for_message(value: &str) -> String {
 struct RawConfig {
     profile: Option<RawProfile>,
     js: Option<RawJs>,
+    rendering: Option<RawRendering>,
+}
+
+/// `[rendering]` セクションの生 TOML 構造（非公開）。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRendering {
+    enabled: Option<bool>,
 }
 
 /// `[js]` セクションの生 TOML 構造（非公開）。
@@ -780,6 +850,10 @@ pub enum ConfigError {
         /// このバイナリに同梱されているエンジン（V8 → boa 順。空もあり得る）。
         compiled: &'static [EngineKind],
     },
+    /// `[rendering] enabled = true` だが、このバイナリにレンダリング層が同梱
+    /// されていない（無視して成功させない）。暫定挙動で、最終仕様は
+    /// `rendering-layer.md` と合わせて決める（`RENDER-1`・TASK-91.3・Issue #216）。
+    RenderingNotCompiled,
 }
 
 impl ConfigError {
@@ -861,6 +935,11 @@ impl std::fmt::Display for ConfigError {
                 requested.as_str(),
                 format_engine_list(compiled),
                 requested.feature_name()
+            ),
+            ConfigError::RenderingNotCompiled => write!(
+                f,
+                "rendering.enabled = true but the rendering layer is not compiled into \
+                 this binary (no build currently links it); set rendering.enabled = false"
             ),
             ConfigError::UnknownJsEngine { value, compiled } => write!(
                 f,
@@ -1043,8 +1122,7 @@ mod tests {
     }
 
     /// TASK-91（91.1）: トップレベルの未知キーは `deny_unknown_fields` により
-    /// 構文エラーになる（#216 未マージの間、`[rendering]` を
-    /// 含む TOML もこの経路でエラーになる）。
+    /// 構文エラーになる。
     #[test]
     fn task_91_1_unknown_top_level_key_is_rejected() {
         let err = Config::from_toml_str("[unknown]\nfoo = 1\n")
@@ -1240,5 +1318,50 @@ mod tests {
                 ));
             }
         }
+    }
+
+    /// TASK-91（91.3）: `[rendering]` 省略・空・`enabled = false` は無効で成功する。
+    #[test]
+    fn task_91_3_disabled_paths() {
+        for input in ["", "[rendering]\n", "[rendering]\nenabled = false\n"] {
+            let config = Config::from_toml_str(input).expect("無効は受理");
+            assert!(!config.rendering().enabled(), "{input:?}");
+            assert_eq!(config, Config::default(), "{input:?}");
+        }
+    }
+
+    /// TASK-91（91.3）: 型違い・未知キーは構文エラー。
+    #[test]
+    fn task_91_3_invalid_toml_is_syntax_error() {
+        for bad in [
+            "[rendering]\nenabled = \"yes\"\n",
+            "[rendering]\nenable = true\n",
+        ] {
+            let err = Config::from_toml_str(bad).expect_err("構文エラー");
+            assert!(matches!(err, Error::Config(ConfigError::Syntax { .. })));
+        }
+    }
+
+    /// TASK-91（91.3）: 未同梱ビルドでの `enabled = true` は設定エラー（暫定）。
+    #[test]
+    fn task_91_3_enabled_without_layer_is_rejected() {
+        let err = Config::from_toml_str("[rendering]\nenabled = true\n").expect_err("未同梱は拒否");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::RenderingNotCompiled)
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("rendering.enabled = true"), "{msg}");
+        assert!(msg.contains("not compiled"), "{msg}");
+    }
+
+    /// TASK-91（91.3）: 同梱ビルド（`compiled = true`）では有効化が受理される。
+    #[test]
+    fn task_91_3_enabled_with_layer_is_accepted() {
+        let raw = Some(RawRendering {
+            enabled: Some(true),
+        });
+        let config = resolve_rendering(raw, true).expect("同梱なら受理");
+        assert!(config.enabled());
     }
 }
