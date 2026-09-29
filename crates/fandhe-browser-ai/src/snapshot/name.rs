@@ -89,7 +89,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use fandhe_browser_core::dom::{Document, NodeData, NodeId};
+use fandhe_browser_core::dom::{Children, Document, NodeData, NodeId};
 
 use super::state::is_html_element_named;
 
@@ -590,14 +590,21 @@ fn embedded_control_text(
     }
     if is_html_element_named(doc, id, "select") {
         let mut scan = ContentScan::default();
-        let mut stack: Vec<NodeId> = doc.children(id).rev().collect();
+        // 子ノードを事前に全件確保せず、遅延イテレータのスタックで辿る。
+        // 確保は「積んだ階層数（各 1 イテレータ）」に比例し、階層は 1 ステップ
+        // ごとにしか増えないため `scan_limit` で有界になる（入力の子数に比例しない）。
+        let mut stack: Vec<Children<'_>> = vec![doc.children(id)];
         let mut first: Option<NodeId> = None;
         let mut chosen: Option<NodeId> = None;
         // 選択状態の探索へ予算の半分までを割り当て、残りは選択候補のテキスト収集へ
         // 確保する。後続の `option` が大量でも、確定済みの候補（最初の `option`）の
         // 名前が予算枯渇で失われないようにする（PR #574 レビュー指摘）。
         let scan_limit = max_steps - max_steps / 2;
-        while let Some(current) = stack.pop() {
+        while let Some(top) = stack.last_mut() {
+            let Some(current) = top.next() else {
+                stack.pop();
+                continue;
+            };
             if scan.steps_used >= scan_limit {
                 scan.cut = true;
                 break;
@@ -610,7 +617,7 @@ fn embedded_control_text(
                 }
                 first.get_or_insert(current);
             } else if doc.is_element(current) {
-                stack.extend(doc.children(current).rev());
+                stack.push(doc.children(current));
             }
         }
         let mut out = String::new();
@@ -746,7 +753,7 @@ fn collect_content_text(
                     }
                     continue;
                 }
-                stack.extend(doc.children(current).rev());
+                stack.push(doc.children(current));
             }
             _ => {}
         }
@@ -942,7 +949,15 @@ impl<'doc> NameIndex<'doc> {
                         ids_by_value.entry(id_value).or_insert(node);
                     }
 
-                    if first_title.is_none() && is_html_element_named(doc, node, "title") {
+                    // 文書タイトルは `head` 直下の `title` に限る（body 内の `title` や
+                    // 他要素配下の `title` は文書タイトルにしない。HTML Standard の
+                    // `document.title`。PR #574 レビュー指摘）。
+                    if first_title.is_none()
+                        && is_html_element_named(doc, node, "title")
+                        && doc
+                            .parent(node)
+                            .is_some_and(|parent| is_html_element_named(doc, parent, "head"))
+                    {
                         first_title = Some(node);
                     }
 
@@ -3555,6 +3570,16 @@ mod tests {
         assert_eq!(
             compute_name(&doc, doc.root()),
             named("先", NameSource::DocumentTitle, false)
+        );
+        // body 内の HTML `<title>` は文書タイトルにしない（head 直下に限る）。
+        let doc = parse("<html><head></head><body><p><title>本文</title></p></body></html>");
+        assert_eq!(compute_name(&doc, doc.root()), AccessibleName::default());
+        let doc = parse(
+            "<html><head><title>先頭</title></head><body><div><title>後</title></div></body></html>",
+        );
+        assert_eq!(
+            compute_name(&doc, doc.root()),
+            named("先頭", NameSource::DocumentTitle, false)
         );
         let long = "題".repeat(MAX_NAME_CHARS + 5);
         let doc = parse(&format!("<head><title>{long}</title></head>"));
