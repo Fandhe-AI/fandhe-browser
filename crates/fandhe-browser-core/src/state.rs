@@ -377,14 +377,17 @@ mod tests {
         let g = s.begin_navigation().unwrap();
         s.commit_navigation(g, NavigationResult::new("https://a/", "a"))
             .unwrap();
+        assert_eq!(s.latest().unwrap().url(), "https://a/");
+        // begin_navigation を挟まず、保存済み結果を clear_navigation 自体が消すことを検証する。
+        s.clear_navigation(g).unwrap();
+        assert!(s.latest().is_none());
+        // 古い世代での clear は拒否され、新しい結果を消さない。
         let g2 = s.begin_navigation().unwrap();
-        assert!(s.clear_navigation(g).is_err());
         s.commit_navigation(g2, NavigationResult::new("https://b/", "b"))
             .unwrap();
-        assert!(s.latest().is_some());
         let g3 = s.begin_navigation().unwrap();
-        s.clear_navigation(g3).unwrap();
-        assert!(s.latest().is_none());
+        assert!(s.clear_navigation(g2).is_err());
+        assert_eq!(s.current_generation(), g3);
     }
 
     #[test]
@@ -484,7 +487,7 @@ mod tests {
 
     #[test]
     fn cdp1_stale_result_never_survives_newer_begin() {
-        // 保存と begin が競合しても、Ok で保存された結果は必ず最後に払い出された世代のもの。
+        // 保存と begin が競合しても、begin 完了後に古い結果は残らない。
         for _ in 0..200 {
             let s = NavigationState::new();
             let g1 = s.begin_navigation().unwrap();
@@ -497,8 +500,8 @@ mod tests {
             });
             let (res, g2) = committed;
             match res {
-                // 保存が先に直列化された場合。後続の世代で上書き・破棄できる。
-                Ok(()) => assert_eq!(s.latest().unwrap().url(), "https://old/"),
+                // 保存が先に直列化された場合でも、後続の begin_navigation が結果を無効化する。
+                Ok(()) => assert!(s.latest().is_none()),
                 Err(e) => {
                     assert_eq!(
                         e,
