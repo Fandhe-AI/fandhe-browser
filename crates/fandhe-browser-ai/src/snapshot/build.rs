@@ -19,6 +19,8 @@
 //!   （トークン削減は後続タスク。`AISNAP-1`・`AISNAP-2`）。
 //! - ルート以外の全要素に ref を振る（対話可能な要素への絞り込みは後続タスク）。
 //! - 深さが [`MAX_TREE_DEPTH`] を超えるサブツリーは省略し `Snapshot::truncated` を立てる。
+//! - いずれかの name が打ち切られた場合（文字数上限・子孫走査の上限・構築全体で共有する
+//!   走査予算）も `Snapshot::truncated` を立てる。
 
 use std::fmt;
 
@@ -26,7 +28,8 @@ use fandhe_browser_core::dom::{Children, Document, NodeId};
 
 use super::element_ref::{ElementRef, ElementSignature, RefAllocator, RefError};
 use super::name::{
-    NameIndex, SKIPPED_SUBTREES, compute_name_with_index, is_hidden_element, normalized_input_type,
+    MAX_TOTAL_CONTENT_STEPS, NameIndex, SKIPPED_SUBTREES, compute_name_with_index,
+    is_hidden_element, normalized_input_type,
 };
 use super::role::compute_role;
 use super::state::{compute_state, is_html_element_named};
@@ -112,7 +115,7 @@ struct Frame<'a> {
 ///
 /// ref の発行に失敗した場合 [`SnapshotError::Ref`]。
 pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
-    let index = NameIndex::build(doc);
+    let index = NameIndex::build(doc).with_content_budget(MAX_TOTAL_CONTENT_STEPS);
     let mut refs = RefAllocator::new();
     let mut truncated = false;
 
@@ -120,7 +123,9 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
     let root_role = compute_role(doc, root_id)
         .map(|r| r.as_str().to_string())
         .unwrap_or_else(|| "document".to_string());
-    let root_name = compute_name_with_index(doc, &index, root_id).text;
+    let root_name = compute_name_with_index(doc, &index, root_id);
+    truncated |= root_name.truncated;
+    let root_name = root_name.text;
     let mut stack: Vec<Frame<'_>> = vec![Frame {
         node: Node::new(root_role, root_name),
         children: doc.children(root_id),
@@ -156,7 +161,10 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
             continue;
         };
         let role = role.as_str();
-        let name = compute_name_with_index(doc, &index, child).text;
+        let accessible = compute_name_with_index(doc, &index, child);
+        // 名前の打ち切り（文字数・走査量の上限）も Snapshot 全体へ通知する。
+        truncated |= accessible.truncated;
+        let name = accessible.text;
         let mut sig = ElementSignature::new(role, &name);
         if let Some(d) = discriminator(doc, child) {
             sig = sig.with_discriminator(d);
@@ -375,5 +383,40 @@ mod tests {
         assert_eq!(s, s2);
         drop(s2);
         assert!(!snap(PAGE).truncated);
+    }
+
+    /// AISNAP-1: name の打ち切りが Snapshot::truncated に伝わる。
+    #[test]
+    fn aisnap_1_build_snapshot_propagates_name_truncation() {
+        let long = "あ".repeat(500);
+        let s = snap(&format!("<body><button>{long}</button></body>"));
+        assert!(s.truncated);
+        let btn = child(child(child(&s.tree, 0), 0), 0);
+        assert!(btn.name.chars().count() <= 120);
+    }
+
+    /// AISNAP-1: 入れ子の heading でも構築全体の走査予算で有界に完了し、
+    /// 予算超過は truncated で通知される。
+    #[test]
+    fn aisnap_1_build_snapshot_shared_name_budget_bounded() {
+        let depth = 200;
+        let html = format!(
+            "<body>{}x{}</body>",
+            "<div role=\"heading\">".repeat(depth),
+            "</div>".repeat(depth)
+        );
+        let s = snap(&html);
+        assert!(!s.truncated);
+        // 入れ子 heading の塊を多数並べて共有予算を使い切らせる。
+        let group = format!(
+            "{}{}{}",
+            "<div role=\"heading\">".repeat(100),
+            "<i></i>".repeat(800),
+            "</div>".repeat(100)
+        );
+        let one = snap(&format!("<body>{group}</body>"));
+        assert!(!one.truncated);
+        let s = snap(&format!("<body>{}</body>", group.repeat(60)));
+        assert!(s.truncated);
     }
 }
