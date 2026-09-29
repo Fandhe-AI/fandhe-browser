@@ -1,6 +1,6 @@
-# レンダリング feature（`rendering`）有効時のサイズ増分・ビルド時間
+# レンダリング feature（`rendering`）のゲート検証とサイズ・ビルド時間
 
-対応 `TASK-35` / `MS-1` / ビヘイビア `RENDER-3`（[spec-reference](../../.claude/rules/spec-reference.md)）。
+対応 `TASK-34` / `TASK-35` / `MS-1` / ビヘイビア `RENDER-1` / `RENDER-2` / `RENDER-3`（[spec-reference](../../.claude/rules/spec-reference.md)）。
 
 ## 目的
 
@@ -9,6 +9,49 @@ feature `rendering`（`Servo` 組込）を有効化した場合のバイナリ�
 本ドキュメントは新規の実測を行うものではなく、既存 PoC（PoC-6）の実測値を出典明記のうえ整理したものである。
 リポジトリに `fandhe-browser-render` crate・`fandhe-browser-cli` crate が未作成のため、
 本リポジトリ自身での `cargo build --release --features rendering` 実測はまだ実施できない。
+
+## feature 無効時の確認記録（TASK-34・RENDER-1・RENDER-2）
+
+TASK-34 の成果物のうち確認記録の節。スクリプト側は `scripts/check-render-isolation.sh`（TASK-34.1・#465）、`harness/binary-size/`（TASK-34.2・#466）、CI `binary-size` ジョブ（TASK-34.3・#467）で整備済み。
+
+### 依存グラフ検査（RENDER-1）
+
+| 項目 | 内容 |
+| ---- | ---- |
+| 検査 A | `cargo tree --workspace -e normal,build,dev --exclude fandhe-browser-render`（CI は `--locked` 付き） |
+| 検査 B | `cargo tree -p fandhe-browser-cli -e normal,build,dev` |
+| 判定 | パターン `servo\|fandhe-browser-render`（大文字小文字非区別）の一致行数が 0 なら OK |
+| 対象 crate | `fandhe-browser-ai` / `-cdp` / `-core` / `-js` / `-profile`（render は根から除外。cli は未作成） |
+| feature 指定 | 既定のみ（`--features` / `--all-features` なし）。`-e dev` で dev-dependencies 経由の混入も検出対象 |
+
+| 実行環境 | 検査 A | 検査 B | 根拠 |
+| -------- | ------ | ------ | ---- |
+| ローカル Linux x86_64（rustc 1.98.1、main `555b68e`） | OK（0 件） | skip | `bash scripts/check-render-isolation.sh`、自己テストも成功 |
+| CI ubuntu / macos / windows（ci.yml run `36575544953`、main `555b68e`） | OK（0 件） | skip | ジョブ `render-isolation` の 3 OS すべて success |
+
+- `Cargo.lock` 全体でも `servo` を含むパッケージは 0 件（`grep -ci servo Cargo.lock`）
+- `fandhe-browser-render` 自体がまだ Servo 依存も feature `rendering` も持たないため、現時点の 0 件は「将来の混入を検出するゲートが稼働している」ことの確認にとどまる
+- 検出はクレート名文字列による簡易検出。最終防御線は `deny.toml`（MPL-2.0 不許可）で、`make check-deny-license-reject` が裏付ける
+- 検査 B は `fandhe-browser-cli`（TASK-41.5・#174）追加後に自動で有効化される。それまで cli の既定 feature 範囲は**未検査**
+
+### バイナリサイズ（RENDER-2）
+
+| OS | 実測値 | 上限 | CORE-2 基準（424KB、PoC-6）との比較 |
+| -- | ------ | ---- | ---------------------------------- |
+| ubuntu | 未計測 | 91,480,000 B | 比較不可 |
+| macos | 未計測 | 91,480,000 B | 比較不可 |
+| windows | 未計測 | 91,480,000 B | 比較不可 |
+
+- **未計測の理由**: 計測対象 `fandhe-browser-cli` が未作成で、`make check-binary-size` と CI `binary-size` ジョブ（3 OS）はいずれも `skip:` で終了し休眠している。skip は合格ではない（未計測を実測済みと装わない。REPAIR-3）
+- 代替計測を採らない理由: core の example 等を測っても製品バイナリと構成が異なり、RENDER-2 の実測値と誤解されるため
+- 参考値: 424KB は `println!` のみのスタブ（Servo 未リンク）で、ゲートではなく参考下限。上限 91,480,000 B は Chromium 457.4MB（PoC-2）の 20% から導いた値（詳細は `harness/binary-size/README.md`）
+- 上限見直し（回帰予算を厳しくするか・OS 別上限にするか）: 実測値が無いため**据え置き**。#174 完了後の初回実測で判断する
+- 再計測手順: #174 マージ後に CI `binary-size` ジョブのサマリー（`binary-size: host=... bytes=... limit=... result=...`）とローカル `make check-binary-size` の結果を転記して本節を更新する。release プロファイルが CORE-2 の前提（`opt-level="z"`・`lto` 等）を未適用のため、計測値は大きめ（保守側）に出る
+
+### 受け入れ条件との対応（TASK-34.4）
+
+- feature 無効時の依存グラフ確認記録: **達成**（workspace 範囲・3 OS）。cli の既定 feature 範囲は #174 完了後に検査 B で確認する
+- OS 別バイナリサイズ実測値と CORE-2 水準との比較: **未達**。#174 待ち。比較の枠組み・上限の根拠・再計測手順までを記録済み
 
 ## バイナリサイズ増分
 
@@ -75,11 +118,13 @@ RENDER-3 が求める設計判断材料として、`fandhe-browser-render` crate
 
 ## 出典
 
-- `docs/spec/05-tasks.md` TASK-35・TASK-36・TASK-82
+- `docs/spec/05-tasks.md` TASK-34・TASK-35・TASK-36・TASK-82
 - `docs/spec/06-roadmap.md` MS-1
 - `docs/spec/04-behavior/rendering-layer.md` RENDER-1〜7
 - `docs/spec/04-behavior/measurement-infra.md` MEAS-3
 - `docs/spec/04-behavior/container-cloud.md`（コンテナは RENDER-3 対象外の明記）
+- `docs/spec/04-behavior/core-dom.md` CORE-2
+- `harness/binary-size/README.md`・`scripts/check-render-isolation.sh`（本リポジトリ内の検査実装）
 - `docs/spec/spec.md`（既定ビルドの実サイズ参考値、JS-3・PERF-1）
 - `docs/spec/03-poc/rendering-layer-servo/README.md`（PoC-6 実測本体）
 - `docs/spec/03-poc/browser-landscape-2026/README.md`（PoC-13、参考記載）
