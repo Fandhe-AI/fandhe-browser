@@ -2579,12 +2579,14 @@ fn apply_post_response_rss_check(
     let _ = worker.memory_monitor.take_kill_reason();
     let tail = worker.reap_and_collect_stderr();
     (
-        Err(JsEngineError::ResourceLimitExceeded(format!(
-            "JS worker process RSS ({rss_bytes} bytes) exceeded the parent's monitoring \
-             threshold ({} bytes) immediately after responding; context was discarded; stderr: \
-             {tail}",
-            worker.rss_threshold_bytes
-        ))),
+        Err(ensure_discarded_phrase(
+            JsEngineError::ResourceLimitExceeded(format!(
+                "JS worker process RSS ({rss_bytes} bytes) exceeded the parent's monitoring \
+                 threshold ({} bytes) immediately after responding; context was discarded; \
+                 stderr: {tail}",
+                worker.rss_threshold_bytes
+            )),
+        )),
         false,
     )
 }
@@ -3487,6 +3489,35 @@ mod tests {
                 "expected a successful evaluation result to be discarded and replaced with \
                  ResourceLimitExceeded once the monitor thread's kill is observed, got: {other:?}"
             ),
+        }
+    }
+
+    /// Cursor Bugbot 指摘（#588）: 応答直後の同期 RSS 確認でしきい値超過を
+    /// 検出した経路のメッセージにも、「失われた状態」と「次回の挙動」の
+    /// 両フレーズが含まれること（Issue #527）。しきい値を 0 にして実 RSS
+    /// で必ず超過させる。
+    #[test]
+    fn js_1_apply_post_response_rss_check_over_threshold_message_has_both_phrases() {
+        let child = spawn_long_lived_child_for_test();
+        let mut worker = WorkerHandle::from_child_with_rss_threshold(child, 0)
+            .expect("failed to build a test WorkerHandle");
+
+        let (outcome, keep) =
+            apply_post_response_rss_check(&mut worker, Ok(JsValue::Number(1.0)), true);
+
+        assert!(!keep, "the over-threshold worker must not be kept");
+        match outcome {
+            Err(JsEngineError::ResourceLimitExceeded(msg)) => {
+                assert!(
+                    msg.contains("context was discarded"),
+                    "expected the discard phrase, got: {msg}"
+                );
+                assert!(
+                    msg.contains("the next evaluation runs in a fresh context"),
+                    "expected the fresh-context phrase, got: {msg}"
+                );
+            }
+            other => panic!("expected ResourceLimitExceeded, got: {other:?}"),
         }
     }
 
