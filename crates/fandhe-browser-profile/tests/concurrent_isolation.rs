@@ -114,6 +114,11 @@ struct WorkerReport {
     /// 各 `DataKind` について最後に書き込みに成功したペイロード。
     /// 52.2 での期待値の発生源になる。
     last_payloads: Vec<(DataKind, String)>,
+    /// 各書き込みの直後に行った混線検査（`check_after_write`）の指摘。
+    /// 最終状態だけを見る `find_mixups` では、途中の混線が後続の正しい
+    /// 書き込みで上書きされて消えるため、書き込みごとに記録して残す
+    /// （PROF-3・#185 レビュー指摘）。
+    intermediate_mixups: Vec<String>,
 }
 
 /// ワーカーの終わり方。panic・open 失敗を `Completed` に丸めない
@@ -187,6 +192,7 @@ fn run_concurrent_writes(base: &Path, config: &HarnessConfig) -> Vec<WorkerOutco
     validate_config(config);
 
     let barrier = Barrier::new(config.profiles);
+    let profile_count = config.profiles;
 
     thread::scope(|scope| {
         let handles: Vec<_> = (0..config.profiles)
@@ -232,6 +238,7 @@ fn run_concurrent_writes(base: &Path, config: &HarnessConfig) -> Vec<WorkerOutco
                     let mut writes_succeeded = 0usize;
                     let mut write_errors = Vec::new();
                     let mut last_payloads: Vec<(DataKind, String)> = Vec::new();
+                    let mut intermediate_mixups: Vec<String> = Vec::new();
 
                     for j in 0..writes_per_profile {
                         let Some(&kind) = DataKind::ALL.get(j % DataKind::ALL.len()) else {
@@ -245,6 +252,15 @@ fn run_concurrent_writes(base: &Path, config: &HarnessConfig) -> Vec<WorkerOutco
                         match write_once(&profile, kind, payload.as_bytes()) {
                             Ok(()) => {
                                 writes_succeeded += 1;
+                                // 書き込み直後に所有先・内容を検査し、後続の
+                                // 書き込みで上書きされても途中の混線を残す。
+                                intermediate_mixups.extend(check_after_write(
+                                    base,
+                                    index,
+                                    kind,
+                                    &payload,
+                                    profile_count,
+                                ));
                                 if let Some(slot) =
                                     last_payloads.iter_mut().find(|(k, _)| *k == kind)
                                 {
@@ -269,6 +285,7 @@ fn run_concurrent_writes(base: &Path, config: &HarnessConfig) -> Vec<WorkerOutco
                         writes_succeeded,
                         write_errors,
                         last_payloads,
+                        intermediate_mixups,
                     })
                 })
             })
@@ -308,6 +325,48 @@ fn write_once(profile: &Profile, kind: DataKind, payload: &[u8]) -> Result<(), S
         .map_err(|err| err.to_string())?;
     file.write_all(payload).map_err(|err| err.to_string())?;
     Ok(())
+}
+
+/// 書き込み直後の混線検査（`PROF-3`・#185）。自プロファイルの
+/// `<kind>/concurrent.dat` は自ワーカーだけが書くため `payload` と完全一致する
+/// はずで、他プロファイルのファイルは空（truncate 直後）か読めない（未作成）
+/// 場合を除き、自身以外のマーカー `profile-{m}:` を含まないこと。
+/// 競合中の読み取りで一時的に空・未作成になるのは正常として許容する。
+fn check_after_write(
+    base: &Path,
+    index: usize,
+    kind: DataKind,
+    payload: &str,
+    profile_count: usize,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    for owner in 0..profile_count {
+        let path = base
+            .join(format!("profile-{owner}"))
+            .join(kind.dir_name())
+            .join(TARGET_FILE_NAME);
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if owner == index {
+            if bytes != payload.as_bytes() {
+                found.push(format!(
+                    "profile-{index} {kind:?}: own file {:?} != just-written {payload:?}",
+                    String::from_utf8_lossy(&bytes)
+                ));
+            }
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        for other in (0..profile_count).filter(|&m| m != owner) {
+            if text.contains(&format!("profile-{other}:")) {
+                found.push(format!(
+                    "profile-{owner} {kind:?}: contains marker of profile-{other} ({text:?})"
+                ));
+            }
+        }
+    }
+    found
 }
 
 /// `thread::Result` の `Err` ペイロード（`Box<dyn Any + Send>`）から panic
@@ -763,6 +822,8 @@ struct FailureSummary {
     open_failed: Vec<(usize, String)>,
     write_failures: Vec<(usize, Vec<String>)>,
     short_writes: Vec<(usize, usize)>,
+    /// 書き込み直後検査で見つかった途中の混線（`(worker index, 指摘)`）。
+    intermediate_mixups: Vec<(usize, Vec<String>)>,
 }
 
 /// `outcomes` から panic・open 失敗・書き込み失敗・書き込み不足を数える。
@@ -776,6 +837,11 @@ fn summarize_failures(outcomes: &[WorkerOutcome], expected_writes: usize) -> Fai
                     summary
                         .write_failures
                         .push((report.index, report.write_errors.clone()));
+                }
+                if !report.intermediate_mixups.is_empty() {
+                    summary
+                        .intermediate_mixups
+                        .push((report.index, report.intermediate_mixups.clone()));
                 }
                 if report.writes_succeeded != expected_writes {
                     summary
@@ -825,6 +891,11 @@ fn prof_3_five_concurrent_profiles_have_zero_mixups_and_zero_crashes() {
             "round {round}: {summary:?}"
         );
         assert_eq!(summary.short_writes.len(), 0, "round {round}: {summary:?}");
+        assert_eq!(
+            summary.intermediate_mixups.len(),
+            0,
+            "round {round}: 書き込み途中の混線: {summary:?}"
+        );
 
         let rendered: Vec<String> = mixups.iter().map(|m| m.to_string()).collect();
         assert_eq!(mixups.len(), 0, "round {round}: mixups: {rendered:#?}");
@@ -947,6 +1018,7 @@ fn prof_3_crash_summary_counts_panicked_and_open_failed() {
             writes_succeeded: WRITES_PER_PROFILE,
             write_errors: Vec::new(),
             last_payloads: Vec::new(),
+            intermediate_mixups: Vec::new(),
         })
     };
     let outcomes = vec![
@@ -967,4 +1039,41 @@ fn prof_3_crash_summary_counts_panicked_and_open_failed() {
     assert_eq!(summary.open_failed, vec![(3, "denied".to_string())]);
     assert_eq!(summary.write_failures.len(), 0);
     assert_eq!(summary.short_writes.len(), 0);
+}
+
+/// `PROF-3`・#185（陰性対照）: 書き込み直後検査が、後で上書きされて最終状態には
+/// 残らない途中の混線（他プロファイルへの誤書き込み・自ファイルの内容不一致）を
+/// 検出すること。
+#[test]
+fn prof_3_intermediate_mixup_is_detected_even_if_overwritten_later() {
+    let tmp = TempDir::new();
+    let kind = DataKind::ALL[0];
+    let mut profiles = Vec::new();
+    for i in 0..PROFILE_COUNT {
+        profiles.push(Profile::open(tmp.path().join(format!("profile-{i}"))).expect("open"));
+    }
+    let own = "profile-0:write-0000\n";
+    write_once(&profiles[0], kind, own.as_bytes()).expect("write");
+    assert_eq!(
+        check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT),
+        Vec::<String>::new(),
+        "正常時は 0 件"
+    );
+
+    // profile-1 のファイルへ profile-0 のペイロードが誤って書かれた状況。
+    write_once(&profiles[1], kind, own.as_bytes()).expect("誤書き込み");
+    let found = check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains("contains marker of profile-0"),
+        "{found:?}"
+    );
+
+    // 後続の正しい書き込みで上書きされると最終状態の検出器は 0 件になるが、
+    // 途中の検査結果（上の found）は残る。
+    write_once(&profiles[1], kind, b"profile-1:write-0000\n").expect("正しい書き込み");
+    assert_eq!(
+        check_after_write(tmp.path(), 0, kind, own, PROFILE_COUNT).len(),
+        0
+    );
 }
