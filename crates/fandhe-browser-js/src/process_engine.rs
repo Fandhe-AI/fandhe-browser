@@ -82,7 +82,11 @@
 //! - 期限を超えて戻らない `NativeFn` のスレッドは強制終了できず、戻るか
 //!   プロセスが終了するまで残る。ただしホスト全体の生存数は
 //!   `MAX_LIVE_NATIVE_THREADS`（64）で強制的に頭打ちにし、超過した呼び出し
-//!   はスレッドを起動せず JS 向けのエラーにする
+//!   はスレッドを起動せず JS 向けのエラーにする。期限切れ時は
+//!   [`super::engine_trait::NativeCallContext::is_cancelled`] を立てて
+//!   放棄を通知する（協調的な契約。無視する `ParentNativeFn` は止められず、
+//!   その副作用の重複実行の防止は登録側の責務。強制停止にはプロセス分離が
+//!   必要で別途判断を要する）
 //! - release ビルドは `panic = "abort"` のため、`NativeFn` が panic すると
 //!   ホストプロセスごと終了する（unwind するビルドではスレッド内に閉じる
 //!   が、release では防げない。プロセス分離が必要で別途判断を要する）。
@@ -2001,7 +2005,8 @@ fn dispatch_native_call(
         return Err(NativeDispatchViolation::UnknownId { id });
     };
     let entry = Arc::clone(entry);
-    let ctx = NativeCallContext { deadline };
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ctx = NativeCallContext::new(deadline, Arc::clone(&cancelled));
     // 期限切れで残ったスレッドが積み上がらないよう、生存数に上限を設ける。
     // 枠はスレッド内へ move し、終了（unwind 含む）まで保持する。
     let Some(slot) = NativeThreadSlot::try_acquire(&LIVE_NATIVE_THREADS, MAX_LIVE_NATIVE_THREADS)
@@ -2043,6 +2048,8 @@ fn dispatch_native_call(
     let native_return = match rx.recv_timeout(wait) {
         Ok(ret) => ret,
         Err(mpsc::RecvTimeoutError::Timeout) => {
+            // 放棄を協調的に通知する（`NativeCallContext::is_cancelled`）。
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
             return Err(NativeDispatchViolation::DeadlineExceeded);
         }
         // 送信前にスレッドが panic（unwind）した。ホストは落とさず JS 側の
@@ -2513,6 +2520,42 @@ mod tests {
             }
             other => panic!("expected NativeReturn::Err, got: {other:?}"),
         }
+    }
+
+    /// `TASK-29`・Issue #526・codex レビュー指摘: 期限切れで待機を打ち切った際、
+    /// 実行中の `ParentNativeFn` へ取り消しが通知されること。
+    #[test]
+    fn js_1_dispatch_native_call_signals_cancellation_after_deadline() {
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_for_closure = Arc::clone(&observed);
+        let native_fns: Vec<NativeEntry> = vec![entry(Box::new(
+            move |_args: &[JsValue], ctx: &NativeCallContext| {
+                let start = Instant::now();
+                while !ctx.is_cancelled() && start.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                observed_for_closure
+                    .store(ctx.is_cancelled(), std::sync::atomic::Ordering::Release);
+                Ok(JsValue::Undefined)
+            },
+        ))];
+        let payload = worker_protocol::encode_native_call(0, &[]).expect("encode must succeed");
+        let result = dispatch_native_call(
+            &native_fns,
+            &payload,
+            Instant::now() + Duration::from_millis(50),
+        );
+        assert!(matches!(
+            result,
+            Err(NativeDispatchViolation::DeadlineExceeded)
+        ));
+        let wait_start = Instant::now();
+        while !observed.load(std::sync::atomic::Ordering::Acquire)
+            && wait_start.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(observed.load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// `TASK-29`・Issue #526: 未登録の `id` は

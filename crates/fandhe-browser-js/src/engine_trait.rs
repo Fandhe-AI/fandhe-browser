@@ -105,34 +105,52 @@ pub enum JsValue {
     String(String),
 }
 
-/// [`NativeFn`] 呼び出し 1 回に紐づく実行コンテキスト（`TASK-29`・
-/// Issue #526・codex レビュー指摘「`NativeFn` が戻らない場合に評価期限が
-/// 機能しない」対応）。
+/// 親プロセス側 `NativeCall` dispatch が [`super::process_engine::ParentNativeFn`]
+/// へ渡す、呼び出し 1 回に紐づく実行コンテキスト（`TASK-29`・Issue #526）。
 ///
-/// 親（`super::process_engine::V8ProcessEngine`）は `NativeFn` を呼び出し
-/// スレッド上で同期実行する（`NativeFn` が `Send` ではなく、V8 の
-/// `Isolate`/`HandleScope` がスレッド固有であるため別スレッドへ移せない。
-/// 下記 [`NativeFn`] のドキュメントコメント参照）。そのため親は実行中の
-/// `NativeFn` を外部から中断する手段を持たず、期限切れを確認できるのは
-/// `NativeFn` から戻った直後だけである（`super::process_engine`
-/// モジュールドキュメントの「親側 `NativeCall` dispatch」節参照）。
+/// [`NativeFn`]（1 引数・従来の呼び出し規約のまま）とは別の型であり、
+/// 既存の `NativeFn` 利用者には影響しない。親は `ParentNativeFn` を専用
+/// スレッドで実行するが、実行中のスレッドを外部から強制終了する手段は
+/// 無い。そのため本構造体は次の 2 つを **協調的** に伝える。
 ///
-/// 本構造体は、呼び出し元が計算済みの評価期限を `NativeFn` 自身へ伝え、
-/// `NativeFn` が自発的に処理を打ち切れるようにするための協調的な手段
-/// である（強制はできない。`NativeFn` がこれを無視して戻らない場合の
-/// 挙動は変わらない）。`Instant` を直接引数にしないのは、将来
-/// フィールドを追加できる構造にするため（coding-rust.md「戻り値は
-/// 将来拡張できる構造を持つ型にする」と同じ考え方を、引数型にも
-/// 適用する）。
-#[derive(Debug, Clone, Copy)]
+/// - `deadline` フィールド: 評価全体の期限
+/// - `is_cancelled()`: 期限切れ・呼び出し放棄の通知。
+///   親は期限内に戻らなかった呼び出しに対し待機を打ち切る際、このフラグを
+///   立てる。`ParentNativeFn` は外部状態を更新する前・長い処理の区間ごとに
+///   確認し、`true` なら以降の副作用を行わず直ちに戻ること（戻り値は
+///   親に破棄される）。これが「期限後に処理が継続し、再試行時に旧処理と
+///   新処理が重複実行される」ことを防ぐための契約である
+///
+/// フラグを無視する `ParentNativeFn` は止められない（`process_engine`
+/// モジュールドキュメントの「既知の制限」参照）。
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct NativeCallContext {
     /// この呼び出しが属する評価全体の期限。呼び出し元
     /// （`super::process_engine::send_evaluate_and_await`）が評価開始時に
-    /// 1 度だけ計算した値であり、`NativeFn` の実行時間もこの期限に含まれる。
-    /// `NativeFn` はこの時刻を超えないよう自身の処理を打ち切ることが
-    /// 望ましい（強制ではない。上記構造体ドキュメント参照）。
+    /// 1 度だけ計算した値で、実行時間もこの期限に含まれる。
     pub deadline: std::time::Instant,
+    /// 期限切れ・放棄の通知フラグ。[`NativeCallContext::is_cancelled`] 参照。
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl NativeCallContext {
+    /// 期限と取り消しフラグから文脈を作る（親側 dispatch が使用）。
+    pub fn new(
+        deadline: std::time::Instant,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            deadline,
+            cancelled,
+        }
+    }
+
+    /// 親が当該呼び出しを放棄した（期限切れ）場合に `true`。`true` の間は
+    /// 外部状態への副作用を起こさず直ちに戻ること。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// [`JsEngine::inject_global_function`]・[`JsEngine::bind_dom_like_object`]
@@ -143,15 +161,13 @@ pub struct NativeCallContext {
 /// `dom.getText`/`dom.count` 相当）。呼び出し元（将来: `fandhe-browser-core`
 /// の TASK-30）は、この関数へ渡す引数が外部入力（プラグイン入出力・ネット
 /// ワーク取得データ由来）である場合、untrusted な入力として検証する責務を
-/// 負う（security.md「プラグイン境界」）。第 2 引数の [`NativeCallContext`]
-/// は呼び出し元が計算した評価期限を伝える（`TASK-29`・Issue #526）。
+/// 負う（security.md「プラグイン境界」）。
 ///
 /// `Send`/`Sync` 境界は付けない。V8 の `Isolate`/`HandleScope` はスレッド
 /// 固有であり、境界を付けると V8 実装（TASK-29）が満たせなくなるため
 /// （`js-engine.md`「選択はプロセス起動時に1回」が定める、エンジンの実行が
 /// プロセス内で単一スレッドに閉じる前提に対応する）。
-pub type NativeFn =
-    Box<dyn FnMut(&[JsValue], &NativeCallContext) -> Result<JsValue, JsEngineError>>;
+pub type NativeFn = Box<dyn FnMut(&[JsValue]) -> Result<JsValue, JsEngineError>>;
 
 /// [`JsEngine::evaluate_script`] の実行制御オプション（TASK-28.3・`JS-1`）。
 ///
