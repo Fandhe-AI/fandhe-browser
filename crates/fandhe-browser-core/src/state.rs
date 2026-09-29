@@ -148,7 +148,12 @@ impl NavigationState {
     /// 世代番号をインクリメントし、新しい世代を返す。
     ///
     /// `u64` を使い切った場合は wrap せず [`StateError::GenerationExhausted`] を返す。
+    ///
+    /// 世代の更新は結果保存（[`Self::commit_navigation`]）と同じロック内で行う。
+    /// ロック無しだと、保存側の世代確認の直後に新しい navigate が始まり、古い結果が
+    /// 保存されたうえで `Superseded` も返らない競合が生じる（`CDP-1`）。
     pub fn begin_navigation(&self) -> Result<NavigationGeneration, StateError> {
+        let _guard = self.lock();
         self.generation
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
             .map(|prev| NavigationGeneration(prev.saturating_add(1)))
@@ -377,6 +382,61 @@ mod tests {
             }
         });
         assert_eq!(s.current_generation().get(), 800);
+    }
+
+    #[test]
+    fn cdp1_begin_navigation_waits_for_commit_lock() {
+        // 結果保存側がロックを保持している間は世代が進まないこと（確認直後の割り込みの防止）。
+        let s = NavigationState::new();
+        let g1 = s.begin_navigation().unwrap();
+        let guard = s.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let s = &s;
+            scope.spawn(move || {
+                let g = s.begin_navigation().unwrap();
+                tx.send(g.get()).unwrap();
+            });
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err()
+            );
+            assert_eq!(s.current_generation(), g1);
+            drop(guard);
+            assert_eq!(rx.recv().unwrap(), 2);
+        });
+        assert_eq!(s.current_generation().get(), 2);
+    }
+
+    #[test]
+    fn cdp1_stale_result_never_survives_newer_begin() {
+        // 保存と begin が競合しても、Ok で保存された結果は必ず最後に払い出された世代のもの。
+        for _ in 0..200 {
+            let s = NavigationState::new();
+            let g1 = s.begin_navigation().unwrap();
+            let committed = std::thread::scope(|scope| {
+                let h = scope.spawn(|| {
+                    s.commit_navigation(g1, NavigationResult::new("https://old/", "old"))
+                });
+                let g2 = s.begin_navigation().unwrap();
+                (h.join().unwrap(), g2)
+            });
+            let (res, g2) = committed;
+            match res {
+                // 保存が先に直列化された場合。後続の世代で上書き・破棄できる。
+                Ok(()) => assert_eq!(s.latest().unwrap().url(), "https://old/"),
+                Err(e) => {
+                    assert_eq!(
+                        e,
+                        StateError::Superseded {
+                            attempted: g1,
+                            current: g2
+                        }
+                    );
+                    assert!(s.latest().is_none());
+                }
+            }
+        }
     }
 
     #[test]
