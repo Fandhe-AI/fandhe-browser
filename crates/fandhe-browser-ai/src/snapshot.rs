@@ -16,7 +16,12 @@
 //! 構築はまだ実装しない（実装済みを装わない。REPAIR-3）。段階的に以下の
 //! Issue で実装する：
 //!
-//! - role（役割）算出: TASK-11.3（Issue #72）
+//! - role（役割）算出: TASK-11.3（`AISNAP-1`・Issue #72）。骨格と button・
+//!   link・heading・table・list 等の代表要素は TASK-11.3.1（Issue #541）で
+//!   実装済み（[`role`] モジュール・[`role::compute_role`]）。`input[type]`
+//!   の対応表は TASK-11.3.2（Issue #542）、`select`・`header`/`footer`/
+//!   `aside`（sectioning 祖先判定）は TASK-11.3.3（Issue #543）が担う。
+//!   form・section・img の名前依存の昇格は担当未割り当て（role.rs の doc 参照）
 //! - accessible name（アクセシブルネーム）算出: TASK-11.4（Issue #73）を
 //!   3 分割。ARIA 属性（`aria-labelledby`/`aria-label`）: TASK-11.4.1
 //!   （Issue #544）で実装済み。HTML ネイティブのラベル付け（`alt`・`title`・
@@ -28,12 +33,15 @@
 //!   [`state::compute_state`]）。ただし DOM 構築時にこの関数を呼び出す配線は
 //!   まだない（呼び出しの組み込みは TASK-11.7・Issue #76 が担う）
 //! - ref（role + name シグネチャによる再特定要求。`AISNAP-10`）: TASK-11.6（Issue #75）
-//! - DOM から `Snapshot` へのツリー構築統合: TASK-11.7（Issue #76）
+//! - DOM から `Snapshot` へのツリー構築統合（[`role::compute_role`]・
+//!   [`state::compute_state`] の呼び出し組み込みを含む）: TASK-11.7（Issue #76）
 //! - ユニットテスト一式: TASK-11.8（Issue #77）
 
 pub mod name;
+pub mod role;
 pub mod state;
 pub use name::{AccessibleName, NameIndex, NameSource, compute_name, compute_name_with_index};
+pub use role::{ComputedRole, RoleSource, compute_role};
 pub use state::{CheckedState, State, compute_state};
 
 /// 方式 B 簡約ツリーの 1 ノード（`AISNAP-1`・`TASK-11`・`MS-2`）。
@@ -43,7 +51,9 @@ pub use state::{CheckedState, State, compute_state};
 ///
 /// - `role`: ARIA role のトークン（例: `"document"`・`"heading"`・`"button"`）。
 ///   役割の種類は多く将来も増えるため `String` とし、enum 化しない。
-///   算出は TASK-11.3（Issue #72）が担う
+///   算出ロジックは [`role::compute_role`]。骨格と代表要素は TASK-11.3.1
+///   （Issue #541）で実装済みだが、DOM 構築時にこの関数を呼び出す配線は
+///   まだない（本フィールドへの反映は TASK-11.7・Issue #76 が担う）
 /// - `name`: accessible name。空文字列は「名前なし」を表す。
 ///   算出は TASK-11.4（Issue #73）が担う。ネイティブのラベル付け分は
 ///   [`name::compute_name`]（TASK-11.4.2・Issue #545）、ARIA 属性分は
