@@ -3051,7 +3051,7 @@ mod tests {
     #[test]
     fn js_1_dispatch_native_call_rejects_unregistered_object_handle() {
         let native_fns: Vec<NativeEntry> =
-            vec![entry(Arc::new(|_: &[JsValue], _: &NativeCallContext| {
+            vec![entry(Box::new(|_: &[JsValue], _: &NativeCallContext| {
                 Ok(JsValue::Undefined)
             }))];
         let payload = worker_protocol::encode_native_call(
