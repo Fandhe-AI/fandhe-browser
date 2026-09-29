@@ -280,18 +280,25 @@ mod linux_impl {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
 
-        let handle = thread::spawn(move || -> Result<Vec<(SmapsRollup, SmapsRollup)>, String> {
-            let mut samples = Vec::new();
-            while !stop_for_thread.load(Ordering::Relaxed) && samples.len() < MAX_SAMPLES_PER_EVAL {
-                // 子が評価中にクラッシュ・破棄された場合はここで `Err`
-                // になる。その場合は試行を中断する（設計 3.3 参照。pid
-                // が再利用される恐れがあるため、静かに読み飛ばさない）。
-                let pair = read_pair(pid)?;
-                samples.push(pair);
-                thread::sleep(SAMPLE_INTERVAL);
-            }
-            Ok(samples)
-        });
+        let handle = thread::spawn(
+            move || -> Result<(Vec<(SmapsRollup, SmapsRollup)>, bool), String> {
+                let mut samples = Vec::new();
+                while !stop_for_thread.load(Ordering::Relaxed)
+                    && samples.len() < MAX_SAMPLES_PER_EVAL
+                {
+                    // 子が評価中にクラッシュ・破棄された場合はここで `Err`
+                    // になる。その場合は試行を中断する（設計 3.3 参照。pid
+                    // が再利用される恐れがあるため、静かに読み飛ばさない）。
+                    let pair = read_pair(pid)?;
+                    samples.push(pair);
+                    thread::sleep(SAMPLE_INTERVAL);
+                }
+                // 評価完了（stop）より前にサンプル上限へ達した場合は、以降の
+                // メモリ増加を観測できていないため truncated として返す。
+                let truncated = !stop_for_thread.load(Ordering::Relaxed);
+                Ok((samples, truncated))
+            },
+        );
 
         let eval_result = engine.evaluate_script(workload, &EvaluateOptions::default());
         stop.store(true, Ordering::Relaxed);
@@ -306,7 +313,14 @@ mod linux_impl {
             return Err(format!("evaluate_script failed during workload: {err}"));
         }
 
-        let samples = joined?;
+        let (samples, truncated) = joined?;
+        // 上限到達後の値を評価全体のピークとして報告しない（過小評価の
+        // 防止。fail-closed で試行ごとエラーにする）。
+        if truncated {
+            return Err(format!(
+                "memory sampler reached MAX_SAMPLES_PER_EVAL ({MAX_SAMPLES_PER_EVAL}) before the evaluation finished; peak RSS would be underestimated"
+            ));
+        }
         if samples.is_empty() {
             return Err(
                 "no memory samples were collected during the workload evaluation".to_string(),
