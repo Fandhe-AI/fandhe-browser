@@ -695,27 +695,31 @@ impl Profile {
     /// unix では検証済みの [`Profile::root_fd`] を起点に `openat`/`unlinkat` で
     /// 再帰削除し、パス文字列は再解決しない（[`Profile::root`] は表示専用）。
     /// ディレクトリは `NOFOLLOW` で開き、symlink はエントリとして unlink する
-    /// だけでリンク先へは触れない。マウントポイントはまたがず（`st_dev` の
-    /// 一致確認）、深さは `MAX_DELETE_DEPTH` で制限する。
+    /// だけでリンク先へは触れない。マウントポイントはまたがず（`st_dev` に加え
+    /// Linux では `statx` の `mnt_id` の一致確認。同一 FS 上の bind mount は
+    /// `st_dev` では検出できないため。`mnt_id` を取得できなければ再帰しない）、
+    /// 深さは `MAX_DELETE_DEPTH` で制限する。
     ///
     /// 処理順序:
     ///
     /// 1. ルートのパスが `open` 時と同じ実体を指すか `(st_dev, st_ino)` で
     ///    確認する。不一致なら何も消さず [`ProfileError::InvalidLayout`]
     ///    （fail-closed）
-    /// 2. `profile.lock` を保持したまま、それ以外の全エントリを消す（削除中の
-    ///    並行 open は `Locked` で拒否される）
-    /// 3. `profile.lock` を unlink してロックを解放し、ルートを `rmdir` する
+    /// 2. `profile.lock` を保持したまま、ルートを親ディレクトリ内の一時名
+    ///    （`.fandhe-deleting-<pid>-<nanos>`）へ `renameat` で退避する。以降
+    ///    元のパスは空きになり、並行 `open` は別 inode の新規プロファイルを
+    ///    作るだけで、削除中のツリーには到達できない
+    /// 3. 退避したツリーの全エントリを（`profile.lock` を含めて）消す。ロックは
+    ///    保持した fd を通じて最後まで維持し、`profile.lock` を unlink するのは
+    ///    もう名前で到達できない退避ツリー内に限る（`lock.rs` が禁じる inode の
+    ///    すり替わりは起きない）
+    /// 4. 退避ルートを `rmdir` してからロックを解放する
     ///
-    /// spec の「ロックを解放した上で」は最終状態（ロック解放・ルート不在）を
-    /// 表すと解釈し、削除中に並行 open でデータが作り直される競合を避けるため
-    /// 解放をルート `rmdir` の直前にしている（`PROF-5` の意図確認は spec 側の課題）。
+    /// 途中で失敗した場合は退避を元の名前へ戻す（元の名前が空いている場合のみ）。
+    /// 呼び出し元は `Profile::open` で開き直して `delete` を再試行できる。
     ///
-    /// 残る競合: 手順 1 の確認から最後の `rmdir` までの間にパスが差し替えられ
-    /// 得るが、`rmdir` は空ディレクトリしか消せず symlink には失敗するため、
-    /// 影響は空ディレクトリ 1 つに限られる。途中で失敗した場合、`self` は消費
-    /// 済みでロックは解放され、ツリーは一部だけ消えている可能性がある。呼び出し
-    /// 元は `Profile::open` で開き直して `delete` を再試行する。
+    /// 残る競合: 手順 1 の確認から手順 2 の `renameat` までの間にパスが差し替え
+    /// られ得るが、退避後に inode を再確認し、不一致なら戻して拒否する。
     ///
     /// Windows では `open` が常に失敗するため到達しないが、成功を装わず
     /// [`ProfileError::Unsupported`] を返す（`XOS-7`〜`XOS-10`、REPAIR-3）。
@@ -757,29 +761,111 @@ impl Profile {
             }
 
             drop(data_fds);
-            remove_dir_contents_at(
-                root_fd.as_fd(),
-                root_stat.st_dev,
-                0,
-                &root,
-                Some(LOCK_FILE_NAME.as_ref()),
-            )?;
-            match rustix::fs::unlinkat(&root_fd, LOCK_FILE_NAME, AtFlags::empty()) {
-                Ok(()) | Err(Errno::NOENT) => {}
+
+            let tomb_name = std::ffi::OsString::from(format!(
+                ".fandhe-deleting-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            match rustix::fs::statat(&parent_fd, &tomb_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Err(Errno::NOENT) => {}
+                Ok(_) => {
+                    return Err(ProfileError::InvalidLayout {
+                        path: root,
+                        reason: "deletion staging name already exists",
+                    });
+                }
                 Err(err) => return Err(ProfileError::Io(err.into())),
             }
+            rustix::fs::renameat(&parent_fd, &root_name, &parent_fd, &tomb_name)
+                .map_err(|err| ProfileError::Io(err.into()))?;
+
+            let result = (|| {
+                // 退避したものが検証済みの root_fd と同じ実体であることを確認する。
+                let moved = rustix::fs::statat(&parent_fd, &tomb_name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|err| ProfileError::Io(err.into()))?;
+                if moved.st_dev != root_stat.st_dev || moved.st_ino != root_stat.st_ino {
+                    return Err(ProfileError::InvalidLayout {
+                        path: root.clone(),
+                        reason: "profile root was replaced during deletion",
+                    });
+                }
+                let root_mount = mount_identity(root_fd.as_fd())?;
+                remove_dir_contents_at(root_fd.as_fd(), root_mount, 0, &root, None)?;
+                match rustix::fs::unlinkat(&parent_fd, &tomb_name, AtFlags::REMOVEDIR) {
+                    Ok(()) => Ok(()),
+                    Err(Errno::NOTEMPTY) => Err(ProfileError::InvalidLayout {
+                        path: root.clone(),
+                        reason: "profile root became non-empty during deletion",
+                    }),
+                    Err(err) => Err(ProfileError::Io(err.into())),
+                }
+            })();
+
+            if result.is_err() {
+                // 元の名前が空いている場合のみ戻す（既存エントリを上書きしない）。
+                if matches!(
+                    rustix::fs::statat(&parent_fd, &root_name, AtFlags::SYMLINK_NOFOLLOW),
+                    Err(Errno::NOENT)
+                ) {
+                    let _ = rustix::fs::renameat(&parent_fd, &tomb_name, &parent_fd, &root_name);
+                }
+            }
+            // ロックは最後まで保持する（ここで初めて解放）。
             drop(profile_lock);
             drop(root_fd);
-
-            match rustix::fs::unlinkat(&parent_fd, &root_name, AtFlags::REMOVEDIR) {
-                Ok(()) => Ok(()),
-                Err(Errno::NOTEMPTY) => Err(ProfileError::InvalidLayout {
-                    path: root,
-                    reason: "profile root became non-empty during deletion; it may have been reopened concurrently",
-                }),
-                Err(err) => Err(ProfileError::Io(err.into())),
-            }
+            result
         }
+    }
+}
+
+/// マウント境界の識別子。同一 FS 上の bind mount は `st_dev` が同じになるため、
+/// Linux では `statx` の `mnt_id` を併用する（`PROF-5`）。
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MountIdentity {
+    dev: rustix::fs::Dev,
+    /// Linux（カーネル 5.8 以降）のみ Some。取得できない場合は None。
+    mnt_id: Option<u64>,
+}
+
+/// `fd` が属するマウントの識別子を返す。
+#[cfg(unix)]
+fn mount_identity(fd: BorrowedFd<'_>) -> Result<MountIdentity, ProfileError> {
+    let st = rustix::fs::fstat(fd).map_err(|err| ProfileError::Io(err.into()))?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let mnt_id =
+        match rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, rustix::fs::StatxFlags::MNT_ID) {
+            Ok(sx) if sx.stx_mask & rustix::fs::StatxFlags::MNT_ID.bits() != 0 => {
+                Some(sx.stx_mnt_id)
+            }
+            _ => None,
+        };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let mnt_id = None;
+    Ok(MountIdentity {
+        dev: st.st_dev,
+        mnt_id,
+    })
+}
+
+/// `child` がルートと同じマウントに属するか。Linux で `mnt_id` を取得できない
+/// 場合は bind mount を識別できないため fail-closed で false とする。
+#[cfg(unix)]
+fn same_mount(root: MountIdentity, child: MountIdentity) -> bool {
+    if root.dev != child.dev {
+        return false;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        matches!((root.mnt_id, child.mnt_id), (Some(a), Some(b)) if a == b)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        true
     }
 }
 
@@ -797,12 +883,12 @@ const MAX_DELETE_PASSES: usize = 4;
 /// （[`Profile::delete`] から呼ばれる。`PROF-5`）。
 ///
 /// symlink・通常ファイル等は `unlinkat` でエントリとして消すだけで辿らない。
-/// ディレクトリは `NOFOLLOW` で開き、`st_dev` が `root_dev` と同じであること
-/// （マウントポイントをまたがないこと）を確認してから再帰する。
+/// ディレクトリは `NOFOLLOW` で開き、`root_mount` と同じマウントであること
+/// （bind mount を含むマウントポイントをまたがないこと）を確認してから再帰する。
 #[cfg(unix)]
 fn remove_dir_contents_at(
     dir_fd: BorrowedFd<'_>,
-    root_dev: rustix::fs::Dev,
+    root_mount: MountIdentity,
     depth: usize,
     display_path: &Path,
     keep: Option<&std::ffi::OsStr>,
@@ -842,15 +928,13 @@ fn remove_dir_contents_at(
                 let child_path = display_path.join(std::ffi::OsStr::from_bytes(bytes));
                 let child_fd = rustix::fs::openat(dir_fd, name, OPEN_DIR_FLAGS, Mode::empty())
                     .map_err(|err| classify_dir_open_error(&child_path, err))?;
-                let st =
-                    rustix::fs::fstat(&child_fd).map_err(|err| ProfileError::Io(err.into()))?;
-                if st.st_dev != root_dev {
+                if !same_mount(root_mount, mount_identity(child_fd.as_fd())?) {
                     return Err(ProfileError::InvalidLayout {
                         path: child_path,
                         reason: "refusing to cross a mount point during profile deletion",
                     });
                 }
-                remove_dir_contents_at(child_fd.as_fd(), root_dev, depth + 1, &child_path, None)?;
+                remove_dir_contents_at(child_fd.as_fd(), root_mount, depth + 1, &child_path, None)?;
                 drop(child_fd);
                 match rustix::fs::unlinkat(dir_fd, name, AtFlags::REMOVEDIR) {
                     Ok(()) | Err(Errno::NOENT) => {}
@@ -2075,5 +2159,29 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    /// `PROF-5`: 削除失敗時は退避を元の名前へ戻し、親ディレクトリに退避名を
+    /// 残さない。戻った後は `open` し直して再試行できる。
+    #[cfg(unix)]
+    #[test]
+    fn prof_5_delete_failure_restores_root_name() {
+        let tmp = TempDir::new();
+        let root = tmp.path().join("profile");
+        let profile = Profile::open(&root).expect("open");
+        let mut deep = root.join("cache");
+        for i in 0..=MAX_DELETE_DEPTH {
+            deep.push(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).expect("deep dirs");
+
+        profile.delete().expect_err("must refuse");
+
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("profile")]);
+        Profile::open(&root).expect("reopen after failed delete");
     }
 }
