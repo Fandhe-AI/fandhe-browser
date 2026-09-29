@@ -551,3 +551,58 @@ fn task_91_1_windows_rooted_or_prefixed_relative_root_is_rejected() {
         );
     }
 }
+
+/// TASK-91（91.1）・PROF-6: symlink の後ろの `..` は symlink 解決後の物理
+/// パスに対して処理される（Issue #538 P1 再指摘の回帰防止）。
+///
+/// 設定ディレクトリ内の `link` が外部ディレクトリ `outside/sub` を指すとき、
+/// `root = 'link/../profiles'` の実到達先は `outside/profiles` であり
+/// 設定ディレクトリ外のため拒否されなければならない。字句上で先に
+/// `link/..` を相殺すると `<設定ディレクトリ>/profiles` と誤判定して受理する。
+#[cfg(unix)]
+#[test]
+fn task_91_1_p1_parent_after_symlink_is_resolved_physically_and_rejected() {
+    let config_dir = TempDir::new();
+    let outside = TempDir::new();
+    let target = outside.path().join("sub");
+    std::fs::create_dir_all(&target).expect("外部の sub を作成できる");
+    std::os::unix::fs::symlink(&target, config_dir.path().join("link"))
+        .expect("symlink を作成できる");
+
+    let config_path = config_dir.write_config("[profile]\nroot = 'link/../profiles'\n");
+    let err = Config::load(&config_path)
+        .expect_err("symlink 後の '..' で設定ディレクトリ外へ出る root は拒否される");
+
+    assert!(matches!(
+        err,
+        Error::Config(ConfigError::InvalidValue {
+            key: "profile.root",
+            ..
+        })
+    ));
+}
+
+/// TASK-91（91.1）: symlink が設定ディレクトリ内の実ディレクトリを指す場合、
+/// `link/../profiles` は物理的な親（`<設定ディレクトリ>/a/b` の親）配下へ
+/// 解決される。
+#[cfg(unix)]
+#[test]
+fn task_91_1_p1_parent_after_symlink_inside_config_dir_is_resolved_physically() {
+    let config_dir = TempDir::new();
+    let nested = config_dir.path().join("a").join("b");
+    std::fs::create_dir_all(&nested).expect("a/b を作成できる");
+    std::os::unix::fs::symlink(&nested, config_dir.path().join("link"))
+        .expect("symlink を作成できる");
+
+    let config_path = config_dir.write_config("[profile]\nroot = 'link/../profiles'\n");
+    let config = Config::load(&config_path).expect("設定ディレクトリ内に収まる root は受理される");
+
+    let canonical = config_dir
+        .path()
+        .canonicalize()
+        .expect("canonicalize できる");
+    assert_eq!(
+        config.profile().root().expect("root が解決されている"),
+        canonical.join("a").join("profiles"),
+    );
+}

@@ -234,7 +234,7 @@ impl Config {
             // （`resolve_physical_prefix`）。片方だけ解決すると、symlink を
             // 経由する環境（例: macOS の `/var` → `/private/var`）で正当な
             // `root` を誤って境界外と判定する。`..`・`.` は
-            // `resolve_physical_prefix` 内の字句正規化で畳み込まれる。
+            // `resolve_physical_prefix` が symlink 解決と同時に処理する。
             let joined = if root.is_absolute() {
                 root.clone()
             } else {
@@ -502,84 +502,64 @@ fn verify_same_file(file: &File, canonical: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// パスを字句上（コンポーネント解析のみ）で正規化する（`.` を除去し、
-/// `..` を直前の `Normal` 要素と相殺する）。
-///
-/// [`Config::load`] が `root`（絶対パスの場合はそれ自身、相対パスの場合は
-/// symlink 解決済みの基準ディレクトリとの結合結果）を正規化する後処理として
-/// 使う（Issue #538 P0・P1 レビュー指摘）。`root` 自体はまだ実在するとは
-/// 限らないため、ここでは `canonicalize` を呼ばず、あくまで字句上の畳み込み
-/// に留める。ルート（`RootDir`/`Prefix`）より上位へ脱出する `..` は、実際の
-/// OS のパス解決と同様にルート自身へ留める（捨てる）。`root` 自身の各要素が
-/// symlink でないかの検証は行わない（`fandhe-browser-profile::Profile::open`
-/// に委ねる。モジュール doc「パス解決」参照）。
-fn normalize_lexically(path: &Path) -> PathBuf {
-    use std::path::Component;
-
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => match result.components().next_back() {
-                Some(Component::Normal(_)) => {
-                    result.pop();
-                }
-                Some(Component::RootDir) | Some(Component::Prefix(_)) => {
-                    // ルートより上位へは脱出しない（OS のパス解決と同様に
-                    // ルート自身に留める）。
-                }
-                _ => {
-                    result.push("..");
-                }
-            },
-            other => result.push(other.as_os_str()),
-        }
-    }
-    result
-}
-
-/// `path`（絶対パス想定）を字句正規化したうえで、実在する最長の祖先だけ
-/// `canonicalize`（symlink 解決）し、実在しない残りの要素をその後ろへ
-/// 字句のまま結合して返す（`realpath -m` 相当）。
+/// `path`（絶対パス想定）を先頭の要素から順に辿り、実在する要素は都度
+/// `canonicalize`（symlink 解決）しながら `..` を処理する。実在しなくなった
+/// 以降の要素は字句のまま扱う（`realpath -m` 相当）。
 ///
 /// [`Config::load`] が絶対 `root`（`fandhe-browser-profile::Profile::open`
 /// 呼び出し前は実在するとは限らない）を、symlink 解決済みの設定ディレクトリ
 /// （`canonicalize` 済みの `base_abs`）と桁を揃えて比較するために使う
-/// （Issue #538 P0 再指摘）。祖先が 1 つも実在しない場合（ルート自体が
-/// 読めない等）は `canonicalize` のエラーをそのまま [`ConfigError::Io`] へ
-/// 写像する。実在しない末尾の要素は symlink になり得ないため、字句のまま
-/// 残してよい（実在する部分の symlink 解決だけで `base_abs` との比較に
-/// 十分な物理的一致が得られる）。`root` の実在する部分に symlink 自体が
-/// あるかどうかを積極的に拒否する検査はここでは行わない（モジュール doc
-/// 「パス解決」参照。`Profile::open` の責務）。
+/// （Issue #538 P0 再指摘）。`..` は解決済みの物理パスに対して親へ戻すため、
+/// symlink の後ろの `..` が symlink 解決前に相殺されて実到達先とずれる
+/// ことがない（Issue #538 P1 再指摘。例: `link` が外部ディレクトリを指す場合の
+/// `link/../profiles` は外部ディレクトリの親配下として判定される）。
+/// 要素が実在するのに `canonicalize` できない場合（dangling symlink・
+/// 権限不足等）は fail-closed で [`ConfigError::Io`] を返す。
+/// `root` の実在する部分に symlink 自体があるかどうかを積極的に拒否する検査は
+/// ここでは行わない（モジュール doc「パス解決」参照。`Profile::open` の責務）。
 fn resolve_physical_prefix(path: &Path) -> Result<PathBuf> {
-    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
-    let mut current = normalize_lexically(path);
+    use std::path::Component;
 
-    loop {
-        match std::fs::canonicalize(&current) {
-            Ok(mut resolved) => {
-                while let Some(part) = suffix.pop() {
-                    resolved.push(part);
-                }
-                return Ok(resolved);
+    let io_error = |source: std::io::Error| {
+        Error::from(ConfigError::Io {
+            message: format!("failed to resolve {}: {source}", path.display()),
+        })
+    };
+
+    let mut resolved = PathBuf::new();
+    // 実在しない（字句のまま積んだ）要素の個数。0 の間だけ実在確認・解決する。
+    let mut missing_depth: usize = 0;
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // `resolved` は物理解決済み（または実在しない字句要素）のため、
+                // 単純に親へ戻せば実際の OS のパス解決と一致する。ルートより
+                // 上位へは脱出しない（`pop` は false を返して何もしない）。
+                resolved.pop();
+                missing_depth = missing_depth.saturating_sub(1);
             }
-            Err(source) => {
-                let Some(file_name) = current.file_name() else {
-                    return Err(Error::from(ConfigError::Io {
-                        message: format!("failed to resolve {}: {source}", path.display()),
-                    }));
-                };
-                suffix.push(file_name.to_os_string());
-                let Some(parent) = current.parent() else {
-                    return Err(Error::from(ConfigError::Io {
-                        message: format!("failed to resolve {}: {source}", path.display()),
-                    }));
-                };
-                current = parent.to_path_buf();
+            Component::Prefix(_) | Component::RootDir => resolved.push(component.as_os_str()),
+            Component::Normal(name) => {
+                resolved.push(name);
+                if missing_depth > 0 {
+                    missing_depth += 1;
+                    continue;
+                }
+                match std::fs::symlink_metadata(&resolved) {
+                    Ok(_) => {
+                        resolved = std::fs::canonicalize(&resolved).map_err(io_error)?;
+                    }
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                        missing_depth = 1;
+                    }
+                    Err(source) => return Err(io_error(source)),
+                }
             }
         }
     }
+    Ok(resolved)
 }
 
 /// `candidate`（字句正規化済みの絶対パス）が `base`（同じく字句正規化済みの
