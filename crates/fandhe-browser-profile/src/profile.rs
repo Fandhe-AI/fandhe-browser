@@ -154,6 +154,18 @@ pub enum ProfileError {
         /// ルート配下に収まらないと判定された候補パス。
         candidate: PathBuf,
     },
+    /// OS 慣習の既定プロファイルルートを解決できない場合に返す
+    /// （`XOS-7`、TASK-60（60.3）・#202。`store::OsDefaultStore` が返す）。
+    ///
+    /// 必要な環境変数（`HOME`・`LOCALAPPDATA` 等）が未設定・空・相対パス・
+    /// `..` 含みの場合や、既定値が定義されていないプラットフォームで使う。
+    /// `/tmp` やカレントディレクトリへ暗黙にフォールバックせず失敗させる
+    /// （fail-closed。REPAIR-3）。環境変数の値（ユーザー名を含みうる）は
+    /// エラーへコピーしない。
+    DefaultRootUnavailable {
+        /// 解決できない理由を示す英語メッセージ。
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for ProfileError {
@@ -179,6 +191,9 @@ impl fmt::Display for ProfileError {
             ProfileError::InvalidComponent { reason } => {
                 write!(f, "invalid path component: {reason}")
             }
+            ProfileError::DefaultRootUnavailable { reason } => {
+                write!(f, "default profile root is unavailable: {reason}")
+            }
             ProfileError::OutsideRoot { root, candidate } => {
                 write!(
                     f,
@@ -200,6 +215,7 @@ impl std::error::Error for ProfileError {
             ProfileError::Locked { .. } => None,
             ProfileError::InvalidComponent { .. } => None,
             ProfileError::OutsideRoot { .. } => None,
+            ProfileError::DefaultRootUnavailable { .. } => None,
         }
     }
 }
@@ -436,6 +452,12 @@ pub struct Profile {
     root: PathBuf,
     #[cfg(unix)]
     root_fd: OwnedFd,
+    /// `open` 時点でルートの実親として検証済みのディレクトリハンドル。
+    /// `delete` が「ルートが今もこの親の直下にある」ことを確認する基準になる
+    /// （`root_fd/..` だけを信用すると、ルートが別ディレクトリへ同名で移動
+    /// された場合に移動先を親と誤認する。`PROF-5`）。
+    #[cfg(unix)]
+    parent_fd: OwnedFd,
     #[cfg(unix)]
     data_fds: DataDirFds,
     // フィールドは宣言順に drop されるため、ロックは他のハンドルより後、
@@ -525,6 +547,11 @@ impl Profile {
             let root_fd = open_dir_all_verified(&root)?;
             set_dir_permissions_0700(&root_fd)?;
 
+            // ルートの親を open 時点で確保する。この時点の `root_fd/..` は、
+            // 検証済みの走査で辿った実親そのもの（PROF-5）。
+            let parent_fd = rustix::fs::openat(&root_fd, "..", OPEN_DIR_FLAGS, Mode::empty())
+                .map_err(|err| classify_dir_open_error(&root, err))?;
+
             // ロックファイルはデータ種別ディレクトリを作成する前に取得する。
             // ロック取得に失敗した（= 既に別の Profile が開いている）2 回目の
             // opener は、以降の行に到達せずここで返るため、data dir 側には
@@ -561,6 +588,7 @@ impl Profile {
             Ok(Profile {
                 root,
                 root_fd,
+                parent_fd,
                 data_fds,
                 _lock: profile_lock,
             })
@@ -702,9 +730,12 @@ impl Profile {
     ///
     /// 処理順序:
     ///
-    /// 1. ルートのパスが `open` 時と同じ実体を指すか `(st_dev, st_ino)` で
-    ///    確認する。不一致なら何も消さず [`ProfileError::InvalidLayout`]
-    ///    （fail-closed）
+    /// 1. ルートが `open` 時に保持した親ディレクトリの直下に同じ実体
+    ///    （`(st_dev, st_ino)`）のまま存在し、`root_fd/..` も保持した親と一致
+    ///    するかを確認する（別の親へ同名で移動されたルートは拒否）。続けて
+    ///    ツリー全体を読み取り専用で検証する（深さ上限・マウント境界・
+    ///    ディレクトリの書き込み権限）。いずれかに違反すれば何も消さず
+    ///    [`ProfileError::InvalidLayout`]（fail-closed）
     /// 2. `profile.lock` を保持したまま、ルートを親ディレクトリ内の一時名
     ///    （`.fandhe-deleting-<pid>-<nanos>`）へ `renameat` で退避する。以降
     ///    元のパスは空きになり、並行 `open` は別 inode の新規プロファイルを
@@ -714,6 +745,12 @@ impl Profile {
     ///    もう名前で到達できない退避ツリー内に限る（`lock.rs` が禁じる inode の
     ///    すり替わりは起きない）
     /// 4. 退避ルートを `rmdir` してからロックを解放する
+    ///
+    /// 部分削除の契約: 手順 1 の検証を通った後に起きる競合・I/O 障害（走査中の
+    /// 他プロセスによる差し替え・ディスク障害等）では、削除が一部進んだ状態で
+    /// エラーになり得る。この場合、退避は元の名前へ戻すが、既に消えたエントリは
+    /// 復元されない。既知の失敗要因（深さ・マウント・権限）は手順 1 で先に
+    /// 弾くため、通常運用では何も消えないまま拒否される。
     ///
     /// 退避・復元の rename は既存エントリを上書きしない（Linux では
     /// `RENAME_NOREPLACE`）。途中で失敗した場合は退避を元の名前へ戻す。呼び出し元は
@@ -752,6 +789,7 @@ impl Profile {
             let Profile {
                 root,
                 root_fd,
+                parent_fd,
                 data_fds,
                 _lock: profile_lock,
             } = self;
@@ -763,11 +801,22 @@ impl Profile {
                 });
             };
 
-            // 親ハンドルは root_fd の ".." から得る（"/" から辿り直さない）。
-            let parent_fd = rustix::fs::openat(&root_fd, "..", OPEN_DIR_FLAGS, Mode::empty())
-                .map_err(|err| classify_dir_open_error(&root, err))?;
+            // 親ハンドルは open 時に検証済みのものを使う。ルートが別の親へ
+            // 移動されていれば `root_fd/..` が保持中の親と食い違う。
             let root_stat =
                 rustix::fs::fstat(&root_fd).map_err(|err| ProfileError::Io(err.into()))?;
+            let held_parent =
+                rustix::fs::fstat(&parent_fd).map_err(|err| ProfileError::Io(err.into()))?;
+            let up_fd = rustix::fs::openat(&root_fd, "..", OPEN_DIR_FLAGS, Mode::empty())
+                .map_err(|err| classify_dir_open_error(&root, err))?;
+            let up_stat = rustix::fs::fstat(&up_fd).map_err(|err| ProfileError::Io(err.into()))?;
+            drop(up_fd);
+            if (up_stat.st_dev, up_stat.st_ino) != (held_parent.st_dev, held_parent.st_ino) {
+                return Err(ProfileError::InvalidLayout {
+                    path: root,
+                    reason: "profile root was moved out of the directory it was opened in",
+                });
+            }
             let named_stat = rustix::fs::statat(&parent_fd, &root_name, AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|err| ProfileError::Io(err.into()))?;
             if named_stat.st_dev != root_stat.st_dev || named_stat.st_ino != root_stat.st_ino {
@@ -776,6 +825,12 @@ impl Profile {
                     reason: "profile root path no longer refers to the opened profile directory",
                 });
             }
+
+            // 退避（最初の破壊的操作）の前にツリー全体を読み取り専用で検証する。
+            // 深さ上限・マウント境界・権限で後から失敗して一部だけ消える事態を
+            // 避ける（PROF-5）。
+            let root_mount_pre = mount_identity(root_fd.as_fd())?;
+            validate_tree_for_delete(root_fd.as_fd(), root_mount_pre, 0, &root)?;
 
             drop(data_fds);
 
@@ -1322,6 +1377,80 @@ fn remove_dir_contents_at(
         path: display_path.to_path_buf(),
         reason: "profile directory kept changing during deletion",
     })
+}
+
+/// 削除を始める前に、`dir_fd` 配下のツリー全体が [`remove_dir_contents_at`] で
+/// 削除できる形かを読み取り専用で検証する（[`Profile::delete`] から呼ばれる。
+/// `PROF-5`）。
+///
+/// 深さ上限・マウント境界の越境・ディレクトリの走査／書き込み権限不足を、
+/// 何も消す前に [`ProfileError`] として返す。これにより、既知の失敗要因で
+/// 一部のデータ（Cookie 等）だけが消える状態を避ける。検証後に起きる競合や
+/// I/O 障害による途中失敗までは防げない（その場合の契約は
+/// [`Profile::delete`] を参照）。
+#[cfg(unix)]
+fn validate_tree_for_delete(
+    dir_fd: BorrowedFd<'_>,
+    root_mount: MountIdentity,
+    depth: usize,
+    display_path: &Path,
+) -> Result<(), ProfileError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if depth > MAX_DELETE_DEPTH {
+        return Err(ProfileError::InvalidLayout {
+            path: display_path.to_path_buf(),
+            reason: "profile directory tree exceeds maximum deletion depth",
+        });
+    }
+    // エントリの unlink にはディレクトリの書き込み・検索権限が要る。
+    match rustix::fs::accessat(
+        dir_fd,
+        ".",
+        rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
+        AtFlags::empty(),
+    ) {
+        Ok(()) => {}
+        Err(Errno::ACCESS | Errno::PERM | Errno::ROFS) => {
+            return Err(ProfileError::InvalidLayout {
+                path: display_path.to_path_buf(),
+                reason: "profile directory is not writable; refusing to delete before removing anything",
+            });
+        }
+        Err(err) => return Err(ProfileError::Io(err.into())),
+    }
+    let dir = Dir::read_from(dir_fd).map_err(|err| ProfileError::Io(err.into()))?;
+    for entry in dir {
+        let entry = entry.map_err(|err| ProfileError::Io(err.into()))?;
+        let name = entry.file_name();
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let is_dir = match entry.file_type() {
+            FileType::Directory => true,
+            FileType::Unknown => {
+                let st = rustix::fs::statat(dir_fd, name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|err| ProfileError::Io(err.into()))?;
+                FileType::from_raw_mode(st.st_mode) == FileType::Directory
+            }
+            _ => false,
+        };
+        if !is_dir {
+            continue;
+        }
+        let child_path = display_path.join(std::ffi::OsStr::from_bytes(bytes));
+        let child_fd = rustix::fs::openat(dir_fd, name, OPEN_DIR_FLAGS, Mode::empty())
+            .map_err(|err| classify_dir_open_error(&child_path, err))?;
+        if !same_mount(root_mount, mount_identity(child_fd.as_fd())?) {
+            return Err(ProfileError::InvalidLayout {
+                path: child_path,
+                reason: "refusing to cross a mount point during profile deletion",
+            });
+        }
+        validate_tree_for_delete(child_fd.as_fd(), root_mount, depth + 1, &child_path)?;
+    }
+    Ok(())
 }
 
 /// `dir_fd` 配下に `name` という名前の通常ファイルを作成（既存なら開く）し、
@@ -2576,6 +2705,59 @@ mod tests {
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from("profile")]);
         Profile::open(&root).expect("reopen after failed delete");
+    }
+
+    /// `PROF-5`（PR #582 P0）: `open` 後にルートが別の親ディレクトリへ同名で
+    /// 移動された場合、移動先で再帰削除を進めず拒否し、データを消さない。
+    #[cfg(unix)]
+    #[test]
+    fn prof_5_delete_refuses_root_moved_to_another_parent() {
+        let tmp = TempDir::new();
+        let orig_parent = tmp.path().join("a");
+        let other_parent = tmp.path().join("b");
+        std::fs::create_dir_all(&orig_parent).expect("a");
+        std::fs::create_dir_all(&other_parent).expect("b");
+        let root = orig_parent.join("profile");
+        let profile = Profile::open(&root).expect("open");
+        profile
+            .create_file_in(DataKind::Cookies, "c.txt".as_ref())
+            .expect("create");
+        std::fs::rename(&root, other_parent.join("profile")).expect("move");
+
+        let err = profile.delete().expect_err("must refuse");
+        assert!(
+            matches!(err, ProfileError::InvalidLayout { .. }),
+            "unexpected: {err:?}"
+        );
+        assert!(
+            other_parent
+                .join("profile")
+                .join("cookies")
+                .join("c.txt")
+                .exists()
+        );
+    }
+
+    /// `PROF-5`（PR #582 P1）: 検証で拒否される場合は、先に処理され得る
+    /// 他のエントリ（Cookie 等）も含め何も消さない。
+    #[cfg(unix)]
+    #[test]
+    fn prof_5_delete_refusal_removes_nothing() {
+        let tmp = TempDir::new();
+        let root = tmp.path().join("profile");
+        let profile = Profile::open(&root).expect("open");
+        profile
+            .create_file_in(DataKind::Cookies, "c.txt".as_ref())
+            .expect("create");
+        let mut deep = root.join("history");
+        for i in 0..=MAX_DELETE_DEPTH {
+            deep.push(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).expect("deep dirs");
+
+        profile.delete().expect_err("must refuse");
+        assert!(root.join("cookies").join("c.txt").exists());
+        assert!(root.join("profile.lock").exists());
     }
 
     /// `PROF-5`: 名前が別の空ディレクトリへ差し替えられている場合、

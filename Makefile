@@ -291,44 +291,20 @@ endif
 
 # 既定ビルド（feature 指定なし）の依存グラフに Servo 系クレートが混入していないことを
 # 検証する（RENDER-1・ci.md「既定ビルドに Servo が含まれないことを cargo tree で検証」）。
-# `--exclude fandhe-browser-render` で render crate 自身を走査の根から外す
-# （workspace member は cargo tree 上つねに根として現れるため、除外しないと
-# render crate の存在自体が常に一致してしまい検証にならない）。fandhe-browser-render
-# が未作成の段階では cargo tree が「excluded package(s) ... not found」の警告を
-# 標準エラーへ出すのみで終了コードは 0・標準出力には現れない（実機検証済み）ため、
-# 標準出力だけを判定対象にし標準エラーは素通しする（2>&1 で合流させない）。
-# 検出パターンは変数化し、Servo 本体・fandhe-browser-render のいずれかが既定ビルドの
-# 依存グラフに現れたら fail-closed で非 0 終了する。
-# edge には dev（dev-dependencies）も含める（-e normal,build,dev）。`cargo test`
-# は既定でも dev-dependencies をビルドするため、normal,build だけでは
-# dev-dependencies 経由の Servo 混入を見逃す。
-# これはクレート名文字列に基づく簡易検出であり、リネームや再エクスポート経由の
-# 混入までは捕捉できない。最終的な防御線は deny.toml（[graph].all-features = true
-# により Servo（MPL-2.0）が [licenses] の allow に無いことを検出して fail-closed
-# する）である。
-#
-# `--exclude fandhe-browser-render` は workspace member から render crate を
-# 除いた「残り」を走査する。fandhe-browser-render 以外に member crate が 1 つも
-# 無い状態（TASK-1.4 単独 merge 直後等）でこれを実行すると、cargo は
-# 「virtual manifest で member が 0 件」を manifest エラーとして扱い
-# 非 0 終了する（実機検証済み）。これは「Servo が混入していない」を意味する
-# 正常系ではなく cargo 自体の実行失敗のため、render 以外の member が無い間は
-# 判定不能として skip する（render 以外の member が存在しない時点では既定ビルドに
-# 混入しうる依存グラフ自体が存在しないため、fail-closed の弱体化にはあたらない）。
-RENDER_ISOLATION_PATTERN := servo|fandhe-browser-render
+# 判定ロジックの正本は scripts/check-render-isolation.sh に一本化した（TASK-34.1・
+# Issue #465）。同スクリプトは workspace 全体に加え fandhe-browser-cli の既定
+# feature（未追加の間は skip。TASK-41.5・#174）も検査し、.github/workflows/ci.yml
+# の render-isolation ジョブ（3 OS matrix）から同じスクリプトを直接呼び出す。
+# `--exclude fandhe-browser-render` の理由・edge に dev を含める理由・
+# fandhe-browser-render 以外の member が無い間 skip する理由などの詳細な設計判断は
+# スクリプト側のコメントを参照。ここでは HAS_CARGO / RENDER_ISOLATION_MEMBERS による
+# skip 判定のみを Makefile 側に残す。最終的な防御線は deny.toml（Servo（MPL-2.0）が
+# [licenses] の allow に無いことを検出して fail-closed する）である。
 RENDER_ISOLATION_MEMBERS := $(filter-out crates/fandhe-browser-render/Cargo.toml,$(HAS_MEMBERS))
 .PHONY: check-render-isolation
-check-render-isolation: ## 既定ビルドの依存グラフに Servo 系クレートが含まれないことを検証する
+check-render-isolation: ## 既定ビルド（cli 既定 feature 含む）の依存グラフに Servo 系クレートが含まれないことを検証する（scripts/check-render-isolation.sh）
 ifneq ($(and $(HAS_CARGO),$(RENDER_ISOLATION_MEMBERS)),)
-	@out=$$(cargo tree --workspace -e normal,build,dev --exclude fandhe-browser-render) || { \
-		echo "NG: cargo tree の実行に失敗しました" >&2; \
-		exit 1; \
-	}; \
-	if printf '%s\n' "$$out" | grep -Ei "$(RENDER_ISOLATION_PATTERN)" | grep -q .; then \
-		echo "NG: 既定ビルドの依存グラフに Servo 系クレートが含まれています" >&2; \
-		printf '%s\n' "$$out" | grep -Ei "$(RENDER_ISOLATION_PATTERN)" >&2; \
-		exit 1; \
-	fi
+	@bash scripts/check-render-isolation.sh
 else
 	@echo "skip: Cargo.toml 未追加、または fandhe-browser-render 以外の member crate が無いため check-render-isolation をスキップ"
 endif
@@ -553,9 +529,10 @@ check-bench-record: ## competitor_lightpanda 記録スクリプトの自己テ�
 # jq 未導入時は check-compat-regression と同じ方針で fail-closed にする）。
 # self-test（合成ファイルによる判定モードの自己テスト）を先に実行してから、
 # 対象 package のリリースビルド・判定に進む。`ci:` の依存には追加しない
-# （cargo build --release のコストが大きいため。CI・`ci:` 集約への組込みは
-# #467（TASK-34.3）が判断する。harness/binary-size/README.md「make ci に
-# 含めない理由」参照）。
+# （cargo build --release のコストが大きいため。判断済み）。GitHub Actions
+# での継続的なゲートは `.github/workflows/ci.yml` の `binary-size` ジョブ
+# （TASK-34.3・#467）が 3 OS で担う。harness/binary-size/README.md「CI」
+# 「make ci に含めない理由」参照。
 .PHONY: check-binary-size
 check-binary-size: ## feature 無効（既定）のリリースバイナリサイズが CORE-2 水準の上限以下か検査する（RENDER-2）
 	@command -v jq >/dev/null 2>&1 || { \

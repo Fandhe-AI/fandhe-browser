@@ -32,6 +32,12 @@
 //! （`Profile::delete`。`PROF-5`、TASK-53（53.2）・#188）も実装済み。以下はいずれも
 //! 未実装であり、実装済みを装う公開 API・ダミー実装は置かない。
 //!
+//! - `ProfileStore::delete`（`PROF-5`）から `Profile::delete` への接続。
+//!   `store.rs` の `ProfileStore`（`XOS-7`・TASK-60（60.2）・#201）と OS 慣習の
+//!   既定パス解決 `OsDefaultStore`（TASK-60（60.3）・#202）は実装済み。明示指定
+//!   による上書きは #203。`Profile::delete` は `self` を消費するが
+//!   `ProfileStore::delete` は `&Profile` を取るため、トレイト契約の見直しが
+//!   要る（既定実装は `Unsupported` を返す）
 //! - 並行アクセス時のデータ分離（`PROF-2`・`PROF-3`、TASK-51・TASK-52）
 //! - Windows での ACL によるアクセス制限（`XOS-7`〜`XOS-10`。Unix の
 //!   パーミッション 0o700 相当の隔離を Windows でも実現する。TASK-50・#176
@@ -39,9 +45,11 @@
 //!   dependency-policy.md に従いユーザー承認を経る）
 
 pub mod profile;
+pub mod store;
 
 mod lock;
 
 pub use profile::{
     DataKind, Profile, ProfileError, SafeComponent, assert_within_root, sanitize_component,
 };
+pub use store::{APP_DIR_NAME, OsDefaultStore, ProfileStore, ResolvedRoot, RootSource};

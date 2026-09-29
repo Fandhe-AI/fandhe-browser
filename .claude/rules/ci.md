@@ -19,7 +19,7 @@ cargo test --workspace
 
 ## 分離・構成の検証
 
-- 既定ビルドに Servo が含まれないことを `cargo tree` で検証する（RENDER-1）
+- 既定ビルドに Servo が含まれないことを `cargo tree` で検証する（RENDER-1）。判定ロジックの正本は `scripts/check-render-isolation.sh`（`make check-render-isolation` から呼ぶ薄いラッパー）で、CI では `render-isolation` ジョブ（3 OS matrix）が同スクリプトを直接実行する（TASK-34.1・Issue #465）。`fandhe-browser-cli` の既定 feature も検査対象だが、cli crate 未追加の間（TASK-41.5・#174）はスクリプトが notice を出して自動 skip する
 - ライセンス検査は `cargo deny check licenses` で行う（[licensing](./licensing.md)）
 - 対象サイト群の動作率回帰チェック（`REPAIR-8`・`COMPAT-1`・`COMPAT-4`。TASK-9.2）:
   `make check-compat-regression`（CI では `compat-regression` ジョブ）が
@@ -33,6 +33,7 @@ cargo test --workspace
   `--allow-missing` を外し fail-closed（ファイル不在は exit 2）に戻す。
   スキーマ契約・終了コードは `harness/compat-regression/README.md` を参照
 - 許可外ライセンス（GPL/AGPL/LGPL/MPL-2.0・ライセンス未記載）を持つ canary を `cargo deny` が reject することを `make check-deny-license-reject` で検証する（TASK-9.1・REPAIR-8）
+- feature 無効（既定）時のリリースバイナリサイズが `RENDER-2`（基準は `CORE-2` と同じ「Chromium 比 80% 以上削減」）の上限以下かを `make check-binary-size`（CI では `binary-size` ジョブ・3 OS）で検証する（TASK-34.2・TASK-34.3）。`fandhe-browser-cli` crate が workspace に未追加の間（#174）は判定が `skip:` になり休眠状態（詳細は `harness/binary-size/README.md`）
 
 ## ワークフロー変更時の注意
 
