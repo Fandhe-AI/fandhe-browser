@@ -496,11 +496,15 @@ python3 harness/render-screenshot/measure_ssim.py \
 ```json
 {
   "schema_version": 1,
+  "png_sha256": "<対応 PNG の SHA-256（小文字 16 進 64 桁）>",
   "elements": [
     { "id": "header", "x": 0, "y": 0, "width": 1280, "height": 64 }
   ]
 }
 ```
+
+`png_sha256` は必須（後述）。実値の例は
+`0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef` の形式。
 
 - `id` は `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` に一致し重複不可。`x`/`y`/`width`/
   `height` は有限の数値（`bool` は不可）で絶対値 1e6 以下、`width`/`height` は

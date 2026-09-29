@@ -395,6 +395,19 @@ class DecodePngGrayTest(unittest.TestCase):
             with self.assertRaises(ms.PngDecodeError):
                 ms.decode_png_gray(path)
 
+    def test_rejects_trns_chunk(self) -> None:
+        # Codex P2 指摘: tRNS（透過色）は解釈せず読み飛ばすと透明画素を不透明扱いに
+        # してしまうため、明示的に拒否する。
+        data = build_png(2, 2, lambda x, y: (10, 20, 30))
+        idat_pos = data.index(b"IDAT") - 4
+        data = data[:idat_pos] + _chunk(b"tRNS", b"\x00\x00\x00\x00\x00\x00") + data[idat_pos:]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.png"
+            path.write_bytes(data)
+            with self.assertRaises(ms.PngDecodeError) as ctx:
+                ms.decode_png_gray(path)
+            self.assertIn("tRNS", str(ctx.exception))
+
     def test_refuses_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "real.png"
@@ -816,6 +829,24 @@ class BboxPngBindingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             bbox_path, png_path = self._write(tmp, {"schema_version": 1, "elements": []})
             self.assertIn("png_sha256 is missing", ms._bbox_png_binding_mismatch(bbox_path, png_path))
+
+    def test_symlinked_png_is_refused_before_hashing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            digest = hashlib.sha256(b"png-bytes").hexdigest()
+            bbox_path, real = self._write(tmp, {"schema_version": 1, "elements": [], "png_sha256": digest})
+            link = Path(tmp) / "link.png"
+            try:
+                link.symlink_to(real)
+            except OSError:
+                self.skipTest("symlink creation is not permitted in this environment")
+            self.assertIn("symlink", ms._bbox_png_binding_mismatch(bbox_path, link))
+
+    def test_oversized_png_is_refused_before_hashing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            digest = hashlib.sha256(b"png-bytes").hexdigest()
+            bbox_path, png_path = self._write(tmp, {"schema_version": 1, "elements": [], "png_sha256": digest})
+            with mock.patch.object(cs, "MAX_PNG_BYTES", 4):
+                self.assertIn("byte limit", ms._bbox_png_binding_mismatch(bbox_path, png_path))
 
     def test_read_failure_is_not_reported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1265,6 +1296,18 @@ class LoadCaptureResultTest(unittest.TestCase):
             self.assertEqual(len(skipped), 1)
             self.assertEqual(skipped[0]["site_id"], "a")
             self.assertIn("not declared", skipped[0]["reason"])
+
+    def test_declared_site_without_captures_is_skipped(self) -> None:
+        # Codex P2 指摘: `sites` に宣言されても `captures` に 1 件もないサイトが
+        # `skipped` に出なかった。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            self._write_result(capture_dir, [], sites=[{"id": "ghost", "url": "https://example.com/"}])
+            _viewport, pairs, skipped = ms.load_capture_result(capture_dir)
+            self.assertEqual(pairs, [])
+            self.assertEqual(len(skipped), 1)
+            self.assertEqual(skipped[0]["site_id"], "ghost")
+            self.assertIn("no capture entries", skipped[0]["reason"])
 
     def test_sites_not_a_list_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

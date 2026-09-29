@@ -294,6 +294,15 @@ def load_capture_result(
 
     pairs: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    # `sites` に宣言されているのに `captures` に 1 件もないサイトも、結果から
+    # 落とさず理由付きで `skipped` に含める（Codex P2 指摘。宣言済み ID 基準の走査）。
+    for declared_id in sorted(declared_site_ids - by_site.keys()):
+        skipped.append(
+            {
+                "site_id": declared_id,
+                "reason": "no capture entries in capture-result.json 'captures'",
+            }
+        )
     for site_id, by_engine in sorted(by_site.items()):
         if site_id not in declared_site_ids:
             skipped.append(
@@ -492,6 +501,14 @@ def _read_png_chunks(
                 raise PngDecodeError(
                     f"PLTE chunk is not allowed for color_type={color_type}: {path}"
                 )
+        elif ctype == b"tRNS":
+            # tRNS（透過色・パレット透過）は補助チャンクだが画素の透明度を変える。
+            # 本スクリプトは tRNS を解釈して白背景へ合成しないため、読み飛ばすと
+            # 透明画素を不透明として SSIM を計算してしまう（Codex P2 指摘）。
+            # 誤った計測値を出さないよう明示的に拒否する（fail-closed）。
+            raise PngDecodeError(
+                f"tRNS chunk (transparency) is not supported by measure_ssim: {path}"
+            )
         else:
             if ctype[0:1].isupper():
                 raise PngDecodeError(f"unknown critical chunk {ctype!r}: {path}")
@@ -1086,14 +1103,21 @@ def _bbox_png_binding_mismatch(bbox_path: Path, png_path: Path) -> str | None:
     expected = payload["png_sha256"]
     if not isinstance(expected, str) or not _SHA256_HEX_RE.fullmatch(expected):
         return "png_sha256 must be a 64-character lowercase hex string"
-    digest = hashlib.sha256()
+    # ハッシュ計算前に symlink 拒否とサイズ上限を適用する（PNG デコーダ
+    # `_read_png_chunks` と同じ方針。巨大ファイル・特殊デバイスへの symlink による
+    # ハング防止。Bugbot 指摘）。読み込みも上限 + 1 バイトで打ち切る（TOCTOU 対策）。
     try:
+        if png_path.is_symlink():
+            return "PNG is a symlink (refusing to hash)"
+        if png_path.stat().st_size > cs.MAX_PNG_BYTES:
+            return f"PNG exceeds the {cs.MAX_PNG_BYTES} byte limit (refusing to hash)"
         with png_path.open("rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
-                digest.update(chunk)
+            png_bytes = fh.read(cs.MAX_PNG_BYTES + 1)
     except OSError:
         return None
-    if digest.hexdigest() != expected:
+    if len(png_bytes) > cs.MAX_PNG_BYTES:
+        return f"PNG exceeds the {cs.MAX_PNG_BYTES} byte limit (refusing to hash)"
+    if hashlib.sha256(png_bytes).hexdigest() != expected:
         return "png_sha256 does not match the captured PNG (stale bbox from a previous capture)"
     return None
 
