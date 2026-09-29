@@ -549,6 +549,7 @@ fn is_hidden_element(doc: &Document, id: NodeId) -> bool {
 ///
 /// - テキスト系 `input`（`type` 省略・未知を含む）→ `value`。`password` は
 ///   平文がスナップショットへ漏れないよう**取り込まない**
+/// - `textarea` → 子のテキスト（現在値）
 /// - `select` → `selected` 属性を持つ最初の `option`、無ければ最初の `option` の
 ///   テキスト（探索は `max_steps` の半分までを消費し、残りは候補のテキスト収集に
 ///   確保する。探索が上限に達したら最初の `option` を採用し `cut` を立てる）
@@ -587,6 +588,21 @@ fn embedded_control_text(
             fold_attr_bounded(value, &mut out);
         }
         return Some((out, ContentScan::default()));
+    }
+    if is_html_element_named(doc, id, "textarea") {
+        // `textarea` の現在値は子のテキスト（RCDATA）。走査は `max_steps` で有界。
+        let mut out = String::new();
+        let scan = collect_content_text(
+            doc,
+            id,
+            exclude,
+            ContentWalk {
+                max_steps,
+                include_hidden: true,
+            },
+            &mut out,
+        );
+        return Some((out, scan));
     }
     if is_html_element_named(doc, id, "select") {
         let mut scan = ContentScan::default();
@@ -731,24 +747,32 @@ fn collect_content_text(
                 }
                 // accname 2C: 再帰中の埋め込みコントロール（2E）では `aria-label` を無視して
                 // コントロールの値を優先するため、`aria-label` より先に判定する。
-                if let Some((text, inner)) = embedded_control_text(
+                let embedded = embedded_control_text(
                     doc,
                     current,
                     exclude,
                     opts.max_steps.saturating_sub(scan.steps_used),
-                ) {
+                );
+                if let Some((text, inner)) = &embedded {
                     scan.steps_used += inner.steps_used;
                     scan.cut |= inner.cut;
-                    fold!(text.chars());
-                    if inner.cut {
-                        break;
+                    // 値が空で打ち切りも無いときは `aria-label` へ譲る（参照先側の
+                    // `scan_referent_own_text` と結果を一致させる）。打ち切りは
+                    // `scan.cut` へ伝播済みで、残り予算がある限り兄弟の走査は続ける。
+                    if has_non_whitespace(text) || inner.cut {
+                        fold!(text.chars());
+                        continue;
                     }
-                    continue;
                 }
                 if let Some(label) = doc.attribute(current, "aria-label")
                     && has_non_whitespace(label)
                 {
                     fold!(label.chars());
+                    continue;
+                }
+                if embedded.is_some() {
+                    // 値も `aria-label` も無い埋め込みコントロールは名前へ寄与しない
+                    // （内部の `option` 等の子孫テキストへは降りない）。
                     continue;
                 }
                 if is_html_element_named(doc, current, "img") {
@@ -3289,6 +3313,30 @@ mod tests {
                 "button"
             ),
             named("数量 5", NameSource::Content, false)
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: 値が空の埋め込みコントロールは
+    /// `aria-label` へ譲り、`textarea` は現在値（子テキスト）を使う。
+    #[test]
+    fn aisnap_1_content_empty_control_falls_back_and_textarea_value() {
+        assert_eq!(
+            name(r#"<button><input aria-label="数量"></button>"#, "button"),
+            named("数量", NameSource::Content, false)
+        );
+        assert_eq!(
+            name(
+                r#"<button>メモ <textarea aria-label="欄">本文</textarea></button>"#,
+                "button"
+            ),
+            named("メモ 本文", NameSource::Content, false)
+        );
+        assert_eq!(
+            name(
+                r#"<button>メモ <textarea aria-label="欄"></textarea></button>"#,
+                "button"
+            ),
+            named("メモ 欄", NameSource::Content, false)
         );
     }
 
