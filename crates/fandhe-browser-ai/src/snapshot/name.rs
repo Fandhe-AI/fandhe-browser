@@ -1230,25 +1230,37 @@ fn referent_text(
     }
 
     let mut out = String::new();
-    // 参照先自身の `aria-label` / `img` の `alt` は部分木を走査せず対象にも
-    // 依存しないため、走査予算を消費しない。
+    // 対象を含む参照先（キャッシュ不能）と含まない参照先（初回走査）で
+    // 別々の文書全体予算を消費する。使い切ったら `None`（寄与なし+truncated）。
+    let budget = if contains_target {
+        &index.uncached_scans_left
+    } else {
+        &index.first_scans_left
+    };
+    let consume_budget = || {
+        let left = budget.get();
+        if left == 0 {
+            return false;
+        }
+        budget.set(left - 1);
+        true
+    };
+    // 参照先自身の `aria-label` / `img` の `alt` / テキスト系 `input` の値は
+    // 部分木を走査せず対象にも依存しないため、走査予算を消費しない。
+    // 一方 `select` の option 探索は部分木を辿るため、1 回ごとに予算を消費し
+    // （多数の `select` × 大量の `option` で総走査量が二乗になるのを防ぐ）、
+    // 1 回あたりの走査も `MAX_CONTENT_STEPS` で頭打ちにする。
+    if is_html_element_named(doc, referent, "select") && !consume_budget() {
+        return None;
+    }
     let cut = if let Some(own_cut) = scan_referent_own_text(doc, referent, &mut out) {
         // 参照先自身の値を読む経路（select の選択 option 探索など）が予算で
         // 打ち切られた場合も、不完全な値を確定値として返さないよう伝播する。
         own_cut
     } else {
-        // 対象を含む参照先（キャッシュ不能）と含まない参照先（初回走査）で
-        // 別々の文書全体予算を消費する。使い切ったら `None`（寄与なし+truncated）。
-        let budget = if contains_target {
-            &index.uncached_scans_left
-        } else {
-            &index.first_scans_left
-        };
-        let left = budget.get();
-        if left == 0 {
+        if !consume_budget() {
             return None;
         }
-        budget.set(left - 1);
         // accname 2A: 直接参照された hidden な参照先は、その hidden な子孫も
         // 含めて寄与する（参照先の内側だけ `include_hidden`）。
         let scan = collect_content_text(
@@ -1276,13 +1288,14 @@ fn referent_text(
 /// 名前の断片を `out` へ取り込めたら `Some(cut)`（部分木の走査は不要）。
 /// `cut` は参照先自身の値の読み取りが走査上限で打ち切られたか
 /// （`select` の option 探索）。取り込めなければ `None`。
-/// 対象要素に依存しないため走査予算の対象外。
+/// 対象要素に依存しないためキャッシュ対象。走査予算は呼び出し元（[`referent_text`]）が
+/// `select` に限り消費し、1 回あたりの走査は [`MAX_CONTENT_STEPS`] で上限する。
 fn scan_referent_own_text(doc: &Document, referent: NodeId, out: &mut String) -> Option<bool> {
     // 参照先自身が埋め込みコントロール（accname 2E）なら、値を `aria-label` より
     // 優先する（子孫走査側の 2E と結果を一致させる。PR #574 レビュー指摘）。
     // 値が空で打ち切りも無い場合だけ `aria-label` / `alt` へ譲る。
     // 参照先の label・title は未実装（担当 Issue 未確定）。
-    let embedded = embedded_control_text(doc, referent, referent, doc.node_count());
+    let embedded = embedded_control_text(doc, referent, referent, MAX_CONTENT_STEPS);
     if let Some((text, scan)) = &embedded
         && (has_non_whitespace(text) || scan.cut)
     {
@@ -2922,7 +2935,7 @@ mod tests {
     /// AISNAP-1（TASK-11.4.3・#546）: `aria-labelledby` の参照先が `select` で、選択 option の探索が走査上限で打ち切られたとき、最初の option を採用しつつ `truncated: true` を伝える（キャッシュ経由でも落とさない）。
     #[test]
     fn aisnap_1_aria_labelledby_select_referent_scan_cut_propagates_truncated() {
-        let filler = "<option></option>".repeat(200);
+        let filler = "<option></option>".repeat(600);
         let html = format!(
             r#"<select id="s"><option>先頭</option>{filler}<option selected>選択</option></select><p id="t1" aria-labelledby="s">a</p><p id="t2" aria-labelledby="s">b</p>"#
         );
@@ -3023,6 +3036,39 @@ mod tests {
         );
         assert_eq!(
             names.get(MAX_UNCACHED_REFERENT_SCANS),
+            Some(&named("", NameSource::None, true))
+        );
+    }
+
+    /// AISNAP-1（TASK-11.4.3・#546）: `select` の参照先の option 探索も初回走査予算（`MAX_CACHEABLE_REFERENT_SCANS`）を消費する。超過後は空の名前 + `truncated: true`。
+    #[test]
+    fn aisnap_1_aria_labelledby_select_referent_consumes_first_scan_budget() {
+        let n = MAX_CACHEABLE_REFERENT_SCANS + 5;
+        let mut html = String::new();
+        for i in 0..n {
+            html.push_str(&format!(
+                r#"<select id="s{i}"><option>値{i}</option></select><p id="t{i}" aria-labelledby="s{i}">x</p>"#
+            ));
+        }
+        let parsed = parse_document(&html, &ParseOptions::default()).expect("成功する");
+        let doc = parsed.document;
+        let targets = fandhe_browser_core::query::query_selector_all_str(&doc, doc.root(), "p")
+            .expect("セレクタは解釈できる");
+        let index = NameIndex::build(&doc);
+        let names: Vec<AccessibleName> = targets
+            .iter()
+            .map(|&id| compute_name_with_index(&doc, &index, id))
+            .collect();
+        assert_eq!(
+            names.get(MAX_CACHEABLE_REFERENT_SCANS - 1),
+            Some(&named(
+                &format!("値{}", MAX_CACHEABLE_REFERENT_SCANS - 1),
+                NameSource::AriaLabelledBy,
+                false
+            ))
+        );
+        assert_eq!(
+            names.get(MAX_CACHEABLE_REFERENT_SCANS),
             Some(&named("", NameSource::None, true))
         );
     }
