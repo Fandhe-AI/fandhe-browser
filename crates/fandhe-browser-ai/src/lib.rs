@@ -52,7 +52,8 @@
 //!   （TASK-11.4.2・Issue #545、TASK-11.4.1・Issue #544、TASK-11.4.3・
 //!   Issue #546）、ref 生成器は実装済み（TASK-11.6・Issue #75）。
 //!   ツリー構築統合は実装済み（TASK-11.7・Issue #76）。
-//!   残作業は TASK-11.3.2・11.3.3・11.8（Issue #542・#543・#77））
+//!   残作業は TASK-11.3.2・11.3.3（Issue #542・#543）。TASK-11.8（Issue #77）の
+//!   結合テスト一式は `tests/snapshot.rs` で実装済み）
 //! - `/ai/*` ルータ向けスナップショット API（`AISNAP-6`・`AISNAP-14`・`CDP-1`
 //!   （API 単体動作は `AISNAP-7`）、`TASK-19`（単体動作確認は `TASK-20`）、
 //!   `MS-4`）
