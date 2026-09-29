@@ -33,8 +33,9 @@
 //!
 //! - `discriminator`: `id`・`href`・フォーム部品の `name` など、要素自身に付く
 //!   安定した識別属性（untrusted な文字列。ダイジェストにのみ使い ref には入らない）
-//! - `scope`: 親要素の ref のダイジェスト。別コンテナの同名要素と出現番号を
-//!   共有しないための範囲指定
+//! - `scope`: 親要素の ref（ダイジェストと出現番号の両方）。別コンテナの同名要素と
+//!   出現番号を共有しないための範囲指定。同名の親が複数あっても、親の出現番号が
+//!   違えば子のダイジェストも分かれる
 //!
 //! これらでダイジェストが分かれる要素は、同名要素の挿入・並び替えの影響を受けない。
 //! 識別属性も親も同じ完全に同一の要素だけは、文書順の出現番号に頼る（外形上
@@ -94,8 +95,10 @@ pub struct ElementSignature<'a> {
     pub name: &'a str,
     /// 要素自身の安定した識別属性（`id`・`href` 等）。無ければ `None`。
     pub discriminator: Option<&'a str>,
-    /// 親要素の ref のダイジェスト（[`ElementRef::digest`]）。ルート直下は `None`。
-    pub scope: Option<u32>,
+    /// 親要素の ref（ダイジェストと出現番号）。ルート直下は `None`。
+    ///
+    /// 同名の親が複数ある場合に子が衝突しないよう、出現番号も含めて扱う。
+    pub scope: Option<ElementRef>,
 }
 
 impl<'a> ElementSignature<'a> {
@@ -115,8 +118,8 @@ impl<'a> ElementSignature<'a> {
         self
     }
 
-    /// 親のダイジェストを設定する。
-    pub fn with_scope(mut self, scope: u32) -> Self {
+    /// 親要素の ref を設定する。
+    pub fn with_scope(mut self, scope: ElementRef) -> Self {
         self.scope = Some(scope);
         self
     }
@@ -138,7 +141,8 @@ impl<'a> ElementSignature<'a> {
             }
             if let Some(sc) = self.scope {
                 h = fnv1a_update(h, &[2]);
-                h = fnv1a_update(h, &sc.to_le_bytes());
+                h = fnv1a_update(h, &sc.digest.to_le_bytes());
+                h = fnv1a_update(h, &sc.occurrence.to_le_bytes());
             }
         }
         ((h >> 32) as u32) ^ (h as u32)
@@ -312,8 +316,16 @@ mod tests {
     #[test]
     fn aisnap_10_scope_separates_same_name_in_different_containers() {
         let mut a = RefAllocator::new();
-        let first = ElementSignature::new("button", "Delete").with_scope(1);
-        let second = ElementSignature::new("button", "Delete").with_scope(2);
+        let p1 = ElementRef {
+            digest: 1,
+            occurrence: 1,
+        };
+        let p2 = ElementRef {
+            digest: 2,
+            occurrence: 1,
+        };
+        let first = ElementSignature::new("button", "Delete").with_scope(p1);
+        let second = ElementSignature::new("button", "Delete").with_scope(p2);
         let r1 = a.allocate_signature(&first).unwrap();
         let r2 = a.allocate_signature(&second).unwrap();
         assert_eq!(r1.occurrence, 1);
@@ -323,6 +335,51 @@ mod tests {
             ElementSignature::new("button", "Submit").digest(),
             ref_signature("button", "Submit")
         );
+    }
+
+    /// `AISNAP-10`: 同名の親が複数あっても、親の出現番号が違えば子の ref は衝突せず、
+    /// 先頭に同名カードを挿入しても既存カードの子 ref は変わらない。
+    #[test]
+    fn aisnap_10_scope_includes_parent_occurrence() {
+        let run = |cards: &[&str]| {
+            let mut a = RefAllocator::new();
+            let mut out = Vec::new();
+            for id in cards {
+                let card = ElementSignature::new("article", "Card").with_discriminator(id);
+                let cr = a.allocate_signature(&card).unwrap();
+                let del = ElementSignature::new("button", "Delete").with_scope(cr);
+                out.push((id.to_string(), s(a.allocate_signature(&del).unwrap())));
+            }
+            out
+        };
+        // 識別属性なしの同名親 2 つ。親の出現番号だけが違う。
+        let mut a = RefAllocator::new();
+        let c1 = a
+            .allocate_signature(&ElementSignature::new("article", "Card"))
+            .unwrap();
+        let c2 = a
+            .allocate_signature(&ElementSignature::new("article", "Card"))
+            .unwrap();
+        assert_eq!((c1.occurrence, c2.occurrence), (1, 2));
+        let d1 = a
+            .allocate_signature(&ElementSignature::new("button", "Delete").with_scope(c1))
+            .unwrap();
+        let d2 = a
+            .allocate_signature(&ElementSignature::new("button", "Delete").with_scope(c2))
+            .unwrap();
+        assert_ne!(d1.digest, d2.digest);
+        assert_eq!((d1.occurrence, d2.occurrence), (1, 1));
+        assert_ne!(s(d1), s(d2));
+
+        // 識別属性付きの親: 先頭挿入・並べ替えで既存カードの子 ref が変わらない。
+        let before = run(&["a", "b"]);
+        let inserted = run(&["new", "a", "b"]);
+        let find = |v: &[(String, String)], id: &str| {
+            v.iter().find(|x| x.0 == id).map(|x| x.1.clone()).unwrap()
+        };
+        assert_eq!(find(&before, "a"), find(&inserted, "a"));
+        assert_eq!(find(&before, "b"), find(&inserted, "b"));
+        assert_ne!(find(&before, "a"), find(&before, "b"));
     }
 
     /// `AISNAP-10`: role と name の境界が曖昧にならない。
