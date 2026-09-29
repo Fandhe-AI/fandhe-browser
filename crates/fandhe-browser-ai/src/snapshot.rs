@@ -38,7 +38,8 @@
 //! - DOM から `Snapshot` へのツリー構築統合（[`role::compute_role`]・
 //!   [`state::compute_state`] の呼び出し組み込みを含む）: TASK-11.7（Issue #76）で
 //!   実装済み（[`build_snapshot`]。generic の折り畳み等の簡約は未実装）
-//! - ユニットテスト一式: TASK-11.8（Issue #77）
+//! - ユニットテスト一式: TASK-11.8（Issue #77）で実装済み（代表フィクスチャ 3 種の
+//!   結合テスト `tests/snapshot.rs`）
 
 pub mod build;
 pub mod element_ref;
