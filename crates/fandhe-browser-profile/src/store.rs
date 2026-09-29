@@ -12,6 +12,7 @@
 //! - ルート経路上の symlink の検証は [`Profile::open`] がハンドル基準で行う
 //!   （`PROF-1`・`PROF-4`）。macOS の `/var` のような OS 標準の symlink を含む
 //!   パスは、[`Profile::open`] の doc と同様に事前の `canonicalize` が必要
+//!   （[`OsDefaultStore`] は既存の祖先を実体パスへ解決してから返す）
 //!
 //! ## スタブについて（`code-comment-style.md`・REPAIR-3）
 //!
@@ -155,7 +156,42 @@ impl OsDefaultStore {
 impl ProfileStore for OsDefaultStore {
     fn resolve_root(&self) -> Result<ResolvedRoot, ProfileError> {
         let path = platform_default_root(&|key| std::env::var_os(key))?;
-        Ok(ResolvedRoot::new(path, RootSource::OsDefault))
+        Ok(ResolvedRoot::new(
+            canonicalize_base(&path),
+            RootSource::OsDefault,
+        ))
+    }
+}
+
+/// アプリディレクトリより上位（基点）の既存部分を実体パスへ解決する。
+///
+/// [`Profile::open`] は祖先の symlink を拒否する（`PROF-1`・`PROF-4`）ため、macOS の
+/// `/var` や `$HOME` 自体が symlink の環境では、環境変数由来のパスをそのまま渡すと
+/// 既定保存先が `InvalidLayout` になる。ここで既存の祖先だけを `canonicalize` し、
+/// 未作成の残りの要素と末尾のアプリディレクトリ名はそのまま結合する。
+/// 末尾のアプリディレクトリ自体は解決しないので、それが symlink であれば
+/// [`Profile::open`] が従来どおり拒否する（境界は緩めない）。解決できる祖先が
+/// 無ければ入力をそのまま返し、拒否は [`Profile::open`] に委ねる。
+fn canonicalize_base(path: &Path) -> PathBuf {
+    let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) else {
+        return path.to_path_buf();
+    };
+    let mut existing = parent;
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(real) = existing.canonicalize() {
+            let mut out = real;
+            out.extend(rest.iter().rev());
+            out.push(leaf);
+            return out;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(up), Some(name)) => {
+                rest.push(name);
+                existing = up;
+            }
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
@@ -555,5 +591,46 @@ mod tests {
                 .unwrap()
                 .ends_with("Library/Application Support")
         );
+    }
+
+    /// XOS-7・PROF-1: 基点が symlink 経由でも実体パスへ解決し、`Profile::open` が開ける。
+    #[cfg(unix)]
+    #[test]
+    fn xos_7_canonicalize_base_resolves_symlinked_ancestors() {
+        let tmp = TempDir::new();
+        let real = tmp.0.join("real");
+        std::fs::create_dir_all(real.join("data")).unwrap();
+        let link = tmp.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // 既存の基点は実体へ、未作成の中間要素とアプリ名はそのまま結合される。
+        assert_eq!(
+            canonicalize_base(&link.join("data").join("fandhe-browser")),
+            real.join("data").join("fandhe-browser")
+        );
+        assert_eq!(
+            canonicalize_base(&link.join("missing").join("sub").join("fandhe-browser")),
+            real.join("missing").join("sub").join("fandhe-browser")
+        );
+        let root = canonicalize_base(&link.join("data").join("fandhe-browser"));
+        assert!(Profile::open(&root).is_ok());
+    }
+
+    /// PROF-1: 末尾のアプリディレクトリが symlink なら解決せず、`Profile::open` が拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_canonicalize_base_keeps_symlinked_leaf_rejected() {
+        let tmp = TempDir::new();
+        let target = tmp.0.join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        let leaf = tmp.0.join("fandhe-browser");
+        std::os::unix::fs::symlink(&target, &leaf).unwrap();
+
+        let root = canonicalize_base(&leaf);
+        assert_eq!(root, leaf);
+        assert!(matches!(
+            Profile::open(&root),
+            Err(ProfileError::InvalidLayout { .. })
+        ));
     }
 }
