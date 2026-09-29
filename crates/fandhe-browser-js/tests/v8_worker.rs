@@ -23,9 +23,25 @@
 //! `cargo test -p fandhe-browser-js --features test-support`。
 
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use fandhe_browser_js::process_engine::ParentNativeFn;
 use fandhe_browser_js::process_engine::{V8ProcessEngine, WorkerSpawnConfigForTest};
-use fandhe_browser_js::{EvaluateOptions, JsEngineError, JsValue};
+use fandhe_browser_js::{EvaluateOptions, JsEngineError, JsValue, NativeCallContext};
+
+/// `super::v8_engine::SCRIPT_EXECUTION_TIMEOUT`（子の watchdog。`pub(crate)`
+/// で本クレート外からは参照できない）の値を、本結合テストの目的
+/// （watchdog が `NativeCall` の待ち時間も含めて計測することの確認）の
+/// ために手作業で複製した値（`TASK-29`・Issue #526）。変更時は両方を
+/// 更新すること。
+const CHILD_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `super::process_engine::EVALUATE_RECV_TIMEOUT`（`pub(crate)` で本
+/// クレート外からは参照できない）の値を手作業で複製した値（`TASK-29`・
+/// Issue #526）。`CHILD_WATCHDOG_TIMEOUT` + 1 秒。変更時は両方を更新
+/// すること。
+const PARENT_EVALUATE_DEADLINE: Duration = Duration::from_secs(3);
 
 /// テスト用に小さいヒープ上限を渡す（Issue #503 設計書 §7 W6「テスト用に
 /// 小さいヒープ上限を渡す経路（テスト専用。本番では無効）」）。本番の
@@ -105,6 +121,16 @@ fn main() -> ExitCode {
         "case: js_1_repeated_short_evaluations_accumulating_array_buffers_hit_resource_limit"
     );
     js_1_repeated_short_evaluations_accumulating_array_buffers_hit_resource_limit();
+    eprintln!("case: js_1_native_call_round_trip_returns_value_and_records_args");
+    js_1_native_call_round_trip_returns_value_and_records_args();
+    eprintln!("case: js_1_native_call_err_is_catchable_and_context_survives");
+    js_1_native_call_err_is_catchable_and_context_survives();
+    eprintln!("case: js_1_native_call_duration_is_included_in_the_watchdog_timeout");
+    js_1_native_call_duration_is_included_in_the_watchdog_timeout();
+    eprintln!("case: js_1_native_call_exceeding_evaluate_deadline_discards_context");
+    js_1_native_call_exceeding_evaluate_deadline_discards_context();
+    eprintln!("case: js_1_native_call_with_unknown_id_discards_context_and_recovers");
+    js_1_native_call_with_unknown_id_discards_context_and_recovers();
     #[cfg(target_os = "linux")]
     {
         eprintln!("case: js_1_linux_child_process_has_rlimit_data_set");
@@ -194,6 +220,7 @@ fn js_1_oom_returns_resource_limit_exceeded_and_next_eval_uses_fresh_context() {
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: None,
+        native_proxies_for_test: Vec::new(),
         windows_process_memory_limit_bytes_override: None,
     });
     engine
@@ -242,6 +269,7 @@ fn js_1_handshake_failure_is_engine_unavailable() {
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: None,
+        native_proxies_for_test: Vec::new(),
         windows_process_memory_limit_bytes_override: None,
     });
 
@@ -266,6 +294,7 @@ fn js_1_handshake_rejects_hello_naming_a_different_engine() {
         hello_wrong_engine_for_test: true,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: None,
+        native_proxies_for_test: Vec::new(),
         windows_process_memory_limit_bytes_override: None,
     });
 
@@ -295,6 +324,7 @@ fn js_1_handshake_rejects_hello_with_wrong_length() {
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: true,
         rss_threshold_bytes_override: None,
+        native_proxies_for_test: Vec::new(),
         windows_process_memory_limit_bytes_override: None,
     });
 
@@ -458,6 +488,7 @@ fn js_1_oversized_test_heap_limit_is_clamped_to_the_production_default() {
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: None,
+        native_proxies_for_test: Vec::new(),
         windows_process_memory_limit_bytes_override: None,
     });
 
@@ -493,6 +524,7 @@ fn js_1_undersized_test_heap_limit_is_raised_to_a_working_floor() {
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: None,
+        native_proxies_for_test: Vec::new(),
         windows_process_memory_limit_bytes_override: None,
     });
 
@@ -619,6 +651,7 @@ fn js_1_array_buffer_backing_store_exhaustion_is_caught_as_resource_limit_exceed
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: Some(TEST_RSS_THRESHOLD_BYTES),
+        native_proxies_for_test: Vec::new(),
         windows_process_memory_limit_bytes_override: None,
     });
     engine
@@ -809,6 +842,7 @@ fn js_1_repeated_short_evaluations_accumulating_array_buffers_hit_resource_limit
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: Some(TEST_RSS_THRESHOLD_BYTES),
+        native_proxies_for_test: Vec::new(),
         windows_process_memory_limit_bytes_override: None,
     });
     engine
@@ -895,6 +929,7 @@ fn js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation() {
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
         rss_threshold_bytes_override: Some(TEST_RSS_THRESHOLD_BYTES),
+        native_proxies_for_test: Vec::new(),
         windows_process_memory_limit_bytes_override: None,
     });
     engine
@@ -933,6 +968,252 @@ fn js_1_windows_process_memory_limit_kills_oversized_array_buffer_allocation() {
             panic!("expected the pre-OOM variable to be gone in the fresh context, got: {other:?}")
         }
     }
+}
+/// `new_for_test` で子プロセスの構成を作りつつ、`register_native_function_for_test`
+/// で親側に `NativeFn` を 1 つ登録する（`TASK-29`・Issue #526）。呼び出し元
+/// は `spawn_config.native_proxies_for_test` に同じ id で子側のプロキシ名を
+/// 渡しておく。戻り値はエンジンと、実際に割り当てられた id。
+fn engine_with_one_native_fn_for_test(
+    native_fn: ParentNativeFn,
+    spawn_config: WorkerSpawnConfigForTest,
+) -> (V8ProcessEngine, u32) {
+    let mut engine = V8ProcessEngine::new_for_test(spawn_config);
+    let id = engine
+        .register_native_function_for_test(native_fn)
+        .unwrap_or_else(|err| panic!("registering a native function must succeed: {err}"));
+    (engine, id)
+}
+
+/// `TASK-29`・Issue #526 受け入れ条件 1: 親は `NativeCall` を受け取ると、
+/// 対応する `NativeFn` を実行し、結果を `NativeReturn` として子へ返す。
+/// `NativeFn` が受け取った引数（`Arc<Mutex<..>>` で記録）と、JS 側で見える
+/// 戻り値の両方を確認する。
+fn js_1_native_call_round_trip_returns_value_and_records_args() {
+    let seen_args: Arc<Mutex<Vec<JsValue>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_args_for_closure = Arc::clone(&seen_args);
+    let native_fn: ParentNativeFn = Box::new(move |args: &[JsValue], _ctx: &NativeCallContext| {
+        *seen_args_for_closure.lock().unwrap() = args.to_vec();
+        Ok(JsValue::Number(42.0))
+    });
+
+    let (mut engine, id) = engine_with_one_native_fn_for_test(
+        native_fn,
+        WorkerSpawnConfigForTest {
+            heap_limit_bytes: None,
+            protocol_version_override: None,
+            hello_wrong_engine_for_test: false,
+            hello_extra_byte_for_test: false,
+            rss_threshold_bytes_override: None,
+            native_proxies_for_test: vec![("f".to_string(), 0)],
+            windows_process_memory_limit_bytes_override: None,
+        },
+    );
+    assert_eq!(id, 0, "the first registration must be assigned id 0");
+
+    let result = engine
+        .evaluate_script("f(1, 'a')", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("calling the native proxy must succeed: {err}"));
+    assert_eq!(result, JsValue::Number(42.0));
+    assert_eq!(
+        *seen_args.lock().unwrap(),
+        vec![JsValue::Number(1.0), JsValue::String("a".to_string())]
+    );
+}
+
+/// `TASK-29`・Issue #526: `NativeFn` が `Err` を返した場合、JS の
+/// `try`/`catch` で捕捉でき、メッセージが一致し、続く評価で Context
+/// （グローバル変数）が残っていること。
+fn js_1_native_call_err_is_catchable_and_context_survives() {
+    let native_fn: ParentNativeFn = Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| {
+        Err(JsEngineError::EvaluationFailed("boom".to_string()))
+    });
+    let (mut engine, id) = engine_with_one_native_fn_for_test(
+        native_fn,
+        WorkerSpawnConfigForTest {
+            heap_limit_bytes: None,
+            protocol_version_override: None,
+            hello_wrong_engine_for_test: false,
+            hello_extra_byte_for_test: false,
+            rss_threshold_bytes_override: None,
+            native_proxies_for_test: vec![("f".to_string(), 0)],
+            windows_process_memory_limit_bytes_override: None,
+        },
+    );
+    assert_eq!(id, 0);
+
+    engine
+        .evaluate_script("var marker = 5;", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("marker declaration must evaluate successfully: {err}"));
+
+    let result = engine
+        .evaluate_script(
+            "try { f(); 'unreachable'; } catch (e) { e.message; }",
+            &EvaluateOptions::default(),
+        )
+        .unwrap_or_else(|err| panic!("the thrown error must be catchable in JS: {err}"));
+    // `dispatch_native_call` は `NativeFn` の `Err`（`JsEngineError`）を
+    // `to_string()`（`Display` 実装）でメッセージ化するため、`Err` の
+    // 中身の文字列そのものではなく `Display` 表現が JS 側に届く。
+    assert_eq!(
+        result,
+        JsValue::String("script evaluation failed: boom".to_string())
+    );
+
+    let result = engine
+        .evaluate_script("marker", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("context must survive a non-fatal NativeFn error: {err}"));
+    assert_eq!(result, JsValue::Number(5.0));
+}
+
+/// `TASK-29`・Issue #526 受け入れ条件 2: `NativeFn` の実行時間が子の
+/// watchdog（`CHILD_WATCHDOG_TIMEOUT`）に含まれること。`NativeFn` を
+/// `CHILD_WATCHDOG_TIMEOUT` より長く（かつ `PARENT_EVALUATE_DEADLINE` より
+/// 短く）ブロックさせ、`Ok` ではなく子の watchdog 由来の `Timeout` になる
+/// こと、Context は残ることを確認する。
+fn js_1_native_call_duration_is_included_in_the_watchdog_timeout() {
+    let native_fn: ParentNativeFn = Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| {
+        std::thread::sleep(CHILD_WATCHDOG_TIMEOUT + Duration::from_millis(300));
+        Ok(JsValue::Number(1.0))
+    });
+    let (mut engine, id) = engine_with_one_native_fn_for_test(
+        native_fn,
+        WorkerSpawnConfigForTest {
+            heap_limit_bytes: None,
+            protocol_version_override: None,
+            hello_wrong_engine_for_test: false,
+            hello_extra_byte_for_test: false,
+            rss_threshold_bytes_override: None,
+            native_proxies_for_test: vec![("f".to_string(), 0)],
+            windows_process_memory_limit_bytes_override: None,
+        },
+    );
+    assert_eq!(id, 0);
+
+    engine
+        .evaluate_script("globalThis.x = 5;", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("marker declaration must evaluate successfully: {err}"));
+
+    // `f()` の呼び出し（ネイティブコールバック）から戻った直後に
+    // `while (true) {}` を続けることで、V8 のインタプリタが
+    // バックエッジのチェックポイントへ確実に到達させる。`f(); 1` のような
+    // トリビアルな残り処理だけだと、チェックポイントに一度も到達しない
+    // まま `Run` が正常終了しうる（`isolate.terminate_execution()` は
+    // 「次にインタプリタがチェックポイントを踏んだとき」に効く要求で
+    // あり、要求時点で即座にスタックを巻き戻すわけではないため）。
+    match engine.evaluate_script("f(); while (true) {}", &EvaluateOptions::default()) {
+        Err(JsEngineError::Timeout(msg)) => {
+            assert!(
+                msg.contains("timed out inside the JS worker process"),
+                "expected the child watchdog's message, got: {msg}"
+            );
+            assert!(
+                !msg.contains("context was discarded"),
+                "the child watchdog's timeout must not discard the context, got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected the child watchdog to time out (proving the NativeFn's blocking time is \
+             counted), got: {other:?} (an Ok result would mean the closure's time was not \
+             counted)"
+        ),
+    }
+
+    let result = engine
+        .evaluate_script("x", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("context must survive a watchdog-based timeout: {err}"));
+    assert_eq!(result, JsValue::Number(5.0));
+}
+
+/// `TASK-29`・Issue #526: `NativeFn` が `PARENT_EVALUATE_DEADLINE` を
+/// 超えてブロックすると、親は `NATIVE_RETURN` を送らずに子を `kill` し、
+/// `Timeout`（"context was discarded" を含む）を返すこと。次の評価は
+/// 新しい子で成功すること（前の状態は消えている）。
+fn js_1_native_call_exceeding_evaluate_deadline_discards_context() {
+    let native_fn: ParentNativeFn = Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| {
+        std::thread::sleep(PARENT_EVALUATE_DEADLINE + Duration::from_millis(300));
+        Ok(JsValue::Number(1.0))
+    });
+    let (mut engine, id) = engine_with_one_native_fn_for_test(
+        native_fn,
+        WorkerSpawnConfigForTest {
+            heap_limit_bytes: None,
+            protocol_version_override: None,
+            hello_wrong_engine_for_test: false,
+            hello_extra_byte_for_test: false,
+            rss_threshold_bytes_override: None,
+            native_proxies_for_test: vec![("f".to_string(), 0)],
+            windows_process_memory_limit_bytes_override: None,
+        },
+    );
+    assert_eq!(id, 0);
+
+    engine
+        .evaluate_script("var before = 1;", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("marker declaration must evaluate successfully: {err}"));
+
+    match engine.evaluate_script("f(); 1", &EvaluateOptions::default()) {
+        Err(JsEngineError::Timeout(msg)) => {
+            assert!(
+                msg.contains("context was discarded"),
+                "exceeding the parent's evaluate deadline must discard the context, got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected Timeout when a NativeFn exceeds the parent's evaluate deadline, got: \
+             {other:?}"
+        ),
+    }
+
+    let result = engine
+        .evaluate_script("40 + 2", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("engine must recover with a fresh child: {err}"));
+    assert_eq!(result, JsValue::Number(42.0));
+
+    match engine.evaluate_script("before", &EvaluateOptions::default()) {
+        Err(JsEngineError::EvaluationFailed(msg)) => {
+            assert!(
+                msg.contains("before") || msg.contains("ReferenceError"),
+                "expected a ReferenceError for a variable from the discarded context, got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected the pre-timeout variable to be gone in the fresh context, got: {other:?}"
+        ),
+    }
+}
+
+/// `TASK-29`・Issue #526: 子に登録したプロキシの id に対応する `NativeFn`
+/// が親に登録されていない場合、`EngineUnavailable`（"context was
+/// discarded" を含む）になり、次の評価は新しい子で回復すること。
+fn js_1_native_call_with_unknown_id_discards_context_and_recovers() {
+    let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
+        heap_limit_bytes: None,
+        protocol_version_override: None,
+        hello_wrong_engine_for_test: false,
+        hello_extra_byte_for_test: false,
+        rss_threshold_bytes_override: None,
+        // 子には id 7 のプロキシを登録させるが、親には何も登録しない
+        // （`native_fns` は空のまま）。
+        native_proxies_for_test: vec![("f".to_string(), 7)],
+        windows_process_memory_limit_bytes_override: None,
+    });
+
+    match engine.evaluate_script("f()", &EvaluateOptions::default()) {
+        Err(JsEngineError::EngineUnavailable(msg)) => {
+            assert!(
+                msg.contains("context was discarded"),
+                "an unregistered NativeCall id must discard the context, got: {msg}"
+            );
+        }
+        other => {
+            panic!("expected EngineUnavailable for an unregistered NativeCall id, got: {other:?}")
+        }
+    }
+
+    let result = engine
+        .evaluate_script("1 + 1", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("engine must recover with a fresh child: {err}"));
+    assert_eq!(result, JsValue::Number(2.0));
 }
 
 /// Job Object の上限を下げた検証で使う上限値（112 MiB）。
@@ -981,6 +1262,7 @@ fn js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_li
         protocol_version_override: None,
         hello_wrong_engine_for_test: false,
         hello_extra_byte_for_test: false,
+        native_proxies_for_test: Vec::new(),
         rss_threshold_bytes_override: None,
         windows_process_memory_limit_bytes_override: Some(LOWERED_JOB_LIMIT_BYTES),
     });
