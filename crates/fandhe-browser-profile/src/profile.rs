@@ -154,6 +154,18 @@ pub enum ProfileError {
         /// ルート配下に収まらないと判定された候補パス。
         candidate: PathBuf,
     },
+    /// OS 慣習の既定プロファイルルートを解決できない場合に返す
+    /// （`XOS-7`、TASK-60（60.3）・#202。`store::OsDefaultStore` が返す）。
+    ///
+    /// 必要な環境変数（`HOME`・`LOCALAPPDATA` 等）が未設定・空・相対パス・
+    /// `..` 含みの場合や、既定値が定義されていないプラットフォームで使う。
+    /// `/tmp` やカレントディレクトリへ暗黙にフォールバックせず失敗させる
+    /// （fail-closed。REPAIR-3）。環境変数の値（ユーザー名を含みうる）は
+    /// エラーへコピーしない。
+    DefaultRootUnavailable {
+        /// 解決できない理由を示す英語メッセージ。
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for ProfileError {
@@ -179,6 +191,9 @@ impl fmt::Display for ProfileError {
             ProfileError::InvalidComponent { reason } => {
                 write!(f, "invalid path component: {reason}")
             }
+            ProfileError::DefaultRootUnavailable { reason } => {
+                write!(f, "default profile root is unavailable: {reason}")
+            }
             ProfileError::OutsideRoot { root, candidate } => {
                 write!(
                     f,
@@ -200,6 +215,7 @@ impl std::error::Error for ProfileError {
             ProfileError::Locked { .. } => None,
             ProfileError::InvalidComponent { .. } => None,
             ProfileError::OutsideRoot { .. } => None,
+            ProfileError::DefaultRootUnavailable { .. } => None,
         }
     }
 }
