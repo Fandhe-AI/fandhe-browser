@@ -129,12 +129,21 @@ pub(crate) const TEST_HELLO_EXTRA_BYTE_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER
 pub(crate) const TEST_WINDOWS_PROCESS_MEMORY_LIMIT_ENV_VAR: &str =
     "FANDHE_BROWSER_JS_WORKER_WINDOWS_PROCESS_MEMORY_LIMIT_BYTES";
 
+/// 環境変数のバイト数文字列を `u64` で解釈し、`usize` に収まらない値は
+/// `usize::MAX` へ飽和させる（32 ビット環境でも `usize` 範囲外の巨大値が
+/// 解釈失敗（`None` = 既定値）にならず、後段のクランプで上限へ丸められる。
+/// 3 OS 対応・`JS-1`・`TASK-29`）。数値として解釈できなければ `None`。
+fn parse_env_bytes_saturating(value: &str) -> Option<usize> {
+    let parsed = value.trim().parse::<u64>().ok()?;
+    Some(usize::try_from(parsed).unwrap_or(usize::MAX))
+}
+
 /// [`TEST_WINDOWS_PROCESS_MEMORY_LIMIT_ENV_VAR`] の生の値から、
 /// `enforce_child_memory_limit` へ渡す上書き値を決める純粋関数。解釈
 /// できなければ `None`（本番値）、解釈できればクランプした値を返す。
 #[cfg(target_os = "windows")]
 fn test_windows_process_memory_limit_from_env_value(raw: Option<&str>) -> Option<usize> {
-    raw.and_then(|value| value.trim().parse::<usize>().ok())
+    raw.and_then(parse_env_bytes_saturating)
         .map(super::resource_limits::clamp_test_windows_process_memory_limit_bytes)
 }
 
@@ -156,7 +165,7 @@ fn test_windows_process_memory_limit_from_env_value(raw: Option<&str>) -> Option
 /// - 解釈できた場合は [`super::v8_engine::clamp_test_heap_limit_bytes`] で
 ///   クランプした値を返す（本番の既定値を超えられず、下限も満たす）
 fn test_heap_limit_from_env_value(raw: Option<&str>) -> Option<usize> {
-    raw.and_then(|value| value.trim().parse::<usize>().ok())
+    raw.and_then(parse_env_bytes_saturating)
         .map(super::v8_engine::clamp_test_heap_limit_bytes)
 }
 
@@ -661,6 +670,19 @@ mod tests {
             None
         );
         assert_eq!(test_windows_process_memory_limit_from_env_value(None), None);
+    }
+
+    /// 3 OS 対応: `usize` に収まらない巨大値は解釈失敗にならず `usize::MAX`
+    /// へ飽和し、数値でない値は `None` になること（32 ビット環境対応）。
+    #[test]
+    fn js_1_parse_env_bytes_saturating_saturates_and_rejects_non_numeric() {
+        assert_eq!(parse_env_bytes_saturating(" 1024 "), Some(1024));
+        assert_eq!(
+            parse_env_bytes_saturating("18446744073709551615"),
+            Some(usize::MAX)
+        );
+        assert_eq!(parse_env_bytes_saturating("18446744073709551616"), None);
+        assert_eq!(parse_env_bytes_saturating("x"), None);
     }
 
     /// JS-1・Issue #503 W5: `JsEngineError::Timeout` は `ErrorKind::Timeout`
