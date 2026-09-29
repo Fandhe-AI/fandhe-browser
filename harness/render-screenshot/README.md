@@ -512,14 +512,14 @@ python3 harness/render-screenshot/measure_ssim.py \
   影響しない
 - ファイルが存在しない場合、そのサイトの bbox 判定は `not_measured`（サイト
   不合格）になる。エンジン側で bbox を書き出す仕組みができるまでの既定挙動
-- bbox JSON は任意フィールド `png_sha256`（対応 PNG の SHA-256・小文字 16 進
-  64 桁）を持てる。存在する場合、`measure_ssim.py` は PNG 実体のハッシュと照合し、
-  不一致・形式不正なら前回撮影時点の bbox が混入した `stale` として不合格
+- bbox JSON は必須フィールド `png_sha256`（対応 PNG の SHA-256・小文字 16 進
+  64 桁）を持つ。`measure_ssim.py` は PNG 実体のハッシュと照合し、
+  欠落・不一致・形式不正なら前回撮影時点の bbox が混入した `stale` として不合格
   （`error`）にする（`_bbox_png_binding_mismatch`。fail-closed 方針）。ファイル
   更新時刻には依存しないため、bbox 先行記録・PNG 後保存のどちらの生成順序でも
-  正しく検証できる。フィールドが無い場合は対応付け不能のため検証せず受理する
-  （再撮影で `--out-dir` を使い回す場合は抽出処理側で `png_sha256` を付与するか、
-  bbox JSON を削除してから再撮影すること）
+  正しく検証できる。フィールドが無い場合も対応付け不能のため不合格にする
+  （fail-closed。再撮影で `--out-dir` を使い回しても古い bbox が今回の測定値と
+  して受理されない。抽出処理側は撮影ごとに `png_sha256` を付与すること）
 
 ### ±5%・80% の解釈（#55 で確認する解釈）
 

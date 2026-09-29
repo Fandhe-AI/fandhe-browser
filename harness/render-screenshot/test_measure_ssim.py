@@ -812,10 +812,10 @@ class BboxPngBindingTest(unittest.TestCase):
             bbox_path, png_path = self._write(tmp, {"schema_version": 1, "elements": [], "png_sha256": "ABC"})
             self.assertIn("64-character", ms._bbox_png_binding_mismatch(bbox_path, png_path))
 
-    def test_missing_field_is_not_verified(self) -> None:
+    def test_missing_field_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bbox_path, png_path = self._write(tmp, {"schema_version": 1, "elements": []})
-            self.assertIsNone(ms._bbox_png_binding_mismatch(bbox_path, png_path))
+            self.assertIn("png_sha256 is missing", ms._bbox_png_binding_mismatch(bbox_path, png_path))
 
     def test_read_failure_is_not_reported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1390,7 +1390,33 @@ class MainIntegrationTest(unittest.TestCase):
 
     def _write_bboxes(self, capture_dir: Path, engine: str, site_id: str, elements: list[dict]) -> None:
         path = capture_dir / engine / f"{site_id}.bboxes.json"
-        path.write_text(json.dumps({"schema_version": 1, "elements": elements}), encoding="utf-8")
+        payload: dict = {"schema_version": 1, "elements": elements}
+        png = capture_dir / engine / f"{site_id}.png"
+        if png.exists():
+            # 対応 PNG のハッシュを付与する（`png_sha256` は必須。Codex P1 対応）。
+            payload["png_sha256"] = hashlib.sha256(png.read_bytes()).hexdigest()
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_bbox_without_png_hash_does_not_pass(self) -> None:
+        # Codex P1 対応: `png_sha256` の無い bbox（--out-dir 再利用で残った古い bbox）は
+        # SSIM が閾値を満たしていても合格判定に使わない。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            site_id = "s0"
+            self._make_site_pngs(capture_dir, site_id, identical=True)
+            elements = [{"id": f"e{i}", "x": 0, "y": 0, "width": 10, "height": 10} for i in range(5)]
+            for engine in ("chromium", "servo"):
+                path = capture_dir / engine / f"{site_id}.bboxes.json"
+                path.write_text(json.dumps({"schema_version": 1, "elements": elements}), encoding="utf-8")
+            self._write_capture_result(capture_dir, [site_id])
+
+            exit_code = ms.main(["--capture-dir", str(capture_dir), "--min-sites", "1"])
+            self.assertEqual(exit_code, 1)
+            result = json.loads((capture_dir / "measure-result.json").read_text(encoding="utf-8"))
+            site_result = result["sites"][0]
+            self.assertFalse(site_result["passed"])
+            self.assertEqual(site_result["bbox"]["status"], "error")
+            self.assertIn("png_sha256 is missing", site_result["bbox"]["reason"])
 
     def _write_capture_result(self, capture_dir: Path, site_ids: list[str]) -> None:
         captures = []

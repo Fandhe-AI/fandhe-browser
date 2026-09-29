@@ -1057,18 +1057,19 @@ _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def _bbox_png_binding_mismatch(bbox_path: Path, png_path: Path) -> str | None:
-    """bbox JSON の任意フィールド `png_sha256` と PNG 実体の SHA-256 を照合する。
+    """bbox JSON の必須フィールド `png_sha256` と PNG 実体の SHA-256 を照合する。
 
     `capture_screenshots.py`（#53）の再撮影では PNG だけが差し替わり、bbox JSON
     （TASK-36/38 の抽出処理が本スクリプトの外側で書き出す別ファイル）が前回撮影
     のまま残る可能性がある（Codex P1 指摘）。ファイル更新時刻は bbox と PNG の
     生成順序に依存し、正常な撮影（bbox 先行記録 → PNG 保存）を誤って落とすため
-    使わない。代わりに bbox JSON が任意で持つ `png_sha256`（対応 PNG の SHA-256
+    使わない。代わりに bbox JSON が持つ `png_sha256`（対応 PNG の SHA-256
     小文字 16 進 64 桁）で撮影と対応付ける。生成順序に依存しない検証である。
 
-    - フィールドが無い: 対応付け不能のため検証しない（`None`。後方互換）。
-    - 形式が不正・不一致: 不一致理由の文字列を返す（呼び出し側が fail-closed で
-      不合格にする）。
+    - フィールドが無い・形式が不正・不一致: 対応付け不能または前回撮影の混入と
+      みなし、理由の文字列を返す（呼び出し側が fail-closed で不合格にする。
+      フィールド欠落を受理すると `--out-dir` 再利用時に古い bbox を今回の
+      測定値として合格判定に使えてしまう。Codex P1 指摘）。
     - 読み込み失敗: `load_bboxes` 等の別経路が扱うため `None`。
     RENDER-5 / TASK-37.2。
     """
@@ -1078,8 +1079,10 @@ def _bbox_png_binding_mismatch(bbox_path: Path, png_path: Path) -> str | None:
         payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_non_finite_constant)
     except (OSError, ValueError, RecursionError, BboxError):
         return None
-    if not isinstance(payload, dict) or "png_sha256" not in payload:
+    if not isinstance(payload, dict):
         return None
+    if "png_sha256" not in payload:
+        return "png_sha256 is missing (cannot bind the bbox to the captured PNG)"
     expected = payload["png_sha256"]
     if not isinstance(expected, str) or not _SHA256_HEX_RE.fullmatch(expected):
         return "png_sha256 must be a 64-character lowercase hex string"
