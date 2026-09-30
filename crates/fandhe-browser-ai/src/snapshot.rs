@@ -41,6 +41,10 @@
 //! - データ葉（`isDataLeaf`）の判定結果の反映: TASK-13.3（`AISNAP-3`・Issue #88）で
 //!   実装済み（[`Node::data_leaf`]。算出は [`crate::data_leaf::classify_data_leaf`]。
 //!   印を付けるだけで、簡約・剪定への利用は後続タスク）
+//! - 表・一覧の圧縮戦略の統合: TASK-12.5（`AISNAP-2`・Issue #83）で実装済み
+//!   （[`Node::table`]・[`TableSummary`]。規則的な `table`・`ul`・`ol` は
+//!   [`build_snapshot`] が子孫を展開せず、ヘッダ・圧縮行・超過行数を持つ 1 ノードへ
+//!   置き換える。圧縮した行・項目の中の操作要素（リンク等）は現状 ref を持たない）
 //! - ユニットテスト一式: TASK-11.8（Issue #77）で実装済み（代表フィクスチャ 3 種の
 //!   結合テスト `tests/snapshot.rs`）
 
@@ -88,10 +92,9 @@ pub use state::{CheckedState, State, compute_state};
 ///
 /// `#[non_exhaustive]` により、今後のフィールド追加は破壊的変更にならない。
 ///
-/// 拡張方針: 表・一覧類型のノードには TASK-12（`AISNAP-2`）で `header`
-/// （ヘッダ列）・`rows`（圧縮 1 行表現の行）・`truncated_rows`（省略した
-/// 行数）を追加する予定である。実現方法（専用構造体を `Option` で持たせる
-/// 案など）は TASK-12 で決める。
+/// - `table`: 規則的な表・一覧を圧縮した内容（`AISNAP-2`・TASK-12.5・Issue #83）。
+///   `Some` のノードは子孫を展開せず（`children` は空）、ヘッダ・圧縮行・超過行数を
+///   [`TableSummary`] に持つ。`None` は圧縮していないノード
 ///
 /// 呼び出し文脈: [`build_snapshot`]（TASK-11.7・Issue #76）が `core` の DOM から構築し、
 /// 将来は `cli` 層の配線を経由して `cdp` の `/ai/snapshot` から使われる
@@ -120,6 +123,91 @@ pub struct Node {
     /// データ葉と判定した根拠。`None` はデータ葉でない。
     /// 判定は [`crate::data_leaf::classify_data_leaf`]（`AISNAP-3`・TASK-13.3・Issue #88）。
     pub data_leaf: Option<DataLeafKind>,
+    /// 規則的な表・一覧の圧縮結果。`None` は圧縮していないノード
+    /// （`AISNAP-2`・TASK-12.5・Issue #83）。
+    pub table: Option<TableSummary>,
+}
+
+/// 圧縮した表・一覧のヘッダ 1 セル（`AISNAP-2`・`AISNAP-10`・TASK-12.5）。
+///
+/// ヘッダ行のみ個別 ref を持つ（データ行は圧縮のため ref を持たない）。
+/// spec の想定 JSON ではヘッダを文字列配列で描くが、JSON への写像は
+/// TASK-19・`AISNAP-6` で扱う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HeaderCell {
+    /// role トークン（通常 `columnheader`）。
+    pub role: String,
+    /// accessible name。
+    pub name: String,
+    /// 再特定要求（形式は [`Node::r#ref`] と同じ）。
+    pub r#ref: String,
+}
+
+impl HeaderCell {
+    /// role・name・ref を指定して作る。
+    pub fn new(role: impl Into<String>, name: impl Into<String>, r#ref: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            name: name.into(),
+            r#ref: r#ref.into(),
+        }
+    }
+}
+
+/// 圧縮した 1 データ行（セルを `" | "` で連結した文字列。`AISNAP-2`・TASK-12.5）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TableRow {
+    /// 1 行表現。
+    pub text: String,
+    /// いずれかのセルが上限（文字数・走査量）で切り詰められたか。
+    pub truncated: bool,
+}
+
+impl TableRow {
+    /// 行文字列と切り詰め有無を指定して作る。
+    pub fn new(text: impl Into<String>, truncated: bool) -> Self {
+        Self {
+            text: text.into(),
+            truncated,
+        }
+    }
+}
+
+/// 規則的な表・一覧の圧縮表現（`AISNAP-2`・TASK-12.5・Issue #83）。
+///
+/// [`build_snapshot`] が `compress_table` の部品（構造検出・ヘッダ ref 付与・行圧縮）から
+/// 組み立てる。呼び出し元は将来の `/ai/snapshot`（TASK-19）。
+///
+/// 既知の制約（実装済みを装わない。REPAIR-3）:
+/// - 非表示のヘッダセルは `header` から除かれるため、`header` と `rows` の列位置は
+///   対応しないことがある
+/// - `tfoot` 行は `rows` にも `truncated_rows` にも含めない
+/// - セル内の `" | "` はエスケープしない
+/// - 圧縮した行・項目の中のリンク等の操作要素は ref を持たない
+/// - 行の省略は `truncated_rows`、セルの切り詰めは [`TableRow::truncated`] で通知し、
+///   [`Snapshot::truncated`] は立てない
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TableSummary {
+    /// ヘッダセル（ヘッダ行が無い表・一覧では空）。
+    pub header: Vec<HeaderCell>,
+    /// 先頭から最大 20 行の圧縮行。
+    pub rows: Vec<TableRow>,
+    /// 20 行を超えて省略した行数。
+    pub truncated_rows: usize,
+}
+
+impl TableSummary {
+    /// ヘッダ・行・超過行数を指定して作る。
+    pub fn new(header: Vec<HeaderCell>, rows: Vec<TableRow>, truncated_rows: usize) -> Self {
+        Self {
+            header,
+            rows,
+            truncated_rows,
+        }
+    }
 }
 
 impl Node {
@@ -133,6 +221,7 @@ impl Node {
             children: Vec::new(),
             state: State::default(),
             data_leaf: None,
+            table: None,
         }
     }
 
@@ -154,6 +243,13 @@ impl Node {
     #[must_use]
     pub fn with_data_leaf(mut self, kind: DataLeafKind) -> Self {
         self.data_leaf = Some(kind);
+        self
+    }
+
+    /// `table` に圧縮結果を設定した `Node` を返す（ビルダー。`AISNAP-2`）。
+    #[must_use]
+    pub fn with_table(mut self, table: TableSummary) -> Self {
+        self.table = Some(table);
         self
     }
 
@@ -210,7 +306,9 @@ impl Snapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckedState, DataLeafKind, Node, Snapshot, State};
+    use super::{
+        CheckedState, DataLeafKind, HeaderCell, Node, Snapshot, State, TableRow, TableSummary,
+    };
 
     /// `AISNAP-1`（TASK-11.2・Issue #71、`state` の既定値は TASK-11.5・
     /// Issue #74）: `Node::new` が role・name を設定し、`ref` は `None`、
@@ -224,6 +322,21 @@ mod tests {
         assert_eq!(node.children.len(), 0);
         assert_eq!(node.state, State::default());
         assert_eq!(node.data_leaf, None);
+        assert_eq!(node.table, None);
+    }
+
+    /// `AISNAP-2`（TASK-12.5・Issue #83）: `with_table` が `table` だけを設定すること。
+    #[test]
+    fn aisnap_2_node_with_table_sets_summary() {
+        let summary = TableSummary::new(
+            vec![HeaderCell::new("columnheader", "名前", "e1")],
+            vec![TableRow::new("太郎", false)],
+            3,
+        );
+        let node = Node::new("table", "").with_table(summary.clone());
+        assert_eq!(node.table, Some(summary));
+        assert_eq!(node.r#ref, None);
+        assert_eq!(node.children.len(), 0);
     }
 
     /// `AISNAP-3`（TASK-13.3・Issue #88）: `with_data_leaf` が `data_leaf` だけを

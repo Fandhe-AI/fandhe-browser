@@ -181,8 +181,32 @@ fn parse(html: &str) -> Document {
         .document
 }
 
+/// 圧縮した表（`Node::table`）のヘッダセルを、テスト上の仮想子ノード
+/// （role・name・ref・`data_leaf = TableCell`）として展開した木を返す。
+///
+/// TASK-12.5（`AISNAP-2`）で規則的な表は子孫（th/td）を展開せず `TableSummary` へ
+/// 圧縮される。ヘッダの `th` は圧縮表現でも個別 ref を持つため、判別可能性の検査では
+/// 「ヘッダセル = 表ノード直下の columnheader 葉」とみなして従来の検査を維持する
+/// （`th` は常に `DataLeafKind::TableCell` のため data_leaf は固定値でよい）。
+fn expand_header_cells(node: &Node) -> Node {
+    let mut out = node.clone();
+    out.children = node.children.iter().map(expand_header_cells).collect();
+    if let Some(table) = &node.table {
+        for h in &table.header {
+            out.children.push(
+                Node::new(h.role.clone(), h.name.clone())
+                    .with_ref(h.r#ref.clone())
+                    .with_data_leaf(DataLeafKind::TableCell),
+            );
+        }
+    }
+    out
+}
+
 fn snap(doc: &Document) -> Snapshot {
-    build_snapshot(doc).expect("フィクスチャの構築は成功する")
+    let s = build_snapshot(doc).expect("フィクスチャの構築は成功する");
+    let truncated = s.truncated;
+    Snapshot::new(expand_header_cells(&s.tree)).with_truncated(truncated)
 }
 
 /// 先行順（明示スタックの反復）で全ノードを列挙する。
@@ -242,7 +266,17 @@ fn map_to_snapshot<'a>(doc: &Document, snapshot: &'a Snapshot, target: NodeId) -
         cur = parent;
     }
     let mut node = &snapshot.tree;
-    for idx in path.iter().rev() {
+    let mut steps = path.iter().rev();
+    while let Some(idx) = steps.next() {
+        if node.table.is_some() {
+            // 圧縮した表: 残りの経路（thead/tr/th）は最後の添字（列位置）のヘッダセルへ畳む。
+            let col = steps.next_back().unwrap_or(idx);
+            node = node
+                .children
+                .get(*col)
+                .expect("列位置に対応するヘッダセルがある");
+            break;
+        }
         node = node
             .children
             .get(*idx)
@@ -280,9 +314,19 @@ fn first_path(root: &Node, pred: fn(&Node) -> bool) -> Option<Vec<usize>> {
 }
 
 /// Snapshot 上の添字列を DOM へ逆引きする（`map_to_snapshot` の逆。フィクスチャ制約が前提）。
-fn dom_at_path(doc: &Document, path: &[usize]) -> Option<NodeId> {
+fn dom_at_path(doc: &Document, snapshot: &Snapshot, path: &[usize]) -> Option<NodeId> {
     let mut cur = doc.root();
+    let mut vnode = &snapshot.tree;
     for idx in path {
+        if vnode.table.is_some() {
+            // 圧縮した表のヘッダセル（仮想子ノード）: 列位置の th を文書順で逆引きする。
+            let th = doc
+                .descendants(cur)
+                .filter(|d| doc.local_name(*d) == Some("th"))
+                .nth(*idx)?;
+            return Some(th);
+        }
+        vnode = vnode.children.get(*idx)?;
         cur = doc
             .children(cur)
             .filter(|c| is_snapshot_child(doc, *c))
@@ -328,7 +372,7 @@ fn evaluate(task: &Task) -> Outcome {
             return Outcome::ValueMismatch(name.to_string());
         }
         let actual = first_path(&snapshot.tree, task.predicate)
-            .and_then(|path| dom_at_path(&doc, &path))
+            .and_then(|path| dom_at_path(&doc, &snapshot, &path))
             .and_then(|id| doc.text_content(id))
             .unwrap_or_default();
         if actual != expected {
