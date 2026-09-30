@@ -29,7 +29,8 @@
 //! [`verify_port_owner`]。TASK-84.6・Issue #559）もここに置く。OS 別の実照会は
 //! `measure.rs` の `lookup_port_owner_pids` が担い、Linux は実装済み
 //! （TASK-84.6.2・#560。`/proc` の解析部 [`proc_net_tcp_listen_inode`] 等を
-//! 本ファイルに置く）、macOS（#561）・Windows（#562）は未対応。
+//! 本ファイルに置く）、macOS は実装済み（TASK-84.6.3・#561。`lsof` の出力解析部
+//! [`parse_lsof_listen_pids`] を本ファイルに置く）、Windows（#562）は未対応。
 //!
 //! `AISNAP-1`（MCP トークン削減率）計測は、任意の外部 URL ではなく、
 //! リポジトリに同梱した静的 fixture（外部参照を含まない自作コンテンツ。
@@ -313,7 +314,7 @@ const READINESS_RESPONSE_FIELDS: &[&str] = &[
 /// 非依存にソケットの所有プロセスを調べる手段が無く、`unsafe`・新規
 /// 依存なしでは実装しない）。ポートの所有 PID の確認は別途
 /// [`verify_port_owner`]（TASK-84.6。OS 別の実照会は Linux のみ実装済み。
-/// macOS #561・Windows #562 は未対応）が担い、
+/// Windows #562 は未対応。Linux・macOS は実装済み）が担い、
 /// 本関数の本文形チェックはそれと併用する前段の足切りである。
 pub fn looks_like_browser_readiness_response(body: &str) -> bool {
     let Ok(JsonValue::Object(fields)) = parse_json(body) else {
@@ -1380,6 +1381,71 @@ pub fn parse_socket_link_inode(link: &str) -> Option<u64> {
         .ok()
 }
 
+/// `lsof -nP -iTCP:<port> -sTCP:LISTEN -Fpn` の出力から、`port` の LISTEN
+/// ソケットを持つ PID を返す（TASK-84.6.3・#561。`measure.rs` の macOS 版
+/// `lookup_port_owner_pids` が呼ぶ。`PERF-3`/`PERF-6`）。
+///
+/// `-F` 出力は 1 行 1 フィールド（先頭 1 文字が ID）で、`p<pid>` がプロセス
+/// セットの開始、`f<fd>` はファイル記述子、`n<name>` がアドレス
+/// （`127.0.0.1:9222`・`*:9222`・`[::1]:9222` 等）。契約:
+/// - アドレスは 127.0.0.1 宛ての probe に応答し得るもの（`*`・`127.0.0.1`・
+///   `[::ffff:127.0.0.1]`・`[::]`）だけを所有者に数える（Linux 版
+///   [`proc_net_tcp_listen_inode`] と同じ方針。多めに数えても `Mismatch` が
+///   増えるだけで安全側）。`[::1]` や他の IP は対象外
+/// - 接続済みソケット（`->` を含む）・別ポートの行は読み飛ばす
+/// - 形式不正（PID 非数値・0、`p` より前の `n`、`HOST:PORT` でない値）は
+///   `Err`。黙って読み飛ばさず fail-closed にする
+/// - 所有 PID は重複なし・出現順。`max_pids` 超過も `Err`（黙って切り捨てない）
+///
+/// 本体は cfg で落とさない（ユニットテストを 3 OS で実行するため）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn parse_lsof_listen_pids(out: &str, port: u16, max_pids: usize) -> Result<Vec<u32>, String> {
+    let mut pids: Vec<u32> = Vec::new();
+    let mut current: Option<u32> = None;
+    for line in out.lines() {
+        let mut chars = line.chars();
+        let Some(id) = chars.next() else { continue };
+        let value = line.get(id.len_utf8()..).unwrap_or("");
+        match id {
+            'p' => {
+                let pid: u32 = value
+                    .parse()
+                    .map_err(|_| format!("invalid pid in lsof output: {value:?}"))?;
+                if pid == 0 {
+                    return Err("pid 0 in lsof output".to_string());
+                }
+                current = Some(pid);
+            }
+            'n' => {
+                let Some(pid) = current else {
+                    return Err(format!("lsof name field before pid: {value:?}"));
+                };
+                if value.contains("->") {
+                    continue;
+                }
+                let Some((host, port_text)) = value.rsplit_once(':') else {
+                    return Err(format!("lsof name is not HOST:PORT: {value:?}"));
+                };
+                let line_port: u16 = port_text
+                    .parse()
+                    .map_err(|_| format!("invalid port in lsof name: {value:?}"))?;
+                if line_port != port {
+                    continue;
+                }
+                let reachable = matches!(host, "*" | "127.0.0.1" | "[::ffff:127.0.0.1]" | "[::]");
+                if reachable && !pids.contains(&pid) {
+                    if pids.len() >= max_pids {
+                        return Err(format!("more than {max_pids} processes own the port"));
+                    }
+                    pids.push(pid);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(pids)
+}
+
 /// ポートの所有 PID（`owner_pids`）がすべて、起動した子プロセスツリー
 /// （`candidate_pids`）に含まれるかを判定する純粋関数（TASK-84.6・
 /// `PERF-3`/`PERF-6`）。
@@ -1397,7 +1463,7 @@ pub fn parse_socket_link_inode(link: &str) -> Option<u64> {
 /// `contains` の線形比較のみを行う（添字アクセスなし）。
 /// `reprobe_after_kill`（事後確認）との役割分担は [`port_conflict_error`]
 /// を参照（本関数は事前ゲート、あちらは所有者確認が未対応の OS
-/// （macOS・Windows）での唯一の防御として併用する）。
+/// （Windows）での唯一の防御として併用する）。
 pub fn verify_port_owner(
     port: u16,
     root_pid: u32,
@@ -1439,7 +1505,7 @@ pub fn verify_port_owner(
 /// なら計測を `Error` として扱うべき理由文字列を返す。
 ///
 /// 役割分担（TASK-84.6）: 事前ゲートの [`verify_port_owner`]（readiness
-/// 成功時にポートの所有 PID を確認。Linux は実装済み（#560）で、macOS #561・
+/// 成功時にポートの所有 PID を確認。Linux・macOS は実装済み（#560・#561）で、
 /// Windows #562 は未対応）と本事後確認は併用する。本確認は所有者確認が未対応の
 /// OS での唯一の防御であり、所有者確認の後に割り込んだプロセスや居残りも検出する。
 ///
@@ -4368,5 +4434,44 @@ mod tests {
             normalize_timeout_error(err).kind(),
             std::io::ErrorKind::ConnectionReset
         );
+    }
+
+    // PERF-3/PERF-6（TASK-84.6.3・#561）: lsof -F pn 出力の解析。
+    #[test]
+    fn perf3_parse_lsof_listen_pids_accepts_reachable_addresses() {
+        let out = "p123\nf5\nn127.0.0.1:9222\np456\nf6\nn*:9222\np789\nf7\nn[::]:9222\np10\nf8\nn[::ffff:127.0.0.1]:9222\n";
+        assert_eq!(
+            parse_lsof_listen_pids(out, 9222, 64),
+            Ok(vec![123, 456, 789, 10])
+        );
+    }
+
+    #[test]
+    fn perf3_parse_lsof_listen_pids_ignores_unreachable_and_other_ports() {
+        let out = "p1\nf5\nn[::1]:9222\np2\nf5\nn192.168.0.2:9222\np3\nf5\nn127.0.0.1:1111\np4\nf5\nn127.0.0.1:9222->127.0.0.1:5000\n";
+        assert_eq!(parse_lsof_listen_pids(out, 9222, 64), Ok(vec![]));
+        assert_eq!(parse_lsof_listen_pids("", 9222, 64), Ok(vec![]));
+    }
+
+    #[test]
+    fn perf3_parse_lsof_listen_pids_dedups_same_pid() {
+        let out = "p7\nf5\nn127.0.0.1:9222\nf6\nn[::]:9222\n";
+        assert_eq!(parse_lsof_listen_pids(out, 9222, 64), Ok(vec![7]));
+    }
+
+    #[test]
+    fn perf3_parse_lsof_listen_pids_rejects_malformed_output() {
+        assert!(parse_lsof_listen_pids("n127.0.0.1:9222\n", 9222, 64).is_err());
+        assert!(parse_lsof_listen_pids("pabc\n", 9222, 64).is_err());
+        assert!(parse_lsof_listen_pids("p0\n", 9222, 64).is_err());
+        assert!(parse_lsof_listen_pids("p1\nnnocolon\n", 9222, 64).is_err());
+        assert!(parse_lsof_listen_pids("p1\nn127.0.0.1:xyz\n", 9222, 64).is_err());
+    }
+
+    #[test]
+    fn perf3_parse_lsof_listen_pids_rejects_too_many_owners() {
+        let out = "p1\nn*:9222\np2\nn*:9222\np3\nn*:9222\n";
+        assert_eq!(parse_lsof_listen_pids(out, 9222, 3), Ok(vec![1, 2, 3]));
+        assert!(parse_lsof_listen_pids(out, 9222, 2).is_err());
     }
 }

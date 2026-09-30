@@ -14,8 +14,9 @@
 //! ポート所有者確認（TASK-84.6・Issue #559）: readiness 成功時に、probe した
 //! ポートの所有 PID が起動した子プロセスツリーに含まれるかを
 //! [`check_port_owner`] で確認する事前ゲートを持つ。OS 別の実照会のうち
-//! Linux は実装済み（TASK-84.6.2・#560。`/proc` を std だけで読む）。
-//! macOS（#561）・Windows（#562）は未実装で「未対応」を返し、従来どおり
+//! Linux は実装済み（TASK-84.6.2・#560。`/proc` を std だけで読む）、macOS も
+//! 実装済み（TASK-84.6.3・#561。`lsof` の出力を解析する）。
+//! Windows（#562）は未実装で「未対応」を返し、従来どおり
 //! 事後確認（[`reprobe_after_kill`]）だけに頼る（併用方針）。
 //!
 //! 対応ビヘイビア: バイナリサイズ計測が使う `PERF-1`、cold start 計測が使う
@@ -61,6 +62,8 @@ use crate::support::{
 #[cfg(unix)]
 use crate::support::parse_pgrep_pids;
 // Linux 版 `lookup_port_owner_pids` の `/proc` 解析部（TASK-84.6.2・#560）。
+#[cfg(target_os = "macos")]
+use crate::support::parse_lsof_listen_pids;
 #[cfg(windows)]
 use crate::support::parse_tasklist_mem_kb;
 #[cfg(target_os = "linux")]
@@ -504,8 +507,8 @@ impl Drop for ChildGuard {
 /// 「応答しているのが自分の子プロセスらしいか」を検証する
 /// （[`looks_like_browser_readiness_response`]・`Child::try_wait` 参照）。
 /// さらに readiness 成功時に [`check_port_owner`]（TASK-84.6）でポートの
-/// 所有 PID が子プロセスツリー内かを確認する（Linux は実装済み #560。
-/// macOS #561・Windows #562 は未対応）。
+/// 所有 PID が子プロセスツリー内かを確認する（Linux・macOS は実装済み
+/// #560・#561。Windows #562 は未対応）。
 fn reserve_port() -> Result<u16, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind failed: {e}"))?;
     listener
@@ -531,7 +534,7 @@ fn reserve_port() -> Result<u16, String> {
 /// 一致しない・見つからない・照会に失敗した場合は `Err` を返し、呼び出し元
 /// の計測を `Outcome::Error` にする。`check_port_owner` の照会時間を
 /// cold start（`PERF-3`）へ混ぜないため、経過時間は照会の前に確定させる。
-/// 所有者確認が未対応の OS（macOS・Windows。Linux は実装済み）では stderr に
+/// 所有者確認が未対応の OS（Windows。Linux・macOS は実装済み）では stderr に
 /// 1 回だけ注記を出し、事後確認
 /// （[`reprobe_after_kill`]）だけに頼る。
 fn spawn_and_wait_ready(
@@ -669,7 +672,7 @@ pub(crate) enum PortOwnerVerdict {
 /// は置き換えず併用する: 本関数が未対応の OS での唯一の防御になり、確認後に
 /// 割り込んだプロセスや居残りも事後確認が検出する。
 ///
-/// Linux は実装済み（#560）。外部コマンドを使う OS 別実装（#561・#562）は、
+/// Linux（#560）・macOS（#561）は実装済み。外部コマンドを使う OS 別実装（macOS #561・Windows #562）は、
 /// `Command::new` と分割済みの固定引数だけを使いシェルを通さない・出力バイト数/行数/PID 数を上限で縛る・
 /// `get()` と checked 演算を使い `[]`/`unwrap` を使わない・
 /// `run_with_deadline`/`EXTERNAL_COMMAND_DEADLINE` で期限を付ける、を守る。
@@ -689,17 +692,80 @@ pub(crate) fn check_port_owner(
 /// 起動した対象プロセスの PID。Linux 版が祖先関係の判定範囲に使う）。
 /// `Ok(None)` は「この OS では未対応」（確認済みではない）。
 ///
-/// 非 Linux 版のスタブ（TASK-84.6.1）: macOS（#561）が
-/// `lsof -nP -iTCP:<port> -sTCP:LISTEN -Fp`、Windows（#562）が
-/// `netstat -ano -p TCP` で実装するまで `Ok(None)` を返す。照合対象は
-/// 127.0.0.1 / 0.0.0.0 の LISTEN（IPv6 の扱いは各 issue で決める）。
+/// Linux・macOS 以外（実質 Windows）版のスタブ（TASK-84.6.1）: Windows
+/// （#562）が `netstat -ano -p TCP` で実装するまで `Ok(None)` を返す。
+/// 照合対象は 127.0.0.1 / 0.0.0.0 の LISTEN（IPv6 の扱いは #562 で決める）。
 /// 照会失敗は [`PortOwnerError::LookupFailed`] で返す。
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn lookup_port_owner_pids(
     _root_pid: u32,
     _port: u16,
 ) -> Result<Option<Vec<u32>>, PortOwnerError> {
     Ok(None)
+}
+
+/// macOS 版が読む `lsof` 出力の上限バイト数。到達したら切り捨ての可能性が
+/// あるため `LookupFailed` にする（`run_capturing_output_with_deadline` は
+/// 黙って切り詰めるので呼び出し側で検出する）。
+#[cfg(target_os = "macos")]
+const MAX_LSOF_OUTPUT_BYTES: usize = 16 * 1024;
+
+/// macOS 版が受け付ける所有 PID 数の上限。超過は `LookupFailed`。
+#[cfg(target_os = "macos")]
+const MAX_PORT_OWNER_PIDS: usize = 64;
+
+/// macOS 版（TASK-84.6.3・#561。`PERF-3`/`PERF-6`）: `lsof -nP -iTCP:<port>
+/// -sTCP:LISTEN -Fpn` で LISTEN 所有 PID を照会する。[`check_port_owner`]
+/// から readiness 成功時に呼ばれ、出力は support の
+/// [`parse_lsof_listen_pids`] が解析する。
+///
+/// `unsafe`（libproc FFI）・新規依存を避けるため外部コマンド方式とし、
+/// `Command::new` と固定引数でシェルを通さず、期限
+/// （`EXTERNAL_COMMAND_DEADLINE`）と出力上限を付ける。fail-closed:
+/// 起動失敗・期限超過・出力上限到達・不正 UTF-8・形式不正・想定外の終了
+/// コードは `LookupFailed`。終了コード 1 かつ出力なしは「該当なし」で
+/// `Ok(Some(空))`（後段が `NoOwnerFound` にする）。
+///
+/// 既知の限界: 非特権の `lsof` は他ユーザーのプロセスの fd を見られない。
+/// 他ユーザーのプロセスが同ソケットを保持していても検出できないが、
+/// `reprobe_after_kill`（事後確認）の併用が補う（Linux 版の fd 受け渡しと同様）。
+#[cfg(target_os = "macos")]
+pub(crate) fn lookup_port_owner_pids(
+    _root_pid: u32,
+    port: u16,
+) -> Result<Option<Vec<u32>>, PortOwnerError> {
+    let lookup_failed = |reason: String| PortOwnerError::LookupFailed { port, reason };
+    let mut command = Command::new("lsof");
+    command.args([
+        "-nP",
+        "-w",
+        &format!("-iTCP:{port}"),
+        "-sTCP:LISTEN",
+        "-Fpn",
+    ]);
+    let (status, stdout) = crate::support::run_capturing_output_with_deadline(
+        command,
+        crate::support::EXTERNAL_COMMAND_DEADLINE,
+        MAX_LSOF_OUTPUT_BYTES,
+    )
+    .map_err(|e| lookup_failed(format!("failed to run lsof: {e}")))?;
+    if stdout.len() >= MAX_LSOF_OUTPUT_BYTES {
+        return Err(lookup_failed(format!(
+            "lsof output reached {MAX_LSOF_OUTPUT_BYTES} bytes and may be truncated"
+        )));
+    }
+    if !status.success() {
+        return if status.code() == Some(1) && stdout.is_empty() {
+            Ok(Some(Vec::new()))
+        } else {
+            Err(lookup_failed(format!("lsof exited with status {status}")))
+        };
+    }
+    let text = String::from_utf8(stdout)
+        .map_err(|_| lookup_failed("lsof output is not valid UTF-8".to_string()))?;
+    parse_lsof_listen_pids(&text, port, MAX_PORT_OWNER_PIDS)
+        .map(Some)
+        .map_err(|e| lookup_failed(format!("failed to parse lsof output: {e}")))
 }
 
 /// Linux 版が集める LISTEN inode 数の上限（coding-rust.md「件数を上限検証」）。
@@ -1038,7 +1104,7 @@ const PORT_CONFLICT_REPROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// - 対象が孫プロセス以降を起動していた場合、`ChildGuard`/
 ///   `kill_process_group` の `wait` は直接の子までしか保証しない
 /// - 所有者の PID 確認（`check_port_owner`）は Linux のみ実装済み（#560）。
-///   macOS #561・Windows #562 は入るまで行われない
+///   Windows #562 は入るまで行われない
 ///
 /// 役割分担（TASK-84.6）: 事前ゲートの [`check_port_owner`]（ポートの所有
 /// PID 確認）とは置き換えずに併用する。事前ゲートが未対応の OS では本関数が

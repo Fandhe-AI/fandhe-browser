@@ -28,7 +28,9 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
   子プロセスツリー内かを readiness 成功時に確認する共通インターフェース
   （`check_port_owner`）を持つ。Linux は実装済み（TASK-84.6.2・Issue #560。
   `/proc/net/tcp{,6}` の LISTEN inode と `/proc/<pid>/fd` の `socket:[inode]`
-  を突き合わせる）。macOS（#561）・Windows（#562）は未実装で「未対応」として
+  を突き合わせる）。macOS も実装済み（TASK-84.6.3・Issue #561。
+  `lsof -nP -iTCP:<port> -sTCP:LISTEN -Fpn` の PID と子プロセスツリーを突き合わせる）。
+  Windows（#562）は未実装で「未対応」として
   従来の事後確認（`reprobe_after_kill`）だけに頼る（両者は併用する設計）
 
 ## 運用（ローカルでの実測・記録）
