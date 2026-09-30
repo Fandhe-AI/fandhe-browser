@@ -25,6 +25,13 @@
 //! 検証する（外部プロセス起動を伴うが、対象バイナリではなく OS 標準の
 //! シェルのみを使うため、依存関係は増えない）。
 //!
+//! ポート所有者確認の共通型・判定ロジック（[`PortOwnerError`]・
+//! [`verify_port_owner`]。TASK-84.6・Issue #559）もここに置く。OS 別の実照会は
+//! `measure.rs` の `lookup_port_owner_pids` が担い、Linux は実装済み
+//! （TASK-84.6.2・#560。`/proc` の解析部 [`proc_net_tcp_listen_inode`] 等を
+//! 本ファイルに置く）、macOS は実装済み（TASK-84.6.3・#561。`lsof` の出力解析部
+//! [`parse_lsof_listen_pids`] を本ファイルに置く）、Windows（#562）は未対応。
+//!
 //! `AISNAP-1`（MCP トークン削減率）計測は、任意の外部 URL ではなく、
 //! リポジトリに同梱した静的 fixture（外部参照を含まない自作コンテンツ。
 //! [`FIXTURE_TABLE`]）だけを対象にする。計測対象ブラウザは接続時に名前を
@@ -305,7 +312,10 @@ const READINESS_RESPONSE_FIELDS: &[&str] = &[
 /// 確認と組み合わせた best-effort。完全な防止には子プロセスが実際に
 /// そのポートを bind していることの確認が要るが、std だけでは OS
 /// 非依存にソケットの所有プロセスを調べる手段が無く、`unsafe`・新規
-/// 依存なしでは実装しない）。
+/// 依存なしでは実装しない）。ポートの所有 PID の確認は別途
+/// [`verify_port_owner`]（TASK-84.6。OS 別の実照会は Linux のみ実装済み。
+/// Windows #562 は未対応。Linux・macOS は実装済み）が担い、
+/// 本関数の本文形チェックはそれと併用する前段の足切りである。
 pub fn looks_like_browser_readiness_response(body: &str) -> bool {
     let Ok(JsonValue::Object(fields)) = parse_json(body) else {
         return false;
@@ -1238,6 +1248,248 @@ pub fn kill_process_group(pid: u32) -> Result<(), String> {
     exit_status_to_result(status)
 }
 
+/// ポート所有者確認（TASK-84.6・`PERF-3`/`PERF-6`）が失敗した理由。
+///
+/// `measure.rs` の `check_port_owner` が返す。どの variant も「この試行の
+/// 計測値を採用しない」を意味し、呼び出し元 `spawn_and_wait_ready` が
+/// `Err` へ変換して試行を `Outcome::Error` にする（fail-closed）。将来
+/// 理由が増えても呼び出し側を壊さないよう列挙型にしている（REPAIR-4）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortOwnerError {
+    /// probe したポートで LISTEN しているソケットの所有者が見つからない
+    /// （測定対象外のプロセスが所有していて見えない場合を含む）。
+    NoOwnerFound { port: u16 },
+    /// 所有者の中に、起動した子プロセスツリーへ含まれない PID がある。
+    Mismatch {
+        port: u16,
+        root_pid: u32,
+        foreign_pids: Vec<u32>,
+    },
+    /// OS 側の照会が失敗した（外部コマンドの起動失敗・非 0 終了・パース不能・
+    /// 上限超過・プロセスツリー走査失敗）。
+    LookupFailed { port: u16, reason: String },
+}
+
+impl std::fmt::Display for PortOwnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoOwnerFound { port } => {
+                write!(f, "port owner not found for port {port}")
+            }
+            Self::Mismatch {
+                port,
+                root_pid,
+                foreign_pids,
+            } => write!(
+                f,
+                "port owner mismatch on port {port}: pids {foreign_pids:?} are outside the process tree of pid {root_pid}"
+            ),
+            Self::LookupFailed { port, reason } => {
+                write!(f, "port owner lookup failed for port {port}: {reason}")
+            }
+        }
+    }
+}
+
+/// `/proc/net/tcp{,6}` のアドレス欄（`%08X` の連結。v4 は 8 桁・v6 は 32 桁）を
+/// [`std::net::IpAddr`] へ復号する（TASK-84.6.2・#560）。
+///
+/// カーネルは `__be32` をネイティブバイト順の `%08X` で出力するため、32 bit
+/// ワードごとに `to_ne_bytes` で並べ直す（x86/aarch64 では 127.0.0.1 が
+/// `0100007F`）。長さ不正・非 hex は `None`。スライスは `get()` で取る。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn parse_proc_net_hex_addr(hex: &str) -> Option<std::net::IpAddr> {
+    if !hex.is_ascii() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(16);
+    let mut i = 0;
+    while i < hex.len() {
+        let word = u32::from_str_radix(hex.get(i..i.checked_add(8)?)?, 16).ok()?;
+        bytes.extend_from_slice(&word.to_ne_bytes());
+        i = i.checked_add(8)?;
+    }
+    match bytes.len() {
+        4 => {
+            let octets: [u8; 4] = bytes.as_slice().try_into().ok()?;
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)))
+        }
+        16 => {
+            let octets: [u8; 16] = bytes.as_slice().try_into().ok()?;
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
+}
+
+/// `/proc/net/tcp{,6}` の 1 行から、`port` の LISTEN ソケットの inode を返す
+/// （TASK-84.6.2・#560。`measure.rs` の Linux 版 `lookup_port_owner_pids` が
+/// 行ごとに呼ぶ）。
+///
+/// - ヘッダ行（先頭トークン `sl`）・空行・LISTEN 以外・別ポート・inode 0 は
+///   `Ok(None)`
+/// - 形式不正（フィールド不足・`ADDR:PORT` でない・hex 不正・inode 非数値）は
+///   `Err(理由)`。黙って読み飛ばさず fail-closed にする
+/// - アドレスは 127.0.0.1 宛ての probe に応答し得るもの（v4: `127.0.0.1`・
+///   `0.0.0.0`、v6: `::`・`::ffff:127.0.0.1`）だけを受け付ける。多めに含めても
+///   `Mismatch` が増えるだけで安全側だが、取りこぼすと誤って `Verified` を返す
+///   恐れがある。`::` は `IPV6_V6ONLY` で v4 を受けない場合も含めるが、多めに
+///   含める側なので安全
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn proc_net_tcp_listen_inode(line: &str, port: u16) -> Result<Option<u64>, String> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    match fields.first() {
+        None | Some(&"sl") => return Ok(None),
+        Some(_) => {}
+    }
+    let (Some(local), Some(state), Some(inode_text)) =
+        (fields.get(1), fields.get(3), fields.get(9))
+    else {
+        return Err(format!("too few fields in /proc/net/tcp line: {line:?}"));
+    };
+    let Some((addr_hex, port_hex)) = local.split_once(':') else {
+        return Err(format!("local address is not ADDR:PORT: {local:?}"));
+    };
+    let line_port =
+        u16::from_str_radix(port_hex, 16).map_err(|_| format!("invalid port hex: {port_hex:?}"))?;
+    let addr = parse_proc_net_hex_addr(addr_hex)
+        .ok_or_else(|| format!("invalid address hex: {addr_hex:?}"))?;
+    let inode: u64 = inode_text
+        .parse()
+        .map_err(|_| format!("invalid inode: {inode_text:?}"))?;
+    if *state != "0A" || line_port != port || inode == 0 {
+        return Ok(None);
+    }
+    let reachable = match addr {
+        IpAddr::V4(a) => a == Ipv4Addr::LOCALHOST || a == Ipv4Addr::UNSPECIFIED,
+        IpAddr::V6(a) => {
+            a == Ipv6Addr::UNSPECIFIED || a.to_ipv4_mapped() == Some(Ipv4Addr::LOCALHOST)
+        }
+    };
+    Ok(reachable.then_some(inode))
+}
+
+/// `/proc/<pid>/fd/<n>` の `read_link` 結果（`socket:[12345]`）から inode を
+/// 取り出す（TASK-84.6.2・#560）。ソケット以外（`pipe:[1]`・パス等）や
+/// 数値でない値は `None`。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn parse_socket_link_inode(link: &str) -> Option<u64> {
+    link.strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+/// `lsof -a -nP -w -iTCP:<port> -sTCP:LISTEN -Fpn` の出力から、`port` の LISTEN
+/// ソケットを持つ PID を返す（TASK-84.6.3・#561。`measure.rs` の macOS 版
+/// `lookup_port_owner_pids` が呼ぶ。`PERF-3`/`PERF-6`）。
+///
+/// `-F` 出力は 1 行 1 フィールド（先頭 1 文字が ID）で、`p<pid>` がプロセス
+/// セットの開始、`f<fd>` はファイル記述子、`n<name>` がアドレス
+/// （`127.0.0.1:9222`・`*:9222`・`[::1]:9222` 等）。契約:
+/// - アドレスは 127.0.0.1 宛ての probe に応答し得るもの（`*`・`127.0.0.1`・
+///   `[::ffff:127.0.0.1]`・`[::]`）だけを所有者に数える（Linux 版
+///   [`proc_net_tcp_listen_inode`] と同じ方針。多めに数えても `Mismatch` が
+///   増えるだけで安全側）。`[::1]` や他の IP は対象外
+/// - 接続済みソケット（`->` を含む）・別ポートの行は読み飛ばす
+/// - 形式不正（PID 非数値・0、`p` より前の `n`、`HOST:PORT` でない値）は
+///   `Err`。黙って読み飛ばさず fail-closed にする
+/// - 所有 PID は重複なし・出現順。`max_pids` 超過も `Err`（黙って切り捨てない）
+///
+/// 本体は cfg で落とさない（ユニットテストを 3 OS で実行するため）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn parse_lsof_listen_pids(out: &str, port: u16, max_pids: usize) -> Result<Vec<u32>, String> {
+    let mut pids: Vec<u32> = Vec::new();
+    let mut current: Option<u32> = None;
+    for line in out.lines() {
+        let mut chars = line.chars();
+        let Some(id) = chars.next() else { continue };
+        let value = line.get(id.len_utf8()..).unwrap_or("");
+        match id {
+            'p' => {
+                let pid: u32 = value
+                    .parse()
+                    .map_err(|_| format!("invalid pid in lsof output: {value:?}"))?;
+                if pid == 0 {
+                    return Err("pid 0 in lsof output".to_string());
+                }
+                current = Some(pid);
+            }
+            'n' => {
+                let Some(pid) = current else {
+                    return Err(format!("lsof name field before pid: {value:?}"));
+                };
+                if value.contains("->") {
+                    continue;
+                }
+                let Some((host, port_text)) = value.rsplit_once(':') else {
+                    return Err(format!("lsof name is not HOST:PORT: {value:?}"));
+                };
+                let line_port: u16 = port_text
+                    .parse()
+                    .map_err(|_| format!("invalid port in lsof name: {value:?}"))?;
+                if line_port != port {
+                    continue;
+                }
+                let reachable = matches!(host, "*" | "127.0.0.1" | "[::ffff:127.0.0.1]" | "[::]");
+                if reachable && !pids.contains(&pid) {
+                    if pids.len() >= max_pids {
+                        return Err(format!("more than {max_pids} processes own the port"));
+                    }
+                    pids.push(pid);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(pids)
+}
+
+/// ポートの所有 PID（`owner_pids`）がすべて、起動した子プロセスツリー
+/// （`candidate_pids`）に含まれるかを判定する純粋関数（TASK-84.6・
+/// `PERF-3`/`PERF-6`）。
+///
+/// `measure.rs` の `check_port_owner` が、OS 別の照会結果
+/// （`lookup_port_owner_pids`）とツリー走査結果を渡して呼ぶ。契約:
+/// - `owner_pids` が空なら [`PortOwnerError::NoOwnerFound`]
+/// - `owner_pids` の全員が `candidate_pids` に含まれるときだけ `Ok(())`。
+///   fork したワーカーはリッスンソケットを継承し得るため、外部の PID が
+///   1 つでもあれば拒否する
+/// - 不一致なら [`PortOwnerError::Mismatch`]。`foreign_pids` は候補外の
+///   PID だけを重複なしで、出現順に保持する
+///
+/// 件数は呼び出し側（照会・ツリー走査）が上限で縛る前提で、本関数は
+/// `contains` の線形比較のみを行う（添字アクセスなし）。
+/// `reprobe_after_kill`（事後確認）との役割分担は [`port_conflict_error`]
+/// を参照（本関数は事前ゲート、あちらは所有者確認が未対応の OS
+/// （Windows）での唯一の防御として併用する）。
+pub fn verify_port_owner(
+    port: u16,
+    root_pid: u32,
+    owner_pids: &[u32],
+    candidate_pids: &[u32],
+) -> Result<(), PortOwnerError> {
+    if owner_pids.is_empty() {
+        return Err(PortOwnerError::NoOwnerFound { port });
+    }
+    let mut foreign_pids: Vec<u32> = Vec::new();
+    for pid in owner_pids {
+        if !candidate_pids.contains(pid) && !foreign_pids.contains(pid) {
+            foreign_pids.push(*pid);
+        }
+    }
+    if foreign_pids.is_empty() {
+        Ok(())
+    } else {
+        Err(PortOwnerError::Mismatch {
+            port,
+            root_pid,
+            foreign_pids,
+        })
+    }
+}
+
 /// `spawn_and_wait_ready`（`measure.rs`）の 1 試行後、対象
 /// プロセス（グループ）を kill し `wait` で終了を確認したあと、同じポート
 /// へ短い期限で再接続を試みた結果から、その試行を計測値としてそのまま
@@ -1251,6 +1503,11 @@ pub fn kill_process_group(pid: u32) -> Result<(), String> {
 /// を事後確認する（post-hoc な所有権確認）。この関数はその確認結果
 /// （`reprobe_still_responds`）だけを受け取り、`true`（まだ応答がある）
 /// なら計測を `Error` として扱うべき理由文字列を返す。
+///
+/// 役割分担（TASK-84.6）: 事前ゲートの [`verify_port_owner`]（readiness
+/// 成功時にポートの所有 PID を確認。Linux・macOS は実装済み（#560・#561）で、
+/// Windows #562 は未対応）と本事後確認は併用する。本確認は所有者確認が未対応の
+/// OS での唯一の防御であり、所有者確認の後に割り込んだプロセスや居残りも検出する。
 ///
 /// 限界（呼び出し元 `measure.rs` の `reprobe_after_kill` の
 /// ドキュメントにも記載）: (1) kill から再接続までの間に別のプロセスが
@@ -1956,6 +2213,191 @@ fn parse_object(
 
 #[cfg(test)]
 mod tests {
+    // PERF-3/PERF-6: /proc/net/tcp の hex 復号（エンディアン非依存に期待値を作る）。
+    #[test]
+    fn perf3_parse_proc_net_hex_addr_decodes_v4_and_v6() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let v4 = |o: [u8; 4]| format!("{:08X}", u32::from_ne_bytes(o));
+        assert_eq!(
+            parse_proc_net_hex_addr(&v4([127, 0, 0, 1])),
+            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+        );
+        assert_eq!(
+            parse_proc_net_hex_addr("00000000"),
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        );
+        assert_eq!(
+            parse_proc_net_hex_addr(&"0".repeat(32)),
+            Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+        );
+        let mapped = format!(
+            "{:08X}{:08X}{:08X}{}",
+            0,
+            0,
+            u32::from_ne_bytes([0, 0, 0xFF, 0xFF]),
+            v4([127, 0, 0, 1])
+        );
+        assert_eq!(
+            parse_proc_net_hex_addr(&mapped),
+            Some(IpAddr::V6(Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped()))
+        );
+        assert_eq!(parse_proc_net_hex_addr("0100"), None);
+        assert_eq!(parse_proc_net_hex_addr("0100007"), None);
+        assert_eq!(parse_proc_net_hex_addr("ZZZZZZZZ"), None);
+        assert_eq!(parse_proc_net_hex_addr(""), None);
+    }
+
+    #[allow(dead_code)] // bench ターゲットは #[test] を除外してコンパイルされるため
+    fn proc_line(addr_hex: &str, port: u16, st: &str, inode: &str) -> String {
+        format!(
+            "   0: {addr_hex}:{port:04X} 00000000:0000 {st} 00000000:00000000 00:00000000 00000000  1000        0 {inode} 1 0000000000000000 100 0 0 10 0"
+        )
+    }
+
+    #[test]
+    fn perf3_proc_net_tcp_listen_inode_filters_lines() {
+        let lo = format!("{:08X}", u32::from_ne_bytes([127, 0, 0, 1]));
+        let ext = format!("{:08X}", u32::from_ne_bytes([192, 168, 1, 5]));
+        let any6 = "0".repeat(32);
+        let mapped = format!(
+            "{:08X}{:08X}{:08X}{}",
+            0,
+            0,
+            u32::from_ne_bytes([0, 0, 0xFF, 0xFF]),
+            lo
+        );
+        assert_eq!(
+            proc_net_tcp_listen_inode("  sl  local_address rem_address   st tx_queue", 9222),
+            Ok(None)
+        );
+        assert_eq!(proc_net_tcp_listen_inode("", 9222), Ok(None));
+        assert_eq!(
+            proc_net_tcp_listen_inode(&proc_line(&lo, 9222, "0A", "12345"), 9222),
+            Ok(Some(12345))
+        );
+        assert_eq!(
+            proc_net_tcp_listen_inode(&proc_line("00000000", 9222, "0A", "12345"), 9222),
+            Ok(Some(12345))
+        );
+        assert_eq!(
+            proc_net_tcp_listen_inode(&proc_line(&any6, 9222, "0A", "777"), 9222),
+            Ok(Some(777))
+        );
+        assert_eq!(
+            proc_net_tcp_listen_inode(&proc_line(&mapped, 9222, "0A", "888"), 9222),
+            Ok(Some(888))
+        );
+        assert_eq!(
+            proc_net_tcp_listen_inode(&proc_line(&lo, 9222, "01", "12345"), 9222),
+            Ok(None)
+        );
+        assert_eq!(
+            proc_net_tcp_listen_inode(&proc_line(&lo, 9223, "0A", "12345"), 9222),
+            Ok(None)
+        );
+        assert_eq!(
+            proc_net_tcp_listen_inode(&proc_line(&ext, 9222, "0A", "12345"), 9222),
+            Ok(None)
+        );
+        assert_eq!(
+            proc_net_tcp_listen_inode(&proc_line(&lo, 9222, "0A", "0"), 9222),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn perf3_proc_net_tcp_listen_inode_rejects_malformed_lines() {
+        assert!(proc_net_tcp_listen_inode("   0: 0100007F:2406 00000000:0000 0A", 9222).is_err());
+        assert!(proc_net_tcp_listen_inode(&proc_line("ZZZZZZZZ", 9222, "0A", "1"), 9222).is_err());
+        assert!(
+            proc_net_tcp_listen_inode(&proc_line("00000000", 9222, "0A", "abc"), 9222).is_err()
+        );
+        assert!(
+            proc_net_tcp_listen_inode("   0: 00000000 00000000:0000 0A x x x x x 1", 9222).is_err()
+        );
+    }
+
+    #[test]
+    fn perf3_parse_socket_link_inode_accepts_only_sockets() {
+        assert_eq!(parse_socket_link_inode("socket:[12345]"), Some(12345));
+        assert_eq!(parse_socket_link_inode("pipe:[1]"), None);
+        assert_eq!(parse_socket_link_inode("anon_inode:[eventfd]"), None);
+        assert_eq!(parse_socket_link_inode("/dev/null"), None);
+        assert_eq!(parse_socket_link_inode("socket:[abc]"), None);
+        assert_eq!(parse_socket_link_inode("socket:[12345"), None);
+    }
+
+    // --- PERF-3 / PERF-6: verify_port_owner（TASK-84.6） ---
+
+    #[test]
+    fn perf3_verify_port_owner_empty_owners_is_no_owner_found() {
+        assert_eq!(
+            verify_port_owner(9222, 100, &[], &[100, 101]),
+            Err(PortOwnerError::NoOwnerFound { port: 9222 })
+        );
+    }
+
+    #[test]
+    fn perf3_verify_port_owner_root_owner_is_ok() {
+        assert_eq!(verify_port_owner(9222, 100, &[100], &[100, 101]), Ok(()));
+    }
+
+    #[test]
+    fn perf3_verify_port_owner_descendant_owner_is_ok() {
+        assert_eq!(
+            verify_port_owner(9222, 100, &[101, 102], &[100, 101, 102]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn perf6_verify_port_owner_foreign_owner_is_mismatch() {
+        assert_eq!(
+            verify_port_owner(9222, 100, &[555], &[100, 101]),
+            Err(PortOwnerError::Mismatch {
+                port: 9222,
+                root_pid: 100,
+                foreign_pids: vec![555],
+            })
+        );
+    }
+
+    #[test]
+    fn perf6_verify_port_owner_mixed_owners_reports_only_foreign_deduped() {
+        assert_eq!(
+            verify_port_owner(9222, 100, &[101, 555, 555, 777], &[100, 101]),
+            Err(PortOwnerError::Mismatch {
+                port: 9222,
+                root_pid: 100,
+                foreign_pids: vec![555, 777],
+            })
+        );
+    }
+
+    #[test]
+    fn perf3_port_owner_error_display_contains_details() {
+        let mismatch = PortOwnerError::Mismatch {
+            port: 9222,
+            root_pid: 100,
+            foreign_pids: vec![555],
+        };
+        let text = mismatch.to_string();
+        assert!(text.contains("port owner mismatch"), "{text}");
+        assert!(text.contains("9222"), "{text}");
+        assert!(text.contains("555"), "{text}");
+        let none = PortOwnerError::NoOwnerFound { port: 9222 }.to_string();
+        assert!(
+            none.contains("port owner") && none.contains("9222"),
+            "{none}"
+        );
+        let failed = PortOwnerError::LookupFailed {
+            port: 9222,
+            reason: "lsof exited with status 1".to_string(),
+        }
+        .to_string();
+        assert!(failed.contains("lsof exited with status 1"), "{failed}");
+        assert!(failed.contains("9222"), "{failed}");
+    }
     // Cargo は `[[bench]]` ターゲット（本ファイルを `#[path]` で取り込む
     // `competitor_lightpanda.rs`）にも常に `--cfg test`（`--test` フラグ自体は
     // 付けない）を渡すため、この `mod tests` はベンチ側のビルドでも解析対象になる。
@@ -3992,5 +4434,44 @@ mod tests {
             normalize_timeout_error(err).kind(),
             std::io::ErrorKind::ConnectionReset
         );
+    }
+
+    // PERF-3/PERF-6（TASK-84.6.3・#561）: lsof -F pn 出力の解析。
+    #[test]
+    fn perf3_parse_lsof_listen_pids_accepts_reachable_addresses() {
+        let out = "p123\nf5\nn127.0.0.1:9222\np456\nf6\nn*:9222\np789\nf7\nn[::]:9222\np10\nf8\nn[::ffff:127.0.0.1]:9222\n";
+        assert_eq!(
+            parse_lsof_listen_pids(out, 9222, 64),
+            Ok(vec![123, 456, 789, 10])
+        );
+    }
+
+    #[test]
+    fn perf3_parse_lsof_listen_pids_ignores_unreachable_and_other_ports() {
+        let out = "p1\nf5\nn[::1]:9222\np2\nf5\nn192.168.0.2:9222\np3\nf5\nn127.0.0.1:1111\np4\nf5\nn127.0.0.1:9222->127.0.0.1:5000\n";
+        assert_eq!(parse_lsof_listen_pids(out, 9222, 64), Ok(vec![]));
+        assert_eq!(parse_lsof_listen_pids("", 9222, 64), Ok(vec![]));
+    }
+
+    #[test]
+    fn perf3_parse_lsof_listen_pids_dedups_same_pid() {
+        let out = "p7\nf5\nn127.0.0.1:9222\nf6\nn[::]:9222\n";
+        assert_eq!(parse_lsof_listen_pids(out, 9222, 64), Ok(vec![7]));
+    }
+
+    #[test]
+    fn perf3_parse_lsof_listen_pids_rejects_malformed_output() {
+        assert!(parse_lsof_listen_pids("n127.0.0.1:9222\n", 9222, 64).is_err());
+        assert!(parse_lsof_listen_pids("pabc\n", 9222, 64).is_err());
+        assert!(parse_lsof_listen_pids("p0\n", 9222, 64).is_err());
+        assert!(parse_lsof_listen_pids("p1\nnnocolon\n", 9222, 64).is_err());
+        assert!(parse_lsof_listen_pids("p1\nn127.0.0.1:xyz\n", 9222, 64).is_err());
+    }
+
+    #[test]
+    fn perf3_parse_lsof_listen_pids_rejects_too_many_owners() {
+        let out = "p1\nn*:9222\np2\nn*:9222\np3\nn*:9222\n";
+        assert_eq!(parse_lsof_listen_pids(out, 9222, 3), Ok(vec![1, 2, 3]));
+        assert!(parse_lsof_listen_pids(out, 9222, 2).is_err());
     }
 }

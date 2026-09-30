@@ -26,6 +26,10 @@ name: CI
 # 未実行）だったため、PR で Servo 系が混入しても CI では検出できなかった
 # （最終防御線は deny.toml の MPL-2.0 不許可のみ）。render-isolation ジョブは
 # 同じ判定ロジック（scripts/check-render-isolation.sh）を 3 OS で直接実行する
+# TASK-29.7（Issue #158・JS-1・MS-3）: 下記 rust-ci-js-v8 ジョブを追加した。
+# rust-ci（--all-features）・rust-ci-default-features（既定）のどちらとも異なる
+# `--features js-v8` 単独構成で js crate の TASK-28 共通コンフォーマンステストを
+# V8 に対して 3 OS で検証する
 on:
   workflow_dispatch:
   pull_request:
@@ -63,7 +67,9 @@ jobs:
   # 同じく 3 OS matrix のため OS ごとに別名）の
   # `rust-ci-default-features (ubuntu-latest)`・
   # `rust-ci-default-features (macos-latest)`・
-  # `rust-ci-default-features (windows-latest)` の 3 件も追加する必要がある
+  # `rust-ci-default-features (windows-latest)` の 3 件、および js-v8 単独構成の
+  # `rust-ci-js-v8 (ubuntu-latest)`・`rust-ci-js-v8 (macos-latest)`・
+  # `rust-ci-js-v8 (windows-latest)` の 3 件も追加する必要がある
   # （TASK-55.2・#59 時点で
   # push/pull_request トリガーが有効化されたため、この登録作業はユーザー作業と
   # して実施可能になった。登録自体は本変更の対象外）。
@@ -207,6 +213,39 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test（既定 feature）
         run: cargo test --workspace
+
+  # --------------------------------------------------
+  # rust-ci-js-v8（js crate を `--features js-v8` 単独で 3 OS 検証）
+  # --------------------------------------------------
+  # TASK-29.7（Issue #158・JS-1・MS-3）: TASK-28 共通コンフォーマンステスト
+  # （crates/fandhe-browser-js/tests/conformance.rs）が V8 で合格することを CI で
+  # 継続検証する。rust-ci（--all-features）・rust-ci-default-features（既定）では
+  # 検証されない `--features js-v8` 単独構成を対象にする。この構成では js-boa・
+  # test-support・rendering が無効で、`required-features = ["test-support"]` の
+  # v8_worker テストと bench は対象外になる。
+  # テスト出力に `case:` 行と `conformance: all cases passed` が出れば、V8 が
+  # スクリプト評価・グローバル関数注入・DOM 風バインディングの 3 カテゴリに合格
+  # している。`RUSTFLAGS=-D warnings` は Windows の既存リンカ警告（LNK4098）で
+  # 落ちるため test には付けない（clippy はリンクしないため -D warnings 可）。
+  rust-ci-js-v8:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: clippy
+      - name: cargo clippy（js-v8 単独）
+        run: cargo clippy -p fandhe-browser-js --all-targets --features js-v8 -- -D warnings
+      - name: cargo test（js-v8 単独）
+        run: cargo test -p fandhe-browser-js --features js-v8
 
   # --------------------------------------------------
   # render-isolation（既定ビルドの依存グラフに Servo 系クレートが混入していないことの検証）

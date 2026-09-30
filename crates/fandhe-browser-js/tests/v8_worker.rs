@@ -24,7 +24,7 @@
 
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fandhe_browser_js::process_engine::{DomLikeMemberFn, ParentNativeFn};
 use fandhe_browser_js::process_engine::{V8ProcessEngine, WorkerSpawnConfigForTest};
@@ -175,7 +175,14 @@ fn main() -> ExitCode {
     js_1_dom_like_object_with_non_configurable_name_is_binding_failed_and_keeps_worker();
     eprintln!("case: js_1_dom_like_member_error_is_catchable_and_keeps_context");
     js_1_dom_like_member_error_is_catchable_and_keeps_context();
+    eprintln!("case: js_1_create_engine_v8_native_fn_runs_and_mutates_rust_state");
+    js_1_create_engine_v8_native_fn_runs_and_mutates_rust_state();
+    eprintln!("case: js_1_create_engine_v8_blocking_native_fn_times_out_within_deadline");
+    js_1_create_engine_v8_blocking_native_fn_times_out_within_deadline();
+    eprintln!("case: js_1_create_engine_v8_dom_like_method_runs");
+    js_1_create_engine_v8_dom_like_method_runs();
     eprintln!("v8_worker: all cases passed");
+
     ExitCode::SUCCESS
 }
 
@@ -1855,4 +1862,103 @@ fn js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_li
         .evaluate_script("before_job_limit", &EvaluateOptions::default())
         .unwrap_or_else(|err| panic!("the context must survive a rejected allocation: {err}"));
     assert_eq!(marker, JsValue::Number(531.0));
+}
+
+/// `TASK-29.6.2`・Issue #548: `create_engine(V8)` が返すトレイトオブジェクトへ
+/// 注入した `Send` の `NativeFn`（`Arc<AtomicU32>` を捕獲）が実行され、
+/// Rust 側の状態を更新すること。
+fn js_1_create_engine_v8_native_fn_runs_and_mutates_rust_state() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let mut engine = fandhe_browser_js::create_engine(fandhe_browser_js::EngineKind::V8)
+        .unwrap_or_else(|err| panic!("create_engine(V8) must succeed: {err}"));
+    let counter = Arc::new(AtomicU32::new(0));
+    let counter_for_fn = Arc::clone(&counter);
+    engine
+        .inject_global_function(
+            "bump",
+            Box::new(move |_args: &[JsValue]| {
+                counter_for_fn.fetch_add(1, Ordering::SeqCst);
+                Ok(JsValue::Undefined)
+            }),
+        )
+        .unwrap_or_else(|err| panic!("inject_global_function must succeed: {err}"));
+    engine
+        .evaluate_script("bump(); bump();", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("evaluation must succeed: {err}"));
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
+}
+
+/// `TASK-29.6.2`・Issue #548（`AGENTS.md`「リソース上限」）: トレイト経由の
+/// `NativeFn` が戻らなくても、`evaluate_script` は期限内に `Timeout` で戻り、
+/// 次の評価は新しい Context で成功すること。
+fn js_1_create_engine_v8_blocking_native_fn_times_out_within_deadline() {
+    use std::sync::mpsc;
+
+    let mut engine = fandhe_browser_js::create_engine(fandhe_browser_js::EngineKind::V8)
+        .unwrap_or_else(|err| panic!("create_engine(V8) must succeed: {err}"));
+    // テストが解放するまで戻らない関数（スレッドを後始末するため最後に解放する）。
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    engine
+        .inject_global_function(
+            "blocked",
+            Box::new(move |_args: &[JsValue]| {
+                let _ = release_rx.recv();
+                Ok(JsValue::Number(1.0))
+            }),
+        )
+        .unwrap_or_else(|err| panic!("inject_global_function must succeed: {err}"));
+    let started = Instant::now();
+    let outcome =
+        engine.evaluate_script("globalThis.y = 1; blocked()", &EvaluateOptions::default());
+    let elapsed = started.elapsed();
+    match outcome {
+        Err(JsEngineError::Timeout(msg)) => assert!(
+            msg.contains("context was discarded"),
+            "expected the discard notice, got: {msg}"
+        ),
+        other => panic!("expected Timeout for a native fn that never returns, got: {other:?}"),
+    }
+    assert!(
+        elapsed < PARENT_EVALUATE_DEADLINE + Duration::from_secs(5),
+        "evaluate_script must return near the deadline, took {elapsed:?}"
+    );
+    let _ = release_tx.send(());
+    let result = engine
+        .evaluate_script("typeof y", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("the next evaluation must run in a fresh context: {err}"));
+    assert_eq!(result, JsValue::String("undefined".to_string()));
+}
+
+/// `TASK-29.6.2`・Issue #548: トレイト経由の `bind_dom_like_object` に渡した
+/// `Send` のメソッドが実行され、引数を受け取り Rust 側の状態を更新して
+/// 戻り値を返すこと。
+fn js_1_create_engine_v8_dom_like_method_runs() {
+    let mut engine = fandhe_browser_js::create_engine(fandhe_browser_js::EngineKind::V8)
+        .unwrap_or_else(|err| panic!("create_engine(V8) must succeed: {err}"));
+    let total = Arc::new(Mutex::new(0.0f64));
+    let total_for_fn = Arc::clone(&total);
+    engine
+        .bind_dom_like_object(
+            "counter",
+            vec![(
+                "add".to_string(),
+                Box::new(move |args: &[JsValue]| {
+                    let mut guard = total_for_fn.lock().unwrap();
+                    if let Some(JsValue::Number(n)) = args.first() {
+                        *guard += n;
+                    }
+                    Ok(JsValue::Number(*guard))
+                }) as fandhe_browser_js::NativeFn,
+            )],
+        )
+        .unwrap_or_else(|err| panic!("bind_dom_like_object must succeed: {err}"));
+    let result = engine
+        .evaluate_script(
+            "counter.add(2); counter.add(3)",
+            &EvaluateOptions::default(),
+        )
+        .unwrap_or_else(|err| panic!("evaluation must succeed: {err}"));
+    assert_eq!(result, JsValue::Number(5.0));
+    assert_eq!(*total.lock().unwrap(), 5.0);
 }

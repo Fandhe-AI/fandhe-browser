@@ -91,18 +91,15 @@ const BUNDLED: &[EngineKind] = &[
 /// 順序は `js-engine.md`「(1) 省略」の「同梱エンジンから V8 → boa の優先順で
 /// 選ぶ」という後続契約（TASK-91 が依存）に対応する。
 ///
-/// `js-v8` は TASK-29.1（#152）で `dep:v8` と結合済みだが、`js-boa` は
-/// 依然として `dep:` 接頭辞なしのプレースホルダ feature（TASK-28.1・#147。
-/// `boa_engine` の追加は TASK-32・#165）である。どちらも feature を
-/// 有効化するだけでは実際の V8/boa 実装が使えるわけではない
-/// （実装済みを装わない。REPAIR-3）。[`create_engine`] はこの一覧を
-/// 「同梱判定」の唯一の情報源として使うが、同梱されている（＝ `feature` が
-/// 有効）ことは「具象実装が使える」ことを意味しない。具象実装が入るのは
-/// TASK-29（V8）／TASK-32（`boa`）の完了後であり、それまでは
-/// [`create_engine`] は同梱されている種別に対しても
-/// `CreateEngineError::NotYetImplemented` を返す。呼び出し元はこの一覧の
-/// 要素を、それまでの間「即座に生成・実行できるエンジン」として扱っては
-/// ならない。feature が無効なバリアントはコンパイル自体から除外されるため
+/// `js-v8` は子プロセス版エンジンへ配線済み（TASK-29.6.2・#548）で、
+/// [`create_engine`] は `Ok` を返す。一方 `js-boa` は依然として `dep:` 接頭辞
+/// なしのプレースホルダ feature（TASK-28.1・#147。`boa_engine` の追加は
+/// TASK-32・#165）で、有効化しても具象実装は無い（実装済みを装わない。
+/// REPAIR-3）。[`create_engine`] はこの一覧を「同梱判定」の唯一の情報源として
+/// 使うが、同梱されている（＝ `feature` が有効）ことは「具象実装が使える」
+/// ことを意味しない。boa は TASK-32 の完了までの間 [`create_engine`] が
+/// `CreateEngineError::NotYetImplemented` を返すため、呼び出し元は boa を
+/// 「即座に生成・実行できるエンジン」として扱ってはならない。feature が無効なバリアントはコンパイル自体から除外されるため
 /// （`#[cfg(...)]` 付きの配列要素）、「同梱されていないのに一覧に載る」
 /// 幽霊エントリが実行時分岐の書き間違いで混入する余地はない。
 pub fn bundled_engines() -> &'static [EngineKind] {
@@ -238,11 +235,12 @@ impl NativeCallContext {
 /// プロセス全体が終了する。panic の封じ込めにはプロセス分離が必要で、
 /// 現契約の範囲外（別途設計判断）。
 ///
-/// `Send`/`Sync` 境界は付けない。V8 の `Isolate`/`HandleScope` はスレッド
-/// 固有であり、境界を付けると V8 実装（TASK-29）が満たせなくなるため
-/// （`js-engine.md`「選択はプロセス起動時に1回」が定める、エンジンの実行が
-/// プロセス内で単一スレッドに閉じる前提に対応する）。
-pub type NativeFn = Box<dyn FnMut(&[JsValue]) -> Result<JsValue, JsEngineError>>;
+/// **`Send` 境界（`TASK-29.6.2`・Issue #548）**: 子プロセス版エンジンは
+/// 関数を専用スレッドで実行して期限を強制する（AGENTS.md「リソース上限」）ため
+/// `Send` を要求する。`Rc` 等 `!Send` な状態は捕獲できない（`Arc<Mutex<_>>` 等を
+/// 使う）。`Sync` は不要。V8 の `Isolate`/`HandleScope` 自体はスレッド固有だが、
+/// 関数は `JsValue` のみを受け渡すため `Send` 境界と衝突しない。
+pub type NativeFn = Box<dyn FnMut(&[JsValue]) -> Result<JsValue, JsEngineError> + Send>;
 
 /// [`JsEngine::evaluate_script`] の実行制御オプション（TASK-28.3・`JS-1`）。
 ///
@@ -364,8 +362,8 @@ impl std::error::Error for JsEngineError {}
 /// 橋渡しは TASK-30 で実装する）。
 ///
 /// スレッド安全性: 実装は単一スレッドでの利用を前提としてよい（本トレイト
-/// に `Send`/`Sync` 境界は付けない。理由は [`NativeFn`] のドキュメントを
-/// 参照）。
+/// に `Send`/`Sync` 境界は付けない。V8 の `Isolate` がスレッド固有のため）。
+/// 登録する [`NativeFn`] のみ `Send` を要求する（[`NativeFn`] 参照）。
 pub trait JsEngine {
     /// スクリプトを評価し、結果を [`JsValue`] で返す（`JS-1`「スクリプト
     /// 評価」）。
@@ -382,12 +380,17 @@ pub trait JsEngine {
     /// 登録した分は新しい子へ登録し直される。スクリプトが作った状態は
     /// 失われる（`JS-1`・`TASK-29`・Issue #527）。
     ///
-    /// 子プロセス版（`V8ProcessEngine::inject_global_function`。
-    /// `TASK-29.4`・Issue #155）は登録フレームで子へ即時に登録し、子が登録を
-    /// 拒否した場合（`undefined` 等 non-configurable な名前・重複・件数上限）は
-    /// [`JsEngineError::BindingFailed`] を返す。本トレイトへの集約と、
-    /// [`NativeFn`]（`Send` なし）と親側の `Send` 付き関数型の橋渡しは
-    /// `TASK-29.6`（Issue #157）で行う（未実装）。
+    /// 子プロセス版（`TASK-29.4`・Issue #155）は登録フレームで子へ即時に
+    /// 登録し、子が登録を拒否した場合（`undefined` 等 non-configurable な名前・
+    /// 重複・件数上限）は [`JsEngineError::BindingFailed`] を返す。
+    ///
+    /// 子プロセス版（`TASK-29.6.2`・Issue #548）は `func` を専用スレッドで
+    /// 実行し、期限まで待つ。戻らない関数があっても `evaluate_script` は期限内に
+    /// `Timeout` で戻る（放棄されたスレッドは戻るかプロセス終了まで残る。
+    /// 生存数は上限あり）。期限・取り消しの通知（`NativeCallContext`）は
+    /// `func` へ渡らない。unwind するビルドでは `func` 内の panic を捕捉して
+    /// JS 側のエラーへ変換する（release は `panic = "abort"` でホストごと終了）。
+    /// `func` へ渡る引数は JS 由来の untrusted な値である。
     fn inject_global_function(&mut self, name: &str, func: NativeFn) -> Result<(), JsEngineError>;
 
     /// 名前付きの DOM 風オブジェクト（複数のネイティブメソッドを持つ）を
@@ -396,7 +399,10 @@ pub trait JsEngine {
     /// 相当）。
     ///
     /// 子プロセス版は子の再起動時に登録順どおり再登録する
-    /// （`V8ProcessEngine::bind_dom_like_object`。`TASK-29.5b`）。
+    /// （`TASK-29.5b`）。全メソッドを [`inject_global_function`]
+    /// （Self::inject_global_function）と同じく専用スレッドで期限付きで実行する
+    /// （`TASK-29.6.2`・Issue #548）。`NativeCallContext` が渡らない・panic の
+    /// 扱いも同じ。
     fn bind_dom_like_object(
         &mut self,
         name: &str,
@@ -417,10 +423,10 @@ pub enum CreateEngineError {
         bundled: &'static [EngineKind],
     },
     /// 指定した種別は同梱されている（feature は有効）が、具象実装がまだ
-    /// 存在しない（V8: `TASK-29` / boa: `TASK-32`（いずれも `MS-3`）の
-    /// 完了待ち）。実装済みを装わない（REPAIR-3）ための一時的なバリアント
-    /// であり、`TASK-29`/`TASK-32`（`MS-3`）完了後は該当する種別について
-    /// このバリアントを返さなくなる。
+    /// 存在しない。現在は boa（`TASK-32`・`MS-3` の完了待ち）だけが該当する
+    /// （V8 は `TASK-29.6.2`・#548 で配線済み）。実装済みを装わない
+    /// （REPAIR-3）ための一時的なバリアントであり、`TASK-32` 完了後は boa に
+    /// ついてもこのバリアントを返さなくなる。
     NotYetImplemented {
         /// 呼び出し元が要求した種別。
         requested: EngineKind,
@@ -466,20 +472,31 @@ impl std::error::Error for CreateEngineError {}
 /// 呼び出し元（将来）: `fandhe-browser-core` が `TASK-30`（`MS-3`）で設定
 /// （`[js] engine`）が選択した種別からトレイトオブジェクトを得る際に使う。
 ///
-/// スタブ（現在の制限: 同梱している種別に対しても常にエラーを返し、実際の
-/// エンジンは生成しない）。**契約**: 同梱していない種別（[`bundled_engines`]
-/// に含まれない）には [`CreateEngineError::NotBundled`] を返す（本 Issue の
-/// 受け入れ条件）。同梱していても具象実装がまだ無い間は
-/// [`CreateEngineError::NotYetImplemented`] を返す（`TASK-29`/`TASK-32`
-/// （`MS-3`）完了後に対応する分岐が `Ok` を返すよう置き換わる）。成功した
-/// かのような値（ダミーの [`JsEngine`] 実装）を返す「成功を一律に返す
-/// フォールバック」は行わない（security.md「偽装・回避機能の禁止」）。
+/// **契約**: 同梱していない種別（[`bundled_engines`] に含まれない）には
+/// [`CreateEngineError::NotBundled`] を返し、別エンジンへのフォールバックは
+/// しない。V8 は子プロセス版エンジン（`process_engine::V8ProcessEngine`）を
+/// `Ok` で返す。boa は具象実装が無い間 [`CreateEngineError::NotYetImplemented`]
+/// を返す（`TASK-32`。ダミーの成功を返さない。security.md「偽装・回避機能の
+/// 禁止」）。
+///
+/// # 起動タイミングと失敗の現れ方（`TASK-29.6.2`・#548。`PERF-6`・`PERF-7`・`CORE-3`）
+///
+/// V8 版は**遅延起動**で、本関数は I/O を行わず子プロセスを起動しない。子が
+/// 起動するのは `evaluate_script`・`inject_global_function`・
+/// `bind_dom_like_object` のうち最初に呼ばれたもので、起動・ハンドシェイクの
+/// 失敗は `CreateEngineError` ではなく、その呼び出しが返す
+/// [`JsEngineError::EngineUnavailable`] として現れる。
+///
+/// **ホストの義務**: 子は同じ実行ファイルの自己再実行なので、ホストの
+/// バイナリは `main` の先頭で [`crate::run_js_worker_if_requested`] を呼ぶこと。
+/// 呼ばないと、子として再実行されたホストが通常の `main` を実行してしまい、
+/// ハンドシェイクの期限（5 秒）後に初回呼び出しが `EngineUnavailable` で
+/// 失敗する。
 ///
 /// 同梱判定は [`bundled_engines`] を再利用し、本関数内で独自の feature 分岐
 /// を持たない。`match kind { .. }` に `#[cfg(feature = ...)]` を付けない
 /// ことで、両 feature 同時有効時に `_` 分岐が `unreachable_patterns` になる
-/// 事故を避ける（`TASK-29`/`TASK-32`（`MS-3`）でこの `match` の各アームを
-/// 具象エンジン生成に置き換える際も同じ構造を保つ）。
+/// 事故を避ける（V8 の生成部分だけを `#[cfg]` 付きの関数へ出している）。
 pub fn create_engine(kind: EngineKind) -> Result<Box<dyn JsEngine>, CreateEngineError> {
     if !bundled_engines().contains(&kind) {
         return Err(CreateEngineError::NotBundled {
@@ -488,9 +505,26 @@ pub fn create_engine(kind: EngineKind) -> Result<Box<dyn JsEngine>, CreateEngine
         });
     }
     match kind {
-        EngineKind::V8 => Err(CreateEngineError::NotYetImplemented { requested: kind }),
+        EngineKind::V8 => create_v8_engine(),
         EngineKind::Boa => Err(CreateEngineError::NotYetImplemented { requested: kind }),
     }
+}
+
+/// V8 の子プロセス版エンジンを生成する（[`create_engine`] から呼ばれる。
+/// 子は起動しない）。
+#[cfg(feature = "js-v8")]
+fn create_v8_engine() -> Result<Box<dyn JsEngine>, CreateEngineError> {
+    Ok(Box::new(crate::process_engine::V8ProcessEngine::new()))
+}
+
+/// `js-v8` 無効時の V8 分岐。[`create_engine`] は同梱判定で先に
+/// [`CreateEngineError::NotBundled`] を返すため到達しない。到達した場合も
+/// 成功を装わず `Err` を返す。
+#[cfg(not(feature = "js-v8"))]
+fn create_v8_engine() -> Result<Box<dyn JsEngine>, CreateEngineError> {
+    Err(CreateEngineError::NotYetImplemented {
+        requested: EngineKind::V8,
+    })
 }
 
 #[cfg(test)]
@@ -619,18 +653,25 @@ mod tests {
         ));
     }
 
-    /// JS-1: 同梱されている種別を渡しても、具象実装がまだ無いため
-    /// `NotYetImplemented` を返すこと（＝「同梱＝即利用可能」ではないことの
-    /// 回帰テスト。28.2 のドキュメントコメントの契約を裏付ける）。
+    /// JS-1: V8 を同梱したビルドでは `create_engine(V8)` が子プロセス版を
+    /// `Ok` で返すこと（遅延起動のため子は起動せず、評価もしない。TASK-29.6.2）。
     #[test]
-    #[cfg(any(feature = "js-v8", feature = "js-boa"))]
-    fn js_1_create_engine_returns_not_yet_implemented_err_for_bundled_kind() {
-        for kind in bundled_engines() {
-            assert!(matches!(
-                create_engine(*kind),
-                Err(CreateEngineError::NotYetImplemented { requested }) if requested == *kind
-            ));
-        }
+    #[cfg(feature = "js-v8")]
+    fn js_1_create_engine_returns_ok_for_bundled_v8() {
+        assert!(create_engine(EngineKind::V8).is_ok());
+    }
+
+    /// JS-1: boa は同梱していても具象実装が無いため `NotYetImplemented` を返す
+    /// こと（「同梱＝即利用可能」ではないことの回帰テスト）。
+    #[test]
+    #[cfg(feature = "js-boa")]
+    fn js_1_create_engine_returns_not_yet_implemented_for_bundled_boa() {
+        assert!(matches!(
+            create_engine(EngineKind::Boa),
+            Err(CreateEngineError::NotYetImplemented {
+                requested: EngineKind::Boa
+            })
+        ));
     }
 
     /// JS-1: `JsEngineError`・`CreateEngineError` が `std::error::Error` を
