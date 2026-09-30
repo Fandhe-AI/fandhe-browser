@@ -18,6 +18,14 @@
 //!   `hidden` 属性または `aria-hidden="true"` の要素・`input[type=hidden]`。
 //! - データ葉（表セル・価格クラス要素。`AISNAP-3`・TASK-13.3・Issue #88）は
 //!   `Node::data_leaf` へ印を付けるだけで、role・ref・剪定・打ち切りには使わない。
+//! - 規則的な `table`・`ul`・`ol`（[`crate::compress_table::detect_regular_structure`]
+//!   が `Regular`。`AISNAP-2`・TASK-12.5・Issue #83）は子孫を展開せず、ヘッダ
+//!   （個別 ref）・圧縮行・超過行数を持つ 1 ノード（[`Node::table`]）へ置き換える。
+//!   圧縮では `Snapshot::truncated` を立てない（行の省略は `truncated_rows`、セルの
+//!   切り詰めは `TableRow::truncated` で通知）。ヘッダ name の打ち切りのみ立てる。
+//!   圧縮した行・項目の中の操作要素は現状 ref を持たない。`tfoot` 行は含めない。
+//!   検出は table/list ごとに子孫を走査するため、入れ子の不規則構造では
+//!   O(ノード数 × 入れ子の深さ) になる（深さは [`MAX_TREE_DEPTH`] で有界）。
 //! - generic の折り畳み・`none`/`presentation` の除去・空ノードの剪定は行わない
 //!   （トークン削減は後続タスク。`AISNAP-1`・`AISNAP-2`）。
 //! - ルート以外の全要素に ref を振る（対話可能な要素への絞り込みは後続タスク）。
@@ -29,6 +37,9 @@ use std::fmt;
 
 use fandhe_browser_core::dom::{Children, Document, NodeId};
 
+use crate::compress_table::{
+    TableDetection, assign_header_refs, compress_rows, detect_regular_structure,
+};
 use crate::data_leaf::classify_data_leaf;
 
 use super::element_ref::{ElementRef, ElementSignature, RefAllocator, RefError};
@@ -38,7 +49,7 @@ use super::name::{
 };
 use super::role::compute_role;
 use super::state::{compute_state, is_html_element_named};
-use super::{Node, Snapshot};
+use super::{HeaderCell, Node, Snapshot, TableRow, TableSummary};
 
 /// 構築するツリーの最大深さ（ルートを 0 とする）。
 ///
@@ -182,6 +193,32 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
             .with_ref(elem_ref.to_ref_string())
             .with_state(compute_state(doc, child));
         node.data_leaf = classify_data_leaf(doc, child);
+        // 規則的な表・一覧は子孫を展開せず 1 ノードへ圧縮する（AISNAP-2・TASK-12.5）。
+        if ["table", "ul", "ol"]
+            .iter()
+            .any(|n| is_html_element_named(doc, child, n))
+            && let TableDetection::Regular(structure) = detect_regular_structure(doc, child)
+        {
+            let headers = assign_header_refs(doc, &index, &structure, elem_ref, &mut refs)?;
+            let compressed = compress_rows(doc, &structure);
+            truncated |= headers.iter().any(|h| h.name_truncated);
+            node.table = Some(TableSummary::new(
+                headers
+                    .into_iter()
+                    .map(|h| HeaderCell::new(h.role, h.name, h.elem_ref.to_ref_string()))
+                    .collect(),
+                compressed
+                    .rows
+                    .into_iter()
+                    .map(|r| TableRow::new(r.text, r.truncated))
+                    .collect(),
+                compressed.truncated_rows,
+            ));
+            if let Some(parent) = stack.last_mut() {
+                parent.node.push_child(node);
+            }
+            continue;
+        }
         stack.push(Frame {
             node,
             children: doc.children(child),
@@ -315,7 +352,7 @@ mod tests {
     #[test]
     fn aisnap_3_build_snapshot_reflects_data_leaf() {
         let s = snap(
-            "<body><table><tr><th>名前</th><td>80</td><td><a href=\"/x\">詳細</a></td></tr></table>\
+            "<body><table><tr><th>名前</th><td rowspan=\"2\">80</td><td><a href=\"/x\">詳細</a></td></tr></table>\
              <div class=\"price\"><span class=\"price\">1</span></div><span>plain</span></body>",
         );
         assert_eq!(s.tree.data_leaf, None);
