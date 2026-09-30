@@ -28,6 +28,7 @@
 //! - 削除（`PROF-5`）: #188（TASK-53（53.2））。[`ProfileStore::delete`] の既定実装は
 //!   成功を装わず [`ProfileError::Unsupported`] を返す
 //! - Windows 長パス（`XOS-8`）は [`to_long_path`] として実装済み（TASK-61（61.1）・#205）。
+//!   `LongPathsEnabled` 非依存の結合テストは `tests/long_path.rs`（TASK-61（61.2）・#206）。
 //!   [`ProfileStore::open_or_create`] が適用するが、[`Profile::open`] が実際に使うのは
 //!   `XOS-7` の ACL 実装後になる
 //! - 名前正規化（`XOS-9`、TASK-62）は将来この層へ差し込む。Windows の ACL 隔離が未実装のため、現状 Windows の
