@@ -163,3 +163,25 @@ required-features = ["test-support"]
 [[test]]
 name = "native_call_roundtrip_calc"
 path = "benches/native_call_roundtrip/calc_tests.rs"
+
+# 「JS 不使用経路では遅延起動により子プロセスが起動せず cold start・
+# アイドル RSS に影響しない」ことの実測ベンチ（TASK-29・Issue #558・`CORE-3`・
+# `PERF-6`・`PERF-7`。親 issue #519。sibling: `worker_spawn_latency`・
+# `native_call_roundtrip`・`worker_memory_footprint`）。`harness = false`・
+# `required-features` の理由は `worker_spawn_latency` と同じ（このバイナリ自身が
+# 子プロセス役を兼ねるため既定ハーネスの stdout がフレーム読み取りを壊す。
+# 計測本体が使うテスト専用入口が `test-support` 配下にしか無い）。計測本体は
+# Linux 限定で、他 OS ではコンパイルだけ通り実行時に非 0 で終了する。
+[[bench]]
+name = "lazy_spawn_unused_path"
+path = "benches/lazy_spawn_unused_path.rs"
+harness = false
+required-features = ["test-support"]
+
+# モード子レポート解析・中央値の純関数（`benches/lazy_spawn_unused_path/calc.rs`）
+# のユニットテスト（TASK-29・Issue #558・`PERF-7`）。`std` のみに依存するため
+# `required-features` は付けない。`path` が兄弟の `calc_tests.rs` を指す理由は
+# `worker_spawn_latency_stats` と同じ。
+[[test]]
+name = "lazy_spawn_unused_path_calc"
+path = "benches/lazy_spawn_unused_path/calc_tests.rs"
