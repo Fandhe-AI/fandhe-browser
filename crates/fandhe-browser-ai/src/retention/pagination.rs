@@ -56,18 +56,28 @@ fn has_pager_word(value: &str) -> bool {
     v.contains("pagination") || v.contains("pager") || v.contains("paging")
 }
 
-/// 祖先（自身を除く）に非表示要素があるか。探索は [`MAX_HIDDEN_ANCESTOR_DEPTH`]
-/// 段で打ち切り、上限を超えた先は「非表示ではない」として扱う（文書の深さに
-/// 比例した処理量を避けるため。`find_pagination_link` は項目ごとに 1 回だけ呼ぶ）。
+/// 祖先（自身を除く）に非表示要素があるか、または可視性を確認できないか。
+///
+/// 探索は [`MAX_HIDDEN_ANCESTOR_DEPTH`] 段で打ち切る（文書の深さに比例した処理量を
+/// 避けるため。`find_pagination_link` は項目ごとに 1 回だけ呼ぶ）。上限内に
+/// 非表示祖先が無くても、その先にまだ祖先が残る場合は可視性を確認できないため
+/// fail-closed で `true`（候補から除外）を返す（AISNAP-12・TASK-16.2）。
 fn has_hidden_ancestor(doc: &Document, id: NodeId) -> bool {
-    doc.ancestors(id)
+    let mut ancestors = doc.ancestors(id);
+    if ancestors
+        .by_ref()
         .take(MAX_HIDDEN_ANCESTOR_DEPTH)
         .any(|a| doc.is_element(a) && is_hidden_element(doc, a))
+    {
+        return true;
+    }
+    // 上限に達しても祖先が残っていれば未確認扱い。
+    ancestors.any(|a| doc.is_element(a))
 }
 
 /// ページ番号の文脈ガードで辿る祖先の最大深さ。
 const MAX_PAGINATION_ANCESTOR_DEPTH: usize = 8;
-/// 非表示祖先の探索深さ上限。固定で打ち切り、超過分は「非表示ではない」とみなす。
+/// 非表示祖先の探索深さ上限。超過して祖先が残る場合は可視性未確認として除外する。
 const MAX_HIDDEN_ANCESTOR_DEPTH: usize = 32;
 /// ページ番号とみなす数字ラベルの最大桁数。
 const MAX_PAGE_NUMBER_DIGITS: usize = 4;
@@ -287,7 +297,8 @@ fn has_pagination_context(doc: &Document, id: NodeId) -> bool {
 ///
 /// HTML 名前空間の `<a>`（空でない `href`・自身と祖先のいずれも `hidden` /
 /// `aria-hidden` でない）だけが対象で、範囲外の `NodeId`・非要素・SVG 内の `<a>`
-/// は `None`。祖先の非表示検査は固定深さ（32 段）で打ち切る。判定順はモジュール doc を参照。
+/// は `None`。祖先の非表示検査は固定深さ（32 段）までで、これを超える深さの要素は
+/// 可視性を確認できないため `None`（fail-closed）。判定順はモジュール doc を参照。
 pub fn classify_pagination_link(doc: &Document, id: NodeId) -> Option<PaginationKind> {
     if !is_html_named(doc, id, "a") || has_hidden_ancestor(doc, id) {
         return None;
@@ -355,7 +366,9 @@ fn classify_visible_anchor(doc: &Document, id: NodeId) -> Option<PaginationKind>
 /// 項目（`li`・`tr` 等）のサブツリーからページネーションリンクを探す
 /// （`AISNAP-12`・`TASK-16.2`）。
 ///
-/// 項目自身も対象に含む。項目の非表示祖先の検査は固定深さ（32 段）で打ち切る。非表示サブツリーは読み飛ばし、訪問済み + 未訪問の総量を
+/// 項目自身も対象に含む。項目の非表示祖先の検査は固定深さ（32 段）までで、
+/// これを超える深さの項目は可視性を確認できないため `None`（fail-closed）。
+/// 非表示サブツリーは読み飛ばし、訪問済み + 未訪問の総量を
 /// 内部上限（256 ノード）以内に保つ。残り予算を超える幅の枝はその枝だけ読み飛ばして
 /// 後続の兄弟を確認し、訪問数が上限に達したら「見つからなかった」として
 /// `None`。複数ある場合は文書順で最初の種別を返す。
@@ -427,7 +440,7 @@ mod tests {
     #[test]
     fn hidden_ancestor_scan_is_depth_bounded() {
         // AISNAP-12: 祖先探索は固定深さで打ち切る。範囲内の非表示祖先は除外し、
-        // 上限を超えた先の非表示は検査しない（処理量が文書深さに比例しない）。
+        // 上限を超えて可視性を確認できない深い項目も fail-closed で除外する。
         let nest = |depth: usize| {
             format!(
                 "<div hidden>{}<ul><li><a href=\"/p2\" rel=\"next\">x</a></li></ul>{}</div>",
@@ -440,7 +453,18 @@ mod tests {
         assert_eq!(find_pagination_link(&near, li), None);
         let far = parse(&nest(MAX_HIDDEN_ANCESTOR_DEPTH + 8));
         let li = select(&far, "li");
-        assert_eq!(find_pagination_link(&far, li), Some(PaginationKind::Next));
+        assert_eq!(find_pagination_link(&far, li), None);
+        let a = select(&far, "a");
+        assert_eq!(classify_pagination_link(&far, a), None);
+        assert!(pagination_candidates(&far, &[li]).is_empty());
+        // 深いが非表示祖先を含まない文書でも、上限超過は未確認として除外する。
+        let deep = parse(&format!(
+            "{}<ul><li><a href=\"/p2\" rel=\"next\">x</a></li></ul>{}",
+            "<div>".repeat(MAX_HIDDEN_ANCESTOR_DEPTH + 8),
+            "</div>".repeat(MAX_HIDDEN_ANCESTOR_DEPTH + 8)
+        ));
+        let li = select(&deep, "li");
+        assert_eq!(find_pagination_link(&deep, li), None);
     }
 
     fn parse(html: &str) -> Document {
