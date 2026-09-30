@@ -354,6 +354,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fandhe-browser-cli"
+version = "0.1.0"
+dependencies = [
+ "fandhe-backend-core",
+ "fandhe-backend-http",
+ "fandhe-backend-routes",
+ "fandhe-browser-cdp",
+ "fandhe-browser-core",
+ "fandhe-browser-profile",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "fandhe-browser-core"
 version = "0.1.0"
 dependencies = [

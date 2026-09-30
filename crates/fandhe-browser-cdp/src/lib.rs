@@ -10,12 +10,12 @@
 //! 状態型（CDP セッション・ターゲット表。`CDP-1`、TASK-41.2）と `/json/*`
 //! ルータ（`server::router`。`CDP-1`、TASK-41.3）と `/devtools/browser/{id}` の WS 受け口
 //! （`server::browser_websocket_config`。`CDP-1`、TASK-41.4。ハンドラは暫定で TASK-42 で置換）は
-//! [`server::endpoints`] が一体で公開するは実装済み。
+//! [`server::endpoints`] が一体で公開する。さらに cli での組み立て・起動
+//! （`fandhe-browser-cli` の `server` モジュール。TASK-41.5、`MS-3`）も実装済み。
 //! 以下は未実装で、実装済みを装う公開 API・ダミー実装は置かない
 //! （`code-comment-style.md`・REPAIR-3）。
 //!
 //! - CDP メソッドのハンドラ（`CDP-1`/`CDP-5`/`CDP-6`/`CDP-7`、`TASK-42`、`MS-4`）
-//! - cli での組み立て・起動（TASK-41.5。`CDP-7`/`AISNAP-6`/`SEC-4`、`MS-3`）
 
 mod discovery;
 pub mod server;
