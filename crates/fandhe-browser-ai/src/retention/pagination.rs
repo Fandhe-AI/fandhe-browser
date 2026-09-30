@@ -33,7 +33,7 @@
 //! 祖先探索はすべて定数上限で打ち切り、明示スタックで再帰しない。
 
 use super::{PriorityCandidate, RetentionReason};
-use crate::snapshot::name::{SKIPPED_SUBTREES, is_hidden_element};
+use crate::snapshot::name::{SKIPPED_SUBTREES, is_hidden_element as is_hidden_unbounded};
 use fandhe_browser_core::dom::{Document, NodeData, NodeId};
 
 /// HTML 名前空間の URI（`core` 側の定義が `pub(crate)` のためローカルに持つ）。
@@ -50,6 +50,24 @@ const MAX_LABEL_CHARS: usize = 32;
 const MAX_LABEL_SCAN_CHARS: usize = 256;
 /// 項目サブツリー走査で訪問するノード数の上限（訪問済み + 未訪問スタックの総量）。
 const MAX_ITEM_SCAN_STEPS: usize = 256;
+/// 非表示要素か（本モジュール用。`snapshot::name` の判定に長さ上限を前置する）。
+///
+/// `aria-hidden` が [`MAX_ARIA_LABEL_BYTES`] を超える場合は、共有判定の正規化
+/// （全走査）を避けて fail-closed で非表示扱い（候補から除外）にする
+/// （AISNAP-12・TASK-16.2。security.md「不安全な設計」）。
+fn is_hidden_element(doc: &Document, id: NodeId) -> bool {
+    if doc.attribute(id, "hidden").is_some() {
+        return true;
+    }
+    if doc
+        .attribute(id, "aria-hidden")
+        .is_some_and(|v| v.len() > MAX_ARIA_LABEL_BYTES)
+    {
+        return true;
+    }
+    is_hidden_unbounded(doc, id)
+}
+
 /// ページャ系の語（`pagination`・`pager`・`paging`）を ASCII 大文字小文字非区別で含むか。
 fn has_pager_word(value: &str) -> bool {
     let v = value.to_ascii_lowercase();
@@ -620,6 +638,27 @@ mod tests {
         let pad = " ".repeat(MAX_ARIA_LABEL_BYTES - "page".len());
         let html = format!(r#"<a href="?p=3" aria-current="{pad}page">3</a>"#);
         assert_eq!(classify(&html), Some(PaginationKind::PageNumber));
+    }
+
+    /// AISNAP-12（TASK-16.2・Codex P0）: 巨大な aria-hidden は走査せず fail-closed で
+    /// 非表示扱い、上限ちょうどの `true` は従来どおり非表示、`false` は表示。
+    #[test]
+    fn aisnap_12_oversized_aria_hidden_excluded() {
+        let pad = " ".repeat(MAX_ARIA_LABEL_BYTES);
+        let html = format!(
+            r#"<ul><li aria-hidden="{pad}false"><a href="?p=2" rel="next">次へ</a></li></ul>"#
+        );
+        let doc = parse(&html);
+        assert_eq!(find_pagination_link(&doc, select(&doc, "li")), None);
+        let pad = " ".repeat(MAX_ARIA_LABEL_BYTES - "false".len());
+        let html = format!(
+            r#"<ul><li aria-hidden="{pad}false"><a href="?p=2" rel="next">次へ</a></li></ul>"#
+        );
+        let doc = parse(&html);
+        assert_eq!(
+            find_pagination_link(&doc, select(&doc, "li")),
+            Some(PaginationKind::Next)
+        );
     }
 
     /// AISNAP-12（TASK-16.2）: 対象外の要素・状態は None。
