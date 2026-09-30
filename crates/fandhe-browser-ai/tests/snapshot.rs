@@ -523,3 +523,40 @@ fn aisnap_10_ref_is_stable_across_pages() {
         child(child(&b.tree, 0), 0).r#ref
     );
 }
+
+/// 全ノードを先行順で集める（反復）。
+fn collect_nodes(root: &Node) -> Vec<&Node> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        out.push(n);
+        stack.extend(n.children.iter().rev());
+    }
+    out
+}
+
+/// AISNAP-2: 操作要素（リンク・ボタン・入力欄）を含む表・一覧は圧縮せず、ref を保持する。
+#[test]
+fn aisnap_2_interactive_rows_are_not_compressed() {
+    let html = r#"<body><table><thead><tr><th>名前</th><th>操作</th></tr></thead><tbody><tr><td>太郎</td><td><a href="/u/1">詳細</a> <button>削除</button></td></tr></tbody></table><ul><li><input type="checkbox" aria-label="選択"></li><li>b</li></ul></body>"#;
+    let s = snap(html);
+    let all = collect_nodes(&s.tree);
+    assert!(all.iter().all(|n| n.table.is_none()));
+    for (role, name) in [("link", "詳細"), ("button", "削除"), ("checkbox", "選択")] {
+        let n = all
+            .iter()
+            .find(|n| n.role == role && n.name == name)
+            .expect("操作要素が展開されている");
+        assert!(n.r#ref.is_some());
+    }
+}
+
+/// AISNAP-2: tfoot を持つ表は圧縮せず、フッターの可視情報を保持する。
+#[test]
+fn aisnap_2_table_with_tfoot_is_not_compressed() {
+    let html = "<body><table><thead><tr><th>品名</th><th>金額</th></tr></thead><tbody><tr><td>A</td><td>100</td></tr></tbody><tfoot><tr><td>合計</td><td>100</td></tr></tfoot></table></body>";
+    let s = snap(html);
+    let all = collect_nodes(&s.tree);
+    assert!(all.iter().all(|n| n.table.is_none()));
+    assert!(all.iter().any(|n| n.name == "合計"));
+}

@@ -23,7 +23,9 @@
 //!   （個別 ref）・圧縮行・超過行数を持つ 1 ノード（[`Node::table`]）へ置き換える。
 //!   圧縮では `Snapshot::truncated` を立てない（行の省略は `truncated_rows`、セルの
 //!   切り詰めは `TableRow::truncated` で通知）。ヘッダ name の打ち切りのみ立てる。
-//!   圧縮した行・項目の中の操作要素は現状 ref を持たない。`tfoot` 行は含めない。
+//!   ただし `tfoot` 行がある構造、または操作要素（リンク・ボタン・入力欄・`role`/
+//!   `tabindex` 付き等）を含む構造は圧縮せず通常どおり展開する（ref・state・フッター
+//!   の可視情報を失わないため）。
 //!   検出は table/list ごとに子孫を走査するため、入れ子の不規則構造では
 //!   O(ノード数 × 入れ子の深さ) になる（深さは [`MAX_TREE_DEPTH`] で有界）。
 //! - generic の折り畳み・`none`/`presentation` の除去・空ノードの剪定は行わない
@@ -90,6 +92,57 @@ fn is_excluded(doc: &Document, id: NodeId) -> bool {
             .any(|name| is_html_element_named(doc, id, name))
         || is_hidden_element(doc, id)
         || (is_html_element_named(doc, id, "input") && normalized_input_type(doc, id) == "hidden")
+}
+
+/// 規則的構造を圧縮してよいかを返す（`AISNAP-2`・TASK-12.5）。
+///
+/// 圧縮は子孫の展開（ref・state の付与）を省略するため、次の場合は情報が失われる。
+/// このときは圧縮せず通常の展開を維持する（従来の Snapshot と同じ結果）。
+/// - `tfoot` 行がある（圧縮表現は本文行のみで、合計額などフッターの可視情報が消える）。
+/// - 表・一覧の中に操作要素（リンク・ボタン・入力欄等）がある（ref と state が消える）。
+fn can_compress(
+    doc: &Document,
+    container: NodeId,
+    structure: &crate::compress_table::RegularStructure,
+) -> bool {
+    structure.footer_rows.is_empty() && !has_interactive_descendant(doc, container)
+}
+
+/// `container` の子孫（描画対象のみ）に操作要素があるかを反復走査で返す。
+fn has_interactive_descendant(doc: &Document, container: NodeId) -> bool {
+    let mut stack: Vec<NodeId> = doc.children(container).collect();
+    while let Some(id) = stack.pop() {
+        if !doc.is_element(id) || is_excluded(doc, id) {
+            continue;
+        }
+        if is_interactive_element(doc, id) {
+            return true;
+        }
+        stack.extend(doc.children(id));
+    }
+    false
+}
+
+/// 操作可能（フォーカス・クリック・入力の対象になり得る）要素か。
+fn is_interactive_element(doc: &Document, id: NodeId) -> bool {
+    if [
+        "button", "input", "select", "textarea", "summary", "details",
+    ]
+    .iter()
+    .any(|n| is_html_element_named(doc, id, n))
+    {
+        return true;
+    }
+    if ["a", "area"]
+        .iter()
+        .any(|n| is_html_element_named(doc, id, n))
+        && doc.attribute(id, "href").is_some()
+    {
+        return true;
+    }
+    ["tabindex", "contenteditable", "onclick", "role"]
+        .iter()
+        .any(|a| doc.attribute(id, a).is_some())
 }
 
 /// ref の識別属性。`id` → フォーム部品の `name` → `a`/`area` の `href` の順に、
@@ -198,6 +251,7 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
             .iter()
             .any(|n| is_html_element_named(doc, child, n))
             && let TableDetection::Regular(structure) = detect_regular_structure(doc, child)
+            && can_compress(doc, child, &structure)
         {
             let headers = assign_header_refs(doc, &index, &structure, elem_ref, &mut refs)?;
             let compressed = compress_rows(doc, &structure);
