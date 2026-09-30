@@ -512,11 +512,27 @@ impl Profile {
     /// - Windows など ACL 隔離が未実装のプラットフォームでは常に
     ///   [`ProfileError::Unsupported`]
     pub fn open(root: impl AsRef<Path>) -> Result<Profile, ProfileError> {
+        Self::open_impl(root.as_ref(), false)
+    }
+
+    /// [`Profile::open`] と同じだが、既存のルートディレクトリが他者と共有される形
+    /// （unix で sticky bit 付き・group 書込可・other 書込可）の場合は `fchmod(0700)` の
+    /// 前に [`ProfileError::InvalidLayout`] で拒否する（`PROF-1`・TASK-60（60.4）・#203）。
+    ///
+    /// 判定は実際に開いたルートのハンドル（fd）に対する `fstat` で行い、パス検査と
+    /// `fchmod` の間の差し替え（TOCTOU）を避ける。新規作成したディレクトリは
+    /// `mkdirat(0700)` で作られるため誤って拒否されない。`ExplicitStore` の
+    /// `open_or_create` から呼ばれる。
+    pub(crate) fn open_rejecting_shared_root(root: &Path) -> Result<Profile, ProfileError> {
+        Self::open_impl(root, true)
+    }
+
+    fn open_impl(root: &Path, reject_shared_root: bool) -> Result<Profile, ProfileError> {
         #[cfg(not(unix))]
         {
             // ディレクトリを一切作成せず即座に拒否する（fail-closed。
             // 上記モジュール doc・`ProfileError::Unsupported` 参照）。
-            let _ = root;
+            let _ = (root, reject_shared_root);
             Err(ProfileError::Unsupported {
                 reason: "ACL-based directory isolation is not implemented on this platform yet (tracked by XOS-7..XOS-10); refusing to create a profile with inherited, unrestricted permissions",
             })
@@ -529,7 +545,7 @@ impl Profile {
             // 順に辿るため、この正規化は表示・比較用のパスを整えるだけで、
             // 境界検証そのものは下記のハンドル基準の走査が担う
             // （PR #437 Bugbot 指摘）。
-            let root: PathBuf = root.as_ref().components().collect();
+            let root: PathBuf = root.components().collect();
 
             // 相対パスを渡された場合、ここで一度だけ `std::env::current_dir`
             // 基準の絶対パスへ変換して `Profile` に保存する。変換しないまま
@@ -548,6 +564,9 @@ impl Profile {
             // 使うため、判定と作成・chmod の間でパス文字列を再解決する
             // window が生じない（PR #437 レビュー指摘の TOCTOU 解消）。
             let root_fd = open_dir_all_verified(&root)?;
+            if reject_shared_root {
+                reject_shared_dir_fd(&root_fd, &root)?;
+            }
             set_dir_permissions_0700(&root_fd)?;
 
             // ルートの親を open 時点で確保する。この時点の `root_fd/..` は、
@@ -1807,6 +1826,23 @@ fn open_dir_all_verified(path: &Path) -> Result<OwnedFd, ProfileError> {
 /// 本 crate の未実装範囲。`XOS-7`〜`XOS-10`。TASK-50（50.1）・#176 のスコープ
 /// 外。coding-rust.md「クロスプラットフォーム」で OS 固有処理を
 /// `cfg(target_os = ...)` に局所化する方針に従う）。
+/// ハンドル `fd` のディレクトリが共有形（sticky・group 書込・other 書込）なら拒否する。
+///
+/// `fchmod(0700)` が共有ディレクトリの他利用者から権限を奪うのを防ぐ。`fd` に対する
+/// `fstat` のため、パスの再解決による TOCTOU が生じない（`PROF-1`）。
+#[cfg(unix)]
+fn reject_shared_dir_fd(fd: &OwnedFd, display_path: &Path) -> Result<(), ProfileError> {
+    let st = rustix::fs::fstat(fd).map_err(|err| ProfileError::Io(err.into()))?;
+    // sticky(0o1000)・group 書込(0o020)・other 書込(0o002)。
+    if st.st_mode & 0o1022 != 0 {
+        return Err(ProfileError::InvalidLayout {
+            path: display_path.to_path_buf(),
+            reason: "explicit profile root must not be an existing shared directory",
+        });
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn set_dir_permissions_0700(fd: &OwnedFd) -> Result<(), ProfileError> {
     rustix::fs::fchmod(fd, Mode::RWXU).map_err(|err| ProfileError::Io(err.into()))

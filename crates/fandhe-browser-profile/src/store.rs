@@ -184,8 +184,8 @@ impl ProfileStore for OsDefaultStore {
 ///   ため（`PROF-1`・`PROF-4`）。畳み込まれる要素（`a/link/..` の `link`）が既存の
 ///   symlink の場合は、OS の解決先と字句的な結果が食い違うため [`ProfileError::InvalidLayout`]
 ///   で拒否する
-/// - 既存ディレクトリが他者と共有される形（unix で sticky bit 付き・other 書込可。
-///   `/tmp` 等）の場合は、[`Profile::open`] の `fchmod(0700)` が共有ディレクトリ自体へ
+/// - 既存ディレクトリが他者と共有される形（unix で sticky bit 付き・group 書込可・other 書込可。
+///   `/tmp`・`0770` 等）の場合は、[`Profile::open`] の `fchmod(0700)` が共有ディレクトリ自体へ
 ///   及ぶため [`ProfileError::InvalidLayout`] で拒否する。専用の子ディレクトリを指定する
 /// - `..` を畳み込んだ結果が OS のルート（`/`・ドライブルート）になる指定は、
 ///   `fchmod(0700)` やファイル作成が OS ルートへ及ぶため [`ExplicitStore::new`] が
@@ -237,6 +237,12 @@ impl ProfileStore for ExplicitStore {
     fn resolve_root(&self) -> Result<ResolvedRoot, ProfileError> {
         Ok(ResolvedRoot::new(self.root.clone(), RootSource::Explicit))
     }
+
+    /// 開いたルートのハンドルで共有ディレクトリ（sticky・group/other 書込可）を
+    /// `fchmod(0700)` の前に拒否して開く（`PROF-1`・TOCTOU 回避）。
+    fn open_or_create(&self) -> Result<Profile, ProfileError> {
+        Profile::open_rejecting_shared_root(&self.root)
+    }
 }
 
 /// `..` と `.` を字句的に畳み込んだパスを返す（`PROF-1`）。
@@ -275,7 +281,7 @@ fn normalize_lexically(path: &Path) -> Result<PathBuf, ProfileError> {
     Ok(out)
 }
 
-/// 既存ディレクトリが共有ディレクトリ（unix で sticky bit 付きまたは other 書込可）なら拒否する。
+/// 既存ディレクトリが共有ディレクトリ（unix で sticky bit 付き・group 書込可・other 書込可）なら拒否する。
 ///
 /// [`Profile::open`] はルート自体を `fchmod(0700)` するため、`/tmp` のような共有
 /// ディレクトリを指定されると他者の利用を壊す（`PROF-1`）。存在しない・取得できない
@@ -286,7 +292,7 @@ fn reject_shared_existing_dir(root: &Path) -> Result<(), ProfileError> {
         use std::os::unix::fs::MetadataExt;
         if let Ok(meta) = std::fs::symlink_metadata(root)
             && meta.is_dir()
-            && meta.mode() & 0o1002 != 0
+            && meta.mode() & 0o1022 != 0
         {
             return Err(ProfileError::InvalidLayout {
                 path: root.to_path_buf(),
@@ -352,6 +358,15 @@ impl<D: ProfileStore> ProfileStore for OverridableStore<D> {
         match &self.explicit {
             Some(explicit) => explicit.resolve_root(),
             None => self.default.resolve_root(),
+        }
+    }
+
+    /// 明示指定があれば [`ExplicitStore::open_or_create`]（fd 基準の共有ディレクトリ
+    /// 拒否つき）、なければ既定側の `open_or_create` に委譲する。
+    fn open_or_create(&self) -> Result<Profile, ProfileError> {
+        match &self.explicit {
+            Some(explicit) => explicit.open_or_create(),
+            None => self.default.open_or_create(),
         }
     }
 }
@@ -1048,6 +1063,51 @@ mod tests {
         }
         // 専用の子ディレクトリは受け付ける。
         assert!(ExplicitStore::new(shared.join("profile")).is_ok());
+    }
+
+    /// PROF-1: group 書込可（0770）の既存ディレクトリも共有とみなして拒否する。
+    #[test]
+    #[cfg(unix)]
+    fn prof_1_explicit_group_writable_dir_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new();
+        let shared = tmp.0.join("group-shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+        match ExplicitStore::new(shared.clone()) {
+            Err(ProfileError::InvalidLayout { reason, .. }) => {
+                assert_eq!(
+                    reason,
+                    "explicit profile root must not be an existing shared directory"
+                );
+            }
+            other => panic!("expected InvalidLayout, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// PROF-1: `new` の後に共有形へ変わったルートも、`open_or_create` が開いた fd の
+    /// `fstat` で拒否し、`fchmod(0700)` で権限を奪わない。
+    #[test]
+    #[cfg(unix)]
+    fn prof_1_open_or_create_rejects_shared_root_by_fd() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new();
+        let root = tmp.0.join("late-shared");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = ExplicitStore::new(root.clone()).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap();
+        match store.open_or_create() {
+            Err(ProfileError::InvalidLayout { reason, .. }) => {
+                assert_eq!(
+                    reason,
+                    "explicit profile root must not be an existing shared directory"
+                );
+            }
+            other => panic!("expected InvalidLayout, got {:?}", other.map(|_| ())),
+        }
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o770);
     }
 
     /// PROF-1: `OverridableStore` は dyn 互換で明示パスを返す。
