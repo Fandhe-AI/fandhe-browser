@@ -111,15 +111,12 @@
 //! - 子 → 親へ `ObjectHandle` を渡す経路（オブジェクト参照の往復・親の handle
 //!   照合）は未実装で、現状は fail-closed で拒否する（`TASK-29.5b` の
 //!   後続作業。REPAIR-3）。setter（書き込み可能プロパティ）も未対応。
-//! - トレイト [`JsEngine`] 経由で登録した [`NativeFn`]（`Send` なし。
-//!   `TASK-29.6.2`・Issue #548）は専用スレッドへ渡せないため、呼び出し
-//!   スレッド上でそのまま実行する（`NativeEntry::Inline`）。この経路では
-//!   (1) 戻らない関数を途中で打ち切れない（期限は戻った後にしか判定できず、
-//!   超過していれば子を kill して `Timeout` にする）、(2)
-//!   [`NativeCallContext`]（期限・取り消しフラグ）は渡らない、(3) unwind する
-//!   ビルドでは関数内の panic を捕捉して JS 向けエラーへ変換する
-//!   （release は `panic = "abort"` で両経路とも同じ）。期限の強制が必要な呼び出し元は inherent API（[`ParentNativeFn`]・
-//!   `Threaded` 経路）を使う。このため [`V8ProcessEngine`] は `Send` ではない
+//! - トレイト [`JsEngine`] 経由で登録した [`NativeFn`]（`Send` 境界付き。
+//!   `TASK-29.6.2`・Issue #548）は、`ParentNativeFn` へ包んで inherent API と
+//!   同じ `Threaded` 経路（専用スレッド＋期限付き待機）で実行する。このため
+//!   期限は強制できるが、[`NativeCallContext`]（期限・取り消しフラグ）は
+//!   `NativeFn` のシグネチャに無いため関数へは渡らない（協調的な中断は
+//!   できない）。期限内に戻らない関数のスレッドは下記のとおり残る
 //! - 期限を過ぎて放棄された `NativeFn` のスレッドが `Mutex` を握ったままの
 //!   登録は、子を再起動しても `try_lock` に失敗し続けて JS 側へエラーを
 //!   返す（再起動しても直らない。Issue #527）
@@ -201,21 +198,14 @@ pub type ParentNativeFn =
 
 /// [`V8ProcessEngine::native_fns`] の 1 要素（`TASK-29.6.2`・Issue #548）。
 ///
-/// 実行経路を型で区別する。
-///
-/// - `Threaded`: 本モジュールの inherent API（[`ParentNativeFn`]・`Send`）で
-///   登録されたもの。専用スレッドで実行するため `Arc<Mutex<..>>` で保持し、
-///   戻らない呼び出しが `Mutex` を保持し続けた場合、次回以降の呼び出しは
-///   `try_lock` が失敗して即座にエラーとなる（待機スレッドを積み上げない）。
-///   期限の強制はこの経路でのみ効く
-/// - `Inline`: トレイト [`super::engine_trait::JsEngine`] 経由で登録された
-///   [`NativeFn`]（`Send` なし）。専用スレッドへ渡せないため、呼び出し元
-///   スレッド上でそのまま実行する。`RefCell` は再入（自身の実行中に同じ
-///   関数が呼ばれる）を検出するために使う。期限は関数が戻った後にしか
-///   判定できない（既知の制限を参照）
+/// 親プロセスで実行するネイティブ関数は、inherent API（[`ParentNativeFn`]）・
+/// トレイト経由（`Send` 付きの [`NativeFn`] を `ParentNativeFn` へ包む）とも
+/// 専用スレッドで実行し、期限まで待つ（`Threaded`）。`Arc<Mutex<..>>` で保持し、
+/// 戻らない呼び出しが `Mutex` を保持し続けた場合、次回以降の呼び出しは
+/// `try_lock` が失敗して即座にエラーとなる（待機スレッドを積み上げない）。
+/// 将来、実行境界の異なる経路を足せるよう enum にしている。
 enum NativeEntry {
     Threaded(Arc<Mutex<ParentNativeFn>>),
-    Inline(std::cell::RefCell<NativeFn>),
 }
 
 /// ハンドシェイク（`Hello` フレームの受信）を待つ上限時間（設計書
@@ -1191,10 +1181,9 @@ impl V8ProcessEngine {
     /// 子の応答が想定外・期限切れ・子の異常終了なら、子を破棄して
     /// `EngineUnavailable` 等を返す（メッセージに "context was discarded"）。
     ///
-    /// トレイト [`JsEngine`] 側の `inject_global_function`（`Send` なしの
-    /// [`NativeFn`]）は呼び出しスレッド上で実行する別経路で、期限を強制
-    /// できない（モジュール doc「既知の制限」）。本メソッド（[`ParentNativeFn`]・
-    /// 専用スレッド）は期限を強制できる。
+    /// トレイト [`JsEngine`] 側の `inject_global_function`（`Send` 付きの
+    /// [`NativeFn`]）も `ParentNativeFn` へ包んで同じ専用スレッド経路で実行する
+    /// （モジュール doc「既知の制限」）。
     #[doc(hidden)]
     pub fn inject_global_function(
         &mut self,
@@ -1204,8 +1193,7 @@ impl V8ProcessEngine {
         self.register_global_function_entry(name, NativeEntry::Threaded(Arc::new(Mutex::new(func))))
     }
 
-    /// [`Self::inject_global_function`]（`Threaded`）とトレイト実装
-    /// （`Inline`）が共有する登録本体（`TASK-29.6.2`・Issue #548）。
+    /// [`Self::inject_global_function`] とトレイト実装が共有する登録本体（`TASK-29.6.2`・Issue #548）。
     fn register_global_function_entry(
         &mut self,
         name: &str,
@@ -1279,7 +1267,7 @@ impl V8ProcessEngine {
     /// `EngineUnavailable` 等を返す（"context was discarded"）。
     ///
     /// トレイト [`JsEngine`] 側の `bind_dom_like_object`（メソッドのみ・
-    /// `NativeFn`）は呼び出しスレッド上で実行する別経路（モジュール doc
+    /// `Send` 付きの `NativeFn`）も同じ専用スレッド経路で実行する（モジュール doc
     /// 「既知の制限」）。未実装（REPAIR-3）: setter と、bind したオブジェクト自体を
     /// JS 値として往復させる変換（`JsValue::ObjectHandle` の照合）も未対応で、
     /// 子発の handle は引き続き fail-closed で拒否する。
@@ -1306,8 +1294,7 @@ impl V8ProcessEngine {
         self.bind_dom_like_entries(name, members)
     }
 
-    /// [`Self::bind_dom_like_object`]（`Threaded`）とトレイト実装（`Inline`）が
-    /// 共有する bind 本体（`TASK-29.6.2`・Issue #548）。
+    /// [`Self::bind_dom_like_object`] とトレイト実装が共有する bind 本体（`TASK-29.6.2`・Issue #548）。
     fn bind_dom_like_entries(
         &mut self,
         name: &str,
@@ -2294,13 +2281,20 @@ fn write_frame_with_deadline(
     }
 }
 
+/// [`NativeFn`] を、期限を強制できる親側関数型 [`ParentNativeFn`] へ包む
+/// （`TASK-29.6.2`・Issue #548）。[`NativeCallContext`] は `NativeFn` に
+/// 渡せないため捨てる。
+fn wrap_native_fn(mut func: NativeFn) -> ParentNativeFn {
+    Box::new(move |args: &[JsValue], _ctx: &NativeCallContext| func(args))
+}
+
 /// トレイト [`JsEngine`] 経由の入口（`TASK-29.6.2`・Issue #548。`JS-1`）。
 ///
 /// [`super::engine_trait::create_engine`] が `Box<dyn JsEngine>` として返す。
-/// 登録した [`NativeFn`]（`Send` なし）は [`NativeEntry::Inline`] として
-/// 保持し、呼び出しスレッド上で実行する（期限の強制ができない。
-/// モジュール doc「既知の制限」）。inherent メソッドと同名のため、委譲先は
-/// 型パスで明示する。
+/// 登録した [`NativeFn`]（`Send`）は [`wrap_native_fn`] で [`ParentNativeFn`] へ
+/// 包み、inherent API と同じ専用スレッド経路（[`NativeEntry::Threaded`]）で
+/// 実行する。これにより戻らない関数があっても `evaluate_script` は期限内に
+/// 戻る。inherent メソッドと同名のため、委譲先は型パスで明示する。
 impl JsEngine for V8ProcessEngine {
     fn evaluate_script(
         &mut self,
@@ -2313,7 +2307,7 @@ impl JsEngine for V8ProcessEngine {
     fn inject_global_function(&mut self, name: &str, func: NativeFn) -> Result<(), JsEngineError> {
         self.register_global_function_entry(
             name,
-            NativeEntry::Inline(std::cell::RefCell::new(func)),
+            NativeEntry::Threaded(Arc::new(Mutex::new(wrap_native_fn(func)))),
         )
     }
 
@@ -2328,7 +2322,7 @@ impl JsEngine for V8ProcessEngine {
                 (
                     member_name,
                     worker_protocol::DomLikeMemberKind::Method,
-                    NativeEntry::Inline(std::cell::RefCell::new(f)),
+                    NativeEntry::Threaded(Arc::new(Mutex::new(wrap_native_fn(f)))),
                 )
             })
             .collect();
@@ -2456,46 +2450,8 @@ fn dispatch_native_call(
     }
     let native_return = match entry {
         NativeEntry::Threaded(entry) => dispatch_threaded(Arc::clone(entry), args, deadline)?,
-        NativeEntry::Inline(cell) => dispatch_inline(cell, &args, deadline)?,
     };
     Ok(encode_bounded_native_return(&native_return))
-}
-
-/// [`NativeEntry::Inline`]（トレイト経由で登録された [`NativeFn`]）を呼び出し
-/// スレッド上で実行する（`TASK-29.6.2`・Issue #548）。
-///
-/// [`dispatch_native_call`] から呼ばれる。`NativeFn` は `Send` を要求しない
-/// ため専用スレッドへ渡せず、期限の強制ができない。関数が戻った時点で
-/// 期限を過ぎていれば [`NativeDispatchViolation::DeadlineExceeded`] を返し
-/// （呼び出し元が子を kill して `Timeout` にする）、戻らない関数は打ち切れない
-/// （REPAIR-3。モジュール doc「既知の制限」）。[`NativeCallContext`] は
-/// `NativeFn` のシグネチャに無いため渡らない。再入は
-/// [`NativeReturn::Err`] にする。unwind するビルドでは panic を捕捉して
-/// [`NativeReturn::Err`] に変換する（release は `panic = "abort"`）。
-fn dispatch_inline(
-    cell: &std::cell::RefCell<NativeFn>,
-    args: &[JsValue],
-    deadline: Instant,
-) -> Result<NativeReturn, NativeDispatchViolation> {
-    let Ok(mut func) = cell.try_borrow_mut() else {
-        return Ok(NativeReturn::Err(
-            "the native function is still busy with a previous call".to_string(),
-        ));
-    };
-    // unwind するビルドでは panic を `evaluate_script` の呼び出し元へ伝播させず、
-    // `Threaded` 経路（専用スレッド内で閉じ JS エラーへ変換）と同じく
-    // `NativeReturn::Err` に変換して `Result` 契約を守る。`FnMut` の内部状態が
-    // 壊れうるが、以降の呼び出しも同じ `Err` 経路で扱えるため
-    // `AssertUnwindSafe` とする。release は `panic = "abort"` のため捕捉できない。
-    let ret = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| func(args))) {
-        Ok(Ok(value)) => NativeReturn::Ok(value),
-        Ok(Err(err)) => NativeReturn::Err(worker_protocol::truncate_for_wire(&err.to_string())),
-        Err(_) => NativeReturn::Err("the native function panicked".to_string()),
-    };
-    if Instant::now() >= deadline {
-        return Err(NativeDispatchViolation::DeadlineExceeded);
-    }
-    Ok(ret)
 }
 
 /// [`NativeEntry::Threaded`] を専用スレッドで実行し、期限まで待つ
@@ -3135,48 +3091,6 @@ mod tests {
 
     fn entry(func: ParentNativeFn) -> NativeEntry {
         NativeEntry::Threaded(Arc::new(Mutex::new(func)))
-    }
-
-    /// `TASK-29.6.2`・Issue #548: `Inline` の `NativeFn` が実行中（借用中）に
-    /// 同じエントリへ再入した場合、panic せず具体的なエラー文言の
-    /// [`NativeReturn::Err`] になること。正常な後続呼び出しは成功すること。
-    #[test]
-    fn js_1_dispatch_inline_reentry_returns_still_busy_error() {
-        let cell = std::cell::RefCell::new(
-            Box::new(|_args: &[JsValue]| Ok(JsValue::Number(7.0))) as NativeFn
-        );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        {
-            let _held = cell.borrow_mut();
-            let ret = dispatch_inline(&cell, &[], deadline).expect("no protocol violation");
-            assert_eq!(
-                ret,
-                NativeReturn::Err(
-                    "the native function is still busy with a previous call".to_string()
-                )
-            );
-        }
-        let ret = dispatch_inline(&cell, &[], deadline).expect("no protocol violation");
-        assert_eq!(ret, NativeReturn::Ok(JsValue::Number(7.0)));
-    }
-
-    /// `TASK-29.6.2`・Issue #548: `Inline` の `NativeFn` が panic しても（unwind
-    /// するテストビルドでは）呼び出し元へ伝播せず [`NativeReturn::Err`] になり、
-    /// 借用が解放されて後続呼び出しが `Threaded` 経路と同じ規約で処理されること。
-    #[test]
-    fn js_1_dispatch_inline_contains_a_native_fn_panic_when_unwinding() {
-        let cell = std::cell::RefCell::new(Box::new(
-            |_args: &[JsValue]| -> Result<JsValue, JsEngineError> {
-                panic!("intentional panic for test");
-            },
-        ) as NativeFn);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let ret = dispatch_inline(&cell, &[], deadline).expect("no protocol violation");
-        assert_eq!(
-            ret,
-            NativeReturn::Err("the native function panicked".to_string())
-        );
-        assert!(cell.try_borrow_mut().is_ok());
     }
 
     /// `TASK-29`・Issue #526: 登録件数の上限が具体値どおりであること

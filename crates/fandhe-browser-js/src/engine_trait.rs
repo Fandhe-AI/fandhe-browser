@@ -235,11 +235,12 @@ impl NativeCallContext {
 /// プロセス全体が終了する。panic の封じ込めにはプロセス分離が必要で、
 /// 現契約の範囲外（別途設計判断）。
 ///
-/// `Send`/`Sync` 境界は付けない。V8 の `Isolate`/`HandleScope` はスレッド
-/// 固有であり、境界を付けると V8 実装（TASK-29）が満たせなくなるため
-/// （`js-engine.md`「選択はプロセス起動時に1回」が定める、エンジンの実行が
-/// プロセス内で単一スレッドに閉じる前提に対応する）。
-pub type NativeFn = Box<dyn FnMut(&[JsValue]) -> Result<JsValue, JsEngineError>>;
+/// **`Send` 境界（`TASK-29.6.2`・Issue #548）**: 子プロセス版エンジンは
+/// 関数を専用スレッドで実行して期限を強制する（AGENTS.md「リソース上限」）ため
+/// `Send` を要求する。`Rc` 等 `!Send` な状態は捕獲できない（`Arc<Mutex<_>>` 等を
+/// 使う）。`Sync` は不要。V8 の `Isolate`/`HandleScope` 自体はスレッド固有だが、
+/// 関数は `JsValue` のみを受け渡すため `Send` 境界と衝突しない。
+pub type NativeFn = Box<dyn FnMut(&[JsValue]) -> Result<JsValue, JsEngineError> + Send>;
 
 /// [`JsEngine::evaluate_script`] の実行制御オプション（TASK-28.3・`JS-1`）。
 ///
@@ -361,8 +362,8 @@ impl std::error::Error for JsEngineError {}
 /// 橋渡しは TASK-30 で実装する）。
 ///
 /// スレッド安全性: 実装は単一スレッドでの利用を前提としてよい（本トレイト
-/// に `Send`/`Sync` 境界は付けない。理由は [`NativeFn`] のドキュメントを
-/// 参照）。
+/// に `Send`/`Sync` 境界は付けない。V8 の `Isolate` がスレッド固有のため）。
+/// 登録する [`NativeFn`] のみ `Send` を要求する（[`NativeFn`] 参照）。
 pub trait JsEngine {
     /// スクリプトを評価し、結果を [`JsValue`] で返す（`JS-1`「スクリプト
     /// 評価」）。
@@ -383,14 +384,13 @@ pub trait JsEngine {
     /// 登録し、子が登録を拒否した場合（`undefined` 等 non-configurable な名前・
     /// 重複・件数上限）は [`JsEngineError::BindingFailed`] を返す。
     ///
-    /// 子プロセス版の制限（`TASK-29.6.2`・Issue #548。REPAIR-3）: `func` は
-    /// `Send` ではないため専用スレッドへ渡せず、`evaluate_script` を呼んだ
-    /// スレッド上で実行する。戻らない関数は途中で打ち切れず（期限は関数が
-    /// 戻った後にしか判定できない）、期限・取り消しの通知
-    /// （`NativeCallContext`）も渡らない。unwind するビルドでは `func` 内の
-    /// panic が `evaluate_script` の呼び出し元まで伝播する。期限の強制が必要な
-    /// 呼び出し元は `process_engine` の `#[doc(hidden)]` API（`Send` 付き関数型）
-    /// を使う。`func` へ渡る引数は JS 由来の untrusted な値である。
+    /// 子プロセス版（`TASK-29.6.2`・Issue #548）は `func` を専用スレッドで
+    /// 実行し、期限まで待つ。戻らない関数があっても `evaluate_script` は期限内に
+    /// `Timeout` で戻る（放棄されたスレッドは戻るかプロセス終了まで残る。
+    /// 生存数は上限あり）。期限・取り消しの通知（`NativeCallContext`）は
+    /// `func` へ渡らない。unwind するビルドでは `func` 内の panic を捕捉して
+    /// JS 側のエラーへ変換する（release は `panic = "abort"` でホストごと終了）。
+    /// `func` へ渡る引数は JS 由来の untrusted な値である。
     fn inject_global_function(&mut self, name: &str, func: NativeFn) -> Result<(), JsEngineError>;
 
     /// 名前付きの DOM 風オブジェクト（複数のネイティブメソッドを持つ）を
@@ -400,9 +400,9 @@ pub trait JsEngine {
     ///
     /// 子プロセス版は子の再起動時に登録順どおり再登録する
     /// （`TASK-29.5b`）。全メソッドを [`inject_global_function`]
-    /// （Self::inject_global_function）と同じく呼び出しスレッド上で実行するため、
-    /// 同じ制限（期限を強制できない・`NativeCallContext` が渡らない・panic の
-    /// 伝播。`TASK-29.6.2`・Issue #548）が当てはまる。
+    /// （Self::inject_global_function）と同じく専用スレッドで期限付きで実行する
+    /// （`TASK-29.6.2`・Issue #548）。`NativeCallContext` が渡らない・panic の
+    /// 扱いも同じ。
     fn bind_dom_like_object(
         &mut self,
         name: &str,

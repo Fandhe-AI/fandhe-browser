@@ -203,9 +203,9 @@ mod conformance_checks {
         CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsEngineError, JsValue, NativeFn,
         bundled_engines, create_engine,
     };
-    use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     /// [`run_for_each_bundled_engine`] の実行結果（何件を実チェックし、何件が
     /// `NotYetImplemented` 契約確認で終わったか）。
@@ -376,10 +376,10 @@ mod conformance_checks {
         let options = EvaluateOptions::default();
 
         // print: Rust 側が呼び出し引数を記録できること（PoC-3 の print 相当）。
-        let printed: Rc<RefCell<Vec<JsValue>>> = Rc::new(RefCell::new(Vec::new()));
-        let printed_for_closure = Rc::clone(&printed);
+        let printed: Arc<Mutex<Vec<JsValue>>> = Arc::new(Mutex::new(Vec::new()));
+        let printed_for_closure = Arc::clone(&printed);
         let print_fn: NativeFn = Box::new(move |args: &[JsValue]| {
-            printed_for_closure.borrow_mut().extend_from_slice(args);
+            printed_for_closure.lock().unwrap().extend_from_slice(args);
             Ok(JsValue::Undefined)
         });
         engine
@@ -389,7 +389,7 @@ mod conformance_checks {
             .evaluate_script("print('hello')", &options)
             .unwrap_or_else(|err| panic!("[{kind:?}] calling print failed: {err}"));
         assert_eq!(
-            *printed.borrow(),
+            *printed.lock().unwrap(),
             vec![JsValue::String("hello".into())],
             "[{kind:?}] print must record its argument on the Rust side"
         );
@@ -430,13 +430,13 @@ mod conformance_checks {
     /// （エンジン非依存。PoC-3 の `dom.setText`/`dom.getText`/`dom.count` 相当）。
     fn check_dom_like_binding(kind: EngineKind, engine: &mut dyn JsEngine) {
         let options = EvaluateOptions::default();
-        let store: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
+        let store: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
 
         let set_text_fn: NativeFn = {
-            let store = Rc::clone(&store);
+            let store = Arc::clone(&store);
             Box::new(move |args: &[JsValue]| match (args.first(), args.get(1)) {
                 (Some(JsValue::String(id)), Some(JsValue::String(text))) => {
-                    store.borrow_mut().insert(id.clone(), text.clone());
+                    store.lock().unwrap().insert(id.clone(), text.clone());
                     Ok(JsValue::Undefined)
                 }
                 _ => Err(JsEngineError::BindingFailed(
@@ -445,10 +445,10 @@ mod conformance_checks {
             })
         };
         let get_text_fn: NativeFn = {
-            let store = Rc::clone(&store);
+            let store = Arc::clone(&store);
             Box::new(move |args: &[JsValue]| match args.first() {
                 Some(JsValue::String(id)) => Ok(JsValue::String(
-                    store.borrow().get(id).cloned().unwrap_or_default(),
+                    store.lock().unwrap().get(id).cloned().unwrap_or_default(),
                 )),
                 _ => Err(JsEngineError::BindingFailed(
                     "getText expects an id string".into(),
@@ -456,8 +456,10 @@ mod conformance_checks {
             })
         };
         let count_fn: NativeFn = {
-            let store = Rc::clone(&store);
-            Box::new(move |_args: &[JsValue]| Ok(JsValue::Number(store.borrow().len() as f64)))
+            let store = Arc::clone(&store);
+            Box::new(move |_args: &[JsValue]| {
+                Ok(JsValue::Number(store.lock().unwrap().len() as f64))
+            })
         };
 
         engine
@@ -495,12 +497,12 @@ mod conformance_checks {
         );
 
         assert_eq!(
-            store.borrow().get("title").map(String::as_str),
+            store.lock().unwrap().get("title").map(String::as_str),
             Some("Fandhe"),
             "[{kind:?}] Rust-side store must reflect dom.setText('title', ...)"
         );
         assert_eq!(
-            store.borrow().get("body").map(String::as_str),
+            store.lock().unwrap().get("body").map(String::as_str),
             Some("x"),
             "[{kind:?}] Rust-side store must reflect dom.setText('body', ...)"
         );
