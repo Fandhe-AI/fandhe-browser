@@ -44,7 +44,7 @@ use fandhe_browser_core::dom::{Children, Document, NodeId};
 use crate::compress_table::{
     TableDetection, assign_header_refs, compress_rows, detect_regular_structure,
 };
-use crate::data_leaf::classify_data_leaf;
+use crate::data_leaf::{DataLeafKind, classify_data_leaf};
 
 use super::element_ref::{ElementRef, ElementSignature, RefAllocator, RefError};
 use super::name::{
@@ -137,6 +137,7 @@ fn bounded_descendant_count(doc: &Document, container: NodeId, limit: usize) -> 
 /// - 見出し・入れ子の表 / 一覧・ランドマーク等の意味的な子孫がある（heading 等のノードと ref が消える）。
 /// - 圧縮行はテキストノードのみを取り込むため、テキスト以外に由来する accessible name
 ///   （`img` の `alt`・`aria-label` 等）を持つ子孫がある。
+/// - 表セル以外のデータ葉（価格クラス要素等。`AISNAP-3`）の子孫がある（分類が消える）。
 fn can_compress(
     doc: &Document,
     container: NodeId,
@@ -158,12 +159,22 @@ fn has_lossy_descendant(doc: &Document, container: NodeId) -> bool {
             || is_interactive_element(doc, id)
             || is_semantic_structure_element(doc, id)
             || has_non_text_name_source(doc, id)
+            || has_non_cell_data_leaf(doc, id)
         {
             return true;
         }
         stack.extend(doc.children(id));
     }
     false
+}
+
+/// 表セル以外のデータ葉（価格クラス要素等）か（`AISNAP-3`）。
+///
+/// 圧縮行はセルのテキストしか保持せず、子孫要素の `Node::data_leaf` 分類が消える。
+/// `td`/`th`（`TableCell`）は圧縮の単位そのものなので除外し、それ以外の分類
+/// （`PriceClass` と将来追加される種別）は保守的に展開を維持する。
+fn has_non_cell_data_leaf(doc: &Document, id: NodeId) -> bool {
+    classify_data_leaf(doc, id).is_some_and(|k| k != DataLeafKind::TableCell)
 }
 
 /// 圧縮行の文字列で表せない意味的構造（見出し・入れ子の表 / 一覧・ランドマーク等）か。
@@ -756,6 +767,33 @@ mod tests {
                 .expect("outer container");
             assert!(outer.table.is_none(), "{html}");
         }
+    }
+
+    /// AISNAP-3 / AISNAP-2: 価格クラスのデータ葉を子孫に持つ表・一覧は圧縮せず展開し、
+    /// `DataLeafKind::PriceClass` を保持する（圧縮で分類が消える後退の回帰テスト）。
+    #[test]
+    fn aisnap_3_price_class_descendant_is_not_lost_by_compression() {
+        for html in [
+            "<body><ul><li><span class=\"price\">100</span></li><li>beta</li></ul></body>",
+            "<body><ul><li class=\"item-amount\">100</li><li>beta</li></ul></body>",
+            "<body><table><tr><th>A</th></tr><tr><td><b class=\"Currency\">JPY</b></td></tr></table></body>",
+        ] {
+            let s = snap(html);
+            assert!(!has_table_summary(&s), "{html}");
+            assert!(
+                all_nodes(&s.tree)
+                    .iter()
+                    .any(|n| n.data_leaf == Some(DataLeafKind::PriceClass)),
+                "{html}"
+            );
+        }
+    }
+
+    /// AISNAP-3: 表セル（TableCell）は圧縮の単位なので、従来どおり表は圧縮される。
+    #[test]
+    fn aisnap_3_plain_table_cells_still_compress() {
+        let s = snap("<body><table><tr><th>A</th></tr><tr><td>1</td></tr></table></body>");
+        assert!(has_table_summary(&s));
     }
 
     /// AISNAP-2: 圧縮判定の走査量が上限を超える巨大な一覧は圧縮せず展開する（有界）。
