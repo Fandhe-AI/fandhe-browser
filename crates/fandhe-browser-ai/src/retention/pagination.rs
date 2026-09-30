@@ -264,10 +264,11 @@ fn is_page_number_label(label: &str) -> bool {
 
 /// ページ番号の文脈ガード（数字だけのリンクの誤検出を防ぐ）。
 fn has_pagination_context(doc: &Document, id: NodeId) -> bool {
-    if doc
-        .attribute(id, "aria-current")
-        .is_some_and(|v| v.trim_matches(is_ascii_space).eq_ignore_ascii_case("page"))
-    {
+    if doc.attribute(id, "aria-current").is_some_and(|v| {
+        // 正規化（走査）の前にバイト長を検証し、巨大な値は fail-closed で無視する。
+        v.len() <= MAX_ARIA_LABEL_BYTES
+            && v.trim_matches(is_ascii_space).eq_ignore_ascii_case("page")
+    }) {
         return true;
     }
     doc.ancestors(id)
@@ -607,6 +608,18 @@ mod tests {
         assert_eq!(classify(&html), Some(PaginationKind::Next));
         let html = format!(r#"<a href="/x" class="{pad}next">3</a>"#);
         assert_eq!(classify(&html), Some(PaginationKind::Next));
+    }
+
+    /// AISNAP-12（TASK-16.2・Codex P0）: 巨大な aria-current は走査せず無視し、
+    /// 上限ちょうどは判定される。
+    #[test]
+    fn aisnap_12_oversized_aria_current_ignored() {
+        let pad = " ".repeat(MAX_ARIA_LABEL_BYTES);
+        let html = format!(r#"<a href="?p=3" aria-current="{pad}page">3</a>"#);
+        assert_eq!(classify(&html), None);
+        let pad = " ".repeat(MAX_ARIA_LABEL_BYTES - "page".len());
+        let html = format!(r#"<a href="?p=3" aria-current="{pad}page">3</a>"#);
+        assert_eq!(classify(&html), Some(PaginationKind::PageNumber));
     }
 
     /// AISNAP-12（TASK-16.2）: 対象外の要素・状態は None。

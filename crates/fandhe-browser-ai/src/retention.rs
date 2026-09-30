@@ -418,10 +418,12 @@ mod tests {
     /// 採用順位は最小の rank になる。
     #[test]
     fn aisnap_12_duplicate_index_keeps_first_reason_and_min_rank() {
+        // 残り予算 1 枠。index 10 は重複の最小 rank（0）で、index 9（rank 1）に勝つ。
+        // rank を統合しないと 10 の rank は 1 のままで、index 昇順の 9 が採用される。
         let c = [
             PriorityCandidate::new(10, RetentionReason::Pagination).with_rank(1),
+            PriorityCandidate::new(9, RetentionReason::Pagination).with_rank(1),
             sb(10).with_rank(0),
-            PriorityCandidate::new(11, RetentionReason::Pagination).with_rank(1),
         ];
         let r = select_retained_with_priority(30, &RetentionPolicy::new(6, 5), &c);
         assert_eq!(indexes(&r, RetentionReason::Pagination), vec![10]);
