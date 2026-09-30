@@ -1827,18 +1827,19 @@ fn open_dir_all_verified(path: &Path) -> Result<OwnedFd, ProfileError> {
 /// 外。coding-rust.md「クロスプラットフォーム」で OS 固有処理を
 /// `cfg(target_os = ...)` に局所化する方針に従う）。
 /// ハンドル `fd` のディレクトリが他者にアクセス可能な形（group/other の権限ビット・
-/// setuid/setgid/sticky のいずれかが立っている）なら拒否する。
+/// setuid/sticky のいずれかが立っている。継承され得る setgid は除く）なら拒否する。
 ///
 /// `fchmod(0700)` が共有ディレクトリの他利用者から権限を奪うのを防ぐ。`fd` に対する
 /// `fstat` のため、パスの再解決による TOCTOU が生じない（`PROF-1`）。
 #[cfg(unix)]
 fn reject_shared_dir_fd(fd: &OwnedFd, display_path: &Path) -> Result<(), ProfileError> {
     let st = rustix::fs::fstat(fd).map_err(|err| ProfileError::Io(err.into()))?;
-    // setuid/setgid/sticky(0o7000) と group/other の全権限ビット(0o077)。
+    // setuid/sticky(0o5000) と group/other の全権限ビット(0o077)。setgid(0o2000) は
+    // 親ディレクトリから mkdirat(0700) の新規作成物へ継承され得るため共有判定に含めない。
     // 0755 のような他者が読み取り・通過できる既存ディレクトリも、`fchmod(0700)` で
     // 他者のアクセスを奪うため拒否する（専用プロファイルと確認できるのは所有者のみ
     // アクセス可のものだけ）。
-    if st.st_mode & 0o7077 != 0 {
+    if st.st_mode & 0o5077 != 0 {
         return Err(ProfileError::InvalidLayout {
             path: display_path.to_path_buf(),
             reason: "explicit profile root must not be an existing shared directory",

@@ -292,7 +292,7 @@ fn reject_shared_existing_dir(root: &Path) -> Result<(), ProfileError> {
         use std::os::unix::fs::MetadataExt;
         if let Ok(meta) = std::fs::symlink_metadata(root)
             && meta.is_dir()
-            && meta.mode() & 0o7077 != 0
+            && meta.mode() & 0o5077 != 0
         {
             return Err(ProfileError::InvalidLayout {
                 path: root.to_path_buf(),
@@ -1063,6 +1063,18 @@ mod tests {
         }
         // 専用の子ディレクトリは受け付ける。
         assert!(ExplicitStore::new(shared.join("profile")).is_ok());
+    }
+
+    /// PROF-1: 親から setgid が継承された 0700 ディレクトリ（mode 02700）は専用ルートとして受け付ける。
+    #[test]
+    #[cfg(unix)]
+    fn prof_1_explicit_setgid_only_dir_is_accepted() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new();
+        let dir = tmp.0.join("setgid-root");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2700)).unwrap();
+        assert!(ExplicitStore::new(dir).is_ok());
     }
 
     /// PROF-1: group 書込可（0770）の既存ディレクトリも共有とみなして拒否する。
