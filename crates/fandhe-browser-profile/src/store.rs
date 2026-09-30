@@ -648,6 +648,11 @@ fn to_verbatim_wide(input: &[u16]) -> Result<(Vec<u16>, LongPathKind), &'static 
     if input.len() > VERBATIM_MAX_UNITS {
         return Err(too_long);
     }
+    // 埋め込み NUL は Win32 のファイル API が文字列終端として扱い、別パスへ切り詰められる
+    // （プロファイル境界の回避経路になる）ため、全経路で変換前に拒否する。
+    if input.contains(&0) {
+        return Err("path must not contain NUL characters");
+    }
     if let Some(rest) = input.strip_prefix(&VERBATIM) {
         validate_verbatim_rest(rest)?;
         // 入力長は上記で上限以下のため、変換後（無変更）の長さ判定は不要。
@@ -1639,6 +1644,19 @@ mod tests {
             to_verbatim_wide(&w(&over)),
             Err("path is too long for long path conversion")
         );
+    }
+
+    #[test]
+    fn xos_8_embedded_nul_is_rejected() {
+        let nul = "path must not contain NUL characters";
+        for input in [
+            "C:/a\0b",
+            "C:\\a\0",
+            "\\\\?\\C:\\a\0b",
+            "\\\\server\\share\\a\0b",
+        ] {
+            assert_eq!(to_verbatim_wide(&w(input)), Err(nul), "input: {input:?}");
+        }
     }
 
     #[test]
