@@ -240,15 +240,12 @@ impl TargetRegistry {
     }
 
     /// ターゲットを作成して ID を返す。件数・URL 長の上限超過・ID 枯渇時は表を変更しない。
-    pub fn create_target(
-        &self,
-        kind: TargetKind,
-        url: impl Into<String>,
-    ) -> Result<TargetId, CdpStateError> {
-        let url: String = url.into();
+    pub fn create_target(&self, kind: TargetKind, url: &str) -> Result<TargetId, CdpStateError> {
+        // 借用したまま長さを検証し、超過入力は所有 String へ複製する前に拒否する（巨大入力による DoS 対策）。
         if url.len() > MAX_URL_LEN {
             return Err(CdpStateError::UrlTooLong { limit: MAX_URL_LEN });
         }
+        let url = url.to_owned();
         let mut t = self.lock();
         if t.targets.len() >= MAX_TARGETS {
             return Err(CdpStateError::TooManyTargets { limit: MAX_TARGETS });
@@ -403,7 +400,7 @@ mod tests {
         assert_eq!(r.target(&id).unwrap().url().len(), MAX_URL_LEN);
         let over = "a".repeat(MAX_URL_LEN + 1);
         assert_eq!(
-            r.create_target(TargetKind::Page, over),
+            r.create_target(TargetKind::Page, &over),
             Err(CdpStateError::UrlTooLong { limit: MAX_URL_LEN })
         );
         assert_eq!(r.target_count(), 1);
