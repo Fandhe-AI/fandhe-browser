@@ -18,14 +18,17 @@
 //!
 //! # スタブについて
 //!
-//! [`create_engine`] は同梱済みの種別には `NotYetImplemented`、
-//! 同梱されていない種別には `NotBundled`（詳細は [`engine_trait`] を参照）
-//! を返す。以下は未実装（実装済みを装わない。REPAIR-3）。
+//! [`create_engine`] は V8 には子プロセス版エンジンを返し（`TASK-29.6.2`・
+//! Issue #548。遅延起動。ホストは `main` の先頭で
+//! [`run_js_worker_if_requested`] を呼ぶ義務がある。詳細は [`engine_trait`]）、
+//! 同梱済みの boa には `NotYetImplemented`、同梱されていない種別には
+//! `NotBundled` を返す。以下は未実装（実装済みを装わない。REPAIR-3）。
 //!
-//! - V8 の具象実装（`JS-1`、`TASK-29`、`MS-3`）: Platform/Isolate 初期化・
-//!   評価・注入・DOM 風バインディング・エラー変換（`29.6.1`）は実装済み。
-//!   `create_engine` への配線と `impl JsEngine`（`TASK-29.6.2`・Issue #548）
-//!   は未実装
+//! - V8 の具象実装（`JS-1`、`TASK-29`、`MS-3`）は `create_engine` への配線まで
+//!   完了（`TASK-29.6.2`）。トレイト経由の `NativeFn` は `Send` 境界付きで、
+//!   inherent API と同じ専用スレッド経路（期限付き待機）で実行するため期限を
+//!   強制できる。ただし `NativeCallContext` は関数へ渡らず協調的な中断は
+//!   できない（`process_engine` の「既知の制限」）
 //! - boa の具象実装（`JS-1`、`TASK-32`、`MS-3`）
 //! - core への統合（`js_stub` の置換。`JS-2`、`TASK-30`、`MS-3`）
 //!
@@ -113,13 +116,13 @@ mod worker_protocol;
 #[cfg(feature = "js-v8")]
 mod worker;
 // 子プロセスへの親側プロキシ（TASK-29・Issue #503 設計書 §3.2〜§3.4・
-// §7 W4）。`create_engine` への配線は TASK-29.6.2（Issue #548）で行う。
+// §7 W4）。`create_engine` へは TASK-29.6.2（Issue #548）で配線済み。
 //
 // `pub` にする理由: `tests/v8_worker.rs`（`harness = false`。W6）は結合
 // テストであり、別クレートとしてコンパイルされるため `pub(crate)` の
 // 項目を参照できない。`V8ProcessEngine`・`new`・`evaluate_script` は
 // 本番ビルド（`test-support` feature 無効）でも `#[doc(hidden)] pub` の
-// まま残す（`TASK-29.6.2` で `create_engine` から配線するための本番 API の
+// まま残す（`create_engine` から配線した（`TASK-29.6.2`）本番 API の
 // 一部であり、テスト専用ではない）。一方、テスト専用の入口
 // （`new_for_test`・`send_raw_frame_for_test`・`worker_pid_for_test`・
 // `max_script_source_bytes_for_test`・`max_raw_frame_bytes_for_test`・
