@@ -1806,11 +1806,17 @@ fn linux_proc_chains_related_detects_deep_descendants() {
     assert!(!measure::proc_chains_related(&[700, 600, 1], &owner));
     assert!(!measure::proc_chains_related(&[700, 2], &[100, 2]));
     // 実プロセスのチェーンは自 PID から始まり ppid 0 まで続く。
-    match measure::proc_ancestor_chain(std::process::id()) {
+    let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    match measure::proc_ancestor_chain(std::process::id(), far) {
         measure::ProcChain::Complete(chain) => {
             assert_eq!(chain.first(), Some(&std::process::id()));
             assert!(chain.len() >= 2, "chain should include a parent: {chain:?}");
         }
         other => panic!("expected Complete chain for own pid, got {other:?}"),
     }
+    // 期限超過済みなら祖先探索は DeadlineExceeded を返す。
+    assert_eq!(
+        measure::proc_ancestor_chain(std::process::id(), std::time::Instant::now()),
+        measure::ProcChain::DeadlineExceeded
+    );
 }

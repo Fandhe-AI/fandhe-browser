@@ -864,7 +864,8 @@ pub(crate) fn lookup_port_owner_pids(
     if !unreadable_pids.is_empty() && !owners.is_empty() {
         let mut owner_chains: Vec<Vec<u32>> = Vec::new();
         for &o in &owners {
-            match proc_ancestor_chain(o) {
+            check_deadline()?;
+            match proc_ancestor_chain(o, deadline) {
                 // 所有者から `root_pid` までの祖先だけを対象にする。ソケットの作成者は
                 // `root_pid` の起動後に生まれたプロセス（または `root_pid` 自身）で、
                 // `root_pid` より上位の祖先は継承で保持できない（fd 受け渡しは既知の限界）。
@@ -882,10 +883,17 @@ pub(crate) fn lookup_port_owner_pids(
                         "could not resolve the ancestry of socket owner pid {o}"
                     )));
                 }
+                ProcChain::DeadlineExceeded => {
+                    return Err(fail("port owner scan exceeded its deadline".to_string()));
+                }
             }
         }
         for &pid in &unreadable_pids {
-            let suspicious = match proc_ancestor_chain(pid) {
+            check_deadline()?;
+            let suspicious = match proc_ancestor_chain(pid, deadline) {
+                ProcChain::DeadlineExceeded => {
+                    return Err(fail("port owner scan exceeded its deadline".to_string()));
+                }
                 // 走査後に終了したプロセスは保持者になり得ない。
                 ProcChain::Gone => false,
                 ProcChain::Unknown => true,
@@ -922,6 +930,8 @@ pub(crate) enum ProcChain {
     Gone,
     /// 途中で ppid を読めない・循環・深さ超過などで確定できない。
     Unknown,
+    /// 照会の期限（`deadline`）を超過した。呼び出し側は `LookupFailed` にする。
+    DeadlineExceeded,
 }
 
 /// 祖先チェーンの深さ上限（循環・異常な `/proc` 対策。coding-rust.md「件数を上限検証」）。
@@ -930,12 +940,16 @@ const MAX_PROC_ANCESTOR_DEPTH: usize = 4096;
 
 /// `pid` から `/proc/<pid>/stat` の ppid を辿り、ppid 0 までのチェーンを返す。
 /// `lookup_port_owner_pids` が、fd を読めない PID と所有者の祖先関係を
-/// ツリー全体で判定するために使う。
+/// ツリー全体で判定するために使う。`deadline` を過ぎたら 1 段ごとに
+/// [`ProcChain::DeadlineExceeded`] を返す（`EXTERNAL_COMMAND_DEADLINE` 契約の維持）。
 #[cfg(target_os = "linux")]
-pub(crate) fn proc_ancestor_chain(pid: u32) -> ProcChain {
+pub(crate) fn proc_ancestor_chain(pid: u32, deadline: Instant) -> ProcChain {
     let mut chain: Vec<u32> = Vec::new();
     let mut cur = pid;
     loop {
+        if Instant::now() >= deadline {
+            return ProcChain::DeadlineExceeded;
+        }
         if chain.len() >= MAX_PROC_ANCESTOR_DEPTH || chain.contains(&cur) {
             return ProcChain::Unknown;
         }
