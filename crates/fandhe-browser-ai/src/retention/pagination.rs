@@ -261,13 +261,19 @@ fn has_pagination_context(doc: &Document, id: NodeId) -> bool {
 
 /// 単一要素がページネーションリンクか判定する（`AISNAP-12`・`TASK-16.2`）。
 ///
-/// HTML 名前空間の `<a>`（空でない `href`・非表示でない）だけが対象で、範囲外の
-/// `NodeId`・非要素・SVG 内の `<a>` は `None`。判定順はモジュール doc を参照。
+/// HTML 名前空間の `<a>`（空でない `href`・自身と祖先のいずれも `hidden` /
+/// `aria-hidden` でない）だけが対象で、範囲外の `NodeId`・非要素・SVG 内の `<a>`
+/// は `None`。判定順はモジュール doc を参照。
 pub fn classify_pagination_link(doc: &Document, id: NodeId) -> Option<PaginationKind> {
     if !is_html_named(doc, id, "a") {
         return None;
     }
-    if doc.attribute(id, "href").is_none_or(|h| h.is_empty()) || is_hidden_element(doc, id) {
+    if doc.attribute(id, "href").is_none_or(|h| h.is_empty())
+        || is_hidden_element(doc, id)
+        || doc
+            .ancestors(id)
+            .any(|a| doc.is_element(a) && is_hidden_element(doc, a))
+    {
         return None;
     }
 
@@ -529,6 +535,13 @@ mod tests {
             classify(r#"<a href="/x" rel="next" aria-hidden="true">次へ</a>"#),
             None
         );
+        // 祖先が非表示の `<a>` を直接渡しても None（祖先も確認する）。
+        for attrs in ["hidden", r#"aria-hidden="true""#] {
+            let html = format!(r#"<div {attrs}><a href="/p2" rel="next">Next</a></div>"#);
+            let doc = parse(&html);
+            let a = select(&doc, "a");
+            assert_eq!(classify_pagination_link(&doc, a), None, "{attrs}");
+        }
         let doc = parse(r#"<svg><a href="/x" rel="next">次へ</a></svg>"#);
         let svg_a = doc
             .descendants(doc.root())
