@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fandhe_backend_http::request::{ParseOutcome, parse_request_head};
 use fandhe_backend_http::response::Response;
-use fandhe_browser_cdp::{BrowserId, CdpState, TargetKind, router};
+use fandhe_browser_cdp::{BrowserId, CdpState, TargetKind, endpoints};
 use fandhe_browser_core::AppState;
 use fandhe_browser_profile::Profile;
 use serde_json::{Value, json};
@@ -61,7 +61,8 @@ async fn request(state: &Arc<CdpState>, method: &str, path: &str, host: Option<&
         ParseOutcome::Complete { head, .. } => head,
         ParseOutcome::Incomplete => panic!("incomplete request head"),
     };
-    router(Arc::clone(state)).dispatch(&head, &[]).await
+    let (router, _) = endpoints(state).expect("endpoints").into_parts();
+    router.dispatch(&head, &[]).await
 }
 
 fn json_of(res: &Response) -> Value {

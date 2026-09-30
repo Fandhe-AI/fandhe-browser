@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fandhe_backend_core::server::Server;
-use fandhe_browser_cdp::{BrowserId, CdpState, browser_websocket_config, router};
+use fandhe_browser_cdp::{BrowserId, CdpState, endpoints};
 use fandhe_browser_core::AppState;
 use fandhe_browser_profile::Profile;
 use serde_json::{Value, json};
@@ -55,9 +55,10 @@ async fn start(dir: &TempDir) -> SocketAddr {
         app,
         BrowserId::parse("fixed-1").unwrap(),
     ));
+    let (router, ws_config) = endpoints(&st).expect("endpoints").into_parts();
     let bound = Server::new()
-        .handler(router(Arc::clone(&st)))
-        .websocket(browser_websocket_config(&st).expect("ws config"))
+        .handler(router)
+        .websocket(ws_config)
         .bind("127.0.0.1:0")
         .await
         .expect("bind");

@@ -1,6 +1,6 @@
 //! `/json/*` ディスカバリ応答の本体生成と Host ヘッダ検証（TASK-41（41.3）・#172、`CDP-1`・MS-3）。
 //!
-//! [`crate::server::router`] のハンドラから呼ばれる純関数群で、`CdpState` にも HTTP の型にも
+//! `crate::server::router` のハンドラから呼ばれる純関数群で、`CdpState` にも HTTP の型にも
 //! 依存しない（3 OS で単体テストできる）。JSON は `serde_json` で組み立て、文字列連結はしない。
 //!
 //! # Host 検証（DNS rebinding 対策）

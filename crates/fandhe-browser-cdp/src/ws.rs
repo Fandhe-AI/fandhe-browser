@@ -1,7 +1,7 @@
 //! `/devtools/browser/{id}` WebSocket 受け口の受理判定と暫定メッセージハンドラ
 //! （TASK-41（41.4）・#173、`CDP-1`・`SEC-2`・MS-3）。
 //!
-//! [`crate::server::browser_websocket_config`] が `WebSocketConfig` へ組み込む部品で、
+//! `crate::server::browser_websocket_config` が `WebSocketConfig` へ組み込む部品で、
 //! 判定・応答生成は純関数として切り出し、3 OS で単体テストできるようにしている。
 //! 実際のハンドシェイク（RFC 6455）・フレーミングは core の `fandhe-backend-core`
 //! （websocket feature）が担い、cli（TASK-41.5）が `Server::websocket` で配線する。

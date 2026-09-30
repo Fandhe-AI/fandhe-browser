@@ -8,7 +8,7 @@
 //! # スタブについて
 //!
 //! `/json/*` ルータ（[`router`]。TASK-41.3）と `/devtools/browser/{id}` の WS 受け口設定
-//! （[`browser_websocket_config`]。TASK-41.4）は実装済み。WS のメッセージハンドラは
+//! （[`browser_websocket_config`]。TASK-41.4。公開入口は [`endpoints`]）は実装済み。WS のメッセージハンドラは
 //! 暫定（全リクエストへエラー応答。[`crate::ws`]）で、TASK-42 で置換する（REPAIR-3）。
 //! 初期ターゲット（`about:blank`）の自動作成は行わず、後続タスクの判断に委ねる。
 
@@ -85,6 +85,38 @@ impl fmt::Debug for CdpState {
     }
 }
 
+/// CDP の HTTP ルータと `/devtools/browser/{id}` の WebSocket 設定を一体で保持する組（`CDP-1`・
+/// TASK-41.4・MS-3。REPAIR-3・公開 API の契約）。
+///
+/// `/json/version` は `webSocketDebuggerUrl` を返すため、ルータだけを使うと WebSocket が
+/// 未配線のまま案内 URL へ接続失敗する。両者を別々に公開せず [`endpoints`] で同時に構築させ、
+/// [`CdpEndpoints::into_parts`] で取り出して cli（TASK-41.5）が
+/// `Server::new().handler(router).websocket(config)` へ必ず対で渡す形にする。
+pub struct CdpEndpoints {
+    router: Router,
+    websocket: WebSocketConfig,
+}
+
+impl CdpEndpoints {
+    /// `(ルータ, WebSocket 設定)` に分解する。`Server::handler` と `Server::websocket` へ
+    /// 両方を渡すこと（片方だけだと `/json/version` の URL が接続不能になる）。
+    pub fn into_parts(self) -> (Router, WebSocketConfig) {
+        (self.router, self.websocket)
+    }
+}
+
+/// ルータと WebSocket 設定を一体で構築する（`CDP-1`・TASK-41.3・41.4）。
+///
+/// 個別構築の [`router`]・[`browser_websocket_config`] は非公開で、`webSocketDebuggerUrl` を
+/// 返しながら WebSocket が未配線という状態を公開 API から作れないようにする。
+pub fn endpoints(state: &Arc<CdpState>) -> Result<CdpEndpoints, WsConfigError> {
+    let websocket = browser_websocket_config(state)?;
+    Ok(CdpEndpoints {
+        router: router(Arc::clone(state)),
+        websocket,
+    })
+}
+
 /// JSON 応答の `Content-Type`（Chromium 互換）。
 const JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 
@@ -96,11 +128,12 @@ const JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 /// （DNS rebinding 対策。[`crate::discovery`]）、違反は 400 / 403 を返す。
 ///
 /// `Router` は WebSocket を運べないため、`/devtools/browser/{id}` は
-/// [`browser_websocket_config`] を cli（TASK-41.5）が `Server::websocket` へ渡して受ける。
+/// [`browser_websocket_config`] を `Server::websocket` へ渡して受ける。両者は公開 API の
+/// [`endpoints`] が一体で構築する（本関数単体は非公開）。
 /// cli は `Router::merge` で AI API のルータと合成する。本関数は bind・アクセス制御
 /// （loopback 限定。`SEC-4`）を行わない。`/json/version` の `webSocketDebuggerUrl` は
 /// 検証済み Host と [`CdpState::browser_id`] から組み立てる。
-pub fn router(state: Arc<CdpState>) -> Router {
+pub(crate) fn router(state: Arc<CdpState>) -> Router {
     let version_state = Arc::clone(&state);
     let list_state = Arc::clone(&state);
     let json_state = state;
@@ -160,13 +193,13 @@ impl std::error::Error for WsConfigError {
 
 /// `/devtools/browser/{id}` の WebSocket 受け口設定（`CDP-1`・TASK-41.4・MS-3）。
 ///
-/// cli（TASK-41.5）が `Server::new().handler(router(state.clone()))
-/// .websocket(browser_websocket_config(&state)?)` の形で組み立てる。受理判定
+/// cli（TASK-41.5）が [`endpoints`] の結果を `Server::new().handler(router)
+/// .websocket(config)` の形で組み立てる。受理判定
 /// （Host・Origin・ブラウザ ID。[`crate::ws`]）は本設定のハンドシェイク検査で行う。
 /// メッセージハンドラは暫定（全リクエストへエラー応答）で TASK-42 で置換する。
 /// bind・loopback 限定（`SEC-4`）・同時接続数上限は cli / core 側の責務。
 /// メッセージ・フレームサイズ上限は core の既定値（DoS 安全側）のまま使う。
-pub fn browser_websocket_config(state: &CdpState) -> Result<WebSocketConfig, WsConfigError> {
+pub(crate) fn browser_websocket_config(state: &CdpState) -> Result<WebSocketConfig, WsConfigError> {
     let browser_id = state.browser_id().clone();
     let config = WebSocketConfig::default()
         .with_path_pattern(BROWSER_WS_PATH_PATTERN)
