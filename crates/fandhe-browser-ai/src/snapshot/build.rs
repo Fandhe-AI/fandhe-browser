@@ -25,9 +25,11 @@
 //!   切り詰めは `TableRow::truncated` で通知）。ヘッダ name の打ち切りのみ立てる。
 //!   ただし `tfoot` 行がある構造、または操作要素（リンク・ボタン・入力欄・`role`/
 //!   `tabindex` 付き等）を含む構造は圧縮せず通常どおり展開する（ref・state・フッター
-//!   の可視情報を失わないため）。
-//!   検出は table/list ごとに子孫を走査するため、入れ子の不規則構造では
-//!   O(ノード数 × 入れ子の深さ) になる（深さは [`MAX_TREE_DEPTH`] で有界）。
+//!   の可視情報を失わないため）。`img` の `alt`・`aria-label` 等テキスト以外に由来する
+//!   accessible name を持つ子孫を含む構造も同様に展開する。
+//!   検出は table/list ごとに子孫を走査するが、走査量はコンテナごと
+//!   （`MAX_COMPRESS_SCAN_NODES`）と 1 回の構築全体（`MAX_TOTAL_COMPRESS_SCAN_NODES`）
+//!   で有界とし、超過したコンテナは圧縮せず展開する。
 //! - generic の折り畳み・`none`/`presentation` の除去・空ノードの剪定は行わない
 //!   （トークン削減は後続タスク。`AISNAP-1`・`AISNAP-2`）。
 //! - ルート以外の全要素に ref を振る（対話可能な要素への絞り込みは後続タスク）。
@@ -94,33 +96,82 @@ fn is_excluded(doc: &Document, id: NodeId) -> bool {
         || (is_html_element_named(doc, id, "input") && normalized_input_type(doc, id) == "hidden")
 }
 
+/// 圧縮判定 1 コンテナあたりに走査してよい子孫ノード数の上限（`AISNAP-2`・TASK-12.5）。
+///
+/// 規則構造の検出（`detect_regular_structure`）と展開維持の判定は、外部 HTML の
+/// 子孫を全走査する。圧縮行の 20 件上限より前に走るため、走査量を先に有界化する。
+/// 超過したコンテナは圧縮せず通常の展開を維持する（従来の Snapshot と同じ結果）。
+const MAX_COMPRESS_SCAN_NODES: usize = 20_000;
+
+/// 1 回の `build_snapshot` で圧縮判定に使える走査量の総予算（ノード数）。
+///
+/// 入れ子の表・一覧が多数あっても、判定の総コストがコンテナ数に比例して
+/// 膨らまないようにする。使い切った後の表・一覧は圧縮せず展開する。
+const MAX_TOTAL_COMPRESS_SCAN_NODES: usize = 200_000;
+
+/// `container` の子孫数が `limit` 以下かを反復走査で確かめ、その数を返す（超過は `None`）。
+///
+/// 積むノード数も `limit` 以内に抑える（子は残り予算 + 1 個までしか取らない）。
+fn bounded_descendant_count(doc: &Document, container: NodeId, limit: usize) -> Option<usize> {
+    let mut count = 0usize;
+    let mut stack: Vec<NodeId> = doc.children(container).take(limit + 1).collect();
+    while let Some(id) = stack.pop() {
+        count += 1;
+        if count > limit {
+            return None;
+        }
+        let room = limit.saturating_sub(count + stack.len());
+        stack.extend(doc.children(id).take(room + 1));
+    }
+    Some(count)
+}
+
 /// 規則的構造を圧縮してよいかを返す（`AISNAP-2`・TASK-12.5）。
 ///
-/// 圧縮は子孫の展開（ref・state の付与）を省略するため、次の場合は情報が失われる。
-/// このときは圧縮せず通常の展開を維持する（従来の Snapshot と同じ結果）。
+/// 圧縮は子孫の展開（ref・state・accessible name の付与）を省略するため、
+/// 次の場合は情報が失われる。このときは圧縮せず通常の展開を維持する
+/// （従来の Snapshot と同じ結果）。
 /// - `tfoot` 行がある（圧縮表現は本文行のみで、合計額などフッターの可視情報が消える）。
 /// - 表・一覧の中に操作要素（リンク・ボタン・入力欄等）がある（ref と state が消える）。
+/// - 圧縮行はテキストノードのみを取り込むため、テキスト以外に由来する accessible name
+///   （`img` の `alt`・`aria-label` 等）を持つ子孫がある。
 fn can_compress(
     doc: &Document,
     container: NodeId,
     structure: &crate::compress_table::RegularStructure,
 ) -> bool {
-    structure.footer_rows.is_empty() && !has_interactive_descendant(doc, container)
+    structure.footer_rows.is_empty() && !has_lossy_descendant(doc, container)
 }
 
-/// `container` の子孫（描画対象のみ）に操作要素があるかを反復走査で返す。
-fn has_interactive_descendant(doc: &Document, container: NodeId) -> bool {
+/// `container` の子孫（描画対象のみ）に、圧縮すると失われる要素があるかを反復走査で返す。
+///
+/// 走査量は呼び出し前の [`bounded_descendant_count`] で有界化済みである。
+fn has_lossy_descendant(doc: &Document, container: NodeId) -> bool {
     let mut stack: Vec<NodeId> = doc.children(container).collect();
     while let Some(id) = stack.pop() {
         if !doc.is_element(id) || is_excluded(doc, id) {
             continue;
         }
-        if is_interactive_element(doc, id) {
+        if is_interactive_element(doc, id) || has_non_text_name_source(doc, id) {
             return true;
         }
         stack.extend(doc.children(id));
     }
     false
+}
+
+/// テキストノード以外（属性）に由来する accessible name を持ち得る要素か。
+fn has_non_text_name_source(doc: &Document, id: NodeId) -> bool {
+    if is_html_element_named(doc, id, "img")
+        && doc
+            .attribute(id, "alt")
+            .is_some_and(|v| !v.trim().is_empty())
+    {
+        return true;
+    }
+    ["aria-label", "aria-labelledby", "title"]
+        .iter()
+        .any(|a| doc.attribute(id, a).is_some_and(|v| !v.trim().is_empty()))
 }
 
 /// 操作可能（フォーカス・クリック・入力の対象になり得る）要素か。
@@ -187,6 +238,7 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
     let index = NameIndex::build(doc).with_content_budget(MAX_TOTAL_CONTENT_STEPS);
     let mut refs = RefAllocator::new();
     let mut truncated = false;
+    let mut compress_budget = MAX_TOTAL_COMPRESS_SCAN_NODES;
 
     let root_id = doc.root();
     let root_role = compute_role(doc, root_id)
@@ -247,9 +299,18 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
             .with_state(compute_state(doc, child));
         node.data_leaf = classify_data_leaf(doc, child);
         // 規則的な表・一覧は子孫を展開せず 1 ノードへ圧縮する（AISNAP-2・TASK-12.5）。
-        if ["table", "ul", "ol"]
+        let compressible_kind = ["table", "ul", "ol"]
             .iter()
-            .any(|n| is_html_element_named(doc, child, n))
+            .any(|n| is_html_element_named(doc, child, n));
+        // 走査量の予算内に収まるコンテナだけを圧縮判定へ進める（超過時は展開を維持）。
+        // 超過した走査も予算を消費し、巨大な入れ子の反復で総コストが膨らまないようにする。
+        let within_budget = compressible_kind && {
+            let limit = MAX_COMPRESS_SCAN_NODES.min(compress_budget);
+            let scanned = bounded_descendant_count(doc, child, limit);
+            compress_budget = compress_budget.saturating_sub(scanned.unwrap_or(limit));
+            scanned.is_some()
+        };
+        if within_budget
             && let TableDetection::Regular(structure) = detect_regular_structure(doc, child)
             && can_compress(doc, child, &structure)
         {
@@ -566,5 +627,43 @@ mod tests {
         assert!(!one.truncated);
         let s = snap(&format!("<body>{}</body>", group.repeat(60)));
         assert!(s.truncated);
+    }
+
+    fn has_table_summary(s: &Snapshot) -> bool {
+        all_nodes(&s.tree).iter().any(|n| n.table.is_some())
+    }
+
+    /// AISNAP-2: 一覧の圧縮が有効な基準ケース（テキストのみの li）。
+    #[test]
+    fn aisnap_2_plain_list_is_compressed() {
+        let s = snap("<body><ul><li>alpha</li><li>beta</li></ul></body>");
+        assert!(has_table_summary(&s));
+    }
+
+    /// AISNAP-2: img の alt（accessible name）は行文字列へ入らないため圧縮せず展開する。
+    #[test]
+    fn aisnap_2_list_with_img_alt_is_expanded() {
+        let s = snap(
+            "<body><ul><li><img src=\"a.png\" alt=\"Apple logo\"></li><li>beta</li></ul></body>",
+        );
+        assert!(!has_table_summary(&s));
+        assert!(all_nodes(&s.tree).iter().any(|n| n.name == "Apple logo"));
+    }
+
+    /// AISNAP-2: aria-label を持つ子孫を含む表は圧縮せず展開する。
+    #[test]
+    fn aisnap_2_table_with_aria_label_is_expanded() {
+        let s = snap(
+            "<body><table><tr><th>A</th></tr><tr><td><span aria-label=\"Total\">5</span></td></tr></table></body>",
+        );
+        assert!(!has_table_summary(&s));
+    }
+
+    /// AISNAP-2: 圧縮判定の走査量が上限を超える巨大な一覧は圧縮せず展開する（有界）。
+    #[test]
+    fn aisnap_2_oversized_list_skips_compression() {
+        let items = "<li>x</li>".repeat(super::MAX_COMPRESS_SCAN_NODES + 10);
+        let s = snap(&format!("<body><ul>{items}</ul></body>"));
+        assert!(!has_table_summary(&s));
     }
 }
