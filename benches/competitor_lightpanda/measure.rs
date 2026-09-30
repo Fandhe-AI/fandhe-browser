@@ -717,12 +717,12 @@ const MAX_PROC_SCAN_PIDS: usize = 65_536;
 ///   `LookupFailed`。黙って打ち切ると外部の所有者を見落として誤って
 ///   `Verified` を返し得るため、途中で止めずにエラーにする
 /// - 走査中に終了したプロセス・fd（`NotFound`）は読み飛ばす。権限不足
-///   （`PermissionDenied`）は uid に関わらず走査を続けるが、読めなかった
-///   fd / fd ディレクトリが 1 件でもあり、かつ LISTEN inode のうち読めた fd
-///   から所有 PID を帰属できなかったものが残る場合は、見えないプロセスだけが
-///   保持するソケットを見落とし得るため `LookupFailed`。全 inode が読めた
-///   fd に帰属できていれば、読めないプロセスは別のソケットしか持たない
-///   前提で成功させる（root 所有プロセス等は非特権では必ず読めない）。
+///   （`PermissionDenied`）は走査を続ける。fd（ディレクトリ・エントリ・リンク）
+///   を読めない PID（root 所有・非 dumpable 等。非特権では常に存在する）は、所有者として帰属できた PID の
+///   親・兄弟・子に当たる場合（fork によるソケット継承の経路）に同じソケットを
+///   保持し得るため、他の PID へ帰属できていても `LookupFailed`。それ以外の
+///   読めない PID は対象外とする。既知の限界: 無関係な特権プロセスが fd 受け渡し
+///   で同ソケットを保持する場合は非特権では検出できない
 ///   それ以外の I/O エラーは即 `LookupFailed`
 #[cfg(target_os = "linux")]
 pub(crate) fn lookup_port_owner_pids(port: u16) -> Result<Option<Vec<u32>>, PortOwnerError> {
@@ -778,10 +778,13 @@ pub(crate) fn lookup_port_owner_pids(port: u16) -> Result<Option<Vec<u32>>, Port
     let entries =
         std::fs::read_dir(proc_dir).map_err(|e| fail(format!("failed to read /proc: {e}")))?;
     let mut owners: Vec<u32> = Vec::new();
-    // 権限不足で中身を確認できなかった fd / fd ディレクトリがあったか。
-    let mut unreadable = false;
-    // 読めた fd から所有 PID を帰属できた LISTEN inode。
-    let mut attributed: Vec<u64> = Vec::new();
+    // fd ディレクトリまたは一部の fd を権限不足で確認できなかった PID。
+    let mut unreadable_pids: Vec<u32> = Vec::new();
+    let note_unreadable = |list: &mut Vec<u32>, pid: u32| {
+        if !list.contains(&pid) {
+            list.push(pid);
+        }
+    };
     let mut scanned = 0usize;
     for entry in entries {
         let entry = entry.map_err(|e| fail(format!("failed to read /proc entry: {e}")))?;
@@ -802,9 +805,9 @@ pub(crate) fn lookup_port_owner_pids(port: u16) -> Result<Option<Vec<u32>>, Port
             Ok(fds) => fds,
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
             Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                // uid が違っても fork 後の権限変更や fd 受け渡しで同じソケットを
-                // 保持し得るため読み飛ばさず、確認不能として記録する。
-                unreadable = true;
+                // fd ディレクトリを読めないプロセス（root 所有・非 dumpable 等）は
+                // 走査後に所有者候補との親子・兄弟関係で見落としの可能性を判定する。
+                note_unreadable(&mut unreadable_pids, pid);
                 continue;
             }
             Err(e) => return Err(fail(format!("failed to read /proc/{pid}/fd: {e}"))),
@@ -818,7 +821,7 @@ pub(crate) fn lookup_port_owner_pids(port: u16) -> Result<Option<Vec<u32>>, Port
                 Ok(fd) => fd,
                 Err(e) if e.kind() == ErrorKind::NotFound => continue,
                 Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                    unreadable = true;
+                    note_unreadable(&mut unreadable_pids, pid);
                     continue;
                 }
                 Err(e) => return Err(fail(format!("failed to read /proc/{pid}/fd entry: {e}"))),
@@ -827,7 +830,7 @@ pub(crate) fn lookup_port_owner_pids(port: u16) -> Result<Option<Vec<u32>>, Port
                 Ok(t) => t,
                 Err(e) if e.kind() == ErrorKind::NotFound => continue,
                 Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                    unreadable = true;
+                    note_unreadable(&mut unreadable_pids, pid);
                     continue;
                 }
                 Err(e) => {
@@ -841,26 +844,47 @@ pub(crate) fn lookup_port_owner_pids(port: u16) -> Result<Option<Vec<u32>>, Port
                 .to_str()
                 .and_then(parse_socket_link_inode)
                 .filter(|inode| inodes.contains(inode));
-            if let Some(inode) = inode {
-                if !owners.contains(&pid) {
-                    owners.push(pid);
-                }
-                if !attributed.contains(&inode) {
-                    attributed.push(inode);
-                }
+            if inode.is_some() && !owners.contains(&pid) {
+                owners.push(pid);
             }
         }
     }
-    // 権限不足で見えない fd がある場合、帰属できていない LISTEN inode は
-    // 読めないプロセスだけが保持している可能性を排除できない（外部プロセスが
-    // 同ポートの別 inode を持つケース）。全 inode を帰属できた場合だけ成功させる。
-    if unreadable && inodes.iter().any(|i| !attributed.contains(i)) {
-        return Err(fail(
-            "could not verify every listening socket owner (permission denied on some fds)"
-                .to_string(),
-        ));
+    // fd を（一部でも）読めなかった PID のうち、所有者候補の親・兄弟・子（fork による
+    // ソケット継承の経路）に当たるものは同ソケットを保持し得るため fail-closed。
+    // 関係の確認できない PID（ppid 読み取り失敗）も安全側で同様に扱う。
+    if !unreadable_pids.is_empty() && !owners.is_empty() {
+        let ppid_of = |pid: u32| read_proc_ppid(pid);
+        let mut owner_relatives: Vec<u32> = Vec::new();
+        for &o in &owners {
+            owner_relatives.push(o);
+            if let Some(pp) = ppid_of(o) {
+                owner_relatives.push(pp);
+            }
+        }
+        for &pid in &unreadable_pids {
+            let suspicious = match ppid_of(pid) {
+                // 走査後に終了したプロセスは保持者になり得ない。
+                None if !Path::new(&format!("/proc/{pid}/stat")).exists() => false,
+                None => true,
+                Some(pp) => owner_relatives.contains(&pid) || owner_relatives.contains(&pp),
+            };
+            if suspicious {
+                return Err(fail(format!(
+                    "could not verify every listening socket owner (permission denied on /proc/{pid}/fd)"
+                )));
+            }
+        }
     }
     Ok(Some(owners))
+}
+
+/// `/proc/<pid>/stat` から ppid を読む（`lookup_port_owner_pids` 用）。
+/// comm に空白・括弧を含み得るため最後の `)` 以降を解析する。失敗は `None`。
+#[cfg(target_os = "linux")]
+fn read_proc_ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    rest.split_whitespace().nth(1)?.parse().ok()
 }
 
 /// 所有者として許容する PID の候補（`root_pid` とその子孫）を集める。
