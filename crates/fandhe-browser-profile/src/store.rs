@@ -27,8 +27,10 @@
 //!   [`OverridableStore`]（TASK-60（60.4）・#203）。明示指定が既定解決より優先される
 //! - 削除（`PROF-5`）: #188（TASK-53（53.2））。[`ProfileStore::delete`] の既定実装は
 //!   成功を装わず [`ProfileError::Unsupported`] を返す
-//! - Windows 長パス（`XOS-8`、TASK-61）・名前正規化（`XOS-9`、TASK-62）は
-//!   将来この層へ差し込む。Windows の ACL 隔離が未実装のため、現状 Windows の
+//! - Windows 長パス（`XOS-8`）は [`to_long_path`] として実装済み（TASK-61（61.1）・#205）。
+//!   [`ProfileStore::open_or_create`] が適用するが、[`Profile::open`] が実際に使うのは
+//!   `XOS-7` の ACL 実装後になる
+//! - 名前正規化（`XOS-9`、TASK-62）は将来この層へ差し込む。Windows の ACL 隔離が未実装のため、現状 Windows の
 //!   [`Profile::open`] は `Unsupported` を返し、[`ProfileStore::open_or_create`] も
 //!   それをそのまま伝える
 
@@ -95,6 +97,7 @@ pub trait ProfileStore {
     /// 解決結果が相対パスなら何も作成せず [`ProfileError::InvalidLayout`] を返す
     /// （カレントディレクトリ次第で保存先が変わるのを防ぐ）。境界検証は
     /// [`Profile::open`] に委譲する。
+    /// Windows では [`to_long_path`] で `\\?\` 付きパスへ変換してから渡す（`XOS-8`）。
     fn open_or_create(&self) -> Result<Profile, ProfileError> {
         let resolved = self.resolve_root()?;
         if !resolved.path().is_absolute() {
@@ -103,7 +106,16 @@ pub trait ProfileStore {
                 reason: "profile root must be an absolute path",
             });
         }
-        Profile::open(resolved.path())
+        // Windows では 260 文字制約を避けるため verbatim パスへ変換してから渡す（`XOS-8`、
+        // TASK-61（61.1））。現状は `Profile::open` が ACL 未実装（`XOS-7`）で先に
+        // `Unsupported` を返すため観測できない。ACL 実装時は `Profile::open` 側が
+        // verbatim ルートを受け取る前提で、`assert_within_root` の比較対象も verbatim 形へ
+        // 揃える必要がある（REPAIR-3 の引き継ぎ事項）。
+        #[cfg(windows)]
+        let target = to_long_path(resolved.path())?.into_path();
+        #[cfg(not(windows))]
+        let target = resolved.path().to_path_buf();
+        Profile::open(&target)
     }
 
     /// プロファイルを削除する。
@@ -491,6 +503,221 @@ fn platform_default_parts<F: Fn(&str) -> Option<OsString>>(
     })
 }
 
+/// [`to_long_path`] の変換結果の種別（`XOS-8`、TASK-61（61.1）、MS-3）。
+///
+/// 将来の種別追加に備えて `non_exhaustive` とする（REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LongPathKind {
+    /// Windows 以外。Unix には `MAX_PATH` 相当の制約がないための意図的な no-op
+    /// であり、未実装のスタブではない。
+    Unchanged,
+    /// ドライブ絶対パス（`C:\...` → `\\?\C:\...`）。
+    Disk,
+    /// UNC パス（`\\server\share\...` → `\\?\UNC\server\share\...`）。
+    Unc,
+    /// 入力が既に `\\?\` で始まっていたため変更しなかった。
+    AlreadyVerbatim,
+}
+
+/// [`to_long_path`] の結果。変換後のパスとその種別を持つ。
+///
+/// [`ResolvedRoot`] と同様、生の `PathBuf` ではなく構造体にして後から情報を
+/// 拡張できるようにする（REPAIR-4）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LongPath {
+    path: PathBuf,
+    kind: LongPathKind,
+}
+
+impl LongPath {
+    /// 変換後のパス。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 変換の種別。
+    pub fn kind(&self) -> LongPathKind {
+        self.kind
+    }
+
+    /// パスの所有権を取り出す。
+    pub fn into_path(self) -> PathBuf {
+        self.path
+    }
+}
+
+/// verbatim パス全体の UTF-16 単位数の上限（Win32 の 32767 文字制限）。
+#[cfg(any(windows, test))]
+const VERBATIM_MAX_UNITS: usize = 32767;
+/// 付与しうる最長プレフィックス（`\\?\UNC\`）の UTF-16 単位数。
+#[cfg(any(windows, test))]
+const VERBATIM_MAX_PREFIX_UNITS: usize = 8;
+
+/// `\\?\` プレフィックスを付けた verbatim パスへ変換する（`XOS-8`、TASK-61（61.1）、MS-3）。
+///
+/// [`ProfileStore::open_or_create`] が Windows でルートを [`Profile::open`] へ渡す前に
+/// 呼ぶ。`LongPathsEnabled` レジストリ設定に依存せず 260 文字（`MAX_PATH`）の制約を
+/// 回避するための変換で、規則は次のとおり。
+///
+/// - `C:\a` → `\\?\C:\a`（[`LongPathKind::Disk`]）
+/// - `\\server\share\a` → `\\?\UNC\server\share\a`（[`LongPathKind::Unc`]）
+/// - 既に `\\?\` で始まる → 変更しない（[`LongPathKind::AlreadyVerbatim`]）
+/// - `\\?\` は Win32 の正規化を無効にするため、`/` を `\` へ、連続区切りを 1 つへ、
+///   `.` 要素を除去する。末尾のドット・空白は verbatim では保存される（名前の
+///   正規化は `XOS-9`・TASK-62 の責務でここでは行わない）
+///
+/// fail-closed で [`ProfileError::InvalidLayout`] を返す入力: `..` 要素（verbatim では
+/// リテラル扱いとなり、解決するとプロファイル境界外へ抜ける経路になるため）、
+/// 相対・ドライブ相対・ルート相対・空のパス、デバイス名前空間（`\\.\`・`//?/` 等）、
+/// 上限（32767 UTF-16 単位）超過。
+///
+/// Rust の `std::fs` も Windows で長い絶対パスを自動的に verbatim 化するが、どの長さで
+/// 変換されるかは std の実装詳細である。本関数は std 内部への暗黙依存をなくし、
+/// 子プロセスへ渡す引数や `XOS-7` の ACL 実装で使う Win32 直接呼び出し等、`std::fs` を
+/// 経由しない経路でも長パスを扱えるようにする。
+///
+/// Windows 以外では入力をそのまま [`LongPathKind::Unchanged`] で返す（意図的な no-op）。
+#[cfg(windows)]
+pub fn to_long_path(path: &Path) -> Result<LongPath, ProfileError> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    match to_verbatim_wide(&wide) {
+        Ok((out, kind)) => Ok(LongPath {
+            path: PathBuf::from(OsString::from_wide(&out)),
+            kind,
+        }),
+        Err(reason) => Err(ProfileError::InvalidLayout {
+            path: path.to_path_buf(),
+            reason,
+        }),
+    }
+}
+
+/// [`to_long_path`] の非 Windows 版。Unix には同種の制約がないため入力をそのまま返す
+/// 意図的な no-op（スタブではない）。
+#[cfg(not(windows))]
+pub fn to_long_path(path: &Path) -> Result<LongPath, ProfileError> {
+    Ok(LongPath {
+        path: path.to_path_buf(),
+        kind: LongPathKind::Unchanged,
+    })
+}
+
+/// [`to_long_path`] の変換規則の本体（UTF-16 単位列に対する純関数）。
+///
+/// Linux 上では `Path::components` が `C:\` を解釈できないため、target 非依存の
+/// 純関数として実装し、全 OS の単体テストで全規則を検証できるようにする。
+#[cfg(any(windows, test))]
+fn to_verbatim_wide(input: &[u16]) -> Result<(Vec<u16>, LongPathKind), &'static str> {
+    const BS: u16 = b'\\' as u16;
+    const FS: u16 = b'/' as u16;
+    const QUESTION: u16 = b'?' as u16;
+    const DOT: u16 = b'.' as u16;
+    const COLON: u16 = b':' as u16;
+    const VERBATIM: [u16; 4] = [BS, BS, QUESTION, BS];
+    const UNC_PREFIX: [u16; 8] = [
+        BS,
+        BS,
+        QUESTION,
+        BS,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        BS,
+    ];
+    let is_sep = |u: u16| u == BS || u == FS;
+
+    // アロケーション前に長さを検証する（無制限確保による DoS の防止）。
+    if input.len() > VERBATIM_MAX_UNITS - VERBATIM_MAX_PREFIX_UNITS {
+        return Err("path is too long for long path conversion");
+    }
+    if input.starts_with(&VERBATIM) {
+        return Ok((input.to_vec(), LongPathKind::AlreadyVerbatim));
+    }
+    // `\\?\` の厳密一致以外のデバイス名前空間（`\\.\`・`//?/` 等）は拒否する。
+    if let (Some(&a), Some(&b), Some(&c), Some(&d)) =
+        (input.first(), input.get(1), input.get(2), input.get(3))
+        && is_sep(a)
+        && is_sep(b)
+        && (c == QUESTION || c == DOT)
+        && is_sep(d)
+    {
+        return Err("device namespace paths are not supported for long path conversion");
+    }
+
+    // verbatim では `/` が区切りにならないため先に `\` へ揃える。
+    let norm: Vec<u16> = input
+        .iter()
+        .map(|&u| if u == FS { BS } else { u })
+        .collect();
+
+    // 区切りで分割した要素から `.`・空要素を除き、`..` は拒否する。
+    let push_elements =
+        |out: &mut Vec<u16>, rest: &[u16], first_sep: bool| -> Result<(), &'static str> {
+            let mut need_sep = first_sep;
+            for elem in rest.split(|&u| u == BS) {
+                if elem.is_empty() || elem == [DOT] {
+                    continue;
+                }
+                if elem == [DOT, DOT] {
+                    return Err("parent directory components are not allowed in long paths");
+                }
+                if need_sep {
+                    out.push(BS);
+                }
+                out.extend_from_slice(elem);
+                need_sep = true;
+            }
+            Ok(())
+        };
+
+    let not_absolute = "long path conversion requires an absolute drive or UNC path";
+    let mut out: Vec<u16> = Vec::with_capacity(norm.len() + VERBATIM_MAX_PREFIX_UNITS);
+
+    // ドライブ絶対パス `X:\...`
+    if let (Some(&letter), Some(&colon), Some(&sep)) = (norm.first(), norm.get(1), norm.get(2))
+        && u8::try_from(letter).is_ok_and(|l| l.is_ascii_alphabetic())
+        && colon == COLON
+        && sep == BS
+    {
+        out.extend_from_slice(&VERBATIM);
+        out.push(letter);
+        out.push(COLON);
+        out.push(BS);
+        let rest = norm.get(3..).unwrap_or(&[]);
+        push_elements(&mut out, rest, false)?;
+        return Ok((out, LongPathKind::Disk));
+    }
+
+    // UNC `\\server\share\...`（3 連続以上の区切りは拒否）
+    if let (Some(&a), Some(&b)) = (norm.first(), norm.get(1))
+        && a == BS
+        && b == BS
+    {
+        let rest = norm.get(2..).unwrap_or(&[]);
+        let mut segs = rest.split(|&u| u == BS);
+        let server = segs.next().unwrap_or(&[]);
+        let share = segs.next().unwrap_or(&[]);
+        let invalid = |s: &[u16]| s.is_empty() || s == [DOT] || s == [DOT, DOT];
+        if invalid(server) || invalid(share) {
+            return Err("UNC path requires a valid server and share name");
+        }
+        out.extend_from_slice(&UNC_PREFIX);
+        out.extend_from_slice(server);
+        out.push(BS);
+        out.extend_from_slice(share);
+        // server と share の直後の残り要素を追加する。
+        let consumed = server.len() + 1 + share.len();
+        let tail = rest.get(consumed..).unwrap_or(&[]);
+        push_elements(&mut out, tail, true)?;
+        return Ok((out, LongPathKind::Unc));
+    }
+
+    // 相対・ドライブ相対・ルート相対・NT 形式（`\??\`）・空は拒否（fail-closed）。
+    Err(not_absolute)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1187,5 +1414,150 @@ mod tests {
             Err(ProfileError::Unsupported { .. })
         ));
         assert!(!root.exists());
+    }
+    // ---- XOS-8（TASK-61（61.1））: 長パス変換 ----
+
+    fn w(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    fn conv(s: &str) -> Result<(String, LongPathKind), &'static str> {
+        to_verbatim_wide(&w(s)).map(|(v, k)| (String::from_utf16(&v).unwrap(), k))
+    }
+
+    #[test]
+    fn xos_8_disk_path_gets_verbatim_prefix() {
+        assert_eq!(
+            conv(r"C:\Users\a\fandhe-browser"),
+            Ok((
+                r"\\?\C:\Users\a\fandhe-browser".to_string(),
+                LongPathKind::Disk
+            ))
+        );
+        assert_eq!(
+            conv(r"C:\"),
+            Ok((r"\\?\C:\".to_string(), LongPathKind::Disk))
+        );
+    }
+
+    #[test]
+    fn xos_8_unc_path_gets_unc_prefix() {
+        assert_eq!(
+            conv(r"\\server\share\dir"),
+            Ok((r"\\?\UNC\server\share\dir".to_string(), LongPathKind::Unc))
+        );
+        assert_eq!(
+            conv(r"\\server\share"),
+            Ok((r"\\?\UNC\server\share".to_string(), LongPathKind::Unc))
+        );
+    }
+
+    #[test]
+    fn xos_8_already_verbatim_is_unchanged() {
+        assert_eq!(
+            conv(r"\\?\C:\x"),
+            Ok((r"\\?\C:\x".to_string(), LongPathKind::AlreadyVerbatim))
+        );
+    }
+
+    #[test]
+    fn xos_8_forward_slashes_and_dot_are_normalized() {
+        assert_eq!(
+            conv("C:/a/./b//c/"),
+            Ok((r"\\?\C:\a\b\c".to_string(), LongPathKind::Disk))
+        );
+    }
+
+    #[test]
+    fn xos_8_parent_dir_is_rejected() {
+        let reason = "parent directory components are not allowed in long paths";
+        assert_eq!(conv(r"C:\a\..\b"), Err(reason));
+        assert_eq!(conv(r"\\server\share\..\b"), Err(reason));
+    }
+
+    #[test]
+    fn xos_8_non_absolute_is_rejected() {
+        let reason = "long path conversion requires an absolute drive or UNC path";
+        for input in [r"a\b", "C:foo", r"\foo", r"\??\C:\x", ""] {
+            assert_eq!(conv(input), Err(reason), "input: {input:?}");
+        }
+        let unc = "UNC path requires a valid server and share name";
+        for input in [r"\\server", r"\\server\", r"\\\server\share"] {
+            assert_eq!(conv(input), Err(unc), "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn xos_8_device_namespace_is_rejected() {
+        let reason = "device namespace paths are not supported for long path conversion";
+        for input in [r"\\.\C:\x", "//?/C:/x", r"\\?/C:\x"] {
+            assert_eq!(conv(input), Err(reason), "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn xos_8_over_limit_is_rejected() {
+        let max = VERBATIM_MAX_UNITS - VERBATIM_MAX_PREFIX_UNITS;
+        let ok = format!(r"C:\{}", "a".repeat(max - 3));
+        let (out, kind) = to_verbatim_wide(&w(&ok)).unwrap();
+        assert_eq!(kind, LongPathKind::Disk);
+        assert_eq!(out.len(), max + 4);
+        let too_long = format!(r"C:\{}", "a".repeat(max - 2));
+        assert_eq!(
+            to_verbatim_wide(&w(&too_long)),
+            Err("path is too long for long path conversion")
+        );
+    }
+
+    #[test]
+    fn xos_8_long_disk_path_over_260() {
+        let input = format!(r"C:\{}", vec!["d".repeat(60); 5].join(r"\"));
+        assert!(input.len() > 260);
+        let (out, kind) = conv(&input).unwrap();
+        assert_eq!(kind, LongPathKind::Disk);
+        assert_eq!(out, format!(r"\\?\{input}"));
+        assert_eq!(out.len(), input.len() + 4);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn xos_8_non_windows_is_unchanged() {
+        let long = to_long_path(Path::new("/tmp/a/b")).unwrap();
+        assert_eq!(long.path(), Path::new("/tmp/a/b"));
+        assert_eq!(long.kind(), LongPathKind::Unchanged);
+        assert_eq!(long.into_path(), PathBuf::from("/tmp/a/b"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn xos_8_long_path_fs_roundtrip_on_windows() {
+        struct Guard(PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                if let Ok(long) = to_long_path(&self.0) {
+                    let _ = std::fs::remove_dir_all(long.path());
+                }
+            }
+        }
+        let top = std::env::temp_dir().join(format!("fandhe-long-{}", std::process::id()));
+        let _guard = Guard(top.clone());
+        let mut deep = top.clone();
+        for i in 0..6 {
+            deep.push(format!("{i}-{}", "x".repeat(50)));
+        }
+        assert!(deep.as_os_str().len() > 300);
+
+        let long = to_long_path(&deep).unwrap();
+        assert!(long.path().to_string_lossy().starts_with(r"\\?\"));
+        assert!(matches!(
+            long.kind(),
+            LongPathKind::Disk | LongPathKind::Unc
+        ));
+
+        std::fs::create_dir_all(long.path()).unwrap();
+        let file = long.path().join("data.txt");
+        std::fs::write(&file, b"long-path").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"long-path");
+        assert_eq!(std::fs::metadata(&file).unwrap().len(), 9);
     }
 }
