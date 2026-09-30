@@ -677,7 +677,7 @@ pub(crate) fn check_port_owner(
     root_pid: u32,
     port: u16,
 ) -> Result<PortOwnerVerdict, PortOwnerError> {
-    let Some(owner_pids) = lookup_port_owner_pids(port)? else {
+    let Some(owner_pids) = lookup_port_owner_pids(root_pid, port)? else {
         return Ok(PortOwnerVerdict::Unsupported);
     };
     let candidates = collect_owner_candidate_pids(root_pid, port)?;
@@ -685,7 +685,8 @@ pub(crate) fn check_port_owner(
     Ok(PortOwnerVerdict::Verified)
 }
 
-/// `port` で LISTEN しているソケットの所有 PID を OS に照会する。
+/// `port` で LISTEN しているソケットの所有 PID を OS に照会する（`root_pid` は
+/// 起動した対象プロセスの PID。Linux 版が祖先関係の判定範囲に使う）。
 /// `Ok(None)` は「この OS では未対応」（確認済みではない）。
 ///
 /// 非 Linux 版のスタブ（TASK-84.6.1）: macOS（#561）が
@@ -694,7 +695,10 @@ pub(crate) fn check_port_owner(
 /// 127.0.0.1 / 0.0.0.0 の LISTEN（IPv6 の扱いは各 issue で決める）。
 /// 照会失敗は [`PortOwnerError::LookupFailed`] で返す。
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn lookup_port_owner_pids(_port: u16) -> Result<Option<Vec<u32>>, PortOwnerError> {
+pub(crate) fn lookup_port_owner_pids(
+    _root_pid: u32,
+    _port: u16,
+) -> Result<Option<Vec<u32>>, PortOwnerError> {
     Ok(None)
 }
 
@@ -718,14 +722,18 @@ const MAX_PROC_SCAN_PIDS: usize = 65_536;
 ///   `Verified` を返し得るため、途中で止めずにエラーにする
 /// - 走査中に終了したプロセス・fd（`NotFound`）は読み飛ばす。権限不足
 ///   （`PermissionDenied`）は走査を続ける。fd（ディレクトリ・エントリ・リンク）
-///   を読めない PID（root 所有・非 dumpable 等。非特権では常に存在する）は、所有者として帰属できた PID の
-///   親・兄弟・子に当たる場合（fork によるソケット継承の経路）に同じソケットを
-///   保持し得るため、他の PID へ帰属できていても `LookupFailed`。それ以外の
+///   を読めない PID（root 所有・非 dumpable 等。非特権では常に存在する）は、所有者として帰属できた PID と
+///   祖先チェーン（ppid を辿る）が、所有者から `root_pid` までの祖先と交わる場合
+///   （親・子・兄弟・孫以降。fork によるソケット継承の経路）に同じソケットを
+///   保持し得るため、他の PID へ帰属できていても `LookupFailed`（祖先を確定できない場合も同様）。それ以外の
 ///   読めない PID は対象外とする。既知の限界: 無関係な特権プロセスが fd 受け渡し
 ///   で同ソケットを保持する場合は非特権では検出できない
 ///   それ以外の I/O エラーは即 `LookupFailed`
 #[cfg(target_os = "linux")]
-pub(crate) fn lookup_port_owner_pids(port: u16) -> Result<Option<Vec<u32>>, PortOwnerError> {
+pub(crate) fn lookup_port_owner_pids(
+    root_pid: u32,
+    port: u16,
+) -> Result<Option<Vec<u32>>, PortOwnerError> {
     use std::io::ErrorKind;
     use std::path::Path;
 
@@ -849,24 +857,41 @@ pub(crate) fn lookup_port_owner_pids(port: u16) -> Result<Option<Vec<u32>>, Port
             }
         }
     }
-    // fd を（一部でも）読めなかった PID のうち、所有者候補の親・兄弟・子（fork による
-    // ソケット継承の経路）に当たるものは同ソケットを保持し得るため fail-closed。
-    // 関係の確認できない PID（ppid 読み取り失敗）も安全側で同様に扱う。
+    // fd を（一部でも）読めなかった PID のうち、所有者候補と祖先関係（親・子・兄弟・
+    // 孫以降・おじ/おい等。fork によるソケット継承の経路）を否定できないものは
+    // 同ソケットを保持し得るため fail-closed。祖先チェーンの解決に失敗した
+    // PID も安全側で同様に扱う。
     if !unreadable_pids.is_empty() && !owners.is_empty() {
-        let ppid_of = |pid: u32| read_proc_ppid(pid);
-        let mut owner_relatives: Vec<u32> = Vec::new();
+        let mut owner_chains: Vec<Vec<u32>> = Vec::new();
         for &o in &owners {
-            owner_relatives.push(o);
-            if let Some(pp) = ppid_of(o) {
-                owner_relatives.push(pp);
+            match proc_ancestor_chain(o) {
+                // 所有者から `root_pid` までの祖先だけを対象にする。ソケットの作成者は
+                // `root_pid` の起動後に生まれたプロセス（または `root_pid` 自身）で、
+                // `root_pid` より上位の祖先は継承で保持できない（fd 受け渡しは既知の限界）。
+                // `root_pid` の配下でない所有者は後段の `verify_port_owner` が
+                // `Mismatch` にするため、ここでは関係判定の対象外とする。
+                ProcChain::Complete(c) => {
+                    if let Some(i) = c.iter().position(|p| *p == root_pid) {
+                        owner_chains.push(c[..=i].to_vec());
+                    }
+                }
+                // 走査後に終了した所有者は保持者でなくなっている。
+                ProcChain::Gone => {}
+                ProcChain::Unknown => {
+                    return Err(fail(format!(
+                        "could not resolve the ancestry of socket owner pid {o}"
+                    )));
+                }
             }
         }
         for &pid in &unreadable_pids {
-            let suspicious = match ppid_of(pid) {
+            let suspicious = match proc_ancestor_chain(pid) {
                 // 走査後に終了したプロセスは保持者になり得ない。
-                None if !Path::new(&format!("/proc/{pid}/stat")).exists() => false,
-                None => true,
-                Some(pp) => owner_relatives.contains(&pid) || owner_relatives.contains(&pp),
+                ProcChain::Gone => false,
+                ProcChain::Unknown => true,
+                ProcChain::Complete(chain) => owner_chains
+                    .iter()
+                    .any(|oc| proc_chains_related(&chain, oc)),
             };
             if suspicious {
                 return Err(fail(format!(
@@ -885,6 +910,58 @@ fn read_proc_ppid(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = stat.get(stat.rfind(')')? + 1..)?;
     rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// [`proc_ancestor_chain`] の結果。
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProcChain {
+    /// 自身から ppid 0 までのチェーン（自身を含む）。
+    Complete(Vec<u32>),
+    /// 起点の PID が既に存在しない。
+    Gone,
+    /// 途中で ppid を読めない・循環・深さ超過などで確定できない。
+    Unknown,
+}
+
+/// 祖先チェーンの深さ上限（循環・異常な `/proc` 対策。coding-rust.md「件数を上限検証」）。
+#[cfg(target_os = "linux")]
+const MAX_PROC_ANCESTOR_DEPTH: usize = 4096;
+
+/// `pid` から `/proc/<pid>/stat` の ppid を辿り、ppid 0 までのチェーンを返す。
+/// `lookup_port_owner_pids` が、fd を読めない PID と所有者の祖先関係を
+/// ツリー全体で判定するために使う。
+#[cfg(target_os = "linux")]
+pub(crate) fn proc_ancestor_chain(pid: u32) -> ProcChain {
+    let mut chain: Vec<u32> = Vec::new();
+    let mut cur = pid;
+    loop {
+        if chain.len() >= MAX_PROC_ANCESTOR_DEPTH || chain.contains(&cur) {
+            return ProcChain::Unknown;
+        }
+        chain.push(cur);
+        match read_proc_ppid(cur) {
+            Some(0) => return ProcChain::Complete(chain),
+            Some(pp) => cur = pp,
+            None => {
+                let exists = std::path::Path::new(&format!("/proc/{cur}/stat")).exists();
+                return if exists || chain.len() > 1 {
+                    // 途中の親が消えた場合は再親子付けされており関係を確定できない。
+                    ProcChain::Unknown
+                } else {
+                    ProcChain::Gone
+                };
+            }
+        }
+    }
+}
+
+/// 2 つの祖先チェーン（自身を含む）が、init（1）・kthreadd（2）・0 以外の
+/// PID を共有するか。共有するなら一方が他方の祖先か、共通の親から fork
+/// された関係であり、ソケット継承の可能性を否定できない。
+#[cfg(target_os = "linux")]
+pub(crate) fn proc_chains_related(a: &[u32], b: &[u32]) -> bool {
+    a.iter().any(|p| *p > 2 && b.contains(p))
 }
 
 /// 所有者として許容する PID の候補（`root_pid` とその子孫）を集める。

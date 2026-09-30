@@ -545,6 +545,8 @@ fn run_test_cases() {
         linux_lookup_port_owner_pids_returns_own_pid_for_listener();
         eprintln!("case: linux_check_port_owner_rejects_foreign_listener");
         linux_check_port_owner_rejects_foreign_listener();
+        eprintln!("case: linux_proc_chains_related_detects_deep_descendants");
+        linux_proc_chains_related_detects_deep_descendants();
     }
     eprintln!("competitor_lightpanda_measure: all cases passed");
 }
@@ -1741,7 +1743,7 @@ fn wait_with_deadline_kills_descendant_process_cross_platform() {
 fn linux_lookup_port_owner_pids_returns_own_pid_for_listener() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("local_addr").port();
-    match measure::lookup_port_owner_pids(port) {
+    match measure::lookup_port_owner_pids(std::process::id(), port) {
         Ok(Some(pids)) => assert!(
             pids.contains(&std::process::id()),
             "own pid {} should own port {port}: {pids:?}",
@@ -1781,5 +1783,34 @@ fn linux_check_port_owner_rejects_foreign_listener() {
             assert_eq!(foreign_pids, vec![std::process::id()]);
         }
         other => panic!("expected Mismatch for a foreign listener, got {other:?}"),
+    }
+}
+
+/// PERF-3/PERF-6（TASK-84.6.2・#560）: fd を読めない PID が所有者の孫以降・
+/// おい等でも祖先チェーンの交差で関係ありと判定し、init/kthreadd だけを
+/// 共有する無関係な PID は対象外とする。実プロセスの祖先チェーンは自 PID と
+/// 親 PID を含む。
+#[cfg(target_os = "linux")]
+fn linux_proc_chains_related_detects_deep_descendants() {
+    // 所有者 100（親 50）に対して、孫 300（300 -> 200 -> 100 -> 50 -> 1）。
+    let owner = vec![100, 50, 1];
+    assert!(measure::proc_chains_related(
+        &[300, 200, 100, 50, 1],
+        &owner
+    ));
+    // 兄弟の子（おい）: 400 -> 150 -> 50 -> 1。
+    assert!(measure::proc_chains_related(&[400, 150, 50, 1], &owner));
+    // 所有者が読めない PID の子孫である場合（200 が読めない PID）。
+    assert!(measure::proc_chains_related(&[200, 1], &[100, 200, 1]));
+    // init だけを共有する無関係な PID は対象外。
+    assert!(!measure::proc_chains_related(&[700, 600, 1], &owner));
+    assert!(!measure::proc_chains_related(&[700, 2], &[100, 2]));
+    // 実プロセスのチェーンは自 PID から始まり ppid 0 まで続く。
+    match measure::proc_ancestor_chain(std::process::id()) {
+        measure::ProcChain::Complete(chain) => {
+            assert_eq!(chain.first(), Some(&std::process::id()));
+            assert!(chain.len() >= 2, "chain should include a parent: {chain:?}");
+        }
+        other => panic!("expected Complete chain for own pid, got {other:?}"),
     }
 }
