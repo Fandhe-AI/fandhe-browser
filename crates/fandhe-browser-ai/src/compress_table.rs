@@ -567,6 +567,12 @@ fn cell_text(doc: &Document, cell: NodeId) -> (String, bool) {
                 }
             }
             Some(NodeData::Element { .. }) => {
+                // `<br>` は改行境界なので空白として扱い、前後の文字列が結合しないようにする
+                // （`foo<br>bar` → `foo bar`）。
+                if id != cell && is_html(doc, id, "br") {
+                    pending_space = !out.is_empty();
+                    continue;
+                }
                 if id != cell
                     && (SKIPPED_SUBTREES.iter().any(|n| is_html(doc, id, n))
                         || is_hidden_element(doc, id))
@@ -1063,6 +1069,18 @@ mod tests {
         );
         // 列数は colspan 込みで 3 のため規則的。セル数基準で 2 セルになる。
         assert_eq!(texts(&c), ["x | sub", "p | q | r"]);
+    }
+
+    /// AISNAP-2（TASK-12.5）: `<br>` は空白境界として扱い、前後の文字列を結合しない。
+    #[test]
+    fn aisnap_2_compress_rows_br_is_word_boundary() {
+        let r = rows_of(
+            "<table><tr><td>foo<br>bar<td><br>x<br></tr><tr><td>a<td>b</table>",
+            "table",
+        );
+        assert_eq!(texts(&r), ["foo bar | x", "a | b"]);
+        let l = rows_of("<ul><li>foo<br>bar</li><li>baz</li></ul>", "ul");
+        assert_eq!(texts(&l), ["foo bar", "baz"]);
     }
 
     /// AISNAP-2（TASK-12.3）: セル文字列の 40 文字切り詰め（多バイト含む）。
