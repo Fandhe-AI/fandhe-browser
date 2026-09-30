@@ -145,8 +145,12 @@ toml = { version = "=1.1.6" }
 # JSON 応答の生成に使う。`fandhe-backend-http`・`fandhe-backend-routes` は Issue #171
 # でユーザー承認済み（2026-09-29 に 0.4.2 へ更新）、`serde_json` は Issue #419 で
 # 承認済み。ライセンスはいずれも MIT OR Apache-2.0。配置は `fandhe-browser-cdp` のみ。
-# `fandhe-backend-core`（サーバー本体・WebSocket feature）は WS 受け口を実装する
-# TASK-41.4（Issue #173）で追加する。
+# TASK-41.4（Issue #173・CDP-1・MS-3）: `fandhe-backend-core`（feature `websocket`）を
+# `/devtools/browser/{id}` の WS 受け口（`WebSocketConfig`・`WsMessageHandler`）に使う。
+# Issue #171 で 0.4.2 の採用が承認済み。ライセンスは MIT OR Apache-2.0。配置は
+# `fandhe-browser-cdp` のみ（cli への追加は TASK-41.5・Issue #174）。推移依存は
+# tokio-tungstenite（handshake のみ）・sha1・futures-util で、C/C++ ビルドは不要。
+fandhe-backend-core = { version = "=0.4.2", features = ["websocket"] }
 fandhe-backend-http = { version = "=0.4.2" }
 fandhe-backend-routes = { version = "=0.4.2" }
 serde_json = { version = "=1.0.151" }

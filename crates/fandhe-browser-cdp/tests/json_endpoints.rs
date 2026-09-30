@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fandhe_backend_http::request::{ParseOutcome, parse_request_head};
 use fandhe_backend_http::response::Response;
-use fandhe_browser_cdp::{BrowserId, CdpState, TargetKind, router};
+use fandhe_browser_cdp::{BrowserId, CdpState, TargetKind, endpoints};
 use fandhe_browser_core::AppState;
 use fandhe_browser_profile::Profile;
 use serde_json::{Value, json};
@@ -61,7 +61,8 @@ async fn request(state: &Arc<CdpState>, method: &str, path: &str, host: Option<&
         ParseOutcome::Complete { head, .. } => head,
         ParseOutcome::Incomplete => panic!("incomplete request head"),
     };
-    router(Arc::clone(state)).dispatch(&head, &[]).await
+    let (router, _) = endpoints(state).expect("endpoints").into_parts();
+    router.dispatch(&head, &[]).await
 }
 
 fn json_of(res: &Response) -> Value {
@@ -71,17 +72,33 @@ fn json_of(res: &Response) -> Value {
 const JSON_CT: &str = "application/json; charset=UTF-8";
 
 #[tokio::test]
-async fn cdp1_json_version_omits_unserved_ws_url() {
+async fn cdp1_json_version_has_ws_url() {
     let dir = TempDir::new();
     let st = state(&dir);
     let res = request(&st, "GET", "/json/version", Some("127.0.0.1:9222")).await;
     assert_eq!(res.status, 200);
     assert_eq!(res.header("content-type"), Some(JSON_CT));
     let v = json_of(&res);
-    assert!(v.get("webSocketDebuggerUrl").is_none());
+    assert_eq!(
+        v["webSocketDebuggerUrl"],
+        "ws://127.0.0.1:9222/devtools/browser/fixed-1"
+    );
+    assert!(v.get("V8-Version").is_none());
     let product = format!("fandhe-browser/{}", env!("CARGO_PKG_VERSION"));
     assert_eq!(v["Browser"], product.as_str());
     assert_eq!(v["Protocol-Version"], "1.3");
+}
+
+#[tokio::test]
+async fn cdp1_json_version_ws_url_brackets_ipv6_authority() {
+    let dir = TempDir::new();
+    let st = state(&dir);
+    let res = request(&st, "GET", "/json/version", Some("[::1]:9222")).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(
+        json_of(&res)["webSocketDebuggerUrl"],
+        "ws://[::1]:9222/devtools/browser/fixed-1"
+    );
 }
 
 #[tokio::test]

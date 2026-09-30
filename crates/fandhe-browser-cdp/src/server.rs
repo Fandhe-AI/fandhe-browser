@@ -7,21 +7,28 @@
 //!
 //! # スタブについて
 //!
-//! `/json/*` ルータ（[`router`]。TASK-41.3）は実装済み。`/devtools/browser/{id}` 受け口
-//! （TASK-41.4）は後続タスクで [`router`] へ追加する（REPAIR-3）。初期ターゲット
-//! （`about:blank`）の自動作成は行わず、後続タスクの判断に委ねる。
+//! `/json/*` ルータ（[`router`]。TASK-41.3）と `/devtools/browser/{id}` の WS 受け口設定
+//! （[`browser_websocket_config`]。TASK-41.4。公開入口は [`endpoints`]）は実装済み。WS のメッセージハンドラは
+//! 暫定（全リクエストへエラー応答。[`crate::ws`]）で、TASK-42 で置換する（REPAIR-3）。
+//! 初期ターゲット（`about:blank`）の自動作成は行わず、後続タスクの判断に委ねる。
 
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
+use fandhe_backend_core::plugin_websocket::pattern::PathPatternError;
+use fandhe_backend_core::plugin_websocket::{
+    PingIntervalError, WebSocketConfig, WsHandshakeContext,
+};
 use fandhe_backend_http::request::RequestHead;
 use fandhe_backend_http::response::Response;
 use fandhe_backend_routes::Router;
 use fandhe_browser_core::AppState;
 
-use crate::discovery::{self, Authority, HostError};
+use crate::discovery::{self, Authority, BROWSER_WS_PATH_PATTERN, HostError};
 use crate::target::{BrowserId, TargetRegistry};
+use crate::ws;
 
 /// `CdpState::new` が払い出すブラウザ ID 用のプロセス内連番。
 static BROWSER_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -78,6 +85,38 @@ impl fmt::Debug for CdpState {
     }
 }
 
+/// CDP の HTTP ルータと `/devtools/browser/{id}` の WebSocket 設定を一体で保持する組（`CDP-1`・
+/// TASK-41.4・MS-3。REPAIR-3・公開 API の契約）。
+///
+/// `/json/version` は `webSocketDebuggerUrl` を返すため、ルータだけを使うと WebSocket が
+/// 未配線のまま案内 URL へ接続失敗する。両者を別々に公開せず [`endpoints`] で同時に構築させ、
+/// [`CdpEndpoints::into_parts`] で取り出して cli（TASK-41.5）が
+/// `Server::new().handler(router).websocket(config)` へ必ず対で渡す形にする。
+pub struct CdpEndpoints {
+    router: Router,
+    websocket: WebSocketConfig,
+}
+
+impl CdpEndpoints {
+    /// `(ルータ, WebSocket 設定)` に分解する。`Server::handler` と `Server::websocket` へ
+    /// 両方を渡すこと（片方だけだと `/json/version` の URL が接続不能になる）。
+    pub fn into_parts(self) -> (Router, WebSocketConfig) {
+        (self.router, self.websocket)
+    }
+}
+
+/// ルータと WebSocket 設定を一体で構築する（`CDP-1`・TASK-41.3・41.4）。
+///
+/// 個別構築の [`router`]・[`browser_websocket_config`] は非公開で、`webSocketDebuggerUrl` を
+/// 返しながら WebSocket が未配線という状態を公開 API から作れないようにする。
+pub fn endpoints(state: &Arc<CdpState>) -> Result<CdpEndpoints, WsConfigError> {
+    let websocket = browser_websocket_config(state)?;
+    Ok(CdpEndpoints {
+        router: router(Arc::clone(state)),
+        websocket,
+    })
+}
+
 /// JSON 応答の `Content-Type`（Chromium 互換）。
 const JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 
@@ -88,16 +127,19 @@ const JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 /// `/json` は `/json/list` の互換エイリアス。Host ヘッダは localhost / IP リテラルのみ許可し
 /// （DNS rebinding 対策。[`crate::discovery`]）、違反は 400 / 403 を返す。
 ///
-/// TASK-41.4（`/devtools/browser/{id}` の WS 受け口）が同じ関数へルートを追加し、cli
-/// （TASK-41.5）が `Router::merge` で AI API のルータと合成する。本関数は bind・アクセス
-/// 制御（loopback 限定。`SEC-4`）を行わない。WS 受け口が未実装のため `/json/version` は
-/// `webSocketDebuggerUrl` を返さない（TASK-41.4 で受け口と同時に追加。REPAIR-3）。
-pub fn router(state: Arc<CdpState>) -> Router {
+/// `Router` は WebSocket を運べないため、`/devtools/browser/{id}` は
+/// [`browser_websocket_config`] を `Server::websocket` へ渡して受ける。両者は公開 API の
+/// [`endpoints`] が一体で構築する（本関数単体は非公開）。
+/// cli は `Router::merge` で AI API のルータと合成する。本関数は bind・アクセス制御
+/// （loopback 限定。`SEC-4`）を行わない。`/json/version` の `webSocketDebuggerUrl` は
+/// 検証済み Host と [`CdpState::browser_id`] から組み立てる。
+pub(crate) fn router(state: Arc<CdpState>) -> Router {
+    let version_state = Arc::clone(&state);
     let list_state = Arc::clone(&state);
     let json_state = state;
     Router::new()
         .route("GET", "/json/version", move |head, _| {
-            version_response(head)
+            version_response(&version_state, head)
         })
         .route("GET", "/json/list", move |head, _| {
             list_response(&list_state, head)
@@ -108,11 +150,72 @@ pub fn router(state: Arc<CdpState>) -> Router {
 }
 
 /// `/json/version` の応答を作る。
-fn version_response(head: &RequestHead) -> Response {
-    if let Err(e) = Authority::from_host_header(head.header("host")) {
-        return host_error_response(e);
+fn version_response(state: &CdpState, head: &RequestHead) -> Response {
+    match Authority::from_host_header(head.header("host")) {
+        Ok(authority) => json_response(discovery::version_body(&authority, state.browser_id())),
+        Err(e) => host_error_response(e),
     }
-    json_response(discovery::version_body())
+}
+
+/// サーバー起点 Ping の間隔と Pong 待ち。`interval + pong_timeout` を core の
+/// 既定 idle timeout（60 秒）未満にし、生存クライアントは Pong で idle が延長され続け、
+/// 無応答の対向は 40 秒以内に切断される。
+const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
+const WS_PONG_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// [`browser_websocket_config`] の構築エラー。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum WsConfigError {
+    /// パスパターンが不正。
+    PathPattern(PathPatternError),
+    /// Ping 間隔の設定が不正。
+    PingInterval(PingIntervalError),
+}
+
+impl fmt::Display for WsConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PathPattern(_) => f.write_str("invalid websocket path pattern"),
+            Self::PingInterval(_) => f.write_str("invalid websocket ping interval"),
+        }
+    }
+}
+
+impl std::error::Error for WsConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PathPattern(e) => Some(e),
+            Self::PingInterval(e) => Some(e),
+        }
+    }
+}
+
+/// `/devtools/browser/{id}` の WebSocket 受け口設定（`CDP-1`・TASK-41.4・MS-3）。
+///
+/// cli（TASK-41.5）が [`endpoints`] の結果を `Server::new().handler(router)
+/// .websocket(config)` の形で組み立てる。受理判定
+/// （Host・Origin・ブラウザ ID。[`crate::ws`]）は本設定のハンドシェイク検査で行う。
+/// メッセージハンドラは暫定（全リクエストへエラー応答）で TASK-42 で置換する。
+/// bind・loopback 限定（`SEC-4`）・同時接続数上限は cli / core 側の責務。
+/// メッセージ・フレームサイズ上限は core の既定値（DoS 安全側）のまま使う。
+pub(crate) fn browser_websocket_config(state: &CdpState) -> Result<WebSocketConfig, WsConfigError> {
+    let browser_id = state.browser_id().clone();
+    let config = WebSocketConfig::default()
+        .with_path_pattern(BROWSER_WS_PATH_PATTERN)
+        .map_err(WsConfigError::PathPattern)?
+        .with_ping_interval(WS_PING_INTERVAL, WS_PONG_TIMEOUT)
+        .map_err(WsConfigError::PingInterval)?
+        .with_handshake_check(move |ctx: &WsHandshakeContext<'_>| {
+            ws::check_handshake(
+                ctx.header("host"),
+                ctx.header("origin"),
+                ctx.param("id"),
+                &browser_id,
+            )
+        })
+        .with_handler(ws::BrowserSessionHandler);
+    Ok(config)
 }
 
 /// `/json/list`・`/json` の応答を作る。authority は使わないが、version と同じく
@@ -125,12 +228,18 @@ fn list_response(state: &CdpState, head: &RequestHead) -> Response {
 }
 
 /// Host 検証エラーを 400 / 403 へ写像する。本体は入力値を含まない固定文言。
-fn host_error_response(e: HostError) -> Response {
+pub(crate) fn host_error_response(e: HostError) -> Response {
     let status = match e {
         HostError::NotAllowed => 403,
         _ => 400,
     };
-    let body = format!("{{\"error\":\"{e}\"}}").into_bytes();
+    error_response(status, &e.to_string())
+}
+
+/// `{"error":"<固定文言>"}` の JSON エラー応答。`msg` は呼び出し側の固定文言に限る
+/// （ヘッダ値などの入力を渡さない）。
+pub(crate) fn error_response(status: u16, msg: &str) -> Response {
+    let body = format!("{{\"error\":\"{msg}\"}}").into_bytes();
     Response::new(status, body).with_content_type(JSON_CONTENT_TYPE)
 }
 
