@@ -195,6 +195,14 @@ fn is_interactive_element(doc: &Document, id: NodeId) -> bool {
     {
         return true;
     }
+    // `controls` 付きの音声・動画は再生 UI を持つ操作要素として扱う。
+    if ["audio", "video"]
+        .iter()
+        .any(|n| is_html_element_named(doc, id, n))
+        && doc.attribute(id, "controls").is_some()
+    {
+        return true;
+    }
     ["tabindex", "contenteditable", "onclick", "role"]
         .iter()
         .any(|a| doc.attribute(id, a).is_some())
@@ -669,6 +677,17 @@ mod tests {
     fn aisnap_2_table_with_caption_is_expanded() {
         let s = snap("<body><table><caption>売上</caption><tr><td>100</td></tr></table></body>");
         assert!(!has_table_summary(&s));
+    }
+
+    /// AISNAP-2: controls 付きの audio / video を含む一覧は操作要素があるため圧縮せず展開する。
+    #[test]
+    fn aisnap_2_list_with_media_controls_is_expanded() {
+        for tag in ["audio", "video"] {
+            let s = snap(&format!(
+                "<body><ul><li><{tag} controls src=\"a.mp4\"></{tag}></li><li>beta</li></ul></body>"
+            ));
+            assert!(!has_table_summary(&s), "{tag} with controls must expand");
+        }
     }
 
     /// AISNAP-2: 圧縮判定の走査量が上限を超える巨大な一覧は圧縮せず展開する（有界）。
