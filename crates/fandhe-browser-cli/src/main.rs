@@ -4,6 +4,9 @@
 //! 最小雛形。サブコマンド・引数解析は TASK-47（`CLI-1`）で追加する。組み立ての実体は
 //! [`server`] にあり、本ファイルはランタイム構築とエラー終了コードへの写像だけを担う。
 
+//!
+//! Windows では profile crate の ACL 実装（`XOS-7`〜`XOS-10`）待ちのため起動不可（fail-closed）。
+//! `ProfileError::Unsupported` の場合は理由を示す固定の英語メッセージで非ゼロ終了する。
 mod server;
 
 use std::process::ExitCode;

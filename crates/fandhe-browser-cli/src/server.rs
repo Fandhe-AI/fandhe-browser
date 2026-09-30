@@ -18,6 +18,12 @@
 //!   （TASK-33・`RENDER-1`）で `AppState::new` へ渡す。現状は常に無効レンダラー
 //! - AI API ルータ: TASK-19 で `fandhe-browser-ai` を依存に加え、[`RouterFactory`] として渡す
 //!
+//! # 対応 OS
+//!
+//! Windows では profile crate の ACL 実装（`XOS-7`〜`XOS-10`）待ちのため起動できない
+//! （fail-closed）。`Profile::open` が `ProfileError::Unsupported` を返し、cli は
+//! [`UNSUPPORTED_OS_MESSAGE`] を出して非ゼロ終了する。成功を装うことはしない。
+//!
 //! # セキュリティ
 //!
 //! CDP は任意操作を許すため bind 先は loopback に限定し、それ以外は bind 前に拒否する
@@ -44,6 +50,13 @@ pub(crate) const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr:
 /// （`AISNAP-6`）を型の上で強制する。TASK-19 では `Box::new(|app| ai_router(app))` の形で渡す。
 pub(crate) type RouterFactory = Box<dyn FnOnce(Arc<AppState>) -> Router>;
 
+/// プロファイル隔離が未対応の OS（現状 Windows）で起動に失敗した際の固定文言。
+///
+/// profile crate の Windows ACL（`XOS-7`〜`XOS-10`）が未実装のため、既定 ACL で機密データを
+/// 書く偽装成功を避けて `Profile::open` が `Unsupported` を返す。その意図した fail-closed を
+/// 利用者へ伝える。`main` が `error: ` を前置して stderr へ出し、非ゼロで終了する。
+pub(crate) const UNSUPPORTED_OS_MESSAGE: &str = "profile isolation is not yet supported on this OS (Windows ACL not implemented; XOS-7..XOS-10)";
+
 /// 起動時のエラー。`Display` は固定の英語文言で、入力値（パス・アドレス等）を埋め込まない。
 #[derive(Debug)]
 #[non_exhaustive]
@@ -67,6 +80,7 @@ pub(crate) enum StartupError {
 impl fmt::Display for StartupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Profile(ProfileError::Unsupported { .. }) => f.write_str(UNSUPPORTED_OS_MESSAGE),
             Self::Profile(_) => f.write_str("failed to open profile"),
             Self::WebSocketConfig(_) => f.write_str("failed to build websocket config"),
             Self::RouteConflict(_) => f.write_str("router merge conflict"),
@@ -178,6 +192,21 @@ mod tests {
         }
     }
 
+    /// `XOS-7`〜`XOS-10`: `Unsupported` だけが固定の理由文言になり、他のプロファイル
+    /// エラーの表示は変わらない（OS 非依存で 3 OS とも実行）。
+    #[test]
+    fn xos7_unsupported_profile_error_displays_fixed_message() {
+        let err = StartupError::Profile(ProfileError::Unsupported { reason: "x" });
+        assert_eq!(
+            err.to_string(),
+            "profile isolation is not yet supported on this OS (Windows ACL not implemented; XOS-7..XOS-10)"
+        );
+        let other = StartupError::Profile(ProfileError::Locked {
+            path: std::path::PathBuf::from("p"),
+        });
+        assert_eq!(other.to_string(), "failed to open profile");
+    }
+
     #[test]
     fn cdp1_default_addr_is_loopback_9333() {
         assert_eq!(DEFAULT_ADDR.to_string(), "127.0.0.1:9333");
@@ -196,6 +225,7 @@ mod tests {
                 err,
                 StartupError::Profile(ProfileError::Unsupported { .. })
             ));
+            assert_eq!(err.to_string(), UNSUPPORTED_OS_MESSAGE);
         }
     }
 
