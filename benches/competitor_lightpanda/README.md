@@ -26,9 +26,10 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
   計測したプロセスツリー全体の実測値を渡す運用にする（既定値は埋め込まない）
 - ポート所有者確認（TASK-84.6・Issue #559）: probe したポートの所有 PID が
   子プロセスツリー内かを readiness 成功時に確認する共通インターフェース
-  （`check_port_owner`）は追加済みだが、OS 別の実照会は未実装（Linux: #560・
-  macOS: #561・Windows: #562）で、現状は全 OS が「未対応」として従来の
-  事後確認（`reprobe_after_kill`）だけに頼る（両者は併用する設計）
+  （`check_port_owner`）を持つ。Linux は実装済み（TASK-84.6.2・Issue #560。
+  `/proc/net/tcp{,6}` の LISTEN inode と `/proc/<pid>/fd` の `socket:[inode]`
+  を突き合わせる）。macOS（#561）・Windows（#562）は未実装で「未対応」として
+  従来の事後確認（`reprobe_after_kill`）だけに頼る（両者は併用する設計）
 
 ## 運用（ローカルでの実測・記録）
 

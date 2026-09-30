@@ -13,10 +13,10 @@
 //!
 //! ポート所有者確認（TASK-84.6・Issue #559）: readiness 成功時に、probe した
 //! ポートの所有 PID が起動した子プロセスツリーに含まれるかを
-//! [`check_port_owner`] で確認する事前ゲートを持つ。OS 別の実照会
-//! （Linux: #560・macOS: #561・Windows: #562）は未実装で、現状は全 OS が
-//! 「未対応」を返し、従来どおり事後確認（[`reprobe_after_kill`]）だけに
-//! 頼る（併用方針）。
+//! [`check_port_owner`] で確認する事前ゲートを持つ。OS 別の実照会のうち
+//! Linux は実装済み（TASK-84.6.2・#560。`/proc` を std だけで読む）。
+//! macOS（#561）・Windows（#562）は未実装で「未対応」を返し、従来どおり
+//! 事後確認（[`reprobe_after_kill`]）だけに頼る（併用方針）。
 //!
 //! 対応ビヘイビア: バイナリサイズ計測が使う `PERF-1`、cold start 計測が使う
 //! `PERF-3`、アイドル RSS 計測が使う `PERF-6`、MCP トークン削減率計測が使う
@@ -60,8 +60,11 @@ use crate::support::{
 // （TASK-84.2・TASK-84.5・PERF-6・Issue #212）。
 #[cfg(unix)]
 use crate::support::parse_pgrep_pids;
+// Linux 版 `lookup_port_owner_pids` の `/proc` 解析部（TASK-84.6.2・#560）。
 #[cfg(windows)]
 use crate::support::parse_tasklist_mem_kb;
+#[cfg(target_os = "linux")]
+use crate::support::{parse_socket_link_inode, proc_net_tcp_listen_inode};
 
 /// fixture 配信サーバーの各種上限（coding-rust.md「長さ・件数を上限検証」）。
 /// ローカル専用のベンチ補助サーバーだが、想定外の大量・低速接続で
@@ -501,7 +504,8 @@ impl Drop for ChildGuard {
 /// 「応答しているのが自分の子プロセスらしいか」を検証する
 /// （[`looks_like_browser_readiness_response`]・`Child::try_wait` 参照）。
 /// さらに readiness 成功時に [`check_port_owner`]（TASK-84.6）でポートの
-/// 所有 PID が子プロセスツリー内かを確認する（OS 別実装は #560〜#562）。
+/// 所有 PID が子プロセスツリー内かを確認する（Linux は実装済み #560。
+/// macOS #561・Windows #562 は未対応）。
 fn reserve_port() -> Result<u16, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind failed: {e}"))?;
     listener
@@ -527,7 +531,8 @@ fn reserve_port() -> Result<u16, String> {
 /// 一致しない・見つからない・照会に失敗した場合は `Err` を返し、呼び出し元
 /// の計測を `Outcome::Error` にする。`check_port_owner` の照会時間を
 /// cold start（`PERF-3`）へ混ぜないため、経過時間は照会の前に確定させる。
-/// 所有者確認が未対応の OS では stderr に 1 回だけ注記を出し、事後確認
+/// 所有者確認が未対応の OS（macOS・Windows。Linux は実装済み）では stderr に
+/// 1 回だけ注記を出し、事後確認
 /// （[`reprobe_after_kill`]）だけに頼る。
 fn spawn_and_wait_ready(
     bin: &PathBuf,
@@ -648,7 +653,8 @@ pub(crate) const PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// ポート所有者確認の結果（`Err` 以外）。`Unsupported` は「未確認」であり
 /// 「確認済み」ではない（REPAIR-3）。
-enum PortOwnerVerdict {
+#[derive(Debug)]
+pub(crate) enum PortOwnerVerdict {
     Verified,
     Unsupported,
 }
@@ -663,12 +669,15 @@ enum PortOwnerVerdict {
 /// は置き換えず併用する: 本関数が未対応の OS での唯一の防御になり、確認後に
 /// 割り込んだプロセスや居残りも事後確認が検出する。
 ///
-/// 外部コマンドを使う OS 別実装（#561・#562）は、`Command::new` と分割済みの
-/// 固定引数だけを使いシェルを通さない・出力バイト数/行数/PID 数を上限で縛る・
+/// Linux は実装済み（#560）。外部コマンドを使う OS 別実装（#561・#562）は、
+/// `Command::new` と分割済みの固定引数だけを使いシェルを通さない・出力バイト数/行数/PID 数を上限で縛る・
 /// `get()` と checked 演算を使い `[]`/`unwrap` を使わない・
 /// `run_with_deadline`/`EXTERNAL_COMMAND_DEADLINE` で期限を付ける、を守る。
-fn check_port_owner(root_pid: u32, port: u16) -> Result<PortOwnerVerdict, PortOwnerError> {
-    let Some(owner_pids) = lookup_port_owner_pids(port)? else {
+pub(crate) fn check_port_owner(
+    root_pid: u32,
+    port: u16,
+) -> Result<PortOwnerVerdict, PortOwnerError> {
+    let Some(owner_pids) = lookup_port_owner_pids(root_pid, port)? else {
         return Ok(PortOwnerVerdict::Unsupported);
     };
     let candidates = collect_owner_candidate_pids(root_pid, port)?;
@@ -676,18 +685,297 @@ fn check_port_owner(root_pid: u32, port: u16) -> Result<PortOwnerVerdict, PortOw
     Ok(PortOwnerVerdict::Verified)
 }
 
-/// `port` で LISTEN しているソケットの所有 PID を OS に照会する。
+/// `port` で LISTEN しているソケットの所有 PID を OS に照会する（`root_pid` は
+/// 起動した対象プロセスの PID。Linux 版が祖先関係の判定範囲に使う）。
 /// `Ok(None)` は「この OS では未対応」（確認済みではない）。
 ///
-/// スタブ（TASK-84.6.1）: 現状は全 OS で `Ok(None)` を返す。将来は
-/// Linux（#560）が `/proc/net/tcp{,6}` の LISTEN inode と `/proc/<pid>/fd`
-/// の `socket:[inode]` の突き合わせ、macOS（#561）が
+/// 非 Linux 版のスタブ（TASK-84.6.1）: macOS（#561）が
 /// `lsof -nP -iTCP:<port> -sTCP:LISTEN -Fp`、Windows（#562）が
-/// `netstat -ano -p TCP` で実装する。照合対象は 127.0.0.1 / 0.0.0.0 の
-/// LISTEN（IPv6 の扱いは各 issue で決める）。照会失敗は
-/// [`PortOwnerError::LookupFailed`] で返す。
-fn lookup_port_owner_pids(_port: u16) -> Result<Option<Vec<u32>>, PortOwnerError> {
+/// `netstat -ano -p TCP` で実装するまで `Ok(None)` を返す。照合対象は
+/// 127.0.0.1 / 0.0.0.0 の LISTEN（IPv6 の扱いは各 issue で決める）。
+/// 照会失敗は [`PortOwnerError::LookupFailed`] で返す。
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn lookup_port_owner_pids(
+    _root_pid: u32,
+    _port: u16,
+) -> Result<Option<Vec<u32>>, PortOwnerError> {
     Ok(None)
+}
+
+/// Linux 版が集める LISTEN inode 数の上限（coding-rust.md「件数を上限検証」）。
+/// 超えたら黙って切り捨てず `LookupFailed` にする。
+#[cfg(target_os = "linux")]
+const MAX_PORT_OWNER_INODES: usize = 64;
+
+/// Linux 版が `/proc` から列挙する PID 数の上限。超過は `LookupFailed`。
+#[cfg(target_os = "linux")]
+const MAX_PROC_SCAN_PIDS: usize = 65_536;
+
+/// `/proc/net/tcp{,6}` から `port` の LISTEN ソケットの inode を集め、
+/// `/proc/<pid>/fd` の `socket:[inode]` と突き合わせて所有 PID を返す。
+/// [`check_port_owner`] から readiness 成功時に呼ばれる。std だけで読み
+/// （`unsafe`・新規依存なし）、`/proc` の内容は untrusted として扱う。
+///
+/// - inode が 0 件なら `Ok(Some(空))`（[`verify_port_owner`] が `NoOwnerFound`）
+/// - 形式不正・上限超過・期限超過（`EXTERNAL_COMMAND_DEADLINE`）は
+///   `LookupFailed`。黙って打ち切ると外部の所有者を見落として誤って
+///   `Verified` を返し得るため、途中で止めずにエラーにする
+/// - 走査中に終了したプロセス・fd（`NotFound`）は読み飛ばす。権限不足
+///   （`PermissionDenied`）は走査を続ける。fd（ディレクトリ・エントリ・リンク）
+///   を読めない PID（root 所有・非 dumpable 等。非特権では常に存在する）は、所有者として帰属できた PID と
+///   祖先チェーン（ppid を辿る）が、所有者から `root_pid` までの祖先と交わる場合
+///   （親・子・兄弟・孫以降。fork によるソケット継承の経路）に同じソケットを
+///   保持し得るため、他の PID へ帰属できていても `LookupFailed`（祖先を確定できない場合も同様）。それ以外の
+///   読めない PID は対象外とする。既知の限界: 無関係な特権プロセスが fd 受け渡し
+///   で同ソケットを保持する場合は非特権では検出できない
+///   それ以外の I/O エラーは即 `LookupFailed`
+#[cfg(target_os = "linux")]
+pub(crate) fn lookup_port_owner_pids(
+    root_pid: u32,
+    port: u16,
+) -> Result<Option<Vec<u32>>, PortOwnerError> {
+    use std::io::ErrorKind;
+    use std::path::Path;
+
+    let fail = |reason: String| PortOwnerError::LookupFailed { port, reason };
+    let deadline = Instant::now() + crate::support::EXTERNAL_COMMAND_DEADLINE;
+    let check_deadline = || {
+        if Instant::now() >= deadline {
+            Err(fail("port owner scan exceeded its deadline".to_string()))
+        } else {
+            Ok(())
+        }
+    };
+
+    let mut inodes: Vec<u64> = Vec::new();
+    for (path, optional) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            // IPv6 無効環境では tcp6 が存在しない。空として扱う。
+            Err(e) if optional && e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(fail(format!("failed to open {path}: {e}"))),
+        };
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            check_deadline()?;
+            let n = read_line_bounded(&mut reader, &mut line)
+                .map_err(|e| fail(format!("failed to read {path}: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            let inode = proc_net_tcp_listen_inode(&line, port)
+                .map_err(|e| fail(format!("failed to parse {path}: {e}")))?;
+            if let Some(inode) = inode
+                && !inodes.contains(&inode)
+            {
+                if inodes.len() >= MAX_PORT_OWNER_INODES {
+                    return Err(fail(format!(
+                        "more than {MAX_PORT_OWNER_INODES} listening sockets on the port"
+                    )));
+                }
+                inodes.push(inode);
+            }
+        }
+    }
+    if inodes.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let proc_dir = Path::new("/proc");
+    let entries =
+        std::fs::read_dir(proc_dir).map_err(|e| fail(format!("failed to read /proc: {e}")))?;
+    let mut owners: Vec<u32> = Vec::new();
+    // fd ディレクトリまたは一部の fd を権限不足で確認できなかった PID。
+    let mut unreadable_pids: Vec<u32> = Vec::new();
+    let note_unreadable = |list: &mut Vec<u32>, pid: u32| {
+        if !list.contains(&pid) {
+            list.push(pid);
+        }
+    };
+    let mut scanned = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|e| fail(format!("failed to read /proc entry: {e}")))?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        scanned += 1;
+        if scanned > MAX_PROC_SCAN_PIDS {
+            return Err(fail(format!(
+                "more than {MAX_PROC_SCAN_PIDS} processes in /proc"
+            )));
+        }
+        let fds = match std::fs::read_dir(proc_dir.join(pid.to_string()).join("fd")) {
+            Ok(fds) => fds,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                // fd ディレクトリを読めないプロセス（root 所有・非 dumpable 等）は
+                // 走査後に所有者候補との親子・兄弟関係で見落としの可能性を判定する。
+                note_unreadable(&mut unreadable_pids, pid);
+                continue;
+            }
+            Err(e) => return Err(fail(format!("failed to read /proc/{pid}/fd: {e}"))),
+        };
+        for fd in fds {
+            check_deadline()?;
+            // fd の列挙・readlink は競合で消えた（NotFound）場合のみ読み飛ばす。
+            // 権限不足等で確認できない fd を無視すると所有者を見落として
+            // 誤って Verified を返し得るため、LookupFailed にする。
+            let fd = match fd {
+                Ok(fd) => fd,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                    note_unreadable(&mut unreadable_pids, pid);
+                    continue;
+                }
+                Err(e) => return Err(fail(format!("failed to read /proc/{pid}/fd entry: {e}"))),
+            };
+            let target = match std::fs::read_link(fd.path()) {
+                Ok(t) => t,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                    note_unreadable(&mut unreadable_pids, pid);
+                    continue;
+                }
+                Err(e) => {
+                    return Err(fail(format!(
+                        "failed to read link {}: {e}",
+                        fd.path().display()
+                    )));
+                }
+            };
+            let inode = target
+                .to_str()
+                .and_then(parse_socket_link_inode)
+                .filter(|inode| inodes.contains(inode));
+            if inode.is_some() && !owners.contains(&pid) {
+                owners.push(pid);
+            }
+        }
+    }
+    // fd を（一部でも）読めなかった PID のうち、所有者候補と祖先関係（親・子・兄弟・
+    // 孫以降・おじ/おい等。fork によるソケット継承の経路）を否定できないものは
+    // 同ソケットを保持し得るため fail-closed。祖先チェーンの解決に失敗した
+    // PID も安全側で同様に扱う。
+    if !unreadable_pids.is_empty() && !owners.is_empty() {
+        let mut owner_chains: Vec<Vec<u32>> = Vec::new();
+        for &o in &owners {
+            check_deadline()?;
+            match proc_ancestor_chain(o, deadline) {
+                // 所有者から `root_pid` までの祖先だけを対象にする。ソケットの作成者は
+                // `root_pid` の起動後に生まれたプロセス（または `root_pid` 自身）で、
+                // `root_pid` より上位の祖先は継承で保持できない（fd 受け渡しは既知の限界）。
+                // `root_pid` の配下でない所有者は後段の `verify_port_owner` が
+                // `Mismatch` にするため、ここでは関係判定の対象外とする。
+                ProcChain::Complete(c) => {
+                    if let Some(i) = c.iter().position(|p| *p == root_pid) {
+                        owner_chains.push(c[..=i].to_vec());
+                    }
+                }
+                // 走査後に終了した所有者は保持者でなくなっている。
+                ProcChain::Gone => {}
+                ProcChain::Unknown => {
+                    return Err(fail(format!(
+                        "could not resolve the ancestry of socket owner pid {o}"
+                    )));
+                }
+                ProcChain::DeadlineExceeded => {
+                    return Err(fail("port owner scan exceeded its deadline".to_string()));
+                }
+            }
+        }
+        for &pid in &unreadable_pids {
+            check_deadline()?;
+            let suspicious = match proc_ancestor_chain(pid, deadline) {
+                ProcChain::DeadlineExceeded => {
+                    return Err(fail("port owner scan exceeded its deadline".to_string()));
+                }
+                // 走査後に終了したプロセスは保持者になり得ない。
+                ProcChain::Gone => false,
+                ProcChain::Unknown => true,
+                ProcChain::Complete(chain) => owner_chains
+                    .iter()
+                    .any(|oc| proc_chains_related(&chain, oc)),
+            };
+            if suspicious {
+                return Err(fail(format!(
+                    "could not verify every listening socket owner (permission denied on /proc/{pid}/fd)"
+                )));
+            }
+        }
+    }
+    Ok(Some(owners))
+}
+
+/// `/proc/<pid>/stat` から ppid を読む（`lookup_port_owner_pids` 用）。
+/// comm に空白・括弧を含み得るため最後の `)` 以降を解析する。失敗は `None`。
+#[cfg(target_os = "linux")]
+fn read_proc_ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// [`proc_ancestor_chain`] の結果。
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProcChain {
+    /// 自身から ppid 0 までのチェーン（自身を含む）。
+    Complete(Vec<u32>),
+    /// 起点の PID が既に存在しない。
+    Gone,
+    /// 途中で ppid を読めない・循環・深さ超過などで確定できない。
+    Unknown,
+    /// 照会の期限（`deadline`）を超過した。呼び出し側は `LookupFailed` にする。
+    DeadlineExceeded,
+}
+
+/// 祖先チェーンの深さ上限（循環・異常な `/proc` 対策。coding-rust.md「件数を上限検証」）。
+#[cfg(target_os = "linux")]
+const MAX_PROC_ANCESTOR_DEPTH: usize = 4096;
+
+/// `pid` から `/proc/<pid>/stat` の ppid を辿り、ppid 0 までのチェーンを返す。
+/// `lookup_port_owner_pids` が、fd を読めない PID と所有者の祖先関係を
+/// ツリー全体で判定するために使う。`deadline` を過ぎたら 1 段ごとに
+/// [`ProcChain::DeadlineExceeded`] を返す（`EXTERNAL_COMMAND_DEADLINE` 契約の維持）。
+#[cfg(target_os = "linux")]
+pub(crate) fn proc_ancestor_chain(pid: u32, deadline: Instant) -> ProcChain {
+    let mut chain: Vec<u32> = Vec::new();
+    let mut cur = pid;
+    loop {
+        if Instant::now() >= deadline {
+            return ProcChain::DeadlineExceeded;
+        }
+        if chain.len() >= MAX_PROC_ANCESTOR_DEPTH || chain.contains(&cur) {
+            return ProcChain::Unknown;
+        }
+        chain.push(cur);
+        match read_proc_ppid(cur) {
+            Some(0) => return ProcChain::Complete(chain),
+            Some(pp) => cur = pp,
+            None => {
+                let exists = std::path::Path::new(&format!("/proc/{cur}/stat")).exists();
+                return if exists || chain.len() > 1 {
+                    // 途中の親が消えた場合は再親子付けされており関係を確定できない。
+                    ProcChain::Unknown
+                } else {
+                    ProcChain::Gone
+                };
+            }
+        }
+    }
+}
+
+/// 2 つの祖先チェーン（自身を含む）が、init（1）・kthreadd（2）・0 以外の
+/// PID を共有するか。共有するなら一方が他方の祖先か、共通の親から fork
+/// された関係であり、ソケット継承の可能性を否定できない。
+#[cfg(target_os = "linux")]
+pub(crate) fn proc_chains_related(a: &[u32], b: &[u32]) -> bool {
+    a.iter().any(|p| *p > 2 && b.contains(p))
 }
 
 /// 所有者として許容する PID の候補（`root_pid` とその子孫）を集める。
@@ -749,8 +1037,8 @@ const PORT_CONFLICT_REPROBE_TIMEOUT: Duration = Duration::from_millis(500);
 ///   場合、それを「元から居た別プロセス」と区別できない
 /// - 対象が孫プロセス以降を起動していた場合、`ChildGuard`/
 ///   `kill_process_group` の `wait` は直接の子までしか保証しない
-/// - 所有者の PID 確認（`check_port_owner`）は OS 別実装（#560〜#562）が
-///   入るまで行われない
+/// - 所有者の PID 確認（`check_port_owner`）は Linux のみ実装済み（#560）。
+///   macOS #561・Windows #562 は入るまで行われない
 ///
 /// 役割分担（TASK-84.6）: 事前ゲートの [`check_port_owner`]（ポートの所有
 /// PID 確認）とは置き換えずに併用する。事前ゲートが未対応の OS では本関数が
