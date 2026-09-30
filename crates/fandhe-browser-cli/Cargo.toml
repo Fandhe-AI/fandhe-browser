@@ -1,0 +1,33 @@
+[package]
+name = "fandhe-browser-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "fandhe-browser の CLI バイナリ crate。現状は core・profile・cdp を組み立ててサーバーを起動するだけの最小雛形（TASK-41.5）で、サブコマンドは TASK-47 で追加する"
+
+[[bin]]
+name = "fandhe-browser"
+path = "src/main.rs"
+
+# feature `rendering` は置かない。render crate には Renderer 実装がまだ無く、
+# 追加しても挙動が変わらず実装済みを装うことになるため（REPAIR-3。TASK-33 で追加する）。
+
+# workspace 内 path 依存・承認済みの workspace 依存のみ（registry クレートの追加ではない）。
+# ai は AI API ルータを合成する TASK-19 まで依存に加えない。
+[dependencies]
+fandhe-browser-core = { path = "../fandhe-browser-core" }
+fandhe-browser-profile = { path = "../fandhe-browser-profile" }
+fandhe-browser-cdp = { path = "../fandhe-browser-cdp" }
+# Server・BoundServer（#171 で承認済み）
+fandhe-backend-core = { workspace = true }
+# Router・RouterMergeError（#171 で承認済み）
+fandhe-backend-routes = { workspace = true }
+# ランタイム構築（#35 で承認済み。feature は workspace 定義のまま）
+tokio = { workspace = true }
+
+[dev-dependencies]
+# テストでの JSON 検証（#419 で承認済み）
+serde_json = { workspace = true }
+# テストの追加ルータ（ai ルータ相当）が返す Response 型
+fandhe-backend-http = { workspace = true }
