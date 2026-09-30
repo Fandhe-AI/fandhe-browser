@@ -387,7 +387,7 @@ pub trait JsEngine {
     /// 拒否した場合（`undefined` 等 non-configurable な名前・重複・件数上限）は
     /// [`JsEngineError::BindingFailed`] を返す。本トレイトへの集約と、
     /// [`NativeFn`]（`Send` なし）と親側の `Send` 付き関数型の橋渡しは
-    /// `TASK-29.6`（Issue #157）で行う（未実装）。
+    /// `TASK-29.6.2`（Issue #548）で行う（未実装）。
     fn inject_global_function(&mut self, name: &str, func: NativeFn) -> Result<(), JsEngineError>;
 
     /// 名前付きの DOM 風オブジェクト（複数のネイティブメソッドを持つ）を
