@@ -552,9 +552,13 @@ impl LongPath {
     }
 }
 
-/// verbatim パス全体の UTF-16 単位数の上限（Win32 の 32767 文字制限）。
+/// Win32 の長パス上限（終端 NUL を含めて 32767 UTF-16 単位）。
 #[cfg(any(windows, test))]
-const VERBATIM_MAX_UNITS: usize = 32767;
+const VERBATIM_MAX_UNITS_WITH_NUL: usize = 32767;
+/// verbatim パス本体の UTF-16 単位数の上限。Win32 の上限 32767 単位には終端 NUL の
+/// 1 単位が含まれるため、本体は最大 32766 単位とする（入力長・変換後長の両方で適用）。
+#[cfg(any(windows, test))]
+const VERBATIM_MAX_UNITS: usize = VERBATIM_MAX_UNITS_WITH_NUL - 1;
 /// 付与しうる最長プレフィックス（`\\?\UNC\`）の UTF-16 単位数。
 #[cfg(any(windows, test))]
 const VERBATIM_MAX_PREFIX_UNITS: usize = 8;
@@ -577,7 +581,7 @@ const VERBATIM_MAX_PREFIX_UNITS: usize = 8;
 /// fail-closed で [`ProfileError::InvalidLayout`] を返す入力: `..` 要素（verbatim では
 /// リテラル扱いとなり、解決するとプロファイル境界外へ抜ける経路になるため）、
 /// 相対・ドライブ相対・ルート相対・空のパス、デバイス名前空間（`\\.\`・`//?/` 等）、
-/// 上限（32767 UTF-16 単位）超過。
+/// 上限（終端 NUL を含め 32767 UTF-16 単位、すなわち本体 32766 単位）超過。
 ///
 /// Rust の `std::fs` も Windows で長い絶対パスを自動的に verbatim 化するが、どの長さで
 /// 変換されるかは std の実装詳細である。本関数は std 内部への暗黙依存をなくし、
@@ -1610,7 +1614,15 @@ mod tests {
 
     #[test]
     fn xos_8_over_limit_is_rejected() {
+        // 終端 NUL の 1 単位を確保するため、本体の上限は 32766 単位（32767 は拒否）。
+        assert_eq!(VERBATIM_MAX_UNITS, 32766);
         let max = VERBATIM_MAX_UNITS;
+        let at_win32_limit = format!(r"\\?\C:\{}", "a".repeat(32767 - 7));
+        assert_eq!(at_win32_limit.len(), 32767);
+        assert_eq!(
+            to_verbatim_wide(&w(&at_win32_limit)),
+            Err("path is too long for long path conversion")
+        );
         let reason = Err("path is too long for long path conversion");
         // ドライブ: プレフィックス 4 単位を付与した結果がちょうど上限。
         let ok = format!(r"C:\{}", "a".repeat(max - 4 - 3));
