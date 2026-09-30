@@ -5,7 +5,7 @@
 //!
 //! # Host 検証（DNS rebinding 対策）
 //!
-//! 将来 `webSocketDebuggerUrl` の authority はリクエストの `Host` ヘッダから作る（Chromium と同方式。
+//! `webSocketDebuggerUrl` の authority はリクエストの `Host` ヘッダから作る（Chromium と同方式。
 //! cli が port 0 で bind してもルータ構築後に決まるアドレスへ追従できる）。ホストは `localhost`
 //! か IP リテラルに限り、それ以外（= DNS rebinding で到達した任意ホスト名）は拒否する。
 //! 生のヘッダ文字列は応答へ出さず、parse した値から authority を組み立て直す。
@@ -13,8 +13,8 @@
 //!
 //! # スタブについて
 //!
-//! `/json/version` も `webSocketDebuggerUrl` を持たない。`/devtools/browser/{id}` の受け口
-//! （TASK-41.4）が未実装のため、接続先として返さない（REPAIR-3）。受け口と同時に追加する。
+//! `/json/version` の `webSocketDebuggerUrl` は `/devtools/browser/{id}` 受け口
+//! （TASK-41.4。[`crate::ws`]）と対で返す。
 //! `/json/list` の各要素はページごとの `webSocketDebuggerUrl`・`devtoolsFrontendUrl` を持たない。
 //! `/devtools/page/{id}` 受け口が未実装のため存在しない URL を出さない（REPAIR-3）。
 //! 受け口を実装するタスク（TASK-42 以降・`CDP-1`）で追加する。`title` も `TargetInfo` に
@@ -27,7 +27,14 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use serde_json::{Value, json};
 
-use crate::target::TargetInfo;
+use crate::target::{BrowserId, TargetInfo};
+
+/// ブラウザ WS 受け口のパスパターン（`WebSocketConfig::with_path_pattern` に渡す。
+/// `{id}` が [`BrowserId`]）。`webSocketDebuggerUrl` と受け口で同じ定義を共有する。
+pub(crate) const BROWSER_WS_PATH_PATTERN: &str = "/devtools/browser/{id}";
+
+/// `webSocketDebuggerUrl` のパス接頭辞（[`BROWSER_WS_PATH_PATTERN`] の `{id}` 直前まで）。
+const BROWSER_WS_PATH_PREFIX: &str = "/devtools/browser/";
 
 /// `Host` ヘッダ値の最大長（バイト）。ホスト名の上限 253 + `:` + ポート 5 桁 + 余裕。
 const MAX_HOST_HEADER_LEN: usize = 262;
@@ -42,8 +49,7 @@ pub(crate) struct Authority(String);
 impl Authority {
     /// 正規化済みの authority 文字列（`127.0.0.1:9222`・`[::1]:9222`・`localhost` 等）。
     ///
-    /// 現状はテストのみが使う。TASK-41.4 で `webSocketDebuggerUrl` を追加する際に本番でも使う。
-    #[cfg(test)]
+    /// `/json/version` の `webSocketDebuggerUrl` 組み立てに使う（TASK-41.4）。
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -142,15 +148,24 @@ fn canonical_host(host: &str) -> Result<String, HostError> {
 
 /// `/json/version` の本体（JSON）を作る。
 ///
-/// `webSocketDebuggerUrl` は含めない。`/devtools/browser/{id}` の WS 受け口が未実装
-/// （TASK-41.4）のため、接続できない URL を出さない（REPAIR-3）。受け口の実装と同時に
-/// authority（[`Authority`]）と `BrowserId` から組み立てて追加する（`CDP-1`）。
-pub(crate) fn version_body() -> Result<Vec<u8>, serde_json::Error> {
+/// `webSocketDebuggerUrl` は検証・再構築済みの `authority` と、文字種が制限された
+/// `browser_id` からのみ組み立てる（生の Host ヘッダは使わない。`CDP-1`）。
+/// `V8-Version`・`WebKit-Version` は偽値を返さないため出さない。
+pub(crate) fn version_body(
+    authority: &Authority,
+    browser_id: &BrowserId,
+) -> Result<Vec<u8>, serde_json::Error> {
     let product = concat!("fandhe-browser/", env!("CARGO_PKG_VERSION"));
     let body = json!({
         "Browser": product,
         "Protocol-Version": PROTOCOL_VERSION,
         "User-Agent": product,
+        "webSocketDebuggerUrl": format!(
+            "ws://{}{}{}",
+            authority.as_str(),
+            BROWSER_WS_PATH_PREFIX,
+            browser_id.as_str()
+        ),
     });
     serde_json::to_vec(&body)
 }
@@ -218,16 +233,37 @@ mod tests {
         assert_eq!(HostError::NotAllowed.to_string(), "host not allowed");
     }
 
+    fn version(host: &str, id: &str) -> Value {
+        let a = Authority::from_host_header(Some(host)).unwrap();
+        let b = BrowserId::parse(id).unwrap();
+        serde_json::from_slice(&version_body(&a, &b).unwrap()).unwrap()
+    }
+
     #[test]
     fn cdp1_version_body_has_real_values_only() {
-        let v: Value = serde_json::from_slice(&version_body().unwrap()).unwrap();
+        let v = version("127.0.0.1:9222", "fixed-1");
         let product = format!("fandhe-browser/{}", env!("CARGO_PKG_VERSION"));
         assert_eq!(v["Browser"], product.as_str());
         assert_eq!(v["User-Agent"], product.as_str());
         assert_eq!(v["Protocol-Version"], "1.3");
-        assert!(v.get("webSocketDebuggerUrl").is_none());
+        assert_eq!(
+            v["webSocketDebuggerUrl"],
+            "ws://127.0.0.1:9222/devtools/browser/fixed-1"
+        );
         assert!(v.get("V8-Version").is_none());
         assert!(v.get("WebKit-Version").is_none());
+    }
+
+    #[test]
+    fn cdp1_version_ws_url_follows_authority_form() {
+        assert_eq!(
+            version("[::1]:9222", "b-2")["webSocketDebuggerUrl"],
+            "ws://[::1]:9222/devtools/browser/b-2"
+        );
+        assert_eq!(
+            version("LOCALHOST:1234", "b-2")["webSocketDebuggerUrl"],
+            "ws://localhost:1234/devtools/browser/b-2"
+        );
     }
 
     #[test]
