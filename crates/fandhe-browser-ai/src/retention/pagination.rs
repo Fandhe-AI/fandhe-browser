@@ -121,8 +121,18 @@ fn is_ascii_space(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\x0C' | '\r' | ' ' | '\u{A0}')
 }
 
+/// `rel`・`class`・`role` などトークン列属性の最大バイト数。超える値は走査せず
+/// 一致なしとみなす（巨大属性値を持つリンクの大量投入による走査コスト増幅を防ぐ。
+/// security.md「不安全な設計」）。
+const MAX_TOKEN_ATTR_BYTES: usize = 1024;
+
 /// 空白区切りトークンに `wanted` が（ASCII 大文字小文字非区別で）完全一致するか。
+///
+/// `value` が [`MAX_TOKEN_ATTR_BYTES`] を超える場合は走査せず `false`。
 fn token_matches(value: &str, wanted: &str) -> bool {
+    if value.len() > MAX_TOKEN_ATTR_BYTES {
+        return false;
+    }
     value
         .split(is_ascii_space)
         .any(|t| !t.is_empty() && t.eq_ignore_ascii_case(wanted))
@@ -472,6 +482,23 @@ mod tests {
         let html = format!(r#"<a href="/x" aria-label="{big}">次へ</a>"#);
         assert_eq!(classify(&html), None);
         let html = format!(r#"<a href="/x" aria-label="{big} next" class="next">3</a>"#);
+        assert_eq!(classify(&html), Some(PaginationKind::Next));
+    }
+
+    /// AISNAP-12（TASK-16.2）: 巨大な rel / class は走査せず一致なし、上限ちょうどは判定される。
+    #[test]
+    fn aisnap_12_oversized_rel_and_class_excluded() {
+        let pad = " ".repeat(MAX_TOKEN_ATTR_BYTES);
+        let html = format!(r#"<a href="/x" rel="{pad}next">3</a>"#);
+        assert_eq!(classify(&html), None);
+        let html = format!(r#"<a href="/x" class="{pad}next">3</a>"#);
+        assert_eq!(classify(&html), None);
+        let html = format!(r#"<a href="/x" class="{pad}morelink">3</a>"#);
+        assert_eq!(classify(&html), None);
+        let pad = " ".repeat(MAX_TOKEN_ATTR_BYTES - "next".len());
+        let html = format!(r#"<a href="/x" rel="{pad}next">3</a>"#);
+        assert_eq!(classify(&html), Some(PaginationKind::Next));
+        let html = format!(r#"<a href="/x" class="{pad}next">3</a>"#);
         assert_eq!(classify(&html), Some(PaginationKind::Next));
     }
 
