@@ -238,6 +238,10 @@ dependencies = [
 [[package]]
 name = "fandhe-browser-cdp"
 version = "0.1.0"
+dependencies = [
+ "fandhe-browser-core",
+ "fandhe-browser-profile",
+]
 
 [[package]]
 name = "fandhe-browser-core"

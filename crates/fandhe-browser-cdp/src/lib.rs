@@ -2,15 +2,24 @@
 //!
 //! `fandhe-browser-cli` から起動され、Playwright / Puppeteer 等の CDP クライアントに
 //! 対して DOM 操作・ページ制御 API を公開することを目指す（README「実装方針（要点）」の
-//! CDP 互換方針を参照）。将来的には `fandhe-browser-core`（DOM・fetch）・
-//! `fandhe-browser-profile`（プロファイル分離）に依存する設計だが、両 crate が
-//! 本 crate と並行して整備中のため、現時点ではまだ依存を張っていない。
+//! CDP 互換方針を参照）。`fandhe-browser-core` の `AppState` に依存し、cdp 固有の
+//! 状態（ターゲット表・セッション表）は [`server::CdpState`] が内包する。
 //!
 //! # スタブについて
 //!
-//! 本ファイルは crate の雛形（TASK-1（1.6）・ビヘイビア `REPAIR-1`）であり、
-//! 実装済みを装う公開 API・ダミー実装は置かない（`code-comment-style.md`・REPAIR-3）。
+//! 状態型（CDP セッション・ターゲット表。`CDP-1`、TASK-41.2）は実装済み。
+//! 以下は未実装で、実装済みを装う公開 API・ダミー実装は置かない
+//! （`code-comment-style.md`・REPAIR-3）。
 //!
+//! - `/json/*` ルータ（TASK-41.3）・`/devtools/browser/{id}` 受け口（TASK-41.4）
 //! - CDP メソッドのハンドラ（`CDP-1`/`CDP-5`/`CDP-6`/`CDP-7`、`TASK-42`、`MS-4`）
-//! - サーバーの起動（`AppState`・CDP ルータの骨格。`CDP-1`/`CDP-7`/`AISNAP-6`/
-//!   `SEC-4`、`TASK-41`、`MS-3`。担当は cli/cdp 両クレートに跨る）
+//! - cli での組み立て・起動（TASK-41.5。`CDP-7`/`AISNAP-6`/`SEC-4`、`MS-3`）
+
+pub mod server;
+pub mod target;
+
+pub use server::CdpState;
+pub use target::{
+    BrowserId, CdpStateError, MAX_SESSIONS, MAX_TARGETS, SessionId, TargetId, TargetInfo,
+    TargetKind, TargetRegistry,
+};
