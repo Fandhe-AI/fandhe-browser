@@ -10,11 +10,13 @@
 //!
 //! # 判定規則（強い根拠から順）
 //!
-//! 対象は HTML 名前空間の `<a>` で、空でない `href` を持ち非表示でないもの。
+//! 対象は HTML 名前空間の `<a>` で、空でない `href` を持ち、自身も祖先も非表示でないもの
+//! （祖先の非表示は [`find_pagination_link`] が項目の祖先を検査する）。
 //!
 //! 1. `rel` トークン: `next` / `prev` / `previous`
 //! 2. ラベルの完全一致（`aria-label` を優先、無ければ短い表示テキスト。
-//!    空白正規化・ASCII 小文字化後の完全一致で、部分一致はしない）
+//!    空白正規化・ASCII 小文字化後の完全一致で、部分一致はしない。単独の `more` は
+//!    ページ番号と同じ文脈ガードがある場合だけ）
 //! 3. `class` トークン: `next` / `prev` / `previous` / `morelink`（Hacker News）
 //! 4. 数字だけのラベル（1〜4 桁）は、`aria-current="page"` または
 //!    `pagination`/`pager`/`paging` 系 class の祖先、もしくは `aria-label` が同系語を
@@ -108,7 +110,9 @@ const PREVIOUS_LABELS: &[&str] = &[
 ];
 const FIRST_LABELS: &[&str] = &["first", "first page", "« first", "最初", "最初へ", "先頭へ"];
 const LAST_LABELS: &[&str] = &["last", "last page", "last »", "最後", "最後へ"];
-const MORE_LABELS: &[&str] = &["more", "load more", "show more", "もっと見る", "さらに表示"];
+const MORE_LABELS: &[&str] = &["load more", "show more", "もっと見る", "さらに表示"];
+/// 単独の `more` ラベル。記事一覧の各行にも現れるため、ページャの文脈がある場合に限る。
+const BARE_MORE_LABEL: &str = "more";
 
 fn is_html_named(doc: &Document, id: NodeId, name: &str) -> bool {
     doc.namespace_url(id) == Some(HTML_NAMESPACE_URI)
@@ -290,6 +294,11 @@ pub fn classify_pagination_link(doc: &Document, id: NodeId) -> Option<Pagination
     if let Some(kind) = label.as_deref().and_then(kind_from_label) {
         return Some(kind);
     }
+    // 単独の "more" は文脈なしでは記事行の通常リンクと区別できないため、
+    // ページャ文脈がある場合だけ More とする（`morelink` class は下で根拠になる）。
+    if label.as_deref() == Some(BARE_MORE_LABEL) && has_pagination_context(doc, id) {
+        return Some(PaginationKind::More);
+    }
 
     if let Some(class) = doc.attribute(id, "class") {
         if token_matches(class, "next") {
@@ -316,6 +325,13 @@ pub fn classify_pagination_link(doc: &Document, id: NodeId) -> Option<Pagination
 /// 内部上限（256 ノード）以内に保つ。上限に達したら「見つからなかった」として
 /// `None`。複数ある場合は文書順で最初の種別を返す。
 pub fn find_pagination_link(doc: &Document, item: NodeId) -> Option<PaginationKind> {
+    // 項目自身より上の祖先が非表示なら、配下のリンクも不可視として扱う。
+    if doc
+        .ancestors(item)
+        .any(|a| doc.is_element(a) && is_hidden_element(doc, a))
+    {
+        return None;
+    }
     let mut stack = vec![item];
     let mut steps = 0usize;
     while let Some(id) = stack.pop() {
@@ -674,5 +690,34 @@ mod tests {
         let detection = detect_regular_structure(&doc, ul);
         let structure = detection.as_regular().expect("規則的な一覧");
         assert!(pagination_candidates(&doc, &structure.body_rows).is_empty());
+    }
+
+    /// AISNAP-12（TASK-16.2）: 非表示の祖先配下のリンクは候補にしない。
+    #[test]
+    fn aisnap_12_hidden_ancestor_excluded() {
+        for attrs in ["hidden", r#"aria-hidden="true""#] {
+            let html = format!(
+                r#"<div {attrs}><ul><li><a href="?p=2" rel="next">Next</a></li></ul></div>"#
+            );
+            let doc = parse(&html);
+            let li = select(&doc, "li");
+            assert_eq!(find_pagination_link(&doc, li), None, "{attrs}");
+            assert!(pagination_candidates(&doc, &[li]).is_empty(), "{attrs}");
+        }
+        let doc = parse(r#"<div><ul><li><a href="?p=2" rel="next">Next</a></li></ul></div>"#);
+        let li = select(&doc, "li");
+        assert_eq!(find_pagination_link(&doc, li), Some(PaginationKind::Next));
+    }
+
+    /// AISNAP-12（TASK-16.2）: 単独の More はページャ文脈がある場合だけ判定する。
+    #[test]
+    fn aisnap_12_bare_more_requires_context() {
+        assert_eq!(classify(r#"<a href="/article/1">More</a>"#), None);
+        let doc = parse(r#"<div class="pagination"><a href="/p2">More</a></div>"#);
+        let a = select(&doc, "a");
+        assert_eq!(
+            classify_pagination_link(&doc, a),
+            Some(PaginationKind::More)
+        );
     }
 }
