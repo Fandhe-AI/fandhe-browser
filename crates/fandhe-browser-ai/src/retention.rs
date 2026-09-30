@@ -1,11 +1,13 @@
 //! 表・一覧の圧縮で「どの項目を保持するか」を決める優先保持の選択層
-//! （`AISNAP-12`・`TASK-16`・`TASK-16.1`・`MS-2`・Issue #104）。
+//! （`AISNAP-12`・`TASK-16`・`TASK-16.1`・`TASK-16.3`・`MS-2`・Issue #104・#106）。
 //!
 //! 役割: 固定件数キャップの単純な `take(cap)` に代わり、キャップ境界付近の
 //! 軽微なページ変化で重要要素が簡約表現から消える問題（PoC-4）を避けるための
-//! 予算モデルを提供する。本モジュールは項目数（`len`）と方針
-//! （[`RetentionPolicy`]）から保持する index だけを返し、DOM には依存しない
-//! （表の行・`li` などの並びへ [`Retention::apply`] で写像する）。
+//! 予算モデルを提供する。選択層（本ファイル）は項目数（`len`）・方針
+//! （[`RetentionPolicy`]）・優先候補（[`PriorityCandidate`]）から保持する index
+//! だけを返し、DOM には依存しない（表の行・`li` などの並びへ
+//! [`Retention::apply`] で写像する）。DOM 上の優先項目の検出は子モジュール
+//! （フォーム送信ボタンは [`submit_button`]・TASK-16.3）が担う。
 //!
 //! # 予算モデル
 //!
@@ -13,8 +15,10 @@
 //!
 //! 1. 先頭から `min(head_keep, cap, len)` 件を [`RetentionReason::Head`] で予約する。
 //!    後続の段がこの予約を追い出すことはない
-//! 2. 優先項目の段（ページネーション・送信ボタン。TASK-16.2・16.3 で追加予定。
-//!    現在は未実装で何も選ばない）。残り予算 `cap - 確保済み` の範囲で追加する
+//! 2. 優先項目の段（フォーム送信ボタンは実装済み・TASK-16.3。ページネーションは
+//!    TASK-16.3・Issue #106 で別途追加）。呼び出し元が渡す優先候補を、残り予算
+//!    `cap - 確保済み` の範囲で index 昇順に採用する。先頭確保の範囲内・範囲外の
+//!    候補は無視し、同一 index の重複は最初の理由を採る
 //! 3. 残り予算で未選択の項目を文書順に [`RetentionReason::Fill`] で充填する
 //! 4. 結果は文書順（index 昇順）で返し、省略件数は [`Retention::omitted`] に入れる
 //!
@@ -24,9 +28,18 @@
 //! # 現状
 //!
 //! 呼び出し元はまだ無い。`compress_table::compress_rows` の `take(MAX_TABLE_ROWS)`
-//! の置き換え（統合）は TASK-16.4（Issue #107）で行う。ページネーション（#105）・
-//! 送信ボタン（#106）の優先保持も未実装で、実装済みを装わない（REPAIR-3）。
+//! の置き換え（統合）は TASK-16.4（Issue #107）で行い、そこで `compress_rows` が
+//! [`submit_button::submit_button_candidates`] の結果を
+//! [`select_retained_with_priority`] へ渡す想定である。送信ボタンの優先保持（#106）は
+//! 実装済み。ページネーション（#105）の優先保持は別 PR で、両者の候補の合成は
+//! TASK-16.4 の責務である。
 //! `<select>` の先頭圧縮は本モジュールの対象外（未実装）である。
+
+pub mod submit_button;
+
+pub use submit_button::{
+    SubmitButtonKind, classify_submit_button, find_submit_button, submit_button_candidates,
+};
 
 /// 保持の予算方針（`AISNAP-12`）。構築は [`RetentionPolicy::new`] 経由に限る。
 ///
@@ -52,8 +65,8 @@ impl RetentionPolicy {
 
 /// 項目が保持された理由（`AISNAP-12`）。
 ///
-/// TASK-16.2（#105）・16.3（#106）でページネーション・送信ボタン用の
-/// variant を追加予定のため `non_exhaustive` とする。
+/// 送信ボタン用 variant は TASK-16.3（#106）で追加済み。ページネーション用は
+/// TASK-16.2（#105）で追加予定のため `non_exhaustive` とする。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RetentionReason {
@@ -61,6 +74,29 @@ pub enum RetentionReason {
     Head,
     /// 残り予算による文書順の充填で保持された。
     Fill,
+    /// フォームの送信ボタンを含むため優先して保持された（TASK-16.3・
+    /// Issue #106）。種別の詳細は [`SubmitButtonKind`]。
+    SubmitButton,
+}
+
+/// 優先して保持したい項目の候補（`AISNAP-12`・`TASK-16.3`）。
+///
+/// DOM 検出側（[`submit_button::submit_button_candidates`] 等）が生成し、選択層
+/// [`select_retained_with_priority`] が予算内で採用する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PriorityCandidate {
+    /// 元の並びにおける 0 始まりの位置。
+    pub index: usize,
+    /// 優先する理由（保持結果の [`RetainedItem::reason`] になる）。
+    pub reason: RetentionReason,
+}
+
+impl PriorityCandidate {
+    /// 候補を構築する。
+    pub fn new(index: usize, reason: RetentionReason) -> Self {
+        Self { index, reason }
+    }
 }
 
 /// 保持された 1 項目（`AISNAP-12`）。
@@ -98,9 +134,25 @@ impl Retention {
 
 /// `len` 件の並びから `policy` に従い保持する項目を選ぶ（`AISNAP-12`）。
 ///
-/// 確保量は `min(len, cap)` で上限され、巨大な `len` でも `len` に比例した
-/// 確保・走査はしない。
+/// 優先候補なしの [`select_retained_with_priority`]。確保量は `min(len, cap)` で
+/// 上限され、巨大な `len` でも `len` に比例した確保・走査はしない。
 pub fn select_retained(len: usize, policy: &RetentionPolicy) -> Retention {
+    select_retained_with_priority(len, policy, &[])
+}
+
+/// 優先候補つきで保持する項目を選ぶ（`AISNAP-12`・`TASK-16.3`・Issue #106）。
+///
+/// 予算モデル（先頭確保 → 優先項目 → 文書順の充填）はモジュール doc を参照。
+/// `candidates` のうち範囲外（`index >= len`）と先頭確保範囲内のものは無視し、
+/// 残りを index 昇順で残り予算まで採用する（候補過多時は文書順の先頭側が残る）。
+/// 同一 index が複数あれば与えられた順で先の理由を採る。確保量は
+/// `min(len, cap) + candidates.len()` 以下、走査量は `cap + candidates.len()` 程度で、
+/// 巨大な `len` に比例しない。
+pub fn select_retained_with_priority(
+    len: usize,
+    policy: &RetentionPolicy,
+    candidates: &[PriorityCandidate],
+) -> Retention {
     // 正規化: 総予算は cap と len の小さい方。head_keep も予算以下へ抑える。
     let budget = policy.cap.min(len);
     let head = policy.head_keep.min(budget);
@@ -112,23 +164,48 @@ pub fn select_retained(len: usize, policy: &RetentionPolicy) -> Retention {
         reason: RetentionReason::Head,
     }));
 
-    // 優先項目の段（TASK-16.2・16.3 で追加予定。未実装）。
-    // ここで残り予算 `budget - kept.len()` の範囲に限って追加し、Head は追い出さない。
-
-    // 文書順の充填（現状は先頭確保の直後から連続して埋まる）。
-    kept.extend((head..budget).map(|index| RetainedItem {
-        index,
-        reason: RetentionReason::Fill,
+    // 優先項目の段: 範囲外・先頭確保済みを除き、index 昇順（安定整列で重複は
+    // 与えられた順の先頭が残る）に並べて残り予算まで採用する。
+    let mut prioritized: Vec<PriorityCandidate> = candidates
+        .iter()
+        .copied()
+        .filter(|c| c.index >= head && c.index < len)
+        .collect();
+    prioritized.sort_by_key(|c| c.index);
+    prioritized.dedup_by_key(|c| c.index);
+    prioritized.truncate(budget.saturating_sub(head));
+    kept.extend(prioritized.iter().map(|c| RetainedItem {
+        index: c.index,
+        reason: c.reason,
     }));
 
-    // 現状は index が昇順で構築されるため整列不要。優先項目の段の追加時に整列する。
+    // 文書順の充填: 優先段で採用済みの index（`prioritized` は昇順）を飛ばし、
+    // 予算に達するまで埋める。
+    let mut skip = prioritized.iter().map(|c| c.index).peekable();
+    let mut index = head;
+    while kept.len() < budget && index < len {
+        while skip.next_if(|&s| s < index).is_some() {}
+        if skip.next_if(|&s| s == index).is_none() {
+            kept.push(RetainedItem {
+                index,
+                reason: RetentionReason::Fill,
+            });
+        }
+        index += 1;
+    }
+
+    // 優先項目が Fill の間に入るため、文書順（index 昇順）へ整列する。
+    kept.sort_by_key(|item| item.index);
     let omitted = len.saturating_sub(kept.len());
     Retention { kept, omitted }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RetentionPolicy, RetentionReason, select_retained};
+    use super::{
+        PriorityCandidate, RetentionPolicy, RetentionReason, select_retained,
+        select_retained_with_priority,
+    };
     use crate::compress_table::detect_regular_structure;
     use fandhe_browser_core::dom::{Document, NodeId};
     use fandhe_browser_core::parse::{ParseOptions, parse_document};
@@ -234,6 +311,100 @@ mod tests {
         assert_eq!(r.apply(&items), vec![&"a", &"b", &"c", &"d"]);
         assert_eq!(r.apply(&items[..2]), vec![&"a", &"b"]);
         assert!(r.apply::<&str>(&[]).is_empty());
+    }
+
+    fn sb(index: usize) -> PriorityCandidate {
+        PriorityCandidate::new(index, RetentionReason::SubmitButton)
+    }
+
+    /// AISNAP-12（TASK-16.3・Issue #106）: キャップ外の優先候補が保持される。
+    #[test]
+    fn aisnap_12_priority_candidate_beyond_cap_is_kept() {
+        let r = select_retained_with_priority(30, &RetentionPolicy::new(20, 5), &[sb(29)]);
+        assert_eq!(indexes(&r, RetentionReason::Head), vec![0, 1, 2, 3, 4]);
+        assert_eq!(indexes(&r, RetentionReason::SubmitButton), vec![29]);
+        assert_eq!(
+            indexes(&r, RetentionReason::Fill),
+            (5..19).collect::<Vec<_>>()
+        );
+        assert_eq!(r.kept.len(), 20);
+        assert_eq!(r.omitted, 10);
+        let all: Vec<usize> = r.kept.iter().map(|i| i.index).collect();
+        assert!(all.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// AISNAP-12: 先頭確保範囲内の候補は二重計上されない。
+    #[test]
+    fn aisnap_12_priority_candidate_inside_head_is_not_double_counted() {
+        let r = select_retained_with_priority(30, &RetentionPolicy::new(20, 5), &[sb(2)]);
+        assert_eq!(indexes(&r, RetentionReason::Head), vec![0, 1, 2, 3, 4]);
+        assert!(indexes(&r, RetentionReason::SubmitButton).is_empty());
+        assert_eq!(
+            indexes(&r, RetentionReason::Fill),
+            (5..20).collect::<Vec<_>>()
+        );
+    }
+
+    /// AISNAP-12: 範囲外・重複の候補は無視・統合される。
+    #[test]
+    fn aisnap_12_priority_out_of_range_and_duplicates() {
+        let c = [sb(30), sb(usize::MAX), sb(25), sb(25)];
+        let r = select_retained_with_priority(30, &RetentionPolicy::new(20, 5), &c);
+        assert_eq!(indexes(&r, RetentionReason::SubmitButton), vec![25]);
+        assert_eq!(r.kept.len(), 20);
+        assert_eq!(r.omitted, 10);
+    }
+
+    /// AISNAP-12: 候補過多なら index 昇順で残り予算まで採用する。
+    #[test]
+    fn aisnap_12_priority_overflow_takes_lowest_indexes() {
+        let c = [sb(29), sb(10), sb(20), sb(15), sb(12)];
+        let r = select_retained_with_priority(30, &RetentionPolicy::new(8, 5), &c);
+        assert_eq!(indexes(&r, RetentionReason::SubmitButton), vec![10, 12, 15]);
+        assert!(indexes(&r, RetentionReason::Fill).is_empty());
+        assert_eq!(r.kept.len(), 8);
+    }
+
+    /// AISNAP-12: head_keep == cap では優先段は先頭確保を追い出さない。
+    #[test]
+    fn aisnap_12_priority_does_not_evict_head() {
+        let r = select_retained_with_priority(30, &RetentionPolicy::new(5, 5), &[sb(29)]);
+        assert_eq!(indexes(&r, RetentionReason::Head), vec![0, 1, 2, 3, 4]);
+        assert!(indexes(&r, RetentionReason::SubmitButton).is_empty());
+    }
+
+    /// AISNAP-12: cap 0 は候補があっても何も保持しない。
+    #[test]
+    fn aisnap_12_priority_cap_zero_keeps_nothing() {
+        let r = select_retained_with_priority(10, &RetentionPolicy::new(0, 0), &[sb(3)]);
+        assert!(r.kept.is_empty());
+        assert_eq!(r.omitted, 10);
+    }
+
+    /// AISNAP-12: 巨大 len でも優先候補つきで確保量は cap に収まる。
+    #[test]
+    fn aisnap_12_priority_large_len_bounded() {
+        let r = select_retained_with_priority(
+            usize::MAX,
+            &RetentionPolicy::new(20, 1),
+            &[sb(usize::MAX - 1)],
+        );
+        assert_eq!(r.kept.len(), 20);
+        assert_eq!(
+            indexes(&r, RetentionReason::SubmitButton),
+            vec![usize::MAX - 1]
+        );
+        assert_eq!(r.omitted, usize::MAX - 20);
+    }
+
+    /// AISNAP-12: 候補なしなら select_retained と一致する。
+    #[test]
+    fn aisnap_12_select_retained_equals_empty_priority() {
+        let p = RetentionPolicy::new(20, 5);
+        assert_eq!(
+            select_retained(30, &p),
+            select_retained_with_priority(30, &p, &[])
+        );
     }
 
     fn parse(html: &str) -> Document {
