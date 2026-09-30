@@ -253,7 +253,12 @@ impl ProfileStore for ExplicitStore {
     /// 開いたルートのハンドルで共有ディレクトリ（sticky・group/other 書込可）を
     /// `fchmod(0700)` の前に拒否して開く（`PROF-1`・TOCTOU 回避）。
     fn open_or_create(&self) -> Result<Profile, ProfileError> {
-        Profile::open_rejecting_shared_root(&self.root)
+        // Windows では既定実装と同じく verbatim パスへ変換してから開く（`XOS-8`、TASK-61（61.1））。
+        #[cfg(windows)]
+        let target = to_long_path(&self.root)?.into_path();
+        #[cfg(not(windows))]
+        let target = self.root.clone();
+        Profile::open_rejecting_shared_root(&target)
     }
 }
 
@@ -563,6 +568,8 @@ const VERBATIM_MAX_PREFIX_UNITS: usize = 8;
 /// - `C:\a` → `\\?\C:\a`（[`LongPathKind::Disk`]）
 /// - `\\server\share\a` → `\\?\UNC\server\share\a`（[`LongPathKind::Unc`]）
 /// - 既に `\\?\` で始まる → 変更しない（[`LongPathKind::AlreadyVerbatim`]）
+///   （`\\?\X:\...` と `\\?\UNC\server\share\...` のみ許可し、`..`・`.`・空要素・`/`・
+///   `GLOBALROOT` 等のデバイス名前空間は検証して拒否する）
 /// - `\\?\` は Win32 の正規化を無効にするため、`/` を `\` へ、連続区切りを 1 つへ、
 ///   `.` 要素を除去する。末尾のドット・空白は verbatim では保存される（名前の
 ///   正規化は `XOS-9`・TASK-62 の責務でここでは行わない）
@@ -582,7 +589,12 @@ const VERBATIM_MAX_PREFIX_UNITS: usize = 8;
 pub fn to_long_path(path: &Path) -> Result<LongPath, ProfileError> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    // 確保前に UTF-16 単位数を上限 + 1 で打ち切り、巨大入力でのメモリ消費を防ぐ。
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .take(VERBATIM_MAX_UNITS + 1)
+        .collect();
     match to_verbatim_wide(&wide) {
         Ok((out, kind)) => Ok(LongPath {
             path: PathBuf::from(OsString::from_wide(&out)),
@@ -633,7 +645,8 @@ fn to_verbatim_wide(input: &[u16]) -> Result<(Vec<u16>, LongPathKind), &'static 
     if input.len() > VERBATIM_MAX_UNITS - VERBATIM_MAX_PREFIX_UNITS {
         return Err("path is too long for long path conversion");
     }
-    if input.starts_with(&VERBATIM) {
+    if let Some(rest) = input.strip_prefix(&VERBATIM) {
+        validate_verbatim_rest(rest)?;
         return Ok((input.to_vec(), LongPathKind::AlreadyVerbatim));
     }
     // `\\?\` の厳密一致以外のデバイス名前空間（`\\.\`・`//?/` 等）は拒否する。
@@ -718,6 +731,62 @@ fn to_verbatim_wide(input: &[u16]) -> Result<(Vec<u16>, LongPathKind), &'static 
     // 相対・ドライブ相対・ルート相対・NT 形式（`\??\`）・空は拒否（fail-closed）。
     Err(not_absolute)
 }
+
+/// 既に `\\?\` で始まる入力の残り部分（プレフィックス除去後）を検証する（`XOS-8`・`PROF-1`）。
+///
+/// 許可する形式は `\\?\X:\...`（ドライブ）と `\\?\UNC\server\share\...` のみ。
+/// `\\?\GLOBALROOT\...`・`\\?\Volume{...}` 等のデバイス名前空間は拒否する。verbatim では
+/// `/`・`.`・`..` がリテラル扱いとなり境界外へ抜ける経路になり得るため、`/` を含む入力と
+/// `.`・`..`・空の要素（末尾の 1 つの区切りを除く）も拒否する（fail-closed）。
+#[cfg(any(windows, test))]
+fn validate_verbatim_rest(rest: &[u16]) -> Result<(), &'static str> {
+    const BS: u16 = b'\\' as u16;
+    const DOT: u16 = b'.' as u16;
+    let bad = "verbatim path must be a drive or UNC path without '.', '..' or '/' components";
+
+    if rest.contains(&(b'/' as u16)) {
+        return Err(bad);
+    }
+    let is_drive = matches!(
+        (rest.first(), rest.get(1), rest.get(2)),
+        (Some(&l), Some(&c), Some(&s))
+            if u8::try_from(l).is_ok_and(|l| l.is_ascii_alphabetic())
+                && c == b':' as u16
+                && s == BS
+    );
+    let is_unc = rest.len() > 4
+        && rest.get(3) == Some(&BS)
+        && rest.get(..3).is_some_and(|p| {
+            p.iter()
+                .zip(b"UNC")
+                .all(|(&u, &b)| u8::try_from(u).is_ok_and(|u| u.eq_ignore_ascii_case(&b)))
+        });
+    let tail = if is_drive {
+        rest.get(3..).unwrap_or(&[])
+    } else if is_unc {
+        rest.get(4..).unwrap_or(&[])
+    } else {
+        return Err(bad);
+    };
+    // 末尾の区切り 1 つだけは許可する（`\\?\C:\` のようなルート）。
+    let tail = tail.strip_suffix(&[BS]).unwrap_or(tail);
+    if tail.is_empty() {
+        // ドライブのルートは可。UNC は server・share が必要なので不可。
+        return if is_drive { Ok(()) } else { Err(bad) };
+    }
+    let mut count = 0usize;
+    for elem in tail.split(|&u| u == BS) {
+        if elem.is_empty() || elem == [DOT] || elem == [DOT, DOT] {
+            return Err(bad);
+        }
+        count += 1;
+    }
+    if is_unc && count < 2 {
+        return Err("UNC path requires a valid server and share name");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1466,6 +1535,31 @@ mod tests {
             conv("C:/a/./b//c/"),
             Ok((r"\\?\C:\a\b\c".to_string(), LongPathKind::Disk))
         );
+    }
+
+    #[test]
+    fn xos_8_verbatim_input_is_validated() {
+        for ok in [
+            r"\\?\C:\",
+            r"\\?\C:\a\b",
+            r"\\?\UNC\srv\share",
+            r"\\?\unc\srv\share\a",
+        ] {
+            assert!(conv(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            r"\\?\C:\root\..\outside",
+            r"\\?\C:\a\.\b",
+            r"\\?\C:\a\\b",
+            "\\\\?\\C:/a",
+            r"\\?\GLOBALROOT\Device\x",
+            r"\\?\Volume{1234}\a",
+            r"\\?\UNC\srv",
+            r"\\?\UNC\srv\share\..\x",
+            r"\\?\C:",
+        ] {
+            assert!(conv(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
