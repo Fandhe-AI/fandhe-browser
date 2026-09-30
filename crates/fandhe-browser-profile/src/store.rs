@@ -641,12 +641,16 @@ fn to_verbatim_wide(input: &[u16]) -> Result<(Vec<u16>, LongPathKind), &'static 
     ];
     let is_sep = |u: u16| u == BS || u == FS;
 
-    // アロケーション前に長さを検証する（無制限確保による DoS の防止）。
-    if input.len() > VERBATIM_MAX_UNITS - VERBATIM_MAX_PREFIX_UNITS {
-        return Err("path is too long for long path conversion");
+    // アロケーション前に入力長を粗く検証する（無制限確保による DoS の防止）。変換後の
+    // 長さによる厳密な判定は各経路の末尾で行う（付与するプレフィックスが入力形式で
+    // 異なり、既存 verbatim は付与なしのため、一律の差し引きは有効な長パスを誤拒否する）。
+    let too_long = "path is too long for long path conversion";
+    if input.len() > VERBATIM_MAX_UNITS {
+        return Err(too_long);
     }
     if let Some(rest) = input.strip_prefix(&VERBATIM) {
         validate_verbatim_rest(rest)?;
+        // 入力長は上記で上限以下のため、変換後（無変更）の長さ判定は不要。
         return Ok((input.to_vec(), LongPathKind::AlreadyVerbatim));
     }
     // `\\?\` の厳密一致以外のデバイス名前空間（`\\.\`・`//?/` 等）は拒否する。
@@ -701,6 +705,9 @@ fn to_verbatim_wide(input: &[u16]) -> Result<(Vec<u16>, LongPathKind), &'static 
         out.push(BS);
         let rest = norm.get(3..).unwrap_or(&[]);
         push_elements(&mut out, rest, false)?;
+        if out.len() > VERBATIM_MAX_UNITS {
+            return Err(too_long);
+        }
         return Ok((out, LongPathKind::Disk));
     }
 
@@ -725,6 +732,9 @@ fn to_verbatim_wide(input: &[u16]) -> Result<(Vec<u16>, LongPathKind), &'static 
         let consumed = server.len() + 1 + share.len();
         let tail = rest.get(consumed..).unwrap_or(&[]);
         push_elements(&mut out, tail, true)?;
+        if out.len() > VERBATIM_MAX_UNITS {
+            return Err(too_long);
+        }
         return Ok((out, LongPathKind::Unc));
     }
 
@@ -768,11 +778,15 @@ fn validate_verbatim_rest(rest: &[u16]) -> Result<(), &'static str> {
     } else {
         return Err(bad);
     };
-    // 末尾の区切り 1 つだけは許可する（`\\?\C:\` のようなルート）。
+    // ドライブのルート（`\\?\C:\`）はそのまま許可する。UNC は server・share が必要。
+    if tail.is_empty() {
+        return if is_drive { Ok(()) } else { Err(bad) };
+    }
+    // 末尾の区切り 1 つだけは許可する。取り除いて空になる（`\\?\C:\\` のように区切りが
+    // 連続する）場合は空要素を含むため拒否する。
     let tail = tail.strip_suffix(&[BS]).unwrap_or(tail);
     if tail.is_empty() {
-        // ドライブのルートは可。UNC は server・share が必要なので不可。
-        return if is_drive { Ok(()) } else { Err(bad) };
+        return Err(bad);
     }
     let mut count = 0usize;
     for elem in tail.split(|&u| u == BS) {
@@ -1591,16 +1605,49 @@ mod tests {
 
     #[test]
     fn xos_8_over_limit_is_rejected() {
-        let max = VERBATIM_MAX_UNITS - VERBATIM_MAX_PREFIX_UNITS;
-        let ok = format!(r"C:\{}", "a".repeat(max - 3));
+        let max = VERBATIM_MAX_UNITS;
+        let reason = Err("path is too long for long path conversion");
+        // ドライブ: プレフィックス 4 単位を付与した結果がちょうど上限。
+        let ok = format!(r"C:\{}", "a".repeat(max - 4 - 3));
         let (out, kind) = to_verbatim_wide(&w(&ok)).unwrap();
         assert_eq!(kind, LongPathKind::Disk);
-        assert_eq!(out.len(), max + 4);
-        let too_long = format!(r"C:\{}", "a".repeat(max - 2));
+        assert_eq!(out.len(), max);
+        let over = format!(r"C:\{}", "a".repeat(max - 4 - 2));
+        assert_eq!(to_verbatim_wide(&w(&over)), reason);
+        // UNC: プレフィックス 6 単位（`\\` を `\\?\UNC\` へ）の増加でちょうど上限。
+        let ok = format!(r"\\s\h\{}", "a".repeat(max - 6 - 6));
+        let (out, kind) = to_verbatim_wide(&w(&ok)).unwrap();
+        assert_eq!(kind, LongPathKind::Unc);
+        assert_eq!(out.len(), max);
+        let over = format!(r"\\s\h\{}", "a".repeat(max - 6 - 5));
+        assert_eq!(to_verbatim_wide(&w(&over)), reason);
+    }
+
+    #[test]
+    fn xos_8_existing_verbatim_near_limit_is_accepted() {
+        // 既存 verbatim は付与なしのため、32760 単位でも上限内なら受理する。
+        let max = VERBATIM_MAX_UNITS;
+        let input = format!(r"\\?\C:\{}", "a".repeat(32760 - 7));
+        assert_eq!(input.len(), 32760);
+        let (out, kind) = to_verbatim_wide(&w(&input)).unwrap();
+        assert_eq!(kind, LongPathKind::AlreadyVerbatim);
+        assert_eq!(out.len(), 32760);
+        let exact = format!(r"\\?\C:\{}", "a".repeat(max - 7));
+        assert!(to_verbatim_wide(&w(&exact)).is_ok());
+        let over = format!(r"\\?\C:\{}", "a".repeat(max - 6));
         assert_eq!(
-            to_verbatim_wide(&w(&too_long)),
+            to_verbatim_wide(&w(&over)),
             Err("path is too long for long path conversion")
         );
+    }
+
+    #[test]
+    fn xos_8_verbatim_drive_root_with_extra_separator_is_rejected() {
+        let bad = "verbatim path must be a drive or UNC path without '.', '..' or '/' components";
+        for input in [r"\\?\C:\\", r"\\?\C:\\\"] {
+            assert_eq!(to_verbatim_wide(&w(input)), Err(bad), "input: {input:?}");
+        }
+        assert!(to_verbatim_wide(&w(r"\\?\C:\")).is_ok());
     }
 
     #[test]
