@@ -12,12 +12,19 @@
 //! 添字対応付け（`map_to_snapshot`）で結び付け、role・name・data_leaf の一致で
 //! 対応付けの正しさを確認する。判別可能の条件は次の 3 点。
 //! 1. 対応ノードが ref を持つ（PoC の `found`）。
-//! 2. その ref が木全体で一意（PoC の `restoreOk` 相当）。
+//! 2. その ref が形式上妥当で木全体で一意。ref から DOM を復元できること（PoC の
+//!    `restoreOk`）は検証しない（下記「未検証の契約」）。
 //! 3. snapshot の情報だけで作る述語の「先行順で最初の一致」が対象ノードと一致する。
 //!
 //! 値の確認（`expected_text`）の範囲: Snapshot は価格等のテキスト値を保持しないため、
-//! 値そのものの保持ではなく「Snapshot の位置（ref 相当）から DOM を再特定して値に
-//! 到達できること」を検証する。name を持つノード（リンク・表見出し）は name も照合する。
+//! 値そのものの保持ではなく「Snapshot 木の添字位置から DOM を再特定して値に到達できる
+//! こと」を検証する。これは ref ではなく子添字の位置による再特定であり、ref の復元性は
+//! 保証しない。name を持つノード（リンク・表見出し）は name も照合する。
+//!
+//! 未検証の契約（ref から対象 DOM 要素を解決できること）: ref から DOM への公開リゾルバが
+//! 未提供のため本ファイルでは検証せず、`restoreOk` 相当を満たしたとは主張しない。リゾルバ
+//! 提供後に ref 経由の解決テストへ差し替える（`AISNAP-3` は判別可能性の集計、ref 復元性は
+//! `AISNAP-10` 側の契約）。
 //!
 //! フィクスチャ制約: `<body>` 内に `build_snapshot` が除外する要素（`script`・`style`・
 //! `noscript`・`template`・`hidden`・`aria-hidden="true"`・`input[type=hidden]`）を
@@ -75,7 +82,7 @@ enum Outcome {
     RefNotUnique,
     /// 述語の最初の一致が対象ノードと異なる（または一致なし）。
     PredicateMismatch,
-    /// Snapshot の name または ref で再特定した DOM の値が期待と異なる。
+    /// Snapshot の name、または木の添字位置で再特定した DOM の値が期待と異なる（ref 経由ではない）。
     ValueMismatch(String),
 }
 
@@ -312,10 +319,10 @@ fn evaluate(task: &Task) -> Outcome {
         // Snapshot は価格などのテキスト値を持たない（`Node` に text フィールドは無い）。
         // そのため値の確認は次の 2 段に分ける。
         // (a) Snapshot 側: name が空でなければ（リンク・表見出し）name が期待値と一致する。
-        // (b) ref による DOM 再特定: 述語が選んだ Snapshot 上の位置から DOM を復元し、
-        //     その要素の text_content が期待値と一致する（PoC の restoreOk 相当）。
-        //     値そのものが Snapshot に残ることではなく、Snapshot の情報だけで
-        //     値の在処へ辿り着けることを検証する。
+        // (b) 添字位置による DOM 再特定: 述語が選んだ Snapshot 上の子添字位置から DOM を
+        //     逆引きし、その要素の text_content が期待値と一致する。ref を使った復元では
+        //     なく（リゾルバ未提供）、`restoreOk` 相当の検証ではない。値そのものが Snapshot に
+        //     残ることではなく、Snapshot の構造だけで値の在処へ辿り着けることを検証する。
         let name = first.map(|n| n.name.as_str()).unwrap_or_default();
         if !name.is_empty() && name != expected {
             return Outcome::ValueMismatch(name.to_string());
@@ -331,9 +338,13 @@ fn evaluate(task: &Task) -> Outcome {
     Outcome::Discriminable
 }
 
-/// AISNAP-3: 7 タスクそれぞれの判定結果を具体値で固定する。
+/// AISNAP-3 回帰固定: 現状 7 タスクすべてが `Discriminable` であることを具体値で固定する。
+///
+/// 受入基準（7 件中 6 件以上）より意図的に厳しい。基準の判定は直後の
+/// `aisnap_3_discriminable_tasks_at_least_6_of_7` が担い、本テストは 1 件でも退行したら
+/// 気付くための固定であり、許容する非判別タスクは無い。
 #[test]
-fn aisnap_3_each_representative_task_outcome() {
+fn aisnap_3_all_seven_tasks_currently_discriminable_regression_pin() {
     let got: Vec<(&str, Outcome)> = tasks().iter().map(|t| (t.name, evaluate(t))).collect();
     let expected: Vec<(&str, Outcome)> = [
         "login-button",
