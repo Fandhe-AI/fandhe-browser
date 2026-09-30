@@ -3132,6 +3132,29 @@ mod tests {
         NativeEntry::Threaded(Arc::new(Mutex::new(func)))
     }
 
+    /// `TASK-29.6.2`・Issue #548: `Inline` の `NativeFn` が実行中（借用中）に
+    /// 同じエントリへ再入した場合、panic せず具体的なエラー文言の
+    /// [`NativeReturn::Err`] になること。正常な後続呼び出しは成功すること。
+    #[test]
+    fn js_1_dispatch_inline_reentry_returns_still_busy_error() {
+        let cell = std::cell::RefCell::new(
+            Box::new(|_args: &[JsValue]| Ok(JsValue::Number(7.0))) as NativeFn
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        {
+            let _held = cell.borrow_mut();
+            let ret = dispatch_inline(&cell, &[], deadline).expect("no protocol violation");
+            assert_eq!(
+                ret,
+                NativeReturn::Err(
+                    "the native function is still busy with a previous call".to_string()
+                )
+            );
+        }
+        let ret = dispatch_inline(&cell, &[], deadline).expect("no protocol violation");
+        assert_eq!(ret, NativeReturn::Ok(JsValue::Number(7.0)));
+    }
+
     /// `TASK-29`・Issue #526: 登録件数の上限が具体値どおりであること
     /// （回帰確認）。
     #[test]

@@ -175,11 +175,13 @@ fn main() -> ExitCode {
     js_1_dom_like_object_with_non_configurable_name_is_binding_failed_and_keeps_worker();
     eprintln!("case: js_1_dom_like_member_error_is_catchable_and_keeps_context");
     js_1_dom_like_member_error_is_catchable_and_keeps_context();
-    eprintln!("v8_worker: all cases passed");
     eprintln!("case: js_1_create_engine_v8_native_fn_runs_inline_and_mutates_rust_state");
     js_1_create_engine_v8_native_fn_runs_inline_and_mutates_rust_state();
     eprintln!("case: js_1_create_engine_v8_inline_native_fn_over_deadline_discards_context");
     js_1_create_engine_v8_inline_native_fn_over_deadline_discards_context();
+    eprintln!("case: js_1_create_engine_v8_dom_like_method_runs_inline");
+    js_1_create_engine_v8_dom_like_method_runs_inline();
+    eprintln!("v8_worker: all cases passed");
 
     ExitCode::SUCCESS
 }
@@ -1914,4 +1916,39 @@ fn js_1_create_engine_v8_inline_native_fn_over_deadline_discards_context() {
         .evaluate_script("typeof y", &EvaluateOptions::default())
         .unwrap_or_else(|err| panic!("the next evaluation must run in a fresh context: {err}"));
     assert_eq!(result, JsValue::String("undefined".to_string()));
+}
+
+/// `TASK-29.6.2`・Issue #548: トレイト経由の `bind_dom_like_object` に渡した
+/// `Send` なしのメソッド（`Rc<Cell<_>>` を捕獲）が呼び出しスレッド上で
+/// 実行され、引数を受け取り Rust 側の状態を更新して戻り値を返すこと。
+fn js_1_create_engine_v8_dom_like_method_runs_inline() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let mut engine = fandhe_browser_js::create_engine(fandhe_browser_js::EngineKind::V8)
+        .unwrap_or_else(|err| panic!("create_engine(V8) must succeed: {err}"));
+    let total = Rc::new(Cell::new(0.0f64));
+    let total_for_fn = Rc::clone(&total);
+    engine
+        .bind_dom_like_object(
+            "counter",
+            vec![(
+                "add".to_string(),
+                Box::new(move |args: &[JsValue]| {
+                    if let Some(JsValue::Number(n)) = args.first() {
+                        total_for_fn.set(total_for_fn.get() + n);
+                    }
+                    Ok(JsValue::Number(total_for_fn.get()))
+                }) as fandhe_browser_js::NativeFn,
+            )],
+        )
+        .unwrap_or_else(|err| panic!("bind_dom_like_object must succeed: {err}"));
+    let result = engine
+        .evaluate_script(
+            "counter.add(2); counter.add(3)",
+            &EvaluateOptions::default(),
+        )
+        .unwrap_or_else(|err| panic!("evaluation must succeed: {err}"));
+    assert_eq!(result, JsValue::Number(5.0));
+    assert_eq!(total.get(), 5.0);
 }
