@@ -152,3 +152,24 @@ path = "benches/worker_memory_footprint/smaps_tests.rs"
 [[test]]
 name = "conformance"
 harness = false
+
+# NativeCall/NativeReturn の往復時間の実測ベンチ（TASK-29・Issue #556・
+# `CORE-3`・`PERF-6`・`PERF-7`。親 issue #519。sibling: `worker_spawn_latency`・
+# `worker_memory_footprint`）。`harness = false`・`required-features` の理由は
+# `worker_spawn_latency` と同じ（このバイナリ自身が子プロセス役を兼ねるため、
+# 既定ハーネスの stdout 出力がプロトコルフレームの読み取りを壊す。計測本体が
+# 使うテスト専用入口が `test-support` 配下にしか無い）。
+[[bench]]
+name = "native_call_roundtrip"
+path = "benches/native_call_roundtrip.rs"
+harness = false
+required-features = ["test-support"]
+
+# 到着間隔の差分・バッチ差分法の純関数（`benches/native_call_roundtrip/calc.rs`）
+# のユニットテスト（TASK-29・Issue #556・`PERF-6`・`PERF-7`）。ベンチ本体とは
+# 独立に、どの feature 構成でも実行できる（`std` のみに依存するため
+# `required-features` は付けない）。`path` が `calc.rs` 本体ではなく兄弟の
+# `calc_tests.rs` を指す理由は `worker_spawn_latency_stats` と同じ。
+[[test]]
+name = "native_call_roundtrip_calc"
+path = "benches/native_call_roundtrip/calc_tests.rs"
