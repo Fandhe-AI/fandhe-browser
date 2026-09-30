@@ -56,13 +56,19 @@
 //!   `checked == 0` が正しい期待値であるにもかかわらず失敗してしまう
 //!   （PR #427 レビュー指摘（Bugbot）への対応。4 回目）。
 //!
-//! 現時点（[`IMPLEMENTED_ENGINES`] が空）では、feature 有効構成でも
-//! `check_*` はまだ 1 度も実際のスクリプト評価まで到達しない
-//! （`create_engine` がどの種別にも `NotYetImplemented` を返すため）。
-//! これは実装状況をそのまま反映した結果であり、テスト自体は
-//! `run_for_each_bundled_engine` を必ず呼び出し、[`bundled_engines`] を
-//! 空にしない cfg gate と合わせて「ループが空のまま無検証で成功する」
-//! ことを許さない（実装済みを装わない。REPAIR-3）。
+//! V8 は `create_engine` から子プロセス版として配線済み（TASK-29.6.2・
+//! Issue #548）のため、`js-v8` 有効構成では [`IMPLEMENTED_ENGINES`] に V8 を
+//! 含み、`check_*` が実際にスクリプト評価まで到達する（boa は
+//! `NotYetImplemented` 契約の確認のみ）。
+//!
+//! ## `harness = false` の理由（TASK-29.6.2・Issue #548）
+//!
+//! V8 版は子プロセス（このテストバイナリ自身の自己再実行）で評価するため、
+//! `main` の先頭で [`fandhe_browser_js::run_js_worker_if_requested`] を呼ぶ必要が
+//! ある。子プロセス役のときの stdout はプロトコルフレーム専用で、libtest の
+//! 出力が混入するとフレームが壊れる（`v8_worker` 結合テストと同じ作法）。
+//! そのため `Cargo.toml` で `harness = false` とし、下記の `main` が各ケースを
+//! 順に実行する（失敗は panic で非 0 終了。ケース名は stderr に出す）。
 
 use fandhe_browser_js::{CreateEngineError, EngineKind, bundled_engines, create_engine};
 
@@ -89,7 +95,12 @@ use fandhe_browser_js::{CreateEngineError, EngineKind, bundled_engines, create_e
 /// と `create_engine` の `NotBundled` 応答のみで行う）。そのため `js-v8`/
 /// `js-boa` のいずれかが有効な構成でのみ存在させる。
 #[cfg(any(feature = "js-v8", feature = "js-boa"))]
-const IMPLEMENTED_ENGINES: &[EngineKind] = &[];
+const IMPLEMENTED_ENGINES: &[EngineKind] = &[
+    // V8 は子プロセス版として配線済み（TASK-29.6.2・Issue #548）。`js-boa` のみ
+    // 有効な構成では V8 は同梱されないため feature で絞る。
+    #[cfg(feature = "js-v8")]
+    EngineKind::V8,
+];
 
 /// JS-1: `create_engine` の同梱種別ごとの契約（[`IMPLEMENTED_ENGINES`] に
 /// 含まれるかどうかで `Ok`/`NotYetImplemented` のどちらを返すべきか）を
@@ -99,7 +110,6 @@ const IMPLEMENTED_ENGINES: &[EngineKind] = &[];
 /// [`js_1_create_engine_contract_is_empty_by_default`] を参照。PR #427
 /// レビュー指摘: 空のループが無検証で成功しないよう、ループが空になり得る
 /// 構成そのものに本テストを存在させない）。
-#[test]
 #[cfg(any(feature = "js-v8", feature = "js-boa"))]
 fn js_1_create_engine_contract_for_bundled_engines() {
     let engines = bundled_engines();
@@ -142,7 +152,6 @@ fn js_1_create_engine_contract_for_bundled_engines() {
 /// TASK-29/32 で実装済みエンジン種別をそこへ追加しても、既定構成が
 /// エンジンを同梱しないという契約自体は変わらない。両者を混ぜて検証
 /// すると、実装が進むたびに既定構成のこのテストが不当に失敗する）。
-#[test]
 #[cfg(not(any(feature = "js-v8", feature = "js-boa")))]
 fn js_1_create_engine_contract_is_empty_by_default() {
     assert_eq!(
@@ -511,8 +520,7 @@ mod conformance_checks {
     /// でのみ存在し、[`IMPLEMENTED_ENGINES`] が非空になった時点で
     /// `check_script_evaluation` を実際に呼び出すようになる
     /// （モジュールドキュメント参照）。
-    #[test]
-    fn js_1_conformance_script_evaluation_for_each_bundled_engine() {
+    pub(super) fn js_1_conformance_script_evaluation_for_each_bundled_engine() {
         let summary = run_for_each_bundled_engine(check_script_evaluation);
         assert_conformance_summary_matches_current_contract(&summary);
     }
@@ -520,8 +528,7 @@ mod conformance_checks {
     /// JS-1: グローバル関数注入が、同梱された各エンジンで同じ形状で動作すること
     /// （TASK-28.4・Issue #150）。`js-v8`/`js-boa` のいずれかが有効な構成
     /// でのみ存在する（モジュールドキュメント参照）。
-    #[test]
-    fn js_1_conformance_global_function_injection_for_each_bundled_engine() {
+    pub(super) fn js_1_conformance_global_function_injection_for_each_bundled_engine() {
         let summary = run_for_each_bundled_engine(check_global_function_injection);
         assert_conformance_summary_matches_current_contract(&summary);
     }
@@ -529,9 +536,38 @@ mod conformance_checks {
     /// JS-1: DOM 風オブジェクトへのバインディングが、同梱された各エンジンで
     /// 同じ形状で動作すること（TASK-28.4・Issue #150）。`js-v8`/`js-boa` の
     /// いずれかが有効な構成でのみ存在する（モジュールドキュメント参照）。
-    #[test]
-    fn js_1_conformance_dom_like_binding_for_each_bundled_engine() {
+    pub(super) fn js_1_conformance_dom_like_binding_for_each_bundled_engine() {
         let summary = run_for_each_bundled_engine(check_dom_like_binding);
         assert_conformance_summary_matches_current_contract(&summary);
     }
+}
+
+/// 子プロセス役なら役に徹し、そうでなければ各ケースを順に実行する
+/// （`harness = false`。モジュール冒頭のドキュメント参照）。
+fn main() -> std::process::ExitCode {
+    // 子プロセスとして再実行された場合は、libtest 等の出力より前に
+    // ワーカーへ制御を渡す（stdout はフレーム専用）。
+    if let Some(code) = fandhe_browser_js::run_js_worker_if_requested() {
+        return code;
+    }
+
+    #[cfg(any(feature = "js-v8", feature = "js-boa"))]
+    {
+        eprintln!("case: js_1_create_engine_contract_for_bundled_engines");
+        js_1_create_engine_contract_for_bundled_engines();
+        eprintln!("case: js_1_conformance_script_evaluation_for_each_bundled_engine");
+        conformance_checks::js_1_conformance_script_evaluation_for_each_bundled_engine();
+        eprintln!("case: js_1_conformance_global_function_injection_for_each_bundled_engine");
+        conformance_checks::js_1_conformance_global_function_injection_for_each_bundled_engine();
+        eprintln!("case: js_1_conformance_dom_like_binding_for_each_bundled_engine");
+        conformance_checks::js_1_conformance_dom_like_binding_for_each_bundled_engine();
+    }
+    #[cfg(not(any(feature = "js-v8", feature = "js-boa")))]
+    {
+        eprintln!("case: js_1_create_engine_contract_is_empty_by_default");
+        js_1_create_engine_contract_is_empty_by_default();
+    }
+
+    eprintln!("conformance: all cases passed");
+    std::process::ExitCode::SUCCESS
 }

@@ -176,6 +176,11 @@ fn main() -> ExitCode {
     eprintln!("case: js_1_dom_like_member_error_is_catchable_and_keeps_context");
     js_1_dom_like_member_error_is_catchable_and_keeps_context();
     eprintln!("v8_worker: all cases passed");
+    eprintln!("case: js_1_create_engine_v8_native_fn_runs_inline_and_mutates_rust_state");
+    js_1_create_engine_v8_native_fn_runs_inline_and_mutates_rust_state();
+    eprintln!("case: js_1_create_engine_v8_inline_native_fn_over_deadline_discards_context");
+    js_1_create_engine_v8_inline_native_fn_over_deadline_discards_context();
+
     ExitCode::SUCCESS
 }
 
@@ -1855,4 +1860,58 @@ fn js_1_windows_job_object_process_memory_limit_rejects_commit_beyond_lowered_li
         .evaluate_script("before_job_limit", &EvaluateOptions::default())
         .unwrap_or_else(|err| panic!("the context must survive a rejected allocation: {err}"));
     assert_eq!(marker, JsValue::Number(531.0));
+}
+
+/// `TASK-29.6.2`・Issue #548: `create_engine(V8)` が返すトレイトオブジェクトへ
+/// 注入した `Send` なしの `NativeFn`（`Rc<Cell<_>>` を捕獲）が、呼び出し
+/// スレッド上で実行され Rust 側の状態を更新すること。
+fn js_1_create_engine_v8_native_fn_runs_inline_and_mutates_rust_state() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let mut engine = fandhe_browser_js::create_engine(fandhe_browser_js::EngineKind::V8)
+        .unwrap_or_else(|err| panic!("create_engine(V8) must succeed: {err}"));
+    let counter = Rc::new(Cell::new(0u32));
+    let counter_for_fn = Rc::clone(&counter);
+    engine
+        .inject_global_function(
+            "bump",
+            Box::new(move |_args: &[JsValue]| {
+                counter_for_fn.set(counter_for_fn.get() + 1);
+                Ok(JsValue::Undefined)
+            }),
+        )
+        .unwrap_or_else(|err| panic!("inject_global_function must succeed: {err}"));
+    engine
+        .evaluate_script("bump(); bump();", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("evaluation must succeed: {err}"));
+    assert_eq!(counter.get(), 2);
+}
+
+/// `TASK-29.6.2`・Issue #548: トレイト経由の `NativeFn` が評価期限を超えて
+/// 戻った場合、期限は戻った後に判定され `Timeout` になること。次の評価は
+/// 新しい Context で成功すること。
+fn js_1_create_engine_v8_inline_native_fn_over_deadline_discards_context() {
+    let mut engine = fandhe_browser_js::create_engine(fandhe_browser_js::EngineKind::V8)
+        .unwrap_or_else(|err| panic!("create_engine(V8) must succeed: {err}"));
+    engine
+        .inject_global_function(
+            "slow",
+            Box::new(|_args: &[JsValue]| {
+                std::thread::sleep(PARENT_EVALUATE_DEADLINE + Duration::from_millis(300));
+                Ok(JsValue::Number(1.0))
+            }),
+        )
+        .unwrap_or_else(|err| panic!("inject_global_function must succeed: {err}"));
+    match engine.evaluate_script("globalThis.y = 1; slow()", &EvaluateOptions::default()) {
+        Err(JsEngineError::Timeout(msg)) => assert!(
+            msg.contains("context was discarded"),
+            "expected the discard notice, got: {msg}"
+        ),
+        other => panic!("expected Timeout after an over-deadline inline NativeFn, got: {other:?}"),
+    }
+    let result = engine
+        .evaluate_script("typeof y", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("the next evaluation must run in a fresh context: {err}"));
+    assert_eq!(result, JsValue::String("undefined".to_string()));
 }

@@ -33,11 +33,10 @@ windows-sys = { workspace = true, optional = true }
 # 対応する（TASK-28.1 が予約枠として定義し、本 TASK-29.1 で `js-v8` を
 # 実依存へ結合した）。
 #
-# `js-v8` は `dep:v8` と結合済みだが、`v8` crate を呼び出す具象実装
-# （`JsEngine` トレイトの V8 実装）はまだない。`create_engine`
-# （`engine_trait.rs`）は `js-v8` 有効時も `CreateEngineError::NotYetImplemented`
-# を返し続ける（実装済みを装わない。REPAIR-3）。具象実装は TASK-29 の
-# 後続サブタスクで追加する。
+# `js-v8` は `dep:v8` と結合済みで、`create_engine`（`engine_trait.rs`）は
+# 子プロセス版の V8 エンジンを返す（TASK-29.6.2・Issue #548）。boa は
+# TASK-32 まで `CreateEngineError::NotYetImplemented` のまま（実装済みを
+# 装わない。REPAIR-3）。
 #
 # `js-boa` は Cargo の制約（`dep:` 接頭辞 feature は対応する optional
 # 依存が [dependencies] に無いと feature が無効でも manifest 解析自体が
@@ -142,3 +141,14 @@ required-features = ["test-support"]
 [[test]]
 name = "worker_memory_footprint_smaps"
 path = "benches/worker_memory_footprint/smaps_tests.rs"
+
+# 両エンジン共通のコンフォーマンステスト（TASK-28.4・Issue #150）。V8 を
+# `create_engine` から配線した（TASK-29.6.2・Issue #548）ため、このテスト
+# バイナリ自身が子プロセス役を兼ねる（`v8_worker` と同じ作法。`main` の先頭で
+# `fandhe_browser_js::run_js_worker_if_requested` を呼ぶ）。`harness = false`
+# の理由も同じ: 子プロセス役のときの stdout はプロトコルフレーム専用で、
+# libtest の出力が混入するとフレームが壊れる。`required-features` は付けない
+# （既定構成の契約テストも同じバイナリで実行するため）。
+[[test]]
+name = "conformance"
+harness = false
