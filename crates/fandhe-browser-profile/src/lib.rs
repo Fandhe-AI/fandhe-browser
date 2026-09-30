@@ -43,6 +43,8 @@
 //!   #203）も実装済み。`Profile::delete` は `self` を消費するが
 //!   `ProfileStore::delete` は `&Profile` を取るため、トレイト契約の見直しが
 //!   要る（既定実装は `Unsupported` を返す）
+//! - Windows 長パス（`XOS-8`、TASK-61（61.1）・#205）は `store::to_long_path` として実装済み。
+//!   `Profile::open` が verbatim ルートを使うのは下記 ACL 実装後
 //! - Windows での ACL によるアクセス制限（`XOS-7`〜`XOS-10`。Unix の
 //!   パーミッション 0o700 相当の隔離を Windows でも実現する。TASK-50・#176
 //!   では意図的にスコープ外とした。新規依存が必要になるため、導入時は
@@ -57,6 +59,6 @@ pub use profile::{
     DataKind, Profile, ProfileError, SafeComponent, assert_within_root, sanitize_component,
 };
 pub use store::{
-    APP_DIR_NAME, ExplicitStore, OsDefaultStore, OverridableStore, ProfileStore, ResolvedRoot,
-    RootSource,
+    APP_DIR_NAME, ExplicitStore, LongPath, LongPathKind, OsDefaultStore, OverridableStore,
+    ProfileStore, ResolvedRoot, RootSource, to_long_path,
 };
