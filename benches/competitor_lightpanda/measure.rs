@@ -715,10 +715,12 @@ const MAX_LSOF_OUTPUT_BYTES: usize = 16 * 1024;
 #[cfg(target_os = "macos")]
 const MAX_PORT_OWNER_PIDS: usize = 64;
 
-/// macOS 版（TASK-84.6.3・#561。`PERF-3`/`PERF-6`）: `lsof -nP -w -iTCP:<port>
+/// macOS 版（TASK-84.6.3・#561。`PERF-3`/`PERF-6`）: `lsof -a -nP -w -iTCP:<port>
 /// -sTCP:LISTEN -Fpn` で LISTEN 所有 PID を照会する。[`check_port_owner`]
 /// から readiness 成功時に呼ばれ、出力は support の
-/// [`parse_lsof_listen_pids`] が解析する。
+/// [`parse_lsof_listen_pids`] が解析する。`-a` で `-i` と `-s` を AND にする
+/// （既定は OR で、対象ポート以外の LISTEN まで大量に出力され、パイプ容量超過で
+/// lsof が停止し得るため）。
 ///
 /// `unsafe`（libproc FFI）・新規依存を避けるため外部コマンド方式とし、
 /// `Command::new` と固定引数でシェルを通さず、期限
@@ -738,6 +740,7 @@ pub(crate) fn lookup_port_owner_pids(
     let lookup_failed = |reason: String| PortOwnerError::LookupFailed { port, reason };
     let mut command = Command::new("lsof");
     command.args([
+        "-a",
         "-nP",
         "-w",
         &format!("-iTCP:{port}"),

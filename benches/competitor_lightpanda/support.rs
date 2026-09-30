@@ -1381,7 +1381,7 @@ pub fn parse_socket_link_inode(link: &str) -> Option<u64> {
         .ok()
 }
 
-/// `lsof -nP -w -iTCP:<port> -sTCP:LISTEN -Fpn` の出力から、`port` の LISTEN
+/// `lsof -a -nP -w -iTCP:<port> -sTCP:LISTEN -Fpn` の出力から、`port` の LISTEN
 /// ソケットを持つ PID を返す（TASK-84.6.3・#561。`measure.rs` の macOS 版
 /// `lookup_port_owner_pids` が呼ぶ。`PERF-3`/`PERF-6`）。
 ///
