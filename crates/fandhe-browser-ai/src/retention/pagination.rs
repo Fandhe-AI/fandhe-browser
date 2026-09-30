@@ -371,7 +371,8 @@ fn classify_visible_anchor(doc: &Document, id: NodeId) -> Option<PaginationKind>
 /// 非表示サブツリーは読み飛ばし、訪問済み + 未訪問の総量を
 /// 内部上限（256 ノード）以内に保つ。残り予算を超える幅の枝はその枝だけ読み飛ばして
 /// 後続の兄弟を確認し、訪問数が上限に達したら「見つからなかった」として
-/// `None`。複数ある場合は文書順で最初の種別を返す。
+/// `None`（それまでに見つけた種別があればそれを返す）。複数ある場合は移動リンク
+/// （[`PaginationKind::rank`] 0）を優先し、同順位は文書順で最初の種別を返す。
 pub fn find_pagination_link(doc: &Document, item: NodeId) -> Option<PaginationKind> {
     // 項目自身より上の祖先が非表示なら、配下のリンクも不可視として扱う。
     // 祖先探索は項目ごとに 1 回・固定深さで打ち切る（配下ノードは走査中に
@@ -379,12 +380,13 @@ pub fn find_pagination_link(doc: &Document, item: NodeId) -> Option<PaginationKi
     if has_hidden_ancestor(doc, item) {
         return None;
     }
+    let mut best: Option<PaginationKind> = None;
     let mut stack = vec![item];
     let mut steps = 0usize;
     while let Some(id) = stack.pop() {
         steps += 1;
         if steps > MAX_ITEM_SCAN_STEPS {
-            return None;
+            return best;
         }
         if !doc.is_element(id) {
             continue;
@@ -395,7 +397,11 @@ pub fn find_pagination_link(doc: &Document, item: NodeId) -> Option<PaginationKi
             continue;
         }
         if let Some(kind) = classify_visible_anchor(doc, id) {
-            return Some(kind);
+            if kind.rank() == 0 {
+                return Some(kind);
+            }
+            // ページ番号は保留し、同じ項目内の移動リンク（次へ等）を探し続ける。
+            best.get_or_insert(kind);
         }
         let budget = MAX_ITEM_SCAN_STEPS.saturating_sub(steps + stack.len());
         let mut kids: Vec<NodeId> = doc.children(id).take(budget + 1).collect();
@@ -407,7 +413,7 @@ pub fn find_pagination_link(doc: &Document, item: NodeId) -> Option<PaginationKi
         kids.reverse();
         stack.extend(kids);
     }
-    None
+    best
 }
 
 /// 並びの各項目にページネーションリンク検出を適用し、該当項目を優先候補として返す
@@ -717,6 +723,19 @@ mod tests {
             r#"<ul><li><div>{wide}<a href="?p=2" rel="next">次へ</a></div></li></ul>"#
         ));
         assert_eq!(find_pagination_link(&doc, select(&doc, "li")), None);
+    }
+
+    /// AISNAP-12（TASK-16.2・Codex P1）: 同じ項目内でページ番号の後に「次へ」が
+    /// あっても、項目の種別は移動リンク（Next）になる。
+    #[test]
+    fn aisnap_12_item_prefers_next_over_earlier_page_number() {
+        let doc = parse(
+            r#"<ul class="pagination"><li><a href="?p=1">1</a><a href="?p=2" rel="next">次へ</a></li></ul>"#,
+        );
+        assert_eq!(
+            find_pagination_link(&doc, select(&doc, "li")),
+            Some(PaginationKind::Next)
+        );
     }
 
     fn list_fixture(with_next: bool) -> String {
