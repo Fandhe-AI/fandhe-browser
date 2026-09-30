@@ -24,8 +24,11 @@
 //! 成立することだけを示し、それ以上は主張しない。レジストリ切替の E2E と
 //! `longPathAware` マニフェスト比較は TASK-63（実機測定）の範囲。
 //!
-//! Windows では ACL 隔離が未実装（`XOS-7`）のため、`open_or_create` は変換成功後に
-//! `Unsupported` を返す。成功扱いにはしない。
+//! Windows では ACL 隔離が未実装（`XOS-7`）のため、`open_or_create` は常に
+//! `Unsupported` を返し、`to_long_path` 変換後のパスを公開 API から観測できない。
+//! そのため Windows での `open_or_create` 経路の変換検証は行わず（変換の回帰は
+//! `to_long_path` 単体とファイル操作のテストが担う）、fail-closed の維持のみ確認する。
+//! `open_or_create` 側の変換検証は ACL 実装時（`XOS-7`）に追加する。
 
 use fandhe_browser_profile::{ExplicitStore, LongPathKind, ProfileStore, to_long_path};
 use std::path::{Path, PathBuf};
@@ -170,12 +173,13 @@ fn xos_8_windows_file_ops_at_boundary_lengths() {
     }
 }
 
-/// XOS-8: Windows で 260 文字超のルートの `open_or_create` は、変換成功後の ACL 未実装
-/// ゲート（`XOS-7`）で `Unsupported` になる。`InvalidLayout`・`Io` ではないことから変換
-/// 自体は成功している。成功扱いには丸めない。
+/// XOS-7: Windows で 260 文字超のルートの `open_or_create` は、ACL 未実装ゲートにより
+/// 成功を装わず `Unsupported` を返す（fail-closed の維持のみを確認する）。
+/// `open_or_create` 内の `to_long_path` 呼び出しの有無はここでは検出できない
+/// （`Unsupported` は変換有無に関わらず返るため。検証範囲は上記モジュール doc 参照）。
 #[cfg(windows)]
 #[test]
-fn xos_8_windows_open_or_create_with_long_root_is_unsupported() {
+fn xos_7_windows_open_or_create_with_long_root_stays_unsupported() {
     use fandhe_browser_profile::ProfileError;
 
     let guard = Guard::new();
