@@ -16,6 +16,11 @@ name: CI
 # 時点で rust-ci（deny-checks: ... licenses ...）が満たしており、
 # deny-license-reject はその fail-closed 性（許可外ライセンス混入時に確実に
 # reject するか）を negative test で継続的に検証する
+# TASK-56.1（#195・XOS-6・MS-3）: Servo を組み込む Windows ビルドの前提
+# （Windows SDK 10.0.19041.0 以上・MSVC v143・C++ ATL・Python/uv）を、下記
+# windows-servo-prereqs ジョブで windows-latest 上に検証（不足分は導入）する形で
+# 明記した。Servo 本体の Windows ビルド（--features rendering）の CI 化は
+# TASK-58 以降で、docs/setup/windows.md は TASK-56.2（#196）が作成予定
 # TASK-34.1（Issue #465・RENDER-1）: 下記 render-isolation ジョブを追加した。
 # 従来 `make check-render-isolation` はローカル専用（make ci には含むが CI からは
 # 未実行）だったため、PR で Servo 系が混入しても CI では検出できなかった
@@ -107,6 +112,9 @@ jobs:
   rust-ci:
     strategy:
       fail-fast: false
+      # windows-latest の Servo 組込ビルド前提（Windows SDK・MSVC v143・C++ ATL・
+      # Python/uv。XOS-6・TASK-56.1）は下記 windows-servo-prereqs ジョブが
+      # 検証・導入する。本ジョブは Servo を含まないため追加セットアップ不要
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     uses: Fandhe-AI/actions/.github/workflows/rust-base-ci.yml@latest
@@ -177,6 +185,9 @@ jobs:
   rust-ci-default-features:
     strategy:
       fail-fast: false
+      # windows-latest の Servo 組込ビルド前提（Windows SDK・MSVC v143・C++ ATL・
+      # Python/uv。XOS-6・TASK-56.1）は下記 windows-servo-prereqs ジョブが
+      # 検証・導入する。本ジョブは Servo を含まないため追加セットアップ不要
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -389,6 +400,156 @@ jobs:
           toolchain: stable
       - name: make check-deny-license-reject
         run: make check-deny-license-reject
+
+  # --------------------------------------------------
+  # windows-servo-prereqs（Servo 組込 Windows ビルドの前提検証）
+  # --------------------------------------------------
+  # TASK-56.1（#195・XOS-6・MS-3）: Servo を組み込む Windows ビルドは Windows SDK
+  # 10.0.19041.0 以上・MSVC v143 ツールセット・C++ ATL（v143 向け）・Python と uv を
+  # 必要とする。本ジョブはそれらが windows-latest で揃うことを fail-closed で検証し、
+  # 不足するもの（v143 向け ATL・uv）だけ導入する。
+  #
+  # 別ジョブにした理由: rust-ci は reusable workflow 呼び出しのためステップを足せず、
+  # rust-ci-default-features は Servo を使わないため、前提の不備で既定 feature
+  # ゲートが落ちる（単一責務に反する）のを避ける。将来の Windows rendering ビルド
+  # ジョブ（TASK-58 等）は本ジョブのステップ群を統合・再利用する。
+  #
+  # runner の実態（runner-images 公開 README・2026-09 時点）: windows-latest は
+  # VS 2026（既定ツールセット v145）。Windows SDK 10.0.26100.0・v143 系ツールセット
+  # （MSVC 14.44）・Python 3 は導入済みで検証のみ。v143 向け ATL は未導入の可能性が
+  # あるため、無い場合のみ VS Installer で追加する。uv は未導入のためバージョンと
+  # sha256 を固定して pip で導入する（iwr | iex や新規サードパーティ action は使わない）。
+  #
+  # pwsh は末尾でしか $LASTEXITCODE を検査しないため、ネイティブコマンドごとに
+  # 明示判定する（rust-ci-default-features 上部の「shell: 明示不要」注記は cargo
+  # 単一コマンドのステップにのみ当てはまる）。checkout・secrets は不要。
+  #
+  # branch protection の必須チェックへ `windows-servo-prereqs` を追加する場合は
+  # ユーザー作業（本変更の対象外）。
+  windows-servo-prereqs:
+    runs-on: windows-latest
+    # VS Installer の modify に時間がかかりうるため 30 分。ハング防止（NFR-10）
+    timeout-minutes: 30
+    # checkout も GitHub API も使わないため権限は不要（最小権限）
+    permissions: {}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # Servo の Windows 前提の下限（XOS-6）
+      MIN_WINDOWS_SDK: "10.0.19041.0"
+      # v143 向け C++ ATL の VS コンポーネント ID（VS 2026 の 14.44 サイドバイサイド）
+      ATL_V143_COMPONENT: Microsoft.VisualStudio.Component.VC.14.44.17.14.ATL
+      # uv は完全固定（win_amd64 wheel の sha256 で完全性を検証）
+      UV_VERSION: "0.12.20"
+      UV_WHEEL_SHA256: 1502e03f4da3280cbb493d356d59bdd401bf23197cd71df64e1c6feac156090c
+    steps:
+      - name: Windows SDK の検証
+        run: |
+          $min = [version]$env:MIN_WINDOWS_SDK
+          $root = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Include'
+          $found = @()
+          if (Test-Path $root) {
+            $found = Get-ChildItem $root -Directory |
+              Where-Object { $_.Name -match '^10\.\d+\.\d+\.\d+$' } |
+              ForEach-Object { [version]$_.Name } |
+              Where-Object { $_ -ge $min } | Sort-Object -Descending
+          }
+          if ($found.Count -eq 0) {
+            Write-Host "::error::Windows SDK >= $min not found under $root"
+            exit 1
+          }
+          Write-Host "Windows SDK: $($found[0])"
+      - name: VS と MSVC v143 ツールセットの検証
+        run: |
+          $vsInstaller = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
+          $vswhere = Join-Path $vsInstaller 'vswhere.exe'
+          $installPath = & $vswhere -products * -latest `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($installPath)) {
+            Write-Host "::error::Visual Studio with the MSVC toolset not found"
+            exit 1
+          }
+          $installPath = $installPath.Trim()
+          $msvcRoot = Join-Path $installPath 'VC\Tools\MSVC'
+          # v143 のうち ATL 導入対象（ATL_V143_COMPONENT）と対になる 14.44 系のみを
+          # 検証対象にする（ATL は 14.44 固定のため、別版を選ぶと atlbase.h が見つからない）
+          $v143 = @()
+          if (Test-Path $msvcRoot) {
+            $v143 = Get-ChildItem $msvcRoot -Directory |
+              Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
+              Where-Object { [version]$_.Name -ge [version]'14.44' } |
+              Where-Object { [version]$_.Name -lt [version]'14.45' } |
+              Sort-Object { [version]$_.Name } -Descending
+          }
+          if ($v143.Count -eq 0) {
+            Write-Host "::error::MSVC v143 toolset 14.44 (paired with the ATL component) not found under $msvcRoot"
+            exit 1
+          }
+          Write-Host "VS: $installPath"
+          Write-Host "MSVC v143 toolset: $($v143[0].Name)"
+          "VS_INSTALL_PATH=$installPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "MSVC_V143_DIR=$($v143[0].FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: v143 向け C++ ATL の検証（無ければ導入）
+        run: |
+          $header = Join-Path $env:MSVC_V143_DIR 'atlmfc\include\atlbase.h'
+          if (-not (Test-Path $header)) {
+            Write-Host "ATL for v143 not found; installing $env:ATL_V143_COMPONENT"
+            $setup = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\setup.exe'
+            $p = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+              'modify', '--installPath', "`"$env:VS_INSTALL_PATH`"",
+              '--add', $env:ATL_V143_COMPONENT,
+              '--quiet', '--norestart', '--nocache')
+            if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+              Write-Host "::error::VS Installer failed with exit code $($p.ExitCode)"
+              exit 1
+            }
+          }
+          if (-not (Test-Path $header)) {
+            Write-Host "::error::C++ ATL for v143 (atlbase.h) not found under $env:MSVC_V143_DIR"
+            exit 1
+          }
+          Write-Host "C++ ATL for v143: $header"
+      - name: Python の検証
+        run: |
+          $out = python --version
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch '^Python 3\.') {
+            Write-Host "::error::Python 3.x not found (got: $out)"
+            exit 1
+          }
+          Write-Host $out
+      - name: uv の導入（バージョン・ハッシュ固定）
+        run: |
+          # 導入済みの uv があっても sha256 検証を必ず通すため、まず wheel を
+          # 明示取得（--require-hashes で検証）し、その wheel を強制再導入する
+          $work = Join-Path $env:RUNNER_TEMP 'uv-wheel'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $req = Join-Path $work 'uv-requirements.txt'
+          "uv==$env:UV_VERSION --hash=sha256:$env:UV_WHEEL_SHA256" | Out-File -FilePath $req -Encoding ascii
+          python -m pip download --disable-pip-version-check --no-cache-dir `
+            --require-hashes --only-binary=:all: --no-deps -d $work -r $req
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::hash-verified download of pinned uv failed"
+            Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          python -m pip install --disable-pip-version-check --no-cache-dir `
+            --require-hashes --only-binary=:all: --no-deps --force-reinstall `
+            --no-index --find-links $work -r $req
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::pip install of pinned uv failed"
+            Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+          # 出力は "uv 0.12.20 (<hash> <date> <target>)" 形式のため前方一致で比較する
+          $ver = python -m uv --version
+          if ($LASTEXITCODE -ne 0 -or $ver -notlike "uv $env:UV_VERSION *") {
+            Write-Host "::error::unexpected uv version: $ver"
+            exit 1
+          }
+          Write-Host $ver
 
   # --------------------------------------------------
   # binary-size（feature 無効時のリリースバイナリサイズ検査を CI へ組込み）
