@@ -181,7 +181,12 @@ impl ProfileStore for OsDefaultStore {
 /// - `..` を含むパスは受け付けるが、[`ExplicitStore::new`] が副作用の前に字句的に
 ///   畳み込んで保存する（`/tmp/new-dir/../profile` は `/tmp/profile`）。畳み込まずに
 ///   [`Profile::open`] へ渡すと、途中要素（`/tmp/new-dir`）が最終ルートの外に作成される
-///   ため（`PROF-1`・`PROF-4`）。symlink を含む `a/link/..` も字句的に `a` として扱う
+///   ため（`PROF-1`・`PROF-4`）。畳み込まれる要素（`a/link/..` の `link`）が既存の
+///   symlink の場合は、OS の解決先と字句的な結果が食い違うため [`ProfileError::InvalidLayout`]
+///   で拒否する
+/// - 既存ディレクトリが他者と共有される形（unix で sticky bit 付き・other 書込可。
+///   `/tmp` 等）の場合は、[`Profile::open`] の `fchmod(0700)` が共有ディレクトリ自体へ
+///   及ぶため [`ProfileError::InvalidLayout`] で拒否する。専用の子ディレクトリを指定する
 /// - `..` を畳み込んだ結果が OS のルート（`/`・ドライブルート）になる指定は、
 ///   `fchmod(0700)` やファイル作成が OS ルートへ及ぶため [`ExplicitStore::new`] が
 ///   [`ProfileError::InvalidLayout`] で拒否する
@@ -205,7 +210,7 @@ impl ExplicitStore {
                 reason: "explicit profile root must not be empty",
             });
         }
-        let root = normalize_lexically(&std::path::absolute(&path)?);
+        let root = normalize_lexically(&std::path::absolute(&path)?)?;
         if !root.is_absolute() {
             return Err(ProfileError::InvalidLayout {
                 path: root,
@@ -218,6 +223,7 @@ impl ExplicitStore {
                 reason: "explicit profile root must not be the filesystem root",
             });
         }
+        reject_shared_existing_dir(&root)?;
         Ok(Self { root })
     }
 
@@ -237,8 +243,11 @@ impl ProfileStore for ExplicitStore {
 ///
 /// [`ExplicitStore::new`] が、[`Profile::open`] に `..` 付きパスを渡すと最終ルート外の
 /// 途中要素が作成される問題を、副作用の前に防ぐために使う。ルート直上の `..` は
-/// ルートに留まる（OS の解決規則と同じ）。ファイルシステムは参照しない。
-fn normalize_lexically(path: &Path) -> PathBuf {
+/// ルートに留まる（OS の解決規則と同じ）。畳み込まれる要素が既存の symlink なら、
+/// 字句的な結果と OS の解決先が食い違い symlink 検証（`PROF-4`）を迂回し得るため
+/// [`ProfileError::InvalidLayout`] を返す（fail-closed）。存在しない要素は symlink では
+/// あり得ないのでそのまま畳み込む。
+fn normalize_lexically(path: &Path) -> Result<PathBuf, ProfileError> {
     let mut out = PathBuf::new();
     let mut normal_depth = 0usize;
     for component in path.components() {
@@ -249,6 +258,12 @@ fn normalize_lexically(path: &Path) -> PathBuf {
             }
             Component::ParentDir => {
                 if normal_depth > 0 {
+                    if std::fs::symlink_metadata(&out).is_ok_and(|m| m.file_type().is_symlink()) {
+                        return Err(ProfileError::InvalidLayout {
+                            path: out,
+                            reason: "explicit profile root must not use '..' after a symlink",
+                        });
+                    }
                     out.pop();
                     normal_depth -= 1;
                 }
@@ -257,7 +272,31 @@ fn normalize_lexically(path: &Path) -> PathBuf {
             Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
         }
     }
-    out
+    Ok(out)
+}
+
+/// 既存ディレクトリが共有ディレクトリ（unix で sticky bit 付きまたは other 書込可）なら拒否する。
+///
+/// [`Profile::open`] はルート自体を `fchmod(0700)` するため、`/tmp` のような共有
+/// ディレクトリを指定されると他者の利用を壊す（`PROF-1`）。存在しない・取得できない
+/// 場合は [`Profile::open`] 側の検証に委ねる。unix 以外では何もしない。
+fn reject_shared_existing_dir(root: &Path) -> Result<(), ProfileError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::symlink_metadata(root)
+            && meta.is_dir()
+            && meta.mode() & 0o1002 != 0
+        {
+            return Err(ProfileError::InvalidLayout {
+                path: root.to_path_buf(),
+                reason: "explicit profile root must not be an existing shared directory",
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+    Ok(())
 }
 
 /// `..` を字句的に畳み込んだ結果が OS のルート（`/`・`C:\\` などのドライブルート・
@@ -950,24 +989,65 @@ mod tests {
         }
     }
 
-    /// PROF-1: `..` を含む明示パスでも、最終ルートの外に途中要素が作成されない。
+    /// PROF-1: `..` を含む明示パスでも、最終ルートの外に途中要素が作成される前に畳み込まれる。
+    /// `Profile::open` は unix のみ対応（Windows は XOS-7..10 で未実装）のため unix に限る。
     #[test]
+    #[cfg(unix)]
     fn prof_1_explicit_dotdot_creates_nothing_outside_final_root() {
-        let base = std::env::temp_dir().join(format!(
-            "fandhe-prof1-dotdot-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let tmp = TempDir::new();
+        // macOS の `/var` などの symlink を Profile::open が拒否するため実体化する。
+        std::fs::create_dir_all(&tmp.0).unwrap();
+        let base = std::fs::canonicalize(&tmp.0).unwrap();
         let raw = base.join("new-dir").join("..").join("profile");
         let store = ExplicitStore::new(raw).unwrap();
         assert_eq!(store.root(), base.join("profile").as_path());
-        let _profile = Profile::open(store.root()).unwrap();
+        let profile = Profile::open(store.root()).unwrap();
         assert!(base.join("profile").is_dir());
         assert!(!base.join("new-dir").exists());
-        drop(_profile);
-        let _ = std::fs::remove_dir_all(&base);
+        drop(profile);
+    }
+
+    /// PROF-1・PROF-4: 既存 symlink の直後の `..` は字句的畳み込みと OS 解決が食い違うため拒否する。
+    #[test]
+    #[cfg(unix)]
+    fn prof_1_explicit_dotdot_after_symlink_is_rejected() {
+        let tmp = TempDir::new();
+        std::fs::create_dir_all(&tmp.0).unwrap();
+        let base = std::fs::canonicalize(&tmp.0).unwrap();
+        std::fs::create_dir_all(base.join("real").join("deep")).unwrap();
+        std::os::unix::fs::symlink(base.join("real").join("deep"), base.join("link")).unwrap();
+        let raw = base.join("link").join("..").join("profile");
+        match ExplicitStore::new(raw) {
+            Err(ProfileError::InvalidLayout { reason, .. }) => {
+                assert_eq!(
+                    reason,
+                    "explicit profile root must not use '..' after a symlink"
+                );
+            }
+            other => panic!("expected InvalidLayout, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// PROF-1: sticky bit 付きの共有ディレクトリ（`/tmp` 相当）は専用ルートとして拒否する。
+    #[test]
+    #[cfg(unix)]
+    fn prof_1_explicit_shared_existing_dir_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new();
+        let shared = tmp.0.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        match ExplicitStore::new(shared.clone()) {
+            Err(ProfileError::InvalidLayout { reason, .. }) => {
+                assert_eq!(
+                    reason,
+                    "explicit profile root must not be an existing shared directory"
+                );
+            }
+            other => panic!("expected InvalidLayout, got {:?}", other.map(|_| ())),
+        }
+        // 専用の子ディレクトリは受け付ける。
+        assert!(ExplicitStore::new(shared.join("profile")).is_ok());
     }
 
     /// PROF-1: `OverridableStore` は dyn 互換で明示パスを返す。
