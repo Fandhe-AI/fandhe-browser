@@ -25,8 +25,9 @@
 //! フォームオーナーは、`form` 属性があればその値を id に持つ HTML の `<form>` が文書内に
 //! 実在すること（WHATWG のとおり `form` 属性は祖先の `<form>` より優先し、参照先が無い・
 //! `<form>` でない場合はオーナー無し）。`form` 属性が無ければ祖先に HTML の `<form>` が
-//! あること。core に id から要素を引く API が無いため、参照先は文書全体の前順走査
-//! （`MAX_FORM_ID_SCAN_NODES` で打ち切り、超過時は未解決としてオーナー無し）で解決する。
+//! あること。core に id から要素を引く API が無いため、参照先は文書全体の前順走査で
+//! 作る id 索引（`MAX_FORM_ID_SCAN_NODES` で打ち切り、超過後の id は未解決としてオーナー無し）で
+//! 解決する。索引は [`submit_button_candidates`] の全項目で共有し、走査は高々 1 回。
 //!
 //! # 上限（security.md「不安全な設計」）
 //!
@@ -34,11 +35,13 @@
 //! `eq_ignore_ascii_case`、`form` は空判定のみ）、項目サブツリー走査
 //! （`MAX_ITEM_SCAN_STEPS`）・祖先探索（`MAX_FORM_ANCESTOR_DEPTH`）を定数上限で
 //! 打ち切り、明示スタックで再帰しない。[`submit_button_candidates`] の確保量は
-//! `items.len()` 以下、総走査量は `items.len()` × 定数で上限が決まる。
+//! `items.len()` 以下、項目走査量は `items.len()` × 定数、
+//! `form` 属性解決の文書走査は候補数に依らず 1 回で上限が決まる。
 
 use super::{PriorityCandidate, RetentionReason};
 use crate::snapshot::name::{SKIPPED_SUBTREES, is_hidden_element};
 use fandhe_browser_core::dom::{Document, NodeId};
+use std::collections::HashMap;
 
 /// HTML 名前空間の URI（`core` 側の定義が `pub(crate)` のためローカルに持つ）。
 const HTML_NAMESPACE_URI: &str = "http://www.w3.org/1999/xhtml";
@@ -88,51 +91,97 @@ fn button_submits(doc: &Document, id: NodeId) -> bool {
     doc.attribute(id, "command").is_none() && doc.attribute(id, "commandfor").is_none()
 }
 
-/// `form` 属性値を id に持つ HTML `<form>` が文書内にあるか。
+/// `form` 属性の参照先解決用 id 索引（文書全体を高々 1 回だけ走査して構築する）。
 ///
-/// 前順で最初に id が一致した要素だけを見る（WHATWG）。それが `<form>` でなければ、
-/// 空値・不在・走査上限超過と同じく未解決（`false`）。
-fn form_id_resolves(doc: &Document, form_id: &str) -> bool {
-    if form_id.is_empty() {
-        return false;
+/// 候補ごとの再走査で総走査量が「候補数 × 文書サイズ」になるのを防ぐため、
+/// [`submit_button_candidates`] の全項目・[`find_submit_button`] の全ノードで共有する。
+/// 索引は初回参照時に遅延構築する（`form` 属性が無い文書では走査しない）。
+/// 確保量は `MAX_FORM_ID_SCAN_NODES` 件以下のエントリに収まる。
+struct FormIdIndex<'a> {
+    doc: &'a Document,
+    /// id → その id を持つ前順で最初の要素が HTML `<form>` か。未構築なら `None`。
+    map: Option<HashMap<&'a str, bool>>,
+}
+
+impl<'a> FormIdIndex<'a> {
+    fn new(doc: &'a Document) -> Self {
+        Self { doc, map: None }
     }
-    // `descendants` は生成時に根の全子ノードをスタックへ積むため使わない。
-    // 子イテレータのスタック（長さは深さ以下・訪問数で上限）で前順に走査し、
-    // 幅広い文書でも確保量を `MAX_FORM_ID_SCAN_NODES` に依存させない。
-    let mut stack = vec![doc.children(doc.root())];
-    let mut visited = 0usize;
-    while let Some(iter) = stack.last_mut() {
-        let Some(n) = iter.next() else {
-            stack.pop();
-            continue;
-        };
-        visited += 1;
-        if visited > MAX_FORM_ID_SCAN_NODES {
+
+    /// `form` 属性値を id に持つ HTML `<form>` が文書内にあるか。
+    ///
+    /// 前順で最初に id が一致した要素だけを見る（WHATWG）。それが `<form>` でなければ、
+    /// 空値・不在・走査上限超過と同じく未解決（`false`）。
+    fn resolves(&mut self, form_id: &str) -> bool {
+        if form_id.is_empty() {
             return false;
         }
-        if doc.is_element(n) && doc.attribute(n, "id") == Some(form_id) {
-            return is_html_named(doc, n, "form");
-        }
-        stack.push(doc.children(n));
+        let doc = self.doc;
+        self.map
+            .get_or_insert_with(|| Self::build(doc))
+            .get(form_id)
+            .copied()
+            .unwrap_or(false)
     }
-    false
+
+    fn build(doc: &'a Document) -> HashMap<&'a str, bool> {
+        let mut map: HashMap<&'a str, bool> = HashMap::new();
+        // `descendants` は生成時に根の全子ノードをスタックへ積むため使わない。
+        // 子イテレータのスタック（長さは深さ以下・訪問数で上限）で前順に走査し、
+        // 幅広い文書でも確保量を `MAX_FORM_ID_SCAN_NODES` に依存させない。
+        let mut stack = vec![doc.children(doc.root())];
+        let mut visited = 0usize;
+        while let Some(iter) = stack.last_mut() {
+            let Some(n) = iter.next() else {
+                stack.pop();
+                continue;
+            };
+            visited += 1;
+            if visited > MAX_FORM_ID_SCAN_NODES {
+                break;
+            }
+            if doc.is_element(n)
+                && let Some(id) = doc.attribute(n, "id")
+            {
+                map.entry(id)
+                    .or_insert_with(|| is_html_named(doc, n, "form"));
+            }
+            stack.push(doc.children(n));
+        }
+        map
+    }
 }
 
 /// フォームオーナーを持つか（`form` 属性の参照先 `<form>` の実在、無ければ祖先の `<form>`）。
-fn has_form_owner(doc: &Document, id: NodeId) -> bool {
+fn has_form_owner(doc: &Document, id: NodeId, forms: &mut FormIdIndex<'_>) -> bool {
     if let Some(form_id) = doc.attribute(id, "form") {
-        return form_id_resolves(doc, form_id);
+        return forms.resolves(form_id);
     }
     doc.ancestors(id)
         .take(MAX_FORM_ANCESTOR_DEPTH)
         .any(|a| doc.is_element(a) && is_html_named(doc, a, "form"))
 }
 
-/// 単一要素がフォームの送信ボタンか判定する（`AISNAP-12`・`TASK-16.3`）。
+/// 祖先（`MAX_HIDDEN_ANCESTOR_DEPTH` まで）に非表示要素が無いか。
 ///
-/// 範囲外の `NodeId`・非要素・HTML 以外の名前空間・非表示要素・フォームオーナーの
-/// 無い要素は `None`。規則の詳細はモジュール doc を参照。
-pub fn classify_submit_button(doc: &Document, id: NodeId) -> Option<SubmitButtonKind> {
+/// 上限を超える深さの祖先は非表示状態を確認できないため `false`（fail-closed）。
+fn ancestors_visible(doc: &Document, id: NodeId) -> bool {
+    let mut checked = 0usize;
+    for a in doc.ancestors(id).take(MAX_HIDDEN_ANCESTOR_DEPTH + 1) {
+        checked += 1;
+        if doc.is_element(a) && is_hidden_element(doc, a) {
+            return false;
+        }
+    }
+    checked <= MAX_HIDDEN_ANCESTOR_DEPTH
+}
+
+/// 祖先の非表示確認を除いた分類（項目走査中に祖先確認を重複させないための内部版）。
+fn classify_element(
+    doc: &Document,
+    id: NodeId,
+    forms: &mut FormIdIndex<'_>,
+) -> Option<SubmitButtonKind> {
     if !doc.is_element(id) || is_hidden_element(doc, id) {
         return None;
     }
@@ -153,7 +202,19 @@ pub fn classify_submit_button(doc: &Document, id: NodeId) -> Option<SubmitButton
     } else {
         return None;
     };
-    has_form_owner(doc, id).then_some(kind)
+    has_form_owner(doc, id, forms).then_some(kind)
+}
+
+/// 単一要素がフォームの送信ボタンか判定する（`AISNAP-12`・`TASK-16.3`）。
+///
+/// 範囲外の `NodeId`・非要素・HTML 以外の名前空間・自身または祖先（`MAX_HIDDEN_ANCESTOR_DEPTH`
+/// まで。超える深さは確認不能として除外）が非表示の要素・フォームオーナーの無い要素は `None`。
+/// 規則の詳細はモジュール doc を参照。
+pub fn classify_submit_button(doc: &Document, id: NodeId) -> Option<SubmitButtonKind> {
+    if !doc.is_element(id) || is_hidden_element(doc, id) || !ancestors_visible(doc, id) {
+        return None;
+    }
+    classify_element(doc, id, &mut FormIdIndex::new(doc))
 }
 
 /// 項目（`li`・`tr` 等）のサブツリーから送信ボタンを探す（`AISNAP-12`・`TASK-16.3`）。
@@ -163,15 +224,15 @@ pub fn classify_submit_button(doc: &Document, id: NodeId) -> Option<SubmitButton
 /// 訪問済み + 未訪問の総量を内部上限（256 ノード）以内に保つ。子が残り予算を超える場合は
 /// 文書順で予算内の子だけを調べ、超過分は打ち切る。複数ある場合は文書順で最初の種別を返す。
 pub fn find_submit_button(doc: &Document, item: NodeId) -> Option<SubmitButtonKind> {
-    let mut checked = 0usize;
-    for a in doc.ancestors(item).take(MAX_HIDDEN_ANCESTOR_DEPTH + 1) {
-        checked += 1;
-        if doc.is_element(a) && is_hidden_element(doc, a) {
-            return None;
-        }
-    }
-    // 上限を超える祖先は非表示状態を確認できないため、候補から除外する（fail-closed）。
-    if checked > MAX_HIDDEN_ANCESTOR_DEPTH {
+    find_with_index(doc, item, &mut FormIdIndex::new(doc))
+}
+
+fn find_with_index(
+    doc: &Document,
+    item: NodeId,
+    forms: &mut FormIdIndex<'_>,
+) -> Option<SubmitButtonKind> {
+    if !ancestors_visible(doc, item) {
         return None;
     }
     let mut stack = vec![item];
@@ -189,7 +250,7 @@ pub fn find_submit_button(doc: &Document, item: NodeId) -> Option<SubmitButtonKi
         {
             continue;
         }
-        if let Some(kind) = classify_submit_button(doc, id) {
+        if let Some(kind) = classify_element(doc, id, forms) {
             return Some(kind);
         }
         let budget = MAX_ITEM_SCAN_STEPS.saturating_sub(steps + stack.len());
@@ -205,12 +266,14 @@ pub fn find_submit_button(doc: &Document, item: NodeId) -> Option<SubmitButtonKi
 /// （`AISNAP-12`・`TASK-16.3`）。
 ///
 /// 理由は [`RetentionReason::SubmitButton`]。ページネーション候補との合成は
-/// TASK-16.4 で呼び出し側が行う。
+/// TASK-16.4 で呼び出し側が行う。`form` 属性の id 索引は全項目で共有し、文書全体の
+/// 走査は高々 1 回（`MAX_FORM_ID_SCAN_NODES` 上限）に抑える。
 pub fn submit_button_candidates(doc: &Document, items: &[NodeId]) -> Vec<PriorityCandidate> {
+    let mut forms = FormIdIndex::new(doc);
     items
         .iter()
         .enumerate()
-        .filter(|(_, item)| find_submit_button(doc, **item).is_some())
+        .filter(|(_, item)| find_with_index(doc, **item, &mut forms).is_some())
         .map(|(index, _)| PriorityCandidate::new(index, RetentionReason::SubmitButton))
         .collect()
 }
@@ -486,6 +549,35 @@ mod tests {
             find_submit_button(&doc, select(&doc, "li")),
             Some(SubmitButtonKind::Button)
         );
+    }
+
+    /// AISNAP-12: `classify_submit_button` に直接渡した要素も、祖先が非表示なら `None`。
+    #[test]
+    fn aisnap_12_classify_ignores_hidden_ancestor() {
+        let doc = parse("<form><div hidden><button>Send</button></div></form>");
+        assert_eq!(classify_submit_button(&doc, select(&doc, "button")), None);
+        let doc = parse("<form><div aria-hidden=true><button>Send</button></div></form>");
+        assert_eq!(classify_submit_button(&doc, select(&doc, "button")), None);
+        let doc = parse("<form><div><button>Send</button></div></form>");
+        assert_eq!(
+            classify_submit_button(&doc, select(&doc, "button")),
+            Some(SubmitButtonKind::Button)
+        );
+    }
+
+    /// AISNAP-12: 多数の未解決 `form` 属性候補があっても id 索引は共有され、結果は正しい。
+    #[test]
+    fn aisnap_12_many_unresolved_form_refs() {
+        let mut html = String::from("<form id=f></form><ul>");
+        for _ in 0..500 {
+            html.push_str("<li><button form=missing>x</button></li>");
+        }
+        html.push_str("<li><button form=f>y</button></li></ul>");
+        let doc = parse(&html);
+        let det = detect_regular_structure(&doc, select(&doc, "ul"));
+        let items = det.as_regular().expect("規則的な一覧").body_rows.clone();
+        let cands = submit_button_candidates(&doc, &items);
+        assert_eq!(indexes_of(&cands), vec![500]);
     }
 
     /// AISNAP-12: 子が多い・深いネストでも有界に終了し、上限先のボタンは見つけない。
