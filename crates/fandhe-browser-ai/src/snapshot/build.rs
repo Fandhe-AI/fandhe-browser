@@ -134,6 +134,7 @@ fn bounded_descendant_count(doc: &Document, container: NodeId, limit: usize) -> 
 /// - `tfoot` 行がある（圧縮表現は本文行のみで、合計額などフッターの可視情報が消える）。
 /// - 表・一覧の中に操作要素（リンク・ボタン・入力欄等）がある（ref と state が消える）。
 /// - 表に `caption` がある（圧縮表現は caption を保持せず、表題が Snapshot から消える）。
+/// - 見出し・入れ子の表 / 一覧・ランドマーク等の意味的な子孫がある（heading 等のノードと ref が消える）。
 /// - 圧縮行はテキストノードのみを取り込むため、テキスト以外に由来する accessible name
 ///   （`img` の `alt`・`aria-label` 等）を持つ子孫がある。
 fn can_compress(
@@ -155,6 +156,7 @@ fn has_lossy_descendant(doc: &Document, container: NodeId) -> bool {
         }
         if is_html_element_named(doc, id, "caption")
             || is_interactive_element(doc, id)
+            || is_semantic_structure_element(doc, id)
             || has_non_text_name_source(doc, id)
         {
             return true;
@@ -162,6 +164,52 @@ fn has_lossy_descendant(doc: &Document, container: NodeId) -> bool {
         stack.extend(doc.children(id));
     }
     false
+}
+
+/// 圧縮行の文字列で表せない意味的構造（見出し・入れ子の表 / 一覧・ランドマーク等）か。
+///
+/// 表・一覧の構造そのもの（`tr` / `td` / `th` / `li` 等）は圧縮の対象なので含めない。
+/// これらが子孫にあると、展開時に出る heading 等のノードと ref が圧縮で消える。
+fn is_semantic_structure_element(doc: &Document, id: NodeId) -> bool {
+    [
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "table",
+        "ul",
+        "ol",
+        "dl",
+        "menu",
+        "form",
+        "fieldset",
+        "figure",
+        "nav",
+        "header",
+        "footer",
+        "main",
+        "aside",
+        "section",
+        "article",
+        "dialog",
+        "blockquote",
+        "pre",
+        "hr",
+        "img",
+        "progress",
+        "meter",
+        "output",
+        "iframe",
+        "object",
+        "embed",
+        "canvas",
+        "svg",
+        "math",
+    ]
+    .iter()
+    .any(|n| is_html_element_named(doc, id, n))
 }
 
 /// テキストノード以外（属性）に由来する accessible name を持ち得る要素か。
@@ -687,6 +735,26 @@ mod tests {
                 "<body><ul><li><{tag} controls src=\"a.mp4\"></{tag}></li><li>beta</li></ul></body>"
             ));
             assert!(!has_table_summary(&s), "{tag} with controls must expand");
+        }
+    }
+
+    /// AISNAP-2: 見出し・入れ子の表 / 一覧を含む構造は圧縮せず展開し、heading ノードを保持する。
+    #[test]
+    fn aisnap_2_structure_with_semantic_descendant_is_expanded() {
+        let s = snap("<body><ul><li><h2>見出し</h2>本文</li><li>beta</li></ul></body>");
+        assert!(!has_table_summary(&s));
+        assert!(all_nodes(&s.tree).iter().any(|n| n.role == "heading"));
+        // 入れ子の表・一覧では外側のコンテナが圧縮されない（内側は単独で判定される）。
+        for html in [
+            "<body><ul><li><ul><li>x</li></ul></li><li>y</li></ul></body>",
+            "<body><table><tr><td><table><tr><td>x</td></tr></table></td></tr><tr><td>y</td></tr></table></body>",
+        ] {
+            let s = snap(html);
+            let outer = all_nodes(&s.tree)
+                .into_iter()
+                .find(|n| n.role == "list" || n.role == "table")
+                .expect("outer container");
+            assert!(outer.table.is_none(), "{html}");
         }
     }
 
