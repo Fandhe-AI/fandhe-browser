@@ -26,7 +26,7 @@
 //!   ただし `tfoot` 行がある構造、または操作要素（リンク・ボタン・入力欄・`role`/
 //!   `tabindex` 付き等）を含む構造は圧縮せず通常どおり展開する（ref・state・フッター
 //!   の可視情報を失わないため）。`img` の `alt`・`aria-label` 等テキスト以外に由来する
-//!   accessible name を持つ子孫を含む構造も同様に展開する。
+//!   accessible name を持つ子孫、または `caption` を含む構造も同様に展開する。
 //!   検出は table/list ごとに子孫を走査するが、走査量はコンテナごと
 //!   （`MAX_COMPRESS_SCAN_NODES`）と 1 回の構築全体（`MAX_TOTAL_COMPRESS_SCAN_NODES`）
 //!   で有界とし、超過したコンテナは圧縮せず展開する。
@@ -133,6 +133,7 @@ fn bounded_descendant_count(doc: &Document, container: NodeId, limit: usize) -> 
 /// （従来の Snapshot と同じ結果）。
 /// - `tfoot` 行がある（圧縮表現は本文行のみで、合計額などフッターの可視情報が消える）。
 /// - 表・一覧の中に操作要素（リンク・ボタン・入力欄等）がある（ref と state が消える）。
+/// - 表に `caption` がある（圧縮表現は caption を保持せず、表題が Snapshot から消える）。
 /// - 圧縮行はテキストノードのみを取り込むため、テキスト以外に由来する accessible name
 ///   （`img` の `alt`・`aria-label` 等）を持つ子孫がある。
 fn can_compress(
@@ -152,7 +153,10 @@ fn has_lossy_descendant(doc: &Document, container: NodeId) -> bool {
         if !doc.is_element(id) || is_excluded(doc, id) {
             continue;
         }
-        if is_interactive_element(doc, id) || has_non_text_name_source(doc, id) {
+        if is_html_element_named(doc, id, "caption")
+            || is_interactive_element(doc, id)
+            || has_non_text_name_source(doc, id)
+        {
             return true;
         }
         stack.extend(doc.children(id));
@@ -656,6 +660,14 @@ mod tests {
         let s = snap(
             "<body><table><tr><th>A</th></tr><tr><td><span aria-label=\"Total\">5</span></td></tr></table></body>",
         );
+        assert!(!has_table_summary(&s));
+    }
+
+    /// AISNAP-2: caption を持つ表は圧縮せず展開し、従来の展開結果を維持する（圧縮表現は caption を保持しないため）。
+    /// caption の accessible name 化は name.rs の担当範囲で本 Issue の対象外。
+    #[test]
+    fn aisnap_2_table_with_caption_is_expanded() {
+        let s = snap("<body><table><caption>売上</caption><tr><td>100</td></tr></table></body>");
         assert!(!has_table_summary(&s));
     }
 
