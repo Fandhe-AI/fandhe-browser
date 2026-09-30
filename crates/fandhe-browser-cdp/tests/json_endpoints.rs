@@ -71,17 +71,14 @@ fn json_of(res: &Response) -> Value {
 const JSON_CT: &str = "application/json; charset=UTF-8";
 
 #[tokio::test]
-async fn cdp1_json_version_returns_ws_url_from_host() {
+async fn cdp1_json_version_omits_unserved_ws_url() {
     let dir = TempDir::new();
     let st = state(&dir);
     let res = request(&st, "GET", "/json/version", Some("127.0.0.1:9222")).await;
     assert_eq!(res.status, 200);
     assert_eq!(res.header("content-type"), Some(JSON_CT));
     let v = json_of(&res);
-    assert_eq!(
-        v["webSocketDebuggerUrl"],
-        "ws://127.0.0.1:9222/devtools/browser/fixed-1"
-    );
+    assert!(v.get("webSocketDebuggerUrl").is_none());
     let product = format!("fandhe-browser/{}", env!("CARGO_PKG_VERSION"));
     assert_eq!(v["Browser"], product.as_str());
     assert_eq!(v["Protocol-Version"], "1.3");

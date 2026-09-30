@@ -90,15 +90,14 @@ const JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 ///
 /// TASK-41.4（`/devtools/browser/{id}` の WS 受け口）が同じ関数へルートを追加し、cli
 /// （TASK-41.5）が `Router::merge` で AI API のルータと合成する。本関数は bind・アクセス
-/// 制御（loopback 限定。`SEC-4`）を行わない。`webSocketDebuggerUrl` が指す WS 受け口は
-/// TASK-41.4 まで存在しない（REPAIR-3）。
+/// 制御（loopback 限定。`SEC-4`）を行わない。WS 受け口が未実装のため `/json/version` は
+/// `webSocketDebuggerUrl` を返さない（TASK-41.4 で受け口と同時に追加。REPAIR-3）。
 pub fn router(state: Arc<CdpState>) -> Router {
-    let version_state = Arc::clone(&state);
     let list_state = Arc::clone(&state);
     let json_state = state;
     Router::new()
         .route("GET", "/json/version", move |head, _| {
-            version_response(&version_state, head)
+            version_response(head)
         })
         .route("GET", "/json/list", move |head, _| {
             list_response(&list_state, head)
@@ -109,12 +108,11 @@ pub fn router(state: Arc<CdpState>) -> Router {
 }
 
 /// `/json/version` の応答を作る。
-fn version_response(state: &CdpState, head: &RequestHead) -> Response {
-    let authority = match Authority::from_host_header(head.header("host")) {
-        Ok(a) => a,
-        Err(e) => return host_error_response(e),
-    };
-    json_response(discovery::version_body(state.browser_id(), &authority))
+fn version_response(head: &RequestHead) -> Response {
+    if let Err(e) = Authority::from_host_header(head.header("host")) {
+        return host_error_response(e);
+    }
+    json_response(discovery::version_body())
 }
 
 /// `/json/list`・`/json` の応答を作る。authority は使わないが、version と同じく
