@@ -220,7 +220,7 @@ mod tests {
         #[test]
         fn cdp1_open_app_state_is_unsupported_on_non_unix() {
             let dir = TempDir::new();
-            let err = open_app_state(&FixedStore(dir.0.clone())).unwrap_err();
+            let err = open_app_state(&FixedStore(dir.path.clone())).unwrap_err();
             assert!(matches!(
                 err,
                 StartupError::Profile(ProfileError::Unsupported { .. })
@@ -316,9 +316,9 @@ mod tests {
         #[test]
         fn aisnap6_open_app_state_uses_store_root() {
             let dir = TempDir::new();
-            let store = FixedStore(dir.0.clone());
+            let store = FixedStore(dir.path.clone());
             let app = open_app_state(&store).expect("open");
-            assert_eq!(app.profile().root(), dir.0.as_path());
+            assert_eq!(app.profile().root(), dir.path.as_path());
             // 同じルートを二重に開けない（PROF-1）。
             let err = open_app_state(&store).unwrap_err();
             assert!(matches!(
@@ -330,7 +330,7 @@ mod tests {
         #[tokio::test]
         async fn cdp1_serves_json_version_and_list_on_same_listener() {
             let dir = TempDir::new();
-            let app = open_app_state(&FixedStore(dir.0.clone())).unwrap();
+            let app = open_app_state(&FixedStore(dir.path.clone())).unwrap();
             let (bound, cdp) = bind(&app, "127.0.0.1:0".parse().unwrap(), vec![])
                 .await
                 .unwrap();
@@ -356,7 +356,7 @@ mod tests {
         #[tokio::test]
         async fn cdp1_devtools_browser_upgrade_on_same_listener() {
             let dir = TempDir::new();
-            let app = open_app_state(&FixedStore(dir.0.clone())).unwrap();
+            let app = open_app_state(&FixedStore(dir.path.clone())).unwrap();
             let (bound, cdp) = bind(&app, "127.0.0.1:0".parse().unwrap(), vec![])
                 .await
                 .unwrap();
@@ -380,7 +380,7 @@ mod tests {
         #[tokio::test]
         async fn aisnap6_extra_router_factory_shares_app_state() {
             let dir = TempDir::new();
-            let app = open_app_state(&FixedStore(dir.0.clone())).unwrap();
+            let app = open_app_state(&FixedStore(dir.path.clone())).unwrap();
             let received: Arc<std::sync::Mutex<Option<Arc<AppState>>>> = Arc::default();
             let slot = Arc::clone(&received);
             let factory: RouterFactory = Box::new(move |a| {
@@ -407,7 +407,7 @@ mod tests {
         #[tokio::test]
         async fn cdp1_extra_router_conflict_is_rejected() {
             let dir = TempDir::new();
-            let app = open_app_state(&FixedStore(dir.0.clone())).unwrap();
+            let app = open_app_state(&FixedStore(dir.path.clone())).unwrap();
             let factory: RouterFactory = Box::new(|_| {
                 Router::new().route("GET", "/json/version", |_, _| {
                     Response::new(200, Vec::new())
@@ -430,21 +430,38 @@ mod tests {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
         /// 一時ディレクトリ（drop で再帰削除。外部依存は追加しない）。
-        pub(super) struct TempDir(pub(super) PathBuf);
+        ///
+        /// `.0` は自前で新規作成した親ディレクトリ配下の未作成パス（プロファイルルート用）。
+        /// 親は `create_dir` の排他的作成に成功したものだけを使い、既存パスと衝突した場合は
+        /// 連番を進めて別名を選ぶ。drop では自分が作った親だけを削除する。
+        pub(super) struct TempDir {
+            pub(super) owned: PathBuf,
+            pub(super) path: PathBuf,
+        }
 
         impl TempDir {
             pub(super) fn new() -> Self {
-                let n = COUNTER.fetch_add(1, Ordering::Relaxed);
                 let base = std::env::temp_dir()
                     .canonicalize()
                     .unwrap_or_else(|_| std::env::temp_dir());
-                Self(base.join(format!("fandhe-cli-test-{}-{n}", std::process::id())))
+                loop {
+                    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let owned = base.join(format!("fandhe-cli-test-{}-{n}", std::process::id()));
+                    match std::fs::create_dir(&owned) {
+                        Ok(()) => {
+                            let path = owned.join("profile");
+                            return Self { owned, path };
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(e) => panic!("failed to create test temp dir: {e}"),
+                    }
+                }
             }
         }
 
         impl Drop for TempDir {
             fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
+                let _ = std::fs::remove_dir_all(&self.owned);
             }
         }
 
