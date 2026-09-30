@@ -48,6 +48,9 @@ const INPUTS_FORM: &str = r#"<!DOCTYPE html><html><head><title>Inputs</title></h
 /// 4. ダッシュボード表（後続に `#table2` のディストラクタ）。
 const DASHBOARD_TABLE: &str = r#"<!DOCTYPE html><html><head><title>Tables</title></head><body><h3>Data Tables</h3><table id="table1"><thead><tr><th><span>Last Name</span></th><th><span>First Name</span></th><th><span>Due</span></th></tr></thead><tbody><tr><td>Doe</td><td>Jane</td><td>50.00</td></tr><tr><td>Roe</td><td>Rick</td><td>12.00</td></tr></tbody></table><table id="table2"><thead><tr><th><span>Surname</span></th><th><span>Given</span></th></tr></thead><tbody><tr><td>Poe</td><td>Pat</td></tr></tbody></table></body></html>"#;
 
+/// 表見出しのネガティブコントロール用。表より前に同じ role・name の非データ葉を置く。
+const HEADING_AMBIGUOUS: &str = r#"<!DOCTYPE html><html><head><title>Tables</title></head><body><div role="columnheader">Last Name</div><table><thead><tr><th>Last Name</th></tr></thead><tbody><tr><td>Doe</td></tr></tbody></table></body></html>"#;
+
 /// 5. ドロップダウン。
 const DROPDOWN_FORM: &str = r#"<!DOCTYPE html><html><head><title>Dropdown</title></head><body><h3>Dropdown List</h3><select id="dropdown"><option value="">Please select an option</option><option value="1">Option 1</option><option value="2">Option 2</option></select></body></html>"#;
 
@@ -243,6 +246,34 @@ fn map_to_snapshot<'a>(doc: &Document, snapshot: &'a Snapshot, target: NodeId) -
     node
 }
 
+/// 述語に最初に一致するノードへの、ルートからの子添字の列を先行順で返す。
+fn first_path(root: &Node, pred: fn(&Node) -> bool) -> Option<Vec<usize>> {
+    let mut stack: Vec<(&Node, Vec<usize>)> = vec![(root, Vec::new())];
+    while let Some((node, path)) = stack.pop() {
+        if pred(node) {
+            return Some(path);
+        }
+        for (i, child) in node.children.iter().enumerate().rev() {
+            let mut p = path.clone();
+            p.push(i);
+            stack.push((child, p));
+        }
+    }
+    None
+}
+
+/// Snapshot 上の添字列を DOM へ逆引きする（`map_to_snapshot` の逆。フィクスチャ制約が前提）。
+fn dom_at_path(doc: &Document, path: &[usize]) -> Option<NodeId> {
+    let mut cur = doc.root();
+    for idx in path {
+        cur = doc
+            .children(cur)
+            .filter(|c| is_snapshot_child(doc, *c))
+            .nth(*idx)?;
+    }
+    Some(cur)
+}
+
 /// 1 タスクの判別結果を返す。
 fn evaluate(task: &Task) -> Outcome {
     let doc = parse(task.html);
@@ -268,7 +299,13 @@ fn evaluate(task: &Task) -> Outcome {
         return Outcome::PredicateMismatch;
     }
     if let Some(expected) = task.expected_text {
-        let actual = doc.text_content(target).unwrap_or_default();
+        // 値は selector の対象ではなく、Snapshot 上で述語が最初に選んだノードの
+        // 位置から DOM を復元して読む（PoC の restoreOk 相当）。Snapshot から
+        // data_leaf・ref が失われれば上の判定で不一致になる。
+        let actual = first_path(&snapshot.tree, task.predicate)
+            .and_then(|path| dom_at_path(&doc, &path))
+            .and_then(|id| doc.text_content(id))
+            .unwrap_or_default();
         if actual != expected {
             return Outcome::ValueMismatch(actual);
         }
@@ -310,8 +347,8 @@ fn aisnap_3_discriminable_tasks_at_least_6_of_7() {
     );
 }
 
-/// AISNAP-3 ネガティブコントロール: 価格・表見出しは role/name だけでは他ノードと
-/// 区別できず、`data_leaf` があって初めて対象が一意に定まる。
+/// AISNAP-3 ネガティブコントロール: 価格・表見出しは role/name の述語だと別ノードを選び、
+/// `data_leaf` を併用して初めて対象を選べる（同 role・name の別ノードの存在を検証）。
 #[test]
 fn aisnap_3_data_tasks_rely_on_data_leaf() {
     // 価格: 対象は (generic, "") で、同じ組の非価格ノードが木に存在する。
@@ -340,24 +377,60 @@ fn aisnap_3_data_tasks_rely_on_data_leaf() {
         .count();
     assert_eq!(price_leaves, 3, "価格葉は 3 件で、先頭が対象");
 
-    // 表見出し: 先頭の TableCell+columnheader は #table1 の最初の th で、#table2 とは別。
-    let doc = parse(DASHBOARD_TABLE);
-    let snapshot = snap(&doc);
-    let t1 = query_selector_str(&doc, doc.root(), "table#table1 th")
-        .expect("セレクタは有効")
-        .expect("th がある");
-    let t2 = query_selector_str(&doc, doc.root(), "table#table2 th")
-        .expect("セレクタは有効")
-        .expect("th がある");
-    let r1 = map_to_snapshot(&doc, &snapshot, t1).r#ref.clone();
-    let r2 = map_to_snapshot(&doc, &snapshot, t2).r#ref.clone();
-    assert_ne!(r1, r2, "2 つの表の見出しは別 ref");
-    let nodes = all_nodes(&snapshot.tree);
-    let first = nodes
+    // 価格: (generic, "") の最初の一致は対象ではなく、data_leaf なら対象を選べる。
+    let first_shape = nodes
         .iter()
-        .find(|n| is_table_heading(n))
-        .expect("表見出しの葉がある");
-    assert_eq!(first.r#ref, r1);
+        .find(|n| n.role == "generic" && n.name.is_empty())
+        .expect("同形ノードがある");
+    assert_ne!(
+        first_shape.r#ref, mapped.r#ref,
+        "role/name では別ノードを選ぶ"
+    );
+    let first_price = nodes
+        .iter()
+        .find(|n| n.data_leaf == Some(DataLeafKind::PriceClass))
+        .expect("価格葉がある");
+    assert_eq!(
+        first_price.r#ref, mapped.r#ref,
+        "data_leaf なら対象を選べる"
+    );
+
+    // 表見出し: 同じ role・name を持つ非データ葉（role 上書きの div）が表より前にあり、
+    // role/name の述語はそれを選ぶ。data_leaf 併用なら表の th を選べる。
+    let doc = parse(HEADING_AMBIGUOUS);
+    let snapshot = snap(&doc);
+    let th = query_selector_str(&doc, doc.root(), "table th")
+        .expect("セレクタは有効")
+        .expect("th がある");
+    let decoy = query_selector_str(&doc, doc.root(), "div[role=columnheader]")
+        .expect("セレクタは有効")
+        .expect("ディストラクタがある");
+    let th_node = map_to_snapshot(&doc, &snapshot, th);
+    let decoy_node = map_to_snapshot(&doc, &snapshot, decoy);
+    assert_eq!(
+        (th_node.role.as_str(), th_node.name.as_str()),
+        (decoy_node.role.as_str(), decoy_node.name.as_str()),
+        "対象とディストラクタは role・name が同じ"
+    );
+    assert_ne!(th_node.r#ref, decoy_node.r#ref, "別ノード");
+    assert_eq!(decoy_node.data_leaf, None);
+    let nodes = all_nodes(&snapshot.tree);
+    let by_role_name = nodes
+        .iter()
+        .find(|n| n.role == "columnheader" && n.name == "Last Name")
+        .expect("role/name の一致がある");
+    assert_eq!(
+        by_role_name.r#ref, decoy_node.r#ref,
+        "role/name はディストラクタを選ぶ"
+    );
+    let by_data_leaf = nodes
+        .iter()
+        .find(|n| is_table_heading(n) && n.name == "Last Name")
+        .expect("data_leaf 併用の一致がある");
+    assert_eq!(
+        by_data_leaf.r#ref, th_node.r#ref,
+        "data_leaf なら対象を選べる"
+    );
 }
 
 /// AISNAP-3: 同一 HTML から 2 回構築した Snapshot は一致し、全 ref は木内で一意。
