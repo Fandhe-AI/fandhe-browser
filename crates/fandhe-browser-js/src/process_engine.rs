@@ -117,9 +117,8 @@
 //!   (1) 戻らない関数を途中で打ち切れない（期限は戻った後にしか判定できず、
 //!   超過していれば子を kill して `Timeout` にする）、(2)
 //!   [`NativeCallContext`]（期限・取り消しフラグ）は渡らない、(3) unwind する
-//!   ビルドでは関数内の panic が `evaluate_script` の呼び出し元へ伝播する
-//!   （後始末は `WorkerHandle::drop`。release は `panic = "abort"` で両経路とも
-//!   同じ）。期限の強制が必要な呼び出し元は inherent API（[`ParentNativeFn`]・
+//!   ビルドでは関数内の panic を捕捉して JS 向けエラーへ変換する
+//!   （release は `panic = "abort"` で両経路とも同じ）。期限の強制が必要な呼び出し元は inherent API（[`ParentNativeFn`]・
 //!   `Threaded` 経路）を使う。このため [`V8ProcessEngine`] は `Send` ではない
 //! - 期限を過ぎて放棄された `NativeFn` のスレッドが `Mutex` を握ったままの
 //!   登録は、子を再起動しても `try_lock` に失敗し続けて JS 側へエラーを
@@ -2471,8 +2470,8 @@ fn dispatch_native_call(
 /// （呼び出し元が子を kill して `Timeout` にする）、戻らない関数は打ち切れない
 /// （REPAIR-3。モジュール doc「既知の制限」）。[`NativeCallContext`] は
 /// `NativeFn` のシグネチャに無いため渡らない。再入は
-/// [`NativeReturn::Err`] にする。unwind するビルドでは panic が呼び出し元へ
-/// 伝播する（`WorkerHandle::drop` が子の後始末をする）。
+/// [`NativeReturn::Err`] にする。unwind するビルドでは panic を捕捉して
+/// [`NativeReturn::Err`] に変換する（release は `panic = "abort"`）。
 fn dispatch_inline(
     cell: &std::cell::RefCell<NativeFn>,
     args: &[JsValue],
@@ -2483,9 +2482,15 @@ fn dispatch_inline(
             "the native function is still busy with a previous call".to_string(),
         ));
     };
-    let ret = match func(args) {
-        Ok(value) => NativeReturn::Ok(value),
-        Err(err) => NativeReturn::Err(worker_protocol::truncate_for_wire(&err.to_string())),
+    // unwind するビルドでは panic を `evaluate_script` の呼び出し元へ伝播させず、
+    // `Threaded` 経路（専用スレッド内で閉じ JS エラーへ変換）と同じく
+    // `NativeReturn::Err` に変換して `Result` 契約を守る。`FnMut` の内部状態が
+    // 壊れうるが、以降の呼び出しも同じ `Err` 経路で扱えるため
+    // `AssertUnwindSafe` とする。release は `panic = "abort"` のため捕捉できない。
+    let ret = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| func(args))) {
+        Ok(Ok(value)) => NativeReturn::Ok(value),
+        Ok(Err(err)) => NativeReturn::Err(worker_protocol::truncate_for_wire(&err.to_string())),
+        Err(_) => NativeReturn::Err("the native function panicked".to_string()),
     };
     if Instant::now() >= deadline {
         return Err(NativeDispatchViolation::DeadlineExceeded);
@@ -3153,6 +3158,25 @@ mod tests {
         }
         let ret = dispatch_inline(&cell, &[], deadline).expect("no protocol violation");
         assert_eq!(ret, NativeReturn::Ok(JsValue::Number(7.0)));
+    }
+
+    /// `TASK-29.6.2`・Issue #548: `Inline` の `NativeFn` が panic しても（unwind
+    /// するテストビルドでは）呼び出し元へ伝播せず [`NativeReturn::Err`] になり、
+    /// 借用が解放されて後続呼び出しが `Threaded` 経路と同じ規約で処理されること。
+    #[test]
+    fn js_1_dispatch_inline_contains_a_native_fn_panic_when_unwinding() {
+        let cell = std::cell::RefCell::new(Box::new(
+            |_args: &[JsValue]| -> Result<JsValue, JsEngineError> {
+                panic!("intentional panic for test");
+            },
+        ) as NativeFn);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let ret = dispatch_inline(&cell, &[], deadline).expect("no protocol violation");
+        assert_eq!(
+            ret,
+            NativeReturn::Err("the native function panicked".to_string())
+        );
+        assert!(cell.try_borrow_mut().is_ok());
     }
 
     /// `TASK-29`・Issue #526: 登録件数の上限が具体値どおりであること
