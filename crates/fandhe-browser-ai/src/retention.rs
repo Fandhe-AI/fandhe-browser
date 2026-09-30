@@ -193,7 +193,14 @@ pub fn select_retained_with_priority(
         .filter(|c| c.index >= head && c.index < len)
         .collect();
     prioritized.sort_by_key(|c| c.index);
-    prioritized.dedup_by_key(|c| c.index);
+    // 同一 index は先着の理由を残しつつ、採用順位は重複の中の最小 rank にする。
+    prioritized.dedup_by(|dup, kept| {
+        let same = dup.index == kept.index;
+        if same {
+            kept.rank = kept.rank.min(dup.rank);
+        }
+        same
+    });
     // 予算不足時は rank の小さい候補（移動リンク等）を優先し、同順位は index 昇順。
     // 採用後は index 昇順へ戻す（充填段の skip が昇順を前提とするため）。
     let room = budget.saturating_sub(head);
@@ -405,6 +412,20 @@ mod tests {
         assert_eq!(indexes(&r, RetentionReason::SubmitButton), vec![10, 25]);
         let all: Vec<usize> = r.kept.iter().map(|i| i.index).collect();
         assert!(all.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// AISNAP-12（TASK-16.2・Codex P2）: 同一 index の重複は先着の理由を残し、
+    /// 採用順位は最小の rank になる。
+    #[test]
+    fn aisnap_12_duplicate_index_keeps_first_reason_and_min_rank() {
+        let c = [
+            PriorityCandidate::new(10, RetentionReason::Pagination).with_rank(1),
+            sb(10).with_rank(0),
+            PriorityCandidate::new(11, RetentionReason::Pagination).with_rank(1),
+        ];
+        let r = select_retained_with_priority(30, &RetentionPolicy::new(6, 5), &c);
+        assert_eq!(indexes(&r, RetentionReason::Pagination), vec![10]);
+        assert!(indexes(&r, RetentionReason::SubmitButton).is_empty());
     }
 
     /// AISNAP-12: head_keep == cap では優先段は先頭確保を追い出さない。
