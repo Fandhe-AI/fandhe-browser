@@ -22,9 +22,11 @@
 //! （`type=" submit "` は無効値）。`disabled` の送信ボタンも対象に含める。有効・無効の
 //! 切り替えで簡約表現から出入りすると参照が不安定になるため（`AISNAP-12` の目的）。
 //!
-//! フォームオーナーは、祖先に HTML の `<form>` があるか、空でない `form` 属性を持つこと。
-//! core に id から要素を引く API が無いため `form=` の参照先は解決しない。誤検出は
-//! 保持枠を 1 つ使うだけ、未検出は文書順の充填へ劣化するだけで、どちらも安全側である。
+//! フォームオーナーは、`form` 属性があればその値を id に持つ HTML の `<form>` が文書内に
+//! 実在すること（WHATWG のとおり `form` 属性は祖先の `<form>` より優先し、参照先が無い・
+//! `<form>` でない場合はオーナー無し）。`form` 属性が無ければ祖先に HTML の `<form>` が
+//! あること。core に id から要素を引く API が無いため、参照先は文書全体の前順走査
+//! （`MAX_FORM_ID_SCAN_NODES` で打ち切り、超過時は未解決としてオーナー無し）で解決する。
 //!
 //! # 上限（security.md「不安全な設計」）
 //!
@@ -45,8 +47,11 @@ const HTML_NAMESPACE_URI: &str = "http://www.w3.org/1999/xhtml";
 const MAX_ITEM_SCAN_STEPS: usize = 256;
 /// フォームオーナー探索で辿る祖先の最大深さ。超えた先の `<form>` は無いものとして扱う。
 const MAX_FORM_ANCESTOR_DEPTH: usize = 32;
-/// 項目の祖先に非表示要素が無いか確認する最大深さ。超えた先は表示扱いとする。
+/// 項目の祖先に非表示要素が無いか確認する最大深さ。超えた場合は非表示状態を確認できない
+/// ものとして候補から除外する。
 const MAX_HIDDEN_ANCESTOR_DEPTH: usize = 256;
+/// `form` 属性の参照先を解決する際に走査する文書ノード数の上限。超えたら未解決とする。
+const MAX_FORM_ID_SCAN_NODES: usize = 65_536;
 
 /// 送信ボタンの種別（`AISNAP-12`・`TASK-16.3`）。
 ///
@@ -83,10 +88,24 @@ fn button_submits(doc: &Document, id: NodeId) -> bool {
     doc.attribute(id, "command").is_none() && doc.attribute(id, "commandfor").is_none()
 }
 
-/// フォームオーナーを持つか（祖先の `<form>` または空でない `form` 属性）。
+/// `form` 属性値を id に持つ HTML `<form>` が文書内にあるか。
+///
+/// 前順で最初に id が一致した要素だけを見る（WHATWG）。それが `<form>` でなければ、
+/// 空値・不在・走査上限超過と同じく未解決（`false`）。
+fn form_id_resolves(doc: &Document, form_id: &str) -> bool {
+    if form_id.is_empty() {
+        return false;
+    }
+    doc.descendants(doc.root())
+        .take(MAX_FORM_ID_SCAN_NODES)
+        .find(|n| doc.is_element(*n) && doc.attribute(*n, "id") == Some(form_id))
+        .is_some_and(|n| is_html_named(doc, n, "form"))
+}
+
+/// フォームオーナーを持つか（`form` 属性の参照先 `<form>` の実在、無ければ祖先の `<form>`）。
 fn has_form_owner(doc: &Document, id: NodeId) -> bool {
-    if doc.attribute(id, "form").is_some_and(|v| !v.is_empty()) {
-        return true;
+    if let Some(form_id) = doc.attribute(id, "form") {
+        return form_id_resolves(doc, form_id);
     }
     doc.ancestors(id)
         .take(MAX_FORM_ANCESTOR_DEPTH)
@@ -123,16 +142,20 @@ pub fn classify_submit_button(doc: &Document, id: NodeId) -> Option<SubmitButton
 
 /// 項目（`li`・`tr` 等）のサブツリーから送信ボタンを探す（`AISNAP-12`・`TASK-16.3`）。
 ///
-/// 項目自身も対象に含む。項目自身・祖先（`MAX_HIDDEN_ANCESTOR_DEPTH` まで）が非表示なら
-/// `None`。非表示・`script`/`style`/`noscript`/`template` のサブツリーは読み飛ばし、
+/// 項目自身も対象に含む。項目自身・祖先（`MAX_HIDDEN_ANCESTOR_DEPTH` まで）が非表示、または祖先が
+/// その上限を超える深さなら `None`。非表示・`script`/`style`/`noscript`/`template` のサブツリーは読み飛ばし、
 /// 訪問済み + 未訪問の総量を内部上限（256 ノード）以内に保つ。子が残り予算を超える場合は
 /// 文書順で予算内の子だけを調べ、超過分は打ち切る。複数ある場合は文書順で最初の種別を返す。
 pub fn find_submit_button(doc: &Document, item: NodeId) -> Option<SubmitButtonKind> {
-    if doc
-        .ancestors(item)
-        .take(MAX_HIDDEN_ANCESTOR_DEPTH)
-        .any(|a| doc.is_element(a) && is_hidden_element(doc, a))
-    {
+    let mut checked = 0usize;
+    for a in doc.ancestors(item).take(MAX_HIDDEN_ANCESTOR_DEPTH + 1) {
+        checked += 1;
+        if doc.is_element(a) && is_hidden_element(doc, a) {
+            return None;
+        }
+    }
+    // 上限を超える祖先は非表示状態を確認できないため、候補から除外する（fail-closed）。
+    if checked > MAX_HIDDEN_ANCESTOR_DEPTH {
         return None;
     }
     let mut stack = vec![item];
@@ -179,8 +202,8 @@ pub fn submit_button_candidates(doc: &Document, items: &[NodeId]) -> Vec<Priorit
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_FORM_ANCESTOR_DEPTH, SubmitButtonKind, classify_submit_button, find_submit_button,
-        submit_button_candidates,
+        MAX_FORM_ANCESTOR_DEPTH, MAX_HIDDEN_ANCESTOR_DEPTH, SubmitButtonKind,
+        classify_submit_button, find_submit_button, submit_button_candidates,
     };
     use crate::compress_table::detect_regular_structure;
     use crate::retention::{
@@ -346,10 +369,17 @@ mod tests {
         let doc = parse("<div><button>a</button></div>");
         assert_eq!(classify_submit_button(&doc, select(&doc, "button")), None);
         let doc = parse("<div><button form=f1>a</button></div>");
+        assert_eq!(classify_submit_button(&doc, select(&doc, "button")), None);
+        let doc = parse("<form id=f1></form><div><button form=f1>a</button></div>");
         assert_eq!(
             classify_submit_button(&doc, select(&doc, "button")),
             Some(SubmitButtonKind::Button)
         );
+        // 参照先が `<form>` でない・form 属性が祖先 form より優先される場合はオーナー無し。
+        let doc = parse("<div id=f1></div><button form=f1>a</button>");
+        assert_eq!(classify_submit_button(&doc, select(&doc, "button")), None);
+        let doc = parse("<form><button form=missing>a</button></form>");
+        assert_eq!(classify_submit_button(&doc, select(&doc, "button")), None);
         let doc = parse("<div><button form=''>a</button></div>");
         assert_eq!(classify_submit_button(&doc, select(&doc, "button")), None);
     }
@@ -473,6 +503,19 @@ mod tests {
         );
         let doc = parse(&html);
         assert_eq!(classify_submit_button(&doc, select(&doc, "button")), None);
+    }
+
+    /// AISNAP-12: 祖先が非表示確認の上限を超える深さの項目は候補にしない。
+    #[test]
+    fn aisnap_12_hidden_ancestor_depth_limit_excludes_item() {
+        let depth = MAX_HIDDEN_ANCESTOR_DEPTH + 10;
+        let html = format!(
+            "<form><div hidden>{}<button>x</button>{}</div></form>",
+            "<div>".repeat(depth),
+            "</div>".repeat(depth)
+        );
+        let doc = parse(&html);
+        assert_eq!(find_submit_button(&doc, select(&doc, "button")), None);
     }
 
     /// AISNAP-12: 候補は index 昇順で、空入力には空を返す。
