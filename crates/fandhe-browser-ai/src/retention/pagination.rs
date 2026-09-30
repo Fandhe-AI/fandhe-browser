@@ -17,8 +17,10 @@
 //!    空白正規化・ASCII 小文字化後の完全一致で、部分一致はしない）
 //! 3. `class` トークン: `next` / `prev` / `previous` / `morelink`（Hacker News）
 //! 4. 数字だけのラベル（1〜4 桁）は、`aria-current="page"` または
-//!    `nav`・`role="navigation"`・`pagination`/`pager`/`paging` 系 class の
-//!    祖先が近くにある場合に限り [`PaginationKind::PageNumber`]
+//!    `pagination`/`pager`/`paging` 系 class の祖先、もしくは `aria-label` が同系語を
+//!    含む `nav`・`role="navigation"` の祖先が近くにある場合に限り
+//!    [`PaginationKind::PageNumber`]（素の `nav` だけではサイト全体ナビと区別できず
+//!    誤検出するため根拠にしない）
 //!
 //! 語表はヒューリスティックで、誤検出はキャップ内の 1 枠を消費するだけ、
 //! 未検出は従来の文書順 `take` へ劣化するだけ（安全側）。語表の拡充は将来課題。
@@ -37,12 +39,21 @@ const HTML_NAMESPACE_URI: &str = "http://www.w3.org/1999/xhtml";
 
 /// ラベル取得で訪問するノード数の上限（訪問済み + 未訪問スタックの総量）。
 const MAX_LABEL_SCAN_STEPS: usize = 64;
+/// `aria-label` 属性値の最大バイト数。超える値はキーワードでないとみなし、
+/// 正規化（全走査・複製）の前に候補から除外する（security.md「不安全な設計」）。
+const MAX_ARIA_LABEL_BYTES: usize = 256;
 /// ラベル（空白正規化後）の最大文字数。超える長文はキーワードとみなさない。
 const MAX_LABEL_CHARS: usize = 32;
 /// ラベル取得で走査するテキストの総文字数の上限。
 const MAX_LABEL_SCAN_CHARS: usize = 256;
 /// 項目サブツリー走査で訪問するノード数の上限（訪問済み + 未訪問スタックの総量）。
 const MAX_ITEM_SCAN_STEPS: usize = 256;
+/// ページャ系の語（`pagination`・`pager`・`paging`）を ASCII 大文字小文字非区別で含むか。
+fn has_pager_word(value: &str) -> bool {
+    let v = value.to_ascii_lowercase();
+    v.contains("pagination") || v.contains("pager") || v.contains("paging")
+}
+
 /// ページ番号の文脈ガードで辿る祖先の最大深さ。
 const MAX_PAGINATION_ANCESTOR_DEPTH: usize = 8;
 /// ページ番号とみなす数字ラベルの最大桁数。
@@ -216,20 +227,20 @@ fn has_pagination_context(doc: &Document, id: NodeId) -> bool {
             if !doc.is_element(a) {
                 return false;
             }
-            if is_html_named(doc, a, "nav") {
-                return true;
-            }
-            if doc
-                .attribute(a, "role")
-                .is_some_and(|r| token_matches(r, "navigation"))
+            let is_nav = is_html_named(doc, a, "nav")
+                || doc
+                    .attribute(a, "role")
+                    .is_some_and(|r| token_matches(r, "navigation"));
+            // ナビ領域は aria-label がページャ系の語を持つ場合だけ根拠にする。
+            if is_nav
+                && doc
+                    .attribute(a, "aria-label")
+                    .is_some_and(|l| l.len() <= MAX_ARIA_LABEL_BYTES && has_pager_word(l))
             {
                 return true;
             }
             doc.attribute(a, "class").is_some_and(|c| {
-                c.split(is_ascii_space).any(|t| {
-                    let t = t.to_ascii_lowercase();
-                    t.contains("pagination") || t.contains("pager") || t.contains("paging")
-                })
+                c.len() <= MAX_ARIA_LABEL_BYTES && c.split(is_ascii_space).any(has_pager_word)
             })
         })
 }
@@ -255,11 +266,16 @@ pub fn classify_pagination_link(doc: &Document, id: NodeId) -> Option<Pagination
         }
     }
 
-    let label = doc
-        .attribute(id, "aria-label")
-        .map(normalize_label)
-        .filter(|l| !l.is_empty())
-        .or_else(|| short_label(doc, id));
+    // 巨大な aria-label は正規化（全走査・複製）せず、ラベル由来の判定から除外する。
+    // 空の aria-label は本文ラベルへフォールバックする。
+    let aria = doc.attribute(id, "aria-label");
+    let label = match aria {
+        Some(raw) if raw.len() > MAX_ARIA_LABEL_BYTES => None,
+        _ => aria
+            .map(normalize_label)
+            .filter(|l| !l.is_empty())
+            .or_else(|| short_label(doc, id)),
+    };
 
     if let Some(kind) = label.as_deref().and_then(kind_from_label) {
         return Some(kind);
@@ -425,8 +441,14 @@ mod tests {
     #[test]
     fn aisnap_12_page_number_requires_context() {
         assert_eq!(
-            classify(r#"<nav><a href="?p=3">3</a></nav>"#),
+            classify(r#"<nav aria-label="Pagination"><a href="?p=3">3</a></nav>"#),
             Some(PaginationKind::PageNumber)
+        );
+        // サイト全体ナビ内の数字リンクはページ番号とみなさない。
+        assert_eq!(classify(r#"<nav><a href="/section/1">1</a></nav>"#), None);
+        assert_eq!(
+            classify(r#"<nav aria-label="Main menu"><a href="/s/2">2</a></nav>"#),
+            None
         );
         assert_eq!(
             classify(r#"<div class="Pagination-list"><a href="?p=3">3</a></div>"#),
@@ -437,7 +459,20 @@ mod tests {
             Some(PaginationKind::PageNumber)
         );
         assert_eq!(classify(r#"<a href="/item">42</a>"#), None);
-        assert_eq!(classify(r#"<nav><a href="/item">12345</a></nav>"#), None);
+        assert_eq!(
+            classify(r#"<nav aria-label="Pagination"><a href="/item">12345</a></nav>"#),
+            None
+        );
+    }
+
+    /// AISNAP-12（TASK-16.2）: 巨大な aria-label は候補から除外され有界に終了する。
+    #[test]
+    fn aisnap_12_oversized_aria_label_excluded() {
+        let big = "x".repeat(1_000_000);
+        let html = format!(r#"<a href="/x" aria-label="{big}">次へ</a>"#);
+        assert_eq!(classify(&html), None);
+        let html = format!(r#"<a href="/x" aria-label="{big} next" class="next">3</a>"#);
+        assert_eq!(classify(&html), Some(PaginationKind::Next));
     }
 
     /// AISNAP-12（TASK-16.2）: 対象外の要素・状態は None。
