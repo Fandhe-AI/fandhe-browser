@@ -15,6 +15,10 @@
 //! 2. その ref が木全体で一意（PoC の `restoreOk` 相当）。
 //! 3. snapshot の情報だけで作る述語の「先行順で最初の一致」が対象ノードと一致する。
 //!
+//! 値の確認（`expected_text`）の範囲: Snapshot は価格等のテキスト値を保持しないため、
+//! 値そのものの保持ではなく「Snapshot の位置（ref 相当）から DOM を再特定して値に
+//! 到達できること」を検証する。name を持つノード（リンク・表見出し）は name も照合する。
+//!
 //! フィクスチャ制約: `<body>` 内に `build_snapshot` が除外する要素（`script`・`style`・
 //! `noscript`・`template`・`hidden`・`aria-hidden="true"`・`input[type=hidden]`）を
 //! 置かない。除外されると添字対応付けがずれるため。
@@ -71,7 +75,7 @@ enum Outcome {
     RefNotUnique,
     /// 述語の最初の一致が対象ノードと異なる（または一致なし）。
     PredicateMismatch,
-    /// 復元後の値が期待と異なる。
+    /// Snapshot の name または ref で再特定した DOM の値が期待と異なる。
     ValueMismatch(String),
 }
 
@@ -185,7 +189,7 @@ fn all_nodes(root: &Node) -> Vec<&Node> {
     out
 }
 
-/// ref が `e` + 16 桁の小文字 16 進 + 任意の `-<n>` の形か。
+/// ref が `ElementRef::to_ref_string` の契約 `e<16hex>[v<n>][-<n>]` の形か。
 fn is_ref_shaped(r: &str) -> bool {
     let Some(rest) = r.strip_prefix('e') else {
         return false;
@@ -197,11 +201,17 @@ fn is_ref_shaped(r: &str) -> bool {
     if hex_len != 16 {
         return false;
     }
-    let tail: String = rest.chars().skip(16).collect();
-    tail.is_empty()
-        || tail
-            .strip_prefix('-')
-            .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
+    let all_digits = |d: &str| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit());
+    let mut tail: &str = rest.get(16..).unwrap_or("");
+    if let Some(after_v) = tail.strip_prefix('v') {
+        let end = after_v.find('-').unwrap_or(after_v.len());
+        let (variant, remain) = after_v.split_at(end);
+        if !all_digits(variant) {
+            return false;
+        }
+        tail = remain;
+    }
+    tail.is_empty() || tail.strip_prefix('-').is_some_and(all_digits)
 }
 
 /// `build_snapshot` が `Node` 化する子か（フィクスチャ制約下では要素かつ `head` でない）。
@@ -299,9 +309,17 @@ fn evaluate(task: &Task) -> Outcome {
         return Outcome::PredicateMismatch;
     }
     if let Some(expected) = task.expected_text {
-        // 値は selector の対象ではなく、Snapshot 上で述語が最初に選んだノードの
-        // 位置から DOM を復元して読む（PoC の restoreOk 相当）。Snapshot から
-        // data_leaf・ref が失われれば上の判定で不一致になる。
+        // Snapshot は価格などのテキスト値を持たない（`Node` に text フィールドは無い）。
+        // そのため値の確認は次の 2 段に分ける。
+        // (a) Snapshot 側: name が空でなければ（リンク・表見出し）name が期待値と一致する。
+        // (b) ref による DOM 再特定: 述語が選んだ Snapshot 上の位置から DOM を復元し、
+        //     その要素の text_content が期待値と一致する（PoC の restoreOk 相当）。
+        //     値そのものが Snapshot に残ることではなく、Snapshot の情報だけで
+        //     値の在処へ辿り着けることを検証する。
+        let name = first.map(|n| n.name.as_str()).unwrap_or_default();
+        if !name.is_empty() && name != expected {
+            return Outcome::ValueMismatch(name.to_string());
+        }
         let actual = first_path(&snapshot.tree, task.predicate)
             .and_then(|path| dom_at_path(&doc, &path))
             .and_then(|id| doc.text_content(id))
@@ -447,5 +465,30 @@ fn aisnap_3_snapshot_is_deterministic_and_refs_unique() {
             .collect();
         let unique: HashSet<&str> = refs.iter().copied().collect();
         assert_eq!(refs.len(), unique.len(), "{} の ref は一意", task.name);
+    }
+}
+
+/// AISNAP-3: `is_ref_shaped` は `e<16hex>[v<n>][-<n>]` の全組み合わせを受け入れ、不正形を弾く。
+#[test]
+fn aisnap_3_is_ref_shaped_follows_ref_contract() {
+    let h = "0123456789abcdef";
+    for ok in [
+        format!("e{h}"),
+        format!("e{h}-2"),
+        format!("e{h}v1"),
+        format!("e{h}v12-3"),
+    ] {
+        assert!(is_ref_shaped(&ok), "{ok}");
+    }
+    for ng in [
+        format!("e{h}v"),
+        format!("e{h}vx"),
+        format!("e{h}v1-"),
+        format!("e{h}-"),
+        format!("e{h}x"),
+        "e0123".to_string(),
+        format!("x{h}"),
+    ] {
+        assert!(!is_ref_shaped(&ng), "{ng}");
     }
 }
