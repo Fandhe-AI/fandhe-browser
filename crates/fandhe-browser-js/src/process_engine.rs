@@ -1,7 +1,7 @@
 //! JS 評価用の子プロセスへの親側プロキシ（`JS-1`・`TASK-29`・Issue #503
 //! 「JS プロセス分離」設計書 §3.2・§3.3・§3.4・§7 W4）。
 //!
-//! 呼び出し元（将来）: `TASK-29.6`（Issue #157）で `create_engine` から
+//! 呼び出し元（将来）: `TASK-29.6.2`（Issue #548）で `create_engine` から
 //! 配線され、`impl JsEngine for V8ProcessEngine` を追加する（現時点では
 //! inherent メソッドとして `evaluate_script`・`inject_global_function` を
 //! 提供するに留める。設計書 §7「案 X」4）。
@@ -107,7 +107,7 @@
 //! - 子 → 親へ `ObjectHandle` を渡す経路（オブジェクト参照の往復・親の handle
 //!   照合）は未実装で、現状は fail-closed で拒否する（`TASK-29.5b` の
 //!   後続作業。REPAIR-3）。setter（書き込み可能プロパティ）も未対応。
-//! - `impl JsEngine for V8ProcessEngine`（`TASK-29.6`・Issue #157）は未実装で、
+//! - `impl JsEngine for V8ProcessEngine`（`TASK-29.6.2`・Issue #548）は未実装で、
 //!   トレイトの `NativeFn`（`Send` なし）と本型の [`ParentNativeFn`]（`Send`
 //!   あり）の不一致の橋渡しもそこで決める
 //! - 期限を過ぎて放棄された `NativeFn` のスレッドが `Mutex` を握ったままの
@@ -1093,7 +1093,7 @@ pub enum DomLikeMemberFn {
 /// 型自体も `pub` である必要がある（`pub(crate)` は別クレートから見えない）。
 /// テスト専用メソッド自体は `#[cfg(feature = "test-support")]` で個別に
 /// gate する（[`WorkerSpawnConfigForTest`] のドキュメントコメント参照）。
-/// `TASK-29.6`（Issue #157）で `create_engine` から配線し、
+/// `TASK-29.6.2`（Issue #548）で `create_engine` から配線し、
 /// `impl JsEngine for V8ProcessEngine` を追加する（現時点では
 /// inherent メソッドに留める）。
 #[doc(hidden)]
@@ -1967,18 +1967,11 @@ impl V8ProcessEngine {
                     let (outcome, keep) = match worker_protocol::decode_error(&payload) {
                         // 子の watchdog による打ち切り。子プロセスは生き続け、
                         // Context も残る（設計書 §3.3 の表の 1 行目）。
-                        Ok((ErrorKind::Timeout, message)) => (
-                            Err(JsEngineError::Timeout(format!(
-                                "script execution timed out inside the JS worker process: \
-                                 {message}"
-                            ))),
-                            true,
-                        ),
-                        Ok((ErrorKind::Evaluation, message)) => {
-                            (Err(JsEngineError::EvaluationFailed(message)), true)
-                        }
-                        Ok((ErrorKind::Binding, message)) => {
-                            (Err(JsEngineError::BindingFailed(message)), true)
+                        // Timeout / Evaluation / Binding はいずれも子を維持する
+                        // （`keep = true`）。変換は
+                        // [`error_frame_to_js_engine_error`] に集約している。
+                        Ok((kind, message)) => {
+                            (Err(error_frame_to_js_engine_error(kind, message)), true)
                         }
                         Err(err) => {
                             worker.terminate_now();
@@ -2534,6 +2527,26 @@ fn handshake_discard_error(
             worker.rss_threshold_bytes,
         ),
         None => fallback(),
+    }
+}
+
+/// 子プロセスからの `ERROR` フレーム（デコード済みの種別・メッセージ）を、
+/// 親側で呼び出し元へ返す [`JsEngineError`] へ変換する（`JS-1`・
+/// `TASK-29.6.1`・Issue #547）。
+///
+/// 呼び出し元: 応答待ちループ（`evaluate_script` 等の `ERROR` フレーム受信
+/// 分岐）。`decode_error` の失敗（不正フレーム）は本関数の対象外で、
+/// ループ側が子を破棄して `EngineUnavailable` にする。V8 失敗からワイヤ
+/// `ErrorKind` を経て本関数に至る全体対応表は `v8_engine.rs` のモジュール
+/// doc「エラー変換」節を参照。`Timeout` には子プロセス内での打ち切りである
+/// ことを示す接頭辞を付ける。それ以外はメッセージをそのまま保つ。
+pub(crate) fn error_frame_to_js_engine_error(kind: ErrorKind, message: String) -> JsEngineError {
+    match kind {
+        ErrorKind::Timeout => JsEngineError::Timeout(format!(
+            "script execution timed out inside the JS worker process: {message}"
+        )),
+        ErrorKind::Evaluation => JsEngineError::EvaluationFailed(message),
+        ErrorKind::Binding => JsEngineError::BindingFailed(message),
     }
 }
 

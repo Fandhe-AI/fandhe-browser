@@ -799,12 +799,13 @@ fn respond_to_registration(
 /// 不要になった）。
 ///
 /// `JsEngineError::ResourceLimitExceeded`・`JsEngineError::EngineUnavailable`
-/// は現在の `v8_engine`（子プロセスの中で動く評価本体）実装からは返らない
-/// （ヒープ上限到達はこのプロセス自体の fatal OOM に一本化し、
-/// `EngineUnavailable` は親側 `process_engine.rs` だけが構築する variant
-/// のため）。`enum` が存在する以上 `match` を尽くす必要があるため、
-/// 防御的に「評価失敗」として扱う分岐を用意する（実際に到達する経路は
-/// 無い。実装済みを装わない。REPAIR-3）。
+/// はワイヤ上に専用の `ErrorKind` が無いため、`Evaluation` に畳んで送る
+/// （`EngineUnavailable` は `v8_engine` が NativeCall fatal 記録済みの
+/// Context に対する評価要求で返しうる。親側では `EvaluationFailed` として
+/// 見える。区別するにはプロトコル変更が必要で、`TASK-29.6.1` の範囲外）。
+/// 親側の逆変換は `process_engine::error_frame_to_js_engine_error`、
+/// V8 失敗からの全体対応表は `v8_engine.rs` のモジュール doc「エラー変換」
+/// 節を参照。
 fn classify_evaluation_error(err: &JsEngineError) -> (ErrorKind, String) {
     match err {
         JsEngineError::EvaluationFailed(msg) => (
@@ -1258,5 +1259,48 @@ mod tests {
             handle_bind_dom_like_object(&mut engine, &[1, 2], &mut written, &mut count).is_err()
         );
         assert!(written.is_empty());
+    }
+
+    /// JS-1・TASK-29.6.1: 子側 [`JsEngineError`] がワイヤ（`ERROR` フレーム）を
+    /// 経て親側で復元されるとき、variant とメッセージが期待どおりになること。
+    #[test]
+    fn js_1_error_round_trips_through_the_wire_to_the_parent_error() {
+        use super::super::process_engine::error_frame_to_js_engine_error;
+
+        let cases = [
+            (
+                JsEngineError::EvaluationFailed("SyntaxError: x".to_string()),
+                JsEngineError::EvaluationFailed("SyntaxError: x".to_string()),
+            ),
+            (
+                JsEngineError::BindingFailed("bind".to_string()),
+                JsEngineError::BindingFailed("bind".to_string()),
+            ),
+            (
+                JsEngineError::Timeout("script execution exceeded".to_string()),
+                JsEngineError::Timeout(
+                    "script execution timed out inside the JS worker process: \
+                     script execution exceeded"
+                        .to_string(),
+                ),
+            ),
+            (
+                JsEngineError::EngineUnavailable("gone".to_string()),
+                JsEngineError::EvaluationFailed("gone".to_string()),
+            ),
+        ];
+        for (child_error, expected_parent) in cases {
+            let (kind, message) = classify_evaluation_error(&child_error);
+            let body = worker_protocol::encode_error(kind, &message);
+            let (decoded_kind, decoded_message) =
+                worker_protocol::decode_error(&body).expect("decode");
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    error_frame_to_js_engine_error(decoded_kind, decoded_message)
+                ),
+                format!("{expected_parent:?}")
+            );
+        }
     }
 }
