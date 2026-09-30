@@ -718,8 +718,11 @@ const MAX_PROC_SCAN_PIDS: usize = 65_536;
 /// - 形式不正・上限超過・期限超過（`EXTERNAL_COMMAND_DEADLINE`）は
 ///   `LookupFailed`。黙って打ち切ると外部の所有者を見落として誤って
 ///   `Verified` を返し得るため、途中で止めずにエラーにする
-/// - 走査中に終了した・他ユーザーのプロセス（`NotFound`/`PermissionDenied`）は
-///   読み飛ばす。本当の所有者が見えない場合は結果的に `NoOwnerFound` になる
+/// - 走査中に終了したプロセス・fd（`NotFound`）は読み飛ばす。権限不足
+///   （`PermissionDenied`。systemd --user 等 dumpable でない同一 uid の
+///   プロセスで常態的に起きる）は読み飛ばすが、所有者が判明していない
+///   LISTEN inode が残る場合は確認不能として `LookupFailed`。それ以外の
+///   I/O エラーは即 `LookupFailed`
 #[cfg(target_os = "linux")]
 pub(crate) fn lookup_port_owner_pids(port: u16) -> Result<Option<Vec<u32>>, PortOwnerError> {
     use std::io::ErrorKind;
@@ -774,6 +777,10 @@ pub(crate) fn lookup_port_owner_pids(port: u16) -> Result<Option<Vec<u32>>, Port
     let entries =
         std::fs::read_dir(proc_dir).map_err(|e| fail(format!("failed to read /proc: {e}")))?;
     let mut owners: Vec<u32> = Vec::new();
+    // 権限不足で中身を確認できなかった fd / fd ディレクトリがあったか。
+    let mut unreadable = false;
+    // いずれかの確認できた fd に紐づいた LISTEN inode。
+    let mut attributed: Vec<u64> = Vec::new();
     let mut scanned = 0usize;
     for entry in entries {
         let entry = entry.map_err(|e| fail(format!("failed to read /proc entry: {e}")))?;
@@ -792,27 +799,63 @@ pub(crate) fn lookup_port_owner_pids(port: u16) -> Result<Option<Vec<u32>>, Port
         }
         let fds = match std::fs::read_dir(proc_dir.join(pid.to_string()).join("fd")) {
             Ok(fds) => fds,
-            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                unreadable = true;
                 continue;
             }
             Err(e) => return Err(fail(format!("failed to read /proc/{pid}/fd: {e}"))),
         };
         for fd in fds {
             check_deadline()?;
-            let Ok(fd) = fd else { continue };
-            // fd は走査中に閉じられ得る。読めないものは読み飛ばす。
-            let Ok(target) = std::fs::read_link(fd.path()) else {
-                continue;
+            // fd の列挙・readlink は競合で消えた（NotFound）場合のみ読み飛ばす。
+            // 権限不足等で確認できない fd を無視すると所有者を見落として
+            // 誤って Verified を返し得るため、LookupFailed にする。
+            let fd = match fd {
+                Ok(fd) => fd,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                    unreadable = true;
+                    continue;
+                }
+                Err(e) => return Err(fail(format!("failed to read /proc/{pid}/fd entry: {e}"))),
             };
-            let matched = target
+            let target = match std::fs::read_link(fd.path()) {
+                Ok(t) => t,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                    unreadable = true;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(fail(format!(
+                        "failed to read link {}: {e}",
+                        fd.path().display()
+                    )));
+                }
+            };
+            let inode = target
                 .to_str()
                 .and_then(parse_socket_link_inode)
-                .is_some_and(|inode| inodes.contains(&inode));
-            if matched {
-                owners.push(pid);
-                break;
+                .filter(|inode| inodes.contains(inode));
+            if let Some(inode) = inode {
+                if !owners.contains(&pid) {
+                    owners.push(pid);
+                }
+                if !attributed.contains(&inode) {
+                    attributed.push(inode);
+                }
             }
         }
+    }
+    // 権限不足で見えない fd があり、かつ所有者が判明していない LISTEN inode が
+    // 残る場合、その inode を外部プロセスが持つ可能性を排除できない。
+    // 子の PID だけで Verified にしないよう LookupFailed にする。
+    if unreadable && inodes.iter().any(|i| !attributed.contains(i)) {
+        return Err(fail(
+            "could not verify every listening socket owner (permission denied on some fds)"
+                .to_string(),
+        ));
     }
     Ok(Some(owners))
 }
