@@ -17,12 +17,14 @@
 //!
 //! ## スタブについて（`code-comment-style.md`・REPAIR-3）
 //!
-//! 具象型は OS 既定パス解決の [`OsDefaultStore`] のみ実装済みである。
+//! 具象型は OS 既定パス解決の [`OsDefaultStore`]・明示指定の [`ExplicitStore`]・
+//! 両者を合成する [`OverridableStore`] を実装済みである。
 //!
 //! - OS 既定パスの解決は [`OsDefaultStore`]（TASK-60（60.3）・#202）。
 //!   `directories` は #200 の判断（推移的依存 `option-ext` が MPL-2.0）で不採用と
 //!   し、std の環境変数だけで自前解決する
-//! - 明示指定による上書き（`RootSource::Explicit`。`PROF-1`）: #203（TASK-60（60.4））
+//! - 明示指定による上書き（`RootSource::Explicit`。`PROF-1`）は [`ExplicitStore`]・
+//!   [`OverridableStore`]（TASK-60（60.4）・#203）。明示指定が既定解決より優先される
 //! - 削除（`PROF-5`）: #188（TASK-53（53.2））。[`ProfileStore::delete`] の既定実装は
 //!   成功を装わず [`ProfileError::Unsupported`] を返す
 //! - Windows 長パス（`XOS-8`、TASK-61）・名前正規化（`XOS-9`、TASK-62）は
@@ -41,9 +43,9 @@ use crate::profile::{Profile, ProfileError};
 pub enum RootSource {
     /// OS 慣習に基づく既定保存先（`XOS-7`。[`OsDefaultStore`]）。
     OsDefault,
-    /// 呼び出し元による明示指定（`PROF-1`。#203 で実装）。
+    /// 呼び出し元による明示指定（`PROF-1`。[`ExplicitStore`] が返す）。
     ///
-    /// 相対パスの絶対化は上書き境界（#203）の責務で、ここへ渡る値は絶対パスとする。
+    /// 相対パスの絶対化は [`ExplicitStore::new`] が行うため、ここへ渡る値は絶対パスとする。
     Explicit,
 }
 
@@ -58,7 +60,7 @@ pub struct ResolvedRoot {
 }
 
 impl ResolvedRoot {
-    /// 解決結果を作る。`ProfileStore` 実装者（#202・#203）が使う。
+    /// 解決結果を作る。[`OsDefaultStore`]・[`ExplicitStore`] などの `ProfileStore` 実装者が使う。
     pub fn new(path: PathBuf, source: RootSource) -> Self {
         Self { path, source }
     }
@@ -140,8 +142,8 @@ pub const APP_DIR_NAME: &str = "fandhe-browser";
 ///
 /// 必要な環境変数が使えなければ暗黙の代替先へ落とさず
 /// [`ProfileError::DefaultRootUnavailable`] を返す（fail-closed）。プロセスの環境変数は
-/// 書き換えない。明示指定による上書き（`RootSource::Explicit`）は #203（TASK-60（60.4））
-/// が担う。
+/// 書き換えない。明示指定による上書き（`RootSource::Explicit`）は [`OverridableStore`]
+/// （TASK-60（60.4）・#203）が担う。
 #[derive(Debug, Clone, Default)]
 pub struct OsDefaultStore {
     _private: (),
@@ -161,6 +163,211 @@ impl ProfileStore for OsDefaultStore {
             canonicalize_base(&base).join(tail),
             RootSource::OsDefault,
         ))
+    }
+}
+
+/// 明示指定されたプロファイルルートを返す [`ProfileStore`]
+/// （`PROF-1`・`XOS-7`、TASK-60（60.4）・#203、MS-3）。
+///
+/// `fandhe-browser-cli`（TASK-41 で追加予定）が、利用者の「任意のパスをルートに
+/// 指定する」オプションを受け取ったときに作る。通常は [`OverridableStore`] 経由で
+/// 既定解決より優先させる。
+///
+/// - 相対パスは [`ExplicitStore::new`] の時点で 1 回だけ絶対化して固定する
+///   （実行中の `chdir` で保存先が変わらないようにするため）
+/// - `canonicalize` はしない。symlink の検証は [`Profile::open`] がハンドル基準で
+///   行う（`PROF-1`・`PROF-4`）。macOS の `/var` など OS 標準の symlink を含む
+///   パスは、[`Profile::open`] の doc と同様に呼び出し側で `canonicalize` が必要
+/// - `..` を含むパスは受け付けるが、[`ExplicitStore::new`] が副作用の前に字句的に
+///   畳み込んで保存する（`/tmp/new-dir/../profile` は `/tmp/profile`）。畳み込まずに
+///   [`Profile::open`] へ渡すと、途中要素（`/tmp/new-dir`）が最終ルートの外に作成される
+///   ため（`PROF-1`・`PROF-4`）。畳み込まれる要素（`a/link/..` の `link`）が既存の
+///   symlink の場合は、OS の解決先と字句的な結果が食い違うため [`ProfileError::InvalidLayout`]
+///   で拒否する
+/// - 既存ディレクトリが他者と共有される形（unix で group/other にアクセス権がある、または sticky 等が立っている。
+///   `/tmp`・`0755`・`0770` 等）の場合は、[`Profile::open`] の `fchmod(0700)` が共有ディレクトリ自体へ
+///   及ぶため [`ProfileError::InvalidLayout`] で拒否する。専用の子ディレクトリを指定する
+/// - `..` を畳み込んだ結果が OS のルート（`/`・ドライブルート）になる指定は、
+///   `fchmod(0700)` やファイル作成が OS ルートへ及ぶため [`ExplicitStore::new`] が
+///   [`ProfileError::InvalidLayout`] で拒否する
+///
+/// [`ProfileStore::delete`] は既定実装（`Unsupported`）のままで、#188 が担う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitStore {
+    root: PathBuf,
+}
+
+impl ExplicitStore {
+    /// 明示指定パスからストアを作る。相対パスは現在のカレントディレクトリで絶対化する。
+    ///
+    /// 空パスは [`ProfileError::InvalidLayout`]、カレントディレクトリが取得できない
+    /// などの OS エラーは [`ProfileError::Io`] を返す（fail-closed）。
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, ProfileError> {
+        let path = path.into();
+        if path.as_os_str().is_empty() {
+            return Err(ProfileError::InvalidLayout {
+                path,
+                reason: "explicit profile root must not be empty",
+            });
+        }
+        let root = normalize_lexically(&std::path::absolute(&path)?)?;
+        if !root.is_absolute() {
+            return Err(ProfileError::InvalidLayout {
+                path: root,
+                reason: "explicit profile root must be an absolute path",
+            });
+        }
+        if is_filesystem_root(&root) {
+            return Err(ProfileError::InvalidLayout {
+                path: root,
+                reason: "explicit profile root must not be the filesystem root",
+            });
+        }
+        reject_shared_existing_dir(&root)?;
+        Ok(Self { root })
+    }
+
+    /// 絶対化済みの明示指定ルート。
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl ProfileStore for ExplicitStore {
+    fn resolve_root(&self) -> Result<ResolvedRoot, ProfileError> {
+        Ok(ResolvedRoot::new(self.root.clone(), RootSource::Explicit))
+    }
+
+    /// 開いたルートのハンドルで共有ディレクトリ（sticky・group/other 書込可）を
+    /// `fchmod(0700)` の前に拒否して開く（`PROF-1`・TOCTOU 回避）。
+    fn open_or_create(&self) -> Result<Profile, ProfileError> {
+        Profile::open_rejecting_shared_root(&self.root)
+    }
+}
+
+/// `..` と `.` を字句的に畳み込んだパスを返す（`PROF-1`）。
+///
+/// [`ExplicitStore::new`] が、[`Profile::open`] に `..` 付きパスを渡すと最終ルート外の
+/// 途中要素が作成される問題を、副作用の前に防ぐために使う。ルート直上の `..` は
+/// ルートに留まる（OS の解決規則と同じ）。畳み込まれる要素が既存の symlink なら、
+/// 字句的な結果と OS の解決先が食い違い symlink 検証（`PROF-4`）を迂回し得るため
+/// [`ProfileError::InvalidLayout`] を返す（fail-closed）。存在しない要素は symlink では
+/// あり得ないのでそのまま畳み込む。
+fn normalize_lexically(path: &Path) -> Result<PathBuf, ProfileError> {
+    let mut out = PathBuf::new();
+    let mut normal_depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => {
+                out.push(name);
+                normal_depth += 1;
+            }
+            Component::ParentDir => {
+                if normal_depth > 0 {
+                    if std::fs::symlink_metadata(&out).is_ok_and(|m| m.file_type().is_symlink()) {
+                        return Err(ProfileError::InvalidLayout {
+                            path: out,
+                            reason: "explicit profile root must not use '..' after a symlink",
+                        });
+                    }
+                    out.pop();
+                    normal_depth -= 1;
+                }
+            }
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
+        }
+    }
+    Ok(out)
+}
+
+/// 既存ディレクトリが他者にアクセス可能（unix で group/other の権限ビットまたは sticky 等が立っている）なら拒否する。
+///
+/// [`Profile::open`] はルート自体を `fchmod(0700)` するため、`/tmp` のような共有
+/// ディレクトリを指定されると他者の利用を壊す（`PROF-1`）。存在しない・取得できない
+/// 場合は [`Profile::open`] 側の検証に委ねる。unix 以外では何もしない。
+fn reject_shared_existing_dir(root: &Path) -> Result<(), ProfileError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::symlink_metadata(root)
+            && meta.is_dir()
+            && meta.mode() & 0o5077 != 0
+        {
+            return Err(ProfileError::InvalidLayout {
+                path: root.to_path_buf(),
+                reason: "explicit profile root must not be an existing shared directory",
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+    Ok(())
+}
+
+/// `..` を字句的に畳み込んだ結果が OS のルート（`/`・`C:\\` などのドライブルート・
+/// UNC 共有ルート）を指すかを返す（`PROF-1`）。
+///
+/// [`ExplicitStore::new`] が、[`Profile::open`] による `fchmod(0700)` やファイル作成が
+/// OS ルートへ及ぶのを副作用の前に防ぐために使う。`std::path::absolute` は `..` を
+/// 畳み込まないため、`/a/..` のような指定もここで検出する。
+fn is_filesystem_root(path: &Path) -> bool {
+    let mut normal_depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => normal_depth += 1,
+            // ルート直上の `..` はルートに留まる（OS の解決規則と同じ）。
+            Component::ParentDir => normal_depth = normal_depth.saturating_sub(1),
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+        }
+    }
+    normal_depth == 0
+}
+
+/// 明示指定 > 既定（既定は型パラメータ `D`。通常 [`OsDefaultStore`]）の優先順位で
+/// ルートを解決する [`ProfileStore`]（`PROF-1`・`XOS-7`、TASK-60（60.4）・#203）。
+///
+/// `fandhe-browser-cli`（TASK-41 で追加予定）が `Box<dyn ProfileStore>` として保持する
+/// 想定（`'static` なら dyn 化できる。enum 分岐にはしない）。明示指定があるときは
+/// 既定側の `resolve_root` を呼ばないため、`HOME` 等が使えない環境
+/// （`DefaultRootUnavailable`）でも明示指定だけで動く。明示指定がなく既定も解決
+/// できなければ、暗黙の代替先へ落とさずそのエラーを返す。
+/// [`ProfileStore::delete`] は既定実装のまま（#188）。
+#[derive(Debug, Clone)]
+pub struct OverridableStore<D = OsDefaultStore> {
+    explicit: Option<ExplicitStore>,
+    default: D,
+}
+
+impl OverridableStore<OsDefaultStore> {
+    /// 明示指定がなければ OS 既定（[`OsDefaultStore`]）を使うストアを作る。
+    pub fn new(explicit: Option<ExplicitStore>) -> Self {
+        Self::with_default(explicit, OsDefaultStore::new())
+    }
+}
+
+impl<D: ProfileStore> OverridableStore<D> {
+    /// 既定側のストアを差し替えて作る（テストや将来の既定解決の差し替え用）。
+    pub fn with_default(explicit: Option<ExplicitStore>, default: D) -> Self {
+        Self { explicit, default }
+    }
+}
+
+impl<D: ProfileStore> ProfileStore for OverridableStore<D> {
+    fn resolve_root(&self) -> Result<ResolvedRoot, ProfileError> {
+        match &self.explicit {
+            Some(explicit) => explicit.resolve_root(),
+            None => self.default.resolve_root(),
+        }
+    }
+
+    /// 明示指定があれば [`ExplicitStore::open_or_create`]（fd 基準の共有ディレクトリ
+    /// 拒否つき）、なければ既定側の `open_or_create` に委譲する。
+    fn open_or_create(&self) -> Result<Profile, ProfileError> {
+        match &self.explicit {
+            Some(explicit) => explicit.open_or_create(),
+            None => self.default.open_or_create(),
+        }
     }
 }
 
@@ -656,5 +863,329 @@ mod tests {
         let root = canonicalize_base(&base).join(tail);
         assert_eq!(root, real.join("fandhe-browser"));
         assert!(Profile::open(&root).is_ok());
+    }
+
+    /// 常に失敗する既定ストア（明示指定時に参照されないことの確認用）。
+    struct FailingDefault;
+
+    impl ProfileStore for FailingDefault {
+        fn resolve_root(&self) -> Result<ResolvedRoot, ProfileError> {
+            Err(ProfileError::DefaultRootUnavailable {
+                reason: "test default must not be consulted",
+            })
+        }
+    }
+
+    /// 呼び出し回数を数える既定ストア。
+    struct CountingDefault {
+        calls: std::cell::Cell<usize>,
+        root: PathBuf,
+    }
+
+    impl CountingDefault {
+        fn new(root: PathBuf) -> Self {
+            Self {
+                calls: std::cell::Cell::new(0),
+                root,
+            }
+        }
+    }
+
+    impl ProfileStore for CountingDefault {
+        fn resolve_root(&self) -> Result<ResolvedRoot, ProfileError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(ResolvedRoot::new(self.root.clone(), RootSource::OsDefault))
+        }
+    }
+
+    /// PROF-1: 明示指定は既定解決より優先され、既定側は呼ばれない。
+    #[test]
+    fn prof_1_explicit_root_overrides_default() {
+        let explicit_root = abs("explicit-root");
+        let store = OverridableStore::with_default(
+            Some(ExplicitStore::new(explicit_root.clone()).unwrap()),
+            CountingDefault::new(abs("default-root")),
+        );
+        let resolved = store.resolve_root().unwrap();
+        assert_eq!(resolved.path(), explicit_root.as_path());
+        assert_eq!(resolved.source(), RootSource::Explicit);
+        assert_eq!(store.default.calls.get(), 0);
+
+        // 既定が解決不能でも明示指定だけで成功する。
+        let failing = OverridableStore::with_default(
+            Some(ExplicitStore::new(explicit_root.clone()).unwrap()),
+            FailingDefault,
+        );
+        assert_eq!(
+            failing.resolve_root().unwrap().path(),
+            explicit_root.as_path()
+        );
+    }
+
+    /// XOS-7: 明示指定がなければ既定側の結果がそのまま返る。
+    #[test]
+    fn xos_7_falls_back_to_default_without_explicit() {
+        let default_root = abs("default-root");
+        let store =
+            OverridableStore::with_default(None, CountingDefault::new(default_root.clone()));
+        let resolved = store.resolve_root().unwrap();
+        assert_eq!(resolved.path(), default_root.as_path());
+        assert_eq!(resolved.source(), RootSource::OsDefault);
+        assert_eq!(store.default.calls.get(), 1);
+
+        // 既定も解決できなければ暗黙の代替先へ落とさずエラーを返す。
+        let failing = OverridableStore::with_default(None, FailingDefault);
+        assert!(matches!(
+            failing.resolve_root(),
+            Err(ProfileError::DefaultRootUnavailable { .. })
+        ));
+    }
+
+    /// PROF-1: 相対パスは生成時に絶対化され、`resolve_root` が返す値は固定される。
+    #[test]
+    fn prof_1_explicit_relative_path_is_absolutized() {
+        let store = ExplicitStore::new(PathBuf::from("rel").join("profile")).unwrap();
+        let expected = std::env::current_dir().unwrap().join("rel").join("profile");
+        assert_eq!(store.root(), expected.as_path());
+        assert!(store.root().is_absolute());
+        assert_eq!(
+            store.resolve_root().unwrap(),
+            ResolvedRoot::new(expected, RootSource::Explicit)
+        );
+    }
+
+    /// PROF-1: 空パスは拒否される（fail-closed）。
+    #[test]
+    fn prof_1_explicit_empty_path_is_rejected() {
+        match ExplicitStore::new("") {
+            Err(ProfileError::InvalidLayout { reason, .. }) => {
+                assert_eq!(reason, "explicit profile root must not be empty");
+            }
+            other => panic!("expected InvalidLayout, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// PROF-1: OS ルートは `..` 経由の指定も含めて副作用の前に拒否される。
+    #[test]
+    fn prof_1_explicit_filesystem_root_is_rejected() {
+        #[cfg(unix)]
+        let candidates = ["/", "//", "/.", "/..", "/a/..", "/a/b/../..", "/../.."];
+        #[cfg(windows)]
+        let candidates = ["C:\\", "C:/", "C:\\a\\..", "C:\\..", "C:/a/../.."];
+        for candidate in candidates {
+            match ExplicitStore::new(candidate) {
+                Err(ProfileError::InvalidLayout { reason, .. }) => {
+                    assert_eq!(
+                        reason,
+                        "explicit profile root must not be the filesystem root"
+                    );
+                }
+                other => panic!(
+                    "expected InvalidLayout for {candidate:?}, got {:?}",
+                    other.map(|_| ())
+                ),
+            }
+        }
+    }
+
+    /// PROF-1: ルート直下の通常ディレクトリや、`..` を含んでもルート外を指す指定は受け付ける。
+    #[test]
+    #[cfg(unix)]
+    fn prof_1_explicit_non_root_paths_are_accepted() {
+        for (candidate, expected) in [
+            ("/a", "/a"),
+            ("/a/b/..", "/a"),
+            ("/a/../b", "/b"),
+            ("/tmp/new-dir/../profile", "/tmp/profile"),
+            ("/a/./b", "/a/b"),
+        ] {
+            let store = ExplicitStore::new(candidate).unwrap();
+            assert_eq!(store.root(), Path::new(expected));
+        }
+    }
+
+    /// PROF-1: `..` を含む明示パスでも、最終ルートの外に途中要素が作成される前に畳み込まれる。
+    /// `Profile::open` は unix のみ対応（Windows は XOS-7..10 で未実装）のため unix に限る。
+    #[test]
+    #[cfg(unix)]
+    fn prof_1_explicit_dotdot_creates_nothing_outside_final_root() {
+        let tmp = TempDir::new();
+        // macOS の `/var` などの symlink を Profile::open が拒否するため実体化する。
+        std::fs::create_dir_all(&tmp.0).unwrap();
+        let base = std::fs::canonicalize(&tmp.0).unwrap();
+        let raw = base.join("new-dir").join("..").join("profile");
+        let store = ExplicitStore::new(raw).unwrap();
+        assert_eq!(store.root(), base.join("profile").as_path());
+        let profile = Profile::open(store.root()).unwrap();
+        assert!(base.join("profile").is_dir());
+        assert!(!base.join("new-dir").exists());
+        drop(profile);
+    }
+
+    /// PROF-1・PROF-4: 既存 symlink の直後の `..` は字句的畳み込みと OS 解決が食い違うため拒否する。
+    #[test]
+    #[cfg(unix)]
+    fn prof_1_explicit_dotdot_after_symlink_is_rejected() {
+        let tmp = TempDir::new();
+        std::fs::create_dir_all(&tmp.0).unwrap();
+        let base = std::fs::canonicalize(&tmp.0).unwrap();
+        std::fs::create_dir_all(base.join("real").join("deep")).unwrap();
+        std::os::unix::fs::symlink(base.join("real").join("deep"), base.join("link")).unwrap();
+        let raw = base.join("link").join("..").join("profile");
+        match ExplicitStore::new(raw) {
+            Err(ProfileError::InvalidLayout { reason, .. }) => {
+                assert_eq!(
+                    reason,
+                    "explicit profile root must not use '..' after a symlink"
+                );
+            }
+            other => panic!("expected InvalidLayout, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// PROF-1: sticky bit 付きの共有ディレクトリ（`/tmp` 相当）は専用ルートとして拒否する。
+    #[test]
+    #[cfg(unix)]
+    fn prof_1_explicit_shared_existing_dir_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new();
+        let shared = tmp.0.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        match ExplicitStore::new(shared.clone()) {
+            Err(ProfileError::InvalidLayout { reason, .. }) => {
+                assert_eq!(
+                    reason,
+                    "explicit profile root must not be an existing shared directory"
+                );
+            }
+            other => panic!("expected InvalidLayout, got {:?}", other.map(|_| ())),
+        }
+        // 専用の子ディレクトリは受け付ける。
+        assert!(ExplicitStore::new(shared.join("profile")).is_ok());
+    }
+
+    /// PROF-1: 親から setgid が継承された 0700 ディレクトリ（mode 02700）は専用ルートとして受け付ける。
+    #[test]
+    #[cfg(unix)]
+    fn prof_1_explicit_setgid_only_dir_is_accepted() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new();
+        let dir = tmp.0.join("setgid-root");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2700)).unwrap();
+        assert!(ExplicitStore::new(dir).is_ok());
+    }
+
+    /// PROF-1: group 書込可（0770）の既存ディレクトリも共有とみなして拒否する。
+    #[test]
+    #[cfg(unix)]
+    fn prof_1_explicit_group_writable_dir_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new();
+        let shared = tmp.0.join("group-shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+        match ExplicitStore::new(shared.clone()) {
+            Err(ProfileError::InvalidLayout { reason, .. }) => {
+                assert_eq!(
+                    reason,
+                    "explicit profile root must not be an existing shared directory"
+                );
+            }
+            other => panic!("expected InvalidLayout, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// PROF-1: 他者が読み取り・通過できる 0755 の既存ディレクトリも拒否し、
+    /// `fchmod(0700)` で他利用者の権限を奪わない。
+    #[test]
+    #[cfg(unix)]
+    fn prof_1_explicit_world_readable_dir_is_rejected_and_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new();
+        let shared = tmp.0.join("world-readable");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match ExplicitStore::new(shared.clone()) {
+            Err(ProfileError::InvalidLayout { reason, .. }) => {
+                assert_eq!(
+                    reason,
+                    "explicit profile root must not be an existing shared directory"
+                );
+            }
+            other => panic!("expected InvalidLayout, got {:?}", other.map(|_| ())),
+        }
+        let mode = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o755);
+    }
+
+    /// PROF-1: `new` の後に共有形へ変わったルートも、`open_or_create` が開いた fd の
+    /// `fstat` で拒否し、`fchmod(0700)` で権限を奪わない。
+    #[test]
+    #[cfg(unix)]
+    fn prof_1_open_or_create_rejects_shared_root_by_fd() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new();
+        let root = tmp.0.join("late-shared");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = ExplicitStore::new(root.clone()).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap();
+        match store.open_or_create() {
+            Err(ProfileError::InvalidLayout { reason, .. }) => {
+                assert_eq!(
+                    reason,
+                    "explicit profile root must not be an existing shared directory"
+                );
+            }
+            other => panic!("expected InvalidLayout, got {:?}", other.map(|_| ())),
+        }
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o770);
+    }
+
+    /// PROF-1: `OverridableStore` は dyn 互換で明示パスを返す。
+    #[test]
+    fn prof_1_overridable_store_is_dyn_compatible() {
+        let root = abs("explicit-dyn");
+        let store: Box<dyn ProfileStore> = Box::new(OverridableStore::new(Some(
+            ExplicitStore::new(root.clone()).unwrap(),
+        )));
+        let resolved = store.resolve_root().unwrap();
+        assert_eq!(resolved.path(), root.as_path());
+        assert_eq!(resolved.source(), RootSource::Explicit);
+    }
+
+    /// PROF-1: `open_or_create` は明示ルートだけを作成し、既定側は作らない。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_open_or_create_uses_explicit_root_only() {
+        let tmp = TempDir::new();
+        let explicit = tmp.0.join("explicit");
+        let default = tmp.0.join("default");
+        let store = OverridableStore::with_default(
+            Some(ExplicitStore::new(explicit.clone()).unwrap()),
+            FixedStore {
+                resolved: ResolvedRoot::new(default.clone(), RootSource::OsDefault),
+            },
+        );
+        let profile = store.open_or_create().unwrap();
+        assert_eq!(profile.root(), explicit.as_path());
+        assert!(explicit.is_dir());
+        assert!(!default.exists());
+    }
+
+    /// PROF-1: Windows では明示ストアでも既存の fail-closed（`Unsupported`）を伝える。
+    #[cfg(not(unix))]
+    #[test]
+    fn prof_1_explicit_open_or_create_is_unsupported_on_windows() {
+        let root = std::env::temp_dir().join("fandhe-store-win-explicit");
+        let store = ExplicitStore::new(root.clone()).unwrap();
+        assert!(matches!(
+            store.open_or_create(),
+            Err(ProfileError::Unsupported { .. })
+        ));
+        assert!(!root.exists());
     }
 }

@@ -39,7 +39,8 @@
 //! - `ProfileStore::delete`（`PROF-5`）から `Profile::delete` への接続。
 //!   `store.rs` の `ProfileStore`（`XOS-7`・TASK-60（60.2）・#201）と OS 慣習の
 //!   既定パス解決 `OsDefaultStore`（TASK-60（60.3）・#202）は実装済み。明示指定
-//!   による上書きは #203。`Profile::delete` は `self` を消費するが
+//!   による上書き `ExplicitStore`・`OverridableStore`（`PROF-1`、TASK-60（60.4）・
+//!   #203）も実装済み。`Profile::delete` は `self` を消費するが
 //!   `ProfileStore::delete` は `&Profile` を取るため、トレイト契約の見直しが
 //!   要る（既定実装は `Unsupported` を返す）
 //! - Windows での ACL によるアクセス制限（`XOS-7`〜`XOS-10`。Unix の
@@ -55,4 +56,7 @@ mod lock;
 pub use profile::{
     DataKind, Profile, ProfileError, SafeComponent, assert_within_root, sanitize_component,
 };
-pub use store::{APP_DIR_NAME, OsDefaultStore, ProfileStore, ResolvedRoot, RootSource};
+pub use store::{
+    APP_DIR_NAME, ExplicitStore, OsDefaultStore, OverridableStore, ProfileStore, ResolvedRoot,
+    RootSource,
+};
