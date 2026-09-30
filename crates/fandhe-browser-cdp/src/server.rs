@@ -7,16 +7,20 @@
 //!
 //! # スタブについて
 //!
-//! `/json/*` ルータ（TASK-41.3）と `/devtools/browser/{id}` 受け口（TASK-41.4）は
-//! 後続タスクで本ファイルに追加する（REPAIR-3）。初期ターゲット（`about:blank`）の
-//! 自動作成は行わず、後続タスクの判断に委ねる。
+//! `/json/*` ルータ（[`router`]。TASK-41.3）は実装済み。`/devtools/browser/{id}` 受け口
+//! （TASK-41.4）は後続タスクで [`router`] へ追加する（REPAIR-3）。初期ターゲット
+//! （`about:blank`）の自動作成は行わず、後続タスクの判断に委ねる。
 
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use fandhe_backend_http::request::RequestHead;
+use fandhe_backend_http::response::Response;
+use fandhe_backend_routes::Router;
 use fandhe_browser_core::AppState;
 
+use crate::discovery::{self, Authority, HostError};
 use crate::target::{BrowserId, TargetRegistry};
 
 /// `CdpState::new` が払い出すブラウザ ID 用のプロセス内連番。
@@ -71,6 +75,71 @@ impl fmt::Debug for CdpState {
             .field("targets", &self.registry.target_count())
             .field("sessions", &self.registry.session_count())
             .finish()
+    }
+}
+
+/// JSON 応答の `Content-Type`（Chromium 互換）。
+const JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
+
+/// CDP ディスカバリ用の HTTP ルータ（`GET /json/version`・`GET /json/list`・`GET /json`。
+/// `CDP-1`・TASK-41.3・MS-3）。
+///
+/// Playwright の `connectOverCDP`・Puppeteer が接続前に叩くエンドポイントを提供する。
+/// `/json` は `/json/list` の互換エイリアス。Host ヘッダは localhost / IP リテラルのみ許可し
+/// （DNS rebinding 対策。[`crate::discovery`]）、違反は 400 / 403 を返す。
+///
+/// TASK-41.4（`/devtools/browser/{id}` の WS 受け口）が同じ関数へルートを追加し、cli
+/// （TASK-41.5）が `Router::merge` で AI API のルータと合成する。本関数は bind・アクセス
+/// 制御（loopback 限定。`SEC-4`）を行わない。WS 受け口が未実装のため `/json/version` は
+/// `webSocketDebuggerUrl` を返さない（TASK-41.4 で受け口と同時に追加。REPAIR-3）。
+pub fn router(state: Arc<CdpState>) -> Router {
+    let list_state = Arc::clone(&state);
+    let json_state = state;
+    Router::new()
+        .route("GET", "/json/version", move |head, _| {
+            version_response(head)
+        })
+        .route("GET", "/json/list", move |head, _| {
+            list_response(&list_state, head)
+        })
+        .route("GET", "/json", move |head, _| {
+            list_response(&json_state, head)
+        })
+}
+
+/// `/json/version` の応答を作る。
+fn version_response(head: &RequestHead) -> Response {
+    if let Err(e) = Authority::from_host_header(head.header("host")) {
+        return host_error_response(e);
+    }
+    json_response(discovery::version_body())
+}
+
+/// `/json/list`・`/json` の応答を作る。authority は使わないが、version と同じく
+/// 不正な Host を持つ（DNS rebinding 経由の）リクエストにはターゲット一覧も渡さない。
+fn list_response(state: &CdpState, head: &RequestHead) -> Response {
+    if let Err(e) = Authority::from_host_header(head.header("host")) {
+        return host_error_response(e);
+    }
+    json_response(discovery::list_body(&state.registry().targets()))
+}
+
+/// Host 検証エラーを 400 / 403 へ写像する。本体は入力値を含まない固定文言。
+fn host_error_response(e: HostError) -> Response {
+    let status = match e {
+        HostError::NotAllowed => 403,
+        _ => 400,
+    };
+    let body = format!("{{\"error\":\"{e}\"}}").into_bytes();
+    Response::new(status, body).with_content_type(JSON_CONTENT_TYPE)
+}
+
+/// シリアライズ結果を 200 の JSON 応答にする。失敗時は panic せず 500 を返す。
+fn json_response(body: Result<Vec<u8>, serde_json::Error>) -> Response {
+    match body {
+        Ok(b) => Response::new(200, b).with_content_type(JSON_CONTENT_TYPE),
+        Err(_) => Response::new(500, br#"{"error":"internal error"}"#.to_vec())
+            .with_content_type(JSON_CONTENT_TYPE),
     }
 }
 

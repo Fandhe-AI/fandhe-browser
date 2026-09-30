@@ -7,18 +7,20 @@
 //!
 //! # スタブについて
 //!
-//! 状態型（CDP セッション・ターゲット表。`CDP-1`、TASK-41.2）は実装済み。
+//! 状態型（CDP セッション・ターゲット表。`CDP-1`、TASK-41.2）と `/json/*`
+//! ルータ（[`server::router`]。`CDP-1`、TASK-41.3）は実装済み。
 //! 以下は未実装で、実装済みを装う公開 API・ダミー実装は置かない
 //! （`code-comment-style.md`・REPAIR-3）。
 //!
-//! - `/json/*` ルータ（TASK-41.3）・`/devtools/browser/{id}` 受け口（TASK-41.4）
+//! - `/devtools/browser/{id}` 受け口（TASK-41.4）
 //! - CDP メソッドのハンドラ（`CDP-1`/`CDP-5`/`CDP-6`/`CDP-7`、`TASK-42`、`MS-4`）
 //! - cli での組み立て・起動（TASK-41.5。`CDP-7`/`AISNAP-6`/`SEC-4`、`MS-3`）
 
+mod discovery;
 pub mod server;
 pub mod target;
 
-pub use server::CdpState;
+pub use server::{CdpState, router};
 pub use target::{
     BrowserId, CdpStateError, MAX_SESSIONS, MAX_TARGETS, SessionId, TargetId, TargetInfo,
     TargetKind, TargetRegistry,

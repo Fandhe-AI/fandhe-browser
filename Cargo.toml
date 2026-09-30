@@ -141,6 +141,16 @@ toml = { version = "=1.1.6" }
 # 上記の `=1.1.6` は #213 で承認された `toml = "=1.1.6+spec-1.1.0"` と
 # 同一クレート（`toml-1.1.6+spec-1.1.0`）に解決される。
 
+# TASK-41.3（Issue #172・CDP-1・MS-3）: cdp crate の HTTP ルータ（`/json/*`）と
+# JSON 応答の生成に使う。`fandhe-backend-http`・`fandhe-backend-routes` は Issue #171
+# でユーザー承認済み（2026-09-29 に 0.4.2 へ更新）、`serde_json` は Issue #419 で
+# 承認済み。ライセンスはいずれも MIT OR Apache-2.0。配置は `fandhe-browser-cdp` のみ。
+# `fandhe-backend-core`（サーバー本体・WebSocket feature）は WS 受け口を実装する
+# TASK-41.4（Issue #173）で追加する。
+fandhe-backend-http = { version = "=0.4.2" }
+fandhe-backend-routes = { version = "=0.4.2" }
+serde_json = { version = "=1.0.151" }
+
 [profile.release]
 # release ビルドは panic 発生時に unwind せず即座に中断する前提
 # （coding-rust.md「release は panic = "abort" 前提のため catch_unwind に頼らない」）。
