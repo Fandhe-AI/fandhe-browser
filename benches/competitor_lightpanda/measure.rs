@@ -61,11 +61,12 @@ use crate::support::{
 // （TASK-84.2・TASK-84.5・PERF-6・Issue #212）。
 #[cfg(unix)]
 use crate::support::parse_pgrep_pids;
-// Linux 版 `lookup_port_owner_pids` の `/proc` 解析部（TASK-84.6.2・#560）。
+// macOS 版 `lookup_port_owner_pids` の `lsof` 出力解析部（TASK-84.6.3・#561）。
 #[cfg(target_os = "macos")]
 use crate::support::parse_lsof_listen_pids;
 #[cfg(windows)]
 use crate::support::parse_tasklist_mem_kb;
+// Linux 版 `lookup_port_owner_pids` の `/proc` 解析部（TASK-84.6.2・#560）。
 #[cfg(target_os = "linux")]
 use crate::support::{parse_socket_link_inode, proc_net_tcp_listen_inode};
 
@@ -672,7 +673,7 @@ pub(crate) enum PortOwnerVerdict {
 /// は置き換えず併用する: 本関数が未対応の OS での唯一の防御になり、確認後に
 /// 割り込んだプロセスや居残りも事後確認が検出する。
 ///
-/// Linux（#560）・macOS（#561）は実装済み。外部コマンドを使う OS 別実装（macOS #561・Windows #562）は、
+/// Linux（#560）・macOS（#561）は実装済み。外部コマンドを使う OS 別実装（macOS 版・今後の Windows #562）は、
 /// `Command::new` と分割済みの固定引数だけを使いシェルを通さない・出力バイト数/行数/PID 数を上限で縛る・
 /// `get()` と checked 演算を使い `[]`/`unwrap` を使わない・
 /// `run_with_deadline`/`EXTERNAL_COMMAND_DEADLINE` で期限を付ける、を守る。
@@ -714,7 +715,7 @@ const MAX_LSOF_OUTPUT_BYTES: usize = 16 * 1024;
 #[cfg(target_os = "macos")]
 const MAX_PORT_OWNER_PIDS: usize = 64;
 
-/// macOS 版（TASK-84.6.3・#561。`PERF-3`/`PERF-6`）: `lsof -nP -iTCP:<port>
+/// macOS 版（TASK-84.6.3・#561。`PERF-3`/`PERF-6`）: `lsof -nP -w -iTCP:<port>
 /// -sTCP:LISTEN -Fpn` で LISTEN 所有 PID を照会する。[`check_port_owner`]
 /// から readiness 成功時に呼ばれ、出力は support の
 /// [`parse_lsof_listen_pids`] が解析する。
