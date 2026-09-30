@@ -3,7 +3,7 @@
 //! （`JS-1`・TASK-29（29.2）・MS-3・Issue #153）。
 //!
 //! 呼び出し元（将来）: [`super::engine_trait::create_engine`] の
-//! `EngineKind::V8` 分岐（TASK-29.6/29.7 で配線する。§スタブについて）。
+//! `EngineKind::V8` 分岐（TASK-29.6.2・Issue #548 で配線する。§スタブについて）。
 //! 上位 crate（core・TASK-30）は [`super::engine_trait::JsEngine`]
 //! トレイト越しにだけ使い、本モジュールの型を直接見ない
 //! （`pub` を付けず crate 内に閉じる。AC-2）。
@@ -22,7 +22,7 @@
 //! Issue #526）を実装済みである。以下は未実装（実装済みを装わない。
 //! REPAIR-3）。
 //!
-//! - [`super::engine_trait::JsEngine`] トレイトへの集約（`TASK-29.6`）。
+//! - [`super::engine_trait::JsEngine`] トレイトへの集約（`TASK-29.6.2`・Issue #548）。
 //!   本モジュールは同トレイトと同じシグネチャの inherent メソッドとして
 //!   `evaluate_script` を提供するに留め、`impl JsEngine for V8Engine` は
 //!   まだ書かない（29.4「グローバル関数注入」・29.5「DOM 風バインディング」
@@ -43,14 +43,31 @@
 //!
 //! 引き続き未実装:
 //!
-//! - `create_engine`（`engine_trait.rs`）への配線（`TASK-29.6`・`29.7`）。
+//! - `create_engine`（`engine_trait.rs`）への配線（`TASK-29.6.2`・Issue #548）。
 //!   配線すると `tests/conformance.rs` の同梱エンジン向けコンフォーマンス
 //!   テスト（注入・バインディングの契約検証を含む）が V8 に対しても走る
 //!   ため、29.5 の完了を待つ
-//! - `v8` 由来のエラーを共通エラー型へ変換する仕組み（`TASK-29.6`）
 //! - 実行時間・入力サイズ・結果サイズ・ヒープサイズの上限値を呼び出し側
 //!   から調整する経路（[`super::engine_trait::EvaluateOptions`] の拡張。
 //!   `TASK-30`（`MS-3`）で扱う。現状は本モジュールの定数で固定値を使う）
+//!
+//! # エラー変換（`JS-1`・`TASK-29.6.1`・Issue #547）
+//!
+//! V8 の API 由来の失敗は非公開の `V8Failure` に分類し、共通エラー型
+//! [`JsEngineError`] への変換を `impl From<V8Failure> for JsEngineError` の
+//! 1 か所に集約している。V8 を呼ぶ前の自前検証（長さ・件数の上限）は
+//! `V8Failure` を経由せず [`JsEngineError`] を直接構築する。エラーが
+//! 子プロセスから親へ届くまでの全体対応表は次のとおり。
+//!
+//! | V8 側の失敗（`V8Failure`） | 子側 [`JsEngineError`] | ワイヤ `ErrorKind` | 親側 [`JsEngineError`] |
+//! | --- | --- | --- | --- |
+//! | `IsolateAlreadyActive` / `ContextSetup` / `BindingSetup` | `BindingFailed` | `Binding` | `BindingFailed` |
+//! | `Allocation` / `Threw` / `ResultConversion` | `EvaluationFailed` | `Evaluation` | `EvaluationFailed` |
+//! | `Terminated` | `Timeout` | `Timeout` | `Timeout`（接頭辞付き） |
+//! | `NativeCallFatal` | `EngineUnavailable` | `Evaluation`（畳まれる） | `EvaluationFailed` |
+//!
+//! ワイヤ変換は `super::worker` の `classify_evaluation_error`、親側の逆変換は
+//! `super::process_engine::error_frame_to_js_engine_error`。
 //!
 //! # プロセス全体の初期化について
 //!
@@ -495,6 +512,62 @@ impl std::fmt::Display for IsolateAlreadyActiveOnThread {
 
 impl std::error::Error for IsolateAlreadyActiveOnThread {}
 
+/// V8（`v8` crate）の API 呼び出し由来の失敗を分類する非公開の中間型
+/// （`JS-1`・`TASK-29.6.1`・Issue #547）。
+///
+/// 役割: 「V8 で何が起きたか」をこのモジュール内で 1 か所に分類し、
+/// [`JsEngineError`]（トレイト共通のエラー型）への変換を
+/// `impl From<V8Failure> for JsEngineError` の 1 か所へ集約する。
+/// `pub(crate)` の入口（[`V8Engine`] のメソッド）は `?` / `.into()` で
+/// [`JsEngineError`] へ変換して返すため、この型は crate の外にも他モジュール
+/// にも見えない（`v8` 由来の詳細を上位 crate へ漏らさない。coding-rust.md）。
+///
+/// V8 を呼ぶ前の自前検証（スクリプト長・名前長・件数の上限）は V8 の失敗
+/// ではないため本型を経由せず、従来どおり [`JsEngineError`] を直接構築する。
+/// 変換後の variant とメッセージは変更前と同一（refactor。挙動不変）。
+/// ワイヤ・親側までの全体対応表はモジュール doc「エラー変換」節を参照。
+#[derive(Debug)]
+enum V8Failure {
+    /// 同一スレッドでの Isolate 二重生成（[`V8_ISOLATE_ACTIVE`]）。
+    IsolateAlreadyActive(IsolateAlreadyActiveOnThread),
+    /// Context 生成時の WebAssembly 無効化失敗（fail-closed で起動しない）。
+    ContextSetup(String),
+    /// グローバルへのネイティブプロキシ登録における V8 API の失敗。
+    BindingSetup(String),
+    /// スクリプトソース文字列の確保失敗。
+    Allocation(String),
+    /// コンパイル失敗・実行時例外（切り詰め済みメッセージ）。
+    Threw(String),
+    /// watchdog 等による打ち切り。`stage` は `"compilation"` / `"execution"`。
+    Terminated { stage: &'static str },
+    /// 評価結果の V8 値から [`JsValue`] への変換失敗。
+    ResultConversion(String),
+    /// 逆方向 RPC の fatal 記録済み（Context は破棄済み。以後の評価を拒否する）。
+    NativeCallFatal(String),
+}
+
+impl From<V8Failure> for JsEngineError {
+    fn from(failure: V8Failure) -> Self {
+        match failure {
+            V8Failure::IsolateAlreadyActive(err) => JsEngineError::BindingFailed(err.to_string()),
+            V8Failure::ContextSetup(message) | V8Failure::BindingSetup(message) => {
+                JsEngineError::BindingFailed(message)
+            }
+            V8Failure::Allocation(message)
+            | V8Failure::Threw(message)
+            | V8Failure::ResultConversion(message) => JsEngineError::EvaluationFailed(message),
+            V8Failure::Terminated { stage } => JsEngineError::Timeout(format!(
+                "script {stage} exceeded the {} second timeout and was terminated",
+                SCRIPT_EXECUTION_TIMEOUT.as_secs_f64()
+            )),
+            V8Failure::NativeCallFatal(message) => JsEngineError::EngineUnavailable(format!(
+                "a previous native call ended the worker protocol connection; \
+                 context was discarded: {message}"
+            )),
+        }
+    }
+}
+
 impl V8Engine {
     /// V8 の初期化（[`ensure_v8_initialized`]）を確実に行ったうえで、
     /// 新しい Isolate を生成する。
@@ -550,9 +623,7 @@ impl V8Engine {
             }
         });
         if !acquired {
-            return Err(JsEngineError::BindingFailed(
-                IsolateAlreadyActiveOnThread.to_string(),
-            ));
+            return Err(V8Failure::IsolateAlreadyActive(IsolateAlreadyActiveOnThread).into());
         }
         let create_params = v8::CreateParams::default()
             .heap_limits(0, heap_limit_bytes)
@@ -615,11 +686,12 @@ impl V8Engine {
             let scope = &mut v8::ContextScope::new(&mut scope, context);
             let global = context.global(scope);
             let Some(key) = v8::String::new(scope, "WebAssembly") else {
-                return Err(JsEngineError::BindingFailed(
+                return Err(V8Failure::ContextSetup(
                     "failed to allocate the \"WebAssembly\" property key string while \
                      disabling WebAssembly"
                         .to_string(),
-                ));
+                )
+                .into());
             };
             let key: v8::Local<v8::Value> = key.into();
             let undefined: v8::Local<v8::Value> = v8::undefined(scope).into();
@@ -635,11 +707,12 @@ impl V8Engine {
             // 備える）のいずれでも、無効化に失敗したとみなし fail-closed
             // にする。
             if global.set(scope, key, undefined) != Some(true) {
-                return Err(JsEngineError::BindingFailed(
+                return Err(V8Failure::ContextSetup(
                     "failed to overwrite the \"WebAssembly\" global property with undefined \
                      (Object::Set did not report success)"
                         .to_string(),
-                ));
+                )
+                .into());
             }
 
             // 上書きの戻り値だけに頼らず、実際に読み出して `undefined` に
@@ -649,11 +722,12 @@ impl V8Engine {
             match global.get(scope, key) {
                 Some(value) if value.is_undefined() => {}
                 other => {
-                    return Err(JsEngineError::BindingFailed(format!(
+                    return Err(V8Failure::ContextSetup(format!(
                         "\"WebAssembly\" global property is not undefined after the overwrite \
                          (read back: {other:?}); refusing to start the isolate with \
                          WebAssembly potentially still reachable"
-                    )));
+                    ))
+                    .into());
                 }
             }
         }
@@ -761,10 +835,7 @@ impl V8Engine {
             .get_slot::<NativeCallBridge>()
             .and_then(|bridge| bridge.fatal.clone())
         {
-            return Err(JsEngineError::EngineUnavailable(format!(
-                "a previous native call ended the worker protocol connection; \
-                 context was discarded: {message}"
-            )));
+            return Err(V8Failure::NativeCallFatal(message).into());
         }
 
         Self::evaluate_in_isolate(&mut self.isolate, &self.context, script, options)
@@ -844,23 +915,26 @@ impl V8Engine {
         let scope = &mut v8::ContextScope::new(&mut scope, context);
 
         let Some(function) = new_native_proxy_function(scope, id) else {
-            return Err(JsEngineError::BindingFailed(
+            return Err(V8Failure::BindingSetup(
                 "failed to create the native proxy function".to_string(),
-            ));
+            )
+            .into());
         };
         let Some(key) = v8::String::new(scope, name) else {
-            return Err(JsEngineError::BindingFailed(
+            return Err(V8Failure::BindingSetup(
                 "failed to allocate the native proxy function name string".to_string(),
-            ));
+            )
+            .into());
         };
         let global = context.global(scope);
         let key: v8::Local<v8::Name> = key.into();
         let value: v8::Local<v8::Value> = function.into();
         if global.create_data_property(scope, key, value) != Some(true) {
-            return Err(JsEngineError::BindingFailed(format!(
+            return Err(V8Failure::BindingSetup(format!(
                 "failed to register the native proxy function {name:?} on the global object \
                  (Object::CreateDataProperty did not report success)"
-            )));
+            ))
+            .into());
         }
         Ok(())
     }
@@ -897,7 +971,10 @@ impl V8Engine {
         &mut self,
         binding: &worker_protocol::DomLikeObjectBinding,
     ) -> Result<(), JsEngineError> {
+        // V8 を呼ぶ前の自前検証は従来どおり直接構築、V8 API の失敗は
+        // [`V8Failure`] を経由する（`TASK-29.6.1`）。
         let fail = |msg: String| JsEngineError::BindingFailed(msg);
+        let v8_fail = |msg: String| JsEngineError::from(V8Failure::BindingSetup(msg));
         // 外部入力（親からのフレーム）の多層防御としての再検証。
         if binding.name.is_empty() {
             return Err(fail("DOM-like object name must not be empty".to_string()));
@@ -934,12 +1011,12 @@ impl V8Engine {
         let object = v8::Object::new(scope);
         for member in &binding.members {
             let Some(function) = new_native_proxy_function(scope, member.native_call_id) else {
-                return Err(fail(
+                return Err(v8_fail(
                     "failed to create a DOM-like member proxy function".to_string(),
                 ));
             };
             let Some(key) = v8::String::new(scope, &member.name) else {
-                return Err(fail(
+                return Err(v8_fail(
                     "failed to allocate a DOM-like member name string".to_string(),
                 ));
             };
@@ -959,7 +1036,7 @@ impl V8Engine {
                 }
             };
             if defined != Some(true) {
-                return Err(fail(format!(
+                return Err(v8_fail(format!(
                     "failed to define the DOM-like member {:?} (the property definition did \
                      not report success)",
                     member.name
@@ -968,7 +1045,7 @@ impl V8Engine {
         }
 
         let Some(name_key) = v8::String::new(scope, &binding.name) else {
-            return Err(fail(
+            return Err(v8_fail(
                 "failed to allocate the DOM-like object name string".to_string(),
             ));
         };
@@ -976,7 +1053,7 @@ impl V8Engine {
         let name_key: v8::Local<v8::Name> = name_key.into();
         let value: v8::Local<v8::Value> = object.into();
         if global.create_data_property(scope, name_key, value) != Some(true) {
-            return Err(fail(format!(
+            return Err(v8_fail(format!(
                 "failed to register the DOM-like object {:?} on the global object \
                  (Object::CreateDataProperty did not report success)",
                 binding.name
@@ -1134,21 +1211,11 @@ impl V8Engine {
             Some(source) => source,
             None => {
                 finish_watchdog(done_tx, watchdog);
-                return Err(JsEngineError::EvaluationFailed(
+                return Err(V8Failure::Allocation(
                     "failed to allocate script source string".to_string(),
-                ));
+                )
+                .into());
             }
-        };
-
-        // 打ち切り済みかどうかに応じたタイムアウトメッセージを組み立てる。
-        // `stage`（"compilation"/"execution"）でどちらの段階の打ち切りかを
-        // 呼び出し側・テストが判別できるようにする（PR #503 レビュー
-        // 指摘 P1 の回帰テストがこの文言差で判別する）。
-        let timeout_message = |stage: &str| -> String {
-            format!(
-                "script {stage} exceeded the {} second timeout and was terminated",
-                SCRIPT_EXECUTION_TIMEOUT.as_secs_f64()
-            )
         };
 
         let compile_result = v8::Script::compile(&tc, source, None);
@@ -1171,9 +1238,12 @@ impl V8Engine {
                 let message = extract_message();
                 let was_terminated = finish_watchdog(done_tx, watchdog);
                 if was_terminated {
-                    return Err(JsEngineError::Timeout(timeout_message("compilation")));
+                    return Err(V8Failure::Terminated {
+                        stage: "compilation",
+                    }
+                    .into());
                 }
-                return Err(JsEngineError::EvaluationFailed(message));
+                return Err(V8Failure::Threw(message).into());
             }
         };
 
@@ -1191,13 +1261,13 @@ impl V8Engine {
             Some(result) => result,
             None => {
                 if was_terminated {
-                    return Err(JsEngineError::Timeout(timeout_message("execution")));
+                    return Err(V8Failure::Terminated { stage: "execution" }.into());
                 }
                 let message = match message {
                     Some(message) => message,
                     None => "unknown script error".to_string(),
                 };
-                return Err(JsEngineError::EvaluationFailed(message));
+                return Err(V8Failure::Threw(message).into());
             }
         };
 
@@ -1264,9 +1334,10 @@ fn value_to_js_value(
     } else if value.is_number() {
         match value.number_value(scope) {
             Some(number) => Ok(JsValue::Number(number)),
-            None => Err(JsEngineError::EvaluationFailed(
+            None => Err(V8Failure::ResultConversion(
                 "failed to convert V8 number result to f64".to_string(),
-            )),
+            )
+            .into()),
         }
     } else if value.is_string() {
         // codex レビュー指摘 #154 P1: `to_rust_string_lossy` は変換前に
@@ -1276,20 +1347,23 @@ fn value_to_js_value(
         // 切り詰めではなく `Err` にする。security.md「偽装・回避機能の禁止」）。
         match value.to_string(scope) {
             Some(s) if s.length() > MAX_RESULT_STRING_UTF16_UNITS => {
-                Err(JsEngineError::EvaluationFailed(format!(
+                Err(V8Failure::ResultConversion(format!(
                     "string result exceeds the maximum supported length of {MAX_RESULT_STRING_UTF16_UNITS} UTF-16 code units"
-                )))
+                ))
+                .into())
             }
             Some(s) => Ok(JsValue::String(s.to_rust_string_lossy(scope))),
-            None => Err(JsEngineError::EvaluationFailed(
+            None => Err(V8Failure::ResultConversion(
                 "failed to convert V8 string result to a UTF-16 string".to_string(),
-            )),
+            )
+            .into()),
         }
     } else {
         let type_name = value.type_of(scope).to_rust_string_lossy(scope);
-        Err(JsEngineError::EvaluationFailed(format!(
+        Err(V8Failure::ResultConversion(format!(
             "evaluation result of type '{type_name}' is not representable as JsValue"
-        )))
+        ))
+        .into())
     }
 }
 
@@ -2733,5 +2807,65 @@ mod tests {
             engine.install_native_proxy_global("hostAdd", 4),
             Err(JsEngineError::BindingFailed(_))
         ));
+    }
+
+    /// `JsEngineError` は `PartialEq` を持たないため Debug 表現（variant 名と
+    /// メッセージ全体を含む）で等価判定する。
+    fn same_error(actual: JsEngineError, expected: JsEngineError) {
+        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+    }
+
+    /// JS-1・TASK-29.6.1: `V8Failure` から [`JsEngineError`] への変換が、
+    /// 変換前と同じ variant・メッセージになること（唯一の変換点の回帰）。
+    #[test]
+    fn js_1_v8_failure_converts_to_the_expected_js_engine_error() {
+        same_error(
+            JsEngineError::from(V8Failure::IsolateAlreadyActive(
+                IsolateAlreadyActiveOnThread,
+            )),
+            JsEngineError::BindingFailed(IsolateAlreadyActiveOnThread.to_string()),
+        );
+        same_error(
+            JsEngineError::from(V8Failure::ContextSetup("ctx".to_string())),
+            JsEngineError::BindingFailed("ctx".to_string()),
+        );
+        same_error(
+            JsEngineError::from(V8Failure::BindingSetup("bind".to_string())),
+            JsEngineError::BindingFailed("bind".to_string()),
+        );
+        same_error(
+            JsEngineError::from(V8Failure::Allocation("alloc".to_string())),
+            JsEngineError::EvaluationFailed("alloc".to_string()),
+        );
+        same_error(
+            JsEngineError::from(V8Failure::Threw("SyntaxError: x".to_string())),
+            JsEngineError::EvaluationFailed("SyntaxError: x".to_string()),
+        );
+        same_error(
+            JsEngineError::from(V8Failure::ResultConversion("conv".to_string())),
+            JsEngineError::EvaluationFailed("conv".to_string()),
+        );
+        same_error(
+            JsEngineError::from(V8Failure::Terminated { stage: "execution" }),
+            JsEngineError::Timeout(
+                "script execution exceeded the 2 second timeout and was terminated".to_string(),
+            ),
+        );
+        same_error(
+            JsEngineError::from(V8Failure::Terminated {
+                stage: "compilation",
+            }),
+            JsEngineError::Timeout(
+                "script compilation exceeded the 2 second timeout and was terminated".to_string(),
+            ),
+        );
+        same_error(
+            JsEngineError::from(V8Failure::NativeCallFatal("boom".to_string())),
+            JsEngineError::EngineUnavailable(
+                "a previous native call ended the worker protocol connection; \
+                 context was discarded: boom"
+                    .to_string(),
+            ),
+        );
     }
 }

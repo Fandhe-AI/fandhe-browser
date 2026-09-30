@@ -92,6 +92,19 @@ pub enum PaginationKind {
     PageNumber,
 }
 
+impl PaginationKind {
+    /// 優先段での採用順位（小さいほど先に採用。`AISNAP-12`・TASK-16.2）。
+    ///
+    /// 次へ・前へ・最初・最後・もっと見る等の移動リンクは 0、ページ番号は 1。
+    /// 予算が足りないとき、ページ番号が移動リンクを押し出さないために使う。
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::PageNumber => 1,
+            _ => 0,
+        }
+    }
+}
+
 // ラベル語表（出典: PoC-4 発見事項 4・Hacker News fixture `hn-list.html` の
 // `morelink`、および一般的なページャの表記）。比較前に ASCII 小文字化する。
 const NEXT_LABELS: &[&str] = &[
@@ -343,7 +356,8 @@ fn classify_visible_anchor(doc: &Document, id: NodeId) -> Option<PaginationKind>
 /// （`AISNAP-12`・`TASK-16.2`）。
 ///
 /// 項目自身も対象に含む。項目の非表示祖先の検査は固定深さ（32 段）で打ち切る。非表示サブツリーは読み飛ばし、訪問済み + 未訪問の総量を
-/// 内部上限（256 ノード）以内に保つ。上限に達したら「見つからなかった」として
+/// 内部上限（256 ノード）以内に保つ。残り予算を超える幅の枝はその枝だけ読み飛ばして
+/// 後続の兄弟を確認し、訪問数が上限に達したら「見つからなかった」として
 /// `None`。複数ある場合は文書順で最初の種別を返す。
 pub fn find_pagination_link(doc: &Document, item: NodeId) -> Option<PaginationKind> {
     // 項目自身より上の祖先が非表示なら、配下のリンクも不可視として扱う。
@@ -373,7 +387,9 @@ pub fn find_pagination_link(doc: &Document, item: NodeId) -> Option<PaginationKi
         let budget = MAX_ITEM_SCAN_STEPS.saturating_sub(steps + stack.len());
         let mut kids: Vec<NodeId> = doc.children(id).take(budget + 1).collect();
         if kids.len() > budget {
-            return None;
+            // 残り予算を超える幅の枝は読み飛ばし、後続の兄弟（rel=next 等）を
+            // 確認する。打ち切ると幅広い枝の後ろのリンクを見落とすため。
+            continue;
         }
         kids.reverse();
         stack.extend(kids);
@@ -384,14 +400,19 @@ pub fn find_pagination_link(doc: &Document, item: NodeId) -> Option<PaginationKi
 /// 並びの各項目にページネーションリンク検出を適用し、該当項目を優先候補として返す
 /// （`AISNAP-12`・`TASK-16.2`・Issue #105）。
 ///
-/// 戻り値は index 昇順で、理由は [`RetentionReason::Pagination`]。確保量は
+/// 戻り値は index 昇順で、理由は [`RetentionReason::Pagination`]。候補の
+/// `rank` は [`PaginationKind::rank`]（移動リンク 0・ページ番号 1）で、予算不足時は
+/// 移動リンクがページ番号より先に採用される。確保量は
 /// `items.len()` 以下、総走査量は `items.len()` × 256 ノードで上限される。
 pub fn pagination_candidates(doc: &Document, items: &[NodeId]) -> Vec<PriorityCandidate> {
     items
         .iter()
         .enumerate()
-        .filter(|&(_, &item)| find_pagination_link(doc, item).is_some())
-        .map(|(index, _)| PriorityCandidate::new(index, RetentionReason::Pagination))
+        .filter_map(|(index, &item)| {
+            find_pagination_link(doc, item).map(|kind| {
+                PriorityCandidate::new(index, RetentionReason::Pagination).with_rank(kind.rank())
+            })
+        })
         .collect()
 }
 
@@ -623,6 +644,54 @@ mod tests {
         }
         html.push_str(r#"<a href="?p=2" rel="next">次へ</a></li></ul>"#);
         let doc = parse(&html);
+        assert_eq!(find_pagination_link(&doc, select(&doc, "li")), None);
+    }
+
+    /// AISNAP-12（TASK-16.2・Codex P1）: ページ番号が多くても、末尾の「次へ」が
+    /// 予算不足でページ番号に押し出されず保持される。
+    #[test]
+    fn aisnap_12_next_outranks_page_numbers_under_tight_budget() {
+        let mut html =
+            String::from(r#"<ul class="pagination"><li>a</li><li>b</li><li>c</li><li>d</li>"#);
+        for n in 1..=8 {
+            html.push_str(&format!(r#"<li><a href="?p={n}">{n}</a></li>"#));
+        }
+        html.push_str(r#"<li><a href="?p=2" rel="next">次へ</a></li></ul>"#);
+        let doc = parse(&html);
+        let items: Vec<NodeId> = doc
+            .children(select(&doc, "ul"))
+            .filter(|&n| doc.is_element(n))
+            .collect();
+        assert_eq!(items.len(), 13);
+        let candidates = pagination_candidates(&doc, &items);
+        assert_eq!(candidates.len(), 9);
+        // 先頭 2 件確保 + 優先枠 3 件。次へ（index 12）が必ず残り、残り 2 枠は番号。
+        let r = select_retained_with_priority(13, &RetentionPolicy::new(5, 2), &candidates);
+        let picked: Vec<usize> = r
+            .kept
+            .iter()
+            .filter(|i| i.reason == RetentionReason::Pagination)
+            .map(|i| i.index)
+            .collect();
+        assert_eq!(picked, vec![4, 5, 12]);
+    }
+
+    /// AISNAP-12（TASK-16.2・Codex P2）: 残り予算を超える幅の枝は読み飛ばし、
+    /// 後続の兄弟にある rel=next を見落とさない。
+    #[test]
+    fn aisnap_12_wide_branch_skipped_then_sibling_next_found() {
+        let wide = "<i></i>".repeat(300);
+        let doc = parse(&format!(
+            r#"<ul><li><div>{wide}</div><a href="?p=2" rel="next">次へ</a></li></ul>"#
+        ));
+        assert_eq!(
+            find_pagination_link(&doc, select(&doc, "li")),
+            Some(PaginationKind::Next)
+        );
+        // 幅広い枝の内側にあるリンクは上限超過で未検出（有界性は維持）。
+        let doc = parse(&format!(
+            r#"<ul><li><div>{wide}<a href="?p=2" rel="next">次へ</a></div></li></ul>"#
+        ));
         assert_eq!(find_pagination_link(&doc, select(&doc, "li")), None);
     }
 

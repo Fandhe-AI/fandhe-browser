@@ -18,15 +18,68 @@
 //!
 //! # スタブについて
 //!
-//! [`create_engine`] は同梱済みの種別には `NotYetImplemented`、
-//! 同梱されていない種別には `NotBundled`（詳細は [`engine_trait`] を参照）
-//! を返す。以下は未実装（実装済みを装わない。REPAIR-3）。
+//! [`create_engine`] は V8 には子プロセス版エンジンを返し（`TASK-29.6.2`・
+//! Issue #548。遅延起動。ホストは `main` の先頭で
+//! [`run_js_worker_if_requested`] を呼ぶ義務がある。詳細は [`engine_trait`]）、
+//! 同梱済みの boa には `NotYetImplemented`、同梱されていない種別には
+//! `NotBundled` を返す。以下は未実装（実装済みを装わない。REPAIR-3）。
 //!
-//! - V8 の具象実装（`JS-1`、`TASK-29`、`MS-3`）: Platform/Isolate 初期化
-//!   （`29.2`）のみ実装済み。`JsEngine` 実装・`create_engine` への配線は
-//!   `29.3`〜`29.6`
+//! - V8 の具象実装（`JS-1`、`TASK-29`、`MS-3`）は `create_engine` への配線まで
+//!   完了（`TASK-29.6.2`）。トレイト経由の `NativeFn` は `Send` 境界付きで、
+//!   inherent API と同じ専用スレッド経路（期限付き待機）で実行するため期限を
+//!   強制できる。ただし `NativeCallContext` は関数へ渡らず協調的な中断は
+//!   できない（`process_engine` の「既知の制限」）
 //! - boa の具象実装（`JS-1`、`TASK-32`、`MS-3`）
 //! - core への統合（`js_stub` の置換。`JS-2`、`TASK-30`、`MS-3`）
+//!
+//! # 公開境界（`JS-1`・TASK-29.6.1・Issue #547）
+//!
+//! `v8` crate の型は公開 API に現れない。検査は 3 層で行う。
+//!
+//! 1. `tests/public_api_boundary.rs`: 公開シグネチャを `fandhe_browser_js` と
+//!    `std` の型だけの関数ポインタ型注釈へ固定する（`v8` 型が混入すると
+//!    コンパイルが失敗する）
+//! 2. 下記の `compile_fail` doctest: `v8` の再エクスポートや非公開モジュール
+//!    へ到達できないこと
+//! 3. crate 属性 `#![deny(private_interfaces, private_bounds)]`: `pub(crate)`
+//!    の型が `pub` シグネチャへ漏れるとビルドが失敗する
+//!
+//! 限界: 外部 crate（`v8`）の型が新規の `pub` 項目へ混入することを網羅的に
+//! 自動検出する手段は stable にない（`exported_private_dependencies` は
+//! `-Zpublic-dependency` が必要で stable では機能しないことを実測済み）。
+//! 新しい `pub` 項目を足したら上記 1 にも追加する。
+//!
+//! 参照先が存在することの確認（`compile_fail` が別理由で通らないための対）:
+//!
+//! ```
+//! use fandhe_browser_js::{JsEngine, JsEngineError, create_engine};
+//! ```
+//!
+//! `v8` の再エクスポートは無い。
+//!
+//! ```compile_fail
+//! use fandhe_browser_js::v8::V8;
+//! ```
+//!
+//! `v8_engine` は非公開。
+//!
+//! ```compile_fail
+//! use fandhe_browser_js::v8_engine::V8Engine;
+//! ```
+//!
+//! `worker` は非公開。
+//!
+//! ```compile_fail
+//! use fandhe_browser_js::worker;
+//! ```
+//!
+//! `resource_limits` は非公開。
+//!
+//! ```compile_fail
+//! use fandhe_browser_js::resource_limits;
+//! ```
+
+#![deny(private_interfaces, private_bounds)]
 
 pub mod engine_trait;
 // V8（`rusty_v8`）の Platform/Isolate 初期化（TASK-29.2）と、
@@ -63,13 +116,13 @@ mod worker_protocol;
 #[cfg(feature = "js-v8")]
 mod worker;
 // 子プロセスへの親側プロキシ（TASK-29・Issue #503 設計書 §3.2〜§3.4・
-// §7 W4）。`create_engine` への配線は TASK-29.6（Issue #157）で行う。
+// §7 W4）。`create_engine` へは TASK-29.6.2（Issue #548）で配線済み。
 //
 // `pub` にする理由: `tests/v8_worker.rs`（`harness = false`。W6）は結合
 // テストであり、別クレートとしてコンパイルされるため `pub(crate)` の
 // 項目を参照できない。`V8ProcessEngine`・`new`・`evaluate_script` は
 // 本番ビルド（`test-support` feature 無効）でも `#[doc(hidden)] pub` の
-// まま残す（`TASK-29.6` で `create_engine` から配線するための本番 API の
+// まま残す（`create_engine` から配線した（`TASK-29.6.2`）本番 API の
 // 一部であり、テスト専用ではない）。一方、テスト専用の入口
 // （`new_for_test`・`send_raw_frame_for_test`・`worker_pid_for_test`・
 // `max_script_source_bytes_for_test`・`max_raw_frame_bytes_for_test`・

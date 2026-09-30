@@ -39,20 +39,31 @@
 //! - `ProfileStore::delete`（`PROF-5`）から `Profile::delete` への接続。
 //!   `store.rs` の `ProfileStore`（`XOS-7`・TASK-60（60.2）・#201）と OS 慣習の
 //!   既定パス解決 `OsDefaultStore`（TASK-60（60.3）・#202）は実装済み。明示指定
-//!   による上書きは #203。`Profile::delete` は `self` を消費するが
+//!   による上書き `ExplicitStore`・`OverridableStore`（`PROF-1`、TASK-60（60.4）・
+//!   #203）も実装済み。`Profile::delete` は `self` を消費するが
 //!   `ProfileStore::delete` は `&Profile` を取るため、トレイト契約の見直しが
 //!   要る（既定実装は `Unsupported` を返す）
+//! - 名前正規化（`XOS-9`、TASK-62（62.1）・#208）は `normalize.rs` に ASCII 限定の
+//!   正規化と大文字小文字衝突検出を実装済み。非 ASCII の明示的エンコードと、
+//!   `Profile::create_file_in`・`ProfileStore` への組み込みは未実装
+//! - Windows 長パス（`XOS-8`、TASK-61（61.1）・#205）は `store::to_long_path` として実装済み。
+//!   `Profile::open` が verbatim ルートを使うのは下記 ACL 実装後
 //! - Windows での ACL によるアクセス制限（`XOS-7`〜`XOS-10`。Unix の
 //!   パーミッション 0o700 相当の隔離を Windows でも実現する。TASK-50・#176
 //!   では意図的にスコープ外とした。新規依存が必要になるため、導入時は
 //!   dependency-policy.md に従いユーザー承認を経る）
 
+pub mod normalize;
 pub mod profile;
 pub mod store;
 
 mod lock;
 
+pub use normalize::{MAX_REGISTRY_ENTRIES, NameRegistry, NormalizedName, normalize_name};
 pub use profile::{
     DataKind, Profile, ProfileError, SafeComponent, assert_within_root, sanitize_component,
 };
-pub use store::{APP_DIR_NAME, OsDefaultStore, ProfileStore, ResolvedRoot, RootSource};
+pub use store::{
+    APP_DIR_NAME, ExplicitStore, LongPath, LongPathKind, OsDefaultStore, OverridableStore,
+    ProfileStore, ResolvedRoot, RootSource, to_long_path,
+};

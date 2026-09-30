@@ -41,12 +41,12 @@
 //!   テストでは参照しない（PR #427 レビュー指摘の 2 回目の対応）。
 //! - [`conformance_checks`] モジュール（`check_*` を含む実処理検査一式）
 //!   も同じ cfg gate 配下に置く。`js-v8`/`js-boa` いずれかが有効な限り
-//!   3 関数すべてが `#[test]` として常に実行され、[`create_engine`] が
-//!   `Ok` を返すようになった時点（TASK-29・V8／TASK-32・boa 完了時）で
-//!   自動的に `check_*` を呼び出すようになる。「実装が入ったのに
-//!   `#[test]` を付け直し忘れる」余地を構造上なくす（本 crate の CI は
-//!   `cargo test --all-features` に加え既定 feature 構成も別ジョブで
-//!   検証する。ci.yml 参照）。
+//!   3 関数すべてが `harness = false` の `main` から常に順次呼ばれ、
+//!   [`create_engine`] が `Ok` を返す種別（V8 は TASK-29.6.2 で対応済み。
+//!   boa は TASK-32 完了時）に対して `check_*` を実行する。実装が入ったのに
+//!   呼び出しを付け忘れる余地を構造上なくす（本 crate の CI は
+//!   `cargo test --all-features` に加え既定 feature 構成・`--features js-v8`
+//!   単独構成（TASK-29.7・Issue #158）も別ジョブで検証する。ci.yml 参照）。
 //! - [`assert_conformance_summary_matches_current_contract`] の
 //!   「検査対象があるのに無検証で成功しない」追加アサーションは、
 //!   `bundled_engines()` と [`IMPLEMENTED_ENGINES`] の積集合
@@ -56,19 +56,26 @@
 //!   `checked == 0` が正しい期待値であるにもかかわらず失敗してしまう
 //!   （PR #427 レビュー指摘（Bugbot）への対応。4 回目）。
 //!
-//! 現時点（[`IMPLEMENTED_ENGINES`] が空）では、feature 有効構成でも
-//! `check_*` はまだ 1 度も実際のスクリプト評価まで到達しない
-//! （`create_engine` がどの種別にも `NotYetImplemented` を返すため）。
-//! これは実装状況をそのまま反映した結果であり、テスト自体は
-//! `run_for_each_bundled_engine` を必ず呼び出し、[`bundled_engines`] を
-//! 空にしない cfg gate と合わせて「ループが空のまま無検証で成功する」
-//! ことを許さない（実装済みを装わない。REPAIR-3）。
+//! V8 は `create_engine` から子プロセス版として配線済み（TASK-29.6.2・
+//! Issue #548）のため、`js-v8` 有効構成では [`IMPLEMENTED_ENGINES`] に V8 を
+//! 含み、`check_*` が実際にスクリプト評価まで到達する（boa は
+//! `NotYetImplemented` 契約の確認のみ）。
+//!
+//! ## `harness = false` の理由（TASK-29.6.2・Issue #548）
+//!
+//! V8 版は子プロセス（このテストバイナリ自身の自己再実行）で評価するため、
+//! `main` の先頭で [`fandhe_browser_js::run_js_worker_if_requested`] を呼ぶ必要が
+//! ある。子プロセス役のときの stdout はプロトコルフレーム専用で、libtest の
+//! 出力が混入するとフレームが壊れる（`v8_worker` 結合テストと同じ作法）。
+//! そのため `Cargo.toml` で `harness = false` とし、下記の `main` が各ケースを
+//! 順に実行する（失敗は panic で非 0 終了。ケース名は stderr に出す）。
 
 use fandhe_browser_js::{CreateEngineError, EngineKind, bundled_engines, create_engine};
 
 /// 具象実装が存在し、[`create_engine`] が `Ok` を返す種別の宣言
-/// （TASK-29 完了時に [`EngineKind::V8`]、TASK-32 完了時に
-/// [`EngineKind::Boa`] をここへ追加する）。
+/// （[`EngineKind::V8`] は TASK-29.6.2・Issue #548 で追加済みで、TASK-29.7・
+/// Issue #158 が 3 カテゴリ合格を CI で検証する。[`EngineKind::Boa`] は
+/// TASK-32 完了時にここへ追加する）。
 ///
 /// [`js_1_create_engine_contract_for_bundled_engines`]・
 /// [`conformance_checks`] 内の各ヘルパーが期待値の唯一の情報源として参照
@@ -89,7 +96,12 @@ use fandhe_browser_js::{CreateEngineError, EngineKind, bundled_engines, create_e
 /// と `create_engine` の `NotBundled` 応答のみで行う）。そのため `js-v8`/
 /// `js-boa` のいずれかが有効な構成でのみ存在させる。
 #[cfg(any(feature = "js-v8", feature = "js-boa"))]
-const IMPLEMENTED_ENGINES: &[EngineKind] = &[];
+const IMPLEMENTED_ENGINES: &[EngineKind] = &[
+    // V8 は子プロセス版として配線済み（TASK-29.6.2・Issue #548）。`js-boa` のみ
+    // 有効な構成では V8 は同梱されないため feature で絞る。
+    #[cfg(feature = "js-v8")]
+    EngineKind::V8,
+];
 
 /// JS-1: `create_engine` の同梱種別ごとの契約（[`IMPLEMENTED_ENGINES`] に
 /// 含まれるかどうかで `Ok`/`NotYetImplemented` のどちらを返すべきか）を
@@ -99,7 +111,6 @@ const IMPLEMENTED_ENGINES: &[EngineKind] = &[];
 /// [`js_1_create_engine_contract_is_empty_by_default`] を参照。PR #427
 /// レビュー指摘: 空のループが無検証で成功しないよう、ループが空になり得る
 /// 構成そのものに本テストを存在させない）。
-#[test]
 #[cfg(any(feature = "js-v8", feature = "js-boa"))]
 fn js_1_create_engine_contract_for_bundled_engines() {
     let engines = bundled_engines();
@@ -142,7 +153,6 @@ fn js_1_create_engine_contract_for_bundled_engines() {
 /// TASK-29/32 で実装済みエンジン種別をそこへ追加しても、既定構成が
 /// エンジンを同梱しないという契約自体は変わらない。両者を混ぜて検証
 /// すると、実装が進むたびに既定構成のこのテストが不当に失敗する）。
-#[test]
 #[cfg(not(any(feature = "js-v8", feature = "js-boa")))]
 fn js_1_create_engine_contract_is_empty_by_default() {
     assert_eq!(
@@ -176,17 +186,15 @@ fn js_1_create_engine_contract_is_empty_by_default() {
 ///
 /// `js-v8`/`js-boa` のいずれかが有効な構成でのみコンパイル・実行される
 /// （モジュール冒頭のドキュメント参照）。そのため [`bundled_engines`] が
-/// 常に非空になる構成でのみ 3 関数すべてが `#[test]` として動く。
-/// [`IMPLEMENTED_ENGINES`] が空の現時点では `create_engine` がどの種別にも
-/// `NotYetImplemented` を返すため、`check_*`（実際のスクリプト評価・
-/// 関数注入・DOM バインディング）自体はまだ 1 度も到達しない。ただし
-/// `run_for_each_bundled_engine`（本モジュール内）は必ず呼ばれ、
-/// 「同梱されているのに `NotYetImplemented` を返す」という現行契約を
-/// 明示的に検証し続けるため、`cargo test` の出力が「pass」でも実際には
-/// 何も検証していない、という状態にはならない（PR #427 レビュー指摘への
-/// 対応。TASK-29・V8／TASK-32・boa の完了により対応する種別が
-/// [`IMPLEMENTED_ENGINES`] へ追加された瞬間、既にある `#[test]` がそのまま
-/// `check_*` を呼び出すようになる。付け直し忘れの余地がない）。
+/// 常に非空になる構成でのみ 3 関数すべてが、`harness = false` の `main` から
+/// 順に呼ばれる（冒頭の「`harness = false` の理由」参照）。`js-v8` 有効時は
+/// V8 に対して `check_*`（実際のスクリプト評価・関数注入・DOM バインディング）
+/// が実行される（TASK-29.7・Issue #158）。boa は [`IMPLEMENTED_ENGINES`] に
+/// 未追加のため、`create_engine` が `NotYetImplemented` を返す契約の確認のみ
+/// を行う。`run_for_each_bundled_engine`（本モジュール内）が必ず呼ばれるため、
+/// 出力が「pass」でも実際には何も検証していない、という状態にはならない
+/// （PR #427 レビュー指摘への対応。TASK-32・boa の完了で [`IMPLEMENTED_ENGINES`]
+/// へ追加された種別は、呼び出し側の変更なしに `check_*` の対象になる）。
 #[cfg(any(feature = "js-v8", feature = "js-boa"))]
 mod conformance_checks {
     use super::IMPLEMENTED_ENGINES;
@@ -194,9 +202,9 @@ mod conformance_checks {
         CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsEngineError, JsValue, NativeFn,
         bundled_engines, create_engine,
     };
-    use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     /// [`run_for_each_bundled_engine`] の実行結果（何件を実チェックし、何件が
     /// `NotYetImplemented` 契約確認で終わったか）。
@@ -367,10 +375,10 @@ mod conformance_checks {
         let options = EvaluateOptions::default();
 
         // print: Rust 側が呼び出し引数を記録できること（PoC-3 の print 相当）。
-        let printed: Rc<RefCell<Vec<JsValue>>> = Rc::new(RefCell::new(Vec::new()));
-        let printed_for_closure = Rc::clone(&printed);
+        let printed: Arc<Mutex<Vec<JsValue>>> = Arc::new(Mutex::new(Vec::new()));
+        let printed_for_closure = Arc::clone(&printed);
         let print_fn: NativeFn = Box::new(move |args: &[JsValue]| {
-            printed_for_closure.borrow_mut().extend_from_slice(args);
+            printed_for_closure.lock().unwrap().extend_from_slice(args);
             Ok(JsValue::Undefined)
         });
         engine
@@ -380,7 +388,7 @@ mod conformance_checks {
             .evaluate_script("print('hello')", &options)
             .unwrap_or_else(|err| panic!("[{kind:?}] calling print failed: {err}"));
         assert_eq!(
-            *printed.borrow(),
+            *printed.lock().unwrap(),
             vec![JsValue::String("hello".into())],
             "[{kind:?}] print must record its argument on the Rust side"
         );
@@ -421,13 +429,13 @@ mod conformance_checks {
     /// （エンジン非依存。PoC-3 の `dom.setText`/`dom.getText`/`dom.count` 相当）。
     fn check_dom_like_binding(kind: EngineKind, engine: &mut dyn JsEngine) {
         let options = EvaluateOptions::default();
-        let store: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
+        let store: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
 
         let set_text_fn: NativeFn = {
-            let store = Rc::clone(&store);
+            let store = Arc::clone(&store);
             Box::new(move |args: &[JsValue]| match (args.first(), args.get(1)) {
                 (Some(JsValue::String(id)), Some(JsValue::String(text))) => {
-                    store.borrow_mut().insert(id.clone(), text.clone());
+                    store.lock().unwrap().insert(id.clone(), text.clone());
                     Ok(JsValue::Undefined)
                 }
                 _ => Err(JsEngineError::BindingFailed(
@@ -436,10 +444,10 @@ mod conformance_checks {
             })
         };
         let get_text_fn: NativeFn = {
-            let store = Rc::clone(&store);
+            let store = Arc::clone(&store);
             Box::new(move |args: &[JsValue]| match args.first() {
                 Some(JsValue::String(id)) => Ok(JsValue::String(
-                    store.borrow().get(id).cloned().unwrap_or_default(),
+                    store.lock().unwrap().get(id).cloned().unwrap_or_default(),
                 )),
                 _ => Err(JsEngineError::BindingFailed(
                     "getText expects an id string".into(),
@@ -447,8 +455,10 @@ mod conformance_checks {
             })
         };
         let count_fn: NativeFn = {
-            let store = Rc::clone(&store);
-            Box::new(move |_args: &[JsValue]| Ok(JsValue::Number(store.borrow().len() as f64)))
+            let store = Arc::clone(&store);
+            Box::new(move |_args: &[JsValue]| {
+                Ok(JsValue::Number(store.lock().unwrap().len() as f64))
+            })
         };
 
         engine
@@ -486,12 +496,12 @@ mod conformance_checks {
         );
 
         assert_eq!(
-            store.borrow().get("title").map(String::as_str),
+            store.lock().unwrap().get("title").map(String::as_str),
             Some("Fandhe"),
             "[{kind:?}] Rust-side store must reflect dom.setText('title', ...)"
         );
         assert_eq!(
-            store.borrow().get("body").map(String::as_str),
+            store.lock().unwrap().get("body").map(String::as_str),
             Some("x"),
             "[{kind:?}] Rust-side store must reflect dom.setText('body', ...)"
         );
@@ -508,11 +518,10 @@ mod conformance_checks {
 
     /// JS-1: スクリプト評価が、同梱された各エンジンで同じ形状の結果を返すこと
     /// （TASK-28.4・Issue #150）。`js-v8`/`js-boa` のいずれかが有効な構成
-    /// でのみ存在し、[`IMPLEMENTED_ENGINES`] が非空になった時点で
-    /// `check_script_evaluation` を実際に呼び出すようになる
+    /// でのみ存在し、[`IMPLEMENTED_ENGINES`] に含まれる種別（現状は V8）に
+    /// 対して `check_script_evaluation` を実際に呼び出す
     /// （モジュールドキュメント参照）。
-    #[test]
-    fn js_1_conformance_script_evaluation_for_each_bundled_engine() {
+    pub(super) fn js_1_conformance_script_evaluation_for_each_bundled_engine() {
         let summary = run_for_each_bundled_engine(check_script_evaluation);
         assert_conformance_summary_matches_current_contract(&summary);
     }
@@ -520,8 +529,7 @@ mod conformance_checks {
     /// JS-1: グローバル関数注入が、同梱された各エンジンで同じ形状で動作すること
     /// （TASK-28.4・Issue #150）。`js-v8`/`js-boa` のいずれかが有効な構成
     /// でのみ存在する（モジュールドキュメント参照）。
-    #[test]
-    fn js_1_conformance_global_function_injection_for_each_bundled_engine() {
+    pub(super) fn js_1_conformance_global_function_injection_for_each_bundled_engine() {
         let summary = run_for_each_bundled_engine(check_global_function_injection);
         assert_conformance_summary_matches_current_contract(&summary);
     }
@@ -529,9 +537,38 @@ mod conformance_checks {
     /// JS-1: DOM 風オブジェクトへのバインディングが、同梱された各エンジンで
     /// 同じ形状で動作すること（TASK-28.4・Issue #150）。`js-v8`/`js-boa` の
     /// いずれかが有効な構成でのみ存在する（モジュールドキュメント参照）。
-    #[test]
-    fn js_1_conformance_dom_like_binding_for_each_bundled_engine() {
+    pub(super) fn js_1_conformance_dom_like_binding_for_each_bundled_engine() {
         let summary = run_for_each_bundled_engine(check_dom_like_binding);
         assert_conformance_summary_matches_current_contract(&summary);
     }
+}
+
+/// 子プロセス役なら役に徹し、そうでなければ各ケースを順に実行する
+/// （`harness = false`。モジュール冒頭のドキュメント参照）。
+fn main() -> std::process::ExitCode {
+    // 子プロセスとして再実行された場合は、libtest 等の出力より前に
+    // ワーカーへ制御を渡す（stdout はフレーム専用）。
+    if let Some(code) = fandhe_browser_js::run_js_worker_if_requested() {
+        return code;
+    }
+
+    #[cfg(any(feature = "js-v8", feature = "js-boa"))]
+    {
+        eprintln!("case: js_1_create_engine_contract_for_bundled_engines");
+        js_1_create_engine_contract_for_bundled_engines();
+        eprintln!("case: js_1_conformance_script_evaluation_for_each_bundled_engine");
+        conformance_checks::js_1_conformance_script_evaluation_for_each_bundled_engine();
+        eprintln!("case: js_1_conformance_global_function_injection_for_each_bundled_engine");
+        conformance_checks::js_1_conformance_global_function_injection_for_each_bundled_engine();
+        eprintln!("case: js_1_conformance_dom_like_binding_for_each_bundled_engine");
+        conformance_checks::js_1_conformance_dom_like_binding_for_each_bundled_engine();
+    }
+    #[cfg(not(any(feature = "js-v8", feature = "js-boa")))]
+    {
+        eprintln!("case: js_1_create_engine_contract_is_empty_by_default");
+        js_1_create_engine_contract_is_empty_by_default();
+    }
+
+    eprintln!("conformance: all cases passed");
+    std::process::ExitCode::SUCCESS
 }

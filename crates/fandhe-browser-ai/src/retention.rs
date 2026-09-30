@@ -1,5 +1,5 @@
 //! 表・一覧の圧縮で「どの項目を保持するか」を決める優先保持の選択層
-//! （`AISNAP-12`・`TASK-16`・`TASK-16.1`・`TASK-16.2`・`MS-2`・Issue #104・#105）。
+//! （`AISNAP-12`・`TASK-16`・`TASK-16.1`・`TASK-16.2`・`TASK-16.3`・`MS-2`・Issue #104・#105・#106）。
 //!
 //! 役割: 固定件数キャップの単純な `take(cap)` に代わり、キャップ境界付近の
 //! 軽微なページ変化で重要要素が簡約表現から消える問題（PoC-4）を避けるための
@@ -7,7 +7,8 @@
 //! （[`RetentionPolicy`]）・優先候補（[`PriorityCandidate`]）から保持する index
 //! だけを返し、DOM には依存しない（表の行・`li` などの並びへ
 //! [`Retention::apply`] で写像する）。DOM 上の優先項目の検出は子モジュール
-//! （ページネーションは [`pagination`]・TASK-16.2）が担う。
+//! （ページネーションは [`pagination`]・TASK-16.2、フォーム送信ボタンは
+//! [`submit_button`]・TASK-16.3）が担う。
 //!
 //! # 予算モデル
 //!
@@ -15,8 +16,8 @@
 //!
 //! 1. 先頭から `min(head_keep, cap, len)` 件を [`RetentionReason::Head`] で予約する。
 //!    後続の段がこの予約を追い出すことはない
-//! 2. 優先項目の段（ページネーションは実装済み・TASK-16.2。送信ボタンは
-//!    TASK-16.3 で追加予定で未実装）。呼び出し元が渡す優先候補を、残り予算
+//! 2. 優先項目の段（ページネーション・フォーム送信ボタンとも実装済み・
+//!    TASK-16.2・TASK-16.3）。呼び出し元が渡す優先候補を、残り予算
 //!    `cap - 確保済み` の範囲で index 昇順に採用する。先頭確保の範囲内・範囲外の
 //!    候補は無視し、同一 index の重複は最初の理由を採る
 //! 3. 残り予算で未選択の項目を文書順に [`RetentionReason::Fill`] で充填する
@@ -29,15 +30,20 @@
 //!
 //! 呼び出し元はまだ無い。`compress_table::compress_rows` の `take(MAX_TABLE_ROWS)`
 //! の置き換え（統合）は TASK-16.4（Issue #107）で行い、そこで `compress_rows` が
-//! [`pagination::pagination_candidates`] の結果を [`select_retained_with_priority`]
-//! へ渡す想定である。ページネーションの優先保持（#105）は実装済み。送信ボタン
-//! （#106）の優先保持は未実装で、実装済みを装わない（REPAIR-3）。
+//! [`pagination::pagination_candidates`] と [`submit_button::submit_button_candidates`]
+//! の結果を合成して [`select_retained_with_priority`] へ渡す想定である。
+//! ページネーション（#105）・送信ボタン（#106）の優先保持はいずれも実装済みで、
+//! 両者の候補の合成は TASK-16.4 の責務である。
 //! `<select>` の先頭圧縮は本モジュールの対象外（未実装）である。
 
 pub mod pagination;
+pub mod submit_button;
 
 pub use pagination::{
     PaginationKind, classify_pagination_link, find_pagination_link, pagination_candidates,
+};
+pub use submit_button::{
+    SubmitButtonKind, classify_submit_button, find_submit_button, submit_button_candidates,
 };
 
 /// 保持の予算方針（`AISNAP-12`）。構築は [`RetentionPolicy::new`] 経由に限る。
@@ -64,8 +70,8 @@ impl RetentionPolicy {
 
 /// 項目が保持された理由（`AISNAP-12`）。
 ///
-/// ページネーション用 variant は TASK-16.2（#105）で追加済み。送信ボタン用は
-/// TASK-16.3（#106）で追加予定のため `non_exhaustive` とする。
+/// ページネーション用・送信ボタン用 variant はそれぞれ TASK-16.2（#105）・
+/// TASK-16.3（#106）で追加済み。将来の追加に備え `non_exhaustive` とする。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RetentionReason {
@@ -77,11 +83,14 @@ pub enum RetentionReason {
     /// ため優先して保持された（TASK-16.2・Issue #105）。種別の詳細は
     /// [`PaginationKind`]。
     Pagination,
+    /// フォームの送信ボタンを含むため優先して保持された（TASK-16.3・
+    /// Issue #106）。種別の詳細は [`SubmitButtonKind`]。
+    SubmitButton,
 }
 
-/// 優先して保持したい項目の候補（`AISNAP-12`・`TASK-16.2`）。
+/// 優先して保持したい項目の候補（`AISNAP-12`・`TASK-16.3`）。
 ///
-/// DOM 検出側（[`pagination::pagination_candidates`] 等）が生成し、選択層
+/// DOM 検出側（[`submit_button::submit_button_candidates`] 等）が生成し、選択層
 /// [`select_retained_with_priority`] が予算内で採用する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -90,12 +99,24 @@ pub struct PriorityCandidate {
     pub index: usize,
     /// 優先する理由（保持結果の [`RetainedItem::reason`] になる）。
     pub reason: RetentionReason,
+    /// 予算不足時の採用順位。小さいほど先に採用する（既定 0。同順位は index 昇順）。
+    pub rank: u8,
 }
 
 impl PriorityCandidate {
-    /// 候補を構築する。
+    /// 候補を構築する（採用順位は 0）。
     pub fn new(index: usize, reason: RetentionReason) -> Self {
-        Self { index, reason }
+        Self {
+            index,
+            reason,
+            rank: 0,
+        }
+    }
+
+    /// 採用順位を指定した候補を返す（小さいほど予算不足時に先に採用される）。
+    pub fn with_rank(mut self, rank: u8) -> Self {
+        self.rank = rank;
+        self
     }
 }
 
@@ -140,11 +161,11 @@ pub fn select_retained(len: usize, policy: &RetentionPolicy) -> Retention {
     select_retained_with_priority(len, policy, &[])
 }
 
-/// 優先候補つきで保持する項目を選ぶ（`AISNAP-12`・`TASK-16.2`・Issue #105）。
+/// 優先候補つきで保持する項目を選ぶ（`AISNAP-12`・`TASK-16.2`・`TASK-16.3`）。
 ///
 /// 予算モデル（先頭確保 → 優先項目 → 文書順の充填）はモジュール doc を参照。
 /// `candidates` のうち範囲外（`index >= len`）と先頭確保範囲内のものは無視し、
-/// 残りを index 昇順で残り予算まで採用する（候補過多時は文書順の先頭側が残る）。
+/// 残りを残り予算まで採用する（候補過多時は `rank` の小さい順、同順位は index 昇順）。
 /// 同一 index が複数あれば与えられた順で先の理由を採る。確保量は
 /// `min(len, cap) + candidates.len()` 以下、走査量は `cap + candidates.len()` 程度で、
 /// 巨大な `len` に比例しない。
@@ -173,7 +194,14 @@ pub fn select_retained_with_priority(
         .collect();
     prioritized.sort_by_key(|c| c.index);
     prioritized.dedup_by_key(|c| c.index);
-    prioritized.truncate(budget.saturating_sub(head));
+    // 予算不足時は rank の小さい候補（移動リンク等）を優先し、同順位は index 昇順。
+    // 採用後は index 昇順へ戻す（充填段の skip が昇順を前提とするため）。
+    let room = budget.saturating_sub(head);
+    if prioritized.len() > room {
+        prioritized.sort_by_key(|c| (c.rank, c.index));
+        prioritized.truncate(room);
+        prioritized.sort_by_key(|c| c.index);
+    }
     kept.extend(prioritized.iter().map(|c| RetainedItem {
         index: c.index,
         reason: c.reason,
@@ -313,16 +341,16 @@ mod tests {
         assert!(r.apply::<&str>(&[]).is_empty());
     }
 
-    fn pag(index: usize) -> PriorityCandidate {
-        PriorityCandidate::new(index, RetentionReason::Pagination)
+    fn sb(index: usize) -> PriorityCandidate {
+        PriorityCandidate::new(index, RetentionReason::SubmitButton)
     }
 
-    /// AISNAP-12（TASK-16.2・Issue #105）: キャップ外の優先候補が保持される。
+    /// AISNAP-12（TASK-16.3・Issue #106）: キャップ外の優先候補が保持される。
     #[test]
     fn aisnap_12_priority_candidate_beyond_cap_is_kept() {
-        let r = select_retained_with_priority(30, &RetentionPolicy::new(20, 5), &[pag(29)]);
+        let r = select_retained_with_priority(30, &RetentionPolicy::new(20, 5), &[sb(29)]);
         assert_eq!(indexes(&r, RetentionReason::Head), vec![0, 1, 2, 3, 4]);
-        assert_eq!(indexes(&r, RetentionReason::Pagination), vec![29]);
+        assert_eq!(indexes(&r, RetentionReason::SubmitButton), vec![29]);
         assert_eq!(
             indexes(&r, RetentionReason::Fill),
             (5..19).collect::<Vec<_>>()
@@ -336,9 +364,9 @@ mod tests {
     /// AISNAP-12: 先頭確保範囲内の候補は二重計上されない。
     #[test]
     fn aisnap_12_priority_candidate_inside_head_is_not_double_counted() {
-        let r = select_retained_with_priority(30, &RetentionPolicy::new(20, 5), &[pag(2)]);
+        let r = select_retained_with_priority(30, &RetentionPolicy::new(20, 5), &[sb(2)]);
         assert_eq!(indexes(&r, RetentionReason::Head), vec![0, 1, 2, 3, 4]);
-        assert!(indexes(&r, RetentionReason::Pagination).is_empty());
+        assert!(indexes(&r, RetentionReason::SubmitButton).is_empty());
         assert_eq!(
             indexes(&r, RetentionReason::Fill),
             (5..20).collect::<Vec<_>>()
@@ -348,9 +376,9 @@ mod tests {
     /// AISNAP-12: 範囲外・重複の候補は無視・統合される。
     #[test]
     fn aisnap_12_priority_out_of_range_and_duplicates() {
-        let c = [pag(30), pag(usize::MAX), pag(25), pag(25)];
+        let c = [sb(30), sb(usize::MAX), sb(25), sb(25)];
         let r = select_retained_with_priority(30, &RetentionPolicy::new(20, 5), &c);
-        assert_eq!(indexes(&r, RetentionReason::Pagination), vec![25]);
+        assert_eq!(indexes(&r, RetentionReason::SubmitButton), vec![25]);
         assert_eq!(r.kept.len(), 20);
         assert_eq!(r.omitted, 10);
     }
@@ -358,25 +386,39 @@ mod tests {
     /// AISNAP-12: 候補過多なら index 昇順で残り予算まで採用する。
     #[test]
     fn aisnap_12_priority_overflow_takes_lowest_indexes() {
-        let c = [pag(29), pag(10), pag(20), pag(15), pag(12)];
+        let c = [sb(29), sb(10), sb(20), sb(15), sb(12)];
         let r = select_retained_with_priority(30, &RetentionPolicy::new(8, 5), &c);
-        assert_eq!(indexes(&r, RetentionReason::Pagination), vec![10, 12, 15]);
+        assert_eq!(indexes(&r, RetentionReason::SubmitButton), vec![10, 12, 15]);
         assert!(indexes(&r, RetentionReason::Fill).is_empty());
         assert_eq!(r.kept.len(), 8);
+    }
+
+    /// AISNAP-12（TASK-16.2）: 候補過多時は rank の小さい候補が先に採用される。
+    #[test]
+    fn aisnap_12_priority_overflow_prefers_lower_rank() {
+        let c = [
+            sb(10).with_rank(1),
+            sb(11).with_rank(1),
+            sb(25).with_rank(0),
+        ];
+        let r = select_retained_with_priority(30, &RetentionPolicy::new(7, 5), &c);
+        assert_eq!(indexes(&r, RetentionReason::SubmitButton), vec![10, 25]);
+        let all: Vec<usize> = r.kept.iter().map(|i| i.index).collect();
+        assert!(all.windows(2).all(|w| w[0] < w[1]));
     }
 
     /// AISNAP-12: head_keep == cap では優先段は先頭確保を追い出さない。
     #[test]
     fn aisnap_12_priority_does_not_evict_head() {
-        let r = select_retained_with_priority(30, &RetentionPolicy::new(5, 5), &[pag(29)]);
+        let r = select_retained_with_priority(30, &RetentionPolicy::new(5, 5), &[sb(29)]);
         assert_eq!(indexes(&r, RetentionReason::Head), vec![0, 1, 2, 3, 4]);
-        assert!(indexes(&r, RetentionReason::Pagination).is_empty());
+        assert!(indexes(&r, RetentionReason::SubmitButton).is_empty());
     }
 
     /// AISNAP-12: cap 0 は候補があっても何も保持しない。
     #[test]
     fn aisnap_12_priority_cap_zero_keeps_nothing() {
-        let r = select_retained_with_priority(10, &RetentionPolicy::new(0, 0), &[pag(3)]);
+        let r = select_retained_with_priority(10, &RetentionPolicy::new(0, 0), &[sb(3)]);
         assert!(r.kept.is_empty());
         assert_eq!(r.omitted, 10);
     }
@@ -387,11 +429,11 @@ mod tests {
         let r = select_retained_with_priority(
             usize::MAX,
             &RetentionPolicy::new(20, 1),
-            &[pag(usize::MAX - 1)],
+            &[sb(usize::MAX - 1)],
         );
         assert_eq!(r.kept.len(), 20);
         assert_eq!(
-            indexes(&r, RetentionReason::Pagination),
+            indexes(&r, RetentionReason::SubmitButton),
             vec![usize::MAX - 1]
         );
         assert_eq!(r.omitted, usize::MAX - 20);
