@@ -23,6 +23,8 @@ pub const MAX_TARGETS: usize = 64;
 pub const MAX_SESSIONS: usize = 256;
 /// 外部入力から ID を組み立てる際の最大バイト長。
 const MAX_ID_LEN: usize = 64;
+/// ターゲット URL の最大バイト長（巨大 URL によるメモリ無制限消費の防止）。
+pub const MAX_URL_LEN: usize = 8192;
 
 /// cdp 状態型の操作エラー。表は失敗時に変更されない。
 ///
@@ -48,6 +50,11 @@ pub enum CdpStateError {
     IdExhausted,
     /// 外部入力の ID が空・長すぎる・許可外の文字を含む。
     InvalidId,
+    /// ターゲット URL がバイト長の上限（[`MAX_URL_LEN`]）を超えている。
+    UrlTooLong {
+        /// 上限値（バイト）。
+        limit: usize,
+    },
 }
 
 impl fmt::Display for CdpStateError {
@@ -59,6 +66,7 @@ impl fmt::Display for CdpStateError {
             Self::TooManySessions { limit } => write!(f, "too many sessions (limit {limit})"),
             Self::IdExhausted => f.write_str("id counter exhausted"),
             Self::InvalidId => f.write_str("invalid id"),
+            Self::UrlTooLong { limit } => write!(f, "url too long (limit {limit} bytes)"),
         }
     }
 }
@@ -231,12 +239,16 @@ impl TargetRegistry {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// ターゲットを作成して ID を返す。上限超過・ID 枯渇時は表を変更しない。
+    /// ターゲットを作成して ID を返す。件数・URL 長の上限超過・ID 枯渇時は表を変更しない。
     pub fn create_target(
         &self,
         kind: TargetKind,
         url: impl Into<String>,
     ) -> Result<TargetId, CdpStateError> {
+        let url: String = url.into();
+        if url.len() > MAX_URL_LEN {
+            return Err(CdpStateError::UrlTooLong { limit: MAX_URL_LEN });
+        }
         let mut t = self.lock();
         if t.targets.len() >= MAX_TARGETS {
             return Err(CdpStateError::TooManyTargets { limit: MAX_TARGETS });
@@ -247,7 +259,7 @@ impl TargetRegistry {
         let info = TargetInfo {
             target_id: id.clone(),
             kind,
-            url: url.into(),
+            url,
         };
         t.next_target = next;
         t.targets.insert(id.clone(), info);
@@ -379,6 +391,22 @@ mod tests {
         assert_eq!(r.session_target(&s3), Some(other));
         assert!(r.target(&t).is_none());
         assert_eq!(r.close_target(&t), Err(CdpStateError::UnknownTarget));
+    }
+
+    #[test]
+    fn cdp1_url_length_limit_rejects_oversized_url() {
+        let r = TargetRegistry::new();
+        let at_limit = "a".repeat(MAX_URL_LEN);
+        let id = r
+            .create_target(TargetKind::Page, at_limit.as_str())
+            .unwrap();
+        assert_eq!(r.target(&id).unwrap().url().len(), MAX_URL_LEN);
+        let over = "a".repeat(MAX_URL_LEN + 1);
+        assert_eq!(
+            r.create_target(TargetKind::Page, over),
+            Err(CdpStateError::UrlTooLong { limit: MAX_URL_LEN })
+        );
+        assert_eq!(r.target_count(), 1);
     }
 
     #[test]
