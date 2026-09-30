@@ -71,8 +71,9 @@ fn has_hidden_ancestor(doc: &Document, id: NodeId) -> bool {
     {
         return true;
     }
-    // 上限に達しても祖先が残っていれば未確認扱い。
-    ancestors.any(|a| doc.is_element(a))
+    // 上限に達しても次の祖先が要素なら未確認扱い。残りは全走査せず 1 件だけ
+    // 確認する（深さに比例した処理を避ける。文書ルートは要素でないため除外されない）。
+    ancestors.next().is_some_and(|a| doc.is_element(a))
 }
 
 /// ページ番号の文脈ガードで辿る祖先の最大深さ。
