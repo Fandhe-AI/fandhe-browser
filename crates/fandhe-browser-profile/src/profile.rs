@@ -169,6 +169,20 @@ pub enum ProfileError {
         /// 解決できない理由を示す英語メッセージ。
         reason: &'static str,
     },
+    /// 大文字小文字だけが異なる名前が既に登録されている場合に返す
+    /// （`XOS-9`、TASK-62（62.1）・#208。`normalize::NameRegistry::insert` が返す）。
+    ///
+    /// 生の入力はフィールドへコピーしない（`InvalidComponent` と同じ理由）。
+    NameCollision {
+        /// 衝突の内容を示す英語メッセージ。
+        reason: &'static str,
+    },
+    /// `normalize::NameRegistry` が登録件数の上限に達した場合に返す
+    /// （`XOS-9`、TASK-62（62.1）・#208。無制限確保による DoS の防止）。
+    RegistryFull {
+        /// 登録できる件数の上限。
+        limit: usize,
+    },
 }
 
 impl fmt::Display for ProfileError {
@@ -197,6 +211,12 @@ impl fmt::Display for ProfileError {
             ProfileError::DefaultRootUnavailable { reason } => {
                 write!(f, "default profile root is unavailable: {reason}")
             }
+            ProfileError::NameCollision { reason } => {
+                write!(f, "name collision: {reason}")
+            }
+            ProfileError::RegistryFull { limit } => {
+                write!(f, "name registry is full: limit is {limit} entries")
+            }
             ProfileError::OutsideRoot { root, candidate } => {
                 write!(
                     f,
@@ -219,6 +239,8 @@ impl std::error::Error for ProfileError {
             ProfileError::InvalidComponent { .. } => None,
             ProfileError::OutsideRoot { .. } => None,
             ProfileError::DefaultRootUnavailable { .. } => None,
+            ProfileError::NameCollision { .. } => None,
+            ProfileError::RegistryFull { .. } => None,
         }
     }
 }
@@ -290,6 +312,17 @@ impl<'a> SafeComponent<'a> {
     /// 検証済みのコンポーネントを `&OsStr` として返す。
     pub fn as_os_str(&self) -> &'a std::ffi::OsStr {
         self.0
+    }
+
+    /// 検証済みであることを呼び出し元が保証する値から構築する（crate 内専用）。
+    ///
+    /// `normalize::NormalizedName::as_safe_component` が、`sanitize_component`
+    /// 通過後に ASCII 小文字化しただけの文字列（区切り文字を生まず長さも不変）
+    /// を再検証なしで渡すために使う（`XOS-9`、TASK-62（62.1）・#208）。
+    /// 前提: `raw` は `sanitize_component` を通過する値であること。
+    pub(crate) fn from_validated(raw: &'a std::ffi::OsStr) -> Self {
+        debug_assert!(sanitize_component(raw).is_ok());
+        SafeComponent(raw)
     }
 }
 
