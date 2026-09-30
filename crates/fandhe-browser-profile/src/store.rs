@@ -178,9 +178,10 @@ impl ProfileStore for OsDefaultStore {
 /// - `canonicalize` はしない。symlink の検証は [`Profile::open`] がハンドル基準で
 ///   行う（`PROF-1`・`PROF-4`）。macOS の `/var` など OS 標準の symlink を含む
 ///   パスは、[`Profile::open`] の doc と同様に呼び出し側で `canonicalize` が必要
-/// - `..` を含むパスは受け付ける。`PROF-1` が「任意のパス」を求めるうえ、
-///   [`Profile::open`] は `..` をハンドル基準でたどるため境界外への書き込み経路に
-///   ならない（環境変数由来の暗黙の値を拒否する `usable_base` とは入力の信頼度が異なる）
+/// - `..` を含むパスは受け付けるが、[`ExplicitStore::new`] が副作用の前に字句的に
+///   畳み込んで保存する（`/tmp/new-dir/../profile` は `/tmp/profile`）。畳み込まずに
+///   [`Profile::open`] へ渡すと、途中要素（`/tmp/new-dir`）が最終ルートの外に作成される
+///   ため（`PROF-1`・`PROF-4`）。symlink を含む `a/link/..` も字句的に `a` として扱う
 /// - `..` を畳み込んだ結果が OS のルート（`/`・ドライブルート）になる指定は、
 ///   `fchmod(0700)` やファイル作成が OS ルートへ及ぶため [`ExplicitStore::new`] が
 ///   [`ProfileError::InvalidLayout`] で拒否する
@@ -204,7 +205,7 @@ impl ExplicitStore {
                 reason: "explicit profile root must not be empty",
             });
         }
-        let root = std::path::absolute(&path)?;
+        let root = normalize_lexically(&std::path::absolute(&path)?);
         if !root.is_absolute() {
             return Err(ProfileError::InvalidLayout {
                 path: root,
@@ -230,6 +231,33 @@ impl ProfileStore for ExplicitStore {
     fn resolve_root(&self) -> Result<ResolvedRoot, ProfileError> {
         Ok(ResolvedRoot::new(self.root.clone(), RootSource::Explicit))
     }
+}
+
+/// `..` と `.` を字句的に畳み込んだパスを返す（`PROF-1`）。
+///
+/// [`ExplicitStore::new`] が、[`Profile::open`] に `..` 付きパスを渡すと最終ルート外の
+/// 途中要素が作成される問題を、副作用の前に防ぐために使う。ルート直上の `..` は
+/// ルートに留まる（OS の解決規則と同じ）。ファイルシステムは参照しない。
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    let mut normal_depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => {
+                out.push(name);
+                normal_depth += 1;
+            }
+            Component::ParentDir => {
+                if normal_depth > 0 {
+                    out.pop();
+                    normal_depth -= 1;
+                }
+            }
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
+        }
+    }
+    out
 }
 
 /// `..` を字句的に畳み込んだ結果が OS のルート（`/`・`C:\\` などのドライブルート・
@@ -910,10 +938,36 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn prof_1_explicit_non_root_paths_are_accepted() {
-        for candidate in ["/a", "/a/b/..", "/a/../b"] {
+        for (candidate, expected) in [
+            ("/a", "/a"),
+            ("/a/b/..", "/a"),
+            ("/a/../b", "/b"),
+            ("/tmp/new-dir/../profile", "/tmp/profile"),
+            ("/a/./b", "/a/b"),
+        ] {
             let store = ExplicitStore::new(candidate).unwrap();
-            assert_eq!(store.root(), Path::new(candidate));
+            assert_eq!(store.root(), Path::new(expected));
         }
+    }
+
+    /// PROF-1: `..` を含む明示パスでも、最終ルートの外に途中要素が作成されない。
+    #[test]
+    fn prof_1_explicit_dotdot_creates_nothing_outside_final_root() {
+        let base = std::env::temp_dir().join(format!(
+            "fandhe-prof1-dotdot-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let raw = base.join("new-dir").join("..").join("profile");
+        let store = ExplicitStore::new(raw).unwrap();
+        assert_eq!(store.root(), base.join("profile").as_path());
+        let _profile = Profile::open(store.root()).unwrap();
+        assert!(base.join("profile").is_dir());
+        assert!(!base.join("new-dir").exists());
+        drop(_profile);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// PROF-1: `OverridableStore` は dyn 互換で明示パスを返す。
