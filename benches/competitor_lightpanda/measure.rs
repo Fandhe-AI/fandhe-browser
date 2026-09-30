@@ -11,6 +11,13 @@
 //! の `main` は環境変数の解析・[`run_all`] の呼び出し・出力だけを行う薄い
 //! ラッパーになる。
 //!
+//! ポート所有者確認（TASK-84.6・Issue #559）: readiness 成功時に、probe した
+//! ポートの所有 PID が起動した子プロセスツリーに含まれるかを
+//! [`check_port_owner`] で確認する事前ゲートを持つ。OS 別の実照会
+//! （Linux: #560・macOS: #561・Windows: #562）は未実装で、現状は全 OS が
+//! 「未対応」を返し、従来どおり事後確認（[`reprobe_after_kill`]）だけに
+//! 頼る（併用方針）。
+//!
 //! 対応ビヘイビア: バイナリサイズ計測が使う `PERF-1`、cold start 計測が使う
 //! `PERF-3`、アイドル RSS 計測が使う `PERF-6`、MCP トークン削減率計測が使う
 //! `AISNAP-1`（TASK-84（84.1）・Issue #211）。
@@ -37,12 +44,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::support::{
-    DeadlineReader, JsonValue, Outcome, apply_new_process_group, approx_tokens, arg_error_gate,
-    bench_exit_code, content_length_exceeds_limit, expand_args, fixture_kind,
+    DeadlineReader, JsonValue, Outcome, PortOwnerError, apply_new_process_group, approx_tokens,
+    arg_error_gate, bench_exit_code, content_length_exceeds_limit, expand_args, fixture_kind,
     http_status_for_io_error, json_escape, kill_process_group,
     looks_like_browser_readiness_response, lookup_fixture, median, parse_content_length,
     parse_http_request_line, parse_http_status, parse_json, port_conflict_error, reduction_pct,
-    require_bin, token_reduction_gate, validate_mcp_response, wait_with_deadline,
+    require_bin, token_reduction_gate, validate_mcp_response, verify_port_owner,
+    wait_with_deadline,
 };
 // `parse_pgrep_pids` は unix 専用の `pgrep_children`（下記 `#[cfg(unix)]`）が
 // 呼ぶ。`parse_tasklist_mem_kb` は windows 専用の `sample_rss_kb`
@@ -492,6 +500,8 @@ impl Drop for ChildGuard {
 /// 呼び出し元 `spawn_and_wait_ready` 側で「ポートが空いているか」ではなく
 /// 「応答しているのが自分の子プロセスらしいか」を検証する
 /// （[`looks_like_browser_readiness_response`]・`Child::try_wait` 参照）。
+/// さらに readiness 成功時に [`check_port_owner`]（TASK-84.6）でポートの
+/// 所有 PID が子プロセスツリー内かを確認する（OS 別実装は #560〜#562）。
 fn reserve_port() -> Result<u16, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind failed: {e}"))?;
     listener
@@ -512,9 +522,13 @@ fn reserve_port() -> Result<u16, String> {
 /// 既に終了していれば別プロセスの応答を拾う前に打ち切る、(2) 応答本文が
 /// ブラウザらしい形（JSON オブジェクト）であることを
 /// [`looks_like_browser_readiness_response`] で確認する、の 2 点を追加した。
-/// 子プロセスが実際にそのポートを bind していることまでは確認できていない
-/// （std だけでは OS 非依存にソケットの所有プロセスを調べる手段が無い。
-/// `looks_like_browser_readiness_response` のドキュメント参照）。
+/// 加えて readiness 成功時に [`check_port_owner`] で、子プロセス（ツリー）が
+/// 実際にそのポートを所有していることを確認する（TASK-84.6）。所有者が
+/// 一致しない・見つからない・照会に失敗した場合は `Err` を返し、呼び出し元
+/// の計測を `Outcome::Error` にする。`check_port_owner` の照会時間を
+/// cold start（`PERF-3`）へ混ぜないため、経過時間は照会の前に確定させる。
+/// 所有者確認が未対応の OS では stderr に 1 回だけ注記を出し、事後確認
+/// （[`reprobe_after_kill`]）だけに頼る。
 fn spawn_and_wait_ready(
     bin: &PathBuf,
     args: &[String],
@@ -583,7 +597,13 @@ fn spawn_and_wait_ready(
             Ok((status, body))
                 if (200..300).contains(&status) && looks_like_browser_readiness_response(&body) =>
             {
-                return Ok((guard, port, start.elapsed()));
+                let elapsed = start.elapsed();
+                match check_port_owner(guard.0.id(), port) {
+                    Ok(PortOwnerVerdict::Verified) => {}
+                    Ok(PortOwnerVerdict::Unsupported) => note_port_owner_unsupported_once(),
+                    Err(e) => return Err(format!("port owner verification failed: {e}")),
+                }
+                return Ok((guard, port, elapsed));
             }
             Ok((status, body)) => {
                 // 応答は得られたが readiness の条件を満たさない（ステータス・
@@ -626,6 +646,85 @@ pub(crate) const PROBE_BODY_MAX_BYTES: usize = 64 * 1024;
 /// 呼ぶ際の `outer_deadline` を組み立てるために参照する。
 pub(crate) const PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// ポート所有者確認の結果（`Err` 以外）。`Unsupported` は「未確認」であり
+/// 「確認済み」ではない（REPAIR-3）。
+enum PortOwnerVerdict {
+    Verified,
+    Unsupported,
+}
+
+/// [`spawn_and_wait_ready`] の readiness 成功時に呼ばれる、ポート所有者の
+/// 事前ゲート（TASK-84.6・`PERF-3`/`PERF-6`）。`port` の LISTEN 所有 PID が
+/// `root_pid` の子プロセスツリー内に収まるかを確認する。
+///
+/// 所有者を先に照会してから候補（子＋子孫）を集める。照会時点で所有していた
+/// 子孫は、直後のツリー走査にも必ず現れるため。判定は純粋関数
+/// [`verify_port_owner`] に委ねる。`reprobe_after_kill`（kill 後の事後確認）
+/// は置き換えず併用する: 本関数が未対応の OS での唯一の防御になり、確認後に
+/// 割り込んだプロセスや居残りも事後確認が検出する。
+///
+/// 外部コマンドを使う OS 別実装（#561・#562）は、`Command::new` と分割済みの
+/// 固定引数だけを使いシェルを通さない・出力バイト数/行数/PID 数を上限で縛る・
+/// `get()` と checked 演算を使い `[]`/`unwrap` を使わない・
+/// `run_with_deadline`/`EXTERNAL_COMMAND_DEADLINE` で期限を付ける、を守る。
+fn check_port_owner(root_pid: u32, port: u16) -> Result<PortOwnerVerdict, PortOwnerError> {
+    let Some(owner_pids) = lookup_port_owner_pids(port)? else {
+        return Ok(PortOwnerVerdict::Unsupported);
+    };
+    let candidates = collect_owner_candidate_pids(root_pid, port)?;
+    verify_port_owner(port, root_pid, &owner_pids, &candidates)?;
+    Ok(PortOwnerVerdict::Verified)
+}
+
+/// `port` で LISTEN しているソケットの所有 PID を OS に照会する。
+/// `Ok(None)` は「この OS では未対応」（確認済みではない）。
+///
+/// スタブ（TASK-84.6.1）: 現状は全 OS で `Ok(None)` を返す。将来は
+/// Linux（#560）が `/proc/net/tcp{,6}` の LISTEN inode と `/proc/<pid>/fd`
+/// の `socket:[inode]` の突き合わせ、macOS（#561）が
+/// `lsof -nP -iTCP:<port> -sTCP:LISTEN -Fp`、Windows（#562）が
+/// `netstat -ano -p TCP` で実装する。照合対象は 127.0.0.1 / 0.0.0.0 の
+/// LISTEN（IPv6 の扱いは各 issue で決める）。照会失敗は
+/// [`PortOwnerError::LookupFailed`] で返す。
+fn lookup_port_owner_pids(_port: u16) -> Result<Option<Vec<u32>>, PortOwnerError> {
+    Ok(None)
+}
+
+/// 所有者として許容する PID の候補（`root_pid` とその子孫）を集める。
+/// unix は既存の [`collect_stable_process_tree_pids`] を使う。
+/// 走査に失敗した場合は [`PortOwnerError::LookupFailed`]。
+#[cfg(unix)]
+fn collect_owner_candidate_pids(root_pid: u32, port: u16) -> Result<Vec<u32>, PortOwnerError> {
+    collect_stable_process_tree_pids(root_pid).ok_or_else(|| PortOwnerError::LookupFailed {
+        port,
+        reason: "process tree scan did not stabilize".to_string(),
+    })
+}
+
+/// windows 版のスタブ（TASK-84.6.1）。Windows にはまだプロセスツリーの走査が
+/// 無い（`sample_rss_kb` は単体 PID）ため常に `LookupFailed` を返す。#562
+/// （TASK-84.6.4）で実装する。現状は `lookup_port_owner_pids` が未対応を返す
+/// ためここへは到達しない。
+#[cfg(windows)]
+fn collect_owner_candidate_pids(_root_pid: u32, port: u16) -> Result<Vec<u32>, PortOwnerError> {
+    Err(PortOwnerError::LookupFailed {
+        port,
+        reason: "process tree enumeration is not implemented on windows yet (TASK-84.6.4)"
+            .to_string(),
+    })
+}
+
+/// 所有者確認が未対応であることを、プロセス内で 1 回だけ stderr へ注記する
+/// （未対応を「確認済み」と装わない。REPAIR-3）。
+fn note_port_owner_unsupported_once() {
+    static NOTED: AtomicBool = AtomicBool::new(false);
+    if !NOTED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "notice: port owner verification is not implemented on this OS yet (TASK-84.6); relying on post-hoc reprobe"
+        );
+    }
+}
+
 /// [`reprobe_after_kill`] が同じポートへ再接続を試みる際の期限。
 /// `TcpStream::connect_timeout` は接続拒否（誰も listen していない）なら
 /// この期限を待たずに即座に返るため、実際にはこの値は「応答が無いことを
@@ -650,7 +749,12 @@ const PORT_CONFLICT_REPROBE_TIMEOUT: Duration = Duration::from_millis(500);
 ///   場合、それを「元から居た別プロセス」と区別できない
 /// - 対象が孫プロセス以降を起動していた場合、`ChildGuard`/
 ///   `kill_process_group` の `wait` は直接の子までしか保証しない
-/// - std だけではソケットの所有者を PID で直接確認できない
+/// - 所有者の PID 確認（`check_port_owner`）は OS 別実装（#560〜#562）が
+///   入るまで行われない
+///
+/// 役割分担（TASK-84.6）: 事前ゲートの [`check_port_owner`]（ポートの所有
+/// PID 確認）とは置き換えずに併用する。事前ゲートが未対応の OS では本関数が
+/// 唯一の防御で、事前ゲートの後に割り込んだプロセスや居残りも検出できる。
 ///
 /// これらの限界があっても、「対象を殺したのに同じポートがまだ応答する」
 /// という明白な矛盾を検出できることには意味があり、黙って誤った計測値を

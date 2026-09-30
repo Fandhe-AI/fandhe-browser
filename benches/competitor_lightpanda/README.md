@@ -24,6 +24,11 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
   `idleRssKb` の実測値があっても数値比較をせず `unsupported` になる
   （下記「`perf6` フィールド」参照）。`CHROMIUM_IDLE_RSS_KB` には、別途
   計測したプロセスツリー全体の実測値を渡す運用にする（既定値は埋め込まない）
+- ポート所有者確認（TASK-84.6・Issue #559）: probe したポートの所有 PID が
+  子プロセスツリー内かを readiness 成功時に確認する共通インターフェース
+  （`check_port_owner`）は追加済みだが、OS 別の実照会は未実装（Linux: #560・
+  macOS: #561・Windows: #562）で、現状は全 OS が「未対応」として従来の
+  事後確認（`reprobe_after_kill`）だけに頼る（両者は併用する設計）
 
 ## 運用（ローカルでの実測・記録）
 
