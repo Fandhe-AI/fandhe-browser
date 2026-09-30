@@ -96,10 +96,26 @@ fn form_id_resolves(doc: &Document, form_id: &str) -> bool {
     if form_id.is_empty() {
         return false;
     }
-    doc.descendants(doc.root())
-        .take(MAX_FORM_ID_SCAN_NODES)
-        .find(|n| doc.is_element(*n) && doc.attribute(*n, "id") == Some(form_id))
-        .is_some_and(|n| is_html_named(doc, n, "form"))
+    // `descendants` は生成時に根の全子ノードをスタックへ積むため使わない。
+    // 子イテレータのスタック（長さは深さ以下・訪問数で上限）で前順に走査し、
+    // 幅広い文書でも確保量を `MAX_FORM_ID_SCAN_NODES` に依存させない。
+    let mut stack = vec![doc.children(doc.root())];
+    let mut visited = 0usize;
+    while let Some(iter) = stack.last_mut() {
+        let Some(n) = iter.next() else {
+            stack.pop();
+            continue;
+        };
+        visited += 1;
+        if visited > MAX_FORM_ID_SCAN_NODES {
+            return false;
+        }
+        if doc.is_element(n) && doc.attribute(n, "id") == Some(form_id) {
+            return is_html_named(doc, n, "form");
+        }
+        stack.push(doc.children(n));
+    }
+    false
 }
 
 /// フォームオーナーを持つか（`form` 属性の参照先 `<form>` の実在、無ければ祖先の `<form>`）。
