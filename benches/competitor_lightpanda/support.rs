@@ -25,6 +25,10 @@
 //! 検証する（外部プロセス起動を伴うが、対象バイナリではなく OS 標準の
 //! シェルのみを使うため、依存関係は増えない）。
 //!
+//! ポート所有者確認の共通型・判定ロジック（[`PortOwnerError`]・
+//! [`verify_port_owner`]。TASK-84.6・Issue #559）もここに置く。OS 別の実照会は
+//! `measure.rs` 側のスタブを #560〜#562 が埋める。
+//!
 //! `AISNAP-1`（MCP トークン削減率）計測は、任意の外部 URL ではなく、
 //! リポジトリに同梱した静的 fixture（外部参照を含まない自作コンテンツ。
 //! [`FIXTURE_TABLE`]）だけを対象にする。計測対象ブラウザは接続時に名前を
@@ -305,7 +309,9 @@ const READINESS_RESPONSE_FIELDS: &[&str] = &[
 /// 確認と組み合わせた best-effort。完全な防止には子プロセスが実際に
 /// そのポートを bind していることの確認が要るが、std だけでは OS
 /// 非依存にソケットの所有プロセスを調べる手段が無く、`unsafe`・新規
-/// 依存なしでは実装しない）。
+/// 依存なしでは実装しない）。ポートの所有 PID の確認は別途
+/// [`verify_port_owner`]（TASK-84.6。OS 別の実照会は #560〜#562）が担い、
+/// 本関数の本文形チェックはそれと併用する前段の足切りである。
 pub fn looks_like_browser_readiness_response(body: &str) -> bool {
     let Ok(JsonValue::Object(fields)) = parse_json(body) else {
         return false;
@@ -1238,6 +1244,93 @@ pub fn kill_process_group(pid: u32) -> Result<(), String> {
     exit_status_to_result(status)
 }
 
+/// ポート所有者確認（TASK-84.6・`PERF-3`/`PERF-6`）が失敗した理由。
+///
+/// `measure.rs` の `check_port_owner` が返す。どの variant も「この試行の
+/// 計測値を採用しない」を意味し、呼び出し元 `spawn_and_wait_ready` が
+/// `Err` へ変換して試行を `Outcome::Error` にする（fail-closed）。将来
+/// 理由が増えても呼び出し側を壊さないよう列挙型にしている（REPAIR-4）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortOwnerError {
+    /// probe したポートで LISTEN しているソケットの所有者が見つからない
+    /// （測定対象外のプロセスが所有していて見えない場合を含む）。
+    NoOwnerFound { port: u16 },
+    /// 所有者の中に、起動した子プロセスツリーへ含まれない PID がある。
+    Mismatch {
+        port: u16,
+        root_pid: u32,
+        foreign_pids: Vec<u32>,
+    },
+    /// OS 側の照会が失敗した（外部コマンドの起動失敗・非 0 終了・パース不能・
+    /// 上限超過・プロセスツリー走査失敗）。
+    LookupFailed { port: u16, reason: String },
+}
+
+impl std::fmt::Display for PortOwnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoOwnerFound { port } => {
+                write!(f, "port owner not found for port {port}")
+            }
+            Self::Mismatch {
+                port,
+                root_pid,
+                foreign_pids,
+            } => write!(
+                f,
+                "port owner mismatch on port {port}: pids {foreign_pids:?} are outside the process tree of pid {root_pid}"
+            ),
+            Self::LookupFailed { port, reason } => {
+                write!(f, "port owner lookup failed for port {port}: {reason}")
+            }
+        }
+    }
+}
+
+/// ポートの所有 PID（`owner_pids`）がすべて、起動した子プロセスツリー
+/// （`candidate_pids`）に含まれるかを判定する純粋関数（TASK-84.6・
+/// `PERF-3`/`PERF-6`）。
+///
+/// `measure.rs` の `check_port_owner` が、OS 別の照会結果
+/// （`lookup_port_owner_pids`）とツリー走査結果を渡して呼ぶ。契約:
+/// - `owner_pids` が空なら [`PortOwnerError::NoOwnerFound`]
+/// - `owner_pids` の全員が `candidate_pids` に含まれるときだけ `Ok(())`。
+///   fork したワーカーはリッスンソケットを継承し得るため、外部の PID が
+///   1 つでもあれば拒否する
+/// - 不一致なら [`PortOwnerError::Mismatch`]。`foreign_pids` は候補外の
+///   PID だけを重複なしで、出現順に保持する
+///
+/// 件数は呼び出し側（照会・ツリー走査）が上限で縛る前提で、本関数は
+/// `contains` の線形比較のみを行う（添字アクセスなし）。
+/// `reprobe_after_kill`（事後確認）との役割分担は [`port_conflict_error`]
+/// を参照（本関数は事前ゲート、あちらは所有者確認が未対応の OS での
+/// 唯一の防御として併用する）。
+pub fn verify_port_owner(
+    port: u16,
+    root_pid: u32,
+    owner_pids: &[u32],
+    candidate_pids: &[u32],
+) -> Result<(), PortOwnerError> {
+    if owner_pids.is_empty() {
+        return Err(PortOwnerError::NoOwnerFound { port });
+    }
+    let mut foreign_pids: Vec<u32> = Vec::new();
+    for pid in owner_pids {
+        if !candidate_pids.contains(pid) && !foreign_pids.contains(pid) {
+            foreign_pids.push(*pid);
+        }
+    }
+    if foreign_pids.is_empty() {
+        Ok(())
+    } else {
+        Err(PortOwnerError::Mismatch {
+            port,
+            root_pid,
+            foreign_pids,
+        })
+    }
+}
+
 /// `spawn_and_wait_ready`（`measure.rs`）の 1 試行後、対象
 /// プロセス（グループ）を kill し `wait` で終了を確認したあと、同じポート
 /// へ短い期限で再接続を試みた結果から、その試行を計測値としてそのまま
@@ -1251,6 +1344,11 @@ pub fn kill_process_group(pid: u32) -> Result<(), String> {
 /// を事後確認する（post-hoc な所有権確認）。この関数はその確認結果
 /// （`reprobe_still_responds`）だけを受け取り、`true`（まだ応答がある）
 /// なら計測を `Error` として扱うべき理由文字列を返す。
+///
+/// 役割分担（TASK-84.6）: 事前ゲートの [`verify_port_owner`]（readiness
+/// 成功時にポートの所有 PID を確認。OS 別実装は #560〜#562 で、現状は全 OS
+/// 未対応）と本事後確認は併用する。本確認は所有者確認が未対応の OS での
+/// 唯一の防御であり、所有者確認の後に割り込んだプロセスや居残りも検出する。
 ///
 /// 限界（呼び出し元 `measure.rs` の `reprobe_after_kill` の
 /// ドキュメントにも記載）: (1) kill から再接続までの間に別のプロセスが
@@ -1956,6 +2054,78 @@ fn parse_object(
 
 #[cfg(test)]
 mod tests {
+
+    // --- PERF-3 / PERF-6: verify_port_owner（TASK-84.6） ---
+
+    #[test]
+    fn perf3_verify_port_owner_empty_owners_is_no_owner_found() {
+        assert_eq!(
+            verify_port_owner(9222, 100, &[], &[100, 101]),
+            Err(PortOwnerError::NoOwnerFound { port: 9222 })
+        );
+    }
+
+    #[test]
+    fn perf3_verify_port_owner_root_owner_is_ok() {
+        assert_eq!(verify_port_owner(9222, 100, &[100], &[100, 101]), Ok(()));
+    }
+
+    #[test]
+    fn perf3_verify_port_owner_descendant_owner_is_ok() {
+        assert_eq!(
+            verify_port_owner(9222, 100, &[101, 102], &[100, 101, 102]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn perf6_verify_port_owner_foreign_owner_is_mismatch() {
+        assert_eq!(
+            verify_port_owner(9222, 100, &[555], &[100, 101]),
+            Err(PortOwnerError::Mismatch {
+                port: 9222,
+                root_pid: 100,
+                foreign_pids: vec![555],
+            })
+        );
+    }
+
+    #[test]
+    fn perf6_verify_port_owner_mixed_owners_reports_only_foreign_deduped() {
+        assert_eq!(
+            verify_port_owner(9222, 100, &[101, 555, 555, 777], &[100, 101]),
+            Err(PortOwnerError::Mismatch {
+                port: 9222,
+                root_pid: 100,
+                foreign_pids: vec![555, 777],
+            })
+        );
+    }
+
+    #[test]
+    fn perf3_port_owner_error_display_contains_details() {
+        let mismatch = PortOwnerError::Mismatch {
+            port: 9222,
+            root_pid: 100,
+            foreign_pids: vec![555],
+        };
+        let text = mismatch.to_string();
+        assert!(text.contains("port owner mismatch"), "{text}");
+        assert!(text.contains("9222"), "{text}");
+        assert!(text.contains("555"), "{text}");
+        let none = PortOwnerError::NoOwnerFound { port: 9222 }.to_string();
+        assert!(
+            none.contains("port owner") && none.contains("9222"),
+            "{none}"
+        );
+        let failed = PortOwnerError::LookupFailed {
+            port: 9222,
+            reason: "lsof exited with status 1".to_string(),
+        }
+        .to_string();
+        assert!(failed.contains("lsof exited with status 1"), "{failed}");
+        assert!(failed.contains("9222"), "{failed}");
+    }
     // Cargo は `[[bench]]` ターゲット（本ファイルを `#[path]` で取り込む
     // `competitor_lightpanda.rs`）にも常に `--cfg test`（`--test` フラグ自体は
     // 付けない）を渡すため、この `mod tests` はベンチ側のビルドでも解析対象になる。
