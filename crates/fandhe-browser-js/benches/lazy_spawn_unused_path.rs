@@ -327,9 +327,8 @@ mod linux_impl {
             let max_children = r.iter().map(|x| x.child_process_count).max().unwrap_or(0);
             let pid_seen = r.iter().any(|x| x.worker_pid_after_new);
             in_process.push(format!(
-                "\"{mode}\":{{\"workerPidAfterNew\":{},\"maxChildProcessCount\":{max_children},\
+                "\"{mode}\":{{\"workerPidAfterNew\":{pid_seen},\"maxChildProcessCount\":{max_children},\
                  \"rssDeltaKiBMedian\":{},\"pssDeltaKiBMedian\":{}}}",
-                if pid_seen { "true" } else { "null" },
                 calc::median_i64(&rss).ok_or("no rss samples")?,
                 calc::median_i64(&pss).ok_or("no pss samples")?,
             ));
