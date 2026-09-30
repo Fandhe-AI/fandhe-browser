@@ -516,7 +516,7 @@ impl Profile {
     }
 
     /// [`Profile::open`] と同じだが、既存のルートディレクトリが他者と共有される形
-    /// （unix で sticky bit 付き・group 書込可・other 書込可）の場合は `fchmod(0700)` の
+    /// （unix で group/other にアクセス権がある、または sticky 等が立っている。`0755`・`/tmp` 等）の場合は `fchmod(0700)` の
     /// 前に [`ProfileError::InvalidLayout`] で拒否する（`PROF-1`・TASK-60（60.4）・#203）。
     ///
     /// 判定は実際に開いたルートのハンドル（fd）に対する `fstat` で行い、パス検査と
@@ -1826,15 +1826,19 @@ fn open_dir_all_verified(path: &Path) -> Result<OwnedFd, ProfileError> {
 /// 本 crate の未実装範囲。`XOS-7`〜`XOS-10`。TASK-50（50.1）・#176 のスコープ
 /// 外。coding-rust.md「クロスプラットフォーム」で OS 固有処理を
 /// `cfg(target_os = ...)` に局所化する方針に従う）。
-/// ハンドル `fd` のディレクトリが共有形（sticky・group 書込・other 書込）なら拒否する。
+/// ハンドル `fd` のディレクトリが他者にアクセス可能な形（group/other の権限ビット・
+/// setuid/setgid/sticky のいずれかが立っている）なら拒否する。
 ///
 /// `fchmod(0700)` が共有ディレクトリの他利用者から権限を奪うのを防ぐ。`fd` に対する
 /// `fstat` のため、パスの再解決による TOCTOU が生じない（`PROF-1`）。
 #[cfg(unix)]
 fn reject_shared_dir_fd(fd: &OwnedFd, display_path: &Path) -> Result<(), ProfileError> {
     let st = rustix::fs::fstat(fd).map_err(|err| ProfileError::Io(err.into()))?;
-    // sticky(0o1000)・group 書込(0o020)・other 書込(0o002)。
-    if st.st_mode & 0o1022 != 0 {
+    // setuid/setgid/sticky(0o7000) と group/other の全権限ビット(0o077)。
+    // 0755 のような他者が読み取り・通過できる既存ディレクトリも、`fchmod(0700)` で
+    // 他者のアクセスを奪うため拒否する（専用プロファイルと確認できるのは所有者のみ
+    // アクセス可のものだけ）。
+    if st.st_mode & 0o7077 != 0 {
         return Err(ProfileError::InvalidLayout {
             path: display_path.to_path_buf(),
             reason: "explicit profile root must not be an existing shared directory",
