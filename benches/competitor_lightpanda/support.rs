@@ -30,7 +30,10 @@
 //! `measure.rs` の `lookup_port_owner_pids` が担い、Linux は実装済み
 //! （TASK-84.6.2・#560。`/proc` の解析部 [`proc_net_tcp_listen_inode`] 等を
 //! 本ファイルに置く）、macOS は実装済み（TASK-84.6.3・#561。`lsof` の出力解析部
-//! [`parse_lsof_listen_pids`] を本ファイルに置く）、Windows（#562）は未対応。
+//! [`parse_lsof_listen_pids`] を本ファイルに置く）、Windows も実装済み
+//! （TASK-84.6.4・#562。`netstat` の解析部 [`parse_netstat_listen_pids`] と
+//! プロセス表の解析・子孫算出 [`parse_windows_process_table`]・
+//! [`windows_descendant_pids`] を本ファイルに置く）。
 //!
 //! `AISNAP-1`（MCP トークン削減率）計測は、任意の外部 URL ではなく、
 //! リポジトリに同梱した静的 fixture（外部参照を含まない自作コンテンツ。
@@ -313,8 +316,8 @@ const READINESS_RESPONSE_FIELDS: &[&str] = &[
 /// そのポートを bind していることの確認が要るが、std だけでは OS
 /// 非依存にソケットの所有プロセスを調べる手段が無く、`unsafe`・新規
 /// 依存なしでは実装しない）。ポートの所有 PID の確認は別途
-/// [`verify_port_owner`]（TASK-84.6。OS 別の実照会は Linux のみ実装済み。
-/// Windows #562 は未対応。Linux・macOS は実装済み）が担い、
+/// [`verify_port_owner`]（TASK-84.6。OS 別の実照会は Linux・macOS・Windows
+/// で実装済み）が担い、
 /// 本関数の本文形チェックはそれと併用する前段の足切りである。
 pub fn looks_like_browser_readiness_response(body: &str) -> bool {
     let Ok(JsonValue::Object(fields)) = parse_json(body) else {
@@ -1110,14 +1113,25 @@ pub fn run_with_deadline(
 
 /// `command` の stdout を上限付きで採取しつつ、完了を期限付きで待つ。
 ///
-/// `ps`/`pgrep`/`tasklist` のような出力の小さいローカルコマンド専用
-/// （`measure.rs` の unix 版 `sample_process_group_rss_kb`・windows 版
-/// `sample_rss_kb` が使う。TASK-84.2・TASK-84.5・PERF-6）。
-/// `max_stdout_bytes` を超える出力は切り捨てて読み続ける（無制限確保を
-/// 避ける。coding-rust.md「長さ・件数を上限検証してからアロケーションに
-/// 使う」）。stdin は `Stdio::null()` に固定する（呼び出し元からの入力を
-/// 渡す用途を持たない）。unix・windows 両方の経路から呼ばれるため
-/// `#[cfg(...)]` は付けない。
+/// `ps`/`pgrep`/`tasklist`/`lsof`/`netstat`/`powershell` のようなローカルの OS
+/// 標準コマンド向け（`measure.rs` の `sample_process_group_rss_kb`・
+/// `sample_rss_kb`・各 OS 版 `lookup_port_owner_pids` などが使う。TASK-84.2・
+/// TASK-84.5・TASK-84.6.4・PERF-3/PERF-6）。
+///
+/// stdout は待機中に別スレッドで読み出し続ける。`netstat -ano` 等の出力は
+/// パイプ容量を超え得るため、`wait` の後に読む方式では子が書き込みで
+/// ブロックして期限切れ kill になり、照会が常に失敗してしまう（#562）。
+/// `max_stdout_bytes` を超える分は読み捨てて EOF まで読み続ける（子を
+/// ブロックさせず、かつ無制限確保を避ける。coding-rust.md「長さ・件数を
+/// 上限検証してからアロケーションに使う」）。返る `Vec` の長さが
+/// `max_stdout_bytes` に達していたら切り捨ての可能性があるので、呼び出し側で
+/// 検出する。stdin・stderr は `Stdio::null()` に固定する。
+///
+/// 読み出しスレッドの結果は残り期限付きの `recv_timeout` で受け取る
+/// （`join` は使わない。stdout を継承した孫プロセスが EOF を遅らせても
+/// 無期限に止まらないため）。受信期限超過・読み取りエラーは `Err`
+/// （fail-closed）。unix・windows 両方の経路から呼ばれるため `#[cfg(...)]`
+/// は付けない。
 pub fn run_capturing_output_with_deadline(
     mut command: std::process::Command,
     deadline: Duration,
@@ -1127,33 +1141,42 @@ pub fn run_capturing_output_with_deadline(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
+    let start = Instant::now();
     let mut child = command
         .spawn()
         .map_err(|e| format!("failed to spawn: {e}"))?;
-    // `ps -o rss=` のような対象コマンドの出力は常に数バイト〜数十バイト
-    // であり、パイプバッファ（多くの OS で 64KiB 以上）を埋めて書き込みが
-    // ブロックする実運用上のリスクは無視できる。読み出し自体は `wait` の
-    // 前ではなく後に行う（このプリミティブの想定用途では出力が極小で
-    // あるため、待機中に相手が書き込みでブロックすることはない）。
+    let mut out = child
+        .stdout
+        .take()
+        .ok_or_else(|| "child stdout was not captured".to_string())?;
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
+    std::thread::spawn(move || {
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        let result = loop {
+            match out.read(&mut buf) {
+                Ok(0) => break Ok(stdout),
+                Ok(n) => {
+                    let remaining = max_stdout_bytes.saturating_sub(stdout.len());
+                    let take = remaining.min(n);
+                    if let Some(chunk) = buf.get(..take) {
+                        stdout.extend_from_slice(chunk);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => break Err(format!("read stdout: {e}")),
+            }
+        };
+        let _ = tx.send(result);
+    });
     let status = wait_with_deadline(&mut child, deadline)?;
-    let mut stdout = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = out
-                .read(&mut buf)
-                .map_err(|e| format!("read stdout: {e}"))?;
-            if n == 0 {
-                break;
-            }
-            let remaining = max_stdout_bytes.saturating_sub(stdout.len());
-            let take = remaining.min(n);
-            stdout.extend_from_slice(&buf[..take]);
-            if stdout.len() >= max_stdout_bytes {
-                break;
-            }
-        }
-    }
+    // 子の終了後は通常 EOF がすぐ届く。期限を使い切っていても最低限の猶予を与える。
+    let remaining = deadline
+        .saturating_sub(start.elapsed())
+        .max(Duration::from_millis(500));
+    let stdout = rx
+        .recv_timeout(remaining)
+        .map_err(|_| "timed out waiting for stdout to reach EOF".to_string())??;
     Ok((status, stdout))
 }
 
@@ -1446,6 +1469,154 @@ pub fn parse_lsof_listen_pids(out: &str, port: u16, max_pids: usize) -> Result<V
     Ok(pids)
 }
 
+/// `netstat -a -n -o -p TCP`（または `TCPv6`）の出力から、`port` で LISTEN
+/// しているソケットの所有 PID を返す（TASK-84.6.4・#562。`measure.rs` の
+/// Windows 版 `lookup_port_owner_pids` が呼ぶ。`PERF-3`/`PERF-6`）。
+///
+/// 行は `TCP <local> <foreign> <state> <pid>` の 5 フィールド。見出し行と状態列
+/// （`LISTENING`）はロケールで翻訳されるため文字列に頼らず、先頭トークンが
+/// `TCP` の行だけを対象にし、LISTEN は外部アドレスのポートが `0` で判定する。
+/// 契約:
+/// - アドレスは [`parse_lsof_listen_pids`] と同じく 127.0.0.1 宛ての probe に
+///   応答し得るもの（`127.0.0.1`・`0.0.0.0`・`[::]`・`[::ffff:127.0.0.1]`）
+///   だけを数える（`[::1]` や他の IP は対象外。多めに数えても `Mismatch` が
+///   増えるだけで安全側）
+/// - `TCP` 行で形式不正（フィールド不足・`HOST:PORT` でない・ポート/PID が数値
+///   でない）、対象ポートの行の PID が 0 なら `Err`（fail-closed）
+/// - PID は重複なし・出現順。`max_pids` 超過も `Err`
+///
+/// 本体は cfg で落とさない（ユニットテストを 3 OS で実行するため）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn parse_netstat_listen_pids(
+    out: &str,
+    port: u16,
+    max_pids: usize,
+) -> Result<Vec<u32>, String> {
+    let mut pids: Vec<u32> = Vec::new();
+    for line in out.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.first().copied() != Some("TCP") {
+            continue;
+        }
+        let (Some(local), Some(foreign), Some(pid_text)) =
+            (fields.get(1), fields.get(2), fields.get(4))
+        else {
+            return Err(format!("malformed netstat TCP line: {line:?}"));
+        };
+        let port_of = |addr: &str| -> Result<(String, u16), String> {
+            let (host, port_text) = addr
+                .rsplit_once(':')
+                .ok_or_else(|| format!("netstat address is not HOST:PORT: {addr:?}"))?;
+            let p: u16 = port_text
+                .parse()
+                .map_err(|_| format!("invalid port in netstat address: {addr:?}"))?;
+            Ok((host.to_string(), p))
+        };
+        let (local_host, local_port) = port_of(local)?;
+        let (_, foreign_port) = port_of(foreign)?;
+        let pid: u32 = pid_text
+            .parse()
+            .map_err(|_| format!("invalid pid in netstat line: {line:?}"))?;
+        if foreign_port != 0 || local_port != port {
+            continue;
+        }
+        if pid == 0 {
+            return Err("pid 0 in netstat output".to_string());
+        }
+        let reachable = matches!(
+            local_host.as_str(),
+            "127.0.0.1" | "0.0.0.0" | "[::]" | "[::ffff:127.0.0.1]"
+        );
+        if reachable && !pids.contains(&pid) {
+            if pids.len() >= max_pids {
+                return Err(format!("more than {max_pids} processes own the port"));
+            }
+            pids.push(pid);
+        }
+    }
+    Ok(pids)
+}
+
+/// Windows のプロセス表（`Get-CimInstance Win32_Process` を「PID 親PID
+/// 作成時刻」の 3 数値・1 行 1 プロセスに整形した出力）を解析する
+/// （TASK-84.6.4・#562。`measure.rs` の Windows 版
+/// `collect_owner_candidate_pids` が呼ぶ）。空行は読み飛ばし、それ以外で 3 つの
+/// 数値でない行・`max_rows` 超過は `Err`（fail-closed）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn parse_windows_process_table(
+    out: &str,
+    max_rows: usize,
+) -> Result<Vec<(u32, u32, u64)>, String> {
+    let mut rows: Vec<(u32, u32, u64)> = Vec::new();
+    for line in out.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.is_empty() {
+            continue;
+        }
+        let (Some(pid), Some(ppid), Some(created), None) =
+            (fields.first(), fields.get(1), fields.get(2), fields.get(3))
+        else {
+            return Err(format!("malformed process table line: {line:?}"));
+        };
+        let parsed = (
+            pid.parse::<u32>(),
+            ppid.parse::<u32>(),
+            created.parse::<u64>(),
+        );
+        let (Ok(pid), Ok(ppid), Ok(created)) = parsed else {
+            return Err(format!("non-numeric process table line: {line:?}"));
+        };
+        if rows.len() >= max_rows {
+            return Err(format!("more than {max_rows} rows in process table"));
+        }
+        rows.push((pid, ppid, created));
+    }
+    Ok(rows)
+}
+
+/// プロセス表 `table`（PID・親 PID・作成時刻）から `root_pid` 自身と子孫の PID
+/// を幅優先で集める（TASK-84.6.4・#562。Windows 版
+/// `collect_owner_candidate_pids` が呼ぶ純関数）。
+///
+/// Windows は PID を再利用するため、終了済みの親の PID を別プロセスが再利用
+/// すると古い子が誤って子孫に見える。そこで「子の作成時刻 >= 親の作成時刻」の
+/// ときだけ親子とみなし、作成時刻 0（不明）の行は子として採用しない。
+/// `root_pid` が表に無い・ツリー件数が `max_tree` 超過は `Err`。訪問済み集合で
+/// 循環しても停止する。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn windows_descendant_pids(
+    root_pid: u32,
+    table: &[(u32, u32, u64)],
+    max_tree: usize,
+) -> Result<Vec<u32>, String> {
+    let Some(root_created) = table
+        .iter()
+        .find(|(pid, _, _)| *pid == root_pid)
+        .map(|(_, _, created)| *created)
+    else {
+        return Err(format!("pid {root_pid} not found in process table"));
+    };
+    let mut tree: Vec<(u32, u64)> = vec![(root_pid, root_created)];
+    let mut next = 0usize;
+    while let Some(&(parent, parent_created)) = tree.get(next) {
+        next += 1;
+        for (pid, ppid, created) in table {
+            if *ppid != parent
+                || *created == 0
+                || *created < parent_created
+                || tree.iter().any(|(seen, _)| seen == pid)
+            {
+                continue;
+            }
+            if tree.len() >= max_tree {
+                return Err(format!("more than {max_tree} processes in the tree"));
+            }
+            tree.push((*pid, *created));
+        }
+    }
+    Ok(tree.into_iter().map(|(pid, _)| pid).collect())
+}
+
 /// ポートの所有 PID（`owner_pids`）がすべて、起動した子プロセスツリー
 /// （`candidate_pids`）に含まれるかを判定する純粋関数（TASK-84.6・
 /// `PERF-3`/`PERF-6`）。
@@ -1463,7 +1634,7 @@ pub fn parse_lsof_listen_pids(out: &str, port: u16, max_pids: usize) -> Result<V
 /// `contains` の線形比較のみを行う（添字アクセスなし）。
 /// `reprobe_after_kill`（事後確認）との役割分担は [`port_conflict_error`]
 /// を参照（本関数は事前ゲート、あちらは所有者確認が未対応の OS
-/// （Windows）での唯一の防御として併用する）。
+/// での唯一の防御として併用する）。
 pub fn verify_port_owner(
     port: u16,
     root_pid: u32,
@@ -1505,8 +1676,8 @@ pub fn verify_port_owner(
 /// なら計測を `Error` として扱うべき理由文字列を返す。
 ///
 /// 役割分担（TASK-84.6）: 事前ゲートの [`verify_port_owner`]（readiness
-/// 成功時にポートの所有 PID を確認。Linux・macOS は実装済み（#560・#561）で、
-/// Windows #562 は未対応）と本事後確認は併用する。本確認は所有者確認が未対応の
+/// 成功時にポートの所有 PID を確認。Linux・macOS・Windows は実装済み
+/// （#560・#561・#562））と本事後確認は併用する。本確認は所有者確認が未対応の
 /// OS での唯一の防御であり、所有者確認の後に割り込んだプロセスや居残りも検出する。
 ///
 /// 限界（呼び出し元 `measure.rs` の `reprobe_after_kill` の
@@ -3713,6 +3884,173 @@ mod tests {
                 .expect("run succeeds");
         assert!(status.success());
         assert_eq!(stdout.len(), 4);
+    }
+
+    // --- parse_netstat_listen_pids（TASK-84.6.4・#562。3 OS で実行する） ---
+
+    #[test]
+    fn parse_netstat_listen_pids_ipv4_listener() {
+        let out = "\nActive Connections\n\n  Proto  Local Address          Foreign Address        State           PID\n  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1084\n  TCP    127.0.0.1:9222         0.0.0.0:0              LISTENING       4242\n  TCP    127.0.0.1:9222         127.0.0.1:50000        ESTABLISHED     4242\n  TCP    192.168.1.5:9222       0.0.0.0:0              LISTENING       7777\n";
+        assert_eq!(parse_netstat_listen_pids(out, 9222, 8), Ok(vec![4242]));
+    }
+
+    #[test]
+    fn parse_netstat_listen_pids_ipv6_wildcard() {
+        let out = "  TCP    [::]:9222              [::]:0                 LISTENING       555\n";
+        assert_eq!(parse_netstat_listen_pids(out, 9222, 8), Ok(vec![555]));
+    }
+
+    #[test]
+    fn parse_netstat_listen_pids_localized_output() {
+        let out = "Aktive Verbindungen\n\n  Proto  Lokale Adresse         Remoteadresse          Status           PID\n  TCP    0.0.0.0:9222           0.0.0.0:0              ABHÖREN         321\n";
+        assert_eq!(parse_netstat_listen_pids(out, 9222, 8), Ok(vec![321]));
+    }
+
+    #[test]
+    fn parse_netstat_listen_pids_excludes_other_port_and_loopback_v6() {
+        let out = "  TCP    [::1]:9222             [::]:0                 LISTENING       10\n  TCP    0.0.0.0:9223           0.0.0.0:0              LISTENING       11\n";
+        assert_eq!(parse_netstat_listen_pids(out, 9222, 8), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn parse_netstat_listen_pids_returns_system_pid_as_is() {
+        let out = "  TCP    0.0.0.0:9222           0.0.0.0:0              LISTENING       4\n";
+        assert_eq!(parse_netstat_listen_pids(out, 9222, 8), Ok(vec![4]));
+    }
+
+    #[test]
+    fn parse_netstat_listen_pids_dedups_pids() {
+        let out = "  TCP    0.0.0.0:9222           0.0.0.0:0              LISTENING       9\n  TCP    [::]:9222              [::]:0                 LISTENING       9\n";
+        assert_eq!(parse_netstat_listen_pids(out, 9222, 8), Ok(vec![9]));
+    }
+
+    #[test]
+    fn parse_netstat_listen_pids_rejects_malformed_tcp_line() {
+        assert!(parse_netstat_listen_pids("  TCP    0.0.0.0:9222\n", 9222, 8).is_err());
+        assert!(
+            parse_netstat_listen_pids(
+                "  TCP    0.0.0.0:9222  0.0.0.0:0  LISTENING  abc\n",
+                9222,
+                8
+            )
+            .is_err()
+        );
+        assert!(
+            parse_netstat_listen_pids("  TCP    nocolon  0.0.0.0:0  LISTENING  5\n", 9222, 8)
+                .is_err()
+        );
+        assert!(
+            parse_netstat_listen_pids("  TCP    0.0.0.0:9222  0.0.0.0:0  LISTENING  0\n", 9222, 8)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_netstat_listen_pids_rejects_more_than_max_pids() {
+        let out = "  TCP    0.0.0.0:9222  0.0.0.0:0  LISTENING  1\n  TCP    [::]:9222  [::]:0  LISTENING  2\n";
+        assert!(parse_netstat_listen_pids(out, 9222, 1).is_err());
+    }
+
+    #[test]
+    fn parse_netstat_listen_pids_empty_output_is_empty() {
+        assert_eq!(parse_netstat_listen_pids("", 9222, 8), Ok(Vec::new()));
+    }
+
+    // --- parse_windows_process_table / windows_descendant_pids ---
+
+    #[test]
+    fn parse_windows_process_table_parses_rows_and_skips_blank_lines() {
+        assert_eq!(
+            parse_windows_process_table("1 0 100\n\n  20 1 200  \r\n", 8),
+            Ok(vec![(1, 0, 100), (20, 1, 200)])
+        );
+    }
+
+    #[test]
+    fn parse_windows_process_table_rejects_malformed_and_oversized() {
+        assert!(parse_windows_process_table("1 0\n", 8).is_err());
+        assert!(parse_windows_process_table("1 0 100 7\n", 8).is_err());
+        assert!(parse_windows_process_table("a 0 100\n", 8).is_err());
+        assert!(parse_windows_process_table("1 0 100\n2 0 100\n", 1).is_err());
+    }
+
+    #[test]
+    fn windows_descendant_pids_collects_children_and_grandchildren() {
+        let table = [(10, 1, 100), (20, 10, 200), (30, 20, 300), (40, 1, 150)];
+        assert_eq!(
+            windows_descendant_pids(10, &table, 16),
+            Ok(vec![10, 20, 30])
+        );
+    }
+
+    #[test]
+    fn windows_descendant_pids_excludes_reused_parent_pid() {
+        // PID 20 の子 30 は 20 より古い作成時刻 = 終了済みの別プロセスの子
+        let table = [(10, 1, 100), (20, 10, 200), (30, 20, 150)];
+        assert_eq!(windows_descendant_pids(10, &table, 16), Ok(vec![10, 20]));
+    }
+
+    #[test]
+    fn windows_descendant_pids_excludes_unknown_creation_time() {
+        let table = [(10, 1, 100), (20, 10, 0)];
+        assert_eq!(windows_descendant_pids(10, &table, 16), Ok(vec![10]));
+    }
+
+    #[test]
+    fn windows_descendant_pids_errors_when_root_missing() {
+        assert!(windows_descendant_pids(99, &[(10, 1, 100)], 16).is_err());
+    }
+
+    #[test]
+    fn windows_descendant_pids_terminates_on_cycle() {
+        let table = [(10, 20, 100), (20, 10, 100)];
+        assert_eq!(windows_descendant_pids(10, &table, 16), Ok(vec![10, 20]));
+    }
+
+    #[test]
+    fn windows_descendant_pids_errors_when_tree_exceeds_max() {
+        let table = [(10, 1, 100), (20, 10, 200), (30, 10, 200)];
+        assert!(windows_descendant_pids(10, &table, 2).is_err());
+    }
+
+    /// パイプ容量を大きく超える出力でも、待機中に読み出すため子が
+    /// ブロックせず期限内に完了し、上限で打ち切られる（TASK-84.6.4・#562）。
+    #[cfg(unix)]
+    #[test]
+    fn run_capturing_output_with_deadline_drains_output_larger_than_pipe() {
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("i=0; while [ $i -lt 4096 ]; do printf '%063d\\n' 0; i=$((i+1)); done");
+        let (status, stdout) = run_capturing_output_with_deadline(
+            command,
+            std::time::Duration::from_secs(10),
+            100_000,
+        )
+        .expect("run succeeds");
+        assert!(status.success());
+        assert_eq!(stdout.len(), 100_000);
+    }
+
+    /// Windows 版。`powershell` で 256 KiB 超を出力しても詰まらない。
+    #[cfg(windows)]
+    #[test]
+    fn run_capturing_output_with_deadline_drains_output_larger_than_pipe_windows() {
+        let mut command = std::process::Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Console]::Out.Write('a' * 300000)",
+        ]);
+        let (status, stdout) = run_capturing_output_with_deadline(
+            command,
+            std::time::Duration::from_secs(30),
+            100_000,
+        )
+        .expect("run succeeds");
+        assert!(status.success());
+        assert_eq!(stdout.len(), 100_000);
     }
 
     // `Content-Length` が読み取り上限を

@@ -15,9 +15,11 @@
 //! ポートの所有 PID が起動した子プロセスツリーに含まれるかを
 //! [`check_port_owner`] で確認する事前ゲートを持つ。OS 別の実照会のうち
 //! Linux は実装済み（TASK-84.6.2・#560。`/proc` を std だけで読む）、macOS も
-//! 実装済み（TASK-84.6.3・#561。`lsof` の出力を解析する）。
-//! Windows（#562）は未実装で「未対応」を返し、従来どおり
-//! 事後確認（[`reprobe_after_kill`]）だけに頼る（併用方針）。
+//! 実装済み（TASK-84.6.3・#561。`lsof` の出力を解析する）、Windows も実装済み
+//! （TASK-84.6.4・#562。`netstat -ano` の LISTEN 所有 PID と
+//! `Get-CimInstance Win32_Process` から作る子プロセスツリーを突き合わせる）。
+//! これら以外の OS は「未対応」を返し、従来どおり事後確認
+//! （[`reprobe_after_kill`]）だけに頼る（併用方針）。
 //!
 //! 対応ビヘイビア: バイナリサイズ計測が使う `PERF-1`、cold start 計測が使う
 //! `PERF-3`、アイドル RSS 計測が使う `PERF-6`、MCP トークン削減率計測が使う
@@ -66,6 +68,12 @@ use crate::support::parse_pgrep_pids;
 use crate::support::parse_lsof_listen_pids;
 #[cfg(windows)]
 use crate::support::parse_tasklist_mem_kb;
+// Windows 版 `lookup_port_owner_pids` / `collect_owner_candidate_pids` の
+// 出力解析部（TASK-84.6.4・#562）。
+#[cfg(windows)]
+use crate::support::{
+    parse_netstat_listen_pids, parse_windows_process_table, windows_descendant_pids,
+};
 // Linux 版 `lookup_port_owner_pids` の `/proc` 解析部（TASK-84.6.2・#560）。
 #[cfg(target_os = "linux")]
 use crate::support::{parse_socket_link_inode, proc_net_tcp_listen_inode};
@@ -509,7 +517,7 @@ impl Drop for ChildGuard {
 /// （[`looks_like_browser_readiness_response`]・`Child::try_wait` 参照）。
 /// さらに readiness 成功時に [`check_port_owner`]（TASK-84.6）でポートの
 /// 所有 PID が子プロセスツリー内かを確認する（Linux・macOS は実装済み
-/// #560・#561。Windows #562 は未対応）。
+/// #560・#561、Windows は #562）。
 fn reserve_port() -> Result<u16, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind failed: {e}"))?;
     listener
@@ -535,7 +543,7 @@ fn reserve_port() -> Result<u16, String> {
 /// 一致しない・見つからない・照会に失敗した場合は `Err` を返し、呼び出し元
 /// の計測を `Outcome::Error` にする。`check_port_owner` の照会時間を
 /// cold start（`PERF-3`）へ混ぜないため、経過時間は照会の前に確定させる。
-/// 所有者確認が未対応の OS（Windows。Linux・macOS は実装済み）では stderr に
+/// 所有者確認が未対応の OS（Linux・macOS・Windows 以外）では stderr に
 /// 1 回だけ注記を出し、事後確認
 /// （[`reprobe_after_kill`]）だけに頼る。
 fn spawn_and_wait_ready(
@@ -673,7 +681,7 @@ pub(crate) enum PortOwnerVerdict {
 /// は置き換えず併用する: 本関数が未対応の OS での唯一の防御になり、確認後に
 /// 割り込んだプロセスや居残りも事後確認が検出する。
 ///
-/// Linux（#560）・macOS（#561）は実装済み。外部コマンドを使う OS 別実装（macOS 版・今後の Windows #562）は、
+/// Linux（#560）・macOS（#561）・Windows（#562）は実装済み。外部コマンドを使う OS 別実装（macOS 版・Windows 版）は、
 /// `Command::new` と分割済みの固定引数だけを使いシェルを通さない・出力バイト数/行数/PID 数を上限で縛る・
 /// `get()` と checked 演算を使い `[]`/`unwrap` を使わない・
 /// `run_with_deadline`/`EXTERNAL_COMMAND_DEADLINE` で期限を付ける、を守る。
@@ -693,11 +701,10 @@ pub(crate) fn check_port_owner(
 /// 起動した対象プロセスの PID。Linux 版が祖先関係の判定範囲に使う）。
 /// `Ok(None)` は「この OS では未対応」（確認済みではない）。
 ///
-/// Linux・macOS 以外（実質 Windows）版のスタブ（TASK-84.6.1）: Windows
-/// （#562）が `netstat -ano -p TCP` で実装するまで `Ok(None)` を返す。
-/// 照合対象は 127.0.0.1 / 0.0.0.0 の LISTEN（IPv6 の扱いは #562 で決める）。
+/// Linux・macOS・Windows 以外の OS 向けのスタブ（TASK-84.6.1）: `Ok(None)`
+/// （未対応）を返し、事後確認（[`reprobe_after_kill`]）だけに頼る。
 /// 照会失敗は [`PortOwnerError::LookupFailed`] で返す。
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub(crate) fn lookup_port_owner_pids(
     _root_pid: u32,
     _port: u16,
@@ -770,6 +777,81 @@ pub(crate) fn lookup_port_owner_pids(
     parse_lsof_listen_pids(&text, port, MAX_PORT_OWNER_PIDS)
         .map(Some)
         .map_err(|e| lookup_failed(format!("failed to parse lsof output: {e}")))
+}
+
+/// Windows 版が読む `netstat` 出力 1 回あたりの上限バイト数。到達したら
+/// 切り捨ての可能性があるため `LookupFailed` にする。
+#[cfg(windows)]
+const MAX_NETSTAT_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// Windows 版が読むプロセス表出力の上限バイト数。超過は `LookupFailed`。
+#[cfg(windows)]
+const MAX_PROCESS_TABLE_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Windows 版が受け付ける所有 PID 数・プロセス表の行数・子孫ツリーの件数の上限。
+/// 超過は黙って切り捨てず `LookupFailed`。
+#[cfg(windows)]
+const MAX_WINDOWS_OWNER_PIDS: usize = 64;
+#[cfg(windows)]
+const MAX_WINDOWS_PROCESS_ROWS: usize = 65_536;
+#[cfg(windows)]
+const MAX_WINDOWS_TREE_PIDS: usize = 256;
+
+/// Windows 版（TASK-84.6.4・#562。`PERF-3`/`PERF-6`）: `netstat -a -n -o -p TCP`
+/// と `-p TCPv6`（`[::]` のデュアルスタック LISTEN は後者にしか出ない）で
+/// LISTEN 所有 PID を照会する。[`check_port_owner`] から readiness 成功時に
+/// 呼ばれ、出力は support の [`parse_netstat_listen_pids`] が解析する。
+///
+/// `unsafe`（`GetExtendedTcpTable` FFI）・新規依存を避けるため外部コマンド
+/// 方式とし、`Command::new` と固定引数（ポートも埋め込まない）でシェルを通さず、
+/// 期限（`EXTERNAL_COMMAND_DEADLINE`）と出力上限を付ける。fail-closed:
+/// 起動失敗・非 0 終了・期限超過・出力上限到達・形式不正・PID 数超過は
+/// `LookupFailed`。該当なしは `Ok(Some(空))`（後段が `NoOwnerFound` にする）。
+#[cfg(windows)]
+pub(crate) fn lookup_port_owner_pids(
+    _root_pid: u32,
+    port: u16,
+) -> Result<Option<Vec<u32>>, PortOwnerError> {
+    let lookup_failed = |reason: String| PortOwnerError::LookupFailed { port, reason };
+    let mut pids: Vec<u32> = Vec::new();
+    for proto in ["TCP", "TCPv6"] {
+        let mut command = Command::new("netstat");
+        command.args(["-a", "-n", "-o", "-p", proto]);
+        let (status, stdout) = crate::support::run_capturing_output_with_deadline(
+            command,
+            crate::support::EXTERNAL_COMMAND_DEADLINE,
+            MAX_NETSTAT_OUTPUT_BYTES,
+        )
+        .map_err(|e| lookup_failed(format!("failed to run netstat -p {proto}: {e}")))?;
+        if stdout.len() >= MAX_NETSTAT_OUTPUT_BYTES {
+            return Err(lookup_failed(format!(
+                "netstat output reached {MAX_NETSTAT_OUTPUT_BYTES} bytes and may be truncated"
+            )));
+        }
+        if !status.success() {
+            return Err(lookup_failed(format!(
+                "netstat -p {proto} exited with status {status}"
+            )));
+        }
+        // OEM コードページだが、使うのは ASCII トークンだけなので lossy で足りる。
+        let listed = parse_netstat_listen_pids(
+            &String::from_utf8_lossy(&stdout),
+            port,
+            MAX_WINDOWS_OWNER_PIDS,
+        )
+        .map_err(|e| lookup_failed(format!("failed to parse netstat output: {e}")))?;
+        for pid in listed {
+            if !pids.contains(&pid) {
+                if pids.len() >= MAX_WINDOWS_OWNER_PIDS {
+                    return Err(lookup_failed(format!(
+                        "more than {MAX_WINDOWS_OWNER_PIDS} processes own the port"
+                    )));
+                }
+                pids.push(pid);
+            }
+        }
+    }
+    Ok(Some(pids))
 }
 
 /// Linux 版が集める LISTEN inode 数の上限（coding-rust.md「件数を上限検証」）。
@@ -1059,17 +1141,43 @@ fn collect_owner_candidate_pids(root_pid: u32, port: u16) -> Result<Vec<u32>, Po
     })
 }
 
-/// windows 版のスタブ（TASK-84.6.1）。Windows にはまだプロセスツリーの走査が
-/// 無い（`sample_rss_kb` は単体 PID）ため常に `LookupFailed` を返す。#562
-/// （TASK-84.6.4）で実装する。現状は `lookup_port_owner_pids` が未対応を返す
-/// ためここへは到達しない。
+/// windows 版（TASK-84.6.4・#562）: `powershell.exe` で
+/// `Get-CimInstance Win32_Process` を 1 回実行して全プロセスの
+/// 「PID 親PID 作成時刻」を得て、Rust 側で `root_pid` の子孫を絞り込む。
+/// std では PPID を取れず、`tasklist` に PPID が無く、`wmic` は現行 Windows 11
+/// で既定から外されているための選択。スクリプトは外部の値を一切埋め込まない
+/// 固定文字列（ダブルクォートを含めず、`Command` の引用と干渉させない）で、
+/// 全件を出力して絞り込む。1 回の CIM クエリは一貫したスナップショット
+/// なので、unix のような複数回走査の安定化はしない（所有者を先に照会して
+/// いるため、所有者は必ずスナップショットに現れる）。
+/// 失敗・期限超過・出力上限到達・形式不正・root 不在は `LookupFailed`。
 #[cfg(windows)]
-fn collect_owner_candidate_pids(_root_pid: u32, port: u16) -> Result<Vec<u32>, PortOwnerError> {
-    Err(PortOwnerError::LookupFailed {
-        port,
-        reason: "process tree enumeration is not implemented on windows yet (TASK-84.6.4)"
-            .to_string(),
-    })
+fn collect_owner_candidate_pids(root_pid: u32, port: u16) -> Result<Vec<u32>, PortOwnerError> {
+    const SCRIPT: &str = "Get-CimInstance -ClassName Win32_Process | ForEach-Object { $t = 0; if ($_.CreationDate) { $t = $_.CreationDate.ToFileTimeUtc() }; '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, $t }";
+    let lookup_failed = |reason: String| PortOwnerError::LookupFailed { port, reason };
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT]);
+    let (status, stdout) = crate::support::run_capturing_output_with_deadline(
+        command,
+        crate::support::EXTERNAL_COMMAND_DEADLINE,
+        MAX_PROCESS_TABLE_OUTPUT_BYTES,
+    )
+    .map_err(|e| lookup_failed(format!("failed to run powershell: {e}")))?;
+    if stdout.len() >= MAX_PROCESS_TABLE_OUTPUT_BYTES {
+        return Err(lookup_failed(format!(
+            "process table output reached {MAX_PROCESS_TABLE_OUTPUT_BYTES} bytes and may be truncated"
+        )));
+    }
+    if !status.success() {
+        return Err(lookup_failed(format!(
+            "powershell exited with status {status}"
+        )));
+    }
+    let table =
+        parse_windows_process_table(&String::from_utf8_lossy(&stdout), MAX_WINDOWS_PROCESS_ROWS)
+            .map_err(|e| lookup_failed(format!("failed to parse process table: {e}")))?;
+    windows_descendant_pids(root_pid, &table, MAX_WINDOWS_TREE_PIDS)
+        .map_err(|e| lookup_failed(format!("failed to build process tree: {e}")))
 }
 
 /// 所有者確認が未対応であることを、プロセス内で 1 回だけ stderr へ注記する
@@ -1107,12 +1215,12 @@ const PORT_CONFLICT_REPROBE_TIMEOUT: Duration = Duration::from_millis(500);
 ///   場合、それを「元から居た別プロセス」と区別できない
 /// - 対象が孫プロセス以降を起動していた場合、`ChildGuard`/
 ///   `kill_process_group` の `wait` は直接の子までしか保証しない
-/// - 所有者の PID 確認（`check_port_owner`）は Linux のみ実装済み（#560）。
-///   Windows #562 は入るまで行われない
+/// - 所有者の PID 確認（`check_port_owner`）は Linux・macOS・Windows で実装済み
+///   （#560・#561・#562）だが、確認後に割り込んだプロセスや居残りは検出できない
 ///
 /// 役割分担（TASK-84.6）: 事前ゲートの [`check_port_owner`]（ポートの所有
-/// PID 確認）とは置き換えずに併用する。事前ゲートが未対応の OS では本関数が
-/// 唯一の防御で、事前ゲートの後に割り込んだプロセスや居残りも検出できる。
+/// PID 確認）とは置き換えずに併用する。事前ゲートが未対応の OS（上記 3 OS
+/// 以外）では本関数が唯一の防御で、事前ゲートの後に割り込んだプロセスや居残りも検出できる。
 ///
 /// これらの限界があっても、「対象を殺したのに同じポートがまだ応答する」
 /// という明白な矛盾を検出できることには意味があり、黙って誤った計測値を

@@ -537,9 +537,9 @@ fn run_test_cases() {
         eprintln!("case: stabilize_pid_scan_returns_some_once_two_scans_match");
         stabilize_pid_scan_returns_some_once_two_scans_match();
     }
-    // Linux・macOS の実照会（TASK-84.6.2・#560、TASK-84.6.3・#561）。Windows は
-    // 未対応を返すため対象外。
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // Linux・macOS・Windows の実照会（TASK-84.6.2・#560、TASK-84.6.3・#561、
+    // TASK-84.6.4・#562）。
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
         eprintln!("case: lookup_port_owner_pids_returns_own_pid_for_listener");
         lookup_port_owner_pids_returns_own_pid_for_listener();
@@ -1740,9 +1740,9 @@ fn wait_with_deadline_kills_descendant_process_cross_platform() {
     );
 }
 
-/// PERF-3/PERF-6（TASK-84.6.2・#560、TASK-84.6.3・#561）: 自プロセスが LISTEN しているポートを
+/// PERF-3/PERF-6（TASK-84.6.2・#560、TASK-84.6.3・#561、TASK-84.6.4・#562）: 自プロセスが LISTEN しているポートを
 /// `lookup_port_owner_pids` が自 PID として返す（hex 復号が実機で正しい確認も兼ねる）。
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn lookup_port_owner_pids_returns_own_pid_for_listener() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("local_addr").port();
@@ -1752,13 +1752,13 @@ fn lookup_port_owner_pids_returns_own_pid_for_listener() {
             "own pid {} should own port {port}: {pids:?}",
             std::process::id()
         ),
-        other => panic!("expected Ok(Some(pids)) on linux/macos, got {other:?}"),
+        other => panic!("expected Ok(Some(pids)) on linux/macos/windows, got {other:?}"),
     }
 }
 
-/// PERF-3/PERF-6（TASK-84.6.2・#560、TASK-84.6.3・#561）: ポートを所有するのが子のツリー外
+/// PERF-3/PERF-6（TASK-84.6.2・#560、TASK-84.6.3・#561、TASK-84.6.4・#562）: ポートを所有するのが子のツリー外
 /// （このテストプロセス）なら `Mismatch` になる。
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn check_port_owner_rejects_foreign_listener() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("local_addr").port();
