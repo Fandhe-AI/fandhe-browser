@@ -181,6 +181,9 @@ impl ProfileStore for OsDefaultStore {
 /// - `..` を含むパスは受け付ける。`PROF-1` が「任意のパス」を求めるうえ、
 ///   [`Profile::open`] は `..` をハンドル基準でたどるため境界外への書き込み経路に
 ///   ならない（環境変数由来の暗黙の値を拒否する `usable_base` とは入力の信頼度が異なる）
+/// - `..` を畳み込んだ結果が OS のルート（`/`・ドライブルート）になる指定は、
+///   `fchmod(0700)` やファイル作成が OS ルートへ及ぶため [`ExplicitStore::new`] が
+///   [`ProfileError::InvalidLayout`] で拒否する
 ///
 /// [`ProfileStore::delete`] は既定実装（`Unsupported`）のままで、#188 が担う。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +211,12 @@ impl ExplicitStore {
                 reason: "explicit profile root must be an absolute path",
             });
         }
+        if is_filesystem_root(&root) {
+            return Err(ProfileError::InvalidLayout {
+                path: root,
+                reason: "explicit profile root must not be the filesystem root",
+            });
+        }
         Ok(Self { root })
     }
 
@@ -221,6 +230,25 @@ impl ProfileStore for ExplicitStore {
     fn resolve_root(&self) -> Result<ResolvedRoot, ProfileError> {
         Ok(ResolvedRoot::new(self.root.clone(), RootSource::Explicit))
     }
+}
+
+/// `..` を字句的に畳み込んだ結果が OS のルート（`/`・`C:\\` などのドライブルート・
+/// UNC 共有ルート）を指すかを返す（`PROF-1`）。
+///
+/// [`ExplicitStore::new`] が、[`Profile::open`] による `fchmod(0700)` やファイル作成が
+/// OS ルートへ及ぶのを副作用の前に防ぐために使う。`std::path::absolute` は `..` を
+/// 畳み込まないため、`/a/..` のような指定もここで検出する。
+fn is_filesystem_root(path: &Path) -> bool {
+    let mut normal_depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => normal_depth += 1,
+            // ルート直上の `..` はルートに留まる（OS の解決規則と同じ）。
+            Component::ParentDir => normal_depth = normal_depth.saturating_sub(1),
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+        }
+    }
+    normal_depth == 0
 }
 
 /// 明示指定 > 既定（既定は型パラメータ `D`。通常 [`OsDefaultStore`]）の優先順位で
@@ -852,6 +880,39 @@ mod tests {
                 assert_eq!(reason, "explicit profile root must not be empty");
             }
             other => panic!("expected InvalidLayout, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// PROF-1: OS ルートは `..` 経由の指定も含めて副作用の前に拒否される。
+    #[test]
+    fn prof_1_explicit_filesystem_root_is_rejected() {
+        #[cfg(unix)]
+        let candidates = ["/", "//", "/.", "/..", "/a/..", "/a/b/../..", "/../.."];
+        #[cfg(windows)]
+        let candidates = ["C:\\", "C:/", "C:\\a\\..", "C:\\..", "C:/a/../.."];
+        for candidate in candidates {
+            match ExplicitStore::new(candidate) {
+                Err(ProfileError::InvalidLayout { reason, .. }) => {
+                    assert_eq!(
+                        reason,
+                        "explicit profile root must not be the filesystem root"
+                    );
+                }
+                other => panic!(
+                    "expected InvalidLayout for {candidate:?}, got {:?}",
+                    other.map(|_| ())
+                ),
+            }
+        }
+    }
+
+    /// PROF-1: ルート直下の通常ディレクトリや、`..` を含んでもルート外を指す指定は受け付ける。
+    #[test]
+    #[cfg(unix)]
+    fn prof_1_explicit_non_root_paths_are_accepted() {
+        for candidate in ["/a", "/a/b/..", "/a/../b"] {
+            let store = ExplicitStore::new(candidate).unwrap();
+            assert_eq!(store.root(), Path::new(candidate));
         }
     }
 
