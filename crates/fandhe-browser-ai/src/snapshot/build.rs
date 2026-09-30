@@ -126,6 +126,26 @@ fn bounded_descendant_count(doc: &Document, container: NodeId, limit: usize) -> 
     Some(count)
 }
 
+/// `container` の子孫要素がすべて相対深さ `max_rel` 以内（子を 1 とする）かを返す。
+///
+/// 圧縮は子孫を展開しないため、展開経路なら [`MAX_TREE_DEPTH`] で省略され
+/// `truncated` が立つ子孫が行文字列へ現れてしまう。深さ超過を含む場合は圧縮せず
+/// 通常の展開経路へ進める（深さ制限と省略通知の契約を維持。`AISNAP-2`）。
+/// 呼び出し前の [`bounded_descendant_count`] で走査量は有界化済みで、反復で走査する。
+fn subtree_fits_depth(doc: &Document, container: NodeId, max_rel: usize) -> bool {
+    let mut stack: Vec<(NodeId, usize)> = doc.children(container).map(|c| (c, 1)).collect();
+    while let Some((id, rel)) = stack.pop() {
+        if !doc.is_element(id) {
+            continue;
+        }
+        if rel > max_rel {
+            return false;
+        }
+        stack.extend(doc.children(id).map(|c| (c, rel + 1)));
+    }
+    true
+}
+
 /// 規則的構造を圧縮してよいかを返す（`AISNAP-2`・TASK-12.5）。
 ///
 /// 圧縮は子孫の展開（ref・state・accessible name の付与）を省略するため、
@@ -379,7 +399,7 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
             let limit = MAX_COMPRESS_SCAN_NODES.min(compress_budget);
             let scanned = bounded_descendant_count(doc, child, limit);
             compress_budget = compress_budget.saturating_sub(scanned.unwrap_or(limit));
-            scanned.is_some()
+            scanned.is_some() && subtree_fits_depth(doc, child, MAX_TREE_DEPTH - depth)
         };
         if within_budget
             && let TableDetection::Regular(structure) = detect_regular_structure(doc, child)
@@ -793,6 +813,31 @@ mod tests {
     #[test]
     fn aisnap_3_plain_table_cells_still_compress() {
         let s = snap("<body><table><tr><th>A</th></tr><tr><td>1</td></tr></table></body>");
+        assert!(has_table_summary(&s));
+    }
+
+    /// AISNAP-2 / AISNAP-1: 子孫が `MAX_TREE_DEPTH` を超える一覧は圧縮せず展開し、
+    /// 従来どおり深さ超過を省略して `truncated` を立てる（圧縮で省略通知が消えない）。
+    #[test]
+    fn aisnap_2_list_with_descendant_beyond_max_depth_is_not_compressed() {
+        // ul は深さ MAX_TREE_DEPTH - 1、li は MAX_TREE_DEPTH、span は MAX_TREE_DEPTH + 1。
+        let wrap = MAX_TREE_DEPTH - 4;
+        let html = format!(
+            "<body>{}<ul><li><span>x</span></li><li>y</li></ul>{}</body>",
+            "<div>".repeat(wrap),
+            "</div>".repeat(wrap)
+        );
+        let s = snap(&html);
+        assert!(s.truncated);
+        assert!(!has_table_summary(&s));
+        // 深さに収まる同形の一覧は従来どおり圧縮され、truncated も立たない。
+        let html = format!(
+            "<body>{}<ul><li><span>x</span></li><li>y</li></ul>{}</body>",
+            "<div>".repeat(wrap - 1),
+            "</div>".repeat(wrap - 1)
+        );
+        let s = snap(&html);
+        assert!(!s.truncated);
         assert!(has_table_summary(&s));
     }
 
