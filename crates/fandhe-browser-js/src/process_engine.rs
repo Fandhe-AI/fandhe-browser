@@ -1106,7 +1106,7 @@ pub enum DomLikeMemberFn {
 /// gate する（[`WorkerSpawnConfigForTest`] のドキュメントコメント参照）。
 /// `TASK-29.6.2`（Issue #548）で `create_engine` から配線し、
 /// `impl JsEngine for V8ProcessEngine` を追加した。トレイト経由の
-/// [`NativeFn`] は呼び出しスレッド上で実行する（モジュール doc「既知の制限」）。
+/// [`NativeFn`] は専用スレッドで実行し期限まで待つ（モジュール doc「既知の制限」）。
 #[doc(hidden)]
 pub struct V8ProcessEngine {
     worker: Option<WorkerHandle>,

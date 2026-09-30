@@ -25,8 +25,10 @@
 //! `NotBundled` を返す。以下は未実装（実装済みを装わない。REPAIR-3）。
 //!
 //! - V8 の具象実装（`JS-1`、`TASK-29`、`MS-3`）は `create_engine` への配線まで
-//!   完了（`TASK-29.6.2`）。トレイト経由の `NativeFn` は呼び出しスレッド上で
-//!   実行するため期限を強制できない（`process_engine` の「既知の制限」）
+//!   完了（`TASK-29.6.2`）。トレイト経由の `NativeFn` は `Send` 境界付きで、
+//!   inherent API と同じ専用スレッド経路（期限付き待機）で実行するため期限を
+//!   強制できる。ただし `NativeCallContext` は関数へ渡らず協調的な中断は
+//!   できない（`process_engine` の「既知の制限」）
 //! - boa の具象実装（`JS-1`、`TASK-32`、`MS-3`）
 //! - core への統合（`js_stub` の置換。`JS-2`、`TASK-30`、`MS-3`）
 //!
