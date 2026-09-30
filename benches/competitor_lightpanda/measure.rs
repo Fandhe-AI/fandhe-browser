@@ -707,23 +707,6 @@ const MAX_PORT_OWNER_INODES: usize = 64;
 #[cfg(target_os = "linux")]
 const MAX_PROC_SCAN_PIDS: usize = 65_536;
 
-/// Linux 版 [`lookup_port_owner_pids`]（TASK-84.6.2・#560）。
-///
-/// `/proc/<pid>/status` の Uid 行（real/effective）が自プロセスと一致するか。
-/// 読めない・解析できない場合は `None`（呼び出し側は安全側＝同 uid 扱い）。
-#[cfg(target_os = "linux")]
-fn proc_shares_uid(pid: u32) -> Option<bool> {
-    let uid_of = |path: &str| -> Option<(String, String)> {
-        let text = std::fs::read_to_string(path).ok()?;
-        let line = text.lines().find(|l| l.starts_with("Uid:"))?;
-        let mut it = line.split_whitespace().skip(1);
-        Some((it.next()?.to_string(), it.next()?.to_string()))
-    };
-    let mine = uid_of("/proc/self/status")?;
-    let theirs = uid_of(&format!("/proc/{pid}/status"))?;
-    Some(mine.0 == theirs.0 || mine.1 == theirs.1 || mine.0 == theirs.1 || mine.1 == theirs.0)
-}
-
 /// `/proc/net/tcp{,6}` から `port` の LISTEN ソケットの inode を集め、
 /// `/proc/<pid>/fd` の `socket:[inode]` と突き合わせて所有 PID を返す。
 /// [`check_port_owner`] から readiness 成功時に呼ばれる。std だけで読み
@@ -734,11 +717,13 @@ fn proc_shares_uid(pid: u32) -> Option<bool> {
 ///   `LookupFailed`。黙って打ち切ると外部の所有者を見落として誤って
 ///   `Verified` を返し得るため、途中で止めずにエラーにする
 /// - 走査中に終了したプロセス・fd（`NotFound`）は読み飛ばす。権限不足
-///   （`PermissionDenied`）は走査を続けるが、同 uid（または uid 不明）の
-///   読めない fd が 1 件でもあれば全所有者を確認できないため、inode が既知
-///   でも最終的に `LookupFailed`。別 uid のプロセスの fd ディレクトリは
-///   読み飛ばす。それ以外の
-///   I/O エラーは即 `LookupFailed`
+///   （`PermissionDenied`）は uid に関わらず走査を続けるが、読めなかった
+///   fd / fd ディレクトリが 1 件でもあり、かつ LISTEN inode のうち読めた fd
+///   から所有 PID を帰属できなかったものが残る場合は、見えないプロセスだけが
+///   保持するソケットを見落とし得るため `LookupFailed`。全 inode が読めた
+///   fd に帰属できていれば、読めないプロセスは別のソケットしか持たない
+///   前提で成功させる（root 所有プロセス等は非特権では必ず読めない）。
+///   それ以外の I/O エラーは即 `LookupFailed`
 #[cfg(target_os = "linux")]
 pub(crate) fn lookup_port_owner_pids(port: u16) -> Result<Option<Vec<u32>>, PortOwnerError> {
     use std::io::ErrorKind;
@@ -795,6 +780,8 @@ pub(crate) fn lookup_port_owner_pids(port: u16) -> Result<Option<Vec<u32>>, Port
     let mut owners: Vec<u32> = Vec::new();
     // 権限不足で中身を確認できなかった fd / fd ディレクトリがあったか。
     let mut unreadable = false;
+    // 読めた fd から所有 PID を帰属できた LISTEN inode。
+    let mut attributed: Vec<u64> = Vec::new();
     let mut scanned = 0usize;
     for entry in entries {
         let entry = entry.map_err(|e| fail(format!("failed to read /proc entry: {e}")))?;
@@ -815,11 +802,9 @@ pub(crate) fn lookup_port_owner_pids(port: u16) -> Result<Option<Vec<u32>>, Port
             Ok(fds) => fds,
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
             Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                // 別 uid のプロセスは当該ツリーのソケットを保持し得ないため
-                // 読み飛ばす。同 uid の読めないプロセスは確認不能として扱う。
-                if proc_shares_uid(pid) != Some(false) {
-                    unreadable = true;
-                }
+                // uid が違っても fork 後の権限変更や fd 受け渡しで同じソケットを
+                // 保持し得るため読み飛ばさず、確認不能として記録する。
+                unreadable = true;
                 continue;
             }
             Err(e) => return Err(fail(format!("failed to read /proc/{pid}/fd: {e}"))),
@@ -856,15 +841,20 @@ pub(crate) fn lookup_port_owner_pids(port: u16) -> Result<Option<Vec<u32>>, Port
                 .to_str()
                 .and_then(parse_socket_link_inode)
                 .filter(|inode| inodes.contains(inode));
-            if inode.is_some() && !owners.contains(&pid) {
-                owners.push(pid);
+            if let Some(inode) = inode {
+                if !owners.contains(&pid) {
+                    owners.push(pid);
+                }
+                if !attributed.contains(&inode) {
+                    attributed.push(inode);
+                }
             }
         }
     }
-    // 権限不足で見えない fd がある場合、既知の inode が子プロセスの fd から
-    // 見つかっていても、読めないプロセスが同じソケットを継承している可能性を
-    // 排除できない。全所有者を確認できた場合だけ成功させるため LookupFailed にする。
-    if unreadable {
+    // 権限不足で見えない fd がある場合、帰属できていない LISTEN inode は
+    // 読めないプロセスだけが保持している可能性を排除できない（外部プロセスが
+    // 同ポートの別 inode を持つケース）。全 inode を帰属できた場合だけ成功させる。
+    if unreadable && inodes.iter().any(|i| !attributed.contains(i)) {
         return Err(fail(
             "could not verify every listening socket owner (permission denied on some fds)"
                 .to_string(),
