@@ -537,14 +537,17 @@ fn run_test_cases() {
         eprintln!("case: stabilize_pid_scan_returns_some_once_two_scans_match");
         stabilize_pid_scan_returns_some_once_two_scans_match();
     }
-    // Linux 限定の実照会（TASK-84.6.2・#560）。機能自体が Linux 専用のため
-    // 限定する（他 OS は未対応を返す）。
+    // Linux・macOS の実照会（TASK-84.6.2・#560、TASK-84.6.3・#561）。Windows は
+    // 未対応を返すため対象外。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        eprintln!("case: lookup_port_owner_pids_returns_own_pid_for_listener");
+        lookup_port_owner_pids_returns_own_pid_for_listener();
+        eprintln!("case: check_port_owner_rejects_foreign_listener");
+        check_port_owner_rejects_foreign_listener();
+    }
     #[cfg(target_os = "linux")]
     {
-        eprintln!("case: linux_lookup_port_owner_pids_returns_own_pid_for_listener");
-        linux_lookup_port_owner_pids_returns_own_pid_for_listener();
-        eprintln!("case: linux_check_port_owner_rejects_foreign_listener");
-        linux_check_port_owner_rejects_foreign_listener();
         eprintln!("case: linux_proc_chains_related_detects_deep_descendants");
         linux_proc_chains_related_detects_deep_descendants();
     }
@@ -1737,10 +1740,10 @@ fn wait_with_deadline_kills_descendant_process_cross_platform() {
     );
 }
 
-/// PERF-3/PERF-6（TASK-84.6.2・#560）: 自プロセスが LISTEN しているポートを
+/// PERF-3/PERF-6（TASK-84.6.2・#560、TASK-84.6.3・#561）: 自プロセスが LISTEN しているポートを
 /// `lookup_port_owner_pids` が自 PID として返す（hex 復号が実機で正しい確認も兼ねる）。
-#[cfg(target_os = "linux")]
-fn linux_lookup_port_owner_pids_returns_own_pid_for_listener() {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn lookup_port_owner_pids_returns_own_pid_for_listener() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("local_addr").port();
     match measure::lookup_port_owner_pids(std::process::id(), port) {
@@ -1749,14 +1752,14 @@ fn linux_lookup_port_owner_pids_returns_own_pid_for_listener() {
             "own pid {} should own port {port}: {pids:?}",
             std::process::id()
         ),
-        other => panic!("expected Ok(Some(pids)) on linux, got {other:?}"),
+        other => panic!("expected Ok(Some(pids)) on linux/macos, got {other:?}"),
     }
 }
 
-/// PERF-3/PERF-6（TASK-84.6.2・#560）: ポートを所有するのが子のツリー外
+/// PERF-3/PERF-6（TASK-84.6.2・#560、TASK-84.6.3・#561）: ポートを所有するのが子のツリー外
 /// （このテストプロセス）なら `Mismatch` になる。
-#[cfg(target_os = "linux")]
-fn linux_check_port_owner_rejects_foreign_listener() {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn check_port_owner_rejects_foreign_listener() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("local_addr").port();
     let current_exe = std::env::current_exe().expect("current_exe");
