@@ -17,12 +17,14 @@
 //!
 //! ## スタブについて（`code-comment-style.md`・REPAIR-3）
 //!
-//! 具象型は OS 既定パス解決の [`OsDefaultStore`] のみ実装済みである。
+//! 具象型は OS 既定パス解決の [`OsDefaultStore`]・明示指定の [`ExplicitStore`]・
+//! 両者を合成する [`OverridableStore`] を実装済みである。
 //!
 //! - OS 既定パスの解決は [`OsDefaultStore`]（TASK-60（60.3）・#202）。
 //!   `directories` は #200 の判断（推移的依存 `option-ext` が MPL-2.0）で不採用と
 //!   し、std の環境変数だけで自前解決する
-//! - 明示指定による上書き（`RootSource::Explicit`。`PROF-1`）: #203（TASK-60（60.4））
+//! - 明示指定による上書き（`RootSource::Explicit`。`PROF-1`）は [`ExplicitStore`]・
+//!   [`OverridableStore`]（TASK-60（60.4）・#203）。明示指定が既定解決より優先される
 //! - 削除（`PROF-5`）: #188（TASK-53（53.2））。[`ProfileStore::delete`] の既定実装は
 //!   成功を装わず [`ProfileError::Unsupported`] を返す
 //! - Windows 長パス（`XOS-8`、TASK-61）・名前正規化（`XOS-9`、TASK-62）は
@@ -41,9 +43,9 @@ use crate::profile::{Profile, ProfileError};
 pub enum RootSource {
     /// OS 慣習に基づく既定保存先（`XOS-7`。[`OsDefaultStore`]）。
     OsDefault,
-    /// 呼び出し元による明示指定（`PROF-1`。#203 で実装）。
+    /// 呼び出し元による明示指定（`PROF-1`。[`ExplicitStore`] が返す）。
     ///
-    /// 相対パスの絶対化は上書き境界（#203）の責務で、ここへ渡る値は絶対パスとする。
+    /// 相対パスの絶対化は [`ExplicitStore::new`] が行うため、ここへ渡る値は絶対パスとする。
     Explicit,
 }
 
@@ -58,7 +60,7 @@ pub struct ResolvedRoot {
 }
 
 impl ResolvedRoot {
-    /// 解決結果を作る。`ProfileStore` 実装者（#202・#203）が使う。
+    /// 解決結果を作る。[`OsDefaultStore`]・[`ExplicitStore`] などの `ProfileStore` 実装者が使う。
     pub fn new(path: PathBuf, source: RootSource) -> Self {
         Self { path, source }
     }
@@ -140,8 +142,8 @@ pub const APP_DIR_NAME: &str = "fandhe-browser";
 ///
 /// 必要な環境変数が使えなければ暗黙の代替先へ落とさず
 /// [`ProfileError::DefaultRootUnavailable`] を返す（fail-closed）。プロセスの環境変数は
-/// 書き換えない。明示指定による上書き（`RootSource::Explicit`）は #203（TASK-60（60.4））
-/// が担う。
+/// 書き換えない。明示指定による上書き（`RootSource::Explicit`）は [`OverridableStore`]
+/// （TASK-60（60.4）・#203）が担う。
 #[derive(Debug, Clone, Default)]
 pub struct OsDefaultStore {
     _private: (),
@@ -161,6 +163,101 @@ impl ProfileStore for OsDefaultStore {
             canonicalize_base(&base).join(tail),
             RootSource::OsDefault,
         ))
+    }
+}
+
+/// 明示指定されたプロファイルルートを返す [`ProfileStore`]
+/// （`PROF-1`・`XOS-7`、TASK-60（60.4）・#203、MS-3）。
+///
+/// `fandhe-browser-cli`（TASK-41 で追加予定）が、利用者の「任意のパスをルートに
+/// 指定する」オプションを受け取ったときに作る。通常は [`OverridableStore`] 経由で
+/// 既定解決より優先させる。
+///
+/// - 相対パスは [`ExplicitStore::new`] の時点で 1 回だけ絶対化して固定する
+///   （実行中の `chdir` で保存先が変わらないようにするため）
+/// - `canonicalize` はしない。symlink の検証は [`Profile::open`] がハンドル基準で
+///   行う（`PROF-1`・`PROF-4`）。macOS の `/var` など OS 標準の symlink を含む
+///   パスは、[`Profile::open`] の doc と同様に呼び出し側で `canonicalize` が必要
+/// - `..` を含むパスは受け付ける。`PROF-1` が「任意のパス」を求めるうえ、
+///   [`Profile::open`] は `..` をハンドル基準でたどるため境界外への書き込み経路に
+///   ならない（環境変数由来の暗黙の値を拒否する `usable_base` とは入力の信頼度が異なる）
+///
+/// [`ProfileStore::delete`] は既定実装（`Unsupported`）のままで、#188 が担う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitStore {
+    root: PathBuf,
+}
+
+impl ExplicitStore {
+    /// 明示指定パスからストアを作る。相対パスは現在のカレントディレクトリで絶対化する。
+    ///
+    /// 空パスは [`ProfileError::InvalidLayout`]、カレントディレクトリが取得できない
+    /// などの OS エラーは [`ProfileError::Io`] を返す（fail-closed）。
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, ProfileError> {
+        let path = path.into();
+        if path.as_os_str().is_empty() {
+            return Err(ProfileError::InvalidLayout {
+                path,
+                reason: "explicit profile root must not be empty",
+            });
+        }
+        let root = std::path::absolute(&path)?;
+        if !root.is_absolute() {
+            return Err(ProfileError::InvalidLayout {
+                path: root,
+                reason: "explicit profile root must be an absolute path",
+            });
+        }
+        Ok(Self { root })
+    }
+
+    /// 絶対化済みの明示指定ルート。
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl ProfileStore for ExplicitStore {
+    fn resolve_root(&self) -> Result<ResolvedRoot, ProfileError> {
+        Ok(ResolvedRoot::new(self.root.clone(), RootSource::Explicit))
+    }
+}
+
+/// 明示指定 > 既定（既定は型パラメータ `D`。通常 [`OsDefaultStore`]）の優先順位で
+/// ルートを解決する [`ProfileStore`]（`PROF-1`・`XOS-7`、TASK-60（60.4）・#203）。
+///
+/// `fandhe-browser-cli`（TASK-41 で追加予定）が `Box<dyn ProfileStore>` として保持する
+/// 想定（`'static` なら dyn 化できる。enum 分岐にはしない）。明示指定があるときは
+/// 既定側の `resolve_root` を呼ばないため、`HOME` 等が使えない環境
+/// （`DefaultRootUnavailable`）でも明示指定だけで動く。明示指定がなく既定も解決
+/// できなければ、暗黙の代替先へ落とさずそのエラーを返す。
+/// [`ProfileStore::delete`] は既定実装のまま（#188）。
+#[derive(Debug, Clone)]
+pub struct OverridableStore<D = OsDefaultStore> {
+    explicit: Option<ExplicitStore>,
+    default: D,
+}
+
+impl OverridableStore<OsDefaultStore> {
+    /// 明示指定がなければ OS 既定（[`OsDefaultStore`]）を使うストアを作る。
+    pub fn new(explicit: Option<ExplicitStore>) -> Self {
+        Self::with_default(explicit, OsDefaultStore::new())
+    }
+}
+
+impl<D: ProfileStore> OverridableStore<D> {
+    /// 既定側のストアを差し替えて作る（テストや将来の既定解決の差し替え用）。
+    pub fn with_default(explicit: Option<ExplicitStore>, default: D) -> Self {
+        Self { explicit, default }
+    }
+}
+
+impl<D: ProfileStore> ProfileStore for OverridableStore<D> {
+    fn resolve_root(&self) -> Result<ResolvedRoot, ProfileError> {
+        match &self.explicit {
+            Some(explicit) => explicit.resolve_root(),
+            None => self.default.resolve_root(),
+        }
     }
 }
 
@@ -656,5 +753,149 @@ mod tests {
         let root = canonicalize_base(&base).join(tail);
         assert_eq!(root, real.join("fandhe-browser"));
         assert!(Profile::open(&root).is_ok());
+    }
+
+    /// 常に失敗する既定ストア（明示指定時に参照されないことの確認用）。
+    struct FailingDefault;
+
+    impl ProfileStore for FailingDefault {
+        fn resolve_root(&self) -> Result<ResolvedRoot, ProfileError> {
+            Err(ProfileError::DefaultRootUnavailable {
+                reason: "test default must not be consulted",
+            })
+        }
+    }
+
+    /// 呼び出し回数を数える既定ストア。
+    struct CountingDefault {
+        calls: std::cell::Cell<usize>,
+        root: PathBuf,
+    }
+
+    impl CountingDefault {
+        fn new(root: PathBuf) -> Self {
+            Self {
+                calls: std::cell::Cell::new(0),
+                root,
+            }
+        }
+    }
+
+    impl ProfileStore for CountingDefault {
+        fn resolve_root(&self) -> Result<ResolvedRoot, ProfileError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(ResolvedRoot::new(self.root.clone(), RootSource::OsDefault))
+        }
+    }
+
+    /// PROF-1: 明示指定は既定解決より優先され、既定側は呼ばれない。
+    #[test]
+    fn prof_1_explicit_root_overrides_default() {
+        let explicit_root = abs("explicit-root");
+        let store = OverridableStore::with_default(
+            Some(ExplicitStore::new(explicit_root.clone()).unwrap()),
+            CountingDefault::new(abs("default-root")),
+        );
+        let resolved = store.resolve_root().unwrap();
+        assert_eq!(resolved.path(), explicit_root.as_path());
+        assert_eq!(resolved.source(), RootSource::Explicit);
+        assert_eq!(store.default.calls.get(), 0);
+
+        // 既定が解決不能でも明示指定だけで成功する。
+        let failing = OverridableStore::with_default(
+            Some(ExplicitStore::new(explicit_root.clone()).unwrap()),
+            FailingDefault,
+        );
+        assert_eq!(
+            failing.resolve_root().unwrap().path(),
+            explicit_root.as_path()
+        );
+    }
+
+    /// XOS-7: 明示指定がなければ既定側の結果がそのまま返る。
+    #[test]
+    fn xos_7_falls_back_to_default_without_explicit() {
+        let default_root = abs("default-root");
+        let store =
+            OverridableStore::with_default(None, CountingDefault::new(default_root.clone()));
+        let resolved = store.resolve_root().unwrap();
+        assert_eq!(resolved.path(), default_root.as_path());
+        assert_eq!(resolved.source(), RootSource::OsDefault);
+        assert_eq!(store.default.calls.get(), 1);
+
+        // 既定も解決できなければ暗黙の代替先へ落とさずエラーを返す。
+        let failing = OverridableStore::with_default(None, FailingDefault);
+        assert!(matches!(
+            failing.resolve_root(),
+            Err(ProfileError::DefaultRootUnavailable { .. })
+        ));
+    }
+
+    /// PROF-1: 相対パスは生成時に絶対化され、`resolve_root` が返す値は固定される。
+    #[test]
+    fn prof_1_explicit_relative_path_is_absolutized() {
+        let store = ExplicitStore::new(PathBuf::from("rel").join("profile")).unwrap();
+        let expected = std::env::current_dir().unwrap().join("rel").join("profile");
+        assert_eq!(store.root(), expected.as_path());
+        assert!(store.root().is_absolute());
+        assert_eq!(
+            store.resolve_root().unwrap(),
+            ResolvedRoot::new(expected, RootSource::Explicit)
+        );
+    }
+
+    /// PROF-1: 空パスは拒否される（fail-closed）。
+    #[test]
+    fn prof_1_explicit_empty_path_is_rejected() {
+        match ExplicitStore::new("") {
+            Err(ProfileError::InvalidLayout { reason, .. }) => {
+                assert_eq!(reason, "explicit profile root must not be empty");
+            }
+            other => panic!("expected InvalidLayout, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// PROF-1: `OverridableStore` は dyn 互換で明示パスを返す。
+    #[test]
+    fn prof_1_overridable_store_is_dyn_compatible() {
+        let root = abs("explicit-dyn");
+        let store: Box<dyn ProfileStore> = Box::new(OverridableStore::new(Some(
+            ExplicitStore::new(root.clone()).unwrap(),
+        )));
+        let resolved = store.resolve_root().unwrap();
+        assert_eq!(resolved.path(), root.as_path());
+        assert_eq!(resolved.source(), RootSource::Explicit);
+    }
+
+    /// PROF-1: `open_or_create` は明示ルートだけを作成し、既定側は作らない。
+    #[cfg(unix)]
+    #[test]
+    fn prof_1_open_or_create_uses_explicit_root_only() {
+        let tmp = TempDir::new();
+        let explicit = tmp.0.join("explicit");
+        let default = tmp.0.join("default");
+        let store = OverridableStore::with_default(
+            Some(ExplicitStore::new(explicit.clone()).unwrap()),
+            FixedStore {
+                resolved: ResolvedRoot::new(default.clone(), RootSource::OsDefault),
+            },
+        );
+        let profile = store.open_or_create().unwrap();
+        assert_eq!(profile.root(), explicit.as_path());
+        assert!(explicit.is_dir());
+        assert!(!default.exists());
+    }
+
+    /// PROF-1: Windows では明示ストアでも既存の fail-closed（`Unsupported`）を伝える。
+    #[cfg(not(unix))]
+    #[test]
+    fn prof_1_explicit_open_or_create_is_unsupported_on_windows() {
+        let root = std::env::temp_dir().join("fandhe-store-win-explicit");
+        let store = ExplicitStore::new(root.clone()).unwrap();
+        assert!(matches!(
+            store.open_or_create(),
+            Err(ProfileError::Unsupported { .. })
+        ));
+        assert!(!root.exists());
     }
 }
