@@ -45,6 +45,8 @@ const HTML_NAMESPACE_URI: &str = "http://www.w3.org/1999/xhtml";
 const MAX_ITEM_SCAN_STEPS: usize = 256;
 /// フォームオーナー探索で辿る祖先の最大深さ。超えた先の `<form>` は無いものとして扱う。
 const MAX_FORM_ANCESTOR_DEPTH: usize = 32;
+/// 項目の祖先に非表示要素が無いか確認する最大深さ。超えた先は表示扱いとする。
+const MAX_HIDDEN_ANCESTOR_DEPTH: usize = 256;
 
 /// 送信ボタンの種別（`AISNAP-12`・`TASK-16.3`）。
 ///
@@ -121,10 +123,18 @@ pub fn classify_submit_button(doc: &Document, id: NodeId) -> Option<SubmitButton
 
 /// 項目（`li`・`tr` 等）のサブツリーから送信ボタンを探す（`AISNAP-12`・`TASK-16.3`）。
 ///
-/// 項目自身も対象に含む。非表示・`script`/`style`/`noscript`/`template` のサブツリーは
-/// 読み飛ばし、訪問済み + 未訪問の総量を内部上限（256 ノード）以内に保つ。上限に達したら
-/// 「見つからなかった」として `None`。複数ある場合は文書順で最初の種別を返す。
+/// 項目自身も対象に含む。項目自身・祖先（`MAX_HIDDEN_ANCESTOR_DEPTH` まで）が非表示なら
+/// `None`。非表示・`script`/`style`/`noscript`/`template` のサブツリーは読み飛ばし、
+/// 訪問済み + 未訪問の総量を内部上限（256 ノード）以内に保つ。子が残り予算を超える場合は
+/// 文書順で予算内の子だけを調べ、超過分は打ち切る。複数ある場合は文書順で最初の種別を返す。
 pub fn find_submit_button(doc: &Document, item: NodeId) -> Option<SubmitButtonKind> {
+    if doc
+        .ancestors(item)
+        .take(MAX_HIDDEN_ANCESTOR_DEPTH)
+        .any(|a| doc.is_element(a) && is_hidden_element(doc, a))
+    {
+        return None;
+    }
     let mut stack = vec![item];
     let mut steps = 0usize;
     while let Some(id) = stack.pop() {
@@ -144,10 +154,8 @@ pub fn find_submit_button(doc: &Document, item: NodeId) -> Option<SubmitButtonKi
             return Some(kind);
         }
         let budget = MAX_ITEM_SCAN_STEPS.saturating_sub(steps + stack.len());
-        let mut kids: Vec<NodeId> = doc.children(id).take(budget + 1).collect();
-        if kids.len() > budget {
-            return None;
-        }
+        // 予算超過分の子は打ち切る（先頭側の子は文書順で必ず調べる）。
+        let mut kids: Vec<NodeId> = doc.children(id).take(budget).collect();
         kids.reverse();
         stack.extend(kids);
     }
@@ -387,6 +395,49 @@ mod tests {
         let inner = format!("<button type='{big}'>x</button>");
         assert_eq!(
             classify_in_form(&inner, "button"),
+            Some(SubmitButtonKind::Button)
+        );
+    }
+
+    /// AISNAP-12: 幅広の兄弟があっても、予算内の先頭側の送信ボタンは見つける。
+    #[test]
+    fn aisnap_12_wide_children_keep_leading_button() {
+        let mut html = String::from("<form><div><button>first</button>");
+        for _ in 0..500 {
+            html.push_str("<span>x</span>");
+        }
+        html.push_str("</div></form>");
+        let doc = parse(&html);
+        assert_eq!(
+            find_submit_button(&doc, select(&doc, "div")),
+            Some(SubmitButtonKind::Button)
+        );
+
+        // 先行する兄弟のボタンは、後続の幅広要素に妨げられず見つかる。
+        let mut html = String::from("<form><div><p><button>a</button></p><section>");
+        for _ in 0..500 {
+            html.push_str("<span>x</span>");
+        }
+        html.push_str("</section></div></form>");
+        let doc = parse(&html);
+        assert_eq!(
+            find_submit_button(&doc, select(&doc, "div")),
+            Some(SubmitButtonKind::Button)
+        );
+    }
+
+    /// AISNAP-12: 非表示の祖先を持つ項目は送信ボタン候補にしない。
+    #[test]
+    fn aisnap_12_hidden_ancestor_of_item_is_ignored() {
+        let doc = parse("<form><ul hidden><li><button>a</button></li></ul></form>");
+        assert_eq!(find_submit_button(&doc, select(&doc, "li")), None);
+        let doc = parse(
+            "<form><div aria-hidden=true><table><tr><td><button>a</button></td></tr></table></div></form>",
+        );
+        assert_eq!(find_submit_button(&doc, select(&doc, "tr")), None);
+        let doc = parse("<form><ul><li><button>a</button></li></ul></form>");
+        assert_eq!(
+            find_submit_button(&doc, select(&doc, "li")),
             Some(SubmitButtonKind::Button)
         );
     }
