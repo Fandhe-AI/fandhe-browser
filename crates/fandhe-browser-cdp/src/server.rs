@@ -9,7 +9,8 @@
 //!
 //! `/json/*` ルータ（[`router`]。TASK-41.3）と `/devtools/browser/{id}` の WS 受け口設定
 //! （[`browser_websocket_config`]。TASK-41.4。公開入口は [`endpoints`]）は実装済み。WS のメッセージハンドラは
-//! 暫定（全リクエストへエラー応答。[`crate::ws`]）で、TASK-42 で置換する（REPAIR-3）。
+//! [`crate::protocol`] のディスパッチャへ委譲する（TASK-42.1）。組込みメソッド表は空で、個別メソッドは
+//! TASK-42.2 以降（REPAIR-3）。
 //! 初期ターゲット（`about:blank`）の自動作成は行わず、後続タスクの判断に委ねる。
 
 use std::fmt;
@@ -27,6 +28,7 @@ use fandhe_backend_routes::Router;
 use fandhe_browser_core::AppState;
 
 use crate::discovery::{self, Authority, BROWSER_WS_PATH_PATTERN, HostError};
+use crate::protocol::Dispatcher;
 use crate::target::{BrowserId, TargetRegistry};
 use crate::ws;
 
@@ -171,6 +173,8 @@ pub enum WsConfigError {
     PathPattern(PathPatternError),
     /// Ping 間隔の設定が不正。
     PingInterval(PingIntervalError),
+    /// コマンドディスパッチャの組込み表が不正（登録名の不正・重複）。
+    Dispatcher,
 }
 
 impl fmt::Display for WsConfigError {
@@ -178,6 +182,7 @@ impl fmt::Display for WsConfigError {
         match self {
             Self::PathPattern(_) => f.write_str("invalid websocket path pattern"),
             Self::PingInterval(_) => f.write_str("invalid websocket ping interval"),
+            Self::Dispatcher => f.write_str("invalid command dispatcher table"),
         }
     }
 }
@@ -187,6 +192,7 @@ impl std::error::Error for WsConfigError {
         match self {
             Self::PathPattern(e) => Some(e),
             Self::PingInterval(e) => Some(e),
+            Self::Dispatcher => None,
         }
     }
 }
@@ -196,11 +202,14 @@ impl std::error::Error for WsConfigError {
 /// cli（TASK-41.5）が [`endpoints`] の結果を `Server::new().handler(router)
 /// .websocket(config)` の形で組み立てる。受理判定
 /// （Host・Origin・ブラウザ ID。[`crate::ws`]）は本設定のハンドシェイク検査で行う。
-/// メッセージハンドラは暫定（全リクエストへエラー応答）で TASK-42 で置換する。
+/// メッセージハンドラは [`crate::protocol`] のディスパッチャへ委譲する（TASK-42.1）。
 /// bind・loopback 限定（`SEC-4`）・同時接続数上限は cli / core 側の責務。
 /// メッセージ・フレームサイズ上限は core の既定値（DoS 安全側）のまま使う。
-pub(crate) fn browser_websocket_config(state: &CdpState) -> Result<WebSocketConfig, WsConfigError> {
+pub(crate) fn browser_websocket_config(
+    state: &Arc<CdpState>,
+) -> Result<WebSocketConfig, WsConfigError> {
     let browser_id = state.browser_id().clone();
+    let dispatcher = Dispatcher::builtin().map_err(|_| WsConfigError::Dispatcher)?;
     let config = WebSocketConfig::default()
         .with_path_pattern(BROWSER_WS_PATH_PATTERN)
         .map_err(WsConfigError::PathPattern)?
@@ -214,7 +223,10 @@ pub(crate) fn browser_websocket_config(state: &CdpState) -> Result<WebSocketConf
                 &browser_id,
             )
         })
-        .with_handler(ws::BrowserSessionHandler);
+        .with_handler(ws::BrowserSessionHandler::new(
+            Arc::clone(state),
+            dispatcher,
+        ));
     Ok(config)
 }
 

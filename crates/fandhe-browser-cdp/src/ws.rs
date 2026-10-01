@@ -1,33 +1,29 @@
-//! `/devtools/browser/{id}` WebSocket 受け口の受理判定と暫定メッセージハンドラ
+//! `/devtools/browser/{id}` WebSocket 受け口の受理判定とメッセージハンドラ
 //! （TASK-41（41.4）・#173、`CDP-1`・`SEC-2`・MS-3）。
 //!
 //! `crate::server::browser_websocket_config` が `WebSocketConfig` へ組み込む部品で、
-//! 判定・応答生成は純関数として切り出し、3 OS で単体テストできるようにしている。
+//! ハンドシェイク判定は純関数として切り出し、3 OS で単体テストできるようにしている。
 //! 実際のハンドシェイク（RFC 6455）・フレーミングは core の `fandhe-backend-core`
 //! （websocket feature）が担い、cli（TASK-41.5）が `Server::websocket` で配線する。
 //!
 //! # スタブについて
 //!
-//! [`BrowserSessionHandler`] は暫定実装で、CDP メソッドを一切処理しない。全リクエストへ
-//! JSON-RPC エラーを返し、成功（`result`）は返さない（`SEC-2`：未実装メソッドへ
-//! 一律成功を返す検出回避的な挙動の禁止）。TASK-42（`protocol.rs`・`CDP-5`/`CDP-6`）で
-//! メソッドディスパッチ・`CdpState` 参照を持つハンドラへ置き換える。
+//! [`BrowserSessionHandler`] は `crate::protocol::Dispatcher` へ委譲するだけで、組込み
+//! メソッド表は現状空（個別メソッドは TASK-42.2〜42.5、未実装メソッドの応答方針は
+//! 42.6・`CDP-6`）。未実装メソッドへ成功を返さない（`SEC-2`）。
+
+use std::sync::Arc;
 
 use fandhe_backend_core::plugin_websocket::BoxFuture;
 use fandhe_backend_core::plugin_websocket::handler::{
     WsHandlerError, WsMessage, WsMessageHandler, WsOutcome,
 };
 use fandhe_backend_http::response::Response;
-use serde_json::{Value, json};
 
 use crate::discovery::Authority;
-use crate::server::{error_response, host_error_response};
+use crate::protocol::Dispatcher;
+use crate::server::{CdpState, error_response, host_error_response};
 use crate::target::BrowserId;
-
-/// JSON-RPC: Method not found。
-const CODE_METHOD_NOT_FOUND: i64 = -32601;
-/// JSON-RPC: Invalid Request。
-const CODE_INVALID_REQUEST: i64 = -32600;
 
 /// ハンドシェイクの受理判定。拒否時はそのまま返せる HTTP 応答を `Err` で返す。
 ///
@@ -56,28 +52,21 @@ pub(crate) fn check_handshake(
     }
 }
 
-/// 受信テキストに対する暫定応答（JSON 文字列）を作る。
+/// `/devtools/browser/{id}` セッションのメッセージハンドラ。
 ///
-/// トップレベルがオブジェクトで `id` が整数なら「method not implemented」を、それ以外は
-/// 「invalid request」を返す。method 名などの入力値は応答へエコーしない。
-pub(crate) fn placeholder_reply(text: &str) -> String {
-    let id = serde_json::from_str::<Value>(text)
-        .ok()
-        .and_then(|v| v.get("id").filter(|i| i.is_i64() || i.is_u64()).cloned());
-    let reply = match id {
-        Some(id) => json!({
-            "id": id,
-            "error": {"code": CODE_METHOD_NOT_FOUND, "message": "method not implemented"},
-        }),
-        None => json!({
-            "error": {"code": CODE_INVALID_REQUEST, "message": "invalid request"},
-        }),
-    };
-    reply.to_string()
+/// 受信テキストを [`Dispatcher`]（`crate::protocol`）へ渡し、レスポンスとイベントを
+/// 順序どおり WebSocket テキストフレームで返す。`TASK-42`（42.1）・`CDP-1`。
+pub(crate) struct BrowserSessionHandler {
+    state: Arc<CdpState>,
+    dispatcher: Dispatcher,
 }
 
-/// `/devtools/browser/{id}` セッションの暫定メッセージハンドラ（TASK-42 で置換）。
-pub(crate) struct BrowserSessionHandler;
+impl BrowserSessionHandler {
+    /// `crate::server::browser_websocket_config` から接続設定の構築時に 1 度だけ作る。
+    pub(crate) fn new(state: Arc<CdpState>, dispatcher: Dispatcher) -> Self {
+        Self { state, dispatcher }
+    }
+}
 
 impl WsMessageHandler for BrowserSessionHandler {
     fn name(&self) -> &'static str {
@@ -88,7 +77,12 @@ impl WsMessageHandler for BrowserSessionHandler {
         Box::pin(async move {
             Ok(match msg {
                 WsMessage::Text(t) => {
-                    WsOutcome::Reply(vec![WsMessage::Text(placeholder_reply(&t))])
+                    let frames = self
+                        .dispatcher
+                        .dispatch(&self.state, &t)
+                        .await
+                        .into_frames();
+                    WsOutcome::Reply(frames.into_iter().map(WsMessage::Text).collect())
                 }
                 // CDP はテキストフレームのみ。バイナリは受け付けず切断する。
                 WsMessage::Binary(_) => WsOutcome::Close,
@@ -136,34 +130,5 @@ mod tests {
         assert_eq!(rejected(h, None, Some("other")), unknown);
         assert_eq!(rejected(h, None, Some("bad_id!")), unknown);
         assert_eq!(rejected(h, None, None), unknown);
-    }
-
-    #[test]
-    fn cdp1_ws_placeholder_reply_is_always_an_error() {
-        let v: Value = serde_json::from_str(&placeholder_reply(
-            r#"{"id":1,"method":"Browser.getVersion"}"#,
-        ))
-        .unwrap();
-        assert_eq!(
-            v,
-            json!({"id": 1, "error": {"code": -32601, "message": "method not implemented"}})
-        );
-        for bad in [
-            "not json",
-            r#"{"method":"Browser.getVersion"}"#,
-            r#"{"id":"1","method":"x"}"#,
-            r#"[1,2]"#,
-        ] {
-            let v: Value = serde_json::from_str(&placeholder_reply(bad)).unwrap();
-            assert_eq!(v["error"]["code"], -32600, "input: {bad}");
-            assert!(v.get("result").is_none());
-        }
-    }
-
-    #[test]
-    fn cdp1_ws_placeholder_reply_does_not_echo_method() {
-        let r = placeholder_reply(r#"{"id":7,"method":"Evil.secretMethod"}"#);
-        assert!(!r.contains("Evil"));
-        assert!(!r.contains("result"));
     }
 }
