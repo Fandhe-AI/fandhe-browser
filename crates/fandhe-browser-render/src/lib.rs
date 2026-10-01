@@ -10,7 +10,9 @@
 //!
 //! # スタブについて
 //!
-//! - feature `rendering` の Cargo 定義・core の描画トレイト（`Renderer`。
-//!   `fandhe-browser-core::render`）との結線（RENDER-1・TASK-33・MS-1）
+//! - （済み）feature `rendering` の Cargo 定義（workspace 登録 #45・cli 側の結線
+//!   TASK-33.4・#459。RENDER-1・MS-1）
+//! - core の描画トレイト（`Renderer`。`fandhe-browser-core::render`）の実装と、
+//!   cli による `AppState` への注入（RENDER-1・TASK-38・MS-4）
 //! - Servo の組込・スクリーンショット取得等の本実装（RENDER-1・TASK-38・
 //!   MS-4）

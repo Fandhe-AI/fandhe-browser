@@ -9,7 +9,7 @@
 //! cli が port 0 で bind してもルータ構築後に決まるアドレスへ追従できる）。ホストは `localhost`
 //! か IP リテラルに限り、それ以外（= DNS rebinding で到達した任意ホスト名）は拒否する。
 //! 生のヘッダ文字列は応答へ出さず、parse した値から authority を組み立て直す。
-//! プロセス全体のアクセス制御（loopback 限定バインド）は TASK-41.5・`SEC-4` の責務。
+//! プロセス全体のアクセス制御（loopback 限定バインド）は TASK-41.5・`SEC-4` の責務で、cli の `server` モジュール（`ensure_loopback`）で実装済み。
 //!
 //! # スタブについて
 //!

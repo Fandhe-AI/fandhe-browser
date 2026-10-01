@@ -65,7 +65,7 @@ x86_64 優先は spec の対象 OS 方針（Linux は x86_64 優先、macOS は 
 
 ## CI ランナーとターゲットの対応
 
-`.github/workflows/ci.yml` の 3 OS matrix のランナーと、そのホスト triple に対応する prebuilt 候補は次のとおり。ホスト triple は main の CI 実行（2026-10-01、`binary-size` ジョブのログの `host:` 行）で確認した値で、ホストの記録にすぎない。`fandhe-browser-cli` crate が未追加（#174）の間は同ジョブの実ビルドが休眠しており、`js-v8` 有効時の prebuilt 取得実績は確認していない（取得記録の確認は未実施）。
+`.github/workflows/ci.yml` の 3 OS matrix のランナーと、そのホスト triple に対応する prebuilt 候補は次のとおり。ホスト triple は main の CI 実行（2026-10-01、`binary-size` ジョブのログの `host:` 行）で確認した値で、ホストの記録にすぎない。同ジョブは `fandhe-browser-cli` を実ビルドしているが、既定 feature に `js-v8` を含まないため rusty_v8 の prebuilt は取得しておらず、`js-v8` 有効時の取得実績は確認していない（取得記録の確認は未実施）。
 
 | ランナー | ホスト triple | 対応する prebuilt 候補 |
 | -------- | ------------- | ----------------- |

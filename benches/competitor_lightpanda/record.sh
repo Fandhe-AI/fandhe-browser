@@ -16,7 +16,8 @@
 # .github/workflows/bench-competitor.yml（定期実行）。
 #
 # 現状の限界（REPAIR-3「実装済みを装わない」）: fandhe-browser-cli
-# （TASK-41.5）が未実装で CI に対象バイナリが無いため、CI 実行では
+# （TASK-41.5・#616 で追加済み）は存在するが、CI では対象バイナリ
+# （FANDHE_BROWSER_BIN）を渡していないため、CI 実行では
 # lightpanda・fandhe-browser の両方が skipped になり、実際の数値は記録
 # されない。数値を記録できるのは対象バイナリを用意したローカル・計測マシンで
 # 実行したときに限る（benches/competitor_lightpanda/README.md 参照）。

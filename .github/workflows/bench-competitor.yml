@@ -4,8 +4,8 @@ name: Bench Competitor
 # PERF-1・PERF-3・PERF-6・AISNAP-1）を定期的に実行し、結果を CI アーティファクト
 # として保存する（benches/competitor_lightpanda/README.md「記録先」参照）。
 #
-# 現状の限界（README.md に同じ記載）: fandhe-browser-cli（TASK-41.5）が未実装で
-# Lightpanda のバイナリも用意していないため、本ワークフローの実行では
+# 現状の限界（README.md に同じ記載）: fandhe-browser-cli（TASK-41.5・#616 で追加済み）は存在するが、CI では
+# 対象バイナリ（FANDHE_BROWSER_BIN）も Lightpanda のバイナリも渡していないため、本ワークフローの実行では
 # lightpanda・fandhe-browser の両方が skipped になる。CHROMIUM_IDLE_RSS_KB も
 # まだ与えていない（PERF-6 比較は skipped のまま）。対象バイナリの導入・
 # 配線は別 Issue（benches/competitor_lightpanda/README.md「現状の限界」・

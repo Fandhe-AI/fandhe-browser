@@ -287,7 +287,7 @@ pub fn parse_http_status(line: &str) -> Option<u16> {
 /// `fandhe-browser-cdp` crate が対象とする CDP プロトコルの
 /// `Browser`/`Protocol-Version` に加え、Chromium 系 CDP 実装が一般的に返す
 /// `webSocketDebuggerUrl`・`User-Agent`・`V8-Version`・`WebKit-Version` も
-/// 許容する（`fandhe-browser-cli` は未実装で確定した応答形が無いため、
+/// 許容する（`fandhe-browser-cli` は存在するが、cdp の `/json/version` 応答形は TASK-42 以降で変わりうるため、
 /// 単一のフィールド名に絞らず既知の候補を並べる）。
 const READINESS_RESPONSE_FIELDS: &[&str] = &[
     "browser",

@@ -109,7 +109,7 @@ pub(crate) const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// 計測対象 1 つ分の設定（Lightpanda / fandhe-browser）。
 ///
 /// `bin` が `None` のときはバイナリ未提供として全計測を `Outcome::Skipped` にする
-/// （`fandhe-browser-cli` は TASK-41.5 未着手のため、本 PR 時点では常にこの経路）。
+/// （CI では `FANDHE_BROWSER_BIN` を渡していないため、この経路になる）。
 pub struct Target {
     pub name: &'static str,
     pub bin: Option<PathBuf>,

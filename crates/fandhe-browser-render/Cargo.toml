@@ -11,5 +11,6 @@ publish.workspace = true
 
 [dependencies]
 # 依存最小方針（dependency-policy.md）: 本 crate は雛形段階のため依存はゼロ。
-# Servo（MPL-2.0）の導入・feature gate `rendering` の追加は TASK-33
+# feature `rendering` は cli 側に定義済み（TASK-33.4・#459。workspace 登録は #45）で、
+# 本 crate を optional 依存として有効化する。Servo（MPL-2.0）の導入は TASK-38
 # （ビヘイビア RENDER-1）でユーザー承認を経て行う。
