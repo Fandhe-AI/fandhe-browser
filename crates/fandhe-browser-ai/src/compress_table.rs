@@ -13,6 +13,8 @@
 //! （[`compress_rows`]・TASK-12.3・Issue #81）、ヘッダの個別 ref 付与
 //! （[`assign_header_refs`]・TASK-12.2・Issue #80）、超過行数
 //! （`CompressedRows::truncated_rows`・TASK-12.4・Issue #82）は統合済み。
+//! 行選択は固定の先頭 20 行ではなく `retention` の優先保持
+//! （`AISNAP-12`・TASK-16.4・Issue #107）で行う。
 //! `tfoot` 行は統合時に除外と決めた（`rows`・`truncated_rows` に含めない）。
 //!
 //! # 判定規則（table）
@@ -35,6 +37,7 @@
 //! あるが、共通化は統合時（TASK-12.5）に検討する（波及範囲を本モジュールに
 //! 閉じるため複製している）。
 
+use crate::retention::{RetentionPolicy, priority_candidates, select_retained_with_priority};
 use crate::snapshot::element_ref::ElementSignature;
 use crate::snapshot::name::{SKIPPED_SUBTREES, is_hidden_element};
 use crate::snapshot::{
@@ -404,9 +407,17 @@ pub fn detect_regular_structure(doc: &Document, id: NodeId) -> TableDetection {
 
 // ---- データ行の圧縮 1 行表現（TASK-12.3・Issue #81） ----
 
-/// 圧縮表現に含めるデータ行の上限（`AISNAP-2` の「先頭 20 行」・PoC-4 の
-/// `MAX_TABLE_ROWS`）。
+/// 圧縮表現に含めるデータ行の総予算（`AISNAP-2` の「20 行」・PoC-4 の
+/// `MAX_TABLE_ROWS`）。固定の先頭 20 行ではなく、優先保持
+/// （`AISNAP-12`・TASK-16.4・Issue #107）の予算モデルの `cap` として使う。
 pub const MAX_TABLE_ROWS: usize = 20;
+
+/// 優先保持で先頭から必ず確保する行数（`AISNAP-12`・TASK-16.4・Issue #107）。
+///
+/// 1 以上でないと「先頭行が必ず含まれる」保証が成り立たず、大きくするほど優先候補
+/// （ページネーション・送信ボタン）の枠（`MAX_TABLE_ROWS - TABLE_HEAD_KEEP`）が減る。
+/// 暫定値であり、TASK-17（`AISNAP-10` の破損率測定）の結果で見直す。
+pub const TABLE_HEAD_KEEP: usize = 5;
 
 /// 1 セルあたりの文字数上限（`char` 単位。PoC-4 の `slice(0, 40)`）。
 /// 超えた場合は末尾に `…` を付ける。
@@ -440,17 +451,103 @@ pub struct CompressedRow {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct CompressedRows {
-    /// 先頭から最大 [`MAX_TABLE_ROWS`] 行（文書順）。
+    /// 優先保持（`AISNAP-12`）で選んだ最大 [`MAX_TABLE_ROWS`] 行（文書順）。
     pub rows: Vec<CompressedRow>,
-    /// 表示対象のデータ行のうち、先頭 [`MAX_TABLE_ROWS`] 行を超えて省略した行数
+    /// 表示対象のデータ行のうち、保持されず省略した行数
     /// （「他N行」注記の元数値。`AISNAP-2`・TASK-12.4・Issue #82）。
     /// `rows` と同じ母集団（非表示行を除く）で数え、`tfoot` 行・セルを持たない行は含めない。
     /// 文字列注記への整形は出力側（TASK-19・`AISNAP-6`）の責務。
     pub truncated_rows: usize,
 }
 
-/// 規則的と判定済みの構造から、データ行を先頭 [`MAX_TABLE_ROWS`] 行まで
-/// 1 行 1 文字列へ圧縮する（`AISNAP-2`・`TASK-12.3`・Issue #81）。
+/// 非表示の行・祖先（`tbody`・表自身・その外側を含む）の行を除いたデータ行を文書順で返す。
+///
+/// `build_snapshot` の非表示サブツリー除外に合わせるため、選択の index 空間から先に除く
+/// （除かないと非表示行が `omitted` に混ざる）。
+fn visible_body_rows(doc: &Document, structure: &RegularStructure) -> Vec<NodeId> {
+    structure
+        .body_rows
+        .iter()
+        .copied()
+        .filter(|&row| {
+            !is_hidden_element(doc, row) && !doc.ancestors(row).any(|a| is_hidden_element(doc, a))
+        })
+        .collect()
+}
+
+/// 圧縮せず展開する表・一覧で、優先保持（`AISNAP-12`・TASK-16.4・Issue #107）の対象外となり
+/// 1 行文字列へ畳んでよい行を（表示対象データ行の中での index, 行）の組で文書順に返す。
+///
+/// 呼び出し文脈: `build_snapshot` が、操作要素等を含むため `can_compress` で全体を圧縮
+/// できない規則的構造に対して呼ぶ。[`compress_rows`] と同じ予算モデル（先頭確保 →
+/// ページネーション・送信ボタン → 文書順充填）で保持する行を選び、保持されず、かつ
+/// `must_keep` が `false` の行（ref・state・意味的ノードなど畳むと失われる内容を持たない行）
+/// だけを返す。返した行は [`compress_row_list`] で文字列化され、内容は省略されない。
+/// 表示対象行が [`MAX_TABLE_ROWS`] 以下なら空を返す。
+pub fn rows_to_fold(
+    doc: &Document,
+    structure: &RegularStructure,
+    must_keep: impl Fn(NodeId) -> bool,
+) -> Vec<(usize, NodeId)> {
+    let visible = visible_body_rows(doc, structure);
+    if visible.len() <= MAX_TABLE_ROWS {
+        return Vec::new();
+    }
+    let candidates = priority_candidates(doc, &visible);
+    let policy = RetentionPolicy::new(MAX_TABLE_ROWS, TABLE_HEAD_KEEP);
+    let retention = select_retained_with_priority(visible.len(), &policy, &candidates);
+    let kept: std::collections::HashSet<usize> = retention.kept.iter().map(|k| k.index).collect();
+    visible
+        .iter()
+        .enumerate()
+        .filter(|(i, row)| !kept.contains(i) && !must_keep(**row))
+        .map(|(i, row)| (i, *row))
+        .collect()
+}
+
+/// 明示した行要素の列を 1 行 1 文字列へ圧縮する（文書順を保つ。行の省略はしない）。
+///
+/// [`compress_rows`] の行文字列化部分を切り出したもの。`build_snapshot` が畳む行
+/// （[`rows_to_fold`]）の文字列化にも使う。
+pub fn compress_row_list(
+    doc: &Document,
+    kind: StructureKind,
+    rows: &[NodeId],
+) -> Vec<CompressedRow> {
+    rows.iter()
+        .map(|&row| compress_one_row(doc, kind, row))
+        .collect()
+}
+
+fn compress_one_row(doc: &Document, kind: StructureKind, row: NodeId) -> CompressedRow {
+    let cells: Vec<NodeId> = match kind {
+        StructureKind::Table => doc
+            .children(row)
+            .filter(|&c| is_html(doc, c, "td") || is_html(doc, c, "th"))
+            .take(MAX_COLUMNS)
+            .collect(),
+        // List と将来の種別は行要素自身を 1 セルとする。
+        _ => vec![row],
+    };
+    let mut text = String::new();
+    let mut truncated = false;
+    for (i, cell) in cells.into_iter().enumerate() {
+        if i > 0 {
+            text.push_str(CELL_SEPARATOR);
+        }
+        let (cell_text, cut) = cell_text(doc, cell);
+        text.push_str(&cell_text);
+        truncated |= cut;
+    }
+    CompressedRow {
+        row,
+        text,
+        truncated,
+    }
+}
+
+/// 規則的と判定済みの構造から、データ行を最大 [`MAX_TABLE_ROWS`] 行まで
+/// 優先保持（`AISNAP-12`・TASK-16.4・Issue #107）で選び 1 行 1 文字列へ圧縮する（`AISNAP-2`・`TASK-12.3`・Issue #81）。
 ///
 /// 呼び出し文脈: `build_snapshot`（TASK-12.5・Issue #83）が、
 /// [`detect_regular_structure`] が `Regular` を返した表・一覧に対して呼ぶ。
@@ -466,48 +563,31 @@ pub struct CompressedRows {
 ///   [`MAX_CELL_SCAN_STEPS`] ノード・[`MAX_CELL_SCAN_CHARS`] 文字で打ち切る。CSS による非表示はスタイル未評価
 ///   のため対象外
 /// - ヘッダ行・`tfoot` 行は含めない（`tfoot` は統合時（TASK-12.5）に除外と決めた）
-/// - 表示対象のデータ行のうち 20 行を超えた件数を `truncated_rows` に返す
+/// - 行選択は固定の先頭 20 行ではなく `retention` の予算モデルによる（先頭
+///   [`TABLE_HEAD_KEEP`] 行の確保 → ページネーション・送信ボタンを含む行 → 文書順の
+///   充填）。表示対象行が 20 行以下なら全行を文書順で返す。`build_snapshot` 経由では
+///   操作要素を含む表・一覧は全体を圧縮できない（`can_compress`）ため本関数には渡らず、
+///   展開側で [`rows_to_fold`] が同じ予算モデルで畳む行を選ぶ
+/// - 表示対象のデータ行のうち保持されなかった件数を `truncated_rows` に返す
 ///   （非表示行・`tfoot`・ヘッダは数えない。TASK-12.4・Issue #82）
 /// - セル内に `" | "` が含まれると区切りが曖昧になる（エスケープの要否は
 ///   出力形式が決まる統合時に判断する既知の制約）
 pub fn compress_rows(doc: &Document, structure: &RegularStructure) -> CompressedRows {
-    let mut rows = Vec::with_capacity(structure.body_rows.len().min(MAX_TABLE_ROWS));
-    // 非表示の行・祖先（`tbody`・表自身・その外側を含む）の行は除外してから
-    // 20 行の予算を数える（`build_snapshot` の非表示サブツリー除外に合わせる）。
-    let mut visible_rows = structure.body_rows.iter().copied().filter(|&row| {
-        !is_hidden_element(doc, row) && !doc.ancestors(row).any(|a| is_hidden_element(doc, a))
-    });
-    for row in visible_rows.by_ref().take(MAX_TABLE_ROWS) {
-        let cells: Vec<NodeId> = match structure.kind {
-            StructureKind::Table => doc
-                .children(row)
-                .filter(|&c| is_html(doc, c, "td") || is_html(doc, c, "th"))
-                .take(MAX_COLUMNS)
-                .collect(),
-            // List と将来の種別は行要素自身を 1 セルとする。
-            _ => vec![row],
-        };
-        let mut text = String::new();
-        let mut truncated = false;
-        for (i, cell) in cells.into_iter().enumerate() {
-            if i > 0 {
-                text.push_str(CELL_SEPARATOR);
-            }
-            let (cell_text, cut) = cell_text(doc, cell);
-            text.push_str(&cell_text);
-            truncated |= cut;
-        }
-        rows.push(CompressedRow {
-            row,
-            text,
-            truncated,
-        });
-    }
-    // 予算を使い切った後の残りが「他N行」（`rows` と同じ非表示判定で数える）。
-    let truncated_rows = visible_rows.count();
+    let visible = visible_body_rows(doc, structure);
+    // 予算内に収まるなら全行が残るため、検出コストを払わず候補を空にする。
+    let candidates = if visible.len() > MAX_TABLE_ROWS {
+        priority_candidates(doc, &visible)
+    } else {
+        Vec::new()
+    };
+    let policy = RetentionPolicy::new(MAX_TABLE_ROWS, TABLE_HEAD_KEEP);
+    let retention = select_retained_with_priority(visible.len(), &policy, &candidates);
+    let kept_rows: Vec<NodeId> = retention.apply(&visible).into_iter().copied().collect();
+    let rows = compress_row_list(doc, structure.kind, &kept_rows);
+    // 保持されなかった表示対象行が「他N行」（`rows` と同じ母集団で数える）。
     CompressedRows {
         rows,
-        truncated_rows,
+        truncated_rows: retention.omitted,
     }
 }
 
@@ -981,6 +1061,102 @@ mod tests {
         assert_eq!(r.rows[19].text, "r20a | r20b");
         assert_eq!(r.rows[5].row, s.body_rows[5]);
         assert_eq!(r.truncated_rows, 1);
+    }
+
+    // ---- TASK-16.4（Issue #107）優先保持による固定キャップの置換 ----
+
+    fn regular_doc(html: &str, sel: &str) -> (Document, RegularStructure) {
+        let doc = parse(html);
+        let s = match detect_regular_structure(&doc, select(&doc, sel)) {
+            TableDetection::Regular(s) => s,
+            other => panic!("規則的を期待したが {other:?}"),
+        };
+        (doc, s)
+    }
+
+    fn li_list(n: usize, last: &str) -> String {
+        let mut h = String::from("<ul>");
+        for i in 1..=n {
+            h.push_str(&format!("<li>i{i}</li>"));
+        }
+        h.push_str(&format!("<li>{last}</li></ul>"));
+        h
+    }
+
+    fn positions(r: &CompressedRows, s: &RegularStructure) -> Vec<usize> {
+        r.rows
+            .iter()
+            .map(|x| s.body_rows.iter().position(|&b| b == x.row).expect("行"))
+            .collect()
+    }
+
+    /// AISNAP-12（TASK-16.4）: 20 行を超えた末尾のページネーション行が保持される。
+    #[test]
+    fn aisnap_12_compress_rows_keeps_pagination_beyond_cap() {
+        let (doc, s) = regular_doc(&li_list(29, "<a href=\"/p2\" rel=\"next\">next</a>"), "ul");
+        let r = compress_rows(&doc, &s);
+        let pos = positions(&r, &s);
+        assert_eq!(r.rows.len(), 20);
+        assert_eq!(r.truncated_rows, 10);
+        assert_eq!(pos[0], 0);
+        assert_eq!(pos[19], 29);
+        assert!(pos.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(r.rows[19].text, "next");
+    }
+
+    /// AISNAP-12（TASK-16.4）: 20 行を超えた位置の送信ボタン行が保持される。
+    #[test]
+    fn aisnap_12_compress_rows_keeps_submit_button_beyond_cap() {
+        let mut h = String::from("<form><table>");
+        for i in 1..=30 {
+            if i == 25 {
+                h.push_str("<tr><td><button>send</button>");
+            } else {
+                h.push_str(&format!("<tr><td>r{i}"));
+            }
+        }
+        h.push_str("</table></form>");
+        let (doc, s) = regular_doc(&h, "table");
+        let r = compress_rows(&doc, &s);
+        assert!(positions(&r, &s).contains(&24));
+        assert_eq!(r.rows.len(), 20);
+        assert_eq!(r.truncated_rows, 10);
+    }
+
+    /// AISNAP-12（TASK-16.4）: 行の追加でキャップ境界が動いてもページネーション行は残る。
+    #[test]
+    fn aisnap_12_pagination_row_survives_row_insertion() {
+        let pg = "<a href=\"/p2\" rel=\"next\">next</a>";
+        let (doc, s) = regular_doc(&li_list(24, pg), "ul");
+        let r = compress_rows(&doc, &s);
+        assert_eq!((r.rows.len(), r.truncated_rows), (20, 5));
+        assert!(positions(&r, &s).contains(&24));
+        let (doc, s) = regular_doc(&li_list(25, pg), "ul");
+        let r = compress_rows(&doc, &s);
+        assert_eq!((r.rows.len(), r.truncated_rows), (20, 6));
+        assert!(positions(&r, &s).contains(&25));
+    }
+
+    /// AISNAP-12（TASK-16.4）: 非表示行は候補にも件数にも数えない。
+    #[test]
+    fn aisnap_12_hidden_pagination_row_is_not_candidate() {
+        let mut h = String::from("<ul>");
+        for i in 1..=30 {
+            h.push_str(&format!("<li>i{i}</li>"));
+        }
+        h.push_str("<li hidden><a href=\"/p2\" rel=\"next\">next</a></li></ul>");
+        let (doc, s) = regular_doc(&h, "ul");
+        let r = compress_rows(&doc, &s);
+        assert_eq!((r.rows.len(), r.truncated_rows), (20, 10));
+        assert!(r.rows.iter().all(|x| x.text != "next"));
+    }
+
+    /// AISNAP-12（TASK-16.4）: 20 行以下は候補の有無にかかわらず全行を文書順で返す。
+    #[test]
+    fn aisnap_12_within_cap_unchanged() {
+        let r = rows_of(&li_list(2, "<a href=\"/p2\" rel=\"next\">next</a>"), "ul");
+        assert_eq!(texts(&r), ["i1", "i2", "next"]);
+        assert_eq!(r.truncated_rows, 0);
     }
 
     /// AISNAP-2（TASK-12.3）: thead なし 100 行・境界（20 行・3 行・ヘッダのみ）。

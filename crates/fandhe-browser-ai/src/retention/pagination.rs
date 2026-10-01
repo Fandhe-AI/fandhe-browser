@@ -4,9 +4,9 @@
 //! 一覧・表の各項目（`li`・`tr` 等）のサブツリーから「次へ・前へ・ページ番号・
 //! もっと見る」リンクを検出し、優先候補（[`PriorityCandidate`]）へ変換する。
 //! TASK-16.4（Issue #107）で `compress_table::compress_rows` が
-//! `pagination_candidates(doc, &structure.body_rows)` の結果を
-//! [`select_retained_with_priority`](super::select_retained_with_priority) へ渡す
-//! 想定で、現時点の呼び出し元はテストのみ（統合前）。
+//! [`priority_candidates`](super::priority_candidates) 経由で `pagination_candidates` を呼び、
+//! 結果を [`select_retained_with_priority`](super::select_retained_with_priority) へ渡す
+//! （統合済み）。
 //!
 //! # 判定規則（強い根拠から順）
 //!

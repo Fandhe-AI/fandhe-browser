@@ -1,12 +1,13 @@
 //! 表・一覧の圧縮で「どの項目を保持するか」を決める優先保持の選択層
-//! （`AISNAP-12`・`TASK-16`・`TASK-16.1`・`TASK-16.2`・`TASK-16.3`・`MS-2`・Issue #104・#105・#106）。
+//! （`AISNAP-12`・`TASK-16`・`TASK-16.1`・`TASK-16.2`・`TASK-16.3`・`TASK-16.4`・`MS-2`・Issue #104・#105・#106・#107）。
 //!
 //! 役割: 固定件数キャップの単純な `take(cap)` に代わり、キャップ境界付近の
 //! 軽微なページ変化で重要要素が簡約表現から消える問題（PoC-4）を避けるための
 //! 予算モデルを提供する。選択層（本ファイル）は項目数（`len`）・方針
 //! （[`RetentionPolicy`]）・優先候補（[`PriorityCandidate`]）から保持する index
-//! だけを返し、DOM には依存しない（表の行・`li` などの並びへ
-//! [`Retention::apply`] で写像する）。DOM 上の優先項目の検出は子モジュール
+//! だけを返し、`select_retained*` は DOM に依存しない（表の行・`li` などの並びへ
+//! [`Retention::apply`] で写像する）。[`priority_candidates`] は DOM 検出子
+//! モジュールを束ねる薄い合成関数である。DOM 上の優先項目の検出は子モジュール
 //! （ページネーションは [`pagination`]・TASK-16.2、フォーム送信ボタンは
 //! [`submit_button`]・TASK-16.3）が担う。
 //!
@@ -28,13 +29,16 @@
 //!
 //! # 現状
 //!
-//! 呼び出し元はまだ無い。`compress_table::compress_rows` の `take(MAX_TABLE_ROWS)`
-//! の置き換え（統合）は TASK-16.4（Issue #107）で行い、そこで `compress_rows` が
-//! [`pagination::pagination_candidates`] と [`submit_button::submit_button_candidates`]
-//! の結果を合成して [`select_retained_with_priority`] へ渡す想定である。
-//! ページネーション（#105）・送信ボタン（#106）の優先保持はいずれも実装済みで、
-//! 両者の候補の合成は TASK-16.4 の責務である。
-//! `<select>` の先頭圧縮は本モジュールの対象外（未実装）である。
+//! 統合済み（TASK-16.4・Issue #107）。`compress_table::compress_rows` が
+//! [`priority_candidates`] → [`select_retained_with_priority`] → [`Retention::apply`]
+//! で表示対象行を選ぶ。操作要素を含む表・一覧は `can_compress` により全体を圧縮できないため、
+//! `build_snapshot` は `compress_table::rows_to_fold` で同じ予算モデルを展開側へ適用し、
+//! 保持対象外かつ失われる内容のない通常行を 1 行文字列へ畳む（内容は省略しない）。
+//! 操作要素を持つ行は ref・state を保つため上限を超えても展開して残す。
+//! `<select>` の件数キャップは Rust 実装に存在しないため本モジュールの対象外で、
+//! 将来 `<select>` を圧縮するときは本モジュールを使う。
+
+use fandhe_browser_core::dom::{Document, NodeId};
 
 pub mod pagination;
 pub mod submit_button;
@@ -104,7 +108,7 @@ pub struct PriorityCandidate {
 }
 
 impl PriorityCandidate {
-    /// 候補を構築する（採用順位は 0）。
+    /// 候補を構築する（採用順位は 0。`AISNAP-12`）。
     pub fn new(index: usize, reason: RetentionReason) -> Self {
         Self {
             index,
@@ -113,7 +117,7 @@ impl PriorityCandidate {
         }
     }
 
-    /// 採用順位を指定した候補を返す（小さいほど予算不足時に先に採用される）。
+    /// 採用順位を指定した候補を返す（小さいほど予算不足時に先に採用される。`AISNAP-12`）。
     pub fn with_rank(mut self, rank: u8) -> Self {
         self.rank = rank;
         self
@@ -143,14 +147,28 @@ pub struct Retention {
 impl Retention {
     /// 保持 index を `items` へ写像して文書順に返す。
     ///
-    /// 範囲外の index は読み飛ばす（`[]` を使わず panic しない）。
-    /// TASK-16.4 で `body_rows` 等へ適用する想定。
+    /// 範囲外の index は読み飛ばす（`[]` を使わず panic しない）。`AISNAP-12`。
+    /// `compress_rows` が表示対象行へ適用する（`AISNAP-12`・TASK-16.4）。
     pub fn apply<'a, T>(&self, items: &'a [T]) -> Vec<&'a T> {
         self.kept
             .iter()
             .filter_map(|item| items.get(item.index))
             .collect()
     }
+}
+
+/// 一覧・表の項目から優先保持候補を合成する（`AISNAP-12`・`TASK-16.4`・Issue #107）。
+///
+/// `compress_rows` から呼ばれ、ページネーション（[`pagination_candidates`]）→
+/// フォーム送信ボタン（[`submit_button_candidates`]）の順で連結して返す。両方を含む
+/// 項目は同一 index が重複するが、[`select_retained_with_priority`] は与えられた順で
+/// 先の理由（`Pagination`）を残し rank は最小値に統合する。新たな検出器はここへ追加する。
+/// 確保量は `2 * items.len()` 以下、走査量は各検出器の上限（`items.len() * 256` ずつと、
+/// `FormIdIndex` の高々 1 回の文書走査）の和。
+pub fn priority_candidates(doc: &Document, items: &[NodeId]) -> Vec<PriorityCandidate> {
+    let mut candidates = pagination_candidates(doc, items);
+    candidates.extend(submit_button_candidates(doc, items));
+    candidates
 }
 
 /// `len` 件の並びから `policy` に従い保持する項目を選ぶ（`AISNAP-12`）。
@@ -252,6 +270,38 @@ mod tests {
             .filter(|i| i.reason == reason)
             .map(|i| i.index)
             .collect()
+    }
+
+    /// AISNAP-12（TASK-16.4・Issue #107）: ページネーションと送信ボタンの候補を合成し、
+    /// 両方を含む項目は選択後に `Pagination` が残る。
+    #[test]
+    fn aisnap_12_priority_candidates_merge_pagination_and_submit() {
+        let doc = parse(
+            "<form><ul>\
+             <li>a\
+             <li><a href=\"/p2\" rel=\"next\">next</a>\
+             <li><button>send</button>\
+             <li><a href=\"/p3\" rel=\"next\">next</a><button>send</button>\
+             </ul></form>",
+        );
+        let ul = select(&doc, "ul");
+        let items: Vec<NodeId> = doc.children(ul).collect();
+        let c = super::priority_candidates(&doc, &items);
+        let pairs: Vec<(usize, RetentionReason)> = c.iter().map(|c| (c.index, c.reason)).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (1, RetentionReason::Pagination),
+                (3, RetentionReason::Pagination),
+                (2, RetentionReason::SubmitButton),
+                (3, RetentionReason::SubmitButton),
+            ]
+        );
+        let r = select_retained_with_priority(4, &RetentionPolicy::new(3, 1), &c);
+        let kept: Vec<(usize, RetentionReason)> =
+            r.kept.iter().map(|i| (i.index, i.reason)).collect();
+        assert_eq!(kept[0], (0, RetentionReason::Head));
+        assert!(kept.contains(&(1, RetentionReason::Pagination)));
     }
 
     /// AISNAP-12（TASK-16.1・Issue #104）: キャップ超過でも先頭件が保持される。

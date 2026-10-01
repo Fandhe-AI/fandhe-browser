@@ -3,10 +3,10 @@
 //! 役割: 親モジュール [`super`]（選択層）は index しか扱わないため、本モジュールが
 //! 一覧・表の各項目（`li`・`tr` 等）のサブツリーから「フォームの送信ボタン」を検出し、
 //! 優先候補（[`PriorityCandidate`]）へ変換する。TASK-16.4（Issue #107）で
-//! `compress_table::compress_rows` が `submit_button_candidates(doc, &structure.body_rows)`
-//! の結果を [`select_retained_with_priority`](super::select_retained_with_priority) へ
-//! 渡す想定で、現時点の呼び出し元はテストのみ（統合前）。ページネーション候補との
-//! 合成（連結して選択層へ渡すこと）も TASK-16.4 の責務である。
+//! `compress_table::compress_rows` が [`priority_candidates`](super::priority_candidates)
+//! 経由で `submit_button_candidates` を呼び、ページネーション候補と連結して
+//! [`select_retained_with_priority`](super::select_retained_with_priority) へ渡す
+//! （統合済み）。
 //!
 //! # 判定規則
 //!
@@ -266,7 +266,7 @@ fn find_with_index(
 /// （`AISNAP-12`・`TASK-16.3`）。
 ///
 /// 理由は [`RetentionReason::SubmitButton`]。ページネーション候補との合成は
-/// TASK-16.4 で呼び出し側が行う。`form` 属性の id 索引は全項目で共有し、文書全体の
+/// [`priority_candidates`](super::priority_candidates)（TASK-16.4）が行う。`form` 属性の id 索引は全項目で共有し、文書全体の
 /// 走査は高々 1 回（`MAX_FORM_ID_SCAN_NODES` 上限）に抑える。
 pub fn submit_button_candidates(doc: &Document, items: &[NodeId]) -> Vec<PriorityCandidate> {
     let mut forms = FormIdIndex::new(doc);

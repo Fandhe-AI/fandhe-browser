@@ -69,11 +69,11 @@
 //!   snapshot 構築への統合は実装済み（TASK-13.3・Issue #88。`Node::data_leaf`・圧縮表ヘッダの
 //!   `HeaderCell::data_leaf`）
 //! - 重要要素優先保持（`AISNAP-12`・`TASK-16`・`MS-2`）。先頭件の優先保持と
-//!   予算モデルは実装済み（TASK-16.1・Issue #104。[`retention`]・統合前のため
-//!   呼び出し元なし）。ページネーションリンクの優先保持（TASK-16.2・Issue #105。
+//!   予算モデルは実装済み（TASK-16.1・Issue #104。[`retention`]）。ページネーションリンクの優先保持（TASK-16.2・Issue #105。
 //!   [`retention::pagination`]）・フォーム送信ボタンの優先保持（TASK-16.3・
-//!   Issue #106。[`retention::submit_button`]）も実装済み（同じく統合前）。
-//!   固定キャップの置換（#107）・耐性テスト（#108）は未実装
+//!   Issue #106。[`retention::submit_button`]）も実装済み。
+//!   固定キャップの置換（TASK-16.4・Issue #107。`compress_table::compress_rows`）は
+//!   実装済み、耐性テスト（#108）は未実装
 //! - `/ai/*` ルータ向けスナップショット API（`AISNAP-6`・`AISNAP-14`・`CDP-1`
 //!   （API 単体動作は `AISNAP-7`）、`TASK-19`（単体動作確認は `TASK-20`）、
 //!   `MS-4`）

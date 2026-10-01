@@ -126,6 +126,48 @@ pub struct Node {
     /// 規則的な表・一覧の圧縮結果。`None` は圧縮していないノード
     /// （`AISNAP-2`・TASK-12.5・Issue #83）。
     pub table: Option<TableSummary>,
+    /// 展開した表・一覧（操作要素等を含み全体を圧縮できないもの）のうち、優先保持
+    /// （`AISNAP-12`・TASK-16.4）の対象外で、かつ失われる内容を持たない通常行を
+    /// 子ノードの代わりに 1 行文字列へ畳んだもの（文書順）。ref・state を持つ行
+    /// （リンク・ボタン等を含む行）と優先保持で選ばれた行は畳まず `children` に残す。
+    /// 空は畳んだ行なし。行の内容は省略せず文字列で保持する（セルの切り詰めは
+    /// [`FoldedRow::truncated`] で通知）。
+    ///
+    /// 契約（`AISNAP-2`・`AISNAP-12`）: 畳んだ行は ref・`data_leaf` を持たない
+    /// （圧縮表の「データ行は ref を持たない」を展開表の通常行へ広げる）。ref を持つべき行は
+    /// `children` に残る。元の順序は [`FoldedRow::index`] で復元する。
+    pub folded_rows: Vec<FoldedRow>,
+}
+
+/// 展開した表・一覧で 1 行文字列へ畳んだ通常行（`AISNAP-12`・TASK-16.4）。
+///
+/// [`Node::folded_rows`] の要素。ref・`data_leaf` は持たない（`AISNAP-2` の
+/// 「データ行は ref を持たない」と同じ契約）。
+///
+/// `index` は、表・一覧の表示対象データ行（ヘッダ行・`tfoot` 行・非表示行を除く）を
+/// 文書順に数えたときの 0 起点の位置。展開側（`children` 配下）に残る表示対象データ行は、
+/// 畳んだ行が使っていない index を文書順に昇順で占める。したがって両者を index で
+/// 統合すれば元の文書順を復元できる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FoldedRow {
+    /// 表示対象データ行の中での元の位置（0 起点）。
+    pub index: usize,
+    /// 1 行表現（セルを `" | "` で連結）。
+    pub text: String,
+    /// いずれかのセルが上限で切り詰められたか。
+    pub truncated: bool,
+}
+
+impl FoldedRow {
+    /// 位置・行文字列・切り詰め有無を指定して作る。
+    pub fn new(index: usize, text: impl Into<String>, truncated: bool) -> Self {
+        Self {
+            index,
+            text: text.into(),
+            truncated,
+        }
+    }
 }
 
 /// 圧縮した表・一覧のヘッダ 1 セル（`AISNAP-2`・`AISNAP-10`・TASK-12.5）。
@@ -212,9 +254,9 @@ impl TableRow {
 pub struct TableSummary {
     /// ヘッダセル（ヘッダ行が無い表・一覧では空）。
     pub header: Vec<HeaderCell>,
-    /// 先頭から最大 20 行の圧縮行。
+    /// 優先保持（`AISNAP-12`）で選んだ最大 20 行の圧縮行（文書順）。
     pub rows: Vec<TableRow>,
-    /// 20 行を超えて省略した行数。
+    /// 保持されず省略した表示対象の行数。
     pub truncated_rows: usize,
 }
 
@@ -241,6 +283,7 @@ impl Node {
             state: State::default(),
             data_leaf: None,
             table: None,
+            folded_rows: Vec::new(),
         }
     }
 
