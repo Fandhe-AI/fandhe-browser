@@ -1111,6 +1111,41 @@ pub fn run_with_deadline(
     wait_with_deadline(&mut child, deadline)
 }
 
+/// 同時に残存してよい stdout 読み出しスレッド数の上限。
+pub const MAX_LIVE_STDOUT_READERS: usize = 16;
+static LIVE_STDOUT_READERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 残存する stdout 読み出しスレッドの枠（`Drop` で解放する RAII ガード）。
+/// [`run_capturing_output_with_deadline`] が、期限超過後も `read` で
+/// ブロックし続けるスレッドの蓄積を上限で抑えるために使う。
+#[derive(Debug)]
+pub struct ReaderSlot {
+    counter: &'static std::sync::atomic::AtomicUsize,
+}
+
+impl ReaderSlot {
+    /// 枠を 1 つ確保する。`counter` が `limit` 以上なら `Err`。
+    pub fn acquire(
+        counter: &'static std::sync::atomic::AtomicUsize,
+        limit: usize,
+    ) -> Result<Self, String> {
+        use std::sync::atomic::Ordering;
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < limit).then_some(n.saturating_add(1))
+            })
+            .map_err(|_| format!("too many stdout reader threads still blocked (limit {limit})"))?;
+        Ok(Self { counter })
+    }
+}
+
+impl Drop for ReaderSlot {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// `command` の stdout を上限付きで採取しつつ、完了を期限付きで待つ。
 ///
 /// `ps`/`pgrep`/`tasklist`/`lsof`/`netstat`/`powershell` のようなローカルの OS
@@ -1132,6 +1167,13 @@ pub fn run_with_deadline(
 /// 無期限に止まらないため）。受信期限超過・読み取りエラーは `Err`
 /// （fail-closed）。unix・windows 両方の経路から呼ばれるため `#[cfg(...)]`
 /// は付けない。
+///
+/// 期限超過時、std だけでは（`unsafe`・新規依存なしでは）ブロック中の
+/// `read` を中断できず、孫プロセスがパイプを閉じるまで読み出しスレッドが
+/// 残る。繰り返し呼ばれてもスレッドが無制限に蓄積しないよう、残存スレッド数を
+/// [`ReaderSlot`] で数え、[`MAX_LIVE_STDOUT_READERS`] に達していたら子を
+/// 起動せず `Err` を返す（fail-closed）。残存スレッドはパイプが閉じて EOF を
+/// 読めば自然に終了し、枠を解放する。
 pub fn run_capturing_output_with_deadline(
     mut command: std::process::Command,
     deadline: Duration,
@@ -1142,6 +1184,8 @@ pub fn run_capturing_output_with_deadline(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     let start = Instant::now();
+    // spawn 前に枠を確保し、上限超過なら子プロセスを起こさずに失敗させる。
+    let slot = ReaderSlot::acquire(&LIVE_STDOUT_READERS, MAX_LIVE_STDOUT_READERS)?;
     let mut child = command
         .spawn()
         .map_err(|e| format!("failed to spawn: {e}"))?;
@@ -1151,6 +1195,8 @@ pub fn run_capturing_output_with_deadline(
         .ok_or_else(|| "child stdout was not captured".to_string())?;
     let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
     std::thread::spawn(move || {
+        // スレッド終了（EOF・読み取りエラー）時の Drop で枠を解放する。
+        let _slot = slot;
         let mut stdout: Vec<u8> = Vec::new();
         let mut buf = [0u8; 8192];
         let result = loop {
@@ -4835,5 +4881,20 @@ mod tests {
         let out = "p1\nn*:9222\np2\nn*:9222\np3\nn*:9222\n";
         assert_eq!(parse_lsof_listen_pids(out, 9222, 3), Ok(vec![1, 2, 3]));
         assert!(parse_lsof_listen_pids(out, 9222, 2).is_err());
+    }
+
+    /// PERF-3・PERF-6（TASK-84.6.4）: 残存読み出しスレッドの枠は上限で拒否し、
+    /// `Drop` で解放される。
+    #[test]
+    fn reader_slot_rejects_over_limit_and_releases_on_drop() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let a = ReaderSlot::acquire(&COUNTER, 2).expect("first slot");
+        let b = ReaderSlot::acquire(&COUNTER, 2).expect("second slot");
+        assert!(ReaderSlot::acquire(&COUNTER, 2).is_err());
+        drop(a);
+        let c = ReaderSlot::acquire(&COUNTER, 2).expect("slot after release");
+        drop(b);
+        drop(c);
+        assert_eq!(COUNTER.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 }
