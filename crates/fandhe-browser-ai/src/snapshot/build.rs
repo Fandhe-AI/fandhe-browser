@@ -295,7 +295,8 @@ fn has_non_text_name_source(doc: &Document, id: NodeId) -> bool {
 /// `title` を持つ要素に限り [`compute_name_with_index`] で name の出所を確認する
 /// （`AISNAP-2`・`AISNAP-1`・TASK-12・Issue #631）。出所が `title` なら true。
 /// 走査予算の超過（`truncated`）で `title` へ落ちるか確定できない場合も安全側で true。
-/// 共有予算を消費するが、対象は `title` 付き要素に限り 1 回の走査は上限付きで有界。
+/// 判定は name 算出用の共有予算とは別枠の予算で行い（[`NameIndex::with_isolated_content_budget`]）、
+/// 判定対象外の要素の name・`truncated` を変えない。対象は `title` 付き要素に限り有界。
 /// 畳む行の判定（`AISNAP-12`）と [`can_compress`] の双方から呼ばれる。
 fn title_becomes_name(doc: &Document, index: &NameIndex<'_>, id: NodeId) -> bool {
     if !doc
@@ -304,7 +305,8 @@ fn title_becomes_name(doc: &Document, index: &NameIndex<'_>, id: NodeId) -> bool
     {
         return false;
     }
-    let name = compute_name_with_index(doc, index, id);
+    // 判定は別枠の予算で行い、name 算出用の共有予算を消費しない。
+    let name = index.with_isolated_content_budget(|| compute_name_with_index(doc, index, id));
     name.truncated || name.source == NameSource::Title
 }
 
