@@ -248,8 +248,10 @@ fn aisnap_2_table_snapshot_is_compressed() {
             vec![
                 n("table", "", "e7c96b5162ee5821b", vec![]).with_table(TableSummary::new(
                     vec![
-                        HeaderCell::new("columnheader", "名前", "ed7fea8519e468d01"),
-                        HeaderCell::new("columnheader", "点数", "ee748caeae6097f8b"),
+                        HeaderCell::new("columnheader", "名前", "ed7fea8519e468d01")
+                            .with_data_leaf(DataLeafKind::TableCell),
+                        HeaderCell::new("columnheader", "点数", "ee748caeae6097f8b")
+                            .with_data_leaf(DataLeafKind::TableCell),
                     ],
                     vec![TableRow::new("太郎 | 80", false)],
                     0,

@@ -26,9 +26,14 @@
 //! 提供後に ref 経由の解決テストへ差し替える（`AISNAP-3` は判別可能性の集計、ref 復元性は
 //! `AISNAP-10` 側の契約）。
 //!
+//! 圧縮表のヘッダ（AISNAP-2・TASK-12.5）: `TableSummary::header` の `HeaderCell` を
+//! 表ノード直下の葉として走査する（`Item`）。`HeaderCell::data_leaf` は型の値をそのまま
+//! 検査し、テスト側で補完しない（Issue #625）。
+//!
 //! フィクスチャ制約: `<body>` 内に `build_snapshot` が除外する要素（`script`・`style`・
 //! `noscript`・`template`・`hidden`・`aria-hidden="true"`・`input[type=hidden]`）を
-//! 置かない。除外されると添字対応付けがずれるため。
+//! 置かない。除外されると添字対応付けがずれるため。また圧縮表に非表示セルを置かない
+//! （`header` の添字と列位置がずれるため）。
 //!
 //! フィクスチャは PoC の 7 ページの構造を模した合成 HTML で、値はすべてダミー
 //! （実サイトの HTML・外部通信・実資格情報なし。`docs/spec` も参照しない）。
@@ -38,7 +43,8 @@ use std::collections::HashSet;
 
 use fandhe_browser_ai::data_leaf::classify_data_leaf;
 use fandhe_browser_ai::snapshot::{
-    CheckedState, DataLeafKind, Node, Snapshot, build_snapshot, compute_name, compute_role,
+    CheckedState, DataLeafKind, HeaderCell, Node, Snapshot, build_snapshot, compute_name,
+    compute_role,
 };
 use fandhe_browser_core::dom::{Document, NodeId};
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
@@ -71,6 +77,60 @@ const HN_LIST: &str = r#"<!DOCTYPE html><html><head><title>News</title></head><b
 /// 7. チェックボックス。
 const CHECKBOXES_FORM: &str = r#"<!DOCTYPE html><html><head><title>Checkboxes</title></head><body><h3>Checkboxes</h3><form id="checkboxes"><input type="checkbox"> checkbox 1<br><input type="checkbox" checked> checkbox 2</form></body></html>"#;
 
+/// 走査対象の借用ビュー。通常ノードと、圧縮表（`Node::table`）のヘッダセルを
+/// 同じ述語で検査するための和型（値の補完はしない）。
+#[derive(Clone, Copy)]
+enum Item<'a> {
+    Node(&'a Node),
+    Header(&'a HeaderCell),
+}
+
+impl<'a> Item<'a> {
+    fn role(self) -> &'a str {
+        match self {
+            Item::Node(n) => &n.role,
+            Item::Header(h) => &h.role,
+        }
+    }
+    fn name(self) -> &'a str {
+        match self {
+            Item::Node(n) => &n.name,
+            Item::Header(h) => &h.name,
+        }
+    }
+    fn r#ref(self) -> Option<&'a str> {
+        match self {
+            Item::Node(n) => n.r#ref.as_deref(),
+            Item::Header(h) => Some(&h.r#ref),
+        }
+    }
+    fn data_leaf(self) -> Option<DataLeafKind> {
+        match self {
+            Item::Node(n) => n.data_leaf,
+            Item::Header(h) => h.data_leaf,
+        }
+    }
+    fn checked(self) -> Option<CheckedState> {
+        match self {
+            Item::Node(n) => n.state.checked,
+            Item::Header(_) => None,
+        }
+    }
+    /// 子（通常の子の後ろに圧縮表のヘッダを並べる）。
+    fn children(self) -> Vec<Item<'a>> {
+        match self {
+            Item::Node(n) => {
+                let mut out: Vec<Item<'a>> = n.children.iter().map(Item::Node).collect();
+                if let Some(t) = &n.table {
+                    out.extend(t.header.iter().map(Item::Header));
+                }
+                out
+            }
+            Item::Header(_) => Vec::new(),
+        }
+    }
+}
+
 /// 代表タスクの判別結果（真偽値だけにしない。REPAIR-4）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Outcome {
@@ -93,31 +153,31 @@ struct Task {
     /// 対象要素の CSS セレクタ。
     selector: &'static str,
     /// snapshot の情報だけでエージェントが対象を特定する述語。
-    predicate: fn(&Node) -> bool,
+    predicate: fn(Item<'_>) -> bool,
     /// データ系タスクで、対象要素の text_content の期待値。
     expected_text: Option<&'static str>,
 }
 
-fn is_login_button(n: &Node) -> bool {
-    n.role == "button" && n.name == "Login"
+fn is_login_button(n: Item<'_>) -> bool {
+    n.role() == "button" && n.name() == "Login"
 }
-fn is_first_price(n: &Node) -> bool {
-    n.data_leaf == Some(DataLeafKind::PriceClass)
+fn is_first_price(n: Item<'_>) -> bool {
+    n.data_leaf() == Some(DataLeafKind::PriceClass)
 }
-fn is_number_input(n: &Node) -> bool {
-    n.role == "spinbutton"
+fn is_number_input(n: Item<'_>) -> bool {
+    n.role() == "spinbutton"
 }
-fn is_table_heading(n: &Node) -> bool {
-    n.data_leaf == Some(DataLeafKind::TableCell) && n.role == "columnheader"
+fn is_table_heading(n: Item<'_>) -> bool {
+    n.data_leaf() == Some(DataLeafKind::TableCell) && n.role() == "columnheader"
 }
-fn is_dropdown(n: &Node) -> bool {
-    n.role == "combobox"
+fn is_dropdown(n: Item<'_>) -> bool {
+    n.role() == "combobox"
 }
-fn is_top_story_link(n: &Node) -> bool {
-    n.role == "link" && n.name == "Sample Story Alpha"
+fn is_top_story_link(n: Item<'_>) -> bool {
+    n.role() == "link" && n.name() == "Sample Story Alpha"
 }
-fn is_first_checkbox(n: &Node) -> bool {
-    n.role == "checkbox" && n.state.checked == Some(CheckedState::Unchecked)
+fn is_first_checkbox(n: Item<'_>) -> bool {
+    n.role() == "checkbox" && n.checked() == Some(CheckedState::Unchecked)
 }
 
 /// PoC-4 の 7 タスク。
@@ -181,41 +241,17 @@ fn parse(html: &str) -> Document {
         .document
 }
 
-/// 圧縮した表（`Node::table`）のヘッダセルを、テスト上の仮想子ノード
-/// （role・name・ref・`data_leaf = TableCell`）として展開した木を返す。
-///
-/// TASK-12.5（`AISNAP-2`）で規則的な表は子孫（th/td）を展開せず `TableSummary` へ
-/// 圧縮される。ヘッダの `th` は圧縮表現でも個別 ref を持つため、判別可能性の検査では
-/// 「ヘッダセル = 表ノード直下の columnheader 葉」とみなして従来の検査を維持する
-/// （`th` は常に `DataLeafKind::TableCell` のため data_leaf は固定値でよい）。
-fn expand_header_cells(node: &Node) -> Node {
-    let mut out = node.clone();
-    out.children = node.children.iter().map(expand_header_cells).collect();
-    if let Some(table) = &node.table {
-        for h in &table.header {
-            out.children.push(
-                Node::new(h.role.clone(), h.name.clone())
-                    .with_ref(h.r#ref.clone())
-                    .with_data_leaf(DataLeafKind::TableCell),
-            );
-        }
-    }
-    out
-}
-
 fn snap(doc: &Document) -> Snapshot {
-    let s = build_snapshot(doc).expect("フィクスチャの構築は成功する");
-    let truncated = s.truncated;
-    Snapshot::new(expand_header_cells(&s.tree)).with_truncated(truncated)
+    build_snapshot(doc).expect("フィクスチャの構築は成功する")
 }
 
-/// 先行順（明示スタックの反復）で全ノードを列挙する。
-fn all_nodes(root: &Node) -> Vec<&Node> {
+/// 先行順（明示スタックの反復）で全項目（圧縮表のヘッダを含む）を列挙する。
+fn all_nodes(root: &Node) -> Vec<Item<'_>> {
     let mut out = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        out.push(node);
-        stack.extend(node.children.iter().rev());
+    let mut stack = vec![Item::Node(root)];
+    while let Some(item) = stack.pop() {
+        out.push(item);
+        stack.extend(item.children().into_iter().rev());
     }
     out
 }
@@ -250,9 +286,9 @@ fn is_snapshot_child(doc: &Document, id: NodeId) -> bool {
     doc.is_element(id) && doc.local_name(id) != Some("head")
 }
 
-/// DOM 上の `target` に対応する Snapshot 上のノードを、ルートからの添字で辿って返す。
+/// DOM 上の `target` に対応する Snapshot 上の項目を、ルートからの添字で辿って返す。
 /// role・name・data_leaf の一致まで確認し、ずれは対応付け自体の不備として失敗させる。
-fn map_to_snapshot<'a>(doc: &Document, snapshot: &'a Snapshot, target: NodeId) -> &'a Node {
+fn map_to_snapshot<'a>(doc: &Document, snapshot: &'a Snapshot, target: NodeId) -> Item<'a> {
     // target からルートへ向かって、各段での「Snapshot 上の子としての添字」を集める。
     let mut path = Vec::new();
     let mut cur = target;
@@ -265,46 +301,52 @@ fn map_to_snapshot<'a>(doc: &Document, snapshot: &'a Snapshot, target: NodeId) -
         path.push(idx);
         cur = parent;
     }
-    let mut node = &snapshot.tree;
+    let mut item = Item::Node(&snapshot.tree);
     let mut steps = path.iter().rev();
     while let Some(idx) = steps.next() {
-        if node.table.is_some() {
+        let Item::Node(node) = item else {
+            panic!("ヘッダセルの下に子はない");
+        };
+        if let Some(table) = &node.table {
             // 圧縮した表: 残りの経路（thead/tr/th）は最後の添字（列位置）のヘッダセルへ畳む。
             let col = steps.next_back().unwrap_or(idx);
-            node = node
-                .children
-                .get(*col)
-                .expect("列位置に対応するヘッダセルがある");
+            item = Item::Header(
+                table
+                    .header
+                    .get(*col)
+                    .expect("列位置に対応するヘッダセルがある"),
+            );
             break;
         }
-        node = node
-            .children
-            .get(*idx)
-            .expect("添字に対応する Snapshot ノードがある");
+        item = Item::Node(
+            node.children
+                .get(*idx)
+                .expect("添字に対応する Snapshot ノードがある"),
+        );
     }
     let expected_role = compute_role(doc, target).map_or("generic", |r| r.as_str());
-    assert_eq!(node.role, expected_role, "対応付けの role が一致する");
+    assert_eq!(item.role(), expected_role, "対応付けの role が一致する");
     assert_eq!(
-        node.name,
+        item.name(),
         compute_name(doc, target).text,
         "対応付けの name が一致する"
     );
     assert_eq!(
-        node.data_leaf,
+        item.data_leaf(),
         classify_data_leaf(doc, target),
         "対応付けの data_leaf が一致する"
     );
-    node
+    item
 }
 
-/// 述語に最初に一致するノードへの、ルートからの子添字の列を先行順で返す。
-fn first_path(root: &Node, pred: fn(&Node) -> bool) -> Option<Vec<usize>> {
-    let mut stack: Vec<(&Node, Vec<usize>)> = vec![(root, Vec::new())];
-    while let Some((node, path)) = stack.pop() {
-        if pred(node) {
+/// 述語に最初に一致する項目への、ルートからの子添字の列を先行順で返す。
+fn first_path<'a>(root: Item<'a>, pred: fn(Item<'_>) -> bool) -> Option<Vec<usize>> {
+    let mut stack: Vec<(Item<'a>, Vec<usize>)> = vec![(root, Vec::new())];
+    while let Some((item, path)) = stack.pop() {
+        if pred(item) {
             return Some(path);
         }
-        for (i, child) in node.children.iter().enumerate().rev() {
+        for (i, child) in item.children().into_iter().enumerate().rev() {
             let mut p = path.clone();
             p.push(i);
             stack.push((child, p));
@@ -316,17 +358,17 @@ fn first_path(root: &Node, pred: fn(&Node) -> bool) -> Option<Vec<usize>> {
 /// Snapshot 上の添字列を DOM へ逆引きする（`map_to_snapshot` の逆。フィクスチャ制約が前提）。
 fn dom_at_path(doc: &Document, snapshot: &Snapshot, path: &[usize]) -> Option<NodeId> {
     let mut cur = doc.root();
-    let mut vnode = &snapshot.tree;
+    let mut node = &snapshot.tree;
     for idx in path {
-        if vnode.table.is_some() {
-            // 圧縮した表のヘッダセル（仮想子ノード）: 列位置の th を文書順で逆引きする。
+        if node.table.is_some() {
+            // 圧縮した表のヘッダセル: 列位置の th を文書順で逆引きする。
             let th = doc
                 .descendants(cur)
                 .filter(|d| doc.local_name(*d) == Some("th"))
                 .nth(*idx)?;
             return Some(th);
         }
-        vnode = vnode.children.get(*idx)?;
+        node = node.children.get(*idx)?;
         cur = doc
             .children(cur)
             .filter(|c| is_snapshot_child(doc, *c))
@@ -344,19 +386,19 @@ fn evaluate(task: &Task) -> Outcome {
         .expect("フィクスチャに対象要素がある");
     let mapped = map_to_snapshot(&doc, &snapshot, target);
 
-    let Some(target_ref) = mapped.r#ref.as_deref().filter(|r| is_ref_shaped(r)) else {
+    let Some(target_ref) = mapped.r#ref().filter(|r| is_ref_shaped(r)) else {
         return Outcome::NoRef;
     };
     let nodes = all_nodes(&snapshot.tree);
     let same_ref = nodes
         .iter()
-        .filter(|n| n.r#ref.as_deref() == Some(target_ref))
+        .filter(|n| n.r#ref() == Some(target_ref))
         .count();
     if same_ref != 1 {
         return Outcome::RefNotUnique;
     }
-    let first = nodes.iter().find(|n| (task.predicate)(n));
-    if first.and_then(|n| n.r#ref.as_deref()) != Some(target_ref) {
+    let first = nodes.iter().find(|n| (task.predicate)(**n));
+    if first.and_then(|n| n.r#ref()) != Some(target_ref) {
         return Outcome::PredicateMismatch;
     }
     if let Some(expected) = task.expected_text {
@@ -367,11 +409,11 @@ fn evaluate(task: &Task) -> Outcome {
         //     逆引きし、その要素の text_content が期待値と一致する。ref を使った復元では
         //     なく（リゾルバ未提供）、`restoreOk` 相当の検証ではない。値そのものが Snapshot に
         //     残ることではなく、Snapshot の構造だけで値の在処へ辿り着けることを検証する。
-        let name = first.map(|n| n.name.as_str()).unwrap_or_default();
+        let name = first.map(|n| n.name()).unwrap_or_default();
         if !name.is_empty() && name != expected {
             return Outcome::ValueMismatch(name.to_string());
         }
-        let actual = first_path(&snapshot.tree, task.predicate)
+        let actual = first_path(Item::Node(&snapshot.tree), task.predicate)
             .and_then(|path| dom_at_path(&doc, &snapshot, &path))
             .and_then(|id| doc.text_content(id))
             .unwrap_or_default();
@@ -431,14 +473,11 @@ fn aisnap_3_data_tasks_rely_on_data_leaf() {
         .expect("セレクタは有効")
         .expect("価格要素がある");
     let mapped = map_to_snapshot(&doc, &snapshot, target);
-    assert_eq!(
-        (mapped.role.as_str(), mapped.name.as_str()),
-        ("generic", "")
-    );
+    assert_eq!((mapped.role(), mapped.name()), ("generic", ""));
     let nodes = all_nodes(&snapshot.tree);
     let same_shape = nodes
         .iter()
-        .filter(|n| n.role == "generic" && n.name.is_empty())
+        .filter(|n| n.role() == "generic" && n.name().is_empty())
         .count();
     assert!(
         same_shape > 1,
@@ -446,25 +485,27 @@ fn aisnap_3_data_tasks_rely_on_data_leaf() {
     );
     let price_leaves = nodes
         .iter()
-        .filter(|n| n.data_leaf == Some(DataLeafKind::PriceClass))
+        .filter(|n| n.data_leaf() == Some(DataLeafKind::PriceClass))
         .count();
     assert_eq!(price_leaves, 3, "価格葉は 3 件で、先頭が対象");
 
     // 価格: (generic, "") の最初の一致は対象ではなく、data_leaf なら対象を選べる。
     let first_shape = nodes
         .iter()
-        .find(|n| n.role == "generic" && n.name.is_empty())
+        .find(|n| n.role() == "generic" && n.name().is_empty())
         .expect("同形ノードがある");
     assert_ne!(
-        first_shape.r#ref, mapped.r#ref,
+        first_shape.r#ref(),
+        mapped.r#ref(),
         "role/name では別ノードを選ぶ"
     );
     let first_price = nodes
         .iter()
-        .find(|n| n.data_leaf == Some(DataLeafKind::PriceClass))
+        .find(|n| n.data_leaf() == Some(DataLeafKind::PriceClass))
         .expect("価格葉がある");
     assert_eq!(
-        first_price.r#ref, mapped.r#ref,
+        first_price.r#ref(),
+        mapped.r#ref(),
         "data_leaf なら対象を選べる"
     );
 
@@ -481,27 +522,29 @@ fn aisnap_3_data_tasks_rely_on_data_leaf() {
     let th_node = map_to_snapshot(&doc, &snapshot, th);
     let decoy_node = map_to_snapshot(&doc, &snapshot, decoy);
     assert_eq!(
-        (th_node.role.as_str(), th_node.name.as_str()),
-        (decoy_node.role.as_str(), decoy_node.name.as_str()),
+        (th_node.role(), th_node.name()),
+        (decoy_node.role(), decoy_node.name()),
         "対象とディストラクタは role・name が同じ"
     );
-    assert_ne!(th_node.r#ref, decoy_node.r#ref, "別ノード");
-    assert_eq!(decoy_node.data_leaf, None);
+    assert_ne!(th_node.r#ref(), decoy_node.r#ref(), "別ノード");
+    assert_eq!(decoy_node.data_leaf(), None);
     let nodes = all_nodes(&snapshot.tree);
     let by_role_name = nodes
         .iter()
-        .find(|n| n.role == "columnheader" && n.name == "Last Name")
+        .find(|n| n.role() == "columnheader" && n.name() == "Last Name")
         .expect("role/name の一致がある");
     assert_eq!(
-        by_role_name.r#ref, decoy_node.r#ref,
+        by_role_name.r#ref(),
+        decoy_node.r#ref(),
         "role/name はディストラクタを選ぶ"
     );
     let by_data_leaf = nodes
         .iter()
-        .find(|n| is_table_heading(n) && n.name == "Last Name")
+        .find(|n| is_table_heading(**n) && n.name() == "Last Name")
         .expect("data_leaf 併用の一致がある");
     assert_eq!(
-        by_data_leaf.r#ref, th_node.r#ref,
+        by_data_leaf.r#ref(),
+        th_node.r#ref(),
         "data_leaf なら対象を選べる"
     );
 }
@@ -516,7 +559,7 @@ fn aisnap_3_snapshot_is_deterministic_and_refs_unique() {
         assert_eq!(a, b, "{} は決定的", task.name);
         let refs: Vec<&str> = all_nodes(&a.tree)
             .iter()
-            .filter_map(|n| n.r#ref.as_deref())
+            .filter_map(|n| n.r#ref())
             .collect();
         let unique: HashSet<&str> = refs.iter().copied().collect();
         assert_eq!(refs.len(), unique.len(), "{} の ref は一意", task.name);
