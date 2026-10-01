@@ -39,8 +39,10 @@
 //! [`observability`] モジュールは TASK-10（10.1・Issue #219・ビヘイビア
 //! `REPAIR-9`）で、`fetch`/`parse`/`dom`/`query`/`js_stub` 各モジュールの
 //! 操作計測が共通で使うレコード型（[`observability::OperationRecord`] 等）を
-//! 追加した。各モジュールへの計測の組み込み・出力先の確定は含まない
-//! （モジュール doc コメント・Issue #218 を参照）。
+//! 追加した。`fetch`・`parse`・`dom` へは TASK-10.2.1（#549）で recorder
+//! （[`observability::OperationRecorder`]）経由の計装を組み込み済み。`query`・
+//! `js_stub` は #550、本番の出力先の確定・実装は #221・#218 の担当で含まない
+//! （[`observability::InMemoryRecorder`] はテスト・簡易集計用で本番の出力先ではない）。
 //! [`config`] モジュールは TASK-91（91.1・Issue #214・対象ビヘイビアなし・
 //! 基盤タスク）で、`fandhe-browser.toml` の `[profile]` セクション
 //! （保存先・分離強度）を読み込む本実装を追加した（`toml`・`serde` は
@@ -57,6 +59,8 @@
 //! - [`render::DisabledRenderer`]（`RENDER-1`・`TASK-33`/`TASK-38`・`MS-1`/`MS-4`）
 //! - [`observability::OperationRecord::to_json_line`]（`REPAIR-9`・`TASK-10（10.1）`・
 //!   `MS-4`。出力形式は Issue #218 で未確定な暫定エンコーダ）
+//! - [`observability::InMemoryRecorder`]（`REPAIR-9`・`TASK-10.3`・#221。
+//!   テスト・簡易集計用で本番の出力先ではない）
 
 pub mod config;
 pub mod dom;
@@ -79,7 +83,10 @@ pub use dom::{
 };
 pub use error::{Error, ParseError, Result};
 pub use fetch::{FetchOptions, FetchResponse, Fetcher};
-pub use observability::{FailureKind, OperationKind, OperationOutcome, OperationRecord};
+pub use observability::{
+    FailureKind, InMemoryRecorder, OperationCounts, OperationKind, OperationOutcome,
+    OperationRecord, OperationRecorder, RecorderHandle,
+};
 pub use parse::{
     ParseDiagnostics, ParseErrorPolicy, ParseOptions, ParsedDocument, parse_document,
     parse_document_bytes,
