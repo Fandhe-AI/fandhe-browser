@@ -57,8 +57,10 @@ fandhe-browser-js = { path = "../fandhe-browser-js" }
 
 # `JsEngineNotCompiled` のエラーメッセージが案内する `--features js-v8` /
 # `--features js-boa` を core 対象のビルドでも有効にするための feature 転送
-# （TASK-91.2・Issue #215・PR #578 レビュー指摘）。js crate の同名 feature を
+# （spec 上の担当は TASK-30（30.1）・JS-2・MS-3、Issue #159。実装は TASK-91.2・
+# Issue #215・PR #578 レビュー指摘で先に導入済み）。js crate の同名 feature を
 # 有効にするだけで、新規依存は増えない。既定は空のため既定ビルドの依存グラフは不変。
+# cli 側の転送と `default = ["js-v8"]` は TASK-30.2（Issue #160）が担う。
 [features]
 default = []
 js-v8 = ["fandhe-browser-js/js-v8"]
