@@ -66,11 +66,16 @@ pub(crate) const CONFIG_PATH_EMPTY_MESSAGE: &str = "FANDHE_BROWSER_CONFIG is set
 pub(crate) const PROFILE_ROOT_NOT_WIRED_MESSAGE: &str =
     "profile.root in the config file is not yet supported by the CLI (TASK-47/TASK-60.4)";
 
+/// 設定ファイルの I/O エラー（`ConfigError::Io`）の固定文言。core のメッセージは
+/// `path.display()` を含むため、表示せずこの文言へ写像する。
+pub(crate) const CONFIG_IO_MESSAGE: &str = "failed to read the config file";
+
 /// 起動時のエラー。`Display` は固定の英語文言で、入力値（パス・アドレス等）を埋め込まない。
 ///
 /// 例外は [`StartupError::Config`] のみで、core の設定エラー文言（指定値・同梱エンジン一覧・
-/// 必要な feature）をそのまま透過する（spec `JS-1` 切替方式ケース (3) の要求。値は運用者
-/// 自身のローカル設定由来。設定ファイルのパスは含まれない）。
+/// 必要な feature）を透過する（spec `JS-1` 切替方式ケース (3) の要求。値は運用者自身の
+/// ローカル設定由来）。ただしファイルパスを含み得る I/O エラー（`ConfigError::Io`）だけは
+/// [`CONFIG_IO_MESSAGE`] の固定文言へ写像し、設定ファイルのパスを表示しない。
 #[derive(Debug)]
 #[non_exhaustive]
 pub(crate) enum StartupError {
@@ -99,6 +104,9 @@ pub(crate) enum StartupError {
 impl fmt::Display for StartupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Config(fandhe_browser_core::Error::Config(
+                fandhe_browser_core::config::ConfigError::Io { .. },
+            )) => f.write_str(CONFIG_IO_MESSAGE),
             Self::Config(e) => write!(f, "{e}"),
             Self::ConfigPathEmpty => f.write_str(CONFIG_PATH_EMPTY_MESSAGE),
             Self::ProfileRootNotWired => f.write_str(PROFILE_ROOT_NOT_WIRED_MESSAGE),
@@ -229,6 +237,17 @@ mod tests {
             path: std::path::PathBuf::from("p"),
         });
         assert_eq!(other.to_string(), "failed to open profile");
+    }
+
+    /// 設定ファイルの I/O エラーは固定文言へ写像され、パスが表示に漏れない。
+    #[test]
+    fn config_io_error_displays_fixed_message_without_path() {
+        let io = fandhe_browser_core::Error::Config(fandhe_browser_core::config::ConfigError::Io {
+            message: "failed to open /secret/dir/cfg.toml: No such file".to_string(),
+        });
+        let shown = StartupError::Config(io).to_string();
+        assert_eq!(shown, "failed to read the config file");
+        assert!(!shown.contains("/secret"));
     }
 
     #[test]

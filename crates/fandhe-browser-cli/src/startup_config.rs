@@ -87,7 +87,9 @@ mod tests {
         let path = dir.0.join("nope.toml");
         let err = load_startup_config_from(Some(path.into_os_string())).expect_err("missing");
         assert!(matches!(err, StartupError::Config(_)));
-        assert!(err.to_string().starts_with("configuration error:"));
+        let shown = err.to_string();
+        assert_eq!(shown, "failed to read the config file");
+        assert!(!shown.contains("nope.toml"));
         assert!(err.source().is_some());
     }
 
