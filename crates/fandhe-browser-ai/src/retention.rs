@@ -31,9 +31,8 @@
 //!
 //! 統合済み（TASK-16.4・Issue #107）。`compress_table::compress_rows` が
 //! [`priority_candidates`] → [`select_retained_with_priority`] → [`Retention::apply`]
-//! で表示対象行を選ぶ。操作要素を含む表・一覧は `can_compress` により圧縮されないため、
-//! `build_snapshot` は `compress_table::omitted_rows_preserving` で同じ予算モデルを
-//! 展開側へ適用する（操作要素を持つ行は ref・state を保つため上限を超えても残す）。
+//! で表示対象行を選ぶ。`build_snapshot` 経由では `can_compress` により操作要素を含む
+//! 表・一覧が圧縮されないため候補は空になり、結果は先頭確保 + 文書順充填になる。
 //! `<select>` の件数キャップは Rust 実装に存在しないため本モジュールの対象外で、
 //! 将来 `<select>` を圧縮するときは本モジュールを使う。
 
