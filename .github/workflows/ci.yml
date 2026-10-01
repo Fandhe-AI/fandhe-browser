@@ -213,6 +213,15 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test（既定 feature）
         run: cargo test --workspace
+      # TASK-30.4（Issue #162・JS-2）: workspace 全体の検証では cli の
+      # `default = ["js-v8"]` が feature 統合で core に伝わり、エンジンなし構成の
+      # テスト（`cfg(not(any(feature = "js-v8", feature = "js-boa")))`）が
+      # コンパイル対象から外れる。core を単独で選んでエンジンなし構成を検証する
+      # （`cargo tree` 検査の #168 / TASK-32.4 はこのテスト実行を含まない）
+      - name: cargo clippy（core 単独・エンジンなし）
+        run: cargo clippy -p fandhe-browser-core --all-targets -- -D warnings
+      - name: cargo test（core 単独・エンジンなし）
+        run: cargo test -p fandhe-browser-core
 
   # --------------------------------------------------
   # rust-ci-js-v8（js crate を `--features js-v8` 単独で 3 OS 検証）
