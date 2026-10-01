@@ -41,8 +41,8 @@ fandhe-browser-render = { workspace = true, optional = true }
 #   既定                                          = V8 のみ同梱
 #   --no-default-features --features js-boa       = 軽量（boa。js 側は TASK-32・#165 までプレースホルダ）
 #   --no-default-features                         = エンジンなし（JS 実行要求はエラーで、成功を装わない）
-# 現状は同梱の結線だけ（REPAIR-3）。実行経路から `create_engine` はまだ呼ばれず、
-# js_stub の置換は #161（TASK-30.3）、main 先頭のワーカーフックは #514 で行う。
+# `main` 先頭でワーカーフック `run_js_worker_if_requested` を呼ぶ（#514）。ただし実行経路から
+# `create_engine` はまだ呼ばれない（REPAIR-3）。js_stub の置換は #161（TASK-30.3）。
 default = ["js-v8"]
 js-v8 = ["fandhe-browser-core/js-v8"]
 js-boa = ["fandhe-browser-core/js-boa"]

@@ -1131,7 +1131,7 @@ impl ReaderSlot {
     ) -> Result<Self, String> {
         use std::sync::atomic::Ordering;
         counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < limit).then_some(n.saturating_add(1))
             })
             .map_err(|_| format!("too many stdout reader threads still blocked (limit {limit})"))?;
