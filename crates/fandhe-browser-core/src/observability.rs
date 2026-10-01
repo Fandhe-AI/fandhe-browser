@@ -11,7 +11,7 @@
 //! `TASK-10.2.1`（Issue #549）で、レコードの受け口（[`OperationRecorder`]・
 //! [`RecorderHandle`]）とテスト・簡易集計用の有界メモリ内集計器
 //! （[`InMemoryRecorder`]）を追加し、`fetch`・`parse`・`dom` へ計装を組み込んだ。
-//! `query`・`js_stub` への計装は Issue #550（`TASK-10.2.2`）、本番の出力先
+//! `query`・`js_stub` へは Issue #550（`TASK-10.2.2`）で組み込み済み。本番の出力先
 //! （ファイル・外部基盤）・保持期間は Issue #221（`TASK-10.3`）と Issue #218
 //! （`TASK-10（10.h1）`。出力形式・保持期間・収集基盤の決定。担当は人間、
 //! 本 Issue 時点で未決）が担当する。recorder は呼び出し側が options 経由で
@@ -326,7 +326,7 @@ impl OperationRecord {
 
 /// 操作レコードの受け口（`REPAIR-9`・`TASK-10.2.1`）。
 ///
-/// `fetch`・`parse`・`dom` の計装コードが 1 操作ごとに [`OperationRecord`] を
+/// `fetch`・`parse`・`dom`・`query`・`js_stub` の計装コードが 1 操作ごとに [`OperationRecord`] を
 /// 渡す。in-process の Rust トレイトであり、プラグイン境界（PLUG 系）でも
 /// 動的ライブラリのロードでもない。
 ///
@@ -340,7 +340,8 @@ pub trait OperationRecorder: Send + Sync {
 
 /// [`OperationRecorder`] の共有ハンドル。既定は無効（何も記録しない）。
 ///
-/// `FetchOptions`・`ParseOptions`・`dom::Document` が保持し、計装箇所は
+/// `FetchOptions`・`ParseOptions`・`JsStubOptions`・`dom::Document` が保持し
+/// （`query` は照合対象 `Document` のものを使う）、計装箇所は
 /// [`RecorderHandle::is_enabled`] で無効時の `Instant::now()` を省ける。
 #[derive(Clone, Default)]
 pub struct RecorderHandle {

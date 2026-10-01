@@ -39,9 +39,9 @@
 //! [`observability`] モジュールは TASK-10（10.1・Issue #219・ビヘイビア
 //! `REPAIR-9`）で、`fetch`/`parse`/`dom`/`query`/`js_stub` 各モジュールの
 //! 操作計測が共通で使うレコード型（[`observability::OperationRecord`] 等）を
-//! 追加した。`fetch`・`parse`・`dom` へは TASK-10.2.1（#549）で recorder
-//! （[`observability::OperationRecorder`]）経由の計装を組み込み済み。`query`・
-//! `js_stub` は #550、本番の出力先の確定・実装は #221・#218 の担当で含まない
+//! 追加した。`fetch`・`parse`・`dom` へは TASK-10.2.1（#549）、`query`・`js_stub` へは
+//! TASK-10.2.2（#550）で recorder（[`observability::OperationRecorder`]）経由の計装を
+//! 組み込み済み。本番の出力先の確定・実装は #221・#218 の担当で含まない
 //! （[`observability::InMemoryRecorder`] はテスト・簡易集計用で本番の出力先ではない）。
 //! [`config`] モジュールは TASK-91（91.1・Issue #214・対象ビヘイビアなし・
 //! 基盤タスク）で、`fandhe-browser.toml` の `[profile]` セクション
