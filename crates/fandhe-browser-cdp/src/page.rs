@@ -148,17 +148,29 @@ impl CommandHandler for PageNavigate {
             // レジストリに登録済みであることを要求する（未登録 ID で共有状態を書き換えさせない。
             // `CDP-1`・`SEC-2`）。`sessionId` なし（ブラウザレベル）はセッション／ターゲット対応
             // （TASK-43・`CDP-2`）が入るまで従来どおり許容する（スタブ）。
-            if let Some(sid) = ctx.session_id
-                && ctx.state.registry().session_target(sid).is_none()
-            {
-                return Err(CdpError::INVALID_PARAMS);
-            }
+            let target_id = match ctx.session_id {
+                Some(sid) => Some(
+                    ctx.state
+                        .registry()
+                        .session_target(sid)
+                        .ok_or(CdpError::INVALID_PARAMS)?,
+                ),
+                None => None,
+            };
             let url = params
                 .get("url")
                 .and_then(Value::as_str)
                 .filter(|u| !u.is_empty() && u.len() <= MAX_URL_LEN)
                 .ok_or(CdpError::INVALID_PARAMS)?;
-            let out = navigate(&self.fetcher, ctx.state.app_state().navigation(), url).await?;
+            let nav = ctx.state.app_state().navigation();
+            let out = navigate(&self.fetcher, nav, url).await?;
+            // 成功時のみ、ターゲット表の URL を確定した最終 URL へ更新する（`CDP-1`）。
+            // 取得中にターゲットが閉じられた場合（UnknownTarget）は無視してよい。
+            if out.error_text.is_none()
+                && let (Some(tid), Some(latest)) = (&target_id, nav.latest())
+            {
+                let _ = ctx.state.registry().set_target_url(tid, latest.url());
+            }
             let mut result = json!({
                 "frameId": MAIN_FRAME_ID,
                 "loaderId": out.loader_id,
@@ -466,6 +478,25 @@ mod tests {
             let f = frames(allowed_dispatcher().dispatch(&st, &req.to_string()).await);
             assert_eq!(f[0]["result"]["loaderId"], json!("1"));
             assert_eq!(st.app_state().navigation().latest().unwrap().html(), "ok");
+            // 成功後はターゲット表の URL も遷移先へ更新される（`CDP-1`）。
+            assert_eq!(st.registry().target(&tid).unwrap().url(), url);
+        }
+
+        #[tokio::test]
+        async fn cdp1_page_navigate_failure_keeps_target_url() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let tid = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let sid = st.registry().attach(&tid).unwrap();
+            let req = json!({"id": 1, "method": "Page.navigate",
+                "sessionId": sid.as_str(), "params": {"url": "file:///etc/passwd"}});
+            let f = frames(allowed_dispatcher().dispatch(&st, &req.to_string()).await);
+            assert_eq!(f[0]["result"]["errorText"], json!("net::ERR_ACCESS_DENIED"));
+            assert_eq!(st.registry().target(&tid).unwrap().url(), "about:blank");
         }
 
         #[tokio::test]
