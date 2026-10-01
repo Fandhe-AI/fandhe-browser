@@ -193,9 +193,9 @@ impl TableRow {
 pub struct TableSummary {
     /// ヘッダセル（ヘッダ行が無い表・一覧では空）。
     pub header: Vec<HeaderCell>,
-    /// 先頭から最大 20 行の圧縮行。
+    /// 優先保持（`AISNAP-12`）で選んだ最大 20 行の圧縮行（文書順）。
     pub rows: Vec<TableRow>,
-    /// 20 行を超えて省略した行数。
+    /// 保持されず省略した表示対象の行数。
     pub truncated_rows: usize,
 }
 
