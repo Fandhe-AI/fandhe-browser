@@ -1,11 +1,9 @@
 //! `[js] engine`（TASK-91（91.2）・Issue #215・`JS-1`）の fail-closed 起動エラーを、
 //! 子プロセスの終了コード・stderr として検証する結合テスト。
 //!
-//! cli は追加済みだが、起動シーケンスで設定を読み込む配線が未実施のため、起動シーケンス（設定読み込み → 失敗なら
-//! stderr へ出して非 0 終了）を、このテストバイナリ自身の再実行
-//! （`std::env::current_exe()`）で模す。cli 作成後は TASK-30 の結合テスト
-//! （既定ビルドで `engine = "boa"` → 非 0 終了）が実バイナリで同等の検証を
-//! 担う。「JS 無効」の起動時ログ出力（REPAIR-3）は本テストの対象外。
+//! 起動シーケンス（設定読み込み → 失敗なら stderr へ出して非 0 終了）を、このテスト
+//! バイナリ自身の再実行（`std::env::current_exe()`）で模す。実バイナリでの同等の検証は
+//! `crates/fandhe-browser-cli/tests/engine_mismatch.rs`（TASK-30.5）が担う。「JS 無効」の起動時ログ出力（REPAIR-3）は本テストの対象外。
 //!
 //! 期待値は同梱一覧（`bundled_engines`）から実行時に組み立てるため、既定
 //! feature（同梱なし）でも `--all-features`（V8・boa）でも skip されずに通る。
