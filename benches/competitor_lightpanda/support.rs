@@ -31,7 +31,7 @@
 //! （TASK-84.6.2・#560。`/proc` の解析部 [`proc_net_tcp_listen_inode`] 等を
 //! 本ファイルに置く）、macOS は実装済み（TASK-84.6.3・#561。`lsof` の出力解析部
 //! [`parse_lsof_listen_pids`] を本ファイルに置く）、Windows も実装済み
-//! （TASK-84.6.4・#562。`netstat` の解析部 [`parse_netstat_listen_pids`] と
+//! （TASK-84.6.4・#562。`netstat` の解析部 [`parse_netstat_listen_owners`] と
 //! プロセス表の解析・子孫算出 [`parse_windows_process_table`]・
 //! [`windows_descendant_pids`] を本ファイルに置く）。
 //!
@@ -1515,6 +1515,56 @@ pub fn parse_lsof_listen_pids(out: &str, port: u16, max_pids: usize) -> Result<V
     Ok(pids)
 }
 
+/// [`parse_netstat_listen_owners`] の結果。127.0.0.1 宛て probe への応答可否が
+/// netstat 出力から確定できるものと、確定できない `[::]` を分けて持つ
+/// （TASK-84.6.4・#562。`PERF-3`/`PERF-6`）。
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct NetstatListenOwners {
+    /// IPv4 で到達できると確定する LISTEN（`127.0.0.1`・`0.0.0.0`・
+    /// `[::ffff:127.0.0.1]`）の所有 PID。出現順・重複なし
+    pub ipv4_reachable: Vec<u32>,
+    /// `[::]` の LISTEN の所有 PID。netstat からは IPv6 専用かデュアルスタック
+    /// か判別できず、IPv4 の probe に応答するとは限らない。出現順・重複なし
+    pub ipv6_wildcard: Vec<u32>,
+}
+
+impl NetstatListenOwners {
+    /// 別プロトコル（`TCP` と `TCPv6`）の結果を取り込む。件数は各リスト
+    /// `max_pids` 以内で、超過は `Err`。
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn merge(&mut self, other: NetstatListenOwners, max_pids: usize) -> Result<(), String> {
+        for (dst, src) in [
+            (&mut self.ipv4_reachable, other.ipv4_reachable),
+            (&mut self.ipv6_wildcard, other.ipv6_wildcard),
+        ] {
+            for pid in src {
+                if !dst.contains(&pid) {
+                    if dst.len() >= max_pids {
+                        return Err(format!("more than {max_pids} processes own the port"));
+                    }
+                    dst.push(pid);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// readiness probe（127.0.0.1）に応答し得る所有 PID を決める。IPv4 で到達
+    /// できると確定する LISTEN があればそれだけを返し、`[::]` の PID は含めない
+    /// （別プロセスの IPv6 専用リスナーが同ポートにいても IPv4 側の所有者判定を
+    /// 汚さない）。IPv4 の LISTEN が無いときだけ、デュアルスタックの `[::]` を
+    /// 候補として返す（IPv6 専用だった場合は probe 自体が失敗するため安全側）。
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn resolve(self) -> Vec<u32> {
+        if self.ipv4_reachable.is_empty() {
+            self.ipv6_wildcard
+        } else {
+            self.ipv4_reachable
+        }
+    }
+}
+
 /// `netstat -a -n -o -p TCP`（または `TCPv6`）の出力から、`port` で LISTEN
 /// しているソケットの所有 PID を返す（TASK-84.6.4・#562。`measure.rs` の
 /// Windows 版 `lookup_port_owner_pids` が呼ぶ。`PERF-3`/`PERF-6`）。
@@ -1527,22 +1577,23 @@ pub fn parse_lsof_listen_pids(out: &str, port: u16, max_pids: usize) -> Result<V
 /// `BOUND` は識別できないが、その場合は余分な PID が混ざり `Mismatch`
 /// （fail-closed）になるだけで誤って所有者一致とはならない。
 /// 契約:
-/// - アドレスは [`parse_lsof_listen_pids`] と同じく 127.0.0.1 宛ての probe に
-///   応答し得るもの（`127.0.0.1`・`0.0.0.0`・`[::]`・`[::ffff:127.0.0.1]`）
-///   だけを数える（`[::1]` や他の IP は対象外。多めに数えても `Mismatch` が
-///   増えるだけで安全側）
+/// - 127.0.0.1 宛ての probe に応答し得るアドレスだけを数える。`127.0.0.1`・
+///   `0.0.0.0`・`[::ffff:127.0.0.1]` は [`NetstatListenOwners::ipv4_reachable`]、
+///   `[::]` は IPv6 専用か判別できないため別枠の
+///   [`NetstatListenOwners::ipv6_wildcard`] に分ける（採否は
+///   [`NetstatListenOwners::resolve`]）。`[::1]` や他の IP は対象外
 /// - `TCP` 行で形式不正（フィールド不足・`HOST:PORT` でない・ポート/PID が数値
 ///   でない）、対象ポートの行の PID が 0 なら `Err`（fail-closed）
-/// - PID は重複なし・出現順。`max_pids` 超過も `Err`
+/// - PID は各リスト内で重複なし・出現順。`max_pids` 超過も `Err`
 ///
 /// 本体は cfg で落とさない（ユニットテストを 3 OS で実行するため）。
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn parse_netstat_listen_pids(
+pub fn parse_netstat_listen_owners(
     out: &str,
     port: u16,
     max_pids: usize,
-) -> Result<Vec<u32>, String> {
-    let mut pids: Vec<u32> = Vec::new();
+) -> Result<NetstatListenOwners, String> {
+    let mut owners = NetstatListenOwners::default();
     for line in out.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.first().copied() != Some("TCP") {
@@ -1581,18 +1632,19 @@ pub fn parse_netstat_listen_pids(
         if pid == 0 {
             return Err("pid 0 in netstat output".to_string());
         }
-        let reachable = matches!(
-            local_host.as_str(),
-            "127.0.0.1" | "0.0.0.0" | "[::]" | "[::ffff:127.0.0.1]"
-        );
-        if reachable && !pids.contains(&pid) {
-            if pids.len() >= max_pids {
+        let target = match local_host.as_str() {
+            "127.0.0.1" | "0.0.0.0" | "[::ffff:127.0.0.1]" => &mut owners.ipv4_reachable,
+            "[::]" => &mut owners.ipv6_wildcard,
+            _ => continue,
+        };
+        if !target.contains(&pid) {
+            if target.len() >= max_pids {
                 return Err(format!("more than {max_pids} processes own the port"));
             }
-            pids.push(pid);
+            target.push(pid);
         }
     }
-    Ok(pids)
+    Ok(owners)
 }
 
 /// Windows のプロセス表（`Get-CimInstance Win32_Process` を「PID 親PID
@@ -3944,7 +3996,48 @@ mod tests {
         assert_eq!(stdout.len(), 4);
     }
 
-    // --- parse_netstat_listen_pids（TASK-84.6.4・#562。3 OS で実行する） ---
+    // --- parse_netstat_listen_owners（TASK-84.6.4・#562。3 OS で実行する） ---
+
+    /// 単一出力を解析して [`NetstatListenOwners::resolve`] まで通す（既存テスト用）。
+    #[allow(dead_code)] // bench ターゲットは #[test] を除外してコンパイルされるため
+    fn parse_netstat_listen_pids(out: &str, port: u16, max: usize) -> Result<Vec<u32>, String> {
+        parse_netstat_listen_owners(out, port, max).map(NetstatListenOwners::resolve)
+    }
+
+    #[test]
+    fn parse_netstat_listen_owners_separates_ipv6_wildcard() {
+        let out = "  TCP    127.0.0.1:9222         0.0.0.0:0              LISTENING       1\n  TCP    [::]:9222              [::]:0                 LISTENING       2\n";
+        assert_eq!(
+            parse_netstat_listen_owners(out, 9222, 8),
+            Ok(NetstatListenOwners {
+                ipv4_reachable: vec![1],
+                ipv6_wildcard: vec![2],
+            })
+        );
+    }
+
+    #[test]
+    fn netstat_resolve_prefers_ipv4_and_excludes_ipv6_only_foreign_listener() {
+        // 別プロセス(2)の IPv6 専用 [::] と本物の IPv4 リスナー(1)が共存しても所有者は 1 のみ。
+        let out = "  TCP    127.0.0.1:9222         0.0.0.0:0              LISTENING       1\n  TCP    [::]:9222              [::]:0                 LISTENING       2\n";
+        assert_eq!(parse_netstat_listen_pids(out, 9222, 8), Ok(vec![1]));
+    }
+
+    #[test]
+    fn netstat_merge_combines_protocols_then_resolves() {
+        let v4 = "  TCP    0.0.0.0:9222           0.0.0.0:0              LISTENING       5\n";
+        let v6 = "  TCP    [::]:9222              [::]:0                 LISTENING       6\n";
+        let mut owners = parse_netstat_listen_owners(v4, 9222, 8).unwrap();
+        owners
+            .merge(parse_netstat_listen_owners(v6, 9222, 8).unwrap(), 8)
+            .unwrap();
+        assert_eq!(owners.resolve(), vec![5]);
+        let mut only_v6 = NetstatListenOwners::default();
+        only_v6
+            .merge(parse_netstat_listen_owners(v6, 9222, 8).unwrap(), 8)
+            .unwrap();
+        assert_eq!(only_v6.resolve(), vec![6]);
+    }
 
     #[test]
     fn parse_netstat_listen_pids_ipv4_listener() {
@@ -3990,7 +4083,7 @@ mod tests {
 
     #[test]
     fn parse_netstat_listen_pids_dedups_pids() {
-        let out = "  TCP    0.0.0.0:9222           0.0.0.0:0              LISTENING       9\n  TCP    [::]:9222              [::]:0                 LISTENING       9\n";
+        let out = "  TCP    0.0.0.0:9222           0.0.0.0:0              LISTENING       9\n  TCP    127.0.0.1:9222         0.0.0.0:0              LISTENING       9\n";
         assert_eq!(parse_netstat_listen_pids(out, 9222, 8), Ok(vec![9]));
     }
 
@@ -4017,7 +4110,7 @@ mod tests {
 
     #[test]
     fn parse_netstat_listen_pids_rejects_more_than_max_pids() {
-        let out = "  TCP    0.0.0.0:9222  0.0.0.0:0  LISTENING  1\n  TCP    [::]:9222  [::]:0  LISTENING  2\n";
+        let out = "  TCP    0.0.0.0:9222  0.0.0.0:0  LISTENING  1\n  TCP    127.0.0.1:9222  0.0.0.0:0  LISTENING  2\n";
         assert!(parse_netstat_listen_pids(out, 9222, 1).is_err());
     }
 

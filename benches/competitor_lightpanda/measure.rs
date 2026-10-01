@@ -72,7 +72,8 @@ use crate::support::parse_tasklist_mem_kb;
 // 出力解析部（TASK-84.6.4・#562）。
 #[cfg(windows)]
 use crate::support::{
-    parse_netstat_listen_pids, parse_windows_process_table, windows_descendant_pids,
+    NetstatListenOwners, parse_netstat_listen_owners, parse_windows_process_table,
+    windows_descendant_pids,
 };
 // Linux 版 `lookup_port_owner_pids` の `/proc` 解析部（TASK-84.6.2・#560）。
 #[cfg(target_os = "linux")]
@@ -800,7 +801,9 @@ const MAX_WINDOWS_TREE_PIDS: usize = 256;
 /// Windows 版（TASK-84.6.4・#562。`PERF-3`/`PERF-6`）: `netstat -a -n -o -p TCP`
 /// と `-p TCPv6`（`[::]` のデュアルスタック LISTEN は後者にしか出ない）で
 /// LISTEN 所有 PID を照会する。[`check_port_owner`] から readiness 成功時に
-/// 呼ばれ、出力は support の [`parse_netstat_listen_pids`] が解析する。
+/// 呼ばれ、出力は support の [`parse_netstat_listen_owners`] が解析する。
+/// IPv6 専用リスナーを IPv4 の所有者に混ぜないよう、`[::]` の PID は IPv4 で
+/// 到達できる LISTEN が無いときだけ採用する（`NetstatListenOwners::resolve`）。
 ///
 /// `unsafe`（`GetExtendedTcpTable` FFI）・新規依存を避けるため外部コマンド
 /// 方式とし、`Command::new` と固定引数（ポートも埋め込まない）でシェルを通さず、
@@ -813,7 +816,7 @@ pub(crate) fn lookup_port_owner_pids(
     port: u16,
 ) -> Result<Option<Vec<u32>>, PortOwnerError> {
     let lookup_failed = |reason: String| PortOwnerError::LookupFailed { port, reason };
-    let mut pids: Vec<u32> = Vec::new();
+    let mut owners = NetstatListenOwners::default();
     for proto in ["TCP", "TCPv6"] {
         let mut command = Command::new("netstat");
         command.args(["-a", "-n", "-o", "-p", proto]);
@@ -834,24 +837,17 @@ pub(crate) fn lookup_port_owner_pids(
             )));
         }
         // OEM コードページだが、使うのは ASCII トークンだけなので lossy で足りる。
-        let listed = parse_netstat_listen_pids(
+        let listed = parse_netstat_listen_owners(
             &String::from_utf8_lossy(&stdout),
             port,
             MAX_WINDOWS_OWNER_PIDS,
         )
         .map_err(|e| lookup_failed(format!("failed to parse netstat output: {e}")))?;
-        for pid in listed {
-            if !pids.contains(&pid) {
-                if pids.len() >= MAX_WINDOWS_OWNER_PIDS {
-                    return Err(lookup_failed(format!(
-                        "more than {MAX_WINDOWS_OWNER_PIDS} processes own the port"
-                    )));
-                }
-                pids.push(pid);
-            }
-        }
+        owners
+            .merge(listed, MAX_WINDOWS_OWNER_PIDS)
+            .map_err(lookup_failed)?;
     }
-    Ok(Some(pids))
+    Ok(Some(owners.resolve()))
 }
 
 /// Linux 版が集める LISTEN inode 数の上限（coding-rust.md「件数を上限検証」）。
