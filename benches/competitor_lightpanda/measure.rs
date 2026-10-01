@@ -802,8 +802,9 @@ const MAX_WINDOWS_TREE_PIDS: usize = 256;
 /// と `-p TCPv6`（`[::]` のデュアルスタック LISTEN は後者にしか出ない）で
 /// LISTEN 所有 PID を照会する。[`check_port_owner`] から readiness 成功時に
 /// 呼ばれ、出力は support の [`parse_netstat_listen_owners`] が解析する。
-/// IPv6 専用リスナーを IPv4 の所有者に混ぜないよう、`[::]` の PID は IPv4 で
-/// 到達できる LISTEN が無いときだけ採用する（`NetstatListenOwners::resolve`）。
+/// `[::]` の PID はデュアルスタックか判別できないため、IPv4 の所有者に加えた
+/// 和集合で返し、無関係な PID は所有者検証の `Mismatch` で弾く
+/// （`NetstatListenOwners::resolve`）。
 ///
 /// `unsafe`（`GetExtendedTcpTable` FFI）・新規依存を避けるため外部コマンド
 /// 方式とし、`Command::new` と固定引数（ポートも埋め込まない）でシェルを通さず、

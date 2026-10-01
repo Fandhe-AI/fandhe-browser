@@ -1550,18 +1550,21 @@ impl NetstatListenOwners {
         Ok(())
     }
 
-    /// readiness probe（127.0.0.1）に応答し得る所有 PID を決める。IPv4 で到達
-    /// できると確定する LISTEN があればそれだけを返し、`[::]` の PID は含めない
-    /// （別プロセスの IPv6 専用リスナーが同ポートにいても IPv4 側の所有者判定を
-    /// 汚さない）。IPv4 の LISTEN が無いときだけ、デュアルスタックの `[::]` を
-    /// 候補として返す（IPv6 専用だった場合は probe 自体が失敗するため安全側）。
+    /// readiness probe（127.0.0.1）に応答し得る所有 PID を決める。netstat からは
+    /// `[::]` が IPv6 専用かデュアルスタックか判別できず、別プロセスのデュアル
+    /// スタックリスナーが IPv4 の probe に応答し得るため、IPv4 で到達できる PID に
+    /// `[::]` の PID を加えた和集合（IPv4 の出現順・重複なし）を返す。無関係な
+    /// IPv6 専用リスナーが混ざる場合は後段の所有者検証が `Mismatch`（fail-closed）に
+    /// するだけで、誤って `Verified` にはならない。
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn resolve(self) -> Vec<u32> {
-        if self.ipv4_reachable.is_empty() {
-            self.ipv6_wildcard
-        } else {
-            self.ipv4_reachable
+        let mut pids = self.ipv4_reachable;
+        for pid in self.ipv6_wildcard {
+            if !pids.contains(&pid) {
+                pids.push(pid);
+            }
         }
+        pids
     }
 }
 
@@ -4017,10 +4020,11 @@ mod tests {
     }
 
     #[test]
-    fn netstat_resolve_prefers_ipv4_and_excludes_ipv6_only_foreign_listener() {
-        // 別プロセス(2)の IPv6 専用 [::] と本物の IPv4 リスナー(1)が共存しても所有者は 1 のみ。
+    fn netstat_resolve_keeps_ipv6_wildcard_owner_alongside_ipv4() {
+        // [::] がデュアルスタックか判別できないため、別プロセス(2)も候補に残す
+        // （後段の所有者検証が Mismatch にする）。
         let out = "  TCP    127.0.0.1:9222         0.0.0.0:0              LISTENING       1\n  TCP    [::]:9222              [::]:0                 LISTENING       2\n";
-        assert_eq!(parse_netstat_listen_pids(out, 9222, 8), Ok(vec![1]));
+        assert_eq!(parse_netstat_listen_pids(out, 9222, 8), Ok(vec![1, 2]));
     }
 
     #[test]
@@ -4031,7 +4035,7 @@ mod tests {
         owners
             .merge(parse_netstat_listen_owners(v6, 9222, 8).unwrap(), 8)
             .unwrap();
-        assert_eq!(owners.resolve(), vec![5]);
+        assert_eq!(owners.resolve(), vec![5, 6]);
         let mut only_v6 = NetstatListenOwners::default();
         only_v6
             .merge(parse_netstat_listen_owners(v6, 9222, 8).unwrap(), 8)
