@@ -67,6 +67,10 @@ impl CdpError {
     pub const SERVER_ERROR: Self = Self::new(-32000, "server error");
     /// 直近の navigate 結果が無い（未 navigate・取得中・取得失敗を区別しない。`DOM.getDocument`）。
     pub const NO_DOCUMENT: Self = Self::new(-32000, "no document loaded");
+    /// 未実装のオプション（`DOM.getDocument` の `pierce: true` 等）。成功を装わず明示的に拒否する（`REPAIR-3`）。
+    pub const UNSUPPORTED_PARAMS: Self = Self::new(-32602, "unsupported params");
+    /// 文書のノード数が採番の処理量上限を超えた（`DOM.getDocument`。`SEC-2`）。
+    pub const DOCUMENT_TOO_LARGE: Self = Self::new(-32000, "document too large");
 
     const fn new(code: i64, message: &'static str) -> Self {
         Self { code, message }
