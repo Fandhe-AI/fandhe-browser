@@ -13,7 +13,8 @@
 //!   `fandhe_browser_js::create_engine` へ渡して得た `Box<dyn JsEngine>` を保持する。
 //!   評価のたびに生成し直さない（子プロセス版 V8 は評価ごとに起動すると
 //!   コンテキストも失うため）。エンジンなしビルド（`JsConfig::engine() == None`）
-//!   では JS 無効として構築され、評価は必ずエラーになる。
+//!   では JS 無効として構築され、評価は必ずエラーになる（TASK-30（30.4）・
+//!   Issue #162。`tests/js_stub_no_engine.rs` が crate 外から検証する）。
 //! - [`execute_js_stub`]: [`JsRuntime`] へスクリプト評価を委譲する薄い境界。
 //!
 //! # 契約・注意
