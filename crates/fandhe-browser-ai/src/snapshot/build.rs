@@ -26,7 +26,8 @@
 //!   ただし `tfoot` 行がある構造、または操作要素（リンク・ボタン・入力欄・`role`/
 //!   `tabindex` 付き等）を含む構造は圧縮せず通常どおり展開する（ref・state・フッター
 //!   の可視情報を失わないため）。`img` の `alt`・`aria-label` 等テキスト以外に由来する
-//!   accessible name を持つ子孫、または `caption` を含む構造も同様に展開する。
+//!   accessible name を持つ子孫、または `caption` を含む構造も同様に展開する。`title` は
+//!   展開時に name の出所になる要素（`generic`・`listitem` 等）の場合だけ展開を維持する。
 //!   圧縮できない規則的構造で表示対象行が `MAX_TABLE_ROWS` 超のときは、優先保持
 //!   （`AISNAP-12`・TASK-16.4。ページネーション・送信ボタン）で選ばれた行と ref・state 等を
 //!   持つ行を展開のまま残し、それ以外の通常行は `Node::folded_rows` へ文字列で畳む（内容は省略しない）。
@@ -53,7 +54,7 @@ use crate::data_leaf::{DataLeafKind, classify_data_leaf};
 
 use super::element_ref::{ElementRef, ElementSignature, RefAllocator, RefError};
 use super::name::{
-    MAX_TOTAL_CONTENT_STEPS, NameIndex, SKIPPED_SUBTREES, compute_name_with_index,
+    MAX_TOTAL_CONTENT_STEPS, NameIndex, NameSource, SKIPPED_SUBTREES, compute_name_with_index,
     is_hidden_element, normalized_input_type,
 };
 use super::role::compute_role;
@@ -163,21 +164,27 @@ fn subtree_fits_depth(doc: &Document, container: NodeId, max_rel: usize) -> bool
 /// - 表に `caption` がある（圧縮表現は caption を保持せず、表題が Snapshot から消える）。
 /// - 見出し・入れ子の表 / 一覧・ランドマーク等の意味的な子孫がある（heading 等のノードと ref が消える）。
 /// - 圧縮行はテキストノードのみを取り込むため、テキスト以外に由来する accessible name
-///   （`img` の `alt`・`aria-label` 等）を持つ子孫がある。
+///   （`img` の `alt`・`aria-label` 等）を持つ子孫がある。`title` は、展開時にその要素の
+///   name の出所になる場合（`generic`・`listitem` 等、または子孫テキストが空の `td` 等）だけが
+///   対象で、子孫テキストが name になる要素の `title` は拒否の理由にしない
+///   （[`title_becomes_name`]。`AISNAP-2`・TASK-12・Issue #631）。
+///   既知の制約: `span[title]` のような `generic` の `title` は展開で name に現れるため
+///   展開を維持する。圧縮行へ `title` を表現する対応は後続候補（未実装）。
 /// - 表セル以外のデータ葉（価格クラス要素等。`AISNAP-3`）の子孫がある（分類が消える）。
 fn can_compress(
     doc: &Document,
     container: NodeId,
     structure: &crate::compress_table::RegularStructure,
+    index: &NameIndex<'_>,
 ) -> bool {
-    structure.footer_rows.is_empty() && !has_lossy_descendant(doc, container)
+    structure.footer_rows.is_empty() && !has_lossy_descendant(doc, index, container)
 }
 
 /// `container` の子孫（描画対象のみ）に、圧縮すると失われる要素があるかを反復走査で返す。
 ///
 /// 走査量は呼び出し前の [`bounded_descendant_count`] で有界化済みである。
-fn has_lossy_descendant(doc: &Document, container: NodeId) -> bool {
-    subtree_has_lossy(doc, container, false)
+fn has_lossy_descendant(doc: &Document, index: &NameIndex<'_>, container: NodeId) -> bool {
+    subtree_has_lossy(doc, index, container, false)
 }
 
 /// `root`（`include_root` なら自身を含む）配下に、1 行文字列へ畳むと失われる要素
@@ -185,7 +192,12 @@ fn has_lossy_descendant(doc: &Document, container: NodeId) -> bool {
 ///
 /// 畳む行の判定（`AISNAP-12`・TASK-16.4）と [`has_lossy_descendant`] で共有する。
 /// 走査量は呼び出し前の [`bounded_descendant_count`] で有界化済みの部分木に限る。
-fn subtree_has_lossy(doc: &Document, root: NodeId, include_root: bool) -> bool {
+fn subtree_has_lossy(
+    doc: &Document,
+    index: &NameIndex<'_>,
+    root: NodeId,
+    include_root: bool,
+) -> bool {
     let mut stack: Vec<NodeId> = if include_root {
         vec![root]
     } else {
@@ -199,6 +211,7 @@ fn subtree_has_lossy(doc: &Document, root: NodeId, include_root: bool) -> bool {
             || is_interactive_element(doc, id)
             || is_semantic_structure_element(doc, id)
             || has_non_text_name_source(doc, id)
+            || title_becomes_name(doc, index, id)
             || has_non_cell_data_leaf(doc, id)
         {
             return true;
@@ -272,9 +285,37 @@ fn has_non_text_name_source(doc: &Document, id: NodeId) -> bool {
     {
         return true;
     }
-    ["aria-label", "aria-labelledby", "title"]
+    ["aria-label", "aria-labelledby"]
         .iter()
         .any(|a| doc.attribute(id, a).is_some_and(|v| !v.trim().is_empty()))
+}
+
+/// 空でない `title` が、展開時にこの要素の accessible name になる（圧縮すると消える）か。
+///
+/// `title` を持つ要素に限り [`compute_name_with_index`] で name の出所を確認する
+/// （`AISNAP-2`・`AISNAP-1`・TASK-12・Issue #631）。出所が `title` なら true。
+/// 子孫テキストの超過（`truncated`）では `title` へフォールバックしない（name from content が
+/// 打ち切られた場合は空の名前＋`truncated` で、`title` は name に現れない）ため、`truncated` は
+/// 判定に使わず `source` だけで判断する（content 由来の `truncated` を title 由来と誤認しない）。
+/// 判定は name 算出用の共有予算とは別枠の予算で行い（[`NameIndex::with_isolated_content_budget`]）、
+/// 判定対象外の要素の name・`truncated` を変えない。対象は `title` 付き要素に限り有界。
+/// 判定予算が枯渇して出所を確定できない場合は保守的に true（展開を維持）を返す。
+/// 畳む行の判定（`AISNAP-12`）と [`can_compress`] の双方から呼ばれる。
+fn title_becomes_name(doc: &Document, index: &NameIndex<'_>, id: NodeId) -> bool {
+    if !doc
+        .attribute(id, "title")
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        return false;
+    }
+    // 判定は別枠の予算で行い、name 算出用の共有予算を消費しない。
+    let name = index.with_isolated_content_budget(|| compute_name_with_index(doc, index, id));
+    if name.source == NameSource::Title {
+        return true;
+    }
+    // 判定予算の枯渇で名前の出所を確定できない場合は保守的に「title が name になる」
+    // 扱いとし、展開を維持する（圧縮で accessible name を失わない）。
+    name.source == NameSource::None && name.truncated && index.isolated_budget_exhausted()
 }
 
 /// 操作可能（フォーカス・クリック・入力の対象になり得る）要素か。
@@ -436,11 +477,13 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
         // 失われる内容のない通常行は件数を省略せず 1 行文字列へ畳む（`Node::folded_rows`）。
         // 行の選択はページネーション・送信ボタンの検出（`priority_candidates`）を含む。
         let (compressible, expanded_structure) = match regular {
-            Some(s) if can_compress(doc, child, &s) => (Some(s), None),
+            Some(s) if can_compress(doc, child, &s, &index) => (Some(s), None),
             other => (None, other),
         };
         if let Some(structure) = expanded_structure {
-            let fold_rows = rows_to_fold(doc, &structure, |row| subtree_has_lossy(doc, row, true));
+            let fold_rows = rows_to_fold(doc, &structure, |row| {
+                subtree_has_lossy(doc, &index, row, true)
+            });
             let ids: Vec<NodeId> = fold_rows.iter().map(|&(_, id)| id).collect();
             node.folded_rows = compress_row_list(doc, structure.kind, &ids)
                 .into_iter()
@@ -861,6 +904,105 @@ mod tests {
         }
     }
 
+    /// AISNAP-2（Issue #631）: 子孫テキストが name になる td/tr の title は展開でも name に
+    /// 出ないため、title だけを理由に圧縮を拒否しない。
+    #[test]
+    fn aisnap_2_table_with_titled_cell_text_is_compressed() {
+        let s = snap(
+            "<body><table><tr><th>A</th></tr><tr title=\"r\"><td title=\"tip\">80</td></tr></table></body>",
+        );
+        assert!(has_table_summary(&s));
+        let table = all_nodes(&s.tree)
+            .into_iter()
+            .find_map(|n| n.table.as_ref())
+            .expect("圧縮される");
+        let text = format!("{table:?}");
+        assert!(text.contains("80"));
+        assert!(!text.contains("tip"));
+    }
+
+    /// AISNAP-2（Issue #631）: 子孫テキストが name 文字数上限を超える title 付き td でも、
+    /// name は content 由来（title は name に出ない）なので圧縮を拒否しない。
+    #[test]
+    fn aisnap_2_titled_cell_with_overlong_text_is_still_compressed() {
+        let long = "x".repeat(400);
+        let html = format!(
+            "<body><table><tr><th>A</th></tr><tr><td title=\"tip\">{long}</td></tr></table></body>"
+        );
+        let s = snap(&html);
+        assert!(has_table_summary(&s));
+    }
+
+    /// AISNAP-2（Issue #631）: 判定予算が枯渇して name の出所を確定できない場合は
+    /// 保守的に「title が name になる」扱い（展開維持）にし、名前を失わない。
+    #[test]
+    fn aisnap_2_exhausted_judge_budget_keeps_expansion() {
+        use super::title_becomes_name;
+        use crate::snapshot::name::NameIndex;
+
+        let html = r#"<table><tr><td id="c" title="tip">x</td></tr></table>"#;
+        let parsed =
+            parse_document(html, &ParseOptions::default()).expect("テスト入力は必ず成功する");
+        let doc = parsed.document;
+        let id = fandhe_browser_core::query::query_selector_str(&doc, doc.root(), "td#c")
+            .expect("セレクタは解釈できる")
+            .expect("対象要素が見つかる");
+        // 予算が十分なら name は子孫テキスト由来で title は出ない（false）。
+        let ample = NameIndex::build(&doc).with_content_budget(1024);
+        assert!(!title_becomes_name(&doc, &ample, id));
+        // 予算 0 では出所を確定できないため保守的に true。
+        let zero = NameIndex::build(&doc).with_content_budget(0);
+        assert!(title_becomes_name(&doc, &zero, id));
+    }
+
+    /// AISNAP-2（Issue #631）: generic（span）の title は展開で name になるため展開を維持する。
+    #[test]
+    fn aisnap_2_titled_generic_span_keeps_expansion() {
+        let s = snap(
+            "<body><table><tr><th>A</th></tr><tr><td><span title=\"2026-09-30T12:00\">2 hours ago</span></td></tr></table></body>",
+        );
+        assert!(!has_table_summary(&s));
+        assert!(
+            all_nodes(&s.tree)
+                .iter()
+                .any(|n| n.role == "generic" && n.name == "2026-09-30T12:00")
+        );
+    }
+
+    /// AISNAP-2（Issue #631）: listitem の title は name になるため展開を維持する。
+    #[test]
+    fn aisnap_2_titled_list_item_keeps_expansion() {
+        let s = snap("<body><ul><li title=\"x\">text</li><li>beta</li></ul></body>");
+        assert!(!has_table_summary(&s));
+        assert!(
+            all_nodes(&s.tree)
+                .iter()
+                .any(|n| n.role == "listitem" && n.name == "x")
+        );
+    }
+
+    /// AISNAP-2（Issue #631）: 子孫テキストのない td の title は name になるため展開を維持する。
+    #[test]
+    fn aisnap_2_titled_empty_cell_keeps_expansion() {
+        let s =
+            snap("<body><table><tr><th>A</th></tr><tr><td title=\"tip\"></td></tr></table></body>");
+        assert!(!has_table_summary(&s));
+        assert!(
+            all_nodes(&s.tree)
+                .iter()
+                .any(|n| n.role == "cell" && n.name == "tip")
+        );
+    }
+
+    /// AISNAP-2: aria-labelledby を持つ子孫を含む表は圧縮せず展開する。
+    #[test]
+    fn aisnap_2_table_with_aria_labelledby_is_expanded() {
+        let s = snap(
+            "<body><span id=\"l\">Total</span><table><tr><th>A</th></tr><tr><td><span aria-labelledby=\"l\">5</span></td></tr></table></body>",
+        );
+        assert!(!has_table_summary(&s));
+    }
+
     /// AISNAP-3: 表セル（TableCell）は圧縮の単位なので、従来どおり表は圧縮される。
     #[test]
     fn aisnap_3_plain_table_cells_still_compress() {
@@ -942,6 +1084,25 @@ mod tests {
         }
         html.push_str("</tbody></table>");
         html
+    }
+
+    /// AISNAP-12・Issue #631: title 付き td の行は畳まれ、title が name になる span の行は
+    /// 展開のまま残る。
+    #[test]
+    fn aisnap_12_titled_cell_row_is_folded_but_titled_span_row_is_kept() {
+        let s = snap(&table_with_rows(
+            40,
+            &[
+                (30, "<a href=\"/next\">Next</a>"),
+                (35, "<span title=\"KEEPTITLE\">kept</span>"),
+                (36, "plain"),
+            ],
+        ));
+        let nodes = all_nodes(&s.tree);
+        assert!(nodes.iter().any(|n| n.name == "KEEPTITLE"));
+        let table = nodes.iter().find(|n| n.role == "table").expect("table");
+        assert!(!table.folded_rows.iter().any(|r| r.index == 35));
+        assert!(table.folded_rows.iter().any(|r| r.index == 36));
     }
 
     /// AISNAP-12・TASK-16.4: 操作要素を含み全体を圧縮できない表でも、キャップ外の

@@ -361,6 +361,19 @@ fn aisnap_2_large_table_reports_truncated_rows() {
     assert!(first_table(&s).children.is_empty());
 }
 
+/// `AISNAP-2`（Issue #631）: title 付きセルだけを理由に表の圧縮は拒否されない。
+#[test]
+fn aisnap_2_titled_cells_table_is_compressed() {
+    let html = page(
+        "<table><tr><th>名前</th><th>値</th></tr>\
+         <tr><td title=\"tip\">A</td><td title=\"t2\">80</td></tr></table>",
+    );
+    let s = snap(&html);
+    let t = summary(&s);
+    assert_eq!(t.header.len(), 2);
+    assert_eq!(t.rows.first(), Some(&TableRow::new("A | 80", false)));
+}
+
 /// `AISNAP-2`（TASK-12.5・Issue #83）: hidden / aria-hidden の表は Node にならない。
 #[test]
 fn aisnap_2_hidden_tables_are_excluded() {
