@@ -1,12 +1,13 @@
 # 対応 CPU アーキテクチャと rusty_v8 prebuilt 公開ターゲット
 
-対応 `TASK-57`（57.1）/ `MS-3` / ビヘイビア `XOS-5`（[spec-reference](../../.claude/rules/spec-reference.md)）。
+対応 `TASK-57`（57.1・57.2）/ `MS-3` / ビヘイビア `XOS-5`（[spec-reference](../../.claude/rules/spec-reference.md)）。
 
 ## 目的
 
 `XOS-5` の前提である「`rusty_v8`（crates.io の `v8` crate）の prebuilt 静的ライブラリがどのターゲットで公開されているか」を整理し、
 x86_64 優先方針と本リポジトリが採用する `v8` crate バージョンの関係を明確にする。
 本ドキュメントは GitHub Releases の公開アセットを机上で確認したもので、各ターゲットでの実機ビルド・実行の実測ではない（実測は `TASK-58` 等）。
+prebuilt がないターゲットの代替手段と musl の注意点（`TASK-57.2`）も末尾に記す。
 
 ## prebuilt 公開ターゲット一覧
 
@@ -76,4 +77,47 @@ musl ターゲットと aarch64 Linux は CI の matrix に含まれていない
 
 ## prebuilt が公開されていないターゲットの扱い
 
-`TASK-57.2`（#472）で記載する。
+`XOS-5`（`TASK-57.2` / `MS-3`）。該当するのは、上記の公開ターゲット一覧に載っていないターゲット（`XOS-5` の 8 ターゲット以外。例: 32bit や BSD 系）と、採用版より古い `v8`（150.2.0 未満）で musl をビルドする場合である。
+これらでは `v8` の `build.rs` が対応するアーカイブを取得できず、ビルドは失敗する想定である（取得の仕組みは前節の「取得の仕組み」を参照。失敗の細部は実測していない）。
+代替手段は次の 2 つで、いずれも本リポジトリの CI では検証していない。
+
+### 代替手段 1: ソースビルド（`V8_FROM_SOURCE`）
+
+- 環境変数 `V8_FROM_SOURCE` を設定すると、`v8` の `build.rs` が V8 をソースからビルドする
+- コストと前提（`rusty_v8` README「Build V8 from Source」。`container-cloud.md` の判断理由で要約済み）
+  - ビルドに約 30 分かかる
+  - Python 3・`curl`・libclang 21.1+ が必要
+  - `gn`・`ninja`・`clang` は見つからなければ自動でダウンロードされる
+- musl で使う場合は `RUSTY_V8_MUSL_SYSROOT` で sysroot を指定できる（`container-cloud.md` の代替案 C を参照）
+- 本リポジトリの位置づけ: `XOS-5` の 8 ターゲットでは使わない（`container-cloud.md` の決定 3）。未検証である
+- `RUSTY_V8_MIRROR` / `RUSTY_V8_ARCHIVE` で、自前で用意したアーカイブの取得元に差し替えることもできる。取得元は信頼できるものに限り、バージョンを固定する（チェックサム検証の有無は確認していない）
+
+### 代替手段 2: 軽量ビルド（V8 を同梱しない）
+
+- `boa` のみを同梱し、V8 の prebuilt をダウンロードしない構成である（`js-engine.md`「JS エンジンの切替方式」のビルド構成表。`JS-1` 系）
+- `boa_engine` は純 Rust（`XOS-3`）なので、Rust のターゲットさえあればビルドできる見込みである（実機では確認していない）
+- spec 上のビルドコマンドは `cargo build --release -p fandhe-browser-cli --no-default-features --features js-boa`、概算サイズは約 10.05MB（机上の概算）
+- **現状、軽量ビルドはまだ利用できない**（`REPAIR-3`: 実装済みを装わない）
+  - `fandhe-browser-js` の `js-boa` はプレースホルダで、`boa_engine` は未導入（`TASK-32`・#144 / #165 / #166）
+  - `fandhe-browser-cli` には JS エンジン feature の転送と既定がない（`TASK-30.2`・#160）
+  - 上記コマンドは spec の提案に基づく将来の構成である
+- V8 の代替ターゲット対応ではなく、JS 実行エンジンが `boa` に変わる配布物である。互換性・性能の差が生じうる
+
+### 選び方の目安
+
+| 状況 | 推奨 |
+| ---- | ---- |
+| `XOS-5` の 8 ターゲット（採用版 `=152.2.0`） | prebuilt（既定） |
+| prebuilt がなく V8 が必要（互換性重視） | `V8_FROM_SOURCE`（ビルド時間・ツールチェーンのコストを受け入れる。未検証） |
+| prebuilt がなく、ビルドを軽く保ちたい・V8 が不要 | 軽量ビルド（`TASK-30`・`TASK-32` の完了後に利用可能） |
+
+## musl 向け prebuilt の注意点
+
+`XOS-5`・`container-cloud.md` の決定 4。
+
+- musl 向け prebuilt を使うには `v8` 150.2.0 以上が必要（前掲の一覧を参照）
+- `rusty_v8` 上流の CI は musl 向け prebuilt をテストしていない。glibc ランナー上で musl ターゲットをクロスビルドするだけで（iOS ターゲットと同じ build-only）、nextest・clippy は musl で実行されない。debug 用の musl アーカイブもない
+  - 出典: `rusty_v8` の [ci.yml（コミット 9395618）](https://github.com/denoland/rusty_v8/blob/9395618fb3af7a697c2e9d447b24cd204d050691/.github/workflows/ci.yml)。確認は spec（`container-cloud.md`）の 2026-09-24 時点の記録による
+- Deno 本体も Linux 向けは `*-unknown-linux-gnu` だけを配布している（musl 上での V8 の動作実績が gnu より少ないことの傍証。出典は spec を参照）
+- 本リポジトリでの扱い: 既定コンテナ（musl・`scratch`）の採用は、`TASK-66` の `scratch` 内 JS スモークテストの成功を条件とする（fail-closed。`CTR-2`）。失敗した場合は代替案 A（glibc＋`distroless/cc`）への切替をオーナーが判断する
+- 本リポジトリの CI（3 OS matrix）にも musl は含まれていない（前節を参照）。追加は本ドキュメントの範囲外（`TASK-58` 等）
