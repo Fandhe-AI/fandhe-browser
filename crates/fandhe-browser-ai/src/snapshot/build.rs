@@ -17,7 +17,7 @@
 //!   ネストを一致させるため）: `head`・`script`・`style`・`noscript`・`template`・
 //!   `hidden` 属性または `aria-hidden="true"` の要素・`input[type=hidden]`。
 //! - データ葉（表セル・価格クラス要素。`AISNAP-3`・TASK-13.3・Issue #88）は
-//!   `Node::data_leaf` へ印を付けるだけで、role・ref・剪定・打ち切りには使わない。
+//!   `Node::data_leaf`（圧縮表では `HeaderCell::data_leaf`）へ印を付けるだけで、role・ref・剪定・打ち切りには使わない。
 //! - 規則的な `table`・`ul`・`ol`（[`crate::compress_table::detect_regular_structure`]
 //!   が `Regular`。`AISNAP-2`・TASK-12.5・Issue #83）は子孫を展開せず、ヘッダ
 //!   （個別 ref）・圧縮行・超過行数を持つ 1 ノード（[`Node::table`]）へ置き換える。
@@ -411,7 +411,14 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
             node.table = Some(TableSummary::new(
                 headers
                     .into_iter()
-                    .map(|h| HeaderCell::new(h.role, h.name, h.elem_ref.to_ref_string()))
+                    .map(|h| {
+                        // 展開時の Node と同じ規則で元セルを分類する（値の決め打ちはしない）。
+                        let cell = HeaderCell::new(h.role, h.name, h.elem_ref.to_ref_string());
+                        match classify_data_leaf(doc, h.cell) {
+                            Some(kind) => cell.with_data_leaf(kind),
+                            None => cell,
+                        }
+                    })
                     .collect(),
                 compressed
                     .rows
@@ -814,6 +821,37 @@ mod tests {
     fn aisnap_3_plain_table_cells_still_compress() {
         let s = snap("<body><table><tr><th>A</th></tr><tr><td>1</td></tr></table></body>");
         assert!(has_table_summary(&s));
+    }
+
+    /// AISNAP-2 / AISNAP-3（Issue #625）: 圧縮表のヘッダセルは `classify_data_leaf` 由来の
+    /// `TableCell` を持ち、展開した場合の columnheader `Node::data_leaf` と一致する。
+    #[test]
+    fn aisnap_2_compressed_header_cells_carry_table_cell_data_leaf() {
+        let cases = [
+            "<body><table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table></body>",
+            "<body><table><thead><tr><td>A</td><td>B</td></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table></body>",
+        ];
+        for html in cases {
+            let s = snap(html);
+            let table = all_nodes(&s.tree)
+                .into_iter()
+                .find_map(|n| n.table.as_ref())
+                .expect("圧縮される");
+            assert_eq!(table.header.len(), 2, "{html}");
+            for h in &table.header {
+                assert_eq!(h.data_leaf, Some(DataLeafKind::TableCell), "{html}");
+            }
+        }
+        // 同じ th を展開した場合（rowspan で不規則化）の分類と一致する。
+        let expanded = snap(
+            "<body><table><thead><tr><th>A</th></tr></thead><tbody><tr><td rowspan=\"2\">1</td></tr></tbody></table></body>",
+        );
+        assert!(!has_table_summary(&expanded));
+        let th = all_nodes(&expanded.tree)
+            .into_iter()
+            .find(|n| n.role == "columnheader")
+            .expect("columnheader がある");
+        assert_eq!(th.data_leaf, Some(DataLeafKind::TableCell));
     }
 
     /// AISNAP-2 / AISNAP-1: 子孫が `MAX_TREE_DEPTH` を超える一覧は圧縮せず展開し、

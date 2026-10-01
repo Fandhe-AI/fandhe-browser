@@ -133,6 +133,10 @@ pub struct Node {
 /// ヘッダ行のみ個別 ref を持つ（データ行は圧縮のため ref を持たない）。
 /// spec の想定 JSON ではヘッダを文字列配列で描くが、JSON への写像は
 /// TASK-19・`AISNAP-6` で扱う。
+///
+/// データ葉分類（`AISNAP-3`・TASK-13.3）も [`Node`] と同じく [`HeaderCell::data_leaf`]
+/// に型として保持する。圧縮の有無で同じ `th` の分類が変わらないことを型で保証する契約で、
+/// 利用側（テスト・後続の JSON 写像）が値を補完する必要はない（Issue #625）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HeaderCell {
@@ -142,16 +146,31 @@ pub struct HeaderCell {
     pub name: String,
     /// 再特定要求（形式は [`Node::r#ref`] と同じ）。
     pub r#ref: String,
+    /// データ葉と判定した根拠。`None` はデータ葉でない。
+    ///
+    /// `build_snapshot` が元セル（`td`/`th`）に対して
+    /// [`crate::data_leaf::classify_data_leaf`] で算出する。ヘッダセルは `td`/`th` に
+    /// 限られるため現状は常に `Some(DataLeafKind::TableCell)`。展開時の
+    /// [`Node::data_leaf`] と同一規則で、role・ref には影響しない（`AISNAP-10`）。
+    pub data_leaf: Option<DataLeafKind>,
 }
 
 impl HeaderCell {
-    /// role・name・ref を指定して作る。
+    /// role・name・ref を指定して作る。`data_leaf` は `None`（[`Self::with_data_leaf`] で設定）。
     pub fn new(role: impl Into<String>, name: impl Into<String>, r#ref: impl Into<String>) -> Self {
         Self {
             role: role.into(),
             name: name.into(),
             r#ref: r#ref.into(),
+            data_leaf: None,
         }
+    }
+
+    /// データ葉の判定根拠を設定する（[`Node::with_data_leaf`] と対）。
+    #[must_use]
+    pub fn with_data_leaf(mut self, kind: DataLeafKind) -> Self {
+        self.data_leaf = Some(kind);
+        self
     }
 }
 
@@ -323,6 +342,24 @@ mod tests {
         assert_eq!(node.state, State::default());
         assert_eq!(node.data_leaf, None);
         assert_eq!(node.table, None);
+    }
+
+    /// `AISNAP-3`（Issue #625）: `HeaderCell::new` は `data_leaf` を `None` にする。
+    #[test]
+    fn aisnap_3_header_cell_new_defaults_data_leaf_none() {
+        let h = HeaderCell::new("columnheader", "名前", "e1");
+        assert_eq!(h.data_leaf, None);
+    }
+
+    /// `AISNAP-3`（Issue #625）: `with_data_leaf` は `data_leaf` だけを設定する。
+    #[test]
+    fn aisnap_3_header_cell_with_data_leaf_sets_kind() {
+        let h =
+            HeaderCell::new("columnheader", "名前", "e1").with_data_leaf(DataLeafKind::TableCell);
+        assert_eq!(h.data_leaf, Some(DataLeafKind::TableCell));
+        assert_eq!(h.role, "columnheader");
+        assert_eq!(h.name, "名前");
+        assert_eq!(h.r#ref, "e1");
     }
 
     /// `AISNAP-2`（TASK-12.5・Issue #83）: `with_table` が `table` だけを設定すること。
