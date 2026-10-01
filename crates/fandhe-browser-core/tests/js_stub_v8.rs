@@ -2,8 +2,8 @@
 //! ビヘイビア `JS-2`・Issue #161）。
 //!
 //! V8 は子プロセス版のため、子として再実行されたときにワーカーとして振る舞う
-//! よう `main` の先頭で `run_js_worker_if_requested` を呼ぶ必要がある
-//! （`fandhe-browser-js` の `tests/conformance.rs` と同じ作法）。そのため
+//! よう `main` の先頭で core の再エクスポート `run_js_worker_if_requested`
+//! （#513）を呼ぶ必要がある（`fandhe-browser-js` の `tests/conformance.rs` と同じ作法）。そのため
 //! `harness = false`。`js-v8` 有効構成でのみビルドする（`Cargo.toml` 参照）。
 
 use fandhe_browser_core::js_stub::{JsRuntime, execute_js_stub};
@@ -12,7 +12,7 @@ use fandhe_browser_js::{EngineKind, JsEngineError, JsValue};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    if let Some(code) = fandhe_browser_js::run_js_worker_if_requested() {
+    if let Some(code) = fandhe_browser_core::run_js_worker_if_requested() {
         return code;
     }
 

@@ -146,9 +146,9 @@ pub use engine_trait::{
 /// 判定する（`JS-1`・`TASK-29`・Issue #503「JS プロセス分離」設計書
 /// §3.1・§7 W3）。
 ///
-/// 呼び出し元（将来）: `fandhe-browser-core` が `pub use` で再エクスポート
-/// し（`TASK-30`）、`fandhe-browser-cli` の `main` が tokio ランタイム・
-/// ロギング・設定読み込みより**前**に呼ぶ契約（`TASK-41`）。
+/// 呼び出し元: `fandhe-browser-core` が `pub use` で再エクスポート済み
+/// （`TASK-30`・#513）。`fandhe-browser-cli` の `main` が tokio ランタイム・
+/// ロギング・設定読み込みより**前**に呼ぶ契約（`TASK-41`・#514 で配線）。
 ///
 /// 環境変数 `worker_protocol::MARKER_ENV_VAR`
 /// （`FANDHE_BROWSER_JS_WORKER`）が設定されていなければ `None` を返し、
