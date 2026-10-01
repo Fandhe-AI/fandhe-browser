@@ -665,6 +665,19 @@ impl Fetcher {
         result
     }
 
+    /// `url` の形式・scheme・IP リテラル host を、ネットワークへ出ずに事前検査する。
+    ///
+    /// [`Fetcher::get`] が送信前に行う検査（解析・scheme・アドレス）と同一で、cdp の
+    /// `Page.navigate` が共有状態を変更する前に不正 URL を弾くために呼ぶ（`CDP-1`・`SEC-2`）。
+    /// DNS 解決後のアドレス検査はここでは行わない（取得時の resolver が担う）。
+    pub fn validate_url(&self, url: &str) -> Result<()> {
+        let parsed = Url::parse(url).map_err(|source| Error::InvalidInput {
+            message: format!("invalid URL: {source}"),
+        })?;
+        reject_disallowed_scheme(&parsed)?;
+        reject_disallowed_address(&parsed, self.options.allow_private_network_access)
+    }
+
     /// [`Fetcher::get`] の本体（計装の内側。SSRF 検査の順序・内容は不変）。
     async fn get_inner(&self, url: &str) -> Result<FetchResponse> {
         let parsed = Url::parse(url).map_err(|source| Error::InvalidInput {

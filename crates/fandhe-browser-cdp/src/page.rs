@@ -74,6 +74,16 @@ pub(crate) async fn navigate(
     nav: &NavigationState,
     url: &str,
 ) -> Result<NavigateOutcome, CdpError> {
+    // 共有状態を変更する前に URL の形式・scheme を検証する。不正 URL や `file:` で
+    // 保存済みの URL / HTML を失わせない（`about:blank` は下で個別に扱う）。
+    if url != "about:blank"
+        && let Err(e) = fetcher.validate_url(url)
+    {
+        return Ok(NavigateOutcome {
+            loader_id: format!("{:x}", nav.current_generation().get()),
+            error_text: Some(fetch_error_text(&e)),
+        });
+    }
     let generation = nav.begin_navigation().map_err(state_error)?;
     let mut outcome = NavigateOutcome {
         loader_id: format!("{:x}", generation.get()),
@@ -284,6 +294,26 @@ mod tests {
         assert!(nav.latest().is_none());
     }
 
+    #[tokio::test]
+    async fn cdp1_navigate_invalid_url_keeps_previous_result() {
+        let port = serve("200 OK", "keep");
+        let nav = NavigationState::new();
+        let f = allowed_fetcher();
+        let url = format!("http://127.0.0.1:{port}/");
+        navigate(&f, &nav, &url).await.unwrap();
+        let before = nav.current_generation().get();
+
+        let out = navigate(&f, &nav, "file:///etc/passwd").await.unwrap();
+        assert_eq!(out.error_text, Some("net::ERR_ACCESS_DENIED"));
+        let out = navigate(&f, &nav, "not a url").await.unwrap();
+        assert_eq!(out.error_text, Some("net::ERR_INVALID_URL"));
+
+        let latest = nav.latest().unwrap();
+        assert_eq!(latest.url(), url);
+        assert_eq!(latest.html(), "keep");
+        assert_eq!(nav.current_generation().get(), before);
+    }
+
     #[test]
     fn cdp1_fetch_error_text_is_fixed_table() {
         use std::time::Duration;
@@ -492,7 +522,7 @@ mod tests {
             assert_eq!(
                 f,
                 vec![json!({"id": 1, "result": {
-                    "frameId": "main", "loaderId": "1", "errorText": "net::ERR_ACCESS_DENIED"}})]
+                    "frameId": "main", "loaderId": "0", "errorText": "net::ERR_ACCESS_DENIED"}})]
             );
         }
     }
