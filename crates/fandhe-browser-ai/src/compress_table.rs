@@ -476,7 +476,7 @@ fn visible_body_rows(doc: &Document, structure: &RegularStructure) -> Vec<NodeId
 }
 
 /// 圧縮せず展開する表・一覧で、優先保持（`AISNAP-12`・TASK-16.4・Issue #107）の対象外となり
-/// 1 行文字列へ畳んでよい行を文書順で返す。
+/// 1 行文字列へ畳んでよい行を（表示対象データ行の中での index, 行）の組で文書順に返す。
 ///
 /// 呼び出し文脈: `build_snapshot` が、操作要素等を含むため `can_compress` で全体を圧縮
 /// できない規則的構造に対して呼ぶ。[`compress_rows`] と同じ予算モデル（先頭確保 →
@@ -488,7 +488,7 @@ pub fn rows_to_fold(
     doc: &Document,
     structure: &RegularStructure,
     must_keep: impl Fn(NodeId) -> bool,
-) -> Vec<NodeId> {
+) -> Vec<(usize, NodeId)> {
     let visible = visible_body_rows(doc, structure);
     if visible.len() <= MAX_TABLE_ROWS {
         return Vec::new();
@@ -501,7 +501,7 @@ pub fn rows_to_fold(
         .iter()
         .enumerate()
         .filter(|(i, row)| !kept.contains(i) && !must_keep(**row))
-        .map(|(_, row)| *row)
+        .map(|(i, row)| (i, *row))
         .collect()
 }
 

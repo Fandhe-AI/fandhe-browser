@@ -58,7 +58,7 @@ use super::name::{
 };
 use super::role::compute_role;
 use super::state::{compute_state, is_html_element_named};
-use super::{HeaderCell, Node, Snapshot, TableRow, TableSummary};
+use super::{FoldedRow, HeaderCell, Node, Snapshot, TableRow, TableSummary};
 
 /// 構築するツリーの最大深さ（ルートを 0 とする）。
 ///
@@ -441,11 +441,13 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
         };
         if let Some(structure) = expanded_structure {
             let fold_rows = rows_to_fold(doc, &structure, |row| subtree_has_lossy(doc, row, true));
-            node.folded_rows = compress_row_list(doc, structure.kind, &fold_rows)
+            let ids: Vec<NodeId> = fold_rows.iter().map(|&(_, id)| id).collect();
+            node.folded_rows = compress_row_list(doc, structure.kind, &ids)
                 .into_iter()
-                .map(|r| TableRow::new(r.text, r.truncated))
+                .zip(fold_rows.iter())
+                .map(|(r, &(index, _))| FoldedRow::new(index, r.text, r.truncated))
                 .collect();
-            folded.extend(fold_rows);
+            folded.extend(ids);
         }
         if let Some(structure) = compressible {
             let headers = assign_header_refs(doc, &index, &structure, elem_ref, &mut refs)?;
@@ -971,6 +973,52 @@ mod tests {
             assert!(in_folded || in_tree, "{text} must survive");
         }
         assert!(!s.truncated);
+    }
+
+    /// AISNAP-12・AISNAP-2: 途中の操作行だけを展開した 20 行超の表で、畳んだ行と展開行を
+    /// index で文書順に統合でき、畳んだ行は ref を持たず、操作行の ref は残る。
+    #[test]
+    fn aisnap_12_folded_rows_merge_in_document_order() {
+        let s = snap(&table_with_rows(40, &[(30, "<a href=\"/next\">Next</a>")]));
+        let nodes = all_nodes(&s.tree);
+        let table = nodes.iter().find(|n| n.role == "table").expect("table");
+        // 展開された本文行（ヘッダ行を除く）は畳まれていない index を昇順で占める。
+        let expanded_body: Vec<&Node> = nodes
+            .iter()
+            .copied()
+            .filter(|n| n.role == "row" && n.name != "n")
+            .collect();
+        let folded_idx: Vec<usize> = table.folded_rows.iter().map(|r| r.index).collect();
+        let free: Vec<usize> = (0..40).filter(|i| !folded_idx.contains(i)).collect();
+        assert_eq!(free.len(), expanded_body.len());
+        assert!(free.contains(&30));
+        let mut merged: Vec<(usize, String)> = table
+            .folded_rows
+            .iter()
+            .map(|r| (r.index, r.text.clone()))
+            .collect();
+        for (i, row) in free.iter().zip(&expanded_body) {
+            let text = all_nodes(row)
+                .iter()
+                .map(|n| n.name.as_str())
+                .find(|n| !n.is_empty())
+                .unwrap_or("")
+                .to_string();
+            merged.push((*i, text));
+        }
+        merged.sort_by_key(|(i, _)| *i);
+        // 文書順に統合すると行 0..40 が欠けずに並ぶ（操作行は index 30）。
+        for (i, text) in &merged {
+            if *i == 30 {
+                assert_eq!(text, "Next");
+            } else {
+                assert_eq!(text, &format!("row{i}"));
+            }
+        }
+        assert_eq!(merged.len(), 40);
+        // 畳んだ行は ref を持たない（型に ref が無い）。操作行の ref は残る。
+        let link = nodes.iter().find(|n| n.role == "link").expect("link");
+        assert!(link.r#ref.is_some());
     }
 
     /// AISNAP-12: 見出し等の意味的な子孫を持つ行は件数上限を超えても畳まず展開する。
