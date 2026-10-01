@@ -262,10 +262,9 @@ jobs:
   # 3 OS matrix（.claude/rules/ci.md・XOS-1）で実行し、shell: bash を明示する
   # （Windows 既定の pwsh ではなく git-bash で確実に動かすため）。
   #
-  # fandhe-browser-cli crate は本 PR 時点で未追加（TASK-41.5・#174 が OPEN）の
-  # ため、スクリプト側が ::notice:: を出して cli 既定 feature 検査を自動 skip
-  # する。#174 で crate が追加されれば、本ジョブ・Makefile を変更しなくても
-  # cli 検査が自動的に有効になる。
+  # fandhe-browser-cli crate は追加済み（TASK-41.5・#174）のため、cli 既定
+  # feature 検査も実行される。cli の manifest が無い場合はスクリプトが NG にする
+  # （fail-closed。REPAIR-5・#633）。
   #
   # self-test（合成データに対して NG を検出できることの証跡。compat-regression
   # ジョブの self-test と同じ趣旨。REPAIR-5・REPAIR-8）を本検査の前に実行し、
@@ -601,18 +600,15 @@ jobs:
   # 毎回ジョブログへ残すため（compat-regression・deny-license-reject と同じ
   # fail-closed 性の考え方。REPAIR-5・REPAIR-8）。
   #
-  # 現時点で workspace に fandhe-browser-cli crate が無い（TASK-41.5・#174 が
-  # 追加予定）ため、実判定ステップは `skip:` を出して exit 0 になる（休眠
-  # 状態。harness/binary-size/README.md「計測対象はまだ存在しない」参照）。
-  # #174 がこの crate を追加すると、本ファイルを変更しなくても自動的に実
-  # ビルド・判定の経路（fail-closed）へ入る。
+  # 対象 package（fandhe-browser-cli。TASK-41.5・#174 で追加済み）が workspace
+  # に無い場合は exit 2 で fail-closed になる（harness/binary-size/README.md
+  # 「計測対象と fail-closed 契約」参照。REPAIR-5・#633）。
   #
   # make を使わない理由: windows-latest に make がある保証がなく、既存の
   # 3 OS ジョブ（compat-regression・bench-record-selftest）はどれもスクリプト
   # を直接呼んでいる（make を使う deny-license-reject は ubuntu 単独ジョブ）。
-  # cache を使わない理由: 現状はビルド自体が起きず（上記 skip）、
-  # windows-latest には cache prune の既知問題がある（rust-ci ジョブの
-  # コメント参照）。#174 後のビルド時間増加への cache 導入は別途検討する。
+  # cache を使わない理由: windows-latest には cache prune の既知問題がある
+  # （rust-ci ジョブのコメント参照）。ビルド時間増加への cache 導入は別途検討する。
   #
   # 上限値・package 名は Makefile の BINARY_SIZE_LIMIT_BYTES /
   # BINARY_SIZE_PACKAGE を単一真実源とし、ここでは値を重複定義しない
@@ -627,7 +623,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # #174 適用後はリリースビルドが走るため rust-ci-default-features と同値にする
+    # リリースビルドが走るため rust-ci-default-features と同値にする
     timeout-minutes: 30
     permissions:
       contents: read
@@ -682,19 +678,10 @@ jobs:
           bash harness/binary-size/check-binary-size.sh \
             --package "$BINARY_SIZE_PACKAGE" \
             --limit "$BINARY_SIZE_LIMIT_BYTES" | tee "$out" || status=$?
-          # "::notice::" 等のワークフローコマンドはステップの stdout/stderr からのみ
-          # 解釈され、$GITHUB_STEP_SUMMARY へのリダイレクト内では単なる markdown
-          # テキストとして扱われ発火しない。そのため notice の echo はサマリー用の
-          # ブレースグループの外（本来の stdout）に出す（Issue #467 レビュー指摘）。
-          if grep -q '^skip:' "$out"; then
-            echo "::notice::binary-size: fandhe-browser-cli crate not yet added to workspace (#174) — gate is dormant"
-          fi
           {
             echo "### Binary size ($RUNNER_OS)"
             echo
-            if grep -q '^skip:' "$out"; then
-              echo "skip: fandhe-browser-cli crate 未追加（#174）のため判定を skip した"
-            elif grep -q '^binary-size:' "$out"; then
+            if grep -q '^binary-size:' "$out"; then
               echo "| host | package | bin | bytes | limit | result |"
               echo "| ---- | ------- | --- | ----- | ----- | ------ |"
               grep '^binary-size:' "$out" | while IFS= read -r line; do
@@ -707,7 +694,7 @@ jobs:
                 echo "| $host | $package | $bin | $bytes | $limit | $result |"
               done
             else
-              echo "(no binary-size / skip output was produced; check-binary-size.sh exited with a usage/build error)"
+              echo "(no binary-size output was produced; check-binary-size.sh exited with a usage/build error)"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
