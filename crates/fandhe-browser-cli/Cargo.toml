@@ -41,3 +41,30 @@ rendering = ["dep:fandhe-browser-render"]
 serde_json = { workspace = true }
 # テストの追加ルータ（ai ルータ相当）が返す Response 型
 fandhe-backend-http = { workspace = true }
+
+# TASK-84.3（Issue #460・ビヘイビア PERF-1・PERF-3・PERF-6・AISNAP-1・MS-3）:
+# Lightpanda 比較ベンチのホスト。TASK-84.1（Issue #211）では実ビルドを持つ member が
+# core しかなく暫定で core に置いていたが、計測対象バイナリの所有者である cli へ移設した。
+# core のテスト（`cargo test -p fandhe-browser-core`）からベンチ由来のプロセス起動を伴う
+# 結合テストを外すことも狙い。`path` は workspace ルート直下の `benches/` を指す相対パスで
+# （core・cli とも `crates/<name>/` で深さが同じためそのまま有効）、新規依存の追加ではない
+# （dependency-policy.md の対象外）。ソース本体は移動していない。
+[[bench]]
+name = "competitor_lightpanda"
+path = "../../benches/competitor_lightpanda.rs"
+harness = false
+
+[[test]]
+name = "competitor_lightpanda_support"
+path = "../../benches/competitor_lightpanda/support.rs"
+
+# fixture サーバーの起動・対象プロセスとの通信・計測結果・終了コードまでを通す結合テスト
+# （対象: PERF-3・PERF-6・AISNAP-1）。対象バイナリを模したローカルプロセスはこのテスト
+# バイナリ自身の再実行（`std::env::current_exe()`）で実現し、役割は `--fandhe-fake-role`
+# 引数で渡す。fake MCP は stdout に JSON-RPC 応答の行だけを書く契約のため、libtest の出力
+# （"running N tests" 等）が混入しないよう `harness = false` にし、`measure_tests.rs`
+# 自身が独自の `main` でケースを順に実行する。
+[[test]]
+name = "competitor_lightpanda_measure"
+path = "../../benches/competitor_lightpanda/measure_tests.rs"
+harness = false
