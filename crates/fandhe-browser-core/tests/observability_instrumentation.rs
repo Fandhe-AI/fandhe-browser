@@ -10,7 +10,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
-use fandhe_browser_core::js_stub::{JsStubOptions, execute_js_stub, execute_js_stub_with_options};
+use fandhe_browser_core::js_stub::{
+    JsRuntime, JsStubOptions, execute_js_stub, execute_js_stub_with_options,
+};
 use fandhe_browser_core::selector::parse_selector_list;
 use fandhe_browser_core::{
     FailureKind, FetchOptions, Fetcher, InMemoryRecorder, OperationKind, OperationOutcome,
@@ -290,7 +292,8 @@ fn repair_9_query_via_parse_recorder() {
 fn repair_9_js_stub_failure_is_recorded() {
     let rec = new_recorder();
     let options = JsStubOptions::new().with_recorder(rec.clone());
-    let _ = execute_js_stub_with_options("1 + 1", &options).expect_err("stub");
+    let mut rt = JsRuntime::disabled();
+    let _ = execute_js_stub_with_options(&mut rt, "1 + 1", &options).expect_err("JS 無効");
     let records = rec.records();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].operation(), OperationKind::JsStub);
@@ -310,7 +313,8 @@ fn repair_9_query_and_js_stub_without_recorder_record_nothing() {
         .expect("parse")
         .document;
     let _ = query_selector_all_str(&doc, doc.root(), "p").expect("ok");
-    let _ = execute_js_stub("1");
-    let _ = execute_js_stub_with_options("1", &JsStubOptions::default());
+    let mut rt = JsRuntime::disabled();
+    let _ = execute_js_stub(&mut rt, "1");
+    let _ = execute_js_stub_with_options(&mut rt, "1", &JsStubOptions::default());
     assert_eq!(rec.records().len(), 0);
 }

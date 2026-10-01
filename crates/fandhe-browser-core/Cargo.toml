@@ -76,3 +76,12 @@ tokio = { workspace = true }
 [[test]]
 name = "config_js_engine"
 harness = false
+
+# TASK-30（30.3）・Issue #161: `js_stub` が V8 で実際に評価する結合テスト。V8 は子プロセス版の
+# ため、子として再実行されたときにワーカーとして振る舞うよう独自 `main` の先頭で
+# `run_js_worker_if_requested` を呼ぶ必要があり `harness = false`。V8 同梱時のみ意味を持つため
+# `required-features` で既定構成のビルド対象から外す。
+[[test]]
+name = "js_stub_v8"
+harness = false
+required-features = ["js-v8"]
