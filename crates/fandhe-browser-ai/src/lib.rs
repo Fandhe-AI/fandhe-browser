@@ -66,7 +66,8 @@
 //! - データ葉（非インタラクティブなデータ値）の検出（`AISNAP-3`・`TASK-13`・
 //!   `MS-2`）。`td`/`th` の検出（TASK-13.1・Issue #86）と
 //!   価格クラス名パターン（TASK-13.2・Issue #87）は実装済み（[`data_leaf`]）。
-//!   snapshot 構築への統合は実装済み（TASK-13.3・Issue #88。`Node::data_leaf`）
+//!   snapshot 構築への統合は実装済み（TASK-13.3・Issue #88。`Node::data_leaf`・圧縮表ヘッダの
+//!   `HeaderCell::data_leaf`）
 //! - 重要要素優先保持（`AISNAP-12`・`TASK-16`・`MS-2`）。先頭件の優先保持と
 //!   予算モデルは実装済み（TASK-16.1・Issue #104。[`retention`]）。ページネーションリンクの優先保持（TASK-16.2・Issue #105。
 //!   [`retention::pagination`]）・フォーム送信ボタンの優先保持（TASK-16.3・

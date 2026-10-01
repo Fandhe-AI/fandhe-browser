@@ -12,7 +12,7 @@
 //!
 //! # スタブについて（REPAIR-3）
 //!
-//! `snapshot::build::build_snapshot` から呼ばれ、結果は `Node::data_leaf` に入る
+//! `snapshot::build::build_snapshot` から呼ばれ、結果は `Node::data_leaf`（圧縮表のヘッダは `HeaderCell::data_leaf`。TASK-12.5）に入る
 //! （TASK-13.3・Issue #88。簡約・剪定への利用は後続）。判定規則として実装済みなのは `td`/`th` と
 //! 価格クラス名パターン（TASK-13.2・Issue #87）で、地の文・引用文への拡充は
 //! TASK-15（Issue #99・#100。`AISNAP-11`）で実装する。
