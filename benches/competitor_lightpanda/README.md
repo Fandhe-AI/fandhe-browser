@@ -8,8 +8,8 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
 
 ## 現状の限界（重要。REPAIR-3「実装済みを装わない」）
 
-- `fandhe-browser-cli`（TASK-41.5・Issue #174）が未実装で、CI には Lightpanda
-  のバイナリも用意していない。そのため **CI 実行では `lightpanda`・
+- `fandhe-browser-cli`（TASK-41.5・#616 で追加済み）は存在するが、CI では
+  対象バイナリ（`FANDHE_BROWSER_BIN`）も Lightpanda のバイナリも渡していない。そのため **CI 実行では `lightpanda`・
   `fandhe-browser` の両方が `skipped` になり、実際の数値は記録されない**。
   このパイプラインが渡すのは「記録の仕組みと記録フォーマット」であり、
   実測値を記録できるのは対象バイナリ（`LIGHTPANDA_BIN`・

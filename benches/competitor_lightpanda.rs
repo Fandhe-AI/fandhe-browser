@@ -2,8 +2,8 @@
 //!
 //! TASK-84（84.1）・Issue #211。`docs/spec/03-poc/browser-landscape-2026`
 //! （PoC-13）の Node.js 計測スクリプト（`measure-lp.mjs`・`mcp_snapshot.mjs`）
-//! を移植し、Lightpanda と fandhe-browser（`fandhe-browser-cli` 未実装のため
-//! 現状は計測対象なしで skip する）を対象に、バイナリサイズ（`PERF-1`）・
+//! を移植し、Lightpanda と fandhe-browser（`fandhe-browser-cli` は存在するが、CI では
+//! `FANDHE_BROWSER_BIN` を渡さないため計測対象なしで skip する）を対象に、バイナリサイズ（`PERF-1`）・
 //! cold start（`PERF-3`）・アイドル RSS（`PERF-6`。unix は `ps`、Windows は
 //! `tasklist` に委ねる。TASK-84.5）・MCP レスポンスのトークン削減率
 //! （`AISNAP-1`）を計測する。

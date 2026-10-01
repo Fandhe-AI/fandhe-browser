@@ -4,7 +4,7 @@
 //!
 //! # 呼び出し文脈
 //!
-//! `fandhe-browser-cli`（TASK-41.5・未作成）が起動時に [`Config::load`] で
+//! `fandhe-browser-cli`（TASK-41.5・#616 で追加済みだが `Config::load` の呼び出し配線は未実施。別 Issue）が起動時に [`Config::load`] で
 //! 設定ファイルを読み込み、得られた [`ProfileConfig`] を
 //! `fandhe-browser-profile::Profile::open`（TASK-50・#177）へ渡す想定
 //! （設計時点の申し送り。cli crate 側の配線は別 Issue）。
@@ -29,7 +29,7 @@
 //!
 //! 3 は暫定挙動であり、最終仕様は `rendering-layer.md` と合わせて決める
 //! （spec TASK-91 の記述。Issue #216 の範囲外）。現時点ではレンダリング層を
-//! リンクしたビルドが存在しない（render crate は骨組み・cli 未作成）ため、
+//! リンクしたビルドが存在しない（render crate は骨組みで Servo 未リンク、cli は `rendering` feature を持つが core へ転送していない）ため、
 //! `enabled = true` は常に 3 になる。
 //!
 //! # `[js] engine` の解決規則（JS-1・TASK-91.2）
@@ -343,8 +343,8 @@ impl RenderingConfig {
 /// レンダリング層をリンクしたビルドか（暫定。RENDER-1・TASK-91.3）。
 ///
 /// 現時点ではレンダリング層を同梱するビルドが存在しない（render crate は骨組みで
-/// cli は未作成）ため `false` 固定。cli（TASK-41）が feature `rendering` を core へ
-/// 転送する段階で、feature 由来の値へ置き換える（TASK-33/TASK-38）。core へ未宣言の
+/// cli は `rendering` feature を持つが core へは転送していない）ため `false` 固定。
+/// cli が feature `rendering` を core へ転送する段階で、feature 由来の値へ置き換える（TASK-33/TASK-38）。core へ未宣言の
 /// feature を `cfg!` で参照すると `unexpected_cfgs` になるため、定数で保持する。
 const RENDERING_COMPILED: bool = false;
 
@@ -367,7 +367,7 @@ fn resolve_rendering(raw: Option<RawRendering>, compiled: bool) -> Result<Render
 /// 簡易実装（REPAIR-3）: 本型は選択結果を保持するだけで、エンジンの生成・
 /// 起動時ログ・「JS disabled」の表示は行わない。`create_engine` への配線は
 /// TASK-30（`JS-2`）、cli の起動シーケンスでの非 0 終了・表示は TASK-41
-/// （cli 未作成）の責務。
+/// 系・TASK-47 の責務（cli は TASK-41.5 で追加済みだが、起動シーケンスへの配線は未実施）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct JsConfig {

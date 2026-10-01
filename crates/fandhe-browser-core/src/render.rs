@@ -11,8 +11,8 @@
 //!
 //! ## 本モジュールの範囲外（将来仕様。REPAIR-3: 実装済みを装わない）
 //!
-//! - feature `rendering` の Cargo 定義（`RENDER-1`、`TASK-33`（33.1）、`MS-1`）
-//! - cli による具象実装の注入（`RENDER-1`、`TASK-41.5`・#174、`MS-3`）。`AppState` への
+//! - （済み）feature `rendering` の Cargo 定義: workspace 登録は #45、cli 側の feature 結線は TASK-33.4・#459（`RENDER-1`、`MS-1`）
+//! - cli による具象実装の注入（`RENDER-1`、`TASK-38`、`MS-3`。cli の feature 結線は済みで、具象実装と注入は未実装）。`AppState` への
 //!   格納自体は [`crate::state::AppState`] で実装済み（TASK-41.1・#169）
 //! - `fandhe-browser-render`（Servo）側の本実装（`RENDER-1`、`TASK-33` 本体・`TASK-38`、`MS-1`/`MS-4`）
 
@@ -45,7 +45,7 @@ pub trait Renderer: Send + Sync {
 /// `cdp`・`ai` は、`rendering` feature を有効化した `fandhe-browser-cli` が
 /// 具象実装（`fandhe-browser-render` 側。TASK-33 本体・別 issue）を注入しない限り、
 /// この既定実装を介してのみ描画機能へアクセスする（`AppState` への格納は
-/// [`crate::state::AppState`] で実装済み。具象実装の注入は TASK-41.5・#174）。すべてのメソッドは入力によらず常に
+/// [`crate::state::AppState`] で実装済み。具象実装の注入は TASK-38。現状 cli は `with_disabled_renderer` を使う）。すべてのメソッドは入力によらず常に
 /// [`RenderError::RenderingDisabled`] を返し、`Ok` を返すことは決してない。
 /// 未実装の機能で「成功を一律に返す」フォールバックは検出回避として作用しうるため
 /// 明示的にエラーを返す（security.md「偽装・回避機能の禁止」・REPAIR-3）。

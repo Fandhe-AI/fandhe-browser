@@ -1,7 +1,7 @@
 //! CDP と AI API が共有する最小の共通状態 [`AppState`]（TASK-41（41.1）・MS-3・
 //! ビヘイビア `CDP-1`・`AISNAP-6`）。
 //!
-//! `fandhe-browser-cli`（TASK-41.5・#174）が `Profile::open` の結果と描画ハンドルから
+//! `fandhe-browser-cli`（TASK-41.5・#616 で追加済み。`server` モジュールが生成する。ai ルータへの共有は TASK-19 で未合成）が `Profile::open` の結果と描画ハンドルから
 //! [`AppState`] を 1 つ生成し、`Arc<AppState>` として `fandhe-browser-cdp`
 //! （TASK-41.2・#170 の状態型が内包）と `fandhe-browser-ai` のルータへ同じ
 //! インスタンスを渡す。共有型を下位の core に置くことで、ai と cdp の間に依存を作らずに
@@ -287,7 +287,7 @@ pub struct AppState {
 
 impl AppState {
     /// プロファイルと描画ハンドルから構築する。cli が feature `rendering` 有効時に
-    /// 具象実装を注入する経路（TASK-41.5・#174。`RENDER-1`）。
+    /// TASK-38 で cli が具象実装を注入する予定の経路（`RENDER-1`。現状 cli は `with_disabled_renderer` を使う）。
     pub fn new(profile: Arc<Profile>, renderer: Arc<dyn Renderer>) -> Self {
         Self {
             navigation: NavigationState::new(),

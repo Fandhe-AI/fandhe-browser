@@ -68,7 +68,7 @@ js-boa = ["fandhe-browser-js/js-boa"]
 tokio = { workspace = true }
 
 # TASK-91（91.2）・Issue #215: `[js] engine` の fail-closed 起動エラーを、子プロセス
-# の非 0 終了・stderr として検証する結合テスト。cli（TASK-41.5）未作成のため、
+# の非 0 終了・stderr として検証する結合テスト。cli は追加済み（TASK-41.5・#616）だが `[js] engine` の起動シーケンスをまだ持たないため、
 # このテストバイナリ自身の再実行（`std::env::current_exe()`）で起動シーケンスを
 # 模す。親が終了コードと stderr を集計する独自 `main` を持つため `harness = false`。
 [[test]]
