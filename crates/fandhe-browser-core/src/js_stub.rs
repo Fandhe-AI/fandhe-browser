@@ -24,7 +24,8 @@
 //! - [`JsRuntime`] は `!Send`（`JsEngine` が `Send` 境界を持たないため）。将来
 //!   `AppState`・cdp へ載せる際は専用スレッドで保持する必要がある。
 //! - 子プロセス版エンジンを使うホストバイナリは、`main` の先頭で
-//!   `fandhe_browser_js::run_js_worker_if_requested` を呼ばなければならない。
+//!   core の再エクスポート `fandhe_browser_core::run_js_worker_if_requested`
+//!   （実体は js crate の同名関数。#513）を呼ばなければならない。
 //! - `create_engine(V8)` は子プロセスを起動しない（最初の `evaluate_script` で
 //!   遅延起動。PERF-7・TASK-29.6）。その契約を守るため、本モジュールは
 //!   `inject_global_function`・`bind_dom_like_object` を呼ばない（呼ぶと
