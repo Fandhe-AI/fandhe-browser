@@ -70,12 +70,18 @@ pub(crate) const PROFILE_ROOT_NOT_WIRED_MESSAGE: &str =
 /// `path.display()` を含むため、表示せずこの文言へ写像する。
 pub(crate) const CONFIG_IO_MESSAGE: &str = "failed to read the config file";
 
+/// `profile.root` の値検証エラー（`ConfigError::InvalidValue`）の固定文言。core の
+/// メッセージは「設定ファイルの親ディレクトリの絶対パス」を含み得るため、表示せずこの文言へ写像する。
+pub(crate) const CONFIG_PROFILE_ROOT_INVALID_MESSAGE: &str =
+    "profile.root in the config file is invalid";
+
 /// 起動時のエラー。`Display` は固定の英語文言で、入力値（パス・アドレス等）を埋め込まない。
 ///
 /// 例外は [`StartupError::Config`] のみで、core の設定エラー文言（指定値・同梱エンジン一覧・
 /// 必要な feature）を透過する（spec `JS-1` 切替方式ケース (3) の要求。値は運用者自身の
-/// ローカル設定由来）。ただしファイルパスを含み得る I/O エラー（`ConfigError::Io`）だけは
-/// [`CONFIG_IO_MESSAGE`] の固定文言へ写像し、設定ファイルのパスを表示しない。
+/// ローカル設定由来）。ただしファイルパスを含み得る I/O エラー（`ConfigError::Io`）と
+/// `profile.root` の値検証エラー（親ディレクトリの絶対パスを含み得る）は
+/// [`CONFIG_IO_MESSAGE`]・[`CONFIG_PROFILE_ROOT_INVALID_MESSAGE`] の固定文言へ写像し、パスを表示しない。
 #[derive(Debug)]
 #[non_exhaustive]
 pub(crate) enum StartupError {
@@ -107,6 +113,12 @@ impl fmt::Display for StartupError {
             Self::Config(fandhe_browser_core::Error::Config(
                 fandhe_browser_core::config::ConfigError::Io { .. },
             )) => f.write_str(CONFIG_IO_MESSAGE),
+            Self::Config(fandhe_browser_core::Error::Config(
+                fandhe_browser_core::config::ConfigError::InvalidValue {
+                    key: "profile.root",
+                    ..
+                },
+            )) => f.write_str(CONFIG_PROFILE_ROOT_INVALID_MESSAGE),
             Self::Config(e) => write!(f, "{e}"),
             Self::ConfigPathEmpty => f.write_str(CONFIG_PATH_EMPTY_MESSAGE),
             Self::ProfileRootNotWired => f.write_str(PROFILE_ROOT_NOT_WIRED_MESSAGE),
@@ -247,6 +259,20 @@ mod tests {
         });
         let shown = StartupError::Config(io).to_string();
         assert_eq!(shown, "failed to read the config file");
+        assert!(!shown.contains("/secret"));
+    }
+
+    /// `profile.root` の値検証エラーは固定文言へ写像され、親ディレクトリのパスが漏れない。
+    #[test]
+    fn config_profile_root_invalid_displays_fixed_message_without_path() {
+        let e = fandhe_browser_core::Error::Config(
+            fandhe_browser_core::config::ConfigError::InvalidValue {
+                key: "profile.root",
+                message: "profile.root \"../x\" must resolve under (/secret/dir)".to_string(),
+            },
+        );
+        let shown = StartupError::Config(e).to_string();
+        assert_eq!(shown, "profile.root in the config file is invalid");
         assert!(!shown.contains("/secret"));
     }
 
