@@ -294,7 +294,9 @@ fn has_non_text_name_source(doc: &Document, id: NodeId) -> bool {
 ///
 /// `title` を持つ要素に限り [`compute_name_with_index`] で name の出所を確認する
 /// （`AISNAP-2`・`AISNAP-1`・TASK-12・Issue #631）。出所が `title` なら true。
-/// 走査予算の超過（`truncated`）で `title` へ落ちるか確定できない場合も安全側で true。
+/// 子孫テキストの超過（`truncated`）では `title` へフォールバックしない（name from content が
+/// 打ち切られた場合は空の名前＋`truncated` で、`title` は name に現れない）ため、`truncated` は
+/// 判定に使わず `source` だけで判断する（content 由来の `truncated` を title 由来と誤認しない）。
 /// 判定は name 算出用の共有予算とは別枠の予算で行い（[`NameIndex::with_isolated_content_budget`]）、
 /// 判定対象外の要素の name・`truncated` を変えない。対象は `title` 付き要素に限り有界。
 /// 畳む行の判定（`AISNAP-12`）と [`can_compress`] の双方から呼ばれる。
@@ -307,7 +309,7 @@ fn title_becomes_name(doc: &Document, index: &NameIndex<'_>, id: NodeId) -> bool
     }
     // 判定は別枠の予算で行い、name 算出用の共有予算を消費しない。
     let name = index.with_isolated_content_budget(|| compute_name_with_index(doc, index, id));
-    name.truncated || name.source == NameSource::Title
+    name.source == NameSource::Title
 }
 
 /// 操作可能（フォーカス・クリック・入力の対象になり得る）要素か。
@@ -911,6 +913,18 @@ mod tests {
         let text = format!("{table:?}");
         assert!(text.contains("80"));
         assert!(!text.contains("tip"));
+    }
+
+    /// AISNAP-2（Issue #631）: 子孫テキストが name 文字数上限を超える title 付き td でも、
+    /// name は content 由来（title は name に出ない）なので圧縮を拒否しない。
+    #[test]
+    fn aisnap_2_titled_cell_with_overlong_text_is_still_compressed() {
+        let long = "x".repeat(400);
+        let html = format!(
+            "<body><table><tr><th>A</th></tr><tr><td title=\"tip\">{long}</td></tr></table></body>"
+        );
+        let s = snap(&html);
+        assert!(has_table_summary(&s));
     }
 
     /// AISNAP-2（Issue #631）: generic（span）の title は展開で name になるため展開を維持する。
