@@ -284,7 +284,7 @@ impl<'a> NativeThreadSlot<'a> {
     /// 生存数が `max` 未満なら枠を確保する。満杯なら `None`。
     fn try_acquire(counter: &'a std::sync::atomic::AtomicUsize, max: usize) -> Option<Self> {
         counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < max).then_some(n + 1)
             })
             .ok()
