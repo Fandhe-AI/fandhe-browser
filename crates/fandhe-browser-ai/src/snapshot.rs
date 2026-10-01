@@ -44,7 +44,9 @@
 //! - 表・一覧の圧縮戦略の統合: TASK-12.5（`AISNAP-2`・Issue #83）で実装済み
 //!   （[`Node::table`]・[`TableSummary`]。規則的な `table`・`ul`・`ol` は
 //!   [`build_snapshot`] が子孫を展開せず、ヘッダ・圧縮行・超過行数を持つ 1 ノードへ
-//!   置き換える。圧縮した行・項目の中の操作要素（リンク等）は現状 ref を持たない）
+//!   置き換える。圧縮した行・項目の中の操作要素（リンク等）の格納先として
+//!   [`TableRow::controls`]（[`RowControl`]）を Issue #630 で追加済みだが、現状は常に空。
+//!   保持と ref 付与は後続 Issue #632 で行う。`AISNAP-10`・`AISNAP-13`）
 //! - ユニットテスト一式: TASK-11.8（Issue #77）で実装済み（代表フィクスチャ 3 種の
 //!   結合テスト `tests/snapshot.rs`）
 
@@ -216,7 +218,52 @@ impl HeaderCell {
     }
 }
 
+/// 圧縮行内の操作要素 1 件（リンク・ボタン等。`AISNAP-10`・`AISNAP-13`・TASK-12・Issue #630）。
+///
+/// [`Node`] の role・name・ref・state に対応する。`ref` は圧縮行に操作要素を載せる目的
+/// （ref での再特定。`AISNAP-10`）そのものなので `Option` にせず必須とし、形式は
+/// [`Node::ref`] と同じ（`e<16hex>[v<n>][-n]`）。
+///
+/// 未実装（REPAIR-3）: 現在 [`build_snapshot`] はこの型を生成しない（型のみ先行追加）。
+/// 後続 Issue #632 で圧縮経路が `RefAllocator` で ref を発行して格納し、セル内に複数
+/// リンクがあっても上限付きで保持する（`AISNAP-13`）。JSON への写像は TASK-19・`AISNAP-6`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RowControl {
+    /// ARIA role トークン（例: `link`・`button`）。
+    pub role: String,
+    /// accessible name（空文字列は名前なし）。
+    pub name: String,
+    /// 再特定用 ref（[`Node::ref`] と同じ形式）。
+    pub r#ref: String,
+    /// 状態フラグ（既定は [`State::default`]）。
+    pub state: State,
+}
+
+impl RowControl {
+    /// role・name・ref を指定して作る。`state` は既定値（[`Self::with_state`] で設定）。
+    pub fn new(role: impl Into<String>, name: impl Into<String>, r#ref: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            name: name.into(),
+            r#ref: r#ref.into(),
+            state: State::default(),
+        }
+    }
+
+    /// 状態フラグを設定する。
+    #[must_use]
+    pub fn with_state(mut self, state: State) -> Self {
+        self.state = state;
+        self
+    }
+}
+
 /// 圧縮した 1 データ行（セルを `" | "` で連結した文字列。`AISNAP-2`・TASK-12.5）。
+///
+/// [`build_snapshot`] が圧縮行から生成する。行内操作要素の格納先 [`TableRow::controls`] と
+/// 件数超過フラグ [`TableRow::controls_truncated`] は Issue #630 で追加した型のみで、
+/// 現状は常に空・`false`。設定は後続 Issue #632（`AISNAP-10`・`AISNAP-13`）で行う。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TableRow {
@@ -224,6 +271,11 @@ pub struct TableRow {
     pub text: String,
     /// いずれかのセルが上限（文字数・走査量）で切り詰められたか。
     pub truncated: bool,
+    /// 行内の操作要素（現状は常に空。#632 で保持する）。
+    pub controls: Vec<RowControl>,
+    /// 行あたりの操作要素の件数上限を超えて省略したか（現状は常に `false`）。
+    /// セルの切り詰め [`TableRow::truncated`]・行の省略 `TableSummary::truncated_rows` とは別。
+    pub controls_truncated: bool,
 }
 
 impl TableRow {
@@ -232,7 +284,23 @@ impl TableRow {
         Self {
             text: text.into(),
             truncated,
+            controls: Vec::new(),
+            controls_truncated: false,
         }
+    }
+
+    /// 行内操作要素を設定する（呼び出しは #632 以降。現状 [`build_snapshot`] は使わない）。
+    #[must_use]
+    pub fn with_controls(mut self, controls: Vec<RowControl>) -> Self {
+        self.controls = controls;
+        self
+    }
+
+    /// 操作要素の件数超過フラグを設定する。
+    #[must_use]
+    pub fn with_controls_truncated(mut self, truncated: bool) -> Self {
+        self.controls_truncated = truncated;
+        self
     }
 }
 
@@ -246,7 +314,9 @@ impl TableRow {
 ///   対応しないことがある
 /// - `tfoot` 行は `rows` にも `truncated_rows` にも含めない
 /// - セル内の `" | "` はエスケープしない
-/// - 圧縮した行・項目の中のリンク等の操作要素は ref を持たない
+/// - 圧縮した行・項目の中の操作要素の格納先として `TableRow::controls`（[`RowControl`]）を
+///   持つが、現状は常に空・`controls_truncated == false`。保持と ref 付与は後続 Issue #632
+///   （TASK-12・`AISNAP-10`・`AISNAP-13`）で行う
 /// - 行の省略は `truncated_rows`、セルの切り詰めは [`TableRow::truncated`] で通知し、
 ///   [`Snapshot::truncated`] は立てない
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,7 +439,8 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckedState, DataLeafKind, HeaderCell, Node, Snapshot, State, TableRow, TableSummary,
+        CheckedState, DataLeafKind, HeaderCell, Node, RowControl, Snapshot, State, TableRow,
+        TableSummary,
     };
 
     /// `AISNAP-1`（TASK-11.2・Issue #71、`state` の既定値は TASK-11.5・
@@ -385,6 +456,60 @@ mod tests {
         assert_eq!(node.state, State::default());
         assert_eq!(node.data_leaf, None);
         assert_eq!(node.table, None);
+    }
+
+    /// `AISNAP-2`（Issue #630）: `TableRow::new` は操作要素を空・超過なしで初期化する。
+    #[test]
+    fn aisnap_2_table_row_new_defaults_controls_empty() {
+        let r = TableRow::new("a | b", true);
+        assert_eq!(r.text, "a | b");
+        assert!(r.truncated);
+        assert_eq!(r.controls, vec![]);
+        assert!(!r.controls_truncated);
+    }
+
+    /// `AISNAP-10`（Issue #630）: `RowControl::new` は state を既定値にする。
+    #[test]
+    fn aisnap_10_row_control_new_defaults_state() {
+        let c = RowControl::new("link", "次へ", "e1");
+        assert_eq!(c.role, "link");
+        assert_eq!(c.name, "次へ");
+        assert_eq!(c.r#ref, "e1");
+        assert_eq!(c.state, State::default());
+    }
+
+    /// `AISNAP-10`（Issue #630）: `with_state` は state だけを変える。
+    #[test]
+    fn aisnap_10_row_control_with_state_sets_state_only() {
+        let st = State::default().with_disabled(true);
+        let c = RowControl::new("button", "削除", "e2").with_state(st.clone());
+        assert_eq!(c.state, st);
+        assert_eq!(c.role, "button");
+        assert_eq!(c.name, "削除");
+        assert_eq!(c.r#ref, "e2");
+    }
+
+    /// `AISNAP-13`（Issue #630）: `with_controls` は controls だけを設定する（セル内複数リンク想定）。
+    #[test]
+    fn aisnap_13_table_row_with_controls_sets_controls_only() {
+        let r = TableRow::new("x", false).with_controls(vec![
+            RowControl::new("link", "A", "e1"),
+            RowControl::new("link", "B", "e2"),
+        ]);
+        assert_eq!(r.controls.len(), 2);
+        assert_eq!(r.controls.first().map(|c| c.name.as_str()), Some("A"));
+        assert_eq!(r.controls.get(1).map(|c| c.r#ref.as_str()), Some("e2"));
+        assert_eq!(r.text, "x");
+        assert!(!r.truncated);
+        assert!(!r.controls_truncated);
+    }
+
+    /// `AISNAP-13`（Issue #630）: `with_controls_truncated` はフラグだけを立てる。
+    #[test]
+    fn aisnap_13_table_row_with_controls_truncated_sets_flag_only() {
+        let r = TableRow::new("x", false).with_controls_truncated(true);
+        assert!(r.controls_truncated);
+        assert_eq!(r.controls, vec![]);
     }
 
     /// `AISNAP-3`（Issue #625）: `HeaderCell::new` は `data_leaf` を `None` にする。
