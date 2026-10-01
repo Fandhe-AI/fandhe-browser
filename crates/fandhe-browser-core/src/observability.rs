@@ -86,6 +86,8 @@ pub enum FailureKind {
     Unsupported,
     /// [`Error::JsExecutionUnavailable`] に対応。
     JsExecutionUnavailable,
+    /// [`Error::JsEvaluation`] に対応（TASK-30（30.3）・`JS-2`）。
+    JsEvaluation,
     /// [`Error::Parse`] に対応。
     Parse,
     /// [`Error::Timeout`] に対応。
@@ -116,6 +118,7 @@ impl FailureKind {
             FailureKind::InvalidInput => "invalid_input",
             FailureKind::Unsupported => "unsupported",
             FailureKind::JsExecutionUnavailable => "js_execution_unavailable",
+            FailureKind::JsEvaluation => "js_evaluation",
             FailureKind::Parse => "parse",
             FailureKind::Timeout => "timeout",
             FailureKind::TooManyRedirects => "too_many_redirects",
@@ -144,6 +147,7 @@ impl From<&Error> for FailureKind {
             Error::InvalidInput { .. } => FailureKind::InvalidInput,
             Error::Unsupported { .. } => FailureKind::Unsupported,
             Error::JsExecutionUnavailable { .. } => FailureKind::JsExecutionUnavailable,
+            Error::JsEvaluation(_) => FailureKind::JsEvaluation,
             Error::Parse(_) => FailureKind::Parse,
             Error::Timeout { .. } => FailureKind::Timeout,
             Error::TooManyRedirects { .. } => FailureKind::TooManyRedirects,
@@ -577,6 +581,7 @@ mod tests {
             FailureKind::JsExecutionUnavailable.as_str(),
             "js_execution_unavailable"
         );
+        assert_eq!(FailureKind::JsEvaluation.as_str(), "js_evaluation");
         assert_eq!(FailureKind::Parse.as_str(), "parse");
         assert_eq!(FailureKind::Timeout.as_str(), "timeout");
         assert_eq!(FailureKind::TooManyRedirects.as_str(), "too_many_redirects");

@@ -63,17 +63,24 @@ pub enum Error {
     /// CORE-1・TASK-24（24.9）・#43）。
     ///
     /// `Unsupported`（構文的に正しいが未対応の入力・機能）とは意味を分ける:
-    /// こちらは「JS エンジンがまだ統合されていない」「エンジン非同梱ビルド
-    /// である」という実行環境側の事情を表す。`fandhe-browser-js`（TASK-28）
-    /// の統合後、TASK-30（Issue #143・ビヘイビア `JS-2`）で V8 実呼び出しに
-    /// 置換されるまでの間、および同梱ビルドでない場合の双方をこの variant
-    /// で表現する（`js-engine.md` 決定 4）。
+    /// こちらは実行環境側の事情を表す。エンジンなしビルド、およびエンジン生成の
+    /// 失敗（未同梱・未実装。TASK-30（30.3）・ビヘイビア `JS-2`・`js-engine.md`
+    /// 決定 4）が該当する。エンジンが評価を試みて失敗した場合は
+    /// [`Error::JsEvaluation`] を使う。
     JsExecutionUnavailable {
         /// 実行できない理由を示す英語メッセージ。呼び出し元から渡された
         /// スクリプト文字列は埋め込まない（外部入力の反響・ログ肥大化を
         /// 避けるため。security.md）。
         message: String,
     },
+    /// JS エンジンがスクリプト評価に失敗した（`js_stub::execute_js_stub`。
+    /// TASK-30（30.3）・`JS-2`・Issue #161）。
+    ///
+    /// Timeout・ResourceLimitExceeded・EngineUnavailable・EvaluationFailed 等の
+    /// 区別を失わないよう [`fandhe_browser_js::JsEngineError`] をそのまま保持する
+    /// （実際の打ち切り理由を隠さない。security.md）。エンジン抽象の型であり、
+    /// V8 / boa の具象型は漏れない。
+    JsEvaluation(fandhe_browser_js::JsEngineError),
     /// `parse` モジュール（TASK-24.4・#38・ビヘイビア `CORE-1`）が返す
     /// HTML パース固有のエラー。詳細は [`ParseError`] を参照。
     Parse(ParseError),
@@ -166,6 +173,7 @@ impl fmt::Display for Error {
             Error::JsExecutionUnavailable { message } => {
                 write!(f, "JS execution unavailable: {message}")
             }
+            Error::JsEvaluation(source) => write!(f, "JS evaluation failed: {source}"),
             Error::Parse(source) => write!(f, "parse error: {source}"),
             Error::Timeout { limit } => write!(f, "request timed out after {limit:?}"),
             Error::TooManyRedirects { limit } => {
@@ -197,6 +205,7 @@ impl std::error::Error for Error {
         match self {
             Error::Io(source) => Some(source),
             Error::Parse(source) => Some(source),
+            Error::JsEvaluation(source) => Some(source),
             Error::InvalidInput { .. }
             | Error::Unsupported { .. }
             | Error::JsExecutionUnavailable { .. }
@@ -436,6 +445,39 @@ mod tests {
             std::error::Error::source(&err).map(ToString::to_string),
             None::<String>
         );
+    }
+
+    /// JS-2（TASK-30.3・#161）: `Error::JsEvaluation` の `Display` と `source()`。
+    #[test]
+    fn js_2_js_evaluation_display_and_source() {
+        use fandhe_browser_js::JsEngineError;
+        let cases = [
+            (
+                JsEngineError::EvaluationFailed("x".to_string()),
+                "JS evaluation failed: script evaluation failed: x",
+            ),
+            (
+                JsEngineError::BindingFailed("x".to_string()),
+                "JS evaluation failed: binding registration failed: x",
+            ),
+            (
+                JsEngineError::ResourceLimitExceeded("x".to_string()),
+                "JS evaluation failed: script evaluation exceeded a resource limit: x",
+            ),
+            (
+                JsEngineError::Timeout("x".to_string()),
+                "JS evaluation failed: script evaluation timed out: x",
+            ),
+            (
+                JsEngineError::EngineUnavailable("x".to_string()),
+                "JS evaluation failed: js engine is temporarily unavailable: x",
+            ),
+        ];
+        for (inner, expected) in cases {
+            let err = Error::JsEvaluation(inner);
+            assert_eq!(err.to_string(), expected);
+            assert!(std::error::Error::source(&err).is_some());
+        }
     }
 
     /// CORE-1（TASK-24.4・#38）: `ParseError` の各バリアントの `Display` が

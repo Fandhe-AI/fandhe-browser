@@ -366,7 +366,8 @@ fn resolve_rendering(raw: Option<RawRendering>, compiled: bool) -> Result<Render
 ///
 /// 簡易実装（REPAIR-3）: 本型は選択結果を保持するだけで、エンジンの生成・
 /// 起動時ログ・「JS disabled」の表示は行わない。`create_engine` への配線は
-/// TASK-30（`JS-2`）、cli の起動シーケンスでの非 0 終了・表示は TASK-41
+/// `js_stub::JsRuntime::from_config`（TASK-30（30.3）・`JS-2`）が担う。cli の起動
+/// シーケンスでの非 0 終了・表示は TASK-41
 /// 系・TASK-47 の責務（cli は TASK-41.5 で追加済みだが、起動シーケンスへの配線は未実施）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

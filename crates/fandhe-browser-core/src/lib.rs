@@ -26,9 +26,9 @@
 //! サブセットをパースする本実装を持つ。`query`（TASK-24.10・#418）は
 //! `selector` の AST を `dom::Document` に照合し、`querySelector`/
 //! `querySelectorAll`/`Element.matches()` 相当の API を提供する本実装を持つ。
-//! JS 実行スタブとの境界は TASK-24（24.9・Issue #43）で `js_stub` モジュールとして
-//! 追加した。関数本体（[`js_stub::execute_js_stub`]）は常にエラーを返すスタブであり、
-//! TASK-30（Issue #143・ビヘイビア `JS-2`）で `fandhe-browser-js` の実装へ置換される。
+//! JS 実行の境界は TASK-24（24.9・Issue #43）で `js_stub` モジュールとして追加し、
+//! TASK-30（30.3・Issue #161・ビヘイビア `JS-2`）で設定が選んだ `fandhe-browser-js` の
+//! エンジン（[`js_stub::JsRuntime`]）への評価委譲へ置換した（boa は TASK-32 まで未実装）。
 //! [`render`] モジュールは TASK-33（サブタスク 33.2・ビヘイビア `RENDER-1`）で追加した
 //! 描画トレイトの定義に加え、feature `rendering` 無効時に用いる既定実装
 //! `DisabledRenderer`（TASK-33（33.3）・issue #47）を含む。`fandhe-browser-render`
