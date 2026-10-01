@@ -3,8 +3,9 @@
 //! fetch（ネットワーク取得）・HTML パース・DOM・query（DOM 探索）・CSSOM・
 //! config（設定）・可観測性（ログ・トレーシング）・描画機能への境界（[`render`]）を
 //! 担う crate。`fandhe-browser-profile`（`state` モジュールが `Profile` を保持する。
-//! TASK-41.1・#169。workspace 内 path 依存）に依存し、将来的には `fandhe-browser-js`
-//! にも依存する想定（AGENTS.md「crate 間の許可依存」: js・profile）。`Cargo.toml` の `[dependencies]` には
+//! TASK-41.1・#169。workspace 内 path 依存）と `fandhe-browser-js`（`js_stub` が
+//! 評価を委譲する。workspace 内 path 依存）に依存する（AGENTS.md「crate 間の許可依存」:
+//! js・profile）。`Cargo.toml` の `[dependencies]` には
 //! `html5ever = "=0.40.1"`（Issue #35 承認済み・TASK-24.4・#38）と reqwest・
 //! rustls（同じく Issue #35 承認済み・TASK-24.2・#36）を持つ。他の依存追加は
 //! 該当タスクで dependency-policy.md のユーザー承認制に従って行う。
@@ -29,6 +30,10 @@
 //! JS 実行の境界は TASK-24（24.9・Issue #43）で `js_stub` モジュールとして追加し、
 //! TASK-30（30.3・Issue #161・ビヘイビア `JS-2`）で設定が選んだ `fandhe-browser-js` の
 //! エンジン（[`js_stub::JsRuntime`]）への評価委譲へ置換した（boa は TASK-32 まで未実装）。
+//! 子プロセス版 JS エンジンのワーカー入口 `run_js_worker_if_requested` は、cli が js へ
+//! 直接依存せずに呼べるよう crate ルートから再エクスポートしている（TASK-30・`JS-2`・
+//! #513）。cli の `main` 先頭で `fandhe_browser_core::run_js_worker_if_requested()` として
+//! 呼ぶ（呼び出しの配線は TASK-41・#514）。
 //! [`render`] モジュールは TASK-33（サブタスク 33.2・ビヘイビア `RENDER-1`）で追加した
 //! 描画トレイトの定義に加え、feature `rendering` 無効時に用いる既定実装
 //! `DisabledRenderer`（TASK-33（33.3）・issue #47）を含む。`fandhe-browser-render`
@@ -83,6 +88,9 @@ pub use dom::{
 };
 pub use error::{Error, ParseError, Result};
 pub use fetch::{FetchOptions, FetchResponse, Fetcher};
+// js crate のワーカー入口をそのまま再エクスポートする（ラッパーを挟まない）。ラッパーで
+// マーカー設定時にも `None` を返すと fail-closed が崩れるため（security.md・`JS-2`・#513）。
+pub use fandhe_browser_js::run_js_worker_if_requested;
 pub use observability::{
     FailureKind, InMemoryRecorder, OperationCounts, OperationKind, OperationOutcome,
     OperationRecord, OperationRecorder, RecorderHandle,
