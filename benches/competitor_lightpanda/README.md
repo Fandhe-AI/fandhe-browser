@@ -30,7 +30,9 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
   `/proc/net/tcp{,6}` の LISTEN inode と `/proc/<pid>/fd` の `socket:[inode]`
   を突き合わせる）。macOS も実装済み（TASK-84.6.3・Issue #561。
   `lsof -a -nP -w -iTCP:<port> -sTCP:LISTEN -Fpn` の PID と子プロセスツリーを突き合わせる）。
-  Windows（#562）は未実装で「未対応」として
+  Windows も実装済み（TASK-84.6.4・Issue #562。`netstat -a -n -o -p TCP/TCPv6` の
+  LISTEN 所有 PID と、`Get-CimInstance Win32_Process` から作る子プロセスツリーを
+  突き合わせる）。これら以外の OS は「未対応」として
   従来の事後確認（`reprobe_after_kill`）だけに頼る（両者は併用する設計）
 
 ## 運用（ローカルでの実測・記録）
