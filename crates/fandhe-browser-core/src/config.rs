@@ -4,8 +4,9 @@
 //!
 //! # 呼び出し文脈
 //!
-//! `fandhe-browser-cli`（TASK-41.5・#616 で追加済みだが `Config::load` の呼び出し配線は未実施。別 Issue）が起動時に [`Config::load`] で
-//! 設定ファイルを読み込み、得られた [`ProfileConfig`] を
+//! `fandhe-browser-cli` が起動時に、環境変数 `FANDHE_BROWSER_CONFIG` で指定されたときだけ
+//! [`Config::load`] で設定ファイルを読み込む（TASK-30.5・#163。暫定。`profile.root` の配線は
+//! 未実施で cli 側が拒否する）。将来は得られた [`ProfileConfig`] を
 //! `fandhe-browser-profile::Profile::open`（TASK-50・#177）へ渡す想定
 //! （設計時点の申し送り。cli crate 側の配線は別 Issue）。
 //!
