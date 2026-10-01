@@ -97,7 +97,18 @@
 //! [`element_matches`]・[`query_selector_all`]・[`query_selector`] は
 //! いずれもこのエラーを伝播する。
 //!
-//! 対応 ID: `CORE-1`・TASK-24（24.10）・MS-1。
+//! # 可観測性（`REPAIR-9`・`TASK-10.2.2`・Issue #550）
+//!
+//! 公開関数 1 回の呼び出しにつき [`OperationKind::Query`] のレコードをちょうど
+//! 1 件記録する。recorder は照合対象の [`Document`] が保持するもの
+//! （`ParseOptions::with_recorder` からの引き継ぎ、または
+//! [`Document::set_recorder`] による後付け）を使い、未設定なら何も記録しない。
+//! `*_str` 版は selector 解析エラー（`InvalidInput`・`Unsupported`）も含めて 1 件の
+//! 失敗として記録し、内部で呼ぶ非 `_str` 版による二重記録は起こさない
+//! （`*_inner` を [`instrumented`] で 1 回だけ包む構造）。レコードには selector
+//! 文字列を含めない（固定 enum と数値のみ）。
+//!
+//! 対応 ID: `CORE-1`・`REPAIR-9`・TASK-24（24.10）・TASK-10（10.2.2）・MS-1。
 //!
 //! ## 本モジュールの範囲外（将来仕様。REPAIR-3: 実装済みを装わない）
 //!
@@ -107,9 +118,11 @@
 //!   対応 TASK・MS 未定・spec 側で未割当）
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::dom::{Document, NodeId, QuirksMode};
 use crate::error::{Error, Result};
+use crate::observability::OperationKind;
 use crate::selector::{
     AttributeMatcher, Combinator, ComplexSelector, CompoundSelector, SelectorList, SimpleSelector,
     html_local_name_eq, parse_selector_list,
@@ -481,6 +494,20 @@ fn list_matches(
     Ok(false)
 }
 
+/// 公開エントリポイントの計装（`REPAIR-9`・`TASK-10.2.2`）。`document` の
+/// recorder が有効なときだけレイテンシを計測し、[`OperationKind::Query`] を
+/// 1 回だけ記録する。`Result` は観測するだけで値・エラーはそのまま返す。
+fn instrumented<T>(document: &Document, body: impl FnOnce() -> Result<T>) -> Result<T> {
+    let start = document.recorder.is_enabled().then(Instant::now);
+    let result = body();
+    if let Some(start) = start {
+        document
+            .recorder
+            .record_result(OperationKind::Query, &result, start.elapsed());
+    }
+    result
+}
+
 /// `element` が `selectors` に一致するかどうかを判定する（`Element.matches()`
 /// 相当）。`element` が要素でない場合や範囲外の場合は `Ok(false)` を返す
 /// （panic しない）。
@@ -490,6 +517,16 @@ fn list_matches(
 /// 内部の照合メモ化キャッシュが [`MAX_MATCH_CACHE_ENTRIES`] を超える場合、
 /// [`Error::MatchCacheLimitExceeded`] を返す（モジュール doc 参照）。
 pub fn element_matches(
+    document: &Document,
+    element: NodeId,
+    selectors: &SelectorList,
+) -> Result<bool> {
+    instrumented(document, || {
+        element_matches_inner(document, element, selectors)
+    })
+}
+
+fn element_matches_inner(
     document: &Document,
     element: NodeId,
     selectors: &SelectorList,
@@ -516,6 +553,16 @@ pub fn element_matches(
 /// 内部の照合メモ化キャッシュが [`MAX_MATCH_CACHE_ENTRIES`] を超える場合、
 /// [`Error::MatchCacheLimitExceeded`] を返す（モジュール doc 参照）。
 pub fn query_selector_all(
+    document: &Document,
+    scope: NodeId,
+    selectors: &SelectorList,
+) -> Result<Vec<NodeId>> {
+    instrumented(document, || {
+        query_selector_all_inner(document, scope, selectors)
+    })
+}
+
+fn query_selector_all_inner(
     document: &Document,
     scope: NodeId,
     selectors: &SelectorList,
@@ -547,6 +594,16 @@ pub fn query_selector(
     scope: NodeId,
     selectors: &SelectorList,
 ) -> Result<Option<NodeId>> {
+    instrumented(document, || {
+        query_selector_inner(document, scope, selectors)
+    })
+}
+
+fn query_selector_inner(
+    document: &Document,
+    scope: NodeId,
+    selectors: &SelectorList,
+) -> Result<Option<NodeId>> {
     let mut cache = MatchCache::new();
     for candidate in document.descendants(scope) {
         if document.is_element(candidate)
@@ -571,8 +628,10 @@ pub fn query_selector_all_str(
     scope: NodeId,
     selector: &str,
 ) -> Result<Vec<NodeId>> {
-    let selectors = parse_selector_list(selector)?;
-    query_selector_all(document, scope, &selectors)
+    instrumented(document, || {
+        let selectors = parse_selector_list(selector)?;
+        query_selector_all_inner(document, scope, &selectors)
+    })
 }
 
 /// `selector` 文字列を [`parse_selector_list`] で解析してから
@@ -588,8 +647,10 @@ pub fn query_selector_str(
     scope: NodeId,
     selector: &str,
 ) -> Result<Option<NodeId>> {
-    let selectors = parse_selector_list(selector)?;
-    query_selector(document, scope, &selectors)
+    instrumented(document, || {
+        let selectors = parse_selector_list(selector)?;
+        query_selector_inner(document, scope, &selectors)
+    })
 }
 
 #[cfg(test)]
@@ -1358,5 +1419,50 @@ mod tests {
         let err = parse_selector_list(":::not-a-selector:::")
             .expect_err("不正なセレクタ構文はエラーになるはず");
         assert!(matches!(err, Error::Unsupported { .. }));
+    }
+
+    /// REPAIR-9: `set_recorder` 後の `query_selector_all` は `Query` / `Success` を 1 件記録する。
+    #[test]
+    fn repair_9_query_selector_all_records_one_success() {
+        use crate::observability::{InMemoryRecorder, OperationOutcome};
+        use std::sync::Arc;
+
+        let mut doc = parse("<ul><li>a</li><li>b</li></ul>");
+        let rec = Arc::new(InMemoryRecorder::with_capacity(8));
+        doc.set_recorder(rec.clone());
+        let root = doc.root();
+
+        let found = query_selector_all(&doc, root, &selectors("li")).expect("成功する");
+        assert_eq!(found.len(), 2);
+
+        let records = rec.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation(), OperationKind::Query);
+        assert_eq!(records[0].outcome(), OperationOutcome::Success);
+    }
+
+    /// REPAIR-9: `_str` 版の selector 解析エラーはちょうど 1 件の `Query` 失敗になる。
+    #[test]
+    fn repair_9_query_selector_str_records_parse_error_once() {
+        use crate::observability::{FailureKind, InMemoryRecorder, OperationOutcome};
+        use std::sync::Arc;
+
+        let mut doc = parse("<p>x</p>");
+        let rec = Arc::new(InMemoryRecorder::with_capacity(8));
+        doc.set_recorder(rec.clone());
+        let root = doc.root();
+
+        let err = query_selector_str(&doc, root, "a >").expect_err("不正な selector");
+        assert!(matches!(err, Error::InvalidInput { .. }));
+
+        let records = rec.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation(), OperationKind::Query);
+        assert_eq!(
+            records[0].outcome(),
+            OperationOutcome::Failure {
+                kind: FailureKind::InvalidInput
+            }
+        );
     }
 }
