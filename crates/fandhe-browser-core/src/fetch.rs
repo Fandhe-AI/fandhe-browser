@@ -47,13 +47,14 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect::Policy;
 use reqwest::{Client, ClientBuilder, Url};
 
 use crate::error::{Error, Result};
+use crate::observability::{OperationKind, OperationRecorder, RecorderHandle};
 
 /// デフォルトの全体タイムアウト（30 秒）。
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -105,6 +106,8 @@ pub struct FetchOptions {
     /// ため、呼び出し側が明示的に `true` を設定すれば許可できる。既定は
     /// 安全側（拒否）に倒す。
     pub allow_private_network_access: bool,
+    /// 操作レコードの記録先（`REPAIR-9`・`TASK-10.2.1`）。既定は無効。
+    recorder: RecorderHandle,
 }
 
 impl Default for FetchOptions {
@@ -115,6 +118,7 @@ impl Default for FetchOptions {
             max_redirects: DEFAULT_MAX_REDIRECTS,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             allow_private_network_access: false,
+            recorder: RecorderHandle::default(),
         }
     }
 }
@@ -123,6 +127,16 @@ impl FetchOptions {
     /// 既定値で [`FetchOptions`] を作る（[`Default`] と同義）。
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// [`Fetcher::get`] の操作レコードの記録先を設定する（`REPAIR-9`・`TASK-10.2.1`）。
+    ///
+    /// 1 回の `get` につきレコード 1 件（操作種別 `Fetch`）。4xx/5xx は `Ok` のため
+    /// `Success`。URL・host・本文はレコードに含めない。未設定なら記録しない。
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Arc<dyn OperationRecorder>) -> Self {
+        self.recorder = RecorderHandle::new(recorder);
+        self
     }
 
     /// リクエスト全体のタイムアウトを設定する。
@@ -640,6 +654,19 @@ impl Fetcher {
     /// - 4xx/5xx は `Err` にせず `Ok` で返す（404 ページ等もパース対象に
     ///   なり得るため、判断は呼び出し側に委ねる）
     pub async fn get(&self, url: &str) -> Result<FetchResponse> {
+        // 無効時は Instant::now() も呼ばない。
+        let start = self.options.recorder.is_enabled().then(Instant::now);
+        let result = self.get_inner(url).await;
+        if let Some(start) = start {
+            self.options
+                .recorder
+                .record_result(OperationKind::Fetch, &result, start.elapsed());
+        }
+        result
+    }
+
+    /// [`Fetcher::get`] の本体（計装の内側。SSRF 検査の順序・内容は不変）。
+    async fn get_inner(&self, url: &str) -> Result<FetchResponse> {
         let parsed = Url::parse(url).map_err(|source| Error::InvalidInput {
             message: format!("invalid URL: {source}"),
         })?;

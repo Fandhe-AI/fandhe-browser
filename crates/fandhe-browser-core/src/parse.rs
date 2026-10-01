@@ -40,12 +40,15 @@
 
 use crate::dom::{Attribute, Document, Node, NodeData, NodeId, QuirksMode};
 use crate::error::{Error, ParseError, Result};
+use crate::observability::{OperationKind, OperationRecorder, RecorderHandle};
 use html5ever::interface::{ElemName, ElementFlags, NodeOrText, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::tree_builder::TreeBuilderOpts;
 use html5ever::{Attribute as HtmlAttribute, LocalName, Namespace, ParseOpts, QualName};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::sync::Arc;
+use std::time::Instant;
 
 /// ルートノード（[`html5ever::interface::TreeSink::get_document`]）の ID。
 /// arena（[`ArenaSink::new`]）は常にこの位置に [`NodeData::Document`] を
@@ -89,6 +92,8 @@ pub struct ParseOptions {
     max_recorded_errors: usize,
     scripting_enabled: bool,
     error_policy: ParseErrorPolicy,
+    /// 操作レコードの記録先（`REPAIR-9`・`TASK-10.2.1`）。生成する `Document` にも引き継ぐ。
+    recorder: RecorderHandle,
 }
 
 /// 入力サイズ上限の既定値（32 MiB）。
@@ -120,11 +125,23 @@ impl Default for ParseOptions {
             // 逆に false とする。JS 統合時（`TASK-30`・`MS-3`）に見直す。
             scripting_enabled: false,
             error_policy: ParseErrorPolicy::Recover,
+            recorder: RecorderHandle::default(),
         }
     }
 }
 
 impl ParseOptions {
+    /// パース操作の記録先を設定する（`REPAIR-9`・`TASK-10.2.1`）。
+    ///
+    /// [`parse_document`]・[`parse_document_bytes`] は 1 回の呼び出しにつき
+    /// ちょうど 1 件（操作種別 `Parse`）を記録する。生成された `Document` にも
+    /// 同じ recorder が引き継がれ、`dom` の計装（`text_content`）が使う。
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Arc<dyn OperationRecorder>) -> Self {
+        self.recorder = RecorderHandle::new(recorder);
+        self
+    }
+
     /// 入力サイズ上限（バイト数）を設定する。
     pub fn with_max_input_bytes(mut self, max_input_bytes: usize) -> Self {
         self.max_input_bytes = max_input_bytes;
@@ -206,6 +223,10 @@ pub struct ParsedDocument {
 ///
 /// [`parse` モジュールのドキュメント](self) の「エラーポリシー」を参照。
 pub fn parse_document(input: &str, options: &ParseOptions) -> Result<ParsedDocument> {
+    instrumented(options, || parse_document_inner(input, options))
+}
+
+fn parse_document_inner(input: &str, options: &ParseOptions) -> Result<ParsedDocument> {
     if options.max_nodes == 0 {
         return Err(Error::Parse(ParseError::InvalidMaxNodes { requested: 0 }));
     }
@@ -245,6 +266,10 @@ pub fn parse_document(input: &str, options: &ParseOptions) -> Result<ParsedDocum
 ///
 /// [`parse` モジュールのドキュメント](self) の「エラーポリシー」を参照。
 pub fn parse_document_bytes(input: &[u8], options: &ParseOptions) -> Result<ParsedDocument> {
+    instrumented(options, || parse_document_bytes_inner(input, options))
+}
+
+fn parse_document_bytes_inner(input: &[u8], options: &ParseOptions) -> Result<ParsedDocument> {
     // オプション検証（`max_nodes`）を入力検証より先に行う。`parse_document`
     // 側でも同じ検査をするが、`InvalidUtf8`/`InputTooLarge` を先に返すと
     // 「同じ `options` で `parse_document` を呼ぶと `InvalidMaxNodes` に
@@ -262,11 +287,28 @@ pub fn parse_document_bytes(input: &[u8], options: &ParseOptions) -> Result<Pars
     }
 
     match std::str::from_utf8(input) {
-        Ok(text) => parse_document(text, options),
+        Ok(text) => parse_document_inner(text, options),
         Err(utf8_error) => Err(Error::Parse(ParseError::InvalidUtf8 {
             valid_up_to: utf8_error.valid_up_to(),
         })),
     }
+}
+
+/// 公開エントリポイントの計装（`REPAIR-9`・`TASK-10.2.1`）。レイテンシを計測し
+/// `Parse` を 1 回だけ記録する。`parse_document_bytes` が `parse_document` を呼ぶ
+/// 二重記録を避けるため、公開関数は `*_inner` をこの関数で包む構造にしている。
+fn instrumented(
+    options: &ParseOptions,
+    body: impl FnOnce() -> Result<ParsedDocument>,
+) -> Result<ParsedDocument> {
+    let start = options.recorder.is_enabled().then(Instant::now);
+    let result = body();
+    if let Some(start) = start {
+        options
+            .recorder
+            .record_result(OperationKind::Parse, &result, start.elapsed());
+    }
+    result
 }
 
 /// html5ever `TreeSink::elem_name` の戻り値。
@@ -350,6 +392,8 @@ struct ArenaSink {
     max_nodes: usize,
     max_recorded_errors: usize,
     strict: bool,
+    /// 完成した `Document` へ引き継ぐ recorder（`REPAIR-9`・`TASK-10.2.1`）。
+    recorder: RecorderHandle,
 }
 
 impl ArenaSink {
@@ -380,6 +424,7 @@ impl ArenaSink {
             max_nodes: options.max_nodes.max(RESERVED_NODE_COUNT),
             max_recorded_errors: options.max_recorded_errors,
             strict: matches!(options.error_policy, ParseErrorPolicy::Strict),
+            recorder: options.recorder.clone(),
         }
     }
 
@@ -597,6 +642,7 @@ impl TreeSink for ArenaSink {
                 nodes: self.nodes.into_inner(),
                 root: ROOT_ID,
                 quirks_mode: self.quirks_mode.get(),
+                recorder: self.recorder,
             },
             diagnostics,
         })

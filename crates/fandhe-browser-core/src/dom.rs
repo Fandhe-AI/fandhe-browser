@@ -151,6 +151,13 @@ pub type QuirksMode = html5ever::interface::QuirksMode;
 /// 型をここで再エクスポートする。
 pub use html5ever::QualName;
 
+use std::sync::Arc;
+use std::time::Instant;
+
+use crate::observability::{
+    FailureKind, OperationKind, OperationOutcome, OperationRecorder, RecorderHandle,
+};
+
 /// HTML 名前空間の URI（`html5ever::ns!(html)` が展開する定数と同じ値）。
 ///
 /// [`Document::attribute`]・[`Document::local_name`] の大文字小文字照合規則
@@ -172,9 +179,20 @@ pub struct Document {
     pub(crate) root: NodeId,
     /// パース時に決定した quirks mode。
     pub(crate) quirks_mode: QuirksMode,
+    /// 操作レコードの記録先（`REPAIR-9`・`TASK-10.2.1`）。パース時に `ParseOptions` から
+    /// 引き継ぎ、`text_content` が使う。`Arc<dyn OperationRecorder>`（`Send + Sync`）
+    /// なので `Document` の `Send + Sync` 契約は保たれる。
+    pub(crate) recorder: RecorderHandle,
 }
 
 impl Document {
+    /// 操作レコードの記録先を（付け替え）設定する（`REPAIR-9`・`TASK-10.2.1`）。
+    ///
+    /// recorder なしでパースした文書へ後から付けたい場合に使う。
+    pub fn set_recorder(&mut self, recorder: Arc<dyn OperationRecorder>) {
+        self.recorder = RecorderHandle::new(recorder);
+    }
+
     /// ルートノード（[`NodeData::Document`]）の ID を返す。
     pub fn root(&self) -> NodeId {
         self.root
@@ -373,7 +391,29 @@ impl Document {
     ///   （[`Document::descendants`] を利用し再帰しない。template contents は
     ///   子孫に含まれないため、テキストにも含まれない）
     /// - Document / Doctype・範囲外 ID: `None`
+    ///
+    /// `REPAIR-9`（`TASK-10.2.1`）の計装対象。recorder が有効なら 1 回の呼び出しにつき
+    /// 1 件（操作種別 `Dom`）を記録する。範囲外 ID は `Failure { InvalidInput }`、
+    /// それ以外（`None` を返す Document / Doctype を含む）は `Success`。
     pub fn text_content(&self, id: NodeId) -> Option<String> {
+        if !self.recorder.is_enabled() {
+            return self.text_content_inner(id);
+        }
+        let start = Instant::now();
+        let text = self.text_content_inner(id);
+        let outcome = if self.node_data(id).is_some() {
+            OperationOutcome::Success
+        } else {
+            OperationOutcome::Failure {
+                kind: FailureKind::InvalidInput,
+            }
+        };
+        self.recorder
+            .record_outcome(OperationKind::Dom, outcome, start.elapsed());
+        text
+    }
+
+    fn text_content_inner(&self, id: NodeId) -> Option<String> {
         match self.node_data(id)? {
             NodeData::Text { contents } | NodeData::Comment { contents } => Some(contents.clone()),
             NodeData::ProcessingInstruction { data, .. } => Some(data.clone()),
@@ -744,6 +784,7 @@ mod tests {
             ],
             root: NodeId::new(0),
             quirks_mode: QuirksMode::NoQuirks,
+            recorder: RecorderHandle::default(),
         };
 
         let ancestor_count = doc.ancestors(NodeId::new(0)).count();
@@ -751,5 +792,28 @@ mod tests {
 
         let descendant_count = doc.descendants(NodeId::new(0)).count();
         assert!(descendant_count <= doc.node_count());
+    }
+
+    /// `REPAIR-9`（`TASK-10.2.1`）: 範囲外 `NodeId` の `text_content` は
+    /// `Dom` / `Failure { InvalidInput }` として 1 件記録され、戻り値は `None`。
+    #[test]
+    fn repair_9_text_content_out_of_range_is_recorded_as_failure() {
+        use crate::observability::{InMemoryRecorder, OperationOutcome};
+
+        let mut doc = parse("<p>hi</p>").document;
+        let rec = Arc::new(InMemoryRecorder::with_capacity(8));
+        doc.set_recorder(rec.clone());
+
+        assert_eq!(doc.text_content(NodeId::new(9_999)), None);
+
+        let records = rec.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation(), OperationKind::Dom);
+        assert_eq!(
+            records[0].outcome(),
+            OperationOutcome::Failure {
+                kind: FailureKind::InvalidInput
+            }
+        );
     }
 }

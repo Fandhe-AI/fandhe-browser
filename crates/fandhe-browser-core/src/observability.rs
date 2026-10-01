@@ -6,10 +6,17 @@
 //! ことを求めている（`TASK-10（10.1）`・`MS-4`）。本モジュールはその最初の
 //! 一歩として、全モジュール共通のレコード型（[`OperationRecord`]）とその
 //! 構成要素（[`OperationKind`]・[`OperationOutcome`]・[`FailureKind`]）だけを
-//! 定義する。各モジュール（fetch/parse/dom/query/js_stub）への計測の組み込み・
-//! 出力先（ファイル・外部基盤）・保持期間は本モジュールの範囲外であり、
-//! `TASK-10` の後続サブ Issue と Issue #218（`TASK-10（10.h1）`。出力形式・
-//! 保持期間・収集基盤の決定。担当は人間、本 Issue 時点で未決）が担当する。
+//! 定義する。
+//!
+//! `TASK-10.2.1`（Issue #549）で、レコードの受け口（[`OperationRecorder`]・
+//! [`RecorderHandle`]）とテスト・簡易集計用の有界メモリ内集計器
+//! （[`InMemoryRecorder`]）を追加し、`fetch`・`parse`・`dom` へ計装を組み込んだ。
+//! `query`・`js_stub` への計装は Issue #550（`TASK-10.2.2`）、本番の出力先
+//! （ファイル・外部基盤）・保持期間は Issue #221（`TASK-10.3`）と Issue #218
+//! （`TASK-10（10.h1）`。出力形式・保持期間・収集基盤の決定。担当は人間、
+//! 本 Issue 時点で未決）が担当する。recorder は呼び出し側が options 経由で
+//! 明示注入する方式で、未設定（既定）なら一切記録しない（process-global は
+//! 並列テストで記録が混ざるため採らない）。
 //!
 //! [`OperationRecord::to_json_line`] は、workspace が `serde` 等のシリアライズ
 //! 用クレートを持たない現時点での **暫定** エンコーダである（dependency-policy.md
@@ -17,6 +24,8 @@
 //! 出力形式が #218 で確定した際は、本関数の差し替え、または `serde` 導入
 //! （導入する場合は改めてユーザー承認を要る）が見込まれる。
 
+use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
@@ -315,9 +324,234 @@ impl OperationRecord {
     }
 }
 
+/// 操作レコードの受け口（`REPAIR-9`・`TASK-10.2.1`）。
+///
+/// `fetch`・`parse`・`dom` の計装コードが 1 操作ごとに [`OperationRecord`] を
+/// 渡す。in-process の Rust トレイトであり、プラグイン境界（PLUG 系）でも
+/// 動的ライブラリのロードでもない。
+///
+/// 実装は次の契約を守ること。async の `fetch` ホットパスから同期的に
+/// 呼ばれるため、(1) panic しない、(2) 長時間ブロックしない、(3) 記録の
+/// 失敗を操作の失敗へ波及させない（戻り値を持たない理由）。
+pub trait OperationRecorder: Send + Sync {
+    /// レコードを 1 件受け取る。
+    fn record(&self, record: &OperationRecord);
+}
+
+/// [`OperationRecorder`] の共有ハンドル。既定は無効（何も記録しない）。
+///
+/// `FetchOptions`・`ParseOptions`・`dom::Document` が保持し、計装箇所は
+/// [`RecorderHandle::is_enabled`] で無効時の `Instant::now()` を省ける。
+#[derive(Clone, Default)]
+pub struct RecorderHandle {
+    inner: Option<Arc<dyn OperationRecorder>>,
+}
+
+impl fmt::Debug for RecorderHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecorderHandle")
+            .field("enabled", &self.inner.is_some())
+            .finish()
+    }
+}
+
+impl RecorderHandle {
+    /// `recorder` へ記録する有効なハンドルを作る。
+    pub fn new(recorder: Arc<dyn OperationRecorder>) -> Self {
+        Self {
+            inner: Some(recorder),
+        }
+    }
+
+    /// 何も記録しない無効なハンドルを作る（[`Default`] と同義）。
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    /// recorder が設定されているか。
+    pub fn is_enabled(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    /// `Result` の成否から [`OperationRecord`] を作って記録する。無効なら何もしない。
+    pub(crate) fn record_result<T>(
+        &self,
+        kind: OperationKind,
+        result: &Result<T>,
+        latency: Duration,
+    ) {
+        self.record_outcome(kind, OperationOutcome::from_result(result), latency);
+    }
+
+    /// 成否を指定して記録する。`Result` を返さない操作（dom 等）向け。
+    pub(crate) fn record_outcome(
+        &self,
+        kind: OperationKind,
+        outcome: OperationOutcome,
+        latency: Duration,
+    ) {
+        let Some(recorder) = &self.inner else {
+            return;
+        };
+        // システム時計が UNIX エポックより前の場合はレコードを黙って捨てる。
+        // 記録の失敗で本来の操作（fetch/parse/dom）を失敗させないため。
+        if let Ok(record) = OperationRecord::now(kind, outcome, latency) {
+            recorder.record(&record);
+        }
+    }
+}
+
+/// [`InMemoryRecorder::counts`] の集計結果。
+///
+/// `#[non_exhaustive]`（REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct OperationCounts {
+    /// 成功した操作の件数。
+    pub success: u64,
+    /// 失敗した操作の件数。
+    pub failure: u64,
+}
+
+#[derive(Debug, Default)]
+struct InMemoryInner {
+    records: Vec<OperationRecord>,
+    capacity: usize,
+    dropped: u64,
+}
+
+/// `Vec` の事前確保の上限。巨大な `capacity` 指定による確保増幅を防ぐ。
+const IN_MEMORY_PREALLOC_LIMIT: usize = 64;
+
+/// 件数上限付きのメモリ内 [`OperationRecorder`]。
+///
+/// **テスト・簡易集計用のユーティリティであり、本番の出力先ではない**
+/// （出力先は Issue #218 で決定し #221 で実装する。`REPAIR-9`・`TASK-10.3`）。
+/// 上限超過分は捨てて [`InMemoryRecorder::dropped`] に数える。
+#[derive(Debug, Default)]
+pub struct InMemoryRecorder {
+    inner: Mutex<InMemoryInner>,
+}
+
+impl InMemoryRecorder {
+    /// 最大 `capacity` 件を保持する recorder を作る。
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(InMemoryInner {
+                records: Vec::with_capacity(capacity.min(IN_MEMORY_PREALLOC_LIMIT)),
+                capacity,
+                dropped: 0,
+            }),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, InMemoryInner> {
+        // poison は回復して続行する（記録側の panic を呼び出し元へ波及させない）。
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 保持中のレコードのコピーを記録順に返す。
+    pub fn records(&self) -> Vec<OperationRecord> {
+        self.lock().records.clone()
+    }
+
+    /// 上限超過で捨てたレコード数。
+    pub fn dropped(&self) -> u64 {
+        self.lock().dropped
+    }
+
+    /// 保持中のレコードから `kind` の成功・失敗件数を数える。
+    /// 上限超過で捨てたレコードは数えない。
+    pub fn counts(&self, kind: OperationKind) -> OperationCounts {
+        let inner = self.lock();
+        let mut counts = OperationCounts::default();
+        for record in inner.records.iter().filter(|r| r.operation() == kind) {
+            match record.outcome() {
+                OperationOutcome::Success => counts.success = counts.success.saturating_add(1),
+                _ => counts.failure = counts.failure.saturating_add(1),
+            }
+        }
+        counts
+    }
+}
+
+impl OperationRecorder for InMemoryRecorder {
+    fn record(&self, record: &OperationRecord) {
+        let mut inner = self.lock();
+        if inner.records.len() < inner.capacity {
+            inner.records.push(*record);
+        } else {
+            inner.dropped = inner.dropped.saturating_add(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rec(kind: OperationKind, outcome: OperationOutcome) -> OperationRecord {
+        OperationRecord::now(kind, outcome, Duration::ZERO).expect("now is after epoch")
+    }
+
+    /// `REPAIR-9`: 上限超過分は捨てて `dropped` に数える。
+    #[test]
+    fn repair_9_in_memory_recorder_respects_capacity() {
+        let r = InMemoryRecorder::with_capacity(2);
+        for _ in 0..3 {
+            r.record(&rec(OperationKind::Fetch, OperationOutcome::Success));
+        }
+        assert_eq!(r.records().len(), 2);
+        assert_eq!(r.dropped(), 1);
+    }
+
+    /// `REPAIR-9`: 種別ごとの成功・失敗件数を数える。
+    #[test]
+    fn repair_9_in_memory_recorder_counts_by_kind() {
+        let r = InMemoryRecorder::with_capacity(10);
+        let fail = OperationOutcome::Failure {
+            kind: FailureKind::Timeout,
+        };
+        r.record(&rec(OperationKind::Fetch, OperationOutcome::Success));
+        r.record(&rec(OperationKind::Fetch, OperationOutcome::Success));
+        r.record(&rec(OperationKind::Fetch, fail));
+        r.record(&rec(OperationKind::Parse, OperationOutcome::Success));
+        let fetch = r.counts(OperationKind::Fetch);
+        assert_eq!((fetch.success, fetch.failure), (2, 1));
+        let parse = r.counts(OperationKind::Parse);
+        assert_eq!((parse.success, parse.failure), (1, 0));
+        let dom = r.counts(OperationKind::Dom);
+        assert_eq!((dom.success, dom.failure), (0, 0));
+    }
+
+    /// `REPAIR-9`: 無効ハンドルは何もせず、有効ハンドルは 1 件記録する。
+    #[test]
+    fn repair_9_handle_enabled_and_disabled() {
+        let disabled = RecorderHandle::disabled();
+        assert!(!disabled.is_enabled());
+        disabled.record_outcome(
+            OperationKind::Dom,
+            OperationOutcome::Success,
+            Duration::ZERO,
+        );
+        let mem = Arc::new(InMemoryRecorder::with_capacity(4));
+        let handle = RecorderHandle::new(mem.clone());
+        assert!(handle.is_enabled());
+        let ok: Result<()> = Ok(());
+        handle.record_result(OperationKind::Dom, &ok, Duration::ZERO);
+        assert_eq!(mem.records().len(), 1);
+    }
+
+    /// `REPAIR-9`: `RecorderHandle` の `Debug` は具体値で安定している。
+    #[test]
+    fn repair_9_handle_debug_is_stable() {
+        assert_eq!(
+            format!("{:?}", RecorderHandle::disabled()),
+            "RecorderHandle { enabled: false }"
+        );
+        let handle = RecorderHandle::new(Arc::new(InMemoryRecorder::with_capacity(1)));
+        assert_eq!(format!("{handle:?}"), "RecorderHandle { enabled: true }");
+    }
 
     /// `REPAIR-9`: `OperationKind::as_str` が全種別で安定した文字列を返す。
     #[test]
