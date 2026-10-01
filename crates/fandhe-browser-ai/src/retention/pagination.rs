@@ -13,6 +13,9 @@
 //! 対象は HTML 名前空間の `<a>` で、空でない `href` を持ち、自身も祖先も非表示でないもの
 //! （祖先の非表示は [`find_pagination_link`] が項目の祖先を検査する）。
 //!
+//! 無効なリンク（自身または固定深さの祖先が `aria-disabled="true"` / `disabled` class。
+//! `href="#"` は根拠にしない）は、下記の判定に該当しても候補から除外する。
+//!
 //! 1. `rel` トークン: `next` / `prev` / `previous`
 //! 2. ラベルの完全一致（`aria-label` を優先、無ければ短い表示テキスト。
 //!    空白正規化・ASCII 小文字化後の完全一致で、部分一致はしない。単独の `more` は
@@ -329,6 +332,46 @@ pub fn classify_pagination_link(doc: &Document, id: NodeId) -> Option<Pagination
 /// 祖先の可視性が検査済みの `<a>` を分類する（`classify_pagination_link` と
 /// `find_pagination_link` の共通部）。自身の `href`・`hidden` だけを検査する。
 fn classify_visible_anchor(doc: &Document, id: NodeId) -> Option<PaginationKind> {
+    let kind = classify_anchor_kind(doc, id)?;
+    // 種別が判定できたリンクだけ無効状態を検査する（祖先探索のコストを抑える）。
+    if is_disabled_link(doc, id) {
+        return None;
+    }
+    Some(kind)
+}
+
+/// 要素自身が無効状態か（`aria-disabled="true"` または `disabled` class）。
+///
+/// 属性値は長さ上限を超える場合に走査せず無効扱いにしない（他属性と同じ方針）。
+fn is_disabled_element(doc: &Document, id: NodeId) -> bool {
+    doc.attribute(id, "aria-disabled").is_some_and(|v| {
+        v.len() <= MAX_ARIA_LABEL_BYTES
+            && v.trim_matches(is_ascii_space).eq_ignore_ascii_case("true")
+    }) || doc
+        .attribute(id, "class")
+        .is_some_and(|c| token_matches(c, "disabled"))
+}
+
+/// リンク自身、または固定深さ（[`MAX_HIDDEN_ANCESTOR_DEPTH`]）までの祖先
+/// （`li.disabled > a` 等）が無効状態か。深さ上限を超えて祖先要素が残る場合は
+/// 確認できないため fail-closed で無効扱い（AISNAP-12・TASK-16.2）。
+/// `href="#"` は無効の根拠にしない（「もっと見る」系を落とさないため）。
+fn is_disabled_link(doc: &Document, id: NodeId) -> bool {
+    if is_disabled_element(doc, id) {
+        return true;
+    }
+    let mut ancestors = doc.ancestors(id);
+    if ancestors
+        .by_ref()
+        .take(MAX_HIDDEN_ANCESTOR_DEPTH)
+        .any(|a| doc.is_element(a) && is_disabled_element(doc, a))
+    {
+        return true;
+    }
+    ancestors.next().is_some_and(|a| doc.is_element(a))
+}
+
+fn classify_anchor_kind(doc: &Document, id: NodeId) -> Option<PaginationKind> {
     if !is_html_named(doc, id, "a")
         || doc.attribute(id, "href").is_none_or(|h| h.is_empty())
         || is_hidden_element(doc, id)
@@ -659,6 +702,67 @@ mod tests {
             find_pagination_link(&doc, select(&doc, "li")),
             Some(PaginationKind::Next)
         );
+    }
+
+    /// AISNAP-12（TASK-16.2・Codex P1）: 無効なリンク（自身の aria-disabled・
+    /// disabled class・祖先 li.disabled）は候補にならず、href="#" は残る。
+    #[test]
+    fn aisnap_12_disabled_links_excluded() {
+        let prev = r#"rel="prev""#;
+        assert_eq!(
+            classify(&format!(
+                r#"<a href="?p=1" {prev} aria-disabled="true">前へ</a>"#
+            )),
+            None
+        );
+        assert_eq!(
+            classify(&format!(
+                r#"<a href="?p=1" {prev} aria-disabled=" TRUE ">前へ</a>"#
+            )),
+            None
+        );
+        assert_eq!(
+            classify(&format!(
+                r#"<a href="?p=1" {prev} class="btn disabled">前へ</a>"#
+            )),
+            None
+        );
+        assert_eq!(
+            classify(&format!(
+                r#"<ul class="pagination"><li class="page-item disabled"><a href="?p=1" {prev}>前へ</a></li></ul>"#
+            )),
+            None
+        );
+        // 無効でない・href="#" は残る。
+        assert_eq!(
+            classify(&format!(
+                r#"<a href="?p=1" {prev} aria-disabled="false">前へ</a>"#
+            )),
+            Some(PaginationKind::Previous)
+        );
+        assert_eq!(
+            classify(r##"<a href="#" class="morelink">more</a>"##),
+            Some(PaginationKind::More)
+        );
+        // 無効な前へが先頭にあっても、予算不足時に有効な次へが候補として残る。
+        let doc = parse(
+            r#"<ul><li class="disabled"><a href="?p=0" rel="prev">前へ</a></li><li>x</li><li><a href="?p=2" rel="next">次へ</a></li></ul>"#,
+        );
+        let items: Vec<NodeId> = doc
+            .children(select(&doc, "ul"))
+            .filter(|&n| doc.is_element(n))
+            .collect();
+        let c = pagination_candidates(&doc, &items);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.first().map(|c| c.index), Some(2));
+    }
+
+    /// AISNAP-12（TASK-16.2）: 巨大な aria-disabled は走査せず無効扱いにしない。
+    #[test]
+    fn aisnap_12_oversized_aria_disabled_ignored() {
+        let pad = " ".repeat(MAX_ARIA_LABEL_BYTES);
+        let html = format!(r#"<a href="?p=1" rel="prev" aria-disabled="{pad}true">前へ</a>"#);
+        assert_eq!(classify(&html), Some(PaginationKind::Previous));
     }
 
     /// AISNAP-12（TASK-16.2）: 対象外の要素・状態は None。
