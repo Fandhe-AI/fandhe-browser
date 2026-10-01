@@ -460,6 +460,51 @@ pub struct CompressedRows {
     pub truncated_rows: usize,
 }
 
+/// 非表示の行・祖先（`tbody`・表自身・その外側を含む）の行を除いたデータ行を文書順で返す。
+///
+/// `build_snapshot` の非表示サブツリー除外に合わせるため、選択の index 空間から先に除く
+/// （除かないと非表示行が `omitted` に混ざる）。
+fn visible_body_rows(doc: &Document, structure: &RegularStructure) -> Vec<NodeId> {
+    structure
+        .body_rows
+        .iter()
+        .copied()
+        .filter(|&row| {
+            !is_hidden_element(doc, row) && !doc.ancestors(row).any(|a| is_hidden_element(doc, a))
+        })
+        .collect()
+}
+
+/// 圧縮せず展開する表・一覧で、優先保持（`AISNAP-12`・TASK-16.4・Issue #107）により
+/// 省略してよい行を文書順で返す。
+///
+/// 呼び出し文脈: `build_snapshot` が、操作要素等を含むため `can_compress` で圧縮できない
+/// 規則的構造に対して呼ぶ。圧縮と違い展開行は ref・state を持つため、`must_keep` が
+/// `true` の行（操作要素など圧縮すると失われる内容を持つ行）は件数上限を超えても
+/// 必ず残し、省略するのは [`compress_rows`] と同じ予算モデル（先頭確保 → ページネーション・
+/// 送信ボタン → 文書順充填）で外れた、`must_keep` でない行だけにする。
+/// 表示対象行が [`MAX_TABLE_ROWS`] 以下なら空を返す。
+pub fn omitted_rows_preserving(
+    doc: &Document,
+    structure: &RegularStructure,
+    must_keep: impl Fn(NodeId) -> bool,
+) -> Vec<NodeId> {
+    let visible = visible_body_rows(doc, structure);
+    if visible.len() <= MAX_TABLE_ROWS {
+        return Vec::new();
+    }
+    let candidates = priority_candidates(doc, &visible);
+    let policy = RetentionPolicy::new(MAX_TABLE_ROWS, TABLE_HEAD_KEEP);
+    let retention = select_retained_with_priority(visible.len(), &policy, &candidates);
+    let kept: std::collections::HashSet<usize> = retention.kept.iter().map(|k| k.index).collect();
+    visible
+        .iter()
+        .enumerate()
+        .filter(|(i, row)| !kept.contains(i) && !must_keep(**row))
+        .map(|(_, row)| *row)
+        .collect()
+}
+
 /// 規則的と判定済みの構造から、データ行を最大 [`MAX_TABLE_ROWS`] 行まで
 /// 優先保持（`AISNAP-12`・TASK-16.4・Issue #107）で選び 1 行 1 文字列へ圧縮する（`AISNAP-2`・`TASK-12.3`・Issue #81）。
 ///
@@ -480,24 +525,14 @@ pub struct CompressedRows {
 /// - 行選択は固定の先頭 20 行ではなく `retention` の予算モデルによる（先頭
 ///   [`TABLE_HEAD_KEEP`] 行の確保 → ページネーション・送信ボタンを含む行 → 文書順の
 ///   充填）。表示対象行が 20 行以下なら全行を文書順で返す。`build_snapshot` 経由では
-///   操作要素を含む表・一覧が圧縮されない（`can_compress`）ため優先候補は空になり、
-///   結果は従来の先頭 20 行と同じになる
+///   操作要素を含む表・一覧が圧縮されない（`can_compress`）ため本関数には渡らず、
+///   展開側で [`omitted_rows_preserving`] が同じ予算モデルを適用する
 /// - 表示対象のデータ行のうち保持されなかった件数を `truncated_rows` に返す
 ///   （非表示行・`tfoot`・ヘッダは数えない。TASK-12.4・Issue #82）
 /// - セル内に `" | "` が含まれると区切りが曖昧になる（エスケープの要否は
 ///   出力形式が決まる統合時に判断する既知の制約）
 pub fn compress_rows(doc: &Document, structure: &RegularStructure) -> CompressedRows {
-    // 非表示の行・祖先（`tbody`・表自身・その外側を含む）の行は、選択の index 空間
-    // から先に除く（`build_snapshot` の非表示サブツリー除外に合わせる。
-    // 除かないと非表示行が `omitted` に混ざる）。
-    let visible: Vec<NodeId> = structure
-        .body_rows
-        .iter()
-        .copied()
-        .filter(|&row| {
-            !is_hidden_element(doc, row) && !doc.ancestors(row).any(|a| is_hidden_element(doc, a))
-        })
-        .collect();
+    let visible = visible_body_rows(doc, structure);
     // 予算内に収まるなら全行が残るため、検出コストを払わず候補を空にする。
     let candidates = if visible.len() > MAX_TABLE_ROWS {
         priority_candidates(doc, &visible)
