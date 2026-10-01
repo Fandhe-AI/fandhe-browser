@@ -363,6 +363,7 @@ dependencies = [
  "fandhe-browser-cdp",
  "fandhe-browser-core",
  "fandhe-browser-profile",
+ "fandhe-browser-render",
  "serde_json",
  "tokio",
 ]

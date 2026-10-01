@@ -10,9 +10,6 @@ description = "fandhe-browser の CLI バイナリ crate。現状は core・prof
 name = "fandhe-browser"
 path = "src/main.rs"
 
-# feature `rendering` は置かない。render crate には Renderer 実装がまだ無く、
-# 追加しても挙動が変わらず実装済みを装うことになるため（REPAIR-3。TASK-33 で追加する）。
-
 # workspace 内 path 依存・承認済みの workspace 依存のみ（registry クレートの追加ではない）。
 # ai は AI API ルータを合成する TASK-19 まで依存に加えない。
 [dependencies]
@@ -25,6 +22,19 @@ fandhe-backend-core = { workspace = true }
 fandhe-backend-routes = { workspace = true }
 # ランタイム構築（#35 で承認済み。feature は workspace 定義のまま）
 tokio = { workspace = true }
+# render（Servo・MPL-2.0）の optional 依存。workspace 内 path 依存（TASK-33.1・#45 で登録済み。registry クレートではない）。
+# `dep:` 経由でのみ有効化し、暗黙の feature は作らない
+fandhe-browser-render = { workspace = true, optional = true }
+
+# TASK-33.4・RENDER-1・MS-1（#459）: render を optional 依存に持つのは cli だけ（spec TASK-33）。
+# `rendering` は既定 feature に含めないオプトイン。`dep:` 接頭辞により、外から有効にできる入口を
+# `rendering` だけにする（暗黙の feature `fandhe-browser-render` を作らない）。
+# 既定ビルドの依存グラフへ render が入らないことは scripts/check-render-isolation.sh の検査 B が担保する。
+# 現状は依存の結線だけで挙動は変わらない（REPAIR-3）。render crate はまだ雛形で `Renderer` 実装を持たず、
+# cli のコードからも参照していない。将来、core::render の描画トレイトへ render 実装を結線し
+# Servo を組み込む（TASK-38・RENDER-1 系）。
+[features]
+rendering = ["dep:fandhe-browser-render"]
 
 [dev-dependencies]
 # テストでの JSON 検証（#419 で承認済み）
