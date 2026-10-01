@@ -136,7 +136,7 @@ else
   TMP_OUTPUT=$(mktemp "${TMPDIR:-/tmp}/competitor-lightpanda-bench.XXXXXX")
   OWN_TMP_OUTPUT="$TMP_OUTPUT"
   set +e
-  cargo bench -q -p fandhe-browser-core --bench competitor_lightpanda >"$TMP_OUTPUT"
+  cargo bench -q -p fandhe-browser-cli --bench competitor_lightpanda >"$TMP_OUTPUT"
   BENCH_EXIT_CODE=$?
   set -e
 fi
