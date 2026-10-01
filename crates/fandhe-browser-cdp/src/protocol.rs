@@ -7,8 +7,8 @@
 //! （WebSocket・HTTP）の型を一切参照せず、フレームとの変換は ws.rs の責務とする。
 //!
 //! 公開入口は無く crate 内部専用。後続タスクは [`builtin_handlers`] へメソッドを
-//! 追加するだけでよい（`Page.navigate` は 42.2、イベント送出は 42.3、`DOM.getDocument`・
-//! `DOM.querySelector` は 42.4・42.5）。
+//! 追加するだけでよい（`Page.navigate` は 42.2 で登録済み、イベント送出は 42.3、
+//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5）。
 //!
 //! # 入力の扱い
 //!
@@ -20,8 +20,8 @@
 //!
 //! # スタブについて
 //!
-//! [`builtin_handlers`] は空で、全メソッドが「method not implemented」（`-32601`）になる。
-//! 未実装メソッドへ成功を返さない（`SEC-2`）。未実装メソッドの正式な応答方針と受信ログは
+//! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）のみ登録済みで、それ以外の
+//! メソッドは「method not implemented」（`-32601`）になる。未実装メソッドへ成功を返さない（`SEC-2`）。未実装メソッドの正式な応答方針と受信ログは
 //! TASK-42.6（`CDP-6`）で確定する。
 
 use std::collections::HashMap;
@@ -30,8 +30,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use fandhe_browser_core::FetchOptions;
 use serde_json::{Map, Value, json};
 
+use crate::page::PageNavigate;
 use crate::server::CdpState;
 use crate::target::SessionId;
 
@@ -292,6 +294,8 @@ pub(crate) enum DispatcherError {
     InvalidMethodName,
     /// 同名メソッドの重複登録（黙って上書きしない）。
     DuplicateMethod,
+    /// 組込みハンドラの初期化に失敗した（例: HTTP クライアント構築失敗）。
+    HandlerInit,
 }
 
 impl fmt::Display for DispatcherError {
@@ -299,6 +303,7 @@ impl fmt::Display for DispatcherError {
         f.write_str(match self {
             Self::InvalidMethodName => "invalid command method name",
             Self::DuplicateMethod => "duplicate command method",
+            Self::HandlerInit => "command handler initialization failed",
         })
     }
 }
@@ -308,12 +313,14 @@ impl std::error::Error for DispatcherError {}
 /// 登録済みハンドラ表。
 type HandlerTable = Vec<(&'static str, Box<dyn CommandHandler>)>;
 
-/// 組込みハンドラ表。現状は空（スタブ。`CDP-1`）。
+/// 組込みハンドラ表。`Page.navigate`（TASK-42.2。`CDP-1`）を登録済み。
 ///
-/// TASK-42.2（`Page.navigate`）・42.4（`DOM.getDocument`）・42.5（`DOM.querySelector`）が
-/// ここへ追加する。
-pub(crate) fn builtin_handlers() -> HandlerTable {
-    Vec::new()
+/// 42.4（`DOM.getDocument`）・42.5（`DOM.querySelector`）がここへ追加する。
+/// `Page.navigate` は既定の `FetchOptions`（内部アドレス拒否）で `Fetcher` を構築する。
+pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
+    let navigate =
+        PageNavigate::new(FetchOptions::default()).map_err(|_| DispatcherError::HandlerInit)?;
+    Ok(vec![("Page.navigate", Box::new(navigate))])
 }
 
 /// メソッド名からハンドラへ振り分けるディスパッチャ。構築後は不変。
@@ -324,7 +331,7 @@ pub(crate) struct Dispatcher {
 impl Dispatcher {
     /// 組込みハンドラ表（[`builtin_handlers`]）から構築する。ws.rs の接続設定から呼ばれる。
     pub fn builtin() -> Result<Self, DispatcherError> {
-        Self::from_handlers(builtin_handlers())
+        Self::from_handlers(builtin_handlers()?)
     }
 
     /// 任意のハンドラ表から構築する。名前の検証と重複検出を行う。
@@ -673,7 +680,7 @@ mod tests {
                 v,
                 json!({"id": 7, "error": {"code": -32601, "message": "method not implemented"}})
             );
-            // 組込み表（現状空）でも同じ。
+            // 組込み表でも未登録メソッドは同じ。
             let b = Dispatcher::builtin().unwrap();
             let v = frames(
                 b.dispatch(&st, r#"{"id":1,"method":"Browser.getVersion"}"#)
