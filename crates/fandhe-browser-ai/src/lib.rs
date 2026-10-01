@@ -73,7 +73,8 @@
 //!   [`retention::pagination`]）・フォーム送信ボタンの優先保持（TASK-16.3・
 //!   Issue #106。[`retention::submit_button`]）も実装済み。
 //!   固定キャップの置換（TASK-16.4・Issue #107。`compress_table::compress_rows`）は
-//!   実装済み、耐性テスト（#108）は未実装
+//!   実装済み。キャップ境界要素の軽微変化耐性テストも実装済み（TASK-16.5・
+//!   Issue #108。`tests/retention.rs`）
 //! - `/ai/*` ルータ向けスナップショット API（`AISNAP-6`・`AISNAP-14`・`CDP-1`
 //!   （API 単体動作は `AISNAP-7`）、`TASK-19`（単体動作確認は `TASK-20`）、
 //!   `MS-4`）
