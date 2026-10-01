@@ -1473,9 +1473,13 @@ pub fn parse_lsof_listen_pids(out: &str, port: u16, max_pids: usize) -> Result<V
 /// しているソケットの所有 PID を返す（TASK-84.6.4・#562。`measure.rs` の
 /// Windows 版 `lookup_port_owner_pids` が呼ぶ。`PERF-3`/`PERF-6`）。
 ///
-/// 行は `TCP <local> <foreign> <state> <pid>` の 5 フィールド。見出し行と状態列
-/// （`LISTENING`）はロケールで翻訳されるため文字列に頼らず、先頭トークンが
-/// `TCP` の行だけを対象にし、LISTEN は外部アドレスのポートが `0` で判定する。
+/// 行は `TCP <local> <foreign> <state...> <pid>`。状態列（`LISTENING`）は
+/// ロケールで翻訳され複数語になり得るため、PID は最終フィールド、状態は
+/// 3 番目以降〜最終直前の連結として扱う。先頭トークンが `TCP` の行だけを対象にし、
+/// LISTEN は外部アドレスのポートが `0` の行から、`BOUND` 行（bind 済み・未 LISTEN。
+/// 外部アドレスが `0.0.0.0:0` になる）を除いて判定する。ローカライズされた
+/// `BOUND` は識別できないが、その場合は余分な PID が混ざり `Mismatch`
+/// （fail-closed）になるだけで誤って所有者一致とはならない。
 /// 契約:
 /// - アドレスは [`parse_lsof_listen_pids`] と同じく 127.0.0.1 宛ての probe に
 ///   応答し得るもの（`127.0.0.1`・`0.0.0.0`・`[::]`・`[::ffff:127.0.0.1]`）
@@ -1498,11 +1502,19 @@ pub fn parse_netstat_listen_pids(
         if fields.first().copied() != Some("TCP") {
             continue;
         }
-        let (Some(local), Some(foreign), Some(pid_text)) =
-            (fields.get(1), fields.get(2), fields.get(4))
-        else {
+        // 状態列が最低 1 語あるため 5 フィールド以上が必要。
+        let (Some(local), Some(foreign), Some(pid_text), true) = (
+            fields.get(1),
+            fields.get(2),
+            fields.last(),
+            fields.len() >= 5,
+        ) else {
             return Err(format!("malformed netstat TCP line: {line:?}"));
         };
+        let state = fields
+            .get(3..fields.len() - 1)
+            .map(|s| s.join(" ").to_uppercase())
+            .unwrap_or_default();
         let port_of = |addr: &str| -> Result<(String, u16), String> {
             let (host, port_text) = addr
                 .rsplit_once(':')
@@ -1517,7 +1529,7 @@ pub fn parse_netstat_listen_pids(
         let pid: u32 = pid_text
             .parse()
             .map_err(|_| format!("invalid pid in netstat line: {line:?}"))?;
-        if foreign_port != 0 || local_port != port {
+        if foreign_port != 0 || local_port != port || state == "BOUND" {
             continue;
         }
         if pid == 0 {
@@ -3904,6 +3916,18 @@ mod tests {
     fn parse_netstat_listen_pids_localized_output() {
         let out = "Aktive Verbindungen\n\n  Proto  Lokale Adresse         Remoteadresse          Status           PID\n  TCP    0.0.0.0:9222           0.0.0.0:0              ABHÖREN         321\n";
         assert_eq!(parse_netstat_listen_pids(out, 9222, 8), Ok(vec![321]));
+    }
+
+    #[test]
+    fn parse_netstat_listen_pids_excludes_bound_rows() {
+        let out = "  TCP    0.0.0.0:9222           0.0.0.0:0              BOUND           777\n  TCP    0.0.0.0:9222           0.0.0.0:0              LISTENING       888\n";
+        assert_eq!(parse_netstat_listen_pids(out, 9222, 8), Ok(vec![888]));
+    }
+
+    #[test]
+    fn parse_netstat_listen_pids_multi_word_state() {
+        let out = "  TCP    127.0.0.1:9222         0.0.0.0:0              EN ECOUTE       654\n";
+        assert_eq!(parse_netstat_listen_pids(out, 9222, 8), Ok(vec![654]));
     }
 
     #[test]
