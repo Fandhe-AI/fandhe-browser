@@ -20,7 +20,7 @@
 //!
 //! # スタブについて
 //!
-//! [`builtin_handlers`] は空で、全メソッドが「method not implemented」（`-32601`）になる。
+//! [`builtin_handlers`] に未登録のメソッドは「method not implemented」（`-32601`）になる。
 //! 未実装メソッドへ成功を返さない（`SEC-2`）。未実装メソッドの正式な応答方針と受信ログは
 //! TASK-42.6（`CDP-6`）で確定する。
 
@@ -65,6 +65,8 @@ impl CdpError {
     pub const INVALID_PARAMS: Self = Self::new(-32602, "invalid params");
     /// ハンドラ内部エラー（CDP の server error 帯）。
     pub const SERVER_ERROR: Self = Self::new(-32000, "server error");
+    /// 直近の navigate 結果が無い（未 navigate・取得中・取得失敗を区別しない。`DOM.getDocument`）。
+    pub const NO_DOCUMENT: Self = Self::new(-32000, "no document loaded");
 
     const fn new(code: i64, message: &'static str) -> Self {
         Self { code, message }
@@ -308,12 +310,11 @@ impl std::error::Error for DispatcherError {}
 /// 登録済みハンドラ表。
 type HandlerTable = Vec<(&'static str, Box<dyn CommandHandler>)>;
 
-/// 組込みハンドラ表。現状は空（スタブ。`CDP-1`）。
+/// 組込みハンドラ表。登録済みは `DOM.getDocument`（42.4）のみ（`CDP-1`）。
 ///
-/// TASK-42.2（`Page.navigate`）・42.4（`DOM.getDocument`）・42.5（`DOM.querySelector`）が
-/// ここへ追加する。
+/// TASK-42.2（`Page.navigate`）・42.5（`DOM.querySelector`）がここへ追加する。
 pub(crate) fn builtin_handlers() -> HandlerTable {
-    Vec::new()
+    vec![("DOM.getDocument", Box::new(crate::dom::DomGetDocument))]
 }
 
 /// メソッド名からハンドラへ振り分けるディスパッチャ。構築後は不変。

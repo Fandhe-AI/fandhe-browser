@@ -15,10 +15,11 @@
 //! 以下は未実装で、実装済みを装う公開 API・ダミー実装は置かない
 //! （`code-comment-style.md`・REPAIR-3）。
 //!
-//! - JSON-RPC ディスパッチャ（`protocol.rs`。TASK-42.1）は実装済みだが組込みメソッド表は空
+//! - JSON-RPC ディスパッチャ（`protocol.rs`。TASK-42.1）は実装済みで、組込みメソッド表の登録済みは `DOM.getDocument`（TASK-42.4。実データ反映）のみ
 //! - 個別 CDP メソッドのハンドラ（`CDP-1`/`CDP-5`/`CDP-6`/`CDP-7`、`TASK-42.2`〜`42.6`、`MS-4`）
 
 mod discovery;
+mod dom;
 mod protocol;
 pub mod server;
 pub mod target;
