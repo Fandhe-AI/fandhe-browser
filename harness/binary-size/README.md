@@ -8,22 +8,14 @@ SSOT（`docs/spec` の `04-behavior/`）を参照すること
 
 親 Issue #48（TASK-34）。兄弟 Issue は #465（TASK-34.1・依存グラフ検査）、#467（TASK-34.3・CI 組込み）、#468（TASK-34.4・確認記録）の 3 件。CI（GitHub Actions）への組込みは #467（TASK-34.3）で完了し、`.github/workflows/ci.yml` の `binary-size` ジョブ（3 OS）が実行する。`make ci` には組み込まない（下記「`make ci` に含めない理由」参照）。
 
-## 計測対象はまだ存在しない（重要）
+## 計測対象と fail-closed 契約
 
-本 Issue の時点で workspace に `fandhe-browser-cli` crate は無い（TASK-41.5・
-Issue #174 が追加予定）。そのため `check-binary-size.sh --package
-fandhe-browser-cli`（既定 package）は「package が見つからない」として `skip:`
-を出し exit 0 になる（回帰ゲートは実質的に無効）。この skip は既定 package
-（`fandhe-browser-cli`）の不在に限定される。`--package` / `BINARY_SIZE_PACKAGE`
-で既定値以外を明示指定した場合に package が見つからないときは、誤記・設定の
-ずれを「未導入のためスキップ」として握りつぶさないよう exit 2（入力・使用
-エラー）にする。
-
-**skip の解除条件**: #174 が `crates/fandhe-browser-cli/` を追加すると、
-`cargo metadata` に package が現れるようになり、このスクリプトは自動的に
-package モードのビルド・判定経路へ進む（本ファイル・`Makefile` 側の変更は
-不要）。以後、計測できない状態（`cargo build` 失敗・実行ファイル不在等）は
-すべて fail-closed（exit 2）になる。
+既定 package `fandhe-browser-cli` は workspace に存在する（TASK-41.5・
+Issue #174・#616 で追加済み）。package が workspace に無い場合は、既定値かどうかに
+関係なく exit 2（入力・使用エラー）にする。cli の削除・リネームや
+`--package` / `BINARY_SIZE_PACKAGE` の誤記を「未導入のためスキップ」として
+黙って通過させないためである（REPAIR-5・#633）。計測できない状態
+（`cargo build` 失敗・実行ファイル不在等）もすべて exit 2 になる。
 
 ## 上限値と根拠
 
@@ -107,9 +99,9 @@ harness/binary-size/check-binary-size.sh \
 
 | exit | 意味 |
 | ---- | ---- |
-| 0 | 合格（すべてのバイナリが上限以下）、または package モードで既定 package（`fandhe-browser-cli`）が workspace に無い（`skip:`） |
+| 0 | 合格（すべてのバイナリが上限以下） |
 | 1 | 不合格（1 つ以上のバイナリが上限を超えた） |
-| 2 | 入力・使用エラー（引数不正・`--limit`/`--host`/`--bin`/`--package` の形式不正・ファイル不在・`cargo`/`jq`/`rustc` 未導入・`cargo metadata`/`cargo build` 失敗・既定値以外の package が workspace に無い・bin target 不在・実行ファイル抽出結果 0 件） |
+| 2 | 入力・使用エラー（引数不正・`--limit`/`--host`/`--bin`/`--package` の形式不正・ファイル不在・`cargo`/`jq`/`rustc` 未導入・`cargo metadata`/`cargo build` 失敗・package が workspace に無い・bin target 不在・実行ファイル抽出結果 0 件） |
 
 サイズが上限ちょうど（`bytes == limit`）は合格（「超えたら」fail）。
 
@@ -131,8 +123,8 @@ make check-binary-size
 TASK-34.3（#467）で導入。3 OS（ubuntu/macos/windows）の各ネイティブランナーで
 実行し、`make` は使わない（windows-latest に `make` がある保証がないため。
 `compat-regression`・`bench-record-selftest` と同じ方針でスクリプトを直接
-呼ぶ）。cache も使わない（現状は package skip のためビルド自体が起きず、
-windows-latest には cache prune の既知問題があるため）。
+呼ぶ）。cache は使わない（windows-latest には cache prune の既知問題があるため。
+cache 導入は別途検討する）。
 
 上限値・package 名は `Makefile` の `BINARY_SIZE_LIMIT_BYTES` /
 `BINARY_SIZE_PACKAGE` を単一真実源とし、ジョブ側では値を重複定義しない。
@@ -141,10 +133,8 @@ windows-latest には cache prune の既知問題があるため）。
 
 self-test（`self-test.sh`）を実判定の前に毎回実行し、上限超過（合成
 201 bytes > limit 200）で確実に exit 1 になることをジョブログへ証跡として
-残す。実判定の出力（`binary-size: ...` 行、または `skip:` 行）はジョブログ
-とステップサマリー（表形式）の両方に出す。package skip の間は
-`::notice::` とサマリーへその旨を明示し、休眠状態であることを分かるように
-する。
+残す。実判定の出力（`binary-size: ...` 行）はジョブログとステップサマリー
+（表形式）の両方に出す。
 
 branch protection の必須チェックに加える場合は OS 数分
 （`binary-size (ubuntu-latest)` / `(macos-latest)` / `(windows-latest)` の

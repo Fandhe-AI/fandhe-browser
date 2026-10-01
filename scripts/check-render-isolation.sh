@@ -8,8 +8,8 @@
 #
 # 検査は 2 本立て:
 #   A. workspace 全体（render crate 自身を --exclude して走査の根から外す）
-#   B. fandhe-browser-cli の既定 feature（TASK-41.5・#174 で crate 追加予定。
-#      未追加の間は「検査対象の依存グラフ自体が無い」ため skip する）
+#   B. fandhe-browser-cli の既定 feature（TASK-41.5・#174 で crate 追加済み。
+#      cli の manifest が無い場合は NG とする。fail-closed・REPAIR-5・#633）
 #
 # `cargo tree` は既定でホストのターゲットに絞って依存グラフを表示するため、
 # cfg(windows)/cfg(unix) の target 依存は当該 OS のランナーでしか現れない。
@@ -59,6 +59,19 @@ detect() {
     return 1
   fi
   echo "OK: ${label} の依存グラフに Servo 系クレートは含まれていません"
+  return 0
+}
+
+# 検査 B の前提確認: cli の manifest が無ければ NG を標準エラーへ出して 1 を返す。
+# cli の削除・リネーム・manifest 破損で検査 B が「未導入のため skip」として
+# 黙って通過する fail-open を防ぐ（REPAIR-5・RENDER-1・#633）。
+# $1 = cli manifest のパス。検査 B 本体と self_test() から呼ばれる。
+require_cli_manifest() {
+  local manifest="$1"
+  if [ ! -f "$manifest" ]; then
+    echo "NG: ${manifest} が見つからないため fandhe-browser-cli（既定 feature）の検査を実行できません" >&2
+    return 1
+  fi
   return 0
 }
 
@@ -115,6 +128,26 @@ self_test() {
     echo "OK(self-test): 大量の無関係な行だけの場合は誤検出しませんでした"
   fi
 
+  # cli manifest の不在は NG（fail-closed・#633）。存在側は自スクリプトで代用し、
+  # 実リポの cli の有無に依存させない。
+  local err_missing
+  if err_missing=$(require_cli_manifest "crates/__does_not_exist__/Cargo.toml" 2>&1 >/dev/null); then
+    echo "NG(self-test): cli manifest 不在を NG にできませんでした（fail-open 回帰）" >&2
+    failures=$((failures + 1))
+  elif [[ "$err_missing" != *"が見つからないため fandhe-browser-cli"* ]]; then
+    echo "NG(self-test): cli manifest 不在の NG メッセージが想定と異なります: ${err_missing}" >&2
+    failures=$((failures + 1))
+  else
+    echo "OK(self-test): cli manifest 不在を正しく NG にしました"
+  fi
+
+  if ! require_cli_manifest "${BASH_SOURCE[0]}" >/dev/null 2>&1; then
+    echo "NG(self-test): 存在する manifest を誤って NG にしました" >&2
+    failures=$((failures + 1))
+  else
+    echo "OK(self-test): 存在する manifest は NG にしませんでした"
+  fi
+
   if [ "$failures" -ne 0 ]; then
     echo "NG: self-test に ${failures} 件の失敗があります" >&2
     return 1
@@ -166,9 +199,9 @@ else
   fi
 fi
 
-# 検査 B: fandhe-browser-cli の既定 feature（TASK-41.5・#174 で crate 追加予定）
-if [ ! -f crates/fandhe-browser-cli/Cargo.toml ]; then
-  notice "skip: crates/fandhe-browser-cli/Cargo.toml が未追加のため cli 既定 feature 検査をスキップ（#174 完了後に自動で有効化）"
+# 検査 B: fandhe-browser-cli の既定 feature（TASK-41.5・#174）。manifest 不在は NG
+if ! require_cli_manifest crates/fandhe-browser-cli/Cargo.toml; then
+  STATUS=1
 else
   if ! OUT_B=$(cargo tree -p fandhe-browser-cli -e normal,build,dev ${CARGO_TREE_LOCKED_ARGS[@]+"${CARGO_TREE_LOCKED_ARGS[@]}"}); then
     echo "NG: cargo tree（fandhe-browser-cli）の実行に失敗しました" >&2
