@@ -29,9 +29,10 @@ Issue #174・#616 で追加済み）。package が workspace に無い場合は�
   リンク）は参考下限であり、ゲートにはしない。fetch・TLS・HTML パーサー・
   CDP サーバーを含む実バイナリでは到達しない水準のため。参考値として PoC-2 の
   プロトタイプ実測は 2.11MB
-- JS エンジン: 現状の既定ビルド（`fandhe-browser-js` の `default = []`）は
-  `js-v8` 無効で V8 を含まない。V8 を同梱した場合の増分は PoC-3 実測
-  +40.81MB（TASK-27 の記述）で、同梱しても上限内に収まる見込み
+- JS エンジン: 既定ビルドは `fandhe-browser-cli` の `default = ["js-v8"]`
+  （TASK-30.2・#160）により V8 を同梱する。V8 の増分は PoC-3 実測
+  +40.81MB（TASK-27 の記述）で、上限内に収まるかは `make check-binary-size`
+  の実測で判定する
 - release プロファイル: 現状はルート `Cargo.toml` の `[profile.release]` が
   `panic = "abort"` のみで、`CORE-2` の前提（`opt-level = "z"`・`lto = true`・
   `codegen-units = 1`・`strip = true`）が未適用。計測値は正規構成より大きく
@@ -154,6 +155,7 @@ branch protection の必須チェックに加える場合は OS 数分
   の `[profile.release]` は `panic = "abort"` のみ）。workspace 全体に影響する
   変更のためユーザー判断のうえ別 Issue で扱う（関連: TASK-27 #146、
   TASK-94.1 #368）
-- spec（`js-engine.md`・TASK-27）は「既定ビルド = V8 のみ同梱」とするが、
-  `fandhe-browser-js` は `default = []`（`js-v8` は既定で無効）。spec と実装の
-  食い違いはユーザーへ報告済み
+- spec（`js-engine.md`・TASK-27）の「既定ビルド = V8 のみ同梱」は、
+  `fandhe-browser-cli` の `default = ["js-v8"]`（TASK-30.2・#160）で解消済み。
+  `fandhe-browser-js` / core の `default = []` は意図どおり（feature 統合で
+  軽量ビルドから V8 を外せなくなるのを防ぐため）
