@@ -766,11 +766,11 @@ fn try_reserve(counter: &AtomicUsize, additional: usize, limit: usize) -> bool {
 fn release_reservation(counter: &AtomicUsize, amount: usize) {
     // `fetch_sub` は `amount` がカウンタの現在値を超えると（V8 の契約
     // 違反や本関数のバグにより）アンダーフローして wrap するが、
-    // `fetch_update` と `saturating_sub` を使い、万一そのような呼び出しが
+    // `try_update` と `saturating_sub` を使い、万一そのような呼び出しが
     // あっても 0 未満にはならず fail-closed（カウンタが 0 に留まり、以後の
     // 確保はより厳しく制限される側に倒れる）にする。advisor 指摘（V8 の
     // 契約はこれを防ぐはずだが、契約違反時にも安全側に倒す多層防御）。
-    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+    let _ = counter.try_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(amount))
     });
 }

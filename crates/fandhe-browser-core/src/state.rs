@@ -189,7 +189,7 @@ impl NavigationState {
         let mut guard = self.lock();
         let next = self
             .generation
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
             .map(|prev| NavigationGeneration(prev.saturating_add(1)))
             .map_err(|_| StateError::GenerationExhausted)?;
         // 前ページの結果を同じロック内で無効化する。残すと、取得中や取得失敗後に
@@ -261,7 +261,7 @@ impl NavigationState {
         if advance {
             // ロックを保持しているため、判定から加算までに他の begin は割り込めない。
             self.generation
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
                 .map_err(|_| StateError::GenerationExhausted)?;
         }
         *guard = Some(value);
