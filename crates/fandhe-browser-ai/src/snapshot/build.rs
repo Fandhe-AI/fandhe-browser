@@ -43,7 +43,6 @@ use fandhe_browser_core::dom::{Children, Document, NodeId};
 
 use crate::compress_table::{
     TableDetection, assign_header_refs, compress_rows, detect_regular_structure,
-    omitted_rows_preserving,
 };
 use crate::data_leaf::{DataLeafKind, classify_data_leaf};
 
@@ -151,8 +150,8 @@ fn subtree_fits_depth(doc: &Document, container: NodeId, max_rel: usize) -> bool
 ///
 /// 圧縮は子孫の展開（ref・state・accessible name の付与）を省略するため、
 /// 次の場合は情報が失われる。このときは圧縮せず通常の展開を維持する
-/// （従来の Snapshot と同じ結果。ただし行数が上限超過の規則的構造は、失われる内容を持たない
-/// 行だけを `omitted_rows_preserving` で省略する。AISNAP-12・TASK-16.4）。
+/// （従来の Snapshot と同じ結果。行の可視テキストを失わないよう、行数が多くても行は省略しない。
+/// AISNAP-12・TASK-16.4）。
 /// - `tfoot` 行がある（圧縮表現は本文行のみで、合計額などフッターの可視情報が消える）。
 /// - 表・一覧の中に操作要素（リンク・ボタン・入力欄等）がある（ref と state が消える）。
 /// - 表に `caption` がある（圧縮表現は caption を保持せず、表題が Snapshot から消える）。
@@ -166,17 +165,6 @@ fn can_compress(
     structure: &crate::compress_table::RegularStructure,
 ) -> bool {
     structure.footer_rows.is_empty() && !has_lossy_descendant(doc, container)
-}
-
-/// 行 `row` 自身または子孫に、省略すると失われる内容（操作要素・見出し等）があるか。
-///
-/// 展開側の優先保持（`omitted_rows_preserving`）で、true の行は上限を超えても残す。
-fn row_has_lossy_content(doc: &Document, row: NodeId) -> bool {
-    is_interactive_element(doc, row)
-        || is_semantic_structure_element(doc, row)
-        || has_non_text_name_source(doc, row)
-        || has_non_cell_data_leaf(doc, row)
-        || has_lossy_descendant(doc, row)
 }
 
 /// `container` の子孫（描画対象のみ）に、圧縮すると失われる要素があるかを反復走査で返す。
@@ -343,8 +331,6 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
     let mut refs = RefAllocator::new();
     let mut truncated = false;
     let mut compress_budget = MAX_TOTAL_COMPRESS_SCAN_NODES;
-    // 優先保持で展開から省略する行（展開側の上限適用。AISNAP-12・TASK-16.4）。
-    let mut omitted_rows: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
 
     let root_id = doc.root();
     let root_role = compute_role(doc, root_id)
@@ -375,7 +361,7 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
             }
             continue;
         };
-        if !doc.is_element(child) || is_excluded(doc, child) || omitted_rows.contains(&child) {
+        if !doc.is_element(child) || is_excluded(doc, child) {
             continue;
         }
         let (parent_depth, parent_ref) = (top.depth, top.elem_ref);
@@ -424,20 +410,10 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
         } else {
             None
         };
-        // 圧縮できない（操作要素等を含む）規則的構造は展開を維持しつつ、上限超過分の
-        // うち失われる内容を持たない行だけを省略する（AISNAP-12・TASK-16.4）。
-        // 省略した行数は Node::omitted_rows に残し、無通知で値が消えないようにする。
-        let compressible = regular.filter(|s| {
-            let ok = can_compress(doc, child, s);
-            if !ok {
-                let omitted =
-                    omitted_rows_preserving(doc, s, |row| row_has_lossy_content(doc, row));
-                truncated |= !omitted.is_empty();
-                node.omitted_rows = omitted.len();
-                omitted_rows.extend(omitted);
-            }
-            ok
-        });
+        // 圧縮できない（操作要素等を含む）規則的構造は展開を維持する。展開行は td 等の
+        // 可視テキストを持ち、省略すると値が復元できなくなるため行は省略しない
+        // （件数のみの omitted_rows では内容を残せない。AISNAP-12・TASK-16.4）。
+        let compressible = regular.filter(|s| can_compress(doc, child, s));
         if let Some(structure) = compressible {
             let headers = assign_header_refs(doc, &index, &structure, elem_ref, &mut refs)?;
             let compressed = compress_rows(doc, &structure);
@@ -921,10 +897,10 @@ mod tests {
         assert!(!has_table_summary(&s));
     }
 
-    /// AISNAP-12・TASK-16.4: 操作要素を含み圧縮されない表でも、上限超過分のうち
-    /// 失われる内容を持たない行だけを省略し、操作要素を持つ行は ref を保って残す。
+    /// AISNAP-12・TASK-16.4: 操作要素を含み圧縮されない表は、行数が上限を超えても
+    /// 通常行の可視テキストを省略せず全行を展開する（値の消失を防ぐ）。
     #[test]
-    fn aisnap_12_expanded_table_prunes_only_lossless_rows() {
+    fn aisnap_12_expanded_table_keeps_all_rows() {
         let mut html = String::from("<table><thead><tr><th>n</th></tr></thead><tbody>");
         for i in 0..40 {
             if i == 30 {
@@ -939,15 +915,9 @@ mod tests {
         let links: Vec<_> = nodes.iter().filter(|n| n.role == "link").collect();
         assert_eq!(links.len(), 1);
         assert!(links[0].r#ref.is_some());
-        let texts = nodes.iter().filter(|n| n.role == "cell").count();
-        // 通常行は先頭 5 行 + 充填で 19 行、リンク行は上限外で追加される。
-        assert!(texts < 40, "plain rows beyond the cap are omitted: {texts}");
-        assert!(s.truncated);
-        // 省略した行数は表ノードに残る（無通知で値が消えない）。
-        let table = nodes
-            .iter()
-            .find(|n| n.omitted_rows > 0)
-            .expect("省略件数を持つ表ノードがある");
-        assert_eq!(table.omitted_rows, 40 - 1 - (texts - 1));
+        let rows = nodes.iter().filter(|n| n.role == "row").count();
+        assert_eq!(rows, 41, "header row plus all 40 body rows");
+        assert!(nodes.iter().all(|n| n.omitted_rows == 0));
+        assert!(!s.truncated);
     }
 }
