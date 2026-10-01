@@ -20,7 +20,8 @@
 use std::collections::HashSet;
 
 use fandhe_browser_ai::snapshot::{
-    CheckedState, DataLeafKind, Node, Snapshot, State, build_snapshot, ref_signature,
+    CheckedState, DataLeafKind, HeaderCell, Node, Snapshot, State, TableRow, TableSummary,
+    build_snapshot, ref_signature,
 };
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
 
@@ -86,11 +87,18 @@ fn assert_common(html: &str, s: &Snapshot) {
     assert_eq!(s.tree.r#ref, None);
     assert!(!s.truncated);
     assert_eq!(&snap(html), s, "同じ HTML は同じ Snapshot になる");
-    let refs: Vec<&str> = all_nodes(&s.tree)
-        .into_iter()
+    let nodes = all_nodes(&s.tree);
+    let mut refs: Vec<&str> = nodes
+        .iter()
         .skip(1)
         .map(|nd| nd.r#ref.as_deref().expect("ルート以外は ref を持つ"))
         .collect();
+    // 圧縮した表のヘッダ ref も一意性の検査対象に含める（AISNAP-2・TASK-12.5）。
+    for nd in &nodes {
+        if let Some(t) = &nd.table {
+            refs.extend(t.header.iter().map(|h| h.r#ref.as_str()));
+        }
+    }
     assert!(
         refs.iter().all(|r| is_ref_shaped(r)),
         "ref の形状: {refs:?}"
@@ -121,15 +129,11 @@ fn aisnap_1_article_snapshot_structure() {
                     vec![n("link", "公式ドキュメント", "ed45c1d22b4e186f4", vec![])],
                 ),
                 n("heading", "要点", "ee0714a175d20c8b2", vec![]),
-                n(
-                    "list",
-                    "",
-                    "ecc842c965dec143a",
-                    vec![
-                        n("listitem", "", "ef17dbedadbdb41bc", vec![]),
-                        n("listitem", "", "ef17dbedadbdb41bc-2", vec![]),
-                    ],
-                ),
+                n("list", "", "ecc842c965dec143a", vec![]).with_table(TableSummary::new(
+                    vec![],
+                    vec![TableRow::new("所有権", false), TableRow::new("借用", false)],
+                    0,
+                )),
                 n("contentinfo", "", "ec0aa17bccd809080", vec![]),
             ],
         )],
@@ -144,11 +148,8 @@ fn aisnap_1_article_snapshot_structure() {
     let link = child(child(body, 2), 0);
     assert_eq!(link.role, "link");
     assert_eq!(link.r#ref.as_deref(), Some("ed45c1d22b4e186f4"));
-    // 同 role・同 name の listitem は `-2` で区別される（AISNAP-10）。
-    assert_eq!(
-        child(child(body, 4), 1).r#ref.as_deref(),
-        Some("ef17dbedadbdb41bc-2")
-    );
+    // 規則的な ul は子孫を展開せず 1 ノードへ圧縮される（AISNAP-2・TASK-12.5）。
+    assert_eq!(child(body, 4).children.len(), 0);
 }
 
 /// `AISNAP-1`（TASK-11.8・Issue #77・MS-2）: フォームページの構造・state を具体値で固定し、
@@ -229,10 +230,51 @@ fn aisnap_1_form_snapshot_structure() {
     }
 }
 
-/// `AISNAP-1`（TASK-11.8・Issue #77・MS-2）: 表ページの構造を具体値で固定する。
+/// `AISNAP-2`（TASK-12.5・Issue #83・MS-2）: 規則的な表は子孫を展開せず、ヘッダ
+/// （個別 ref）・圧縮行・超過行数を持つ 1 ノードになる（受入基準）。
+/// ヘッダ ref の scope が rowgroup/row から table に変わったため、TASK-11.8 当時と
+/// リテラルが異なる（AISNAP-10）。rowgroup・row・cell は圧縮で消える。
 #[test]
-fn aisnap_1_table_snapshot_structure() {
+fn aisnap_2_table_snapshot_is_compressed() {
     let s = snap(TABLE);
+    let expected = Snapshot::new(Node::new("document", "成績表").with_children(vec![n(
+        "generic",
+        "",
+        "e65477c205c50fefb",
+        vec![n(
+            "generic",
+            "",
+            "e9c1602d3222315df",
+            vec![
+                n("table", "", "e7c96b5162ee5821b", vec![]).with_table(TableSummary::new(
+                    vec![
+                        HeaderCell::new("columnheader", "名前", "ed7fea8519e468d01")
+                            .with_data_leaf(DataLeafKind::TableCell),
+                        HeaderCell::new("columnheader", "点数", "ee748caeae6097f8b")
+                            .with_data_leaf(DataLeafKind::TableCell),
+                    ],
+                    vec![TableRow::new("太郎 | 80", false)],
+                    0,
+                )),
+            ],
+        )],
+    )]));
+    assert_eq!(s, expected);
+    assert_common(TABLE, &s);
+    let table = child(child(child(&s.tree, 0), 0), 0);
+    assert_eq!(table.role, "table");
+    assert_eq!(table.data_leaf, None);
+}
+
+/// 規則的でない表（rowspan 付き）。従来どおり子孫へ展開される。
+const IRREGULAR_TABLE: &str = r#"<!DOCTYPE html><html><head><title>成績表</title></head><body><table><thead><tr><th>名前</th><th>点数</th></tr></thead><tbody><tr><td rowspan="2">太郎</td><td>80</td></tr></tbody></table></body></html>"#;
+
+/// `AISNAP-1`・`AISNAP-2`（TASK-11.8・TASK-12.5・Issue #83）: 規則的でない表は
+/// 圧縮されず（`table == None`）、rowgroup・row・cell が具体値で展開される。
+#[test]
+fn aisnap_2_irregular_table_snapshot_is_expanded() {
+    let s = snap(IRREGULAR_TABLE);
+    let tc = DataLeafKind::TableCell;
     let expected = Snapshot::new(Node::new("document", "成績表").with_children(vec![n(
         "generic",
         "",
@@ -255,11 +297,11 @@ fn aisnap_1_table_snapshot_structure() {
                             "名前点数",
                             "e3b9ec063bec3ce0d",
                             vec![
-                                    n("columnheader", "名前", "e895cf72c839b312e", vec![])
-                                        .with_data_leaf(DataLeafKind::TableCell),
-                                    n("columnheader", "点数", "e4c3266d420a99a2c", vec![])
-                                        .with_data_leaf(DataLeafKind::TableCell),
-                                ],
+                                n("columnheader", "名前", "e895cf72c839b312e", vec![])
+                                    .with_data_leaf(tc),
+                                n("columnheader", "点数", "e4c3266d420a99a2c", vec![])
+                                    .with_data_leaf(tc),
+                            ],
                         )],
                     ),
                     n(
@@ -271,11 +313,9 @@ fn aisnap_1_table_snapshot_structure() {
                             "太郎80",
                             "e603d30fc95b8b612",
                             vec![
-                                    n("cell", "太郎", "e8c54b60bbb2904e5", vec![])
-                                        .with_data_leaf(DataLeafKind::TableCell),
-                                    n("cell", "80", "eb3df38593dc1377c", vec![])
-                                        .with_data_leaf(DataLeafKind::TableCell),
-                                ],
+                                n("cell", "太郎", "e8c54b60bbb2904e5", vec![]).with_data_leaf(tc),
+                                n("cell", "80", "eb3df38593dc1377c", vec![]).with_data_leaf(tc),
+                            ],
                         )],
                     ),
                 ],
@@ -283,11 +323,176 @@ fn aisnap_1_table_snapshot_structure() {
         )],
     )]));
     assert_eq!(s, expected);
-    assert_common(TABLE, &s);
-
+    assert_common(IRREGULAR_TABLE, &s);
     let table = child(child(child(&s.tree, 0), 0), 0);
-    assert_eq!(table.role, "table");
-    assert_eq!(child(child(child(table, 0), 0), 1).name, "点数");
+    assert_eq!(table.table, None);
+}
+
+/// 表を取り出す（`body` 直下の最初の子）。
+fn first_table(s: &Snapshot) -> &Node {
+    child(child(child(&s.tree, 0), 0), 0)
+}
+
+fn summary(s: &Snapshot) -> &TableSummary {
+    first_table(s).table.as_ref().expect("圧縮された表である")
+}
+
+/// ページ全体の HTML を作る。
+fn page(body: &str) -> String {
+    format!("<!DOCTYPE html><html><head><title>t</title></head><body>{body}</body></html>")
+}
+
+/// `AISNAP-2`（TASK-12.5・Issue #83）: thead なし 25 行の表は 20 行に圧縮され、
+/// 超過 5 行が `truncated_rows` になる。
+#[test]
+fn aisnap_2_large_table_reports_truncated_rows() {
+    let rows: String = (1..=25)
+        .map(|i| format!("<tr><td>r{i}</td><td>{i}</td></tr>"))
+        .collect();
+    let html = page(&format!("<table>{rows}</table>"));
+    let s = snap(&html);
+    let t = summary(&s);
+    assert_eq!(t.header, vec![]);
+    assert_eq!(t.rows.len(), 20);
+    assert_eq!(t.rows.first(), Some(&TableRow::new("r1 | 1", false)));
+    assert_eq!(t.rows.get(19), Some(&TableRow::new("r20 | 20", false)));
+    assert_eq!(t.truncated_rows, 5);
+    assert!(!s.truncated, "行の省略では Snapshot::truncated を立てない");
+    assert!(first_table(&s).children.is_empty());
+}
+
+/// `AISNAP-2`（Issue #631）: title 付きセルだけを理由に表の圧縮は拒否されない。
+#[test]
+fn aisnap_2_titled_cells_table_is_compressed() {
+    let html = page(
+        "<table><tr><th>名前</th><th>値</th></tr>\
+         <tr><td title=\"tip\">A</td><td title=\"t2\">80</td></tr></table>",
+    );
+    let s = snap(&html);
+    let t = summary(&s);
+    assert_eq!(t.header.len(), 2);
+    assert_eq!(t.rows.first(), Some(&TableRow::new("A | 80", false)));
+}
+
+/// `AISNAP-2`（TASK-12.5・Issue #83）: hidden / aria-hidden の表は Node にならない。
+#[test]
+fn aisnap_2_hidden_tables_are_excluded() {
+    let html = page(
+        "<table hidden><tr><td>秘密1</td></tr></table>\
+         <table aria-hidden=\"true\"><tr><td>秘密2</td></tr></table><p>本文</p>",
+    );
+    let s = snap(&html);
+    let nodes = all_nodes(&s.tree);
+    assert!(
+        nodes
+            .iter()
+            .all(|nd| nd.table.is_none() && nd.role != "table")
+    );
+    assert!(nodes.iter().all(|nd| !nd.name.contains("秘密")));
+}
+
+/// `AISNAP-2`・`AISNAP-10`（TASK-12.5・Issue #83）: id が異なる同形の表 2 つで
+/// ヘッダ ref が互いに異なる。
+#[test]
+fn aisnap_10_headers_of_distinct_tables_have_distinct_refs() {
+    let one = |id: &str| {
+        format!(
+            "<table id=\"{id}\"><thead><tr><th>名前</th></tr></thead><tr><td>a</td></tr></table>"
+        )
+    };
+    let html = page(&format!("{}{}", one("t1"), one("t2")));
+    let s = snap(&html);
+    let tables: Vec<&Node> = all_nodes(&s.tree)
+        .into_iter()
+        .filter(|nd| nd.table.is_some())
+        .collect();
+    assert_eq!(tables.len(), 2);
+    let refs: Vec<&str> = tables
+        .iter()
+        .flat_map(|nd| {
+            let t = nd.table.as_ref().expect("圧縮済み");
+            t.header.iter().map(|h| h.r#ref.as_str())
+        })
+        .collect();
+    assert_eq!(refs.len(), 2);
+    assert_ne!(refs.first(), refs.get(1));
+    assert_common(&html, &s);
+}
+
+/// `AISNAP-2`（TASK-12.5・Issue #83）: 圧縮した行の中の hidden 入力の値は行テキストへ漏れない。
+#[test]
+fn aisnap_2_hidden_input_value_does_not_leak_into_row() {
+    let html = page(
+        "<table><tr><td>a<input type=\"hidden\" value=\"dummy-secret\"></td><td>b</td></tr></table>",
+    );
+    let s = snap(&html);
+    let t = summary(&s);
+    assert_eq!(t.rows, vec![TableRow::new("a | b", false)]);
+}
+
+/// `AISNAP-2`（TASK-12.5・Issue #83）: ヘッダ name の打ち切りは `Snapshot::truncated` を
+/// 立てる。短いセルだけの表では立たない。
+#[test]
+fn aisnap_2_header_name_truncation_marks_snapshot() {
+    let long = "あ".repeat(5000);
+    let html = page(&format!(
+        "<table><thead><tr><th>{long}</th></tr></thead><tr><td>x</td></tr></table>"
+    ));
+    assert!(snap(&html).truncated);
+    let short = page("<table><thead><tr><th>名</th></tr></thead><tr><td>x</td></tr></table>");
+    assert!(!snap(&short).truncated);
+}
+
+/// `AISNAP-2`（TASK-12.5・Issue #83）: 入れ子の表・列数の食い違う表は圧縮されない。
+#[test]
+fn aisnap_2_irregular_tables_are_not_compressed() {
+    let nested = page("<table><tr><td><table><tr><td>x</td></tr></table></td></tr></table>");
+    let mismatch = page("<table><tr><td>a</td><td>b</td></tr><tr><td>c</td></tr></table>");
+    for html in [nested, mismatch] {
+        let s = snap(&html);
+        assert_eq!(first_table(&s).table, None);
+        assert!(!first_table(&s).children.is_empty());
+    }
+}
+
+/// `AISNAP-2`（TASK-12.5・Issue #83）: ul/ol の各 li が 1 行になり、header は空。
+#[test]
+fn aisnap_2_lists_are_compressed_to_rows() {
+    let html =
+        page("<ul><li>りんご</li><li>みかん</li></ul><ol><li>一</li><li>二</li><li>三</li></ol>");
+    let s = snap(&html);
+    let lists: Vec<&TableSummary> = all_nodes(&s.tree)
+        .into_iter()
+        .filter_map(|nd| nd.table.as_ref())
+        .collect();
+    assert_eq!(lists.len(), 2);
+    let first = lists.first().expect("ul がある");
+    assert_eq!(first.header, vec![]);
+    assert_eq!(
+        first.rows,
+        vec![
+            TableRow::new("りんご", false),
+            TableRow::new("みかん", false)
+        ]
+    );
+    let second = lists.get(1).expect("ol がある");
+    assert_eq!(second.rows.len(), 3);
+    assert_eq!(second.truncated_rows, 0);
+}
+
+/// `AISNAP-2`・`AISNAP-10`（TASK-12.5・Issue #83）: 圧縮で ref の発行数が変わっても、
+/// 後続要素の ref は決定的（同じ HTML の 2 回構築で一致）。
+#[test]
+fn aisnap_10_refs_after_compressed_table_are_deterministic() {
+    let html = page("<table><tr><td>a</td></tr></table><button>送信</button>");
+    let (a, b) = (snap(&html), snap(&html));
+    assert_eq!(a, b);
+    let btn = all_nodes(&a.tree)
+        .into_iter()
+        .find(|nd| nd.role == "button")
+        .expect("button がある");
+    assert!(btn.r#ref.is_some());
+    assert_common(&html, &a);
 }
 
 /// 価格クラス要素を含むページ（landmark 系は使わない）。
@@ -332,4 +537,41 @@ fn aisnap_10_ref_is_stable_across_pages() {
         child(child(&a.tree, 0), 0).r#ref,
         child(child(&b.tree, 0), 0).r#ref
     );
+}
+
+/// 全ノードを先行順で集める（反復）。
+fn collect_nodes(root: &Node) -> Vec<&Node> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        out.push(n);
+        stack.extend(n.children.iter().rev());
+    }
+    out
+}
+
+/// AISNAP-2: 操作要素（リンク・ボタン・入力欄）を含む表・一覧は圧縮せず、ref を保持する。
+#[test]
+fn aisnap_2_interactive_rows_are_not_compressed() {
+    let html = r#"<body><table><thead><tr><th>名前</th><th>操作</th></tr></thead><tbody><tr><td>太郎</td><td><a href="/u/1">詳細</a> <button>削除</button></td></tr></tbody></table><ul><li><input type="checkbox" aria-label="選択"></li><li>b</li></ul></body>"#;
+    let s = snap(html);
+    let all = collect_nodes(&s.tree);
+    assert!(all.iter().all(|n| n.table.is_none()));
+    for (role, name) in [("link", "詳細"), ("button", "削除"), ("checkbox", "選択")] {
+        let n = all
+            .iter()
+            .find(|n| n.role == role && n.name == name)
+            .expect("操作要素が展開されている");
+        assert!(n.r#ref.is_some());
+    }
+}
+
+/// AISNAP-2: tfoot を持つ表は圧縮せず、フッターの可視情報を保持する。
+#[test]
+fn aisnap_2_table_with_tfoot_is_not_compressed() {
+    let html = "<body><table><thead><tr><th>品名</th><th>金額</th></tr></thead><tbody><tr><td>A</td><td>100</td></tr></tbody><tfoot><tr><td>合計</td><td>100</td></tr></tfoot></table></body>";
+    let s = snap(html);
+    let all = collect_nodes(&s.tree);
+    assert!(all.iter().all(|n| n.table.is_none()));
+    assert!(all.iter().any(|n| n.name == "合計"));
 }

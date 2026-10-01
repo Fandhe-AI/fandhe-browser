@@ -8,8 +8,8 @@
 //! `tasklist` に委ねる。TASK-84.5）・MCP レスポンスのトークン削減率
 //! （`AISNAP-1`）を計測する。
 //!
-//! `cargo bench --bench competitor_lightpanda`（暫定ホストは
-//! `fandhe-browser-core`。crate 側 `Cargo.toml` のコメント参照）で実行する。
+//! `cargo bench -p fandhe-browser-cli --bench competitor_lightpanda`（ホストは
+//! `fandhe-browser-cli`。crate 側 `Cargo.toml` のコメント参照）で実行する。
 //! 対象バイナリの有無は環境変数で与え、未設定の対象は panic させず skip し
 //! 理由を stderr へ出す（coding-rust.md「外部入力の経路では unwrap を使わず
 //! 明示的に処理する」）。結果は JSON として stdout へ出す（プログラム出力は

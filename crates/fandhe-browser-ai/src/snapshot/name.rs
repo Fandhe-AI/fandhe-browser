@@ -891,6 +891,9 @@ pub struct NameIndex<'doc> {
     /// 子孫テキスト走査（name from content）の索引全体で共有する残りステップ数
     /// （[`MAX_TOTAL_CONTENT_STEPS`]）。
     content_steps_left: Cell<usize>,
+    /// 圧縮可否の判定専用の残りステップ数（[`NameIndex::with_isolated_content_budget`]）。
+    /// 判定が `content_steps_left` を消費して後続の name 算出を空にしないための別枠。
+    judge_steps_left: Cell<usize>,
     /// 文書順で最初の HTML 名前空間の `<title>` 要素（文書ルートの名前用。
     /// SVG の `<title>` は含めない）。構築時の単一走査で記録する。
     first_title: Option<NodeId>,
@@ -903,7 +906,32 @@ impl<'doc> NameIndex<'doc> {
     #[must_use]
     pub(super) fn with_content_budget(self, steps: usize) -> Self {
         self.content_steps_left.set(steps);
+        self.judge_steps_left.set(steps);
         self
+    }
+
+    /// `f` の間だけ、子孫テキスト走査の予算を判定専用の別枠に差し替えて実行する。
+    ///
+    /// 圧縮可否の判定（`build` の `title_becomes_name`。`AISNAP-2`・TASK-12・
+    /// Issue #631）が name 算出用の共有予算（`content_steps_left`）を消費すると、
+    /// 判定対象外の要素の name が空・`truncated` になり出力が変わってしまうため、
+    /// 判定は別枠（`with_content_budget` と同じ上限）で行い共有予算は変化させない。
+    /// 判定の総量も同じ上限で有界に保つ。
+    pub(super) fn with_isolated_content_budget<T>(&self, f: impl FnOnce() -> T) -> T {
+        let shared = self.content_steps_left.replace(self.judge_steps_left.get());
+        let out = f();
+        self.judge_steps_left.set(self.content_steps_left.get());
+        self.content_steps_left.set(shared);
+        out
+    }
+
+    /// 判定専用の予算（[`NameIndex::with_isolated_content_budget`]）が尽きているか。
+    ///
+    /// 尽きた後の子孫テキスト走査は空の名前＋`truncated` になり、展開時に `title` が
+    /// name になるかを確定できない。呼び出し側は圧縮せず展開を維持する
+    /// （`AISNAP-1`・`AISNAP-2`・TASK-12・Issue #631。AGENTS.md のリソース上限）。
+    pub(super) fn isolated_budget_exhausted(&self) -> bool {
+        self.judge_steps_left.get() == 0
     }
 
     /// `ancestor` が `node` 自身またはその祖先かどうかを、構築時に記録した
@@ -1071,6 +1099,7 @@ impl<'doc> NameIndex<'doc> {
             uncached_scans_left: Cell::new(MAX_UNCACHED_REFERENT_SCANS),
             first_scans_left: Cell::new(MAX_CACHEABLE_REFERENT_SCANS),
             content_steps_left: Cell::new(usize::MAX),
+            judge_steps_left: Cell::new(usize::MAX),
             first_title,
         }
     }
@@ -2532,6 +2561,36 @@ mod tests {
                 "selector={selector}"
             );
         }
+    }
+
+    /// AISNAP-2（TASK-12・Issue #631）: 判定専用の別枠予算で name を算出しても、
+    /// 共有予算（`with_content_budget`）は消費されず、後続要素の name は空にならない。
+    #[test]
+    fn aisnap_2_isolated_content_budget_does_not_consume_shared_budget() {
+        use super::{NameIndex, compute_name_with_index};
+
+        let html =
+            r#"<button id="a" title="t">あいうえお</button><button id="b">かきくけこ</button>"#;
+        let parsed =
+            parse_document(html, &ParseOptions::default()).expect("テスト入力は必ず成功する");
+        let doc = parsed.document;
+        let root = doc.root();
+        let index = NameIndex::build(&doc).with_content_budget(64);
+        let find = |sel: &str| {
+            query_selector_str(&doc, root, sel)
+                .expect("セレクタは解釈できる")
+                .expect("対象要素が見つかる")
+        };
+        // 判定を何度行っても共有予算は減らない。
+        for _ in 0..8 {
+            let judged = index.with_isolated_content_budget(|| {
+                compute_name_with_index(&doc, &index, find("button#a"))
+            });
+            assert_eq!(judged.text, "あいうえお");
+        }
+        let later = compute_name_with_index(&doc, &index, find("button#b"));
+        assert_eq!(later.text, "かきくけこ");
+        assert!(!later.truncated);
     }
 
     /// AISNAP-1（TASK-11.4.2・#545・PR #567 レビュー指摘の P2 修正）:

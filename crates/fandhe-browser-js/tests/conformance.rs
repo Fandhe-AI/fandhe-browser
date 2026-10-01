@@ -41,12 +41,12 @@
 //!   テストでは参照しない（PR #427 レビュー指摘の 2 回目の対応）。
 //! - [`conformance_checks`] モジュール（`check_*` を含む実処理検査一式）
 //!   も同じ cfg gate 配下に置く。`js-v8`/`js-boa` いずれかが有効な限り
-//!   3 関数すべてが `#[test]` として常に実行され、[`create_engine`] が
-//!   `Ok` を返すようになった時点（TASK-29・V8／TASK-32・boa 完了時）で
-//!   自動的に `check_*` を呼び出すようになる。「実装が入ったのに
-//!   `#[test]` を付け直し忘れる」余地を構造上なくす（本 crate の CI は
-//!   `cargo test --all-features` に加え既定 feature 構成も別ジョブで
-//!   検証する。ci.yml 参照）。
+//!   3 関数すべてが `harness = false` の `main` から常に順次呼ばれ、
+//!   [`create_engine`] が `Ok` を返す種別（V8 は TASK-29.6.2 で対応済み。
+//!   boa は TASK-32 完了時）に対して `check_*` を実行する。実装が入ったのに
+//!   呼び出しを付け忘れる余地を構造上なくす（本 crate の CI は
+//!   `cargo test --all-features` に加え既定 feature 構成・`--features js-v8`
+//!   単独構成（TASK-29.7・Issue #158）も別ジョブで検証する。ci.yml 参照）。
 //! - [`assert_conformance_summary_matches_current_contract`] の
 //!   「検査対象があるのに無検証で成功しない」追加アサーションは、
 //!   `bundled_engines()` と [`IMPLEMENTED_ENGINES`] の積集合
@@ -73,8 +73,9 @@
 use fandhe_browser_js::{CreateEngineError, EngineKind, bundled_engines, create_engine};
 
 /// 具象実装が存在し、[`create_engine`] が `Ok` を返す種別の宣言
-/// （TASK-29 完了時に [`EngineKind::V8`]、TASK-32 完了時に
-/// [`EngineKind::Boa`] をここへ追加する）。
+/// （[`EngineKind::V8`] は TASK-29.6.2・Issue #548 で追加済みで、TASK-29.7・
+/// Issue #158 が 3 カテゴリ合格を CI で検証する。[`EngineKind::Boa`] は
+/// TASK-32 完了時にここへ追加する）。
 ///
 /// [`js_1_create_engine_contract_for_bundled_engines`]・
 /// [`conformance_checks`] 内の各ヘルパーが期待値の唯一の情報源として参照
@@ -185,17 +186,15 @@ fn js_1_create_engine_contract_is_empty_by_default() {
 ///
 /// `js-v8`/`js-boa` のいずれかが有効な構成でのみコンパイル・実行される
 /// （モジュール冒頭のドキュメント参照）。そのため [`bundled_engines`] が
-/// 常に非空になる構成でのみ 3 関数すべてが `#[test]` として動く。
-/// [`IMPLEMENTED_ENGINES`] が空の現時点では `create_engine` がどの種別にも
-/// `NotYetImplemented` を返すため、`check_*`（実際のスクリプト評価・
-/// 関数注入・DOM バインディング）自体はまだ 1 度も到達しない。ただし
-/// `run_for_each_bundled_engine`（本モジュール内）は必ず呼ばれ、
-/// 「同梱されているのに `NotYetImplemented` を返す」という現行契約を
-/// 明示的に検証し続けるため、`cargo test` の出力が「pass」でも実際には
-/// 何も検証していない、という状態にはならない（PR #427 レビュー指摘への
-/// 対応。TASK-29・V8／TASK-32・boa の完了により対応する種別が
-/// [`IMPLEMENTED_ENGINES`] へ追加された瞬間、既にある `#[test]` がそのまま
-/// `check_*` を呼び出すようになる。付け直し忘れの余地がない）。
+/// 常に非空になる構成でのみ 3 関数すべてが、`harness = false` の `main` から
+/// 順に呼ばれる（冒頭の「`harness = false` の理由」参照）。`js-v8` 有効時は
+/// V8 に対して `check_*`（実際のスクリプト評価・関数注入・DOM バインディング）
+/// が実行される（TASK-29.7・Issue #158）。boa は [`IMPLEMENTED_ENGINES`] に
+/// 未追加のため、`create_engine` が `NotYetImplemented` を返す契約の確認のみ
+/// を行う。`run_for_each_bundled_engine`（本モジュール内）が必ず呼ばれるため、
+/// 出力が「pass」でも実際には何も検証していない、という状態にはならない
+/// （PR #427 レビュー指摘への対応。TASK-32・boa の完了で [`IMPLEMENTED_ENGINES`]
+/// へ追加された種別は、呼び出し側の変更なしに `check_*` の対象になる）。
 #[cfg(any(feature = "js-v8", feature = "js-boa"))]
 mod conformance_checks {
     use super::IMPLEMENTED_ENGINES;
@@ -519,8 +518,8 @@ mod conformance_checks {
 
     /// JS-1: スクリプト評価が、同梱された各エンジンで同じ形状の結果を返すこと
     /// （TASK-28.4・Issue #150）。`js-v8`/`js-boa` のいずれかが有効な構成
-    /// でのみ存在し、[`IMPLEMENTED_ENGINES`] が非空になった時点で
-    /// `check_script_evaluation` を実際に呼び出すようになる
+    /// でのみ存在し、[`IMPLEMENTED_ENGINES`] に含まれる種別（現状は V8）に
+    /// 対して `check_script_evaluation` を実際に呼び出す
     /// （モジュールドキュメント参照）。
     pub(super) fn js_1_conformance_script_evaluation_for_each_bundled_engine() {
         let summary = run_for_each_bundled_engine(check_script_evaluation);

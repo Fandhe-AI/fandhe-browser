@@ -58,20 +58,23 @@
 //!   検出ロジックは実装済み（TASK-12.1・Issue #79。[`compress_table`]）。
 //!   ヘッダ ref 付与は実装済み（TASK-12.2・Issue #80。`assign_header_refs`）。
 //!   データ行の圧縮 1 行表現も実装済み（TASK-12.3・Issue #81。
-//!   [`compress_table::compress_rows`]・統合前のため呼び出し元なし）。
+//!   [`compress_table::compress_rows`]）。
 //!   超過行数 `truncated_rows` も実装済み（TASK-12.4・Issue #82。
-//!   [`compress_table::CompressedRows`]）。ツリー構築への統合（#83）・
-//!   回帰テスト（#84）は未実装
+//!   [`compress_table::CompressedRows`]）。ツリー構築への統合は実装済み
+//!   （TASK-12.5・Issue #83。[`snapshot::build_snapshot`] が [`snapshot::Node::table`] へ
+//!   格納）。回帰テスト（#84）は未実装
 //! - データ葉（非インタラクティブなデータ値）の検出（`AISNAP-3`・`TASK-13`・
 //!   `MS-2`）。`td`/`th` の検出（TASK-13.1・Issue #86）と
 //!   価格クラス名パターン（TASK-13.2・Issue #87）は実装済み（[`data_leaf`]）。
-//!   snapshot 構築への統合は実装済み（TASK-13.3・Issue #88。`Node::data_leaf`）
+//!   snapshot 構築への統合は実装済み（TASK-13.3・Issue #88。`Node::data_leaf`・圧縮表ヘッダの
+//!   `HeaderCell::data_leaf`）
 //! - 重要要素優先保持（`AISNAP-12`・`TASK-16`・`MS-2`）。先頭件の優先保持と
-//!   予算モデルは実装済み（TASK-16.1・Issue #104。[`retention`]・統合前のため
-//!   呼び出し元なし）。フォーム送信ボタンの優先保持も実装済み
-//!   （TASK-16.3・Issue #106。[`retention::submit_button`]・同じく統合前）。
-//!   ページネーション（#105）は別 PR で追加され、固定キャップの置換（#107）・
-//!   耐性テスト（#108）は未実装
+//!   予算モデルは実装済み（TASK-16.1・Issue #104。[`retention`]）。ページネーションリンクの優先保持（TASK-16.2・Issue #105。
+//!   [`retention::pagination`]）・フォーム送信ボタンの優先保持（TASK-16.3・
+//!   Issue #106。[`retention::submit_button`]）も実装済み。
+//!   固定キャップの置換（TASK-16.4・Issue #107。`compress_table::compress_rows`）は
+//!   実装済み。キャップ境界要素の軽微変化耐性テストも実装済み（TASK-16.5・
+//!   Issue #108。`tests/retention.rs`）
 //! - `/ai/*` ルータ向けスナップショット API（`AISNAP-6`・`AISNAP-14`・`CDP-1`
 //!   （API 単体動作は `AISNAP-7`）、`TASK-19`（単体動作確認は `TASK-20`）、
 //!   `MS-4`）

@@ -31,15 +31,15 @@ fandhe-browser/
 ├── .markdownlint.jsonc / .yamllint / .editorconfig-checker.json  # lint-docs 設定
 ├── Cargo.toml                     #（予定）workspace 定義
 ├── deny.toml                      # cargo-deny 設定（ライセンス・advisories 検査。MPL-2.0 は未許可）
-├── crates/                        #（予定）
+├── crates/                        # 各 crate（mcp のみ予定）
 │   ├── fandhe-browser-core/       #   fetch・HTML パース・DOM・query・CSSOM・config・可観測性
 │   ├── fandhe-browser-js/         #   JS エンジン抽象（V8 既定 / boa）
 │   ├── fandhe-browser-ai/         #   AI 最適化 API（アクセシビリティツリー・簡約 DOM）・プラグイン API
 │   ├── fandhe-browser-cdp/        #   CDP 互換サーバー
 │   ├── fandhe-browser-render/     #   Servo 組込（feature gate `rendering`・MPL-2.0 隔離）
 │   ├── fandhe-browser-profile/    #   プロファイル分離
-│   ├── fandhe-browser-cli/        #   CLI
-│   └── fandhe-browser-mcp/        #   MCP 参照プラグイン（別バイナリ）
+│   ├── fandhe-browser-cli/        #   CLI（最小雛形: core・profile・cdp を組み立ててサーバー起動。サブコマンドは TASK-47）
+│   └── fandhe-browser-mcp/        #   MCP 参照プラグイン（別バイナリ。予定）
 ├── tests/ / benches/              #（予定）結合テスト・ベンチ
 ├── scripts/                       # 依存グラフ検査等のスクリプト。check-render-isolation.sh（TASK-34.1・RENDER-1）
 ├── harness/                       # 互換性テストハーネス。compat-regression/（TASK-9.2・対象サイト群の動作率回帰チェック）・binary-size/（TASK-34.2・既定 feature リリースバイナリのサイズ検査）実装済み
