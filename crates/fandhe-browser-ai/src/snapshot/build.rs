@@ -27,6 +27,9 @@
 //!   `tabindex` 付き等）を含む構造は圧縮せず通常どおり展開する（ref・state・フッター
 //!   の可視情報を失わないため）。`img` の `alt`・`aria-label` 等テキスト以外に由来する
 //!   accessible name を持つ子孫、または `caption` を含む構造も同様に展開する。
+//!   圧縮できない規則的構造で表示対象行が `MAX_TABLE_ROWS` 超のときは、優先保持
+//!   （`AISNAP-12`・TASK-16.4。ページネーション・送信ボタン）で選ばれた行と ref・state 等を
+//!   持つ行を展開のまま残し、それ以外の通常行は `Node::folded_rows` へ文字列で畳む（内容は省略しない）。
 //!   検出は table/list ごとに子孫を走査するが、走査量はコンテナごと
 //!   （`MAX_COMPRESS_SCAN_NODES`）と 1 回の構築全体（`MAX_TOTAL_COMPRESS_SCAN_NODES`）
 //!   で有界とし、超過したコンテナは圧縮せず展開する。
@@ -37,12 +40,14 @@
 //! - いずれかの name が打ち切られた場合（文字数上限・子孫走査の上限・構築全体で共有する
 //!   走査予算）も `Snapshot::truncated` を立てる。
 
+use std::collections::HashSet;
 use std::fmt;
 
 use fandhe_browser_core::dom::{Children, Document, NodeId};
 
 use crate::compress_table::{
-    TableDetection, assign_header_refs, compress_rows, detect_regular_structure,
+    TableDetection, assign_header_refs, compress_row_list, compress_rows, detect_regular_structure,
+    rows_to_fold,
 };
 use crate::data_leaf::{DataLeafKind, classify_data_leaf};
 
@@ -150,8 +155,9 @@ fn subtree_fits_depth(doc: &Document, container: NodeId, max_rel: usize) -> bool
 ///
 /// 圧縮は子孫の展開（ref・state・accessible name の付与）を省略するため、
 /// 次の場合は情報が失われる。このときは圧縮せず通常の展開を維持する
-/// （従来の Snapshot と同じ結果。行の可視テキストを失わないよう、行数が多くても行は省略しない。
-/// AISNAP-12・TASK-16.4）。
+/// （ref・state を持つ行は展開を維持する。表示対象行が多い場合は優先保持
+/// （AISNAP-12・TASK-16.4）の対象外で失われる内容のない通常行だけを 1 行文字列へ畳み、
+/// 内容は省略しない）。
 /// - `tfoot` 行がある（圧縮表現は本文行のみで、合計額などフッターの可視情報が消える）。
 /// - 表・一覧の中に操作要素（リンク・ボタン・入力欄等）がある（ref と state が消える）。
 /// - 表に `caption` がある（圧縮表現は caption を保持せず、表題が Snapshot から消える）。
@@ -171,7 +177,20 @@ fn can_compress(
 ///
 /// 走査量は呼び出し前の [`bounded_descendant_count`] で有界化済みである。
 fn has_lossy_descendant(doc: &Document, container: NodeId) -> bool {
-    let mut stack: Vec<NodeId> = doc.children(container).collect();
+    subtree_has_lossy(doc, container, false)
+}
+
+/// `root`（`include_root` なら自身を含む）配下に、1 行文字列へ畳むと失われる要素
+/// （操作要素・意味的ノード・テキスト以外由来の name・非セルのデータ葉・`caption`）があるか。
+///
+/// 畳む行の判定（`AISNAP-12`・TASK-16.4）と [`has_lossy_descendant`] で共有する。
+/// 走査量は呼び出し前の [`bounded_descendant_count`] で有界化済みの部分木に限る。
+fn subtree_has_lossy(doc: &Document, root: NodeId, include_root: bool) -> bool {
+    let mut stack: Vec<NodeId> = if include_root {
+        vec![root]
+    } else {
+        doc.children(root).collect()
+    };
     while let Some(id) = stack.pop() {
         if !doc.is_element(id) || is_excluded(doc, id) {
             continue;
@@ -331,6 +350,8 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
     let mut refs = RefAllocator::new();
     let mut truncated = false;
     let mut compress_budget = MAX_TOTAL_COMPRESS_SCAN_NODES;
+    // 展開する表・一覧で `Node::folded_rows` へ畳んだ行。主ループは子ノード化しない。
+    let mut folded: HashSet<NodeId> = HashSet::new();
 
     let root_id = doc.root();
     let root_role = compute_role(doc, root_id)
@@ -361,7 +382,7 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
             }
             continue;
         };
-        if !doc.is_element(child) || is_excluded(doc, child) {
+        if !doc.is_element(child) || is_excluded(doc, child) || folded.contains(&child) {
             continue;
         }
         let (parent_depth, parent_ref) = (top.depth, top.elem_ref);
@@ -410,10 +431,22 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
         } else {
             None
         };
-        // 圧縮できない（操作要素等を含む）規則的構造は展開を維持する。展開行は td 等の
-        // 可視テキストを持ち、省略すると値が復元できなくなるため行は省略しない
-        // （件数のみの omitted_rows では内容を残せない。AISNAP-12・TASK-16.4）。
-        let compressible = regular.filter(|s| can_compress(doc, child, s));
+        // 圧縮できない（操作要素等を含む）規則的構造は展開を維持する。ref・state を持つ行、
+        // 優先保持（AISNAP-12・TASK-16.4）で選ばれた行は展開のまま残し、それ以外で
+        // 失われる内容のない通常行は件数を省略せず 1 行文字列へ畳む（`Node::folded_rows`）。
+        // 行の選択はページネーション・送信ボタンの検出（`priority_candidates`）を含む。
+        let (compressible, expanded_structure) = match regular {
+            Some(s) if can_compress(doc, child, &s) => (Some(s), None),
+            other => (None, other),
+        };
+        if let Some(structure) = expanded_structure {
+            let fold_rows = rows_to_fold(doc, &structure, |row| subtree_has_lossy(doc, row, true));
+            node.folded_rows = compress_row_list(doc, structure.kind, &fold_rows)
+                .into_iter()
+                .map(|r| TableRow::new(r.text, r.truncated))
+                .collect();
+            folded.extend(fold_rows);
+        }
         if let Some(structure) = compressible {
             let headers = assign_header_refs(doc, &index, &structure, elem_ref, &mut refs)?;
             let compressed = compress_rows(doc, &structure);
@@ -897,27 +930,73 @@ mod tests {
         assert!(!has_table_summary(&s));
     }
 
-    /// AISNAP-12・TASK-16.4: 操作要素を含み圧縮されない表は、行数が上限を超えても
-    /// 通常行の可視テキストを省略せず全行を展開する（値の消失を防ぐ）。
-    #[test]
-    fn aisnap_12_expanded_table_keeps_all_rows() {
+    fn table_with_rows(total: usize, special: &[(usize, &str)]) -> String {
         let mut html = String::from("<table><thead><tr><th>n</th></tr></thead><tbody>");
-        for i in 0..40 {
-            if i == 30 {
-                html.push_str("<tr><td><a href=\"/next\">NEXTLINK</a></td></tr>");
-            } else {
-                html.push_str(&format!("<tr><td>row{i}</td></tr>"));
+        for i in 0..total {
+            match special.iter().find(|(idx, _)| *idx == i) {
+                Some((_, cell)) => html.push_str(&format!("<tr><td>{cell}</td></tr>")),
+                None => html.push_str(&format!("<tr><td>row{i}</td></tr>")),
             }
         }
         html.push_str("</tbody></table>");
-        let s = snap(&html);
+        html
+    }
+
+    /// AISNAP-12・TASK-16.4: 操作要素を含み全体を圧縮できない表でも、キャップ外の
+    /// ページネーションリンクは ref 付きで展開して残し（実 Snapshot 経路）、
+    /// 通常行は件数を省略せず文字列へ畳む。
+    #[test]
+    fn aisnap_12_expanded_table_keeps_pagination_link_and_folds_plain_rows() {
+        let s = snap(&table_with_rows(40, &[(30, "<a href=\"/next\">Next</a>")]));
         let nodes = all_nodes(&s.tree);
         let links: Vec<_> = nodes.iter().filter(|n| n.role == "link").collect();
         assert_eq!(links.len(), 1);
         assert!(links[0].r#ref.is_some());
-        let rows = nodes.iter().filter(|n| n.role == "row").count();
-        assert_eq!(rows, 41, "header row plus all 40 body rows");
-        assert!(nodes.iter().all(|n| n.omitted_rows == 0));
+        let table = nodes
+            .iter()
+            .find(|n| n.role == "table")
+            .expect("table node");
+        // 展開された行（ヘッダ行 + 優先保持 20 行）と畳まれた通常行の合計が全行。
+        let expanded_rows = nodes.iter().filter(|n| n.role == "row").count();
+        assert_eq!(expanded_rows, 1 + 20);
+        assert_eq!(table.folded_rows.len(), 40 - 20);
+        // 畳まれた行の内容は失われない。
+        for i in 0..40 {
+            if i == 30 {
+                continue;
+            }
+            let text = format!("row{i}");
+            let in_folded = table.folded_rows.iter().any(|r| r.text == text);
+            let in_tree = nodes.iter().any(|n| n.name.contains(&text));
+            assert!(in_folded || in_tree, "{text} must survive");
+        }
         assert!(!s.truncated);
+    }
+
+    /// AISNAP-12: 見出し等の意味的な子孫を持つ行は件数上限を超えても畳まず展開する。
+    #[test]
+    fn aisnap_12_semantic_row_beyond_cap_is_expanded_not_folded() {
+        let s = snap(&table_with_rows(
+            40,
+            &[(35, "<h2>KEEPHEAD</h2>"), (36, "<a href=\"/x\">x</a>")],
+        ));
+        let nodes = all_nodes(&s.tree);
+        assert!(nodes.iter().any(|n| n.role == "heading"));
+        let table = nodes.iter().find(|n| n.role == "table").expect("table");
+        assert!(
+            table
+                .folded_rows
+                .iter()
+                .all(|r| !r.text.contains("KEEPHEAD"))
+        );
+    }
+
+    /// AISNAP-12: 表示対象行が上限以下なら畳まず従来どおり全行を展開する。
+    #[test]
+    fn aisnap_12_small_expanded_table_folds_nothing() {
+        let s = snap(&table_with_rows(10, &[(3, "<a href=\"/n\">n</a>")]));
+        let nodes = all_nodes(&s.tree);
+        assert_eq!(nodes.iter().filter(|n| n.role == "row").count(), 11);
+        assert!(nodes.iter().all(|n| n.folded_rows.is_empty()));
     }
 }

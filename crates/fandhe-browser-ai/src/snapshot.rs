@@ -126,10 +126,13 @@ pub struct Node {
     /// 規則的な表・一覧の圧縮結果。`None` は圧縮していないノード
     /// （`AISNAP-2`・TASK-12.5・Issue #83）。
     pub table: Option<TableSummary>,
-    /// 展開した表・一覧のうち、優先保持（`AISNAP-12`・TASK-16.4）で子ノードから省略した
-    /// 表示対象行の数。操作要素等を含み圧縮できない表・一覧で、失われる内容を持たない行だけを
-    /// 省略した件数（0 は省略なし）。出力側の「他N行」注記の元数値（TASK-19・`AISNAP-6`）。
-    pub omitted_rows: usize,
+    /// 展開した表・一覧（操作要素等を含み全体を圧縮できないもの）のうち、優先保持
+    /// （`AISNAP-12`・TASK-16.4）の対象外で、かつ失われる内容を持たない通常行を
+    /// 子ノードの代わりに 1 行文字列へ畳んだもの（文書順）。ref・state を持つ行
+    /// （リンク・ボタン等を含む行）と優先保持で選ばれた行は畳まず `children` に残す。
+    /// 空は畳んだ行なし。行の内容は省略せず文字列で保持する（セルの切り詰めは
+    /// [`TableRow::truncated`] で通知）。畳んだ行の元の並び位置は保持しない。
+    pub folded_rows: Vec<TableRow>,
 }
 
 /// 圧縮した表・一覧のヘッダ 1 セル（`AISNAP-2`・`AISNAP-10`・TASK-12.5）。
@@ -245,7 +248,7 @@ impl Node {
             state: State::default(),
             data_leaf: None,
             table: None,
-            omitted_rows: 0,
+            folded_rows: Vec::new(),
         }
     }
 

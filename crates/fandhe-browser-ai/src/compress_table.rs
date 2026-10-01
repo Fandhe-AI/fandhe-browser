@@ -475,16 +475,16 @@ fn visible_body_rows(doc: &Document, structure: &RegularStructure) -> Vec<NodeId
         .collect()
 }
 
-/// 圧縮せず展開する表・一覧で、優先保持（`AISNAP-12`・TASK-16.4・Issue #107）により
-/// 省略してよい行を文書順で返す。
+/// 圧縮せず展開する表・一覧で、優先保持（`AISNAP-12`・TASK-16.4・Issue #107）の対象外となり
+/// 1 行文字列へ畳んでよい行を文書順で返す。
 ///
-/// 呼び出し文脈: `build_snapshot` が、操作要素等を含むため `can_compress` で圧縮できない
-/// 規則的構造に対して呼ぶ。圧縮と違い展開行は ref・state を持つため、`must_keep` が
-/// `true` の行（操作要素など圧縮すると失われる内容を持つ行）は件数上限を超えても
-/// 必ず残し、省略するのは [`compress_rows`] と同じ予算モデル（先頭確保 → ページネーション・
-/// 送信ボタン → 文書順充填）で外れた、`must_keep` でない行だけにする。
+/// 呼び出し文脈: `build_snapshot` が、操作要素等を含むため `can_compress` で全体を圧縮
+/// できない規則的構造に対して呼ぶ。[`compress_rows`] と同じ予算モデル（先頭確保 →
+/// ページネーション・送信ボタン → 文書順充填）で保持する行を選び、保持されず、かつ
+/// `must_keep` が `false` の行（ref・state・意味的ノードなど畳むと失われる内容を持たない行）
+/// だけを返す。返した行は [`compress_row_list`] で文字列化され、内容は省略されない。
 /// 表示対象行が [`MAX_TABLE_ROWS`] 以下なら空を返す。
-pub fn omitted_rows_preserving(
+pub fn rows_to_fold(
     doc: &Document,
     structure: &RegularStructure,
     must_keep: impl Fn(NodeId) -> bool,
@@ -503,6 +503,47 @@ pub fn omitted_rows_preserving(
         .filter(|(i, row)| !kept.contains(i) && !must_keep(**row))
         .map(|(_, row)| *row)
         .collect()
+}
+
+/// 明示した行要素の列を 1 行 1 文字列へ圧縮する（文書順を保つ。行の省略はしない）。
+///
+/// [`compress_rows`] の行文字列化部分を切り出したもの。`build_snapshot` が畳む行
+/// （[`rows_to_fold`]）の文字列化にも使う。
+pub fn compress_row_list(
+    doc: &Document,
+    kind: StructureKind,
+    rows: &[NodeId],
+) -> Vec<CompressedRow> {
+    rows.iter()
+        .map(|&row| compress_one_row(doc, kind, row))
+        .collect()
+}
+
+fn compress_one_row(doc: &Document, kind: StructureKind, row: NodeId) -> CompressedRow {
+    let cells: Vec<NodeId> = match kind {
+        StructureKind::Table => doc
+            .children(row)
+            .filter(|&c| is_html(doc, c, "td") || is_html(doc, c, "th"))
+            .take(MAX_COLUMNS)
+            .collect(),
+        // List と将来の種別は行要素自身を 1 セルとする。
+        _ => vec![row],
+    };
+    let mut text = String::new();
+    let mut truncated = false;
+    for (i, cell) in cells.into_iter().enumerate() {
+        if i > 0 {
+            text.push_str(CELL_SEPARATOR);
+        }
+        let (cell_text, cut) = cell_text(doc, cell);
+        text.push_str(&cell_text);
+        truncated |= cut;
+    }
+    CompressedRow {
+        row,
+        text,
+        truncated,
+    }
 }
 
 /// 規則的と判定済みの構造から、データ行を最大 [`MAX_TABLE_ROWS`] 行まで
@@ -525,8 +566,8 @@ pub fn omitted_rows_preserving(
 /// - 行選択は固定の先頭 20 行ではなく `retention` の予算モデルによる（先頭
 ///   [`TABLE_HEAD_KEEP`] 行の確保 → ページネーション・送信ボタンを含む行 → 文書順の
 ///   充填）。表示対象行が 20 行以下なら全行を文書順で返す。`build_snapshot` 経由では
-///   操作要素を含む表・一覧が圧縮されない（`can_compress`）ため本関数には渡らず、
-///   展開側で [`omitted_rows_preserving`] が同じ予算モデルを適用する
+///   操作要素を含む表・一覧は全体を圧縮できない（`can_compress`）ため本関数には渡らず、
+///   展開側で [`rows_to_fold`] が同じ予算モデルで畳む行を選ぶ
 /// - 表示対象のデータ行のうち保持されなかった件数を `truncated_rows` に返す
 ///   （非表示行・`tfoot`・ヘッダは数えない。TASK-12.4・Issue #82）
 /// - セル内に `" | "` が含まれると区切りが曖昧になる（エスケープの要否は
@@ -541,33 +582,8 @@ pub fn compress_rows(doc: &Document, structure: &RegularStructure) -> Compressed
     };
     let policy = RetentionPolicy::new(MAX_TABLE_ROWS, TABLE_HEAD_KEEP);
     let retention = select_retained_with_priority(visible.len(), &policy, &candidates);
-    let mut rows = Vec::with_capacity(retention.kept.len());
-    for &row in retention.apply(&visible) {
-        let cells: Vec<NodeId> = match structure.kind {
-            StructureKind::Table => doc
-                .children(row)
-                .filter(|&c| is_html(doc, c, "td") || is_html(doc, c, "th"))
-                .take(MAX_COLUMNS)
-                .collect(),
-            // List と将来の種別は行要素自身を 1 セルとする。
-            _ => vec![row],
-        };
-        let mut text = String::new();
-        let mut truncated = false;
-        for (i, cell) in cells.into_iter().enumerate() {
-            if i > 0 {
-                text.push_str(CELL_SEPARATOR);
-            }
-            let (cell_text, cut) = cell_text(doc, cell);
-            text.push_str(&cell_text);
-            truncated |= cut;
-        }
-        rows.push(CompressedRow {
-            row,
-            text,
-            truncated,
-        });
-    }
+    let kept_rows: Vec<NodeId> = retention.apply(&visible).into_iter().copied().collect();
+    let rows = compress_row_list(doc, structure.kind, &kept_rows);
     // 保持されなかった表示対象行が「他N行」（`rows` と同じ母集団で数える）。
     CompressedRows {
         rows,
