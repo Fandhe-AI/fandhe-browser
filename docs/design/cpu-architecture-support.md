@@ -58,14 +58,14 @@ x86_64 優先は spec の対象 OS 方針（Linux は x86_64 優先、macOS は 
 | `x86_64-apple-darwin`・`aarch64-pc-windows-msvc` | prebuilt でビルド可能。実機検証は後回し |
 
 - 採用版は `=152.2.0`（ルート `Cargo.toml` の `[workspace.dependencies]`）で、150.2.0 以上のため上記 8 ターゲットすべてに prebuilt がある。musl 向け prebuilt を使うには 150.2.0 以上が必要
-- `v8` は `fandhe-browser-js` の feature `js-v8` からのみ使われ、既定ビルドの依存グラフには入らない
+- `v8` は `fandhe-browser-js` の feature `js-v8` からのみ使われる。`fandhe-browser-cli` の既定 feature（`default = ["js-v8"]`。TASK-30.2・#160）で有効になり、`--no-default-features` では依存グラフに入らない
 - 取得の仕組み: `v8` の `build.rs`（`prebuilt_profile()`・`prebuilt_features_suffix()`・`static_lib_name()`）が Cargo の `TARGET` 名と feature 接尾辞からアーカイブ名を組み立てる。本リポジトリは既定 feature（`use_custom_libcxx`）だけを使うため、接尾辞なしの release アーカイブを取得する。`use_custom_libcxx` を外さない理由は `Cargo.toml` のコメントを参照
 - バージョンを 150.2.0 未満へ下げると musl 向け prebuilt がなくなる。上げる場合は上記アセット一覧を確認し直す（依存の更新はユーザー承認制。[dependency-policy](../../.claude/rules/dependency-policy.md)）
 - crates.io 上の最新版との差は今回確認していない
 
 ## CI ランナーとターゲットの対応
 
-`.github/workflows/ci.yml` の 3 OS matrix のランナーと、そのホスト triple に対応する prebuilt 候補は次のとおり。ホスト triple は main の CI 実行（2026-10-01、`binary-size` ジョブのログの `host:` 行）で確認した値で、ホストの記録にすぎない。同ジョブは `fandhe-browser-cli` を実ビルドしているが、既定 feature に `js-v8` を含まないため rusty_v8 の prebuilt は取得しておらず、`js-v8` 有効時の取得実績は確認していない（取得記録の確認は未実施）。
+`.github/workflows/ci.yml` の 3 OS matrix のランナーと、そのホスト triple に対応する prebuilt 候補は次のとおり。ホスト triple は main の CI 実行（2026-10-01、`binary-size` ジョブのログの `host:` 行）で確認した値で、ホストの記録にすぎない。同ジョブは `fandhe-browser-cli` を実ビルドしており、既定 feature が `js-v8` を含むようになった（#160）ため rusty_v8 の prebuilt を取得する見込みだが、CI での取得実績は確認していない（取得記録の確認は未実施）。
 
 | ランナー | ホスト triple | 対応する prebuilt 候補 |
 | -------- | ------------- | ----------------- |

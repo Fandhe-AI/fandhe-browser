@@ -34,6 +34,19 @@ fandhe-browser-render = { workspace = true, optional = true }
 # cli のコードからも参照していない。将来、core::render の描画トレイトへ render 実装を結線し
 # Servo を組み込む（TASK-38・RENDER-1 系）。
 [features]
+# TASK-30.2・JS-2・JS-1「JS エンジンの切替方式」決定 2・3・MS-3（#160）: JS エンジンの同梱を決める
+# feature 連鎖 `cli → core → js` の最上流。JS エンジンの `default` を持つのは cli だけにする
+# （core / js に置くと ai・cdp 経由の feature 統合で、軽量ビルドから V8 を外せなくなるため）。
+# ビルド構成の対応:
+#   既定                                          = V8 のみ同梱
+#   --no-default-features --features js-boa       = 軽量（boa。js 側は TASK-32・#165 までプレースホルダ）
+#   --no-default-features                         = エンジンなし（JS 実行要求はエラーで、成功を装わない）
+# 現状は同梱の結線だけ（REPAIR-3）。実行経路から `create_engine` はまだ呼ばれず、
+# js_stub の置換は #161（TASK-30.3）、main 先頭のワーカーフックは #514 で行う。
+default = ["js-v8"]
+js-v8 = ["fandhe-browser-core/js-v8"]
+js-boa = ["fandhe-browser-core/js-boa"]
+# `rendering` は JS の feature と独立に組み合わせられる（既定には含めない）
 rendering = ["dep:fandhe-browser-render"]
 
 [dev-dependencies]
