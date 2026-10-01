@@ -24,13 +24,17 @@
 //! 失敗として扱う（一律 success を返して検出を回避する挙動ではない）。`errorText` は
 //! [`fetch_error_text`] の閉じた固定文言表のみで、URL・アドレス等の入力由来文字列を含めない。
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
+
 use fandhe_browser_core::{
-    Error, FetchOptions, Fetcher, NavigationResult, NavigationState, StateError,
+    Error, FetchOptions, Fetcher, NavigationGeneration, NavigationResult, NavigationState,
+    StateError,
 };
 use serde_json::{Value, json};
 
 use crate::protocol::{BoxFuture, CdpError, CommandContext, CommandHandler, HandlerOutput};
-use crate::target::MAX_URL_LEN;
+use crate::target::{CdpStateError, MAX_URL_LEN, TargetId};
 
 /// メインフレームの `frameId`（スタブ。将来はセッション → ターゲット ID。`CDP-2`・TASK-43）。
 pub(crate) const MAIN_FRAME_ID: &str = "main";
@@ -42,6 +46,17 @@ pub(crate) struct NavigateOutcome {
     pub loader_id: String,
     /// 取得失敗・中断時の CDP `errorText`（固定文言）。成功時は `None`。
     pub error_text: Option<&'static str>,
+    /// 今回の遷移が commit された場合の確定 URL と世代。失敗・中断（`Superseded`）時は `None`。
+    /// ターゲット表の更新は `nav.latest()` の再読込ではなく、この値だけを根拠に行う
+    /// （並行する別の `Page.navigate` の URL を書き込まないため。`CDP-1`）。
+    pub committed: Option<CommittedNavigation>,
+}
+
+/// commit に成功した遷移の確定 URL と、commit 直後の世代。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommittedNavigation {
+    pub url: String,
+    pub generation: NavigationGeneration,
 }
 
 /// 取得エラーを CDP の `errorText`（固定文言）へ写像する閉じた表。
@@ -82,12 +97,14 @@ pub(crate) async fn navigate(
         return Ok(NavigateOutcome {
             loader_id: format!("{:x}", nav.current_generation().get()),
             error_text: Some(fetch_error_text(&e)),
+            committed: None,
         });
     }
     let generation = nav.begin_navigation().map_err(state_error)?;
     let mut outcome = NavigateOutcome {
         loader_id: format!("{:x}", generation.get()),
         error_text: None,
+        committed: None,
     };
 
     if url == "about:blank" {
@@ -95,7 +112,12 @@ pub(crate) async fn navigate(
         // 世代（`current_generation`）に合わせ、次の遷移で番号が飛ばないようにする。
         return match nav.clear_navigation(generation) {
             Ok(()) => {
+                let advanced = nav.current_generation();
                 outcome.loader_id = format!("{:x}", generation.get().saturating_add(1));
+                outcome.committed = Some(CommittedNavigation {
+                    url: "about:blank".to_owned(),
+                    generation: advanced,
+                });
                 Ok(outcome)
             }
             Err(StateError::Superseded { .. }) => {
@@ -108,9 +130,21 @@ pub(crate) async fn navigate(
 
     match fetcher.get(url).await {
         Ok(resp) => {
-            let result = NavigationResult::new(resp.final_url(), resp.body_text_lossy());
+            // 共有状態・ターゲット表を更新する前に確定 URL の長さを検証する。超過分を commit
+            // したうえでターゲット表だけ古いまま成功を返す不整合を作らない（`CDP-1`・`SEC-2`）。
+            if resp.final_url().len() > MAX_URL_LEN {
+                outcome.error_text = Some("net::ERR_INVALID_URL");
+                return Ok(outcome);
+            }
+            let final_url = resp.final_url().to_owned();
+            let result = NavigationResult::new(&final_url, resp.body_text_lossy());
             match nav.commit_navigation(generation, result) {
-                Ok(()) => {}
+                Ok(()) => {
+                    outcome.committed = Some(CommittedNavigation {
+                        url: final_url,
+                        generation,
+                    });
+                }
                 Err(StateError::Superseded { .. }) => {
                     outcome.error_text = Some("net::ERR_ABORTED");
                 }
@@ -125,6 +159,12 @@ pub(crate) async fn navigate(
 /// `Page.navigate` ハンドラ。`Fetcher`（接続プール）を所有し、起動時に 1 回だけ構築する。
 pub(crate) struct PageNavigate {
     fetcher: Fetcher,
+    /// ターゲットごとの遷移状態（`CDP-1` のターゲット境界）。別ターゲットへの
+    /// `Page.navigate` が他ターゲットの HTML・URL を上書きしないよう分離する。
+    /// `sessionId` なし（ブラウザレベル）は従来どおり `AppState::navigation()` を直接使う。
+    /// TASK-42.4（`DOM.getDocument`）がターゲット別に読めるようになるまでは、成功した遷移を
+    /// `AppState::navigation()` へ「直近にナビゲートしたページ」としてミラーする（スタブ。`REPAIR-3`）。
+    targets: Mutex<HashMap<TargetId, Arc<NavigationState>>>,
 }
 
 impl PageNavigate {
@@ -133,7 +173,23 @@ impl PageNavigate {
     pub fn new(options: FetchOptions) -> Result<Self, Error> {
         Ok(Self {
             fetcher: Fetcher::new(options)?,
+            targets: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// `tid` 用の遷移状態を返す（なければ作る）。
+    fn target_state(&self, tid: &TargetId) -> Arc<NavigationState> {
+        let mut m = self.targets.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(
+            m.entry(tid.clone())
+                .or_insert_with(|| Arc::new(NavigationState::new())),
+        )
+    }
+
+    /// 閉じられたターゲットの状態を破棄する。
+    fn forget_target(&self, tid: &TargetId) {
+        let mut m = self.targets.lock().unwrap_or_else(PoisonError::into_inner);
+        m.remove(tid);
     }
 }
 
@@ -162,15 +218,36 @@ impl CommandHandler for PageNavigate {
                 .and_then(Value::as_str)
                 .filter(|u| !u.is_empty() && u.len() <= MAX_URL_LEN)
                 .ok_or(CdpError::INVALID_PARAMS)?;
-            let nav = ctx.state.app_state().navigation();
-            let out = navigate(&self.fetcher, nav, url).await?;
-            // 成功時のみ、ターゲット表の URL を確定した最終 URL へ更新する（`CDP-1`）。
-            // 取得中にターゲットが閉じられた場合（UnknownTarget）は無視してよい。
-            if out.error_text.is_none()
-                && let (Some(tid), Some(latest)) = (&target_id, nav.latest())
-            {
-                let _ = ctx.state.registry().set_target_url(tid, latest.url());
-            }
+            let app_nav = ctx.state.app_state().navigation();
+            let out = match &target_id {
+                Some(tid) => {
+                    let nav = self.target_state(tid);
+                    let out = navigate(&self.fetcher, &nav, url).await?;
+                    // commit 済みで、かつ後続の遷移に追い越されていない場合に限り、そのターゲット
+                    // だけを確定 URL で更新する（`CDP-1`）。
+                    if let Some(c) = &out.committed
+                        && nav.current_generation() == c.generation
+                    {
+                        match ctx.state.registry().set_target_url(tid, &c.url) {
+                            Ok(()) => {}
+                            // 取得中にターゲットが閉じられた場合は状態も破棄する。
+                            Err(CdpStateError::UnknownTarget) => self.forget_target(tid),
+                            Err(_) => return Err(CdpError::SERVER_ERROR),
+                        }
+                        // 既存の読み手（AppState）へ直近ページとしてミラーする。
+                        if let Some(latest) = nav.latest()
+                            && let Ok(g) = app_nav.begin_navigation()
+                        {
+                            let _ = app_nav.commit_navigation(
+                                g,
+                                NavigationResult::new(latest.url(), latest.html()),
+                            );
+                        }
+                    }
+                    out
+                }
+                None => navigate(&self.fetcher, app_nav, url).await?,
+            };
             let mut result = json!({
                 "frameId": MAIN_FRAME_ID,
                 "loaderId": out.loader_id,
@@ -480,6 +557,78 @@ mod tests {
             assert_eq!(st.app_state().navigation().latest().unwrap().html(), "ok");
             // 成功後はターゲット表の URL も遷移先へ更新される（`CDP-1`）。
             assert_eq!(st.registry().target(&tid).unwrap().url(), url);
+        }
+
+        #[tokio::test]
+        async fn cdp1_page_navigate_keeps_per_target_state_and_urls() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let t1 = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let t2 = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let s1 = st.registry().attach(&t1).unwrap();
+            let s2 = st.registry().attach(&t2).unwrap();
+            let p1 = serve("200 OK", "one");
+            let p2 = serve("200 OK", "two");
+            let u1 = format!("http://127.0.0.1:{p1}/");
+            let u2 = format!("http://127.0.0.1:{p2}/");
+            let h = PageNavigate::new(FetchOptions::new().with_allow_private_network_access(true))
+                .unwrap();
+            let d = Dispatcher::from_handlers(vec![("Page.navigate", Box::new(h))]).unwrap();
+            for (id, sid, u) in [(1, &s1, &u1), (2, &s2, &u2)] {
+                let req = json!({"id": id, "method": "Page.navigate",
+                    "sessionId": sid.as_str(), "params": {"url": u}});
+                let f = frames(d.dispatch(&st, &req.to_string()).await);
+                assert_eq!(f[0]["result"]["loaderId"], json!("1"));
+            }
+            assert_eq!(st.registry().target(&t1).unwrap().url(), u1);
+            assert_eq!(st.registry().target(&t2).unwrap().url(), u2);
+        }
+
+        #[tokio::test]
+        async fn cdp1_page_navigate_overlong_final_url_fails_without_state_change() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let tid = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let sid = st.registry().attach(&tid).unwrap();
+            let long = format!("/{}", "a".repeat(MAX_URL_LEN));
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            thread::spawn(move || {
+                for mut s in listener.incoming().flatten() {
+                    let long = long.clone();
+                    thread::spawn(move || {
+                        let mut buf = [0u8; 1024];
+                        let n = s.read(&mut buf).unwrap_or(0);
+                        let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        let resp = if head.starts_with("GET / ") {
+                            format!(
+                                "HTTP/1.1 302 Found\r\nLocation: {long}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                        } else {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                                .to_owned()
+                        };
+                        let _ = s.write_all(resp.as_bytes());
+                    });
+                }
+            });
+            let url = format!("http://127.0.0.1:{port}/");
+            let req = json!({"id": 1, "method": "Page.navigate",
+                "sessionId": sid.as_str(), "params": {"url": url}});
+            let f = frames(allowed_dispatcher().dispatch(&st, &req.to_string()).await);
+            assert_eq!(f[0]["result"]["errorText"], json!("net::ERR_INVALID_URL"));
+            assert_eq!(st.registry().target(&tid).unwrap().url(), "about:blank");
         }
 
         #[tokio::test]
