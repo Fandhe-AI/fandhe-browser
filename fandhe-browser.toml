@@ -1,5 +1,6 @@
 # fandhe-browser 設定サンプル（TASK-91 / MS-3）。
 # 読み込み・検証の仕様は crates/fandhe-browser-core/src/config.rs を参照。
+# cli は環境変数 FANDHE_BROWSER_CONFIG で指定したときだけ読み込む（暫定。TASK-47 で引数化予定）。
 # 相対パスは、この設定ファイルの親ディレクトリを基準に解決される。
 
 [profile]

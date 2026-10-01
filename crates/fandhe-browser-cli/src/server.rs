@@ -57,10 +57,29 @@ pub(crate) type RouterFactory = Box<dyn FnOnce(Arc<AppState>) -> Router>;
 /// 利用者へ伝える。`main` が `error: ` を前置して stderr へ出し、非ゼロで終了する。
 pub(crate) const UNSUPPORTED_OS_MESSAGE: &str = "profile isolation is not yet supported on this OS (Windows ACL not implemented; XOS-7..XOS-10)";
 
+/// `FANDHE_BROWSER_CONFIG` が空文字だった場合の固定文言（`startup_config` が返す）。
+pub(crate) const CONFIG_PATH_EMPTY_MESSAGE: &str = "FANDHE_BROWSER_CONFIG is set but empty";
+
+/// 設定の `[profile] root` が指定されたが cli へ未配線の場合の固定文言。
+///
+/// 黙って無視すると既定プロファイルへ書き込む（設定が効いているように装う）ため拒否する。
+pub(crate) const PROFILE_ROOT_NOT_WIRED_MESSAGE: &str =
+    "profile.root in the config file is not yet supported by the CLI (TASK-47/TASK-60.4)";
+
 /// 起動時のエラー。`Display` は固定の英語文言で、入力値（パス・アドレス等）を埋め込まない。
+///
+/// 例外は [`StartupError::Config`] のみで、core の設定エラー文言（指定値・同梱エンジン一覧・
+/// 必要な feature）をそのまま透過する（spec `JS-1` 切替方式ケース (3) の要求。値は運用者
+/// 自身のローカル設定由来。設定ファイルのパスは含まれない）。
 #[derive(Debug)]
 #[non_exhaustive]
 pub(crate) enum StartupError {
+    /// 設定ファイルの読み込み・検証の失敗（未同梱エンジン指定を含む。`JS-2`・TASK-30.5）。
+    Config(fandhe_browser_core::Error),
+    /// `FANDHE_BROWSER_CONFIG` が空文字。
+    ConfigPathEmpty,
+    /// `[profile] root` 指定は cli 未配線のため拒否した。
+    ProfileRootNotWired,
     /// プロファイルのルート解決・open の失敗（Windows の `Unsupported`・二重起動の `Locked` を含む）。
     Profile(ProfileError),
     /// CDP の WebSocket 設定の構築失敗。
@@ -80,6 +99,9 @@ pub(crate) enum StartupError {
 impl fmt::Display for StartupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Config(e) => write!(f, "{e}"),
+            Self::ConfigPathEmpty => f.write_str(CONFIG_PATH_EMPTY_MESSAGE),
+            Self::ProfileRootNotWired => f.write_str(PROFILE_ROOT_NOT_WIRED_MESSAGE),
             Self::Profile(ProfileError::Unsupported { .. }) => f.write_str(UNSUPPORTED_OS_MESSAGE),
             Self::Profile(_) => f.write_str("failed to open profile"),
             Self::WebSocketConfig(_) => f.write_str("failed to build websocket config"),
@@ -95,6 +117,8 @@ impl fmt::Display for StartupError {
 impl std::error::Error for StartupError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Config(e) => Some(e),
+            Self::ConfigPathEmpty | Self::ProfileRootNotWired => None,
             Self::Profile(e) => Some(e),
             Self::WebSocketConfig(e) => Some(e),
             Self::RouteConflict(e) => Some(e),
