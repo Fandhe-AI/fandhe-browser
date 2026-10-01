@@ -925,6 +925,15 @@ impl<'doc> NameIndex<'doc> {
         out
     }
 
+    /// 判定専用の予算（[`NameIndex::with_isolated_content_budget`]）が尽きているか。
+    ///
+    /// 尽きた後の子孫テキスト走査は空の名前＋`truncated` になり、展開時に `title` が
+    /// name になるかを確定できない。呼び出し側は圧縮せず展開を維持する
+    /// （`AISNAP-1`・`AISNAP-2`・TASK-12・Issue #631。AGENTS.md のリソース上限）。
+    pub(super) fn isolated_budget_exhausted(&self) -> bool {
+        self.judge_steps_left.get() == 0
+    }
+
     /// `ancestor` が `node` 自身またはその祖先かどうかを、構築時に記録した
     /// 入退場番号の区間包含で定数時間に判定する。索引に載らないノード
     /// （走査上限で打ち切られた分）は「含まない」として扱う。

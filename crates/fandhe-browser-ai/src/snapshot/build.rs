@@ -299,6 +299,7 @@ fn has_non_text_name_source(doc: &Document, id: NodeId) -> bool {
 /// 判定に使わず `source` だけで判断する（content 由来の `truncated` を title 由来と誤認しない）。
 /// 判定は name 算出用の共有予算とは別枠の予算で行い（[`NameIndex::with_isolated_content_budget`]）、
 /// 判定対象外の要素の name・`truncated` を変えない。対象は `title` 付き要素に限り有界。
+/// 判定予算が枯渇して出所を確定できない場合は保守的に true（展開を維持）を返す。
 /// 畳む行の判定（`AISNAP-12`）と [`can_compress`] の双方から呼ばれる。
 fn title_becomes_name(doc: &Document, index: &NameIndex<'_>, id: NodeId) -> bool {
     if !doc
@@ -309,7 +310,12 @@ fn title_becomes_name(doc: &Document, index: &NameIndex<'_>, id: NodeId) -> bool
     }
     // 判定は別枠の予算で行い、name 算出用の共有予算を消費しない。
     let name = index.with_isolated_content_budget(|| compute_name_with_index(doc, index, id));
-    name.source == NameSource::Title
+    if name.source == NameSource::Title {
+        return true;
+    }
+    // 判定予算の枯渇で名前の出所を確定できない場合は保守的に「title が name になる」
+    // 扱いとし、展開を維持する（圧縮で accessible name を失わない）。
+    name.source == NameSource::None && name.truncated && index.isolated_budget_exhausted()
 }
 
 /// 操作可能（フォーカス・クリック・入力の対象になり得る）要素か。
@@ -925,6 +931,28 @@ mod tests {
         );
         let s = snap(&html);
         assert!(has_table_summary(&s));
+    }
+
+    /// AISNAP-2（Issue #631）: 判定予算が枯渇して name の出所を確定できない場合は
+    /// 保守的に「title が name になる」扱い（展開維持）にし、名前を失わない。
+    #[test]
+    fn aisnap_2_exhausted_judge_budget_keeps_expansion() {
+        use super::title_becomes_name;
+        use crate::snapshot::name::NameIndex;
+
+        let html = r#"<table><tr><td id="c" title="tip">x</td></tr></table>"#;
+        let parsed =
+            parse_document(html, &ParseOptions::default()).expect("テスト入力は必ず成功する");
+        let doc = parsed.document;
+        let id = fandhe_browser_core::query::query_selector_str(&doc, doc.root(), "td#c")
+            .expect("セレクタは解釈できる")
+            .expect("対象要素が見つかる");
+        // 予算が十分なら name は子孫テキスト由来で title は出ない（false）。
+        let ample = NameIndex::build(&doc).with_content_budget(1024);
+        assert!(!title_becomes_name(&doc, &ample, id));
+        // 予算 0 では出所を確定できないため保守的に true。
+        let zero = NameIndex::build(&doc).with_content_budget(0);
+        assert!(title_becomes_name(&doc, &zero, id));
     }
 
     /// AISNAP-2（Issue #631）: generic（span）の title は展開で name になるため展開を維持する。
