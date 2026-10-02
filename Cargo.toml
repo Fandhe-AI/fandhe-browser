@@ -106,6 +106,15 @@ tokio = { version = "=1.53.1", default-features = false, features = [
 # の Servo 隔離と同様の考え方）。
 v8 = { version = "=152.2.0" }
 
+# TASK-32（32.1）・JS-1・MS-3: 軽量 JS エンジン boa（`boa_engine` crate）。
+# Issue #164（TASK-32.hdep）でユーザー承認済み（2026-09-25）。
+# ライセンスは Unlicense OR MIT（licensing.md の許可範囲内）。純 Rust で
+# C/C++ ビルドを要さず、3 OS ともネイティブビルド不要。
+# feature は既定（`float16`・`xsum`・`temporal`）のまま使い、`intl` 系は有効化しない。
+# 使用箇所は `fandhe-browser-js`（feature `js-boa`）のみで、既定ビルド
+# （`js-boa` 無効）の依存グラフには含まれない（RENDER-1 と同じ隔離の考え方）。
+boa_engine = { version = "=0.22.0" }
+
 # TASK-29（Issue #503・JS-1）: Windows で JS ワーカーの子プロセスに OS 強制の
 # コミットメモリ上限（Job Object の ProcessMemoryLimit）を掛け、親側で子の
 # コミット量（PrivateUsage）を取得するために Win32 API を直接呼ぶ。win32job の

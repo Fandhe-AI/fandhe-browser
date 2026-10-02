@@ -39,7 +39,7 @@ fandhe-browser-render = { workspace = true, optional = true }
 # （core / js に置くと ai・cdp 経由の feature 統合で、軽量ビルドから V8 を外せなくなるため）。
 # ビルド構成の対応:
 #   既定                                          = V8 のみ同梱
-#   --no-default-features --features js-boa       = 軽量（boa。js 側は TASK-32・#165 までプレースホルダ）
+#   --no-default-features --features js-boa       = 軽量（boa。js 側の実装は TASK-32.2・#166 まで未実装）
 #   --no-default-features                         = エンジンなし（JS 実行要求はエラーで、成功を装わない）
 # `main` 先頭でワーカーフック `run_js_worker_if_requested` を呼ぶ（#514）。ただし実行経路から
 # `create_engine` はまだ呼ばれない（REPAIR-3）。js_stub の置換は #161（TASK-30.3）。

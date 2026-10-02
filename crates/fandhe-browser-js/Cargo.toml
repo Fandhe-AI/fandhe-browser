@@ -11,11 +11,12 @@ publish.workspace = true
 # （`default = []`）の依存グラフには含めない（RENDER-1 の Servo 隔離と
 # 同じ考え方。3 OS 一級対応の既定ビルドを軽量に保つ）。
 #
-# boa（boa_engine）の具体的な依存追加は TASK-32（Issue #165）でユーザー
-# 承認を経て行う（dependency-policy.md）。それまで `js-boa` は
-# プレースホルダ feature のまま残す。
+# boa（boa_engine）は TASK-32（32.1）・JS-1 で Issue #164（2026-09-25 承認）に
+# 従い追加した（dependency-policy.md）。V8 と同じく `optional = true` とし、
+# `js-boa` feature 経由でのみ有効化して既定ビルドの依存グラフには含めない。
 [dependencies]
 v8 = { workspace = true, optional = true }
+boa_engine = { workspace = true, optional = true }
 
 # JS ワーカーの子プロセスが自身へ OS のメモリ上限を掛けるための依存（TASK-29・
 # Issue #503。ユーザー承認 2026-09-28）。いずれも `js-v8` feature からのみ有効化し、
@@ -35,17 +36,15 @@ windows-sys = { workspace = true, optional = true }
 #
 # `js-v8` は `dep:v8` と結合済みで、`create_engine`（`engine_trait.rs`）は
 # 子プロセス版の V8 エンジンを返す（TASK-29.6.2・Issue #548）。boa は
-# TASK-32 まで `CreateEngineError::NotYetImplemented` のまま（実装済みを
+# TASK-32.2（#166）まで `CreateEngineError::NotYetImplemented` のまま（実装済みを
 # 装わない。REPAIR-3）。
 #
-# `js-boa` は Cargo の制約（`dep:` 接頭辞 feature は対応する optional
-# 依存が [dependencies] に無いと feature が無効でも manifest 解析自体が
-# 失敗する）により、`boa_engine` を追加する TASK-32（Issue #165）まで
-# 引き続き `dep:` 接頭辞なしのプレースホルダのままにする。
+# `js-boa` は `dep:boa_engine` と結合済み（TASK-32.1・Issue #165）。具象実装
+# （`create_engine` からの生成）は TASK-32.2（Issue #166）まで未実装。
 [features]
 default = []
 js-v8 = ["dep:v8", "dep:rustix", "dep:windows-sys"]
-js-boa = []
+js-boa = ["dep:boa_engine"]
 # テスト専用入口（`*_for_test`）を本番ビルドから隔離する feature（Issue
 # #528・TASK-29・`JS-1`）。`process_engine` のテスト専用メソッド・
 # `WorkerSpawnConfigForTest` はこの feature が有効なときだけ crate 外から
