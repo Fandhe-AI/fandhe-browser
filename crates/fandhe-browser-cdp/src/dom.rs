@@ -4,6 +4,7 @@
 //! 呼ばれる。`Page.navigate`（42.2）が core の `AppState::navigation()` へ保存した
 //! 最終 URL と HTML を読み、core の `parse_document` で DOM 化して CDP の `DOM.Node`
 //! 形式の JSON へ変換する。読み取り専用で状態は変更しない。
+//! `DOM.querySelector`（TASK-42.5・#243、`CDP-1`・`CDP-5`）も同じ文書・採番を使う。
 //!
 //! # nodeId の採番（TASK-42.5 `DOM.querySelector` が依存する契約）
 //!
@@ -26,17 +27,27 @@
 //! - `<base href>` の解決は未実装。`href` 付き `base` 要素を持つ文書では `baseURL` を省略する
 //! - 採番は文書全体を走査するため、ノード数が [`MAX_NUMBERED_NODES`] を超える文書は
 //!   `DOCUMENT_TOO_LARGE` エラーにする（切り詰めない）
-//! - 呼び出しごとに再パースし、ノード表のセッション保持・キャッシュは行わない
+//! - 呼び出しごとに再パースし、ノード表のセッション保持・キャッシュは行わない。
+//!   `DOM.getDocument` と `DOM.querySelector` の間に別の遷移が確定すると、同じ nodeId が
+//!   新しい文書のノードを指す（ノード表の保持は後続。`CDP-2`・TASK-43）
+//! - `DOM.querySelector`: 一致なしは `{"nodeId": 0}`（`CDP-5`）。構文不正は `INVALID_PARAMS`、
+//!   未対応構文（core のサブセット外）は `UNSUPPORTED_PARAMS`、解決できない nodeId は
+//!   `NODE_NOT_FOUND`（0 を捏造しない。`SEC-2`）。テキスト等の非コンテナを起点にした場合は
+//!   子孫要素が無いため 0 を返す（Chrome はエラー。差異）
 //! - 直近の navigate 結果が無い場合は空ドキュメントを捏造せずエラーを返す（`SEC-2`）
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use fandhe_browser_core::NavigationResult;
 use fandhe_browser_core::{
-    Document, Error, NodeData, NodeId, ParseError, ParseOptions, parse_document,
+    Document, Error, NodeData, NodeId, ParseError, ParseOptions, ParsedDocument, parse_document,
+    query_selector_str,
 };
 use serde_json::{Map, Value, json};
 
 use crate::protocol::{BoxFuture, CdpError, CommandContext, CommandHandler, HandlerOutput};
+use crate::target::TargetId;
 
 /// 1 応答で展開する最大の深さ（root = 0）。構築は反復的だが、serde_json の直列化・drop が
 /// 深さに比例して再帰するため上限を設ける。
@@ -120,7 +131,6 @@ impl NodeNumbering {
     }
 
     /// CDP の nodeId に対応する core の `NodeId`。
-    #[allow(dead_code)] // 42.5（DOM.querySelector）が使う
     pub(crate) fn resolve(&self, node_id: i64) -> Option<NodeId> {
         let idx = usize::try_from(node_id.checked_sub(1)?).ok()?;
         self.order.get(idx).copied()
@@ -299,6 +309,106 @@ pub(crate) fn build_document_node(
     Ok(built.remove(&root).unwrap_or(Value::Null))
 }
 
+/// `sessionId` を解決する（なければブラウザレベル = `None`）。未登録は `INVALID_PARAMS`。
+fn resolve_target(ctx: &CommandContext<'_>) -> Result<Option<TargetId>, CdpError> {
+    match ctx.session_id {
+        Some(sid) => Ok(Some(
+            ctx.state
+                .registry()
+                .session_target(sid)
+                .ok_or(CdpError::INVALID_PARAMS)?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// 対象の最終確定文書を取得して DOM 化する。`DOM.getDocument`・`DOM.querySelector` が共有し、
+/// 文書の選択・上限・エラー写像を 1 か所に保つ。
+fn load_document(
+    ctx: &CommandContext<'_>,
+    target: Option<&TargetId>,
+) -> Result<(Arc<NavigationResult>, ParsedDocument), CdpError> {
+    let latest = match target {
+        // そのターゲットが最後に確定した文書だけを読む。共有状態へはフォールバックしない
+        // （別ターゲットの内容を返さない。`CDP-1`）。未確定・失敗は明示エラー（`SEC-2`）。
+        Some(tid) => ctx
+            .state
+            .navigations()
+            .get(tid)
+            .and_then(|n| n.latest())
+            .ok_or(CdpError::TARGET_DOCUMENT_UNAVAILABLE)?,
+        None => ctx
+            .state
+            .app_state()
+            .navigation()
+            .latest()
+            .ok_or(CdpError::NO_DOCUMENT)?,
+    };
+    // DOM 応答用の上限をパース時点で適用し、巨大文書の全ノード構築を避ける（`SEC-2`）。
+    let opts = ParseOptions::default().with_max_nodes(MAX_NUMBERED_NODES);
+    let parsed = parse_document(latest.html(), &opts).map_err(|e| match e {
+        Error::Parse(ParseError::NodeLimitExceeded { .. }) => CdpError::DOCUMENT_TOO_LARGE,
+        _ => CdpError::SERVER_ERROR,
+    })?;
+    Ok((latest, parsed))
+}
+
+/// `params` から `(nodeId, selector)` を取り出す。欠落・型違いは `INVALID_PARAMS`。
+fn parse_query_params(params: &Value) -> Result<(i64, &str), CdpError> {
+    let node_id = params
+        .get("nodeId")
+        .and_then(Value::as_i64)
+        .ok_or(CdpError::INVALID_PARAMS)?;
+    let selector = params
+        .get("selector")
+        .and_then(Value::as_str)
+        .ok_or(CdpError::INVALID_PARAMS)?;
+    Ok((node_id, selector))
+}
+
+/// `nodeId` 配下でセレクタに最初に一致する要素の nodeId を返す。一致なしは `0`（`CDP-5`）。
+///
+/// 構文不正・未対応構文・処理量超過は 0 にせずエラーにする（一致なしを装わない。`REPAIR-3`・`SEC-2`）。
+/// 採番は [`number_nodes`] で `DOM.getDocument` と同一。
+fn query_selector_node_id(doc: &Document, node_id: i64, selector: &str) -> Result<i64, CdpError> {
+    if doc.node_count() > MAX_NUMBERED_NODES {
+        return Err(CdpError::DOCUMENT_TOO_LARGE);
+    }
+    let numbering = number_nodes(doc);
+    let scope = numbering.resolve(node_id).ok_or(CdpError::NODE_NOT_FOUND)?;
+    match query_selector_str(doc, scope, selector) {
+        Ok(Some(found)) => numbering.node_id(found).ok_or(CdpError::SERVER_ERROR),
+        Ok(None) => Ok(0),
+        Err(Error::InvalidInput { .. }) => Err(CdpError::INVALID_PARAMS),
+        Err(Error::Unsupported { .. }) => Err(CdpError::UNSUPPORTED_PARAMS),
+        Err(Error::MatchCacheLimitExceeded { .. }) => Err(CdpError::DOCUMENT_TOO_LARGE),
+        Err(_) => Err(CdpError::SERVER_ERROR),
+    }
+}
+
+/// `DOM.querySelector` ハンドラ（TASK-42.5・#243、`CDP-1`・`CDP-5`）。
+///
+/// `protocol::builtin_handlers` から登録される。直近（または `sessionId` のターゲットの）
+/// 確定文書を再パースし、`DOM.getDocument` と同じ採番で nodeId を返す。
+pub(crate) struct DomQuerySelector;
+
+impl CommandHandler for DomQuerySelector {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            // 検証順: セッション解決 → パラメータ検証 → 文書の取得 → 照合。
+            let target = resolve_target(&ctx)?;
+            let (node_id, selector) = parse_query_params(params)?;
+            let (_latest, parsed) = load_document(&ctx, target.as_ref())?;
+            let found = query_selector_node_id(&parsed.document, node_id, selector)?;
+            Ok(HandlerOutput::result(json!({ "nodeId": found })))
+        })
+    }
+}
+
 /// `DOM.getDocument` ハンドラ。
 pub(crate) struct DomGetDocument;
 
@@ -310,39 +420,10 @@ impl CommandHandler for DomGetDocument {
     ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
         Box::pin(async move {
             // 検証順: セッション解決 → パラメータ検証 → 文書の取得。
-            let target = match ctx.session_id {
-                Some(sid) => Some(
-                    ctx.state
-                        .registry()
-                        .session_target(sid)
-                        .ok_or(CdpError::INVALID_PARAMS)?,
-                ),
-                None => None,
-            };
+            let target = resolve_target(&ctx)?;
             let depth = parse_depth(params)?;
             check_pierce(params)?;
-            let latest = match &target {
-                // そのターゲットが最後に確定した文書だけを読む。共有状態へはフォールバックしない
-                // （別ターゲットの内容を返さない。`CDP-1`）。未確定・失敗は明示エラー（`SEC-2`）。
-                Some(tid) => ctx
-                    .state
-                    .navigations()
-                    .get(tid)
-                    .and_then(|n| n.latest())
-                    .ok_or(CdpError::TARGET_DOCUMENT_UNAVAILABLE)?,
-                None => ctx
-                    .state
-                    .app_state()
-                    .navigation()
-                    .latest()
-                    .ok_or(CdpError::NO_DOCUMENT)?,
-            };
-            // DOM 応答用の上限をパース時点で適用し、巨大文書の全ノード構築を避ける（`SEC-2`）。
-            let opts = ParseOptions::default().with_max_nodes(MAX_NUMBERED_NODES);
-            let parsed = parse_document(latest.html(), &opts).map_err(|e| match e {
-                Error::Parse(ParseError::NodeLimitExceeded { .. }) => CdpError::DOCUMENT_TOO_LARGE,
-                _ => CdpError::SERVER_ERROR,
-            })?;
+            let (latest, parsed) = load_document(&ctx, target.as_ref())?;
             let root = build_document_node(&parsed.document, latest.url(), depth)?;
             Ok(HandlerOutput::result(json!({ "root": root })))
         })
@@ -507,6 +588,94 @@ mod tests {
         assert_eq!(
             parse_depth(&json!({"depth": 256})),
             Ok(Depth::exact(MAX_TREE_DEPTH))
+        );
+    }
+
+    fn qs(node_id: i64, selector: &str) -> Result<i64, CdpError> {
+        query_selector_node_id(&doc(PAGE), node_id, selector)
+    }
+
+    #[test]
+    fn cdp1_query_selector_returns_matching_node_id() {
+        for sel in ["h1", "#t", "body > h1"] {
+            assert_eq!(qs(1, sel), Ok(6), "{sel}");
+        }
+    }
+
+    #[test]
+    fn cdp1_query_selector_node_id_matches_get_document() {
+        let d = doc(PAGE);
+        let tree = build_document_node(&d, "u", Depth::unlimited()).unwrap();
+        let h1 = &tree["children"][1]["children"][1]["children"][0];
+        assert_eq!(h1["nodeName"], "H1");
+        assert_eq!(
+            query_selector_node_id(&d, 1, "h1"),
+            Ok(h1["nodeId"].as_i64().unwrap())
+        );
+    }
+
+    #[test]
+    fn cdp1_query_selector_scoped_to_node() {
+        assert_eq!(qs(5, "h1"), Ok(6));
+        assert_eq!(qs(5, "head"), Ok(0));
+    }
+
+    #[test]
+    fn cdp1_query_selector_excludes_scope_itself() {
+        assert_eq!(qs(6, "h1"), Ok(0));
+    }
+
+    #[test]
+    fn cdp5_query_selector_missing_selector_returns_zero() {
+        assert_eq!(qs(1, "#does-not-exist"), Ok(0));
+    }
+
+    #[test]
+    fn cdp1_query_selector_text_node_scope_returns_zero() {
+        assert_eq!(qs(7, "h1"), Ok(0));
+    }
+
+    #[test]
+    fn repair3_query_selector_unsupported_selector_is_error() {
+        for sel in ["h1:first-child", "*", "h1 + p"] {
+            assert_eq!(qs(1, sel), Err(CdpError::UNSUPPORTED_PARAMS), "{sel}");
+        }
+    }
+
+    #[test]
+    fn sec2_query_selector_invalid_selector_is_error() {
+        let long = "a".repeat(4097);
+        for sel in ["", "#", long.as_str()] {
+            assert_eq!(
+                qs(1, sel),
+                Err(CdpError::INVALID_PARAMS),
+                "len {}",
+                sel.len()
+            );
+        }
+    }
+
+    #[test]
+    fn cdp1_query_selector_unknown_node_id_is_error() {
+        for id in [0, -1, 8, i64::MAX] {
+            assert_eq!(qs(id, "h1"), Err(CdpError::NODE_NOT_FOUND), "{id}");
+        }
+    }
+
+    #[test]
+    fn cdp1_query_selector_invalid_params() {
+        for p in [
+            json!({"selector": "h1"}),
+            json!({"nodeId": "1", "selector": "h1"}),
+            json!({"nodeId": 1.5, "selector": "h1"}),
+            json!({"nodeId": 1}),
+            json!({"nodeId": 1, "selector": 5}),
+        ] {
+            assert_eq!(parse_query_params(&p), Err(CdpError::INVALID_PARAMS), "{p}");
+        }
+        assert_eq!(
+            parse_query_params(&json!({"nodeId": 1, "selector": "h1"})),
+            Ok((1, "h1"))
         );
     }
 
@@ -727,6 +896,109 @@ mod tests {
                 pierce["error"],
                 json!({"code": -32602, "message": "unsupported params"})
             );
+        }
+
+        fn qs_text(id: u32, sid: Option<&str>, params: &str) -> String {
+            let sess = sid.map_or(String::new(), |s| format!(r#","sessionId":"{s}""#));
+            format!(r#"{{"id":{id},"method":"DOM.querySelector"{sess},"params":{params}}}"#)
+        }
+
+        #[tokio::test]
+        async fn cdp1_dispatch_query_selector_after_navigation() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            let v = call(&st, &qs_text(1, None, r#"{"nodeId":1,"selector":"h1"}"#)).await;
+            assert_eq!(v, json!({"id": 1, "result": {"nodeId": 6}}));
+        }
+
+        #[tokio::test]
+        async fn cdp5_dispatch_query_selector_missing_returns_zero() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            let v = call(
+                &st,
+                &qs_text(2, None, r##"{"nodeId":1,"selector":"#does-not-exist"}"##),
+            )
+            .await;
+            assert_eq!(v, json!({"id": 2, "result": {"nodeId": 0}}));
+        }
+
+        #[tokio::test]
+        async fn cdp1_dispatch_query_selector_without_navigation_is_error() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let v = call(&st, &qs_text(3, None, r#"{"nodeId":1,"selector":"h1"}"#)).await;
+            assert_eq!(
+                v["error"],
+                json!({"code": -32000, "message": "no document loaded"})
+            );
+            assert!(v.get("result").is_none());
+        }
+
+        #[tokio::test]
+        async fn cdp1_dispatch_query_selector_unknown_session_rejected() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            let v = call(
+                &st,
+                &qs_text(4, Some("NOPE-1"), r#"{"nodeId":1,"selector":"h1"}"#),
+            )
+            .await;
+            assert_eq!(
+                v["error"],
+                json!({"code": -32602, "message": "invalid params"})
+            );
+        }
+
+        /// セッション付きはそのターゲットの文書だけを検索する（共有状態へフォールバックしない）。
+        #[tokio::test]
+        async fn cdp1_dispatch_query_selector_session_uses_target_document() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            let (tid, sid) = session_for_new_target(&st);
+            let none = call(
+                &st,
+                &qs_text(5, Some(&sid), r#"{"nodeId":1,"selector":"h1"}"#),
+            )
+            .await;
+            assert_eq!(
+                none["error"],
+                serde_json::from_str::<Value>(UNAVAILABLE).unwrap()
+            );
+            commit_target(&st, &tid, "https://target.example/", "<p id=\"x\">a</p>");
+            let hit = call(
+                &st,
+                &qs_text(6, Some(&sid), r##"{"nodeId":1,"selector":"#x"}"##),
+            )
+            .await;
+            assert_eq!(hit["result"]["nodeId"], 5);
+            let miss = call(
+                &st,
+                &qs_text(7, Some(&sid), r#"{"nodeId":1,"selector":"h1"}"#),
+            )
+            .await;
+            assert_eq!(miss["result"]["nodeId"], 0);
+        }
+
+        #[tokio::test]
+        async fn sec2_dispatch_query_selector_error_does_not_echo_selector() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            let v = call(
+                &st,
+                &qs_text(8, None, r#"{"nodeId":1,"selector":"h1:MARKER-xyz"}"#),
+            )
+            .await;
+            assert_eq!(
+                v["error"],
+                json!({"code": -32602, "message": "unsupported params"})
+            );
+            assert!(!v.to_string().contains("MARKER-xyz"));
         }
     }
 }
