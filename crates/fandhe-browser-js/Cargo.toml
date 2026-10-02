@@ -35,16 +35,20 @@ windows-sys = { workspace = true, optional = true }
 # 実依存へ結合した）。
 #
 # `js-v8` は `dep:v8` と結合済みで、`create_engine`（`engine_trait.rs`）は
-# 子プロセス版の V8 エンジンを返す（TASK-29.6.2・Issue #548）。boa は
-# 同一プロセス内の boa 版エンジンを返す（TASK-32.2・Issue #166。wall-clock
-# タイムアウト・ヒープ上限が無い点は `boa_engine.rs` の「既知の制限」参照）。
+# 子プロセス版の V8 エンジンを返す（TASK-29.6.2・Issue #548）。boa も
+# 同じ子プロセス分離基盤（`process_engine`・`worker`・`resource_limits`）の上で
+# 動かす（TASK-32.2・Issue #166）。boa には wall-clock タイムアウト・ヒープ
+# 上限の API が無いため、親による期限 kill と子の OS メモリ上限で強制する
+# （AGENTS.md「リソース上限」P0）。そのため `js-boa` も `js-v8` と同じ
+# 既承認の optional 依存（rustix・windows-sys。Issue #503・2026-09-28 承認）を
+# 有効化する（新規 crate の追加ではない）。
 #
 # `js-boa` は `dep:boa_engine` と結合済み（TASK-32.1・Issue #165）。具象実装
 # （`create_engine` からの生成）は TASK-32.2（Issue #166）で追加済み。
 [features]
 default = []
 js-v8 = ["dep:v8", "dep:rustix", "dep:windows-sys"]
-js-boa = ["dep:boa_engine"]
+js-boa = ["dep:boa_engine", "dep:rustix", "dep:windows-sys"]
 # テスト専用入口（`*_for_test`）を本番ビルドから隔離する feature（Issue
 # #528・TASK-29・`JS-1`）。`process_engine` のテスト専用メソッド・
 # `WorkerSpawnConfigForTest` はこの feature が有効なときだけ crate 外から
@@ -140,6 +144,16 @@ required-features = ["test-support"]
 [[test]]
 name = "worker_memory_footprint_smaps"
 path = "benches/worker_memory_footprint/smaps_tests.rs"
+
+# boa 子プロセス分離（TASK-32.2・Issue #166）の結合テスト。実時間・メモリの上限が
+# プロセス境界で効くことを実際の子プロセスで確認する。`harness = false` の理由は
+# `conformance` と同じ（このバイナリ自身が子プロセス役を兼ね、stdout は
+# プロトコルフレーム専用）。`js-boa` が無いビルドでは `create_engine(Boa)` が
+# 成立しないため `required-features` で除外する。
+[[test]]
+name = "boa_worker"
+harness = false
+required-features = ["js-boa"]
 
 # 両エンジン共通のコンフォーマンステスト（TASK-28.4・Issue #150）。V8 を
 # `create_engine` から配線した（TASK-29.6.2・Issue #548）ため、このテスト

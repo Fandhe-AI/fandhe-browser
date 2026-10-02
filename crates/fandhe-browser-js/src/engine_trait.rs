@@ -91,10 +91,10 @@ const BUNDLED: &[EngineKind] = &[
 /// 順序は `js-engine.md`「(1) 省略」の「同梱エンジンから V8 → boa の優先順で
 /// 選ぶ」という後続契約（TASK-91 が依存）に対応する。
 ///
-/// `js-v8` は子プロセス版エンジン、`js-boa` は同一プロセス内の boa 版エンジンへ
-/// 配線済みで（TASK-29.6.2・#548／TASK-32.2・#166）、[`create_engine`] は
-/// どちらも `Ok` を返す。ただし boa 版は wall-clock タイムアウト・ヒープ上限を
-/// 持たない（`boa_engine` モジュールの「既知の制限」。REPAIR-3）。
+/// `js-v8`・`js-boa` はどちらも子プロセス版エンジンへ配線済みで
+/// （TASK-29.6.2・#548／TASK-32.2・#166）、[`create_engine`] はどちらも `Ok` を
+/// 返す。boa は V8 と同じ子プロセス分離基盤の上で動き、実時間は親の期限 kill、
+/// メモリは子の OS 上限と親の RSS 監視で強制する（`boa_worker` モジュール doc）。
 /// [`create_engine`] はこの一覧を「同梱判定」の唯一の情報源として使う。
 /// feature が無効なバリアントはコンパイル自体から除外されるため
 /// （`#[cfg(...)]` 付きの配列要素）、「同梱されていないのに一覧に載る」
@@ -470,15 +470,14 @@ impl std::error::Error for CreateEngineError {}
 ///
 /// **契約**: 同梱していない種別（[`bundled_engines`] に含まれない）には
 /// [`CreateEngineError::NotBundled`] を返し、別エンジンへのフォールバックは
-/// しない。V8 は子プロセス版エンジン（`process_engine::V8ProcessEngine`）を
-/// `Ok` で返す。boa は同一プロセス内の boa 版エンジン（`boa_engine::BoaEngine`・
-/// `TASK-32.2`・#166）を `Ok` で返す。boa 版は V8 版と異なりプロセス分離を
-/// せず、wall-clock タイムアウトとヒープ上限が無い（`boa_engine` モジュールの
-/// 「既知の制限」）。
+/// しない。V8・boa とも子プロセス版エンジン（`process_engine::V8ProcessEngine`。
+/// boa は `EngineKind::Boa` を指定して生成。`TASK-32.2`・#166）を `Ok` で返す。
+/// boa には中断 API・ヒープ上限 API が無いため、プロセス境界で実時間（親の
+/// 期限 kill）とメモリ（子の OS 上限・親の RSS 監視）を強制する。
 ///
 /// # 起動タイミングと失敗の現れ方（`TASK-29.6.2`・#548。`PERF-6`・`PERF-7`・`CORE-3`）
 ///
-/// V8 版は**遅延起動**で、本関数は I/O を行わず子プロセスを起動しない。子が
+/// V8 版・boa 版とも**遅延起動**で、本関数は I/O を行わず子プロセスを起動しない。子が
 /// 起動するのは `evaluate_script`・`inject_global_function`・
 /// `bind_dom_like_object` のうち最初に呼ばれたもので、起動・ハンドシェイクの
 /// 失敗は `CreateEngineError` ではなく、その呼び出しが返す
@@ -507,11 +506,13 @@ pub fn create_engine(kind: EngineKind) -> Result<Box<dyn JsEngine>, CreateEngine
     }
 }
 
-/// boa 版エンジンを生成する（[`create_engine`] から呼ばれる。コンテキストは
-/// 最初の操作まで作らない）。
+/// boa の子プロセス版エンジンを生成する（[`create_engine`] から呼ばれる。
+/// 子は最初の操作まで起動しない）。
 #[cfg(feature = "js-boa")]
 fn create_boa_engine() -> Result<Box<dyn JsEngine>, CreateEngineError> {
-    Ok(Box::new(crate::boa_engine::BoaEngine::new()))
+    Ok(Box::new(
+        crate::process_engine::V8ProcessEngine::with_engine_kind(EngineKind::Boa),
+    ))
 }
 
 /// `js-boa` 無効時の boa 分岐。[`create_engine`] は同梱判定で先に

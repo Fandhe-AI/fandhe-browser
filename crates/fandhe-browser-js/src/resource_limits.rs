@@ -186,14 +186,19 @@
 //!   発火してこの子が選ばれて終了することは検証していない（環境依存の
 //!   ため対象外。回帰テストが確認するのは値の書き込みそのものに留まる）
 
+#[cfg(feature = "js-v8")]
 use std::alloc::{Layout, alloc, alloc_zeroed, dealloc};
+#[cfg(feature = "js-v8")]
 use std::ffi::c_void;
 #[cfg(target_os = "macos")]
 use std::io::Read;
 #[cfg(target_os = "linux")]
 use std::path::Path;
+#[cfg(feature = "js-v8")]
 use std::ptr::NonNull;
+#[cfg(feature = "js-v8")]
 use std::sync::Arc;
+#[cfg(feature = "js-v8")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 #[cfg(target_os = "macos")]
@@ -219,6 +224,16 @@ use std::time::Instant;
 /// 際限のない確保だけは確実に止めることを狙った値である。
 const HEAP_EXTERNAL_ALLOWANCE_BYTES: u64 = 128 * 1024 * 1024;
 
+/// RSS しきい値の算出に使う「エンジンのヒープ上限」の基準値（バイト）。
+/// V8 は Isolate ヒープ上限（`v8_engine::MAX_ISOLATE_HEAP_BYTES`）を使う。
+/// boa（`js-boa` のみ）には専用のヒープ上限 API が無いため、同じ 128 MiB を
+/// 基準にして V8 と同じ監視しきい値（320 MiB）にそろえる（`TASK-32.2`・
+/// Issue #166）。
+#[cfg(feature = "js-v8")]
+const CHILD_HEAP_BASELINE_BYTES: u64 = super::v8_engine::MAX_ISOLATE_HEAP_BYTES as u64;
+#[cfg(not(feature = "js-v8"))]
+const CHILD_HEAP_BASELINE_BYTES: u64 = 128 * 1024 * 1024;
+
 /// 親が子の RSS を監視する際のしきい値（バイト）。V8 の Isolate ヒープ
 /// 上限（[`super::v8_engine`] の `MAX_ISOLATE_HEAP_BYTES`。128 MiB）と
 /// [`HEAP_EXTERNAL_ALLOWANCE_BYTES`]（128 MiB）の合計 256 MiB に対し、
@@ -235,9 +250,8 @@ const HEAP_EXTERNAL_ALLOWANCE_BYTES: u64 = 128 * 1024 * 1024;
 /// コメント「OS ごとの強制の強さ」節の実測結果を参照。Windows は
 /// [`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`] のドキュメントコメントが説明
 /// するとおり、本しきい値より 64 MiB 大きい値にしている）。
-pub(crate) const MAX_CHILD_RSS_BYTES: u64 = super::v8_engine::MAX_ISOLATE_HEAP_BYTES as u64
-    + HEAP_EXTERNAL_ALLOWANCE_BYTES
-    + 64 * 1024 * 1024;
+pub(crate) const MAX_CHILD_RSS_BYTES: u64 =
+    CHILD_HEAP_BASELINE_BYTES + HEAP_EXTERNAL_ALLOWANCE_BYTES + 64 * 1024 * 1024;
 
 /// 親が子のメモリ使用量をポーリングする間隔。50〜100 ミリ秒の範囲で、
 /// 監視の追随性（短いほど検出が速い）と監視自体のコスト（`ps` の起動を
@@ -466,14 +480,17 @@ pub(crate) fn clamp_test_windows_process_memory_limit_bytes(requested: usize) ->
 /// しきい値。320 MiB）を 64 MiB 下回る状態を保てる。V8 自身のコード
 /// 領域・snapshot・Rust ホストバイナリの通常の確保等（この上限の対象
 /// 外）にその 64 MiB の余裕を割り当てる設計である。
+#[cfg(feature = "js-v8")]
 pub(crate) const MAX_ARRAY_BUFFER_ALLOCATION_BYTES: usize = HEAP_EXTERNAL_ALLOWANCE_BYTES as usize;
 
 /// [`new_bounded_array_buffer_allocator`] が確保に使うアラインメント
 /// （バイト）。`Float64Array`・SIMD 演算等が要求しうる最大アラインメント
 /// を満たすため、一般的な malloc 実装が保証する 16 バイトに合わせる。
+#[cfg(feature = "js-v8")]
 const ARRAY_BUFFER_ALLOCATION_ALIGN: usize = 16;
 
 /// wasm の 1 ページのバイト数（V8 の仕様で固定。64 KiB）。
+#[cfg(feature = "js-v8")]
 const WASM_MEMORY_PAGE_BYTES: u64 = 64 * 1024;
 
 /// wasm の単一メモリインスタンスに許す最大ページ数
@@ -493,6 +510,7 @@ const WASM_MEMORY_PAGE_BYTES: u64 = 64 * 1024;
 /// ため、通常運用でこの上書きが失敗したまま見逃されることはない。本
 /// フラグは、それでもなお無制限の wasm メモリ確保という抜け穴を残さない
 /// ための保険として、対応前から存在した上限フラグを引き続き設定する）。
+#[cfg(feature = "js-v8")]
 const WASM_MAX_MEM_PAGES: u64 = HEAP_EXTERNAL_ALLOWANCE_BYTES / WASM_MEMORY_PAGE_BYTES;
 
 /// [`WASM_MAX_MEM_PAGES`] を V8 のフラグとして設定する（V8 152.2.0 の
@@ -510,6 +528,7 @@ const WASM_MAX_MEM_PAGES: u64 = HEAP_EXTERNAL_ALLOWANCE_BYTES / WASM_MEMORY_PAGE
 /// 単一フラグ（`--no-expose-wasm` 等）が存在しない（実機で確認済み）
 /// ため、単一メモリインスタンスへの上限という、対応前から存在した
 /// 手段をそのまま残す。
+#[cfg(feature = "js-v8")]
 pub(crate) fn configure_wasm_max_mem_pages_flag() {
     v8::V8::set_flags_from_string(&format!("--wasm-max-mem-pages={WASM_MAX_MEM_PAGES}"));
 }
@@ -732,6 +751,7 @@ mod windows_job {
 /// `AtomicUsize` と `usize` のみで構成されるため自動的に満たされ、
 /// `new_rust_allocator` が要求する `T: Sized + Send + Sync + 'static`
 /// 境界を満たす。
+#[cfg(feature = "js-v8")]
 struct BoundedArrayBufferAllocatorState {
     /// 現在確保済みの合計バイト数。
     allocated_bytes: AtomicUsize,
@@ -745,6 +765,7 @@ struct BoundedArrayBufferAllocatorState {
 /// のドキュメントコメントが「アロケータはスレッドセーフでなければ
 /// ならない」と要求しているため）。加算後の合計が `usize` で表現できない
 /// 場合（オーバーフロー）も拒否する。
+#[cfg(feature = "js-v8")]
 fn try_reserve(counter: &AtomicUsize, additional: usize, limit: usize) -> bool {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
@@ -763,6 +784,7 @@ fn try_reserve(counter: &AtomicUsize, additional: usize, limit: usize) -> bool {
 }
 
 /// [`try_reserve`] で加算した分を減算する（`free` から呼ぶ）。
+#[cfg(feature = "js-v8")]
 fn release_reservation(counter: &AtomicUsize, amount: usize) {
     // `fetch_sub` は `amount` がカウンタの現在値を超えると（V8 の契約
     // 違反や本関数のバグにより）アンダーフローして wrap するが、
@@ -782,6 +804,7 @@ fn release_reservation(counter: &AtomicUsize, amount: usize) {
 /// 通じて実際にメモリを読み書きすることは無い契約（`len == 0` の
 /// backing store には触れる場所が無い）ため、`free` 側でも対応する
 /// `len == 0` の分岐でこのポインタを `dealloc` しない。
+#[cfg(feature = "js-v8")]
 fn zero_length_allocation() -> *mut c_void {
     NonNull::<u8>::dangling().as_ptr() as *mut c_void
 }
@@ -793,6 +816,7 @@ fn zero_length_allocation() -> *mut c_void {
 /// 返す（V8 はこれを `RangeError: Array buffer allocation failed` に
 /// 変換する。呼び出し元の 2 つの vtable 関数から共有するロジックを
 /// ここへ集約する）。
+#[cfg(feature = "js-v8")]
 fn bounded_alloc(
     state: &BoundedArrayBufferAllocatorState,
     len: usize,
@@ -840,6 +864,7 @@ fn bounded_alloc(
 /// `&BoundedArrayBufferAllocatorState` として参照する操作は常に安全。
 /// パニックしうる処理は含まない（`extern "C"` 境界を越えて巻き戻ると
 /// 未定義動作になるため）。
+#[cfg(feature = "js-v8")]
 unsafe extern "C" fn bounded_array_buffer_allocate(
     handle: &BoundedArrayBufferAllocatorState,
     len: usize,
@@ -852,6 +877,7 @@ unsafe extern "C" fn bounded_array_buffer_allocate(
 ///
 /// # SAFETY
 /// [`bounded_array_buffer_allocate`] の SAFETY コメントと同じ。
+#[cfg(feature = "js-v8")]
 unsafe extern "C" fn bounded_array_buffer_allocate_uninitialized(
     handle: &BoundedArrayBufferAllocatorState,
     len: usize,
@@ -874,6 +900,7 @@ unsafe extern "C" fn bounded_array_buffer_allocate_uninitialized(
 /// いない（[`zero_length_allocation`] 参照）ため、対応してここでも
 /// `dealloc` を呼ばない。`handle` の有効性は
 /// [`bounded_array_buffer_allocate`] の SAFETY コメントと同じ。
+#[cfg(feature = "js-v8")]
 unsafe extern "C" fn bounded_array_buffer_free(
     handle: &BoundedArrayBufferAllocatorState,
     data: *mut c_void,
@@ -906,6 +933,7 @@ unsafe extern "C" fn bounded_array_buffer_free(
 /// 得たポインタを、対応する 1 回だけ `from_raw` に渡す」契約を満たす
 /// ことが呼び出し元の責務であり、本関数がその唯一の呼び出し箇所である
 /// ため、二重解放・use-after-free は起こらない。
+#[cfg(feature = "js-v8")]
 unsafe extern "C" fn bounded_array_buffer_drop(handle: *const BoundedArrayBufferAllocatorState) {
     // SAFETY: 上記のとおり。
     let state = unsafe { Arc::from_raw(handle) };
@@ -916,6 +944,7 @@ unsafe extern "C" fn bounded_array_buffer_drop(handle: *const BoundedArrayBuffer
 /// [`bounded_array_buffer_free`]・[`bounded_array_buffer_drop`] をまとめた
 /// vtable。`'static` な単一のインスタンスを全 Isolate で共有する
 /// （`handle` 側だけが Isolate ごとに異なる）。
+#[cfg(feature = "js-v8")]
 static BOUNDED_ARRAY_BUFFER_ALLOCATOR_VTABLE: v8::RustAllocatorVtable<
     BoundedArrayBufferAllocatorState,
 > = v8::RustAllocatorVtable {
@@ -973,6 +1002,7 @@ static BOUNDED_ARRAY_BUFFER_ALLOCATOR_VTABLE: v8::RustAllocatorVtable<
 /// または `kReservation` 相当の予約型確保（resizable `ArrayBuffer`／
 /// growable `SharedArrayBuffer` が経由する確保方式）を制御する手段・
 /// フラグが `v8` crate 側に入った場合は、この残存経路を再評価する。
+#[cfg(feature = "js-v8")]
 pub(crate) fn new_bounded_array_buffer_allocator() -> v8::UniqueRef<v8::Allocator> {
     let state = Arc::new(BoundedArrayBufferAllocatorState {
         allocated_bytes: AtomicUsize::new(0),
@@ -1175,11 +1205,19 @@ fn read_rss_windows(probe: ChildMemoryProbe) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// TASK-32.2・Issue #166: RSS しきい値は V8・boa のどちらのビルドでも
+    /// 同じ 320 MiB であること（boa は V8 と同じ基準でそろえる）。
+    #[test]
+    fn js_1_child_rss_threshold_is_320_mib_for_every_bundled_engine() {
+        assert_eq!(MAX_CHILD_RSS_BYTES, 320 * 1024 * 1024);
+    }
+
     /// codex レビュー指摘 #503 P0: RSS しきい値（320 MiB）・
     /// `ArrayBuffer` 確保の合計上限（128 MiB）が、ドキュメントコメントが
     /// 説明する根拠どおりの具体値であること。ヒープ上限＋本上限が
     /// RSS しきい値を 64 MiB 下回ることも確認する（`MAX_ARRAY_BUFFER_ALLOCATION_BYTES`
     /// のドキュメントコメントが説明する予算配分）。
+    #[cfg(feature = "js-v8")]
     #[test]
     fn js_1_memory_budget_constants_match_documented_values() {
         assert_eq!(MAX_CHILD_RSS_BYTES, 320 * 1024 * 1024);
@@ -1197,6 +1235,7 @@ mod tests {
     /// 包まない。単体テストは vtable 関数を直接呼ぶだけであり、
     /// `v8::new_rust_allocator` を経由しないため `Arc::into_raw`／
     /// `Arc::from_raw` の対応関係を気にする必要が無い）。
+    #[cfg(feature = "js-v8")]
     fn test_allocator_state(limit_bytes: usize) -> BoundedArrayBufferAllocatorState {
         BoundedArrayBufferAllocatorState {
             allocated_bytes: AtomicUsize::new(0),
@@ -1207,6 +1246,7 @@ mod tests {
     /// codex レビュー指摘 #503 P0 の単体テスト: 上限以下の確保は成功し、
     /// カウンタが確保量ぶん増え、`free` で確保量ぶん減ることを確認する。
     #[test]
+    #[cfg(feature = "js-v8")]
     fn js_1_bounded_array_buffer_allocator_tracks_allocate_and_free() {
         let state = test_allocator_state(1024);
 
@@ -1231,6 +1271,7 @@ mod tests {
     /// 確保は成功し、さらに 1 バイトでも超える確保は拒否される（境界値）。
     /// 拒否された確保はカウンタを変化させないことも確認する。
     #[test]
+    #[cfg(feature = "js-v8")]
     fn js_1_bounded_array_buffer_allocator_rejects_allocation_exceeding_the_limit() {
         let state = test_allocator_state(128);
 
@@ -1265,6 +1306,7 @@ mod tests {
     /// サイズ 0 `Layout` を避ける分岐。`free` に `len == 0` で渡しても
     /// panic せず、カウンタも変化しないこと）。
     #[test]
+    #[cfg(feature = "js-v8")]
     fn js_1_bounded_array_buffer_allocator_handles_zero_length_without_counting() {
         let state = test_allocator_state(0);
 
@@ -1288,6 +1330,7 @@ mod tests {
     /// 確認。`tests/v8_worker.rs` の結合テストが確認する「GC を挟んだ
     /// 繰り返し確保」の土台となる単体レベルの保証）。
     #[test]
+    #[cfg(feature = "js-v8")]
     fn js_1_bounded_array_buffer_allocator_can_reallocate_after_freeing() {
         let state = test_allocator_state(64);
 

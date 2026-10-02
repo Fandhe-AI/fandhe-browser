@@ -101,7 +101,7 @@ const IMPLEMENTED_ENGINES: &[EngineKind] = &[
     // 有効な構成では V8 は同梱されないため feature で絞る。
     #[cfg(feature = "js-v8")]
     EngineKind::V8,
-    // boa は同一プロセス版として配線済み（TASK-32.2・Issue #166）。
+    // boa は V8 と同じ子プロセス版として配線済み（TASK-32.2・Issue #166）。
     #[cfg(feature = "js-boa")]
     EngineKind::Boa,
 ];

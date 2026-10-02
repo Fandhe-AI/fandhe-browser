@@ -21,10 +21,11 @@
 //! [`create_engine`] は V8 には子プロセス版エンジンを返し（`TASK-29.6.2`・
 //! Issue #548。遅延起動。ホストは `main` の先頭で
 //! [`run_js_worker_if_requested`] を呼ぶ義務がある。詳細は [`engine_trait`]）、
-//! boa には同一プロセス内で動く boa 版エンジンを返し（`TASK-32.2`・Issue #166。
-//! wall-clock タイムアウトとヒープ上限が無い点など V8 版との差は `boa_engine`
-//! モジュールの「既知の制限」を参照）、同梱されていない種別には `NotBundled` を
-//! 返す。以下は未実装（実装済みを装わない。REPAIR-3）。
+//! boa にも V8 と同じ子プロセス分離基盤の上で動く boa 版エンジンを返し
+//! （`TASK-32.2`・Issue #166。boa には中断 API・ヒープ上限 API が無いため、
+//! 実時間は親の期限 kill、メモリは子の OS 上限と親の RSS 監視で強制する。
+//! 詳細は `boa_worker` モジュールの doc を参照）、同梱されていない種別には
+//! `NotBundled` を返す。以下は未実装（実装済みを装わない。REPAIR-3）。
 //!
 //! - V8 の具象実装（`JS-1`、`TASK-29`、`MS-3`）は `create_engine` への配線まで
 //!   完了（`TASK-29.6.2`）。トレイト経由の `NativeFn` は `Send` 境界付きで、
@@ -107,11 +108,18 @@ mod v8_engine;
 // もしない（coding-rust.md「V8 / boa の具象型を上位 crate へ漏らさない」）。
 #[cfg(feature = "js-boa")]
 mod boa_engine;
+// boa を子プロセス（`worker`）の評価エンジンとして使うためのアダプタ
+// （TASK-32.2・Issue #166）。boa の具象型は本 crate 内に閉じる。
+#[cfg(feature = "js-boa")]
+mod boa_worker;
+// V8 子プロセス・boa 子プロセスが共有する定数と逆方向 RPC の窓口。
+#[cfg(any(feature = "js-v8", feature = "js-boa"))]
+mod shared;
 // 子プロセスのヒープ外メモリに OS 側の上限を掛ける（TASK-29・Issue #503
 // 設計書 §5・codex レビュー指摘 #503 P0 対応）。[`worker`]（子側の起動時
 // 強制）と [`process_engine`]（親側の RSS 監視）の両方から使う非公開
 // モジュール。
-#[cfg(feature = "js-v8")]
+#[cfg(any(feature = "js-v8", feature = "js-boa"))]
 mod resource_limits;
 // JS 評価用の子プロセスと stdio でやり取りするバイナリプロトコルの
 // フレーミング・コーデック（TASK-29・Issue #503「JS プロセス分離」
@@ -131,7 +139,7 @@ mod worker_protocol;
 // JS 評価を行う子プロセスの入口（TASK-29・Issue #503 設計書 §3.1・
 // §7 W3）。`js-v8` feature 有効時のみ、実際に V8 を組み込んだ子プロセス
 // として動作できる。
-#[cfg(feature = "js-v8")]
+#[cfg(any(feature = "js-v8", feature = "js-boa"))]
 mod worker;
 // 子プロセスへの親側プロキシ（TASK-29・Issue #503 設計書 §3.2〜§3.4・
 // §7 W4）。`create_engine` へは TASK-29.6.2（Issue #548）で配線済み。
@@ -151,7 +159,7 @@ mod worker;
 // `V8ProcessEngine` は `Child`・パイプ・チャネルしか保持せず `v8` crate の
 // 型を一切参照しないため、coding-rust.md「V8 / boa の具象型を上位 crate
 // へ漏らさない」には抵触しない。
-#[cfg(feature = "js-v8")]
+#[cfg(any(feature = "js-v8", feature = "js-boa"))]
 #[doc(hidden)]
 pub mod process_engine;
 
@@ -201,15 +209,15 @@ pub fn run_js_worker_if_requested() -> Option<std::process::ExitCode> {
     Some(dispatch_worker(&marker_value))
 }
 
-#[cfg(feature = "js-v8")]
+#[cfg(any(feature = "js-v8", feature = "js-boa"))]
 fn dispatch_worker(marker_value: &str) -> std::process::ExitCode {
     worker::worker_main(marker_value)
 }
 
-#[cfg(not(feature = "js-v8"))]
+#[cfg(not(any(feature = "js-v8", feature = "js-boa")))]
 fn dispatch_worker(_marker_value: &str) -> std::process::ExitCode {
     eprintln!(
-        "fandhe-browser-js worker: this binary was not built with the js-v8 feature and \
+        "fandhe-browser-js worker: this binary was not built with the js-v8 or js-boa feature and \
          cannot run as a JS evaluation worker"
     );
     std::process::ExitCode::FAILURE

@@ -1,15 +1,17 @@
 //! boa（`boa_engine`）による [`JsEngine`] 実装（MS-3・TASK-32（32.2）・
 //! ビヘイビア `JS-1`・Issue #166）。
 //!
-//! 呼び出し元: [`crate::engine_trait::create_engine`] が
-//! [`EngineKind::Boa`](crate::EngineKind::Boa) に対して [`BoaEngine::new`] を
-//! 呼び、`Box<dyn JsEngine>` として上位 crate（core 等）へ渡す。boa の具象型
-//! （`Context`・`JsValue` 等）は本モジュールの外へ出さない（`mod` は非公開。
-//! coding-rust.md「V8 / boa の具象型を上位 crate へ漏らさない」）。
+//! 呼び出し元: [`crate::boa_worker::BoaChildEngine`] が **子プロセスの中で**
+//! [`BoaEngine::new`] を呼ぶ。ホスト側へは [`crate::engine_trait::create_engine`]
+//! が子プロセス版エンジン（`process_engine`）を返し、本型は直接ホストへ渡らない
+//! （`mod` は非公開。boa の具象型 `Context`・`JsValue` 等も本モジュールの外へ
+//! 出さない。coding-rust.md「V8 / boa の具象型を上位 crate へ漏らさない」）。
 //!
-//! V8 版（`process_engine`・子プロセス分離）とは異なり、boa 版は **ホストと
-//! 同一プロセス・呼び出しスレッド上** で同期実行する。`Context` は `!Send` で
-//! あり、[`JsEngine`] 自体も `Send` を要求しない。
+//! 本型自体は呼び出しスレッド上で同期実行する素の boa ラッパーで、boa に
+//! 中断 API・ヒープ上限 API が無いため、実時間・メモリの上限は **ホストと
+//! 別プロセスで動かすこと** で強制する（AGENTS.md「リソース上限」P0。
+//! 詳細は `boa_worker` のモジュール doc）。`Context` は `!Send` であり、
+//! [`JsEngine`] 自体も `Send` を要求しない。
 //!
 //! # `unsafe` を使わない設計
 //!
@@ -21,25 +23,20 @@
 //!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
-//! boa 0.22 は V8 と同等のリソース制御を持たない。V8 版との差は次のとおり。
+//! boa 0.22 は V8 と同等のリソース制御を持たない。本型の中での打ち切りは
+//! 「ループ 1 つあたりの反復回数」（[`BOA_LOOP_ITERATION_LIMIT`]）・再帰深度・
+//! スタックサイズだけで、**これは実時間・ヒープの上限ではない**（入れ子ループ
+//! や重い組込み関数は上限内で長時間走り・巨大確保もし得る）。実時間とメモリは
+//! 本型を子プロセスの中で動かし、親が強制する（`boa_worker`・`process_engine`・
+//! `resource_limits`）。
 //!
-//! - **wall-clock のタイムアウトは無い**: 打ち切りは「ループ 1 つあたりの反復
-//!   回数」（[`BOA_LOOP_ITERATION_LIMIT`]）・再帰深度・スタックサイズだけ。
-//!   入れ子ループや重い組込み関数は上限内で長時間走り得る。外部からの中断 API
-//!   が boa に無いため [`JsEngineError::Timeout`] は返さない
-//! - **ヒープ上限は無い**: ホストと同一プロセスで動くため、巨大な確保はホスト
-//!   のメモリを圧迫し得る（V8 版はプロセス分離と OS のメモリ上限で守る）
-//! - 上限は [`JsEngineError::ResourceLimitExceeded`] として区別して返す。
-//!   コンテキストは残るため、メッセージに "context was discarded" は含めない
+//! - 反復・再帰・スタックの上限は [`JsEngineError::ResourceLimitExceeded`]
+//!   として区別して返す。コンテキストは残るため、メッセージに
+//!   "context was discarded" は含めない
 //! - 上限を超える反復を必要とする正当なスクリプトは boa では失敗する
 //!   （V8 との挙動差）
-//! - [`NativeFn`] はホストプロセス内で同期実行し、期限は掛けない。release は
-//!   `panic = "abort"` のため、関数内の panic はホストごと終了する
-//!   （[`NativeFn`] の既存契約どおり）
-//!
-//! 将来仕様: wall-clock タイムアウト・ヒープ上限が必要になった場合は、V8 と
-//! 同じ子プロセス分離か boa の命令数予算（依存 feature の変更が必要でユーザー
-//! 承認制）を別タスクで検討する（`JS-1`・TASK-32）。
+//! - [`NativeFn`] は本型を動かすプロセスの中で同期実行する。子プロセスでは
+//!   親へ転送するプロキシ関数（`boa_worker`）で、期限は親が掛ける
 
 use std::cell::RefCell;
 use std::collections::HashSet;
