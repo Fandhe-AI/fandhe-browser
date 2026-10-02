@@ -30,6 +30,10 @@ name: CI
 # rust-ci（--all-features）・rust-ci-default-features（既定）のどちらとも異なる
 # `--features js-v8` 単独構成で js crate の TASK-28 共通コンフォーマンステストを
 # V8 に対して 3 OS で検証する
+# TASK-32.4（Issue #168・JS-1・MS-3）: JS エンジンビルド構成表の残り行を追加した。
+# 軽量ビルド（js-boa のみ）は rust-ci-js-boa、依存グラフ検査（軽量ビルドに v8 が
+# 無い・エンジンなしに v8 も boa_engine も無い）は js-engine-isolation、両エンジン
+# 同梱の共通テストは rust-ci-default-features 内のステップで検証する
 on:
   workflow_dispatch:
   pull_request:
@@ -69,7 +73,10 @@ jobs:
   # `rust-ci-default-features (macos-latest)`・
   # `rust-ci-default-features (windows-latest)` の 3 件、および js-v8 単独構成の
   # `rust-ci-js-v8 (ubuntu-latest)`・`rust-ci-js-v8 (macos-latest)`・
-  # `rust-ci-js-v8 (windows-latest)` の 3 件も追加する必要がある
+  # `rust-ci-js-v8 (windows-latest)` の 3 件、軽量ビルド（js-boa のみ）の
+  # `rust-ci-js-boa (<os>)` と JS エンジン分離検査の `js-engine-isolation (<os>)`
+  # （いずれも ubuntu-latest・macos-latest・windows-latest の各 3 件）も追加する
+  # 必要がある（TASK-32.4・#168。登録はユーザー作業で本変更の対象外）
   # （TASK-55.2・#59 時点で
   # push/pull_request トリガーが有効化されたため、この登録作業はユーザー作業と
   # して実施可能になった。登録自体は本変更の対象外）。
@@ -217,11 +224,23 @@ jobs:
       # `default = ["js-v8"]` が feature 統合で core に伝わり、エンジンなし構成の
       # テスト（`cfg(not(any(feature = "js-v8", feature = "js-boa")))`）が
       # コンパイル対象から外れる。core を単独で選んでエンジンなし構成を検証する
-      # （`cargo tree` 検査の #168 / TASK-32.4 はこのテスト実行を含まない）
+      # （依存グラフ検査は js-engine-isolation ジョブ・TASK-32.4 が担い、
+      # このテスト実行は含まない）
       - name: cargo clippy（core 単独・エンジンなし）
         run: cargo clippy -p fandhe-browser-core --all-targets -- -D warnings
       - name: cargo test（core 単独・エンジンなし）
         run: cargo test -p fandhe-browser-core
+      # TASK-32.4（Issue #168・JS-1）: ビルド構成表の「両エンジン同梱」行。既定ビルドの
+      # ジョブ内で共通テスト（js の conformance・core の js_stub_v8 / js_stub_boa）を
+      # 両エンジン有効で追加実行する。rust-ci の --all-features は test-support・
+      # rendering も同時に有効で表の構成そのものではないため明示的に実行する。
+      # macOS では boa が無効（確保時のメモリ上限を強制できず fail-closed）で、
+      # テストは cfg(target_os) で期待値を分けている（skip ではない）。
+      # `--features` は Windows 既定の pwsh でカンマが配列解釈されるため 2 回書く。
+      - name: cargo test（js 両エンジン同梱）
+        run: cargo test -p fandhe-browser-js --features js-v8 --features js-boa
+      - name: cargo test（core 両エンジン同梱）
+        run: cargo test -p fandhe-browser-core --features js-v8 --features js-boa
 
   # --------------------------------------------------
   # rust-ci-js-v8（js crate を `--features js-v8` 単独で 3 OS 検証）
@@ -255,6 +274,48 @@ jobs:
         run: cargo clippy -p fandhe-browser-js --all-targets --features js-v8 -- -D warnings
       - name: cargo test（js-v8 単独）
         run: cargo test -p fandhe-browser-js --features js-v8
+
+  # --------------------------------------------------
+  # rust-ci-js-boa（軽量ビルド `--no-default-features --features js-boa` を 3 OS 検証）
+  # --------------------------------------------------
+  # TASK-32.4（Issue #168・JS-1・MS-3）: ビルド構成表の「軽量ビルド」行。V8 を
+  # 含めない構成で cli のビルド・テストと、js・core の boa 向け共通テスト
+  # （conformance・boa_worker・js_stub_boa）を実行する。`--workspace` と
+  # `--features` は併用せず、必ず `-p` で指定する。
+  # macOS では boa が無効（確保時のメモリ上限を強制できず fail-closed）で、
+  # テストは cfg(target_os) で期待値を分けている（skip による回避ではない）。
+  # 末尾の `cargo check`（エンジンなし）は表の「エンジンなし: 3 OS で check」行。
+  # `RUSTFLAGS=-D warnings` は Windows の既存リンカ警告（LNK4098）で落ちるため
+  # test には付けない。release ビルドのサイズ実測は TASK-31 の範囲で対象外。
+  rust-ci-js-boa:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: clippy
+      - name: cargo build（軽量ビルド）
+        run: cargo build -p fandhe-browser-cli --no-default-features --features js-boa
+      - name: cargo clippy（cli 軽量ビルド）
+        run: cargo clippy -p fandhe-browser-cli --all-targets --no-default-features --features js-boa -- -D warnings
+      - name: cargo test（cli 軽量ビルド）
+        run: cargo test -p fandhe-browser-cli --no-default-features --features js-boa
+      - name: cargo clippy（js js-boa）
+        run: cargo clippy -p fandhe-browser-js --all-targets --features js-boa -- -D warnings
+      - name: cargo test（js js-boa）
+        run: cargo test -p fandhe-browser-js --features js-boa
+      - name: cargo test（core js-boa）
+        run: cargo test -p fandhe-browser-core --features js-boa
+      - name: cargo check（cli エンジンなし）
+        run: cargo check -p fandhe-browser-cli --no-default-features
 
   # --------------------------------------------------
   # render-isolation（既定ビルドの依存グラフに Servo 系クレートが混入していないことの検証）
@@ -306,6 +367,37 @@ jobs:
         run: bash scripts/check-render-isolation.sh --self-test
       - name: 既定ビルドの依存グラフ検査
         run: bash scripts/check-render-isolation.sh
+
+  # --------------------------------------------------
+  # js-engine-isolation（JS エンジン構成ごとの依存グラフ検査）
+  # --------------------------------------------------
+  # TASK-32.4（Issue #168・JS-1・MS-3）: 軽量ビルドの依存グラフに v8 が無く、
+  # エンジンなしに v8・boa_engine が無いことを `cargo tree` で検証する。判定ロジックの
+  # 正本は scripts/check-js-engine-isolation.sh（Makefile と共有）。`cargo tree` は
+  # ホストのターゲットに絞るため target 依存は当該 OS でしか現れず、3 OS matrix で
+  # 実行する。self-test を先に実行しゲートが素通りしないことをログへ残す。
+  # cargo は依存解決のみ（ビルドしない）。
+  js-engine-isolation:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - name: 自己テスト（合成データによる検出の証跡確認）
+        run: bash scripts/check-js-engine-isolation.sh --self-test
+      - name: JS エンジン構成の依存グラフ検査
+        run: bash scripts/check-js-engine-isolation.sh
 
   # --------------------------------------------------
   # compat-regression（対象サイト群の動作率マトリクスに対する回帰チェック）

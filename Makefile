@@ -310,6 +310,18 @@ else
 	@echo "skip: Cargo.toml 未追加、または fandhe-browser-render 以外の member crate が無いため check-render-isolation をスキップ"
 endif
 
+# JS エンジンのビルド構成（軽量ビルド・エンジンなし）の依存グラフに、含まれてはならない
+# エンジン crate（v8・boa_engine）が無いことを検証する（TASK-32.4・JS-1・Issue #168）。
+# 判定ロジックの正本は scripts/check-js-engine-isolation.sh で、ci.yml の
+# js-engine-isolation ジョブ（3 OS matrix）も同じスクリプトを直接呼び出す。
+.PHONY: check-js-engine-isolation
+check-js-engine-isolation: ## 軽量ビルド・エンジンなし構成の依存グラフに v8（エンジンなしは boa_engine も）が含まれないことを検証する（scripts/check-js-engine-isolation.sh）
+ifneq ($(and $(HAS_CARGO),$(wildcard crates/fandhe-browser-cli/Cargo.toml)),)
+	@bash scripts/check-js-engine-isolation.sh
+else
+	@echo "skip: Cargo.toml 未追加、または fandhe-browser-cli が無いため check-js-engine-isolation をスキップ"
+endif
+
 # workspace 内の全 member crate が非公開（`publish = false` 相当）であることを
 # 検証する（Cargo.toml の `[workspace.package]` 契約・deny.toml の
 # `allow-wildcard-paths = true` が前提とする private crate 方針）。
@@ -465,7 +477,7 @@ endif
 # workspace 作成前・render crate 追加前の CI を壊さない。docker-ci は make ci を
 # 呼ぶため自動的にこの検証を含む。
 .PHONY: ci
-ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-publish-private test test-rendering deny check-deny-license-reject check-compat-regression check-bench-record ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-js-engine-isolation check-publish-private test test-rendering deny check-deny-license-reject check-compat-regression check-bench-record ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 対象サイト群の動作率回帰チェック（TASK-9.2・REPAIR-8。harness/compat-regression/README.md 参照）
