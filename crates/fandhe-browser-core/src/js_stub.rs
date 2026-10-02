@@ -444,12 +444,28 @@ mod tests {
 
     /// JS-2（TASK-30.3・#161・TASK-32.2・#166）: `js-boa` 構成で boa が選ばれる
     /// （評価はしない。設定経由の評価確認は TASK-32.3・#167）。
-    #[cfg(feature = "js-boa")]
+    #[cfg(all(feature = "js-boa", not(target_os = "macos")))]
     #[test]
     fn js_2_from_config_selects_boa() {
         let cfg = crate::Config::from_toml_str("[js]\nengine = \"boa\"\n").expect("設定");
         let rt = JsRuntime::from_config(cfg.js()).expect("Ok");
         assert_eq!(rt.engine_kind(), Some(EngineKind::Boa));
+    }
+
+    /// JS-2・REPAIR-3（TASK-32.2・#166）: macOS では boa が無効（確保時に効く
+    /// メモリ上限を強制できない）のため、`from_config` は別エンジンへ
+    /// フォールバックせず `JsExecutionUnavailable` で失敗する。
+    #[cfg(all(feature = "js-boa", target_os = "macos"))]
+    #[test]
+    fn js_2_from_config_boa_is_unavailable_on_macos() {
+        let cfg = crate::Config::from_toml_str("[js]\nengine = \"boa\"\n").expect("設定");
+        let err = JsRuntime::from_config(cfg.js())
+            .err()
+            .expect("macOS では失敗");
+        assert_eq!(
+            err.to_string(),
+            "JS execution unavailable: js engine \"boa\" is bundled but not yet implemented"
+        );
     }
 
     /// REPAIR-9: recorder 付きの失敗呼び出しは `JsStub` / `Failure` を 1 件記録する。

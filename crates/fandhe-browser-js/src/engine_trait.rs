@@ -91,7 +91,8 @@ const BUNDLED: &[EngineKind] = &[
 /// 順序は `js-engine.md`「(1) 省略」の「同梱エンジンから V8 → boa の優先順で
 /// 選ぶ」という後続契約（TASK-91 が依存）に対応する。
 ///
-/// `js-v8`・`js-boa` はどちらも子プロセス版エンジンへ配線済みで
+/// `js-v8`・`js-boa` はどちらも子プロセス版エンジンへ配線済み（macOS の boa は
+/// 無効で `create_engine` が `NotYetImplemented` を返す）で
 /// （TASK-29.6.2・#548／TASK-32.2・#166）、[`create_engine`] はどちらも `Ok` を
 /// 返す。boa は V8 と同じ子プロセス分離基盤の上で動き、実時間は親の期限 kill、
 /// メモリは子の OS 上限と親の RSS 監視で強制する（`boa_worker` モジュール doc）。
@@ -470,7 +471,7 @@ impl std::error::Error for CreateEngineError {}
 ///
 /// **契約**: 同梱していない種別（[`bundled_engines`] に含まれない）には
 /// [`CreateEngineError::NotBundled`] を返し、別エンジンへのフォールバックは
-/// しない。V8・boa とも子プロセス版エンジン（`process_engine::V8ProcessEngine`。
+/// しない。V8・boa（macOS を除く。macOS の boa は `NotYetImplemented`）とも子プロセス版エンジン（`process_engine::V8ProcessEngine`。
 /// boa は `EngineKind::Boa` を指定して生成。`TASK-32.2`・#166）を `Ok` で返す。
 /// boa には中断 API・ヒープ上限 API が無いため、プロセス境界で実時間（親の
 /// 期限 kill）とメモリ（子の OS 上限・親の RSS 監視）を強制する。
@@ -693,9 +694,24 @@ mod tests {
     /// JS-1: boa を同梱したビルドでは `create_engine(Boa)` が boa 版を `Ok` で
     /// 返すこと（コンテキストは遅延生成のため評価はしない。TASK-32.2）。
     #[test]
-    #[cfg(feature = "js-boa")]
+    #[cfg(all(feature = "js-boa", not(target_os = "macos")))]
     fn js_1_create_engine_returns_ok_for_bundled_boa() {
         assert!(create_engine(EngineKind::Boa).is_ok());
+    }
+
+    /// JS-1・REPAIR-3: macOS では確保時に効くメモリ上限を強制できないため boa は
+    /// 無効で、`create_engine(Boa)` は `NotYetImplemented` を返す（fail-closed。
+    /// TASK-32.2）。
+    #[test]
+    #[cfg(all(feature = "js-boa", target_os = "macos"))]
+    fn js_1_create_engine_returns_not_yet_implemented_for_boa_on_macos() {
+        match create_engine(EngineKind::Boa) {
+            Err(CreateEngineError::NotYetImplemented { requested }) => {
+                assert_eq!(requested, EngineKind::Boa);
+            }
+            Err(other) => panic!("expected NotYetImplemented, got {other:?}"),
+            Ok(_) => panic!("boa must be disabled on macOS"),
+        }
     }
 
     /// JS-1: `JsEngineError`・`CreateEngineError` が `std::error::Error` を

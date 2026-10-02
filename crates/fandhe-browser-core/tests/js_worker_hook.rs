@@ -1,7 +1,7 @@
 //! core が再エクスポートする `run_js_worker_if_requested`（TASK-30・ビヘイビア `JS-2`・
 //! Issue #513）の結合テスト。
 //!
-//! cli が js へ直接依存せずワーカー入口を呼べること（シグネチャ固定）と、`js-v8` 無効の
+//! cli が js へ直接依存せずワーカー入口を呼べること（シグネチャ固定）と、`js-v8`・`js-boa` 無効の
 //! ビルドでワーカー起動要求（マーカー環境変数）を受けたとき成功を装わず fail-closed になる
 //! ことを、自身の再実行（`std::env::current_exe()`）で検証する。`js-v8` 有効ビルドでは
 //! 任意のマーカー値で V8 ワーカーに入ってしまうため再実行はせず、V8 経路は
@@ -11,7 +11,7 @@ use std::process::ExitCode;
 
 /// js crate の `worker_protocol::MARKER_ENV_VAR` と同じ契約値（js 側では `pub(crate)` で
 /// 参照できないため、テスト内に契約文字列として持つ）。
-#[cfg(not(feature = "js-v8"))]
+#[cfg(not(any(feature = "js-v8", feature = "js-boa")))]
 const MARKER_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER";
 
 fn main() -> ExitCode {
@@ -23,7 +23,7 @@ fn main() -> ExitCode {
     eprintln!("case: JS-2 reexport signature");
     let _: fn() -> Option<ExitCode> = fandhe_browser_core::run_js_worker_if_requested;
 
-    #[cfg(not(feature = "js-v8"))]
+    #[cfg(not(any(feature = "js-v8", feature = "js-boa")))]
     {
         eprintln!("case: JS-2 worker request without js-v8 fails closed");
         let exe = std::env::current_exe().expect("current exe");

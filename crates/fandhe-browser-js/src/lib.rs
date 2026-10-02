@@ -24,7 +24,9 @@
 //! boa にも V8 と同じ子プロセス分離基盤の上で動く boa 版エンジンを返し
 //! （`TASK-32.2`・Issue #166。boa には中断 API・ヒープ上限 API が無いため、
 //! 実時間は親の期限 kill、メモリは子の OS 上限と親の RSS 監視で強制する。
-//! 詳細は `boa_worker` モジュールの doc を参照）、同梱されていない種別には
+//! 詳細は `boa_worker` モジュールの doc を参照。ただし macOS では確保時に効く
+//! メモリ上限を強制できないため boa は無効で `NotYetImplemented` を返す。
+//! `JS-1`・`TASK-32.2`・`REPAIR-3`）、同梱されていない種別には
 //! `NotBundled` を返す。以下は未実装（実装済みを装わない。REPAIR-3）。
 //!
 //! - V8 の具象実装（`JS-1`、`TASK-29`、`MS-3`）は `create_engine` への配線まで
