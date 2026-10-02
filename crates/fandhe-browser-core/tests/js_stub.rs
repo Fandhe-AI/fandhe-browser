@@ -12,6 +12,7 @@ use fandhe_browser_core::js_stub::{JsRuntime, execute_js_stub};
 /// macOS で boa のみ同梱した構成（boa は確保時に効くメモリ上限を強制できず無効。
 /// `create_engine(Boa)` は `NotYetImplemented`）か。この構成では既定選択の boa が
 /// 生成できない。
+#[cfg(any(feature = "js-v8", feature = "js-boa"))]
 const BOA_ONLY_ON_MACOS: bool = cfg!(all(
     target_os = "macos",
     feature = "js-boa",

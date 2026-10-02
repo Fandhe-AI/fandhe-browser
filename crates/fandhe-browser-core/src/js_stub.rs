@@ -459,13 +459,13 @@ mod tests {
     #[test]
     fn js_2_from_config_boa_is_unavailable_on_macos() {
         let cfg = crate::Config::from_toml_str("[js]\nengine = \"boa\"\n").expect("設定");
-        let err = JsRuntime::from_config(cfg.js())
-            .err()
-            .expect("macOS では失敗");
-        assert_eq!(
-            err.to_string(),
-            "JS execution unavailable: js engine \"boa\" is bundled but not yet implemented"
-        );
+        match JsRuntime::from_config(cfg.js()) {
+            Err(err) => assert_eq!(
+                err.to_string(),
+                "JS execution unavailable: js engine \"boa\" is bundled but not yet implemented"
+            ),
+            Ok(_) => panic!("boa must be disabled on macOS"),
+        }
     }
 
     /// REPAIR-9: recorder 付きの失敗呼び出しは `JsStub` / `Failure` を 1 件記録する。
