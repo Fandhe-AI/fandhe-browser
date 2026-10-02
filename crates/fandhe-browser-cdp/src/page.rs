@@ -28,7 +28,6 @@
 //! 世代を払い出した後の取得失敗は直近結果を無効化するため、ターゲット表の URL も試行した URL
 //! へ更新し、文書を持たない共有状態と食い違わせない（`CDP-1`）。
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use fandhe_browser_core::{
@@ -38,7 +37,7 @@ use fandhe_browser_core::{
 use serde_json::{Value, json};
 
 use crate::protocol::{BoxFuture, CdpError, CommandContext, CommandHandler, HandlerOutput};
-use crate::target::{CdpStateError, MAX_URL_LEN, TargetId, TargetRegistry};
+use crate::target::{CdpStateError, MAX_URL_LEN, TargetId};
 
 /// メインフレームの `frameId`（スタブ。将来はセッション → ターゲット ID。`CDP-2`・TASK-43）。
 pub(crate) const MAIN_FRAME_ID: &str = "main";
@@ -207,12 +206,13 @@ pub(crate) async fn navigate_gated(
 /// `Page.navigate` ハンドラ。`Fetcher`（接続プール）を所有し、起動時に 1 回だけ構築する。
 pub(crate) struct PageNavigate {
     fetcher: Fetcher,
-    /// ターゲットごとの遷移状態（`CDP-1` のターゲット境界）。別ターゲットへの
-    /// `Page.navigate` が他ターゲットの HTML・URL を上書きしないよう分離する。
+    /// ターゲット別の遷移状態は `CdpState::navigations()`（`DOM.getDocument` も読む。`CDP-1`）に置く。
     /// `sessionId` なし（ブラウザレベル）は従来どおり `AppState::navigation()` を直接使う。
-    /// TASK-42.4（`DOM.getDocument`）がターゲット別に読めるようになるまでは、成功した遷移を
-    /// `AppState::navigation()` へ「直近にナビゲートしたページ」としてミラーする（スタブ。`REPAIR-3`）。
-    targets: Mutex<HashMap<TargetId, Arc<NavigationState>>>,
+    /// 成功した遷移は `AppState::navigation()` へ「直近にナビゲートしたページ」としてミラーする。
+    /// ai（`AISNAP-6`）と `sessionId` なしの `DOM.getDocument` が共有状態を読むため維持する。
+    ///
+    /// 以下の `gate`・`published` はハンドラ（= ディスパッチャ）単位で、遷移状態表は `CdpState` 単位。
+    /// ディスパッチャは `browser_websocket_config` で 1 回だけ作る前提。
     /// 結果確定の直列化と完了順の採番。
     gate: CommitGate,
     /// 共有状態へ最後にミラーした内容の記録。ターゲット表の更新・ミラーを 1 つの
@@ -262,7 +262,6 @@ impl PageNavigate {
     pub fn new(options: FetchOptions) -> Result<Self, Error> {
         Ok(Self {
             fetcher: Fetcher::new(options)?,
-            targets: Mutex::new(HashMap::new()),
             gate: Mutex::new(0),
             published: Mutex::new(Published {
                 seq: 0,
@@ -270,26 +269,6 @@ impl PageNavigate {
                 browser_in_flight: 0,
             }),
         })
-    }
-
-    /// `tid` 用の遷移状態を返す（なければ作る）。
-    ///
-    /// 呼び出しのたびにレジストリから消えた（閉じられた）ターゲットの状態を破棄する。
-    /// 閉鎖経路（`Target.closeTarget`）に依存せず、作成・遷移・閉鎖の繰り返しで取得済み HTML が
-    /// 無制限に蓄積しないようにする（保持数は `MAX_TARGETS` 以下に収まる）。
-    fn target_state(&self, registry: &TargetRegistry, tid: &TargetId) -> Arc<NavigationState> {
-        let mut m = self.targets.lock().unwrap_or_else(PoisonError::into_inner);
-        m.retain(|id, _| registry.target(id).is_some());
-        Arc::clone(
-            m.entry(tid.clone())
-                .or_insert_with(|| Arc::new(NavigationState::new())),
-        )
-    }
-
-    /// 閉じられたターゲットの状態を破棄する。
-    fn forget_target(&self, tid: &TargetId) {
-        let mut m = self.targets.lock().unwrap_or_else(PoisonError::into_inner);
-        m.remove(tid);
     }
 }
 
@@ -333,13 +312,13 @@ impl CommandHandler for PageNavigate {
                                 "frameId": MAIN_FRAME_ID,
                                 "loaderId": format!(
                                     "{:x}",
-                                    self.target_state(registry, tid).current_generation().get()
+                                    ctx.state.navigations().get_or_create(registry, tid).current_generation().get()
                                 ),
                                 "errorText": "net::ERR_INVALID_URL",
                             })));
                         }
                     };
-                    let nav = self.target_state(registry, tid);
+                    let nav = ctx.state.navigations().get_or_create(registry, tid);
                     let out = navigate_gated(&self.fetcher, &nav, url, &self.gate).await?;
                     // ターゲット表の更新と共有状態へのミラーを 1 つのロック内で行う。
                     let mut published = self
@@ -348,7 +327,7 @@ impl CommandHandler for PageNavigate {
                         .unwrap_or_else(PoisonError::into_inner);
                     if registry.target(tid).is_none() {
                         // 取得中にターゲットが閉じられた。状態を破棄し、内容は公開しない。
-                        self.forget_target(tid);
+                        ctx.state.navigations().forget(tid);
                     } else if let Some(c) = &out.committed {
                         // 後続の遷移に追い越されていない場合に限り、確定 URL を反映する（`CDP-1`）。
                         // 確定直後に別遷移が始まって結果を保持できなかった（`result` が `None`）場合は
@@ -381,7 +360,9 @@ impl CommandHandler for PageNavigate {
                                         }
                                     }
                                 }
-                                Err(CdpStateError::UnknownTarget) => self.forget_target(tid),
+                                Err(CdpStateError::UnknownTarget) => {
+                                    ctx.state.navigations().forget(tid)
+                                }
                                 Err(_) => return Err(CdpError::SERVER_ERROR),
                             }
                         }
@@ -408,7 +389,9 @@ impl CommandHandler for PageNavigate {
                         // `stored` は状態変更前に検証済み（長さ・形式）。
                         match registry.set_target_url(tid, &stored) {
                             Ok(()) => {}
-                            Err(CdpStateError::UnknownTarget) => self.forget_target(tid),
+                            Err(CdpStateError::UnknownTarget) => {
+                                ctx.state.navigations().forget(tid)
+                            }
                             Err(_) => return Err(CdpError::SERVER_ERROR),
                         }
                         // 共有状態が当該ターゲット自身のミラーのままなら無効化し、直前に成功した
@@ -918,6 +901,169 @@ mod tests {
             format!("http://127.0.0.1:{p}/")
         }
 
+        fn nav_and_dom_dispatcher() -> Dispatcher {
+            let h = PageNavigate::new(FetchOptions::new().with_allow_private_network_access(true))
+                .unwrap();
+            Dispatcher::from_handlers(vec![
+                ("Page.navigate", Box::new(h)),
+                ("DOM.getDocument", Box::new(crate::dom::DomGetDocument)),
+            ])
+            .unwrap()
+        }
+
+        async fn rpc(
+            d: &Dispatcher,
+            st: &Arc<CdpState>,
+            method: &str,
+            sid: &str,
+            params: Value,
+        ) -> Value {
+            let req = json!({"id": 1, "method": method, "sessionId": sid, "params": params});
+            frames(d.dispatch(st, &req.to_string()).await).remove(0)
+        }
+
+        /// 2 ターゲットを別 URL へ遷移させ、各セッションが自分の文書だけを返す（`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_get_document_returns_each_targets_own_document() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let d = nav_and_dom_dispatcher();
+            let t1 = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let t2 = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let s1 = st.registry().attach(&t1).unwrap();
+            let s2 = st.registry().attach(&t2).unwrap();
+            let u1 = format!("http://127.0.0.1:{}/", serve("200 OK", "<p>alpha-body</p>"));
+            let u2 = format!("http://127.0.0.1:{}/", serve("200 OK", "<p>bravo-body</p>"));
+            rpc(&d, &st, "Page.navigate", s1.as_str(), json!({"url": u1})).await;
+            rpc(&d, &st, "Page.navigate", s2.as_str(), json!({"url": u2})).await;
+            let g1 = rpc(
+                &d,
+                &st,
+                "DOM.getDocument",
+                s1.as_str(),
+                json!({"depth": -1}),
+            )
+            .await;
+            let g2 = rpc(
+                &d,
+                &st,
+                "DOM.getDocument",
+                s2.as_str(),
+                json!({"depth": -1}),
+            )
+            .await;
+            assert_eq!(g1["result"]["root"]["documentURL"], json!(u1));
+            assert_eq!(g2["result"]["root"]["documentURL"], json!(u2));
+            let (j1, j2) = (g1.to_string(), g2.to_string());
+            assert!(j1.contains("alpha-body") && !j1.contains("bravo-body"));
+            assert!(j2.contains("bravo-body") && !j2.contains("alpha-body"));
+        }
+
+        /// 取得失敗後は古い文書を返さず明示エラー。他ターゲットは影響を受けない（`REPAIR-3`・`SEC-2`）。
+        #[tokio::test]
+        async fn repair3_get_document_after_failed_navigation_is_unavailable() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let d = nav_and_dom_dispatcher();
+            let t1 = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let t2 = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let s1 = st.registry().attach(&t1).unwrap();
+            let s2 = st.registry().attach(&t2).unwrap();
+            let u = format!("http://127.0.0.1:{}/", serve("200 OK", "<p>kept</p>"));
+            rpc(&d, &st, "Page.navigate", s1.as_str(), json!({"url": u})).await;
+            rpc(&d, &st, "Page.navigate", s2.as_str(), json!({"url": u})).await;
+            rpc(
+                &d,
+                &st,
+                "Page.navigate",
+                s1.as_str(),
+                json!({"url": dead_url()}),
+            )
+            .await;
+            let g1 = rpc(&d, &st, "DOM.getDocument", s1.as_str(), json!({})).await;
+            assert_eq!(
+                g1["error"],
+                json!({"code": -32000, "message": "document not available for target"})
+            );
+            assert!(g1.get("result").is_none());
+            let g2 = rpc(
+                &d,
+                &st,
+                "DOM.getDocument",
+                s2.as_str(),
+                json!({"depth": -1}),
+            )
+            .await;
+            assert!(g2.to_string().contains("kept"));
+        }
+
+        /// `about:blank` へ遷移したセッションは空の html/head/body を持つ文書を返す（`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_get_document_about_blank_returns_empty_document() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let d = nav_and_dom_dispatcher();
+            let t = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let s = st.registry().attach(&t).unwrap();
+            rpc(
+                &d,
+                &st,
+                "Page.navigate",
+                s.as_str(),
+                json!({"url": "about:blank"}),
+            )
+            .await;
+            let g = rpc(&d, &st, "DOM.getDocument", s.as_str(), json!({"depth": -1})).await;
+            assert_eq!(g["result"]["root"]["documentURL"], json!("about:blank"));
+            let names: Vec<String> = g["result"]["root"]["children"][0]["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n["nodeName"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(names, vec!["HEAD", "BODY"]);
+        }
+
+        /// ターゲットを閉じた後の同セッションは `INVALID_PARAMS`（`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_get_document_for_closed_target_is_invalid_params() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let d = nav_and_dom_dispatcher();
+            let t = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let s = st.registry().attach(&t).unwrap();
+            let u = format!("http://127.0.0.1:{}/", serve("200 OK", "x"));
+            rpc(&d, &st, "Page.navigate", s.as_str(), json!({"url": u})).await;
+            st.registry().close_target(&t).unwrap();
+            let g = rpc(&d, &st, "DOM.getDocument", s.as_str(), json!({})).await;
+            assert_eq!(
+                g["error"],
+                json!({"code": -32602, "message": "invalid params"})
+            );
+        }
+
         /// 取得失敗時にターゲット表へ保存する URL から userinfo が除去される（`CDP-1`・`SEC-2`）。
         #[tokio::test]
         async fn cdp1_page_navigate_failure_strips_userinfo_from_target_url() {
@@ -1080,7 +1226,7 @@ mod tests {
                 };
                 h.handle(ctx, &params).await.unwrap();
             }
-            assert_eq!(h.targets.lock().unwrap().len(), 2);
+            assert_eq!(st.navigations().len(), 2);
             st.registry().close_target(&t1).unwrap();
             // 閉鎖後の次の遷移で、閉じたターゲットの状態が破棄される。
             let ctx = CommandContext {
@@ -1088,9 +1234,8 @@ mod tests {
                 session_id: Some(&s2),
             };
             h.handle(ctx, &params).await.unwrap();
-            let m = h.targets.lock().unwrap();
-            assert_eq!(m.len(), 1);
-            assert!(m.contains_key(&t2));
+            assert_eq!(st.navigations().len(), 1);
+            assert!(st.navigations().get(&t2).is_some());
         }
         #[tokio::test]
         async fn cdp1_page_navigate_failure_keeps_target_url() {

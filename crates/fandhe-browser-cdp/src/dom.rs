@@ -18,9 +18,10 @@
 //!   `childNodeCount` だけ返す（CDP の契約どおり）。一方、サーバー上限
 //!   （[`MAX_TREE_DEPTH`]・[`MAX_NODES_PER_RESPONSE`]）で要求どおりに展開できない場合は、
 //!   続きを取る `DOM.requestChildNodes` が未実装のため切り詰めず `DOCUMENT_TOO_LARGE` を返す
-//! - `sessionId` 付きの要求は、ターゲット別のナビゲート状態を読む手段が無いため
-//!   `TARGET_DOCUMENT_UNAVAILABLE` で拒否する（別ターゲットの文書を返さない）。将来は
-//!   ターゲット別ナビゲート状態を `CdpState` 側に持たせて 42.4 / 42.5 が読む（`CDP-1`・`CDP-2`・TASK-43）。
+//! - `sessionId` 付きの要求は、そのセッションのターゲットが最後に確定した文書
+//!   （`CdpState::navigations()`。#658）だけを返す。未遷移・遷移中・取得失敗は
+//!   `TARGET_DOCUMENT_UNAVAILABLE`（空文書を捏造しない）。`frameId` の固定値・
+//!   セッション／ターゲットに基づく決定は `CDP-2`・TASK-43。
 //!   `sessionId` なし（ブラウザレベル）は共有の直近 navigate 結果を読む
 //! - `<base href>` の解決は未実装。`href` 付き `base` 要素を持つ文書では `baseURL` を省略する
 //! - 採番は文書全体を走査するため、ノード数が [`MAX_NUMBERED_NODES`] を超える文書は
@@ -308,21 +309,34 @@ impl CommandHandler for DomGetDocument {
         params: &'a Value,
     ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
         Box::pin(async move {
-            if let Some(sid) = ctx.session_id {
-                if ctx.state.registry().session_target(sid).is_none() {
-                    return Err(CdpError::INVALID_PARAMS);
-                }
-                // ターゲット別の文書を読む手段が無く、共有状態を返すと別ページの内容を漏らし得る。
-                return Err(CdpError::TARGET_DOCUMENT_UNAVAILABLE);
-            }
+            // 検証順: セッション解決 → パラメータ検証 → 文書の取得。
+            let target = match ctx.session_id {
+                Some(sid) => Some(
+                    ctx.state
+                        .registry()
+                        .session_target(sid)
+                        .ok_or(CdpError::INVALID_PARAMS)?,
+                ),
+                None => None,
+            };
             let depth = parse_depth(params)?;
             check_pierce(params)?;
-            let latest = ctx
-                .state
-                .app_state()
-                .navigation()
-                .latest()
-                .ok_or(CdpError::NO_DOCUMENT)?;
+            let latest = match &target {
+                // そのターゲットが最後に確定した文書だけを読む。共有状態へはフォールバックしない
+                // （別ターゲットの内容を返さない。`CDP-1`）。未確定・失敗は明示エラー（`SEC-2`）。
+                Some(tid) => ctx
+                    .state
+                    .navigations()
+                    .get(tid)
+                    .and_then(|n| n.latest())
+                    .ok_or(CdpError::TARGET_DOCUMENT_UNAVAILABLE)?,
+                None => ctx
+                    .state
+                    .app_state()
+                    .navigation()
+                    .latest()
+                    .ok_or(CdpError::NO_DOCUMENT)?,
+            };
             // DOM 応答用の上限をパース時点で適用し、巨大文書の全ノード構築を避ける（`SEC-2`）。
             let opts = ParseOptions::default().with_max_nodes(MAX_NUMBERED_NODES);
             let parsed = parse_document(latest.html(), &opts).map_err(|e| match e {
@@ -623,26 +637,96 @@ mod tests {
             assert!(v.get("result").is_none());
         }
 
-        #[tokio::test]
-        async fn cdp1_dispatch_get_document_registered_session_rejected() {
-            let dir = TempDir::new();
-            let st = state(&dir);
-            navigate(&st);
+        fn session_for_new_target(st: &Arc<CdpState>) -> (crate::target::TargetId, String) {
             let reg = st.registry();
             let tid = reg
                 .create_target(crate::target::TargetKind::Page, "about:blank")
                 .unwrap();
             let sid = reg.attach(&tid).unwrap();
-            let text = format!(
-                r#"{{"id":5,"method":"DOM.getDocument","sessionId":"{}"}}"#,
-                sid.as_str()
-            );
-            let v = call(&st, &text).await;
+            (tid, sid.as_str().to_owned())
+        }
+
+        fn commit_target(st: &Arc<CdpState>, tid: &crate::target::TargetId, url: &str, html: &str) {
+            let n = st.navigations().get_or_create(st.registry(), tid);
+            let g = n.begin_navigation().unwrap();
+            n.commit_navigation(g, NavigationResult::new(url, html))
+                .unwrap();
+        }
+
+        fn get_doc_text(sid: &str, params: &str) -> String {
+            format!(
+                r#"{{"id":5,"method":"DOM.getDocument","sessionId":"{sid}","params":{params}}}"#
+            )
+        }
+
+        const UNAVAILABLE: &str =
+            r#"{"code":-32000,"message":"document not available for target"}"#;
+
+        /// 登録済みでも未遷移のターゲットは、共有状態に文書があっても返さない（`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_dispatch_get_document_unnavigated_session_unavailable() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            let (_tid, sid) = session_for_new_target(&st);
+            let v = call(&st, &get_doc_text(&sid, "{}")).await;
             assert_eq!(
                 v["error"],
-                json!({"code": -32000, "message": "document not available for target"})
+                serde_json::from_str::<Value>(UNAVAILABLE).unwrap()
             );
             assert!(v.get("result").is_none());
+        }
+
+        /// 遷移中（begin のみ・未 commit）のターゲットは明示エラー（`REPAIR-3`・`SEC-2`）。
+        #[tokio::test]
+        async fn repair3_dispatch_get_document_in_flight_session_unavailable() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let (tid, sid) = session_for_new_target(&st);
+            commit_target(&st, &tid, "https://old.example/", PAGE);
+            let n = st.navigations().get(&tid).unwrap();
+            n.begin_navigation().unwrap();
+            let v = call(&st, &get_doc_text(&sid, "{}")).await;
+            assert_eq!(
+                v["error"],
+                serde_json::from_str::<Value>(UNAVAILABLE).unwrap()
+            );
+        }
+
+        /// セッション付きはターゲットの文書、セッションなしは共有状態の文書を返す（`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_dispatch_get_document_target_and_shared_are_separate() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            let (tid, sid) = session_for_new_target(&st);
+            commit_target(&st, &tid, "https://target.example/", PAGE);
+            let t = call(&st, &get_doc_text(&sid, "{}")).await;
+            assert_eq!(
+                t["result"]["root"]["documentURL"],
+                "https://target.example/"
+            );
+            let s = call(&st, r#"{"id":6,"method":"DOM.getDocument"}"#).await;
+            assert_eq!(s["result"]["root"]["documentURL"], "https://example.com/");
+        }
+
+        /// セッション付きでもパラメータ検証は有効（`REPAIR-3`）。
+        #[tokio::test]
+        async fn repair3_dispatch_get_document_session_validates_params() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let (tid, sid) = session_for_new_target(&st);
+            commit_target(&st, &tid, "https://target.example/", PAGE);
+            let bad = call(&st, &get_doc_text(&sid, r#"{"depth":-2}"#)).await;
+            assert_eq!(
+                bad["error"],
+                json!({"code": -32602, "message": "invalid params"})
+            );
+            let pierce = call(&st, &get_doc_text(&sid, r#"{"pierce":true}"#)).await;
+            assert_eq!(
+                pierce["error"],
+                json!({"code": -32602, "message": "unsupported params"})
+            );
         }
     }
 }
