@@ -92,7 +92,11 @@ pub(crate) const MARKER_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER";
 /// [`tag::BIND_DOM_LIKE_OBJECT`] を追加（`TASK-29.5a`・Issue #524）。
 /// `NativeReturn`／`Result` 経由で新しい値タグが実際に流れうるため、
 /// ワイヤ形式の世代差をハンドシェイクで検出できるよう上げた。
-pub(crate) const PROTOCOL_VERSION: u16 = 3;
+///
+/// 4: [`ErrorKind::ResourceLimit`]（ワイヤ値 3）を追加（`TASK-32.2`・
+/// Issue #166）。旧世代の親は未知のエラー種別を解釈できないため、世代差を
+/// ハンドシェイクで検出できるよう上げた。
+pub(crate) const PROTOCOL_VERSION: u16 = 4;
 
 /// フレームの `tag` バイトの値。
 ///
@@ -2213,7 +2217,7 @@ mod tests {
     #[test]
     fn js_1_marker_env_var_and_protocol_version_have_the_documented_values() {
         assert_eq!(MARKER_ENV_VAR, "FANDHE_BROWSER_JS_WORKER");
-        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     /// JS-1: 想定される tag 値が予約分も含め重複しないこと（プロトコル

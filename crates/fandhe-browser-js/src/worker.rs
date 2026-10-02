@@ -740,8 +740,22 @@ fn create_v8_child_engine() -> Result<Box<dyn ChildEngine>, String> {
     Err("this binary was not built with the js-v8 feature".to_string())
 }
 
-#[cfg(feature = "js-boa")]
+/// macOS では boa を動かさない（fail-closed。親側の [`create_engine`] と同じ
+/// 理由。`engine_trait::create_boa_engine` 参照）。親を経由しない直接起動も
+/// 評価を始めずに終了させる。
+///
+/// [`create_engine`]: super::engine_trait::create_engine
+#[cfg(all(feature = "js-boa", target_os = "macos"))]
 fn create_boa_child_engine() -> Result<Box<dyn ChildEngine>, String> {
+    Err("the boa engine is disabled on macOS because no allocation-time memory limit can be enforced"
+        .to_string())
+}
+
+#[cfg(all(feature = "js-boa", not(target_os = "macos")))]
+fn create_boa_child_engine() -> Result<Box<dyn ChildEngine>, String> {
+    // boa 専用の追加メモリ上限（Linux のみ。他 OS は no-op）。
+    // `enforce_child_memory_limit` の後に呼ぶため、上限は下げる方向にしか動かない。
+    super::resource_limits::tighten_child_memory_limit_for_boa()?;
     // boa には Platform 初期化も専用のヒープ上限 API も無い。メモリは
     // 呼び出し元が先に掛けた OS 側の上限（`enforce_child_memory_limit`）と
     // 親の RSS 監視、時間は親の期限 kill で守る（AGENTS.md「リソース上限」）。

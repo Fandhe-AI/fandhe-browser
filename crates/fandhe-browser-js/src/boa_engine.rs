@@ -79,6 +79,13 @@ const BOA_LOOP_ITERATION_LIMIT: u64 = 1_000_000;
 /// V8 版の `resource_limits::MAX_ARRAY_BUFFER_ALLOCATION_BYTES` と同値に保つ。
 /// boa 既定（1.5 GiB）では単発の巨大確保が親の RSS 監視（320 MiB）より先に
 /// OS の上限へ達しうるため、ホストフックで引き下げる。
+///
+/// 単位は**バイト**（boa 0.22 の `create_byte_data_block` /
+/// `create_shared_byte_data_block` が確保サイズ（バイト）をこのフックの戻り値と
+/// 直接比較する。boa 既定値 1_610_612_736 も 1.5 GiB のバイト数）。なお
+/// フックは 1 回の確保の上限しか決められず、合計の確保量は制限できない。
+/// 合計はプロセス単位の上限（Linux の `RLIMIT_DATA`・Windows の Job Object・
+/// 親の RSS 監視）で抑える（`resource_limits::tighten_child_memory_limit_for_boa`）。
 const MAX_BUFFER_BYTES: u64 = 128 * 1024 * 1024;
 
 /// boa の `HostHooks` のうち、バッファ確保の上限だけを差し替える実装

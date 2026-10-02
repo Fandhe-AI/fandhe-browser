@@ -596,6 +596,52 @@ pub(crate) fn enforce_child_memory_limit(
     }
 }
 
+/// boa 専用の `RLIMIT_DATA` 上限（バイト。1 GiB）。boa には V8 の `CodeRange`
+/// 予約が無いため、V8 用の 2 GiB（[`LINUX_RLIMIT_DATA_CEILING_BYTES`]）より
+/// 厳しくできる。boa にはヒープ・合計バッファ量の上限 API が無く（`HostHooks`
+/// の `max_buffer_size` は 1 回の確保の上限しか決められない）、128 MiB 未満の
+/// `ArrayBuffer` を保持し続けた合計は、確保時に効くプロセス単位の上限でしか
+/// 抑えられない。親側の RSS 監視（[`MAX_CHILD_RSS_BYTES`]・75 ms 間隔）が
+/// 先に kill する想定で、本値は監視が間に合わない場合の最終防衛線である
+/// （親の監視との重なりで正常系が確保失敗にならないよう、RSS しきい値の
+/// 3 倍強を確保している）。
+#[cfg(all(feature = "js-boa", target_os = "linux"))]
+const LINUX_BOA_RLIMIT_DATA_CEILING_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// boa 子プロセス専用の追加メモリ上限（`JS-1`・`TASK-32.2`・Issue #166）。
+/// [`enforce_child_memory_limit`] の後に呼ぶ。
+///
+/// - Linux: `RLIMIT_DATA` を [`LINUX_BOA_RLIMIT_DATA_CEILING_BYTES`] まで下げる
+///   （既存の上限より緩くはしない）。合計確保量に確保時点で効く
+/// - Windows: Job Object のコミット上限（[`WINDOWS_PROCESS_MEMORY_LIMIT_BYTES`]）
+///   が既に確保時点で合計に効くため何もしない
+/// - macOS: boa 自体を無効にしている（`engine_trait::create_boa_engine`）ため
+///   到達しない。何もしない
+#[cfg(feature = "js-boa")]
+pub(crate) fn tighten_child_memory_limit_for_boa() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        let existing = getrlimit(Resource::Data);
+        let target = match existing.maximum {
+            Some(hard) => hard.min(LINUX_BOA_RLIMIT_DATA_CEILING_BYTES),
+            None => LINUX_BOA_RLIMIT_DATA_CEILING_BYTES,
+        };
+        setrlimit(
+            Resource::Data,
+            Rlimit {
+                current: Some(target),
+                maximum: Some(target),
+            },
+        )
+        .map_err(|err| format!("failed to tighten RLIMIT_DATA to {target} bytes for boa: {err}"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
+}
+
 /// Linux: `RLIMIT_DATA` の soft/hard 両方を、既存の hard limit を超えない
 /// 値（[`compute_rlimit_data_target`]）に設定する。`rustix::process::
 /// getrlimit`・`setrlimit` は safe API のため `unsafe` を追加しない

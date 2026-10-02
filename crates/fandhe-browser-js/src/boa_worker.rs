@@ -23,13 +23,17 @@
 //!   `HEAP_EXTERNAL_ALLOWANCE_BYTES` と同値）に制限し、超過は catch 可能な
 //!   `RangeError` になる
 //!
-//! **macOS の限界（実装済みを装わない。REPAIR-3）**: macOS には OS による
-//! プロセス単位のメモリ上限が無い（`resource_limits` の macOS 行参照）。上記の
-//! バッファ上限は `ArrayBuffer` 系のデータブロックだけを対象とし、文字列・
-//! 配列・オブジェクトの増加はこれを経由せず、親の RSS 監視（75 ms 間隔の
-//! 後追い検出）だけが防御になる。V8 版の macOS と同じ水準であり、強制的な
-//! 上限ではない。強制できる手段（OS 機構）が得られた時点で `enforce_child_memory_limit`
-//! に実装する（`JS-1`）
+//! **macOS では boa を無効にしている（fail-closed。実装済みを装わない。REPAIR-3）**:
+//! macOS には確保時に効く OS のプロセス単位メモリ上限が無く（`resource_limits`
+//! の macOS 行参照）、boa にはヒープ上限 API も無いため、親の事後 RSS 監視だけでは
+//! 強制にならない（AGENTS.md「リソース上限」P0）。`create_engine(EngineKind::Boa)`
+//! は `NotYetImplemented` を返し、子プロセス側も起動を拒否する。確保時に効く
+//! 上限を macOS で掛けられるようになった時点で解除する（`JS-1`）。
+//!
+//! **合計確保量**: boa のホストフックは 1 回の確保の上限しか決められないため、
+//! 128 MiB 未満のバッファを積み上げた合計は、Linux では boa 専用の `RLIMIT_DATA`
+//! （1 GiB。`resource_limits::tighten_child_memory_limit_for_boa`）、Windows では
+//! Job Object のコミット上限（確保時に効く）と、各 OS共通の親の RSS 監視で抑える
 //!
 //! boa の具象型（`Context`・`JsValue`）は [`super::boa_engine`] の中に閉じ、
 //! 本モジュールは `JsEngine` トレイト越しにしか boa を扱わない。

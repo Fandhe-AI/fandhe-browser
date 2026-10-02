@@ -419,10 +419,10 @@ pub enum CreateEngineError {
         /// このバイナリに実際に同梱されている種別の一覧。
         bundled: &'static [EngineKind],
     },
-    /// 指定した種別の具象実装が存在しない。V8（TASK-29.6.2・#548）・boa
-    /// （TASK-32.2・#166）とも配線済みのため、現在はどの同梱種別にも返らない。
-    /// feature 無効側の防御的分岐でのみ使い、成功を装わない（REPAIR-3）。
-    /// 公開 API の互換性のため variant は残している。
+    /// 指定した種別が現在の環境では利用できない。V8（TASK-29.6.2・#548）・boa
+    /// （TASK-32.2・#166）とも配線済みだが、macOS の boa は確保時に効くメモリ
+    /// 上限を OS で強制できないため無効にしており、この値を返す（成功を
+    /// 装わない。REPAIR-3）。feature 無効側の防御的分岐でも使う。
     NotYetImplemented {
         /// 呼び出し元が要求した種別。
         requested: EngineKind,
@@ -508,7 +508,22 @@ pub fn create_engine(kind: EngineKind) -> Result<Box<dyn JsEngine>, CreateEngine
 
 /// boa の子プロセス版エンジンを生成する（[`create_engine`] から呼ばれる。
 /// 子は最初の操作まで起動しない）。
-#[cfg(feature = "js-boa")]
+///
+/// macOS では boa を無効にする（fail-closed。`JS-1`・`TASK-32.2`・Issue #166・
+/// AGENTS.md「リソース上限」P0）。boa にはヒープ上限 API が無く、macOS の子
+/// プロセスには確保時に効く OS 側のメモリ上限が無い（`resource_limits` の
+/// モジュール doc。`setrlimit` が `EINVAL`）ため、親の事後 RSS 監視だけでは
+/// 強制になっていないと判断した。確保時に効く上限を macOS でも掛けられる
+/// ようになった時点で本分岐を外す。**実装済みを装わず**
+/// [`CreateEngineError::NotYetImplemented`] を返す（REPAIR-3）。
+#[cfg(all(feature = "js-boa", target_os = "macos"))]
+fn create_boa_engine() -> Result<Box<dyn JsEngine>, CreateEngineError> {
+    Err(CreateEngineError::NotYetImplemented {
+        requested: EngineKind::Boa,
+    })
+}
+
+#[cfg(all(feature = "js-boa", not(target_os = "macos")))]
 fn create_boa_engine() -> Result<Box<dyn JsEngine>, CreateEngineError> {
     Ok(Box::new(
         crate::process_engine::V8ProcessEngine::with_engine_kind(EngineKind::Boa),

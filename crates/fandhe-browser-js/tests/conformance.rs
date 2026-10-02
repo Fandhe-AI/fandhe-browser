@@ -102,7 +102,9 @@ const IMPLEMENTED_ENGINES: &[EngineKind] = &[
     #[cfg(feature = "js-v8")]
     EngineKind::V8,
     // boa は V8 と同じ子プロセス版として配線済み（TASK-32.2・Issue #166）。
-    #[cfg(feature = "js-boa")]
+    // macOS の boa は確保時に効くメモリ上限を強制できないため無効（create_engine は
+    // NotYetImplemented を返す。`tests/boa_worker.rs` が挙動を検証する）。
+    #[cfg(all(feature = "js-boa", not(target_os = "macos")))]
     EngineKind::Boa,
 ];
 

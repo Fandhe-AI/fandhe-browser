@@ -17,25 +17,30 @@
 //! `cargo test -p fandhe-browser-js --features js-boa --test boa_worker`。
 
 use std::process::ExitCode;
+#[cfg(not(target_os = "macos"))]
 use std::time::{Duration, Instant};
 
-use fandhe_browser_js::{
-    EngineKind, EvaluateOptions, JsEngine, JsEngineError, JsValue, create_engine,
-};
+use fandhe_browser_js::{EngineKind, create_engine};
+#[cfg(not(target_os = "macos"))]
+use fandhe_browser_js::{EvaluateOptions, JsEngine, JsEngineError, JsValue};
 
 /// 親の評価期限（`process_engine::EVALUATE_RECV_TIMEOUT`。3 秒）に猶予を足した
 /// 上限。これ以内に呼び出しが戻らなければ実時間の上限が効いていない。
+#[cfg(not(target_os = "macos"))]
 const TIMEOUT_TEST_DEADLINE: Duration = Duration::from_secs(15);
 
+#[cfg(not(target_os = "macos"))]
 fn boa_engine() -> Box<dyn JsEngine> {
     create_engine(EngineKind::Boa).expect("the js-boa feature is enabled for this test")
 }
 
+#[cfg(not(target_os = "macos"))]
 fn eval(engine: &mut dyn JsEngine, script: &str) -> Result<JsValue, JsEngineError> {
     engine.evaluate_script(script, &EvaluateOptions::default())
 }
 
 /// 基本評価が子プロセスを経由して動くこと。
+#[cfg(not(target_os = "macos"))]
 fn js_1_boa_evaluates_in_a_child_process() {
     let mut engine = boa_engine();
     assert_eq!(
@@ -57,6 +62,7 @@ fn js_1_boa_evaluates_in_a_child_process() {
 /// 実時間の上限: ループ反復上限（boa 内蔵）に数えられない処理（正規表現の
 /// 破滅的バックトラッキング）が親の期限で
 /// `Timeout` になり、その後の評価は新しい子で成功すること。
+#[cfg(not(target_os = "macos"))]
 fn js_1_boa_wall_clock_limit_kills_the_child_and_recovers() {
     let mut engine = boa_engine();
     let started = Instant::now();
@@ -87,6 +93,7 @@ fn js_1_boa_wall_clock_limit_kills_the_child_and_recovers() {
 /// メモリの上限（親の RSS 監視）: バッファ 1 つあたりの上限（128 MiB）未満の
 /// 確保を保持し続けて積み上げ、ホストが `ResourceLimitExceeded` を受け取り
 /// （子は親の RSS 監視で kill される）、その後も評価を続けられること。
+#[cfg(not(target_os = "macos"))]
 fn js_1_boa_memory_limit_is_enforced_by_the_child_boundary() {
     let mut engine = boa_engine();
     let started = Instant::now();
@@ -112,6 +119,7 @@ fn js_1_boa_memory_limit_is_enforced_by_the_child_boundary() {
 
 /// 単発の巨大確保（上限 128 MiB 超）は boa のホストフックで拒否され、catch 可能な
 /// `RangeError` になること（子と Context は生き残り、既存のグローバルも残る）。
+#[cfg(not(target_os = "macos"))]
 fn js_1_boa_oversized_buffer_is_rejected_without_killing_the_child() {
     let mut engine = boa_engine();
     eval(&mut *engine, "var marker = 7").expect("eval");
@@ -132,6 +140,7 @@ fn js_1_boa_oversized_buffer_is_rejected_without_killing_the_child() {
 
 /// ループ反復上限（boa 内蔵）は `ResourceLimitExceeded` としてワイヤを越えて伝わり、
 /// 子は kill されず Context も残ること（"context was discarded" を含まない）。
+#[cfg(not(target_os = "macos"))]
 fn js_1_boa_loop_limit_is_reported_as_resource_limit_exceeded() {
     let mut engine = boa_engine();
     eval(&mut *engine, "var before = 11").expect("eval");
@@ -149,6 +158,7 @@ fn js_1_boa_loop_limit_is_reported_as_resource_limit_exceeded() {
 }
 
 /// 逆方向 RPC: ホスト関数・DOM 風オブジェクトのメソッドが子を越えて呼べること。
+#[cfg(not(target_os = "macos"))]
 fn js_1_boa_native_calls_cross_the_process_boundary() {
     let mut engine = boa_engine();
     engine
@@ -186,6 +196,43 @@ fn js_1_boa_native_calls_cross_the_process_boundary() {
     );
 }
 
+/// boa の `ArrayBuffer` 上限の単位（バイト）の固定: 64 MiB は確保でき、
+/// 128 MiB 超は `RangeError` になること（PR #656 レビュー指摘への回答。
+/// `HostHooks::max_buffer_size` はバイト単位）。
+#[cfg(not(target_os = "macos"))]
+fn js_1_boa_buffer_limit_unit_is_bytes() {
+    let mut engine = boa_engine();
+    assert_eq!(
+        eval(
+            &mut *engine,
+            "var b = new ArrayBuffer(67108864); b.byteLength"
+        )
+        .expect("eval"),
+        JsValue::Number(67108864.0)
+    );
+    assert_eq!(
+        eval(
+            &mut *engine,
+            "try { new ArrayBuffer(134217729); 'allocated' } catch (e) { e.name }"
+        )
+        .expect("eval"),
+        JsValue::String("RangeError".to_string())
+    );
+}
+
+/// macOS では boa を無効にしていること（確保時に効くメモリ上限を OS で強制
+/// できないため fail-closed。`create_engine` は `NotYetImplemented`）。
+#[cfg(target_os = "macos")]
+fn js_1_boa_is_disabled_on_macos() {
+    match create_engine(EngineKind::Boa) {
+        Err(fandhe_browser_js::CreateEngineError::NotYetImplemented { requested }) => {
+            assert_eq!(requested, EngineKind::Boa);
+        }
+        Err(other) => panic!("unexpected error {other:?}"),
+        Ok(_) => panic!("boa must be disabled on macOS"),
+    }
+}
+
 fn main() -> ExitCode {
     // 子プロセスとして再実行された場合は、他の出力より前にワーカーへ制御を渡す
     // （stdout はフレーム専用）。
@@ -193,18 +240,28 @@ fn main() -> ExitCode {
         return code;
     }
 
-    eprintln!("case: js_1_boa_evaluates_in_a_child_process");
-    js_1_boa_evaluates_in_a_child_process();
-    eprintln!("case: js_1_boa_native_calls_cross_the_process_boundary");
-    js_1_boa_native_calls_cross_the_process_boundary();
-    eprintln!("case: js_1_boa_wall_clock_limit_kills_the_child_and_recovers");
-    js_1_boa_wall_clock_limit_kills_the_child_and_recovers();
-    eprintln!("case: js_1_boa_oversized_buffer_is_rejected_without_killing_the_child");
-    js_1_boa_oversized_buffer_is_rejected_without_killing_the_child();
-    eprintln!("case: js_1_boa_loop_limit_is_reported_as_resource_limit_exceeded");
-    js_1_boa_loop_limit_is_reported_as_resource_limit_exceeded();
-    eprintln!("case: js_1_boa_memory_limit_is_enforced_by_the_child_boundary");
-    js_1_boa_memory_limit_is_enforced_by_the_child_boundary();
+    #[cfg(target_os = "macos")]
+    {
+        eprintln!("case: js_1_boa_is_disabled_on_macos");
+        js_1_boa_is_disabled_on_macos();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        eprintln!("case: js_1_boa_evaluates_in_a_child_process");
+        js_1_boa_evaluates_in_a_child_process();
+        eprintln!("case: js_1_boa_native_calls_cross_the_process_boundary");
+        js_1_boa_native_calls_cross_the_process_boundary();
+        eprintln!("case: js_1_boa_wall_clock_limit_kills_the_child_and_recovers");
+        js_1_boa_wall_clock_limit_kills_the_child_and_recovers();
+        eprintln!("case: js_1_boa_oversized_buffer_is_rejected_without_killing_the_child");
+        js_1_boa_oversized_buffer_is_rejected_without_killing_the_child();
+        eprintln!("case: js_1_boa_loop_limit_is_reported_as_resource_limit_exceeded");
+        js_1_boa_loop_limit_is_reported_as_resource_limit_exceeded();
+        eprintln!("case: js_1_boa_memory_limit_is_enforced_by_the_child_boundary");
+        js_1_boa_memory_limit_is_enforced_by_the_child_boundary();
+        eprintln!("case: js_1_boa_buffer_limit_unit_is_bytes");
+        js_1_boa_buffer_limit_unit_is_bytes();
+    }
     eprintln!("boa_worker: all cases passed");
     ExitCode::SUCCESS
 }
