@@ -77,7 +77,10 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
 const BOA_LOOP_ITERATION_LIMIT: u64 = 1_000_000;
 
 /// グローバル関数と DOM 風オブジェクトのメンバーを合わせた、登録簿の総エントリ
-/// 数の上限。DOM 風オブジェクトを無制限に登録して登録簿が肥大化するのを防ぐ。
+/// 数の上限。グローバル名の件数上限（[`MAX_REGISTERED_GLOBAL_FUNCTIONS`]）とは
+/// 別軸の上限で、メンバー数の多い DOM 風オブジェクトで登録簿が肥大化するのを
+/// 防ぐ。メソッド 0 個の bind は登録簿を増やさないため、こちらでは数えられない
+/// （グローバル名の件数上限が防ぐ）。
 const MAX_REGISTRY_ENTRIES: usize = 4096;
 
 /// `Context` に保持する [`NativeFn`] の登録簿。
@@ -97,7 +100,10 @@ pub(crate) struct BoaEngine {
     context: Option<Context>,
     /// 定義済みのグローバル名（関数・DOM 風オブジェクト）。重複登録を拒否する。
     defined_names: HashSet<String>,
-    /// 登録済みのグローバル関数の件数（DOM 風オブジェクトは含めない）。
+    /// 登録済みのグローバル名の件数（グローバル関数と DOM 風オブジェクトを
+    /// 合算する。メソッド 0 個の DOM 風オブジェクトも 1 件に数える。V8 版
+    /// `process_engine`・`worker` の `registered_count` と同じ数え方）。
+    /// 上限は [`MAX_REGISTERED_GLOBAL_FUNCTIONS`]。
     global_function_count: usize,
 }
 
@@ -198,6 +204,11 @@ impl JsEngine for BoaEngine {
                 )));
             }
         }
+        if self.global_function_count >= MAX_REGISTERED_GLOBAL_FUNCTIONS {
+            return Err(JsEngineError::BindingFailed(format!(
+                "too many global names (maximum {MAX_REGISTERED_GLOBAL_FUNCTIONS})"
+            )));
+        }
         if self.defined_names.contains(name) {
             return Err(JsEngineError::BindingFailed(format!(
                 "global name '{name}' is already defined"
@@ -219,6 +230,7 @@ impl JsEngine for BoaEngine {
         define_global(context, name, BoaValue::from(object))?;
         push_registry(context, functions)?;
         self.defined_names.insert(name.to_string());
+        self.global_function_count += 1;
         Ok(())
     }
 }
@@ -701,6 +713,31 @@ mod tests {
             Err(JsEngineError::BindingFailed(_))
         ));
         assert_eq!(eval(&mut e, "dom.one()").unwrap(), JsValue::Number(1.0));
+    }
+
+    /// JS-1: DOM 風オブジェクトもグローバル名の件数上限（メソッド 0 個でも 1 件）に
+    /// 数えられ、関数と合算で `MAX_REGISTERED_GLOBAL_FUNCTIONS` を超えられない。
+    #[test]
+    fn js_1_boa_dom_like_objects_count_toward_global_name_cap() {
+        let mut e = BoaEngine::new();
+        let noop = || -> NativeFn { Box::new(|_| Ok(JsValue::Undefined)) };
+        for i in 0..(MAX_REGISTERED_GLOBAL_FUNCTIONS - 1) {
+            e.bind_dom_like_object(&format!("empty{i}"), Vec::new())
+                .unwrap();
+        }
+        e.inject_global_function("last", noop()).unwrap();
+        assert!(matches!(
+            e.bind_dom_like_object("overflow", Vec::new()),
+            Err(JsEngineError::BindingFailed(_))
+        ));
+        assert!(matches!(
+            e.inject_global_function("overflow_fn", noop()),
+            Err(JsEngineError::BindingFailed(_))
+        ));
+        assert_eq!(
+            eval(&mut e, "typeof empty0").unwrap(),
+            JsValue::String("object".into())
+        );
     }
 
     /// JS-1: 生成直後に何も評価せず drop しても問題ない（遅延生成）。
