@@ -527,18 +527,32 @@ impl CommandHandler for PageNavigate {
             // 応答フレームの組み立て後〜ソケット書き込みの区間は、イベントが要求元の応答に同梱される
             // 設計上このハンドラでは直列化できない（セッション単位の配送順は TASK-43・`CDP-2` で扱う）。
             // ブラウザレベル遷移も、確定時の世代が共有状態に残っているかを同様に再確認する。
-            if let Some(url) = navigated
-                && recheck.as_ref().is_none_or(|(n, g)| {
-                    let _gate = lock_gate(&self.gate);
-                    n.current_generation() == *g
-                })
-                && recheck_shared.is_none_or(|g| {
-                    let _gate = lock_gate(&self.gate);
-                    app_nav.current_generation() == g
-                })
-            {
-                for ev in navigation_events(&out.loader_id, &url, monotonic_seconds()) {
-                    output = output.with_event(ev);
+            // ターゲット付き遷移は、公開後にターゲットが閉じられていないか（ターゲット表に存在し、
+            // セッションが同じターゲットを指したままか）も再確認する。保持中の `NavigationState`
+            // の世代はターゲット削除では変わらないため、世代だけでは閉じたターゲットの
+            // イベントを止められない（`CDP-1`・`CDP-2`）。
+            // 送出対象の確定（ターゲット生存・世代の再確認）とイベント列の作成は、同じ `gate` の
+            // ロック内で行う。確認後にロックを手放してから生成すると、その間に別の遷移が同一
+            // ターゲットで開始・確定しても古いイベントが出てしまうため（`CDP-1`）。
+            if let Some(url) = navigated {
+                let _gate = lock_gate(&self.gate);
+                let target_alive = match (&target_id, ctx.session_id) {
+                    (Some(tid), Some(sid)) => {
+                        let registry = ctx.state.registry();
+                        registry.target(tid).is_some()
+                            && registry.session_target(sid).as_ref() == Some(tid)
+                    }
+                    _ => true,
+                };
+                if target_alive
+                    && recheck
+                        .as_ref()
+                        .is_none_or(|(n, g)| n.current_generation() == *g)
+                    && recheck_shared.is_none_or(|g| app_nav.current_generation() == g)
+                {
+                    for ev in navigation_events(&out.loader_id, &url, monotonic_seconds()) {
+                        output = output.with_event(ev);
+                    }
                 }
             }
             Ok(output)
