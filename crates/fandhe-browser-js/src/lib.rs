@@ -106,11 +106,13 @@ mod v8_engine;
 // boa（`boa_engine`）による [`JsEngine`] 実装（TASK-32.2・Issue #166）。
 // V8 と同じく具象型を上位 crate へ漏らさないため `pub` を付けず、`pub use`
 // もしない（coding-rust.md「V8 / boa の具象型を上位 crate へ漏らさない」）。
-#[cfg(feature = "js-boa")]
+// macOS では boa を無効にしている（`engine_trait::create_boa_engine`）ため
+// 呼び出し元が無くなり dead_code になる。呼び出し元と同じ条件で閉じる。
+#[cfg(all(feature = "js-boa", not(target_os = "macos")))]
 mod boa_engine;
 // boa を子プロセス（`worker`）の評価エンジンとして使うためのアダプタ
 // （TASK-32.2・Issue #166）。boa の具象型は本 crate 内に閉じる。
-#[cfg(feature = "js-boa")]
+#[cfg(all(feature = "js-boa", not(target_os = "macos")))]
 mod boa_worker;
 // V8 子プロセス・boa 子プロセスが共有する定数と逆方向 RPC の窓口。
 #[cfg(any(feature = "js-v8", feature = "js-boa"))]

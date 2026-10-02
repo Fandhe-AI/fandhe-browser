@@ -617,24 +617,31 @@ const LINUX_BOA_RLIMIT_DATA_CEILING_BYTES: u64 = 1024 * 1024 * 1024;
 ///   が既に確保時点で合計に効くため何もしない
 /// - macOS: boa 自体を無効にしている（`engine_trait::create_boa_engine`）ため
 ///   到達しない。何もしない
-#[cfg(feature = "js-boa")]
+#[cfg(all(feature = "js-boa", not(target_os = "macos")))]
 pub(crate) fn tighten_child_memory_limit_for_boa() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
         let existing = getrlimit(Resource::Data);
-        let target = match existing.maximum {
-            Some(hard) => hard.min(LINUX_BOA_RLIMIT_DATA_CEILING_BYTES),
-            None => LINUX_BOA_RLIMIT_DATA_CEILING_BYTES,
+        // soft・hard それぞれ独立に「既存値と上限の小さい方」へ下げる。
+        // soft が上限より既に厳しい場合に引き上げて防御を弱めない
+        // （codex レビュー指摘 P1）。`None`（無制限）は上限値で置き換える。
+        let tighten = |existing: Option<u64>| {
+            existing.map_or(LINUX_BOA_RLIMIT_DATA_CEILING_BYTES, |v| {
+                v.min(LINUX_BOA_RLIMIT_DATA_CEILING_BYTES)
+            })
         };
+        let current = tighten(existing.current);
+        // soft は hard を超えられないため hard も同時に下げる側へ揃える。
+        let maximum = tighten(existing.maximum).max(current);
         setrlimit(
             Resource::Data,
             Rlimit {
-                current: Some(target),
-                maximum: Some(target),
+                current: Some(current),
+                maximum: Some(maximum),
             },
         )
-        .map_err(|err| format!("failed to tighten RLIMIT_DATA to {target} bytes for boa: {err}"))
+        .map_err(|err| format!("failed to tighten RLIMIT_DATA to {current} bytes for boa: {err}"))
     }
     #[cfg(not(target_os = "linux"))]
     {
