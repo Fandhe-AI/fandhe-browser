@@ -7,7 +7,7 @@
 //! （WebSocket・HTTP）の型を一切参照せず、フレームとの変換は ws.rs の責務とする。
 //!
 //! 公開入口は無く crate 内部専用。後続タスクは [`builtin_handlers`] へメソッドを
-//! 追加するだけでよい（`Page.navigate` は 42.2 で登録済み、イベント送出は 42.3、
+//! 追加するだけでよい（`Page.navigate` は 42.2 で登録済み、イベント送出は 42.3 で実装済み、
 //! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5）。
 //!
 //! # 入力の扱い
@@ -144,7 +144,7 @@ impl CdpResponse {
 
 /// CDP イベント（サーバー → クライアント。`id` を持たない通知）。
 ///
-/// 実際の送出（`Page.frameNavigated`・`Page.loadEventFired`）は TASK-42.3。
+/// `Page.navigate` が確定時に `Page.frameNavigated`・`Page.loadEventFired` を送出する（TASK-42.3）。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CdpEvent {
     /// イベント名。サーバー側の定数に限る。
@@ -178,8 +178,6 @@ pub(crate) struct HandlerOutput {
     pub events: Vec<CdpEvent>,
 }
 
-// 42.2 以降のハンドラが使う API のため dead_code を許容する。
-#[allow(dead_code)]
 impl HandlerOutput {
     /// イベントなしの出力。`result` は JSON オブジェクトを渡す。
     pub fn result(result: Value) -> Self {
@@ -197,7 +195,7 @@ impl HandlerOutput {
 }
 
 /// [`Dispatcher::dispatch`] の結果。送出順は「レスポンス → イベント列」
-/// （42.3 で確定・変更し得る。`CDP-5`）。
+/// （42.3 で確定。Chromium 流の並べ替えの要否は TASK-43・`CDP-2` で判断。`CDP-5`）。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DispatchOutcome {
     /// コマンドへの応答。

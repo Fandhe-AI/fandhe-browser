@@ -9,8 +9,9 @@
 //!
 //! # スタブ・範囲外（`REPAIR-3`）
 //!
-//! - `Page.frameNavigated`・`Page.loadEventFired` 等のイベント送出は TASK-42.3（#241）。
-//!   本ハンドラの出力は `events` が空。
+//! - イベントは確定した遷移（結果が公開されたもの）に限り `Page.frameNavigated` →
+//!   `Page.loadEventFired` を送出する（TASK-42.3・#241）。失敗・中断・追い越された遷移では
+//!   送出しない。残るスタブは [`navigation_events`] を参照。
 //! - HTML は `FetchResponse::body_text_lossy`（UTF-8 lossy）で文字列化する簡易実装。
 //!   文字コード判定は `CORE-5`・TASK-25 で置き換える。
 //! - `frameId` は [`MAIN_FRAME_ID`] の固定値。セッション／ターゲットに基づく決定は
@@ -29,7 +30,8 @@
 //! へ更新し、文書を持たない共有状態と食い違わせない（`CDP-1`）。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Instant;
 
 use fandhe_browser_core::{
     Error, FetchOptions, Fetcher, NavigationGeneration, NavigationResult, NavigationState,
@@ -37,7 +39,9 @@ use fandhe_browser_core::{
 };
 use serde_json::{Value, json};
 
-use crate::protocol::{BoxFuture, CdpError, CommandContext, CommandHandler, HandlerOutput};
+use crate::protocol::{
+    BoxFuture, CdpError, CdpEvent, CommandContext, CommandHandler, HandlerOutput,
+};
 use crate::target::{CdpStateError, MAX_URL_LEN, TargetId, TargetRegistry};
 
 /// メインフレームの `frameId`（スタブ。将来はセッション → ターゲット ID。`CDP-2`・TASK-43）。
@@ -93,6 +97,50 @@ pub(crate) fn fetch_error_text(err: &Error) -> &'static str {
         Error::InvalidInput { .. } => "net::ERR_INVALID_URL",
         _ => "net::ERR_FAILED",
     }
+}
+
+/// プロセス内の単調時計（秒）。`Page.loadEventFired` の `timestamp`（CDP `MonotonicTime`）に使う。
+/// 基点は初回呼び出し時で、システム時刻の変更に影響されない。
+fn monotonic_seconds() -> f64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
+/// 確定した遷移の CDP イベント列（`Page.frameNavigated` → `Page.loadEventFired`）を作る
+/// （TASK-42.3・`CDP-1`）。`PageNavigate::handle` が、遷移が確定し結果が公開された場合のみ呼ぶ。
+/// `session_id` は `Dispatcher::dispatch` がリクエストの値で補完するため `None` で返す。
+///
+/// 送出順は `DispatchOutcome` の「レスポンス → イベント列」で確定とする。実 Chromium のように
+/// `frameNavigated` を応答より前へ出す並べ替えの要否は TASK-43（`CDP-2`）で判断する。
+///
+/// # スタブ（`REPAIR-3`）
+///
+/// - `frame.mimeType` は固定値 `text/html`（`NavigationResult` が Content-Type を保持しないため。
+///   実値化は `CORE-5`・TASK-25 以降）。
+/// - `securityOrigin` 等の他フィールドは出さない。
+/// - `Page.enable` による購読ゲート・`frameStartedLoading`・`domContentEventFired` 等は未実装
+///   （TASK-43・`CDP-2`）。
+fn navigation_events(loader_id: &str, url: &str, timestamp: f64) -> [CdpEvent; 2] {
+    [
+        CdpEvent {
+            method: "Page.frameNavigated",
+            params: json!({
+                "frame": {
+                    "id": MAIN_FRAME_ID,
+                    "loaderId": loader_id,
+                    "url": url,
+                    "mimeType": "text/html",
+                },
+                "type": "Navigation",
+            }),
+            session_id: None,
+        },
+        CdpEvent {
+            method: "Page.loadEventFired",
+            params: json!({ "timestamp": timestamp }),
+            session_id: None,
+        },
+    ]
 }
 
 fn state_error(_: StateError) -> CdpError {
@@ -319,6 +367,8 @@ impl CommandHandler for PageNavigate {
                 .filter(|u| !u.is_empty() && u.len() <= MAX_URL_LEN)
                 .ok_or(CdpError::INVALID_PARAMS)?;
             let app_nav = ctx.state.app_state().navigation();
+            // 遷移が確定し結果が公開された場合のみ `Some(確定 URL)`。イベント送出の根拠になる。
+            let mut navigated: Option<String> = None;
             let out = match &target_id {
                 Some(tid) => {
                     let registry = ctx.state.registry();
@@ -362,6 +412,7 @@ impl CommandHandler for PageNavigate {
                         {
                             match registry.set_target_url(tid, &c.url) {
                                 Ok(()) => {
+                                    navigated = Some(c.url.clone());
                                     // 今回確定した結果だけを、完了順が新しい場合に限りミラーする。
                                     // ブラウザレベル遷移の進行中などでミラーを見送る場合も、確定順
                                     // （`seq`）は記録する。記録しないと、見送った新しい確定（B）より
@@ -434,6 +485,7 @@ impl CommandHandler for PageNavigate {
                     // 新しい場合に限り、共有状態をどのターゲットのミラーでもないものとして記録する。
                     // 失敗・中断・より新しい確定が公開済みの場合は記録を変えない（`CDP-1`）。
                     if let Some(c) = &out.committed {
+                        navigated = Some(c.url.clone());
                         let mut published = self
                             .published
                             .lock()
@@ -470,7 +522,13 @@ impl CommandHandler for PageNavigate {
             if let (Some(text), Some(obj)) = (out.error_text, result.as_object_mut()) {
                 obj.insert("errorText".into(), json!(text));
             }
-            Ok(HandlerOutput::result(result))
+            let mut output = HandlerOutput::result(result);
+            if let Some(url) = navigated {
+                for ev in navigation_events(&out.loader_id, &url, monotonic_seconds()) {
+                    output = output.with_event(ev);
+                }
+            }
+            Ok(output)
         })
     }
 }
@@ -666,6 +724,33 @@ mod tests {
         }
     }
 
+    /// `navigation_events` は `frameNavigated` → `loadEventFired` を具体値で返す（TASK-42.3・`CDP-1`）。
+    #[test]
+    fn cdp1_navigation_events_shape() {
+        let ev = navigation_events("1", "http://example.test/", 1.5);
+        assert_eq!(ev[0].method, "Page.frameNavigated");
+        assert_eq!(
+            serde_json::from_str::<Value>(&ev[0].to_json()).unwrap(),
+            json!({"method": "Page.frameNavigated", "params": {
+                "frame": {"id": "main", "loaderId": "1",
+                    "url": "http://example.test/", "mimeType": "text/html"},
+                "type": "Navigation"}})
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&ev[1].to_json()).unwrap(),
+            json!({"method": "Page.loadEventFired", "params": {"timestamp": 1.5}})
+        );
+        assert!(ev[0].session_id.is_none() && ev[1].session_id.is_none());
+    }
+
+    #[test]
+    fn cdp1_monotonic_seconds_is_non_negative_and_non_decreasing() {
+        let a = monotonic_seconds();
+        let b = monotonic_seconds();
+        assert!(a.is_finite() && a >= 0.0);
+        assert!(b >= a);
+    }
+
     // CdpState は AppState（Profile::open）が必要で非 unix では構築手段が無いため unix 限定
     // （protocol.rs の `mod dispatch` と同じ理由）。
     #[cfg(unix)]
@@ -726,13 +811,120 @@ mod tests {
             let url = format!("http://127.0.0.1:{port}/");
             let req = json!({"id": 1, "method": "Page.navigate", "params": {"url": url}});
             let f = frames(allowed_dispatcher().dispatch(&st, &req.to_string()).await);
+            // 応答 → frameNavigated → loadEventFired の順（TASK-42.3）。
+            assert_eq!(f.len(), 3);
             assert_eq!(
-                f,
-                vec![json!({"id": 1, "result": {"frameId": "main", "loaderId": "1"}})]
+                f[0],
+                json!({"id": 1, "result": {"frameId": "main", "loaderId": "1"}})
             );
+            assert_eq!(f[1]["method"], json!("Page.frameNavigated"));
+            assert_eq!(f[2]["method"], json!("Page.loadEventFired"));
             let latest = st.app_state().navigation().latest().unwrap();
             assert_eq!(latest.url(), url);
             assert_eq!(latest.html(), "<p>via cdp</p>");
+        }
+
+        /// 成功遷移は `frameNavigated` → `loadEventFired` を具体値で送出する
+        /// （TASK-42.3・`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_page_navigate_emits_frame_navigated_then_load_event_fired() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let port = serve("200 OK", "<p>ev</p>");
+            let url = format!("http://127.0.0.1:{port}/");
+            let req = json!({"id": 1, "method": "Page.navigate", "params": {"url": url}});
+            let f = frames(allowed_dispatcher().dispatch(&st, &req.to_string()).await);
+            assert_eq!(f.len(), 3);
+            assert_eq!(f[0]["result"]["loaderId"], json!("1"));
+            assert_eq!(
+                f[1],
+                json!({"method": "Page.frameNavigated", "params": {
+                    "frame": {"id": "main", "loaderId": "1", "url": url, "mimeType": "text/html"},
+                    "type": "Navigation"}})
+            );
+            assert_eq!(f[2]["method"], json!("Page.loadEventFired"));
+            let ts = f[2]["params"]["timestamp"].as_f64().unwrap();
+            assert!(ts.is_finite() && ts >= 0.0);
+            assert_eq!(f[2]["params"].as_object().unwrap().len(), 1);
+            assert!(f[1].get("sessionId").is_none());
+        }
+
+        /// 登録済み `sessionId` 付きの遷移では、全フレームへ同じ `sessionId` が付く。
+        #[tokio::test]
+        async fn cdp1_page_navigate_events_carry_session_id() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let tid = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let sid = st.registry().attach(&tid).unwrap();
+            let port = serve("200 OK", "ok");
+            let url = format!("http://127.0.0.1:{port}/");
+            let req = json!({"id": 1, "method": "Page.navigate",
+                "sessionId": sid.as_str(), "params": {"url": url}});
+            let f = frames(allowed_dispatcher().dispatch(&st, &req.to_string()).await);
+            assert_eq!(f.len(), 3);
+            assert_eq!(f[1]["method"], json!("Page.frameNavigated"));
+            assert_eq!(f[2]["method"], json!("Page.loadEventFired"));
+            for fr in &f {
+                assert_eq!(fr["sessionId"], json!(sid.as_str()));
+            }
+        }
+
+        /// `about:blank` も確定遷移としてイベントを送出し、`loaderId` は応答と一致する。
+        #[tokio::test]
+        async fn cdp1_page_navigate_about_blank_emits_events() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let req = json!({"id": 1, "method": "Page.navigate", "params": {"url": "about:blank"}});
+            let f = frames(allowed_dispatcher().dispatch(&st, &req.to_string()).await);
+            assert_eq!(f.len(), 3);
+            assert_eq!(f[1]["method"], json!("Page.frameNavigated"));
+            assert_eq!(f[1]["params"]["frame"]["url"], json!("about:blank"));
+            assert_eq!(
+                f[1]["params"]["frame"]["loaderId"],
+                f[0]["result"]["loaderId"]
+            );
+            assert_eq!(f[2]["method"], json!("Page.loadEventFired"));
+        }
+
+        /// 4xx 応答も完了した遷移として commit されるためイベントを送出する。
+        #[tokio::test]
+        async fn cdp1_page_navigate_http_error_status_still_emits_events() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let port = serve("404 Not Found", "nope");
+            let url = format!("http://127.0.0.1:{port}/");
+            let req = json!({"id": 1, "method": "Page.navigate", "params": {"url": url}});
+            let f = frames(allowed_dispatcher().dispatch(&st, &req.to_string()).await);
+            assert_eq!(f.len(), 3);
+            assert_eq!(f[1]["method"], json!("Page.frameNavigated"));
+            assert_eq!(f[2]["method"], json!("Page.loadEventFired"));
+        }
+
+        /// 取得失敗・不正 URL・許可外 scheme・未登録 session・`url` 欠落ではイベントを送出しない。
+        #[tokio::test]
+        async fn cdp1_page_navigate_failures_emit_no_events() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let d = allowed_dispatcher();
+            let cases = [
+                json!({"url": dead_url()}),
+                json!({"url": "not a url"}),
+                json!({"url": "file:///etc/passwd"}),
+                json!({}),
+            ];
+            for (i, params) in cases.iter().enumerate() {
+                let req = json!({"id": i, "method": "Page.navigate", "params": params});
+                let f = frames(d.dispatch(&st, &req.to_string()).await);
+                assert_eq!(f.len(), 1, "params={params}");
+            }
+            let req = json!({"id": 9, "method": "Page.navigate",
+                "sessionId": "NOSUCH", "params": {"url": "about:blank"}});
+            let f = frames(d.dispatch(&st, &req.to_string()).await);
+            assert_eq!(f.len(), 1);
         }
 
         #[tokio::test]
