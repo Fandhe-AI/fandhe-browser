@@ -230,6 +230,30 @@ struct Published {
     /// ミラー元ターゲットと、ミラー直後の共有状態の世代。
     /// ミラーが無い・無効化済み・ブラウザレベル遷移で上書き済みなら `None`。
     mirrored: Option<(TargetId, NavigationGeneration)>,
+    /// 進行中のブラウザレベル（`sessionId` なし）遷移の数。0 でない間は、ターゲット遷移の
+    /// ミラー（共有状態の世代払い出し）を行わない。ミラーが進行中の遷移の世代を進めて
+    /// `Superseded` で中断させないため（`CDP-1`）。
+    browser_in_flight: usize,
+}
+
+/// ブラウザレベル遷移の進行中を [`Published::browser_in_flight`] へ記録するガード。
+/// 完了・エラー・future の破棄のいずれでも減算する。
+struct BrowserFlight<'a>(&'a Mutex<Published>);
+
+impl<'a> BrowserFlight<'a> {
+    fn enter(published: &'a Mutex<Published>) -> Self {
+        let mut p = published.lock().unwrap_or_else(PoisonError::into_inner);
+        p.browser_in_flight = p.browser_in_flight.saturating_add(1);
+        drop(p);
+        Self(published)
+    }
+}
+
+impl Drop for BrowserFlight<'_> {
+    fn drop(&mut self) {
+        let mut p = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        p.browser_in_flight = p.browser_in_flight.saturating_sub(1);
+    }
 }
 
 impl PageNavigate {
@@ -243,6 +267,7 @@ impl PageNavigate {
             published: Mutex::new(Published {
                 seq: 0,
                 mirrored: None,
+                browser_in_flight: 0,
             }),
         })
     }
@@ -297,6 +322,23 @@ impl CommandHandler for PageNavigate {
             let out = match &target_id {
                 Some(tid) => {
                     let registry = ctx.state.registry();
+                    // 失敗時に保存する URL（userinfo 除去後）を状態変更の前に確定・検証する。
+                    // 再文字列化（Unicode パスのパーセントエンコード等）で `MAX_URL_LEN` を超える
+                    // URL は、世代の払い出し・ドキュメントの無効化の前に固定文言の失敗として返し、
+                    // ターゲット表と共有状態を食い違わせない（`CDP-1`・`SEC-2`）。
+                    let stored = match self.fetcher.sanitize_url(url) {
+                        Ok(u) if u.len() <= MAX_URL_LEN => u,
+                        _ => {
+                            return Ok(HandlerOutput::result(json!({
+                                "frameId": MAIN_FRAME_ID,
+                                "loaderId": format!(
+                                    "{:x}",
+                                    self.target_state(registry, tid).current_generation().get()
+                                ),
+                                "errorText": "net::ERR_INVALID_URL",
+                            })));
+                        }
+                    };
                     let nav = self.target_state(registry, tid);
                     let out = navigate_gated(&self.fetcher, &nav, url, &self.gate).await?;
                     // ターゲット表の更新と共有状態へのミラーを 1 つのロック内で行う。
@@ -322,6 +364,7 @@ impl CommandHandler for PageNavigate {
                                 Ok(()) => {
                                     // 今回確定した結果だけを、完了順が新しい場合に限りミラーする。
                                     if c.seq > published.seq
+                                        && published.browser_in_flight == 0
                                         && let Ok(g) = app_nav.begin_navigation()
                                         && app_nav
                                             .commit_navigation(
@@ -358,10 +401,7 @@ impl CommandHandler for PageNavigate {
                         // `url` は長さ検証済みで、scheme・形式は `validate_url` 通過済み。
                         // 保存する URL は userinfo（認証情報）を除去した形にする（成功時の `final_url`
                         // と同じ扱い。`/json/list` の url・title へ漏らさない。`SEC-2`）。
-                        let stored = self
-                            .fetcher
-                            .sanitize_url(url)
-                            .map_err(|_| CdpError::SERVER_ERROR)?;
+                        // `stored` は状態変更前に検証済み（長さ・形式）。
                         match registry.set_target_url(tid, &stored) {
                             Ok(()) => {}
                             Err(CdpStateError::UnknownTarget) => self.forget_target(tid),
@@ -372,6 +412,7 @@ impl CommandHandler for PageNavigate {
                         // いる間は消さない（`CDP-1`）。
                         if let Some((mid, mg)) = &published.mirrored
                             && mid == tid
+                            && published.browser_in_flight == 0
                             && app_nav.current_generation() == *mg
                         {
                             let _ = app_nav.begin_navigation();
@@ -381,6 +422,9 @@ impl CommandHandler for PageNavigate {
                     out
                 }
                 None => {
+                    // 世代払い出しより前に進行中を記録し、ターゲット遷移のミラーと調停する。
+                    // 記録は結果の公開（下の `published` 更新）が済むまで保持する。
+                    let _flight = BrowserFlight::enter(&self.published);
                     let out = navigate_gated(&self.fetcher, app_nav, url, &self.gate).await?;
                     // ブラウザレベル遷移も確定順（`seq`）の管理に含める。実際に確定し、かつ公開済みより
                     // 新しい場合に限り、共有状態をどのターゲットのミラーでもないものとして記録する。
@@ -756,6 +800,36 @@ mod tests {
             }
             assert_eq!(st.registry().target(&t1).unwrap().url(), u1);
             assert_eq!(st.registry().target(&t2).unwrap().url(), u2);
+        }
+
+        /// 正規化（パーセントエンコード）後に `MAX_URL_LEN` を超える URL は、状態変更前に
+        /// 固定文言の失敗として返り、ターゲット URL・共有状態は変わらない（`CDP-1`・`SEC-2`）。
+        #[tokio::test]
+        async fn cdp1_page_navigate_url_overlong_after_normalization_fails_without_state_change() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let tid = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let sid = st.registry().attach(&tid).unwrap();
+            let port = serve("200 OK", "prev");
+            let ok_url = format!("http://127.0.0.1:{port}/");
+            let ok = json!({"id": 1, "method": "Page.navigate",
+                "sessionId": sid.as_str(), "params": {"url": ok_url}});
+            let d = allowed_dispatcher();
+            let _ = d.dispatch(&st, &ok.to_string()).await;
+            // 生では 4000 バイト（上限内）、エンコード後は 12000 バイトを超える。
+            let url = format!("http://127.0.0.1:{port}/{}", "é".repeat(2000));
+            assert!(url.len() <= MAX_URL_LEN);
+            let req = json!({"id": 2, "method": "Page.navigate",
+                "sessionId": sid.as_str(), "params": {"url": url}});
+            let f = frames(d.dispatch(&st, &req.to_string()).await);
+            assert_eq!(f[0]["result"]["errorText"], json!("net::ERR_INVALID_URL"));
+            assert!(f[0].get("error").is_none());
+            assert_eq!(st.registry().target(&tid).unwrap().url(), ok_url);
+            assert_eq!(st.app_state().navigation().latest().unwrap().html(), "prev");
         }
 
         #[tokio::test]
