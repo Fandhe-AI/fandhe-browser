@@ -344,14 +344,22 @@ pub(crate) enum ProtocolError {
     /// [`decode_native_return`] が未知の status バイト（0=Ok, 1=Err 以外）を
     /// 受け取った（`JS-1`・Issue #511）。
     #[cfg_attr(
-        not(any(test, feature = "js-v8", feature = "js-boa")),
+        not(any(
+            test,
+            feature = "js-v8",
+            all(feature = "js-boa", not(target_os = "macos"))
+        )),
         allow(dead_code)
     )]
     InvalidNativeReturnStatus(u8),
     /// [`decode_native_return`] の Err ペイロード（エラーメッセージ）が
     /// [`MAX_ERROR_MESSAGE_BYTES`] を超えていた（`JS-1`・Issue #511）。
     #[cfg_attr(
-        not(any(test, feature = "js-v8", feature = "js-boa")),
+        not(any(
+            test,
+            feature = "js-v8",
+            all(feature = "js-boa", not(target_os = "macos"))
+        )),
         allow(dead_code)
     )]
     ErrorMessageTooLong { len: usize, max: usize },
@@ -1312,7 +1320,11 @@ impl DomLikeReader<'_> {
 /// 長さを送信直前に再確認するが、その時点ではすでに確保が終わっている
 /// ため、DoS 対策としては確保前の本検証が主たる防御線になる）。
 #[cfg_attr(
-    not(any(test, feature = "js-v8", feature = "js-boa")),
+    not(any(
+        test,
+        feature = "js-v8",
+        all(feature = "js-boa", not(target_os = "macos"))
+    )),
     allow(dead_code)
 )]
 pub(crate) fn encode_native_call(id: u32, args: &[JsValue]) -> Result<Vec<u8>, ProtocolError> {
@@ -1580,7 +1592,11 @@ pub(crate) fn truncate_for_wire(message: &str) -> String {
 ///   [`ProtocolError::ErrorMessageTooLong`] を返す（外部入力の長さを検証
 ///   してから文字列変換に使う。coding-rust.md「外部入力」節）
 #[cfg_attr(
-    not(any(test, feature = "js-v8", feature = "js-boa")),
+    not(any(
+        test,
+        feature = "js-v8",
+        all(feature = "js-boa", not(target_os = "macos"))
+    )),
     allow(dead_code)
 )]
 pub(crate) fn decode_native_return(payload: &[u8]) -> Result<NativeReturn, ProtocolError> {

@@ -7,7 +7,9 @@
 
 use std::time::Duration;
 
+#[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
 use super::engine_trait::JsValue;
+#[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
 use super::worker_protocol::NativeReturn;
 
 /// 評価できるスクリプトの最大バイト数（`JS-1`・OWASP A04「不安全な設計」。
@@ -29,6 +31,19 @@ pub(crate) const SCRIPT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(2);
 /// プロキシ関数（`boa_worker`）。実装は [`super::worker`] の
 /// `StdioTransport`（stdio 越しに親と一問一答する）を想定するが、呼び出し側は
 /// その具象型に依存しない（テストでは台本どおりに応答する偽の実装を使う）。
+///
+/// # コンパイル条件（Issue #659・`REPAIR-6`）
+///
+/// 利用者は `StdioTransport::new` の本番呼び出し 2 箇所
+/// （`worker::create_v8_child_engine` = `js-v8`、
+/// `worker::create_boa_child_engine` = `js-boa` かつ macOS 以外）だけである。
+/// そのため本 trait・[`NativeCallFailure`]・`worker::StdioTransport`・
+/// `worker_protocol` の NativeCall 系コーデックは、この 2 つの OR
+/// （`js-v8` または `js-boa` かつ非 macOS）でゲートする。macOS の boa は
+/// fail-closed で無効（`lib.rs` の `mod boa_worker` のゲートと連動）なので、
+/// macOS で boa を有効化する際は shared.rs・worker.rs・worker_protocol.rs の
+/// 同条件の箇所を同時に変えること。
+#[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
 pub(crate) trait NativeCallTransport {
     /// `id` で識別されるホスト関数を `args` を渡して呼び出し、応答が
     /// 届くまでブロックする。
@@ -36,6 +51,7 @@ pub(crate) trait NativeCallTransport {
 }
 
 /// [`NativeCallTransport::call`] が失敗した際の分類（`JS-1`・Issue #511）。
+#[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
 #[derive(Debug)]
 pub(crate) enum NativeCallFailure {
     /// 送信前に拒否した（非 fatal。呼び出し元は JS の `RangeError` として

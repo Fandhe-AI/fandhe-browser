@@ -61,14 +61,19 @@
 //!   理由は [`super::v8_engine::ensure_v8_initialized_with`] のドキュメント
 //!   コメント参照）
 
-use std::io::{self, Read, Write};
+#[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
+use std::io::Read;
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 use super::engine_trait::{EngineKind, EvaluateOptions, JsEngineError, JsValue};
+#[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
 use super::shared::{NativeCallFailure, NativeCallTransport};
 #[cfg(feature = "js-v8")]
 use super::v8_engine::V8Engine;
-use super::worker_protocol::{self, ErrorKind, NativeReturn, ProtocolError, tag};
+#[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
+use super::worker_protocol::NativeReturn;
+use super::worker_protocol::{self, ErrorKind, ProtocolError, tag};
 
 /// 親が子プロセスへ「どのエンジンで評価するか」を伝える環境変数
 /// （`TASK-32.2`・Issue #166）。値は [`EngineKind::as_str`] の表記
@@ -345,17 +350,23 @@ fn test_heap_limit_from_env_value(raw: Option<&str>) -> Option<usize> {
 /// 再入不能なロックで永久にブロックする（デッドロック）。[`worker_main`]
 /// はこの理由でループ全体を通して `lock()` を保持しない（同関数の
 /// ドキュメントコメント参照）。
+///
+/// macOS × `js-boa` 単独では利用者が無いためコンパイルしない
+/// （条件は [`super::shared::NativeCallTransport`] 参照）。
+#[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
 pub(crate) struct StdioTransport<R, W> {
     reader: R,
     writer: W,
 }
 
+#[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
 impl<R, W> StdioTransport<R, W> {
     pub(crate) fn new(reader: R, writer: W) -> Self {
         Self { reader, writer }
     }
 }
 
+#[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
 impl<R: Read, W: Write> NativeCallTransport for StdioTransport<R, W> {
     /// `NativeCall` を送り、`NativeReturn` が届くまでブロックする
     /// （一問一答）。
@@ -1154,6 +1165,7 @@ mod tests {
     /// JS-1・Issue #511: `StdioTransport::call` が、期待どおりの
     /// `NativeCall` フレームを書き込み、事前に符号化した `NativeReturn` を
     /// 正しく読み取れること（実 stdio・実子プロセスを介さない往復確認）。
+    #[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
     #[test]
     fn js_1_stdio_transport_round_trips_a_native_call() {
         let mut response = Vec::new();
@@ -1188,6 +1200,7 @@ mod tests {
 
     /// JS-1・Issue #511: 親が読み取り側を閉じた（EOF）場合は `Fatal` を
     /// 返すこと。
+    #[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
     #[test]
     fn js_1_stdio_transport_call_is_fatal_on_eof() {
         let mut transport = StdioTransport::new(io::Cursor::new(Vec::<u8>::new()), Vec::new());
@@ -1199,6 +1212,7 @@ mod tests {
 
     /// JS-1・Issue #511: `NATIVE_RETURN` 以外の想定外のタグは `Fatal` を
     /// 返すこと（一問一答の違反）。
+    #[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
     #[test]
     fn js_1_stdio_transport_call_is_fatal_on_unexpected_tag() {
         let mut response = Vec::new();
@@ -1212,6 +1226,7 @@ mod tests {
     }
 
     /// JS-1・Issue #511: フレーム長が上限を超える応答は `Fatal` を返すこと。
+    #[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
     #[test]
     fn js_1_stdio_transport_call_is_fatal_on_oversized_frame() {
         let max = worker_protocol::MAX_FRAME_PAYLOAD_PARENT_TO_CHILD;
@@ -1227,6 +1242,7 @@ mod tests {
 
     /// JS-1・Issue #511: 引数の件数・合計サイズが上限を超える場合は
     /// `Rejected` になり、何も書き込まれないこと。
+    #[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
     #[test]
     fn js_1_stdio_transport_call_rejects_too_many_args_without_writing() {
         let mut written = Vec::new();
