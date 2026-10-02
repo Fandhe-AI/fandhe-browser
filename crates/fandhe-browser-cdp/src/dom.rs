@@ -324,13 +324,12 @@ fn resolve_target(ctx: &CommandContext<'_>) -> Result<Option<TargetId>, CdpError
     }
 }
 
-/// 対象の最終確定文書を取得して DOM 化する。`DOM.getDocument`・`DOM.querySelector` が共有し、
-/// 文書の選択・上限・エラー写像を 1 か所に保つ。
-fn load_document(
+/// 対象の最終確定文書を返す。`load_document` と、払い出し記録時の最新性再確認が共有する。
+fn current_latest(
     ctx: &CommandContext<'_>,
     target: Option<&TargetId>,
-) -> Result<(Arc<NavigationResult>, ParsedDocument), CdpError> {
-    let latest = match target {
+) -> Result<Arc<NavigationResult>, CdpError> {
+    match target {
         // そのターゲットが最後に確定した文書だけを読む。共有状態へはフォールバックしない
         // （別ターゲットの内容を返さない。`CDP-1`）。未確定・失敗は明示エラー（`SEC-2`）。
         Some(tid) => ctx
@@ -338,14 +337,23 @@ fn load_document(
             .navigations()
             .get(tid)
             .and_then(|n| n.latest())
-            .ok_or(CdpError::TARGET_DOCUMENT_UNAVAILABLE)?,
+            .ok_or(CdpError::TARGET_DOCUMENT_UNAVAILABLE),
         None => ctx
             .state
             .app_state()
             .navigation()
             .latest()
-            .ok_or(CdpError::NO_DOCUMENT)?,
-    };
+            .ok_or(CdpError::NO_DOCUMENT),
+    }
+}
+
+/// 対象の最終確定文書を取得して DOM 化する。`DOM.getDocument`・`DOM.querySelector` が共有し、
+/// 文書の選択・上限・エラー写像を 1 か所に保つ。
+fn load_document(
+    ctx: &CommandContext<'_>,
+    target: Option<&TargetId>,
+) -> Result<(Arc<NavigationResult>, ParsedDocument), CdpError> {
+    let latest = current_latest(ctx, target)?;
     // DOM 応答用の上限をパース時点で適用し、巨大文書の全ノード構築を避ける（`SEC-2`）。
     let opts = ParseOptions::default().with_max_nodes(MAX_NUMBERED_NODES);
     let parsed = parse_document(latest.html(), &opts).map_err(|e| match e {
@@ -361,6 +369,11 @@ fn load_document(
 /// `Arc` を保持するためアドレスが再利用されず `Arc::ptr_eq` で同一文書を判定できる。
 /// 遷移が確定すると新しい `Arc` に置き換わり、旧 nodeId は無効になる。保持件数は
 /// 生存ターゲット数 + 1 以下（閉じたターゲットは記録時に破棄。`SEC-2`）。
+///
+/// 記録は文書（世代）単位で、ノード単位では持たない。払い出し済み文書に対しては、
+/// `DOM.getDocument` が（深さ制限で）返していない範囲の nodeId も `number_nodes` の
+/// 採番内なら検索起点として受理する（採番が決定的で、同じ文書をセレクタで辿れる範囲を
+/// 超える情報は得られないため。Chrome の「要求済みノードのみ有効」とは差異。`CDP-1`）。
 pub(crate) struct IssuedDocuments {
     inner: Mutex<HashMap<Option<TargetId>, Arc<NavigationResult>>>,
 }
@@ -373,17 +386,27 @@ impl IssuedDocuments {
     }
 
     /// `doc` を払い出し済みとして記録する（旧記録は置き換え）。
+    ///
+    /// 並行する古い `DOM.getDocument` が遅れて完了しても新しい文書の記録を上書きしないよう、
+    /// 記録用ロックを保持したまま `latest` で最新の確定文書を再取得し、`doc` と同一のときだけ
+    /// 記録する（古い文書は記録しない）。戻り値は記録したか。
     fn record(
         &self,
         registry: &crate::target::TargetRegistry,
         target: Option<&TargetId>,
         doc: &Arc<NavigationResult>,
-    ) {
+        latest: impl FnOnce() -> Option<Arc<NavigationResult>>,
+    ) -> bool {
         let mut m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         m.retain(|k, _| k.as_ref().is_none_or(|t| registry.target(t).is_some()));
+        if !latest().is_some_and(|l| Arc::ptr_eq(&l, doc)) {
+            return false;
+        }
         if target.is_none_or(|t| registry.target(t).is_some()) {
             m.insert(target.cloned(), Arc::clone(doc));
+            return true;
         }
+        false
     }
 
     /// `doc` が現在の払い出し済み文書と同一か。
@@ -470,9 +493,13 @@ impl CommandHandler for DomGetDocument {
             check_pierce(params)?;
             let (latest, parsed) = load_document(&ctx, target.as_ref())?;
             let root = build_document_node(&parsed.document, latest.url(), depth)?;
+            // 構築中に遷移・並行 getDocument で最新でなくなった文書は記録しない（nodeId は
+            // 無効扱い。新世代の記録を古い `Arc` で上書きしない）。
             ctx.state
                 .dom_issued()
-                .record(ctx.state.registry(), target.as_ref(), &latest);
+                .record(ctx.state.registry(), target.as_ref(), &latest, || {
+                    current_latest(&ctx, target.as_ref()).ok()
+                });
             Ok(HandlerOutput::result(json!({ "root": root })))
         })
     }
@@ -738,6 +765,23 @@ mod tests {
         }
         assert_eq!(a.resolve(0), None);
         assert_eq!(a.resolve(a.order.len() as i64 + 1), None);
+    }
+
+    /// 古い文書の記録要求は、最新文書の払い出し記録を上書きしない（`CDP-1`）。
+    #[test]
+    fn cdp1_issued_record_rejects_stale_document() {
+        let registry = crate::target::TargetRegistry::new();
+        let old = Arc::new(NavigationResult::new("https://example.com/", "<p>old</p>"));
+        let new = Arc::new(NavigationResult::new("https://example.com/", "<p>new</p>"));
+        let issued = IssuedDocuments::new();
+        // 最新は new。new を記録できる。
+        assert!(issued.record(&registry, None, &new, || Some(Arc::clone(&new))));
+        // 遅れて完了した old は最新でないため記録されず、new が有効なまま残る。
+        assert!(!issued.record(&registry, None, &old, || Some(Arc::clone(&new))));
+        assert!(issued.is_current(None, &new));
+        assert!(!issued.is_current(None, &old));
+        // 最新を取得できない場合も記録しない。
+        assert!(!issued.record(&registry, None, &old, || None));
     }
 
     // CdpState は AppState（Profile::open）が必要で、非 unix では構築手段が無い
