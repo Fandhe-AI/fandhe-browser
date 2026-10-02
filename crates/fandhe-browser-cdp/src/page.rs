@@ -485,13 +485,24 @@ impl CommandHandler for PageNavigate {
                     // 新しい場合に限り、共有状態をどのターゲットのミラーでもないものとして記録する。
                     // 失敗・中断・より新しい確定が公開済みの場合は記録を変えない（`CDP-1`）。
                     if let Some(c) = &out.committed {
-                        navigated = Some(c.url.clone());
                         let mut published = self
                             .published
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner);
                         if c.seq > published.seq {
                             published.seq = c.seq;
+                            // イベント送出は、より新しい確定が公開済みでなく（上の `seq` 判定）、確定後に
+                            // 別遷移へ追い越されていない（世代一致・結果保持）場合に限る。追い越された
+                            // 遷移の `frameNavigated` が新しい遷移のイベントの後に届かないようにする。
+                            // 世代確認は共有状態を書き換える前に行い、`gate` で後続遷移の開始と排他にする。
+                            {
+                                let _gate = lock_gate(&self.gate);
+                                if app_nav.current_generation() == c.generation
+                                    && c.result.is_some()
+                                {
+                                    navigated = Some(c.url.clone());
+                                }
+                            }
                             // 共有状態に古いターゲットのミラーが載ったままなら、今回の確定結果で
                             // 戻す。別の進行中遷移を巻き込まないよう、載っているのがそのミラー
                             // 自身（世代一致）の場合に限る。確定結果を戻せなかった（`result` が
@@ -1244,6 +1255,30 @@ mod tests {
             assert_eq!(p.seq, 2);
             assert!(p.mirrored.is_none());
             assert!(st.app_state().navigation().latest().is_none());
+        }
+
+        /// より新しい確定が公開済みの場合、ブラウザレベル遷移は追い越されたものとして
+        /// イベントを送出しない（TASK-42.3・`CDP-1`）。応答自体は返る。
+        #[tokio::test]
+        async fn cdp1_page_navigate_browser_level_overtaken_emits_no_events() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let h = Arc::new(
+                PageNavigate::new(FetchOptions::new().with_allow_private_network_access(true))
+                    .unwrap(),
+            );
+            h.published.lock().unwrap().seq = u64::MAX;
+            let d = Dispatcher::from_handlers(vec![(
+                "Page.navigate",
+                Box::new(SharedHandler(Arc::clone(&h))),
+            )])
+            .unwrap();
+            let u = format!("http://127.0.0.1:{}/", serve("200 OK", "x"));
+            let req = json!({"id": 1, "method": "Page.navigate", "params": {"url": u}});
+            let f = frames(d.dispatch(&st, &req.to_string()).await);
+            assert_eq!(f.len(), 1);
+            assert_eq!(f[0]["id"], json!(1));
+            assert_eq!(f[0]["result"]["frameId"], json!("main"));
         }
 
         #[tokio::test]
