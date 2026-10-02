@@ -161,7 +161,9 @@ required-features = ["js-boa"]
 # `fandhe_browser_js::run_js_worker_if_requested` を呼ぶ）。`harness = false`
 # の理由も同じ: 子プロセス役のときの stdout はプロトコルフレーム専用で、
 # libtest の出力が混入するとフレームが壊れる。`required-features` は付けない
-# （既定構成の契約テストも同じバイナリで実行するため）。
+# （既定構成の契約テストも同じバイナリで実行するため）。boa も同じ子プロセス経路で
+# 検査される（TASK-32.2・Issue #166）。両エンジン同梱時は V8・boa 双方が検査された
+# ことを具体値で固定する（TASK-32.3・Issue #167）。
 [[test]]
 name = "conformance"
 harness = false
