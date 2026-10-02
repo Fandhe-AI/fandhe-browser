@@ -132,7 +132,14 @@ pub(crate) async fn navigate_gated(
             began: None,
         });
     }
-    let generation = nav.begin_navigation().map_err(state_error)?;
+    // 世代の払い出しは `gate` のロック内で行う。呼び出し側（`PageNavigate::handle`）は世代確認から
+    // ターゲット表の更新・公開までを同じ `gate` のロック内で行うため、同一ターゲットの後続遷移の
+    // 開始と排他になり、確認後に追い越されて URL と HTML が食い違うことがない（`CDP-1`）。
+    let generation = {
+        let _guard = lock_gate(gate);
+        nav.begin_navigation()
+    }
+    .map_err(state_error)?;
     let mut outcome = NavigateOutcome {
         loader_id: format!("{:x}", generation.get()),
         error_text: None,
@@ -305,6 +312,9 @@ impl CommandHandler for PageNavigate {
                         // 確定直後に別遷移が始まって結果を保持できなかった（`result` が `None`）場合は
                         // 追い越されたものとして扱い、URL もミラーも公開しない。URL だけ公開して
                         // 共有状態との食い違いを作らないため。
+                        // 世代確認から URL 更新・ミラーまでは `gate` を保持し、同一ターゲットの後続遷移の
+                        // 開始（`navigate_gated` の世代払い出し）と排他にする（`CDP-1`）。
+                        let _gate = lock_gate(&self.gate);
                         if nav.current_generation() == c.generation
                             && let Some(r) = &c.result
                         {
@@ -331,12 +341,28 @@ impl CommandHandler for PageNavigate {
                     } else if let Some(g) = out.began
                         && nav.current_generation() == g
                     {
+                        // 上の確認と URL 更新の間に同一ターゲットの後続遷移が開始しないよう、
+                        // `gate` を保持したうえで世代を再確認する（`CDP-1`）。
+                        let _gate = lock_gate(&self.gate);
+                        if nav.current_generation() != g {
+                            return Ok(HandlerOutput::result(json!({
+                                "frameId": MAIN_FRAME_ID,
+                                "loaderId": out.loader_id,
+                                "errorText": out.error_text.unwrap_or("net::ERR_FAILED"),
+                            })));
+                        }
                         // 取得失敗（後続の遷移に追い越されていない）。ターゲットの直近結果は
                         // begin で無効化済みのため、ターゲット表の URL も試行した URL へ揃える
                         // （失敗時の URL 契約: Chromium がエラーページに試行 URL を保つのと同じ。
                         // 検証で弾いた遷移は状態を変えないので URL も変えない。`CDP-1`）。
                         // `url` は長さ検証済みで、scheme・形式は `validate_url` 通過済み。
-                        match registry.set_target_url(tid, url) {
+                        // 保存する URL は userinfo（認証情報）を除去した形にする（成功時の `final_url`
+                        // と同じ扱い。`/json/list` の url・title へ漏らさない。`SEC-2`）。
+                        let stored = self
+                            .fetcher
+                            .sanitize_url(url)
+                            .map_err(|_| CdpError::SERVER_ERROR)?;
+                        match registry.set_target_url(tid, &stored) {
                             Ok(()) => {}
                             Err(CdpStateError::UnknownTarget) => self.forget_target(tid),
                             Err(_) => return Err(CdpError::SERVER_ERROR),
@@ -812,6 +838,27 @@ mod tests {
             let p = dead.local_addr().unwrap().port();
             drop(dead);
             format!("http://127.0.0.1:{p}/")
+        }
+
+        /// 取得失敗時にターゲット表へ保存する URL から userinfo が除去される（`CDP-1`・`SEC-2`）。
+        #[tokio::test]
+        async fn cdp1_page_navigate_failure_strips_userinfo_from_target_url() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let tid = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let sid = st.registry().attach(&tid).unwrap();
+            let base = dead_url();
+            let dead = base.replace("http://", "http://user:secret@");
+            let req = json!({"id": 1, "method": "Page.navigate",
+                "sessionId": sid.as_str(), "params": {"url": dead}});
+            let f = frames(allowed_dispatcher().dispatch(&st, &req.to_string()).await);
+            assert!(f[0]["result"]["errorText"].is_string());
+            let stored = st.registry().target(&tid).unwrap().url().to_owned();
+            assert_eq!(stored, base);
         }
 
         #[tokio::test]
