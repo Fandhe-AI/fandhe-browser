@@ -23,6 +23,10 @@
 //! `errorText` を付けて返す。これは仕様上の失敗通知であり、Puppeteer / Playwright は
 //! 失敗として扱う（一律 success を返して検出を回避する挙動ではない）。`errorText` は
 //! [`fetch_error_text`] の閉じた固定文言表のみで、URL・アドレス等の入力由来文字列を含めない。
+//!
+//! 検証段階で弾いた遷移（不正 URL・許可外 scheme）は状態を変えず、ターゲット表の URL も維持する。
+//! 世代を払い出した後の取得失敗は直近結果を無効化するため、ターゲット表の URL も試行した URL
+//! へ更新し、文書を持たない共有状態と食い違わせない（`CDP-1`）。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -326,15 +330,27 @@ impl CommandHandler for PageNavigate {
                         }
                     } else if let Some(g) = out.began
                         && nav.current_generation() == g
-                        && let Some((mid, mg)) = &published.mirrored
-                        && mid == tid
-                        && app_nav.current_generation() == *mg
                     {
-                        // 取得失敗でターゲットの直近結果は無効化済み。共有状態が当該ターゲット
-                        // 自身のミラーのままなら無効化し、直前に成功したページを読めなくする。
-                        // 別ターゲットやブラウザレベル遷移の結果が載っている間は消さない（`CDP-1`）。
-                        let _ = app_nav.begin_navigation();
-                        published.mirrored = None;
+                        // 取得失敗（後続の遷移に追い越されていない）。ターゲットの直近結果は
+                        // begin で無効化済みのため、ターゲット表の URL も試行した URL へ揃える
+                        // （失敗時の URL 契約: Chromium がエラーページに試行 URL を保つのと同じ。
+                        // 検証で弾いた遷移は状態を変えないので URL も変えない。`CDP-1`）。
+                        // `url` は長さ検証済みで、scheme・形式は `validate_url` 通過済み。
+                        match registry.set_target_url(tid, url) {
+                            Ok(()) => {}
+                            Err(CdpStateError::UnknownTarget) => self.forget_target(tid),
+                            Err(_) => return Err(CdpError::SERVER_ERROR),
+                        }
+                        // 共有状態が当該ターゲット自身のミラーのままなら無効化し、直前に成功した
+                        // ページを読めなくする。別ターゲットやブラウザレベル遷移の結果が載って
+                        // いる間は消さない（`CDP-1`）。
+                        if let Some((mid, mg)) = &published.mirrored
+                            && mid == tid
+                            && app_nav.current_generation() == *mg
+                        {
+                            let _ = app_nav.begin_navigation();
+                            published.mirrored = None;
+                        }
                     }
                     out
                 }
@@ -350,14 +366,21 @@ impl CommandHandler for PageNavigate {
                             .unwrap_or_else(PoisonError::into_inner);
                         if c.seq > published.seq {
                             published.seq = c.seq;
-                            let prev = published.mirrored.take();
-                            // 今回の確定より古いターゲット結果が共有状態へ載ったままなら、今回の
-                            // 確定結果で戻す。別の進行中遷移を巻き込まないよう、載っているのが
-                            // そのミラー自身（世代一致）の場合に限る。
-                            if prev.is_some_and(|(_, mg)| app_nav.current_generation() == mg)
-                                && let Some(r) = &c.result
+                            // 共有状態に古いターゲットのミラーが載ったままなら、今回の確定結果で
+                            // 戻す。別の進行中遷移を巻き込まないよう、載っているのがそのミラー
+                            // 自身（世代一致）の場合に限る。確定結果を戻せなかった（`result` が
+                            // `None`・begin 失敗）場合はミラー記録を残し、そのターゲットの後の
+                            // 失敗で共有状態を無効化できるようにする。
+                            let on_shared = published
+                                .mirrored
+                                .as_ref()
+                                .is_some_and(|(_, mg)| app_nav.current_generation() == *mg);
+                            if !on_shared {
+                                published.mirrored = None;
+                            } else if let Some(r) = &c.result
                                 && let Ok(g) = app_nav.begin_navigation()
                             {
+                                published.mirrored = None;
                                 let _ = app_nav
                                     .commit_navigation(g, NavigationResult::new(r.url(), r.html()));
                             }
@@ -710,7 +733,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn cdp1_page_navigate_overlong_final_url_fails_without_state_change() {
+        async fn cdp1_page_navigate_overlong_final_url_fails_and_target_url_is_attempted_url() {
             use crate::target::TargetKind;
             let dir = TempDir::new();
             let st = state(&dir);
@@ -746,7 +769,8 @@ mod tests {
                 "sessionId": sid.as_str(), "params": {"url": url}});
             let f = frames(allowed_dispatcher().dispatch(&st, &req.to_string()).await);
             assert_eq!(f[0]["result"]["errorText"], json!("net::ERR_INVALID_URL"));
-            assert_eq!(st.registry().target(&tid).unwrap().url(), "about:blank");
+            // 取得失敗後のターゲット URL は試行した URL（失敗時の URL 契約。`CDP-1`）。
+            assert_eq!(st.registry().target(&tid).unwrap().url(), url);
         }
 
         #[tokio::test]
@@ -772,11 +796,14 @@ mod tests {
             let dead = TcpListener::bind("127.0.0.1:0").unwrap();
             let dead_port = dead.local_addr().unwrap().port();
             drop(dead);
+            let dead = format!("http://127.0.0.1:{dead_port}/");
             let ng = json!({"id": 2, "method": "Page.navigate",
-                "sessionId": sid.as_str(), "params": {"url": format!("http://127.0.0.1:{dead_port}/")}});
+                "sessionId": sid.as_str(), "params": {"url": dead}});
             let f = frames(d.dispatch(&st, &ng.to_string()).await);
             assert!(f[0]["result"]["errorText"].is_string());
             assert!(st.app_state().navigation().latest().is_none());
+            // ターゲット表の URL も、文書を持たない状態と食い違わないよう試行 URL へ揃う。
+            assert_eq!(st.registry().target(&tid).unwrap().url(), dead);
         }
 
         /// 閉じたポートの URL を返す。
@@ -810,15 +837,17 @@ mod tests {
                     "sessionId": sid.as_str(), "params": {"url": u}});
                 d.dispatch(&st, &req.to_string()).await;
             }
+            let dead = dead_url();
             let ng = json!({"id": 3, "method": "Page.navigate",
-                "sessionId": sa.as_str(), "params": {"url": dead_url()}});
+                "sessionId": sa.as_str(), "params": {"url": dead}});
             let f = frames(d.dispatch(&st, &ng.to_string()).await);
             assert!(f[0]["result"]["errorText"].is_string());
             let latest = st.app_state().navigation().latest().unwrap();
             assert_eq!(latest.html(), "b-page");
             assert_eq!(latest.url(), ub);
             assert_eq!(st.registry().target(&tb).unwrap().url(), ub);
-            assert_eq!(st.registry().target(&ta).unwrap().url(), ua);
+            // 失敗したターゲット自身の URL は試行 URL（他ターゲットには影響しない）。
+            assert_eq!(st.registry().target(&ta).unwrap().url(), dead);
         }
 
         #[tokio::test]
