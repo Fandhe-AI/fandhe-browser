@@ -91,15 +91,13 @@ const BUNDLED: &[EngineKind] = &[
 /// 順序は `js-engine.md`「(1) 省略」の「同梱エンジンから V8 → boa の優先順で
 /// 選ぶ」という後続契約（TASK-91 が依存）に対応する。
 ///
-/// `js-v8` は子プロセス版エンジンへ配線済み（TASK-29.6.2・#548）で、
-/// [`create_engine`] は `Ok` を返す。一方 `js-boa` は依存（`boa_engine`）を
-/// TASK-32.1（#165）で結合済みだが、有効化しても具象実装は無い（実装は
-/// TASK-32.2・#166）（実装済みを装わない。
-/// REPAIR-3）。[`create_engine`] はこの一覧を「同梱判定」の唯一の情報源として
-/// 使うが、同梱されている（＝ `feature` が有効）ことは「具象実装が使える」
-/// ことを意味しない。boa は TASK-32 の完了までの間 [`create_engine`] が
-/// `CreateEngineError::NotYetImplemented` を返すため、呼び出し元は boa を
-/// 「即座に生成・実行できるエンジン」として扱ってはならない。feature が無効なバリアントはコンパイル自体から除外されるため
+/// `js-v8`・`js-boa` はどちらも子プロセス版エンジンへ配線済み（macOS の boa は
+/// 無効で `create_engine` が `NotYetImplemented` を返す）で
+/// （TASK-29.6.2・#548／TASK-32.2・#166）、[`create_engine`] はどちらも `Ok` を
+/// 返す。boa は V8 と同じ子プロセス分離基盤の上で動き、実時間は親の期限 kill、
+/// メモリは子の OS 上限と親の RSS 監視で強制する（`boa_worker` モジュール doc）。
+/// [`create_engine`] はこの一覧を「同梱判定」の唯一の情報源として使う。
+/// feature が無効なバリアントはコンパイル自体から除外されるため
 /// （`#[cfg(...)]` 付きの配列要素）、「同梱されていないのに一覧に載る」
 /// 幽霊エントリが実行時分岐の書き間違いで混入する余地はない。
 pub fn bundled_engines() -> &'static [EngineKind] {
@@ -422,11 +420,10 @@ pub enum CreateEngineError {
         /// このバイナリに実際に同梱されている種別の一覧。
         bundled: &'static [EngineKind],
     },
-    /// 指定した種別は同梱されている（feature は有効）が、具象実装がまだ
-    /// 存在しない。現在は boa（`TASK-32`・`MS-3` の完了待ち）だけが該当する
-    /// （V8 は `TASK-29.6.2`・#548 で配線済み）。実装済みを装わない
-    /// （REPAIR-3）ための一時的なバリアントであり、`TASK-32` 完了後は boa に
-    /// ついてもこのバリアントを返さなくなる。
+    /// 指定した種別が現在の環境では利用できない。V8（TASK-29.6.2・#548）・boa
+    /// （TASK-32.2・#166）とも配線済みだが、macOS の boa は確保時に効くメモリ
+    /// 上限を OS で強制できないため無効にしており、この値を返す（成功を
+    /// 装わない。REPAIR-3）。feature 無効側の防御的分岐でも使う。
     NotYetImplemented {
         /// 呼び出し元が要求した種別。
         requested: EngineKind,
@@ -474,14 +471,14 @@ impl std::error::Error for CreateEngineError {}
 ///
 /// **契約**: 同梱していない種別（[`bundled_engines`] に含まれない）には
 /// [`CreateEngineError::NotBundled`] を返し、別エンジンへのフォールバックは
-/// しない。V8 は子プロセス版エンジン（`process_engine::V8ProcessEngine`）を
-/// `Ok` で返す。boa は具象実装が無い間 [`CreateEngineError::NotYetImplemented`]
-/// を返す（`TASK-32`。ダミーの成功を返さない。security.md「偽装・回避機能の
-/// 禁止」）。
+/// しない。V8・boa（macOS を除く。macOS の boa は `NotYetImplemented`）とも子プロセス版エンジン（`process_engine::V8ProcessEngine`。
+/// boa は `EngineKind::Boa` を指定して生成。`TASK-32.2`・#166）を `Ok` で返す。
+/// boa には中断 API・ヒープ上限 API が無いため、プロセス境界で実時間（親の
+/// 期限 kill）とメモリ（子の OS 上限・親の RSS 監視）を強制する。
 ///
 /// # 起動タイミングと失敗の現れ方（`TASK-29.6.2`・#548。`PERF-6`・`PERF-7`・`CORE-3`）
 ///
-/// V8 版は**遅延起動**で、本関数は I/O を行わず子プロセスを起動しない。子が
+/// V8 版・boa 版とも**遅延起動**で、本関数は I/O を行わず子プロセスを起動しない。子が
 /// 起動するのは `evaluate_script`・`inject_global_function`・
 /// `bind_dom_like_object` のうち最初に呼ばれたもので、起動・ハンドシェイクの
 /// 失敗は `CreateEngineError` ではなく、その呼び出しが返す
@@ -506,8 +503,41 @@ pub fn create_engine(kind: EngineKind) -> Result<Box<dyn JsEngine>, CreateEngine
     }
     match kind {
         EngineKind::V8 => create_v8_engine(),
-        EngineKind::Boa => Err(CreateEngineError::NotYetImplemented { requested: kind }),
+        EngineKind::Boa => create_boa_engine(),
     }
+}
+
+/// boa の子プロセス版エンジンを生成する（[`create_engine`] から呼ばれる。
+/// 子は最初の操作まで起動しない）。
+///
+/// macOS では boa を無効にする（fail-closed。`JS-1`・`TASK-32.2`・Issue #166・
+/// AGENTS.md「リソース上限」P0）。boa にはヒープ上限 API が無く、macOS の子
+/// プロセスには確保時に効く OS 側のメモリ上限が無い（`resource_limits` の
+/// モジュール doc。`setrlimit` が `EINVAL`）ため、親の事後 RSS 監視だけでは
+/// 強制になっていないと判断した。確保時に効く上限を macOS でも掛けられる
+/// ようになった時点で本分岐を外す。**実装済みを装わず**
+/// [`CreateEngineError::NotYetImplemented`] を返す（REPAIR-3）。
+#[cfg(all(feature = "js-boa", target_os = "macos"))]
+fn create_boa_engine() -> Result<Box<dyn JsEngine>, CreateEngineError> {
+    Err(CreateEngineError::NotYetImplemented {
+        requested: EngineKind::Boa,
+    })
+}
+
+#[cfg(all(feature = "js-boa", not(target_os = "macos")))]
+fn create_boa_engine() -> Result<Box<dyn JsEngine>, CreateEngineError> {
+    Ok(Box::new(
+        crate::process_engine::V8ProcessEngine::with_engine_kind(EngineKind::Boa),
+    ))
+}
+
+/// `js-boa` 無効時の boa 分岐。[`create_engine`] は同梱判定で先に
+/// `NotBundled` を返すため到達しないが、成功を装わず `NotYetImplemented` を返す。
+#[cfg(not(feature = "js-boa"))]
+fn create_boa_engine() -> Result<Box<dyn JsEngine>, CreateEngineError> {
+    Err(CreateEngineError::NotYetImplemented {
+        requested: EngineKind::Boa,
+    })
 }
 
 /// V8 の子プロセス版エンジンを生成する（[`create_engine`] から呼ばれる。
@@ -661,17 +691,27 @@ mod tests {
         assert!(create_engine(EngineKind::V8).is_ok());
     }
 
-    /// JS-1: boa は同梱していても具象実装が無いため `NotYetImplemented` を返す
-    /// こと（「同梱＝即利用可能」ではないことの回帰テスト）。
+    /// JS-1: boa を同梱したビルドでは `create_engine(Boa)` が boa 版を `Ok` で
+    /// 返すこと（コンテキストは遅延生成のため評価はしない。TASK-32.2）。
     #[test]
-    #[cfg(feature = "js-boa")]
-    fn js_1_create_engine_returns_not_yet_implemented_for_bundled_boa() {
-        assert!(matches!(
-            create_engine(EngineKind::Boa),
-            Err(CreateEngineError::NotYetImplemented {
-                requested: EngineKind::Boa
-            })
-        ));
+    #[cfg(all(feature = "js-boa", not(target_os = "macos")))]
+    fn js_1_create_engine_returns_ok_for_bundled_boa() {
+        assert!(create_engine(EngineKind::Boa).is_ok());
+    }
+
+    /// JS-1・REPAIR-3: macOS では確保時に効くメモリ上限を強制できないため boa は
+    /// 無効で、`create_engine(Boa)` は `NotYetImplemented` を返す（fail-closed。
+    /// TASK-32.2）。
+    #[test]
+    #[cfg(all(feature = "js-boa", target_os = "macos"))]
+    fn js_1_create_engine_returns_not_yet_implemented_for_boa_on_macos() {
+        match create_engine(EngineKind::Boa) {
+            Err(CreateEngineError::NotYetImplemented { requested }) => {
+                assert_eq!(requested, EngineKind::Boa);
+            }
+            Err(other) => panic!("expected NotYetImplemented, got {other:?}"),
+            Ok(_) => panic!("boa must be disabled on macOS"),
+        }
     }
 
     /// JS-1: `JsEngineError`・`CreateEngineError` が `std::error::Error` を

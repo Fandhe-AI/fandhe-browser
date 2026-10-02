@@ -235,7 +235,7 @@ const REGISTER_ACK_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
 /// 1 つの期限を使い回す（`dispatch_native_call`・[`write_frame_with_deadline`]
 /// のドキュメントコメント参照。期限を延長する経路は無い）。
 const EVALUATE_RECV_TIMEOUT: Duration =
-    super::v8_engine::SCRIPT_EXECUTION_TIMEOUT.saturating_add(Duration::from_secs(1));
+    super::shared::SCRIPT_EXECUTION_TIMEOUT.saturating_add(Duration::from_secs(1));
 
 /// 子の `Drop` 時、stdin を閉じてから強制終了するまでに正常終了を待つ
 /// 上限時間（設計書 §3.2「1 秒だけ `try_wait` で待つ」）。
@@ -843,6 +843,10 @@ impl WorkerHandle {
     fn stderr_indicates_oom(tail: &str) -> bool {
         tail.contains("Fatal JavaScript out of memory")
             || tail.contains("Fatal process out of memory")
+            // boa（Rust の割り当て失敗）: OS のメモリ上限に達すると
+            // 標準の alloc error handler がこのメッセージを出して abort する
+            // （`TASK-32.2`・Issue #166）。
+            || (tail.contains("memory allocation of ") && tail.contains(" bytes failed"))
     }
 }
 
@@ -967,6 +971,13 @@ mod spawn_config {
         /// ドキュメントコメント参照）。子プロセス側（`super::super::worker`）でも
         /// 同じクランプを独立に適用しており、親を経由しない直接起動に対する
         /// 防御になっている（多層防御）。
+        #[cfg_attr(
+            not(feature = "js-v8"),
+            allow(
+                dead_code,
+                reason = "V8 ヒープ上限は V8 の子プロセスにだけ意味を持つ（js-boa のみのビルドでは読まない。TASK-32.2）"
+            )
+        )]
         pub heap_limit_bytes: Option<usize>,
         /// 子へ渡すプロトコルバージョンの上書き値（ハンドシェイク失敗を
         /// 決定的に再現するためのテスト専用経路）。`None` の場合は
@@ -1125,6 +1136,12 @@ pub struct V8ProcessEngine {
     /// `worker` を破棄しても残り、次に起動する子へ `spawn_worker` が
     /// 登録し直す（`native_fns` と同じ寿命）。
     host_bindings: Vec<HostBinding>,
+    /// 子プロセスが評価に使うエンジン種別（`TASK-32.2`・Issue #166）。
+    /// 子へ環境変数で伝え（[`super::worker::ENGINE_ENV_VAR`]）、`Hello` の
+    /// 種別がこの値と一致しなければハンドシェイクを失敗させる。
+    /// 型名は V8 子プロセス専用だった経緯で `V8ProcessEngine` のまま
+    /// （公開名の互換性のため。boa も同じ分離基盤を使う）。
+    engine_kind: EngineKind,
 }
 
 impl V8ProcessEngine {
@@ -1134,11 +1151,21 @@ impl V8ProcessEngine {
     /// を使う。
     #[doc(hidden)]
     pub fn new() -> Self {
+        Self::with_engine_kind(EngineKind::V8)
+    }
+
+    /// [`V8ProcessEngine::new`] と同じだが、子プロセスの評価エンジン種別を
+    /// 指定する（`TASK-32.2`・Issue #166。boa も V8 と同じ子プロセス分離・
+    /// 親による期限 kill・OS メモリ上限・RSS 監視の上で動かす）。
+    /// 同梱判定は呼び出し元（[`super::engine_trait::create_engine`]）が行う。
+    #[doc(hidden)]
+    pub fn with_engine_kind(engine_kind: EngineKind) -> Self {
         Self {
             worker: None,
             spawn_config: WorkerSpawnConfigForTest::default(),
             native_fns: Vec::new(),
             host_bindings: Vec::new(),
+            engine_kind,
         }
     }
 
@@ -1153,6 +1180,7 @@ impl V8ProcessEngine {
             spawn_config,
             native_fns: Vec::new(),
             host_bindings: Vec::new(),
+            engine_kind: EngineKind::V8,
         }
     }
 
@@ -1422,7 +1450,7 @@ impl V8ProcessEngine {
         // 「親は MAX_FRAME_PAYLOAD_PARENT_TO_CHILD（1 MiB+64 KiB）まで
         // 受け付けるが、子は MAX_SCRIPT_SOURCE_BYTES（1 MiB）までしか
         // 受け付けない」対応: 親の事前検証を子の実効的な上限
-        // （`super::v8_engine::MAX_SCRIPT_SOURCE_BYTES`）に揃える。
+        // （`super::shared::MAX_SCRIPT_SOURCE_BYTES`）に揃える。
         // `MAX_FRAME_PAYLOAD_PARENT_TO_CHILD` はフレームのタグ・長さ
         // プレフィックス分の余白を含むプロトコル上の上限であり、
         // アプリケーション側の実効的な入力上限とは別物である
@@ -1430,10 +1458,10 @@ impl V8ProcessEngine {
         // 弾いておけば、子を起動して書き込みを試みたあとに子側の
         // `V8Engine::evaluate_script` が同じ理由で `EvaluationFailed`
         // を返す（＝子プロセスを 1 つ無駄に起動する）ことを避けられる。
-        if script.len() > super::v8_engine::MAX_SCRIPT_SOURCE_BYTES {
+        if script.len() > super::shared::MAX_SCRIPT_SOURCE_BYTES {
             return Err(JsEngineError::EvaluationFailed(format!(
                 "script source exceeds the maximum supported length of {} bytes",
-                super::v8_engine::MAX_SCRIPT_SOURCE_BYTES
+                super::shared::MAX_SCRIPT_SOURCE_BYTES
             )));
         }
 
@@ -1556,14 +1584,14 @@ impl V8ProcessEngine {
     /// テスト専用: [`evaluate_script`](Self::evaluate_script) が事前検証
     /// に使うスクリプト長上限（バイト）を返す。codex レビュー指摘 #503
     /// P1「親は子より大きい入力を受け付ける」の回帰テストが、`tests/`
-    /// 配下の結合テスト（別クレート）から `super::v8_engine::MAX_SCRIPT_SOURCE_BYTES`
+    /// 配下の結合テスト（別クレート）から `super::shared::MAX_SCRIPT_SOURCE_BYTES`
     /// （`pub(crate)`）へ直接アクセスできないため、定数の値だけを最小限
     /// 公開する（`v8` crate の型は一切介さない）。feature `test-support`
     /// 有効時のみ存在する（Issue #528）。
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn max_script_source_bytes_for_test() -> usize {
-        super::v8_engine::MAX_SCRIPT_SOURCE_BYTES
+        super::shared::MAX_SCRIPT_SOURCE_BYTES
     }
 
     /// テスト専用: [`send_raw_frame_for_test`](Self::send_raw_frame_for_test)
@@ -1660,6 +1688,10 @@ impl V8ProcessEngine {
             worker_protocol::MARKER_ENV_VAR,
             protocol_version.to_string(),
         );
+        // 子へエンジン種別を明示する（env_clear 済みのため必ず渡す）。
+        command.env(super::worker::ENGINE_ENV_VAR, self.engine_kind.as_str());
+        // V8 ヒープ上限のテスト用上書きは V8 の子プロセスにだけ意味を持つ。
+        #[cfg(feature = "js-v8")]
         if let Some(heap_limit_bytes) = self.spawn_config.heap_limit_bytes {
             // テスト専用（Issue #503 設計書 §7 W6）。本番の `new()` は
             // `spawn_config.heap_limit_bytes` が常に `None` のため、この
@@ -1770,22 +1802,23 @@ impl V8ProcessEngine {
                 match worker_protocol::decode_hello(&payload) {
                     Ok((version, engine))
                         if version == worker_protocol::PROTOCOL_VERSION
-                            && engine == EngineKind::V8 =>
+                            && engine == self.engine_kind =>
                     {
                         Ok(worker)
                     }
                     Ok((version, engine)) if version == worker_protocol::PROTOCOL_VERSION => {
                         // codex レビュー指摘 #503 P1「Hello のエンジン種別を
-                        // 無視している」対応: 本 crate（`V8ProcessEngine`）は
-                        // V8 の子プロセス専用であり、`Boa` を名乗る `Hello`
-                        // は起動した実行ファイル・プロトコルの取り違えを
+                        // 無視している」対応: 要求したエンジン種別
+                        // （`self.engine_kind`）と異なる種別を名乗る `Hello`
+                        // は、起動した実行ファイル・プロトコルの取り違えを
                         // 疑うべき異常事態である。
+                        let expected = self.engine_kind;
                         worker.terminate_now();
                         let tail = worker.reap_and_collect_stderr();
                         Err(handshake_discard_error(&worker, &tail, || {
                             JsEngineError::EngineUnavailable(format!(
                                 "JS worker process reported unexpected engine kind {engine:?} \
-                                 (expected V8); stderr: {tail}"
+                                 (expected {expected:?}); stderr: {tail}"
                             ))
                         }))
                     }
@@ -2647,6 +2680,7 @@ pub(crate) fn error_frame_to_js_engine_error(kind: ErrorKind, message: String) -
         )),
         ErrorKind::Evaluation => JsEngineError::EvaluationFailed(message),
         ErrorKind::Binding => JsEngineError::BindingFailed(message),
+        ErrorKind::ResourceLimit => JsEngineError::ResourceLimitExceeded(message),
     }
 }
 
@@ -4180,7 +4214,7 @@ mod tests {
             binding_failed_msg(validate_new_host_binding(&[], &[], "")),
             "native function name must not be empty"
         );
-        let long = "a".repeat(super::super::v8_engine::MAX_NATIVE_PROXY_NAME_BYTES + 1);
+        let long = "a".repeat(super::super::worker_protocol::MAX_GLOBAL_FUNCTION_NAME_BYTES + 1);
         assert_eq!(
             binding_failed_msg(validate_new_host_binding(&[], &[], &long)),
             "native function name exceeds the maximum supported length of 256 bytes"
@@ -4285,7 +4319,11 @@ mod tests {
             Err(RegisterAckViolation::UnexpectedResult(_))
         ));
         // Binding 以外の ERROR。
-        for kind in [ErrorKind::Evaluation, ErrorKind::Timeout] {
+        for kind in [
+            ErrorKind::Evaluation,
+            ErrorKind::Timeout,
+            ErrorKind::ResourceLimit,
+        ] {
             let payload = worker_protocol::encode_error(kind, "x");
             assert!(matches!(
                 interpret_register_ack(tag::ERROR, &payload),

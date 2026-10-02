@@ -65,6 +65,7 @@
 //! | `Allocation` / `Threw` / `ResultConversion` | `EvaluationFailed` | `Evaluation` | `EvaluationFailed` |
 //! | `Terminated` | `Timeout` | `Timeout` | `Timeout`（接頭辞付き） |
 //! | `NativeCallFatal` | `EngineUnavailable` | `Evaluation`（畳まれる） | `EvaluationFailed` |
+//! | （boa のループ・再帰・スタック上限。V8 では発生しない） | `ResourceLimitExceeded` | `ResourceLimit` | `ResourceLimitExceeded`（Context は残る） |
 //!
 //! ワイヤ変換は `super::worker` の `classify_evaluation_error`、親側の逆変換は
 //! `super::process_engine::error_frame_to_js_engine_error`。
@@ -114,6 +115,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use super::engine_trait::{EvaluateOptions, JsEngineError, JsValue};
+// 逆方向 RPC の窓口は boa 子プロセスとも共有するため `shared` へ置いた
+// （Issue #166）。既存の参照パスを保つため再エクスポートする。
+pub(crate) use super::shared::{NativeCallFailure, NativeCallTransport};
 use super::worker_protocol::{self, NativeReturn};
 
 /// [`install_native_proxy_global`](V8Engine::install_native_proxy_global) が
@@ -125,37 +129,6 @@ use super::worker_protocol::{self, NativeReturn};
 /// （coding-rust.md「外部入力」節・OWASP A04）。
 pub(crate) const MAX_NATIVE_PROXY_NAME_BYTES: usize =
     worker_protocol::MAX_GLOBAL_FUNCTION_NAME_BYTES;
-
-/// 子プロセス側から親プロセスへ逆方向 RPC（`NativeCall`）を送り、
-/// [`NativeReturn`] が届くまで**同期的にブロックする**窓口（`JS-1`・
-/// `TASK-29`・Issue #511）。
-///
-/// 呼び出し元: [`native_proxy_callback`]（本モジュール）が、JS から
-/// プロキシ関数が呼ばれるたびに呼ぶ。実装は [`super::worker`] の
-/// `StdioTransport`（stdio 越しに親と一問一答する）を想定するが、本
-/// モジュールはその具象型に依存しない（テストでは台本どおりに応答する
-/// 偽の実装を使う）。
-///
-/// スレッド安全性: [`V8Engine`] が `!Send` であるのと同様、本トレイトの
-/// 実装も単一スレッド（Isolate を保持するスレッド）でのみ使われる前提で
-/// よい（`Send`/`Sync` 境界を付けない）。
-pub(crate) trait NativeCallTransport {
-    /// `id` で識別されるホスト関数を `args` を渡して呼び出し、応答が
-    /// 届くまでブロックする。
-    fn call(&mut self, id: u32, args: &[JsValue]) -> Result<NativeReturn, NativeCallFailure>;
-}
-
-/// [`NativeCallTransport::call`] が失敗した際の分類（`JS-1`・Issue #511）。
-#[derive(Debug)]
-pub(crate) enum NativeCallFailure {
-    /// 送信前に拒否した（非 fatal。呼び出し元は JS の `RangeError` として
-    /// 投げる。子・親のプロセス・接続は生き続ける）。
-    Rejected(String),
-    /// プロトコル違反・EOF・I/O エラー（fatal。呼び出し元は評価を打ち切り、
-    /// このプロセス自体を終了させる。[`V8Engine::take_native_call_fatal`]
-    /// のドキュメントコメント参照）。
-    Fatal(String),
-}
 
 /// [`V8Engine`] の Isolate スロットに設定する、逆方向 RPC の状態
 /// （`JS-1`・Issue #511）。
@@ -204,7 +177,7 @@ const MAX_ERROR_MESSAGE_EXTRACT_BYTES: usize = MAX_ERROR_MESSAGE_CHARS * 4;
 /// 比較していたため、実質的に無制限のスクリプトを受け付けてしまって
 /// いた。本定数はアプリケーション側で明示的に定めた実効的な上限
 /// （OWASP A04「不安全な設計」対策。security.md）。
-pub(crate) const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
+pub(crate) const MAX_SCRIPT_SOURCE_BYTES: usize = super::shared::MAX_SCRIPT_SOURCE_BYTES;
 
 /// [`V8Engine::new`] が生成する Isolate に設定するヒープサイズの上限
 /// （バイト。`JS-1`・codex レビュー指摘 #154 P0 対応・Issue #503 JS
@@ -342,7 +315,7 @@ const MAX_RESULT_STRING_UTF16_UNITS: usize = 1_048_576; // 約 1M 文字（2 MiB
 /// 含まれる」ことであり、「コンパイル処理自体を強制的に打ち切れる」こと
 /// ではない。[`MAX_SCRIPT_SOURCE_BYTES`] による入力サイズ上限が、
 /// コンパイル時間そのものに対する現状の主な緩和策である。
-pub(crate) const SCRIPT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const SCRIPT_EXECUTION_TIMEOUT: Duration = super::shared::SCRIPT_EXECUTION_TIMEOUT;
 
 /// V8 の Platform が protected 版（thread-isolated allocation 有効）か
 /// unprotected 版かを表す（`JS-1`・`TASK-29`・Issue #520）。

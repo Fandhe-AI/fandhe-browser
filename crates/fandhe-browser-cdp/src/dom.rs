@@ -30,7 +30,9 @@
 
 use std::collections::HashMap;
 
-use fandhe_browser_core::{Document, NodeData, NodeId, ParseOptions, parse_document};
+use fandhe_browser_core::{
+    Document, Error, NodeData, NodeId, ParseError, ParseOptions, parse_document,
+};
 use serde_json::{Map, Value, json};
 
 use crate::protocol::{BoxFuture, CdpError, CommandContext, CommandHandler, HandlerOutput};
@@ -321,8 +323,12 @@ impl CommandHandler for DomGetDocument {
                 .navigation()
                 .latest()
                 .ok_or(CdpError::NO_DOCUMENT)?;
-            let parsed = parse_document(latest.html(), &ParseOptions::default())
-                .map_err(|_| CdpError::SERVER_ERROR)?;
+            // DOM 応答用の上限をパース時点で適用し、巨大文書の全ノード構築を避ける（`SEC-2`）。
+            let opts = ParseOptions::default().with_max_nodes(MAX_NUMBERED_NODES);
+            let parsed = parse_document(latest.html(), &opts).map_err(|e| match e {
+                Error::Parse(ParseError::NodeLimitExceeded { .. }) => CdpError::DOCUMENT_TOO_LARGE,
+                _ => CdpError::SERVER_ERROR,
+            })?;
             let root = build_document_node(&parsed.document, latest.url(), depth)?;
             Ok(HandlerOutput::result(json!({ "root": root })))
         })
@@ -443,6 +449,20 @@ mod tests {
             build_document_node(&d, "u", Depth::exact(1)),
             Err(CdpError::DOCUMENT_TOO_LARGE)
         );
+    }
+
+    #[test]
+    fn sec2_dom_parse_limit_rejects_before_full_build() {
+        // DOM 用上限でのパースは、上限超過をパース時点で NodeLimitExceeded にする（SEC-2）。
+        let n = MAX_NUMBERED_NODES + 10;
+        let html = format!("<body>{}</body>", "<i></i>".repeat(n));
+        let opts = ParseOptions::default().with_max_nodes(MAX_NUMBERED_NODES);
+        assert!(matches!(
+            parse_document(&html, &opts),
+            Err(Error::Parse(ParseError::NodeLimitExceeded {
+                limit: MAX_NUMBERED_NODES
+            }))
+        ));
     }
 
     #[test]

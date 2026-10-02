@@ -167,3 +167,11 @@ serde_json = { version = "=1.0.151" }
 # （coding-rust.md「release は panic = "abort" 前提のため catch_unwind に頼らない」）。
 # 仮想 manifest のルートにしか置けない設定のため、workspace 作成時に確定させる。
 panic = "abort"
+
+# boa（`fandhe-browser-js` の `js-boa`。TASK-32.2・Issue #166）の debug ビルド最適化。
+# boa の `ArrayBuffer` 確保は 0 埋め（`resize`）を含み、最適化なしだとバイト単位の
+# ループになって遅い。`tests/boa_worker.rs` のメモリ上限ケースが、遅い CI ランナー
+# でも親の評価期限（4 秒）内に RSS 監視のしきい値へ到達できるよう、boa だけ
+# opt-level を上げる（他の crate・release は変えない。依存の追加・更新ではない）。
+[profile.dev.package.boa_engine]
+opt-level = 2
