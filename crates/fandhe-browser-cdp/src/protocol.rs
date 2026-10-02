@@ -20,8 +20,9 @@
 //!
 //! # スタブについて
 //!
-//! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）のみ登録済みで、それ以外の
-//! メソッドは「method not implemented」（`-32601`）になる。未実装メソッドへ成功を返さない（`SEC-2`）。未実装メソッドの正式な応答方針と受信ログは
+//! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）と `DOM.getDocument`（TASK-42.4）のみ登録済みで、
+//! それ以外のメソッドは「method not implemented」（`-32601`）になる。
+//! 未実装メソッドへ成功を返さない（`SEC-2`）。未実装メソッドの正式な応答方針と受信ログは
 //! TASK-42.6（`CDP-6`）で確定する。
 
 use std::collections::HashMap;
@@ -67,6 +68,15 @@ impl CdpError {
     pub const INVALID_PARAMS: Self = Self::new(-32602, "invalid params");
     /// ハンドラ内部エラー（CDP の server error 帯）。
     pub const SERVER_ERROR: Self = Self::new(-32000, "server error");
+    /// 直近の navigate 結果が無い（未 navigate・取得中・取得失敗を区別しない。`DOM.getDocument`）。
+    pub const NO_DOCUMENT: Self = Self::new(-32000, "no document loaded");
+    /// 未実装のオプション（`DOM.getDocument` の `pierce: true` 等）。成功を装わず明示的に拒否する（`REPAIR-3`）。
+    pub const UNSUPPORTED_PARAMS: Self = Self::new(-32602, "unsupported params");
+    /// 文書のノード数が採番の処理量上限を超えた（`DOM.getDocument`。`SEC-2`）。
+    pub const DOCUMENT_TOO_LARGE: Self = Self::new(-32000, "document too large");
+    /// セッション（ターゲット）別の文書を読む手段が未実装（`DOM.getDocument` の `sessionId` 付き。`CDP-1`・`REPAIR-3`）。
+    pub const TARGET_DOCUMENT_UNAVAILABLE: Self =
+        Self::new(-32000, "document not available for target");
 
     const fn new(code: i64, message: &'static str) -> Self {
         Self { code, message }
@@ -313,14 +323,17 @@ impl std::error::Error for DispatcherError {}
 /// 登録済みハンドラ表。
 type HandlerTable = Vec<(&'static str, Box<dyn CommandHandler>)>;
 
-/// 組込みハンドラ表。`Page.navigate`（TASK-42.2。`CDP-1`）を登録済み。
+/// 組込みハンドラ表。`Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）を登録済み（`CDP-1`）。
 ///
-/// 42.4（`DOM.getDocument`）・42.5（`DOM.querySelector`）がここへ追加する。
+/// 42.5（`DOM.querySelector`）がここへ追加する。
 /// `Page.navigate` は既定の `FetchOptions`（内部アドレス拒否）で `Fetcher` を構築する。
 pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
     let navigate =
         PageNavigate::new(FetchOptions::default()).map_err(|_| DispatcherError::HandlerInit)?;
-    Ok(vec![("Page.navigate", Box::new(navigate))])
+    Ok(vec![
+        ("Page.navigate", Box::new(navigate)),
+        ("DOM.getDocument", Box::new(crate::dom::DomGetDocument)),
+    ])
 }
 
 /// メソッド名からハンドラへ振り分けるディスパッチャ。構築後は不変。
