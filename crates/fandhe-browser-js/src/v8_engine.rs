@@ -65,6 +65,7 @@
 //! | `Allocation` / `Threw` / `ResultConversion` | `EvaluationFailed` | `Evaluation` | `EvaluationFailed` |
 //! | `Terminated` | `Timeout` | `Timeout` | `Timeout`（接頭辞付き） |
 //! | `NativeCallFatal` | `EngineUnavailable` | `Evaluation`（畳まれる） | `EvaluationFailed` |
+//! | （boa のループ・再帰・スタック上限。V8 では発生しない） | `ResourceLimitExceeded` | `ResourceLimit` | `ResourceLimitExceeded`（Context は残る） |
 //!
 //! ワイヤ変換は `super::worker` の `classify_evaluation_error`、親側の逆変換は
 //! `super::process_engine::error_frame_to_js_engine_error`。

@@ -839,6 +839,11 @@ pub(crate) enum ErrorKind {
     /// 子の監視スレッド（watchdog）が実行時間の上限で打ち切った
     /// （設計書 §3.3 の表「子の watchdog が打ち切った」行）。
     Timeout,
+    /// ランタイム上限（boa のループ反復・再帰・スタック上限等）に到達して
+    /// 評価が打ち切られた（[`JsEngineError::ResourceLimitExceeded`] に対応。
+    /// `JS-1`・`TASK-32.2`・Issue #166）。子プロセスと Context は生きている
+    /// ため、親は "context was discarded" を付けずにそのまま返す。
+    ResourceLimit,
 }
 
 impl ErrorKind {
@@ -851,6 +856,7 @@ impl ErrorKind {
             Self::Evaluation => 0,
             Self::Binding => 1,
             Self::Timeout => 2,
+            Self::ResourceLimit => 3,
         }
     }
 
@@ -863,6 +869,7 @@ impl ErrorKind {
             0 => Ok(Self::Evaluation),
             1 => Ok(Self::Binding),
             2 => Ok(Self::Timeout),
+            3 => Ok(Self::ResourceLimit),
             other => Err(ProtocolError::InvalidErrorKind(other)),
         }
     }
@@ -1850,6 +1857,7 @@ mod tests {
             ErrorKind::Evaluation,
             ErrorKind::Binding,
             ErrorKind::Timeout,
+            ErrorKind::ResourceLimit,
         ] {
             let payload = encode_error(kind, "boom");
             let (decoded_kind, message) = decode_error(&payload).expect("decode must succeed");

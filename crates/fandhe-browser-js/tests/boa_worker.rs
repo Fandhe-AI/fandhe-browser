@@ -4,7 +4,7 @@
 //! 時間・メモリ使用量に上限が無い」への回答として、boa を V8 と同じ子プロセス
 //! 分離基盤の上で動かしたことを、実際の子プロセスで確認する。
 //!
-//! - 実時間: ループ 1 つあたりの反復上限（boa 内蔵）に当たらない入れ子ループで
+//! - 実時間: ループ 1 つあたりの反復上限（boa 内蔵）に当たらないループ反復上限に数えられない処理（正規表現のバックトラッキング）で
 //!   親の期限（3 秒）を超えさせ、`JsEngineError::Timeout` で呼び出しが戻ること
 //!   （子は kill され、次の評価は新しい子で動くこと）
 //! - メモリ: 巨大確保が子の中で閉じ、ホストは
@@ -54,19 +54,20 @@ fn js_1_boa_evaluates_in_a_child_process() {
     );
 }
 
-/// 実時間の上限: 入れ子ループ（各ループは boa の反復上限未満）が親の期限で
+/// 実時間の上限: ループ反復上限（boa 内蔵）に数えられない処理（正規表現の
+/// 破滅的バックトラッキング）が親の期限で
 /// `Timeout` になり、その後の評価は新しい子で成功すること。
 fn js_1_boa_wall_clock_limit_kills_the_child_and_recovers() {
     let mut engine = boa_engine();
     let started = Instant::now();
     let result = eval(
         &mut *engine,
-        "var n = 0; for (var i = 0; i < 900000; i++) { for (var j = 0; j < 900000; j++) { n++; } } n",
+        "var n = 1; /^(a+)+$/.test('a'.repeat(60) + 'b'); n",
     );
     let elapsed = started.elapsed();
     assert!(
         matches!(result, Err(JsEngineError::Timeout(_))),
-        "nested loops must be stopped by the wall-clock limit, got {result:?}"
+        "a non-loop busy computation must be stopped by the wall-clock limit, got {result:?}"
     );
     assert!(
         elapsed < TIMEOUT_TEST_DEADLINE,
@@ -83,16 +84,18 @@ fn js_1_boa_wall_clock_limit_kills_the_child_and_recovers() {
     );
 }
 
-/// メモリの上限: 巨大確保が子の中で閉じ、ホストは `ResourceLimitExceeded` を
-/// 受け取り（親の RSS 監視または子の OS 上限）、その後も評価を続けられること。
+/// メモリの上限（親の RSS 監視）: バッファ 1 つあたりの上限（128 MiB）未満の
+/// 確保を保持し続けて積み上げ、ホストが `ResourceLimitExceeded` を受け取り
+/// （子は親の RSS 監視で kill される）、その後も評価を続けられること。
 fn js_1_boa_memory_limit_is_enforced_by_the_child_boundary() {
     let mut engine = boa_engine();
     let started = Instant::now();
     let result = eval(
         &mut *engine,
-        "var keep = []; for (var i = 0; i < 900000; i++) { keep.push(new ArrayBuffer(536870912 + i)); } keep.length",
+        "var keep = []; for (var i = 0; i < 900000; i++) { keep.push(new ArrayBuffer(67108864)); } keep.length",
     );
     let elapsed = started.elapsed();
+    eprintln!("memory case took {elapsed:?}: {result:?}");
     assert!(
         matches!(result, Err(JsEngineError::ResourceLimitExceeded(_))),
         "memory exhaustion must be contained by the child, got {result:?}"
@@ -104,6 +107,44 @@ fn js_1_boa_memory_limit_is_enforced_by_the_child_boundary() {
     assert_eq!(
         eval(&mut *engine, "1 + 1").expect("eval after memory kill"),
         JsValue::Number(2.0)
+    );
+}
+
+/// 単発の巨大確保（上限 128 MiB 超）は boa のホストフックで拒否され、catch 可能な
+/// `RangeError` になること（子と Context は生き残り、既存のグローバルも残る）。
+fn js_1_boa_oversized_buffer_is_rejected_without_killing_the_child() {
+    let mut engine = boa_engine();
+    eval(&mut *engine, "var marker = 7").expect("eval");
+    match eval(
+        &mut *engine,
+        "try { new ArrayBuffer(536870912); 'allocated' } catch (e) { e.name }",
+    )
+    .expect("eval")
+    {
+        JsValue::String(name) => assert_eq!(name, "RangeError"),
+        other => panic!("unexpected value {other:?}"),
+    }
+    assert_eq!(
+        eval(&mut *engine, "marker").expect("same context"),
+        JsValue::Number(7.0)
+    );
+}
+
+/// ループ反復上限（boa 内蔵）は `ResourceLimitExceeded` としてワイヤを越えて伝わり、
+/// 子は kill されず Context も残ること（"context was discarded" を含まない）。
+fn js_1_boa_loop_limit_is_reported_as_resource_limit_exceeded() {
+    let mut engine = boa_engine();
+    eval(&mut *engine, "var before = 11").expect("eval");
+    match eval(&mut *engine, "while (true) {}") {
+        Err(JsEngineError::ResourceLimitExceeded(message)) => assert!(
+            !message.contains("context was discarded"),
+            "the child is alive, got {message:?}"
+        ),
+        other => panic!("expected ResourceLimitExceeded, got {other:?}"),
+    }
+    assert_eq!(
+        eval(&mut *engine, "before").expect("same context"),
+        JsValue::Number(11.0)
     );
 }
 
@@ -125,8 +166,8 @@ fn js_1_boa_native_calls_cross_the_process_boundary() {
     );
     match eval(&mut *engine, "try { hostAdd('x') } catch (e) { e.message }").expect("eval") {
         JsValue::String(message) => assert!(
-            message.contains("bad args"),
-            "the host error must reach JS, got {message:?}"
+            message == "script evaluation failed: bad args",
+            "the host error must carry exactly one prefix (as on V8), got {message:?}"
         ),
         other => panic!("unexpected value {other:?}"),
     }
@@ -158,6 +199,10 @@ fn main() -> ExitCode {
     js_1_boa_native_calls_cross_the_process_boundary();
     eprintln!("case: js_1_boa_wall_clock_limit_kills_the_child_and_recovers");
     js_1_boa_wall_clock_limit_kills_the_child_and_recovers();
+    eprintln!("case: js_1_boa_oversized_buffer_is_rejected_without_killing_the_child");
+    js_1_boa_oversized_buffer_is_rejected_without_killing_the_child();
+    eprintln!("case: js_1_boa_loop_limit_is_reported_as_resource_limit_exceeded");
+    js_1_boa_loop_limit_is_reported_as_resource_limit_exceeded();
     eprintln!("case: js_1_boa_memory_limit_is_enforced_by_the_child_boundary");
     js_1_boa_memory_limit_is_enforced_by_the_child_boundary();
     eprintln!("boa_worker: all cases passed");

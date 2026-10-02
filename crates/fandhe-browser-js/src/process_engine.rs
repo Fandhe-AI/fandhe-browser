@@ -2680,6 +2680,7 @@ pub(crate) fn error_frame_to_js_engine_error(kind: ErrorKind, message: String) -
         )),
         ErrorKind::Evaluation => JsEngineError::EvaluationFailed(message),
         ErrorKind::Binding => JsEngineError::BindingFailed(message),
+        ErrorKind::ResourceLimit => JsEngineError::ResourceLimitExceeded(message),
     }
 }
 
@@ -4318,7 +4319,11 @@ mod tests {
             Err(RegisterAckViolation::UnexpectedResult(_))
         ));
         // Binding 以外の ERROR。
-        for kind in [ErrorKind::Evaluation, ErrorKind::Timeout] {
+        for kind in [
+            ErrorKind::Evaluation,
+            ErrorKind::Timeout,
+            ErrorKind::ResourceLimit,
+        ] {
             let payload = worker_protocol::encode_error(kind, "x");
             assert!(matches!(
                 interpret_register_ack(tag::ERROR, &payload),

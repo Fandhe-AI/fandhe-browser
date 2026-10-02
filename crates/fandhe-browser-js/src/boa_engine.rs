@@ -40,7 +40,9 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::rc::Rc;
 
+use boa_engine::context::HostHooks;
 use boa_engine::error::{EngineError, RuntimeLimitError};
 use boa_engine::object::{FunctionObjectBuilder, ObjectInitializer};
 use boa_engine::property::{PropertyDescriptor, PropertyKey};
@@ -72,6 +74,22 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
 /// 未満で打ち切れる値として選んだ（wall-clock の代替ではない。モジュール
 /// ドキュメントの「既知の制限」参照）。
 const BOA_LOOP_ITERATION_LIMIT: u64 = 1_000_000;
+
+/// `ArrayBuffer`・`SharedArrayBuffer` 1 つあたりの最大バイト数（128 MiB）。
+/// V8 版の `resource_limits::MAX_ARRAY_BUFFER_ALLOCATION_BYTES` と同値に保つ。
+/// boa 既定（1.5 GiB）では単発の巨大確保が親の RSS 監視（320 MiB）より先に
+/// OS の上限へ達しうるため、ホストフックで引き下げる。
+const MAX_BUFFER_BYTES: u64 = 128 * 1024 * 1024;
+
+/// boa の `HostHooks` のうち、バッファ確保の上限だけを差し替える実装
+/// （他のフックは boa 既定のまま。safe API のみ）。
+struct BoundedBufferHooks;
+
+impl HostHooks for BoundedBufferHooks {
+    fn max_buffer_size(&self, _context: &mut Context) -> u64 {
+        MAX_BUFFER_BYTES
+    }
+}
 
 /// グローバル関数と DOM 風オブジェクトのメンバーを合わせた、登録簿の総エントリ
 /// 数の上限。グローバル名の件数上限（[`MAX_REGISTERED_GLOBAL_FUNCTIONS`]）とは
@@ -119,11 +137,14 @@ impl BoaEngine {
     fn context_mut(&mut self) -> Result<&mut Context, JsEngineError> {
         if self.context.is_none() {
             // `Context::default()` は内部で `expect` するため使わない。
-            let mut context = Context::builder().build().map_err(|err| {
-                JsEngineError::EngineUnavailable(truncate_message(&format!(
-                    "failed to create boa context: {err}"
-                )))
-            })?;
+            let mut context = Context::builder()
+                .host_hooks(Rc::new(BoundedBufferHooks))
+                .build()
+                .map_err(|err| {
+                    JsEngineError::EngineUnavailable(truncate_message(&format!(
+                        "failed to create boa context: {err}"
+                    )))
+                })?;
             let limits = context.runtime_limits_mut();
             limits.set_loop_iteration_limit(BOA_LOOP_ITERATION_LIMIT);
             // recursion・stack_size は boa 既定（512・10240）を維持する。
@@ -338,7 +359,21 @@ fn dispatch_native(id: usize, args: &[BoaValue], context: &mut Context) -> JsRes
     };
     match outcome {
         Ok(value) => to_boa_value(&value).map_err(|msg| native_error(&msg)),
-        Err(err) => Err(native_error(&err.to_string())),
+        Err(err) => Err(native_error(engine_error_message(&err))),
+    }
+}
+
+/// [`JsEngineError`] が保持する元メッセージを返す。`Display` はバリアント名の
+/// 接頭辞（"script evaluation failed: " 等）を付けるため、JS の `Error.message`
+/// へ渡す際に二重の接頭辞（親側でラップ済みのメッセージへ再度付与）にならない
+/// よう、接頭辞なしの本文だけを取り出す。
+fn engine_error_message(err: &JsEngineError) -> &str {
+    match err {
+        JsEngineError::EvaluationFailed(msg)
+        | JsEngineError::BindingFailed(msg)
+        | JsEngineError::ResourceLimitExceeded(msg)
+        | JsEngineError::Timeout(msg)
+        | JsEngineError::EngineUnavailable(msg) => msg,
     }
 }
 
@@ -605,7 +640,7 @@ mod tests {
         );
         assert_eq!(
             eval(&mut e, "try { fail() } catch (err) { err.message }").unwrap(),
-            JsValue::String("binding registration failed: nope".into())
+            JsValue::String("nope".into())
         );
     }
 

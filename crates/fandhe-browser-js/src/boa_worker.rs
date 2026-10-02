@@ -18,6 +18,19 @@
 //!   子の異常終了となり、ホストは [`crate::JsEngineError::ResourceLimitExceeded`]
 //!   として受け取る。OS ごとの強制の強さは `resource_limits` のドキュメント参照
 //!
+//! - **バッファ確保（boa 内）**: `ArrayBuffer`・`SharedArrayBuffer` の 1 回の確保は
+//!   boa のホストフック（`boa_engine::BoundedBufferHooks`）で 128 MiB（V8 版の
+//!   `HEAP_EXTERNAL_ALLOWANCE_BYTES` と同値）に制限し、超過は catch 可能な
+//!   `RangeError` になる
+//!
+//! **macOS の限界（実装済みを装わない。REPAIR-3）**: macOS には OS による
+//! プロセス単位のメモリ上限が無い（`resource_limits` の macOS 行参照）。上記の
+//! バッファ上限は `ArrayBuffer` 系のデータブロックだけを対象とし、文字列・
+//! 配列・オブジェクトの増加はこれを経由せず、親の RSS 監視（75 ms 間隔の
+//! 後追い検出）だけが防御になる。V8 版の macOS と同じ水準であり、強制的な
+//! 上限ではない。強制できる手段（OS 機構）が得られた時点で `enforce_child_memory_limit`
+//! に実装する（`JS-1`）
+//!
 //! boa の具象型（`Context`・`JsValue`）は [`super::boa_engine`] の中に閉じ、
 //! 本モジュールは `JsEngine` トレイト越しにしか boa を扱わない。
 //!
@@ -228,7 +241,7 @@ mod tests {
             .expect("evaluation must succeed");
         match value {
             JsValue::String(message) => assert!(
-                message.contains("host said no"),
+                message == "host said no",
                 "the host error must reach JS, got {message:?}"
             ),
             other => panic!("unexpected value {other:?}"),

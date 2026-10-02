@@ -914,8 +914,10 @@ fn respond_to_registration(
 /// 判別していたが、専用 variant を追加したため文言ヒューリスティックは
 /// 不要になった）。
 ///
-/// `JsEngineError::ResourceLimitExceeded`・`JsEngineError::EngineUnavailable`
-/// はワイヤ上に専用の `ErrorKind` が無いため、`Evaluation` に畳んで送る
+/// `JsEngineError::ResourceLimitExceeded` は `ErrorKind::ResourceLimit`
+/// で送る（boa のループ・再帰・スタック上限。`TASK-32.2`・Issue #166）。
+/// `JsEngineError::EngineUnavailable` はワイヤ上に専用の `ErrorKind` が無いため、
+/// `Evaluation` に畳んで送る
 /// （`EngineUnavailable` は `v8_engine` が NativeCall fatal 記録済みの
 /// Context に対する評価要求で返しうる。親側では `EvaluationFailed` として
 /// 見える。区別するにはプロトコル変更が必要で、`TASK-29.6.1` の範囲外）。
@@ -934,7 +936,11 @@ fn classify_evaluation_error(err: &JsEngineError) -> (ErrorKind, String) {
         JsEngineError::Timeout(msg) => {
             (ErrorKind::Timeout, worker_protocol::truncate_for_wire(msg))
         }
-        JsEngineError::ResourceLimitExceeded(msg) | JsEngineError::EngineUnavailable(msg) => (
+        JsEngineError::ResourceLimitExceeded(msg) => (
+            ErrorKind::ResourceLimit,
+            worker_protocol::truncate_for_wire(msg),
+        ),
+        JsEngineError::EngineUnavailable(msg) => (
             ErrorKind::Evaluation,
             worker_protocol::truncate_for_wire(msg),
         ),
@@ -1104,7 +1110,7 @@ mod tests {
 
         let (kind, message) =
             classify_evaluation_error(&JsEngineError::ResourceLimitExceeded("oom".to_string()));
-        assert_eq!(kind, ErrorKind::Evaluation);
+        assert_eq!(kind, ErrorKind::ResourceLimit);
         assert_eq!(message, "oom");
 
         let (kind, message) =
