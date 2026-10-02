@@ -34,7 +34,7 @@ fn main() -> ExitCode {
         assert!(!out.status.success(), "must not succeed: {:?}", out.status);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("not built with the js-v8 feature"),
+            stderr.contains("not built with the js-v8 or js-boa feature"),
             "unexpected stderr: {stderr}"
         );
     }
