@@ -363,18 +363,22 @@ impl CommandHandler for PageNavigate {
                             match registry.set_target_url(tid, &c.url) {
                                 Ok(()) => {
                                     // 今回確定した結果だけを、完了順が新しい場合に限りミラーする。
-                                    if c.seq > published.seq
-                                        && published.browser_in_flight == 0
-                                        && let Ok(g) = app_nav.begin_navigation()
-                                        && app_nav
-                                            .commit_navigation(
-                                                g,
-                                                NavigationResult::new(r.url(), r.html()),
-                                            )
-                                            .is_ok()
-                                    {
+                                    // ブラウザレベル遷移の進行中などでミラーを見送る場合も、確定順
+                                    // （`seq`）は記録する。記録しないと、見送った新しい確定（B）より
+                                    // 古い確定（A）が後から条件を通り、共有状態に古い HTML が残る。
+                                    if c.seq > published.seq {
                                         published.seq = c.seq;
-                                        published.mirrored = Some((tid.clone(), g));
+                                        if published.browser_in_flight == 0
+                                            && let Ok(g) = app_nav.begin_navigation()
+                                            && app_nav
+                                                .commit_navigation(
+                                                    g,
+                                                    NavigationResult::new(r.url(), r.html()),
+                                                )
+                                                .is_ok()
+                                        {
+                                            published.mirrored = Some((tid.clone(), g));
+                                        }
                                     }
                                 }
                                 Err(CdpStateError::UnknownTarget) => self.forget_target(tid),
@@ -996,6 +1000,58 @@ mod tests {
             let latest = st.app_state().navigation().latest().unwrap();
             assert_eq!(latest.html(), "browser-level");
             assert_eq!(latest.url(), ub);
+        }
+
+        struct SharedHandler(Arc<PageNavigate>);
+
+        impl CommandHandler for SharedHandler {
+            fn handle<'a>(
+                &'a self,
+                ctx: CommandContext<'a>,
+                params: &'a Value,
+            ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+                self.0.handle(ctx, params)
+            }
+        }
+
+        /// ブラウザレベル遷移の進行中にミラーを見送った確定も、確定順（`seq`）を記録する
+        /// （古い確定が後から共有状態へ公開されないようにする。`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_page_navigate_skipped_mirror_still_records_commit_order() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let ta = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let tb = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let sa = st.registry().attach(&ta).unwrap();
+            let sb = st.registry().attach(&tb).unwrap();
+            let h = Arc::new(
+                PageNavigate::new(FetchOptions::new().with_allow_private_network_access(true))
+                    .unwrap(),
+            );
+            let d = Dispatcher::from_handlers(vec![(
+                "Page.navigate",
+                Box::new(SharedHandler(Arc::clone(&h))),
+            )])
+            .unwrap();
+            let flight = BrowserFlight::enter(&h.published);
+            for (id, sid) in [(1, &sa), (2, &sb)] {
+                let u = format!("http://127.0.0.1:{}/", serve("200 OK", "x"));
+                let req = json!({"id": id, "method": "Page.navigate",
+                    "sessionId": sid.as_str(), "params": {"url": u}});
+                d.dispatch(&st, &req.to_string()).await;
+            }
+            drop(flight);
+            let p = h.published.lock().unwrap();
+            assert_eq!(p.seq, 2);
+            assert!(p.mirrored.is_none());
+            assert!(st.app_state().navigation().latest().is_none());
         }
 
         #[tokio::test]
