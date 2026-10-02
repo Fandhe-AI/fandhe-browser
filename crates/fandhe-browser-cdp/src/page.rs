@@ -371,6 +371,8 @@ impl CommandHandler for PageNavigate {
             let mut navigated: Option<String> = None;
             // ターゲット遷移の送出直前の世代再確認用（遷移状態と確定時の世代）。
             let mut recheck: Option<(Arc<NavigationState>, NavigationGeneration)> = None;
+            // ブラウザレベル遷移の送出直前の世代再確認用（共有状態 `app_nav` の確定時の世代）。
+            let mut recheck_shared: Option<NavigationGeneration> = None;
             let out = match &target_id {
                 Some(tid) => {
                     let registry = ctx.state.registry();
@@ -501,6 +503,7 @@ impl CommandHandler for PageNavigate {
                             let _gate = lock_gate(&self.gate);
                             if app_nav.current_generation() == c.generation && c.result.is_some() {
                                 navigated = Some(c.url.clone());
+                                recheck_shared = Some(c.generation);
                             }
                         }
                         if c.seq > published.seq {
@@ -540,10 +543,15 @@ impl CommandHandler for PageNavigate {
             // 直前に `gate` を保持して再確認する（`CDP-1`）。追い越された遷移のイベントを出さない。
             // 応答フレームの組み立て後〜ソケット書き込みの区間は、イベントが要求元の応答に同梱される
             // 設計上このハンドラでは直列化できない（セッション単位の配送順は TASK-43・`CDP-2` で扱う）。
+            // ブラウザレベル遷移も、確定時の世代が共有状態に残っているかを同様に再確認する。
             if let Some(url) = navigated
                 && recheck.as_ref().is_none_or(|(n, g)| {
                     let _gate = lock_gate(&self.gate);
                     n.current_generation() == *g
+                })
+                && recheck_shared.is_none_or(|g| {
+                    let _gate = lock_gate(&self.gate);
+                    app_nav.current_generation() == g
                 })
             {
                 for ev in navigation_events(&out.loader_id, &url, monotonic_seconds()) {
