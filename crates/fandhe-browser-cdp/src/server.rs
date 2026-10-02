@@ -28,6 +28,7 @@ use fandhe_backend_routes::Router;
 use fandhe_browser_core::AppState;
 
 use crate::discovery::{self, Authority, BROWSER_WS_PATH_PATTERN, HostError};
+use crate::navigation::TargetNavigations;
 use crate::protocol::Dispatcher;
 use crate::target::{BrowserId, TargetRegistry};
 use crate::ws;
@@ -43,6 +44,8 @@ pub struct CdpState {
     app: Arc<AppState>,
     browser_id: BrowserId,
     registry: TargetRegistry,
+    /// ターゲット別の遷移状態（`Page.navigate` が書き、`DOM.getDocument` が読む。`CDP-1`）。
+    navigations: TargetNavigations,
 }
 
 impl CdpState {
@@ -58,6 +61,7 @@ impl CdpState {
             app,
             browser_id,
             registry: TargetRegistry::new(),
+            navigations: TargetNavigations::new(),
         }
     }
 
@@ -74,6 +78,11 @@ impl CdpState {
     /// ターゲット・セッション表。
     pub fn registry(&self) -> &TargetRegistry {
         &self.registry
+    }
+
+    /// ターゲット別の遷移状態表（crate 内部専用。`CDP-1`）。
+    pub(crate) fn navigations(&self) -> &TargetNavigations {
+        &self.navigations
     }
 }
 
