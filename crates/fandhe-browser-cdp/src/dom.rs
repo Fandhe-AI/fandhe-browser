@@ -14,9 +14,15 @@
 //! # スタブについて（実装済みを装わない。`REPAIR-3`）
 //!
 //! - `pierce: true` は明示エラー（`UNSUPPORTED_PARAMS`）。iframe の `contentDocument`・shadow DOM・`<template>` の `templateContent` は返さない
-//! - 深さ上限（[`MAX_TREE_DEPTH`]）またはノード予算（[`MAX_NODES_PER_RESPONSE`]）を超える
-//!   ノードは `children` を付けず `childNodeCount` だけ返す（続きを取る
-//!   `DOM.requestChildNodes` は未実装）
+//! - クライアントが `depth` で要求した深さに達したノードは `children` を付けず
+//!   `childNodeCount` だけ返す（CDP の契約どおり）。一方、サーバー上限
+//!   （[`MAX_TREE_DEPTH`]・[`MAX_NODES_PER_RESPONSE`]）で要求どおりに展開できない場合は、
+//!   続きを取る `DOM.requestChildNodes` が未実装のため切り詰めず `DOCUMENT_TOO_LARGE` を返す
+//! - `sessionId` 付きの要求は、ターゲット別のナビゲート状態を読む手段が無いため
+//!   `TARGET_DOCUMENT_UNAVAILABLE` で拒否する（別ターゲットの文書を返さない）。将来は
+//!   ターゲット別ナビゲート状態を `CdpState` 側に持たせて 42.4 / 42.5 が読む（`CDP-1`・`CDP-2`・TASK-43）。
+//!   `sessionId` なし（ブラウザレベル）は共有の直近 navigate 結果を読む
+//! - `<base href>` の解決は未実装。`href` 付き `base` 要素を持つ文書では `baseURL` を省略する
 //! - 採番は文書全体を走査するため、ノード数が [`MAX_NUMBERED_NODES`] を超える文書は
 //!   `DOCUMENT_TOO_LARGE` エラーにする（切り詰めない）
 //! - 呼び出しごとに再パースし、ノード表のセッション保持・キャッシュは行わない
@@ -40,23 +46,50 @@ pub(crate) const MAX_NODES_PER_RESPONSE: usize = 10_000;
 /// 決まる契約のため部分採番はできず、超過した文書は黙って切り詰めずエラーにする（`SEC-2`）。
 pub(crate) const MAX_NUMBERED_NODES: usize = 200_000;
 
-/// `DOM.getDocument` の展開深さ（[`MAX_TREE_DEPTH`] へ丸め済み）。
+/// `DOM.getDocument` の展開深さ。`limit` は [`MAX_TREE_DEPTH`] へ丸め済みで、
+/// `clamped` は要求値（`-1` 含む）が上限で丸められたことを示す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Depth(u32);
+pub(crate) struct Depth {
+    limit: u32,
+    clamped: bool,
+}
+
+impl Depth {
+    const fn exact(limit: u32) -> Self {
+        Self {
+            limit,
+            clamped: false,
+        }
+    }
+
+    /// サーバー上限まで全展開（`-1` 相当）。
+    #[cfg(test)]
+    const fn unlimited() -> Self {
+        Self {
+            limit: MAX_TREE_DEPTH,
+            clamped: true,
+        }
+    }
+}
 
 /// `params` から `depth` を検証して取り出す（省略時 1、-1 は上限まで全展開）。
 pub(crate) fn parse_depth(params: &Value) -> Result<Depth, CdpError> {
     let Some(v) = params.get("depth") else {
-        return Ok(Depth(1));
+        return Ok(Depth::exact(1));
     };
     let n = v.as_i64().ok_or(CdpError::INVALID_PARAMS)?;
     match n {
-        -1 => Ok(Depth(MAX_TREE_DEPTH)),
-        0.. => Ok(Depth(
-            u32::try_from(n)
-                .unwrap_or(MAX_TREE_DEPTH)
-                .min(MAX_TREE_DEPTH),
-        )),
+        -1 => Ok(Depth {
+            limit: MAX_TREE_DEPTH,
+            clamped: true,
+        }),
+        0.. => match u32::try_from(n) {
+            Ok(d) if d <= MAX_TREE_DEPTH => Ok(Depth::exact(d)),
+            _ => Ok(Depth {
+                limit: MAX_TREE_DEPTH,
+                clamped: true,
+            }),
+        },
         _ => Err(CdpError::INVALID_PARAMS),
     }
 }
@@ -119,6 +152,7 @@ fn node_json(
     id: NodeId,
     node_id: i64,
     document_url: &str,
+    include_base_url: bool,
 ) -> Option<Map<String, Value>> {
     let mut m = Map::new();
     m.insert("nodeId".into(), json!(node_id));
@@ -172,14 +206,29 @@ fn node_json(
     m.insert("nodeValue".into(), json!(value));
     if ty == 9 {
         m.insert("documentURL".into(), json!(document_url));
-        m.insert("baseURL".into(), json!(document_url));
+        if include_base_url {
+            m.insert("baseURL".into(), json!(document_url));
+        }
         m.insert("xmlVersion".into(), json!(""));
     }
     Some(m)
 }
 
+/// `href` 属性を持つ HTML の `base` 要素が文書内にあるか。
+fn has_base_href(doc: &Document) -> bool {
+    doc.descendants(doc.root()).any(|id| {
+        matches!(
+            doc.node_data(id),
+            Some(NodeData::Element { name, attrs, .. })
+                if &*name.ns == "http://www.w3.org/1999/xhtml"
+                    && &*name.local == "base"
+                    && attrs.iter().any(|a| &*a.name.local == "href")
+        )
+    })
+}
+
 /// `doc` を `DOM.Node`（root）の JSON へ変換する。明示スタックで反復的に構築し、
-/// 深さ・ノード数の上限を超えるノードは `childNodeCount` のみにする。
+/// 要求深さに達したノードは `childNodeCount` のみにし、サーバー上限超過は `DOCUMENT_TOO_LARGE`。
 pub(crate) fn build_document_node(
     doc: &Document,
     document_url: &str,
@@ -189,8 +238,10 @@ pub(crate) fn build_document_node(
         return Err(CdpError::DOCUMENT_TOO_LARGE);
     }
     let numbering = number_nodes(doc);
-    let limit = depth.0;
+    let limit = depth.limit;
     let root = doc.root();
+    // <base href> は未解決のため、存在する文書では誤った baseURL を返さず省略する（REPAIR-3）。
+    let include_base_url = !has_base_href(doc);
 
     // 1 回目: 文書順（前順）に、含めるノードと展開有無を決める。
     let mut included: Vec<(NodeId, bool)> = Vec::new();
@@ -198,7 +249,20 @@ pub(crate) fn build_document_node(
     let mut stack: Vec<(NodeId, u32)> = vec![(root, 0)];
     while let Some((id, d)) = stack.pop() {
         let count = doc.children(id).count();
-        let expand = d < limit && count > 0 && count <= budget;
+        // サーバー上限で要求どおり展開できないなら、切り詰めた成功応答にせず明示エラーにする。
+        // 要求深さ（丸めなし）に達しただけなら CDP の契約どおり childNodeCount のみ返す。
+        let expand = if count == 0 {
+            false
+        } else if d < limit {
+            if count > budget {
+                return Err(CdpError::DOCUMENT_TOO_LARGE);
+            }
+            true
+        } else if depth.clamped {
+            return Err(CdpError::DOCUMENT_TOO_LARGE);
+        } else {
+            false
+        };
         if expand {
             budget -= count;
             let kids: Vec<NodeId> = doc.children(id).collect();
@@ -213,7 +277,7 @@ pub(crate) fn build_document_node(
         let Some(nid) = numbering.node_id(id) else {
             continue;
         };
-        let Some(mut m) = node_json(doc, id, nid, document_url) else {
+        let Some(mut m) = node_json(doc, id, nid, document_url, include_base_url) else {
             continue;
         };
         if let Some(pid) = doc.parent(id).and_then(|p| numbering.node_id(p)) {
@@ -242,10 +306,12 @@ impl CommandHandler for DomGetDocument {
         params: &'a Value,
     ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
         Box::pin(async move {
-            if let Some(sid) = ctx.session_id
-                && ctx.state.registry().session_target(sid).is_none()
-            {
-                return Err(CdpError::INVALID_PARAMS);
+            if let Some(sid) = ctx.session_id {
+                if ctx.state.registry().session_target(sid).is_none() {
+                    return Err(CdpError::INVALID_PARAMS);
+                }
+                // ターゲット別の文書を読む手段が無く、共有状態を返すと別ページの内容を漏らし得る。
+                return Err(CdpError::TARGET_DOCUMENT_UNAVAILABLE);
             }
             let depth = parse_depth(params)?;
             check_pierce(params)?;
@@ -277,7 +343,7 @@ mod tests {
 
     #[test]
     fn cdp1_get_document_default_depth_one() {
-        let v = build_document_node(&doc(PAGE), "https://example.com/", Depth(1)).unwrap();
+        let v = build_document_node(&doc(PAGE), "https://example.com/", Depth::exact(1)).unwrap();
         let expected = json!({
             "nodeId": 1, "backendNodeId": 1, "nodeType": 9, "nodeName": "#document",
             "localName": "", "nodeValue": "", "documentURL": "https://example.com/",
@@ -295,7 +361,7 @@ mod tests {
 
     #[test]
     fn cdp1_get_document_depth_unlimited() {
-        let v = build_document_node(&doc(PAGE), "u", Depth(MAX_TREE_DEPTH)).unwrap();
+        let v = build_document_node(&doc(PAGE), "u", Depth::unlimited()).unwrap();
         let body = &v["children"][1]["children"][1];
         assert_eq!(body["nodeName"], "BODY");
         let h1 = &body["children"][0];
@@ -310,7 +376,7 @@ mod tests {
 
     #[test]
     fn cdp1_get_document_depth_zero_returns_root_only() {
-        let v = build_document_node(&doc(PAGE), "u", Depth(0)).unwrap();
+        let v = build_document_node(&doc(PAGE), "u", Depth::exact(0)).unwrap();
         assert_eq!(v["childNodeCount"], 2);
         assert!(v.get("children").is_none());
     }
@@ -318,7 +384,7 @@ mod tests {
     #[test]
     fn cdp1_get_document_comment_and_svg_namespace() {
         let d = doc("<body><!--c--><svg viewBox=\"0 0 1 1\"></svg></body>");
-        let v = build_document_node(&d, "u", Depth(MAX_TREE_DEPTH)).unwrap();
+        let v = build_document_node(&d, "u", Depth::unlimited()).unwrap();
         let body = &v["children"][0]["children"][1];
         assert_eq!(body["children"][0]["nodeName"], "#comment");
         assert_eq!(body["children"][0]["nodeValue"], "c");
@@ -326,40 +392,46 @@ mod tests {
         assert_eq!(body["children"][1]["localName"], "svg");
     }
 
-    fn count_nodes(v: &Value) -> usize {
-        1 + v["children"]
-            .as_array()
-            .map_or(0, |a| a.iter().map(count_nodes).sum())
-    }
-
     #[test]
-    fn cdp1_get_document_caps_depth() {
-        // html5ever の既定上限に当たらない範囲でネストさせる（上限は html/body を含めて超える段数）。
+    fn cdp1_get_document_server_depth_cap_is_error() {
+        // 上限を超える段数の文書を全展開要求すると、切り詰めずエラーにする。
         let n = MAX_TREE_DEPTH as usize + 10;
         let html = format!("{}{}", "<div>".repeat(n), "</div>".repeat(n));
         let d = doc(&html);
-        let v = build_document_node(&d, "u", Depth(MAX_TREE_DEPTH)).unwrap();
-        let mut cur = &v;
-        let mut depth = 0;
-        while let Some(c) = cur["children"].as_array().and_then(|a| a.last()) {
-            cur = c;
-            depth += 1;
-        }
-        assert_eq!(depth, MAX_TREE_DEPTH);
-        assert_eq!(cur["childNodeCount"], 1);
+        assert_eq!(
+            build_document_node(&d, "u", Depth::unlimited()),
+            Err(CdpError::DOCUMENT_TOO_LARGE)
+        );
+        // 要求深さが上限以内なら同じ文書でも成功する。
+        let v = build_document_node(&d, "u", Depth::exact(3)).unwrap();
+        assert_eq!(v["children"][0]["children"][1]["childNodeCount"], 1);
     }
 
     #[test]
-    fn cdp1_get_document_caps_node_budget() {
+    fn cdp1_get_document_node_budget_exceeded_is_error() {
         let n = MAX_NODES_PER_RESPONSE + 50;
         let html = format!("<body>{}</body>", "<i></i>".repeat(n));
         let d = doc(&html);
-        let v = build_document_node(&d, "u", Depth(MAX_TREE_DEPTH)).unwrap();
-        // body の子が予算を超えるため body は展開されない。
-        assert!(count_nodes(&v) <= MAX_NODES_PER_RESPONSE);
+        assert_eq!(
+            build_document_node(&d, "u", Depth::unlimited()),
+            Err(CdpError::DOCUMENT_TOO_LARGE)
+        );
+        // 要求深さで body の手前までなら成功し、childNodeCount が正しい。
+        let v = build_document_node(&d, "u", Depth::exact(2)).unwrap();
         let body = &v["children"][0]["children"][1];
         assert_eq!(body["childNodeCount"], n);
         assert!(body.get("children").is_none());
+    }
+
+    #[test]
+    fn cdp1_get_document_base_url_omitted_with_base_href() {
+        let with = doc("<head><base href=\"/x/\"></head><body></body>");
+        let v = build_document_node(&with, "https://e.com/a", Depth::exact(0)).unwrap();
+        assert_eq!(v["documentURL"], "https://e.com/a");
+        assert!(v.get("baseURL").is_none());
+        let without = doc(PAGE);
+        let v = build_document_node(&without, "https://e.com/a", Depth::exact(0)).unwrap();
+        assert_eq!(v["baseURL"], "https://e.com/a");
     }
 
     #[test]
@@ -368,7 +440,7 @@ mod tests {
         let html = format!("<body>{}</body>", "<i></i>".repeat(n));
         let d = doc(&html);
         assert_eq!(
-            build_document_node(&d, "u", Depth(1)),
+            build_document_node(&d, "u", Depth::exact(1)),
             Err(CdpError::DOCUMENT_TOO_LARGE)
         );
     }
@@ -392,14 +464,15 @@ mod tests {
             Err(CdpError::UNSUPPORTED_PARAMS)
         );
         assert_eq!(check_pierce(&json!({"pierce": false})), Ok(()));
-        assert_eq!(parse_depth(&json!({})), Ok(Depth(1)));
-        assert_eq!(
-            parse_depth(&json!({"depth": -1})),
-            Ok(Depth(MAX_TREE_DEPTH))
-        );
+        assert_eq!(parse_depth(&json!({})), Ok(Depth::exact(1)));
+        assert_eq!(parse_depth(&json!({"depth": -1})), Ok(Depth::unlimited()));
         assert_eq!(
             parse_depth(&json!({"depth": 99999})),
-            Ok(Depth(MAX_TREE_DEPTH))
+            Ok(Depth::unlimited())
+        );
+        assert_eq!(
+            parse_depth(&json!({"depth": 256})),
+            Ok(Depth::exact(MAX_TREE_DEPTH))
         );
     }
 
@@ -526,6 +599,28 @@ mod tests {
             assert_eq!(
                 v["error"],
                 json!({"code": -32602, "message": "invalid params"})
+            );
+            assert!(v.get("result").is_none());
+        }
+
+        #[tokio::test]
+        async fn cdp1_dispatch_get_document_registered_session_rejected() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            let reg = st.registry();
+            let tid = reg
+                .create_target(crate::target::TargetKind::Page, "about:blank")
+                .unwrap();
+            let sid = reg.attach(&tid).unwrap();
+            let text = format!(
+                r#"{{"id":5,"method":"DOM.getDocument","sessionId":"{}"}}"#,
+                sid.as_str()
+            );
+            let v = call(&st, &text).await;
+            assert_eq!(
+                v["error"],
+                json!({"code": -32000, "message": "document not available for target"})
             );
             assert!(v.get("result").is_none());
         }

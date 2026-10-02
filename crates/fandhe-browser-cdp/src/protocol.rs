@@ -71,6 +71,9 @@ impl CdpError {
     pub const UNSUPPORTED_PARAMS: Self = Self::new(-32602, "unsupported params");
     /// 文書のノード数が採番の処理量上限を超えた（`DOM.getDocument`。`SEC-2`）。
     pub const DOCUMENT_TOO_LARGE: Self = Self::new(-32000, "document too large");
+    /// セッション（ターゲット）別の文書を読む手段が未実装（`DOM.getDocument` の `sessionId` 付き。`CDP-1`・`REPAIR-3`）。
+    pub const TARGET_DOCUMENT_UNAVAILABLE: Self =
+        Self::new(-32000, "document not available for target");
 
     const fn new(code: i64, message: &'static str) -> Self {
         Self { code, message }
