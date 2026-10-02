@@ -491,6 +491,24 @@ impl CommandHandler for DomQuerySelector {
     }
 }
 
+/// 文書構築中の遷移競合で記録できなかった場合の再試行上限（`SEC-2`: 無限ループ防止）。
+const MAX_ISSUE_ATTEMPTS: usize = 3;
+
+/// `build` が `(root, recorded)` を返す。記録できなかった（構築中に遷移して最新でなくなった・
+/// セッションが消えた）旧文書の nodeId は後続の `DOM.querySelector` で解決できないため成功応答に
+/// しない。新しい文書で上限回まで作り直し、収束しなければ明示エラーを返す（`CDP-1`・`REPAIR-3`）。
+fn build_recorded_root(
+    mut build: impl FnMut() -> Result<(Value, bool), CdpError>,
+) -> Result<Value, CdpError> {
+    for _ in 0..MAX_ISSUE_ATTEMPTS {
+        let (root, recorded) = build()?;
+        if recorded {
+            return Ok(root);
+        }
+    }
+    Err(CdpError::SERVER_ERROR)
+}
+
 /// `DOM.getDocument` ハンドラ。
 pub(crate) struct DomGetDocument;
 
@@ -505,15 +523,19 @@ impl CommandHandler for DomGetDocument {
             let target = resolve_target(&ctx)?;
             let depth = parse_depth(params)?;
             check_pierce(params)?;
-            let (latest, parsed) = load_document(&ctx, target.as_ref())?;
-            let root = build_document_node(&parsed.document, latest.url(), depth)?;
-            // 構築中に遷移・並行 getDocument で最新でなくなった文書は記録しない（nodeId は
-            // 無効扱い。新世代の記録を古い `Arc` で上書きしない）。
-            ctx.state
-                .dom_issued()
-                .record(ctx.state.registry(), ctx.session_id, &latest, || {
-                    current_latest(&ctx, target.as_ref()).ok()
-                });
+            let root = build_recorded_root(|| {
+                let (latest, parsed) = load_document(&ctx, target.as_ref())?;
+                let root = build_document_node(&parsed.document, latest.url(), depth)?;
+                // 構築中に遷移・並行 getDocument で最新でなくなった文書は記録しない（新世代の
+                // 記録を古い `Arc` で上書きしない）。記録できたかを呼び出し側へ返す。
+                let recorded = ctx.state.dom_issued().record(
+                    ctx.state.registry(),
+                    ctx.session_id,
+                    &latest,
+                    || current_latest(&ctx, target.as_ref()).ok(),
+                );
+                Ok((root, recorded))
+            })?;
             Ok(HandlerOutput::result(json!({ "root": root })))
         })
     }
@@ -779,6 +801,24 @@ mod tests {
         }
         assert_eq!(a.resolve(0), None);
         assert_eq!(a.resolve(a.order.len() as i64 + 1), None);
+    }
+
+    /// 記録できなかった文書の root は成功で返さず、再試行または明示エラーにする（`CDP-1`）。
+    #[test]
+    fn cdp1_build_recorded_root_retries_then_errors() {
+        let mut calls = 0;
+        let r = build_recorded_root(|| {
+            calls += 1;
+            Ok((json!({ "n": calls }), calls == 2))
+        });
+        assert_eq!(r.unwrap(), json!({ "n": 2 }));
+        let mut calls = 0;
+        let r = build_recorded_root(|| {
+            calls += 1;
+            Ok((json!({}), false))
+        });
+        assert_eq!(r.unwrap_err(), CdpError::SERVER_ERROR);
+        assert_eq!(calls, MAX_ISSUE_ATTEMPTS);
     }
 
     /// 古い文書の記録要求は、最新文書の払い出し記録を上書きしない（`CDP-1`）。
