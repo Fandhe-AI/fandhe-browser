@@ -28,7 +28,7 @@
 //! - 採番は文書全体を走査するため、ノード数が [`MAX_NUMBERED_NODES`] を超える文書は
 //!   `DOCUMENT_TOO_LARGE` エラーにする（切り詰めない）
 //! - 呼び出しごとに再パースするが、nodeId の世代は [`IssuedDocuments`] で管理する。
-//!   `DOM.getDocument` が払い出した文書（`Arc<NavigationResult>` の同一性）をターゲット別に
+//!   `DOM.getDocument` が払い出した文書（`Arc<NavigationResult>` の同一性）を要求元セッション別に
 //!   記録し、`DOM.querySelector` は最新の確定文書がその記録と同一のときだけ nodeId を解決する。
 //!   getDocument 未呼び出し・遷移後の古い nodeId は `NODE_NOT_FOUND`（別文書の別ノードへ
 //!   解決しない。`CDP-1`）。ノード表そのものの保持・`DOM.requestChildNodes` は後続（`CDP-2`・TASK-43）
@@ -49,7 +49,7 @@ use fandhe_browser_core::{
 use serde_json::{Map, Value, json};
 
 use crate::protocol::{BoxFuture, CdpError, CommandContext, CommandHandler, HandlerOutput};
-use crate::target::TargetId;
+use crate::target::{SessionId, TargetId};
 
 /// 1 応答で展開する最大の深さ（root = 0）。構築は反復的だが、serde_json の直列化・drop が
 /// 深さに比例して再帰するため上限を設ける。
@@ -365,17 +365,21 @@ fn load_document(
 
 /// `DOM.getDocument` が nodeId を払い出した文書の記録（`CDP-1`）。
 ///
-/// キーは `sessionId` のターゲット（ブラウザレベルは `None`）。値は払い出し時点の確定文書で、
+/// キーは要求元の `sessionId`（ブラウザレベルは `None`）。別セッションが同じターゲットへ
+/// attach していても、`DOM.getDocument` を呼んだセッションの nodeId だけが有効になる。
+/// ブラウザレベル（`None`）は WebSocket 接続の識別子がハンドラへ渡らないため接続間で共有される
+/// 既知の制約（接続単位の分離は `CDP-2`・TASK-43 で接続コンテキストを導入して対応）。
+/// 値は払い出し時点の確定文書で、
 /// `Arc` を保持するためアドレスが再利用されず `Arc::ptr_eq` で同一文書を判定できる。
 /// 遷移が確定すると新しい `Arc` に置き換わり、旧 nodeId は無効になる。保持件数は
-/// 生存ターゲット数 + 1 以下（閉じたターゲットは記録時に破棄。`SEC-2`）。
+/// 生存セッション数 + 1 以下（detach・ターゲット閉鎖で消えたセッションは記録時に破棄。`SEC-2`）。
 ///
 /// 記録は文書（世代）単位で、ノード単位では持たない。払い出し済み文書に対しては、
 /// `DOM.getDocument` が（深さ制限で）返していない範囲の nodeId も `number_nodes` の
 /// 採番内なら検索起点として受理する（採番が決定的で、同じ文書をセレクタで辿れる範囲を
 /// 超える情報は得られないため。Chrome の「要求済みノードのみ有効」とは差異。`CDP-1`）。
 pub(crate) struct IssuedDocuments {
-    inner: Mutex<HashMap<Option<TargetId>, Arc<NavigationResult>>>,
+    inner: Mutex<HashMap<Option<SessionId>, Arc<NavigationResult>>>,
 }
 
 impl IssuedDocuments {
@@ -393,26 +397,29 @@ impl IssuedDocuments {
     fn record(
         &self,
         registry: &crate::target::TargetRegistry,
-        target: Option<&TargetId>,
+        session: Option<&SessionId>,
         doc: &Arc<NavigationResult>,
         latest: impl FnOnce() -> Option<Arc<NavigationResult>>,
     ) -> bool {
         let mut m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        m.retain(|k, _| k.as_ref().is_none_or(|t| registry.target(t).is_some()));
+        m.retain(|k, _| {
+            k.as_ref()
+                .is_none_or(|s| registry.session_target(s).is_some())
+        });
         if !latest().is_some_and(|l| Arc::ptr_eq(&l, doc)) {
             return false;
         }
-        if target.is_none_or(|t| registry.target(t).is_some()) {
-            m.insert(target.cloned(), Arc::clone(doc));
+        if session.is_none_or(|s| registry.session_target(s).is_some()) {
+            m.insert(session.cloned(), Arc::clone(doc));
             return true;
         }
         false
     }
 
     /// `doc` が現在の払い出し済み文書と同一か。
-    fn is_current(&self, target: Option<&TargetId>, doc: &Arc<NavigationResult>) -> bool {
+    fn is_current(&self, session: Option<&SessionId>, doc: &Arc<NavigationResult>) -> bool {
         let m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        m.get(&target.cloned())
+        m.get(&session.cloned())
             .is_some_and(|issued| Arc::ptr_eq(issued, doc))
     }
 }
@@ -468,10 +475,17 @@ impl CommandHandler for DomQuerySelector {
             let (node_id, selector) = parse_query_params(params)?;
             let (latest, parsed) = load_document(&ctx, target.as_ref())?;
             // nodeId は getDocument が払い出した文書でのみ有効。未取得・遷移後は解決しない（`CDP-1`）。
-            if !ctx.state.dom_issued().is_current(target.as_ref(), &latest) {
+            // 払い出し記録は要求元セッション単位（別セッションの getDocument では有効にならない）。
+            if !ctx.state.dom_issued().is_current(ctx.session_id, &latest) {
                 return Err(CdpError::NODE_NOT_FOUND);
             }
             let found = query_selector_node_id(&parsed.document, node_id, selector)?;
+            // 検索中に遷移が確定した場合は旧文書の結果を返さない（`CDP-1`）。
+            let still_latest =
+                current_latest(&ctx, target.as_ref()).is_ok_and(|l| Arc::ptr_eq(&l, &latest));
+            if !still_latest || !ctx.state.dom_issued().is_current(ctx.session_id, &latest) {
+                return Err(CdpError::NODE_NOT_FOUND);
+            }
             Ok(HandlerOutput::result(json!({ "nodeId": found })))
         })
     }
@@ -497,7 +511,7 @@ impl CommandHandler for DomGetDocument {
             // 無効扱い。新世代の記録を古い `Arc` で上書きしない）。
             ctx.state
                 .dom_issued()
-                .record(ctx.state.registry(), target.as_ref(), &latest, || {
+                .record(ctx.state.registry(), ctx.session_id, &latest, || {
                     current_latest(&ctx, target.as_ref()).ok()
                 });
             Ok(HandlerOutput::result(json!({ "root": root })))
@@ -1144,6 +1158,24 @@ mod tests {
             )
             .await;
             assert_eq!(v["error"]["message"], "node not found");
+        }
+
+        /// 同じターゲットへ attach した別セッションの getDocument では nodeId が有効にならない（`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_dispatch_query_selector_issuance_is_per_session() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let (tid, sid_a) = session_for_new_target(&st);
+            let sid_b = st.registry().attach(&tid).unwrap().as_str().to_owned();
+            commit_target(&st, &tid, "https://t.example/", PAGE);
+            call(&st, &get_doc_text(&sid_a, "{}")).await;
+            let q_a = qs_text(12, Some(&sid_a), r#"{"nodeId":1,"selector":"h1"}"#);
+            assert_eq!(call(&st, &q_a).await["result"]["nodeId"], 6);
+            let q_b = qs_text(13, Some(&sid_b), r#"{"nodeId":1,"selector":"h1"}"#);
+            let v = call(&st, &q_b).await;
+            assert_eq!(v["error"]["message"], "node not found");
+            call(&st, &get_doc_text(&sid_b, "{}")).await;
+            assert_eq!(call(&st, &q_b).await["result"]["nodeId"], 6);
         }
     }
 }
