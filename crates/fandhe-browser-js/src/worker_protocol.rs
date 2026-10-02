@@ -78,7 +78,10 @@ pub(crate) const MARKER_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER";
 /// 本 crate が実装しているワーカープロトコルのバージョン（設計書 §3.1）。
 /// [`super::worker`]（`js-v8` feature 有効時のみ）が実際に検証・送信に
 /// 使う。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 ///
 /// 2: 親 → 子の登録フレーム [`tag::REGISTER_GLOBAL_FUNCTION`] を追加
 /// （`TASK-29.4`・Issue #155）。子は未知の tag をプロトコル違反として
@@ -89,7 +92,11 @@ pub(crate) const MARKER_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER";
 /// [`tag::BIND_DOM_LIKE_OBJECT`] を追加（`TASK-29.5a`・Issue #524）。
 /// `NativeReturn`／`Result` 経由で新しい値タグが実際に流れうるため、
 /// ワイヤ形式の世代差をハンドシェイクで検出できるよう上げた。
-pub(crate) const PROTOCOL_VERSION: u16 = 3;
+///
+/// 4: [`ErrorKind::ResourceLimit`]（ワイヤ値 3）を追加（`TASK-32.2`・
+/// Issue #166）。旧世代の親は未知のエラー種別を解釈できないため、世代差を
+/// ハンドシェイクで検出できるよう上げた。
+pub(crate) const PROTOCOL_VERSION: u16 = 4;
 
 /// フレームの `tag` バイトの値。
 ///
@@ -99,7 +106,10 @@ pub(crate) const PROTOCOL_VERSION: u16 = 3;
 /// （`expect` ではなく `allow` にする理由: 個々の未配線項目
 /// （`decode_js_value` 等）の `expect(dead_code)` と異なるスコープに
 /// 独立して付けるための整理。REPAIR-3）。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) mod tag {
     /// 子 → 親。ハンドシェイク（[`super::encode_hello`]）。
     pub(crate) const HELLO: u8 = 1;
@@ -127,7 +137,7 @@ pub(crate) mod tag {
     /// 応答は `RESULT(Undefined)` / `ERROR{Binding}`。親の送信は
     /// `process_engine`、子の処理は `worker` が担う（Issue #525）。
     #[cfg_attr(
-        not(any(test, feature = "js-v8")),
+        not(any(test, feature = "js-v8", feature = "js-boa")),
         allow(
             dead_code,
             reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -139,12 +149,18 @@ pub(crate) mod tag {
 /// 注入するグローバル関数名の最大バイト数（`JS-1`・`TASK-29.4`・
 /// Issue #155）。親の事前検証・登録フレームの decode・子の
 /// `v8_engine` が同じ値を共有する。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) const MAX_GLOBAL_FUNCTION_NAME_BYTES: usize = 256;
 
 /// 注入できるグローバル関数の最大件数（親の登録簿・子の登録数の双方で
 /// 検証する。子は親を信頼しない。`JS-1`・`TASK-29.4`・Issue #155）。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) const MAX_REGISTERED_GLOBAL_FUNCTIONS: usize = 1024;
 
 /// [`super::process_engine`] が親 → 子のフレーム読み取りに使う上限
@@ -152,13 +168,19 @@ pub(crate) const MAX_REGISTERED_GLOBAL_FUNCTIONS: usize = 1024;
 /// [`super::worker`] のスクリプト長上限（`MAX_SCRIPT_SOURCE_BYTES`。1 MiB）
 /// に余裕（64 KiB）を足した値。[`super::worker`] が実際に読み取りへ使う
 /// （`js-v8` feature 有効時のみ）。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) const MAX_FRAME_PAYLOAD_PARENT_TO_CHILD: usize = 1_048_576 + 65_536;
 
 /// [`super::process_engine`]（W4）が子 → 親のフレーム読み取りに使う上限
 /// （ペイロードのバイト数。設計書 §3.5）。結果文字列の上限（1M UTF-16
 /// 単位。UTF-8 では最悪 3 MiB）に余裕（64 KiB）を足した値。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) const MAX_FRAME_PAYLOAD_CHILD_TO_PARENT: usize = 3 * 1_048_576 + 65_536;
 
 /// エラーメッセージのペイロードに許容する最大バイト数（4 KiB。設計書
@@ -167,7 +189,10 @@ pub(crate) const MAX_FRAME_PAYLOAD_CHILD_TO_PARENT: usize = 3 * 1_048_576 + 65_5
 /// `MAX_ERROR_MESSAGE_CHARS`/`truncate_error_message` 相当の上限を適用
 /// 済みであることを前提とする）。[`super::worker`] が実際に使う
 /// （`js-v8` feature 有効時のみ）。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
 
 /// [`DomLikeObjectBinding`] のメンバー（メソッド・プロパティ）の最大件数
@@ -176,7 +201,7 @@ pub(crate) const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
 /// 確保する。ヘッダ最大 266 B ＋ メンバー最大 263 B × 256 件 ＝ 最大
 /// 67,594 B で、[`MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`] に十分収まる。
 #[cfg_attr(
-    not(any(test, feature = "js-v8")),
+    not(any(test, feature = "js-v8", feature = "js-boa")),
     allow(
         dead_code,
         reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -187,7 +212,7 @@ pub(crate) const MAX_DOM_LIKE_OBJECT_MEMBERS: usize = 256;
 /// [`DomLikeMember`] の名前の最大バイト数（`JS-1`・`TASK-29.5a`・Issue #524）。
 /// グローバル名の上限は [`MAX_GLOBAL_FUNCTION_NAME_BYTES`] を共用する。
 #[cfg_attr(
-    not(any(test, feature = "js-v8")),
+    not(any(test, feature = "js-v8", feature = "js-boa")),
     allow(
         dead_code,
         reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -203,7 +228,10 @@ pub(crate) const MAX_DOM_LIKE_MEMBER_NAME_BYTES: usize = 256;
 /// `Vec::with_capacity` する（確保前検証。巨大な `argc` を主張するフレーム
 /// でも実際にはメモリを確保しない）。`print`・`dom.setText` 等（PoC-3
 /// 相当）の用途には十分な値として選んだ。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) const MAX_NATIVE_CALL_ARGS: usize = 64;
 
 /// フレーム・値のデコードに失敗したことを表すエラー（`JS-1`・`TASK-29`・
@@ -217,15 +245,24 @@ pub(crate) enum ProtocolError {
     /// 下層の I/O エラー（読み取り・書き込み失敗。[`write_frame`]・
     /// [`read_frame`] が返す。`js-v8` feature 有効時のみ非テストで構築
     /// されうる）。
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     Io(io::Error),
     /// フレーム長が 0（タグバイト自体が存在しない。[`read_frame`]。
     /// `js-v8` feature 有効時のみ非テストで構築されうる）。
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     EmptyFrame,
     /// ペイロード長が呼び出し側の指定した上限を超えた（[`read_frame`]。
     /// `js-v8` feature 有効時のみ非テストで構築されうる）。
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     FrameTooLarge { len: usize, max: usize },
     /// 未知の tag バイト。呼び出し元（`super::worker`・
     /// `super::process_engine`）がタグの意味解釈をした結果として構築する
@@ -245,48 +282,78 @@ pub(crate) enum ProtocolError {
     /// 値のデコード時に、未知の [`JsValue`] タグバイトを受け取った
     /// （[`decode_js_value`]。W4（process_engine.rs）から使われるまで
     /// 未構築）。
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     InvalidValueTag(u8),
     /// 真偽値の表現が `0`/`1` のどちらでもなかった（[`decode_js_value`]。
     /// W4 から使われるまで未構築）。
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     InvalidBoolByte(u8),
     /// 未知の [`ErrorKind`] タグバイト（[`decode_error`]。W4 から使われる
     /// まで未構築）。
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     InvalidErrorKind(u8),
     /// 未知のエンジン種別バイト（`Hello` フレームの `engine` フィールド。
     /// [`decode_hello`]。W4 から使われるまで未構築）。
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     InvalidEngineByte(u8),
     /// ペイロードが期待する長さに満たない（切り詰められている。
     /// [`decode_js_value`]/[`decode_hello`]/[`decode_error`]。W4 から
     /// 使われるまで未構築）。
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     Truncated,
     /// ペイロードが期待する長さを超えている（末尾に余分なバイトが
     /// 付いている。[`decode_hello`] のように、フレーム全体を 1 つの
     /// 固定長値として解釈する箇所で構築する。codex レビュー指摘 #503
     /// P1「decode_hello が末尾の余分なバイトを拒否していない」対応）。
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     TrailingBytes { expected: usize, actual: usize },
     /// 文字列として解釈すべきバイト列が不正な UTF-8 だった
     /// （[`decode_evaluate`]。`super::worker` が親からの `Evaluate`
     /// フレームを検証する際に構築する。`js-v8` feature 有効時のみ非
     /// テストで構築されうる）。
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     InvalidUtf8,
     /// [`encode_native_call`] に渡した引数の件数が [`MAX_NATIVE_CALL_ARGS`]
     /// を超えていた（`JS-1`・Issue #511）。
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     TooManyNativeCallArgs { count: usize, max: usize },
     /// [`decode_native_return`] が未知の status バイト（0=Ok, 1=Err 以外）を
     /// 受け取った（`JS-1`・Issue #511）。
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     InvalidNativeReturnStatus(u8),
     /// [`decode_native_return`] の Err ペイロード（エラーメッセージ）が
     /// [`MAX_ERROR_MESSAGE_BYTES`] を超えていた（`JS-1`・Issue #511）。
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     ErrorMessageTooLong { len: usize, max: usize },
     /// [`encode_native_call`] の引数列をエンコードした場合の合計サイズが
     /// [`MAX_FRAME_PAYLOAD_CHILD_TO_PARENT`] を超える（`JS-1`・Issue #511・
@@ -297,17 +364,23 @@ pub(crate) enum ProtocolError {
     /// 件数の検証だけでは合計バイト数の DoS を防げない。`encode_native_call`
     /// は `out` へ追記する**前**に合計サイズを checked 演算で積算し、この
     /// 上限を超えた時点で確保・追記を一切行わずに本エラーを返す。
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     NativeCallPayloadTooLarge { size: usize, max: usize },
     /// [`decode_register_global_function`] の name が
     /// [`MAX_GLOBAL_FUNCTION_NAME_BYTES`] を超えていた（`TASK-29.4`・
     /// Issue #155）。
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     GlobalFunctionNameTooLong { len: usize, max: usize },
     /// bind フレームのメンバー数が [`MAX_DOM_LIKE_OBJECT_MEMBERS`] を超えた
     /// （`TASK-29.5a`・Issue #524）。
     #[cfg_attr(
-        not(any(test, feature = "js-v8")),
+        not(any(test, feature = "js-v8", feature = "js-boa")),
         allow(
             dead_code,
             reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -317,7 +390,7 @@ pub(crate) enum ProtocolError {
     /// bind フレームのグローバル名・メンバー名が上限を超えた
     /// （`TASK-29.5a`・Issue #524）。
     #[cfg_attr(
-        not(any(test, feature = "js-v8")),
+        not(any(test, feature = "js-v8", feature = "js-boa")),
         allow(
             dead_code,
             reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -326,7 +399,7 @@ pub(crate) enum ProtocolError {
     DomLikeNameTooLong { len: usize, max: usize },
     /// bind フレームのグローバル名・メンバー名が空（`TASK-29.5a`・Issue #524）。
     #[cfg_attr(
-        not(any(test, feature = "js-v8")),
+        not(any(test, feature = "js-v8", feature = "js-boa")),
         allow(
             dead_code,
             reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -335,7 +408,7 @@ pub(crate) enum ProtocolError {
     EmptyDomLikeName,
     /// bind フレームのメンバー種別バイトが未知（`TASK-29.5a`・Issue #524）。
     #[cfg_attr(
-        not(any(test, feature = "js-v8")),
+        not(any(test, feature = "js-v8", feature = "js-boa")),
         allow(
             dead_code,
             reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -345,7 +418,7 @@ pub(crate) enum ProtocolError {
     /// bind フレームでメンバー名が重複した（`TASK-29.5a`・Issue #524）。
     /// untrusted な名前をメッセージへ埋め込まないため名前は保持しない。
     #[cfg_attr(
-        not(any(test, feature = "js-v8")),
+        not(any(test, feature = "js-v8", feature = "js-boa")),
         allow(
             dead_code,
             reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -443,7 +516,10 @@ impl From<io::Error> for ProtocolError {
 ///
 /// [`read_frame`] からのみ呼ばれる（`js-v8` feature 有効時のみ非テストで
 /// 到達する）。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 fn read_exact_or_clean_eof(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<bool> {
     let mut filled = 0usize;
     while filled < buf.len() {
@@ -471,7 +547,10 @@ fn read_exact_or_clean_eof(reader: &mut impl Read, buf: &mut [u8]) -> io::Result
 /// `flush` することを想定し、本関数自体は `flush` しない（複数フレームを
 /// まとめて `flush` したい呼び出し側の裁量に委ねる）。`js-v8` feature
 /// 有効時のみ非テストで [`super::worker`] から使われる。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn write_frame(
     writer: &mut impl Write,
     tag: u8,
@@ -514,7 +593,10 @@ pub(crate) fn write_frame(
 /// 検査するため、上限超過を主張するフレームに対して実際のメモリ確保は
 /// 発生しない（OWASP A04「不安全な設計」対策）。`js-v8` feature 有効時
 /// のみ非テストで [`super::worker`] から使われる。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn read_frame(
     reader: &mut impl Read,
     max_payload_len: usize,
@@ -558,7 +640,10 @@ pub(crate) fn read_frame(
 /// 既知の全 variant を網羅すれば `_` 分岐は不要（`#[non_exhaustive]` が
 /// 制限するのは他 crate からの網羅性判定のみ）。`js-v8` feature 有効時
 /// のみ非テストで [`super::worker`] から使われる。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn encode_js_value(value: &JsValue, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
     match value {
         JsValue::Undefined => out.push(0),
@@ -596,7 +681,10 @@ pub(crate) fn encode_js_value(value: &JsValue, out: &mut Vec<u8>) -> Result<(), 
 ///
 /// 呼び出し元（将来）: `super::process_engine`（W4）が子からの `Result`
 /// フレームをデコードする際に使う。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn decode_js_value(buf: &[u8]) -> Result<(JsValue, usize), ProtocolError> {
     let tag = *buf.first().ok_or(ProtocolError::Truncated)?;
     match tag {
@@ -650,7 +738,10 @@ pub(crate) fn decode_js_value(buf: &[u8]) -> Result<(JsValue, usize), ProtocolEr
 ///
 /// 表現: `u16 LE protocol_version` ＋ `u8 engine`（0=V8, 1=Boa）。
 /// `js-v8` feature 有効時のみ非テストで [`super::worker`] から使われる。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn encode_hello(protocol_version: u16, engine: EngineKind) -> Vec<u8> {
     let mut out = Vec::with_capacity(3);
     out.extend_from_slice(&protocol_version.to_le_bytes());
@@ -665,7 +756,10 @@ pub(crate) fn encode_hello(protocol_version: u16, engine: EngineKind) -> Vec<u8>
 ///
 /// 呼び出し元（将来）: `super::process_engine`（W4）がハンドシェイクで
 /// 子からの `Hello` フレームをデコードする際に使う。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn decode_hello(payload: &[u8]) -> Result<(u16, EngineKind), ProtocolError> {
     // `Hello` は常にちょうど 3 バイト（`u16` の version＋`u8` の engine）の
     // 固定長フレームであり、他の値が後ろに連結される設計ではない。
@@ -704,7 +798,10 @@ pub(crate) fn decode_hello(payload: &[u8]) -> Result<(u16, EngineKind), Protocol
 ///
 /// 呼び出し元（将来）: `super::process_engine`（W4）が子へ評価対象の
 /// スクリプトを送る際に使う。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn encode_evaluate(script: &str) -> Vec<u8> {
     script.as_bytes().to_vec()
 }
@@ -712,7 +809,10 @@ pub(crate) fn encode_evaluate(script: &str) -> Vec<u8> {
 /// [`encode_evaluate`] の逆変換。`js-v8` feature 有効時のみ非テストで
 /// [`super::worker`] から使われる（親からの `Evaluate` フレームを検証
 /// する経路）。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn decode_evaluate(payload: &[u8]) -> Result<String, ProtocolError> {
     std::str::from_utf8(payload)
         .map(str::to_string)
@@ -727,7 +827,10 @@ pub(crate) fn decode_evaluate(payload: &[u8]) -> Result<String, ProtocolError> {
 /// する）。子プロセス側（`super::worker`。`js-v8` feature 有効時のみ）は
 /// 既に評価失敗の分類にこの型を使っている。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) enum ErrorKind {
     /// スクリプト評価が失敗した（構文エラー・実行時例外）。
     Evaluation,
@@ -740,24 +843,37 @@ pub(crate) enum ErrorKind {
     /// 子の監視スレッド（watchdog）が実行時間の上限で打ち切った
     /// （設計書 §3.3 の表「子の watchdog が打ち切った」行）。
     Timeout,
+    /// ランタイム上限（boa のループ反復・再帰・スタック上限等）に到達して
+    /// 評価が打ち切られた（[`JsEngineError::ResourceLimitExceeded`] に対応。
+    /// `JS-1`・`TASK-32.2`・Issue #166）。子プロセスと Context は生きている
+    /// ため、親は "context was discarded" を付けずにそのまま返す。
+    ResourceLimit,
 }
 
 impl ErrorKind {
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     fn to_byte(self) -> u8 {
         match self {
             Self::Evaluation => 0,
             Self::Binding => 1,
             Self::Timeout => 2,
+            Self::ResourceLimit => 3,
         }
     }
 
-    #[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "js-v8", feature = "js-boa")),
+        allow(dead_code)
+    )]
     fn from_byte(byte: u8) -> Result<Self, ProtocolError> {
         match byte {
             0 => Ok(Self::Evaluation),
             1 => Ok(Self::Binding),
             2 => Ok(Self::Timeout),
+            3 => Ok(Self::ResourceLimit),
             other => Err(ProtocolError::InvalidErrorKind(other)),
         }
     }
@@ -770,7 +886,10 @@ impl ErrorKind {
 /// [`MAX_ERROR_MESSAGE_BYTES`] へ切り詰め済みであることを前提とする
 /// （本関数自体は切り詰めない）。`js-v8` feature 有効時のみ非テストで
 /// [`super::worker`] から使われる。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn encode_error(kind: ErrorKind, message: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + message.len());
     out.push(kind.to_byte());
@@ -790,7 +909,10 @@ pub(crate) fn encode_error(kind: ErrorKind, message: &str) -> Vec<u8> {
 /// 定義されており（長さプレフィックスを持たない）、`payload.len()` を
 /// 常に過不足なく消費する。末尾に余分なバイトが付く余地自体が無い
 /// （不正な内容であれば `InvalidUtf8` として拒否される）。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn decode_error(payload: &[u8]) -> Result<(ErrorKind, String), ProtocolError> {
     let kind_byte = *payload.first().ok_or(ProtocolError::Truncated)?;
     let kind = ErrorKind::from_byte(kind_byte)?;
@@ -805,7 +927,10 @@ pub(crate) fn decode_error(payload: &[u8]) -> Result<(ErrorKind, String), Protoc
 /// 表現: `u32 LE id` ＋ `name` の UTF-8 バイト列（残り全部。長さは
 /// フレーム長で決まる）。呼び出し元: `super::process_engine` の
 /// `register_one`（`js-v8` feature 有効時のみ）。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn encode_register_global_function(id: u32, name: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + name.len());
     out.extend_from_slice(&id.to_le_bytes());
@@ -818,7 +943,10 @@ pub(crate) fn encode_register_global_function(id: u32, name: &str) -> Vec<u8> {
 ///
 /// 4 バイト未満・不正 UTF-8・空の name・[`MAX_GLOBAL_FUNCTION_NAME_BYTES`]
 /// 超の name は [`ProtocolError`] にする。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn decode_register_global_function(
     payload: &[u8],
 ) -> Result<(u32, String), ProtocolError> {
@@ -848,7 +976,7 @@ pub(crate) fn decode_register_global_function(
 /// 予約するのみ（REPAIR-3。デコードは未知の kind として拒否する）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
-    not(any(test, feature = "js-v8")),
+    not(any(test, feature = "js-v8", feature = "js-boa")),
     allow(
         dead_code,
         reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -863,7 +991,7 @@ pub(crate) enum DomLikeMemberKind {
 
 impl DomLikeMemberKind {
     #[cfg_attr(
-        not(any(test, feature = "js-v8")),
+        not(any(test, feature = "js-v8", feature = "js-boa")),
         allow(
             dead_code,
             reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -877,7 +1005,7 @@ impl DomLikeMemberKind {
     }
 
     #[cfg_attr(
-        not(any(test, feature = "js-v8")),
+        not(any(test, feature = "js-v8", feature = "js-boa")),
         allow(
             dead_code,
             reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -895,7 +1023,7 @@ impl DomLikeMemberKind {
 /// bind する DOM 風オブジェクトの 1 メンバー（`JS-1`・`TASK-29.5a`・Issue #524）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
-    not(any(test, feature = "js-v8")),
+    not(any(test, feature = "js-v8", feature = "js-boa")),
     allow(
         dead_code,
         reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -919,7 +1047,7 @@ pub(crate) struct DomLikeMember {
 /// `super::worker` が受けて JS のグローバルへプロキシオブジェクトを生やす。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
-    not(any(test, feature = "js-v8")),
+    not(any(test, feature = "js-v8", feature = "js-boa")),
     allow(
         dead_code,
         reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -936,7 +1064,7 @@ pub(crate) struct DomLikeObjectBinding {
 
 /// bind フレームの名前 1 件を検証する（空・長さ超過を拒否）。
 #[cfg_attr(
-    not(any(test, feature = "js-v8")),
+    not(any(test, feature = "js-v8", feature = "js-boa")),
     allow(
         dead_code,
         reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -965,7 +1093,7 @@ fn validate_dom_like_name(name: &str, max: usize) -> Result<(), ProtocolError> {
 /// 空の名前・上限超過・メンバー名の重複は、確保前に検証して
 /// [`ProtocolError`] を返す。
 #[cfg_attr(
-    not(any(test, feature = "js-v8")),
+    not(any(test, feature = "js-v8", feature = "js-boa")),
     allow(
         dead_code,
         reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -1025,7 +1153,7 @@ pub(crate) fn encode_bind_dom_like_object(
 /// `u16 LE len` ＋ UTF-8 バイト列を追記する（長さは検証済みの前提だが
 /// `u16` に収まらなければ拒否する）。
 #[cfg_attr(
-    not(any(test, feature = "js-v8")),
+    not(any(test, feature = "js-v8", feature = "js-boa")),
     allow(
         dead_code,
         reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -1048,7 +1176,7 @@ fn push_dom_like_name(out: &mut Vec<u8>, name: &str) -> Result<(), ProtocolError
 /// 不正 UTF-8・空の名前・長さ超過・未知の kind・メンバー名の重複・末尾の
 /// 余分なバイトはすべて [`ProtocolError`] にする。
 #[cfg_attr(
-    not(any(test, feature = "js-v8")),
+    not(any(test, feature = "js-v8", feature = "js-boa")),
     allow(
         dead_code,
         reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -1100,7 +1228,7 @@ pub(crate) fn decode_bind_dom_like_object(
 
 /// [`decode_bind_dom_like_object`] 専用の境界検査付きバイト読み取り。
 #[cfg_attr(
-    not(any(test, feature = "js-v8")),
+    not(any(test, feature = "js-v8", feature = "js-boa")),
     allow(
         dead_code,
         reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -1112,7 +1240,7 @@ struct DomLikeReader<'a> {
 }
 
 #[cfg_attr(
-    not(any(test, feature = "js-v8")),
+    not(any(test, feature = "js-v8", feature = "js-boa")),
     allow(
         dead_code,
         reason = "js-v8 feature 有効時のみ子の worker が使う（TASK-29.5b・REPAIR-3）"
@@ -1183,7 +1311,10 @@ impl DomLikeReader<'_> {
 /// （[`super::worker::StdioTransport::call`]）は本関数が返した `Vec` の
 /// 長さを送信直前に再確認するが、その時点ではすでに確保が終わっている
 /// ため、DoS 対策としては確保前の本検証が主たる防御線になる）。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn encode_native_call(id: u32, args: &[JsValue]) -> Result<Vec<u8>, ProtocolError> {
     if args.len() > MAX_NATIVE_CALL_ARGS {
         return Err(ProtocolError::TooManyNativeCallArgs {
@@ -1237,7 +1368,10 @@ pub(crate) fn encode_native_call(id: u32, args: &[JsValue]) -> Result<Vec<u8>, P
 /// （複製を伴わない V8 側の見積もり。codex レビュー指摘 #533 P0 対応）の
 /// ドキュメンテーションコメントから参照する。表現形式（タグ 1 バイト＋
 /// 種別ごとの値）は手作業で同期する必要がある。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn encoded_js_value_len(value: &JsValue) -> Result<usize, ProtocolError> {
     match value {
         JsValue::Undefined | JsValue::Null => Ok(1),
@@ -1271,7 +1405,10 @@ pub(crate) fn encoded_js_value_len(value: &JsValue) -> Result<usize, ProtocolErr
 ///
 /// 呼び出し元: `super::process_engine::dispatch_native_call`（`js-v8`
 /// feature 有効時のみ）。Issue #526 で実装済み。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn decode_native_call(payload: &[u8]) -> Result<(u32, Vec<JsValue>), ProtocolError> {
     let id_bytes: [u8; 4] = payload
         .get(0..4)
@@ -1321,7 +1458,10 @@ pub(crate) fn decode_native_call(payload: &[u8]) -> Result<(u32, Vec<JsValue>), 
 /// [`decode_native_return`] でこれを読み、`Ok` は JS の戻り値へ、`Err` は
 /// JS の例外（`try`/`catch` で捕捉可能）へ変換する。
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) enum NativeReturn {
     /// `NativeFn` の呼び出しが成功した。
     Ok(JsValue),
@@ -1344,7 +1484,10 @@ pub(crate) enum NativeReturn {
 /// [`truncate_for_wire`]（[`MAX_ERROR_MESSAGE_BYTES`] 以内）を通す前提の
 /// ため現実的にはオーバーフローしないが、外部入力由来のサイズ計算である
 /// ため `checked_add` を使う。coding-rust.md「外部入力」節）。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn encoded_native_return_len(value: &NativeReturn) -> Result<usize, ProtocolError> {
     match value {
         NativeReturn::Ok(value) => {
@@ -1380,7 +1523,10 @@ pub(crate) fn encoded_native_return_len(value: &NativeReturn) -> Result<usize, P
 /// [`encoded_native_return_len`] で確保前に長さを検証してから本関数を
 /// 呼ぶ。`dispatch_native_call`・`encode_bounded_native_return` の
 /// ドキュメントコメント参照）。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn encode_native_return(value: &NativeReturn) -> Result<Vec<u8>, ProtocolError> {
     let mut out = Vec::new();
     match value {
@@ -1406,7 +1552,10 @@ pub(crate) fn encode_native_return(value: &NativeReturn) -> Result<Vec<u8>, Prot
 /// 前。`JS-1`・`TASK-29`・Issue #526）の双方が使う共通の切り詰め処理
 /// （元は `worker.rs` に private 実装として存在した。両者が使う
 /// プロトコル上の制約であるため本モジュールへ移した）。
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn truncate_for_wire(message: &str) -> String {
     if message.len() <= MAX_ERROR_MESSAGE_BYTES {
         return message.to_string();
@@ -1430,7 +1579,10 @@ pub(crate) fn truncate_for_wire(message: &str) -> String {
 ///   [`MAX_ERROR_MESSAGE_BYTES`] を超える場合は `from_utf8` を試みる**前**に
 ///   [`ProtocolError::ErrorMessageTooLong`] を返す（外部入力の長さを検証
 ///   してから文字列変換に使う。coding-rust.md「外部入力」節）
-#[cfg_attr(not(any(test, feature = "js-v8")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) fn decode_native_return(payload: &[u8]) -> Result<NativeReturn, ProtocolError> {
     let status = *payload.first().ok_or(ProtocolError::Truncated)?;
     let body = payload.get(1..).ok_or(ProtocolError::Truncated)?;
@@ -1709,6 +1861,7 @@ mod tests {
             ErrorKind::Evaluation,
             ErrorKind::Binding,
             ErrorKind::Timeout,
+            ErrorKind::ResourceLimit,
         ] {
             let payload = encode_error(kind, "boom");
             let (decoded_kind, message) = decode_error(&payload).expect("decode must succeed");
@@ -2064,7 +2217,7 @@ mod tests {
     #[test]
     fn js_1_marker_env_var_and_protocol_version_have_the_documented_values() {
         assert_eq!(MARKER_ENV_VAR, "FANDHE_BROWSER_JS_WORKER");
-        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     /// JS-1: 想定される tag 値が予約分も含め重複しないこと（プロトコル

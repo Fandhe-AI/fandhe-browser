@@ -65,8 +65,84 @@ use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
 use super::engine_trait::{EngineKind, EvaluateOptions, JsEngineError, JsValue};
-use super::v8_engine::{NativeCallFailure, NativeCallTransport, V8Engine};
+use super::shared::{NativeCallFailure, NativeCallTransport};
+#[cfg(feature = "js-v8")]
+use super::v8_engine::V8Engine;
 use super::worker_protocol::{self, ErrorKind, NativeReturn, ProtocolError, tag};
+
+/// 親が子プロセスへ「どのエンジンで評価するか」を伝える環境変数
+/// （`TASK-32.2`・Issue #166）。値は [`EngineKind::as_str`] の表記
+/// （`"v8"`/`"boa"`）。親（[`super::process_engine`]）は `env_clear()` した
+/// うえで必ずこの値を渡す。未設定は V8 として扱う（親を介さない直接起動の
+/// 後方互換。TEST 用途）。値は untrusted な入力として厳密に照合し、
+/// 未知の値は fail-closed で起動を拒否する。
+pub(crate) const ENGINE_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER_ENGINE";
+
+/// [`ENGINE_ENV_VAR`] の生の値から [`EngineKind`] を決める（未設定は V8）。
+/// 未知の値は `Err`（成功を装わない）。
+fn engine_kind_from_env_value(raw: Option<&str>) -> Result<EngineKind, String> {
+    match raw {
+        None => Ok(EngineKind::V8),
+        Some("v8") => Ok(EngineKind::V8),
+        Some("boa") => Ok(EngineKind::Boa),
+        Some(other) => Err(format!(
+            "unknown worker engine {:?} in {ENGINE_ENV_VAR}",
+            other.chars().take(32).collect::<String>()
+        )),
+    }
+}
+
+/// 子プロセスのフレームループが評価エンジンへ要求する最小の窓口
+/// （`TASK-32.2`・Issue #166）。V8（[`V8Engine`]）と boa
+/// （[`super::boa_worker::BoaChildEngine`]）の両方が実装し、
+/// [`worker_main`] 以降の処理をエンジン非依存にする。
+pub(crate) trait ChildEngine {
+    /// スクリプトを永続 Context で評価する。
+    fn evaluate_script(
+        &mut self,
+        script: &str,
+        options: &EvaluateOptions,
+    ) -> Result<JsValue, JsEngineError>;
+
+    /// 逆方向 RPC が fatal で終わっていれば、そのメッセージを取り出す
+    /// （取り出すと `None` に戻る）。
+    fn take_native_call_fatal(&mut self) -> Option<String>;
+
+    /// 親側関数 `id` へ転送するグローバル関数 `name` を登録する。
+    fn install_native_proxy_global(&mut self, name: &str, id: u32) -> Result<(), JsEngineError>;
+
+    /// DOM 風オブジェクトを登録する。
+    fn install_dom_like_object(
+        &mut self,
+        binding: &worker_protocol::DomLikeObjectBinding,
+    ) -> Result<(), JsEngineError>;
+}
+
+#[cfg(feature = "js-v8")]
+impl ChildEngine for V8Engine {
+    fn evaluate_script(
+        &mut self,
+        script: &str,
+        options: &EvaluateOptions,
+    ) -> Result<JsValue, JsEngineError> {
+        V8Engine::evaluate_script(self, script, options)
+    }
+
+    fn take_native_call_fatal(&mut self) -> Option<String> {
+        V8Engine::take_native_call_fatal(self)
+    }
+
+    fn install_native_proxy_global(&mut self, name: &str, id: u32) -> Result<(), JsEngineError> {
+        V8Engine::install_native_proxy_global(self, name, id)
+    }
+
+    fn install_dom_like_object(
+        &mut self,
+        binding: &worker_protocol::DomLikeObjectBinding,
+    ) -> Result<(), JsEngineError> {
+        V8Engine::install_dom_like_object(self, binding)
+    }
+}
 
 /// テスト専用: 子プロセスの V8 Isolate に設定するヒープ上限（バイト）を
 /// 上書きする環境変数（Issue #503 設計書 §7 W6「テスト用に小さいヒープ
@@ -91,6 +167,7 @@ use super::worker_protocol::{self, ErrorKind, NativeReturn, ProtocolError, tag};
 /// （本モジュールを含む他モジュール）から不可視になるためリンクにできない。
 /// Issue #528）と合わせた多層防御であり、どちらか一方が壊れても上限は
 /// 保たれる）。
+#[cfg(feature = "js-v8")]
 pub(crate) const TEST_HEAP_LIMIT_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER_HEAP_LIMIT_BYTES";
 
 /// テスト専用: 子プロセスが送る `Hello` フレームのエンジン種別を
@@ -215,6 +292,7 @@ pub(crate) const TEST_WINDOWS_PROCESS_MEMORY_LIMIT_ENV_VAR: &str =
 /// `usize::MAX` へ飽和させる（32 ビット環境でも `usize` 範囲外の巨大値が
 /// 解釈失敗（`None` = 既定値）にならず、後段のクランプで上限へ丸められる。
 /// 3 OS 対応・`JS-1`・`TASK-29`）。数値として解釈できなければ `None`。
+#[cfg(any(feature = "js-v8", target_os = "windows"))]
 fn parse_env_bytes_saturating(value: &str) -> Option<usize> {
     let parsed = value.trim().parse::<u64>().ok()?;
     Some(usize::try_from(parsed).unwrap_or(usize::MAX))
@@ -246,6 +324,7 @@ fn test_windows_process_memory_limit_from_env_value(raw: Option<&str>) -> Option
 ///   ヒープ上限を使う。[`V8Engine::new`]）
 /// - 解釈できた場合は [`super::v8_engine::clamp_test_heap_limit_bytes`] で
 ///   クランプした値を返す（本番の既定値を超えられず、下限も満たす）
+#[cfg(feature = "js-v8")]
 fn test_heap_limit_from_env_value(raw: Option<&str>) -> Option<usize> {
     raw.and_then(parse_env_bytes_saturating)
         .map(super::v8_engine::clamp_test_heap_limit_bytes)
@@ -420,63 +499,24 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
             }
         };
 
-    // V8 の Platform を protected 版（thread-isolated allocation 有効）で
-    // 初期化する（`JS-1`・`TASK-29`・Issue #520）。この子プロセスは
-    // `main`（`run_js_worker_if_requested` 経由）から本関数まで単一
-    // スレッドで直線的に進み、Isolate に入るのもこのスレッドだけである
-    // ため、`v8_engine::ensure_v8_initialized_with` のドキュメントコメント
-    // が述べる「子孫スレッド制約」に抵触しない。呼ぶ位置は
-    // `enforce_child_memory_limit()` の**後**（OS 側の上限を先に掛ける
-    // 順序を保つ）・`V8Engine::new*` の**前**（Isolate 生成より前に
-    // Platform を確定させる）にする。
-    //
-    // プロトコルバージョン検証の早期 return より**必ず下**に置くこと。
-    // `js_1_worker_main_rejects_unsupported_protocol_version` 等の
-    // ユニットテストはテストプロセス内で `worker_main` を直接呼ぶため、
-    // これより上で protected 初期化を呼ぶとテストプロセスが protected に
-    // なってしまう（他のテストスレッドが PKU ホストで `SEGV_PKUERR` に
-    // なりうる。実装者への注意。Issue #520 実装計画）。
-    let actual_platform =
-        super::v8_engine::ensure_v8_initialized_with(super::v8_engine::V8PlatformKind::Protected);
-    if actual_platform != super::v8_engine::V8PlatformKind::Protected {
-        // 正規の子プロセスでは起こり得ない（このプロセスは V8 の Platform
-        // をまだ初期化していないはずのため）。想定外の経路（テスト用の
-        // 直接呼び出し等）で先に unprotected 初期化が行われていたことを
-        // 示す。保護が有効であるかのように装わず、診断を出して評価は
-        // 継続する（unprotected のままでも従来と同じ安全水準であり、
-        // fail-closed で止める必要はない。security.md「偽装・回避機能の
-        // 禁止」）。
-        eprintln!(
-            "fandhe-browser-js worker: V8 platform was already initialized as {actual_platform:?}; \
-             thread-isolated allocation is not active"
-        );
-    }
-
-    // 環境変数は untrusted な入力（`TEST_HEAP_LIMIT_ENV_VAR` のドキュメント
-    // コメント参照）。`test_heap_limit_from_env_value` が読み取った直後に
-    // クランプすることで、親を経由しない直接起動でも本番の上限
-    // （`MAX_ISOLATE_HEAP_BYTES`）を超えられない。
-    let heap_limit_override =
-        test_heap_limit_from_env_value(std::env::var(TEST_HEAP_LIMIT_ENV_VAR).ok().as_deref());
-    let engine_result = match heap_limit_override {
-        Some(bytes) => V8Engine::new_with_heap_limit(bytes),
-        None => V8Engine::new(),
-    };
-    let mut engine = match engine_result {
+    // エンジン種別は親が環境変数で明示する（`TASK-32.2`・Issue #166）。
+    // untrusted な入力として厳密に照合し、未知の値・未同梱の種別は
+    // 評価を始めずに終了する（fail-closed）。
+    let engine_kind =
+        match engine_kind_from_env_value(std::env::var(ENGINE_ENV_VAR).ok().as_deref()) {
+            Ok(kind) => kind,
+            Err(err) => {
+                eprintln!("fandhe-browser-js worker: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let mut engine: Box<dyn ChildEngine> = match create_child_engine(engine_kind) {
         Ok(engine) => engine,
         Err(err) => {
-            eprintln!("fandhe-browser-js worker: failed to create the V8 engine: {err}");
+            eprintln!("fandhe-browser-js worker: {err}");
             return ExitCode::FAILURE;
         }
     };
-
-    // JS-1・Issue #511: 逆方向 RPC の transport を配線する（Hello を送る前。
-    // 評価が始まる前に必ず設定済みにしておく）。`io::stdin()`/`io::stdout()`
-    // は呼び出しごとにロックする（`StdioTransport` のドキュメントコメント
-    // 参照）。ループ側もこの後は `StdinLock`/`StdoutLock` を関数スコープで
-    // 保持しない（旧実装は保持しており、評価中に本 transport が同じ
-    // stdin を読もうとするとデッドロックしていた）。
-    engine.set_native_call_transport(Box::new(StdioTransport::new(io::stdin(), io::stdout())));
 
     // JS-1・TASK-29・Issue #526: `test-support` ビルドに限り、結合テストが
     // 親側 `NativeCall` dispatch を実際の子プロセスで検証できるよう、
@@ -523,7 +563,7 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
     {
         EngineKind::Boa
     } else {
-        EngineKind::V8
+        engine_kind
     };
     let mut hello_payload =
         worker_protocol::encode_hello(worker_protocol::PROTOCOL_VERSION, hello_engine);
@@ -574,7 +614,7 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                match evaluate_and_respond(&mut engine, &script, &mut stdout) {
+                match evaluate_and_respond(engine.as_mut(), &script, &mut stdout) {
                     Ok(RespondOutcome::Responded) => {}
                     Ok(RespondOutcome::NativeCallProtocolViolation(message)) => {
                         // JS-1・Issue #511: 逆方向 RPC が fatal
@@ -597,7 +637,7 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
             }
             tag::REGISTER_GLOBAL_FUNCTION => {
                 match handle_register_global_function(
-                    &mut engine,
+                    engine.as_mut(),
                     &payload,
                     &mut stdout,
                     &mut registered_count,
@@ -617,7 +657,7 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
             }
             tag::BIND_DOM_LIKE_OBJECT => {
                 if let Err(err) = handle_bind_dom_like_object(
-                    &mut engine,
+                    engine.as_mut(),
                     &payload,
                     &mut stdout,
                     &mut registered_count,
@@ -637,6 +677,96 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
             }
         }
     }
+}
+
+/// 要求された種別の評価エンジンを子プロセスの中で生成し、逆方向 RPC の
+/// transport（stdio）を配線して返す（`TASK-32.2`・Issue #166）。
+///
+/// 呼び出し元: [`worker_main`]。メモリ上限（`enforce_child_memory_limit`）を
+/// 掛けた**後**に呼ぶ（OS の上限を先に掛ける順序を保つ）。feature で
+/// 同梱されていない種別は `Err`（成功を装わない）。
+fn create_child_engine(kind: EngineKind) -> Result<Box<dyn ChildEngine>, String> {
+    match kind {
+        EngineKind::V8 => create_v8_child_engine(),
+        EngineKind::Boa => create_boa_child_engine(),
+    }
+}
+
+#[cfg(feature = "js-v8")]
+fn create_v8_child_engine() -> Result<Box<dyn ChildEngine>, String> {
+    // V8 の Platform を protected 版（thread-isolated allocation 有効）で
+    // 初期化する（`JS-1`・`TASK-29`・Issue #520）。この子プロセスは
+    // `main`（`run_js_worker_if_requested` 経由）から本関数まで単一
+    // スレッドで直線的に進み、Isolate に入るのもこのスレッドだけである
+    // ため、`v8_engine::ensure_v8_initialized_with` のドキュメントコメント
+    // が述べる「子孫スレッド制約」に抵触しない。呼ぶ位置は
+    // `enforce_child_memory_limit()` の**後**・`V8Engine::new*` の**前**。
+    //
+    // プロトコルバージョン検証の早期 return より**必ず下**に置くこと
+    // （`worker_main` を直接呼ぶユニットテストのプロセスが protected に
+    // ならないようにするため。Issue #520 実装計画）。
+    let actual_platform =
+        super::v8_engine::ensure_v8_initialized_with(super::v8_engine::V8PlatformKind::Protected);
+    if actual_platform != super::v8_engine::V8PlatformKind::Protected {
+        // 正規の子プロセスでは起こり得ない。保護が有効であるかのように
+        // 装わず、診断を出して評価は継続する（unprotected のままでも従来と
+        // 同じ安全水準。security.md「偽装・回避機能の禁止」）。
+        eprintln!(
+            "fandhe-browser-js worker: V8 platform was already initialized as {actual_platform:?}; \
+             thread-isolated allocation is not active"
+        );
+    }
+
+    // 環境変数は untrusted な入力（`TEST_HEAP_LIMIT_ENV_VAR` のドキュメント
+    // コメント参照）。読み取った直後にクランプする。
+    let heap_limit_override =
+        test_heap_limit_from_env_value(std::env::var(TEST_HEAP_LIMIT_ENV_VAR).ok().as_deref());
+    let engine_result = match heap_limit_override {
+        Some(bytes) => V8Engine::new_with_heap_limit(bytes),
+        None => V8Engine::new(),
+    };
+    let mut engine =
+        engine_result.map_err(|err| format!("failed to create the V8 engine: {err}"))?;
+
+    // JS-1・Issue #511: 逆方向 RPC の transport を配線する（Hello を送る前）。
+    // `io::stdin()`/`io::stdout()` は呼び出しごとにロックする（`StdioTransport`
+    // のドキュメントコメント参照）。
+    engine.set_native_call_transport(Box::new(StdioTransport::new(io::stdin(), io::stdout())));
+    Ok(Box::new(engine))
+}
+
+#[cfg(not(feature = "js-v8"))]
+fn create_v8_child_engine() -> Result<Box<dyn ChildEngine>, String> {
+    Err("this binary was not built with the js-v8 feature".to_string())
+}
+
+/// macOS では boa を動かさない（fail-closed。親側の [`create_engine`] と同じ
+/// 理由。`engine_trait::create_boa_engine` 参照）。親を経由しない直接起動も
+/// 評価を始めずに終了させる。
+///
+/// [`create_engine`]: super::engine_trait::create_engine
+#[cfg(all(feature = "js-boa", target_os = "macos"))]
+fn create_boa_child_engine() -> Result<Box<dyn ChildEngine>, String> {
+    Err("the boa engine is disabled on macOS because no allocation-time memory limit can be enforced"
+        .to_string())
+}
+
+#[cfg(all(feature = "js-boa", not(target_os = "macos")))]
+fn create_boa_child_engine() -> Result<Box<dyn ChildEngine>, String> {
+    // boa 専用の追加メモリ上限（Linux のみ。他 OS は no-op）。
+    // `enforce_child_memory_limit` の後に呼ぶため、上限は下げる方向にしか動かない。
+    super::resource_limits::tighten_child_memory_limit_for_boa()?;
+    // boa には Platform 初期化も専用のヒープ上限 API も無い。メモリは
+    // 呼び出し元が先に掛けた OS 側の上限（`enforce_child_memory_limit`）と
+    // 親の RSS 監視、時間は親の期限 kill で守る（AGENTS.md「リソース上限」）。
+    Ok(Box::new(super::boa_worker::BoaChildEngine::new(Box::new(
+        StdioTransport::new(io::stdin(), io::stdout()),
+    ))))
+}
+
+#[cfg(not(feature = "js-boa"))]
+fn create_boa_child_engine() -> Result<Box<dyn ChildEngine>, String> {
+    Err("this binary was not built with the js-boa feature".to_string())
 }
 
 /// [`evaluate_and_respond`] の結果（`JS-1`・Issue #511）。
@@ -674,7 +804,7 @@ enum RespondOutcome {
 /// プロセスを終了させる。親はこれを EOF として検出し `EngineUnavailable`
 /// へ変換する。`super::process_engine` を参照）。
 fn evaluate_and_respond(
-    engine: &mut V8Engine,
+    engine: &mut dyn ChildEngine,
     script: &str,
     stdout: &mut impl Write,
 ) -> Result<RespondOutcome, ProtocolError> {
@@ -707,7 +837,7 @@ fn evaluate_and_respond(
 /// （`Err` を返さない）。`Err` はフレームの decode 失敗（プロトコル違反）
 /// または応答送信の失敗のみで、呼び出し元がプロセスを終了させる。
 fn handle_register_global_function(
-    engine: &mut V8Engine,
+    engine: &mut dyn ChildEngine,
     payload: &[u8],
     stdout: &mut impl Write,
     registered_count: &mut usize,
@@ -736,7 +866,7 @@ fn handle_register_global_function(
 /// 上限をかける）。`Binding` 失敗では子も Context も生きたまま。
 /// `Err` はデコード失敗（プロトコル違反）または応答送信の失敗のみ。
 fn handle_bind_dom_like_object(
-    engine: &mut V8Engine,
+    engine: &mut dyn ChildEngine,
     payload: &[u8],
     stdout: &mut impl Write,
     registered_count: &mut usize,
@@ -798,8 +928,10 @@ fn respond_to_registration(
 /// 判別していたが、専用 variant を追加したため文言ヒューリスティックは
 /// 不要になった）。
 ///
-/// `JsEngineError::ResourceLimitExceeded`・`JsEngineError::EngineUnavailable`
-/// はワイヤ上に専用の `ErrorKind` が無いため、`Evaluation` に畳んで送る
+/// `JsEngineError::ResourceLimitExceeded` は `ErrorKind::ResourceLimit`
+/// で送る（boa のループ・再帰・スタック上限。`TASK-32.2`・Issue #166）。
+/// `JsEngineError::EngineUnavailable` はワイヤ上に専用の `ErrorKind` が無いため、
+/// `Evaluation` に畳んで送る
 /// （`EngineUnavailable` は `v8_engine` が NativeCall fatal 記録済みの
 /// Context に対する評価要求で返しうる。親側では `EvaluationFailed` として
 /// 見える。区別するにはプロトコル変更が必要で、`TASK-29.6.1` の範囲外）。
@@ -818,7 +950,11 @@ fn classify_evaluation_error(err: &JsEngineError) -> (ErrorKind, String) {
         JsEngineError::Timeout(msg) => {
             (ErrorKind::Timeout, worker_protocol::truncate_for_wire(msg))
         }
-        JsEngineError::ResourceLimitExceeded(msg) | JsEngineError::EngineUnavailable(msg) => (
+        JsEngineError::ResourceLimitExceeded(msg) => (
+            ErrorKind::ResourceLimit,
+            worker_protocol::truncate_for_wire(msg),
+        ),
+        JsEngineError::EngineUnavailable(msg) => (
             ErrorKind::Evaluation,
             worker_protocol::truncate_for_wire(msg),
         ),
@@ -897,6 +1033,7 @@ mod tests {
     /// 134,217,728 バイト）を大きく超える値を渡しても、子プロセス自身が
     /// 既定値へクランプすること（実プロセス・stdio を介さず、値の変換
     /// 経路だけを具体値で検証する）。
+    #[cfg(feature = "js-v8")]
     #[test]
     fn js_1_test_heap_limit_from_env_value_clamps_an_oversized_direct_value() {
         // 4 GiB。本番の既定値（128 MiB）を大きく超える。
@@ -908,6 +1045,7 @@ mod tests {
 
     /// codex レビュー指摘 #503 P0: `0` を直接渡しても、実用上動作する
     /// 最小値（1 MiB = 1,048,576 バイト）まで引き上げられること。
+    #[cfg(feature = "js-v8")]
     #[test]
     fn js_1_test_heap_limit_from_env_value_raises_zero_to_the_floor() {
         assert_eq!(test_heap_limit_from_env_value(Some("0")), Some(1_048_576));
@@ -915,6 +1053,7 @@ mod tests {
 
     /// codex レビュー指摘 #503 P0: `usize` として解釈できない値・値が
     /// 未設定の場合は `None`（既定のヒープ上限を使う経路）になること。
+    #[cfg(feature = "js-v8")]
     #[test]
     fn js_1_test_heap_limit_from_env_value_falls_back_to_default_on_invalid_or_missing_input() {
         assert_eq!(test_heap_limit_from_env_value(Some("not-a-number")), None);
@@ -944,6 +1083,7 @@ mod tests {
 
     /// 3 OS 対応: `usize` に収まらない巨大値は解釈失敗にならず `usize::MAX`
     /// へ飽和し、数値でない値は `None` になること（32 ビット環境対応）。
+    #[cfg(any(feature = "js-v8", target_os = "windows"))]
     #[test]
     fn js_1_parse_env_bytes_saturating_saturates_and_rejects_non_numeric() {
         assert_eq!(parse_env_bytes_saturating(" 1024 "), Some(1024));
@@ -984,7 +1124,7 @@ mod tests {
 
         let (kind, message) =
             classify_evaluation_error(&JsEngineError::ResourceLimitExceeded("oom".to_string()));
-        assert_eq!(kind, ErrorKind::Evaluation);
+        assert_eq!(kind, ErrorKind::ResourceLimit);
         assert_eq!(message, "oom");
 
         let (kind, message) =
@@ -1102,6 +1242,7 @@ mod tests {
     }
 
     /// 登録フレーム処理の応答を 1 件読む補助（テスト用）。
+    #[cfg(feature = "js-v8")]
     fn read_one_response(written: Vec<u8>) -> (u8, Vec<u8>) {
         worker_protocol::read_frame(&mut io::Cursor::new(written), 4096)
             .expect("frame must be readable")
@@ -1110,6 +1251,7 @@ mod tests {
 
     /// JS-1・TASK-29.4: 登録に成功すると `RESULT(Undefined)` が書かれ、
     /// 件数が増えること。
+    #[cfg(feature = "js-v8")]
     #[test]
     fn js_1_register_global_function_success_responds_with_undefined() {
         let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
@@ -1129,6 +1271,7 @@ mod tests {
 
     /// JS-1・TASK-29.4: 登録できない名前（`undefined` は non-configurable）
     /// は `ERROR{Binding}` になり、件数は増えず `Ok` を返す（子は生きる）。
+    #[cfg(feature = "js-v8")]
     #[test]
     fn js_1_register_global_function_failure_responds_with_binding_error() {
         let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
@@ -1147,6 +1290,7 @@ mod tests {
     }
 
     /// JS-1・TASK-29.4: 件数が上限に達していれば `ERROR{Binding}` にする。
+    #[cfg(feature = "js-v8")]
     #[test]
     fn js_1_register_global_function_rejects_beyond_the_count_limit() {
         let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
@@ -1161,6 +1305,7 @@ mod tests {
     }
 
     /// JS-1・TASK-29.4: 壊れたペイロードはプロトコル違反として `Err`。
+    #[cfg(feature = "js-v8")]
     #[test]
     fn js_1_register_global_function_malformed_payload_is_an_error() {
         let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
@@ -1173,6 +1318,7 @@ mod tests {
         assert!(written.is_empty());
     }
 
+    #[cfg(feature = "js-v8")]
     fn sample_bind_payload(name: &str) -> Vec<u8> {
         use worker_protocol::{DomLikeMember, DomLikeMemberKind, DomLikeObjectBinding};
         worker_protocol::encode_bind_dom_like_object(&DomLikeObjectBinding {
@@ -1188,6 +1334,7 @@ mod tests {
     }
 
     /// JS-1・TASK-29.5b: bind に成功すると `RESULT(Undefined)` が書かれ件数が増える。
+    #[cfg(feature = "js-v8")]
     #[test]
     fn js_1_bind_dom_like_object_success_responds_with_undefined() {
         let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
@@ -1210,6 +1357,7 @@ mod tests {
     }
 
     /// JS-1・TASK-29.5b: 登録できない名前は `ERROR{Binding}`（件数は増えず子は生きる）。
+    #[cfg(feature = "js-v8")]
     #[test]
     fn js_1_bind_dom_like_object_failure_responds_with_binding_error() {
         let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
@@ -1232,6 +1380,7 @@ mod tests {
     }
 
     /// JS-1・TASK-29.5b: 件数が上限に達していれば `ERROR{Binding}`。
+    #[cfg(feature = "js-v8")]
     #[test]
     fn js_1_bind_dom_like_object_rejects_beyond_the_count_limit() {
         let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
@@ -1250,6 +1399,7 @@ mod tests {
     }
 
     /// JS-1・TASK-29.5b: 壊れたペイロードはプロトコル違反として `Err`。
+    #[cfg(feature = "js-v8")]
     #[test]
     fn js_1_bind_dom_like_object_malformed_payload_is_an_error() {
         let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");

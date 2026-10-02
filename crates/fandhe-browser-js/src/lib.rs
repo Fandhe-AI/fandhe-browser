@@ -21,7 +21,12 @@
 //! [`create_engine`] は V8 には子プロセス版エンジンを返し（`TASK-29.6.2`・
 //! Issue #548。遅延起動。ホストは `main` の先頭で
 //! [`run_js_worker_if_requested`] を呼ぶ義務がある。詳細は [`engine_trait`]）、
-//! 同梱済みの boa には `NotYetImplemented`、同梱されていない種別には
+//! boa にも V8 と同じ子プロセス分離基盤の上で動く boa 版エンジンを返し
+//! （`TASK-32.2`・Issue #166。boa には中断 API・ヒープ上限 API が無いため、
+//! 実時間は親の期限 kill、メモリは子の OS 上限と親の RSS 監視で強制する。
+//! 詳細は `boa_worker` モジュールの doc を参照。ただし macOS では確保時に効く
+//! メモリ上限を強制できないため boa は無効で `NotYetImplemented` を返す。
+//! `JS-1`・`TASK-32.2`・`REPAIR-3`）、同梱されていない種別には
 //! `NotBundled` を返す。以下は未実装（実装済みを装わない。REPAIR-3）。
 //!
 //! - V8 の具象実装（`JS-1`、`TASK-29`、`MS-3`）は `create_engine` への配線まで
@@ -29,7 +34,6 @@
 //!   inherent API と同じ専用スレッド経路（期限付き待機）で実行するため期限を
 //!   強制できる。ただし `NativeCallContext` は関数へ渡らず協調的な中断は
 //!   できない（`process_engine` の「既知の制限」）
-//! - boa の具象実装（`JS-1`、`TASK-32`、`MS-3`）
 //! - core への統合（`js_stub` の置換。`JS-2`、`TASK-30`、`MS-3`）
 //!
 //! # 公開境界（`JS-1`・TASK-29.6.1・Issue #547）
@@ -78,6 +82,18 @@
 //! ```compile_fail
 //! use fandhe_browser_js::resource_limits;
 //! ```
+//!
+//! `boa_engine` は非公開（boa 固有型を公開しない）。
+//!
+//! ```compile_fail
+//! use fandhe_browser_js::boa_engine::BoaEngine;
+//! ```
+//!
+//! `boa_engine` crate の再エクスポートは無い。
+//!
+//! ```compile_fail
+//! use fandhe_browser_js::boa_engine::Context;
+//! ```
 
 #![deny(private_interfaces, private_bounds)]
 
@@ -89,11 +105,25 @@ pub mod engine_trait;
 // 抽象越しに使い、V8 / boa の具象型を上位 crate へ漏らさない」）。
 #[cfg(feature = "js-v8")]
 mod v8_engine;
+// boa（`boa_engine`）による [`JsEngine`] 実装（TASK-32.2・Issue #166）。
+// V8 と同じく具象型を上位 crate へ漏らさないため `pub` を付けず、`pub use`
+// もしない（coding-rust.md「V8 / boa の具象型を上位 crate へ漏らさない」）。
+// macOS では boa を無効にしている（`engine_trait::create_boa_engine`）ため
+// 呼び出し元が無くなり dead_code になる。呼び出し元と同じ条件で閉じる。
+#[cfg(all(feature = "js-boa", not(target_os = "macos")))]
+mod boa_engine;
+// boa を子プロセス（`worker`）の評価エンジンとして使うためのアダプタ
+// （TASK-32.2・Issue #166）。boa の具象型は本 crate 内に閉じる。
+#[cfg(all(feature = "js-boa", not(target_os = "macos")))]
+mod boa_worker;
+// V8 子プロセス・boa 子プロセスが共有する定数と逆方向 RPC の窓口。
+#[cfg(any(feature = "js-v8", feature = "js-boa"))]
+mod shared;
 // 子プロセスのヒープ外メモリに OS 側の上限を掛ける（TASK-29・Issue #503
 // 設計書 §5・codex レビュー指摘 #503 P0 対応）。[`worker`]（子側の起動時
 // 強制）と [`process_engine`]（親側の RSS 監視）の両方から使う非公開
 // モジュール。
-#[cfg(feature = "js-v8")]
+#[cfg(any(feature = "js-v8", feature = "js-boa"))]
 mod resource_limits;
 // JS 評価用の子プロセスと stdio でやり取りするバイナリプロトコルの
 // フレーミング・コーデック（TASK-29・Issue #503「JS プロセス分離」
@@ -113,7 +143,7 @@ mod worker_protocol;
 // JS 評価を行う子プロセスの入口（TASK-29・Issue #503 設計書 §3.1・
 // §7 W3）。`js-v8` feature 有効時のみ、実際に V8 を組み込んだ子プロセス
 // として動作できる。
-#[cfg(feature = "js-v8")]
+#[cfg(any(feature = "js-v8", feature = "js-boa"))]
 mod worker;
 // 子プロセスへの親側プロキシ（TASK-29・Issue #503 設計書 §3.2〜§3.4・
 // §7 W4）。`create_engine` へは TASK-29.6.2（Issue #548）で配線済み。
@@ -133,7 +163,7 @@ mod worker;
 // `V8ProcessEngine` は `Child`・パイプ・チャネルしか保持せず `v8` crate の
 // 型を一切参照しないため、coding-rust.md「V8 / boa の具象型を上位 crate
 // へ漏らさない」には抵触しない。
-#[cfg(feature = "js-v8")]
+#[cfg(any(feature = "js-v8", feature = "js-boa"))]
 #[doc(hidden)]
 pub mod process_engine;
 
@@ -183,15 +213,15 @@ pub fn run_js_worker_if_requested() -> Option<std::process::ExitCode> {
     Some(dispatch_worker(&marker_value))
 }
 
-#[cfg(feature = "js-v8")]
+#[cfg(any(feature = "js-v8", feature = "js-boa"))]
 fn dispatch_worker(marker_value: &str) -> std::process::ExitCode {
     worker::worker_main(marker_value)
 }
 
-#[cfg(not(feature = "js-v8"))]
+#[cfg(not(any(feature = "js-v8", feature = "js-boa")))]
 fn dispatch_worker(_marker_value: &str) -> std::process::ExitCode {
     eprintln!(
-        "fandhe-browser-js worker: this binary was not built with the js-v8 feature and \
+        "fandhe-browser-js worker: this binary was not built with the js-v8 or js-boa feature and \
          cannot run as a JS evaluation worker"
     );
     std::process::ExitCode::FAILURE
