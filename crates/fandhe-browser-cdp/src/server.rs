@@ -9,7 +9,7 @@
 //!
 //! `/json/*` ルータ（[`router`]。TASK-41.3）と `/devtools/browser/{id}` の WS 受け口設定
 //! （[`browser_websocket_config`]。TASK-41.4。公開入口は [`endpoints`]）は実装済み。WS のメッセージハンドラは
-//! [`crate::protocol`] のディスパッチャへ委譲する（TASK-42.1）。組込みメソッド表は空で、個別メソッドは
+//! [`crate::protocol`] のディスパッチャへ委譲する（TASK-42.1）。組込みメソッドは `Page.navigate`（TASK-42.2）のみで、残りの個別メソッドは
 //! TASK-42.2 以降（REPAIR-3）。
 //! 初期ターゲット（`about:blank`）の自動作成は行わず、後続タスクの判断に委ねる。
 

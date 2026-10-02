@@ -275,6 +275,20 @@ impl TargetRegistry {
         v
     }
 
+    /// ターゲットの現在 URL を更新する（`Page.navigate` の成功後に cdp の page ハンドラから呼ぶ。
+    /// `/json/list` の URL と共有状態の整合を保つ。`CDP-1`）。
+    ///
+    /// 未知ターゲット・URL 長超過では表を変更しない。
+    pub fn set_target_url(&self, id: &TargetId, url: &str) -> Result<(), CdpStateError> {
+        if url.len() > MAX_URL_LEN {
+            return Err(CdpStateError::UrlTooLong { limit: MAX_URL_LEN });
+        }
+        let mut t = self.lock();
+        let info = t.targets.get_mut(id).ok_or(CdpStateError::UnknownTarget)?;
+        info.url = url.to_owned();
+        Ok(())
+    }
+
     /// ターゲットを閉じ、配下セッションを削除して、その SessionId を返す
     /// （将来 `Target.detachedFromTarget` の送出に使う）。
     pub fn close_target(&self, id: &TargetId) -> Result<Vec<SessionId>, CdpStateError> {
