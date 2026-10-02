@@ -204,9 +204,21 @@ pub(crate) struct PageNavigate {
     targets: Mutex<HashMap<TargetId, Arc<NavigationState>>>,
     /// 結果確定の直列化と完了順の採番。
     gate: CommitGate,
-    /// 共有状態へ最後にミラーした確定の通し番号。ターゲット表の更新・ミラーを 1 つの
+    /// 共有状態へ最後にミラーした内容の記録。ターゲット表の更新・ミラーを 1 つの
     /// 同期境界（このロック）で行い、古い遷移が新しい結果を巻き戻さないようにする。
-    published: Mutex<u64>,
+    published: Mutex<Published>,
+}
+
+/// 共有状態（`AppState::navigation()`）へ最後にミラーした内容の記録（`CDP-1`）。
+///
+/// 取得失敗時に共有状態を無効化してよいのは、共有状態が「その失敗したターゲット自身の
+/// ミラー」のままである場合に限る。別ターゲットのページを消さないための根拠として使う。
+struct Published {
+    /// 最後にミラーした確定の通し番号。
+    seq: u64,
+    /// ミラー元ターゲットと、ミラー直後の共有状態の世代。
+    /// ミラーが無い・無効化済み・ブラウザレベル遷移で上書き済みなら `None`。
+    mirrored: Option<(TargetId, NavigationGeneration)>,
 }
 
 impl PageNavigate {
@@ -217,7 +229,10 @@ impl PageNavigate {
             fetcher: Fetcher::new(options)?,
             targets: Mutex::new(HashMap::new()),
             gate: Mutex::new(0),
-            published: Mutex::new(0),
+            published: Mutex::new(Published {
+                seq: 0,
+                mirrored: None,
+            }),
         })
     }
 
@@ -274,7 +289,7 @@ impl CommandHandler for PageNavigate {
                     let nav = self.target_state(registry, tid);
                     let out = navigate_gated(&self.fetcher, &nav, url, &self.gate).await?;
                     // ターゲット表の更新と共有状態へのミラーを 1 つのロック内で行う。
-                    let mut last = self
+                    let mut published = self
                         .published
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
@@ -287,15 +302,18 @@ impl CommandHandler for PageNavigate {
                             match registry.set_target_url(tid, &c.url) {
                                 Ok(()) => {
                                     // 今回確定した結果だけを、完了順が新しい場合に限りミラーする。
-                                    if c.seq > *last
+                                    if c.seq > published.seq
                                         && let Some(r) = &c.result
                                         && let Ok(g) = app_nav.begin_navigation()
+                                        && app_nav
+                                            .commit_navigation(
+                                                g,
+                                                NavigationResult::new(r.url(), r.html()),
+                                            )
+                                            .is_ok()
                                     {
-                                        let _ = app_nav.commit_navigation(
-                                            g,
-                                            NavigationResult::new(r.url(), r.html()),
-                                        );
-                                        *last = c.seq;
+                                        published.seq = c.seq;
+                                        published.mirrored = Some((tid.clone(), g));
                                     }
                                 }
                                 Err(CdpStateError::UnknownTarget) => self.forget_target(tid),
@@ -304,14 +322,28 @@ impl CommandHandler for PageNavigate {
                         }
                     } else if let Some(g) = out.began
                         && nav.current_generation() == g
+                        && let Some((mid, mg)) = &published.mirrored
+                        && mid == tid
+                        && app_nav.current_generation() == *mg
                     {
-                        // 取得失敗でターゲットの直近結果は無効化済み。共有状態も同様に無効化し、
-                        // 直前に成功したページの HTML・URL を読めないようにする（`CDP-1`）。
+                        // 取得失敗でターゲットの直近結果は無効化済み。共有状態が当該ターゲット
+                        // 自身のミラーのままなら無効化し、直前に成功したページを読めなくする。
+                        // 別ターゲットやブラウザレベル遷移の結果が載っている間は消さない（`CDP-1`）。
                         let _ = app_nav.begin_navigation();
+                        published.mirrored = None;
                     }
                     out
                 }
-                None => navigate_gated(&self.fetcher, app_nav, url, &self.gate).await?,
+                None => {
+                    let out = navigate_gated(&self.fetcher, app_nav, url, &self.gate).await?;
+                    // 共有状態はもはやどのターゲットのミラーでもない。後続のターゲット失敗で
+                    // ブラウザレベル遷移の結果を消さないよう記録を外す（`CDP-1`）。
+                    self.published
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .mirrored = None;
+                    out
+                }
             };
             let mut result = json!({
                 "frameId": MAIN_FRAME_ID,
@@ -724,6 +756,75 @@ mod tests {
             let f = frames(d.dispatch(&st, &ng.to_string()).await);
             assert!(f[0]["result"]["errorText"].is_string());
             assert!(st.app_state().navigation().latest().is_none());
+        }
+
+        /// 閉じたポートの URL を返す。
+        fn dead_url() -> String {
+            let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = dead.local_addr().unwrap().port();
+            drop(dead);
+            format!("http://127.0.0.1:{p}/")
+        }
+
+        #[tokio::test]
+        async fn cdp1_page_navigate_failure_on_other_target_keeps_shared_state() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let ta = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let tb = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let sa = st.registry().attach(&ta).unwrap();
+            let sb = st.registry().attach(&tb).unwrap();
+            let d = allowed_dispatcher();
+            let ua = format!("http://127.0.0.1:{}/", serve("200 OK", "a-page"));
+            let ub = format!("http://127.0.0.1:{}/", serve("200 OK", "b-page"));
+            for (id, sid, u) in [(1, &sa, &ua), (2, &sb, &ub)] {
+                let req = json!({"id": id, "method": "Page.navigate",
+                    "sessionId": sid.as_str(), "params": {"url": u}});
+                d.dispatch(&st, &req.to_string()).await;
+            }
+            let ng = json!({"id": 3, "method": "Page.navigate",
+                "sessionId": sa.as_str(), "params": {"url": dead_url()}});
+            let f = frames(d.dispatch(&st, &ng.to_string()).await);
+            assert!(f[0]["result"]["errorText"].is_string());
+            let latest = st.app_state().navigation().latest().unwrap();
+            assert_eq!(latest.html(), "b-page");
+            assert_eq!(latest.url(), ub);
+            assert_eq!(st.registry().target(&tb).unwrap().url(), ub);
+            assert_eq!(st.registry().target(&ta).unwrap().url(), ua);
+        }
+
+        #[tokio::test]
+        async fn cdp1_page_navigate_target_failure_keeps_browser_level_result() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let ta = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let sa = st.registry().attach(&ta).unwrap();
+            let d = allowed_dispatcher();
+            let ua = format!("http://127.0.0.1:{}/", serve("200 OK", "a-page"));
+            let ub = format!("http://127.0.0.1:{}/", serve("200 OK", "browser-level"));
+            let ok = json!({"id": 1, "method": "Page.navigate",
+                "sessionId": sa.as_str(), "params": {"url": ua}});
+            d.dispatch(&st, &ok.to_string()).await;
+            let bl = json!({"id": 2, "method": "Page.navigate", "params": {"url": ub}});
+            d.dispatch(&st, &bl.to_string()).await;
+            let ng = json!({"id": 3, "method": "Page.navigate",
+                "sessionId": sa.as_str(), "params": {"url": dead_url()}});
+            let f = frames(d.dispatch(&st, &ng.to_string()).await);
+            assert!(f[0]["result"]["errorText"].is_string());
+            let latest = st.app_state().navigation().latest().unwrap();
+            assert_eq!(latest.html(), "browser-level");
+            assert_eq!(latest.url(), ub);
         }
 
         #[tokio::test]
