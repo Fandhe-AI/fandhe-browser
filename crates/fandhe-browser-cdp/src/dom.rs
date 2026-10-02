@@ -9,8 +9,11 @@
 //! # nodeId の採番（TASK-42.5 `DOM.querySelector` が依存する契約）
 //!
 //! core の `NodeId` は数値を取り出せないため、cdp 側で [`number_nodes`] が決定的に採番する。
-//! root を 1 とし、続いて `descendants(root)` の文書順に 1 ずつ増やす。同じ HTML なら
-//! 常に同じ番号になる。`backendNodeId` は `nodeId` と同値。
+//! root を `base + 1` とし、続いて `descendants(root)` の文書順に 1 ずつ増やす。`base` は
+//! [`IssuedDocuments`] が払い出しごとに単調増加で割り当て、文書（払い出し）をまたいで
+//! nodeId を再利用しない（旧文書の nodeId が新文書の別ノードに当たらない。`CDP-1`）。
+//! 同じ払い出し済み文書への再 `DOM.getDocument` は同じ `base` を再利用する。
+//! `backendNodeId` は `nodeId` と同値。
 //!
 //! # スタブについて（実装済みを装わない。`REPAIR-3`）
 //!
@@ -121,26 +124,28 @@ fn check_pierce(params: &Value) -> Result<(), CdpError> {
 }
 
 /// 文書順の採番結果。42.5 が nodeId から core の `NodeId` を解決するのに使う。
+/// nodeId は `base + 1` から始まる（`base` は払い出しごとの単調増加オフセット）。
 pub(crate) struct NodeNumbering {
+    base: i64,
     order: Vec<NodeId>,
     ids: HashMap<NodeId, i64>,
 }
 
 impl NodeNumbering {
-    /// core の `NodeId` に対応する CDP の nodeId（1 始まり）。
+    /// core の `NodeId` に対応する CDP の nodeId（`base + 1` 始まり）。
     pub(crate) fn node_id(&self, id: NodeId) -> Option<i64> {
         self.ids.get(&id).copied()
     }
 
     /// CDP の nodeId に対応する core の `NodeId`。
     pub(crate) fn resolve(&self, node_id: i64) -> Option<NodeId> {
-        let idx = usize::try_from(node_id.checked_sub(1)?).ok()?;
+        let idx = usize::try_from(node_id.checked_sub(self.base)?.checked_sub(1)?).ok()?;
         self.order.get(idx).copied()
     }
 }
 
-/// root から文書順に採番する（root = 1）。同じ文書なら常に同じ結果になる。
-pub(crate) fn number_nodes(doc: &Document) -> NodeNumbering {
+/// root から文書順に採番する（root = `base + 1`）。同じ文書・同じ `base` なら常に同じ結果になる。
+pub(crate) fn number_nodes(doc: &Document, base: i64) -> NodeNumbering {
     let root = doc.root();
     let mut order = Vec::with_capacity(doc.node_count());
     order.push(root);
@@ -148,9 +153,12 @@ pub(crate) fn number_nodes(doc: &Document) -> NodeNumbering {
     let ids = order
         .iter()
         .enumerate()
-        .map(|(i, id)| (*id, i64::try_from(i + 1).unwrap_or(i64::MAX)))
+        .map(|(i, id)| {
+            let off = i64::try_from(i + 1).unwrap_or(i64::MAX);
+            (*id, base.saturating_add(off))
+        })
         .collect();
-    NodeNumbering { order, ids }
+    NodeNumbering { base, order, ids }
 }
 
 /// 修飾名（prefix があれば `prefix:local`）。
@@ -244,15 +252,17 @@ fn has_base_href(doc: &Document) -> bool {
 
 /// `doc` を `DOM.Node`（root）の JSON へ変換する。明示スタックで反復的に構築し、
 /// 要求深さに達したノードは `childNodeCount` のみにし、サーバー上限超過は `DOCUMENT_TOO_LARGE`。
+/// nodeId は `base + 1` から採番する（[`number_nodes`]）。
 pub(crate) fn build_document_node(
     doc: &Document,
     document_url: &str,
     depth: Depth,
+    base: i64,
 ) -> Result<Value, CdpError> {
     if doc.node_count() > MAX_NUMBERED_NODES {
         return Err(CdpError::DOCUMENT_TOO_LARGE);
     }
-    let numbering = number_nodes(doc);
+    let numbering = number_nodes(doc, base);
     let limit = depth.limit;
     let root = doc.root();
     // <base href> は未解決のため、存在する文書では誤った baseURL を返さず省略する（REPAIR-3）。
@@ -369,58 +379,104 @@ fn load_document(
 /// attach していても、`DOM.getDocument` を呼んだセッションの nodeId だけが有効になる。
 /// ブラウザレベル（`None`）は WebSocket 接続の識別子がハンドラへ渡らないため接続間で共有される
 /// 既知の制約（接続単位の分離は `CDP-2`・TASK-43 で接続コンテキストを導入して対応）。
-/// 値は払い出し時点の確定文書で、
+/// 値は払い出し時点の確定文書と nodeId の `base`（[`number_nodes`]）で、
 /// `Arc` を保持するためアドレスが再利用されず `Arc::ptr_eq` で同一文書を判定できる。
 /// 遷移が確定すると新しい `Arc` に置き換わり、旧 nodeId は無効になる。保持件数は
 /// 生存セッション数 + 1 以下（detach・ターゲット閉鎖で消えたセッションは記録時に破棄。`SEC-2`）。
+///
+/// `base` は全セッション共通の単調増加カウンタから払い出し、一度割り当てた範囲を
+/// 再利用しない。これにより、遷移後に再度 `DOM.getDocument` しても旧文書の nodeId は
+/// 新文書のどのノードにも解決されず、別セッションの nodeId とも重ならない（`CDP-1`）。
+/// 同じ払い出し済み文書に対する再 `DOM.getDocument` は既存の `base` を再利用する。
 ///
 /// 記録は文書（世代）単位で、ノード単位では持たない。払い出し済み文書に対しては、
 /// `DOM.getDocument` が（深さ制限で）返していない範囲の nodeId も `number_nodes` の
 /// 採番内なら検索起点として受理する（採番が決定的で、同じ文書をセレクタで辿れる範囲を
 /// 超える情報は得られないため。Chrome の「要求済みノードのみ有効」とは差異。`CDP-1`）。
+/// 一度も払い出していない範囲の nodeId は `NODE_NOT_FOUND`。
 pub(crate) struct IssuedDocuments {
-    inner: Mutex<HashMap<Option<SessionId>, Arc<NavigationResult>>>,
+    inner: Mutex<IssuedState>,
+}
+
+struct IssuedState {
+    docs: HashMap<Option<SessionId>, (Arc<NavigationResult>, i64)>,
+    /// 次に割り当てる `base`（これまでに予約した nodeId 範囲の末尾）。
+    next_base: i64,
 }
 
 impl IssuedDocuments {
     pub(crate) fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(IssuedState {
+                docs: HashMap::new(),
+                next_base: 0,
+            }),
         }
     }
 
-    /// `doc` を払い出し済みとして記録する（旧記録は置き換え）。
+    /// `doc` に使う nodeId の `base` を返す。同じ文書が払い出し済みならその `base` を再利用し、
+    /// そうでなければ `node_count` 個分の範囲を新規予約する（予約した範囲は記録に失敗しても
+    /// 再利用しない）。カウンタがあふれる場合は `SERVER_ERROR`（`SEC-2`）。
+    fn base_for(
+        &self,
+        session: Option<&SessionId>,
+        doc: &Arc<NavigationResult>,
+        node_count: usize,
+    ) -> Result<i64, CdpError> {
+        let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((issued, base)) = st.docs.get(&session.cloned())
+            && Arc::ptr_eq(issued, doc)
+        {
+            return Ok(*base);
+        }
+        let base = st.next_base;
+        let span = i64::try_from(node_count).map_err(|_| CdpError::SERVER_ERROR)?;
+        st.next_base = base.checked_add(span).ok_or(CdpError::SERVER_ERROR)?;
+        Ok(base)
+    }
+
+    /// `doc`（nodeId の `base`）を払い出し済みとして記録する（旧記録は置き換え）。
     ///
     /// 並行する古い `DOM.getDocument` が遅れて完了しても新しい文書の記録を上書きしないよう、
     /// 記録用ロックを保持したまま `latest` で最新の確定文書を再取得し、`doc` と同一のときだけ
-    /// 記録する（古い文書は記録しない）。戻り値は記録したか。
+    /// 記録する（古い文書は記録しない）。同じ文書が別の `base` で記録済みの場合（並行する
+    /// 同一文書の getDocument）は既存を維持して `false` を返し、呼び出し側が既存 `base` で
+    /// 作り直す。戻り値は `base` が有効な記録として確定したか。
     fn record(
         &self,
         registry: &crate::target::TargetRegistry,
         session: Option<&SessionId>,
         doc: &Arc<NavigationResult>,
+        base: i64,
         latest: impl FnOnce() -> Option<Arc<NavigationResult>>,
     ) -> bool {
-        let mut m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        m.retain(|k, _| {
+        let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        st.docs.retain(|k, _| {
             k.as_ref()
                 .is_none_or(|s| registry.session_target(s).is_some())
         });
         if !latest().is_some_and(|l| Arc::ptr_eq(&l, doc)) {
             return false;
         }
-        if session.is_none_or(|s| registry.session_target(s).is_some()) {
-            m.insert(session.cloned(), Arc::clone(doc));
-            return true;
+        if !session.is_none_or(|s| registry.session_target(s).is_some()) {
+            return false;
         }
-        false
+        if let Some((issued, existing)) = st.docs.get(&session.cloned())
+            && Arc::ptr_eq(issued, doc)
+        {
+            return *existing == base;
+        }
+        st.docs.insert(session.cloned(), (Arc::clone(doc), base));
+        true
     }
 
-    /// `doc` が現在の払い出し済み文書と同一か。
-    fn is_current(&self, session: Option<&SessionId>, doc: &Arc<NavigationResult>) -> bool {
-        let m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        m.get(&session.cloned())
-            .is_some_and(|issued| Arc::ptr_eq(issued, doc))
+    /// `doc` が現在の払い出し済み文書と同一ならその nodeId の `base`。
+    fn issued_base(&self, session: Option<&SessionId>, doc: &Arc<NavigationResult>) -> Option<i64> {
+        let st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        st.docs
+            .get(&session.cloned())
+            .filter(|(issued, _)| Arc::ptr_eq(issued, doc))
+            .map(|(_, base)| *base)
     }
 }
 
@@ -440,12 +496,17 @@ fn parse_query_params(params: &Value) -> Result<(i64, &str), CdpError> {
 /// `nodeId` 配下でセレクタに最初に一致する要素の nodeId を返す。一致なしは `0`（`CDP-5`）。
 ///
 /// 構文不正・未対応構文・処理量超過は 0 にせずエラーにする（一致なしを装わない。`REPAIR-3`・`SEC-2`）。
-/// 採番は [`number_nodes`] で `DOM.getDocument` と同一。
-fn query_selector_node_id(doc: &Document, node_id: i64, selector: &str) -> Result<i64, CdpError> {
+/// 採番は [`number_nodes`] で `DOM.getDocument` と同一（払い出し時の `base` を渡す）。
+fn query_selector_node_id(
+    doc: &Document,
+    base: i64,
+    node_id: i64,
+    selector: &str,
+) -> Result<i64, CdpError> {
     if doc.node_count() > MAX_NUMBERED_NODES {
         return Err(CdpError::DOCUMENT_TOO_LARGE);
     }
-    let numbering = number_nodes(doc);
+    let numbering = number_nodes(doc, base);
     let scope = numbering.resolve(node_id).ok_or(CdpError::NODE_NOT_FOUND)?;
     match query_selector_str(doc, scope, selector) {
         Ok(Some(found)) => numbering.node_id(found).ok_or(CdpError::SERVER_ERROR),
@@ -476,14 +537,16 @@ impl CommandHandler for DomQuerySelector {
             let (latest, parsed) = load_document(&ctx, target.as_ref())?;
             // nodeId は getDocument が払い出した文書でのみ有効。未取得・遷移後は解決しない（`CDP-1`）。
             // 払い出し記録は要求元セッション単位（別セッションの getDocument では有効にならない）。
-            if !ctx.state.dom_issued().is_current(ctx.session_id, &latest) {
+            let Some(base) = ctx.state.dom_issued().issued_base(ctx.session_id, &latest) else {
                 return Err(CdpError::NODE_NOT_FOUND);
-            }
-            let found = query_selector_node_id(&parsed.document, node_id, selector)?;
+            };
+            let found = query_selector_node_id(&parsed.document, base, node_id, selector)?;
             // 検索中に遷移が確定した場合は旧文書の結果を返さない（`CDP-1`）。
             let still_latest =
                 current_latest(&ctx, target.as_ref()).is_ok_and(|l| Arc::ptr_eq(&l, &latest));
-            if !still_latest || !ctx.state.dom_issued().is_current(ctx.session_id, &latest) {
+            if !still_latest
+                || ctx.state.dom_issued().issued_base(ctx.session_id, &latest) != Some(base)
+            {
                 return Err(CdpError::NODE_NOT_FOUND);
             }
             Ok(HandlerOutput::result(json!({ "nodeId": found })))
@@ -525,13 +588,19 @@ impl CommandHandler for DomGetDocument {
             check_pierce(params)?;
             let root = build_recorded_root(|| {
                 let (latest, parsed) = load_document(&ctx, target.as_ref())?;
-                let root = build_document_node(&parsed.document, latest.url(), depth)?;
+                let base = ctx.state.dom_issued().base_for(
+                    ctx.session_id,
+                    &latest,
+                    parsed.document.node_count(),
+                )?;
+                let root = build_document_node(&parsed.document, latest.url(), depth, base)?;
                 // 構築中に遷移・並行 getDocument で最新でなくなった文書は記録しない（新世代の
                 // 記録を古い `Arc` で上書きしない）。記録できたかを呼び出し側へ返す。
                 let recorded = ctx.state.dom_issued().record(
                     ctx.state.registry(),
                     ctx.session_id,
                     &latest,
+                    base,
                     || current_latest(&ctx, target.as_ref()).ok(),
                 );
                 Ok((root, recorded))
@@ -555,7 +624,8 @@ mod tests {
 
     #[test]
     fn cdp1_get_document_default_depth_one() {
-        let v = build_document_node(&doc(PAGE), "https://example.com/", Depth::exact(1)).unwrap();
+        let v =
+            build_document_node(&doc(PAGE), "https://example.com/", Depth::exact(1), 0).unwrap();
         let expected = json!({
             "nodeId": 1, "backendNodeId": 1, "nodeType": 9, "nodeName": "#document",
             "localName": "", "nodeValue": "", "documentURL": "https://example.com/",
@@ -573,7 +643,7 @@ mod tests {
 
     #[test]
     fn cdp1_get_document_depth_unlimited() {
-        let v = build_document_node(&doc(PAGE), "u", Depth::unlimited()).unwrap();
+        let v = build_document_node(&doc(PAGE), "u", Depth::unlimited(), 0).unwrap();
         let body = &v["children"][1]["children"][1];
         assert_eq!(body["nodeName"], "BODY");
         let h1 = &body["children"][0];
@@ -588,7 +658,7 @@ mod tests {
 
     #[test]
     fn cdp1_get_document_depth_zero_returns_root_only() {
-        let v = build_document_node(&doc(PAGE), "u", Depth::exact(0)).unwrap();
+        let v = build_document_node(&doc(PAGE), "u", Depth::exact(0), 0).unwrap();
         assert_eq!(v["childNodeCount"], 2);
         assert!(v.get("children").is_none());
     }
@@ -596,7 +666,7 @@ mod tests {
     #[test]
     fn cdp1_get_document_comment_and_svg_namespace() {
         let d = doc("<body><!--c--><svg viewBox=\"0 0 1 1\"></svg></body>");
-        let v = build_document_node(&d, "u", Depth::unlimited()).unwrap();
+        let v = build_document_node(&d, "u", Depth::unlimited(), 0).unwrap();
         let body = &v["children"][0]["children"][1];
         assert_eq!(body["children"][0]["nodeName"], "#comment");
         assert_eq!(body["children"][0]["nodeValue"], "c");
@@ -611,11 +681,11 @@ mod tests {
         let html = format!("{}{}", "<div>".repeat(n), "</div>".repeat(n));
         let d = doc(&html);
         assert_eq!(
-            build_document_node(&d, "u", Depth::unlimited()),
+            build_document_node(&d, "u", Depth::unlimited(), 0),
             Err(CdpError::DOCUMENT_TOO_LARGE)
         );
         // 要求深さが上限以内なら同じ文書でも成功する。
-        let v = build_document_node(&d, "u", Depth::exact(3)).unwrap();
+        let v = build_document_node(&d, "u", Depth::exact(3), 0).unwrap();
         assert_eq!(v["children"][0]["children"][1]["childNodeCount"], 1);
     }
 
@@ -625,11 +695,11 @@ mod tests {
         let html = format!("<body>{}</body>", "<i></i>".repeat(n));
         let d = doc(&html);
         assert_eq!(
-            build_document_node(&d, "u", Depth::unlimited()),
+            build_document_node(&d, "u", Depth::unlimited(), 0),
             Err(CdpError::DOCUMENT_TOO_LARGE)
         );
         // 要求深さで body の手前までなら成功し、childNodeCount が正しい。
-        let v = build_document_node(&d, "u", Depth::exact(2)).unwrap();
+        let v = build_document_node(&d, "u", Depth::exact(2), 0).unwrap();
         let body = &v["children"][0]["children"][1];
         assert_eq!(body["childNodeCount"], n);
         assert!(body.get("children").is_none());
@@ -638,11 +708,11 @@ mod tests {
     #[test]
     fn cdp1_get_document_base_url_omitted_with_base_href() {
         let with = doc("<head><base href=\"/x/\"></head><body></body>");
-        let v = build_document_node(&with, "https://e.com/a", Depth::exact(0)).unwrap();
+        let v = build_document_node(&with, "https://e.com/a", Depth::exact(0), 0).unwrap();
         assert_eq!(v["documentURL"], "https://e.com/a");
         assert!(v.get("baseURL").is_none());
         let without = doc(PAGE);
-        let v = build_document_node(&without, "https://e.com/a", Depth::exact(0)).unwrap();
+        let v = build_document_node(&without, "https://e.com/a", Depth::exact(0), 0).unwrap();
         assert_eq!(v["baseURL"], "https://e.com/a");
     }
 
@@ -652,7 +722,7 @@ mod tests {
         let html = format!("<body>{}</body>", "<i></i>".repeat(n));
         let d = doc(&html);
         assert_eq!(
-            build_document_node(&d, "u", Depth::exact(1)),
+            build_document_node(&d, "u", Depth::exact(1), 0),
             Err(CdpError::DOCUMENT_TOO_LARGE)
         );
     }
@@ -703,7 +773,7 @@ mod tests {
     }
 
     fn qs(node_id: i64, selector: &str) -> Result<i64, CdpError> {
-        query_selector_node_id(&doc(PAGE), node_id, selector)
+        query_selector_node_id(&doc(PAGE), 0, node_id, selector)
     }
 
     #[test]
@@ -716,11 +786,11 @@ mod tests {
     #[test]
     fn cdp1_query_selector_node_id_matches_get_document() {
         let d = doc(PAGE);
-        let tree = build_document_node(&d, "u", Depth::unlimited()).unwrap();
+        let tree = build_document_node(&d, "u", Depth::unlimited(), 0).unwrap();
         let h1 = &tree["children"][1]["children"][1]["children"][0];
         assert_eq!(h1["nodeName"], "H1");
         assert_eq!(
-            query_selector_node_id(&d, 1, "h1"),
+            query_selector_node_id(&d, 0, 1, "h1"),
             Ok(h1["nodeId"].as_i64().unwrap())
         );
     }
@@ -792,8 +862,8 @@ mod tests {
 
     #[test]
     fn cdp1_numbering_is_deterministic() {
-        let a = number_nodes(&doc(PAGE));
-        let b = number_nodes(&doc(PAGE));
+        let a = number_nodes(&doc(PAGE), 0);
+        let b = number_nodes(&doc(PAGE), 0);
         assert_eq!(a.order.len(), b.order.len());
         for i in 1..=a.order.len() as i64 {
             assert_eq!(a.resolve(i).and_then(|n| a.node_id(n)), Some(i));
@@ -828,14 +898,48 @@ mod tests {
         let old = Arc::new(NavigationResult::new("https://example.com/", "<p>old</p>"));
         let new = Arc::new(NavigationResult::new("https://example.com/", "<p>new</p>"));
         let issued = IssuedDocuments::new();
+        let nb = issued.base_for(None, &new, 10).unwrap();
+        let ob = issued.base_for(None, &old, 10).unwrap();
         // 最新は new。new を記録できる。
-        assert!(issued.record(&registry, None, &new, || Some(Arc::clone(&new))));
+        assert!(issued.record(&registry, None, &new, nb, || Some(Arc::clone(&new))));
         // 遅れて完了した old は最新でないため記録されず、new が有効なまま残る。
-        assert!(!issued.record(&registry, None, &old, || Some(Arc::clone(&new))));
-        assert!(issued.is_current(None, &new));
-        assert!(!issued.is_current(None, &old));
+        assert!(!issued.record(&registry, None, &old, ob, || Some(Arc::clone(&new))));
+        assert_eq!(issued.issued_base(None, &new), Some(nb));
+        assert_eq!(issued.issued_base(None, &old), None);
         // 最新を取得できない場合も記録しない。
-        assert!(!issued.record(&registry, None, &old, || None));
+        assert!(!issued.record(&registry, None, &old, ob, || None));
+    }
+
+    /// nodeId の範囲は文書をまたいで再利用せず、同一文書の再払い出しは同じ範囲（`CDP-1`）。
+    #[test]
+    fn cdp1_issued_base_is_monotonic_and_reused_per_document() {
+        let registry = crate::target::TargetRegistry::new();
+        let a = Arc::new(NavigationResult::new("https://example.com/", "<p>a</p>"));
+        let b = Arc::new(NavigationResult::new("https://example.com/", "<p>a</p>"));
+        let issued = IssuedDocuments::new();
+        let ba = issued.base_for(None, &a, 10).unwrap();
+        assert_eq!(ba, 0);
+        assert!(issued.record(&registry, None, &a, ba, || Some(Arc::clone(&a))));
+        // 同一文書の再払い出しは既存の base を再利用する。
+        assert_eq!(issued.base_for(None, &a, 10).unwrap(), 0);
+        // 別文書（同一 HTML でも別 Arc）は重ならない範囲を得る。
+        let bb = issued.base_for(None, &b, 10).unwrap();
+        assert_eq!(bb, 10);
+        assert!(issued.record(&registry, None, &b, bb, || Some(Arc::clone(&b))));
+        assert_eq!(issued.issued_base(None, &a), None);
+        assert_eq!(issued.issued_base(None, &b), Some(10));
+        // 旧範囲の nodeId は新文書の採番に含まれない。
+        let n = number_nodes(&doc(PAGE), 10);
+        assert_eq!(n.resolve(1), None);
+        assert_eq!(n.resolve(10), None);
+        assert!(n.resolve(11).is_some());
+        // 同一文書が別 base で記録済みなら並行記録は確定させない。
+        assert!(!issued.record(&registry, None, &b, 99, || Some(Arc::clone(&b))));
+        // カウンタのあふれは明示エラー。
+        assert_eq!(
+            issued.base_for(None, &a, usize::MAX),
+            Err(CdpError::SERVER_ERROR)
+        );
     }
 
     // CdpState は AppState（Profile::open）が必要で、非 unix では構築手段が無い
@@ -1179,8 +1283,14 @@ mod tests {
             let stale = call(&st, &q).await;
             assert_eq!(stale["error"]["message"], "node not found");
             assert!(stale.get("result").is_none());
-            call(&st, gd).await;
-            assert_eq!(call(&st, &q).await["result"]["nodeId"], 6);
+            // 再取得後の nodeId は旧文書の範囲と重ならない（旧 nodeId 1 は新文書でも無効）。
+            let root = call(&st, gd).await["result"]["root"]["nodeId"]
+                .as_i64()
+                .unwrap();
+            assert_eq!(root, 8);
+            assert_eq!(call(&st, &q).await["error"]["message"], "node not found");
+            let q2 = qs_text(14, None, r#"{"nodeId":8,"selector":"h1"}"#);
+            assert_eq!(call(&st, &q2).await["result"]["nodeId"], 13);
         }
 
         /// ターゲット別の記録は互いに独立（`CDP-1`）。
@@ -1214,8 +1324,14 @@ mod tests {
             let q_b = qs_text(13, Some(&sid_b), r#"{"nodeId":1,"selector":"h1"}"#);
             let v = call(&st, &q_b).await;
             assert_eq!(v["error"]["message"], "node not found");
-            call(&st, &get_doc_text(&sid_b, "{}")).await;
-            assert_eq!(call(&st, &q_b).await["result"]["nodeId"], 6);
+            let root_b = call(&st, &get_doc_text(&sid_b, "{}")).await["result"]["root"]["nodeId"]
+                .as_i64()
+                .unwrap();
+            // 別セッションの払い出しは重ならない範囲になり、q_a の nodeId は q_b では解決しない。
+            assert_eq!(root_b, 8);
+            assert_eq!(call(&st, &q_b).await["error"]["message"], "node not found");
+            let q_b2 = qs_text(15, Some(&sid_b), r#"{"nodeId":8,"selector":"h1"}"#);
+            assert_eq!(call(&st, &q_b2).await["result"]["nodeId"], 13);
         }
     }
 }
