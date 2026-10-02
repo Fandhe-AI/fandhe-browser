@@ -443,7 +443,7 @@ mod tests {
     }
 
     /// JS-2（TASK-30.3・#161・TASK-32.2・#166）: `js-boa` 構成で boa が選ばれる
-    /// （評価はしない。設定経由の評価確認は TASK-32.3・#167）。
+    /// （評価はしない。設定経由の評価確認は `tests/js_stub_boa.rs`。TASK-32.3・#167）。
     #[cfg(all(feature = "js-boa", not(target_os = "macos")))]
     #[test]
     fn js_2_from_config_selects_boa() {

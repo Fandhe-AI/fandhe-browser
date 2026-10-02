@@ -61,6 +61,10 @@
 //! 含み、`check_*` が実際にスクリプト評価まで到達する（boa も TASK-32.2・
 //! Issue #166 で同様）。
 //!
+//! 両エンジン同梱構成（`js-v8` + `js-boa`）では、上記に加えて
+//! `js_1_conformance_runs_against_both_engines_when_both_bundled` が、V8・boa の
+//! 双方が実際に検査されたことを具体値で固定する（TASK-32.3・Issue #167）。
+//!
 //! ## `harness = false` の理由（TASK-29.6.2・Issue #548）
 //!
 //! V8 版は子プロセス（このテストバイナリ自身の自己再実行）で評価するため、
@@ -218,11 +222,11 @@ mod conformance_checks {
     /// この値を検証し、「ループが 0 回だったので何も検査していない」ことを
     /// 暗黙のまま素通りさせない。
     #[derive(Debug, PartialEq, Eq)]
-    struct ConformanceRunSummary {
+    pub(super) struct ConformanceRunSummary {
         /// `create_engine` が `Ok` を返し、`check` を実際に呼び出した件数。
-        checked: usize,
+        pub(super) checked: usize,
         /// `CreateEngineError::NotYetImplemented` 契約確認で終わった件数。
-        not_yet_implemented: usize,
+        pub(super) not_yet_implemented: usize,
     }
 
     /// [`bundled_engines`] が返す各エンジン種別に対して `check` を実行する
@@ -523,28 +527,67 @@ mod conformance_checks {
 
     /// JS-1: スクリプト評価が、同梱された各エンジンで同じ形状の結果を返すこと
     /// （TASK-28.4・Issue #150）。`js-v8`/`js-boa` のいずれかが有効な構成
-    /// でのみ存在し、[`IMPLEMENTED_ENGINES`] に含まれる種別（現状は V8）に
+    /// でのみ存在し、[`IMPLEMENTED_ENGINES`] に含まれる種別（V8、および macOS 以外では boa）に
     /// 対して `check_script_evaluation` を実際に呼び出す
     /// （モジュールドキュメント参照）。
-    pub(super) fn js_1_conformance_script_evaluation_for_each_bundled_engine() {
+    pub(super) fn js_1_conformance_script_evaluation_for_each_bundled_engine()
+    -> ConformanceRunSummary {
         let summary = run_for_each_bundled_engine(check_script_evaluation);
         assert_conformance_summary_matches_current_contract(&summary);
+        summary
     }
 
     /// JS-1: グローバル関数注入が、同梱された各エンジンで同じ形状で動作すること
     /// （TASK-28.4・Issue #150）。`js-v8`/`js-boa` のいずれかが有効な構成
     /// でのみ存在する（モジュールドキュメント参照）。
-    pub(super) fn js_1_conformance_global_function_injection_for_each_bundled_engine() {
+    pub(super) fn js_1_conformance_global_function_injection_for_each_bundled_engine()
+    -> ConformanceRunSummary {
         let summary = run_for_each_bundled_engine(check_global_function_injection);
         assert_conformance_summary_matches_current_contract(&summary);
+        summary
     }
 
     /// JS-1: DOM 風オブジェクトへのバインディングが、同梱された各エンジンで
     /// 同じ形状で動作すること（TASK-28.4・Issue #150）。`js-v8`/`js-boa` の
     /// いずれかが有効な構成でのみ存在する（モジュールドキュメント参照）。
-    pub(super) fn js_1_conformance_dom_like_binding_for_each_bundled_engine() {
+    pub(super) fn js_1_conformance_dom_like_binding_for_each_bundled_engine()
+    -> ConformanceRunSummary {
         let summary = run_for_each_bundled_engine(check_dom_like_binding);
         assert_conformance_summary_matches_current_contract(&summary);
+        summary
+    }
+
+    /// JS-1: 両エンジン同梱構成（`js-v8` + `js-boa`）で、共通テストが V8・boa の
+    /// 双方に対して実際に実行されたことを具体値で固定する（TASK-32.3・Issue #167）。
+    ///
+    /// 期待件数を [`IMPLEMENTED_ENGINES`] から導出せず `cfg(target_os)` 別の定数で
+    /// 書くのは、片方の配線が外れ `IMPLEMENTED_ENGINES` も同時に外された場合に
+    /// 動的導出のアサーションが素通りするのを防ぐため。macOS の boa は確保時に効く
+    /// メモリ上限を強制できず fail-closed で無効（`NotYetImplemented`）になる。
+    /// 引数は直前に実行済みの 3 ケースの戻り値で、`check_*` を二重実行しない。
+    #[cfg(all(feature = "js-v8", feature = "js-boa"))]
+    pub(super) fn js_1_conformance_runs_against_both_engines_when_both_bundled(
+        summaries: &[(&str, ConformanceRunSummary)],
+    ) {
+        assert_eq!(
+            bundled_engines(),
+            &[EngineKind::V8, EngineKind::Boa],
+            "both-engine build must bundle V8 then boa (spec default priority order)"
+        );
+        #[cfg(not(target_os = "macos"))]
+        let expected = ConformanceRunSummary {
+            checked: 2,
+            not_yet_implemented: 0,
+        };
+        #[cfg(target_os = "macos")]
+        let expected = ConformanceRunSummary {
+            checked: 1,
+            not_yet_implemented: 1,
+        };
+        assert_eq!(summaries.len(), 3, "script/function/dom summaries expected");
+        for (name, summary) in summaries {
+            assert_eq!(summary, &expected, "{name}: engines actually checked");
+        }
     }
 }
 
@@ -562,11 +605,23 @@ fn main() -> std::process::ExitCode {
         eprintln!("case: js_1_create_engine_contract_for_bundled_engines");
         js_1_create_engine_contract_for_bundled_engines();
         eprintln!("case: js_1_conformance_script_evaluation_for_each_bundled_engine");
-        conformance_checks::js_1_conformance_script_evaluation_for_each_bundled_engine();
+        let _script =
+            conformance_checks::js_1_conformance_script_evaluation_for_each_bundled_engine();
         eprintln!("case: js_1_conformance_global_function_injection_for_each_bundled_engine");
-        conformance_checks::js_1_conformance_global_function_injection_for_each_bundled_engine();
+        let _function =
+            conformance_checks::js_1_conformance_global_function_injection_for_each_bundled_engine(
+            );
         eprintln!("case: js_1_conformance_dom_like_binding_for_each_bundled_engine");
-        conformance_checks::js_1_conformance_dom_like_binding_for_each_bundled_engine();
+        let _dom = conformance_checks::js_1_conformance_dom_like_binding_for_each_bundled_engine();
+        #[cfg(all(feature = "js-v8", feature = "js-boa"))]
+        {
+            eprintln!("case: js_1_conformance_runs_against_both_engines_when_both_bundled");
+            conformance_checks::js_1_conformance_runs_against_both_engines_when_both_bundled(&[
+                ("script_evaluation", _script),
+                ("global_function_injection", _function),
+                ("dom_like_binding", _dom),
+            ]);
+        }
     }
     #[cfg(not(any(feature = "js-v8", feature = "js-boa")))]
     {
