@@ -298,12 +298,16 @@ impl CommandHandler for PageNavigate {
                         self.forget_target(tid);
                     } else if let Some(c) = &out.committed {
                         // 後続の遷移に追い越されていない場合に限り、確定 URL を反映する（`CDP-1`）。
-                        if nav.current_generation() == c.generation {
+                        // 確定直後に別遷移が始まって結果を保持できなかった（`result` が `None`）場合は
+                        // 追い越されたものとして扱い、URL もミラーも公開しない。URL だけ公開して
+                        // 共有状態との食い違いを作らないため。
+                        if nav.current_generation() == c.generation
+                            && let Some(r) = &c.result
+                        {
                             match registry.set_target_url(tid, &c.url) {
                                 Ok(()) => {
                                     // 今回確定した結果だけを、完了順が新しい場合に限りミラーする。
                                     if c.seq > published.seq
-                                        && let Some(r) = &c.result
                                         && let Ok(g) = app_nav.begin_navigation()
                                         && app_nav
                                             .commit_navigation(
@@ -336,12 +340,29 @@ impl CommandHandler for PageNavigate {
                 }
                 None => {
                     let out = navigate_gated(&self.fetcher, app_nav, url, &self.gate).await?;
-                    // 共有状態はもはやどのターゲットのミラーでもない。後続のターゲット失敗で
-                    // ブラウザレベル遷移の結果を消さないよう記録を外す（`CDP-1`）。
-                    self.published
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .mirrored = None;
+                    // ブラウザレベル遷移も確定順（`seq`）の管理に含める。実際に確定し、かつ公開済みより
+                    // 新しい場合に限り、共有状態をどのターゲットのミラーでもないものとして記録する。
+                    // 失敗・中断・より新しい確定が公開済みの場合は記録を変えない（`CDP-1`）。
+                    if let Some(c) = &out.committed {
+                        let mut published = self
+                            .published
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        if c.seq > published.seq {
+                            published.seq = c.seq;
+                            let prev = published.mirrored.take();
+                            // 今回の確定より古いターゲット結果が共有状態へ載ったままなら、今回の
+                            // 確定結果で戻す。別の進行中遷移を巻き込まないよう、載っているのが
+                            // そのミラー自身（世代一致）の場合に限る。
+                            if prev.is_some_and(|(_, mg)| app_nav.current_generation() == mg)
+                                && let Some(r) = &c.result
+                                && let Ok(g) = app_nav.begin_navigation()
+                            {
+                                let _ = app_nav
+                                    .commit_navigation(g, NavigationResult::new(r.url(), r.html()));
+                            }
+                        }
+                    }
                     out
                 }
             };
