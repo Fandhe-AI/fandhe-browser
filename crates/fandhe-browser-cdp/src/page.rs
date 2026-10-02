@@ -369,6 +369,8 @@ impl CommandHandler for PageNavigate {
             let app_nav = ctx.state.app_state().navigation();
             // 遷移が確定し結果が公開された場合のみ `Some(確定 URL)`。イベント送出の根拠になる。
             let mut navigated: Option<String> = None;
+            // ターゲット遷移の送出直前の世代再確認用（遷移状態と確定時の世代）。
+            let mut recheck: Option<(Arc<NavigationState>, NavigationGeneration)> = None;
             let out = match &target_id {
                 Some(tid) => {
                     let registry = ctx.state.registry();
@@ -413,6 +415,7 @@ impl CommandHandler for PageNavigate {
                             match registry.set_target_url(tid, &c.url) {
                                 Ok(()) => {
                                     navigated = Some(c.url.clone());
+                                    recheck = Some((Arc::clone(&nav), c.generation));
                                     // 今回確定した結果だけを、完了順が新しい場合に限りミラーする。
                                     // ブラウザレベル遷移の進行中などでミラーを見送る場合も、確定順
                                     // （`seq`）は記録する。記録しないと、見送った新しい確定（B）より
@@ -489,20 +492,19 @@ impl CommandHandler for PageNavigate {
                             .published
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner);
+                        // イベント送出の可否は `seq` ではなく共有状態の世代で決める。`seq` は
+                        // `app_nav` を置き換えないターゲット遷移のコミットでも進むため、`seq` で
+                        // 判定すると並行するセッションスコープの遷移が大きい `seq` を記録しただけで、
+                        // 現在の遷移（世代一致・結果保持）のイベントが落ちて待機中のクライアントが
+                        // 止まる。追い越された遷移（世代不一致）は `gate` を保持して確認し、送出しない。
+                        {
+                            let _gate = lock_gate(&self.gate);
+                            if app_nav.current_generation() == c.generation && c.result.is_some() {
+                                navigated = Some(c.url.clone());
+                            }
+                        }
                         if c.seq > published.seq {
                             published.seq = c.seq;
-                            // イベント送出は、より新しい確定が公開済みでなく（上の `seq` 判定）、確定後に
-                            // 別遷移へ追い越されていない（世代一致・結果保持）場合に限る。追い越された
-                            // 遷移の `frameNavigated` が新しい遷移のイベントの後に届かないようにする。
-                            // 世代確認は共有状態を書き換える前に行い、`gate` で後続遷移の開始と排他にする。
-                            {
-                                let _gate = lock_gate(&self.gate);
-                                if app_nav.current_generation() == c.generation
-                                    && c.result.is_some()
-                                {
-                                    navigated = Some(c.url.clone());
-                                }
-                            }
                             // 共有状態に古いターゲットのミラーが載ったままなら、今回の確定結果で
                             // 戻す。別の進行中遷移を巻き込まないよう、載っているのがそのミラー
                             // 自身（世代一致）の場合に限る。確定結果を戻せなかった（`result` が
@@ -534,7 +536,16 @@ impl CommandHandler for PageNavigate {
                 obj.insert("errorText".into(), json!(text));
             }
             let mut output = HandlerOutput::result(result);
-            if let Some(url) = navigated {
+            // 公開処理の後に別の `Page.navigate` が同一ターゲットで確定していないかを、送出の
+            // 直前に `gate` を保持して再確認する（`CDP-1`）。追い越された遷移のイベントを出さない。
+            // 応答フレームの組み立て後〜ソケット書き込みの区間は、イベントが要求元の応答に同梱される
+            // 設計上このハンドラでは直列化できない（セッション単位の配送順は TASK-43・`CDP-2` で扱う）。
+            if let Some(url) = navigated
+                && recheck.as_ref().is_none_or(|(n, g)| {
+                    let _gate = lock_gate(&self.gate);
+                    n.current_generation() == *g
+                })
+            {
                 for ev in navigation_events(&out.loader_id, &url, monotonic_seconds()) {
                     output = output.with_event(ev);
                 }
@@ -1257,10 +1268,11 @@ mod tests {
             assert!(st.app_state().navigation().latest().is_none());
         }
 
-        /// より新しい確定が公開済みの場合、ブラウザレベル遷移は追い越されたものとして
-        /// イベントを送出しない（TASK-42.3・`CDP-1`）。応答自体は返る。
+        /// ターゲットレベルのコミットで `seq` だけが進んでいても、共有状態の世代が一致する
+        /// ブラウザレベル遷移はイベントを送出する（待機中のクライアントを止めない。
+        /// TASK-42.3・`CDP-1`）。
         #[tokio::test]
-        async fn cdp1_page_navigate_browser_level_overtaken_emits_no_events() {
+        async fn cdp1_page_navigate_browser_level_emits_events_despite_advanced_seq() {
             let dir = TempDir::new();
             let st = state(&dir);
             let h = Arc::new(
@@ -1276,9 +1288,11 @@ mod tests {
             let u = format!("http://127.0.0.1:{}/", serve("200 OK", "x"));
             let req = json!({"id": 1, "method": "Page.navigate", "params": {"url": u}});
             let f = frames(d.dispatch(&st, &req.to_string()).await);
-            assert_eq!(f.len(), 1);
+            assert_eq!(f.len(), 3);
             assert_eq!(f[0]["id"], json!(1));
             assert_eq!(f[0]["result"]["frameId"], json!("main"));
+            assert_eq!(f[1]["method"], json!("Page.frameNavigated"));
+            assert_eq!(f[2]["method"], json!("Page.loadEventFired"));
         }
 
         #[tokio::test]
