@@ -27,9 +27,11 @@
 //! - `<base href>` の解決は未実装。`href` 付き `base` 要素を持つ文書では `baseURL` を省略する
 //! - 採番は文書全体を走査するため、ノード数が [`MAX_NUMBERED_NODES`] を超える文書は
 //!   `DOCUMENT_TOO_LARGE` エラーにする（切り詰めない）
-//! - 呼び出しごとに再パースし、ノード表のセッション保持・キャッシュは行わない。
-//!   `DOM.getDocument` と `DOM.querySelector` の間に別の遷移が確定すると、同じ nodeId が
-//!   新しい文書のノードを指す（ノード表の保持は後続。`CDP-2`・TASK-43）
+//! - 呼び出しごとに再パースするが、nodeId の世代は [`IssuedDocuments`] で管理する。
+//!   `DOM.getDocument` が払い出した文書（`Arc<NavigationResult>` の同一性）をターゲット別に
+//!   記録し、`DOM.querySelector` は最新の確定文書がその記録と同一のときだけ nodeId を解決する。
+//!   getDocument 未呼び出し・遷移後の古い nodeId は `NODE_NOT_FOUND`（別文書の別ノードへ
+//!   解決しない。`CDP-1`）。ノード表そのものの保持・`DOM.requestChildNodes` は後続（`CDP-2`・TASK-43）
 //! - `DOM.querySelector`: 一致なしは `{"nodeId": 0}`（`CDP-5`）。構文不正は `INVALID_PARAMS`、
 //!   未対応構文（core のサブセット外）は `UNSUPPORTED_PARAMS`、解決できない nodeId は
 //!   `NODE_NOT_FOUND`（0 を捏造しない。`SEC-2`）。テキスト等の非コンテナを起点にした場合は
@@ -37,7 +39,7 @@
 //! - 直近の navigate 結果が無い場合は空ドキュメントを捏造せずエラーを返す（`SEC-2`）
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use fandhe_browser_core::NavigationResult;
 use fandhe_browser_core::{
@@ -353,6 +355,45 @@ fn load_document(
     Ok((latest, parsed))
 }
 
+/// `DOM.getDocument` が nodeId を払い出した文書の記録（`CDP-1`）。
+///
+/// キーは `sessionId` のターゲット（ブラウザレベルは `None`）。値は払い出し時点の確定文書で、
+/// `Arc` を保持するためアドレスが再利用されず `Arc::ptr_eq` で同一文書を判定できる。
+/// 遷移が確定すると新しい `Arc` に置き換わり、旧 nodeId は無効になる。保持件数は
+/// 生存ターゲット数 + 1 以下（閉じたターゲットは記録時に破棄。`SEC-2`）。
+pub(crate) struct IssuedDocuments {
+    inner: Mutex<HashMap<Option<TargetId>, Arc<NavigationResult>>>,
+}
+
+impl IssuedDocuments {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `doc` を払い出し済みとして記録する（旧記録は置き換え）。
+    fn record(
+        &self,
+        registry: &crate::target::TargetRegistry,
+        target: Option<&TargetId>,
+        doc: &Arc<NavigationResult>,
+    ) {
+        let mut m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        m.retain(|k, _| k.as_ref().is_none_or(|t| registry.target(t).is_some()));
+        if target.is_none_or(|t| registry.target(t).is_some()) {
+            m.insert(target.cloned(), Arc::clone(doc));
+        }
+    }
+
+    /// `doc` が現在の払い出し済み文書と同一か。
+    fn is_current(&self, target: Option<&TargetId>, doc: &Arc<NavigationResult>) -> bool {
+        let m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        m.get(&target.cloned())
+            .is_some_and(|issued| Arc::ptr_eq(issued, doc))
+    }
+}
+
 /// `params` から `(nodeId, selector)` を取り出す。欠落・型違いは `INVALID_PARAMS`。
 fn parse_query_params(params: &Value) -> Result<(i64, &str), CdpError> {
     let node_id = params
@@ -402,7 +443,11 @@ impl CommandHandler for DomQuerySelector {
             // 検証順: セッション解決 → パラメータ検証 → 文書の取得 → 照合。
             let target = resolve_target(&ctx)?;
             let (node_id, selector) = parse_query_params(params)?;
-            let (_latest, parsed) = load_document(&ctx, target.as_ref())?;
+            let (latest, parsed) = load_document(&ctx, target.as_ref())?;
+            // nodeId は getDocument が払い出した文書でのみ有効。未取得・遷移後は解決しない（`CDP-1`）。
+            if !ctx.state.dom_issued().is_current(target.as_ref(), &latest) {
+                return Err(CdpError::NODE_NOT_FOUND);
+            }
             let found = query_selector_node_id(&parsed.document, node_id, selector)?;
             Ok(HandlerOutput::result(json!({ "nodeId": found })))
         })
@@ -425,6 +470,9 @@ impl CommandHandler for DomGetDocument {
             check_pierce(params)?;
             let (latest, parsed) = load_document(&ctx, target.as_ref())?;
             let root = build_document_node(&parsed.document, latest.url(), depth)?;
+            ctx.state
+                .dom_issued()
+                .record(ctx.state.registry(), target.as_ref(), &latest);
             Ok(HandlerOutput::result(json!({ "root": root })))
         })
     }
@@ -908,6 +956,7 @@ mod tests {
             let dir = TempDir::new();
             let st = state(&dir);
             navigate(&st);
+            call(&st, r#"{"id":90,"method":"DOM.getDocument"}"#).await;
             let v = call(&st, &qs_text(1, None, r#"{"nodeId":1,"selector":"h1"}"#)).await;
             assert_eq!(v, json!({"id": 1, "result": {"nodeId": 6}}));
         }
@@ -917,6 +966,7 @@ mod tests {
             let dir = TempDir::new();
             let st = state(&dir);
             navigate(&st);
+            call(&st, r#"{"id":90,"method":"DOM.getDocument"}"#).await;
             let v = call(
                 &st,
                 &qs_text(2, None, r##"{"nodeId":1,"selector":"#does-not-exist"}"##),
@@ -970,6 +1020,7 @@ mod tests {
                 serde_json::from_str::<Value>(UNAVAILABLE).unwrap()
             );
             commit_target(&st, &tid, "https://target.example/", "<p id=\"x\">a</p>");
+            call(&st, &get_doc_text(&sid, "{}")).await;
             let hit = call(
                 &st,
                 &qs_text(6, Some(&sid), r##"{"nodeId":1,"selector":"#x"}"##),
@@ -989,6 +1040,7 @@ mod tests {
             let dir = TempDir::new();
             let st = state(&dir);
             navigate(&st);
+            call(&st, r#"{"id":90,"method":"DOM.getDocument"}"#).await;
             let v = call(
                 &st,
                 &qs_text(8, None, r#"{"nodeId":1,"selector":"h1:MARKER-xyz"}"#),
@@ -999,6 +1051,55 @@ mod tests {
                 json!({"code": -32602, "message": "unsupported params"})
             );
             assert!(!v.to_string().contains("MARKER-xyz"));
+        }
+
+        /// getDocument 前の nodeId は解決しない（`CDP-1`・`SEC-2`）。
+        #[tokio::test]
+        async fn cdp1_dispatch_query_selector_requires_get_document() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            let v = call(&st, &qs_text(9, None, r#"{"nodeId":1,"selector":"h1"}"#)).await;
+            assert_eq!(
+                v["error"],
+                json!({"code": -32000, "message": "node not found"})
+            );
+        }
+
+        /// 遷移確定後は旧文書の nodeId を新文書の別ノードへ解決せず、再取得で復活する（`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_dispatch_query_selector_stale_node_id_after_navigation() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            let gd = r#"{"id":90,"method":"DOM.getDocument"}"#;
+            call(&st, gd).await;
+            let q = qs_text(10, None, r#"{"nodeId":1,"selector":"h1"}"#);
+            assert_eq!(call(&st, &q).await["result"]["nodeId"], 6);
+            // 同一 HTML への再遷移でも別文書として旧 nodeId を無効化する。
+            navigate(&st);
+            let stale = call(&st, &q).await;
+            assert_eq!(stale["error"]["message"], "node not found");
+            assert!(stale.get("result").is_none());
+            call(&st, gd).await;
+            assert_eq!(call(&st, &q).await["result"]["nodeId"], 6);
+        }
+
+        /// ターゲット別の記録は互いに独立（`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_dispatch_query_selector_target_issuance_is_separate() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let (tid, sid) = session_for_new_target(&st);
+            commit_target(&st, &tid, "https://t.example/", PAGE);
+            navigate(&st);
+            call(&st, r#"{"id":90,"method":"DOM.getDocument"}"#).await;
+            let v = call(
+                &st,
+                &qs_text(11, Some(&sid), r#"{"nodeId":1,"selector":"h1"}"#),
+            )
+            .await;
+            assert_eq!(v["error"]["message"], "node not found");
         }
     }
 }

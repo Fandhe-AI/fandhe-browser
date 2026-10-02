@@ -28,6 +28,7 @@ use fandhe_backend_routes::Router;
 use fandhe_browser_core::AppState;
 
 use crate::discovery::{self, Authority, BROWSER_WS_PATH_PATTERN, HostError};
+use crate::dom::IssuedDocuments;
 use crate::navigation::TargetNavigations;
 use crate::protocol::Dispatcher;
 use crate::target::{BrowserId, TargetRegistry};
@@ -46,6 +47,8 @@ pub struct CdpState {
     registry: TargetRegistry,
     /// ターゲット別の遷移状態（`Page.navigate` が書き、`DOM.getDocument` が読む。`CDP-1`）。
     navigations: TargetNavigations,
+    /// `DOM.getDocument` が nodeId を払い出した文書の記録（`DOM.querySelector` が世代検証に使う。`CDP-1`）。
+    dom_issued: IssuedDocuments,
 }
 
 impl CdpState {
@@ -62,6 +65,7 @@ impl CdpState {
             browser_id,
             registry: TargetRegistry::new(),
             navigations: TargetNavigations::new(),
+            dom_issued: IssuedDocuments::new(),
         }
     }
 
@@ -78,6 +82,11 @@ impl CdpState {
     /// ターゲット・セッション表。
     pub fn registry(&self) -> &TargetRegistry {
         &self.registry
+    }
+
+    /// nodeId 払い出し済み文書の記録（crate 内部専用。`CDP-1`）。
+    pub(crate) fn dom_issued(&self) -> &IssuedDocuments {
+        &self.dom_issued
     }
 
     /// ターゲット別の遷移状態表（crate 内部専用。`CDP-1`）。
