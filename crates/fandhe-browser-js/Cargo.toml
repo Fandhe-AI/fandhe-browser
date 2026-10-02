@@ -36,11 +36,11 @@ windows-sys = { workspace = true, optional = true }
 #
 # `js-v8` は `dep:v8` と結合済みで、`create_engine`（`engine_trait.rs`）は
 # 子プロセス版の V8 エンジンを返す（TASK-29.6.2・Issue #548）。boa は
-# TASK-32.2（#166）まで `CreateEngineError::NotYetImplemented` のまま（実装済みを
-# 装わない。REPAIR-3）。
+# 同一プロセス内の boa 版エンジンを返す（TASK-32.2・Issue #166。wall-clock
+# タイムアウト・ヒープ上限が無い点は `boa_engine.rs` の「既知の制限」参照）。
 #
 # `js-boa` は `dep:boa_engine` と結合済み（TASK-32.1・Issue #165）。具象実装
-# （`create_engine` からの生成）は TASK-32.2（Issue #166）まで未実装。
+# （`create_engine` からの生成）は TASK-32.2（Issue #166）で追加済み。
 [features]
 default = []
 js-v8 = ["dep:v8", "dep:rustix", "dep:windows-sys"]

@@ -33,8 +33,6 @@
 //!
 //! # スタブ・簡易実装の残り（REPAIR-3）
 //!
-//! - boa は `create_engine` が `NotYetImplemented` を返す間（TASK-32 まで）、
-//!   [`JsRuntime::from_config`] が `JsExecutionUnavailable` で失敗する。
 //! - グローバル関数注入・DOM 風オブジェクトのバインドの配線は未実装（後続）。
 //!
 //! # 可観測性（`REPAIR-9`・`TASK-10.2.2`・Issue #550）
@@ -444,14 +442,14 @@ mod tests {
         assert_eq!(rt.engine_kind(), Some(EngineKind::V8));
     }
 
-    /// JS-2（TASK-30.3・#161）: boa は TASK-32 まで fail-closed（暫定契約）。
+    /// JS-2（TASK-30.3・#161・TASK-32.2・#166）: `js-boa` 構成で boa が選ばれる
+    /// （評価はしない。設定経由の評価確認は TASK-32.3・#167）。
     #[cfg(feature = "js-boa")]
     #[test]
-    fn js_2_from_config_boa_is_unavailable_until_task_32() {
+    fn js_2_from_config_selects_boa() {
         let cfg = crate::Config::from_toml_str("[js]\nengine = \"boa\"\n").expect("設定");
-        let err = JsRuntime::from_config(cfg.js()).expect_err("未実装");
-        assert!(matches!(err, Error::JsExecutionUnavailable { .. }));
-        assert!(err.to_string().contains("not yet implemented"));
+        let rt = JsRuntime::from_config(cfg.js()).expect("Ok");
+        assert_eq!(rt.engine_kind(), Some(EngineKind::Boa));
     }
 
     /// REPAIR-9: recorder 付きの失敗呼び出しは `JsStub` / `Failure` を 1 件記録する。

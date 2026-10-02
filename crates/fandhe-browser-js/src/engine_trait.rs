@@ -91,15 +91,12 @@ const BUNDLED: &[EngineKind] = &[
 /// 順序は `js-engine.md`「(1) 省略」の「同梱エンジンから V8 → boa の優先順で
 /// 選ぶ」という後続契約（TASK-91 が依存）に対応する。
 ///
-/// `js-v8` は子プロセス版エンジンへ配線済み（TASK-29.6.2・#548）で、
-/// [`create_engine`] は `Ok` を返す。一方 `js-boa` は依存（`boa_engine`）を
-/// TASK-32.1（#165）で結合済みだが、有効化しても具象実装は無い（実装は
-/// TASK-32.2・#166）（実装済みを装わない。
-/// REPAIR-3）。[`create_engine`] はこの一覧を「同梱判定」の唯一の情報源として
-/// 使うが、同梱されている（＝ `feature` が有効）ことは「具象実装が使える」
-/// ことを意味しない。boa は TASK-32 の完了までの間 [`create_engine`] が
-/// `CreateEngineError::NotYetImplemented` を返すため、呼び出し元は boa を
-/// 「即座に生成・実行できるエンジン」として扱ってはならない。feature が無効なバリアントはコンパイル自体から除外されるため
+/// `js-v8` は子プロセス版エンジン、`js-boa` は同一プロセス内の boa 版エンジンへ
+/// 配線済みで（TASK-29.6.2・#548／TASK-32.2・#166）、[`create_engine`] は
+/// どちらも `Ok` を返す。ただし boa 版は wall-clock タイムアウト・ヒープ上限を
+/// 持たない（`boa_engine` モジュールの「既知の制限」。REPAIR-3）。
+/// [`create_engine`] はこの一覧を「同梱判定」の唯一の情報源として使う。
+/// feature が無効なバリアントはコンパイル自体から除外されるため
 /// （`#[cfg(...)]` 付きの配列要素）、「同梱されていないのに一覧に載る」
 /// 幽霊エントリが実行時分岐の書き間違いで混入する余地はない。
 pub fn bundled_engines() -> &'static [EngineKind] {
@@ -422,11 +419,10 @@ pub enum CreateEngineError {
         /// このバイナリに実際に同梱されている種別の一覧。
         bundled: &'static [EngineKind],
     },
-    /// 指定した種別は同梱されている（feature は有効）が、具象実装がまだ
-    /// 存在しない。現在は boa（`TASK-32`・`MS-3` の完了待ち）だけが該当する
-    /// （V8 は `TASK-29.6.2`・#548 で配線済み）。実装済みを装わない
-    /// （REPAIR-3）ための一時的なバリアントであり、`TASK-32` 完了後は boa に
-    /// ついてもこのバリアントを返さなくなる。
+    /// 指定した種別の具象実装が存在しない。V8（TASK-29.6.2・#548）・boa
+    /// （TASK-32.2・#166）とも配線済みのため、現在はどの同梱種別にも返らない。
+    /// feature 無効側の防御的分岐でのみ使い、成功を装わない（REPAIR-3）。
+    /// 公開 API の互換性のため variant は残している。
     NotYetImplemented {
         /// 呼び出し元が要求した種別。
         requested: EngineKind,
@@ -475,9 +471,10 @@ impl std::error::Error for CreateEngineError {}
 /// **契約**: 同梱していない種別（[`bundled_engines`] に含まれない）には
 /// [`CreateEngineError::NotBundled`] を返し、別エンジンへのフォールバックは
 /// しない。V8 は子プロセス版エンジン（`process_engine::V8ProcessEngine`）を
-/// `Ok` で返す。boa は具象実装が無い間 [`CreateEngineError::NotYetImplemented`]
-/// を返す（`TASK-32`。ダミーの成功を返さない。security.md「偽装・回避機能の
-/// 禁止」）。
+/// `Ok` で返す。boa は同一プロセス内の boa 版エンジン（`boa_engine::BoaEngine`・
+/// `TASK-32.2`・#166）を `Ok` で返す。boa 版は V8 版と異なりプロセス分離を
+/// せず、wall-clock タイムアウトとヒープ上限が無い（`boa_engine` モジュールの
+/// 「既知の制限」）。
 ///
 /// # 起動タイミングと失敗の現れ方（`TASK-29.6.2`・#548。`PERF-6`・`PERF-7`・`CORE-3`）
 ///
@@ -506,8 +503,24 @@ pub fn create_engine(kind: EngineKind) -> Result<Box<dyn JsEngine>, CreateEngine
     }
     match kind {
         EngineKind::V8 => create_v8_engine(),
-        EngineKind::Boa => Err(CreateEngineError::NotYetImplemented { requested: kind }),
+        EngineKind::Boa => create_boa_engine(),
     }
+}
+
+/// boa 版エンジンを生成する（[`create_engine`] から呼ばれる。コンテキストは
+/// 最初の操作まで作らない）。
+#[cfg(feature = "js-boa")]
+fn create_boa_engine() -> Result<Box<dyn JsEngine>, CreateEngineError> {
+    Ok(Box::new(crate::boa_engine::BoaEngine::new()))
+}
+
+/// `js-boa` 無効時の boa 分岐。[`create_engine`] は同梱判定で先に
+/// `NotBundled` を返すため到達しないが、成功を装わず `NotYetImplemented` を返す。
+#[cfg(not(feature = "js-boa"))]
+fn create_boa_engine() -> Result<Box<dyn JsEngine>, CreateEngineError> {
+    Err(CreateEngineError::NotYetImplemented {
+        requested: EngineKind::Boa,
+    })
 }
 
 /// V8 の子プロセス版エンジンを生成する（[`create_engine`] から呼ばれる。
@@ -661,17 +674,12 @@ mod tests {
         assert!(create_engine(EngineKind::V8).is_ok());
     }
 
-    /// JS-1: boa は同梱していても具象実装が無いため `NotYetImplemented` を返す
-    /// こと（「同梱＝即利用可能」ではないことの回帰テスト）。
+    /// JS-1: boa を同梱したビルドでは `create_engine(Boa)` が boa 版を `Ok` で
+    /// 返すこと（コンテキストは遅延生成のため評価はしない。TASK-32.2）。
     #[test]
     #[cfg(feature = "js-boa")]
-    fn js_1_create_engine_returns_not_yet_implemented_for_bundled_boa() {
-        assert!(matches!(
-            create_engine(EngineKind::Boa),
-            Err(CreateEngineError::NotYetImplemented {
-                requested: EngineKind::Boa
-            })
-        ));
+    fn js_1_create_engine_returns_ok_for_bundled_boa() {
+        assert!(create_engine(EngineKind::Boa).is_ok());
     }
 
     /// JS-1: `JsEngineError`・`CreateEngineError` が `std::error::Error` を

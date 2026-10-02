@@ -21,15 +21,16 @@
 //! [`create_engine`] は V8 には子プロセス版エンジンを返し（`TASK-29.6.2`・
 //! Issue #548。遅延起動。ホストは `main` の先頭で
 //! [`run_js_worker_if_requested`] を呼ぶ義務がある。詳細は [`engine_trait`]）、
-//! 同梱済みの boa には `NotYetImplemented`、同梱されていない種別には
-//! `NotBundled` を返す。以下は未実装（実装済みを装わない。REPAIR-3）。
+//! boa には同一プロセス内で動く boa 版エンジンを返し（`TASK-32.2`・Issue #166。
+//! wall-clock タイムアウトとヒープ上限が無い点など V8 版との差は `boa_engine`
+//! モジュールの「既知の制限」を参照）、同梱されていない種別には `NotBundled` を
+//! 返す。以下は未実装（実装済みを装わない。REPAIR-3）。
 //!
 //! - V8 の具象実装（`JS-1`、`TASK-29`、`MS-3`）は `create_engine` への配線まで
 //!   完了（`TASK-29.6.2`）。トレイト経由の `NativeFn` は `Send` 境界付きで、
 //!   inherent API と同じ専用スレッド経路（期限付き待機）で実行するため期限を
 //!   強制できる。ただし `NativeCallContext` は関数へ渡らず協調的な中断は
 //!   できない（`process_engine` の「既知の制限」）
-//! - boa の具象実装（`JS-1`、`TASK-32`、`MS-3`）
 //! - core への統合（`js_stub` の置換。`JS-2`、`TASK-30`、`MS-3`）
 //!
 //! # 公開境界（`JS-1`・TASK-29.6.1・Issue #547）
@@ -78,6 +79,18 @@
 //! ```compile_fail
 //! use fandhe_browser_js::resource_limits;
 //! ```
+//!
+//! `boa_engine` は非公開（boa 固有型を公開しない）。
+//!
+//! ```compile_fail
+//! use fandhe_browser_js::boa_engine::BoaEngine;
+//! ```
+//!
+//! `boa_engine` crate の再エクスポートは無い。
+//!
+//! ```compile_fail
+//! use fandhe_browser_js::boa_engine::Context;
+//! ```
 
 #![deny(private_interfaces, private_bounds)]
 
@@ -89,6 +102,11 @@ pub mod engine_trait;
 // 抽象越しに使い、V8 / boa の具象型を上位 crate へ漏らさない」）。
 #[cfg(feature = "js-v8")]
 mod v8_engine;
+// boa（`boa_engine`）による [`JsEngine`] 実装（TASK-32.2・Issue #166）。
+// V8 と同じく具象型を上位 crate へ漏らさないため `pub` を付けず、`pub use`
+// もしない（coding-rust.md「V8 / boa の具象型を上位 crate へ漏らさない」）。
+#[cfg(feature = "js-boa")]
+mod boa_engine;
 // 子プロセスのヒープ外メモリに OS 側の上限を掛ける（TASK-29・Issue #503
 // 設計書 §5・codex レビュー指摘 #503 P0 対応）。[`worker`]（子側の起動時
 // 強制）と [`process_engine`]（親側の RSS 監視）の両方から使う非公開

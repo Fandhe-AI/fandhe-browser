@@ -15,10 +15,9 @@ use fandhe_browser_core::js_stub::{JsRuntime, execute_js_stub};
 fn js_2_runtime_reflects_configured_engine_kind() {
     use fandhe_browser_core::Config;
     let config = Config::default();
-    // boa のみ同梱（TASK-32 まで未実装）の構成では from_config が失敗するため、成功時のみ検証する。
-    if let Ok(rt) = JsRuntime::from_config(config.js()) {
-        assert_eq!(rt.engine_kind(), config.js().engine());
-    }
+    // V8・boa のどちらの同梱構成でも from_config は成功する（boa は TASK-32.2・#166 で実装済み）。
+    let rt = JsRuntime::from_config(config.js()).expect("同梱エンジンが選ばれる");
+    assert_eq!(rt.engine_kind(), config.js().engine());
 }
 
 /// JS-2: JS 無効ランタイムは常に失敗する（全構成共通）。

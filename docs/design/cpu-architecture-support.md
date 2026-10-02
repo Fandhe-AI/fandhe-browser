@@ -98,7 +98,7 @@ musl ターゲットと aarch64 Linux は CI の matrix に含まれていない
 - `boa_engine` は純 Rust（`XOS-3`）なので、Rust のターゲットさえあればビルドできる見込みである（実機では確認していない）
 - spec 上のビルドコマンドは `cargo build --release -p fandhe-browser-cli --no-default-features --features js-boa`、概算サイズは約 10.05MB（机上の概算）
 - **現状、軽量ビルドはまだ利用できない**（`REPAIR-3`: 実装済みを装わない）
-  - `fandhe-browser-js` の `js-boa` はプレースホルダで、`boa_engine` は未導入（`TASK-32`・#144 / #165 / #166）
+  - `fandhe-browser-js` の `js-boa` は `boa_engine` を結合し、boa 版エンジンを実装済み（`TASK-32`・#165 / #166）。設定経由の選択確認・CI のビルド構成検証は後続（#167 / #168）
   - `fandhe-browser-cli` には JS エンジン feature の転送と既定がない（`TASK-30.2`・#160）
   - 上記コマンドは spec の提案に基づく将来の構成である
 - V8 の代替ターゲット対応ではなく、JS 実行エンジンが `boa` に変わる配布物である。互換性・性能の差が生じうる
