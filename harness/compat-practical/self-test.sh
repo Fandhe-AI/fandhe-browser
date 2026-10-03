@@ -97,6 +97,12 @@ expect_exit "trailing newline in url" 2 bash "$CHECK" --validate-only --tasks "$
 write_tasks empty '[]'
 expect_exit "empty array" 2 bash "$CHECK" --validate-only --tasks "$WORK/empty.json"
 write_tasks bad '{not json'
+: >"$WORK/zero.json"
+expect_exit "empty file" 2 bash "$CHECK" --validate-only --tasks "$WORK/zero.json"
+expect_contains "$LAST_OUTPUT" "exactly one JSON document" "empty file message"
+printf '%s\n%s\n' "[$VALID]" "[$VALID]" >"$WORK/multi.json"
+expect_exit "multiple documents" 2 bash "$CHECK" --validate-only --tasks "$WORK/multi.json"
+expect_contains "$LAST_OUTPUT" "exactly one JSON document" "multiple documents message"
 expect_exit "invalid json" 2 bash "$CHECK" --validate-only --tasks "$WORK/bad.json"
 expect_exit "timeout zero" 2 bash "$CHECK" --validate-only --timeout 0
 expect_exit "timeout over" 2 bash "$CHECK" --validate-only --timeout 61
@@ -117,6 +123,7 @@ chmod +x "$STUB_DIR/curl"
 # getent スタブ: DNS へは出ず STUB_RESOLVE_IP（既定は公開アドレス）を返す
 cat >"$STUB_DIR/getent" <<'STUB'
 #!/usr/bin/env bash
+[ -z "${STUB_RESOLVE_NONE:-}" ] || exit 0
 printf '%s      STREAM %s\n' "${STUB_RESOLVE_IP:-93.184.216.34}" "${2:-}"
 STUB
 chmod +x "$STUB_DIR/getent"
@@ -205,6 +212,20 @@ expect_eq "$(jq -r 'select(.id=="x1") | .blocked' "$WORK/rip.jsonl")" "connected
 : >"$LOG"
 expect_exit "dns pin" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/pin.jsonl"
 expect_contains "$(cat "$LOG")" "--resolve example.com:443:93.184.216.34" "dns pinned to validated ip"
+
+: >"$LOG"
+expect_exit "dns pin ipv6" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_RESOLVE_IP=2606:4700::1 STUB_IP=2606:4700::1 bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/pin6.jsonl"
+expect_contains "$(cat "$LOG")" "--resolve example.com:443:[2606:4700::1]" "ipv6 pinned to validated ip"
+
+: >"$LOG"
+expect_exit "unresolvable host rejected" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_RESOLVE_NONE=1 bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/nores.jsonl"
+expect_contains "$LAST_OUTPUT" "reachable=0/2" "unresolvable summary"
+expect_eq "$(wc -l <"$LOG" | tr -d ' ')" "0" "unresolvable: curl not invoked"
+expect_eq "$(jq -r 'select(.id=="x1") | .blocked' "$WORK/nores.jsonl")" "host could not be resolved for address pinning" "unresolvable blocked reason"
+
+: >"$LOG"
+expect_exit "proxy disabled" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/noproxy.jsonl"
+expect_contains "$(cat "$LOG")" "-q -sS --noproxy *" "curl ignores curlrc and proxies"
 
 # --- Windows の jq が出す CRLF を除去する（CR が URL・件数・出力へ混入しない）---
 CRLF_DIR="$WORK/crlf"

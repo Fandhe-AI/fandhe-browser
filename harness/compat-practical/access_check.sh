@@ -42,7 +42,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-command -v jq >/dev/null 2>&1 || die "jq is required but was not found on PATH"
+# lib.sh が jq 関数を定義するため `command -v jq` は常に成功する。バイナリ自体を `type -P` で探す
+type -P jq >/dev/null 2>&1 || die "jq is required but was not found on PATH"
 if ! [[ "$TIMEOUT" =~ ^[1-9][0-9]?$ ]] || [ "$TIMEOUT" -gt 60 ]; then
   die "--timeout must be an integer in 1..60"
 fi
@@ -52,6 +53,15 @@ size=$(wc -c <"$TASKS" | tr -d ' ')
 
 # スキーマ検証。違反内容を 1 行ずつ jq が列挙する（不正 JSON は jq が非 0 で終わる）。
 # id・cat は表示用に切り詰め、CI ログでワークフローコマンドとして解釈されない文字だけに制限済み。
+# JSON 文書がちょうど 1 個であることを先に確認する。空ファイルは jq のフィルタが一度も走らず
+# 終了コード 0・違反なしになり、複数文書は先頭以外が検証されないため、どちらも拒否する。
+set +e
+doc_count=$(jq -n '[inputs] | length' "$TASKS" 2>/dev/null)
+doc_status=$?
+set -e
+[ "$doc_status" -eq 0 ] || die "tasks file is not valid JSON: $TASKS"
+[ "$doc_count" = "1" ] || die "tasks file must contain exactly one JSON document (found $doc_count): $TASKS"
+
 set +e
 violations=$(jq -r --arg re "$ID_RE" --argjson max "$MAX_ENTRIES" '
   def nm: (.id | tostring | .[0:80]);
@@ -117,7 +127,8 @@ MAX_REDIRS=5
 # fetch_site <url>
 #   リダイレクトを自前で最大 MAX_REDIRS 回追い、各ホップで url_check（scheme・ポート・内部名・IP リテラル）と
 #   DNS 解決後アドレスの公開判定を行う（SSRF 対策。curl -L は使わない）。解決できたときは
-#   --resolve で検証済み IPv4 へ接続先を固定し、解決手段が無い環境でも curl の remote_ip を事後検証する。
+#   --resolve で検証済み IPv4/IPv6 へ接続先を固定する（固定できないホストは取得前に拒否）。
+#   プロキシは --noproxy '*' で無効化し、curl の remote_ip も事後検証する。
 #   結果をグローバル F_CODE / F_RC / F_MS / F_BLOCKED（拒否理由。無ければ空）へ設定する。
 fetch_site() {
   local cur="$1" hop=0 host ips ip out rc code t rip loc ms reason
@@ -136,13 +147,19 @@ fetch_site() {
           F_BLOCKED="host resolves to a non-public address"; F_CODE=0; return 0
         fi
         case "$ip" in
-          *:*) ;;
+          *:*) pins+=(--resolve "$host:443:[$ip]") ;;
           *) pins+=(--resolve "$host:443:$ip") ;;
         esac
       done
+      # 固定できるアドレスが無いホストは再解決による接続先すり替えを防げないため取得前に拒否する
+      if [ "${#pins[@]}" -eq 0 ]; then
+        F_BLOCKED="host could not be resolved for address pinning"; F_CODE=0; return 0
+      fi
     fi
     set +e
-    out=$(LC_ALL=C curl -sS -o /dev/null -w '%{http_code} %{time_total} %{remote_ip} %{redirect_url}' \
+    # -q: .curlrc を読まない。--noproxy '*': 環境変数・設定のプロキシを無効化し、--resolve で固定した
+    # 検証済みアドレスへ直接接続させる（プロキシ経由だと最終宛先を固定・検証できず SSRF 対策を迂回される）
+    out=$(LC_ALL=C curl -q -sS --noproxy '*' -o /dev/null -w '%{http_code} %{time_total} %{remote_ip} %{redirect_url}' \
       --max-time "$TIMEOUT" --proto '=https' --proto-redir '=https' -A "$UA" \
       ${pins[@]+"${pins[@]}"} -- "$cur" 2>/dev/null)
     rc=$?

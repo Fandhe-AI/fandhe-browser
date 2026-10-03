@@ -41,7 +41,7 @@ bash harness/compat-practical/access_check.sh [--tasks P] [--out P] [--timeout S
 - 依存は bash・jq・curl のみ。実ネットワークへ出るため CI では実行しない（CI は `self-test.sh` と `--validate-only`）
 - `--timeout` は 1〜60 の整数（既定 8）。リダイレクトは自前で 5 回まで追う（`curl -L` は使わない）、https のみ（`--proto '=https' --proto-redir '=https'`）
 - UA は偽装しない識別子 `fandhe-browser-harness/0.1 (+https://github.com/Fandhe-AI/fandhe-browser)`。anti-bot 回避はしない
-- SSRF 対策（SEC 系）: 各ホップで `lib.sh` の `url_check`（https のみ・userinfo なし・ポート 443 のみ・IPv6 リテラル不可・localhost 系/内部ドメイン不可・IP リテラルは公開 IPv4 の厳密な 10 進表記のみ）と、DNS 解決後アドレスの公開判定（getent / dscacheutil があるとき。検証済み IPv4 へ `--resolve` で固定）を行い、curl の `remote_ip` も事後検証する。拒否時は curl を呼ばず（事後検証を除く）`blocked` に理由を記録し `reachable:false`
+- SSRF 対策（SEC 系）: 各ホップで `lib.sh` の `url_check`（https のみ・userinfo なし・ポート 443 のみ・IPv6 リテラル不可・localhost 系/内部ドメイン不可・IP リテラルは公開 IPv4 の厳密な 10 進表記のみ）と、DNS 解決後アドレスの公開判定（getent / dscacheutil があるとき。検証済み IPv4/IPv6 を `--resolve` で固定。解決できない・固定できないホストは取得前に拒否）を行い、curl は `-q --noproxy '*'`（.curlrc・プロキシ無効）で起動し、`remote_ip` も事後検証する。tasks.json は JSON 文書がちょうど 1 個であることを検証する（空ファイル・複数文書は拒否）拒否時は curl を呼ばず（事後検証を除く）`blocked` に理由を記録し `reachable:false`
 - Windows の jq が出す CRLF は `lib.sh` の `jq` ラッパーが除去する
 - 出力は JSONL。1 行目がメタ行、以降は 1 件 1 行
 

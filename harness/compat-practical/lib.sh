@@ -98,7 +98,8 @@ url_check() {
 
 # resolve_host_ips <host>
 #   ホストの IP を 1 行 1 件で stdout へ出す（getent / dscacheutil のあるときのみ。無ければ何も出さない）。
-#   出力が空でも呼び出し側は curl の接続先 IP（remote_ip）を事後検証するため fail-open にはならない。
+#   出力が空のとき、呼び出し側（access_check.sh）は接続先を固定できないホストとして取得前に拒否する
+#   （fail-closed。解決手段の無い環境では IP リテラル以外の URL は取得しない）。
 resolve_host_ips() {
   if command -v getent >/dev/null 2>&1; then
     getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u
