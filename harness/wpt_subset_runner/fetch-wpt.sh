@@ -186,16 +186,25 @@ rollback() {
   local reason="$1" failed=0
   rm -rf "${WPT_DIR}" || failed=1
   if [ -e "${STAGE}/old" ] || [ -L "${STAGE}/old" ]; then
-    mv "${STAGE}/old" "${WPT_DIR}" || failed=1
+    # 復元先が残っていると mv が配下へ入れ子で退避データを移してしまうため、空いているときだけ戻す。
+    if [ -e "${WPT_DIR}" ] || [ -L "${WPT_DIR}" ]; then
+      failed=1
+    else
+      mv "${STAGE}/old" "${WPT_DIR}" || failed=1
+    fi
   fi
   if [ -e "${STAGE}/old.tsv" ] || [ -L "${STAGE}/old.tsv" ]; then
-    mv "${STAGE}/old.tsv" "${OUT_TSV}" || failed=1
+    if [ -e "${OUT_TSV}" ] || [ -L "${OUT_TSV}" ]; then
+      failed=1
+    else
+      mv "${STAGE}/old.tsv" "${OUT_TSV}" || failed=1
+    fi
   fi
   if [ "${failed}" -ne 0 ]; then
     KEEP_STAGE=1
     echo "error: rollback failed; previous data is preserved in ${STAGE}" >&2
     echo "error: to restore manually: mv ${STAGE}/old ${WPT_DIR}; mv ${STAGE}/old.tsv ${OUT_TSV}" >&2
-    echo "error: (remove ${WPT_DIR} and ${OUT_TSV} first if they exist; then delete ${STAGE})" >&2
+    echo "error: (if ${WPT_DIR} or ${OUT_TSV} still exists, move it aside first; keep ${STAGE} until restored)" >&2
   else
     KEEP_STAGE=0
   fi

@@ -192,5 +192,31 @@ check "rollback failure: unrestored previous data kept in staging" \
 check "rollback failure: new fetch leftovers removed" \
   '[ ! -e "${stage_dir}/wpt" ] && [ ! -e "${stage_dir}/subset.tsv" ]'
 
+# 10. 復元先の削除に失敗（rm 失敗）しても、退避した旧 wpt/ を残った復元先の配下へ入れ子で移さない。
+work="${TMP}/rollback-rm-fails"
+mkdir -p "${work}/wpt" "${TMP}/fakebin3"
+printf 'old-content\n' >"${work}/wpt/marker.txt"
+printf 'old-tsv\n' >"${work}/subset.tsv"
+REAL_RM="$(command -v rm)"
+cat >"${TMP}/fakebin3/mv" <<MV_EOF
+#!/usr/bin/env bash
+case "\$*" in
+  *"/subset.tsv "*"/subset.tsv") exit 1 ;;
+esac
+exec "${REAL_MV}" "\$@"
+MV_EOF
+cat >"${TMP}/fakebin3/rm" <<RM_EOF
+#!/usr/bin/env bash
+case "\$*" in
+  *"/rollback-rm-fails/wpt") exit 1 ;;
+esac
+exec "${REAL_RM}" "\$@"
+RM_EOF
+chmod +x "${TMP}/fakebin3/mv" "${TMP}/fakebin3/rm"
+PATH="${TMP}/fakebin3:${PATH}" run_fetch "${work}" "${SRC_URL}"
+stage_dir="$(find "${work}" -maxdepth 1 -name '.wpt-stage.*' | head -n 1)"
+check "rollback rm failure: backup not nested, stays in staging" \
+  '[ "${RUN_RC}" -eq 2 ] && [ -n "${stage_dir}" ] && [ ! -e "${work}/wpt/old" ] && [ "$(cat "${stage_dir}/old/marker.txt")" = "old-content" ] && [ "$(cat "${work}/subset.tsv")" = "old-tsv" ] && [[ "${RUN_OUT}" == *"rollback failed"* ]]'
+
 echo "${CASES} cases, ${FAILURES} failures"
 [ "${FAILURES}" -eq 0 ]
