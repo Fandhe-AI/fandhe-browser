@@ -37,8 +37,9 @@
 //!   入れ子（`&`）。実需が出た段階で拡張する（各 enum は
 //!   `#[non_exhaustive]` のため非破壊で追加できる。対応 TASK・MS 未定・
 //!   spec 側で未割当）
-//! - 詳細度（specificity）の計算（ビヘイビア `CORE-1`・`TASK-105`・`MS-8`。
-//!   本モジュールの AST を再利用して追加する予定）
+//! - 詳細度（specificity）の計算（ビヘイビア `CORE-5`・`TASK-105`（105.3・#257）・
+//!   `MS-8`。値の型は [`crate::cssom::Specificity`]（#255）。本モジュールの AST を
+//!   再利用して追加する予定）
 
 use crate::error::{Error, Result};
 
