@@ -12,16 +12,18 @@
 //! メソッド表は `Page.navigate`・`DOM.getDocument`・`DOM.querySelector`（TASK-42.2・42.4・42.5。未実装メソッドの応答方針は
 //! 42.6・`CDP-6`）。未実装メソッドへ成功を返さない（`SEC-2`）。
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use fandhe_backend_core::plugin_websocket::BoxFuture;
 use fandhe_backend_core::plugin_websocket::handler::{
-    WsHandlerError, WsMessage, WsMessageHandler, WsOutcome,
+    CloseReason, WsConnContext, WsConnId, WsHandlerError, WsMessage, WsMessageHandler, WsOutcome,
 };
 use fandhe_backend_http::response::Response;
 
 use crate::discovery::Authority;
-use crate::protocol::Dispatcher;
+use crate::protocol::{ConnId, Dispatcher};
 use crate::server::{CdpState, error_response, host_error_response};
 use crate::target::BrowserId;
 
@@ -59,12 +61,30 @@ pub(crate) fn check_handshake(
 pub(crate) struct BrowserSessionHandler {
     state: Arc<CdpState>,
     dispatcher: Dispatcher,
+    /// 生存中の接続 → crate 内接続 ID。切断（`on_close`）で必ず取り除く。
+    conns: Mutex<HashMap<WsConnId, ConnId>>,
+    next_conn: AtomicU64,
 }
 
 impl BrowserSessionHandler {
     /// `crate::server::browser_websocket_config` から接続設定の構築時に 1 度だけ作る。
     pub(crate) fn new(state: Arc<CdpState>, dispatcher: Dispatcher) -> Self {
-        Self { state, dispatcher }
+        Self {
+            state,
+            dispatcher,
+            conns: Mutex::new(HashMap::new()),
+            next_conn: AtomicU64::new(1),
+        }
+    }
+}
+
+impl BrowserSessionHandler {
+    /// 接続に対応する crate 内接続 ID を返す（初回要求時に割り当てる）。
+    fn conn_for(&self, id: WsConnId) -> ConnId {
+        let mut conns = self.conns.lock().unwrap_or_else(PoisonError::into_inner);
+        *conns
+            .entry(id)
+            .or_insert_with(|| ConnId::new(self.next_conn.fetch_add(1, Ordering::Relaxed)))
     }
 }
 
@@ -73,13 +93,24 @@ impl WsMessageHandler for BrowserSessionHandler {
         "cdp-browser"
     }
 
-    fn on_message(&self, msg: WsMessage) -> BoxFuture<'_, Result<WsOutcome, WsHandlerError>> {
+    /// 接続 ID が必要なため `on_message_with_ctx` を使う。本メソッドは呼ばれない契約だが、
+    /// 万一呼ばれても接続 ID なしでは処理せず切断する（fail-closed）。
+    fn on_message(&self, _msg: WsMessage) -> BoxFuture<'_, Result<WsOutcome, WsHandlerError>> {
+        Box::pin(async { Ok(WsOutcome::Close) })
+    }
+
+    fn on_message_with_ctx<'a>(
+        &'a self,
+        ctx: &'a WsConnContext,
+        msg: WsMessage,
+    ) -> BoxFuture<'a, Result<WsOutcome, WsHandlerError>> {
         Box::pin(async move {
             Ok(match msg {
                 WsMessage::Text(t) => {
+                    let conn = self.conn_for(ctx.conn_id());
                     let frames = self
                         .dispatcher
-                        .dispatch(&self.state, &t)
+                        .dispatch_on(&self.state, Some(conn), &t)
                         .await
                         .into_frames();
                     WsOutcome::Reply(frames.into_iter().map(WsMessage::Text).collect())
@@ -88,6 +119,18 @@ impl WsMessageHandler for BrowserSessionHandler {
                 WsMessage::Binary(_) => WsOutcome::Close,
             })
         })
+    }
+
+    /// 切断時にその接続の接続 ID と nodeId 払い出し記録を解放する（`CDP-1`・`SEC-2`）。
+    fn on_close(&self, ctx: &WsConnContext, _reason: CloseReason) {
+        let removed = self
+            .conns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&ctx.conn_id());
+        if let Some(conn) = removed {
+            self.state.dom_issued().release_connection(conn);
+        }
     }
 }
 

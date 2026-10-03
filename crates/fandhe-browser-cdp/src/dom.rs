@@ -25,7 +25,7 @@
 //! - `sessionId` 付きの要求は、そのセッションのターゲットが最後に確定した文書
 //!   （`CdpState::navigations()`。#658）だけを返す。未遷移・遷移中・取得失敗は
 //!   `TARGET_DOCUMENT_UNAVAILABLE`（空文書を捏造しない）。`frameId` の固定値・
-//!   セッション／ターゲットに基づく決定は `CDP-2`・TASK-43。
+//!   セッション／ターゲットに基づく決定は `CDP-2`・TASK-43（接続単位の nodeId 分離は実装済み）。
 //!   `sessionId` なし（ブラウザレベル）は共有の直近 navigate 結果を読む
 //! - `<base href>` の解決は未実装。`href` 付き `base` 要素を持つ文書では `baseURL` を省略する
 //! - 採番は文書全体を走査するため、ノード数が [`MAX_NUMBERED_NODES`] を超える文書は
@@ -51,7 +51,7 @@ use fandhe_browser_core::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::protocol::{BoxFuture, CdpError, CommandContext, CommandHandler, HandlerOutput};
+use crate::protocol::{BoxFuture, CdpError, CommandContext, CommandHandler, ConnId, HandlerOutput};
 use crate::target::{SessionId, TargetId};
 
 /// 1 応答で展開する最大の深さ（root = 0）。構築は反復的だが、serde_json の直列化・drop が
@@ -375,10 +375,12 @@ fn load_document(
 
 /// `DOM.getDocument` が nodeId を払い出した文書の記録（`CDP-1`）。
 ///
-/// キーは要求元の `sessionId`（ブラウザレベルは `None`）。別セッションが同じターゲットへ
-/// attach していても、`DOM.getDocument` を呼んだセッションの nodeId だけが有効になる。
-/// ブラウザレベル（`None`）は WebSocket 接続の識別子がハンドラへ渡らないため接続間で共有される
-/// 既知の制約（接続単位の分離は `CDP-2`・TASK-43 で接続コンテキストを導入して対応）。
+/// キーは（WebSocket 接続 ID, 要求元の `sessionId`（ブラウザレベルは `None`））の組。
+/// 別セッション・別接続が同じターゲットへ attach していても、`DOM.getDocument` を呼んだ
+/// 接続・セッションの nodeId だけが有効になる（ブラウザレベルも接続ごとに分離）。接続が閉じたら
+/// [`IssuedDocuments::release_connection`] でその接続の記録を解放する。
+/// 接続 ID（[`ConnId`]）は `crate::ws` が `WsConnContext` の接続単位で割り当てて渡す。`None` は WebSocket を介さない
+/// 直接 dispatch（テスト）専用。
 /// 値は払い出し時点の確定文書と nodeId の `base`（[`number_nodes`]）で、
 /// `Arc` を保持するためアドレスが再利用されず `Arc::ptr_eq` で同一文書を判定できる。
 /// 遷移が確定すると新しい `Arc` に置き換わり、旧 nodeId は無効になる。保持件数は
@@ -398,8 +400,11 @@ pub(crate) struct IssuedDocuments {
     inner: Mutex<IssuedState>,
 }
 
+/// 払い出し記録のキー（接続 ID, `sessionId`）。
+type IssuedKey = (Option<ConnId>, Option<SessionId>);
+
 struct IssuedState {
-    docs: HashMap<Option<SessionId>, (Arc<NavigationResult>, i64)>,
+    docs: HashMap<IssuedKey, (Arc<NavigationResult>, i64)>,
     /// 次に割り当てる `base`（これまでに予約した nodeId 範囲の末尾）。
     next_base: i64,
 }
@@ -419,12 +424,13 @@ impl IssuedDocuments {
     /// 再利用しない）。カウンタがあふれる場合は `SERVER_ERROR`（`SEC-2`）。
     fn base_for(
         &self,
+        conn: Option<ConnId>,
         session: Option<&SessionId>,
         doc: &Arc<NavigationResult>,
         node_count: usize,
     ) -> Result<i64, CdpError> {
         let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((issued, base)) = st.docs.get(&session.cloned())
+        if let Some((issued, base)) = st.docs.get(&(conn, session.cloned()))
             && Arc::ptr_eq(issued, doc)
         {
             return Ok(*base);
@@ -445,13 +451,14 @@ impl IssuedDocuments {
     fn record(
         &self,
         registry: &crate::target::TargetRegistry,
+        conn: Option<ConnId>,
         session: Option<&SessionId>,
         doc: &Arc<NavigationResult>,
         base: i64,
         latest: impl FnOnce() -> Option<Arc<NavigationResult>>,
     ) -> bool {
         let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        st.docs.retain(|k, _| {
+        st.docs.retain(|(_, k), _| {
             k.as_ref()
                 .is_none_or(|s| registry.session_target(s).is_some())
         });
@@ -461,20 +468,43 @@ impl IssuedDocuments {
         if !session.is_none_or(|s| registry.session_target(s).is_some()) {
             return false;
         }
-        if let Some((issued, existing)) = st.docs.get(&session.cloned())
+        if let Some((issued, existing)) = st.docs.get(&(conn, session.cloned()))
             && Arc::ptr_eq(issued, doc)
         {
             return *existing == base;
         }
-        st.docs.insert(session.cloned(), (Arc::clone(doc), base));
+        st.docs
+            .insert((conn, session.cloned()), (Arc::clone(doc), base));
         true
     }
 
+    /// 接続 `conn` の払い出し記録をすべて解放する（切断時に `crate::ws` の `on_close` から呼ぶ。
+    /// 閉じた接続の記録を残さない。`SEC-2`・`CDP-1`）。`base` カウンタは巻き戻さない。
+    pub(crate) fn release_connection(&self, conn: ConnId) {
+        let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        st.docs.retain(|(c, _), _| *c != Some(conn));
+    }
+
+    /// 記録の件数（テスト用）。
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .docs
+            .len()
+    }
+
     /// `doc` が現在の払い出し済み文書と同一ならその nodeId の `base`。
-    fn issued_base(&self, session: Option<&SessionId>, doc: &Arc<NavigationResult>) -> Option<i64> {
+    fn issued_base(
+        &self,
+        conn: Option<ConnId>,
+        session: Option<&SessionId>,
+        doc: &Arc<NavigationResult>,
+    ) -> Option<i64> {
         let st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         st.docs
-            .get(&session.cloned())
+            .get(&(conn, session.cloned()))
             .filter(|(issued, _)| Arc::ptr_eq(issued, doc))
             .map(|(_, base)| *base)
     }
@@ -536,8 +566,12 @@ impl CommandHandler for DomQuerySelector {
             let (node_id, selector) = parse_query_params(params)?;
             let (latest, parsed) = load_document(&ctx, target.as_ref())?;
             // nodeId は getDocument が払い出した文書でのみ有効。未取得・遷移後は解決しない（`CDP-1`）。
-            // 払い出し記録は要求元セッション単位（別セッションの getDocument では有効にならない）。
-            let Some(base) = ctx.state.dom_issued().issued_base(ctx.session_id, &latest) else {
+            // 払い出し記録は要求元の接続・セッション単位（別接続・別セッションの getDocument では有効にならない）。
+            let Some(base) = ctx
+                .state
+                .dom_issued()
+                .issued_base(ctx.conn, ctx.session_id, &latest)
+            else {
                 return Err(CdpError::NODE_NOT_FOUND);
             };
             let found = query_selector_node_id(&parsed.document, base, node_id, selector)?;
@@ -545,7 +579,11 @@ impl CommandHandler for DomQuerySelector {
             let still_latest =
                 current_latest(&ctx, target.as_ref()).is_ok_and(|l| Arc::ptr_eq(&l, &latest));
             if !still_latest
-                || ctx.state.dom_issued().issued_base(ctx.session_id, &latest) != Some(base)
+                || ctx
+                    .state
+                    .dom_issued()
+                    .issued_base(ctx.conn, ctx.session_id, &latest)
+                    != Some(base)
             {
                 return Err(CdpError::NODE_NOT_FOUND);
             }
@@ -589,6 +627,7 @@ impl CommandHandler for DomGetDocument {
             let root = build_recorded_root(|| {
                 let (latest, parsed) = load_document(&ctx, target.as_ref())?;
                 let base = ctx.state.dom_issued().base_for(
+                    ctx.conn,
                     ctx.session_id,
                     &latest,
                     parsed.document.node_count(),
@@ -598,6 +637,7 @@ impl CommandHandler for DomGetDocument {
                 // 記録を古い `Arc` で上書きしない）。記録できたかを呼び出し側へ返す。
                 let recorded = ctx.state.dom_issued().record(
                     ctx.state.registry(),
+                    ctx.conn,
                     ctx.session_id,
                     &latest,
                     base,
@@ -891,6 +931,24 @@ mod tests {
         assert_eq!(calls, MAX_ISSUE_ATTEMPTS);
     }
 
+    /// 接続 A で払い出した記録は接続 B からは見えず、接続切断で解放される（`CDP-1`・`SEC-2`）。
+    #[test]
+    fn cdp1_issued_is_isolated_per_connection_and_released() {
+        let registry = crate::target::TargetRegistry::new();
+        let d = Arc::new(NavigationResult::new("https://example.com/", "<p>a</p>"));
+        let issued = IssuedDocuments::new();
+        let (a, b) = (ConnId::new(1), ConnId::new(2));
+        let base = issued.base_for(Some(a), None, &d, 10).unwrap();
+        assert!(issued.record(&registry, Some(a), None, &d, base, || Some(Arc::clone(&d))));
+        assert_eq!(issued.issued_base(Some(a), None, &d), Some(base));
+        assert_eq!(issued.issued_base(Some(b), None, &d), None);
+        issued.release_connection(b);
+        assert_eq!(issued.len(), 1);
+        issued.release_connection(a);
+        assert_eq!(issued.len(), 0);
+        assert_eq!(issued.issued_base(Some(a), None, &d), None);
+    }
+
     /// 古い文書の記録要求は、最新文書の払い出し記録を上書きしない（`CDP-1`）。
     #[test]
     fn cdp1_issued_record_rejects_stale_document() {
@@ -898,16 +956,16 @@ mod tests {
         let old = Arc::new(NavigationResult::new("https://example.com/", "<p>old</p>"));
         let new = Arc::new(NavigationResult::new("https://example.com/", "<p>new</p>"));
         let issued = IssuedDocuments::new();
-        let nb = issued.base_for(None, &new, 10).unwrap();
-        let ob = issued.base_for(None, &old, 10).unwrap();
+        let nb = issued.base_for(None, None, &new, 10).unwrap();
+        let ob = issued.base_for(None, None, &old, 10).unwrap();
         // 最新は new。new を記録できる。
-        assert!(issued.record(&registry, None, &new, nb, || Some(Arc::clone(&new))));
+        assert!(issued.record(&registry, None, None, &new, nb, || Some(Arc::clone(&new))));
         // 遅れて完了した old は最新でないため記録されず、new が有効なまま残る。
-        assert!(!issued.record(&registry, None, &old, ob, || Some(Arc::clone(&new))));
-        assert_eq!(issued.issued_base(None, &new), Some(nb));
-        assert_eq!(issued.issued_base(None, &old), None);
+        assert!(!issued.record(&registry, None, None, &old, ob, || Some(Arc::clone(&new))));
+        assert_eq!(issued.issued_base(None, None, &new), Some(nb));
+        assert_eq!(issued.issued_base(None, None, &old), None);
         // 最新を取得できない場合も記録しない。
-        assert!(!issued.record(&registry, None, &old, ob, || None));
+        assert!(!issued.record(&registry, None, None, &old, ob, || None));
     }
 
     /// nodeId の範囲は文書をまたいで再利用せず、同一文書の再払い出しは同じ範囲（`CDP-1`）。
@@ -917,27 +975,27 @@ mod tests {
         let a = Arc::new(NavigationResult::new("https://example.com/", "<p>a</p>"));
         let b = Arc::new(NavigationResult::new("https://example.com/", "<p>a</p>"));
         let issued = IssuedDocuments::new();
-        let ba = issued.base_for(None, &a, 10).unwrap();
+        let ba = issued.base_for(None, None, &a, 10).unwrap();
         assert_eq!(ba, 0);
-        assert!(issued.record(&registry, None, &a, ba, || Some(Arc::clone(&a))));
+        assert!(issued.record(&registry, None, None, &a, ba, || Some(Arc::clone(&a))));
         // 同一文書の再払い出しは既存の base を再利用する。
-        assert_eq!(issued.base_for(None, &a, 10).unwrap(), 0);
+        assert_eq!(issued.base_for(None, None, &a, 10).unwrap(), 0);
         // 別文書（同一 HTML でも別 Arc）は重ならない範囲を得る。
-        let bb = issued.base_for(None, &b, 10).unwrap();
+        let bb = issued.base_for(None, None, &b, 10).unwrap();
         assert_eq!(bb, 10);
-        assert!(issued.record(&registry, None, &b, bb, || Some(Arc::clone(&b))));
-        assert_eq!(issued.issued_base(None, &a), None);
-        assert_eq!(issued.issued_base(None, &b), Some(10));
+        assert!(issued.record(&registry, None, None, &b, bb, || Some(Arc::clone(&b))));
+        assert_eq!(issued.issued_base(None, None, &a), None);
+        assert_eq!(issued.issued_base(None, None, &b), Some(10));
         // 旧範囲の nodeId は新文書の採番に含まれない。
         let n = number_nodes(&doc(PAGE), 10);
         assert_eq!(n.resolve(1), None);
         assert_eq!(n.resolve(10), None);
         assert!(n.resolve(11).is_some());
         // 同一文書が別 base で記録済みなら並行記録は確定させない。
-        assert!(!issued.record(&registry, None, &b, 99, || Some(Arc::clone(&b))));
+        assert!(!issued.record(&registry, None, None, &b, 99, || Some(Arc::clone(&b))));
         // カウンタのあふれは明示エラー。
         assert_eq!(
-            issued.base_for(None, &a, usize::MAX),
+            issued.base_for(None, None, &a, usize::MAX),
             Err(CdpError::SERVER_ERROR)
         );
     }

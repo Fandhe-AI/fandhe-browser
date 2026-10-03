@@ -278,6 +278,20 @@ pub(crate) fn parse_request(text: &str) -> Result<CdpRequest, ParseFailure> {
     })
 }
 
+/// WebSocket 接続 1 本を表す crate 内の識別子（`crate::ws` が接続ごとに割り当てる。`CDP-1`）。
+///
+/// ブラウザレベルの状態（`DOM.getDocument` の nodeId 払い出し記録等）を接続単位で分離するための
+/// キー。プロセス内連番で推測可能なため認可には使わない（識別子であって資格情報ではない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ConnId(u64);
+
+impl ConnId {
+    /// 連番から構築する。
+    pub(crate) fn new(n: u64) -> Self {
+        Self(n)
+    }
+}
+
 /// ハンドラが参照する実行コンテキスト。
 // フィールドは 42.2 以降のハンドラが読む（骨格のみ先行）ため dead_code を許容する。
 #[allow(dead_code)]
@@ -286,6 +300,8 @@ pub(crate) struct CommandContext<'a> {
     pub state: &'a Arc<CdpState>,
     /// リクエストの `sessionId`。
     pub session_id: Option<&'a SessionId>,
+    /// 要求元の WebSocket 接続。WebSocket を介さない直接 dispatch（テスト）では `None`。
+    pub conn: Option<ConnId>,
 }
 
 /// 1 メソッド分のハンドラ。
@@ -369,7 +385,18 @@ impl Dispatcher {
     /// 受信テキスト 1 件を処理する。パース失敗・未登録メソッド・ハンドラのエラーは
     /// すべてエラー応答になり、成功応答を捏造しない（`SEC-2`）。未登録メソッドの
     /// 正式方針は 42.6（`CDP-6`）で確定する。
+    #[cfg(test)]
     pub async fn dispatch(&self, state: &Arc<CdpState>, text: &str) -> DispatchOutcome {
+        self.dispatch_on(state, None, text).await
+    }
+
+    /// [`Self::dispatch`] の接続指定版。ws.rs の `on_message_with_ctx` が接続 ID 付きで呼ぶ。
+    pub async fn dispatch_on(
+        &self,
+        state: &Arc<CdpState>,
+        conn: Option<ConnId>,
+        text: &str,
+    ) -> DispatchOutcome {
         let req = match parse_request(text) {
             Ok(r) => r,
             Err(f) => {
@@ -387,6 +414,7 @@ impl Dispatcher {
         let ctx = CommandContext {
             state,
             session_id: req.session_id.as_ref(),
+            conn,
         };
         match handler.handle(ctx, &req.params).await {
             Ok(out) => {
