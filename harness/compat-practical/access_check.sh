@@ -109,13 +109,15 @@ jq -cn --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg ua "$UA" --argjson to "$T
 
 REACHABLE=0
 while IFS=$'\t' read -r id cat url; do
-  start=$(date +%s)
   set +e
-  code=$(curl -sS -o /dev/null -w '%{http_code}' -L --max-redirs 5 --max-time "$TIMEOUT" \
+  out=$(LC_ALL=C curl -sS -o /dev/null -w '%{http_code} %{time_total}' -L --max-redirs 5 --max-time "$TIMEOUT" \
     --proto '=https' --proto-redir '=https' -A "$UA" -- "$url" 2>/dev/null)
   rc=$?
   set -e
-  elapsed=$((($(date +%s) - start) * 1000))
+  # curl の time_total（秒・小数）をミリ秒へ変換する。取得できなければ 0
+  code="${out%% *}"
+  total="${out#* }"
+  elapsed=$(LC_ALL=C awk -v t="$total" 'BEGIN { if (t ~ /^[0-9]+(\.[0-9]+)?$/) printf "%d", t * 1000; else print 0 }')
   [[ "$code" =~ ^[0-9]{3}$ ]] || code=0
   [ "$rc" -eq 0 ] || code=0
   reach=false

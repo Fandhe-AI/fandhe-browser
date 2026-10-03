@@ -100,8 +100,8 @@ STUB_DIR="$WORK/stub"
 mkdir -p "$STUB_DIR"
 cat >"$STUB_DIR/curl" <<'STUB'
 #!/usr/bin/env bash
-# -w '%{http_code}' の出力を STUB_CODE、終了コードを STUB_RC で固定する
-printf '%s' "${STUB_CODE:-200}"
+# -w '%{http_code} %{time_total}' の出力を STUB_CODE と固定の 0.250 秒、終了コードを STUB_RC で固定する
+printf '%s 0.250' "${STUB_CODE:-200}"
 exit "${STUB_RC:-0}"
 STUB
 chmod +x "$STUB_DIR/curl"
@@ -119,6 +119,7 @@ expect_eq "$(jq -s 'length' "$WORK/out.jsonl")" "3" "jsonl line count"
 expect_eq "$(result_field x1 http_status)" "200" "200 http_status"
 expect_eq "$(result_field x1 reachable)" "true" "200 reachable"
 expect_eq "$(result_field x1 curl_exit)" "0" "200 curl_exit"
+expect_eq "$(result_field x1 elapsed_ms)" "250" "200 elapsed_ms (ms 精度)"
 
 expect_exit "stub timeout" 0 run_net 000 28
 expect_contains "$LAST_OUTPUT" "reachable=0/2" "stub timeout summary"
