@@ -458,6 +458,12 @@ jobs:
           fi
       - name: 自己テスト（fixture による閾値未満 fail の証跡確認）
         run: bash harness/compat-regression/self-test.sh
+      # TASK-71.1（#310・MEAS-4）: 実測ハーネス compat-practical の自己テストと
+      # tasks.json のスキーマ検証。curl はスタブでネットワーク・secrets は使わない。
+      - name: compat-practical 自己テスト・tasks.json スキーマ検証
+        run: |
+          bash harness/compat-practical/self-test.sh
+          bash harness/compat-practical/access_check.sh --validate-only
       - name: 対象サイト群の動作率回帰チェック
         run: |
           bash harness/compat-regression/check-matrix.sh \
