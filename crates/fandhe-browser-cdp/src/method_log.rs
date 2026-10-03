@@ -7,14 +7,21 @@
 //! [`ReceivedMethodsSnapshot`] だけを公開する。
 //!
 //! 記録するのはメソッド名と件数のみ（`id`・`sessionId`・`params` は記録しない）。メソッド名は
-//! クライアントが自由に決められるため、区別して保持する名前数に [`MAX_TRACKED_METHODS`] の
-//! 上限を設け、超過分は件数だけ数える（無制限メモリ確保による DoS の防止）。
+//! クライアントが自由に決められるため、未実装メソッドとして区別して保持する名前数に
+//! [`MAX_TRACKED_METHODS`] の上限を設け、超過分は件数だけ数える（無制限メモリ確保による DoS の
+//! 防止）。ハンドラ登録済みメソッド（`Handled`）は名前集合がハンドラ登録数で有界なため上限の
+//! 対象外とし、未実装名の枠を食わない。上限到達後に初めて届いた未実装名は保持しないが、
+//! [`MAX_OVERFLOW_REPORTS`] 件までは呼び出し側がログ出力できるよう
+//! [`RecordResult::DroppedReport`] を返し、必須メソッドの洗い出し（`CDP-6`）を妨げない。
 
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 /// 区別して保持するメソッド名数の上限。
 pub(crate) const MAX_TRACKED_METHODS: usize = 256;
+
+/// 保持上限到達後に、名前を保持せず呼び出し側へ出力を促す回数の上限（ログ洪水の防止）。
+pub(crate) const MAX_OVERFLOW_REPORTS: u64 = 1024;
 
 /// メソッドの処理結果の区分。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,8 +39,11 @@ pub(crate) enum RecordResult {
     FirstSeen,
     /// 既に保持している名前のカウントを増やした。
     Counted,
-    /// 保持上限に達していたため名前を保持せず、破棄件数だけ増やした。
+    /// 保持上限に達していたため名前を保持せず、破棄件数だけ増やした（出力枠も使い切り済み）。
     Dropped,
+    /// 保持上限に達していたため名前は保持しないが、出力枠が残っているので呼び出し側は
+    /// 名前を 1 回ログへ出してよい（同名の重複は排除しない。枠は [`MAX_OVERFLOW_REPORTS`]）。
+    DroppedReport,
 }
 
 /// メソッド 1 つ分の受信件数。
@@ -60,6 +70,7 @@ pub struct ReceivedMethodsSnapshot {
 struct Inner {
     methods: HashMap<String, MethodCounts>,
     dropped: u64,
+    overflow_reports: u64,
 }
 
 /// 上限付きの受信メソッド集計。
@@ -77,8 +88,17 @@ impl ReceivedMethodLog {
     pub(crate) fn record(&self, method: &str, kind: MethodDisposition) -> RecordResult {
         let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let first = !g.methods.contains_key(method);
-        if first && g.methods.len() >= MAX_TRACKED_METHODS {
+        // 上限は未実装名だけに適用する（Handled はハンドラ登録数で有界）。
+        let tracked_unimpl = g.methods.values().filter(|c| c.unimplemented > 0).count();
+        if first
+            && kind == MethodDisposition::Unimplemented
+            && tracked_unimpl >= MAX_TRACKED_METHODS
+        {
             g.dropped = g.dropped.saturating_add(1);
+            if g.overflow_reports < MAX_OVERFLOW_REPORTS {
+                g.overflow_reports += 1;
+                return RecordResult::DroppedReport;
+            }
             return RecordResult::Dropped;
         }
         let c = g.methods.entry(method.to_owned()).or_default();
@@ -145,7 +165,7 @@ mod tests {
             if i < MAX_TRACKED_METHODS {
                 assert_eq!(r, RecordResult::FirstSeen);
             } else {
-                assert_eq!(r, RecordResult::Dropped);
+                assert_eq!(r, RecordResult::DroppedReport);
             }
         }
         assert_eq!(
@@ -157,6 +177,36 @@ mod tests {
         assert_eq!(s.dropped, 3);
         let m0 = s.methods.iter().find(|(k, _)| k == "M.m0").unwrap().1;
         assert_eq!(m0.unimplemented, 2);
+    }
+
+    #[test]
+    fn cdp6_method_log_handled_names_do_not_consume_unimplemented_slots() {
+        let log = ReceivedMethodLog::new();
+        for i in 0..MAX_TRACKED_METHODS {
+            log.record(&format!("H.h{i}"), MethodDisposition::Handled);
+        }
+        assert_eq!(
+            log.record("New.method", MethodDisposition::Unimplemented),
+            RecordResult::FirstSeen
+        );
+    }
+
+    #[test]
+    fn cdp6_method_log_overflow_reports_are_bounded() {
+        let log = ReceivedMethodLog::new();
+        for i in 0..MAX_TRACKED_METHODS {
+            log.record(&format!("M.m{i}"), MethodDisposition::Unimplemented);
+        }
+        let mut reports = 0u64;
+        for i in 0..MAX_OVERFLOW_REPORTS + 5 {
+            if log.record(&format!("O.o{i}"), MethodDisposition::Unimplemented)
+                == RecordResult::DroppedReport
+            {
+                reports += 1;
+            }
+        }
+        assert_eq!(reports, MAX_OVERFLOW_REPORTS);
+        assert_eq!(log.snapshot().dropped, MAX_OVERFLOW_REPORTS + 5);
     }
 
     #[test]

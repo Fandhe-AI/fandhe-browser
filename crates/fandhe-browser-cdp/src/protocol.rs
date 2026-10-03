@@ -42,8 +42,8 @@
 //!
 //! パースと名前検証を通ったリクエストのメソッド名と件数を `CdpState` の受信ログ
 //! （[`CdpState::received_methods`]）へ記録する（`id`・`sessionId`・`params` は記録しない。
-//! 保持名数に上限あり。`crate::method_log`）。未実装メソッドは名前の初出時に 1 回だけ
-//! stderr へ 1 行出す。本番の出力先は #221（TASK-10.3）で決める。
+//! 未実装名の保持数に上限あり。`crate::method_log`）。未実装メソッドは名前の初出時に 1 回だけ
+//! stderr へ 1 行出す（保持上限到達後も一定件数までは出す）。本番の出力先は #221（TASK-10.3）で決める。
 
 use std::collections::HashMap;
 use std::fmt;
@@ -435,7 +435,13 @@ impl Dispatcher {
             MethodDisposition::Unimplemented
         };
         let recorded = state.method_log().record(&req.method, kind);
-        if kind == MethodDisposition::Unimplemented && recorded == RecordResult::FirstSeen {
+        // 保持上限到達後も出力枠内（DroppedReport）は名前を出し、必須メソッドの洗い出しを妨げない。
+        if kind == MethodDisposition::Unimplemented
+            && matches!(
+                recorded,
+                RecordResult::FirstSeen | RecordResult::DroppedReport
+            )
+        {
             // 名前は method_name_is_valid 済み（ASCII 英数字と `.`）なのでログ注入の恐れはない。
             eprintln!("cdp: unimplemented method received: {}", req.method);
         }
