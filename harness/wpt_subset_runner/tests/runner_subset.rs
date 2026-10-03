@@ -124,6 +124,20 @@ fn build_tree() -> PathBuf {
              <script>test(function () {{ assert_true(true); }}, 'only classic');</script>\n"
         ),
     );
+    // template 内のスクリプトは実行されない文書の一部ではないため、計画に含めない。
+    write(
+        &root,
+        "dom/template.html",
+        &format!(
+            "{HEAD}<template><script>throw new Error('in template');</script></template>\n\
+             <script>test(function () {{ assert_true(true); }}, 'outside');done();</script>\n"
+        ),
+    );
+    write(
+        &root,
+        "dom/template-harness-only.html",
+        "<!DOCTYPE html>\n<template><script src=\"/resources/testharness.js\"></script></template>\n",
+    );
     // 総量上限（PLUG-10）の回帰用。インライン 3 本 + 外部サポート 1 本。
     write(
         &root,
@@ -256,6 +270,20 @@ fn run_cases(root: &Path, engine: Option<EngineKind>) {
         }
         other => panic!("throws.html: {other:?}"),
     }
+
+    match th("dom/template.html") {
+        FileOutcome::Completed {
+            subtests, verdict, ..
+        } => {
+            assert_eq!(verdict, Verdict::Pass);
+            assert_eq!(subtests.first().expect("subtest").name, "outside");
+        }
+        other => panic!("template.html: {other:?}"),
+    }
+    assert_eq!(
+        th("dom/template-harness-only.html"),
+        FileOutcome::HarnessNotReferenced
+    );
 
     // PLUG-10: 件数・合計サイズ・時間の総量上限超過はエラーとして記録する。
     let limited = |l: RunLimits| {

@@ -610,6 +610,12 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
                 if code.len() as u64 > MAX_SCRIPT_BYTES {
                     return FileOutcome::TooLarge;
                 }
+                consumed_bytes = consumed_bytes.saturating_add(code.len() as u64);
+                if consumed_bytes > limits.max_total_bytes {
+                    return FileOutcome::LimitExceeded {
+                        kind: LimitKind::TotalBytes,
+                    };
+                }
                 if let Err(error) = eval(&mut runtime, code) {
                     return FileOutcome::ScriptFailed { index, error };
                 }
@@ -708,6 +714,9 @@ fn is_classic_script_type(ty: Option<&str>) -> bool {
 }
 
 /// HTML をパースして JS の `<script>` を文書順に集める（`src` があれば外部扱い）。
+///
+/// `<template>` の template contents は core の `descendants` が辿らない（別フラグメント）
+/// ため、template 内の `<script>` は計画に含まれない（`tests/runner_subset.rs` で検証）。
 fn collect_scripts(html: &str) -> Result<Vec<ScriptSource>, String> {
     let options = ParseOptions::default()
         .with_scripting_enabled(true)
