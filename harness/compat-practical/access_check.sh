@@ -5,7 +5,7 @@
 # JSONL に書く。結果は後続の run_core.sh（TASK-71.2・#311）と matrix.json 生成
 # （TASK-71.3・#312）が jq で読む。本スクリプトは fandhe-browser を起動しない。
 #
-# 使い方: access_check.sh [--tasks P] [--out P] [--timeout SEC] [--bin P] [--validate-only]
+# 使い方: access_check.sh [--tasks P] [--out P] [--timeout SEC] [--total-timeout SEC] [--bin P] [--validate-only]
 # 終了コード: 0=記録完了（到達不能サイトがあっても 0。到達可否は計測結果でありゲートではない）
 #            1=記録の書き込み失敗  2=入力・使用エラー（スキーマ違反・引数不正・jq/curl 無し・バイナリ検証失敗）
 set -euo pipefail
@@ -17,6 +17,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TASKS="$SCRIPT_DIR/tasks.json"
 OUT="$SCRIPT_DIR/results/access_check.jsonl"
 TIMEOUT=8
+# 全タスク合計の実行時間上限（秒）。--timeout は curl 1 回ごとの上限で、最大 1000 タスク × 最大 6 取得
+# （リダイレクト追従込み）では実行時間が際限なく伸びるため、全体の期限を別に設ける（P0: リソース上限）
+TOTAL_TIMEOUT=600
 BIN_ARG=""
 VALIDATE_ONLY=0
 # UA は偽装しない正直な識別子（security.md: UA 偽装・anti-bot 回避の禁止）
@@ -36,6 +39,7 @@ while [ $# -gt 0 ]; do
     --tasks) [ $# -ge 2 ] || die "--tasks requires a value"; TASKS="$2"; shift 2 ;;
     --out) [ $# -ge 2 ] || die "--out requires a value"; OUT="$2"; shift 2 ;;
     --timeout) [ $# -ge 2 ] || die "--timeout requires a value"; TIMEOUT="$2"; shift 2 ;;
+    --total-timeout) [ $# -ge 2 ] || die "--total-timeout requires a value"; TOTAL_TIMEOUT="$2"; shift 2 ;;
     --bin) [ $# -ge 2 ] || die "--bin requires a value"; BIN_ARG="$2"; shift 2 ;;
     --validate-only) VALIDATE_ONLY=1; shift ;;
     *) die "unknown argument: $1" ;;
@@ -46,6 +50,9 @@ done
 type -P jq >/dev/null 2>&1 || die "jq is required but was not found on PATH"
 if ! [[ "$TIMEOUT" =~ ^[1-9][0-9]?$ ]] || [ "$TIMEOUT" -gt 60 ]; then
   die "--timeout must be an integer in 1..60"
+fi
+if ! [[ "$TOTAL_TIMEOUT" =~ ^[1-9][0-9]{0,3}$ ]] || [ "$TOTAL_TIMEOUT" -gt 3600 ]; then
+  die "--total-timeout must be an integer in 1..3600"
 fi
 [ -f "$TASKS" ] || die "tasks file not found: $TASKS"
 size=$(wc -c <"$TASKS" | tr -d ' ')
@@ -118,9 +125,9 @@ trap 'rm -f "$TMP"' EXIT
 
 # MSYS2_ARG_CONV_EXCL: Windows（Git Bash）がネイティブ jq へ渡す /tmp/... 形式の --arg 値を
 # C:/... へ変換して記録値がずれるのを防ぐ（この呼び出しはファイル引数を持たないため全除外してよい）
-MSYS2_ARG_CONV_EXCL='*' jq -cn --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg ua "$UA" --argjson to "$TIMEOUT" \
+MSYS2_ARG_CONV_EXCL='*' jq -cn --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg ua "$UA" --argjson to "$TIMEOUT" --argjson tto "$TOTAL_TIMEOUT" \
   --arg sha "$(sha256_of "$TASKS")" --arg bin "$BIN_RESOLVED" \
-  '{type:"meta",measured_at:$at,user_agent:$ua,timeout_sec:$to,tasks_sha256:$sha,bin:(if $bin=="" then null else $bin end)}' >"$TMP"
+  '{type:"meta",measured_at:$at,user_agent:$ua,timeout_sec:$to,total_timeout_sec:$tto,tasks_sha256:$sha,bin:(if $bin=="" then null else $bin end)}' >"$TMP"
 
 MAX_REDIRS=5
 
@@ -131,10 +138,17 @@ MAX_REDIRS=5
 #   プロキシは --noproxy '*' で無効化し、curl の remote_ip も事後検証する。
 #   結果をグローバル F_CODE / F_RC / F_MS / F_BLOCKED（拒否理由。無ければ空）へ設定する。
 fetch_site() {
-  local cur="$1" hop=0 host ips ip out rc code t rip loc ms reason
+  local cur="$1" hop=0 host ips ip out rc code t rip loc ms reason remaining max_time
   local pins=()
   F_CODE=0; F_RC=0; F_MS=0; F_BLOCKED=""
   while :; do
+    # 全体期限（TOTAL_TIMEOUT）を超えたら以降の取得は行わず、記録だけ確定させる（curl_exit=28 は timeout 相当）
+    remaining=$((TOTAL_TIMEOUT - SECONDS))
+    if [ "$remaining" -le 0 ]; then
+      F_BLOCKED="total time limit exceeded"; F_CODE=0; F_RC=28; return 0
+    fi
+    max_time=$TIMEOUT
+    if [ "$remaining" -lt "$max_time" ]; then max_time=$remaining; fi
     if ! reason="$(url_check "$cur")"; then
       F_BLOCKED="$reason"; F_CODE=0; return 0
     fi
@@ -160,7 +174,7 @@ fetch_site() {
     # -q: .curlrc を読まない。--noproxy '*': 環境変数・設定のプロキシを無効化し、--resolve で固定した
     # 検証済みアドレスへ直接接続させる（プロキシ経由だと最終宛先を固定・検証できず SSRF 対策を迂回される）
     out=$(LC_ALL=C curl -q -sS --noproxy '*' -o /dev/null -w '%{http_code} %{time_total} %{remote_ip} %{redirect_url}' \
-      --max-time "$TIMEOUT" --proto '=https' --proto-redir '=https' -A "$UA" \
+      --max-time "$max_time" --proto '=https' --proto-redir '=https' -A "$UA" \
       ${pins[@]+"${pins[@]}"} -- "$cur" 2>/dev/null)
     rc=$?
     set -e
@@ -187,6 +201,8 @@ fetch_site() {
 }
 
 REACHABLE=0
+# bash 組み込みの SECONDS で全体期限を測る。ここから計時を始める
+SECONDS=0
 while IFS=$'\t' read -r id cat url; do
   fetch_site "$url"
   reach=false

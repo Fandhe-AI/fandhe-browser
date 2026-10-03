@@ -106,6 +106,8 @@ expect_contains "$LAST_OUTPUT" "exactly one JSON document" "multiple documents m
 expect_exit "invalid json" 2 bash "$CHECK" --validate-only --tasks "$WORK/bad.json"
 expect_exit "timeout zero" 2 bash "$CHECK" --validate-only --timeout 0
 expect_exit "timeout over" 2 bash "$CHECK" --validate-only --timeout 61
+expect_exit "total timeout zero" 2 bash "$CHECK" --validate-only --total-timeout 0
+expect_exit "total timeout over" 2 bash "$CHECK" --validate-only --total-timeout 3601
 
 # --- ネットワーク経路（curl スタブ）---
 STUB_DIR="$WORK/stub"
@@ -116,6 +118,7 @@ cat >"$STUB_DIR/curl" <<'STUB'
 # STUB_CODE=コード（固定 0.250 秒）STUB_IP=接続先 IP STUB_REDIRECT=redirect_url STUB_RC=終了コード。
 # STUB_LOG があれば呼び出しごとの引数を追記する。
 [ -z "${STUB_LOG:-}" ] || echo "$*" >>"$STUB_LOG"
+[ -z "${STUB_SLEEP:-}" ] || sleep "$STUB_SLEEP"
 printf '%s 0.250 %s %s' "${STUB_CODE:-200}" "${STUB_IP:-93.184.216.34}" "${STUB_REDIRECT:-}"
 exit "${STUB_RC:-0}"
 STUB
@@ -153,6 +156,14 @@ expect_exit "stub 403" 0 run_net 403 0
 expect_eq "$(result_field x2 http_status)" "403" "403 http_status"
 expect_eq "$(result_field x2 reachable)" "false" "403 reachable"
 expect_eq "$(ls -A "$WORK" | grep -c '^\.access_check\.' || true)" "0" "no leftover temp file"
+
+# --- 全体期限（--total-timeout）: 超過後のタスクは取得せず blocked で記録を確定する ---
+: >"$WORK/curl-dl.log"
+expect_exit "total deadline" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$WORK/curl-dl.log" STUB_SLEEP=2 bash "$CHECK" --tasks "$WORK/net.json" --total-timeout 1 --out "$WORK/dl.jsonl"
+expect_eq "$(wc -l <"$WORK/curl-dl.log" | tr -d ' ')" "1" "total deadline: curl not invoked after expiry"
+expect_eq "$(jq -r 'select(.id=="x2") | .blocked' "$WORK/dl.jsonl")" "total time limit exceeded" "total deadline blocked reason"
+expect_eq "$(jq -r 'select(.id=="x2") | .curl_exit' "$WORK/dl.jsonl")" "28" "total deadline curl_exit"
+expect_eq "$(jq -s 'length' "$WORK/dl.jsonl")" "3" "total deadline: all records written"
 
 # --- SSRF 対策（url_check / 解決後アドレス / リダイレクト）---
 expect_exit "url_check public host" 0 url_check "https://example.com/"
@@ -223,25 +234,37 @@ expect_contains "$LAST_OUTPUT" "reachable=0/2" "unresolvable summary"
 expect_eq "$(wc -l <"$LOG" | tr -d ' ')" "0" "unresolvable: curl not invoked"
 expect_eq "$(jq -r 'select(.id=="x1") | .blocked' "$WORK/nores.jsonl")" "host could not be resolved for address pinning" "unresolvable blocked reason"
 
-# getent / dscacheutil が無い環境（Windows の Bash 環境）では powershell で解決する
+# getent / dscacheutil が無い環境（Windows の Bash 環境）では powershell で解決する。
+# Linux / macOS では getent / dscacheutil が先に選ばれるため PATH をスタブだけに絞る。Windows（Git Bash）では
+# 絞った PATH だと MSYS のシンボリックリンク・DLL 解決が不安定なため、スタブを PATH 先頭へ足すだけにする
 PS_DIR="$WORK/ps"
 mkdir -p "$PS_DIR"
-for t in awk sort tr; do ln -s "$(type -P "$t")" "$PS_DIR/$t"; done
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) PS_PATH="$PS_DIR:$PATH" ;;
+  *)
+    for t in awk sort tr; do ln -s "$(type -P "$t")" "$PS_DIR/$t"; done
+    PS_PATH="$PS_DIR"
+    ;;
+esac
 cat >"$PS_DIR/powershell.exe" <<'STUB'
 #!/bin/sh
 # CRLF 付きで STUB_PS_IPS（空白区切り）を返し、環境変数経由のホスト名を STUB_PS_LOG へ記録する
+# STUB_PS_FAIL があれば DNS 失敗（GetHostAddresses の例外）を模して何も出さず非 0 で終わる
 [ -z "${STUB_PS_LOG:-}" ] || echo "host=$FANDHE_RESOLVE_HOST" >>"$STUB_PS_LOG"
+[ -z "${STUB_PS_FAIL:-}" ] || exit 1
 for ip in $STUB_PS_IPS; do printf '%s\r\n' "$ip"; done
 STUB
 chmod +x "$PS_DIR/powershell.exe"
 PS_LOG="$WORK/ps.log"
 : >"$PS_LOG"
-expect_eq "$(env PATH="$PS_DIR" STUB_PS_LOG="$PS_LOG" STUB_PS_IPS="93.184.216.34 2606:4700::1" "$BASH" -c ". '$SCRIPT_DIR/lib.sh'; resolve_host_ips example.com" | tr '\n' ' ')" \
+expect_eq "$(env PATH="$PS_PATH" STUB_PS_LOG="$PS_LOG" STUB_PS_IPS="93.184.216.34 2606:4700::1" "$BASH" -c ". '$SCRIPT_DIR/lib.sh'; resolve_host_ips example.com" | tr '\n' ' ')" \
   "2606:4700::1 93.184.216.34 " "powershell resolver output (CR 除去・ソート)"
 expect_contains "$(cat "$PS_LOG")" "host=example.com" "powershell receives host via env"
 : >"$PS_LOG"
-expect_eq "$(env PATH="$PS_DIR" STUB_PS_LOG="$PS_LOG" STUB_PS_IPS="93.184.216.34" "$BASH" -c ". '$SCRIPT_DIR/lib.sh'; resolve_host_ips 'a;b\$(x).com'")" "" "powershell resolver rejects unsafe host"
+expect_eq "$(env PATH="$PS_PATH" STUB_PS_LOG="$PS_LOG" STUB_PS_IPS="93.184.216.34" "$BASH" -c ". '$SCRIPT_DIR/lib.sh'; resolve_host_ips 'a;b\$(x).com'")" "" "powershell resolver rejects unsafe host"
 expect_eq "$(wc -c <"$PS_LOG" | tr -d ' ')" "0" "powershell not invoked for unsafe host"
+# DNS 失敗（powershell が非 0 終了）でも set -eo pipefail 下で resolve_host_ips は 0 を返し何も出さない
+expect_exit "powershell dns failure returns 0" 0 env PATH="$PS_PATH" STUB_PS_FAIL=1 "$BASH" -c "set -eo pipefail; . '$SCRIPT_DIR/lib.sh'; r=\$(resolve_host_ips nx.example.com); [ -z \"\$r\" ]"
 
 : >"$LOG"
 expect_exit "proxy disabled" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/noproxy.jsonl"

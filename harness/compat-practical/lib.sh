@@ -102,13 +102,15 @@ url_check() {
 #   いずれも無い・解決できないときは何も出さず、呼び出し側（access_check.sh）が接続先を固定できない
 #   ホストとして取得前に拒否する（fail-closed）。
 #   PowerShell へはホスト名を環境変数で渡しコマンド文字列へ連結しない（インジェクション対策）。
+#   名前解決の失敗（PowerShell の GetHostAddresses は DNS 失敗で例外 → 非 0 終了）は pipefail 下でも
+#   `|| true` で吸収し、常に return 0 で「何も出さない」ことで呼び出し側の fail-closed 拒否へ繋ぐ。
 #   併せてホスト名を DNS ラベル文字（英数字・ハイフン・ドット）に限って検証する。
 resolve_host_ips() {
   local ps
   if command -v getent >/dev/null 2>&1; then
-    getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u
+    getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u || true
   elif command -v dscacheutil >/dev/null 2>&1; then
-    dscacheutil -q host -a name "$1" 2>/dev/null | awk '/^(ip_address|ipv6_address):/ {print $2}' | sort -u
+    dscacheutil -q host -a name "$1" 2>/dev/null | awk '/^(ip_address|ipv6_address):/ {print $2}' | sort -u || true
   else
     ps=""
     if command -v powershell.exe >/dev/null 2>&1; then
@@ -119,7 +121,7 @@ resolve_host_ips() {
     if [ -n "$ps" ] && [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; then
       FANDHE_RESOLVE_HOST="$1" "$ps" -NoProfile -NonInteractive -Command \
         '[System.Net.Dns]::GetHostAddresses($env:FANDHE_RESOLVE_HOST) | ForEach-Object { $_.IPAddressToString }' \
-        2>/dev/null | tr -d '\r' | awk 'NF {print $1}' | sort -u
+        2>/dev/null | tr -d '\r' | awk 'NF {print $1}' | sort -u || true
     fi
   fi
   return 0
