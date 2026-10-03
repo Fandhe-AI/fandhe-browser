@@ -121,9 +121,19 @@ done <<<"${dirs_sorted}"
 [ ! -L "${WORK_DIR}" ] || die "${WORK_DIR} is a symlink; refusing to use it"
 mkdir -p "${WORK_DIR}"
 STAGE="$(mktemp -d "${WORK_DIR}/.wpt-stage.XXXXXX")" || die "failed to create staging directory"
-trap 'rm -rf "${STAGE}"' EXIT
 NEW_DIR="${STAGE}/wpt"
 TSV_TMP="${STAGE}/subset.tsv"
+# KEEP_STAGE=1 の間（旧データを STAGE へ退避している区間）は、異常終了しても STAGE 内の
+# 退避データ（old・old.tsv）を消さない。新規取得側（NEW_DIR・TSV_TMP）だけを後始末する。
+KEEP_STAGE=0
+cleanup() {
+  if [ "${KEEP_STAGE}" = "1" ]; then
+    rm -rf "${NEW_DIR}" "${TSV_TMP}" || true
+  else
+    rm -rf "${STAGE}"
+  fi
+}
+trap cleanup EXIT
 OUT_TSV="${WORK_DIR}/subset.tsv"
 # 出力先の種別は置き換えに着手する前に検証する（置換の途中失敗で旧データを失わないため）。
 # symlink は置換時にリンク自体を除去するため許容し、ディレクトリだけを拒否する。
@@ -170,18 +180,35 @@ git_new checkout -q --detach "${REV}" || die "git checkout ${REV} failed"
 # 取得と検証が成功した後にだけ置き換える。置き換え先が symlink なら辿らずリンク自体を除去する
 # （mv は symlink 先のディレクトリの中へ移動してしまうため）。既存の wpt/・subset.tsv は
 # 退避してから差し替え、どちらかの差し替えに失敗したら両方を元へ戻す（旧データを失わない）。
+# 復元の各手順は個別に判定し、1 つでも失敗したら退避データ（STAGE）を保持して手動復旧の
+# 手順を stderr へ出す。復元が完全に成功したときだけ KEEP_STAGE=0 にして STAGE を消す。
 rollback() {
-  rm -rf "${WPT_DIR}"
-  [ ! -e "${STAGE}/old" ] && [ ! -L "${STAGE}/old" ] || mv "${STAGE}/old" "${WPT_DIR}"
-  [ ! -e "${STAGE}/old.tsv" ] && [ ! -L "${STAGE}/old.tsv" ] || mv "${STAGE}/old.tsv" "${OUT_TSV}"
-  die "$1"
+  local reason="$1" failed=0
+  rm -rf "${WPT_DIR}" || failed=1
+  if [ -e "${STAGE}/old" ] || [ -L "${STAGE}/old" ]; then
+    mv "${STAGE}/old" "${WPT_DIR}" || failed=1
+  fi
+  if [ -e "${STAGE}/old.tsv" ] || [ -L "${STAGE}/old.tsv" ]; then
+    mv "${STAGE}/old.tsv" "${OUT_TSV}" || failed=1
+  fi
+  if [ "${failed}" -ne 0 ]; then
+    KEEP_STAGE=1
+    echo "error: rollback failed; previous data is preserved in ${STAGE}" >&2
+    echo "error: to restore manually: mv ${STAGE}/old ${WPT_DIR}; mv ${STAGE}/old.tsv ${OUT_TSV}" >&2
+    echo "error: (remove ${WPT_DIR} and ${OUT_TSV} first if they exist; then delete ${STAGE})" >&2
+  else
+    KEEP_STAGE=0
+  fi
+  die "${reason}"
 }
+KEEP_STAGE=1
 if [ -L "${WPT_DIR}" ] || [ -e "${WPT_DIR}" ]; then
-  mv "${WPT_DIR}" "${STAGE}/old" || die "failed to move aside ${WPT_DIR}"
+  mv "${WPT_DIR}" "${STAGE}/old" || { KEEP_STAGE=0; die "failed to move aside ${WPT_DIR}"; }
 fi
 if [ -L "${OUT_TSV}" ] || [ -e "${OUT_TSV}" ]; then
   mv "${OUT_TSV}" "${STAGE}/old.tsv" || rollback "failed to move aside ${OUT_TSV}"
 fi
 mv "${NEW_DIR}" "${WPT_DIR}" || rollback "failed to install ${WPT_DIR}"
 mv "${TSV_TMP}" "${OUT_TSV}" || rollback "failed to write ${OUT_TSV}"
+KEEP_STAGE=0
 echo "WPT ${REV} ready at ${WPT_DIR}; wrote ${OUT_TSV}"

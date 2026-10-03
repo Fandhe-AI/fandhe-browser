@@ -167,5 +167,30 @@ PATH="${TMP}/fakebin:${PATH}" run_fetch "${work}" "${SRC_URL}"
 check "install failure: rolled back" \
   '[ "${RUN_RC}" -eq 2 ] && [[ "${RUN_OUT}" == *"failed to write"* ]] && [ "$(cat "${work}/wpt/marker.txt")" = "old-content" ] && [ "$(cat "${work}/subset.tsv")" = "old-tsv" ]'
 
+# 9. 復元（rollback）自体が失敗したら、退避した旧データを消さず、場所を stderr に出して非 0 で終了する。
+#    subset.tsv の設置と、旧 subset.tsv の復元（old.tsv -> subset.tsv）の両方を mv で落とす。
+work="${TMP}/rollback-fails"
+mkdir -p "${work}/wpt" "${TMP}/fakebin2"
+printf 'old-content\n' >"${work}/wpt/marker.txt"
+printf 'old-tsv\n' >"${work}/subset.tsv"
+cat >"${TMP}/fakebin2/mv" <<MV_EOF
+#!/usr/bin/env bash
+case "\$*" in
+  *"/subset.tsv "*"/subset.tsv") exit 1 ;;
+  *"/old.tsv "*"/subset.tsv") exit 1 ;;
+esac
+exec "${REAL_MV}" "\$@"
+MV_EOF
+chmod +x "${TMP}/fakebin2/mv"
+PATH="${TMP}/fakebin2:${PATH}" run_fetch "${work}" "${SRC_URL}"
+stage_dir="$(find "${work}" -maxdepth 1 -name '.wpt-stage.*' | head -n 1)"
+check "rollback failure: exits 2 and reports the preserved location" \
+  '[ "${RUN_RC}" -eq 2 ] && [ -n "${stage_dir}" ] && [[ "${RUN_OUT}" == *"rollback failed"* ]] && [[ "${RUN_OUT}" == *"${stage_dir}"* ]]'
+# 復元できなかった旧 subset.tsv は STAGE に残り、復元できた旧 wpt/ は元の場所へ戻る。
+check "rollback failure: unrestored previous data kept in staging" \
+  '[ "$(cat "${stage_dir}/old.tsv")" = "old-tsv" ] && [ "$(cat "${work}/wpt/marker.txt")" = "old-content" ]'
+check "rollback failure: new fetch leftovers removed" \
+  '[ ! -e "${stage_dir}/wpt" ] && [ ! -e "${stage_dir}/subset.tsv" ]'
+
 echo "${CASES} cases, ${FAILURES} failures"
 [ "${FAILURES}" -eq 0 ]
