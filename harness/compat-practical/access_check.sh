@@ -223,7 +223,8 @@ while IFS=$'\x1f' read -r id cat url; do
     reach=true
     REACHABLE=$((REACHABLE + 1))
   fi
-  jq -cn --arg id "$id" --arg cat "$cat" --arg url "$url" --argjson st "$F_CODE" --argjson rc "$F_RC" \
+  # Windows（Git Bash）の引数変換が url のバックスラッシュ・スラッシュを書き換えないよう全除外する
+  MSYS2_ARG_CONV_EXCL='*' jq -cn --arg id "$id" --arg cat "$cat" --arg url "$url" --argjson st "$F_CODE" --argjson rc "$F_RC" \
     --argjson ms "$F_MS" --argjson reach "$reach" --arg bl "$F_BLOCKED" \
     '{type:"result",id:$id,cat:$cat,url:$url,http_status:$st,reachable:$reach,curl_exit:$rc,elapsed_ms:$ms,blocked:(if $bl=="" then null else $bl end)}' >>"$TMP"
   echo "[$id] status=$F_CODE reachable=$reach${F_BLOCKED:+ blocked=$F_BLOCKED}"
