@@ -40,8 +40,13 @@ REV="$(jq -r '.source.wptRevision // ""' "${SUBSET_JSON}" | tr -d '\r')"
 valid_path() {
   local p="$1"
   [[ "${p}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || return 1
+  # 空セグメント（'//'・末尾 '/'）はランナーの validate_relative_path が拒否するため、
+  # 書き出す TSV がランナー側の規則を必ず満たすようここでも拒否する。
   case "/${p}/" in
-    */../*) return 1 ;;
+    */../* | *//* ) return 1 ;;
+  esac
+  case "${p}" in
+    */) return 1 ;;
   esac
   return 0
 }

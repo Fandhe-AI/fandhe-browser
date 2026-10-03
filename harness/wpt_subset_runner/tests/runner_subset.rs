@@ -39,6 +39,7 @@ fn build_tree() -> PathBuf {
             "{HEAD}<script>\n\
              test(function () {{ assert_true(true); }}, 'first');\n\
              test(function () {{ assert_true(1 === 1); }}, 'second');\n\
+             done();\n\
              </script>\n"
         ),
     );
@@ -62,6 +63,12 @@ fn build_tree() -> PathBuf {
              </script>\n"
         ),
     );
+    // completion が届かない（未完了テストが残り得る）ファイルは Pass にしない。
+    write(
+        &root,
+        "dom/no-completion.html",
+        &format!("{HEAD}<script>test(function () {{ assert_true(true); }}, 'ok');</script>\n"),
+    );
     write(
         &root,
         "dom/nosubtests.html",
@@ -72,10 +79,22 @@ fn build_tree() -> PathBuf {
         "dom/support.html",
         &format!(
             "{HEAD}<script src=\"support/helper.js\"></script>\n\
-             <script>test(function () {{ assert_true(helperValue === 7); }}, 'uses helper');</script>\n"
+             <script>test(function () {{ assert_true(helperValue === 7); }}, 'uses helper'); done();</script>\n"
         ),
     );
     write(&root, "dom/support/helper.js", "var helperValue = 7;\n");
+    // ちょうど 1 MiB のサポートスクリプト。評価時に接尾辞が加わり JsRuntime の上限を超えるため、
+    // 実行時のサイズ超過ではなく TooLarge として扱う。
+    write(
+        &root,
+        "dom/big-support.html",
+        &format!("{HEAD}<script src=\"support/big.js\"></script>\n"),
+    );
+    write(
+        &root,
+        "dom/support/big.js",
+        &format!("//{}", "a".repeat(1024 * 1024 - 2)),
+    );
     write(
         &root,
         "dom/missing-support.html",
@@ -155,6 +174,20 @@ fn run_cases(root: &Path, engine: Option<EngineKind>) {
             assert_eq!(verdict, Verdict::Fail);
         }
         other => panic!("harness-error.html: {other:?}"),
+    }
+
+    assert_eq!(th("dom/big-support.html"), FileOutcome::TooLarge);
+
+    match th("dom/no-completion.html") {
+        FileOutcome::Completed {
+            completion,
+            verdict,
+            ..
+        } => {
+            assert!(completion.is_none());
+            assert_eq!(verdict, Verdict::Incomplete);
+        }
+        other => panic!("no-completion.html: {other:?}"),
     }
 
     match th("dom/nosubtests.html") {

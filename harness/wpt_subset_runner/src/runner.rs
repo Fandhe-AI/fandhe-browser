@@ -63,6 +63,9 @@ const TESTHARNESSREPORT_PATH: &str = "resources/testharnessreport.js";
 /// 付けるのは定数だけで、外部文字列は連結しない。
 const SCRIPT_SUFFIX: &str = "\n;undefined;\n";
 
+/// 接尾辞込みで [`MAX_SOURCE_BYTES`]（JsRuntime の入力上限）に収まるスクリプト本体の上限。
+const MAX_SCRIPT_BYTES: u64 = MAX_SOURCE_BYTES - SCRIPT_SUFFIX.len() as u64;
+
 /// WPT のテスト種別（`wpt-subset.json` の `harness`）。
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,9 +249,11 @@ impl RunOptions {
 
 /// ファイル単位の合否分類。
 ///
-/// `Pass` はサブテストが 1 件以上あり全て PASS の場合だけ。0 件は成功を装わず
-/// [`Verdict::NoResults`] とする。completion が届いていて `OK` 以外（ERROR・TIMEOUT・
-/// PRECONDITION_FAILED）なら、サブテストが全件 PASS でも `Fail` にする。
+/// `Pass` はサブテストが 1 件以上あり全て PASS で、かつ completion が `OK` で届いた場合だけ。
+/// 0 件は成功を装わず [`Verdict::NoResults`] とする。completion が届いていて `OK` 以外
+/// （ERROR・TIMEOUT・PRECONDITION_FAILED）なら、サブテストが全件 PASS でも `Fail` にする。
+/// completion が無いと未完了の async_test / promise_test の有無を判別できないため、
+/// 全件 PASS でも `Pass` にせず [`Verdict::Incomplete`] とする（REPAIR-3）。
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -258,21 +263,26 @@ pub enum Verdict {
     Fail,
     /// サブテストの結果が 1 件も通知されなかった。
     NoResults,
+    /// 通知済みサブテストは全て PASS だが completion が届かず、未完了テストが残っていない
+    /// と確認できない（合格として数えない）。
+    Incomplete,
 }
 
 /// サブテスト結果と完了通知から [`Verdict`] を決める。
 ///
-/// completion は届かないこともある（`None` は「失敗」と見なさない）が、届いて `OK` 以外なら
-/// ハーネス自体が失敗しているため `Fail`（結果 0 件でも `NoResults` にせず `Fail`）。
+/// completion が届いて `OK` 以外ならハーネス自体が失敗しているため `Fail`（結果 0 件でも
+/// `NoResults` にせず `Fail`）。completion が無く全件 PASS なら `Incomplete`（`Pass` にしない）。
 pub fn verdict_of(subtests: &[SubtestResult], completion: Option<&HarnessCompletion>) -> Verdict {
     if completion.is_some_and(|c| c.status != HarnessStatus::Ok) {
         Verdict::Fail
     } else if subtests.is_empty() {
         Verdict::NoResults
-    } else if subtests.iter().all(|s| s.status == SubtestStatus::Pass) {
+    } else if !subtests.iter().all(|s| s.status == SubtestStatus::Pass) {
+        Verdict::Fail
+    } else if completion.is_some() {
         Verdict::Pass
     } else {
-        Verdict::Fail
+        Verdict::Incomplete
     }
 }
 
@@ -473,6 +483,9 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
                 }
             }
             Step::Eval(code) => {
+                if code.len() as u64 > MAX_SCRIPT_BYTES {
+                    return FileOutcome::TooLarge;
+                }
                 if let Err(error) = eval(&mut runtime, code) {
                     return FileOutcome::ScriptFailed { index, error };
                 }
@@ -665,21 +678,21 @@ fn read_under_root(root: &Path, rel: &str) -> Result<String, FileOutcome> {
     if !meta.is_file() {
         return Err(FileOutcome::Missing);
     }
-    if meta.len() > MAX_SOURCE_BYTES {
+    if meta.len() > MAX_SCRIPT_BYTES {
         return Err(FileOutcome::TooLarge);
     }
     // metadata 確認後にファイルが増えても上限を超えて確保しないよう、読み取り自体を
-    // MAX_SOURCE_BYTES + 1 バイトに制限し、超過は TooLarge に分類する。
+    // MAX_SCRIPT_BYTES + 1 バイトに制限し、超過は TooLarge に分類する。
     let file = fs::File::open(&canon).map_err(|e| FileOutcome::ReadFailed {
         error: e.to_string(),
     })?;
     let mut bytes = Vec::new();
-    file.take(MAX_SOURCE_BYTES + 1)
+    file.take(MAX_SCRIPT_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| FileOutcome::ReadFailed {
             error: e.to_string(),
         })?;
-    if bytes.len() as u64 > MAX_SOURCE_BYTES {
+    if bytes.len() as u64 > MAX_SCRIPT_BYTES {
         return Err(FileOutcome::TooLarge);
     }
     String::from_utf8(bytes).map_err(|e| FileOutcome::ReadFailed {
@@ -839,7 +852,10 @@ mod tests {
     #[test]
     fn verdict_table() {
         assert_eq!(verdict_of(&[], None), Verdict::NoResults);
-        assert_eq!(verdict_of(&[sub(SubtestStatus::Pass)], None), Verdict::Pass);
+        assert_eq!(
+            verdict_of(&[sub(SubtestStatus::Pass)], None),
+            Verdict::Incomplete
+        );
         assert_eq!(
             verdict_of(&[sub(SubtestStatus::Pass), sub(SubtestStatus::Fail)], None),
             Verdict::Fail

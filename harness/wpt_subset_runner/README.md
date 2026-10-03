@@ -110,9 +110,9 @@ bash harness/wpt_subset_runner/fetch-wpt.sh   # jq・git・ネットワークが
 | `UnsupportedScript` | `type="module"` を含む（評価できないため実行しない。classic だけで Pass にしない） |
 | `EngineUnavailable` | JS ランタイムを作れない・エンジン未指定（`None` は JS 無効。既定エンジンへは落とさない） |
 | `CollectFailed` | JS 側から不正な通知があった |
-| `Completed` | 実行完了。`verdict` は `Pass`（1 件以上で全 PASS かつ completion が届いていれば `OK`）・`Fail`（completion が `OK` 以外を含む）・`NoResults`（0 件は Pass にしない） |
+| `Completed` | 実行完了。`verdict` は `Pass`（1 件以上で全 PASS かつ completion が `OK` で届いた）・`Fail`（PASS 以外がある・completion が `OK` 以外）・`Incomplete`（全 PASS だが completion が無く未完了テストを除外できない。Pass にしない）・`NoResults`（0 件は Pass にしない） |
 
-completion は届かないこともあるため無くても失敗とは見なさないが、届いて `OK` 以外なら verdict は `Fail`。
+completion が無いと未完了の async_test / promise_test を判別できないため `Pass` にはしない（`Incomplete`）。届いて `OK` 以外なら verdict は `Fail`。
 
 実物の testharness.js での動作確認（リビジョン固定時点。V8 / boa。DOM・タイマーが無い環境のまま）:
 testharness 152 件は `Completed/Fail` 53 / 46・`Completed/NoResults` 3 / 10・`ScriptFailed` 93・`Missing` 1・
