@@ -36,6 +36,42 @@ schema="$(jq -r '.schemaVersion' "${SUBSET_JSON}" | tr -d '\r')"
 REV="$(jq -r '.source.wptRevision // ""' "${SUBSET_JSON}" | tr -d '\r')"
 [[ "${REV}" =~ ^[0-9a-f]{40}$ ]] || die "source.wptRevision must be a 40-char lowercase hex SHA"
 
+# README「スキーマ契約」の件数・対応関係を取得前に再検証する（違反時は fail-closed）。
+# 上限（1 MiB・10000 件）、totalSelected と実件数の一致、file の一意性、
+# file が `<dir>/` で始まること、dir が perDirectorySummary に存在すること、
+# picked・harnessBreakdown が subset の集計と一致することを確認する。
+size_bytes="$(wc -c <"${SUBSET_JSON}" | tr -d '[:space:]')"
+[ "${size_bytes}" -le 1048576 ] || die "wpt-subset.json exceeds 1 MiB"
+contract_err="$(jq -r '
+  def cnt(f): [.subset[] | select(f)] | length;
+  if (.subset | type) != "array" then "subset must be an array"
+  elif (.perDirectorySummary | type) != "array" then "perDirectorySummary must be an array"
+  elif (.subset | length) > 10000 then "subset exceeds 10000 entries"
+  elif (.totalSelected | type) != "number" or .totalSelected != (.subset | length) then
+    "totalSelected does not match subset length"
+  elif ([.subset[] | .file | type] | all(. == "string") | not) then "subset[].file must be a string"
+  elif ([.subset[] | .dir | type] | all(. == "string") | not) then "subset[].dir must be a string"
+  elif ([.subset[].file] | length) != ([.subset[].file] | unique | length) then
+    "subset[].file is not unique"
+  elif ([.subset[] | select(. as $e | ($e.file | startswith($e.dir + "/")) | not)] | length) > 0 then
+    "subset[].file does not start with its dir"
+  elif ([.perDirectorySummary[].dir] | length) != ([.perDirectorySummary[].dir] | unique | length) then
+    "perDirectorySummary[].dir is not unique"
+  elif ([.perDirectorySummary[].dir] as $dirs
+        | [.subset[] | select(. as $e | $dirs | index($e.dir) == null)] | length) > 0 then
+    "subset[].dir is not listed in perDirectorySummary"
+  elif (. as $r | [.perDirectorySummary[]
+        | select(.picked != (.dir as $d | [$r.subset[] | select(.dir == $d)] | length))]
+        | length) > 0 then
+    "perDirectorySummary[].picked does not match subset"
+  elif ((.harnessBreakdown.testharness // -1) != cnt(.harness == "testharness")
+        or (.harnessBreakdown.reftest // -1) != cnt(.harness == "reftest")
+        or (.harnessBreakdown.other // -1) != cnt(.harness == "other")) then
+    "harnessBreakdown does not match subset"
+  else "" end
+' "${SUBSET_JSON}")" || die "failed to validate wpt-subset.json contract"
+[ -z "${contract_err}" ] || die "wpt-subset.json contract violation: ${contract_err}"
+
 # パス規則（README のスキーマ契約と同じ）: 許可文字のみ・先頭 '/' と '..' セグメント禁止。
 valid_path() {
   local p="$1"
