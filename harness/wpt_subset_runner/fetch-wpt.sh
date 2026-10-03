@@ -48,17 +48,24 @@ valid_path() {
 
 # testharness.js と、テストが共通で参照するサポートスクリプトの置き場も取得する。
 PATTERNS=("/resources/" "/common/" "/css/support/")
+# プロセス置換では jq の失敗を set -e / pipefail で検出できないため、出力を変数へ
+# 取り込んで終了状態を明示的に確認してから処理する。
+dirs_out="$(jq -r '.subset[].dir' "${SUBSET_JSON}")" || die "failed to read .subset[].dir"
+dirs_sorted="$(printf '%s\n' "${dirs_out}" | sort -u)" || die "failed to sort dirs"
 while IFS= read -r d; do
   d="${d%$'\r'}"
+  [ -n "${d}" ] || continue
   valid_path "${d}" || die "invalid dir in wpt-subset.json: ${d}"
   PATTERNS+=("/${d}/")
-done < <(jq -r '.subset[].dir' "${SUBSET_JSON}" | sort -u)
+done <<<"${dirs_sorted}"
 [ "${#PATTERNS[@]}" -gt 1 ] || die "no directories in wpt-subset.json"
 
 # subset.tsv は検証済みの行だけを書く（harness は列挙値、file は valid_path）。
 TSV_TMP="$(mktemp "${TMPDIR:-/tmp}/wpt-subset-tsv.XXXXXX")"
 trap 'rm -f "${TSV_TMP}"' EXIT
+files_out="$(jq -r '.subset[] | [.harness, .file] | @tsv' "${SUBSET_JSON}")" || die "failed to read .subset[]"
 while IFS=$'\t' read -r harness file; do
+  [ -n "${harness}${file}" ] || continue
   file="${file%$'\r'}"
   case "${harness}" in
     testharness | reftest | other) ;;
@@ -66,7 +73,8 @@ while IFS=$'\t' read -r harness file; do
   esac
   valid_path "${file}" || die "invalid file in wpt-subset.json: ${file}"
   printf '%s\t%s\n' "${harness}" "${file}" >>"${TSV_TMP}"
-done < <(jq -r '.subset[] | [.harness, .file] | @tsv' "${SUBSET_JSON}")
+done <<<"${files_out}"
+[ -s "${TSV_TMP}" ] || die "no entries in wpt-subset.json"
 
 mkdir -p "${WORK_DIR}"
 

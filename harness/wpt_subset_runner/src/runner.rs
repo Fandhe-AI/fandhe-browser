@@ -33,6 +33,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use fandhe_browser_core::js_stub::JsRuntime;
@@ -370,7 +371,12 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
     }
     let root = match fs::canonicalize(&options.wpt_root) {
         Ok(r) => r,
-        Err(_) => return FileOutcome::Missing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FileOutcome::Missing,
+        Err(e) => {
+            return FileOutcome::ReadFailed {
+                error: e.to_string(),
+            };
+        }
     };
     let html = match read_under_root(&root, &entry.file) {
         Ok(h) => h,
@@ -662,9 +668,20 @@ fn read_under_root(root: &Path, rel: &str) -> Result<String, FileOutcome> {
     if meta.len() > MAX_SOURCE_BYTES {
         return Err(FileOutcome::TooLarge);
     }
-    let bytes = fs::read(&canon).map_err(|e| FileOutcome::ReadFailed {
+    // metadata 確認後にファイルが増えても上限を超えて確保しないよう、読み取り自体を
+    // MAX_SOURCE_BYTES + 1 バイトに制限し、超過は TooLarge に分類する。
+    let file = fs::File::open(&canon).map_err(|e| FileOutcome::ReadFailed {
         error: e.to_string(),
     })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| FileOutcome::ReadFailed {
+            error: e.to_string(),
+        })?;
+    if bytes.len() as u64 > MAX_SOURCE_BYTES {
+        return Err(FileOutcome::TooLarge);
+    }
     String::from_utf8(bytes).map_err(|e| FileOutcome::ReadFailed {
         error: e.to_string(),
     })
