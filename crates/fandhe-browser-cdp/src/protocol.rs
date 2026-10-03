@@ -385,7 +385,7 @@ impl Dispatcher {
     /// 受信テキスト 1 件を処理する。パース失敗・未登録メソッド・ハンドラのエラーは
     /// すべてエラー応答になり、成功応答を捏造しない（`SEC-2`）。未登録メソッドの
     /// 正式方針は 42.6（`CDP-6`）で確定する。
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub async fn dispatch(&self, state: &Arc<CdpState>, text: &str) -> DispatchOutcome {
         self.dispatch_on(state, None, text).await
     }

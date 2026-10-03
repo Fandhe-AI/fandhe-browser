@@ -82,9 +82,12 @@ impl BrowserSessionHandler {
     /// 接続に対応する crate 内接続 ID を返す（初回要求時に割り当てる）。
     fn conn_for(&self, id: WsConnId) -> ConnId {
         let mut conns = self.conns.lock().unwrap_or_else(PoisonError::into_inner);
-        *conns
-            .entry(id)
-            .or_insert_with(|| ConnId::new(self.next_conn.fetch_add(1, Ordering::Relaxed)))
+        *conns.entry(id).or_insert_with(|| {
+            let conn = ConnId::new(self.next_conn.fetch_add(1, Ordering::Relaxed));
+            // 生存中として登録する（切断後の記録を拒否するため。`SEC-2`）。
+            self.state.dom_issued().open_connection(conn);
+            conn
+        })
     }
 }
 

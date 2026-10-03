@@ -41,7 +41,7 @@
 //!   子孫要素が無いため 0 を返す（Chrome はエラー。差異）
 //! - 直近の navigate 結果が無い場合は空ドキュメントを捏造せずエラーを返す（`SEC-2`）
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use fandhe_browser_core::NavigationResult;
@@ -407,6 +407,8 @@ struct IssuedState {
     docs: HashMap<IssuedKey, (Arc<NavigationResult>, i64)>,
     /// 次に割り当てる `base`（これまでに予約した nodeId 範囲の末尾）。
     next_base: i64,
+    /// 生存中の接続。切断済みの接続への記録を拒否するために持つ（`SEC-2`）。
+    live: HashSet<ConnId>,
 }
 
 impl IssuedDocuments {
@@ -415,8 +417,16 @@ impl IssuedDocuments {
             inner: Mutex::new(IssuedState {
                 docs: HashMap::new(),
                 next_base: 0,
+                live: HashSet::new(),
             }),
         }
+    }
+
+    /// 接続 `conn` を生存中として登録する（`crate::ws` が接続の初回要求時に呼ぶ）。
+    /// 登録のない接続・[`Self::release_connection`] 済みの接続への [`Self::record`] は拒否される。
+    pub(crate) fn open_connection(&self, conn: ConnId) {
+        let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        st.live.insert(conn);
     }
 
     /// `doc` に使う nodeId の `base` を返す。同じ文書が払い出し済みならその `base` を再利用し、
@@ -468,6 +478,11 @@ impl IssuedDocuments {
         if !session.is_none_or(|s| registry.session_target(s).is_some()) {
             return false;
         }
+        // 切断（`release_connection`）と競合した記録を拒否する。確認と挿入は同一ロック内。
+        // 閉じた接続には応答の届け先がないため、呼び出し側の再試行が尽きて失敗しても害はない。
+        if conn.is_some_and(|c| !st.live.contains(&c)) {
+            return false;
+        }
         if let Some((issued, existing)) = st.docs.get(&(conn, session.cloned()))
             && Arc::ptr_eq(issued, doc)
         {
@@ -482,6 +497,7 @@ impl IssuedDocuments {
     /// 閉じた接続の記録を残さない。`SEC-2`・`CDP-1`）。`base` カウンタは巻き戻さない。
     pub(crate) fn release_connection(&self, conn: ConnId) {
         let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        st.live.remove(&conn);
         st.docs.retain(|(c, _), _| *c != Some(conn));
     }
 
@@ -938,6 +954,8 @@ mod tests {
         let d = Arc::new(NavigationResult::new("https://example.com/", "<p>a</p>"));
         let issued = IssuedDocuments::new();
         let (a, b) = (ConnId::new(1), ConnId::new(2));
+        issued.open_connection(a);
+        issued.open_connection(b);
         let base = issued.base_for(Some(a), None, &d, 10).unwrap();
         assert!(issued.record(&registry, Some(a), None, &d, base, || Some(Arc::clone(&d))));
         assert_eq!(issued.issued_base(Some(a), None, &d), Some(base));
@@ -947,6 +965,33 @@ mod tests {
         issued.release_connection(a);
         assert_eq!(issued.len(), 0);
         assert_eq!(issued.issued_base(Some(a), None, &d), None);
+    }
+
+    /// 切断（release）後の記録要求は拒否され、閉じた接続の文書が残らない（`SEC-2`・`CDP-1`）。
+    #[test]
+    fn sec2_record_after_release_connection_is_rejected() {
+        let registry = crate::target::TargetRegistry::new();
+        let d = Arc::new(NavigationResult::new("https://example.com/", "<p>a</p>"));
+        let issued = IssuedDocuments::new();
+        let conn = ConnId::new(7);
+        issued.open_connection(conn);
+        let base = issued.base_for(Some(conn), None, &d, 10).unwrap();
+        // getDocument の途中で切断が走った状況を再現する。
+        issued.release_connection(conn);
+        assert!(
+            !issued.record(&registry, Some(conn), None, &d, base, || Some(Arc::clone(
+                &d
+            )))
+        );
+        assert_eq!(issued.len(), 0);
+        assert_eq!(issued.issued_base(Some(conn), None, &d), None);
+        // 未登録の接続も同様に拒否する。
+        assert!(
+            !issued.record(&registry, Some(ConnId::new(8)), None, &d, base, || Some(
+                Arc::clone(&d)
+            ))
+        );
+        assert_eq!(issued.len(), 0);
     }
 
     /// 古い文書の記録要求は、最新文書の払い出し記録を上書きしない（`CDP-1`）。
