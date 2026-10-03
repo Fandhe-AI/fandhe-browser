@@ -1,0 +1,3014 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "specPath": "docs/spec/03-poc/browser-behavior-profile/proto/wpt-subset.json",
+    "specCommit": "c7f2995d21d94339ff8ffbb3b66fae4953043c18",
+    "generatedAt": "2026-09-23T02:31:04.815Z",
+    "wptSource": "https://github.com/web-platform-tests/wpt (sparse checkout, depth=1)",
+    "wptRevision": null,
+    "selector": "select_wpt_subset.mjs",
+    "task": "TASK-101.1",
+    "behavior": "PLUG-10",
+    "milestone": "MS-8"
+  },
+  "totalSelected": 257,
+  "minimumRequired": 200,
+  "meetsMinimum": true,
+  "perDirectorySummary": [
+    {
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "requested": 20,
+      "available": 2365,
+      "picked": 20,
+      "reason": "棚卸しで最頻出の CSSOM 機能（grid-template-columns 等）"
+    },
+    {
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "requested": 15,
+      "available": 1322,
+      "picked": 15,
+      "reason": "棚卸しで頻出（display:flex 系）"
+    },
+    {
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "requested": 15,
+      "available": 855,
+      "picked": 15,
+      "reason": "背景・ボーダー系プロパティが棚卸しで多数マッピング"
+    },
+    {
+      "dir": "css/css-color",
+      "mappedFeatures": [
+        "color",
+        "currentcolor",
+        "color-scheme"
+      ],
+      "requested": 10,
+      "available": 326,
+      "picked": 10,
+      "reason": "color プロパティの棚卸しマッピングに対応"
+    },
+    {
+      "dir": "css/css-transitions",
+      "mappedFeatures": [
+        "transitions",
+        "transition-behavior"
+      ],
+      "requested": 8,
+      "available": 197,
+      "picked": 8,
+      "reason": "transition 系プロパティの棚卸しマッピングに対応"
+    },
+    {
+      "dir": "css/css-transforms",
+      "mappedFeatures": [
+        "transforms2d",
+        "transforms3d",
+        "individual-transforms"
+      ],
+      "requested": 10,
+      "available": 928,
+      "picked": 10,
+      "reason": "transform 系プロパティの棚卸しマッピングに対応"
+    },
+    {
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "requested": 20,
+      "available": 1874,
+      "picked": 20,
+      "reason": "テキスト関連プロパティが棚卸しで多数マッピング"
+    },
+    {
+      "dir": "css/css-ui",
+      "mappedFeatures": [
+        "cursor",
+        "outline",
+        "resize",
+        "appearance",
+        "user-select"
+      ],
+      "requested": 12,
+      "available": 1308,
+      "picked": 12,
+      "reason": "UI 系プロパティの棚卸しマッピングに対応"
+    },
+    {
+      "dir": "css/css-position",
+      "mappedFeatures": [
+        "absolute-positioning",
+        "anchor-positioning"
+      ],
+      "requested": 8,
+      "available": 391,
+      "picked": 8,
+      "reason": "位置指定プロパティの棚卸しマッピングに対応"
+    },
+    {
+      "dir": "css/css-shapes",
+      "mappedFeatures": [
+        "clip-path",
+        "masks"
+      ],
+      "requested": 6,
+      "available": 382,
+      "picked": 6,
+      "reason": "clip-path/masks の棚卸しマッピングに対応"
+    },
+    {
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "requested": 15,
+      "available": 532,
+      "picked": 15,
+      "reason": "フォント関連プロパティが棚卸しで多数マッピング"
+    },
+    {
+      "dir": "css/css-overflow",
+      "mappedFeatures": [
+        "overflow-clip",
+        "overflow-wrap",
+        "text-overflow"
+      ],
+      "requested": 8,
+      "available": 911,
+      "picked": 8,
+      "reason": "overflow 系プロパティの棚卸しマッピングに対応"
+    },
+    {
+      "dir": "css/css-scroll-snap",
+      "mappedFeatures": [
+        "scroll-snap"
+      ],
+      "requested": 5,
+      "available": 213,
+      "picked": 5,
+      "reason": "scroll-snap の棚卸しマッピングに対応"
+    },
+    {
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "requested": 15,
+      "available": 285,
+      "picked": 15,
+      "reason": "CSSOM API（getComputedStyle 等）が棚卸しの layer a にマッピング"
+    },
+    {
+      "dir": "css/css-conditional",
+      "mappedFeatures": [
+        "container-anchor-position-queries"
+      ],
+      "requested": 5,
+      "available": 424,
+      "picked": 5,
+      "reason": "コンテナクエリ関連の棚卸しマッピングに対応"
+    },
+    {
+      "dir": "css/css-contain",
+      "mappedFeatures": [
+        "contain",
+        "content-visibility"
+      ],
+      "requested": 8,
+      "available": 592,
+      "picked": 8,
+      "reason": "contain/content-visibility の棚卸しマッピングに対応"
+    },
+    {
+      "dir": "css/css-display",
+      "mappedFeatures": [
+        "display"
+      ],
+      "requested": 6,
+      "available": 116,
+      "picked": 6,
+      "reason": "display プロパティの棚卸しマッピングに対応"
+    },
+    {
+      "dir": "css/css-variables",
+      "mappedFeatures": [
+        "custom-properties"
+      ],
+      "requested": 6,
+      "available": 196,
+      "picked": 6,
+      "reason": "CSS カスタムプロパティ（--*）関連。棚卸しでは直接検出されなかったが関連ディレクトリとして含める"
+    },
+    {
+      "dir": "css/css-align",
+      "mappedFeatures": [
+        "align-content-block"
+      ],
+      "requested": 5,
+      "available": 296,
+      "picked": 5,
+      "reason": "align-content 等の棚卸しマッピングに対応"
+    },
+    {
+      "dir": "css/css-multicol",
+      "mappedFeatures": [
+        "multi-column",
+        "column-breaks"
+      ],
+      "requested": 6,
+      "available": 593,
+      "picked": 6,
+      "reason": "多段組みプロパティの棚卸しマッピングに対応"
+    },
+    {
+      "dir": "css/css-cascade",
+      "mappedFeatures": [
+        "all"
+      ],
+      "requested": 4,
+      "available": 146,
+      "picked": 4,
+      "reason": "all プロパティ等カスケード関連の棚卸しマッピングに対応"
+    },
+    {
+      "dir": "dom/nodes",
+      "mappedFeatures": [
+        "dom",
+        "mutationobserver"
+      ],
+      "requested": 12,
+      "available": 337,
+      "picked": 12,
+      "reason": "DOM ノード操作 API（document.createElement 等）が棚卸しの layer a にマッピング"
+    },
+    {
+      "dir": "dom/events",
+      "mappedFeatures": [
+        "events",
+        "mouse-events",
+        "pointer-events-api"
+      ],
+      "requested": 10,
+      "available": 174,
+      "picked": 10,
+      "reason": "イベント関連 API が棚卸しの layer a にマッピング"
+    },
+    {
+      "dir": "fetch",
+      "mappedFeatures": [
+        "fetch"
+      ],
+      "requested": 10,
+      "available": 308,
+      "picked": 10,
+      "reason": "fetch API が棚卸しの layer a に高頻度でマッピング（PoC-4 コーパス由来）"
+    },
+    {
+      "dir": "resize-observer",
+      "mappedFeatures": [
+        "resize-observer"
+      ],
+      "requested": 4,
+      "available": 39,
+      "picked": 4,
+      "reason": "ResizeObserver が棚卸しの layer a にマッピング"
+    },
+    {
+      "dir": "intersection-observer",
+      "mappedFeatures": [
+        "intersection-observer"
+      ],
+      "requested": 4,
+      "available": 168,
+      "picked": 4,
+      "reason": "IntersectionObserver が棚卸しの layer a にマッピング"
+    },
+    {
+      "dir": "html/webappapis",
+      "mappedFeatures": [
+        "window",
+        "navigator"
+      ],
+      "requested": 10,
+      "available": 340,
+      "picked": 10,
+      "reason": "window/navigator グローバル API が棚卸しの layer a にマッピング"
+    }
+  ],
+  "subset": [
+    {
+      "file": "css/css-grid/abspos/absolute-positioning-changing-containing-block-001.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-grid/abspos/absolute-positioning-definite-sizes-001.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-grid/abspos/absolute-positioning-grid-container-containing-block-001.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-grid/abspos/absolute-positioning-grid-container-parent-001.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-grid/abspos/absolute-positioning-grid-container-parent-002.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-grid/abspos/abspos-in-flexbox-in-grid-crash.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-grid/abspos/descendant-static-position-001.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-grid/abspos/descendant-static-position-002.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-grid/abspos/descendant-static-position-003.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-grid/abspos/descendant-static-position-004.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-grid/abspos/empty-grid-001.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-grid/abspos/grid-abspos-staticpos-align-items-center-large-border-padding.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-grid/abspos/grid-abspos-staticpos-align-items-center.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-grid/abspos/grid-abspos-staticpos-align-items-end-large-border-padding.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-grid/abspos/grid-abspos-staticpos-align-items-end.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-grid/abspos/grid-abspos-staticpos-align-items-flex-end-large-border-padding.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-grid/abspos/grid-abspos-staticpos-align-items-flex-end.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-grid/abspos/grid-abspos-staticpos-align-items-self-end-large-border-padding.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-grid/abspos/grid-abspos-staticpos-align-items-self-end.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-grid/abspos/grid-abspos-staticpos-align-self-001.html",
+      "dir": "css/css-grid",
+      "mappedFeatures": [
+        "grid"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-flexbox/abspos/abspos-autopos-htb-ltr.html",
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-flexbox/abspos/abspos-autopos-htb-rtl.html",
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-flexbox/abspos/abspos-autopos-vlr-ltr.html",
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-flexbox/abspos/abspos-autopos-vlr-rtl.html",
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-flexbox/abspos/abspos-autopos-vrl-ltr.html",
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-flexbox/abspos/abspos-autopos-vrl-rtl.html",
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-flexbox/abspos/abspos-descendent-001.html",
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-flexbox/abspos/dynamic-align-self-001.html",
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-flexbox/abspos/flex-abspos-align-self-safe-outer-cb-001.tentative.html",
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-flexbox/abspos/flex-abspos-align-self-safe-outer-cb-002.tentative.html",
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-flexbox/abspos/flex-abspos-align-self-safe-outer-cb-003.tentative.html",
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-flexbox/abspos/flex-abspos-staticpos-align-content-001.html",
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-flexbox/abspos/flex-abspos-staticpos-align-self-001.html",
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-flexbox/abspos/flex-abspos-staticpos-align-self-002.html",
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-flexbox/abspos/flex-abspos-staticpos-align-self-003.html",
+      "dir": "css/css-flexbox",
+      "mappedFeatures": [
+        "flexbox",
+        "flexbox-gap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-backgrounds/animations/background-color-animation-backdrop-infinite-duration-crash.html",
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-backgrounds/animations/background-color-animation-custom-property.html",
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-backgrounds/animations/background-color-animation-custom-timing-function-reverse.html",
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-backgrounds/animations/background-color-animation-custom-timing-function.html",
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-backgrounds/animations/background-color-animation-element-not-visible-at-current-viewport.html",
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-backgrounds/animations/background-color-animation-fallback-additive-keyframe.html",
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-backgrounds/animations/background-color-animation-fallback-missing-0-percent.html",
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-backgrounds/animations/background-color-animation-fallback-missing-100-percent.html",
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-backgrounds/animations/background-color-animation-fallback-replace.html",
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-backgrounds/animations/background-color-animation-field-crash.html",
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-backgrounds/animations/background-color-animation-fragmented.html",
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-backgrounds/animations/background-color-animation-half-opaque.html",
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-backgrounds/animations/background-color-animation-in-body.html",
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-backgrounds/animations/background-color-animation-non-empty-no-draw-crash.html",
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-backgrounds/animations/background-color-animation-non-zero-size-element-change-to-zero.html",
+      "dir": "css/css-backgrounds",
+      "mappedFeatures": [
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-size",
+        "border-radius",
+        "borders"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-color/a98rgb-001.html",
+      "dir": "css/css-color",
+      "mappedFeatures": [
+        "color",
+        "currentcolor",
+        "color-scheme"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-color/a98rgb-002.html",
+      "dir": "css/css-color",
+      "mappedFeatures": [
+        "color",
+        "currentcolor",
+        "color-scheme"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-color/a98rgb-003.html",
+      "dir": "css/css-color",
+      "mappedFeatures": [
+        "color",
+        "currentcolor",
+        "color-scheme"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-color/a98rgb-004.html",
+      "dir": "css/css-color",
+      "mappedFeatures": [
+        "color",
+        "currentcolor",
+        "color-scheme"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-color/animation/color-composition.html",
+      "dir": "css/css-color",
+      "mappedFeatures": [
+        "color",
+        "currentcolor",
+        "color-scheme"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-color/animation/color-interpolation.html",
+      "dir": "css/css-color",
+      "mappedFeatures": [
+        "color",
+        "currentcolor",
+        "color-scheme"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-color/animation/contrast-color-interpolation.html",
+      "dir": "css/css-color",
+      "mappedFeatures": [
+        "color",
+        "currentcolor",
+        "color-scheme"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-color/animation/opacity-animation-ending-correctly-001.html",
+      "dir": "css/css-color",
+      "mappedFeatures": [
+        "color",
+        "currentcolor",
+        "color-scheme"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-color/animation/opacity-animation-ending-correctly-002.html",
+      "dir": "css/css-color",
+      "mappedFeatures": [
+        "color",
+        "currentcolor",
+        "color-scheme"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-color/animation/opacity-interpolation.html",
+      "dir": "css/css-color",
+      "mappedFeatures": [
+        "color",
+        "currentcolor",
+        "color-scheme"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transitions/AnimationEffect-getComputedTiming.tentative.html",
+      "dir": "css/css-transitions",
+      "mappedFeatures": [
+        "transitions",
+        "transition-behavior"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transitions/CSSTransition-canceling.tentative.html",
+      "dir": "css/css-transitions",
+      "mappedFeatures": [
+        "transitions",
+        "transition-behavior"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transitions/CSSTransition-currentTime.tentative.html",
+      "dir": "css/css-transitions",
+      "mappedFeatures": [
+        "transitions",
+        "transition-behavior"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transitions/CSSTransition-effect.tentative.html",
+      "dir": "css/css-transitions",
+      "mappedFeatures": [
+        "transitions",
+        "transition-behavior"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transitions/CSSTransition-finished.tentative.html",
+      "dir": "css/css-transitions",
+      "mappedFeatures": [
+        "transitions",
+        "transition-behavior"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transitions/CSSTransition-not-canceling.tentative.html",
+      "dir": "css/css-transitions",
+      "mappedFeatures": [
+        "transitions",
+        "transition-behavior"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transitions/CSSTransition-ready.tentative.html",
+      "dir": "css/css-transitions",
+      "mappedFeatures": [
+        "transitions",
+        "transition-behavior"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transitions/CSSTransition-startTime.tentative.html",
+      "dir": "css/css-transitions",
+      "mappedFeatures": [
+        "transitions",
+        "transition-behavior"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transforms/2d-rotate-001.html",
+      "dir": "css/css-transforms",
+      "mappedFeatures": [
+        "transforms2d",
+        "transforms3d",
+        "individual-transforms"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-transforms/2d-rotate-js.html",
+      "dir": "css/css-transforms",
+      "mappedFeatures": [
+        "transforms2d",
+        "transforms3d",
+        "individual-transforms"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transforms/2d-transform-inline-js.html",
+      "dir": "css/css-transforms",
+      "mappedFeatures": [
+        "transforms2d",
+        "transforms3d",
+        "individual-transforms"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transforms/3d-point-mapping-2-transforminterop.html",
+      "dir": "css/css-transforms",
+      "mappedFeatures": [
+        "transforms2d",
+        "transforms3d",
+        "individual-transforms"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transforms/3d-point-mapping-3.html",
+      "dir": "css/css-transforms",
+      "mappedFeatures": [
+        "transforms2d",
+        "transforms3d",
+        "individual-transforms"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transforms/3d-point-mapping-4.html",
+      "dir": "css/css-transforms",
+      "mappedFeatures": [
+        "transforms2d",
+        "transforms3d",
+        "individual-transforms"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transforms/3d-point-mapping-coplanar.html",
+      "dir": "css/css-transforms",
+      "mappedFeatures": [
+        "transforms2d",
+        "transforms3d",
+        "individual-transforms"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transforms/3d-point-mapping-deep.html",
+      "dir": "css/css-transforms",
+      "mappedFeatures": [
+        "transforms2d",
+        "transforms3d",
+        "individual-transforms"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transforms/3d-point-mapping-origins.html",
+      "dir": "css/css-transforms",
+      "mappedFeatures": [
+        "transforms2d",
+        "transforms3d",
+        "individual-transforms"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-transforms/3d-point-mapping-overlapping.html",
+      "dir": "css/css-transforms",
+      "mappedFeatures": [
+        "transforms2d",
+        "transforms3d",
+        "individual-transforms"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-text/altering-dom-crash.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-text/animations/hyphen-limit-chars-interpolation.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-text/animations/hyphen-no-interpolation.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-text/animations/hyphenate-limit-lines-interpolation.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-text/animations/letter-spacing-composition.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-text/animations/letter-spacing-interpolation.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-text/animations/line-break-no-interpolation.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-text/animations/tab-size-interpolation.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-text/animations/text-indent-composition.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-text/animations/text-indent-interpolation.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-text/animations/word-spacing-composition.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-text/animations/word-spacing-interpolation.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-text/bidi/bidi-lines-001.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-text/bidi/bidi-lines-002.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-text/bidi/bidi-tab-001.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-text/bidi/empty-span-001.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-text/boundary-shaping/boundary-shaping-001.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-text/boundary-shaping/boundary-shaping-002.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-text/boundary-shaping/boundary-shaping-003.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-text/boundary-shaping/boundary-shaping-004.html",
+      "dir": "css/css-text",
+      "mappedFeatures": [
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-shadow",
+        "letter-spacing",
+        "line-height",
+        "white-space",
+        "word-break",
+        "overflow-wrap",
+        "text-wrap"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-ui/accent-color-checkbox-checked-001.html",
+      "dir": "css/css-ui",
+      "mappedFeatures": [
+        "cursor",
+        "outline",
+        "resize",
+        "appearance",
+        "user-select"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-ui/accent-color-computed.html",
+      "dir": "css/css-ui",
+      "mappedFeatures": [
+        "cursor",
+        "outline",
+        "resize",
+        "appearance",
+        "user-select"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-ui/accent-color-invalidation-currentcolor.html",
+      "dir": "css/css-ui",
+      "mappedFeatures": [
+        "cursor",
+        "outline",
+        "resize",
+        "appearance",
+        "user-select"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-ui/accent-color-parent-currentcolor.html",
+      "dir": "css/css-ui",
+      "mappedFeatures": [
+        "cursor",
+        "outline",
+        "resize",
+        "appearance",
+        "user-select"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-ui/accent-color-parsing.html",
+      "dir": "css/css-ui",
+      "mappedFeatures": [
+        "cursor",
+        "outline",
+        "resize",
+        "appearance",
+        "user-select"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-ui/accent-color-radio-checked-001.html",
+      "dir": "css/css-ui",
+      "mappedFeatures": [
+        "cursor",
+        "outline",
+        "resize",
+        "appearance",
+        "user-select"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-ui/accent-color-visited.html",
+      "dir": "css/css-ui",
+      "mappedFeatures": [
+        "cursor",
+        "outline",
+        "resize",
+        "appearance",
+        "user-select"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-ui/animation/accent-color-interpolation.html",
+      "dir": "css/css-ui",
+      "mappedFeatures": [
+        "cursor",
+        "outline",
+        "resize",
+        "appearance",
+        "user-select"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-ui/animation/appearance-no-interpolation.html",
+      "dir": "css/css-ui",
+      "mappedFeatures": [
+        "cursor",
+        "outline",
+        "resize",
+        "appearance",
+        "user-select"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-ui/animation/caret-animation-parsing.html",
+      "dir": "css/css-ui",
+      "mappedFeatures": [
+        "cursor",
+        "outline",
+        "resize",
+        "appearance",
+        "user-select"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-ui/animation/caret-color-composition.html",
+      "dir": "css/css-ui",
+      "mappedFeatures": [
+        "cursor",
+        "outline",
+        "resize",
+        "appearance",
+        "user-select"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-ui/animation/caret-color-interpolation.html",
+      "dir": "css/css-ui",
+      "mappedFeatures": [
+        "cursor",
+        "outline",
+        "resize",
+        "appearance",
+        "user-select"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-position/absolute-pos-box-inside-fixed-pos-box-with-changing-height.html",
+      "dir": "css/css-position",
+      "mappedFeatures": [
+        "absolute-positioning",
+        "anchor-positioning"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-position/animations/bottom-composition.html",
+      "dir": "css/css-position",
+      "mappedFeatures": [
+        "absolute-positioning",
+        "anchor-positioning"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-position/animations/bottom-interpolation.html",
+      "dir": "css/css-position",
+      "mappedFeatures": [
+        "absolute-positioning",
+        "anchor-positioning"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-position/animations/left-composition.html",
+      "dir": "css/css-position",
+      "mappedFeatures": [
+        "absolute-positioning",
+        "anchor-positioning"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-position/animations/left-interpolation.html",
+      "dir": "css/css-position",
+      "mappedFeatures": [
+        "absolute-positioning",
+        "anchor-positioning"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-position/animations/position-interpolation.html",
+      "dir": "css/css-position",
+      "mappedFeatures": [
+        "absolute-positioning",
+        "anchor-positioning"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-position/animations/right-composition.html",
+      "dir": "css/css-position",
+      "mappedFeatures": [
+        "absolute-positioning",
+        "anchor-positioning"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-position/animations/right-interpolation.html",
+      "dir": "css/css-position",
+      "mappedFeatures": [
+        "absolute-positioning",
+        "anchor-positioning"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-shapes/animation/shape-image-threshold-interpolation.html",
+      "dir": "css/css-shapes",
+      "mappedFeatures": [
+        "clip-path",
+        "masks"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-shapes/animation/shape-margin-composition.html",
+      "dir": "css/css-shapes",
+      "mappedFeatures": [
+        "clip-path",
+        "masks"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-shapes/animation/shape-margin-interpolation.html",
+      "dir": "css/css-shapes",
+      "mappedFeatures": [
+        "clip-path",
+        "masks"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-shapes/animation/shape-outside-composition.html",
+      "dir": "css/css-shapes",
+      "mappedFeatures": [
+        "clip-path",
+        "masks"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-shapes/animation/shape-outside-interpolation.html",
+      "dir": "css/css-shapes",
+      "mappedFeatures": [
+        "clip-path",
+        "masks"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-shapes/animation/shape-outside-path-interpolation.html",
+      "dir": "css/css-shapes",
+      "mappedFeatures": [
+        "clip-path",
+        "masks"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-fonts/alternates-order.html",
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-fonts/animations/font-palette-animation-not-specified-endpoints.html",
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-fonts/animations/font-palette-interpolation.html",
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-fonts/animations/font-size-adjust-composition.html",
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-fonts/animations/font-size-adjust-interpolation.html",
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-fonts/animations/font-size-composition.html",
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-fonts/animations/font-size-interpolation-001.html",
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-fonts/animations/font-size-interpolation-002.html",
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-fonts/animations/font-size-interpolation-003.html",
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-fonts/animations/font-stretch-interpolation.html",
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-fonts/animations/font-style-interpolation.html",
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-fonts/animations/font-variation-settings-composition.html",
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-fonts/animations/font-variation-settings-interpolation.html",
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-fonts/animations/font-weight-composition.html",
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-fonts/animations/multiple-elements-font-palette-animation.html",
+      "dir": "css/css-fonts",
+      "mappedFeatures": [
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "font-variant",
+        "font-feature-settings",
+        "font-synthesis",
+        "font-shorthand",
+        "font-variation-settings"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-overflow/abspos-relayout-with-scrollable-descendant-vertical-lr.html",
+      "dir": "css/css-overflow",
+      "mappedFeatures": [
+        "overflow-clip",
+        "overflow-wrap",
+        "text-overflow"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-overflow/abspos-relayout-with-scrollable-descendant.html",
+      "dir": "css/css-overflow",
+      "mappedFeatures": [
+        "overflow-clip",
+        "overflow-wrap",
+        "text-overflow"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-overflow/abspos-shrink-to-fit-with-scrollable-descendant.html",
+      "dir": "css/css-overflow",
+      "mappedFeatures": [
+        "overflow-clip",
+        "overflow-wrap",
+        "text-overflow"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-overflow/add-scroller-then-scroll-content-into-view.html",
+      "dir": "css/css-overflow",
+      "mappedFeatures": [
+        "overflow-clip",
+        "overflow-wrap",
+        "text-overflow"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-overflow/auto-scrollbar-inline-children.html",
+      "dir": "css/css-overflow",
+      "mappedFeatures": [
+        "overflow-clip",
+        "overflow-wrap",
+        "text-overflow"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-overflow/before-after-pseudo-element-scrolling.html",
+      "dir": "css/css-overflow",
+      "mappedFeatures": [
+        "overflow-clip",
+        "overflow-wrap",
+        "text-overflow"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-overflow/button-with-scrollable-descendant.html",
+      "dir": "css/css-overflow",
+      "mappedFeatures": [
+        "overflow-clip",
+        "overflow-wrap",
+        "text-overflow"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-overflow/chrome-480554290-crash.html",
+      "dir": "css/css-overflow",
+      "mappedFeatures": [
+        "overflow-clip",
+        "overflow-wrap",
+        "text-overflow"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-scroll-snap/capturing-snap-positions.html",
+      "dir": "css/css-scroll-snap",
+      "mappedFeatures": [
+        "scroll-snap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-scroll-snap/crashtests/fractional-covering-area-crash.html",
+      "dir": "css/css-scroll-snap",
+      "mappedFeatures": [
+        "scroll-snap"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-scroll-snap/ignore-snap-points-orthogonal-to-snap-axis.html",
+      "dir": "css/css-scroll-snap",
+      "mappedFeatures": [
+        "scroll-snap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-scroll-snap/inheritance.html",
+      "dir": "css/css-scroll-snap",
+      "mappedFeatures": [
+        "scroll-snap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-scroll-snap/input/keyboard-snap-interruption.html",
+      "dir": "css/css-scroll-snap",
+      "mappedFeatures": [
+        "scroll-snap"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/cssom/CSS-escape-numeric-id.html",
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/cssom/CSS-namespace-object-class-string.html",
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/cssom/CSS-supports.html",
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/cssom/CSSConditionRule-conditionText.html",
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/cssom/CSSContainerRule.tentative.html",
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/cssom/CSSCounterStyleRule.html",
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/cssom/CSSFontFaceRule.html",
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/cssom/CSSFontFeatureValuesRule.html",
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/cssom/CSSGroupingRule-cssRules.html",
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/cssom/CSSGroupingRule-insertRule-computed.html",
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/cssom/CSSGroupingRule-insertRule.html",
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/cssom/CSSImportRule-insertRule-styleSheet-parentStyleSheet.html",
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/cssom/CSSImportRule-layer-false-positive.html",
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/cssom/CSSImportRule-layer-media.html",
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/cssom/CSSImportRule-media-identity.html",
+      "dir": "css/cssom",
+      "mappedFeatures": [
+        "css-object-model",
+        "get-computed-style",
+        "constructed-stylesheets"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-conditional/at-media-001.html",
+      "dir": "css/css-conditional",
+      "mappedFeatures": [
+        "container-anchor-position-queries"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-conditional/at-media-002.html",
+      "dir": "css/css-conditional",
+      "mappedFeatures": [
+        "container-anchor-position-queries"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-conditional/at-media-003.html",
+      "dir": "css/css-conditional",
+      "mappedFeatures": [
+        "container-anchor-position-queries"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-conditional/at-media-content-001.html",
+      "dir": "css/css-conditional",
+      "mappedFeatures": [
+        "container-anchor-position-queries"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-conditional/at-media-content-002.html",
+      "dir": "css/css-conditional",
+      "mappedFeatures": [
+        "container-anchor-position-queries"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-contain/contain-animation-001.html",
+      "dir": "css/css-contain",
+      "mappedFeatures": [
+        "contain",
+        "content-visibility"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-contain/contain-body-bg-001.html",
+      "dir": "css/css-contain",
+      "mappedFeatures": [
+        "contain",
+        "content-visibility"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-contain/contain-body-bg-002.html",
+      "dir": "css/css-contain",
+      "mappedFeatures": [
+        "contain",
+        "content-visibility"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-contain/contain-body-bg-003.html",
+      "dir": "css/css-contain",
+      "mappedFeatures": [
+        "contain",
+        "content-visibility"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-contain/contain-body-bg-004.html",
+      "dir": "css/css-contain",
+      "mappedFeatures": [
+        "contain",
+        "content-visibility"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-contain/contain-body-dir-001.html",
+      "dir": "css/css-contain",
+      "mappedFeatures": [
+        "contain",
+        "content-visibility"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-contain/contain-body-dir-002.html",
+      "dir": "css/css-contain",
+      "mappedFeatures": [
+        "contain",
+        "content-visibility"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-contain/contain-body-dir-003.html",
+      "dir": "css/css-contain",
+      "mappedFeatures": [
+        "contain",
+        "content-visibility"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-display/accessibility/display-contents-role-and-label.html",
+      "dir": "css/css-display",
+      "mappedFeatures": [
+        "display"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-display/animations/display-interpolation-none.html",
+      "dir": "css/css-display",
+      "mappedFeatures": [
+        "display"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-display/animations/display-interpolation.html",
+      "dir": "css/css-display",
+      "mappedFeatures": [
+        "display"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-display/display-change-iframe.html",
+      "dir": "css/css-display",
+      "mappedFeatures": [
+        "display"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-display/display-change-object-iframe.html",
+      "dir": "css/css-display",
+      "mappedFeatures": [
+        "display"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-display/display-contents-001-crash.html",
+      "dir": "css/css-display",
+      "mappedFeatures": [
+        "display"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-variables/css-variable-change-style-001.html",
+      "dir": "css/css-variables",
+      "mappedFeatures": [
+        "custom-properties"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-variables/css-variable-change-style-002.html",
+      "dir": "css/css-variables",
+      "mappedFeatures": [
+        "custom-properties"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-variables/css-vars-custom-property-case-sensitive-001.html",
+      "dir": "css/css-variables",
+      "mappedFeatures": [
+        "custom-properties"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-variables/css-vars-custom-property-inheritance.html",
+      "dir": "css/css-variables",
+      "mappedFeatures": [
+        "custom-properties"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-variables/custom-properties-inherit.html",
+      "dir": "css/css-variables",
+      "mappedFeatures": [
+        "custom-properties"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-variables/missing-closing-nested-fallback-crash.html",
+      "dir": "css/css-variables",
+      "mappedFeatures": [
+        "custom-properties"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "css/css-align/abspos/align-items-static-position-001.tentative.html",
+      "dir": "css/css-align",
+      "mappedFeatures": [
+        "align-content-block"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-align/abspos/align-items-static-position-002.tentative.html",
+      "dir": "css/css-align",
+      "mappedFeatures": [
+        "align-content-block"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-align/abspos/align-items-static-position.html",
+      "dir": "css/css-align",
+      "mappedFeatures": [
+        "align-content-block"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-align/abspos/align-out-of-flow-only-content.html",
+      "dir": "css/css-align",
+      "mappedFeatures": [
+        "align-content-block"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-align/abspos/align-self-default-overflow-htb-ltr-htb.html",
+      "dir": "css/css-align",
+      "mappedFeatures": [
+        "align-content-block"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-multicol/abspos-after-spanner-static-pos.html",
+      "dir": "css/css-multicol",
+      "mappedFeatures": [
+        "multi-column",
+        "column-breaks"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-multicol/abspos-after-spanner.html",
+      "dir": "css/css-multicol",
+      "mappedFeatures": [
+        "multi-column",
+        "column-breaks"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-multicol/abspos-autopos-contained-by-viewport-000.html",
+      "dir": "css/css-multicol",
+      "mappedFeatures": [
+        "multi-column",
+        "column-breaks"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-multicol/abspos-autopos-contained-by-viewport-001.html",
+      "dir": "css/css-multicol",
+      "mappedFeatures": [
+        "multi-column",
+        "column-breaks"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-multicol/abspos-containing-block-outside-spanner.html",
+      "dir": "css/css-multicol",
+      "mappedFeatures": [
+        "multi-column",
+        "column-breaks"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-multicol/abspos-in-multicol-with-spanner-crash.html",
+      "dir": "css/css-multicol",
+      "mappedFeatures": [
+        "multi-column",
+        "column-breaks"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "css/css-cascade/all-prop-001.html",
+      "dir": "css/css-cascade",
+      "mappedFeatures": [
+        "all"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-cascade/all-prop-002.html",
+      "dir": "css/css-cascade",
+      "mappedFeatures": [
+        "all"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-cascade/all-prop-inherit-color.html",
+      "dir": "css/css-cascade",
+      "mappedFeatures": [
+        "all"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "css/css-cascade/all-prop-initial-color.html",
+      "dir": "css/css-cascade",
+      "mappedFeatures": [
+        "all"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "dom/nodes/Attr-prefix.html",
+      "dir": "dom/nodes",
+      "mappedFeatures": [
+        "dom",
+        "mutationobserver"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/nodes/CharacterData-appendChild.html",
+      "dir": "dom/nodes",
+      "mappedFeatures": [
+        "dom",
+        "mutationobserver"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/nodes/CharacterData-appendData.html",
+      "dir": "dom/nodes",
+      "mappedFeatures": [
+        "dom",
+        "mutationobserver"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/nodes/CharacterData-data.html",
+      "dir": "dom/nodes",
+      "mappedFeatures": [
+        "dom",
+        "mutationobserver"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/nodes/CharacterData-deleteData.html",
+      "dir": "dom/nodes",
+      "mappedFeatures": [
+        "dom",
+        "mutationobserver"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/nodes/CharacterData-insertData.html",
+      "dir": "dom/nodes",
+      "mappedFeatures": [
+        "dom",
+        "mutationobserver"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/nodes/CharacterData-remove.html",
+      "dir": "dom/nodes",
+      "mappedFeatures": [
+        "dom",
+        "mutationobserver"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/nodes/CharacterData-replaceData.html",
+      "dir": "dom/nodes",
+      "mappedFeatures": [
+        "dom",
+        "mutationobserver"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/nodes/CharacterData-substringData.html",
+      "dir": "dom/nodes",
+      "mappedFeatures": [
+        "dom",
+        "mutationobserver"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/nodes/CharacterData-surrogates.html",
+      "dir": "dom/nodes",
+      "mappedFeatures": [
+        "dom",
+        "mutationobserver"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/nodes/ChildNode-after.html",
+      "dir": "dom/nodes",
+      "mappedFeatures": [
+        "dom",
+        "mutationobserver"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/nodes/ChildNode-before.html",
+      "dir": "dom/nodes",
+      "mappedFeatures": [
+        "dom",
+        "mutationobserver"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/events/Body-FrameSet-Event-Handlers.html",
+      "dir": "dom/events",
+      "mappedFeatures": [
+        "events",
+        "mouse-events",
+        "pointer-events-api"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/events/CustomEvent.html",
+      "dir": "dom/events",
+      "mappedFeatures": [
+        "events",
+        "mouse-events",
+        "pointer-events-api"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/events/Event-cancelBubble.html",
+      "dir": "dom/events",
+      "mappedFeatures": [
+        "events",
+        "mouse-events",
+        "pointer-events-api"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/events/Event-constants.html",
+      "dir": "dom/events",
+      "mappedFeatures": [
+        "events",
+        "mouse-events",
+        "pointer-events-api"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/events/Event-defaultPrevented-after-dispatch.html",
+      "dir": "dom/events",
+      "mappedFeatures": [
+        "events",
+        "mouse-events",
+        "pointer-events-api"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/events/Event-defaultPrevented.html",
+      "dir": "dom/events",
+      "mappedFeatures": [
+        "events",
+        "mouse-events",
+        "pointer-events-api"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/events/Event-dispatch-bubble-canceled.html",
+      "dir": "dom/events",
+      "mappedFeatures": [
+        "events",
+        "mouse-events",
+        "pointer-events-api"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/events/Event-dispatch-bubbles-false.html",
+      "dir": "dom/events",
+      "mappedFeatures": [
+        "events",
+        "mouse-events",
+        "pointer-events-api"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/events/Event-dispatch-bubbles-true.html",
+      "dir": "dom/events",
+      "mappedFeatures": [
+        "events",
+        "mouse-events",
+        "pointer-events-api"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "dom/events/Event-dispatch-click.html",
+      "dir": "dom/events",
+      "mappedFeatures": [
+        "events",
+        "mouse-events",
+        "pointer-events-api"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "fetch/api/abort/destroyed-context.html",
+      "dir": "fetch",
+      "mappedFeatures": [
+        "fetch"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "fetch/api/abort/keepalive.html",
+      "dir": "fetch",
+      "mappedFeatures": [
+        "fetch"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "fetch/api/abort/serviceworker-intercepted.https.html",
+      "dir": "fetch",
+      "mappedFeatures": [
+        "fetch"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "fetch/api/basic/block-mime-as-script.html",
+      "dir": "fetch",
+      "mappedFeatures": [
+        "fetch"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "fetch/api/basic/fetch-in-popup-from-iframe.html",
+      "dir": "fetch",
+      "mappedFeatures": [
+        "fetch"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "fetch/api/basic/url-parsing.sub.html",
+      "dir": "fetch",
+      "mappedFeatures": [
+        "fetch"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "fetch/api/cors/data-url-iframe.html",
+      "dir": "fetch",
+      "mappedFeatures": [
+        "fetch"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "fetch/api/cors/data-url-shared-worker.html",
+      "dir": "fetch",
+      "mappedFeatures": [
+        "fetch"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "fetch/api/cors/data-url-worker.html",
+      "dir": "fetch",
+      "mappedFeatures": [
+        "fetch"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "fetch/api/cors/sandboxed-iframe.html",
+      "dir": "fetch",
+      "mappedFeatures": [
+        "fetch"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "resize-observer/calculate-depth-for-node.html",
+      "dir": "resize-observer",
+      "mappedFeatures": [
+        "resize-observer"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "resize-observer/callback-cross-realm-report-exception.html",
+      "dir": "resize-observer",
+      "mappedFeatures": [
+        "resize-observer"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "resize-observer/change-layout-in-error.html",
+      "dir": "resize-observer",
+      "mappedFeatures": [
+        "resize-observer"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "resize-observer/devicepixel.html",
+      "dir": "resize-observer",
+      "mappedFeatures": [
+        "resize-observer"
+      ],
+      "harness": "reftest"
+    },
+    {
+      "file": "intersection-observer/animating.html",
+      "dir": "intersection-observer",
+      "mappedFeatures": [
+        "intersection-observer"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "intersection-observer/bounding-box.html",
+      "dir": "intersection-observer",
+      "mappedFeatures": [
+        "intersection-observer"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "intersection-observer/callback-cross-realm-report-exception.html",
+      "dir": "intersection-observer",
+      "mappedFeatures": [
+        "intersection-observer"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "intersection-observer/client-rect.html",
+      "dir": "intersection-observer",
+      "mappedFeatures": [
+        "intersection-observer"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "html/webappapis/animation-frames/callback-cross-realm-report-exception.html",
+      "dir": "html/webappapis",
+      "mappedFeatures": [
+        "window",
+        "navigator"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "html/webappapis/animation-frames/callback-exception.html",
+      "dir": "html/webappapis",
+      "mappedFeatures": [
+        "window",
+        "navigator"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "html/webappapis/animation-frames/callback-handle.html",
+      "dir": "html/webappapis",
+      "mappedFeatures": [
+        "window",
+        "navigator"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "html/webappapis/animation-frames/callback-invoked.html",
+      "dir": "html/webappapis",
+      "mappedFeatures": [
+        "window",
+        "navigator"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "html/webappapis/animation-frames/callback-multicalls.html",
+      "dir": "html/webappapis",
+      "mappedFeatures": [
+        "window",
+        "navigator"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "html/webappapis/animation-frames/callback-timestamp.html",
+      "dir": "html/webappapis",
+      "mappedFeatures": [
+        "window",
+        "navigator"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "html/webappapis/animation-frames/cancel-handle-manual.html",
+      "dir": "html/webappapis",
+      "mappedFeatures": [
+        "window",
+        "navigator"
+      ],
+      "harness": "other"
+    },
+    {
+      "file": "html/webappapis/animation-frames/cancel-invoked.html",
+      "dir": "html/webappapis",
+      "mappedFeatures": [
+        "window",
+        "navigator"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "html/webappapis/animation-frames/cancel-pending.html",
+      "dir": "html/webappapis",
+      "mappedFeatures": [
+        "window",
+        "navigator"
+      ],
+      "harness": "testharness"
+    },
+    {
+      "file": "html/webappapis/animation-frames/nested-raf-not-sync.html",
+      "dir": "html/webappapis",
+      "mappedFeatures": [
+        "window",
+        "navigator"
+      ],
+      "harness": "testharness"
+    }
+  ],
+  "harnessBreakdown": {
+    "testharness": 152,
+    "reftest": 88,
+    "other": 17
+  }
+}
