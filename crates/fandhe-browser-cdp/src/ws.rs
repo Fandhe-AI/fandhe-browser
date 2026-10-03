@@ -9,7 +9,7 @@
 //! # スタブについて
 //!
 //! [`BrowserSessionHandler`] は `crate::protocol::Dispatcher` へ委譲するだけで、組込み
-//! メソッド表は `Page.navigate`・`DOM.getDocument`・`DOM.querySelector`（TASK-42.2・42.4・42.5。未実装メソッドの応答方針は
+//! メソッド表は `Page.navigate`・`DOM.getDocument`・`DOM.querySelector`・`DOM.requestChildNodes`（TASK-42.2・42.4・42.5・#657。未実装メソッドの応答方針は
 //! 42.6・`CDP-6`）。未実装メソッドへ成功を返さない（`SEC-2`）。
 
 use std::collections::HashMap;
