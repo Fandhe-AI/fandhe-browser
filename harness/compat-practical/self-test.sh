@@ -88,6 +88,12 @@ write_tasks kind '[{"id":"x1","cat":"static","url":"https://example.com/","selec
 expect_exit "unknown kind" 2 bash "$CHECK" --validate-only --tasks "$WORK/kind.json"
 write_tasks cat '[{"id":"x1","cat":"a\nb","url":"https://example.com/","selector":"h1","kind":"text"}]'
 expect_exit "newline in cat" 2 bash "$CHECK" --validate-only --tasks "$WORK/cat.json"
+write_tasks idnl '[{"id":"x1\n","cat":"static","url":"https://example.com/","selector":"h1","kind":"text"}]'
+expect_exit "trailing newline in id" 2 bash "$CHECK" --validate-only --tasks "$WORK/idnl.json"
+write_tasks catnl '[{"id":"x1","cat":"static\n","url":"https://example.com/","selector":"h1","kind":"text"}]'
+expect_exit "trailing newline in cat" 2 bash "$CHECK" --validate-only --tasks "$WORK/catnl.json"
+write_tasks urlnl '[{"id":"x1","cat":"static","url":"https://example.com/\n","selector":"h1","kind":"text"}]'
+expect_exit "trailing newline in url" 2 bash "$CHECK" --validate-only --tasks "$WORK/urlnl.json"
 write_tasks empty '[]'
 expect_exit "empty array" 2 bash "$CHECK" --validate-only --tasks "$WORK/empty.json"
 write_tasks bad '{not json'
@@ -100,11 +106,20 @@ STUB_DIR="$WORK/stub"
 mkdir -p "$STUB_DIR"
 cat >"$STUB_DIR/curl" <<'STUB'
 #!/usr/bin/env bash
-# -w '%{http_code} %{time_total}' の出力を STUB_CODE と固定の 0.250 秒、終了コードを STUB_RC で固定する
-printf '%s 0.250' "${STUB_CODE:-200}"
+# -w '%{http_code} %{time_total} %{remote_ip} %{redirect_url}' の出力を固定する。
+# STUB_CODE=コード（固定 0.250 秒）STUB_IP=接続先 IP STUB_REDIRECT=redirect_url STUB_RC=終了コード。
+# STUB_LOG があれば呼び出しごとの引数を追記する。
+[ -z "${STUB_LOG:-}" ] || echo "$*" >>"$STUB_LOG"
+printf '%s 0.250 %s %s' "${STUB_CODE:-200}" "${STUB_IP:-93.184.216.34}" "${STUB_REDIRECT:-}"
 exit "${STUB_RC:-0}"
 STUB
 chmod +x "$STUB_DIR/curl"
+# getent スタブ: DNS へは出ず STUB_RESOLVE_IP（既定は公開アドレス）を返す
+cat >"$STUB_DIR/getent" <<'STUB'
+#!/usr/bin/env bash
+printf '%s      STREAM %s\n' "${STUB_RESOLVE_IP:-93.184.216.34}" "${2:-}"
+STUB
+chmod +x "$STUB_DIR/getent"
 write_tasks net "[$VALID,{\"id\":\"x2\",\"cat\":\"spa\",\"url\":\"https://example.org/\",\"selector\":\"h1\",\"kind\":\"text\"}]"
 
 run_net() { PATH="$STUB_DIR:$PATH" STUB_CODE="$1" STUB_RC="$2" bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/out.jsonl"; }
@@ -132,11 +147,84 @@ expect_eq "$(result_field x2 http_status)" "403" "403 http_status"
 expect_eq "$(result_field x2 reachable)" "false" "403 reachable"
 expect_eq "$(ls -A "$WORK" | grep -c '^\.access_check\.' || true)" "0" "no leftover temp file"
 
+# --- SSRF 対策（url_check / 解決後アドレス / リダイレクト）---
+expect_exit "url_check public host" 0 url_check "https://example.com/"
+expect_contains "$(url_check "https://localhost/" || true)" "internal host name" "url_check localhost"
+expect_contains "$(url_check "https://127.0.0.1/" || true)" "non-public" "url_check loopback"
+expect_contains "$(url_check "https://169.254.169.254/latest" || true)" "non-public" "url_check metadata"
+expect_contains "$(url_check "https://10.1.2.3/" || true)" "non-public" "url_check private"
+expect_contains "$(url_check "https://2130706433/" || true)" "non-public" "url_check decimal ip"
+expect_contains "$(url_check "https://0177.0.0.1/" || true)" "non-public" "url_check octal ip"
+expect_contains "$(url_check "https://[::1]/" || true)" "IPv6 literal" "url_check ipv6"
+expect_contains "$(url_check "https://user@example.com/" || true)" "userinfo" "url_check userinfo"
+expect_contains "$(url_check "https://example.com:8443/" || true)" "port is not 443" "url_check port"
+expect_exit "is_public_ip 8.8.8.8" 0 is_public_ip 8.8.8.8
+expect_exit "is_public_ip 172.16.0.1" 1 is_public_ip 172.16.0.1
+expect_exit "is_public_ip 172.32.0.1" 0 is_public_ip 172.32.0.1
+expect_exit "is_public_ip 100.64.0.1" 1 is_public_ip 100.64.0.1
+expect_exit "is_public_ip ::1" 1 is_public_ip ::1
+expect_exit "is_public_ip fe80::1" 1 is_public_ip fe80::1
+expect_exit "is_public_ip fd00::1" 1 is_public_ip fd00::1
+expect_exit "is_public_ip ::ffff:127.0.0.1" 1 is_public_ip ::ffff:127.0.0.1
+expect_exit "is_public_ip 2606:4700::1" 0 is_public_ip 2606:4700::1
+
+write_tasks ssrf '[{"id":"s1","cat":"static","url":"https://127.0.0.1/","selector":"h1","kind":"text"},{"id":"s2","cat":"static","url":"https://localhost/x","selector":"h1","kind":"text"}]'
+LOG="$WORK/curl.log"
+: >"$LOG"
+expect_exit "ssrf literal tasks" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" bash "$CHECK" --tasks "$WORK/ssrf.json" --out "$WORK/ssrf.jsonl"
+expect_contains "$LAST_OUTPUT" "reachable=0/2" "ssrf literal summary"
+expect_eq "$(wc -l <"$LOG" | tr -d ' ')" "0" "ssrf literal: curl not invoked"
+expect_eq "$(jq -r 'select(.id=="s1") | .blocked' "$WORK/ssrf.jsonl")" "non-public or non-canonical IP literal" "ssrf literal blocked reason"
+
+: >"$LOG"
+expect_exit "ssrf resolves private" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_RESOLVE_IP=10.0.0.5 bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/ssrf2.jsonl"
+expect_contains "$LAST_OUTPUT" "reachable=0/2" "ssrf resolve summary"
+expect_eq "$(wc -l <"$LOG" | tr -d ' ')" "0" "ssrf resolve: curl not invoked"
+expect_eq "$(jq -r 'select(.id=="x1") | .blocked' "$WORK/ssrf2.jsonl")" "host resolves to a non-public address" "ssrf resolve blocked reason"
+
+: >"$LOG"
+expect_exit "ssrf redirect to loopback" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_CODE=302 STUB_REDIRECT=https://127.0.0.1/admin bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/ssrf3.jsonl"
+expect_contains "$LAST_OUTPUT" "reachable=0/2" "ssrf redirect summary"
+expect_eq "$(wc -l <"$LOG" | tr -d ' ')" "2" "ssrf redirect: only first hop fetched per task"
+expect_eq "$(jq -r 'select(.id=="x1") | .blocked' "$WORK/ssrf3.jsonl")" "non-public or non-canonical IP literal" "ssrf redirect blocked reason"
+
+: >"$LOG"
+expect_exit "ssrf redirect to http" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_CODE=301 STUB_REDIRECT=http://example.org/ bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/ssrf4.jsonl"
+expect_eq "$(jq -r 'select(.id=="x1") | .blocked' "$WORK/ssrf4.jsonl")" "scheme is not https" "ssrf redirect http blocked"
+
+: >"$LOG"
+expect_exit "redirect loop" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_CODE=302 STUB_REDIRECT=https://example.net/ bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/loop.jsonl"
+expect_eq "$(jq -r 'select(.id=="x1") | .curl_exit' "$WORK/loop.jsonl")" "47" "redirect loop curl_exit"
+expect_eq "$(jq -r 'select(.id=="x1") | .reachable' "$WORK/loop.jsonl")" "false" "redirect loop unreachable"
+expect_eq "$(grep -c . "$LOG")" "12" "redirect loop: 6 hops per task"
+
+: >"$LOG"
+expect_exit "connected to private ip" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_IP=192.168.0.1 bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/rip.jsonl"
+expect_eq "$(jq -r 'select(.id=="x1") | .blocked' "$WORK/rip.jsonl")" "connected to a non-public address" "remote_ip post-check"
+
+: >"$LOG"
+expect_exit "dns pin" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/pin.jsonl"
+expect_contains "$(cat "$LOG")" "--resolve example.com:443:93.184.216.34" "dns pinned to validated ip"
+
+# --- Windows の jq が出す CRLF を除去する（CR が URL・件数・出力へ混入しない）---
+CRLF_DIR="$WORK/crlf"
+mkdir -p "$CRLF_DIR"
+cat >"$CRLF_DIR/jq" <<'STUB'
+#!/usr/bin/env bash
+"$REAL_JQ" "$@" | sed 's/$/\r/'
+exit "${PIPESTATUS[0]}"
+STUB
+chmod +x "$CRLF_DIR/jq"
+expect_exit "crlf jq" 0 env REAL_JQ="$(type -P jq)" PATH="$CRLF_DIR:$STUB_DIR:$PATH" bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/crlf.jsonl"
+expect_contains "$LAST_OUTPUT" "reachable=2/2" "crlf jq summary"
+expect_eq "$(grep -c "$(printf '\r')" "$WORK/crlf.jsonl" || true)" "0" "crlf jq: no CR in jsonl"
+expect_eq "$(jq -r 'select(.id=="x1") | .url' "$WORK/crlf.jsonl")" "https://example.com/" "crlf jq: url intact"
+
 # --- resolve_bin ---
 expect_exit "bin missing" 2 resolve_bin "$WORK/nope"
 mkdir -p "$WORK/adir"
 expect_exit "bin is directory" 2 resolve_bin "$WORK/adir"
-printf '#!/bin/sh\n' >"$WORK/notexec"
+printf 'plain text, not a script\n' >"$WORK/notexec"
 chmod -x "$WORK/notexec"
 expect_exit "bin not executable" 2 resolve_bin "$WORK/notexec"
 printf '#!/bin/sh\n' >"$WORK/fakebin"
@@ -145,6 +233,9 @@ expect_exit "bin ok via arg" 0 resolve_bin "$WORK/fakebin"
 expect_eq "$LAST_OUTPUT" "$WORK/fakebin" "bin ok path"
 expect_exit "bin ok via env" 0 env FANDHE_BROWSER_BIN="$WORK/fakebin" bash -c ". '$SCRIPT_DIR/lib.sh'; resolve_bin"
 expect_eq "$LAST_OUTPUT" "$WORK/fakebin" "bin env path"
+expect_exit "access_check env bin missing" 2 env FANDHE_BROWSER_BIN="$WORK/nope" bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/out4.jsonl"
+expect_exit "access_check env bin ok" 0 env PATH="$STUB_DIR:$PATH" FANDHE_BROWSER_BIN="$WORK/fakebin" bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/out5.jsonl"
+expect_eq "$(jq -r 'select(.type=="meta") | .bin' "$WORK/out5.jsonl")" "$WORK/fakebin" "meta bin recorded via env"
 expect_exit "access_check --bin missing" 2 bash "$CHECK" --bin "$WORK/nope" --tasks "$WORK/net.json" --out "$WORK/out2.jsonl"
 expect_exit "access_check --bin ok" 0 env PATH="$STUB_DIR:$PATH" bash "$CHECK" --bin "$WORK/fakebin" --tasks "$WORK/net.json" --out "$WORK/out3.jsonl"
 expect_eq "$(jq -r 'select(.type=="meta") | .bin' "$WORK/out3.jsonl")" "$WORK/fakebin" "meta bin recorded"

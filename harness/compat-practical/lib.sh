@@ -4,6 +4,110 @@
 # access_check.sh と、後続の run_core.sh（TASK-71.2・#311）から `source` して使う。
 # 本ファイルは関数定義のみで、source した時点では何も実行しない。
 
+# jq ラッパー。Windows（Git Bash）のネイティブ jq は行末を CRLF で出力し、`$(...)` や
+# `read` へ CR が混入して等値判定・URL・件数が壊れるため、出力から CR を除く。
+# 呼び出し先の jq が非 0 で終わった場合は pipefail 前提でその終了コードを返す。
+# （各スクリプトは `set -o pipefail` 済みで本ファイルを source する）
+jq() {
+  command jq "$@" | tr -d '\r'
+}
+
+# is_public_ipv4 <addr>
+#   厳密な 10 進ドット表記（先頭ゼロなし。8 進・16 進・短縮表記は curl が別アドレスへ解釈するため拒否）
+#   の IPv4 で、かつ公開アドレスなら return 0。ループバック・プライベート・リンクローカル・
+#   CGNAT・予約・ドキュメント用・マルチキャスト等は return 1（SSRF 対策。SEC 系）。
+is_public_ipv4() {
+  local re='^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$'
+  local a b c d
+  [[ "$1" =~ $re ]] || return 1
+  a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}; c=${BASH_REMATCH[3]}; d=${BASH_REMATCH[4]}
+  if [ "$a" -gt 255 ] || [ "$b" -gt 255 ] || [ "$c" -gt 255 ] || [ "$d" -gt 255 ]; then
+    return 1
+  fi
+  if [ "$a" -eq 0 ] || [ "$a" -eq 10 ] || [ "$a" -eq 127 ] || [ "$a" -ge 224 ]; then return 1; fi
+  if [ "$a" -eq 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ]; then return 1; fi
+  if [ "$a" -eq 169 ] && [ "$b" -eq 254 ]; then return 1; fi
+  if [ "$a" -eq 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ]; then return 1; fi
+  if [ "$a" -eq 192 ] && [ "$b" -eq 168 ]; then return 1; fi
+  if [ "$a" -eq 192 ] && [ "$b" -eq 0 ] && { [ "$c" -eq 0 ] || [ "$c" -eq 2 ]; }; then return 1; fi
+  if [ "$a" -eq 198 ] && { [ "$b" -eq 18 ] || [ "$b" -eq 19 ]; }; then return 1; fi
+  if [ "$a" -eq 198 ] && [ "$b" -eq 51 ] && [ "$c" -eq 100 ]; then return 1; fi
+  if [ "$a" -eq 203 ] && [ "$b" -eq 0 ] && [ "$c" -eq 113 ]; then return 1; fi
+  return 0
+}
+
+# is_public_ip <addr>
+#   IPv4 は is_public_ipv4。IPv6 はグローバルユニキャスト（2000::/3）のみ許可し、
+#   ドキュメント用（2001:db8::/32）・6to4（2002::/16）は拒否。IPv4 射影（::ffff:a.b.c.d）は IPv4 として判定する。
+is_public_ip() {
+  local ip
+  ip="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+  case "$ip" in
+    ::ffff:*.*) is_public_ipv4 "${ip#::ffff:}" ;;
+    2001:db8:* | 2001:0db8:* | 2002:*) return 1 ;;
+    [23][0-9a-f][0-9a-f][0-9a-f]:*) return 0 ;;
+    *:*) return 1 ;;
+    *) is_public_ipv4 "$ip" ;;
+  esac
+}
+
+# url_host <url>
+#   https URL の authority から小文字のホスト名（末尾ドット・ポート除去）を stdout へ出す。
+url_host() {
+  local rest authority host
+  rest="${1#https://}"
+  authority="${rest%%[/?#]*}"
+  host="${authority%%:*}"
+  host="$(printf '%s' "$host" | tr 'A-Z' 'a-z')"
+  printf '%s\n' "${host%.}"
+}
+
+# url_check <url>
+#   取得してよい URL かを検証する。許可なら return 0。拒否なら理由（英語）を stdout へ出して return 1。
+#   https のみ・userinfo なし・ポート 443 のみ・IPv6 リテラル不可・localhost 系/内部ドメイン不可・
+#   数値風ホスト（IP リテラル）は公開 IPv4 の厳密な 10 進表記に限る（SSRF 対策。SEC 系）。
+#   DNS 解決後のアドレス検証は呼び出し側（access_check.sh）が行う。
+url_check() {
+  local url="$1" rest authority host port
+  case "$url" in
+    https://*) ;;
+    *) echo "scheme is not https"; return 1 ;;
+  esac
+  rest="${url#https://}"
+  authority="${rest%%[/?#]*}"
+  case "$authority" in
+    *@*) echo "userinfo is not allowed"; return 1 ;;
+    \[*) echo "IPv6 literal host is not allowed"; return 1 ;;
+  esac
+  host="${authority%%:*}"
+  if [ "$host" != "$authority" ]; then
+    port="${authority#*:}"
+    if [ "$port" != "443" ]; then echo "port is not 443"; return 1; fi
+  fi
+  host="$(url_host "$url")"
+  [ -n "$host" ] || { echo "empty host"; return 1; }
+  case "$host" in
+    localhost | *.localhost | *.local | *.internal | *.localdomain | *.lan | *.home.arpa)
+      echo "internal host name is not allowed"; return 1 ;;
+  esac
+  if [[ "$host" =~ ^(0x[0-9a-f]+|[0-9]+)(\.(0x[0-9a-f]+|[0-9]+))*$ ]]; then
+    if ! is_public_ipv4 "$host"; then echo "non-public or non-canonical IP literal"; return 1; fi
+  fi
+  return 0
+}
+
+# resolve_host_ips <host>
+#   ホストの IP を 1 行 1 件で stdout へ出す（getent / dscacheutil のあるときのみ。無ければ何も出さない）。
+#   出力が空でも呼び出し側は curl の接続先 IP（remote_ip）を事後検証するため fail-open にはならない。
+resolve_host_ips() {
+  if command -v getent >/dev/null 2>&1; then
+    getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u
+  elif command -v dscacheutil >/dev/null 2>&1; then
+    dscacheutil -q host -a name "$1" 2>/dev/null | awk '/^(ip_address|ipv6_address):/ {print $2}' | sort -u
+  fi
+  return 0
+}
+
 # resolve_bin [<path>]
 #   実行対象バイナリ（cli crate の `fandhe-browser`）の絶対パスを解決・検証する。
 #   優先順位: 引数 <path> > 環境変数 FANDHE_BROWSER_BIN > <repo>/target/release/fandhe-browser
