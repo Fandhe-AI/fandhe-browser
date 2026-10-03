@@ -4,7 +4,8 @@
 //! 呼ばれる。`Page.navigate`（42.2）が core の `AppState::navigation()` へ保存した
 //! 最終 URL と HTML を読み、core の `parse_document` で DOM 化して CDP の `DOM.Node`
 //! 形式の JSON へ変換する。読み取り専用で状態は変更しない。
-//! `DOM.querySelector`（TASK-42.5・#243、`CDP-1`・`CDP-5`）も同じ文書・採番を使う。
+//! `DOM.querySelector`（TASK-42.5・#243、`CDP-1`・`CDP-5`）・`DOM.requestChildNodes`
+//! （TASK-42・#657、`CDP-1`・`SEC-2`・`REPAIR-3`）も同じ文書・採番を使う。
 //!
 //! # nodeId の採番（TASK-42.5 `DOM.querySelector` が依存する契約）
 //!
@@ -21,7 +22,8 @@
 //! - クライアントが `depth` で要求した深さに達したノードは `children` を付けず
 //!   `childNodeCount` だけ返す（CDP の契約どおり）。一方、サーバー上限
 //!   （[`MAX_TREE_DEPTH`]・[`MAX_NODES_PER_RESPONSE`]）で要求どおりに展開できない場合は、
-//!   続きを取る `DOM.requestChildNodes` が未実装のため切り詰めず `DOCUMENT_TOO_LARGE` を返す
+//!   切り詰めず `DOCUMENT_TOO_LARGE` を返す（`DOM.requestChildNodes` を実装した後も、
+//!   サイレントな切り詰めで成功を装わないためこの方針を維持する）
 //! - `sessionId` 付きの要求は、そのセッションのターゲットが最後に確定した文書
 //!   （`CdpState::navigations()`。#658）だけを返す。未遷移・遷移中・取得失敗は
 //!   `TARGET_DOCUMENT_UNAVAILABLE`（空文書を捏造しない）。`frameId` の固定値・
@@ -34,11 +36,21 @@
 //!   `DOM.getDocument` が払い出した文書（`Arc<NavigationResult>` の同一性）を要求元セッション別に
 //!   記録し、`DOM.querySelector` は最新の確定文書がその記録と同一のときだけ nodeId を解決する。
 //!   getDocument 未呼び出し・遷移後の古い nodeId は `NODE_NOT_FOUND`（別文書の別ノードへ
-//!   解決しない。`CDP-1`）。ノード表そのものの保持・`DOM.requestChildNodes` は後続（`CDP-2`・TASK-43）
+//!   解決しない。`CDP-1`）。ノード表そのものの保持（再パースの削減）は後続（`CDP-2`・TASK-43）
 //! - `DOM.querySelector`: 一致なしは `{"nodeId": 0}`（`CDP-5`）。構文不正は `INVALID_PARAMS`、
 //!   未対応構文（core のサブセット外）は `UNSUPPORTED_PARAMS`、解決できない nodeId は
 //!   `NODE_NOT_FOUND`（0 を捏造しない。`SEC-2`）。テキスト等の非コンテナを起点にした場合は
 //!   子孫要素が無いため 0 を返す（Chrome はエラー。差異）
+//! - `DOM.requestChildNodes`: `nodeId` の子ノードを `DOM.setChildNodes` イベント
+//!   （`{"parentId", "nodes"}`）で返し、応答の `result` は `{}`。`depth` は起点からの相対深さ
+//!   （省略時 1・`-1` は上限まで・0 は `INVALID_PARAMS`）。未知・遷移後の nodeId は
+//!   `NODE_NOT_FOUND`、上限超過は `DOCUMENT_TOO_LARGE`。Chrome との差異: (1) Chrome は
+//!   イベントを応答より先に送るが、本実装は dispatcher の方針どおり応答を先に送る（並べ替えは
+//!   `CDP-2`・TASK-43）、(2) 子を持たない・非コンテナのノードでも Chrome は何も送らないが、
+//!   本実装は `nodes: []` のイベントを必ず送る（無応答で成功を装わない。`REPAIR-3`）
+//! - 払い出し記録は [`MAX_ISSUED_DOCUMENTS`] 件で頭打ちとし、超過した新規払い出しは
+//!   `ISSUED_LIMIT_EXCEEDED`（`SEC-2`）。破棄は、遷移後の別文書の再取得で置き換え・接続切断で
+//!   解放（同じ確定文書への再 `DOM.getDocument` は同じ nodeId を返す既存契約を維持する）
 //! - 直近の navigate 結果が無い場合は空ドキュメントを捏造せずエラーを返す（`SEC-2`）
 
 use std::collections::{HashMap, HashSet};
@@ -64,6 +76,11 @@ pub(crate) const MAX_NODES_PER_RESPONSE: usize = 10_000;
 /// 採番（文書全体の走査・表の保持）を行う文書のノード数上限。nodeId は文書全体の文書順で
 /// 決まる契約のため部分採番はできず、超過した文書は黙って切り詰めずエラーにする（`SEC-2`）。
 pub(crate) const MAX_NUMBERED_NODES: usize = 200_000;
+
+/// 払い出し記録（[`IssuedDocuments`]）の件数上限。（接続 × セッション）の組ごとに 1 件持つため、
+/// セッション数の上限（256 件）にブラウザレベル・複数接続分を見込んだ値。
+/// 超過時は他クライアントの記録を追い出さず、新規の払い出しを明示エラーで拒否する（`SEC-2`）。
+pub(crate) const MAX_ISSUED_DOCUMENTS: usize = 1024;
 
 /// `DOM.getDocument` の展開深さ。`limit` は [`MAX_TREE_DEPTH`] へ丸め済みで、
 /// `clamped` は要求値（`-1` 含む）が上限で丸められたことを示す。
@@ -111,6 +128,17 @@ pub(crate) fn parse_depth(params: &Value) -> Result<Depth, CdpError> {
         },
         _ => Err(CdpError::INVALID_PARAMS),
     }
+}
+
+/// `DOM.requestChildNodes` の `depth` を検証する。起点ノードからの相対深さで、子が 1 段目。
+/// 省略時 1、`-1` は上限まで全展開。CDP の仕様上 0 は不正（`DOM.getDocument` は 0 を受理する
+/// ため、[`parse_depth`] の後段で区別する）なので `INVALID_PARAMS` で拒否する。
+fn parse_child_depth(params: &Value) -> Result<Depth, CdpError> {
+    let depth = parse_depth(params)?;
+    if depth.limit == 0 && !depth.clamped {
+        return Err(CdpError::INVALID_PARAMS);
+    }
+    Ok(depth)
 }
 
 /// `pierce` を検証する。bool 以外は不正、`true`（shadow DOM・iframe の貫通）は未実装のため
@@ -250,8 +278,7 @@ fn has_base_href(doc: &Document) -> bool {
     })
 }
 
-/// `doc` を `DOM.Node`（root）の JSON へ変換する。明示スタックで反復的に構築し、
-/// 要求深さに達したノードは `childNodeCount` のみにし、サーバー上限超過は `DOCUMENT_TOO_LARGE`。
+/// `doc` を `DOM.Node`（root）の JSON へ変換する。[`build_subtree`] を root 起点で呼ぶ薄い入口。
 /// nodeId は `base + 1` から採番する（[`number_nodes`]）。
 pub(crate) fn build_document_node(
     doc: &Document,
@@ -263,15 +290,37 @@ pub(crate) fn build_document_node(
         return Err(CdpError::DOCUMENT_TOO_LARGE);
     }
     let numbering = number_nodes(doc, base);
-    let limit = depth.limit;
-    let root = doc.root();
     // <base href> は未解決のため、存在する文書では誤った baseURL を返さず省略する（REPAIR-3）。
     let include_base_url = !has_base_href(doc);
+    build_subtree(
+        doc,
+        &numbering,
+        doc.root(),
+        depth,
+        document_url,
+        include_base_url,
+    )
+}
+
+/// `start` を起点とする部分木を `DOM.Node` の JSON へ変換する。`DOM.getDocument`（root 起点）と
+/// `DOM.requestChildNodes`（任意ノード起点。`children` だけを取り出して使う）が共有する。
+///
+/// 明示スタックで反復的に構築し、要求深さ（`start` からの相対）に達したノードは
+/// `childNodeCount` のみにする。サーバー上限超過は切り詰めず `DOCUMENT_TOO_LARGE`（`SEC-2`）。
+fn build_subtree(
+    doc: &Document,
+    numbering: &NodeNumbering,
+    start: NodeId,
+    depth: Depth,
+    document_url: &str,
+    include_base_url: bool,
+) -> Result<Value, CdpError> {
+    let limit = depth.limit;
 
     // 1 回目: 文書順（前順）に、含めるノードと展開有無を決める。
     let mut included: Vec<(NodeId, bool)> = Vec::new();
     let mut budget = MAX_NODES_PER_RESPONSE.saturating_sub(1);
-    let mut stack: Vec<(NodeId, u32)> = vec![(root, 0)];
+    let mut stack: Vec<(NodeId, u32)> = vec![(start, 0)];
     while let Some((id, d)) = stack.pop() {
         let count = doc.children(id).count();
         // サーバー上限で要求どおり展開できないなら、切り詰めた成功応答にせず明示エラーにする。
@@ -318,7 +367,7 @@ pub(crate) fn build_document_node(
         }
         built.insert(id, Value::Object(m));
     }
-    Ok(built.remove(&root).unwrap_or(Value::Null))
+    Ok(built.remove(&start).unwrap_or(Value::Null))
 }
 
 /// `sessionId` を解決する（なければブラウザレベル = `None`）。未登録は `INVALID_PARAMS`。
@@ -384,7 +433,8 @@ fn load_document(
 /// 値は払い出し時点の確定文書と nodeId の `base`（[`number_nodes`]）で、
 /// `Arc` を保持するためアドレスが再利用されず `Arc::ptr_eq` で同一文書を判定できる。
 /// 遷移が確定すると新しい `Arc` に置き換わり、旧 nodeId は無効になる。保持件数は
-/// 生存セッション数 + 1 以下（detach・ターゲット閉鎖で消えたセッションは記録時に破棄。`SEC-2`）。
+/// [`MAX_ISSUED_DOCUMENTS`] 以下（detach・ターゲット閉鎖で消えたセッションは記録時に破棄し、
+/// 上限超過の新規払い出しは他の記録を追い出さず [`RecordOutcome::LimitExceeded`]。`SEC-2`）。
 ///
 /// `base` は全セッション共通の単調増加カウンタから払い出し、一度割り当てた範囲を
 /// 再利用しない。これにより、遷移後に再度 `DOM.getDocument` しても旧文書の nodeId は
@@ -398,6 +448,18 @@ fn load_document(
 /// 一度も払い出していない範囲の nodeId は `NODE_NOT_FOUND`。
 pub(crate) struct IssuedDocuments {
     inner: Mutex<IssuedState>,
+}
+
+/// [`IssuedDocuments::record`] の結果。呼び出し側は `Stale` なら再試行し、`LimitExceeded` は
+/// 再試行せず明示エラーにする（`SEC-2`・`REPAIR-4`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordOutcome {
+    /// `base` が有効な記録として確定した。
+    Recorded,
+    /// 最新の文書でない・セッションが消えた・接続が切れた・同じ文書が別の `base` で記録済み。
+    Stale,
+    /// 新規キーの記録が [`MAX_ISSUED_DOCUMENTS`] を超える。
+    LimitExceeded,
 }
 
 /// 払い出し記録のキー（接続 ID, `sessionId`）。
@@ -457,7 +519,8 @@ impl IssuedDocuments {
     /// 記録用ロックを保持したまま `latest` で最新の確定文書を再取得し、`doc` と同一のときだけ
     /// 記録する（古い文書は記録しない）。同じ文書が別の `base` で記録済みの場合（並行する
     /// 同一文書の getDocument）は既存を維持して `false` を返し、呼び出し側が既存 `base` で
-    /// 作り直す。戻り値は `base` が有効な記録として確定したか。
+    /// 作り直す。戻り値は [`RecordOutcome`]。新規キーの追加で [`MAX_ISSUED_DOCUMENTS`] を超える場合は
+    /// 他の記録を追い出さず `LimitExceeded`（既存キーの置き換えは件数が増えないため常に許可）。
     fn record(
         &self,
         registry: &crate::target::TargetRegistry,
@@ -466,31 +529,38 @@ impl IssuedDocuments {
         doc: &Arc<NavigationResult>,
         base: i64,
         latest: impl FnOnce() -> Option<Arc<NavigationResult>>,
-    ) -> bool {
+    ) -> RecordOutcome {
         let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         st.docs.retain(|(_, k), _| {
             k.as_ref()
                 .is_none_or(|s| registry.session_target(s).is_some())
         });
         if !latest().is_some_and(|l| Arc::ptr_eq(&l, doc)) {
-            return false;
+            return RecordOutcome::Stale;
         }
         if !session.is_none_or(|s| registry.session_target(s).is_some()) {
-            return false;
+            return RecordOutcome::Stale;
         }
         // 切断（`release_connection`）と競合した記録を拒否する。確認と挿入は同一ロック内。
         // 閉じた接続には応答の届け先がないため、呼び出し側の再試行が尽きて失敗しても害はない。
         if conn.is_some_and(|c| !st.live.contains(&c)) {
-            return false;
+            return RecordOutcome::Stale;
         }
-        if let Some((issued, existing)) = st.docs.get(&(conn, session.cloned()))
+        let key = (conn, session.cloned());
+        if let Some((issued, existing)) = st.docs.get(&key)
             && Arc::ptr_eq(issued, doc)
         {
-            return *existing == base;
+            return if *existing == base {
+                RecordOutcome::Recorded
+            } else {
+                RecordOutcome::Stale
+            };
         }
-        st.docs
-            .insert((conn, session.cloned()), (Arc::clone(doc), base));
-        true
+        if !st.docs.contains_key(&key) && st.docs.len() >= MAX_ISSUED_DOCUMENTS {
+            return RecordOutcome::LimitExceeded;
+        }
+        st.docs.insert(key, (Arc::clone(doc), base));
+        RecordOutcome::Recorded
     }
 
     /// 接続 `conn` の払い出し記録をすべて解放する（切断時に `crate::ws` の `on_close` から呼ぶ。
@@ -608,19 +678,85 @@ impl CommandHandler for DomQuerySelector {
     }
 }
 
+/// `DOM.requestChildNodes` ハンドラ（TASK-42・#657、`CDP-1`・`SEC-2`・`REPAIR-3`）。
+///
+/// `protocol::builtin_handlers` から登録される。`DOM.getDocument` が `depth` で展開を止めた
+/// ノード（`childNodeCount` のみ）の子を、`DOM.setChildNodes` イベントで返す。検証順は
+/// [`DomQuerySelector`] と同じ（セッション → パラメータ → 文書 → 払い出し照合 → 構築 → 再確認）。
+pub(crate) struct DomRequestChildNodes;
+
+impl CommandHandler for DomRequestChildNodes {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            let target = resolve_target(&ctx)?;
+            let node_id = params
+                .get("nodeId")
+                .and_then(Value::as_i64)
+                .ok_or(CdpError::INVALID_PARAMS)?;
+            let depth = parse_child_depth(params)?;
+            check_pierce(params)?;
+            let (latest, parsed) = load_document(&ctx, target.as_ref())?;
+            // getDocument 未呼び出し・遷移後の古い記録はここで弾く（`CDP-1`）。
+            let Some(base) = ctx
+                .state
+                .dom_issued()
+                .issued_base(ctx.conn, ctx.session_id, &latest)
+            else {
+                return Err(CdpError::NODE_NOT_FOUND);
+            };
+            let doc = &parsed.document;
+            if doc.node_count() > MAX_NUMBERED_NODES {
+                return Err(CdpError::DOCUMENT_TOO_LARGE);
+            }
+            let numbering = number_nodes(doc, base);
+            let start = numbering.resolve(node_id).ok_or(CdpError::NODE_NOT_FOUND)?;
+            let subtree = build_subtree(doc, &numbering, start, depth, latest.url(), false)?;
+            // 構築中に遷移が確定した場合は旧文書の結果を返さない（`CDP-1`）。
+            let still_latest =
+                current_latest(&ctx, target.as_ref()).is_ok_and(|l| Arc::ptr_eq(&l, &latest));
+            if !still_latest
+                || ctx
+                    .state
+                    .dom_issued()
+                    .issued_base(ctx.conn, ctx.session_id, &latest)
+                    != Some(base)
+            {
+                return Err(CdpError::NODE_NOT_FOUND);
+            }
+            // 子の無いノードでも `nodes: []` を必ず送る（無応答で成功を装わない。`REPAIR-3`）。
+            let nodes = match subtree {
+                Value::Object(mut m) => m.remove("children").unwrap_or_else(|| json!([])),
+                _ => json!([]),
+            };
+            let event = crate::protocol::CdpEvent {
+                method: "DOM.setChildNodes",
+                params: json!({ "parentId": node_id, "nodes": nodes }),
+                session_id: None,
+            };
+            Ok(HandlerOutput::result(json!({})).with_event(event))
+        })
+    }
+}
+
 /// 文書構築中の遷移競合で記録できなかった場合の再試行上限（`SEC-2`: 無限ループ防止）。
 const MAX_ISSUE_ATTEMPTS: usize = 3;
 
-/// `build` が `(root, recorded)` を返す。記録できなかった（構築中に遷移して最新でなくなった・
+/// `build` が `(root, outcome)` を返す。記録できなかった（構築中に遷移して最新でなくなった・
 /// セッションが消えた）旧文書の nodeId は後続の `DOM.querySelector` で解決できないため成功応答に
 /// しない。新しい文書で上限回まで作り直し、収束しなければ明示エラーを返す（`CDP-1`・`REPAIR-3`）。
+/// 件数上限超過（`LimitExceeded`）は再試行しても解消しないため、すぐ `ISSUED_LIMIT_EXCEEDED` を返す（`SEC-2`）。
 fn build_recorded_root(
-    mut build: impl FnMut() -> Result<(Value, bool), CdpError>,
+    mut build: impl FnMut() -> Result<(Value, RecordOutcome), CdpError>,
 ) -> Result<Value, CdpError> {
     for _ in 0..MAX_ISSUE_ATTEMPTS {
-        let (root, recorded) = build()?;
-        if recorded {
-            return Ok(root);
+        match build()? {
+            (root, RecordOutcome::Recorded) => return Ok(root),
+            (_, RecordOutcome::LimitExceeded) => return Err(CdpError::ISSUED_LIMIT_EXCEEDED),
+            (_, RecordOutcome::Stale) => {}
         }
     }
     Err(CdpError::SERVER_ERROR)
@@ -651,7 +787,7 @@ impl CommandHandler for DomGetDocument {
                 let root = build_document_node(&parsed.document, latest.url(), depth, base)?;
                 // 構築中に遷移・並行 getDocument で最新でなくなった文書は記録しない（新世代の
                 // 記録を古い `Arc` で上書きしない）。記録できたかを呼び出し側へ返す。
-                let recorded = ctx.state.dom_issued().record(
+                let outcome = ctx.state.dom_issued().record(
                     ctx.state.registry(),
                     ctx.conn,
                     ctx.session_id,
@@ -659,7 +795,7 @@ impl CommandHandler for DomGetDocument {
                     base,
                     || current_latest(&ctx, target.as_ref()).ok(),
                 );
-                Ok((root, recorded))
+                Ok((root, outcome))
             })?;
             Ok(HandlerOutput::result(json!({ "root": root })))
         })
@@ -935,13 +1071,20 @@ mod tests {
         let mut calls = 0;
         let r = build_recorded_root(|| {
             calls += 1;
-            Ok((json!({ "n": calls }), calls == 2))
+            Ok((
+                json!({ "n": calls }),
+                if calls == 2 {
+                    RecordOutcome::Recorded
+                } else {
+                    RecordOutcome::Stale
+                },
+            ))
         });
         assert_eq!(r.unwrap(), json!({ "n": 2 }));
         let mut calls = 0;
         let r = build_recorded_root(|| {
             calls += 1;
-            Ok((json!({}), false))
+            Ok((json!({}), RecordOutcome::Stale))
         });
         assert_eq!(r.unwrap_err(), CdpError::SERVER_ERROR);
         assert_eq!(calls, MAX_ISSUE_ATTEMPTS);
@@ -957,7 +1100,10 @@ mod tests {
         issued.open_connection(a);
         issued.open_connection(b);
         let base = issued.base_for(Some(a), None, &d, 10).unwrap();
-        assert!(issued.record(&registry, Some(a), None, &d, base, || Some(Arc::clone(&d))));
+        assert_eq!(
+            issued.record(&registry, Some(a), None, &d, base, || Some(Arc::clone(&d))),
+            RecordOutcome::Recorded
+        );
         assert_eq!(issued.issued_base(Some(a), None, &d), Some(base));
         assert_eq!(issued.issued_base(Some(b), None, &d), None);
         issued.release_connection(b);
@@ -978,18 +1124,20 @@ mod tests {
         let base = issued.base_for(Some(conn), None, &d, 10).unwrap();
         // getDocument の途中で切断が走った状況を再現する。
         issued.release_connection(conn);
-        assert!(
-            !issued.record(&registry, Some(conn), None, &d, base, || Some(Arc::clone(
+        assert_eq!(
+            issued.record(&registry, Some(conn), None, &d, base, || Some(Arc::clone(
                 &d
-            )))
+            ))),
+            RecordOutcome::Stale
         );
         assert_eq!(issued.len(), 0);
         assert_eq!(issued.issued_base(Some(conn), None, &d), None);
         // 未登録の接続も同様に拒否する。
-        assert!(
-            !issued.record(&registry, Some(ConnId::new(8)), None, &d, base, || Some(
+        assert_eq!(
+            issued.record(&registry, Some(ConnId::new(8)), None, &d, base, || Some(
                 Arc::clone(&d)
-            ))
+            )),
+            RecordOutcome::Stale
         );
         assert_eq!(issued.len(), 0);
     }
@@ -1004,13 +1152,22 @@ mod tests {
         let nb = issued.base_for(None, None, &new, 10).unwrap();
         let ob = issued.base_for(None, None, &old, 10).unwrap();
         // 最新は new。new を記録できる。
-        assert!(issued.record(&registry, None, None, &new, nb, || Some(Arc::clone(&new))));
+        assert_eq!(
+            issued.record(&registry, None, None, &new, nb, || Some(Arc::clone(&new))),
+            RecordOutcome::Recorded
+        );
         // 遅れて完了した old は最新でないため記録されず、new が有効なまま残る。
-        assert!(!issued.record(&registry, None, None, &old, ob, || Some(Arc::clone(&new))));
+        assert_eq!(
+            issued.record(&registry, None, None, &old, ob, || Some(Arc::clone(&new))),
+            RecordOutcome::Stale
+        );
         assert_eq!(issued.issued_base(None, None, &new), Some(nb));
         assert_eq!(issued.issued_base(None, None, &old), None);
         // 最新を取得できない場合も記録しない。
-        assert!(!issued.record(&registry, None, None, &old, ob, || None));
+        assert_eq!(
+            issued.record(&registry, None, None, &old, ob, || None),
+            RecordOutcome::Stale
+        );
     }
 
     /// nodeId の範囲は文書をまたいで再利用せず、同一文書の再払い出しは同じ範囲（`CDP-1`）。
@@ -1022,13 +1179,19 @@ mod tests {
         let issued = IssuedDocuments::new();
         let ba = issued.base_for(None, None, &a, 10).unwrap();
         assert_eq!(ba, 0);
-        assert!(issued.record(&registry, None, None, &a, ba, || Some(Arc::clone(&a))));
+        assert_eq!(
+            issued.record(&registry, None, None, &a, ba, || Some(Arc::clone(&a))),
+            RecordOutcome::Recorded
+        );
         // 同一文書の再払い出しは既存の base を再利用する。
         assert_eq!(issued.base_for(None, None, &a, 10).unwrap(), 0);
         // 別文書（同一 HTML でも別 Arc）は重ならない範囲を得る。
         let bb = issued.base_for(None, None, &b, 10).unwrap();
         assert_eq!(bb, 10);
-        assert!(issued.record(&registry, None, None, &b, bb, || Some(Arc::clone(&b))));
+        assert_eq!(
+            issued.record(&registry, None, None, &b, bb, || Some(Arc::clone(&b))),
+            RecordOutcome::Recorded
+        );
         assert_eq!(issued.issued_base(None, None, &a), None);
         assert_eq!(issued.issued_base(None, None, &b), Some(10));
         // 旧範囲の nodeId は新文書の採番に含まれない。
@@ -1037,7 +1200,10 @@ mod tests {
         assert_eq!(n.resolve(10), None);
         assert!(n.resolve(11).is_some());
         // 同一文書が別 base で記録済みなら並行記録は確定させない。
-        assert!(!issued.record(&registry, None, None, &b, 99, || Some(Arc::clone(&b))));
+        assert_eq!(
+            issued.record(&registry, None, None, &b, 99, || Some(Arc::clone(&b))),
+            RecordOutcome::Stale
+        );
         // カウンタのあふれは明示エラー。
         assert_eq!(
             issued.base_for(None, None, &a, usize::MAX),
@@ -1045,6 +1211,134 @@ mod tests {
         );
     }
 
+    /// 起点ノード（HTML）から depth 1 で組んだ部分木は、子だけを展開し parentId が起点を指す（`CDP-1`）。
+    #[test]
+    fn cdp1_build_subtree_from_html_depth_one() {
+        let d = doc(PAGE);
+        let n = number_nodes(&d, 0);
+        let html = n.resolve(3).unwrap();
+        let v = build_subtree(&d, &n, html, Depth::exact(1), "u", false).unwrap();
+        assert_eq!(v["nodeId"], 3);
+        assert_eq!(
+            v["children"],
+            json!([
+                {
+                    "nodeId": 4, "backendNodeId": 4, "parentId": 3, "attributes": [],
+                    "nodeType": 1, "nodeName": "HEAD", "localName": "head", "nodeValue": ""
+                },
+                {
+                    "nodeId": 5, "backendNodeId": 5, "parentId": 3, "attributes": [],
+                    "nodeType": 1, "nodeName": "BODY", "localName": "body", "nodeValue": "",
+                    "childNodeCount": 1
+                }
+            ])
+        );
+    }
+
+    /// `DOM.requestChildNodes` の depth は 0 を拒否し、省略は 1・-1 は上限まで（`REPAIR-3`）。
+    #[test]
+    fn cdp1_parse_child_depth_rejects_zero() {
+        assert_eq!(
+            parse_child_depth(&json!({"depth": 0})),
+            Err(CdpError::INVALID_PARAMS)
+        );
+        assert_eq!(parse_child_depth(&json!({})), Ok(Depth::exact(1)));
+        assert_eq!(parse_child_depth(&json!({"depth": 2})), Ok(Depth::exact(2)));
+        assert_eq!(
+            parse_child_depth(&json!({"depth": -1})),
+            Ok(Depth::unlimited())
+        );
+        assert_eq!(
+            parse_child_depth(&json!({"depth": -2})),
+            Err(CdpError::INVALID_PARAMS)
+        );
+        assert_eq!(
+            parse_child_depth(&json!({"depth": "1"})),
+            Err(CdpError::INVALID_PARAMS)
+        );
+    }
+
+    /// 部分木のノード数が上限を超えたら切り詰めず `DOCUMENT_TOO_LARGE`（`SEC-2`）。
+    #[test]
+    fn sec2_subtree_node_budget_exceeded_is_error() {
+        let n = MAX_NODES_PER_RESPONSE + 50;
+        let html = format!("<body>{}</body>", "<i></i>".repeat(n));
+        let d = doc(&html);
+        let num = number_nodes(&d, 0);
+        let body = num.resolve(4).unwrap();
+        assert_eq!(
+            build_subtree(&d, &num, body, Depth::exact(1), "u", false),
+            Err(CdpError::DOCUMENT_TOO_LARGE)
+        );
+    }
+
+    /// 部分木の深さがサーバー上限を超える全展開は `DOCUMENT_TOO_LARGE`（`SEC-2`）。
+    #[test]
+    fn sec2_subtree_depth_cap_is_error() {
+        let n = MAX_TREE_DEPTH as usize + 10;
+        let html = format!("{}{}", "<div>".repeat(n), "</div>".repeat(n));
+        let d = doc(&html);
+        let num = number_nodes(&d, 0);
+        let html_el = num.resolve(2).unwrap();
+        assert_eq!(
+            build_subtree(&d, &num, html_el, Depth::unlimited(), "u", false),
+            Err(CdpError::DOCUMENT_TOO_LARGE)
+        );
+    }
+
+    /// 払い出し記録は上限に達すると新規キーを拒否し、既存キーの置き換えと解放後の再記録は許可する（`SEC-2`）。
+    #[test]
+    fn sec2_issued_record_limit_is_enforced() {
+        let registry = crate::target::TargetRegistry::new();
+        let d = Arc::new(NavigationResult::new("https://example.com/", "<p>a</p>"));
+        let issued = IssuedDocuments::new();
+        for i in 0..MAX_ISSUED_DOCUMENTS {
+            let c = ConnId::new(i as u64 + 1);
+            issued.open_connection(c);
+            let base = issued.base_for(Some(c), None, &d, 1).unwrap();
+            assert_eq!(
+                issued.record(&registry, Some(c), None, &d, base, || Some(Arc::clone(&d))),
+                RecordOutcome::Recorded
+            );
+        }
+        assert_eq!(issued.len(), MAX_ISSUED_DOCUMENTS);
+        let extra = ConnId::new(MAX_ISSUED_DOCUMENTS as u64 + 1);
+        issued.open_connection(extra);
+        let base = issued.base_for(Some(extra), None, &d, 1).unwrap();
+        assert_eq!(
+            issued.record(&registry, Some(extra), None, &d, base, || Some(Arc::clone(
+                &d
+            ))),
+            RecordOutcome::LimitExceeded
+        );
+        assert_eq!(issued.len(), MAX_ISSUED_DOCUMENTS);
+        // 既存キーの置き換え（別の文書）は件数が増えないため許可される。
+        let newer = Arc::new(NavigationResult::new("https://example.com/", "<p>b</p>"));
+        let first = ConnId::new(1);
+        let nb = issued.base_for(Some(first), None, &newer, 1).unwrap();
+        assert_eq!(
+            issued.record(&registry, Some(first), None, &newer, nb, || Some(
+                Arc::clone(&newer)
+            )),
+            RecordOutcome::Recorded
+        );
+        // 解放で空きができれば再び記録できる。
+        issued.release_connection(first);
+        assert_eq!(
+            issued.record(&registry, Some(extra), None, &d, base, || Some(Arc::clone(
+                &d
+            ))),
+            RecordOutcome::Recorded
+        );
+        // 上限超過は再試行せず専用エラーになる。
+        let mut calls = 0;
+        let r = build_recorded_root(|| {
+            calls += 1;
+            Ok((json!({}), RecordOutcome::LimitExceeded))
+        });
+        assert_eq!(r, Err(CdpError::ISSUED_LIMIT_EXCEEDED));
+        assert_eq!(calls, 1);
+    }
     // CdpState は AppState（Profile::open）が必要で、非 unix では構築手段が無い
     // （protocol.rs のテストと同じ理由）ため、状態を要するテストは unix 限定。
     #[cfg(unix)]
@@ -1435,6 +1729,242 @@ mod tests {
             assert_eq!(call(&st, &q_b).await["error"]["message"], "node not found");
             let q_b2 = qs_text(15, Some(&sid_b), r#"{"nodeId":8,"selector":"h1"}"#);
             assert_eq!(call(&st, &q_b2).await["result"]["nodeId"], 13);
+        }
+
+        async fn call_frames(st: &Arc<CdpState>, text: &str) -> Vec<Value> {
+            Dispatcher::builtin()
+                .unwrap()
+                .dispatch(st, text)
+                .await
+                .into_frames()
+                .iter()
+                .map(|f| serde_json::from_str(f).unwrap())
+                .collect()
+        }
+
+        fn rcn(id: u32, params: &str) -> String {
+            format!(r#"{{"id":{id},"method":"DOM.requestChildNodes","params":{params}}}"#)
+        }
+
+        fn head() -> Value {
+            json!({
+                "nodeId": 4, "backendNodeId": 4, "parentId": 3, "attributes": [],
+                "nodeType": 1, "nodeName": "HEAD", "localName": "head", "nodeValue": ""
+            })
+        }
+
+        fn body() -> Value {
+            json!({
+                "nodeId": 5, "backendNodeId": 5, "parentId": 3, "attributes": [],
+                "nodeType": 1, "nodeName": "BODY", "localName": "body", "nodeValue": "",
+                "childNodeCount": 1
+            })
+        }
+
+        /// depth 1 の getDocument で省略された孫以降を requestChildNodes で順に取れる（`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_dispatch_request_child_nodes_fetches_grandchildren() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            let gd = call(
+                &st,
+                r#"{"id":1,"method":"DOM.getDocument","params":{"depth":1}}"#,
+            )
+            .await;
+            let html = &gd["result"]["root"]["children"][1];
+            assert_eq!(html["nodeId"], 3);
+            assert_eq!(html["childNodeCount"], 2);
+            assert!(html.get("children").is_none());
+
+            let f = call_frames(&st, &rcn(2, r#"{"nodeId":3}"#)).await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(f[0], json!({"id": 2, "result": {}}));
+            assert_eq!(
+                f[1],
+                json!({
+                    "method": "DOM.setChildNodes",
+                    "params": {"parentId": 3, "nodes": [head(), body()]}
+                })
+            );
+
+            let f = call_frames(&st, &rcn(3, r#"{"nodeId":5}"#)).await;
+            assert_eq!(
+                f[1]["params"],
+                json!({"parentId": 5, "nodes": [{
+                    "nodeId": 6, "backendNodeId": 6, "parentId": 5,
+                    "attributes": ["id", "t"],
+                    "nodeType": 1, "nodeName": "H1", "localName": "h1", "nodeValue": "",
+                    "childNodeCount": 1
+                }]})
+            );
+
+            let f = call_frames(&st, &rcn(4, r#"{"nodeId":6}"#)).await;
+            assert_eq!(
+                f[1]["params"],
+                json!({"parentId": 6, "nodes": [{
+                    "nodeId": 7, "backendNodeId": 7, "parentId": 6,
+                    "nodeType": 3, "nodeName": "#text", "localName": "", "nodeValue": "Hi"
+                }]})
+            );
+
+            let f = call_frames(&st, &rcn(5, r#"{"nodeId":3,"depth":-1}"#)).await;
+            let nodes = &f[1]["params"]["nodes"];
+            assert_eq!(nodes[1]["children"][0]["nodeId"], 6);
+            assert_eq!(nodes[1]["children"][0]["children"][0]["nodeValue"], "Hi");
+        }
+
+        /// 子を持たないノードでも `nodes: []` のイベントを必ず送る（`REPAIR-3`）。
+        #[tokio::test]
+        async fn cdp1_dispatch_request_child_nodes_leaf_returns_empty_nodes() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            call(&st, r#"{"id":1,"method":"DOM.getDocument"}"#).await;
+            let f = call_frames(&st, &rcn(2, r#"{"nodeId":7}"#)).await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(f[0], json!({"id": 2, "result": {}}));
+            assert_eq!(
+                f[1],
+                json!({"method": "DOM.setChildNodes", "params": {"parentId": 7, "nodes": []}})
+            );
+        }
+
+        /// getDocument 前の呼び出しは明示エラーでイベントを送らない（`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_dispatch_request_child_nodes_requires_get_document() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            let f = call_frames(&st, &rcn(1, r#"{"nodeId":1}"#)).await;
+            assert_eq!(f.len(), 1);
+            assert_eq!(
+                f[0]["error"],
+                json!({"code": -32000, "message": "node not found"})
+            );
+        }
+
+        /// 遷移後の旧 nodeId は無効で、再取得した新しい採番では取れる（`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_dispatch_request_child_nodes_stale_after_navigation() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            let gd = r#"{"id":90,"method":"DOM.getDocument","params":{"depth":0}}"#;
+            call(&st, gd).await;
+            let q = rcn(10, r#"{"nodeId":3}"#);
+            assert_eq!(call_frames(&st, &q).await[1]["params"]["parentId"], 3);
+            navigate(&st);
+            let stale = call_frames(&st, &q).await;
+            assert_eq!(stale.len(), 1);
+            assert_eq!(stale[0]["error"]["message"], "node not found");
+            let root = call(&st, gd).await["result"]["root"]["nodeId"]
+                .as_i64()
+                .unwrap();
+            assert_eq!(root, 8);
+            assert_eq!(
+                call_frames(&st, &q).await[0]["error"]["message"],
+                "node not found"
+            );
+            let f = call_frames(&st, &rcn(11, r#"{"nodeId":10}"#)).await;
+            assert_eq!(f[1]["params"]["parentId"], 10);
+            assert_eq!(f[1]["params"]["nodes"][0]["nodeId"], 11);
+        }
+
+        /// 未知の nodeId は明示エラー（`REPAIR-3`）。
+        #[tokio::test]
+        async fn repair3_dispatch_request_child_nodes_unknown_node_id() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            call(&st, r#"{"id":1,"method":"DOM.getDocument"}"#).await;
+            for id in ["999", "0", "-5"] {
+                let f = call_frames(&st, &rcn(2, &format!(r#"{{"nodeId":{id}}}"#))).await;
+                assert_eq!(f.len(), 1);
+                assert_eq!(f[0]["error"]["message"], "node not found");
+            }
+        }
+
+        /// 不正パラメータは `invalid params`、`pierce: true` は未対応として拒否（`REPAIR-3`）。
+        #[tokio::test]
+        async fn repair3_dispatch_request_child_nodes_invalid_params() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            call(&st, r#"{"id":1,"method":"DOM.getDocument"}"#).await;
+            for p in [
+                "{}",
+                r#"{"nodeId":"1"}"#,
+                r#"{"nodeId":1,"depth":0}"#,
+                r#"{"nodeId":1,"depth":-2}"#,
+                r#"{"nodeId":1,"pierce":"x"}"#,
+            ] {
+                let f = call_frames(&st, &rcn(2, p)).await;
+                assert_eq!(
+                    f[0]["error"],
+                    json!({"code": -32602, "message": "invalid params"}),
+                    "{p}"
+                );
+                assert_eq!(f.len(), 1);
+            }
+            let f = call_frames(&st, &rcn(3, r#"{"nodeId":1,"pierce":true}"#)).await;
+            assert_eq!(
+                f[0]["error"],
+                json!({"code": -32602, "message": "unsupported params"})
+            );
+        }
+
+        /// 未登録の sessionId は拒否（`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_dispatch_request_child_nodes_unknown_session_rejected() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            let t = r#"{"id":1,"method":"DOM.requestChildNodes","sessionId":"nope","params":{"nodeId":1}}"#;
+            let f = call_frames(&st, t).await;
+            assert_eq!(f.len(), 1);
+            assert_eq!(
+                f[0]["error"],
+                json!({"code": -32602, "message": "invalid params"})
+            );
+        }
+
+        /// セッション付き要求ではイベントにも同じ sessionId が付き、別セッションの nodeId は解決しない（`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_dispatch_request_child_nodes_session_event_carries_session_id() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let (tid, sid_a) = session_for_new_target(&st);
+            let sid_b = st.registry().attach(&tid).unwrap().as_str().to_owned();
+            commit_target(&st, &tid, "https://t.example/", PAGE);
+            call(&st, &get_doc_text(&sid_a, r#"{"depth":0}"#)).await;
+            let req = |sid: &str| {
+                format!(
+                    r#"{{"id":7,"method":"DOM.requestChildNodes","sessionId":"{sid}","params":{{"nodeId":3}}}}"#
+                )
+            };
+            let f = call_frames(&st, &req(&sid_a)).await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(f[0]["sessionId"], sid_a.as_str());
+            assert_eq!(f[1]["method"], "DOM.setChildNodes");
+            assert_eq!(f[1]["sessionId"], sid_a.as_str());
+            assert_eq!(f[1]["params"]["parentId"], 3);
+            let f = call_frames(&st, &req(&sid_b)).await;
+            assert_eq!(f.len(), 1);
+            assert_eq!(f[0]["error"]["message"], "node not found");
+        }
+
+        /// エラー応答は入力値をエコーしない（`SEC-2`）。
+        #[tokio::test]
+        async fn sec2_dispatch_request_child_nodes_error_does_not_echo_input() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            navigate(&st);
+            call(&st, r#"{"id":1,"method":"DOM.getDocument"}"#).await;
+            let f = call_frames(&st, &rcn(2, r#"{"nodeId":424242}"#)).await;
+            assert!(!f[0].to_string().contains("424242"));
+            let f = call_frames(&st, &rcn(3, r#"{"nodeId":1,"depth":"zzz-secret"}"#)).await;
+            assert!(!f[0].to_string().contains("zzz-secret"));
         }
     }
 }

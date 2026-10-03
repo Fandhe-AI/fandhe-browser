@@ -8,7 +8,7 @@
 //!
 //! 公開入口は無く crate 内部専用。後続タスクは [`builtin_handlers`] へメソッドを
 //! 追加するだけでよい（`Page.navigate` は 42.2 で登録済み、イベント送出は 42.3 で実装済み、
-//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5 で登録済み）。
+//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657 で登録済み）。
 //!
 //! # 入力の扱い
 //!
@@ -21,7 +21,7 @@
 //! # スタブについて
 //!
 //! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
-//! `DOM.querySelector`（TASK-42.5）のみ登録済みで、
+//! `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）のみ登録済みで、
 //! それ以外のメソッドは「method not implemented」（`-32601`）になる。
 //! 未実装メソッドへ成功を返さない（`SEC-2`）。未実装メソッドの正式な応答方針と受信ログは
 //! TASK-42.6（`CDP-6`）で確定する。
@@ -81,6 +81,9 @@ impl CdpError {
         Self::new(-32000, "document not available for target");
     /// 指定 nodeId が現在の文書の採番表に無い（形式は正しいが対象が無い。`DOM.querySelector`。`CDP-1`）。
     pub const NODE_NOT_FOUND: Self = Self::new(-32000, "node not found");
+    /// nodeId の払い出し記録が件数上限に達した（`DOM.getDocument`。他クライアントの記録を
+    /// 追い出さず新規の払い出しを拒否する。`SEC-2`）。
+    pub const ISSUED_LIMIT_EXCEEDED: Self = Self::new(-32000, "too many issued documents");
 
     const fn new(code: i64, message: &'static str) -> Self {
         Self { code, message }
@@ -342,7 +345,7 @@ impl std::error::Error for DispatcherError {}
 type HandlerTable = Vec<(&'static str, Box<dyn CommandHandler>)>;
 
 /// 組込みハンドラ表。`Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
-/// `DOM.querySelector`（TASK-42.5）を登録済み（`CDP-1`）。
+/// `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）を登録済み（`CDP-1`）。
 ///
 /// `Page.navigate` は既定の `FetchOptions`（内部アドレス拒否）で `Fetcher` を構築する。
 pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
@@ -352,6 +355,10 @@ pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
         ("Page.navigate", Box::new(navigate)),
         ("DOM.getDocument", Box::new(crate::dom::DomGetDocument)),
         ("DOM.querySelector", Box::new(crate::dom::DomQuerySelector)),
+        (
+            "DOM.requestChildNodes",
+            Box::new(crate::dom::DomRequestChildNodes),
+        ),
     ])
 }
 

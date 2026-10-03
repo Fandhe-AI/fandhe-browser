@@ -15,7 +15,7 @@
 //! 以下は未実装で、実装済みを装う公開 API・ダミー実装は置かない
 //! （`code-comment-style.md`・REPAIR-3）。
 //!
-//! - JSON-RPC ディスパッチャ（`protocol.rs`。TASK-42.1）は実装済みで、組込みメソッドは `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4。`sessionId` 付きはターゲット別の確定文書を返す。#658）・`DOM.querySelector`（TASK-42.5。#243）
+//! - JSON-RPC ディスパッチャ（`protocol.rs`。TASK-42.1）は実装済みで、組込みメソッドは `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4。`sessionId` 付きはターゲット別の確定文書を返す。#658）・`DOM.querySelector`（TASK-42.5。#243）・`DOM.requestChildNodes`（#657）
 //! - 個別 CDP メソッドのハンドラ（`CDP-1`/`CDP-5`/`CDP-6`/`CDP-7`、`TASK-42.2`〜`42.6`、`MS-4`）
 
 mod discovery;
