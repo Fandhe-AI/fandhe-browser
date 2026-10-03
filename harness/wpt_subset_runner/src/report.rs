@@ -123,7 +123,7 @@ pub enum ReportError {
     },
     /// 件数が上限超過。
     TooManyEntries,
-    /// `file` が不正（空・長さ超過）。
+    /// `file` が不正（空・長さ超過・許可文字外・絶対パス・`..` セグメント）。
     InvalidFile {
         /// 理由。
         reason: &'static str,
@@ -196,6 +196,24 @@ impl UnrunnableReport {
             }
             if file.len() > MAX_FILE_BYTES {
                 return Err(ReportError::InvalidFile { reason: "too long" });
+            }
+            if file.starts_with('/') {
+                return Err(ReportError::InvalidFile {
+                    reason: "absolute path",
+                });
+            }
+            if !file
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
+            {
+                return Err(ReportError::InvalidFile {
+                    reason: "disallowed character",
+                });
+            }
+            if file.split('/').any(|seg| seg == "..") {
+                return Err(ReportError::InvalidFile {
+                    reason: "parent segment",
+                });
             }
             if !seen.insert(file) {
                 return Err(ReportError::Duplicate {
@@ -363,6 +381,25 @@ mod tests {
             UnrunnableReport::from_entries([("other", "")]),
             Err(ReportError::InvalidFile { reason: "empty" })
         );
+    }
+
+    #[test]
+    fn plug_10_rejects_unsafe_paths() {
+        for (bad, reason) in [
+            ("/x", "absolute path"),
+            ("../x", "parent segment"),
+            ("a/../x", "parent segment"),
+            ("a b.html", "disallowed character"),
+            ("a\\b.html", "disallowed character"),
+            ("é.html", "disallowed character"),
+        ] {
+            assert_eq!(
+                UnrunnableReport::from_entries([("reftest", bad)]),
+                Err(ReportError::InvalidFile { reason }),
+                "{bad}"
+            );
+        }
+        assert!(UnrunnableReport::from_entries([("reftest", "a/b-c_d.1.html")]).is_ok());
     }
 
     #[test]
