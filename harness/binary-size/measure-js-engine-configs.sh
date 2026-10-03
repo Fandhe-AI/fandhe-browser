@@ -85,9 +85,9 @@ OUT_EOF
   else echo "none"; fi
 }
 
-# $1=bytes → 10 進 MB（10^6）を小数第 2 位まで
+# $1=bytes → 10 進 MB（10^6）を小数第 2 位まで。小数点をカンマにするロケールで mb=42,92 となり出力契約が壊れないよう C ロケールに固定する
 bytes_to_mb() {
-  awk -v b="$1" 'BEGIN { printf "%.2f", b / 1000000 }'
+  LC_ALL=C awk -v b="$1" 'BEGIN { printf "%.2f", b / 1000000 }'
 }
 
 # $1=name $2=value。LABEL_RE に合わない値は出力せず exit 2。

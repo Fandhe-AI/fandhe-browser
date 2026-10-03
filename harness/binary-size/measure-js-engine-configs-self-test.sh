@@ -32,6 +32,7 @@ check "empty input" "none" "$(printf '' | observed_engines)"
 check "mb 42920000" "42.92" "$(bytes_to_mb 42920000)"
 check "mb 999999" "1.00" "$(bytes_to_mb 999999)"
 check "mb 0" "0.00" "$(bytes_to_mb 0)"
+check "mb locale independent" "42.92" "$(LC_ALL=de_DE.UTF-8 LC_NUMERIC=de_DE.UTF-8 bytes_to_mb 42920000)"
 
 check "default expects v8" "v8" "$(config_expected_engines default)"
 check "boa expects boa" "boa" "$(config_expected_engines boa)"
