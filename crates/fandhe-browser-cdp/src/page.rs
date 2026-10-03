@@ -9,8 +9,9 @@
 //!
 //! # スタブ・範囲外（`REPAIR-3`）
 //!
-//! - `Page.frameNavigated`・`Page.loadEventFired` 等のイベント送出は TASK-42.3（#241）。
-//!   本ハンドラの出力は `events` が空。
+//! - イベントは確定した遷移（結果が公開されたもの）に限り `Page.frameNavigated` →
+//!   `Page.loadEventFired` を送出する（TASK-42.3・#241）。失敗・中断・追い越された遷移では
+//!   送出しない。残るスタブは [`navigation_events`] を参照。
 //! - HTML は `FetchResponse::body_text_lossy`（UTF-8 lossy）で文字列化する簡易実装。
 //!   文字コード判定は `CORE-5`・TASK-25 で置き換える。
 //! - `frameId` は [`MAIN_FRAME_ID`] の固定値。セッション／ターゲットに基づく決定は
@@ -28,7 +29,8 @@
 //! 世代を払い出した後の取得失敗は直近結果を無効化するため、ターゲット表の URL も試行した URL
 //! へ更新し、文書を持たない共有状態と食い違わせない（`CDP-1`）。
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Instant;
 
 use fandhe_browser_core::{
     Error, FetchOptions, Fetcher, NavigationGeneration, NavigationResult, NavigationState,
@@ -36,8 +38,10 @@ use fandhe_browser_core::{
 };
 use serde_json::{Value, json};
 
-use crate::protocol::{BoxFuture, CdpError, CommandContext, CommandHandler, HandlerOutput};
-use crate::target::{CdpStateError, MAX_URL_LEN, TargetId};
+use crate::protocol::{
+    BoxFuture, CdpError, CdpEvent, CommandContext, CommandHandler, HandlerOutput,
+};
+use crate::target::{CdpStateError, MAX_URL_LEN, TargetId, TargetRegistry};
 
 /// メインフレームの `frameId`（スタブ。将来はセッション → ターゲット ID。`CDP-2`・TASK-43）。
 pub(crate) const MAIN_FRAME_ID: &str = "main";
@@ -92,6 +96,50 @@ pub(crate) fn fetch_error_text(err: &Error) -> &'static str {
         Error::InvalidInput { .. } => "net::ERR_INVALID_URL",
         _ => "net::ERR_FAILED",
     }
+}
+
+/// プロセス内の単調時計（秒）。`Page.loadEventFired` の `timestamp`（CDP `MonotonicTime`）に使う。
+/// 基点は初回呼び出し時で、システム時刻の変更に影響されない。
+fn monotonic_seconds() -> f64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
+/// 確定した遷移の CDP イベント列（`Page.frameNavigated` → `Page.loadEventFired`）を作る
+/// （TASK-42.3・`CDP-1`）。`PageNavigate::handle` が、遷移が確定し結果が公開された場合のみ呼ぶ。
+/// `session_id` は `Dispatcher::dispatch` がリクエストの値で補完するため `None` で返す。
+///
+/// 送出順は `DispatchOutcome` の「レスポンス → イベント列」で確定とする。実 Chromium のように
+/// `frameNavigated` を応答より前へ出す並べ替えの要否は TASK-43（`CDP-2`）で判断する。
+///
+/// # スタブ（`REPAIR-3`）
+///
+/// - `frame.mimeType` は固定値 `text/html`（`NavigationResult` が Content-Type を保持しないため。
+///   実値化は `CORE-5`・TASK-25 以降）。
+/// - `securityOrigin` 等の他フィールドは出さない。
+/// - `Page.enable` による購読ゲート・`frameStartedLoading`・`domContentEventFired` 等は未実装
+///   （TASK-43・`CDP-2`）。
+fn navigation_events(loader_id: &str, url: &str, timestamp: f64) -> [CdpEvent; 2] {
+    [
+        CdpEvent {
+            method: "Page.frameNavigated",
+            params: json!({
+                "frame": {
+                    "id": MAIN_FRAME_ID,
+                    "loaderId": loader_id,
+                    "url": url,
+                    "mimeType": "text/html",
+                },
+                "type": "Navigation",
+            }),
+            session_id: None,
+        },
+        CdpEvent {
+            method: "Page.loadEventFired",
+            params: json!({ "timestamp": timestamp }),
+            session_id: None,
+        },
+    ]
 }
 
 fn state_error(_: StateError) -> CdpError {
@@ -218,6 +266,17 @@ pub(crate) struct PageNavigate {
     /// 共有状態へ最後にミラーした内容の記録。ターゲット表の更新・ミラーを 1 つの
     /// 同期境界（このロック）で行い、古い遷移が新しい結果を巻き戻さないようにする。
     published: Mutex<Published>,
+    /// テスト専用: イベント送出直前で一時停止させ、確定後〜送出前の競合を再現する。
+    #[cfg(test)]
+    pre_emit_pause: PreEmitPause,
+}
+
+/// テスト専用の一時停止ゲート（`armed` の間、送出直前で `paused` を立てて待つ）。
+#[cfg(test)]
+#[derive(Default)]
+struct PreEmitPause {
+    armed: std::sync::atomic::AtomicBool,
+    paused: std::sync::atomic::AtomicBool,
 }
 
 /// 共有状態（`AppState::navigation()`）へ最後にミラーした内容の記録（`CDP-1`）。
@@ -234,25 +293,77 @@ struct Published {
     /// ミラー（共有状態の世代払い出し）を行わない。ミラーが進行中の遷移の世代を進めて
     /// `Superseded` で中断させないため（`CDP-1`）。
     browser_in_flight: usize,
+    /// ブラウザレベル遷移の進行中のためミラーを見送った、確定順（`seq`）が最新のターゲット確定。
+    /// 進行中記録の解放時（最後のガードの `Drop`）に共有状態へ反映する（`CDP-1`）。
+    pending: Option<PendingMirror>,
+}
+
+/// ミラーを見送ったターゲット確定結果（解放時の再反映用）。
+struct PendingMirror {
+    target: TargetId,
+    /// 保留時点のターゲット遷移状態と世代。反映前に、同一ターゲットの後続遷移で無効化されて
+    /// いないかを確認する。
+    nav: Arc<NavigationState>,
+    generation: NavigationGeneration,
+    result: Arc<NavigationResult>,
 }
 
 /// ブラウザレベル遷移の進行中を [`Published::browser_in_flight`] へ記録するガード。
 /// 完了・エラー・future の破棄のいずれでも減算する。
-struct BrowserFlight<'a>(&'a Mutex<Published>);
+///
+/// 最後のガードの解放時に、見送ったターゲット確定（`pending`）があれば共有状態へ反映する。
+/// 反映するのは見送った中で確定順が最新のものだけで、ブラウザレベル遷移が後から確定していれば
+/// `pending` は破棄済みのため古い結果で上書きしない（`CDP-1`）。
+struct BrowserFlight<'a> {
+    published: &'a Mutex<Published>,
+    app_nav: &'a NavigationState,
+    registry: &'a TargetRegistry,
+    gate: &'a CommitGate,
+}
 
 impl<'a> BrowserFlight<'a> {
-    fn enter(published: &'a Mutex<Published>) -> Self {
+    fn enter(
+        published: &'a Mutex<Published>,
+        app_nav: &'a NavigationState,
+        registry: &'a TargetRegistry,
+        gate: &'a CommitGate,
+    ) -> Self {
         let mut p = published.lock().unwrap_or_else(PoisonError::into_inner);
         p.browser_in_flight = p.browser_in_flight.saturating_add(1);
         drop(p);
-        Self(published)
+        Self {
+            published,
+            app_nav,
+            registry,
+            gate,
+        }
     }
 }
 
 impl Drop for BrowserFlight<'_> {
     fn drop(&mut self) {
-        let mut p = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut p = self
+            .published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         p.browser_in_flight = p.browser_in_flight.saturating_sub(1);
+        if p.browser_in_flight != 0 {
+            return;
+        }
+        let Some(m) = p.pending.take() else { return };
+        // 保留中にターゲットが閉じられた、または同一ターゲットの後続遷移で結果が無効化された
+        // 場合は反映しない（直近結果の契約。`CDP-1`）。世代確認は `gate` を保持して行う。
+        let _gate = lock_gate(self.gate);
+        if self.registry.target(&m.target).is_some()
+            && m.nav.current_generation() == m.generation
+            && let Ok(g) = self.app_nav.begin_navigation()
+            && self
+                .app_nav
+                .commit_navigation(g, NavigationResult::new(m.result.url(), m.result.html()))
+                .is_ok()
+        {
+            p.mirrored = Some((m.target, g));
+        }
     }
 }
 
@@ -267,7 +378,10 @@ impl PageNavigate {
                 seq: 0,
                 mirrored: None,
                 browser_in_flight: 0,
+                pending: None,
             }),
+            #[cfg(test)]
+            pre_emit_pause: PreEmitPause::default(),
         })
     }
 }
@@ -298,6 +412,17 @@ impl CommandHandler for PageNavigate {
                 .filter(|u| !u.is_empty() && u.len() <= MAX_URL_LEN)
                 .ok_or(CdpError::INVALID_PARAMS)?;
             let app_nav = ctx.state.app_state().navigation();
+            // 遷移が確定し結果が公開された場合のみ `Some(確定 URL)`。イベント送出の根拠になる。
+            let mut navigated: Option<String> = None;
+            // ターゲット遷移の送出直前の世代再確認用（遷移状態と確定時の世代）。
+            let mut recheck: Option<(Arc<NavigationState>, NavigationGeneration)> = None;
+            // ブラウザレベル遷移の送出直前の世代再確認用（共有状態 `app_nav` の確定時の世代）。
+            let mut recheck_shared: Option<NavigationGeneration> = None;
+            // ブラウザレベル遷移の進行中記録。確定・公開後もイベント送出が済むまで保持する。
+            // 送出前に手放すと、その隙にターゲット遷移のミラーが共有状態の世代を進め、送出直前の
+            // 世代再確認が失敗して Page.frameNavigated / loadEventFired が落ち、待機中の
+            // クライアントが止まる（`CDP-1`）。ミラーを見送る間も `seq` は記録される。
+            let mut _flight: Option<BrowserFlight<'_>> = None;
             let out = match &target_id {
                 Some(tid) => {
                     let registry = ctx.state.registry();
@@ -341,14 +466,23 @@ impl CommandHandler for PageNavigate {
                         {
                             match registry.set_target_url(tid, &c.url) {
                                 Ok(()) => {
+                                    navigated = Some(c.url.clone());
+                                    recheck = Some((Arc::clone(&nav), c.generation));
                                     // 今回確定した結果だけを、完了順が新しい場合に限りミラーする。
                                     // ブラウザレベル遷移の進行中などでミラーを見送る場合も、確定順
                                     // （`seq`）は記録する。記録しないと、見送った新しい確定（B）より
                                     // 古い確定（A）が後から条件を通り、共有状態に古い HTML が残る。
                                     if c.seq > published.seq {
                                         published.seq = c.seq;
-                                        if published.browser_in_flight == 0
-                                            && let Ok(g) = app_nav.begin_navigation()
+                                        if published.browser_in_flight != 0 {
+                                            // 見送った最新の確定を、進行中記録の解放時に反映する。
+                                            published.pending = Some(PendingMirror {
+                                                target: tid.clone(),
+                                                nav: Arc::clone(&nav),
+                                                generation: c.generation,
+                                                result: Arc::clone(r),
+                                            });
+                                        } else if let Ok(g) = app_nav.begin_navigation()
                                             && app_nav
                                                 .commit_navigation(
                                                     g,
@@ -397,6 +531,11 @@ impl CommandHandler for PageNavigate {
                         // 共有状態が当該ターゲット自身のミラーのままなら無効化し、直前に成功した
                         // ページを読めなくする。別ターゲットやブラウザレベル遷移の結果が載って
                         // いる間は消さない（`CDP-1`）。
+                        // 見送り中の確定が当該ターゲットのものなら、失敗した遷移が無効化済みの
+                        // ため解放時に反映しない。
+                        if published.pending.as_ref().is_some_and(|m| &m.target == tid) {
+                            published.pending = None;
+                        }
                         if let Some((mid, mg)) = &published.mirrored
                             && mid == tid
                             && published.browser_in_flight == 0
@@ -411,7 +550,12 @@ impl CommandHandler for PageNavigate {
                 None => {
                     // 世代払い出しより前に進行中を記録し、ターゲット遷移のミラーと調停する。
                     // 記録は結果の公開（下の `published` 更新）が済むまで保持する。
-                    let _flight = BrowserFlight::enter(&self.published);
+                    _flight = Some(BrowserFlight::enter(
+                        &self.published,
+                        app_nav,
+                        ctx.state.registry(),
+                        &self.gate,
+                    ));
                     let out = navigate_gated(&self.fetcher, app_nav, url, &self.gate).await?;
                     // ブラウザレベル遷移も確定順（`seq`）の管理に含める。実際に確定し、かつ公開済みより
                     // 新しい場合に限り、共有状態をどのターゲットのミラーでもないものとして記録する。
@@ -421,8 +565,22 @@ impl CommandHandler for PageNavigate {
                             .published
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner);
+                        // イベント送出の可否は `seq` ではなく共有状態の世代で決める。`seq` は
+                        // `app_nav` を置き換えないターゲット遷移のコミットでも進むため、`seq` で
+                        // 判定すると並行するセッションスコープの遷移が大きい `seq` を記録しただけで、
+                        // 現在の遷移（世代一致・結果保持）のイベントが落ちて待機中のクライアントが
+                        // 止まる。追い越された遷移（世代不一致）は `gate` を保持して確認し、送出しない。
+                        {
+                            let _gate = lock_gate(&self.gate);
+                            if app_nav.current_generation() == c.generation && c.result.is_some() {
+                                navigated = Some(c.url.clone());
+                                recheck_shared = Some(c.generation);
+                            }
+                        }
                         if c.seq > published.seq {
                             published.seq = c.seq;
+                            // 見送り中のターゲット確定はこの確定より古いため破棄する。
+                            published.pending = None;
                             // 共有状態に古いターゲットのミラーが載ったままなら、今回の確定結果で
                             // 戻す。別の進行中遷移を巻き込まないよう、載っているのがそのミラー
                             // 自身（世代一致）の場合に限る。確定結果を戻せなかった（`result` が
@@ -453,7 +611,62 @@ impl CommandHandler for PageNavigate {
             if let (Some(text), Some(obj)) = (out.error_text, result.as_object_mut()) {
                 obj.insert("errorText".into(), json!(text));
             }
-            Ok(HandlerOutput::result(result))
+            let mut output = HandlerOutput::result(result);
+            // 公開処理の後に別の `Page.navigate` が同一ターゲットで確定していないかを、送出の
+            // 直前に `gate` を保持して再確認する（`CDP-1`）。追い越された遷移のイベントを出さない。
+            // 応答フレームの組み立て後〜ソケット書き込みの区間は、イベントが要求元の応答に同梱される
+            // 設計上このハンドラでは直列化できない（セッション単位の配送順は TASK-43・`CDP-2` で扱う）。
+            // ブラウザレベル遷移も、確定時の世代が共有状態に残っているかを同様に再確認する。
+            // ターゲット付き遷移は、公開後にターゲットが閉じられていないか（ターゲット表に存在し、
+            // セッションが同じターゲットを指したままか）も再確認する。保持中の `NavigationState`
+            // の世代はターゲット削除では変わらないため、世代だけでは閉じたターゲットの
+            // イベントを止められない（`CDP-1`・`CDP-2`）。
+            // 送出対象の確定（ターゲット生存・世代の再確認）とイベント列の作成は、同じ `gate` の
+            // ロック内で行う。確認後にロックを手放してから生成すると、その間に別の遷移が同一
+            // ターゲットで開始・確定しても古いイベントが出てしまうため（`CDP-1`）。
+            #[cfg(test)]
+            {
+                use std::sync::atomic::Ordering;
+                // 最初に到達した 1 件だけ停止する（後続のターゲット遷移は素通りさせる）。
+                if self.pre_emit_pause.armed.load(Ordering::SeqCst)
+                    && !self.pre_emit_pause.paused.swap(true, Ordering::SeqCst)
+                {
+                    while self.pre_emit_pause.armed.load(Ordering::SeqCst) {
+                        let mut yielded = false;
+                        std::future::poll_fn(|cx| {
+                            if yielded {
+                                return std::task::Poll::Ready(());
+                            }
+                            yielded = true;
+                            cx.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        })
+                        .await;
+                    }
+                }
+            }
+            if let Some(url) = navigated {
+                let _gate = lock_gate(&self.gate);
+                let target_alive = match (&target_id, ctx.session_id) {
+                    (Some(tid), Some(sid)) => {
+                        let registry = ctx.state.registry();
+                        registry.target(tid).is_some()
+                            && registry.session_target(sid).as_ref() == Some(tid)
+                    }
+                    _ => true,
+                };
+                if target_alive
+                    && recheck
+                        .as_ref()
+                        .is_none_or(|(n, g)| n.current_generation() == *g)
+                    && recheck_shared.is_none_or(|g| app_nav.current_generation() == g)
+                {
+                    for ev in navigation_events(&out.loader_id, &url, monotonic_seconds()) {
+                        output = output.with_event(ev);
+                    }
+                }
+            }
+            Ok(output)
         })
     }
 }
@@ -649,6 +862,33 @@ mod tests {
         }
     }
 
+    /// `navigation_events` は `frameNavigated` → `loadEventFired` を具体値で返す（TASK-42.3・`CDP-1`）。
+    #[test]
+    fn cdp1_navigation_events_shape() {
+        let ev = navigation_events("1", "http://example.test/", 1.5);
+        assert_eq!(ev[0].method, "Page.frameNavigated");
+        assert_eq!(
+            serde_json::from_str::<Value>(&ev[0].to_json()).unwrap(),
+            json!({"method": "Page.frameNavigated", "params": {
+                "frame": {"id": "main", "loaderId": "1",
+                    "url": "http://example.test/", "mimeType": "text/html"},
+                "type": "Navigation"}})
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&ev[1].to_json()).unwrap(),
+            json!({"method": "Page.loadEventFired", "params": {"timestamp": 1.5}})
+        );
+        assert!(ev[0].session_id.is_none() && ev[1].session_id.is_none());
+    }
+
+    #[test]
+    fn cdp1_monotonic_seconds_is_non_negative_and_non_decreasing() {
+        let a = monotonic_seconds();
+        let b = monotonic_seconds();
+        assert!(a.is_finite() && a >= 0.0);
+        assert!(b >= a);
+    }
+
     // CdpState は AppState（Profile::open）が必要で非 unix では構築手段が無いため unix 限定
     // （protocol.rs の `mod dispatch` と同じ理由）。
     #[cfg(unix)]
@@ -709,13 +949,120 @@ mod tests {
             let url = format!("http://127.0.0.1:{port}/");
             let req = json!({"id": 1, "method": "Page.navigate", "params": {"url": url}});
             let f = frames(allowed_dispatcher().dispatch(&st, &req.to_string()).await);
+            // 応答 → frameNavigated → loadEventFired の順（TASK-42.3）。
+            assert_eq!(f.len(), 3);
             assert_eq!(
-                f,
-                vec![json!({"id": 1, "result": {"frameId": "main", "loaderId": "1"}})]
+                f[0],
+                json!({"id": 1, "result": {"frameId": "main", "loaderId": "1"}})
             );
+            assert_eq!(f[1]["method"], json!("Page.frameNavigated"));
+            assert_eq!(f[2]["method"], json!("Page.loadEventFired"));
             let latest = st.app_state().navigation().latest().unwrap();
             assert_eq!(latest.url(), url);
             assert_eq!(latest.html(), "<p>via cdp</p>");
+        }
+
+        /// 成功遷移は `frameNavigated` → `loadEventFired` を具体値で送出する
+        /// （TASK-42.3・`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_page_navigate_emits_frame_navigated_then_load_event_fired() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let port = serve("200 OK", "<p>ev</p>");
+            let url = format!("http://127.0.0.1:{port}/");
+            let req = json!({"id": 1, "method": "Page.navigate", "params": {"url": url}});
+            let f = frames(allowed_dispatcher().dispatch(&st, &req.to_string()).await);
+            assert_eq!(f.len(), 3);
+            assert_eq!(f[0]["result"]["loaderId"], json!("1"));
+            assert_eq!(
+                f[1],
+                json!({"method": "Page.frameNavigated", "params": {
+                    "frame": {"id": "main", "loaderId": "1", "url": url, "mimeType": "text/html"},
+                    "type": "Navigation"}})
+            );
+            assert_eq!(f[2]["method"], json!("Page.loadEventFired"));
+            let ts = f[2]["params"]["timestamp"].as_f64().unwrap();
+            assert!(ts.is_finite() && ts >= 0.0);
+            assert_eq!(f[2]["params"].as_object().unwrap().len(), 1);
+            assert!(f[1].get("sessionId").is_none());
+        }
+
+        /// 登録済み `sessionId` 付きの遷移では、全フレームへ同じ `sessionId` が付く。
+        #[tokio::test]
+        async fn cdp1_page_navigate_events_carry_session_id() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let tid = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let sid = st.registry().attach(&tid).unwrap();
+            let port = serve("200 OK", "ok");
+            let url = format!("http://127.0.0.1:{port}/");
+            let req = json!({"id": 1, "method": "Page.navigate",
+                "sessionId": sid.as_str(), "params": {"url": url}});
+            let f = frames(allowed_dispatcher().dispatch(&st, &req.to_string()).await);
+            assert_eq!(f.len(), 3);
+            assert_eq!(f[1]["method"], json!("Page.frameNavigated"));
+            assert_eq!(f[2]["method"], json!("Page.loadEventFired"));
+            for fr in &f {
+                assert_eq!(fr["sessionId"], json!(sid.as_str()));
+            }
+        }
+
+        /// `about:blank` も確定遷移としてイベントを送出し、`loaderId` は応答と一致する。
+        #[tokio::test]
+        async fn cdp1_page_navigate_about_blank_emits_events() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let req = json!({"id": 1, "method": "Page.navigate", "params": {"url": "about:blank"}});
+            let f = frames(allowed_dispatcher().dispatch(&st, &req.to_string()).await);
+            assert_eq!(f.len(), 3);
+            assert_eq!(f[1]["method"], json!("Page.frameNavigated"));
+            assert_eq!(f[1]["params"]["frame"]["url"], json!("about:blank"));
+            assert_eq!(
+                f[1]["params"]["frame"]["loaderId"],
+                f[0]["result"]["loaderId"]
+            );
+            assert_eq!(f[2]["method"], json!("Page.loadEventFired"));
+        }
+
+        /// 4xx 応答も完了した遷移として commit されるためイベントを送出する。
+        #[tokio::test]
+        async fn cdp1_page_navigate_http_error_status_still_emits_events() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let port = serve("404 Not Found", "nope");
+            let url = format!("http://127.0.0.1:{port}/");
+            let req = json!({"id": 1, "method": "Page.navigate", "params": {"url": url}});
+            let f = frames(allowed_dispatcher().dispatch(&st, &req.to_string()).await);
+            assert_eq!(f.len(), 3);
+            assert_eq!(f[1]["method"], json!("Page.frameNavigated"));
+            assert_eq!(f[2]["method"], json!("Page.loadEventFired"));
+        }
+
+        /// 取得失敗・不正 URL・許可外 scheme・未登録 session・`url` 欠落ではイベントを送出しない。
+        #[tokio::test]
+        async fn cdp1_page_navigate_failures_emit_no_events() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let d = allowed_dispatcher();
+            let cases = [
+                json!({"url": dead_url()}),
+                json!({"url": "not a url"}),
+                json!({"url": "file:///etc/passwd"}),
+                json!({}),
+            ];
+            for (i, params) in cases.iter().enumerate() {
+                let req = json!({"id": i, "method": "Page.navigate", "params": params});
+                let f = frames(d.dispatch(&st, &req.to_string()).await);
+                assert_eq!(f.len(), 1, "params={params}");
+            }
+            let req = json!({"id": 9, "method": "Page.navigate",
+                "sessionId": "NOSUCH", "params": {"url": "about:blank"}});
+            let f = frames(d.dispatch(&st, &req.to_string()).await);
+            assert_eq!(f.len(), 1);
         }
 
         #[tokio::test]
@@ -1186,9 +1533,14 @@ mod tests {
                 Box::new(SharedHandler(Arc::clone(&h))),
             )])
             .unwrap();
-            let flight = BrowserFlight::enter(&h.published);
-            for (id, sid) in [(1, &sa), (2, &sb)] {
-                let u = format!("http://127.0.0.1:{}/", serve("200 OK", "x"));
+            let flight = BrowserFlight::enter(
+                &h.published,
+                st.app_state().navigation(),
+                st.registry(),
+                &h.gate,
+            );
+            for (id, sid, body) in [(1, &sa, "x"), (2, &sb, "y")] {
+                let u = format!("http://127.0.0.1:{}/", serve("200 OK", body));
                 let req = json!({"id": id, "method": "Page.navigate",
                     "sessionId": sid.as_str(), "params": {"url": u}});
                 d.dispatch(&st, &req.to_string()).await;
@@ -1196,8 +1548,137 @@ mod tests {
             drop(flight);
             let p = h.published.lock().unwrap();
             assert_eq!(p.seq, 2);
-            assert!(p.mirrored.is_none());
-            assert!(st.app_state().navigation().latest().is_none());
+            // 解放時に、見送った中で確定順が最新（seq 2）のターゲット結果だけが反映される。
+            assert_eq!(p.mirrored.as_ref().map(|(t, _)| t), Some(&tb));
+            assert!(p.pending.is_none());
+            assert_eq!(st.app_state().navigation().latest().unwrap().html(), "y");
+        }
+
+        /// 保留中の確定は、解放時にターゲットが閉じられていれば、または同一ターゲットの後続遷移で
+        /// 無効化されていれば共有状態へ反映しない（TASK-42.3・`CDP-1`。レビュー指摘
+        /// 「保留した結果の反映前にターゲットの状態を再確認する」）。
+        #[tokio::test]
+        async fn cdp1_page_navigate_pending_mirror_skipped_when_target_closed_or_superseded() {
+            use crate::target::TargetKind;
+            for close in [true, false] {
+                let dir = TempDir::new();
+                let st = state(&dir);
+                let ta = st
+                    .registry()
+                    .create_target(TargetKind::Page, "about:blank")
+                    .unwrap();
+                let sa = st.registry().attach(&ta).unwrap();
+                let h = Arc::new(
+                    PageNavigate::new(FetchOptions::new().with_allow_private_network_access(true))
+                        .unwrap(),
+                );
+                let d = Dispatcher::from_handlers(vec![(
+                    "Page.navigate",
+                    Box::new(SharedHandler(Arc::clone(&h))),
+                )])
+                .unwrap();
+                let flight = BrowserFlight::enter(
+                    &h.published,
+                    st.app_state().navigation(),
+                    st.registry(),
+                    &h.gate,
+                );
+                let u = format!("http://127.0.0.1:{}/", serve("200 OK", "x"));
+                let req = json!({"id": 1, "method": "Page.navigate",
+                    "sessionId": sa.as_str(), "params": {"url": u}});
+                d.dispatch(&st, &req.to_string()).await;
+                assert!(h.published.lock().unwrap().pending.is_some());
+                if close {
+                    st.registry().close_target(&ta).unwrap();
+                } else {
+                    let nav = st.navigations().get_or_create(st.registry(), &ta);
+                    nav.begin_navigation().unwrap();
+                }
+                drop(flight);
+                assert!(st.app_state().navigation().latest().is_none());
+                assert!(h.published.lock().unwrap().mirrored.is_none());
+            }
+        }
+
+        /// ターゲットレベルのコミットで `seq` だけが進んでいても、共有状態の世代が一致する
+        /// ブラウザレベル遷移はイベントを送出する（待機中のクライアントを止めない。
+        /// TASK-42.3・`CDP-1`）。
+        #[tokio::test]
+        async fn cdp1_page_navigate_browser_level_emits_events_despite_advanced_seq() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let h = Arc::new(
+                PageNavigate::new(FetchOptions::new().with_allow_private_network_access(true))
+                    .unwrap(),
+            );
+            h.published.lock().unwrap().seq = u64::MAX;
+            let d = Dispatcher::from_handlers(vec![(
+                "Page.navigate",
+                Box::new(SharedHandler(Arc::clone(&h))),
+            )])
+            .unwrap();
+            let u = format!("http://127.0.0.1:{}/", serve("200 OK", "x"));
+            let req = json!({"id": 1, "method": "Page.navigate", "params": {"url": u}});
+            let f = frames(d.dispatch(&st, &req.to_string()).await);
+            assert_eq!(f.len(), 3);
+            assert_eq!(f[0]["id"], json!(1));
+            assert_eq!(f[0]["result"]["frameId"], json!("main"));
+            assert_eq!(f[1]["method"], json!("Page.frameNavigated"));
+            assert_eq!(f[2]["method"], json!("Page.loadEventFired"));
+        }
+
+        /// ブラウザレベル遷移の確定後〜イベント送出前にターゲット遷移が確定しても、共有状態への
+        /// ミラーは進行中記録で見送られ、ブラウザレベル遷移のイベントは落ちない
+        /// （TASK-42.3・`CDP-1`。レビュー指摘「Target mirror drops browser events」）。
+        #[tokio::test]
+        async fn cdp1_page_navigate_browser_events_survive_target_mirror_before_emit() {
+            use crate::target::TargetKind;
+            use std::sync::atomic::Ordering;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let tid = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let sid = st.registry().attach(&tid).unwrap();
+            let h = Arc::new(
+                PageNavigate::new(FetchOptions::new().with_allow_private_network_access(true))
+                    .unwrap(),
+            );
+            let d = Dispatcher::from_handlers(vec![(
+                "Page.navigate",
+                Box::new(SharedHandler(Arc::clone(&h))),
+            )])
+            .unwrap();
+            h.pre_emit_pause.armed.store(true, Ordering::SeqCst);
+            let ub = format!("http://127.0.0.1:{}/", serve("200 OK", "browser"));
+            let ut = format!("http://127.0.0.1:{}/", serve("200 OK", "target"));
+            let browser_req = json!({"id": 1, "method": "Page.navigate", "params": {"url": ub}});
+            let target_req = json!({"id": 2, "method": "Page.navigate",
+                "sessionId": sid.as_str(), "params": {"url": ut}});
+            let browser_msg = browser_req.to_string();
+            let browser = d.dispatch(&st, &browser_msg);
+            let driver = async {
+                while !h.pre_emit_pause.paused.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                // ブラウザ遷移は確定済みで送出待ち。この間にターゲット遷移を完了させる。
+                let tf = frames(d.dispatch(&st, &target_req.to_string()).await);
+                h.pre_emit_pause.armed.store(false, Ordering::SeqCst);
+                tf
+            };
+            let (bo, tf) = tokio::join!(browser, driver);
+            let bf = frames(bo);
+            assert_eq!(bf.len(), 3);
+            assert_eq!(bf[1]["method"], json!("Page.frameNavigated"));
+            assert_eq!(bf[2]["method"], json!("Page.loadEventFired"));
+            assert_eq!(tf.len(), 3);
+            assert_eq!(h.published.lock().unwrap().browser_in_flight, 0);
+            // ガード解放後、共有状態は確定順が最新の割り込んだターゲット遷移の結果になる
+            // （レビュー指摘「イベント送出待ちの間に確定したターゲット遷移が反映されない」）。
+            let latest = st.app_state().navigation().latest().unwrap();
+            assert_eq!(latest.html(), "target");
+            assert_eq!(latest.url(), ut);
         }
 
         #[tokio::test]
