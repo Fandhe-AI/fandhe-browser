@@ -93,7 +93,7 @@ JS エンジン上で動かす最小の環境と、サブテスト結果を Rust
 
 | 理由コード | 対象 | 確度（`basis`） | 件数 |
 | ---------- | ---- | --------------- | ---- |
-| `requires-rendering-engine-comparison` | reftest（描画比較に第 2 レンダリングエンジンが要る） | `confirmed` | 88 |
+| `reftest-comparison-not-implemented` | reftest（本ハーネスが描画比較を未実装。同一ブラウザーでの比較自体は原理上可能） | `confirmed` | 88 |
 | `unverified-likely-unrunnable` | other（内容未検証・実行できない可能性が高い） | `speculative` | 17 |
 
 - 出力は `schemaVersion`・`total`・`byReason[]`（`reason`・`basis`・`harness`・`description`・`count`・`files`）。0 件の理由も必ず出す

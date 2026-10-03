@@ -7,8 +7,9 @@
 //!
 //! # 確度の区別
 //!
-//! - reftest: `match`/`mismatch` の描画比較に第 2 レンダリングエンジンが要るため
-//!   実行できない（PoC-16 で確認済み。[`Basis::Confirmed`]）
+//! - reftest: `match`/`mismatch` は同一ブラウザーで描画して比較すれば原理上は実行できる。
+//!   実行できないのは本ハーネスが描画比較（ピクセル比較等）を実装していないという実装上の制約のため
+//!   （ハーネスの機能範囲から確認できる事実。[`Basis::Confirmed`]。第 2 エンジンが要るとは主張しない）
 //! - other: ファイル内容を確かめておらず、実行できない可能性が高いという推測
 //!   （[`Basis::Speculative`]）。推測を確認済みに見せかけない（REPAIR-3）
 //!
@@ -52,8 +53,8 @@ impl Basis {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnrunnableReason {
-    /// reftest: 描画比較に第 2 レンダリングエンジンが要る（確認済み）。
-    RequiresRenderingEngineComparison,
+    /// reftest: 本ハーネスが描画比較を実装していない（実装上の制約。確認済み）。
+    ReftestComparisonNotImplemented,
     /// other: 内容未検証で、実行できない可能性が高い（推測）。
     UnverifiedLikelyUnrunnable,
 }
@@ -61,13 +62,13 @@ pub enum UnrunnableReason {
 impl UnrunnableReason {
     /// 出力順（宣言順）で固定した全理由。
     const ALL: [UnrunnableReason; 2] = [
-        UnrunnableReason::RequiresRenderingEngineComparison,
+        UnrunnableReason::ReftestComparisonNotImplemented,
         UnrunnableReason::UnverifiedLikelyUnrunnable,
     ];
 
     fn index(&self) -> usize {
         match self {
-            UnrunnableReason::RequiresRenderingEngineComparison => 0,
+            UnrunnableReason::ReftestComparisonNotImplemented => 0,
             UnrunnableReason::UnverifiedLikelyUnrunnable => 1,
         }
     }
@@ -75,8 +76,8 @@ impl UnrunnableReason {
     /// 出力に使う固定の機械可読コード。
     pub fn code(&self) -> &'static str {
         match self {
-            UnrunnableReason::RequiresRenderingEngineComparison => {
-                "requires-rendering-engine-comparison"
+            UnrunnableReason::ReftestComparisonNotImplemented => {
+                "reftest-comparison-not-implemented"
             }
             UnrunnableReason::UnverifiedLikelyUnrunnable => "unverified-likely-unrunnable",
         }
@@ -85,7 +86,7 @@ impl UnrunnableReason {
     /// 理由の確度。
     pub fn basis(&self) -> Basis {
         match self {
-            UnrunnableReason::RequiresRenderingEngineComparison => Basis::Confirmed,
+            UnrunnableReason::ReftestComparisonNotImplemented => Basis::Confirmed,
             UnrunnableReason::UnverifiedLikelyUnrunnable => Basis::Speculative,
         }
     }
@@ -93,7 +94,7 @@ impl UnrunnableReason {
     /// 対応する `wpt-subset.json` の harness ラベル。
     pub fn harness_label(&self) -> &'static str {
         match self {
-            UnrunnableReason::RequiresRenderingEngineComparison => "reftest",
+            UnrunnableReason::ReftestComparisonNotImplemented => "reftest",
             UnrunnableReason::UnverifiedLikelyUnrunnable => "other",
         }
     }
@@ -101,8 +102,8 @@ impl UnrunnableReason {
     /// 英語の説明文。
     pub fn description(&self) -> &'static str {
         match self {
-            UnrunnableReason::RequiresRenderingEngineComparison => {
-                "reftest compares rendering against a reference; requires a second rendering engine"
+            UnrunnableReason::ReftestComparisonNotImplemented => {
+                "reftest needs a rendering comparison against a reference page; this harness does not implement it"
             }
             UnrunnableReason::UnverifiedLikelyUnrunnable => {
                 "content not verified; likely unrunnable (speculative)"
@@ -152,7 +153,7 @@ impl std::error::Error for ReportError {}
 pub fn classify_unrunnable(harness_label: &str) -> Result<Option<UnrunnableReason>, ReportError> {
     match harness_label {
         "testharness" => Ok(None),
-        "reftest" => Ok(Some(UnrunnableReason::RequiresRenderingEngineComparison)),
+        "reftest" => Ok(Some(UnrunnableReason::ReftestComparisonNotImplemented)),
         "other" => Ok(Some(UnrunnableReason::UnverifiedLikelyUnrunnable)),
         other => Err(ReportError::UnknownHarness {
             label: other.to_string(),
@@ -287,7 +288,7 @@ fn write_json_string(out: &mut String, s: &str) {
 mod tests {
     use super::*;
 
-    const R: UnrunnableReason = UnrunnableReason::RequiresRenderingEngineComparison;
+    const R: UnrunnableReason = UnrunnableReason::ReftestComparisonNotImplemented;
     const O: UnrunnableReason = UnrunnableReason::UnverifiedLikelyUnrunnable;
 
     #[test]
@@ -307,7 +308,7 @@ mod tests {
 
     #[test]
     fn plug_10_reason_codes_are_stable() {
-        assert_eq!(R.code(), "requires-rendering-engine-comparison");
+        assert_eq!(R.code(), "reftest-comparison-not-implemented");
         assert_eq!(O.code(), "unverified-likely-unrunnable");
         assert_eq!(R.basis().code(), "confirmed");
         assert_eq!(O.basis().code(), "speculative");
@@ -333,9 +334,9 @@ mod tests {
         let r = UnrunnableReport::from_entries([("reftest", "a.html")]).unwrap();
         let expected = concat!(
             "{\"schemaVersion\":1,\"total\":1,\"byReason\":[",
-            "{\"reason\":\"requires-rendering-engine-comparison\",\"basis\":\"confirmed\",",
-            "\"harness\":\"reftest\",\"description\":\"reftest compares rendering against a ",
-            "reference; requires a second rendering engine\",\"count\":1,\"files\":[\"a.html\"]},",
+            "{\"reason\":\"reftest-comparison-not-implemented\",\"basis\":\"confirmed\",",
+            "\"harness\":\"reftest\",\"description\":\"reftest needs a rendering comparison against a ",
+            "reference page; this harness does not implement it\",\"count\":1,\"files\":[\"a.html\"]},",
             "{\"reason\":\"unverified-likely-unrunnable\",\"basis\":\"speculative\",",
             "\"harness\":\"other\",\"description\":\"content not verified; likely unrunnable ",
             "(speculative)\",\"count\":0,\"files\":[]}]}"
