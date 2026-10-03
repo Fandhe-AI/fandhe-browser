@@ -169,6 +169,39 @@ async fn cdp1_devtools_browser_ws_handshake_and_roundtrip() {
 }
 
 #[tokio::test]
+async fn cdp6_unimplemented_method_over_ws_is_error_and_logged() {
+    let dir = TempDir::new();
+    let (addr, st) = start_with_state(&dir).await;
+    tokio::task::spawn_blocking(move || {
+        let mut s = connect(addr);
+        let head = upgrade(
+            &mut s,
+            "/devtools/browser/fixed-1",
+            &format!("127.0.0.1:{}", addr.port()),
+            "",
+        );
+        assert_eq!(status_of(&head), 101, "head: {head}");
+        send_text(&mut s, r#"{"id":1,"method":"Browser.getVersion"}"#);
+        assert_eq!(
+            read_text_json(&mut s),
+            json!({"id": 1, "error": {"code": -32601, "message": "method not implemented"}})
+        );
+        send_text(&mut s, r#"{"id":2,"method":"Browser.getVersion"}"#);
+        read_text_json(&mut s);
+    })
+    .await
+    .unwrap();
+    let snap = st.received_methods();
+    let c = snap
+        .methods
+        .iter()
+        .find(|(k, _)| k == "Browser.getVersion")
+        .map(|(_, c)| *c)
+        .expect("logged");
+    assert_eq!((c.handled, c.unimplemented), (0, 2));
+}
+
+#[tokio::test]
 async fn cdp1_json_version_ws_url_is_connectable() {
     let dir = TempDir::new();
     let addr = start(&dir).await;
