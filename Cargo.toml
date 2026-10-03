@@ -15,10 +15,14 @@ resolver = "3"
 # 固定メンバー列挙にすると、並列実装される後続タスク（各 crate 追加。
 # `fandhe-browser-ai`（TASK-1・旧 TASK-1.5・Issue #26）を含む）がすべて本ファイルの
 # 同じ行を編集する必要が生じ、並列 PR 間でコンフリクトを誘発するため、
-# グロブ表記を採用する。以降の crate 追加 PR は本ファイルの変更を伴わない。
+# グロブ表記を採用する。以降の `crates/` 配下の crate 追加 PR は本ファイルの変更を
+# 伴わない。
+# 例外: `harness/` 配下のツール crate（`harness/wpt_subset_runner`。PLUG-10・
+# TASK-101.2.1・#553）は他の harness ディレクトリが Cargo.toml を持たず
+# `harness/*` グロブが使えないため、明示パスで列挙する。
 # `make check-workspace-manifest`（`make ci` に含む）が `cargo verify-project`
 # で常時この manifest の妥当性を検証する。
-members = ["crates/*"]
+members = ["crates/*", "harness/wpt_subset_runner"]
 
 [workspace.package]
 # 各 crate 側は `version.workspace = true` 等（`edition`/`license` も同様）で
