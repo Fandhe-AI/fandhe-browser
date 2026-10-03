@@ -18,7 +18,8 @@
 //!
 //! `subset.tsv` の `file` とテスト HTML 中の `src` は untrusted として扱う。文字種・`..`・
 //! URL 形式を検証して字句的に正規化したうえで `Path::join` し、さらに canonicalize 後に
-//! WPT ルート配下であることを確認する（symlink 経由の脱出を断つ）。ネットワーク取得は
+//! WPT ルート配下であることを確認する（symlink 経由の脱出を断つ。open 後の差し替えへの
+//! 対策と残存リスクは [`open_under_root`] 参照）。ネットワーク取得は
 //! 一切行わず、URL 形式の `src` は [`FileOutcome::ScriptRejected`] にする。
 //!
 //! # 制限（簡易実装。実装済みを装わない。REPAIR-3）
@@ -28,6 +29,8 @@
 //! - `type="module"` のスクリプトは評価できないため、含むファイルは実行せず
 //!   [`FileOutcome::UnsupportedScript`] にする（classic だけの結果で Pass を装わない）。
 //!   JSON などのデータブロックは実行対象ではないため読み飛ばす
+//! - `src` 付きの `defer` / `async` classic script も、実行順（defer は文書末・async は
+//!   到着順）を再現できないため同様に [`FileOutcome::UnsupportedScript`] にする
 //! - スクリプトが 1 つでも評価に失敗したらそのファイルは [`FileOutcome::ScriptFailed`]
 //!   として打ち切る（WPT 本来の「失敗しても続行」とは異なる）
 
@@ -388,9 +391,10 @@ pub enum FileOutcome {
         /// 失敗の説明。
         error: String,
     },
-    /// `type="module"` のスクリプトを含む（評価できないため実行しない）。
+    /// `type="module"`、または `src` 付きの `defer` / `async` スクリプトを含む
+    /// （評価順を再現できないため実行しない）。
     UnsupportedScript {
-        /// `type` 属性の値。
+        /// `type="module"` なら `type` 属性の値、`defer` / `async` ならその属性名。
         script_type: String,
     },
     /// 参照された外部スクリプトが無い（黙って飛ばさない）。
@@ -464,9 +468,10 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
         Ok(h) => h,
         Err(outcome) => return outcome,
     };
-    let scripts = match collect_scripts(&html) {
+    let scripts = match collect_scripts(&html, &entry.file, &options.limits) {
         Ok(s) => s,
-        Err(error) => return FileOutcome::HtmlParseFailed { error },
+        Err(CollectError::Parse(error)) => return FileOutcome::HtmlParseFailed { error },
+        Err(CollectError::Limit(kind)) => return FileOutcome::LimitExceeded { kind },
     };
     // 未対応スクリプトは JS を実行する前に確定させる（部分実行の結果で Pass にしない）。
     if let Some(ScriptSource::Unsupported(script_type)) = scripts
@@ -498,8 +503,6 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
                 if rel == TESTHARNESS_PATH {
                     harness_referenced = true;
                     plan.push(Step::Harness(src.clone(), rel));
-                } else if rel == TESTHARNESSREPORT_PATH {
-                    // attach_result_reporter が代替するため読み込まない。
                 } else {
                     plan.push(Step::Support(src.clone(), rel));
                 }
@@ -658,10 +661,12 @@ enum Step {
     Eval(String),
 }
 
+#[derive(Debug)]
 enum ScriptSource {
     Inline(String),
     External(String),
-    /// 評価できない種別（`type="module"`。値は `type` 属性）。
+    /// 評価できない種別（`type="module"` ならその `type` 値、`src` 付きの `defer` /
+    /// `async` ならその属性名）。
     Unsupported(String),
 }
 
@@ -713,17 +718,42 @@ fn is_classic_script_type(ty: Option<&str>) -> bool {
     }
 }
 
+/// [`collect_scripts`] の失敗。
+#[derive(Debug)]
+enum CollectError {
+    /// HTML のパースに失敗した。
+    Parse(String),
+    /// 収集中に総量上限（件数・インライン本文の合計バイト数）を超えた。
+    Limit(LimitKind),
+}
+
 /// HTML をパースして JS の `<script>` を文書順に集める（`src` があれば外部扱い）。
+///
+/// 集めながら件数（`limits.max_steps`）とインライン本文の合計バイト数
+/// （`limits.max_total_bytes`）を逐次判定し、超えた時点で打ち切って `Limit` を返す。
+/// 上限を超えるスクリプトを `Vec` に積まない（`PLUG-10`・Issue #554 のレビュー指摘）。
+/// `testharnessreport.js` は `attach_result_reporter` が代替し手順にならないため、
+/// 件数にも `Vec` にも含めない。評価できない種別（`type="module"`、`src` 付きの
+/// `defer` / `async`）を見つけたら、その場で `Unsupported` 1 件だけを返す。
+///
+/// `defer` / `async` は `src` を持つ classic script にだけ効く（インラインでは無視される）
+/// ため、`src` 付きに限って未対応にする。実行順（defer は文書末・async は到着順）は
+/// 再現できないので、文書順に実行して Pass を装わない（REPAIR-3）。
 ///
 /// `<template>` の template contents は core の `descendants` が辿らない（別フラグメント）
 /// ため、template 内の `<script>` は計画に含まれない（`tests/runner_subset.rs` で検証）。
-fn collect_scripts(html: &str) -> Result<Vec<ScriptSource>, String> {
+fn collect_scripts(
+    html: &str,
+    test_file: &str,
+    limits: &RunLimits,
+) -> Result<Vec<ScriptSource>, CollectError> {
     let options = ParseOptions::default()
         .with_scripting_enabled(true)
         .with_max_input_bytes(MAX_SOURCE_BYTES as usize);
-    let parsed = parse_document(html, &options).map_err(|e| e.to_string())?;
+    let parsed = parse_document(html, &options).map_err(|e| CollectError::Parse(e.to_string()))?;
     let doc = &parsed.document;
     let mut out = Vec::new();
+    let mut inline_bytes: u64 = 0;
     for id in doc.descendants(doc.root()) {
         if doc.local_name(id) != Some("script") {
             continue;
@@ -731,17 +761,38 @@ fn collect_scripts(html: &str) -> Result<Vec<ScriptSource>, String> {
         let ty = doc.attribute(id, "type");
         if !is_classic_script_type(ty) {
             if ty.is_some_and(|t| t.trim().eq_ignore_ascii_case("module")) {
-                out.push(ScriptSource::Unsupported(
+                return Ok(vec![ScriptSource::Unsupported(
                     ty.unwrap_or_default().to_string(),
-                ));
+                )]);
             }
             continue;
         }
         match doc.attribute(id, "src") {
-            Some(src) => out.push(ScriptSource::External(src.to_string())),
-            None => out.push(ScriptSource::Inline(
-                doc.text_content(id).unwrap_or_default(),
-            )),
+            Some(src) => {
+                for attr in ["defer", "async"] {
+                    if doc.attribute(id, attr).is_some() {
+                        return Ok(vec![ScriptSource::Unsupported(attr.to_string())]);
+                    }
+                }
+                if resolve_src(test_file, src).is_ok_and(|rel| rel == TESTHARNESSREPORT_PATH) {
+                    continue;
+                }
+                if out.len() >= limits.max_steps {
+                    return Err(CollectError::Limit(LimitKind::Steps));
+                }
+                out.push(ScriptSource::External(src.to_string()));
+            }
+            None => {
+                if out.len() >= limits.max_steps {
+                    return Err(CollectError::Limit(LimitKind::Steps));
+                }
+                let code = doc.text_content(id).unwrap_or_default();
+                inline_bytes = inline_bytes.saturating_add(code.len() as u64);
+                if inline_bytes > limits.max_total_bytes {
+                    return Err(CollectError::Limit(LimitKind::TotalBytes));
+                }
+                out.push(ScriptSource::Inline(code));
+            }
         }
     }
     Ok(out)
@@ -750,7 +801,7 @@ fn collect_scripts(html: &str) -> Result<Vec<ScriptSource>, String> {
 /// `<script src>` の値を、テストファイル `test_file`（ルート相対）基準でルート相対パスへ
 /// 字句的に解決する。URL 形式・不正文字・ルート外への脱出は `Err`（理由は英語）。
 ///
-/// 純関数。symlink による脱出は呼び出し後の [`read_under_root`] が canonicalize で断つ。
+/// 純関数。symlink による脱出は呼び出し後の [`open_under_root`] が断つ。
 pub fn resolve_src(test_file: &str, src: &str) -> Result<String, String> {
     if src.is_empty() {
         return Err("empty src".to_string());
@@ -790,11 +841,52 @@ pub fn resolve_src(test_file: &str, src: &str) -> Result<String, String> {
     Ok(rel)
 }
 
-/// ルート配下の通常ファイルへ解決し、canonicalize 後のパスとサイズを返す（上限超過は TooLarge）。
-fn resolve_under_root(root: &Path, rel: &str) -> Result<(PathBuf, u64), FileOutcome> {
+/// Windows の `FILE_ATTRIBUTE_REPARSE_POINT`（symlink・junction 等の再解析ポイント）。
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+/// ルート配下の通常ファイルを開き、ハンドルとサイズを返す（上限超過は TooLarge）。
+///
+/// # TOCTOU 対策（`PLUG-10`・Issue #554 のレビュー指摘）
+///
+/// 脅威モデル: 取得ディレクトリは本ツール（`fetch-wpt.sh`）が毎回新しく作り、書き込めるのは
+/// ローカル利用者だけである。そのうえで、canonicalize から open までの間に symlink を
+/// 差し替えられてもルート外のファイルを読まないよう、検証の順序を「open → ハンドル基準の
+/// 種別・サイズ判定 → canonicalize → ルート配下確認 → ハンドルと canonical パスの同一性照合」
+/// にする。サイズ判定・読み取り上限も開いたハンドル基準で行う（パスを開き直さない）。
+///
+/// - Unix: ハンドルの `(dev, ino)` と canonical パスの `(dev, ino)` が一致しなければ拒否する
+/// - Windows: ハンドルが再解析ポイントなら拒否する。`(dev, ino)` 相当を std だけでは取れない
+///   ため、open 後に途中のディレクトリが差し替えられる残存リスクが Windows に残る
+///   （canonicalize 後のルート配下確認で緩和するのみ）
+/// - その他の OS: 同一性を確認できないため fail-closed（`ReadFailed`）
+fn open_under_root(root: &Path, rel: &str) -> Result<(fs::File, u64), FileOutcome> {
     let mut path = root.to_path_buf();
     for seg in rel.split('/') {
         path.push(seg);
+    }
+    let file = match fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(FileOutcome::Missing),
+        // Windows ではディレクトリを開くと PermissionDenied になる。通常ファイルでないものは
+        // Unix 側（`is_file` 判定）と揃えて存在しない扱いにする。
+        Err(_) if fs::metadata(&path).is_ok_and(|m| !m.is_file()) => {
+            return Err(FileOutcome::Missing);
+        }
+        Err(e) => {
+            return Err(FileOutcome::ReadFailed {
+                error: e.to_string(),
+            });
+        }
+    };
+    let meta = file.metadata().map_err(|e| FileOutcome::ReadFailed {
+        error: e.to_string(),
+    })?;
+    if !meta.is_file() {
+        return Err(FileOutcome::Missing);
+    }
+    if meta.len() > MAX_SCRIPT_BYTES {
+        return Err(FileOutcome::TooLarge);
     }
     let canon = match fs::canonicalize(&path) {
         Ok(c) => c,
@@ -809,34 +901,73 @@ fn resolve_under_root(root: &Path, rel: &str) -> Result<(PathBuf, u64), FileOutc
         // symlink 等でルート外へ出る経路は存在しないものとして扱う。
         return Err(FileOutcome::Missing);
     }
-    let meta = fs::metadata(&canon).map_err(|e| FileOutcome::ReadFailed {
-        error: e.to_string(),
-    })?;
-    if !meta.is_file() {
-        return Err(FileOutcome::Missing);
+    confirm_same_file(&meta, &canon)?;
+    Ok((file, meta.len()))
+}
+
+/// 開いたハンドルの metadata と canonical パスが同じファイルであることを確認する（Unix）。
+///
+/// `(dev, ino)` が一致しなければ、open と canonicalize の間にパスが差し替えられたとみなして
+/// 拒否する。
+#[cfg(unix)]
+fn confirm_same_file(handle: &fs::Metadata, canon: &Path) -> Result<(), FileOutcome> {
+    use std::os::unix::fs::MetadataExt;
+
+    let by_path = match fs::metadata(canon) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(FileOutcome::Missing),
+        Err(e) => {
+            return Err(FileOutcome::ReadFailed {
+                error: e.to_string(),
+            });
+        }
+    };
+    if handle.dev() == by_path.dev() && handle.ino() == by_path.ino() {
+        Ok(())
+    } else {
+        Err(FileOutcome::ReadFailed {
+            error: "file identity changed while opening".to_string(),
+        })
     }
-    if meta.len() > MAX_SCRIPT_BYTES {
-        return Err(FileOutcome::TooLarge);
+}
+
+/// 開いたハンドルが再解析ポイントでないことを確認する（Windows）。
+///
+/// 残存リスク: 途中のディレクトリの差し替えは検出できない（[`open_under_root`] 参照）。
+#[cfg(windows)]
+fn confirm_same_file(handle: &fs::Metadata, _canon: &Path) -> Result<(), FileOutcome> {
+    use std::os::windows::fs::MetadataExt;
+
+    if handle.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        Err(FileOutcome::ReadFailed {
+            error: "reparse point is not allowed".to_string(),
+        })
+    } else {
+        Ok(())
     }
-    Ok((canon, meta.len()))
+}
+
+/// 同一性を確認できない OS では fail-closed にする。
+#[cfg(not(any(unix, windows)))]
+fn confirm_same_file(_handle: &fs::Metadata, _canon: &Path) -> Result<(), FileOutcome> {
+    Err(FileOutcome::ReadFailed {
+        error: "file identity check is not supported on this platform".to_string(),
+    })
 }
 
 /// ルート配下のファイルのサイズだけを返す（読まない）。総量上限の事前検証用。
 fn file_size_under_root(root: &Path, rel: &str) -> Result<u64, FileOutcome> {
-    resolve_under_root(root, rel).map(|(_, len)| len)
+    open_under_root(root, rel).map(|(_, len)| len)
 }
 
 /// ルート相対パス `rel` のファイルを、ルート配下であることを確認して読む。
 ///
 /// 戻り値の `Err` は、そのまま [`FileOutcome`] として返せる分類
-/// （`Missing` / `TooLarge` / `ReadFailed`）。サイズは読む前に metadata で確認する。
+/// （`Missing` / `TooLarge` / `ReadFailed`）。検証は [`open_under_root`] が開いたハンドルで行う。
 fn read_under_root(root: &Path, rel: &str) -> Result<String, FileOutcome> {
-    let (canon, _) = resolve_under_root(root, rel)?;
-    // metadata 確認後にファイルが増えても上限を超えて確保しないよう、読み取り自体を
+    let (file, _) = open_under_root(root, rel)?;
+    // サイズ確認後にファイルが増えても上限を超えて確保しないよう、読み取り自体を
     // MAX_SCRIPT_BYTES + 1 バイトに制限し、超過は TooLarge に分類する。
-    let file = fs::File::open(&canon).map_err(|e| FileOutcome::ReadFailed {
-        error: e.to_string(),
-    })?;
     let mut bytes = Vec::new();
     file.take(MAX_SCRIPT_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -1065,5 +1196,171 @@ mod tests {
         assert!(!is_classic_script_type(Some(
             "application/json; text/javascript"
         )));
+    }
+
+    /// PLUG-10: 件数上限は収集中に逐次判定し、超えた時点で打ち切る（Vec に積まない）。
+    #[test]
+    fn collect_scripts_stops_at_step_limit() {
+        let html = "<script>1</script>".repeat(10);
+        let limits = RunLimits {
+            max_steps: 3,
+            ..RunLimits::default()
+        };
+        assert!(matches!(
+            collect_scripts(&html, "a/t.html", &limits),
+            Err(CollectError::Limit(LimitKind::Steps))
+        ));
+        // 上限ちょうどは通る。testharnessreport.js は件数に含めない。
+        let ok = "<script>1</script><script src=\"/resources/testharnessreport.js\"></script>\
+                  <script>2</script><script>3</script>";
+        let got = collect_scripts(ok, "a/t.html", &limits).expect("ok");
+        assert_eq!(got.len(), 3);
+    }
+
+    /// PLUG-10: インライン本文の合計バイト数も収集中に判定する。
+    #[test]
+    fn collect_scripts_stops_at_total_bytes_limit() {
+        let html = format!("<script>{0}</script><script>{0}</script>", "x".repeat(600));
+        let mut limits = RunLimits {
+            max_total_bytes: 1000,
+            ..RunLimits::default()
+        };
+        assert!(matches!(
+            collect_scripts(&html, "a/t.html", &limits),
+            Err(CollectError::Limit(LimitKind::TotalBytes))
+        ));
+        limits.max_total_bytes = 1200;
+        assert!(collect_scripts(&html, "a/t.html", &limits).is_ok());
+    }
+
+    /// PLUG-10: `src` 付きの defer / async は実行順を再現できないため Unsupported にする。
+    #[test]
+    fn collect_scripts_marks_defer_and_async_unsupported() {
+        for (attrs, expected) in [
+            ("defer", "defer"),
+            ("async", "async"),
+            ("async defer", "defer"),
+        ] {
+            let html = format!("<script src=\"a.js\" {attrs}></script>");
+            match collect_scripts(&html, "a/t.html", &RunLimits::default()) {
+                Ok(v) => match v.as_slice() {
+                    [ScriptSource::Unsupported(name)] => assert_eq!(name, expected),
+                    _ => panic!("{attrs}: unexpected scripts"),
+                },
+                Err(_) => panic!("{attrs}: collect failed"),
+            }
+        }
+        // インラインでは defer / async は無視されるため、通常の実行対象のまま。
+        let inline = "<script defer>1</script>";
+        match collect_scripts(inline, "a/t.html", &RunLimits::default()) {
+            Ok(v) => assert!(matches!(v.as_slice(), [ScriptSource::Inline(_)])),
+            Err(_) => panic!("inline collect failed"),
+        }
+    }
+
+    /// PLUG-10: defer 付きファイルは JS を評価せず UnsupportedScript で fail-closed になる。
+    #[test]
+    fn run_entry_reports_unsupported_for_deferred_script() {
+        let root = scratch_dir("defer");
+        write_file(&root, "resources/testharness.js", "// stub");
+        write_file(
+            &root,
+            "t.html",
+            "<script src=\"/resources/testharness.js\"></script>\
+             <script src=\"x.js\" defer></script>",
+        );
+        let entry = SubsetEntry::new("t.html", HarnessKind::Testharness).expect("entry");
+        assert_eq!(
+            run_entry(&RunOptions::new(&root, None), &entry),
+            FileOutcome::UnsupportedScript {
+                script_type: "defer".to_string()
+            }
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// PLUG-10: 開いたハンドルで種別・サイズを判定し、通常ファイルは (ハンドル, サイズ) で返る。
+    #[test]
+    fn open_under_root_returns_handle_and_size() {
+        let root = fs::canonicalize(scratch_dir("open")).expect("canon");
+        write_file(&root, "a/b.js", "12345");
+        let (mut f, len) = open_under_root(&root, "a/b.js").expect("open");
+        assert_eq!(len, 5);
+        let mut s = String::new();
+        f.read_to_string(&mut s).expect("read");
+        assert_eq!(s, "12345");
+        assert!(matches!(
+            open_under_root(&root, "a"),
+            Err(FileOutcome::Missing)
+        ));
+        assert!(matches!(
+            open_under_root(&root, "nope.js"),
+            Err(FileOutcome::Missing)
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// PLUG-10: ルート外を指す symlink は存在しないものとして拒否する（Unix）。
+    #[cfg(unix)]
+    #[test]
+    fn open_under_root_rejects_symlink_escaping_root() {
+        let base = fs::canonicalize(scratch_dir("symlink")).expect("canon");
+        let root = base.join("wpt");
+        write_file(&root, "keep.js", "ok");
+        write_file(&base, "outside.js", "secret");
+        std::os::unix::fs::symlink(base.join("outside.js"), root.join("leak.js")).expect("link");
+        assert!(matches!(
+            open_under_root(&root, "leak.js"),
+            Err(FileOutcome::Missing)
+        ));
+        assert!(matches!(
+            read_under_root(&root, "leak.js"),
+            Err(FileOutcome::Missing)
+        ));
+        // ルート内を指す symlink は同一性が一致するため許可される。
+        std::os::unix::fs::symlink(root.join("keep.js"), root.join("alias.js")).expect("link");
+        assert_eq!(
+            read_under_root(&root, "alias.js").ok().as_deref(),
+            Some("ok")
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// PLUG-10: 開いたハンドルと canonical パスが別ファイルなら拒否する（open 後の差し替え。Unix）。
+    #[cfg(unix)]
+    #[test]
+    fn confirm_same_file_rejects_replaced_path() {
+        let root = fs::canonicalize(scratch_dir("identity")).expect("canon");
+        write_file(&root, "a.js", "a");
+        write_file(&root, "b.js", "b");
+        let handle = fs::File::open(root.join("a.js")).expect("open");
+        let meta = handle.metadata().expect("meta");
+        assert!(confirm_same_file(&meta, &root.join("a.js")).is_ok());
+        match confirm_same_file(&meta, &root.join("b.js")) {
+            Err(FileOutcome::ReadFailed { error }) => {
+                assert_eq!(error, "file identity changed while opening");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "wpt-runner-unit-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn write_file(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(path, body).expect("write");
     }
 }

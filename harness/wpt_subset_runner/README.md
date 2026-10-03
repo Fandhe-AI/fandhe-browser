@@ -116,7 +116,7 @@ bash harness/wpt_subset_runner/fetch-wpt.sh   # jq・git・ネットワークが
 | `SupportScriptMissing` / `ScriptRejected` | 外部スクリプトが無い / 参照規則違反 |
 | `LimitExceeded` | 1 ファイルの総量上限超過（`RunLimits`。手順 64 件・合計 8 MiB・総時間 30 秒。件数と合計サイズは実行前に検証。根拠は `runner.rs` の定数コメント） |
 | `ScriptFailed` | テスト側スクリプトの評価失敗（そのファイルで打ち切る） |
-| `UnsupportedScript` | `type="module"` を含む（評価できないため実行しない。classic だけで Pass にしない） |
+| `UnsupportedScript` | `type="module"`、または `src` 付きの `defer` / `async` を含む（実行順を再現できないため実行しない。classic だけで Pass にしない。値は `module` の type 値か `defer` / `async`） |
 | `EngineUnavailable` | JS ランタイムを作れない・エンジン未指定（`None` は JS 無効。既定エンジンへは落とさない） |
 | `CollectFailed` | JS 側から不正な通知があった |
 | `Completed` | 実行完了。`verdict` は `Pass`（1 件以上で全 PASS かつ completion が `OK` で届いた）・`Fail`（PASS 以外がある・completion が `OK` 以外）・`Incomplete`（全 PASS だが completion が無く未完了テストを除外できない。Pass にしない）・`NoResults`（0 件は Pass にしない） |
