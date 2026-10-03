@@ -25,7 +25,9 @@
 //!
 //! - DOM・タイマーが無いため、DOM を要するテストや `async_test` 系は testharness.js 自身の
 //!   判定で失敗するか結果なし（[`Verdict::NoResults`]）になる。偽の DOM で通さない
-//! - `type="module"` などの非 JS スクリプトは評価せず読み飛ばす
+//! - `type="module"` のスクリプトは評価できないため、含むファイルは実行せず
+//!   [`FileOutcome::UnsupportedScript`] にする（classic だけの結果で Pass を装わない）。
+//!   JSON などのデータブロックは実行対象ではないため読み飛ばす
 //! - スクリプトが 1 つでも評価に失敗したらそのファイルは [`FileOutcome::ScriptFailed`]
 //!   として打ち切る（WPT 本来の「失敗しても続行」とは異なる）
 
@@ -37,7 +39,9 @@ use fandhe_browser_core::js_stub::JsRuntime;
 use fandhe_browser_core::{Config, EngineKind, ParseOptions, parse_document};
 
 use crate::environment::{EnvironmentError, attach_result_reporter, install_testharness_globals};
-use crate::results::{CollectedResults, HarnessCompletion, SubtestResult, SubtestStatus};
+use crate::results::{
+    CollectedResults, HarnessCompletion, HarnessStatus, SubtestResult, SubtestStatus,
+};
 
 /// `subset.tsv` の最大行数（`wpt-subset.json` のエントリ上限と同じ）。
 pub const MAX_SUBSET_ENTRIES: usize = 10_000;
@@ -242,7 +246,8 @@ impl RunOptions {
 /// ファイル単位の合否分類。
 ///
 /// `Pass` はサブテストが 1 件以上あり全て PASS の場合だけ。0 件は成功を装わず
-/// [`Verdict::NoResults`] とする。completion は参考情報で、判定の根拠にしない。
+/// [`Verdict::NoResults`] とする。completion が届いていて `OK` 以外（ERROR・TIMEOUT・
+/// PRECONDITION_FAILED）なら、サブテストが全件 PASS でも `Fail` にする。
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -254,9 +259,14 @@ pub enum Verdict {
     NoResults,
 }
 
-/// サブテスト結果から [`Verdict`] を決める。
-pub fn verdict_of(subtests: &[SubtestResult]) -> Verdict {
-    if subtests.is_empty() {
+/// サブテスト結果と完了通知から [`Verdict`] を決める。
+///
+/// completion は届かないこともある（`None` は「失敗」と見なさない）が、届いて `OK` 以外なら
+/// ハーネス自体が失敗しているため `Fail`（結果 0 件でも `NoResults` にせず `Fail`）。
+pub fn verdict_of(subtests: &[SubtestResult], completion: Option<&HarnessCompletion>) -> Verdict {
+    if completion.is_some_and(|c| c.status != HarnessStatus::Ok) {
+        Verdict::Fail
+    } else if subtests.is_empty() {
         Verdict::NoResults
     } else if subtests.iter().all(|s| s.status == SubtestStatus::Pass) {
         Verdict::Pass
@@ -294,6 +304,11 @@ pub enum FileOutcome {
     HarnessLoadFailed {
         /// 失敗の説明。
         error: String,
+    },
+    /// `type="module"` のスクリプトを含む（評価できないため実行しない）。
+    UnsupportedScript {
+        /// `type` 属性の値。
+        script_type: String,
     },
     /// 参照された外部スクリプトが無い（黙って飛ばさない）。
     SupportScriptMissing {
@@ -365,12 +380,22 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
         Ok(s) => s,
         Err(error) => return FileOutcome::HtmlParseFailed { error },
     };
+    // 未対応スクリプトは JS を実行する前に確定させる（部分実行の結果で Pass にしない）。
+    if let Some(ScriptSource::Unsupported(script_type)) = scripts
+        .iter()
+        .find(|s| matches!(s, ScriptSource::Unsupported(_)))
+    {
+        return FileOutcome::UnsupportedScript {
+            script_type: script_type.clone(),
+        };
+    }
 
     // 事前に参照を解決する。拒否・不在は評価前に確定させ、JS を一切実行しない。
     let mut plan: Vec<Step> = Vec::new();
     let mut harness_referenced = false;
     for script in &scripts {
         match script {
+            ScriptSource::Unsupported(_) => {}
             ScriptSource::Inline(code) => plan.push(Step::Eval(code.clone())),
             ScriptSource::External(src) => {
                 let rel = match resolve_src(&entry.file, src) {
@@ -455,7 +480,7 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
             completion,
             ..
         }) => {
-            let verdict = verdict_of(&subtests);
+            let verdict = verdict_of(&subtests, completion.as_ref());
             FileOutcome::Completed {
                 subtests,
                 completion,
@@ -481,6 +506,8 @@ enum Step {
 enum ScriptSource {
     Inline(String),
     External(String),
+    /// 評価できない種別（`type="module"`。値は `type` 属性）。
+    Unsupported(String),
 }
 
 fn reporter_error(e: &EnvironmentError) -> String {
@@ -492,7 +519,8 @@ fn new_runtime(engine: Option<EngineKind>) -> Result<JsRuntime, String> {
     let toml = match engine {
         Some(EngineKind::V8) => "[js]\nengine = \"v8\"\n",
         Some(EngineKind::Boa) => "[js]\nengine = \"boa\"\n",
-        _ => "",
+        // JS 無効。既定エンジンへ黙って落とさず、実行不能として返す。
+        None => return Err("JS engine is disabled (no engine selected)".to_string()),
     };
     let cfg = Config::from_toml_str(toml).map_err(|e| e.to_string())?;
     JsRuntime::from_config(cfg.js()).map_err(|e| e.to_string())
@@ -541,7 +569,13 @@ fn collect_scripts(html: &str) -> Result<Vec<ScriptSource>, String> {
         if doc.local_name(id) != Some("script") {
             continue;
         }
-        if !is_classic_script_type(doc.attribute(id, "type")) {
+        let ty = doc.attribute(id, "type");
+        if !is_classic_script_type(ty) {
+            if ty.is_some_and(|t| t.trim().eq_ignore_ascii_case("module")) {
+                out.push(ScriptSource::Unsupported(
+                    ty.unwrap_or_default().to_string(),
+                ));
+            }
             continue;
         }
         match doc.attribute(id, "src") {
@@ -787,13 +821,34 @@ mod tests {
     /// PLUG-10: verdict の判定表（0 件は Pass にしない）。
     #[test]
     fn verdict_table() {
-        assert_eq!(verdict_of(&[]), Verdict::NoResults);
-        assert_eq!(verdict_of(&[sub(SubtestStatus::Pass)]), Verdict::Pass);
+        assert_eq!(verdict_of(&[], None), Verdict::NoResults);
+        assert_eq!(verdict_of(&[sub(SubtestStatus::Pass)], None), Verdict::Pass);
         assert_eq!(
-            verdict_of(&[sub(SubtestStatus::Pass), sub(SubtestStatus::Fail)]),
+            verdict_of(&[sub(SubtestStatus::Pass), sub(SubtestStatus::Fail)], None),
             Verdict::Fail
         );
-        assert_eq!(verdict_of(&[sub(SubtestStatus::NotRun)]), Verdict::Fail);
+        assert_eq!(
+            verdict_of(&[sub(SubtestStatus::NotRun)], None),
+            Verdict::Fail
+        );
+        let done = |status| HarnessCompletion {
+            status,
+            message: None,
+            message_truncated: false,
+        };
+        let pass = [sub(SubtestStatus::Pass)];
+        assert_eq!(
+            verdict_of(&pass, Some(&done(HarnessStatus::Ok))),
+            Verdict::Pass
+        );
+        for st in [
+            HarnessStatus::Error,
+            HarnessStatus::Timeout,
+            HarnessStatus::PreconditionFailed,
+        ] {
+            assert_eq!(verdict_of(&pass, Some(&done(st))), Verdict::Fail);
+            assert_eq!(verdict_of(&[], Some(&done(st))), Verdict::Fail);
+        }
     }
 
     /// PLUG-10: reftest・other はファイルを読まずにスキップされる。

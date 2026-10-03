@@ -54,6 +54,16 @@ fn build_tree() -> PathBuf {
     );
     write(
         &root,
+        "dom/harness-error.html",
+        &format!(
+            "{HEAD}<script>\n\
+             test(function () {{ assert_true(true); }}, 'ok');\n\
+             done_with_error();\n\
+             </script>\n"
+        ),
+    );
+    write(
+        &root,
         "dom/nosubtests.html",
         &format!("{HEAD}<script>1 + 1;</script>\n"),
     );
@@ -130,6 +140,23 @@ fn run_cases(root: &Path, engine: Option<EngineKind>) {
         other => panic!("fail.html: {other:?}"),
     }
 
+    // completion が OK 以外なら、サブテストが全件 PASS でも Fail。
+    match th("dom/harness-error.html") {
+        FileOutcome::Completed {
+            subtests,
+            completion,
+            verdict,
+        } => {
+            assert!(subtests.iter().all(|s| s.status == SubtestStatus::Pass));
+            assert_eq!(
+                completion.map(|c| c.status),
+                Some(wpt_subset_runner::HarnessStatus::Error)
+            );
+            assert_eq!(verdict, Verdict::Fail);
+        }
+        other => panic!("harness-error.html: {other:?}"),
+    }
+
     match th("dom/nosubtests.html") {
         FileOutcome::Completed {
             subtests, verdict, ..
@@ -150,16 +177,13 @@ fn run_cases(root: &Path, engine: Option<EngineKind>) {
         other => panic!("support.html: {other:?}"),
     }
 
-    // type=module は読み飛ばされ、classic のサブテストだけが実行される。
-    match th("dom/module.html") {
-        FileOutcome::Completed {
-            subtests, verdict, ..
-        } => {
-            assert_eq!(verdict, Verdict::Pass);
-            assert_eq!(subtests.len(), 1);
+    // type=module を含むファイルは、classic だけで Pass を装わず実行不能にする。
+    assert_eq!(
+        th("dom/module.html"),
+        FileOutcome::UnsupportedScript {
+            script_type: "module".to_string()
         }
-        other => panic!("module.html: {other:?}"),
-    }
+    );
 
     assert_eq!(
         th("dom/missing-support.html"),
@@ -201,8 +225,9 @@ fn main() -> ExitCode {
     let root = build_tree();
     let bundled = bundled_engines();
 
-    if bundled.is_empty() {
-        eprintln!("case: no engine");
+    {
+        // engine=None は JS 無効。コンパイル済みエンジンがあっても既定へ落とさない。
+        eprintln!("case: engine none");
         match run_entry(
             &RunOptions::new(&root, None),
             &entry("dom/pass.html", HarnessKind::Testharness),
