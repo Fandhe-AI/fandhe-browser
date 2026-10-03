@@ -129,6 +129,7 @@ cat >"$STUB_DIR/getent" <<'STUB'
 [ -z "${STUB_RESOLVE_NONE:-}" ] || exit 0
 [ -z "${STUB_RESOLVE_PID:-}" ] || echo $$ >"$STUB_RESOLVE_PID"
 [ -z "${STUB_RESOLVE_SLEEP:-}" ] || exec sleep "$STUB_RESOLVE_SLEEP"
+[ -z "${STUB_RESOLVE_DELAY:-}" ] || sleep "$STUB_RESOLVE_DELAY"
 printf '%s      STREAM %s\n' "${STUB_RESOLVE_IP:-93.184.216.34}" "${2:-}"
 STUB
 chmod +x "$STUB_DIR/getent"
@@ -161,7 +162,7 @@ expect_eq "$(ls -A "$WORK" | grep -c '^\.access_check\.' || true)" "0" "no lefto
 
 # --- 全体期限（--total-timeout）: 超過後のタスクは取得せず blocked で記録を確定する ---
 : >"$WORK/curl-dl.log"
-expect_exit "total deadline" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$WORK/curl-dl.log" STUB_SLEEP=2 bash "$CHECK" --tasks "$WORK/net.json" --total-timeout 1 --out "$WORK/dl.jsonl"
+expect_exit "total deadline" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$WORK/curl-dl.log" STUB_SLEEP=3 bash "$CHECK" --tasks "$WORK/net.json" --total-timeout 2 --out "$WORK/dl.jsonl"
 expect_eq "$(wc -l <"$WORK/curl-dl.log" | tr -d ' ')" "1" "total deadline: curl not invoked after expiry"
 expect_eq "$(jq -r 'select(.id=="x2") | .blocked' "$WORK/dl.jsonl")" "total time limit exceeded" "total deadline blocked reason"
 expect_eq "$(jq -r 'select(.id=="x2") | .curl_exit' "$WORK/dl.jsonl")" "28" "total deadline curl_exit"
@@ -272,6 +273,13 @@ expect_eq "$(env PATH="$STUB_DIR:$PATH" STUB_RESOLVE_SLEEP=20 STUB_RESOLVE_PID="
 # 期限超過時に解決コマンド自体が残らない（P1: 子プロセスの回収）
 sleep 0.5
 expect_exit "slow dns resolver process killed" 1 kill -0 "$(cat "$WORK/res.pid")"
+
+# DNS 解決で時間を使った後は残り時間を再計算する（P1）。解決スタブが 2 秒かかる場合、全体期限 3 秒では
+# 解決後の curl に元の --max-time 3 を渡さない（残り 1 秒以下へ切り詰めるか、期限切れなら curl を呼ばない）
+write_tasks one '[{"id":"o1","cat":"static","url":"https://example.com/","selector":"h1","kind":"text"}]'
+: >"$LOG"
+expect_exit "dns consumes total deadline" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_RESOLVE_DELAY=2 bash "$CHECK" --tasks "$WORK/one.json" --total-timeout 3 --out "$WORK/dnsused.jsonl"
+expect_eq "$(grep -c -- '--max-time 3' "$LOG" || true)" "0" "dns consumed deadline: max-time is recomputed after resolve"
 
 # getent / dscacheutil が無い環境（Windows の Bash 環境）では powershell で解決する。
 # Linux / macOS では getent / dscacheutil が先に選ばれるため PATH をスタブだけに絞る。Windows（Git Bash）では

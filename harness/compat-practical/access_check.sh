@@ -174,6 +174,13 @@ fetch_site() {
         F_BLOCKED="host could not be resolved for address pinning"; F_CODE=0; return 0
       fi
     fi
+    # DNS 解決で時間を使った分を差し引いて残り時間を再計算し、期限切れなら curl を起動せず記録を確定する
+    remaining=$((TOTAL_TIMEOUT - SECONDS))
+    if [ "$remaining" -le 0 ]; then
+      F_BLOCKED="total time limit exceeded"; F_CODE=0; F_RC=28; return 0
+    fi
+    max_time=$TIMEOUT
+    if [ "$remaining" -lt "$max_time" ]; then max_time=$remaining; fi
     set +e
     # -q: .curlrc を読まない。--noproxy '*': 環境変数・設定のプロキシを無効化し、--resolve で固定した
     # 検証済みアドレスへ直接接続させる（プロキシ経由だと最終宛先を固定・検証できず SSRF 対策を迂回される）
