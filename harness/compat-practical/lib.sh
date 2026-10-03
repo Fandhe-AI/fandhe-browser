@@ -97,14 +97,30 @@ url_check() {
 }
 
 # resolve_host_ips <host>
-#   ホストの IP を 1 行 1 件で stdout へ出す（getent / dscacheutil のあるときのみ。無ければ何も出さない）。
-#   出力が空のとき、呼び出し側（access_check.sh）は接続先を固定できないホストとして取得前に拒否する
-#   （fail-closed。解決手段の無い環境では IP リテラル以外の URL は取得しない）。
+#   ホストの IP を 1 行 1 件で stdout へ出す。解決手段は getent（Linux）→ dscacheutil（macOS）→
+#   powershell の [System.Net.Dns]（Windows の Bash 環境。getent / dscacheutil が無いため）の順。
+#   いずれも無い・解決できないときは何も出さず、呼び出し側（access_check.sh）が接続先を固定できない
+#   ホストとして取得前に拒否する（fail-closed）。
+#   PowerShell へはホスト名を環境変数で渡しコマンド文字列へ連結しない（インジェクション対策）。
+#   併せてホスト名を DNS ラベル文字（英数字・ハイフン・ドット）に限って検証する。
 resolve_host_ips() {
+  local ps
   if command -v getent >/dev/null 2>&1; then
     getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u
   elif command -v dscacheutil >/dev/null 2>&1; then
     dscacheutil -q host -a name "$1" 2>/dev/null | awk '/^(ip_address|ipv6_address):/ {print $2}' | sort -u
+  else
+    ps=""
+    if command -v powershell.exe >/dev/null 2>&1; then
+      ps=powershell.exe
+    elif command -v powershell >/dev/null 2>&1; then
+      ps=powershell
+    fi
+    if [ -n "$ps" ] && [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; then
+      FANDHE_RESOLVE_HOST="$1" "$ps" -NoProfile -NonInteractive -Command \
+        '[System.Net.Dns]::GetHostAddresses($env:FANDHE_RESOLVE_HOST) | ForEach-Object { $_.IPAddressToString }' \
+        2>/dev/null | tr -d '\r' | awk 'NF {print $1}' | sort -u
+    fi
   fi
   return 0
 }

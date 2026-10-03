@@ -223,6 +223,26 @@ expect_contains "$LAST_OUTPUT" "reachable=0/2" "unresolvable summary"
 expect_eq "$(wc -l <"$LOG" | tr -d ' ')" "0" "unresolvable: curl not invoked"
 expect_eq "$(jq -r 'select(.id=="x1") | .blocked' "$WORK/nores.jsonl")" "host could not be resolved for address pinning" "unresolvable blocked reason"
 
+# getent / dscacheutil が無い環境（Windows の Bash 環境）では powershell で解決する
+PS_DIR="$WORK/ps"
+mkdir -p "$PS_DIR"
+for t in awk sort tr; do ln -s "$(type -P "$t")" "$PS_DIR/$t"; done
+cat >"$PS_DIR/powershell.exe" <<'STUB'
+#!/bin/sh
+# CRLF 付きで STUB_PS_IPS（空白区切り）を返し、環境変数経由のホスト名を STUB_PS_LOG へ記録する
+[ -z "${STUB_PS_LOG:-}" ] || echo "host=$FANDHE_RESOLVE_HOST" >>"$STUB_PS_LOG"
+for ip in $STUB_PS_IPS; do printf '%s\r\n' "$ip"; done
+STUB
+chmod +x "$PS_DIR/powershell.exe"
+PS_LOG="$WORK/ps.log"
+: >"$PS_LOG"
+expect_eq "$(env PATH="$PS_DIR" STUB_PS_LOG="$PS_LOG" STUB_PS_IPS="93.184.216.34 2606:4700::1" "$BASH" -c ". '$SCRIPT_DIR/lib.sh'; resolve_host_ips example.com" | tr '\n' ' ')" \
+  "2606:4700::1 93.184.216.34 " "powershell resolver output (CR 除去・ソート)"
+expect_contains "$(cat "$PS_LOG")" "host=example.com" "powershell receives host via env"
+: >"$PS_LOG"
+expect_eq "$(env PATH="$PS_DIR" STUB_PS_LOG="$PS_LOG" STUB_PS_IPS="93.184.216.34" "$BASH" -c ". '$SCRIPT_DIR/lib.sh'; resolve_host_ips 'a;b\$(x).com'")" "" "powershell resolver rejects unsafe host"
+expect_eq "$(wc -c <"$PS_LOG" | tr -d ' ')" "0" "powershell not invoked for unsafe host"
+
 : >"$LOG"
 expect_exit "proxy disabled" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/noproxy.jsonl"
 expect_contains "$(cat "$LOG")" "-q -sS --noproxy *" "curl ignores curlrc and proxies"
