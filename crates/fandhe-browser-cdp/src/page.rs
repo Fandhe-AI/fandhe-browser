@@ -266,6 +266,17 @@ pub(crate) struct PageNavigate {
     /// 共有状態へ最後にミラーした内容の記録。ターゲット表の更新・ミラーを 1 つの
     /// 同期境界（このロック）で行い、古い遷移が新しい結果を巻き戻さないようにする。
     published: Mutex<Published>,
+    /// テスト専用: イベント送出直前で一時停止させ、確定後〜送出前の競合を再現する。
+    #[cfg(test)]
+    pre_emit_pause: PreEmitPause,
+}
+
+/// テスト専用の一時停止ゲート（`armed` の間、送出直前で `paused` を立てて待つ）。
+#[cfg(test)]
+#[derive(Default)]
+struct PreEmitPause {
+    armed: std::sync::atomic::AtomicBool,
+    paused: std::sync::atomic::AtomicBool,
 }
 
 /// 共有状態（`AppState::navigation()`）へ最後にミラーした内容の記録（`CDP-1`）。
@@ -316,6 +327,8 @@ impl PageNavigate {
                 mirrored: None,
                 browser_in_flight: 0,
             }),
+            #[cfg(test)]
+            pre_emit_pause: PreEmitPause::default(),
         })
     }
 }
@@ -352,6 +365,11 @@ impl CommandHandler for PageNavigate {
             let mut recheck: Option<(Arc<NavigationState>, NavigationGeneration)> = None;
             // ブラウザレベル遷移の送出直前の世代再確認用（共有状態 `app_nav` の確定時の世代）。
             let mut recheck_shared: Option<NavigationGeneration> = None;
+            // ブラウザレベル遷移の進行中記録。確定・公開後もイベント送出が済むまで保持する。
+            // 送出前に手放すと、その隙にターゲット遷移のミラーが共有状態の世代を進め、送出直前の
+            // 世代再確認が失敗して Page.frameNavigated / loadEventFired が落ち、待機中の
+            // クライアントが止まる（`CDP-1`）。ミラーを見送る間も `seq` は記録される。
+            let mut _flight: Option<BrowserFlight<'_>> = None;
             let out = match &target_id {
                 Some(tid) => {
                     let registry = ctx.state.registry();
@@ -467,7 +485,7 @@ impl CommandHandler for PageNavigate {
                 None => {
                     // 世代払い出しより前に進行中を記録し、ターゲット遷移のミラーと調停する。
                     // 記録は結果の公開（下の `published` 更新）が済むまで保持する。
-                    let _flight = BrowserFlight::enter(&self.published);
+                    _flight = Some(BrowserFlight::enter(&self.published));
                     let out = navigate_gated(&self.fetcher, app_nav, url, &self.gate).await?;
                     // ブラウザレベル遷移も確定順（`seq`）の管理に含める。実際に確定し、かつ公開済みより
                     // 新しい場合に限り、共有状態をどのターゲットのミラーでもないものとして記録する。
@@ -534,6 +552,27 @@ impl CommandHandler for PageNavigate {
             // 送出対象の確定（ターゲット生存・世代の再確認）とイベント列の作成は、同じ `gate` の
             // ロック内で行う。確認後にロックを手放してから生成すると、その間に別の遷移が同一
             // ターゲットで開始・確定しても古いイベントが出てしまうため（`CDP-1`）。
+            #[cfg(test)]
+            {
+                use std::sync::atomic::Ordering;
+                // 最初に到達した 1 件だけ停止する（後続のターゲット遷移は素通りさせる）。
+                if self.pre_emit_pause.armed.load(Ordering::SeqCst)
+                    && !self.pre_emit_pause.paused.swap(true, Ordering::SeqCst)
+                {
+                    while self.pre_emit_pause.armed.load(Ordering::SeqCst) {
+                        let mut yielded = false;
+                        std::future::poll_fn(|cx| {
+                            if yielded {
+                                return std::task::Poll::Ready(());
+                            }
+                            yielded = true;
+                            cx.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        })
+                        .await;
+                    }
+                }
+            }
             if let Some(url) = navigated {
                 let _gate = lock_gate(&self.gate);
                 let target_alive = match (&target_id, ctx.session_id) {
@@ -1461,6 +1500,55 @@ mod tests {
             assert_eq!(f[0]["result"]["frameId"], json!("main"));
             assert_eq!(f[1]["method"], json!("Page.frameNavigated"));
             assert_eq!(f[2]["method"], json!("Page.loadEventFired"));
+        }
+
+        /// ブラウザレベル遷移の確定後〜イベント送出前にターゲット遷移が確定しても、共有状態への
+        /// ミラーは進行中記録で見送られ、ブラウザレベル遷移のイベントは落ちない
+        /// （TASK-42.3・`CDP-1`。レビュー指摘「Target mirror drops browser events」）。
+        #[tokio::test]
+        async fn cdp1_page_navigate_browser_events_survive_target_mirror_before_emit() {
+            use crate::target::TargetKind;
+            use std::sync::atomic::Ordering;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let tid = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let sid = st.registry().attach(&tid).unwrap();
+            let h = Arc::new(
+                PageNavigate::new(FetchOptions::new().with_allow_private_network_access(true))
+                    .unwrap(),
+            );
+            let d = Dispatcher::from_handlers(vec![(
+                "Page.navigate",
+                Box::new(SharedHandler(Arc::clone(&h))),
+            )])
+            .unwrap();
+            h.pre_emit_pause.armed.store(true, Ordering::SeqCst);
+            let ub = format!("http://127.0.0.1:{}/", serve("200 OK", "browser"));
+            let ut = format!("http://127.0.0.1:{}/", serve("200 OK", "target"));
+            let browser_req = json!({"id": 1, "method": "Page.navigate", "params": {"url": ub}});
+            let target_req = json!({"id": 2, "method": "Page.navigate",
+                "sessionId": sid.as_str(), "params": {"url": ut}});
+            let browser_msg = browser_req.to_string();
+            let browser = d.dispatch(&st, &browser_msg);
+            let driver = async {
+                while !h.pre_emit_pause.paused.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                // ブラウザ遷移は確定済みで送出待ち。この間にターゲット遷移を完了させる。
+                let tf = frames(d.dispatch(&st, &target_req.to_string()).await);
+                h.pre_emit_pause.armed.store(false, Ordering::SeqCst);
+                tf
+            };
+            let (bo, tf) = tokio::join!(browser, driver);
+            let bf = frames(bo);
+            assert_eq!(bf.len(), 3);
+            assert_eq!(bf[1]["method"], json!("Page.frameNavigated"));
+            assert_eq!(bf[2]["method"], json!("Page.loadEventFired"));
+            assert_eq!(tf.len(), 3);
+            assert_eq!(h.published.lock().unwrap().browser_in_flight, 0);
         }
 
         #[tokio::test]
