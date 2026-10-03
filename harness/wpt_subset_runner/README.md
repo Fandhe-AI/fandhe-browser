@@ -122,6 +122,22 @@ testharness 152 件は `Completed/Fail` 53 / 46・`Completed/NoResults` 3 / 10�
 
 テストは偽の WPT ツリー（一時ディレクトリ）で `tests/runner_subset.rs` が検証する。
 
+## 実行不能項目の記録（TASK-101.5・#277・PLUG-10・MS-8）
+
+`report` モジュールが、実行できない 2 群の理由と確度を JSON セクションとして書き出す
+（`UnrunnableReport::to_json`）。#276 のレポートが `"unrunnable"` キーへ埋め込む前提で、
+このセクションのキー名は固定する。
+
+| 理由コード | 対象 | 確度（`basis`） | 件数 |
+| ---------- | ---- | --------------- | ---- |
+| `reftest-comparison-not-implemented` | reftest（本ハーネスが描画比較を未実装。同一ブラウザーでの比較自体は原理上可能） | `confirmed` | 88 |
+| `unverified-likely-unrunnable` | other（内容未検証・実行できない可能性が高い） | `speculative` | 17 |
+
+- 出力は `schemaVersion`・`total`・`byReason[]`（`reason`・`basis`・`harness`・`description`・`count`・`files`）。0 件の理由も必ず出す
+- ファイルは昇順で、出力は決定的。件数上限は 10,000
+- 記録するのは理由だけで、対象外にする方針の承認は人間担当の #279（TASK-101.h1）が決める
+- JSON は手書きで出力し、`wpt-subset.json` はライブラリでは読まない（依存を追加しないため。テストだけが読む）
+
 ## コミットしないもの
 
 WPT のクローン・テスト内容は `.gitignore` で除外する（`wpt-work/`・`wpt/`）。
