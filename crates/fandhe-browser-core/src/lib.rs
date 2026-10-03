@@ -91,6 +91,9 @@ pub use fetch::{FetchOptions, FetchResponse, Fetcher};
 // js crate のワーカー入口をそのまま再エクスポートする（ラッパーを挟まない）。ラッパーで
 // マーカー設定時にも `None` を返すと fail-closed が崩れるため（security.md・`JS-2`・#513）。
 pub use fandhe_browser_js::run_js_worker_if_requested;
+// `JsRuntime::inject_global_function` の引数・エラー型。利用側（WPT ランナー等）が js crate へ
+// 直接依存せず core 経由で扱えるようにする（PLUG-10・TASK-101.2.1・#553）。
+pub use fandhe_browser_js::{JsEngineError, JsValue, NativeFn};
 pub use observability::{
     FailureKind, InMemoryRecorder, OperationCounts, OperationKind, OperationOutcome,
     OperationRecord, OperationRecorder, RecorderHandle,

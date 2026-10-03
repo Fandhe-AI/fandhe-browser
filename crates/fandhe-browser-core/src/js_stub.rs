@@ -27,13 +27,16 @@
 //!   core の再エクスポート `fandhe_browser_core::run_js_worker_if_requested`
 //!   （実体は js crate の同名関数。#513）を呼ばなければならない。
 //! - `create_engine(V8)` は子プロセスを起動しない（最初の `evaluate_script` で
-//!   遅延起動。PERF-7・TASK-29.6）。その契約を守るため、本モジュールは
+//!   遅延起動。PERF-7・TASK-29.6）。その契約を守るため、本モジュールは自発的には
 //!   `inject_global_function`・`bind_dom_like_object` を呼ばない（呼ぶと
-//!   その時点でワーカーが起動する）。DOM バインディングの配線は後続タスクで決める。
+//!   その時点でワーカーが起動する）。呼び出し元が
+//!   [`JsRuntime::inject_global_function`] を明示的に呼んだときだけ注入する
+//!   （`PLUG-10`・TASK-101.2.1・#553。WPT ランナーが結果受け取り用の関数を注入する）。
+//!   DOM バインディングの配線は後続タスクで決める。
 //!
 //! # スタブ・簡易実装の残り（REPAIR-3）
 //!
-//! - グローバル関数注入・DOM 風オブジェクトのバインドの配線は未実装（後続）。
+//! - DOM 風オブジェクトのバインド（`bind_dom_like_object`）の配線は未実装（後続）。
 //!
 //! # 可観測性（`REPAIR-9`・`TASK-10.2.2`・Issue #550）
 //!
@@ -44,6 +47,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+// 注入関数の型を core 経由で使えるよう再公開する（js crate へ直接依存してよいのは
+// core のみという crate 間の許可依存を、harness 等の利用側に守らせるため）。
+pub use fandhe_browser_js::{JsEngineError, NativeFn};
 use fandhe_browser_js::{
     CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsValue, create_engine,
 };
@@ -182,6 +188,29 @@ impl JsRuntime {
                 let value = js_value_to_display_string(&js_value)?;
                 Ok(JsExecutionOutput { value, js_value })
             }
+        }
+    }
+
+    /// JS のグローバル関数 `name` を注入する（`JS-2`・`PLUG-10`・TASK-101.2.1・#553）。
+    ///
+    /// 呼び出し元: WPT サブセットランナー（`harness/wpt_subset_runner`）が、結果受け取り
+    /// 用のネイティブ関数を testharness.js の評価前に登録するために呼ぶ。
+    ///
+    /// - JS 無効のランタイムは成功を装わず `JsExecutionUnavailable` を返す
+    /// - 失敗は [`crate::Error::JsEvaluation`] に包み、`BindingFailed` 等の種別を保つ
+    /// - 子プロセス版エンジン（V8）では、この呼び出しの時点でワーカーが起動する
+    ///   （PERF-7 の遅延起動は、本関数を呼ばない経路では維持される）
+    /// - 子が再起動した場合、ホストが登録した関数は再登録されるがスクリプト上の状態
+    ///   （グローバル変数・定義済み関数）は失われる（js crate の契約）
+    /// - `func` に渡る引数は JS 側由来の untrusted な値。型・範囲を検証して使うこと
+    pub fn inject_global_function(&mut self, name: &str, func: NativeFn) -> crate::Result<()> {
+        match &mut self.state {
+            RuntimeState::Disabled => Err(crate::Error::JsExecutionUnavailable {
+                message: DISABLED_MESSAGE.to_string(),
+            }),
+            RuntimeState::Enabled { engine, .. } => engine
+                .inject_global_function(name, func)
+                .map_err(crate::Error::JsEvaluation),
         }
     }
 
@@ -466,6 +495,68 @@ mod tests {
             ),
             Ok(_) => panic!("boa must be disabled on macOS"),
         }
+    }
+
+    /// JS-2・PLUG-10（TASK-101.2.1・#553）: 注入がエンジンへ委譲され、
+    /// 評価（`execute`）は注入を呼ばない（PERF-7 の回帰防止）。
+    #[test]
+    fn plug_10_inject_global_function_delegates_to_engine() {
+        let (mut rt, _, binds) = fake_runtime(Ok(JsValue::Undefined));
+        rt.inject_global_function("hostFn", Box::new(|_| Ok(JsValue::Undefined)))
+            .expect("注入成功");
+        assert_eq!(*binds.lock().unwrap(), 1);
+        execute_js_stub(&mut rt, "1").expect("評価成功");
+        assert_eq!(*binds.lock().unwrap(), 1);
+    }
+
+    /// JS-2・PLUG-10（TASK-101.2.1・#553）: 注入失敗は種別を保ったまま
+    /// `Error::JsEvaluation(BindingFailed)` になる。
+    #[test]
+    fn plug_10_inject_global_function_preserves_binding_failed() {
+        struct FailingEngine;
+        impl JsEngine for FailingEngine {
+            fn evaluate_script(
+                &mut self,
+                _script: &str,
+                _options: &EvaluateOptions,
+            ) -> Result<JsValue, JsEngineError> {
+                Ok(JsValue::Undefined)
+            }
+            fn inject_global_function(
+                &mut self,
+                _name: &str,
+                _func: NativeFn,
+            ) -> Result<(), JsEngineError> {
+                Err(JsEngineError::BindingFailed("nope".to_string()))
+            }
+            fn bind_dom_like_object(
+                &mut self,
+                _name: &str,
+                _methods: Vec<(String, NativeFn)>,
+            ) -> Result<(), JsEngineError> {
+                Ok(())
+            }
+        }
+        let mut rt = JsRuntime::from_engine_for_test(EngineKind::V8, Box::new(FailingEngine));
+        let err = rt
+            .inject_global_function("f", Box::new(|_| Ok(JsValue::Undefined)))
+            .expect_err("失敗する");
+        assert!(matches!(
+            err,
+            Error::JsEvaluation(JsEngineError::BindingFailed(_))
+        ));
+        assert_eq!(err.to_string(), "JS evaluation failed: binding registration failed: nope");
+    }
+
+    /// JS-2・PLUG-10（TASK-101.2.1・#553）: JS 無効のランタイムは注入に成功せず
+    /// `JsExecutionUnavailable` を返す。
+    #[test]
+    fn plug_10_inject_global_function_on_disabled_runtime_fails() {
+        let mut rt = JsRuntime::disabled();
+        let err = rt
+            .inject_global_function("f", Box::new(|_| Ok(JsValue::Undefined)))
+            .expect_err("常に失敗する");
+        assert!(matches!(err, Error::JsExecutionUnavailable { .. }));
     }
 
     /// REPAIR-9: recorder 付きの失敗呼び出しは `JsStub` / `Failure` を 1 件記録する。
