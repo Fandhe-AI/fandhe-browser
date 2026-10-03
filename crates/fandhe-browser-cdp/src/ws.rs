@@ -9,8 +9,8 @@
 //! # スタブについて
 //!
 //! [`BrowserSessionHandler`] は `crate::protocol::Dispatcher` へ委譲するだけで、組込み
-//! メソッド表は `Page.navigate`・`DOM.getDocument`・`DOM.querySelector`・`DOM.requestChildNodes`（TASK-42.2・42.4・42.5・#657。未実装メソッドの応答方針は
-//! 42.6・`CDP-6`）。未実装メソッドへ成功を返さない（`SEC-2`）。
+//! メソッド表は `Page.navigate`・`DOM.getDocument`・`DOM.querySelector`・`DOM.requestChildNodes`（TASK-42.2・42.4・42.5・#657）。未実装メソッドの応答方針は
+//! 確定済み（`-32601` を返し受信ログに記録。`protocol.rs` 参照。`CDP-6`）で、成功を返さない（`SEC-2`）。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

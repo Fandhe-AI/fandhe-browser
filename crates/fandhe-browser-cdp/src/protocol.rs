@@ -18,13 +18,32 @@
 //! エラー文言は固定文言（[`CdpError`]）で method 名などの入力値をエコーしない。
 //! メッセージ全体のサイズ上限は core の WebSocket 既定値に任せ、ここでは再実装しない。
 //!
-//! # スタブについて
+//! # 未実装メソッドの応答方針（`CDP-6`・`SEC-2`・TASK-42.6・#244）
 //!
 //! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 //! `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）のみ登録済みで、
-//! それ以外のメソッドは「method not implemented」（`-32601`）になる。
-//! 未実装メソッドへ成功を返さない（`SEC-2`）。未実装メソッドの正式な応答方針と受信ログは
-//! TASK-42.6（`CDP-6`）で確定する。
+//! それ以外のメソッドは JSON-RPC の「method not implemented」（`-32601`）エラーを返す。
+//! 汎用の空 success フォールバック（PoC-5 の暫定挙動）は採らない。理由は次のとおり。
+//!
+//! - `SEC-2`・security.md「偽装・回避機能の禁止」: 何にでも `{}` を成功で返すと、
+//!   `Emulation.setUserAgentOverride`・`Network.setUserAgentOverride`・
+//!   `Page.addScriptToEvaluateOnNewDocument` など stealth 系が使う呼び出しが、効いていないのに
+//!   成功したように見える。これは検出回避・偽装と同じ形の挙動になるため採らない（レビュー確認済み）
+//! - `REPAIR-3`: 実装済みを装わない。呼び出し側が未対応を検知して迂回・報告できるようにする
+//! - PoC-5 のフォールバックは必須メソッドを実測で洗い出す一時手段だった。その目的は
+//!   下記の受信ログが引き継ぐため、フォールバックは不要
+//! - Chromium は `'X' wasn't found` とメソッド名を返すが、本 crate は 42.1 の方針（固定文言・
+//!   入力値を応答へ反映しない）を守る意図的な差異とする
+//! - 今後、何もしないと分かっているメソッドへ成功を返す必要が出たら、`builtin_handlers` へ
+//!   メソッド単位で個別登録し `SEC-2` の観点でレビューする。汎用フォールバック・前方一致での
+//!   一括成功は追加しない。Playwright 互換（`CDP-2`）のための no-op の要否は TASK-43 で判断する
+//!
+//! # 受信ログ（`CDP-6`）
+//!
+//! パースと名前検証を通ったリクエストのメソッド名と件数を `CdpState` の受信ログ
+//! （[`CdpState::received_methods`]）へ記録する（`id`・`sessionId`・`params` は記録しない。
+//! 保持名数に上限あり。`crate::method_log`）。未実装メソッドは名前の初出時に 1 回だけ
+//! stderr へ 1 行出す。本番の出力先は #221（TASK-10.3）で決める。
 
 use std::collections::HashMap;
 use std::fmt;
@@ -35,6 +54,7 @@ use std::sync::Arc;
 use fandhe_browser_core::FetchOptions;
 use serde_json::{Map, Value, json};
 
+use crate::method_log::{MethodDisposition, RecordResult};
 use crate::page::PageNavigate;
 use crate::server::CdpState;
 use crate::target::SessionId;
@@ -63,7 +83,7 @@ impl CdpError {
     pub const PARSE_ERROR: Self = Self::new(-32700, "parse error");
     /// リクエストの形が不正。
     pub const INVALID_REQUEST: Self = Self::new(-32600, "invalid request");
-    /// メソッドが登録されていない。文言は旧暫定実装と互換。
+    /// メソッドが登録されていない。成功を返さず固定文言のエラーにする方針（`CDP-6`・`SEC-2`。モジュールドキュメント参照）。
     pub const METHOD_NOT_FOUND: Self = Self::new(-32601, "method not implemented");
     /// `params` が不正。
     pub const INVALID_PARAMS: Self = Self::new(-32602, "invalid params");
@@ -388,8 +408,8 @@ impl Dispatcher {
     }
 
     /// 受信テキスト 1 件を処理する。パース失敗・未登録メソッド・ハンドラのエラーは
-    /// すべてエラー応答になり、成功応答を捏造しない（`SEC-2`）。未登録メソッドの
-    /// 正式方針は 42.6（`CDP-6`）で確定する。
+    /// すべてエラー応答になり、成功応答を捏造しない（`SEC-2`）。パースと名前検証を通った
+    /// メソッド名だけが受信ログへ記録される（パース失敗は記録しない。`CDP-6`）。
     #[cfg(all(test, unix))]
     pub async fn dispatch(&self, state: &Arc<CdpState>, text: &str) -> DispatchOutcome {
         self.dispatch_on(state, None, text).await
@@ -408,7 +428,18 @@ impl Dispatcher {
                 return outcome(f.id, None, ResponseBody::Error(f.error), Vec::new());
             }
         };
-        let Some(handler) = self.handlers.get(req.method.as_str()) else {
+        let handler = self.handlers.get(req.method.as_str());
+        let kind = if handler.is_some() {
+            MethodDisposition::Handled
+        } else {
+            MethodDisposition::Unimplemented
+        };
+        let recorded = state.method_log().record(&req.method, kind);
+        if kind == MethodDisposition::Unimplemented && recorded == RecordResult::FirstSeen {
+            // 名前は method_name_is_valid 済み（ASCII 英数字と `.`）なのでログ注入の恐れはない。
+            eprintln!("cdp: unimplemented method received: {}", req.method);
+        }
+        let Some(handler) = handler else {
             return outcome(
                 Some(req.id),
                 req.session_id,
@@ -743,6 +774,46 @@ mod tests {
                     json!({"id": 1, "error": {"code": -32601, "message": "method not implemented"}})
                 ]
             );
+        }
+
+        #[tokio::test]
+        async fn cdp6_dispatch_records_unimplemented_and_handled_methods() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let d = dispatcher();
+            let v = frames(
+                d.dispatch(&st, r#"{"id":1,"method":"Evil.secretMethod"}"#)
+                    .await,
+            );
+            assert_eq!(
+                v,
+                vec![
+                    json!({"id": 1, "error": {"code": -32601, "message": "method not implemented"}})
+                ]
+            );
+            d.dispatch(&st, r#"{"id":2,"method":"Alpha.one"}"#).await;
+            d.dispatch(&st, r#"{"id":3,"method":"Gamma.fail"}"#).await;
+            let s = st.received_methods();
+            let get = |n: &str| s.methods.iter().find(|(k, _)| k == n).map(|(_, c)| *c);
+            let evil = get("Evil.secretMethod").unwrap();
+            assert_eq!((evil.handled, evil.unimplemented), (0, 1));
+            let alpha = get("Alpha.one").unwrap();
+            assert_eq!((alpha.handled, alpha.unimplemented), (1, 0));
+            let gamma = get("Gamma.fail").unwrap();
+            assert_eq!((gamma.handled, gamma.unimplemented), (1, 0));
+            assert_eq!(s.dropped, 0);
+        }
+
+        #[tokio::test]
+        async fn cdp6_dispatch_does_not_record_parse_failures() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let d = dispatcher();
+            d.dispatch(&st, "not json").await;
+            d.dispatch(&st, r#"{"id":3,"method":"A b"}"#).await;
+            let s = st.received_methods();
+            assert!(s.methods.is_empty());
+            assert_eq!(s.dropped, 0);
         }
 
         #[tokio::test]
