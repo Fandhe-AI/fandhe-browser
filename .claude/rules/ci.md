@@ -20,6 +20,7 @@ cargo test --workspace
 ## 分離・構成の検証
 
 - 既定ビルドに Servo が含まれないことを `cargo tree` で検証する（RENDER-1）。判定ロジックの正本は `scripts/check-render-isolation.sh`（`make check-render-isolation` から呼ぶ薄いラッパー）で、CI では `render-isolation` ジョブ（3 OS matrix）が同スクリプトを直接実行する（TASK-34.1・Issue #465）。`fandhe-browser-cli` の既定 feature も検査対象だが、cli の manifest が無い場合は NG（fail-closed。TASK-41.5・#174・#633）
+- JS エンジン構成の依存グラフを `cargo tree` で検証する（TASK-32.4・`JS-1`・Issue #168）。軽量ビルド（`--no-default-features --features js-boa`）に `v8` が、エンジンなし（`--no-default-features`）に `v8`・`boa_engine` が含まれないことを `scripts/check-js-engine-isolation.sh`（`make check-js-engine-isolation`）で判定し、CI では `js-engine-isolation` ジョブ（3 OS matrix）が直接実行する。軽量ビルドの build・test は `rust-ci-js-boa` ジョブ、両エンジン同梱の共通テストは `rust-ci-default-features` ジョブ内で実行する
 - ライセンス検査は `cargo deny check licenses` で行う（[licensing](./licensing.md)）
 - 対象サイト群の動作率回帰チェック（`REPAIR-8`・`COMPAT-1`・`COMPAT-4`。TASK-9.2）:
   `make check-compat-regression`（CI では `compat-regression` ジョブ）が
