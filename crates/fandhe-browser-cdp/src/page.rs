@@ -1704,6 +1704,7 @@ mod tests {
                 let ctx = CommandContext {
                     state: &st,
                     session_id: Some(sid),
+                    conn: None,
                 };
                 h.handle(ctx, &params).await.unwrap();
             }
@@ -1713,6 +1714,7 @@ mod tests {
             let ctx = CommandContext {
                 state: &st,
                 session_id: Some(&s2),
+                conn: None,
             };
             h.handle(ctx, &params).await.unwrap();
             assert_eq!(st.navigations().len(), 1);

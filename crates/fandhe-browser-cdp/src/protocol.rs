@@ -8,7 +8,7 @@
 //!
 //! 公開入口は無く crate 内部専用。後続タスクは [`builtin_handlers`] へメソッドを
 //! 追加するだけでよい（`Page.navigate` は 42.2 で登録済み、イベント送出は 42.3 で実装済み、
-//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5）。
+//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5 で登録済み）。
 //!
 //! # 入力の扱い
 //!
@@ -20,7 +20,8 @@
 //!
 //! # スタブについて
 //!
-//! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）と `DOM.getDocument`（TASK-42.4）のみ登録済みで、
+//! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
+//! `DOM.querySelector`（TASK-42.5）のみ登録済みで、
 //! それ以外のメソッドは「method not implemented」（`-32601`）になる。
 //! 未実装メソッドへ成功を返さない（`SEC-2`）。未実装メソッドの正式な応答方針と受信ログは
 //! TASK-42.6（`CDP-6`）で確定する。
@@ -78,6 +79,8 @@ impl CdpError {
     /// 空文書を捏造せず明示エラーにする。`CDP-1`・`REPAIR-3`・`SEC-2`）。
     pub const TARGET_DOCUMENT_UNAVAILABLE: Self =
         Self::new(-32000, "document not available for target");
+    /// 指定 nodeId が現在の文書の採番表に無い（形式は正しいが対象が無い。`DOM.querySelector`。`CDP-1`）。
+    pub const NODE_NOT_FOUND: Self = Self::new(-32000, "node not found");
 
     const fn new(code: i64, message: &'static str) -> Self {
         Self { code, message }
@@ -273,6 +276,20 @@ pub(crate) fn parse_request(text: &str) -> Result<CdpRequest, ParseFailure> {
     })
 }
 
+/// WebSocket 接続 1 本を表す crate 内の識別子（`crate::ws` が接続ごとに割り当てる。`CDP-1`）。
+///
+/// ブラウザレベルの状態（`DOM.getDocument` の nodeId 払い出し記録等）を接続単位で分離するための
+/// キー。プロセス内連番で推測可能なため認可には使わない（識別子であって資格情報ではない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ConnId(u64);
+
+impl ConnId {
+    /// 連番から構築する。
+    pub(crate) fn new(n: u64) -> Self {
+        Self(n)
+    }
+}
+
 /// ハンドラが参照する実行コンテキスト。
 // フィールドは 42.2 以降のハンドラが読む（骨格のみ先行）ため dead_code を許容する。
 #[allow(dead_code)]
@@ -281,6 +298,8 @@ pub(crate) struct CommandContext<'a> {
     pub state: &'a Arc<CdpState>,
     /// リクエストの `sessionId`。
     pub session_id: Option<&'a SessionId>,
+    /// 要求元の WebSocket 接続。WebSocket を介さない直接 dispatch（テスト）では `None`。
+    pub conn: Option<ConnId>,
 }
 
 /// 1 メソッド分のハンドラ。
@@ -322,9 +341,9 @@ impl std::error::Error for DispatcherError {}
 /// 登録済みハンドラ表。
 type HandlerTable = Vec<(&'static str, Box<dyn CommandHandler>)>;
 
-/// 組込みハンドラ表。`Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）を登録済み（`CDP-1`）。
+/// 組込みハンドラ表。`Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
+/// `DOM.querySelector`（TASK-42.5）を登録済み（`CDP-1`）。
 ///
-/// 42.5（`DOM.querySelector`）がここへ追加する。
 /// `Page.navigate` は既定の `FetchOptions`（内部アドレス拒否）で `Fetcher` を構築する。
 pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
     let navigate =
@@ -332,6 +351,7 @@ pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
     Ok(vec![
         ("Page.navigate", Box::new(navigate)),
         ("DOM.getDocument", Box::new(crate::dom::DomGetDocument)),
+        ("DOM.querySelector", Box::new(crate::dom::DomQuerySelector)),
     ])
 }
 
@@ -363,7 +383,18 @@ impl Dispatcher {
     /// 受信テキスト 1 件を処理する。パース失敗・未登録メソッド・ハンドラのエラーは
     /// すべてエラー応答になり、成功応答を捏造しない（`SEC-2`）。未登録メソッドの
     /// 正式方針は 42.6（`CDP-6`）で確定する。
+    #[cfg(all(test, unix))]
     pub async fn dispatch(&self, state: &Arc<CdpState>, text: &str) -> DispatchOutcome {
+        self.dispatch_on(state, None, text).await
+    }
+
+    /// [`Self::dispatch`] の接続指定版。ws.rs の `on_message_with_ctx` が接続 ID 付きで呼ぶ。
+    pub async fn dispatch_on(
+        &self,
+        state: &Arc<CdpState>,
+        conn: Option<ConnId>,
+        text: &str,
+    ) -> DispatchOutcome {
         let req = match parse_request(text) {
             Ok(r) => r,
             Err(f) => {
@@ -381,6 +412,7 @@ impl Dispatcher {
         let ctx = CommandContext {
             state,
             session_id: req.session_id.as_ref(),
+            conn,
         };
         match handler.handle(ctx, &req.params).await {
             Ok(out) => {

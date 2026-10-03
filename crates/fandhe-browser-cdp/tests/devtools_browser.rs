@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use fandhe_backend_core::server::Server;
 use fandhe_browser_cdp::{BrowserId, CdpState, endpoints};
-use fandhe_browser_core::AppState;
+use fandhe_browser_core::{AppState, NavigationResult};
 use fandhe_browser_profile::Profile;
 use serde_json::{Value, json};
 
@@ -49,6 +49,11 @@ impl Drop for TempDir {
 
 /// 実サーバーを起動してアドレスを返す。タスクはテスト終了時にランタイムごと破棄される。
 async fn start(dir: &TempDir) -> SocketAddr {
+    start_with_state(dir).await.0
+}
+
+/// [`start`] と同じだが、`CdpState` も返す（ブラウザレベル文書をテストから設定するため）。
+async fn start_with_state(dir: &TempDir) -> (SocketAddr, Arc<CdpState>) {
     let profile = Arc::new(Profile::open(&dir.0).expect("profile open"));
     let app = Arc::new(AppState::with_disabled_renderer(profile));
     let st = Arc::new(CdpState::with_browser_id(
@@ -64,7 +69,7 @@ async fn start(dir: &TempDir) -> SocketAddr {
         .expect("bind");
     let addr = bound.local_addr().expect("local_addr");
     tokio::spawn(bound.run());
-    addr
+    (addr, st)
 }
 
 fn connect(addr: SocketAddr) -> TcpStream {
@@ -122,8 +127,17 @@ fn read_text_json(s: &mut TcpStream) -> Value {
     s.read_exact(&mut h).expect("frame header");
     assert_eq!(h[0], 0x81, "expected FIN + text frame");
     assert_eq!(h[1] & 0x80, 0, "server frames must not be masked");
-    let len = usize::from(h[1] & 0x7f);
-    assert!(len < 126);
+    let mut len = usize::from(h[1] & 0x7f);
+    if len == 126 {
+        // 126 バイト以上は 16 bit 拡張長（RFC 6455 5.2）。
+        let mut ext = [0u8; 2];
+        s.read_exact(&mut ext).expect("extended length");
+        len = usize::from(u16::from_be_bytes(ext));
+    }
+    assert!(
+        len < 126 || h[1] & 0x7f == 126,
+        "payload too large for test helper"
+    );
     let mut payload = vec![0u8; len];
     s.read_exact(&mut payload).expect("frame payload");
     serde_json::from_slice(&payload).expect("json payload")
@@ -257,6 +271,56 @@ async fn cdp1_devtools_browser_plain_get_is_404() {
         .unwrap();
         let head = read_head(&mut s);
         assert_eq!(status_of(&head), 404, "head: {head}");
+    })
+    .await
+    .unwrap();
+}
+
+/// ブラウザレベルの nodeId は WebSocket 接続ごとに分離される（`CDP-1`・`SEC-2`）。
+/// 接続 A で `DOM.getDocument` した nodeId は、接続 B の `DOM.querySelector` では
+/// 解決されず（`NODE_NOT_FOUND`）、A 自身では解決できる。
+#[tokio::test]
+async fn cdp1_browser_level_node_ids_are_isolated_per_connection() {
+    let dir = TempDir::new();
+    let (addr, st) = start_with_state(&dir).await;
+    let nav = st.app_state().navigation();
+    let generation = nav.begin_navigation().expect("begin");
+    nav.commit_navigation(
+        generation,
+        NavigationResult::new("https://example.com/", "<p id=\"x\">hi</p>"),
+    )
+    .expect("commit");
+
+    tokio::task::spawn_blocking(move || {
+        let host = format!("127.0.0.1:{}", addr.port());
+        let open = || {
+            let mut s = connect(addr);
+            let head = upgrade(&mut s, "/devtools/browser/fixed-1", &host, "");
+            assert_eq!(status_of(&head), 101, "head: {head}");
+            s
+        };
+        let (mut a, mut b) = (open(), open());
+        let q = r##"{"id":2,"method":"DOM.querySelector","params":{"nodeId":1,"selector":"#x"}}"##;
+
+        send_text(
+            &mut a,
+            r#"{"id":1,"method":"DOM.getDocument","params":{"depth":0}}"#,
+        );
+        assert_eq!(read_text_json(&mut a)["result"]["root"]["nodeId"], json!(1));
+
+        // 接続 B は getDocument していないため、A の nodeId は使い回せない。
+        send_text(&mut b, q);
+        let rb = read_text_json(&mut b);
+        assert_eq!(rb["error"]["code"], json!(-32000), "resp: {rb}");
+        assert!(rb.get("result").is_none());
+
+        // 接続 A では解決できる（`#x` はルート（nodeId 1）以外の正の nodeId に解決される）。
+        send_text(&mut a, q);
+        let ra = read_text_json(&mut a);
+        assert!(
+            ra["result"]["nodeId"].as_i64().unwrap_or(0) > 1,
+            "resp: {ra}"
+        );
     })
     .await
     .unwrap();
