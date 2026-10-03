@@ -5,7 +5,9 @@
 # sparse checkout で取得し、ランナー入力 `subset.tsv`（1 行 `<harness>\t<file>`）を書き出す。
 # Rust 側の `wpt_subset_runner::runner`（`parse_subset_tsv`）が subset.tsv を読む。
 #
-# 取得元 URL はハードコードし、引数・環境変数では変えられない。ネットワークが必要なため
+# 取得元 URL はハードコードし、引数・環境変数では変えられない（自己テスト専用の差し替え口は
+# 下記 `FETCH_WPT_SELF_TEST` 参照）。既存の作業ディレクトリは一切再利用せず、毎回新しい一時
+# ディレクトリへ取得・検証し、成功後にだけ置き換える（PLUG-10）。ネットワークが必要なため
 # CI には組み込まない（CI 連携は #278 の判断）。依存は bash + jq + git のみ
 # （新規 Cargo 依存を避けるため。.claude/rules/dependency-policy.md）。
 #
@@ -13,7 +15,9 @@
 # 終了コード: 0 成功 / 2 入力・前提不正または取得失敗
 set -euo pipefail
 
-readonly WPT_URL="https://github.com/web-platform-tests/wpt.git"
+readonly WPT_URL_OFFICIAL="https://github.com/web-platform-tests/wpt.git"
+WPT_URL="${WPT_URL_OFFICIAL}"
+ALLOWED_PROTOCOL="https"
 
 die() {
   echo "error: $*" >&2
@@ -25,6 +29,16 @@ command -v git >/dev/null 2>&1 || die "git is required"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUBSET_JSON="${SCRIPT_DIR}/wpt-subset.json"
+# 自己テスト専用の差し替え口（fetch-wpt-self-test.sh がローカルの一時リポジトリを使うため）。
+# `FETCH_WPT_SELF_TEST=1` のときだけ有効で、取得元は `file://` のローカルパスに限る。
+# 通常の利用（変数未設定）では公式 URL・同梱 JSON 以外を受け付けない。
+if [ "${FETCH_WPT_SELF_TEST:-}" = "1" ]; then
+  [[ "${FETCH_WPT_SELF_TEST_URL:-}" == file:///* ]] || die "self-test mode requires a file:/// URL"
+  WPT_URL="${FETCH_WPT_SELF_TEST_URL}"
+  ALLOWED_PROTOCOL="file"
+  SUBSET_JSON="${FETCH_WPT_SELF_TEST_JSON:-${SUBSET_JSON}}"
+  echo "warning: self-test mode; fetching from ${WPT_URL}" >&2
+fi
 WORK_DIR="${WPT_WORK_DIR:-${SCRIPT_DIR}/wpt-work}"
 WPT_DIR="${WORK_DIR}/wpt"
 
@@ -101,9 +115,17 @@ while IFS= read -r d; do
 done <<<"${dirs_sorted}"
 [ "${#PATTERNS[@]}" -gt 1 ] || die "no directories in wpt-subset.json"
 
+# 作業ディレクトリ（WORK_DIR）は symlink を拒否する。取得は WORK_DIR 直下の一時ディレクトリ
+# （同一ファイルシステム＝mv が rename になる）で行い、失敗時は trap で消す。既存の
+# WPT_DIR・subset.tsv は成功するまで変更しない。
+[ ! -L "${WORK_DIR}" ] || die "${WORK_DIR} is a symlink; refusing to use it"
+mkdir -p "${WORK_DIR}"
+STAGE="$(mktemp -d "${WORK_DIR}/.wpt-stage.XXXXXX")" || die "failed to create staging directory"
+trap 'rm -rf "${STAGE}"' EXIT
+NEW_DIR="${STAGE}/wpt"
+TSV_TMP="${STAGE}/subset.tsv"
+
 # subset.tsv は検証済みの行だけを書く（harness は列挙値、file は valid_path）。
-TSV_TMP="$(mktemp "${TMPDIR:-/tmp}/wpt-subset-tsv.XXXXXX")"
-trap 'rm -f "${TSV_TMP}"' EXIT
 files_out="$(jq -r '.subset[] | [.harness, .file] | @tsv' "${SUBSET_JSON}")" || die "failed to read .subset[]"
 while IFS=$'\t' read -r harness file; do
   [ -n "${harness}${file}" ] || continue
@@ -117,71 +139,45 @@ while IFS=$'\t' read -r harness file; do
 done <<<"${files_out}"
 [ -s "${TSV_TMP}" ] || die "no entries in wpt-subset.json"
 
-# 既存の作業ディレクトリは信頼しない（fail-closed。PLUG-10）。別の取得元・別リポジトリ・
-# リポジトリ外を指す symlink を再利用すると、固定リビジョンと無関係なコードを JS ランナーへ
-# 渡してしまうため、次を全て満たす場合だけ再利用する。
-#   - WORK_DIR・WPT_DIR・WPT_DIR/.git が symlink でなく実体のディレクトリ
-#     （`.git` がファイル＝gitdir 参照の場合も、外部の gitdir を指し得るため拒否する）
-#   - WPT_DIR 自身がリポジトリのトップレベル（親リポジトリの一部ではない）
-#   - origin の URL（.git/config の生の値）が公式 WPT_URL と完全一致し、url.* の書き換え設定が無い
-# 再利用するクローンの .git/config に仕込まれたコマンド（fsmonitor・hooks）を実行しないよう、
-# WPT_DIR に対する git 呼び出しは常に無効化オプション付きで行う。
-git_wpt() {
-  git -c core.fsmonitor=false -c core.hooksPath=/dev/null \
-    -c core.excludesFile=/dev/null -C "${WPT_DIR}" "$@"
+# git はユーザー・システム設定や環境変数経由の GIT_DIR 等に影響されないようにし、
+# hooks・fsmonitor を無効化し、使用プロトコルを取得元の種別に限る。新規に作った一時
+# リポジトリだけを触るため、既存クローンの .git/config（filter.*・url.* 等）は読まない。
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+export GIT_ALLOW_PROTOCOL="${ALLOWED_PROTOCOL}"
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG
+git_new() {
+  git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.excludesFile=/dev/null \
+    -C "${NEW_DIR}" "$@"
 }
 
-# 追跡ファイルの変更・未追跡ファイルに加え、無視対象（.gitignore・.git/info/exclude・
-# グローバル ignore）のファイルも検出して拒否する。`--porcelain` 単体は無視対象を列挙せず、
-# 固定リビジョンに属さない JS が resources/ 等に残っていても清潔と誤判定するため
-# `--ignored=matching` を付け、ユーザー環境の ignore 設定に依存しないよう excludesFile を無効化する。
-assert_clean() {
-  local out
-  out="$(git_wpt status --porcelain --untracked-files=all \
-    --ignored=matching)" || die "git status failed"
-  [ -z "${out}" ] || die "${WPT_DIR} has local, untracked or ignored files; remove it and re-run for a fresh checkout"
-}
+mkdir "${NEW_DIR}"
+git_new init -q || die "git init failed"
+git_new remote add origin "${WPT_URL}" || die "git remote add failed"
+git_new sparse-checkout set --no-cone -- "${PATTERNS[@]}" || die "sparse-checkout failed"
+git_new fetch -q --depth 1 --filter=blob:none origin "${REV}" || die "git fetch ${REV} failed"
+git_new checkout -q --detach "${REV}" || die "git checkout ${REV} failed"
+[ "$(git_new rev-parse --verify HEAD)" = "${REV}" ] || die "HEAD is not ${REV}"
 
-[ ! -L "${WORK_DIR}" ] || die "${WORK_DIR} is a symlink; refusing to use it"
-mkdir -p "${WORK_DIR}"
-[ ! -L "${WPT_DIR}" ] || die "${WPT_DIR} is a symlink; refusing to reuse it"
-
-if [ -e "${WPT_DIR}" ]; then
+# 取得と検証が成功した後にだけ置き換える。置き換え先が symlink なら辿らずリンク自体を除去する
+# （mv は symlink 先のディレクトリの中へ移動してしまうため）。既存ディレクトリは退避してから
+# 差し替え、差し替えに失敗したら元へ戻す。
+if [ -L "${WPT_DIR}" ]; then
+  rm -f "${WPT_DIR}"
+elif [ -e "${WPT_DIR}" ]; then
   [ -d "${WPT_DIR}" ] || die "${WPT_DIR} exists but is not a directory"
-  [ ! -L "${WPT_DIR}/.git" ] || die "${WPT_DIR}/.git is a symlink; refusing to reuse it"
-  [ -d "${WPT_DIR}/.git" ] || die "${WPT_DIR}/.git is not a directory (gitdir file is not accepted)"
-  top="$(git_wpt rev-parse --show-toplevel 2>/dev/null || true)"
-  [ -n "${top}" ] && [ "$(cd "${top}" && pwd -P)" = "$(cd "${WPT_DIR}" && pwd -P)" ] \
-    || die "${WPT_DIR} is not the top level of its own git repository"
-  origin_raw="$(git_wpt config --local --get remote.origin.url 2>/dev/null || true)"
-  [ "${origin_raw}" = "${WPT_URL}" ] \
-    || die "origin of ${WPT_DIR} is not ${WPT_URL}; remove it and re-run for a fresh clone"
-  # クローン内の `url.<base>.insteadOf` は URL を別ホストへ書き換え得るため拒否する
-  # （ユーザーのグローバル設定の insteadOf は信頼するため、--local のみ検査する）。
-  [ -z "$(git_wpt config --local --get-regexp '^url\.' 2>/dev/null || true)" ] \
-    || die "${WPT_DIR} defines url rewrite rules (url.*); remove it and re-run for a fresh clone"
-  # 取得・チェックアウトの前にも検査する（無視対象を残したクローンを触らず拒否する）。
-  assert_clean
-else
-  git clone --filter=blob:none --no-checkout --sparse -- "${WPT_URL}" "${WPT_DIR}" \
-    || die "git clone failed"
+  mv "${WPT_DIR}" "${STAGE}/old" || die "failed to move aside ${WPT_DIR}"
+fi
+if ! mv "${NEW_DIR}" "${WPT_DIR}"; then
+  [ ! -e "${STAGE}/old" ] || mv "${STAGE}/old" "${WPT_DIR}"
+  die "failed to install ${WPT_DIR}"
 fi
 
-# sparse パターンはリビジョンの一致に関わらず毎回設定する（クローン直後の HEAD が
-# 固定リビジョンと一致していても作業ツリーを必ず構築するため）。
-git_wpt sparse-checkout set --no-cone -- "${PATTERNS[@]}" \
-  || die "sparse-checkout failed"
-# 取得元は `origin` 名ではなく検証済みの定数 URL を明示する。
-if [ "$(git_wpt rev-parse --verify HEAD 2>/dev/null || true)" != "${REV}" ]; then
-  git_wpt fetch --filter=blob:none "${WPT_URL}" "${REV}" || die "git fetch ${REV} failed"
+# subset.tsv も同じ手順（symlink を辿らず rename で置き換える）。
+OUT_TSV="${WORK_DIR}/subset.tsv"
+if [ -L "${OUT_TSV}" ]; then
+  rm -f "${OUT_TSV}"
+elif [ -d "${OUT_TSV}" ]; then
+  die "${OUT_TSV} is a directory"
 fi
-git_wpt checkout --detach "${REV}" || die "git checkout ${REV} failed"
-# 既存クローンを再利用する場合、追跡ファイルの変更・未追跡ファイルが残っていると、
-# 固定リビジョンと異なる testharness.js やテストを実行できてしまう。チェックアウト後に
-# HEAD が固定リビジョンであり、作業ツリーが清潔であることを確認し、違えば失敗させる
-# （手動で wpt-work を削除して取得し直す）。
-[ "$(git_wpt rev-parse --verify HEAD)" = "${REV}" ] || die "HEAD is not ${REV}"
-assert_clean
-
-cp "${TSV_TMP}" "${WORK_DIR}/subset.tsv"
-echo "WPT ${REV} ready at ${WPT_DIR}; wrote ${WORK_DIR}/subset.tsv"
+mv -f "${TSV_TMP}" "${OUT_TSV}" || die "failed to write ${OUT_TSV}"
+echo "WPT ${REV} ready at ${WPT_DIR}; wrote ${OUT_TSV}"

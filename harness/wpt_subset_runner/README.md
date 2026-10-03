@@ -87,9 +87,14 @@ bash harness/wpt_subset_runner/fetch-wpt.sh   # jq・git・ネットワークが
 
 - 取得元は公式 `web-platform-tests/wpt` にハードコード（引数・環境変数で変更不可）。`resources/`・`common/`・
   `css/support/` と選定ディレクトリだけを sparse checkout する（出力先は `wpt-work/`。`WPT_WORK_DIR` で変更可）
-- 既存の `wpt-work/wpt` は、symlink でなく・`.git` が実体ディレクトリで・自身がトップレベルで・origin が公式 URL と
-  完全一致する場合だけ再利用し、違えば exit 2（fail-closed）。fetch も公式 URL を明示して行う。
-  検証は `bash harness/wpt_subset_runner/fetch-wpt-self-test.sh`（ネットワーク不要）で確認する
+- 既存の `wpt-work/wpt` は一切再利用しない。毎回 `wpt-work/` 直下の一時ディレクトリへ `git init`・`fetch --depth 1`
+  （固定 SHA）・sparse checkout し、取得と検証が成功した後にだけ `wpt-work/wpt` を差し替える（既存が symlink なら
+  リンク自体を除去して置換）。失敗時は一時ディレクトリを消し、既存の `wpt/`・`subset.tsv` は変更しない。
+  git はシステム・ユーザー設定を読まず、hooks・fsmonitor を無効化し、プロトコルを https に限る
+  （既存クローンの `.git/config` の filter・url 書き換え等を実行しないための構造的対策）
+- `subset.tsv` は一時ファイルに書いてから rename で置換する（既存が symlink でもリンク先へ書き込まない）。
+  検証は `bash harness/wpt_subset_runner/fetch-wpt-self-test.sh`（ネットワーク不要。ローカルの一時 git リポジトリを
+  使う自己テスト専用の差し替え口 `FETCH_WPT_SELF_TEST=1` は `file:///` の URL のみ受け付ける）で確認する
 - `wpt-work/subset.tsv`（1 行 `<harness>\t<file>`）を書き出す。Rust 側は JSON を読まない（新規依存を避けるため）
 - `file`・`dir` はパス規則（許可文字・`..` 禁止）で検証してから git へ渡す。スキーマ全体の検証は #278 の担当
 
