@@ -41,7 +41,7 @@ use serde_json::{Value, json};
 use crate::protocol::{
     BoxFuture, CdpError, CdpEvent, CommandContext, CommandHandler, HandlerOutput,
 };
-use crate::target::{CdpStateError, MAX_URL_LEN, TargetId};
+use crate::target::{CdpStateError, MAX_URL_LEN, TargetId, TargetRegistry};
 
 /// メインフレームの `frameId`（スタブ。将来はセッション → ターゲット ID。`CDP-2`・TASK-43）。
 pub(crate) const MAIN_FRAME_ID: &str = "main";
@@ -301,6 +301,10 @@ struct Published {
 /// ミラーを見送ったターゲット確定結果（解放時の再反映用）。
 struct PendingMirror {
     target: TargetId,
+    /// 保留時点のターゲット遷移状態と世代。反映前に、同一ターゲットの後続遷移で無効化されて
+    /// いないかを確認する。
+    nav: Arc<NavigationState>,
+    generation: NavigationGeneration,
     result: Arc<NavigationResult>,
 }
 
@@ -310,26 +314,51 @@ struct PendingMirror {
 /// 最後のガードの解放時に、見送ったターゲット確定（`pending`）があれば共有状態へ反映する。
 /// 反映するのは見送った中で確定順が最新のものだけで、ブラウザレベル遷移が後から確定していれば
 /// `pending` は破棄済みのため古い結果で上書きしない（`CDP-1`）。
-struct BrowserFlight<'a>(&'a Mutex<Published>, &'a NavigationState);
+struct BrowserFlight<'a> {
+    published: &'a Mutex<Published>,
+    app_nav: &'a NavigationState,
+    registry: &'a TargetRegistry,
+    gate: &'a CommitGate,
+}
 
 impl<'a> BrowserFlight<'a> {
-    fn enter(published: &'a Mutex<Published>, app_nav: &'a NavigationState) -> Self {
+    fn enter(
+        published: &'a Mutex<Published>,
+        app_nav: &'a NavigationState,
+        registry: &'a TargetRegistry,
+        gate: &'a CommitGate,
+    ) -> Self {
         let mut p = published.lock().unwrap_or_else(PoisonError::into_inner);
         p.browser_in_flight = p.browser_in_flight.saturating_add(1);
         drop(p);
-        Self(published, app_nav)
+        Self {
+            published,
+            app_nav,
+            registry,
+            gate,
+        }
     }
 }
 
 impl Drop for BrowserFlight<'_> {
     fn drop(&mut self) {
-        let mut p = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut p = self
+            .published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         p.browser_in_flight = p.browser_in_flight.saturating_sub(1);
-        if p.browser_in_flight == 0
-            && let Some(m) = p.pending.take()
-            && let Ok(g) = self.1.begin_navigation()
+        if p.browser_in_flight != 0 {
+            return;
+        }
+        let Some(m) = p.pending.take() else { return };
+        // 保留中にターゲットが閉じられた、または同一ターゲットの後続遷移で結果が無効化された
+        // 場合は反映しない（直近結果の契約。`CDP-1`）。世代確認は `gate` を保持して行う。
+        let _gate = lock_gate(self.gate);
+        if self.registry.target(&m.target).is_some()
+            && m.nav.current_generation() == m.generation
+            && let Ok(g) = self.app_nav.begin_navigation()
             && self
-                .1
+                .app_nav
                 .commit_navigation(g, NavigationResult::new(m.result.url(), m.result.html()))
                 .is_ok()
         {
@@ -449,6 +478,8 @@ impl CommandHandler for PageNavigate {
                                             // 見送った最新の確定を、進行中記録の解放時に反映する。
                                             published.pending = Some(PendingMirror {
                                                 target: tid.clone(),
+                                                nav: Arc::clone(&nav),
+                                                generation: c.generation,
                                                 result: Arc::clone(r),
                                             });
                                         } else if let Ok(g) = app_nav.begin_navigation()
@@ -519,7 +550,12 @@ impl CommandHandler for PageNavigate {
                 None => {
                     // 世代払い出しより前に進行中を記録し、ターゲット遷移のミラーと調停する。
                     // 記録は結果の公開（下の `published` 更新）が済むまで保持する。
-                    _flight = Some(BrowserFlight::enter(&self.published, app_nav));
+                    _flight = Some(BrowserFlight::enter(
+                        &self.published,
+                        app_nav,
+                        ctx.state.registry(),
+                        &self.gate,
+                    ));
                     let out = navigate_gated(&self.fetcher, app_nav, url, &self.gate).await?;
                     // ブラウザレベル遷移も確定順（`seq`）の管理に含める。実際に確定し、かつ公開済みより
                     // 新しい場合に限り、共有状態をどのターゲットのミラーでもないものとして記録する。
@@ -1497,7 +1533,12 @@ mod tests {
                 Box::new(SharedHandler(Arc::clone(&h))),
             )])
             .unwrap();
-            let flight = BrowserFlight::enter(&h.published, st.app_state().navigation());
+            let flight = BrowserFlight::enter(
+                &h.published,
+                st.app_state().navigation(),
+                st.registry(),
+                &h.gate,
+            );
             for (id, sid, body) in [(1, &sa, "x"), (2, &sb, "y")] {
                 let u = format!("http://127.0.0.1:{}/", serve("200 OK", body));
                 let req = json!({"id": id, "method": "Page.navigate",
@@ -1511,6 +1552,52 @@ mod tests {
             assert_eq!(p.mirrored.as_ref().map(|(t, _)| t), Some(&tb));
             assert!(p.pending.is_none());
             assert_eq!(st.app_state().navigation().latest().unwrap().html(), "y");
+        }
+
+        /// 保留中の確定は、解放時にターゲットが閉じられていれば、または同一ターゲットの後続遷移で
+        /// 無効化されていれば共有状態へ反映しない（TASK-42.3・`CDP-1`。レビュー指摘
+        /// 「保留した結果の反映前にターゲットの状態を再確認する」）。
+        #[tokio::test]
+        async fn cdp1_page_navigate_pending_mirror_skipped_when_target_closed_or_superseded() {
+            use crate::target::TargetKind;
+            for close in [true, false] {
+                let dir = TempDir::new();
+                let st = state(&dir);
+                let ta = st
+                    .registry()
+                    .create_target(TargetKind::Page, "about:blank")
+                    .unwrap();
+                let sa = st.registry().attach(&ta).unwrap();
+                let h = Arc::new(
+                    PageNavigate::new(FetchOptions::new().with_allow_private_network_access(true))
+                        .unwrap(),
+                );
+                let d = Dispatcher::from_handlers(vec![(
+                    "Page.navigate",
+                    Box::new(SharedHandler(Arc::clone(&h))),
+                )])
+                .unwrap();
+                let flight = BrowserFlight::enter(
+                    &h.published,
+                    st.app_state().navigation(),
+                    st.registry(),
+                    &h.gate,
+                );
+                let u = format!("http://127.0.0.1:{}/", serve("200 OK", "x"));
+                let req = json!({"id": 1, "method": "Page.navigate",
+                    "sessionId": sa.as_str(), "params": {"url": u}});
+                d.dispatch(&st, &req.to_string()).await;
+                assert!(h.published.lock().unwrap().pending.is_some());
+                if close {
+                    st.registry().close_target(&ta).unwrap();
+                } else {
+                    let nav = st.navigations().get_or_create(st.registry(), &ta);
+                    nav.begin_navigation().unwrap();
+                }
+                drop(flight);
+                assert!(st.app_state().navigation().latest().is_none());
+                assert!(h.published.lock().unwrap().mirrored.is_none());
+            }
         }
 
         /// ターゲットレベルのコミットで `seq` だけが進んでいても、共有状態の世代が一致する
