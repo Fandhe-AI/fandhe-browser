@@ -558,6 +558,27 @@ check-binary-size: ## feature 無効（既定）のリリースバイナリサ�
 		--limit "$(BINARY_SIZE_LIMIT_BYTES)"
 
 # --------------------------------------------------
+# JS エンジン構成別リリースバイナリサイズ計測（TASK-31.1・Issue #469・JS-3・PERF-1。
+# harness/binary-size/README.md 参照）
+# --------------------------------------------------
+
+# 計測のみでゲートではない（閾値判定は #470）。V8 を含むリリースビルドを 3 回
+# 行うためコストが大きく、`ci:` の依存には追加しない（check-binary-size と同じ判断）。
+# JS_BINARY_SIZE_STRIP を空でない値にすると strip=symbols で計測する。
+JS_BINARY_SIZE_STRIP ?=
+
+.PHONY: measure-js-binary-size
+measure-js-binary-size: ## JS エンジン構成別（既定 V8 / 軽量 boa / エンジンなし）のリリースバイナリサイズを計測する（TASK-31.1・JS-3・PERF-1）
+	@command -v jq >/dev/null 2>&1 || { \
+		echo "NG: jq が未導入のため measure-js-binary-size を実行できません" >&2; \
+		exit 1; \
+	}
+	bash harness/binary-size/measure-js-engine-configs-self-test.sh
+	bash harness/binary-size/measure-js-engine-configs.sh \
+		--package "$(BINARY_SIZE_PACKAGE)" \
+		$(if $(JS_BINARY_SIZE_STRIP),--strip)
+
+# --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
 # --------------------------------------------------
 
