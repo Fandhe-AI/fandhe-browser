@@ -29,7 +29,10 @@ is_public_ipv4() {
   if [ "$a" -eq 169 ] && [ "$b" -eq 254 ]; then return 1; fi
   if [ "$a" -eq 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ]; then return 1; fi
   if [ "$a" -eq 192 ] && [ "$b" -eq 168 ]; then return 1; fi
+  # 192.0.0.0/24（IETF プロトコル割当。192.0.0.8 等の特殊用途を含む）と 192.0.2.0/24（ドキュメント用）
   if [ "$a" -eq 192 ] && [ "$b" -eq 0 ] && { [ "$c" -eq 0 ] || [ "$c" -eq 2 ]; }; then return 1; fi
+  # 192.88.99.0/24（6to4 リレーエニーキャスト。廃止済みの特殊用途）
+  if [ "$a" -eq 192 ] && [ "$b" -eq 88 ] && [ "$c" -eq 99 ]; then return 1; fi
   if [ "$a" -eq 198 ] && { [ "$b" -eq 18 ] || [ "$b" -eq 19 ]; }; then return 1; fi
   if [ "$a" -eq 198 ] && [ "$b" -eq 51 ] && [ "$c" -eq 100 ]; then return 1; fi
   if [ "$a" -eq 203 ] && [ "$b" -eq 0 ] && [ "$c" -eq 113 ]; then return 1; fi
@@ -38,13 +41,22 @@ is_public_ipv4() {
 
 # is_public_ip <addr>
 #   IPv4 は is_public_ipv4。IPv6 はグローバルユニキャスト（2000::/3）のみ許可し、
-#   ドキュメント用（2001:db8::/32）・6to4（2002::/16）は拒否。IPv4 射影（::ffff:a.b.c.d）は IPv4 として判定する。
+#   ドキュメント用（2001:db8::/32・3fff::/20）・6to4（2002::/16）・IETF プロトコル割当（2001::/23）は拒否。IPv4 射影（::ffff:a.b.c.d）は IPv4 として判定する。
 is_public_ip() {
-  local ip
+  local ip g
   ip="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
   case "$ip" in
     ::ffff:*.*) is_public_ipv4 "${ip#::ffff:}" ;;
     2001:db8:* | 2001:0db8:* | 2002:*) return 1 ;;
+    2001:* | 3fff:*)
+      # 2001::/23（IETF プロトコル割当。Teredo 2001::/32・ORCHID 等の特殊用途を含む）と
+      # 3fff::/20（ドキュメント用）は 2 番目のグループの値で判定して拒否する
+      g="${ip#*:}"; g="${g%%:*}"; g=$((16#${g:-0}))
+      case "$ip" in
+        2001:*) [ "$g" -lt 512 ] && return 1 ;;
+        *) [ "$g" -lt 4096 ] && return 1 ;;
+      esac
+      return 0 ;;
     [23][0-9a-f][0-9a-f][0-9a-f]:*) return 0 ;;
     *:*) return 1 ;;
     *) is_public_ipv4 "$ip" ;;

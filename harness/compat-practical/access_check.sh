@@ -214,7 +214,9 @@ fetch_site() {
 REACHABLE=0
 # bash 組み込みの SECONDS で全体期限を測る。ここから計時を始める
 SECONDS=0
-while IFS=$'\t' read -r id cat url; do
+# @tsv はバックスラッシュ等をエスケープし read -r が復元しないため、スキーマで制御文字を除いた
+# フィールドを US（0x1f）区切りで渡して値を変えない（url に 0x1f は含まれない）
+while IFS=$'\x1f' read -r id cat url; do
   fetch_site "$url"
   reach=false
   if [ "$F_RC" -eq 0 ] && [ -z "$F_BLOCKED" ] && [ "$F_CODE" -ge 200 ] && [ "$F_CODE" -lt 400 ]; then
@@ -225,7 +227,7 @@ while IFS=$'\t' read -r id cat url; do
     --argjson ms "$F_MS" --argjson reach "$reach" --arg bl "$F_BLOCKED" \
     '{type:"result",id:$id,cat:$cat,url:$url,http_status:$st,reachable:$reach,curl_exit:$rc,elapsed_ms:$ms,blocked:(if $bl=="" then null else $bl end)}' >>"$TMP"
   echo "[$id] status=$F_CODE reachable=$reach${F_BLOCKED:+ blocked=$F_BLOCKED}"
-done < <(jq -r '.[] | [.id, .cat, .url] | @tsv' "$TASKS")
+done < <(jq -r '.[] | [.id, .cat, .url] | join("\u001f")' "$TASKS")
 
 mv -f "$TMP" "$OUT" || { echo "error: cannot write $OUT" >&2; exit 1; }
 trap - EXIT

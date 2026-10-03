@@ -190,6 +190,16 @@ expect_exit "url_check rejects backslash userinfo" 1 url_check "https://example.
 expect_exit "url_check uppercase host ok" 0 url_check "https://EXAMPLE.com:443/a?b#c"
 expect_eq "$(url_host "https://EXAMPLE.com:443/a")" "example.com" "url_host lowercases"
 expect_eq "$(url_host "https://example.com./")" "example.com." "url_host keeps trailing dot"
+# 特殊用途アドレスは公開扱いにしない（P0）
+for ip in 192.0.0.8 192.0.0.1 192.0.0.255 192.88.99.1 255.255.255.255 240.0.0.1 198.51.100.7; do
+  expect_exit "is_public_ipv4 rejects $ip" 1 is_public_ipv4 "$ip"
+done
+for ip in 2001::1 2001:0:4136:e378::1 2001:1::1 2001:1ff::1 2001:10::1 3fff::1 3fff:fff::1 2001:DB8::1; do
+  expect_exit "is_public_ip rejects $ip" 1 is_public_ip "$ip"
+done
+for ip in 192.0.1.1 192.88.98.1 2001:200::1 2001:4860:4860::8888 3fff:1000::1 2606:4700::1111; do
+  expect_exit "is_public_ip accepts $ip" 0 is_public_ip "$ip"
+done
 expect_exit "is_public_ip 8.8.8.8" 0 is_public_ip 8.8.8.8
 expect_exit "is_public_ip 172.16.0.1" 1 is_public_ip 172.16.0.1
 expect_exit "is_public_ip 172.32.0.1" 0 is_public_ip 172.32.0.1
@@ -280,6 +290,13 @@ write_tasks one '[{"id":"o1","cat":"static","url":"https://example.com/","select
 : >"$LOG"
 expect_exit "dns consumes total deadline" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_RESOLVE_DELAY=2 bash "$CHECK" --tasks "$WORK/one.json" --total-timeout 3 --out "$WORK/dnsused.jsonl"
 expect_eq "$(grep -c -- '--max-time 3' "$LOG" || true)" "0" "dns consumed deadline: max-time is recomputed after resolve"
+
+# タスク URL のバックスラッシュを変えずに取得・記録する（P1: @tsv エスケープの復元漏れ）
+write_tasks bsl '[{"id":"b1","cat":"static","url":"https://example.com/a\\b\\\\c","selector":"h1","kind":"text"}]'
+: >"$LOG"
+expect_exit "backslash url intact" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" bash "$CHECK" --tasks "$WORK/bsl.json" --out "$WORK/bsl.jsonl"
+expect_eq "$(jq -r 'select(.id=="b1") | .url' "$WORK/bsl.jsonl")" 'https://example.com/a\b\\c' "backslash url recorded as defined"
+expect_contains "$(cat "$LOG")" 'https://example.com/a\b\\c' "backslash url passed to curl as defined"
 
 # getent / dscacheutil が無い環境（Windows の Bash 環境）では powershell で解決する。
 # Linux / macOS では getent / dscacheutil が先に選ばれるため PATH をスタブだけに絞る。Windows（Git Bash）では
