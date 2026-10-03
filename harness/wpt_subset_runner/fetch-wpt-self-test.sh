@@ -71,5 +71,29 @@ git init -q "${work}"
 mkdir -p "${work}/wpt/.git"
 expect_reject "non-toplevel directory is rejected" "${work}" "not the top level"
 
+# 8. 公式 origin でも、無視対象・未追跡ファイルが残るクローンは拒否する
+#    （取得より前に失敗するためネットワークへ接続しない）。
+OFFICIAL="https://github.com/web-platform-tests/wpt.git"
+work="${TMP}/ignored"
+mkdir -p "${work}/wpt/resources"
+git init -q "${work}/wpt"
+git -C "${work}/wpt" remote add origin "${OFFICIAL}"
+printf 'resources/evil.js\n' >"${work}/wpt/.git/info/exclude"
+printf 'evil()\n' >"${work}/wpt/resources/evil.js"
+expect_reject "ignored file is rejected" "${work}" "ignored files"
+work="${TMP}/untracked"
+mkdir -p "${work}/wpt/resources"
+git init -q "${work}/wpt"
+git -C "${work}/wpt" remote add origin "${OFFICIAL}"
+printf 'evil()\n' >"${work}/wpt/resources/evil.js"
+expect_reject "untracked file is rejected" "${work}" "ignored files"
+
+work="${TMP}/rewrite"
+mkdir -p "${work}/wpt"
+git init -q "${work}/wpt"
+git -C "${work}/wpt" remote add origin "${OFFICIAL}"
+git -C "${work}/wpt" config "url.https://example.invalid/.insteadOf" "https://github.com/"
+expect_reject "url rewrite rule is rejected" "${work}" "url rewrite rules"
+
 echo "${CASES} cases, ${FAILURES} failures"
 [ "${FAILURES}" -eq 0 ]

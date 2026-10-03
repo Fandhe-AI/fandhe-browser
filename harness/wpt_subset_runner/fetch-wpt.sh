@@ -123,11 +123,23 @@ done <<<"${files_out}"
 #   - WORK_DIR・WPT_DIR・WPT_DIR/.git が symlink でなく実体のディレクトリ
 #     （`.git` がファイル＝gitdir 参照の場合も、外部の gitdir を指し得るため拒否する）
 #   - WPT_DIR 自身がリポジトリのトップレベル（親リポジトリの一部ではない）
-#   - origin の URL（insteadOf 展開前・後とも）が公式 WPT_URL と完全一致
+#   - origin の URL（.git/config の生の値）が公式 WPT_URL と完全一致し、url.* の書き換え設定が無い
 # 再利用するクローンの .git/config に仕込まれたコマンド（fsmonitor・hooks）を実行しないよう、
 # WPT_DIR に対する git 呼び出しは常に無効化オプション付きで行う。
 git_wpt() {
-  git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "${WPT_DIR}" "$@"
+  git -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+    -c core.excludesFile=/dev/null -C "${WPT_DIR}" "$@"
+}
+
+# 追跡ファイルの変更・未追跡ファイルに加え、無視対象（.gitignore・.git/info/exclude・
+# グローバル ignore）のファイルも検出して拒否する。`--porcelain` 単体は無視対象を列挙せず、
+# 固定リビジョンに属さない JS が resources/ 等に残っていても清潔と誤判定するため
+# `--ignored=matching` を付け、ユーザー環境の ignore 設定に依存しないよう excludesFile を無効化する。
+assert_clean() {
+  local out
+  out="$(git_wpt status --porcelain --untracked-files=all \
+    --ignored=matching)" || die "git status failed"
+  [ -z "${out}" ] || die "${WPT_DIR} has local, untracked or ignored files; remove it and re-run for a fresh checkout"
 }
 
 [ ! -L "${WORK_DIR}" ] || die "${WORK_DIR} is a symlink; refusing to use it"
@@ -141,10 +153,15 @@ if [ -e "${WPT_DIR}" ]; then
   top="$(git_wpt rev-parse --show-toplevel 2>/dev/null || true)"
   [ -n "${top}" ] && [ "$(cd "${top}" && pwd -P)" = "$(cd "${WPT_DIR}" && pwd -P)" ] \
     || die "${WPT_DIR} is not the top level of its own git repository"
-  origin_raw="$(git_wpt config --get remote.origin.url 2>/dev/null || true)"
-  origin_resolved="$(git_wpt remote get-url origin 2>/dev/null || true)"
-  [ "${origin_raw}" = "${WPT_URL}" ] && [ "${origin_resolved}" = "${WPT_URL}" ] \
+  origin_raw="$(git_wpt config --local --get remote.origin.url 2>/dev/null || true)"
+  [ "${origin_raw}" = "${WPT_URL}" ] \
     || die "origin of ${WPT_DIR} is not ${WPT_URL}; remove it and re-run for a fresh clone"
+  # クローン内の `url.<base>.insteadOf` は URL を別ホストへ書き換え得るため拒否する
+  # （ユーザーのグローバル設定の insteadOf は信頼するため、--local のみ検査する）。
+  [ -z "$(git_wpt config --local --get-regexp '^url\.' 2>/dev/null || true)" ] \
+    || die "${WPT_DIR} defines url rewrite rules (url.*); remove it and re-run for a fresh clone"
+  # 取得・チェックアウトの前にも検査する（無視対象を残したクローンを触らず拒否する）。
+  assert_clean
 else
   git clone --filter=blob:none --no-checkout --sparse -- "${WPT_URL}" "${WPT_DIR}" \
     || die "git clone failed"
@@ -164,8 +181,7 @@ git_wpt checkout --detach "${REV}" || die "git checkout ${REV} failed"
 # HEAD が固定リビジョンであり、作業ツリーが清潔であることを確認し、違えば失敗させる
 # （手動で wpt-work を削除して取得し直す）。
 [ "$(git_wpt rev-parse --verify HEAD)" = "${REV}" ] || die "HEAD is not ${REV}"
-status_out="$(git_wpt status --porcelain --untracked-files=all)" || die "git status failed"
-[ -z "${status_out}" ] || die "${WPT_DIR} has local changes; remove it and re-run for a fresh checkout"
+assert_clean
 
 cp "${TSV_TMP}" "${WORK_DIR}/subset.tsv"
 echo "WPT ${REV} ready at ${WPT_DIR}; wrote ${WORK_DIR}/subset.tsv"
