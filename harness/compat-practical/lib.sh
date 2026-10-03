@@ -52,20 +52,25 @@ is_public_ip() {
 }
 
 # url_host <url>
-#   https URL の authority から小文字のホスト名（末尾ドット・ポート除去）を stdout へ出す。
+#   https URL の authority から小文字のホスト名（ポート除去）を stdout へ出す。末尾ドットは除かない
+#   （除くと検証したホスト名と curl の接続先ホスト名が食い違い、--resolve の固定を迂回されるため）。
 url_host() {
   local rest authority host
   rest="${1#https://}"
   authority="${rest%%[/?#]*}"
   host="${authority%%:*}"
   host="$(printf '%s' "$host" | tr 'A-Z' 'a-z')"
-  printf '%s\n' "${host%.}"
+  printf '%s\n' "$host"
 }
 
 # url_check <url>
 #   取得してよい URL かを検証する。許可なら return 0。拒否なら理由（英語）を stdout へ出して return 1。
 #   https のみ・userinfo なし・ポート 443 のみ・IPv6 リテラル不可・localhost 系/内部ドメイン不可・
 #   数値風ホスト（IP リテラル）は公開 IPv4 の厳密な 10 進表記に限る（SSRF 対策。SEC 系）。
+#   ホスト名は小文字化後 ASCII の DNS ラベル（英数字・ハイフン、ドット区切り）に限る。末尾ドット・
+#   連続ドット・パーセントエンコード・非 ASCII（IDN）・バックスラッシュ等は curl が正規化して別の
+#   ホスト名へ解釈し得る（--resolve の固定キーとずれる）ため拒否し、「検証したホスト名」と
+#   「curl が実際に接続するホスト名」が常に一致することを保証する。
 #   DNS 解決後のアドレス検証は呼び出し側（access_check.sh）が行う。
 url_check() {
   local url="$1" rest authority host port
@@ -86,6 +91,10 @@ url_check() {
   fi
   host="$(url_host "$url")"
   [ -n "$host" ] || { echo "empty host"; return 1; }
+  if ! [[ "$host" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$ ]] \
+    || [ "${#host}" -gt 253 ]; then
+    echo "host name is not a canonical ASCII DNS name"; return 1
+  fi
   case "$host" in
     localhost | *.localhost | *.local | *.internal | *.localdomain | *.lan | *.home.arpa)
       echo "internal host name is not allowed"; return 1 ;;
@@ -96,7 +105,8 @@ url_check() {
   return 0
 }
 
-# resolve_host_ips <host>
+# resolve_host_ips <host> [<limit_sec>]
+#   <limit_sec> 指定時は解決に秒数の上限をかけ、超過したら何も出さず return 0（呼び出し側が拒否する）。
 #   ホストの IP を 1 行 1 件で stdout へ出す。解決手段は getent（Linux）→ dscacheutil（macOS）→
 #   powershell の [System.Net.Dns]（Windows の Bash 環境。getent / dscacheutil が無いため）の順。
 #   いずれも無い・解決できないときは何も出さず、呼び出し側（access_check.sh）が接続先を固定できない
@@ -106,6 +116,35 @@ url_check() {
 #   `|| true` で吸収し、常に return 0 で「何も出さない」ことで呼び出し側の fail-closed 拒否へ繋ぐ。
 #   併せてホスト名を DNS ラベル文字（英数字・ハイフン・ドット）に限って検証する。
 resolve_host_ips() {
+  local out pid start limit="${2:-}"
+  if [ -z "$limit" ]; then
+    _resolve_host_ips_raw "$1"
+    return 0
+  fi
+  # 解決コマンド（getent / dscacheutil / PowerShell）は OS により上限指定の手段が異なるため、
+  # 外部の timeout コマンドに頼らず bash 側で期限監視する（3 OS 共通）。期限超過なら何も出さない
+  out="$(mktemp)" || return 0
+  _resolve_host_ips_raw "$1" >"$out" 2>/dev/null &
+  pid=$!
+  start=$SECONDS
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ $((SECONDS - start)) -ge "$limit" ]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      rm -f "$out"
+      return 0
+    fi
+    sleep 0.1
+  done
+  wait "$pid" 2>/dev/null || true
+  cat "$out"
+  rm -f "$out"
+  return 0
+}
+
+# _resolve_host_ips_raw <host>
+#   resolve_host_ips の本体（期限なし）。OS ごとの解決手段の分岐だけを持つ。
+_resolve_host_ips_raw() {
   local ps
   if command -v getent >/dev/null 2>&1; then
     getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u || true

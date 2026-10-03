@@ -127,6 +127,7 @@ chmod +x "$STUB_DIR/curl"
 cat >"$STUB_DIR/getent" <<'STUB'
 #!/usr/bin/env bash
 [ -z "${STUB_RESOLVE_NONE:-}" ] || exit 0
+[ -z "${STUB_RESOLVE_SLEEP:-}" ] || sleep "$STUB_RESOLVE_SLEEP"
 printf '%s      STREAM %s\n' "${STUB_RESOLVE_IP:-93.184.216.34}" "${2:-}"
 STUB
 chmod +x "$STUB_DIR/getent"
@@ -176,6 +177,17 @@ expect_contains "$(url_check "https://0177.0.0.1/" || true)" "non-public" "url_c
 expect_contains "$(url_check "https://[::1]/" || true)" "IPv6 literal" "url_check ipv6"
 expect_contains "$(url_check "https://user@example.com/" || true)" "userinfo" "url_check userinfo"
 expect_contains "$(url_check "https://example.com:8443/" || true)" "port is not 443" "url_check port"
+# 検証したホスト名と curl の接続先ホスト名が一致しない URL は拒否する（P0: DNS 固定の迂回防止。SEC 系）
+for u in "https://example.com./" "https://example.com.:443/" "https://EXAMPLE.COM./x" "https://example..com/" \
+  "https://exa%6dple.com/" "https://exa%2Emple.com/" "https://例え.jp/" \
+  "https://-example.com/" "https://example_x.com/" "https://1.2.3.4./"; do
+  expect_contains "$(url_check "$u" || true)" "canonical ASCII DNS name" "url_check rejects non-canonical host $u"
+done
+expect_exit "url_check rejects empty port" 1 url_check "https://example.com:/"
+expect_exit "url_check rejects backslash userinfo" 1 url_check "https://example.com\\@evil.com/"
+expect_exit "url_check uppercase host ok" 0 url_check "https://EXAMPLE.com:443/a?b#c"
+expect_eq "$(url_host "https://EXAMPLE.com:443/a")" "example.com" "url_host lowercases"
+expect_eq "$(url_host "https://example.com./")" "example.com." "url_host keeps trailing dot"
 expect_exit "is_public_ip 8.8.8.8" 0 is_public_ip 8.8.8.8
 expect_exit "is_public_ip 172.16.0.1" 1 is_public_ip 172.16.0.1
 expect_exit "is_public_ip 172.32.0.1" 0 is_public_ip 172.32.0.1
@@ -233,6 +245,29 @@ expect_exit "unresolvable host rejected" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="
 expect_contains "$LAST_OUTPUT" "reachable=0/2" "unresolvable summary"
 expect_eq "$(wc -l <"$LOG" | tr -d ' ')" "0" "unresolvable: curl not invoked"
 expect_eq "$(jq -r 'select(.id=="x1") | .blocked' "$WORK/nores.jsonl")" "host could not be resolved for address pinning" "unresolvable blocked reason"
+
+# 末尾ドット付きホストは curl を呼ばず取得前に拒否する（--resolve の固定キーと接続先ホストのずれを作らない）
+write_tasks dot '[{"id":"d1","cat":"static","url":"https://example.com./","selector":"h1","kind":"text"}]'
+: >"$LOG"
+expect_exit "trailing dot host rejected" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" bash "$CHECK" --tasks "$WORK/dot.json" --out "$WORK/dot.jsonl"
+expect_eq "$(wc -l <"$LOG" | tr -d ' ')" "0" "trailing dot: curl not invoked"
+expect_eq "$(jq -r 'select(.id=="d1") | .blocked' "$WORK/dot.jsonl")" "host name is not a canonical ASCII DNS name" "trailing dot blocked reason"
+# リダイレクト先の末尾ドットも同様に拒否する
+: >"$LOG"
+expect_exit "redirect to trailing dot" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_CODE=302 STUB_REDIRECT=https://example.net./ bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/dot2.jsonl"
+expect_eq "$(jq -r 'select(.id=="x1") | .blocked' "$WORK/dot2.jsonl")" "host name is not a canonical ASCII DNS name" "redirect trailing dot blocked"
+expect_eq "$(wc -l <"$LOG" | tr -d ' ')" "2" "redirect trailing dot: only first hop fetched per task"
+
+# DNS 解決にも期限をかける（P1）: 解決が詰まっても --total-timeout で打ち切り、以降の取得を止めて記録する
+: >"$LOG"
+dns_start=$SECONDS
+expect_exit "slow dns total deadline" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_RESOLVE_SLEEP=20 bash "$CHECK" --tasks "$WORK/net.json" --total-timeout 1 --out "$WORK/slowdns.jsonl"
+[ $((SECONDS - dns_start)) -lt 10 ] || { echo "FAIL [slow dns bounded]: took $((SECONDS - dns_start))s" >&2; FAILURES=$((FAILURES + 1)); }
+CASES=$((CASES + 1))
+expect_eq "$(wc -l <"$LOG" | tr -d ' ')" "0" "slow dns: curl not invoked"
+expect_eq "$(jq -r 'select(.id=="x2") | .blocked' "$WORK/slowdns.jsonl")" "total time limit exceeded" "slow dns total deadline blocked reason"
+expect_eq "$(jq -s 'length' "$WORK/slowdns.jsonl")" "3" "slow dns: all records written"
+expect_eq "$(env PATH="$STUB_DIR:$PATH" STUB_RESOLVE_SLEEP=20 bash -c ". '$SCRIPT_DIR/lib.sh'; resolve_host_ips example.com 1")" "" "resolve_host_ips honors limit"
 
 # getent / dscacheutil が無い環境（Windows の Bash 環境）では powershell で解決する。
 # Linux / macOS では getent / dscacheutil が先に選ばれるため PATH をスタブだけに絞る。Windows（Git Bash）では

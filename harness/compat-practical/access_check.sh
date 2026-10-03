@@ -155,7 +155,8 @@ fetch_site() {
     host="$(url_host "$cur")"
     pins=()
     if ! [[ "$host" =~ ^[0-9.]+$ ]]; then
-      ips="$(resolve_host_ips "$host")"
+      # DNS 解決にも全体期限の残り時間を上限としてかける（getent 等は curl の --max-time の対象外）
+      ips="$(resolve_host_ips "$host" "$max_time")"
       for ip in $ips; do
         if ! is_public_ip "$ip"; then
           F_BLOCKED="host resolves to a non-public address"; F_CODE=0; return 0
@@ -167,6 +168,9 @@ fetch_site() {
       done
       # 固定できるアドレスが無いホストは再解決による接続先すり替えを防げないため取得前に拒否する
       if [ "${#pins[@]}" -eq 0 ]; then
+        if [ "$((TOTAL_TIMEOUT - SECONDS))" -le 0 ]; then
+          F_BLOCKED="total time limit exceeded"; F_CODE=0; F_RC=28; return 0
+        fi
         F_BLOCKED="host could not be resolved for address pinning"; F_CODE=0; return 0
       fi
     fi

@@ -41,7 +41,7 @@ bash harness/compat-practical/access_check.sh [--tasks P] [--out P] [--timeout S
 - 依存は bash・jq・curl のみ。実ネットワークへ出るため CI では実行しない（CI は `self-test.sh` と `--validate-only`）
 - `--timeout` は 1〜60 の整数（既定 8。curl 1 回あたりの上限）。`--total-timeout` は 1〜3600 の整数（既定 600）で全タスク合計の期限。超過後のタスクは取得せず `blocked: "total time limit exceeded"`・`curl_exit: 28` で記録を確定する（各 curl の `--max-time` も残り時間で切り詰める）。リダイレクトは自前で 5 回まで追う（`curl -L` は使わない）、https のみ（`--proto '=https' --proto-redir '=https'`）
 - UA は偽装しない識別子 `fandhe-browser-harness/0.1 (+https://github.com/Fandhe-AI/fandhe-browser)`。anti-bot 回避はしない
-- SSRF 対策（SEC 系）: 各ホップで `lib.sh` の `url_check`（https のみ・userinfo なし・ポート 443 のみ・IPv6 リテラル不可・localhost 系/内部ドメイン不可・IP リテラルは公開 IPv4 の厳密な 10 進表記のみ）と、DNS 解決後アドレスの公開判定（getent / dscacheutil / Windows は powershell の `[System.Net.Dns]`（ホスト名は環境変数で渡す）で解決できるとき。検証済み IPv4/IPv6 を `--resolve` で固定。解決できない・固定できないホストは取得前に拒否）を行い、curl は `-q --noproxy '*'`（.curlrc・プロキシ無効）で起動し、`remote_ip` も事後検証する。tasks.json は JSON 文書がちょうど 1 個であることを検証する（空ファイル・複数文書は拒否）拒否時は curl を呼ばず（事後検証を除く）`blocked` に理由を記録し `reachable:false`
+- SSRF 対策（SEC 系）: 各ホップで `lib.sh` の `url_check`（https のみ・userinfo なし・ポート 443 のみ・IPv6 リテラル不可・localhost 系/内部ドメイン不可・IP リテラルは公開 IPv4 の厳密な 10 進表記のみ）と、ホスト名の正規形検証（小文字化後 ASCII の DNS ラベルのみ。末尾ドット・連続ドット・パーセントエンコード・IDN・バックスラッシュは拒否し、検証したホスト名と curl の接続先ホスト名を常に一致させて `--resolve` の固定を迂回させない）と、DNS 解決後アドレスの公開判定（DNS 解決にも `--timeout` と全体期限の残り時間の小さい方を上限とし、超過時は `total time limit exceeded` で記録して以降の取得を止める。getent / dscacheutil / Windows は powershell の `[System.Net.Dns]`（ホスト名は環境変数で渡す）で解決できるとき。検証済み IPv4/IPv6 を `--resolve` で固定。解決できない・固定できないホストは取得前に拒否）を行い、curl は `-q --noproxy '*'`（.curlrc・プロキシ無効）で起動し、`remote_ip` も事後検証する。tasks.json は JSON 文書がちょうど 1 個であることを検証する（空ファイル・複数文書は拒否）拒否時は curl を呼ばず（事後検証を除く）`blocked` に理由を記録し `reachable:false`
 - Windows の jq が出す CRLF は `lib.sh` の `jq` ラッパーが除去する
 - 出力は JSONL。1 行目がメタ行、以降は 1 件 1 行
 
@@ -78,4 +78,5 @@ Issue #311 でタスクを実行するには、TASK-47（`CLI-1`）の CLI サ�
 
 - 実施日: 2026-10-03 / OS: Linux
 - 結果: 22 件中 20 件が到達可（a6 StackOverflow・d4 W3Schools は HTTP 403）
+- 出力形式の版: 同梱の `results/access_check.jsonl` のメタ行は `total_timeout_sec` 追加前の形式（版 1）で測定したもの。現行スクリプトの出力（上記の契約）には `total_timeout_sec` が加わる。再計測時に置き換える
 - 到達可否はネットワーク環境と時期で変わる。再計測したら実施日と OS をここへ追記する
