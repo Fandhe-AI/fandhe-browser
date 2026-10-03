@@ -96,6 +96,13 @@ if [ "$(git -C "${WPT_DIR}" rev-parse --verify HEAD 2>/dev/null || true)" != "${
   git -C "${WPT_DIR}" fetch --filter=blob:none origin "${REV}" || die "git fetch ${REV} failed"
 fi
 git -C "${WPT_DIR}" checkout --detach "${REV}" || die "git checkout ${REV} failed"
+# 既存クローンを再利用する場合、追跡ファイルの変更・未追跡ファイルが残っていると、
+# 固定リビジョンと異なる testharness.js やテストを実行できてしまう。チェックアウト後に
+# HEAD が固定リビジョンであり、作業ツリーが清潔であることを確認し、違えば失敗させる
+# （手動で wpt-work を削除して取得し直す）。
+[ "$(git -C "${WPT_DIR}" rev-parse --verify HEAD)" = "${REV}" ] || die "HEAD is not ${REV}"
+status_out="$(git -C "${WPT_DIR}" status --porcelain --untracked-files=all)" || die "git status failed"
+[ -z "${status_out}" ] || die "${WPT_DIR} has local changes; remove it and re-run for a fresh checkout"
 
 cp "${TSV_TMP}" "${WORK_DIR}/subset.tsv"
 echo "WPT ${REV} ready at ${WPT_DIR}; wrote ${WORK_DIR}/subset.tsv"
