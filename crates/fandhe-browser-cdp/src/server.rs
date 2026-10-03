@@ -29,6 +29,7 @@ use fandhe_browser_core::AppState;
 
 use crate::discovery::{self, Authority, BROWSER_WS_PATH_PATTERN, HostError};
 use crate::dom::IssuedDocuments;
+use crate::method_log::{ReceivedMethodLog, ReceivedMethodsSnapshot};
 use crate::navigation::TargetNavigations;
 use crate::protocol::Dispatcher;
 use crate::target::{BrowserId, TargetRegistry};
@@ -49,6 +50,8 @@ pub struct CdpState {
     navigations: TargetNavigations,
     /// `DOM.getDocument` が nodeId を払い出した文書の記録（`DOM.querySelector` が世代検証に使う。`CDP-1`）。
     dom_issued: IssuedDocuments,
+    /// 受信メソッド名の集計（`Dispatcher::dispatch_on` が書く。`CDP-6`）。
+    method_log: ReceivedMethodLog,
 }
 
 impl CdpState {
@@ -66,7 +69,21 @@ impl CdpState {
             registry: TargetRegistry::new(),
             navigations: TargetNavigations::new(),
             dom_issued: IssuedDocuments::new(),
+            method_log: ReceivedMethodLog::new(),
         }
+    }
+
+    /// 受信メソッド集計（`Dispatcher::dispatch_on` が記録する）。
+    pub(crate) fn method_log(&self) -> &ReceivedMethodLog {
+        &self.method_log
+    }
+
+    /// 受信したメソッド名の件数スナップショット（`CDP-6` の受信ログ。読み取り専用）。
+    ///
+    /// 本番の出力先（ファイル・構造化ログ）は #221（TASK-10.3）で決める。未実装メソッドは
+    /// `unimplemented` に数えられ、必須メソッドの洗い出しに使える。
+    pub fn received_methods(&self) -> ReceivedMethodsSnapshot {
+        self.method_log.snapshot()
     }
 
     /// 内包する core の共通状態。

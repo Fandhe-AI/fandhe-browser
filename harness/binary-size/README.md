@@ -148,6 +148,63 @@ branch protection の必須チェックに加える場合は OS 数分
 が大きいため（判断済み）。CI での継続的なゲートは上記 `binary-size` ジョブが
 担い、ローカルでは必要に応じて `make check-binary-size` を個別に実行する。
 
+## JS エンジン構成別サイズ計測（TASK-31.1・#469）
+
+`measure-js-engine-configs.sh` が JS エンジン構成ごとのリリースバイナリサイズを
+計測する（`JS-1` ビルド構成表・`JS-3`・`PERF-1`・MS-3）。出力は後続の Issue #470
+（TASK-31.2・測定レポート）が読む。**計測のみでゲートではない**（閾値判定は
+Issue #470、既定ビルドの上限ゲートは上記 `check-binary-size.sh`）。
+
+| config | cargo 引数 | features ラベル | 期待エンジン |
+| ------ | ---------- | --------------- | ------------ |
+| `default` | （なし） | `default` | `v8` |
+| `boa` | `--no-default-features --features js-boa` | `no-default-js-boa` | `boa` |
+| `none` | `--no-default-features` | `no-default` | `none` |
+
+### 出力形式の契約
+
+構成ごとに bin target 1 つあたり 1 行を標準出力へ出す（Markdown 表等の補助出力は
+契約外）。
+
+```text
+js-binary-size: config=<default|boa|none> features=<label> engines=<v8|boa|none> os=<uname -s> host=<triple> target=<triple> rustc=<release> rustc_commit=<hash> cargo=<release> profile=release strip=<none|symbols> package=<name> bin=<name> bytes=<N> mb=<X.XX>
+```
+
+- `mb` は 10 進（10^6 bytes）で小数第 2 位まで
+- `host` と `target` は常に `rustc -vV` の host（`--target` は渡さない。各 OS の
+  ネイティブビルドのみ。クロスコンパイルは対象外）
+- `strip` は既定 `none`。`--strip`（`make ... JS_BINARY_SIZE_STRIP=1`）で
+  `CARGO_PROFILE_RELEASE_STRIP=symbols` を `cargo build` にだけ渡す（`Cargo.toml`
+  は編集しない。profile が変わるため全体の再ビルドが走る。spec の strip 後の
+  参考値と比べるための任意モード）
+- 全フィールドは `^[A-Za-z0-9._-]{1,64}$` で検証してから出力する（ワークフロー
+  コマンド誤解釈の防止）
+
+### 終了コード
+
+| exit | 意味 |
+| ---- | ---- |
+| 0 | 3 構成すべてを計測でき、陽性対照も一致した |
+| 1 | 陽性対照の不一致（feature 連鎖 cli → core → js が壊れ、期待外のエンジンが同梱された） |
+| 2 | 使用エラー・計測不能（引数不正・`cargo` / `jq` / `rustc` 未導入・build / metadata 失敗・package / bin 不在・実行ファイル 0 件） |
+
+陽性対照は `cargo build` の JSON から `v8` / `boa_engine` の lib artifact の有無を
+見て、構成と同梱エンジンの対応を確かめる。不一致でも残りの構成は計測してから
+exit 1 にする（全体像をログに残すため）。3 構成は同じ `target/release/<bin>` を
+上書きするため、ビルド直後に逐次計測する。
+
+### ローカル実行
+
+```bash
+make measure-js-binary-size                          # 自己テスト → 3 構成の計測
+make measure-js-binary-size JS_BINARY_SIZE_STRIP=1   # strip=symbols で計測
+```
+
+V8 を含むビルドは時間がかかる。`make ci` と CI には含めない（コストが大きく、
+ゲートでもないため）。3 OS での実測は #470 のレポート作成時に各 OS で手動実行する。
+macOS の bash 3.2・Windows の Git Bash 向けに bash 4 系機能は使っていないが、
+本リポジトリのローカル環境（Linux）以外での動作は未確認。
+
 ## 現状の限界
 
 - release プロファイルが `CORE-2` の前提（`opt-level = "z"`・`lto = true`・

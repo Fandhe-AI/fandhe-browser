@@ -54,12 +54,16 @@
 //! Issue #213 で承認済み）。`[js] engine`（TASK-91（91.2）・Issue #215）も
 //! 読める。`[rendering] enabled`（TASK-91（91.3）・Issue #216）も読める
 //! （未同梱ビルドでの有効化は暫定でエラー。`config` モジュール doc コメント参照）。
+//! [`cssom`] モジュールは TASK-105（105.1・#255・`CORE-5`）で公開型を追加した。
+//! パース・カスケード・computed style API は後続の sub-issue（#256〜#262）の担当で、
+//! まだ含まない。
 //!
 //! # スタブについて
 //!
 //! 未実装・簡易実装の詳細は各モジュールの `//!` を参照（`REPAIR-3`: 実装済みを
 //! 装わない）。crate 直下では対象モジュールの名前のみを挙げる。
 //!
+//! - [`cssom`]（`CORE-5`・`TASK-105`・`MS-8`。型定義のみ）
 //! - [`js_stub`]（`JS-2`・`TASK-30`・`MS-3`）
 //! - [`render::DisabledRenderer`]（`RENDER-1`・`TASK-33`/`TASK-38`・`MS-1`/`MS-4`）
 //! - [`observability::OperationRecord::to_json_line`]（`REPAIR-9`・`TASK-10（10.1）`・
@@ -68,6 +72,7 @@
 //!   テスト・簡易集計用で本番の出力先ではない）
 
 pub mod config;
+pub mod cssom;
 pub mod dom;
 pub mod error;
 pub mod fetch;
@@ -83,6 +88,7 @@ pub use config::{
     Config, ConfigError, EngineKind, IsolationStrength, JsConfig, ProfileConfig, RenderingConfig,
     bundled_engines,
 };
+pub use cssom::{Declaration, Importance, Specificity, StyleRule, Stylesheet};
 pub use dom::{
     Ancestors, Attribute, Children, Descendants, Document, Node, NodeData, NodeId, QuirksMode,
 };
