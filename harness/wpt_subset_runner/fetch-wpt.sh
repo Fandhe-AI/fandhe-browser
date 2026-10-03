@@ -124,6 +124,15 @@ STAGE="$(mktemp -d "${WORK_DIR}/.wpt-stage.XXXXXX")" || die "failed to create st
 trap 'rm -rf "${STAGE}"' EXIT
 NEW_DIR="${STAGE}/wpt"
 TSV_TMP="${STAGE}/subset.tsv"
+OUT_TSV="${WORK_DIR}/subset.tsv"
+# 出力先の種別は置き換えに着手する前に検証する（置換の途中失敗で旧データを失わないため）。
+# symlink は置換時にリンク自体を除去するため許容し、ディレクトリだけを拒否する。
+if [ ! -L "${OUT_TSV}" ] && [ -e "${OUT_TSV}" ]; then
+  [ -f "${OUT_TSV}" ] || die "${OUT_TSV} exists but is not a regular file"
+fi
+if [ ! -L "${WPT_DIR}" ] && [ -e "${WPT_DIR}" ]; then
+  [ -d "${WPT_DIR}" ] || die "${WPT_DIR} exists but is not a directory"
+fi
 
 # subset.tsv は検証済みの行だけを書く（harness は列挙値、file は valid_path）。
 files_out="$(jq -r '.subset[] | [.harness, .file] | @tsv' "${SUBSET_JSON}")" || die "failed to read .subset[]"
@@ -159,25 +168,20 @@ git_new checkout -q --detach "${REV}" || die "git checkout ${REV} failed"
 [ "$(git_new rev-parse --verify HEAD)" = "${REV}" ] || die "HEAD is not ${REV}"
 
 # 取得と検証が成功した後にだけ置き換える。置き換え先が symlink なら辿らずリンク自体を除去する
-# （mv は symlink 先のディレクトリの中へ移動してしまうため）。既存ディレクトリは退避してから
-# 差し替え、差し替えに失敗したら元へ戻す。
-if [ -L "${WPT_DIR}" ]; then
-  rm -f "${WPT_DIR}"
-elif [ -e "${WPT_DIR}" ]; then
-  [ -d "${WPT_DIR}" ] || die "${WPT_DIR} exists but is not a directory"
+# （mv は symlink 先のディレクトリの中へ移動してしまうため）。既存の wpt/・subset.tsv は
+# 退避してから差し替え、どちらかの差し替えに失敗したら両方を元へ戻す（旧データを失わない）。
+rollback() {
+  rm -rf "${WPT_DIR}"
+  [ ! -e "${STAGE}/old" ] && [ ! -L "${STAGE}/old" ] || mv "${STAGE}/old" "${WPT_DIR}"
+  [ ! -e "${STAGE}/old.tsv" ] && [ ! -L "${STAGE}/old.tsv" ] || mv "${STAGE}/old.tsv" "${OUT_TSV}"
+  die "$1"
+}
+if [ -L "${WPT_DIR}" ] || [ -e "${WPT_DIR}" ]; then
   mv "${WPT_DIR}" "${STAGE}/old" || die "failed to move aside ${WPT_DIR}"
 fi
-if ! mv "${NEW_DIR}" "${WPT_DIR}"; then
-  [ ! -e "${STAGE}/old" ] || mv "${STAGE}/old" "${WPT_DIR}"
-  die "failed to install ${WPT_DIR}"
+if [ -L "${OUT_TSV}" ] || [ -e "${OUT_TSV}" ]; then
+  mv "${OUT_TSV}" "${STAGE}/old.tsv" || rollback "failed to move aside ${OUT_TSV}"
 fi
-
-# subset.tsv も同じ手順（symlink を辿らず rename で置き換える）。
-OUT_TSV="${WORK_DIR}/subset.tsv"
-if [ -L "${OUT_TSV}" ]; then
-  rm -f "${OUT_TSV}"
-elif [ -d "${OUT_TSV}" ]; then
-  die "${OUT_TSV} is a directory"
-fi
-mv -f "${TSV_TMP}" "${OUT_TSV}" || die "failed to write ${OUT_TSV}"
+mv "${NEW_DIR}" "${WPT_DIR}" || rollback "failed to install ${WPT_DIR}"
+mv "${TSV_TMP}" "${OUT_TSV}" || rollback "failed to write ${OUT_TSV}"
 echo "WPT ${REV} ready at ${WPT_DIR}; wrote ${OUT_TSV}"

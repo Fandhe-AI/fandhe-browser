@@ -140,5 +140,32 @@ check "fetch failure: existing directory and subset.tsv preserved" \
   '[ "$(cat "${work}/wpt/marker.txt")" = "old-content" ] && [ "$(cat "${work}/subset.tsv")" = "old-tsv" ]'
 check "fetch failure: staging directory removed" '[ -z "$(ls -A "${work}" | grep "^\.wpt-stage" || true)" ]'
 
+# 7. 出力先 subset.tsv がディレクトリなら、置き換えに着手せず拒否し、既存の wpt/ を保持する。
+work="${TMP}/tsv-dir"
+mkdir -p "${work}/wpt" "${work}/subset.tsv"
+printf 'old-content\n' >"${work}/wpt/marker.txt"
+run_fetch "${work}" "${SRC_URL}"
+check "tsv is a directory: rejected, existing wpt preserved" \
+  '[ "${RUN_RC}" -eq 2 ] && [ "$(cat "${work}/wpt/marker.txt")" = "old-content" ] && [ -d "${work}/subset.tsv" ]'
+
+# 8. 置換の途中で subset.tsv の差し替えが失敗しても、旧 wpt/ と subset.tsv を復元する。
+#    mv を失敗させる PATH 上のラッパーで 2 回目以降の mv（subset.tsv の設置）を落とす。
+work="${TMP}/rollback"
+mkdir -p "${work}/wpt" "${TMP}/fakebin"
+printf 'old-content\n' >"${work}/wpt/marker.txt"
+printf 'old-tsv\n' >"${work}/subset.tsv"
+REAL_MV="$(command -v mv)"
+cat >"${TMP}/fakebin/mv" <<MV_EOF
+#!/usr/bin/env bash
+case "\$*" in
+  *"/subset.tsv "*"/subset.tsv") exit 1 ;;
+esac
+exec "${REAL_MV}" "\$@"
+MV_EOF
+chmod +x "${TMP}/fakebin/mv"
+PATH="${TMP}/fakebin:${PATH}" run_fetch "${work}" "${SRC_URL}"
+check "install failure: rolled back" \
+  '[ "${RUN_RC}" -eq 2 ] && [[ "${RUN_OUT}" == *"failed to write"* ]] && [ "$(cat "${work}/wpt/marker.txt")" = "old-content" ] && [ "$(cat "${work}/subset.tsv")" = "old-tsv" ]'
+
 echo "${CASES} cases, ${FAILURES} failures"
 [ "${FAILURES}" -eq 0 ]

@@ -89,7 +89,7 @@ bash harness/wpt_subset_runner/fetch-wpt.sh   # jq・git・ネットワークが
   `css/support/` と選定ディレクトリだけを sparse checkout する（出力先は `wpt-work/`。`WPT_WORK_DIR` で変更可）
 - 既存の `wpt-work/wpt` は一切再利用しない。毎回 `wpt-work/` 直下の一時ディレクトリへ `git init`・`fetch --depth 1`
   （固定 SHA）・sparse checkout し、取得と検証が成功した後にだけ `wpt-work/wpt` を差し替える（既存が symlink なら
-  リンク自体を除去して置換）。失敗時は一時ディレクトリを消し、既存の `wpt/`・`subset.tsv` は変更しない。
+  リンク自体を除去して置換）。失敗時（置換の途中を含む）は一時ディレクトリを消し、既存の `wpt/`・`subset.tsv` を保持または復元する。
   git はシステム・ユーザー設定を読まず、hooks・fsmonitor を無効化し、プロトコルを https に限る
   （既存クローンの `.git/config` の filter・url 書き換え等を実行しないための構造的対策）
 - `subset.tsv` は一時ファイルに書いてから rename で置換する（既存が symlink でもリンク先へ書き込まない）。
