@@ -35,6 +35,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use fandhe_browser_core::js_stub::JsRuntime;
 use fandhe_browser_core::{Config, EngineKind, ParseOptions, parse_document};
@@ -52,6 +53,26 @@ pub const MAX_SUBSET_LINE_BYTES: usize = 4 * 1024;
 pub const MAX_SUBSET_BYTES: usize = 1024 * 1024;
 /// 読み込むテスト HTML・外部スクリプト 1 ファイルの最大バイト数。
 pub const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
+
+/// 1 ファイルの実行手順（testharness.js・外部サポート・インライン）の最大件数。
+///
+/// 根拠: 実 WPT のテストは testharness.js・report・数個のヘルパ・テスト本体で通常 10 件未満。
+/// 64 件はそれを十分に上回りつつ、細工した HTML によるスクリプト大量参照の DoS を断つ
+/// （`PLUG-10`・security.md「不安全な設計」）。
+pub const MAX_PLAN_STEPS: usize = 64;
+/// 1 ファイルで評価するスクリプト本体の合計最大バイト数。
+///
+/// 根拠: 1 本の上限（[`MAX_SOURCE_BYTES`] = 1 MiB）の 8 倍。実 WPT では testharness.js
+/// （約 0.2 MiB）とヘルパの合計が 1 MiB 前後で、8 MiB なら正当なテストを落とさず、
+/// 1 MiB 級のスクリプトを [`MAX_PLAN_STEPS`] 件並べる 64 MiB 超の評価を拒否できる。
+/// js crate / core 側の入力上限は 1 回の評価単位で、ファイル全体の総量は本値で制限する。
+pub const MAX_TOTAL_SCRIPT_BYTES: u64 = 8 * MAX_SOURCE_BYTES;
+/// 1 ファイルの実行にかけられる総時間の上限。
+///
+/// 根拠: js crate が 1 回の評価を 2 秒で打ち切るため、手順の境界で確認すれば超過は
+/// 最大 2 秒。30 秒は正当なテスト（通常 1 秒未満）に十分で、[`MAX_PLAN_STEPS`] 件の全てが
+/// 2 秒を使い切る最悪ケース（128 秒）を抑える。
+pub const MAX_FILE_DURATION: Duration = Duration::from_secs(30);
 
 /// testharness.js の WPT ルート相対パス（正規化後）。
 const TESTHARNESS_PATH: &str = "resources/testharness.js";
@@ -235,16 +256,62 @@ pub struct RunOptions {
     pub wpt_root: PathBuf,
     /// 使う JS エンジン。`None` は JS 無効（[`FileOutcome::EngineUnavailable`] になる）。
     pub engine: Option<EngineKind>,
+    /// 1 ファイルあたりの総量上限（`PLUG-10`）。既定は [`RunLimits::default`]。
+    pub limits: RunLimits,
 }
 
 impl RunOptions {
-    /// WPT ルートとエンジンを指定して作る。
+    /// WPT ルートとエンジンを指定して作る。上限は既定値。
     pub fn new(wpt_root: impl Into<PathBuf>, engine: Option<EngineKind>) -> Self {
         Self {
             wpt_root: wpt_root.into(),
             engine,
+            limits: RunLimits::default(),
         }
     }
+
+    /// 総量上限を差し替える（テスト用に小さな値を渡す用途を想定）。
+    pub fn with_limits(mut self, limits: RunLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+}
+
+/// 1 ファイルの実行に課す総量上限（件数・合計バイト数・総実行時間）。
+///
+/// 既定値は [`MAX_PLAN_STEPS`]・[`MAX_TOTAL_SCRIPT_BYTES`]・[`MAX_FILE_DURATION`]。
+/// 超過は [`FileOutcome::LimitExceeded`] になり、部分実行の結果で Pass を装わない。
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunLimits {
+    /// 実行手順の最大件数。
+    pub max_steps: usize,
+    /// スクリプト本体の合計最大バイト数。
+    pub max_total_bytes: u64,
+    /// ファイル全体の最大実行時間。
+    pub max_duration: Duration,
+}
+
+impl Default for RunLimits {
+    fn default() -> Self {
+        Self {
+            max_steps: MAX_PLAN_STEPS,
+            max_total_bytes: MAX_TOTAL_SCRIPT_BYTES,
+            max_duration: MAX_FILE_DURATION,
+        }
+    }
+}
+
+/// [`FileOutcome::LimitExceeded`] が示す超過した上限の種類。
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitKind {
+    /// 実行手順の件数。
+    Steps,
+    /// スクリプト本体の合計バイト数。
+    TotalBytes,
+    /// ファイル全体の実行時間。
+    Duration,
 }
 
 /// ファイル単位の合否分類。
@@ -304,6 +371,11 @@ pub enum FileOutcome {
     },
     /// ファイルが [`MAX_SOURCE_BYTES`] を超えた。
     TooLarge,
+    /// 1 ファイルの総量上限（[`RunLimits`]）を超えたため実行を打ち切った（`PLUG-10`）。
+    LimitExceeded {
+        /// 超過した上限の種類。
+        kind: LimitKind,
+    },
     /// HTML のパースに失敗した。
     HtmlParseFailed {
         /// 失敗の説明。
@@ -438,6 +510,36 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
         return FileOutcome::HarnessNotReferenced;
     }
 
+    // 実行前に件数と合計サイズを検証する（JS を 1 つも評価しないうちに fail-closed）。
+    let limits = options.limits;
+    if plan.len() > limits.max_steps {
+        return FileOutcome::LimitExceeded {
+            kind: LimitKind::Steps,
+        };
+    }
+    let mut planned_bytes: u64 = 0;
+    for step in &plan {
+        let size = match step {
+            Step::Eval(code) => code.len() as u64,
+            Step::Harness(src, rel) | Step::Support(src, rel) => {
+                match file_size_under_root(&root, rel) {
+                    Ok(n) => n,
+                    Err(FileOutcome::Missing) => {
+                        return FileOutcome::SupportScriptMissing { src: src.clone() };
+                    }
+                    Err(other) => return other,
+                }
+            }
+        };
+        planned_bytes = planned_bytes.saturating_add(size);
+        if planned_bytes > limits.max_total_bytes {
+            return FileOutcome::LimitExceeded {
+                kind: LimitKind::TotalBytes,
+            };
+        }
+    }
+
+    let started = Instant::now();
     let mut runtime = match new_runtime(options.engine) {
         Ok(r) => r,
         Err(error) => return FileOutcome::EngineUnavailable { error },
@@ -451,7 +553,15 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
         }
     };
 
+    let mut consumed_bytes: u64 = 0;
     for (index, step) in plan.iter().enumerate() {
+        // 1 評価の超過は js crate の評価タイムアウト（2 秒）で抑えられるため、手順の
+        // 境界でファイル全体の時間を確認すれば超過は上限 + 評価 1 回分に収まる。
+        if started.elapsed() > limits.max_duration {
+            return FileOutcome::LimitExceeded {
+                kind: LimitKind::Duration,
+            };
+        }
         match step {
             Step::Harness(src, rel) => {
                 let code = match read_under_root(&root, rel) {
@@ -461,6 +571,13 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
                     }
                     Err(other) => return other,
                 };
+                // 事前検証後にファイルが増えた場合（TOCTOU）に備え、読み込んだ実バイト数でも検証する。
+                consumed_bytes = consumed_bytes.saturating_add(code.len() as u64);
+                if consumed_bytes > limits.max_total_bytes {
+                    return FileOutcome::LimitExceeded {
+                        kind: LimitKind::TotalBytes,
+                    };
+                }
                 if let Err(error) = eval(&mut runtime, &code) {
                     return FileOutcome::HarnessLoadFailed { error };
                 }
@@ -478,6 +595,13 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
                     }
                     Err(other) => return other,
                 };
+                // 事前検証後にファイルが増えた場合（TOCTOU）に備え、読み込んだ実バイト数でも検証する。
+                consumed_bytes = consumed_bytes.saturating_add(code.len() as u64);
+                if consumed_bytes > limits.max_total_bytes {
+                    return FileOutcome::LimitExceeded {
+                        kind: LimitKind::TotalBytes,
+                    };
+                }
                 if let Err(error) = eval(&mut runtime, &code) {
                     return FileOutcome::ScriptFailed { index, error };
                 }
@@ -491,6 +615,12 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
                 }
             }
         }
+    }
+
+    if started.elapsed() > limits.max_duration {
+        return FileOutcome::LimitExceeded {
+            kind: LimitKind::Duration,
+        };
     }
 
     match collector.take() {
@@ -651,11 +781,8 @@ pub fn resolve_src(test_file: &str, src: &str) -> Result<String, String> {
     Ok(rel)
 }
 
-/// ルート相対パス `rel` のファイルを、ルート配下であることを確認して読む。
-///
-/// 戻り値の `Err` は、そのまま [`FileOutcome`] として返せる分類
-/// （`Missing` / `TooLarge` / `ReadFailed`）。サイズは読む前に metadata で確認する。
-fn read_under_root(root: &Path, rel: &str) -> Result<String, FileOutcome> {
+/// ルート配下の通常ファイルへ解決し、canonicalize 後のパスとサイズを返す（上限超過は TooLarge）。
+fn resolve_under_root(root: &Path, rel: &str) -> Result<(PathBuf, u64), FileOutcome> {
     let mut path = root.to_path_buf();
     for seg in rel.split('/') {
         path.push(seg);
@@ -682,6 +809,20 @@ fn read_under_root(root: &Path, rel: &str) -> Result<String, FileOutcome> {
     if meta.len() > MAX_SCRIPT_BYTES {
         return Err(FileOutcome::TooLarge);
     }
+    Ok((canon, meta.len()))
+}
+
+/// ルート配下のファイルのサイズだけを返す（読まない）。総量上限の事前検証用。
+fn file_size_under_root(root: &Path, rel: &str) -> Result<u64, FileOutcome> {
+    resolve_under_root(root, rel).map(|(_, len)| len)
+}
+
+/// ルート相対パス `rel` のファイルを、ルート配下であることを確認して読む。
+///
+/// 戻り値の `Err` は、そのまま [`FileOutcome`] として返せる分類
+/// （`Missing` / `TooLarge` / `ReadFailed`）。サイズは読む前に metadata で確認する。
+fn read_under_root(root: &Path, rel: &str) -> Result<String, FileOutcome> {
+    let (canon, _) = resolve_under_root(root, rel)?;
     // metadata 確認後にファイルが増えても上限を超えて確保しないよう、読み取り自体を
     // MAX_SCRIPT_BYTES + 1 バイトに制限し、超過は TooLarge に分類する。
     let file = fs::File::open(&canon).map_err(|e| FileOutcome::ReadFailed {

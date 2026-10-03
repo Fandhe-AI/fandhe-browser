@@ -27,6 +27,6 @@ pub use results::{
     SubtestResult, SubtestStatus,
 };
 pub use runner::{
-    FileOutcome, HarnessKind, RunOptions, SubsetEntry, SubsetError, Verdict, parse_subset_tsv,
-    run_entry, run_subset,
+    FileOutcome, HarnessKind, LimitKind, RunLimits, RunOptions, SubsetEntry, SubsetError, Verdict,
+    parse_subset_tsv, run_entry, run_subset,
 };

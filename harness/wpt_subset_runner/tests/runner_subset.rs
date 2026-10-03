@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use fandhe_browser_core::{EngineKind, bundled_engines};
-use wpt_subset_runner::runner::{RunOptions, SubsetEntry, run_entry};
+use std::time::Duration;
+use wpt_subset_runner::runner::{LimitKind, RunLimits, RunOptions, SubsetEntry, run_entry};
 use wpt_subset_runner::{FileOutcome, HarnessKind, SubtestStatus, Verdict};
 
 const FAKE_TESTHARNESS: &str = include_str!("fixtures/fake_testharness.js");
@@ -122,6 +123,20 @@ fn build_tree() -> PathBuf {
             "{HEAD}<script type=\"module\">this is not valid js</script>\n\
              <script>test(function () {{ assert_true(true); }}, 'only classic');</script>\n"
         ),
+    );
+    // 総量上限（PLUG-10）の回帰用。インライン 3 本 + 外部サポート 1 本。
+    write(
+        &root,
+        "dom/many.html",
+        &format!(
+            "{HEAD}<script>var a=1;</script><script>var b=2;</script>\n\
+             <script src=\"support/mid.js\"></script>\n"
+        ),
+    );
+    write(
+        &root,
+        "dom/support/mid.js",
+        &format!("//{}", "m".repeat(5000)),
     );
     root
 }
@@ -241,6 +256,44 @@ fn run_cases(root: &Path, engine: Option<EngineKind>) {
         }
         other => panic!("throws.html: {other:?}"),
     }
+
+    // PLUG-10: 件数・合計サイズ・時間の総量上限超過はエラーとして記録する。
+    let limited = |l: RunLimits| {
+        run_entry(
+            &RunOptions::new(root, engine).with_limits(l),
+            &entry("dom/many.html", HarnessKind::Testharness),
+        )
+    };
+    let base = RunLimits::default();
+    // testharness.js + inline 2 本 + support 1 本 = 4 手順
+    let mut l = base;
+    l.max_steps = 3;
+    assert_eq!(
+        limited(l),
+        FileOutcome::LimitExceeded {
+            kind: LimitKind::Steps
+        }
+    );
+    let mut l = base;
+    l.max_total_bytes = 1000; // support 5002 バイトで超過
+    assert_eq!(
+        limited(l),
+        FileOutcome::LimitExceeded {
+            kind: LimitKind::TotalBytes
+        }
+    );
+    let mut l = base;
+    l.max_duration = Duration::ZERO;
+    assert_eq!(
+        limited(l),
+        FileOutcome::LimitExceeded {
+            kind: LimitKind::Duration
+        }
+    );
+    // 上限ちょうどなら通る（境界）。
+    let mut l = base;
+    l.max_steps = 4;
+    assert!(matches!(limited(l), FileOutcome::Completed { .. }));
 
     // reftest・other は読まずにスキップ（ファイルが無くても Skipped）。
     for kind in [HarnessKind::Reftest, HarnessKind::Other] {

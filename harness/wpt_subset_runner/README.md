@@ -87,6 +87,9 @@ bash harness/wpt_subset_runner/fetch-wpt.sh   # jq・git・ネットワークが
 
 - 取得元は公式 `web-platform-tests/wpt` にハードコード（引数・環境変数で変更不可）。`resources/`・`common/`・
   `css/support/` と選定ディレクトリだけを sparse checkout する（出力先は `wpt-work/`。`WPT_WORK_DIR` で変更可）
+- 既存の `wpt-work/wpt` は、symlink でなく・`.git` が実体ディレクトリで・自身がトップレベルで・origin が公式 URL と
+  完全一致する場合だけ再利用し、違えば exit 2（fail-closed）。fetch も公式 URL を明示して行う。
+  検証は `bash harness/wpt_subset_runner/fetch-wpt-self-test.sh`（ネットワーク不要）で確認する
 - `wpt-work/subset.tsv`（1 行 `<harness>\t<file>`）を書き出す。Rust 側は JSON を読まない（新規依存を避けるため）
 - `file`・`dir` はパス規則（許可文字・`..` 禁止）で検証してから git へ渡す。スキーマ全体の検証は #278 の担当
 
@@ -106,6 +109,7 @@ bash harness/wpt_subset_runner/fetch-wpt.sh   # jq・git・ネットワークが
 | `HarnessNotReferenced` | testharness 種別なのに `/resources/testharness.js` を読み込まない |
 | `HarnessLoadFailed` | testharness.js の評価またはアダプタ登録の失敗 |
 | `SupportScriptMissing` / `ScriptRejected` | 外部スクリプトが無い / 参照規則違反 |
+| `LimitExceeded` | 1 ファイルの総量上限超過（`RunLimits`。手順 64 件・合計 8 MiB・総時間 30 秒。件数と合計サイズは実行前に検証。根拠は `runner.rs` の定数コメント） |
 | `ScriptFailed` | テスト側スクリプトの評価失敗（そのファイルで打ち切る） |
 | `UnsupportedScript` | `type="module"` を含む（評価できないため実行しない。classic だけで Pass にしない） |
 | `EngineUnavailable` | JS ランタイムを作れない・エンジン未指定（`None` は JS 無効。既定エンジンへは落とさない） |

@@ -117,27 +117,54 @@ while IFS=$'\t' read -r harness file; do
 done <<<"${files_out}"
 [ -s "${TSV_TMP}" ] || die "no entries in wpt-subset.json"
 
-mkdir -p "${WORK_DIR}"
+# 既存の作業ディレクトリは信頼しない（fail-closed。PLUG-10）。別の取得元・別リポジトリ・
+# リポジトリ外を指す symlink を再利用すると、固定リビジョンと無関係なコードを JS ランナーへ
+# 渡してしまうため、次を全て満たす場合だけ再利用する。
+#   - WORK_DIR・WPT_DIR・WPT_DIR/.git が symlink でなく実体のディレクトリ
+#     （`.git` がファイル＝gitdir 参照の場合も、外部の gitdir を指し得るため拒否する）
+#   - WPT_DIR 自身がリポジトリのトップレベル（親リポジトリの一部ではない）
+#   - origin の URL（insteadOf 展開前・後とも）が公式 WPT_URL と完全一致
+# 再利用するクローンの .git/config に仕込まれたコマンド（fsmonitor・hooks）を実行しないよう、
+# WPT_DIR に対する git 呼び出しは常に無効化オプション付きで行う。
+git_wpt() {
+  git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "${WPT_DIR}" "$@"
+}
 
-if [ ! -d "${WPT_DIR}/.git" ]; then
+[ ! -L "${WORK_DIR}" ] || die "${WORK_DIR} is a symlink; refusing to use it"
+mkdir -p "${WORK_DIR}"
+[ ! -L "${WPT_DIR}" ] || die "${WPT_DIR} is a symlink; refusing to reuse it"
+
+if [ -e "${WPT_DIR}" ]; then
+  [ -d "${WPT_DIR}" ] || die "${WPT_DIR} exists but is not a directory"
+  [ ! -L "${WPT_DIR}/.git" ] || die "${WPT_DIR}/.git is a symlink; refusing to reuse it"
+  [ -d "${WPT_DIR}/.git" ] || die "${WPT_DIR}/.git is not a directory (gitdir file is not accepted)"
+  top="$(git_wpt rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "${top}" ] && [ "$(cd "${top}" && pwd -P)" = "$(cd "${WPT_DIR}" && pwd -P)" ] \
+    || die "${WPT_DIR} is not the top level of its own git repository"
+  origin_raw="$(git_wpt config --get remote.origin.url 2>/dev/null || true)"
+  origin_resolved="$(git_wpt remote get-url origin 2>/dev/null || true)"
+  [ "${origin_raw}" = "${WPT_URL}" ] && [ "${origin_resolved}" = "${WPT_URL}" ] \
+    || die "origin of ${WPT_DIR} is not ${WPT_URL}; remove it and re-run for a fresh clone"
+else
   git clone --filter=blob:none --no-checkout --sparse -- "${WPT_URL}" "${WPT_DIR}" \
     || die "git clone failed"
 fi
 
 # sparse パターンはリビジョンの一致に関わらず毎回設定する（クローン直後の HEAD が
 # 固定リビジョンと一致していても作業ツリーを必ず構築するため）。
-git -C "${WPT_DIR}" sparse-checkout set --no-cone -- "${PATTERNS[@]}" \
+git_wpt sparse-checkout set --no-cone -- "${PATTERNS[@]}" \
   || die "sparse-checkout failed"
-if [ "$(git -C "${WPT_DIR}" rev-parse --verify HEAD 2>/dev/null || true)" != "${REV}" ]; then
-  git -C "${WPT_DIR}" fetch --filter=blob:none origin "${REV}" || die "git fetch ${REV} failed"
+# 取得元は `origin` 名ではなく検証済みの定数 URL を明示する。
+if [ "$(git_wpt rev-parse --verify HEAD 2>/dev/null || true)" != "${REV}" ]; then
+  git_wpt fetch --filter=blob:none "${WPT_URL}" "${REV}" || die "git fetch ${REV} failed"
 fi
-git -C "${WPT_DIR}" checkout --detach "${REV}" || die "git checkout ${REV} failed"
+git_wpt checkout --detach "${REV}" || die "git checkout ${REV} failed"
 # 既存クローンを再利用する場合、追跡ファイルの変更・未追跡ファイルが残っていると、
 # 固定リビジョンと異なる testharness.js やテストを実行できてしまう。チェックアウト後に
 # HEAD が固定リビジョンであり、作業ツリーが清潔であることを確認し、違えば失敗させる
 # （手動で wpt-work を削除して取得し直す）。
-[ "$(git -C "${WPT_DIR}" rev-parse --verify HEAD)" = "${REV}" ] || die "HEAD is not ${REV}"
-status_out="$(git -C "${WPT_DIR}" status --porcelain --untracked-files=all)" || die "git status failed"
+[ "$(git_wpt rev-parse --verify HEAD)" = "${REV}" ] || die "HEAD is not ${REV}"
+status_out="$(git_wpt status --porcelain --untracked-files=all)" || die "git status failed"
 [ -z "${status_out}" ] || die "${WPT_DIR} has local changes; remove it and re-run for a fresh checkout"
 
 cp "${TSV_TMP}" "${WORK_DIR}/subset.tsv"
