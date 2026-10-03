@@ -106,7 +106,7 @@ url_check() {
 }
 
 # resolve_host_ips <host> [<limit_sec>]
-#   <limit_sec> 指定時は解決に秒数の上限をかけ、超過したら何も出さず return 0（呼び出し側が拒否する）。
+#   <limit_sec> 指定時は解決に秒数の上限をかけ、超過したら解決コマンドの PID を kill して何も出さず return 0（呼び出し側が拒否する）。
 #   ホストの IP を 1 行 1 件で stdout へ出す。解決手段は getent（Linux）→ dscacheutil（macOS）→
 #   powershell の [System.Net.Dns]（Windows の Bash 環境。getent / dscacheutil が無いため）の順。
 #   いずれも無い・解決できないときは何も出さず、呼び出し側（access_check.sh）が接続先を固定できない
@@ -116,54 +116,67 @@ url_check() {
 #   `|| true` で吸収し、常に return 0 で「何も出さない」ことで呼び出し側の fail-closed 拒否へ繋ぐ。
 #   併せてホスト名を DNS ラベル文字（英数字・ハイフン・ドット）に限って検証する。
 resolve_host_ips() {
-  local out pid start limit="${2:-}"
-  if [ -z "$limit" ]; then
-    _resolve_host_ips_raw "$1"
-    return 0
-  fi
-  # 解決コマンド（getent / dscacheutil / PowerShell）は OS により上限指定の手段が異なるため、
-  # 外部の timeout コマンドに頼らず bash 側で期限監視する（3 OS 共通）。期限超過なら何も出さない
-  out="$(mktemp)" || return 0
-  _resolve_host_ips_raw "$1" >"$out" 2>/dev/null &
-  pid=$!
-  start=$SECONDS
-  while kill -0 "$pid" 2>/dev/null; do
-    if [ $((SECONDS - start)) -ge "$limit" ]; then
-      kill "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-      rm -f "$out"
-      return 0
-    fi
-    sleep 0.1
-  done
-  wait "$pid" 2>/dev/null || true
-  cat "$out"
-  rm -f "$out"
-  return 0
-}
-
-# _resolve_host_ips_raw <host>
-#   resolve_host_ips の本体（期限なし）。OS ごとの解決手段の分岐だけを持つ。
-_resolve_host_ips_raw() {
-  local ps
+  local host="$1" limit="${2:-}" kind="" ps="" raw pid start
   if command -v getent >/dev/null 2>&1; then
-    getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u || true
+    kind=getent
   elif command -v dscacheutil >/dev/null 2>&1; then
-    dscacheutil -q host -a name "$1" 2>/dev/null | awk '/^(ip_address|ipv6_address):/ {print $2}' | sort -u || true
+    kind=dscache
   else
-    ps=""
     if command -v powershell.exe >/dev/null 2>&1; then
       ps=powershell.exe
     elif command -v powershell >/dev/null 2>&1; then
       ps=powershell
     fi
-    if [ -n "$ps" ] && [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; then
-      FANDHE_RESOLVE_HOST="$1" "$ps" -NoProfile -NonInteractive -Command \
-        '[System.Net.Dns]::GetHostAddresses($env:FANDHE_RESOLVE_HOST) | ForEach-Object { $_.IPAddressToString }' \
-        2>/dev/null | tr -d '\r' | awk 'NF {print $1}' | sort -u || true
+    if [ -n "$ps" ] && [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; then
+      kind=ps
     fi
   fi
+  [ -n "$kind" ] || return 0
+  local ps_script='[System.Net.Dns]::GetHostAddresses($env:FANDHE_RESOLVE_HOST) | ForEach-Object { $_.IPAddressToString }'
+  if [ -z "$limit" ]; then
+    case "$kind" in
+      getent) getent ahosts "$host" 2>/dev/null | _resolve_parse getent || true ;;
+      dscache) dscacheutil -q host -a name "$host" 2>/dev/null | _resolve_parse dscache || true ;;
+      ps) FANDHE_RESOLVE_HOST="$host" "$ps" -NoProfile -NonInteractive -Command "$ps_script" 2>/dev/null \
+        | _resolve_parse ps || true ;;
+    esac
+    return 0
+  fi
+  # 期限付き: 解決コマンド自身をバックグラウンドで直接起動し（サブシェル・パイプを挟まない）、
+  # その PID を期限超過時に kill する。外部 timeout コマンドは OS ごとの有無が違うため使わない
+  raw="$(mktemp)" || return 0
+  case "$kind" in
+    getent) getent ahosts "$host" >"$raw" 2>/dev/null & ;;
+    dscache) dscacheutil -q host -a name "$host" >"$raw" 2>/dev/null & ;;
+    ps) FANDHE_RESOLVE_HOST="$host" "$ps" -NoProfile -NonInteractive -Command "$ps_script" >"$raw" 2>/dev/null & ;;
+  esac
+  pid=$!
+  start=$SECONDS
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ $((SECONDS - start)) -ge "$limit" ]; then
+      kill "$pid" 2>/dev/null || true
+      sleep 0.1
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      rm -f "$raw"
+      return 0
+    fi
+    sleep 0.1
+  done
+  wait "$pid" 2>/dev/null || true
+  _resolve_parse "$kind" <"$raw" || true
+  rm -f "$raw"
   return 0
+}
+
+# _resolve_parse <kind>
+#   解決コマンドの出力（stdin）から IP を 1 行 1 件へ整形する。kind は getent / dscache / ps。
+_resolve_parse() {
+  case "$1" in
+    getent) awk '{print $1}' | sort -u ;;
+    dscache) awk '/^(ip_address|ipv6_address):/ {print $2}' | sort -u ;;
+    ps) tr -d '\r' | awk 'NF {print $1}' | sort -u ;;
+  esac
 }
 
 # resolve_bin [<path>]

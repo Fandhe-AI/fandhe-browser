@@ -127,7 +127,8 @@ chmod +x "$STUB_DIR/curl"
 cat >"$STUB_DIR/getent" <<'STUB'
 #!/usr/bin/env bash
 [ -z "${STUB_RESOLVE_NONE:-}" ] || exit 0
-[ -z "${STUB_RESOLVE_SLEEP:-}" ] || sleep "$STUB_RESOLVE_SLEEP"
+[ -z "${STUB_RESOLVE_PID:-}" ] || echo $$ >"$STUB_RESOLVE_PID"
+[ -z "${STUB_RESOLVE_SLEEP:-}" ] || exec sleep "$STUB_RESOLVE_SLEEP"
 printf '%s      STREAM %s\n' "${STUB_RESOLVE_IP:-93.184.216.34}" "${2:-}"
 STUB
 chmod +x "$STUB_DIR/getent"
@@ -267,7 +268,10 @@ CASES=$((CASES + 1))
 expect_eq "$(wc -l <"$LOG" | tr -d ' ')" "0" "slow dns: curl not invoked"
 expect_eq "$(jq -r 'select(.id=="x2") | .blocked' "$WORK/slowdns.jsonl")" "total time limit exceeded" "slow dns total deadline blocked reason"
 expect_eq "$(jq -s 'length' "$WORK/slowdns.jsonl")" "3" "slow dns: all records written"
-expect_eq "$(env PATH="$STUB_DIR:$PATH" STUB_RESOLVE_SLEEP=20 bash -c ". '$SCRIPT_DIR/lib.sh'; resolve_host_ips example.com 1")" "" "resolve_host_ips honors limit"
+expect_eq "$(env PATH="$STUB_DIR:$PATH" STUB_RESOLVE_SLEEP=20 STUB_RESOLVE_PID="$WORK/res.pid" bash -c ". '$SCRIPT_DIR/lib.sh'; resolve_host_ips example.com 1")" "" "resolve_host_ips honors limit"
+# 期限超過時に解決コマンド自体が残らない（P1: 子プロセスの回収）
+sleep 0.5
+expect_exit "slow dns resolver process killed" 1 kill -0 "$(cat "$WORK/res.pid")"
 
 # getent / dscacheutil が無い環境（Windows の Bash 環境）では powershell で解決する。
 # Linux / macOS では getent / dscacheutil が先に選ばれるため PATH をスタブだけに絞る。Windows（Git Bash）では
