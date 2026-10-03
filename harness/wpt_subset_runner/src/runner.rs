@@ -560,7 +560,8 @@ fn is_classic_script_type(ty: Option<&str>) -> bool {
     match ty {
         None => true,
         Some(t) => {
-            let t = t.trim();
+            // MIME パラメータ（`text/javascript; charset=utf-8` 等）は種別判定から除く
+            let t = t.split(';').next().unwrap_or_default().trim();
             t.is_empty()
                 || [
                     "text/javascript",
@@ -903,7 +904,16 @@ mod tests {
         assert!(is_classic_script_type(None));
         assert!(is_classic_script_type(Some("")));
         assert!(is_classic_script_type(Some("Text/JavaScript")));
+        assert!(is_classic_script_type(Some(
+            "text/javascript; charset=utf-8"
+        )));
+        assert!(is_classic_script_type(Some(
+            " Application/JavaScript ;charset=UTF-8"
+        )));
         assert!(!is_classic_script_type(Some("module")));
         assert!(!is_classic_script_type(Some("application/json")));
+        assert!(!is_classic_script_type(Some(
+            "application/json; text/javascript"
+        )));
     }
 }
