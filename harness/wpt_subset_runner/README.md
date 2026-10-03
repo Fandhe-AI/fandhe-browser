@@ -5,7 +5,7 @@ WPT（web-platform-tests）サブセット実行基盤の入力となる選定�
 （`docs/spec` の `04-behavior/`）を参照すること
 （[spec-reference](../../.claude/rules/spec-reference.md)）。
 
-`wpt-subset.json` は PoC-16 で選定した 257 件を移植した設定データで、後続のランナー
+`wpt-subset.json` は PoC-16 で選定した 257 件を移植した設定データで、ランナー
 （#554・TASK-101.2.2）と集計・レポート（#276・#277）が読み込む。
 
 ## 由来
@@ -76,14 +76,50 @@ JS エンジン上で動かす最小の環境と、サブテスト結果を Rust
 - 評価 1 回あたりの上限（スクリプト 1 MiB・実行 2 秒）は js crate の固定値に従う
 - `JsValue` はスカラーのみのため、受け渡しは文字列・数値に限る
 
-## #554 への申し送り
+## 取得とランナー（TASK-101.2.2・Issue #554）
 
-- WPT のリビジョンが未記録（`source.wptRevision` は `null`）。ランナー実装時に WPT のコミットを
-  固定して埋めること。取得元はハードコードした公式リポジトリに限定する
-- 固定したリビジョンに該当ファイルが無い場合は、独自の状態（例: missing）として記録し、黙って選び直さない
-- ファイルごとに新しい `JsRuntime` を作る（エンジン再起動で状態が失われるため、ファイル単位の失敗として扱う）
-- completion に依存せず、result 通知を正とする
-- 本 crate の結合テストは偽 testharness を使う。固定リビジョンの実物の testharness.js での動作確認は #554 で行う
+`wpt-subset.json` の `source.wptRevision` に WPT のリビジョン（`74ca910926d76710943f2a8798817102f69d6e40`）を固定した。
+リビジョンの正本は JSON で、スクリプトに二重定義しない。
+
+```bash
+bash harness/wpt_subset_runner/fetch-wpt.sh   # jq・git・ネットワークが必要。CI には組み込まない
+```
+
+- 取得元は公式 `web-platform-tests/wpt` にハードコード（引数・環境変数で変更不可）。`resources/`・`common/`・
+  `css/support/` と選定ディレクトリだけを sparse checkout する（出力先は `wpt-work/`。`WPT_WORK_DIR` で変更可）
+- `wpt-work/subset.tsv`（1 行 `<harness>\t<file>`）を書き出す。Rust 側は JSON を読まない（新規依存を避けるため）
+- `file`・`dir` はパス規則（許可文字・`..` 禁止）で検証してから git へ渡す。スキーマ全体の検証は #278 の担当
+
+ランナー（`wpt_subset_runner::runner`）の流れ: `parse_subset_tsv` → `run_entry` / `run_subset`。
+ファイルごとに新しい `JsRuntime` を作り、HTML の `<script>` を文書順に評価する
+（`testharness.js` の評価直後に `attach_result_reporter`。`testharnessreport.js` は読み込まない）。
+`src` は `/` 始まりならルート基準、それ以外はテストファイル基準で字句的に解決し、canonicalize 後に
+ルート配下であることを確認する。URL 形式の `src` は取得せず拒否する。
+
+結果分類（`FileOutcome`。集計はしない）:
+
+| 分類 | 意味 |
+| ---- | ---- |
+| `Skipped` | testharness 以外（reftest・other）。読まずにスキップ |
+| `Missing` | 固定リビジョンにファイルが無い（黙って選び直さない） |
+| `ReadFailed` / `TooLarge` / `HtmlParseFailed` | 読み込み・サイズ上限（1 MiB）・パースの失敗 |
+| `HarnessNotReferenced` | testharness 種別なのに `/resources/testharness.js` を読み込まない |
+| `HarnessLoadFailed` | testharness.js の評価またはアダプタ登録の失敗 |
+| `SupportScriptMissing` / `ScriptRejected` | 外部スクリプトが無い / 参照規則違反 |
+| `ScriptFailed` | テスト側スクリプトの評価失敗（そのファイルで打ち切る） |
+| `EngineUnavailable` | JS ランタイムを作れない（エンジンなしビルド等） |
+| `CollectFailed` | JS 側から不正な通知があった |
+| `Completed` | 実行完了。`verdict` は `Pass`（1 件以上で全 PASS）・`Fail`・`NoResults`（0 件は Pass にしない） |
+
+completion は参考情報で、verdict は result 通知だけから決める。
+
+実物の testharness.js での動作確認（リビジョン固定時点。V8 / boa。DOM・タイマーが無い環境のまま）:
+testharness 152 件は `Completed/Fail` 53 / 46・`Completed/NoResults` 3 / 10・`ScriptFailed` 93・`Missing` 1・
+`SupportScriptMissing` 2（V8 / boa の順。`Pass` は 0 件）。reftest・other の 105 件は `Skipped`。
+実物の testharness.js は読み込めるが、`window`・`document` を要するテストは失敗する
+（偽の DOM で通さない方針。合格率は #276 が扱う）。
+
+テストは偽の WPT ツリー（一時ディレクトリ）で `tests/runner_subset.rs` が検証する。
 
 ## コミットしないもの
 

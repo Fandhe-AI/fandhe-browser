@@ -5,7 +5,7 @@
     "specCommit": "c7f2995d21d94339ff8ffbb3b66fae4953043c18",
     "generatedAt": "2026-09-23T02:31:04.815Z",
     "wptSource": "https://github.com/web-platform-tests/wpt (sparse checkout, depth=1)",
-    "wptRevision": null,
+    "wptRevision": "74ca910926d76710943f2a8798817102f69d6e40",
     "selector": "select_wpt_subset.mjs",
     "task": "TASK-101.1",
     "behavior": "PLUG-10",
