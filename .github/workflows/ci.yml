@@ -34,6 +34,13 @@ name: CI
 # 軽量ビルド（js-boa のみ）は rust-ci-js-boa、依存グラフ検査（軽量ビルドに v8 が
 # 無い・エンジンなしに v8 も boa_engine も無い）は js-engine-isolation、両エンジン
 # 同梱の共通テストは rust-ci-default-features 内のステップで検証する
+# TASK-9.3（#340・REPAIR-8・MS-7）: 受入基準 1（push / pull_request トリガー）は
+# TASK-55.2（#59）で、受入基準 2（9.1・9.2 のジョブ統合）は deny-license-reject
+# （TASK-9.1・#338）・rust-ci の deny-checks（TASK-77・#64）・compat-regression
+# （TASK-9.2・#339）で既に満たしている。本記録は新規ジョブ追加やトリガー変更では
+# なく、TASK-9（9.1〜9.3）の本格 CI パイプライン統合が完了したことの明文化
+# （TASK-7 の記録と同じ扱い）。compat-regression の --allow-missing は #312
+# （TASK-71.3）の完了まで維持する
 on:
   workflow_dispatch:
   pull_request:
