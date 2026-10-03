@@ -49,10 +49,10 @@ use std::time::Instant;
 
 // 注入関数の型を core 経由で使えるよう再公開する（js crate へ直接依存してよいのは
 // core のみという crate 間の許可依存を、harness 等の利用側に守らせるため）。
-pub use fandhe_browser_js::{JsEngineError, NativeFn};
 use fandhe_browser_js::{
     CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsValue, create_engine,
 };
+pub use fandhe_browser_js::{JsEngineError, NativeFn};
 
 use crate::config::JsConfig;
 use crate::observability::{OperationKind, OperationRecorder, RecorderHandle};
@@ -545,7 +545,10 @@ mod tests {
             err,
             Error::JsEvaluation(JsEngineError::BindingFailed(_))
         ));
-        assert_eq!(err.to_string(), "JS evaluation failed: binding registration failed: nope");
+        assert_eq!(
+            err.to_string(),
+            "JS evaluation failed: binding registration failed: nope"
+        );
     }
 
     /// JS-2・PLUG-10（TASK-101.2.1・#553）: JS 無効のランタイムは注入に成功せず

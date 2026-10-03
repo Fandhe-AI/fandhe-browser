@@ -1,0 +1,30 @@
+# wpt-subset-runner: WPT サブセット（PLUG-10・TASK-101）を core 経由で実行する
+# ハーネス用ツール crate。TASK-101.2.1（#553）では testharness.js が動く最小の
+# グローバル環境と結果の受け渡しだけを提供する（取得・実行・合否集計は #554）。
+#
+# 依存は `fandhe-browser-core` のみ（path 依存。外部 crate は追加しない）。
+# AGENTS.md「crate 間の許可依存」により js crate へは直接依存しない。
+
+[package]
+name = "wpt-subset-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# `make check-publish-private` が検証する契約（root Cargo.toml 参照）。
+publish.workspace = true
+
+[dependencies]
+fandhe-browser-core = { path = "../../crates/fandhe-browser-core" }
+
+# `default` は必ず空にする。既定 feature でエンジンを有効にすると feature unification により
+# `cargo test --workspace` の既定構成で core・js の「エンジンなし」前提のテストが壊れる。
+[features]
+default = []
+js-v8 = ["fandhe-browser-core/js-v8"]
+js-boa = ["fandhe-browser-core/js-boa"]
+
+# 子プロセス版 JS ワーカーの役割を兼ねる独自 `main` を持つため `harness = false`
+# （core の `tests/js_stub_v8.rs` と同じ理由）。
+[[test]]
+name = "testharness_env"
+harness = false
