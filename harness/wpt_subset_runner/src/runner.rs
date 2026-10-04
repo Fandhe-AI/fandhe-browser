@@ -464,7 +464,7 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
             };
         }
     };
-    let html = match read_under_root(&root, &entry.file) {
+    let html = match read_under_root(&root, &entry.file, MAX_SOURCE_BYTES) {
         Ok(h) => h,
         Err(outcome) => return outcome,
     };
@@ -525,7 +525,7 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
         let size = match step {
             Step::Eval(code) => code.len() as u64,
             Step::Harness(src, rel) | Step::Support(src, rel) => {
-                match file_size_under_root(&root, rel) {
+                match file_size_under_root(&root, rel, MAX_SCRIPT_BYTES) {
                     Ok(n) => n,
                     Err(FileOutcome::Missing) => {
                         return FileOutcome::SupportScriptMissing { src: src.clone() };
@@ -567,7 +567,7 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
         }
         match step {
             Step::Harness(src, rel) => {
-                let code = match read_under_root(&root, rel) {
+                let code = match read_under_root(&root, rel, MAX_SCRIPT_BYTES) {
                     Ok(c) => c,
                     Err(FileOutcome::Missing) => {
                         return FileOutcome::SupportScriptMissing { src: src.clone() };
@@ -591,7 +591,7 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
                 }
             }
             Step::Support(src, rel) => {
-                let code = match read_under_root(&root, rel) {
+                let code = match read_under_root(&root, rel, MAX_SCRIPT_BYTES) {
                     Ok(c) => c,
                     Err(FileOutcome::Missing) => {
                         return FileOutcome::SupportScriptMissing { src: src.clone() };
@@ -860,7 +860,7 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 ///   ため、open 後に途中のディレクトリが差し替えられる残存リスクが Windows に残る
 ///   （canonicalize 後のルート配下確認で緩和するのみ）
 /// - その他の OS: 同一性を確認できないため fail-closed（`ReadFailed`）
-fn open_under_root(root: &Path, rel: &str) -> Result<(fs::File, u64), FileOutcome> {
+fn open_under_root(root: &Path, rel: &str, max_bytes: u64) -> Result<(fs::File, u64), FileOutcome> {
     let mut path = root.to_path_buf();
     for seg in rel.split('/') {
         path.push(seg);
@@ -885,7 +885,7 @@ fn open_under_root(root: &Path, rel: &str) -> Result<(fs::File, u64), FileOutcom
     if !meta.is_file() {
         return Err(FileOutcome::Missing);
     }
-    if meta.len() > MAX_SCRIPT_BYTES {
+    if meta.len() > max_bytes {
         return Err(FileOutcome::TooLarge);
     }
     let canon = match fs::canonicalize(&path) {
@@ -956,25 +956,26 @@ fn confirm_same_file(_handle: &fs::Metadata, _canon: &Path) -> Result<(), FileOu
 }
 
 /// ルート配下のファイルのサイズだけを返す（読まない）。総量上限の事前検証用。
-fn file_size_under_root(root: &Path, rel: &str) -> Result<u64, FileOutcome> {
-    open_under_root(root, rel).map(|(_, len)| len)
+fn file_size_under_root(root: &Path, rel: &str, max_bytes: u64) -> Result<u64, FileOutcome> {
+    open_under_root(root, rel, max_bytes).map(|(_, len)| len)
 }
 
 /// ルート相対パス `rel` のファイルを、ルート配下であることを確認して読む。
 ///
-/// 戻り値の `Err` は、そのまま [`FileOutcome`] として返せる分類
+/// `max_bytes` は用途別の上限（HTML は [`MAX_SOURCE_BYTES`]、評価する JS は接尾辞を
+/// 差し引いた [`MAX_SCRIPT_BYTES`]）。戻り値の `Err` は、そのまま [`FileOutcome`] として返せる分類
 /// （`Missing` / `TooLarge` / `ReadFailed`）。検証は [`open_under_root`] が開いたハンドルで行う。
-fn read_under_root(root: &Path, rel: &str) -> Result<String, FileOutcome> {
-    let (file, _) = open_under_root(root, rel)?;
+fn read_under_root(root: &Path, rel: &str, max_bytes: u64) -> Result<String, FileOutcome> {
+    let (file, _) = open_under_root(root, rel, max_bytes)?;
     // サイズ確認後にファイルが増えても上限を超えて確保しないよう、読み取り自体を
-    // MAX_SCRIPT_BYTES + 1 バイトに制限し、超過は TooLarge に分類する。
+    // max_bytes + 1 バイトに制限し、超過は TooLarge に分類する。
     let mut bytes = Vec::new();
-    file.take(MAX_SCRIPT_BYTES + 1)
+    file.take(max_bytes + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| FileOutcome::ReadFailed {
             error: e.to_string(),
         })?;
-    if bytes.len() as u64 > MAX_SCRIPT_BYTES {
+    if bytes.len() as u64 > max_bytes {
         return Err(FileOutcome::TooLarge);
     }
     String::from_utf8(bytes).map_err(|e| FileOutcome::ReadFailed {
@@ -1284,17 +1285,17 @@ mod tests {
     fn open_under_root_returns_handle_and_size() {
         let root = fs::canonicalize(scratch_dir("open")).expect("canon");
         write_file(&root, "a/b.js", "12345");
-        let (mut f, len) = open_under_root(&root, "a/b.js").expect("open");
+        let (mut f, len) = open_under_root(&root, "a/b.js", MAX_SCRIPT_BYTES).expect("open");
         assert_eq!(len, 5);
         let mut s = String::new();
         f.read_to_string(&mut s).expect("read");
         assert_eq!(s, "12345");
         assert!(matches!(
-            open_under_root(&root, "a"),
+            open_under_root(&root, "a", MAX_SCRIPT_BYTES),
             Err(FileOutcome::Missing)
         ));
         assert!(matches!(
-            open_under_root(&root, "nope.js"),
+            open_under_root(&root, "nope.js", MAX_SCRIPT_BYTES),
             Err(FileOutcome::Missing)
         ));
         let _ = fs::remove_dir_all(&root);
@@ -1310,17 +1311,19 @@ mod tests {
         write_file(&base, "outside.js", "secret");
         std::os::unix::fs::symlink(base.join("outside.js"), root.join("leak.js")).expect("link");
         assert!(matches!(
-            open_under_root(&root, "leak.js"),
+            open_under_root(&root, "leak.js", MAX_SCRIPT_BYTES),
             Err(FileOutcome::Missing)
         ));
         assert!(matches!(
-            read_under_root(&root, "leak.js"),
+            read_under_root(&root, "leak.js", MAX_SCRIPT_BYTES),
             Err(FileOutcome::Missing)
         ));
         // ルート内を指す symlink は同一性が一致するため許可される。
         std::os::unix::fs::symlink(root.join("keep.js"), root.join("alias.js")).expect("link");
         assert_eq!(
-            read_under_root(&root, "alias.js").ok().as_deref(),
+            read_under_root(&root, "alias.js", MAX_SCRIPT_BYTES)
+                .ok()
+                .as_deref(),
             Some("ok")
         );
         let _ = fs::remove_dir_all(&base);
@@ -1342,6 +1345,63 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// PLUG-10: HTML は MAX_SOURCE_BYTES（1 MiB）ちょうどまで受理し、+1 で TooLarge。
+    /// スクリプト用の上限（MAX_SCRIPT_BYTES）は接尾辞分だけ小さく、超過は従来どおり拒否する。
+    #[test]
+    fn read_under_root_limit_is_chosen_by_caller() {
+        let root = fs::canonicalize(scratch_dir("limits")).expect("canon");
+        let html_ok = "a".repeat(MAX_SOURCE_BYTES as usize);
+        write_file(&root, "ok.html", &html_ok);
+        write_file(&root, "big.html", &format!("{html_ok}a"));
+        let mid = "b".repeat(MAX_SCRIPT_BYTES as usize + 1);
+        write_file(&root, "mid.html", &mid);
+        assert_eq!(
+            MAX_SCRIPT_BYTES,
+            MAX_SOURCE_BYTES - SCRIPT_SUFFIX.len() as u64
+        );
+        assert_eq!(
+            read_under_root(&root, "ok.html", MAX_SOURCE_BYTES)
+                .expect("html at limit")
+                .len() as u64,
+            MAX_SOURCE_BYTES
+        );
+        assert!(matches!(
+            read_under_root(&root, "big.html", MAX_SOURCE_BYTES),
+            Err(FileOutcome::TooLarge)
+        ));
+        assert_eq!(
+            read_under_root(&root, "mid.html", MAX_SOURCE_BYTES)
+                .expect("html above script limit")
+                .len() as u64,
+            MAX_SCRIPT_BYTES + 1
+        );
+        assert!(matches!(
+            read_under_root(&root, "mid.html", MAX_SCRIPT_BYTES),
+            Err(FileOutcome::TooLarge)
+        ));
+        assert!(matches!(
+            file_size_under_root(&root, "big.html", MAX_SOURCE_BYTES),
+            Err(FileOutcome::TooLarge)
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// PLUG-10: テスト HTML が MAX_SCRIPT_BYTES 超・MAX_SOURCE_BYTES 以下でも run_entry は
+    /// TooLarge にしない（HTML 上限は MAX_SOURCE_BYTES）。
+    #[test]
+    fn run_entry_accepts_html_between_script_and_source_limits() {
+        let root = fs::canonicalize(scratch_dir("htmlbig")).expect("canon");
+        let pad = "x".repeat(MAX_SCRIPT_BYTES as usize - 8);
+        write_file(&root, "t.html", &format!("<!-- {pad} -->"));
+        let entry = SubsetEntry::new("t.html", HarnessKind::Testharness).expect("entry");
+        // HTML は MAX_SCRIPT_BYTES + 1 バイト。読み込みを通過し、後段の判定に進む。
+        assert_eq!(
+            run_entry(&RunOptions::new(&root, None), &entry),
+            FileOutcome::HarnessNotReferenced
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
