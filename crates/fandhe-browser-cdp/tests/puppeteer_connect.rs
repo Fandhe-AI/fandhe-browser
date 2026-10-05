@@ -284,3 +284,16 @@ fn preflight_fails_explicitly_when_not_installed() {
         }
     );
 }
+
+/// CDP-3: `TempDir::new` は既存ディレクトリを流用・削除せず、毎回新規に作成する。
+#[test]
+fn cdp3_temp_dir_never_reuses_or_removes_existing_directory() {
+    let a = TempDir::new();
+    let marker = a.0.join("keep.txt");
+    std::fs::write(&marker, b"x").expect("write marker");
+    let b = TempDir::new();
+    assert_ne!(a.0, b.0);
+    assert!(b.0.is_dir());
+    drop(b);
+    assert!(marker.is_file());
+}

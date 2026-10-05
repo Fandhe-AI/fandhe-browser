@@ -56,12 +56,22 @@ static COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub struct TempDir(pub PathBuf);
 
 impl TempDir {
+    /// 排他的に（`create_dir` で）新規作成できたパスだけを所有する。同名の既存ディレクトリ
+    /// （PID 再利用・前回の異常終了の残骸）は流用も削除もせず、別名で作り直す。
     pub fn new() -> Self {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let base = std::env::temp_dir()
             .canonicalize()
             .unwrap_or_else(|_| std::env::temp_dir());
-        Self(base.join(format!("fandhe-cdp-script-{}-{n}", std::process::id())))
+        for _ in 0..1000 {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("fandhe-cdp-script-{}-{n}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create temp dir: {e}"),
+            }
+        }
+        panic!("could not create a unique temp dir");
     }
 }
 
