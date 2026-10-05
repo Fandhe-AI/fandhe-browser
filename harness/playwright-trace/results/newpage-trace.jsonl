@@ -1,0 +1,7 @@
+{"seq":0,"kind":"meta","schema":1,"purpose":"CDP trace until chromium.connectOverCDP/newContext/newPage (CDP-2, TASK-43.1)","playwright":"1.63.0","node":"v24.21.0"}
+{"seq":1,"kind":"http","method":"GET","path":"/json/version","status":200}
+{"seq":2,"kind":"http","method":"GET","path":"/json/version/","status":404}
+{"seq":3,"kind":"stage","name":"connectOverCDP(http)","ok":false,"error":"browserType.connectOverCDP: Unexpected status 404 when connecting to http://127.0.0.1:<PORT>/json/version/.\nThis does not look like a DevTools server, try connecting via ws://.\nCall log:\n  - <ws preparing> retrieving websocket url from http://127.0.0.1:<PORT>\n"}
+{"seq":4,"kind":"cdp","dir":"send","message":{"id":1,"method":"Browser.getVersion"}}
+{"seq":5,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":1}}
+{"seq":6,"kind":"stage","name":"connectOverCDP(ws)","ok":false,"error":"browserType.connectOverCDP: Protocol error (Browser.getVersion): method not implemented\nCall log:\n  - <ws connecting> ws://127.0.0.1:<PORT>/devtools/browser/trace-1\n  - <ws connected> ws://127.0.0.1:<PORT>/devtools/browser/trace-1\n  - <ws disconnecting> ws://127.0.0.1:<PORT>/devtools/browser/trace-1\n  - <ws disconnected> ws://127.0.0.1:<PORT>/devtools/browser/trace-1 code=1006 reason=\n"}
