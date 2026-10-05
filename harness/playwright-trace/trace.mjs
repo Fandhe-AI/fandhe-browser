@@ -175,11 +175,8 @@ if (browser) {
   await Promise.race([browser.close().catch(() => {}), new Promise((r) => setTimeout(r, 2000))]);
 }
 
-// 接続失敗・CDP 0 件は収集失敗。成功扱いの JSONL を残さず非 0 終了する。
-const verdict = checkCollection({
-  connected: Boolean(browser),
-  cdpCount: records.filter((r) => r.kind === "cdp").length,
-});
+// CDP 0 件は収集失敗（接続失敗でも CDP 送受信があれば調査用トレースとして保存する）。成功扱いの JSONL を残さず非 0 終了する。
+const verdict = checkCollection({ cdpCount: records.filter((r) => r.kind === "cdp").length });
 if (!verdict.ok) fatal(verdict.reason);
 
 writeFileSync(args.out, toJsonl(records), { flag: args.force ? "w" : "wx" });

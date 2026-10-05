@@ -31,7 +31,7 @@ expect_exit2 "option-like out path is rejected" --endpoint http://127.0.0.1:9333
 expect_exit2 "missing module-dir is rejected" --endpoint http://127.0.0.1:9333 --out /nonexistent-dir/x.jsonl
 expect_exit2 "unknown argument is rejected" --bogus
 
-# 接続に全失敗した場合は JSONL を書かず exit 1 すること（CDP-2・fail-closed）。
+# CDP メッセージが 0 件（接続全失敗）の場合は JSONL を書かず exit 1 すること（CDP-2・fail-closed）。
 # 偽の playwright-core（常に connectOverCDP が reject）と、閉じたポートを使う。
 FAKE_DIR="$(mktemp -d)"
 trap 'rm -rf "$FAKE_DIR"' EXIT
@@ -43,9 +43,9 @@ status=0
 node "$SCRIPT_DIR/trace.mjs" --endpoint http://127.0.0.1:9 --out "$FAKE_DIR/out.jsonl" \
   --module-dir "$FAKE_DIR" --playwright-version 0.0.0 >/dev/null 2>"$FAKE_DIR/err.txt" || status=$?
 if [ "$status" -ne 1 ] || [ -e "$FAKE_DIR/out.jsonl" ]; then
-  echo "FAIL: all-connections-failed must exit 1 without output (got $status)" >&2
+  echo "FAIL: zero-message trace must exit 1 without output (got $status)" >&2
   exit 1
 fi
-grep -q "no CDP connection succeeded" "$FAKE_DIR/err.txt" || { echo "FAIL: missing error message" >&2; exit 1; }
-echo "ok: failed connections exit 1 without writing a trace"
+grep -q "no CDP messages were captured" "$FAKE_DIR/err.txt" || { echo "FAIL: missing error message" >&2; exit 1; }
+echo "ok: zero-message traces exit 1 without writing a trace"
 echo "playwright-trace self-test: all passed"

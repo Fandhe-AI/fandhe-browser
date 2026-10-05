@@ -13,6 +13,7 @@ import {
   parseProtocolLine,
   drainLines,
   MAX_RAW_LINE_BYTES,
+  MAX_CHUNK_BYTES,
   toJsonl,
   validateEndpoint,
   validateJsonl,
@@ -105,10 +106,14 @@ t("validateJsonl reports violations", () => {
   assert.notDeepEqual(validateJsonl('{"seq":0,"kind":"meta"}'), []);
 });
 
-t("checkCollection rejects failed connections and empty traces", () => {
-  assert.deepEqual(checkCollection({ connected: false, cdpCount: 5 }), { ok: false, reason: "no CDP connection succeeded" });
-  assert.equal(checkCollection({ connected: true, cdpCount: 0 }).ok, false);
-  assert.deepEqual(checkCollection({ connected: true, cdpCount: 1 }), { ok: true, reason: null });
+t("checkCollection rejects empty traces but accepts failed-connection traces with CDP frames", () => {
+  assert.equal(checkCollection({ cdpCount: 0 }).ok, false);
+  assert.deepEqual(checkCollection({ cdpCount: 3 }), { ok: true, reason: null });
+});
+
+t("drainLines rejects an oversized chunk before splitting", () => {
+  const many = "a\n".repeat(MAX_CHUNK_BYTES);
+  assert.throws(() => drainLines("", many), /chunk exceeds buffer limit/);
 });
 
 t("committed trace conforms to schema", () => {

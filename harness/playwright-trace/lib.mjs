@@ -69,6 +69,8 @@ export function parseProtocolLine(rawLine) {
 
 // 1 行（タイムスタンプ等の接頭辞込み）の許容バイト数。
 export const MAX_RAW_LINE_BYTES = MAX_LINE_BYTES * 2;
+/** 1 回の stderr 書き込みとして受け付ける最大バイト数（分割前の割り当て量を抑える）。 */
+export const MAX_CHUNK_BYTES = 1024 * 1024;
 
 /**
  * stderr チャンクを残余バッファへ連結し、完結した行と新しい残余を返す。
@@ -76,6 +78,8 @@ export const MAX_RAW_LINE_BYTES = MAX_LINE_BYTES * 2;
  * 行ごとに検証する。無制限バッファ防止）。
  */
 export function drainLines(pending, chunk) {
+  // 連結・分割で大きな配列を確保する前に、チャンク単体と連結後の総量を上限検証する。
+  if (Buffer.byteLength(chunk) > MAX_CHUNK_BYTES) throw new Error("protocol log chunk exceeds buffer limit");
   const parts = (pending + chunk).split("\n");
   const rest = parts.pop();
   for (const l of parts) {
@@ -148,11 +152,11 @@ export function validateJsonl(text) {
 
 /**
  * 収集結果を成果物として保存してよいか判定する（CDP-2・TASK-43.1、REPAIR-3）。
- * trace.mjs の書き込み直前から呼ばれる。接続に一度も成功していない、または CDP メッセージが
- * 0 件のトレースは正常な収集結果ではないため、理由付きで不成立を返す（fail-closed）。
+ * trace.mjs の書き込み直前から呼ばれる。CDP メッセージが 0 件のトレースは正常な収集結果ではない
+ * ため理由付きで不成立を返す（fail-closed）。接続段階が失敗していても、失敗までの CDP 送受信が
+ * 得られていれば調査用トレースとして有効（現行サーバーは接続ハンドシェイクで失敗する）。
  */
-export function checkCollection({ connected, cdpCount }) {
-  if (!connected) return { ok: false, reason: "no CDP connection succeeded" };
+export function checkCollection({ cdpCount }) {
   if (cdpCount === 0) return { ok: false, reason: "no CDP messages were captured (pw:protocol output missing?)" };
   return { ok: true, reason: null };
 }
