@@ -49,6 +49,8 @@ TASK-14（MS-2）の測定対象となる、14 ページ相当以上・5 類型�
 | `hn-list.html` | `.athing` 30 行の `.titleline > a` |
 | `checkboxes-form.html` | `input[type=checkbox]` 2 個 |
 
+判定の実体は `benches/token_reduction/retention_check.rs`（TASK-14.4）。`cargo bench -p fandhe-browser-ai --bench token_reduction` の `# retention check (AISNAP-3)` セクションに 7 種の判別結果を出力し、`cargo test -p fandhe-browser-ai --test token_reduction_retention_check` で具体値を固定している。
+
 ## 生成パラメータ
 
 大きなフィクスチャは決定的な使い捨てスクリプトで生成し、生成物のみをコミットしている（スクリプトは保存していない）。

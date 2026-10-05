@@ -49,3 +49,9 @@ path = "benches/token_reduction/tokens_tests.rs"
 [[test]]
 name = "token_reduction_reduction"
 path = "benches/token_reduction/reduction_tests.rs"
+
+# 情報保持チェック（TASK-14.4・AISNAP-3・Issue #95）の判定ロジックのテスト。
+# bench ターゲットは libtest として起動されないため、別 [[test]] ターゲットに分ける。
+[[test]]
+name = "token_reduction_retention_check"
+path = "benches/token_reduction/retention_check_tests.rs"

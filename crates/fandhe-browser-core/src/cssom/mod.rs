@@ -6,15 +6,19 @@
 //! `cssparser` / `selectors` は MPL-2.0 のため core では使わず、セレクタは
 //! [`crate::selector`] を共有・拡張する）。
 //!
-//! 現状は型定義のみ（TASK-105.1・#255）。以下は予定している兄弟モジュールで、
-//! まだ存在しない（REPAIR-3: 実装済みを装わない）。
+//! 現状は型定義（TASK-105.1・#255）と宣言パーサー [`parse_declarations`]（TASK-105.2・#256）
+//! まで。以下は予定している兄弟モジュールで、まだ存在しない
+//! （REPAIR-3: 実装済みを装わない）。
 //!
-//! - `declaration`: 宣言パーサー（#256）
 //! - `selector`: セレクタ拡張と詳細度の計算（#257）
 //! - ルール分割（#551）・`stylesheet` 構築（#552）
 //! - マッチング（#259）・`computed`: カスケードと computed style API（#260）
 //! - 上限検証（#261）・結合テスト（#262）
 
+mod declaration;
 mod types;
 
+pub use declaration::{
+    MAX_DECLARATION_INPUT_BYTES, MAX_DECLARATIONS_PER_BLOCK, parse_declarations,
+};
 pub use types::{Declaration, Importance, Specificity, StyleRule, Stylesheet};
