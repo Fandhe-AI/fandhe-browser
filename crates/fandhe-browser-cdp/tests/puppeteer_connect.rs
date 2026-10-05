@@ -60,6 +60,18 @@ fn fake_script_child_entry() {
             println!("FANDHE_SCRIPT_RESULT {{\"ok\":true,\"step\":\"gc\",\"error\":null}}");
         }
         "echo" => println!("FANDHE_SCRIPT_RESULT {{\"ok\":true,\"step\":\"{ep}\",\"error\":null}}"),
+        // ok:true の結果行を出した後に異常終了する（成功扱いにしないことの検証）。
+        "okexit" => {
+            println!("FANDHE_SCRIPT_RESULT {{\"ok\":true,\"step\":\"late\",\"error\":null}}");
+            eprintln!("fatal: crashed after result");
+            std::process::exit(2);
+        }
+        // 短い結果行を大量に出す（最後の 1 行のみ保持され、無制限に溜めないことの検証）。
+        "manyresults" => {
+            for i in 0..200_000 {
+                println!("FANDHE_SCRIPT_RESULT {{\"ok\":true,\"step\":\"s{i}\",\"error\":null}}");
+            }
+        }
         other => panic!("unknown mode {other}"),
     }
     std::process::exit(0);
@@ -167,6 +179,39 @@ fn collects_result_after_large_stdout() {
         ScriptOutcome::Completed {
             ok: true,
             step: "flood".into(),
+            error: None
+        }
+    );
+}
+
+/// CDP-3: ok:true の結果行の後に異常終了したら成功結果にせず `ExitedAbnormally`。
+#[test]
+fn abnormal_exit_after_ok_result_is_not_success() {
+    match run_script(&fake("okexit"), "ws://x", D) {
+        ScriptOutcome::ExitedAbnormally {
+            exit_code,
+            step,
+            stderr_tail,
+        } => {
+            assert_eq!(exit_code, Some(2));
+            assert_eq!(step, "late");
+            assert!(
+                stderr_tail.contains("crashed after result"),
+                "{stderr_tail}"
+            );
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+/// CDP-3: 結果行を大量に出しても最後の 1 行だけを保持して回収する。
+#[test]
+fn keeps_only_last_of_many_result_lines() {
+    assert_eq!(
+        run_script(&fake("manyresults"), "ws://x", D),
+        ScriptOutcome::Completed {
+            ok: true,
+            step: "s199999".into(),
             error: None
         }
     );

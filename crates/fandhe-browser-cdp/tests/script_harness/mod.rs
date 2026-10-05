@@ -23,9 +23,9 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fandhe_backend_core::server::Server;
@@ -167,6 +167,13 @@ pub enum ScriptOutcome {
         exit_code: Option<i32>,
         stderr_tail: String,
     },
+    /// 結果行は `ok: true` だったが、スクリプトが異常終了した（終了コード非 0 / シグナル終了）。
+    /// 成功結果として扱わない（終了状態と結果行の照合。接続試験の偽陽性防止）。
+    ExitedAbnormally {
+        exit_code: Option<i32>,
+        step: String,
+        stderr_tail: String,
+    },
     /// 締め切りを超えて kill した。
     TimedOut { stderr_tail: String },
     /// 結果行が不正（JSON 不正・欠落フィールド・長さ超過）。
@@ -216,14 +223,24 @@ fn spawn_tail_reader<R: Read + Send + 'static>(mut r: R) -> Receiver<Vec<u8>> {
     rx
 }
 
-/// stdout を別スレッドで読み、`RESULT_PREFIX` で始まる行を見つけるたびに逐次送信する。
+/// stdout リーダーの共有状態。最後に見つけた結果行だけを上書き保持する（総メモリ量は
+/// `MAX_RESULT_LINE_BYTES + 2` に有界。結果行を大量に出す子による無制限確保を防ぐ）。
+struct ResultSlot {
+    last: Arc<Mutex<Vec<u8>>>,
+    done: Receiver<()>,
+}
+
+/// stdout を別スレッドで読み、`RESULT_PREFIX` で始まる行を見つけるたびに共有スロットへ
+/// 上書きする（最後の結果行のみ保持）。
 ///
-/// 出力量に関わらず結果行を取りこぼさない（先頭保持だと 1MiB 超の出力で末尾の結果行を
+/// 出力量に関わらず末尾の結果行を取りこぼさない（先頭保持だと 1MiB 超の出力で末尾の結果行を
 /// 捨ててしまうため）。1 行の保持は `MAX_RESULT_LINE_BYTES + 1` までで、超過分は読み捨てる
-/// （長さ超過は `parse_result_line` が `Malformed` にする）。逐次送信するため、孫プロセスが
-/// パイプを握って EOF が来なくても、それまでに出力された結果行は [`collect`] が回収できる。
-fn spawn_result_reader<R: Read + Send + 'static>(mut r: R) -> Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
+/// （長さ超過は `parse_result_line` が `Malformed` にする）。孫プロセスがパイプを握って EOF が
+/// 来なくても、それまでに出力された結果行は [`collect_result`] が回収できる。
+fn spawn_result_reader<R: Read + Send + 'static>(mut r: R) -> ResultSlot {
+    let (done_tx, done) = mpsc::channel();
+    let last = Arc::new(Mutex::new(Vec::new()));
+    let shared = Arc::clone(&last);
     std::thread::spawn(move || {
         let cap = MAX_RESULT_LINE_BYTES + 1;
         let mut cur: Vec<u8> = Vec::new();
@@ -232,7 +249,9 @@ fn spawn_result_reader<R: Read + Send + 'static>(mut r: R) -> Receiver<Vec<u8>> 
             if cur.starts_with(RESULT_PREFIX.as_bytes()) {
                 let mut line = std::mem::take(cur);
                 line.push(b'\n');
-                tx.send(line).ok();
+                if let Ok(mut g) = shared.lock() {
+                    *g = line;
+                }
             }
             cur.clear();
         };
@@ -251,8 +270,16 @@ fn spawn_result_reader<R: Read + Send + 'static>(mut r: R) -> Receiver<Vec<u8>> 
             }
         }
         finish(&mut cur);
+        done_tx.send(()).ok();
     });
-    rx
+    ResultSlot { last, done }
+}
+
+/// リーダーの完了を最大 `JOIN_GRACE` 待ち、その時点の最後の結果行を返す（孫プロセスが
+/// パイプを握り続けて EOF が来ない場合でも `run_script` がハングしない）。
+fn collect_result(slot: &ResultSlot) -> Vec<u8> {
+    let _ = slot.done.recv_timeout(JOIN_GRACE);
+    slot.last.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
 /// リーダーが送った最後のメッセージを締め切り付きで受け取る。孫プロセスがパイプの write 端を
@@ -363,7 +390,7 @@ pub fn run_script(cmd: &ScriptCommand, ws_endpoint: &str, deadline: Duration) ->
             None => std::thread::sleep(Duration::from_millis(20)),
         }
     };
-    let stdout = collect(&out);
+    let stdout = collect_result(&out);
     let stderr = collect(&err);
     // 正常終了でも孫が残り得るため、回収後にグループ全体を掃除する。
     kill_group(child.id());
@@ -373,6 +400,15 @@ pub fn run_script(cmd: &ScriptCommand, ws_endpoint: &str, deadline: Duration) ->
         };
     }
     match parse_result_line(&stdout) {
+        Ok(Some(ScriptOutcome::Completed { ok: true, step, .. }))
+            if !status.is_some_and(|s| s.success()) =>
+        {
+            ScriptOutcome::ExitedAbnormally {
+                exit_code: status.and_then(|s| s.code()),
+                step,
+                stderr_tail: tail(&stderr),
+            }
+        }
         Ok(Some(o)) => o,
         Ok(None) => ScriptOutcome::NoResult {
             exit_code: status.and_then(|s| s.code()),
