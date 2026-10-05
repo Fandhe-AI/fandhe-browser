@@ -60,7 +60,7 @@ fn render_covers_every_output_field() {
         "  - button [e5] (disabled)",
         "  - checkbox \"Agree\" [e6] (checked)",
         "  - table \"T\" [e2]",
-        "    header: Name [e1]",
+        "    header: columnheader \"Name\" [e1]",
         "    Alice {checkbox=e3 (unchecked), button \"Del\"=e4 (disabled)} …(controls)",
         "    Bob …(text)",
         "    … +3 rows",
@@ -72,7 +72,7 @@ fn render_covers_every_output_field() {
     ]
     .join("\n");
     assert_eq!(text, expected);
-    assert_eq!(TokenCounter::new().expect("tokenizer").count(&text), 101);
+    assert_eq!(TokenCounter::new().expect("tokenizer").count(&text), 105);
 }
 
 #[test]
@@ -172,7 +172,7 @@ fn fixtures_measured_with_concrete_values() {
     assert_eq!(s.pages, 17);
     // 実測値（小数 1 桁）。現行 snapshot は generic 折り畳み未実装のため
     // 85% 目標（AISNAP-1）に届かない。判定は #97。
-    assert!((s.mean_reduction_pct - (-24.2)).abs() < 0.05, "{s:?}");
+    assert!((s.mean_reduction_pct - (-24.5)).abs() < 0.05, "{s:?}");
     assert!((s.min_reduction_pct - (-146.9)).abs() < 0.05, "{s:?}");
     assert!((s.max_reduction_pct - 91.4).abs() < 0.05, "{s:?}");
     approx(s.median_snapshot_tokens, 4387.0);

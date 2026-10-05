@@ -84,7 +84,14 @@ fn render_head(node: &Node, depth: usize, lines: &mut Vec<String>) {
         let header: Vec<String> = table
             .header
             .iter()
-            .map(|h| format!("{} [{}]", one_line(&h.name), h.r#ref))
+            .map(|h| {
+                format!(
+                    "{} \"{}\" [{}]",
+                    one_line(&h.role),
+                    one_line(&h.name),
+                    h.r#ref
+                )
+            })
             .collect();
         lines.push(format!("{sub}header: {}", header.join(" | ")));
         for row in &table.rows {
