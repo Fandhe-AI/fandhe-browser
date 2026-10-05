@@ -542,7 +542,7 @@ CI 失敗・外部チェック指摘・未解決レビュースレッドがあ�
 
 **修正上限（6 回）到達時の分類:** 上限到達で `blocked` へ落ちる際は、上限に達した時点で観測していた状態で再開可否を分類する。`unresolved-comments`（未解決スレッドが実在する）は人間の resolve で解消し得るため `quality`（`blocked` 終端・monitoring 再開対象）、`needs-fix`（CI 失敗等）は修正予算が尽きているため `unrecoverable`（`failed` 終端・再開対象外）とする。後者を再開可能にすると、`fixCount` が上限のまま復元されたランが「即 blocked」を毎回繰り返し、`blocked` は halt の連続カウントに乗らないため停止防御も働かない。**base 取り込み上限（`baseMergeCount >= args.maxBaseMerges`）はこの `unrecoverable` 側の判断とは分岐する**: `needs-fix` は自動修正の予算切れであり自動化の外側では状態が変わらないが、base コンフリクトは human が PR ブランチへ直接 base を取り込んで push すれば解消し得る。解消されれば次回 monitor はもう `conflicting` を返さず上限判定の分岐自体を通らないため、「即 blocked を毎回繰り返す」懸念が同じ形では成立しない。したがって base 取り込み上限到達は `quality`（`blocked` 終端・monitoring 再開対象）に分類する。
 
-**StructuredOutput 未返却時の fail-safe 分類:** Merge ループ突入時点で対象イシューの PR は必ず作成済みのため（`impl.prNumber` は `runImplement` が PR 作成成功後にのみ Merge ループを呼ぶ）、監視・マージ実行・マージ検証・base 取り込み・修正のいずれかのエージェント呼び出しが StructuredOutput を返さず終了した場合（`agent()` の例外・null 返却いずれも同じ経路へ合流させる）、systemic failure として `failed`（Recover → 通常 Implement 経路。再 PR 作成を含む）へ倒すと既存 PR に対して重複 PR を作りうる。そのため既存の enum 外応答（モデルが何かを返した上での不整合。厳格な `failed` を維持）とは区別し、`blocked`（次回実行で monitoring 再開）に分類する。対象は「PR が既に存在する Merge ループ内」に限り、Plan / Implement / Review / Recover / PR Create（`pr: 0`）の失敗分類には一切触れない（halt 防御は弱めない。`blocked` はこのランの中で自動リトライを一切行わない）。ルートノード（verify-close）は `pr` / `worktree` の概念を持たないため、同じ理由で `blocked`（halt 非カウント）に分類し、次回実行時に verify-close を素のまま再実行する。詳細は references/recovery.md の「StructuredOutput 未返却時の fail-safe」節を参照。
+**StructuredOutput 未返却時の fail-safe 分類:** Merge ループ突入時点で対象イシューの PR は必ず作成済みのため（`impl.prNumber` は `runImplement` が PR 作成成功後にのみ Merge ループを呼ぶ）、監視・マージ実行・マージ検証・base 取り込み・修正のいずれかのエージェント呼び出しが StructuredOutput を返さず終了した場合（`agent()` の例外・null 返却いずれも同じ経路へ合流させる）、systemic failure として `failed`（Recover → 通常 Implement 経路。再 PR 作成を含む）へ倒すと既存 PR に対して重複 PR を作りうる。そのため既存の enum 外応答（モデルが何かを返した上での不整合。厳格な `failed` を維持）とは区別し、`blocked`（次回実行で monitoring 再開）に分類する。対象は「PR が既に存在する Merge ループ内」に限り、Plan / Implement / Review / Recover / PR Create（`pr: 0`）の失敗分類には一切触れない（halt 防御は弱めない。monitor に限り、null・例外のとき 1 回だけ即時再試行し（再試行は gh run rerun・@cursor review 投稿等の書き込みを禁止した観測専用の指示付きで行う。）（書き込みを伴う fix は 1 回目が push 済みの可能性があり、再実行すると pushed:false の no-op で push を見失うため再試行しない）、それでも失敗した場合に `blocked` へ倒す。それ以外はこのランの中で自動リトライを行わない）。ルートノード（verify-close）は `pr` / `worktree` の概念を持たないため、同じ理由で `blocked`（halt 非カウント）に分類し、次回実行時に verify-close を素のまま再実行する。詳細は references/recovery.md の「StructuredOutput 未返却時の fail-safe」節を参照。
 
 **強制スレッド再走査の救済ラウンド:** merge-exec が `unresolved-threads`（未解決スレッドの「件数」だけを検出）を返し、かつスレッド内容の一覧が手元にない場合、ホストは fix を起動せず `forceThreadRescan` を立てて次ラウンドの monitor に手順 5 の強制再走査を指示する。このとき監視予算がすでに尽きていると救済ラウンドが一度も走らないため、**実行全体で 1 回だけ監視枠を延長する**（2 回目以降は延長せず残り予算で終端する。merge-exec が空一覧を返し続けても監視回数は初期予算 + 1 で有界）。
 
@@ -632,13 +632,14 @@ open のサブイシューが残っている場合、または受入基準が未
 | `plan:declared-deps-*`（本文の依存宣言の機械抽出） | haiku | low | 定型コマンド出力の転記（判断なし） |
 | `plan:out-of-tree-deps-*` / `plan:root-ancestors-<round>`（ツリー外前提の state・ルートの祖先チェーンの機械取得） | haiku | low | 定型コマンド出力の転記（判断なし）。ツリー外の前提がある場合のみ起動。祖先チェーンはラウンドごとにラベルが変わる（`plan:root-ancestors-1` 等、最大 5 ラウンド） |
 | `detect:external-checks`（外部チェック判定） | haiku | low | 定型コマンド集計 |
-| `state:load` / `state:update` / `state:cleanup` / `state:init-all` / `state:high-water` | haiku（未返却時 sonnet へ 1 回フォールバック） | low | jq の機械処理。StructuredOutput 未返却（例外・null・schema 不適合）が続く場合のみ同一プロンプトで sonnet へ 1 回フォールバックする（詳細は `references/recovery.md`） |
+| `state:load` / `state:load-verify` / `state:update` / `state:cleanup` / `state:init-all` / `state:high-water` | haiku（未返却時 sonnet へ 1 回フォールバック） | low | jq の機械処理。StructuredOutput 未返却（例外・null・schema 不適合）が続く場合のみ同一プロンプトで sonnet へ 1 回フォールバックする。`state:load-verify` は読込結果を項目ごとの sha256 で照合する独立エージェント（詳細は `references/recovery.md`） |
 | `nonce:seed`（境界トークン用 seed 生成） | haiku | low | `/dev/urandom` 読み出しのみ（driver に乱数源が無いため。下記「非信頼データの扱い」2 を参照） |
 | `recover:#N`（中断作業の継続可否判断） | （指定なし＝セッション継承） | medium | 計画判断相当（Plan と同じ軸で判断） |
 | `plan:#N`（per-issue 計画立案） | （指定なし＝セッション継承） | high | 最も複雑な計画立案 |
 | `impl:#N`（実装） | sonnet | medium | 計画に沿った実装（コスト最適化） |
 | `review:#N`（独立 Review） | sonnet | medium | 品質・セキュリティ判定 |
 | `fix:#N`（修正） | sonnet | medium | 実装系・コスト最適化 |
+| `pr-bind:#N`（monitoring 再開前・新規 PR の Merge ループ投入前の PR 照合） | sonnet | low | `gh pr view` の取得値の転記のみ（実在・headRefName・closingIssuesReferences の判定はホスト側） |
 | `merge:#N`（CI/レビュー監視・マージ） | sonnet | medium | CI/レビュー判定・マージ可否ゲート |
 | `close:#N`（受入基準確認・クローズ） | sonnet | medium | 受入基準確認・クローズ |
 
