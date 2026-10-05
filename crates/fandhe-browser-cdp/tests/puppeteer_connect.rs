@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use script_harness::{
     HarnessError, INSTALL_HINT, ScriptCommand, ScriptError, ScriptOutcome, TempDir,
-    browser_ws_endpoint, preflight_puppeteer, run_script, start_server,
+    browser_ws_endpoint, parse_result_line, preflight_puppeteer, run_script, start_server,
 };
 
 const MODE_ENV: &str = "FANDHE_FAKE_SCRIPT_MODE";
@@ -296,4 +296,25 @@ fn cdp3_temp_dir_never_reuses_or_removes_existing_directory() {
     assert!(b.0.is_dir());
     drop(b);
     assert!(marker.is_file());
+}
+
+/// CDP-3: 結果行内の不正 UTF-8 は置換せず `Err`、結果行以外の不正バイトは無視する。
+#[test]
+fn cdp3_result_line_requires_valid_utf8() {
+    let mut bad = b"FANDHE_SCRIPT_RESULT {\"ok\":true,\"step\":\"a".to_vec();
+    bad.extend_from_slice(&[0xff, 0xfe]);
+    bad.extend_from_slice(b"\",\"error\":null}\n");
+    let err = parse_result_line(&bad).expect_err("invalid utf-8 must be rejected");
+    assert!(err.starts_with("result line is not valid UTF-8"), "{err}");
+
+    let mut ok = vec![0xff, b'\n'];
+    ok.extend_from_slice(b"FANDHE_SCRIPT_RESULT {\"ok\":true,\"step\":\"s\",\"error\":null}\n");
+    assert_eq!(
+        parse_result_line(&ok),
+        Ok(Some(ScriptOutcome::Completed {
+            ok: true,
+            step: "s".into(),
+            error: None
+        }))
+    );
 }

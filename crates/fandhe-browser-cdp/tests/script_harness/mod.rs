@@ -120,7 +120,7 @@ impl Future for StopFuture {
     }
 }
 
-/// サーバースレッド終了を待つ上限（超過時は待たずにプロファイルを削除する）。
+/// サーバースレッド終了を待つ上限（超過時はプロファイルを削除せず保持して失敗にする）。
 const SERVER_STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// 起動済みテストサーバー。drop 時にサーバーを停止してスレッド終了を待ち、その後に
@@ -130,14 +130,24 @@ pub struct TestServer {
     pub addr: SocketAddr,
     stop: Arc<StopSignal>,
     stopped: Receiver<()>,
-    _dir: TempDir,
+    _dir: Option<TempDir>,
 }
 
 impl Drop for TestServer {
     fn drop(&mut self) {
         self.stop.trigger();
-        // サーバースレッドが終了時に送る完了通知を待つ（切断で Err になっても待機は終わる）。
-        let _ = self.stopped.recv_timeout(SERVER_STOP_GRACE);
+        // サーバースレッドが終了時に送る完了通知を待つ（送信側が drop されて Err(Disconnected)
+        // になるのはスレッド終了済みの場合なので削除してよい）。時間切れは稼働中の可能性が
+        // あるため、プロファイルを削除せず（leak して）失敗として報告する。
+        if matches!(
+            self.stopped.recv_timeout(SERVER_STOP_GRACE),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            std::mem::forget(self._dir.take());
+            if !std::thread::panicking() {
+                panic!("test server did not stop within {SERVER_STOP_GRACE:?}; profile dir kept");
+            }
+        }
     }
 }
 
@@ -182,7 +192,7 @@ pub fn start_server() -> TestServer {
         addr,
         stop,
         stopped,
-        _dir: dir,
+        _dir: Some(dir),
     }
 }
 
@@ -387,13 +397,21 @@ fn tail(bytes: &[u8]) -> String {
 
 /// stdout から結果行（最後の 1 行）を取り出して解析する。結果行が無ければ `Ok(None)`。
 pub fn parse_result_line(stdout: &[u8]) -> Result<Option<ScriptOutcome>, String> {
-    let text = String::from_utf8_lossy(stdout);
-    let Some(line) = text.lines().rev().find(|l| l.starts_with(RESULT_PREFIX)) else {
+    // 結果行以外（ログ等）に不正な UTF-8 があっても無視できるよう、バイト列のまま行を探し、
+    // 結果行だけを厳密に UTF-8 検証する（置換して成功扱いにしない）。
+    let Some(raw) = stdout
+        .split(|b| *b == b'\n')
+        .rev()
+        .find(|l| l.starts_with(RESULT_PREFIX.as_bytes()))
+    else {
         return Ok(None);
     };
-    if line.len() > MAX_RESULT_LINE_BYTES {
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    if raw.len() > MAX_RESULT_LINE_BYTES {
         return Err(format!("result line exceeds {MAX_RESULT_LINE_BYTES} bytes"));
     }
+    let line =
+        std::str::from_utf8(raw).map_err(|e| format!("result line is not valid UTF-8: {e}"))?;
     let json: Value = serde_json::from_str(line.get(RESULT_PREFIX.len()..).unwrap_or_default())
         .map_err(|e| format!("result line is not valid JSON: {e}"))?;
     let ok = json
