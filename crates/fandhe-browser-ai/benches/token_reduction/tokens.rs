@@ -7,8 +7,8 @@
 //! ようにする。呼び出し元はベンチ本体（`token_reduction.rs`）とユニットテスト
 //! （`tokens_tests.rs`）で、どちらも `#[path]` で本ファイルを取り込む。
 //!
-//! 未実装（#94・TASK-14.3）: snapshot 経由のトークン数・削減率・平均集計。
-//! #94 は [`RawHtmlTokens`] へフィールドを足して拡張する。
+//! snapshot 経由のトークン数・削減率・平均集計は `reduction.rs`
+//! （TASK-14.3・Issue #94）が担い、本モジュールの [`measure_raw_html`] を分母に使う。
 
 use std::fmt;
 use std::fs;

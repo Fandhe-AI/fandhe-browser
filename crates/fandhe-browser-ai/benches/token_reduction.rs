@@ -1,27 +1,63 @@
-//! 生 HTML トークン量の計測ベンチ（TASK-14.2・`AISNAP-1`・Issue #93・`MS-2`）。
+//! 生 HTML・snapshot のトークン量と削減率の計測ベンチ
+//! （TASK-14.2・TASK-14.3・`AISNAP-1`・Issue #93・#94・`MS-2`）。
 //!
 //! 実行: `cargo bench -p fandhe-browser-ai --bench token_reduction`
 //!
-//! 現時点は `benches/fixtures/` の各ページの生 HTML トークン量（`cl100k_base`）だけを
-//! 出力する。snapshot 経由のトークン数・削減率・平均集計は未実装で、#94
-//! （TASK-14.3・`AISNAP-1`）が追加する。
+//! `benches/fixtures/` の全ページについて、生 HTML と snapshot（`build_snapshot` の
+//! 結果を `snapshot_text` で暫定テキスト化したもの）のトークン量（`cl100k_base`）、
+//! 生 HTML 比の削減率、全ページ平均を TSV で出力する。件数は spec 上の 14 ページ
+//! ではなくディレクトリ内の全件（現状 17）。目標値（85%）は参考表示のみで、
+//! 達成可否の判定は #97 の担当のため終了コードには反映しない。
+//! テキスト形式は測定用の暫定形式（TASK-19・`AISNAP-6` で確定後に差し替え）。
 
 #[path = "token_reduction/tokens.rs"]
 mod tokens;
 
+#[path = "token_reduction/snapshot_text.rs"]
+mod snapshot_text;
+
+#[path = "token_reduction/reduction.rs"]
+mod reduction;
+
 use std::process::ExitCode;
 
+/// `AISNAP-1` の目標削減率（%）。参考表示専用。
+const TARGET_PCT: f64 = 85.0;
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let counter = tokens::TokenCounter::new()?;
+    let rows = reduction::measure_reduction(&counter, &tokens::fixtures_dir())?;
+    let summary = reduction::summarize(&rows).ok_or("no fixtures found")?;
+    println!("name\tbytes\trawHtmlTokens\tsnapshotTokens\treductionPct\ttruncated");
+    for r in &rows {
+        println!(
+            "{}\t{}\t{}\t{}\t{:.1}\t{}",
+            r.name,
+            r.bytes,
+            r.raw_html_tokens,
+            r.snapshot_tokens,
+            r.reduction_pct,
+            r.snapshot_truncated
+        );
+    }
+    println!();
+    println!("# token reduction vs raw HTML (AISNAP-1)");
+    println!("pages\t{}", summary.pages);
+    println!("meanReductionPct\t{:.1}", summary.mean_reduction_pct);
+    println!("minReductionPct\t{:.1}", summary.min_reduction_pct);
+    println!("maxReductionPct\t{:.1}", summary.max_reduction_pct);
+    println!(
+        "medianSnapshotTokens\t{:.1}\t(AISNAP-4 reference)",
+        summary.median_snapshot_tokens
+    );
+    println!("targetPct\t{TARGET_PCT:.1}");
+    println!("met\t{}", summary.mean_reduction_pct >= TARGET_PCT);
+    Ok(())
+}
+
 fn main() -> ExitCode {
-    let result = tokens::TokenCounter::new()
-        .and_then(|counter| tokens::measure_raw_html(&counter, &tokens::fixtures_dir()));
-    match result {
-        Ok(rows) => {
-            println!("name\tbytes\trawHtmlTokens");
-            for r in rows {
-                println!("{}\t{}\t{}", r.name, r.bytes, r.tokens);
-            }
-            ExitCode::SUCCESS
-        }
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
