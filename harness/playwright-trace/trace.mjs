@@ -14,6 +14,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
   SCHEMA_VERSION,
+  MAX_LINE_BYTES,
   MAX_RECORDS,
   normalizeString,
   normalizeValue,
@@ -63,10 +64,16 @@ const push = (r) => {
 
 // playwright-core の debug 出力を有効化し、stderr への書き込みを横取りする（エコーしない）。
 process.env.DEBUG = "pw:protocol";
+process.env.DEBUG_COLORS = "no";
 let pending = "";
 const origWrite = process.stderr.write.bind(process.stderr);
 process.stderr.write = (chunk, ...rest) => {
   pending += chunk.toString();
+  // 改行が来ないまま蓄積が上限を超えたら収集を中断する（無制限バッファ防止）。
+  if (Buffer.byteLength(pending) > MAX_LINE_BYTES * 2 && pending.indexOf("\n") < 0) {
+    origWrite("error: protocol log line exceeds buffer limit; aborting\n");
+    process.exit(1);
+  }
   let idx;
   while ((idx = pending.indexOf("\n")) >= 0) {
     const line = pending.slice(0, idx);
@@ -150,13 +157,10 @@ if (!browser) {
 }
 
 if (browser) {
+  // 既存 context の有無に関わらず newContext から newPage までの CDP 列を必ず収集する。
   let context;
-  const ctxs = await stage("browser.contexts()", async () => browser.contexts());
-  if (ctxs.ok && ctxs.value.length > 0) context = ctxs.value[0];
-  if (!context) {
-    const r = await stage("newContext", () => browser.newContext());
-    if (r.ok) context = r.value;
-  }
+  const r = await stage("newContext", () => browser.newContext());
+  if (r.ok) context = r.value;
   if (context) {
     // newPage 到達後は goto 等へ進まない（スコープは newPage まで）。
     await stage("newPage", () => context.newPage());

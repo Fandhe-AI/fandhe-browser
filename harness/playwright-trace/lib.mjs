@@ -9,6 +9,7 @@ export const PLACEHOLDER_PORT = "<PORT>";
 // 1 行あたり・総行数の上限（無制限確保の防止。security.md「不安全な設計」）。
 export const MAX_LINE_BYTES = 64 * 1024;
 export const MAX_RECORDS = 1024;
+const ANSI = /\u001b\[[0-9;]*m/g;
 
 /** loopback の IP リテラル（127.0.0.1 / [::1]）かを判定する。ホスト名（localhost 含む）は拒否。 */
 export function isLoopbackHost(hostname) {
@@ -50,7 +51,9 @@ export function validateOutPath(raw) {
  * DEBUG=pw:protocol の 1 行（`<ISO 時刻> pw:protocol SEND ► {json}` /
  * `... ◀ RECV {json}`）を解析する。対象外の行は null、JSON 不正は Error。
  */
-export function parseProtocolLine(line) {
+export function parseProtocolLine(rawLine) {
+  // TTY では debug が namespace と SEND/RECV の間へ色リセットを挟むため、照合前に ANSI を除去する。
+  const line = rawLine.replace(ANSI, "");
   const m = /pw:protocol (SEND ►|◀ RECV) (\{.*\})\s*$/.exec(line);
   if (m === null) return null;
   if (Buffer.byteLength(m[2]) > MAX_LINE_BYTES) {
@@ -58,8 +61,6 @@ export function parseProtocolLine(line) {
   }
   return { dir: m[1] === "SEND ►" ? "send" : "recv", message: JSON.parse(m[2]) };
 }
-
-const ANSI = /\u001b\[[0-9;]*m/g;
 
 /** 文字列中のポート・ANSI・ホームディレクトリ等を固定表現へ置換する。 */
 export function normalizeString(s, port) {

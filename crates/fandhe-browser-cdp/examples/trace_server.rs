@@ -17,7 +17,13 @@ fn main() {
     use fandhe_browser_profile::Profile;
 
     // プロファイルは PID 付きの一時ディレクトリに作り、終了時に削除を試みる。
-    let dir = std::env::temp_dir().join(format!("fandhe-cdp-trace-{}", std::process::id()));
+    // Profile::open は祖先に symlink を含むパスを拒否する（macOS の /var -> /private/var 等）ため、
+    // 信頼できる基点を canonicalize してから専用名を結合する。
+    let base = std::env::temp_dir().canonicalize().unwrap_or_else(|e| {
+        eprintln!("failed to canonicalize temp dir: {e}");
+        std::process::exit(1);
+    });
+    let dir = base.join(format!("fandhe-cdp-trace-{}", std::process::id()));
     let profile = Arc::new(Profile::open(&dir).unwrap_or_else(|e| {
         eprintln!("failed to open profile: {e}");
         std::process::exit(1);

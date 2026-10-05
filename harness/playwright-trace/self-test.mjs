@@ -61,6 +61,11 @@ t("parseProtocolLine parses SEND and RECV", () => {
   assert.throws(() => parseProtocolLine("pw:protocol SEND ► {broken}"));
 });
 
+t("parseProtocolLine tolerates ANSI sequences around SEND/RECV", () => {
+  const r = parseProtocolLine('2026-10-05T10:09:13.132Z \u001b[0m\u001b[31mpw:protocol\u001b[0m SEND ► {"id":1}');
+  assert.deepEqual(r, { dir: "send", message: { id: 1 } });
+});
+
 t("normalize replaces port and strips ANSI", () => {
   assert.equal(normalizeString("ws://127.0.0.1:44337/x \u001b[2mdim\u001b[22m", "44337"), "ws://127.0.0.1:<PORT>/x dim");
   assert.deepEqual(normalizeValue({ a: ["http://127.0.0.1:1234/"] }, "1234"), { a: ["http://127.0.0.1:<PORT>/"] });
