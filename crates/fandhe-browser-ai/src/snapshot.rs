@@ -46,8 +46,7 @@
 //!   [`build_snapshot`] が子孫を展開せず、ヘッダ・圧縮行・超過行数を持つ 1 ノードへ
 //!   置き換える。圧縮した行・項目の中の操作要素（リンク等）の格納先として
 //!   [`TableRow::controls`]（[`RowControl`]）へ、圧縮行内の `a[href]`・`button` を ref 付きで保持する
-//!   （`AISNAP-13`・Issue #630 で型、#632 で保持）。
-//!   保持と ref 付与は後続 Issue #632 で行う。`AISNAP-10`・`AISNAP-13`）
+//!   （`AISNAP-13`・Issue #630 で型、#632 で保持。`AISNAP-10`・`AISNAP-13`）
 //! - ユニットテスト一式: TASK-11.8（Issue #77）で実装済み（代表フィクスチャ 3 種の
 //!   結合テスト `tests/snapshot.rs`）
 
