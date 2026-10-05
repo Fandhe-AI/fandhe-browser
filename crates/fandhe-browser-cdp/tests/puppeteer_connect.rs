@@ -45,6 +45,19 @@ fn fake_script_child_entry() {
         "hang" => std::thread::sleep(Duration::from_secs(120)),
         "malformed" => println!("FANDHE_SCRIPT_RESULT {{not json"),
         "oversize" => println!("FANDHE_SCRIPT_RESULT {}", "x".repeat(70 * 1024)),
+        // 1MiB 超の出力の末尾に結果行を出す（結果行を取りこぼさないことの検証）。
+        "flood" => {
+            let line = "y".repeat(1023);
+            for _ in 0..2048 {
+                println!("{line}");
+            }
+            println!("FANDHE_SCRIPT_RESULT {{\"ok\":true,\"step\":\"flood\",\"error\":null}}");
+        }
+        // 孫プロセスがパイプを握ったまま残る状況（join がハングしないことの検証）。
+        "grandchild" => {
+            let _ = std::process::Command::new("sleep").arg("30").spawn();
+            println!("FANDHE_SCRIPT_RESULT {{\"ok\":true,\"step\":\"gc\",\"error\":null}}");
+        }
         "echo" => println!("FANDHE_SCRIPT_RESULT {{\"ok\":true,\"step\":\"{ep}\",\"error\":null}}"),
         other => panic!("unknown mode {other}"),
     }
@@ -143,6 +156,28 @@ fn rejects_malformed_and_oversize_lines() {
             reason: "result line exceeds 65536 bytes".into()
         }
     );
+}
+
+/// CDP-3: stdout が 1MiB を超えても末尾の結果行を回収できる。
+#[test]
+fn collects_result_after_large_stdout() {
+    assert_eq!(
+        run_script(&fake("flood"), "ws://x", D),
+        ScriptOutcome::Completed {
+            ok: true,
+            step: "flood".into(),
+            error: None
+        }
+    );
+}
+
+/// CDP-3: 孫プロセスがパイプを握り続けても締め切り後にハングしない。
+#[cfg(unix)]
+#[test]
+fn does_not_hang_when_grandchild_holds_pipe() {
+    let started = std::time::Instant::now();
+    let _ = run_script(&fake("grandchild"), "ws://x", D);
+    assert!(started.elapsed() < Duration::from_secs(20));
 }
 
 /// CDP-3: 実サーバーの WS エンドポイントがスクリプトへそのまま渡る。

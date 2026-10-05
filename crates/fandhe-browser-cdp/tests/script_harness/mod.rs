@@ -12,7 +12,8 @@
 //!   `{"ok": bool, "step": string, "error": {"name": string, "message": string} | null}` を出す。
 //!
 //! # 安全性
-//! 子プロセスは締め切りで kill し、stdout/stderr・結果行には読み取り上限を設ける
+//! 子プロセスは締め切りで kill し、stderr は末尾のみ・stdout は結果行のみを上限付きで保持し、
+//! kill 後のリーダー待機にも上限を設ける
 //! （無制限確保による DoS の防止）。サーバーは `127.0.0.1:0` にのみ bind する。
 
 // 2 つのテストターゲットが別々の部分集合を使うため、未使用項目の警告を許容する。
@@ -24,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use fandhe_backend_core::server::Server;
@@ -36,7 +38,7 @@ use serde_json::Value;
 pub const ENDPOINT_ENV: &str = "FANDHE_CDP_WS_ENDPOINT";
 /// 結果行の固定接頭辞（後ろに JSON が続く）。
 pub const RESULT_PREFIX: &str = "FANDHE_SCRIPT_RESULT ";
-/// stdout / stderr それぞれの保持上限（超過分は読み捨てる）。
+/// stderr の保持上限（末尾を保持）。stdout は結果行のみ回収する。
 pub const MAX_STREAM_BYTES: usize = 1024 * 1024;
 /// 結果行 1 行の長さ上限。
 pub const MAX_RESULT_LINE_BYTES: usize = 64 * 1024;
@@ -44,6 +46,8 @@ pub const MAX_RESULT_LINE_BYTES: usize = 64 * 1024;
 pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
 /// `stderr_tail` に保持する末尾バイト数。
 const STDERR_TAIL_BYTES: usize = 2048;
+/// kill / 終了後にリーダー出力を待つ上限（孫プロセスがパイプを握り続ける場合の保護）。
+const JOIN_GRACE: Duration = Duration::from_secs(2);
 
 /// 未導入時に表示する導入手順（固定の英語文言。AC3）。
 pub const INSTALL_HINT: &str =
@@ -189,24 +193,75 @@ pub enum HarnessError {
     },
 }
 
-/// stdout/stderr を別スレッドで上限付きに読む。上限超過分は読み捨てる（子のパイプ詰まり防止）。
-fn spawn_reader<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec<u8>> {
+/// stderr を別スレッドで読み、末尾 [`MAX_STREAM_BYTES`] だけを保持する（子のパイプ詰まり防止）。
+fn spawn_tail_reader<R: Read + Send + 'static>(mut r: R) -> Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut kept = Vec::new();
+        let mut kept: Vec<u8> = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
             match r.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let room = MAX_STREAM_BYTES.saturating_sub(kept.len());
-                    if let Some(chunk) = buf.get(..n.min(room)) {
-                        kept.extend_from_slice(chunk);
+                    kept.extend_from_slice(buf.get(..n).unwrap_or_default());
+                    // 上限の 2 倍に達したら末尾 MAX_STREAM_BYTES だけ残す（償却 O(1)）。
+                    if kept.len() >= MAX_STREAM_BYTES * 2 {
+                        kept.drain(..kept.len() - MAX_STREAM_BYTES);
                     }
                 }
             }
         }
-        kept
-    })
+        let start = kept.len().saturating_sub(MAX_STREAM_BYTES);
+        tx.send(kept.split_off(start)).ok();
+    });
+    rx
+}
+
+/// stdout を別スレッドで読み、`RESULT_PREFIX` で始まる最後の行だけを回収する。
+///
+/// 出力量に関わらず結果行を取りこぼさない（先頭保持だと 1MiB 超の出力で末尾の結果行を
+/// 捨ててしまうため）。1 行の保持は `MAX_RESULT_LINE_BYTES + 1` までで、超過分は読み捨てる
+/// （長さ超過は `parse_result_line` が `Malformed` にする）。
+fn spawn_result_reader<R: Read + Send + 'static>(mut r: R) -> Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let cap = MAX_RESULT_LINE_BYTES + 1;
+        let mut cur: Vec<u8> = Vec::new();
+        let mut last: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        let finish = |cur: &mut Vec<u8>, last: &mut Vec<u8>| {
+            if cur.starts_with(RESULT_PREFIX.as_bytes()) {
+                std::mem::swap(cur, last);
+            }
+            cur.clear();
+        };
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    for &b in buf.get(..n).unwrap_or_default() {
+                        if b == b'\n' {
+                            finish(&mut cur, &mut last);
+                        } else if cur.len() < cap {
+                            cur.push(b);
+                        }
+                    }
+                }
+            }
+        }
+        finish(&mut cur, &mut last);
+        if !last.is_empty() {
+            last.push(b'\n');
+        }
+        tx.send(last).ok();
+    });
+    rx
+}
+
+/// リーダーの結果を締め切り付きで受け取る。孫プロセスがパイプの write 端を握り続けて
+/// EOF が来ない場合でも `run_script` がハングしないよう、`JOIN_GRACE` で諦める。
+fn collect(rx: &Receiver<Vec<u8>>) -> Vec<u8> {
+    rx.recv_timeout(JOIN_GRACE).unwrap_or_default()
 }
 
 fn tail(bytes: &[u8]) -> String {
@@ -267,8 +322,8 @@ pub fn run_script(cmd: &ScriptCommand, ws_endpoint: &str, deadline: Duration) ->
         c.current_dir(d);
     }
     let mut child = c.spawn().expect("spawn script");
-    let out = spawn_reader(child.stdout.take().expect("stdout"));
-    let err = spawn_reader(child.stderr.take().expect("stderr"));
+    let out = spawn_result_reader(child.stdout.take().expect("stdout"));
+    let err = spawn_tail_reader(child.stderr.take().expect("stderr"));
 
     let start = Instant::now();
     let (status, timed_out) = loop {
@@ -282,8 +337,8 @@ pub fn run_script(cmd: &ScriptCommand, ws_endpoint: &str, deadline: Duration) ->
             None => std::thread::sleep(Duration::from_millis(20)),
         }
     };
-    let stdout = out.join().unwrap_or_default();
-    let stderr = err.join().unwrap_or_default();
+    let stdout = collect(&out);
+    let stderr = collect(&err);
     if timed_out {
         return ScriptOutcome::TimedOut {
             stderr_tail: tail(&stderr),
