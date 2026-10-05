@@ -30,6 +30,10 @@
 //! 表ノード直下の葉として走査する（`Item`）。`HeaderCell::data_leaf` は型の値をそのまま
 //! 検査し、テスト側で補完しない（Issue #625）。
 //!
+//! 圧縮表の行内操作要素（AISNAP-2・AISNAP-13・Issue #632）: リンク・ボタンだけの表・一覧は
+//! 圧縮され、行内の `a[href]`・`button` は `TableRow::controls` の `RowControl` として ref を
+//! 持つ。表ノード直下の葉としてヘッダの後ろに文書順で並べて走査する（`Item::Control`）。
+//!
 //! フィクスチャ制約: `<body>` 内に `build_snapshot` が除外する要素（`script`・`style`・
 //! `noscript`・`template`・`hidden`・`aria-hidden="true"`・`input[type=hidden]`）を
 //! 置かない。除外されると添字対応付けがずれるため。また圧縮表に非表示セルを置かない
@@ -43,8 +47,8 @@ use std::collections::HashSet;
 
 use fandhe_browser_ai::data_leaf::classify_data_leaf;
 use fandhe_browser_ai::snapshot::{
-    CheckedState, DataLeafKind, HeaderCell, Node, Snapshot, build_snapshot, compute_name,
-    compute_role,
+    CheckedState, DataLeafKind, HeaderCell, Node, RowControl, Snapshot, build_snapshot,
+    compute_name, compute_role,
 };
 use fandhe_browser_core::dom::{Document, NodeId};
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
@@ -78,11 +82,12 @@ const HN_LIST: &str = r#"<!DOCTYPE html><html><head><title>News</title></head><b
 const CHECKBOXES_FORM: &str = r#"<!DOCTYPE html><html><head><title>Checkboxes</title></head><body><h3>Checkboxes</h3><form id="checkboxes"><input type="checkbox"> checkbox 1<br><input type="checkbox" checked> checkbox 2</form></body></html>"#;
 
 /// 走査対象の借用ビュー。通常ノードと、圧縮表（`Node::table`）のヘッダセルを
-/// 同じ述語で検査するための和型（値の補完はしない）。
+/// 同じ述語で検査するための和型（値の補完はしない）。圧縮表の行内操作要素も含む。
 #[derive(Clone, Copy)]
 enum Item<'a> {
     Node(&'a Node),
     Header(&'a HeaderCell),
+    Control(&'a RowControl),
 }
 
 impl<'a> Item<'a> {
@@ -90,43 +95,53 @@ impl<'a> Item<'a> {
         match self {
             Item::Node(n) => &n.role,
             Item::Header(h) => &h.role,
+            Item::Control(c) => &c.role,
         }
     }
     fn name(self) -> &'a str {
         match self {
             Item::Node(n) => &n.name,
             Item::Header(h) => &h.name,
+            Item::Control(c) => &c.name,
         }
     }
     fn r#ref(self) -> Option<&'a str> {
         match self {
             Item::Node(n) => n.r#ref.as_deref(),
             Item::Header(h) => Some(&h.r#ref),
+            Item::Control(c) => Some(&c.r#ref),
         }
     }
     fn data_leaf(self) -> Option<DataLeafKind> {
         match self {
             Item::Node(n) => n.data_leaf,
             Item::Header(h) => h.data_leaf,
+            Item::Control(_) => None,
         }
     }
     fn checked(self) -> Option<CheckedState> {
         match self {
             Item::Node(n) => n.state.checked,
-            Item::Header(_) => None,
+            Item::Header(_) | Item::Control(_) => None,
         }
     }
-    /// 子（通常の子の後ろに圧縮表のヘッダを並べる）。
+    /// 子（通常の子の後ろに圧縮表のヘッダ、各行の操作要素を文書順で並べる）。
     fn children(self) -> Vec<Item<'a>> {
         match self {
             Item::Node(n) => {
                 let mut out: Vec<Item<'a>> = n.children.iter().map(Item::Node).collect();
                 if let Some(t) = &n.table {
                     out.extend(t.header.iter().map(Item::Header));
+                    out.extend(
+                        t.rows
+                            .iter()
+                            .flat_map(|r| r.controls.iter())
+                            .map(Item::Control),
+                    );
                 }
                 out
             }
-            Item::Header(_) => Vec::new(),
+            Item::Header(_) | Item::Control(_) => Vec::new(),
         }
     }
 }
@@ -286,11 +301,22 @@ fn is_snapshot_child(doc: &Document, id: NodeId) -> bool {
     doc.is_element(id) && doc.local_name(id) != Some("head")
 }
 
+/// 圧縮表の行内操作要素（`a[href]`・`button`）か（フィクスチャでは `tabindex` 等を使わない）。
+fn is_row_control_element(doc: &Document, id: NodeId) -> bool {
+    match doc.local_name(id) {
+        Some("a") => doc.attribute(id, "href").is_some(),
+        Some("button") => true,
+        _ => false,
+    }
+}
+
 /// DOM 上の `target` に対応する Snapshot 上の項目を、ルートからの添字で辿って返す。
 /// role・name・data_leaf の一致まで確認し、ずれは対応付け自体の不備として失敗させる。
 fn map_to_snapshot<'a>(doc: &Document, snapshot: &'a Snapshot, target: NodeId) -> Item<'a> {
     // target からルートへ向かって、各段での「Snapshot 上の子としての添字」を集める。
     let mut path = Vec::new();
+    // chain[k] は深さ k の Snapshot 項目に対応する DOM ノード（後で逆順にする）。
+    let mut chain = vec![target];
     let mut cur = target;
     while let Some(parent) = doc.parent(cur) {
         let idx = doc
@@ -299,23 +325,44 @@ fn map_to_snapshot<'a>(doc: &Document, snapshot: &'a Snapshot, target: NodeId) -
             .position(|c| c == cur)
             .expect("対象は親の Snapshot 対象の子に含まれる");
         path.push(idx);
+        chain.push(parent);
         cur = parent;
     }
+    chain.reverse();
     let mut item = Item::Node(&snapshot.tree);
     let mut steps = path.iter().rev();
+    let mut depth = 0usize;
     while let Some(idx) = steps.next() {
         let Item::Node(node) = item else {
             panic!("ヘッダセルの下に子はない");
         };
         if let Some(table) = &node.table {
-            // 圧縮した表: 残りの経路（thead/tr/th）は最後の添字（列位置）のヘッダセルへ畳む。
-            let col = steps.next_back().unwrap_or(idx);
-            item = Item::Header(
-                table
-                    .header
-                    .get(*col)
-                    .expect("列位置に対応するヘッダセルがある"),
-            );
+            if is_row_control_element(doc, target) {
+                // 圧縮した表の操作要素: 表内の `a[href]`・`button` の文書順位置で対応付ける
+                // （フィクスチャ制約: 全行が保持され、行・表の上限未満）。
+                let table_dom = *chain.get(depth).expect("表に対応する DOM がある");
+                let pos = doc
+                    .descendants(table_dom)
+                    .filter(|d| is_row_control_element(doc, *d))
+                    .position(|d| d == target)
+                    .expect("対象は表の操作要素に含まれる");
+                let control = table
+                    .rows
+                    .iter()
+                    .flat_map(|r| r.controls.iter())
+                    .nth(pos)
+                    .expect("位置に対応する操作要素がある");
+                item = Item::Control(control);
+            } else {
+                // 圧縮した表: 残りの経路（thead/tr/th）は最後の添字（列位置）のヘッダセルへ畳む。
+                let col = steps.next_back().unwrap_or(idx);
+                item = Item::Header(
+                    table
+                        .header
+                        .get(*col)
+                        .expect("列位置に対応するヘッダセルがある"),
+                );
+            }
             break;
         }
         item = Item::Node(
@@ -323,6 +370,7 @@ fn map_to_snapshot<'a>(doc: &Document, snapshot: &'a Snapshot, target: NodeId) -
                 .get(*idx)
                 .expect("添字に対応する Snapshot ノードがある"),
         );
+        depth += 1;
     }
     let expected_role = compute_role(doc, target).map_or("generic", |r| r.as_str());
     assert_eq!(item.role(), expected_role, "対応付けの role が一致する");
@@ -360,7 +408,15 @@ fn dom_at_path(doc: &Document, snapshot: &Snapshot, path: &[usize]) -> Option<No
     let mut cur = doc.root();
     let mut node = &snapshot.tree;
     for idx in path {
-        if node.table.is_some() {
+        if let Some(table) = &node.table {
+            let header_len = table.header.len();
+            if *idx >= header_len {
+                // 圧縮した表の操作要素: 表内の `a[href]`・`button` を文書順で逆引きする。
+                return doc
+                    .descendants(cur)
+                    .filter(|d| is_row_control_element(doc, *d))
+                    .nth(*idx - header_len);
+            }
             // 圧縮した表のヘッダセル: 列位置の th を文書順で逆引きする。
             let th = doc
                 .descendants(cur)
