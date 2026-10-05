@@ -61,6 +61,13 @@ DENY_LICENSE_REJECT_CASES := GPL-3.0-only AGPL-3.0-only LGPL-2.1-only MPL-2.0
 BINARY_SIZE_PACKAGE ?= fandhe-browser-cli
 BINARY_SIZE_LIMIT_BYTES ?= 91480000
 
+# trace-playwright（TASK-43.1・CDP-2。harness/playwright-trace/README.md 参照）が
+# npm から一時導入する playwright-core の版（exact 固定。package.json・lockfile は置かない）。
+# 版を上げるときは PLAYWRIGHT_INTEGRITY も更新する（`npm view playwright-core@<版> dist.integrity`）。
+# run.sh が導入結果を検証し、playwright-core 単独・版・integrity が一致しなければ失敗する。
+PLAYWRIGHT_VERSION := 1.63.0
+PLAYWRIGHT_INTEGRITY := sha512-rYCsBF/M5HjUch52bbtVONEFjv6Xu8sm8h72dNlR5bzIE1fvC/bxgspzkjSfU+MweEMmPM8KJebG6nnyxo5mCg==
+
 .PHONY: help
 help: ## ターゲット一覧を表示する
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
@@ -608,3 +615,14 @@ docker-shell: ## 開発コンテナのシェルに入る
 .PHONY: docker-ci
 docker-ci: ## コンテナ内で make ci を実行する（環境非依存の検証）
 	docker compose run --rm dev make ci
+
+# --------------------------------------------------
+# Playwright トレース収集（TASK-43.1・CDP-2。harness/playwright-trace/README.md 参照）
+# --------------------------------------------------
+.PHONY: trace-playwright
+trace-playwright: ## Playwright newPage() 到達までの CDP トレースを再取得する（手動・要 node/npm/ネットワーク。CI 対象外）
+	bash harness/playwright-trace/run.sh $(PLAYWRIGHT_VERSION) $(PLAYWRIGHT_INTEGRITY) harness/playwright-trace/results/newpage-trace.jsonl --force
+
+.PHONY: check-playwright-trace
+check-playwright-trace: ## harness/playwright-trace のオフライン自己テストを実行する（Playwright・ネットワーク不要。要 node）
+	bash harness/playwright-trace/self-test.sh
