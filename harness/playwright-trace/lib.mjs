@@ -104,7 +104,10 @@ export function normalizeValue(v, port) {
   if (Array.isArray(v)) return v.map((x) => normalizeValue(x, port));
   if (v !== null && typeof v === "object") {
     const o = {};
-    for (const [k, x] of Object.entries(v)) o[k] = normalizeValue(x, port);
+    for (const [k, x] of Object.entries(v)) {
+      // `o[k] =` だと `__proto__` キーがプロトタイプ変更になり直列化で失われるため、own property として定義する。
+      Object.defineProperty(o, k, { value: normalizeValue(x, port), enumerable: true, writable: true, configurable: true });
+    }
     return o;
   }
   return v;

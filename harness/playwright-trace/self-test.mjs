@@ -89,6 +89,11 @@ t("normalize replaces port and strips ANSI", () => {
   assert.deepEqual(normalizeValue({ a: ["http://127.0.0.1:1234/"] }, "1234"), { a: ["http://127.0.0.1:<PORT>/"] });
 });
 
+t("normalizeValue keeps __proto__ keys as own properties", () => {
+  const msg = JSON.parse('{"a":1,"__proto__":{"x":"y"}}');
+  assert.equal(JSON.stringify(normalizeValue(msg, "1")), '{"a":1,"__proto__":{"x":"y"}}');
+});
+
 t("toJsonl adds seq and validates", () => {
   const text = toJsonl([
     { kind: "meta", schema: 1 },
