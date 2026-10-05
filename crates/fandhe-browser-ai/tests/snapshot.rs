@@ -855,6 +855,7 @@ fn aisnap_2_table_with_tfoot_is_not_compressed() {
     assert!(all.iter().all(|n| n.table.is_none()));
     assert!(all.iter().any(|n| n.name == "合計"));
 }
+
 // ---------------------------------------------------------------------------
 // Hacker News 相当フィクスチャの回帰テスト（TASK-12.6・Issue #84・`AISNAP-2`・`MS-2`）
 // ---------------------------------------------------------------------------
