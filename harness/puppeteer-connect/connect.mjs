@@ -25,8 +25,25 @@ process.on("unhandledRejection", (e) => {
   process.exit(1);
 });
 
+// 接続先がループバックの ws:// URL であることを URL 解析で厳密に検証する。
+// 正規表現の前方一致では `ws://localhost:80@evil.example/` のようにユーザー情報で
+// ホストを偽装できるため、hostname・port・userinfo を個別に確認する。
+function isLoopbackWsEndpoint(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "ws:") return false;
+  if (url.username !== "" || url.password !== "") return false;
+  if (!["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) return false;
+  const port = Number(url.port);
+  return url.port !== "" && Number.isInteger(port) && port >= 1 && port <= 65535;
+}
+
 const endpoint = process.env.FANDHE_CDP_WS_ENDPOINT ?? "";
-if (!/^ws:\/\/(127\.0\.0\.1|localhost):/.test(endpoint)) {
+if (!isLoopbackWsEndpoint(endpoint)) {
   report(false, "connect", new Error("endpoint must be a loopback ws:// URL"));
   process.exit(1);
 }
