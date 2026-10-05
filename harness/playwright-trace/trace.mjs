@@ -64,6 +64,7 @@ try {
 }
 
 const port = endpoint.port;
+const host = endpoint.hostname;
 const records = [];
 const origWrite = process.stderr.write.bind(process.stderr);
 // 欠落・切り詰めたトレースを正常成果物として残さないため、致命的エラーは JSONL を書かずに
@@ -114,7 +115,7 @@ process.stderr.write = (chunk, ...rest) => {
     let rec = null;
     try {
       const parsed = parseProtocolLine(line);
-      if (parsed) rec = { kind: "cdp", dir: parsed.dir, message: normalizeValue(parsed.message, port) };
+      if (parsed) rec = { kind: "cdp", dir: parsed.dir, message: normalizeValue(parsed.message, port, host) };
     } catch (e) {
       // 解析不能行はレコード欠落になるため収集全体を失敗させる。
       fatal(`unparsable protocol line: ${e.message}`);
@@ -156,7 +157,7 @@ async function stage(name, fn) {
     return { ok: true, value: v };
   } catch (e) {
     if (/timed out after/.test(String(e.message))) timedOutStage ??= name;
-    push({ kind: "stage", name, ok: false, error: normalizeString(String(e.message), port) });
+    push({ kind: "stage", name, ok: false, error: normalizeString(String(e.message), port, host) });
     return { ok: false };
   }
 }
@@ -174,7 +175,7 @@ for (const p of ["/json/version", "/json/version/"]) {
       if (typeof body.webSocketDebuggerUrl === "string") wsUrl = body.webSocketDebuggerUrl;
     }
   } catch (e) {
-    push({ kind: "http", method: "GET", path: p, error: normalizeString(String(e.message), port) });
+    push({ kind: "http", method: "GET", path: p, error: normalizeString(String(e.message), port, host) });
   }
 }
 

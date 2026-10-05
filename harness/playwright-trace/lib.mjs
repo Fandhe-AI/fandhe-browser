@@ -89,24 +89,31 @@ export function drainLines(pending, chunk) {
   return { lines: parts, rest };
 }
 
-/** 文字列中のポート・ANSI・ホームディレクトリ等を固定表現へ置換する。 */
-export function normalizeString(s, port) {
+/**
+ * 文字列中の接続先（host:port）・ANSI を固定表現へ置換する。
+ * `host` は endpoint の URL ホスト表記（`127.0.0.1` / `[::1]`）。host:port に一致し、ポート直後が
+ * 数字でない箇所だけを置換するため、無関係な URL・数値（例: `example.com:12345`）は変えない。
+ * host 未指定時はポート置換を行わない。
+ */
+export function normalizeString(s, port, host) {
   let out = s.replace(ANSI, "");
-  if (port) {
-    out = out.split(`:${port}`).join(`:${PLACEHOLDER_PORT}`);
+  if (port && host) {
+    const esc = host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`(?<![0-9A-Za-z.\\-])${esc}:${port}(?![0-9])`, "g");
+    out = out.replace(re, `${host}:${PLACEHOLDER_PORT}`);
   }
   return out;
 }
 
 /** JSON 値を再帰的に走査して全文字列を正規化する。 */
-export function normalizeValue(v, port) {
-  if (typeof v === "string") return normalizeString(v, port);
-  if (Array.isArray(v)) return v.map((x) => normalizeValue(x, port));
+export function normalizeValue(v, port, host) {
+  if (typeof v === "string") return normalizeString(v, port, host);
+  if (Array.isArray(v)) return v.map((x) => normalizeValue(x, port, host));
   if (v !== null && typeof v === "object") {
     const o = {};
     for (const [k, x] of Object.entries(v)) {
       // `o[k] =` だと `__proto__` キーがプロトタイプ変更になり直列化で失われるため、own property として定義する。
-      Object.defineProperty(o, k, { value: normalizeValue(x, port), enumerable: true, writable: true, configurable: true });
+      Object.defineProperty(o, k, { value: normalizeValue(x, port, host), enumerable: true, writable: true, configurable: true });
     }
     return o;
   }
@@ -193,4 +200,22 @@ export function validateDiscoveredWs(target, endpoint) {
     throw new Error("discovered WebSocket URL does not match the endpoint host and port");
   }
   return u;
+}
+
+/**
+ * npm install 後の hidden lockfile（node_modules/.package-lock.json）を検証する。
+ * 導入されたパッケージが期待する 1 つ（name・version・integrity 一致）だけであることを確認し、
+ * 違反は Error を投げる（fail-closed）。verify-install.mjs（run.sh から呼ぶ）が使う。
+ */
+export function verifyInstalledPackages(lock, { name, version, integrity }) {
+  const pkgs = lock && typeof lock === "object" ? lock.packages : null;
+  if (!pkgs || typeof pkgs !== "object") throw new Error("lockfile has no packages");
+  const keys = Object.keys(pkgs).filter((k) => k !== "");
+  const want = `node_modules/${name}`;
+  const extra = keys.filter((k) => k !== want);
+  if (extra.length > 0) throw new Error(`unexpected packages installed: ${extra.join(", ")}`);
+  const entry = pkgs[want];
+  if (!entry) throw new Error(`${name} was not installed`);
+  if (entry.version !== version) throw new Error(`version mismatch: expected ${version}, got ${entry.version}`);
+  if (entry.integrity !== integrity) throw new Error("integrity mismatch");
 }
