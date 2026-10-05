@@ -10,7 +10,7 @@
 //         --module-dir <playwright-core を install した dir> --playwright-version <x.y.z> [--force]
 
 import { createRequire } from "node:module";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
   SCHEMA_VERSION,
@@ -83,6 +83,20 @@ process.env.DEBUG_COLORS = "no";
 let pending = "";
 // newPage 到達後の終了処理（browser.close）の CDP は収集対象外（README の契約: newPage まで）。
 let capturing = true;
+// 収集を止める。改行前に途切れた pw:protocol 行が残っていればメッセージ欠落になるため失敗させる。
+const stopCapture = () => {
+  if (!capturing) return;
+  capturing = false;
+  if (pending.trim() !== "") {
+    let incomplete = true;
+    try {
+      incomplete = parseProtocolLine(pending) !== null;
+    } catch {
+      incomplete = true;
+    }
+    if (incomplete) fatal("incomplete pw:protocol line at end of capture");
+  }
+};
 process.stderr.write = (chunk, ...rest) => {
   let lines;
   try {
@@ -118,13 +132,14 @@ push({
   node: process.version,
 });
 
-const withTimeout = (p, label) =>
-  Promise.race([
-    p,
-    new Promise((_, rej) =>
-      setTimeout(() => rej(new Error(`${label} timed out after ${STAGE_TIMEOUT_MS}ms`)), STAGE_TIMEOUT_MS),
-    ),
-  ]);
+const withTimeout = (p, label) => {
+  let timer;
+  const timeout = new Promise((_, rej) => {
+    timer = setTimeout(() => rej(new Error(`${label} timed out after ${STAGE_TIMEOUT_MS}ms`)), STAGE_TIMEOUT_MS);
+  });
+  // 段階が先に決着してもタイマーを残さない（後からの reject・プロセス延命を防ぐ）。
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+};
 
 /** 段階を実行して stage レコードを積む。成功なら値、失敗なら undefined を返す。 */
 let timedOutStage = null;
@@ -183,22 +198,37 @@ if (browser) {
     // newPage 到達後は goto 等へ進まない（スコープは newPage まで）。
     await stage("newPage", () => context.newPage());
   }
-  capturing = false;
+  stopCapture();
   await Promise.race([browser.close().catch(() => {}), new Promise((r) => setTimeout(r, 2000))]);
 }
 
 // タイムアウトした段階は fn() が中止されず CDP 送受信が続き得るため、段階の成否とメッセージ列が
 // 一致しない。保存せず、進行中の接続を best-effort（上限時間付き）で閉じてから失敗終了する。
 if (timedOutStage) {
-  capturing = false;
+  stopCapture();
   if (browser) await Promise.race([browser.close().catch(() => {}), new Promise((r) => setTimeout(r, 2000))]);
   fatal(`stage timed out: ${timedOutStage}`);
 }
+
+stopCapture();
 
 // CDP 0 件は収集失敗（接続失敗でも CDP 送受信があれば調査用トレースとして保存する）。成功扱いの JSONL を残さず非 0 終了する。
 const verdict = checkCollection({ cdpCount: records.filter((r) => r.kind === "cdp").length });
 if (!verdict.ok) fatal(verdict.reason);
 
-writeFileSync(args.out, toJsonl(records), { flag: args.force ? "w" : "wx" });
+// --force 時は別ファイルへ書き終えてから置き換え、途中失敗で既存の成果物を壊さない。
+const text = toJsonl(records);
+if (args.force) {
+  const tmp = `${args.out}.tmp-${process.pid}`;
+  try {
+    writeFileSync(tmp, text, { flag: "wx" });
+    renameSync(tmp, args.out);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    fatal(`failed to write trace: ${e.message}`);
+  }
+} else {
+  writeFileSync(args.out, text, { flag: "wx" });
+}
 process.stderr.write = origWrite;
 process.exit(0);

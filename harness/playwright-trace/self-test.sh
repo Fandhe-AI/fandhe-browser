@@ -63,4 +63,39 @@ if [ "$status" -ne 1 ] || [ -e "$FAKE_DIR/out2.jsonl" ]; then
 fi
 grep -q "stage timed out" "$FAKE_DIR/err2.txt" || { echo "FAIL: missing timeout message" >&2; exit 1; }
 echo "ok: timed-out stage exits 1 without writing a trace"
+
+# 末尾が改行前に途切れた pw:protocol 行は欠落になるため exit 1 すること（CDP-2・fail-closed）。
+cat >"$FAKE_DIR/node_modules/playwright-core/index.js" <<'JS'
+exports.chromium = { connectOverCDP: async () => {
+  process.stderr.write('t pw:protocol SEND \u25ba {"id":1,"method":"A.b"}\n');
+  process.stderr.write('t pw:protocol \u25c0 RECV {"id":1');
+  throw new Error("connect refused");
+} };
+JS
+status=0
+node "$SCRIPT_DIR/trace.mjs" --endpoint http://127.0.0.1:9 --out "$FAKE_DIR/out3.jsonl" \
+  --module-dir "$FAKE_DIR" --playwright-version 0.0.0 >/dev/null 2>"$FAKE_DIR/err3.txt" || status=$?
+if [ "$status" -ne 1 ] || [ -e "$FAKE_DIR/out3.jsonl" ]; then
+  echo "FAIL: incomplete protocol line must exit 1 without output (got $status)" >&2
+  exit 1
+fi
+grep -q "incomplete pw:protocol line" "$FAKE_DIR/err3.txt" || { echo "FAIL: missing incomplete-line message" >&2; exit 1; }
+echo "ok: incomplete protocol line exits 1 without writing a trace"
+
+# --force は既存ファイルを置き換え、一時ファイルを残さないこと。
+cat >"$FAKE_DIR/node_modules/playwright-core/index.js" <<'JS'
+exports.chromium = { connectOverCDP: async () => {
+  process.stderr.write('t pw:protocol SEND \u25ba {"id":1,"method":"A.b"}\n');
+  throw new Error("connect refused");
+} };
+JS
+echo "old" >"$FAKE_DIR/out4.jsonl"
+node "$SCRIPT_DIR/trace.mjs" --endpoint http://127.0.0.1:9 --out "$FAKE_DIR/out4.jsonl" --force \
+  --module-dir "$FAKE_DIR" --playwright-version 0.0.0 >/dev/null 2>&1
+grep -q '"method":"A.b"' "$FAKE_DIR/out4.jsonl" || { echo "FAIL: --force did not replace the trace" >&2; exit 1; }
+if ls "$FAKE_DIR"/out4.jsonl.tmp-* >/dev/null 2>&1; then
+  echo "FAIL: temporary file left behind" >&2
+  exit 1
+fi
+echo "ok: --force replaces the trace without leaving temporary files"
 echo "playwright-trace self-test: all passed"
