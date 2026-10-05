@@ -142,6 +142,11 @@ impl RuleBlocks {
     }
 }
 
+/// 識別子の一部になりうる文字（コメント前後でトークンが融合するかの判定用）。
+fn is_ident_like(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_' || !c.is_ascii()
+}
+
 type Chars<'a> = Peekable<CharIndices<'a>>;
 
 /// `/` を消費した直後（次が `*`）に呼び、`*/` までコメントを読み飛ばす。未終端は EOF まで。
@@ -193,9 +198,12 @@ fn read_body(it: &mut Chars<'_>, len: usize) -> usize {
     len
 }
 
-/// at-rule を、文形式は深さ 0 の `;` まで、ブロック形式は対応する `}` まで読み飛ばす。
+/// at-rule を、文形式は括弧外・ブロック外の `;` まで、ブロック形式は at-rule 自身のブロックを
+/// 閉じる `}` まで読み飛ばす。`(` / `[` 内の `{` `}` は括弧が閉じるまでブロック境界として
+/// 数えない（`url(foo}bar)` で読み飛ばしが早期終了しない。CORE-5・#551）。
 fn skip_at_rule(it: &mut Chars<'_>) {
-    let mut depth: usize = 0;
+    let mut paren: usize = 0;
+    let mut braces: usize = 0;
     while let Some((_, c)) = it.next() {
         match c {
             '/' if matches!(it.peek(), Some((_, '*'))) => skip_comment(it),
@@ -203,10 +211,16 @@ fn skip_at_rule(it: &mut Chars<'_>) {
             '\\' => {
                 it.next();
             }
-            ';' if depth == 0 => return,
-            '(' | '[' | '{' => depth = depth.saturating_add(1),
-            '}' if depth <= 1 => return,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ';' if paren == 0 && braces == 0 => return,
+            '(' | '[' => paren = paren.saturating_add(1),
+            ')' | ']' => paren = paren.saturating_sub(1),
+            '{' if paren == 0 => braces = braces.saturating_add(1),
+            '}' if paren == 0 => {
+                braces = braces.saturating_sub(1);
+                if braces == 0 {
+                    return;
+                }
+            }
             _ => {}
         }
     }
@@ -237,8 +251,13 @@ pub fn split_rule_blocks(input: &str) -> Result<RuleBlocks> {
         match c {
             '/' if matches!(it.peek(), Some((_, '*'))) => {
                 skip_comment(&mut it);
-                // 前後のトークンを融合させない。
-                if start.is_some() && !prelude.ends_with(' ') {
+                // コメントは空白ではない（空白にすると `a/**/.b` が子孫結合子になる）ため何も
+                // 挿入しない。ただし前後が識別子文字同士だと別トークンが融合するので、その場合だけ
+                // 区切りを入れる。
+                if start.is_some()
+                    && prelude.chars().next_back().is_some_and(is_ident_like)
+                    && it.peek().is_some_and(|&(_, n)| is_ident_like(n))
+                {
                     prelude.push(' ');
                 }
             }
@@ -371,6 +390,21 @@ mod tests {
     }
 
     /// CORE-5: 余分な `}` は記録して後続ルールを取る。
+    #[test]
+    fn core_5_at_rule_paren_brace_does_not_end_skip() {
+        assert_eq!(
+            pb("@import url(foo}bar); a{color:red}"),
+            vec![t("a", "color:red", 22)]
+        );
+    }
+
+    #[test]
+    fn core_5_comment_is_not_descendant_combinator() {
+        assert_eq!(pb("a/**/.b{x:y}")[0].0, "a.b");
+        assert_eq!(pb("a /**/.b{x:y}")[0].0, "a .b");
+        assert_eq!(pb("a/**/b{x:y}")[0].0, "a b");
+    }
+
     #[test]
     fn core_5_unexpected_close_brace() {
         let r = split_rule_blocks("} a{b:c}").expect("must split");
