@@ -16,9 +16,19 @@
 //! 次の ref ベースの基準で判定する。
 //!
 //! 1. フィクスチャの DOM に PoC セレクタの一致要素が 1 件以上ある
-//! 2. snapshot を先行順に平坦化した列に、期待シグネチャ（role・name・`data_leaf`）へ一致する
-//!    エントリがある
+//! 2. snapshot を先行順に平坦化した列に、期待シグネチャ（role・name・`data_leaf`）へ一致し、
+//!    かつ ref のダイジェストが「DOM 先頭一致要素から再計算した ref ダイジェスト」と一致する
+//!    エントリがある（DOM 要素と snapshot エントリの同一性。下記）
 //! 3. 先頭の一致エントリが空でない ref を持つ
+//!
+//! # 同一性の検証（`AISNAP-10`）
+//!
+//! snapshot は NodeId を公開しないため、DOM 先頭一致要素の祖先鎖から `build_snapshot` と同じ規則
+//! （role・name・識別属性・親 ref スコープ）で ref ダイジェストを再計算し、エントリの ref と突き合わせる。
+//! これで「対象が snapshot から消えても別要素が同じ role・name を持てば Identified になる」誤判定を
+//! 防ぐ。ref の出現番号（`-n`）は snapshot 側の除外・圧縮に依存し DOM から再現できないため、
+//! 同じ親・同じシグネチャの兄弟どうし（識別属性なし）はこの方式でも区別できない（ref 設計上も
+//! 出現番号でしか区別されない同一シグネチャ要素）。
 //!
 //! 「対象を判別できる」ことと「値を読める」ことは別である。たとえば価格（`p.price_color`）は
 //! `data_leaf = PriceClass` と ref で判別できるが、role `generic`・name 空で価格文字列は
@@ -28,7 +38,12 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use fandhe_browser_ai::snapshot::{DataLeafKind, Node, build_snapshot};
+use fandhe_browser_ai::snapshot::element_ref::ElementSignature;
+use fandhe_browser_ai::snapshot::{
+    DataLeafKind, ElementRef, NameIndex, Node, RefAllocator, build_snapshot,
+    compute_name_with_index, compute_role,
+};
+use fandhe_browser_core::dom::{Document, NodeId};
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
 use fandhe_browser_core::query::query_selector_all_str;
 
@@ -240,11 +255,92 @@ pub fn flatten(root: &Node) -> Vec<FlatEntry> {
     out
 }
 
+/// `ref` 文字列（`e<16hex>[v<n>][-<n>]`）の先頭 16 桁 16 進ダイジェストを取り出す。
+fn ref_digest(r: &str) -> Option<u64> {
+    let hex = r.strip_prefix('e')?.get(..16)?;
+    u64::from_str_radix(hex, 16).ok()
+}
+
+/// `build_snapshot` の `discriminator`（`id` → フォーム部品の `name` → `a`/`area` の `href`）と同じ規則。
+fn discriminator(doc: &Document, id: NodeId) -> Option<&str> {
+    if let Some(v) = doc.attribute(id, "id").filter(|s| !s.is_empty()) {
+        return Some(v);
+    }
+    let local = doc.local_name(id).unwrap_or("");
+    if matches!(local, "input" | "select" | "textarea" | "button")
+        && let Some(v) = doc.attribute(id, "name").filter(|s| !s.is_empty())
+    {
+        return Some(v);
+    }
+    if matches!(local, "a" | "area") {
+        return doc.attribute(id, "href").filter(|s| !s.is_empty());
+    }
+    None
+}
+
+/// ルート直下から `id` までの要素鎖の ref を `build_snapshot` と同じ規則で再計算する。
+/// role を持たない要素が鎖にあれば `None`（snapshot へ入らない要素）。
+/// 出現番号は scope に折り込まれないため、新規アロケータで十分（`AISNAP-10`）。
+fn chain_ref(doc: &Document, index: &NameIndex<'_>, id: NodeId) -> Option<ElementRef> {
+    let mut path: Vec<NodeId> = doc.ancestors(id).filter(|&a| doc.is_element(a)).collect();
+    path.reverse();
+    path.push(id);
+    let mut scope: Option<ElementRef> = None;
+    for e in path {
+        let role = compute_role(doc, e)?;
+        let name = compute_name_with_index(doc, index, e);
+        let mut sig = ElementSignature::new(role.as_str(), &name.text);
+        if let Some(d) = discriminator(doc, e) {
+            sig = sig.with_discriminator(d);
+        }
+        if let Some(sc) = scope {
+            sig = sig.with_scope(sc);
+        }
+        scope = Some(RefAllocator::new().allocate_signature(&sig).ok()?);
+    }
+    scope
+}
+
+/// DOM 要素 `id` に対応しうる snapshot ref ダイジェストの集合を返す。
+/// 通常要素は祖先鎖の ref。表のヘッダセルは圧縮経路が表 ref 直下のスコープで
+/// 発行する（`id` 属性のみを識別属性とする）ため、その分も含める。空は snapshot へ入らない要素。
+pub fn target_digests(doc: &Document, id: NodeId) -> Vec<u64> {
+    let index = NameIndex::build(doc);
+    let mut out = Vec::new();
+    if let Some(r) = chain_ref(doc, &index, id) {
+        out.push(r.digest);
+    }
+    if matches!(doc.local_name(id), Some("th" | "td"))
+        && let Some(table) = doc
+            .ancestors(id)
+            .find(|&a| doc.local_name(a) == Some("table"))
+        && let Some(table_ref) = chain_ref(doc, &index, table)
+        && let Some(role) = compute_role(doc, id)
+    {
+        let name = compute_name_with_index(doc, &index, id);
+        let mut sig = ElementSignature::new(role.as_str(), &name.text);
+        if let Some(d) = doc.attribute(id, "id").filter(|s| !s.is_empty()) {
+            sig = sig.with_discriminator(d);
+        }
+        sig = sig.with_scope(table_ref);
+        if let Ok(r) = RefAllocator::new().allocate_signature(&sig) {
+            out.push(r.digest);
+        }
+    }
+    out
+}
+
 /// 平坦化済みエントリから期待シグネチャへの一致を数え、判別結果を決める。
+///
+/// `target_digests` は DOM 先頭一致要素から再計算した ref ダイジェスト（[`target_digests`]）。
+/// ref を持つエントリは、シグネチャに加えて ref のダイジェストがこの集合に含まれる場合だけ
+/// 一致とする（DOM 要素と snapshot エントリの同一性）。ref を持たないエントリは同一性を
+/// 検証できないため、原因を `MatchWithoutRef` として報告できるようシグネチャ一致のみで残す。
 pub fn judge(
     task: &Task,
     dom_matches: usize,
     dom_text: Option<&str>,
+    target_digests: &[u64],
     entries: &[FlatEntry],
     snapshot_truncated: bool,
 ) -> TaskCheck {
@@ -257,6 +353,10 @@ pub fn judge(
             (NameExpect::Any, _) => true,
         })
         .filter(|e| task.data_leaf.is_none_or(|k| e.data_leaf == Some(k)))
+        .filter(|e| match e.r#ref.as_deref() {
+            None | Some("") => true,
+            Some(r) => ref_digest(r).is_some_and(|d| target_digests.contains(&d)),
+        })
         .collect();
     let first = matches.first();
     let verdict = if dom_matches == 0 {
@@ -317,10 +417,15 @@ pub fn run_retention_checks(dir: &Path) -> Result<Vec<TaskCheck>, RetentionCheck
         let snapshot =
             build_snapshot(doc).map_err(|e| RetentionCheckError::Snapshot(e.to_string()))?;
         let entries = flatten(&snapshot.tree);
+        let digests = found
+            .first()
+            .map(|id| target_digests(doc, *id))
+            .unwrap_or_default();
         out.push(judge(
             task,
             found.len(),
             dom_text.as_deref(),
+            &digests,
             &entries,
             snapshot.truncated,
         ));

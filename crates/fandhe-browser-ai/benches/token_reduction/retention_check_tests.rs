@@ -73,7 +73,7 @@ const EXPECTED: [Expected; 7] = [
     (
         "table-header-first",
         6,
-        2,
+        1,
         "e091124527e8c0f5e",
         Some(DataLeafKind::TableCell),
         "Last Name",
@@ -133,11 +133,44 @@ fn aisnap_3_per_task_concrete_values() {
     }
 }
 
+/// 達成基準の契約（6/7 以上）。最終判断は人間担当の #97 が行うため、ここでは閾値だけを検証する。
 #[test]
 fn aisnap_3_identified_count_meets_threshold() {
     let c = checks();
-    assert_eq!(identified_count(&c), 7);
-    assert!(identified_count(&c) >= 6);
+    assert!(
+        identified_count(&c) >= 6,
+        "identified {}",
+        identified_count(&c)
+    );
+}
+
+/// 現状値（7/7）の回帰固定。閾値契約（上のテスト）とは独立で、1 件でも判別不能になった場合は
+/// 閾値内でも意図せぬ変化として検出する。許容範囲の変更時はこのテストを更新する。
+#[test]
+fn aisnap_3_current_baseline_identifies_all_seven() {
+    assert_eq!(identified_count(&checks()), 7);
+}
+
+/// 同一性検証: 同じ role・name の別要素が ref を持っていても、DOM 対象要素から
+/// 再計算した ref ダイジェストと一致しなければ Identified にしない。
+#[test]
+fn aisnap_3_same_signature_other_element_is_not_identified() {
+    let root = Node::new("document", "").with_children(vec![
+        Node::new("combobox", "").with_ref("e0000000000000001"),
+    ]);
+    let task = TASKS
+        .iter()
+        .find(|t| t.id == "dropdown-select")
+        .expect("task");
+    let c = judge(task, 1, None, &[0x2], &flatten(&root), false);
+    assert_eq!(
+        c.verdict,
+        Verdict::NotIdentified {
+            reason: NotIdentifiedReason::NoMatchingNode
+        }
+    );
+    let ok = judge(task, 1, None, &[0x1], &flatten(&root), false);
+    assert_eq!(ok.verdict, ident("e0000000000000001"));
 }
 
 #[test]
@@ -174,7 +207,7 @@ fn match_without_ref_is_not_identified() {
         .iter()
         .find(|t| t.id == "dropdown-select")
         .expect("task");
-    let c = judge(task, 1, None, &flatten(&root), false);
+    let c = judge(task, 1, None, &[], &flatten(&root), false);
     assert_eq!(
         c.verdict,
         Verdict::NotIdentified {
@@ -191,14 +224,14 @@ fn no_match_and_missing_dom_reasons() {
         .iter()
         .find(|t| t.id == "dropdown-select")
         .expect("task");
-    let none = judge(task, 1, None, &flatten(&root), false);
+    let none = judge(task, 1, None, &[], &flatten(&root), false);
     assert_eq!(
         none.verdict,
         Verdict::NotIdentified {
             reason: NotIdentifiedReason::NoMatchingNode
         }
     );
-    let missing = judge(task, 0, None, &flatten(&root), false);
+    let missing = judge(task, 0, None, &[], &flatten(&root), false);
     assert_eq!(
         missing.verdict,
         Verdict::NotIdentified {
@@ -236,7 +269,7 @@ fn not_identified_row_shows_reason() {
         .iter()
         .find(|t| t.id == "dropdown-select")
         .expect("task");
-    let c = judge(task, 1, None, &flatten(&root), false);
+    let c = judge(task, 1, None, &[], &flatten(&root), false);
     assert_eq!(
         format_row(&c),
         "dropdown-select\tdropdown-form.html\tselect#dropdown\tno\t1\t0\t-\t-\t-\tfalse\tno-matching-node"
