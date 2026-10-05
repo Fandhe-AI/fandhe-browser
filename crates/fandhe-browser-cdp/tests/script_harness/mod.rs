@@ -16,9 +16,6 @@
 //! kill 後のリーダー待機にも上限を設ける
 //! （無制限確保による DoS の防止）。サーバーは `127.0.0.1:0` にのみ bind する。
 
-// 2 つのテストターゲットが別々の部分集合を使うため、未使用項目の警告を許容する。
-#![allow(dead_code)]
-
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -45,8 +42,6 @@ pub const RESULT_PREFIX: &str = "FANDHE_SCRIPT_RESULT ";
 pub const MAX_STREAM_BYTES: usize = 1024 * 1024;
 /// 結果行 1 行の長さ上限。
 pub const MAX_RESULT_LINE_BYTES: usize = 64 * 1024;
-/// 既定の待機締め切り。
-pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
 /// `stderr_tail` に保持する末尾バイト数。
 const STDERR_TAIL_BYTES: usize = 2048;
 /// kill / 終了後にリーダー出力を待つ上限（孫プロセスがパイプを握り続ける場合の保護）。
@@ -123,7 +118,6 @@ const SERVER_STOP_GRACE: Duration = Duration::from_secs(10);
 /// 消してしまうため。フィールドは宣言順に drop されるので `_dir` は最後）。
 pub struct TestServer {
     pub addr: SocketAddr,
-    pub state: Arc<CdpState>,
     stop: Arc<StopSignal>,
     stopped: Receiver<()>,
     _dir: TempDir,
@@ -146,8 +140,7 @@ pub fn start_server() -> TestServer {
     let dir = TempDir::new();
     let profile = Arc::new(Profile::open(&dir.0).expect("profile open"));
     let app = Arc::new(AppState::with_disabled_renderer(profile));
-    let state = Arc::new(CdpState::new(app));
-    let st = Arc::clone(&state);
+    let st = Arc::new(CdpState::new(app));
     let stop = Arc::new(StopSignal::default());
     let stop_for_thread = Arc::clone(&stop);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -177,7 +170,6 @@ pub fn start_server() -> TestServer {
         .expect("server did not start");
     TestServer {
         addr,
-        state,
         stop,
         stopped,
         _dir: dir,
@@ -543,13 +535,4 @@ pub fn preflight_puppeteer(harness_dir: &Path) -> Result<ScriptCommand, HarnessE
         envs: Vec::new(),
         cwd: Some(harness_dir.to_path_buf()),
     })
-}
-
-/// `harness/puppeteer-connect` のパス（`Path::join` で組み立てる）。
-pub fn puppeteer_harness_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("harness")
-        .join("puppeteer-connect")
 }
