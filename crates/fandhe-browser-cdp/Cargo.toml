@@ -6,6 +6,15 @@ license.workspace = true
 publish.workspace = true
 description = "CDP 互換サーバー crate（fandhe-browser）。状態型は TASK-41.2、ルータは TASK-41.3、WS 受け口は TASK-41.4、プロトコル層は TASK-42"
 
+# 実 Puppeteer を使う明示実行ターゲット（TASK-45.1・#480・CDP-3）。Node と puppeteer-core に
+# 依存し、CI の reusable workflow（cargo test --workspace --all-features）へ Node を導入
+# できないため既定の `cargo test` からは外す。`make test-puppeteer-connect` で実行し、
+# 未導入なら skip せず失敗する（harness/puppeteer-connect/README.md 参照）。
+[[test]]
+name = "puppeteer_connect_live"
+path = "tests/puppeteer_connect_live.rs"
+test = false
+
 # workspace 内 path 依存のみ（AGENTS.md「crate 間の許可依存」。registry クレートの追加ではない）
 [dependencies]
 fandhe-browser-core = { path = "../fandhe-browser-core" }
