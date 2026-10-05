@@ -31,12 +31,19 @@
         completion_callbacks.forEach(function (cb) { cb(tests, hs); });
     }
 
+    // ハーネス自体の失敗（ERROR=1）を通知する。サブテストは全件 PASS のまま。
+    function done_with_error() {
+        var hs = { status: 1, message: 'harness error' };
+        completion_callbacks.forEach(function (cb) { cb(tests, hs); });
+    }
+
     function add_result_callback(cb) { result_callbacks.push(cb); }
     function add_completion_callback(cb) { completion_callbacks.push(cb); }
 
     global_scope.assert_true = assert_true;
     global_scope.test = test;
     global_scope.done = done;
+    global_scope.done_with_error = done_with_error;
     global_scope.add_result_callback = add_result_callback;
     global_scope.add_completion_callback = add_completion_callback;
 })(self);
