@@ -10,6 +10,8 @@ import { createRequire } from "node:module";
 const PREFIX = "FANDHE_SCRIPT_RESULT ";
 const MAX_LEN = 500;
 
+// 結果行の書き込み完了（パイプへのフラッシュ）まで待つ Promise を返す。完了前の
+// process.exit で結果行が失われないよう、終了前に必ず await する。
 function report(ok, step, err) {
   const error = err
     ? {
@@ -17,11 +19,13 @@ function report(ok, step, err) {
         message: String(err?.message ?? err).slice(0, MAX_LEN),
       }
     : null;
-  process.stdout.write(`${PREFIX}${JSON.stringify({ ok, step, error })}\n`);
+  return new Promise((resolve) => {
+    process.stdout.write(`${PREFIX}${JSON.stringify({ ok, step, error })}\n`, () => resolve());
+  });
 }
 
-process.on("unhandledRejection", (e) => {
-  report(false, "connect", e);
+process.on("unhandledRejection", async (e) => {
+  await report(false, "connect", e);
   process.exit(1);
 });
 
@@ -44,7 +48,7 @@ function isLoopbackWsEndpoint(value) {
 
 const endpoint = process.env.FANDHE_CDP_WS_ENDPOINT ?? "";
 if (!isLoopbackWsEndpoint(endpoint)) {
-  report(false, "connect", new Error("endpoint must be a loopback ws:// URL"));
+  await report(false, "connect", new Error("endpoint must be a loopback ws:// URL"));
   process.exit(1);
 }
 
@@ -52,8 +56,8 @@ try {
   const puppeteer = createRequire(import.meta.url)("puppeteer-core");
   const browser = await puppeteer.connect({ browserWSEndpoint: endpoint });
   await browser.disconnect();
-  report(true, "connect", null);
+  await report(true, "connect", null);
 } catch (e) {
-  report(false, "connect", e);
+  await report(false, "connect", e);
   process.exit(1);
 }
