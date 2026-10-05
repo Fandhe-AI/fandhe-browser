@@ -24,3 +24,29 @@ publish.workspace = true
 # 追加しない（依存最小方針）。
 [dependencies]
 fandhe-browser-core = { path = "../fandhe-browser-core" }
+
+# TASK-14.2（Issue #93・AISNAP-1・MS-2）: 生 HTML のトークン量算出に使う
+# tiktoken-rs（cl100k_base）。採否は Issue #92 に記録済み。計測は benches/ に
+# 閉じるため dev-dependencies のみとし、配布バイナリの依存グラフへ入れない。
+[dev-dependencies]
+tiktoken-rs = { workspace = true }
+
+# 生 HTML トークン量の計測ベンチ。独自 main で結果を stdout へ出すため
+# harness = false。後続 #94（TASK-14.3）が snapshot 側の計測・削減率を追加する。
+[[bench]]
+name = "token_reduction"
+path = "benches/token_reduction.rs"
+harness = false
+
+# トークンカウント純関数のユニットテスト。bench ターゲットは libtest として
+# 起動されず `cargo test --workspace` で実行されないため、別ファイルの
+# [[test]] ターゲットに分ける（fandhe-browser-js の worker_spawn_latency_stats と同構成）。
+[[test]]
+name = "token_reduction_tokens"
+path = "benches/token_reduction/tokens_tests.rs"
+
+# 情報保持チェック（TASK-14.4・AISNAP-3・Issue #95）の判定ロジックのテスト。
+# bench ターゲットは libtest として起動されないため、別 [[test]] ターゲットに分ける。
+[[test]]
+name = "token_reduction_retention_check"
+path = "benches/token_reduction/retention_check_tests.rs"

@@ -19,6 +19,7 @@
 
 use std::collections::HashSet;
 
+use fandhe_browser_ai::compress_table::MAX_TABLE_ROWS;
 use fandhe_browser_ai::snapshot::{
     CheckedState, DataLeafKind, HeaderCell, MAX_ROW_CONTROLS, MAX_TABLE_CONTROLS, Node, Snapshot,
     State, TableRow, TableSummary, build_snapshot, ref_signature,
@@ -853,4 +854,209 @@ fn aisnap_2_table_with_tfoot_is_not_compressed() {
     let all = collect_nodes(&s.tree);
     assert!(all.iter().all(|n| n.table.is_none()));
     assert!(all.iter().any(|n| n.name == "合計"));
+}
+
+// ---------------------------------------------------------------------------
+// Hacker News 相当フィクスチャの回帰テスト（TASK-12.6・Issue #84・`AISNAP-2`・`MS-2`）
+// ---------------------------------------------------------------------------
+
+/// Hacker News のレイアウトを踏襲した合成ページ（値はすべてダミー。実ページの複写ではない）。
+///
+/// 構造: 入れ子のレイアウト表・ヘッダ表・記事表（題名行・subtext 行・spacer 行の繰り返しと
+/// 末尾の More 行）・フッタ。`with_titles` が true のとき、実ページ同様に
+/// `div.votearrow` と `span.age` へ `title` 属性を付ける。この 2 つは `generic` の
+/// accessible name になり、現行実装では圧縮を拒否させる（`build.rs` の `can_compress`
+/// の「既知の制約」）。
+fn hn_page(stories: usize, with_titles: bool) -> String {
+    let (vote_title, age_title) = if with_titles {
+        (" title=\"upvote\"", " title=\"2026-01-01T00:00:00\"")
+    } else {
+        ("", "")
+    };
+    let mut rows = String::new();
+    for i in 1..=stories {
+        rows.push_str(&format!(
+            "<tr class=\"athing\" id=\"{i}\"><td align=\"right\" valign=\"top\" class=\"title\"><span class=\"rank\">{i}.</span></td>\
+<td valign=\"top\" class=\"votelinks\"><center><a id=\"up_{i}\" href=\"vote?id={i}&amp;how=up\"><div class=\"votearrow\"{vote_title}></div></a></center></td>\
+<td class=\"title\"><span class=\"titleline\"><a href=\"https://example.com/s/{i}\">Story headline number {i}</a>\
+<span class=\"sitebit comhead\"> (<a href=\"from?site=example.com\"><span class=\"sitestr\">example.com</span></a>)</span></span></td></tr>\
+<tr><td colspan=\"2\"></td><td class=\"subtext\"><span class=\"subline\"><span class=\"score\" id=\"score_{i}\">{i} points</span> by \
+<a href=\"user?id=user{i}\" class=\"hnuser\">user{i}</a> <span class=\"age\"{age_title}><a href=\"item?id={i}\">{i} hours ago</a></span> \
+<span id=\"unv_{i}\"></span> | <a href=\"hide?id={i}\">hide</a> | <a href=\"item?id={i}\">{i} comments</a></span></td></tr>\
+<tr class=\"spacer\" style=\"height:5px\"></tr>"
+        ));
+    }
+    let body = format!(
+        "<center><table id=\"hnmain\" border=\"0\" cellpadding=\"0\" cellspacing=\"0\" width=\"85%\" bgcolor=\"#f6f6ef\">\
+<tr><td bgcolor=\"#ff6600\"><table border=\"0\" cellpadding=\"0\" cellspacing=\"0\" width=\"100%\" style=\"padding:2px\"><tr>\
+<td style=\"width:18px;padding-right:4px\"><a href=\"https://example.com\"><img src=\"logo.gif\" width=\"18\" height=\"18\" alt=\"Y\"></a></td>\
+<td style=\"line-height:12pt; height:10px;\"><span class=\"pagetop\"><b class=\"hnname\"><a href=\"news\">Sample News</a></b>\
+<a href=\"newest\">new</a> | <a href=\"front\">past</a> | <a href=\"newcomments\">comments</a> | <a href=\"ask\">ask</a> | <a href=\"show\">show</a> | <a href=\"jobs\">jobs</a> | <a href=\"submit\">submit</a></span></td>\
+<td style=\"text-align:right;padding-right:4px;\"><span class=\"pagetop\"><a href=\"login?goto=news\">login</a></span></td></tr></table></td></tr>\
+<tr id=\"pagespace\" title=\"\" style=\"height:10px\"></tr>\
+<tr><td><table border=\"0\" cellpadding=\"0\" cellspacing=\"0\">{rows}\
+<tr class=\"morespace\" style=\"height:10px\"></tr><tr><td colspan=\"2\"></td><td class=\"title\"><a href=\"?p=2\" class=\"morelink\" rel=\"next\">More</a></td></tr>\
+</table></td></tr>\
+<tr><td><table width=\"100%\" cellspacing=\"0\" cellpadding=\"1\"><tr><td bgcolor=\"#ff6600\"></td></tr></table><br>\
+<center><span class=\"yclinks\"><a href=\"newsguidelines.html\">Guidelines</a> | <a href=\"newsfaq.html\">FAQ</a> | <a href=\"lists\">Lists</a> | <a href=\"security.html\">Security</a></span><br><br>\
+<form method=\"get\" action=\"//search.example.com/\">Search: <input type=\"text\" name=\"q\" size=\"17\" autocorrect=\"off\" spellcheck=\"false\" autocapitalize=\"off\" autocomplete=\"off\"></form></center></td></tr>\
+</table></center>"
+    );
+    page(&body)
+}
+
+/// テスト内の量の代理指標: Snapshot を 1 ノード 1 行（role・name・ref）で描画した文字列。
+///
+/// これは決定的な「バイト長の代理指標」でありトークン数ではない。正規のシリアライズ形式は
+/// TASK-19（`AISNAP-6`）、トークン実測は TASK-14・TASK-23 が担う。圧縮表は header・行テキスト・
+/// 行内操作要素（role・name・ref）・`truncated_rows` を全て出力し、情報を落として有利に見せない。
+/// 明示スタックの反復で走査する（再帰・添字なし）。
+fn render_text(s: &Snapshot) -> String {
+    let mut out = String::new();
+    let mut stack = vec![(&s.tree, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        let pad = "  ".repeat(depth);
+        out.push_str(&format!(
+            "{pad}{} {:?} {}\n",
+            node.role,
+            node.name,
+            node.r#ref.as_deref().unwrap_or("-")
+        ));
+        if let Some(t) = &node.table {
+            for h in &t.header {
+                out.push_str(&format!(
+                    "{pad}  header {} {:?} {}\n",
+                    h.role, h.name, h.r#ref
+                ));
+            }
+            for row in &t.rows {
+                out.push_str(&format!("{pad}  row {:?}\n", row.text));
+                for c in &row.controls {
+                    out.push_str(&format!("{pad}    {} {:?} {}\n", c.role, c.name, c.r#ref));
+                }
+            }
+            out.push_str(&format!("{pad}  truncated_rows {}\n", t.truncated_rows));
+        }
+        stack.extend(node.children.iter().rev().map(|c| (c, depth + 1)));
+    }
+    out
+}
+
+/// 行数が `min_rows` 以上の圧縮表のうち行数最大のもの。
+fn largest_table(s: &Snapshot, min_rows: usize) -> Option<&TableSummary> {
+    tables(s)
+        .into_iter()
+        .filter(|t| t.rows.len() >= min_rows)
+        .max_by_key(|t| t.rows.len())
+}
+
+/// 圧縮表の行内操作要素の ref を文書順で全て集める。
+fn row_control_refs(t: &TableSummary) -> Vec<&str> {
+    t.rows
+        .iter()
+        .flat_map(|r| r.controls.iter().map(|c| c.r#ref.as_str()))
+        .collect()
+}
+
+/// `AISNAP-2`・`AISNAP-10`・`AISNAP-12`・`AISNAP-13`・TASK-12.6・Issue #84:
+/// 現行実装が圧縮できる HN 形状のサブセット（記事数 9・`title` 属性なし）では、
+/// 記事表が行へ圧縮され、簡約表現が生 HTML より小さい。
+///
+/// 忠実な HN ページとの差分は `title` 属性 2 種（`votearrow`・`age`）の除去と、記事数が
+/// `MAX_TABLE_ROWS` 以内に収まる点。両者の理由と現状は
+/// `aisnap_2_faithful_hn_page_stays_expanded_known_gap` を参照。
+#[test]
+fn aisnap_2_hn_like_list_is_compressed_and_smaller_than_html() {
+    let stories = (MAX_TABLE_ROWS - 1) / 2;
+    let html = hn_page(stories, false);
+    let s = snap(&html);
+
+    let t = largest_table(&s, 2).expect("記事表は圧縮される");
+    assert_eq!(t.rows.len(), 2 * stories + 1);
+    assert_eq!(t.truncated_rows, 0);
+    assert!(t.header.is_empty());
+
+    // 題名行: 投票リンク（空名）・題名リンク・サイトリンクの 3 操作要素。
+    let first = t.rows.first().expect("先頭行がある");
+    assert_eq!(
+        control_shapes(first),
+        vec![
+            ("link", "", false),
+            ("link", "Story headline number 1", false),
+            ("link", "example.com", false),
+        ]
+    );
+    // subtext 行: ユーザー・経過時間・hide・コメントの 4 リンク。
+    let second = t.rows.get(1).expect("2 行目がある");
+    assert_eq!(
+        control_shapes(second),
+        vec![
+            ("link", "user1", false),
+            ("link", "1 hours ago", false),
+            ("link", "hide", false),
+            ("link", "1 comments", false),
+        ]
+    );
+    // 末尾の More（ページング）リンクが ref 付きで残る（AISNAP-12）。
+    let last = t.rows.last().expect("末尾行がある");
+    assert_eq!(control_shapes(last), vec![("link", "More", false)]);
+
+    // 操作要素は全件保持され、ref は形式どおりで一意（AISNAP-10・AISNAP-13）。
+    let refs = row_control_refs(t);
+    assert_eq!(refs.len(), 7 * stories + 1);
+    assert!(refs.iter().all(|r| is_ref_shaped(r)));
+    let unique: HashSet<&str> = refs.iter().copied().collect();
+    assert_eq!(unique.len(), refs.len());
+
+    // 決定性。
+    assert_eq!(s, snap(&html));
+
+    // 量: 簡約表現は生 HTML より小さい（バイト長の代理指標。トークン数ではない）。
+    let rendered = render_text(&s);
+    assert!(
+        rendered.len() < html.len(),
+        "rendered {} bytes must be smaller than html {} bytes",
+        rendered.len(),
+        html.len()
+    );
+}
+
+/// `AISNAP-2`・`AISNAP-13`・TASK-12.6・Issue #84: 既知のギャップの固定。
+/// 忠実な HN 形状（30 記事・`title` 属性あり）の記事表は現行実装では圧縮されず、
+/// 全ノードが展開される。原因は独立に 3 つあり、いずれか 1 つで圧縮が拒否される。
+///
+/// 1. `div.votearrow[title]`: `generic` の `title` が accessible name になり、圧縮が
+///    情報を落とすと判定される（`build.rs` の `can_compress`）。
+/// 2. `span.age[title]`: 同上。
+/// 3. 非空行が `MAX_TABLE_ROWS` を超え、省略行にリンクがあると圧縮は拒否される
+///    （`AISNAP-13`・Issue #632）。
+///
+/// 本テストは望ましくない現状を期待値にしている。解消した時点で期待値を反転させること。
+/// この形状では生 HTML 比の削減は未達（展開表現は生 HTML より大きい）のため、
+/// 量の assert はしない。
+#[test]
+fn aisnap_2_faithful_hn_page_stays_expanded_known_gap() {
+    let stories = 30;
+    let faithful = snap(&hn_page(stories, true));
+    assert!(largest_table(&faithful, 2).is_none());
+
+    // 切り分け: title を外しても（行数上限＋操作要素が原因で）未圧縮。
+    assert!(largest_table(&snap(&hn_page(stories, false)), 2).is_none());
+    // 切り分け: 記事数を上限内にしても（title が原因で）未圧縮。
+    let within_cap = (MAX_TABLE_ROWS - 1) / 2;
+    assert!(largest_table(&snap(&hn_page(within_cap, true)), 2).is_none());
+
+    // 展開されても情報は失われない: 記事リンク・More リンクが ref 付きで残る。
+    let nodes = collect_nodes(&faithful.tree);
+    for name in [
+        "Story headline number 1",
+        "Story headline number 30",
+        "More",
+    ] {
+        let node = nodes
+            .iter()
+            .find(|n| n.role == "link" && n.name == name)
+            .unwrap_or_else(|| panic!("link {name:?} must remain"));
+        assert!(node.r#ref.as_deref().is_some_and(is_ref_shaped));
+    }
 }

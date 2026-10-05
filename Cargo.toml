@@ -54,6 +54,12 @@ publish = false
 [workspace.dependencies]
 fandhe-browser-render = { path = "crates/fandhe-browser-render" }
 
+# TASK-14.2（Issue #93・AISNAP-1）: 生 HTML のトークン量（cl100k_base）計測用。
+# 採否・バージョンは Issue #92 に記録済み。ライセンスは MIT。配置は
+# fandhe-browser-ai の [dev-dependencies] のみ（配布バイナリに含めない）。
+# BPE データは crate 同梱でネットワーク取得はない。
+tiktoken-rs = { version = "=0.12.1" }
+
 # fandhe-browser-profile（TASK-50（50.1）・ビヘイビア PROF-1）: unix でディレクトリ
 # ハンドル（fd）基準の openat/mkdirat/fchmod を使い、パス文字列の再解決に伴う
 # TOCTOU（symlink 差し替え競合。PR #437 レビュー指摘）を解消するために使う。
