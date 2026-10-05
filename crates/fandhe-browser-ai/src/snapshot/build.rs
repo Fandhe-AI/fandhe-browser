@@ -26,7 +26,9 @@
 //!   本文行（`tr`/`li`）内の `a[href]`・`button` は圧縮を拒否せず、圧縮行ごとに
 //!   `TableRow::controls` へ ref・state 付きで保持する（セル内に複数あっても行あたり
 //!   [`MAX_ROW_CONTROLS`]・表全体 [`MAX_TABLE_CONTROLS`] を上限に全件を文書順で保持し、
-//!   超過は `TableRow::controls_truncated` で通知する。`AISNAP-2`・`AISNAP-13`・Issue #632）。
+//!   超過は `TableRow::controls_truncated` で通知する。行は末尾まで走査し、優先保持
+//!   （ページネーション・送信ボタン。`AISNAP-12`）は表全体で先に枠を確保する
+//!   （優先要素だけで上限を超える表は圧縮せず展開する）。`AISNAP-2`・`AISNAP-13`・Issue #632）。
 //!   ただし `tfoot` 行がある構造、またはそれ以外の操作要素（入力欄・`select`・`textarea`・
 //!   `role`/`tabindex`/`onclick` 付き、ヘッダ行内のリンク等）を含む構造は圧縮せず
 //!   通常どおり展開する（ref・state・フッターの可視情報を失わないため）。`img` の `alt`・`aria-label` 等テキスト以外に由来する
@@ -390,30 +392,25 @@ pub const MAX_ROW_CONTROLS: usize = 8;
 
 /// 1 つの圧縮表・一覧が保持する操作要素の合計上限（`AISNAP-13`）。
 ///
-/// 行の文書順に消費し、使い切った後の行は `controls_truncated` を立てる。暫定値
-/// （行をまたぐ優先保持は未実装。#84・#108 で見直す）。
+/// 優先保持の要素は表全体で先に枠を確保し、残りを文書順に配る（`apply_table_budget`）。
+/// 優先要素だけで超える場合は圧縮せず展開する。暫定値（#84・#108 で見直す）。
 pub const MAX_TABLE_CONTROLS: usize = 120;
 
-/// 1 行から候補として集める操作要素数の上限（外部 HTML の件数で確保が膨らまないため）。
-const MAX_ROW_CONTROL_CANDIDATES: usize = 64;
+/// 圧縮行 1 行ぶんの操作要素の採用計画（ref 発行前。`AISNAP-13`・`AISNAP-12`）。
+struct RowControlPlan {
+    /// 行上限（[`MAX_ROW_CONTROLS`]）適用後の `(要素, 優先保持か)`（文書順）。
+    kept: Vec<(NodeId, bool)>,
+    /// 行上限・表上限のいずれかで落とした要素があるか。
+    truncated: bool,
+}
 
-/// 圧縮行 `row` の子孫から操作要素を文書順で集め、ref を発行して返す（`AISNAP-13`・`AISNAP-10`）。
+/// 圧縮行 `row` の子孫から操作要素を文書順で全件集め、行上限を適用した計画を返す。
 ///
-/// `build_snapshot` の圧縮経路から呼ばれる。戻り値は `(controls, controls_truncated)`。
-/// `table_budget` はコンテナ全体の残り件数で、採用数だけ減らす。
-/// ref は展開時と同じ規則（role・name・`discriminator`・コンテナ scope）で発行する。
-fn collect_row_controls(
-    doc: &Document,
-    index: &NameIndex<'_>,
-    refs: &mut RefAllocator,
-    container_ref: ElementRef,
-    row: NodeId,
-    table_budget: &mut usize,
-    name_truncated: &mut bool,
-) -> Result<(Vec<RowControl>, bool), SnapshotError> {
+/// 走査は行末まで続ける（64 件目より後の `rel="next"`・送信ボタンも優先検出へ渡すため）。
+/// 確保量は呼び出し元が `MAX_COMPRESS_SCAN_NODES` で有界化済みの子孫数以下。
+fn plan_row_controls(doc: &Document, row: NodeId) -> RowControlPlan {
     // 先行順（文書順）の反復走査。子は逆順に積む。
     let mut candidates: Vec<NodeId> = Vec::new();
-    let mut truncated = false;
     let mut stack: Vec<NodeId> = doc.children(row).collect();
     stack.reverse();
     while let Some(id) = stack.pop() {
@@ -421,10 +418,6 @@ fn collect_row_controls(
             continue;
         }
         if is_row_control(doc, id) {
-            if candidates.len() >= MAX_ROW_CONTROL_CANDIDATES {
-                truncated = true;
-                break;
-            }
             candidates.push(id);
         }
         let before = stack.len();
@@ -433,22 +426,93 @@ fn collect_row_controls(
             added.reverse();
         }
     }
-    if candidates.len() > MAX_ROW_CONTROLS {
-        let priority = priority_candidates(doc, &candidates);
-        let kept = select_retained_with_priority(
-            candidates.len(),
-            &RetentionPolicy::new(MAX_ROW_CONTROLS, 1),
-            &priority,
-        );
-        candidates = kept.apply(&candidates).into_iter().copied().collect();
-        truncated = true;
+    if candidates.is_empty() {
+        return RowControlPlan {
+            kept: Vec::new(),
+            truncated: false,
+        };
     }
-    if candidates.len() > *table_budget {
-        candidates.truncate(*table_budget);
-        truncated = true;
+    let priority = priority_candidates(doc, &candidates);
+    let mut is_priority = vec![false; candidates.len()];
+    for p in &priority {
+        if let Some(flag) = is_priority.get_mut(p.index) {
+            *flag = true;
+        }
     }
-    *table_budget = table_budget.saturating_sub(candidates.len());
+    if candidates.len() <= MAX_ROW_CONTROLS {
+        let kept = candidates.iter().copied().zip(is_priority).collect();
+        return RowControlPlan {
+            kept,
+            truncated: false,
+        };
+    }
+    let retention = select_retained_with_priority(
+        candidates.len(),
+        &RetentionPolicy::new(MAX_ROW_CONTROLS, 1),
+        &priority,
+    );
+    let kept = retention
+        .kept
+        .iter()
+        .filter_map(|item| {
+            let id = candidates.get(item.index).copied()?;
+            let pri = is_priority.get(item.index).copied().unwrap_or(false);
+            Some((id, pri))
+        })
+        .collect();
+    RowControlPlan {
+        kept,
+        truncated: true,
+    }
+}
 
+/// 表全体の上限（[`MAX_TABLE_CONTROLS`]）を行計画へ適用する（`AISNAP-12`・`AISNAP-13`）。
+///
+/// 優先保持（ページネーション・送信ボタン）の要素は表全体で先に枠を確保し、残り枠を
+/// 非優先要素へ文書順に配る。優先要素だけで上限を超える場合は `None`（圧縮を拒否し、
+/// 呼び出し元は展開経路へ進む）。
+fn apply_table_budget(plans: &mut [RowControlPlan]) -> Option<()> {
+    let priority_total: usize = plans
+        .iter()
+        .map(|p| p.kept.iter().filter(|(_, pri)| *pri).count())
+        .sum();
+    if priority_total > MAX_TABLE_CONTROLS {
+        return None;
+    }
+    let mut room = MAX_TABLE_CONTROLS - priority_total;
+    for plan in plans.iter_mut() {
+        let before = plan.kept.len();
+        plan.kept.retain(|(_, pri)| {
+            if *pri {
+                true
+            } else if room > 0 {
+                room -= 1;
+                true
+            } else {
+                false
+            }
+        });
+        if plan.kept.len() < before {
+            plan.truncated = true;
+        }
+    }
+    Some(())
+}
+
+/// 計画済みの操作要素へ ref を発行し [`RowControl`] 列にする（`AISNAP-13`・`AISNAP-10`）。
+///
+/// `build_snapshot` の圧縮経路から呼ばれる。ref は展開時と同じ規則
+/// （role・name・`discriminator`・コンテナ scope）で発行する。
+fn build_row_controls(
+    doc: &Document,
+    index: &NameIndex<'_>,
+    refs: &mut RefAllocator,
+    container_ref: ElementRef,
+    plan: &RowControlPlan,
+    name_truncated: &mut bool,
+) -> Result<(Vec<RowControl>, bool), SnapshotError> {
+    let candidates: Vec<NodeId> = plan.kept.iter().map(|(id, _)| *id).collect();
+    let truncated = plan.truncated;
     let mut controls = Vec::with_capacity(candidates.len());
     for id in candidates {
         let role = compute_role(doc, id)
@@ -603,8 +667,20 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
         // 優先保持（AISNAP-12・TASK-16.4）で選ばれた行は展開のまま残し、それ以外で
         // 失われる内容のない通常行は件数を省略せず 1 行文字列へ畳む（`Node::folded_rows`）。
         // 行の選択はページネーション・送信ボタンの検出（`priority_candidates`）を含む。
+        // 行内操作要素の採用計画で表全体の優先枠を確保できない場合は圧縮を拒否する。
         let (compressible, expanded_structure) = match regular {
-            Some(s) if can_compress(doc, child, &s, &index) => (Some(s), None),
+            Some(s) if can_compress(doc, child, &s, &index) => {
+                let compressed = compress_rows(doc, &s);
+                let mut plans: Vec<RowControlPlan> = compressed
+                    .rows
+                    .iter()
+                    .map(|r| plan_row_controls(doc, r.row))
+                    .collect();
+                match apply_table_budget(&mut plans) {
+                    Some(()) => (Some((s, compressed, plans)), None),
+                    None => (None, Some(s)),
+                }
+            }
             other => (None, other),
         };
         if let Some(structure) = expanded_structure {
@@ -619,23 +695,14 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
                 .collect();
             folded.extend(ids);
         }
-        if let Some(structure) = compressible {
+        if let Some((structure, compressed, plans)) = compressible {
             let headers = assign_header_refs(doc, &index, &structure, elem_ref, &mut refs)?;
-            let compressed = compress_rows(doc, &structure);
             truncated |= headers.iter().any(|h| h.name_truncated);
             // 保持された行の操作要素を文書順に収集する。省略行（truncated_rows）の分は保持しない。
-            let mut table_budget = MAX_TABLE_CONTROLS;
             let mut rows = Vec::with_capacity(compressed.rows.len());
-            for r in compressed.rows {
-                let (controls, controls_truncated) = collect_row_controls(
-                    doc,
-                    &index,
-                    &mut refs,
-                    elem_ref,
-                    r.row,
-                    &mut table_budget,
-                    &mut truncated,
-                )?;
+            for (r, plan) in compressed.rows.into_iter().zip(plans.iter()) {
+                let (controls, controls_truncated) =
+                    build_row_controls(doc, &index, &mut refs, elem_ref, plan, &mut truncated)?;
                 rows.push(
                     TableRow::new(r.text, r.truncated)
                         .with_controls(controls)
@@ -673,6 +740,7 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
 
 #[cfg(test)]
 mod tests {
+    use super::{MAX_ROW_CONTROLS, MAX_TABLE_CONTROLS};
     use super::{MAX_TREE_DEPTH, build_snapshot};
     use crate::data_leaf::DataLeafKind;
     use crate::snapshot::{CheckedState, Node, Snapshot};
@@ -1352,5 +1420,50 @@ mod tests {
         let nodes = all_nodes(&s.tree);
         assert_eq!(nodes.iter().filter(|n| n.role == "row").count(), 11);
         assert!(nodes.iter().all(|n| n.folded_rows.is_empty()));
+    }
+
+    /// AISNAP-12・AISNAP-13・Issue #632: 1 行に 64 件超のリンクがあっても、後ろにある
+    /// `rel="next"` リンクは行上限の中で優先保持される。
+    #[test]
+    fn aisnap_12_row_controls_keep_next_link_beyond_scan_cap() {
+        let mut cell = String::new();
+        for i in 0..70 {
+            cell.push_str(&format!("<a href=\"/p{i}\">L{i}</a>"));
+        }
+        cell.push_str("<a href=\"/next\" rel=\"next\">Next</a>");
+        let s = snap(&format!(
+            "<table><thead><tr><th>h</th></tr></thead><tbody><tr><td>{cell}</td></tr></tbody></table>"
+        ));
+        let nodes = all_nodes(&s.tree);
+        let table = nodes.iter().find_map(|n| n.table.as_ref()).expect("table");
+        let row = table.rows.first().expect("row");
+        assert_eq!(row.controls.len(), MAX_ROW_CONTROLS);
+        assert!(row.controls_truncated);
+        assert!(row.controls.iter().any(|c| c.name == "Next"));
+    }
+
+    /// AISNAP-12・AISNAP-13・Issue #632: 先行行が表全体の枠を使い切っても、後続行の
+    /// `rel="next"` リンクは優先枠で保持される。
+    #[test]
+    fn aisnap_12_table_budget_reserves_priority_for_later_rows() {
+        let mut html = String::from("<table><thead><tr><th>h</th></tr></thead><tbody>");
+        for r in 0..19 {
+            html.push_str("<tr><td>");
+            for i in 0..MAX_ROW_CONTROLS {
+                html.push_str(&format!("<a href=\"/r{r}c{i}\">R{r}C{i}</a>"));
+            }
+            html.push_str("</td></tr>");
+        }
+        html.push_str("<tr><td><a href=\"/next\" rel=\"next\">Next</a></td></tr>");
+        html.push_str("</tbody></table>");
+        let s = snap(&html);
+        let nodes = all_nodes(&s.tree);
+        let table = nodes.iter().find_map(|n| n.table.as_ref()).expect("table");
+        let last = table.rows.last().expect("last row");
+        assert_eq!(last.controls.len(), 1);
+        assert_eq!(last.controls[0].name, "Next");
+        let total: usize = table.rows.iter().map(|r| r.controls.len()).sum();
+        assert_eq!(total, MAX_TABLE_CONTROLS);
+        assert!(table.rows.iter().any(|r| r.controls_truncated));
     }
 }
