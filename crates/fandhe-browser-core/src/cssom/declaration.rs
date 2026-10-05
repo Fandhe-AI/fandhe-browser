@@ -278,6 +278,18 @@ mod tests {
     }
 
     #[test]
+    fn core_5_important_with_comments_between_tokens() {
+        let imp = |v: &str| (String::from("color"), v.to_owned(), Importance::Important);
+        assert_eq!(pairs("color: red !/*x*/important"), vec![imp("red")]);
+        assert_eq!(pairs("color: red ! /*x*/ important"), vec![imp("red")]);
+        assert_eq!(
+            pairs("color: red /*x*/!/*y*/important/*z*/;"),
+            vec![imp("red")]
+        );
+        assert_eq!(pairs("color: red !impor/*x*/tant"), vec![]);
+    }
+
+    #[test]
     fn core_5_delimiters_are_protected() {
         assert_eq!(
             pairs("background: url(data:image/png;base64,AAAA)"),
