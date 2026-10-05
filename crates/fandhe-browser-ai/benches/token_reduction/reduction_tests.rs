@@ -58,7 +58,6 @@ fn render_covers_every_output_field() {
     let expected = [
         "- document \"Title\"",
         "  - button [e5] (disabled)",
-        "  folded …(text)",
         "  - checkbox \"Agree\" [e6] (checked)",
         "  - table \"T\" [e2]",
         "    header: Name [e1]",
@@ -67,6 +66,8 @@ fn render_covers_every_output_field() {
         "    … +3 rows",
         "  - list",
         "    - text \"a b\"",
+        // データ行の child を持たないので畳んだ行は末尾にまとめて出る。
+        "  folded …(text)",
         "… truncated",
     ]
     .join("\n");
@@ -185,4 +186,32 @@ fn missing_directory_is_read_error() {
         Err(ReductionError::Tokens(_)) => {}
         other => panic!("unexpected: {other:?}"),
     }
+}
+
+/// AISNAP-12・AISNAP-1: ヘッダ行と index 0 の畳んだ行がある表で、畳んだ行はヘッダの後・
+/// 先頭データ行の前に出る（ヘッダを数えず、データ行だけで位置を進める）。
+#[test]
+fn render_folded_row_follows_header_row_in_document_order() {
+    let header =
+        Node::new("row", "n").with_children(vec![Node::new("columnheader", "n").with_ref("e2")]);
+    let data1 = Node::new("row", "").with_children(vec![Node::new("link", "Next").with_ref("e3")]);
+    let mut table = Node::new("table", "T")
+        .with_ref("e1")
+        .with_children(vec![header, data1]);
+    table.folded_rows = vec![
+        FoldedRow::new(0, "row0", false),
+        FoldedRow::new(2, "row2", false),
+    ];
+    let text = render_snapshot(&Snapshot::new(table));
+    let expected = [
+        "- table \"T\" [e1]",
+        "  - row \"n\"",
+        "    - columnheader \"n\" [e2]",
+        "  row0",
+        "  - row",
+        "    - link \"Next\" [e3]",
+        "  row2",
+    ]
+    .join("\n");
+    assert_eq!(text, expected);
 }

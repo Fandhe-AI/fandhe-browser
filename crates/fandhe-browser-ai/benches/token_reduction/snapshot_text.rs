@@ -98,28 +98,46 @@ fn render_node(node: &Node, depth: usize, lines: &mut Vec<String>) {
             lines.push(format!("{sub}… +{} rows", table.truncated_rows));
         }
     }
-    // 畳んだ行と children を FoldedRow::index で統合し文書順を復元する。
-    // children 側の表示対象データ行は、畳んだ行が使わない index を昇順で占める契約
-    // （`AISNAP-12`）。index を持たない非データ行の child が混じる場合の位置は近似になる。
+    // 畳んだ行と children を FoldedRow::index で統合し文書順を復元する（`AISNAP-12`）。
+    // `index` は表示対象データ行だけを数えた位置なので、位置カウンタもデータ行の child
+    // だけで進める。ヘッダ行・caption 等の非データ child は数えず、元の位置のまま出す。
+    // データ行か否かは Node から構造的に判別できないため role で近似する（`is_data_row`）。
     let mut folded: Vec<&FoldedRow> = node.folded_rows.iter().collect();
     folded.sort_by_key(|f| f.index);
     let mut folded = folded.into_iter().peekable();
-    let mut children = node.children.iter().peekable();
-    let mut pos = 0usize;
-    loop {
-        if folded.peek().is_some_and(|f| f.index <= pos) || children.peek().is_none() {
-            let Some(f) = folded.next() else { break };
-            let mut l = format!("{sub}{}", one_line(&f.text));
-            if f.truncated {
-                l.push_str(" …(text)");
+    let mut data_pos = 0usize;
+    for child in &node.children {
+        if is_data_row(child) {
+            while let Some(f) = folded.next_if(|f| f.index <= data_pos) {
+                lines.push(render_folded(&sub, f));
             }
-            lines.push(l);
-        } else if let Some(child) = children.next() {
-            render_node(child, depth + 1, lines);
+            data_pos += 1;
         }
-        pos += 1;
-    }
-    for child in children {
         render_node(child, depth + 1, lines);
+    }
+    for f in folded {
+        lines.push(render_folded(&sub, f));
+    }
+}
+
+fn render_folded(sub: &str, f: &FoldedRow) -> String {
+    let mut l = format!("{sub}{}", one_line(&f.text));
+    if f.truncated {
+        l.push_str(" …(text)");
+    }
+    l
+}
+
+/// 表の本文行・一覧項目に当たる child か（`FoldedRow::index` の数え方に合わせる近似判定）。
+///
+/// ヘッダ行（全セルが `columnheader`）は除く。`tfoot` 行や th のみの本文行は構造から
+/// 区別できないため近似になる（測定用の暫定形式。確定は TASK-19・`AISNAP-6`）。
+fn is_data_row(node: &Node) -> bool {
+    match node.role.as_str() {
+        "listitem" => true,
+        "row" => {
+            node.children.is_empty() || !node.children.iter().all(|c| c.role == "columnheader")
+        }
+        _ => false,
     }
 }
