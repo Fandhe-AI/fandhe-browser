@@ -142,6 +142,25 @@ fn reports_no_result() {
     }
 }
 
+/// CDP-3: 実行ファイル欠落などの起動失敗は panic せず `SpawnFailed`（理由付き）で返る。
+#[test]
+fn reports_spawn_failure() {
+    let missing = TempDir::new().0.join("no-such-program");
+    let cmd = ScriptCommand {
+        program: missing.clone(),
+        args: Vec::new(),
+        envs: Vec::new(),
+        cwd: None,
+    };
+    match run_script(&cmd, "ws://x", D) {
+        ScriptOutcome::SpawnFailed { reason } => {
+            assert!(reason.contains("failed to spawn"), "{reason}");
+            assert!(reason.contains("no-such-program"), "{reason}");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
 /// CDP-3: 締め切り超過は kill して `TimedOut`。
 #[test]
 fn times_out_and_kills() {

@@ -19,13 +19,16 @@
 // 2 つのテストターゲットが別々の部分集合を使うため、未使用項目の警告を許容する。
 #![allow(dead_code)]
 
+use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use fandhe_backend_core::server::Server;
@@ -73,31 +76,88 @@ impl Drop for TempDir {
     }
 }
 
-/// 起動済みテストサーバー。`_dir` はプロファイル用で、本体の drop まで保持する。
+/// サーバー停止要求の共有状態（`stop` フラグと、待機中 Future の waker）。
+#[derive(Default)]
+struct StopSignal {
+    inner: Mutex<(bool, Option<Waker>)>,
+}
+
+impl StopSignal {
+    fn trigger(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.0 = true;
+            if let Some(w) = g.1.take() {
+                w.wake();
+            }
+        }
+    }
+}
+
+/// `BoundServer::run_until` へ渡す停止 Future（workspace の tokio は `sync` / `time` feature を
+/// 持たないため、標準ライブラリだけで実装する）。
+struct StopFuture(Arc<StopSignal>);
+
+impl Future for StopFuture {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        match self.0.inner.lock() {
+            Ok(mut g) => {
+                if g.0 {
+                    Poll::Ready(())
+                } else {
+                    g.1 = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+            // ロック汚染時は停止扱いにして待機を打ち切る。
+            Err(_) => Poll::Ready(()),
+        }
+    }
+}
+
+/// サーバースレッド終了を待つ上限（超過時は待たずにプロファイルを削除する）。
+const SERVER_STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// 起動済みテストサーバー。drop 時にサーバーを停止してスレッド終了を待ち、その後に
+/// `_dir`（プロファイル）を削除する（停止前に削除するとサーバーが保持中のプロファイルを
+/// 消してしまうため。フィールドは宣言順に drop されるので `_dir` は最後）。
 pub struct TestServer {
     pub addr: SocketAddr,
     pub state: Arc<CdpState>,
+    stop: Arc<StopSignal>,
+    stopped: Receiver<()>,
     _dir: TempDir,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.stop.trigger();
+        // サーバースレッドが終了時に送る完了通知を待つ（切断で Err になっても待機は終わる）。
+        let _ = self.stopped.recv_timeout(SERVER_STOP_GRACE);
+    }
 }
 
 /// 実サーバーを専用スレッドで起動する。
 ///
 /// 子プロセスの待機はブロッキングなので、テスト側ランタイムとは別の current_thread
 /// ランタイムで動かす（workspace の tokio は `rt-multi-thread` を持たず、feature 追加は
-/// 依存変更になるため行わない）。スレッドはテストプロセス終了まで残る。
+/// 依存変更になるため行わない）。スレッドは [`TestServer`] の drop で停止・終了を待つ。
 pub fn start_server() -> TestServer {
     let dir = TempDir::new();
     let profile = Arc::new(Profile::open(&dir.0).expect("profile open"));
     let app = Arc::new(AppState::with_disabled_renderer(profile));
     let state = Arc::new(CdpState::new(app));
     let st = Arc::clone(&state);
+    let stop = Arc::new(StopSignal::default());
+    let stop_for_thread = Arc::clone(&stop);
     let (tx, rx) = std::sync::mpsc::channel();
+    let (stopped_tx, stopped) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
-        rt.block_on(async move {
+        let _ = rt.block_on(async move {
             let (router, ws_config) = endpoints(&st).expect("endpoints").into_parts();
             let bound = Server::new()
                 .handler(router)
@@ -106,8 +166,11 @@ pub fn start_server() -> TestServer {
                 .await
                 .expect("bind");
             tx.send(bound.local_addr().expect("local_addr")).ok();
-            bound.run().await
-        })
+            bound.run_until(StopFuture(stop_for_thread)).await
+        });
+        // ランタイム（接続タスク含む）を落としてから完了を通知する。
+        drop(rt);
+        stopped_tx.send(()).ok();
     });
     let addr = rx
         .recv_timeout(Duration::from_secs(10))
@@ -115,6 +178,8 @@ pub fn start_server() -> TestServer {
     TestServer {
         addr,
         state,
+        stop,
+        stopped,
         _dir: dir,
     }
 }
@@ -176,6 +241,8 @@ pub enum ScriptOutcome {
     },
     /// 締め切りを超えて kill した。
     TimedOut { stderr_tail: String },
+    /// スクリプトを起動できなかった（実行ファイル欠落・権限エラー等）。
+    SpawnFailed { reason: String },
     /// 結果行が不正（JSON 不正・欠落フィールド・長さ超過）。
     Malformed { reason: String },
 }
@@ -373,21 +440,41 @@ pub fn run_script(cmd: &ScriptCommand, ws_endpoint: &str, deadline: Duration) ->
     if let Some(d) = &cmd.cwd {
         c.current_dir(d);
     }
-    let mut child = c.spawn().expect("spawn script");
-    let out = spawn_result_reader(child.stdout.take().expect("stdout"));
-    let err = spawn_tail_reader(child.stderr.take().expect("stderr"));
+    let mut child = match c.spawn() {
+        Ok(ch) => ch,
+        Err(e) => {
+            return ScriptOutcome::SpawnFailed {
+                reason: format!("failed to spawn {}: {e}", cmd.program.display()),
+            };
+        }
+    };
+    let (Some(child_out), Some(child_err)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return ScriptOutcome::SpawnFailed {
+            reason: "child stdout/stderr pipe was not available".to_string(),
+        };
+    };
+    let out = spawn_result_reader(child_out);
+    let err = spawn_tail_reader(child_err);
 
     let start = Instant::now();
     let (status, timed_out) = loop {
-        match child.try_wait().expect("try_wait") {
-            Some(s) => break (Some(s), false),
-            None if start.elapsed() >= deadline => {
+        match child.try_wait() {
+            Ok(Some(s)) => break (Some(s), false),
+            Err(_) => {
                 kill_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
                 break (None, true);
             }
-            None => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) if start.elapsed() >= deadline => {
+                kill_group(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                break (None, true);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
         }
     };
     let stdout = collect_result(&out);
