@@ -21,6 +21,8 @@ import {
   normalizeValue,
   parseProtocolLine,
   toJsonl,
+  readBodyLimited,
+  validateDiscoveredWs,
   validateEndpoint,
   validateOutPath,
 } from "./lib.mjs";
@@ -74,6 +76,8 @@ const push = (r) => {
 process.env.DEBUG = "pw:protocol";
 process.env.DEBUG_COLORS = "no";
 let pending = "";
+// newPage 到達後の終了処理（browser.close）の CDP は収集対象外（README の契約: newPage まで）。
+let capturing = true;
 process.stderr.write = (chunk, ...rest) => {
   let lines;
   try {
@@ -90,7 +94,7 @@ process.stderr.write = (chunk, ...rest) => {
       // 解析不能行はレコード欠落になるため収集全体を失敗させる。
       fatal(`unparsable protocol line: ${e.message}`);
     }
-    if (rec) push(rec);
+    if (rec && capturing) push(rec);
   }
   const cb = rest.find((x) => typeof x === "function");
   if (cb) cb();
@@ -138,7 +142,7 @@ for (const p of ["/json/version", "/json/version/"]) {
     const res = await fetch(origin + p, { redirect: "manual", signal: AbortSignal.timeout(STAGE_TIMEOUT_MS) });
     push({ kind: "http", method: "GET", path: p, status: res.status });
     if (res.status === 200 && p === "/json/version") {
-      const body = await res.json();
+      const body = JSON.parse(await readBodyLimited(res));
       if (typeof body.webSocketDebuggerUrl === "string") wsUrl = body.webSocketDebuggerUrl;
     }
   } catch (e) {
@@ -155,7 +159,7 @@ if (!browser) {
   // http 経由が失敗した場合は、discovery が返した ws:// で CDP メッセージ列の収集を試みる。
   const target = endpoint.protocol === "ws:" ? endpoint.href : wsUrl;
   if (target) {
-    const wsEndpoint = validateEndpoint(target);
+    const wsEndpoint = validateDiscoveredWs(target, endpoint);
     const r = await stage("connectOverCDP(ws)", () =>
       chromium.connectOverCDP(wsEndpoint.href, { timeout: STAGE_TIMEOUT_MS }),
     );
@@ -172,6 +176,7 @@ if (browser) {
     // newPage 到達後は goto 等へ進まない（スコープは newPage まで）。
     await stage("newPage", () => context.newPage());
   }
+  capturing = false;
   await Promise.race([browser.close().catch(() => {}), new Promise((r) => setTimeout(r, 2000))]);
 }
 

@@ -16,15 +16,24 @@ import {
   MAX_CHUNK_BYTES,
   toJsonl,
   validateEndpoint,
+  validateDiscoveredWs,
+  readBodyLimited,
+  MAX_DISCOVERY_BYTES,
   validateJsonl,
   validateOutPath,
 } from "./lib.mjs";
 
 let cases = 0;
+const asyncCases = [];
 const t = (name, fn) => {
-  fn();
-  cases++;
-  console.log(`ok: ${name}`);
+  const r = fn();
+  const done = () => {
+    cases++;
+    console.log(`ok: ${name}`);
+  };
+  // 非同期ケースの失敗（reject）も確実に終了コードへ反映するため、最後に await する。
+  if (r && typeof r.then === "function") asyncCases.push(r.then(done));
+  else done();
 };
 
 t("endpoint accepts loopback http/ws with port", () => {
@@ -94,6 +103,19 @@ t("normalizeValue keeps __proto__ keys as own properties", () => {
   assert.equal(JSON.stringify(normalizeValue(msg, "1")), '{"a":1,"__proto__":{"x":"y"}}');
 });
 
+t("validateDiscoveredWs pins host and port to the endpoint", () => {
+  const ep = validateEndpoint("http://127.0.0.1:9333");
+  assert.equal(validateDiscoveredWs("ws://127.0.0.1:9333/devtools/browser/x", ep).port, "9333");
+  assert.throws(() => validateDiscoveredWs("ws://127.0.0.1:9444/x", ep), /does not match/);
+  assert.throws(() => validateDiscoveredWs("ws://[::1]:9333/x", ep), /does not match/);
+});
+
+t("readBodyLimited rejects oversized discovery bodies", async () => {
+  const big = new Response("x".repeat(MAX_DISCOVERY_BYTES + 1));
+  await assert.rejects(readBodyLimited(big), /size limit/);
+  assert.equal(await readBodyLimited(new Response('{"a":1}')), '{"a":1}');
+});
+
 t("toJsonl adds seq and validates", () => {
   const text = toJsonl([
     { kind: "meta", schema: 1 },
@@ -128,4 +150,5 @@ t("committed trace conforms to schema", () => {
   assert.ok(!text.includes("/home/"), "no local absolute paths");
 });
 
+await Promise.all(asyncCases);
 console.log(`self-test: ${cases} cases passed`);

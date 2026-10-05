@@ -163,3 +163,34 @@ export function checkCollection({ cdpCount }) {
   if (cdpCount === 0) return { ok: false, reason: "no CDP messages were captured (pw:protocol output missing?)" };
   return { ok: true, reason: null };
 }
+
+/** HTTP discovery 応答本文の最大バイト数（/json/version は小さな JSON のため十分に小さく取る）。 */
+export const MAX_DISCOVERY_BYTES = 64 * 1024;
+
+/**
+ * ReadableStream 由来の本文を上限付きで読み、超過時は Error を投げる。
+ * trace.mjs の HTTP discovery から呼ばれる。確保前にサイズを検証するため res.json() は使わない。
+ */
+export async function readBodyLimited(res, maxBytes = MAX_DISCOVERY_BYTES) {
+  if (!res.body) return "";
+  const chunks = [];
+  let total = 0;
+  for await (const c of res.body) {
+    total += c.byteLength;
+    if (total > maxBytes) throw new Error("discovery response exceeds size limit");
+    chunks.push(c);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/**
+ * discovery が返した WebSocket URL を検証する。loopback であることに加え、元の endpoint と
+ * ホスト・ポートが一致しなければ拒否する（別ローカルサービスへの接続誘導を防ぐ。SSRF 対策）。
+ */
+export function validateDiscoveredWs(target, endpoint) {
+  const u = validateEndpoint(target);
+  if (u.hostname !== endpoint.hostname || u.port !== endpoint.port) {
+    throw new Error("discovered WebSocket URL does not match the endpoint host and port");
+  }
+  return u;
+}
