@@ -175,9 +175,12 @@ fn render_children(children: &[Node], depth: usize, m: &mut Merge<'_>, lines: &m
     for child in children {
         if is_transparent_group(child) {
             render_head(child, depth, lines);
+            let before = m.seen;
             render_children(&child.children, depth + 1, m, lines);
             // 最後のデータ行を含むグループの末尾で、残りの畳んだ行を同じ階層へ出す。
-            if m.seen >= m.total {
+            // データ行を持たないグループ（thead 等）では出さない（全行が畳まれた表でも
+            // 本文行がヘッダ直後に出ないよう、その場合は呼び出し元の末尾で出す）。
+            if m.seen > before && m.seen >= m.total {
                 m.flush(&"  ".repeat(depth + 1), lines);
             }
             continue;

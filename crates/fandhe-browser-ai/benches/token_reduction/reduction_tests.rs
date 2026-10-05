@@ -282,3 +282,31 @@ fn render_folded_rows_interleave_inside_rowgroups() {
     .join("\n");
     assert_eq!(text, expected);
 }
+
+/// AISNAP-12: 全データ行が畳まれた表では、畳んだ行は thead の後ろ（表の末尾）に出る。
+#[test]
+fn render_all_rows_folded_after_header_group() {
+    let thead = Node::new("rowgroup", "").with_children(vec![
+        Node::new("row", "").with_children(vec![Node::new("columnheader", "n").with_ref("e1")]),
+    ]);
+    let tbody = Node::new("rowgroup", "");
+    let mut table = Node::new("table", "T")
+        .with_ref("e0")
+        .with_children(vec![thead, tbody]);
+    table.folded_rows = vec![
+        FoldedRow::new(0, "row0", false),
+        FoldedRow::new(1, "row1", false),
+    ];
+    let text = render_snapshot(&Snapshot::new(table));
+    let expected = [
+        "- table \"T\" [e0]",
+        "  - rowgroup",
+        "    - row",
+        "      - columnheader \"n\" [e1]",
+        "  - rowgroup",
+        "  row0",
+        "  row1",
+    ]
+    .join("\n");
+    assert_eq!(text, expected);
+}
