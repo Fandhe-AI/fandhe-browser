@@ -1,12 +1,20 @@
-//! CSS テキストを「セレクタ部 + `{ ... }` の中身」のルールブロックへ分割する字句処理
-//! （TASK-105.4.1・#551・MS-8・ビヘイビア `CORE-5`。`PLUG-8` の前提条件）。
+//! CSS テキストのルールブロック分割（TASK-105.4.1・#551）と、DOM からのスタイル源収集・
+//! [`Stylesheet`] 構築（TASK-105.4.2・#552）。MS-8・ビヘイビア `CORE-5`（`PLUG-8` の前提条件）。
 //!
-//! 呼び出し元は #552 が集める `<style>` 要素の中身と外部スタイルシート文字列で、どちらも
-//! 外部入力（ネットワーク取得した CSS）である。出力の [`RuleBlock::prelude`] は
-//! [`crate::selector::parse_selector_list`] へ、[`RuleBlock::body`] は
-//! [`super::parse_declarations`] へそのまま渡せる。本モジュールは字句分割だけを担い、
-//! セレクタ・宣言の解析も [`super::StyleRule`] / [`super::Stylesheet`] の組み立ても行わない
-//! （後者は #552 の責務）。新規依存は使わない（#263 の決定）。
+//! 入口は 3 つ。外部スタイルシート文字列・`<style>` の中身を [`parse_stylesheet`] へ、
+//! 文書全体を [`collect_document_styles`] へ、単一要素の `style` 属性を
+//! [`parse_style_attribute`] へ渡す。入力はいずれも外部入力（ネットワーク取得した
+//! HTML / CSS）。結果は後続の #259（マッチング）・#260（カスケード・computed style）が
+//! 入力にする。inline の `style` 属性は `Stylesheet` ではなく要素ごとの宣言列
+//! （[`InlineStyle`]）で表す（`StyleRule` はセレクタ必須で単一ノードを指せず、#260 は
+//! inline をマッチ結果とは別のカスケード入力として扱うため）。
+//!
+//! 分割結果の [`RuleBlock::prelude`] は [`crate::selector::parse_selector_list`] へ、
+//! [`RuleBlock::body`] は [`super::parse_declarations`] へ渡す。新規依存は使わない（#263 の決定）。
+//!
+//! 外部スタイルシート（`<link rel="stylesheet">`・`@import`）の取得は本モジュールの責務外で、
+//! ネットワークには触れない。呼び出し側が fetch 済み（scheme・アドレス検証済み）の文字列を
+//! [`parse_stylesheet`] へ渡す。
 //!
 //! # エラー方針
 //!
@@ -16,13 +24,20 @@
 //! - 構造的に壊れたルール（セレクタ部が空・ブロック無し・余分な `}`）はそのルールだけを
 //!   捨てて [`RuleBlockError`] に記録し、残りの処理を続ける
 //! - コメント・文字列・ブロックが EOF まで閉じない場合は、EOF で暗黙に閉じたものとする
+//! - セレクタ・宣言の解析に失敗したルール（[`RuleBlockErrorKind::UnsupportedSelector`] /
+//!   `InvalidSelector` / `InvalidDeclarations`）もそのルールだけを捨てて記録し、残りを
+//!   続ける。記録は offset 昇順で、種別とバイト位置のみ（入力テキストは含めない）
+//! - 宣言 0 件のルール（`a{}`）は捨てずに残す
 //! - 入力長・ルール数が上限を超えたら [`Error::InvalidInput`]（確保前・`push` 前に判定。
 //!   メッセージに入力は含めない）。エラー記録は上限までで、超過分は件数だけ数える
 //!
 //! # 未実装（REPAIR-3: 実装済みを装わない）
 //!
-//! - セレクタ・宣言レベルの解析失敗の記録（#552 が [`RuleBlockErrorKind`] へ variant を
-//!   足して行う。`#[non_exhaustive]`）
+//! - `<link rel="stylesheet">` の解決・取得と `@import` の取得（取得は呼び出し側の責務）
+//! - `<style>` の `media` 属性（無視する）、SVG の `<style>`（対象外）、Shadow DOM、
+//!   `disabled` 等の状態、JS による動的変更の反映、起源（UA / user / author）の区別
+//! - CSSOM 用の可観測性計装（`OperationKind` に対応 variant が無い）
+//! - 1 スタイル源の上限違反で文書全体の収集が `Err` になる挙動の見直し（#261）
 //! - 条件付きグループ（`@media` / `@supports` / `@layer`）内のルールの取り込みと
 //!   `@import` の取得（いずれも読み飛ばすだけ）
 //! - CSS ネスト（body 内の入れ子ルール）の展開。body に入れ子のまま残す
@@ -35,8 +50,10 @@
 use std::iter::Peekable;
 use std::str::CharIndices;
 
-use super::is_css_whitespace;
+use super::{Declaration, StyleRule, Stylesheet, is_css_whitespace, parse_declarations};
+use crate::dom::{Document, HTML_NAMESPACE_URI, NodeData, NodeId};
 use crate::error::{Error, Result};
+use crate::selector::{html_local_name_eq, parse_selector_list};
 
 /// 受け付ける CSS テキストの最大バイト数（暫定。見直しは #261）。
 pub const MAX_STYLESHEET_INPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -72,7 +89,7 @@ impl RuleBlock {
     }
 }
 
-/// 構造的に壊れたルールの種別。#552 が解析失敗の variant を追加する。
+/// 壊れたルールの種別（構造エラーと、セレクタ・宣言の解析失敗）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RuleBlockErrorKind {
@@ -82,6 +99,12 @@ pub enum RuleBlockErrorKind {
     MissingBlock,
     /// 対応する `{` の無い `}`。
     UnexpectedCloseBrace,
+    /// セレクタが構文上は正しいがサブセット外（`a:hover` 等。`Error::Unsupported`）。
+    UnsupportedSelector,
+    /// セレクタの構文不正・セレクタ上限超過（CDO / CDC 混入を含む）。
+    InvalidSelector,
+    /// 宣言ブロックが上限（入力長・宣言数）を超えた。
+    InvalidDeclarations,
 }
 
 /// 分割中に記録した壊れたルールの情報（種別とバイト位置のみ。入力テキストは含めない）。
@@ -333,6 +356,206 @@ pub fn split_rule_blocks(input: &str) -> Result<RuleBlocks> {
     Ok(out)
 }
 
+/// [`parse_stylesheet`] の結果。組み立て済みの [`Stylesheet`] と、捨てたルールの記録。
+#[derive(Debug, Clone, Default)]
+pub struct ParsedStylesheet {
+    stylesheet: Stylesheet,
+    errors: Vec<RuleBlockError>,
+    dropped_errors: usize,
+    skipped_at_rules: usize,
+}
+
+impl ParsedStylesheet {
+    /// 構築したスタイルシート（ソース順のルール）。
+    pub fn stylesheet(&self) -> &Stylesheet {
+        &self.stylesheet
+    }
+
+    /// 所有権付きでスタイルシートを取り出す。
+    pub fn into_stylesheet(self) -> Stylesheet {
+        self.stylesheet
+    }
+
+    /// 捨てたルールの記録（offset 昇順・最大 [`MAX_RULE_BLOCK_ERRORS`] 件）。
+    pub fn errors(&self) -> &[RuleBlockError] {
+        &self.errors
+    }
+
+    /// 上限超過で記録しなかったエラーの件数。
+    pub fn dropped_errors(&self) -> usize {
+        self.dropped_errors
+    }
+
+    /// 読み飛ばした at-rule の件数。
+    pub fn skipped_at_rules(&self) -> usize {
+        self.skipped_at_rules
+    }
+}
+
+/// CSS テキスト（外部スタイルシート文字列・`<style>` の中身）から [`Stylesheet`] を構築する。
+///
+/// [`split_rule_blocks`] の結果を `parse_selector_list` / `parse_declarations` に通し、失敗した
+/// ルールだけを捨てて [`ParsedStylesheet::errors`] へ記録して継続する。`Err` は入力長・ルール数の
+/// 上限違反（[`Error::InvalidInput`]）のみ。ネットワークには触れない。
+/// 対応ビヘイビア: `CORE-5`（TASK-105.4.2・#552）。
+pub fn parse_stylesheet(css: &str) -> Result<ParsedStylesheet> {
+    let mut split = split_rule_blocks(css)?;
+    let blocks = std::mem::take(&mut split.blocks);
+    let mut rules = Vec::with_capacity(blocks.len());
+    for block in &blocks {
+        let selectors = match parse_selector_list(block.prelude()) {
+            Ok(s) => s,
+            Err(Error::Unsupported { .. }) => {
+                split.push_error(RuleBlockErrorKind::UnsupportedSelector, block.offset());
+                continue;
+            }
+            Err(_) => {
+                split.push_error(RuleBlockErrorKind::InvalidSelector, block.offset());
+                continue;
+            }
+        };
+        match parse_declarations(block.body()) {
+            Ok(declarations) => rules.push(StyleRule::new(selectors, declarations)),
+            Err(_) => split.push_error(RuleBlockErrorKind::InvalidDeclarations, block.offset()),
+        }
+    }
+    // 構造エラーと解析エラーが混在するため、ソース順（offset 昇順・安定）に揃える。
+    split.errors.sort_by_key(|e| e.offset);
+    Ok(ParsedStylesheet {
+        stylesheet: Stylesheet::new(rules),
+        errors: split.errors,
+        dropped_errors: split.dropped_errors,
+        skipped_at_rules: split.skipped_at_rules,
+    })
+}
+
+/// 1 つの `<style>` 要素から構築したスタイルシート。
+#[derive(Debug, Clone)]
+pub struct StyleElementSheet {
+    node: NodeId,
+    parsed: ParsedStylesheet,
+}
+
+impl StyleElementSheet {
+    /// 元の `<style>` 要素のノード。
+    pub fn node(&self) -> NodeId {
+        self.node
+    }
+
+    /// 構築結果。
+    pub fn parsed(&self) -> &ParsedStylesheet {
+        &self.parsed
+    }
+}
+
+/// `style` 属性を持つ要素と、その宣言列（#260 がマッチ結果とは別の inline 入力として使う）。
+#[derive(Debug, Clone)]
+pub struct InlineStyle {
+    node: NodeId,
+    declarations: Vec<Declaration>,
+}
+
+impl InlineStyle {
+    /// `style` 属性を持つ要素のノード。
+    pub fn node(&self) -> NodeId {
+        self.node
+    }
+
+    /// 属性値を解析した宣言（ソース順。`style=""` は空）。
+    pub fn declarations(&self) -> &[Declaration] {
+        &self.declarations
+    }
+}
+
+/// 文書から集めたスタイル源（`<style>` 要素のシートと inline 宣言。いずれも文書順）。
+#[derive(Debug, Clone, Default)]
+pub struct DocumentStyles {
+    style_sheets: Vec<StyleElementSheet>,
+    inline_styles: Vec<InlineStyle>,
+}
+
+impl DocumentStyles {
+    /// `<style>` 要素ごとのスタイルシート（文書順）。
+    pub fn style_sheets(&self) -> &[StyleElementSheet] {
+        &self.style_sheets
+    }
+
+    /// `style` 属性を持つ要素ごとの宣言列（文書順）。
+    pub fn inline_styles(&self) -> &[InlineStyle] {
+        &self.inline_styles
+    }
+}
+
+/// `<style>` を読み飛ばすべき `type` か（値が非空で `text/css` 以外。HTML 仕様に合わせる）。
+fn style_type_is_not_css(value: &str) -> bool {
+    let v = value.trim_matches(is_css_whitespace);
+    !v.is_empty() && !v.eq_ignore_ascii_case("text/css")
+}
+
+/// `<style>` 要素の子テキストを連結する。累積長を確保前に検査する（無制限確保の防止）。
+fn style_element_text(document: &Document, id: NodeId) -> Result<String> {
+    let mut text = String::new();
+    for child in document.children(id) {
+        if let Some(NodeData::Text { contents }) = document.node_data(child) {
+            if text.len().saturating_add(contents.len()) > MAX_STYLESHEET_INPUT_BYTES {
+                return Err(Error::InvalidInput {
+                    message: format!("stylesheet input exceeds {MAX_STYLESHEET_INPUT_BYTES} bytes"),
+                });
+            }
+            text.push_str(contents);
+        }
+    }
+    Ok(text)
+}
+
+/// 文書の `<style>` 要素と `style` 属性を収集し、`<style>` は [`Stylesheet`] へ構築する。
+///
+/// `<style>` は HTML 名前空間のものだけが対象（SVG は対象外）で、`type` が空以外かつ
+/// `text/css` 以外なら読み飛ばす。`<template>` の contents は含まれない。`style` 属性は
+/// 全名前空間の要素が対象。`Err` は 1 スタイル源の上限違反のみ（fail-closed。見直しは #261）。
+/// 対応ビヘイビア: `CORE-5`（TASK-105.4.2・#552）。
+pub fn collect_document_styles(document: &Document) -> Result<DocumentStyles> {
+    let mut out = DocumentStyles::default();
+    for id in document.descendants(document.root()) {
+        if !document.is_element(id) {
+            continue;
+        }
+        let is_html_style = document.namespace_url(id) == Some(HTML_NAMESPACE_URI)
+            && document
+                .local_name(id)
+                .is_some_and(|n| html_local_name_eq(n, "style"));
+        if is_html_style
+            && !document
+                .attribute(id, "type")
+                .is_some_and(style_type_is_not_css)
+        {
+            let text = style_element_text(document, id)?;
+            out.style_sheets.push(StyleElementSheet {
+                node: id,
+                parsed: parse_stylesheet(&text)?,
+            });
+        }
+        if let Some(value) = document.attribute(id, "style") {
+            out.inline_styles.push(InlineStyle {
+                node: id,
+                declarations: parse_declarations(value)?,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// 単一要素の `style` 属性を宣言列へ解析する。#260 が要素単位で呼ぶ入口。
+///
+/// 属性なし・要素以外・範囲外は `Ok(None)`、`style=""` は `Ok(Some(vec![]))`。
+/// 対応ビヘイビア: `CORE-5`（TASK-105.4.2・#552）。
+pub fn parse_style_attribute(document: &Document, id: NodeId) -> Result<Option<Vec<Declaration>>> {
+    document
+        .attribute(id, "style")
+        .map(parse_declarations)
+        .transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,5 +759,114 @@ mod tests {
         let r = split_rule_blocks(&"}".repeat(MAX_RULE_BLOCK_ERRORS + 3)).expect("ok");
         assert_eq!(r.errors().len(), MAX_RULE_BLOCK_ERRORS);
         assert_eq!(r.dropped_errors(), 3);
+    }
+
+    fn rules_of(css: &str) -> ParsedStylesheet {
+        parse_stylesheet(css).expect("must parse")
+    }
+
+    /// CORE-5: 外部文字列から 2 ルールを具体値で構築する。
+    #[test]
+    fn core_5_parse_stylesheet_builds_rules() {
+        let p = rules_of("a{color:red} .b{margin:0 !important}");
+        assert_eq!(p.stylesheet().len(), 2);
+        let d0 = p.stylesheet().rules()[0].declarations();
+        assert_eq!(
+            (d0[0].property(), d0[0].value(), d0[0].importance()),
+            ("color", "red", crate::cssom::Importance::Normal)
+        );
+        let d1 = p.stylesheet().rules()[1].declarations();
+        assert_eq!(
+            (d1[0].property(), d1[0].value(), d1[0].importance()),
+            ("margin", "0", crate::cssom::Importance::Important)
+        );
+        assert!(p.errors().is_empty());
+    }
+
+    /// CORE-5: 未対応セレクタのルールだけ捨てて記録する。
+    #[test]
+    fn core_5_unsupported_selector_recorded() {
+        let p = rules_of("a:hover{color:red} p{top:1px}");
+        assert_eq!(p.stylesheet().len(), 1);
+        assert_eq!(p.errors().len(), 1);
+        assert_eq!(
+            p.errors()[0].kind(),
+            RuleBlockErrorKind::UnsupportedSelector
+        );
+        assert_eq!(p.errors()[0].offset(), 0);
+    }
+
+    /// CORE-5: 構文不正セレクタは InvalidSelector、後続は残る。
+    #[test]
+    fn core_5_invalid_selector_recorded() {
+        let p = rules_of("p{a:b} a>>b{c:d} q{e:f}");
+        assert_eq!(p.stylesheet().len(), 2);
+        assert_eq!(p.errors().len(), 1);
+        assert_eq!(p.errors()[0].kind(), RuleBlockErrorKind::InvalidSelector);
+        assert_eq!(p.errors()[0].offset(), 7);
+    }
+
+    /// CORE-5: 宣言ブロックの上限超過は InvalidDeclarations、正常ルールは残る。
+    #[test]
+    fn core_5_invalid_declarations_recorded() {
+        let big = "x".repeat(crate::cssom::MAX_DECLARATION_INPUT_BYTES + 1);
+        let p = rules_of(&format!("a{{{big}}} b{{c:d}}"));
+        assert_eq!(p.stylesheet().len(), 1);
+        assert_eq!(p.errors().len(), 1);
+        assert_eq!(
+            p.errors()[0].kind(),
+            RuleBlockErrorKind::InvalidDeclarations
+        );
+        assert_eq!(p.errors()[0].offset(), 0);
+    }
+
+    /// CORE-5: 構造エラーと解析エラーは offset 昇順で並び、at-rule 件数を引き継ぐ。
+    #[test]
+    fn core_5_errors_sorted_by_offset() {
+        let p = rules_of("a:hover{x:y} @import 'x'; } b{c:d}");
+        let got: Vec<_> = p.errors().iter().map(|e| (e.kind(), e.offset())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (RuleBlockErrorKind::UnsupportedSelector, 0),
+                (RuleBlockErrorKind::UnexpectedCloseBrace, 26),
+            ]
+        );
+        assert_eq!(p.skipped_at_rules(), 1);
+        assert_eq!(p.stylesheet().len(), 1);
+    }
+
+    /// CORE-5: エラー記録は上限で止まり超過分は件数のみ。
+    #[test]
+    fn core_5_parse_error_cap() {
+        let p = rules_of(&"a:hover{x:y}".repeat(MAX_RULE_BLOCK_ERRORS + 3));
+        assert_eq!(p.errors().len(), MAX_RULE_BLOCK_ERRORS);
+        assert_eq!(p.dropped_errors(), 3);
+    }
+
+    /// CORE-5: 宣言 0 件のルールは残る。空入力は空シート。
+    #[test]
+    fn core_5_empty_rule_kept_and_empty_input() {
+        let p = rules_of("a{}");
+        assert_eq!(p.stylesheet().len(), 1);
+        assert!(p.stylesheet().rules()[0].declarations().is_empty());
+        let e = rules_of("");
+        assert!(e.stylesheet().is_empty());
+        assert!(e.errors().is_empty());
+    }
+
+    /// CORE-5: 上限違反は Err のまま。
+    #[test]
+    fn core_5_parse_stylesheet_limits_are_err() {
+        let ng = " ".repeat(MAX_STYLESHEET_INPUT_BYTES + 1);
+        assert!(matches!(
+            parse_stylesheet(&ng),
+            Err(Error::InvalidInput { .. })
+        ));
+        let ng = "a{}".repeat(MAX_RULES_PER_STYLESHEET + 1);
+        assert!(matches!(
+            parse_stylesheet(&ng),
+            Err(Error::InvalidInput { .. })
+        ));
     }
 }

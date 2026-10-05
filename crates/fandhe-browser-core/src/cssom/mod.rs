@@ -8,10 +8,11 @@
 //!
 //! 現状は型定義（TASK-105.1・#255）、宣言パーサー [`parse_declarations`]（TASK-105.2・#256）、
 //! 詳細度計算 [`specificity`] / [`specificities`]（TASK-105.3・#257）、
-//! CSS テキストのルールブロック分割 [`split_rule_blocks`]（TASK-105.4.1・#551）まで。
+//! CSS テキストのルールブロック分割 [`split_rule_blocks`]（TASK-105.4.1・#551）、
+//! DOM からのスタイル源収集と [`Stylesheet`] 構築 [`collect_document_styles`] /
+//! [`parse_stylesheet`] / [`parse_style_attribute`]（TASK-105.4.2・#552）まで。
 //! 以下は予定している兄弟モジュールで、まだ存在しない（REPAIR-3: 実装済みを装わない）。
 //!
-//! - `stylesheet` 構築（#552）
 //! - マッチング（#259）・`computed`: カスケードと computed style API（#260）
 //! - 上限検証（#261）・結合テスト（#262）
 
@@ -25,8 +26,10 @@ pub use declaration::{
 };
 pub use selector::{specificities, specificity};
 pub use stylesheet::{
-    MAX_RULE_BLOCK_ERRORS, MAX_RULES_PER_STYLESHEET, MAX_STYLESHEET_INPUT_BYTES, RuleBlock,
-    RuleBlockError, RuleBlockErrorKind, RuleBlocks, split_rule_blocks,
+    DocumentStyles, InlineStyle, MAX_RULE_BLOCK_ERRORS, MAX_RULES_PER_STYLESHEET,
+    MAX_STYLESHEET_INPUT_BYTES, ParsedStylesheet, RuleBlock, RuleBlockError, RuleBlockErrorKind,
+    RuleBlocks, StyleElementSheet, collect_document_styles, parse_style_attribute,
+    parse_stylesheet, split_rule_blocks,
 };
 pub use types::{Declaration, Importance, Specificity, StyleRule, Stylesheet};
 
