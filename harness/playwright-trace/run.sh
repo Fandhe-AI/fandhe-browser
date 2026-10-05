@@ -42,7 +42,10 @@ TARGET_DIR="$(cd "$REPO_ROOT" && cargo metadata --format-version 1 --no-deps \
 (cd "$WORK" && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --no-save --no-audit --no-fund --ignore-scripts \
   "playwright-core@$PW_VERSION" >/dev/null)
 
-"$TARGET_DIR/debug/examples/trace_server" >"$WORK/server.out" 2>"$WORK/server.err" &
+# 一時プロファイルは trace_server が temp_dir 配下へ作る。SIGTERM 停止では自前の削除に
+# 到達しないため、TMPDIR を $WORK 配下へ向けて cleanup の rm -rf で一緒に消す。
+mkdir -p "$WORK/tmp"
+TMPDIR="$WORK/tmp" "$TARGET_DIR/debug/examples/trace_server" >"$WORK/server.out" 2>"$WORK/server.err" &
 SERVER_PID=$!
 
 ADDR=""
