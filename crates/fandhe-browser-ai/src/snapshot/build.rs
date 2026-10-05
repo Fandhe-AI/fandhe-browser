@@ -28,7 +28,8 @@
 //!   [`MAX_ROW_CONTROLS`]・表全体 [`MAX_TABLE_CONTROLS`] を上限に全件を文書順で保持し、
 //!   超過は `TableRow::controls_truncated` で通知する。行は末尾まで走査し、優先保持
 //!   （ページネーション・送信ボタン。`AISNAP-12`）は表全体で先に枠を確保する
-//!   （優先要素だけで上限を超える表は圧縮せず展開する）。`AISNAP-2`・`AISNAP-13`・Issue #632）。
+//!   （優先要素だけで行・表の上限を超える表、および保持上限で省略される行に操作要素が
+//!   ある表は圧縮せず展開する）。`AISNAP-2`・`AISNAP-13`・Issue #632）。
 //!   ただし `tfoot` 行がある構造、またはそれ以外の操作要素（入力欄・`select`・`textarea`・
 //!   `role`/`tabindex`/`onclick` 付き、ヘッダ行内のリンク等）を含む構造は圧縮せず
 //!   通常どおり展開する（ref・state・フッターの可視情報を失わないため）。`img` の `alt`・`aria-label` 等テキスト以外に由来する
@@ -42,8 +43,7 @@
 //!   で有界とし、超過したコンテナは圧縮せず展開する。
 //!   既知の制約（REPAIR-3）: ヘッダ行（`th`）に操作要素がある表（ソートリンク付き等）は
 //!   圧縮せず展開する。表全体の上限は文書順に消費し、行をまたぐ優先保持はしない
-//!   （暫定。#84・#108 で見直す）。保持されず省略した行（`truncated_rows`）内の操作要素は
-//!   表現せず ref も発行しない。リンクのテキストはセル文字列と control の name の双方に現れる。
+//!   （暫定。#84・#108 で見直す）。リンクのテキストはセル文字列と control の name の双方に現れる。
 //! - generic の折り畳み・`none`/`presentation` の除去・空ノードの剪定は行わない
 //!   （トークン削減は後続タスク。`AISNAP-1`・`AISNAP-2`）。
 //! - ルート以外の全要素に ref を振る（対話可能な要素への絞り込みは後続タスク）。
@@ -408,7 +408,10 @@ struct RowControlPlan {
 ///
 /// 走査は行末まで続ける（64 件目より後の `rel="next"`・送信ボタンも優先検出へ渡すため）。
 /// 確保量は呼び出し元が `MAX_COMPRESS_SCAN_NODES` で有界化済みの子孫数以下。
-fn plan_row_controls(doc: &Document, row: NodeId) -> RowControlPlan {
+///
+/// 行内の優先要素（`AISNAP-12`）だけで [`MAX_ROW_CONTROLS`] を超える場合は優先要素を
+/// 落とさずに表現できないため `None`（呼び出し元は圧縮を拒否して展開経路へ進む）。
+fn plan_row_controls(doc: &Document, row: NodeId) -> Option<RowControlPlan> {
     // 先行順（文書順）の反復走査。子は逆順に積む。
     let mut candidates: Vec<NodeId> = Vec::new();
     let mut stack: Vec<NodeId> = doc.children(row).collect();
@@ -427,12 +430,15 @@ fn plan_row_controls(doc: &Document, row: NodeId) -> RowControlPlan {
         }
     }
     if candidates.is_empty() {
-        return RowControlPlan {
+        return Some(RowControlPlan {
             kept: Vec::new(),
             truncated: false,
-        };
+        });
     }
     let priority = priority_candidates(doc, &candidates);
+    if priority.len() > MAX_ROW_CONTROLS {
+        return None;
+    }
     let mut is_priority = vec![false; candidates.len()];
     for p in &priority {
         if let Some(flag) = is_priority.get_mut(p.index) {
@@ -441,10 +447,10 @@ fn plan_row_controls(doc: &Document, row: NodeId) -> RowControlPlan {
     }
     if candidates.len() <= MAX_ROW_CONTROLS {
         let kept = candidates.iter().copied().zip(is_priority).collect();
-        return RowControlPlan {
+        return Some(RowControlPlan {
             kept,
             truncated: false,
-        };
+        });
     }
     let retention = select_retained_with_priority(
         candidates.len(),
@@ -460,10 +466,30 @@ fn plan_row_controls(doc: &Document, row: NodeId) -> RowControlPlan {
             Some((id, pri))
         })
         .collect();
-    RowControlPlan {
+    Some(RowControlPlan {
         kept,
         truncated: true,
+    })
+}
+
+/// 保持上限で省略される本文行に操作要素（`a[href]`・`button`）が含まれるか。
+///
+/// 省略行の操作要素には ref を発行できず再特定できなくなるため、含まれる場合は呼び出し元が
+/// 圧縮を拒否して展開経路へ進む（`AISNAP-2`・`AISNAP-13`・Issue #632）。
+fn omitted_rows_have_controls(
+    doc: &Document,
+    structure: &crate::compress_table::RegularStructure,
+    compressed: &crate::compress_table::CompressedRows,
+) -> bool {
+    if compressed.truncated_rows == 0 {
+        return false;
     }
+    let kept: HashSet<NodeId> = compressed.rows.iter().map(|r| r.row).collect();
+    structure
+        .body_rows
+        .iter()
+        .filter(|r| !kept.contains(r) && doc.is_element(**r) && !is_excluded(doc, **r))
+        .any(|&r| plan_row_controls(doc, r).is_none_or(|p| !p.kept.is_empty()))
 }
 
 /// 表全体の上限（[`MAX_TABLE_CONTROLS`]）を行計画へ適用する（`AISNAP-12`・`AISNAP-13`）。
@@ -671,13 +697,17 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
         let (compressible, expanded_structure) = match regular {
             Some(s) if can_compress(doc, child, &s, &index) => {
                 let compressed = compress_rows(doc, &s);
-                let mut plans: Vec<RowControlPlan> = compressed
+                let plans: Option<Vec<RowControlPlan>> = compressed
                     .rows
                     .iter()
                     .map(|r| plan_row_controls(doc, r.row))
                     .collect();
-                match apply_table_budget(&mut plans) {
-                    Some(()) => (Some((s, compressed, plans)), None),
+                let planned = plans.filter(|_| !omitted_rows_have_controls(doc, &s, &compressed));
+                match planned {
+                    Some(mut plans) => match apply_table_budget(&mut plans) {
+                        Some(()) => (Some((s, compressed, plans)), None),
+                        None => (None, Some(s)),
+                    },
                     None => (None, Some(s)),
                 }
             }
@@ -698,7 +728,7 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
         if let Some((structure, compressed, plans)) = compressible {
             let headers = assign_header_refs(doc, &index, &structure, elem_ref, &mut refs)?;
             truncated |= headers.iter().any(|h| h.name_truncated);
-            // 保持された行の操作要素を文書順に収集する。省略行（truncated_rows）の分は保持しない。
+            // 保持された行の操作要素を文書順に収集する（省略行に操作要素がある表は上で圧縮を拒否済み）。
             let mut rows = Vec::with_capacity(compressed.rows.len());
             for (r, plan) in compressed.rows.into_iter().zip(plans.iter()) {
                 let (controls, controls_truncated) =
@@ -1465,5 +1495,39 @@ mod tests {
         let total: usize = table.rows.iter().map(|r| r.controls.len()).sum();
         assert_eq!(total, MAX_TABLE_CONTROLS);
         assert!(table.rows.iter().any(|r| r.controls_truncated));
+    }
+
+    /// AISNAP-12・Issue #632: 1 行の優先要素が行上限を超える表は、優先要素を落とさないよう
+    /// 圧縮せず展開する。
+    #[test]
+    fn aisnap_12_row_priority_over_row_cap_rejects_compression() {
+        let mut cell = String::new();
+        for i in 0..=MAX_ROW_CONTROLS {
+            cell.push_str(&format!("<a href=\"/n{i}\" rel=\"next\">Next{i}</a>"));
+        }
+        let s = snap(&format!(
+            "<table><thead><tr><th>h</th></tr></thead><tbody><tr><td>{cell}</td></tr></tbody></table>"
+        ));
+        let nodes = all_nodes(&s.tree);
+        assert!(nodes.iter().all(|n| n.table.is_none()));
+        for i in 0..=MAX_ROW_CONTROLS {
+            let name = format!("Next{i}");
+            assert!(nodes.iter().any(|n| n.name == name && n.r#ref.is_some()));
+        }
+    }
+
+    /// AISNAP-13・Issue #632: 保持上限で省略される行に操作要素がある表は圧縮せず展開し、
+    /// 21 行目以降の操作要素にも ref を発行する。
+    #[test]
+    fn aisnap_13_omitted_rows_with_controls_reject_compression() {
+        let mut html = String::from("<table><thead><tr><th>h</th></tr></thead><tbody>");
+        for r in 0..25 {
+            html.push_str(&format!("<tr><td><a href=\"/r{r}\">Row{r}</a></td></tr>"));
+        }
+        html.push_str("</tbody></table>");
+        let s = snap(&html);
+        let nodes = all_nodes(&s.tree);
+        assert!(nodes.iter().all(|n| n.table.is_none()));
+        assert!(nodes.iter().any(|n| n.name == "Row24" && n.r#ref.is_some()));
     }
 }
