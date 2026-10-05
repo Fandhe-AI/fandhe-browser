@@ -10,6 +10,11 @@
 //! - WS エンドポイントは環境変数 [`ENDPOINT_ENV`] で渡す（シェル文字列は経由しない）。
 //! - スクリプトは stdout に [`RESULT_PREFIX`] で始まる 1 行の JSON
 //!   `{"ok": bool, "step": string, "error": {"name": string, "message": string} | null}` を出す。
+//! - 任意フィールド `stages`（TASK-45.2・#481）は段階ごとの到達結果の配列
+//!   `[{"name": string, "status": "ok" | "failed" | "not_reached", "error": {...} | null}]`。
+//!   無ければ空として扱う（後方互換）。件数は [`MAX_STAGES`]、名前長は
+//!   [`MAX_STAGE_NAME_BYTES`] が上限で、整合性（`failed` は error 必須・`ok` 後続の矛盾・
+//!   トップレベル `ok: true` との不一致）を検証し、違反は `Malformed` にする。
 //!
 //! # 安全性
 //! 子プロセスは締め切りで kill し、stderr は末尾のみ・stdout は結果行のみを上限付きで保持し、
@@ -40,6 +45,10 @@ pub const ENDPOINT_ENV: &str = "FANDHE_CDP_WS_ENDPOINT";
 pub const RESULT_PREFIX: &str = "FANDHE_SCRIPT_RESULT ";
 /// stderr の保持上限（末尾を保持）。stdout は結果行のみ回収する。
 pub const MAX_STREAM_BYTES: usize = 1024 * 1024;
+/// `stages` の件数上限（無制限確保の防止）。
+pub const MAX_STAGES: usize = 16;
+/// 段階名の長さ上限（バイト）。
+pub const MAX_STAGE_NAME_BYTES: usize = 64;
 /// 結果行 1 行の長さ上限。
 pub const MAX_RESULT_LINE_BYTES: usize = 64 * 1024;
 /// `stderr_tail` に保持する末尾バイト数。
@@ -128,6 +137,9 @@ const SERVER_STOP_GRACE: Duration = Duration::from_secs(10);
 /// 消してしまうため。フィールドは宣言順に drop されるので `_dir` は最後）。
 pub struct TestServer {
     pub addr: SocketAddr,
+    /// サーバーが保持する CDP 状態（未実装メソッドの受信記録など、層 B の検証用）。
+    #[allow(dead_code)]
+    pub state: Arc<CdpState>,
     stop: Arc<StopSignal>,
     stopped: Receiver<()>,
     _dir: Option<TempDir>,
@@ -161,6 +173,7 @@ pub fn start_server() -> TestServer {
     let profile = Arc::new(Profile::open(&dir.0).expect("profile open"));
     let app = Arc::new(AppState::with_disabled_renderer(profile));
     let st = Arc::new(CdpState::new(app));
+    let state = Arc::clone(&st);
     let stop = Arc::new(StopSignal::default());
     let stop_for_thread = Arc::clone(&stop);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -190,6 +203,7 @@ pub fn start_server() -> TestServer {
         .expect("server did not start");
     TestServer {
         addr,
+        state,
         stop,
         stopped,
         _dir: Some(dir),
@@ -230,6 +244,25 @@ pub struct ScriptError {
     pub message: String,
 }
 
+/// 段階の到達状態（TASK-45.2・`CDP-3`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageStatus {
+    /// 成功した。
+    Ok,
+    /// この段階で失敗した（`error` が必須）。
+    Failed,
+    /// 先行段階の失敗により実行されなかった。
+    NotReached,
+}
+
+/// 1 段階の結果（接続 → newPage → goto → セレクタ取得の各段階。名前は呼び出し側が決める）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageResult {
+    pub name: String,
+    pub status: StageStatus,
+    pub error: Option<ScriptError>,
+}
+
 /// スクリプト実行結果の回収形（REPAIR-4。真偽値で済ませない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptOutcome {
@@ -238,6 +271,8 @@ pub enum ScriptOutcome {
         ok: bool,
         step: String,
         error: Option<ScriptError>,
+        /// 段階別の到達結果（`stages` 未報告なら空）。
+        stages: Vec<StageResult>,
     },
     /// 結果行なしで終了した。
     NoResult {
@@ -423,22 +458,85 @@ pub fn parse_result_line(stdout: &[u8]) -> Result<Option<ScriptOutcome>, String>
         .and_then(Value::as_str)
         .ok_or("missing string field `step`")?
         .to_string();
-    let error = match json.get("error") {
-        None | Some(Value::Null) => None,
-        Some(e) => Some(ScriptError {
+    let error = parse_error(json.get("error"), "error")?;
+    let stages = parse_stages(json.get("stages"))?;
+    if ok && stages.iter().any(|s| s.status != StageStatus::Ok) {
+        return Err("`ok` is true but a stage did not succeed".to_string());
+    }
+    Ok(Some(ScriptOutcome::Completed {
+        ok,
+        step,
+        error,
+        stages,
+    }))
+}
+
+/// `{name, message}` 形のエラーを解析する（null / 欠落は `None`）。`label` はエラー文言用の接頭辞。
+fn parse_error(v: Option<&Value>, label: &str) -> Result<Option<ScriptError>, String> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(e) => Ok(Some(ScriptError {
             name: e
                 .get("name")
                 .and_then(Value::as_str)
-                .ok_or("missing string field `error.name`")?
+                .ok_or(format!("missing string field `{label}.name`"))?
                 .to_string(),
             message: e
                 .get("message")
                 .and_then(Value::as_str)
-                .ok_or("missing string field `error.message`")?
+                .ok_or(format!("missing string field `{label}.message`"))?
                 .to_string(),
-        }),
+        })),
+    }
+}
+
+/// `stages` を検証付きで解析する（外部入力。件数・名前長の上限と整合性を確認する）。
+fn parse_stages(v: Option<&Value>) -> Result<Vec<StageResult>, String> {
+    let arr = match v {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(a)) => a,
+        Some(_) => return Err("`stages` must be an array".to_string()),
     };
-    Ok(Some(ScriptOutcome::Completed { ok, step, error }))
+    if arr.len() > MAX_STAGES {
+        return Err(format!("`stages` exceeds {MAX_STAGES} entries"));
+    }
+    let mut out: Vec<StageResult> = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or(format!("missing string field `stages[{i}].name`"))?;
+        if name.is_empty() || name.len() > MAX_STAGE_NAME_BYTES {
+            return Err(format!(
+                "`stages[{i}].name` must be 1..={MAX_STAGE_NAME_BYTES} bytes"
+            ));
+        }
+        let status = match item.get("status").and_then(Value::as_str) {
+            Some("ok") => StageStatus::Ok,
+            Some("failed") => StageStatus::Failed,
+            Some("not_reached") => StageStatus::NotReached,
+            _ => return Err(format!("invalid `stages[{i}].status`")),
+        };
+        let error = parse_error(item.get("error"), &format!("stages[{i}].error"))?;
+        match (status, &error) {
+            (StageStatus::Failed, None) => {
+                return Err(format!("`stages[{i}]` is failed but has no error"));
+            }
+            (StageStatus::Ok | StageStatus::NotReached, Some(_)) => {
+                return Err(format!("`stages[{i}]` is not failed but has an error"));
+            }
+            _ => {}
+        }
+        if status == StageStatus::Ok && out.last().is_some_and(|p| p.status != StageStatus::Ok) {
+            return Err(format!("`stages[{i}]` is ok after a non-ok stage"));
+        }
+        out.push(StageResult {
+            name: name.to_string(),
+            status,
+            error,
+        });
+    }
+    Ok(out)
 }
 
 /// スクリプトを実行し、締め切り内に結果を回収する。

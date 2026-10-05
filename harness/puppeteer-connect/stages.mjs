@@ -1,0 +1,90 @@
+// Puppeteer 基本操作の段階実行ロジック（TASK-45.2・#481、ビヘイビア CDP-3・MS-4）。
+//
+// 役割: connect.mjs から呼ばれ、接続 → newPage → goto → セレクタ取得を順に実行して
+// 段階別の到達結果（stages）を返す純粋ロジック。puppeteer を注入できるため、
+// self-test.mjs が偽クライアントでオフライン検証する。最初の失敗で止め、残りは not_reached。
+// UA・フィンガープリントを変えるオプションは渡さない（SEC-2）。
+
+const MAX_LEN = 500;
+export const STAGE_NAMES = ["connect", "newPage", "goto", "selector"];
+
+export function toError(err) {
+  return {
+    name: String(err?.name ?? "Error").slice(0, MAX_LEN),
+    message: String(err?.message ?? err).slice(0, MAX_LEN),
+  };
+}
+
+// 段階を期限と競わせる（イベント待ちで止まる場合の保護）。
+async function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const e = new Error(`stage timed out after ${ms} ms`);
+      e.name = "StageTimeout";
+      reject(e);
+    }, ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// onStage は実行中の段階名の通知（unhandledRejection 時の報告用）。
+export async function runStages({ puppeteer, endpoint, stageTimeoutMs = 10000, onStage = () => {} }) {
+  const stages = STAGE_NAMES.map((name) => ({ name, status: "not_reached", error: null }));
+  let browser;
+  let page;
+  const steps = [
+    async () => {
+      browser = await puppeteer.connect({
+        browserWSEndpoint: endpoint,
+        protocolTimeout: stageTimeoutMs,
+      });
+    },
+    async () => {
+      page = await browser.newPage();
+    },
+    // about:blank はネットワーク取得なしで確定遷移として扱われる（SSRF 防御を緩めない）。
+    async () => {
+      await page.goto("about:blank", { timeout: stageTimeoutMs });
+    },
+    async () => {
+      const el = await page.$("body");
+      if (el === null || el === undefined) {
+        const e = new Error("selector `body` matched no element");
+        e.name = "SelectorNotFound";
+        throw e;
+      }
+    },
+  ];
+  try {
+    for (let i = 0; i < steps.length; i++) {
+      onStage(stages[i].name);
+      try {
+        await withTimeout(steps[i](), stageTimeoutMs);
+        stages[i].status = "ok";
+      } catch (e) {
+        stages[i].status = "failed";
+        stages[i].error = toError(e);
+        break;
+      }
+    }
+  } finally {
+    try {
+      await browser?.disconnect();
+    } catch {
+      // 切断失敗は到達結果に影響させない。
+    }
+  }
+  const bad = stages.find((s) => s.status !== "ok");
+  const last = stages[stages.length - 1];
+  return {
+    ok: bad === undefined,
+    step: (bad ?? last).name,
+    error: bad?.error ?? null,
+    stages,
+  };
+}

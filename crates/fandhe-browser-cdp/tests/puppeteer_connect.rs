@@ -3,7 +3,8 @@
 //! Node・Puppeteer に依存せず、`cargo test --workspace` で常に実行される。偽スクリプトは
 //! テストバイナリ自身の再実行で実現する（`fandhe-browser-profile` の `lock_child_entry` と
 //! 同じ流儀）。実 Puppeteer を使う試験ターゲットは puppeteer-core 導入の承認後に追加する
-//! （harness/puppeteer-connect/README.md「導入状況」）。
+//! （harness/puppeteer-connect/README.md「導入状況」）。TASK-45.2（#481）で段階別結果（`stages`）の
+//! 回収・検証を追加した。
 //! `Profile::open` が非 unix で `Unsupported` を返す仕様のため `#[cfg(unix)]`
 //! （任意の skip ではなく `tests/devtools_browser.rs` と同じ理由）。
 
@@ -14,8 +15,9 @@ mod script_harness;
 use std::time::Duration;
 
 use script_harness::{
-    HarnessError, INSTALL_HINT, ScriptCommand, ScriptError, ScriptOutcome, TempDir,
-    browser_ws_endpoint, parse_result_line, preflight_puppeteer, run_script, start_server,
+    HarnessError, INSTALL_HINT, ScriptCommand, ScriptError, ScriptOutcome, StageResult,
+    StageStatus, TempDir, browser_ws_endpoint, parse_result_line, preflight_puppeteer, run_script,
+    start_server,
 };
 
 const MODE_ENV: &str = "FANDHE_FAKE_SCRIPT_MODE";
@@ -72,9 +74,79 @@ fn fake_script_child_entry() {
                 println!("FANDHE_SCRIPT_RESULT {{\"ok\":true,\"step\":\"s{i}\",\"error\":null}}");
             }
         }
+        // 段階別結果（TASK-45.2・#481）。結果行は `stages_line` で組み立てる。
+        "stages_all_ok" => stages_line(
+            true,
+            "selector",
+            None,
+            r#"[{"name":"connect","status":"ok","error":null},{"name":"newPage","status":"ok","error":null},{"name":"goto","status":"ok","error":null},{"name":"selector","status":"ok","error":null}]"#,
+        ),
+        "stages_fail_at_connect" => stages_line(
+            false,
+            "connect",
+            Some(("ProtocolError", "Method not found")),
+            r#"[{"name":"connect","status":"failed","error":{"name":"ProtocolError","message":"Method not found"}},{"name":"newPage","status":"not_reached","error":null},{"name":"goto","status":"not_reached","error":null},{"name":"selector","status":"not_reached","error":null}]"#,
+        ),
+        "stages_fail_at_goto" => stages_line(
+            false,
+            "goto",
+            Some(("TimeoutError", "Navigation timeout of 10000 ms exceeded")),
+            r#"[{"name":"connect","status":"ok","error":null},{"name":"newPage","status":"ok","error":null},{"name":"goto","status":"failed","error":{"name":"TimeoutError","message":"Navigation timeout of 10000 ms exceeded"}},{"name":"selector","status":"not_reached","error":null}]"#,
+        ),
+        "stages_bad_status" => stages_line(
+            false,
+            "connect",
+            None,
+            r#"[{"name":"connect","status":"maybe","error":null}]"#,
+        ),
+        "stages_not_array" => stages_line(false, "connect", None, r#"{"name":"connect"}"#),
+        "stages_too_many" => {
+            let items: Vec<String> = (0..17)
+                .map(|i| format!(r#"{{"name":"s{i}","status":"ok","error":null}}"#))
+                .collect();
+            stages_line(true, "s16", None, &format!("[{}]", items.join(",")));
+        }
+        "stages_long_name" => {
+            let n = "n".repeat(65);
+            stages_line(
+                true,
+                "x",
+                None,
+                &format!(r#"[{{"name":"{n}","status":"ok","error":null}}]"#),
+            );
+        }
+        "stages_ok_true_with_failed" => stages_line(
+            true,
+            "connect",
+            None,
+            r#"[{"name":"connect","status":"failed","error":{"name":"E","message":"m"}}]"#,
+        ),
+        "stages_failed_without_error" => stages_line(
+            false,
+            "connect",
+            None,
+            r#"[{"name":"connect","status":"failed","error":null}]"#,
+        ),
+        "stages_ok_after_failed" => stages_line(
+            false,
+            "connect",
+            None,
+            r#"[{"name":"connect","status":"failed","error":{"name":"E","message":"m"}},{"name":"newPage","status":"ok","error":null}]"#,
+        ),
         other => panic!("unknown mode {other}"),
     }
     std::process::exit(0);
+}
+
+/// `stages` 付きの結果行を出す（偽スクリプト用。`stages_json` はそのまま埋め込む）。
+fn stages_line(ok: bool, step: &str, err: Option<(&str, &str)>, stages_json: &str) {
+    let error = match err {
+        Some((n, m)) => format!(r#"{{"name":"{n}","message":"{m}"}}"#),
+        None => "null".to_string(),
+    };
+    println!(
+        "FANDHE_SCRIPT_RESULT {{\"ok\":{ok},\"step\":\"{step}\",\"error\":{error},\"stages\":{stages_json}}}"
+    );
 }
 
 fn fake(mode: &str) -> ScriptCommand {
@@ -103,7 +175,8 @@ fn collects_success_result() {
         ScriptOutcome::Completed {
             ok: true,
             step: "connect".into(),
-            error: None
+            error: None,
+            stages: vec![]
         }
     );
 }
@@ -119,7 +192,8 @@ fn collects_failure_result() {
             error: Some(ScriptError {
                 name: "Error".into(),
                 message: "boom".into()
-            })
+            }),
+            stages: vec![]
         }
     );
 }
@@ -198,7 +272,8 @@ fn collects_result_after_large_stdout() {
         ScriptOutcome::Completed {
             ok: true,
             step: "flood".into(),
-            error: None
+            error: None,
+            stages: vec![]
         }
     );
 }
@@ -231,7 +306,8 @@ fn keeps_only_last_of_many_result_lines() {
         ScriptOutcome::Completed {
             ok: true,
             step: "s199999".into(),
-            error: None
+            error: None,
+            stages: vec![]
         }
     );
 }
@@ -247,7 +323,8 @@ fn does_not_hang_when_grandchild_holds_pipe() {
         ScriptOutcome::Completed {
             ok: true,
             step: "gc".into(),
-            error: None
+            error: None,
+            stages: vec![]
         }
     );
 }
@@ -260,7 +337,9 @@ fn passes_real_server_endpoint_to_script() {
     let o = run_script(&fake("echo"), &ep, D);
     let prefix = format!("ws://127.0.0.1:{}/devtools/browser/", server.addr.port());
     match o {
-        ScriptOutcome::Completed { ok, step, error } => {
+        ScriptOutcome::Completed {
+            ok, step, error, ..
+        } => {
             assert!(ok);
             assert_eq!(step, ep);
             assert!(step.starts_with(&prefix));
@@ -314,7 +393,8 @@ fn cdp3_result_line_requires_valid_utf8() {
         Ok(Some(ScriptOutcome::Completed {
             ok: true,
             step: "s".into(),
-            error: None
+            error: None,
+            stages: vec![]
         }))
     );
 }
@@ -336,4 +416,137 @@ fn cdp3_preflight_script_arg_is_cwd_relative_file_name() {
             assert_eq!(reason, "node executable was not found");
         }
     }
+}
+
+fn stage(name: &str, status: StageStatus, error: Option<(&str, &str)>) -> StageResult {
+    StageResult {
+        name: name.into(),
+        status,
+        error: error.map(|(n, m)| ScriptError {
+            name: n.into(),
+            message: m.into(),
+        }),
+    }
+}
+
+/// CDP-3: 段階ごとの到達可否（connect / newPage / goto / selector）を回収できる。
+#[test]
+fn cdp3_collects_reach_of_each_stage() {
+    assert_eq!(
+        run_script(&fake("stages_all_ok"), "ws://x", D),
+        ScriptOutcome::Completed {
+            ok: true,
+            step: "selector".into(),
+            error: None,
+            stages: vec![
+                stage("connect", StageStatus::Ok, None),
+                stage("newPage", StageStatus::Ok, None),
+                stage("goto", StageStatus::Ok, None),
+                stage("selector", StageStatus::Ok, None),
+            ],
+        }
+    );
+}
+
+/// CDP-3: 失敗段階のエラー内容を保持し、後続段階は `NotReached` になる。
+#[test]
+fn cdp3_records_error_of_failed_stage_and_marks_rest_not_reached() {
+    assert_eq!(
+        run_script(&fake("stages_fail_at_goto"), "ws://x", D),
+        ScriptOutcome::Completed {
+            ok: false,
+            step: "goto".into(),
+            error: Some(ScriptError {
+                name: "TimeoutError".into(),
+                message: "Navigation timeout of 10000 ms exceeded".into()
+            }),
+            stages: vec![
+                stage("connect", StageStatus::Ok, None),
+                stage("newPage", StageStatus::Ok, None),
+                stage(
+                    "goto",
+                    StageStatus::Failed,
+                    Some(("TimeoutError", "Navigation timeout of 10000 ms exceeded"))
+                ),
+                stage("selector", StageStatus::NotReached, None),
+            ],
+        }
+    );
+}
+
+/// CDP-3: 到達 0 段階（connect 失敗）も「記録された結果」として回収できる。
+#[test]
+fn cdp3_zero_stages_reached_is_still_a_recorded_result() {
+    match run_script(&fake("stages_fail_at_connect"), "ws://x", D) {
+        ScriptOutcome::Completed {
+            ok, step, stages, ..
+        } => {
+            assert!(!ok);
+            assert_eq!(step, "connect");
+            assert_eq!(
+                stages.first(),
+                Some(&stage(
+                    "connect",
+                    StageStatus::Failed,
+                    Some(("ProtocolError", "Method not found"))
+                ))
+            );
+            assert_eq!(
+                stages
+                    .iter()
+                    .filter(|s| s.status == StageStatus::NotReached)
+                    .count(),
+                3
+            );
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+/// CDP-3: 不整合な段階報告は成功扱いにせず `Malformed`（具体的な理由つき）。
+#[test]
+fn cdp3_rejects_inconsistent_stage_reports() {
+    let cases = [
+        ("stages_bad_status", "invalid `stages[0].status`"),
+        ("stages_not_array", "`stages` must be an array"),
+        ("stages_too_many", "`stages` exceeds 16 entries"),
+        ("stages_long_name", "`stages[0].name` must be 1..=64 bytes"),
+        (
+            "stages_ok_true_with_failed",
+            "`ok` is true but a stage did not succeed",
+        ),
+        (
+            "stages_failed_without_error",
+            "`stages[0]` is failed but has no error",
+        ),
+        (
+            "stages_ok_after_failed",
+            "`stages[1]` is ok after a non-ok stage",
+        ),
+    ];
+    for (mode, reason) in cases {
+        assert_eq!(
+            run_script(&fake(mode), "ws://x", D),
+            ScriptOutcome::Malformed {
+                reason: reason.into()
+            },
+            "mode {mode}"
+        );
+    }
+}
+
+/// CDP-3: `stages` の無い結果行は空配列として扱う（後方互換）。
+#[test]
+fn cdp3_result_line_without_stages_is_backward_compatible() {
+    assert_eq!(
+        parse_result_line(
+            b"FANDHE_SCRIPT_RESULT {\"ok\":false,\"step\":\"connect\",\"error\":null}\n"
+        ),
+        Ok(Some(ScriptOutcome::Completed {
+            ok: false,
+            step: "connect".into(),
+            error: None,
+            stages: vec![]
+        }))
+    );
 }

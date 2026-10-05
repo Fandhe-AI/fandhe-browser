@@ -626,3 +626,7 @@ trace-playwright: ## Playwright newPage() 到達までの CDP トレースを再
 .PHONY: check-playwright-trace
 check-playwright-trace: ## harness/playwright-trace のオフライン自己テストを実行する（Playwright・ネットワーク不要。要 node）
 	bash harness/playwright-trace/self-test.sh
+
+.PHONY: check-puppeteer-connect
+check-puppeteer-connect: ## harness/puppeteer-connect のオフライン自己テストを実行する（Puppeteer・ネットワーク不要。要 node。TASK-45.2）
+	bash harness/puppeteer-connect/self-test.sh
