@@ -42,15 +42,33 @@ static COUNTER: AtomicUsize = AtomicUsize::new(0);
 const WS_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
 
 /// 一時ディレクトリ（drop で再帰削除）。
+///
+/// `new` が非 recursive の `create_dir`（既存パスなら失敗）で排他的に新規作成できたディレクトリ
+/// だけを保持するため、実行前から存在したパスをプロファイルとして開いたり削除したりしない（PROF-1）。
 struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let base = std::env::temp_dir()
             .canonicalize()
             .unwrap_or_else(|_| std::env::temp_dir());
-        Self(base.join(format!("fandhe-cdp-trace-test-{}-{n}", std::process::id())))
+        for _ in 0..64 {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let candidate = base.join(format!(
+                "fandhe-cdp-trace-test-{}-{nanos}-{n}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => return Self(candidate),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create temp dir: {e}"),
+            }
+        }
+        panic!("failed to create a unique temp dir");
     }
 }
 
