@@ -138,6 +138,18 @@ testharness 152 件は `Completed/Fail` 53 / 46・`Completed/NoResults` 3 / 10�
 
 テストは偽の WPT ツリー（一時ディレクトリ）で `tests/runner_subset.rs` が検証する。
 
+## プロファイル別実行（TASK-101.3・#275・PLUG-10・MS-8）
+
+- `WptProfile`（`chrome` / `safari`。完全一致のみ受理。`WptProfile::parse`・`FromStr`）と
+  `RunOptions::with_profile`、`run_subset_for_profiles` を提供する。指定した各プロファイルについて
+  別々に実行し、`ProfileRun { profile, results }` を指定順に返す（空・重複指定は `Err`）。
+  #276 の集計は `ProfileRun::profile` / `WptProfile::as_str` をレポートキー値に使う
+- **現時点ではプロファイル間で結果内容は同一**。TASK-100（`PLUG-8`・#266〜#268）の gating が未提供で、
+  ランナーは CSSOM 経路を通らないため。ハーネス内で gating を自作せず、偽の差分も作らない（REPAIR-3）。
+  TASK-100 完了後に core の公開 API へ配線し、結合テストの等価 assert を差分検証へ置き換える
+- `--profile` の CLI フラグ（バイナリ）は未提供。プロファイル指定は UA 等の識別面や
+  JS グローバルを変更しない（`SEC-1`・`SEC-2`）
+
 ## 実行不能項目の記録（TASK-101.5・#277・PLUG-10・MS-8）
 
 `report` モジュールが、実行できない 2 群の理由と確度を JSON セクションとして書き出す
