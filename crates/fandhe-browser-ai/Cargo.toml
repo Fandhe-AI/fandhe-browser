@@ -32,7 +32,7 @@ fandhe-browser-core = { path = "../fandhe-browser-core" }
 tiktoken-rs = { workspace = true }
 
 # 生 HTML トークン量の計測ベンチ。独自 main で結果を stdout へ出すため
-# harness = false。後続 #94（TASK-14.3）が snapshot 側の計測・削減率を追加する。
+# harness = false。TASK-14.3（Issue #94・AISNAP-1）で snapshot 側の計測・削減率・平均を追加した。
 [[bench]]
 name = "token_reduction"
 path = "benches/token_reduction.rs"
@@ -44,6 +44,11 @@ harness = false
 [[test]]
 name = "token_reduction_tokens"
 path = "benches/token_reduction/tokens_tests.rs"
+
+# 削減率算出・snapshot テキスト化のユニットテスト（TASK-14.3・Issue #94・AISNAP-1）。
+[[test]]
+name = "token_reduction_reduction"
+path = "benches/token_reduction/reduction_tests.rs"
 
 # 情報保持チェック（TASK-14.4・AISNAP-3・Issue #95）の判定ロジックのテスト。
 # bench ターゲットは libtest として起動されないため、別 [[test]] ターゲットに分ける。
