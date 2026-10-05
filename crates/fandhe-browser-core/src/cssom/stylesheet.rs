@@ -201,29 +201,34 @@ fn read_body(it: &mut Chars<'_>, len: usize) -> usize {
 /// at-rule を、文形式は括弧外・ブロック外の `;` まで、ブロック形式は at-rule 自身のブロックを
 /// 閉じる `}` まで読み飛ばす。`(` / `[` 内の `{` `}` は括弧が閉じるまでブロック境界として
 /// 数えない（`url(foo}bar)` で読み飛ばしが早期終了しない。CORE-5・#551）。
-fn skip_at_rule(it: &mut Chars<'_>) {
+///
+/// ブロックを開いていない状態（深さ 0）で `}` に達した場合は at-rule が `;` なしで終端した
+/// 余分な `}` とみなし、その `}` の位置を返す（呼び出し側が `UnexpectedCloseBrace` を記録する）。
+fn skip_at_rule(it: &mut Chars<'_>) -> Option<usize> {
     let mut paren: usize = 0;
     let mut braces: usize = 0;
-    while let Some((_, c)) = it.next() {
+    while let Some((i, c)) = it.next() {
         match c {
             '/' if matches!(it.peek(), Some((_, '*'))) => skip_comment(it),
             '"' | '\'' => read_string(it, c, None),
             '\\' => {
                 it.next();
             }
-            ';' if paren == 0 && braces == 0 => return,
+            ';' if paren == 0 && braces == 0 => return None,
             '(' | '[' => paren = paren.saturating_add(1),
             ')' | ']' => paren = paren.saturating_sub(1),
             '{' if paren == 0 => braces = braces.saturating_add(1),
+            '}' if paren == 0 && braces == 0 => return Some(i),
             '}' if paren == 0 => {
                 braces = braces.saturating_sub(1);
                 if braces == 0 {
-                    return;
+                    return None;
                 }
             }
             _ => {}
         }
     }
+    None
 }
 
 /// CSS テキストをルールブロックの列へ分割する。
@@ -267,8 +272,11 @@ pub fn split_rule_blocks(input: &str) -> Result<RuleBlocks> {
                 }
             }
             '@' if start.is_none() => {
-                skip_at_rule(&mut it);
+                let stray_close = skip_at_rule(&mut it);
                 out.skipped_at_rules = out.skipped_at_rules.saturating_add(1);
+                if let Some(offset) = stray_close {
+                    out.push_error(RuleBlockErrorKind::UnexpectedCloseBrace, offset);
+                }
             }
             '}' if depth == 0 => {
                 out.push_error(RuleBlockErrorKind::UnexpectedCloseBrace, i);
@@ -414,6 +422,20 @@ mod tests {
             RuleBlockErrorKind::UnexpectedCloseBrace
         );
         assert_eq!(r.errors()[0].offset(), 0);
+        assert_eq!(r.blocks().len(), 1);
+        assert_eq!(r.blocks()[0].prelude(), "a");
+    }
+
+    /// CORE-5: at-rule 直後の余分な `}` も構造エラーとして記録し、後続ルールは取る。
+    #[test]
+    fn core_5_stray_close_brace_after_at_rule() {
+        let r = split_rule_blocks("@unknown } a{b:c}").expect("must split");
+        assert_eq!(r.errors().len(), 1);
+        assert_eq!(
+            r.errors()[0].kind(),
+            RuleBlockErrorKind::UnexpectedCloseBrace
+        );
+        assert_eq!(r.errors()[0].offset(), 9);
         assert_eq!(r.blocks().len(), 1);
         assert_eq!(r.blocks()[0].prelude(), "a");
     }
