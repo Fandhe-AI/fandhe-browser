@@ -25,7 +25,7 @@ Puppeteer 接続試験の実行基盤（TASK-45.1・Issue #480・ビヘイビア
 - stdout に `FANDHE_SCRIPT_RESULT` + 半角スペースで始まる 1 行の JSON を出す:
   `{"ok": bool, "step": string, "error": {"name": string, "message": string} | null}`
 - 回収結果は `ScriptOutcome`（`Completed` / `NoResult` / `TimedOut` / `Malformed`）で表す
-- 締め切り（既定 60 秒）で kill し、stdout / stderr は各 1MiB、結果行は 64KiB を上限とする
+- 呼び出し側が `run_script` に渡す締め切り（既定値なし）で kill し、stdout / stderr は各 1MiB、結果行は 64KiB を上限とする
 
 ## 実行方法
 
