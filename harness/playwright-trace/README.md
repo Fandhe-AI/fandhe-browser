@@ -9,6 +9,7 @@ CDP メッセージ列を、再現可能な JSONL として保存するハーネ
 
 | ファイル | 役割 |
 | -------- | ---- |
+| `verify-install.mjs` | 一時導入した playwright-core が単独・指定版・指定 integrity であることの検証 |
 | `run.sh` | `trace_server` の起動・playwright-core の一時導入・`trace.mjs` 実行・後始末 |
 | `trace.mjs` | 実 Playwright を段階実行し、`DEBUG=pw:protocol` の出力を横取りして JSONL 化 |
 | `lib.mjs` | 引数検証・ログ解析・正規化・スキーマ検証（純粋関数） |
@@ -25,7 +26,10 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
 ```
 
 - playwright-core は Makefile の `PLAYWRIGHT_VERSION`（exact 固定）を `mktemp -d` へ一時導入する。
-  `package.json`・lockfile・`node_modules` はコミットしない。ブラウザ本体は取得しない
+  `package.json`・lockfile・`node_modules` はコミットしない。代わりに導入後に `verify-install.mjs` が
+  `node_modules/.package-lock.json` を検証し、導入物が playwright-core 単独（推移的依存なし）で、
+  版と npm 整合性ハッシュ（Makefile の `PLAYWRIGHT_INTEGRITY`）が一致しなければ失敗する。
+  版を上げるときは integrity も更新するブラウザ本体は取得しない
   （`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1`・`--ignore-scripts`）
 - 接続先は loopback の IP リテラル（`127.0.0.1` / `[::1]`）のみ許可し、`goto()` など外部アクセスは行わない
 - 取得方法は playwright-core が `logger` オプションを公開していないため `DEBUG=pw:protocol` の

@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import {
   checkCollection,
   normalizeString,
+  verifyInstalledPackages,
   normalizeValue,
   parseProtocolLine,
   drainLines,
@@ -94,13 +95,36 @@ t("drainLines rejects oversized lines even when the chunk contains newlines", ()
 });
 
 t("normalize replaces port and strips ANSI", () => {
-  assert.equal(normalizeString("ws://127.0.0.1:44337/x \u001b[2mdim\u001b[22m", "44337"), "ws://127.0.0.1:<PORT>/x dim");
-  assert.deepEqual(normalizeValue({ a: ["http://127.0.0.1:1234/"] }, "1234"), { a: ["http://127.0.0.1:<PORT>/"] });
+  assert.equal(normalizeString("ws://127.0.0.1:44337/x \u001b[2mdim\u001b[22m", "44337", "127.0.0.1"), "ws://127.0.0.1:<PORT>/x dim");
+  assert.deepEqual(normalizeValue({ a: ["http://127.0.0.1:1234/"] }, "1234", "127.0.0.1"), { a: ["http://127.0.0.1:<PORT>/"] });
+});
+
+t("normalize only replaces the endpoint host:port", () => {
+  assert.equal(normalizeString("http://example.com:12345/", "1234", "127.0.0.1"), "http://example.com:12345/");
+  assert.equal(normalizeString("http://example.com:1234/", "1234", "127.0.0.1"), "http://example.com:1234/");
+  assert.equal(normalizeString("at 12:1234 and 127.0.0.1:12345", "1234", "127.0.0.1"), "at 12:1234 and 127.0.0.1:12345");
+  assert.equal(normalizeString("x ws://127.0.0.1:1234/a", "1234", "127.0.0.1"), "x ws://127.0.0.1:<PORT>/a");
+  assert.equal(normalizeString("http://[::1]:1234/", "1234", "[::1]"), "http://[::1]:<PORT>/");
+  assert.equal(normalizeString("127.0.0.1:1234", "1234", undefined), "127.0.0.1:1234");
+});
+
+t("verifyInstalledPackages accepts only the exact single package", () => {
+  const want = { name: "playwright-core", version: "1.63.0", integrity: "sha512-AAAA" };
+  const ok = { packages: { "node_modules/playwright-core": { version: "1.63.0", integrity: "sha512-AAAA" } } };
+  assert.doesNotThrow(() => verifyInstalledPackages(ok, want));
+  const extra = { packages: { ...ok.packages, "node_modules/left-pad": { version: "1.0.0" } } };
+  assert.throws(() => verifyInstalledPackages(extra, want), /unexpected packages installed: node_modules\/left-pad/);
+  const badInt = { packages: { "node_modules/playwright-core": { version: "1.63.0", integrity: "sha512-BBBB" } } };
+  assert.throws(() => verifyInstalledPackages(badInt, want), /integrity mismatch/);
+  const badVer = { packages: { "node_modules/playwright-core": { version: "1.62.0", integrity: "sha512-AAAA" } } };
+  assert.throws(() => verifyInstalledPackages(badVer, want), /version mismatch: expected 1.63.0, got 1.62.0/);
+  assert.throws(() => verifyInstalledPackages({ packages: {} }, want), /was not installed/);
+  assert.throws(() => verifyInstalledPackages({}, want), /no packages/);
 });
 
 t("normalizeValue keeps __proto__ keys as own properties", () => {
   const msg = JSON.parse('{"a":1,"__proto__":{"x":"y"}}');
-  assert.equal(JSON.stringify(normalizeValue(msg, "1")), '{"a":1,"__proto__":{"x":"y"}}');
+  assert.equal(JSON.stringify(normalizeValue(msg, "1", "127.0.0.1")), '{"a":1,"__proto__":{"x":"y"}}');
 });
 
 t("validateDiscoveredWs pins host and port to the endpoint", () => {

@@ -6,18 +6,23 @@
 # 起動し、playwright-core（exact 固定版）を mktemp -d へ導入して trace.mjs を実行する。
 # ネットワーク（npm レジストリ）と node/npm が必要。CI では実行しない（手動）。
 #
-# 使い方: run.sh <playwright-core の exact バージョン> <出力 JSONL パス> [--force]
+# 使い方: run.sh <playwright-core の exact バージョン> <npm integrity> <出力 JSONL パス> [--force]
 set -euo pipefail
 
-if [ "$#" -lt 2 ]; then
-  echo "usage: run.sh <playwright-version> <out.jsonl> [--force]" >&2
+if [ "$#" -lt 3 ]; then
+  echo "usage: run.sh <playwright-version> <integrity> <out.jsonl> [--force]" >&2
   exit 2
 fi
 PW_VERSION="$1"
-OUT="$2"
-shift 2
+PW_INTEGRITY="$2"
+OUT="$3"
+shift 3
 if ! [[ "$PW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "error: playwright version must be exact x.y.z: $PW_VERSION" >&2
+  exit 2
+fi
+if ! [[ "$PW_INTEGRITY" =~ ^sha512-[A-Za-z0-9+/]+=*$ ]]; then
+  echo "error: integrity must be an sha512 SRI string" >&2
   exit 2
 fi
 for cmd in node npm cargo; do
@@ -41,6 +46,8 @@ TARGET_DIR="$(cd "$REPO_ROOT" && cargo metadata --format-version 1 --no-deps \
 # playwright-core のみ・ブラウザ本体は取得しない・install script は実行しない。
 (cd "$WORK" && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --no-save --no-audit --no-fund --ignore-scripts \
   "playwright-core@$PW_VERSION" >/dev/null)
+# 推移的依存の混入・版や integrity の相違があれば、トレースを取らずに失敗する。
+node "$SCRIPT_DIR/verify-install.mjs" "$WORK" playwright-core "$PW_VERSION" "$PW_INTEGRITY"
 
 # 一時プロファイルは trace_server が temp_dir 配下へ作る。SIGTERM 停止では自前の削除に
 # 到達しないため、TMPDIR を $WORK 配下へ向けて cleanup の rm -rf で一緒に消す。

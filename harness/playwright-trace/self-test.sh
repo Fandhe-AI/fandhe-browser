@@ -117,4 +117,17 @@ if [ "$status" -ne 0 ] || ! grep -q '"method":"A.b"' "$FAKE_DIR/out5.jsonl"; the
   exit 1
 fi
 echo "ok: protocol lines after capture stops are discarded"
+
+# verify-install.mjs が導入結果の不一致を exit 1 で拒否し、一致なら 0 を返すこと（オフライン）。
+VDIR="$(mktemp -d)"
+trap 'rm -rf "$FAKE_DIR" "$VDIR"' EXIT
+mkdir -p "$VDIR/node_modules"
+cat >"$VDIR/node_modules/.package-lock.json" <<'JSON'
+{"packages":{"node_modules/playwright-core":{"version":"1.63.0","integrity":"sha512-AAAA"}}}
+JSON
+node "$SCRIPT_DIR/verify-install.mjs" "$VDIR" playwright-core 1.63.0 sha512-AAAA >/dev/null 2>&1 || { echo "FAIL: valid install rejected" >&2; exit 1; }
+status=0
+node "$SCRIPT_DIR/verify-install.mjs" "$VDIR" playwright-core 1.63.0 sha512-BBBB >/dev/null 2>&1 || status=$?
+[ "$status" -eq 1 ] || { echo "FAIL: integrity mismatch must exit 1 (got $status)" >&2; exit 1; }
+echo "ok: verify-install accepts a matching install and rejects a mismatch"
 echo "playwright-trace self-test: all passed"
