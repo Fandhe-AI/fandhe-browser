@@ -57,8 +57,15 @@ try {
 
 const port = endpoint.port;
 const records = [];
+const origWrite = process.stderr.write.bind(process.stderr);
+// 欠落・切り詰めたトレースを正常成果物として残さないため、致命的エラーは JSONL を書かずに
+// 即座に非 0 終了する（出力は最後の writeFileSync でのみ行う）。
+const fatal = (msg) => {
+  origWrite(`error: ${msg}; aborting without writing trace\n`);
+  process.exit(1);
+};
 const push = (r) => {
-  if (records.length >= MAX_RECORDS) throw new Error("record limit exceeded");
+  if (records.length >= MAX_RECORDS) fatal("record limit exceeded");
   records.push(r);
 };
 
@@ -66,24 +73,25 @@ const push = (r) => {
 process.env.DEBUG = "pw:protocol";
 process.env.DEBUG_COLORS = "no";
 let pending = "";
-const origWrite = process.stderr.write.bind(process.stderr);
 process.stderr.write = (chunk, ...rest) => {
   pending += chunk.toString();
   // 改行が来ないまま蓄積が上限を超えたら収集を中断する（無制限バッファ防止）。
   if (Buffer.byteLength(pending) > MAX_LINE_BYTES * 2 && pending.indexOf("\n") < 0) {
-    origWrite("error: protocol log line exceeds buffer limit; aborting\n");
-    process.exit(1);
+    fatal("protocol log line exceeds buffer limit");
   }
   let idx;
   while ((idx = pending.indexOf("\n")) >= 0) {
     const line = pending.slice(0, idx);
     pending = pending.slice(idx + 1);
+    let rec = null;
     try {
       const parsed = parseProtocolLine(line);
-      if (parsed) push({ kind: "cdp", dir: parsed.dir, message: normalizeValue(parsed.message, port) });
+      if (parsed) rec = { kind: "cdp", dir: parsed.dir, message: normalizeValue(parsed.message, port) };
     } catch (e) {
-      origWrite(`warn: unparsable protocol line: ${e.message}\n`);
+      // 解析不能行はレコード欠落になるため収集全体を失敗させる。
+      fatal(`unparsable protocol line: ${e.message}`);
     }
+    if (rec) push(rec);
   }
   const cb = rest.find((x) => typeof x === "function");
   if (cb) cb();
