@@ -34,6 +34,19 @@ fn one_line(s: &str) -> String {
         .collect()
 }
 
+/// name を `"` で囲んで出す。値中の `\` と `"` をエスケープし、境界を曖昧にしない。
+fn quoted(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in one_line(s).chars() {
+        if c == '\\' || c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
 fn state_suffix(state: &State) -> String {
     let mut out = String::new();
     if state.disabled {
@@ -54,7 +67,7 @@ fn render_control(c: &RowControl) -> String {
     let label = if c.name.is_empty() {
         one_line(&c.role)
     } else {
-        format!("{} \"{}\"", one_line(&c.role), one_line(&c.name))
+        format!("{} {}", one_line(&c.role), quoted(&c.name))
     };
     format!("{label}={}{}", c.r#ref, state_suffix(&c.state))
 }
@@ -71,7 +84,7 @@ fn render_head(node: &Node, depth: usize, lines: &mut Vec<String>) {
     let indent = "  ".repeat(depth);
     let mut line = format!("{indent}- {}", node.role);
     if !node.name.is_empty() {
-        line.push_str(&format!(" \"{}\"", one_line(&node.name)));
+        line.push_str(&format!(" {}", quoted(&node.name)));
     }
     if let Some(r) = &node.r#ref {
         line.push_str(&format!(" [{r}]"));
@@ -84,14 +97,7 @@ fn render_head(node: &Node, depth: usize, lines: &mut Vec<String>) {
         let header: Vec<String> = table
             .header
             .iter()
-            .map(|h| {
-                format!(
-                    "{} \"{}\" [{}]",
-                    one_line(&h.role),
-                    one_line(&h.name),
-                    h.r#ref
-                )
-            })
+            .map(|h| format!("{} {} [{}]", one_line(&h.role), quoted(&h.name), h.r#ref))
             .collect();
         lines.push(format!("{sub}header: {}", header.join(" | ")));
         for row in &table.rows {
@@ -181,7 +187,8 @@ fn count_data_rows(children: &[Node]) -> usize {
 
 fn render_children(children: &[Node], depth: usize, m: &mut Merge<'_>, lines: &mut Vec<String>) {
     let sub = "  ".repeat(depth);
-    for child in children {
+    let last_group = children.iter().rposition(is_transparent_group);
+    for (i, child) in children.iter().enumerate() {
         if is_transparent_group(child) {
             render_head(child, depth, lines);
             let before = m.seen;
@@ -189,7 +196,10 @@ fn render_children(children: &[Node], depth: usize, m: &mut Merge<'_>, lines: &m
             // 最後のデータ行を含むグループの末尾で、残りの畳んだ行を同じ階層へ出す。
             // データ行を持たないグループ（thead 等）では出さない（全行が畳まれた表でも
             // 本文行がヘッダ直後に出ないよう、その場合は呼び出し元の末尾で出す）。
-            if m.seen > before && m.seen >= m.total {
+            // 展開側のデータ行が 1 件もない表（全行が畳まれた表）は、最後のグループ
+            // （tbody 相当）の中へ出す。
+            let is_body = m.seen > before || (m.total == 0 && last_group == Some(i));
+            if is_body && m.seen >= m.total {
                 m.flush(&"  ".repeat(depth + 1), lines);
             }
             continue;

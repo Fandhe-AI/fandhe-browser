@@ -283,7 +283,7 @@ fn render_folded_rows_interleave_inside_rowgroups() {
     assert_eq!(text, expected);
 }
 
-/// AISNAP-12: 全データ行が畳まれた表では、畳んだ行は thead の後ろ（表の末尾）に出る。
+/// AISNAP-12: 全データ行が畳まれた表では、畳んだ行は thead の後ろの最後の rowgroup 内に出る。
 #[test]
 fn render_all_rows_folded_after_header_group() {
     let thead = Node::new("rowgroup", "").with_children(vec![
@@ -304,9 +304,17 @@ fn render_all_rows_folded_after_header_group() {
         "    - row",
         "      - columnheader \"n\" [e1]",
         "  - rowgroup",
-        "  row0",
-        "  row1",
+        "    row0",
+        "    row1",
     ]
     .join("\n");
     assert_eq!(text, expected);
+}
+
+/// AISNAP-1: name 中の `"` と `\` はエスケープされ、値の境界が曖昧にならない。
+#[test]
+fn render_escapes_quotes_in_names() {
+    let n = Node::new("button", "Say \"hi\" \\o/").with_ref("e1");
+    let text = render_snapshot(&Snapshot::new(n));
+    assert_eq!(text, "- button \"Say \\\"hi\\\" \\\\o/\" [e1]");
 }
