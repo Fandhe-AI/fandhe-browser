@@ -6,12 +6,12 @@
 //! 壊れた。TASK-16.4 で固定の `take(20)` を予算モデル（`retention`）へ置換したため、
 //! 本ファイルはその回帰を crate 外の公開 API から検出する。
 //!
-//! 2 層構成の理由: `build_snapshot` はリンク・ボタンを含む表を展開し、操作要素を持つ行は
-//! 保持選択に関係なく常に残る。そのため Snapshot 経路だけでは固定キャップへ退行しても
-//! 通ってしまう。そこで (B) `compress_rows` の公開 API 経路で境界をまたぐ配置を検証し、
+//! 2 層構成の理由: (B) `compress_rows` の公開 API 経路で境界をまたぐ配置を検証し、
 //! 対照アサーション（優先候補なしの `select_retained` ならその行は消える）で、
-//! テストが実際に境界をまたいでいることを示す。(A) Snapshot 経路は受入基準どおり
-//! 変化前後の 2 回の `build_snapshot` で存在と ref の有無を確かめる。
+//! テストが実際に境界をまたいでいることを示す。(A) Snapshot 経路は変化前後の 2 回の
+//! `build_snapshot` で存在と ref の有無を確かめる。リンク・ボタンだけの表・一覧は圧縮され
+//! （Issue #632）、保持行の `TableRow::controls` に ref 付きで残る。`caption` を足した変種は
+//! 圧縮を拒否する展開経路（操作要素を持つ行は保持選択に関係なく常に残る）を引き続き検証する。
 //!
 //! 範囲外: 2 回の Snapshot 間での ref の一致（`AISNAP-10`・TASK-17）。ここでは確かめない。
 //! フィクスチャはすべて静的なダミー値で、外部通信をしない。
@@ -20,7 +20,9 @@ use fandhe_browser_ai::compress_table::{
     MAX_TABLE_ROWS, TABLE_HEAD_KEEP, compress_rows, detect_regular_structure,
 };
 use fandhe_browser_ai::retention::{RetentionPolicy, select_retained};
-use fandhe_browser_ai::snapshot::{Node, Snapshot, TableRow, TableSummary, build_snapshot};
+use fandhe_browser_ai::snapshot::{
+    Node, RowControl, Snapshot, TableRow, TableSummary, build_snapshot,
+};
 use fandhe_browser_core::dom::Document;
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
 use fandhe_browser_core::query::query_selector_str;
@@ -214,16 +216,82 @@ fn nodes_named<'a>(s: &'a Snapshot, role: &str, name: &str) -> Vec<&'a Node> {
         .collect()
 }
 
-/// AISNAP-12・TASK-16.5・Issue #108: バナーと先頭行の挿入の前後で Snapshot を取り直しても、
-/// ページネーションリンクは ref 付きで 1 つだけ残り、畳まれず、本文行は欠けない。
+/// 圧縮された表・一覧の行内操作要素から `role`・`name` が一致するものを集める。
+fn controls_named<'a>(s: &'a Snapshot, role: &str, name: &str) -> Vec<&'a RowControl> {
+    all_nodes(&s.tree)
+        .into_iter()
+        .filter_map(|n| n.table.as_ref())
+        .flat_map(|t| t.rows.iter())
+        .flat_map(|r| r.controls.iter())
+        .filter(|c| c.role == role && c.name == name)
+        .collect()
+}
+
+/// `caption` を足して圧縮を拒否し、展開経路（優先保持 + 畳み込み）へ固定した表。
+fn captioned(table: &str) -> String {
+    table.replacen("<table>", "<table><caption>c</caption>", 1)
+}
+
+/// AISNAP-12・AISNAP-2・AISNAP-13・TASK-16.5・Issue #108・#632: 圧縮経路で、バナーと先頭行の
+/// 挿入の前後に Snapshot を取り直しても、キャップ外のページネーションリンクを含む行が
+/// 圧縮行として残り、その control が ref 付きで 1 件だけ存在し、行数の合計が欠けない。
 #[test]
-fn aisnap_12_snapshot_keeps_pagination_link_across_banner_and_row_insertion() {
+fn aisnap_12_snapshot_compressed_table_keeps_pagination_control_across_banner_and_row_insertion() {
     let mut rows = base_rows(TOTAL);
     set_row(&mut rows, BOUNDARY, NEXT);
     let before = snap(&page(&table_html(&rows)));
 
     rows.insert(0, "告知".to_string());
     let after = snap(&page(&format!("<div>お知らせ</div>{}", table_html(&rows))));
+
+    for (s, total) in [(&before, TOTAL), (&after, TOTAL + 1)] {
+        let controls = controls_named(s, "link", "Next");
+        assert_eq!(controls.len(), 1);
+        assert!(controls.iter().all(|c| c.r#ref.starts_with('e')));
+        let t = summary(s);
+        assert_eq!(t.rows.len(), MAX_TABLE_ROWS);
+        assert_eq!(t.rows.len() + t.truncated_rows, total);
+        assert!(t.rows.iter().any(|r| r.text == "Next"));
+    }
+}
+
+/// AISNAP-12・AISNAP-2・Issue #632: 表外へのバナー挿入の前後でも、送信ボタンは圧縮行の
+/// control として ref 付きで 1 件だけ残り、その ref は変わらない（`AISNAP-10`）。
+#[test]
+fn aisnap_12_snapshot_compressed_table_keeps_submit_control_across_banner_insertion() {
+    let mut rows = base_rows(TOTAL);
+    set_row(&mut rows, BOUNDARY, "<button type=\"submit\">send</button>");
+    let form = format!("<form>{}</form>", table_html(&rows));
+    let before = snap(&page(&form));
+    let after = snap(&page(&format!("<div>お知らせ</div>{form}")));
+    for s in [&before, &after] {
+        assert_eq!(controls_named(s, "button", "send").len(), 1);
+        let t = summary(s);
+        assert_eq!(t.rows.len(), MAX_TABLE_ROWS);
+        assert_eq!(t.rows.len() + t.truncated_rows, TOTAL);
+    }
+    let refs = |s: &Snapshot| {
+        controls_named(s, "button", "send")
+            .iter()
+            .map(|c| c.r#ref.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(refs(&before), refs(&after));
+}
+
+/// AISNAP-12・TASK-16.5・Issue #108: `caption` で圧縮を拒否した展開経路でも、バナーと
+/// 先頭行の挿入の前後でページネーションリンクは ref 付きで 1 つだけ残り、畳まれない。
+#[test]
+fn aisnap_12_snapshot_keeps_pagination_link_across_banner_and_row_insertion() {
+    let mut rows = base_rows(TOTAL);
+    set_row(&mut rows, BOUNDARY, NEXT);
+    let before = snap(&page(&captioned(&table_html(&rows))));
+
+    rows.insert(0, "告知".to_string());
+    let after = snap(&page(&format!(
+        "<div>お知らせ</div>{}",
+        captioned(&table_html(&rows))
+    )));
 
     for (s, total) in [(&before, TOTAL), (&after, TOTAL + 1)] {
         let links = nodes_named(s, "link", "Next");
@@ -234,13 +302,13 @@ fn aisnap_12_snapshot_keeps_pagination_link_across_banner_and_row_insertion() {
     }
 }
 
-/// AISNAP-12・TASK-16.5・Issue #108: 表外へのバナー挿入の前後でも、送信ボタンは
-/// ref 付きで残る。
+/// AISNAP-12・TASK-16.5・Issue #108: `caption` で圧縮を拒否した展開経路でも、表外への
+/// バナー挿入の前後で送信ボタンは ref 付きで残る。
 #[test]
 fn aisnap_12_snapshot_keeps_submit_button_across_banner_insertion() {
     let mut rows = base_rows(TOTAL);
     set_row(&mut rows, BOUNDARY, "<button type=\"submit\">send</button>");
-    let form = format!("<form>{}</form>", table_html(&rows));
+    let form = format!("<form>{}</form>", captioned(&table_html(&rows)));
     let before = snap(&page(&form));
     let after = snap(&page(&format!("<div>お知らせ</div>{form}")));
     for s in [&before, &after] {

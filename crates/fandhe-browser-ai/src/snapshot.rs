@@ -45,7 +45,8 @@
 //!   （[`Node::table`]・[`TableSummary`]。規則的な `table`・`ul`・`ol` は
 //!   [`build_snapshot`] が子孫を展開せず、ヘッダ・圧縮行・超過行数を持つ 1 ノードへ
 //!   置き換える。圧縮した行・項目の中の操作要素（リンク等）の格納先として
-//!   [`TableRow::controls`]（[`RowControl`]）を Issue #630 で追加済みだが、現状は常に空。
+//!   [`TableRow::controls`]（[`RowControl`]）へ、圧縮行内の `a[href]`・`button` を ref 付きで保持する
+//!   （`AISNAP-13`・Issue #630 で型、#632 で保持）。
 //!   保持と ref 付与は後続 Issue #632 で行う。`AISNAP-10`・`AISNAP-13`）
 //! - ユニットテスト一式: TASK-11.8（Issue #77）で実装済み（代表フィクスチャ 3 種の
 //!   結合テスト `tests/snapshot.rs`）
@@ -56,7 +57,9 @@ pub mod name;
 pub mod role;
 pub mod state;
 pub use crate::data_leaf::DataLeafKind;
-pub use build::{MAX_TREE_DEPTH, SnapshotError, build_snapshot};
+pub use build::{
+    MAX_ROW_CONTROLS, MAX_TABLE_CONTROLS, MAX_TREE_DEPTH, SnapshotError, build_snapshot,
+};
 pub use element_ref::{ElementRef, RefAllocator, RefError, ref_signature};
 pub use name::{AccessibleName, NameIndex, NameSource, compute_name, compute_name_with_index};
 pub use role::{ComputedRole, RoleSource, compute_role};
@@ -224,9 +227,11 @@ impl HeaderCell {
 /// （ref での再特定。`AISNAP-10`）そのものなので `Option` にせず必須とし、形式は
 /// [`Node::ref`] と同じ（`e<16hex>[v<n>][-n]`）。
 ///
-/// 未実装（REPAIR-3）: 現在 [`build_snapshot`] はこの型を生成しない（型のみ先行追加）。
-/// 後続 Issue #632 で圧縮経路が `RefAllocator` で ref を発行して格納し、セル内に複数
-/// リンクがあっても上限付きで保持する（`AISNAP-13`）。JSON への写像は TASK-19・`AISNAP-6`。
+/// [`build_snapshot`] の圧縮経路が、保持した行の中の `a[href]`・`button` から生成する
+/// （`RefAllocator` で発行した ref。セル内に複数あっても行あたり [`MAX_ROW_CONTROLS`]・
+/// 表全体 [`MAX_TABLE_CONTROLS`] を上限に文書順で全件保持する。`AISNAP-13`・Issue #632）。
+/// 既知の制約（REPAIR-3）: 上限値は暫定（#84 の測定で調整）。省略行（`truncated_rows`）内の
+/// 操作要素は保持せず ref も発行しない。JSON への写像は TASK-19・`AISNAP-6`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RowControl {
@@ -261,9 +266,9 @@ impl RowControl {
 
 /// 圧縮した 1 データ行（セルを `" | "` で連結した文字列。`AISNAP-2`・TASK-12.5）。
 ///
-/// [`build_snapshot`] が圧縮行から生成する。行内操作要素の格納先 [`TableRow::controls`] と
-/// 件数超過フラグ [`TableRow::controls_truncated`] は Issue #630 で追加した型のみで、
-/// 現状は常に空・`false`。設定は後続 Issue #632（`AISNAP-10`・`AISNAP-13`）で行う。
+/// [`build_snapshot`] が圧縮行から生成する。行内操作要素は [`TableRow::controls`] へ、
+/// 件数上限を超えた省略は [`TableRow::controls_truncated`] で通知する
+/// （`AISNAP-10`・`AISNAP-13`・Issue #632）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TableRow {
@@ -271,9 +276,9 @@ pub struct TableRow {
     pub text: String,
     /// いずれかのセルが上限（文字数・走査量）で切り詰められたか。
     pub truncated: bool,
-    /// 行内の操作要素（現状は常に空。#632 で保持する）。
+    /// 行内の `a[href]`・`button`（文書順。上限は [`MAX_ROW_CONTROLS`]・[`MAX_TABLE_CONTROLS`]）。
     pub controls: Vec<RowControl>,
-    /// 行あたりの操作要素の件数上限を超えて省略したか（現状は常に `false`）。
+    /// 行あたり・表全体の操作要素の件数上限を超えて省略したか。
     /// セルの切り詰め [`TableRow::truncated`]・行の省略 `TableSummary::truncated_rows` とは別。
     pub controls_truncated: bool,
 }
@@ -289,7 +294,7 @@ impl TableRow {
         }
     }
 
-    /// 行内操作要素を設定する（呼び出しは #632 以降。現状 [`build_snapshot`] は使わない）。
+    /// 行内操作要素を設定する（圧縮経路の [`build_snapshot`] が呼ぶ）。
     #[must_use]
     pub fn with_controls(mut self, controls: Vec<RowControl>) -> Self {
         self.controls = controls;
@@ -314,9 +319,10 @@ impl TableRow {
 ///   対応しないことがある
 /// - `tfoot` 行は `rows` にも `truncated_rows` にも含めない
 /// - セル内の `" | "` はエスケープしない
-/// - 圧縮した行・項目の中の操作要素の格納先として `TableRow::controls`（[`RowControl`]）を
-///   持つが、現状は常に空・`controls_truncated == false`。保持と ref 付与は後続 Issue #632
-///   （TASK-12・`AISNAP-10`・`AISNAP-13`）で行う
+/// - 圧縮した行・項目の中の `a[href]`・`button` は `TableRow::controls`（[`RowControl`]）へ
+///   ref 付きで保持する（`AISNAP-10`・`AISNAP-13`・Issue #632）。ヘッダ行に操作要素がある表は
+///   圧縮せず展開し、省略行内の操作要素は保持しない。上限（[`MAX_ROW_CONTROLS`]・
+///   [`MAX_TABLE_CONTROLS`]）は暫定で、行をまたぐ優先保持はしない
 /// - 行の省略は `truncated_rows`、セルの切り詰めは [`TableRow::truncated`] で通知し、
 ///   [`Snapshot::truncated`] は立てない
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -62,7 +62,8 @@
 //!   超過行数 `truncated_rows` も実装済み（TASK-12.4・Issue #82。
 //!   [`compress_table::CompressedRows`]）。ツリー構築への統合は実装済み
 //!   （TASK-12.5・Issue #83。[`snapshot::build_snapshot`] が [`snapshot::Node::table`] へ
-//!   格納）。回帰テスト（#84）は未実装
+//!   格納）。リンク・ボタンを含む表・一覧の圧縮と行内操作要素への ref 付与は実装済み
+//!   （Issue #632。`snapshot::TableRow::controls`）。回帰テスト（#84）は未実装
 //! - データ葉（非インタラクティブなデータ値）の検出（`AISNAP-3`・`TASK-13`・
 //!   `MS-2`）。`td`/`th` の検出（TASK-13.1・Issue #86）と
 //!   価格クラス名パターン（TASK-13.2・Issue #87）は実装済み（[`data_leaf`]）。
