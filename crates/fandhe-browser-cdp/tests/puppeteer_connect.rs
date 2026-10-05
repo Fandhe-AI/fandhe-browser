@@ -171,13 +171,20 @@ fn collects_result_after_large_stdout() {
     );
 }
 
-/// CDP-3: 孫プロセスがパイプを握り続けても締め切り後にハングしない。
-#[cfg(unix)]
+/// CDP-3: 孫プロセスがパイプを握り続けても、ハングせず出力済みの結果行も取りこぼさない。
 #[test]
 fn does_not_hang_when_grandchild_holds_pipe() {
     let started = std::time::Instant::now();
-    let _ = run_script(&fake("grandchild"), "ws://x", D);
+    let outcome = run_script(&fake("grandchild"), "ws://x", D);
     assert!(started.elapsed() < Duration::from_secs(20));
+    assert_eq!(
+        outcome,
+        ScriptOutcome::Completed {
+            ok: true,
+            step: "gc".into(),
+            error: None
+        }
+    );
 }
 
 /// CDP-3: 実サーバーの WS エンドポイントがスクリプトへそのまま渡る。
