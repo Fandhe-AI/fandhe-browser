@@ -23,9 +23,16 @@
 //!   （個別 ref）・圧縮行・超過行数を持つ 1 ノード（[`Node::table`]）へ置き換える。
 //!   圧縮では `Snapshot::truncated` を立てない（行の省略は `truncated_rows`、セルの
 //!   切り詰めは `TableRow::truncated` で通知）。ヘッダ name の打ち切りのみ立てる。
-//!   ただし `tfoot` 行がある構造、または操作要素（リンク・ボタン・入力欄・`role`/
-//!   `tabindex` 付き等）を含む構造は圧縮せず通常どおり展開する（ref・state・フッター
-//!   の可視情報を失わないため）。`img` の `alt`・`aria-label` 等テキスト以外に由来する
+//!   本文行（`tr`/`li`）内の `a[href]`・`button` は圧縮を拒否せず、圧縮行ごとに
+//!   `TableRow::controls` へ ref・state 付きで保持する（セル内に複数あっても行あたり
+//!   [`MAX_ROW_CONTROLS`]・表全体 [`MAX_TABLE_CONTROLS`] を上限に全件を文書順で保持し、
+//!   超過は `TableRow::controls_truncated` で通知する。行は末尾まで走査し、優先保持
+//!   （ページネーション・送信ボタン。`AISNAP-12`）は表全体で先に枠を確保する
+//!   （優先要素だけで行・表の上限を超える表、および保持上限で省略される行に操作要素が
+//!   ある表は圧縮せず展開する）。`AISNAP-2`・`AISNAP-13`・Issue #632）。
+//!   ただし `tfoot` 行がある構造、またはそれ以外の操作要素（入力欄・`select`・`textarea`・
+//!   `role`/`tabindex`/`onclick` 付き、ヘッダ行内のリンク等）を含む構造は圧縮せず
+//!   通常どおり展開する（ref・state・フッターの可視情報を失わないため）。`img` の `alt`・`aria-label` 等テキスト以外に由来する
 //!   accessible name を持つ子孫、または `caption` を含む構造も同様に展開する。`title` は
 //!   展開時に name の出所になる要素（`generic`・`listitem` 等）の場合だけ展開を維持する。
 //!   圧縮できない規則的構造で表示対象行が `MAX_TABLE_ROWS` 超のときは、優先保持
@@ -34,6 +41,9 @@
 //!   検出は table/list ごとに子孫を走査するが、走査量はコンテナごと
 //!   （`MAX_COMPRESS_SCAN_NODES`）と 1 回の構築全体（`MAX_TOTAL_COMPRESS_SCAN_NODES`）
 //!   で有界とし、超過したコンテナは圧縮せず展開する。
+//!   既知の制約（REPAIR-3）: ヘッダ行（`th`）に操作要素がある表（ソートリンク付き等）は
+//!   圧縮せず展開する。表全体の上限は文書順に消費し、行をまたぐ優先保持はしない
+//!   （暫定。#84・#108 で見直す）。リンクのテキストはセル文字列と control の name の双方に現れる。
 //! - generic の折り畳み・`none`/`presentation` の除去・空ノードの剪定は行わない
 //!   （トークン削減は後続タスク。`AISNAP-1`・`AISNAP-2`）。
 //! - ルート以外の全要素に ref を振る（対話可能な要素への絞り込みは後続タスク）。
@@ -51,6 +61,7 @@ use crate::compress_table::{
     rows_to_fold,
 };
 use crate::data_leaf::{DataLeafKind, classify_data_leaf};
+use crate::retention::priority_candidates;
 
 use super::element_ref::{ElementRef, ElementSignature, RefAllocator, RefError};
 use super::name::{
@@ -59,7 +70,7 @@ use super::name::{
 };
 use super::role::compute_role;
 use super::state::{compute_state, is_html_element_named};
-use super::{FoldedRow, HeaderCell, Node, Snapshot, TableRow, TableSummary};
+use super::{FoldedRow, HeaderCell, Node, RowControl, Snapshot, TableRow, TableSummary};
 
 /// 構築するツリーの最大深さ（ルートを 0 とする）。
 ///
@@ -160,7 +171,10 @@ fn subtree_fits_depth(doc: &Document, container: NodeId, max_rel: usize) -> bool
 /// （AISNAP-12・TASK-16.4）の対象外で失われる内容のない通常行だけを 1 行文字列へ畳み、
 /// 内容は省略しない）。
 /// - `tfoot` 行がある（圧縮表現は本文行のみで、合計額などフッターの可視情報が消える）。
-/// - 表・一覧の中に操作要素（リンク・ボタン・入力欄等）がある（ref と state が消える）。
+/// - 表・一覧の本文行の外（ヘッダ行等）に操作要素がある、または本文行の中に `a[href]`・
+///   `button` 以外の操作要素（入力欄・`select`・`tabindex`/`onclick`/`role` 付き等）がある
+///   （ref と state が消える）。本文行内の `a[href]`・`button` は拒否せず、
+///   [`collect_row_controls`] が `TableRow::controls` へ保持する（Issue #632）。
 /// - 表に `caption` がある（圧縮表現は caption を保持せず、表題が Snapshot から消える）。
 /// - 見出し・入れ子の表 / 一覧・ランドマーク等の意味的な子孫がある（heading 等のノードと ref が消える）。
 /// - 圧縮行はテキストノードのみを取り込むため、テキスト以外に由来する accessible name
@@ -177,38 +191,45 @@ fn can_compress(
     structure: &crate::compress_table::RegularStructure,
     index: &NameIndex<'_>,
 ) -> bool {
-    structure.footer_rows.is_empty() && !has_lossy_descendant(doc, index, container)
-}
-
-/// `container` の子孫（描画対象のみ）に、圧縮すると失われる要素があるかを反復走査で返す。
-///
-/// 走査量は呼び出し前の [`bounded_descendant_count`] で有界化済みである。
-fn has_lossy_descendant(doc: &Document, index: &NameIndex<'_>, container: NodeId) -> bool {
-    subtree_has_lossy(doc, index, container, false)
+    if !structure.footer_rows.is_empty() {
+        return false;
+    }
+    // 本文行（`tr`/`li`）の内側の `a[href]`・`button` は行内操作要素として保持できる
+    // （`TableRow::controls`。`AISNAP-2`・`AISNAP-13`・Issue #632）。ヘッダ行などの外側は
+    // 格納先がなく黙って消えるため、従来どおり圧縮を拒否する。
+    let body_rows: HashSet<NodeId> = structure.body_rows.iter().copied().collect();
+    !subtree_has_lossy(doc, index, container, false, Some(&body_rows))
 }
 
 /// `root`（`include_root` なら自身を含む）配下に、1 行文字列へ畳むと失われる要素
 /// （操作要素・意味的ノード・テキスト以外由来の name・非セルのデータ葉・`caption`）があるか。
 ///
-/// 畳む行の判定（`AISNAP-12`・TASK-16.4）と [`has_lossy_descendant`] で共有する。
+/// 畳む行の判定（`AISNAP-12`・TASK-16.4。`controls_allowed_in` は `None`）と
+/// [`can_compress`]（本文行の集合を渡す）で共有する。
+/// `controls_allowed_in` が `Some` のとき、その集合の行の内側にある [`is_row_control`] な
+/// 要素は操作要素であることを拒否の理由にしない（他の拒否条件は適用する。Issue #632）。
 /// 走査量は呼び出し前の [`bounded_descendant_count`] で有界化済みの部分木に限る。
 fn subtree_has_lossy(
     doc: &Document,
     index: &NameIndex<'_>,
     root: NodeId,
     include_root: bool,
+    controls_allowed_in: Option<&HashSet<NodeId>>,
 ) -> bool {
-    let mut stack: Vec<NodeId> = if include_root {
-        vec![root]
+    // 要素は (ノード, 許可された行の内側か) の組で積む。
+    let mut stack: Vec<(NodeId, bool)> = if include_root {
+        vec![(root, false)]
     } else {
-        doc.children(root).collect()
+        doc.children(root).map(|c| (c, false)).collect()
     };
-    while let Some(id) = stack.pop() {
+    while let Some((id, in_row)) = stack.pop() {
         if !doc.is_element(id) || is_excluded(doc, id) {
             continue;
         }
+        let interactive_blocks =
+            is_interactive_element(doc, id) && !(in_row && is_row_control(doc, id));
         if is_html_element_named(doc, id, "caption")
-            || is_interactive_element(doc, id)
+            || interactive_blocks
             || is_semantic_structure_element(doc, id)
             || has_non_text_name_source(doc, id)
             || title_becomes_name(doc, index, id)
@@ -216,7 +237,8 @@ fn subtree_has_lossy(
         {
             return true;
         }
-        stack.extend(doc.children(id));
+        let child_in_row = in_row || controls_allowed_in.is_some_and(|rows| rows.contains(&id));
+        stack.extend(doc.children(id).map(|c| (c, child_in_row)));
     }
     false
 }
@@ -348,6 +370,205 @@ fn is_interactive_element(doc: &Document, id: NodeId) -> bool {
         .any(|a| doc.attribute(id, a).is_some())
 }
 
+/// 圧縮行の中で個別の `ref` を付けて保持できる操作要素（`a[href]`・`button`）か。
+///
+/// [`is_interactive_element`] とは別の述語で、圧縮の拒否理由の判定を緩めるためだけに使う
+/// （`AISNAP-2`・`AISNAP-13`・Issue #632）。`tabindex`・`contenteditable`・`onclick`・`role`
+/// 付きの要素は、役割の上書きやスクリプト由来の挙動を `RowControl` で表せないため含めない。
+fn is_row_control(doc: &Document, id: NodeId) -> bool {
+    let is_link = is_html_element_named(doc, id, "a") && doc.attribute(id, "href").is_some();
+    let is_button = is_html_element_named(doc, id, "button");
+    (is_link || is_button)
+        && !["tabindex", "contenteditable", "onclick", "role"]
+            .iter()
+            .any(|a| doc.attribute(id, a).is_some())
+}
+
+/// 圧縮行 1 行あたりに保持する操作要素の最大件数（`AISNAP-13`）。
+///
+/// 超過時は優先保持（`AISNAP-12`。ページネーション・送信ボタン）を先に残し、
+/// `TableRow::controls_truncated` で通知する。暫定値で、#84 の測定で調整する。
+pub const MAX_ROW_CONTROLS: usize = 8;
+
+/// 1 つの圧縮表・一覧が保持する操作要素の合計上限（`AISNAP-13`）。
+///
+/// 優先保持の要素は表全体で先に枠を確保し、残りを文書順に配る（`apply_table_budget`）。
+/// 優先要素だけで超える場合は圧縮せず展開する。暫定値（#84・#108 で見直す）。
+pub const MAX_TABLE_CONTROLS: usize = 120;
+
+/// 圧縮行 1 行ぶんの操作要素の採用計画（ref 発行前。`AISNAP-13`・`AISNAP-12`）。
+struct RowControlPlan {
+    /// 行上限（[`MAX_ROW_CONTROLS`]）適用後の `(要素, 優先保持か)`（文書順）。
+    kept: Vec<(NodeId, bool)>,
+    /// 行上限・表上限のいずれかで落とした要素があるか。
+    truncated: bool,
+}
+
+/// 圧縮行 `row` の子孫から操作要素を文書順で全件集め、行上限を適用した計画を返す。
+///
+/// 走査は行末まで続ける（64 件目より後の `rel="next"`・送信ボタンも優先検出へ渡すため）。
+/// 確保量は呼び出し元が `MAX_COMPRESS_SCAN_NODES` で有界化済みの子孫数以下。
+///
+/// 行内の優先要素（`AISNAP-12`）だけで [`MAX_ROW_CONTROLS`] を超える場合は優先要素を
+/// 落とさずに表現できないため `None`（呼び出し元は圧縮を拒否して展開経路へ進む）。
+fn plan_row_controls(doc: &Document, row: NodeId) -> Option<RowControlPlan> {
+    // 先行順（文書順）の反復走査。子は逆順に積む。
+    let mut candidates: Vec<NodeId> = Vec::new();
+    let mut stack: Vec<NodeId> = doc.children(row).collect();
+    stack.reverse();
+    while let Some(id) = stack.pop() {
+        if !doc.is_element(id) || is_excluded(doc, id) {
+            continue;
+        }
+        if is_row_control(doc, id) {
+            candidates.push(id);
+        }
+        let before = stack.len();
+        stack.extend(doc.children(id));
+        if let Some(added) = stack.get_mut(before..) {
+            added.reverse();
+        }
+    }
+    if candidates.is_empty() {
+        return Some(RowControlPlan {
+            kept: Vec::new(),
+            truncated: false,
+        });
+    }
+    let priority = priority_candidates(doc, &candidates);
+    if priority.len() > MAX_ROW_CONTROLS {
+        return None;
+    }
+    let mut is_priority = vec![false; candidates.len()];
+    for p in &priority {
+        if let Some(flag) = is_priority.get_mut(p.index) {
+            *flag = true;
+        }
+    }
+    if candidates.len() <= MAX_ROW_CONTROLS {
+        let kept = candidates.iter().copied().zip(is_priority).collect();
+        return Some(RowControlPlan {
+            kept,
+            truncated: false,
+        });
+    }
+    // 優先要素（件数は MAX_ROW_CONTROLS 以下を確認済み）を先に全件確保し、
+    // 残り枠を非優先要素へ文書順に配る（先頭枠の予約で優先要素を押し出さない）。
+    let mut room = MAX_ROW_CONTROLS - priority.len();
+    let kept: Vec<(NodeId, bool)> = candidates
+        .iter()
+        .copied()
+        .zip(is_priority)
+        .filter(|(_, pri)| {
+            if *pri {
+                true
+            } else if room > 0 {
+                room -= 1;
+                true
+            } else {
+                false
+            }
+        })
+        .collect();
+    Some(RowControlPlan {
+        kept,
+        truncated: true,
+    })
+}
+
+/// 保持上限で省略される本文行に操作要素（`a[href]`・`button`）が含まれるか。
+///
+/// 省略行の操作要素には ref を発行できず再特定できなくなるため、含まれる場合は呼び出し元が
+/// 圧縮を拒否して展開経路へ進む（`AISNAP-2`・`AISNAP-13`・Issue #632）。
+fn omitted_rows_have_controls(
+    doc: &Document,
+    structure: &crate::compress_table::RegularStructure,
+    compressed: &crate::compress_table::CompressedRows,
+) -> bool {
+    if compressed.truncated_rows == 0 {
+        return false;
+    }
+    let kept: HashSet<NodeId> = compressed.rows.iter().map(|r| r.row).collect();
+    // compress_rows が省略し得るのは可視行のみ（非表示 tbody 配下の行は対象外）。
+    crate::compress_table::visible_body_rows(doc, structure)
+        .iter()
+        .filter(|r| !kept.contains(r) && doc.is_element(**r) && !is_excluded(doc, **r))
+        .any(|&r| plan_row_controls(doc, r).is_none_or(|p| !p.kept.is_empty()))
+}
+
+/// 表全体の上限（[`MAX_TABLE_CONTROLS`]）を行計画へ適用する（`AISNAP-12`・`AISNAP-13`）。
+///
+/// 優先保持（ページネーション・送信ボタン）の要素は表全体で先に枠を確保し、残り枠を
+/// 非優先要素へ文書順に配る。優先要素だけで上限を超える場合は `None`（圧縮を拒否し、
+/// 呼び出し元は展開経路へ進む）。
+fn apply_table_budget(plans: &mut [RowControlPlan]) -> Option<()> {
+    let priority_total: usize = plans
+        .iter()
+        .map(|p| p.kept.iter().filter(|(_, pri)| *pri).count())
+        .sum();
+    if priority_total > MAX_TABLE_CONTROLS {
+        return None;
+    }
+    let mut room = MAX_TABLE_CONTROLS - priority_total;
+    for plan in plans.iter_mut() {
+        let before = plan.kept.len();
+        plan.kept.retain(|(_, pri)| {
+            if *pri {
+                true
+            } else if room > 0 {
+                room -= 1;
+                true
+            } else {
+                false
+            }
+        });
+        if plan.kept.len() < before {
+            plan.truncated = true;
+        }
+    }
+    Some(())
+}
+
+/// 計画済みの操作要素へ ref を発行し [`RowControl`] 列にする（`AISNAP-13`・`AISNAP-10`）。
+///
+/// `build_snapshot` の圧縮経路から呼ばれる。ref は展開時と同じ規則
+/// （role・name・`discriminator`・コンテナ scope）で発行する。
+fn build_row_controls(
+    doc: &Document,
+    index: &NameIndex<'_>,
+    refs: &mut RefAllocator,
+    container_ref: ElementRef,
+    plan: &RowControlPlan,
+    name_truncated: &mut bool,
+) -> Result<(Vec<RowControl>, bool), SnapshotError> {
+    let candidates: Vec<NodeId> = plan.kept.iter().map(|(id, _)| *id).collect();
+    let truncated = plan.truncated;
+    let mut controls = Vec::with_capacity(candidates.len());
+    for id in candidates {
+        let role = compute_role(doc, id)
+            .map(|r| r.as_str().to_string())
+            .unwrap_or_else(|| {
+                if is_html_element_named(doc, id, "a") {
+                    "link".to_string()
+                } else {
+                    "button".to_string()
+                }
+            });
+        let accessible = compute_name_with_index(doc, index, id);
+        *name_truncated |= accessible.truncated;
+        let mut sig = ElementSignature::new(&role, &accessible.text).with_scope(container_ref);
+        if let Some(d) = discriminator(doc, id) {
+            sig = sig.with_discriminator(d);
+        }
+        let elem_ref = refs.allocate_signature(&sig)?;
+        controls.push(
+            RowControl::new(role, accessible.text, elem_ref.to_ref_string())
+                .with_state(compute_state(doc, id)),
+        );
+    }
+    Ok((controls, truncated))
+}
+
 /// ref の識別属性。`id` → フォーム部品の `name` → `a`/`area` の `href` の順に、
 /// 最初に空でないものを返す。値はダイジェストにのみ使われ ref 文字列には入らない。
 fn discriminator(doc: &Document, id: NodeId) -> Option<&str> {
@@ -476,13 +697,29 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
         // 優先保持（AISNAP-12・TASK-16.4）で選ばれた行は展開のまま残し、それ以外で
         // 失われる内容のない通常行は件数を省略せず 1 行文字列へ畳む（`Node::folded_rows`）。
         // 行の選択はページネーション・送信ボタンの検出（`priority_candidates`）を含む。
+        // 行内操作要素の採用計画で表全体の優先枠を確保できない場合は圧縮を拒否する。
         let (compressible, expanded_structure) = match regular {
-            Some(s) if can_compress(doc, child, &s, &index) => (Some(s), None),
+            Some(s) if can_compress(doc, child, &s, &index) => {
+                let compressed = compress_rows(doc, &s);
+                let plans: Option<Vec<RowControlPlan>> = compressed
+                    .rows
+                    .iter()
+                    .map(|r| plan_row_controls(doc, r.row))
+                    .collect();
+                let planned = plans.filter(|_| !omitted_rows_have_controls(doc, &s, &compressed));
+                match planned {
+                    Some(mut plans) => match apply_table_budget(&mut plans) {
+                        Some(()) => (Some((s, compressed, plans)), None),
+                        None => (None, Some(s)),
+                    },
+                    None => (None, Some(s)),
+                }
+            }
             other => (None, other),
         };
         if let Some(structure) = expanded_structure {
             let fold_rows = rows_to_fold(doc, &structure, |row| {
-                subtree_has_lossy(doc, &index, row, true)
+                subtree_has_lossy(doc, &index, row, true, None)
             });
             let ids: Vec<NodeId> = fold_rows.iter().map(|&(_, id)| id).collect();
             node.folded_rows = compress_row_list(doc, structure.kind, &ids)
@@ -492,10 +729,20 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
                 .collect();
             folded.extend(ids);
         }
-        if let Some(structure) = compressible {
+        if let Some((structure, compressed, plans)) = compressible {
             let headers = assign_header_refs(doc, &index, &structure, elem_ref, &mut refs)?;
-            let compressed = compress_rows(doc, &structure);
             truncated |= headers.iter().any(|h| h.name_truncated);
+            // 保持された行の操作要素を文書順に収集する（省略行に操作要素がある表は上で圧縮を拒否済み）。
+            let mut rows = Vec::with_capacity(compressed.rows.len());
+            for (r, plan) in compressed.rows.into_iter().zip(plans.iter()) {
+                let (controls, controls_truncated) =
+                    build_row_controls(doc, &index, &mut refs, elem_ref, plan, &mut truncated)?;
+                rows.push(
+                    TableRow::new(r.text, r.truncated)
+                        .with_controls(controls)
+                        .with_controls_truncated(controls_truncated),
+                );
+            }
             node.table = Some(TableSummary::new(
                 headers
                     .into_iter()
@@ -508,11 +755,7 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
                         }
                     })
                     .collect(),
-                compressed
-                    .rows
-                    .into_iter()
-                    .map(|r| TableRow::new(r.text, r.truncated))
-                    .collect(),
+                rows,
                 compressed.truncated_rows,
             ));
             if let Some(parent) = stack.last_mut() {
@@ -531,6 +774,7 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
 
 #[cfg(test)]
 mod tests {
+    use super::{MAX_ROW_CONTROLS, MAX_TABLE_CONTROLS};
     use super::{MAX_TREE_DEPTH, build_snapshot};
     use crate::data_leaf::DataLeafKind;
     use crate::snapshot::{CheckedState, Node, Snapshot};
@@ -1074,8 +1318,11 @@ mod tests {
         assert!(!has_table_summary(&s));
     }
 
+    /// 展開経路のテスト用。`caption`（圧縮の拒否条件）を付けて圧縮を避け、リンクだけでは
+    /// 展開されなくなった（Issue #632）後も展開・畳み込みの経路を検証できるようにする。
     fn table_with_rows(total: usize, special: &[(usize, &str)]) -> String {
-        let mut html = String::from("<table><thead><tr><th>n</th></tr></thead><tbody>");
+        let mut html =
+            String::from("<table><caption>c</caption><thead><tr><th>n</th></tr></thead><tbody>");
         for i in 0..total {
             match special.iter().find(|(idx, _)| *idx == i) {
                 Some((_, cell)) => html.push_str(&format!("<tr><td>{cell}</td></tr>")),
@@ -1207,5 +1454,122 @@ mod tests {
         let nodes = all_nodes(&s.tree);
         assert_eq!(nodes.iter().filter(|n| n.role == "row").count(), 11);
         assert!(nodes.iter().all(|n| n.folded_rows.is_empty()));
+    }
+
+    /// AISNAP-12・AISNAP-13・Issue #632: 1 行に 64 件超のリンクがあっても、後ろにある
+    /// `rel="next"` リンクは行上限の中で優先保持される。
+    #[test]
+    fn aisnap_12_row_controls_keep_next_link_beyond_scan_cap() {
+        let mut cell = String::new();
+        for i in 0..70 {
+            cell.push_str(&format!("<a href=\"/p{i}\">L{i}</a>"));
+        }
+        cell.push_str("<a href=\"/next\" rel=\"next\">Next</a>");
+        let s = snap(&format!(
+            "<table><thead><tr><th>h</th></tr></thead><tbody><tr><td>{cell}</td></tr></tbody></table>"
+        ));
+        let nodes = all_nodes(&s.tree);
+        let table = nodes.iter().find_map(|n| n.table.as_ref()).expect("table");
+        let row = table.rows.first().expect("row");
+        assert_eq!(row.controls.len(), MAX_ROW_CONTROLS);
+        assert!(row.controls_truncated);
+        assert!(row.controls.iter().any(|c| c.name == "Next"));
+    }
+
+    /// AISNAP-12・AISNAP-13・Issue #632: 先行行が表全体の枠を使い切っても、後続行の
+    /// `rel="next"` リンクは優先枠で保持される。
+    #[test]
+    fn aisnap_12_table_budget_reserves_priority_for_later_rows() {
+        let mut html = String::from("<table><thead><tr><th>h</th></tr></thead><tbody>");
+        for r in 0..19 {
+            html.push_str("<tr><td>");
+            for i in 0..MAX_ROW_CONTROLS {
+                html.push_str(&format!("<a href=\"/r{r}c{i}\">R{r}C{i}</a>"));
+            }
+            html.push_str("</td></tr>");
+        }
+        html.push_str("<tr><td><a href=\"/next\" rel=\"next\">Next</a></td></tr>");
+        html.push_str("</tbody></table>");
+        let s = snap(&html);
+        let nodes = all_nodes(&s.tree);
+        let table = nodes.iter().find_map(|n| n.table.as_ref()).expect("table");
+        let last = table.rows.last().expect("last row");
+        assert_eq!(last.controls.len(), 1);
+        assert_eq!(last.controls[0].name, "Next");
+        let total: usize = table.rows.iter().map(|r| r.controls.len()).sum();
+        assert_eq!(total, MAX_TABLE_CONTROLS);
+        assert!(table.rows.iter().any(|r| r.controls_truncated));
+    }
+
+    /// AISNAP-12・Issue #632: 1 行の優先要素が行上限を超える表は、優先要素を落とさないよう
+    /// 圧縮せず展開する。
+    #[test]
+    fn aisnap_12_row_priority_over_row_cap_rejects_compression() {
+        let mut cell = String::new();
+        for i in 0..=MAX_ROW_CONTROLS {
+            cell.push_str(&format!("<a href=\"/n{i}\" rel=\"next\">Next{i}</a>"));
+        }
+        let s = snap(&format!(
+            "<table><thead><tr><th>h</th></tr></thead><tbody><tr><td>{cell}</td></tr></tbody></table>"
+        ));
+        let nodes = all_nodes(&s.tree);
+        assert!(nodes.iter().all(|n| n.table.is_none()));
+        for i in 0..=MAX_ROW_CONTROLS {
+            let name = format!("Next{i}");
+            assert!(nodes.iter().any(|n| n.name == name && n.r#ref.is_some()));
+        }
+    }
+
+    /// AISNAP-13・Issue #632: 保持上限で省略される行に操作要素がある表は圧縮せず展開し、
+    /// 21 行目以降の操作要素にも ref を発行する。
+    #[test]
+    fn aisnap_13_omitted_rows_with_controls_reject_compression() {
+        let mut html = String::from("<table><thead><tr><th>h</th></tr></thead><tbody>");
+        for r in 0..25 {
+            html.push_str(&format!("<tr><td><a href=\"/r{r}\">Row{r}</a></td></tr>"));
+        }
+        html.push_str("</tbody></table>");
+        let s = snap(&html);
+        let nodes = all_nodes(&s.tree);
+        assert!(nodes.iter().all(|n| n.table.is_none()));
+        assert!(nodes.iter().any(|n| n.name == "Row24" && n.r#ref.is_some()));
+    }
+
+    /// AISNAP-12・Issue #632: 先頭の通常リンクが枠を予約せず、優先リンク 8 件が全件残る。
+    #[test]
+    fn aisnap_12_row_priority_not_displaced_by_leading_plain_link() {
+        let mut cell = String::from("<a href=\"/plain\">Plain</a>");
+        for i in 0..MAX_ROW_CONTROLS {
+            cell.push_str(&format!("<a href=\"/n{i}\" rel=\"next\">Next{i}</a>"));
+        }
+        let s = snap(&format!(
+            "<table><thead><tr><th>h</th></tr></thead><tbody><tr><td>{cell}</td></tr></tbody></table>"
+        ));
+        let nodes = all_nodes(&s.tree);
+        let table = nodes.iter().find_map(|n| n.table.as_ref()).expect("table");
+        let row = table.rows.first().expect("row");
+        assert_eq!(row.controls.len(), MAX_ROW_CONTROLS);
+        for i in 0..MAX_ROW_CONTROLS {
+            let name = format!("Next{i}");
+            assert!(row.controls.iter().any(|c| c.name == name));
+        }
+        assert!(row.controls.iter().all(|c| c.name != "Plain"));
+        assert!(row.controls_truncated);
+    }
+
+    /// AISNAP-13・Issue #632: 非表示 tbody 内の操作要素は省略行として数えず、可視行が
+    /// 操作要素を持たなければ圧縮する。
+    #[test]
+    fn aisnap_13_hidden_rows_with_controls_do_not_block_compression() {
+        let mut html = String::from("<table><thead><tr><th>h</th></tr></thead><tbody>");
+        for r in 0..25 {
+            html.push_str(&format!("<tr><td>Row{r}</td></tr>"));
+        }
+        html.push_str(
+            "</tbody><tbody hidden><tr><td><a href=\"/x\">Hidden</a></td></tr></tbody></table>",
+        );
+        let s = snap(&html);
+        let nodes = all_nodes(&s.tree);
+        assert!(nodes.iter().any(|n| n.table.is_some()));
     }
 }

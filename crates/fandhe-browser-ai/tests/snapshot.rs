@@ -20,8 +20,8 @@
 use std::collections::HashSet;
 
 use fandhe_browser_ai::snapshot::{
-    CheckedState, DataLeafKind, HeaderCell, Node, Snapshot, State, TableRow, TableSummary,
-    build_snapshot, ref_signature,
+    CheckedState, DataLeafKind, HeaderCell, MAX_ROW_CONTROLS, MAX_TABLE_CONTROLS, Node, Snapshot,
+    State, TableRow, TableSummary, build_snapshot, ref_signature,
 };
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
 
@@ -93,10 +93,17 @@ fn assert_common(html: &str, s: &Snapshot) {
         .skip(1)
         .map(|nd| nd.r#ref.as_deref().expect("ルート以外は ref を持つ"))
         .collect();
-    // 圧縮した表のヘッダ ref も一意性の検査対象に含める（AISNAP-2・TASK-12.5）。
+    // 圧縮した表のヘッダ ref・行内操作要素の ref も一意性の検査対象に含める
+    // （AISNAP-2・TASK-12.5・Issue #632）。
     for nd in &nodes {
         if let Some(t) = &nd.table {
             refs.extend(t.header.iter().map(|h| h.r#ref.as_str()));
+            refs.extend(
+                t.rows
+                    .iter()
+                    .flat_map(|r| r.controls.iter())
+                    .map(|c| c.r#ref.as_str()),
+            );
         }
     }
     assert!(
@@ -550,20 +557,292 @@ fn collect_nodes(root: &Node) -> Vec<&Node> {
     out
 }
 
-/// AISNAP-2: 操作要素（リンク・ボタン・入力欄）を含む表・一覧は圧縮せず、ref を保持する。
+/// 圧縮された表・一覧（`Node::table` を持つノード）を先行順で返す。
+fn tables(s: &Snapshot) -> Vec<&TableSummary> {
+    collect_nodes(&s.tree)
+        .into_iter()
+        .filter_map(|n| n.table.as_ref())
+        .collect()
+}
+
+/// 先頭の圧縮表。無ければテスト失敗。
+fn first_summary(s: &Snapshot) -> &TableSummary {
+    tables(s).into_iter().next().expect("圧縮された表がある")
+}
+
+/// 圧縮された表・一覧が 1 つも無い（展開された）か。
+fn is_expanded(s: &Snapshot) -> bool {
+    tables(s).is_empty()
+}
+
+/// `(role, name, disabled)` の列。
+fn control_shapes(row: &TableRow) -> Vec<(&str, &str, bool)> {
+    row.controls
+        .iter()
+        .map(|c| (c.role.as_str(), c.name.as_str(), c.state.disabled))
+        .collect()
+}
+
+fn links_row(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("<a href=\"/p/{i}\">l{i}</a>"))
+        .collect()
+}
+
+/// AISNAP-2・AISNAP-13・Issue #632: リンク・ボタンを含む表は圧縮され、行内の操作要素が
+/// role・name・state・ref 付きで `TableRow::controls` に入る。子ノードへは展開されない。
 #[test]
-fn aisnap_2_interactive_rows_are_not_compressed() {
-    let html = r#"<body><table><thead><tr><th>名前</th><th>操作</th></tr></thead><tbody><tr><td>太郎</td><td><a href="/u/1">詳細</a> <button>削除</button></td></tr></tbody></table><ul><li><input type="checkbox" aria-label="選択"></li><li>b</li></ul></body>"#;
+fn aisnap_2_link_and_button_rows_are_compressed_with_controls() {
+    let html = r#"<body><table><thead><tr><th>名前</th><th>操作</th></tr></thead><tbody><tr><td>太郎</td><td><a href="/u/1">詳細</a> <button>削除</button></td></tr><tr><td>花子</td><td><a href="/u/2">詳細</a> <button disabled>削除</button></td></tr></tbody></table></body>"#;
     let s = snap(html);
+    assert_common(html, &s);
     let all = collect_nodes(&s.tree);
-    assert!(all.iter().all(|n| n.table.is_none()));
-    for (role, name) in [("link", "詳細"), ("button", "削除"), ("checkbox", "選択")] {
-        let n = all
-            .iter()
-            .find(|n| n.role == role && n.name == name)
-            .expect("操作要素が展開されている");
-        assert!(n.r#ref.is_some());
+    let table_node = all.iter().find(|n| n.table.is_some()).expect("圧縮表");
+    assert!(table_node.children.is_empty());
+    assert!(all.iter().all(|n| n.role != "link" && n.role != "button"));
+    let t = first_summary(&s);
+    assert_eq!(t.rows.len(), 2);
+    assert_eq!(
+        control_shapes(t.rows.first().expect("1 行目")),
+        vec![("link", "詳細", false), ("button", "削除", false)]
+    );
+    assert_eq!(
+        control_shapes(t.rows.get(1).expect("2 行目")),
+        vec![("link", "詳細", false), ("button", "削除", true)]
+    );
+    assert!(t.rows.iter().all(|r| !r.controls_truncated));
+    // 行文字列は従来どおりセル文字列で、control の ref は全て形式が正しい。
+    assert_eq!(
+        t.rows.first().map(|r| r.text.as_str()),
+        Some("太郎 | 詳細 削除")
+    );
+}
+
+/// AISNAP-2・Issue #632: `ul`・`ol` もリンクだけなら圧縮され、行内リンクが control になる。
+#[test]
+fn aisnap_2_link_lists_are_compressed_with_controls() {
+    let html = r#"<body><ul><li><a href="/a">記事A</a></li><li><a href="/b">記事B</a></li></ul><ol><li><a href="/c">記事C</a></li><li>プレーン</li></ol></body>"#;
+    let s = snap(html);
+    assert_common(html, &s);
+    let ts = tables(&s);
+    assert_eq!(ts.len(), 2);
+    let ul = ts.first().expect("ul");
+    assert_eq!(
+        ul.rows.iter().flat_map(control_shapes).collect::<Vec<_>>(),
+        vec![("link", "記事A", false), ("link", "記事B", false)]
+    );
+    let ol = ts.get(1).expect("ol");
+    assert_eq!(
+        control_shapes(ol.rows.first().expect("1 行目")),
+        vec![("link", "記事C", false)]
+    );
+    assert!(ol.rows.get(1).is_some_and(|r| r.controls.is_empty()));
+}
+
+/// AISNAP-2・Issue #632: `input` を含む一覧は従来どおり展開され、ref を持つ。
+#[test]
+fn aisnap_2_input_rows_are_not_compressed() {
+    let html =
+        r#"<body><ul><li><input type="checkbox" aria-label="選択"></li><li>b</li></ul></body>"#;
+    let s = snap(html);
+    assert!(is_expanded(&s));
+    let all = collect_nodes(&s.tree);
+    let cb = all
+        .iter()
+        .find(|n| n.role == "checkbox" && n.name == "選択")
+        .expect("操作要素が展開されている");
+    assert!(cb.r#ref.is_some());
+}
+
+/// AISNAP-13・Issue #632: 同一セル内の複数リンクは先頭 1 件に絞らず、全件を文書順で保持する。
+#[test]
+fn aisnap_13_multiple_links_in_one_cell_are_all_kept_in_order() {
+    let html = r#"<body><table><thead><tr><th>タグ</th></tr></thead><tbody><tr><td><a href="/t/1">一</a> <a href="/t/2">二</a> <a href="/t/3">三</a></td></tr><tr><td>x</td></tr></tbody></table></body>"#;
+    let s = snap(html);
+    let t = first_summary(&s);
+    let row = t.rows.first().expect("1 行目");
+    assert_eq!(
+        control_shapes(row),
+        vec![
+            ("link", "一", false),
+            ("link", "二", false),
+            ("link", "三", false)
+        ]
+    );
+    assert!(!row.controls_truncated);
+    assert!(
+        t.rows
+            .get(1)
+            .is_some_and(|r| r.controls.is_empty() && !r.controls_truncated)
+    );
+}
+
+/// AISNAP-10・Issue #632: 行内 control の ref は、同名でも href が違えば別、同名・同 href でも
+/// 出現順で別になり、2 回構築で一致し、表外へのバナー挿入で変わらない。
+#[test]
+fn aisnap_10_row_control_refs_are_unique_and_stable() {
+    let table = r#"<table><thead><tr><th>n</th></tr></thead><tbody><tr><td><a href="/x">詳細</a> <a href="/y">詳細</a> <a href="/x">詳細</a></td></tr></tbody></table>"#;
+    let html = format!("<body>{table}</body>");
+    let s = snap(&html);
+    assert_common(&html, &s);
+    let refs: Vec<&str> = first_summary(&s)
+        .rows
+        .iter()
+        .flat_map(|r| r.controls.iter())
+        .map(|c| c.r#ref.as_str())
+        .collect();
+    assert_eq!(refs.len(), 3);
+    let uniq: HashSet<&str> = refs.iter().copied().collect();
+    assert_eq!(uniq.len(), 3, "{refs:?}");
+    let bannered = snap(&format!("<body><div>お知らせ</div>{table}</body>"));
+    let refs_after: Vec<&str> = first_summary(&bannered)
+        .rows
+        .iter()
+        .flat_map(|r| r.controls.iter())
+        .map(|c| c.r#ref.as_str())
+        .collect();
+    // 兄弟が増えても表（scope）の ref は変わらないため control の ref も変わらない。
+    assert_eq!(refs, refs_after);
+}
+
+/// AISNAP-10・Issue #632: 行内 control の ref のリテラル固定（ハッシュ・scope 規則の回帰検出）。
+#[test]
+fn aisnap_10_row_control_ref_literal_is_pinned() {
+    let html = r#"<body><ul><li><a href="/a">記事A</a></li><li>b</li></ul></body>"#;
+    let s = snap(html);
+    let c = first_summary(&s)
+        .rows
+        .first()
+        .and_then(|r| r.controls.first())
+        .expect("control がある");
+    assert_eq!(c.r#ref, "eca61c2b53fd46633");
+}
+
+/// AISNAP-2・Issue #632: 維持される拒否条件（ref・name・分類を失う構造）では、従来どおり
+/// 圧縮せず展開し、対象ノードが ref 付きで残る。
+#[test]
+fn aisnap_2_lossy_structures_with_links_stay_expanded() {
+    let wrap = |cell: &str| {
+        format!(
+            "<body><table><thead><tr><th>n</th></tr></thead><tbody><tr><td>{cell}</td></tr><tr><td>b</td></tr></tbody></table></body>"
+        )
+    };
+    let cases: Vec<(&str, String)> = vec![
+        ("caption", "<body><table><caption>表題</caption><thead><tr><th>n</th></tr></thead><tbody><tr><td><a href=\"/a\">A</a></td></tr><tr><td>b</td></tr></tbody></table></body>".to_string()),
+        ("tfoot", "<body><table><thead><tr><th>n</th></tr></thead><tbody><tr><td><a href=\"/a\">A</a></td></tr></tbody><tfoot><tr><td>合計</td></tr></tfoot></table></body>".to_string()),
+        ("heading", wrap("<h3>見出し</h3><a href=\"/a\">A</a>")),
+        ("img alt", wrap("<a href=\"/a\">A</a><img src=\"/i.png\" alt=\"画像\">")),
+        ("aria-label", wrap("<a href=\"/a\" aria-label=\"ラベル\">A</a>")),
+        ("aria-labelledby", wrap("<a href=\"/a\" aria-labelledby=\"x\">A</a>")),
+        ("title only", wrap("<a href=\"/a\" title=\"題名\"></a>")),
+        ("price leaf", wrap("<span class=\"price\">1</span><a href=\"/a\">A</a>")),
+        ("input", wrap("<input type=\"text\" aria-label=\"入力\"><a href=\"/a\">A</a>")),
+        ("select", wrap("<select aria-label=\"選択\"></select><a href=\"/a\">A</a>")),
+        ("textarea", wrap("<textarea aria-label=\"本文\"></textarea><a href=\"/a\">A</a>")),
+        ("tabindex", wrap("<a href=\"/a\" tabindex=\"0\">A</a>")),
+        ("onclick", wrap("<button onclick=\"f()\">B</button>")),
+        ("role", wrap("<a href=\"/a\" role=\"tab\">A</a>")),
+        ("header link", "<body><table><thead><tr><th><a href=\"/sort\">名前</a></th></tr></thead><tbody><tr><td>a</td></tr><tr><td>b</td></tr></tbody></table></body>".to_string()),
+    ];
+    for (label, html) in cases {
+        let s = snap(&html);
+        assert!(is_expanded(&s), "{label} は展開される");
+        // 展開された操作要素（リンク・ボタン）は ref を持つ。
+        assert!(
+            collect_nodes(&s.tree)
+                .iter()
+                .filter(|n| n.role == "link" || n.role == "button")
+                .all(|n| n.r#ref.is_some()),
+            "{label}"
+        );
     }
+}
+
+/// AISNAP-13・AISNAP-12・Issue #632: 行あたり上限を超えると `MAX_ROW_CONTROLS` 件に絞り
+/// `controls_truncated` を立てる。超過行末尾のページネーションリンクは優先して残す。
+#[test]
+fn aisnap_13_row_control_cap_keeps_pagination_and_flags_truncation() {
+    let over = MAX_ROW_CONTROLS + 1;
+    let cell = format!(
+        "{}<a href=\"/next\" rel=\"next\">Next</a>",
+        links_row(MAX_ROW_CONTROLS)
+    );
+    let html = format!(
+        "<body><table><thead><tr><th>n</th></tr></thead><tbody><tr><td>{cell}</td></tr><tr><td>{}</td></tr></tbody></table></body>",
+        links_row(MAX_ROW_CONTROLS)
+    );
+    let s = snap(&html);
+    assert_common(&html, &s);
+    let t = first_summary(&s);
+    let row = t.rows.first().expect("1 行目");
+    assert_eq!(over, MAX_ROW_CONTROLS + 1);
+    assert_eq!(row.controls.len(), MAX_ROW_CONTROLS);
+    assert!(row.controls_truncated);
+    let names: Vec<&str> = row.controls.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names.last(), Some(&"Next"));
+    assert_eq!(names.first(), Some(&"l0"));
+    // 上限ちょうどの行は省略なし。
+    let exact = t.rows.get(1).expect("2 行目");
+    assert_eq!(exact.controls.len(), MAX_ROW_CONTROLS);
+    assert!(!exact.controls_truncated);
+}
+
+/// AISNAP-13・Issue #632: コンテナ全体の上限を超える表では合計が上限に等しく、超過した行の
+/// フラグが立つ。上限までに収まった行は立たない。
+#[test]
+fn aisnap_13_table_control_cap_flags_rows_beyond_budget() {
+    let rows: String = (0..20)
+        .map(|_| format!("<tr><td>{}</td></tr>", links_row(MAX_ROW_CONTROLS)))
+        .collect();
+    let html = format!(
+        "<body><table><thead><tr><th>n</th></tr></thead><tbody>{rows}</tbody></table></body>"
+    );
+    let s = snap(&html);
+    assert_common(&html, &s);
+    let t = first_summary(&s);
+    let total: usize = t.rows.iter().map(|r| r.controls.len()).sum();
+    assert_eq!(total, MAX_TABLE_CONTROLS);
+    let full = MAX_TABLE_CONTROLS / MAX_ROW_CONTROLS;
+    for (i, r) in t.rows.iter().enumerate() {
+        if i < full {
+            assert_eq!(r.controls.len(), MAX_ROW_CONTROLS, "行 {i}");
+            assert!(!r.controls_truncated, "行 {i}");
+        } else {
+            assert!(r.controls.is_empty(), "行 {i}");
+            assert!(r.controls_truncated, "行 {i}");
+        }
+    }
+}
+
+/// AISNAP-12・Issue #632: 20 行超の表で、キャップ外のページネーション行も圧縮行として残り、
+/// その control が ref を持つ。省略行の分は保持しない。
+#[test]
+fn aisnap_12_pagination_row_beyond_cap_keeps_control_with_ref() {
+    let rows: String = (0..40)
+        .map(|i| {
+            if i == 30 {
+                "<tr><td><a href=\"/next\" rel=\"next\">Next</a></td></tr>".to_string()
+            } else {
+                format!("<tr><td>row{i}</td></tr>")
+            }
+        })
+        .collect();
+    let html = format!(
+        "<body><table><thead><tr><th>n</th></tr></thead><tbody>{rows}</tbody></table></body>"
+    );
+    let s = snap(&html);
+    assert_common(&html, &s);
+    let t = first_summary(&s);
+    assert_eq!(t.rows.len(), 20);
+    assert_eq!(t.truncated_rows, 20);
+    let nexts: Vec<_> = t
+        .rows
+        .iter()
+        .flat_map(|r| r.controls.iter())
+        .filter(|c| c.name == "Next")
+        .collect();
+    assert_eq!(nexts.len(), 1);
+    assert!(nexts.iter().all(|c| c.r#ref.starts_with('e')));
 }
 
 /// AISNAP-2: tfoot を持つ表は圧縮せず、フッターの可視情報を保持する。
