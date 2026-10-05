@@ -37,6 +37,39 @@ fn is_css_whitespace(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0C}')
 }
 
+/// CSS 識別子の先頭以外に使える文字（英数字・`-`・`_`・非 ASCII）。
+/// 非 ASCII は CSS Syntax の ident code point（U+0080 以上）に従い許可する。
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii()
+}
+
+/// 識別子の開始文字（英字・`_`・非 ASCII。数字と単独の `-` は不可）。
+fn is_ident_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_' || !c.is_ascii()
+}
+
+/// property 名が CSS 識別子の規則を満たすか。`--x`（カスタムプロパティ）と
+/// `-webkit-x` 形式は許可し、`1color`・`-`・`--`・`-1a` は不可とする。
+fn is_valid_property_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let rest = if first == '-' {
+        match chars.next() {
+            // `--` 単独は予約で不可。`--x` は以降を ident 文字で検証する。
+            Some('-') => return name.len() > 2 && chars.all(is_ident_char),
+            Some(second) if is_ident_start(second) => chars,
+            _ => return false,
+        }
+    } else if is_ident_start(first) {
+        chars
+    } else {
+        return false;
+    };
+    rest.into_iter().all(is_ident_char)
+}
+
 fn trim_css(s: &str) -> &str {
     s.trim_matches(is_css_whitespace)
 }
@@ -87,7 +120,11 @@ pub fn parse_declarations(input: &str) -> Result<Vec<Declaration>> {
                     }
                     prev = n;
                 }
-                cur.push(' ');
+                // property 名側はトークンを分断せず単に除去する（`col/*x*/or` は `color`）。
+                // 値側は `a/**/b` が 1 語に融合しないよう空白 1 つへ置換する。
+                if cur.in_value {
+                    cur.push(' ');
+                }
             }
             '\\' => {
                 cur.push(c);
@@ -146,11 +183,7 @@ impl Current {
             return Ok(());
         }
         let property = trim_css(&self.property);
-        let valid_name = !property.is_empty()
-            && property
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii());
-        if !valid_name {
+        if !is_valid_property_name(property) {
             return Ok(());
         }
 
@@ -281,6 +314,26 @@ mod tests {
         assert_eq!(pairs(": red; margin: 0"), want);
         assert_eq!(pairs("color:; margin: 0"), want);
         assert_eq!(pairs("*zoom: 1; margin: 0"), want);
+    }
+
+    #[test]
+    fn core_5_comment_does_not_split_property_name() {
+        assert_eq!(pairs("col/*x*/or: red"), vec![n("color", "red")]);
+        assert_eq!(pairs("color/*x*/: red"), vec![n("color", "red")]);
+        assert_eq!(pairs("color: re/**/d"), vec![n("color", "re d")]);
+    }
+
+    #[test]
+    fn core_5_property_name_follows_ident_rules() {
+        let want = vec![n("margin", "0")];
+        assert_eq!(pairs("1color: red; margin: 0"), want);
+        assert_eq!(pairs("-: red; margin: 0"), want);
+        assert_eq!(pairs("--: red; margin: 0"), want);
+        assert_eq!(pairs("-1a: red; margin: 0"), want);
+        assert_eq!(pairs("a!b: red; margin: 0"), want);
+        assert_eq!(pairs("-webkit-x: 1"), vec![n("-webkit-x", "1")]);
+        assert_eq!(pairs("_a1: 1"), vec![n("_a1", "1")]);
+        assert_eq!(pairs("--1: 1"), vec![n("--1", "1")]);
     }
 
     #[test]
