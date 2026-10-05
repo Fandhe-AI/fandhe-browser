@@ -145,3 +145,14 @@ export function validateJsonl(text) {
   });
   return problems;
 }
+
+/**
+ * 収集結果を成果物として保存してよいか判定する（CDP-2・TASK-43.1、REPAIR-3）。
+ * trace.mjs の書き込み直前から呼ばれる。接続に一度も成功していない、または CDP メッセージが
+ * 0 件のトレースは正常な収集結果ではないため、理由付きで不成立を返す（fail-closed）。
+ */
+export function checkCollection({ connected, cdpCount }) {
+  if (!connected) return { ok: false, reason: "no CDP connection succeeded" };
+  if (cdpCount === 0) return { ok: false, reason: "no CDP messages were captured (pw:protocol output missing?)" };
+  return { ok: true, reason: null };
+}

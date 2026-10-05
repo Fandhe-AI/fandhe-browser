@@ -30,4 +30,22 @@ expect_exit2 "missing endpoint is rejected" --out /dev/null
 expect_exit2 "option-like out path is rejected" --endpoint http://127.0.0.1:9333 --out -x
 expect_exit2 "missing module-dir is rejected" --endpoint http://127.0.0.1:9333 --out /nonexistent-dir/x.jsonl
 expect_exit2 "unknown argument is rejected" --bogus
+
+# 接続に全失敗した場合は JSONL を書かず exit 1 すること（CDP-2・fail-closed）。
+# 偽の playwright-core（常に connectOverCDP が reject）と、閉じたポートを使う。
+FAKE_DIR="$(mktemp -d)"
+trap 'rm -rf "$FAKE_DIR"' EXIT
+mkdir -p "$FAKE_DIR/node_modules/playwright-core"
+cat >"$FAKE_DIR/node_modules/playwright-core/index.js" <<'JS'
+exports.chromium = { connectOverCDP: async () => { throw new Error("connect refused"); } };
+JS
+status=0
+node "$SCRIPT_DIR/trace.mjs" --endpoint http://127.0.0.1:9 --out "$FAKE_DIR/out.jsonl" \
+  --module-dir "$FAKE_DIR" --playwright-version 0.0.0 >/dev/null 2>"$FAKE_DIR/err.txt" || status=$?
+if [ "$status" -ne 1 ] || [ -e "$FAKE_DIR/out.jsonl" ]; then
+  echo "FAIL: all-connections-failed must exit 1 without output (got $status)" >&2
+  exit 1
+fi
+grep -q "no CDP connection succeeded" "$FAKE_DIR/err.txt" || { echo "FAIL: missing error message" >&2; exit 1; }
+echo "ok: failed connections exit 1 without writing a trace"
 echo "playwright-trace self-test: all passed"

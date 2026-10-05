@@ -14,6 +14,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
   SCHEMA_VERSION,
+  checkCollection,
   drainLines,
   MAX_RECORDS,
   normalizeString,
@@ -173,6 +174,13 @@ if (browser) {
   }
   await Promise.race([browser.close().catch(() => {}), new Promise((r) => setTimeout(r, 2000))]);
 }
+
+// 接続失敗・CDP 0 件は収集失敗。成功扱いの JSONL を残さず非 0 終了する。
+const verdict = checkCollection({
+  connected: Boolean(browser),
+  cdpCount: records.filter((r) => r.kind === "cdp").length,
+});
+if (!verdict.ok) fatal(verdict.reason);
 
 writeFileSync(args.out, toJsonl(records), { flag: args.force ? "w" : "wx" });
 process.stderr.write = origWrite;

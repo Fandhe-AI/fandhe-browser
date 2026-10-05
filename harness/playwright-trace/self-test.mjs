@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import assert from "node:assert/strict";
 import {
+  checkCollection,
   normalizeString,
   normalizeValue,
   parseProtocolLine,
@@ -102,6 +103,12 @@ t("validateJsonl reports violations", () => {
   assert.notDeepEqual(validateJsonl('{"seq":0,"kind":"cdp","dir":"x","message":{}}\n'), []);
   assert.notDeepEqual(validateJsonl("not json\n"), []);
   assert.notDeepEqual(validateJsonl('{"seq":0,"kind":"meta"}'), []);
+});
+
+t("checkCollection rejects failed connections and empty traces", () => {
+  assert.deepEqual(checkCollection({ connected: false, cdpCount: 5 }), { ok: false, reason: "no CDP connection succeeded" });
+  assert.equal(checkCollection({ connected: true, cdpCount: 0 }).ok, false);
+  assert.deepEqual(checkCollection({ connected: true, cdpCount: 1 }), { ok: true, reason: null });
 });
 
 t("committed trace conforms to schema", () => {
