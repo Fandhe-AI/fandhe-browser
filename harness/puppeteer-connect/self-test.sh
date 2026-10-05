@@ -13,6 +13,7 @@ fi
 
 node --check "$SCRIPT_DIR/connect.mjs"
 node --check "$SCRIPT_DIR/stages.mjs"
+node --check "$SCRIPT_DIR/contract-sample.mjs"
 node "$SCRIPT_DIR/self-test.mjs"
 
 # 非 loopback エンドポイントは puppeteer 読み込み前に結果行つきで exit 1 になること。

@@ -14,7 +14,8 @@
 //!   `[{"name": string, "status": "ok" | "failed" | "not_reached", "error": {...} | null}]`。
 //!   無ければ空として扱う（後方互換）。件数は [`MAX_STAGES`]、名前長は
 //!   [`MAX_STAGE_NAME_BYTES`] が上限で、整合性（`failed` は error 必須・`ok` 後続の矛盾・
-//!   トップレベル `ok: true` との不一致）を検証し、違反は `Malformed` にする。
+//!   トップレベル `ok: true` との不一致・`ok: false` なのに失敗段階が無い矛盾・`step` が最初の
+//!   失敗段階名と異なる矛盾）を検証し、違反は `Malformed` にする。
 //!
 //! # 安全性
 //! 子プロセスは締め切りで kill し、stderr は末尾のみ・stdout は結果行のみを上限付きで保持し、
@@ -462,6 +463,16 @@ pub fn parse_result_line(stdout: &[u8]) -> Result<Option<ScriptOutcome>, String>
     let stages = parse_stages(json.get("stages"))?;
     if ok && stages.iter().any(|s| s.status != StageStatus::Ok) {
         return Err("`ok` is true but a stage did not succeed".to_string());
+    }
+    // トップレベルと段階の相互整合（偽陽性防止）。`stages` 未報告（空）は検証対象外。
+    if !ok && !stages.is_empty() {
+        match stages.iter().find(|s| s.status == StageStatus::Failed) {
+            None => return Err("`ok` is false but no stage failed".to_string()),
+            Some(f) if f.name != step => {
+                return Err("`step` does not match the first failed stage".to_string());
+            }
+            Some(_) => {}
+        }
     }
     Ok(Some(ScriptOutcome::Completed {
         ok,
