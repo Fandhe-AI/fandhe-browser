@@ -98,6 +98,12 @@ const stopCapture = () => {
   }
 };
 process.stderr.write = (chunk, ...rest) => {
+  const cb0 = rest.find((x) => typeof x === "function");
+  // 収集終了後（browser.close 中など）のログは解析も保持もせず破棄する。
+  if (!capturing) {
+    if (cb0) cb0();
+    return true;
+  }
   let lines;
   try {
     ({ lines, rest: pending } = drainLines(pending, chunk.toString()));

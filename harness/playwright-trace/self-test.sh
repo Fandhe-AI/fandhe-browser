@@ -98,4 +98,23 @@ if ls "$FAKE_DIR"/out4.jsonl.tmp-* >/dev/null 2>&1; then
   exit 1
 fi
 echo "ok: --force replaces the trace without leaving temporary files"
+
+# 収集終了後（browser.close 中）の解析不能な protocol 行では失敗せず、取得済みトレースを保存すること。
+cat >"$FAKE_DIR/node_modules/playwright-core/index.js" <<'JS'
+exports.chromium = { connectOverCDP: async () => {
+  process.stderr.write('t pw:protocol SEND \u25ba {"id":1,"method":"A.b"}\n');
+  return {
+    newContext: async () => ({ newPage: async () => ({}) }),
+    close: async () => { process.stderr.write("t pw:protocol SENT garbage\n"); },
+  };
+} };
+JS
+status=0
+node "$SCRIPT_DIR/trace.mjs" --endpoint http://127.0.0.1:9 --out "$FAKE_DIR/out5.jsonl" \
+  --module-dir "$FAKE_DIR" --playwright-version 0.0.0 >/dev/null 2>&1 || status=$?
+if [ "$status" -ne 0 ] || ! grep -q '"method":"A.b"' "$FAKE_DIR/out5.jsonl"; then
+  echo "FAIL: post-capture garbage must not fail the run (got $status)" >&2
+  exit 1
+fi
+echo "ok: protocol lines after capture stops are discarded"
 echo "playwright-trace self-test: all passed"
