@@ -318,3 +318,22 @@ fn cdp3_result_line_requires_valid_utf8() {
         }))
     );
 }
+
+/// CDP-3: 起動引数は cwd 基準のファイル名のみ（相対 `harness_dir` でも二重 join しない）。
+#[test]
+fn cdp3_preflight_script_arg_is_cwd_relative_file_name() {
+    let dir = TempDir::new();
+    let pkg = dir.0.join("node_modules").join("puppeteer-core");
+    std::fs::create_dir_all(&pkg).expect("mkdir");
+    std::fs::write(pkg.join("package.json"), b"{}").expect("write");
+    match preflight_puppeteer(&dir.0) {
+        Ok(cmd) => {
+            assert_eq!(cmd.args, vec!["connect.mjs".to_string()]);
+            assert_eq!(cmd.cwd, Some(dir.0.clone()));
+        }
+        // node 未導入の環境では起動コマンドを作らない（引数の検証対象外）。
+        Err(HarnessError::ToolUnavailable { reason, .. }) => {
+            assert_eq!(reason, "node executable was not found");
+        }
+    }
+}

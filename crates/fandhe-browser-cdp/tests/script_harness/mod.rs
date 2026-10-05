@@ -554,12 +554,9 @@ pub fn preflight_puppeteer(harness_dir: &Path) -> Result<ScriptCommand, HarnessE
     }
     Ok(ScriptCommand {
         program: PathBuf::from("node"),
-        args: vec![
-            harness_dir
-                .join("connect.mjs")
-                .to_string_lossy()
-                .into_owned(),
-        ],
+        // cwd に `harness_dir` を設定するため、引数はファイル名のみ（相対 `harness_dir` で
+        // 二重に join されて解決できなくなるのを防ぐ）。
+        args: vec!["connect.mjs".to_string()],
         envs: Vec::new(),
         cwd: Some(harness_dir.to_path_buf()),
     })
