@@ -17,18 +17,19 @@
 //!
 //! 1. フィクスチャの DOM に PoC セレクタの一致要素が 1 件以上ある
 //! 2. snapshot を先行順に平坦化した列に、期待シグネチャ（role・name・`data_leaf`）へ一致し、
-//!    かつ ref のダイジェストが「DOM 先頭一致要素から再計算した ref ダイジェスト」と一致する
+//!    かつ ref のダイジェストと出現番号が「DOM 先頭一致要素から再計算した ref」と一致する
 //!    エントリがある（DOM 要素と snapshot エントリの同一性。下記）
 //! 3. 先頭の一致エントリが空でない ref を持つ
 //!
 //! # 同一性の検証（`AISNAP-10`）
 //!
 //! snapshot は NodeId を公開しないため、DOM 先頭一致要素の祖先鎖から `build_snapshot` と同じ規則
-//! （role・name・識別属性・親 ref スコープ）で ref ダイジェストを再計算し、エントリの ref と突き合わせる。
-//! これで「対象が snapshot から消えても別要素が同じ role・name を持てば Identified になる」誤判定を
-//! 防ぐ。ref の出現番号（`-n`）は snapshot 側の除外・圧縮に依存し DOM から再現できないため、
-//! 同じ親・同じシグネチャの兄弟どうし（識別属性なし）はこの方式でも区別できない（ref 設計上も
-//! 出現番号でしか区別されない同一シグネチャ要素）。
+//! （role・name・識別属性・親 ref スコープ）で ref ダイジェストを再計算し、さらに文書順で先行する
+//! 同一ダイジェスト要素の数から出現番号（`-n`）を求めて、エントリの ref と突き合わせる。
+//! これで「対象が snapshot から消えても別要素（兄弟を含む）が同じ role・name を持てば
+//! Identified になる」誤判定を防ぐ。出現番号は DOM のみから再現するため、`build_snapshot` が
+//! 省略する要素（hidden・圧縮等）が先行すると実番号とずれうるが、その場合は一致しない側
+//! （NotIdentified）へ倒れる（fail-closed）。
 //!
 //! 「対象を判別できる」ことと「値を読める」ことは別である。たとえば価格（`p.price_color`）は
 //! `data_leaf = PriceClass` と ref で判別できるが、role `generic`・name 空で価格文字列は
@@ -255,10 +256,22 @@ pub fn flatten(root: &Node) -> Vec<FlatEntry> {
     out
 }
 
-/// `ref` 文字列（`e<16hex>[v<n>][-<n>]`）の先頭 16 桁 16 進ダイジェストを取り出す。
-fn ref_digest(r: &str) -> Option<u64> {
-    let hex = r.strip_prefix('e')?.get(..16)?;
-    u64::from_str_radix(hex, 16).ok()
+/// `ref` 文字列（`e<16hex>[v<n>][-<n>]`）をダイジェストと出現番号（無印は 1）へ分解する。
+/// 形式に合わない文字列は `None`（同一性を確認できないため一致扱いにしない）。
+fn parse_ref(r: &str) -> Option<(u64, u32)> {
+    let rest = r.strip_prefix('e')?;
+    let digest = u64::from_str_radix(rest.get(..16)?, 16).ok()?;
+    let mut tail = rest.get(16..)?;
+    if let Some(v) = tail.strip_prefix('v') {
+        let end = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
+        v.get(..end)?.parse::<u32>().ok()?;
+        tail = v.get(end..)?;
+    }
+    match tail.strip_prefix('-') {
+        None if tail.is_empty() => Some((digest, 1)),
+        Some(n) => Some((digest, n.parse().ok()?)),
+        None => None,
+    }
 }
 
 /// `build_snapshot` の `discriminator`（`id` → フォーム部品の `name` → `a`/`area` の `href`）と同じ規則。
@@ -301,30 +314,65 @@ fn chain_ref(doc: &Document, index: &NameIndex<'_>, id: NodeId) -> Option<Elemen
     scope
 }
 
-/// DOM 要素 `id` に対応しうる snapshot ref ダイジェストの集合を返す。
-/// 通常要素は祖先鎖の ref。表のヘッダセルは圧縮経路が表 ref 直下のスコープで
-/// 発行する（`id` 属性のみを識別属性とする）ため、その分も含める。空は snapshot へ入らない要素。
-pub fn target_digests(doc: &Document, id: NodeId) -> Vec<u64> {
+/// 文書順で `id` より前にある要素のうち、`same` を満たすものの数を返す。
+/// `build_snapshot` は同じダイジェストの要素へ先行順に出現番号を振るため、
+/// 「先行する同一シグネチャ要素の数 + 1」が対象の出現番号になる。
+fn preceding_count(doc: &Document, id: NodeId, same: impl Fn(NodeId) -> bool) -> u32 {
+    let mut n: u32 = 0;
+    for e in doc.descendants(doc.root()) {
+        if e == id {
+            break;
+        }
+        if doc.is_element(e) && same(e) {
+            n = n.saturating_add(1);
+        }
+    }
+    n
+}
+
+/// DOM 要素 `id` に対応しうる snapshot ref の（ダイジェスト, 出現番号）の集合を返す。
+/// 通常要素は祖先鎖の ref と、先行する同一ダイジェスト要素数から求めた出現番号。
+/// 表のヘッダセルは圧縮経路が表 ref 直下のスコープで発行する（`id` 属性のみを
+/// 識別属性とする）ため、その分も含める。空は snapshot へ入らない要素。
+///
+/// 出現番号は DOM のみから再現するため、`build_snapshot` が省略する要素（hidden・
+/// 深さ超過・圧縮）が先行すると実際の番号とずれうる。ずれた場合は一致しない側
+/// （`NotIdentified`）へ倒れ、別要素を誤って `Identified` にすることはない（fail-closed）。
+pub fn target_refs(doc: &Document, id: NodeId) -> Vec<(u64, u32)> {
     let index = NameIndex::build(doc);
     let mut out = Vec::new();
     if let Some(r) = chain_ref(doc, &index, id) {
-        out.push(r.digest);
+        let role = compute_role(doc, id);
+        let before = preceding_count(doc, id, |e| {
+            compute_role(doc, e) == role
+                && chain_ref(doc, &index, e).is_some_and(|c| c.digest == r.digest)
+        });
+        out.push((r.digest, before.saturating_add(1)));
     }
     if matches!(doc.local_name(id), Some("th" | "td"))
         && let Some(table) = doc
             .ancestors(id)
             .find(|&a| doc.local_name(a) == Some("table"))
         && let Some(table_ref) = chain_ref(doc, &index, table)
-        && let Some(role) = compute_role(doc, id)
     {
-        let name = compute_name_with_index(doc, &index, id);
-        let mut sig = ElementSignature::new(role.as_str(), &name.text);
-        if let Some(d) = doc.attribute(id, "id").filter(|s| !s.is_empty()) {
-            sig = sig.with_discriminator(d);
-        }
-        sig = sig.with_scope(table_ref);
-        if let Ok(r) = RefAllocator::new().allocate_signature(&sig) {
-            out.push(r.digest);
+        let scoped = |e: NodeId| -> Option<u64> {
+            let role = compute_role(doc, e)?;
+            let name = compute_name_with_index(doc, &index, e);
+            let mut sig = ElementSignature::new(role.as_str(), &name.text);
+            if let Some(d) = doc.attribute(e, "id").filter(|s| !s.is_empty()) {
+                sig = sig.with_discriminator(d);
+            }
+            sig = sig.with_scope(table_ref);
+            RefAllocator::new()
+                .allocate_signature(&sig)
+                .ok()
+                .map(|r| r.digest)
+        };
+        if let Some(d) = scoped(id) {
+            let before = preceding_count(doc, id, |e| {
+                matches!(doc.local_name(e), Some("th" | "td")) && scoped(e) == Some(d)
+            });
+            out.push((d, before.saturating_add(1)));
         }
     }
     out
@@ -332,15 +380,16 @@ pub fn target_digests(doc: &Document, id: NodeId) -> Vec<u64> {
 
 /// 平坦化済みエントリから期待シグネチャへの一致を数え、判別結果を決める。
 ///
-/// `target_digests` は DOM 先頭一致要素から再計算した ref ダイジェスト（[`target_digests`]）。
-/// ref を持つエントリは、シグネチャに加えて ref のダイジェストがこの集合に含まれる場合だけ
-/// 一致とする（DOM 要素と snapshot エントリの同一性）。ref を持たないエントリは同一性を
+/// `target_refs` は DOM 先頭一致要素から再計算した ref の（ダイジェスト, 出現番号）
+/// （[`target_refs`]）。ref を持つエントリは、シグネチャに加えて ref のダイジェストと
+/// 出現番号の組がこの集合に含まれる場合だけ一致とする（同じ親・同じシグネチャの兄弟を
+/// 出現番号で区別する）（DOM 要素と snapshot エントリの同一性）。ref を持たないエントリは同一性を
 /// 検証できないため、原因を `MatchWithoutRef` として報告できるようシグネチャ一致のみで残す。
 pub fn judge(
     task: &Task,
     dom_matches: usize,
     dom_text: Option<&str>,
-    target_digests: &[u64],
+    target_refs: &[(u64, u32)],
     entries: &[FlatEntry],
     snapshot_truncated: bool,
 ) -> TaskCheck {
@@ -355,7 +404,7 @@ pub fn judge(
         .filter(|e| task.data_leaf.is_none_or(|k| e.data_leaf == Some(k)))
         .filter(|e| match e.r#ref.as_deref() {
             None | Some("") => true,
-            Some(r) => ref_digest(r).is_some_and(|d| target_digests.contains(&d)),
+            Some(r) => parse_ref(r).is_some_and(|p| target_refs.contains(&p)),
         })
         .collect();
     let first = matches.first();
@@ -417,15 +466,15 @@ pub fn run_retention_checks(dir: &Path) -> Result<Vec<TaskCheck>, RetentionCheck
         let snapshot =
             build_snapshot(doc).map_err(|e| RetentionCheckError::Snapshot(e.to_string()))?;
         let entries = flatten(&snapshot.tree);
-        let digests = found
+        let target = found
             .first()
-            .map(|id| target_digests(doc, *id))
+            .map(|id| target_refs(doc, *id))
             .unwrap_or_default();
         out.push(judge(
             task,
             found.len(),
             dom_text.as_deref(),
-            &digests,
+            &target,
             &entries,
             snapshot.truncated,
         ));

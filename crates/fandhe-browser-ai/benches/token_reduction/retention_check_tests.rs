@@ -55,7 +55,7 @@ const EXPECTED: [Expected; 7] = [
     (
         "price-first",
         20,
-        20,
+        1,
         "eebd41136ac2ff69e-6",
         Some(DataLeafKind::PriceClass),
         "",
@@ -97,7 +97,7 @@ const EXPECTED: [Expected; 7] = [
         "Compass pattern beta anchor lantern sigma ribbon",
         true,
     ),
-    ("checkbox-first", 2, 2, "e91f35187869ba882", None, "", false),
+    ("checkbox-first", 2, 1, "e91f35187869ba882", None, "", false),
 ];
 
 #[test]
@@ -162,15 +162,37 @@ fn aisnap_3_same_signature_other_element_is_not_identified() {
         .iter()
         .find(|t| t.id == "dropdown-select")
         .expect("task");
-    let c = judge(task, 1, None, &[0x2], &flatten(&root), false);
+    let c = judge(task, 1, None, &[(0x2, 1)], &flatten(&root), false);
     assert_eq!(
         c.verdict,
         Verdict::NotIdentified {
             reason: NotIdentifiedReason::NoMatchingNode
         }
     );
-    let ok = judge(task, 1, None, &[0x1], &flatten(&root), false);
+    let ok = judge(task, 1, None, &[(0x1, 1)], &flatten(&root), false);
     assert_eq!(ok.verdict, ident("e0000000000000001"));
+}
+
+/// 同一性検証: ダイジェストが同じでも出現番号が異なる兄弟（`-2`）は対象（出現番号 1）と
+/// 区別し、Identified にしない（先頭要素が消えて兄弟だけが残るケース）。
+#[test]
+fn aisnap_3_same_digest_different_occurrence_is_not_identified() {
+    let task = TASKS
+        .iter()
+        .find(|t| t.id == "dropdown-select")
+        .expect("task");
+    let sibling = Node::new("document", "").with_children(vec![
+        Node::new("combobox", "").with_ref("e0000000000000001-2"),
+    ]);
+    let c = judge(task, 1, None, &[(0x1, 1)], &flatten(&sibling), false);
+    assert_eq!(
+        c.verdict,
+        Verdict::NotIdentified {
+            reason: NotIdentifiedReason::NoMatchingNode
+        }
+    );
+    let ok = judge(task, 1, None, &[(0x1, 2)], &flatten(&sibling), false);
+    assert_eq!(ok.verdict, ident("e0000000000000001-2"));
 }
 
 #[test]
@@ -257,7 +279,7 @@ fn aisnap_3_tsv_rows_have_header_column_count_and_concrete_text() {
     assert_eq!(
         c.get(1).map(format_row).as_deref(),
         Some(
-            "price-first\tec-product-list.html\tp.price_color\tyes\t20\t20\teebd41136ac2ff69e-6\tPriceClass\t-\tfalse\t-"
+            "price-first\tec-product-list.html\tp.price_color\tyes\t20\t1\teebd41136ac2ff69e-6\tPriceClass\t-\tfalse\t-"
         )
     );
 }
