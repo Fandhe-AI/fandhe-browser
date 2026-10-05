@@ -402,25 +402,44 @@ pub fn parse_stylesheet(css: &str) -> Result<ParsedStylesheet> {
     let mut split = split_rule_blocks(css)?;
     let blocks = std::mem::take(&mut split.blocks);
     let mut rules = Vec::with_capacity(blocks.len());
+    // 解析エラーは上限を掛けずに集め、構造エラーと統合・offset 順に並べてから上限を適用する
+    // （先に構造エラーで枠を使い切ると、前半の解析エラーが後半の構造エラーに押し出されるため）。
+    // 構造エラーは offset 昇順で先頭 MAX 件を保持済みで、捨てた分はそれより後ろなので結果は厳密。
+    let mut parse_errors: Vec<RuleBlockError> = Vec::new();
     for block in &blocks {
         let selectors = match parse_selector_list(block.prelude()) {
             Ok(s) => s,
             Err(Error::Unsupported { .. }) => {
-                split.push_error(RuleBlockErrorKind::UnsupportedSelector, block.offset());
+                parse_errors.push(RuleBlockError {
+                    kind: RuleBlockErrorKind::UnsupportedSelector,
+                    offset: block.offset(),
+                });
                 continue;
             }
             Err(_) => {
-                split.push_error(RuleBlockErrorKind::InvalidSelector, block.offset());
+                parse_errors.push(RuleBlockError {
+                    kind: RuleBlockErrorKind::InvalidSelector,
+                    offset: block.offset(),
+                });
                 continue;
             }
         };
         match parse_declarations(block.body()) {
             Ok(declarations) => rules.push(StyleRule::new(selectors, declarations)),
-            Err(_) => split.push_error(RuleBlockErrorKind::InvalidDeclarations, block.offset()),
+            Err(_) => parse_errors.push(RuleBlockError {
+                kind: RuleBlockErrorKind::InvalidDeclarations,
+                offset: block.offset(),
+            }),
         }
     }
     // 構造エラーと解析エラーが混在するため、ソース順（offset 昇順・安定）に揃える。
+    split.errors.extend(parse_errors);
     split.errors.sort_by_key(|e| e.offset);
+    if split.errors.len() > MAX_RULE_BLOCK_ERRORS {
+        let excess = split.errors.len() - MAX_RULE_BLOCK_ERRORS;
+        split.errors.truncate(MAX_RULE_BLOCK_ERRORS);
+        split.dropped_errors = split.dropped_errors.saturating_add(excess);
+    }
     Ok(ParsedStylesheet {
         stylesheet: Stylesheet::new(rules),
         errors: split.errors,
@@ -856,6 +875,25 @@ mod tests {
     }
 
     /// CORE-5: 上限違反は Err のまま。
+    /// 後半の大量の余分な `}` があっても、前半の解析エラーが ソース順・上限件数の契約で残る（CORE-5）。
+    #[test]
+    fn core_5_parse_errors_not_displaced_by_late_structural() {
+        let css = format!("a:hover{{x:y}} {}", "} ".repeat(MAX_RULE_BLOCK_ERRORS + 10));
+        let r = parse_stylesheet(&css).expect("must parse");
+        assert_eq!(r.errors().len(), MAX_RULE_BLOCK_ERRORS);
+        assert_eq!(r.errors()[0].offset(), 0);
+        assert_eq!(
+            r.errors()[0].kind(),
+            RuleBlockErrorKind::UnsupportedSelector
+        );
+        assert_eq!(r.dropped_errors(), 11);
+        assert!(
+            r.errors()
+                .windows(2)
+                .all(|w| w[0].offset() <= w[1].offset())
+        );
+    }
+
     #[test]
     fn core_5_parse_stylesheet_limits_are_err() {
         let ng = " ".repeat(MAX_STYLESHEET_INPUT_BYTES + 1);
