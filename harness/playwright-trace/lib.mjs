@@ -55,11 +55,34 @@ export function parseProtocolLine(rawLine) {
   // TTY では debug が namespace と SEND/RECV の間へ色リセットを挟むため、照合前に ANSI を除去する。
   const line = rawLine.replace(ANSI, "");
   const m = /pw:protocol (SEND ►|◀ RECV) (\{.*\})\s*$/.exec(line);
-  if (m === null) return null;
+  if (m === null) {
+    // pw:protocol 行なのに形式が合わない（ログ形式の変更等）まま捨てると CDP メッセージが
+    // 欠落した JSONL が残るため、対象外ではなく解析失敗として扱う。
+    if (line.includes("pw:protocol")) throw new Error("unrecognized pw:protocol line format");
+    return null;
+  }
   if (Buffer.byteLength(m[2]) > MAX_LINE_BYTES) {
     throw new Error("protocol line exceeds size limit");
   }
   return { dir: m[1] === "SEND ►" ? "send" : "recv", message: JSON.parse(m[2]) };
+}
+
+// 1 行（タイムスタンプ等の接頭辞込み）の許容バイト数。
+export const MAX_RAW_LINE_BYTES = MAX_LINE_BYTES * 2;
+
+/**
+ * stderr チャンクを残余バッファへ連結し、完結した行と新しい残余を返す。
+ * 完結行・残余のいずれかが上限を超えたら Error を投げる（改行を含む巨大書き込みも
+ * 行ごとに検証する。無制限バッファ防止）。
+ */
+export function drainLines(pending, chunk) {
+  const parts = (pending + chunk).split("\n");
+  const rest = parts.pop();
+  for (const l of parts) {
+    if (Buffer.byteLength(l) > MAX_RAW_LINE_BYTES) throw new Error("protocol log line exceeds buffer limit");
+  }
+  if (Buffer.byteLength(rest) > MAX_RAW_LINE_BYTES) throw new Error("protocol log line exceeds buffer limit");
+  return { lines: parts, rest };
 }
 
 /** 文字列中のポート・ANSI・ホームディレクトリ等を固定表現へ置換する。 */

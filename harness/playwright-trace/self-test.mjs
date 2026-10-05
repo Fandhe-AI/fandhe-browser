@@ -10,6 +10,8 @@ import {
   normalizeString,
   normalizeValue,
   parseProtocolLine,
+  drainLines,
+  MAX_RAW_LINE_BYTES,
   toJsonl,
   validateEndpoint,
   validateJsonl,
@@ -64,6 +66,20 @@ t("parseProtocolLine parses SEND and RECV", () => {
 t("parseProtocolLine tolerates ANSI sequences around SEND/RECV", () => {
   const r = parseProtocolLine('2026-10-05T10:09:13.132Z \u001b[0m\u001b[31mpw:protocol\u001b[0m SEND ► {"id":1}');
   assert.deepEqual(r, { dir: "send", message: { id: 1 } });
+});
+
+t("parseProtocolLine rejects pw:protocol lines in an unrecognized format", () => {
+  assert.throws(() => parseProtocolLine("2026-10-05T10:09:13.132Z pw:protocol SENT >> {}"), /unrecognized/);
+});
+
+t("drainLines splits lines and keeps the unfinished remainder", () => {
+  assert.deepEqual(drainLines("ab", "c\nd\ne"), { lines: ["abc", "d"], rest: "e" });
+});
+
+t("drainLines rejects oversized lines even when the chunk contains newlines", () => {
+  const big = "x".repeat(MAX_RAW_LINE_BYTES + 1);
+  assert.throws(() => drainLines("", `${big}\nshort\n`), /buffer limit/);
+  assert.throws(() => drainLines("", `short\n${big}`), /buffer limit/);
 });
 
 t("normalize replaces port and strips ANSI", () => {

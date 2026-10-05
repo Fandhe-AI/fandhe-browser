@@ -14,7 +14,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
   SCHEMA_VERSION,
-  MAX_LINE_BYTES,
+  drainLines,
   MAX_RECORDS,
   normalizeString,
   normalizeValue,
@@ -74,15 +74,13 @@ process.env.DEBUG = "pw:protocol";
 process.env.DEBUG_COLORS = "no";
 let pending = "";
 process.stderr.write = (chunk, ...rest) => {
-  pending += chunk.toString();
-  // 改行が来ないまま蓄積が上限を超えたら収集を中断する（無制限バッファ防止）。
-  if (Buffer.byteLength(pending) > MAX_LINE_BYTES * 2 && pending.indexOf("\n") < 0) {
-    fatal("protocol log line exceeds buffer limit");
+  let lines;
+  try {
+    ({ lines, rest: pending } = drainLines(pending, chunk.toString()));
+  } catch (e) {
+    fatal(e.message);
   }
-  let idx;
-  while ((idx = pending.indexOf("\n")) >= 0) {
-    const line = pending.slice(0, idx);
-    pending = pending.slice(idx + 1);
+  for (const line of lines) {
     let rec = null;
     try {
       const parsed = parseProtocolLine(line);
