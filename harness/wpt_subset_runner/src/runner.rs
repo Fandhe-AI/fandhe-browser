@@ -449,11 +449,19 @@ pub fn run_subset(
 }
 
 /// 1 エントリを実行して分類する。ファイルごとに新しい `JsRuntime` を作る。
+///
+/// 時間計測は HTML の読み込み前から始め、読み込み・サポートスクリプトの事前検証・評価の
+/// 全体に [`RunLimits::max_duration`] を適用する（`PLUG-10`）。各段階の境界で超過を確認する。
 pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
+    let started = Instant::now();
+    let limits = options.limits;
     if entry.harness != HarnessKind::Testharness {
         return FileOutcome::Skipped {
             harness: entry.harness,
         };
+    }
+    if let Some(over) = duration_exceeded(started, &limits) {
+        return over;
     }
     let root = match fs::canonicalize(&options.wpt_root) {
         Ok(r) => r,
@@ -464,10 +472,16 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
             };
         }
     };
+    if let Some(over) = duration_exceeded(started, &limits) {
+        return over;
+    }
     let html = match read_under_root(&root, &entry.file, MAX_SOURCE_BYTES) {
         Ok(h) => h,
         Err(outcome) => return outcome,
     };
+    if let Some(over) = duration_exceeded(started, &limits) {
+        return over;
+    }
     let scripts = match collect_scripts(&html, &entry.file, &options.limits) {
         Ok(s) => s,
         Err(CollectError::Parse(error)) => return FileOutcome::HtmlParseFailed { error },
@@ -514,7 +528,6 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
     }
 
     // 実行前に件数と合計サイズを検証する（JS を 1 つも評価しないうちに fail-closed）。
-    let limits = options.limits;
     if plan.len() > limits.max_steps {
         return FileOutcome::LimitExceeded {
             kind: LimitKind::Steps,
@@ -522,6 +535,9 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
     }
     let mut planned_bytes: u64 = 0;
     for step in &plan {
+        if let Some(over) = duration_exceeded(started, &limits) {
+            return over;
+        }
         let size = match step {
             Step::Eval(code) => code.len() as u64,
             Step::Harness(src, rel) | Step::Support(src, rel) => {
@@ -542,7 +558,9 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
         }
     }
 
-    let started = Instant::now();
+    if let Some(over) = duration_exceeded(started, &limits) {
+        return over;
+    }
     let mut runtime = match new_runtime(options.engine) {
         Ok(r) => r,
         Err(error) => return FileOutcome::EngineUnavailable { error },
@@ -560,10 +578,8 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
     for (index, step) in plan.iter().enumerate() {
         // 1 評価の超過は js crate の評価タイムアウト（2 秒）で抑えられるため、手順の
         // 境界でファイル全体の時間を確認すれば超過は上限 + 評価 1 回分に収まる。
-        if started.elapsed() > limits.max_duration {
-            return FileOutcome::LimitExceeded {
-                kind: LimitKind::Duration,
-            };
+        if let Some(over) = duration_exceeded(started, &limits) {
+            return over;
         }
         match step {
             Step::Harness(src, rel) => {
@@ -626,10 +642,8 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
         }
     }
 
-    if started.elapsed() > limits.max_duration {
-        return FileOutcome::LimitExceeded {
-            kind: LimitKind::Duration,
-        };
+    if let Some(over) = duration_exceeded(started, &limits) {
+        return over;
     }
 
     match collector.take() {
@@ -649,6 +663,16 @@ pub fn run_entry(options: &RunOptions, entry: &SubsetEntry) -> FileOutcome {
             error: e.to_string(),
         },
     }
+}
+
+/// `started` からの経過が `max_duration` 以上なら [`FileOutcome::LimitExceeded`]（Duration）を返す。
+///
+/// `>=` なのは、`max_duration` が 0 のときに粗い時計（Windows 等）で経過 0 と判定されても
+/// 確実に打ち切るため。
+fn duration_exceeded(started: Instant, limits: &RunLimits) -> Option<FileOutcome> {
+    (started.elapsed() >= limits.max_duration).then_some(FileOutcome::LimitExceeded {
+        kind: LimitKind::Duration,
+    })
 }
 
 /// 事前に解決した実行手順。
@@ -860,10 +884,31 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 ///   ため、open 後に途中のディレクトリが差し替えられる残存リスクが Windows に残る
 ///   （canonicalize 後のルート配下確認で緩和するのみ）
 /// - その他の OS: 同一性を確認できないため fail-closed（`ReadFailed`）
+///
+/// # 特殊ファイル（FIFO・ソケット・デバイス）の拒否
+///
+/// FIFO を `open` すると書き手が現れるまで停止し得るため、open の前に `metadata`（symlink は
+/// 解決先で判定）で種別を確認し、通常ファイル以外は open せずに拒否する（ディレクトリは従来どおり
+/// `Missing`、それ以外は `ReadFailed`）。open 後もハンドルの種別を再確認する。
+///
+/// 残存リスク: 種別確認から open までの間に FIFO へ差し替えられると open が停止し得る。これを
+/// 塞ぐには `O_NONBLOCK` での open が必要だが std だけでは指定できず（libc 等の依存追加か
+/// unsafe が必要）、本ツールでは採らない。攻撃にはローカルで WPT チェックアウトへの書き込み権限が
+/// 必要で、チェックアウトは `fetch-wpt.sh` が固定 SHA から作る（README「制限」参照）。
 fn open_under_root(root: &Path, rel: &str, max_bytes: u64) -> Result<(fs::File, u64), FileOutcome> {
     let mut path = root.to_path_buf();
     for seg in rel.split('/') {
         path.push(seg);
+    }
+    match fs::metadata(&path) {
+        Ok(m) if m.is_file() => {}
+        Ok(m) => return Err(non_regular_outcome(&m)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(FileOutcome::Missing),
+        Err(e) => {
+            return Err(FileOutcome::ReadFailed {
+                error: e.to_string(),
+            });
+        }
     }
     let file = match fs::File::open(&path) {
         Ok(f) => f,
@@ -883,7 +928,7 @@ fn open_under_root(root: &Path, rel: &str, max_bytes: u64) -> Result<(fs::File, 
         error: e.to_string(),
     })?;
     if !meta.is_file() {
-        return Err(FileOutcome::Missing);
+        return Err(non_regular_outcome(&meta));
     }
     if meta.len() > max_bytes {
         return Err(FileOutcome::TooLarge);
@@ -903,6 +948,18 @@ fn open_under_root(root: &Path, rel: &str, max_bytes: u64) -> Result<(fs::File, 
     }
     confirm_same_file(&meta, &canon)?;
     Ok((file, meta.len()))
+}
+
+/// 通常ファイルでないものの拒否結果。ディレクトリは従来どおり `Missing`、FIFO・ソケット・
+/// デバイス等は `ReadFailed`（理由は英語）。
+fn non_regular_outcome(meta: &fs::Metadata) -> FileOutcome {
+    if meta.is_dir() {
+        FileOutcome::Missing
+    } else {
+        FileOutcome::ReadFailed {
+            error: "not a regular file".to_string(),
+        }
+    }
 }
 
 /// 開いたハンドルの metadata と canonical パスが同じファイルであることを確認する（Unix）。
@@ -1422,5 +1479,129 @@ mod tests {
         let path = root.join(rel);
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         fs::write(path, body).expect("write");
+    }
+
+    /// 停止しない前提で `f` を別スレッドで実行する（修正前に FIFO で停止する場合はタイムアウトで失敗）。
+    #[cfg(unix)]
+    fn run_bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("operation must not block on a special file")
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(root: &Path, rel: &str) {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+    }
+
+    /// PLUG-10: FIFO を HTML として指定しても open で停止せず、ReadFailed で拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn run_entry_rejects_fifo_html_without_blocking() {
+        let root = scratch_dir("fifo-html");
+        make_fifo(&root, "t.html");
+        let entry = SubsetEntry::new("t.html", HarnessKind::Testharness).expect("entry");
+        let opts = RunOptions::new(&root, None);
+        let outcome = run_bounded(move || run_entry(&opts, &entry));
+        assert_eq!(
+            outcome,
+            FileOutcome::ReadFailed {
+                error: "not a regular file".to_string()
+            }
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// PLUG-10: FIFO を src スクリプトとして参照しても、事前検証で停止せず拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn run_entry_rejects_fifo_support_script_without_blocking() {
+        let root = scratch_dir("fifo-src");
+        write_file(&root, "resources/testharness.js", "// stub");
+        make_fifo(&root, "pipe.js");
+        write_file(
+            &root,
+            "t.html",
+            "<script src=\"/resources/testharness.js\"></script>\
+             <script src=\"pipe.js\"></script>",
+        );
+        let entry = SubsetEntry::new("t.html", HarnessKind::Testharness).expect("entry");
+        let opts = RunOptions::new(&root, None);
+        let outcome = run_bounded(move || run_entry(&opts, &entry));
+        assert_eq!(
+            outcome,
+            FileOutcome::ReadFailed {
+                error: "not a regular file".to_string()
+            }
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// PLUG-10: ルート内の symlink が FIFO を指す場合も解決先の種別で拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn open_under_root_rejects_symlink_to_fifo() {
+        let root = fs::canonicalize(scratch_dir("fifo-link")).expect("canon");
+        make_fifo(&root, "real.fifo");
+        std::os::unix::fs::symlink(root.join("real.fifo"), root.join("link.js")).expect("symlink");
+        let r = run_bounded(move || {
+            let r = open_under_root(&root, "link.js", MAX_SCRIPT_BYTES);
+            let _ = fs::remove_dir_all(&root);
+            r.map(|_| ())
+        });
+        assert_eq!(
+            r.err(),
+            Some(FileOutcome::ReadFailed {
+                error: "not a regular file".to_string()
+            })
+        );
+    }
+
+    /// PLUG-10: `max_duration` は HTML 読み込み前から効く。0 なら存在しないファイルでも
+    /// Missing ではなく Duration 超過で終わる（読み込み前に確認している証拠）。
+    #[test]
+    fn run_entry_applies_zero_duration_before_html_read() {
+        let root = scratch_dir("zero-before");
+        let entry = SubsetEntry::new("absent.html", HarnessKind::Testharness).expect("entry");
+        let mut opts = RunOptions::new(&root, None);
+        opts.limits.max_duration = Duration::ZERO;
+        assert_eq!(
+            run_entry(&opts, &entry),
+            FileOutcome::LimitExceeded {
+                kind: LimitKind::Duration
+            }
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// PLUG-10: 実在する HTML でも `max_duration` が 0 なら評価前に Duration 超過で終わる。
+    #[test]
+    fn run_entry_applies_zero_duration_with_existing_html() {
+        let root = scratch_dir("zero-after");
+        write_file(&root, "resources/testharness.js", "// stub");
+        write_file(
+            &root,
+            "t.html",
+            "<script src=\"/resources/testharness.js\"></script>",
+        );
+        let entry = SubsetEntry::new("t.html", HarnessKind::Testharness).expect("entry");
+        let mut opts = RunOptions::new(&root, None);
+        opts.limits.max_duration = Duration::ZERO;
+        assert_eq!(
+            run_entry(&opts, &entry),
+            FileOutcome::LimitExceeded {
+                kind: LimitKind::Duration
+            }
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }
