@@ -28,7 +28,8 @@ JS-3・PERF-1 が「検討中」に留まる理由は、V8 統合後の実バイ
 # strip なし（既定。`--release` のままのバイナリ）
 make measure-js-binary-size
 
-# strip あり（ハーネスが `strip` したコピーのサイズを測る）
+# strip あり（`CARGO_PROFILE_RELEASE_STRIP=symbols` を指定して再ビルドしたバイナリのサイズを測る。
+# バイナリのコピーに `strip` コマンドは実行しない。`Cargo.toml` も編集しない）
 make measure-js-binary-size JS_BINARY_SIZE_STRIP=1
 ```
 
@@ -76,19 +77,25 @@ CI の Linux 値（70,576,624 B）とローカルの `default`（70,613,360 B）
 
 ## CORE-2 の達成可否
 
+注意: 以下の判定は現行の `fandhe-browser-cli` 構成に限る。現行 `main.rs` は最小雛形で、
+選択エンジンの `JsRuntime` 配線と AI API ルータの合成が後続タスクとして未実装である。
+これらを組み込むとバイナリは増えうるため、組み込み後に再計測・再判定が必要で、
+現時点で完成後の CLI が CORE-2 を満たすとは断定しない。
+
 | OS | 判定 | 根拠 |
 | -- | ---- | ---- |
 | Linux | met | 70,576,624 B（削減率 84.57%）が上限 91,480,000 B 以下 |
 | macOS | met | 63,072,656 B（削減率 86.21%）が上限以下 |
 | Windows | met | 47,401,472 B（削減率 89.64%）が上限以下 |
 
-strip なし・最適化設定未適用の値で基準内に収まっている。参考として Linux の strip あり
+現行構成では、strip なし・最適化設定未適用の値で基準内に収まっている。参考として Linux の strip あり
 `default`（52,721,656 B）の削減率は 88.47%。
 
 ## 机上算定・PoC 実測との比較
 
 比較対象（PoC-15 の机上算定・PoC-3 の増分・PoC-2 の基盤）は strip 後の値のため、
-ローカルの strip あり計測と比べる。
+ローカルの strip あり計測（`CARGO_PROFILE_RELEASE_STRIP=symbols` での再ビルド）と比べる。
+なお `strip = true` を含む正規のプロファイル構成とは `opt-level`・LTO 等が異なる。
 
 ### 構成別
 
@@ -120,6 +127,7 @@ strip なし・最適化設定未適用の値で基準内に収まっている�
 - release プロファイルの CORE-2 前提が未適用（#146・#368）。適用後に再計測する
 - macOS・Windows の軽量・エンジンなし構成が未測定
 - strip あり計測はローカル Linux のみ
+- 現行 CLI は最小雛形（`JsRuntime` 配線・AI API ルータ合成が未実装）。組み込み後の再計測・CORE-2 再判定が必要
 - 両エンジン同梱構成は対象外
 - `harness/binary-size/README.md` の「3 OS での実測は #470 で手動実行」という記述は、
   本レポートが macOS・Windows の非既定構成を測っていないため実態と合わない
@@ -133,7 +141,7 @@ JS-3・PERF-1 の「検討中」を「確定」に変えるか、目標値を見
 
 | 条件 | 状況 | 参照 |
 | ---- | ---- | ---- |
-| 既定ビルドの実バイナリで CORE-2 の達成可否を記録 | 達成（3 OS とも met） | 「CORE-2 の達成可否」 |
+| 既定ビルドの実バイナリで CORE-2 の達成可否を記録 | 現行の最小雛形 CLI に限り達成（3 OS とも met）。JsRuntime 配線・AI API ルータ合成後に再判定が必要 | 「CORE-2 の達成可否」 |
 | 軽量ビルド・エンジンなしのサイズを参考値で記録 | 部分達成（Linux のみ。macOS・Windows は未測定） | 「3 構成の実測」 |
 | PoC-15 の机上算定・PoC-3 の増分との比較を記録 | 達成（strip あり値どうしで比較） | 「机上算定・PoC 実測との比較」 |
 
