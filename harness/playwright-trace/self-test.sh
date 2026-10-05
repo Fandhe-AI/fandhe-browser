@@ -48,4 +48,19 @@ if [ "$status" -ne 1 ] || [ -e "$FAKE_DIR/out.jsonl" ]; then
 fi
 grep -q "no CDP messages were captured" "$FAKE_DIR/err.txt" || { echo "FAIL: missing error message" >&2; exit 1; }
 echo "ok: zero-message traces exit 1 without writing a trace"
+
+# いずれかの段階がタイムアウトしたら JSONL を書かず exit 1 すること（CDP-2・fail-closed）。
+# connectOverCDP が決して解決しない偽 playwright-core と、短い段階タイムアウトを使う。
+cat >"$FAKE_DIR/node_modules/playwright-core/index.js" <<'JS'
+exports.chromium = { connectOverCDP: () => new Promise(() => {}) };
+JS
+status=0
+node "$SCRIPT_DIR/trace.mjs" --endpoint http://127.0.0.1:9 --out "$FAKE_DIR/out2.jsonl" \
+  --module-dir "$FAKE_DIR" --playwright-version 0.0.0 --stage-timeout-ms 200 >/dev/null 2>"$FAKE_DIR/err2.txt" || status=$?
+if [ "$status" -ne 1 ] || [ -e "$FAKE_DIR/out2.jsonl" ]; then
+  echo "FAIL: timed-out stage must exit 1 without output (got $status)" >&2
+  exit 1
+fi
+grep -q "stage timed out" "$FAKE_DIR/err2.txt" || { echo "FAIL: missing timeout message" >&2; exit 1; }
+echo "ok: timed-out stage exits 1 without writing a trace"
 echo "playwright-trace self-test: all passed"

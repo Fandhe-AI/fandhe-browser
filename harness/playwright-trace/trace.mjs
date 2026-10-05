@@ -27,14 +27,14 @@ import {
   validateOutPath,
 } from "./lib.mjs";
 
-const STAGE_TIMEOUT_MS = 10_000;
+let STAGE_TIMEOUT_MS = 10_000;
 
 function parseArgs(argv) {
   const args = { force: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--force") args.force = true;
-    else if (["--endpoint", "--out", "--module-dir", "--playwright-version"].includes(a)) {
+    else if (["--endpoint", "--out", "--module-dir", "--playwright-version", "--stage-timeout-ms"].includes(a)) {
       args[a.slice(2)] = argv[++i];
     } else throw new Error(`unknown argument: ${a}`);
   }
@@ -49,6 +49,11 @@ try {
   validateOutPath(args.out);
   if (typeof args["module-dir"] !== "string" || typeof args["playwright-version"] !== "string") {
     throw new Error("--module-dir and --playwright-version are required");
+  }
+  if (args["stage-timeout-ms"] !== undefined) {
+    const n = Number(args["stage-timeout-ms"]);
+    if (!Number.isInteger(n) || n < 1 || n > 60_000) throw new Error("--stage-timeout-ms must be an integer in 1..60000");
+    STAGE_TIMEOUT_MS = n;
   }
   if (existsSync(args.out) && !args.force) {
     throw new Error(`output exists (use --force to overwrite): ${args.out}`);
@@ -122,12 +127,14 @@ const withTimeout = (p, label) =>
   ]);
 
 /** 段階を実行して stage レコードを積む。成功なら値、失敗なら undefined を返す。 */
+let timedOutStage = null;
 async function stage(name, fn) {
   try {
     const v = await withTimeout(fn(), name);
     push({ kind: "stage", name, ok: true });
     return { ok: true, value: v };
   } catch (e) {
+    if (/timed out after/.test(String(e.message))) timedOutStage ??= name;
     push({ kind: "stage", name, ok: false, error: normalizeString(String(e.message), port) });
     return { ok: false };
   }
@@ -178,6 +185,14 @@ if (browser) {
   }
   capturing = false;
   await Promise.race([browser.close().catch(() => {}), new Promise((r) => setTimeout(r, 2000))]);
+}
+
+// タイムアウトした段階は fn() が中止されず CDP 送受信が続き得るため、段階の成否とメッセージ列が
+// 一致しない。保存せず、進行中の接続を best-effort（上限時間付き）で閉じてから失敗終了する。
+if (timedOutStage) {
+  capturing = false;
+  if (browser) await Promise.race([browser.close().catch(() => {}), new Promise((r) => setTimeout(r, 2000))]);
+  fatal(`stage timed out: ${timedOutStage}`);
 }
 
 // CDP 0 件は収集失敗（接続失敗でも CDP 送受信があれば調査用トレースとして保存する）。成功扱いの JSONL を残さず非 0 終了する。
