@@ -116,6 +116,8 @@ fn render_head(node: &Node, depth: usize, lines: &mut Vec<String>) {
 /// ヘッダ行・caption 等の非データ child は数えず元の位置のまま出す。表の行は
 /// `rowgroup`（`thead`/`tbody`/`tfoot`）配下に入るため、畳んだ行を持たない `rowgroup` は
 /// 透過して同じ状態で走査する。
+///
+/// 制限: 位置カウンタは `is_data_row` の近似に依存する（詳細は同関数のコメント）。
 struct Merge<'a> {
     folded: std::iter::Peekable<std::vec::IntoIter<&'a FoldedRow>>,
     pos: usize,
@@ -204,8 +206,13 @@ fn render_folded(sub: &str, f: &FoldedRow) -> String {
 
 /// 表の本文行・一覧項目に当たる child か（`FoldedRow::index` の数え方に合わせる近似判定）。
 ///
-/// ヘッダ行（全セルが `columnheader`）は除く。`tfoot` 行や th のみの本文行は構造から
-/// 区別できないため近似になる（測定用の暫定形式。確定は TASK-19・`AISNAP-6`）。
+/// ヘッダ行（全セルが `columnheader`）は除く。
+///
+/// 制限（受容済みの近似）: `Node` の構造からは行が thead/tbody/tfoot のどれに属するか
+/// 判別できないため、`tfoot` 行や th のみの本文行も本文行として数える。tfoot が tbody より
+/// 前にある表では、位置カウンタ（`Merge::pos`）がずれて折り畳んだ行の出力順が近似になる。
+/// トークン数への影響は軽微。出力形式は TASK-19（`AISNAP-6`）で確定予定で、その際に
+/// build 側が位置情報を出す形へ見直す（`FoldedRow` の形式変更を伴うため破壊的変更）。
 fn is_data_row(node: &Node) -> bool {
     match node.role.as_str() {
         "listitem" => true,
