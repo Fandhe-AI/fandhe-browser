@@ -103,7 +103,8 @@ fn main() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `Profile::open` が非 unix 未対応のため、非 unix ではコンパイルのみ通して明示的に失敗する。
+/// `Profile::open` が非 unix 未対応（Windows の ACL 隔離 `XOS-7` 未実装。追跡 #295・TASK-63）のため、
+/// 非 unix ではコンパイルのみ通して明示的に失敗する（REPAIR-3）。
 #[cfg(not(unix))]
 fn main() {
     eprintln!("trace_server is supported on unix only");

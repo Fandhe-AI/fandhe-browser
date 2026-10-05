@@ -31,6 +31,12 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
 - 取得方法は playwright-core が `logger` オプションを公開していないため `DEBUG=pw:protocol` の
   stderr 出力を解析する方式を採った
 
+## 制限事項
+
+- Windows は未対応。`trace_server` が使う `fandhe-browser-profile` の `Profile::open` が、Windows の
+  ACL 隔離（`XOS-7`）未実装のため `Unsupported` を返す（`crates/fandhe-browser-profile/src/store.rs` に
+  記載の既存制約）。成功を装わず明示的に失敗する。追跡は #295（TASK-63）
+
 ## JSONL スキーマ（schema 1）
 
 1 行 1 レコード・LF 固定。共通で `seq`（0 始まりの連番）と `kind` を持つ。
