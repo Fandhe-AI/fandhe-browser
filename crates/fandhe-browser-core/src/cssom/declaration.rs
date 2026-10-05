@@ -23,6 +23,7 @@
 //! - 同名 property の重複解決。ソース順に全件残し、後勝ちはカスケード（#260）の責務
 //! - 上限値は暫定。見直しは #261（TASK-105.7）が担う
 
+use super::is_css_whitespace;
 use super::types::{Declaration, Importance};
 use crate::error::{Error, Result};
 
@@ -31,11 +32,6 @@ pub const MAX_DECLARATION_INPUT_BYTES: usize = 1024 * 1024;
 
 /// 1 ブロックで受け付ける有効な宣言の最大件数（暫定。見直しは #261）。
 pub const MAX_DECLARATIONS_PER_BLOCK: usize = 4096;
-
-/// CSS の空白（` ` `\t` `\n` `\r` `\u{0C}`）。
-fn is_css_whitespace(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0C}')
-}
 
 /// CSS 識別子の先頭以外に使える文字（英数字・`-`・`_`・非 ASCII）。
 /// 非 ASCII は CSS Syntax の ident code point（U+0080 以上）に従い許可する。
