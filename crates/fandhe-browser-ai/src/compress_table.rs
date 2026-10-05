@@ -462,9 +462,11 @@ pub struct CompressedRows {
 
 /// 非表示の行・祖先（`tbody`・表自身・その外側を含む）の行を除いたデータ行を文書順で返す。
 ///
+/// `build_snapshot` の `omitted_rows_have_controls` も、省略され得る行（可視行）の母集団として使う。
+///
 /// `build_snapshot` の非表示サブツリー除外に合わせるため、選択の index 空間から先に除く
 /// （除かないと非表示行が `omitted` に混ざる）。
-fn visible_body_rows(doc: &Document, structure: &RegularStructure) -> Vec<NodeId> {
+pub(crate) fn visible_body_rows(doc: &Document, structure: &RegularStructure) -> Vec<NodeId> {
     structure
         .body_rows
         .iter()

@@ -61,7 +61,7 @@ use crate::compress_table::{
     rows_to_fold,
 };
 use crate::data_leaf::{DataLeafKind, classify_data_leaf};
-use crate::retention::{RetentionPolicy, priority_candidates, select_retained_with_priority};
+use crate::retention::priority_candidates;
 
 use super::element_ref::{ElementRef, ElementSignature, RefAllocator, RefError};
 use super::name::{
@@ -452,18 +452,22 @@ fn plan_row_controls(doc: &Document, row: NodeId) -> Option<RowControlPlan> {
             truncated: false,
         });
     }
-    let retention = select_retained_with_priority(
-        candidates.len(),
-        &RetentionPolicy::new(MAX_ROW_CONTROLS, 1),
-        &priority,
-    );
-    let kept = retention
-        .kept
+    // 優先要素（件数は MAX_ROW_CONTROLS 以下を確認済み）を先に全件確保し、
+    // 残り枠を非優先要素へ文書順に配る（先頭枠の予約で優先要素を押し出さない）。
+    let mut room = MAX_ROW_CONTROLS - priority.len();
+    let kept: Vec<(NodeId, bool)> = candidates
         .iter()
-        .filter_map(|item| {
-            let id = candidates.get(item.index).copied()?;
-            let pri = is_priority.get(item.index).copied().unwrap_or(false);
-            Some((id, pri))
+        .copied()
+        .zip(is_priority)
+        .filter(|(_, pri)| {
+            if *pri {
+                true
+            } else if room > 0 {
+                room -= 1;
+                true
+            } else {
+                false
+            }
         })
         .collect();
     Some(RowControlPlan {
@@ -485,8 +489,8 @@ fn omitted_rows_have_controls(
         return false;
     }
     let kept: HashSet<NodeId> = compressed.rows.iter().map(|r| r.row).collect();
-    structure
-        .body_rows
+    // compress_rows が省略し得るのは可視行のみ（非表示 tbody 配下の行は対象外）。
+    crate::compress_table::visible_body_rows(doc, structure)
         .iter()
         .filter(|r| !kept.contains(r) && doc.is_element(**r) && !is_excluded(doc, **r))
         .any(|&r| plan_row_controls(doc, r).is_none_or(|p| !p.kept.is_empty()))
@@ -1529,5 +1533,43 @@ mod tests {
         let nodes = all_nodes(&s.tree);
         assert!(nodes.iter().all(|n| n.table.is_none()));
         assert!(nodes.iter().any(|n| n.name == "Row24" && n.r#ref.is_some()));
+    }
+
+    /// AISNAP-12・Issue #632: 先頭の通常リンクが枠を予約せず、優先リンク 8 件が全件残る。
+    #[test]
+    fn aisnap_12_row_priority_not_displaced_by_leading_plain_link() {
+        let mut cell = String::from("<a href=\"/plain\">Plain</a>");
+        for i in 0..MAX_ROW_CONTROLS {
+            cell.push_str(&format!("<a href=\"/n{i}\" rel=\"next\">Next{i}</a>"));
+        }
+        let s = snap(&format!(
+            "<table><thead><tr><th>h</th></tr></thead><tbody><tr><td>{cell}</td></tr></tbody></table>"
+        ));
+        let nodes = all_nodes(&s.tree);
+        let table = nodes.iter().find_map(|n| n.table.as_ref()).expect("table");
+        let row = table.rows.first().expect("row");
+        assert_eq!(row.controls.len(), MAX_ROW_CONTROLS);
+        for i in 0..MAX_ROW_CONTROLS {
+            let name = format!("Next{i}");
+            assert!(row.controls.iter().any(|c| c.name == name));
+        }
+        assert!(row.controls.iter().all(|c| c.name != "Plain"));
+        assert!(row.controls_truncated);
+    }
+
+    /// AISNAP-13・Issue #632: 非表示 tbody 内の操作要素は省略行として数えず、可視行が
+    /// 操作要素を持たなければ圧縮する。
+    #[test]
+    fn aisnap_13_hidden_rows_with_controls_do_not_block_compression() {
+        let mut html = String::from("<table><thead><tr><th>h</th></tr></thead><tbody>");
+        for r in 0..25 {
+            html.push_str(&format!("<tr><td>Row{r}</td></tr>"));
+        }
+        html.push_str(
+            "</tbody><tbody hidden><tr><td><a href=\"/x\">Hidden</a></td></tr></tbody></table>",
+        );
+        let s = snap(&html);
+        let nodes = all_nodes(&s.tree);
+        assert!(nodes.iter().any(|n| n.table.is_some()));
     }
 }
