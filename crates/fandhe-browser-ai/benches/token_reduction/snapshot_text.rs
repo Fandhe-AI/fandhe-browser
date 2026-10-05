@@ -60,6 +60,14 @@ fn render_control(c: &RowControl) -> String {
 }
 
 fn render_node(node: &Node, depth: usize, lines: &mut Vec<String>) {
+    render_head(node, depth, lines);
+    let mut merge = Merge::new(node);
+    render_children(&node.children, depth + 1, &mut merge, lines);
+    merge.flush(&"  ".repeat(depth + 1), lines);
+}
+
+/// ノード自身の行と、圧縮表（`table`）の行までを出す（子ノードと畳んだ行は含まない）。
+fn render_head(node: &Node, depth: usize, lines: &mut Vec<String>) {
     let indent = "  ".repeat(depth);
     let mut line = format!("{indent}- {}", node.role);
     if !node.name.is_empty() {
@@ -98,25 +106,88 @@ fn render_node(node: &Node, depth: usize, lines: &mut Vec<String>) {
             lines.push(format!("{sub}… +{} rows", table.truncated_rows));
         }
     }
-    // 畳んだ行と children を FoldedRow::index で統合し文書順を復元する（`AISNAP-12`）。
-    // `index` は表示対象データ行だけを数えた位置なので、位置カウンタもデータ行の child
-    // だけで進める。ヘッダ行・caption 等の非データ child は数えず、元の位置のまま出す。
-    // データ行か否かは Node から構造的に判別できないため role で近似する（`is_data_row`）。
-    let mut folded: Vec<&FoldedRow> = node.folded_rows.iter().collect();
-    folded.sort_by_key(|f| f.index);
-    let mut folded = folded.into_iter().peekable();
-    let mut data_pos = 0usize;
-    for child in &node.children {
-        if is_data_row(child) {
-            while let Some(f) = folded.next_if(|f| f.index <= data_pos) {
-                lines.push(render_folded(&sub, f));
-            }
-            data_pos += 1;
+}
+
+/// 畳んだ行（`Node::folded_rows`）と展開側の children を `FoldedRow::index` で統合する
+/// 状態（`AISNAP-12`）。
+///
+/// `index` は畳んだ行・展開側を合わせた表示対象データ行の通し位置なので、位置カウンタ
+/// `pos` は 1 本で共有し、畳んだ行を出しても展開側のデータ行を出しても進める。
+/// ヘッダ行・caption 等の非データ child は数えず元の位置のまま出す。表の行は
+/// `rowgroup`（`thead`/`tbody`/`tfoot`）配下に入るため、畳んだ行を持たない `rowgroup` は
+/// 透過して同じ状態で走査する。
+struct Merge<'a> {
+    folded: std::iter::Peekable<std::vec::IntoIter<&'a FoldedRow>>,
+    pos: usize,
+    /// 走査済みの展開側データ行数と、走査対象全体のデータ行数。
+    seen: usize,
+    total: usize,
+}
+
+impl<'a> Merge<'a> {
+    fn new(node: &'a Node) -> Self {
+        let mut folded: Vec<&FoldedRow> = node.folded_rows.iter().collect();
+        folded.sort_by_key(|f| f.index);
+        Self {
+            folded: folded.into_iter().peekable(),
+            pos: 0,
+            seen: 0,
+            total: count_data_rows(&node.children),
         }
-        render_node(child, depth + 1, lines);
     }
-    for f in folded {
-        lines.push(render_folded(&sub, f));
+
+    /// 位置が `pos` 以下の畳んだ行を順に出す。
+    fn flush_due(&mut self, sub: &str, lines: &mut Vec<String>) {
+        while let Some(f) = self.folded.next_if(|f| f.index <= self.pos) {
+            lines.push(render_folded(sub, f));
+            self.pos += 1;
+        }
+    }
+
+    /// 残りの畳んだ行をすべて出す（展開側のデータ行より後ろにある行）。
+    fn flush(&mut self, sub: &str, lines: &mut Vec<String>) {
+        for f in self.folded.by_ref() {
+            lines.push(render_folded(sub, f));
+        }
+    }
+}
+
+/// 畳んだ行を持たない `rowgroup` か（畳んだ行の統合で透過して走査する対象）。
+fn is_transparent_group(node: &Node) -> bool {
+    node.role == "rowgroup" && node.folded_rows.is_empty() && node.table.is_none()
+}
+
+fn count_data_rows(children: &[Node]) -> usize {
+    children
+        .iter()
+        .map(|c| {
+            if is_transparent_group(c) {
+                count_data_rows(&c.children)
+            } else {
+                usize::from(is_data_row(c))
+            }
+        })
+        .sum()
+}
+
+fn render_children(children: &[Node], depth: usize, m: &mut Merge<'_>, lines: &mut Vec<String>) {
+    let sub = "  ".repeat(depth);
+    for child in children {
+        if is_transparent_group(child) {
+            render_head(child, depth, lines);
+            render_children(&child.children, depth + 1, m, lines);
+            // 最後のデータ行を含むグループの末尾で、残りの畳んだ行を同じ階層へ出す。
+            if m.seen >= m.total {
+                m.flush(&"  ".repeat(depth + 1), lines);
+            }
+            continue;
+        }
+        if is_data_row(child) {
+            m.flush_due(&sub, lines);
+            m.seen += 1;
+            m.pos += 1;
+        }
+        render_node(child, depth, lines);
     }
 }
 

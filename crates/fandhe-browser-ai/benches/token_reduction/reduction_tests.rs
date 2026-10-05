@@ -215,3 +215,70 @@ fn render_folded_row_follows_header_row_in_document_order() {
     .join("\n");
     assert_eq!(text, expected);
 }
+
+fn data_row(name: &str, r: &str) -> Node {
+    Node::new("row", "").with_children(vec![Node::new("link", name).with_ref(r)])
+}
+
+/// AISNAP-12: 先頭の複数行が畳まれ、最初の展開行が index 2 のとき、畳んだ行 2 件が
+/// 展開行より前に出る（畳んだ行も位置カウンタへ反映する）。
+#[test]
+fn render_leading_folded_rows_precede_first_expanded_row() {
+    let mut list = Node::new("list", "").with_children(vec![
+        Node::new("listitem", "").with_children(vec![Node::new("link", "L2").with_ref("e2")]),
+    ]);
+    list.folded_rows = vec![
+        FoldedRow::new(0, "item0", false),
+        FoldedRow::new(1, "item1", false),
+        FoldedRow::new(3, "item3", false),
+    ];
+    let text = render_snapshot(&Snapshot::new(list));
+    let expected = [
+        "- list",
+        "  item0",
+        "  item1",
+        "  - listitem",
+        "    - link \"L2\" [e2]",
+        "  item3",
+    ]
+    .join("\n");
+    assert_eq!(text, expected);
+}
+
+/// AISNAP-12: 実際の表の形（行は `rowgroup` 配下）でも、畳んだ行は thead の後の tbody 内で
+/// 展開行と通し位置で交互に出る（index 0・1・3 が畳まれ、2・4 が展開）。
+#[test]
+fn render_folded_rows_interleave_inside_rowgroups() {
+    let thead = Node::new("rowgroup", "").with_children(vec![
+        Node::new("row", "").with_children(vec![Node::new("columnheader", "n").with_ref("e1")]),
+    ]);
+    let tbody =
+        Node::new("rowgroup", "").with_children(vec![data_row("R2", "e2"), data_row("R4", "e3")]);
+    let mut table = Node::new("table", "T")
+        .with_ref("e0")
+        .with_children(vec![thead, tbody]);
+    table.folded_rows = vec![
+        FoldedRow::new(0, "row0", false),
+        FoldedRow::new(1, "row1", false),
+        FoldedRow::new(3, "row3", false),
+        FoldedRow::new(5, "row5", false),
+    ];
+    let text = render_snapshot(&Snapshot::new(table));
+    let expected = [
+        "- table \"T\" [e0]",
+        "  - rowgroup",
+        "    - row",
+        "      - columnheader \"n\" [e1]",
+        "  - rowgroup",
+        "    row0",
+        "    row1",
+        "    - row",
+        "      - link \"R2\" [e2]",
+        "    row3",
+        "    - row",
+        "      - link \"R4\" [e3]",
+        "    row5",
+    ]
+    .join("\n");
+    assert_eq!(text, expected);
+}
