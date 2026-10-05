@@ -2,7 +2,8 @@
 //!
 //! Node・Puppeteer に依存せず、`cargo test --workspace` で常に実行される。偽スクリプトは
 //! テストバイナリ自身の再実行で実現する（`fandhe-browser-profile` の `lock_child_entry` と
-//! 同じ流儀）。実 Puppeteer での確認は `tests/puppeteer_connect_live.rs`（明示実行）。
+//! 同じ流儀）。実 Puppeteer を使う試験ターゲットは puppeteer-core 導入の承認後に追加する
+//! （harness/puppeteer-connect/README.md「導入状況」）。
 //! `Profile::open` が非 unix で `Unsupported` を返す仕様のため `#[cfg(unix)]`
 //! （任意の skip ではなく `tests/devtools_browser.rs` と同じ理由）。
 

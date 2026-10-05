@@ -249,15 +249,6 @@ test-harness: ## harness/render-screenshot のユニットテスト・結合テ�
 	fi
 	python3 -B -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
 
-# 実 Puppeteer 接続試験（TASK-45.1・#480・CDP-3。harness/puppeteer-connect/README.md 参照）。
-# Node / puppeteer-core の有無は Rust 側 preflight が判定し、未導入なら理由付きで失敗する
-# （make 側で黙って skip しない）。未導入環境で失敗するため、npm 導入の承認後に
-# 導入手順とともに `ci` へ追加する。
-.PHONY: test-puppeteer-connect
-test-puppeteer-connect: ## 実 Puppeteer 接続試験を実行する（puppeteer-core 未導入なら失敗）
-	cargo clippy -p fandhe-browser-cdp --test puppeteer_connect_live -- -D warnings
-	cargo test -p fandhe-browser-cdp --test puppeteer_connect_live -- --nocapture
-
 # `rendering` feature（Servo。RENDER-1）は fandhe-browser-render crate 追加まで
 # workspace に存在しない。`cargo metadata` の feature 一覧に無い間は誤ってビルド
 # エラーとして落とさず skip する（cargo 未導入 / Cargo.toml 未追加の HAS_CARGO 判定と

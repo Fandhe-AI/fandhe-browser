@@ -1,8 +1,8 @@
 //! 外部スクリプト（Node 製クライアント等）を実サーバーへ接続させて結果を構造化回収する
 //! 共有基盤（TASK-45.1・#480、ビヘイビア `CDP-3`・MS-4）。
 //!
-//! `tests/puppeteer_connect.rs`（基盤の自己テスト）と `tests/puppeteer_connect_live.rs`
-//! （実 Puppeteer）の両ターゲットが `mod script_harness;` で取り込む。Puppeteer 固有の事柄は
+//! `tests/puppeteer_connect.rs`（基盤の自己テスト）が `mod script_harness;` で取り込む
+//! （実 Puppeteer の試験ターゲットは導入承認後に追加し、同様に取り込む）。Puppeteer 固有の事柄は
 //! 呼び出し側へ寄せ、このモジュールは「サーバー起動・子プロセス実行・結果行の解析」だけを
 //! 担う（Playwright 側の基盤 #476 からも再利用できる形に保つ）。
 //!
@@ -50,8 +50,7 @@ const STDERR_TAIL_BYTES: usize = 2048;
 const JOIN_GRACE: Duration = Duration::from_secs(2);
 
 /// 未導入時に表示する導入手順（固定の英語文言。AC3）。
-pub const INSTALL_HINT: &str =
-    "run `npm ci --ignore-scripts` in harness/puppeteer-connect (requires Node.js 22.12 or later)";
+pub const INSTALL_HINT: &str = "puppeteer-core is not yet provisioned: harness/puppeteer-connect has no package.json or lockfile until its installation is approved (see harness/puppeteer-connect/README.md)";
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -272,8 +271,10 @@ fn collect(rx: &Receiver<Vec<u8>>) -> Vec<u8> {
 /// 子は `process_group(0)` で自身を先頭とするグループに入れてあるため pgid は子の pid に等しい。
 #[cfg(unix)]
 fn kill_group(pid: u32) {
-    let _ = Command::new("kill")
-        .args(["-KILL", "--", &format!("-{pid}")])
+    // macOS の BSD `/bin/kill` は `--` を PID と解釈して拒否するため、POSIX 準拠の
+    // シェル組込み `kill`（`-s KILL -- -<pgid>`）を `sh -c` 経由で使う。pid は数値のみ。
+    let _ = Command::new("sh")
+        .args(["-c", "kill -s KILL -- \"-$1\"", "sh", &pid.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

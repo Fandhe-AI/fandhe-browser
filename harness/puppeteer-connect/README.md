@@ -8,7 +8,7 @@ Puppeteer 接続試験の実行基盤（TASK-45.1・Issue #480・ビヘイビア
 | 範囲 | Issue |
 | ---- | ----- |
 | 実行基盤（サーバー起動・スクリプト実行・結果の構造化回収） | #480（本ディレクトリ） |
-| 接続後の `newPage`・`goto`・セレクタ取得の到達確認 | #481（TASK-45.2。`puppeteer_connect_live.rs` にステップを足す） |
+| 接続後の `newPage`・`goto`・セレクタ取得の到達確認 | #481（TASK-45.2。実試験ターゲットを追加しステップを足す） |
 | 結果レポート | #482（TASK-45.3） |
 
 ## 構成
@@ -18,7 +18,6 @@ Puppeteer 接続試験の実行基盤（TASK-45.1・Issue #480・ビヘイビア
 | `connect.mjs` | `puppeteer-core` で接続し、結果を 1 行で報告するスクリプト |
 | `crates/fandhe-browser-cdp/tests/script_harness/mod.rs` | サーバー起動・子プロセス実行・結果解析の共有基盤 |
 | `crates/fandhe-browser-cdp/tests/puppeteer_connect.rs` | 基盤の自己テスト（Node 不要。`cargo test --workspace` で常に実行） |
-| `crates/fandhe-browser-cdp/tests/puppeteer_connect_live.rs` | 実 Puppeteer を使う明示実行ターゲット（`test = false`） |
 
 ## スクリプトとの契約
 
@@ -30,18 +29,18 @@ Puppeteer 接続試験の実行基盤（TASK-45.1・Issue #480・ビヘイビア
 
 ## 実行方法
 
-```bash
-make test-puppeteer-connect
-```
-
-`puppeteer-core` が未導入（または `node` が無い）場合は skip せず、理由と導入手順
-（`npm ci --ignore-scripts` を本ディレクトリで実行）を表示して失敗する。
+実 Puppeteer を使う試験ターゲットは未追加（下記「導入状況」）。現時点で実行できるのは
+基盤の自己テスト（`cargo test -p fandhe-browser-cdp --test puppeteer_connect`）のみ。
+`preflight_puppeteer` は `puppeteer-core` 未導入なら skip せず、理由付きで失敗を返す。
 
 ## 導入状況（承認待ち）
 
 `puppeteer-core` の導入・バージョン固定はユーザー承認が必要で、現時点では未承認のため
 `package.json`・`package-lock.json`・CI ジョブは追加していない。したがって実 Puppeteer での
-実行は未検証で、基盤は偽スクリプトで検証している。承認後に追加する内容:
+実行は未検証で、基盤は偽スクリプトで検証している。実試験ターゲットは `cargo test --workspace` で実行されない
+`test = false` 形式にせず、依存導入と CI 組み込みと同時に追加する。承認後に追加する内容:
+
+- 実試験ターゲット（`connect.mjs` の結果で `ok == true` かつ `error == None` を検証する）と `make test-puppeteer-connect`
 
 - `package.json`（`puppeteer-core` を完全固定）と `package-lock.json`、`.gitignore` の `node_modules/`
 - 導入済み版の照合（`preflight_puppeteer`）
