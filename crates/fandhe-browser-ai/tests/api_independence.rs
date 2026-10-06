@@ -1,7 +1,9 @@
 //! CDP がスタブ状態でも `GET /ai/snapshot` を単体で使えることを検証するための
 //! テスト用サーバー組み立てヘルパー
 //! （TASK-20.1・Issue #473、ビヘイビア `AISNAP-7`・MS-4）。
-//! 後続の TASK-20.2（#474）・TASK-20.3（#475）が同じヘルパーへテストを足す。
+//! TASK-20.2（#474）は同じヘルパー上で、スタブ CDP 状態の `GET /ai/snapshot` の応答
+//! （未ナビゲート時の `no_navigation`・ナビゲート後の簡約表現全体）を具体値で検証する。
+//! 後続の TASK-20.3（#475）も同じヘルパーへテストを足す。
 //!
 //! # 前提
 //!
@@ -211,4 +213,174 @@ async fn aisnap7_helper_navigate_is_visible_through_composed_router() {
         .await;
     assert_eq!(foreign.status, 403);
     assert_eq!(foreign.body, br#"{"code":"host_not_allowed"}"#.to_vec());
+}
+
+// ---- TASK-20.2（Issue #474・`AISNAP-7`・MS-4）: スタブ CDP 状態での応答検証 ----
+
+const JSON_CT: &str = "application/json; charset=UTF-8";
+
+/// 記事ページ。`tests/snapshot.rs` の `ARTICLE` と同一（別テストバイナリの private const の
+/// ため複製。ref の期待値も同ファイル `aisnap_1_article_snapshot_structure` の転記）。
+const ARTICLE: &str = r#"<!DOCTYPE html><html><head><title>Rust 入門記事</title><style>p{}</style></head><body><header>サイトヘッダ</header><h1>はじめに</h1><p>詳細は<a href="https://example.com/docs">公式ドキュメント</a>を参照。</p><h2>要点</h2><ul><li>所有権</li><li>借用</li></ul><footer>連絡先</footer></body></html>"#;
+
+/// フォームページ。`tests/snapshot.rs` の `FORM` と同一（hidden 値はダミー）。
+const FORM: &str = r#"<!DOCTYPE html><html><head><title>登録フォーム</title></head><body><div><label for="user">ユーザー名</label><input type="text" id="user" name="user"></div><div><label><input type="checkbox" name="agree" checked>規約に同意</label></div><div><input type="radio" name="plan" aria-label="無料プラン"></div><select name="lang" aria-label="言語"></select><input type="hidden" name="token" value="dummy-hidden-value"><button type="submit">送信</button><button disabled>取消</button></body></html>"#;
+
+/// ref 付きの葉ノード期待 JSON（`api.rs::node_json` の形）。
+fn leaf(role: &str, name: &str, r: &str) -> Value {
+    serde_json::json!({"role": role, "name": name, "ref": r, "children": []})
+}
+
+/// ref 付きノード期待 JSON（子あり）。
+fn node(role: &str, name: &str, r: &str, children: Vec<Value>) -> Value {
+    serde_json::json!({"role": role, "name": name, "ref": r, "children": children})
+}
+
+/// ルート（`document`。ref は `null`）を包むエンベロープ期待 JSON。
+fn envelope(url: &str, doc_name: &str, children: Vec<Value>) -> Value {
+    serde_json::json!({
+        "url": url,
+        "tree": {"role": "document", "name": doc_name, "ref": null, "children": children},
+        "truncated": false,
+    })
+}
+
+fn expected_article(url: &str) -> Value {
+    let list = serde_json::json!({
+        "role": "list", "name": "", "ref": "ecc842c965dec143a",
+        "header": [],
+        "rows": [
+            {"text": "所有権", "truncated": false, "controls": [], "controls_truncated": false},
+            {"text": "借用", "truncated": false, "controls": [], "controls_truncated": false},
+        ],
+        "truncated_rows": 0,
+        "children": [],
+    });
+    envelope(
+        url,
+        "Rust 入門記事",
+        vec![node(
+            "generic",
+            "",
+            "e65477c205c50fefb",
+            vec![node(
+                "generic",
+                "",
+                "e9c1602d3222315df",
+                vec![
+                    leaf("banner", "", "e02d16e1795403182"),
+                    leaf("heading", "はじめに", "e300ae11bc252b0fd"),
+                    node(
+                        "generic",
+                        "",
+                        "edf7a99064530f860",
+                        vec![leaf("link", "公式ドキュメント", "ed45c1d22b4e186f4")],
+                    ),
+                    leaf("heading", "要点", "ee0714a175d20c8b2"),
+                    list,
+                    leaf("contentinfo", "", "ec0aa17bccd809080"),
+                ],
+            )],
+        )],
+    )
+}
+
+fn expected_form(url: &str) -> Value {
+    let mut checkbox = leaf("checkbox", "規約に同意", "eb4e606a8d0b0322c");
+    checkbox["checked"] = Value::Bool(true);
+    let mut radio = leaf("radio", "無料プラン", "e3ca491e4e71deece");
+    radio["checked"] = Value::Bool(false);
+    let mut cancel = leaf("button", "取消", "ebc8665358ad3ea30");
+    cancel["disabled"] = Value::Bool(true);
+    envelope(
+        url,
+        "登録フォーム",
+        vec![node(
+            "generic",
+            "",
+            "e65477c205c50fefb",
+            vec![node(
+                "generic",
+                "",
+                "e9c1602d3222315df",
+                vec![
+                    node(
+                        "generic",
+                        "",
+                        "edf7a99064530f860",
+                        vec![
+                            leaf("generic", "", "ec49e5925d2775d07"),
+                            leaf("textbox", "ユーザー名", "e60f2465f276d6230"),
+                        ],
+                    ),
+                    node(
+                        "generic",
+                        "",
+                        "edf7a99064530f860-2",
+                        vec![node("generic", "", "ec49e5925d2775d07-2", vec![checkbox])],
+                    ),
+                    node("generic", "", "edf7a99064530f860-3", vec![radio]),
+                    leaf("combobox", "言語", "ea907649b0395e5e0"),
+                    leaf("button", "送信", "e764e1c46ab9a2bd6"),
+                    cancel,
+                ],
+            )],
+        )],
+    )
+}
+
+/// CDP 側がスタブ（501・未実装）であることを確認する前提チェック。
+async fn assert_cdp_is_stub(server: &StubServer) {
+    let version = server.get("/json/version").await;
+    assert_eq!(version.status, 501);
+    assert_eq!(version.body, STUB_ERROR_BODY.as_bytes().to_vec());
+}
+
+/// ナビゲート前は CDP がスタブでも `no_navigation`（409）になる（TASK-19.2・`AISNAP-14`）。
+#[tokio::test]
+async fn aisnap7_snapshot_before_navigation_is_no_navigation_while_cdp_is_stubbed() {
+    let server = StubServer::start();
+    assert_cdp_is_stub(&server).await;
+
+    let snap = server.get("/ai/snapshot").await;
+    assert_eq!(snap.status, 409);
+    let wire = String::from_utf8_lossy(&snap.serialize(false)).to_lowercase();
+    assert!(
+        wire.contains(&format!("content-type: {}", JSON_CT.to_lowercase())),
+        "unexpected content-type: {wire}"
+    );
+    let v: Value = serde_json::from_slice(&snap.body).expect("json");
+    assert_eq!(
+        v,
+        serde_json::json!({"code": "no_navigation", "message": "no navigation has been performed yet"})
+    );
+    assert!(server.app().navigation().latest().is_none());
+}
+
+/// ナビゲート済みなら CDP がスタブでも簡約表現全体（エンベロープ・全ノード）が返る。
+#[tokio::test]
+async fn aisnap7_snapshot_returns_full_reduced_tree_while_cdp_is_stubbed() {
+    let server = StubServer::start();
+    assert_cdp_is_stub(&server).await;
+    server.navigate("https://example.com/article", ARTICLE);
+
+    let snap = server.get("/ai/snapshot").await;
+    assert_eq!(snap.status, 200);
+    let v: Value = serde_json::from_slice(&snap.body).expect("json");
+    assert_eq!(v, expected_article("https://example.com/article"));
+}
+
+/// フォームの state（checked・disabled）が出て、hidden 入力値は応答へ漏れない。
+#[tokio::test]
+async fn aisnap7_snapshot_reports_form_state_without_hidden_values_while_cdp_is_stubbed() {
+    let server = StubServer::start();
+    assert_cdp_is_stub(&server).await;
+    server.navigate("https://example.com/form", FORM);
+
+    let snap = server.get("/ai/snapshot").await;
+    assert_eq!(snap.status, 200);
+    let text = String::from_utf8(snap.body.clone()).expect("utf8");
+    assert!(!text.contains("dummy-hidden-value"), "hidden value leaked");
+    let v: Value = serde_json::from_slice(&snap.body).expect("json");
+    assert_eq!(v, expected_form("https://example.com/form"));
 }
