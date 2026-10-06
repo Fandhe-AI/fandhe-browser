@@ -88,7 +88,9 @@
     "page": "dashboard-table",
     "selector": "[data-stability-target=\"13\"]",
     "mutation": "paragraph prepended to body",
-    "poc_case": 13
+    "poc_case": 13,
+    "ref_expected": false,
+    "ref_note": "build_snapshot compresses table data rows and issues no ref for td; exclude from the AISNAP-10 measurement"
   },
   {
     "id": "14-python-download-link",

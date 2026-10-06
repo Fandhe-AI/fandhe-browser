@@ -170,3 +170,25 @@ fn total_fixture_size_is_within_bounds() {
         .sum();
     assert!(total <= MAX_TOTAL_BYTES, "合計サイズ {total} が上限超過");
 }
+
+/// ref を発行しない対象は `ref_expected: false` と理由を明記し、測定対象から除外する契約
+/// （`AISNAP-10`・Issue #111）。現状の除外は表データセルの 13 のみ。
+#[test]
+fn ref_less_cases_declare_exclusion_contract() {
+    let raw = fs::read_to_string(stability_dir().join("cases.json")).expect("cases.json を読める");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("cases.json は JSON");
+    let excluded: Vec<&str> = value
+        .as_array()
+        .expect("cases.json は配列")
+        .iter()
+        .filter(|c| c["ref_expected"] == serde_json::Value::Bool(false))
+        .map(|c| {
+            assert!(
+                c["ref_note"].as_str().is_some_and(|n| !n.is_empty()),
+                "ref_expected=false のケースには ref_note が必要"
+            );
+            c["id"].as_str().expect("id は文字列")
+        })
+        .collect();
+    assert_eq!(excluded, vec!["13-table-data-cell"]);
+}
