@@ -337,9 +337,10 @@ fn preceding_count(doc: &Document, id: NodeId, same: impl Fn(NodeId) -> bool) ->
 /// 識別属性とする）ため、その分も含める。空は snapshot へ入らない要素。
 ///
 /// 出現番号は DOM のみから再現するため、`build_snapshot` が省略する要素（hidden・
-/// 深さ超過・圧縮）が先行すると実際の番号とずれうる。ずれた場合は一致しない側
-/// （`NotIdentified`）へ倒れ、別要素を誤って `Identified` にすることはない（fail-closed）。
-pub fn target_refs(doc: &Document, id: NodeId) -> Vec<(u64, u32)> {
+/// 深さ超過）が先行すると実際の番号とずれうる。ずれた場合は一致しない側
+/// （`NotIdentified`）へ倒れる。圧縮行の操作要素は `entries`（snapshot の平坦化結果）の
+/// 件数と突き合わせ、省略があれば候補を出さない（fail-closed）。
+pub fn target_refs(doc: &Document, id: NodeId, entries: &[FlatEntry]) -> Vec<(u64, u32)> {
     let index = NameIndex::build(doc);
     let mut out = Vec::new();
     if let Some(r) = chain_ref(doc, &index, id) {
@@ -376,7 +377,7 @@ pub fn target_refs(doc: &Document, id: NodeId) -> Vec<(u64, u32)> {
             out.push((d, before.saturating_add(1)));
         }
     }
-    out.extend(compressed_control_refs(doc, &index, id));
+    out.extend(compressed_control_refs(doc, &index, id, entries));
     out
 }
 
@@ -389,7 +390,12 @@ pub fn target_refs(doc: &Document, id: NodeId) -> Vec<(u64, u32)> {
 /// 「コンテナ scope・role（role 無しは `a`→link・他→button）・name・識別属性」で再計算する。
 /// 展開されて圧縮されなかった場合は実在しない ref になり、snapshot 側と一致しない
 /// 候補が増えるだけ（fail-closed）。出現番号は同一ダイジェストの先行要素数から求める。
-fn compressed_control_refs(doc: &Document, index: &NameIndex<'_>, id: NodeId) -> Vec<(u64, u32)> {
+fn compressed_control_refs(
+    doc: &Document,
+    index: &NameIndex<'_>,
+    id: NodeId,
+    entries: &[FlatEntry],
+) -> Vec<(u64, u32)> {
     let is_control = |e: NodeId| {
         let local = doc.local_name(e).unwrap_or("");
         (local == "a" && doc.attribute(e, "href").is_some()) || local == "button"
@@ -428,8 +434,30 @@ fn compressed_control_refs(doc: &Document, index: &NameIndex<'_>, id: NodeId) ->
         let Some(digest) = control_sig(id, scope) else {
             continue;
         };
+        // 行・表の上限と優先保持で省略された要素は ref を持たず、DOM 上の先行数から求めた
+        // 出現番号が後続の保持要素の番号とずれる。保持計画は非公開のため、同ダイジェストの
+        // DOM 上の件数と snapshot 上の件数が食い違う場合は番号を確定できないとして
+        // 候補を出さない（fail-closed。別要素の ref を誤って解決しない）。
+        let in_container = |e: NodeId| doc.ancestors(e).any(|a| a == container);
+        let dom_total = doc
+            .descendants(doc.root())
+            .filter(|&e| {
+                doc.is_element(e)
+                    && is_control(e)
+                    && in_container(e)
+                    && control_sig(e, scope) == Some(digest)
+            })
+            .count();
+        let snapshot_total = entries
+            .iter()
+            .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
+            .filter(|&(d, _)| d == digest)
+            .count();
+        if dom_total != snapshot_total {
+            continue;
+        }
         let before = preceding_count(doc, id, |e| {
-            is_control(e) && control_sig(e, scope) == Some(digest)
+            is_control(e) && in_container(e) && control_sig(e, scope) == Some(digest)
         });
         out.push((digest, before.saturating_add(1)));
     }
@@ -526,7 +554,7 @@ pub fn run_retention_checks(dir: &Path) -> Result<Vec<TaskCheck>, RetentionCheck
         let entries = flatten(&snapshot.tree);
         let target = found
             .first()
-            .map(|id| target_refs(doc, *id))
+            .map(|id| target_refs(doc, *id, &entries))
             .unwrap_or_default();
         out.push(judge(
             task,

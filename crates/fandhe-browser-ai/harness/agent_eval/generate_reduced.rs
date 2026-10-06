@@ -205,7 +205,7 @@ pub fn resolve_golden(fixtures_dir: &Path) -> Result<Vec<ResolvedTask>, Generate
                         index: l.index,
                         found: found.len(),
                     })?;
-            let cands = target_refs(doc, node);
+            let cands = target_refs(doc, node, entries);
             let mut refs: Vec<String> = Vec::new();
             for e in entries {
                 if let Some(r) = &e.r#ref
