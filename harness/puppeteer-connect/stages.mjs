@@ -78,6 +78,7 @@ export async function runStages({ puppeteer, endpoint, stageTimeoutMs = 10000, o
   } finally {
     // 切断は最後の段階。切断が応答しなくても stages を返せるよう期限を設ける。先行段階が
     // 失敗済みなら切断は後始末のみ（失敗・時間切れは先行段階の結果を上書きしない）。
+    onStage("disconnect");
     const allOk = stages.slice(0, -1).every((s) => s.status === "ok");
     try {
       if (browser) {

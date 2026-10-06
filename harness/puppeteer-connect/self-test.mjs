@@ -107,5 +107,16 @@ for (const [at, expected] of [
   assert.equal(h.step, "disconnect");
   assert.equal(h.error.name, "StageTimeout");
 }
+{
+  // 切断中も onStage が通知され、想定外の reject が disconnect 段階へ帰属する（#691 Bugbot）。
+  const seen = [];
+  await runStages({
+    puppeteer: fake().puppeteer,
+    endpoint: "ws://127.0.0.1:1/x",
+    stageTimeoutMs: 200,
+    onStage: (n) => seen.push(n),
+  });
+  assert.deepEqual(seen, ["connect", "newPage", "goto", "selector", "disconnect"]);
+}
 console.log("puppeteer-connect self-test: all passed");
 process.exit(0);
