@@ -593,8 +593,12 @@ fn cdp3_rejects_inconsistent_stage_reports() {
 }
 
 /// CDP-3: 実 `connect.mjs` と同じ生成ロジック（`stages.mjs` の `runStages`）が出す結果行を
-/// Rust 側パーサーで回収できる（JS 側と Rust 側のスキーマ乖離の検知。要 node）。
+/// Rust 側パーサーで回収できる（JS 側と Rust 側のスキーマ乖離の検知）。
+/// node 必須のため `cargo test --workspace` の既定実行から外し、node 必須と明示された
+/// `make check-puppeteer-connect`（`harness/puppeteer-connect/self-test.sh`）が
+/// `--ignored` 付きで実行する。
 #[test]
+#[ignore = "requires node; run via `make check-puppeteer-connect`"]
 fn cdp3_stages_mjs_result_line_satisfies_rust_contract() {
     let dir =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../harness/puppeteer-connect");

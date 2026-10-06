@@ -2,7 +2,7 @@
 #
 # harness/puppeteer-connect の自己テスト（TASK-45.2・#481、ビヘイビア CDP-3）。
 # 呼び出し元は Makefile の check-puppeteer-connect。Puppeteer・ネットワーク不要で、
-# stages.mjs の段階判定と connect.mjs のエンドポイント拒否（結果行 + exit 1）を確認する。
+# stages.mjs の段階判定と Rust 側契約テスト（--ignored）、connect.mjs のエンドポイント拒否（結果行 + exit 1）を確認する。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,3 +24,8 @@ if [ "$status" -ne 1 ] || ! grep -q '^FANDHE_SCRIPT_RESULT {"ok":false,"step":"c
   exit 1
 fi
 echo "ok: non-loopback endpoint is rejected with a result line"
+
+# stages.mjs の結果行が Rust 側パーサー（script_harness）の契約を満たすこと（node 必須のため
+# cargo test の既定実行から外し、ここで --ignored 付きで実行する）。
+cd "$SCRIPT_DIR/../.."
+cargo test -p fandhe-browser-cdp --test puppeteer_connect cdp3_stages_mjs_result_line_satisfies_rust_contract -- --ignored --exact
