@@ -62,4 +62,6 @@ TASK-14（MS-2）の測定対象となる、14 ページ相当以上・5 類型�
 snapshot のテキスト化は測定用の暫定形式で、`/ai/snapshot` の確定応答形式ではない（TASK-19・`AISNAP-6`）。85% 目標の判定は #97 の担当。
 
 `AISNAP-5`（巨大静的ページ単体・TASK-14.5・Issue #96）は同コマンドの `# huge static page reduction vs raw DOM (AISNAP-5)` セクションに出力する。分母は生 HTML ではなく生 DOM シリアライズ（PoC-4 `rawDomSerialize` と同じく `script` / `style` / `noscript` / `svg` / `link` / `meta` を除去した `body` の outerHTML 相当。実装は `benches/token_reduction/raw_dom.rs`）で、対象は `wikipedia-article.html` 1 件。
+`AISNAP-15`（TASK-23.1・Issue #129）の分母となる全フィクスチャの生 DOM シリアライズのトークン量は `cargo bench -p fandhe-browser-ai --bench raw_dom_serialize_reduction` で TSV 出力する（`name` / `bytes` / `rawHtmlTokens` / `rawDomTokens`）。生 DOM の定義は `raw_dom.rs` と同一。対生 DOM 比の削減率・平均は #130（TASK-23.2）、85% 達成判断は #131 の担当。
+
 現行実測は生 DOM 55,917 トークン・snapshot 45,300 トークンで削減率 19.0%（生 HTML 比 19.8%）。85% 目標は未達（現行 snapshot に generic 折り畳みが無いため）で、判定は #97 の担当。フィクスチャは合成ページのため、PoC-4 の実ページ値（92.3%）とは参考比較に留まる。

@@ -77,6 +77,17 @@ path = "benches/token_reduction/raw_dom_tests.rs"
 name = "token_reduction_huge_static"
 path = "benches/token_reduction/huge_static_tests.rs"
 
+# 生 DOM シリアライズのトークンカウント（TASK-23.1・Issue #129・AISNAP-15）。
+# bench ターゲットは cargo test で実行されないため別 [[bench]] / [[test]] に分ける。依存は増やさない。
+[[bench]]
+name = "raw_dom_serialize_reduction"
+path = "benches/raw_dom_serialize_reduction.rs"
+harness = false
+
+[[test]]
+name = "raw_dom_serialize_tokens"
+path = "benches/raw_dom_serialize_reduction/raw_dom_tokens_tests.rs"
+
 # エージェント評価ハーネスのタスク定義テスト（TASK-21.1・Issue #119・AISNAP-8）。
 # harness/ は cargo の自動検出対象外のため path を明示する。外部依存は増やさない。
 [[test]]
