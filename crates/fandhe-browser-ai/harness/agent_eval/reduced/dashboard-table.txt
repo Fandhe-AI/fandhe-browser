@@ -1,0 +1,26 @@
+- document "Data Tables"
+  - generic [e65477c205c50fefb]
+    - generic [e9c1602d3222315df]
+      - generic [edf7a99064530f860]
+        - generic [e935f359bc1f66afc]
+          - generic [e7a056b2d84fccaab]
+            - heading "Data Tables" [edb76a20888919be7]
+            - generic [ed83a9e439076c698]
+            - heading "Example 1" [e08cd167f34fdf055]
+            - table [e4554730d3202cbef]
+              header: columnheader "Last Name" [e091124527e8c0f5e] | columnheader "First Name" [e24cb8d2c3de66d75] | columnheader "Email" [efbc5aa84f79f6cb5] | columnheader "Due" [e64ce3e81e5f27d3d] | columnheader "Web Site" [e27fd6dc38fc82d3b] | columnheader "Action" [ed8a079910e885f2e]
+              Beta | Gamma | user1@example.com | $13.00 | http://www.example.com/site1 | edit delete {link "edit"=ed42c6b3dec4e715c, link "delete"=e5cfbb88de0597dda}
+              Gamma | Zeta | user2@example.com | $26.07 | http://www.example.com/site2 | edit delete {link "edit"=ed42c6b3dec4e715c-2, link "delete"=e5cfbb88de0597dda-2}
+              Delta | Lambda | user3@example.com | $39.14 | http://www.example.com/site3 | edit delete {link "edit"=ed42c6b3dec4e715c-3, link "delete"=e5cfbb88de0597dda-3}
+              Epsilon | River | user4@example.com | $52.21 | http://www.example.com/site4 | edit delete {link "edit"=ed42c6b3dec4e715c-4, link "delete"=e5cfbb88de0597dda-4}
+            - heading "Example 2" [e6514488a51843cc4]
+            - table [e3b61da43c4bbccdc]
+              header: columnheader "Last Name" [eebfd98337577b045] | columnheader "First Name" [eabdc010a4338504a] | columnheader "Email" [e7050d7a1246e400a] | columnheader "Due" [e6320e5713e5114f2] | columnheader "Web Site" [eb3ba1bf364f89654] | columnheader "Action" [e511bfd67629faf75]
+              Sigma | Omega | user9@example.com | $117.00 | http://www.example.com/site9 | edit delete {link "edit"=edb08fdd805d1c497, link "delete"=ea005364209a0eec9}
+              Omega | Garden | user10@example.com | $130.07 | http://www.example.com/site10 | edit delete {link "edit"=edb08fdd805d1c497-2, link "delete"=ea005364209a0eec9-2}
+              River | Bridge | user11@example.com | $143.14 | http://www.example.com/site11 | edit delete {link "edit"=edb08fdd805d1c497-3, link "delete"=ea005364209a0eec9-3}
+              Stone | Pattern | user12@example.com | $156.21 | http://www.example.com/site12 | edit delete {link "edit"=edb08fdd805d1c497-4, link "delete"=ea005364209a0eec9-4}
+      - generic [ec4c3c26977df6403]
+        - generic [e2437b2a931763f73]
+        - generic [e2437b2a931763f73-2]
+          - link "Example Test Site" [e124daae3ea9f2799]

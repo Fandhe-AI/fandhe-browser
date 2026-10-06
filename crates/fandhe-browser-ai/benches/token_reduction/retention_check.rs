@@ -211,6 +211,9 @@ pub struct FlatEntry {
     pub name: String,
     pub r#ref: Option<String>,
     pub data_leaf: Option<DataLeafKind>,
+    /// 圧縮された表・一覧（`Node::table` を持つ Node）か。圧縮行の操作要素の
+    /// 採番・件数照合を、`build_snapshot` が実際に圧縮したコンテナへ限定するために使う。
+    pub compressed: bool,
 }
 
 /// 連続空白を 1 つにまとめて前後を trim する。
@@ -230,6 +233,7 @@ pub fn flatten(root: &Node) -> Vec<FlatEntry> {
             name: node.name.clone(),
             r#ref: node.r#ref.clone(),
             data_leaf: node.data_leaf,
+            compressed: node.table.is_some(),
         });
         if let Some(table) = &node.table {
             for h in &table.header {
@@ -238,6 +242,7 @@ pub fn flatten(root: &Node) -> Vec<FlatEntry> {
                     name: h.name.clone(),
                     r#ref: Some(h.r#ref.clone()),
                     data_leaf: h.data_leaf,
+                    compressed: false,
                 });
             }
             for row in &table.rows {
@@ -247,6 +252,7 @@ pub fn flatten(root: &Node) -> Vec<FlatEntry> {
                         name: c.name.clone(),
                         r#ref: Some(c.r#ref.clone()),
                         data_leaf: None,
+                        compressed: false,
                     });
                 }
             }
@@ -258,7 +264,8 @@ pub fn flatten(root: &Node) -> Vec<FlatEntry> {
 
 /// `ref` 文字列（`e<16hex>[v<n>][-<n>]`）をダイジェストと出現番号（無印は 1）へ分解する。
 /// 形式に合わない文字列は `None`（同一性を確認できないため一致扱いにしない）。
-fn parse_ref(r: &str) -> Option<(u64, u32)> {
+/// agent_eval（TASK-21.2・#120）の ref 解決からも使う。
+pub fn parse_ref(r: &str) -> Option<(u64, u32)> {
     let rest = r.strip_prefix('e')?;
     let digest = u64::from_str_radix(rest.get(..16)?, 16).ok()?;
     let mut tail = rest.get(16..)?;
@@ -336,9 +343,10 @@ fn preceding_count(doc: &Document, id: NodeId, same: impl Fn(NodeId) -> bool) ->
 /// 識別属性とする）ため、その分も含める。空は snapshot へ入らない要素。
 ///
 /// 出現番号は DOM のみから再現するため、`build_snapshot` が省略する要素（hidden・
-/// 深さ超過・圧縮）が先行すると実際の番号とずれうる。ずれた場合は一致しない側
-/// （`NotIdentified`）へ倒れ、別要素を誤って `Identified` にすることはない（fail-closed）。
-pub fn target_refs(doc: &Document, id: NodeId) -> Vec<(u64, u32)> {
+/// 深さ超過）が先行すると実際の番号とずれうる。ずれた場合は一致しない側
+/// （`NotIdentified`）へ倒れる。圧縮行の操作要素は `entries`（snapshot の平坦化結果）の
+/// 件数と突き合わせ、省略があれば候補を出さない（fail-closed）。
+pub fn target_refs(doc: &Document, id: NodeId, entries: &[FlatEntry]) -> Vec<(u64, u32)> {
     let index = NameIndex::build(doc);
     let mut out = Vec::new();
     if let Some(r) = chain_ref(doc, &index, id) {
@@ -374,6 +382,124 @@ pub fn target_refs(doc: &Document, id: NodeId) -> Vec<(u64, u32)> {
             });
             out.push((d, before.saturating_add(1)));
         }
+    }
+    out.extend(compressed_control_refs(doc, &index, id, entries));
+    out
+}
+
+/// 圧縮された表・一覧（`table`/`ul`/`ol`）の行内操作要素（`a[href]`・`button`）が
+/// `TableRow::controls` で受ける ref の（ダイジェスト, 出現番号）候補を返す。
+///
+/// `build_row_controls`（`AISNAP-13`）は行内の操作要素を、中間要素ではなくコンテナ
+/// （圧縮された表・一覧）の ref 直下のスコープで発行するため、祖先鎖から再計算する
+/// 通常の ref とはダイジェストが一致しない。そのため祖先の `table`/`ul`/`ol` ごとに
+/// 「コンテナ scope・role（role 無しは `a`→link・他→button）・name・識別属性」で再計算する。
+/// 展開されて圧縮されなかった場合は実在しない ref になり、snapshot 側と一致しない
+/// 候補が増えるだけ（fail-closed）。出現番号は同一ダイジェストの先行要素数から求める。
+fn compressed_control_refs(
+    doc: &Document,
+    index: &NameIndex<'_>,
+    id: NodeId,
+    entries: &[FlatEntry],
+) -> Vec<(u64, u32)> {
+    let is_control = |e: NodeId| {
+        let local = doc.local_name(e).unwrap_or("");
+        (local == "a" && doc.attribute(e, "href").is_some()) || local == "button"
+    };
+    if !is_control(id) {
+        return Vec::new();
+    }
+    let control_sig = |e: NodeId, scope: ElementRef| {
+        let role = compute_role(doc, e)
+            .map(|r| r.as_str().to_string())
+            .unwrap_or_else(|| {
+                if doc.local_name(e) == Some("a") {
+                    "link".to_string()
+                } else {
+                    "button".to_string()
+                }
+            });
+        let name = compute_name_with_index(doc, index, e);
+        let mut sig = ElementSignature::new(&role, &name.text).with_scope(scope);
+        if let Some(d) = discriminator(doc, e) {
+            sig = sig.with_discriminator(d);
+        }
+        RefAllocator::new()
+            .allocate_signature(&sig)
+            .ok()
+            .map(|r| r.digest)
+    };
+    // snapshot 側で圧縮されたコンテナ（`Node::table` を持つ Node）の ref（ダイジェスト, 出現番号）。
+    let compressed_containers: Vec<(u64, u32)> = entries
+        .iter()
+        .filter(|e| e.compressed)
+        .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
+        .collect();
+    let mut out = Vec::new();
+    for container in doc
+        .ancestors(id)
+        .filter(|&a| matches!(doc.local_name(a), Some("table" | "ul" | "ol")))
+    {
+        let Some(scope) = chain_ref(doc, index, container) else {
+            continue;
+        };
+        let Some(digest) = control_sig(id, scope) else {
+            continue;
+        };
+        // 行・表の上限と優先保持で省略された要素は ref を持たず、DOM 上の先行数から求めた
+        // 出現番号が後続の保持要素の番号とずれる。保持計画は非公開のため、同ダイジェストの
+        // DOM 上の件数と snapshot 上の件数が食い違う場合は番号を確定できないとして
+        // 候補を出さない（fail-closed。別要素の ref を誤って解決しない）。
+        // 同じシグネチャ（= 同じ ref ダイジェスト）のコンテナが複数あると、それぞれの
+        // 操作要素が同じダイジェストを共有し、snapshot 側の件数・出現番号は文書全体で
+        // 通しになる。ただし ref を持つのは `build_snapshot` が圧縮したコンテナの操作要素
+        // だけで、非圧縮（展開）側の操作要素は通常の祖先鎖 ref になる。DOM 側も
+        // 「scope ダイジェストが一致し、かつ snapshot で圧縮されたコンテナ（ref の
+        // ダイジェスト・出現番号で照合）配下」の操作要素だけを数えて採番・比較する。
+        let in_container = |e: NodeId| {
+            doc.ancestors(e).any(|a| {
+                matches!(doc.local_name(a), Some("table" | "ul" | "ol"))
+                    && chain_ref(doc, index, a).is_some_and(|c| {
+                        c.digest == scope.digest && {
+                            let role = compute_role(doc, a);
+                            let occ = preceding_count(doc, a, |x| {
+                                compute_role(doc, x) == role
+                                    && chain_ref(doc, index, x)
+                                        .is_some_and(|y| y.digest == c.digest)
+                            })
+                            .saturating_add(1);
+                            compressed_containers.contains(&(c.digest, occ))
+                        }
+                    })
+            })
+        };
+        // 対象自身が圧縮されたコンテナ配下にない（展開側の操作要素）場合、その ref は通常の
+        // 祖先鎖 ref であり、ここで出現番号を振ると圧縮側の先頭 ref と誤一致する。候補を出さない
+        // （fail-closed。PR #706 指摘）。
+        if !in_container(id) {
+            continue;
+        }
+        let dom_total = doc
+            .descendants(doc.root())
+            .filter(|&e| {
+                doc.is_element(e)
+                    && is_control(e)
+                    && in_container(e)
+                    && control_sig(e, scope) == Some(digest)
+            })
+            .count();
+        let snapshot_total = entries
+            .iter()
+            .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
+            .filter(|&(d, _)| d == digest)
+            .count();
+        if dom_total != snapshot_total {
+            continue;
+        }
+        let before = preceding_count(doc, id, |e| {
+            is_control(e) && in_container(e) && control_sig(e, scope) == Some(digest)
+        });
+        out.push((digest, before.saturating_add(1)));
     }
     out
 }
@@ -468,7 +594,7 @@ pub fn run_retention_checks(dir: &Path) -> Result<Vec<TaskCheck>, RetentionCheck
         let entries = flatten(&snapshot.tree);
         let target = found
             .first()
-            .map(|id| target_refs(doc, *id))
+            .map(|id| target_refs(doc, *id, &entries))
             .unwrap_or_default();
         out.push(judge(
             task,

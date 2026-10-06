@@ -1,0 +1,158 @@
+[
+  {
+    "id": "click-01",
+    "locators": [
+      {"selector": "form#login button[type=submit]", "index": 0, "refs": ["e7e730a2753f66c98"]}
+    ]
+  },
+  {
+    "id": "click-02",
+    "locators": [
+      {"selector": "select#dropdown option[value=\"2\"]", "index": 0, "refs": ["e6cd3a2321c2a2551-3"]}
+    ]
+  },
+  {
+    "id": "click-03",
+    "locators": [
+      {"selector": "form#checkboxes input[type=checkbox]", "index": 0, "refs": ["e91f35187869ba882"]}
+    ]
+  },
+  {
+    "id": "click-04",
+    "locators": [
+      {"selector": "table#table1 tbody a[href=\"#edit\"]", "index": 1, "refs": ["ed42c6b3dec4e715c-2"]}
+    ]
+  },
+  {
+    "id": "click-05",
+    "locators": [
+      {"selector": "span.titleline > a", "index": 1, "refs": ["e59ac323ca8ff7777"]}
+    ]
+  },
+  {
+    "id": "click-06",
+    "locators": [
+      {"selector": "article.product_pod button", "index": 0, "refs": ["e05152084af00280e"]}
+    ]
+  },
+  {
+    "id": "click-07",
+    "locators": [
+      {"selector": "a[href=\"/login\"]", "index": 0, "refs": ["eaad5b1540cf0c2a0"]}
+    ]
+  },
+  {
+    "id": "extract-01",
+    "locators": [
+      {"selector": "table#table1 tbody td", "index": 14, "refs": []}
+    ]
+  },
+  {
+    "id": "extract-02",
+    "locators": [
+      {"selector": "p.price_color", "index": 1, "refs": ["eebd41136ac2ff69e-14"]}
+    ]
+  },
+  {
+    "id": "extract-03",
+    "locators": [
+      {"selector": "span.score", "index": 0, "refs": ["eb0cf8a56844b70d5"]}
+    ]
+  },
+  {
+    "id": "extract-04",
+    "locators": [
+      {"selector": "tbody td", "index": 14, "refs": ["e7b0a026b4af3d2a1"]}
+    ]
+  },
+  {
+    "id": "extract-05",
+    "locators": [
+      {"selector": "span.text", "index": 0, "refs": ["e784578bcfc4c2ad1"]}
+    ]
+  },
+  {
+    "id": "extract-06",
+    "locators": [
+      {"selector": "input#id-search-field", "index": 0, "refs": ["e06f3e346ab33335c"]}
+    ]
+  },
+  {
+    "id": "form-01",
+    "locators": [
+      {"selector": "input#username", "index": 0, "refs": ["ebeb72b7112c3c6c8"]},
+      {"selector": "input#password", "index": 0, "refs": ["ea9274c8151c72700"]},
+      {"selector": "form#login button[type=submit]", "index": 0, "refs": ["e7e730a2753f66c98"]}
+    ]
+  },
+  {
+    "id": "form-02",
+    "locators": [
+      {"selector": "select#dropdown", "index": 0, "refs": ["eb9b697ed4f125035"]}
+    ]
+  },
+  {
+    "id": "form-03",
+    "locators": [
+      {"selector": "input#quantity", "index": 0, "refs": ["e07e25f719b2299fb"]}
+    ]
+  },
+  {
+    "id": "form-04",
+    "locators": [
+      {"selector": "form#checkboxes input[type=checkbox]", "index": 0, "refs": ["e91f35187869ba882"]}
+    ]
+  },
+  {
+    "id": "form-05",
+    "locators": [
+      {"selector": "input#id-search-field", "index": 0, "refs": ["e06f3e346ab33335c"]},
+      {"selector": "form#search-form button[type=submit]", "index": 0, "refs": ["e41c6d260fc008053"]}
+    ]
+  },
+  {
+    "id": "form-06",
+    "locators": [
+      {"selector": "form#search input[name=q]", "index": 0, "refs": ["e3ab79c9359f4ed51"]},
+      {"selector": "form#search input[type=submit]", "index": 0, "refs": ["ed694293ce89a8ce1"]}
+    ]
+  },
+  {
+    "id": "nav-01",
+    "locators": [
+      {"selector": "a#js-link-box-x3", "index": 0, "refs": ["ecfa0575b2df06f2e"]},
+      {"selector": "div.lang3 > a", "index": 0, "refs": ["ecfa0575b2df06f2e"]},
+      {"selector": "li.lang-item > a[title=\"Language 3\"]", "index": 0, "refs": ["e93cab2ec97c3a2ea"]}
+    ]
+  },
+  {
+    "id": "nav-02",
+    "locators": [
+      {"selector": "a[href=\"/docs/ref/group1/item3\"]", "index": 0, "refs": ["eaa09f8e5a0ba62fc"]}
+    ]
+  },
+  {
+    "id": "nav-03",
+    "locators": [
+      {"selector": "a[href=\"/downloads/\"]", "index": 0, "refs": ["ef9c80d60bc16c74d"]}
+    ]
+  },
+  {
+    "id": "nav-04",
+    "locators": [
+      {"selector": "span.pagetop > a[href=\"login?goto=news\"]", "index": 0, "refs": ["e83c7716163c6b424"]}
+    ]
+  },
+  {
+    "id": "nav-05",
+    "locators": [
+      {"selector": "li.next > a", "index": 0, "refs": ["eecb7a375060b0fc8"]}
+    ]
+  },
+  {
+    "id": "nav-06",
+    "locators": [
+      {"selector": "a[href=\"https://example.com/\"]", "index": 0, "refs": ["e124daae3ea9f2799"]}
+    ]
+  }
+]
