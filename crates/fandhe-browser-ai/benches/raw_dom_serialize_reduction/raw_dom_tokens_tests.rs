@@ -3,6 +3,8 @@
 //! 期待値はフィクスチャ・`raw_dom.rs`・core パーサーの現行挙動を固定したもの。
 //! 85% 目標の達成判断は #131 の担当で、ここでは判定しない。
 
+// 共有モジュールの tokens.rs は bench 側の全 API を持つため、このテストが使わない項目が
+// dead_code 警告になる。共有コードの個別削除はできないので理由付きで抑止する。
 #[allow(dead_code)]
 #[path = "../token_reduction/tokens.rs"]
 mod tokens;
@@ -10,6 +12,8 @@ mod tokens;
 #[path = "../token_reduction/raw_dom.rs"]
 mod raw_dom;
 
+// raw_dom_tokens.rs は bench の main から使う項目（実行エントリ等）を含み、
+// テストから参照されない項目が dead_code 警告になるため理由付きで抑止する。
 #[allow(dead_code)]
 #[path = "raw_dom_tokens.rs"]
 mod raw_dom_tokens;
