@@ -614,6 +614,43 @@ struct Frame<'a> {
 ///
 /// ref の発行に失敗した場合 [`SnapshotError::Ref`]。
 pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
+    build_snapshot_inner(doc, None)
+}
+
+/// `Snapshot` が実際に ref を発行した要素 1 件分の記録（`AISNAP-10`・TASK-17.1）。
+///
+/// `build_snapshot` が共有予算つきの `NameIndex` で算出した role・name・ref をそのまま
+/// 保持する。ref の再特定ヘルパー（テスト専用）が名前を再計算せず Snapshot 自身の
+/// 結果を使うための crate 内部フックで、公開 API ではない。
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RefHolder {
+    /// ref を発行した DOM 要素（通常ノード・圧縮表のヘッダセル・行内コントロール）。
+    pub(crate) node: NodeId,
+    pub(crate) role: String,
+    pub(crate) name: String,
+    pub(crate) r#ref: String,
+}
+
+/// [`build_snapshot`] と同じ構築を行い、ref を発行した要素の記録も返す（テスト専用）。
+///
+/// 戻り値の `Snapshot` は `build_snapshot` と同一（内部実装を共有する）。
+#[cfg(test)]
+pub(crate) fn build_snapshot_with_holders(
+    doc: &Document,
+) -> Result<(Snapshot, Vec<RefHolder>), SnapshotError> {
+    let mut holders = Vec::new();
+    let snapshot = build_snapshot_inner(doc, Some(&mut holders))?;
+    Ok((snapshot, holders))
+}
+
+/// [`build_snapshot`] の本体。`sink` が `Some` のときだけ ref 発行要素を記録する
+/// （非テストビルドでは常に `None` で、記録処理は何もしない）。
+#[cfg_attr(not(test), allow(unused_mut, unused_variables))]
+fn build_snapshot_inner(
+    doc: &Document,
+    mut sink: Option<&mut Vec<RefHolder>>,
+) -> Result<Snapshot, SnapshotError> {
     let index = NameIndex::build(doc).with_content_budget(MAX_TOTAL_CONTENT_STEPS);
     let mut refs = RefAllocator::new();
     let mut truncated = false;
@@ -675,6 +712,15 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
             sig = sig.with_scope(scope);
         }
         let elem_ref = refs.allocate_signature(&sig)?;
+        #[cfg(test)]
+        if let Some(sink) = sink.as_deref_mut() {
+            sink.push(RefHolder {
+                node: child,
+                role: role.to_string(),
+                name: name.clone(),
+                r#ref: elem_ref.to_ref_string(),
+            });
+        }
         let mut node = Node::new(role, name)
             .with_ref(elem_ref.to_ref_string())
             .with_state(compute_state(doc, child));
@@ -738,11 +784,33 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
         if let Some((structure, compressed, plans)) = compressible {
             let headers = assign_header_refs(doc, &index, &structure, elem_ref, &mut refs)?;
             truncated |= headers.iter().any(|h| h.name_truncated);
+            #[cfg(test)]
+            if let Some(sink) = sink.as_deref_mut() {
+                for h in &headers {
+                    sink.push(RefHolder {
+                        node: h.cell,
+                        role: h.role.clone(),
+                        name: h.name.clone(),
+                        r#ref: h.elem_ref.to_ref_string(),
+                    });
+                }
+            }
             // 保持された行の操作要素を文書順に収集する（省略行に操作要素がある表は上で圧縮を拒否済み）。
             let mut rows = Vec::with_capacity(compressed.rows.len());
             for (r, plan) in compressed.rows.into_iter().zip(plans.iter()) {
                 let (controls, controls_truncated) =
                     build_row_controls(doc, &index, &mut refs, elem_ref, plan, &mut truncated)?;
+                #[cfg(test)]
+                if let Some(sink) = sink.as_deref_mut() {
+                    for ((id, _), c) in plan.kept.iter().zip(controls.iter()) {
+                        sink.push(RefHolder {
+                            node: *id,
+                            role: c.role.clone(),
+                            name: c.name.clone(),
+                            r#ref: c.r#ref.clone(),
+                        });
+                    }
+                }
                 rows.push(
                     TableRow::new(r.text, r.truncated)
                         .with_controls(controls)
