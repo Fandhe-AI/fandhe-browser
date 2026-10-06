@@ -177,21 +177,34 @@ fn exclusion_cause(doc: &Document, n: NodeId) -> Option<OmissionCause> {
     if !doc.is_element(n) {
         return None;
     }
+    // Snapshot 側（`is_hidden_element`）は `aria-hidden` を HTML ASCII 空白だけで trim する。
+    // `str::trim` は Unicode 空白も除くため使わない。
     if doc.attribute(n, "hidden").is_some()
-        || doc
-            .attribute(n, "aria-hidden")
-            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+        || doc.attribute(n, "aria-hidden").is_some_and(|v| {
+            v.trim_matches(|c| matches!(c, '\t' | '\n' | '\u{0C}' | '\r' | ' '))
+                .eq_ignore_ascii_case("true")
+        })
     {
         return Some(OmissionCause::Hidden);
     }
-    let local = doc.local_name(n).unwrap_or("");
+    // Snapshot 側（`is_html_element_named`）は HTML 名前空間の要素だけを対象にする
+    // （SVG の `<style>` 等は除外しない）。
+    let is_html = doc.namespace_url(n) == Some("http://www.w3.org/1999/xhtml");
+    let named = |name: &str| {
+        is_html
+            && doc
+                .local_name(n)
+                .is_some_and(|l| l.eq_ignore_ascii_case(name))
+    };
+    // `input[type=hidden]` は Snapshot の `normalized_input_type` と同じく小文字化のみで
+    // 前後の空白は除去しない（`type=" hidden "` は無効値で text 扱い。Snapshot では ref を持つ）。
     let non_rendered = ["head", "script", "style", "noscript", "template"]
         .iter()
-        .any(|t| local.eq_ignore_ascii_case(t))
-        || (local.eq_ignore_ascii_case("input")
+        .any(|t| named(t))
+        || (named("input")
             && doc
                 .attribute(n, "type")
-                .is_some_and(|v| v.trim().eq_ignore_ascii_case("hidden")));
+                .is_some_and(|v| v.eq_ignore_ascii_case("hidden")));
     non_rendered.then_some(OmissionCause::Excluded)
 }
 
@@ -850,5 +863,37 @@ fn aisnap_10_unique_selector_tracks_target_after_insertion() {
             name: "Go".into(),
             r#ref: "ee727a43f79604781".into(),
         }
+    );
+}
+
+/// AISNAP-10・TASK-17.1・Issue #110: `type=" hidden "`（前後空白つき）の input は Snapshot では
+/// 無効値として text 扱いで ref を持つため、`OmittedFromSnapshot` ではなく `Stable` を返す。
+#[test]
+fn aisnap_10_input_type_with_spaces_is_not_excluded() {
+    let html = page("<input id=\"t\" type=\" hidden \" aria-label=\"Q\">");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &html,
+        after_html: &html,
+        selector: "#t",
+    });
+    assert!(
+        matches!(&result, Reidentification::Stable { role, name, .. } if role == "textbox" && name == "Q"),
+        "got {result:?}"
+    );
+}
+
+/// AISNAP-10・TASK-17.1・Issue #110: `aria-hidden` の前後の Unicode 空白（NBSP）は Snapshot では
+/// trim されず `true` と一致しないため、対象は省略されない。
+#[test]
+fn aisnap_10_aria_hidden_with_nbsp_is_not_excluded() {
+    let html = page("<button id=\"t\" aria-hidden=\"\u{a0}true\">Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &html,
+        after_html: &html,
+        selector: "#t",
+    });
+    assert!(
+        matches!(&result, Reidentification::Stable { name, .. } if name == "Go"),
+        "got {result:?}"
     );
 }
