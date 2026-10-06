@@ -61,13 +61,22 @@ impl Drop for TempDir {
 
 /// スタブ状態の CDP 側ルータ（代役）。CDP 側は未実装・スタブである前提で、
 /// `GET /json/version` と CDP メソッド呼び出しの代役 `POST /cdp-stub/call` が
-/// 固定の未実装応答（501）を返す。`AppState` は保持するだけでナビゲート状態に触れない。
+/// 固定の未実装応答（501）を返す。加えて、`AppState` 共有の検証用プローブ
+/// `GET /cdp-stub/state` が共有ナビゲート状態の最新 URL を JSON で返す
+/// （CDP の成功応答ではなくテスト専用の観測口。`url` は未ナビゲートなら `null`）。
 fn stub_cdp_router(app: Arc<AppState>) -> Router {
     let version_app = Arc::clone(&app);
+    let state_app = Arc::clone(&app);
     Router::new()
         .route("GET", "/json/version", move |_head, _body| {
             let _ = &version_app;
             stub_error()
+        })
+        .route("GET", "/cdp-stub/state", move |_head, _body| {
+            let url = state_app.navigation().latest().map(|n| n.url().to_string());
+            let body = serde_json::json!({ "url": url }).to_string();
+            Response::new(200, body.into_bytes())
+                .with_content_type("application/json; charset=UTF-8")
         })
         .route("POST", "/cdp-stub/call", move |_head, _body| {
             let _ = &app;
@@ -158,6 +167,27 @@ async fn aisnap7_stub_cdp_and_ai_routers_share_one_app_state() {
     let v: Value = serde_json::from_slice(&snap.body).expect("json");
     assert_eq!(v["code"], "no_navigation");
     assert_eq!(v["message"], "no navigation has been performed yet");
+}
+
+/// スタブ側プローブと AI 側が同一 `AppState` を観測することを具体値で確認する
+/// （別 `AppState` を渡すと CDP 側が `null` のままとなり失敗する）。
+#[tokio::test]
+async fn aisnap7_stub_probe_and_ai_observe_same_navigation_state() {
+    let server = StubServer::start();
+
+    let before = server.get("/cdp-stub/state").await;
+    assert_eq!(before.status, 200);
+    let b: Value = serde_json::from_slice(&before.body).expect("json");
+    assert_eq!(b["url"], Value::Null);
+
+    server.navigate("https://example.com/shared", "<h1>Shared</h1>");
+
+    let cdp = server.get("/cdp-stub/state").await;
+    let c: Value = serde_json::from_slice(&cdp.body).expect("json");
+    assert_eq!(c["url"], "https://example.com/shared");
+    let snap = server.get("/ai/snapshot").await;
+    let a: Value = serde_json::from_slice(&snap.body).expect("json");
+    assert_eq!(a["url"], c["url"]);
 }
 
 #[tokio::test]
