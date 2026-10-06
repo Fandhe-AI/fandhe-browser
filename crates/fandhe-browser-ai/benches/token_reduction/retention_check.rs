@@ -211,6 +211,9 @@ pub struct FlatEntry {
     pub name: String,
     pub r#ref: Option<String>,
     pub data_leaf: Option<DataLeafKind>,
+    /// 圧縮された表・一覧（`Node::table` を持つ Node）か。圧縮行の操作要素の
+    /// 採番・件数照合を、`build_snapshot` が実際に圧縮したコンテナへ限定するために使う。
+    pub compressed: bool,
 }
 
 /// 連続空白を 1 つにまとめて前後を trim する。
@@ -230,6 +233,7 @@ pub fn flatten(root: &Node) -> Vec<FlatEntry> {
             name: node.name.clone(),
             r#ref: node.r#ref.clone(),
             data_leaf: node.data_leaf,
+            compressed: node.table.is_some(),
         });
         if let Some(table) = &node.table {
             for h in &table.header {
@@ -238,6 +242,7 @@ pub fn flatten(root: &Node) -> Vec<FlatEntry> {
                     name: h.name.clone(),
                     r#ref: Some(h.r#ref.clone()),
                     data_leaf: h.data_leaf,
+                    compressed: false,
                 });
             }
             for row in &table.rows {
@@ -247,6 +252,7 @@ pub fn flatten(root: &Node) -> Vec<FlatEntry> {
                         name: c.name.clone(),
                         r#ref: Some(c.r#ref.clone()),
                         data_leaf: None,
+                        compressed: false,
                     });
                 }
             }
@@ -423,6 +429,12 @@ fn compressed_control_refs(
             .ok()
             .map(|r| r.digest)
     };
+    // snapshot 側で圧縮されたコンテナ（`Node::table` を持つ Node）の ref（ダイジェスト, 出現番号）。
+    let compressed_containers: Vec<(u64, u32)> = entries
+        .iter()
+        .filter(|e| e.compressed)
+        .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
+        .collect();
     let mut out = Vec::new();
     for container in doc
         .ancestors(id)
@@ -440,12 +452,25 @@ fn compressed_control_refs(
         // 候補を出さない（fail-closed。別要素の ref を誤って解決しない）。
         // 同じシグネチャ（= 同じ ref ダイジェスト）のコンテナが複数あると、それぞれの
         // 操作要素が同じダイジェストを共有し、snapshot 側の件数・出現番号は文書全体で
-        // 通しになる。DOM 側も同じ範囲（scope ダイジェストが一致するコンテナ配下すべて）で
-        // 数えて snapshot_total と比較・採番する。
+        // 通しになる。ただし ref を持つのは `build_snapshot` が圧縮したコンテナの操作要素
+        // だけで、非圧縮（展開）側の操作要素は通常の祖先鎖 ref になる。DOM 側も
+        // 「scope ダイジェストが一致し、かつ snapshot で圧縮されたコンテナ（ref の
+        // ダイジェスト・出現番号で照合）配下」の操作要素だけを数えて採番・比較する。
         let in_container = |e: NodeId| {
             doc.ancestors(e).any(|a| {
                 matches!(doc.local_name(a), Some("table" | "ul" | "ol"))
-                    && chain_ref(doc, index, a).is_some_and(|c| c.digest == scope.digest)
+                    && chain_ref(doc, index, a).is_some_and(|c| {
+                        c.digest == scope.digest && {
+                            let role = compute_role(doc, a);
+                            let occ = preceding_count(doc, a, |x| {
+                                compute_role(doc, x) == role
+                                    && chain_ref(doc, index, x)
+                                        .is_some_and(|y| y.digest == c.digest)
+                            })
+                            .saturating_add(1);
+                            compressed_containers.contains(&(c.digest, occ))
+                        }
+                    })
             })
         };
         let dom_total = doc

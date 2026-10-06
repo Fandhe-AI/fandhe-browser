@@ -337,3 +337,42 @@ fn aisnap_13_same_signature_compressed_tables_resolve_each_control() {
         );
     }
 }
+
+/// 同一シグネチャの表のうち片方だけが圧縮されない場合、非圧縮側の操作要素を件数・採番に
+/// 含めないため、圧縮側のボタンが snapshot の ref へ解決できる（PR #706 指摘・`AISNAP-10`・`AISNAP-13`）。
+#[test]
+fn aisnap_13_uncompressed_same_signature_table_does_not_break_compressed_control() {
+    use fandhe_browser_ai::snapshot::build_snapshot;
+    use fandhe_browser_core::parse::{ParseOptions, parse_document};
+    use fandhe_browser_core::query::query_selector_all_str;
+    use retention_check::{parse_ref, target_refs};
+
+    let rows: String = (0..120)
+        .map(|i| {
+            if i == 0 {
+                "<tr><td>r0 <button>Del</button></td></tr>".to_owned()
+            } else {
+                format!("<tr><td>row{i}</td></tr>")
+            }
+        })
+        .collect();
+    let big = format!("<table><thead><tr><th>n</th></tr></thead><tbody>{rows}</tbody></table>");
+    let small = "<table><tr><td>x <button>Del</button></td></tr></table>";
+    let html = format!("<html><body>{big}{small}</body></html>");
+    let parsed = parse_document(&html, &ParseOptions::default()).expect("parse");
+    let doc = &parsed.document;
+    let entries = flatten(&build_snapshot(doc).expect("snapshot").tree);
+    let buttons = query_selector_all_str(doc, doc.root(), "button").expect("query");
+    assert_eq!(buttons.len(), 2);
+    let snap_refs: Vec<(u64, u32)> = entries
+        .iter()
+        .filter(|e| e.role == "button")
+        .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
+        .collect();
+    let first = target_refs(doc, buttons[0], &entries);
+    assert!(
+        first.iter().any(|c| snap_refs.contains(c)),
+        "candidates {first:?} not in {snap_refs:?} (compressed={})",
+        entries.iter().filter(|e| e.compressed).count()
+    );
+}
