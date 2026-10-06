@@ -19,6 +19,16 @@
 //! データ葉として公開され、文書順で対応する DOM 要素から本文が読める」ことを固定する。
 //! 文書順対応はフィクスチャ制約（`span.text` より前に除外対象要素が無い）に依存する。
 //!
+//! nav-04 節（TASK-18.3・Issue #117）: 1 セル内に複数リンクが並ぶ上部ナビゲーションで、
+//! 対象リンク（PoC は `past`、評価ハーネスは `login`）を選べること。PoC では表の行圧縮が
+//! セル内の操作要素を先頭 1 件しか拾わず、2 件目以降のリンクに ref が付かず失敗した。
+//! Issue #632 の `TableRow::controls`（行あたり `MAX_ROW_CONTROLS`）で全件を文書順に保持して解消した。
+//!
+//! 2 層構成の理由: 実フィクスチャ `hn-list.html` は入れ子 table のレイアウト表で展開経路
+//! （`row` -> `cell` -> `link`）を通る（層 A）。PoC のバグがあった圧縮経路（`TableRow::controls`）は
+//! `dashboard-table.html` と nav-04 形状の合成表で確かめる（層 B）。ハーネスの nav-04（`login`）と
+//! PoC の nav-04（複数リンクセル内の `past`）は対象が別のため、両方を固定する。
+//!
 //! 呼び出し文脈: core の `parse_document` -> ai の `build_snapshot`。フィクスチャは
 //! 自作の合成ページで外部通信をしない。入力がリポ内資産のため `expect` を使う。
 
@@ -28,7 +38,9 @@ use fandhe_browser_ai::compress_table::{
     IrregularReason, MAX_COLUMNS, MAX_TABLE_ROWS, TableDetection, detect_regular_structure,
 };
 use fandhe_browser_ai::data_leaf::classify_data_leaf;
-use fandhe_browser_ai::snapshot::{DataLeafKind, Node, Snapshot, build_snapshot};
+use fandhe_browser_ai::snapshot::{
+    DataLeafKind, MAX_ROW_CONTROLS, Node, Snapshot, TableRow, TableSummary, build_snapshot,
+};
 use fandhe_browser_core::dom::{Document, NodeId};
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
 use fandhe_browser_core::query::{query_selector_all_str, query_selector_str};
@@ -42,6 +54,24 @@ const EXTRACT_05_REF: &str = "e784578bcfc4c2ad1";
 /// 1 件目の引用文本文（`golden-answers.json` の extract-05。フィクスチャは `&ldquo;`/`&rdquo;`）。
 const EXTRACT_05_QUOTE: &str =
     "\u{201c}River stone beta garden prism record valley vector record theta delta system.\u{201d}";
+
+/// `golden-refs.json` の nav-04（`span.pagetop > a[href="login?goto=news"]`。`login` リンク）。
+const NAV_04_LOGIN_REF: &str = "e83c7716163c6b424";
+
+/// `reduced/hn-list.txt` の `link "past"`（PoC の nav-04 の対象。同一セルに 8 リンクが並ぶ）。
+const NAV_04_PAST_REF: &str = "ebb42928eda4ec7d6";
+
+/// 上部ナビの 1 セルに並ぶリンク名（文書順）。
+const NAV_04_CELL_LINKS: [&str; 8] = [
+    "News Board",
+    "new",
+    "past",
+    "comments",
+    "ask",
+    "show",
+    "jobs",
+    "submit",
+];
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -329,4 +359,192 @@ fn aisnap_13_extract_05_quote_elements_are_exposed_as_quote_leaves() {
         })
         .collect();
     assert_eq!(bodies, vec!["Block quote body.", "Inline quote body."]);
+}
+
+/// 先行順で `role == "link"` の子孫を集める。
+fn links_under(n: &Node) -> Vec<&Node> {
+    all_nodes(n)
+        .into_iter()
+        .filter(|c| c.role == "link")
+        .collect()
+}
+
+/// `past` リンクを子孫に持つ最も内側の `cell`（複数リンクを抱えるセル）を返す。
+fn nav_cell(s: &Snapshot) -> &Node {
+    let cells: Vec<&Node> = all_nodes(&s.tree)
+        .into_iter()
+        .filter(|n| {
+            n.role == "cell"
+                && links_under(n).iter().any(|l| l.name == "past")
+                && !n
+                    .children
+                    .iter()
+                    .any(|c| all_nodes(c).iter().any(|d| d.role == "cell"))
+        })
+        .collect();
+    assert_eq!(cells.len(), 1, "past を含む最内セルはちょうど 1 つ");
+    cells.first().copied().expect("直前で件数を確認済み")
+}
+
+/// `AISNAP-13`・TASK-18.3・Issue #117: 同一セルの 8 リンクがすべて ref 付きで文書順に残る。
+#[test]
+fn aisnap_13_nav_04_links_sharing_one_cell_each_keep_a_ref() {
+    let s = snap(&read_fixture("hn-list.html"));
+    assert!(s.truncated, "上限打ち切りが起きている前提");
+    let cell = nav_cell(&s);
+    let links = links_under(cell);
+    let names: Vec<&str> = links.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, NAV_04_CELL_LINKS);
+    let mut refs: Vec<&str> = links
+        .iter()
+        .map(|l| l.r#ref.as_deref().expect("全リンクに ref がある"))
+        .collect();
+    refs.sort_unstable();
+    refs.dedup();
+    assert_eq!(refs.len(), NAV_04_CELL_LINKS.len(), "ref は重複しない");
+    let past = links.get(2).expect("3 件目");
+    assert_eq!(past.name, "past");
+    assert_eq!(past.r#ref.as_deref(), Some(NAV_04_PAST_REF));
+    let hits = all_nodes(&s.tree)
+        .into_iter()
+        .filter(|n| n.role == "link" && n.name == "past")
+        .count();
+    assert_eq!(hits, 1, "past は Snapshot 内で一意に特定できる");
+}
+
+/// `AISNAP-13`・TASK-18.3・Issue #117: ハーネスの nav-04（`login`）が隣接セルと取り違えず残る。
+#[test]
+fn aisnap_13_nav_04_golden_login_link_is_kept_with_ref() {
+    let doc = parse(&read_fixture("hn-list.html"));
+    let ids = query_selector_all_str(
+        &doc,
+        doc.root(),
+        "span.pagetop > a[href=\"login?goto=news\"]",
+    )
+    .expect("セレクタは有効");
+    assert_eq!(ids.len(), 1, "golden のロケータは 1 要素に対応する");
+    let s = build_snapshot(&doc).expect("構築は成功する");
+    let hits: Vec<&Node> = all_nodes(&s.tree)
+        .into_iter()
+        .filter(|n| n.r#ref.as_deref() == Some(NAV_04_LOGIN_REF))
+        .collect();
+    assert_eq!(hits.len(), 1, "login の ref はちょうど 1 ノード");
+    let login = hits.first().copied().expect("直前で件数を確認済み");
+    assert_eq!(
+        (login.role.as_str(), login.name.as_str()),
+        ("link", "login")
+    );
+    let cell_refs: Vec<&str> = links_under(nav_cell(&s))
+        .iter()
+        .filter_map(|l| l.r#ref.as_deref())
+        .collect();
+    assert!(
+        !cell_refs.contains(&NAV_04_LOGIN_REF),
+        "別セルのリンクである"
+    );
+}
+
+/// `AISNAP-13`・TASK-18.3・Issue #117: 層 A が展開経路である理由（入れ子 table）の対照。
+#[test]
+fn aisnap_13_nav_04_hn_list_is_expanded_because_of_nested_tables() {
+    let doc = parse(&read_fixture("hn-list.html"));
+    let ids = query_selector_all_str(&doc, doc.root(), "table").expect("セレクタは有効");
+    let outer = *ids.first().expect("表がある");
+    assert_eq!(
+        detect_regular_structure(&doc, outer),
+        TableDetection::Irregular(IrregularReason::NestedTable)
+    );
+    let s = build_snapshot(&doc).expect("構築は成功する");
+    assert!(
+        links_under(nav_cell(&s)).len() == NAV_04_CELL_LINKS.len()
+            && all_nodes(&s.tree)
+                .iter()
+                .filter(|n| n.role == "table")
+                .any(|t| t.table.is_none()),
+        "ナビを含む表は展開される"
+    );
+}
+
+/// nav-04 形状（1 セルに 7 リンク + 別セルに login）の圧縮対象の合成表。入れ子なし・title なし。
+fn nav_row_html() -> String {
+    "<!DOCTYPE html><html><head><title>t</title></head><body><table>\
+     <thead><tr><th>Site</th><th>Menu</th><th>Account</th></tr></thead><tbody>\
+     <tr><td>News Board</td>\
+     <td><a href=\"/new\">new</a> | <a href=\"/past\">past</a> | <a href=\"/comments\">comments</a> | \
+     <a href=\"/ask\">ask</a> | <a href=\"/show\">show</a> | <a href=\"/jobs\">jobs</a> | \
+     <a href=\"/submit\">submit</a></td>\
+     <td><a href=\"/login?goto=news\">login</a></td></tr>\
+     <tr><td>plain</td><td>row</td><td>two</td></tr>\
+     </tbody></table></body></html>"
+        .to_string()
+}
+
+fn control_pairs(row: &TableRow) -> Vec<(&str, &str)> {
+    row.controls
+        .iter()
+        .map(|c| (c.role.as_str(), c.name.as_str()))
+        .collect()
+}
+
+/// `AISNAP-13`・TASK-18.3・Issue #117: 圧縮行でも複数リンクセルの全リンクが ref 付きで残る。
+#[test]
+fn aisnap_13_nav_04_compressed_row_keeps_every_link_of_a_multi_link_cell() {
+    let s = snap(&nav_row_html());
+    let summary = only_table(&s).table.as_ref().expect("圧縮経路");
+    let first = summary.rows.first().expect("1 行目");
+    let want: Vec<(&str, &str)> = [
+        "new", "past", "comments", "ask", "show", "jobs", "submit", "login",
+    ]
+    .iter()
+    .map(|n| ("link", *n))
+    .collect();
+    assert_eq!(control_pairs(first), want);
+    assert!(MAX_ROW_CONTROLS >= want.len(), "上限内の構成");
+    assert!(!first.controls_truncated);
+    let mut refs: Vec<&str> = first.controls.iter().map(|c| c.r#ref.as_str()).collect();
+    assert!(refs.iter().all(|r| r.starts_with('e') && r.len() > 1));
+    refs.sort_unstable();
+    refs.dedup();
+    assert_eq!(refs.len(), want.len(), "ref は重複しない");
+    let past = first.controls.iter().filter(|c| c.name == "past").count();
+    assert_eq!(past, 1);
+    // 行文字列はセル内 40 文字で切り詰められるが、操作要素は切り詰めに依存せず全件残る。
+    assert!(first.truncated, "メニューセルの本文は切り詰められる");
+    assert!(first.text.starts_with("News Board | new | past | comments"));
+    assert!(first.text.ends_with(" | login"));
+}
+
+/// `AISNAP-13`・TASK-18.3・Issue #117: 実フィクスチャの圧縮表で同名の操作リンクが行ごとに別 ref。
+#[test]
+fn aisnap_13_nav_04_dashboard_action_links_keep_distinct_refs() {
+    let s = snap(&read_fixture("dashboard-table.html"));
+    let tables: Vec<&TableSummary> = all_nodes(&s.tree)
+        .into_iter()
+        .filter_map(|n| n.table.as_ref())
+        .collect();
+    assert_eq!(tables.len(), 2, "圧縮された表は 2 つ");
+    let mut refs: Vec<&str> = Vec::new();
+    for t in &tables {
+        assert_eq!(t.rows.len(), 4);
+        for row in &t.rows {
+            assert_eq!(
+                control_pairs(row),
+                vec![("link", "edit"), ("link", "delete")]
+            );
+            assert!(!row.controls_truncated);
+            refs.extend(row.controls.iter().map(|c| c.r#ref.as_str()));
+        }
+    }
+    let first = tables.first().and_then(|t| t.rows.first()).expect("先頭行");
+    assert_eq!(
+        first.controls.first().map(|c| c.r#ref.as_str()),
+        Some("ed42c6b3dec4e715c")
+    );
+    assert_eq!(
+        first.controls.get(1).map(|c| c.r#ref.as_str()),
+        Some("e5cfbb88de0597dda")
+    );
+    refs.sort_unstable();
+    refs.dedup();
+    assert_eq!(refs.len(), 16, "全 16 リンクの ref は一意");
 }
