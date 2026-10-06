@@ -4,7 +4,8 @@
 //! （TASK-24.7・#41）が解析する `SelectorList` を組み合わせ、
 //! `Element.matches()` / `querySelector` / `querySelectorAll` 相当の API を
 //! 提供する（TASK-24（24.10）・ビヘイビア `CORE-1`・Issue #418）。`cdp`
-//! （`DOM.querySelector` 系ハンドラ）・`ai`（簡約 DOM 抽出）から呼ばれる想定で、
+//! （`DOM.querySelector` 系ハンドラ）・`ai`（簡約 DOM 抽出）・`cssom::match_rules`
+//! （TASK-105.5・#259。crate 内ヘルパー `matching_selector_indices` 経由）から呼ばれる想定で、
 //! 戻り値は要素の要約（tag・text・attrs 等）ではなく [`crate::dom::NodeId`] に
 //! 留める。呼び出し側が `dom` のアクセサ（`local_name`・`attributes`・
 //! `text_content`）で必要な要約を組み立てる（REPAIR-4: 戻り値は将来拡張できる
@@ -536,6 +537,41 @@ fn element_matches_inner(
         return Ok(false);
     }
     list_matches(document, element, selectors, &mut cache)
+}
+
+/// `element` に一致する [`ComplexSelector`] の添字を昇順で全件返す（最初の一致で
+/// 打ち切らない）。
+///
+/// `cssom::match_rules`（TASK-105.5・#259・`CORE-5`）専用の crate 内ヘルパー。
+/// 詳細度はセレクタリスト内の「一致した複雑セレクタ」の最大値で決まるため、
+/// [`element_matches`] の bool では足りない。第 2 の照合器を作らず
+/// [`complex_matches`] を再利用する。
+///
+/// [`OperationKind::Query`] は記録しない（[`instrumented`] を通さない）。ルールごとに
+/// 呼ばれるため、公開 API 1 回 = 1 件という `REPAIR-9` の件数契約を壊さないための意図的な選択。
+/// `MatchCache` は呼び出しごとに新規に作る（キーが 1 個の `SelectorList` に閉じているため）。
+///
+/// 要素でない・範囲外の `element` は `Ok(vec![])`。
+///
+/// # エラー
+///
+/// [`Error::MatchCacheLimitExceeded`] をそのまま伝播する（「不一致」に丸めない）。
+pub(crate) fn matching_selector_indices(
+    document: &Document,
+    element: NodeId,
+    selectors: &SelectorList,
+) -> Result<Vec<usize>> {
+    let mut indices = Vec::new();
+    if !document.is_element(element) {
+        return Ok(indices);
+    }
+    let mut cache = MatchCache::new();
+    for (selector_idx, complex) in selectors.selectors().iter().enumerate() {
+        if complex_matches(document, element, complex, selector_idx, &mut cache)? {
+            indices.push(selector_idx);
+        }
+    }
+    Ok(indices)
 }
 
 /// `scope` の子孫要素のうち `selectors` に一致するものを、文書順・重複なしで
@@ -1439,6 +1475,31 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].operation(), OperationKind::Query);
         assert_eq!(records[0].outcome(), OperationOutcome::Success);
+    }
+
+    /// CORE-5: `matching_selector_indices` は一致した全添字を昇順で返し、Query を記録しない。
+    #[test]
+    fn core_5_matching_selector_indices_returns_all_matches_without_recording() {
+        use crate::observability::InMemoryRecorder;
+        use std::sync::Arc;
+
+        let mut doc = parse(r#"<div id="b" class="a">x</div>"#);
+        let rec = Arc::new(InMemoryRecorder::with_capacity(8));
+        doc.set_recorder(rec.clone());
+        let div = find_by_local_name(&doc, doc.root(), "div");
+        let list = selectors("div.a, #b, span");
+
+        let got = matching_selector_indices(&doc, div, &list).expect("成功する");
+        assert_eq!(got, vec![0, 1]);
+        assert_eq!(rec.records().len(), 0);
+
+        let none = matching_selector_indices(&doc, div, &selectors("span, p")).expect("成功する");
+        assert_eq!(none, Vec::<usize>::new());
+        let root = matching_selector_indices(&doc, doc.root(), &list).expect("成功する");
+        assert_eq!(root, Vec::<usize>::new());
+        let oob =
+            matching_selector_indices(&doc, NodeId::new(usize::MAX), &list).expect("成功する");
+        assert_eq!(oob, Vec::<usize>::new());
     }
 
     /// REPAIR-9: `_str` 版の selector 解析エラーはちょうど 1 件の `Query` 失敗になる。

@@ -10,13 +10,15 @@
 //! 詳細度計算 [`specificity`] / [`specificities`]（TASK-105.3・#257）、
 //! CSS テキストのルールブロック分割 [`split_rule_blocks`]（TASK-105.4.1・#551）、
 //! DOM からのスタイル源収集と [`Stylesheet`] 構築 [`collect_document_styles`] /
-//! [`parse_stylesheet`] / [`parse_style_attribute`]（TASK-105.4.2・#552）まで。
+//! [`parse_stylesheet`] / [`parse_style_attribute`]（TASK-105.4.2・#552）、
+//! セレクタマッチング [`match_rules`]（TASK-105.5・#259）まで。
 //! 以下は予定している兄弟モジュールで、まだ存在しない（REPAIR-3: 実装済みを装わない）。
 //!
-//! - マッチング（#259）・`computed`: カスケードと computed style API（#260）
+//! - `computed`: カスケードと computed style API（#260）
 //! - 上限検証（#261）・結合テスト（#262）
 
 mod declaration;
+mod matcher;
 mod selector;
 mod stylesheet;
 mod types;
@@ -24,6 +26,7 @@ mod types;
 pub use declaration::{
     MAX_DECLARATION_INPUT_BYTES, MAX_DECLARATIONS_PER_BLOCK, parse_declarations,
 };
+pub use matcher::{MatchedRule, match_rules};
 pub use selector::{specificities, specificity};
 pub use stylesheet::{
     DocumentStyles, InlineStyle, MAX_RULE_BLOCK_ERRORS, MAX_RULES_PER_STYLESHEET,
