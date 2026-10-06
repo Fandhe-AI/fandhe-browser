@@ -8,7 +8,13 @@
 //! `class` 属性値に `price`・`amount`・`currency` を ASCII 大文字小文字非区別の
 //! 部分一致で含み、かつ子要素を持たない末端要素もデータ葉とする
 //! （子要素条件は価格クラス名分岐にのみ掛かる）。`cost` は PoC-4 の規則に無く
-//! 測定ベースライン（TASK-14）が変わるため含めない（拡充は TASK-15・Issue #100 で検討）。
+//! 測定ベースライン（TASK-14）が変わるため含めない。
+//!
+//! 地の文の拡充（TASK-15.2・Issue #100・`AISNAP-11`）として、`class` トークンが
+//! `text`・`description`・`note` に完全一致する末端の非インタラクティブ要素も
+//! [`DataLeafKind::ProseClass`] とする。トークンはフィクスチャ実測（`quotes-list.html` の
+//! `span.text` のみが該当し、表・一覧の子孫に当たらない）に基づく。素の `p` 等のタグ規則や
+//! 部分一致は表・一覧内に広く当たり、圧縮判定（`build.rs`）を通じて TASK-14 の測定値を変えるため採らない。
 //!
 //! 引用文（TASK-15.1・Issue #99・`AISNAP-11`）: HTML 名前空間の `blockquote`/`q` 要素は
 //! 子要素の有無を問わず [`DataLeafKind::Quote`] とする（通常形 `<blockquote><p>…</p></blockquote>`
@@ -19,14 +25,14 @@
 //!
 //! `snapshot::build::build_snapshot` から呼ばれ、結果は `Node::data_leaf`（圧縮表のヘッダは `HeaderCell::data_leaf`。TASK-12.5）に入る
 //! （TASK-13.3・Issue #88。簡約・剪定への利用は後続）。判定規則として実装済みなのは `td`/`th` と
-//! 価格クラス名パターン（TASK-13.2・Issue #87）と `blockquote`/`q`（TASK-15.1・Issue #99）で、
-//! 地の文は TASK-15.2（Issue #100。`AISNAP-11`）、`span.text` 等のクラスベースの引用は未対応
-//! （Issue #100・TASK-18）。
+//! 価格クラス名パターン（TASK-13.2・Issue #87）、引用要素 `blockquote`/`q`（TASK-15.1・Issue #99）、
+//! 地の文クラス（TASK-15.2・Issue #100）。地の文の既知の制約: クラスを持たない地の文・上記 3 語以外の
+//! クラス名・インライン子要素を含む地の文は未検出（汎用テキストブロック検出は未実装。`AISNAP-11`）。
 //!
 //! HTML 名前空間定数を本モジュールに持つ理由: `core` 側の定数は `pub(crate)`、
 //! `snapshot::state` のヘルパーは `pub(super)` で、いずれもここから使えないため。
 
-use fandhe_browser_core::dom::{Document, NodeId};
+use fandhe_browser_core::dom::{Document, NodeData, NodeId};
 
 /// HTML 名前空間の URI（上記の理由でローカルに定義する）。
 const HTML_NAMESPACE_URI: &str = "http://www.w3.org/1999/xhtml";
@@ -43,8 +49,44 @@ pub enum DataLeafKind {
     /// HTML 要素のうち `class` 属性に price/amount/currency を含み、
     /// 要素の子を持たないもの（TASK-13.2・Issue #87）。
     PriceClass,
+    /// `class` トークンが `text`/`description`/`note` に完全一致し、子要素を持たず、
+    /// 直下に非空白テキストを持つ非インタラクティブな地の文要素（TASK-15.2・Issue #100）。
+    ProseClass,
     /// HTML の `blockquote`/`q` 要素（引用文の容器。TASK-15.1・Issue #99・`AISNAP-11`）。
     Quote,
+}
+
+/// 地の文クラスのトークン（ASCII 大文字小文字非区別の完全一致。`AISNAP-11`）。
+const PROSE_CLASS_TOKENS: [&str; 3] = ["text", "description", "note"];
+
+/// `class` のいずれかのトークンが地の文クラスに完全一致するか。
+fn has_prose_class_token(doc: &Document, id: NodeId) -> bool {
+    doc.class_names(id)
+        .any(|t| PROSE_CLASS_TOKENS.iter().any(|p| t.eq_ignore_ascii_case(p)))
+}
+
+/// 直下の Text ノードに非空白文字が 1 つでもあるか。
+fn has_direct_non_whitespace_text(doc: &Document, id: NodeId) -> bool {
+    doc.children(id).any(|c| {
+        matches!(doc.node_data(c), Some(NodeData::Text { contents }) if contents.chars().any(|ch| !ch.is_whitespace()))
+    })
+}
+
+/// 操作対象になりうる要素・属性を持つか（地の文から除外する）。
+fn is_interactive_for_prose(doc: &Document, id: NodeId) -> bool {
+    let tag_interactive = doc.local_name(id).is_some_and(|n| {
+        [
+            "button", "input", "select", "textarea", "label", "summary", "option",
+        ]
+        .iter()
+        .any(|t| n.eq_ignore_ascii_case(t))
+            || ((n.eq_ignore_ascii_case("a") || n.eq_ignore_ascii_case("area"))
+                && doc.attribute(id, "href").is_some())
+    });
+    tag_interactive
+        || ["role", "tabindex", "onclick", "contenteditable"]
+            .iter()
+            .any(|a| doc.attribute(id, a).is_some())
 }
 
 /// 価格系クラス名の部分一致パターン（PoC-4 `reduce.mjs` 由来。すべて小文字・非空）。
@@ -86,7 +128,8 @@ fn is_html_element_named(doc: &Document, id: NodeId, name: &str) -> bool {
 /// 判定順: `td`/`th` は子要素の有無を問わず [`DataLeafKind::TableCell`]。
 /// 次に HTML 要素で `class` 属性全体に価格系パターンを部分一致で含み、かつ
 /// 子要素を持たなければ [`DataLeafKind::PriceClass`]。
-/// 最後に `blockquote`/`q` を [`DataLeafKind::Quote`] とする（TASK-15.1・Issue #99）。
+/// 次に `blockquote`/`q` を [`DataLeafKind::Quote`]（TASK-15.1・Issue #99）、
+/// 最後に地の文クラス（TASK-15.2）を満たせば [`DataLeafKind::ProseClass`] とする。
 /// 非要素・ドキュメントルート・対象外の要素・範囲外の `NodeId` は `None`
 /// （panic しない）。`snapshot::build::build_snapshot` が要素ごとに呼ぶ（TASK-13.3・Issue #88）。
 pub fn classify_data_leaf(doc: &Document, id: NodeId) -> Option<DataLeafKind> {
@@ -103,6 +146,13 @@ pub fn classify_data_leaf(doc: &Document, id: NodeId) -> Option<DataLeafKind> {
         Some(DataLeafKind::PriceClass)
     } else if is_html_element_named(doc, id, "blockquote") || is_html_element_named(doc, id, "q") {
         Some(DataLeafKind::Quote)
+    } else if is_html_element(doc, id)
+        && has_prose_class_token(doc, id)
+        && !has_element_child(doc, id)
+        && has_direct_non_whitespace_text(doc, id)
+        && !is_interactive_for_prose(doc, id)
+    {
+        Some(DataLeafKind::ProseClass)
     } else {
         None
     }
@@ -256,6 +306,93 @@ mod tests {
         assert_eq!(classify_data_leaf(&doc, select(&doc, "text")), None);
     }
 
+    fn prose_kind(html: &str) -> Option<DataLeafKind> {
+        let doc = parse(html);
+        classify_data_leaf(&doc, select(&doc, "#t"))
+    }
+
+    /// AISNAP-11（TASK-15.2・Issue #100）: 地の文クラスは真（大文字・複数トークン含む）。
+    #[test]
+    fn aisnap_11_prose_classes_are_data_leaf() {
+        for c in ["text", "description", "note", "TEXT", "foo note bar"] {
+            let doc = parse(&format!(
+                r#"<div class="quote"><span id="t" class="{c}">本文</span></div>"#
+            ));
+            let id = select(&doc, "#t");
+            assert_eq!(
+                classify_data_leaf(&doc, id),
+                Some(DataLeafKind::ProseClass),
+                "{c}"
+            );
+            assert!(is_data_leaf(&doc, id), "{c}");
+        }
+    }
+
+    /// AISNAP-11: 部分一致は偽。
+    #[test]
+    fn aisnap_11_prose_class_requires_exact_token() {
+        for c in ["text-muted", "selftext", "toc-text", "subtext", "notes"] {
+            let h = format!(r#"<p><span id="t" class="{c}">x</span></p>"#);
+            assert_eq!(prose_kind(&h), None, "{c}");
+        }
+    }
+
+    /// AISNAP-11: 子要素・空・空白のみは偽、コメント併存は真。
+    #[test]
+    fn aisnap_11_prose_class_requires_leaf_with_text() {
+        assert_eq!(
+            prose_kind(r#"<p><span id="t" class="text">a <em>b</em></span></p>"#),
+            None
+        );
+        assert_eq!(
+            prose_kind(r#"<p><span id="t" class="text"></span></p>"#),
+            None
+        );
+        assert_eq!(
+            prose_kind(r#"<p><span id="t" class="text">  </span></p>"#),
+            None
+        );
+        assert_eq!(
+            prose_kind(r#"<p><span id="t" class="text">x<!-- c --></span></p>"#),
+            Some(DataLeafKind::ProseClass)
+        );
+    }
+
+    /// AISNAP-11: インタラクティブ要素・属性は偽。href なしの a は真。
+    #[test]
+    fn aisnap_11_prose_class_excludes_interactive() {
+        for h in [
+            r#"<a id="t" class="text" href="/x">x</a>"#,
+            r#"<button id="t" class="note">x</button>"#,
+            r#"<label id="t" class="text">x</label>"#,
+            r#"<span id="t" class="text" role="button">x</span>"#,
+            r#"<span id="t" class="text" tabindex="0">x</span>"#,
+        ] {
+            assert_eq!(prose_kind(h), None, "{h}");
+        }
+        assert_eq!(
+            prose_kind(r#"<a id="t" class="text">x</a>"#),
+            Some(DataLeafKind::ProseClass)
+        );
+    }
+
+    /// AISNAP-11: 判定順（TableCell > PriceClass > ProseClass）と名前空間。
+    #[test]
+    fn aisnap_11_prose_class_precedence_and_namespace() {
+        assert_eq!(
+            prose_kind(r#"<table><tr><td id="t" class="text">1</td></tr></table>"#),
+            Some(DataLeafKind::TableCell)
+        );
+        assert_eq!(
+            prose_kind(r#"<p><span id="t" class="price text">1</span></p>"#),
+            Some(DataLeafKind::PriceClass)
+        );
+        assert_eq!(
+            prose_kind(r#"<svg><text id="t" class="text">1</text></svg>"#),
+            None
+        );
+    }
+
     /// AISNAP-11（TASK-15.1・Issue #99）: blockquote/q は引用文として真（受入基準）。
     #[test]
     fn aisnap_11_blockquote_and_q_are_quote() {
@@ -315,5 +452,15 @@ mod tests {
         assert_eq!(classify_data_leaf(&doc, select(&doc, "q")), None);
         let doc = parse("<div><cite>c</cite></div>");
         assert_eq!(classify_data_leaf(&doc, select(&doc, "cite")), None);
+    }
+
+    /// AISNAP-11（TASK-15.1・15.2）: 引用要素は地の文クラスより優先して Quote とする。
+    #[test]
+    fn aisnap_11_quote_precedes_prose_class() {
+        let doc = parse(r#"<blockquote class="text">本文</blockquote>"#);
+        assert_eq!(
+            classify_data_leaf(&doc, select(&doc, "blockquote")),
+            Some(DataLeafKind::Quote)
+        );
     }
 }

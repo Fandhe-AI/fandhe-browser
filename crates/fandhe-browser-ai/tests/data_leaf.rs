@@ -678,3 +678,34 @@ fn aisnap_3_is_ref_shaped_follows_ref_contract() {
         assert!(!is_ref_shaped(&ng), "{ng}");
     }
 }
+
+/// 引用一覧形の地の文（`span.text`）の `ProseClass` 件数を数える。
+fn count_prose(html: &str) -> usize {
+    let doc = parse(html);
+    let s = snap(&doc);
+    all_nodes(&s.tree)
+        .into_iter()
+        .filter(|i| i.data_leaf() == Some(DataLeafKind::ProseClass))
+        .count()
+}
+
+/// AISNAP-11（TASK-15.2・Issue #100）: 引用一覧形の最小 HTML で `span.text` だけが地の文。
+#[test]
+fn aisnap_11_prose_class_in_minimal_quote_list() {
+    let html = r#"<main><div class="quote"><span class="text">Quote one.</span>
+<a href="/a" class="text">link</a></div>
+<div class="quote"><span class="text">Quote two.</span></div></main>"#;
+    assert_eq!(count_prose(html), 2);
+}
+
+/// AISNAP-11（TASK-15.2・Issue #100）: `quotes-list.html` の `span.text` 10 件すべてが地の文
+/// （PoC-4 extract-05 相当）。
+#[test]
+fn aisnap_11_prose_class_in_quotes_list_fixture() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("benches")
+        .join("fixtures")
+        .join("quotes-list.html");
+    let html = std::fs::read_to_string(path).expect("フィクスチャは UTF-8 で読める");
+    assert_eq!(count_prose(&html), 10);
+}

@@ -246,10 +246,12 @@ fn subtree_has_lossy(
 /// 表セル以外のデータ葉（価格クラス要素等）か（`AISNAP-3`）。
 ///
 /// 圧縮行はセルのテキストしか保持せず、子孫要素の `Node::data_leaf` 分類が消える。
-/// `td`/`th`（`TableCell`）は圧縮の単位そのものなので除外し、それ以外の分類
-/// （`PriceClass` と将来追加される種別）は保守的に展開を維持する。
+/// `td`/`th`（`TableCell`）は圧縮の単位そのものなので除外する。`ProseClass`（地の文。
+/// `AISNAP-11`・TASK-15.2）を含むそれ以外の分類は、圧縮行（`cell_text` は 40 文字で切り詰め・
+/// 行数上限で省略）が全文と分類を保持できないため、データ葉の保全（`AISNAP-11`）を優先して
+/// 圧縮を拒否し展開を維持する。
 fn has_non_cell_data_leaf(doc: &Document, id: NodeId) -> bool {
-    classify_data_leaf(doc, id).is_some_and(|k| k != DataLeafKind::TableCell)
+    classify_data_leaf(doc, id).is_some_and(|k| !matches!(k, DataLeafKind::TableCell))
 }
 
 /// 圧縮行の文字列で表せない意味的構造（見出し・入れ子の表 / 一覧・ランドマーク等）か。
@@ -1146,6 +1148,21 @@ mod tests {
                 "{html}"
             );
         }
+    }
+
+    /// AISNAP-11 / AISNAP-2: 地の文クラス（`span.text` 等）の子孫は圧縮せず展開し、
+    /// 全文と `DataLeafKind::ProseClass` を保持する（TASK-15.2・Issue #100）。
+    #[test]
+    fn aisnap_11_prose_class_descendant_keeps_expansion_and_classification() {
+        let s = snap(
+            "<body><ul><li><span class=\"text\">alpha quote</span></li><li><span class=\"text\">beta quote</span></li></ul></body>",
+        );
+        assert!(!has_table_summary(&s));
+        let leaves: Vec<_> = all_nodes(&s.tree)
+            .into_iter()
+            .filter(|n| n.data_leaf == Some(DataLeafKind::ProseClass))
+            .collect();
+        assert_eq!(leaves.len(), 2);
     }
 
     /// AISNAP-2（Issue #631）: 子孫テキストが name になる td/tr の title は展開でも name に
