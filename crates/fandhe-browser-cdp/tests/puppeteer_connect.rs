@@ -145,6 +145,30 @@ fn fake_script_child_entry() {
             Some(("E", "m")),
             r#"[{"name":"connect","status":"failed","error":{"name":"E","message":"m"}},{"name":"selector","status":"not_reached","error":null}]"#,
         ),
+        "stages_not_reached_before_failed" => stages_line(
+            false,
+            "newPage",
+            Some(("E", "m")),
+            r#"[{"name":"connect","status":"not_reached","error":null},{"name":"newPage","status":"failed","error":{"name":"E","message":"m"}}]"#,
+        ),
+        "stages_two_failed" => stages_line(
+            false,
+            "connect",
+            Some(("E", "m")),
+            r#"[{"name":"connect","status":"failed","error":{"name":"E","message":"m"}},{"name":"newPage","status":"failed","error":{"name":"E","message":"m"}}]"#,
+        ),
+        "stages_error_mismatch" => stages_line(
+            false,
+            "connect",
+            Some(("Other", "x")),
+            r#"[{"name":"connect","status":"failed","error":{"name":"E","message":"m"}}]"#,
+        ),
+        "stages_error_missing_top_level" => stages_line(
+            false,
+            "connect",
+            None,
+            r#"[{"name":"connect","status":"failed","error":{"name":"E","message":"m"}}]"#,
+        ),
         other => panic!("unknown mode {other}"),
     }
     std::process::exit(0);
@@ -542,6 +566,19 @@ fn cdp3_rejects_inconsistent_stage_reports() {
         (
             "stages_step_mismatch",
             "`step` does not match the first failed stage",
+        ),
+        (
+            "stages_not_reached_before_failed",
+            "`stages[0]` is not_reached before any failed stage",
+        ),
+        ("stages_two_failed", "`stages[1]` is a second failed stage"),
+        (
+            "stages_error_mismatch",
+            "top-level `error` does not match the failed stage error",
+        ),
+        (
+            "stages_error_missing_top_level",
+            "top-level `error` does not match the failed stage error",
         ),
     ];
     for (mode, reason) in cases {

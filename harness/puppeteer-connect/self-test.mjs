@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { runStages } from "./stages.mjs";
 
-function fake({ failAt, nullBody, hangAt, lateRejectAt } = {}) {
+function fake({ failAt, nullBody, hangAt, lateRejectAt, hangDisconnect } = {}) {
   const calls = { disconnect: 0 };
   const maybe = async (name, v) => {
     if (hangAt === name) await new Promise(() => {});
@@ -26,6 +26,7 @@ function fake({ failAt, nullBody, hangAt, lateRejectAt } = {}) {
     newPage: () => maybe("newPage", page),
     disconnect: async () => {
       calls.disconnect++;
+      if (hangDisconnect) await new Promise(() => {});
     },
   };
   return { calls, puppeteer: { connect: () => maybe("connect", browser) } };
@@ -85,6 +86,14 @@ for (const [at, expected] of [
   assert.equal(r.step, "goto");
   assert.equal(r.error.name, "StageTimeout");
   assert.deepEqual(statuses(r), ["connect:ok", "newPage:ok", "goto:failed", "selector:not_reached"]);
+}
+{
+  // 切断が応答しなくても stages を返す（切断にも期限。#691 codex）。
+  const f = fake({ failAt: "goto", hangDisconnect: true });
+  const r = await run(f, 50);
+  assert.equal(r.step, "goto");
+  assert.deepEqual(statuses(r), ["connect:ok", "newPage:ok", "goto:failed", "selector:not_reached"]);
+  assert.equal(f.calls.disconnect, 1);
 }
 console.log("puppeteer-connect self-test: all passed");
 process.exit(0);

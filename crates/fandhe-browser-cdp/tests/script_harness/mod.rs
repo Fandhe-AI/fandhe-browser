@@ -471,6 +471,9 @@ pub fn parse_result_line(stdout: &[u8]) -> Result<Option<ScriptOutcome>, String>
             Some(f) if f.name != step => {
                 return Err("`step` does not match the first failed stage".to_string());
             }
+            Some(f) if f.error != error => {
+                return Err("top-level `error` does not match the failed stage error".to_string());
+            }
             Some(_) => {}
         }
     }
@@ -540,6 +543,17 @@ fn parse_stages(v: Option<&Value>) -> Result<Vec<StageResult>, String> {
         }
         if status == StageStatus::Ok && out.last().is_some_and(|p| p.status != StageStatus::Ok) {
             return Err(format!("`stages[{i}]` is ok after a non-ok stage"));
+        }
+        // 「最初の失敗で止め、残りは not_reached」契約: not_reached は失敗の後にのみ許され、
+        // 失敗段階は 1 つだけ。
+        let failed_seen = out.iter().any(|p| p.status == StageStatus::Failed);
+        if status == StageStatus::NotReached && !failed_seen {
+            return Err(format!(
+                "`stages[{i}]` is not_reached before any failed stage"
+            ));
+        }
+        if status == StageStatus::Failed && failed_seen {
+            return Err(format!("`stages[{i}]` is a second failed stage"));
         }
         out.push(StageResult {
             name: name.to_string(),

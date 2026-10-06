@@ -77,9 +77,10 @@ export async function runStages({ puppeteer, endpoint, stageTimeoutMs = 10000, o
     }
   } finally {
     try {
-      await browser?.disconnect();
+      // 切断が応答しなくても記録済みの stages を返せるよう、切断にも期限を設ける。
+      if (browser) await withTimeout(Promise.resolve().then(() => browser.disconnect()), stageTimeoutMs);
     } catch {
-      // 切断失敗は到達結果に影響させない。
+      // 切断失敗・時間切れは到達結果に影響させない。
     }
   }
   const bad = stages.find((s) => s.status !== "ok");
