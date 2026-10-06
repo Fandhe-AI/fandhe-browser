@@ -15,7 +15,8 @@
 //! - 未ナビゲート時は 409 と `{"code":"no_navigation","message":...}` を返す（成功を装わない。
 //!   TASK-19.2・Issue #224・`AISNAP-14`）。spec 上 `AISNAP-14` の形式・ステータスは検討中で、
 //!   spec の例示形に合わせた暫定確定。エラー本文は全 variant で `code` と `message` の 2 キー
-//! - 共有状態を跨ぐ結合テストは TASK-19.4（Issue #226）が担う
+//! - 共有状態を跨ぐ結合テストは cli の `server.rs` テスト（TASK-19.4・Issue #226。ai ⇔ cdp 依存は
+//!   禁止のため両者を合成できる cli に置く）で実施済み
 //! - 将来プラグインレジストリ（`PLUG-2`・TASK-92）を持つ ai 固有の状態型へ
 //!   `Arc<AppState>` を内包する形で差し替える余地がある
 //!
