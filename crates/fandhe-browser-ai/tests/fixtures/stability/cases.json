@@ -1,0 +1,137 @@
+[
+  {
+    "id": "01-login-submit",
+    "page": "login-form",
+    "selector": "#login button",
+    "mutation": "banner div prepended to body",
+    "poc_case": 1
+  },
+  {
+    "id": "02-login-username",
+    "page": "login-form",
+    "selector": "#username",
+    "mutation": "paragraph prepended to form",
+    "poc_case": 2
+  },
+  {
+    "id": "03-dropdown-select",
+    "page": "dropdown-form",
+    "selector": "#dropdown",
+    "mutation": "h2 heading prepended to body",
+    "poc_case": 3
+  },
+  {
+    "id": "04-checkbox-first",
+    "page": "checkboxes-form",
+    "selector": "[data-stability-target=\"04\"]",
+    "mutation": "skip-link anchor prepended to body",
+    "poc_case": 4
+  },
+  {
+    "id": "05-number-input",
+    "page": "inputs-form",
+    "selector": "#quantity",
+    "mutation": "nav with link prepended to body",
+    "poc_case": 5
+  },
+  {
+    "id": "06-quote-text",
+    "page": "quotes-list",
+    "selector": "[data-stability-target=\"06\"]",
+    "mutation": "banner div prepended to body",
+    "poc_case": 6
+  },
+  {
+    "id": "07-quote-tag-link",
+    "page": "quotes-list",
+    "selector": "[data-stability-target=\"07\"]",
+    "mutation": "paragraph appended to footer",
+    "poc_case": 7
+  },
+  {
+    "id": "08-hn-first-title",
+    "page": "hn-list",
+    "selector": "[id=\"40000000\"] .titleline > a",
+    "mutation": "ad div prepended to body",
+    "poc_case": 8
+  },
+  {
+    "id": "09-hn-more-link",
+    "page": "hn-list",
+    "selector": "a.morelink",
+    "mutation": "paragraph appended to body",
+    "poc_case": 9
+  },
+  {
+    "id": "10-ec-price",
+    "page": "ec-product-list",
+    "selector": "[data-stability-target=\"10\"]",
+    "mutation": "text-only nav prepended to body",
+    "poc_case": 10
+  },
+  {
+    "id": "11-ec-product-link",
+    "page": "ec-product-list",
+    "selector": "h3 a[href=\"catalogue/item-1/index.html\"]",
+    "mutation": "div prepended to body",
+    "poc_case": 11
+  },
+  {
+    "id": "12-table-header-cell",
+    "page": "dashboard-table",
+    "selector": "[data-stability-target=\"12\"]",
+    "mutation": "h1 heading prepended to body",
+    "poc_case": 12
+  },
+  {
+    "id": "13-table-data-cell",
+    "page": "dashboard-table",
+    "selector": "[data-stability-target=\"13\"]",
+    "mutation": "paragraph prepended to body",
+    "poc_case": 13,
+    "ref_expected": false,
+    "ref_note": "build_snapshot compresses table data rows and issues no ref for td; exclude from the AISNAP-10 measurement"
+  },
+  {
+    "id": "14-python-download-link",
+    "page": "python-portal",
+    "selector": "[href=\"/downloads/\"]",
+    "mutation": "cookie consent div prepended to body",
+    "poc_case": 14
+  },
+  {
+    "id": "15-wiki-language-link",
+    "page": "wiki-portal-nav",
+    "selector": "#js-link-box-x0",
+    "mutation": "div prepended to body",
+    "poc_case": 15
+  },
+  {
+    "id": "16-login-password",
+    "page": "login-form",
+    "selector": "#password",
+    "mutation": "paragraph appended to body",
+    "poc_case": null
+  },
+  {
+    "id": "17-hn-second-title",
+    "page": "hn-list",
+    "selector": "[id=\"40000001\"] .titleline > a",
+    "mutation": "ad div prepended to body",
+    "poc_case": null
+  },
+  {
+    "id": "18-quotes-author-link",
+    "page": "quotes-list",
+    "selector": "[href=\"/author/author-1\"]",
+    "mutation": "banner div prepended to body",
+    "poc_case": null
+  },
+  {
+    "id": "19-quotes-login-link",
+    "page": "quotes-list",
+    "selector": "[href=\"/login\"]",
+    "mutation": "div prepended to body",
+    "poc_case": null
+  }
+]
