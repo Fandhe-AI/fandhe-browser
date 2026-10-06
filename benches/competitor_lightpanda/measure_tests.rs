@@ -543,6 +543,8 @@ fn run_test_cases() {
     {
         eprintln!("case: lookup_port_owner_pids_returns_own_pid_for_listener");
         lookup_port_owner_pids_returns_own_pid_for_listener();
+        eprintln!("case: check_port_owner_verifies_direct_child_listener");
+        check_port_owner_verifies_direct_child_listener();
         eprintln!("case: check_port_owner_rejects_foreign_listener");
         check_port_owner_rejects_foreign_listener();
     }
@@ -1753,6 +1755,51 @@ fn lookup_port_owner_pids_returns_own_pid_for_listener() {
             std::process::id()
         ),
         other => panic!("expected Ok(Some(pids)) on linux/macos/windows, got {other:?}"),
+    }
+}
+
+/// PERF-3（TASK-84.6・Issue #698）: 直接の子が LISTEN している場合、
+/// `check_port_owner` はプロセス表照会なしで `Verified` を返す。
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn check_port_owner_verifies_direct_child_listener() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("local_addr").port()
+    };
+    let current_exe = std::env::current_exe().expect("current_exe");
+    let mut child = std::process::Command::new(&current_exe)
+        .arg(FAKE_ROLE_FLAG)
+        .arg("cdp-ok")
+        .arg("--port")
+        .arg(port.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn cdp-ok");
+    let child_pid = child.id();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200))
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let result = if ready {
+        Some(measure::check_port_owner(child_pid, port))
+    } else {
+        None
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    match result {
+        Some(Ok(measure::PortOwnerVerdict::Verified)) => {}
+        other => panic!("expected Verified for a direct child listener, got {other:?}"),
     }
 }
 
