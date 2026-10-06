@@ -9,6 +9,16 @@
 //! `MAX_COLUMNS`（20）を超えるため圧縮せず展開経路（`row` -> `cell`）を通る（層 A）。
 //! 圧縮 `TableSummary::rows` 経路は 20 列以下の合成表で確かめる（層 B）。
 //!
+//! extract-05 節（TASK-18.2・Issue #116）: `quotes-list` の 1 件目の引用文本文の抽出。
+//! PoC では `span.text`（価格・表セル以外の地の文）がデータ葉判定の対象外で、簡約表現に
+//! 引用文が現れず失敗した。TASK-15（`AISNAP-11`）で `DataLeafKind::ProseClass` /
+//! `DataLeafKind::Quote` が加わり解消した。
+//!
+//! 契約: Snapshot は地の文葉の本文を `Node::name` に持たない（`span` の role は `generic` で
+//! 内容命名の対象外。値は ref で別途取得する前提・`AISNAP-3`）。本節は「引用要素が ref 付きの
+//! データ葉として公開され、文書順で対応する DOM 要素から本文が読める」ことを固定する。
+//! 文書順対応はフィクスチャ制約（`span.text` より前に除外対象要素が無い）に依存する。
+//!
 //! 呼び出し文脈: core の `parse_document` -> ai の `build_snapshot`。フィクスチャは
 //! 自作の合成ページで外部通信をしない。入力がリポ内資産のため `expect` を使う。
 
@@ -17,13 +27,21 @@ use std::path::PathBuf;
 use fandhe_browser_ai::compress_table::{
     IrregularReason, MAX_COLUMNS, MAX_TABLE_ROWS, TableDetection, detect_regular_structure,
 };
+use fandhe_browser_ai::data_leaf::classify_data_leaf;
 use fandhe_browser_ai::snapshot::{DataLeafKind, Node, Snapshot, build_snapshot};
-use fandhe_browser_core::dom::Document;
+use fandhe_browser_core::dom::{Document, NodeId};
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
-use fandhe_browser_core::query::query_selector_str;
+use fandhe_browser_core::query::{query_selector_all_str, query_selector_str};
 
 /// `AISNAP-10` の ref 安定性に基づく固定値（`harness/agent_eval/golden-refs.json` の extract-04）。
 const EXTRACT_04_REF: &str = "e7b0a026b4af3d2a1";
+
+/// `AISNAP-10` の ref 安定性に基づく固定値（`golden-refs.json` の extract-05。`span.text` 0 番目）。
+const EXTRACT_05_REF: &str = "e784578bcfc4c2ad1";
+
+/// 1 件目の引用文本文（`golden-answers.json` の extract-05。フィクスチャは `&ldquo;`/`&rdquo;`）。
+const EXTRACT_05_QUOTE: &str =
+    "\u{201c}River stone beta garden prism record valley vector record theta delta system.\u{201d}";
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -197,4 +215,118 @@ fn aisnap_13_extract_04_column_cap_boundary_switches_path() {
         (cell.role.as_str(), cell.name.as_str()),
         ("cell", "r0c14-14")
     );
+}
+
+/// 先行順で `data_leaf == Some(kind)` のノードを集める。
+fn leaves_of(s: &Snapshot, kind: DataLeafKind) -> Vec<&Node> {
+    all_nodes(&s.tree)
+        .into_iter()
+        .filter(|n| n.data_leaf == Some(kind))
+        .collect()
+}
+
+/// DOM 要素の本文（空白を 1 個に正規化）。
+fn normalized_text(doc: &Document, id: NodeId) -> String {
+    let raw = doc.text_content(id).expect("要素の本文は取得できる");
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `AISNAP-13`・TASK-18.2・Issue #116: 引用文の要素が ref 付き地の文葉として公開される。
+/// 本文は `name` に載らない現行契約（`AISNAP-3`）のため、name は検査しない。
+#[test]
+fn aisnap_13_extract_05_quote_body_node_is_exposed_with_ref() {
+    let s = snap(&read_fixture("quotes-list.html"));
+    assert!(!s.truncated, "quotes-list は打ち切られない");
+    let leaves = leaves_of(&s, DataLeafKind::ProseClass);
+    assert_eq!(leaves.len(), 10, "引用文は 10 件");
+    let first = leaves.first().expect("先頭がある");
+    assert_eq!(first.role, "generic");
+    assert_eq!(first.r#ref.as_deref(), Some(EXTRACT_05_REF));
+    assert!(first.table.is_none());
+    let mut refs: Vec<&str> = leaves
+        .iter()
+        .map(|n| n.r#ref.as_deref().expect("全葉に ref がある"))
+        .collect();
+    refs.sort_unstable();
+    refs.dedup();
+    assert_eq!(refs.len(), 10, "ref は重複しない");
+}
+
+/// `AISNAP-13`・TASK-18.2・Issue #116: ref 付き葉と文書順で対応する DOM 要素から 1 件目の
+/// 本文が一意に読める。
+#[test]
+fn aisnap_13_extract_05_quote_body_text_is_read_from_matching_dom_element() {
+    let html = read_fixture("quotes-list.html");
+    let doc = parse(&html);
+    let ids = query_selector_all_str(&doc, doc.root(), "span.text").expect("セレクタは有効");
+    assert_eq!(ids.len(), 10, "DOM 側も 10 件（Snapshot 側と一致）");
+    let first = *ids.first().expect("1 件目");
+    assert_eq!(
+        classify_data_leaf(&doc, first),
+        Some(DataLeafKind::ProseClass)
+    );
+    assert_eq!(normalized_text(&doc, first), EXTRACT_05_QUOTE);
+    let hits = ids
+        .iter()
+        .filter(|id| normalized_text(&doc, **id) == EXTRACT_05_QUOTE)
+        .count();
+    assert_eq!(hits, 1, "本文は一意");
+    let s = build_snapshot(&doc).expect("構築は成功する");
+    assert_eq!(leaves_of(&s, DataLeafKind::ProseClass).len(), ids.len());
+}
+
+/// `AISNAP-13`・TASK-18.2・Issue #116: 同一シグネチャの兄弟（著者 span・tags）と取り違えない。
+#[test]
+fn aisnap_13_extract_05_body_is_not_confused_with_author_or_tags() {
+    let s = snap(&read_fixture("quotes-list.html"));
+    let parent = all_nodes(&s.tree)
+        .into_iter()
+        .find(|n| {
+            n.children
+                .iter()
+                .any(|c| c.r#ref.as_deref() == Some(EXTRACT_05_REF))
+        })
+        .expect("対象の親がある");
+    let target = parent.children.first().expect("先頭の子");
+    assert_eq!(target.r#ref.as_deref(), Some(EXTRACT_05_REF));
+    let author = parent.children.get(1).expect("著者 span");
+    let tags = parent.children.get(2).expect("tags div");
+    assert_eq!(author.data_leaf, None);
+    assert_eq!(tags.data_leaf, None);
+    assert_ne!(author.r#ref, target.r#ref);
+    assert_ne!(tags.r#ref, target.r#ref);
+    let link_names = |n: &Node| -> Vec<String> {
+        all_nodes(n)
+            .into_iter()
+            .filter(|c| c.role == "link")
+            .map(|c| c.name.clone())
+            .collect()
+    };
+    assert_eq!(link_names(author), vec!["(about)"]);
+    assert_eq!(link_names(tags), vec!["alpha", "beta", "gamma"]);
+}
+
+/// `AISNAP-13`・TASK-18.2・Issue #116: 実際の引用要素（`blockquote`・`q`）も `Quote` 葉として
+/// 公開され、対応する DOM 要素から本文が読める。
+#[test]
+fn aisnap_13_extract_05_quote_elements_are_exposed_as_quote_leaves() {
+    let html = "<!DOCTYPE html><html><head><title>t</title></head><body>\
+        <blockquote><p>Block quote body.</p></blockquote>\
+        <p>Lead <q>Inline quote body.</q></p></body></html>";
+    let doc = parse(html);
+    let s = build_snapshot(&doc).expect("構築は成功する");
+    let leaves = leaves_of(&s, DataLeafKind::Quote);
+    assert_eq!(leaves.len(), 2, "blockquote と q の 2 件");
+    assert!(leaves.iter().all(|n| n.r#ref.is_some()));
+    let bodies: Vec<String> = ["blockquote", "q"]
+        .iter()
+        .map(|sel| {
+            let ids = query_selector_all_str(&doc, doc.root(), sel).expect("セレクタは有効");
+            assert_eq!(ids.len(), 1);
+            let id = *ids.first().expect("1 件");
+            assert_eq!(classify_data_leaf(&doc, id), Some(DataLeafKind::Quote));
+            normalized_text(&doc, id)
+        })
+        .collect();
+    assert_eq!(bodies, vec!["Block quote body.", "Inline quote body."]);
 }
