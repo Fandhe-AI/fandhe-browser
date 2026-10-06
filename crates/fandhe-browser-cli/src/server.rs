@@ -2,8 +2,9 @@
 //!
 //! `main` から呼ばれ、プロファイルを開いて core の `AppState` を 1 つ生成し、cdp の
 //! ルータ・WS 受け口（`fandhe_browser_cdp::endpoints`）を同一リスナーへ載せて待ち受ける。
-//! 依存方向は cli → cdp / core / profile の一方向（`self-repair-design.md` 決定 3）。
-//! AI API ルータ（TASK-19）は [`RouterFactory`] 経由で同じ `Arc<AppState>` から合成する。
+//! 依存方向は cli → cdp / ai / core / profile の一方向（`self-repair-design.md` 決定 3）。
+//! AI API ルータ（ai の `/ai/*`。TASK-19.3・#225）は [`default_router_factories`] が返す
+//! [`RouterFactory`] 経由で同じ `Arc<AppState>` から合成する。
 //!
 //! # スタブについて
 //!
@@ -16,7 +17,6 @@
 //!   現状は [`DEFAULT_ADDR`] 固定
 //! - feature `rendering` 時の描画実装の注入: render crate が `Renderer` を実装した時点
 //!   （TASK-33・`RENDER-1`）で `AppState::new` へ渡す。現状は常に無効レンダラー
-//! - AI API ルータ: TASK-19 で `fandhe-browser-ai` を依存に加え、[`RouterFactory`] として渡す
 //!
 //! # 対応 OS
 //!
@@ -47,8 +47,16 @@ pub(crate) const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr:
 /// 追加ルータ（AI API 等）を、CDP と同じ `Arc<AppState>` から組み立てるファクトリ。
 ///
 /// 組み立て済みの `Router` ではなくファクトリを渡させることで、`AppState` の共有
-/// （`AISNAP-6`）を型の上で強制する。TASK-19 では `Box::new(|app| ai_router(app))` の形で渡す。
+/// （`AISNAP-6`）を型の上で強制する。既定の一覧は [`default_router_factories`]。
 pub(crate) type RouterFactory = Box<dyn FnOnce(Arc<AppState>) -> Router>;
+
+/// 既定で CDP のルータへ合成する追加ルータ（現状は ai の `/ai/*` のみ。`AISNAP-6`・TASK-19.3）。
+///
+/// `main` が [`run`] へ渡す。ai の `router` は cdp と互いに依存せず、`Arc<AppState>` だけを共有する。
+/// ルート衝突は [`StartupError::RouteConflict`] で起動を失敗させる（fail-closed）。
+pub(crate) fn default_router_factories() -> Vec<RouterFactory> {
+    vec![Box::new(fandhe_browser_ai::api::router)]
+}
 
 /// プロファイル隔離が未対応の OS（現状 Windows）で起動に失敗した際の固定文言。
 ///
@@ -471,6 +479,113 @@ mod tests {
             assert_eq!((status, body.as_str()), (200, "pong"));
             let (status, _, _) = blocking(move || get(addr, "/json/version")).await;
             assert_eq!(status, 200);
+        }
+
+        /// 合成済みの実 ai ルータ（`main` と同じ `default_router_factories`）で、`/json/*` と
+        /// `/ai/snapshot` が同一リスナーから返ること（`AISNAP-6`・TASK-19.3）。
+        #[tokio::test]
+        async fn aisnap6_serves_json_and_ai_snapshot_on_same_listener() {
+            let dir = TempDir::new();
+            let app = open_app_state(&FixedStore(dir.path.clone())).unwrap();
+            let (bound, cdp) = bind(
+                &app,
+                "127.0.0.1:0".parse().unwrap(),
+                default_router_factories(),
+            )
+            .await
+            .unwrap();
+            let addr = bound.local_addr().unwrap();
+            tokio::spawn(bound.run());
+            let id = cdp.browser_id().as_str().to_string();
+
+            let (status, _, body) = blocking(move || get(addr, "/json/version")).await;
+            assert_eq!(status, 200);
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                v["webSocketDebuggerUrl"],
+                format!("ws://127.0.0.1:{}/devtools/browser/{id}", addr.port())
+            );
+            let (status, _, _) = blocking(move || get(addr, "/json/list")).await;
+            assert_eq!(status, 200);
+
+            // 未ナビゲートでも 404 ではなく 409 が返る = ai ルータへ到達している（AISNAP-14）。
+            let (status, _, body) = blocking(move || get(addr, "/ai/snapshot")).await;
+            assert_eq!(status, 409);
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                serde_json::json!({
+                    "code": "no_navigation",
+                    "message": "no navigation has been performed yet"
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn aisnap6_ai_snapshot_returns_200_after_navigation_commit() {
+            use fandhe_browser_core::NavigationResult;
+
+            let dir = TempDir::new();
+            let app = open_app_state(&FixedStore(dir.path.clone())).unwrap();
+            let (bound, _cdp) = bind(
+                &app,
+                "127.0.0.1:0".parse().unwrap(),
+                default_router_factories(),
+            )
+            .await
+            .unwrap();
+            let addr = bound.local_addr().unwrap();
+            tokio::spawn(bound.run());
+
+            let nav = app.navigation();
+            let g = nav.begin_navigation().expect("begin");
+            nav.commit_navigation(
+                g,
+                NavigationResult::new(
+                    "https://example.com/",
+                    "<title>Example Domain</title><h1>Example Domain</h1>",
+                ),
+            )
+            .expect("commit");
+
+            let (status, head, body) = blocking(move || get(addr, "/ai/snapshot")).await;
+            assert_eq!(status, 200);
+            assert!(
+                head.to_ascii_lowercase()
+                    .contains("content-type: application/json; charset=utf-8"),
+                "{head}"
+            );
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["url"], "https://example.com/");
+            assert_eq!(v["tree"]["role"], "document");
+            assert_eq!(v["tree"]["name"], "Example Domain");
+        }
+
+        /// 合成後も DNS rebinding 対策（Host 検証）が効くこと（SEC 系・OWASP A01/A05）。
+        #[tokio::test]
+        async fn sec_ai_snapshot_rejects_disallowed_host_on_composed_listener() {
+            let dir = TempDir::new();
+            let app = open_app_state(&FixedStore(dir.path.clone())).unwrap();
+            let (bound, _cdp) = bind(
+                &app,
+                "127.0.0.1:0".parse().unwrap(),
+                default_router_factories(),
+            )
+            .await
+            .unwrap();
+            let addr = bound.local_addr().unwrap();
+            tokio::spawn(bound.run());
+
+            let (status, _, body) = blocking(move || {
+                http(
+                    addr,
+                    "GET /ai/snapshot HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n"
+                        .to_string(),
+                )
+            })
+            .await;
+            assert_eq!(status, 403);
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["code"], "host_not_allowed");
         }
 
         #[tokio::test]

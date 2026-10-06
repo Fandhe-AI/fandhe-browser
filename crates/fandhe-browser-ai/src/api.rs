@@ -4,7 +4,7 @@
 //! （`AISNAP-1` 方式 B）を構築し、JSON で返す `GET /ai/snapshot` ルータを提供する。
 //! [`router`] は bind・アクセス制御（loopback 限定。`SEC-4`）を行わないが、DNS rebinding 対策として
 //! `Host` ヘッダ（localhost / IP リテラルのみ許可）を cdp と共通の core 実装で検証する。cli が
-//! `RouterFactory` として受け取り、cdp のルータと `Router::merge` で合成する想定
+//! `RouterFactory` として受け取り、cdp のルータと `Router::merge` で合成する
 //! （TASK-19.3・Issue #225）。cdp と ai は互いに依存せず、`Arc<AppState>` だけを共有する。
 //!
 //! # スタブ・暫定仕様について（REPAIR-3）

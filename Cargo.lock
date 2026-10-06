@@ -716,6 +716,7 @@ dependencies = [
  "fandhe-backend-core",
  "fandhe-backend-http",
  "fandhe-backend-routes",
+ "fandhe-browser-ai",
  "fandhe-browser-cdp",
  "fandhe-browser-core",
  "fandhe-browser-profile",
