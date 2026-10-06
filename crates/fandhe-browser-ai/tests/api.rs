@@ -1,5 +1,5 @@
 //! `fandhe_browser_ai::api::router` の `/ai/snapshot` 結合テスト
-//! （TASK-19.1・Issue #223、ビヘイビア `AISNAP-6`・MS-4）。
+//! （TASK-19.1・Issue #223、TASK-19.2・Issue #224、ビヘイビア `AISNAP-6`・`AISNAP-14`・MS-4）。
 //!
 //! TCP bind はせず `Router::dispatch` へ直接渡す。`AppState` の構築には `Profile::open` が
 //! 必要で、非 unix では `ProfileError::Unsupported` を返す仕様のため `#[cfg(unix)]` とする
@@ -105,12 +105,26 @@ async fn aisnap6_snapshot_follows_shared_state_updates() {
 }
 
 #[tokio::test]
-async fn aisnap6_snapshot_before_navigation_is_409() {
+async fn aisnap14_snapshot_before_navigation_is_409_no_navigation() {
     let dir = TempDir::new();
     let app = app(&dir);
     let res = get(&app, "/ai/snapshot").await;
     assert_eq!(res.status, 409);
-    assert_eq!(res.body, br#"{"code":"no_navigation"}"#.to_vec());
+    let v: Value = serde_json::from_slice(&res.body).expect("json");
+    assert_eq!(v["code"], "no_navigation");
+    assert_eq!(v["message"], "no navigation has been performed yet");
+    // 409 の後にナビゲートすると同じ AppState で 200 になる
+    navigate(&app, "https://example.com/", "<h1>x</h1>");
+    assert_eq!(get(&app, "/ai/snapshot").await.status, 200);
+}
+
+#[tokio::test]
+async fn aisnap14_host_check_precedes_navigation_check() {
+    let dir = TempDir::new();
+    let app = app(&dir);
+    let res = get_with_host(&app, "/ai/snapshot", Some("evil.example:9222")).await;
+    assert_eq!(res.status, 403);
+    assert_eq!(res.body, br#"{"code":"host_not_allowed"}"#.to_vec());
 }
 
 #[tokio::test]

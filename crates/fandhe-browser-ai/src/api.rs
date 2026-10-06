@@ -12,8 +12,9 @@
 //! - JSON の形は spec `api-ai-snapshot.md` の想定スキーマ（検討中）に寄せた暫定形で、
 //!   確定スキーマではない。エンベロープは `{"url", "tree", "truncated"}`。`url` は
 //!   `NavigationResult::url` の値で、[`Snapshot`] 型には持たせない
-//! - 未ナビゲート時は 409 と固定 JSON を返す（成功を装わない）。エラー本文の確定形と
-//!   テストは TASK-19.2（Issue #224・`AISNAP-14`）が担う
+//! - 未ナビゲート時は 409 と `{"code":"no_navigation","message":...}` を返す（成功を装わない。
+//!   TASK-19.2・Issue #224・`AISNAP-14`）。spec 上 `AISNAP-14` の形式・ステータスは検討中で、
+//!   spec の例示形に合わせた暫定確定。エラー本文は全 variant で `code` と `message` の 2 キー
 //! - 共有状態を跨ぐ結合テストは TASK-19.4（Issue #226）が担う
 //! - 将来プラグインレジストリ（`PLUG-2`・TASK-92）を持つ ai 固有の状態型へ
 //!   `Arc<AppState>` を内包する形で差し替える余地がある
@@ -39,11 +40,11 @@ use crate::snapshot::{CheckedState, DataLeafKind, Node, Snapshot, TableSummary, 
 const JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 
 /// `/ai/snapshot` 処理の失敗。`Display` は固定の英語文言で、URL・HTML・内部エラーの
-/// 詳細を含めない（情報漏えい防止）。
+/// 詳細を含めない（情報漏えい防止）。応答本文の `message` に使われる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ApiError {
-    /// 直近のナビゲート結果がない（`AISNAP-14`。確定形は TASK-19.2）。
+    /// 直近のナビゲート結果がない。409 / `no_navigation` で返す（`AISNAP-14`・TASK-19.2）。
     NoNavigation,
     /// HTML のパースに失敗した。
     Parse,
@@ -56,7 +57,7 @@ pub enum ApiError {
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            ApiError::NoNavigation => "no navigation",
+            ApiError::NoNavigation => "no navigation has been performed yet",
             ApiError::Parse => "failed to parse document",
             ApiError::Snapshot => "failed to build snapshot",
             ApiError::Serialize => "failed to serialize snapshot",
@@ -92,7 +93,8 @@ fn host_error_response(e: HostError) -> Response {
     Response::new(status, body).with_content_type(JSON_CONTENT_TYPE)
 }
 
-/// 固定文言のエラー応答。`NoNavigation` は 409（200 で成功を装わない）、他は 500。
+/// 固定文言のエラー応答 `{"code", "message"}`。`NoNavigation` は 409（200 で成功を装わない）、他は 500。
+/// `message` は [`ApiError`] の `Display`（固定文言）で、リクエスト由来の値を含めない。
 fn error_response(e: ApiError) -> Response {
     let (status, code) = match e {
         ApiError::NoNavigation => (409, "no_navigation"),
@@ -100,7 +102,9 @@ fn error_response(e: ApiError) -> Response {
         ApiError::Snapshot => (500, "snapshot_failed"),
         ApiError::Serialize => (500, "serialize_failed"),
     };
-    let body = json!({ "code": code }).to_string().into_bytes();
+    let body = json!({ "code": code, "message": e.to_string() })
+        .to_string()
+        .into_bytes();
     Response::new(status, body).with_content_type(JSON_CONTENT_TYPE)
 }
 
@@ -352,18 +356,50 @@ mod tests {
         assert_eq!(v["tree"]["role"], "document");
     }
 
+    fn error_json(e: ApiError) -> (u16, Value) {
+        let res = error_response(e);
+        let v: Value = serde_json::from_slice(&res.body).expect("json");
+        (res.status, v)
+    }
+
     #[test]
-    fn aisnap6_no_navigation_is_an_error_not_a_fake_success() {
+    fn aisnap14_no_navigation_is_409_with_code_and_message() {
         let nav = NavigationState::new();
         assert_eq!(snapshot_body(&nav), Err(ApiError::NoNavigation));
         let res = error_response(ApiError::NoNavigation);
         assert_eq!(res.status, 409);
-        assert_eq!(res.body, br#"{"code":"no_navigation"}"#.to_vec());
+        let v: Value = serde_json::from_slice(&res.body).expect("json");
+        assert_eq!(v["code"], "no_navigation");
+        assert_eq!(v["message"], "no navigation has been performed yet");
+        assert_eq!(v.as_object().expect("object").len(), 2);
     }
 
     #[test]
-    fn aisnap6_error_display_is_fixed_text() {
-        assert_eq!(ApiError::Parse.to_string(), "failed to parse document");
-        assert_eq!(error_response(ApiError::Parse).status, 500);
+    fn aisnap14_error_bodies_have_code_and_fixed_message() {
+        for (e, status, code, message) in [
+            (
+                ApiError::Parse,
+                500,
+                "parse_failed",
+                "failed to parse document",
+            ),
+            (
+                ApiError::Snapshot,
+                500,
+                "snapshot_failed",
+                "failed to build snapshot",
+            ),
+            (
+                ApiError::Serialize,
+                500,
+                "serialize_failed",
+                "failed to serialize snapshot",
+            ),
+        ] {
+            let (s, v) = error_json(e);
+            assert_eq!(s, status);
+            assert_eq!(v["code"], code);
+            assert_eq!(v["message"], message);
+        }
     }
 }
