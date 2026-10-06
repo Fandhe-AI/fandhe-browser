@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Login Page</title>
+<script src="/js/vendor/app.js"></script>
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<div class="notice">Notice: scheduled maintenance tonight.</div>
+<div class="row">
+<div id="content" class="large-12 columns">
+<h2>Login Page</h2>
+<h4 class="subheader">This is where you can log into the secure area. Enter dummy-user and dummy-pass to continue.</h4>
+<form name="login" id="login" action="/authenticate" method="post">
+<div class="row">
+<div class="large-6 small-12 columns">
+<label for="username">Username</label>
+<input type="text" name="username" id="username">
+</div>
+</div>
+<div class="row">
+<div class="large-6 small-12 columns">
+<label for="password">Password</label>
+<input type="password" name="password" id="password">
+</div>
+</div>
+<button class="radius" type="submit"><i class="fa fa-2x fa-sign-in"> Login</i></button>
+</form>
+</div>
+</div>
+<div id="page-footer">
+<hr>
+<div>Powered by <a href="https://example.com/">Example Test Site</a></div>
+</div>
+</body>
+</html>

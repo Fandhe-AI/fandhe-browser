@@ -1,7 +1,7 @@
 # エージェント評価ハーネス: 代表タスク 25 件と golden answer
 
 TASK-21.1（MS-2・`AISNAP-8`・Issue #119）。簡約表現と生 HTML をエージェントに渡したときの成功率を比較するための、代表タスクと正解の定義。
-親は #118。TASK-21.2（#120）が簡約表現の生成ハーネス、後続の #121 が採点・成功率算出。
+親は #118。TASK-21.2（#120）が簡約表現の生成ハーネス、TASK-21.3（#121）が採点・成功率算出。
 
 ## ファイル
 
@@ -13,6 +13,8 @@ TASK-21.1（MS-2・`AISNAP-8`・Issue #119）。簡約表現と生 HTML をエ�
 | `golden-answers.json` | 採点側。**エージェントへ渡さない**。`tasks.rs` から生成 |
 | `generate_reduced.rs` | 簡約表現の生成とロケータの ref 解決（TASK-21.2・#120）。#121 は `#[path]` で取り込む |
 | `generate_reduced_tests.rs` | `[[test]] agent_eval_generate_reduced`。25 タスク全件の生成・生成物一致を固定する |
+| `score.rs` | 回答の採点・種別別集計・70% 判定（TASK-21.3・#121。純ロジック） |
+| `score_tests.rs` | `[[test]] agent_eval_score`。合成回答で採点器を検証する（実回答は含まない） |
 | `reduced/<page>.txt` | エージェントへ渡す簡約表現（`tasks.rs` が指す 13 ページ分）。生成物。データ葉（価格・引用・地の文クラス）の本文と `option` のラベル・value は snapshot が持たないため、生成器が DOM から補う（回答可能性の確保） |
 | `golden-refs.json` | 採点側。**エージェントへ渡さない**。golden の各ロケータを解決した ref（解決不能は空配列）。生成物 |
 
@@ -65,4 +67,40 @@ cargo test -p fandhe-browser-ai --test agent_eval_tasks
 # 簡約表現（reduced/*.txt）と golden-refs.json を書き直す・検証する
 AGENT_EVAL_WRITE=1 cargo test -p fandhe-browser-ai --test agent_eval_generate_reduced
 cargo test -p fandhe-browser-ai --test agent_eval_generate_reduced
+```
+
+## 採点（TASK-21.3）
+
+`score.rs` は別途取得したエージェント回答を golden と照合する。実エージェントの回答と測定結果（`results.json`）は本リポジトリに含めない。「全体 70% 以上」の実測は親 #118 の工程で、採点器のテストは合成回答で検算するだけである（`REPAIR-3`）。
+
+回答ファイルはタスク id をキーにした配列。回答不能はエントリ欠落または該当フィールドが `null`。未知フィールドは無視する。
+
+```json
+[
+  {"id": "click-01", "ref": "<ref>"},
+  {"id": "extract-02", "value": "<value>"},
+  {"id": "form-01", "steps": [
+    {"action": "fill", "ref": "<ref>", "value": "<value>"},
+    {"action": "click", "ref": "<ref>"}
+  ]},
+  {"id": "nav-03", "ref": null}
+]
+```
+
+| golden | 合格条件 |
+| ------ | -------- |
+| `ref`（click・nav） | 回答 ref が、全ロケータの解決済み ref のいずれかに一致（`golden-refs.json`） |
+| `value`（extract） | 空白を正規化した完全一致（大文字小文字は区別）。ref では比較しないため extract-01 も値が合えば合格 |
+| `steps`（form） | 手順数・各手順の action・ref・value が順序どおりに一致 |
+
+- 不合格の分類: `unanswered` / `invalid_shape` / `mismatch` / `golden_unresolved`（golden の ref が未解決。fail-closed）。
+- 成功率は 4 種別（click・extract・form・nav）と全体。判定は `pass * 100 >= 70 * total`（丸め前の整数比較）。
+- 回答 JSON は外部入力として上限検証する（1 MiB・64 件・32 手順・文字列 4096 バイト）。重複 id・未知 id はエラー。
+
+```bash
+# 採点ロジックの検証（合成回答のみ）
+cargo test -p fandhe-browser-ai --test agent_eval_score
+
+# 実回答を採点して結果を stdout へ出す（results.json は AGENT_EVAL_WRITE=1 併用時のみ書く）
+AGENT_EVAL_ANSWERS=/abs/path/answers.json cargo test -p fandhe-browser-ai --test agent_eval_score -- --nocapture aisnap8_score_real_answers_if_requested
 ```
