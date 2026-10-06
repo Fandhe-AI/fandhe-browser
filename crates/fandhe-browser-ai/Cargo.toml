@@ -87,3 +87,8 @@ path = "harness/agent_eval/tasks_tests.rs"
 [[test]]
 name = "agent_eval_generate_reduced"
 path = "harness/agent_eval/generate_reduced_tests.rs"
+
+# 採点・種別別集計（TASK-21.3・Issue #121・AISNAP-8）。依存は増やさない（serde_json は既存）。
+[[test]]
+name = "agent_eval_score"
+path = "harness/agent_eval/score_tests.rs"
