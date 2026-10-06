@@ -62,4 +62,5 @@ stability/
   `ref_expected` キーが無いケースは ref を持つ前提（測定対象）として扱う。判定側（#110・#112）は
   `ref_expected == false` のケースを分母から除外すること
 - 本ディレクトリは入力資産のみ。破損率の算出・判定（#110・#112）と閾値 10% の妥当性判断（#113）は対象外
+- 破損率の算出は `src/reference_stability/measure.rs`、結果は `docs/design/reference-stability-report.md`（#112）
 - 棚卸しは `tests/stability_fixtures.rs` が固定する
