@@ -38,7 +38,7 @@ fandhe-browser/
 │   ├── fandhe-browser-cdp/        #   CDP 互換サーバー
 │   ├── fandhe-browser-render/     #   Servo 組込（feature gate `rendering`・MPL-2.0 隔離）
 │   ├── fandhe-browser-profile/    #   プロファイル分離
-│   ├── fandhe-browser-cli/        #   CLI（最小雛形: core・profile・cdp を組み立ててサーバー起動。サブコマンドは TASK-47）
+│   ├── fandhe-browser-cli/        #   CLI（最小雛形: core・profile・cdp・ai を組み立ててサーバー起動。サブコマンドは TASK-47）
 │   └── fandhe-browser-mcp/        #   MCP 参照プラグイン（別バイナリ。予定）
 ├── tests/ / benches/              #（予定）結合テスト・ベンチ
 ├── scripts/                       # 依存グラフ検査等のスクリプト。check-render-isolation.sh（TASK-34.1・RENDER-1）・check-js-engine-isolation.sh（TASK-32.4・JS-1）
