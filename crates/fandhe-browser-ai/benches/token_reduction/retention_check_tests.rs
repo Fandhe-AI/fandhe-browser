@@ -297,3 +297,43 @@ fn not_identified_row_shows_reason() {
         "dropdown-select\tdropdown-form.html\tselect#dropdown\tno\t1\t0\t-\t-\t-\tfalse\tno-matching-node"
     );
 }
+
+/// 同一シグネチャの圧縮表が複数あり、各表の行内ボタンが同名でも、DOM 側の件数・出現番号を
+/// snapshot と同じ範囲（文書全体）で数えるため、どちらのボタンも snapshot の ref へ解決できる
+/// （PR #706 指摘・`AISNAP-10`・`AISNAP-13`）。
+#[test]
+fn aisnap_13_same_signature_compressed_tables_resolve_each_control() {
+    use fandhe_browser_ai::snapshot::build_snapshot;
+    use fandhe_browser_core::parse::{ParseOptions, parse_document};
+    use fandhe_browser_core::query::query_selector_all_str;
+    use retention_check::{parse_ref, target_refs};
+
+    let rows: String = (0..120)
+        .map(|i| {
+            if i == 0 {
+                "<tr><td>r0 <button>Del</button></td></tr>".to_owned()
+            } else {
+                format!("<tr><td>row{i}</td></tr>")
+            }
+        })
+        .collect();
+    let table = format!("<table><thead><tr><th>n</th></tr></thead><tbody>{rows}</tbody></table>");
+    let html = format!("<html><body>{table}{table}</body></html>");
+    let parsed = parse_document(&html, &ParseOptions::default()).expect("parse");
+    let doc = &parsed.document;
+    let entries = flatten(&build_snapshot(doc).expect("snapshot").tree);
+    let buttons = query_selector_all_str(doc, doc.root(), "button").expect("query");
+    assert_eq!(buttons.len(), 2);
+    let snap_refs: Vec<(u64, u32)> = entries
+        .iter()
+        .filter(|e| e.role == "button")
+        .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
+        .collect();
+    for id in buttons {
+        let cands = target_refs(doc, id, &entries);
+        assert!(
+            cands.iter().any(|c| snap_refs.contains(c)),
+            "candidates {cands:?} not in {snap_refs:?}"
+        );
+    }
+}

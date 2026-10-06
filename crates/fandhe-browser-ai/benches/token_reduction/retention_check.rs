@@ -438,7 +438,16 @@ fn compressed_control_refs(
         // 出現番号が後続の保持要素の番号とずれる。保持計画は非公開のため、同ダイジェストの
         // DOM 上の件数と snapshot 上の件数が食い違う場合は番号を確定できないとして
         // 候補を出さない（fail-closed。別要素の ref を誤って解決しない）。
-        let in_container = |e: NodeId| doc.ancestors(e).any(|a| a == container);
+        // 同じシグネチャ（= 同じ ref ダイジェスト）のコンテナが複数あると、それぞれの
+        // 操作要素が同じダイジェストを共有し、snapshot 側の件数・出現番号は文書全体で
+        // 通しになる。DOM 側も同じ範囲（scope ダイジェストが一致するコンテナ配下すべて）で
+        // 数えて snapshot_total と比較・採番する。
+        let in_container = |e: NodeId| {
+            doc.ancestors(e).any(|a| {
+                matches!(doc.local_name(a), Some("table" | "ul" | "ol"))
+                    && chain_ref(doc, index, a).is_some_and(|c| c.digest == scope.digest)
+            })
+        };
         let dom_total = doc
             .descendants(doc.root())
             .filter(|&e| {
