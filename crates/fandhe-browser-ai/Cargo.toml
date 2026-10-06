@@ -24,12 +24,23 @@ publish.workspace = true
 # 追加しない（依存最小方針）。
 [dependencies]
 fandhe-browser-core = { path = "../fandhe-browser-core" }
+# TASK-19.1（Issue #223・AISNAP-6）: `/ai/snapshot` のルータ・レスポンス構築・JSON 生成。
+# いずれも workspace 定義の完全固定版を参照するだけで新規バージョンは導入しない
+# （fandhe-backend-* は #171、serde_json は #419 の承認範囲。cdp と同じ構成）。
+# ai crate での利用を明記した承認ではないため PR レビューで可否を確認する。
+fandhe-backend-http = { workspace = true }
+fandhe-backend-routes = { workspace = true }
+serde_json = { workspace = true }
 
 # TASK-14.2（Issue #93・AISNAP-1・MS-2）: 生 HTML のトークン量算出に使う
 # tiktoken-rs（cl100k_base）。採否は Issue #92 に記録済み。計測は benches/ に
 # 閉じるため dev-dependencies のみとし、配布バイナリの依存グラフへ入れない。
 [dev-dependencies]
 tiktoken-rs = { workspace = true }
+# api の結合テストで AppState 構築に使う Profile::open 専用（ai → profile は許可済み）
+fandhe-browser-profile = { path = "../fandhe-browser-profile" }
+# 結合テストの #[tokio::test]（feature は workspace 定義のまま）
+tokio = { workspace = true }
 
 # 生 HTML トークン量の計測ベンチ。独自 main で結果を stdout へ出すため
 # harness = false。TASK-14.3（Issue #94・AISNAP-1）で snapshot 側の計測・削減率・平均を追加した。
