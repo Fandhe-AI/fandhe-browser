@@ -18,10 +18,11 @@ Puppeteer 接続試験の実行基盤（TASK-45.1・Issue #480・ビヘイビア
 | -------- | ---- |
 | `connect.mjs` | `puppeteer-core` で段階実行し、結果を 1 行で報告するスクリプト |
 | `stages.mjs` | 段階実行の純粋ロジック（クライアント注入可）。connect → newPage → goto → selector → disconnect |
-| `contract-sample.mjs` | Rust 側パーサーとの契約テスト用に `stages.mjs` の出力を再現する（`tests/puppeteer_connect.rs` から実行。要 node） |
+| `contract-sample.mjs` | Rust 側パーサーとの契約テスト用に `stages.mjs` の出力を再現する（`tests/puppeteer_contract.rs` から実行。要 node） |
 | `self-test.mjs` / `self-test.sh` | `stages.mjs` と `connect.mjs` のオフライン自己テスト（`make check-puppeteer-connect`。要 node） |
 | `crates/fandhe-browser-cdp/tests/script_harness/mod.rs` | サーバー起動・子プロセス実行・結果解析の共有基盤 |
-| `crates/fandhe-browser-cdp/tests/puppeteer_connect.rs` | 基盤の自己テスト（`cargo test --workspace` で常に実行。契約テスト 1 件のみ node を使う） |
+| `crates/fandhe-browser-cdp/tests/puppeteer_connect.rs` | 基盤の自己テスト（unix のみ。`cargo test --workspace` で常に実行。node 不要） |
+| `crates/fandhe-browser-cdp/tests/puppeteer_contract.rs` | `stages.mjs` と Rust パーサーの契約テスト 1 件（3 OS。要 node。`#[ignore]` のため `self-test.sh` が `--ignored` で実行し、0 件実行は fail） |
 
 ## スクリプトとの契約
 
@@ -42,7 +43,8 @@ Puppeteer 接続試験の実行基盤（TASK-45.1・Issue #480・ビヘイビア
 ## 実行方法
 
 実 Puppeteer を使う試験ターゲットは未追加（下記「導入状況」）。現時点で実行できるのは
-基盤の自己テスト（`cargo test -p fandhe-browser-cdp --test puppeteer_connect`）のみ。
+基盤の自己テスト（`cargo test -p fandhe-browser-cdp --test puppeteer_connect`）と、
+`make check-puppeteer-connect`（`stages.mjs` の自己テストと契約テスト `puppeteer_contract`）のみ。
 `preflight_puppeteer` は `puppeteer-core` 未導入なら skip せず、理由付きで失敗を返す。
 
 ## 導入状況（承認待ち）

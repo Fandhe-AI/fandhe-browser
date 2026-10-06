@@ -628,5 +628,5 @@ check-playwright-trace: ## harness/playwright-trace のオフライン自己テ�
 	bash harness/playwright-trace/self-test.sh
 
 .PHONY: check-puppeteer-connect
-check-puppeteer-connect: ## harness/puppeteer-connect のオフライン自己テストを実行する（Puppeteer・ネットワーク不要。要 node。TASK-45.2）
+check-puppeteer-connect: ## harness/puppeteer-connect のオフライン自己テストと Rust 契約テスト（puppeteer_contract）を実行する（Puppeteer・ネットワーク不要。要 node。TASK-45.2）
 	bash harness/puppeteer-connect/self-test.sh

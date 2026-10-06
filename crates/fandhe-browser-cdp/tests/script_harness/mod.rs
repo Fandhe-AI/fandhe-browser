@@ -1,7 +1,7 @@
 //! 外部スクリプト（Node 製クライアント等）を実サーバーへ接続させて結果を構造化回収する
 //! 共有基盤（TASK-45.1・#480、ビヘイビア `CDP-3`・MS-4）。
 //!
-//! `tests/puppeteer_connect.rs`（基盤の自己テスト）が `mod script_harness;` で取り込む
+//! `tests/puppeteer_connect.rs`（基盤の自己テスト）・`tests/puppeteer_contract.rs`（契約テスト）が `mod script_harness;` で取り込む
 //! （実 Puppeteer の試験ターゲットは導入承認後に追加し、同様に取り込む）。Puppeteer 固有の事柄は
 //! 呼び出し側へ寄せ、このモジュールは「サーバー起動・子プロセス実行・結果行の解析」だけを
 //! 担う（Playwright 側の基盤 #476 からも再利用できる形に保つ）。
