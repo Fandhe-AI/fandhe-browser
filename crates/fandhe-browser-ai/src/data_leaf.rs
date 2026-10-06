@@ -10,12 +10,18 @@
 //! （子要素条件は価格クラス名分岐にのみ掛かる）。`cost` は PoC-4 の規則に無く
 //! 測定ベースライン（TASK-14）が変わるため含めない（拡充は TASK-15・Issue #100 で検討）。
 //!
+//! 引用文（TASK-15.1・Issue #99・`AISNAP-11`）: HTML 名前空間の `blockquote`/`q` 要素は
+//! 子要素の有無を問わず [`DataLeafKind::Quote`] とする（通常形 `<blockquote><p>…</p></blockquote>`
+//! を取りこぼさないため、価格クラスの子要素条件は課さない）。判定順は末尾に追加し、
+//! 既存入力の分類結果は変えない（TASK-14 の測定ベースライン維持）。内側の `p`・`a` 等は対象外。
+//!
 //! # スタブについて（REPAIR-3）
 //!
 //! `snapshot::build::build_snapshot` から呼ばれ、結果は `Node::data_leaf`（圧縮表のヘッダは `HeaderCell::data_leaf`。TASK-12.5）に入る
 //! （TASK-13.3・Issue #88。簡約・剪定への利用は後続）。判定規則として実装済みなのは `td`/`th` と
-//! 価格クラス名パターン（TASK-13.2・Issue #87）で、地の文・引用文への拡充は
-//! TASK-15（Issue #99・#100。`AISNAP-11`）で実装する。
+//! 価格クラス名パターン（TASK-13.2・Issue #87）と `blockquote`/`q`（TASK-15.1・Issue #99）で、
+//! 地の文は TASK-15.2（Issue #100。`AISNAP-11`）、`span.text` 等のクラスベースの引用は未対応
+//! （Issue #100・TASK-18）。
 //!
 //! HTML 名前空間定数を本モジュールに持つ理由: `core` 側の定数は `pub(crate)`、
 //! `snapshot::state` のヘルパーは `pub(super)` で、いずれもここから使えないため。
@@ -37,6 +43,8 @@ pub enum DataLeafKind {
     /// HTML 要素のうち `class` 属性に price/amount/currency を含み、
     /// 要素の子を持たないもの（TASK-13.2・Issue #87）。
     PriceClass,
+    /// HTML の `blockquote`/`q` 要素（引用文の容器。TASK-15.1・Issue #99・`AISNAP-11`）。
+    Quote,
 }
 
 /// 価格系クラス名の部分一致パターン（PoC-4 `reduce.mjs` 由来。すべて小文字・非空）。
@@ -78,6 +86,7 @@ fn is_html_element_named(doc: &Document, id: NodeId, name: &str) -> bool {
 /// 判定順: `td`/`th` は子要素の有無を問わず [`DataLeafKind::TableCell`]。
 /// 次に HTML 要素で `class` 属性全体に価格系パターンを部分一致で含み、かつ
 /// 子要素を持たなければ [`DataLeafKind::PriceClass`]。
+/// 最後に `blockquote`/`q` を [`DataLeafKind::Quote`] とする（TASK-15.1・Issue #99）。
 /// 非要素・ドキュメントルート・対象外の要素・範囲外の `NodeId` は `None`
 /// （panic しない）。`snapshot::build::build_snapshot` が要素ごとに呼ぶ（TASK-13.3・Issue #88）。
 pub fn classify_data_leaf(doc: &Document, id: NodeId) -> Option<DataLeafKind> {
@@ -92,6 +101,8 @@ pub fn classify_data_leaf(doc: &Document, id: NodeId) -> Option<DataLeafKind> {
         && !has_element_child(doc, id)
     {
         Some(DataLeafKind::PriceClass)
+    } else if is_html_element_named(doc, id, "blockquote") || is_html_element_named(doc, id, "q") {
+        Some(DataLeafKind::Quote)
     } else {
         None
     }
@@ -243,5 +254,66 @@ mod tests {
         );
         let doc = parse(r#"<svg><text class="price">1</text></svg>"#);
         assert_eq!(classify_data_leaf(&doc, select(&doc, "text")), None);
+    }
+
+    /// AISNAP-11（TASK-15.1・Issue #99）: blockquote/q は引用文として真（受入基準）。
+    #[test]
+    fn aisnap_11_blockquote_and_q_are_quote() {
+        let doc = parse("<blockquote><p>引用</p></blockquote><p><q>引用</q></p>");
+        for sel in ["blockquote", "q"] {
+            let id = select(&doc, sel);
+            assert_eq!(
+                classify_data_leaf(&doc, id),
+                Some(DataLeafKind::Quote),
+                "{sel}"
+            );
+            assert!(is_data_leaf(&doc, id), "{sel}");
+        }
+    }
+
+    /// AISNAP-11（TASK-15.1・Issue #99）: 子要素の有無を問わず容器のみが対象。
+    #[test]
+    fn aisnap_11_quote_ignores_element_children() {
+        let doc = parse(
+            "<blockquote id=a>text</blockquote><blockquote id=b><p>x <a href=\"/y\">l</a></p></blockquote><q id=c><em>e</em></q>",
+        );
+        for sel in ["#a", "#b", "#c"] {
+            assert_eq!(
+                classify_data_leaf(&doc, select(&doc, sel)),
+                Some(DataLeafKind::Quote),
+                "{sel}"
+            );
+        }
+        for sel in ["p", "a", "em"] {
+            assert_eq!(classify_data_leaf(&doc, select(&doc, sel)), None, "{sel}");
+        }
+    }
+
+    /// AISNAP-11（TASK-15.1・Issue #99）: 判定順（既存分類を保持）と名前空間。
+    #[test]
+    fn aisnap_11_quote_precedence_and_namespace() {
+        let doc = parse("<table><tr><td><q>x</q></td></tr></table>");
+        assert_eq!(
+            classify_data_leaf(&doc, select(&doc, "q")),
+            Some(DataLeafKind::Quote)
+        );
+        assert_eq!(
+            classify_data_leaf(&doc, select(&doc, "td")),
+            Some(DataLeafKind::TableCell)
+        );
+        let doc = parse(r#"<blockquote class="price">text</blockquote>"#);
+        assert_eq!(
+            classify_data_leaf(&doc, select(&doc, "blockquote")),
+            Some(DataLeafKind::PriceClass)
+        );
+        let doc = parse(r#"<blockquote class="price"><p>x</p></blockquote>"#);
+        assert_eq!(
+            classify_data_leaf(&doc, select(&doc, "blockquote")),
+            Some(DataLeafKind::Quote)
+        );
+        let doc = parse("<svg><q>x</q></svg>");
+        assert_eq!(classify_data_leaf(&doc, select(&doc, "q")), None);
+        let doc = parse("<div><cite>c</cite></div>");
+        assert_eq!(classify_data_leaf(&doc, select(&doc, "cite")), None);
     }
 }
