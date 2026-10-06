@@ -19,15 +19,22 @@
 //!
 //! - inline `style` 属性（#260 が `InlineStyle` を別入力として扱う）
 //! - カスケード・`!important`・起源の区別（#260 以降）
-//! - シート数・全要素分を回したときの総量の上限（#261）
+//! - 全要素分を回したときの総量の上限（#261。1 回の呼び出しの結果総数は
+//!   [`MAX_MATCHED_RULES`] で制限済み）
 //! - CSSOM の可観測性計装（`OperationKind` に対応 variant がない）
 //! - 疑似クラス等の未対応セレクタ（`crate::selector` が `Unsupported` にし、AST に現れない）
 
 use crate::dom::{Document, NodeId};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::query::matching_selector_indices;
 
 use super::{Specificity, StyleRule, Stylesheet, specificity};
+
+/// 1 回の [`match_rules`] が返すマッチ結果の総数の上限。
+///
+/// 任意長のシート列を渡されてもメモリを無制限に確保しないための上限
+/// （シートあたり最大 16,384 ルール × 4 シート分。AGENTS.md「リソース上限」）。
+pub const MAX_MATCHED_RULES: usize = 65_536;
 
 /// 1 要素にマッチした 1 ルール分の結果。
 ///
@@ -72,6 +79,8 @@ impl<'a> MatchedRule<'a> {
 /// # エラー
 ///
 /// 照合メモ化キャッシュの上限超過（[`crate::error::Error::MatchCacheLimitExceeded`]）を伝播する。
+/// マッチ結果の総数が [`MAX_MATCHED_RULES`] を超える場合は
+/// [`crate::error::Error::InvalidInput`] を返す（部分結果は返さない）。
 pub fn match_rules<'a>(
     document: &Document,
     element: NodeId,
@@ -92,6 +101,11 @@ pub fn match_rules<'a>(
                 .map(specificity)
                 .max();
             if let Some(specificity) = best {
+                if matched.len() >= MAX_MATCHED_RULES {
+                    return Err(Error::InvalidInput {
+                        message: format!("matched rule count exceeds {MAX_MATCHED_RULES}"),
+                    });
+                }
                 matched.push(MatchedRule {
                     rule,
                     sheet_index,
@@ -224,6 +238,23 @@ mod tests {
             .map(|m| (m.sheet_index(), m.rule_index()))
             .collect();
         assert_eq!(pos, vec![(0, 0), (1, 0), (1, 2)]);
+    }
+
+    /// CORE-5: 結果総数の上限は境界で効き、超過は Err（部分結果を返さない）。
+    #[test]
+    fn core_5_matched_rule_count_limit() {
+        let d = doc("<p>a</p>");
+        let big = sheet(&"p{color:red}".repeat(16_384));
+        let sheets: Vec<&Stylesheet> = vec![&big; MAX_MATCHED_RULES / 16_384];
+        let got =
+            match_rules(&d, find(&d, "p"), sheets.iter().copied()).expect("上限ちょうどは成功");
+        assert_eq!(got.len(), MAX_MATCHED_RULES);
+
+        let one = sheet("p{color:red}");
+        let mut over = sheets.clone();
+        over.push(&one);
+        let err = match_rules(&d, find(&d, "p"), over.iter().copied()).expect_err("超過は失敗");
+        assert!(matches!(err, Error::InvalidInput { .. }));
     }
 
     /// CORE-5: 結合子は query の照合規則に従う。
