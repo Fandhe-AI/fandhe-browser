@@ -3,10 +3,14 @@
 import assert from "node:assert/strict";
 import { runStages } from "./stages.mjs";
 
-function fake({ failAt, nullBody, hangAt } = {}) {
+function fake({ failAt, nullBody, hangAt, lateRejectAt } = {}) {
   const calls = { disconnect: 0 };
   const maybe = async (name, v) => {
     if (hangAt === name) await new Promise(() => {});
+    if (lateRejectAt === name) {
+      await new Promise((r) => setTimeout(r, 120));
+      throw new Error(`${name} late boom`);
+    }
     if (failAt === name) {
       const e = new Error(`${name} boom`);
       e.name = "ProtocolError";
@@ -66,6 +70,21 @@ for (const [at, expected] of [
   assert.equal(r.error.name, "StageTimeout");
   assert.equal(r.error.message, "stage timed out after 50 ms");
   assert.equal(f.calls.disconnect, 1);
+}
+{
+  // ガード（#691 Bugbot。Promise.race が敗者を購読するため修正前も通る防御的テスト）: 期限後に遅れて reject する段階が unhandledRejection を起こさず、
+  // stages（StageTimeout の到達結果）が保持されること。
+  let unhandled = 0;
+  process.on("unhandledRejection", () => {
+    unhandled++;
+  });
+  const f = fake({ lateRejectAt: "goto" });
+  const r = await run(f, 50);
+  await new Promise((res) => setTimeout(res, 200));
+  assert.equal(unhandled, 0);
+  assert.equal(r.step, "goto");
+  assert.equal(r.error.name, "StageTimeout");
+  assert.deepEqual(statuses(r), ["connect:ok", "newPage:ok", "goto:failed", "selector:not_reached"]);
 }
 console.log("puppeteer-connect self-test: all passed");
 process.exit(0);

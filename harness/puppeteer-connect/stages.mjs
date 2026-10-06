@@ -16,7 +16,10 @@ export function toError(err) {
 }
 
 // 段階を期限と競わせる（イベント待ちで止まる場合の保護）。
+// 敗者側（期限後に遅れて reject する段階 promise）は no-op の catch で購読しておく。
+// 未処理だと unhandledRejection となり、connect.mjs が結果行を二重に出して stages を失う。
 async function withTimeout(promise, ms) {
+  promise.catch(() => {});
   let timer;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => {
