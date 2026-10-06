@@ -587,6 +587,181 @@ mod tests {
             let v: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(v["code"], "host_not_allowed");
         }
+        // ---- CDP と独自 API の AppState 共有結合テスト（AISNAP-6・TASK-19.4・Issue #226） ----
+        //
+        // ai ⇔ cdp の crate 間依存は AGENTS.md で禁止のため、両者を合成できる cli に置く。
+        // 実 HTML を取得する `Page.navigate` は、本番 `Fetcher` が内部アドレスを拒否する既定
+        // （SEC-2）のためここでは駆動しない（cdp crate 内テストが担う）。ここでは取得を伴わず
+        // 確定する `about:blank` と、拒否される遷移で「CDP が書いた共有状態を `/ai/snapshot`
+        // が読む」経路を固定する。
+
+        /// `/devtools/browser/{id}` へ WS 接続する（応答ヘッドは 1 バイトずつ読む）。
+        fn ws_connect(addr: SocketAddr, browser_id: &str) -> TcpStream {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let req = format!(
+                "GET /devtools/browser/{browser_id} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\
+                 Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {WS_KEY}\r\n\
+                 Sec-WebSocket-Version: 13\r\n\r\n",
+                addr.port()
+            );
+            s.write_all(req.as_bytes()).unwrap();
+            let mut buf = Vec::new();
+            let mut b = [0u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") {
+                assert_eq!(s.read(&mut b).expect("read head"), 1, "unexpected EOF");
+                buf.push(b[0]);
+            }
+            let head = String::from_utf8(buf).unwrap();
+            assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+            assert!(
+                head.contains(&format!("Sec-WebSocket-Accept: {WS_ACCEPT}")),
+                "{head}"
+            );
+            s
+        }
+
+        /// マスク付きテキストフレームを送る（125 バイト以下の 7 bit 長のみ）。
+        fn ws_send_text(s: &mut TcpStream, text: &str) {
+            let payload = text.as_bytes();
+            assert!(
+                payload.len() < 126,
+                "test helper supports short frames only"
+            );
+            let key = [0x11u8, 0x22, 0x33, 0x44];
+            let mut frame = vec![0x81, 0x80 | payload.len() as u8];
+            frame.extend_from_slice(&key);
+            frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ key[i % 4]));
+            s.write_all(&frame).unwrap();
+        }
+
+        /// サーバー発の非マスクテキストフレームを 1 つ読んで JSON にする（7 bit / 16 bit 長）。
+        fn ws_read_json(s: &mut TcpStream) -> Value {
+            let mut h = [0u8; 2];
+            s.read_exact(&mut h).expect("frame header");
+            assert_eq!(h[0], 0x81, "expected FIN + text frame");
+            assert_eq!(h[1] & 0x80, 0, "server frames must not be masked");
+            let mut len = usize::from(h[1] & 0x7f);
+            assert!(len <= 126, "unsupported frame length");
+            if len == 126 {
+                let mut ext = [0u8; 2];
+                s.read_exact(&mut ext).expect("extended length");
+                len = usize::from(u16::from_be_bytes(ext));
+            }
+            let mut payload = vec![0u8; len];
+            s.read_exact(&mut payload).expect("payload");
+            serde_json::from_slice(&payload).expect("json")
+        }
+
+        /// 合成サーバーを起動し、`https://example.com/` を確定済みにして返す。
+        async fn spawn_with_committed_example() -> (SocketAddr, String, Arc<AppState>, TempDir) {
+            use fandhe_browser_core::NavigationResult;
+
+            let dir = TempDir::new();
+            let app = open_app_state(&FixedStore(dir.path.clone())).unwrap();
+            let (bound, cdp) = bind(
+                &app,
+                "127.0.0.1:0".parse().unwrap(),
+                default_router_factories(),
+            )
+            .await
+            .unwrap();
+            let addr = bound.local_addr().unwrap();
+            tokio::spawn(bound.run());
+            assert!(Arc::ptr_eq(cdp.app_state(), &app));
+
+            let nav = app.navigation();
+            let g = nav.begin_navigation().expect("begin");
+            nav.commit_navigation(
+                g,
+                NavigationResult::new(
+                    "https://example.com/",
+                    "<title>Example Domain</title><h1>Example Domain</h1>",
+                ),
+            )
+            .expect("commit");
+            let id = cdp.browser_id().as_str().to_string();
+            (addr, id, app, dir)
+        }
+
+        async fn snapshot_json(addr: SocketAddr) -> Value {
+            let (status, _, body) = blocking(move || get(addr, "/ai/snapshot")).await;
+            assert_eq!(status, 200, "{body}");
+            serde_json::from_str(&body).unwrap()
+        }
+
+        /// CDP `Page.navigate`（WS 経由）が書いた共有状態を `/ai/snapshot` が読むこと。
+        #[tokio::test]
+        async fn aisnap6_cdp_page_navigate_is_visible_to_ai_snapshot() {
+            let (addr, id, app, _dir) = spawn_with_committed_example().await;
+            let before = snapshot_json(addr).await;
+            assert_eq!(before["url"], "https://example.com/");
+            assert_eq!(before["tree"]["name"], "Example Domain");
+
+            let frames = blocking(move || {
+                let mut s = ws_connect(addr, &id);
+                ws_send_text(
+                    &mut s,
+                    r#"{"id":1,"method":"Page.navigate","params":{"url":"about:blank"}}"#,
+                );
+                [
+                    ws_read_json(&mut s),
+                    ws_read_json(&mut s),
+                    ws_read_json(&mut s),
+                ]
+            })
+            .await;
+            assert_eq!(frames[0]["id"], 1);
+            assert_eq!(frames[0]["result"]["frameId"], "main");
+            assert!(
+                frames[0]["result"].get("errorText").is_none(),
+                "{}",
+                frames[0]
+            );
+            assert_eq!(frames[1]["method"], "Page.frameNavigated");
+            assert_eq!(frames[1]["params"]["frame"]["url"], "about:blank");
+            assert_eq!(frames[2]["method"], "Page.loadEventFired");
+
+            let after = snapshot_json(addr).await;
+            assert_eq!(after["url"], "about:blank");
+            assert_eq!(after["tree"]["role"], "document");
+            assert!(
+                !after.to_string().contains("Example Domain"),
+                "stale content: {after}"
+            );
+            assert_eq!(
+                app.navigation().latest().expect("latest").url(),
+                "about:blank"
+            );
+        }
+
+        /// 拒否された CDP 遷移（内部アドレス）は共有状態を変えず、`/ai/snapshot` も不変（SEC-2）。
+        #[tokio::test]
+        async fn aisnap6_rejected_cdp_navigate_keeps_ai_snapshot_unchanged() {
+            let (addr, id, _app, _dir) = spawn_with_committed_example().await;
+
+            let (nav_resp, next) = blocking(move || {
+                let mut s = ws_connect(addr, &id);
+                ws_send_text(
+                    &mut s,
+                    r#"{"id":1,"method":"Page.navigate","params":{"url":"http://127.0.0.1:1/"}}"#,
+                );
+                let nav_resp = ws_read_json(&mut s);
+                // イベントが出ていなければ、次に届くのは続けて送った未実装メソッドの応答。
+                ws_send_text(&mut s, r#"{"id":2,"method":"Browser.getVersion"}"#);
+                (nav_resp, ws_read_json(&mut s))
+            })
+            .await;
+            assert_eq!(nav_resp["id"], 1);
+            assert_eq!(nav_resp["result"]["errorText"], "net::ERR_ACCESS_DENIED");
+            assert_eq!(next["id"], 2);
+            assert_eq!(next["error"]["code"], -32601);
+
+            let after = snapshot_json(addr).await;
+            assert_eq!(after["url"], "https://example.com/");
+            assert_eq!(after["tree"]["name"], "Example Domain");
+        }
 
         #[tokio::test]
         async fn cdp1_extra_router_conflict_is_rejected() {
