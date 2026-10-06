@@ -12,18 +12,18 @@
 //! 依存しない（上位 crate から下位 crate への一方向依存を保つため。
 //! coding-rust.md）。同じ層である `fandhe-browser-cdp` との相互依存も禁止される。
 //!
-//! `fandhe-browser-cdp` の `/ai/*` 系ルータは本 crate を直接呼び出さない。
-//! 両 crate はいずれも `fandhe-browser-core` にのみ依存する同じ層に位置し、
-//! 結合は `fandhe-browser-render` と同様に `core` が定義する抽象（トレイト）
-//! 経由で行い、具体的な結線（本 crate の実装を `core` のトレイトへ適合させ、
-//! cdp のルータへ渡す配線）は両者に依存できる `fandhe-browser-cli` が担う
-//! 想定である（TASK-19・AISNAP-6・AISNAP-7 で具体化）。
+//! 本 crate は `/ai/*` の `Router` を [`api::router`] として自前で公開し
+//! （TASK-19.1・Issue #223・`AISNAP-6`）、`fandhe-browser-cdp` とは互いに依存しない。
+//! 両 crate は `core` の `Arc<AppState>` を共有し、ルータの合成（`Router::merge`）は
+//! 両者に依存できる `fandhe-browser-cli` が担う想定である
+//! （TASK-19.3・Issue #225・`AISNAP-6`・`AISNAP-7`）。
 //! 外部プラグイン（`crates/fandhe-browser-mcp` 等）からの利用も、mcp crate は
 //! いずれの workspace crate にも依存しない契約のみの層であるため、同様に
 //! `cli` 層での配線を経由する。
 //!
-//! 現在の実依存は `fandhe-browser-core` のみである（TASK-11.1・`AISNAP-1`・
-//! `MS-2` で追加。`profile` は必要になったタスクで追加する）。
+//! 現在の workspace 内依存は `fandhe-browser-core` のみである（TASK-11.1・`AISNAP-1`・
+//! `MS-2` で追加。`profile` は dev-dependency のみ）。外部依存は HTTP ルータ用の
+//! `fandhe-backend-*` と JSON 生成用の `serde_json`（TASK-19.1）。
 //!
 //! # スタブについて
 //!
@@ -80,11 +80,14 @@
 //!   Issue #108。`tests/retention.rs`）
 //! - `/ai/*` ルータ向けスナップショット API（`AISNAP-6`・`AISNAP-14`・`CDP-1`
 //!   （API 単体動作は `AISNAP-7`）、`TASK-19`（単体動作確認は `TASK-20`）、
-//!   `MS-4`）
+//!   `MS-4`）。`GET /ai/snapshot` の正常系の骨格は実装済み（TASK-19.1・Issue #223。
+//!   [`api::router`]）。未ナビゲート時エラーの確定形（TASK-19.2・Issue #224）・
+//!   cli への合成（TASK-19.3・Issue #225）・結合テスト（TASK-19.4・Issue #226）は未実装
 //! - プラグインレジストリ（プロセス分離・stdio 経由の外部プラグイン呼び出し。
 //!   動的ライブラリの実行時ロードは行わない方針。security.md 参照。
 //!   `PLUG-2`、`TASK-92`、`MS-9`）
 
+pub mod api;
 pub mod compress_table;
 pub mod data_leaf;
 pub mod retention;

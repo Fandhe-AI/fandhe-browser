@@ -687,8 +687,13 @@ dependencies = [
 name = "fandhe-browser-ai"
 version = "0.1.0"
 dependencies = [
+ "fandhe-backend-http",
+ "fandhe-backend-routes",
  "fandhe-browser-core",
+ "fandhe-browser-profile",
+ "serde_json",
  "tiktoken-rs",
+ "tokio",
 ]
 
 [[package]]

@@ -101,8 +101,8 @@ pub use state::{CheckedState, State, compute_state};
 ///   [`TableSummary`] に持つ。`None` は圧縮していないノード
 ///
 /// 呼び出し文脈: [`build_snapshot`]（TASK-11.7・Issue #76）が `core` の DOM から構築し、
-/// 将来は `cli` 層の配線を経由して `cdp` の `/ai/snapshot` から使われる
-/// （TASK-19・`AISNAP-6`）。
+/// [`crate::api`] の `/ai/snapshot` が JSON 化して返す
+/// （TASK-19.1・`AISNAP-6`。JSON への写像は `api` モジュールが手組みし、本型に serde は持たせない）。
 ///
 /// 不安全な設計への対処: `children` は再帰構造で、derive した
 /// `Drop`/`PartialEq`/`Debug`/`Clone` も再帰する。[`build_snapshot`] は反復で構築し、
