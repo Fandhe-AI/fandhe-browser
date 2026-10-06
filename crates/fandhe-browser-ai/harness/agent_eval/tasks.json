@@ -1,0 +1,152 @@
+[
+  {
+    "id": "click-01",
+    "category": "click",
+    "page": "login-form",
+    "prompt": "Login ボタンをクリックしてください。対象の要素を特定してください。"
+  },
+  {
+    "id": "click-02",
+    "category": "click",
+    "page": "dropdown-form",
+    "prompt": "ドロップダウンから Option 2 を選ぶ対象の要素を特定してください。"
+  },
+  {
+    "id": "click-03",
+    "category": "click",
+    "page": "checkboxes-form",
+    "prompt": "1 つ目のチェックボックスをクリックする対象の要素を特定してください。"
+  },
+  {
+    "id": "click-04",
+    "category": "click",
+    "page": "dashboard-table",
+    "prompt": "Example 1 の表で、2 行目（Last Name が Gamma の行）の edit リンクを特定してください。"
+  },
+  {
+    "id": "click-05",
+    "category": "click",
+    "page": "hn-list",
+    "prompt": "2 番目の記事のタイトルリンクをクリックする対象の要素を特定してください。"
+  },
+  {
+    "id": "click-06",
+    "category": "click",
+    "page": "ec-product-list",
+    "prompt": "1 番目の商品の Add to basket ボタンを特定してください。"
+  },
+  {
+    "id": "click-07",
+    "category": "click",
+    "page": "quotes-list",
+    "prompt": "ヘッダーにある Login リンクを特定してください。"
+  },
+  {
+    "id": "extract-01",
+    "category": "extract",
+    "page": "dashboard-table",
+    "prompt": "Example 1 の表で、3 行目（Last Name が Delta の行）の Email を答えてください。"
+  },
+  {
+    "id": "extract-02",
+    "category": "extract",
+    "page": "ec-product-list",
+    "prompt": "2 番目の商品（Vector channel thread network）の価格を答えてください。"
+  },
+  {
+    "id": "extract-03",
+    "category": "extract",
+    "page": "hn-list",
+    "prompt": "1 位の記事のポイント表記を答えてください。"
+  },
+  {
+    "id": "extract-04",
+    "category": "extract",
+    "page": "large-table",
+    "prompt": "表の 1 行目・15 列目（Column 14）のセルの値を答えてください。"
+  },
+  {
+    "id": "extract-05",
+    "category": "extract",
+    "page": "quotes-list",
+    "prompt": "1 件目の引用の本文を、引用符も含めてそのまま答えてください。"
+  },
+  {
+    "id": "extract-06",
+    "category": "extract",
+    "page": "python-portal",
+    "prompt": "サイト内検索ボックスの placeholder 文字列を答えてください。"
+  },
+  {
+    "id": "form-01",
+    "category": "form",
+    "page": "login-form",
+    "prompt": "ユーザー名 dummy-user、パスワード dummy-pass でログインする操作手順を答えてください。"
+  },
+  {
+    "id": "form-02",
+    "category": "form",
+    "page": "dropdown-form",
+    "prompt": "ドロップダウンで Option 1 を選択する操作手順を答えてください。"
+  },
+  {
+    "id": "form-03",
+    "category": "form",
+    "page": "inputs-form",
+    "prompt": "数値入力欄に 42 を入力する操作手順を答えてください。"
+  },
+  {
+    "id": "form-04",
+    "category": "form",
+    "page": "checkboxes-form",
+    "prompt": "2 つのチェックボックスをどちらも checked の状態にするために必要な操作だけを答えてください。"
+  },
+  {
+    "id": "form-05",
+    "category": "form",
+    "page": "python-portal",
+    "prompt": "検索ボックスに venv と入力して検索する操作手順を答えてください。"
+  },
+  {
+    "id": "form-06",
+    "category": "form",
+    "page": "reddit-list",
+    "prompt": "検索欄に rust と入力して検索を実行する操作手順を答えてください。"
+  },
+  {
+    "id": "nav-01",
+    "category": "nav",
+    "page": "wiki-portal-nav",
+    "prompt": "Language 3 のサイトへ移動するためにクリックするリンクを特定してください。"
+  },
+  {
+    "id": "nav-02",
+    "category": "nav",
+    "page": "mdn-docs",
+    "prompt": "リファレンスの Item 1.3 のページへ移動するためのリンクを特定してください。"
+  },
+  {
+    "id": "nav-03",
+    "category": "nav",
+    "page": "python-portal",
+    "prompt": "ダウンロードページへ移動するためのリンクを特定してください。"
+  },
+  {
+    "id": "nav-04",
+    "category": "nav",
+    "page": "hn-list",
+    "prompt": "上部ナビゲーションにある login ページへ移動するリンクを特定してください。"
+  },
+  {
+    "id": "nav-05",
+    "category": "nav",
+    "page": "quotes-list",
+    "prompt": "次のページへ進むためのリンクを特定してください。"
+  },
+  {
+    "id": "nav-06",
+    "category": "nav",
+    "page": "login-form",
+    "prompt": "フッターの Example Test Site へ移動するリンクを特定してください。"
+  }
+]
