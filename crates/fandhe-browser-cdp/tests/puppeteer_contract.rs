@@ -6,9 +6,9 @@
 //! `--ignored` 付きで実行する。`Profile::open` を使わないため `puppeteer_connect.rs` と違い
 //! `cfg(unix)` を付けず、Windows でも実際にコンパイル・実行する。
 
-// サーバー起動など本ターゲットで使わない script_harness の公開項目を許容する
-// （`puppeteer_connect.rs` と共有するモジュールのため）。
-#[allow(dead_code)]
+// `Profile::open`（unix 限定）に依存するサーバー起動を含む `script_harness` 全体ではなく、
+// 実行・解析部分（runner.rs）だけを取り込む。
+#[path = "script_harness/runner.rs"]
 mod script_harness;
 
 use std::time::Duration;

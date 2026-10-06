@@ -20,7 +20,7 @@ Puppeteer 接続試験の実行基盤（TASK-45.1・Issue #480・ビヘイビア
 | `stages.mjs` | 段階実行の純粋ロジック（クライアント注入可）。connect → newPage → goto → selector → disconnect |
 | `contract-sample.mjs` | Rust 側パーサーとの契約テスト用に `stages.mjs` の出力を再現する（`tests/puppeteer_contract.rs` から実行。要 node） |
 | `self-test.mjs` / `self-test.sh` | `stages.mjs` と `connect.mjs` のオフライン自己テスト（`make check-puppeteer-connect`。要 node） |
-| `crates/fandhe-browser-cdp/tests/script_harness/mod.rs` | サーバー起動・子プロセス実行・結果解析の共有基盤 |
+| `crates/fandhe-browser-cdp/tests/script_harness/` | 共有基盤。`runner.rs`（子プロセス実行・結果解析。契約テストも単独で取り込む）・`server.rs`（サーバー起動）・`preflight.rs`（導入確認） |
 | `crates/fandhe-browser-cdp/tests/puppeteer_connect.rs` | 基盤の自己テスト（unix のみ。`cargo test --workspace` で常に実行。node 不要） |
 | `crates/fandhe-browser-cdp/tests/puppeteer_contract.rs` | `stages.mjs` と Rust パーサーの契約テスト 1 件（3 OS。要 node。`#[ignore]` のため `self-test.sh` が `--ignored` で実行し、0 件実行は fail） |
 
