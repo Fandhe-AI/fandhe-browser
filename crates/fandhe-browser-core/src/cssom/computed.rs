@@ -31,12 +31,18 @@
 use std::collections::BTreeMap;
 
 use crate::dom::{Document, NodeId};
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 use super::{
     Declaration, Importance, MatchedRule, Specificity, Stylesheet, match_rules,
     parse_style_attribute,
 };
+
+/// 1 回の [`computed_style`] が処理するカスケード対象宣言（マッチしたルールの宣言と inline 宣言の合計）の上限。
+///
+/// 上流の上限（1 ブロック 4,096 宣言・走査ルール 65,536）の積は巨大になりうるため、
+/// カスケードの総量をここで別途制限する（AGENTS.md「リソース上限」。`CORE-5`）。
+pub const MAX_CASCADE_DECLARATIONS: usize = 65_536;
 
 /// 有効宣言の由来。将来の起源・レイヤ追加に備え `#[non_exhaustive]`（REPAIR-4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,7 +176,8 @@ pub fn cascade(matched: &[MatchedRule<'_>], inline: &[Declaration]) -> ComputedS
 /// # エラー
 ///
 /// [`match_rules`] と [`parse_style_attribute`] のエラー（走査ルール総数・照合キャッシュ・
-/// 宣言入力長・宣言数の上限超過）をそのまま伝播する。部分結果は返さない。
+/// 宣言入力長・宣言数の上限超過）をそのまま伝播する。カスケード対象の宣言総数が
+/// [`MAX_CASCADE_DECLARATIONS`] を超える場合は [`Error::InvalidInput`] を返す。部分結果は返さない。
 pub fn computed_style<'a>(
     document: &Document,
     element: NodeId,
@@ -181,6 +188,18 @@ pub fn computed_style<'a>(
     }
     let matched = match_rules(document, element, sheets)?;
     let inline = parse_style_attribute(document, element)?.unwrap_or_default();
+    let mut total = inline.len();
+    for m in &matched {
+        total = total.saturating_add(m.rule().declarations().len());
+        if total > MAX_CASCADE_DECLARATIONS {
+            break;
+        }
+    }
+    if total > MAX_CASCADE_DECLARATIONS {
+        return Err(Error::InvalidInput {
+            message: format!("cascade declaration count exceeds {MAX_CASCADE_DECLARATIONS}"),
+        });
+    }
     Ok(cascade(&matched, &inline))
 }
 
@@ -189,7 +208,6 @@ mod tests {
     use super::super::matcher::MAX_SCANNED_RULES;
     use super::super::parse_stylesheet;
     use super::*;
-    use crate::error::Error;
     use crate::parse::{ParseOptions, parse_document};
 
     fn doc(html: &str) -> Document {
@@ -337,6 +355,24 @@ mod tests {
         let big = sheet(&"p{color:red}".repeat(16_384));
         let sheets: Vec<&Stylesheet> = vec![&big; MAX_SCANNED_RULES / 16_384 + 1];
         let err = computed_style(&d, find(&d, "p"), sheets).expect_err("上限超過");
+        assert!(matches!(err, Error::InvalidInput { .. }));
+    }
+
+    /// CORE-5: カスケード対象の宣言総数の上限（ちょうどは成功・超過は Err）。
+    #[test]
+    fn core5_cascade_declaration_total_is_capped() {
+        let d = doc("<p>a</p>");
+        let decls = "color:red;".repeat(4_096);
+        let big = sheet(&format!("p{{{decls}}}"));
+        let n = MAX_CASCADE_DECLARATIONS / 4_096;
+        let sheets: Vec<&Stylesheet> = vec![&big; n];
+        let got =
+            computed_style(&d, find(&d, "p"), sheets.iter().copied()).expect("上限ちょうどは成功");
+        assert_eq!(got.len(), 1);
+
+        let mut over = sheets.clone();
+        over.push(&big);
+        let err = computed_style(&d, find(&d, "p"), over.iter().copied()).unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }));
     }
 }
