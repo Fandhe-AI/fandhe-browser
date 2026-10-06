@@ -7,9 +7,10 @@
 //!
 //! # 優先順位
 //!
-//! 1. inline（`style` 属性）は詳細度に関係なく author ルールより常に優先する。
-//! 2. ルール同士は詳細度が高い方が勝つ。
-//! 3. 同詳細度ならソース順（シート順 → ルール順 → 宣言順）で後の方が勝つ。
+//! 1. `!important` 宣言は通常宣言より常に優先する（inline の通常宣言にも勝つ）。
+//! 2. 同じ importance なら inline（`style` 属性）が詳細度に関係なく author ルールより優先する。
+//! 3. ルール同士は詳細度が高い方が勝つ。
+//! 4. 同順位ならソース順（シート順 → ルール順 → 宣言順）で後の方が勝つ。
 //!
 //! # PLUG-8 との関係
 //!
@@ -23,7 +24,7 @@
 //!
 //! 戻り値は厳密な CSS の "computed value" ではなく「カスケード後の有効宣言一覧」である。
 //!
-//! - `!important` の順位付け（[`Importance`] は勝者へ素通しで保持するだけ。後続で扱いを決める）
+//! - 起源（UA / user / author）ごとの `!important` 逆転（author のみを扱う）
 //! - 継承・初期値・shorthand 展開・値の型付き解釈・`var()` 解決・レイアウト依存値
 //! - 起源（UA / user / author）・`@layer`・`@media` 等の条件付きルール
 //! - 上限の見直し（#261）。上限は上流（`parse_declarations`・`parse_stylesheet`・`match_rules`）で検証済み
@@ -127,21 +128,48 @@ impl ComputedStyle {
     }
 }
 
+/// 宣言の優先キー（`!important` の有無 → inline か → 詳細度の順に大きい方が勝つ）。
+type PriorityKey = (u8, u8, Specificity);
+
+fn importance_rank(importance: Importance) -> u8 {
+    match importance {
+        Importance::Important => 1,
+        _ => 0,
+    }
+}
+
 /// 純粋なカスケード解決（DOM 非依存）。
 ///
 /// `matched` は [`match_rules`] が返したソース順のままであること（並べ替えた列は結果未規定）。
-/// 詳細度が `>=` の宣言が置き換えるため、同詳細度・同一ルール内の重複は後勝ち。
-/// `inline` は詳細度に関係なく無条件で上書きする。戻り値は勝者の宣言を所有する（clone）。
-/// 失敗しないので `Result` を返さない。件数は入力宣言数以下（入力は上流で上限検証済み）。
-pub fn cascade(matched: &[MatchedRule<'_>], inline: &[Declaration]) -> ComputedStyle {
-    let mut winners: BTreeMap<&str, (&Declaration, DeclarationOrigin)> = BTreeMap::new();
+/// 勝者は「`!important` の有無 → inline か → 詳細度」の順で大きい方で、同順位ならソース順で後勝ち。
+/// したがって `!important` は inline の通常宣言にも勝ち、`!important` 同士は inline が優先する。
+/// 戻り値は勝者の宣言を所有する（clone）。
+///
+/// # エラー
+///
+/// 入力宣言の総数（`matched` の各ルールの宣言と `inline` の合計）が
+/// [`MAX_CASCADE_DECLARATIONS`] を超える場合は走査前に [`Error::InvalidInput`] を返す。
+/// 部分結果は返さない（`CORE-5`）。
+pub fn cascade(matched: &[MatchedRule<'_>], inline: &[Declaration]) -> Result<ComputedStyle> {
+    let mut total = inline.len();
+    for m in matched {
+        total = total.saturating_add(m.rule().declarations().len());
+        if total > MAX_CASCADE_DECLARATIONS {
+            break;
+        }
+    }
+    if total > MAX_CASCADE_DECLARATIONS {
+        return Err(Error::InvalidInput {
+            message: format!("cascade declaration count exceeds {MAX_CASCADE_DECLARATIONS}"),
+        });
+    }
+    let mut winners: BTreeMap<&str, (&Declaration, DeclarationOrigin, PriorityKey)> =
+        BTreeMap::new();
     for m in matched {
         for decl in m.rule().declarations() {
+            let key: PriorityKey = (importance_rank(decl.importance()), 0, m.specificity());
             let beats = match winners.get(decl.property()) {
-                Some((_, DeclarationOrigin::Rule { specificity, .. })) => {
-                    m.specificity() >= *specificity
-                }
-                Some(_) => false,
+                Some((_, _, cur)) => key >= *cur,
                 None => true,
             };
             if beats {
@@ -150,22 +178,33 @@ pub fn cascade(matched: &[MatchedRule<'_>], inline: &[Declaration]) -> ComputedS
                     rule_index: m.rule_index(),
                     specificity: m.specificity(),
                 };
-                winners.insert(decl.property(), (decl, origin));
+                winners.insert(decl.property(), (decl, origin, key));
             }
         }
     }
     for decl in inline {
-        winners.insert(decl.property(), (decl, DeclarationOrigin::Inline));
+        let key: PriorityKey = (
+            importance_rank(decl.importance()),
+            1,
+            Specificity::default(),
+        );
+        let beats = match winners.get(decl.property()) {
+            Some((_, _, cur)) => key >= *cur,
+            None => true,
+        };
+        if beats {
+            winners.insert(decl.property(), (decl, DeclarationOrigin::Inline, key));
+        }
     }
-    ComputedStyle {
+    Ok(ComputedStyle {
         declarations: winners
             .into_values()
-            .map(|(decl, origin)| ComputedDeclaration {
+            .map(|(decl, origin, _)| ComputedDeclaration {
                 declaration: decl.clone(),
                 origin,
             })
             .collect(),
-    }
+    })
 }
 
 /// 要素の computed style（カスケード後の有効宣言一覧）を返す入口。
@@ -188,19 +227,7 @@ pub fn computed_style<'a>(
     }
     let matched = match_rules(document, element, sheets)?;
     let inline = parse_style_attribute(document, element)?.unwrap_or_default();
-    let mut total = inline.len();
-    for m in &matched {
-        total = total.saturating_add(m.rule().declarations().len());
-        if total > MAX_CASCADE_DECLARATIONS {
-            break;
-        }
-    }
-    if total > MAX_CASCADE_DECLARATIONS {
-        return Err(Error::InvalidInput {
-            message: format!("cascade declaration count exceeds {MAX_CASCADE_DECLARATIONS}"),
-        });
-    }
-    Ok(cascade(&matched, &inline))
+    cascade(&matched, &inline)
 }
 
 #[cfg(test)]
@@ -325,7 +352,10 @@ mod tests {
     #[test]
     fn core_5_empty_and_passthrough() {
         assert_eq!(run("<p>a</p>", &[]), ComputedStyle::default());
-        assert_eq!(cascade(&[], &[]), ComputedStyle::default());
+        assert_eq!(
+            cascade(&[], &[]).expect("空は成功"),
+            ComputedStyle::default()
+        );
         let s = run(r#"<p style="">a</p>"#, &["p{color:red}"]);
         assert_eq!(s.get("color").expect("color がある").value(), "red");
         let s = run("<p>a</p>", &["p{color:red !important}"]);
@@ -374,5 +404,54 @@ mod tests {
         over.push(&big);
         let err = computed_style(&d, find(&d, "p"), over.iter().copied()).unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }));
+    }
+
+    /// CORE-5: `!important` は詳細度・ソース順より優先する。
+    #[test]
+    fn core_5_important_beats_later_normal() {
+        let s = run("<p>a</p>", &["p{color:red !important} p{color:blue}"]);
+        let c = s.get("color").expect("color がある");
+        assert_eq!(c.value(), "red");
+        assert_eq!(c.importance(), Importance::Important);
+        assert_eq!(c.origin(), rule(0, 0, 0, 0, 1));
+    }
+
+    /// CORE-5: stylesheet の `!important` は inline の通常宣言に勝つ。
+    #[test]
+    fn core_5_important_rule_beats_normal_inline() {
+        let s = run(
+            r#"<p style="color:green">a</p>"#,
+            &["p{color:red !important}"],
+        );
+        assert_eq!(s.get("color").expect("color がある").value(), "red");
+    }
+
+    /// CORE-5: `!important` 同士は高詳細度が勝ち、同 importance では inline が勝つ。
+    #[test]
+    fn core_5_important_ties_resolved_by_specificity_and_inline() {
+        let s = run(
+            r#"<p id="x">a</p>"#,
+            &["#x{color:red !important} p{color:blue !important}"],
+        );
+        assert_eq!(s.get("color").expect("color がある").value(), "red");
+        let s = run(
+            r#"<p style="color:green !important">a</p>"#,
+            &["p{color:red !important}"],
+        );
+        assert_eq!(
+            s.get("color").expect("color がある").origin(),
+            DeclarationOrigin::Inline
+        );
+    }
+
+    /// CORE-5: 公開 `cascade` も宣言総数の上限を検査する。
+    #[test]
+    fn core_5_cascade_rejects_over_limit_directly() {
+        let inline: Vec<Declaration> = (0..=MAX_CASCADE_DECLARATIONS)
+            .map(|_| Declaration::new("color", "red", Importance::Normal))
+            .collect();
+        let err = cascade(&[], &inline).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(cascade(&[], &inline[..MAX_CASCADE_DECLARATIONS]).is_ok());
     }
 }
