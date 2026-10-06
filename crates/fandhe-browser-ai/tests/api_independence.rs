@@ -3,7 +3,8 @@
 //! （TASK-20.1・Issue #473、ビヘイビア `AISNAP-7`・MS-4）。
 //! TASK-20.2（#474）は同じヘルパー上で、スタブ CDP 状態の `GET /ai/snapshot` の応答
 //! （未ナビゲート時の `no_navigation`・ナビゲート後の簡約表現全体）を具体値で検証する。
-//! 後続の TASK-20.3（#475）も同じヘルパーへテストを足す。
+//! TASK-20.3（#475）は同じヘルパー上で、スタブ CDP の未実装エラー応答（501・`-32601`）を
+//! 繰り返し受けても `GET /ai/snapshot` の応答・共有ナビゲート状態が変わらないことを検証する。
 //!
 //! # 前提
 //!
@@ -382,5 +383,92 @@ async fn aisnap7_snapshot_reports_form_state_without_hidden_values_while_cdp_is_
     let text = String::from_utf8(snap.body.clone()).expect("utf8");
     assert!(!text.contains("dummy-hidden-value"), "hidden value leaked");
     let v: Value = serde_json::from_slice(&snap.body).expect("json");
+    assert_eq!(v, expected_form("https://example.com/form"));
+}
+
+// ---- TASK-20.3（Issue #475・`AISNAP-7`・MS-4）: CDP エラー応答の非波及検証 ----
+
+/// スタブ CDP の未実装エラー応答（501）を複数回発生させ、毎回エラーであることを確認する。
+/// 「成功を装うフォールバック」は作らず（`REPAIR-3`・`SEC-2`）、固定エラー応答のみで
+/// CDP 側の失敗を代表させる。実 cdp との合成は cli 側（TASK-19.3・19.4）の担当。
+async fn call_unimplemented_cdp(server: &StubServer) {
+    for _ in 0..3 {
+        assert_cdp_is_stub(server).await;
+        let call = server
+            .request("POST", "/cdp-stub/call", Some("127.0.0.1:9222"))
+            .await;
+        assert_eq!(call.status, 501);
+        assert_eq!(call.body, STUB_ERROR_BODY.as_bytes().to_vec());
+    }
+}
+
+/// `GET /ai/snapshot` の観測値（status・body・ワイヤ表現）。前後比較用。
+async fn snapshot_observation(server: &StubServer) -> (u16, Vec<u8>, Vec<u8>) {
+    let snap = server.get("/ai/snapshot").await;
+    let wire = snap.serialize(false);
+    (snap.status, snap.body, wire)
+}
+
+/// CDP エラー応答の前後でスナップショット応答が一致し、共有ナビゲート状態も変わらない。
+#[tokio::test]
+async fn aisnap7_snapshot_is_unchanged_across_unimplemented_cdp_calls() {
+    let server = StubServer::start();
+    let url = "https://example.com/article";
+    server.navigate(url, ARTICLE);
+
+    let before = snapshot_observation(&server).await;
+    call_unimplemented_cdp(&server).await;
+    let after = snapshot_observation(&server).await;
+
+    assert_eq!(before.0, 200);
+    assert_eq!(before, after);
+    let v: Value = serde_json::from_slice(&after.1).expect("json");
+    assert_eq!(v, expected_article(url));
+
+    let probe = server.get("/cdp-stub/state").await;
+    let p: Value = serde_json::from_slice(&probe.body).expect("json");
+    assert_eq!(p["url"], url);
+    let latest = server.app().navigation().latest().expect("latest");
+    assert_eq!(latest.url(), url);
+}
+
+/// 未ナビゲートの `no_navigation`（409）も CDP エラー呼び出しの前後で変わらない。
+#[tokio::test]
+async fn aisnap7_no_navigation_error_is_unchanged_across_unimplemented_cdp_calls() {
+    let server = StubServer::start();
+
+    let before = snapshot_observation(&server).await;
+    call_unimplemented_cdp(&server).await;
+    let after = snapshot_observation(&server).await;
+
+    assert_eq!(before.0, 409);
+    assert_eq!(before, after);
+    let v: Value = serde_json::from_slice(&after.1).expect("json");
+    assert_eq!(
+        v,
+        serde_json::json!({"code": "no_navigation", "message": "no navigation has been performed yet"})
+    );
+    assert!(server.app().navigation().latest().is_none());
+}
+
+/// CDP エラーが後続ナビゲーションの結果にも影響しない（毎回の期待値と一致し、hidden 値も漏れない）。
+#[tokio::test]
+async fn aisnap7_cdp_errors_do_not_poison_later_navigations() {
+    let server = StubServer::start();
+
+    server.navigate("https://example.com/article", ARTICLE);
+    call_unimplemented_cdp(&server).await;
+    let a = server.get("/ai/snapshot").await;
+    assert_eq!(a.status, 200);
+    let v: Value = serde_json::from_slice(&a.body).expect("json");
+    assert_eq!(v, expected_article("https://example.com/article"));
+
+    server.navigate("https://example.com/form", FORM);
+    call_unimplemented_cdp(&server).await;
+    let f = server.get("/ai/snapshot").await;
+    assert_eq!(f.status, 200);
+    let text = String::from_utf8(f.body.clone()).expect("utf8");
+    assert!(!text.contains("dummy-hidden-value"), "hidden value leaked");
+    let v: Value = serde_json::from_slice(&f.body).expect("json");
     assert_eq!(v, expected_form("https://example.com/form"));
 }
