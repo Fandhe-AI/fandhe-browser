@@ -40,7 +40,7 @@ PoC の golden は連番 ref（`e1`〜）だが、本リポの ref は `AISNAP-1
 ## 簡約表現の形式と ref 解決（TASK-21.2）
 
 - 形式は `benches/token_reduction/snapshot_text.rs` の暫定行形式。`AISNAP-8` が前提とする `GET /ai/snapshot` の確定応答ではない（`REPAIR-3`）。TASK-19・`AISNAP-6` の確定後に `snapshot_text` 側を差し替える。
-- 生成物は行末の空白だけを落としている（`header: ` 等。`.editorconfig` の `trim_trailing_whitespace` 検査に通すため。内容は変えない）。
+- 生成物は行末の空白だけを落としている（`header:` の後ろの空白等。`.editorconfig` の `trim_trailing_whitespace` 検査に通すため。内容は変えない）。
 - ref 解決は DOM からの再計算（`retention_check::target_refs`）。`build_snapshot` が省略する要素が先行すると不一致側へ倒れ、`refs` は空配列になる（fail-closed）。解決不能はテストの失敗にせず事実として記録する。
 - 現時点で `refs` が空のロケータ: click-04（`table#table1 tbody a[href="#edit"]` index 1）・extract-01（`table#table1 tbody td` index 14）・nav-02・nav-05。簡約表現上で ref を持たない正解要素であり、読み取れるかどうかは #121 の測定結果で判定する。
 - 上限で打ち切られる（`… truncated`）ページは `hn-list`・`large-table`。
