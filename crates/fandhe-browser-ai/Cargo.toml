@@ -88,6 +88,12 @@ harness = false
 name = "raw_dom_serialize_tokens"
 path = "benches/raw_dom_serialize_reduction/raw_dom_tokens_tests.rs"
 
+# 対生 DOM 比の削減率・平均集計テスト（TASK-23.2・Issue #130・AISNAP-15）。
+# bench ターゲットは cargo test で実行されないため別 [[test]] に分ける。依存は増やさない。
+[[test]]
+name = "raw_dom_serialize_reduction_rows"
+path = "benches/raw_dom_serialize_reduction/raw_dom_reduction_tests.rs"
+
 # エージェント評価ハーネスのタスク定義テスト（TASK-21.1・Issue #119・AISNAP-8）。
 # harness/ は cargo の自動検出対象外のため path を明示する。外部依存は増やさない。
 [[test]]
