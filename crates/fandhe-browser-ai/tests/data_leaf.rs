@@ -39,6 +39,13 @@
 //! 置かない。除外されると添字対応付けがずれるため。また圧縮表に非表示セルを置かない
 //! （`header` の添字と列位置がずれるため）。
 //!
+//! TASK-15.4（`AISNAP-11`・Issue #102）: 引用文・地の文データ値のフィクスチャ単位テスト
+//! （`aisnap_11_*` の後半）も本ファイルが担う。規則単体は `src/data_leaf.rs` のユニット
+//! テストが担い、ここでは実フィクスチャ上の要素単位判定と、拡充が TASK-13.4 の
+//! 代表 7 タスクのベースラインを動かさないことを固定する。PoC-4 extract-05 のタスク
+//! レベル回帰は TASK-18.2（`AISNAP-13`）の担当でここでは扱わない。`python-portal.html` は
+//! nav 等の除外要素を含むため添字対応付け（`map_to_snapshot`）を使わない。
+//!
 //! フィクスチャは PoC の 7 ページの構造を模した合成 HTML で、値はすべてダミー
 //! （実サイトの HTML・外部通信・実資格情報なし。`docs/spec` も参照しない）。
 //! ref のリテラルは固定しない（ref の安定性 `AISNAP-10` は `tests/snapshot.rs` の担当）。
@@ -52,7 +59,7 @@ use fandhe_browser_ai::snapshot::{
 };
 use fandhe_browser_core::dom::{Document, NodeId};
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
-use fandhe_browser_core::query::query_selector_str;
+use fandhe_browser_core::query::{query_selector_all_str, query_selector_str};
 
 /// 判別可能とみなす最小タスク数（`AISNAP-3` の受入基準: 7 件中 6 件以上）。
 const REQUIRED_DISCRIMINABLE: usize = 6;
@@ -679,13 +686,13 @@ fn aisnap_3_is_ref_shaped_follows_ref_contract() {
     }
 }
 
-/// 引用一覧形の地の文（`span.text`）の `ProseClass` 件数を数える。
-fn count_prose(html: &str) -> usize {
+/// Snapshot 上で `data_leaf == Some(kind)` の項目数を数える。
+fn count_kind(html: &str, kind: DataLeafKind) -> usize {
     let doc = parse(html);
     let s = snap(&doc);
     all_nodes(&s.tree)
         .into_iter()
-        .filter(|i| i.data_leaf() == Some(DataLeafKind::ProseClass))
+        .filter(|i| i.data_leaf() == Some(kind))
         .count()
 }
 
@@ -695,7 +702,7 @@ fn aisnap_11_prose_class_in_minimal_quote_list() {
     let html = r#"<main><div class="quote"><span class="text">Quote one.</span>
 <a href="/a" class="text">link</a></div>
 <div class="quote"><span class="text">Quote two.</span></div></main>"#;
-    assert_eq!(count_prose(html), 2);
+    assert_eq!(count_kind(html, DataLeafKind::ProseClass), 2);
 }
 
 /// AISNAP-11（TASK-15.2・Issue #100）: `quotes-list.html` の `span.text` 10 件すべてが地の文
@@ -707,7 +714,7 @@ fn aisnap_11_prose_class_in_quotes_list_fixture() {
         .join("fixtures")
         .join("quotes-list.html");
     let html = std::fs::read_to_string(path).expect("フィクスチャは UTF-8 で読める");
-    assert_eq!(count_prose(&html), 10);
+    assert_eq!(count_kind(&html, DataLeafKind::ProseClass), 10);
 }
 
 /// 拡充対象（`Quote`/`ProseClass`）のノードの (種別, ref) を先行順で集める。
@@ -771,4 +778,153 @@ fn aisnap_11_data_leaves_inside_list_keep_refs() {
     for (_, r) in &leaves {
         assert!(is_ref_shaped(r.as_deref().expect("ref あり")));
     }
+}
+
+/// `benches/fixtures/<name>` を読む（`CARGO_MANIFEST_DIR` 起点。3 OS 共通のパス組み立て）。
+fn fixture(name: &str) -> String {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("benches")
+        .join("fixtures")
+        .join(name);
+    std::fs::read_to_string(path).expect("フィクスチャは UTF-8 で読める")
+}
+
+/// セレクタに一致する全要素の `classify_data_leaf` 結果を文書順で返す。
+fn classify_all(doc: &Document, selector: &str) -> Vec<Option<DataLeafKind>> {
+    query_selector_all_str(doc, doc.root(), selector)
+        .expect("セレクタは有効")
+        .into_iter()
+        .map(|id| classify_data_leaf(doc, id))
+        .collect()
+}
+
+/// AISNAP-11（TASK-15.4・Issue #102）: `quotes-list.html` を要素単位で判定する。
+/// `span.text` 10 件のみ `ProseClass`、著者・タグ・部分一致クラス・リンク・容器は対象外。
+#[test]
+fn aisnap_11_quotes_list_fixture_classifies_each_element() {
+    let html = fixture("quotes-list.html");
+    let doc = parse(&html);
+    assert_eq!(
+        classify_all(&doc, "span.text"),
+        vec![Some(DataLeafKind::ProseClass); 10]
+    );
+    for sel in [
+        "small.author",
+        "a.tag",
+        "footer p.text-muted",
+        "h1 a[href]",
+        "div.quote",
+    ] {
+        let got = classify_all(&doc, sel);
+        assert!(!got.is_empty(), "{sel} がフィクスチャに存在する");
+        assert!(got.iter().all(Option::is_none), "{sel} は対象外: {got:?}");
+    }
+    // 文書全体でも拡充種別は ProseClass の 10 件だけ。
+    let all: Vec<Option<DataLeafKind>> = doc
+        .descendants(doc.root())
+        .filter(|id| doc.is_element(*id))
+        .map(|id| classify_data_leaf(&doc, id))
+        .collect();
+    let count = |k| all.iter().filter(|c| **c == Some(k)).count();
+    assert_eq!(count(DataLeafKind::ProseClass), 10);
+    assert_eq!(count(DataLeafKind::Quote), 0);
+    assert_eq!(count(DataLeafKind::PriceClass), 0);
+    assert_eq!(count(DataLeafKind::TableCell), 0);
+    // Snapshot 側の件数も DOM 判定と一致する。
+    assert_eq!(count_kind(&html, DataLeafKind::ProseClass), 10);
+}
+
+/// AISNAP-11（TASK-15.4・Issue #102）: `python-portal.html` の引用文本文（`blockquote`）は
+/// `Quote`、内側の `p` は対象外。Snapshot 上でも 1 件で ref を持つ。
+#[test]
+fn aisnap_11_python_portal_fixture_blockquote_is_quote() {
+    let html = fixture("python-portal.html");
+    let doc = parse(&html);
+    assert_eq!(
+        classify_all(&doc, "section.success-stories blockquote"),
+        vec![Some(DataLeafKind::Quote)]
+    );
+    assert_eq!(
+        classify_all(&doc, "section.success-stories blockquote p"),
+        vec![None]
+    );
+    let s = snap(&doc);
+    let quotes: Vec<Item<'_>> = all_nodes(&s.tree)
+        .into_iter()
+        .filter(|i| i.data_leaf() == Some(DataLeafKind::Quote))
+        .collect();
+    assert_eq!(quotes.len(), 1);
+    let r = quotes
+        .first()
+        .and_then(|q| q.r#ref())
+        .expect("Quote は ref を持つ");
+    assert!(is_ref_shaped(r), "ref 形式が不正: {r}");
+}
+
+/// 引用文本文と地の文データ値の混在ページ（ダミー値のみ）。
+const MIXED_PAGE: &str = r#"<!DOCTYPE html><html><head><title>Mixed</title></head><body><main>
+<blockquote id="bq"><p>Quoted body.</p></blockquote>
+<p>Lead <q id="q1">short quote</q> tail</p>
+<span id="prose" class="text">Prose value.</span>
+<p id="desc" class="description">Description value.</p>
+<div id="note" class="note">Note value.</div>
+<span id="price" class="price">10.00</span>
+<table><tr><td id="cell">Cell</td></tr></table>
+<a id="decoy-link" class="text" href="/x">link</a>
+<span id="muted" class="text-muted">muted</span>
+<p id="plain">plain</p>
+<span id="empty" class="note"></span>
+</main></body></html>"#;
+
+/// AISNAP-11（TASK-15.4・Issue #102）: 混在ページで正例の種別と負例（ディストラクタ）を
+/// (セレクタ, 期待種別) の表で固定する。
+#[test]
+fn aisnap_11_mixed_fixture_quote_and_prose_data_values() {
+    let doc = parse(MIXED_PAGE);
+    let expected: [(&str, Option<DataLeafKind>); 11] = [
+        ("#bq", Some(DataLeafKind::Quote)),
+        ("#q1", Some(DataLeafKind::Quote)),
+        ("#prose", Some(DataLeafKind::ProseClass)),
+        ("#desc", Some(DataLeafKind::ProseClass)),
+        ("#note", Some(DataLeafKind::ProseClass)),
+        ("#price", Some(DataLeafKind::PriceClass)),
+        ("#cell", Some(DataLeafKind::TableCell)),
+        ("#decoy-link", None),
+        ("#muted", None),
+        ("#plain", None),
+        ("#empty", None),
+    ];
+    for (sel, kind) in expected {
+        let id = query_selector_str(&doc, doc.root(), sel)
+            .expect("セレクタは有効")
+            .expect("対象要素がある");
+        assert_eq!(classify_data_leaf(&doc, id), kind, "{sel}");
+    }
+    assert_eq!(count_kind(MIXED_PAGE, DataLeafKind::Quote), 2);
+    assert_eq!(count_kind(MIXED_PAGE, DataLeafKind::ProseClass), 3);
+    assert_eq!(count_kind(MIXED_PAGE, DataLeafKind::PriceClass), 1);
+}
+
+/// AISNAP-11・AISNAP-3（TASK-15.4・Issue #102）: 拡充後も TASK-13.4 の代表 7 フィクスチャに
+/// 拡充種別（Quote/ProseClass）が混入せず、判別可能タスク数が基準（6）以上のまま。
+#[test]
+fn aisnap_11_expansion_keeps_retention_check_baseline() {
+    for task in tasks() {
+        for kind in [DataLeafKind::Quote, DataLeafKind::ProseClass] {
+            assert_eq!(
+                count_kind(task.html, kind),
+                0,
+                "{} に {kind:?} が混入",
+                task.name
+            );
+        }
+    }
+    let ok = tasks()
+        .iter()
+        .filter(|t| evaluate(t) == Outcome::Discriminable)
+        .count();
+    assert_eq!(
+        ok, 7,
+        "拡充後も 7 件すべて判別可能（基準は {REQUIRED_DISCRIMINABLE} 以上）"
+    );
 }
