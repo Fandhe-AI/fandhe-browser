@@ -9,6 +9,8 @@
 //! （7 種・TASK-14.4・`AISNAP-3`・Issue #95）の判別結果を出力する。件数は spec 上の
 //! 14 ページではなくディレクトリ内の全件。目標値（85%）と情報保持チェックの達成判断は
 //! 人間担当（#97）のため終了コードには反映しない。
+//! さらに巨大静的ページ単体の生 DOM 比削減率（TASK-14.5・`AISNAP-5`・Issue #96）を出す。
+//! 分母は生 HTML ではなく生 DOM シリアライズ（`raw_dom.rs`）。
 //! テキスト形式は測定用の暫定形式（TASK-19・`AISNAP-6` で確定後に差し替え）。
 
 #[path = "token_reduction/tokens.rs"]
@@ -22,6 +24,12 @@ mod reduction;
 
 #[path = "token_reduction/retention_check.rs"]
 mod retention_check;
+
+#[path = "token_reduction/raw_dom.rs"]
+mod raw_dom;
+
+#[path = "token_reduction/huge_static.rs"]
+mod huge_static;
 
 use std::process::ExitCode;
 
@@ -61,12 +69,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => print_retention_checks(),
+        Ok(()) => match print_huge_static() {
+            Ok(()) => print_retention_checks(),
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// 巨大静的ページ単体の生 DOM 比削減率（`AISNAP-5`）を出す。判定は #97 のため終了コードへ反映しない。
+fn print_huge_static() -> Result<(), Box<dyn std::error::Error>> {
+    let counter = tokens::TokenCounter::new()?;
+    let r = huge_static::measure_huge_static(&counter, &tokens::fixtures_dir())?;
+    println!();
+    println!("# huge static page reduction vs raw DOM (AISNAP-5)");
+    println!("fixture\t{}", r.name);
+    println!("bytes\t{}", r.bytes);
+    println!("rawHtmlTokens\t{}", r.raw_html_tokens);
+    println!("rawDomTokens\t{}", r.raw_dom_tokens);
+    println!("snapshotTokens\t{}", r.snapshot_tokens);
+    println!("reductionVsRawDomPct\t{:.1}", r.reduction_vs_raw_dom_pct);
+    println!(
+        "reductionVsRawHtmlPct\t{:.1}\t(reference)",
+        r.reduction_vs_raw_html_pct
+    );
+    println!("truncated\t{}", r.snapshot_truncated);
+    println!("targetPct\t{:.1}", huge_static::TARGET_PCT);
+    println!(
+        "met\t{}",
+        r.reduction_vs_raw_dom_pct >= huge_static::TARGET_PCT
+    );
+    Ok(())
 }
 
 /// 情報保持チェック（`AISNAP-3`）の結果表を出す。判定ロジックは `retention_check.rs`。
