@@ -520,3 +520,20 @@ fn aisnap8_score_real_answers_if_requested() {
         std::fs::write(p, out).expect("write results");
     }
 }
+
+/// 巨大な値でも `Tally` の演算が桁あふれしない（AISNAP-8・TASK-21.3）。
+#[test]
+fn aisnap8_tally_large_values_do_not_overflow() {
+    let t = Tally {
+        pass: u32::MAX,
+        total: u32::MAX,
+    };
+    assert_eq!(t.rate_permille(), Some(1000));
+    assert!(t.meets(100));
+    let half = Tally {
+        pass: u32::MAX / 2,
+        total: u32::MAX,
+    };
+    assert_eq!(half.rate_permille(), Some(500));
+    assert!(!half.meets(70));
+}

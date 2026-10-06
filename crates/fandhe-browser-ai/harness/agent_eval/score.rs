@@ -101,7 +101,10 @@ impl Tally {
         if self.total == 0 {
             return None;
         }
-        Some((self.pass * 2000 + self.total) / (2 * self.total))
+        // pub フィールドは任意値を取り得るため u64 へ拡張して演算し、桁あふれを避ける
+        let (pass, total) = (u64::from(self.pass), u64::from(self.total));
+        let permille = (pass * 2000 + total) / (2 * total);
+        Some(u32::try_from(permille).unwrap_or(u32::MAX))
     }
 
     /// `"88.0%"` 形式。`total == 0` は `"n/a"`。
@@ -114,7 +117,9 @@ impl Tally {
 
     /// `threshold_percent` 以上か。丸め前の整数比較で、`total == 0` は未達。
     pub fn meets(&self, threshold_percent: u32) -> bool {
-        self.total > 0 && self.pass * 100 >= threshold_percent * self.total
+        // u64 へ拡張して比較し、桁あふれによる誤判定を避ける
+        self.total > 0
+            && u64::from(self.pass) * 100 >= u64::from(threshold_percent) * u64::from(self.total)
     }
 }
 
