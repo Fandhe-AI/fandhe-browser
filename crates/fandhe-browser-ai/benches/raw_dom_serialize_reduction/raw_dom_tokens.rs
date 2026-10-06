@@ -6,8 +6,8 @@
 //! 呼び出し元はベンチ本体（`raw_dom_serialize_reduction.rs`）とユニットテスト。
 //!
 //! `AISNAP-1` の分母は生 HTML、`AISNAP-15` の分母は本モジュールが数える生 DOM
-//! シリアライズで別指標。対生 DOM 比の削減率・ページ平均は #130（TASK-23.2）、
-//! 85% 達成可否の判断は #131（人間担当）の責務で、ここは分母の算出に徹し
+//! シリアライズで別指標。対生 DOM 比の削減率・ページ平均は `raw_dom_reduction.rs`
+//! （#130・TASK-23.2）、85% 達成可否の判断は #131（人間担当）の責務で、ここは分母の算出に徹し
 //! 目標値に対する assert を持たない。
 //! 本モジュールは `crate::tokens` / `crate::raw_dom` が解決できる前提で使う。
 
@@ -40,7 +40,7 @@ impl fmt::Display for RawDomTokensError {
 
 impl std::error::Error for RawDomTokensError {}
 
-/// 1 フィクスチャ分の測定結果。削減率は持たない（#130 の責務）。
+/// 1 フィクスチャ分の測定結果。削減率は持たない（`raw_dom_reduction.rs` の責務）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawDomTokens {
     pub name: String,
