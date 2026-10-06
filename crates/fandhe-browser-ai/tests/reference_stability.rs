@@ -261,11 +261,9 @@ fn locate(html: &str, selector: &str) -> Located {
             placement: Placement::Omitted(cause),
         };
     }
-    // 名前の打ち切りや深さ省略が Snapshot で起きた文書では、共有走査予算の消費状況まで
-    // 再現できず名前が食い違いうる。誤分類せず `Unmappable` に倒す。
-    if snapshot.truncated {
-        return Located::Unmappable { peers: 0 };
-    }
+    // `snapshot.truncated` は文書全体のフラグで、対象と無関係な打ち切りでも立つ。ここでは
+    // 早期に `Unmappable` へ倒さず、下の同 role+name の ref 保持要素数と DOM 要素数の一致で
+    // 対応づけられる対象は比較を続ける（AISNAP-10）。
     let peers = live_same_signature_elements(&doc, &index, &role, &name);
     let holders: Vec<String> = ref_holders(&snapshot)
         .into_iter()
@@ -273,6 +271,11 @@ fn locate(html: &str, selector: &str) -> Located {
         .map(|(_, _, x)| x)
         .collect();
     let placement = if holders.is_empty() {
+        // 打ち切りのある文書で ref 保持要素が見つからない場合、対象の名前自体が打ち切りで
+        // 食い違った可能性があり、保持上限による省略と区別できない。誤分類せず倒す。
+        if snapshot.truncated {
+            return Located::Unmappable { peers: peers.len() };
+        }
         if INTERACTIVE_ROLES.contains(&role.as_str()) {
             Placement::Omitted(OmissionCause::RetentionLimit)
         } else {
@@ -705,6 +708,33 @@ fn aisnap_10_beyond_depth_limit_is_omitted_from_snapshot() {
             name: "Go".into(),
             cause: OmissionCause::DepthLimit,
         }
+    );
+}
+
+/// AISNAP-10・TASK-17.1・Issue #110: 対象と無関係な深いサブツリーが打ち切られて
+/// `Snapshot::truncated` が立っても、対応づけられる対象は `Stable` のまま比較を続ける。
+#[test]
+fn aisnap_10_unrelated_truncation_keeps_target_stable() {
+    let wrap = MAX_TREE_DEPTH + 8;
+    let html = page(&format!(
+        "<button id=\"t\">Go</button>{}<p>x</p>{}",
+        "<div>".repeat(wrap),
+        "</div>".repeat(wrap)
+    ));
+    let doc = parse(&html);
+    let snapshot = build_snapshot(&doc).expect("フィクスチャの構築は成功する");
+    assert!(snapshot.truncated, "前提: 無関係な深い枝で打ち切りが起きる");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &html,
+        after_html: &html,
+        selector: "#t",
+    });
+    assert!(
+        matches!(
+            &result,
+            Reidentification::Stable { role, name, .. } if role == "button" && name == "Go"
+        ),
+        "unexpected: {result:?}"
     );
 }
 
