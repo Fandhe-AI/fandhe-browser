@@ -164,6 +164,8 @@ fn data_leaf_str(k: DataLeafKind) -> &'static str {
     match k {
         DataLeafKind::TableCell => "table_cell",
         DataLeafKind::PriceClass => "price_class",
+        DataLeafKind::ProseClass => "prose_class",
+        DataLeafKind::Quote => "quote",
     }
 }
 
