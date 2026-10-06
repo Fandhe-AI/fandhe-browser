@@ -56,15 +56,16 @@
 //! （未同梱ビルドでの有効化は暫定でエラー。`config` モジュール doc コメント参照）。
 //! [`cssom`] モジュールは TASK-105（`CORE-5`）で公開型（105.1・#255）と
 //! 宣言パーサー（105.2・#256）・詳細度計算（105.3・#257）・ルールブロック分割
-//! （105.4.1・#551）・スタイル源収集と Stylesheet 構築（105.4.2・#552）・セレクタマッチング（105.5・#259）を追加した。
-//! カスケード・computed style API は後続の sub-issue（#260〜#262）の担当で、まだ含まない。
+//! （105.4.1・#551）・スタイル源収集と Stylesheet 構築（105.4.2・#552）・セレクタマッチング（105.5・#259）・カスケード解決と computed style API（105.6・#260）を追加した。
+//! 上限検証・結合テストは後続の sub-issue（#261・#262）の担当で、まだ含まない
+//! （`!important` 未反映等は [`cssom`] の doc を参照）。
 //!
 //! # スタブについて
 //!
 //! 未実装・簡易実装の詳細は各モジュールの `//!` を参照（`REPAIR-3`: 実装済みを
 //! 装わない）。crate 直下では対象モジュールの名前のみを挙げる。
 //!
-//! - [`cssom`]（`CORE-5`・`TASK-105`・`MS-8`。型定義・宣言パーサー・詳細度計算・ルール分割・スタイル源収集・セレクタマッチングのみ）
+//! - [`cssom`]（`CORE-5`・`TASK-105`・`MS-8`。型定義・宣言パーサー・詳細度計算・ルール分割・スタイル源収集・セレクタマッチング・カスケード解決のみ。`!important`・継承等は未実装）
 //! - [`js_stub`]（`JS-2`・`TASK-30`・`MS-3`）
 //! - [`render::DisabledRenderer`]（`RENDER-1`・`TASK-33`/`TASK-38`・`MS-1`/`MS-4`）
 //! - [`observability::OperationRecord::to_json_line`]（`REPAIR-9`・`TASK-10（10.1）`・
@@ -90,7 +91,10 @@ pub use config::{
     Config, ConfigError, EngineKind, IsolationStrength, JsConfig, ProfileConfig, RenderingConfig,
     bundled_engines,
 };
-pub use cssom::{Declaration, Importance, Specificity, StyleRule, Stylesheet};
+pub use cssom::{
+    ComputedDeclaration, ComputedStyle, Declaration, DeclarationOrigin, Importance, Specificity,
+    StyleRule, Stylesheet,
+};
 pub use dom::{
     Ancestors, Attribute, Children, Descendants, Document, Node, NodeData, NodeId, QuirksMode,
 };
