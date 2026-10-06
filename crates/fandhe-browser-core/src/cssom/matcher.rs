@@ -19,8 +19,8 @@
 //!
 //! - inline `style` 属性（#260 が `InlineStyle` を別入力として扱う）
 //! - カスケード・`!important`・起源の区別（#260 以降）
-//! - 全要素分を回したときの総量の上限（#261。1 回の呼び出しの結果総数は
-//!   [`MAX_MATCHED_RULES`] で制限済み）
+//! - 全要素分を回したときの総量の上限（#261。1 回の呼び出しの走査ルール総数は
+//!   [`MAX_SCANNED_RULES`] で制限済み）
 //! - CSSOM の可観測性計装（`OperationKind` に対応 variant がない）
 //! - 疑似クラス等の未対応セレクタ（`crate::selector` が `Unsupported` にし、AST に現れない）
 
@@ -30,11 +30,12 @@ use crate::query::matching_selector_indices;
 
 use super::{Specificity, StyleRule, Stylesheet, specificity};
 
-/// 1 回の [`match_rules`] が返すマッチ結果の総数の上限。
+/// 1 回の [`match_rules`] が照合する（不一致を含む）ルール総数の上限。
 ///
-/// 任意長のシート列を渡されてもメモリを無制限に確保しないための上限
+/// 任意長のシート列を渡されても照合処理量・結果メモリを無制限にしないための上限
 /// （シートあたり最大 16,384 ルール × 4 シート分。AGENTS.md「リソース上限」）。
-pub const MAX_MATCHED_RULES: usize = 65_536;
+/// マッチ結果の件数は走査件数以下なので、結果の件数もこの値で抑えられる。
+pub const MAX_SCANNED_RULES: usize = 65_536;
 
 /// 1 要素にマッチした 1 ルール分の結果。
 ///
@@ -79,8 +80,8 @@ impl<'a> MatchedRule<'a> {
 /// # エラー
 ///
 /// 照合メモ化キャッシュの上限超過（[`crate::error::Error::MatchCacheLimitExceeded`]）を伝播する。
-/// マッチ結果の総数が [`MAX_MATCHED_RULES`] を超える場合は
-/// [`crate::error::Error::InvalidInput`] を返す（部分結果は返さない）。
+/// 走査するルールの総数が [`MAX_SCANNED_RULES`] を超える場合は、そのシートの照合に
+/// 入る前に [`crate::error::Error::InvalidInput`] を返す（部分結果は返さない）。
 pub fn match_rules<'a>(
     document: &Document,
     element: NodeId,
@@ -91,7 +92,15 @@ pub fn match_rules<'a>(
     if !document.is_element(element) {
         return Ok(matched);
     }
+    let mut scanned = 0usize;
     for (sheet_index, sheet) in sheets.into_iter().enumerate() {
+        // 不一致ルールも照合コストを消費するため、照合前にシート単位で総量を検証する。
+        scanned = scanned.saturating_add(sheet.rules().len());
+        if scanned > MAX_SCANNED_RULES {
+            return Err(Error::InvalidInput {
+                message: format!("scanned rule count exceeds {MAX_SCANNED_RULES}"),
+            });
+        }
         for (rule_index, rule) in sheet.rules().iter().enumerate() {
             let selectors = rule.selectors();
             let indices = matching_selector_indices(document, element, selectors)?;
@@ -101,11 +110,6 @@ pub fn match_rules<'a>(
                 .map(specificity)
                 .max();
             if let Some(specificity) = best {
-                if matched.len() >= MAX_MATCHED_RULES {
-                    return Err(Error::InvalidInput {
-                        message: format!("matched rule count exceeds {MAX_MATCHED_RULES}"),
-                    });
-                }
                 matched.push(MatchedRule {
                     rule,
                     sheet_index,
@@ -240,20 +244,27 @@ mod tests {
         assert_eq!(pos, vec![(0, 0), (1, 0), (1, 2)]);
     }
 
-    /// CORE-5: 結果総数の上限は境界で効き、超過は Err（部分結果を返さない）。
+    /// CORE-5: 走査ルール総数の上限は境界で効き、超過は Err（部分結果を返さない）。
+    /// 不一致ルールのみのシート列でも超過すれば照合前に失敗する。
     #[test]
-    fn core_5_matched_rule_count_limit() {
+    fn core_5_scanned_rule_count_limit() {
         let d = doc("<p>a</p>");
         let big = sheet(&"p{color:red}".repeat(16_384));
-        let sheets: Vec<&Stylesheet> = vec![&big; MAX_MATCHED_RULES / 16_384];
+        let sheets: Vec<&Stylesheet> = vec![&big; MAX_SCANNED_RULES / 16_384];
         let got =
             match_rules(&d, find(&d, "p"), sheets.iter().copied()).expect("上限ちょうどは成功");
-        assert_eq!(got.len(), MAX_MATCHED_RULES);
+        assert_eq!(got.len(), MAX_SCANNED_RULES);
 
         let one = sheet("p{color:red}");
         let mut over = sheets.clone();
         over.push(&one);
         let err = match_rules(&d, find(&d, "p"), over.iter().copied()).expect_err("超過は失敗");
+        assert!(matches!(err, Error::InvalidInput { .. }));
+
+        // 全件不一致でも走査総数で弾かれる。
+        let miss = sheet(&"div{color:red}".repeat(16_384));
+        let sheets: Vec<&Stylesheet> = vec![&miss; MAX_SCANNED_RULES / 16_384 + 1];
+        let err = match_rules(&d, find(&d, "p"), sheets.iter().copied()).expect_err("超過は失敗");
         assert!(matches!(err, Error::InvalidInput { .. }));
     }
 
