@@ -425,6 +425,38 @@ fn aisnap_10_measure_break_rate() {
         ]
     );
 
+    // ケース別診断値（変化後の同シグネチャ候補数・ref 同一性）もレポートと一致させて固定する。
+    // 候補数や ref 同一性だけが変わってもレポート更新を強制する。
+    use RefIdentity::{NoRefBefore, Same};
+    let diagnostics: Vec<(&str, usize, RefIdentity)> = rows
+        .iter()
+        .map(|r| (r.def.id.as_str(), r.after_candidates, r.identity))
+        .collect();
+    assert_eq!(
+        diagnostics,
+        vec![
+            ("01-login-submit", 1, Same),
+            ("02-login-username", 1, Same),
+            ("03-dropdown-select", 1, Same),
+            ("04-checkbox-first", 2, Same),
+            ("05-number-input", 1, Same),
+            ("06-quote-text", 71, Same),
+            ("07-quote-tag-link", 2, Same),
+            ("08-hn-first-title", 1, Same),
+            ("09-hn-more-link", 1, Same),
+            ("10-ec-price", 286, Same),
+            ("11-ec-product-link", 1, Same),
+            ("12-table-header-cell", 2, Same),
+            ("13-table-data-cell", 0, NoRefBefore),
+            ("14-python-download-link", 1, Same),
+            ("15-wiki-language-link", 1, Same),
+            ("16-login-password", 1, Same),
+            ("17-hn-second-title", 1, Same),
+            ("18-quotes-author-link", 10, Same),
+            ("19-quotes-login-link", 1, Same),
+        ]
+    );
+
     let excluded: Vec<&str> = rows
         .iter()
         .filter(|r| !r.def.ref_expected)
