@@ -55,3 +55,13 @@ path = "benches/token_reduction/reduction_tests.rs"
 [[test]]
 name = "token_reduction_retention_check"
 path = "benches/token_reduction/retention_check_tests.rs"
+
+# 生 DOM シリアライザ（TASK-14.5・AISNAP-5・Issue #96）のユニットテスト。
+[[test]]
+name = "token_reduction_raw_dom"
+path = "benches/token_reduction/raw_dom_tests.rs"
+
+# 巨大静的ページ単体の削減率測定（TASK-14.5・AISNAP-5・Issue #96）の具体値固定テスト。
+[[test]]
+name = "token_reduction_huge_static"
+path = "benches/token_reduction/huge_static_tests.rs"
