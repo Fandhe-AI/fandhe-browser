@@ -60,7 +60,7 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
 2. `cargo test -p fandhe-browser-cdp --test playwright_trace` が失敗したら、応答が変わった箇所を確認し
    `tests/playwright_trace.rs` の期待値（`EXPECTED_*`・`stages`・件数）を更新する
 
-## 現時点の到達点（事実のみ。原因分析は #247）
+## 現時点の到達点（事実のみ。原因分析は #247・`docs/design/playwright-compat.md`）
 
 - `connectOverCDP(http://127.0.0.1:<port>)`: Playwright が `GET /json/version/`（末尾スラッシュ付き）を要求し、
   サーバーが 404 を返して失敗する（CDP メッセージは 0 件）。`GET /json/version` は 200
