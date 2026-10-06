@@ -303,26 +303,31 @@ fn check_reidentification(case: &StabilityCase<'_>) -> Reidentification {
             Placement::NoRefByDesign | Placement::Omitted(_) => (role, name, None),
         },
     };
+    // 変化後に ref が無い（省略・設計上 ref なし）なら、名前が変わっていても「消えた」ものとして
+    // 先に `MissingAfter` を返す。シグネチャ比較は双方に ref がある場合だけ意味を持つ。
+    let Some(a) = a_ref else {
+        return Reidentification::MissingAfter {
+            role: b_role,
+            name: b_name,
+        };
+    };
     if (&a_role, &a_name) != (&b_role, &b_name) {
         return Reidentification::SignatureChanged {
             before: (b_role, b_name),
             after: (a_role, a_name),
         };
     }
-    match a_ref {
-        None => Reidentification::MissingAfter {
-            role: b_role,
-            name: b_name,
-        },
-        Some(a) if a == b_ref => Reidentification::Stable {
+    if a == b_ref {
+        Reidentification::Stable {
             role: b_role,
             name: b_name,
             r#ref: b_ref,
-        },
-        Some(a) => Reidentification::RefChanged {
+        }
+    } else {
+        Reidentification::RefChanged {
             before: b_ref,
             after: a,
-        },
+        }
     }
 }
 
@@ -850,6 +855,50 @@ fn aisnap_10_name_budget_exhaustion_matches_snapshot() {
             role: "button".into(),
             name: held.name.clone(),
             r#ref: held.r#ref.clone(),
+        }
+    );
+}
+
+/// AISNAP-10・TASK-17.1・Issue #110: 変化後に名前が変わり、同時に hidden で省略された対象は
+/// `SignatureChanged` ではなく、ref が消えた `MissingAfter`（変化前の role・name）で返す。
+#[test]
+fn aisnap_10_renamed_and_hidden_after_is_missing_after() {
+    let before = page("<button id=\"t\">Go</button>");
+    let after = page("<button id=\"t\" hidden>Stop</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: "#t",
+    });
+    assert_eq!(
+        result,
+        Reidentification::MissingAfter {
+            role: "button".into(),
+            name: "Go".into(),
+        }
+    );
+}
+
+/// AISNAP-10・TASK-17.1・Issue #110: 圧縮表のデータセルと同 role・name の ref 保持要素が
+/// 別にあっても、対象セルは `NotInSnapshot` のまま（別要素の ref を割り当てず Ambiguous にもしない）。
+#[test]
+fn aisnap_10_compressed_cell_with_same_signature_holder_is_not_in_snapshot() {
+    let rows: String = (0..60)
+        .map(|i| format!("<tr><td class=\"c{i}\">row{i}</td></tr>"))
+        .collect();
+    let html = page(&format!(
+        "<div role=\"cell\">row59</div><table><thead><tr><th>n</th></tr></thead><tbody>{rows}</tbody></table>"
+    ));
+    let result = check_reidentification(&StabilityCase {
+        before_html: &html,
+        after_html: &html,
+        selector: "td.c59",
+    });
+    assert_eq!(
+        result,
+        Reidentification::NotInSnapshot {
+            role: "cell".into(),
+            name: "row59".into(),
         }
     );
 }
