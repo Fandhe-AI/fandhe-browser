@@ -53,7 +53,16 @@ fn navigate(app: &AppState, url: &str, html: &str) {
 }
 
 async fn get(app: &Arc<AppState>, path: &str) -> Response {
-    let raw = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:9222\r\n\r\n");
+    get_with_host(app, path, Some("127.0.0.1:9222")).await
+}
+
+/// `host`（None なら Host ヘッダ無し）付きで GET する。
+async fn get_with_host(app: &Arc<AppState>, path: &str, host: Option<&str>) -> Response {
+    let mut raw = format!("GET {path} HTTP/1.1\r\n");
+    if let Some(h) = host {
+        raw.push_str(&format!("Host: {h}\r\n"));
+    }
+    raw.push_str("\r\n");
     let head = match parse_request_head(raw.as_bytes()).expect("parse") {
         ParseOutcome::Complete { head, .. } => head,
         ParseOutcome::Incomplete => panic!("incomplete request head"),
@@ -102,4 +111,44 @@ async fn aisnap6_snapshot_before_navigation_is_409() {
     let res = get(&app, "/ai/snapshot").await;
     assert_eq!(res.status, 409);
     assert_eq!(res.body, br#"{"code":"no_navigation"}"#.to_vec());
+}
+
+#[tokio::test]
+async fn aisnap6_snapshot_accepts_loopback_hosts() {
+    let dir = TempDir::new();
+    let app = app(&dir);
+    navigate(&app, "https://example.com/", "<h1>x</h1>");
+    for host in [
+        "127.0.0.1:9222",
+        "localhost:9222",
+        "[::1]:9222",
+        "localhost",
+    ] {
+        let res = get_with_host(&app, "/ai/snapshot", Some(host)).await;
+        assert_eq!(res.status, 200, "host: {host}");
+    }
+}
+
+#[tokio::test]
+async fn aisnap6_snapshot_rejects_foreign_host_without_leaking_content() {
+    let dir = TempDir::new();
+    let app = app(&dir);
+    navigate(&app, "https://secret.test/", "<h1>private</h1>");
+    let res = get_with_host(&app, "/ai/snapshot", Some("evil.example:9222")).await;
+    assert_eq!(res.status, 403);
+    assert_eq!(res.body, br#"{"code":"host_not_allowed"}"#.to_vec());
+    let text = String::from_utf8(res.body).expect("utf8");
+    assert!(!text.contains("secret.test") && !text.contains("private"));
+}
+
+#[tokio::test]
+async fn aisnap6_snapshot_rejects_missing_and_malformed_host() {
+    let dir = TempDir::new();
+    let app = app(&dir);
+    navigate(&app, "https://example.com/", "<h1>x</h1>");
+    for host in [None, Some("127.0.0.1:65536"), Some("[::1")] {
+        let res = get_with_host(&app, "/ai/snapshot", host).await;
+        assert_eq!(res.status, 400, "host: {host:?}");
+        assert_eq!(res.body, br#"{"code":"invalid_host"}"#.to_vec());
+    }
 }

@@ -77,6 +77,7 @@ pub mod cssom;
 pub mod dom;
 pub mod error;
 pub mod fetch;
+pub mod host;
 pub mod js_stub;
 pub mod observability;
 pub mod parse;

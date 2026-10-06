@@ -2,7 +2,8 @@
 //!
 //! core の [`AppState`] が保持する直近ナビゲート結果から [`Snapshot`]
 //! （`AISNAP-1` 方式 B）を構築し、JSON で返す `GET /ai/snapshot` ルータを提供する。
-//! [`router`] は bind・アクセス制御（loopback 限定。`SEC-4`）を行わない。cli が
+//! [`router`] は bind・アクセス制御（loopback 限定。`SEC-4`）を行わないが、DNS rebinding 対策として
+//! `Host` ヘッダ（localhost / IP リテラルのみ許可）を cdp と共通の core 実装で検証する。cli が
 //! `RouterFactory` として受け取り、cdp のルータと `Router::merge` で合成する想定
 //! （TASK-19.3・Issue #225）。cdp と ai は互いに依存せず、`Arc<AppState>` だけを共有する。
 //!
@@ -28,6 +29,7 @@ use std::sync::Arc;
 
 use fandhe_backend_http::response::Response;
 use fandhe_backend_routes::Router;
+use fandhe_browser_core::host::{Authority, HostError};
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
 use fandhe_browser_core::{AppState, NavigationState};
 use serde_json::{Map, Value, json};
@@ -66,14 +68,28 @@ impl std::error::Error for ApiError {}
 
 /// `GET /ai/snapshot` を登録したルータを返す。cli が合成する（TASK-19.3）。
 pub fn router(app: Arc<AppState>) -> Router {
-    Router::new().route(
-        "GET",
-        "/ai/snapshot",
-        move |_head, _body| match snapshot_body(app.navigation()) {
+    Router::new().route("GET", "/ai/snapshot", move |head, _body| {
+        // DNS rebinding 対策: cdp の `/json/*` と同じ Host 検証（core の `host` モジュール）を
+        // 応答前に行い、不正な Host には snapshot（直近ページの URL・内容）を渡さない。
+        if let Err(e) = Authority::from_host_header(head.header("host")) {
+            return host_error_response(e);
+        }
+        match snapshot_body(app.navigation()) {
             Ok(body) => Response::new(200, body).with_content_type(JSON_CONTENT_TYPE),
             Err(e) => error_response(e),
-        },
-    )
+        }
+    })
+}
+
+/// Host 検証エラーを 400（形式不正）/ 403（許可外ホスト）へ写像する。本体は固定コードのみで
+/// ヘッダ値を含めない。
+fn host_error_response(e: HostError) -> Response {
+    let (status, code) = match e {
+        HostError::NotAllowed => (403, "host_not_allowed"),
+        _ => (400, "invalid_host"),
+    };
+    let body = json!({ "code": code }).to_string().into_bytes();
+    Response::new(status, body).with_content_type(JSON_CONTENT_TYPE)
 }
 
 /// 固定文言のエラー応答。`NoNavigation` は 409（200 で成功を装わない）、他は 500。
