@@ -258,7 +258,8 @@ pub fn flatten(root: &Node) -> Vec<FlatEntry> {
 
 /// `ref` 文字列（`e<16hex>[v<n>][-<n>]`）をダイジェストと出現番号（無印は 1）へ分解する。
 /// 形式に合わない文字列は `None`（同一性を確認できないため一致扱いにしない）。
-fn parse_ref(r: &str) -> Option<(u64, u32)> {
+/// agent_eval（TASK-21.2・#120）の ref 解決からも使う。
+pub fn parse_ref(r: &str) -> Option<(u64, u32)> {
     let rest = r.strip_prefix('e')?;
     let digest = u64::from_str_radix(rest.get(..16)?, 16).ok()?;
     let mut tail = rest.get(16..)?;

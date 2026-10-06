@@ -82,3 +82,8 @@ path = "benches/token_reduction/huge_static_tests.rs"
 [[test]]
 name = "agent_eval_tasks"
 path = "harness/agent_eval/tasks_tests.rs"
+
+# 簡約表現生成ハーネス（TASK-21.2・Issue #120・AISNAP-8）。依存は増やさない。
+[[test]]
+name = "agent_eval_generate_reduced"
+path = "harness/agent_eval/generate_reduced_tests.rs"

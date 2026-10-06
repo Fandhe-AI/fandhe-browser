@@ -1,7 +1,7 @@
 # エージェント評価ハーネス: 代表タスク 25 件と golden answer
 
 TASK-21.1（MS-2・`AISNAP-8`・Issue #119）。簡約表現と生 HTML をエージェントに渡したときの成功率を比較するための、代表タスクと正解の定義。
-親は #118。後続は #120（簡約表現の生成ハーネス）と #121（採点・成功率算出）。
+親は #118。TASK-21.2（#120）が簡約表現の生成ハーネス、後続の #121 が採点・成功率算出。
 
 ## ファイル
 
@@ -11,6 +11,10 @@ TASK-21.1（MS-2・`AISNAP-8`・Issue #119）。簡約表現と生 HTML をエ�
 | `tasks_tests.rs` | `[[test]] agent_eval_tasks`。件数・配分・ロケータ解決・JSON 一致を固定する |
 | `tasks.json` | エージェントへ渡す側（id・category・page・prompt）。`tasks.rs` から生成 |
 | `golden-answers.json` | 採点側。**エージェントへ渡さない**。`tasks.rs` から生成 |
+| `generate_reduced.rs` | 簡約表現の生成とロケータの ref 解決（TASK-21.2・#120）。#121 は `#[path]` で取り込む |
+| `generate_reduced_tests.rs` | `[[test]] agent_eval_generate_reduced`。25 タスク全件の生成・生成物一致を固定する |
+| `reduced/<page>.txt` | エージェントへ渡す簡約表現（`tasks.rs` が指す 13 ページ分）。生成物 |
+| `golden-refs.json` | 採点側。**エージェントへ渡さない**。golden の各ロケータを解決した ref（解決不能は空配列）。生成物 |
 
 ## 種別と件数
 
@@ -31,7 +35,15 @@ TASK-21.1（MS-2・`AISNAP-8`・Issue #119）。簡約表現と生 HTML をエ�
 ## golden が ref ではなくロケータである理由
 
 PoC の golden は連番 ref（`e1`〜）だが、本リポの ref は `AISNAP-10` のダイジェスト形式で移植できない。
-このためロケータで正解を表し、ref への解決は #120、照合は #121 が担う。
+このためロケータで正解を表し、ref への解決は #120（`golden-refs.json`）、照合は #121 が担う。
+
+## 簡約表現の形式と ref 解決（TASK-21.2）
+
+- 形式は `benches/token_reduction/snapshot_text.rs` の暫定行形式。`AISNAP-8` が前提とする `GET /ai/snapshot` の確定応答ではない（`REPAIR-3`）。TASK-19・`AISNAP-6` の確定後に `snapshot_text` 側を差し替える。
+- 生成物は行末の空白だけを落としている（`header: ` 等。`.editorconfig` の `trim_trailing_whitespace` 検査に通すため。内容は変えない）。
+- ref 解決は DOM からの再計算（`retention_check::target_refs`）。`build_snapshot` が省略する要素が先行すると不一致側へ倒れ、`refs` は空配列になる（fail-closed）。解決不能はテストの失敗にせず事実として記録する。
+- 現時点で `refs` が空のロケータ: click-04（`table#table1 tbody a[href="#edit"]` index 1）・extract-01（`table#table1 tbody td` index 14）・nav-02・nav-05。簡約表現上で ref を持たない正解要素であり、読み取れるかどうかは #121 の測定結果で判定する。
+- 上限で打ち切られる（`… truncated`）ページは `hn-list`・`large-table`。
 
 ## PoC との差分
 
@@ -49,4 +61,8 @@ AGENT_EVAL_WRITE=1 cargo test -p fandhe-browser-ai --test agent_eval_tasks
 
 # 通常実行（生成物が正本と一致することを検証する）
 cargo test -p fandhe-browser-ai --test agent_eval_tasks
+
+# 簡約表現（reduced/*.txt）と golden-refs.json を書き直す・検証する
+AGENT_EVAL_WRITE=1 cargo test -p fandhe-browser-ai --test agent_eval_generate_reduced
+cargo test -p fandhe-browser-ai --test agent_eval_generate_reduced
 ```
