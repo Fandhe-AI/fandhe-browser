@@ -2,7 +2,7 @@
 #
 # harness/puppeteer-connect の自己テスト（TASK-45.2・#481、ビヘイビア CDP-3）。
 # 呼び出し元は Makefile の check-puppeteer-connect。Puppeteer・ネットワーク不要で、
-# stages.mjs の段階判定と Rust 側契約テスト（--ignored）、connect.mjs のエンドポイント拒否（結果行 + exit 1）を確認する。
+# stages.mjs の段階判定と Rust 側契約テスト（tests/puppeteer_contract.rs の --ignored。0 件実行は fail）、connect.mjs のエンドポイント拒否（結果行 + exit 1）を確認する。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,4 +28,13 @@ echo "ok: non-loopback endpoint is rejected with a result line"
 # stages.mjs の結果行が Rust 側パーサー（script_harness）の契約を満たすこと（node 必須のため
 # cargo test の既定実行から外し、ここで --ignored 付きで実行する）。
 cd "$SCRIPT_DIR/../.."
-cargo test -p fandhe-browser-cdp --test puppeteer_connect cdp3_stages_mjs_result_line_satisfies_rust_contract -- --ignored --exact
+contract_out="$(cargo test -p fandhe-browser-cdp --test puppeteer_contract -- --ignored --exact cdp3_stages_mjs_result_line_satisfies_rust_contract 2>&1)" || {
+  printf '%s\n' "$contract_out" >&2
+  exit 1
+}
+printf '%s\n' "$contract_out"
+# 0 件一致（テストがコンパイルされない・名前不一致）を成功扱いにしない（fail-closed）。
+if ! grep -qE '^test result: ok\. 1 passed;' <<<"$contract_out"; then
+  echo "FAIL: contract test did not run exactly once (0 tests matched?)" >&2
+  exit 1
+fi

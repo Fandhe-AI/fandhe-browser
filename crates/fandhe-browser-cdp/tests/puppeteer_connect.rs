@@ -592,54 +592,6 @@ fn cdp3_rejects_inconsistent_stage_reports() {
     }
 }
 
-/// CDP-3: 実 `connect.mjs` と同じ生成ロジック（`stages.mjs` の `runStages`）が出す結果行を
-/// Rust 側パーサーで回収できる（JS 側と Rust 側のスキーマ乖離の検知）。
-/// node 必須のため `cargo test --workspace` の既定実行から外し、node 必須と明示された
-/// `make check-puppeteer-connect`（`harness/puppeteer-connect/self-test.sh`）が
-/// `--ignored` 付きで実行する。
-#[test]
-#[ignore = "requires node; run via `make check-puppeteer-connect`"]
-fn cdp3_stages_mjs_result_line_satisfies_rust_contract() {
-    let dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../harness/puppeteer-connect");
-    let cmd = |mode: &str| ScriptCommand {
-        program: "node".into(),
-        args: vec!["contract-sample.mjs".into(), mode.into()],
-        envs: Vec::new(),
-        cwd: Some(dir.clone()),
-    };
-    let names = ["connect", "newPage", "goto", "selector", "disconnect"];
-    assert_eq!(
-        run_script(&cmd("ok"), "ws://x", D),
-        ScriptOutcome::Completed {
-            ok: true,
-            step: "disconnect".into(),
-            error: None,
-            stages: names.map(|n| stage(n, StageStatus::Ok, None)).to_vec(),
-        }
-    );
-    // 失敗時は exit 1 のため、ok:false の結果行がそのまま回収される。
-    let err = ("ProtocolError", "goto boom");
-    assert_eq!(
-        run_script(&cmd("fail_goto"), "ws://x", D),
-        ScriptOutcome::Completed {
-            ok: false,
-            step: "goto".into(),
-            error: Some(ScriptError {
-                name: err.0.into(),
-                message: err.1.into()
-            }),
-            stages: vec![
-                stage("connect", StageStatus::Ok, None),
-                stage("newPage", StageStatus::Ok, None),
-                stage("goto", StageStatus::Failed, Some(err)),
-                stage("selector", StageStatus::NotReached, None),
-                stage("disconnect", StageStatus::NotReached, None),
-            ],
-        }
-    );
-}
-
 /// CDP-3: `stages` の無い結果行は空配列として扱う（後方互換）。
 #[test]
 fn cdp3_result_line_without_stages_is_backward_compatible() {

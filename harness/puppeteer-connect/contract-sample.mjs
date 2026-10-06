@@ -1,6 +1,6 @@
 // Rust 側パーサーとの契約テスト用サンプル出力（TASK-45.2・#481、ビヘイビア CDP-3）。
 //
-// 役割: tests/puppeteer_connect.rs の契約テストから実行され、偽 puppeteer を注入した
+// 役割: tests/puppeteer_contract.rs の契約テストから実行され、偽 puppeteer を注入した
 // runStages の結果を connect.mjs と同じ形式（FANDHE_SCRIPT_RESULT + JSON）で出す。
 // モード: ok（全段階成功）/ fail_goto（goto で失敗）。puppeteer・ネットワーク不要。
 import { runStages } from "./stages.mjs";
