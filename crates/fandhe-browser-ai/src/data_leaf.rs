@@ -122,7 +122,7 @@ fn is_html_element_named(doc: &Document, id: NodeId, name: &str) -> bool {
 /// 次に HTML 要素で `class` 属性全体に価格系パターンを部分一致で含み、かつ
 /// 子要素を持たなければ [`DataLeafKind::PriceClass`]。
 /// 続いて地の文クラス（TASK-15.2）を満たせば [`DataLeafKind::ProseClass`]。
-////// 非要素・ドキュメントルート・対象外の要素・範囲外の `NodeId` は `None`
+/// 非要素・ドキュメントルート・対象外の要素・範囲外の `NodeId` は `None`
 /// （panic しない）。`snapshot::build::build_snapshot` が要素ごとに呼ぶ（TASK-13.3・Issue #88）。
 pub fn classify_data_leaf(doc: &Document, id: NodeId) -> Option<DataLeafKind> {
     if is_html_element_named(doc, id, "td") || is_html_element_named(doc, id, "th") {
