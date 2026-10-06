@@ -89,7 +89,7 @@ pub use state::{CheckedState, State, compute_state};
 /// - `state`: 要素の状態（`disabled`・`checked`）。算出は
 ///   [`state::compute_state`]（TASK-11.5・Issue #74）が担う。`Node::new` の
 ///   既定値は `State::default()`（`disabled: false`・`checked: None`）
-/// - `data_leaf`: 非インタラクティブなデータ値（表セル・価格クラス要素・地の文クラス要素）と判定した
+/// - `data_leaf`: 非インタラクティブなデータ値（表セル・価格クラス要素・引用要素 `blockquote`/`q`・地の文クラス要素）と判定した
 ///   根拠。`None` はデータ葉でない。判定は [`crate::data_leaf::classify_data_leaf`]
 ///   （`AISNAP-3`・TASK-13.3・Issue #88）。role や ref には影響させない
 ///   （ref の安定性。`AISNAP-10`）

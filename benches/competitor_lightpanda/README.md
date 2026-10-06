@@ -32,7 +32,8 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
   `lsof -a -nP -w -iTCP:<port> -sTCP:LISTEN -Fpn` の PID と子プロセスツリーを突き合わせる）。
   Windows も実装済み（TASK-84.6.4・Issue #562。`netstat -a -n -o -p TCP/TCPv6` の
   LISTEN 所有 PID と、`Get-CimInstance Win32_Process` から作る子プロセスツリーを
-  突き合わせる）。これら以外の OS は「未対応」として
+  突き合わせる。プロセス表の照会は専用の期限 60 秒で行う）。所有 PID が起動した子
+  自身だけの場合は子プロセスツリーの照会を省く（Issue #698）。これら以外の OS は「未対応」として
   従来の事後確認（`reprobe_after_kill`）だけに頼る（両者は併用する設計）
 
 ## 運用（ローカルでの実測・記録）

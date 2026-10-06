@@ -68,7 +68,8 @@
 //!   圧縮されない忠実な HN 形状の既知ギャップの固定）
 //! - データ葉（非インタラクティブなデータ値）の検出（`AISNAP-3`・`TASK-13`・
 //!   `MS-2`）。`td`/`th` の検出（TASK-13.1・Issue #86）と
-//!   価格クラス名パターン（TASK-13.2・Issue #87）・地の文クラス（TASK-15.2・Issue #100）は実装済み（[`data_leaf`]）。
+//!   価格クラス名パターン（TASK-13.2・Issue #87）・引用要素 `blockquote`/`q`（TASK-15.1・Issue #99）・
+//!   地の文クラス（TASK-15.2・Issue #100）は実装済み（[`data_leaf`]）。
 //!   snapshot 構築への統合は実装済み（TASK-13.3・Issue #88。`Node::data_leaf`・圧縮表ヘッダの
 //!   `HeaderCell::data_leaf`）
 //! - 重要要素優先保持（`AISNAP-12`・`TASK-16`・`MS-2`）。先頭件の優先保持と

@@ -65,3 +65,9 @@ path = "benches/token_reduction/raw_dom_tests.rs"
 [[test]]
 name = "token_reduction_huge_static"
 path = "benches/token_reduction/huge_static_tests.rs"
+
+# エージェント評価ハーネスのタスク定義テスト（TASK-21.1・Issue #119・AISNAP-8）。
+# harness/ は cargo の自動検出対象外のため path を明示する。外部依存は増やさない。
+[[test]]
+name = "agent_eval_tasks"
+path = "harness/agent_eval/tasks_tests.rs"

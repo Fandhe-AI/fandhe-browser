@@ -1,0 +1,183 @@
+[
+  {
+    "id": "click-01",
+    "type": "ref",
+    "any_of": [
+      {"selector": "form#login button[type=submit]", "index": 0}
+    ]
+  },
+  {
+    "id": "click-02",
+    "type": "ref",
+    "any_of": [
+      {"selector": "select#dropdown option[value=\"2\"]", "index": 0}
+    ]
+  },
+  {
+    "id": "click-03",
+    "type": "ref",
+    "any_of": [
+      {"selector": "form#checkboxes input[type=checkbox]", "index": 0}
+    ]
+  },
+  {
+    "id": "click-04",
+    "type": "ref",
+    "any_of": [
+      {"selector": "table#table1 tbody a[href=\"#edit\"]", "index": 1}
+    ]
+  },
+  {
+    "id": "click-05",
+    "type": "ref",
+    "any_of": [
+      {"selector": "span.titleline > a", "index": 1}
+    ]
+  },
+  {
+    "id": "click-06",
+    "type": "ref",
+    "any_of": [
+      {"selector": "article.product_pod button", "index": 0}
+    ]
+  },
+  {
+    "id": "click-07",
+    "type": "ref",
+    "any_of": [
+      {"selector": "a[href=\"/login\"]", "index": 0}
+    ]
+  },
+  {
+    "id": "extract-01",
+    "type": "value",
+    "value": "user3@example.com",
+    "source": {"selector": "table#table1 tbody td", "index": 14},
+    "attr": null
+  },
+  {
+    "id": "extract-02",
+    "type": "value",
+    "value": "£13.17",
+    "source": {"selector": "p.price_color", "index": 1},
+    "attr": null
+  },
+  {
+    "id": "extract-03",
+    "type": "value",
+    "value": "20 points",
+    "source": {"selector": "span.score", "index": 0},
+    "attr": null
+  },
+  {
+    "id": "extract-04",
+    "type": "value",
+    "value": "r0c14-14",
+    "source": {"selector": "tbody td", "index": 14},
+    "attr": null
+  },
+  {
+    "id": "extract-05",
+    "type": "value",
+    "value": "“River stone beta garden prism record valley vector record theta delta system.”",
+    "source": {"selector": "span.text", "index": 0},
+    "attr": null
+  },
+  {
+    "id": "extract-06",
+    "type": "value",
+    "value": "Search",
+    "source": {"selector": "input#id-search-field", "index": 0},
+    "attr": "placeholder"
+  },
+  {
+    "id": "form-01",
+    "type": "steps",
+    "steps": [
+      {"action": "fill", "target": {"selector": "input#username", "index": 0}, "value": "dummy-user"},
+      {"action": "fill", "target": {"selector": "input#password", "index": 0}, "value": "dummy-pass"},
+      {"action": "click", "target": {"selector": "form#login button[type=submit]", "index": 0}, "value": null}
+    ]
+  },
+  {
+    "id": "form-02",
+    "type": "steps",
+    "steps": [
+      {"action": "select", "target": {"selector": "select#dropdown", "index": 0}, "value": "1"}
+    ]
+  },
+  {
+    "id": "form-03",
+    "type": "steps",
+    "steps": [
+      {"action": "fill", "target": {"selector": "input#quantity", "index": 0}, "value": "42"}
+    ]
+  },
+  {
+    "id": "form-04",
+    "type": "steps",
+    "steps": [
+      {"action": "click", "target": {"selector": "form#checkboxes input[type=checkbox]", "index": 0}, "value": null}
+    ]
+  },
+  {
+    "id": "form-05",
+    "type": "steps",
+    "steps": [
+      {"action": "fill", "target": {"selector": "input#id-search-field", "index": 0}, "value": "venv"},
+      {"action": "click", "target": {"selector": "form#search-form button[type=submit]", "index": 0}, "value": null}
+    ]
+  },
+  {
+    "id": "form-06",
+    "type": "steps",
+    "steps": [
+      {"action": "fill", "target": {"selector": "form#search input[name=q]", "index": 0}, "value": "rust"},
+      {"action": "click", "target": {"selector": "form#search input[type=submit]", "index": 0}, "value": null}
+    ]
+  },
+  {
+    "id": "nav-01",
+    "type": "ref",
+    "any_of": [
+      {"selector": "a#js-link-box-x3", "index": 0},
+      {"selector": "div.lang3 > a", "index": 0},
+      {"selector": "li.lang-item > a[title=\"Language 3\"]", "index": 0}
+    ]
+  },
+  {
+    "id": "nav-02",
+    "type": "ref",
+    "any_of": [
+      {"selector": "a[href=\"/docs/ref/group1/item3\"]", "index": 0}
+    ]
+  },
+  {
+    "id": "nav-03",
+    "type": "ref",
+    "any_of": [
+      {"selector": "a[href=\"/downloads/\"]", "index": 0}
+    ]
+  },
+  {
+    "id": "nav-04",
+    "type": "ref",
+    "any_of": [
+      {"selector": "span.pagetop > a[href=\"login?goto=news\"]", "index": 0}
+    ]
+  },
+  {
+    "id": "nav-05",
+    "type": "ref",
+    "any_of": [
+      {"selector": "li.next > a", "index": 0}
+    ]
+  },
+  {
+    "id": "nav-06",
+    "type": "ref",
+    "any_of": [
+      {"selector": "a[href=\"https://example.com/\"]", "index": 0}
+    ]
+  }
+]

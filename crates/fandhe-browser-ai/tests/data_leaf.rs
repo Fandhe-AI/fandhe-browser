@@ -622,6 +622,38 @@ fn aisnap_3_snapshot_is_deterministic_and_refs_unique() {
     }
 }
 
+/// AISNAP-11（TASK-15.1）: 子要素を持つ `blockquote`・`q` が `build_snapshot` を通した
+/// Snapshot 上でも `Node::data_leaf == Some(DataLeafKind::Quote)` になる。
+/// 引用内のリンクは通常ノードのまま data_leaf を持たない。
+#[test]
+fn aisnap_11_snapshot_marks_quote_elements_with_children() {
+    let html = r#"<!DOCTYPE html><html><head><title>Quotes</title></head><body><blockquote id="bq"><p>Quoted <a href="https://example.com/s">source</a></p></blockquote><p>Lead <q id="inline">short <em>quote</em></q> tail</p></body></html>"#;
+    let doc = parse(html);
+    let snapshot = snap(&doc);
+    let nodes = all_nodes(&snapshot.tree);
+    for selector in ["blockquote#bq", "q#inline"] {
+        let target = query_selector_str(&doc, doc.root(), selector)
+            .expect("セレクタは有効")
+            .expect("フィクスチャに対象要素がある");
+        let mapped = map_to_snapshot(&doc, &snapshot, target);
+        assert_eq!(
+            mapped.data_leaf(),
+            Some(DataLeafKind::Quote),
+            "{selector} は Snapshot 上で Quote"
+        );
+    }
+    let quotes = nodes
+        .iter()
+        .filter(|n| n.data_leaf() == Some(DataLeafKind::Quote))
+        .count();
+    assert_eq!(quotes, 2, "Quote 葉は blockquote と q の 2 件のみ");
+    let link = nodes
+        .iter()
+        .find(|n| n.role() == "link" && n.name() == "source")
+        .expect("引用内リンクがある");
+    assert_eq!(link.data_leaf(), None);
+}
+
 /// AISNAP-3: `is_ref_shaped` は `e<16hex>[v<n>][-<n>]` の全組み合わせを受け入れ、不正形を弾く。
 #[test]
 fn aisnap_3_is_ref_shaped_follows_ref_contract() {

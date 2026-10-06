@@ -676,6 +676,10 @@ pub(crate) enum PortOwnerVerdict {
 /// 事前ゲート（TASK-84.6・`PERF-3`/`PERF-6`）。`port` の LISTEN 所有 PID が
 /// `root_pid` の子プロセスツリー内に収まるかを確認する。
 ///
+/// 呼び出し契約: 先行判定（所有 PID が `root_pid` のみなら子孫照会を省く）は
+/// PID 再利用がない前提に依存するため、呼び出し側は対象の `Child` ハンドルを
+/// 保持している間に呼ぶこと（`spawn_and_wait_ready` の `ChildGuard` が満たす）。
+///
 /// 所有者を先に照会してから候補（子＋子孫）を集める。照会時点で所有していた
 /// 子孫は、直後のツリー走査にも必ず現れるため。判定は純粋関数
 /// [`verify_port_owner`] に委ねる。`reprobe_after_kill`（kill 後の事後確認）
@@ -693,6 +697,15 @@ pub(crate) fn check_port_owner(
     let Some(owner_pids) = lookup_port_owner_pids(root_pid, port)? else {
         return Ok(PortOwnerVerdict::Unsupported);
     };
+    // 先行判定（Issue #698・TASK-84.6・PERF-3）: 候補集合は常に `root_pid` を
+    // 含むため、所有 PID が起動した子自身だけなら子孫を調べなくても結果は同じ。
+    // Windows ではプロセス表照会（PowerShell + CIM）が CI ランナーで 6〜7 秒、
+    // 遅いと 10 秒超かかりフレークの原因だったので、直接の子が所有者の場合は省く。
+    match verify_port_owner(port, root_pid, &owner_pids, &[root_pid]) {
+        Ok(()) => return Ok(PortOwnerVerdict::Verified),
+        Err(PortOwnerError::Mismatch { .. }) => {}
+        Err(e) => return Err(e),
+    }
     let candidates = collect_owner_candidate_pids(root_pid, port)?;
     verify_port_owner(port, root_pid, &owner_pids, &candidates)?;
     Ok(PortOwnerVerdict::Verified)
@@ -1138,6 +1151,13 @@ fn collect_owner_candidate_pids(root_pid: u32, port: u16) -> Result<Vec<u32>, Po
     })
 }
 
+/// Windows のプロセス表照会（PowerShell + CIM）専用の期限。CI ランナーの実測で
+/// 成功時 6〜7 秒・失敗時 10 秒超（Issue #698）のため `EXTERNAL_COMMAND_DEADLINE`
+/// では足りない。照会は readiness の `elapsed` 確定後なので PERF-3 の値を汚さず、
+/// 上限付きである点も変わらない。他の外部コマンドの期限は変更しない。
+#[cfg(windows)]
+const WINDOWS_PROCESS_TABLE_QUERY_DEADLINE: Duration = Duration::from_secs(60);
+
 /// windows 版（TASK-84.6.4・#562）: `powershell.exe` で
 /// `Get-CimInstance Win32_Process` を 1 回実行して全プロセスの
 /// 「PID 親PID 作成時刻」を得て、Rust 側で `root_pid` の子孫を絞り込む。
@@ -1147,7 +1167,8 @@ fn collect_owner_candidate_pids(root_pid: u32, port: u16) -> Result<Vec<u32>, Po
 /// 全件を出力して絞り込む。1 回の CIM クエリは一貫したスナップショット
 /// なので、unix のような複数回走査の安定化はしない（所有者を先に照会して
 /// いるため、所有者は必ずスナップショットに現れる）。
-/// 失敗・期限超過・出力上限到達・形式不正・root 不在は `LookupFailed`。
+/// 失敗・期限超過（[`WINDOWS_PROCESS_TABLE_QUERY_DEADLINE`]）・出力上限到達・
+/// 形式不正・root 不在は `LookupFailed`。
 #[cfg(windows)]
 fn collect_owner_candidate_pids(root_pid: u32, port: u16) -> Result<Vec<u32>, PortOwnerError> {
     const SCRIPT: &str = "Get-CimInstance -ClassName Win32_Process | ForEach-Object { $t = 0; if ($_.CreationDate) { $t = $_.CreationDate.ToFileTimeUtc() }; '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, $t }";
@@ -1156,7 +1177,7 @@ fn collect_owner_candidate_pids(root_pid: u32, port: u16) -> Result<Vec<u32>, Po
     command.args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT]);
     let (status, stdout) = crate::support::run_capturing_output_with_deadline(
         command,
-        crate::support::EXTERNAL_COMMAND_DEADLINE,
+        WINDOWS_PROCESS_TABLE_QUERY_DEADLINE,
         MAX_PROCESS_TABLE_OUTPUT_BYTES,
     )
     .map_err(|e| lookup_failed(format!("failed to run powershell: {e}")))?;

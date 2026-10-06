@@ -1743,6 +1743,8 @@ pub fn windows_descendant_pids(
 /// - 不一致なら [`PortOwnerError::Mismatch`]。`foreign_pids` は候補外の
 ///   PID だけを重複なしで、出現順に保持する
 ///
+/// `check_port_owner` の先行判定では候補を `[root_pid]` のみにして呼ぶ（Issue #698）。
+///
 /// 件数は呼び出し側（照会・ツリー走査）が上限で縛る前提で、本関数は
 /// `contains` の線形比較のみを行う（添字アクセスなし）。
 /// `reprobe_after_kill`（事後確認）との役割分担は [`port_conflict_error`]
@@ -2624,6 +2626,24 @@ mod tests {
     #[test]
     fn perf3_verify_port_owner_root_owner_is_ok() {
         assert_eq!(verify_port_owner(9222, 100, &[100], &[100, 101]), Ok(()));
+    }
+
+    #[test]
+    fn perf3_verify_port_owner_root_only_candidates_cases() {
+        // check_port_owner の先行判定（Issue #698・TASK-84.6）が使う形。
+        assert_eq!(verify_port_owner(9222, 100, &[100], &[100]), Ok(()));
+        assert_eq!(
+            verify_port_owner(9222, 100, &[100, 555], &[100]),
+            Err(PortOwnerError::Mismatch {
+                port: 9222,
+                root_pid: 100,
+                foreign_pids: vec![555],
+            })
+        );
+        assert_eq!(
+            verify_port_owner(9222, 100, &[], &[100]),
+            Err(PortOwnerError::NoOwnerFound { port: 9222 })
+        );
     }
 
     #[test]

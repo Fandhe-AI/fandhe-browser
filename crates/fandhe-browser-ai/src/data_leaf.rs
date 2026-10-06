@@ -16,12 +16,17 @@
 //! `span.text` のみが該当し、表・一覧の子孫に当たらない）に基づく。素の `p` 等のタグ規則や
 //! 部分一致は表・一覧内に広く当たり、圧縮判定（`build.rs`）を通じて TASK-14 の測定値を変えるため採らない。
 //!
+//! 引用文（TASK-15.1・Issue #99・`AISNAP-11`）: HTML 名前空間の `blockquote`/`q` 要素は
+//! 子要素の有無を問わず [`DataLeafKind::Quote`] とする（通常形 `<blockquote><p>…</p></blockquote>`
+//! を取りこぼさないため、価格クラスの子要素条件は課さない）。判定順は末尾に追加し、
+//! 既存入力の分類結果は変えない（TASK-14 の測定ベースライン維持）。内側の `p`・`a` 等は対象外。
+//!
 //! # スタブについて（REPAIR-3）
 //!
 //! `snapshot::build::build_snapshot` から呼ばれ、結果は `Node::data_leaf`（圧縮表のヘッダは `HeaderCell::data_leaf`。TASK-12.5）に入る
 //! （TASK-13.3・Issue #88。簡約・剪定への利用は後続）。判定規則として実装済みなのは `td`/`th` と
-//! 価格クラス名パターン（TASK-13.2・Issue #87）、地の文クラス（TASK-15.2・Issue #100）。
-//! 引用文（Issue #99）は別タスク。地の文の既知の制約: クラスを持たない地の文・上記 3 語以外の
+//! 価格クラス名パターン（TASK-13.2・Issue #87）、引用要素 `blockquote`/`q`（TASK-15.1・Issue #99）、
+//! 地の文クラス（TASK-15.2・Issue #100）。地の文の既知の制約: クラスを持たない地の文・上記 3 語以外の
 //! クラス名・インライン子要素を含む地の文は未検出（汎用テキストブロック検出は未実装。`AISNAP-11`）。
 //!
 //! HTML 名前空間定数を本モジュールに持つ理由: `core` 側の定数は `pub(crate)`、
@@ -47,6 +52,8 @@ pub enum DataLeafKind {
     /// `class` トークンが `text`/`description`/`note` に完全一致し、子要素を持たず、
     /// 直下に非空白テキストを持つ非インタラクティブな地の文要素（TASK-15.2・Issue #100）。
     ProseClass,
+    /// HTML の `blockquote`/`q` 要素（引用文の容器。TASK-15.1・Issue #99・`AISNAP-11`）。
+    Quote,
 }
 
 /// 地の文クラスのトークン（ASCII 大文字小文字非区別の完全一致。`AISNAP-11`）。
@@ -121,7 +128,8 @@ fn is_html_element_named(doc: &Document, id: NodeId, name: &str) -> bool {
 /// 判定順: `td`/`th` は子要素の有無を問わず [`DataLeafKind::TableCell`]。
 /// 次に HTML 要素で `class` 属性全体に価格系パターンを部分一致で含み、かつ
 /// 子要素を持たなければ [`DataLeafKind::PriceClass`]。
-/// 続いて地の文クラス（TASK-15.2）を満たせば [`DataLeafKind::ProseClass`]。
+/// 次に `blockquote`/`q` を [`DataLeafKind::Quote`]（TASK-15.1・Issue #99）、
+/// 最後に地の文クラス（TASK-15.2）を満たせば [`DataLeafKind::ProseClass`] とする。
 /// 非要素・ドキュメントルート・対象外の要素・範囲外の `NodeId` は `None`
 /// （panic しない）。`snapshot::build::build_snapshot` が要素ごとに呼ぶ（TASK-13.3・Issue #88）。
 pub fn classify_data_leaf(doc: &Document, id: NodeId) -> Option<DataLeafKind> {
@@ -136,6 +144,8 @@ pub fn classify_data_leaf(doc: &Document, id: NodeId) -> Option<DataLeafKind> {
         && !has_element_child(doc, id)
     {
         Some(DataLeafKind::PriceClass)
+    } else if is_html_element_named(doc, id, "blockquote") || is_html_element_named(doc, id, "q") {
+        Some(DataLeafKind::Quote)
     } else if is_html_element(doc, id)
         && has_prose_class_token(doc, id)
         && !has_element_child(doc, id)
@@ -380,6 +390,77 @@ mod tests {
         assert_eq!(
             prose_kind(r#"<svg><text id="t" class="text">1</text></svg>"#),
             None
+        );
+    }
+
+    /// AISNAP-11（TASK-15.1・Issue #99）: blockquote/q は引用文として真（受入基準）。
+    #[test]
+    fn aisnap_11_blockquote_and_q_are_quote() {
+        let doc = parse("<blockquote><p>引用</p></blockquote><p><q>引用</q></p>");
+        for sel in ["blockquote", "q"] {
+            let id = select(&doc, sel);
+            assert_eq!(
+                classify_data_leaf(&doc, id),
+                Some(DataLeafKind::Quote),
+                "{sel}"
+            );
+            assert!(is_data_leaf(&doc, id), "{sel}");
+        }
+    }
+
+    /// AISNAP-11（TASK-15.1・Issue #99）: 子要素の有無を問わず容器のみが対象。
+    #[test]
+    fn aisnap_11_quote_ignores_element_children() {
+        let doc = parse(
+            "<blockquote id=a>text</blockquote><blockquote id=b><p>x <a href=\"/y\">l</a></p></blockquote><q id=c><em>e</em></q>",
+        );
+        for sel in ["#a", "#b", "#c"] {
+            assert_eq!(
+                classify_data_leaf(&doc, select(&doc, sel)),
+                Some(DataLeafKind::Quote),
+                "{sel}"
+            );
+        }
+        for sel in ["p", "a", "em"] {
+            assert_eq!(classify_data_leaf(&doc, select(&doc, sel)), None, "{sel}");
+        }
+    }
+
+    /// AISNAP-11（TASK-15.1・Issue #99）: 判定順（既存分類を保持）と名前空間。
+    #[test]
+    fn aisnap_11_quote_precedence_and_namespace() {
+        let doc = parse("<table><tr><td><q>x</q></td></tr></table>");
+        assert_eq!(
+            classify_data_leaf(&doc, select(&doc, "q")),
+            Some(DataLeafKind::Quote)
+        );
+        assert_eq!(
+            classify_data_leaf(&doc, select(&doc, "td")),
+            Some(DataLeafKind::TableCell)
+        );
+        let doc = parse(r#"<blockquote class="price">text</blockquote>"#);
+        assert_eq!(
+            classify_data_leaf(&doc, select(&doc, "blockquote")),
+            Some(DataLeafKind::PriceClass)
+        );
+        let doc = parse(r#"<blockquote class="price"><p>x</p></blockquote>"#);
+        assert_eq!(
+            classify_data_leaf(&doc, select(&doc, "blockquote")),
+            Some(DataLeafKind::Quote)
+        );
+        let doc = parse("<svg><q>x</q></svg>");
+        assert_eq!(classify_data_leaf(&doc, select(&doc, "q")), None);
+        let doc = parse("<div><cite>c</cite></div>");
+        assert_eq!(classify_data_leaf(&doc, select(&doc, "cite")), None);
+    }
+
+    /// AISNAP-11（TASK-15.1・15.2）: 引用要素は地の文クラスより優先して Quote とする。
+    #[test]
+    fn aisnap_11_quote_precedes_prose_class() {
+        let doc = parse(r#"<blockquote class="text">本文</blockquote>"#);
+        assert_eq!(
+            classify_data_leaf(&doc, select(&doc, "blockquote")),
+            Some(DataLeafKind::Quote)
         );
     }
 }
