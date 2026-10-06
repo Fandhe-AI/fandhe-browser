@@ -82,8 +82,8 @@
 //! - `/ai/*` ルータ向けスナップショット API（`AISNAP-6`・`AISNAP-14`・`CDP-1`
 //!   （API 単体動作は `AISNAP-7`）、`TASK-19`（単体動作確認は `TASK-20`）、
 //!   `MS-4`）。`GET /ai/snapshot` の正常系の骨格は実装済み（TASK-19.1・Issue #223。
-//!   [`api::router`]）。未ナビゲート時エラーの確定形（TASK-19.2・Issue #224）・
-//!   cli への合成（TASK-19.3・Issue #225）・結合テスト（TASK-19.4・Issue #226）は未実装
+//!   [`api::router`]）。未ナビゲート時エラー（409 / `no_navigation`）も実装済み（TASK-19.2・
+//!   Issue #224）。cli への合成（TASK-19.3・Issue #225）・結合テスト（TASK-19.4・Issue #226）は未実装
 //! - プラグインレジストリ（プロセス分離・stdio 経由の外部プラグイン呼び出し。
 //!   動的ライブラリの実行時ロードは行わない方針。security.md 参照。
 //!   `PLUG-2`、`TASK-92`、`MS-9`）
