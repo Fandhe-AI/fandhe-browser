@@ -11,18 +11,22 @@
 //! CSS テキストのルールブロック分割 [`split_rule_blocks`]（TASK-105.4.1・#551）、
 //! DOM からのスタイル源収集と [`Stylesheet`] 構築 [`collect_document_styles`] /
 //! [`parse_stylesheet`] / [`parse_style_attribute`]（TASK-105.4.2・#552）、
-//! セレクタマッチング [`match_rules`]（TASK-105.5・#259）まで。
-//! 以下は予定している兄弟モジュールで、まだ存在しない（REPAIR-3: 実装済みを装わない）。
+//! セレクタマッチング [`match_rules`]（TASK-105.5・#259）、
+//! カスケード解決と computed style API [`cascade`] / [`computed_style`]（TASK-105.6・#260）まで。
+//! 以下は未実装（REPAIR-3: 実装済みを装わない）。
 //!
-//! - `computed`: カスケードと computed style API（#260）
 //! - 上限検証（#261）・結合テスト（#262）
 
+mod computed;
 mod declaration;
 mod matcher;
 mod selector;
 mod stylesheet;
 mod types;
 
+pub use computed::{
+    ComputedDeclaration, ComputedStyle, DeclarationOrigin, cascade, computed_style,
+};
 pub use declaration::{
     MAX_DECLARATION_INPUT_BYTES, MAX_DECLARATIONS_PER_BLOCK, parse_declarations,
 };
