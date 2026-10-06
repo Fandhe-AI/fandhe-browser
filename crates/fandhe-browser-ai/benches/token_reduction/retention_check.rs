@@ -473,6 +473,12 @@ fn compressed_control_refs(
                     })
             })
         };
+        // 対象自身が圧縮されたコンテナ配下にない（展開側の操作要素）場合、その ref は通常の
+        // 祖先鎖 ref であり、ここで出現番号を振ると圧縮側の先頭 ref と誤一致する。候補を出さない
+        // （fail-closed。PR #706 指摘）。
+        if !in_container(id) {
+            continue;
+        }
         let dom_total = doc
             .descendants(doc.root())
             .filter(|&e| {

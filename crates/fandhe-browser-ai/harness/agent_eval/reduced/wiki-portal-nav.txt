@@ -11,8 +11,8 @@
             - generic [ec4a4fffb35df4f0d]
             - searchbox "Search" [edb85807397bf7c29]
             - combobox [ee13b2810fe7ac23b]
-              - generic [ef62c7a90678c1ce7]
-              - generic [ef62c7a90678c1ce7-2]
+              - generic "English" [ef62c7a90678c1ce7] value="en"
+              - generic "Other" [ef62c7a90678c1ce7-2] value="xx"
             - button "Search" [e5438a82e1cc9bf7f]
               - generic [e94f74d2f31f41727]
       - generic [edf7a99064530f860-3]

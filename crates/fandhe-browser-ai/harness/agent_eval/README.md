@@ -13,7 +13,7 @@ TASK-21.1（MS-2・`AISNAP-8`・Issue #119）。簡約表現と生 HTML をエ�
 | `golden-answers.json` | 採点側。**エージェントへ渡さない**。`tasks.rs` から生成 |
 | `generate_reduced.rs` | 簡約表現の生成とロケータの ref 解決（TASK-21.2・#120）。#121 は `#[path]` で取り込む |
 | `generate_reduced_tests.rs` | `[[test]] agent_eval_generate_reduced`。25 タスク全件の生成・生成物一致を固定する |
-| `reduced/<page>.txt` | エージェントへ渡す簡約表現（`tasks.rs` が指す 13 ページ分）。生成物 |
+| `reduced/<page>.txt` | エージェントへ渡す簡約表現（`tasks.rs` が指す 13 ページ分）。生成物。データ葉（価格・引用・地の文クラス）の本文と `option` のラベル・value は snapshot が持たないため、生成器が DOM から補う（回答可能性の確保） |
 | `golden-refs.json` | 採点側。**エージェントへ渡さない**。golden の各ロケータを解決した ref（解決不能は空配列）。生成物 |
 
 ## 種別と件数

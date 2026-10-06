@@ -21,8 +21,9 @@ use std::path::{Path, PathBuf};
 use crate::retention_check::{FlatEntry, flatten, parse_ref, target_refs};
 use crate::snapshot_text::render_snapshot;
 use crate::tasks::{GOLDEN, Golden, Locator, TASKS, json_str};
+use fandhe_browser_ai::data_leaf::{DataLeafKind, classify_data_leaf};
 use fandhe_browser_ai::snapshot::{Snapshot, build_snapshot};
-use fandhe_browser_core::dom::Document;
+use fandhe_browser_core::dom::{Document, NodeId};
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
 use fandhe_browser_core::query::query_selector_all_str;
 
@@ -142,9 +143,10 @@ pub fn generate_page(fixtures_dir: &Path, page: &str) -> Result<ReducedPage, Gen
     let snap = snapshot_of(page, &doc)?;
     // 空の name 等で行末に空白が残る（例: `header: `）。意味を持たず、生成物が .editorconfig の
     // trim_trailing_whitespace 検査（lint-docs）に通らないため、行ごとに末尾空白だけを落とす。
+    let notes = value_annotations(&doc, &flatten(&snap.tree));
     let mut text = render_snapshot(&snap)
         .lines()
-        .map(str::trim_end)
+        .map(|l| annotate_line(l.trim_end(), &notes))
         .collect::<Vec<_>>()
         .join("\n");
     text.push('\n');
@@ -153,6 +155,84 @@ pub fn generate_page(fixtures_dir: &Path, page: &str) -> Result<ReducedPage, Gen
         text,
         truncated: snap.truncated,
     })
+}
+
+/// 値注釈の本文の上限（文字数）。長文でもエージェント入力が肥大しないようにする。
+const NOTE_MAX_CHARS: usize = 300;
+
+/// 要素に対応する snapshot ref 文字列（文書順・重複なし。解決不能は空）。
+fn refs_of(doc: &Document, node: NodeId, entries: &[FlatEntry]) -> Vec<String> {
+    let cands = target_refs(doc, node, entries);
+    let mut refs: Vec<String> = Vec::new();
+    for e in entries {
+        if let Some(r) = &e.r#ref
+            && parse_ref(r).is_some_and(|p| cands.contains(&p))
+            && !refs.contains(r)
+        {
+            refs.push(r.clone());
+        }
+    }
+    refs
+}
+
+/// 簡約表現へ補う値注釈（ref → 表示文字列。`"本文"` と任意の `value="…"` 接尾辞）。
+///
+/// snapshot はデータ葉（価格クラス・引用・地の文クラス）の本文と `option` のラベル / value を
+/// 持たない（値は ref で別途取得する前提。`AISNAP-3`）。エージェント評価（#121）が値抽出・
+/// 選択肢の特定に回答できるよう、本ハーネスの出力に限り DOM から本文を補う（`snapshot_text` の
+/// 暫定形式は変えない）。名前を持たない generic 行のみが対象。ref を一意に解決できた要素だけ補う。
+fn value_annotations(doc: &Document, entries: &[FlatEntry]) -> BTreeMap<String, (String, String)> {
+    let mut out = BTreeMap::new();
+    for id in doc.descendants(doc.root()) {
+        if !doc.is_element(id) {
+            continue;
+        }
+        let is_option = doc.local_name(id) == Some("option");
+        let leaf = matches!(
+            classify_data_leaf(doc, id),
+            Some(DataLeafKind::PriceClass | DataLeafKind::ProseClass | DataLeafKind::Quote)
+        );
+        if !is_option && !leaf {
+            continue;
+        }
+        let raw = doc.text_content(id).unwrap_or_default();
+        let norm = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if norm.is_empty() {
+            continue;
+        }
+        let shown: String = norm.chars().take(NOTE_MAX_CHARS).collect();
+        let suffix = if is_option {
+            doc.attribute(id, "value")
+                .map(|v| format!(" value={}", json_str(v)))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let refs = refs_of(doc, id, entries);
+        if let [r] = refs.as_slice() {
+            out.insert(r.clone(), (shown, suffix));
+        }
+    }
+    out
+}
+
+/// `- generic [ref]` 形式の行（名前なし）へ値注釈を挿入する。該当しない行はそのまま返す。
+fn annotate_line(line: &str, notes: &BTreeMap<String, (String, String)>) -> String {
+    let Some(rest) = line.trim_start().strip_prefix("- generic [") else {
+        return line.to_owned();
+    };
+    let Some(end) = rest.find(']') else {
+        return line.to_owned();
+    };
+    let Some(r) = rest.get(..end) else {
+        return line.to_owned();
+    };
+    let Some((text, suffix)) = notes.get(r) else {
+        return line.to_owned();
+    };
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let tail = rest.get(end + 1..).unwrap_or("");
+    format!("{indent}- generic {} [{r}]{tail}{suffix}", json_str(text))
 }
 
 /// 全タスク対象ページの簡約表現を `task_pages()` の順で生成する。
@@ -205,16 +285,7 @@ pub fn resolve_golden(fixtures_dir: &Path) -> Result<Vec<ResolvedTask>, Generate
                         index: l.index,
                         found: found.len(),
                     })?;
-            let cands = target_refs(doc, node, entries);
-            let mut refs: Vec<String> = Vec::new();
-            for e in entries {
-                if let Some(r) = &e.r#ref
-                    && parse_ref(r).is_some_and(|p| cands.contains(&p))
-                    && !refs.contains(r)
-                {
-                    refs.push(r.clone());
-                }
-            }
+            let refs = refs_of(doc, node, entries);
             locators.push(ResolvedLocator {
                 selector: l.selector.to_owned(),
                 index: l.index,

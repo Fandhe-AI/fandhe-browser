@@ -200,3 +200,30 @@ fn aisnap8_truncated_pages_are_those_with_snapshot_cap() {
         vec!["hn-list".to_owned(), "large-table".to_owned()]
     );
 }
+
+/// golden の値・選択肢が簡約表現から回答可能であること（PR #706 指摘・`AISNAP-8`・`AISNAP-3`）。
+/// 価格・引用本文・option のラベルと value は DOM から補う（`generate_reduced::value_annotations`）。
+#[test]
+fn aisnap8_reduced_text_keeps_values_needed_by_tasks() {
+    let text = |page: &str| generate_page(&fixtures(), page).expect("generate").text;
+    let ec = text("ec-product-list");
+    assert!(ec.contains("\"\u{a3}13.17\""), "extract-02 price missing");
+    let quotes = text("quotes-list");
+    assert!(
+        quotes.contains(
+            "\"\u{201c}River stone beta garden prism record valley vector record theta delta system.\u{201d}\""
+        ),
+        "extract-05 quote missing"
+    );
+    let dd = text("dropdown-form");
+    assert!(
+        dd.lines()
+            .any(|l| l.contains("\"Option 2\"") && l.contains("value=\"2\"")),
+        "click-02 option missing: {dd}"
+    );
+    assert!(
+        dd.lines()
+            .any(|l| l.contains("\"Option 1\"") && l.contains("value=\"1\"")),
+        "form-02 option missing: {dd}"
+    );
+}

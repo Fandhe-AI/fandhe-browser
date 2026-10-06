@@ -376,3 +376,58 @@ fn aisnap_13_uncompressed_same_signature_table_does_not_break_compressed_control
         entries.iter().filter(|e| e.compressed).count()
     );
 }
+
+/// 非圧縮の同一シグネチャ表が先にあっても、その操作要素は圧縮側の先頭 ref と誤一致せず、
+/// 未解決のままであること（PR #706 指摘・`AISNAP-10`・`AISNAP-13`）。
+#[test]
+fn aisnap_13_uncompressed_control_before_compressed_stays_unresolved() {
+    use fandhe_browser_ai::snapshot::build_snapshot;
+    use fandhe_browser_core::parse::{ParseOptions, parse_document};
+    use fandhe_browser_core::query::query_selector_all_str;
+    use retention_check::{parse_ref, target_refs};
+
+    let rows: String = (0..120)
+        .map(|i| {
+            if i == 0 {
+                "<tr><td>r0 <button>Del</button></td></tr>".to_owned()
+            } else {
+                format!("<tr><td>row{i}</td></tr>")
+            }
+        })
+        .collect();
+    let big = format!("<table><thead><tr><th>n</th></tr></thead><tbody>{rows}</tbody></table>");
+    // tfoot を持つ表は圧縮されない（`can_compress` が footer 行で拒否）。
+    let small = "<table><tbody><tr><td>x <button>Del</button></td></tr></tbody>\
+                 <tfoot><tr><td>f</td></tr></tfoot></table>";
+    let html = format!("<html><body>{small}{big}</body></html>");
+    let parsed = parse_document(&html, &ParseOptions::default()).expect("parse");
+    let doc = &parsed.document;
+    let entries = flatten(&build_snapshot(doc).expect("snapshot").tree);
+    let buttons = query_selector_all_str(doc, doc.root(), "button").expect("query");
+    assert_eq!(buttons.len(), 2);
+    let snap_refs: Vec<(u64, u32)> = entries
+        .iter()
+        .filter(|e| e.role == "button")
+        .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
+        .collect();
+    let small_cands = target_refs(doc, buttons[0], &entries);
+    let big_cands = target_refs(doc, buttons[1], &entries);
+    // snapshot 上のボタンは 2 件（展開側の通常 ref と圧縮側の行内操作要素 ref）。
+    assert_eq!(snap_refs.len(), 2, "{snap_refs:?}");
+    // 圧縮側の ref は圧縮側ボタンの候補にだけ現れる。
+    let compressed_ref = big_cands
+        .iter()
+        .copied()
+        .find(|c| snap_refs.contains(c) && !small_cands.contains(c))
+        .expect("compressed control must resolve");
+    assert!(
+        !small_cands.contains(&compressed_ref),
+        "uncompressed control stole compressed ref: {small_cands:?}"
+    );
+    // 展開側は自身の通常 ref にだけ解決する。
+    assert_eq!(
+        small_cands.iter().filter(|c| snap_refs.contains(c)).count(),
+        1,
+        "{small_cands:?} vs {snap_refs:?}"
+    );
+}
