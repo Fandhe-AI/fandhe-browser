@@ -1,10 +1,15 @@
 //! 軽微なページ変化の前後で、対象要素を role+name シグネチャで再特定できるかを判定する
 //! ヘルパーとそのユニットテスト（`AISNAP-10`・TASK-17.1・Issue #110・`MS-2`）。
 //!
-//! 呼び出し文脈: core の `parse_document`・`query_selector_str` と、ai の `build_snapshot`・
-//! `compute_role`・`compute_name` を組み合わせる。後続の 15 ケース定義（TASK-17.2・#111）と
-//! 参照破損率の算出（TASK-17.3・#112）から使われる予定で、本ファイルはその判定ロジックの
-//! 土台だけを持つ。
+//! 配置: `build_snapshot` が実際に算出した要素ごとの role・name・ref
+//! （[`crate::snapshot::build::build_snapshot_with_holders`]。crate 内部のテスト専用フック）を
+//! 使うため、crate 内の `#[cfg(test)]` モジュールに置く。名前の再計算はしない（共有予算つきの
+//! `NameIndex` による Snapshot 側の結果と食い違わせないため）。後続の参照破損率の算出
+//! （TASK-17.3・#112）が同じ判定を必要とする場合も、この crate 内のテストから使う想定。
+//!
+//! 呼び出し文脈: core の `parse_document`・`query_selector_all_str` と、ai の
+//! `build_snapshot`（内部フック版）を組み合わせる。フィクスチャ 19 ケース（TASK-17.2・#111）は
+//! `tests/stability_fixtures.rs` が資産として検査し、本ヘルパーには依存しない。
 //!
 //! PoC（`stability_check.mjs`）との差分:
 //! - core の `Document` に変更 API が無いため、軽微な変化は HTML 文字列（変化前・変化後）で表す
@@ -14,19 +19,16 @@
 //! - 設計上 ref を持たない要素（圧縮表のデータ行セル等）は「破損」と区別して
 //!   [`Reidentification::NotInSnapshot`] で返す
 //!
-//! セレクタは変化前後とも 1 要素にだけ一致する必要がある。ref は対象 DOM ノードの順位で
-//! 対応づけ、同名の別要素の ref は代用しない。
+//! セレクタは変化前後とも 1 要素にだけ一致する必要がある。ref は対象 DOM ノードに対して
+//! Snapshot が発行したものだけを使い、同名の別要素の ref は代用しない。
 //!
-//! 範囲外: 15 ケースのフィクスチャ化（#111）・破損率の算出とレポート（#112）・
-//! 同名要素の順位指定による `Ambiguous` の解消（必要になった時点で #111 で拡張する）。
-//! フィクスチャはすべて静的なダミー値で、外部通信をしない。
+//! 範囲外: 破損率の算出とレポート（#112）。フィクスチャはすべて静的なダミー値で、外部通信を
+//! しない。
 
 use std::path::PathBuf;
 
-use fandhe_browser_ai::snapshot::build::MAX_TREE_DEPTH;
-use fandhe_browser_ai::snapshot::{
-    NameIndex, Node, Snapshot, build_snapshot, compute_name_with_index, compute_role,
-};
+use crate::snapshot::build::{MAX_TREE_DEPTH, RefHolder, build_snapshot_with_holders};
+use crate::snapshot::{NameIndex, compute_name_with_index, compute_role};
 use fandhe_browser_core::dom::{Document, NodeId};
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
 use fandhe_browser_core::query::query_selector_all_str;
@@ -100,30 +102,6 @@ fn parse(html: &str) -> Document {
         .document
 }
 
-/// Snapshot 内の ref 保持要素（`Node`・表ヘッダ・行内コントロール）を `(role, name, ref)` で
-/// 先行順に列挙する。明示スタックの反復で再帰しない。
-fn ref_holders(snapshot: &Snapshot) -> Vec<(String, String, String)> {
-    let mut out = Vec::new();
-    let mut stack: Vec<&Node> = vec![&snapshot.tree];
-    while let Some(node) = stack.pop() {
-        if let Some(r) = &node.r#ref {
-            out.push((node.role.clone(), node.name.clone(), r.clone()));
-        }
-        if let Some(table) = &node.table {
-            for h in &table.header {
-                out.push((h.role.clone(), h.name.clone(), h.r#ref.clone()));
-            }
-            for row in &table.rows {
-                for c in &row.controls {
-                    out.push((c.role.clone(), c.name.clone(), c.r#ref.clone()));
-                }
-            }
-        }
-        stack.extend(node.children.iter().rev());
-    }
-    out
-}
-
 /// 対象要素の Snapshot 上の扱い。
 enum Placement {
     /// 対象 DOM ノードに対応する ref がある。
@@ -142,9 +120,6 @@ enum Located {
     Multiple(usize),
     /// 対象は見つかったが role が無く Snapshot に載らない。
     NoRole,
-    /// 省略されていない同 role+name の DOM 要素数と Snapshot の ref 保持要素数が食い違い、
-    /// 対象 DOM ノードと ref を対応づけられない。同名の別要素の ref は代用しない。
-    Unmappable { peers: usize },
     Found {
         role: String,
         name: String,
@@ -224,35 +199,17 @@ fn omission_by_position(doc: &Document, id: NodeId) -> Option<OmissionCause> {
     (depth > MAX_TREE_DEPTH).then_some(OmissionCause::DepthLimit)
 }
 
-/// 文書順で `(role, name)` が一致し、かつ Snapshot から省略されない要素を返す
-/// （対象 DOM ノードの順位付けに使う）。名前は Snapshot と同じ `compute_name_with_index` で
-/// 求める。
-fn live_same_signature_elements(
-    doc: &Document,
-    index: &NameIndex<'_>,
-    role: &str,
-    name: &str,
-) -> Vec<NodeId> {
-    doc.descendants(doc.root())
-        .filter(|&n| doc.is_element(n))
-        .filter(|&n| omission_by_position(doc, n).is_none())
-        .filter(|&n| {
-            compute_role(doc, n).is_some_and(|r| r.as_str() == role)
-                && compute_name_with_index(doc, index, n).text == name
-        })
-        .collect()
-}
-
-/// セレクタが一意に一致する要素を特定し、その DOM ノードに対応する ref だけを返す。
+/// セレクタが一意に一致する要素を特定し、その DOM ノードに対して Snapshot が発行した ref を返す。
 ///
 /// 対応づけ: 対象がまず hidden・深さ上限で省略されるかを DOM から判定する（省略なら別要素の
-/// ref を探さない）。省略されない場合、同 role+name で省略されない DOM 要素（文書順）の中での
-/// 対象の順位 k を求め、Snapshot 側の同 role+name の ref 保持要素（先行順）が同数ならその
-/// k 番目を採る。数が合わないときは把握できない省略（保持上限等）があり順位がずれるため
-/// `Unmappable` とし、確定できない結果は `Ambiguous` に倒す。
+/// ref を探さない）。省略されない場合は、`build_snapshot` が記録した ref 発行要素
+/// （[`RefHolder`]）から対象の `NodeId` で直接引く。role・name も記録された Snapshot 自身の結果を
+/// 使い、再計算しない。記録に無い要素（圧縮表のデータセル・行内コントロールの保持上限で落ちた
+/// 要素等）は Snapshot が名前を算出していないため、名前は予算なしの索引で参考値として求める。
 fn locate(html: &str, selector: &str) -> Located {
     let doc = parse(html);
-    let snapshot = build_snapshot(&doc).expect("フィクスチャの構築は成功する");
+    let (_snapshot, holders) =
+        build_snapshot_with_holders(&doc).expect("フィクスチャの構築は成功する");
     let Ok(matches) = query_selector_all_str(&doc, doc.root(), selector) else {
         return Located::NotFound;
     };
@@ -265,46 +222,22 @@ fn locate(html: &str, selector: &str) -> Located {
         return Located::NoRole;
     };
     let role = role.as_str().to_string();
-    let index = NameIndex::build(&doc);
-    let name = compute_name_with_index(&doc, &index, id).text;
-    if let Some(cause) = omission_by_position(&doc, id) {
+    if let Some(holder) = holders.iter().find(|h: &&RefHolder| h.node == id) {
         return Located::Found {
-            role,
-            name,
-            placement: Placement::Omitted(cause),
+            role: holder.role.clone(),
+            name: holder.name.clone(),
+            placement: Placement::Ref(holder.r#ref.clone()),
         };
     }
-    // `snapshot.truncated` は文書全体のフラグで、対象と無関係な打ち切りでも立つ。ここでは
-    // 早期に `Unmappable` へ倒さず、下の同 role+name の ref 保持要素数と DOM 要素数の一致で
-    // 対応づけられる対象は比較を続ける（AISNAP-10）。
-    let peers = live_same_signature_elements(&doc, &index, &role, &name);
-    let holders: Vec<String> = ref_holders(&snapshot)
-        .into_iter()
-        .filter(|(r, n, _)| *r == role && *n == name)
-        .map(|(_, _, x)| x)
-        .collect();
-    let placement = if holders.is_empty() {
-        // 打ち切りのある文書で ref 保持要素が見つからない場合、対象の名前自体が打ち切りで
-        // 食い違った可能性があり、保持上限による省略と区別できない。誤分類せず倒す。
-        if snapshot.truncated {
-            return Located::Unmappable { peers: peers.len() };
-        }
-        if INTERACTIVE_ROLES.contains(&role.as_str()) {
-            Placement::Omitted(OmissionCause::RetentionLimit)
-        } else {
-            Placement::NoRefByDesign
-        }
-    } else if holders.len() == peers.len() {
-        match peers
-            .iter()
-            .position(|&p| p == id)
-            .and_then(|k| holders.get(k))
-        {
-            Some(r) => Placement::Ref(r.clone()),
-            None => return Located::Unmappable { peers: peers.len() },
-        }
+    let index = NameIndex::build(&doc);
+    let name = compute_name_with_index(&doc, &index, id).text;
+    let placement = if let Some(cause) = omission_by_position(&doc, id) {
+        Placement::Omitted(cause)
+    } else if INTERACTIVE_ROLES.contains(&role.as_str()) {
+        // 記録に無い操作要素は保持上限による省略として扱う（Snapshot が ref を発行していない）。
+        Placement::Omitted(OmissionCause::RetentionLimit)
     } else {
-        return Located::Unmappable { peers: peers.len() };
+        Placement::NoRefByDesign
     };
     Located::Found {
         role,
@@ -326,12 +259,6 @@ fn check_reidentification(case: &StabilityCase<'_>) -> Reidentification {
             return Reidentification::Ambiguous {
                 side: Side::Before,
                 count,
-            };
-        }
-        Located::Unmappable { peers } => {
-            return Reidentification::Ambiguous {
-                side: Side::Before,
-                count: peers,
             };
         }
         Located::NoRole => {
@@ -365,12 +292,6 @@ fn check_reidentification(case: &StabilityCase<'_>) -> Reidentification {
             return Reidentification::Ambiguous {
                 side: Side::After,
                 count,
-            };
-        }
-        Located::Unmappable { peers } => {
-            return Reidentification::Ambiguous {
-                side: Side::After,
-                count: peers,
             };
         }
         Located::Found {
@@ -674,11 +595,8 @@ fn aisnap_10_row_control_over_cap_is_omitted_from_snapshot() {
     ));
     // 保持上限の挙動は ai 側の実装に依存するため、Snapshot に載らないリンクを探して検証する。
     let doc = parse(&html);
-    let snapshot = build_snapshot(&doc).expect("フィクスチャの構築は成功する");
-    let held: Vec<String> = ref_holders(&snapshot)
-        .into_iter()
-        .map(|(_, n, _)| n)
-        .collect();
+    let (_, holders) = build_snapshot_with_holders(&doc).expect("フィクスチャの構築は成功する");
+    let held: Vec<String> = holders.into_iter().map(|h| h.name).collect();
     let dropped = (0..=8)
         .map(|i| format!("L{i}"))
         .find(|n| !held.contains(n))
@@ -735,7 +653,7 @@ fn aisnap_10_unrelated_truncation_keeps_target_stable() {
         "</div>".repeat(wrap)
     ));
     let doc = parse(&html);
-    let snapshot = build_snapshot(&doc).expect("フィクスチャの構築は成功する");
+    let snapshot = crate::snapshot::build_snapshot(&doc).expect("フィクスチャの構築は成功する");
     assert!(snapshot.truncated, "前提: 無関係な深い枝で打ち切りが起きる");
     let result = check_reidentification(&StabilityCase {
         before_html: &html,
@@ -895,5 +813,43 @@ fn aisnap_10_aria_hidden_with_nbsp_is_not_excluded() {
     assert!(
         matches!(&result, Reidentification::Stable { name, .. } if name == "Go"),
         "got {result:?}"
+    );
+}
+
+/// AISNAP-10・TASK-17.1・Issue #110: name 算出の共有予算（`MAX_TOTAL_CONTENT_STEPS`）に達する
+/// HTML でも、対象の role・name・ref は Snapshot 自身の算出結果と一致する。
+/// 予算なしで再計算していた頃は、予算超過後の要素の name が食い違い誤判定した。
+#[test]
+fn aisnap_10_name_budget_exhaustion_matches_snapshot() {
+    // 1 要素あたりの走査上限（1024）に届く内容を持つ role=button の入れ子を、40 グループ並べる。
+    // 入れ子の各祖先が同じ子孫を重複して走査するため、少ないノード数で総予算（2^21）を使い切る。
+    let group = format!(
+        "{}{}{}",
+        "<div role=\"button\">".repeat(60),
+        "<i>x</i>".repeat(1100),
+        "</div>".repeat(60)
+    );
+    let html = page(&format!("{}<button id=\"t\">Go</button>", group.repeat(40)));
+    let doc = parse(&html);
+    let (snapshot, holders) = build_snapshot_with_holders(&doc).expect("構築は成功する");
+    assert!(snapshot.truncated, "前提: 予算超過で打ち切りが起きる");
+    let id = query_selector_all_str(&doc, doc.root(), "#t").expect("有効なセレクタ")[0];
+    let held = holders
+        .iter()
+        .find(|h| h.node == id)
+        .expect("対象は Snapshot が ref を発行している");
+    assert_eq!(held.name, "", "前提: 予算超過後の name は空になる");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &html,
+        after_html: &html,
+        selector: "#t",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Stable {
+            role: "button".into(),
+            name: held.name.clone(),
+            r#ref: held.r#ref.clone(),
+        }
     );
 }

@@ -93,3 +93,6 @@ pub mod compress_table;
 pub mod data_leaf;
 pub mod retention;
 pub mod snapshot;
+
+#[cfg(test)]
+mod reference_stability;
