@@ -19,8 +19,11 @@
 //! - 設計上 ref を持たない要素（圧縮表のデータ行セル等）は「破損」と区別して
 //!   [`Reidentification::NotInSnapshot`] で返す
 //!
-//! セレクタは変化前後とも 1 要素にだけ一致する必要がある。ref は対象 DOM ノードに対して
-//! Snapshot が発行したものだけを使い、同名の別要素の ref は代用しない。
+//! 判定モデル: セレクタは「変化前の対象」を定めるためだけに使い、変化前に 1 要素にだけ一致する
+//! 必要がある。変化前の ref は対象 DOM ノードに対して Snapshot が発行したものを使う。変化後は
+//! 変化前の role+name シグネチャで Snapshot 上の ref 保持要素を探し、候補の一意性と ref の
+//! 一致で安定・ref 変化・曖昧を判定する（セレクタで一意に選べても候補が複数なら曖昧）。候補が
+//! 0 件のときだけ、名前変更と消失・省略の区別に変化後のセレクタを診断用に使う。
 //!
 //! 範囲外: 破損率の算出とレポート（#112）。フィクスチャはすべて静的なダミー値で、外部通信を
 //! しない。
@@ -252,7 +255,6 @@ fn locate(html: &str, selector: &str) -> Located {
 /// 変化後に対象が消えた・一意に決まらないものは参照破損として集計対象に残す。
 fn check_reidentification(case: &StabilityCase<'_>) -> Reidentification {
     let before = locate(case.before_html, case.selector);
-    let after = locate(case.after_html, case.selector);
     let (b_role, b_name, b_ref) = match before {
         Located::NotFound => return Reidentification::TargetNotFound { side: Side::Before },
         Located::Multiple(count) => {
@@ -281,53 +283,64 @@ fn check_reidentification(case: &StabilityCase<'_>) -> Reidentification {
             }
         },
     };
-    let (a_role, a_name, a_ref) = match after {
-        Located::NotFound | Located::NoRole => {
-            return Reidentification::MissingAfter {
-                role: b_role,
-                name: b_name,
-            };
-        }
-        Located::Multiple(count) => {
-            return Reidentification::Ambiguous {
-                side: Side::After,
-                count,
-            };
-        }
-        Located::Found {
-            role,
-            name,
-            placement,
-        } => match placement {
-            Placement::Ref(r) => (role, name, Some(r)),
-            Placement::NoRefByDesign | Placement::Omitted(_) => (role, name, None),
-        },
-    };
-    // 変化後に ref が無い（省略・設計上 ref なし）なら、名前が変わっていても「消えた」ものとして
-    // 先に `MissingAfter` を返す。シグネチャ比較は双方に ref がある場合だけ意味を持つ。
-    let Some(a) = a_ref else {
-        return Reidentification::MissingAfter {
-            role: b_role,
-            name: b_name,
-        };
-    };
-    if (&a_role, &a_name) != (&b_role, &b_name) {
-        return Reidentification::SignatureChanged {
-            before: (b_role, b_name),
-            after: (a_role, a_name),
-        };
-    }
-    if a == b_ref {
-        Reidentification::Stable {
+    reidentify_after(case.after_html, case.selector, b_role, b_name, b_ref)
+}
+
+/// 変化後の HTML で、変化前の対象の role+name シグネチャを持つ Snapshot 上の候補を探して判定する
+/// （`AISNAP-10`）。候補は `build_snapshot` が ref を発行した要素（[`RefHolder`]）のうち
+/// role・name が一致するもの。変化後のセレクタは安定・曖昧・破損の判定には使わない。
+///
+/// - 候補 1 件で ref 一致 → `Stable`、ref 不一致 → `RefChanged`
+/// - 候補複数 → `Ambiguous`（セレクタで一意に選べても曖昧として検出する）
+/// - 候補 0 件 → 「名前が変わった」か「消えた・省略された」かの区別だけに、変化後のセレクタを
+///   診断用の補助情報として使う。セレクタが 1 要素に一致し、それが別の role+name で ref を
+///   持っていれば `SignatureChanged`、それ以外は `MissingAfter`
+fn reidentify_after(
+    html: &str,
+    selector: &str,
+    b_role: String,
+    b_name: String,
+    b_ref: String,
+) -> Reidentification {
+    let doc = parse(html);
+    let (_, holders) = build_snapshot_with_holders(&doc).expect("フィクスチャの構築は成功する");
+    let candidates: Vec<&RefHolder> = holders
+        .iter()
+        .filter(|h| h.role == b_role && h.name == b_name)
+        .collect();
+    match candidates.as_slice() {
+        [one] if one.r#ref == b_ref => Reidentification::Stable {
             role: b_role,
             name: b_name,
             r#ref: b_ref,
-        }
-    } else {
-        Reidentification::RefChanged {
+        },
+        [one] => Reidentification::RefChanged {
             before: b_ref,
-            after: a,
+            after: one.r#ref.clone(),
+        },
+        [] => {
+            // 診断用: セレクタが一意に指す要素が別シグネチャで ref を持つなら名前変更とみなす。
+            let renamed = query_selector_all_str(&doc, doc.root(), selector)
+                .ok()
+                .and_then(|m| match m.as_slice() {
+                    [id] => holders.iter().find(|h| h.node == *id),
+                    _ => None,
+                });
+            match renamed {
+                Some(h) => Reidentification::SignatureChanged {
+                    before: (b_role, b_name),
+                    after: (h.role.clone(), h.name.clone()),
+                },
+                None => Reidentification::MissingAfter {
+                    role: b_role,
+                    name: b_name,
+                },
+            }
         }
+        many => Reidentification::Ambiguous {
+            side: Side::After,
+            count: many.len(),
+        },
     }
 }
 
@@ -386,10 +399,11 @@ fn aisnap_10_banner_added_keeps_ref() {
 fn aisnap_10_changed_id_is_detected_as_ref_changed() {
     let before = page("<button id=\"go\">Go</button>");
     let after = page("<button id=\"run\">Go</button>");
+    // 変化後に `#go` は一致しないが、変化後は role+name の候補で探すため `MissingAfter` にならない。
     let result = check_reidentification(&StabilityCase {
         before_html: &before,
         after_html: &after,
-        selector: "button",
+        selector: "#go",
     });
     assert_eq!(
         result,
@@ -546,8 +560,9 @@ fn aisnap_10_removed_after_is_missing_after() {
     );
 }
 
-/// AISNAP-10・TASK-17.1・Issue #110: 対象が hidden で除外されたうえ同名の別要素が加わり件数が
-/// 前後で揃っても、別要素の ref を代用せず `MissingAfter` にする。
+/// AISNAP-10・TASK-17.1・Issue #110: 対象が hidden で除外されたうえ同名の別要素が加わる場合、
+/// 変化後は role+name の候補（b・c の 2 件）で判定し、どちらかの ref を対象のものとして
+/// 代用せず `Ambiguous` にする（案 Y。変化後のセレクタは判定に使わない）。
 #[test]
 fn aisnap_10_hidden_target_does_not_borrow_sibling_ref() {
     let before = page("<button id=\"a\">Go</button><button id=\"b\">Go</button>");
@@ -561,9 +576,9 @@ fn aisnap_10_hidden_target_does_not_borrow_sibling_ref() {
     });
     assert_eq!(
         result,
-        Reidentification::MissingAfter {
-            role: "button".into(),
-            name: "Go".into(),
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 2,
         }
     );
 }
@@ -768,10 +783,10 @@ fn aisnap_10_same_signature_inserted_before_is_ambiguous() {
     );
 }
 
-/// AISNAP-10・TASK-17.1・Issue #110: 一意なセレクタ（id）なら、同名要素が前方に挿入されても
-/// 同じ要素を追跡できる。
+/// AISNAP-10・TASK-17.1・Issue #110: 変化後はセレクタではなく role+name の候補で判定するため、
+/// `#go` で一意に選べても同 role+name の別要素が増えれば `Ambiguous` になる（案 Y）。
 #[test]
-fn aisnap_10_unique_selector_tracks_target_after_insertion() {
+fn aisnap_10_unique_selector_but_duplicate_signature_after_is_ambiguous() {
     let before = page("<button id=\"go\">Go</button>");
     let after = page("<button class=\"x\">Go</button><button id=\"go\">Go</button>");
     let result = check_reidentification(&StabilityCase {
@@ -781,10 +796,9 @@ fn aisnap_10_unique_selector_tracks_target_after_insertion() {
     });
     assert_eq!(
         result,
-        Reidentification::Stable {
-            role: "button".into(),
-            name: "Go".into(),
-            r#ref: "ee727a43f79604781".into(),
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 2
         }
     );
 }
@@ -834,7 +848,10 @@ fn aisnap_10_name_budget_exhaustion_matches_snapshot() {
         "<i>x</i>".repeat(1100),
         "</div>".repeat(60)
     );
-    let html = page(&format!("{}<button id=\"t\">Go</button>", group.repeat(40)));
+    let html = page(&format!(
+        "{}<a id=\"t\" href=\"/t\">Go</a>",
+        group.repeat(40)
+    ));
     let doc = parse(&html);
     let (snapshot, holders) = build_snapshot_with_holders(&doc).expect("構築は成功する");
     assert!(snapshot.truncated, "前提: 予算超過で打ち切りが起きる");
@@ -852,7 +869,7 @@ fn aisnap_10_name_budget_exhaustion_matches_snapshot() {
     assert_eq!(
         result,
         Reidentification::Stable {
-            role: "button".into(),
+            role: "link".into(),
             name: held.name.clone(),
             r#ref: held.r#ref.clone(),
         }
