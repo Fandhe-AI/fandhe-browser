@@ -27,6 +27,7 @@ use score::{
     render_results_json, score,
 };
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::PathBuf;
 use tasks::{Action, Category, GOLDEN, Golden, TASKS};
 
@@ -499,7 +500,14 @@ fn aisnap8_score_real_answers_if_requested() {
     let Some(path) = std::env::var_os("AGENT_EVAL_ANSWERS") else {
         return;
     };
-    let json = std::fs::read_to_string(PathBuf::from(path)).expect("read answers");
+    // 上限 +1 バイトまでしか読まない。超過分は parse_answers が上限超過として拒否する
+    let mut buf = Vec::new();
+    std::fs::File::open(PathBuf::from(path))
+        .expect("open answers")
+        .take(score::MAX_INPUT_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .expect("read answers");
+    let json = String::from_utf8(buf).expect("answers must be UTF-8");
     let answers = parse_answers(&TASKS, &json).expect("parse answers");
     let rep = run(&answers);
     let out = render_results_json(&rep);
