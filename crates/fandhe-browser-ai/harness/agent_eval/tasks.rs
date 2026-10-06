@@ -328,7 +328,13 @@ const FORM_06: [Step; 2] = [
     ),
 ];
 
-const NAV_01: [Locator; 2] = [loc("a#js-link-box-x3", 0), loc("div.lang3 > a", 0)];
+/// 中央の featured-box リンク（2 ロケータは同一要素）と、言語一覧の別リンク（異なる要素）。
+/// どちらも同じ `//l3.example.org/` へ遷移するため、設問が場所を限定しない以上いずれも正解とする。
+const NAV_01: [Locator; 3] = [
+    loc("a#js-link-box-x3", 0),
+    loc("div.lang3 > a", 0),
+    loc("li.lang-item > a[title=\"Language 3\"]", 0),
+];
 const NAV_02: [Locator; 1] = [loc("a[href=\"/docs/ref/group1/item3\"]", 0)];
 const NAV_03: [Locator; 1] = [loc("a[href=\"/downloads/\"]", 0)];
 const NAV_04: [Locator; 1] = [loc("span.pagetop > a[href=\"login?goto=news\"]", 0)];

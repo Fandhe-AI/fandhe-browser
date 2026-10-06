@@ -141,7 +141,8 @@
     "type": "ref",
     "any_of": [
       {"selector": "a#js-link-box-x3", "index": 0},
-      {"selector": "div.lang3 > a", "index": 0}
+      {"selector": "div.lang3 > a", "index": 0},
+      {"selector": "li.lang-item > a[title=\"Language 3\"]", "index": 0}
     ]
   },
   {

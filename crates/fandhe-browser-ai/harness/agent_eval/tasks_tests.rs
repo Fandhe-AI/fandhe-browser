@@ -157,6 +157,25 @@ fn aisnap8_ref_locators_resolve_to_intended_elements() {
 }
 
 #[test]
+fn aisnap8_nav01_accepts_both_language_3_links() {
+    // featured-box と言語一覧の 2 要素が別ノードとして解決されること。
+    let doc = parse("wiki-portal-nav");
+    let Golden::Ref { any_of } = golden_of("nav-01") else {
+        panic!()
+    };
+    let nodes: Vec<_> = any_of.iter().map(|l| resolve(&doc, l)).collect();
+    assert_eq!(nodes.len(), 3);
+    assert_eq!(nodes[0], nodes[1]);
+    assert_ne!(nodes[0], nodes[2]);
+    // 言語一覧側は li.lang-item 配下にあること。
+    assert!(
+        doc.ancestors(nodes[2])
+            .any(|n| doc.local_name(n) == Some("li")
+                && doc.attribute(n, "class") == Some("lang-item"))
+    );
+}
+
+#[test]
 fn aisnap8_ref_targets_sit_in_the_intended_context() {
     // click-04: 2 行目（Gamma）の edit。
     let doc = parse("dashboard-table");
