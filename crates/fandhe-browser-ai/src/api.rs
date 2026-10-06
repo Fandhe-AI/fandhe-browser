@@ -164,6 +164,7 @@ fn data_leaf_str(k: DataLeafKind) -> &'static str {
     match k {
         DataLeafKind::TableCell => "table_cell",
         DataLeafKind::PriceClass => "price_class",
+        // 拡充したデータ葉（TASK-15.1・15.2。統合は TASK-15.3・Issue #101・`AISNAP-11`）。
         DataLeafKind::ProseClass => "prose_class",
         DataLeafKind::Quote => "quote",
     }
@@ -298,6 +299,47 @@ mod tests {
         assert!(text.contains("\"header\""), "{text}");
         assert!(text.contains("item3"), "{text}");
         assert!(text.contains("\"data_leaf\":\"price_class\""), "{text}");
+    }
+
+    /// 拡充したデータ葉（引用・地の文クラス）が ref 付きで `/ai/snapshot` の JSON へ出る
+    /// （`AISNAP-6`・`AISNAP-11`・TASK-15.3・Issue #101）。
+    #[test]
+    fn aisnap6_expanded_data_leaves_are_emitted_with_refs() {
+        let nav = nav_with(
+            "https://example.com/q",
+            "<blockquote><p>Quoted</p></blockquote><p><q>short</q></p><div><span class=\"text\">Prose body.</span></div>",
+        );
+        let text = String::from_utf8(snapshot_body(&nav).expect("body")).expect("utf8");
+        assert_eq!(text.matches("\"data_leaf\":\"quote\"").count(), 2, "{text}");
+        assert_eq!(
+            text.matches("\"data_leaf\":\"prose_class\"").count(),
+            1,
+            "{text}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let mut found = Vec::new();
+        collect_leaves(&v["tree"], &mut found);
+        assert_eq!(found.len(), 3, "{text}");
+        for (kind, r) in found {
+            assert!(!r.is_empty(), "{kind} has empty ref: {text}");
+        }
+    }
+
+    /// `data_leaf` を持つノードの (種別, ref) を文書順に集める。
+    fn collect_leaves(n: &serde_json::Value, out: &mut Vec<(String, String)>) {
+        if let Some(k) = n.get("data_leaf").and_then(|x| x.as_str()) {
+            let r = n
+                .get("ref")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            out.push((k.to_string(), r));
+        }
+        if let Some(c) = n.get("children").and_then(|x| x.as_array()) {
+            for ch in c {
+                collect_leaves(ch, out);
+            }
+        }
     }
 
     #[test]

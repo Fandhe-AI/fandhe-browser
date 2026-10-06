@@ -16,8 +16,11 @@
 //! - 次の要素はサブツリーごと省略し、子孫の繰り上げはしない（DOM の親子関係と
 //!   ネストを一致させるため）: `head`・`script`・`style`・`noscript`・`template`・
 //!   `hidden` 属性または `aria-hidden="true"` の要素・`input[type=hidden]`。
-//! - データ葉（表セル・価格クラス要素。`AISNAP-3`・TASK-13.3・Issue #88）は
-//!   `Node::data_leaf`（圧縮表では `HeaderCell::data_leaf`）へ印を付けるだけで、role・ref・剪定・打ち切りには使わない。
+//! - データ葉（表セル・価格クラス要素・引用要素・地の文クラス要素。`AISNAP-3`・TASK-13.3・Issue #88、
+//!   拡充は TASK-15.1・15.2）は `Node::data_leaf`（圧縮表では `HeaderCell::data_leaf`）へ印を付けるだけで、
+//!   role・ref・剪定・打ち切りには使わない。展開されたデータ葉は他の要素と同じく ref を持つ。
+//!   表・一覧の子孫にある場合は圧縮・畳みを行わず展開を維持する（圧縮行は ref・全文・分類を
+//!   保持できないため。`AISNAP-11`・TASK-15.3・Issue #101）。展開によるトークン増の最適化は未実装。
 //! - 規則的な `table`・`ul`・`ol`（[`crate::compress_table::detect_regular_structure`]
 //!   が `Regular`。`AISNAP-2`・TASK-12.5・Issue #83）は子孫を展開せず、ヘッダ
 //!   （個別 ref）・圧縮行・超過行数を持つ 1 ノード（[`Node::table`]）へ置き換える。
@@ -243,7 +246,8 @@ fn subtree_has_lossy(
     false
 }
 
-/// 表セル以外のデータ葉（価格クラス要素等）か（`AISNAP-3`）。
+/// 表セル以外のデータ葉（価格クラス要素・引用要素・地の文クラス要素等）か
+/// （`AISNAP-3`・`AISNAP-11`・TASK-15.3）。
 ///
 /// 圧縮行はセルのテキストしか保持せず、子孫要素の `Node::data_leaf` 分類が消える。
 /// `td`/`th`（`TableCell`）は圧縮の単位そのものなので除外する。`ProseClass`（地の文。

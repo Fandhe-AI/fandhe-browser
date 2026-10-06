@@ -40,7 +40,8 @@
 //!   実装済み（[`build_snapshot`]。generic の折り畳み等の簡約は未実装）
 //! - データ葉（`isDataLeaf`）の判定結果の反映: TASK-13.3（`AISNAP-3`・Issue #88）で
 //!   実装済み（[`Node::data_leaf`]。算出は [`crate::data_leaf::classify_data_leaf`]。
-//!   印を付けるだけで、簡約・剪定への利用は後続タスク）
+//!   印を付けるだけで、簡約・剪定への利用は後続タスク）。引用要素・地の文クラスへの拡充結果の
+//!   統合は TASK-15.3（`AISNAP-11`・Issue #101）で実装済み（展開された対象は ref を持つ）
 //! - 表・一覧の圧縮戦略の統合: TASK-12.5（`AISNAP-2`・Issue #83）で実装済み
 //!   （[`Node::table`]・[`TableSummary`]。規則的な `table`・`ul`・`ol` は
 //!   [`build_snapshot`] が子孫を展開せず、ヘッダ・圧縮行・超過行数を持つ 1 ノードへ

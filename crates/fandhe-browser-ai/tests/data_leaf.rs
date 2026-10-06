@@ -709,3 +709,66 @@ fn aisnap_11_prose_class_in_quotes_list_fixture() {
     let html = std::fs::read_to_string(path).expect("フィクスチャは UTF-8 で読める");
     assert_eq!(count_prose(&html), 10);
 }
+
+/// 拡充対象（`Quote`/`ProseClass`）のノードの (種別, ref) を先行順で集める。
+fn leaves_with_refs(html: &str) -> Vec<(DataLeafKind, Option<String>)> {
+    let doc = parse(html);
+    let s = snap(&doc);
+    let again = snap(&doc);
+    assert_eq!(s, again, "同じ文書の再構築は決定的");
+    all_nodes(&s.tree)
+        .into_iter()
+        .filter_map(|i| match i.data_leaf() {
+            Some(k @ (DataLeafKind::Quote | DataLeafKind::ProseClass)) => {
+                Some((k, i.r#ref().map(str::to_string)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// AISNAP-11・AISNAP-10（TASK-15.3・Issue #101）: 単独配置の引用・地の文要素は
+/// Snapshot 上で ref を持ち、種別も反映される。ref は木全体で一意。
+#[test]
+fn aisnap_11_expanded_data_leaves_have_refs() {
+    let html = r#"<main><blockquote id="bq"><p>Quoted text.</p><a href="/s">src</a></blockquote>
+<p><q id="inline">short</q></p><div><span id="prose" class="text">Prose body.</span></div></main>"#;
+    let leaves = leaves_with_refs(html);
+    let kinds: Vec<DataLeafKind> = leaves.iter().map(|(k, _)| *k).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            DataLeafKind::Quote,
+            DataLeafKind::Quote,
+            DataLeafKind::ProseClass
+        ]
+    );
+    let mut seen = HashSet::new();
+    for (_, r) in &leaves {
+        let r = r.as_deref().expect("拡充対象は ref を持つ");
+        assert!(is_ref_shaped(r), "ref 形式が不正: {r}");
+        assert!(seen.insert(r.to_string()), "ref が重複: {r}");
+    }
+}
+
+/// AISNAP-11（TASK-15.3・Issue #101）: 一覧の子孫にある引用・地の文は圧縮されず展開され、
+/// ref と種別を保つ（圧縮行は ref・分類を持てないため展開を維持する）。
+#[test]
+fn aisnap_11_data_leaves_inside_list_keep_refs() {
+    let html = r#"<main><ul><li><blockquote>One</blockquote></li>
+<li><q>Two</q></li><li><span class="text">Three</span></li></ul></main>"#;
+    let doc = parse(html);
+    let s = snap(&doc);
+    assert!(
+        all_nodes(&s.tree).iter().all(|i| match i {
+            Item::Node(n) => n.table.is_none(),
+            _ => true,
+        }),
+        "拡充対象を含む一覧は圧縮されない"
+    );
+    let leaves = leaves_with_refs(html);
+    assert_eq!(leaves.len(), 3);
+    for (_, r) in &leaves {
+        assert!(is_ref_shaped(r.as_deref().expect("ref あり")));
+    }
+}
