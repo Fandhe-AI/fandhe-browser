@@ -17,7 +17,7 @@ Puppeteer 接続試験の実行基盤（TASK-45.1・Issue #480・ビヘイビア
 | ファイル | 内容 |
 | -------- | ---- |
 | `connect.mjs` | `puppeteer-core` で段階実行し、結果を 1 行で報告するスクリプト |
-| `stages.mjs` | 段階実行の純粋ロジック（クライアント注入可）。connect → newPage → goto → selector |
+| `stages.mjs` | 段階実行の純粋ロジック（クライアント注入可）。connect → newPage → goto → selector → disconnect |
 | `contract-sample.mjs` | Rust 側パーサーとの契約テスト用に `stages.mjs` の出力を再現する（`tests/puppeteer_connect.rs` から実行。要 node） |
 | `self-test.mjs` / `self-test.sh` | `stages.mjs` と `connect.mjs` のオフライン自己テスト（`make check-puppeteer-connect`。要 node） |
 | `crates/fandhe-browser-cdp/tests/script_harness/mod.rs` | サーバー起動・子プロセス実行・結果解析の共有基盤 |
@@ -32,7 +32,7 @@ Puppeteer 接続試験の実行基盤（TASK-45.1・Issue #480・ビヘイビア
   無ければ空配列（後方互換）。件数は 16、名前は 64 バイトが上限。`failed` は `error` 必須、
   `ok` / `not_reached` は `error` null、`failed` / `not_reached` の後ろに `ok` は置けず、
   トップレベル `ok: true` と矛盾する報告は `Malformed`（偽陽性防止）
-- 段階は `connect` → `newPage` → `goto` → `selector`。最初の失敗で止め、残りは `not_reached`。
+- 段階は `connect` → `newPage` → `goto` → `selector` → `disconnect`。最初の失敗で止め、残りは `not_reached`（先行段階が失敗済みの切断は後始末のみで結果を上書きしない）。
   各段階は期限（既定 10 秒）付き。`goto` は `about:blank` 固定（ネットワーク取得なしで確定遷移として
   扱われ、SSRF 防御を緩めずに到達可否だけを測るため）
 - 回収結果は `ScriptOutcome`（`Completed`〈`stages` を含む〉 / `NoResult` / `ExitedAbnormally` /

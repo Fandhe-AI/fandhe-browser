@@ -608,12 +608,12 @@ fn cdp3_stages_mjs_result_line_satisfies_rust_contract() {
         envs: Vec::new(),
         cwd: Some(dir.clone()),
     };
-    let names = ["connect", "newPage", "goto", "selector"];
+    let names = ["connect", "newPage", "goto", "selector", "disconnect"];
     assert_eq!(
         run_script(&cmd("ok"), "ws://x", D),
         ScriptOutcome::Completed {
             ok: true,
-            step: "selector".into(),
+            step: "disconnect".into(),
             error: None,
             stages: names.map(|n| stage(n, StageStatus::Ok, None)).to_vec(),
         }
@@ -634,6 +634,7 @@ fn cdp3_stages_mjs_result_line_satisfies_rust_contract() {
                 stage("newPage", StageStatus::Ok, None),
                 stage("goto", StageStatus::Failed, Some(err)),
                 stage("selector", StageStatus::NotReached, None),
+                stage("disconnect", StageStatus::NotReached, None),
             ],
         }
     );

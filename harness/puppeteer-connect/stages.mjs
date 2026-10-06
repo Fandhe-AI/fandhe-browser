@@ -6,7 +6,7 @@
 // UA・フィンガープリントを変えるオプションは渡さない（SEC-2）。
 
 const MAX_LEN = 500;
-export const STAGE_NAMES = ["connect", "newPage", "goto", "selector"];
+export const STAGE_NAMES = ["connect", "newPage", "goto", "selector", "disconnect"];
 
 export function toError(err) {
   return {
@@ -76,11 +76,19 @@ export async function runStages({ puppeteer, endpoint, stageTimeoutMs = 10000, o
       }
     }
   } finally {
+    // 切断は最後の段階。切断が応答しなくても stages を返せるよう期限を設ける。先行段階が
+    // 失敗済みなら切断は後始末のみ（失敗・時間切れは先行段階の結果を上書きしない）。
+    const allOk = stages.slice(0, -1).every((s) => s.status === "ok");
     try {
-      // 切断が応答しなくても記録済みの stages を返せるよう、切断にも期限を設ける。
-      if (browser) await withTimeout(Promise.resolve().then(() => browser.disconnect()), stageTimeoutMs);
-    } catch {
-      // 切断失敗・時間切れは到達結果に影響させない。
+      if (browser) {
+        await withTimeout(Promise.resolve().then(() => browser.disconnect()), stageTimeoutMs);
+        if (allOk) stages[stages.length - 1].status = "ok";
+      }
+    } catch (e) {
+      if (allOk) {
+        stages[stages.length - 1].status = "failed";
+        stages[stages.length - 1].error = toError(e);
+      }
     }
   }
   const bad = stages.find((s) => s.status !== "ok");
