@@ -502,6 +502,7 @@ fn leaf_str(k: Option<DataLeafKind>) -> &'static str {
     match k {
         Some(DataLeafKind::TableCell) => "TableCell",
         Some(DataLeafKind::PriceClass) => "PriceClass",
+        Some(DataLeafKind::ProseClass) => "ProseClass",
         // DataLeafKind は non_exhaustive。将来の種別は未知として出す。
         Some(_) => "Other",
         None => "-",
