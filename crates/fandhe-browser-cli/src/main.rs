@@ -51,10 +51,10 @@ fn run_main() -> Result<(), StartupError> {
         .enable_all()
         .build()
         .map_err(StartupError::Runtime)?;
-    // TASK-19 で AI API ルータのファクトリを、空の `Vec` の代わりにここへ渡す。
+    // AI API ルータ（`/ai/*`）は既定の追加ルータとして CDP と同一リスナーへ合成する（TASK-19.3）。
     runtime.block_on(server::run(
         &OsDefaultStore::new(),
         server::DEFAULT_ADDR,
-        Vec::new(),
+        server::default_router_factories(),
     ))
 }

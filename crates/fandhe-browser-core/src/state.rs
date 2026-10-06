@@ -1,7 +1,7 @@
 //! CDP と AI API が共有する最小の共通状態 [`AppState`]（TASK-41（41.1）・MS-3・
 //! ビヘイビア `CDP-1`・`AISNAP-6`）。
 //!
-//! `fandhe-browser-cli`（TASK-41.5・#616 で追加済み。`server` モジュールが生成する。ai ルータへの共有は TASK-19 で未合成）が `Profile::open` の結果と描画ハンドルから
+//! `fandhe-browser-cli`（TASK-41.5・#616 で追加済み。`server` モジュールが生成する。ai ルータへも同じ `Arc` を共有済み。TASK-19.3）が `Profile::open` の結果と描画ハンドルから
 //! [`AppState`] を 1 つ生成し、`Arc<AppState>` として `fandhe-browser-cdp`
 //! （TASK-41.2・#170 の状態型が内包）と `fandhe-browser-ai` のルータへ同じ
 //! インスタンスを渡す。共有型を下位の core に置くことで、ai と cdp の間に依存を作らずに

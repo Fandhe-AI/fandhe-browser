@@ -4,18 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "fandhe-browser の CLI バイナリ crate。現状は core・profile・cdp を組み立ててサーバーを起動するだけの最小雛形（TASK-41.5）で、サブコマンドは TASK-47 で追加する"
+description = "fandhe-browser の CLI バイナリ crate。現状は core・profile・cdp・ai を組み立ててサーバーを起動するだけの最小雛形（TASK-41.5）で、サブコマンドは TASK-47 で追加する"
 
 [[bin]]
 name = "fandhe-browser"
 path = "src/main.rs"
 
 # workspace 内 path 依存・承認済みの workspace 依存のみ（registry クレートの追加ではない）。
-# ai は AI API ルータを合成する TASK-19 まで依存に加えない。
+# ai は AI API ルータ（`/ai/*`）を cli サーバーへ合成するために依存に加える（TASK-19.3・#225・AISNAP-6）。
 [dependencies]
 fandhe-browser-core = { path = "../fandhe-browser-core" }
 fandhe-browser-profile = { path = "../fandhe-browser-profile" }
 fandhe-browser-cdp = { path = "../fandhe-browser-cdp" }
+fandhe-browser-ai = { path = "../fandhe-browser-ai" }
 # Server・BoundServer（#171 で承認済み）
 fandhe-backend-core = { workspace = true }
 # Router・RouterMergeError（#171 で承認済み）
