@@ -14,7 +14,10 @@ use std::process::ExitCode;
 
 use fandhe_browser_core::{EngineKind, bundled_engines};
 use std::time::Duration;
-use wpt_subset_runner::runner::{LimitKind, RunLimits, RunOptions, SubsetEntry, run_entry};
+use wpt_subset_runner::runner::{
+    LimitKind, RunLimits, RunOptions, SubsetEntry, WptProfile, run_entry, run_subset,
+    run_subset_for_profiles,
+};
 use wpt_subset_runner::{FileOutcome, HarnessKind, SubtestStatus, Verdict};
 
 const FAKE_TESTHARNESS: &str = include_str!("fixtures/fake_testharness.js");
@@ -330,6 +333,53 @@ fn run_cases(root: &Path, engine: Option<EngineKind>) {
             FileOutcome::Skipped { harness: kind }
         );
     }
+
+    // PLUG-10（TASK-101.3）: プロファイルごとにタグ付けされた独立の結果集合が得られる。
+    let entries = [
+        entry("dom/pass.html", HarnessKind::Testharness),
+        entry("dom/fail.html", HarnessKind::Testharness),
+        entry("css/not-there.html", HarnessKind::Reftest),
+    ];
+    let runs = run_subset_for_profiles(&opts, &entries, &WptProfile::ALL).expect("profile runs");
+    let tags: Vec<WptProfile> = runs.iter().map(|r| r.profile).collect();
+    assert_eq!(tags, [WptProfile::Chrome, WptProfile::Safari]);
+    for run in &runs {
+        let files: Vec<&str> = run.results.iter().map(|(e, _)| e.file.as_str()).collect();
+        assert_eq!(
+            files,
+            ["dom/pass.html", "dom/fail.html", "css/not-there.html"]
+        );
+        if engine.is_some() {
+            let verdicts: Vec<Option<Verdict>> = run
+                .results
+                .iter()
+                .map(|(_, o)| match o {
+                    FileOutcome::Completed { verdict, .. } => Some(*verdict),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(verdicts, [Some(Verdict::Pass), Some(Verdict::Fail), None]);
+        } else {
+            assert!(matches!(
+                &run.results[0].1,
+                FileOutcome::EngineUnavailable { .. }
+            ));
+            assert!(matches!(
+                &run.results[1].1,
+                FileOutcome::EngineUnavailable { .. }
+            ));
+        }
+        assert_eq!(
+            run.results[2].1,
+            FileOutcome::Skipped {
+                harness: HarnessKind::Reftest
+            }
+        );
+    }
+    // TASK-100 配線後は、この等価 assert をプロファイル間の差分検証へ置き換える。
+    assert_eq!(runs[0].results, runs[1].results);
+    // プロファイル未指定の従来経路と結果が一致する（従来挙動を変えていない）。
+    assert_eq!(run_subset(&opts, &entries), runs[0].results);
 }
 
 fn main() -> ExitCode {
