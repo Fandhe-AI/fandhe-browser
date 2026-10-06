@@ -172,6 +172,20 @@ fn aisnap8_click01_resolves_to_login_button_ref() {
     );
 }
 
+/// 圧縮された表・一覧の行内リンク（`AISNAP-13`）も scope が異なるだけで解決できること。
+#[test]
+fn aisnap8_compressed_row_controls_resolve_to_refs() {
+    let resolved = resolve_golden(&fixtures()).expect("resolve");
+    for (id, expected) in [
+        ("click-04", "ed42c6b3dec4e715c-2"),
+        ("nav-02", "eaa09f8e5a0ba62fc"),
+        ("nav-05", "eecb7a375060b0fc8"),
+    ] {
+        let t = resolved.iter().find(|r| r.id == id).expect(id);
+        assert_eq!(t.locators[0].refs, vec![expected.to_owned()], "{id}");
+    }
+}
+
 #[test]
 fn aisnap8_truncated_pages_are_those_with_snapshot_cap() {
     // 上限で打ち切られるページは 2 件。測定結果の解釈に必要な事実の固定。

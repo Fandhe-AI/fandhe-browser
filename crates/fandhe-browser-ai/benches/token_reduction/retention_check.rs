@@ -376,6 +376,63 @@ pub fn target_refs(doc: &Document, id: NodeId) -> Vec<(u64, u32)> {
             out.push((d, before.saturating_add(1)));
         }
     }
+    out.extend(compressed_control_refs(doc, &index, id));
+    out
+}
+
+/// 圧縮された表・一覧（`table`/`ul`/`ol`）の行内操作要素（`a[href]`・`button`）が
+/// `TableRow::controls` で受ける ref の（ダイジェスト, 出現番号）候補を返す。
+///
+/// `build_row_controls`（`AISNAP-13`）は行内の操作要素を、中間要素ではなくコンテナ
+/// （圧縮された表・一覧）の ref 直下のスコープで発行するため、祖先鎖から再計算する
+/// 通常の ref とはダイジェストが一致しない。そのため祖先の `table`/`ul`/`ol` ごとに
+/// 「コンテナ scope・role（role 無しは `a`→link・他→button）・name・識別属性」で再計算する。
+/// 展開されて圧縮されなかった場合は実在しない ref になり、snapshot 側と一致しない
+/// 候補が増えるだけ（fail-closed）。出現番号は同一ダイジェストの先行要素数から求める。
+fn compressed_control_refs(doc: &Document, index: &NameIndex<'_>, id: NodeId) -> Vec<(u64, u32)> {
+    let is_control = |e: NodeId| {
+        let local = doc.local_name(e).unwrap_or("");
+        (local == "a" && doc.attribute(e, "href").is_some()) || local == "button"
+    };
+    if !is_control(id) {
+        return Vec::new();
+    }
+    let control_sig = |e: NodeId, scope: ElementRef| {
+        let role = compute_role(doc, e)
+            .map(|r| r.as_str().to_string())
+            .unwrap_or_else(|| {
+                if doc.local_name(e) == Some("a") {
+                    "link".to_string()
+                } else {
+                    "button".to_string()
+                }
+            });
+        let name = compute_name_with_index(doc, index, e);
+        let mut sig = ElementSignature::new(&role, &name.text).with_scope(scope);
+        if let Some(d) = discriminator(doc, e) {
+            sig = sig.with_discriminator(d);
+        }
+        RefAllocator::new()
+            .allocate_signature(&sig)
+            .ok()
+            .map(|r| r.digest)
+    };
+    let mut out = Vec::new();
+    for container in doc
+        .ancestors(id)
+        .filter(|&a| matches!(doc.local_name(a), Some("table" | "ul" | "ol")))
+    {
+        let Some(scope) = chain_ref(doc, index, container) else {
+            continue;
+        };
+        let Some(digest) = control_sig(id, scope) else {
+            continue;
+        };
+        let before = preceding_count(doc, id, |e| {
+            is_control(e) && control_sig(e, scope) == Some(digest)
+        });
+        out.push((digest, before.saturating_add(1)));
+    }
     out
 }
 

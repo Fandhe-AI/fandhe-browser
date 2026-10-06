@@ -20,7 +20,7 @@
   {
     "id": "click-04",
     "locators": [
-      {"selector": "table#table1 tbody a[href=\"#edit\"]", "index": 1, "refs": []}
+      {"selector": "table#table1 tbody a[href=\"#edit\"]", "index": 1, "refs": ["ed42c6b3dec4e715c-2"]}
     ]
   },
   {
@@ -128,7 +128,7 @@
   {
     "id": "nav-02",
     "locators": [
-      {"selector": "a[href=\"/docs/ref/group1/item3\"]", "index": 0, "refs": []}
+      {"selector": "a[href=\"/docs/ref/group1/item3\"]", "index": 0, "refs": ["eaa09f8e5a0ba62fc"]}
     ]
   },
   {
@@ -146,7 +146,7 @@
   {
     "id": "nav-05",
     "locators": [
-      {"selector": "li.next > a", "index": 0, "refs": []}
+      {"selector": "li.next > a", "index": 0, "refs": ["eecb7a375060b0fc8"]}
     ]
   },
   {
