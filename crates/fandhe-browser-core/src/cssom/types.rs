@@ -161,7 +161,7 @@ impl StyleRule {
 /// #552 が組み立て、#259 / #260 が複数を順に扱う。起源の区別（UA・user・author）・
 /// media 条件・ルール単位のエラー記録（#258）は未実装（REPAIR-3。private フィールドなので
 /// 後から非破壊で追加できる）。inline の `style` 属性は Stylesheet として表さない
-/// （表し方は #552 / #260 が決める）。上限検証は型ではせず、各パーサーと #261 が行う。
+/// （要素ごとの宣言列 `InlineStyle` で表す。#552）。上限検証は型ではせず、各パーサーと #261 が行う。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Stylesheet {
     rules: Vec<StyleRule>,

@@ -11,8 +11,10 @@
 //!    testharness.js の評価 → `attach_result_reporter` → テスト側スクリプトの評価
 //! 4. `ResultCollector::take` の結果から [`Verdict`] を決める
 //!
-//! 合格率の集計・レポート（#276）、プロファイル別オプション（#275）、実行不能項目の
-//! 記録（#277）は担当外で、本モジュールは [`FileOutcome`] を返すだけで集計しない。
+//! プロファイル別の実行指定（[`WptProfile`]・[`run_subset_for_profiles`]。TASK-101.3・#275）は
+//! 配線のみを提供し、プロファイルによる挙動差は TASK-100（`PLUG-8`）完了後に配線する。
+//! 合格率の集計・レポート（#276）、実行不能項目の記録（#277）は担当外で、本モジュールは
+//! [`FileOutcome`] を返すだけで集計しない。
 //!
 //! # 外部入力の扱い（fail-closed）
 //!
@@ -33,6 +35,9 @@
 //!   到着順）を再現できないため同様に [`FileOutcome::UnsupportedScript`] にする
 //! - スクリプトが 1 つでも評価に失敗したらそのファイルは [`FileOutcome::ScriptFailed`]
 //!   として打ち切る（WPT 本来の「失敗しても続行」とは異なる）
+//! - プロファイル指定（[`RunOptions::profile`]）は現時点で実行内容を変えない。ランナーは
+//!   CSSOM 経路を通らず、core の gating API（TASK-100.2〜100.4・`PLUG-8`）も未提供のため、
+//!   chrome と safari の結果内容は同一になる。偽の差分を作らない
 
 use std::collections::HashSet;
 use std::fs;
@@ -113,6 +118,95 @@ impl HarnessKind {
         }
     }
 }
+
+/// 結果の識別に使うプロファイル名の最大バイト数（エラー値の切り詰め上限）。
+const MAX_PROFILE_NAME_BYTES: usize = 64;
+
+/// 測定対象のブラウザ振る舞いプロファイル（`PLUG-10`・TASK-101.3・Issue #275）。
+///
+/// ハーネスの `--profile chrome|safari` 相当の指定値。#276 の合格率集計が
+/// [`ProfileRun::profile`] と [`WptProfile::as_str`] をレポートキー値として使う。
+/// 将来 core の `BrowserProfile`（TASK-100・`PLUG-8`）へ変換または置換する。
+/// 名前は PROF 系（保存先ディレクトリ）の `Profile` と区別するため `WptProfile` とする。
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum WptProfile {
+    /// Chrome 系の振る舞い。
+    Chrome,
+    /// Safari 系の振る舞い。
+    Safari,
+}
+
+impl WptProfile {
+    /// 受け付ける全プロファイル（出力の決定性のため固定順）。
+    pub const ALL: [WptProfile; 2] = [WptProfile::Chrome, WptProfile::Safari];
+
+    /// レポート・CLI で使う固定文字列（`chrome` / `safari`）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Chrome => "chrome",
+            Self::Safari => "safari",
+        }
+    }
+
+    /// 完全一致の `chrome` / `safari` のみ受理する。大文字・空白・その他は拒否し、
+    /// 黙って既定へ落とさない。
+    pub fn parse(s: &str) -> Result<Self, ProfileParseError> {
+        match s {
+            "chrome" => Ok(Self::Chrome),
+            "safari" => Ok(Self::Safari),
+            other => {
+                // 外部入力をエラーへ載せるため UTF-8 文字境界で上限まで切り詰める。
+                let end = other
+                    .char_indices()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .take_while(|&e| e <= MAX_PROFILE_NAME_BYTES)
+                    .last()
+                    .unwrap_or(0);
+                Err(ProfileParseError::Unknown {
+                    value: other.get(..end).unwrap_or_default().to_string(),
+                })
+            }
+        }
+    }
+}
+
+impl std::str::FromStr for WptProfile {
+    type Err = ProfileParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+impl std::fmt::Display for WptProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// [`WptProfile::parse`] の失敗。
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileParseError {
+    /// 未知のプロファイル名（`value` は上限で切り詰め済み）。
+    Unknown {
+        /// 渡された文字列。
+        value: String,
+    },
+}
+
+impl std::fmt::Display for ProfileParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown { value } => {
+                write!(f, "unknown profile '{value}' (expected chrome or safari)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProfileParseError {}
 
 /// サブセットの 1 エントリ（WPT ルートからの相対パスと種別）。
 #[non_exhaustive]
@@ -251,7 +345,7 @@ pub fn parse_subset_tsv(input: &str) -> Result<Vec<SubsetEntry>, SubsetError> {
     Ok(entries)
 }
 
-/// 実行オプション。将来 #275 のプロファイル別指定を足せるよう `non_exhaustive`（REPAIR-4）。
+/// 実行オプション。項目追加に備えて `non_exhaustive`（REPAIR-4）。
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -261,6 +355,12 @@ pub struct RunOptions {
     pub engine: Option<EngineKind>,
     /// 1 ファイルあたりの総量上限（`PLUG-10`）。既定は [`RunLimits::default`]。
     pub limits: RunLimits,
+    /// 測定プロファイル。`None` は未指定（従来どおり）。
+    ///
+    /// スタブ: 現時点では [`run_entry`] の実行内容を変えない（JS グローバル環境・UA 等の
+    /// 識別面にも触れない）。将来仕様は TASK-100.2〜100.4（`PLUG-8`）完了後に core の公開 API
+    /// へ委譲し、[`WptProfile`] を core の `BrowserProfile` へ変換または置換する（`PLUG-10`）。
+    pub profile: Option<WptProfile>,
 }
 
 impl RunOptions {
@@ -270,7 +370,14 @@ impl RunOptions {
             wpt_root: wpt_root.into(),
             engine,
             limits: RunLimits::default(),
+            profile: None,
         }
+    }
+
+    /// プロファイルを指定する（`None` で未指定へ戻す）。
+    pub fn with_profile(mut self, profile: Option<WptProfile>) -> Self {
+        self.profile = profile;
+        self
     }
 
     /// 総量上限を差し替える（テスト用に小さな値を渡す用途を想定）。
@@ -446,6 +553,69 @@ pub fn run_subset(
         .iter()
         .map(|e| (e.clone(), run_entry(options, e)))
         .collect()
+}
+
+/// 1 プロファイル分の独立した実行結果（`PLUG-10`・TASK-101.3）。
+///
+/// [`run_subset_for_profiles`] が返し、#276 がプロファイル別合格率を集計する入力になる。
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileRun {
+    /// この結果集合を得たプロファイル。
+    pub profile: WptProfile,
+    /// エントリ順のファイル単位結果。
+    pub results: Vec<(SubsetEntry, FileOutcome)>,
+}
+
+/// [`run_subset_for_profiles`] の指定エラー。
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileSelectionError {
+    /// プロファイルが 1 件も指定されていない。
+    Empty,
+    /// 同じプロファイルが複数回指定された。
+    Duplicate {
+        /// 重複したプロファイル。
+        profile: WptProfile,
+    },
+}
+
+impl std::fmt::Display for ProfileSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("no profile selected"),
+            Self::Duplicate { profile } => write!(f, "duplicate profile '{profile}'"),
+        }
+    }
+}
+
+impl std::error::Error for ProfileSelectionError {}
+
+/// 指定した各プロファイルについて [`run_subset`] を別々に実行し、プロファイルでタグ付けした
+/// 結果集合を指定順に返す（`PLUG-10`・TASK-101.3）。
+///
+/// 空指定・重複指定は拒否する（実行回数は高々 [`WptProfile::ALL`] の件数に有界）。
+/// 現時点ではプロファイルで結果内容は変わらない（[`RunOptions::profile`] のスタブ参照）。
+pub fn run_subset_for_profiles(
+    options: &RunOptions,
+    entries: &[SubsetEntry],
+    profiles: &[WptProfile],
+) -> Result<Vec<ProfileRun>, ProfileSelectionError> {
+    if profiles.is_empty() {
+        return Err(ProfileSelectionError::Empty);
+    }
+    for (i, p) in profiles.iter().enumerate() {
+        if profiles.iter().take(i).any(|q| q == p) {
+            return Err(ProfileSelectionError::Duplicate { profile: *p });
+        }
+    }
+    Ok(profiles
+        .iter()
+        .map(|&profile| ProfileRun {
+            profile,
+            results: run_subset(&options.clone().with_profile(Some(profile)), entries),
+        })
+        .collect())
 }
 
 /// 1 エントリを実行して分類する。ファイルごとに新しい `JsRuntime` を作る。
@@ -1603,5 +1773,93 @@ mod tests {
             }
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// PLUG-10: プロファイル名は完全一致の chrome / safari のみ受理する。
+    #[test]
+    fn wpt_profile_parse_accepts_exact_names_only() {
+        assert_eq!(WptProfile::parse("chrome"), Ok(WptProfile::Chrome));
+        assert_eq!("safari".parse::<WptProfile>(), Ok(WptProfile::Safari));
+        for bad in ["firefox", "", "Chrome", "chrome "] {
+            let err = WptProfile::parse(bad).expect_err(bad);
+            assert_eq!(err, ProfileParseError::Unknown { value: bad.into() });
+            assert_eq!(
+                err.to_string(),
+                format!("unknown profile '{bad}' (expected chrome or safari)")
+            );
+        }
+    }
+
+    /// PLUG-10: 長大・マルチバイト入力でも上限以下に文字境界で切り詰める。
+    #[test]
+    fn wpt_profile_parse_truncates_long_value() {
+        let long = "あ".repeat(1024);
+        let ProfileParseError::Unknown { value } = WptProfile::parse(&long).expect_err("long");
+        assert_eq!(value.len(), 63);
+        assert!(value.chars().all(|c| c == 'あ'));
+        let ascii = "x".repeat(1024);
+        let ProfileParseError::Unknown { value } = WptProfile::parse(&ascii).expect_err("ascii");
+        assert_eq!(value.len(), MAX_PROFILE_NAME_BYTES);
+    }
+
+    /// PLUG-10: as_str / Display と parse は往復し、ALL は固定順。
+    #[test]
+    fn wpt_profile_round_trip() {
+        assert_eq!(WptProfile::ALL, [WptProfile::Chrome, WptProfile::Safari]);
+        for p in WptProfile::ALL {
+            assert_eq!(WptProfile::parse(p.as_str()), Ok(p));
+            assert_eq!(p.to_string(), p.as_str());
+        }
+    }
+
+    /// PLUG-10: profile の既定は None で、with_profile で差し替えられる。
+    #[test]
+    fn run_options_profile_defaults_to_none() {
+        let o = RunOptions::new("/x", None);
+        assert_eq!(o.profile, None);
+        assert_eq!(
+            o.with_profile(Some(WptProfile::Safari)).profile,
+            Some(WptProfile::Safari)
+        );
+    }
+
+    /// PLUG-10: 空・重複指定は拒否する。
+    #[test]
+    fn run_subset_for_profiles_rejects_empty_and_duplicate() {
+        let opts = RunOptions::new("/nonexistent-wpt-root", None);
+        assert_eq!(
+            run_subset_for_profiles(&opts, &[], &[]),
+            Err(ProfileSelectionError::Empty)
+        );
+        assert_eq!(
+            run_subset_for_profiles(&opts, &[], &[WptProfile::Chrome, WptProfile::Chrome]),
+            Err(ProfileSelectionError::Duplicate {
+                profile: WptProfile::Chrome
+            })
+        );
+    }
+
+    /// PLUG-10: プロファイルごとにタグ付けされた別個の結果集合が指定順に返る。
+    #[test]
+    fn run_subset_for_profiles_returns_tagged_runs_in_order() {
+        let opts = RunOptions::new("/nonexistent-wpt-root", None);
+        let entry = SubsetEntry::new("css/a.html", HarnessKind::Reftest).expect("entry");
+        let runs = run_subset_for_profiles(
+            &opts,
+            std::slice::from_ref(&entry),
+            &[WptProfile::Chrome, WptProfile::Safari],
+        )
+        .expect("runs");
+        let expected = vec![(
+            entry,
+            FileOutcome::Skipped {
+                harness: HarnessKind::Reftest,
+            },
+        )];
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].profile, WptProfile::Chrome);
+        assert_eq!(runs[1].profile, WptProfile::Safari);
+        assert_eq!(runs[0].results, expected);
+        assert_eq!(runs[1].results, expected);
     }
 }
