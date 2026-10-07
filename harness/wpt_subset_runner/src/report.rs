@@ -533,6 +533,13 @@ impl WptReport {
                     if must_skip != matches!(outcome, FileOutcome::Skipped { .. }) {
                         return Err(ReportError::InconsistentSkipCount { profile: p });
                     }
+                    // Skipped の harness 値がエントリ種別と一致することも要求する
+                    // （reftest に Skipped{Other} が入っても通さない）。
+                    if let FileOutcome::Skipped { harness } = outcome
+                        && *harness != entry.harness
+                    {
+                        return Err(ReportError::InconsistentSkipCount { profile: p });
+                    }
                 }
                 let summary = ProfileSummary::from_run(run);
                 if summary.skipped() != unrunnable.total() {
@@ -971,6 +978,23 @@ mod tests {
         }
         assert_eq!(
             WptReport::from_runs(&[swapped], None),
+            Err(ReportError::InconsistentSkipCount {
+                profile: WptProfile::Chrome
+            })
+        );
+        // reftest エントリの Skipped が別種別（Other）を名乗る入力。
+        let mut wrong_harness = sample_run(WptProfile::Chrome);
+        let mut patched = false;
+        for (e, o) in wrong_harness.results.iter_mut() {
+            if e.harness == HarnessKind::Reftest && matches!(o, FileOutcome::Skipped { .. }) {
+                *o = skipped(HarnessKind::Other);
+                patched = true;
+                break;
+            }
+        }
+        assert!(patched);
+        assert_eq!(
+            WptReport::from_runs(&[wrong_harness], None),
             Err(ReportError::InconsistentSkipCount {
                 profile: WptProfile::Chrome
             })
