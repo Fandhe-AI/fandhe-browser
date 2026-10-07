@@ -3,7 +3,7 @@
 CSSOM 層の feature gating（`--profile chrome|safari`）が参照する、ブラウザ別の CSS 機能対応可否データ。
 TASK-100.1（Issue #265）・`PLUG-8`・`MS-8` に対応する。
 
-Rust 側の読み込み・照会 API・gating 処理は後続（TASK-100.2〜100.4）で実装する。
+Rust 側の読み込み・照会は `fandhe-browser-core` の `cssom_profile` モジュール（TASK-100.2）で実装済み。公開 API・gating 処理は後続（TASK-100.3・100.4）で実装する。
 本ディレクトリはデータの配置のみを担う。
 
 ## 線引き
