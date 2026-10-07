@@ -28,6 +28,11 @@
 //!   `InvalidSelector` / `InvalidDeclarations`）もそのルールだけを捨てて記録し、残りを
 //!   続ける。記録は offset 昇順で、種別とバイト位置のみ（入力テキストは含めない）
 //! - 宣言 0 件のルール（`a{}`）は捨てずに残す
+//! - 文書単位の [`collect_document_styles`] は、上限違反の 1 スタイル源（`<style>` /
+//!   `style` 属性）だけを捨てて [`DocumentStyles::skipped_sources`] に記録し、残りを収集する
+//!   （1 つの悪性源で文書全体が失敗しないため。TASK-105.7・#261）。文書全体の累積バイト数・
+//!   累積ルール数・処理した源の件数（[`MAX_DOCUMENT_STYLE_SOURCES`]）・処理量
+//!   （[`MAX_DOCUMENT_STYLE_ATTEMPT_BYTES`]）を超える源も同様にその源だけを捨てる
 //! - 入力長・ルール数が上限を超えたら [`Error::InvalidInput`]（確保前・`push` 前に判定。
 //!   メッセージに入力は含めない）。エラー記録は上限までで、超過分は件数だけ数える
 //!
@@ -37,7 +42,6 @@
 //! - `<style>` の `media` 属性（無視する）、SVG の `<style>`（対象外）、Shadow DOM、
 //!   `disabled` 等の状態、JS による動的変更の反映、起源（UA / user / author）の区別
 //! - CSSOM 用の可観測性計装（`OperationKind` に対応 variant が無い）
-//! - 1 スタイル源の上限違反で文書全体の収集が `Err` になる挙動の見直し（#261）
 //! - 条件付きグループ（`@media` / `@supports` / `@layer`）内のルールの取り込みと
 //!   `@import` の取得（いずれも読み飛ばすだけ）
 //! - CSS ネスト（body 内の入れ子ルール）の展開。body に入れ子のまま残す
@@ -45,8 +49,8 @@
 //!   失敗として記録される
 //! - 文字列中の改行で文字列を打ち切る CSS Syntax のエラー回復（現状は EOF まで文字列扱い）
 //! - 括弧の種類を区別した対応づけ（単一カウンタのため `(` を `}` で閉じても深さが戻る）
-//! - 上限値は暫定。見直しは #261（TASK-105.7）が担う
 
+use std::collections::{HashMap, HashSet};
 use std::iter::Peekable;
 use std::str::CharIndices;
 
@@ -55,14 +59,49 @@ use crate::dom::{Document, HTML_NAMESPACE_URI, NodeData, NodeId};
 use crate::error::{Error, Result};
 use crate::selector::{html_local_name_eq, parse_selector_list};
 
-/// 受け付ける CSS テキストの最大バイト数（暫定。見直しは #261）。
+/// 受け付ける CSS テキストの最大バイト数。
+///
+/// 一般的な大規模サイトの CSS（数百 KiB）に十分な余裕を持たせた値で、解析前（確保前）に判定する
+/// （TASK-105.7・#261・`CORE-5`）。
 pub const MAX_STYLESHEET_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
-/// 1 スタイルシートで受け付けるルールブロックの最大件数（暫定。見直しは #261）。
+/// 1 スタイルシートで受け付けるルールブロックの最大件数。
+///
+/// 1 ルールは最小 4 バイト（`a{}`）程度のため、入力長上限だけでは件数が約 100 万に達しうる。
+/// ルール 1 件は構造体・ヒープで数十バイトへ膨らむので、件数側でも `push` 前に頭打ちにする
+/// （TASK-105.7・#261）。
 pub const MAX_RULES_PER_STYLESHEET: usize = 16_384;
 
-/// 記録する [`RuleBlockError`] の最大件数（暫定。超過分は件数のみ。見直しは #261）。
+/// 記録する [`RuleBlockError`] の最大件数（超過分は件数のみ。記録自体が無制限確保にならない
+/// ための頭打ち。TASK-105.7・#261）。
 pub const MAX_RULE_BLOCK_ERRORS: usize = 256;
+
+/// 文書全体で採用する `<style>` テキストと `style` 属性値の累積最大バイト数。
+///
+/// 1 シート上限（[`MAX_STYLESHEET_INPUT_BYTES`]）の 4 シート分。宣言 1 件は入力数バイトに対し
+/// 構造体・ヒープで数十バイトへ膨らむため、バイト累積で文書全体の総確保量を抑える
+/// （`CORE-5`・TASK-105.7・#261）。超過する源は [`collect_document_styles`] がその源だけ捨てる。
+pub const MAX_DOCUMENT_STYLE_BYTES: usize = 4 * MAX_STYLESHEET_INPUT_BYTES;
+
+/// 文書全体で採用する全スタイルシートの累積最大ルール数。
+///
+/// `match_rules` の 1 回あたり走査上限（`MAX_SCANNED_RULES`）と同値。これを超える文書は
+/// `match_rules` が必ず `Err` になるため、収集段階で止める（`CORE-5`・TASK-105.7・#261）。
+pub const MAX_DOCUMENT_STYLE_RULES: usize = 65_536;
+
+/// 文書内で処理対象にするスタイル源（`<style>` と `style` 属性）の最大件数。採否を問わず数える。
+///
+/// 超えた源はパースせず捨てる（`CORE-5`・TASK-105.7・#261）。
+pub const MAX_DOCUMENT_STYLE_SOURCES: usize = 4_096;
+
+/// 文書内で処理対象にしたスタイル源の累積最大バイト数。採否を問わず数える。
+///
+/// 超過する源はパースせず捨てる。ルール数超過で捨てる源の繰り返し解析を抑える
+/// （`CORE-5`・TASK-105.7・#261）。
+pub const MAX_DOCUMENT_STYLE_ATTEMPT_BYTES: usize = 2 * MAX_DOCUMENT_STYLE_BYTES;
+
+/// 上限違反で捨てたスタイル源を記録する最大件数（超過分は件数のみ）。
+pub const MAX_SKIPPED_STYLE_SOURCES: usize = 256;
 
 /// 切り出した 1 ルール分のテキスト。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,7 +475,7 @@ pub fn parse_stylesheet(css: &str) -> Result<ParsedStylesheet> {
     split.errors.extend(parse_errors);
     split.errors.sort_by_key(|e| e.offset);
     if split.errors.len() > MAX_RULE_BLOCK_ERRORS {
-        let excess = split.errors.len() - MAX_RULE_BLOCK_ERRORS;
+        let excess = split.errors.len().saturating_sub(MAX_RULE_BLOCK_ERRORS);
         split.errors.truncate(MAX_RULE_BLOCK_ERRORS);
         split.dropped_errors = split.dropped_errors.saturating_add(excess);
     }
@@ -486,11 +525,49 @@ impl InlineStyle {
     }
 }
 
+/// 上限違反で捨てたスタイル源の種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StyleSourceKind {
+    /// `<style>` 要素。
+    StyleElement,
+    /// `style` 属性。
+    InlineStyle,
+}
+
+/// 上限違反で捨てたスタイル源の記録（ノードと種別のみ。入力テキストは含めない）。
+///
+/// [`collect_document_styles`] が作り、呼び出し側（TASK-100 等）が「黙って捨てた」ことを
+/// 観測できるようにする（`REPAIR-3`・`REPAIR-4`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkippedStyleSource {
+    node: NodeId,
+    kind: StyleSourceKind,
+}
+
+impl SkippedStyleSource {
+    /// 捨てたスタイル源を持つ要素のノード。
+    pub fn node(&self) -> NodeId {
+        self.node
+    }
+
+    /// 捨てたスタイル源の種別。
+    pub fn kind(&self) -> StyleSourceKind {
+        self.kind
+    }
+}
+
 /// 文書から集めたスタイル源（`<style>` 要素のシートと inline 宣言。いずれも文書順）。
 #[derive(Debug, Clone, Default)]
 pub struct DocumentStyles {
     style_sheets: Vec<StyleElementSheet>,
     inline_styles: Vec<InlineStyle>,
+    skipped: Vec<SkippedStyleSource>,
+    dropped_skipped: usize,
+    /// ノード → `inline_styles` 添字の索引（要素ごとの検索を O(1) にする）。
+    inline_index: HashMap<NodeId, usize>,
+    /// 記録上限に関係なく、捨てた `style` 属性を持つ要素の集合（採否判定用）。
+    skipped_inline_nodes: HashSet<NodeId>,
 }
 
 impl DocumentStyles {
@@ -503,12 +580,124 @@ impl DocumentStyles {
     pub fn inline_styles(&self) -> &[InlineStyle] {
         &self.inline_styles
     }
+
+    /// 上限違反で捨てたスタイル源（文書順・最大 [`MAX_SKIPPED_STYLE_SOURCES`] 件）。
+    pub fn skipped_sources(&self) -> &[SkippedStyleSource] {
+        &self.skipped
+    }
+
+    /// 記録上限を超えて記録しなかった、捨てたスタイル源の件数。
+    pub fn dropped_skipped_sources(&self) -> usize {
+        self.dropped_skipped
+    }
+
+    /// `node` の収集済み inline 宣言（採用されなかった・属性なしは `None`）。平均 O(1)。
+    pub fn inline_declarations_for(&self, node: NodeId) -> Option<&[Declaration]> {
+        self.inline_index
+            .get(&node)
+            .and_then(|&i| self.inline_styles.get(i))
+            .map(|i| i.declarations())
+    }
+
+    /// `node` の `style` 属性が上限違反で捨てられたか。記録上限
+    /// （[`MAX_SKIPPED_STYLE_SOURCES`]）を超えた分も含めて判定できる。平均 O(1)。
+    pub fn is_inline_skipped(&self, node: NodeId) -> bool {
+        self.skipped_inline_nodes.contains(&node)
+    }
+
+    fn push_inline(&mut self, node: NodeId, declarations: Vec<Declaration>) {
+        self.inline_index.insert(node, self.inline_styles.len());
+        self.inline_styles.push(InlineStyle { node, declarations });
+    }
+
+    fn push_skipped(&mut self, node: NodeId, kind: StyleSourceKind) {
+        if kind == StyleSourceKind::InlineStyle {
+            self.skipped_inline_nodes.insert(node);
+        }
+        if self.skipped.len() >= MAX_SKIPPED_STYLE_SOURCES {
+            self.dropped_skipped = self.dropped_skipped.saturating_add(1);
+        } else {
+            self.skipped.push(SkippedStyleSource { node, kind });
+        }
+    }
+}
+
+/// 文書全体の累積バイト数・ルール数の予算。採用したスタイル源だけを加算する。
+#[derive(Debug, Default)]
+struct StyleBudget {
+    bytes: usize,
+    rules: usize,
+    /// 採否に関係なく処理対象にした源の件数。
+    sources: usize,
+    /// 採否に関係なく処理対象にした源の累積バイト数。
+    attempted_bytes: usize,
+}
+
+impl StyleBudget {
+    /// 源を処理対象にしてよいか判定し、よければ件数・試行バイト数へ加算する。
+    ///
+    /// 採否に関係なく処理した量を数え、パース・確保の前に頭打ちにする（空・捨てる源の
+    /// 繰り返し処理による DoS 防止。`CORE-5`・TASK-105.7・#261）。false の源は何も処理しない。
+    fn admit(&mut self, n: usize) -> bool {
+        let attempted = self.attempted_bytes.saturating_add(n);
+        if self.sources >= MAX_DOCUMENT_STYLE_SOURCES
+            || attempted > MAX_DOCUMENT_STYLE_ATTEMPT_BYTES
+        {
+            return false;
+        }
+        self.sources += 1;
+        self.attempted_bytes = attempted;
+        true
+    }
+
+    /// 採用済みバイト数に `n` を足しても上限内か（加算はしない）。
+    fn fits_bytes(&self, n: usize) -> bool {
+        self.bytes.saturating_add(n) <= MAX_DOCUMENT_STYLE_BYTES
+    }
+
+    /// 採用済みルール数に `n` を足しても上限内か（加算はしない）。
+    fn fits_rules(&self, n: usize) -> bool {
+        self.rules.saturating_add(n) <= MAX_DOCUMENT_STYLE_RULES
+    }
+
+    fn try_add_bytes(&mut self, n: usize) -> Result<()> {
+        let total = self.bytes.saturating_add(n);
+        if total > MAX_DOCUMENT_STYLE_BYTES {
+            return Err(Error::InvalidInput {
+                message: format!("document style input exceeds {MAX_DOCUMENT_STYLE_BYTES} bytes"),
+            });
+        }
+        self.bytes = total;
+        Ok(())
+    }
+
+    fn try_add_rules(&mut self, n: usize) -> Result<()> {
+        let total = self.rules.saturating_add(n);
+        if total > MAX_DOCUMENT_STYLE_RULES {
+            return Err(Error::InvalidInput {
+                message: format!("document rule count exceeds {MAX_DOCUMENT_STYLE_RULES}"),
+            });
+        }
+        self.rules = total;
+        Ok(())
+    }
 }
 
 /// `<style>` を読み飛ばすべき `type` か（値が非空で `text/css` 以外。HTML 仕様に合わせる）。
 fn style_type_is_not_css(value: &str) -> bool {
     let v = value.trim_matches(is_css_whitespace);
     !v.is_empty() && !v.eq_ignore_ascii_case("text/css")
+}
+
+/// `<style>` 要素の子テキストの合計バイト数（連結せずに数える。予算の事前検査用）。
+fn style_element_text_len(document: &Document, id: NodeId) -> usize {
+    document
+        .children(id)
+        .filter_map(|c| match document.node_data(c) {
+            Some(NodeData::Text { contents }) => Some(contents.len()),
+            _ => None,
+        })
+        .fold(0usize, |a, n| a.saturating_add(n))
 }
 
 /// `<style>` 要素の子テキストを連結する。累積長を確保前に検査する（無制限確保の防止）。
@@ -531,10 +720,17 @@ fn style_element_text(document: &Document, id: NodeId) -> Result<String> {
 ///
 /// `<style>` は HTML 名前空間のものだけが対象（SVG は対象外）で、`type` が空以外かつ
 /// `text/css` 以外なら読み飛ばす。`<template>` の contents は含まれない。`style` 属性は
-/// 全名前空間の要素が対象。`Err` は 1 スタイル源の上限違反のみ（fail-closed。見直しは #261）。
-/// 対応ビヘイビア: `CORE-5`（TASK-105.4.2・#552）。
+/// 全名前空間の要素が対象。
+///
+/// 1 スタイル源の上限違反（[`Error::InvalidInput`]）はその源だけを捨てて
+/// [`DocumentStyles::skipped_sources`] に記録し、残りを収集する。文書全体の累積バイト数・
+/// ルール数・処理した源の件数・処理量の超過も同様にその源だけを捨てる（採用済みの源は失わない）。
+/// `Err` は `InvalidInput` 以外のエラーのみ。単一要素の [`parse_style_attribute`] は従来どおり
+/// 上限違反を `Err` にする。
+/// 対応ビヘイビア: `CORE-5`（TASK-105.4.2・#552、TASK-105.7・#261）。
 pub fn collect_document_styles(document: &Document) -> Result<DocumentStyles> {
     let mut out = DocumentStyles::default();
+    let mut budget = StyleBudget::default();
     for id in document.descendants(document.root()) {
         if !document.is_element(id) {
             continue;
@@ -548,17 +744,54 @@ pub fn collect_document_styles(document: &Document) -> Result<DocumentStyles> {
                 .attribute(id, "type")
                 .is_some_and(style_type_is_not_css)
         {
-            let text = style_element_text(document, id)?;
-            out.style_sheets.push(StyleElementSheet {
-                node: id,
-                parsed: parse_stylesheet(&text)?,
-            });
+            // 連結・パースの前に、処理量（源の件数・試行バイト数）と採用の残り予算を確認する。
+            // いずれの超過もその源だけを捨てる（採用済みの源は失わない）。
+            let raw_len = style_element_text_len(document, id);
+            if !budget.admit(raw_len) || !budget.fits_bytes(raw_len) {
+                out.push_skipped(id, StyleSourceKind::StyleElement);
+            } else {
+                match style_element_text(document, id)
+                    .and_then(|text| parse_stylesheet(&text).map(|parsed| (text.len(), parsed)))
+                {
+                    Ok((text_len, parsed)) => {
+                        // 両上限を先に判定し、採用時だけ両予算を更新する（捨てた源を加算しない）。
+                        let rule_count = parsed.stylesheet().rules().len();
+                        if budget.fits_bytes(text_len)
+                            && budget.fits_rules(rule_count)
+                            && budget.try_add_bytes(text_len).is_ok()
+                            && budget.try_add_rules(rule_count).is_ok()
+                        {
+                            out.style_sheets
+                                .push(StyleElementSheet { node: id, parsed });
+                        } else {
+                            out.push_skipped(id, StyleSourceKind::StyleElement);
+                        }
+                    }
+                    Err(Error::InvalidInput { .. }) => {
+                        out.push_skipped(id, StyleSourceKind::StyleElement);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         }
         if let Some(value) = document.attribute(id, "style") {
-            out.inline_styles.push(InlineStyle {
-                node: id,
-                declarations: parse_declarations(value)?,
-            });
+            if !budget.admit(value.len()) || !budget.fits_bytes(value.len()) {
+                out.push_skipped(id, StyleSourceKind::InlineStyle);
+            } else {
+                match parse_declarations(value) {
+                    Ok(declarations) => {
+                        if budget.try_add_bytes(value.len()).is_ok() {
+                            out.push_inline(id, declarations);
+                        } else {
+                            out.push_skipped(id, StyleSourceKind::InlineStyle);
+                        }
+                    }
+                    Err(Error::InvalidInput { .. }) => {
+                        out.push_skipped(id, StyleSourceKind::InlineStyle);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         }
     }
     Ok(out)
@@ -578,6 +811,7 @@ pub fn parse_style_attribute(document: &Document, id: NodeId) -> Result<Option<V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cssom::{MAX_DECLARATION_INPUT_BYTES, MAX_DECLARATIONS_PER_BLOCK};
 
     fn pb(input: &str) -> Vec<(String, String, usize)> {
         split_rule_blocks(input)
@@ -906,5 +1140,163 @@ mod tests {
             parse_stylesheet(&ng),
             Err(Error::InvalidInput { .. })
         ));
+    }
+
+    fn doc_of(html: &str) -> Document {
+        crate::parse_document(html, &crate::ParseOptions::default())
+            .expect("must parse")
+            .document
+    }
+
+    /// CORE-5（TASK-105.7）: 文書累積バイト数は上限ちょうどで Ok・+1 で Err。
+    #[test]
+    fn core_5_budget_bytes_boundary() {
+        let mut b = StyleBudget::default();
+        b.try_add_bytes(MAX_DOCUMENT_STYLE_BYTES).expect("at limit");
+        match b.try_add_bytes(1) {
+            Err(Error::InvalidInput { message }) => {
+                assert_eq!(message, "document style input exceeds 16777216 bytes");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        // 飽和加算: usize::MAX でも panic しない。
+        assert!(b.try_add_bytes(usize::MAX).is_err());
+    }
+
+    /// CORE-5（TASK-105.7）: 文書累積ルール数は上限ちょうどで Ok・+1 で Err。
+    #[test]
+    fn core_5_budget_rules_boundary() {
+        let mut b = StyleBudget::default();
+        b.try_add_rules(MAX_DOCUMENT_STYLE_RULES).expect("at limit");
+        match b.try_add_rules(1) {
+            Err(Error::InvalidInput { message }) => {
+                assert_eq!(message, "document rule count exceeds 65536");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    /// CORE-5（TASK-105.7）: 過大な `<style>` は捨てて記録し、残りを収集する。
+    #[test]
+    fn core_5_oversize_style_element_is_skipped_not_fatal() {
+        let big = " ".repeat(MAX_STYLESHEET_INPUT_BYTES + 1);
+        let html = format!(
+            "<html><head><style>{big}</style><style>a{{color:red}}</style></head>\
+             <body><p style=\"top:1px\">x</p></body></html>"
+        );
+        let doc = doc_of(&html);
+        let styles = collect_document_styles(&doc).expect("must collect");
+        assert_eq!(styles.style_sheets().len(), 1);
+        assert_eq!(styles.inline_styles().len(), 1);
+        assert_eq!(styles.skipped_sources().len(), 1);
+        assert_eq!(
+            styles.skipped_sources()[0].kind(),
+            StyleSourceKind::StyleElement
+        );
+        assert_eq!(styles.dropped_skipped_sources(), 0);
+    }
+
+    /// CORE-5（TASK-105.7）: ルール数超過の `<style>` も源単位で捨てる。
+    #[test]
+    fn core_5_too_many_rules_style_is_skipped() {
+        let css = "a{}".repeat(MAX_RULES_PER_STYLESHEET + 1);
+        let doc = doc_of(&format!("<style>{css}</style><style>b{{c:d}}</style>"));
+        let styles = collect_document_styles(&doc).expect("must collect");
+        assert_eq!(styles.style_sheets().len(), 1);
+        assert_eq!(styles.skipped_sources().len(), 1);
+    }
+
+    /// CORE-5（TASK-105.7）: 過大・宣言数超過の `style` 属性は該当要素だけ捨てる。
+    #[test]
+    fn core_5_oversize_inline_style_is_skipped() {
+        let big = format!("a:{}", "x".repeat(MAX_DECLARATION_INPUT_BYTES));
+        let many = "a:b;".repeat(MAX_DECLARATIONS_PER_BLOCK + 1);
+        let html =
+            format!("<p style=\"{big}\">1</p><p style=\"{many}\">2</p><p style=\"c:d\">3</p>");
+        let doc = doc_of(&html);
+        let styles = collect_document_styles(&doc).expect("must collect");
+        assert_eq!(styles.inline_styles().len(), 1);
+        assert_eq!(styles.skipped_sources().len(), 2);
+        assert!(
+            styles
+                .skipped_sources()
+                .iter()
+                .all(|s| s.kind() == StyleSourceKind::InlineStyle)
+        );
+    }
+
+    /// CORE-5（TASK-105.7）: 文書全体のルール累積が上限を超えた源は捨てる（Err にしない）。
+    #[test]
+    fn core_5_document_rule_budget_skips_excess_source() {
+        let sheet = format!("<style>{}</style>", "a{}".repeat(MAX_RULES_PER_STYLESHEET));
+        let four = doc_of(&sheet.repeat(4));
+        let styles = collect_document_styles(&four).expect("4 sheets fit");
+        assert_eq!(styles.style_sheets().len(), 4);
+        let five = doc_of(&format!("{}<style>a{{}}</style>", sheet.repeat(4)));
+        let styles = collect_document_styles(&five).expect("must collect");
+        assert_eq!(styles.style_sheets().len(), 4);
+        assert_eq!(styles.skipped_sources().len(), 1);
+    }
+
+    /// CORE-5（TASK-105.7）: 源の件数上限を超えた分は空でも捨てて記録する。
+    #[test]
+    fn core_5_source_count_is_capped() {
+        let html = "<style></style>".repeat(MAX_DOCUMENT_STYLE_SOURCES + 5);
+        let doc = doc_of(&html);
+        let styles = collect_document_styles(&doc).expect("must collect");
+        assert_eq!(styles.style_sheets().len(), MAX_DOCUMENT_STYLE_SOURCES);
+        assert_eq!(styles.skipped_sources().len(), 5);
+    }
+
+    /// CORE-5（TASK-105.7）: 残り予算を超える源は Err にせず、採用済みの源を保つ。
+    #[test]
+    fn core_5_budget_overflow_source_keeps_adopted_styles() {
+        let mut b = StyleBudget::default();
+        b.try_add_bytes(MAX_DOCUMENT_STYLE_BYTES - 1).expect("fits");
+        assert!(!b.fits_bytes(2));
+        assert!(b.fits_bytes(1));
+    }
+
+    /// CORE-5（TASK-105.7）: ルール上限で捨てた `<style>` のバイト数は予算へ加算しない。
+    #[test]
+    fn core_5_rule_overflow_source_does_not_consume_byte_budget() {
+        let pad = |n: usize| format!("a{{}}{}", " ".repeat(n));
+        let full = format!(
+            "<style>{}{}</style>",
+            "a{}".repeat(MAX_RULES_PER_STYLESHEET),
+            " ".repeat(3_500_000)
+        );
+        // 5 枚目はルール数超過で捨てられる（バイトは残り予算内）。捨てた分を誤って
+        // バイト予算へ加算すると後続の inline（500KB）が予算を超えて捨てられ、退行を検出できる。
+        let over = format!("<style>{}</style>", pad(2_500_000));
+        let inline = format!("<p style=\"color:red;{}\">x</p>", " ".repeat(500_000));
+        let html = format!("{}{}{}", full.repeat(4), over, inline);
+        let styles = collect_document_styles(&doc_of(&html)).expect("must collect");
+        assert_eq!(styles.style_sheets().len(), 4);
+        assert_eq!(styles.inline_styles().len(), 1);
+        assert_eq!(styles.skipped_sources().len(), 1);
+    }
+
+    /// CORE-5（TASK-105.7）: 処理量（試行バイト数）の上限を超える源はパースせず捨てる。
+    #[test]
+    fn core_5_attempted_bytes_are_capped() {
+        let mut b = StyleBudget::default();
+        assert!(b.admit(MAX_DOCUMENT_STYLE_ATTEMPT_BYTES));
+        assert!(!b.admit(1));
+        assert!(!StyleBudget::default().admit(usize::MAX));
+    }
+
+    /// CORE-5（TASK-105.7）: skip 記録は上限まで、超過分は件数のみ。
+    #[test]
+    fn core_5_skipped_records_are_capped() {
+        let mut d = DocumentStyles::default();
+        let node = doc_of("<p>x</p>").root();
+        for _ in 0..MAX_SKIPPED_STYLE_SOURCES + 3 {
+            d.push_skipped(node, StyleSourceKind::InlineStyle);
+        }
+        assert_eq!(d.skipped_sources().len(), MAX_SKIPPED_STYLE_SOURCES);
+        assert_eq!(d.dropped_skipped_sources(), 3);
+        // 記録上限を超えた分も採否判定できる。
+        assert!(d.is_inline_skipped(node));
     }
 }

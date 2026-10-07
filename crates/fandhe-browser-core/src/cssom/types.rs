@@ -4,7 +4,7 @@
 //! ルール・スタイルシートの組み立ては #551・#552、マッチング・カスケードは #259・#260 の
 //! 担当で、本モジュールにはパース・計算ロジックを含めない。型のコンストラクタは
 //! 呼び出し側が確保済みのデータを受け取るだけで、外部入力の長さから確保しない。
-//! 入力長・ルール数・宣言数の上限は各パーサーと #261 が確保前に検証する。
+//! 入力長・ルール数・宣言数の上限は `parse_declarations`・`parse_stylesheet`・`collect_document_styles` が確保前に検証する。
 
 use crate::selector::SelectorList;
 
@@ -161,7 +161,8 @@ impl StyleRule {
 /// #552 が組み立て、#259 / #260 が複数を順に扱う。起源の区別（UA・user・author）・
 /// media 条件・ルール単位のエラー記録（#258）は未実装（REPAIR-3。private フィールドなので
 /// 後から非破壊で追加できる）。inline の `style` 属性は Stylesheet として表さない
-/// （要素ごとの宣言列 `InlineStyle` で表す。#552）。上限検証は型ではせず、各パーサーと #261 が行う。
+/// （要素ごとの宣言列 `InlineStyle` で表す。#552）。
+/// 上限検証は型ではせず、各パーサーと `collect_document_styles` が行う。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Stylesheet {
     rules: Vec<StyleRule>,

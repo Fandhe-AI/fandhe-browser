@@ -12,10 +12,13 @@
 //! DOM からのスタイル源収集と [`Stylesheet`] 構築 [`collect_document_styles`] /
 //! [`parse_stylesheet`] / [`parse_style_attribute`]（TASK-105.4.2・#552）、
 //! セレクタマッチング [`match_rules`]（TASK-105.5・#259）、
-//! カスケード解決と computed style API [`cascade`] / [`computed_style`]（TASK-105.6・#260）まで。
+//! カスケード解決と computed style API [`cascade`] / [`computed_style`]（TASK-105.6・#260）、
+//! 外部入力の安全性検証（TASK-105.7・#261。各入口の上限は確保前に判定し、文書全体の累積上限
+//! [`MAX_DOCUMENT_STYLE_BYTES`] / [`MAX_DOCUMENT_STYLE_RULES`] と上限違反スタイル源の
+//! 源単位 skip を含む）まで。
 //! 以下は未実装（REPAIR-3: 実装済みを装わない）。
 //!
-//! - 上限検証（#261）・結合テスト（#262）
+//! - 結合テスト（#262）
 
 mod computed;
 mod declaration;
@@ -26,6 +29,7 @@ mod types;
 
 pub use computed::{
     ComputedDeclaration, ComputedStyle, DeclarationOrigin, cascade, computed_style,
+    computed_style_in_document,
 };
 pub use declaration::{
     MAX_DECLARATION_INPUT_BYTES, MAX_DECLARATIONS_PER_BLOCK, parse_declarations,
@@ -33,10 +37,11 @@ pub use declaration::{
 pub use matcher::{MatchedRule, match_rules};
 pub use selector::{specificities, specificity};
 pub use stylesheet::{
-    DocumentStyles, InlineStyle, MAX_RULE_BLOCK_ERRORS, MAX_RULES_PER_STYLESHEET,
+    DocumentStyles, InlineStyle, MAX_DOCUMENT_STYLE_BYTES, MAX_DOCUMENT_STYLE_RULES,
+    MAX_RULE_BLOCK_ERRORS, MAX_RULES_PER_STYLESHEET, MAX_SKIPPED_STYLE_SOURCES,
     MAX_STYLESHEET_INPUT_BYTES, ParsedStylesheet, RuleBlock, RuleBlockError, RuleBlockErrorKind,
-    RuleBlocks, StyleElementSheet, collect_document_styles, parse_style_attribute,
-    parse_stylesheet, split_rule_blocks,
+    RuleBlocks, SkippedStyleSource, StyleElementSheet, StyleSourceKind, collect_document_styles,
+    parse_style_attribute, parse_stylesheet, split_rule_blocks,
 };
 pub use types::{Declaration, Importance, Specificity, StyleRule, Stylesheet};
 

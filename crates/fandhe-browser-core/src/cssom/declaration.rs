@@ -21,16 +21,15 @@
 //! - 値の型付き解釈（長さ・色・`url()` 等）。値は文字列のまま保持し、解釈も取得もしない
 //! - エスケープ付き property 名（`\66oo` 等）と `*zoom` 等のハック。いずれも捨てる
 //! - 同名 property の重複解決。ソース順に全件残し、後勝ちはカスケード（#260）の責務
-//! - 上限値は暫定。見直しは #261（TASK-105.7）が担う
 
 use super::is_css_whitespace;
 use super::types::{Declaration, Importance};
 use crate::error::{Error, Result};
 
-/// 受け付ける宣言列テキストの最大バイト数（暫定。見直しは #261）。
+/// 受け付ける宣言列テキストの最大バイト数（TASK-105.7・#261 で確定。確保前・`push` 前に判定する）。
 pub const MAX_DECLARATION_INPUT_BYTES: usize = 1024 * 1024;
 
-/// 1 ブロックで受け付ける有効な宣言の最大件数（暫定。見直しは #261）。
+/// 1 ブロックで受け付ける有効な宣言の最大件数（TASK-105.7・#261 で確定。確保前・`push` 前に判定する）。
 pub const MAX_DECLARATIONS_PER_BLOCK: usize = 4096;
 
 /// CSS 識別子の先頭以外に使える文字（英数字・`-`・`_`・非 ASCII）。
@@ -186,7 +185,10 @@ impl Current {
         let mut value = self.value.as_str();
         let mut importance = Importance::Normal;
         if let Some(pos) = self.bang {
-            let (Some(head), Some(tail)) = (value.get(..pos), value.get(pos + 1..)) else {
+            let (Some(head), Some(tail)) = (
+                value.get(..pos),
+                pos.checked_add(1).and_then(|n| value.get(n..)),
+            ) else {
                 return Ok(());
             };
             if !trim_css(tail).eq_ignore_ascii_case("important") {
@@ -401,6 +403,16 @@ mod tests {
                 assert_eq!(message, "declaration count exceeds 4096 per block");
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// CORE-5（TASK-105.7）: 末尾が `!` の値は panic せず宣言ごと捨てる。
+    #[test]
+    fn core_5_trailing_bang_is_dropped() {
+        for input in ["a: b !", "a:!", "a: !", "a: b!;c: d"] {
+            let got = parse_declarations(input).expect("must parse");
+            let names: Vec<&str> = got.iter().map(|d| d.property()).collect();
+            assert!(!names.contains(&"a"), "input {input:?}: {names:?}");
         }
     }
 }
