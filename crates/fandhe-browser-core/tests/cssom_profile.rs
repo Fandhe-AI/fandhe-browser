@@ -225,3 +225,107 @@ fn plug8_gate_from_name_truncates_long_value() {
         other => panic!("unexpected: {other:?}"),
     }
 }
+
+// ---- TASK-100.4（Issue #268）: gating ----
+
+mod gating {
+    use fandhe_browser_core::cssom::{
+        DeclarationOrigin, MAX_DECLARATION_INPUT_BYTES, collect_document_styles,
+        computed_style_in_document,
+    };
+    use fandhe_browser_core::{
+        BrowserProfile, ComputedDeclaration, ComputedStyle, ParseOptions, parse_document,
+        profile_gate,
+    };
+
+    const HTML: &str = r#"<p style="speak:none;hanging-punctuation:first;text-size-adjust:none;width:1px;--custom-prop:1">x</p>"#;
+
+    fn style_of(html: &str) -> ComputedStyle {
+        let doc = parse_document(html, &ParseOptions::default())
+            .expect("parse")
+            .document;
+        let styles = collect_document_styles(&doc).expect("collect");
+        let p = doc
+            .descendants(doc.root())
+            .find(|&i| doc.local_name(i) == Some("p"))
+            .expect("p");
+        computed_style_in_document(&doc, p, &styles).expect("computed")
+    }
+
+    fn names(ds: &[ComputedDeclaration]) -> Vec<&str> {
+        ds.iter().map(|d| d.property()).collect()
+    }
+
+    #[test]
+    fn plug8_gating_disabled_keeps_all_declarations() {
+        let style = style_of(HTML);
+        let g = profile_gate(None).expect("ok").apply(&style);
+        assert_eq!(g.profile(), None);
+        assert_eq!(g.declarations(), style.declarations());
+        assert!(g.removed().is_empty());
+    }
+
+    #[test]
+    fn plug8_gating_chrome_removes_only_unsupported() {
+        let style = style_of(HTML);
+        let g = profile_gate(Some(BrowserProfile::Chrome))
+            .expect("ok")
+            .apply(&style);
+        assert_eq!(
+            names(g.declarations()),
+            ["--custom-prop", "text-size-adjust", "width"]
+        );
+        assert_eq!(names(g.removed()), ["hanging-punctuation", "speak"]);
+        let w = g.get("width").expect("width");
+        assert_eq!(w.value(), style.get("width").expect("w").value());
+        assert_eq!(w.origin(), DeclarationOrigin::Inline);
+    }
+
+    #[test]
+    fn plug8_gating_safari_removes_only_unsupported() {
+        let style = style_of(HTML);
+        let g = profile_gate(Some(BrowserProfile::Safari))
+            .expect("ok")
+            .apply(&style);
+        assert_eq!(
+            names(g.declarations()),
+            ["--custom-prop", "hanging-punctuation", "width"]
+        );
+        assert_eq!(names(g.removed()), ["speak", "text-size-adjust"]);
+    }
+
+    #[test]
+    fn plug8_gating_preserves_important_and_retained_only_lookup() {
+        let style = style_of(r#"<p style="width:1px !important;speak:none">x</p>"#);
+        let g = profile_gate(Some(BrowserProfile::Chrome))
+            .expect("ok")
+            .apply(&style);
+        assert_eq!(g.len(), 1);
+        assert_eq!(
+            g.get("width").expect("width").importance(),
+            style.get("width").expect("w").importance()
+        );
+        assert!(g.get("speak").is_none());
+    }
+
+    #[test]
+    fn plug8_gating_empty_style_is_empty() {
+        let g = profile_gate(Some(BrowserProfile::Chrome))
+            .expect("ok")
+            .apply(&ComputedStyle::default());
+        assert!(g.is_empty());
+        assert!(g.removed().is_empty());
+        assert!(!g.inline_skipped());
+    }
+
+    #[test]
+    fn plug8_gating_passes_through_inline_skipped() {
+        let big = "a".repeat(MAX_DECLARATION_INPUT_BYTES + 1);
+        let style = style_of(&format!(r#"<p style="color:{big}">x</p>"#));
+        assert!(style.inline_skipped());
+        let g = profile_gate(Some(BrowserProfile::Chrome))
+            .expect("ok")
+            .apply(&style);
+        assert!(g.inline_skipped());
+    }
+}
