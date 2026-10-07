@@ -584,13 +584,14 @@ mod identity {
     }
 
     /// 受信した `User-Agent` ヘッダ値を channel へ送り、空の 200 を返す
-    /// ループバック専用サーバーを起動する。
-    fn spawn_ua_capture_server() -> (u16, mpsc::Receiver<Option<String>>) {
+    /// ループバック専用サーバーを起動する。1 リクエストだけ処理して終了し、
+    /// 呼び出し側が `JoinHandle` で回収できる（スレッド・ソケットを残さない）。
+    fn spawn_ua_capture_server() -> (u16, mpsc::Receiver<Option<String>>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
         let port = listener.local_addr().expect("local_addr").port();
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            for mut stream in listener.incoming().flatten() {
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 512];
                 while buf.len() < MAX_HEAD_BYTES && !buf.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -612,12 +613,12 @@ mod identity {
                 );
             }
         });
-        (port, rx)
+        (port, rx, handle)
     }
 
     /// ループバックへ 1 回 GET し、サーバーが受け取った `User-Agent` を返す。
     async fn sent_user_agent() -> String {
-        let (port, rx) = spawn_ua_capture_server();
+        let (port, rx, handle) = spawn_ua_capture_server();
         let options = FetchOptions::new().with_allow_private_network_access(true);
         let fetcher = Fetcher::new(options).expect("Fetcher::new");
         let resp = fetcher
@@ -625,9 +626,12 @@ mod identity {
             .await
             .expect("get");
         assert_eq!(resp.status(), 200);
-        rx.recv_timeout(Duration::from_secs(5))
+        let ua = rx
+            .recv_timeout(Duration::from_secs(5))
             .expect("server must receive request")
-            .expect("User-Agent header must be present")
+            .expect("User-Agent header must be present");
+        handle.join().expect("capture server thread must exit");
+        ua
     }
 
     /// gate を実際に適用し、除去されたプロパティ名を返す（gate が効いていることの確認用）。
