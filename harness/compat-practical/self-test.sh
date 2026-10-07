@@ -449,7 +449,7 @@ else
   expect_eq "$(jq -sc '[.[] | select(.type=="result" and (.id=="b5" or .id=="d2" or .id=="d3")) | .id]' "$WORK/real.out.jsonl")" '["b5","d2","d3"]' "run_core b5 d2 d3 rows"
   expect_eq "$(jq -r 'select(.type=="meta") | .tasks_sha256' "$WORK/real.out.jsonl" | tr -d '\n' | wc -c | tr -d ' ')" "64" "run_core tasks_sha256 recorded"
 
-  # 期限: 応答しないタスクは timeout、全体期限超過後は blocked
+  # 期限: 応答しないタスクは timeout、全体期限に達したタスク（実行中を含む）以降は blocked
   {
     printf '[%s,' "$(rc_task h1 static "$U/hang" h1 text)"
     printf '%s]\n' "$(rc_task h2 static "$U/ok" h1 text)"
@@ -457,7 +457,7 @@ else
   expect_exit "run_core task timeout" 0 bash "$RUN_CORE" --no-spawn --endpoint "$EP" --tasks "$WORK/hang.json" --out "$WORK/hang.out.jsonl" --task-timeout 1
   expect_eq "$(jq -sc '[.[] | select(.type=="result") | .reason]' "$WORK/hang.out.jsonl")" '["timeout",null]' "run_core timeout then continue"
   expect_exit "run_core total timeout" 0 bash "$RUN_CORE" --no-spawn --endpoint "$EP" --tasks "$WORK/hang.json" --out "$WORK/hang2.out.jsonl" --task-timeout 5 --total-timeout 1
-  expect_eq "$(jq -sc '[.[] | select(.type=="result") | .reason]' "$WORK/hang2.out.jsonl")" '["timeout","blocked"]' "run_core blocked after total timeout"
+  expect_eq "$(jq -sc '[.[] | select(.type=="result") | .reason]' "$WORK/hang2.out.jsonl")" '["blocked","blocked"]' "run_core blocked after total timeout"
 
   # 出力の原子性: 失敗時は既存の --out を壊さない
   printf 'KEEP\n' >"$WORK/keep.jsonl"

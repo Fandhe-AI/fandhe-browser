@@ -202,20 +202,27 @@ async function runTask(cdp, t, budgetMs) {
   const fail = (reason, detail = null, extra = {}) => ({
     ...base, success: false, reason, detail, method: "first_match", match_count: null, output_sample: "", ...extra,
   });
-  const to = Math.max(1, Math.min(taskTimeoutMs, budgetMs));
+  // --total-timeout の期限（絶対時刻）。各段階の直前に残り時間を再計算し、到達したら打ち切る
+  const deadline = Date.now() + budgetMs;
+  const remaining = () => deadline - Date.now();
+  const stepTimeout = () => {
+    const left = remaining();
+    if (left <= 0) throw Object.assign(new Error("total time limit exceeded"), { totalExceeded: true });
+    return Math.max(1, Math.min(taskTimeoutMs, left));
+  };
   try {
-    const nav = await cdp.send("Page.navigate", { url: t.url }, to);
+    const nav = await cdp.send("Page.navigate", { url: t.url }, stepTimeout());
     if (typeof nav.errorText === "string" && nav.errorText !== "") {
       return fail("fetch_error", nav.errorText.slice(0, 60));
     }
-    const doc = await cdp.send("DOM.getDocument", { depth: 1 }, to);
+    const doc = await cdp.send("DOM.getDocument", { depth: 1 }, stepTimeout());
     const rootId = doc?.root?.nodeId;
     if (typeof rootId !== "number") return fail("cdp_error", "no root node");
-    const q = await cdp.send("DOM.querySelector", { nodeId: rootId, selector: t.selector }, to);
+    const q = await cdp.send("DOM.querySelector", { nodeId: rootId, selector: t.selector }, stepTimeout());
     if (!q.nodeId) return fail("no_match");
     cdp.events.length = 0;
-    await cdp.send("DOM.requestChildNodes", { nodeId: q.nodeId, depth: -1 }, to);
-    const ev = await cdp.waitEvent((m) => m.method === "DOM.setChildNodes" && m.params?.parentId === q.nodeId, to);
+    await cdp.send("DOM.requestChildNodes", { nodeId: q.nodeId, depth: -1 }, stepTimeout());
+    const ev = await cdp.waitEvent((m) => m.method === "DOM.setChildNodes" && m.params?.parentId === q.nodeId, stepTimeout());
     const nodes = Array.isArray(ev.params?.nodes) ? ev.params.nodes : [];
     if (t.kind === "form") {
       const n = countFormFields(nodes);
@@ -228,6 +235,7 @@ async function runTask(cdp, t, budgetMs) {
     return { ...base, success: true, reason: null, detail: null, method: "first_match", match_count: null, output_sample: sanitizeSample(text) };
   } catch (e) {
     if (cdp.closed) return fail("cdp_error", "connection closed", { closed: true });
+    if (e?.totalExceeded || remaining() <= 0) return fail("blocked", "total time limit exceeded");
     return fail(classifyError(e));
   }
 }
