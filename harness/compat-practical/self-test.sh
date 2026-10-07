@@ -504,5 +504,117 @@ STUB
   esac
 fi
 
+# --- make_matrix.sh（TASK-71.3・MEAS-4）---
+# 合成入力（3 タスク）と実入力の両方で、突合・検証・出力形式を確かめる。オフライン・一時ファイルは $WORK のみ。
+MAKE_MATRIX="$SCRIPT_DIR/make_matrix.sh"
+MM="$WORK/mm"
+mkdir -p "$MM"
+printf '%s\n' \
+  '[{"id":"x1","cat":"static","url":"https://example.com/","selector":"h1","kind":"text"},' \
+  ' {"id":"y1","cat":"spa","url":"https://example.org/","selector":"h1","kind":"text"},' \
+  ' {"id":"z1","cat":"form","url":"https://example.net/","selector":"form","kind":"form"}]' >"$MM/tasks.json"
+MM_SHA="$(sha256_of "$MM/tasks.json")"
+# mm_core <sha> <x1> <y1> <z1>: core JSONL（メタ 1 行 + 結果 3 行）を stdout へ出す
+mm_core() {
+  jq -cn --arg sha "$1" '{type:"meta",schema_version:1,tasks_sha256:$sha}'
+  jq -cn --argjson s "$2" '{type:"result",id:"x1",cat:"static",success:$s,output_sample:"page text"}'
+  jq -cn --argjson s "$3" '{type:"result",id:"y1",cat:"spa",success:$s}'
+  jq -cn --argjson s "$4" '{type:"result",id:"z1",cat:"form",success:$s}'
+}
+mm_core "$MM_SHA" true false true >"$MM/core.jsonl"
+printf '%s\n' \
+  '[{"id":"x1","cat":"static","kind":"text","success":true,"error":null},' \
+  ' {"id":"y1","cat":"spa","kind":"text","success":true,"error":null},' \
+  ' {"id":"z1","cat":"form","kind":"form","success":false,"error":null}]' >"$MM/chromium.json"
+mm_run() { bash "$MAKE_MATRIX" --tasks "$MM/tasks.json" --core "$MM/core.jsonl" --chromium "$MM/chromium.json" "$@"; }
+
+expect_exit "make_matrix synthetic" 0 mm_run --out "$MM/out.json"
+expect_contains "$LAST_OUTPUT" "overall core=2/3 chromium=2/3" "make_matrix overall summary"
+expect_contains "$LAST_OUTPUT" "form core=1/1 chromium=0/1" "make_matrix form summary"
+expect_contains "$LAST_OUTPUT" "spa core=0/1 chromium=1/1" "make_matrix spa summary"
+printf '%s\n' '[' \
+  '  {"id":"x1","cat":"static","fandhe_browser_core":true,"chromium":true},' \
+  '  {"id":"y1","cat":"spa","fandhe_browser_core":false,"chromium":true},' \
+  '  {"id":"z1","cat":"form","fandhe_browser_core":true,"chromium":false}' ']' >"$MM/expected.json"
+expect_eq "$(cat "$MM/out.json")" "$(cat "$MM/expected.json")" "make_matrix exact output"
+expect_eq "$(jq -c '[.[] | keys | length] | unique' "$MM/out.json")" "[4]" "make_matrix exactly 4 keys per entry"
+expect_eq "$(grep -c 'page text' "$MM/out.json" || true)" "0" "make_matrix omits page-derived text"
+expect_eq "$(ls -A "$MM" | grep -c '^\.matrix\.' || true)" "0" "make_matrix leaves no temp file"
+
+# 生成物は check-matrix.sh のスキーマ契約に適合する（終了コード 2 = スキーマ違反でないこと。0/1 は閾値判定の結果）
+CM_STATUS=0
+bash "$SCRIPT_DIR/../compat-regression/check-matrix.sh" --matrix "$MM/out.json" --threshold 1 --all-categories >/dev/null 2>&1 || CM_STATUS=$?
+expect_eq "$([ "$CM_STATUS" -ne 2 ] && echo conforms || echo violates)" "conforms" "make_matrix output conforms to check-matrix schema"
+
+# --validate-only はファイルを書かない
+expect_exit "make_matrix validate-only" 0 mm_run --validate-only --out "$MM/vo.json"
+expect_eq "$([ -e "$MM/vo.json" ] && echo exists || echo absent)" "absent" "make_matrix validate-only writes nothing"
+
+# 異常系: すべて exit 2。失敗時は既存の --out を壊さない
+echo 'previous matrix' >"$MM/keep.json"
+mm_expect_fail() { # $1=name $2...=make_matrix の追加引数
+  local name="$1"
+  shift
+  expect_exit "make_matrix $name" 2 bash "$MAKE_MATRIX" --out "$MM/keep.json" "$@"
+}
+mm_core "$MM_SHA" true false true | sed -n '1,3p' >"$MM/c_missing.jsonl"
+mm_expect_fail "core missing id" --tasks "$MM/tasks.json" --core "$MM/c_missing.jsonl" --chromium "$MM/chromium.json"
+expect_contains "$LAST_OUTPUT" "ids missing from core results: z1" "make_matrix core missing id message"
+{ mm_core "$MM_SHA" true false true; jq -cn '{type:"result",id:"q9",cat:"spa",success:true}'; } >"$MM/c_extra.jsonl"
+mm_expect_fail "core extra id" --tasks "$MM/tasks.json" --core "$MM/c_extra.jsonl" --chromium "$MM/chromium.json"
+expect_contains "$LAST_OUTPUT" "ids in core results but not in tasks: q9" "make_matrix core extra id message"
+jq 'map(select(.id != "z1"))' "$MM/chromium.json" >"$MM/ch_missing.json"
+mm_expect_fail "chromium missing id" --tasks "$MM/tasks.json" --core "$MM/core.jsonl" --chromium "$MM/ch_missing.json"
+expect_contains "$LAST_OUTPUT" "ids missing from chromium results: z1" "make_matrix chromium missing id message"
+jq '. + [{"id":"q9","cat":"spa","kind":"text","success":true,"error":null}]' "$MM/chromium.json" >"$MM/ch_extra.json"
+mm_expect_fail "chromium extra id" --tasks "$MM/tasks.json" --core "$MM/core.jsonl" --chromium "$MM/ch_extra.json"
+jq '(.[] | select(.id == "y1") | .cat) = "lazy"' "$MM/chromium.json" >"$MM/ch_cat.json"
+mm_expect_fail "chromium cat mismatch" --tasks "$MM/tasks.json" --core "$MM/core.jsonl" --chromium "$MM/ch_cat.json"
+expect_contains "$LAST_OUTPUT" "cat differs between tasks and chromium results: y1" "make_matrix cat mismatch message"
+mm_core "$MM_SHA" true false true | sed 's/"cat":"spa"/"cat":"lazy"/' >"$MM/c_cat.jsonl"
+mm_expect_fail "core cat mismatch" --tasks "$MM/tasks.json" --core "$MM/c_cat.jsonl" --chromium "$MM/chromium.json"
+mm_core "0000000000000000000000000000000000000000000000000000000000000000" true false true >"$MM/c_sha.jsonl"
+mm_expect_fail "core tasks_sha256 mismatch" --tasks "$MM/tasks.json" --core "$MM/c_sha.jsonl" --chromium "$MM/chromium.json"
+expect_contains "$LAST_OUTPUT" "tasks_sha256 does not match" "make_matrix sha mismatch message"
+mm_core "$MM_SHA" '"yes"' false true >"$MM/c_bool.jsonl"
+mm_expect_fail "core success not boolean" --tasks "$MM/tasks.json" --core "$MM/c_bool.jsonl" --chromium "$MM/chromium.json"
+jq '(.[0].success) = 1' "$MM/chromium.json" >"$MM/ch_bool.json"
+mm_expect_fail "chromium success not boolean" --tasks "$MM/tasks.json" --core "$MM/core.jsonl" --chromium "$MM/ch_bool.json"
+{ cat "$MM/core.jsonl"; sed -n '2p' "$MM/core.jsonl"; } >"$MM/c_dup.jsonl"
+mm_expect_fail "core duplicate id" --tasks "$MM/tasks.json" --core "$MM/c_dup.jsonl" --chromium "$MM/chromium.json"
+jq '. + [.[0]]' "$MM/chromium.json" >"$MM/ch_dup.json"
+mm_expect_fail "chromium duplicate id" --tasks "$MM/tasks.json" --core "$MM/core.jsonl" --chromium "$MM/ch_dup.json"
+sed '1d' "$MM/core.jsonl" >"$MM/c_nometa.jsonl"
+mm_expect_fail "core without meta line" --tasks "$MM/tasks.json" --core "$MM/c_nometa.jsonl" --chromium "$MM/chromium.json"
+{ cat "$MM/core.jsonl"; sed -n '1p' "$MM/core.jsonl"; } >"$MM/c_meta2.jsonl"
+mm_expect_fail "core with two meta lines" --tasks "$MM/tasks.json" --core "$MM/c_meta2.jsonl" --chromium "$MM/chromium.json"
+{ cat "$MM/chromium.json"; cat "$MM/chromium.json"; } >"$MM/ch_multi.json"
+mm_expect_fail "chromium multiple documents" --tasks "$MM/tasks.json" --core "$MM/core.jsonl" --chromium "$MM/ch_multi.json"
+echo '{"id":"x1"}' >"$MM/ch_obj.json"
+mm_expect_fail "chromium not an array" --tasks "$MM/tasks.json" --core "$MM/core.jsonl" --chromium "$MM/ch_obj.json"
+echo 'not json' >"$MM/c_bad.jsonl"
+mm_expect_fail "core not JSONL" --tasks "$MM/tasks.json" --core "$MM/c_bad.jsonl" --chromium "$MM/chromium.json"
+head -c 1048577 /dev/zero | tr '\0' ' ' >"$MM/ch_big.json"
+mm_expect_fail "chromium too large" --tasks "$MM/tasks.json" --core "$MM/core.jsonl" --chromium "$MM/ch_big.json"
+expect_contains "$LAST_OUTPUT" "too large" "make_matrix size limit message"
+mm_expect_fail "missing core file" --tasks "$MM/tasks.json" --core "$MM/none.jsonl" --chromium "$MM/chromium.json"
+mm_expect_fail "invalid tasks" --tasks "$MM/ch_obj.json" --core "$MM/core.jsonl" --chromium "$MM/chromium.json"
+mm_expect_fail "unknown argument" --bogus
+expect_eq "$(cat "$MM/keep.json")" "previous matrix" "make_matrix failure keeps existing --out"
+expect_exit "make_matrix output dir missing" 1 mm_run --out "$MM/no-such-dir/m.json"
+
+# 実入力: 22 タスクの突合（件数は再計測で変わるためハードコードしない。行単位の一致で確かめる）
+REAL_OUT="$WORK/real_matrix.json"
+expect_exit "make_matrix real inputs" 0 bash "$MAKE_MATRIX" --out "$REAL_OUT"
+expect_eq "$(jq length "$REAL_OUT")" "22" "real matrix entries"
+expect_eq "$(jq -c '[.[].id]' "$REAL_OUT")" "$(jq -c '[.[].id]' "$TASKS")" "real matrix id order follows tasks.json"
+expect_eq "$(jq -c '[.[] | select(.id == "b5" or .id == "d2" or .id == "d3") | .id]' "$REAL_OUT")" '["b5","d2","d3"]' "real matrix js-required ids present"
+expect_eq "$(jq -c '[.[].fandhe_browser_core]' "$REAL_OUT")" \
+  "$(jq -cs '[.[] | select(.type == "result") | .success]' "$SCRIPT_DIR/results/core_results.jsonl")" "real matrix fandhe_browser_core equals core_results success"
+expect_eq "$(jq -c '[.[].chromium]' "$REAL_OUT")" \
+  "$(jq -c '[.[].success]' "$SCRIPT_DIR/reference/chromium_results.json")" "real matrix chromium equals reference success"
+expect_eq "$(jq -c '[.[].cat]' "$REAL_OUT")" "$(jq -c '[.[].cat]' "$TASKS")" "real matrix cat follows tasks.json"
+expect_exit "make_matrix real validate-only" 0 bash "$MAKE_MATRIX" --validate-only
+
 echo "cases=$CASES failures=$FAILURES"
 [ "$FAILURES" -eq 0 ]

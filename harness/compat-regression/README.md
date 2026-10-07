@@ -9,13 +9,15 @@
 
 ## 実マトリクスは未導入（重要）
 
-本 Issue の時点で実マトリクス `harness/compat-practical/results/matrix.json` は
-存在しない（生成は TASK-71.3・Issue #312 が担当。36 サイト版の更新は TASK-89・
+実マトリクス `harness/compat-practical/results/matrix.json` はコミットされていない
+（生成スクリプト `harness/compat-practical/make_matrix.sh` は TASK-71.3・Issue #312 で
+導入済みだが、実測が閾値 70% 未満のためコミットはオーナー判断待ち。詳細は
+`harness/compat-practical/README.md`。36 サイト版の更新は TASK-89・
 Issue #68・人間担当）。そのため `.github/workflows/ci.yml`・`Makefile` では
 `check-matrix.sh` を `--allow-missing` 付きで呼び出しており、ファイルが無い間は
 `::warning::` を出して exit 0（回帰ゲートは実質的に無効）になる。
 
-**`--allow-missing` の削除条件**: #312（TASK-71.3）が `matrix.json` をコミットしたら、
+**`--allow-missing` の削除条件**: 実マトリクス `matrix.json` をコミットしたら、
 `ci.yml`・`Makefile` から `--allow-missing` を削除し、ファイル不在を fail-closed
 （exit 2）に戻すこと。
 

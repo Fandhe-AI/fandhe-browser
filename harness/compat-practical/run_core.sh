@@ -151,13 +151,6 @@ if [ "$got_ids" != "$want_ids" ]; then
   exit 1
 fi
 
-sha256_of() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | cut -d' ' -f1
-  else
-    shasum -a 256 "$1" | cut -d' ' -f1
-  fi
-}
 # コミットする実測にユーザー名を含むホームパスが入らないよう、リポジトリ配下ならリポ相対で記録する
 BIN_REC="$BIN_RESOLVED"
 case "$BIN_REC" in "$REPO_ROOT"/*) BIN_REC="${BIN_REC#"$REPO_ROOT"/}" ;; esac
