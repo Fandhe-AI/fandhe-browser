@@ -103,7 +103,7 @@ bash harness/wpt_subset_runner/fetch-wpt.sh   # jq・git・ネットワークが
   検証は `bash harness/wpt_subset_runner/fetch-wpt-self-test.sh`（ネットワーク不要。ローカルの一時 git リポジトリを
   使う自己テスト専用の差し替え口 `FETCH_WPT_SELF_TEST=1` は `file:///` の URL のみ受け付ける）で確認する
 - `wpt-work/subset.tsv`（1 行 `<harness>\t<file>`）を書き出す。Rust 側は JSON を読まない（新規依存を避けるため）
-- `file`・`dir` はパス規則（許可文字・`..` 禁止）で検証してから git へ渡す。スキーマ全体の検証は #278 の担当
+- `file`・`dir` はパス規則（許可文字・`..` 禁止）で検証してから git へ渡す。`wpt-subset.json` のスキーマ検証は `tests/subset_schema.rs`（#278）が担う
 
 ランナー（`wpt_subset_runner::runner`）の流れ: `parse_subset_tsv` → `run_entry` / `run_subset`。
 ファイルごとに新しい `JsRuntime` を作り、HTML の `<script>` を文書順に評価する
@@ -136,7 +136,15 @@ testharness 152 件は `Completed/Fail` 53 / 46・`Completed/NoResults` 3 / 10�
 実物の testharness.js は読み込めるが、`window`・`document` を要するテストは失敗する
 （偽の DOM で通さない方針。合格率は `report` の `WptReport` が集計する。#276）。
 
-テストは偽の WPT ツリー（一時ディレクトリ）で `tests/runner_subset.rs` が検証する。
+テストは偽の WPT ツリー（一時ディレクトリ）で `tests/runner_subset.rs`（ファイル単位の分類）が検証する。
+`tests/runner.rs`（TASK-101.6・#278）は、既知に合格・既知に失敗するダミー testharness ケースで
+TSV → 実行 → `WptReport` → JSON の経路を通し、合否とレポートを完全一致（golden）で固定する。
+`tests/subset_schema.rs` は `wpt-subset.json` を行走査で検証する（上限・`schemaVersion`・件数の一致・
+パス規則と一意性・`dir` の整合・`wptRevision` の形式）。JSON 型の厳密検証・`mappedFeatures` 要素・
+未知キーの検出は未検証（JSON パーサーの依存追加が必要なため）。
+実 WPT の取得（`fetch-wpt.sh`）は CI に組み込まない（ネットワーク依存で再現性が無く、WPT 本体を
+リポへ同梱しない方針のため）。ハーネスの回帰検出は上記ダミーケースのテストが `cargo test --workspace`
+で担う。
 
 ## プロファイル別実行（TASK-101.3・#275・PLUG-10・MS-8）
 

@@ -2,7 +2,8 @@
 # ハーネス用ツール crate。TASK-101.2.1（#553）では testharness.js が動く最小の
 # グローバル環境と結果の受け渡しだけを提供し、TASK-101.2.2（#554）が取得結果の実行・
 # 合否分類（runner）を足し、TASK-101.3（#275）がプロファイル別実行の指定を足す
-# #276 が合格率の集計・レポート出力（report）を足す。
+# #276 が合格率の集計・レポート出力（report）を足し、TASK-101.6（#278）がダミーケースの
+# 結合テスト（tests/runner.rs）とサブセット定義の契約テスト（tests/subset_schema.rs）を足す。
 #
 # 依存は `fandhe-browser-core` のみ（path 依存。外部 crate は追加しない）。
 # AGENTS.md「crate 間の許可依存」により js crate へは直接依存しない。
@@ -33,4 +34,9 @@ harness = false
 
 [[test]]
 name = "runner_subset"
+harness = false
+
+# TSV からレポート JSON までの一気通貫テスト（TASK-101.6）。同じ理由で `harness = false`。
+[[test]]
+name = "runner"
 harness = false
