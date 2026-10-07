@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "task": "TASK-100.6",
+  "behavior": "PLUG-8",
+  "method": "control (no cssom_profile) vs profiled (load Chrome+Safari) probes, same release build, alternating runs, median RSS; idle = after load with tables retained",
+  "trials": 5,
+  "strippedSymbols": true,
+  "control": {
+    "binarySizeBytes": 1344992,
+    "rssSamplesKib": [
+      3212,
+      3296,
+      3300,
+      3284,
+      3296
+    ],
+    "rssMedianKib": 3296
+  },
+  "profiled": {
+    "binarySizeBytes": 1402168,
+    "rssSamplesKib": [
+      3488,
+      3392,
+      3496,
+      3404,
+      3496
+    ],
+    "rssMedianKib": 3488
+  },
+  "delta": {
+    "binarySizeBytes": 57176,
+    "binarySizePercent": 4.25,
+    "rssKib": 192,
+    "rssMiB": 0.188
+  },
+  "limits": {
+    "binarySizePercent": 10,
+    "rssMiB": 1.2
+  },
+  "withinLimit": {
+    "binarySize": true,
+    "rss": true
+  },
+  "environment": {
+    "commit": "2119e371d14b",
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "os": "Linux",
+    "arch": "x86_64"
+  }
+}

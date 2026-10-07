@@ -600,6 +600,20 @@ measure-js-binary-size: ## JS エンジン構成別（既定 V8 / 軽量 boa / �
 		--package "$(BINARY_SIZE_PACKAGE)" \
 		$(if $(JS_BINARY_SIZE_STRIP),--strip)
 
+# CSSOM プロファイル読み込みのバイナリ増分・アイドル RSS 増分の計測（TASK-100.6・PLUG-8・Issue #270）。
+# release ビルドを伴う一度きりの記録で RSS がランナー差で揺れるため `ci` には含めない。
+# 例: make measure-cssom-profile-cost CSSOM_PROFILE_COST_ARGS="--strip --out benches/cssom_profile_cost/results/cssom-profile-cost-strip.json"
+CSSOM_PROFILE_COST_ARGS ?= --out benches/cssom_profile_cost/results/cssom-profile-cost.json
+
+.PHONY: measure-cssom-profile-cost
+measure-cssom-profile-cost: ## CSSOM プロファイル読み込みのバイナリ増分・アイドル RSS 増分を計測する（TASK-100.6・PLUG-8）
+	@command -v jq >/dev/null 2>&1 || { \
+		echo "NG: jq が未導入のため measure-cssom-profile-cost を実行できません" >&2; \
+		exit 1; \
+	}
+	bash benches/cssom_profile_cost/self-test.sh
+	bash benches/cssom_profile_cost.sh $(CSSOM_PROFILE_COST_ARGS)
+
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
 # --------------------------------------------------
