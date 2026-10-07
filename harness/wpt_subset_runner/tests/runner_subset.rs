@@ -14,6 +14,7 @@ use std::process::ExitCode;
 
 use fandhe_browser_core::{EngineKind, bundled_engines};
 use std::time::Duration;
+use wpt_subset_runner::WptReport;
 use wpt_subset_runner::runner::{
     LimitKind, RunLimits, RunOptions, SubsetEntry, WptProfile, run_entry, run_subset,
     run_subset_for_profiles,
@@ -380,6 +381,31 @@ fn run_cases(root: &Path, engine: Option<EngineKind>) {
     assert_eq!(runs[0].results, runs[1].results);
     // プロファイル未指定の従来経路と結果が一致する（従来挙動を変えていない）。
     assert_eq!(run_subset(&opts, &entries), runs[0].results);
+
+    // 合格率レポート（TASK-101.4・#276）。chrome / safari の双方が数値で出る。
+    let report = WptReport::from_runs(&runs, engine).expect("report");
+    assert_eq!(report.profiles.len(), 2);
+    for p in &report.profiles {
+        assert_eq!((p.total, p.executed, p.skipped()), (3, 2, 1));
+        if engine.is_some() {
+            assert_eq!((p.passed, p.outcome_count("completed")), (1, 2));
+            assert_eq!(p.pass_rate(), Some(0.5));
+        } else {
+            assert_eq!((p.passed, p.outcome_count("engineUnavailable")), (0, 2));
+            assert_eq!(p.pass_rate(), Some(0.0));
+        }
+    }
+    // TASK-100 配線後は、プロファイル間の集計差分の検証へ置き換える。
+    assert_eq!(report.profiles[0].passed, report.profiles[1].passed);
+    assert_eq!(report.unrunnable.total(), 1);
+    let json = report.to_json();
+    let engine_key = engine.map_or("none", |e| e.as_str());
+    assert!(
+        json.contains(&format!("\"engine\":\"{engine_key}\"")),
+        "{json}"
+    );
+    assert_eq!(json.matches("\"profile\":\"chrome\"").count(), 1);
+    assert_eq!(json.matches("\"profile\":\"safari\"").count(), 1);
 }
 
 fn main() -> ExitCode {
