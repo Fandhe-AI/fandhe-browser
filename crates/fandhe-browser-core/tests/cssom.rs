@@ -223,4 +223,10 @@ fn core_5_discarded_rules_do_not_affect_cascade() {
     assert!(flat(&deep).iter().all(|&(_, v)| v != "pink"));
     let outside = styles_of(&doc, &styles, "outside");
     assert!(flat(&outside).iter().all(|&(_, v)| v != "pink"));
+
+    // #teal は #x 外の span.c。`span`(0,0,1) に対し残存ルール `span.c`(0,1,1) が勝つ。
+    // このルールがカスケードから落ちると red になるため、残存ルールの寄与を値と由来で固定する。
+    let teal = styles_of(&doc, &styles, "teal");
+    assert_eq!(flat(&teal), vec![("color", "teal")]);
+    assert_eq!(origin(&teal, "color"), rule(1, 0, 0, 1, 1));
 }
