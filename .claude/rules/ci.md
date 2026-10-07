@@ -29,11 +29,11 @@ cargo test --workspace
   マトリクス内に実在する全ての類型（`cat` は `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`
   に一致する文字列に限る。lazy・table 等も含む）の動作率が閾値 70% 以上かを
   判定する。実マトリクス `harness/compat-practical/results/matrix.json`
-  （TASK-71.3・Issue #312 の `make_matrix.sh` が生成）が未コミットの間は `--allow-missing` を渡し、
-  ファイル不在時は `::warning::` を出して通過させる。実マトリクスのコミット時に
+  （TASK-71.3・Issue #312 が生成予定）が未導入の間は `--allow-missing` を渡し、
+  ファイル不在時は `::warning::` を出して通過させる。#312 の完了後は
   `--allow-missing` を外し fail-closed（ファイル不在は exit 2）に戻す。
   スキーマ契約・終了コードは `harness/compat-regression/README.md` を参照
-- 実マトリクスの生成（TASK-71.3・Issue #312）は `harness/compat-practical/make_matrix.sh`（`core_results.jsonl` と PoC-9 の Chromium 参照データ `reference/chromium_results.json` を `id` で突合。CI では `--validate-only` で入力の整合のみ検査）。実測は閾値 70% 未満（全体 15/22）のため `results/matrix.json` は**未コミット**で、`--allow-missing` は当面維持する（コミット時の扱いはオーナー判断。詳細は `harness/compat-practical/README.md`）
+- 実マトリクスの生成（TASK-71.3・Issue #312）は `harness/compat-practical/make_matrix.sh`（`core_results.jsonl` と PoC-9 の Chromium 参照データ `reference/chromium_results.json` を `id` で突合。CI では `--validate-only` で入力の整合のみ検査）。実測は閾値 70% 未満（全体 15/22）のため `results/matrix.json` は**未コミット**（`--allow-missing` の削除条件は上記のとおり変更しない。未達の扱いはオーナー判断。詳細は `harness/compat-practical/README.md`）
 - 実測ハーネス compat-practical の自己テスト（`MEAS-4`。TASK-71.1・TASK-71.2・TASK-71.3）は `make check-compat-practical`（`make ci` に含む。要 jq・node 22 以降）。CI では `compat-regression` ジョブ内で `harness/compat-practical/self-test.sh` を実行する。`run_core.sh` の自己テストは偽 CDP サーバー（`fake_cdp_server.mjs`）のみを使い、実バイナリ・ネットワークへは出ない
 - 許可外ライセンス（GPL/AGPL/LGPL/MPL-2.0・ライセンス未記載）を持つ canary を `cargo deny` が reject することを `make check-deny-license-reject` で検証する（TASK-9.1・REPAIR-8）
 - Puppeteer 接続試験ハーネスのオフライン自己テスト（`CDP-3`。TASK-45.2）は `make check-puppeteer-connect`（`make ci` に含む。要 node）。CI では `puppeteer-connect-selftest` ジョブ（3 OS）が `harness/puppeteer-connect/self-test.sh` を実行する。`stages.mjs` と Rust パーサーの契約テスト `cdp3_stages_mjs_result_line_satisfies_rust_contract`（`tests/puppeteer_contract.rs`。要 node）は `#[ignore]` で既定の `cargo test` から外れ、self-test.sh が `--ignored` 付きで実行する（0 件実行は fail-closed）
