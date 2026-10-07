@@ -55,8 +55,8 @@ fn plug8_embedded_profiles_load() {
     for p in BrowserProfile::ALL {
         let t = load_profile(p).expect("embedded data loads");
         assert_eq!(t.profile(), p);
-        assert_eq!(t.feature_count(), 112);
-        assert_eq!(t.property_count(), 261);
+        assert_eq!(t.feature_count(), 122);
+        assert_eq!(t.property_count(), 318);
         assert!(std::ptr::eq(t, load_profile(p).unwrap()));
     }
 }
@@ -92,7 +92,12 @@ fn plug8_safari_support() {
 fn plug8_unlisted_properties_pass_through() {
     for profile in BrowserProfile::ALL {
         let t = load_profile(profile).unwrap();
-        for p in ["width", "margin", "--custom-prop", "no-such-property", ""] {
+        for p in [
+            "--custom-prop",
+            "no-such-property",
+            "-webkit-text-size-adjust",
+            "",
+        ] {
             assert_eq!(t.property_support(p), PropertySupport::Unlisted, "{p}");
             assert!(t.is_supported(p));
         }
@@ -156,7 +161,7 @@ fn plug8_gate_chrome_and_safari_values() {
         chrome.property_support("text-size-adjust"),
         PropertySupport::Supported
     );
-    assert_eq!(chrome.property_support("width"), PropertySupport::Unlisted);
+    assert_eq!(chrome.property_support("width"), PropertySupport::Supported);
     assert!(!chrome.allows_property("speak"));
 
     let safari = profile_gate(Some(BrowserProfile::Safari)).expect("ok");
@@ -701,6 +706,74 @@ mod identity {
         assert_eq!(ua, expected_user_agent());
         for token in ["Mozilla", "Chrome", "Safari", "AppleWebKit", "Gecko"] {
             assert!(!ua.contains(token), "UA must not contain {token}: {ua}");
+        }
+    }
+}
+
+// ---- TASK-100.8（Issue #738）: 除外していた基本プロパティの再マッピング ----
+
+/// 再マッピングした基本プロパティ（`width`・`margin`・`overflow`・`gap` 等）が、Chrome / Safari の
+/// 両方で対応扱いとなり gating で除去されないことを具体値で固定する（`PLUG-8`・`MS-8`）。
+/// 以前は `anchor-positioning` 等のサブ機能 feature に誤割り当てされ Chrome で全ページから除去された。
+mod remap {
+    use fandhe_browser_core::cssom::{collect_document_styles, computed_style_in_document};
+    use fandhe_browser_core::cssom_profile::{PropertySupport, load_profile};
+    use fandhe_browser_core::{BrowserProfile, ParseOptions, parse_document, profile_gate};
+
+    #[test]
+    fn plug8_remap_basic_properties_are_supported_in_both_profiles() {
+        for profile in BrowserProfile::ALL {
+            let t = load_profile(profile).expect("embedded data loads");
+            for p in [
+                "width",
+                "height",
+                "margin",
+                "margin-top",
+                "overflow",
+                "overflow-x",
+                "gap",
+                "top",
+                "min-width",
+                "content",
+                "transition",
+                "outline",
+                "-webkit-user-select",
+            ] {
+                assert_eq!(t.property_support(p), PropertySupport::Supported, "{p}");
+            }
+        }
+    }
+
+    #[test]
+    fn plug8_remap_gating_keeps_basic_declarations_with_values() {
+        let html = "<style>p { width: 10px; margin: 4px; overflow: hidden; gap: 8px; height: 5px; transition: none }</style><p>x</p>";
+        let doc = parse_document(html, &ParseOptions::default())
+            .expect("parse")
+            .document;
+        let styles = collect_document_styles(&doc).expect("collect");
+        let p = doc
+            .descendants(doc.root())
+            .find(|&i| doc.local_name(i) == Some("p"))
+            .expect("p");
+        let style = computed_style_in_document(&doc, p, &styles).expect("computed");
+        for profile in BrowserProfile::ALL {
+            let g = profile_gate(Some(profile)).expect("gate").apply(&style);
+            assert!(g.removed().is_empty(), "{profile:?}");
+            assert_eq!(g.len(), style.len());
+            assert_eq!(g.get("width").expect("width").value(), "10px");
+            assert_eq!(g.get("margin").expect("margin").value(), "4px");
+            assert_eq!(g.get("overflow").expect("overflow").value(), "hidden");
+            assert_eq!(g.get("gap").expect("gap").value(), "8px");
+        }
+    }
+
+    #[test]
+    fn plug8_remap_text_size_adjust_prefixed_stays_unlisted() {
+        for profile in BrowserProfile::ALL {
+            let t = load_profile(profile).expect("embedded data loads");
+            for p in ["-webkit-text-size-adjust", "-ms-text-size-adjust"] {
+                assert_eq!(t.property_support(p), PropertySupport::Unlisted, "{p}");
+            }
         }
     }
 }
