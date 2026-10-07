@@ -490,16 +490,21 @@ ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-rende
 # 実測ハーネス compat-practical の自己テスト（TASK-71.1・MEAS-4。harness/compat-practical/README.md 参照）
 # --------------------------------------------------
 
-# オフラインのみ（curl はスタブ）。実ネットワークを使う実計測は README の手順で手動実行する。
+# オフラインのみ（curl はスタブ・run_core は偽 CDP サーバー。TASK-71.2）。実ネットワークを使う実計測は README の手順で手動実行する。
 # jq 未導入時は check-compat-regression と同じ方針で fail-closed。
 .PHONY: check-compat-practical
-check-compat-practical: ## 実測ハーネス（22 タスク定義・アクセス確認）の自己テストとスキーマ検証（MEAS-4）
+check-compat-practical: ## 実測ハーネス（22 タスク定義・アクセス確認・run_core 実行）の自己テストとスキーマ検証（MEAS-4）
 	@command -v jq >/dev/null 2>&1 || { \
 		echo "NG: jq が未導入のため check-compat-practical を実行できません" >&2; \
 		exit 1; \
 	}
+	@command -v node >/dev/null 2>&1 || { \
+		echo "NG: node(22 以降)が未導入のため check-compat-practical を実行できません" >&2; \
+		exit 1; \
+	}
 	bash harness/compat-practical/self-test.sh
 	bash harness/compat-practical/access_check.sh --validate-only
+	bash harness/compat-practical/run_core.sh --validate-only
 
 # --------------------------------------------------
 # 対象サイト群の動作率回帰チェック（TASK-9.2・REPAIR-8。harness/compat-regression/README.md 参照）

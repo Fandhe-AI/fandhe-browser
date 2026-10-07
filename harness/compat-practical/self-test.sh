@@ -368,5 +368,141 @@ expect_exit "access_check --bin missing" 2 bash "$CHECK" --bin "$WORK/nope" --ta
 expect_exit "access_check --bin ok" 0 env PATH="$STUB_DIR:$PATH" bash "$CHECK" --bin "$WORK/fakebin" --tasks "$WORK/net.json" --out "$WORK/out3.jsonl"
 expect_eq "$(jq -r 'select(.type=="meta") | .bin' "$WORK/out3.jsonl")" "$WORK/fakebin" "meta bin recorded"
 
+# --- run_core.sh（TASK-71.2・MEAS-4）。偽 CDP サーバー相手のオフラインテスト ---
+RUN_CORE="$SCRIPT_DIR/run_core.sh"
+FAKE="$SCRIPT_DIR/fake_cdp_server.mjs"
+FAKE_PIDS=()
+trap 'for p in ${FAKE_PIDS[@]+"${FAKE_PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done; rm -rf "$WORK"' EXIT
+
+# start_fake [<fake の追加引数>...]: 偽サーバーを起動して FAKE_PORT へポートを設定する（親シェルで実行すること）
+start_fake() {
+  local portfile="$WORK/fake.port.$RANDOM"
+  "$NODE_BIN" "$FAKE" "$@" >"$portfile" &
+  FAKE_PIDS+=("$!")
+  for _ in $(seq 1 50); do
+    [ -s "$portfile" ] && break
+    sleep 0.1
+  done
+  FAKE_PORT="$(tr -d '\r\n' <"$portfile")"
+}
+rc_task() { printf '{"id":"%s","cat":"%s","url":"%s","selector":"%s","kind":"%s"}' "$1" "$2" "$3" "$4" "$5"; }
+
+if ! type -P node >/dev/null 2>&1 || ! node -e 'process.exit(typeof WebSocket === "function" ? 0 : 1)'; then
+  echo "FAIL [run_core]: node with built-in WebSocket (Node 22+) is required" >&2
+  FAILURES=$((FAILURES + 1))
+else
+  # node が volta 等のシム（子プロセスを生む）でも kill が実体に届くよう、実体の絶対パスを使う
+  NODE_BIN="$(node -p 'process.execPath' | tr -d '\r\n')"
+  expect_exit "run_core validate-only" 0 bash "$RUN_CORE" --validate-only
+  expect_contains "$LAST_OUTPUT" "ok: 22 tasks validated" "run_core validate-only message"
+  expect_exit "run_core bad tasks" 2 bash "$RUN_CORE" --validate-only --tasks "$WORK/dup.json"
+  expect_exit "run_core task-timeout zero" 2 bash "$RUN_CORE" --validate-only --task-timeout 0
+  expect_exit "run_core task-timeout over" 2 bash "$RUN_CORE" --validate-only --task-timeout 121
+  expect_exit "run_core total-timeout over" 2 bash "$RUN_CORE" --validate-only --total-timeout 3601
+  expect_exit "run_core startup-timeout over" 2 bash "$RUN_CORE" --validate-only --startup-timeout 61
+  expect_exit "run_core unknown arg" 2 bash "$RUN_CORE" --bogus
+  expect_exit "run_core non-loopback endpoint" 2 bash "$RUN_CORE" --validate-only --endpoint http://example.com:9333
+  expect_exit "run_core https endpoint" 2 bash "$RUN_CORE" --validate-only --endpoint https://127.0.0.1:9333
+  expect_exit "run_core endpoint port range" 2 bash "$RUN_CORE" --validate-only --endpoint http://127.0.0.1:70000
+
+  start_fake
+  EP="http://127.0.0.1:$FAKE_PORT"
+  U=https://example.com
+  {
+    printf '[%s,' "$(rc_task t1 static "$U/a" h1 text)"
+    printf '%s,' "$(rc_task t2 static "$U/b" li texts)"
+    printf '%s,' "$(rc_task t3 form "$U/c" form form)"
+    printf '%s,' "$(rc_task t4 spa "$U/d" nomatch text)"
+    printf '%s,' "$(rc_task t5 spa "$U/e" emptytext text)"
+    printf '%s,' "$(rc_task t6 table "$U/f" unsupported texts)"
+    printf '%s,' "$(rc_task t7 table "$U/g" toolarge text)"
+    printf '%s,' "$(rc_task t8 static "$U/fetcherr" h1 text)"
+    printf '%s,' "$(rc_task t9 form "$U/h" emptyform form)"
+    printf '%s]\n' "$(rc_task t10 static "$U/i" ctl text)"
+  } >"$WORK/rc.json"
+  expect_exit "run_core synthetic" 0 bash "$RUN_CORE" --no-spawn --endpoint "$EP" --tasks "$WORK/rc.json" --out "$WORK/rc.out.jsonl"
+  expect_contains "$LAST_OUTPUT" "success=4/10" "run_core success count"
+  # 進捗出力にページ由来テキスト（::error:: 風）が出ない
+  expect_eq "$(printf '%s' "$LAST_OUTPUT" | grep -c '::error::' || true)" "0" "run_core progress has no page text"
+  rc_field() { jq -r --arg id "$1" "select(.type==\"result\" and .id==\$id) | .$2" "$WORK/rc.out.jsonl"; }
+  expect_eq "$(rc_field t1 success)/$(rc_field t1 reason)/$(rc_field t1 output_sample)" "true/null/Hello" "run_core text success"
+  expect_eq "$(rc_field t2 success)/$(rc_field t2 method)/$(rc_field t2 match_count)" "true/first_match/null" "run_core texts is first_match only"
+  expect_eq "$(rc_field t3 success)/$(rc_field t3 method)/$(rc_field t3 match_count)" "true/form_fields/2" "run_core form fields"
+  expect_eq "$(rc_field t4 success)/$(rc_field t4 reason)" "false/no_match" "run_core no_match"
+  expect_eq "$(rc_field t5 reason)" "empty_result" "run_core empty_result"
+  expect_eq "$(rc_field t6 reason)" "selector_unsupported" "run_core selector_unsupported"
+  expect_eq "$(rc_field t7 reason)" "document_too_large" "run_core document_too_large"
+  expect_eq "$(rc_field t8 reason)/$(rc_field t8 detail)" "fetch_error/net::ERR_FAILED" "run_core fetch_error"
+  expect_eq "$(rc_field t9 reason)/$(rc_field t9 match_count)" "empty_result/0" "run_core empty form"
+  expect_eq "$(rc_field t10 success)" "true" "run_core ctl text success"
+  # 制御文字の除去と 300 文字切り詰め
+  expect_eq "$(rc_field t10 output_sample | tr -d '\n' | wc -c | tr -d ' ')" "300" "run_core sample truncated to 300 chars"
+  expect_eq "$(jq -r 'select(.type=="result" and .id=="t10") | .output_sample | explode | any(. < 32 or . == 127)' "$WORK/rc.out.jsonl")" "false" "run_core sample has no control chars"
+  expect_eq "$(jq -c 'select(.type=="meta") | [.schema_version,.driver,.page_js_executed,.cdp_browser,.endpoint]' "$WORK/rc.out.jsonl")" \
+    "[1,\"cdp\",false,\"FakeCdp/0.0\",\"$EP\"]" "run_core meta"
+  expect_eq "$(jq -s '[.[] | select(.type=="meta")] | length' "$WORK/rc.out.jsonl")" "1" "run_core one meta line"
+
+  # 本物の tasks.json を流して 22 件・id 集合一致（AC1）と b5・d2・d3 の個別行（AC2）を確認する
+  expect_exit "run_core real tasks" 0 bash "$RUN_CORE" --no-spawn --endpoint "$EP" --out "$WORK/real.out.jsonl"
+  expect_eq "$(jq -s '[.[] | select(.type=="result")] | length' "$WORK/real.out.jsonl")" "22" "run_core 22 results"
+  expect_eq "$(jq -c '[.[].id] | sort' "$TASKS")" "$(jq -sc '[.[] | select(.type=="result") | .id] | sort' "$WORK/real.out.jsonl")" "run_core ids match tasks"
+  expect_eq "$(jq -sc '[.[] | select(.type=="result" and (.id=="b5" or .id=="d2" or .id=="d3")) | .id]' "$WORK/real.out.jsonl")" '["b5","d2","d3"]' "run_core b5 d2 d3 rows"
+  expect_eq "$(jq -r 'select(.type=="meta") | .tasks_sha256' "$WORK/real.out.jsonl" | tr -d '\n' | wc -c | tr -d ' ')" "64" "run_core tasks_sha256 recorded"
+
+  # 期限: 応答しないタスクは timeout、全体期限に達したタスク（実行中を含む）以降は blocked
+  {
+    printf '[%s,' "$(rc_task h1 static "$U/hang" h1 text)"
+    printf '%s]\n' "$(rc_task h2 static "$U/ok" h1 text)"
+  } >"$WORK/hang.json"
+  expect_exit "run_core task timeout" 0 bash "$RUN_CORE" --no-spawn --endpoint "$EP" --tasks "$WORK/hang.json" --out "$WORK/hang.out.jsonl" --task-timeout 1
+  expect_eq "$(jq -sc '[.[] | select(.type=="result") | .reason]' "$WORK/hang.out.jsonl")" '["timeout",null]' "run_core timeout then continue"
+  expect_exit "run_core total timeout" 0 bash "$RUN_CORE" --no-spawn --endpoint "$EP" --tasks "$WORK/hang.json" --out "$WORK/hang2.out.jsonl" --task-timeout 5 --total-timeout 1
+  expect_eq "$(jq -sc '[.[] | select(.type=="result") | .reason]' "$WORK/hang2.out.jsonl")" '["blocked","blocked"]' "run_core blocked after total timeout"
+
+  # 出力の原子性: 失敗時は既存の --out を壊さない
+  printf 'KEEP\n' >"$WORK/keep.jsonl"
+  expect_exit "run_core no endpoint" 2 bash "$RUN_CORE" --no-spawn --endpoint "http://127.0.0.1:1" --out "$WORK/keep.jsonl"
+  expect_eq "$(cat "$WORK/keep.jsonl")" "KEEP" "run_core keeps existing out on failure"
+
+  # webSocketDebuggerUrl のホスト/ポートが endpoint と一致しなければ接続しない
+  start_fake --ws-host-mismatch
+  expect_exit "run_core ws mismatch" 2 bash "$RUN_CORE" --no-spawn --endpoint "http://127.0.0.1:$FAKE_PORT" --out "$WORK/mm.jsonl"
+  expect_contains "$LAST_OUTPUT" "does not match endpoint" "run_core ws mismatch message"
+
+  # 起動経路（スタブバイナリ）。Windows は起動不可（固定の exit 2）
+  RC_PORT="$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})' | tr -d '\r\n')"
+  STUB_BIN="$WORK/stubbin"
+  mkdir -p "$STUB_BIN"
+  cat >"$STUB_BIN/ok" <<STUB
+#!/bin/sh
+echo "\$XDG_DATA_HOME" >"$WORK/profile.path"
+exec "$NODE_BIN" "$FAKE" --port $RC_PORT
+STUB
+  printf '#!/bin/sh\nsleep 30\n' >"$STUB_BIN/never"
+  printf '#!/bin/sh\necho boom >&2\nexit 3\n' >"$STUB_BIN/dies"
+  chmod +x "$STUB_BIN/ok" "$STUB_BIN/never" "$STUB_BIN/dies"
+  case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*)
+      expect_exit "run_core spawn unsupported on windows" 2 bash "$RUN_CORE" --bin "$STUB_BIN/ok" --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp.jsonl"
+      expect_contains "$LAST_OUTPUT" "not supported on Windows" "run_core windows message"
+      ;;
+    *)
+      expect_exit "run_core spawn rejects non-9333 port" 2 bash "$RUN_CORE" --bin "$STUB_BIN/ok" --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp0.jsonl"
+      expect_contains "$LAST_OUTPUT" "spawn mode supports only" "run_core spawn port message"
+      expect_exit "run_core spawn" 0 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/ok" --endpoint "http://127.0.0.1:$RC_PORT" --tasks "$WORK/rc.json" --out "$WORK/sp.jsonl"
+      expect_eq "$(jq -r 'select(.type=="meta") | .bin' "$WORK/sp.jsonl")" "$STUB_BIN/ok" "run_core meta bin"
+      expect_eq "$([ -d "$(cat "$WORK/profile.path")" ] && echo present || echo removed)" "removed" "run_core isolated profile removed"
+      expect_exit "run_core child stopped" 2 bash "$RUN_CORE" --no-spawn --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp2.jsonl"
+      expect_exit "run_core startup timeout" 2 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/never" --endpoint "http://127.0.0.1:$RC_PORT" --startup-timeout 1 --out "$WORK/sp3.jsonl"
+      expect_contains "$LAST_OUTPUT" "did not become ready" "run_core startup timeout message"
+      expect_exit "run_core binary dies" 2 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/dies" --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp4.jsonl"
+      expect_contains "$LAST_OUTPUT" "exited before" "run_core binary dies message"
+      start_fake --port "$RC_PORT"
+      expect_exit "run_core endpoint already responding" 2 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/ok" --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp5.jsonl"
+      expect_contains "$LAST_OUTPUT" "already responding" "run_core already responding message"
+      ;;
+  esac
+fi
+
 echo "cases=$CASES failures=$FAILURES"
 [ "$FAILURES" -eq 0 ]
