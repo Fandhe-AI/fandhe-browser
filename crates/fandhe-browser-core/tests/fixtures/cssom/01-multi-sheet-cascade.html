@@ -1,0 +1,24 @@
+<!doctype html>
+<!-- CORE-5 / TASK-105.8: 複数 <style> が同一 property を競合させる文書。 -->
+<html>
+<head>
+    <style>
+        p { color: red; margin: 0 }
+        .note { font-size: 10px }
+        #lead { line-height: 1 }
+    </style>
+    <style>
+        p { color: green }
+        .note { font-size: 12px; padding: 2px }
+        p { line-height: 2 }
+    </style>
+    <style>
+        .note { color: blue; font-size: 14px }
+    </style>
+</head>
+<body>
+    <p id="lead" class="note">lead</p>
+    <p id="plain">plain</p>
+    <div id="other">other</div>
+</body>
+</html>

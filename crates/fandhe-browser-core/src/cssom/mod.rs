@@ -15,10 +15,7 @@
 //! カスケード解決と computed style API [`cascade`] / [`computed_style`]（TASK-105.6・#260）、
 //! 外部入力の安全性検証（TASK-105.7・#261。各入口の上限は確保前に判定し、文書全体の累積上限
 //! [`MAX_DOCUMENT_STYLE_BYTES`] / [`MAX_DOCUMENT_STYLE_RULES`] と上限違反スタイル源の
-//! 源単位 skip を含む）まで。
-//! 以下は未実装（REPAIR-3: 実装済みを装わない）。
-//!
-//! - 結合テスト（#262）
+//! 源単位 skip を含む）、結合テスト（TASK-105.8・#262。`tests/cssom.rs`）まで。
 
 mod computed;
 mod declaration;
