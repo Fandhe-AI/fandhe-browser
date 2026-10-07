@@ -50,6 +50,7 @@
 //! - 文字列中の改行で文字列を打ち切る CSS Syntax のエラー回復（現状は EOF まで文字列扱い）
 //! - 括弧の種類を区別した対応づけ（単一カウンタのため `(` を `}` で閉じても深さが戻る）
 
+use std::collections::{HashMap, HashSet};
 use std::iter::Peekable;
 use std::str::CharIndices;
 
@@ -563,6 +564,10 @@ pub struct DocumentStyles {
     inline_styles: Vec<InlineStyle>,
     skipped: Vec<SkippedStyleSource>,
     dropped_skipped: usize,
+    /// ノード → `inline_styles` 添字の索引（要素ごとの検索を O(1) にする）。
+    inline_index: HashMap<NodeId, usize>,
+    /// 記録上限に関係なく、捨てた `style` 属性を持つ要素の集合（採否判定用）。
+    skipped_inline_nodes: HashSet<NodeId>,
 }
 
 impl DocumentStyles {
@@ -586,7 +591,29 @@ impl DocumentStyles {
         self.dropped_skipped
     }
 
+    /// `node` の収集済み inline 宣言（採用されなかった・属性なしは `None`）。平均 O(1)。
+    pub fn inline_declarations_for(&self, node: NodeId) -> Option<&[Declaration]> {
+        self.inline_index
+            .get(&node)
+            .and_then(|&i| self.inline_styles.get(i))
+            .map(|i| i.declarations())
+    }
+
+    /// `node` の `style` 属性が上限違反で捨てられたか。記録上限
+    /// （[`MAX_SKIPPED_STYLE_SOURCES`]）を超えた分も含めて判定できる。平均 O(1)。
+    pub fn is_inline_skipped(&self, node: NodeId) -> bool {
+        self.skipped_inline_nodes.contains(&node)
+    }
+
+    fn push_inline(&mut self, node: NodeId, declarations: Vec<Declaration>) {
+        self.inline_index.insert(node, self.inline_styles.len());
+        self.inline_styles.push(InlineStyle { node, declarations });
+    }
+
     fn push_skipped(&mut self, node: NodeId, kind: StyleSourceKind) {
+        if kind == StyleSourceKind::InlineStyle {
+            self.skipped_inline_nodes.insert(node);
+        }
         if self.skipped.len() >= MAX_SKIPPED_STYLE_SOURCES {
             self.dropped_skipped = self.dropped_skipped.saturating_add(1);
         } else {
@@ -754,10 +781,7 @@ pub fn collect_document_styles(document: &Document) -> Result<DocumentStyles> {
                 match parse_declarations(value) {
                     Ok(declarations) => {
                         if budget.try_add_bytes(value.len()).is_ok() {
-                            out.inline_styles.push(InlineStyle {
-                                node: id,
-                                declarations,
-                            });
+                            out.push_inline(id, declarations);
                         } else {
                             out.push_skipped(id, StyleSourceKind::InlineStyle);
                         }
@@ -1242,8 +1266,9 @@ mod tests {
             "a{}".repeat(MAX_RULES_PER_STYLESHEET),
             " ".repeat(3_500_000)
         );
-        // 5 枚目はルール数超過で捨てられる（バイトは残り予算内）。
-        let over = format!("<style>{}</style>", pad(2_000_000));
+        // 5 枚目はルール数超過で捨てられる（バイトは残り予算内）。捨てた分を誤って
+        // バイト予算へ加算すると後続の inline（500KB）が予算を超えて捨てられ、退行を検出できる。
+        let over = format!("<style>{}</style>", pad(2_500_000));
         let inline = format!("<p style=\"color:red;{}\">x</p>", " ".repeat(500_000));
         let html = format!("{}{}{}", full.repeat(4), over, inline);
         let styles = collect_document_styles(&doc_of(&html)).expect("must collect");
@@ -1271,5 +1296,7 @@ mod tests {
         }
         assert_eq!(d.skipped_sources().len(), MAX_SKIPPED_STYLE_SOURCES);
         assert_eq!(d.dropped_skipped_sources(), 3);
+        // 記録上限を超えた分も採否判定できる。
+        assert!(d.is_inline_skipped(node));
     }
 }

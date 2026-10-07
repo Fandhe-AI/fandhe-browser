@@ -35,8 +35,8 @@ use crate::dom::{Document, NodeId};
 use crate::error::{Error, Result};
 
 use super::{
-    Declaration, DocumentStyles, Importance, MatchedRule, Specificity, StyleSourceKind, Stylesheet,
-    match_rules, parse_style_attribute,
+    Declaration, DocumentStyles, Importance, MatchedRule, Specificity, Stylesheet, match_rules,
+    parse_style_attribute,
 };
 
 /// 1 回の [`computed_style`] が処理するカスケード対象宣言（マッチしたルールの宣言と inline 宣言の合計）の上限。
@@ -270,16 +270,8 @@ pub fn computed_style_in_document(
             .iter()
             .map(|s| s.parsed().stylesheet()),
     )?;
-    let inline: &[Declaration] = styles
-        .inline_styles()
-        .iter()
-        .find(|i| i.node() == element)
-        .map(|i| i.declarations())
-        .unwrap_or(&[]);
-    let inline_skipped = styles
-        .skipped_sources()
-        .iter()
-        .any(|s| s.node() == element && s.kind() == StyleSourceKind::InlineStyle);
+    let inline: &[Declaration] = styles.inline_declarations_for(element).unwrap_or(&[]);
+    let inline_skipped = styles.is_inline_skipped(element);
     let mut style = cascade(&matched, inline)?;
     style.inline_skipped = inline_skipped;
     Ok(style)
@@ -348,6 +340,31 @@ mod tests {
         // 収集結果を使わない単体入口は属性を再解析する（従来契約）。
         let legacy = computed_style(&d, p, std::iter::empty::<&Stylesheet>()).expect("ok");
         assert_eq!(legacy.get("color").map(|c| c.value()), Some("red"));
+    }
+
+    /// CORE-5（TASK-105.7）: skip 記録の上限（256 件）を超えた後の inline も捨てた扱いになる。
+    #[test]
+    fn core_5_inline_skipped_is_detected_beyond_record_cap() {
+        let n = super::super::stylesheet::MAX_SKIPPED_STYLE_SOURCES + 10;
+        let html = format!(
+            "{}{}",
+            "<style></style>".repeat(super::super::stylesheet::MAX_DOCUMENT_STYLE_SOURCES),
+            "<p style=\"color:red\">a</p>".repeat(n)
+        );
+        let d = doc(&html);
+        let styles = super::super::collect_document_styles(&d).expect("must collect");
+        assert_eq!(
+            styles.skipped_sources().len(),
+            super::super::stylesheet::MAX_SKIPPED_STYLE_SOURCES
+        );
+        let last = d
+            .descendants(d.root())
+            .filter(|&i| d.is_element(i) && d.attribute(i, "style").is_some())
+            .last()
+            .expect("p");
+        let s = computed_style_in_document(&d, last, &styles).expect("ok");
+        assert!(s.inline_skipped());
+        assert!(s.get("color").is_none());
     }
 
     /// CORE-5: 収集済みの inline と `<style>` はそのままカスケードされる。
