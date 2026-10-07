@@ -1,0 +1,29 @@
+<!doctype html>
+<!-- CORE-5 / TASK-105.8: セレクタリスト・結合子と、捨てられるルールが混在する文書。 -->
+<html>
+<head>
+    <style>
+        span, #x span, div > span { color: red }
+        div span { margin: 1px }
+        div > span.c { padding: 1px }
+        a[href] { top: 1px }
+        a[href="u"] { left: 2px }
+    </style>
+    <style>
+        ::: broken { color: pink }
+        p:hover { color: pink }
+        @media (min-width: 1px) { span { color: pink; width: 1px } }
+        span.c { color: teal }
+        div * { color: pink }
+    </style>
+</head>
+<body>
+    <div id="x">
+        <p><span id="deep" class="c">deep</span></p>
+        <span id="direct">direct</span>
+        <a id="link" href="u">l</a>
+    </div>
+    <span id="outside">outside</span>
+    <em id="bare">bare</em>
+</body>
+</html>

@@ -1,0 +1,18 @@
+<!doctype html>
+<!-- CORE-5 / TASK-105.8: !important と style 属性（inline）の優先順位。 -->
+<html>
+<head>
+    <style>
+        p { color: red !important; margin: 1px }
+        #a { top: 1px; left: 1px !important; margin: 2px }
+    </style>
+    <style>
+        #a { color: blue; width: 10px !important }
+        p.k { margin: 3px; top: 5px }
+    </style>
+</head>
+<body>
+    <p id="a" class="k" style="margin: 9px; top: 9px; width: 99px !important; left: 99px !important">a</p>
+    <p id="b" class="k" style="color: black">b</p>
+</body>
+</html>
