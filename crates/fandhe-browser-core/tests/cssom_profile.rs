@@ -554,8 +554,14 @@ mod diff {
 ///   実装時に本節へ JS 評価ベースの検証を追加すること。
 /// - cdp の `/json/version`・`Browser.getVersion` は cdp crate 側の範囲で、本節の対象外。
 ///
-/// `FetchOptions` はプロファイルを受け取らないため、本テストは現状では「変化し得ない」
-/// ことの確認であり、将来 UA がプロファイル依存になる配線が入った場合に落ちる tripwire である。
+/// 検証範囲の限定（実装済みを装わない。REPAIR-3）:
+/// `FetchOptions` / `Fetcher` はプロファイル（`ProfileGate`・`BrowserProfile`）を受け取らず、
+/// 「プロファイル選択から fetch まで」を通る経路は現状存在しない。よって本節は
+/// 「gate を適用・生成した状態でも、プロファイル情報を持たない `Fetcher` が送る UA は
+/// 固定値のまま」であることの確認に留まり、プロファイル経由の fetch 経路の UA は検証していない。
+/// 将来その配線（例: `FetchOptions` へのプロファイル受け渡し）が入った場合は、
+/// その経路を通して UA を検証するテストを本節へ追加すること（`sent_user_agent` は
+/// 現状プロファイル非依存の `Fetcher` を使う）。
 mod identity {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -647,13 +653,13 @@ mod identity {
     }
 
     #[tokio::test]
-    async fn plug8_identity_user_agent_is_fixed_without_profile() {
+    async fn plug8_identity_profile_less_fetcher_user_agent_is_fixed_value() {
         let _gate = profile_gate(None).expect("None は常に成功する");
         assert_eq!(sent_user_agent().await, expected_user_agent());
     }
 
     #[tokio::test]
-    async fn plug8_identity_user_agent_unchanged_by_profile() {
+    async fn plug8_identity_profile_less_fetcher_user_agent_unaffected_by_gate_apply() {
         let mut seen = Vec::new();
         let mut removed = Vec::new();
         for profile in [
@@ -672,7 +678,7 @@ mod identity {
     }
 
     #[tokio::test]
-    async fn plug8_identity_user_agent_unchanged_by_profile_name() {
+    async fn plug8_identity_profile_less_fetcher_user_agent_unaffected_by_gate_name_resolution() {
         for name in [None, Some("chrome"), Some("safari")] {
             profile_gate_from_name(name).expect("既知の名前は成功する");
             assert_eq!(sent_user_agent().await, expected_user_agent());
@@ -685,7 +691,7 @@ mod identity {
     }
 
     #[tokio::test]
-    async fn plug8_identity_user_agent_does_not_impersonate_browsers() {
+    async fn plug8_identity_profile_less_fetcher_user_agent_does_not_impersonate_browsers() {
         let _gate = profile_gate(Some(BrowserProfile::Chrome)).expect("gate");
         let ua = sent_user_agent().await;
         assert_eq!(ua, expected_user_agent());
