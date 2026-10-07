@@ -540,3 +540,157 @@ mod diff {
         assert_eq!(safari_only, SAFARI_ONLY);
     }
 }
+// ---- TASK-100.7（Issue #271）: 識別面の非変更 ----
+
+/// CSSOM プロファイル（Chrome / Safari）の gating が識別面を変えないことの回帰テスト
+/// （TASK-100.7・`PLUG-8`・線引きは `SEC-1`・`SEC-2`・MS-8）。
+///
+/// プロファイルは「CSS 機能の有無の再現」だけが対象で、UA 文字列・フィンガープリントの
+/// 偽装は対象外（`.claude/rules/security.md`）。core が現に出力する唯一の識別面は
+/// `Fetcher` が送る HTTP `User-Agent` ヘッダなので、これを検証対象とする。
+///
+/// 未検証の範囲（実装済みを装わない。REPAIR-3）:
+/// - `navigator.userAgent` は JS グローバル `navigator` が未実装のため検証できない。
+///   実装時に本節へ JS 評価ベースの検証を追加すること。
+/// - cdp の `/json/version`・`Browser.getVersion` は cdp crate 側の範囲で、本節の対象外。
+///
+/// `FetchOptions` はプロファイルを受け取らないため、本テストは現状では「変化し得ない」
+/// ことの確認であり、将来 UA がプロファイル依存になる配線が入った場合に落ちる tripwire である。
+mod identity {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use fandhe_browser_core::cssom::{collect_document_styles, computed_style_in_document};
+    use fandhe_browser_core::{
+        BrowserProfile, Error, FetchOptions, Fetcher, ParseOptions, parse_document, profile_gate,
+        profile_gate_from_name,
+    };
+
+    /// ヘッダ読み取りの上限（無制限バッファ確保を避ける）。
+    const MAX_HEAD_BYTES: usize = 8192;
+
+    /// 現行の識別面の期待値（`Fetcher::new` が固定設定する値）。
+    fn expected_user_agent() -> String {
+        format!("fandhe-browser/{}", env!("CARGO_PKG_VERSION"))
+    }
+
+    /// 受信した `User-Agent` ヘッダ値を channel へ送り、空の 200 を返す
+    /// ループバック専用サーバーを起動する。
+    fn spawn_ua_capture_server() -> (u16, mpsc::Receiver<Option<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let port = listener.local_addr().expect("local_addr").port();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 512];
+                while buf.len() < MAX_HEAD_BYTES && !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(chunk.get(..n).unwrap_or(&[])),
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).into_owned();
+                let ua = head.split("\r\n").skip(1).find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("user-agent")
+                        .then(|| value.trim().to_string())
+                });
+                let _ = tx.send(ua);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        (port, rx)
+    }
+
+    /// ループバックへ 1 回 GET し、サーバーが受け取った `User-Agent` を返す。
+    async fn sent_user_agent() -> String {
+        let (port, rx) = spawn_ua_capture_server();
+        let options = FetchOptions::new().with_allow_private_network_access(true);
+        let fetcher = Fetcher::new(options).expect("Fetcher::new");
+        let resp = fetcher
+            .get(&format!("http://127.0.0.1:{port}/"))
+            .await
+            .expect("get");
+        assert_eq!(resp.status(), 200);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("server must receive request")
+            .expect("User-Agent header must be present")
+    }
+
+    /// gate を実際に適用し、除去されたプロパティ名を返す（gate が効いていることの確認用）。
+    fn removed_names(profile: Option<BrowserProfile>) -> Vec<String> {
+        let doc = parse_document(
+            r#"<p style="speak:none;text-size-adjust:none;width:1px">x</p>"#,
+            &ParseOptions::default(),
+        )
+        .expect("parse")
+        .document;
+        let styles = collect_document_styles(&doc).expect("collect");
+        let p = doc
+            .descendants(doc.root())
+            .find(|&i| doc.local_name(i) == Some("p"))
+            .expect("p");
+        let style = computed_style_in_document(&doc, p, &styles).expect("computed");
+        let gate = profile_gate(profile).expect("gate");
+        gate.apply(&style)
+            .removed()
+            .iter()
+            .map(|d| d.property().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn plug8_identity_user_agent_is_fixed_without_profile() {
+        let _gate = profile_gate(None).expect("None は常に成功する");
+        assert_eq!(sent_user_agent().await, expected_user_agent());
+    }
+
+    #[tokio::test]
+    async fn plug8_identity_user_agent_unchanged_by_profile() {
+        let mut seen = Vec::new();
+        let mut removed = Vec::new();
+        for profile in [
+            None,
+            Some(BrowserProfile::Chrome),
+            Some(BrowserProfile::Safari),
+        ] {
+            removed.push(removed_names(profile));
+            seen.push(sent_user_agent().await);
+        }
+        assert_eq!(removed[0], Vec::<String>::new());
+        assert_eq!(removed[1], ["speak"]);
+        assert_eq!(removed[2], ["speak", "text-size-adjust"]);
+        let expected = expected_user_agent();
+        assert_eq!(seen, [expected.clone(), expected.clone(), expected]);
+    }
+
+    #[tokio::test]
+    async fn plug8_identity_user_agent_unchanged_by_profile_name() {
+        for name in [None, Some("chrome"), Some("safari")] {
+            profile_gate_from_name(name).expect("既知の名前は成功する");
+            assert_eq!(sent_user_agent().await, expected_user_agent());
+        }
+        assert!(matches!(
+            profile_gate_from_name(Some("firefox")),
+            Err(Error::BrowserProfileName(_))
+        ));
+        assert_eq!(sent_user_agent().await, expected_user_agent());
+    }
+
+    #[tokio::test]
+    async fn plug8_identity_user_agent_does_not_impersonate_browsers() {
+        let _gate = profile_gate(Some(BrowserProfile::Chrome)).expect("gate");
+        let ua = sent_user_agent().await;
+        assert_eq!(ua, expected_user_agent());
+        for token in ["Mozilla", "Chrome", "Safari", "AppleWebKit", "Gecko"] {
+            assert!(!ua.contains(token), "UA must not contain {token}: {ua}");
+        }
+    }
+}
