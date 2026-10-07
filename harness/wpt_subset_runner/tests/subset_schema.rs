@@ -202,8 +202,13 @@ impl Syntax<'_> {
         if self.b.get(self.i) == Some(&b'-') {
             self.i += 1;
         }
-        if !self.digits() {
-            return Err(format!("bad number at {start}"));
+        // RFC 8259: 整数部は `0` 単独、または 1-9 始まりの数字列（先頭ゼロは不可）。
+        match self.b.get(self.i) {
+            Some(b'0') => self.i += 1,
+            Some(b'1'..=b'9') => {
+                self.digits();
+            }
+            _ => return Err(format!("bad number at {start}")),
         }
         if self.b.get(self.i) == Some(&b'.') {
             self.i += 1;
@@ -320,6 +325,11 @@ fn plug_10_syntax_validator_rejects_broken_json() {
     assert!(validate_json_syntax(&format!("{SUBSET_JSON} x")).is_err());
     assert!(validate_json_syntax("{\"a\": [1, 2,]}").is_err());
     assert!(validate_json_syntax("{\"a\": [1, {\"b\": null}], \"c\": -1.5e3}").is_ok());
+    // 先頭ゼロの数値は RFC 8259 で無効。`0` 単独・`0.5` は有効。
+    assert!(validate_json_syntax("[01]").is_err());
+    assert!(validate_json_syntax("[-01]").is_err());
+    assert!(validate_json_syntax("[00]").is_err());
+    assert!(validate_json_syntax("[0, -0, 0.5, 10, 0e1]").is_ok());
 }
 
 #[test]
