@@ -39,8 +39,8 @@
       "sinceVersion": "77"
     },
     "anchor-positioning": {
-      "supported": false,
-      "sinceVersion": null
+      "supported": true,
+      "sinceVersion": "125"
     },
     "animations-css": {
       "supported": true,

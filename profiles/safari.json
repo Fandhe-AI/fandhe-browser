@@ -315,16 +315,16 @@
       "sinceVersion": "7"
     },
     "overscroll-behavior": {
-      "supported": false,
-      "sinceVersion": null
+      "supported": true,
+      "sinceVersion": "16"
     },
     "padding": {
       "supported": true,
       "sinceVersion": "1"
     },
     "page-break-aliases": {
-      "supported": false,
-      "sinceVersion": null
+      "supported": true,
+      "sinceVersion": "1"
     },
     "pointer-events": {
       "supported": true,
@@ -435,8 +435,8 @@
       "sinceVersion": "9"
     },
     "user-select": {
-      "supported": false,
-      "sinceVersion": null
+      "supported": true,
+      "sinceVersion": "3"
     },
     "vertical-align": {
       "supported": true,

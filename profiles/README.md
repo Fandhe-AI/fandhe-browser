@@ -1,7 +1,7 @@
 # profiles
 
 CSSOM 層の feature gating（`--profile chrome|safari`）が参照する、ブラウザ別の CSS 機能対応可否データ。
-TASK-100.1（Issue #265）・`PLUG-8` に対応する。
+TASK-100.1（Issue #265）・`PLUG-8`・`MS-8` に対応する。
 
 Rust 側の読み込み・照会 API・gating 処理は後続（TASK-100.2〜100.4）で実装する。
 本ディレクトリはデータの配置のみを担う。
@@ -47,11 +47,13 @@ Compatibility data derived from caniuse.com (CC-BY-4.0).
 
 ## 生成手順
 
-入力は PoC-16 の生成物 `map-result.json`（`docs/spec/03-poc/browser-behavior-profile/proto/`。元スクリプトは `build_profiles.mjs`・`build_gating_table.mjs`）。
+入力は PoC-16（`PLUG-8`・TASK-100.1・`MS-8`）の生成物 `map-result.json`（`docs/spec/03-poc/browser-behavior-profile/proto/`。元スクリプトは `build_profiles.mjs`・`build_gating_table.mjs`）。
 `b(CSSOM)` 層の feature 112 件と、プロパティ対応 320 件から下記 47 件を除いたものを出力した。
 ビルド・テストは `docs/spec` を読まない（本ディレクトリの JSON のみを参照する）。
 
 ## キュレーション記録
+
+（`PLUG-8`・TASK-100.1・`MS-8`）
 
 PoC のプロパティ → feature 対応は、`css.properties.<prop>.<サブ値>` 形式の compat key でも最初に見つけた feature をプロパティ全体の所属としている。
 そのまま使うと `width`・`margin` 等が `anchor-positioning`（Chrome 非対応）扱いとなり全ページから除去されるため、次の 47 件を除外した。
@@ -66,10 +68,15 @@ PoC のプロパティ → feature 対応は、`css.properties.<prop>.<サブ値
 
 維持した非対応エントリ（プロパティ名そのものが feature の本体）:
 
-- Chrome 非対応: `hanging-punctuation`・`position-area`・`speak`
-- Safari 非対応: `interpolate-size`・`overscroll-behavior-y`・`page-break-after`・`page-break-before`・`page-break-inside`・`speak`・`text-size-adjust`・`user-select`
+- Chrome 非対応: `hanging-punctuation`・`speak`
+- Safari 非対応: `interpolate-size`・`speak`・`text-size-adjust`
 
-出典値そのもの（例: web-features 3.39.0 が Chrome の anchor-positioning を非対応とする点）は改変していない。
+出典値の手動補正（実ブラウザの対応状況に合わせ、gating で有効な宣言を除去しないため）:
+
+- Chrome `anchor-positioning`: 非対応から対応（125）へ。`position-area` が除去されるのを防ぐ
+- Safari `overscroll-behavior`（`overscroll-behavior-y` を含む）: 対応（16）
+- Safari `page-break-aliases`（`page-break-*`）: 対応（1）
+- Safari `user-select`: 対応（3。`-webkit-` 接頭辞付きでの対応を含む。`sinceVersion` は接頭辞付きの初出）
 
 ## 件数・カバレッジ
 
