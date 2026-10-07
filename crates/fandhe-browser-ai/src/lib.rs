@@ -86,11 +86,13 @@
 //!   Issue #224）。cli への合成も実装済み（TASK-19.3・Issue #225。`default_router_factories`）。結合テスト（TASK-19.4・Issue #226）は cli の `server.rs` テストで実装済み
 //! - プラグインレジストリ（プロセス分離・stdio 経由の外部プラグイン呼び出し。
 //!   動的ライブラリの実行時ロードは行わない方針。security.md 参照。
-//!   `PLUG-2`、`TASK-92`、`MS-9`）
+//!   `PLUG-2`、`TASK-92`、`MS-9`）。マニフェスト型は実装済み（TASK-92.1・Issue #353。
+//!   [`plugin_api`]）。レジストリ・エンドポイントは未実装（TASK-92.2〜92.4）
 
 pub mod api;
 pub mod compress_table;
 pub mod data_leaf;
+pub mod plugin_api;
 pub mod retention;
 pub mod snapshot;
 
