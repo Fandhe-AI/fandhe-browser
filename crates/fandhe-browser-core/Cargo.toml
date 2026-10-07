@@ -100,3 +100,14 @@ required-features = ["js-boa"]
 [[test]]
 name = "js_worker_hook"
 harness = false
+
+# TASK-100.6・Issue #270・`PLUG-8`: Chrome/Safari プロファイル読み込みのバイナリ増分・
+# アイドル RSS 増分を測る計測専用プローブ（control は cssom_profile 非参照・profiled は読み込みあり）。
+# 呼び出し元は benches/cssom_profile_cost.sh。出荷物ではない。
+[[example]]
+name = "cssom_profile_cost_control"
+path = "../../benches/cssom_profile_cost/control.rs"
+
+[[example]]
+name = "cssom_profile_cost_profiled"
+path = "../../benches/cssom_profile_cost/profiled.rs"
