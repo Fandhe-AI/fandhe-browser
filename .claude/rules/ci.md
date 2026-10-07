@@ -33,6 +33,7 @@ cargo test --workspace
   ファイル不在時は `::warning::` を出して通過させる。#312 の完了後は
   `--allow-missing` を外し fail-closed（ファイル不在は exit 2）に戻す。
   スキーマ契約・終了コードは `harness/compat-regression/README.md` を参照
+- 実測ハーネス compat-practical の自己テスト（`MEAS-4`。TASK-71.1・TASK-71.2）は `make check-compat-practical`（`make ci` に含む。要 jq・node 22 以降）。CI では `compat-regression` ジョブ内で `harness/compat-practical/self-test.sh` を実行する。`run_core.sh` の自己テストは偽 CDP サーバー（`fake_cdp_server.mjs`）のみを使い、実バイナリ・ネットワークへは出ない
 - 許可外ライセンス（GPL/AGPL/LGPL/MPL-2.0・ライセンス未記載）を持つ canary を `cargo deny` が reject することを `make check-deny-license-reject` で検証する（TASK-9.1・REPAIR-8）
 - Puppeteer 接続試験ハーネスのオフライン自己テスト（`CDP-3`。TASK-45.2）は `make check-puppeteer-connect`（`make ci` に含む。要 node）。CI では `puppeteer-connect-selftest` ジョブ（3 OS）が `harness/puppeteer-connect/self-test.sh` を実行する。`stages.mjs` と Rust パーサーの契約テスト `cdp3_stages_mjs_result_line_satisfies_rust_contract`（`tests/puppeteer_contract.rs`。要 node）は `#[ignore]` で既定の `cargo test` から外れ、self-test.sh が `--ignored` 付きで実行する（0 件実行は fail-closed）
 - feature 無効（既定）時のリリースバイナリサイズが `RENDER-2`（基準は `CORE-2` と同じ「Chromium 比 80% 以上削減」）の上限以下かを `make check-binary-size`（CI では `binary-size` ジョブ・3 OS）で検証する（TASK-34.2・TASK-34.3）。既定 package `fandhe-browser-cli` が workspace に無い場合は exit 2（fail-closed。#633。詳細は `harness/binary-size/README.md`）

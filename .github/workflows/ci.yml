@@ -456,14 +456,21 @@ jobs:
             echo "error: jq is required but was not found on PATH" >&2
             exit 1
           fi
+          # TASK-71.2（#311）: run_core の自己テストは Node 22 以降の組み込み WebSocket を使う
+          if ! node -e 'process.exit(typeof WebSocket === "function" ? 0 : 1)'; then
+            echo "error: node 22 or later (built-in WebSocket) is required" >&2
+            exit 1
+          fi
       - name: 自己テスト（fixture による閾値未満 fail の証跡確認）
         run: bash harness/compat-regression/self-test.sh
       # TASK-71.1（#310・MEAS-4）: 実測ハーネス compat-practical の自己テストと
-      # tasks.json のスキーマ検証。curl はスタブでネットワーク・secrets は使わない。
+      # tasks.json のスキーマ検証。curl はスタブ・run_core は偽 CDP サーバーで、
+      # ネットワーク・secrets は使わない。
       - name: compat-practical 自己テスト・tasks.json スキーマ検証
         run: |
           bash harness/compat-practical/self-test.sh
           bash harness/compat-practical/access_check.sh --validate-only
+          bash harness/compat-practical/run_core.sh --validate-only
       - name: 対象サイト群の動作率回帰チェック
         run: |
           bash harness/compat-regression/check-matrix.sh \
