@@ -142,6 +142,14 @@
       "supported": true,
       "sinceVersion": "143"
     },
+    "container-queries": {
+      "supported": true,
+      "sinceVersion": "105"
+    },
+    "content": {
+      "supported": true,
+      "sinceVersion": "1"
+    },
     "content-visibility": {
       "supported": true,
       "sinceVersion": "108"
@@ -274,6 +282,10 @@
       "supported": true,
       "sinceVersion": "89"
     },
+    "margin": {
+      "supported": true,
+      "sinceVersion": "1"
+    },
     "masks": {
       "supported": true,
       "sinceVersion": "120"
@@ -281,6 +293,10 @@
     "mathml": {
       "supported": true,
       "sinceVersion": "109"
+    },
+    "min-max-width-height": {
+      "supported": true,
+      "sinceVersion": "18"
     },
     "mix-blend-mode": {
       "supported": true,
@@ -310,6 +326,10 @@
       "supported": true,
       "sinceVersion": "90"
     },
+    "overflow-shorthand": {
+      "supported": true,
+      "sinceVersion": "68"
+    },
     "overflow-wrap": {
       "supported": true,
       "sinceVersion": "23"
@@ -323,6 +343,14 @@
       "sinceVersion": "1"
     },
     "page-break-aliases": {
+      "supported": true,
+      "sinceVersion": "1"
+    },
+    "page-breaks": {
+      "supported": true,
+      "sinceVersion": "50"
+    },
+    "physical-properties": {
       "supported": true,
       "sinceVersion": "1"
     },
@@ -398,6 +426,10 @@
       "supported": true,
       "sinceVersion": "1"
     },
+    "text-overflow": {
+      "supported": true,
+      "sinceVersion": "1"
+    },
     "text-shadow": {
       "supported": true,
       "sinceVersion": "2"
@@ -405,6 +437,10 @@
     "text-size-adjust": {
       "supported": true,
       "sinceVersion": "54"
+    },
+    "text-transform": {
+      "supported": true,
+      "sinceVersion": "1"
     },
     "text-underline-offset": {
       "supported": true,
@@ -454,6 +490,10 @@
       "supported": true,
       "sinceVersion": "25"
     },
+    "width-height": {
+      "supported": true,
+      "sinceVersion": "1"
+    },
     "will-change": {
       "supported": true,
       "sinceVersion": "36"
@@ -468,6 +508,7 @@
     }
   },
   "cssProperties": {
+    "-khtml-user-select": "user-select",
     "-moz-animation-duration": "animations-css",
     "-moz-animation-iteration-count": "animations-css",
     "-moz-animation-name": "animations-css",
@@ -478,8 +519,11 @@
     "-moz-column-gap": "flexbox-gap",
     "-moz-tab-size": "tab-size",
     "-moz-transform": "transforms2d",
+    "-moz-transition": "transitions",
+    "-moz-user-select": "user-select",
     "-ms-flex-direction": "flexbox",
     "-ms-transform": "transforms2d",
+    "-ms-user-select": "user-select",
     "-o-animation-duration": "animations-css",
     "-o-animation-iteration-count": "animations-css",
     "-o-animation-name": "animations-css",
@@ -515,7 +559,11 @@
     "-webkit-text-decoration-color": "text-decoration",
     "-webkit-text-decoration-line": "text-decoration",
     "-webkit-transform": "transforms2d",
+    "-webkit-transition": "transitions",
+    "-webkit-user-select": "user-select",
     "accent-color": "accent-color",
+    "align-content": "flexbox",
+    "align-items": "flexbox",
     "align-self": "absolute-positioning",
     "all": "all",
     "animation": "animations-css",
@@ -542,6 +590,7 @@
     "background-position-x": "background-position",
     "background-repeat": "background-repeat",
     "background-size": "background-size",
+    "block-size": "logical-properties",
     "border": "borders",
     "border-block-end": "logical-properties",
     "border-block-end-color": "logical-properties",
@@ -583,8 +632,10 @@
     "border-top-style": "borders",
     "border-top-width": "borders",
     "border-width": "borders",
+    "bottom": "physical-properties",
     "box-shadow": "box-shadow",
     "box-sizing": "box-sizing",
+    "break-inside": "page-breaks",
     "caption-side": "table",
     "clear": "float-clear",
     "clip": "clip",
@@ -596,8 +647,11 @@
     "column-rule": "multi-column",
     "column-width": "multi-column",
     "contain": "contain",
+    "container-type": "container-queries",
+    "content": "content",
     "content-visibility": "content-visibility",
     "counter-increment": "counters",
+    "counter-reset": "counters",
     "cursor": "cursor",
     "direction": "layout-direction-override",
     "display": "display",
@@ -620,6 +674,7 @@
     "font-variant": "font-variant",
     "font-variation-settings": "font-variation-settings",
     "font-weight": "font-weight",
+    "gap": "grid",
     "grid-area": "grid",
     "grid-auto-flow": "grid",
     "grid-column": "grid",
@@ -629,31 +684,65 @@
     "grid-template-columns": "grid",
     "grid-template-rows": "grid",
     "hanging-punctuation": "hanging-punctuation",
+    "height": "width-height",
     "image-rendering": "crisp-edges",
+    "inline-size": "logical-properties",
+    "inset": "logical-properties",
+    "inset-block": "logical-properties",
+    "inset-block-end": "logical-properties",
+    "inset-block-start": "logical-properties",
+    "inset-inline": "logical-properties",
+    "inset-inline-end": "logical-properties",
+    "inset-inline-start": "logical-properties",
     "interpolate-size": "interpolate-size",
     "isolation": "isolation",
     "justify-content": "flexbox",
+    "justify-items": "flexbox",
     "justify-self": "absolute-positioning",
+    "left": "physical-properties",
     "letter-spacing": "letter-spacing",
     "line-break": "line-break",
     "line-height": "line-height",
     "list-style": "list-style",
     "list-style-position": "list-style",
     "list-style-type": "list-style",
+    "margin": "margin",
+    "margin-block": "logical-properties",
+    "margin-block-end": "logical-properties",
+    "margin-block-start": "logical-properties",
+    "margin-bottom": "margin",
+    "margin-inline": "logical-properties",
+    "margin-inline-end": "logical-properties",
+    "margin-inline-start": "logical-properties",
+    "margin-left": "margin",
+    "margin-right": "margin",
+    "margin-top": "margin",
     "mask": "masks",
     "mask-image": "masks",
     "mask-size": "masks",
+    "max-block-size": "logical-properties",
+    "max-height": "min-max-width-height",
+    "max-inline-size": "logical-properties",
+    "max-width": "min-max-width-height",
+    "min-block-size": "logical-properties",
+    "min-height": "min-max-width-height",
+    "min-inline-size": "logical-properties",
+    "min-width": "min-max-width-height",
     "mix-blend-mode": "mix-blend-mode",
     "object-fit": "object-fit",
     "opacity": "opacity",
     "order": "flexbox",
     "orphans": "widows-orphans",
+    "outline": "outline",
     "outline-color": "currentcolor",
     "outline-offset": "outlines",
     "outline-style": "outlines",
     "outline-width": "outlines",
+    "overflow": "overflow-shorthand",
     "overflow-inline": "logical-properties",
     "overflow-wrap": "overflow-wrap",
+    "overflow-x": "overflow-shorthand",
+    "overflow-y": "overflow-shorthand",
     "overscroll-behavior-y": "overscroll-behavior",
     "padding": "padding",
     "padding-block": "logical-properties",
@@ -670,6 +759,7 @@
     "page-break-before": "page-break-aliases",
     "page-break-inside": "page-break-aliases",
     "place-content": "flexbox",
+    "place-items": "flexbox",
     "place-self": "absolute-positioning",
     "pointer-events": "pointer-events",
     "position": "absolute-positioning",
@@ -677,6 +767,7 @@
     "print-color-adjust": "print-color-adjust",
     "quotes": "quotes",
     "resize": "resize",
+    "right": "physical-properties",
     "rotate": "individual-transforms",
     "row-gap": "flexbox-gap",
     "scale": "individual-transforms",
@@ -705,15 +796,20 @@
     "text-decoration-style": "text-decoration",
     "text-decoration-thickness": "text-decoration",
     "text-indent": "text-indent",
+    "text-overflow": "text-overflow",
     "text-rendering": "svg",
     "text-shadow": "text-shadow",
     "text-size-adjust": "text-size-adjust",
+    "text-transform": "text-transform",
     "text-underline-offset": "text-underline-offset",
     "text-wrap": "text-wrap",
     "text-wrap-mode": "text-wrap",
+    "top": "physical-properties",
     "touch-action": "touch-action",
     "transform": "transforms2d",
+    "transform-origin": "transforms2d",
     "transform-style": "transforms3d",
+    "transition": "transitions",
     "transition-delay": "transitions",
     "transition-duration": "transitions",
     "transition-property": "transitions",
@@ -725,6 +821,7 @@
     "visibility": "visibility",
     "white-space": "white-space",
     "widows": "widows-orphans",
+    "width": "width-height",
     "will-change": "will-change",
     "word-break": "word-break",
     "word-spacing": "svg",
