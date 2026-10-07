@@ -202,13 +202,16 @@ async function runTask(cdp, t, budgetMs) {
   const fail = (reason, detail = null, extra = {}) => ({
     ...base, success: false, reason, detail, method: "first_match", match_count: null, output_sample: "", ...extra,
   });
-  // --total-timeout の期限（絶対時刻）。各段階の直前に残り時間を再計算し、到達したら打ち切る
-  const deadline = Date.now() + budgetMs;
-  const remaining = () => deadline - Date.now();
+  // タスク期限は開始時に 1 回だけ確定する（--task-timeout と --total-timeout の残りの小さい方）。
+  // 各 CDP 操作へは「期限までの残り時間」を渡し、操作ごとに予算が再付与されないようにする
+  const startedAt = Date.now();
+  const totalDeadline = startedAt + budgetMs;
+  const taskDeadline = startedAt + Math.min(taskTimeoutMs, budgetMs);
   const stepTimeout = () => {
-    const left = remaining();
-    if (left <= 0) throw Object.assign(new Error("total time limit exceeded"), { totalExceeded: true });
-    return Math.max(1, Math.min(taskTimeoutMs, left));
+    const now = Date.now();
+    if (now >= totalDeadline) throw Object.assign(new Error("total time limit exceeded"), { totalExceeded: true });
+    if (now >= taskDeadline) throw Object.assign(new Error("timeout"), { timeout: true });
+    return taskDeadline - now;
   };
   try {
     const nav = await cdp.send("Page.navigate", { url: t.url }, stepTimeout());
@@ -235,7 +238,7 @@ async function runTask(cdp, t, budgetMs) {
     return { ...base, success: true, reason: null, detail: null, method: "first_match", match_count: null, output_sample: sanitizeSample(text) };
   } catch (e) {
     if (cdp.closed) return fail("cdp_error", "connection closed", { closed: true });
-    if (e?.totalExceeded || remaining() <= 0) return fail("blocked", "total time limit exceeded");
+    if (e?.totalExceeded || Date.now() >= totalDeadline) return fail("blocked", "total time limit exceeded");
     return fail(classifyError(e));
   }
 }
