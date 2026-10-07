@@ -27,7 +27,7 @@
 //! - 起源（UA / user / author）ごとの `!important` 逆転（author のみを扱う）
 //! - 継承・初期値・shorthand 展開・値の型付き解釈・`var()` 解決・レイアウト依存値
 //! - 起源（UA / user / author）・`@layer`・`@media` 等の条件付きルール
-//! - 上限の見直し（#261）。上限は上流（`parse_declarations`・`parse_stylesheet`・`match_rules`）で検証済み
+//! - 上限検証は確定済み（#261）。上限は上流（`parse_declarations`・`parse_stylesheet`・`match_rules`）で検証済み
 
 use std::collections::BTreeMap;
 
@@ -100,6 +100,7 @@ impl ComputedDeclaration {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ComputedStyle {
     declarations: Vec<ComputedDeclaration>,
+    inline_skipped: bool,
 }
 
 impl ComputedStyle {
@@ -115,6 +116,14 @@ impl ComputedStyle {
             .binary_search_by(|d| d.property().cmp(property))
             .ok()
             .and_then(|i| self.declarations.get(i))
+    }
+
+    /// 上限違反の `style` 属性を捨てて計算したか。
+    ///
+    /// [`collect_document_styles`](super::collect_document_styles) が源単位で skip する契約と
+    /// 揃え、`computed_style` も上限違反の inline 宣言だけを捨てて継続する（`CORE-5`・#261）。
+    pub fn inline_skipped(&self) -> bool {
+        self.inline_skipped
     }
 
     /// 有効宣言の件数。
@@ -197,6 +206,7 @@ pub fn cascade(matched: &[MatchedRule<'_>], inline: &[Declaration]) -> Result<Co
         }
     }
     Ok(ComputedStyle {
+        inline_skipped: false,
         declarations: winners
             .into_values()
             .map(|(decl, origin, _)| ComputedDeclaration {
@@ -214,8 +224,9 @@ pub fn cascade(matched: &[MatchedRule<'_>], inline: &[Declaration]) -> Result<Co
 ///
 /// # エラー
 ///
-/// [`match_rules`] と [`parse_style_attribute`] のエラー（走査ルール総数・照合キャッシュ・
-/// 宣言入力長・宣言数の上限超過）をそのまま伝播する。カスケード対象の宣言総数が
+/// [`match_rules`] のエラー（走査ルール総数・照合キャッシュの上限超過）をそのまま伝播する。
+/// `style` 属性が宣言入力長・宣言数の上限を超える場合は、その属性だけ捨てて継続し
+/// [`ComputedStyle::inline_skipped`] を `true` にする。カスケード対象の宣言総数が
 /// [`MAX_CASCADE_DECLARATIONS`] を超える場合は [`Error::InvalidInput`] を返す。部分結果は返さない。
 pub fn computed_style<'a>(
     document: &Document,
@@ -226,8 +237,15 @@ pub fn computed_style<'a>(
         return Ok(ComputedStyle::default());
     }
     let matched = match_rules(document, element, sheets)?;
-    let inline = parse_style_attribute(document, element)?.unwrap_or_default();
-    cascade(&matched, &inline)
+    // 上限違反の style 属性はその源だけ捨てる（collect_document_styles と同じ契約）。
+    let (inline, inline_skipped) = match parse_style_attribute(document, element) {
+        Ok(v) => (v.unwrap_or_default(), false),
+        Err(Error::InvalidInput { .. }) => (Vec::new(), true),
+        Err(e) => return Err(e),
+    };
+    let mut style = cascade(&matched, &inline)?;
+    style.inline_skipped = inline_skipped;
+    Ok(style)
 }
 
 #[cfg(test)]
