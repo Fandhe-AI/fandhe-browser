@@ -105,6 +105,10 @@ if [ "$NO_SPAWN" -eq 0 ]; then
       # Windows は Profile::open が Unsupported（XOS-7〜XOS-10 待ち）で起動できない。成功を装わない
       die "spawning the binary is not supported on Windows yet (profile ACL pending); use --no-spawn" ;;
   esac
+  # バイナリは待ち受けポートを引数・環境変数で変更できず 9333 固定のため、別ポートでは readiness を観測できない。
+  # 起動モードでは 9333 以外を拒否する（別ポートの既存サーバーへ接続するなら --no-spawn を使う）
+  # FC_TEST_ALLOW_SPAWN_PORT=1 は self-test の偽バイナリ専用（実バイナリでは設定しない）
+  [ "$ENDPOINT" = "http://127.0.0.1:9333" ] || [ "${FC_TEST_ALLOW_SPAWN_PORT:-}" = "1" ] || die "spawn mode supports only http://127.0.0.1:9333 (the binary listens on a fixed port); use --no-spawn for other ports"
   BIN_RESOLVED="$(resolve_bin "$BIN_ARG")" || exit 2
   # 固定ポートのため、起動前に応答があれば他プロセスを誤計測しないよう中止する（fail-closed）
   if probe; then die "endpoint is already responding: $ENDPOINT (stop the other process first)"; fi

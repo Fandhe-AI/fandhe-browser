@@ -487,16 +487,18 @@ STUB
       expect_contains "$LAST_OUTPUT" "not supported on Windows" "run_core windows message"
       ;;
     *)
-      expect_exit "run_core spawn" 0 bash "$RUN_CORE" --bin "$STUB_BIN/ok" --endpoint "http://127.0.0.1:$RC_PORT" --tasks "$WORK/rc.json" --out "$WORK/sp.jsonl"
+      expect_exit "run_core spawn rejects non-9333 port" 2 bash "$RUN_CORE" --bin "$STUB_BIN/ok" --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp0.jsonl"
+      expect_contains "$LAST_OUTPUT" "spawn mode supports only" "run_core spawn port message"
+      expect_exit "run_core spawn" 0 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/ok" --endpoint "http://127.0.0.1:$RC_PORT" --tasks "$WORK/rc.json" --out "$WORK/sp.jsonl"
       expect_eq "$(jq -r 'select(.type=="meta") | .bin' "$WORK/sp.jsonl")" "$STUB_BIN/ok" "run_core meta bin"
       expect_eq "$([ -d "$(cat "$WORK/profile.path")" ] && echo present || echo removed)" "removed" "run_core isolated profile removed"
       expect_exit "run_core child stopped" 2 bash "$RUN_CORE" --no-spawn --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp2.jsonl"
-      expect_exit "run_core startup timeout" 2 bash "$RUN_CORE" --bin "$STUB_BIN/never" --endpoint "http://127.0.0.1:$RC_PORT" --startup-timeout 1 --out "$WORK/sp3.jsonl"
+      expect_exit "run_core startup timeout" 2 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/never" --endpoint "http://127.0.0.1:$RC_PORT" --startup-timeout 1 --out "$WORK/sp3.jsonl"
       expect_contains "$LAST_OUTPUT" "did not become ready" "run_core startup timeout message"
-      expect_exit "run_core binary dies" 2 bash "$RUN_CORE" --bin "$STUB_BIN/dies" --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp4.jsonl"
+      expect_exit "run_core binary dies" 2 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/dies" --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp4.jsonl"
       expect_contains "$LAST_OUTPUT" "exited before" "run_core binary dies message"
       start_fake --port "$RC_PORT"
-      expect_exit "run_core endpoint already responding" 2 bash "$RUN_CORE" --bin "$STUB_BIN/ok" --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp5.jsonl"
+      expect_exit "run_core endpoint already responding" 2 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/ok" --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp5.jsonl"
       expect_contains "$LAST_OUTPUT" "already responding" "run_core already responding message"
       ;;
   esac
