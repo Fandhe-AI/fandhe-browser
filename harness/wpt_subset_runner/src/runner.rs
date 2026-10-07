@@ -13,8 +13,8 @@
 //!
 //! プロファイル別の実行指定（[`WptProfile`]・[`run_subset_for_profiles`]。TASK-101.3・#275）は
 //! 配線のみを提供し、プロファイルによる挙動差は TASK-100（`PLUG-8`）完了後に配線する。
-//! 合格率の集計・レポート（#276）、実行不能項目の記録（#277）は担当外で、本モジュールは
-//! [`FileOutcome`] を返すだけで集計しない。
+//! 合格率の集計・レポート（#276）、実行不能項目の記録（#277）は [`crate::report`] が担い、
+//! 本モジュールは [`FileOutcome`] を返すだけで集計しない。
 //!
 //! # 外部入力の扱い（fail-closed）
 //!
@@ -115,6 +115,15 @@ impl HarnessKind {
             "reftest" => Some(Self::Reftest),
             "other" => Some(Self::Other),
             _ => None,
+        }
+    }
+
+    /// [`HarnessKind::parse`] の逆変換（レポートの harness ラベル）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Testharness => "testharness",
+            Self::Reftest => "reftest",
+            Self::Other => "other",
         }
     }
 }
@@ -544,7 +553,7 @@ pub enum FileOutcome {
     },
 }
 
-/// サブセット全体を順に実行する。集計はしない（#276 の担当）。
+/// サブセット全体を順に実行する。集計はしない（合格率は [`crate::report::WptReport`]・#276）。
 pub fn run_subset(
     options: &RunOptions,
     entries: &[SubsetEntry],
@@ -557,7 +566,8 @@ pub fn run_subset(
 
 /// 1 プロファイル分の独立した実行結果（`PLUG-10`・TASK-101.3）。
 ///
-/// [`run_subset_for_profiles`] が返し、#276 がプロファイル別合格率を集計する入力になる。
+/// [`run_subset_for_profiles`] が返し、[`crate::report::WptReport::from_runs`]（#276）が
+/// プロファイル別合格率を集計する入力になる。
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileRun {
@@ -1213,6 +1223,18 @@ fn read_under_root(root: &Path, rel: &str, max_bytes: u64) -> Result<String, Fil
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plug_10_harness_kind_as_str_roundtrips_parse() {
+        for (kind, label) in [
+            (HarnessKind::Testharness, "testharness"),
+            (HarnessKind::Reftest, "reftest"),
+            (HarnessKind::Other, "other"),
+        ] {
+            assert_eq!(kind.as_str(), label);
+            assert_eq!(HarnessKind::parse(label), Some(kind));
+        }
+    }
 
     fn sub(status: SubtestStatus) -> SubtestResult {
         // non_exhaustive のため JSON 相当の経路ではなく、判定表の検証用に

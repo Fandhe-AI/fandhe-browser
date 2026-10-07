@@ -1,9 +1,21 @@
-//! report: 実行不能項目の記録（`PLUG-10`・TASK-101.5・MS-8・Issue #277）。
+//! report: 合格率の集計・レポート出力（TASK-101.4・Issue #276）と実行不能項目の記録
+//! （TASK-101.5・Issue #277）。ともに `PLUG-10`・MS-8。
+//!
+//! # 合格率レポート（TASK-101.4）
+//!
+//! [`WptReport::from_runs`] が [`run_subset_for_profiles`](crate::runner::run_subset_for_profiles)
+//! の戻り値（[`ProfileRun`]）をプロファイル別に集計し、[`WptReport::to_json`] がスキーマ固定の
+//! 機械可読 JSON（`schemaVersion: 1`）を書き出す。分母は「実行を試みた件数」
+//! （testharness 種別。実行に失敗したファイルも含める）、分子は [`Verdict::Pass`] のみで、
+//! 実行失敗を分母から外して合格率を良く見せない（REPAIR-3）。
+//! 現時点では TASK-100（`PLUG-8`）の gating が未提供のため、chrome と safari の数値は同一になる。
+//!
+//! # 実行不能項目の記録（TASK-101.5）
 //!
 //! WPT サブセット（PoC-16 が選んだ 257 件）のうち、本ハーネスが実行できない
 //! reftest・other を「なぜ実行しないか」と「その確度」付きで機械可読に書き出す。
-//! #276（TASK-101.4）が作るレポート全体の `"unrunnable"` キーへ [`UnrunnableReport::to_json`]
-//! の出力を埋め込む前提で、本モジュールはこのセクション単体のスキーマだけを決める。
+//! [`WptReport`] の `"unrunnable"` キーへ [`UnrunnableReport::to_json`] の出力をそのまま
+//! 埋め込む。このセクション単体のスキーマは [`UnrunnableReport`] が決める。
 //!
 //! # 確度の区別
 //!
@@ -23,6 +35,10 @@
 
 use std::collections::HashSet;
 use std::fmt::{self, Write as _};
+
+use fandhe_browser_core::EngineKind;
+
+use crate::runner::{FileOutcome, ProfileRun, Verdict, WptProfile};
 
 /// 記録する件数の上限（`wpt-subset.json` の上限と同じ。無制限確保による DoS を防ぐ）。
 pub const MAX_REPORT_ENTRIES: usize = 10_000;
@@ -133,6 +149,23 @@ pub enum ReportError {
         /// 重複したファイル。
         file: String,
     },
+    /// 集計対象のプロファイルが 1 件も無い（TASK-101.4）。
+    NoProfiles,
+    /// 同じプロファイルの実行結果が複数ある（TASK-101.4）。
+    DuplicateProfile {
+        /// 重複したプロファイル。
+        profile: WptProfile,
+    },
+    /// プロファイル間でエントリ列（`file`・種別の並び）が一致しない（TASK-101.4）。
+    EntryMismatch {
+        /// 先頭と食い違ったプロファイル。
+        profile: WptProfile,
+    },
+    /// 実行不能件数と `Skipped` の件数が一致しない内部不整合（TASK-101.4）。
+    InconsistentSkipCount {
+        /// 食い違ったプロファイル。
+        profile: WptProfile,
+    },
 }
 
 impl fmt::Display for ReportError {
@@ -142,6 +175,22 @@ impl fmt::Display for ReportError {
             ReportError::TooManyEntries => write!(f, "too many report entries"),
             ReportError::InvalidFile { reason } => write!(f, "invalid file entry: {reason}"),
             ReportError::Duplicate { file } => write!(f, "duplicate file entry: {file:?}"),
+            ReportError::NoProfiles => write!(f, "no profile runs to aggregate"),
+            ReportError::DuplicateProfile { profile } => {
+                write!(f, "duplicate profile run: {profile}")
+            }
+            ReportError::EntryMismatch { profile } => {
+                write!(
+                    f,
+                    "entries of profile '{profile}' differ from the first profile"
+                )
+            }
+            ReportError::InconsistentSkipCount { profile } => {
+                write!(
+                    f,
+                    "skipped count of profile '{profile}' disagrees with unrunnable total"
+                )
+            }
         }
     }
 }
@@ -281,6 +330,255 @@ impl UnrunnableReport {
     }
 }
 
+/// `byOutcome` に出す全キー（宣言順で固定。0 件でも省略しない）。
+const OUTCOME_KEYS: [&str; 15] = [
+    "skipped",
+    "missing",
+    "readFailed",
+    "tooLarge",
+    "limitExceeded",
+    "htmlParseFailed",
+    "harnessNotReferenced",
+    "harnessLoadFailed",
+    "unsupportedScript",
+    "supportScriptMissing",
+    "scriptRejected",
+    "scriptFailed",
+    "engineUnavailable",
+    "collectFailed",
+    "completed",
+];
+/// `byOutcome` 内の `skipped` の位置。
+const SKIPPED_INDEX: usize = 0;
+/// `byVerdict` に出す全キー（宣言順で固定）。
+const VERDICT_KEYS: [&str; 4] = ["pass", "fail", "noResults", "incomplete"];
+
+/// [`FileOutcome`] を [`OUTCOME_KEYS`] の位置へ対応させる。
+/// ワイルドカードを使わず、バリアント追加時にコンパイルエラーで集計漏れを検出する。
+fn outcome_index(o: &FileOutcome) -> usize {
+    match o {
+        FileOutcome::Skipped { .. } => 0,
+        FileOutcome::Missing => 1,
+        FileOutcome::ReadFailed { .. } => 2,
+        FileOutcome::TooLarge => 3,
+        FileOutcome::LimitExceeded { .. } => 4,
+        FileOutcome::HtmlParseFailed { .. } => 5,
+        FileOutcome::HarnessNotReferenced => 6,
+        FileOutcome::HarnessLoadFailed { .. } => 7,
+        FileOutcome::UnsupportedScript { .. } => 8,
+        FileOutcome::SupportScriptMissing { .. } => 9,
+        FileOutcome::ScriptRejected { .. } => 10,
+        FileOutcome::ScriptFailed { .. } => 11,
+        FileOutcome::EngineUnavailable { .. } => 12,
+        FileOutcome::CollectFailed { .. } => 13,
+        FileOutcome::Completed { .. } => 14,
+    }
+}
+
+/// [`Verdict`] を [`VERDICT_KEYS`] の位置へ対応させる（網羅 match）。
+fn verdict_index(v: &Verdict) -> usize {
+    match v {
+        Verdict::Pass => 0,
+        Verdict::Fail => 1,
+        Verdict::NoResults => 2,
+        Verdict::Incomplete => 3,
+    }
+}
+
+/// 1 プロファイル分の集計（`PLUG-10`・TASK-101.4）。
+///
+/// 分母 `executed` は `Skipped` 以外の全件（実行失敗を含む）、分子 `passed` は
+/// `Completed` かつ [`Verdict::Pass`] の件数。[`WptReport::from_runs`] が作る。
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSummary {
+    /// 集計したプロファイル。
+    pub profile: WptProfile,
+    /// 入力エントリ数。
+    pub total: usize,
+    /// 実行を試みた件数（`total` − `skipped`。分母）。
+    pub executed: usize,
+    /// 合格件数（分子）。
+    pub passed: usize,
+    by_verdict: [usize; 4],
+    by_outcome: [usize; 15],
+}
+
+impl ProfileSummary {
+    fn from_run(run: &ProfileRun) -> Self {
+        let mut by_verdict = [0usize; 4];
+        let mut by_outcome = [0usize; 15];
+        let mut passed = 0usize;
+        for (_, outcome) in &run.results {
+            if let Some(c) = by_outcome.get_mut(outcome_index(outcome)) {
+                *c += 1;
+            }
+            if let FileOutcome::Completed { verdict, .. } = outcome {
+                if let Some(c) = by_verdict.get_mut(verdict_index(verdict)) {
+                    *c += 1;
+                }
+                if matches!(verdict, Verdict::Pass) {
+                    passed += 1;
+                }
+            }
+        }
+        let total = run.results.len();
+        let skipped = by_outcome.get(SKIPPED_INDEX).copied().unwrap_or(0);
+        Self {
+            profile: run.profile,
+            total,
+            executed: total.saturating_sub(skipped),
+            passed,
+            by_verdict,
+            by_outcome,
+        }
+    }
+
+    /// `Skipped`（reftest・other）の件数。
+    pub fn skipped(&self) -> usize {
+        self.by_outcome.get(SKIPPED_INDEX).copied().unwrap_or(0)
+    }
+
+    /// `byOutcome` のキー名（`skipped`・`missing`・…・`completed`）で件数を引く。未知のキーは 0。
+    pub fn outcome_count(&self, key: &str) -> usize {
+        OUTCOME_KEYS
+            .iter()
+            .position(|k| *k == key)
+            .and_then(|i| self.by_outcome.get(i))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// `Completed` の内訳（`pass`・`fail`・`noResults`・`incomplete`）。未知のキーは 0。
+    pub fn verdict_count(&self, key: &str) -> usize {
+        VERDICT_KEYS
+            .iter()
+            .position(|k| *k == key)
+            .and_then(|i| self.by_verdict.get(i))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 合格率（0.0〜1.0）。`executed == 0` は `None`（0% と区別する）。
+    pub fn pass_rate(&self) -> Option<f64> {
+        if self.executed == 0 {
+            None
+        } else {
+            Some(self.passed as f64 / self.executed as f64)
+        }
+    }
+}
+
+/// プロファイル別合格率レポート全体（`PLUG-10`・TASK-101.4・MS-8・Issue #276）。
+///
+/// 入力は [`run_subset_for_profiles`](crate::runner::run_subset_for_profiles) の戻り値。
+/// [`WptReport::to_json`] はキー名・型・順序が実行結果に依存しない JSON を返す。
+/// `passRate` は小数 4 桁の数値で、`executed == 0` のときは `0.0000`
+/// （数値型を保つため。0 件かどうかは `executed` で判別する）。
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WptReport {
+    /// 実行に使ったエンジン。`None` は JS 無効（JSON では `"none"`）。
+    pub engine: Option<EngineKind>,
+    /// プロファイル別集計（[`WptProfile::ALL`] の順）。
+    pub profiles: Vec<ProfileSummary>,
+    /// 実行不能項目（reftest・other）。
+    pub unrunnable: UnrunnableReport,
+}
+
+impl WptReport {
+    /// プロファイル別の実行結果から集計する。入力順に依存せず出力は [`WptProfile::ALL`] 順。
+    ///
+    /// fail-closed: プロファイル 0 件・重複・プロファイル間のエントリ列不一致・件数上限超過・
+    /// 内部不整合は `Err`。
+    pub fn from_runs(runs: &[ProfileRun], engine: Option<EngineKind>) -> Result<Self, ReportError> {
+        let first = runs.first().ok_or(ReportError::NoProfiles)?;
+        if first.results.len() > MAX_REPORT_ENTRIES {
+            return Err(ReportError::TooManyEntries);
+        }
+        let mut seen: Vec<WptProfile> = Vec::new();
+        for run in runs {
+            if seen.contains(&run.profile) {
+                return Err(ReportError::DuplicateProfile {
+                    profile: run.profile,
+                });
+            }
+            seen.push(run.profile);
+            let same = run.results.len() == first.results.len()
+                && run
+                    .results
+                    .iter()
+                    .zip(&first.results)
+                    .all(|((a, _), (b, _))| a.file == b.file && a.harness == b.harness);
+            if !same {
+                return Err(ReportError::EntryMismatch {
+                    profile: run.profile,
+                });
+            }
+        }
+        let unrunnable = UnrunnableReport::from_entries(
+            first
+                .results
+                .iter()
+                .map(|(e, _)| (e.harness.as_str(), e.file.as_str())),
+        )?;
+        let mut profiles = Vec::new();
+        for p in WptProfile::ALL {
+            if let Some(run) = runs.iter().find(|r| r.profile == p) {
+                let summary = ProfileSummary::from_run(run);
+                if summary.skipped() != unrunnable.total() {
+                    return Err(ReportError::InconsistentSkipCount { profile: p });
+                }
+                profiles.push(summary);
+            }
+        }
+        Ok(Self {
+            engine,
+            profiles,
+            unrunnable,
+        })
+    }
+
+    /// コンパクトな JSON（`schemaVersion: 1`）を返す。キー構成は 0 件でも固定。
+    pub fn to_json(&self) -> String {
+        let mut out = String::from("{\"schemaVersion\":1,\"behavior\":\"PLUG-10\",\"engine\":");
+        write_json_string(&mut out, self.engine.map_or("none", EngineKind::as_str));
+        out.push_str(",\"profiles\":[");
+        for (i, p) in self.profiles.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"profile\":");
+            write_json_string(&mut out, p.profile.as_str());
+            let _ = write!(
+                out,
+                ",\"total\":{},\"executed\":{},\"passed\":{},\"passRate\":{:.4},\"byVerdict\":{{",
+                p.total,
+                p.executed,
+                p.passed,
+                p.pass_rate().unwrap_or(0.0)
+            );
+            for (j, k) in VERDICT_KEYS.iter().enumerate() {
+                if j > 0 {
+                    out.push(',');
+                }
+                let _ = write!(out, "\"{k}\":{}", p.verdict_count(k));
+            }
+            out.push_str("},\"byOutcome\":{");
+            for (j, k) in OUTCOME_KEYS.iter().enumerate() {
+                if j > 0 {
+                    out.push(',');
+                }
+                let _ = write!(out, "\"{k}\":{}", p.outcome_count(k));
+            }
+            out.push_str("}}");
+        }
+        out.push_str("],\"unrunnable\":");
+        out.push_str(&self.unrunnable.to_json());
+        out.push('}');
+        out
+    }
+}
 /// JSON 文字列リテラルとして書き出す（`"`・`\`・制御文字をエスケープ）。
 fn write_json_string(out: &mut String, s: &str) {
     out.push('"');
@@ -452,6 +750,193 @@ mod tests {
             r.records(O)
                 .iter()
                 .any(|f| f == "html/webappapis/animation-frames/cancel-handle-manual.html")
+        );
+    }
+
+    use crate::runner::{HarnessKind, SubsetEntry};
+
+    fn entry(file: &str, h: HarnessKind) -> SubsetEntry {
+        SubsetEntry::new(file, h).unwrap()
+    }
+
+    fn completed(v: Verdict) -> FileOutcome {
+        FileOutcome::Completed {
+            subtests: Vec::new(),
+            completion: None,
+            verdict: v,
+        }
+    }
+
+    fn skipped(h: HarnessKind) -> FileOutcome {
+        FileOutcome::Skipped { harness: h }
+    }
+
+    fn sample_run(profile: WptProfile) -> ProfileRun {
+        let t = HarnessKind::Testharness;
+        ProfileRun {
+            profile,
+            results: vec![
+                (entry("a.html", t), completed(Verdict::Pass)),
+                (entry("b.html", t), completed(Verdict::Fail)),
+                (entry("c.html", t), completed(Verdict::Incomplete)),
+                (entry("d.html", t), completed(Verdict::NoResults)),
+                (entry("e.html", t), FileOutcome::Missing),
+                (
+                    entry("r1.html", HarnessKind::Reftest),
+                    skipped(HarnessKind::Reftest),
+                ),
+                (
+                    entry("o1.html", HarnessKind::Other),
+                    skipped(HarnessKind::Other),
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn plug_10_report_counts_and_rate() {
+        let r = WptReport::from_runs(&[sample_run(WptProfile::Chrome)], None).unwrap();
+        let p = r.profiles.first().unwrap();
+        assert_eq!((p.total, p.executed, p.passed), (7, 5, 1));
+        assert_eq!(p.pass_rate(), Some(0.2));
+        assert_eq!(p.skipped(), 2);
+        assert_eq!(p.outcome_count("missing"), 1);
+        assert_eq!(p.outcome_count("completed"), 4);
+        assert_eq!(p.verdict_count("incomplete"), 1);
+        assert_eq!(r.unrunnable.total(), 2);
+    }
+
+    #[test]
+    fn plug_10_report_json_is_exact() {
+        let t = HarnessKind::Testharness;
+        let run = ProfileRun {
+            profile: WptProfile::Safari,
+            results: vec![
+                (entry("a.html", t), completed(Verdict::Pass)),
+                (entry("b.html", t), FileOutcome::Missing),
+                (
+                    entry("r.html", HarnessKind::Reftest),
+                    skipped(HarnessKind::Reftest),
+                ),
+            ],
+        };
+        let json = WptReport::from_runs(&[run], Some(EngineKind::Boa))
+            .unwrap()
+            .to_json();
+        let head = concat!(
+            "{\"schemaVersion\":1,\"behavior\":\"PLUG-10\",\"engine\":\"boa\",\"profiles\":[",
+            "{\"profile\":\"safari\",\"total\":3,\"executed\":2,\"passed\":1,\"passRate\":0.5000,",
+            "\"byVerdict\":{\"pass\":1,\"fail\":0,\"noResults\":0,\"incomplete\":0},",
+            "\"byOutcome\":{\"skipped\":1,\"missing\":1,\"readFailed\":0,\"tooLarge\":0,",
+            "\"limitExceeded\":0,\"htmlParseFailed\":0,\"harnessNotReferenced\":0,",
+            "\"harnessLoadFailed\":0,\"unsupportedScript\":0,\"supportScriptMissing\":0,",
+            "\"scriptRejected\":0,\"scriptFailed\":0,\"engineUnavailable\":0,",
+            "\"collectFailed\":0,\"completed\":1}}],\"unrunnable\":"
+        );
+        let unrunnable = UnrunnableReport::from_entries([
+            ("testharness", "a.html"),
+            ("testharness", "b.html"),
+            ("reftest", "r.html"),
+        ])
+        .unwrap()
+        .to_json();
+        assert_eq!(json, format!("{head}{unrunnable}}}"));
+    }
+
+    #[test]
+    fn plug_10_report_zero_executed_keeps_schema() {
+        let run = ProfileRun {
+            profile: WptProfile::Chrome,
+            results: vec![(
+                entry("r.html", HarnessKind::Reftest),
+                skipped(HarnessKind::Reftest),
+            )],
+        };
+        let r = WptReport::from_runs(&[run], None).unwrap();
+        assert_eq!(r.profiles.first().unwrap().pass_rate(), None);
+        let json = r.to_json();
+        assert!(json.contains("\"engine\":\"none\""));
+        assert!(json.contains("\"executed\":0,\"passed\":0,\"passRate\":0.0000"));
+        // プロファイル節のキー構成は件数があるレポートと同一。
+        let full = WptReport::from_runs(&[sample_run(WptProfile::Chrome)], None)
+            .unwrap()
+            .to_json();
+        let section = |s: &str| -> String {
+            let start = s.find("\"profiles\"").unwrap();
+            let end = s.find("\"unrunnable\"").unwrap();
+            let mut keys = String::new();
+            let mut in_str = false;
+            let mut cur = String::new();
+            for c in s[start..end].chars() {
+                if c == '"' {
+                    if in_str && s[start..end].contains(&format!("\"{cur}\":")) {
+                        keys.push_str(&cur);
+                        keys.push(',');
+                    }
+                    cur.clear();
+                    in_str = !in_str;
+                } else if in_str {
+                    cur.push(c);
+                }
+            }
+            keys
+        };
+        assert_eq!(section(&json), section(&full));
+    }
+
+    #[test]
+    fn plug_10_report_is_deterministic_and_order_independent() {
+        let a = [
+            sample_run(WptProfile::Chrome),
+            sample_run(WptProfile::Safari),
+        ];
+        let b = [
+            sample_run(WptProfile::Safari),
+            sample_run(WptProfile::Chrome),
+        ];
+        let ja = WptReport::from_runs(&a, None).unwrap().to_json();
+        assert_eq!(ja, WptReport::from_runs(&a, None).unwrap().to_json());
+        assert_eq!(ja, WptReport::from_runs(&b, None).unwrap().to_json());
+        assert_eq!(ja.matches("\"profile\":\"chrome\"").count(), 1);
+        assert_eq!(ja.matches("\"profile\":\"safari\"").count(), 1);
+    }
+
+    #[test]
+    fn plug_10_report_rejects_bad_input() {
+        assert_eq!(
+            WptReport::from_runs(&[], None),
+            Err(ReportError::NoProfiles)
+        );
+        assert_eq!(
+            WptReport::from_runs(
+                &[
+                    sample_run(WptProfile::Chrome),
+                    sample_run(WptProfile::Chrome)
+                ],
+                None
+            ),
+            Err(ReportError::DuplicateProfile {
+                profile: WptProfile::Chrome
+            })
+        );
+        let mut other = sample_run(WptProfile::Safari);
+        other.results.pop();
+        assert_eq!(
+            WptReport::from_runs(&[sample_run(WptProfile::Chrome), other], None),
+            Err(ReportError::EntryMismatch {
+                profile: WptProfile::Safari
+            })
+        );
+        // testharness 種別なのに Skipped という、実行不能件数と食い違う入力。
+        let mut bad = sample_run(WptProfile::Chrome);
+        if let Some(slot) = bad.results.first_mut() {
+            slot.1 = skipped(HarnessKind::Testharness);
+        }
+        assert_eq!(
+            WptReport::from_runs(&[bad], None),
+            Err(ReportError::InconsistentSkipCount {
+                profile: WptProfile::Chrome
+            })
         );
     }
 }

@@ -134,7 +134,7 @@ completion が無いと未完了の async_test / promise_test を判別できな
 testharness 152 件は `Completed/Fail` 53 / 46・`Completed/NoResults` 3 / 10・`ScriptFailed` 93・`Missing` 1・
 `SupportScriptMissing` 2（V8 / boa の順。`Pass` は 0 件）。reftest・other の 105 件は `Skipped`。
 実物の testharness.js は読み込めるが、`window`・`document` を要するテストは失敗する
-（偽の DOM で通さない方針。合格率は #276 が扱う）。
+（偽の DOM で通さない方針。合格率は `report` の `WptReport` が集計する。#276）。
 
 テストは偽の WPT ツリー（一時ディレクトリ）で `tests/runner_subset.rs` が検証する。
 
@@ -143,7 +143,7 @@ testharness 152 件は `Completed/Fail` 53 / 46・`Completed/NoResults` 3 / 10�
 - `WptProfile`（`chrome` / `safari`。完全一致のみ受理。`WptProfile::parse`・`FromStr`）と
   `RunOptions::with_profile`、`run_subset_for_profiles` を提供する。指定した各プロファイルについて
   別々に実行し、`ProfileRun { profile, results }` を指定順に返す（空・重複指定は `Err`）。
-  #276 の集計は `ProfileRun::profile` / `WptProfile::as_str` をレポートキー値に使う
+  #276 の集計（`WptReport`）は `ProfileRun::profile` / `WptProfile::as_str` をレポートキー値に使う
 - **現時点ではプロファイル間で結果内容は同一**。TASK-100（`PLUG-8`・#266〜#268）の gating が未提供で、
   ランナーは CSSOM 経路を通らないため。ハーネス内で gating を自作せず、偽の差分も作らない（REPAIR-3）。
   TASK-100 完了後に core の公開 API へ配線し、結合テストの等価 assert を差分検証へ置き換える
@@ -153,7 +153,7 @@ testharness 152 件は `Completed/Fail` 53 / 46・`Completed/NoResults` 3 / 10�
 ## 実行不能項目の記録（TASK-101.5・#277・PLUG-10・MS-8）
 
 `report` モジュールが、実行できない 2 群の理由と確度を JSON セクションとして書き出す
-（`UnrunnableReport::to_json`）。#276 のレポートが `"unrunnable"` キーへ埋め込む前提で、
+（`UnrunnableReport::to_json`）。#276 の `WptReport` が `"unrunnable"` キーへそのまま埋め込む。
 このセクションのキー名は固定する。
 
 | 理由コード | 対象 | 確度（`basis`） | 件数 |
@@ -165,6 +165,35 @@ testharness 152 件は `Completed/Fail` 53 / 46・`Completed/NoResults` 3 / 10�
 - ファイルは昇順で、出力は決定的。件数上限は 10,000
 - 記録するのは理由だけで、対象外にする方針の承認は人間担当の #279（TASK-101.h1）が決める
 - JSON は手書きで出力し、`wpt-subset.json` はライブラリでは読まない（依存を追加しないため。テストだけが読む）
+
+## 合格率集計・レポート（TASK-101.4・#276・PLUG-10・MS-8）
+
+`WptReport::from_runs(&runs, engine)`（`runs` は `run_subset_for_profiles` の戻り値）が
+プロファイル別に集計し、`WptReport::to_json()` がコンパクトな JSON（`schemaVersion: 1`）を返す。
+キー名・型・順序は実行結果に依存せず、0 件のキーも省略しない。
+
+| キー | 型 | 内容 |
+| ---- | -- | ---- |
+| `schemaVersion` | 整数 | 1 |
+| `behavior` | 文字列 | `PLUG-10` |
+| `engine` | 文字列 | `v8` / `boa` / `none`（JS 無効） |
+| `profiles[]` | 配列 | `chrome`・`safari` の順（実行したプロファイルのみ） |
+| `profiles[].profile` | 文字列 | `chrome` / `safari` |
+| `profiles[].total` | 整数 | 入力エントリ数 |
+| `profiles[].executed` | 整数 | 実行を試みた件数（分母）= `total` − `skipped` |
+| `profiles[].passed` | 整数 | 合格件数（分子）。`Completed` かつ `Verdict::Pass` のみ |
+| `profiles[].passRate` | 数値 | `passed / executed`（小数 4 桁）。`executed == 0` は `0.0000` |
+| `profiles[].byVerdict` | オブジェクト | `Completed` の内訳（`pass`・`fail`・`noResults`・`incomplete`） |
+| `profiles[].byOutcome` | オブジェクト | `FileOutcome` 別件数（15 キー固定） |
+| `unrunnable` | オブジェクト | 実行不能項目（上節。`UnrunnableReport::to_json` の出力） |
+
+- 実行に失敗したファイル（`Missing`・`ScriptFailed`・`EngineUnavailable` 等）は分母に含め不合格として数える。
+  `Skipped`（reftest・other）だけが分母から外れる。`Incomplete`・`NoResults` は合格に数えない
+- `executed == 0` の判別は `executed` で行う（Rust 側は `ProfileSummary::pass_rate()` が `None`）
+- 現時点では TASK-100（`PLUG-8`）の gating が未提供のため、chrome と safari の数値は同一になる
+- プロファイル 0 件・重複・プロファイル間のエントリ不一致は `Err`（fail-closed）
+- テスト由来のエラー文字列・サブテスト名は出力しない（件数のみ）
+- ファイル書き出し・CLI は未提供（`to_json()` の文字列を返すまで）
 
 ## コミットしないもの
 
