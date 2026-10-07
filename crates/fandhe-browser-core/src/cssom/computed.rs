@@ -35,8 +35,8 @@ use crate::dom::{Document, NodeId};
 use crate::error::{Error, Result};
 
 use super::{
-    Declaration, Importance, MatchedRule, Specificity, Stylesheet, match_rules,
-    parse_style_attribute,
+    Declaration, DocumentStyles, Importance, MatchedRule, Specificity, StyleSourceKind, Stylesheet,
+    match_rules, parse_style_attribute,
 };
 
 /// 1 回の [`computed_style`] が処理するカスケード対象宣言（マッチしたルールの宣言と inline 宣言の合計）の上限。
@@ -248,6 +248,43 @@ pub fn computed_style<'a>(
     Ok(style)
 }
 
+/// [`collect_document_styles`](super::collect_document_styles) の収集結果を使って computed style を返す入口。
+///
+/// `<style>` は採用済みの源だけ、inline は収集済みの宣言だけを使い、文書全体の上限で
+/// 捨てた源（[`DocumentStyles::skipped_sources`]）は再解析せず捨てたまま扱う
+/// （`style` 属性なら [`ComputedStyle::inline_skipped`] を `true` にする）。
+/// 採否が収集結果と食い違わない（`CORE-5`・TASK-105.7・#261）。エラーは [`computed_style`] と同じ。
+pub fn computed_style_in_document(
+    document: &Document,
+    element: NodeId,
+    styles: &DocumentStyles,
+) -> Result<ComputedStyle> {
+    if !document.is_element(element) {
+        return Ok(ComputedStyle::default());
+    }
+    let matched = match_rules(
+        document,
+        element,
+        styles
+            .style_sheets()
+            .iter()
+            .map(|s| s.parsed().stylesheet()),
+    )?;
+    let inline: &[Declaration] = styles
+        .inline_styles()
+        .iter()
+        .find(|i| i.node() == element)
+        .map(|i| i.declarations())
+        .unwrap_or(&[]);
+    let inline_skipped = styles
+        .skipped_sources()
+        .iter()
+        .any(|s| s.node() == element && s.kind() == StyleSourceKind::InlineStyle);
+    let mut style = cascade(&matched, inline)?;
+    style.inline_skipped = inline_skipped;
+    Ok(style)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::matcher::MAX_SCANNED_RULES;
@@ -292,6 +329,36 @@ mod tests {
             rule_index,
             specificity: Specificity::new(ids, classes, types),
         }
+    }
+
+    /// CORE-5（TASK-105.7）: 文書全体の上限で捨てた inline は computed 側でも再適用しない。
+    #[test]
+    fn core_5_document_skipped_inline_is_not_reapplied() {
+        let html = format!(
+            "{}<p style=\"color:red\">a</p>",
+            "<style></style>".repeat(super::super::stylesheet::MAX_DOCUMENT_STYLE_SOURCES)
+        );
+        let d = doc(&html);
+        let styles = super::super::collect_document_styles(&d).expect("must collect");
+        assert_eq!(styles.skipped_sources().len(), 1);
+        let p = find(&d, "p");
+        let s = computed_style_in_document(&d, p, &styles).expect("ok");
+        assert!(s.get("color").is_none());
+        assert!(s.inline_skipped());
+        // 収集結果を使わない単体入口は属性を再解析する（従来契約）。
+        let legacy = computed_style(&d, p, std::iter::empty::<&Stylesheet>()).expect("ok");
+        assert_eq!(legacy.get("color").map(|c| c.value()), Some("red"));
+    }
+
+    /// CORE-5: 収集済みの inline と `<style>` はそのままカスケードされる。
+    #[test]
+    fn core_5_in_document_applies_adopted_sources() {
+        let d = doc("<style>p{color:blue;margin:1px}</style><p style=\"color:red\">a</p>");
+        let styles = super::super::collect_document_styles(&d).expect("must collect");
+        let s = computed_style_in_document(&d, find(&d, "p"), &styles).expect("ok");
+        assert_eq!(s.get("color").map(|c| c.value()), Some("red"));
+        assert_eq!(s.get("margin").map(|c| c.value()), Some("1px"));
+        assert!(!s.inline_skipped());
     }
 
     /// CORE-5: 先に書かれた高詳細度が後の低詳細度に勝つ。

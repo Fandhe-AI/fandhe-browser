@@ -29,6 +29,7 @@ mod types;
 
 pub use computed::{
     ComputedDeclaration, ComputedStyle, DeclarationOrigin, cascade, computed_style,
+    computed_style_in_document,
 };
 pub use declaration::{
     MAX_DECLARATION_INPUT_BYTES, MAX_DECLARATIONS_PER_BLOCK, parse_declarations,

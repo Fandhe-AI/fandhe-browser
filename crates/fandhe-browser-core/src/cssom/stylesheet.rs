@@ -628,6 +628,11 @@ impl StyleBudget {
         self.bytes.saturating_add(n) <= MAX_DOCUMENT_STYLE_BYTES
     }
 
+    /// 採用済みルール数に `n` を足しても上限内か（加算はしない）。
+    fn fits_rules(&self, n: usize) -> bool {
+        self.rules.saturating_add(n) <= MAX_DOCUMENT_STYLE_RULES
+    }
+
     fn try_add_bytes(&mut self, n: usize) -> Result<()> {
         let total = self.bytes.saturating_add(n);
         if total > MAX_DOCUMENT_STYLE_BYTES {
@@ -722,10 +727,12 @@ pub fn collect_document_styles(document: &Document) -> Result<DocumentStyles> {
                     .and_then(|text| parse_stylesheet(&text).map(|parsed| (text.len(), parsed)))
                 {
                     Ok((text_len, parsed)) => {
-                        if budget.try_add_bytes(text_len).is_ok()
-                            && budget
-                                .try_add_rules(parsed.stylesheet().rules().len())
-                                .is_ok()
+                        // 両上限を先に判定し、採用時だけ両予算を更新する（捨てた源を加算しない）。
+                        let rule_count = parsed.stylesheet().rules().len();
+                        if budget.fits_bytes(text_len)
+                            && budget.fits_rules(rule_count)
+                            && budget.try_add_bytes(text_len).is_ok()
+                            && budget.try_add_rules(rule_count).is_ok()
                         {
                             out.style_sheets
                                 .push(StyleElementSheet { node: id, parsed });
@@ -1224,6 +1231,25 @@ mod tests {
         b.try_add_bytes(MAX_DOCUMENT_STYLE_BYTES - 1).expect("fits");
         assert!(!b.fits_bytes(2));
         assert!(b.fits_bytes(1));
+    }
+
+    /// CORE-5（TASK-105.7）: ルール上限で捨てた `<style>` のバイト数は予算へ加算しない。
+    #[test]
+    fn core_5_rule_overflow_source_does_not_consume_byte_budget() {
+        let pad = |n: usize| format!("a{{}}{}", " ".repeat(n));
+        let full = format!(
+            "<style>{}{}</style>",
+            "a{}".repeat(MAX_RULES_PER_STYLESHEET),
+            " ".repeat(3_500_000)
+        );
+        // 5 枚目はルール数超過で捨てられる（バイトは残り予算内）。
+        let over = format!("<style>{}</style>", pad(2_000_000));
+        let inline = format!("<p style=\"color:red;{}\">x</p>", " ".repeat(500_000));
+        let html = format!("{}{}{}", full.repeat(4), over, inline);
+        let styles = collect_document_styles(&doc_of(&html)).expect("must collect");
+        assert_eq!(styles.style_sheets().len(), 4);
+        assert_eq!(styles.inline_styles().len(), 1);
+        assert_eq!(styles.skipped_sources().len(), 1);
     }
 
     /// CORE-5（TASK-105.7）: 処理量（試行バイト数）の上限を超える源はパースせず捨てる。
