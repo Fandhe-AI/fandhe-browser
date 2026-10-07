@@ -101,7 +101,23 @@ impl Parser<'_> {
                     self.i += 1;
                     return Ok(s);
                 }
-                b'\\' => self.i += 2,
+                b'\\' => {
+                    // JSON の許可エスケープのみ受理する（`\u` は 4 桁 16 進を要求）。
+                    match self.b.get(self.i + 1) {
+                        Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {
+                            self.i += 2;
+                        }
+                        Some(b'u') => {
+                            let hex = self.b.get(self.i + 2..self.i + 6);
+                            if !matches!(hex, Some(h) if h.iter().all(u8::is_ascii_hexdigit)) {
+                                return Err(format!("bad \\u escape at byte {}", self.i));
+                            }
+                            self.i += 6;
+                        }
+                        _ => return Err(format!("invalid escape at byte {}", self.i)),
+                    }
+                }
+                0x00..=0x1f => return Err(format!("control char in string at byte {}", self.i)),
                 _ => self.i += 1,
             }
         }
@@ -115,6 +131,41 @@ impl Parser<'_> {
         } else {
             Err(format!("bad literal at byte {}", self.i))
         }
+    }
+
+    fn digits(&mut self) -> Result<(), String> {
+        let start = self.i;
+        while matches!(self.b.get(self.i), Some(c) if c.is_ascii_digit()) {
+            self.i += 1;
+        }
+        if self.i == start {
+            return Err(format!("expected digit at byte {}", self.i));
+        }
+        Ok(())
+    }
+
+    /// JSON の number 文法（`-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`）。
+    fn number(&mut self) -> Result<Json, String> {
+        if self.b.get(self.i) == Some(&b'-') {
+            self.i += 1;
+        }
+        if self.b.get(self.i) == Some(&b'0') {
+            self.i += 1;
+        } else {
+            self.digits()?;
+        }
+        if self.b.get(self.i) == Some(&b'.') {
+            self.i += 1;
+            self.digits()?;
+        }
+        if matches!(self.b.get(self.i), Some(b'e' | b'E')) {
+            self.i += 1;
+            if matches!(self.b.get(self.i), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            self.digits()?;
+        }
+        Ok(Json::Num)
     }
 
     fn value(&mut self) -> Result<Json, String> {
@@ -172,13 +223,7 @@ impl Parser<'_> {
             Some(b't') => self.lit("true", Json::Bool(true)),
             Some(b'f') => self.lit("false", Json::Bool(false)),
             Some(b'n') => self.lit("null", Json::Null),
-            Some(c) if c.is_ascii_digit() || *c == b'-' => {
-                while matches!(self.b.get(self.i), Some(c) if c.is_ascii_digit() || b"+-.eE".contains(c))
-                {
-                    self.i += 1;
-                }
-                Ok(Json::Num)
-            }
+            Some(c) if c.is_ascii_digit() || *c == b'-' => self.number(),
             _ => Err(format!("unexpected token at byte {}", self.i)),
         }
     }
@@ -251,6 +296,26 @@ fn plug8_profile_data_css_properties_reference_existing_features() {
 }
 
 #[test]
+fn plug8_test_parser_rejects_invalid_json_grammar() {
+    // 最小パーサー自体の文法検査（無効なエスケープ・number）を固定する。
+    for bad in [r#""a\qb""#, r#""\u12G4""#, "01", "1e", "-", "1."] {
+        let mut p = Parser {
+            b: bad.as_bytes(),
+            i: 0,
+        };
+        let r = p.value();
+        assert!(r.is_err() || p.i != bad.len(), "must reject {bad}");
+    }
+    for ok in [r#""a\/bé""#, "0", "-1.5e+3", "10"] {
+        let mut p = Parser {
+            b: ok.as_bytes(),
+            i: 0,
+        };
+        assert!(p.value().is_ok() && p.i == ok.len(), "must accept {ok}");
+    }
+}
+
+#[test]
 fn plug8_profile_data_excludes_subfeature_mappings() {
     // サブ機能の対応開始版をプロパティ全体へ適用しない（基本プロパティを誤って gating しない）。
     for (data, browser) in [(CHROME, "chrome"), (SAFARI, "safari")] {
@@ -266,6 +331,13 @@ fn plug8_profile_data_excludes_subfeature_mappings() {
             "text-transform",
             "transform-origin",
             "transition",
+            "overflow",
+            "overflow-x",
+            "overflow-y",
+            "outline",
+            "gap",
+            "-webkit-transition",
+            "-moz-transition",
         ] {
             assert!(
                 !props.contains_key(p),
