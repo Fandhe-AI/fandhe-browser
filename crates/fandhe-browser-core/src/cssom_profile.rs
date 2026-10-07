@@ -3,9 +3,10 @@
 //! TASK-100.2（Issue #266）・`PLUG-8`・MS-8。`profiles/chrome.json`・`profiles/safari.json`
 //! （TASK-100.1・#265）をバイナリへ埋め込み、CSS プロパティ単位の対応可否を照会する。
 //! TASK-100.3（Issue #267）で公開入口 [`profile_gate`]・[`profile_gate_from_name`] と
-//! ハンドル [`ProfileGate`] を追加した。gating ロジック（TASK-100.4・#268）は
-//! [`ProfileGate`] を受け取る形で呼ばれる想定で、本モジュール自体は
-//! 「読み込み・照会・起動入口」だけを担う。
+//! ハンドル [`ProfileGate`] を追加した。TASK-100.4（Issue #268）で gating 本体
+//! [`ProfileGate::filter_declarations`]・[`ProfileGate::apply`] を追加し、computed style の
+//! 宣言列（`cssom::ComputedStyle`）から非対応プロパティの宣言を除去する
+//! （カスケード後に絞る方式。プロパティ単位のため事前に絞る方式と結果は等価）。
 //!
 //! # 線引き・注意
 //!
@@ -15,9 +16,8 @@
 //!   無関係で、その保管場所へアクセスしない。
 //! - 埋め込みデータの読み込みに失敗しても panic せず [`ProfileLoadError`] を返す
 //!   （fail-closed。全プロパティ素通しへ黙って落とさない）。
-//! - 未実装（REPAIR-3）: 非対応宣言の除去（gating 本体）は #268（TASK-100.4）の担当。
-//!   [`ProfileGate`] 単体では何も除去しない。`fandhe-browser-cli` の `--profile` 実配線も
-//!   cli 側タスクの担当で未実装。
+//! - 未実装（REPAIR-3）: `fandhe-browser-cli` の `--profile` 実配線は cli 側タスクの担当で
+//!   未実装（本モジュールはライブラリ関数として gating を提供するのみ）。
 //!
 //! JSON の解析は依存を増やさないため非公開の最小パーサーで行う（core は `serde_json`
 //! を依存に持たない。dependency-policy）。
@@ -26,6 +26,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::OnceLock;
+
+use crate::cssom::{ComputedDeclaration, ComputedStyle};
 
 const CHROME_JSON: &str = include_str!("../../../profiles/chrome.json");
 const SAFARI_JSON: &str = include_str!("../../../profiles/safari.json");
@@ -249,8 +251,8 @@ pub fn load_profile(profile: BrowserProfile) -> Result<&'static ProfileTable, Pr
 /// [`profile_gate`] / [`profile_gate_from_name`] が返す `Copy` のハンドルで、
 /// `fandhe-browser-cli` が起動時に 1 回得て保持し、computed style 取得経路へ渡す
 /// （cli 側の実配線は未実装で cli 側タスクの担当。REPAIR-3）。
-/// 宣言の除去は #268（TASK-100.4）が本ハンドルを受け取って行う拡張点で、
-/// 本型は照会アクセサのみを持ち何も除去しない。
+/// 宣言の除去は [`ProfileGate::filter_declarations`]・[`ProfileGate::apply`]
+/// （TASK-100.4・#268）が担う。
 /// Cookie・ストレージのユーザープロファイルとは無関係。TASK-100.3・`PLUG-8`・MS-8。
 #[derive(Debug, Clone, Copy)]
 pub struct ProfileGate {
@@ -287,6 +289,87 @@ impl ProfileGate {
     pub fn allows_property(&self, property: &str) -> bool {
         self.property_support(property).is_allowed()
     }
+
+    /// 宣言列から非対応（[`PropertySupport::Unsupported`]）プロパティの宣言だけを除く。
+    ///
+    /// 対応・未掲載（`--` カスタムプロパティ等）の宣言は値・重要度・由来・順序を保って残す。
+    /// 呼び出し元は computed style 取得経路（cli 配線は未実装）。確保量は入力長以下。
+    /// 無効な gate は全宣言を残す。TASK-100.4・Issue #268・`PLUG-8`・MS-8。
+    pub fn filter_declarations(&self, declarations: &[ComputedDeclaration]) -> GatedStyle {
+        let mut kept = Vec::new();
+        let mut removed = Vec::new();
+        for decl in declarations {
+            if self.allows_property(decl.property()) {
+                kept.push(decl.clone());
+            } else {
+                removed.push(decl.clone());
+            }
+        }
+        GatedStyle {
+            profile: self.profile(),
+            declarations: kept,
+            removed,
+            inline_skipped: false,
+        }
+    }
+
+    /// [`ComputedStyle`] 全体へ gating を適用する（`inline_skipped` を引き継ぐ）。
+    /// TASK-100.4・Issue #268・`PLUG-8`。
+    pub fn apply(&self, style: &ComputedStyle) -> GatedStyle {
+        let mut gated = self.filter_declarations(style.declarations());
+        gated.inline_skipped = style.inline_skipped();
+        gated
+    }
+}
+
+/// gating 適用後の宣言一覧。
+///
+/// [`ProfileGate`] が返す構造化結果で、残した宣言に加え除去した宣言も保持する
+/// （後続の検証・AI 自己補修での診断用。`REPAIR-4`）。UA 文字列等の識別面には
+/// 関与しない（`SEC-1`・`SEC-2`）。TASK-100.4・Issue #268・`PLUG-8`・MS-8。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatedStyle {
+    profile: Option<BrowserProfile>,
+    declarations: Vec<ComputedDeclaration>,
+    removed: Vec<ComputedDeclaration>,
+    inline_skipped: bool,
+}
+
+impl GatedStyle {
+    /// 適用したプロファイル。gating 無効なら `None`。
+    pub fn profile(&self) -> Option<BrowserProfile> {
+        self.profile
+    }
+
+    /// 残した宣言（入力順を保持）。
+    pub fn declarations(&self) -> &[ComputedDeclaration] {
+        &self.declarations
+    }
+
+    /// 非対応として除去した宣言（入力順）。
+    pub fn removed(&self) -> &[ComputedDeclaration] {
+        &self.removed
+    }
+
+    /// 残した宣言から property 名（小文字）で探す。除去済みは `None`。
+    pub fn get(&self, property: &str) -> Option<&ComputedDeclaration> {
+        self.declarations.iter().find(|d| d.property() == property)
+    }
+
+    /// 元の `ComputedStyle` が inline 源を skip していたか。
+    pub fn inline_skipped(&self) -> bool {
+        self.inline_skipped
+    }
+
+    /// 残した宣言数。
+    pub fn len(&self) -> usize {
+        self.declarations.len()
+    }
+
+    /// 残した宣言が無いか。
+    pub fn is_empty(&self) -> bool {
+        self.declarations.is_empty()
+    }
 }
 
 /// プロファイル指定から feature gating を起動する公開入口。
@@ -298,7 +381,7 @@ impl ProfileGate {
 /// 埋め込みデータの読み込み失敗は [`crate::Error::BrowserProfileLoad`] を返し、
 /// 黙って無効へ落とさない（fail-closed）。
 ///
-/// 未実装（REPAIR-3）: 宣言の除去は #268（TASK-100.4）。CSS 機能の有無のみを扱い、
+/// 宣言の除去は [`ProfileGate::apply`]（#268）。CSS 機能の有無のみを扱い、
 /// `navigator.userAgent` 等の識別面は読み書きしない（`SEC-1`・`SEC-2`）。
 /// TASK-100.3・Issue #267・`PLUG-8`・MS-8。
 pub fn profile_gate(profile: Option<BrowserProfile>) -> crate::Result<ProfileGate> {
@@ -597,6 +680,17 @@ mod tests {
         assert_eq!(t.property_support("q"), PropertySupport::Unsupported);
         assert_eq!(t.property_support("zzz"), PropertySupport::Unlisted);
         assert_eq!((t.property_count(), t.feature_count()), (2, 2));
+    }
+
+    #[test]
+    fn plug8_gate_apply_matches_filter_declarations() {
+        let gate = profile_gate(Some(BrowserProfile::Chrome)).expect("ok");
+        let style = ComputedStyle::default();
+        let a = gate.apply(&style);
+        let b = gate.filter_declarations(style.declarations());
+        assert_eq!(a, b);
+        assert_eq!(a.profile(), Some(BrowserProfile::Chrome));
+        assert!(a.removed().is_empty());
     }
 
     #[test]
