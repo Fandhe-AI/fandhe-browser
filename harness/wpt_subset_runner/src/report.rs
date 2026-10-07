@@ -525,6 +525,15 @@ impl WptReport {
         let mut profiles = Vec::new();
         for p in WptProfile::ALL {
             if let Some(run) = runs.iter().find(|r| r.profile == p) {
+                // 件数だけでなくエントリごとに対応を検証する。testharness は Skipped 以外、
+                // reftest・other は Skipped であること（入れ替わりで分母と実行不能記録が
+                // 食い違うのを防ぐ。fail-closed）。
+                for (entry, outcome) in &run.results {
+                    let must_skip = classify_unrunnable(entry.harness.as_str())?.is_some();
+                    if must_skip != matches!(outcome, FileOutcome::Skipped { .. }) {
+                        return Err(ReportError::InconsistentSkipCount { profile: p });
+                    }
+                }
                 let summary = ProfileSummary::from_run(run);
                 if summary.skipped() != unrunnable.total() {
                     return Err(ReportError::InconsistentSkipCount { profile: p });
@@ -934,6 +943,34 @@ mod tests {
         }
         assert_eq!(
             WptReport::from_runs(&[bad], None),
+            Err(ReportError::InconsistentSkipCount {
+                profile: WptProfile::Chrome
+            })
+        );
+        // 件数は一致するが対応が入れ替わった入力（testharness を Skipped・reftest を Completed）。
+        let mut swapped = sample_run(WptProfile::Chrome);
+        let mut done_idx = None;
+        let mut skip_idx = None;
+        for (i, (e, o)) in swapped.results.iter().enumerate() {
+            if e.harness == HarnessKind::Testharness && done_idx.is_none() {
+                done_idx = Some(i);
+            }
+            if matches!(o, FileOutcome::Skipped { .. })
+                && e.harness == HarnessKind::Reftest
+                && skip_idx.is_none()
+            {
+                skip_idx = Some(i);
+            }
+        }
+        if let (Some(a), Some(b)) = (done_idx, skip_idx) {
+            let (x, y) = (swapped.results[a].1.clone(), swapped.results[b].1.clone());
+            swapped.results[a].1 = y;
+            swapped.results[b].1 = x;
+        } else {
+            panic!("sample_run lacks testharness/reftest entries");
+        }
+        assert_eq!(
+            WptReport::from_runs(&[swapped], None),
             Err(ReportError::InconsistentSkipCount {
                 profile: WptProfile::Chrome
             })
