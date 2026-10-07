@@ -184,7 +184,10 @@ function countFormFields(nodes) {
         if (n.attributes[i] === "name" && n.attributes[i + 1] !== "") count++;
       }
     }
-    if (Array.isArray(n.children)) stack.push(...n.children);
+    // 展開引数の上限（RangeError）を避けるため 1 件ずつ積む（CDP は 1 文書 20 万ノードまで許容）
+    if (Array.isArray(n.children)) {
+      for (const c of n.children) stack.push(c);
+    }
   }
   return count;
 }
