@@ -258,13 +258,24 @@ async function main() {
     fatal(`discovery failed: ${String(e.message).slice(0, 100)}`);
   }
   const ws = new WebSocket(disc.ws);
+  // 接続待ちにも期限を適用する（/json/version は応答するが handshake が完了しないサーバー対策）。
+  // 期限は --total-timeout と --task-timeout の小さい方で、接続に使った時間は総予算から差し引く
+  const start = Date.now();
+  const connectMs = Math.min(taskTimeoutMs, totalTimeoutMs);
   await new Promise((resolve, reject) => {
-    ws.addEventListener("open", resolve, { once: true });
-    ws.addEventListener("error", () => reject(new Error("websocket connect failed")), { once: true });
-  }).catch((e) => fatal(e.message));
+    const timer = setTimeout(() => reject(new Error("websocket connect timeout")), connectMs);
+    ws.addEventListener("open", () => { clearTimeout(timer); resolve(); }, { once: true });
+    ws.addEventListener("error", () => { clearTimeout(timer); reject(new Error("websocket connect failed")); }, { once: true });
+  }).catch((e) => {
+    try {
+      ws.close();
+    } catch {
+      // 切断失敗は致命エラー処理に影響しない
+    }
+    fatal(e.message);
+  });
   emit({ type: "browser", cdp_browser: disc.browser });
   const cdp = new Cdp(ws);
-  const start = Date.now();
   for (const t of tasks) {
     const left = totalTimeoutMs - (Date.now() - start);
     let r;
