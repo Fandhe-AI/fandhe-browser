@@ -28,6 +28,11 @@
 //! `config`（TASK-91（91.1）・Issue #214）は [`Error::Config`] を追加し、
 //! [`crate::config::ConfigError`] を payload として保持する（`Parse`/
 //! `ParseError` と同じ「専用エラー型を variant に包む」方式）。
+//!
+//! `cssom_profile`（TASK-100.3・Issue #267・`PLUG-8`）は [`Error::BrowserProfileLoad`]
+//! （埋め込みデータ不正）と [`Error::BrowserProfileName`]（未知のプロファイル名）を
+//! 追加する。CLI が variant で分岐して固定文言・終了コードへ写像できるようにするため、
+//! `InvalidInput` へ潰さず専用エラー型を保持する。
 
 use std::fmt;
 use std::time::Duration;
@@ -162,6 +167,12 @@ pub enum Error {
     /// 対象ビヘイビアなし）が `fandhe-browser.toml` 相当の TOML 読み込み・
     /// 解釈に失敗した場合に返す。詳細は [`crate::config::ConfigError`] を参照。
     Config(crate::config::ConfigError),
+    /// `cssom_profile`（TASK-100.3・Issue #267・`PLUG-8`）の埋め込みプロファイルデータの
+    /// 読み込みに失敗した場合に返す（fail-closed。素通しへ落とさない）。
+    BrowserProfileLoad(crate::cssom_profile::ProfileLoadError),
+    /// `cssom_profile`（TASK-100.3・Issue #267・`PLUG-8`）へ未知のプロファイル名が
+    /// 渡された場合に返す。payload 内の入力値は 64 バイトへ切り詰め済み。
+    BrowserProfileName(crate::cssom_profile::BrowserProfileParseError),
 }
 
 impl fmt::Display for Error {
@@ -196,6 +207,10 @@ impl fmt::Display for Error {
                 write!(f, "selector match cache exceeded limit of {limit} entries")
             }
             Error::Config(source) => write!(f, "configuration error: {source}"),
+            Error::BrowserProfileLoad(source) => {
+                write!(f, "browser profile data error: {source}")
+            }
+            Error::BrowserProfileName(source) => write!(f, "invalid browser profile: {source}"),
         }
     }
 }
@@ -218,6 +233,8 @@ impl std::error::Error for Error {
             | Error::Network { .. }
             | Error::MatchCacheLimitExceeded { .. } => None,
             Error::Config(source) => Some(source),
+            Error::BrowserProfileLoad(source) => Some(source),
+            Error::BrowserProfileName(source) => Some(source),
         }
     }
 }
@@ -225,6 +242,18 @@ impl std::error::Error for Error {
 impl From<ParseError> for Error {
     fn from(source: ParseError) -> Self {
         Error::Parse(source)
+    }
+}
+
+impl From<crate::cssom_profile::ProfileLoadError> for Error {
+    fn from(source: crate::cssom_profile::ProfileLoadError) -> Self {
+        Error::BrowserProfileLoad(source)
+    }
+}
+
+impl From<crate::cssom_profile::BrowserProfileParseError> for Error {
+    fn from(source: crate::cssom_profile::BrowserProfileParseError) -> Self {
+        Error::BrowserProfileName(source)
     }
 }
 
@@ -709,5 +738,47 @@ mod tests {
             err,
             Error::Config(crate::config::ConfigError::InvalidUtf8)
         ));
+    }
+
+    /// TASK-100.3・Issue #267・`PLUG-8`: `BrowserProfileLoad` の Display・source・`From`。
+    #[test]
+    fn plug8_browser_profile_load_display_source_and_from() {
+        use crate::cssom_profile::ProfileLoadError;
+        fn load() -> Result<()> {
+            Err(ProfileLoadError::BrowserMismatch)?
+        }
+        let err = load().expect_err("load は常に失敗する");
+        assert!(matches!(
+            err,
+            Error::BrowserProfileLoad(ProfileLoadError::BrowserMismatch)
+        ));
+        assert_eq!(
+            err.to_string(),
+            "browser profile data error: profile data browser does not match requested profile"
+        );
+        assert_eq!(
+            std::error::Error::source(&err).map(ToString::to_string),
+            Some("profile data browser does not match requested profile".to_string())
+        );
+    }
+
+    /// TASK-100.3・Issue #267・`PLUG-8`: `BrowserProfileName` の Display・source・`From`。
+    #[test]
+    fn plug8_browser_profile_name_display_source_and_from() {
+        use crate::cssom_profile::BrowserProfileParseError;
+        fn parse() -> Result<()> {
+            Err(BrowserProfileParseError::Unknown {
+                value: "firefox".to_string(),
+            })?
+        }
+        let err = parse().expect_err("parse は常に失敗する");
+        assert_eq!(
+            err.to_string(),
+            "invalid browser profile: unknown browser profile 'firefox' (expected chrome or safari)"
+        );
+        assert_eq!(
+            std::error::Error::source(&err).map(ToString::to_string),
+            Some("unknown browser profile 'firefox' (expected chrome or safari)".to_string())
+        );
     }
 }

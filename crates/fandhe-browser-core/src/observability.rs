@@ -108,6 +108,10 @@ pub enum FailureKind {
     MatchCacheLimitExceeded,
     /// [`Error::Config`] に対応（TASK-91（91.1）・Issue #214）。
     Config,
+    /// [`Error::BrowserProfileLoad`] に対応（TASK-100.3・Issue #267・`PLUG-8`）。
+    BrowserProfileLoad,
+    /// [`Error::BrowserProfileName`] に対応（TASK-100.3・Issue #267・`PLUG-8`）。
+    BrowserProfileName,
 }
 
 impl FailureKind {
@@ -129,6 +133,8 @@ impl FailureKind {
             FailureKind::Network => "network",
             FailureKind::MatchCacheLimitExceeded => "match_cache_limit_exceeded",
             FailureKind::Config => "config",
+            FailureKind::BrowserProfileLoad => "browser_profile_load",
+            FailureKind::BrowserProfileName => "browser_profile_name",
         }
     }
 }
@@ -160,6 +166,8 @@ impl From<&Error> for FailureKind {
             Error::Network { .. } => FailureKind::Network,
             Error::MatchCacheLimitExceeded { .. } => FailureKind::MatchCacheLimitExceeded,
             Error::Config(_) => FailureKind::Config,
+            Error::BrowserProfileLoad(_) => FailureKind::BrowserProfileLoad,
+            Error::BrowserProfileName(_) => FailureKind::BrowserProfileName,
         }
     }
 }

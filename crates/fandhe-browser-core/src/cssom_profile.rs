@@ -2,8 +2,10 @@
 //!
 //! TASK-100.2（Issue #266）・`PLUG-8`・MS-8。`profiles/chrome.json`・`profiles/safari.json`
 //! （TASK-100.1・#265）をバイナリへ埋め込み、CSS プロパティ単位の対応可否を照会する。
-//! 後続の公開 API（TASK-100.3・#267）と gating ロジック（TASK-100.4・#268）から
-//! 呼ばれる土台で、本モジュール自体は「読み込みと照会」だけを担う。
+//! TASK-100.3（Issue #267）で公開入口 [`profile_gate`]・[`profile_gate_from_name`] と
+//! ハンドル [`ProfileGate`] を追加した。gating ロジック（TASK-100.4・#268）は
+//! [`ProfileGate`] を受け取る形で呼ばれる想定で、本モジュール自体は
+//! 「読み込み・照会・起動入口」だけを担う。
 //!
 //! # 線引き・注意
 //!
@@ -13,8 +15,9 @@
 //!   無関係で、その保管場所へアクセスしない。
 //! - 埋め込みデータの読み込みに失敗しても panic せず [`ProfileLoadError`] を返す
 //!   （fail-closed。全プロパティ素通しへ黙って落とさない）。
-//! - 未実装（REPAIR-3）: 非対応宣言の除去（gating 本体）は #268、公開 API・
-//!   [`crate::error::Error`] への統合は #267 の担当。
+//! - 未実装（REPAIR-3）: 非対応宣言の除去（gating 本体）は #268（TASK-100.4）の担当。
+//!   [`ProfileGate`] 単体では何も除去しない。`fandhe-browser-cli` の `--profile` 実配線も
+//!   cli 側タスクの担当で未実装。
 //!
 //! JSON の解析は依存を増やさないため非公開の最小パーサーで行う（core は `serde_json`
 //! を依存に持たない。dependency-policy）。
@@ -229,8 +232,8 @@ impl fmt::Display for ProfileLoadError {
 
 impl std::error::Error for ProfileLoadError {}
 
-/// 埋め込みプロファイルを（初回のみ解析して）返す。呼び出し元は #267 の公開 API・
-/// #268 の gating。失敗時の扱い（素通しにするか）は呼び出し側が決める。
+/// 埋め込みプロファイルを（初回のみ解析して）返す。呼び出し元は [`profile_gate`]
+/// （#267）・#268 の gating。失敗時の扱い（素通しにするか）は呼び出し側が決める。
 pub fn load_profile(profile: BrowserProfile) -> Result<&'static ProfileTable, ProfileLoadError> {
     static CHROME: OnceLock<Result<ProfileTable, ProfileLoadError>> = OnceLock::new();
     static SAFARI: OnceLock<Result<ProfileTable, ProfileLoadError>> = OnceLock::new();
@@ -239,6 +242,83 @@ pub fn load_profile(profile: BrowserProfile) -> Result<&'static ProfileTable, Pr
         BrowserProfile::Safari => SAFARI.get_or_init(|| build_table(profile, SAFARI_JSON)),
     };
     cell.as_ref().map_err(Clone::clone)
+}
+
+/// feature gating の起動結果（無効、または指定プロファイルで有効）。
+///
+/// [`profile_gate`] / [`profile_gate_from_name`] が返す `Copy` のハンドルで、
+/// `fandhe-browser-cli` が起動時に 1 回得て保持し、computed style 取得経路へ渡す
+/// （cli 側の実配線は未実装で cli 側タスクの担当。REPAIR-3）。
+/// 宣言の除去は #268（TASK-100.4）が本ハンドルを受け取って行う拡張点で、
+/// 本型は照会アクセサのみを持ち何も除去しない。
+/// Cookie・ストレージのユーザープロファイルとは無関係。TASK-100.3・`PLUG-8`・MS-8。
+#[derive(Debug, Clone, Copy)]
+pub struct ProfileGate {
+    table: Option<&'static ProfileTable>,
+}
+
+impl ProfileGate {
+    /// gating 無効（`--profile` 指定なし）。全プロパティを素通しとして扱う。
+    pub const fn disabled() -> Self {
+        Self { table: None }
+    }
+
+    /// 有効時のプロファイル種別。無効なら `None`。
+    pub fn profile(&self) -> Option<BrowserProfile> {
+        self.table.map(ProfileTable::profile)
+    }
+
+    /// gating が有効（プロファイル指定あり）か。
+    pub fn is_enabled(&self) -> bool {
+        self.table.is_some()
+    }
+
+    /// プロパティの対応可否を返す。無効時は [`PropertySupport::Unlisted`]。
+    /// `property` は ASCII 小文字に正規化済みであること
+    /// （`cssom::Declaration::property` と同じ契約）。
+    pub fn property_support(&self, property: &str) -> PropertySupport {
+        match self.table {
+            Some(table) => table.property_support(property),
+            None => PropertySupport::Unlisted,
+        }
+    }
+
+    /// 宣言を残してよいか。無効時と未掲載は `true`。
+    pub fn allows_property(&self, property: &str) -> bool {
+        self.property_support(property).is_allowed()
+    }
+}
+
+/// プロファイル指定から feature gating を起動する公開入口。
+///
+/// 呼び出し元: `fandhe-browser-cli` が起動時に `--profile chrome|safari` を解釈し、
+/// 値があれば `Some`、無ければ `None` を渡して 1 回呼ぶ（cli の実配線は未実装・cli 側
+/// タスクの担当）。`None` は [`ProfileGate::disabled`] を返す。
+/// 呼び出し先: [`load_profile`]（初回のみ解析し以後は `&'static` を共有。スレッド安全）。
+/// 埋め込みデータの読み込み失敗は [`crate::Error::BrowserProfileLoad`] を返し、
+/// 黙って無効へ落とさない（fail-closed）。
+///
+/// 未実装（REPAIR-3）: 宣言の除去は #268（TASK-100.4）。CSS 機能の有無のみを扱い、
+/// `navigator.userAgent` 等の識別面は読み書きしない（`SEC-1`・`SEC-2`）。
+/// TASK-100.3・Issue #267・`PLUG-8`・MS-8。
+pub fn profile_gate(profile: Option<BrowserProfile>) -> crate::Result<ProfileGate> {
+    match profile {
+        None => Ok(ProfileGate::disabled()),
+        Some(p) => Ok(ProfileGate {
+            table: Some(load_profile(p)?),
+        }),
+    }
+}
+
+/// CLI の `--profile` 値（文字列）から直接 gating を起動する糖衣。
+///
+/// 呼び出し元: `fandhe-browser-cli` が引数文字列をそのまま渡す。完全一致の
+/// `chrome` / `safari` のみ受理し（trim・小文字化はしない）、未知の名前は
+/// [`crate::Error::BrowserProfileName`]（入力値は 64 バイトへ切り詰め済み）を返す。
+/// 他の契約は [`profile_gate`] と同じ。TASK-100.3・Issue #267・`PLUG-8`。
+pub fn profile_gate_from_name(name: Option<&str>) -> crate::Result<ProfileGate> {
+    let profile = name.map(str::parse::<BrowserProfile>).transpose()?;
+    profile_gate(profile)
 }
 
 /// 簡易照会。未掲載プロパティは `Ok(true)`。

@@ -60,7 +60,8 @@
 //! 外部入力の上限検証（105.7・#261）も含む。結合テスト（105.8・#262・`tests/cssom.rs`）も含む
 //! （`!important` 未反映等は [`cssom`] の doc を参照）。
 //! [`cssom_profile`] モジュール（TASK-100.2・#266・`PLUG-8`・MS-8）は `profiles/*.json` を
-//! 埋め込み、CSS プロパティ単位の対応可否を照会する（gating 本体は #268 の担当）。
+//! 埋め込み、CSS プロパティ単位の対応可否を照会する。TASK-100.3（#267）で公開入口
+//! [`profile_gate`] を追加した（gating 本体は #268 の担当）。
 //!
 //! # スタブについて
 //!
@@ -98,6 +99,7 @@ pub use cssom::{
     ComputedDeclaration, ComputedStyle, Declaration, DeclarationOrigin, Importance, Specificity,
     StyleRule, Stylesheet,
 };
+pub use cssom_profile::{BrowserProfile, ProfileGate, profile_gate, profile_gate_from_name};
 pub use dom::{
     Ancestors, Attribute, Children, Descendants, Document, Node, NodeData, NodeId, QuirksMode,
 };
