@@ -8,8 +8,11 @@
 //! `harnessBreakdown` との一致、`file` のパス規則・一意性（ランナーと同じ `parse_subset_tsv`）、
 //! `dir` と `perDirectorySummary` の整合、`wptRevision` の形式。
 //!
-//! 未検証（行走査では扱えないため）: 各フィールドの JSON 型の厳密検証、`mappedFeatures` 配列要素、
-//! 未知キーの検出。これらは JSON パーサー（依存追加でユーザー承認事項）の導入後に扱う。
+//! 行走査は JSON 構文を検証しないため、依存なしの最小 JSON 構文検証器（`validate_json_syntax`。
+//! RFC 8259 の再帰下降・深さ上限付き）を別途かけ、カンマ・括弧・引用符の欠落や末尾ゴミを検出する。
+//!
+//! 未検証: 各フィールドの JSON 型の厳密検証、`mappedFeatures` 配列要素、未知キーの検出
+//! （構文検証のみで値は構築しないため。JSON パーサー依存の導入はユーザー承認事項）。
 
 use wpt_subset_runner::HarnessKind;
 use wpt_subset_runner::runner::parse_subset_tsv;
@@ -135,6 +138,188 @@ fn parse(json: &str) -> Parsed {
         }
     }
     out
+}
+
+/// 依存なしの最小 JSON 構文検証器（値は構築しない）。深さ上限 64 で再帰を抑える。
+struct Syntax<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl Syntax<'_> {
+    fn ws(&mut self) {
+        while matches!(self.b.get(self.i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.i += 1;
+        }
+    }
+
+    fn lit(&mut self, w: &str) -> Result<(), String> {
+        if self.b.get(self.i..self.i + w.len()) == Some(w.as_bytes()) {
+            self.i += w.len();
+            Ok(())
+        } else {
+            Err(format!("bad literal at {}", self.i))
+        }
+    }
+
+    fn string(&mut self) -> Result<(), String> {
+        self.i += 1; // 開始の引用符
+        loop {
+            match self.b.get(self.i) {
+                None => return Err("unterminated string".into()),
+                Some(b'"') => {
+                    self.i += 1;
+                    return Ok(());
+                }
+                Some(b'\\') => match self.b.get(self.i + 1) {
+                    Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => self.i += 2,
+                    Some(b'u')
+                        if self
+                            .b
+                            .get(self.i + 2..self.i + 6)
+                            .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit)) =>
+                    {
+                        self.i += 6
+                    }
+                    _ => return Err(format!("bad escape at {}", self.i)),
+                },
+                Some(c) if *c < 0x20 => return Err(format!("control char at {}", self.i)),
+                Some(_) => self.i += 1,
+            }
+        }
+    }
+
+    fn digits(&mut self) -> bool {
+        let st = self.i;
+        while matches!(self.b.get(self.i), Some(b'0'..=b'9')) {
+            self.i += 1;
+        }
+        self.i > st
+    }
+
+    fn number(&mut self) -> Result<(), String> {
+        let start = self.i;
+        if self.b.get(self.i) == Some(&b'-') {
+            self.i += 1;
+        }
+        if !self.digits() {
+            return Err(format!("bad number at {start}"));
+        }
+        if self.b.get(self.i) == Some(&b'.') {
+            self.i += 1;
+            if !self.digits() {
+                return Err(format!("bad fraction at {start}"));
+            }
+        }
+        if matches!(self.b.get(self.i), Some(b'e' | b'E')) {
+            self.i += 1;
+            if matches!(self.b.get(self.i), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            if !self.digits() {
+                return Err(format!("bad exponent at {start}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn value(&mut self, depth: usize) -> Result<(), String> {
+        if depth > 64 {
+            return Err("too deep".into());
+        }
+        self.ws();
+        match self.b.get(self.i) {
+            Some(b'{') => {
+                self.i += 1;
+                self.ws();
+                if self.b.get(self.i) == Some(&b'}') {
+                    self.i += 1;
+                    return Ok(());
+                }
+                loop {
+                    self.ws();
+                    if self.b.get(self.i) != Some(&b'"') {
+                        return Err(format!("expected key at {}", self.i));
+                    }
+                    self.string()?;
+                    self.ws();
+                    if self.b.get(self.i) != Some(&b':') {
+                        return Err(format!("expected ':' at {}", self.i));
+                    }
+                    self.i += 1;
+                    self.value(depth + 1)?;
+                    self.ws();
+                    match self.b.get(self.i) {
+                        Some(b',') => self.i += 1,
+                        Some(b'}') => {
+                            self.i += 1;
+                            return Ok(());
+                        }
+                        _ => return Err(format!("expected ',' or '}}' at {}", self.i)),
+                    }
+                }
+            }
+            Some(b'[') => {
+                self.i += 1;
+                self.ws();
+                if self.b.get(self.i) == Some(&b']') {
+                    self.i += 1;
+                    return Ok(());
+                }
+                loop {
+                    self.value(depth + 1)?;
+                    self.ws();
+                    match self.b.get(self.i) {
+                        Some(b',') => self.i += 1,
+                        Some(b']') => {
+                            self.i += 1;
+                            return Ok(());
+                        }
+                        _ => return Err(format!("expected ',' or ']' at {}", self.i)),
+                    }
+                }
+            }
+            Some(b'"') => self.string(),
+            Some(b't') => self.lit("true"),
+            Some(b'f') => self.lit("false"),
+            Some(b'n') => self.lit("null"),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            _ => Err(format!("unexpected token at {}", self.i)),
+        }
+    }
+}
+
+/// JSON 構文（括弧の対応・カンマ区切り・引用符・末尾ゴミ）を検証する。
+fn validate_json_syntax(json: &str) -> Result<(), String> {
+    let mut s = Syntax {
+        b: json.as_bytes(),
+        i: 0,
+    };
+    s.value(0)?;
+    s.ws();
+    if s.i == s.b.len() {
+        Ok(())
+    } else {
+        Err(format!("trailing data at {}", s.i))
+    }
+}
+
+#[test]
+fn plug_10_subset_json_is_syntactically_valid() {
+    validate_json_syntax(SUBSET_JSON).expect("wpt-subset.json is valid JSON");
+}
+
+#[test]
+fn plug_10_syntax_validator_rejects_broken_json() {
+    // 行走査だけなら素通りしうる破損（区切りカンマ・閉じ括弧の欠落）を検出できること。
+    let missing_comma = SUBSET_JSON.replacen("\",\n", "\"\n", 1);
+    assert_ne!(missing_comma, SUBSET_JSON);
+    assert!(validate_json_syntax(&missing_comma).is_err());
+    let missing_close = SUBSET_JSON.trim_end().trim_end_matches('}').to_string();
+    assert!(validate_json_syntax(&missing_close).is_err());
+    assert!(validate_json_syntax(&format!("{SUBSET_JSON} x")).is_err());
+    assert!(validate_json_syntax("{\"a\": [1, 2,]}").is_err());
+    assert!(validate_json_syntax("{\"a\": [1, {\"b\": null}], \"c\": -1.5e3}").is_ok());
 }
 
 #[test]
