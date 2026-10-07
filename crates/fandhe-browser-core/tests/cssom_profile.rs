@@ -329,3 +329,214 @@ mod gating {
         assert!(g.inline_skipped());
     }
 }
+
+// ---- TASK-100.5（Issue #269）: Chrome / Safari 差分プロパティの除去 ----
+
+/// Chrome と Safari でプロパティ単位の対応可否が分かれるものを使い、
+/// gating（`ProfileGate::apply`）が双方向に働くことを具体値で固定する（`PLUG-8`・MS-8）。
+///
+/// 埋め込みデータ上の実際の差分は 3 件のみ（Chrome のみ: `interpolate-size`・
+/// `text-size-adjust`、Safari のみ: `hanging-punctuation`）。Issue 例示の
+/// `user-select`・`position-area` は `profiles/README.md` の手動補正で両対応のため
+/// 差分ではなく「どちらでも除去されない」側として検証する。
+mod diff {
+    use fandhe_browser_core::cssom::{
+        DeclarationOrigin, collect_document_styles, computed_style_in_document,
+    };
+    use fandhe_browser_core::cssom_profile::{PropertySupport, load_profile};
+    use fandhe_browser_core::{
+        BrowserProfile, ComputedStyle, ParseOptions, parse_document, profile_gate,
+    };
+
+    const CHROME_JSON: &str = include_str!("../../../profiles/chrome.json");
+    const SAFARI_JSON: &str = include_str!("../../../profiles/safari.json");
+
+    const CHROME_ONLY: [&str; 2] = ["interpolate-size", "text-size-adjust"];
+    const SAFARI_ONLY: [&str; 1] = ["hanging-punctuation"];
+
+    const HTML: &str = r#"<style>p { text-size-adjust: 100%; interpolate-size: allow-keywords; hanging-punctuation: first; user-select: none; position-area: top; width: 10px }</style><p>x</p>"#;
+
+    fn style_of(html: &str) -> ComputedStyle {
+        let doc = parse_document(html, &ParseOptions::default())
+            .expect("parse")
+            .document;
+        let styles = collect_document_styles(&doc).expect("collect");
+        let p = doc
+            .descendants(doc.root())
+            .find(|&i| doc.local_name(i) == Some("p"))
+            .expect("p");
+        computed_style_in_document(&doc, p, &styles).expect("computed")
+    }
+
+    fn removed_pairs(p: BrowserProfile, style: &ComputedStyle) -> Vec<(String, String)> {
+        profile_gate(Some(p))
+            .expect("gate")
+            .apply(style)
+            .removed()
+            .iter()
+            .map(|d| (d.property().to_string(), d.value().to_string()))
+            .collect()
+    }
+
+    fn pair(a: &str, b: &str) -> (String, String) {
+        (a.to_string(), b.to_string())
+    }
+
+    #[test]
+    fn plug8_diff_safari_removes_chrome_only_properties() {
+        let style = style_of(HTML);
+        assert_eq!(
+            removed_pairs(BrowserProfile::Safari, &style),
+            [
+                pair("interpolate-size", "allow-keywords"),
+                pair("text-size-adjust", "100%")
+            ]
+        );
+        let s = profile_gate(Some(BrowserProfile::Safari))
+            .expect("gate")
+            .apply(&style);
+        assert!(s.get("interpolate-size").is_none());
+        assert!(s.get("text-size-adjust").is_none());
+        // 対照: Chrome では同じ 2 件が値つきで残る。
+        let c = profile_gate(Some(BrowserProfile::Chrome))
+            .expect("gate")
+            .apply(&style);
+        assert_eq!(
+            c.get("interpolate-size").expect("kept").value(),
+            "allow-keywords"
+        );
+        assert_eq!(c.get("text-size-adjust").expect("kept").value(), "100%");
+    }
+
+    #[test]
+    fn plug8_diff_chrome_removes_safari_only_property() {
+        let style = style_of(HTML);
+        assert_eq!(
+            removed_pairs(BrowserProfile::Chrome, &style),
+            [pair("hanging-punctuation", "first")]
+        );
+        let c = profile_gate(Some(BrowserProfile::Chrome))
+            .expect("gate")
+            .apply(&style);
+        assert!(c.get("hanging-punctuation").is_none());
+        let s = profile_gate(Some(BrowserProfile::Safari))
+            .expect("gate")
+            .apply(&style);
+        assert_eq!(s.get("hanging-punctuation").expect("kept").value(), "first");
+    }
+
+    #[test]
+    fn plug8_diff_common_and_unlisted_survive_both() {
+        let style = style_of(HTML);
+        for p in [BrowserProfile::Chrome, BrowserProfile::Safari] {
+            let g = profile_gate(Some(p)).expect("gate").apply(&style);
+            assert_eq!(g.get("user-select").expect("us").value(), "none");
+            assert_eq!(g.get("position-area").expect("pa").value(), "top");
+            assert_eq!(g.get("width").expect("w").value(), "10px");
+            assert_eq!(g.len() + g.removed().len(), style.len());
+        }
+    }
+
+    #[test]
+    fn plug8_diff_keeps_origin_and_ignores_importance() {
+        let style = style_of(&HTML.replace(
+            "<p>",
+            r#"<p style="text-size-adjust: none !important; color: red !important">"#,
+        ));
+        let g = profile_gate(Some(BrowserProfile::Safari))
+            .expect("gate")
+            .apply(&style);
+        let removed = g
+            .removed()
+            .iter()
+            .find(|d| d.property() == "text-size-adjust")
+            .expect("removed");
+        assert_eq!(removed.value(), "none");
+        assert_eq!(removed.origin(), DeclarationOrigin::Inline);
+        assert_eq!(
+            removed.importance(),
+            style.get("text-size-adjust").expect("orig").importance()
+        );
+        // 残存側は由来・重要度が元のまま。
+        let color = g.get("color").expect("color");
+        assert_eq!(color.value(), "red");
+        assert_eq!(color.origin(), DeclarationOrigin::Inline);
+        assert_eq!(
+            color.importance(),
+            style.get("color").expect("orig").importance()
+        );
+        let width = g.get("width").expect("width");
+        assert!(matches!(width.origin(), DeclarationOrigin::Rule { .. }));
+        assert_eq!(width.origin(), style.get("width").expect("o").origin());
+    }
+
+    /// `cssProperties` ブロックのキーを行単位で抜き出す（データは自前生成の固定書式）。
+    fn css_property_keys(json: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut inside = false;
+        for line in json.lines() {
+            if !inside {
+                inside = line.trim_end() == r#"  "cssProperties": {"#;
+            } else if line.trim_start().starts_with('}') {
+                break;
+            } else if let Some(rest) = line.trim_start().strip_prefix('"')
+                && let Some((k, _)) = rest.split_once('"')
+            {
+                keys.push(k.to_string());
+            }
+        }
+        keys
+    }
+
+    #[test]
+    fn plug8_diff_property_set_is_exactly_three() {
+        let chrome = load_profile(BrowserProfile::Chrome).expect("chrome");
+        let safari = load_profile(BrowserProfile::Safari).expect("safari");
+        for n in CHROME_ONLY {
+            assert_eq!(
+                chrome.property_support(n),
+                PropertySupport::Supported,
+                "{n}"
+            );
+            assert_eq!(
+                safari.property_support(n),
+                PropertySupport::Unsupported,
+                "{n}"
+            );
+        }
+        for n in SAFARI_ONLY {
+            assert_eq!(
+                chrome.property_support(n),
+                PropertySupport::Unsupported,
+                "{n}"
+            );
+            assert_eq!(
+                safari.property_support(n),
+                PropertySupport::Supported,
+                "{n}"
+            );
+        }
+        // 取りこぼしを黙って通さない（fail-closed）: 抽出数がテーブル件数と一致すること。
+        // Safari 側にだけ追加されたキーも見逃さないよう、両プロファイルのキーの和集合を走査する。
+        let chrome_keys = css_property_keys(CHROME_JSON);
+        let safari_keys = css_property_keys(SAFARI_JSON);
+        assert_eq!(chrome_keys.len(), chrome.property_count());
+        assert_eq!(safari_keys.len(), safari.property_count());
+        let mut keys = chrome_keys;
+        keys.extend(safari_keys);
+        keys.sort();
+        keys.dedup();
+        let mut chrome_only = Vec::new();
+        let mut safari_only = Vec::new();
+        for k in &keys {
+            match (chrome.property_support(k), safari.property_support(k)) {
+                (a, b) if a == b => {}
+                (PropertySupport::Supported, _) => chrome_only.push(k.as_str()),
+                (_, PropertySupport::Supported) => safari_only.push(k.as_str()),
+                other => panic!("unexpected pair for {k}: {other:?}"),
+            }
+        }
+        assert_eq!(chrome_only, CHROME_ONLY);
+        assert_eq!(safari_only, SAFARI_ONLY);
+    }
+}
