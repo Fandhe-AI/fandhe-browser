@@ -44,10 +44,35 @@ fn page(script: &str) -> String {
     format!("{HEAD}<script>\n{script}\n</script>\n")
 }
 
+/// 一意な一時ディレクトリを原子的に新規作成する。
+///
+/// `create_dir` は既存パスに対して `AlreadyExists` で失敗するため、PID の再利用や
+/// 他プロセスとの衝突時も既存ディレクトリを削除せず、別名で再試行する。
+/// 作成に成功したディレクトリのみが `TreeGuard` の削除対象になる。
+fn create_unique_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    for _ in 0..100 {
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "wpt-runner-e2e-{}-{nanos}-{seq}",
+            std::process::id()
+        ));
+        match fs::create_dir(&root) {
+            Ok(()) => return root,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("create temp dir: {e}"),
+        }
+    }
+    panic!("could not create a unique temp dir");
+}
+
 /// ダミーケースの一時ツリーを作る。`dom/absent.html`・reftest・other は作らない。
 fn build_tree() -> TreeGuard {
-    let root = std::env::temp_dir().join(format!("wpt-runner-e2e-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+    let root = create_unique_dir();
     write(&root, "resources/testharness.js", FAKE_TESTHARNESS);
     write(
         &root,
