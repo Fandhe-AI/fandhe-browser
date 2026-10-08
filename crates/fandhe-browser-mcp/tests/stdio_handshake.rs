@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use rmcp::serde_json::{self, Value};
 
+mod support;
+
 struct Output {
     stdout: String,
     stderr: String,
@@ -14,7 +16,17 @@ struct Output {
 
 /// バイナリを起動し、`input`（None なら即 EOF）を送って期限付きで完了を待つ。
 fn run(input: Option<&str>) -> Output {
+    // 起動時の自己申告（TASK-94.5）に応じる偽ホストを立てる。
+    let host = support::FakeHost::spawn(200, r#"{"ok":true,"id":"fandhe-browser-mcp"}"#);
+    let out = run_with_host(input, &host.addr());
+    host.finish();
+    out
+}
+
+/// `FANDHE_BROWSER_HOST_ADDR` を指定してバイナリを起動する。
+fn run_with_host(input: Option<&str>, addr: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-browser-mcp"))
+        .env("FANDHE_BROWSER_HOST_ADDR", addr)
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {

@@ -3,15 +3,15 @@
 //! `main.rs` が stdio トランスポート上でこのハンドラを起動する。現状は initialize
 //! ハンドシェイクに応答するだけの基盤で、ツールは未実装のため capabilities を空にし、
 //! 実装済みを装わない（REPAIR-3）。将来仕様: TASK-94.3 で navigate、TASK-94.4 で
-//! snapshot を追加して `enable_tools()` を広告し、TASK-94.5 でホストへ自己申告する
-//! （PLUG-3・PLUG-4）。
+//! snapshot を追加して `enable_tools()` を広告する（PLUG-3・PLUG-4）。ホストへの自己申告は
+//! 実装済みで `register.rs` が担う（TASK-94.5）。
 
 use rmcp::ServerHandler;
 use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerConfig};
 
 /// サーバーが採用する MCP プロトコル版。stdio は initialize ハンドシェイクを使うため、
 /// それを持つ 2025-11-25 に固定する（`LATEST` は将来 initialize を廃した版へ進み得る）。
-/// TASK-94.5 の自己申告も同じ定数を参照する。
+/// `register.rs` の自己申告（TASK-94.5）も同じ定数を参照する。
 pub(crate) const SERVER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
 
 /// fandhe-browser の MCP 参照プラグイン本体。状態を持たない（ツール群は TASK-94.3 以降で追加）。
