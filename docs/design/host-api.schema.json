@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Fandhe-AI/fandhe-browser/blob/main/docs/design/host-api.schema.json",
+  "title": "fandhe-browser Host API (plugin boundary)",
+  "description": "ホスト API のプラグイン関連契約（PLUG-2・TASK-92・MS-9）。POST /ai/plugins/register・GET /ai/plugins・マニフェスト形式を定義する。土台は PoC-15 版のスキーマだが、正本は Rust 側の crates/fandhe-browser-ai/src/plugin_api.rs と crates/fandhe-browser-ai/src/api.rs で、本ファイルはそれに合わせている（乖離は plugin_api の schema_contract_tests が検知する）。paths は OpenAPI ではなく、このファイル独自の簡易記法。",
+  "$defs": {
+    "PluginManifest": {
+      "description": "プラグインが自己申告するマニフェスト（登録リクエスト本文）。未知キーは拒否する（fail-closed）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "transport", "tools"],
+      "properties": {
+        "id": {
+          "description": "プラグイン識別子。",
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "maxLength": 64
+        },
+        "version": {
+          "description": "バージョン文字列。先頭が数字 3 組の x.y.z で、以降は改行類を含まない任意文字列。",
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+.*$",
+          "maxLength": 128
+        },
+        "transport": {
+          "description": "ホストとの通信トランスポートの申告値。unix-socket と tcp は受理するだけで接続処理は未実装。",
+          "type": "string",
+          "enum": ["stdio", "unix-socket", "tcp"]
+        },
+        "tools": {
+          "description": "プラグインが提供するツール名の一覧。",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "permissions": {
+          "description": "要求権限の申告値。保持のみで付与・強制はしない。重複は拒否しない。",
+          "type": "array",
+          "maxItems": 5,
+          "default": [],
+          "items": {
+            "type": "string",
+            "enum": ["network.fetch", "dom.read", "dom.write", "fs.read", "fs.write"]
+          }
+        },
+        "protocolVersion": {
+          "description": "プラグイン側が話すプロトコルのバージョン。省略時は unspecified。",
+          "type": "string",
+          "maxLength": 128,
+          "default": "unspecified"
+        }
+      }
+    },
+    "RegisteredPluginManifest": {
+      "description": "GET /ai/plugins が返す登録済みマニフェスト。省略可能キーも既定値を含めて 6 キー全てを出力する。",
+      "allOf": [
+        { "$ref": "#/$defs/PluginManifest" },
+        {
+          "required": ["id", "version", "transport", "tools", "permissions", "protocolVersion"]
+        }
+      ]
+    },
+    "PluginRegisterResponse": {
+      "description": "登録成功（200）の応答。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "id"],
+      "properties": {
+        "ok": { "const": true },
+        "id": { "type": "string" }
+      }
+    },
+    "ErrorResponse": {
+      "description": "登録失敗の応答。message は固定英語で、入力値（id・キー名・ヘッダ値）を含めない。",
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" }
+      }
+    },
+    "HostErrorResponse": {
+      "description": "Host ヘッダ検証エラーの応答。code のみを返す。",
+      "type": "object",
+      "required": ["code"],
+      "properties": {
+        "code": { "type": "string", "enum": ["invalid_host", "host_not_allowed"] }
+      }
+    },
+    "PluginListResponse": {
+      "description": "GET /ai/plugins の 200 応答。登録順で、未登録時は空配列。",
+      "type": "object",
+      "required": ["plugins"],
+      "properties": {
+        "plugins": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/RegisteredPluginManifest" }
+        }
+      }
+    }
+  },
+  "paths": {
+    "POST /ai/plugins/register": {
+      "description": "プラグインを登録する。Content-Type は application/json 必須。",
+      "request": { "$ref": "#/$defs/PluginManifest" },
+      "responses": {
+        "200": { "$ref": "#/$defs/PluginRegisterResponse" },
+        "400": {
+          "description": "マニフェスト不正（ErrorResponse。code は manifestCodes のいずれか）または Host 検証エラー（HostErrorResponse）。",
+          "oneOf": [
+            { "$ref": "#/$defs/ErrorResponse" },
+            { "$ref": "#/$defs/HostErrorResponse" }
+          ],
+          "manifestCodes": [
+            "manifest_too_large",
+            "invalid_json",
+            "not_an_object",
+            "missing_field",
+            "invalid_type",
+            "unknown_field",
+            "invalid_id",
+            "invalid_version",
+            "unknown_transport",
+            "unknown_permission",
+            "too_long",
+            "too_many_items",
+            "empty_tools",
+            "empty_tool_name"
+          ]
+        },
+        "403": {
+          "description": "Origin ヘッダ付き要求（ErrorResponse。code は origin_not_allowed）または Host 不許可（HostErrorResponse）。",
+          "oneOf": [
+            { "$ref": "#/$defs/ErrorResponse" },
+            { "$ref": "#/$defs/HostErrorResponse" }
+          ]
+        },
+        "409": {
+          "description": "id 重複（ErrorResponse。code は duplicate_plugin_id）。",
+          "$ref": "#/$defs/ErrorResponse"
+        },
+        "415": {
+          "description": "Content-Type 不正（ErrorResponse。code は unsupported_media_type）。",
+          "$ref": "#/$defs/ErrorResponse"
+        },
+        "429": {
+          "description": "レジストリ満杯（ErrorResponse。code は plugin_registry_full）。",
+          "$ref": "#/$defs/ErrorResponse"
+        }
+      }
+    },
+    "GET /ai/plugins": {
+      "description": "登録済みプラグインの一覧を返す。",
+      "responses": {
+        "200": { "$ref": "#/$defs/PluginListResponse" },
+        "400": {
+          "description": "Host 検証エラー（code は invalid_host）。",
+          "$ref": "#/$defs/HostErrorResponse"
+        },
+        "403": {
+          "description": "Host 不許可（code は host_not_allowed）。",
+          "$ref": "#/$defs/HostErrorResponse"
+        }
+      }
+    },
+    "GET /ai/snapshot": {
+      "description": "形は本スキーマでは凍結しない（AISNAP-1・AISNAP-6・AISNAP-7）。プラグインの登録有無で振る舞いは変わらない。現行のエンベロープ {url, tree, truncated} は暫定仕様であり、ここでは定義しない。"
+    }
+  },
+  "notes": [
+    "本文は 128 KiB 以下（パース前に検証し、超過は 400 manifest_too_large）。",
+    "Content-Type: application/json 必須。Origin ヘッダ付き要求は一律 403。Host は localhost または IP リテラルのみ許可する。",
+    "maxLength は Unicode コードポイント数（Rust 側の chars() と一致）。version の末尾 .* の . は改行類（LF・CR・U+2028・U+2029）に一致しない。",
+    "permissions の重複は拒否しない。申告値の保持のみで、権限の付与・強制はしない。",
+    "transport の unix-socket と tcp は列挙値として受理するだけで、接続処理は未実装。登録成功は接続済みを意味しない（REPAIR-3）。",
+    "レジストリはインメモリで最大 32 件、id 重複不可。削除・上書き API はない。",
+    "エラー応答は入力値（id・キー名・ヘッダ値）を含めない。"
+  ]
+}
