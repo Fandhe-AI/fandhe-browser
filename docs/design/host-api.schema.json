@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Fandhe-AI/fandhe-browser/blob/main/docs/design/host-api.schema.json",
   "title": "fandhe-browser Host API (plugin boundary)",
-  "description": "ホスト API のプラグイン関連契約（PLUG-2・TASK-92・MS-9）。POST /ai/plugins/register・マニフェスト形式（実装済み）と GET /ai/plugins（未実装の将来仕様。TASK-92.4・Issue #356・PLUG-2）を定義する。土台は PoC-15 版のスキーマだが、正本は Rust 側の crates/fandhe-browser-ai/src/plugin_api.rs と crates/fandhe-browser-ai/src/api.rs で、実装済みの部分は本ファイルがそれに合わせている（乖離は plugin_api の schema_contract_tests が検知する）。GET /ai/plugins と関連 $defs は実装が無く、実装済みを装わない（REPAIR-3）。paths は OpenAPI ではなく、このファイル独自の簡易記法。",
+  "description": "ホスト API のプラグイン関連契約（PLUG-2・TASK-92・MS-9）。POST /ai/plugins/register・マニフェスト形式（実装済み）と GET /ai/plugins（実装済み。TASK-92.4・Issue #356・PLUG-2）を定義する。土台は PoC-15 版のスキーマだが、正本は Rust 側の crates/fandhe-browser-ai/src/plugin_api.rs と crates/fandhe-browser-ai/src/api.rs で、実装済みの部分は本ファイルがそれに合わせている（乖離は plugin_api の schema_contract_tests が検知する）。GET /ai/plugins と関連 $defs も api.rs の router_with_state が実装済みで、応答は {\"plugins\":[...]}（登録順・未登録は空配列）。paths は OpenAPI ではなく、このファイル独自の簡易記法。",
   "$defs": {
     "PluginManifest": {
       "description": "プラグインが自己申告するマニフェスト（登録リクエスト本文）。未知キーは拒否する（fail-closed）。",
@@ -57,7 +57,7 @@
       }
     },
     "RegisteredPluginManifest": {
-      "description": "【未実装の将来仕様。TASK-92.4・Issue #356・PLUG-2】GET /ai/plugins が返す登録済みマニフェスト。省略可能キーも既定値を含めて 6 キー全てを出力する。",
+      "description": "【実装済み。TASK-92.4・Issue #356・PLUG-2】GET /ai/plugins が返す登録済みマニフェスト。省略可能キーも既定値を含めて 6 キー全てを出力する。",
       "allOf": [
         { "$ref": "#/$defs/PluginManifest" },
         {
@@ -93,7 +93,7 @@
       }
     },
     "PluginListResponse": {
-      "description": "【未実装の将来仕様。TASK-92.4・Issue #356・PLUG-2】GET /ai/plugins の 200 応答。登録順で、未登録時は空配列。",
+      "description": "【実装済み。TASK-92.4・Issue #356・PLUG-2】GET /ai/plugins の 200 応答。登録順で、未登録時は空配列。",
       "type": "object",
       "required": ["plugins"],
       "properties": {
@@ -156,7 +156,7 @@
       }
     },
     "GET /ai/plugins": {
-      "description": "【未実装の将来仕様。TASK-92.4・Issue #356・PLUG-2】登録済みプラグインの一覧を返す。現状ルータはこの経路を登録しておらず、要求は未定義経路として扱われる。",
+      "description": "【実装済み。TASK-92.4・Issue #356・PLUG-2】登録済みプラグインの一覧を登録順で返す（未登録は空配列）。ルータ router_with_state が登録済み。",
       "responses": {
         "200": { "$ref": "#/$defs/PluginListResponse" },
         "400": {
@@ -174,7 +174,7 @@
     }
   },
   "notes": [
-    "GET /ai/plugins・PluginListResponse・RegisteredPluginManifest は未実装の将来仕様（TASK-92.4）。実装済みなのは POST /ai/plugins/register と GET /ai/snapshot のみ。",
+    "GET /ai/plugins・PluginListResponse・RegisteredPluginManifest は実装済み（TASK-92.4）。実装済みなのは POST /ai/plugins/register・GET /ai/plugins・GET /ai/snapshot。",
     "本文は 128 KiB 以下（パース前に検証し、超過は 400 manifest_too_large）。",
     "Content-Type: application/json 必須。Origin ヘッダ付き要求は一律 403。Host は localhost または IP リテラルのみ許可する。",
     "maxLength は Unicode コードポイント数（Rust 側の chars() と一致）。version は先頭 x.y.z の後ろに改行類（LF・CR・U+2028・U+2029）を許さず、id・version とも末尾アンカーを (?![\\s\\S]) にして末尾改行も拒否する（Rust の is_valid_id・is_valid_version と一致）。",
