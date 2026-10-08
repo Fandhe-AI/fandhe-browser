@@ -14,6 +14,7 @@ use serde_json::Value;
 use super::{
     DEFAULT_PROTOCOL_VERSION, MAX_ID_CHARS, MAX_PERMISSIONS, MAX_PLUGINS, MAX_STRING_CHARS,
     MAX_TOOLS, ManifestError, ManifestField, PluginPermission, PluginTransport, RegistryError,
+    is_valid_id, is_valid_version,
 };
 
 const SCHEMA_TEXT: &str = include_str!("../../../../docs/design/host-api.schema.json");
@@ -182,8 +183,44 @@ fn plug2_manifest_limits_match_rust_constants() {
 #[test]
 fn plug2_manifest_patterns_match_rust_regex_docs() {
     let p = manifest_props();
-    assert_eq!(p["id"]["pattern"], "^[a-z0-9][a-z0-9-]*$");
-    assert_eq!(p["version"]["pattern"], r"^\d+\.\d+\.\d+.*$");
+    assert_eq!(p["id"]["pattern"], r"^[a-z0-9][a-z0-9-]*(?![\s\S])");
+    assert_eq!(
+        p["version"]["pattern"],
+        r"^\d+\.\d+\.\d+[^\n\r\u2028\u2029]*(?![\s\S])"
+    );
+}
+
+/// 末尾改行を含む具体値を Rust の検証関数が拒否し、スキーマ側も末尾アンカーが厳密であること
+/// （`$` が末尾改行の手前に一致する検証器でも通さない）を確認する。
+#[test]
+fn plug2_trailing_newline_values_are_rejected_like_schema() {
+    for id in ["a\n", "a\r", "a\n\n", "\na"] {
+        assert!(!is_valid_id(id), "id {id:?} must be rejected");
+    }
+    for v in [
+        "1.2.3\n",
+        "1.2.3\r",
+        "1.2.3\u{2028}",
+        "1.2.3\u{2029}",
+        "1.2.3-a\nb",
+    ] {
+        assert!(!is_valid_version(v), "version {v:?} must be rejected");
+    }
+    for id in ["a", "a-1", "0x"] {
+        assert!(is_valid_id(id), "id {id:?} must be accepted");
+    }
+    for v in ["1.2.3", "1.2.3-beta.1", "10.20.30+meta"] {
+        assert!(is_valid_version(v), "version {v:?} must be accepted");
+    }
+    let p = manifest_props();
+    for key in ["id", "version"] {
+        let pat = p[key]["pattern"].as_str().expect("pattern string");
+        assert!(
+            pat.ends_with(r"(?![\s\S])"),
+            "{key} pattern needs strict end anchor"
+        );
+        assert!(!pat.ends_with('$'), "{key} pattern must not end with $");
+    }
 }
 
 #[test]
