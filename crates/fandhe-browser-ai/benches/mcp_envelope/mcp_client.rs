@@ -26,6 +26,8 @@ const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
 /// 未消費の応答行を溜められる件数。要求と応答は 1 対 1 のため正常系では 2 件を超えない。
 /// 超過は子プロセスの暴走とみなして読み取りを打ち切る（最大でも 8 件 × 8 MiB）。
 const MAX_PENDING_LINES: usize = 8;
+/// 書き込みスレッドへ未送信で溜められる行数。要求と応答は 1 対 1 のため正常系では 2 件を超えない。
+const MAX_PENDING_WRITES: usize = 8;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -67,7 +69,8 @@ enum LineEvent {
 /// 起動済みの mcp セッション。Drop で子プロセスを確実に終了させる。
 pub struct McpSession {
     child: Child,
-    stdin: Option<ChildStdin>,
+    /// stdin への書き込みは専用スレッドが担う（パイプ満杯で呼び出し側が無期限に止まらないため）。
+    writer: Option<SyncSender<Vec<u8>>>,
     rx: Receiver<LineEvent>,
     stderr: Arc<Mutex<Vec<u8>>>,
     next_id: u64,
@@ -84,7 +87,11 @@ impl McpSession {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|_| "failed to spawn fandhe-browser-mcp".to_string())?;
-        let stdin = child.stdin.take();
+        let writer = child.stdin.take().map(|stdin| {
+            let (wtx, wrx) = sync_channel::<Vec<u8>>(MAX_PENDING_WRITES);
+            std::thread::spawn(move || write_lines(stdin, wrx));
+            wtx
+        });
         let stdout = child.stdout.take();
         let stderr_pipe = child.stderr.take();
         let (tx, rx) = sync_channel(MAX_PENDING_LINES);
@@ -98,7 +105,7 @@ impl McpSession {
         }
         let mut session = Self {
             child,
-            stdin,
+            writer,
             rx,
             stderr,
             next_id: 1,
@@ -118,15 +125,18 @@ impl McpSession {
         Ok((line, ms, text))
     }
 
+    /// 1 行を書き込みスレッドへ渡す（非ブロッキング）。実際の書き込みが止まっても期限は
+    /// `request` の `recv_timeout` と Drop の kill が担う。
     fn send_line(&mut self, line: &str) -> Result<(), String> {
-        let stdin = self
-            .stdin
-            .as_mut()
+        let writer = self
+            .writer
+            .as_ref()
             .ok_or_else(|| "mcp stdin is closed".to_string())?;
-        stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| stdin.write_all(b"\n"))
-            .and_then(|()| stdin.flush())
+        let mut bytes = Vec::with_capacity(line.len().saturating_add(1));
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        writer
+            .try_send(bytes)
             .map_err(|_| self.with_stderr("failed to write to mcp stdin".to_string()))
     }
 
@@ -176,7 +186,7 @@ impl McpSession {
 impl Drop for McpSession {
     fn drop(&mut self) {
         // stdin を閉じて EOF で自然終了させ、期限を過ぎたら kill する。
-        self.stdin.take();
+        self.writer.take();
         let deadline = Instant::now() + SHUTDOWN_GRACE;
         while Instant::now() < deadline {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
@@ -186,6 +196,20 @@ impl Drop for McpSession {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// 送信キューの行を子プロセスの stdin へ書く。書き込み失敗・チャネル切断（Drop）で終了する。
+/// 書き込みが詰まっても本スレッドだけが止まり、Drop の kill でパイプが閉じて解放される。
+fn write_lines(mut stdin: ChildStdin, rx: Receiver<Vec<u8>>) {
+    while let Ok(bytes) = rx.recv() {
+        if stdin
+            .write_all(&bytes)
+            .and_then(|()| stdin.flush())
+            .is_err()
+        {
+            return;
+        }
     }
 }
 

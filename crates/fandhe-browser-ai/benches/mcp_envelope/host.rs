@@ -14,7 +14,7 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fandhe_backend_http::request::{ParseOutcome, parse_request_head};
 use fandhe_backend_http::response::Response;
@@ -24,6 +24,10 @@ const MAX_HEAD_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_DIRECT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// 1 接続の受信全体の絶対期限（少量ずつ送られる低速送信で受信が長引くのを防ぐ）。
+const CONN_DEADLINE: Duration = Duration::from_secs(10);
+/// 1 回の read の待ち時間上限。停止フラグを定期的に確認するための刻み。
+const READ_SLICE: Duration = Duration::from_millis(250);
 
 /// loopback で ai ルータを待ち受けるホスト。Drop で停止する。
 pub struct BenchHost {
@@ -79,7 +83,7 @@ fn serve(listener: TcpListener, router: Router, stop: Arc<AtomicBool>) {
             break;
         }
         let Ok(stream) = stream else { continue };
-        let _ = handle_connection(stream, &router, &rt);
+        let _ = handle_connection(stream, &router, &rt, &stop);
     }
 }
 
@@ -87,9 +91,10 @@ fn handle_connection(
     mut stream: TcpStream,
     router: &Router,
     rt: &tokio::runtime::Runtime,
+    stop: &AtomicBool,
 ) -> io::Result<()> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    let deadline = Instant::now() + CONN_DEADLINE;
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     let (head, consumed) = loop {
@@ -101,7 +106,7 @@ fn handle_connection(
             Ok(ParseOutcome::Incomplete) => {}
             Err(_) => return reject(&mut stream),
         }
-        let n = stream.read(&mut chunk)?;
+        let n = read_before(&mut stream, &mut chunk, deadline, stop)?;
         if n == 0 {
             return Ok(());
         }
@@ -116,7 +121,7 @@ fn handle_connection(
     };
     let mut body: Vec<u8> = buf.get(consumed..).unwrap_or_default().to_vec();
     while body.len() < content_length {
-        let n = stream.read(&mut chunk)?;
+        let n = read_before(&mut stream, &mut chunk, deadline, stop)?;
         if n == 0 {
             return Ok(());
         }
@@ -131,6 +136,36 @@ fn handle_connection(
     stream.flush()?;
     let _ = stream.shutdown(Shutdown::Both);
     Ok(())
+}
+
+/// 接続全体の期限と停止フラグを確認してから 1 回 read する。期限切れ・停止要求は `TimedOut` で打ち切る。
+fn read_before(
+    stream: &mut TcpStream,
+    chunk: &mut [u8],
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> io::Result<usize> {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "host stopping"));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "connection deadline exceeded",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining.min(READ_SLICE)))?;
+        match stream.read(chunk) {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            other => return other,
+        }
+    }
 }
 
 fn slice_err() -> io::Error {
