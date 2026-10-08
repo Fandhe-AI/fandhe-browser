@@ -14,6 +14,8 @@ use rmcp::serde::Deserialize;
 use rmcp::serde_json::json;
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::host;
 use crate::navigate::{self, NavigateOutcome};
 
@@ -24,6 +26,34 @@ pub(crate) const SERVER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2
 
 /// fandhe-browser の MCP 参照プラグイン本体。状態を持たない。
 pub(crate) struct FandheBrowserMcp;
+
+/// navigate の同時実行（実行中のブロッキング処理）数の上限。
+const MAX_CONCURRENT_NAVIGATE: usize = 4;
+/// 実行中のブロッキング navigate 数。待機キューは持たず、満杯なら即エラーで返す。
+static INFLIGHT_NAVIGATE: AtomicUsize = AtomicUsize::new(0);
+
+/// 同時実行枠。`spawn_blocking` のクロージャへ move し、ブロッキング処理が終わる
+/// （または未実行のまま破棄される）まで保持する。呼び出し側 future がキャンセルされても
+/// 枠は解放されない。
+struct NavigatePermit;
+
+impl NavigatePermit {
+    /// 枠を確保する。満杯なら `None`。
+    fn try_acquire() -> Option<Self> {
+        INFLIGHT_NAVIGATE
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_CONCURRENT_NAVIGATE).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for NavigatePermit {
+    fn drop(&mut self) {
+        INFLIGHT_NAVIGATE.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// navigate ツールの入力。
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -56,9 +86,17 @@ impl FandheBrowserMcp {
             Err(e) => return error_result(&e.to_string(), json!({})),
         };
         let body = navigate::request_body(url);
+        // 投入前に同時実行枠を確保する。満杯なら待たせず即座に構造化エラーを返す。
+        let Some(permit) = NavigatePermit::try_acquire() else {
+            return error_result("too many concurrent navigate requests", json!({}));
+        };
         // main は current_thread ランタイムのため、ブロッキング I/O は専用スレッドへ逃がす。
-        let res =
-            tokio::task::spawn_blocking(move || host::post_json(addr, "/ai/navigate", &body)).await;
+        // permit はクロージャが所有し、処理完了まで（キャンセル後も）枠を保持する。
+        let res = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            host::post_json(addr, "/ai/navigate", &body)
+        })
+        .await;
         let resp = match res {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => return error_result(&e.to_string(), json!({})),
@@ -113,6 +151,17 @@ mod tests {
         let tool = serde_json::to_value(&tools[0]).expect("serialize");
         assert_eq!(tool["name"], "navigate");
         assert_eq!(tool["inputSchema"]["required"], json!(["url"]));
+    }
+
+    /// PLUG-3 / TASK-94.3: 同時実行枠は上限で打ち切られ、解放後に再確保できる。
+    #[test]
+    fn plug3_navigate_permit_is_bounded_and_released() {
+        let held: Vec<_> = (0..MAX_CONCURRENT_NAVIGATE)
+            .map(|_| NavigatePermit::try_acquire().expect("permit"))
+            .collect();
+        assert!(NavigatePermit::try_acquire().is_none());
+        drop(held);
+        assert!(NavigatePermit::try_acquire().is_some());
     }
 
     /// PLUG-3 / TASK-94.2: 採用するプロトコル版は 2025-11-25 に固定されている。

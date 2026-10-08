@@ -90,9 +90,10 @@ fn build_request(addr: SocketAddr, path: &str, body: &[u8]) -> Vec<u8> {
 
 /// 応答バイト列をステータスと本文へ分解する。
 ///
-/// 制約: `Transfer-Encoding: chunked` はデコードしない。chunked 応答の本文は JSON として
-/// 解析できず失敗扱いになる（誤って成功を装うことはない安全側の挙動）。ホストは
-/// `Content-Length` 付きで返す前提（将来 chunked 対応する場合は PLUG-3 の拡張として追加）。
+/// 制約: `Transfer-Encoding` 付き応答（chunked 等）は未対応のため `MalformedResponse` で拒否する。
+/// `Content-Length` は数字のみ・重複なし・上限以下・実受信本文長と一致を要求し、不一致は
+/// `MalformedResponse`（切り詰め・余剰データを成功として扱わない）。ヘッダ自体が無い場合は
+/// 接続終了までの本文を採用する（`Connection: close` 前提）。将来 chunked 対応は PLUG-3 の拡張。
 fn parse_response(raw: &[u8]) -> Result<HostResponse, HostError> {
     let sep = raw
         .windows(4)
@@ -108,6 +109,30 @@ fn parse_response(raw: &[u8]) -> Result<HostResponse, HostError> {
         .ok_or(HostError::MalformedResponse)?;
     let code = rest.split(' ').next().unwrap_or_default();
     let status: u16 = code.parse().map_err(|_| HostError::MalformedResponse)?;
+    let mut content_length: Option<usize> = None;
+    for header in head.lines().skip(1) {
+        let (name, value) = header.split_once(':').ok_or(HostError::MalformedResponse)?;
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(HostError::MalformedResponse);
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            let v = value.trim();
+            if content_length.is_some() || v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(HostError::MalformedResponse);
+            }
+            let n: usize = v.parse().map_err(|_| HostError::MalformedResponse)?;
+            if n > MAX_RESPONSE_BYTES {
+                return Err(HostError::ResponseTooLarge);
+            }
+            content_length = Some(n);
+        }
+    }
+    if let Some(n) = content_length
+        && n != body.len()
+    {
+        return Err(HostError::MalformedResponse);
+    }
     Ok(HostResponse {
         status,
         body: body.to_vec(),
@@ -205,8 +230,20 @@ mod tests {
             b"HTTP/1.1 200 OK",
             b"FOO 200 OK\r\n\r\n",
             b"HTTP/1.1 abc\r\n\r\n",
+            // Content-Length 不一致（短い・長い）・重複・非数字・Transfer-Encoding
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nab",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nab",
+            b"HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nab",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n",
         ] {
             assert_eq!(parse_response(bad), Err(HostError::MalformedResponse));
         }
+        let ok = parse_response(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nab").unwrap();
+        assert_eq!(ok.body, b"ab");
+        assert_eq!(
+            parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 999999\r\n\r\n"),
+            Err(HostError::ResponseTooLarge)
+        );
     }
 }
