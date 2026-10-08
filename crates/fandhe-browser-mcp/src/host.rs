@@ -38,12 +38,23 @@ impl Drop for HostPermit {
 
 /// 同時実行枠を確保する。上限に達していれば `None`（呼び出し側は isError で返す）。
 pub(crate) fn try_acquire() -> Option<HostPermit> {
-    IN_FLIGHT
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < MAX_CONCURRENT_REQUESTS).then_some(n + 1)
-        })
-        .ok()
-        .map(|_| HostPermit(()))
+    // fetch_update は新しい toolchain で非推奨（try_update へ改名）のため、
+    // toolchain 差に依存しない compare_exchange_weak ループで実装する。
+    let mut current = IN_FLIGHT.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_CONCURRENT_REQUESTS {
+            return None;
+        }
+        match IN_FLIGHT.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(HostPermit(())),
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 /// ホスト呼び出しの失敗。MCP 応答へは固定の英語文言（`Display`）のみ流す。
