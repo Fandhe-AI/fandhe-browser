@@ -154,6 +154,29 @@ fn parse_response(raw: &[u8]) -> Result<(u16, &[u8]), RegisterError> {
         .next()
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or(RegisterError::MalformedResponse)?;
+    // 応答の完全性（host.rs::parse_response と同じ規則。PLUG-2 / TASK-94.5）:
+    // Content-Length は重複不可・本文長と一致必須、Transfer-Encoding は未対応で拒否、
+    // コロンのないヘッダ行は不正。切断された部分応答を登録成功と誤認しないための検証。
+    let mut declared: Option<usize> = None;
+    for h in head.lines().skip(1) {
+        let Some((name, value)) = h.split_once(':') else {
+            return Err(RegisterError::MalformedResponse);
+        };
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(RegisterError::MalformedResponse);
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            let v = value.trim();
+            if declared.is_some() || v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(RegisterError::MalformedResponse);
+            }
+            declared = Some(v.parse().map_err(|_| RegisterError::MalformedResponse)?);
+        }
+    }
+    if declared.is_some_and(|n| n != body.len()) {
+        return Err(RegisterError::MalformedResponse);
+    }
     Ok((status, body))
 }
 
@@ -459,6 +482,28 @@ mod tests {
             parse_response(b"HTTP/1.1 200 OK\r\n"),
             Err(RegisterError::MalformedResponse)
         ));
+    }
+
+    /// PLUG-2 / TASK-94.5: HTTP フレーミング違反（切断・重複・chunked・不正ヘッダ）は MalformedResponse。
+    #[test]
+    fn plug2_parse_response_validates_framing() {
+        let ok = parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+        assert_eq!(ok, (200, &b"{}"[..]));
+        let truncated: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 38\r\n\r\n{\"ok\":true,\"id\":\"fandhe-browser-mcp\"}";
+        for bad in [
+            truncated,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n{}",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{}",
+            b"HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\n{}",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{}",
+            b"HTTP/1.1 200 OK\r\nbadheader\r\n\r\n{}",
+        ] {
+            assert!(matches!(
+                parse_response(bad),
+                Err(RegisterError::MalformedResponse)
+            ));
+        }
     }
 
     fn far() -> Instant {

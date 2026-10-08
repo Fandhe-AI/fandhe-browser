@@ -2,8 +2,8 @@
 //!
 //! バイナリは MCP セッション開始前にホストの `POST /ai/plugins/register` へ自己申告する
 //! ため、結合テストの偽ホストは先にその 1 リクエストへ応答しなければならない。
-//! 各テストファイルが `mod common;` で取り込むため、使われない関数は許容する。
-#![allow(dead_code)]
+//! 各テストファイルが `mod common;` で取り込む。取り込み先によって未使用になる関数にだけ
+//! 個別に `#[allow(dead_code)]` を付ける（モジュール全体の抑止はしない）。
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -44,6 +44,8 @@ pub fn body_complete(text: &str) -> bool {
 }
 
 /// 自己申告だけを受けて listener を閉じる偽ホスト。以後のツール呼び出しは接続拒否になる。
+/// stdio_handshake.rs からは使われないため、この関数に限り dead_code を許容する。
+#[allow(dead_code)]
 pub fn register_then_close() -> String {
     let (addr, _handle) = register_only();
     addr
