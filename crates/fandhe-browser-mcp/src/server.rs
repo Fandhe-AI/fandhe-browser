@@ -41,7 +41,7 @@ impl NavigatePermit {
     /// 枠を確保する。満杯なら `None`。
     fn try_acquire() -> Option<Self> {
         INFLIGHT_NAVIGATE
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_CONCURRENT_NAVIGATE).then_some(n + 1)
             })
             .ok()
