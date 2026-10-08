@@ -1,4 +1,4 @@
-//! stdio MCP ハンドシェイクの結合テスト（TASK-94.2・PLUG-3）。実バイナリを起動して検証する。
+//! stdio MCP ハンドシェイクの結合テスト（TASK-94.2・PLUG-3・MS-9）。実バイナリを起動して検証する。
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -26,7 +26,8 @@ fn run(input: Option<&str>) -> Output {
         .expect("spawn mcp binary");
     if let Some(text) = input {
         let mut stdin = child.stdin.take().expect("stdin");
-        stdin.write_all(text.as_bytes()).expect("write stdin");
+        // 子が上限超過で先に終了した場合の BrokenPipe は想定内のため無視する。
+        let _ = stdin.write_all(text.as_bytes());
         drop(stdin);
     }
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -114,6 +115,33 @@ fn plug3_stdio_eof_before_initialize_fails() {
 #[test]
 fn plug3_stdio_unknown_protocol_version_negotiates_latest() {
     let out = run(Some(&init_line("1999-01-01")));
+    let msgs = parse(&out);
+    assert_eq!(find_id(&msgs, 1)["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
+/// PLUG-3 / TASK-94.2: 改行なしで 4 MiB を超える入力は打ち切られ、失敗終了し stdout は空。
+#[test]
+fn plug3_stdio_oversized_message_terminates_session() {
+    let input = "x".repeat(4 * 1024 * 1024 + 1024);
+    let out = run(Some(&input));
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr.contains("failed to initialize MCP session"),
+        "{}",
+        out.stderr
+    );
+}
+
+/// PLUG-3 / TASK-94.2: 上限以内の長い行（約 1 MiB）でも通常どおり応答する。
+#[test]
+fn plug3_stdio_large_message_within_limit_is_accepted() {
+    let pad = "y".repeat(1024 * 1024);
+    let line = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-11-25","capabilities":{{}},"clientInfo":{{"name":"test","version":"0.0.0"}},"_meta":{{"pad":"{pad}"}}}}}}"#
+    ) + "\n";
+    let out = run(Some(&line));
     let msgs = parse(&out);
     assert_eq!(find_id(&msgs, 1)["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
