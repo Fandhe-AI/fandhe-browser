@@ -23,12 +23,13 @@ pub(crate) const HOST_ADDR_ENV: &str = "FANDHE_BROWSER_HOST_ADDR";
 pub(crate) const DEFAULT_HOST_ADDR: &str = "127.0.0.1:9333";
 /// 登録エンドポイントのパス。
 const REGISTER_PATH: &str = "/ai/plugins/register";
-/// マニフェストで申告するツール名。TASK-94 完了時の提供予定ツールの申告であり、
-/// 実装は TASK-94.3（navigate）・TASK-94.4（snapshot）で、現時点では未実装（`server.rs` の
-/// capabilities は空。REPAIR-3）。ホスト側スキーマが `tools` に 1 件以上を要求する
-/// （`minItems: 1`）ため空にできず、94.3 / 94.4 完了までは実在しないツールを暫定申告する。
+/// マニフェストで申告するツール名。現時点では提供ツールが無いため空で、空の間は
+/// 自己申告を延期する（`RegisterOutcome::Deferred`）。ホスト側スキーマは `tools` に 1 件以上を
+/// 要求する（`minItems: 1`）ため、未実装の navigate / snapshot を暫定申告すると存在しない
+/// ツールが提供機能として公開される（REPAIR-3 違反）。将来仕様: TASK-94.3（navigate）・
+/// TASK-94.4（snapshot）で実装したツール名をここへ追加した時点で自己申告が有効になる。
 /// 実装との整合は TASK-94.6 で検証する。
-pub(crate) const DECLARED_TOOLS: [&str; 2] = ["navigate", "snapshot"];
+pub(crate) const DECLARED_TOOLS: [&str; 0] = [];
 /// 応答の読み取り上限（バイト）。
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 /// 接続タイムアウト。
@@ -93,6 +94,8 @@ pub(crate) enum RegisterOutcome {
     /// 上書き・削除 API を持たないため、プラグインだけの再起動で必ず起きる。
     /// ホスト側のマニフェストが旧版の可能性がある（暫定扱い。REPAIR-3）。
     AlreadyRegistered,
+    /// 提供ツールが未実装のため自己申告を行わなかった（接続もしない。REPAIR-3）。
+    Deferred,
 }
 
 /// 環境変数の生値から接続先を決める（純関数）。loopback の `ip:port` のみ許可する。
@@ -109,12 +112,13 @@ pub(crate) fn resolve_host_addr(raw: Option<&str>) -> Result<SocketAddr, Registe
 
 /// 自己申告するマニフェスト（`host-api.schema.json` の PluginManifest）。
 /// `runtime` の値は TASK-98.2 の判定規則が未実装のため暫定（PLUG-6）。
-pub(crate) fn manifest() -> Value {
+/// 指定したツール名一覧でマニフェストを組み立てる（ツールが 1 件以上のときのみ送る）。
+fn manifest_for(tools: &[&str]) -> Value {
     json!({
         "id": env!("CARGO_PKG_NAME"),
         "version": env!("CARGO_PKG_VERSION"),
         "transport": "stdio",
-        "tools": DECLARED_TOOLS,
+        "tools": tools,
         "permissions": ["network.fetch", "dom.read"],
         "protocolVersion": SERVER_PROTOCOL_VERSION.as_str(),
         "runtime": "native",
@@ -234,14 +238,28 @@ fn read_limited(
 }
 
 /// ホストへ自己申告する。`main` が MCP セッション開始前に 1 回だけ呼ぶ。
+/// 提供ツールが無い間は何もせず `Deferred` を返す（接続も環境変数の解釈もしない）。
 /// リダイレクト追従・再試行はしない。
 pub(crate) fn register_with_host() -> Result<RegisterOutcome, RegisterError> {
+    if DECLARED_TOOLS.is_empty() {
+        return Ok(RegisterOutcome::Deferred);
+    }
+    register_tools(&DECLARED_TOOLS)
+}
+
+/// `tools` を申告するマニフェストを、環境変数で指定されたホストへ送る。
+fn register_tools(tools: &[&str]) -> Result<RegisterOutcome, RegisterError> {
     let raw = match std::env::var(HOST_ADDR_ENV) {
         Ok(v) => Some(v),
         Err(std::env::VarError::NotPresent) => None,
         Err(std::env::VarError::NotUnicode(_)) => return Err(RegisterError::InvalidAddr),
     };
     let addr = resolve_host_addr(raw.as_deref())?;
+    register_to(addr, tools)
+}
+
+/// `addr` のホストへ `tools` を申告するマニフェストを 1 回 POST する。
+fn register_to(addr: SocketAddr, tools: &[&str]) -> Result<RegisterOutcome, RegisterError> {
     let started = Instant::now();
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| {
         if e.kind() == io::ErrorKind::TimedOut {
@@ -261,7 +279,8 @@ pub(crate) fn register_with_host() -> Result<RegisterOutcome, RegisterError> {
     stream
         .set_write_timeout(Some(remaining))
         .map_err(RegisterError::Io)?;
-    let body = serde_json::to_vec(&manifest()).map_err(|_| RegisterError::UnexpectedBody)?;
+    let body =
+        serde_json::to_vec(&manifest_for(tools)).map_err(|_| RegisterError::UnexpectedBody)?;
     stream
         .write_all(&build_request(addr, &body))
         .map_err(RegisterError::Io)?;
@@ -316,7 +335,7 @@ mod tests {
     /// PLUG-3 / TASK-94.5: マニフェストの各キーが具体値で、スキーマ契約に適合する。
     #[test]
     fn plug3_manifest_values_match_schema() {
-        let m = manifest();
+        let m = manifest_for(&["navigate", "snapshot"]);
         assert_eq!(m["id"], "fandhe-browser-mcp");
         assert_eq!(m["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(m["transport"], "stdio");
@@ -492,6 +511,93 @@ mod tests {
         let r = read_limited(&mut Drip, MAX_RESPONSE_BYTES, deadline, |_| Ok(()));
         assert!(matches!(r, Err(RegisterError::Timeout)), "{r:?}");
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    /// loopback の空きポートで 1 接続だけ受け、受信した要求全体を返しつつ `status` / `body` を応答する。
+    fn fake_host(status: u16, body: &'static str) -> (SocketAddr, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while let Ok(n) = stream.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Content-Length: "))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if rest.len() >= len {
+                        break;
+                    }
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+        (addr, handle)
+    }
+
+    /// PLUG-2 / TASK-94.5: 提供ツールが無い間は接続せず Deferred を返す（REPAIR-3）。
+    #[test]
+    fn plug2_register_with_host_defers_while_no_tools() {
+        assert!(DECLARED_TOOLS.is_empty());
+        assert_eq!(
+            register_with_host().expect("deferred"),
+            RegisterOutcome::Deferred
+        );
+    }
+
+    /// PLUG-2 / TASK-94.5: 実接続で POST を送り、200 は Registered、409 duplicate は AlreadyRegistered。
+    #[test]
+    fn plug2_register_to_sends_manifest_and_interprets_response() {
+        let (addr, h) = fake_host(200, r#"{"ok":true,"id":"fandhe-browser-mcp"}"#);
+        assert_eq!(
+            register_to(addr, &["navigate"]).expect("ok"),
+            RegisterOutcome::Registered
+        );
+        let req = h.join().expect("join");
+        assert!(
+            req.starts_with("POST /ai/plugins/register HTTP/1.1\r\n"),
+            "{req}"
+        );
+        let body: Value =
+            serde_json::from_str(req.split_once("\r\n\r\n").expect("body").1).expect("json");
+        assert_eq!(body, manifest_for(&["navigate"]));
+
+        let (addr, h) = fake_host(409, r#"{"code":"duplicate_plugin_id"}"#);
+        assert_eq!(
+            register_to(addr, &["navigate"]).expect("dup"),
+            RegisterOutcome::AlreadyRegistered
+        );
+        h.join().expect("join");
+    }
+
+    /// PLUG-2 / TASK-94.5: ホストが 400 で拒否したら status と code を保持した Rejected になる。
+    #[test]
+    fn plug2_register_to_rejected_keeps_status_and_code() {
+        let (addr, h) = fake_host(400, r#"{"code":"invalid_id"}"#);
+        match register_to(addr, &["navigate"]) {
+            Err(RegisterError::Rejected { status, code }) => {
+                assert_eq!(status, 400);
+                assert_eq!(code.as_deref(), Some("invalid_id"));
+            }
+            other => panic!("{other:?}"),
+        }
+        h.join().expect("join");
     }
 
     /// PLUG-2 / TASK-94.5: 各 read の前に残り時間で rearm が呼ばれ、締切以下の値になる。

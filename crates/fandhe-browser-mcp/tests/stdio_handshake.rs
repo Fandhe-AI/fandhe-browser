@@ -6,8 +6,6 @@ use std::time::{Duration, Instant};
 
 use rmcp::serde_json::{self, Value};
 
-mod support;
-
 struct Output {
     stdout: String,
     stderr: String,
@@ -15,18 +13,12 @@ struct Output {
 }
 
 /// バイナリを起動し、`input`（None なら即 EOF）を送って期限付きで完了を待つ。
+/// `FANDHE_BROWSER_HOST_ADDR` には接続を試みれば失敗終了する非 loopback の値を渡す。
+/// 未実装ツールの自己申告を延期している間（TASK-94.3 / 94.4 完了まで）は接続しないため、
+/// 成功終了すること自体がホストへ接続していない証拠になる（REPAIR-3）。
 fn run(input: Option<&str>) -> Output {
-    // 起動時の自己申告（TASK-94.5）に応じる偽ホストを立てる。
-    let host = support::FakeHost::spawn(200, r#"{"ok":true,"id":"fandhe-browser-mcp"}"#);
-    let out = run_with_host(input, &host.addr());
-    host.finish();
-    out
-}
-
-/// `FANDHE_BROWSER_HOST_ADDR` を指定してバイナリを起動する。
-fn run_with_host(input: Option<&str>, addr: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-browser-mcp"))
-        .env("FANDHE_BROWSER_HOST_ADDR", addr)
+        .env("FANDHE_BROWSER_HOST_ADDR", "192.0.2.1:9333")
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -156,5 +148,18 @@ fn plug3_stdio_large_message_within_limit_is_accepted() {
     let out = run(Some(&line));
     let msgs = parse(&out);
     assert_eq!(find_id(&msgs, 1)["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
+/// PLUG-3 / TASK-94.5: 提供ツールが無い間は自己申告を延期し、その旨を stderr に出して継続する。
+#[test]
+fn plug3_startup_defers_registration_while_no_tools_implemented() {
+    let out = run(Some(&init_line("2025-11-25")));
+    assert!(
+        out.stderr
+            .contains("host registration deferred: no tools implemented"),
+        "{}",
+        out.stderr
+    );
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 }
