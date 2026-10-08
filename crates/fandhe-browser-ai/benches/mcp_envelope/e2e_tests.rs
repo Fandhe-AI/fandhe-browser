@@ -6,22 +6,22 @@
 
 #![cfg(unix)]
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "FIXTURES は bench 本体専用で e2e は 1 件のみ使う")]
 #[path = "harness.rs"]
 mod harness;
-#[allow(dead_code)]
 #[path = "host.rs"]
 mod host;
-#[allow(dead_code)]
 #[path = "jsonrpc.rs"]
 mod jsonrpc;
-#[allow(dead_code)]
 #[path = "mcp_client.rs"]
 mod mcp_client;
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "集計・TSV 整形は bench 本体専用で e2e は行型のみ使う"
+)]
 #[path = "stats.rs"]
 mod stats;
-#[allow(dead_code)]
+#[allow(dead_code, reason = "tokens.rs の raw HTML 計測等を e2e は使わない")]
 #[path = "../token_reduction/tokens.rs"]
 mod tokens;
 

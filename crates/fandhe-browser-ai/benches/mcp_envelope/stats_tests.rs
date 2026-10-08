@@ -1,6 +1,5 @@
 //! `stats.rs` のユニットテスト（TASK-97.1・Issue #385・`PLUG-5`）。
 
-#[allow(dead_code)]
 #[path = "stats.rs"]
 mod stats;
 

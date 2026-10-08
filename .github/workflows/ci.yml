@@ -376,6 +376,33 @@ jobs:
         run: bash scripts/check-render-isolation.sh
 
   # --------------------------------------------------
+  # mcp-envelope-smoke（MCP エンベロープ測定ハーネスの e2e smoke）
+  # --------------------------------------------------
+  # TASK-97.1（Issue #385・PLUG-5）: #[ignore] の e2e smoke を PR の自動ゲートへ接続する。
+  # 実バイナリを要するため `make check-mcp-envelope`（mcp バイナリのビルド後に
+  # `--ignored` 付きで実行・0 件実行は NG）を呼ぶ。Profile が unix 専用のため
+  # ubuntu / macos のみ（Windows は Makefile 側で非対応として skip する）。
+  mcp-envelope-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - name: MCP エンベロープ e2e smoke
+        run: make check-mcp-envelope
+
+  # --------------------------------------------------
   # js-engine-isolation（JS エンジン構成ごとの依存グラフ検査）
   # --------------------------------------------------
   # TASK-32.4（Issue #168・JS-1・MS-3）: 軽量ビルドの依存グラフに v8 が無く、

@@ -13,7 +13,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,9 @@ use crate::jsonrpc;
 pub const BIN_ENV: &str = "FANDHE_BROWSER_MCP_BIN";
 const HOST_ADDR_ENV: &str = "FANDHE_BROWSER_HOST_ADDR";
 const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
+/// 未消費の応答行を溜められる件数。要求と応答は 1 対 1 のため正常系では 2 件を超えない。
+/// 超過は子プロセスの暴走とみなして読み取りを打ち切る（最大でも 8 件 × 8 MiB）。
+const MAX_PENDING_LINES: usize = 8;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -84,7 +87,7 @@ impl McpSession {
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr_pipe = child.stderr.take();
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(MAX_PENDING_LINES);
         if let Some(out) = stdout {
             std::thread::spawn(move || read_lines(out, tx));
         }
@@ -186,8 +189,8 @@ impl Drop for McpSession {
     }
 }
 
-/// stdout を 1 行ずつ読む。1 行が上限を超えたら `TooLong` で打ち切る。
-fn read_lines(out: impl Read, tx: std::sync::mpsc::Sender<LineEvent>) {
+/// stdout を 1 行ずつ読む。1 行が上限を超えたら `TooLong` で、未消費行が `MAX_PENDING_LINES` を超えたら切断で打ち切る。
+fn read_lines(out: impl Read, tx: SyncSender<LineEvent>) {
     let mut reader = BufReader::new(out);
     loop {
         let mut buf = Vec::new();
@@ -197,26 +200,25 @@ fn read_lines(out: impl Read, tx: std::sync::mpsc::Sender<LineEvent>) {
         {
             Ok(n) => n,
             Err(_) => {
-                let _ = tx.send(LineEvent::Io);
+                let _ = tx.try_send(LineEvent::Io);
                 return;
             }
         };
         if n == 0 {
-            let _ = tx.send(LineEvent::Eof);
+            let _ = tx.try_send(LineEvent::Eof);
             return;
         }
         if buf.last() != Some(&b'\n') && buf.len() as u64 > MAX_LINE_BYTES {
-            let _ = tx.send(LineEvent::TooLong);
+            let _ = tx.try_send(LineEvent::TooLong);
             return;
         }
         while matches!(buf.last(), Some(b'\n' | b'\r')) {
             buf.pop();
         }
-        if tx
-            .send(LineEvent::Line(String::from_utf8_lossy(&buf).into_owned()))
-            .is_err()
-        {
-            return;
+        match tx.try_send(LineEvent::Line(String::from_utf8_lossy(&buf).into_owned())) {
+            Ok(()) => {}
+            // 滞留超過: tx を落として受信側に切断（失敗）として伝える。
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => return,
         }
     }
 }
@@ -230,7 +232,9 @@ fn capture_stderr(mut err: impl Read, sink: Arc<Mutex<Vec<u8>>>) {
             Ok(n) => {
                 if let Ok(mut g) = sink.lock() {
                     let room = MAX_STDERR_BYTES.saturating_sub(g.len());
-                    g.extend_from_slice(&chunk[..n.min(room)]);
+                    if let Some(part) = chunk.get(..n.min(room)) {
+                        g.extend_from_slice(part);
+                    }
                 }
             }
         }

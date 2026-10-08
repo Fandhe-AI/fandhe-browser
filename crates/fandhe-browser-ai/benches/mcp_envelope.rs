@@ -31,7 +31,10 @@ mod mcp_client;
 #[path = "mcp_envelope/stats.rs"]
 mod stats;
 #[cfg(unix)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "token_reduction 共有の tokens.rs の一部（raw HTML 計測等）をこの bench は使わない"
+)]
 #[path = "token_reduction/tokens.rs"]
 mod tokens;
 

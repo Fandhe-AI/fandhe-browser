@@ -105,7 +105,7 @@ fn handle_connection(
         if n == 0 {
             return Ok(());
         }
-        buf.extend_from_slice(&chunk[..n]);
+        buf.extend_from_slice(chunk.get(..n).ok_or_else(slice_err)?);
     };
     let content_length = match head.header("content-length") {
         None => 0,
@@ -120,7 +120,7 @@ fn handle_connection(
         if n == 0 {
             return Ok(());
         }
-        body.extend_from_slice(&chunk[..n]);
+        body.extend_from_slice(chunk.get(..n).ok_or_else(slice_err)?);
         if body.len() > MAX_BODY_BYTES {
             return reject(&mut stream);
         }
@@ -131,6 +131,10 @@ fn handle_connection(
     stream.flush()?;
     let _ = stream.shutdown(Shutdown::Both);
     Ok(())
+}
+
+fn slice_err() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "read length out of range")
 }
 
 fn reject(stream: &mut TcpStream) -> io::Result<()> {
@@ -172,7 +176,9 @@ fn parse_response(raw: &[u8]) -> Result<DirectResponse, String> {
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(malformed)?;
-    let head = std::str::from_utf8(&raw[..sep]).map_err(|_| malformed())?;
+    let body_start = sep.checked_add(4).ok_or_else(malformed)?;
+    let head_bytes = raw.get(..sep).ok_or_else(malformed)?;
+    let head = std::str::from_utf8(head_bytes).map_err(|_| malformed())?;
     let status = head
         .lines()
         .next()
@@ -181,6 +187,6 @@ fn parse_response(raw: &[u8]) -> Result<DirectResponse, String> {
         .ok_or_else(malformed)?;
     Ok(DirectResponse {
         status,
-        body: raw[sep + 4..].to_vec(),
+        body: raw.get(body_start..).ok_or_else(malformed)?.to_vec(),
     })
 }

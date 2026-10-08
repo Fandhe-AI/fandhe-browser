@@ -592,7 +592,8 @@ check-binary-size: ## feature 無効（既定）のリリースバイナリサ�
 
 # 実測値の確定・レポート化は #386（TASK-97.2）。cargo bench は他 package の bin をビルドしないため
 # mcp バイナリを先に release ビルドして FANDHE_BROWSER_MCP_BIN で渡す。unix 専用（Profile が unix のみ）。
-MCP_ENVELOPE_TARGET_DIR ?= $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(CURDIR)/target)
+# 相対 CARGO_TARGET_DIR でも resolve_bin（絶対パス必須）を通すため abspath で絶対化する。
+MCP_ENVELOPE_TARGET_DIR ?= $(abspath $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(CURDIR)/target))
 
 .PHONY: measure-mcp-envelope
 measure-mcp-envelope: ## 方式 B 本体と MCP エンベロープのトークン・レイテンシを測定する（PLUG-5・TASK-97.1。unix のみ）
@@ -603,9 +604,9 @@ measure-mcp-envelope: ## 方式 B 本体と MCP エンベロープのトーク�
 
 .PHONY: check-mcp-envelope
 check-mcp-envelope: ## MCP エンベロープ測定ハーネスの e2e smoke を実バイナリで実行する（PLUG-5・TASK-97.1。unix のみ・0 件実行は NG）
-	@case "$$(uname -s)" in Linux|Darwin) ;; *) echo "NG: check-mcp-envelope は unix のみ対応です" >&2; exit 1;; esac
-	cargo build -p fandhe-browser-mcp
-	@out="$$(mktemp)"; \
+	@case "$$(uname -s)" in Linux|Darwin) ;; *) echo "skip: check-mcp-envelope は unix のみ対応のためスキップ（Profile が unix 専用）"; exit 0;; esac; \
+	cargo build -p fandhe-browser-mcp || exit 1; \
+	out="$$(mktemp)"; \
 	FANDHE_BROWSER_MCP_BIN="$(MCP_ENVELOPE_TARGET_DIR)/debug/fandhe-browser-mcp" \
 		cargo test -p fandhe-browser-ai --test mcp_envelope_e2e -- --ignored 2>&1 | tee "$$out"; \
 	if grep -q "test result: ok. 1 passed" "$$out"; then rc=0; else echo "NG: mcp_envelope_e2e が 1 件成功していません" >&2; rc=1; fi; \
