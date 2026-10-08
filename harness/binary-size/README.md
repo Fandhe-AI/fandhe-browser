@@ -33,11 +33,10 @@ Issue #174・#616 で追加済み）。package が workspace に無い場合は�
   （TASK-30.2・#160）により V8 を同梱する。V8 の増分は PoC-3 実測
   +40.81MB（TASK-27 の記述）で、上限内に収まるかは `make check-binary-size`
   の実測で判定する
-- release プロファイル: 現状はルート `Cargo.toml` の `[profile.release]` が
-  `panic = "abort"` のみで、`CORE-2` の前提（`opt-level = "z"`・`lto = true`・
-  `codegen-units = 1`・`strip = true`）が未適用。計測値は正規構成より大きく
-  出る（保守側）。この不整合はスコープ外として別途報告済み（下記「現状の
-  限界」参照）
+- release プロファイル: ルート `Cargo.toml` の `[profile.release]` は #368
+  （TASK-94.1）で `opt-level = "z"`・`lto = true`・`strip = true` を適用済みだが、
+  `codegen-units = 1` は未適用（下記「現状の限界」参照）。#368 以前の計測値は
+  適用前の値で、大きめ（保守側）に出ている
 - 実バイナリができた後に、より厳しい回帰予算へ見直すかどうかは #468
   （TASK-34.4）が実測を見てから判断する
 
@@ -173,8 +172,10 @@ js-binary-size: config=<default|boa|none> features=<label> engines=<v8|boa|none>
 - `mb` は 10 進（10^6 bytes）で小数第 2 位まで
 - `host` と `target` は常に `rustc -vV` の host（`--target` は渡さない。各 OS の
   ネイティブビルドのみ。クロスコンパイルは対象外）
-- `strip` は既定 `none`。`--strip`（`make ... JS_BINARY_SIZE_STRIP=1`）で
-  `CARGO_PROFILE_RELEASE_STRIP=symbols` を `cargo build` にだけ渡す（`Cargo.toml`
+- `strip` は既定 `none`。`Cargo.toml` の `strip = true`（#368）に関わらず、通常分岐は
+  `CARGO_PROFILE_RELEASE_STRIP=none` を `cargo build` にだけ渡して strip なしで計測する。
+  `--strip`（`make ... JS_BINARY_SIZE_STRIP=1`）では
+  `CARGO_PROFILE_RELEASE_STRIP=symbols` を渡す（`Cargo.toml`
   は編集しない。profile が変わるため全体の再ビルドが走る。spec の strip 後の
   参考値と比べるための任意モード）
 - 全フィールドは `^[A-Za-z0-9._-]{1,64}$` で検証してから出力する（ワークフロー
@@ -207,11 +208,10 @@ macOS の bash 3.2・Windows の Git Bash 向けに bash 4 系機能は使って
 
 ## 現状の限界
 
-- release プロファイルが `CORE-2` の前提（`opt-level = "z"`・`lto = true`・
-  `codegen-units = 1`・`strip = true`）を満たしていない（ルート `Cargo.toml`
-  の `[profile.release]` は `panic = "abort"` のみ）。workspace 全体に影響する
-  変更のためユーザー判断のうえ別 Issue で扱う（関連: TASK-27 #146、
-  TASK-94.1 #368）
+- release プロファイルのうち `codegen-units = 1` が未適用
+  （`opt-level = "z"`・`lto = true`・`strip = true` は #368 で適用済み）。
+  workspace 全体に影響する変更のためユーザー判断のうえ別 Issue で扱う
+  （関連: TASK-27 #146、TASK-94.1 #368）
 - spec（`js-engine.md`・TASK-27）の「既定ビルド = V8 のみ同梱」は、
   `fandhe-browser-cli` の `default = ["js-v8"]`（TASK-30.2・#160）で解消済み。
   `fandhe-browser-js` / core の `default = []` は意図どおり（feature 統合で

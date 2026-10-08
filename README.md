@@ -61,7 +61,7 @@ workspace と crate 骨格（`crates/fandhe-browser-*`）の実装段階です�
 | `fandhe-browser-render` | Servo 組込。feature gate `rendering` 配下のオプトインとし、MPL-2.0 を本 crate 内に隔離（`RENDER-1`、TASK-33/34・MS-1） |
 | `fandhe-browser-profile` | プロファイル（ユーザーデータディレクトリ）分離 |
 | `fandhe-browser-cli`（予定） | CLI 本体 |
-| `fandhe-browser-mcp`（予定） | MCP 参照プラグイン（別バイナリ） |
+| `fandhe-browser-mcp` | MCP 参照プラグイン（別バイナリ） |
 
 ## クイックスタート
 

@@ -108,7 +108,8 @@ build_config() {
   if [ "$strip" -eq 1 ]; then
     CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release ${locked[@]+"${locked[@]}"} -p "$package" $args --message-format=json-render-diagnostics
   else
-    cargo build --release ${locked[@]+"${locked[@]}"} -p "$package" $args --message-format=json-render-diagnostics
+    # Cargo.toml の既定は strip = true（TASK-94.1・#368）。strip=none ラベルと実測を一致させるため明示的に無効化する。
+    CARGO_PROFILE_RELEASE_STRIP=none cargo build --release ${locked[@]+"${locked[@]}"} -p "$package" $args --message-format=json-render-diagnostics
   fi
 }
 
