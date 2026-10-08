@@ -153,8 +153,9 @@ fn parse_response(raw: &[u8]) -> Result<HostResponse, HostError> {
     // 応答の完全性: Content-Length は重複不可・本文長と一致必須、Transfer-Encoding は未対応で拒否。
     let mut declared: Option<usize> = None;
     for h in head.lines().skip(1) {
+        // コロンのないヘッダ行は不正応答として拒否する（従来の防御を維持）。
         let Some((name, value)) = h.split_once(':') else {
-            continue;
+            return Err(HostError::MalformedResponse);
         };
         if name.trim().eq_ignore_ascii_case("transfer-encoding") {
             return Err(HostError::MalformedResponse);
@@ -291,6 +292,8 @@ mod tests {
             b"HTTP/1.1 200 OK",
             b"FOO 200 OK\r\n\r\n",
             b"HTTP/1.1 abc\r\n\r\n",
+            // コロンのないヘッダ行（例: Content-Length 999）は拒否する。
+            b"HTTP/1.1 200 OK\r\nContent-Length 999\r\n\r\n{\"ok\":true}",
         ] {
             assert_eq!(parse_response(bad), Err(HostError::MalformedResponse));
         }

@@ -99,21 +99,23 @@ impl FandheBrowserMcp {
             return error_result("too many concurrent host requests", json!({}));
         };
         // 枠は blocking クロージャが終わるまで保持する（呼び出しが取り消されても解放しない）。
+        // 最大 4 MiB の JSON 解析・再直列化も同じクロージャで行い、current_thread ランタイムを塞がない。
         let res = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            host::get(
+            let resp = host::get(
                 addr,
                 snapshot::SNAPSHOT_PATH,
                 snapshot::MAX_SNAPSHOT_RESPONSE_BYTES,
-            )
+            )?;
+            Ok::<_, host::HostError>(snapshot::interpret(resp.status, &resp.body))
         })
         .await;
-        let resp = match res {
-            Ok(Ok(r)) => r,
+        let outcome = match res {
+            Ok(Ok(o)) => o,
             Ok(Err(e)) => return error_result(&e.to_string(), json!({})),
             Err(_) => return error_result("snapshot task failed", json!({})),
         };
-        match snapshot::interpret(resp.status, &resp.body) {
+        match outcome {
             SnapshotOutcome::Success { text } => {
                 CallToolResult::success(vec![ContentBlock::text(text)])
             }
