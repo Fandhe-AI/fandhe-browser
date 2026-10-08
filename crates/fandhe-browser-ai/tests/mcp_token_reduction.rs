@@ -3,8 +3,14 @@
 //!
 //! 役割: MCP 参照プラグイン（`fandhe-browser-mcp`）の `snapshot` ツールが返すテキストと
 //! 生 HTML を `cl100k_base` で数え、サイトごとの削減率と平均を算出する。
-//! 84.0% 以上の判定は TASK-96.2（#382）、レポート出力は TASK-96.3（#383）の責務で、
-//! ここは数値の算出だけを行い、しきい値に対する assert を持たない。
+//! 84.0% 以上の判定は本ファイルの `judge_plug4` / `assert_plug4` が担う（TASK-96.2・#382）。
+//! レポート出力は TASK-96.3（#383）の責務で、再利用が要る場合は判定を `benches/token_reduction/`
+//! へ移す。
+//!
+//! 実データの現状: 平均削減率は 84.0% に届いていない（約 -75.6%）。PLUG-4 の前提は PoC-5 の
+//! フラット形式だが、現行ホストは JSON ツリーのエンベロープを返し生 HTML より大きいため
+//! （PLUG-5・TASK-97・AISNAP-6 の論点）。実データの verdict は未達のまま固定して事実を記録し
+//! （REPAIR-3）、合否ロジックは合成データで境界値まで検証する。
 //!
 //! 配置の理由: ルート manifest は仮想 manifest でルートの `tests/` は cargo に拾われず、
 //! mcp crate は ai・core と `tiktoken-rs` に依存できない（`PLUG-1`・#92 の承認は ai の
@@ -39,10 +45,72 @@ mod snapshot_text;
 #[path = "../benches/token_reduction/reduction.rs"]
 mod reduction;
 
-use reduction::{ReductionRow, reduction_pct, summarize};
+use reduction::{ReductionRow, ReductionSummary, reduction_pct, summarize};
 use tokens::{TokenCounter, fixtures_dir};
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
+
+/// `PLUG-4` の合格しきい値（%）。方式 B（`AISNAP-1`）の 87.0% から -3 ポイント以内
+/// （PoC-15 成功基準 4）。平均削減率がこの値以上なら合格。
+const PLUG4_THRESHOLD_PCT: f64 = 84.0;
+
+/// しきい値判定の結果。真偽値にせず、差分を持たせて将来のレポート出力（#383）へ拡張できる形にする
+/// （REPAIR-4）。
+#[derive(Debug, Clone, PartialEq)]
+enum Plug4Verdict {
+    /// 平均削減率がしきい値以上。
+    Met { mean_pct: f64, threshold_pct: f64 },
+    /// 平均削減率がしきい値未満（または非有限値）。`gap_pts` は不足ポイント数。
+    Shortfall {
+        mean_pct: f64,
+        threshold_pct: f64,
+        gap_pts: f64,
+    },
+}
+
+/// 平均削減率をしきい値と比べる（境界は以上で合格）。NaN など非有限値は不合格に倒す
+/// （fail-closed）。
+fn judge_plug4(summary: &ReductionSummary, threshold_pct: f64) -> Plug4Verdict {
+    let mean_pct = summary.mean_reduction_pct;
+    if mean_pct.is_finite() && mean_pct >= threshold_pct {
+        Plug4Verdict::Met {
+            mean_pct,
+            threshold_pct,
+        }
+    } else {
+        Plug4Verdict::Shortfall {
+            mean_pct,
+            threshold_pct,
+            gap_pts: threshold_pct - mean_pct,
+        }
+    }
+}
+
+/// `PLUG-4` のゲート。不合格なら `Err`（テスト失敗）、合格なら `Ok`。
+fn assert_plug4(summary: &ReductionSummary) -> TestResult<()> {
+    match judge_plug4(summary, PLUG4_THRESHOLD_PCT) {
+        Plug4Verdict::Met { .. } => Ok(()),
+        Plug4Verdict::Shortfall {
+            mean_pct,
+            threshold_pct,
+            gap_pts,
+        } => Err(format!(
+            "PLUG-4 token reduction below threshold: mean {mean_pct:.3}% < {threshold_pct:.1}% (gap {gap_pts:.3} pts)"
+        )
+        .into()),
+    }
+}
+
+/// 現行 `snapshot_body` の挙動を固定した実測値（site, 生 HTML トークン, snapshot トークン, truncated）。
+/// 現状は JSON エンベロープが生 HTML より大きく削減率は負になる。出力形式の調整は範囲外
+/// （PLUG-4・PLUG-5 側の論点）。
+const PINNED: [(&str, usize, usize, bool); 5] = [
+    ("example-minimal", 103, 202, false),
+    ("wikipedia-article", 56482, 64327, false),
+    ("hn-list", 10220, 21257, true),
+    ("login-form", 284, 553, false),
+    ("mdn-docs", 19005, 31463, false),
+];
 
 /// 代表 5 サイト（`PLUG-4` の列挙順）。
 const SITES: [&str; 5] = [
@@ -138,17 +206,7 @@ fn plug4_mcp_token_reduction_per_site() -> TestResult<()> {
     let rows = measure_mcp_reduction(&counter)?;
     let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
     assert_eq!(names, SITES.to_vec());
-    // 現行 snapshot_body の挙動を固定した実測値（site, 生 HTML トークン, snapshot トークン, truncated）。
-    // 現状は JSON エンベロープが生 HTML より大きく削減率は負になる。判定は #382、
-    // 出力形式の調整は範囲外（PLUG-4・PLUG-5 側の論点）。
-    let pinned = [
-        ("example-minimal", 103, 202, false),
-        ("wikipedia-article", 56482, 64327, false),
-        ("hn-list", 10220, 21257, true),
-        ("login-form", 284, 553, false),
-        ("mdn-docs", 19005, 31463, false),
-    ];
-    for (r, (name, raw, snap, truncated)) in rows.iter().zip(pinned) {
+    for (r, (name, raw, snap, truncated)) in rows.iter().zip(PINNED) {
         assert_eq!(
             (
                 r.name.as_str(),
@@ -168,7 +226,7 @@ fn plug4_mcp_token_reduction_per_site() -> TestResult<()> {
     Ok(())
 }
 
-/// `PLUG-4`: 平均・最小・最大がページごとの値と整合する（84.0% の判定は #382）。
+/// `PLUG-4`: 平均・最小・最大がページごとの値と整合する（84.0% の判定は `judge_plug4`）。
 #[test]
 fn plug4_mcp_token_reduction_summary() -> TestResult<()> {
     let counter = TokenCounter::new()?;
@@ -179,5 +237,135 @@ fn plug4_mcp_token_reduction_summary() -> TestResult<()> {
     assert!((s.mean_reduction_pct - mean).abs() < 1e-9);
     assert!(s.min_reduction_pct <= s.mean_reduction_pct);
     assert!(s.mean_reduction_pct <= s.max_reduction_pct);
+    Ok(())
+}
+
+/// テスト用に平均削減率だけが意味を持つ行を作る（整数トークン数からは境界がちょうど 84.0 にならない）。
+fn synthetic_row(name: &str, pct: f64) -> ReductionRow {
+    ReductionRow {
+        name: name.to_string(),
+        bytes: 0,
+        raw_html_tokens: 0,
+        snapshot_tokens: 0,
+        reduction_pct: pct,
+        snapshot_truncated: false,
+    }
+}
+
+fn summary_of(pcts: &[f64]) -> TestResult<ReductionSummary> {
+    let rows: Vec<ReductionRow> = pcts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| synthetic_row(&format!("site{i}"), *p))
+        .collect();
+    summarize(&rows).ok_or_else(|| "no rows".into())
+}
+
+/// `PLUG-4`: 平均がちょうど 84.0% なら合格（境界は以上）。
+#[test]
+fn plug4_threshold_met_at_exact_boundary() -> TestResult<()> {
+    let s = summary_of(&[84.0; 5])?;
+    assert_eq!(
+        judge_plug4(&s, PLUG4_THRESHOLD_PCT),
+        Plug4Verdict::Met {
+            mean_pct: 84.0,
+            threshold_pct: 84.0
+        }
+    );
+    assert_plug4(&s)
+}
+
+/// `PLUG-4`: 平均が 84.0% を超えれば合格。
+#[test]
+fn plug4_threshold_met_above() -> TestResult<()> {
+    let s = summary_of(&[87.8, 90.0, 85.0, 86.0, 88.0])?;
+    match judge_plug4(&s, PLUG4_THRESHOLD_PCT) {
+        Plug4Verdict::Met { mean_pct, .. } => assert!((mean_pct - 87.36).abs() < 1e-9),
+        other => return Err(format!("expected Met, got {other:?}").into()),
+    }
+    assert_plug4(&s)
+}
+
+/// `PLUG-4`: 平均が 84.0% を下回れば不合格（テスト失敗に相当する `Err`）。
+#[test]
+fn plug4_threshold_shortfall_below() -> TestResult<()> {
+    let s = summary_of(&[83.9; 5])?;
+    match judge_plug4(&s, PLUG4_THRESHOLD_PCT) {
+        Plug4Verdict::Shortfall {
+            mean_pct,
+            threshold_pct,
+            gap_pts,
+        } => {
+            assert!((mean_pct - 83.9).abs() < 1e-9);
+            assert_eq!(threshold_pct, 84.0);
+            assert!((gap_pts - 0.1).abs() < 1e-9);
+        }
+        other => return Err(format!("expected Shortfall, got {other:?}").into()),
+    }
+    let err = match assert_plug4(&s) {
+        Ok(()) => return Err("assert_plug4 must fail below threshold".into()),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("84.0"), "{err}");
+    assert!(err.contains("83.9"), "{err}");
+    Ok(())
+}
+
+/// `PLUG-4`: 1 サイトだけ大きく低く平均が割れる場合も不合格（最小値でなく平均で判定する）。
+#[test]
+fn plug4_threshold_shortfall_when_one_site_drags_mean() -> TestResult<()> {
+    let s = summary_of(&[90.0, 90.0, 90.0, 90.0, 40.0])?;
+    assert!(matches!(
+        judge_plug4(&s, PLUG4_THRESHOLD_PCT),
+        Plug4Verdict::Shortfall { .. }
+    ));
+    assert!(assert_plug4(&s).is_err());
+    Ok(())
+}
+
+/// `PLUG-4`: 平均が NaN なら不合格に倒す（fail-closed）。
+#[test]
+fn plug4_threshold_nan_is_shortfall() -> TestResult<()> {
+    let s = summary_of(&[90.0, f64::NAN, 90.0])?;
+    assert!(matches!(
+        judge_plug4(&s, PLUG4_THRESHOLD_PCT),
+        Plug4Verdict::Shortfall { .. }
+    ));
+    assert!(assert_plug4(&s).is_err());
+    Ok(())
+}
+
+/// `PLUG-4`: 実データの現状 verdict（84.0% 未達・平均約 -75.6%）を固定する。
+///
+/// これは PLUG-4 未達の事実の記録であり、達成を装うものではない（REPAIR-3）。snapshot の出力形式
+/// が縮んで verdict が `Met` に変わったら、本テストを `assert_plug4(&summary)?` による本ゲートに
+/// 置き換える（PLUG-5・TASK-97・AISNAP-6 側の対応後）。
+#[test]
+fn plug4_mcp_token_reduction_current_verdict_is_pinned_shortfall() -> TestResult<()> {
+    let counter = TokenCounter::new()?;
+    let rows = measure_mcp_reduction(&counter)?;
+    let s = summarize(&rows).ok_or("no rows")?;
+    let mut sum = 0.0;
+    for (_, raw, snap, _) in PINNED {
+        sum += reduction_pct(raw, snap).ok_or("zero raw tokens")?;
+    }
+    let expected_mean = sum / PINNED.len() as f64;
+    match judge_plug4(&s, PLUG4_THRESHOLD_PCT) {
+        Plug4Verdict::Shortfall {
+            mean_pct,
+            threshold_pct,
+            gap_pts,
+        } => {
+            assert!((mean_pct - expected_mean).abs() < 1e-9);
+            assert_eq!(threshold_pct, 84.0);
+            assert!((gap_pts - (84.0 - expected_mean)).abs() < 1e-9);
+        }
+        other => {
+            return Err(format!(
+                "verdict changed to {other:?}; replace this test with assert_plug4(&summary)?"
+            )
+            .into());
+        }
+    }
     Ok(())
 }
