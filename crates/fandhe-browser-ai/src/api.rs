@@ -18,7 +18,12 @@
 //! - 共有状態を跨ぐ結合テストは cli の `server.rs` テスト（TASK-19.4・Issue #226。ai ⇔ cdp 依存は
 //!   禁止のため両者を合成できる cli に置く）で実施済み
 //! - プラグインレジストリを持つ ai 固有の状態型 `AiState` は定義済み（TASK-92.2・Issue #354）。
-//!   ルータへの配線（`Arc<AppState>` からの差し替え）は TASK-92.3
+//!   [`router_with_state`] が `Arc<AiState>` を受け取り、`GET /ai/plugins`（TASK-92.4・Issue #356・
+//!   `PLUG-2`）を提供する。登録 `POST /ai/plugins/register` は TASK-92.3（Issue #355）
+//! - `GET /ai/plugins` の応答は `{"plugins":[<manifest>...]}`（登録順。未登録は空配列）の暫定形で、
+//!   PoC-15 の `host-api.schema.json` 準拠。正式スキーマの文書化は TASK-92.5（Issue #357）。
+//!   一覧はプラグインの申告値をそのまま返すだけで「接続済み」「権限付与済み」を意味しない。
+//!   ページング・絞り込みは持たない（上限 `MAX_PLUGINS` 件）
 //!
 //! # 資源上限
 //!
@@ -36,6 +41,7 @@ use fandhe_browser_core::parse::{ParseOptions, parse_document};
 use fandhe_browser_core::{AppState, NavigationState};
 use serde_json::{Map, Value, json};
 
+use crate::plugin_api::{AiState, PluginRegistry};
 use crate::snapshot::{CheckedState, DataLeafKind, Node, Snapshot, TableSummary, build_snapshot};
 
 const JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
@@ -69,18 +75,49 @@ impl fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 
 /// `GET /ai/snapshot` を登録したルータを返す。cli が合成する（TASK-19.3）。
+///
+/// 内部で空のプラグインレジストリを持つ [`AiState`] を作り [`router_with_state`] へ委譲する。
 pub fn router(app: Arc<AppState>) -> Router {
-    Router::new().route("GET", "/ai/snapshot", move |head, _body| {
-        // DNS rebinding 対策: cdp の `/json/*` と同じ Host 検証（core の `host` モジュール）を
-        // 応答前に行い、不正な Host には snapshot（直近ページの URL・内容）を渡さない。
-        if let Err(e) = Authority::from_host_header(head.header("host")) {
-            return host_error_response(e);
-        }
-        match snapshot_body(app.navigation()) {
-            Ok(body) => Response::new(200, body).with_content_type(JSON_CONTENT_TYPE),
-            Err(e) => error_response(e),
-        }
-    })
+    router_with_state(Arc::new(AiState::new(app)))
+}
+
+/// ai 固有状態 [`AiState`] を使うルータを返す（`GET /ai/snapshot`・`GET /ai/plugins`）。
+///
+/// 両ルートとも Host 検証のみ行う読み取り専用 GET で、CORS 許可ヘッダは付けない。
+/// `/ai/plugins` は `PLUG-2`・TASK-92.4・Issue #356。
+pub fn router_with_state(state: Arc<AiState>) -> Router {
+    let snapshot_state = Arc::clone(&state);
+    let plugins_state = state;
+    Router::new()
+        .route("GET", "/ai/snapshot", move |head, _body| {
+            // DNS rebinding 対策: cdp の `/json/*` と同じ Host 検証（core の `host` モジュール）を
+            // 応答前に行い、不正な Host には snapshot（直近ページの URL・内容）を渡さない。
+            if let Err(e) = Authority::from_host_header(head.header("host")) {
+                return host_error_response(e);
+            }
+            match snapshot_body(snapshot_state.app().navigation()) {
+                Ok(body) => Response::new(200, body).with_content_type(JSON_CONTENT_TYPE),
+                Err(e) => error_response(e),
+            }
+        })
+        .route("GET", "/ai/plugins", move |head, _body| {
+            // snapshot と同じ Host 検証で DNS rebinding 経由の列挙を防ぐ。
+            if let Err(e) = Authority::from_host_header(head.header("host")) {
+                return host_error_response(e);
+            }
+            Response::new(200, plugins_body(plugins_state.plugins()))
+                .with_content_type(JSON_CONTENT_TYPE)
+        })
+}
+
+/// 登録済みプラグイン一覧の JSON 本文 `{"plugins":[...]}` を作る純粋部（`PLUG-2`・TASK-92.4）。
+///
+/// `GET /ai/plugins` ハンドラから呼ばれ、レジストリの登録順を保って各マニフェストを
+/// [`PluginManifest::to_value`](crate::plugin_api::PluginManifest::to_value) で出力する。
+/// `Value` の文字列化は失敗しないため `Result` にしない。
+pub fn plugins_body(registry: &PluginRegistry) -> Vec<u8> {
+    let plugins: Vec<Value> = registry.list().iter().map(|m| m.to_value()).collect();
+    json!({ "plugins": plugins }).to_string().into_bytes()
 }
 
 /// Host 検証エラーを 400（形式不正）/ 403（許可外ホスト）へ写像する。本体は固定コードのみで
@@ -402,5 +439,68 @@ mod tests {
             assert_eq!(v["code"], code);
             assert_eq!(v["message"], message);
         }
+    }
+
+    fn registry_with(ids: &[&str]) -> PluginRegistry {
+        let r = PluginRegistry::new();
+        for id in ids {
+            r.register(
+                crate::plugin_api::PluginManifest::from_value(
+                    &json!({"id": id, "version": "1.0.0", "transport": "stdio", "tools": ["t"]}),
+                )
+                .expect("manifest"),
+            )
+            .expect("register");
+        }
+        r
+    }
+
+    #[test]
+    fn plug2_plugins_body_is_empty_array_when_unregistered() {
+        let body = plugins_body(&PluginRegistry::new());
+        assert_eq!(body, b"{\"plugins\":[]}");
+    }
+
+    #[test]
+    fn plug2_plugins_body_lists_manifests_in_registration_order() {
+        let r = PluginRegistry::new();
+        r.register(
+            crate::plugin_api::PluginManifest::from_value(&json!({
+                "id": "b", "version": "2.0.0", "transport": "tcp", "tools": ["x", "y"],
+                "permissions": ["network.fetch"], "protocolVersion": "1"
+            }))
+            .expect("m"),
+        )
+        .expect("reg");
+        r.register(
+            crate::plugin_api::PluginManifest::from_value(
+                &json!({"id": "a", "version": "1.0.0", "transport": "stdio", "tools": ["t"]}),
+            )
+            .expect("m"),
+        )
+        .expect("reg");
+        let v: Value = serde_json::from_slice(&plugins_body(&r)).expect("json");
+        assert_eq!(
+            v,
+            json!({"plugins": [
+                {"id": "b", "version": "2.0.0", "transport": "tcp", "tools": ["x", "y"],
+                 "permissions": ["network.fetch"], "protocolVersion": "1"},
+                {"id": "a", "version": "1.0.0", "transport": "stdio", "tools": ["t"],
+                 "permissions": [], "protocolVersion": "unspecified"},
+            ]})
+        );
+    }
+
+    #[test]
+    fn plug2_plugins_body_round_trips_through_manifest() {
+        let r = registry_with(&["p1", "p2"]);
+        let v: Value = serde_json::from_slice(&plugins_body(&r)).expect("json");
+        let back: Vec<_> = v["plugins"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|e| crate::plugin_api::PluginManifest::from_value(e).expect("manifest"))
+            .collect();
+        assert_eq!(back, r.list());
     }
 }
