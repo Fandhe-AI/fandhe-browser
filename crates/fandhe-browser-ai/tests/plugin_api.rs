@@ -7,7 +7,7 @@
 
 use fandhe_browser_ai::api::{plugins_body, register_plugin};
 use fandhe_browser_ai::plugin_api::{
-    ManifestError, PluginManifest, PluginRegistry, PluginTransport,
+    ManifestError, PluginManifest, PluginRegistry, PluginTransport, SupportTier,
 };
 use serde_json::json;
 
@@ -446,4 +446,45 @@ mod http_flow {
         );
         assert_eq!(get(&r, "/ai/plugins").await.body, registered);
     }
+}
+
+#[test]
+fn plug6_plug3_targets_apply_only_to_native_rust() {
+    let official = PluginManifest::from_slice(
+        br#"{"id":"mcp-ref","version":"0.1.0","transport":"stdio","tools":["fetch"],
+            "runtime":"native","language":"rust"}"#,
+    )
+    .unwrap();
+    let node = PluginManifest::from_slice(
+        br#"{"id":"node-p","version":"0.1.0","transport":"stdio","tools":["fetch"],
+            "runtime":"node","language":"javascript"}"#,
+    )
+    .unwrap();
+    let bare = PluginManifest::from_slice(
+        br#"{"id":"bare","version":"0.1.0","transport":"stdio","tools":["fetch"]}"#,
+    )
+    .unwrap();
+    let r = PluginRegistry::new();
+    for m in [&official, &node, &bare] {
+        r.register(m.clone()).unwrap();
+    }
+    let got: Vec<(String, Option<u64>)> = r
+        .list()
+        .iter()
+        .map(|m| {
+            (
+                m.id().to_owned(),
+                m.plug3_targets().map(|t| t.cold_start_max_ms()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("mcp-ref".to_owned(), Some(50)),
+            ("node-p".to_owned(), None),
+            ("bare".to_owned(), None),
+        ]
+    );
+    assert_eq!(official.support_tier(), SupportTier::Official);
 }
