@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use rmcp::serde_json::{self, Value};
 
+mod common;
+
 struct Output {
     stdout: String,
     stderr: String,
@@ -13,12 +15,17 @@ struct Output {
 }
 
 /// バイナリを起動し、`input`（None なら即 EOF）を送って期限付きで完了を待つ。
-/// `FANDHE_BROWSER_HOST_ADDR` には接続を試みれば失敗終了する非 loopback の値を渡す。
-/// 未実装ツールの自己申告を延期している間（TASK-94.3 / 94.4 完了まで）は接続しないため、
-/// 成功終了すること自体がホストへ接続していない証拠になる（REPAIR-3）。
+/// 起動時の自己申告（TASK-94.5）に応える偽ホストを立て、そのアドレスを
+/// `FANDHE_BROWSER_HOST_ADDR` へ渡す。
 fn run(input: Option<&str>) -> Output {
+    let (host_addr, _reg) = common::register_only();
+    run_with_host(&host_addr, input)
+}
+
+/// `FANDHE_BROWSER_HOST_ADDR` を明示してバイナリを起動する。
+fn run_with_host(host_addr: &str, input: Option<&str>) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-browser-mcp"))
-        .env("FANDHE_BROWSER_HOST_ADDR", "192.0.2.1:9333")
+        .env("FANDHE_BROWSER_HOST_ADDR", host_addr)
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -106,7 +113,7 @@ fn plug3_stdio_initialize_handshake_succeeds() {
     assert_eq!(init["protocolVersion"], "2025-06-18");
     assert_eq!(init["serverInfo"]["name"], "fandhe-browser-mcp");
     assert_eq!(init["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(init["capabilities"], serde_json::json!({}));
+    assert_eq!(init["capabilities"], serde_json::json!({"tools":{}}));
     assert_eq!(find_id(&msgs, 2)["result"], serde_json::json!({}));
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 }
@@ -160,15 +167,55 @@ fn plug3_stdio_large_message_within_limit_is_accepted() {
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 }
 
-/// PLUG-3 / TASK-94.5: 提供ツールが無い間は自己申告を延期し、その旨を stderr に出して継続する。
+/// PLUG-2 / TASK-94.5: 起動時に navigate・snapshot を申告するマニフェストをホストへ POST する。
 #[test]
-fn plug3_startup_defers_registration_while_no_tools_implemented() {
-    let out = run(Some(&init_line("2025-11-25")));
+fn plug2_startup_registers_manifest_with_host() {
+    let (host_addr, reg) = common::register_only();
+    let out = run_with_host(&host_addr, Some(&init_line("2025-11-25")));
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let req = reg.join().expect("register thread");
     assert!(
-        out.stderr
-            .contains("host registration deferred: no tools implemented"),
+        req.starts_with("POST /ai/plugins/register HTTP/1.1\r\n"),
+        "{req}"
+    );
+    let body: Value =
+        serde_json::from_str(req.split_once("\r\n\r\n").expect("body").1).expect("manifest json");
+    assert_eq!(body["id"], "fandhe-browser-mcp");
+    assert_eq!(body["tools"], serde_json::json!(["navigate", "snapshot"]));
+}
+
+/// PLUG-2 / TASK-94.5: 非 loopback の接続先は接続せず失敗終了し、MCP セッションは開始しない。
+#[test]
+fn plug2_startup_fails_closed_on_non_loopback_host() {
+    let out = run_with_host("192.0.2.1:9333", Some(&init_line("2025-11-25")));
+    assert_eq!(out.code, Some(1));
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr.contains("failed to register with host"),
         "{}",
         out.stderr
     );
-    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
+/// PLUG-2 / TASK-94.5: ホストが拒否（500）したら失敗終了し、MCP セッションは開始しない。
+#[test]
+fn plug2_startup_fails_when_host_rejects() {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    });
+    let out = run_with_host(&addr, Some(&init_line("2025-11-25")));
+    assert_eq!(out.code, Some(1));
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr.contains("failed to register with host"),
+        "{}",
+        out.stderr
+    );
 }

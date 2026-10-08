@@ -505,6 +505,7 @@ check-compat-practical: ## 実測ハーネス（22 タスク定義・アクセ�
 	bash harness/compat-practical/self-test.sh
 	bash harness/compat-practical/access_check.sh --validate-only
 	bash harness/compat-practical/run_core.sh --validate-only
+	bash harness/compat-practical/make_matrix.sh --validate-only
 
 # --------------------------------------------------
 # 対象サイト群の動作率回帰チェック（TASK-9.2・REPAIR-8。harness/compat-regression/README.md 参照）

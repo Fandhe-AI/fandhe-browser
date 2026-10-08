@@ -23,13 +23,9 @@ pub(crate) const HOST_ADDR_ENV: &str = "FANDHE_BROWSER_HOST_ADDR";
 pub(crate) const DEFAULT_HOST_ADDR: &str = "127.0.0.1:9333";
 /// 登録エンドポイントのパス。
 const REGISTER_PATH: &str = "/ai/plugins/register";
-/// マニフェストで申告するツール名。現時点では提供ツールが無いため空で、空の間は
-/// 自己申告を延期する（`RegisterOutcome::Deferred`）。ホスト側スキーマは `tools` に 1 件以上を
-/// 要求する（`minItems: 1`）ため、未実装の navigate / snapshot を暫定申告すると存在しない
-/// ツールが提供機能として公開される（REPAIR-3 違反）。将来仕様: TASK-94.3（navigate）・
-/// TASK-94.4（snapshot）で実装したツール名をここへ追加した時点で自己申告が有効になる。
-/// 実装との整合は TASK-94.6 で検証する。
-pub(crate) const DECLARED_TOOLS: [&str; 0] = [];
+/// マニフェストで申告するツール名。`server.rs` が公開するツール（navigate: TASK-94.3・
+/// snapshot: TASK-94.4）と一致させる。実装との整合は TASK-94.6 で検証する。
+pub(crate) const DECLARED_TOOLS: [&str; 2] = ["navigate", "snapshot"];
 /// 応答の読み取り上限（バイト）。
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 /// 接続タイムアウト。
@@ -94,8 +90,6 @@ pub(crate) enum RegisterOutcome {
     /// 上書き・削除 API を持たないため、プラグインだけの再起動で必ず起きる。
     /// ホスト側のマニフェストが旧版の可能性がある（暫定扱い。REPAIR-3）。
     AlreadyRegistered,
-    /// 提供ツールが未実装のため自己申告を行わなかった（接続もしない。REPAIR-3）。
-    Deferred,
 }
 
 /// 環境変数の生値から接続先を決める（純関数）。loopback の `ip:port` のみ許可する。
@@ -238,12 +232,8 @@ fn read_limited(
 }
 
 /// ホストへ自己申告する。`main` が MCP セッション開始前に 1 回だけ呼ぶ。
-/// 提供ツールが無い間は何もせず `Deferred` を返す（接続も環境変数の解釈もしない）。
 /// リダイレクト追従・再試行はしない。
 pub(crate) fn register_with_host() -> Result<RegisterOutcome, RegisterError> {
-    if DECLARED_TOOLS.is_empty() {
-        return Ok(RegisterOutcome::Deferred);
-    }
     register_tools(&DECLARED_TOOLS)
 }
 
@@ -549,16 +539,6 @@ mod tests {
             String::from_utf8_lossy(&buf).into_owned()
         });
         (addr, handle)
-    }
-
-    /// PLUG-2 / TASK-94.5: 提供ツールが無い間は接続せず Deferred を返す（REPAIR-3）。
-    #[test]
-    fn plug2_register_with_host_defers_while_no_tools() {
-        assert!(DECLARED_TOOLS.is_empty());
-        assert_eq!(
-            register_with_host().expect("deferred"),
-            RegisterOutcome::Deferred
-        );
     }
 
     /// PLUG-2 / TASK-94.5: 実接続で POST を送り、200 は Registered、409 duplicate は AlreadyRegistered。

@@ -22,7 +22,8 @@
 //! - レジストリはインメモリでプロセス寿命のみ保持し、永続化しない。削除・上書き API は持たない
 //! - `permissions` は申告値の保持のみで、権限の付与・強制は行わない
 //! - `tcp` / `unix-socket` は列挙値として受理するだけで、接続処理は持たない
-//! - `runtime` / `language` は申告値の保持と出力のみ。`PLUG-3` 目標の適用判定は TASK-98.2（Issue #390）で未実装。
+//! - `runtime` / `language` は申告値の保持と出力に加え、`PLUG-3` 目標の適用判定を [`SupportTier`] が行う
+//!   （TASK-98.2・Issue #390）。判定結果は目標適用の分岐のみに使い、HTTP 応答には出さない。計測の実施は TASK-95。
 //!   省略時の `unspecified` は「公式サポート（Rust ネイティブ）」扱いにしない（未申告は公式扱いにしない。fail-closed）。
 //!   値は自己申告で untrusted であり、プロセス起動やインタプリタ選択には使わない
 //! - 新規依存を避けるため serde の derive は使わず、`serde_json::Value` から手動で抽出する
@@ -51,10 +52,101 @@ pub const DEFAULT_PROTOCOL_VERSION: &str = "unspecified";
 pub const MAX_RUNTIME_CHARS: usize = 64;
 /// `language` の最大文字数（コードポイント数。`PLUG-6`）。
 pub const MAX_LANGUAGE_CHARS: usize = 64;
-/// `runtime` 省略時の既定値。公式サポート扱いにしない（`PLUG-6`・TASK-98.2 が判定する）。
+/// `runtime` 省略時の既定値。公式サポート扱いにしない（`PLUG-6`・[`SupportTier::from_declaration`] が ThirdParty と判定する）。
 pub const DEFAULT_RUNTIME: &str = "unspecified";
-/// `language` 省略時の既定値。公式サポート扱いにしない（`PLUG-6`・TASK-98.2 が判定する）。
+/// `language` 省略時の既定値。公式サポート扱いにしない（`PLUG-6`・[`SupportTier::from_declaration`] が ThirdParty と判定する）。
 pub const DEFAULT_LANGUAGE: &str = "unspecified";
+
+/// 公式サポートと判定する `runtime` 値（`PLUG-6`・TASK-98.2）。
+pub const OFFICIAL_RUNTIME: &str = "native";
+/// 公式サポートと判定する `language` 値（`PLUG-6`・TASK-98.2）。
+pub const OFFICIAL_LANGUAGE: &str = "rust";
+
+/// プラグインのサポート区分（`PLUG-6`・TASK-98.2・Issue #390）。
+///
+/// マニフェストの自己申告から導く。**自己申告は untrusted** のため、この区分は `PLUG-3` の
+/// どの計測目標を当てるかの分岐にのみ使い、権限付与・信頼判定・登録可否・検証緩和の根拠にしない。
+/// 計測の実施は TASK-95 側で、本型は判定のみを担う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SupportTier {
+    /// 公式サポート（`runtime: native` かつ `language: rust`）。`PLUG-3` 目標を適用する。
+    Official,
+    /// サードパーティ・実験的（上記以外すべて）。別枠で、数値目標なし。
+    ThirdParty,
+}
+
+impl SupportTier {
+    /// 区分名（`official` / `third-party`）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SupportTier::Official => "official",
+            SupportTier::ThirdParty => "third-party",
+        }
+    }
+
+    /// 申告値から区分を判定する純粋関数。両方が定数と完全一致のときだけ [`SupportTier::Official`]
+    /// （fail-closed。未申告・片方のみ一致・未知の値は ThirdParty）。値は構築時に小文字へ検証済みのため
+    /// 大文字小文字の正規化はしない。
+    pub fn from_declaration(runtime: &str, language: &str) -> Self {
+        if runtime == OFFICIAL_RUNTIME && language == OFFICIAL_LANGUAGE {
+            SupportTier::Official
+        } else {
+            SupportTier::ThirdParty
+        }
+    }
+
+    /// この区分に適用する `PLUG-3` 目標。ThirdParty は目標なしで `None`。
+    pub fn plug3_targets(self) -> Option<Plug3Targets> {
+        match self {
+            SupportTier::Official => Some(PLUG3_TARGETS),
+            SupportTier::ThirdParty => None,
+        }
+    }
+}
+
+/// `PLUG-3` の数値目標（公式サポートのプラグインにのみ適用。`PLUG-6`・TASK-98.2）。
+///
+/// アイドル RSS 増分の「10MB」は spec に単位の明記がないため MiB（10 * 1024 * 1024）で保持する。
+/// 計測側（TASK-95）の解釈と食い違う場合は spec 側の確認が必要。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Plug3Targets {
+    idle_rss_increase_max_bytes: u64,
+    cold_start_max_ms: u64,
+    call_latency_p50_max_ms: u64,
+    call_latency_p95_max_ms: u64,
+}
+
+/// 公式サポート向けの `PLUG-3` 目標値。
+pub const PLUG3_TARGETS: Plug3Targets = Plug3Targets {
+    idle_rss_increase_max_bytes: 10 * 1024 * 1024,
+    cold_start_max_ms: 50,
+    call_latency_p50_max_ms: 20,
+    call_latency_p95_max_ms: 100,
+};
+
+impl Plug3Targets {
+    /// アイドル RSS 増分の上限（バイト）。
+    pub fn idle_rss_increase_max_bytes(&self) -> u64 {
+        self.idle_rss_increase_max_bytes
+    }
+
+    /// cold start（end-to-end）の上限（ミリ秒）。
+    pub fn cold_start_max_ms(&self) -> u64 {
+        self.cold_start_max_ms
+    }
+
+    /// 呼び出しレイテンシ p50 の上限（ミリ秒）。
+    pub fn call_latency_p50_max_ms(&self) -> u64 {
+        self.call_latency_p50_max_ms
+    }
+
+    /// 呼び出しレイテンシ p95 の上限（ミリ秒）。
+    pub fn call_latency_p95_max_ms(&self) -> u64 {
+        self.call_latency_p95_max_ms
+    }
+}
 
 /// マニフェストのフィールド。エラーの対象特定に使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,16 +501,26 @@ impl PluginManifest {
 
     /// 申告された実行ランタイム（`PLUG-6`）。未指定時は [`DEFAULT_RUNTIME`]。
     ///
-    /// 自己申告の保持のみで、公式サポートの判定は行わない（TASK-98.2・Issue #390 で未実装）。
+    /// 自己申告の保持のみ。公式サポートの判定は [`PluginManifest::support_tier`]（TASK-98.2・Issue #390）。
     pub fn runtime(&self) -> &str {
         &self.runtime
     }
 
     /// 申告された実装言語（`PLUG-6`）。未指定時は [`DEFAULT_LANGUAGE`]。
     ///
-    /// 自己申告の保持のみで、公式サポートの判定は行わない（TASK-98.2・Issue #390 で未実装）。
+    /// 自己申告の保持のみ。公式サポートの判定は [`PluginManifest::support_tier`]（TASK-98.2・Issue #390）。
     pub fn language(&self) -> &str {
         &self.language
+    }
+
+    /// 申告値から導いたサポート区分（`PLUG-6`・TASK-98.2・Issue #390）。応答 JSON には含めない。
+    pub fn support_tier(&self) -> SupportTier {
+        SupportTier::from_declaration(&self.runtime, &self.language)
+    }
+
+    /// 適用すべき `PLUG-3` 目標。公式サポートのみ `Some`、それ以外は `None`（目標なし）。
+    pub fn plug3_targets(&self) -> Option<Plug3Targets> {
+        self.support_tier().plug3_targets()
     }
 
     /// 8 キー全てを出力する JSON 表現（既定値のキーも省略しない）。
@@ -626,7 +728,7 @@ fn optional_token(
 }
 
 /// `^[a-z0-9][a-z0-9.+#_-]*$`（末尾は厳密アンカー。改行を許さない。`PLUG-6`）。
-/// 小文字 ASCII トークンに限り、TASK-98.2 が完全一致で判定できるようにする。
+/// 小文字 ASCII トークンに限り、[`SupportTier::from_declaration`] が完全一致で判定できるようにする。
 fn is_valid_runtime_token(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
@@ -675,6 +777,43 @@ mod schema_contract_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plug6_support_tier_official_only_for_native_rust() {
+        let m = |rt: &str, lang: &str| {
+            let v = json!({"id":"x","version":"1.0.0","transport":"stdio","tools":["t"],
+                "runtime":rt,"language":lang});
+            PluginManifest::from_slice(v.to_string().as_bytes()).unwrap()
+        };
+        let o = m("native", "rust");
+        assert_eq!(o.support_tier(), SupportTier::Official);
+        let t = o.plug3_targets().unwrap();
+        assert_eq!(t.idle_rss_increase_max_bytes(), 10_485_760);
+        assert_eq!(t.cold_start_max_ms(), 50);
+        assert_eq!(t.call_latency_p50_max_ms(), 20);
+        assert_eq!(t.call_latency_p95_max_ms(), 100);
+        for (rt, lang) in [
+            ("unspecified", "rust"),
+            ("native", "unspecified"),
+            ("unspecified", "unspecified"),
+            ("node", "javascript"),
+            ("native-musl", "rust"),
+            ("native", "rustlang"),
+            ("wasm", "rust"),
+        ] {
+            let x = m(rt, lang);
+            assert_eq!(x.support_tier(), SupportTier::ThirdParty, "{rt}/{lang}");
+            assert_eq!(x.plug3_targets(), None, "{rt}/{lang}");
+        }
+    }
+
+    #[test]
+    fn plug6_support_tier_as_str_and_constants_valid() {
+        assert_eq!(SupportTier::Official.as_str(), "official");
+        assert_eq!(SupportTier::ThirdParty.as_str(), "third-party");
+        assert!(is_valid_runtime_token(OFFICIAL_RUNTIME));
+        assert!(is_valid_runtime_token(OFFICIAL_LANGUAGE));
+    }
+
     use super::*;
 
     fn full() -> Value {

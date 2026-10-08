@@ -23,3 +23,6 @@ rmcp = { workspace = true }
 # rmcp が必ず依存する tokio と、94.2 の `#[tokio::main]` 用。workspace 定義
 # （#35 承認・rt / macros）の再利用で新規バージョンは導入しない。
 tokio = { workspace = true }
+# snapshot 応答の解析で `Deserializer::disable_recursion_limit`（feature `unbounded_depth`）を使う。
+# workspace 定義（#419 承認済み・=1.0.151）の再利用で新規バージョンは導入せず、`-p` 単体ビルドでも feature を保証する。
+serde_json = { workspace = true }

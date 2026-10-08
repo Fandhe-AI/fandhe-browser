@@ -226,3 +226,15 @@ resolve_bin() {
   dir="$(cd "$(dirname "$cand")" && pwd)"
   echo "$dir/$(basename "$cand")"
 }
+
+# sha256_of <file>
+#   ファイルの SHA-256（16 進小文字）を stdout へ 1 行出す。sha256sum（Linux・Windows の Bash 環境）
+#   → shasum（macOS）の順。run_core.sh（実測メタの tasks_sha256 記録）と make_matrix.sh
+#   （実測が現行 tasks.json に対するものかの照合。TASK-71.3）が共有する。
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}

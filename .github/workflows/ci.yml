@@ -471,6 +471,7 @@ jobs:
           bash harness/compat-practical/self-test.sh
           bash harness/compat-practical/access_check.sh --validate-only
           bash harness/compat-practical/run_core.sh --validate-only
+          bash harness/compat-practical/make_matrix.sh --validate-only
       - name: 対象サイト群の動作率回帰チェック
         run: |
           bash harness/compat-regression/check-matrix.sh \

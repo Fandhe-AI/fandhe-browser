@@ -7,7 +7,7 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 | 後続 | 内容 |
 | ---- | ---- |
 | #311（TASK-71.2） | 22 タスクの実行スクリプト `run_core.sh`（本 README「run_core.sh」節） |
-| #312（TASK-71.3） | Chromium 実測との突合・`results/matrix.json` 生成 |
+| #312（TASK-71.3） | Chromium 実測との突合・`results/matrix.json` 生成（本 README「make_matrix.sh」節。生成スクリプトは導入済み、マトリクス自体は未コミット。マトリクスのコミットと回帰ゲートの有効化は #312 の残りの受け入れ条件） |
 | #309（TASK-71） | 測定レポート |
 
 ## ファイル
@@ -15,7 +15,9 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 | ファイル | 役割 |
 | -------- | ---- |
 | `tasks.json` | 22 タスク定義 |
-| `lib.sh` | 共通関数 `resolve_bin`（実行対象バイナリの解決と検証） |
+| `lib.sh` | 共通関数 `resolve_bin`（実行対象バイナリの解決と検証）・`sha256_of` |
+| `make_matrix.sh` | core 実測と Chromium 参照データを `id` で突合し動作率マトリクスを生成（TASK-71.3） |
+| `reference/chromium_results.json` | PoC-9 の Chromium（Playwright）実測の転記（22 件。出所は「make_matrix.sh」節） |
 | `access_check.sh` | tasks.json の検証と、22 サイトへの到達可否の記録（curl） |
 | `run_core.sh` | 22 タスクを `fandhe-browser` の CDP サーバーで実行し結果を JSONL へ記録（TASK-71.2） |
 | `run_core.mjs` | `run_core.sh` から呼ばれる依存ゼロの CDP クライアント（Node 22 以降） |
@@ -100,6 +102,56 @@ core の `Page.navigate` は fetch して HTML を保存するだけで、**ペ�
 V8 が同梱されていてもページスクリプトは走らないため、本実測は「V8 統合による解消」を示さない。
 メタ行の `page_js_executed` は `false` 固定で、配線された時点で見直す。b5・d2・d3 の結果は実測のまま記録し、解消を装わない。
 属性演算子 `^=` は core のセレクタサブセット外のため e1 は `selector_unsupported` になる。
+
+## make_matrix.sh
+
+```bash
+bash harness/compat-practical/make_matrix.sh [--tasks P] [--core P] [--chromium P] [--out P] [--validate-only]
+```
+
+spec 対応: TASK-71.3 / MS-6 / `COMPAT-4`（関連 `COMPAT-1`・`MEAS-4`・`REPAIR-3`・`REPAIR-8`）。
+
+- 入力: `tasks.json`・`results/core_results.jsonl`（`run_core.sh` の実測）・`reference/chromium_results.json`。依存は bash・jq のみ（ネットワーク・バイナリ起動なし）
+- 出力: `results/matrix.json`（既定）。`[{id, cat, fandhe_browser_core, chromium}]` を `tasks.json` の順に 1 要素 1 行で書く。`harness/compat-regression/README.md` のスキーマ契約に従い、そのまま `check-matrix.sh` へ渡せる。ページ由来テキスト・絶対パス・ホスト名は含めない。実測の来歴（実施日・OS・バイナリ）は `core_results.jsonl` のメタ行と本 README に残す
+- 入力検証（fail-closed・終了コード 2）: ファイルサイズ 1 MiB 以下、`tasks.json` は `access_check.sh --validate-only` に委譲、core のメタ行がちょうど 1 行で `schema_version` が 1、メタの `tasks_sha256` が現行 `tasks.json` と一致（別のタスク集合に対する実測を混ぜない）、`id` 重複なし、`success` が boolean、Chromium 参照データが単一の JSON 配列、`id` 集合と `cat` が 3 入力で完全一致
+- `--validate-only`: 検証と突合までで、ファイルは書かない（CI で実行）
+- 終了コード: `0` 生成・検証完了（動作率が低くても 0。判定はゲートの `check-matrix.sh` の役割）、`1` 書き込み失敗、`2` 入力・使用エラー。書き込みは一時ファイル経由の置換で、失敗時に既存の `--out` を壊さない
+- 類型の対応（PoC-9 の a〜e）: a=`static`・b=`spa`・c=`lazy`・d=`form`・e=`table`。`id` の頭文字と一致する
+
+### Chromium 参照データの出所
+
+- `reference/chromium_results.json` は PoC-9（`docs/spec/03-poc/practical-compat-level/harness/results/chromium_results.json`、`COMPAT-4`）の生データを次の変換で機械的に写したもの。値は手で書き換えていない。`sample`（ページ由来の第三者テキスト）と `url`（`tasks.json` と重複）は載せない
+
+```bash
+jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
+```
+
+- 計測条件の差: Chromium 側は PoC-9 当時の別時期・別 UA の Playwright 実測（`domcontentloaded` 後に待機）で、`texts` は全件一致の件数判定。本リポ側は `run_core.sh` の先頭一致 1 件判定（`method: "first_match"`）。条件が揃った比較ではない
+- PoC-9 の表との食い違い（生データをそのまま採用し、判断を混ぜない）:
+  - e1: 生データは `success: false`（一致 0 件）。PoC-9 の `matrix.json`・README の表は成功扱い
+  - c1: 生データは `success: true`（anti-bot のブロックページ内のリンクに一致した機械判定）。PoC-9 README は実質失敗と注記している
+  - spec 側の不整合はオーナー経由で spec リポ側の課題として扱う
+
+### 実測の突合結果と回帰ゲートの状況（2026-10-07 実測）
+
+| 区分 | fandhe-browser-core | Chromium（PoC-9 生データ） |
+| ---- | ------------------- | -------------------------- |
+| 全体 | 15/22（68.2%） | 20/22 |
+| static（a） | 6/7 | 7/7 |
+| spa（b） | 4/5 | 5/5 |
+| lazy（c） | 1/2 | 2/2 |
+| form（d） | 3/5 | 5/5 |
+| table（e） | 1/3 | 1/3 |
+
+- この値を `check-matrix.sh --threshold 70 --categories static,spa,form --all-categories` に通すと、全体・form・lazy・table が閾値未満で exit 1 になる（static・spa は通過）
+- 主因は、ナビゲーション経路でページ内 JS が実行されないこと（上記「制約」。b5・d2・d3）と、core のセレクタサブセット外（e1）。閾値・対象類型を下げてゲートを通すことはしない
+- そのため `results/matrix.json` は**コミットしていない**（コミットすると `make check-compat-regression` と CI の `compat-regression` ジョブが閾値未達で赤になる）。実測 15/22（68.2%）が閾値 70% 未満のため、まだコミットできない。閾値・対象類型は下げない。実マトリクスのコミットは #312 の残りの受け入れ条件（閾値 70% 到達後）で、`--allow-missing` は #312 完了後に削除する（main の記述どおり）
+- 失敗 7 件の内訳と追跡先:
+  - b5・d2・d3（`no_match`）: ページ内 JS がナビゲーション経路に未配線のため。扱いは #758（TASK-71.h1・人間判断）で決める
+  - e1（`selector_unsupported`）: 属性演算子 `^=` が core のセレクタサブセット外。#760（TASK-71.6）で対応する
+  - a6（`no_match`）: HTTP 403 でコンテンツを取得できない
+  - c1（`no_match`）・e5（`no_match`）: 本 PR では原因を未調査（実測のまま記録。解消を装わない。REPAIR-3）
+- 再生成: `bash harness/compat-practical/run_core.sh` で再計測してから `bash harness/compat-practical/make_matrix.sh`
 
 ## 計測結果
 
