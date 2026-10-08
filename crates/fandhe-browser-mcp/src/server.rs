@@ -6,7 +6,7 @@
 //! `host.rs` 経由で呼び、失敗は必ず `isError` で返す（成功を装わない）。
 //! `snapshot` ツール（TASK-94.4・PLUG-4）はホストの `GET /ai/snapshot` の簡約スナップショットを
 //! text コンテンツ 1 件で返す（`structuredContent` との二重出力でトークンを増やさない）。
-//! 将来仕様: TASK-94.5 でホストへ自己申告する（PLUG-3）。
+//! 起動時のホストへの自己申告は `register.rs` が担う（TASK-94.5・PLUG-3）。
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -22,7 +22,7 @@ use crate::snapshot::{self, SnapshotOutcome};
 
 /// サーバーが採用する MCP プロトコル版。stdio は initialize ハンドシェイクを使うため、
 /// それを持つ 2025-11-25 に固定する（`LATEST` は将来 initialize を廃した版へ進み得る）。
-/// TASK-94.5 の自己申告も同じ定数を参照する。
+/// `register.rs` の自己申告（TASK-94.5）も同じ定数を参照する。
 pub(crate) const SERVER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
 
 /// fandhe-browser の MCP 参照プラグイン本体。状態を持たない。
@@ -167,6 +167,13 @@ mod tests {
                 .cloned()
         };
         assert_eq!(tools.as_array().map(Vec::len), Some(2));
+        // 起動時の自己申告（TASK-94.5）で申告するツール名と公開ツールが一致すること。
+        let mut names: Vec<&str> = tools
+            .as_array()
+            .map(|a| a.iter().filter_map(|t| t["name"].as_str()).collect())
+            .unwrap_or_default();
+        names.sort_unstable();
+        assert_eq!(names, crate::register::DECLARED_TOOLS.to_vec());
         let nav = find("navigate").expect("navigate");
         assert_eq!(nav["inputSchema"]["required"], json!(["url"]));
         let snap = find("snapshot").expect("snapshot");

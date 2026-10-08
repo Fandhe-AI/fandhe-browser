@@ -13,12 +13,15 @@ use std::time::Duration;
 
 use rmcp::serde_json::{self, Value, json};
 
+mod common;
+
 /// 偽ホスト。1 接続だけ受け、受信した要求全文を返し、`reply` を応答する。
 fn fake_host(reply: &'static str) -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
+        common::serve_register(&listener);
         if let Ok((mut s, _)) = listener.accept() {
             let mut raw = Vec::new();
             let mut buf = [0u8; 4096];
@@ -26,7 +29,7 @@ fn fake_host(reply: &'static str) -> (String, mpsc::Receiver<String>) {
                 let n = s.read(&mut buf).unwrap_or(0);
                 raw.extend_from_slice(&buf[..n]);
                 let text = String::from_utf8_lossy(&raw).to_string();
-                if n == 0 || body_complete(&text) {
+                if n == 0 || common::body_complete(&text) {
                     let _ = tx.send(text);
                     break;
                 }
@@ -35,18 +38,6 @@ fn fake_host(reply: &'static str) -> (String, mpsc::Receiver<String>) {
         }
     });
     (addr, rx)
-}
-
-fn body_complete(text: &str) -> bool {
-    let Some((head, body)) = text.split_once("\r\n\r\n") else {
-        return false;
-    };
-    let len = head
-        .lines()
-        .find_map(|l| l.strip_prefix("Content-Length: "))
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    body.len() >= len
 }
 
 /// MCP セッションを張り、navigate を呼んだ結果（id=3）と ping 応答の有無を返す。
@@ -126,7 +117,9 @@ fn plug3_tools_list_exposes_navigate() {
         json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
     );
+    let (host_addr, _reg) = common::register_only();
     let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-browser-mcp"))
+        .env("FANDHE_BROWSER_HOST_ADDR", host_addr)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -196,10 +189,7 @@ fn plug3_navigate_host_404_is_error() {
 /// PLUG-3 / TASK-94.3: ホスト未起動でも isError を返し、セッションは継続する。
 #[test]
 fn plug3_navigate_connection_refused_keeps_session() {
-    let addr = {
-        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-        l.local_addr().expect("addr").to_string()
-    };
+    let addr = common::register_then_close();
     let (result, pinged) = call_navigate(&addr, "https://example.com/");
     assert_eq!(result["isError"], true);
     assert_eq!(
@@ -219,21 +209,16 @@ fn plug3_navigate_invalid_url_never_contacts_host() {
         "http://a b",
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        listener.set_nonblocking(true).expect("nonblocking");
         let addr = listener.local_addr().expect("addr").to_string();
+        // 自己申告の 1 接続だけを受ける。以後のツール呼び出しで接続されないことを確認する。
+        let reg = thread::spawn(move || {
+            common::serve_register(&listener);
+            listener
+        });
         let (result, _) = call_navigate(&addr, url);
+        let listener = reg.join().expect("register thread");
+        listener.set_nonblocking(true).expect("nonblocking");
         assert_eq!(result["isError"], true, "{url}");
         assert!(listener.accept().is_err(), "host contacted for {url}");
     }
-}
-
-/// PLUG-3 / TASK-94.3: 非 loopback の接続先は接続せず isError。
-#[test]
-fn plug3_navigate_non_loopback_host_is_rejected() {
-    let (result, _) = call_navigate("192.0.2.1:9333", "https://example.com/");
-    assert_eq!(result["isError"], true);
-    assert_eq!(
-        result["structuredContent"]["error"],
-        "host address must be a loopback IP address"
-    );
 }

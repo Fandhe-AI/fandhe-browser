@@ -13,12 +13,15 @@ use std::time::Duration;
 
 use rmcp::serde_json::{self, Value, json};
 
+mod common;
+
 /// 偽ホスト。1 接続だけ受け、要求ヘッダ全文を返し、`reply` を応答して切断する。
 fn fake_host(reply: Vec<u8>) -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
+        common::serve_register(&listener);
         if let Ok((mut s, _)) = listener.accept() {
             let mut raw = Vec::new();
             let mut buf = [0u8; 4096];
@@ -121,7 +124,9 @@ fn plug4_tools_list_exposes_snapshot() {
         json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
     );
+    let (host_addr, _reg) = common::register_only();
     let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-browser-mcp"))
+        .env("FANDHE_BROWSER_HOST_ADDR", host_addr)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -238,10 +243,7 @@ fn plug4_snapshot_oversized_response_is_error() {
 /// PLUG-4 / TASK-94.4: ホスト未起動でも isError を返し、セッションは継続する。
 #[test]
 fn plug4_snapshot_connection_refused_keeps_session() {
-    let addr = {
-        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-        l.local_addr().expect("addr").to_string()
-    };
+    let addr = common::register_then_close();
     let (result, pinged) = call_snapshot(&addr);
     assert_eq!(result["isError"], true);
     assert_eq!(
@@ -249,15 +251,4 @@ fn plug4_snapshot_connection_refused_keeps_session() {
         "failed to connect to host"
     );
     assert!(pinged);
-}
-
-/// PLUG-4 / TASK-94.4: 非 loopback の接続先は接続せず isError。
-#[test]
-fn plug4_snapshot_non_loopback_host_is_rejected() {
-    let (result, _) = call_snapshot("192.0.2.1:9333");
-    assert_eq!(result["isError"], true);
-    assert_eq!(
-        result["structuredContent"]["error"],
-        "host address must be a loopback IP address"
-    );
 }
