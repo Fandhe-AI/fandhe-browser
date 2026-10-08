@@ -4,10 +4,13 @@
 //! 役割: MCP 参照プラグイン（`fandhe-browser-mcp`）の `snapshot` ツールが返すテキストと
 //! 生 HTML を `cl100k_base` で数え、サイトごとの削減率と平均を算出する。
 //! 84.0% 以上の判定は本ファイルの `judge_plug4` / `assert_plug4` が担う（TASK-96.2・#382）。
-//! レポート出力は TASK-96.3（#383）の責務で、再利用が要る場合は判定を `benches/token_reduction/`
-//! へ移す。
+//! 測定レポートは TASK-96.3（#383）で `render_report` が Markdown として stdout に出し、
+//! `docs/design/mcp-token-reduction-report.md` へ転記する（再生成: `cargo test -p fandhe-browser-ai
+//! --test mcp_token_reduction plug4_mcp_token_reduction_report_prints_markdown -- --nocapture`）。
+//! コミット済みレポートとの同期は `plug4_committed_report_contains_rendered_block` が検査する。
+//! 再利用が要る場合は判定を `benches/token_reduction/` へ移す。
 //!
-//! 実データの現状: 平均削減率は 84.0% に届いていない（約 -75.6%）。PLUG-4 の前提は PoC-5 の
+//! 実データの現状: 平均削減率は 84.0% に届いていない（約 -75.7%）。PLUG-4 の前提は PoC-5 の
 //! フラット形式だが、現行ホストは JSON ツリーのエンベロープを返し生 HTML より大きいため
 //! （PLUG-5・TASK-97・AISNAP-6 の論点）。実データの verdict は未達のまま固定して事実を記録し
 //! （REPAIR-3）、合否ロジックは合成データで境界値まで検証する。
@@ -26,7 +29,9 @@
 //! 固定値は snapshot の形（TASK-15/16/19・`AISNAP-6`）が変われば測り直しが要る。
 
 use std::error::Error;
+use std::fmt::Write as _;
 use std::fs;
+use std::path::Path;
 
 use fandhe_browser_ai::api::snapshot_body;
 use fandhe_browser_core::{NavigationResult, NavigationState};
@@ -54,7 +59,7 @@ type TestResult<T> = Result<T, Box<dyn Error>>;
 /// （PoC-15 成功基準 4）。平均削減率がこの値以上なら合格。
 const PLUG4_THRESHOLD_PCT: f64 = 84.0;
 
-/// しきい値判定の結果。真偽値にせず、差分を持たせて将来のレポート出力（#383）へ拡張できる形にする
+/// しきい値判定の結果。真偽値にせず、差分を持たせてレポート出力（`render_report`・#383）で差分まで描画できる形にする
 /// （REPAIR-4）。
 #[derive(Debug, Clone, PartialEq)]
 enum Plug4Verdict {
@@ -185,6 +190,81 @@ fn measure_mcp_reduction(counter: &TokenCounter) -> TestResult<Vec<ReductionRow>
         });
     }
     Ok(rows)
+}
+
+/// 測定結果を Markdown のレポート本体（サイト別・集計・PLUG-4 判定の 3 表）に描画する
+/// （TASK-96.3・`PLUG-4`・#383）。
+///
+/// 呼び出し元は stdout 出力テストと、コミット済みレポートとの同期テスト。出力を
+/// `docs/design/mcp-token-reduction-report.md` へ逐語で転記する。判定は `Plug4Verdict` を
+/// `match` して描画し、未達は未達のまま記す（REPAIR-3）。bytes は `PINNED` に無いため載せない。
+fn render_report(
+    rows: &[ReductionRow],
+    summary: &ReductionSummary,
+    verdict: &Plug4Verdict,
+) -> Result<String, std::fmt::Error> {
+    let mut out = String::new();
+    writeln!(out, "### Per site\n")?;
+    writeln!(
+        out,
+        "| site | rawHtmlTokens | snapshotTokens | reductionPct | truncated |"
+    )?;
+    writeln!(
+        out,
+        "| ---- | ------------- | -------------- | ------------ | --------- |"
+    )?;
+    for r in rows {
+        writeln!(
+            out,
+            "| {} | {} | {} | {:.1} | {} |",
+            r.name, r.raw_html_tokens, r.snapshot_tokens, r.reduction_pct, r.snapshot_truncated
+        )?;
+    }
+    writeln!(out, "\n### Summary\n")?;
+    writeln!(
+        out,
+        "| pages | meanReductionPct | minReductionPct | maxReductionPct | medianSnapshotTokens |"
+    )?;
+    writeln!(
+        out,
+        "| ----- | ---------------- | --------------- | --------------- | -------------------- |"
+    )?;
+    writeln!(
+        out,
+        "| {} | {:.1} | {:.1} | {:.1} | {:.1} |",
+        summary.pages,
+        summary.mean_reduction_pct,
+        summary.min_reduction_pct,
+        summary.max_reduction_pct,
+        summary.median_snapshot_tokens
+    )?;
+    writeln!(out, "\n### PLUG-4 verdict\n")?;
+    writeln!(out, "| thresholdPct | meanPct | verdict | gapPts |")?;
+    writeln!(out, "| ------------ | ------- | ------- | ------ |")?;
+    match verdict {
+        Plug4Verdict::Met {
+            mean_pct,
+            threshold_pct,
+        } => writeln!(out, "| {threshold_pct:.1} | {mean_pct:.1} | Met | 0.0 |")?,
+        Plug4Verdict::Shortfall {
+            mean_pct,
+            threshold_pct,
+            gap_pts,
+        } => writeln!(
+            out,
+            "| {threshold_pct:.1} | {mean_pct:.1} | Shortfall | {gap_pts:.1} |"
+        )?,
+    }
+    Ok(out)
+}
+
+/// 実測から `render_report` の出力を作る（テスト共通）。
+fn measured_report() -> TestResult<String> {
+    let counter = TokenCounter::new()?;
+    let rows = measure_mcp_reduction(&counter)?;
+    let s = summarize(&rows).ok_or("no rows")?;
+    let v = judge_plug4(&s, PLUG4_THRESHOLD_PCT);
+    Ok(render_report(&rows, &s, &v)?)
 }
 
 /// `PLUG-4`: MCP 出力は `snapshot_body` のバイト列と一致する（再直列化で変化しない）。
@@ -335,7 +415,7 @@ fn plug4_threshold_nan_is_shortfall() -> TestResult<()> {
     Ok(())
 }
 
-/// `PLUG-4`: 実データの現状 verdict（84.0% 未達・平均約 -75.6%）を固定する。
+/// `PLUG-4`: 実データの現状 verdict（84.0% 未達・平均約 -75.7%）を固定する。
 ///
 /// これは PLUG-4 未達の事実の記録であり、達成を装うものではない（REPAIR-3）。snapshot の出力形式
 /// が縮んで verdict が `Met` に変わったら、本テストを `assert_plug4(&summary)?` による本ゲートに
@@ -367,5 +447,67 @@ fn plug4_mcp_token_reduction_current_verdict_is_pinned_shortfall() -> TestResult
             .into());
         }
     }
+    Ok(())
+}
+
+/// `PLUG-4`・TASK-96.3: 測定レポートを stdout に出す（`-- --nocapture` で表示し docs へ転記する）。
+/// 5 サイトすべての削減率・平均・しきい値・判定が含まれることを具体値で確かめる。
+#[test]
+fn plug4_mcp_token_reduction_report_prints_markdown() -> TestResult<()> {
+    let report = measured_report()?;
+    println!("{report}");
+    for needle in [
+        "| example-minimal | 103 | 202 | -96.1 | false |",
+        "| wikipedia-article | 56482 | 64327 | -13.9 | false |",
+        "| hn-list | 10220 | 21257 | -108.0 | true |",
+        "| login-form | 284 | 553 | -94.7 | false |",
+        "| mdn-docs | 19005 | 31463 | -65.6 | false |",
+        "| 5 | -75.7 | -108.0 | -13.9 |",
+        "| 84.0 | -75.7 | Shortfall | 159.7 |",
+    ] {
+        assert!(report.contains(needle), "missing row: {needle}\n{report}");
+    }
+    Ok(())
+}
+
+/// `PLUG-4`: サイト別表が `PINNED` から導いた行と一致する（snapshot 形式が変われば落ちる）。
+#[test]
+fn plug4_report_rows_match_pinned() -> TestResult<()> {
+    let report = measured_report()?;
+    for (name, raw, snap, truncated) in PINNED {
+        let pct = reduction_pct(raw, snap).ok_or("zero raw tokens")?;
+        let line = format!("| {name} | {raw} | {snap} | {pct:.1} | {truncated} |");
+        assert!(report.lines().any(|l| l == line), "missing line: {line}");
+    }
+    Ok(())
+}
+
+/// `PLUG-4`: 合成データの `Met` 側の描画。
+#[test]
+fn plug4_report_renders_met_verdict_for_synthetic_data() -> TestResult<()> {
+    let s = summary_of(&[87.8, 90.0, 85.0, 86.0, 88.0])?;
+    let v = judge_plug4(&s, PLUG4_THRESHOLD_PCT);
+    let report = render_report(&[synthetic_row("a", 87.8)], &s, &v)?;
+    assert!(report.contains("| 84.0 | 87.4 | Met | 0.0 |"), "{report}");
+    assert!(report.contains("| a | 0 | 0 | 87.8 | false |"), "{report}");
+    Ok(())
+}
+
+/// `PLUG-4`・TASK-96.3: コミット済みレポートに `render_report` の出力が逐語で含まれる。
+/// 読み込み失敗は `Err`（fail-closed）。CRLF は LF に正規化して比較する。
+#[test]
+fn plug4_committed_report_contains_rendered_block() -> TestResult<()> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("docs")
+        .join("design")
+        .join("mcp-token-reduction-report.md");
+    let committed = fs::read_to_string(&path)?.replace("\r\n", "\n");
+    let report = measured_report()?;
+    assert!(
+        committed.contains(&report),
+        "docs/design/mcp-token-reduction-report.md is out of sync; regenerate with --nocapture"
+    );
     Ok(())
 }
