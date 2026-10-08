@@ -22,6 +22,10 @@ pub enum TokenCountError {
     /// トークナイザ（BPE テーブル）の構築失敗。
     Tokenizer(String),
     /// フィクスチャの読み込み失敗。
+    #[allow(
+        dead_code,
+        reason = "mcp_envelope 系ターゲットはフィクスチャ読込に失敗しない経路のみ使う"
+    )]
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -66,6 +70,10 @@ impl TokenCounter {
 
 /// 1 フィクスチャ分の生 HTML 計測結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "bench 間で共有する tokens.rs のため、mcp_envelope 系ターゲットでは未使用"
+)]
 pub struct RawHtmlTokens {
     /// ファイル名（例: `example-minimal.html`）。
     pub name: String,
@@ -83,6 +91,10 @@ pub fn fixtures_dir() -> PathBuf {
 }
 
 /// `dir` 内の `.html` をファイル名昇順に読み、前処理なしの全文を数える。
+#[allow(
+    dead_code,
+    reason = "bench 間で共有する tokens.rs のため、mcp_envelope 系ターゲットでは未使用"
+)]
 pub fn measure_raw_html(
     counter: &TokenCounter,
     dir: &Path,

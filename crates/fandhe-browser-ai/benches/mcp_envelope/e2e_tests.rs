@@ -6,7 +6,6 @@
 
 #![cfg(unix)]
 
-#[allow(dead_code, reason = "FIXTURES は bench 本体専用で e2e は 1 件のみ使う")]
 #[path = "harness.rs"]
 mod harness;
 #[path = "host.rs"]
@@ -15,13 +14,10 @@ mod host;
 mod jsonrpc;
 #[path = "mcp_client.rs"]
 mod mcp_client;
-#[allow(
-    dead_code,
-    reason = "集計・TSV 整形は bench 本体専用で e2e は行型のみ使う"
-)]
+#[path = "report.rs"]
+mod report;
 #[path = "stats.rs"]
 mod stats;
-#[allow(dead_code, reason = "tokens.rs の raw HTML 計測等を e2e は使わない")]
 #[path = "../token_reduction/tokens.rs"]
 mod tokens;
 
@@ -37,9 +33,10 @@ fn plug5_e2e_mcp_snapshot_matches_direct_and_envelope_is_positive() {
     let counter = tokens::TokenCounter::new().expect("tokenizer");
     let mut h = harness::Harness::start(&bin).expect("harness start (register + initialize)");
     let r = h
-        .measure(&counter, "example-minimal", 1)
+        .measure(&counter, harness::FIXTURES[0], 1)
         .expect("measure example-minimal");
     assert_eq!(r.row.name, "example-minimal");
+    assert_eq!(harness::FIXTURES.len(), 5);
     assert_eq!(r.row.raw_html_tokens, 103);
     // 一致検証は measure 内で済んでいる。MCP の text は方式 B 本体と同じトークン数になる。
     assert_eq!(r.row.mcp_text_tokens, r.row.direct_tokens);
@@ -50,4 +47,12 @@ fn plug5_e2e_mcp_snapshot_matches_direct_and_envelope_is_positive() {
     );
     assert_eq!(r.direct_ms.len(), 1);
     assert_eq!(r.mcp_ms.len(), 1);
+    // レポート整形は集計・TSV 関数を通す。1 反復でも行が出る。
+    let report = report::render(&[r], 1).expect("render report");
+    assert!(report.starts_with(stats::tsv_header()), "{report}");
+    assert!(
+        report.contains("# MCP envelope vs direct (PLUG-5)"),
+        "{report}"
+    );
+    assert!(report.contains("pages\t1"), "{report}");
 }

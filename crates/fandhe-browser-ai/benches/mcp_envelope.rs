@@ -28,13 +28,12 @@ mod jsonrpc;
 #[path = "mcp_envelope/mcp_client.rs"]
 mod mcp_client;
 #[cfg(unix)]
+#[path = "mcp_envelope/report.rs"]
+mod report;
+#[cfg(unix)]
 #[path = "mcp_envelope/stats.rs"]
 mod stats;
 #[cfg(unix)]
-#[allow(
-    dead_code,
-    reason = "token_reduction 共有の tokens.rs の一部（raw HTML 計測等）をこの bench は使わない"
-)]
 #[path = "token_reduction/tokens.rs"]
 mod tokens;
 
@@ -58,8 +57,6 @@ fn parse_iterations(args: &[String]) -> Result<usize, String> {
 
 #[cfg(unix)]
 fn run() -> Result<(), String> {
-    use stats::{aggregate, increments, latency_row, summarize_latency, tsv_header, tsv_row};
-
     let args: Vec<String> = std::env::args().skip(1).collect();
     let iterations = parse_iterations(&args)?;
     let env_bin = std::env::var(mcp_client::BIN_ENV).ok();
@@ -76,62 +73,7 @@ fn run() -> Result<(), String> {
         results.push(h.measure(&counter, name, iterations)?);
     }
 
-    println!("{}", tsv_header());
-    for r in &results {
-        println!("{}", tsv_row(&r.row));
-    }
-    println!();
-    println!("fixture\tpath\tp50Ms\tp95Ms\tmeanMs");
-    let (mut all_direct, mut all_mcp) = (Vec::new(), Vec::new());
-    for r in &results {
-        let inc = increments(&r.mcp_ms, &r.direct_ms);
-        for (label, v) in [
-            ("direct", &r.direct_ms),
-            ("mcp", &r.mcp_ms),
-            ("increment", &inc),
-        ] {
-            let s = summarize_latency(v).ok_or("no latency samples")?;
-            println!("{}", latency_row(&format!("{}\t{label}", r.row.name), &s));
-        }
-        all_direct.extend_from_slice(&r.direct_ms);
-        all_mcp.extend_from_slice(&r.mcp_ms);
-    }
-    let all_inc = increments(&all_mcp, &all_direct);
-    for (label, v) in [
-        ("direct", &all_direct),
-        ("mcp", &all_mcp),
-        ("increment", &all_inc),
-    ] {
-        let s = summarize_latency(v).ok_or("no latency samples")?;
-        println!("{}", latency_row(&format!("ALL\t{label}"), &s));
-    }
-
-    let direct_pct: Vec<f64> = results
-        .iter()
-        .filter_map(|r| r.row.direct_reduction_pct())
-        .collect();
-    let mcp_pct: Vec<f64> = results
-        .iter()
-        .filter_map(|r| r.row.mcp_reduction_pct())
-        .collect();
-    let env_tokens: Vec<f64> = results
-        .iter()
-        .map(|r| r.row.envelope_tokens() as f64)
-        .collect();
-    println!();
-    println!("# MCP envelope vs direct (PLUG-5)");
-    println!("pages\t{}", results.len());
-    println!("iterations\t{iterations}");
-    for (label, v) in [
-        ("DirectReductionPct", &direct_pct),
-        ("McpReductionPct", &mcp_pct),
-        ("EnvelopeTokens", &env_tokens),
-    ] {
-        let a = aggregate(v).ok_or("no aggregate")?;
-        println!("mean{label}\t{:.1}", a.mean);
-        println!("min{label}\t{:.1}", a.min);
-        println!("max{label}\t{:.1}", a.max);
-    }
+    println!("{}", report::render(&results, iterations)?);
     Ok(())
 }
 
