@@ -8,9 +8,12 @@
 //! シグナル処理は持たず、stdin の EOF で終了する。stdin は `limit::LimitedReader` で包み、
 //! 1 メッセージ（改行区切り 1 行）が `MAX_MESSAGE_BYTES` を超えた時点で読み取りを打ち切って
 //! セッションを終了する（改行なしの巨大入力によるメモリ無制限確保の防止）。
-//! 未実装: navigate（TASK-94.3）・snapshot（TASK-94.4）・自己申告（TASK-94.5）。
+//! navigate（TASK-94.3）はホストの `POST /ai/navigate` を `host.rs` 経由で呼ぶ。
+//! 未実装: snapshot（TASK-94.4）・自己申告（TASK-94.5）。
 
+mod host;
 mod limit;
+mod navigate;
 mod server;
 
 use std::process::ExitCode;
