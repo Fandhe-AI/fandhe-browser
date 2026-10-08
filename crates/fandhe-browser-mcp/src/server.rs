@@ -59,9 +59,16 @@ impl FandheBrowserMcp {
             Err(e) => return error_result(&e.to_string(), json!({})),
         };
         let body = navigate::request_body(url);
+        let Some(permit) = host::try_acquire() else {
+            return error_result("too many concurrent host requests", json!({}));
+        };
         // main は current_thread ランタイムのため、ブロッキング I/O は専用スレッドへ逃がす。
-        let res =
-            tokio::task::spawn_blocking(move || host::post_json(addr, "/ai/navigate", &body)).await;
+        // 枠は blocking クロージャが終わるまで保持する（呼び出しが取り消されても解放しない）。
+        let res = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            host::post_json(addr, "/ai/navigate", &body)
+        })
+        .await;
         let resp = match res {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => return error_result(&e.to_string(), json!({})),
