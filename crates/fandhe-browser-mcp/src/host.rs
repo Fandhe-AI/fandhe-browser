@@ -89,6 +89,10 @@ fn build_request(addr: SocketAddr, path: &str, body: &[u8]) -> Vec<u8> {
 }
 
 /// 応答バイト列をステータスと本文へ分解する。
+///
+/// 制約: `Transfer-Encoding: chunked` はデコードしない。chunked 応答の本文は JSON として
+/// 解析できず失敗扱いになる（誤って成功を装うことはない安全側の挙動）。ホストは
+/// `Content-Length` 付きで返す前提（将来 chunked 対応する場合は PLUG-3 の拡張として追加）。
 fn parse_response(raw: &[u8]) -> Result<HostResponse, HostError> {
     let sep = raw
         .windows(4)

@@ -95,7 +95,7 @@ mod tests {
     use super::*;
     use rmcp::serde_json::{self, json};
 
-    /// PLUG-3 / TASK-94.2: get_info はtools capabilities・自 crate の serverInfo・固定プロトコル版を返す。
+    /// PLUG-3 / TASK-94.2: get_info は tools capabilities・自 crate の serverInfo・固定プロトコル版を返す。
     #[test]
     fn plug3_get_info_returns_tools_capability_and_server_info() {
         let info = serde_json::to_value(FandheBrowserMcp.get_info()).expect("serialize");
