@@ -46,7 +46,10 @@ impl TempDir {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let base = std::env::temp_dir();
+        // Profile::open は root 経路上の symlink を拒否する（macOS の /var -> /private/var 等）ため、
+        // 既存の一時ディレクトリを事前に実体パスへ解決する（profile 側の検査は緩めない。PROF 境界）。
+        let tmp = std::env::temp_dir();
+        let base = std::fs::canonicalize(&tmp).unwrap_or(tmp);
         Self(base.join(format!(
             "fandhe-mcp-envelope-{}-{n}-{nanos}",
             std::process::id()
@@ -57,6 +60,17 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// CI 診断用にパスを含まない ProfileError の種別ラベルを返す。
+fn profile_error_label(e: &fandhe_browser_profile::ProfileError) -> String {
+    use fandhe_browser_profile::ProfileError;
+    match e {
+        ProfileError::Io(io) => format!("io:{:?}", io.kind()),
+        ProfileError::InvalidLayout { reason, .. } => format!("invalid-layout:{reason}"),
+        ProfileError::Unsupported { .. } => "unsupported-platform".to_string(),
+        _ => "other".to_string(),
     }
 }
 
@@ -81,8 +95,12 @@ impl Harness {
     /// 一時プロファイル・ホスト・mcp（起動時に登録が 1 回発生）を立ち上げる。
     pub fn start(bin: &Path) -> Result<Self, String> {
         let dir = TempDir::new();
-        let profile =
-            Profile::open(&dir.0).map_err(|_| "failed to open temporary profile".to_string())?;
+        let profile = Profile::open(&dir.0).map_err(|e| {
+            format!(
+                "failed to open temporary profile: {}",
+                profile_error_label(&e)
+            )
+        })?;
         let app = Arc::new(AppState::with_disabled_renderer(Arc::new(profile)));
         let host = BenchHost::start(router(Arc::clone(&app)))
             .map_err(|_| "failed to start bench host".to_string())?;
