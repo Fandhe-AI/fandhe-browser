@@ -102,7 +102,7 @@ fn plug3_stdio_initialize_handshake_succeeds() {
     assert_eq!(init["protocolVersion"], "2025-06-18");
     assert_eq!(init["serverInfo"]["name"], "fandhe-browser-mcp");
     assert_eq!(init["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(init["capabilities"], serde_json::json!({}));
+    assert_eq!(init["capabilities"], serde_json::json!({"tools":{}}));
     assert_eq!(find_id(&msgs, 2)["result"], serde_json::json!({}));
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 }
