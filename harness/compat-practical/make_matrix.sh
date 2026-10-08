@@ -167,12 +167,12 @@ OUT_DIR="$(dirname "$OUT")"
 [ -d "$OUT_DIR" ] || { echo "error: output directory not found: $OUT_DIR" >&2; exit 1; }
 # 出力先と同じディレクトリへ一時ファイルを作ってから置換する（途中失敗で既存の実測を壊さない）
 TMP="$(mktemp "$OUT_DIR/.matrix.XXXXXX")" || { echo "error: cannot create temporary file in $OUT_DIR" >&2; exit 1; }
-# 1 要素 1 行・末尾改行あり・LF 固定
-{
-  echo "["
-  jq -c '.matrix[]' <<<"$result" | awk 'NR > 1 { print prev "," } { prev = "  " $0 } END { print prev }'
-  echo "]"
-} >"$TMP" || { echo "error: failed to write matrix" >&2; exit 1; }
+# 1 要素 1 行・末尾改行あり・LF 固定。各段の失敗を個別に検査し、全て成功した場合だけ置換する
+# （コマンドグループを || の左辺にすると set -e が効かず、途中失敗が echo "]" に隠れるため）
+rows=$(jq -c '.matrix[]' <<<"$result") || { echo "error: failed to extract matrix rows" >&2; exit 1; }
+body=$(awk 'NR > 1 { print prev "," } { prev = "  " $0 } END { print prev }' <<<"$rows") \
+  || { echo "error: failed to format matrix" >&2; exit 1; }
+printf '[\n%s\n]\n' "$body" >"$TMP" || { echo "error: failed to write matrix" >&2; exit 1; }
 mv -f "$TMP" "$OUT" || { echo "error: failed to replace $OUT" >&2; exit 1; }
 TMP=""
 echo "ok: wrote $(jq '.matrix | length' <<<"$result") entries"

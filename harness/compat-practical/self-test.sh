@@ -602,6 +602,18 @@ mm_expect_fail "invalid tasks" --tasks "$MM/ch_obj.json" --core "$MM/core.jsonl"
 mm_expect_fail "unknown argument" --bogus
 expect_eq "$(cat "$MM/keep.json")" "previous matrix" "make_matrix failure keeps existing --out"
 expect_exit "make_matrix output dir missing" 1 mm_run --out "$MM/no-such-dir/m.json"
+# 出力段（jq の行抽出）が失敗したら既存の --out を置換しない（MEAS-4。最後の echo が失敗を隠さない）
+MM_STUB="$MM/stub"
+mkdir -p "$MM_STUB"
+REAL_JQ="$(type -P jq)"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'for a in "$@"; do [ "$a" = ".matrix[]" ] && exit 5; done' \
+  "exec \"$REAL_JQ\" \"\$@\"" >"$MM_STUB/jq"
+chmod +x "$MM_STUB/jq"
+echo 'previous matrix' >"$MM/keep2.json"
+expect_exit "make_matrix output stage failure" 1 env PATH="$MM_STUB:$PATH" bash "$MAKE_MATRIX" --tasks "$MM/tasks.json" --core "$MM/core.jsonl" --chromium "$MM/chromium.json" --out "$MM/keep2.json"
+expect_eq "$(cat "$MM/keep2.json")" "previous matrix" "make_matrix output stage failure keeps existing --out"
+expect_eq "$(ls -A "$MM" | grep -c '^\.matrix\.' || true)" "0" "make_matrix output stage failure leaves no temp file"
 
 # 実入力: 22 タスクの突合（件数は再計測で変わるためハードコードしない。行単位の一致で確かめる）
 REAL_OUT="$WORK/real_matrix.json"
