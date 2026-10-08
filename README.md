@@ -4,7 +4,7 @@ Rust 製の軽量・ミニマムなブラウザの実装リポジトリです。
 
 ## 位置づけ
 
-- **本リポジトリは public** です（vector-db・rust-ai-library と同一方針）
+- **本リポジトリは public** です（fandhe-db・rust-ai-library と同一方針）
 - **仕様・ビヘイビア定義**: [fandhe-browser-spec](https://github.com/Fandhe-AI/fandhe-browser-spec)（`docs/spec` に submodule 参照。**private リポジトリとして意図的に非公開を維持**する方針であり、アクセス権のない環境からは submodule を解決できません）
 - 旧称は `rust-browser` です。spec リポの文書本文には旧称のまま残っている箇所があります
 

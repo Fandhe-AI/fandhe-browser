@@ -2,7 +2,7 @@ name: CI
 
 # push/pull_request で自動起動する（TASK-55.2・Issue #59・対象ビヘイビア XOS-1・MS-1）。
 # workflow_dispatch は手動再実行・検証用に併存させる。有効化に伴い、本リポに存在しない
-# make ターゲット・scripts/ を前提にした vector-db 由来のジョブ（test-default-build
+# make ターゲット・scripts/ を前提にした fandhe-db 由来のジョブ（test-default-build
 # 以降。前バージョンの本ファイル参照）はすべて削除した。lint-docs が参照する設定
 # ファイル（.markdownlint.jsonc 等）の整備・rust-ci の cache-key-prefix のリポ名への
 # 変更は TASK-55.3（Issue #60）で完了済み。3 OS matrix 対応（.claude/rules/ci.md）は
@@ -153,7 +153,7 @@ jobs:
       # 毎回まっさらなため、無効のままだと fmt／clippy／test／deny の各ジョブが
       # 依存クレートを毎回フルビルドすることになる。cache-key-prefix は
       # 他リポジトリ（既定値 `rust-base-ci` や、CI 設定を輸入した際の残置物
-      # `vector-db`）との衝突回避のため本リポ名にする（TASK-55.3・Issue #60）
+      # `fandhe-db`）との衝突回避のため本リポ名にする（TASK-55.3・Issue #60）
       #
       # windows-latest のみ既定 false（Issue #59 レビュー指摘。PR #409 CI 失敗の
       # 実測: rust-base-ci.yml（Fandhe-AI/actions・@latest）の
