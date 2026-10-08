@@ -4,11 +4,13 @@
 //! `navigate` ツール（TASK-94.3）を公開する。navigate はホストの `POST /ai/navigate`
 //! （PoC-15 契約。本リポのホストには未実装のため実ホストでは 404 となり得る。REPAIR-3）を
 //! `host.rs` 経由で呼び、失敗は必ず `isError` で返す（成功を装わない）。
-//! 将来仕様: TASK-94.4 で snapshot を追加し、TASK-94.5 でホストへ自己申告する（PLUG-3・PLUG-4）。
+//! `snapshot` ツール（TASK-94.4・PLUG-4）はホストの `GET /ai/snapshot` の簡約スナップショットを
+//! text コンテンツ 1 件で返す（`structuredContent` との二重出力でトークンを増やさない）。
+//! 将来仕様: TASK-94.5 でホストへ自己申告する（PLUG-3）。
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
+    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
 };
 use rmcp::serde::Deserialize;
 use rmcp::serde_json::json;
@@ -16,6 +18,7 @@ use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 
 use crate::host;
 use crate::navigate::{self, NavigateOutcome};
+use crate::snapshot::{self, SnapshotOutcome};
 
 /// サーバーが採用する MCP プロトコル版。stdio は initialize ハンドシェイクを使うため、
 /// それを持つ 2025-11-25 に固定する（`LATEST` は将来 initialize を廃した版へ進み得る）。
@@ -75,6 +78,44 @@ impl FandheBrowserMcp {
             ),
         }
     }
+
+    /// ホストの簡約スナップショットを取得する。失敗・不完全な応答はすべて `isError`。
+    #[tool(
+        description = "Return the simplified accessibility snapshot of the most recently navigated page."
+    )]
+    async fn snapshot(&self) -> CallToolResult {
+        let addr = match host::resolve_from_env() {
+            Ok(a) => a,
+            Err(e) => return error_result(&e.to_string(), json!({})),
+        };
+        let Some(permit) = host::try_acquire() else {
+            return error_result("too many concurrent host requests", json!({}));
+        };
+        // 枠は blocking クロージャが終わるまで保持する（呼び出しが取り消されても解放しない）。
+        let res = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            host::get(
+                addr,
+                snapshot::SNAPSHOT_PATH,
+                snapshot::MAX_SNAPSHOT_RESPONSE_BYTES,
+            )
+        })
+        .await;
+        let resp = match res {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return error_result(&e.to_string(), json!({})),
+            Err(_) => return error_result("snapshot task failed", json!({})),
+        };
+        match snapshot::interpret(resp.status, &resp.body) {
+            SnapshotOutcome::Success { text } => {
+                CallToolResult::success(vec![ContentBlock::text(text)])
+            }
+            SnapshotOutcome::Failure { status, code } => error_result(
+                "host rejected snapshot",
+                json!({ "status": status, "code": code }),
+            ),
+        }
+    }
 }
 
 #[tool_handler]
@@ -105,14 +146,23 @@ mod tests {
         assert_eq!(info["protocolVersion"], "2025-11-25");
     }
 
-    /// PLUG-3 / TASK-94.3: ツール一覧は navigate のみで、入力スキーマは url 必須。
+    /// PLUG-3 / TASK-94.3 / TASK-94.4: ツール一覧は navigate（url 必須）と snapshot（必須引数なし）。
     #[test]
-    fn plug3_tool_list_has_navigate_with_required_url() {
-        let tools = FandheBrowserMcp::tool_router().list_all();
-        assert_eq!(tools.len(), 1);
-        let tool = serde_json::to_value(&tools[0]).expect("serialize");
-        assert_eq!(tool["name"], "navigate");
-        assert_eq!(tool["inputSchema"]["required"], json!(["url"]));
+    fn plug3_tool_list_has_navigate_and_snapshot() {
+        let router = FandheBrowserMcp::tool_router();
+        let tools = serde_json::to_value(router.list_all()).expect("serialize");
+        let find = |name: &str| {
+            tools
+                .as_array()
+                .and_then(|a| a.iter().find(|t| t["name"] == name))
+                .cloned()
+        };
+        assert_eq!(tools.as_array().map(Vec::len), Some(2));
+        let nav = find("navigate").expect("navigate");
+        assert_eq!(nav["inputSchema"]["required"], json!(["url"]));
+        let snap = find("snapshot").expect("snapshot");
+        assert_eq!(snap["inputSchema"]["type"], "object");
+        assert!(snap["inputSchema"].get("required").is_none());
     }
 
     /// PLUG-3 / TASK-94.2: 採用するプロトコル版は 2025-11-25 に固定されている。
