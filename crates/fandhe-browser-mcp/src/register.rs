@@ -24,7 +24,8 @@ pub(crate) const DEFAULT_HOST_ADDR: &str = "127.0.0.1:9333";
 /// 登録エンドポイントのパス。
 const REGISTER_PATH: &str = "/ai/plugins/register";
 /// マニフェストで申告するツール名。`server.rs` が公開するツール（navigate: TASK-94.3・
-/// snapshot: TASK-94.4）と一致させる。実装との整合は TASK-94.6 で検証する。
+/// snapshot: TASK-94.4）と一致させる。実装との整合は `tests/plugin_flow.rs` の
+/// `plug3_plug4_full_flow_register_navigate_snapshot_in_one_session` で検証済み（TASK-94.6）。
 pub(crate) const DECLARED_TOOLS: [&str; 2] = ["navigate", "snapshot"];
 /// 応答の読み取り上限（バイト）。
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
