@@ -24,13 +24,18 @@ fn run(input: Option<&str>) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mcp binary");
-    if let Some(text) = input {
-        let mut stdin = child.stdin.take().expect("stdin");
-        // 子が上限超過で先に終了した場合の BrokenPipe は想定内のため無視する。
-        let _ = stdin.write_all(text.as_bytes());
-        drop(stdin);
-    }
+    // 期限は送信開始前から数える。子が stdin を読まないとパイプが満杯になり
+    // write_all が止まるため、送信は別スレッドで行い下の期限監視・kill を必ず通す。
     let deadline = Instant::now() + Duration::from_secs(30);
+    let writer = input.map(|text| {
+        let mut stdin = child.stdin.take().expect("stdin");
+        let bytes = text.as_bytes().to_vec();
+        std::thread::spawn(move || {
+            // 子が上限超過で先に終了した場合の BrokenPipe は想定内のため無視する。
+            let _ = stdin.write_all(&bytes);
+            drop(stdin);
+        })
+    });
     let status = loop {
         if let Some(s) = child.try_wait().expect("try_wait") {
             break s;
@@ -41,6 +46,10 @@ fn run(input: Option<&str>) -> Output {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
+    // 子の終了で stdin が閉じるため、送信スレッドは BrokenPipe で終了する。
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
     let mut stdout = String::new();
     let mut stderr = String::new();
     child
