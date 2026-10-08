@@ -50,7 +50,7 @@ fn core_5_unsupported_syntax_is_err() {
         "a::before",
         "a + b",
         "a ~ b",
-        "[a^=v]",
+        "[a$=v]",
         ".a\\:b",
     ] {
         match parse_selector_list(input) {

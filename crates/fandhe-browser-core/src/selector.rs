@@ -15,7 +15,8 @@
 //!
 //! 対応する構文（サブセット）: 型セレクタ（`div`）・ID（`#id`）・
 //! クラス（`.class`）・属性の存在（`[a]`）・属性の完全一致
-//! （`[a=v]` / `[a="v"]` / `[a='v']`）・子孫結合子（空白）・子結合子（`>`）・
+//! （`[a=v]` / `[a="v"]` / `[a='v']`）・属性の前方一致（`[a^=v]`・
+//! TASK-71.6・#760）・子孫結合子（空白）・子結合子（`>`）・
 //! カンマ区切りのセレクタリスト。
 //!
 //! 照合契約（TASK-24.10・`#418`・[`crate::query`] が実装する）: AST（[`CompoundSelector::type_name`]・
@@ -32,8 +33,8 @@
 //!
 //! - 対象外の構文（`Error::Unsupported` を返す。サブセット実装）: `*`
 //!   （全称セレクタ）・疑似クラス / 疑似要素（`:`・`::`）・隣接 / 一般兄弟
-//!   結合子（`+` / `~`）・名前空間（`|`）・`=` 以外の属性演算子（`~=` `|=`
-//!   `^=` `$=` `*=`）・属性フラグ（`i` / `s`）・エスケープ（`\`）・
+//!   結合子（`+` / `~`）・名前空間（`|`）・`=` `^=` 以外の属性演算子（`~=` `|=`
+//!   `$=` `*=`）・属性フラグ（`i` / `s`）・エスケープ（`\`）・
 //!   入れ子（`&`）。実需が出た段階で拡張する（各 enum は
 //!   `#[non_exhaustive]` のため非破壊で追加できる。対応 TASK・MS 未定・
 //!   spec 側で未割当）
@@ -221,6 +222,11 @@ pub enum AttributeMatcher {
     /// `[name=value]`: 属性値が完全一致するかを見る
     /// （値は大文字小文字を区別したまま保持する）。
     Equals(String),
+    /// `[name^=value]`: 属性値が value で始まるか（前方一致）を見る
+    /// （TASK-71.6・#760。値は大文字小文字を区別したまま保持する）。
+    /// 空文字列もパース上は受理するが、照合では常に不一致になる
+    /// （Selectors 仕様。判定は `query` 側）。
+    Prefix(String),
 }
 
 /// 複合セレクタ間の結合子。
@@ -405,30 +411,18 @@ fn parse_attribute_selector(cursor: &mut Cursor<'_>) -> Result<AttributeSelector
         }
         Some('=') => {
             cursor.bump();
-            cursor.skip_whitespace();
-            let value_offset = cursor.offset();
-            let value = match cursor.peek() {
-                Some('\'') | Some('"') => parse_quoted_string(cursor)?,
-                Some(c) if is_ident_start_or_hyphen(c) => parse_ident(cursor)?,
-                Some('\\') => return Err(unsupported_at(value_offset, "escape")),
-                _ => return Err(invalid_input_at(value_offset, "expected attribute value")),
-            };
-            cursor.skip_whitespace();
-            // 属性フラグ（`i` / `s`）は値の直後に識別子が続く形で現れる。
-            if let Some(c) = cursor.peek()
-                && is_ident_start_or_hyphen(c)
-            {
-                return Err(unsupported_at(cursor.offset(), "attribute flag"));
-            }
-            match cursor.peek() {
-                Some(']') => {
-                    cursor.bump();
-                }
-                _ => return Err(invalid_input_at(cursor.offset(), "expected ']'")),
-            }
-            AttributeMatcher::Equals(value)
+            AttributeMatcher::Equals(parse_attribute_value_and_close(cursor)?)
         }
-        Some('~') | Some('|') | Some('^') | Some('$') | Some('*') => {
+        Some('^') => {
+            cursor.bump();
+            // `^=` は 1 トークンのため `^` の直後に `=` を要求する。
+            if cursor.peek() != Some('=') {
+                return Err(invalid_input_at(cursor.offset(), "expected '='"));
+            }
+            cursor.bump();
+            AttributeMatcher::Prefix(parse_attribute_value_and_close(cursor)?)
+        }
+        Some('~') | Some('|') | Some('$') | Some('*') => {
             return Err(unsupported_at(cursor.offset(), "attribute operator"));
         }
         _ => {
@@ -440,6 +434,33 @@ fn parse_attribute_selector(cursor: &mut Cursor<'_>) -> Result<AttributeSelector
     };
 
     Ok(AttributeSelector { name, matcher })
+}
+
+/// 属性演算子の直後から、値（引用符付き文字列または識別子）・属性フラグの
+/// 検出・閉じ `]` までを解析して値を返す。`=` と `^=` が共有する。
+fn parse_attribute_value_and_close(cursor: &mut Cursor<'_>) -> Result<String> {
+    cursor.skip_whitespace();
+    let value_offset = cursor.offset();
+    let value = match cursor.peek() {
+        Some('\'') | Some('"') => parse_quoted_string(cursor)?,
+        Some(c) if is_ident_start_or_hyphen(c) => parse_ident(cursor)?,
+        Some('\\') => return Err(unsupported_at(value_offset, "escape")),
+        _ => return Err(invalid_input_at(value_offset, "expected attribute value")),
+    };
+    cursor.skip_whitespace();
+    // 属性フラグ（`i` / `s`）は値の直後に識別子が続く形で現れる。
+    if let Some(c) = cursor.peek()
+        && is_ident_start_or_hyphen(c)
+    {
+        return Err(unsupported_at(cursor.offset(), "attribute flag"));
+    }
+    match cursor.peek() {
+        Some(']') => {
+            cursor.bump();
+        }
+        _ => return Err(invalid_input_at(cursor.offset(), "expected ']'")),
+    }
+    Ok(value)
 }
 
 /// 複合セレクタ（型名 + `#`/`.`/`[` の繰り返し）を解析する。
@@ -1073,6 +1094,32 @@ mod tests {
         assert_eq!(list.selectors(), &[expected]);
     }
 
+    /// TASK-71.6・#760: `[a^=v]` の各表記が `Prefix` になる（空文字列もパースは成功）。
+    #[test]
+    fn core_1_parses_attribute_prefix_selector() {
+        let cases = [
+            ("[id^=\"issue_\"]", None, "issue_"),
+            ("[id^=issue_]", None, "issue_"),
+            ("[id ^= 'x']", None, "x"),
+            ("[id^=\"\"]", None, ""),
+            ("a[id^=\"issue_\"]", Some("a"), "issue_"),
+        ];
+        for (input, type_name, value) in cases {
+            let list = parse_selector_list(input).expect(input);
+            let expected = ComplexSelector {
+                first: CompoundSelector {
+                    type_name: type_name.map(str::to_string),
+                    simple_selectors: vec![SimpleSelector::Attribute(AttributeSelector {
+                        name: "id".to_string(),
+                        matcher: AttributeMatcher::Prefix(value.to_string()),
+                    })],
+                },
+                rest: Vec::new(),
+            };
+            assert_eq!(list.selectors(), &[expected], "{input}");
+        }
+    }
+
     /// サブセット外の構文が `Error::Unsupported` になることを確認する。
     #[test]
     fn core_1_rejects_unsupported_syntax() {
@@ -1084,7 +1131,7 @@ mod tests {
             "a ~ b",
             "svg|a",
             "[a~=v]",
-            "[a^=v]",
+            "[a^=v i]",
             "[a$=v]",
             "[a*=v]",
             "[a|=v]",
@@ -1127,6 +1174,11 @@ mod tests {
             "[a",
             "[a='v",
             "[]",
+            "[a^]",
+            "[a^ =v]",
+            "[a^v]",
+            "[a^=]",
+            "[a^=\"v",
             "[a=\"x\ny\"]",
             "a\u{0}",
             // 属性セレクタ直後に空白なしで別の複合セレクタが続くケース
