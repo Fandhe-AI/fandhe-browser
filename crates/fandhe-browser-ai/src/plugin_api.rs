@@ -2,8 +2,8 @@
 //!
 //! プラグインが自己申告する識別子・バージョン・トランスポート・提供ツール一覧・要求権限を
 //! 表す [`PluginManifest`] と、その JSON からの構築・JSON への出力を提供する。
-//! 外部入力（プラグイン由来で untrusted）を扱うため、スキーマ制約（PoC-15 の
-//! `host-api.schema.json` の `PluginManifest`）を構築時に全て検証し、不正な状態の値を作れない
+//! 外部入力（プラグイン由来で untrusted）を扱うため、スキーマ制約（
+//! `docs/design/host-api.schema.json` の `PluginManifest`。TASK-92.5）を構築時に全て検証し、不正な状態の値を作れない
 //! ようにしている。未知キー・未知の transport / permission は拒否する（fail-closed）。
 //!
 //! 検証済みマニフェストを保持する [`PluginRegistry`] と、それを `Arc<AppState>` と共に持つ ai 固有の
@@ -570,6 +570,9 @@ fn is_valid_version(s: &str) -> bool {
         .chars()
         .any(|c| matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}'))
 }
+
+#[cfg(test)]
+mod schema_contract_tests;
 
 #[cfg(test)]
 mod tests {
