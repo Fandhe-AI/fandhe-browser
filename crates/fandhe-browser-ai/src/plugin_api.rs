@@ -15,8 +15,8 @@
 //!
 //! # スタブ・暫定仕様について（REPAIR-3）
 //!
-//! - ルート・HTTP ステータス写像は未実装（TASK-92.3〜92.4）。[`AiState`] はまだ
-//!   [`crate::api::router`] から使われていない
+//! - 登録ルート `POST /ai/plugins/register` と HTTP ステータス写像は [`crate::api`] に実装済み
+//!   （TASK-92.3・Issue #355）。一覧 `GET /ai/plugins` は未実装（TASK-92.4・Issue #356）
 //! - レジストリはインメモリでプロセス寿命のみ保持し、永続化しない。削除・上書き API は持たない
 //! - `permissions` は申告値の保持のみで、権限の付与・強制は行わない
 //! - `tcp` / `unix-socket` は列挙値として受理するだけで、接続処理は持たない
@@ -379,7 +379,7 @@ pub const MAX_PLUGINS: usize = 32;
 
 /// レジストリ登録の拒否理由（`PLUG-2`・TASK-92.2・Issue #354）。
 ///
-/// HTTP ステータスへの写像（PoC-15 は重複 409・満杯 429）は TASK-92.3 の責務で、ここでは持たない。
+/// HTTP ステータスへの写像（重複 409・満杯 429）は `api` の登録ハンドラ（TASK-92.3）が持ち、ここでは持たない。
 /// 文言は固定英語で、untrusted な id を含めない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -479,8 +479,8 @@ impl fmt::Debug for PluginRegistry {
 
 /// ai crate 固有の状態（core の共通状態 `Arc<AppState>` とプラグインレジストリ。`PLUG-2`・TASK-92.2・Issue #354）。
 ///
-/// TASK-92.3 / 92.4 のハンドラが `api::router` 内で構築した `Arc<AiState>` を使う予定で、現時点では
-/// ルータから未使用。1 つの `AiState` は 1 つの `AppState`（= 1 プロファイル）に対応し、グローバル
+/// `api::router` が構築した `Arc<AiState>` を登録ハンドラ（TASK-92.3）が使う。一覧ハンドラ（TASK-92.4）は
+/// 未実装。1 つの `AiState` は 1 つの `AppState`（= 1 プロファイル）に対応し、グローバル
 /// 共有を持たないためプロファイル間でレジストリは共有されない（`PROF-1`）。`Clone` は実装せず
 /// `Arc` で共有する。
 pub struct AiState {

@@ -1,7 +1,8 @@
-//! `/ai/*` HTTP API の入口（`AISNAP-6`・TASK-19.1・Issue #223・`MS-4`）。
+//! `/ai/*` HTTP API の入口（`AISNAP-6`・TASK-19.1・Issue #223・`MS-4`、`PLUG-2`・TASK-92.3・Issue #355・`MS-9`）。
 //!
 //! core の [`AppState`] が保持する直近ナビゲート結果から [`Snapshot`]
-//! （`AISNAP-1` 方式 B）を構築し、JSON で返す `GET /ai/snapshot` ルータを提供する。
+//! （`AISNAP-1` 方式 B）を構築し、JSON で返す `GET /ai/snapshot` と、プラグインマニフェストを
+//! 検証してレジストリへ登録する `POST /ai/plugins/register` のルータを提供する。
 //! [`router`] は bind・アクセス制御（loopback 限定。`SEC-4`）を行わないが、DNS rebinding 対策として
 //! `Host` ヘッダ（localhost / IP リテラルのみ許可）を cdp と共通の core 実装で検証する。cli が
 //! `RouterFactory` として受け取り、cdp のルータと `Router::merge` で合成する
@@ -17,8 +18,16 @@
 //!   spec の例示形に合わせた暫定確定。エラー本文は全 variant で `code` と `message` の 2 キー
 //! - 共有状態を跨ぐ結合テストは cli の `server.rs` テスト（TASK-19.4・Issue #226。ai ⇔ cdp 依存は
 //!   禁止のため両者を合成できる cli に置く）で実施済み
-//! - プラグインレジストリを持つ ai 固有の状態型 `AiState` は定義済み（TASK-92.2・Issue #354）。
-//!   ルータへの配線（`Arc<AppState>` からの差し替え）は TASK-92.3
+//! - ルータは ai 固有の状態 [`AiState`]（`AppState` とプラグインレジストリ）を [`router_with_state`] で
+//!   受け取る（TASK-92.2・Issue #354 の状態型を TASK-92.3 で配線）。[`router`] は内部で構築する
+//! - `POST /ai/plugins/register` の応答形は暫定: 成功 `{"ok":true,"id":...}`（200）、失敗 `{"code","message"}`
+//!   （マニフェスト不正 400・id 重複 409・満杯 429・Content-Type 不正 415・Origin 付き 403）。
+//!   入力値（id・キー名・ヘッダ値）は応答に含めない。正式スキーマは TASK-92.5（Issue #357）
+//! - 状態を変更する POST のため、cross-site からの登録を防ぐ目的で `Origin` ヘッダ付き要求を一律拒否し、
+//!   `Content-Type: application/json` を必須とする（CORS 許可ヘッダは付けない）。許可リストは将来の設定項目
+//! - 登録は申告値の保持のみで、プラグインプロセスの起動・接続・権限付与は行わない。
+//!   成功は「接続済み」「権限付与済み」を意味しない
+//! - 一覧取得 `GET /ai/plugins` は未実装（TASK-92.4・Issue #356）
 //!
 //! # 資源上限
 //!
@@ -36,6 +45,7 @@ use fandhe_browser_core::parse::{ParseOptions, parse_document};
 use fandhe_browser_core::{AppState, NavigationState};
 use serde_json::{Map, Value, json};
 
+use crate::plugin_api::{AiState, ManifestError, PluginManifest, PluginRegistry, RegistryError};
 use crate::snapshot::{CheckedState, DataLeafKind, Node, Snapshot, TableSummary, build_snapshot};
 
 const JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
@@ -68,19 +78,145 @@ impl fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
-/// `GET /ai/snapshot` を登録したルータを返す。cli が合成する（TASK-19.3）。
+/// `/ai/*` ルータを返す。cli が合成する（TASK-19.3）。内部で空のプラグインレジストリを持つ
+/// [`AiState`] を構築し [`router_with_state`] へ委譲する（シグネチャは cli の `RouterFactory` 互換）。
 pub fn router(app: Arc<AppState>) -> Router {
-    Router::new().route("GET", "/ai/snapshot", move |head, _body| {
-        // DNS rebinding 対策: cdp の `/json/*` と同じ Host 検証（core の `host` モジュール）を
-        // 応答前に行い、不正な Host には snapshot（直近ページの URL・内容）を渡さない。
-        if let Err(e) = Authority::from_host_header(head.header("host")) {
-            return host_error_response(e);
+    router_with_state(Arc::new(AiState::new(app)))
+}
+
+/// 呼び出し側が保持する [`AiState`] を共有してルータを組み立てる。テスト（レジストリ内容の直接検証）と
+/// 後続ルート（`GET /ai/plugins`・TASK-92.4）が同じ状態を使うための入口。
+pub fn router_with_state(state: Arc<AiState>) -> Router {
+    let snapshot_state = Arc::clone(&state);
+    let register_state = state;
+    Router::new()
+        .route("GET", "/ai/snapshot", move |head, _body| {
+            // DNS rebinding 対策: cdp の `/json/*` と同じ Host 検証（core の `host` モジュール）を
+            // 応答前に行い、不正な Host には snapshot（直近ページの URL・内容）を渡さない。
+            if let Err(e) = Authority::from_host_header(head.header("host")) {
+                return host_error_response(e);
+            }
+            match snapshot_body(snapshot_state.app().navigation()) {
+                Ok(body) => Response::new(200, body).with_content_type(JSON_CONTENT_TYPE),
+                Err(e) => error_response(e),
+            }
+        })
+        .route("POST", "/ai/plugins/register", move |head, body| {
+            // 検査順: Host -> Origin -> Content-Type -> 本文検証 -> 登録。前段で拒否した要求は
+            // 本文をパースしない。
+            if let Err(e) = Authority::from_host_header(head.header("host")) {
+                return host_error_response(e);
+            }
+            if head.header("origin").is_some() {
+                return fixed_error_response(403, "origin_not_allowed", "origin is not allowed");
+            }
+            if !is_json_content_type(head.header("content-type")) {
+                return fixed_error_response(
+                    415,
+                    "unsupported_media_type",
+                    "content type must be application/json",
+                );
+            }
+            match register_plugin(register_state.plugins(), body) {
+                Ok(result) => {
+                    let body = json!({ "ok": true, "id": result.id() })
+                        .to_string()
+                        .into_bytes();
+                    Response::new(200, body).with_content_type(JSON_CONTENT_TYPE)
+                }
+                Err(e) => register_error_response(e),
+            }
+        })
+}
+
+/// プラグイン登録の失敗（`PLUG-2`・TASK-92.3・Issue #355）。マニフェスト検証とレジストリ登録の
+/// 失敗を包み、[`register_error_response`] が HTTP ステータスへ写像する。`Display` は内包エラーの
+/// 固定英語文言で、untrusted な入力値を含めない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RegisterError {
+    /// マニフェストがスキーマ制約に違反した。
+    Manifest(ManifestError),
+    /// レジストリが拒否した（重複・満杯）。
+    Registry(RegistryError),
+}
+
+impl fmt::Display for RegisterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Manifest(e) => e.fmt(f),
+            Self::Registry(e) => e.fmt(f),
         }
-        match snapshot_body(app.navigation()) {
-            Ok(body) => Response::new(200, body).with_content_type(JSON_CONTENT_TYPE),
-            Err(e) => error_response(e),
+    }
+}
+
+impl std::error::Error for RegisterError {}
+
+impl From<ManifestError> for RegisterError {
+    fn from(e: ManifestError) -> Self {
+        Self::Manifest(e)
+    }
+}
+
+impl From<RegistryError> for RegisterError {
+    fn from(e: RegistryError) -> Self {
+        Self::Registry(e)
+    }
+}
+
+/// プラグイン登録の成功結果（`PLUG-2`・TASK-92.3・Issue #355・REPAIR-4）。
+/// 将来のフィールド追加に備え構造体で返す（`#[non_exhaustive]`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RegisterResult {
+    id: String,
+}
+
+impl RegisterResult {
+    /// 登録したプラグインの id。
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// 本文をマニフェストとして検証しレジストリへ登録する純粋部。成功時は登録結果（id）を返す。
+/// `Profile` に依存せず 3 OS でテストできる。登録は申告値の保持のみ（接続・権限付与はしない）。
+pub fn register_plugin(
+    registry: &PluginRegistry,
+    body: &[u8],
+) -> Result<RegisterResult, RegisterError> {
+    let manifest = PluginManifest::from_slice(body)?;
+    let id = manifest.id().to_owned();
+    registry.register(manifest)?;
+    Ok(RegisterResult { id })
+}
+
+/// 登録失敗を HTTP 応答へ写像する。マニフェスト不正は 400（`TooLarge` も PoC-15 契約に合わせ 400）、
+/// id 重複 409、満杯 429。本文は `{"code","message"}` で入力値を含めない。
+fn register_error_response(e: RegisterError) -> Response {
+    let (status, code) = match e {
+        RegisterError::Manifest(m) => (400, m.code()),
+        RegisterError::Registry(RegistryError::DuplicateId) => {
+            (409, RegistryError::DuplicateId.code())
         }
-    })
+        RegisterError::Registry(RegistryError::Full) => (429, RegistryError::Full.code()),
+    };
+    fixed_error_response(status, code, &e.to_string())
+}
+
+/// `{"code","message"}` の固定内容エラー応答。
+fn fixed_error_response(status: u16, code: &str, message: &str) -> Response {
+    let body = json!({ "code": code, "message": message })
+        .to_string()
+        .into_bytes();
+    Response::new(status, body).with_content_type(JSON_CONTENT_TYPE)
+}
+
+/// `Content-Type` が `application/json`（パラメータ・大文字小文字は不問）か。ヘッダ欠落は偽。
+fn is_json_content_type(value: Option<&str>) -> bool {
+    value
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|m| m.trim().eq_ignore_ascii_case("application/json"))
 }
 
 /// Host 検証エラーを 400（形式不正）/ 403（許可外ホスト）へ写像する。本体は固定コードのみで
@@ -402,5 +538,110 @@ mod tests {
             assert_eq!(v["code"], code);
             assert_eq!(v["message"], message);
         }
+    }
+
+    // --- PLUG-2・TASK-92.3 ---
+
+    const VALID: &str = r#"{"id":"mcp-ref","version":"0.1.0","transport":"stdio","tools":["t"]}"#;
+
+    #[test]
+    fn plug2_register_plugin_accepts_valid_manifest() {
+        let reg = PluginRegistry::new();
+        let result = register_plugin(&reg, VALID.as_bytes()).expect("register");
+        assert_eq!(result.id(), "mcp-ref");
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.list()[0].id(), "mcp-ref");
+    }
+
+    #[test]
+    fn plug2_register_plugin_rejects_invalid_manifests() {
+        let reg = PluginRegistry::new();
+        let big = vec![b' '; crate::plugin_api::MAX_MANIFEST_BYTES + 1];
+        for (body, err) in [
+            (&b"{"[..], ManifestError::InvalidJson),
+            (
+                &br#"{"id":"a","version":"1","transport":"stdio","tools":["t"],"x":1}"#[..],
+                ManifestError::UnknownField,
+            ),
+            (&big[..], ManifestError::TooLarge),
+        ] {
+            assert_eq!(
+                register_plugin(&reg, body),
+                Err(RegisterError::Manifest(err))
+            );
+        }
+        assert!(matches!(
+            register_plugin(&reg, br#"{"id":"a"}"#),
+            Err(RegisterError::Manifest(ManifestError::MissingField(_)))
+        ));
+        assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn plug2_register_plugin_rejects_duplicate_and_full() {
+        let reg = PluginRegistry::new();
+        register_plugin(&reg, VALID.as_bytes()).expect("first");
+        assert_eq!(
+            register_plugin(&reg, VALID.as_bytes()),
+            Err(RegisterError::Registry(RegistryError::DuplicateId))
+        );
+        for i in 1..crate::plugin_api::MAX_PLUGINS {
+            let b =
+                format!(r#"{{"id":"p{i}","version":"0.1.0","transport":"stdio","tools":["t"]}}"#);
+            register_plugin(&reg, b.as_bytes()).expect("fill");
+        }
+        let over = br#"{"id":"over","version":"0.1.0","transport":"stdio","tools":["t"]}"#;
+        assert_eq!(
+            register_plugin(&reg, over),
+            Err(RegisterError::Registry(RegistryError::Full))
+        );
+    }
+
+    #[test]
+    fn plug2_register_error_response_maps_status_and_code() {
+        for (e, status, code, message) in [
+            (
+                RegisterError::Manifest(ManifestError::UnknownField),
+                400,
+                "unknown_field",
+                "manifest has an unknown field",
+            ),
+            (
+                RegisterError::Manifest(ManifestError::TooLarge),
+                400,
+                "manifest_too_large",
+                "manifest is too large",
+            ),
+            (
+                RegisterError::Registry(RegistryError::DuplicateId),
+                409,
+                "duplicate_plugin_id",
+                "plugin id is already registered",
+            ),
+            (
+                RegisterError::Registry(RegistryError::Full),
+                429,
+                "plugin_registry_full",
+                "plugin registry is full",
+            ),
+        ] {
+            let res = register_error_response(e);
+            assert_eq!(res.status, status);
+            let v: Value = serde_json::from_slice(&res.body).expect("json");
+            assert_eq!(v["code"], code);
+            assert_eq!(v["message"], message);
+            assert_eq!(v.as_object().expect("object").len(), 2);
+        }
+    }
+
+    #[test]
+    fn plug2_is_json_content_type() {
+        assert!(is_json_content_type(Some("application/json")));
+        assert!(is_json_content_type(Some(
+            "Application/JSON; charset=utf-8"
+        )));
+        assert!(!is_json_content_type(Some("text/plain")));
+        assert!(!is_json_content_type(Some("")));
+        assert!(!is_json_content_type(None));
     }
 }
