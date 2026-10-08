@@ -516,10 +516,8 @@ check-compat-practical: ## 実測ハーネス（22 タスク定義・アクセ�
 # 同じ方針で fail-closed（silent skip にしない）。self-test を先に実行し、
 # fixture（合成データ）に対して「閾値未満で fail する」ことをログに残してから
 # 実マトリクスを判定する。実マトリクス harness/compat-practical/results/matrix.json
-# は未コミットのため、当面 --allow-missing を渡す。保留の理由は実測 15/22
-# （68.2%）が閾値 70% 未満のため、オーナー判断（2026-10-08）で有効化を保留して
-# いること（失敗の内訳は #758・#760）。#759（TASK-71.5）で実マトリクスを
-# コミットするときこのフラグを削除し fail-closed に戻す。
+# は TASK-71.3（#312）が生成予定でまだ無いため、当面 --allow-missing を渡す
+# （#312 で導入され次第このフラグを削除し fail-closed に戻す）。
 .PHONY: check-compat-regression
 check-compat-regression: ## 対象サイト群の動作率マトリクスに対する回帰チェック（COMPAT-1・COMPAT-4）
 	@command -v jq >/dev/null 2>&1 || { \

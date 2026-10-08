@@ -106,11 +106,10 @@ fi
 
 if [ ! -f "$MATRIX" ]; then
   if [ "$ALLOW_MISSING" -eq 1 ]; then
-    # 実マトリクス（harness/compat-practical/results/matrix.json）は実測が閾値未満の
-    # ため、オーナー判断（2026-10-08）でコミットを保留している。#759（TASK-71.5）で
-    # マトリクスをコミットするときこのフラグを ci.yml・Makefile から削除し、
-    # fail-closed（無フラグ時と同じ exit 2）へ戻す。
-    echo "::warning::compat matrix not found at $MATRIX; regression gate inactive until TASK-71.5 (#759) lands"
+    # 実マトリクス（harness/compat-practical/results/matrix.json）は TASK-71.3（#312）
+    # が生成予定でまだ存在しない。#312 がマトリクスをコミットしたらこのフラグを
+    # ci.yml・Makefile から削除し、fail-closed（無フラグ時と同じ exit 2）へ戻す。
+    echo "::warning::compat matrix not found at $MATRIX; regression gate inactive until TASK-71.3 (#312) lands"
     exit 0
   fi
   echo "error: matrix file not found at $MATRIX" >&2

@@ -7,17 +7,15 @@
 フォーム等の類型別動作率 70% 以上）。ID から SSOT（`docs/spec` の `04-behavior/`）を
 参照すること（[spec-reference](../../.claude/rules/spec-reference.md)）。
 
-## 実マトリクスは未コミット（重要）
+## 実マトリクスは未導入（重要）
 
-実マトリクス `harness/compat-practical/results/matrix.json` は未コミットである。
-生成スクリプト `harness/compat-practical/make_matrix.sh` は TASK-71.3・Issue #312 で
-導入済みだが、実測 15/22（68.2%）が閾値 70% 未満のため、オーナー判断（2026-10-08）で
-マトリクスのコミット（ゲートの有効化）を保留している（失敗の内訳は #758・#760。
-36 サイト版の更新は TASK-89・Issue #68・人間担当）。そのため `.github/workflows/ci.yml`・`Makefile` では
+本 Issue の時点で実マトリクス `harness/compat-practical/results/matrix.json` は
+存在しない（生成は TASK-71.3・Issue #312 が担当。36 サイト版の更新は TASK-89・
+Issue #68・人間担当）。そのため `.github/workflows/ci.yml`・`Makefile` では
 `check-matrix.sh` を `--allow-missing` 付きで呼び出しており、ファイルが無い間は
 `::warning::` を出して exit 0（回帰ゲートは実質的に無効）になる。
 
-**`--allow-missing` の削除条件**: #759（TASK-71.5）で実マトリクス `matrix.json` をコミットするとき、
+**`--allow-missing` の削除条件**: #312（TASK-71.3）が `matrix.json` をコミットしたら、
 `ci.yml`・`Makefile` から `--allow-missing` を削除し、ファイル不在を fail-closed
 （exit 2）に戻すこと。
 
@@ -55,7 +53,7 @@ harness/compat-regression/check-matrix.sh \
 - `--key`: 判定に使う boolean フィールド名（既定 `fandhe_browser_core`）
 - `--categories`: 個別にも 70% 以上を要求する `cat` 値の CSV（例: `static,spa,form`）。各値は `cat` と同じ `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` に一致すること（不一致は使用エラー exit 2）。列挙した類型のエントリが 0 件なら使用エラー（exit 2）。列挙した類型が「必ずマトリクスに存在すること」を保証する用途
 - `--all-categories`: `--categories` の CSV に加え、マトリクス内に実在する **全ての** `cat` 値を判定対象にする。`--categories` の固定 CSV だけでは呼び出し側が列挙し忘れた類型（例: `lazy`・`table`）が閾値未満でも検出されずに通過し得る（COMPAT-1 が要求する類型別回帰検出の抜け）。CI・`make check-compat-regression` はこのフラグを付けて呼び出す
-- `--allow-missing`: `--matrix` のファイルが存在しない場合に `::warning::` を出して exit 0 にする（実マトリクス未導入期間の暫定運用。上記「実マトリクスは未コミット」参照）
+- `--allow-missing`: `--matrix` のファイルが存在しない場合に `::warning::` を出して exit 0 にする（実マトリクス未導入期間の暫定運用。上記「実マトリクスは未導入」参照）
 
 ## 終了コード
 
