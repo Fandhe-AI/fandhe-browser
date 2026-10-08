@@ -118,8 +118,10 @@ pub fn router_with_state(state: Arc<AiState>) -> Router {
                 );
             }
             match register_plugin(register_state.plugins(), body) {
-                Ok(id) => {
-                    let body = json!({ "ok": true, "id": id }).to_string().into_bytes();
+                Ok(result) => {
+                    let body = json!({ "ok": true, "id": result.id() })
+                        .to_string()
+                        .into_bytes();
                     Response::new(200, body).with_content_type(JSON_CONTENT_TYPE)
                 }
                 Err(e) => register_error_response(e),
@@ -162,13 +164,31 @@ impl From<RegistryError> for RegisterError {
     }
 }
 
-/// 本文をマニフェストとして検証しレジストリへ登録する純粋部。成功時は登録した id を返す。
+/// プラグイン登録の成功結果（`PLUG-2`・TASK-92.3・Issue #355・REPAIR-4）。
+/// 将来のフィールド追加に備え構造体で返す（`#[non_exhaustive]`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RegisterResult {
+    id: String,
+}
+
+impl RegisterResult {
+    /// 登録したプラグインの id。
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// 本文をマニフェストとして検証しレジストリへ登録する純粋部。成功時は登録結果（id）を返す。
 /// `Profile` に依存せず 3 OS でテストできる。登録は申告値の保持のみ（接続・権限付与はしない）。
-pub fn register_plugin(registry: &PluginRegistry, body: &[u8]) -> Result<String, RegisterError> {
+pub fn register_plugin(
+    registry: &PluginRegistry,
+    body: &[u8],
+) -> Result<RegisterResult, RegisterError> {
     let manifest = PluginManifest::from_slice(body)?;
     let id = manifest.id().to_owned();
     registry.register(manifest)?;
-    Ok(id)
+    Ok(RegisterResult { id })
 }
 
 /// 登録失敗を HTTP 応答へ写像する。マニフェスト不正は 400（`TooLarge` も PoC-15 契約に合わせ 400）、
@@ -527,10 +547,8 @@ mod tests {
     #[test]
     fn plug2_register_plugin_accepts_valid_manifest() {
         let reg = PluginRegistry::new();
-        assert_eq!(
-            register_plugin(&reg, VALID.as_bytes()),
-            Ok("mcp-ref".to_string())
-        );
+        let result = register_plugin(&reg, VALID.as_bytes()).expect("register");
+        assert_eq!(result.id(), "mcp-ref");
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.list()[0].id(), "mcp-ref");
     }
