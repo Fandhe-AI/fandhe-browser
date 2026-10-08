@@ -23,6 +23,7 @@
 //!   `PLUG-2`）と登録 `POST /ai/plugins/register`（TASK-92.3・Issue #355）を提供する
 //! - `GET /ai/plugins` の応答は `{"plugins":[<manifest>...]}`（登録順。未登録は空配列）の暫定形で、
 //!   PoC-15 の `host-api.schema.json` 準拠。正式スキーマの文書化は TASK-92.5（Issue #357）。
+//!   各マニフェストは `runtime`・`language` の申告値も含む（`PLUG-6`・TASK-98.1・Issue #389。未申告は `unspecified`）。
 //!   一覧はプラグインの申告値をそのまま返すだけで「接続済み」「権限付与済み」を意味しない。
 //!   ページング・絞り込みは持たない（上限 `MAX_PLUGINS` 件）
 //! - `POST /ai/plugins/register` の応答形は暫定: 成功 `{"ok":true,"id":...}`（200）、失敗 `{"code","message"}`
@@ -609,9 +610,9 @@ mod tests {
             v,
             json!({"plugins": [
                 {"id": "b", "version": "2.0.0", "transport": "tcp", "tools": ["x", "y"],
-                 "permissions": ["network.fetch"], "protocolVersion": "1"},
+                 "permissions": ["network.fetch"], "protocolVersion": "1", "runtime": "unspecified", "language": "unspecified"},
                 {"id": "a", "version": "1.0.0", "transport": "stdio", "tools": ["t"],
-                 "permissions": [], "protocolVersion": "unspecified"},
+                 "permissions": [], "protocolVersion": "unspecified", "runtime": "unspecified", "language": "unspecified"},
             ]})
         );
     }

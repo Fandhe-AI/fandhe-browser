@@ -21,7 +21,7 @@ fn plug2_reference_plugin_manifest_round_trips_from_bytes() {
         m.to_value(),
         json!({"id":"mcp-ref","version":"0.1.0","transport":"stdio",
                "tools":["fetch","snapshot"],"permissions":["network.fetch"],
-               "protocolVersion":"unspecified"})
+               "protocolVersion":"unspecified","runtime":"unspecified","language":"unspecified"})
     );
 }
 
@@ -48,11 +48,40 @@ fn plug2_register_then_list_round_trips_without_http() {
         listed,
         json!({"plugins": [
             {"id": "mcp-ref", "version": "0.1.0", "transport": "stdio", "tools": ["a", "b"],
-             "permissions": ["network.fetch"], "protocolVersion": "1"},
+             "permissions": ["network.fetch"], "protocolVersion": "1", "runtime": "unspecified", "language": "unspecified"},
             {"id": "second", "version": "2.0.0", "transport": "tcp", "tools": ["t"],
-             "permissions": [], "protocolVersion": "unspecified"},
+             "permissions": [], "protocolVersion": "unspecified", "runtime": "unspecified", "language": "unspecified"},
         ]})
     );
+}
+
+/// `runtime`・`language` が登録 → 一覧で受け渡される（`PLUG-6`・TASK-98.1・Issue #389。純粋部で 3 OS 実行）。
+#[test]
+fn plug6_runtime_and_language_pass_through_register_and_list() {
+    let registry = PluginRegistry::new();
+    let declared = br#"{"id":"js-plugin","version":"1.0.0","transport":"stdio","tools":["t"],
+        "runtime":"node","language":"javascript"}"#;
+    let omitted = br#"{"id":"plain","version":"1.0.0","transport":"stdio","tools":["t"]}"#;
+    register_plugin(&registry, declared).unwrap();
+    register_plugin(&registry, omitted).unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&plugins_body(&registry)).unwrap();
+    assert_eq!(listed["plugins"][0]["runtime"], "node");
+    assert_eq!(listed["plugins"][0]["language"], "javascript");
+    assert_eq!(listed["plugins"][1]["runtime"], "unspecified");
+    assert_eq!(listed["plugins"][1]["language"], "unspecified");
+}
+
+/// 不正な `language` は登録されず、エラーは固定コードで入力値を含まない（`PLUG-6`）。
+#[test]
+fn plug6_register_rejects_invalid_language() {
+    let registry = PluginRegistry::new();
+    let body = br#"{"id":"bad","version":"1.0.0","transport":"stdio","tools":["t"],
+        "language":"Rust"}"#;
+    let e = register_plugin(&registry, body).unwrap_err();
+    let text = e.to_string();
+    assert_eq!(text, "manifest language is invalid");
+    assert!(!text.contains("Rust"));
+    assert_eq!(plugins_body(&registry), b"{\"plugins\":[]}");
 }
 
 /// `AppState` の構築に `Profile::open` が必要で、非 unix では `Unsupported` を返す仕様のため
@@ -243,9 +272,9 @@ mod http_flow {
     fn expected_two() -> Value {
         json!({"plugins": [
             {"id": "mcp-ref", "version": "0.1.0", "transport": "stdio", "tools": ["a", "b"],
-             "permissions": ["network.fetch"], "protocolVersion": "1"},
+             "permissions": ["network.fetch"], "protocolVersion": "1", "runtime": "unspecified", "language": "unspecified"},
             {"id": "second", "version": "2.0.0", "transport": "tcp", "tools": ["t"],
-             "permissions": [], "protocolVersion": "unspecified"},
+             "permissions": [], "protocolVersion": "unspecified", "runtime": "unspecified", "language": "unspecified"},
         ]})
     }
 
@@ -277,7 +306,7 @@ mod http_flow {
             json_of(&res),
             json!({"plugins": [
                 {"id": "second", "version": "2.0.0", "transport": "tcp", "tools": ["t"],
-                 "permissions": [], "protocolVersion": "unspecified"},
+                 "permissions": [], "protocolVersion": "unspecified", "runtime": "unspecified", "language": "unspecified"},
             ]})
         );
     }
@@ -337,7 +366,7 @@ mod http_flow {
             json_of(&after),
             json!({"plugins": [
                 {"id": "keep", "version": "1.0.0", "transport": "stdio", "tools": ["t"],
-                 "permissions": [], "protocolVersion": "unspecified"},
+                 "permissions": [], "protocolVersion": "unspecified", "runtime": "unspecified", "language": "unspecified"},
             ]})
         );
     }

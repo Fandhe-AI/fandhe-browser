@@ -103,9 +103,9 @@ async fn plug2_get_plugins_returns_registered_manifests() {
         json_of(&res),
         json!({"plugins": [
             {"id": "mcp-ref", "version": "0.1.0", "transport": "stdio", "tools": ["a", "b"],
-             "permissions": ["network.fetch"], "protocolVersion": "1"},
+             "permissions": ["network.fetch"], "protocolVersion": "1", "runtime": "unspecified", "language": "unspecified"},
             {"id": "second", "version": "2.0.0", "transport": "tcp", "tools": ["t"],
-             "permissions": [], "protocolVersion": "unspecified"},
+             "permissions": [], "protocolVersion": "unspecified", "runtime": "unspecified", "language": "unspecified"},
         ]})
     );
 }

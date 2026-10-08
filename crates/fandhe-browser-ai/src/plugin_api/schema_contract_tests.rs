@@ -1,5 +1,5 @@
 //! `docs/design/host-api.schema.json` と [`super`]（マニフェスト型）の契約テスト
-//! （`PLUG-2`・TASK-92.5・Issue #357）。
+//! （`PLUG-2`・TASK-92.5・Issue #357。`runtime` / `language` は `PLUG-6`・TASK-98.1・Issue #389）。
 //!
 //! スキーマの制約値を Rust 側の定数・列挙型から導いた期待値と突き合わせ、どちらかだけ
 //! 変更されて乖離したら落ちるようにする。crate 内に置くのは、`#[non_exhaustive]` な列挙型への
@@ -12,9 +12,10 @@ use std::collections::BTreeSet;
 use serde_json::Value;
 
 use super::{
-    DEFAULT_PROTOCOL_VERSION, MAX_ID_CHARS, MAX_PERMISSIONS, MAX_PLUGINS, MAX_STRING_CHARS,
-    MAX_TOOLS, ManifestError, ManifestField, PluginPermission, PluginTransport, RegistryError,
-    is_valid_id, is_valid_version,
+    DEFAULT_LANGUAGE, DEFAULT_PROTOCOL_VERSION, DEFAULT_RUNTIME, MAX_ID_CHARS, MAX_LANGUAGE_CHARS,
+    MAX_PERMISSIONS, MAX_PLUGINS, MAX_RUNTIME_CHARS, MAX_STRING_CHARS, MAX_TOOLS, ManifestError,
+    ManifestField, PluginPermission, PluginTransport, RegistryError, is_valid_id,
+    is_valid_runtime_token, is_valid_version,
 };
 
 const SCHEMA_TEXT: &str = include_str!("../../../../docs/design/host-api.schema.json");
@@ -49,6 +50,8 @@ fn all_fields() -> Vec<ManifestField> {
         ManifestField::Tools,
         ManifestField::Permissions,
         ManifestField::ProtocolVersion,
+        ManifestField::Runtime,
+        ManifestField::Language,
     ] {
         match f {
             ManifestField::Id
@@ -56,7 +59,9 @@ fn all_fields() -> Vec<ManifestField> {
             | ManifestField::Transport
             | ManifestField::Tools
             | ManifestField::Permissions
-            | ManifestField::ProtocolVersion => v.push(f),
+            | ManifestField::ProtocolVersion
+            | ManifestField::Runtime
+            | ManifestField::Language => v.push(f),
         }
     }
     v
@@ -114,6 +119,8 @@ fn all_manifest_codes() -> Vec<&'static str> {
         ManifestError::TooManyItems(ManifestField::Tools),
         ManifestError::EmptyTools,
         ManifestError::EmptyToolName,
+        ManifestError::InvalidRuntime,
+        ManifestError::InvalidLanguage,
     ]
     .iter()
     .map(|e| {
@@ -132,7 +139,9 @@ fn all_manifest_codes() -> Vec<&'static str> {
             | ManifestError::TooLong(_)
             | ManifestError::TooManyItems(_)
             | ManifestError::EmptyTools
-            | ManifestError::EmptyToolName => {}
+            | ManifestError::EmptyToolName
+            | ManifestError::InvalidRuntime
+            | ManifestError::InvalidLanguage => {}
         }
         e.code()
     })
@@ -178,6 +187,10 @@ fn plug2_manifest_limits_match_rust_constants() {
     assert_eq!(p["permissions"]["maxItems"], MAX_PERMISSIONS);
     assert_eq!(p["protocolVersion"]["default"], DEFAULT_PROTOCOL_VERSION);
     assert_eq!(p["permissions"]["default"], serde_json::json!([]));
+    assert_eq!(p["runtime"]["maxLength"], MAX_RUNTIME_CHARS);
+    assert_eq!(p["language"]["maxLength"], MAX_LANGUAGE_CHARS);
+    assert_eq!(p["runtime"]["default"], DEFAULT_RUNTIME);
+    assert_eq!(p["language"]["default"], DEFAULT_LANGUAGE);
 }
 
 #[test]
@@ -188,6 +201,9 @@ fn plug2_manifest_patterns_match_rust_regex_docs() {
         p["version"]["pattern"],
         r"^\d+\.\d+\.\d+[^\n\r\u2028\u2029]*(?![\s\S])"
     );
+    for key in ["runtime", "language"] {
+        assert_eq!(p[key]["pattern"], r"^[a-z0-9][a-z0-9.+#_-]*(?![\s\S])");
+    }
 }
 
 /// 末尾改行を含む具体値を Rust の検証関数が拒否し、スキーマ側も末尾アンカーが厳密であること
@@ -213,7 +229,13 @@ fn plug2_trailing_newline_values_are_rejected_like_schema() {
         assert!(is_valid_version(v), "version {v:?} must be accepted");
     }
     let p = manifest_props();
-    for key in ["id", "version"] {
+    for t in ["rust\n", "rust\r", "\nrust", "node\n20", "Rust", ""] {
+        assert!(!is_valid_runtime_token(t), "token {t:?} must be rejected");
+    }
+    for t in ["rust", "c++", "c#", "python3.12", "node-20"] {
+        assert!(is_valid_runtime_token(t), "token {t:?} must be accepted");
+    }
+    for key in ["id", "version", "runtime", "language"] {
         let pat = p[key]["pattern"].as_str().expect("pattern string");
         assert!(
             pat.ends_with(r"(?![\s\S])"),
@@ -246,7 +268,7 @@ fn plug2_permissions_allow_duplicates() {
 }
 
 #[test]
-fn plug2_registered_manifest_requires_all_six_keys() {
+fn plug2_registered_manifest_requires_all_keys() {
     let r = def("RegisteredPluginManifest");
     let all = r["allOf"].as_array().expect("allOf array");
     assert_eq!(all[0]["$ref"], "#/$defs/PluginManifest");

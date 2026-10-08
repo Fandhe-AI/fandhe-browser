@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Fandhe-AI/fandhe-browser/blob/main/docs/design/host-api.schema.json",
   "title": "fandhe-browser Host API (plugin boundary)",
-  "description": "ホスト API のプラグイン関連契約（PLUG-2・TASK-92・MS-9）。POST /ai/plugins/register・マニフェスト形式（実装済み）と GET /ai/plugins（実装済み。TASK-92.4・Issue #356・PLUG-2）を定義する。土台は PoC-15 版のスキーマだが、正本は Rust 側の crates/fandhe-browser-ai/src/plugin_api.rs と crates/fandhe-browser-ai/src/api.rs で、実装済みの部分は本ファイルがそれに合わせている（乖離は plugin_api の schema_contract_tests が検知する）。GET /ai/plugins と関連 $defs も api.rs の router_with_state が実装済みで、応答は {\"plugins\":[...]}（登録順・未登録は空配列）。paths は OpenAPI ではなく、このファイル独自の簡易記法。",
+  "description": "ホスト API のプラグイン関連契約（PLUG-2・TASK-92・MS-9）。POST /ai/plugins/register・マニフェスト形式（実装済み）と GET /ai/plugins（実装済み。TASK-92.4・Issue #356・PLUG-2）を定義する。土台は PoC-15 版のスキーマだが、正本は Rust 側の crates/fandhe-browser-ai/src/plugin_api.rs と crates/fandhe-browser-ai/src/api.rs で、実装済みの部分は本ファイルがそれに合わせている（乖離は plugin_api の schema_contract_tests が検知する）。GET /ai/plugins と関連 $defs も api.rs の router_with_state が実装済みで、応答は {\"plugins\":[...]}（登録順・未登録は空配列）。マニフェストに runtime・language を追加（PLUG-6・TASK-98.1。目標適用の判定は TASK-98.2 で未実装）。paths は OpenAPI ではなく、このファイル独自の簡易記法。",
   "$defs": {
     "PluginManifest": {
       "description": "プラグインが自己申告するマニフェスト（登録リクエスト本文）。未知キーは拒否する（fail-closed）。",
@@ -53,15 +53,29 @@
           "type": "string",
           "maxLength": 128,
           "default": "unspecified"
+        },
+        "runtime": {
+          "description": "実行ランタイムの自己申告（PLUG-6・TASK-98.1）。省略時は unspecified。申告値の保持のみで、未申告は公式サポート扱いにしない（適用判定は TASK-98.2 で未実装）。",
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9.+#_-]*(?![\\s\\S])",
+          "maxLength": 64,
+          "default": "unspecified"
+        },
+        "language": {
+          "description": "実装言語の自己申告（PLUG-6・TASK-98.1）。省略時は unspecified。申告値の保持のみで、未申告は公式サポート扱いにしない（適用判定は TASK-98.2 で未実装）。",
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9.+#_-]*(?![\\s\\S])",
+          "maxLength": 64,
+          "default": "unspecified"
         }
       }
     },
     "RegisteredPluginManifest": {
-      "description": "【実装済み。TASK-92.4・Issue #356・PLUG-2】GET /ai/plugins が返す登録済みマニフェスト。省略可能キーも既定値を含めて 6 キー全てを出力する。",
+      "description": "【実装済み。TASK-92.4・Issue #356・PLUG-2】GET /ai/plugins が返す登録済みマニフェスト。省略可能キーも既定値を含めて 8 キー全てを出力する。",
       "allOf": [
         { "$ref": "#/$defs/PluginManifest" },
         {
-          "required": ["id", "version", "transport", "tools", "permissions", "protocolVersion"]
+          "required": ["id", "version", "transport", "tools", "permissions", "protocolVersion", "runtime", "language"]
         }
       ]
     },
@@ -131,7 +145,9 @@
             "too_long",
             "too_many_items",
             "empty_tools",
-            "empty_tool_name"
+            "empty_tool_name",
+            "invalid_runtime",
+            "invalid_language"
           ]
         },
         "403": {
@@ -181,6 +197,7 @@
     "permissions の重複は拒否しない。申告値の保持のみで、権限の付与・強制はしない。",
     "transport の unix-socket と tcp は列挙値として受理するだけで、接続処理は未実装。登録成功は接続済みを意味しない（REPAIR-3）。",
     "レジストリはインメモリで最大 32 件、id 重複不可。削除・上書き API はない。",
+    "runtime・language は PLUG-6（TASK-98.1）の自己申告フィールドで、受け渡しのみ。PLUG-3 目標の適用判定は TASK-98.2 で未実装。",
     "エラー応答は入力値（id・キー名・ヘッダ値）を含めない。"
   ]
 }
