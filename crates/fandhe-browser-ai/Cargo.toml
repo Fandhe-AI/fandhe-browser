@@ -109,3 +109,27 @@ path = "harness/agent_eval/generate_reduced_tests.rs"
 [[test]]
 name = "agent_eval_score"
 path = "harness/agent_eval/score_tests.rs"
+
+# 方式 B 本体の MCP エンベロープ測定ハーネス（TASK-97.1・Issue #385・PLUG-5・MS-9）。
+# mcp バイナリ（別プロセス）を stdio で駆動するため mcp crate へは依存せず、依存も増やさない。
+# 実行は `make measure-mcp-envelope`。unix 以外では測定不能として非 0 で終了する。
+[[bench]]
+name = "mcp_envelope"
+path = "benches/mcp_envelope.rs"
+harness = false
+
+# JSON-RPC 純関数のユニットテスト（PLUG-5・TASK-97.1）。bench は cargo test で実行されないため別 [[test]]。
+[[test]]
+name = "mcp_envelope_jsonrpc"
+path = "benches/mcp_envelope/jsonrpc_tests.rs"
+
+# 統計・TSV 整形のユニットテスト（PLUG-5・TASK-97.1）。
+[[test]]
+name = "mcp_envelope_stats"
+path = "benches/mcp_envelope/stats_tests.rs"
+
+# 実バイナリを使う e2e smoke（PLUG-5・TASK-97.1）。#[ignore] のため `make check-mcp-envelope` が
+# `--ignored` 付きで実行する。
+[[test]]
+name = "mcp_envelope_e2e"
+path = "benches/mcp_envelope/e2e_tests.rs"

@@ -484,7 +484,7 @@ endif
 # workspace 作成前・render crate 追加前の CI を壊さない。docker-ci は make ci を
 # 呼ぶため自動的にこの検証を含む。
 .PHONY: ci
-ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-js-engine-isolation check-publish-private test test-rendering deny check-deny-license-reject check-compat-regression check-compat-practical check-puppeteer-connect check-bench-record ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-js-engine-isolation check-publish-private test test-rendering deny check-deny-license-reject check-compat-regression check-compat-practical check-puppeteer-connect check-bench-record check-mcp-envelope ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 実測ハーネス compat-practical の自己テスト（TASK-71.1・MEAS-4。harness/compat-practical/README.md 参照）
@@ -584,6 +584,33 @@ check-binary-size: ## feature 無効（既定）のリリースバイナリサ�
 	bash harness/binary-size/check-binary-size.sh \
 		--package "$(BINARY_SIZE_PACKAGE)" \
 		--limit "$(BINARY_SIZE_LIMIT_BYTES)"
+
+# --------------------------------------------------
+# 方式 B 本体の MCP エンベロープ測定ハーネス（TASK-97.1・Issue #385・PLUG-5・MS-9。
+# crates/fandhe-browser-ai/benches/mcp_envelope.rs 参照）
+# --------------------------------------------------
+
+# 実測値の確定・レポート化は #386（TASK-97.2）。cargo bench は他 package の bin をビルドしないため
+# mcp バイナリを先に release ビルドして FANDHE_BROWSER_MCP_BIN で渡す。unix 専用（Profile が unix のみ）。
+# 相対 CARGO_TARGET_DIR でも resolve_bin（絶対パス必須）を通すため abspath で絶対化する。
+MCP_ENVELOPE_TARGET_DIR ?= $(abspath $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(CURDIR)/target))
+
+.PHONY: measure-mcp-envelope
+measure-mcp-envelope: ## 方式 B 本体と MCP エンベロープのトークン・レイテンシを測定する（PLUG-5・TASK-97.1。unix のみ）
+	@case "$$(uname -s)" in Linux|Darwin) ;; *) echo "NG: measure-mcp-envelope は unix のみ対応です" >&2; exit 1;; esac
+	cargo build --release -p fandhe-browser-mcp
+	FANDHE_BROWSER_MCP_BIN="$(MCP_ENVELOPE_TARGET_DIR)/release/fandhe-browser-mcp" \
+		cargo bench -p fandhe-browser-ai --bench mcp_envelope
+
+.PHONY: check-mcp-envelope
+check-mcp-envelope: ## MCP エンベロープ測定ハーネスの e2e smoke を実バイナリで実行する（PLUG-5・TASK-97.1。unix のみ・0 件実行は NG）
+	@case "$$(uname -s)" in Linux|Darwin) ;; *) echo "skip: check-mcp-envelope は unix のみ対応のためスキップ（Profile が unix 専用）"; exit 0;; esac; \
+	cargo build -p fandhe-browser-mcp || exit 1; \
+	out="$$(mktemp)"; \
+	FANDHE_BROWSER_MCP_BIN="$(MCP_ENVELOPE_TARGET_DIR)/debug/fandhe-browser-mcp" \
+		cargo test -p fandhe-browser-ai --test mcp_envelope_e2e -- --ignored 2>&1 | tee "$$out"; \
+	if grep -q "test result: ok. 1 passed" "$$out"; then rc=0; else echo "NG: mcp_envelope_e2e が 1 件成功していません" >&2; rc=1; fi; \
+	rm -f "$$out"; exit $$rc
 
 # --------------------------------------------------
 # JS エンジン構成別リリースバイナリサイズ計測（TASK-31.1・Issue #469・JS-3・PERF-1。
