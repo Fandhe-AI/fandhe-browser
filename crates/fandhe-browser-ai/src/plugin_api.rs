@@ -1,9 +1,10 @@
 //! プラグインマニフェスト型とレジストリ状態（`PLUG-2`・TASK-92.1・Issue #353・TASK-92.2・Issue #354・`MS-9`）。
+//! `runtime` / `language` の申告フィールド（`PLUG-6`・TASK-98.1・Issue #389）も本モジュールが持つ。
 //!
 //! プラグインが自己申告する識別子・バージョン・トランスポート・提供ツール一覧・要求権限を
 //! 表す [`PluginManifest`] と、その JSON からの構築・JSON への出力を提供する。
-//! 外部入力（プラグイン由来で untrusted）を扱うため、スキーマ制約（PoC-15 の
-//! `host-api.schema.json` の `PluginManifest`）を構築時に全て検証し、不正な状態の値を作れない
+//! 外部入力（プラグイン由来で untrusted）を扱うため、スキーマ制約（
+//! `docs/design/host-api.schema.json` の `PluginManifest`。TASK-92.5）を構築時に全て検証し、不正な状態の値を作れない
 //! ようにしている。未知キー・未知の transport / permission は拒否する（fail-closed）。
 //!
 //! 検証済みマニフェストを保持する [`PluginRegistry`] と、それを `Arc<AppState>` と共に持つ ai 固有の
@@ -15,11 +16,16 @@
 //!
 //! # スタブ・暫定仕様について（REPAIR-3）
 //!
-//! - ルート・HTTP ステータス写像は未実装（TASK-92.3〜92.4）。[`AiState`] はまだ
-//!   [`crate::api::router`] から使われていない
+//! - 登録ルート `POST /ai/plugins/register` と HTTP ステータス写像は [`crate::api`] に実装済み
+//!   （TASK-92.3・Issue #355）。一覧 `GET /ai/plugins` も実装済み（TASK-92.4・Issue #356。
+//!   [`crate::api::router_with_state`]）
 //! - レジストリはインメモリでプロセス寿命のみ保持し、永続化しない。削除・上書き API は持たない
 //! - `permissions` は申告値の保持のみで、権限の付与・強制は行わない
 //! - `tcp` / `unix-socket` は列挙値として受理するだけで、接続処理は持たない
+//! - `runtime` / `language` は申告値の保持と出力に加え、`PLUG-3` 目標の適用判定を [`SupportTier`] が行う
+//!   （TASK-98.2・Issue #390）。判定結果は目標適用の分岐のみに使い、HTTP 応答には出さない。計測の実施は TASK-95。
+//!   省略時の `unspecified` は「公式サポート（Rust ネイティブ）」扱いにしない（未申告は公式扱いにしない。fail-closed）。
+//!   値は自己申告で untrusted であり、プロセス起動やインタプリタ選択には使わない
 //! - 新規依存を避けるため serde の derive は使わず、`serde_json::Value` から手動で抽出する
 
 use std::fmt;
@@ -42,6 +48,105 @@ pub const MAX_PERMISSIONS: usize = 5;
 pub const MAX_MANIFEST_BYTES: usize = 128 * 1024;
 /// `protocolVersion` 省略時の既定値。
 pub const DEFAULT_PROTOCOL_VERSION: &str = "unspecified";
+/// `runtime` の最大文字数（コードポイント数。`PLUG-6`）。
+pub const MAX_RUNTIME_CHARS: usize = 64;
+/// `language` の最大文字数（コードポイント数。`PLUG-6`）。
+pub const MAX_LANGUAGE_CHARS: usize = 64;
+/// `runtime` 省略時の既定値。公式サポート扱いにしない（`PLUG-6`・[`SupportTier::from_declaration`] が ThirdParty と判定する）。
+pub const DEFAULT_RUNTIME: &str = "unspecified";
+/// `language` 省略時の既定値。公式サポート扱いにしない（`PLUG-6`・[`SupportTier::from_declaration`] が ThirdParty と判定する）。
+pub const DEFAULT_LANGUAGE: &str = "unspecified";
+
+/// 公式サポートと判定する `runtime` 値（`PLUG-6`・TASK-98.2）。
+pub const OFFICIAL_RUNTIME: &str = "native";
+/// 公式サポートと判定する `language` 値（`PLUG-6`・TASK-98.2）。
+pub const OFFICIAL_LANGUAGE: &str = "rust";
+
+/// プラグインのサポート区分（`PLUG-6`・TASK-98.2・Issue #390）。
+///
+/// マニフェストの自己申告から導く。**自己申告は untrusted** のため、この区分は `PLUG-3` の
+/// どの計測目標を当てるかの分岐にのみ使い、権限付与・信頼判定・登録可否・検証緩和の根拠にしない。
+/// 計測の実施は TASK-95 側で、本型は判定のみを担う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SupportTier {
+    /// 公式サポート（`runtime: native` かつ `language: rust`）。`PLUG-3` 目標を適用する。
+    Official,
+    /// サードパーティ・実験的（上記以外すべて）。別枠で、数値目標なし。
+    ThirdParty,
+}
+
+impl SupportTier {
+    /// 区分名（`official` / `third-party`）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SupportTier::Official => "official",
+            SupportTier::ThirdParty => "third-party",
+        }
+    }
+
+    /// 申告値から区分を判定する純粋関数。両方が定数と完全一致のときだけ [`SupportTier::Official`]
+    /// （fail-closed。未申告・片方のみ一致・未知の値は ThirdParty）。値は構築時に小文字へ検証済みのため
+    /// 大文字小文字の正規化はしない。
+    pub fn from_declaration(runtime: &str, language: &str) -> Self {
+        if runtime == OFFICIAL_RUNTIME && language == OFFICIAL_LANGUAGE {
+            SupportTier::Official
+        } else {
+            SupportTier::ThirdParty
+        }
+    }
+
+    /// この区分に適用する `PLUG-3` 目標。ThirdParty は目標なしで `None`。
+    pub fn plug3_targets(self) -> Option<Plug3Targets> {
+        match self {
+            SupportTier::Official => Some(PLUG3_TARGETS),
+            SupportTier::ThirdParty => None,
+        }
+    }
+}
+
+/// `PLUG-3` の数値目標（公式サポートのプラグインにのみ適用。`PLUG-6`・TASK-98.2）。
+///
+/// アイドル RSS 増分の「10MB」は spec に単位の明記がないため MiB（10 * 1024 * 1024）で保持する。
+/// 計測側（TASK-95）の解釈と食い違う場合は spec 側の確認が必要。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Plug3Targets {
+    idle_rss_increase_max_bytes: u64,
+    cold_start_max_ms: u64,
+    call_latency_p50_max_ms: u64,
+    call_latency_p95_max_ms: u64,
+}
+
+/// 公式サポート向けの `PLUG-3` 目標値。
+pub const PLUG3_TARGETS: Plug3Targets = Plug3Targets {
+    idle_rss_increase_max_bytes: 10 * 1024 * 1024,
+    cold_start_max_ms: 50,
+    call_latency_p50_max_ms: 20,
+    call_latency_p95_max_ms: 100,
+};
+
+impl Plug3Targets {
+    /// アイドル RSS 増分の上限（バイト）。
+    pub fn idle_rss_increase_max_bytes(&self) -> u64 {
+        self.idle_rss_increase_max_bytes
+    }
+
+    /// cold start（end-to-end）の上限（ミリ秒）。
+    pub fn cold_start_max_ms(&self) -> u64 {
+        self.cold_start_max_ms
+    }
+
+    /// 呼び出しレイテンシ p50 の上限（ミリ秒）。
+    pub fn call_latency_p50_max_ms(&self) -> u64 {
+        self.call_latency_p50_max_ms
+    }
+
+    /// 呼び出しレイテンシ p95 の上限（ミリ秒）。
+    pub fn call_latency_p95_max_ms(&self) -> u64 {
+        self.call_latency_p95_max_ms
+    }
+}
 
 /// マニフェストのフィールド。エラーの対象特定に使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +158,8 @@ pub enum ManifestField {
     Tools,
     Permissions,
     ProtocolVersion,
+    Runtime,
+    Language,
 }
 
 impl ManifestField {
@@ -65,6 +172,8 @@ impl ManifestField {
             Self::Tools => "tools",
             Self::Permissions => "permissions",
             Self::ProtocolVersion => "protocolVersion",
+            Self::Runtime => "runtime",
+            Self::Language => "language",
         }
     }
 }
@@ -167,6 +276,10 @@ pub enum ManifestError {
     EmptyTools,
     /// ツール名が空文字列。
     EmptyToolName,
+    /// `runtime` の形式違反（`PLUG-6`）。
+    InvalidRuntime,
+    /// `language` の形式違反（`PLUG-6`）。
+    InvalidLanguage,
 }
 
 impl ManifestError {
@@ -187,6 +300,8 @@ impl ManifestError {
             Self::TooManyItems(_) => "too_many_items",
             Self::EmptyTools => "empty_tools",
             Self::EmptyToolName => "empty_tool_name",
+            Self::InvalidRuntime => "invalid_runtime",
+            Self::InvalidLanguage => "invalid_language",
         }
     }
 }
@@ -208,6 +323,8 @@ impl fmt::Display for ManifestError {
             Self::TooManyItems(_) => "manifest field has too many items",
             Self::EmptyTools => "manifest tools must not be empty",
             Self::EmptyToolName => "manifest tool name must not be empty",
+            Self::InvalidRuntime => "manifest runtime is invalid",
+            Self::InvalidLanguage => "manifest language is invalid",
         })
     }
 }
@@ -225,6 +342,8 @@ pub struct PluginManifest {
     tools: Vec<String>,
     permissions: Vec<PluginPermission>,
     protocol_version: String,
+    runtime: String,
+    language: String,
 }
 
 impl PluginManifest {
@@ -240,13 +359,15 @@ impl PluginManifest {
     /// パース済み JSON から構築し、スキーマ制約を全て検証する。
     pub fn from_value(value: &Value) -> Result<Self, ManifestError> {
         let obj = value.as_object().ok_or(ManifestError::NotAnObject)?;
-        const KNOWN: [&str; 6] = [
+        const KNOWN: [&str; 8] = [
             "id",
             "version",
             "transport",
             "tools",
             "permissions",
             "protocolVersion",
+            "runtime",
+            "language",
         ];
         if obj.keys().any(|k| !KNOWN.contains(&k.as_str())) {
             return Err(ManifestError::UnknownField);
@@ -321,6 +442,21 @@ impl PluginManifest {
             }
         };
 
+        let runtime = optional_token(
+            obj,
+            ManifestField::Runtime,
+            MAX_RUNTIME_CHARS,
+            DEFAULT_RUNTIME,
+            ManifestError::InvalidRuntime,
+        )?;
+        let language = optional_token(
+            obj,
+            ManifestField::Language,
+            MAX_LANGUAGE_CHARS,
+            DEFAULT_LANGUAGE,
+            ManifestError::InvalidLanguage,
+        )?;
+
         Ok(Self {
             id: id.to_owned(),
             version: version.to_owned(),
@@ -328,6 +464,8 @@ impl PluginManifest {
             tools: tool_names,
             permissions,
             protocol_version,
+            runtime,
+            language,
         })
     }
 
@@ -361,7 +499,31 @@ impl PluginManifest {
         &self.protocol_version
     }
 
-    /// 6 キー全てを出力する JSON 表現（既定値のキーも省略しない）。
+    /// 申告された実行ランタイム（`PLUG-6`）。未指定時は [`DEFAULT_RUNTIME`]。
+    ///
+    /// 自己申告の保持のみ。公式サポートの判定は [`PluginManifest::support_tier`]（TASK-98.2・Issue #390）。
+    pub fn runtime(&self) -> &str {
+        &self.runtime
+    }
+
+    /// 申告された実装言語（`PLUG-6`）。未指定時は [`DEFAULT_LANGUAGE`]。
+    ///
+    /// 自己申告の保持のみ。公式サポートの判定は [`PluginManifest::support_tier`]（TASK-98.2・Issue #390）。
+    pub fn language(&self) -> &str {
+        &self.language
+    }
+
+    /// 申告値から導いたサポート区分（`PLUG-6`・TASK-98.2・Issue #390）。応答 JSON には含めない。
+    pub fn support_tier(&self) -> SupportTier {
+        SupportTier::from_declaration(&self.runtime, &self.language)
+    }
+
+    /// 適用すべき `PLUG-3` 目標。公式サポートのみ `Some`、それ以外は `None`（目標なし）。
+    pub fn plug3_targets(&self) -> Option<Plug3Targets> {
+        self.support_tier().plug3_targets()
+    }
+
+    /// 8 キー全てを出力する JSON 表現（既定値のキーも省略しない）。
     pub fn to_value(&self) -> Value {
         json!({
             "id": self.id,
@@ -370,6 +532,8 @@ impl PluginManifest {
             "tools": self.tools,
             "permissions": self.permissions.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
             "protocolVersion": self.protocol_version,
+            "runtime": self.runtime,
+            "language": self.language,
         })
     }
 }
@@ -379,7 +543,7 @@ pub const MAX_PLUGINS: usize = 32;
 
 /// レジストリ登録の拒否理由（`PLUG-2`・TASK-92.2・Issue #354）。
 ///
-/// HTTP ステータスへの写像（PoC-15 は重複 409・満杯 429）は TASK-92.3 の責務で、ここでは持たない。
+/// HTTP ステータスへの写像（重複 409・満杯 429）は `api` の登録ハンドラ（TASK-92.3）が持ち、ここでは持たない。
 /// 文言は固定英語で、untrusted な id を含めない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -479,8 +643,8 @@ impl fmt::Debug for PluginRegistry {
 
 /// ai crate 固有の状態（core の共通状態 `Arc<AppState>` とプラグインレジストリ。`PLUG-2`・TASK-92.2・Issue #354）。
 ///
-/// TASK-92.3 / 92.4 のハンドラが `api::router` 内で構築した `Arc<AiState>` を使う予定で、現時点では
-/// ルータから未使用。1 つの `AiState` は 1 つの `AppState`（= 1 プロファイル）に対応し、グローバル
+/// `api::router` が構築した `Arc<AiState>` を `api::router_with_state` の各ハンドラ
+/// （TASK-92.3 の登録・TASK-92.4 の一覧）が使う。1 つの `AiState` は 1 つの `AppState`（= 1 プロファイル）に対応し、グローバル
 /// 共有を持たないためプロファイル間でレジストリは共有されない（`PROF-1`）。`Clone` は実装せず
 /// `Arc` で共有する。
 pub struct AiState {
@@ -539,6 +703,43 @@ fn char_len_exceeds(s: &str, max: usize) -> bool {
     s.chars().nth(max).is_some()
 }
 
+/// 任意トークン（`runtime` / `language`）を抽出する。省略時は `default`。
+/// 検査順は 型（`InvalidType`）→ 長さ（`TooLong`）→ 形式（`invalid`）。
+fn optional_token(
+    obj: &Map<String, Value>,
+    field: ManifestField,
+    max_chars: usize,
+    default: &str,
+    invalid: ManifestError,
+) -> Result<String, ManifestError> {
+    match obj.get(field.as_str()) {
+        None => Ok(default.to_owned()),
+        Some(v) => {
+            let s = v.as_str().ok_or(ManifestError::InvalidType(field))?;
+            if char_len_exceeds(s, max_chars) {
+                return Err(ManifestError::TooLong(field));
+            }
+            if !is_valid_runtime_token(s) {
+                return Err(invalid);
+            }
+            Ok(s.to_owned())
+        }
+    }
+}
+
+/// `^[a-z0-9][a-z0-9.+#_-]*$`（末尾は厳密アンカー。改行を許さない。`PLUG-6`）。
+/// 小文字 ASCII トークンに限り、[`SupportTier::from_declaration`] が完全一致で判定できるようにする。
+fn is_valid_runtime_token(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => return false,
+    }
+    chars.all(|c| {
+        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '+' | '#' | '_' | '-')
+    })
+}
+
 /// `^[a-z0-9][a-z0-9-]*$`。
 fn is_valid_id(s: &str) -> bool {
     let mut chars = s.chars();
@@ -572,7 +773,47 @@ fn is_valid_version(s: &str) -> bool {
 }
 
 #[cfg(test)]
+mod schema_contract_tests;
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn plug6_support_tier_official_only_for_native_rust() {
+        let m = |rt: &str, lang: &str| {
+            let v = json!({"id":"x","version":"1.0.0","transport":"stdio","tools":["t"],
+                "runtime":rt,"language":lang});
+            PluginManifest::from_slice(v.to_string().as_bytes()).unwrap()
+        };
+        let o = m("native", "rust");
+        assert_eq!(o.support_tier(), SupportTier::Official);
+        let t = o.plug3_targets().unwrap();
+        assert_eq!(t.idle_rss_increase_max_bytes(), 10_485_760);
+        assert_eq!(t.cold_start_max_ms(), 50);
+        assert_eq!(t.call_latency_p50_max_ms(), 20);
+        assert_eq!(t.call_latency_p95_max_ms(), 100);
+        for (rt, lang) in [
+            ("unspecified", "rust"),
+            ("native", "unspecified"),
+            ("unspecified", "unspecified"),
+            ("node", "javascript"),
+            ("native-musl", "rust"),
+            ("native", "rustlang"),
+            ("wasm", "rust"),
+        ] {
+            let x = m(rt, lang);
+            assert_eq!(x.support_tier(), SupportTier::ThirdParty, "{rt}/{lang}");
+            assert_eq!(x.plug3_targets(), None, "{rt}/{lang}");
+        }
+    }
+
+    #[test]
+    fn plug6_support_tier_as_str_and_constants_valid() {
+        assert_eq!(SupportTier::Official.as_str(), "official");
+        assert_eq!(SupportTier::ThirdParty.as_str(), "third-party");
+        assert!(is_valid_runtime_token(OFFICIAL_RUNTIME));
+        assert!(is_valid_runtime_token(OFFICIAL_LANGUAGE));
+    }
+
     use super::*;
 
     fn full() -> Value {
@@ -582,7 +823,9 @@ mod tests {
             "transport": "unix-socket",
             "tools": ["a.read", "b.write"],
             "permissions": ["network.fetch", "dom.read", "dom.write", "fs.read", "fs.write"],
-            "protocolVersion": "2025-06-18"
+            "protocolVersion": "2025-06-18",
+            "runtime": "node",
+            "language": "javascript"
         })
     }
 
@@ -603,6 +846,8 @@ mod tests {
         assert_eq!(m.tools(), ["a.read".to_owned(), "b.write".to_owned()]);
         assert_eq!(m.permissions().len(), 5);
         assert_eq!(m.protocol_version(), "2025-06-18");
+        assert_eq!(m.runtime(), "node");
+        assert_eq!(m.language(), "javascript");
         assert_eq!(m.to_value(), full());
         assert_eq!(PluginManifest::from_value(&m.to_value()).unwrap(), m);
     }
@@ -612,10 +857,13 @@ mod tests {
         let m = PluginManifest::from_value(&minimal()).unwrap();
         assert!(m.permissions().is_empty());
         assert_eq!(m.protocol_version(), "unspecified");
+        assert_eq!(m.runtime(), "unspecified");
+        assert_eq!(m.language(), "unspecified");
         assert_eq!(
             m.to_value(),
             json!({"id":"p","version":"0.1.0","transport":"stdio","tools":["t"],
-                   "permissions":[],"protocolVersion":"unspecified"})
+                   "permissions":[],"protocolVersion":"unspecified",
+                   "runtime":"unspecified","language":"unspecified"})
         );
     }
 
@@ -769,6 +1017,8 @@ mod tests {
         assert_eq!(e.code(), "missing_field");
         assert_eq!(e.to_string(), "manifest is missing a required field");
         assert_eq!(ManifestField::ProtocolVersion.as_str(), "protocolVersion");
+        assert_eq!(ManifestField::Runtime.as_str(), "runtime");
+        assert_eq!(ManifestField::Language.as_str(), "language");
     }
 
     fn manifest(id: &str, version: &str) -> PluginManifest {
@@ -852,5 +1102,67 @@ mod tests {
         let d = format!("{r:?}");
         assert!(!d.contains("secret-id"));
         assert_eq!(d, "PluginRegistry { len: 1 }");
+    }
+
+    #[test]
+    fn plug6_runtime_and_language_round_trip() {
+        let mut v = minimal();
+        v["runtime"] = json!("native");
+        v["language"] = json!("rust");
+        let m = PluginManifest::from_value(&v).unwrap();
+        assert_eq!(m.runtime(), "native");
+        assert_eq!(m.language(), "rust");
+        let out = m.to_value();
+        assert_eq!(out["runtime"], "native");
+        assert_eq!(out["language"], "rust");
+        assert_eq!(PluginManifest::from_value(&out).unwrap(), m);
+    }
+
+    #[test]
+    fn plug6_rejects_invalid_runtime_and_language() {
+        for (key, field, invalid) in [
+            (
+                "runtime",
+                ManifestField::Runtime,
+                ManifestError::InvalidRuntime,
+            ),
+            (
+                "language",
+                ManifestField::Language,
+                ManifestError::InvalidLanguage,
+            ),
+        ] {
+            let with = |x: Value| {
+                let mut v = minimal();
+                v[key] = x;
+                v
+            };
+            assert_eq!(err(with(json!(1))), ManifestError::InvalidType(field));
+            assert_eq!(
+                err(with(json!("a".repeat(65)))),
+                ManifestError::TooLong(field)
+            );
+            assert!(PluginManifest::from_value(&with(json!("a".repeat(64)))).is_ok());
+            for bad in ["", "Rust", "-x", "node 20", "rust\n", "ｒｕｓｔ"] {
+                assert_eq!(err(with(json!(bad))), invalid, "value {bad:?}");
+            }
+            for ok in ["c++", "c#", "python3.12", "node-20"] {
+                assert!(PluginManifest::from_value(&with(json!(ok))).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn plug6_error_code_and_display_are_fixed() {
+        assert_eq!(ManifestError::InvalidRuntime.code(), "invalid_runtime");
+        assert_eq!(ManifestError::InvalidLanguage.code(), "invalid_language");
+        assert_eq!(
+            ManifestError::InvalidRuntime.to_string(),
+            "manifest runtime is invalid"
+        );
+        assert_eq!(
+            ManifestError::InvalidLanguage.to_string(),
+            "manifest language is invalid"
+        );
     }
 }

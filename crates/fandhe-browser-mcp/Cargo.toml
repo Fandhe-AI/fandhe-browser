@@ -1,0 +1,28 @@
+# fandhe-browser-mcp の crate manifest。
+#
+# REPAIR-1 が定める 8 crate 構成のうち、MCP 参照プラグイン（別バイナリ）を担う crate。
+# TASK-94.1（Issue #368・PLUG-3・MS-9）が追加した雛形で、MCP サーバー本体は
+# TASK-94.2 以降で実装する。PLUG-1 に従い workspace 内の他 crate へは依存しない
+# （ブラウザ本体とは HTTP・stdio・JSON Schema の契約のみで接続する別プロセス）。
+
+[package]
+name = "fandhe-browser-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MCP reference plugin for fandhe-browser (separate binary, stdio)"
+
+[[bin]]
+name = "fandhe-browser-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# Issue #367 で承認済み（=3.4.1・Apache-2.0）。feature は root の workspace 定義を参照。
+rmcp = { workspace = true }
+# rmcp が必ず依存する tokio と、94.2 の `#[tokio::main]` 用。workspace 定義
+# （#35 承認・rt / macros）の再利用で新規バージョンは導入しない。
+tokio = { workspace = true }
+# snapshot 応答の解析で `Deserializer::disable_recursion_limit`（feature `unbounded_depth`）を使う。
+# workspace 定義（#419 承認済み・=1.0.151）の再利用で新規バージョンは導入せず、`-p` 単体ビルドでも feature を保証する。
+serde_json = { workspace = true }

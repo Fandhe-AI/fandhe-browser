@@ -88,7 +88,7 @@
 //!   動的ライブラリの実行時ロードは行わない方針。security.md 参照。
 //!   `PLUG-2`、`TASK-92`、`MS-9`）。マニフェスト型は実装済み（TASK-92.1・Issue #353。
 //!   [`plugin_api`]）。レジストリ状態も実装済み（TASK-92.2・Issue #354。
-//!   [`plugin_api::PluginRegistry`]・[`plugin_api::AiState`]）。エンドポイントは未実装（TASK-92.3〜92.4）
+//!   [`plugin_api::PluginRegistry`]・[`plugin_api::AiState`]）。登録エンドポイント `POST /ai/plugins/register` は実装済み（TASK-92.3・Issue #355）。一覧 `GET /ai/plugins` も実装済み（TASK-92.4・Issue #356。[`api::router_with_state`]）。`PLUG-3` 目標の適用判定（公式サポート判定）も実装済み（TASK-98.2・Issue #390・`PLUG-6`。[`plugin_api::SupportTier`]）
 
 pub mod api;
 pub mod compress_table;
