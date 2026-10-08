@@ -1,4 +1,5 @@
 //! プラグインマニフェスト型とレジストリ状態（`PLUG-2`・TASK-92.1・Issue #353・TASK-92.2・Issue #354・`MS-9`）。
+//! `runtime` / `language` の申告フィールド（`PLUG-6`・TASK-98.1・Issue #389）も本モジュールが持つ。
 //!
 //! プラグインが自己申告する識別子・バージョン・トランスポート・提供ツール一覧・要求権限を
 //! 表す [`PluginManifest`] と、その JSON からの構築・JSON への出力を提供する。
@@ -21,6 +22,9 @@
 //! - レジストリはインメモリでプロセス寿命のみ保持し、永続化しない。削除・上書き API は持たない
 //! - `permissions` は申告値の保持のみで、権限の付与・強制は行わない
 //! - `tcp` / `unix-socket` は列挙値として受理するだけで、接続処理は持たない
+//! - `runtime` / `language` は申告値の保持と出力のみ。`PLUG-3` 目標の適用判定は TASK-98.2（Issue #390）で未実装。
+//!   省略時の `unspecified` は「公式サポート（Rust ネイティブ）」扱いにしない（未申告は公式扱いにしない。fail-closed）。
+//!   値は自己申告で untrusted であり、プロセス起動やインタプリタ選択には使わない
 //! - 新規依存を避けるため serde の derive は使わず、`serde_json::Value` から手動で抽出する
 
 use std::fmt;
@@ -43,6 +47,14 @@ pub const MAX_PERMISSIONS: usize = 5;
 pub const MAX_MANIFEST_BYTES: usize = 128 * 1024;
 /// `protocolVersion` 省略時の既定値。
 pub const DEFAULT_PROTOCOL_VERSION: &str = "unspecified";
+/// `runtime` の最大文字数（コードポイント数。`PLUG-6`）。
+pub const MAX_RUNTIME_CHARS: usize = 64;
+/// `language` の最大文字数（コードポイント数。`PLUG-6`）。
+pub const MAX_LANGUAGE_CHARS: usize = 64;
+/// `runtime` 省略時の既定値。公式サポート扱いにしない（`PLUG-6`・TASK-98.2 が判定する）。
+pub const DEFAULT_RUNTIME: &str = "unspecified";
+/// `language` 省略時の既定値。公式サポート扱いにしない（`PLUG-6`・TASK-98.2 が判定する）。
+pub const DEFAULT_LANGUAGE: &str = "unspecified";
 
 /// マニフェストのフィールド。エラーの対象特定に使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +66,8 @@ pub enum ManifestField {
     Tools,
     Permissions,
     ProtocolVersion,
+    Runtime,
+    Language,
 }
 
 impl ManifestField {
@@ -66,6 +80,8 @@ impl ManifestField {
             Self::Tools => "tools",
             Self::Permissions => "permissions",
             Self::ProtocolVersion => "protocolVersion",
+            Self::Runtime => "runtime",
+            Self::Language => "language",
         }
     }
 }
@@ -168,6 +184,10 @@ pub enum ManifestError {
     EmptyTools,
     /// ツール名が空文字列。
     EmptyToolName,
+    /// `runtime` の形式違反（`PLUG-6`）。
+    InvalidRuntime,
+    /// `language` の形式違反（`PLUG-6`）。
+    InvalidLanguage,
 }
 
 impl ManifestError {
@@ -188,6 +208,8 @@ impl ManifestError {
             Self::TooManyItems(_) => "too_many_items",
             Self::EmptyTools => "empty_tools",
             Self::EmptyToolName => "empty_tool_name",
+            Self::InvalidRuntime => "invalid_runtime",
+            Self::InvalidLanguage => "invalid_language",
         }
     }
 }
@@ -209,6 +231,8 @@ impl fmt::Display for ManifestError {
             Self::TooManyItems(_) => "manifest field has too many items",
             Self::EmptyTools => "manifest tools must not be empty",
             Self::EmptyToolName => "manifest tool name must not be empty",
+            Self::InvalidRuntime => "manifest runtime is invalid",
+            Self::InvalidLanguage => "manifest language is invalid",
         })
     }
 }
@@ -226,6 +250,8 @@ pub struct PluginManifest {
     tools: Vec<String>,
     permissions: Vec<PluginPermission>,
     protocol_version: String,
+    runtime: String,
+    language: String,
 }
 
 impl PluginManifest {
@@ -241,13 +267,15 @@ impl PluginManifest {
     /// パース済み JSON から構築し、スキーマ制約を全て検証する。
     pub fn from_value(value: &Value) -> Result<Self, ManifestError> {
         let obj = value.as_object().ok_or(ManifestError::NotAnObject)?;
-        const KNOWN: [&str; 6] = [
+        const KNOWN: [&str; 8] = [
             "id",
             "version",
             "transport",
             "tools",
             "permissions",
             "protocolVersion",
+            "runtime",
+            "language",
         ];
         if obj.keys().any(|k| !KNOWN.contains(&k.as_str())) {
             return Err(ManifestError::UnknownField);
@@ -322,6 +350,21 @@ impl PluginManifest {
             }
         };
 
+        let runtime = optional_token(
+            obj,
+            ManifestField::Runtime,
+            MAX_RUNTIME_CHARS,
+            DEFAULT_RUNTIME,
+            ManifestError::InvalidRuntime,
+        )?;
+        let language = optional_token(
+            obj,
+            ManifestField::Language,
+            MAX_LANGUAGE_CHARS,
+            DEFAULT_LANGUAGE,
+            ManifestError::InvalidLanguage,
+        )?;
+
         Ok(Self {
             id: id.to_owned(),
             version: version.to_owned(),
@@ -329,6 +372,8 @@ impl PluginManifest {
             tools: tool_names,
             permissions,
             protocol_version,
+            runtime,
+            language,
         })
     }
 
@@ -362,7 +407,21 @@ impl PluginManifest {
         &self.protocol_version
     }
 
-    /// 6 キー全てを出力する JSON 表現（既定値のキーも省略しない）。
+    /// 申告された実行ランタイム（`PLUG-6`）。未指定時は [`DEFAULT_RUNTIME`]。
+    ///
+    /// 自己申告の保持のみで、公式サポートの判定は行わない（TASK-98.2・Issue #390 で未実装）。
+    pub fn runtime(&self) -> &str {
+        &self.runtime
+    }
+
+    /// 申告された実装言語（`PLUG-6`）。未指定時は [`DEFAULT_LANGUAGE`]。
+    ///
+    /// 自己申告の保持のみで、公式サポートの判定は行わない（TASK-98.2・Issue #390 で未実装）。
+    pub fn language(&self) -> &str {
+        &self.language
+    }
+
+    /// 8 キー全てを出力する JSON 表現（既定値のキーも省略しない）。
     pub fn to_value(&self) -> Value {
         json!({
             "id": self.id,
@@ -371,6 +430,8 @@ impl PluginManifest {
             "tools": self.tools,
             "permissions": self.permissions.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
             "protocolVersion": self.protocol_version,
+            "runtime": self.runtime,
+            "language": self.language,
         })
     }
 }
@@ -540,6 +601,43 @@ fn char_len_exceeds(s: &str, max: usize) -> bool {
     s.chars().nth(max).is_some()
 }
 
+/// 任意トークン（`runtime` / `language`）を抽出する。省略時は `default`。
+/// 検査順は 型（`InvalidType`）→ 長さ（`TooLong`）→ 形式（`invalid`）。
+fn optional_token(
+    obj: &Map<String, Value>,
+    field: ManifestField,
+    max_chars: usize,
+    default: &str,
+    invalid: ManifestError,
+) -> Result<String, ManifestError> {
+    match obj.get(field.as_str()) {
+        None => Ok(default.to_owned()),
+        Some(v) => {
+            let s = v.as_str().ok_or(ManifestError::InvalidType(field))?;
+            if char_len_exceeds(s, max_chars) {
+                return Err(ManifestError::TooLong(field));
+            }
+            if !is_valid_runtime_token(s) {
+                return Err(invalid);
+            }
+            Ok(s.to_owned())
+        }
+    }
+}
+
+/// `^[a-z0-9][a-z0-9.+#_-]*$`（末尾は厳密アンカー。改行を許さない。`PLUG-6`）。
+/// 小文字 ASCII トークンに限り、TASK-98.2 が完全一致で判定できるようにする。
+fn is_valid_runtime_token(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => return false,
+    }
+    chars.all(|c| {
+        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '+' | '#' | '_' | '-')
+    })
+}
+
 /// `^[a-z0-9][a-z0-9-]*$`。
 fn is_valid_id(s: &str) -> bool {
     let mut chars = s.chars();
@@ -586,7 +684,9 @@ mod tests {
             "transport": "unix-socket",
             "tools": ["a.read", "b.write"],
             "permissions": ["network.fetch", "dom.read", "dom.write", "fs.read", "fs.write"],
-            "protocolVersion": "2025-06-18"
+            "protocolVersion": "2025-06-18",
+            "runtime": "node",
+            "language": "javascript"
         })
     }
 
@@ -607,6 +707,8 @@ mod tests {
         assert_eq!(m.tools(), ["a.read".to_owned(), "b.write".to_owned()]);
         assert_eq!(m.permissions().len(), 5);
         assert_eq!(m.protocol_version(), "2025-06-18");
+        assert_eq!(m.runtime(), "node");
+        assert_eq!(m.language(), "javascript");
         assert_eq!(m.to_value(), full());
         assert_eq!(PluginManifest::from_value(&m.to_value()).unwrap(), m);
     }
@@ -616,10 +718,13 @@ mod tests {
         let m = PluginManifest::from_value(&minimal()).unwrap();
         assert!(m.permissions().is_empty());
         assert_eq!(m.protocol_version(), "unspecified");
+        assert_eq!(m.runtime(), "unspecified");
+        assert_eq!(m.language(), "unspecified");
         assert_eq!(
             m.to_value(),
             json!({"id":"p","version":"0.1.0","transport":"stdio","tools":["t"],
-                   "permissions":[],"protocolVersion":"unspecified"})
+                   "permissions":[],"protocolVersion":"unspecified",
+                   "runtime":"unspecified","language":"unspecified"})
         );
     }
 
@@ -773,6 +878,8 @@ mod tests {
         assert_eq!(e.code(), "missing_field");
         assert_eq!(e.to_string(), "manifest is missing a required field");
         assert_eq!(ManifestField::ProtocolVersion.as_str(), "protocolVersion");
+        assert_eq!(ManifestField::Runtime.as_str(), "runtime");
+        assert_eq!(ManifestField::Language.as_str(), "language");
     }
 
     fn manifest(id: &str, version: &str) -> PluginManifest {
@@ -856,5 +963,67 @@ mod tests {
         let d = format!("{r:?}");
         assert!(!d.contains("secret-id"));
         assert_eq!(d, "PluginRegistry { len: 1 }");
+    }
+
+    #[test]
+    fn plug6_runtime_and_language_round_trip() {
+        let mut v = minimal();
+        v["runtime"] = json!("native");
+        v["language"] = json!("rust");
+        let m = PluginManifest::from_value(&v).unwrap();
+        assert_eq!(m.runtime(), "native");
+        assert_eq!(m.language(), "rust");
+        let out = m.to_value();
+        assert_eq!(out["runtime"], "native");
+        assert_eq!(out["language"], "rust");
+        assert_eq!(PluginManifest::from_value(&out).unwrap(), m);
+    }
+
+    #[test]
+    fn plug6_rejects_invalid_runtime_and_language() {
+        for (key, field, invalid) in [
+            (
+                "runtime",
+                ManifestField::Runtime,
+                ManifestError::InvalidRuntime,
+            ),
+            (
+                "language",
+                ManifestField::Language,
+                ManifestError::InvalidLanguage,
+            ),
+        ] {
+            let with = |x: Value| {
+                let mut v = minimal();
+                v[key] = x;
+                v
+            };
+            assert_eq!(err(with(json!(1))), ManifestError::InvalidType(field));
+            assert_eq!(
+                err(with(json!("a".repeat(65)))),
+                ManifestError::TooLong(field)
+            );
+            assert!(PluginManifest::from_value(&with(json!("a".repeat(64)))).is_ok());
+            for bad in ["", "Rust", "-x", "node 20", "rust\n", "ｒｕｓｔ"] {
+                assert_eq!(err(with(json!(bad))), invalid, "value {bad:?}");
+            }
+            for ok in ["c++", "c#", "python3.12", "node-20"] {
+                assert!(PluginManifest::from_value(&with(json!(ok))).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn plug6_error_code_and_display_are_fixed() {
+        assert_eq!(ManifestError::InvalidRuntime.code(), "invalid_runtime");
+        assert_eq!(ManifestError::InvalidLanguage.code(), "invalid_language");
+        assert_eq!(
+            ManifestError::InvalidRuntime.to_string(),
+            "manifest runtime is invalid"
+        );
+        assert_eq!(
+            ManifestError::InvalidLanguage.to_string(),
+            "manifest language is invalid"
+        );
     }
 }
