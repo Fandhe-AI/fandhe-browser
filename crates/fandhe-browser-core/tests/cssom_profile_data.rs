@@ -1,8 +1,9 @@
 //! `profiles/chrome.json`・`profiles/safari.json` のデータ配置の回帰テスト。
 //!
 //! TASK-100.1（Issue #265）・`PLUG-8`。後続の読み込みモジュール（TASK-100.2）が
-//! `include_str!` で埋め込む相対パスが解決できることと、キュレーション結果
-//! （`width` 等の基本プロパティを gating 対象に含めない）が維持されることを固定する。
+//! `include_str!` で埋め込む相対パスが解決できることと、再マッピング結果
+//! （TASK-100.8・Issue #738: `width` 等の基本プロパティが本体 feature へ割り当てられ、
+//! サブ機能 feature・対応開始版の誤適用で除去されない）が維持されることを固定する。
 //! JSON 構文・必須フィールド・`cssProperties` の参照先 feature の存在も、依存を増やさず
 //! テスト内の最小パーサーで検証する（読み込みモジュール本体は TASK-100.2 の責務）。
 
@@ -40,11 +41,13 @@ fn plug8_profile_data_keeps_gating_targets() {
 }
 
 #[test]
-fn plug8_profile_data_excludes_miscurated_properties() {
+fn plug8_profile_data_maps_basic_properties_to_body_features() {
     for data in [CHROME, SAFARI] {
-        assert!(!data.contains("\"width\":"));
-        assert!(!data.contains("\"margin\":"));
-        assert!(!data.contains("\"-webkit-user-select\":"));
+        assert!(data.contains("\"width\": \"width-height\""));
+        assert!(data.contains("\"margin\": \"margin\""));
+        assert!(data.contains("\"-webkit-user-select\": \"user-select\""));
+        assert!(!data.contains("\"width\": \"anchor-positioning\""));
+        assert!(!data.contains("\"margin\": \"anchor-positioning\""));
     }
 }
 
@@ -316,8 +319,31 @@ fn plug8_test_parser_rejects_invalid_json_grammar() {
 }
 
 #[test]
-fn plug8_profile_data_excludes_subfeature_mappings() {
-    // サブ機能の対応開始版をプロパティ全体へ適用しない（基本プロパティを誤って gating しない）。
+fn plug8_profile_data_maps_remapped_properties_to_body_features() {
+    // TASK-100.8: 除外していた 59 件のうち 57 件が本体 feature へ割り当てられている。
+    let expected = [
+        ("content", "content"),
+        ("align-content", "flexbox"),
+        ("text-transform", "text-transform"),
+        ("transform-origin", "transforms2d"),
+        ("transition", "transitions"),
+        ("-webkit-transition", "transitions"),
+        ("-moz-transition", "transitions"),
+        ("overflow", "overflow-shorthand"),
+        ("overflow-x", "overflow-shorthand"),
+        ("overflow-y", "overflow-shorthand"),
+        ("outline", "outline"),
+        ("gap", "grid"),
+        ("height", "width-height"),
+        ("top", "physical-properties"),
+        ("min-width", "min-max-width-height"),
+        ("inset", "logical-properties"),
+        ("container-type", "container-queries"),
+        ("break-inside", "page-breaks"),
+        ("text-overflow", "text-overflow"),
+        ("counter-reset", "counters"),
+        ("-khtml-user-select", "user-select"),
+    ];
     for (data, browser) in [(CHROME, "chrome"), (SAFARI, "safari")] {
         let root = parse(data);
         let root = obj(&root, "root");
@@ -325,24 +351,50 @@ fn plug8_profile_data_excludes_subfeature_mappings() {
             root.get("cssProperties").expect("cssProperties"),
             "cssProperties",
         );
-        for p in [
-            "content",
-            "align-content",
-            "text-transform",
-            "transform-origin",
-            "transition",
-            "overflow",
-            "overflow-x",
-            "overflow-y",
-            "outline",
-            "gap",
-            "-webkit-transition",
-            "-moz-transition",
-        ] {
+        for (p, f) in expected {
             assert!(
-                !props.contains_key(p),
-                "{browser}: {p} must not be mapped to a sub-feature"
+                matches!(props.get(p), Some(Json::Str(id)) if id == f),
+                "{browser}: {p} must map to {f}"
             );
+        }
+        // サブ機能 feature へは割り当てない。
+        for (p, id) in props {
+            if let Json::Str(id) = id {
+                if p != "position-area" {
+                    assert_ne!(id, "anchor-positioning", "{browser}: {p}");
+                }
+                assert!(
+                    !matches!(
+                        id.as_str(),
+                        "overflow-clip"
+                            | "flexbox-gap"
+                            | "transition-behavior"
+                            | "alt-text-generated-content"
+                            | "mathml"
+                            | "custom-ellipses"
+                            | "counter-reset-reversed"
+                            | "column-breaks"
+                            | "container-anchor-position-queries"
+                    ) || matches!(p.as_str(), "column-gap" | "row-gap" | "-moz-column-gap"),
+                    "{browser}: {p} -> {id}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn plug8_profile_data_keeps_text_size_adjust_prefixed_unlisted() {
+    // 剥がした先の `text-size-adjust` が Safari 非対応のため、接頭辞付き 2 件は未掲載（素通し）に保つ。
+    for (data, browser) in [(CHROME, "chrome"), (SAFARI, "safari")] {
+        let root = parse(data);
+        let root = obj(&root, "root");
+        let props = obj(
+            root.get("cssProperties").expect("cssProperties"),
+            "cssProperties",
+        );
+        for p in ["-webkit-text-size-adjust", "-ms-text-size-adjust"] {
+            assert!(!props.contains_key(p), "{browser}: {p} must stay unlisted");
         }
     }
 }

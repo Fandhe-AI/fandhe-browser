@@ -1,4 +1,4 @@
-//! プラグインマニフェスト型（`PLUG-2`・TASK-92.1・Issue #353・`MS-9`）。
+//! プラグインマニフェスト型とレジストリ状態（`PLUG-2`・TASK-92.1・Issue #353・TASK-92.2・Issue #354・`MS-9`）。
 //!
 //! プラグインが自己申告する識別子・バージョン・トランスポート・提供ツール一覧・要求権限を
 //! 表す [`PluginManifest`] と、その JSON からの構築・JSON への出力を提供する。
@@ -6,18 +6,26 @@
 //! `host-api.schema.json` の `PluginManifest`）を構築時に全て検証し、不正な状態の値を作れない
 //! ようにしている。未知キー・未知の transport / permission は拒否する（fail-closed）。
 //!
+//! 検証済みマニフェストを保持する [`PluginRegistry`] と、それを `Arc<AppState>` と共に持つ ai 固有の
+//! 状態型 [`AiState`] も本モジュールに置く（core の `AppState` は変更しない。spec
+//! `self-repair-design.md` の「プロトコル固有の状態は各 crate に閉じる」決定）。
+//!
 //! 呼び出し文脈: TASK-92.3 の登録ハンドラ（`POST /ai/plugins/register`）が [`PluginManifest::from_slice`]
 //! を、TASK-92.4 の一覧（`GET /ai/plugins`）が [`PluginManifest::to_value`] を使う想定。
 //!
 //! # スタブ・暫定仕様について（REPAIR-3）
 //!
-//! - レジストリ状態・ルート・HTTP ステータス写像・登録件数上限・id 重複判定は未実装
-//!   （TASK-92.2〜92.4）。本モジュールは型と検証のみ
+//! - ルート・HTTP ステータス写像は未実装（TASK-92.3〜92.4）。[`AiState`] はまだ
+//!   [`crate::api::router`] から使われていない
+//! - レジストリはインメモリでプロセス寿命のみ保持し、永続化しない。削除・上書き API は持たない
 //! - `permissions` は申告値の保持のみで、権限の付与・強制は行わない
 //! - `tcp` / `unix-socket` は列挙値として受理するだけで、接続処理は持たない
 //! - 新規依存を避けるため serde の derive は使わず、`serde_json::Value` から手動で抽出する
 
 use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use fandhe_browser_core::AppState;
 
 use serde_json::{Map, Value, json};
 
@@ -366,6 +374,149 @@ impl PluginManifest {
     }
 }
 
+/// レジストリへ登録できるプラグインの最大件数（PoC-15 の `MAX_PLUGINS`）。無制限確保を防ぐ。
+pub const MAX_PLUGINS: usize = 32;
+
+/// レジストリ登録の拒否理由（`PLUG-2`・TASK-92.2・Issue #354）。
+///
+/// HTTP ステータスへの写像（PoC-15 は重複 409・満杯 429）は TASK-92.3 の責務で、ここでは持たない。
+/// 文言は固定英語で、untrusted な id を含めない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RegistryError {
+    /// 同じ id が登録済み。
+    DuplicateId,
+    /// [`MAX_PLUGINS`] に達している。
+    Full,
+}
+
+impl RegistryError {
+    /// 機械可読なエラーコード。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::DuplicateId => "duplicate_plugin_id",
+            Self::Full => "plugin_registry_full",
+        }
+    }
+}
+
+impl fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateId => f.write_str("plugin id is already registered"),
+            Self::Full => f.write_str("plugin registry is full"),
+        }
+    }
+}
+
+impl std::error::Error for RegistryError {}
+
+/// 登録済みプラグインマニフェストのインメモリレジストリ（`PLUG-2`・TASK-92.2・Issue #354）。
+///
+/// TASK-92.3 の登録ハンドラが [`register`](Self::register) を、TASK-92.4 の一覧が
+/// [`list`](Self::list) を呼ぶ想定。重複判定・上限判定・追加は単一ロック内で行い、並行登録でも
+/// 上限超過・重複が起きない。永続化せず、削除・上書きはできない（既存プラグインの差し替え防止）。
+pub struct PluginRegistry {
+    plugins: Mutex<Vec<PluginManifest>>,
+}
+
+impl PluginRegistry {
+    /// 空のレジストリを作る。
+    pub fn new() -> Self {
+        Self {
+            plugins: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// poison は回復する。書き込みは push のみで途中状態が残らないため安全。
+    fn guard(&self) -> MutexGuard<'_, Vec<PluginManifest>> {
+        self.plugins.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// マニフェストを登録する。判定順は「id 重複 → 件数上限」（PoC-15 に合わせる）。
+    pub fn register(&self, manifest: PluginManifest) -> Result<(), RegistryError> {
+        let mut plugins = self.guard();
+        if plugins.iter().any(|m| m.id() == manifest.id()) {
+            return Err(RegistryError::DuplicateId);
+        }
+        if plugins.len() >= MAX_PLUGINS {
+            return Err(RegistryError::Full);
+        }
+        plugins.push(manifest);
+        Ok(())
+    }
+
+    /// 登録順の複製を返す。
+    pub fn list(&self) -> Vec<PluginManifest> {
+        self.guard().clone()
+    }
+
+    /// 登録件数。
+    pub fn len(&self) -> usize {
+        self.guard().len()
+    }
+
+    /// 登録が 0 件か。
+    pub fn is_empty(&self) -> bool {
+        self.guard().is_empty()
+    }
+}
+
+impl Default for PluginRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for PluginRegistry {
+    /// マニフェスト内容は出さず件数のみ。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PluginRegistry")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+/// ai crate 固有の状態（core の共通状態 `Arc<AppState>` とプラグインレジストリ。`PLUG-2`・TASK-92.2・Issue #354）。
+///
+/// TASK-92.3 / 92.4 のハンドラが `api::router` 内で構築した `Arc<AiState>` を使う予定で、現時点では
+/// ルータから未使用。1 つの `AiState` は 1 つの `AppState`（= 1 プロファイル）に対応し、グローバル
+/// 共有を持たないためプロファイル間でレジストリは共有されない（`PROF-1`）。`Clone` は実装せず
+/// `Arc` で共有する。
+pub struct AiState {
+    app: Arc<AppState>,
+    plugins: PluginRegistry,
+}
+
+impl AiState {
+    /// 空のレジストリで構築する。
+    pub fn new(app: Arc<AppState>) -> Self {
+        Self {
+            app,
+            plugins: PluginRegistry::new(),
+        }
+    }
+
+    /// 内包する core の共通状態。
+    pub fn app(&self) -> &Arc<AppState> {
+        &self.app
+    }
+
+    /// プラグインレジストリ。
+    pub fn plugins(&self) -> &PluginRegistry {
+        &self.plugins
+    }
+}
+
+impl fmt::Debug for AiState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AiState")
+            .field("app", &self.app)
+            .field("plugins", &self.plugins)
+            .finish()
+    }
+}
+
 fn required_str(obj: &Map<String, Value>, field: ManifestField) -> Result<&str, ManifestError> {
     obj.get(field.as_str())
         .ok_or(ManifestError::MissingField(field))?
@@ -618,5 +769,88 @@ mod tests {
         assert_eq!(e.code(), "missing_field");
         assert_eq!(e.to_string(), "manifest is missing a required field");
         assert_eq!(ManifestField::ProtocolVersion.as_str(), "protocolVersion");
+    }
+
+    fn manifest(id: &str, version: &str) -> PluginManifest {
+        PluginManifest::from_value(
+            &json!({"id": id, "version": version, "transport": "stdio", "tools": ["t"]}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn plug2_registry_starts_empty() {
+        let r = PluginRegistry::new();
+        assert_eq!(r.len(), 0);
+        assert!(r.is_empty());
+        assert_eq!(r.list(), Vec::<PluginManifest>::new());
+    }
+
+    #[test]
+    fn plug2_registry_register_then_list_keeps_order() {
+        let r = PluginRegistry::new();
+        let (a, b) = (manifest("beta", "1.0.0"), manifest("alpha", "2.0.0"));
+        r.register(a.clone()).unwrap();
+        r.register(b.clone()).unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r.list(), vec![a, b]);
+        let ids: Vec<String> = r.list().iter().map(|m| m.id().to_owned()).collect();
+        assert_eq!(ids, ["beta", "alpha"]);
+    }
+
+    #[test]
+    fn plug2_registry_rejects_duplicate_id() {
+        let r = PluginRegistry::new();
+        r.register(manifest("dup", "1.0.0")).unwrap();
+        assert_eq!(
+            r.register(manifest("dup", "2.0.0")),
+            Err(RegistryError::DuplicateId)
+        );
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.list()[0].version(), "1.0.0");
+    }
+
+    #[test]
+    fn plug2_registry_rejects_when_full() {
+        let r = PluginRegistry::new();
+        for i in 0..MAX_PLUGINS {
+            r.register(manifest(&format!("p{i}"), "1.0.0")).unwrap();
+        }
+        assert_eq!(
+            r.register(manifest("extra", "1.0.0")),
+            Err(RegistryError::Full)
+        );
+        assert_eq!(r.len(), 32);
+        assert_eq!(
+            r.register(manifest("p0", "1.0.0")),
+            Err(RegistryError::DuplicateId)
+        );
+    }
+
+    #[test]
+    fn plug2_registry_error_code_and_display_are_fixed() {
+        assert_eq!(RegistryError::DuplicateId.code(), "duplicate_plugin_id");
+        assert_eq!(RegistryError::Full.code(), "plugin_registry_full");
+        assert_eq!(
+            RegistryError::DuplicateId.to_string(),
+            "plugin id is already registered"
+        );
+        assert_eq!(RegistryError::Full.to_string(), "plugin registry is full");
+    }
+
+    #[test]
+    fn plug2_registry_and_state_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PluginRegistry>();
+        assert_send_sync::<AiState>();
+    }
+
+    #[test]
+    fn plug2_registry_debug_hides_manifests() {
+        let r = PluginRegistry::new();
+        r.register(manifest("secret-id", "1.0.0")).unwrap();
+        let d = format!("{r:?}");
+        assert!(!d.contains("secret-id"));
+        assert_eq!(d, "PluginRegistry { len: 1 }");
     }
 }
