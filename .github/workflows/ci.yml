@@ -40,7 +40,7 @@ name: CI
 # （TASK-9.2・#339）で既に満たしている。本記録は新規ジョブ追加やトリガー変更では
 # なく、TASK-9（9.1〜9.3）の本格 CI パイプライン統合が完了したことの明文化
 # （TASK-7 の記録と同じ扱い）。compat-regression の --allow-missing は #312
-# （TASK-71.3）の完了まで維持する
+# （TASK-71.3）の完了に伴い削除済み
 on:
   workflow_dispatch:
   pull_request:
@@ -421,10 +421,9 @@ jobs:
   # （REPAIR-5・REPAIR-8。品質ゲートが無言で素通りしないことの担保）。
   #
   # 実マトリクス harness/compat-practical/results/matrix.json は TASK-71.3
-  # （Issue #312）が生成予定でまだ存在しないため、当面 --allow-missing を渡す
-  # （ファイル不在時は ::warning:: を出して exit 0）。#312 がマトリクスをコミット
-  # したら --allow-missing を削除し、ファイル不在を fail-closed（exit 2）に戻す
-  # こと（harness/compat-regression/README.md にも同じ削除条件を明記）。
+  # （Issue #312）でコミット済みのため --allow-missing は渡さない（ファイル不在は
+  # fail-closed の exit 2。閾値未達は exit 1 で赤になる。harness/compat-regression/
+  # README.md 参照）。
   #
   # 3 OS 一級対応（.claude/rules/ci.md・XOS-1）に合わせ ubuntu/macos/windows の
   # 3 OS matrix で実行する。全ステップ shell: bash を明示する（rust-ci-default-
@@ -478,8 +477,7 @@ jobs:
             --matrix harness/compat-practical/results/matrix.json \
             --threshold 70 \
             --categories static,spa,form \
-            --all-categories \
-            --allow-missing
+            --all-categories
 
   # --------------------------------------------------
   # puppeteer-connect-selftest（Puppeteer 接続試験ハーネスの自己テスト）

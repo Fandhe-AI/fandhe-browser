@@ -516,8 +516,8 @@ check-compat-practical: ## 実測ハーネス（22 タスク定義・アクセ�
 # 同じ方針で fail-closed（silent skip にしない）。self-test を先に実行し、
 # fixture（合成データ）に対して「閾値未満で fail する」ことをログに残してから
 # 実マトリクスを判定する。実マトリクス harness/compat-practical/results/matrix.json
-# は TASK-71.3（#312）が生成予定でまだ無いため、当面 --allow-missing を渡す
-# （#312 で導入され次第このフラグを削除し fail-closed に戻す）。
+# は TASK-71.3（#312）でコミット済みのため --allow-missing は渡さない
+# （ファイル不在は fail-closed の exit 2、閾値未達は exit 1）。
 .PHONY: check-compat-regression
 check-compat-regression: ## 対象サイト群の動作率マトリクスに対する回帰チェック（COMPAT-1・COMPAT-4）
 	@command -v jq >/dev/null 2>&1 || { \
@@ -529,8 +529,7 @@ check-compat-regression: ## 対象サイト群の動作率マトリクスに対�
 		--matrix harness/compat-practical/results/matrix.json \
 		--threshold 70 \
 		--categories static,spa,form \
-		--all-categories \
-		--allow-missing
+		--all-categories
 
 # --------------------------------------------------
 # competitor_lightpanda ベンチの継続実行結果記録（TASK-84.2・Issue #212。

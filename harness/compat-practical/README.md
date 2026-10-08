@@ -7,7 +7,7 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 | 後続 | 内容 |
 | ---- | ---- |
 | #311（TASK-71.2） | 22 タスクの実行スクリプト `run_core.sh`（本 README「run_core.sh」節） |
-| #312（TASK-71.3） | Chromium 実測との突合・`results/matrix.json` 生成（本 README「make_matrix.sh」節。生成スクリプトは導入済み、マトリクス自体は未コミット） |
+| #312（TASK-71.3） | Chromium 実測との突合・`results/matrix.json` 生成（本 README「make_matrix.sh」節。生成スクリプトとマトリクスをコミット済み） |
 | #309（TASK-71） | 測定レポート |
 
 ## ファイル
@@ -145,7 +145,7 @@ jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 
 - この値を `check-matrix.sh --threshold 70 --categories static,spa,form --all-categories` に通すと、全体・form・lazy・table が閾値未満で exit 1 になる（static・spa は通過）
 - 主因は、ナビゲーション経路でページ内 JS が実行されないこと（上記「制約」。b5・d2・d3）と、core のセレクタサブセット外（e1）。閾値・対象類型を下げてゲートを通すことはしない
-- そのため `results/matrix.json` は**コミットしていない**（コミットすると `make check-compat-regression` と CI の `compat-regression` ジョブが閾値未達で赤になる）。`--allow-missing` の削除条件（既存の運用ルール）は変更していない。コミットの可否と未達時のゲートの扱いはオーナー判断（ページ JS の配線後に再計測してコミットするのが想定）
+- `results/matrix.json` はコミット済みで、`--allow-missing` は ci.yml・Makefile から削除した（既存の削除条件どおり）。そのため `make check-compat-regression` と CI の `compat-regression` ジョブは閾値未達で赤になる。これは実測を反映した正しい判定であり、閾値・対象類型を下げて通すことはしない。解消はページ JS の配線後に再計測して `matrix.json` を更新する
 - 再生成: `bash harness/compat-practical/run_core.sh` で再計測してから `bash harness/compat-practical/make_matrix.sh`
 
 ## 計測結果
