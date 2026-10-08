@@ -24,7 +24,10 @@ pub(crate) const DEFAULT_HOST_ADDR: &str = "127.0.0.1:9333";
 /// 登録エンドポイントのパス。
 const REGISTER_PATH: &str = "/ai/plugins/register";
 /// マニフェストで申告するツール名。TASK-94 完了時の提供予定ツールの申告であり、
-/// 実装は TASK-94.3（navigate）・TASK-94.4（snapshot）。実装との整合は TASK-94.6 で検証する。
+/// 実装は TASK-94.3（navigate）・TASK-94.4（snapshot）で、現時点では未実装（`server.rs` の
+/// capabilities は空。REPAIR-3）。ホスト側スキーマが `tools` に 1 件以上を要求する
+/// （`minItems: 1`）ため空にできず、94.3 / 94.4 完了までは実在しないツールを暫定申告する。
+/// 実装との整合は TASK-94.6 で検証する。
 pub(crate) const DECLARED_TOOLS: [&str; 2] = ["navigate", "snapshot"];
 /// 応答の読み取り上限（バイト）。
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
@@ -190,11 +193,23 @@ fn interpret(status: u16, body: &[u8]) -> Result<RegisterOutcome, RegisterError>
     }
 }
 
-/// 応答全体（EOF まで）を上限付きで読む。
-fn read_limited(r: &mut impl Read, max: usize) -> Result<Vec<u8>, RegisterError> {
+/// 応答全体（EOF まで）を上限付きで読む。`deadline` を累積の締切とし、各 read の前に
+/// 残り時間で `rearm`（read timeout の再設定）を呼ぶ。締切超過は `Timeout`。
+/// 1 バイトずつ遅延送信されても全体期限で打ち切るため（read timeout は 1 回あたりの上限）。
+fn read_limited(
+    r: &mut impl Read,
+    max: usize,
+    deadline: Instant,
+    mut rearm: impl FnMut(Duration) -> io::Result<()>,
+) -> Result<Vec<u8>, RegisterError> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
+        let left = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or(RegisterError::Timeout)?;
+        rearm(left).map_err(RegisterError::Io)?;
         let n = match r.read(&mut chunk) {
             Ok(n) => n,
             Err(e)
@@ -239,7 +254,7 @@ pub(crate) fn register_with_host() -> Result<RegisterOutcome, RegisterError> {
         .checked_sub(started.elapsed())
         .filter(|d| !d.is_zero())
         .ok_or(RegisterError::Timeout)?;
-    // 読み取り 1 回ごとの待ちも全体期限で頭打ちにする（read_timeout は 1 回あたりの上限）。
+    // 書き込みと最初の read は残り時間で頭打ちにし、以降の read は read_limited が再設定する。
     stream
         .set_read_timeout(Some(remaining))
         .map_err(RegisterError::Io)?;
@@ -250,7 +265,12 @@ pub(crate) fn register_with_host() -> Result<RegisterOutcome, RegisterError> {
     stream
         .write_all(&build_request(addr, &body))
         .map_err(RegisterError::Io)?;
-    let resp = read_limited(&mut stream, MAX_RESPONSE_BYTES)?;
+    let deadline = started + TOTAL_TIMEOUT;
+    let reader = stream.try_clone().map_err(RegisterError::Io)?;
+    let mut rd = &stream;
+    let resp = read_limited(&mut rd, MAX_RESPONSE_BYTES, deadline, |d| {
+        reader.set_read_timeout(Some(d))
+    })?;
     let (status, body) = parse_response(&resp)?;
     interpret(status, body)
 }
@@ -432,17 +452,60 @@ mod tests {
         ));
     }
 
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
     /// PLUG-2 / TASK-94.5: 応答が上限を超えたら ResponseTooLarge。
     #[test]
     fn plug2_read_limited_rejects_oversized() {
         let data = vec![b'a'; 100];
         assert!(matches!(
-            read_limited(&mut data.as_slice(), 50),
+            read_limited(&mut data.as_slice(), 50, far(), |_| Ok(())),
             Err(RegisterError::ResponseTooLarge)
         ));
         assert_eq!(
-            read_limited(&mut data.as_slice(), 100).expect("ok").len(),
+            read_limited(&mut data.as_slice(), 100, far(), |_| Ok(()))
+                .expect("ok")
+                .len(),
             100
         );
+    }
+
+    /// 1 バイトずつ遅延して返す reader（遅延送信ホストの模擬）。
+    struct Drip;
+    impl Read for Drip {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(20));
+            if let Some(b) = buf.first_mut() {
+                *b = b'a';
+            }
+            Ok(1)
+        }
+    }
+
+    /// PLUG-2 / TASK-94.5: 1 read ごとは短くても累積締切を超えたら Timeout（上限到達前）。
+    #[test]
+    fn plug2_read_limited_enforces_total_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(100);
+        let r = read_limited(&mut Drip, MAX_RESPONSE_BYTES, deadline, |_| Ok(()));
+        assert!(matches!(r, Err(RegisterError::Timeout)), "{r:?}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    /// PLUG-2 / TASK-94.5: 各 read の前に残り時間で rearm が呼ばれ、締切以下の値になる。
+    #[test]
+    fn plug2_read_limited_rearms_with_remaining_time() {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut seen = Vec::new();
+        let data = b"abc".to_vec();
+        read_limited(&mut data.as_slice(), 100, deadline, |d| {
+            seen.push(d);
+            Ok(())
+        })
+        .expect("ok");
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|d| *d <= Duration::from_millis(500)));
     }
 }
