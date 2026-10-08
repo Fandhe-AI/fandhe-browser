@@ -172,8 +172,10 @@ js-binary-size: config=<default|boa|none> features=<label> engines=<v8|boa|none>
 - `mb` は 10 進（10^6 bytes）で小数第 2 位まで
 - `host` と `target` は常に `rustc -vV` の host（`--target` は渡さない。各 OS の
   ネイティブビルドのみ。クロスコンパイルは対象外）
-- `strip` は既定 `none`。`--strip`（`make ... JS_BINARY_SIZE_STRIP=1`）で
-  `CARGO_PROFILE_RELEASE_STRIP=symbols` を `cargo build` にだけ渡す（`Cargo.toml`
+- `strip` は既定 `none`。`Cargo.toml` の `strip = true`（#368）に関わらず、通常分岐は
+  `CARGO_PROFILE_RELEASE_STRIP=none` を `cargo build` にだけ渡して strip なしで計測する。
+  `--strip`（`make ... JS_BINARY_SIZE_STRIP=1`）では
+  `CARGO_PROFILE_RELEASE_STRIP=symbols` を渡す（`Cargo.toml`
   は編集しない。profile が変わるため全体の再ビルドが走る。spec の strip 後の
   参考値と比べるための任意モード）
 - 全フィールドは `^[A-Za-z0-9._-]{1,64}$` で検証してから出力する（ワークフロー
