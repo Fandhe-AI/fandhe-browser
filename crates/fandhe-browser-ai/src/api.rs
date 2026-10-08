@@ -18,8 +18,13 @@
 //!   spec の例示形に合わせた暫定確定。エラー本文は全 variant で `code` と `message` の 2 キー
 //! - 共有状態を跨ぐ結合テストは cli の `server.rs` テスト（TASK-19.4・Issue #226。ai ⇔ cdp 依存は
 //!   禁止のため両者を合成できる cli に置く）で実施済み
-//! - ルータは ai 固有の状態 [`AiState`]（`AppState` とプラグインレジストリ）を [`router_with_state`] で
-//!   受け取る（TASK-92.2・Issue #354 の状態型を TASK-92.3 で配線）。[`router`] は内部で構築する
+//! - プラグインレジストリを持つ ai 固有の状態型 `AiState` は定義済み（TASK-92.2・Issue #354）。
+//!   [`router_with_state`] が `Arc<AiState>` を受け取り、`GET /ai/plugins`（TASK-92.4・Issue #356・
+//!   `PLUG-2`）と登録 `POST /ai/plugins/register`（TASK-92.3・Issue #355）を提供する
+//! - `GET /ai/plugins` の応答は `{"plugins":[<manifest>...]}`（登録順。未登録は空配列）の暫定形で、
+//!   PoC-15 の `host-api.schema.json` 準拠。正式スキーマの文書化は TASK-92.5（Issue #357）。
+//!   一覧はプラグインの申告値をそのまま返すだけで「接続済み」「権限付与済み」を意味しない。
+//!   ページング・絞り込みは持たない（上限 `MAX_PLUGINS` 件）
 //! - `POST /ai/plugins/register` の応答形は暫定: 成功 `{"ok":true,"id":...}`（200）、失敗 `{"code","message"}`
 //!   （マニフェスト不正 400・id 重複 409・満杯 429・Content-Type 不正 415・Origin 付き 403）。
 //!   入力値（id・キー名・ヘッダ値）は応答に含めない。正式スキーマは TASK-92.5（Issue #357）
@@ -27,7 +32,6 @@
 //!   `Content-Type: application/json` を必須とする（CORS 許可ヘッダは付けない）。許可リストは将来の設定項目
 //! - 登録は申告値の保持のみで、プラグインプロセスの起動・接続・権限付与は行わない。
 //!   成功は「接続済み」「権限付与済み」を意味しない
-//! - 一覧取得 `GET /ai/plugins` は未実装（TASK-92.4・Issue #356）
 //!
 //! # 資源上限
 //!
@@ -84,10 +88,14 @@ pub fn router(app: Arc<AppState>) -> Router {
     router_with_state(Arc::new(AiState::new(app)))
 }
 
-/// 呼び出し側が保持する [`AiState`] を共有してルータを組み立てる。テスト（レジストリ内容の直接検証）と
-/// 後続ルート（`GET /ai/plugins`・TASK-92.4）が同じ状態を使うための入口。
+/// ai 固有状態 [`AiState`] を使うルータを返す（`GET /ai/snapshot`・`GET /ai/plugins`・
+/// `POST /ai/plugins/register`）。
+///
+/// snapshot・plugins は Host 検証のみ行う読み取り専用 GET で、CORS 許可ヘッダは付けない。
+/// `/ai/plugins` は `PLUG-2`・TASK-92.4・Issue #356、register は TASK-92.3・Issue #355。
 pub fn router_with_state(state: Arc<AiState>) -> Router {
     let snapshot_state = Arc::clone(&state);
+    let plugins_state = Arc::clone(&state);
     let register_state = state;
     Router::new()
         .route("GET", "/ai/snapshot", move |head, _body| {
@@ -100,6 +108,14 @@ pub fn router_with_state(state: Arc<AiState>) -> Router {
                 Ok(body) => Response::new(200, body).with_content_type(JSON_CONTENT_TYPE),
                 Err(e) => error_response(e),
             }
+        })
+        .route("GET", "/ai/plugins", move |head, _body| {
+            // snapshot と同じ Host 検証で DNS rebinding 経由の列挙を防ぐ。
+            if let Err(e) = Authority::from_host_header(head.header("host")) {
+                return host_error_response(e);
+            }
+            Response::new(200, plugins_body(plugins_state.plugins()))
+                .with_content_type(JSON_CONTENT_TYPE)
         })
         .route("POST", "/ai/plugins/register", move |head, body| {
             // 検査順: Host -> Origin -> Content-Type -> 本文検証 -> 登録。前段で拒否した要求は
@@ -127,6 +143,16 @@ pub fn router_with_state(state: Arc<AiState>) -> Router {
                 Err(e) => register_error_response(e),
             }
         })
+}
+
+/// 登録済みプラグイン一覧の JSON 本文 `{"plugins":[...]}` を作る純粋部（`PLUG-2`・TASK-92.4）。
+///
+/// `GET /ai/plugins` ハンドラから呼ばれ、レジストリの登録順を保って各マニフェストを
+/// [`PluginManifest::to_value`](crate::plugin_api::PluginManifest::to_value) で出力する。
+/// `Value` の文字列化は失敗しないため `Result` にしない。
+pub fn plugins_body(registry: &PluginRegistry) -> Vec<u8> {
+    let plugins: Vec<Value> = registry.list().iter().map(|m| m.to_value()).collect();
+    json!({ "plugins": plugins }).to_string().into_bytes()
 }
 
 /// プラグイン登録の失敗（`PLUG-2`・TASK-92.3・Issue #355）。マニフェスト検証とレジストリ登録の
@@ -538,6 +564,69 @@ mod tests {
             assert_eq!(v["code"], code);
             assert_eq!(v["message"], message);
         }
+    }
+
+    fn registry_with(ids: &[&str]) -> PluginRegistry {
+        let r = PluginRegistry::new();
+        for id in ids {
+            r.register(
+                crate::plugin_api::PluginManifest::from_value(
+                    &json!({"id": id, "version": "1.0.0", "transport": "stdio", "tools": ["t"]}),
+                )
+                .expect("manifest"),
+            )
+            .expect("register");
+        }
+        r
+    }
+
+    #[test]
+    fn plug2_plugins_body_is_empty_array_when_unregistered() {
+        let body = plugins_body(&PluginRegistry::new());
+        assert_eq!(body, b"{\"plugins\":[]}");
+    }
+
+    #[test]
+    fn plug2_plugins_body_lists_manifests_in_registration_order() {
+        let r = PluginRegistry::new();
+        r.register(
+            crate::plugin_api::PluginManifest::from_value(&json!({
+                "id": "b", "version": "2.0.0", "transport": "tcp", "tools": ["x", "y"],
+                "permissions": ["network.fetch"], "protocolVersion": "1"
+            }))
+            .expect("m"),
+        )
+        .expect("reg");
+        r.register(
+            crate::plugin_api::PluginManifest::from_value(
+                &json!({"id": "a", "version": "1.0.0", "transport": "stdio", "tools": ["t"]}),
+            )
+            .expect("m"),
+        )
+        .expect("reg");
+        let v: Value = serde_json::from_slice(&plugins_body(&r)).expect("json");
+        assert_eq!(
+            v,
+            json!({"plugins": [
+                {"id": "b", "version": "2.0.0", "transport": "tcp", "tools": ["x", "y"],
+                 "permissions": ["network.fetch"], "protocolVersion": "1"},
+                {"id": "a", "version": "1.0.0", "transport": "stdio", "tools": ["t"],
+                 "permissions": [], "protocolVersion": "unspecified"},
+            ]})
+        );
+    }
+
+    #[test]
+    fn plug2_plugins_body_round_trips_through_manifest() {
+        let r = registry_with(&["p1", "p2"]);
+        let v: Value = serde_json::from_slice(&plugins_body(&r)).expect("json");
+        let back: Vec<_> = v["plugins"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|e| crate::plugin_api::PluginManifest::from_value(e).expect("manifest"))
+            .collect();
+        assert_eq!(back, r.list());
     }
 
     // --- PLUG-2・TASK-92.3 ---
