@@ -171,12 +171,31 @@ fandhe-backend-core = { version = "=0.4.2", features = ["websocket"] }
 fandhe-backend-http = { version = "=0.4.2" }
 fandhe-backend-routes = { version = "=0.4.2" }
 serde_json = { version = "=1.0.151" }
+# TASK-94.1（Issue #368・PLUG-3・MS-9）: MCP 参照プラグイン `fandhe-browser-mcp` の
+# MCP サーバー実装（Rust 公式 SDK）。Issue #367 のオーナー決定（2026-09-25）で
+# 採用・版（=3.4.1）・Apache-2.0・配置（mcp のみ）・`default-features = false` で
+# stdio に必要な feature に絞ること・reqwest 系（auth / reqwest*）を入れないことが
+# 承認済み。feature の具体列挙（server / macros / transport-io）は #368 での解釈で、
+# PR レビューで確認する。`base64` と reqwest・oauth2 系は無効。推移依存は
+# rmcp-macros・schemars・chrono・futures・tokio-util・uuid・darling 等（いずれも
+# MIT / Apache-2.0 系・純 Rust で C/C++ ビルドなし）。
+rmcp = { version = "=3.4.1", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-io",
+] }
 
 [profile.release]
 # release ビルドは panic 発生時に unwind せず即座に中断する前提
 # （coding-rust.md「release は panic = "abort" 前提のため catch_unwind に頼らない」）。
 # 仮想 manifest のルートにしか置けない設定のため、workspace 作成時に確定させる。
 panic = "abort"
+# TASK-94.1（Issue #368・PLUG-3）: バイナリサイズ最小化設定。`[profile.*]` は workspace
+# ルートでしか効かないため、mcp だけでなく全 crate の release ビルド（cli を含む）と、
+# release を継承する bench プロファイルにも適用される。`codegen-units = 1` は未適用。
+opt-level = "z"
+lto = true
+strip = true
 
 # boa（`fandhe-browser-js` の `js-boa`。TASK-32.2・Issue #166）の debug ビルド最適化。
 # boa の `ArrayBuffer` 確保は 0 埋め（`resize`）を含み、最適化なしだとバイト単位の

@@ -18,8 +18,10 @@ JS-3・PERF-1 が「検討中」に留まる理由は、V8 統合後の実バイ
   （`Makefile` の `BINARY_SIZE_LIMIT_BYTES` と同値）
 - 軽量ビルド（boa のみ）・エンジンなしビルドは参考値
 - MB は 10 進（10^6 B）
-- ルート `Cargo.toml` の `[profile.release]` は `panic = "abort"` のみで、CORE-2 の前提
+- ルート `Cargo.toml` の `[profile.release]` は計測時点では `panic = "abort"` のみで、CORE-2 の前提
   （`opt-level = "z"`・`lto = true`・`codegen-units = 1`・`strip = true`）は未適用
+  だった。#368（TASK-94.1）以降は `codegen-units = 1` を除く 3 設定が適用済みで、
+  本書の記載値は適用前のもの
   （#146・#368 で追跡）。本レポートの値は正規構成より大きい側（保守側）に出る
 
 ## 測定方法

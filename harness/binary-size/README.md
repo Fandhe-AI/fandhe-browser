@@ -33,11 +33,10 @@ Issue #174・#616 で追加済み）。package が workspace に無い場合は�
   （TASK-30.2・#160）により V8 を同梱する。V8 の増分は PoC-3 実測
   +40.81MB（TASK-27 の記述）で、上限内に収まるかは `make check-binary-size`
   の実測で判定する
-- release プロファイル: 現状はルート `Cargo.toml` の `[profile.release]` が
-  `panic = "abort"` のみで、`CORE-2` の前提（`opt-level = "z"`・`lto = true`・
-  `codegen-units = 1`・`strip = true`）が未適用。計測値は正規構成より大きく
-  出る（保守側）。この不整合はスコープ外として別途報告済み（下記「現状の
-  限界」参照）
+- release プロファイル: ルート `Cargo.toml` の `[profile.release]` は #368
+  （TASK-94.1）で `opt-level = "z"`・`lto = true`・`strip = true` を適用済みだが、
+  `codegen-units = 1` は未適用（下記「現状の限界」参照）。#368 以前の計測値は
+  適用前の値で、大きめ（保守側）に出ている
 - 実バイナリができた後に、より厳しい回帰予算へ見直すかどうかは #468
   （TASK-34.4）が実測を見てから判断する
 
@@ -207,11 +206,10 @@ macOS の bash 3.2・Windows の Git Bash 向けに bash 4 系機能は使って
 
 ## 現状の限界
 
-- release プロファイルが `CORE-2` の前提（`opt-level = "z"`・`lto = true`・
-  `codegen-units = 1`・`strip = true`）を満たしていない（ルート `Cargo.toml`
-  の `[profile.release]` は `panic = "abort"` のみ）。workspace 全体に影響する
-  変更のためユーザー判断のうえ別 Issue で扱う（関連: TASK-27 #146、
-  TASK-94.1 #368）
+- release プロファイルのうち `codegen-units = 1` が未適用
+  （`opt-level = "z"`・`lto = true`・`strip = true` は #368 で適用済み）。
+  workspace 全体に影響する変更のためユーザー判断のうえ別 Issue で扱う
+  （関連: TASK-27 #146、TASK-94.1 #368）
 - spec（`js-engine.md`・TASK-27）の「既定ビルド = V8 のみ同梱」は、
   `fandhe-browser-cli` の `default = ["js-v8"]`（TASK-30.2・#160）で解消済み。
   `fandhe-browser-js` / core の `default = []` は意図どおり（feature 統合で

@@ -49,7 +49,7 @@ TASK-34 の成果物のうち確認記録の節。スクリプト側は `scripts
 - 代替計測を採らない理由: core の example 等を測っても製品バイナリと構成が異なり、RENDER-2 の実測値と誤解されるため
 - 参考値: CORE-2 の比較基準は Chromium 実測 457.4MB（PoC-2）からの 80% 以上削減であり、424KB（PoC-6）は `println!` のみのスタブ（Servo 未リンク）の参考値でゲートではない。上限 91,480,000 B は Chromium 457.4MB（PoC-2）の 20% から導いた値（詳細は `harness/binary-size/README.md`）
 - 上限見直し（回帰予算を厳しくするか・OS 別上限にするか）: 実測値は得られたが、見直しは人間判断として別途扱うため現状は**据え置き**
-- 再計測手順: CI `binary-size` ジョブのサマリー（`binary-size: host=... bytes=... limit=... result=...`）とローカル `make check-binary-size` の結果を転記して本節を更新する。release プロファイルが CORE-2 の前提（`opt-level="z"`・`lto` 等）を未適用のため、計測値は大きめ（保守側）に出る
+- 再計測手順: CI `binary-size` ジョブのサマリー（`binary-size: host=... bytes=... limit=... result=...`）とローカル `make check-binary-size` の結果を転記して本節を更新する。#368 以前の計測値は release プロファイルの `opt-level="z"`・`lto`・`strip` 適用前のもので、大きめ（保守側）に出ている
 
 ### 受け入れ条件との対応（TASK-34.4）
 
