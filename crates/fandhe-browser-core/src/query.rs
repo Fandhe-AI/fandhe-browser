@@ -45,8 +45,9 @@
 //! - 属性（[`crate::selector::AttributeSelector`]）: [`Document::attribute`]
 //!   を使う（名前空間なしの属性に限定。HTML 名前空間の要素なら属性名は
 //!   大文字小文字を無視して照合する。`Document::attribute` の契約どおり）。
-//!   `Exists` は値の有無、`Equals` は値の完全一致（大文字小文字を区別する）
-//!   で判定する。HTML 仕様の「値を大文字小文字無視で比較する属性」
+//!   `Exists` は値の有無、`Equals` は値の完全一致（大文字小文字を区別する）、
+//!   `Prefix` は前方一致（大文字小文字を区別し、空文字列は常に不一致。
+//!   Selectors 仕様・TASK-71.6・#760）で判定する。HTML 仕様の「値を大文字小文字無視で比較する属性」
 //!   （`type`・`lang` 等）への対応は本モジュールの範囲外（下記「本モジュールの
 //!   範囲外」節を参照）。
 //!
@@ -211,6 +212,13 @@ fn match_attribute(
         AttributeMatcher::Exists => document.attribute(element, &attr.name).is_some(),
         AttributeMatcher::Equals(expected) => {
             document.attribute(element, &attr.name) == Some(expected.as_str())
+        }
+        // Selectors 仕様: 空の値は何にも一致しない（TASK-71.6・#760）。
+        AttributeMatcher::Prefix(prefix) => {
+            !prefix.is_empty()
+                && document
+                    .attribute(element, &attr.name)
+                    .is_some_and(|v| v.starts_with(prefix.as_str()))
         }
     }
 }
@@ -1262,6 +1270,37 @@ mod tests {
         );
         let root = doc.root();
         assert_query_ids(&doc, root, &[("[href]", &["withhref"])]);
+    }
+
+    /// CORE-1・TASK-71.6・#760: 属性の前方一致（`[name^=value]`）。値と完全に
+    /// 等しい場合は一致し、大文字小文字は区別する。空文字列は何にも一致しない。
+    #[test]
+    fn core_1_attribute_prefix_match_and_mismatch() {
+        let doc = parse(
+            r#"<!DOCTYPE html>
+            <a id="issue_1">1</a>
+            <a id="issue_">exact</a>
+            <a id="xissue_2">contains</a>
+            <a id="ISSUE_3">upper</a>
+            <a id="pr_1">pr</a>
+            <a class="noid">no id</a>
+            <div id="issue_div"></div>
+            <span id="" data-x=""></span>"#,
+        );
+        let root = doc.root();
+        assert_query_ids(
+            &doc,
+            root,
+            &[
+                ("[id^=\"issue_\"]", &["issue_1", "issue_", "issue_div"]),
+                ("a[id^=\"issue_\"]", &["issue_1", "issue_"]),
+                ("[id^=\"ISSUE_\"]", &["ISSUE_3"]),
+                ("[id^=\"issue_1x\"]", &[]),
+                ("[id^=\"\"]", &[]),
+                ("[data-x^=\"\"]", &[]),
+                ("[title^=\"a\"]", &[]),
+            ],
+        );
     }
 
     /// CORE-1: 属性値の完全一致セレクタ（`[name=value]`）は引用符の有無に

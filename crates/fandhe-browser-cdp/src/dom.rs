@@ -975,6 +975,15 @@ mod tests {
         }
     }
 
+    /// TASK-71.6・#760: `^=` 属性セレクタが `DOM.querySelector` 経由でも使える。
+    #[test]
+    fn cdp1_query_selector_attribute_prefix() {
+        assert_eq!(qs(1, "[id^=t]"), Ok(6));
+        assert_eq!(qs(1, "h1[id^=\"t\"]"), Ok(6));
+        assert_eq!(qs(1, "[id^=\"zz\"]"), Ok(0));
+        assert_eq!(qs(1, "[id^=\"\"]"), Ok(0));
+    }
+
     #[test]
     fn cdp1_query_selector_node_id_matches_get_document() {
         let d = doc(PAGE);
@@ -1010,7 +1019,7 @@ mod tests {
 
     #[test]
     fn repair3_query_selector_unsupported_selector_is_error() {
-        for sel in ["h1:first-child", "*", "h1 + p"] {
+        for sel in ["h1:first-child", "*", "h1 + p", "[id$=t]"] {
             assert_eq!(qs(1, sel), Err(CdpError::UNSUPPORTED_PARAMS), "{sel}");
         }
     }

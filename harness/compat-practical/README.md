@@ -101,7 +101,7 @@ bash harness/compat-practical/run_core.sh [--tasks P] [--out P] [--bin P] [--end
 core の `Page.navigate` は fetch して HTML を保存するだけで、**ページ内 JS は実行されない**（JS エンジンはナビゲーション経路に未配線）。
 V8 が同梱されていてもページスクリプトは走らないため、本実測は「V8 統合による解消」を示さない。
 メタ行の `page_js_executed` は `false` 固定で、配線された時点で見直す。b5・d2・d3 の結果は実測のまま記録し、解消を装わない。
-属性演算子 `^=` は core のセレクタサブセット外のため e1 は `selector_unsupported` になる。
+属性演算子 `^=` は TASK-71.6（#760）で core のセレクタサブセットに入った。e1 の再計測と `matrix.json` の更新は #312 で扱う。
 
 ## make_matrix.sh
 
@@ -148,7 +148,7 @@ jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 - そのため `results/matrix.json` は**コミットしていない**（コミットすると `make check-compat-regression` と CI の `compat-regression` ジョブが閾値未達で赤になる）。実測 15/22（68.2%）が閾値 70% 未満のため、まだコミットできない。閾値・対象類型は下げない。実マトリクスのコミットは #312 の残りの受け入れ条件（閾値 70% 到達後）で、`--allow-missing` は #312 完了後に削除する（main の記述どおり）
 - 失敗 7 件の内訳と追跡先:
   - b5・d2・d3（`no_match`）: ページ内 JS がナビゲーション経路に未配線のため。扱いは #758（TASK-71.h1・人間判断）で決める
-  - e1（`selector_unsupported`）: 属性演算子 `^=` が core のセレクタサブセット外。#760（TASK-71.6）で対応する
+  - e1（`selector_unsupported`）: 属性演算子 `^=` が core のセレクタサブセット外だった（計測時点）。#760（TASK-71.6）で対応済み。再計測は #312
   - a6（`no_match`）: HTTP 403 でコンテンツを取得できない
   - c1（`no_match`）・e5（`no_match`）: 本 PR では原因を未調査（実測のまま記録。解消を装わない。REPAIR-3）
 - 再生成: `bash harness/compat-practical/run_core.sh` で再計測してから `bash harness/compat-practical/make_matrix.sh`
