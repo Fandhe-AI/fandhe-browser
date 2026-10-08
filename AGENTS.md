@@ -53,6 +53,13 @@ make check-deny-license-reject   # 許可外ライセンス（GPL/AGPL/LGPL/MPL-
                                    # reject されることの negative test（TASK-9.1・REPAIR-8）
 ```
 
+### MCP エンベロープ測定（PLUG-5・TASK-97.1）
+
+```bash
+make measure-mcp-envelope   # 方式 B 本体と MCP 応答のトークン・レイテンシを測定（unix のみ。数値確定は #386）
+make check-mcp-envelope     # 実 mcp バイナリでの e2e smoke（`make ci` に含む。unix のみ）
+```
+
 ### 3 OS 一級対応
 
 - CI は Linux・macOS・Windows の 3 OS ネイティブランナーでビルド・テストする（クロスコンパイル前提にしない）
