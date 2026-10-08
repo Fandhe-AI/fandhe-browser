@@ -7,7 +7,7 @@
 //! 確定（AISNAP-6）に合わせて形状検証を更新する。トークン削減のためのテキスト形式の最適化は
 //! TASK-96 / TASK-97（PLUG-4・PLUG-5）の測定結果を受けた別作業で、ここでは JSON の再直列化のみ。
 
-use rmcp::serde_json::{self, Value};
+use serde_json::Value;
 
 /// `GET /ai/snapshot` のパス。
 pub(crate) const SNAPSHOT_PATH: &str = "/ai/snapshot";
@@ -79,9 +79,27 @@ fn parse_bounded(body: &[u8]) -> Option<Value> {
     Some(v)
 }
 
+/// 解析・再直列化・Drop 用スレッドのスタックサイズ。serde_json の parse / to_string / Drop は
+/// 木の深さ分スタック再帰するため、呼び出し元（Windows のメインは 1 MiB）に依存せず十分確保する。
+const PARSE_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 /// ホスト応答を解釈する。2xx かつエンベロープ形状が正しいときのみ成功（fail-closed）。
 /// 失敗時はホスト本文の自由文を流さず、安全な `code` のみ保持する。
+///
+/// 再帰を伴う処理（解析・再直列化・`Value` の Drop）は大きなスタックを持つ専用スレッドで実行する。
+/// スレッドを起動できない・異常終了した場合は `Failure`（`code` なし）にする。
 pub(crate) fn interpret(status: u16, body: &[u8]) -> SnapshotOutcome {
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(PARSE_STACK_BYTES)
+            .spawn_scoped(s, || interpret_inner(status, body))
+            .ok()
+            .and_then(|h| h.join().ok())
+    })
+    .unwrap_or(SnapshotOutcome::Failure { status, code: None })
+}
+
+fn interpret_inner(status: u16, body: &[u8]) -> SnapshotOutcome {
     let parsed: Option<Value> = parse_bounded(body);
     if (200..300).contains(&status)
         && let Some(v) = parsed.as_ref()
@@ -185,6 +203,23 @@ mod tests {
         assert_eq!(interpret(200, &body), fail(200, None));
         let deep = format!("{}{}", "[".repeat(1_000_000), "]".repeat(1_000_000));
         assert_eq!(interpret(200, deep.as_bytes()), fail(200, None));
+    }
+
+    /// PLUG-4 / TASK-94.4: 呼び出し元スタックが極小でも、ホスト最大深度（約 515 階層）で abort せず成功する。
+    #[test]
+    fn plug4_interpret_survives_small_caller_stack() {
+        let body = nested_tree(256);
+        let len = body.len();
+        let out = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || interpret(200, &body))
+            .unwrap()
+            .join()
+            .unwrap();
+        let SnapshotOutcome::Success { text } = out else {
+            panic!("expected success");
+        };
+        assert_eq!(text.len(), len);
     }
 
     /// 文字列中の括弧・エスケープは深度に数えない。

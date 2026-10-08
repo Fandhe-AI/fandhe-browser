@@ -815,6 +815,7 @@ name = "fandhe-browser-mcp"
 version = "0.1.0"
 dependencies = [
  "rmcp",
+ "serde_json",
  "tokio",
 ]
 
