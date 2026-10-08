@@ -16,7 +16,8 @@
 //! # スタブ・暫定仕様について（REPAIR-3）
 //!
 //! - 登録ルート `POST /ai/plugins/register` と HTTP ステータス写像は [`crate::api`] に実装済み
-//!   （TASK-92.3・Issue #355）。一覧 `GET /ai/plugins` は未実装（TASK-92.4・Issue #356）
+//!   （TASK-92.3・Issue #355）。一覧 `GET /ai/plugins` も実装済み（TASK-92.4・Issue #356。
+//!   [`crate::api::router_with_state`]）
 //! - レジストリはインメモリでプロセス寿命のみ保持し、永続化しない。削除・上書き API は持たない
 //! - `permissions` は申告値の保持のみで、権限の付与・強制は行わない
 //! - `tcp` / `unix-socket` は列挙値として受理するだけで、接続処理は持たない
@@ -479,8 +480,8 @@ impl fmt::Debug for PluginRegistry {
 
 /// ai crate 固有の状態（core の共通状態 `Arc<AppState>` とプラグインレジストリ。`PLUG-2`・TASK-92.2・Issue #354）。
 ///
-/// `api::router` が構築した `Arc<AiState>` を登録ハンドラ（TASK-92.3）が使う。一覧ハンドラ（TASK-92.4）は
-/// 未実装。1 つの `AiState` は 1 つの `AppState`（= 1 プロファイル）に対応し、グローバル
+/// `api::router` が構築した `Arc<AiState>` を `api::router_with_state` の各ハンドラ
+/// （TASK-92.3 の登録・TASK-92.4 の一覧）が使う。1 つの `AiState` は 1 つの `AppState`（= 1 プロファイル）に対応し、グローバル
 /// 共有を持たないためプロファイル間でレジストリは共有されない（`PROF-1`）。`Clone` は実装せず
 /// `Arc` で共有する。
 pub struct AiState {
