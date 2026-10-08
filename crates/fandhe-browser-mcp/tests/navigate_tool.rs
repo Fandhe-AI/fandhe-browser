@@ -115,7 +115,7 @@ fn call_navigate(host_addr: &str, url: &str) -> (Value, bool) {
     (result, pinged)
 }
 
-/// PLUG-3 / TASK-94.3: tools/list に navigate が 1 件載り、url が必須。
+/// PLUG-3 / TASK-94.3: tools/list に navigate が載り、url が必須（snapshot と合わせて 2 件）。
 #[test]
 fn plug3_tools_list_exposes_navigate() {
     let input = format!(
@@ -148,9 +148,12 @@ fn plug3_tools_list_exposes_navigate() {
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
     let list = &msgs.iter().find(|m| m["id"] == 2).expect("list")["result"]["tools"];
-    assert_eq!(list.as_array().map(Vec::len), Some(1));
-    assert_eq!(list[0]["name"], "navigate");
-    assert_eq!(list[0]["inputSchema"]["required"], json!(["url"]));
+    assert_eq!(list.as_array().map(Vec::len), Some(2));
+    let nav = list
+        .as_array()
+        .and_then(|a| a.iter().find(|t| t["name"] == "navigate"))
+        .expect("navigate tool");
+    assert_eq!(nav["inputSchema"]["required"], json!(["url"]));
 }
 
 /// PLUG-3 / TASK-94.3: 正常系。POST /ai/navigate が送られ結果が反映される。

@@ -4,20 +4,21 @@
 //! `navigate` ツール（TASK-94.3）を公開する。navigate はホストの `POST /ai/navigate`
 //! （PoC-15 契約。本リポのホストには未実装のため実ホストでは 404 となり得る。REPAIR-3）を
 //! `host.rs` 経由で呼び、失敗は必ず `isError` で返す（成功を装わない）。
-//! 将来仕様: TASK-94.4 で snapshot を追加し、TASK-94.5 でホストへ自己申告する（PLUG-3・PLUG-4）。
+//! `snapshot` ツール（TASK-94.4・PLUG-4）はホストの `GET /ai/snapshot` の簡約スナップショットを
+//! text コンテンツ 1 件で返す（`structuredContent` との二重出力でトークンを増やさない）。
+//! 将来仕様: TASK-94.5 でホストへ自己申告する（PLUG-3）。
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
+    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
 };
 use rmcp::serde::Deserialize;
 use rmcp::serde_json::json;
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use crate::host;
 use crate::navigate::{self, NavigateOutcome};
+use crate::snapshot::{self, SnapshotOutcome};
 
 /// サーバーが採用する MCP プロトコル版。stdio は initialize ハンドシェイクを使うため、
 /// それを持つ 2025-11-25 に固定する（`LATEST` は将来 initialize を廃した版へ進み得る）。
@@ -26,34 +27,6 @@ pub(crate) const SERVER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2
 
 /// fandhe-browser の MCP 参照プラグイン本体。状態を持たない。
 pub(crate) struct FandheBrowserMcp;
-
-/// navigate の同時実行（実行中のブロッキング処理）数の上限。
-const MAX_CONCURRENT_NAVIGATE: usize = 4;
-/// 実行中のブロッキング navigate 数。待機キューは持たず、満杯なら即エラーで返す。
-static INFLIGHT_NAVIGATE: AtomicUsize = AtomicUsize::new(0);
-
-/// 同時実行枠。`spawn_blocking` のクロージャへ move し、ブロッキング処理が終わる
-/// （または未実行のまま破棄される）まで保持する。呼び出し側 future がキャンセルされても
-/// 枠は解放されない。
-struct NavigatePermit;
-
-impl NavigatePermit {
-    /// 枠を確保する。満杯なら `None`。
-    fn try_acquire() -> Option<Self> {
-        INFLIGHT_NAVIGATE
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < MAX_CONCURRENT_NAVIGATE).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| Self)
-    }
-}
-
-impl Drop for NavigatePermit {
-    fn drop(&mut self) {
-        INFLIGHT_NAVIGATE.fetch_sub(1, Ordering::AcqRel);
-    }
-}
 
 /// navigate ツールの入力。
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -86,12 +59,11 @@ impl FandheBrowserMcp {
             Err(e) => return error_result(&e.to_string(), json!({})),
         };
         let body = navigate::request_body(url);
-        // 投入前に同時実行枠を確保する。満杯なら待たせず即座に構造化エラーを返す。
-        let Some(permit) = NavigatePermit::try_acquire() else {
-            return error_result("too many concurrent navigate requests", json!({}));
+        let Some(permit) = host::try_acquire() else {
+            return error_result("too many concurrent host requests", json!({}));
         };
         // main は current_thread ランタイムのため、ブロッキング I/O は専用スレッドへ逃がす。
-        // permit はクロージャが所有し、処理完了まで（キャンセル後も）枠を保持する。
+        // 枠は blocking クロージャが終わるまで保持する（呼び出しが取り消されても解放しない）。
         let res = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             host::post_json(addr, "/ai/navigate", &body)
@@ -109,6 +81,46 @@ impl FandheBrowserMcp {
             })),
             NavigateOutcome::Failure { status, code } => error_result(
                 "host rejected navigation",
+                json!({ "status": status, "code": code }),
+            ),
+        }
+    }
+
+    /// ホストの簡約スナップショットを取得する。失敗・不完全な応答はすべて `isError`。
+    #[tool(
+        description = "Return the simplified accessibility snapshot of the most recently navigated page."
+    )]
+    async fn snapshot(&self) -> CallToolResult {
+        let addr = match host::resolve_from_env() {
+            Ok(a) => a,
+            Err(e) => return error_result(&e.to_string(), json!({})),
+        };
+        let Some(permit) = host::try_acquire() else {
+            return error_result("too many concurrent host requests", json!({}));
+        };
+        // 枠は blocking クロージャが終わるまで保持する（呼び出しが取り消されても解放しない）。
+        // 最大 4 MiB の JSON 解析・再直列化も同じクロージャで行い、current_thread ランタイムを塞がない。
+        let res = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let resp = host::get(
+                addr,
+                snapshot::SNAPSHOT_PATH,
+                snapshot::MAX_SNAPSHOT_RESPONSE_BYTES,
+            )?;
+            Ok::<_, host::HostError>(snapshot::interpret(resp.status, &resp.body))
+        })
+        .await;
+        let outcome = match res {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => return error_result(&e.to_string(), json!({})),
+            Err(_) => return error_result("snapshot task failed", json!({})),
+        };
+        match outcome {
+            SnapshotOutcome::Success { text } => {
+                CallToolResult::success(vec![ContentBlock::text(text)])
+            }
+            SnapshotOutcome::Failure { status, code } => error_result(
+                "host rejected snapshot",
                 json!({ "status": status, "code": code }),
             ),
         }
@@ -143,25 +155,23 @@ mod tests {
         assert_eq!(info["protocolVersion"], "2025-11-25");
     }
 
-    /// PLUG-3 / TASK-94.3: ツール一覧は navigate のみで、入力スキーマは url 必須。
+    /// PLUG-3 / TASK-94.3 / TASK-94.4: ツール一覧は navigate（url 必須）と snapshot（必須引数なし）。
     #[test]
-    fn plug3_tool_list_has_navigate_with_required_url() {
-        let tools = FandheBrowserMcp::tool_router().list_all();
-        assert_eq!(tools.len(), 1);
-        let tool = serde_json::to_value(&tools[0]).expect("serialize");
-        assert_eq!(tool["name"], "navigate");
-        assert_eq!(tool["inputSchema"]["required"], json!(["url"]));
-    }
-
-    /// PLUG-3 / TASK-94.3: 同時実行枠は上限で打ち切られ、解放後に再確保できる。
-    #[test]
-    fn plug3_navigate_permit_is_bounded_and_released() {
-        let held: Vec<_> = (0..MAX_CONCURRENT_NAVIGATE)
-            .map(|_| NavigatePermit::try_acquire().expect("permit"))
-            .collect();
-        assert!(NavigatePermit::try_acquire().is_none());
-        drop(held);
-        assert!(NavigatePermit::try_acquire().is_some());
+    fn plug3_tool_list_has_navigate_and_snapshot() {
+        let router = FandheBrowserMcp::tool_router();
+        let tools = serde_json::to_value(router.list_all()).expect("serialize");
+        let find = |name: &str| {
+            tools
+                .as_array()
+                .and_then(|a| a.iter().find(|t| t["name"] == name))
+                .cloned()
+        };
+        assert_eq!(tools.as_array().map(Vec::len), Some(2));
+        let nav = find("navigate").expect("navigate");
+        assert_eq!(nav["inputSchema"]["required"], json!(["url"]));
+        let snap = find("snapshot").expect("snapshot");
+        assert_eq!(snap["inputSchema"]["type"], "object");
+        assert!(snap["inputSchema"].get("required").is_none());
     }
 
     /// PLUG-3 / TASK-94.2: 採用するプロトコル版は 2025-11-25 に固定されている。
