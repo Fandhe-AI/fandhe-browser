@@ -112,6 +112,8 @@ pub enum FailureKind {
     BrowserProfileLoad,
     /// [`Error::BrowserProfileName`] に対応（TASK-100.3・Issue #267・`PLUG-8`）。
     BrowserProfileName,
+    /// [`Error::Dom`] に対応（TASK-107・Issue #772・`JS-5`/`JS-6`）。
+    Dom,
 }
 
 impl FailureKind {
@@ -135,6 +137,7 @@ impl FailureKind {
             FailureKind::Config => "config",
             FailureKind::BrowserProfileLoad => "browser_profile_load",
             FailureKind::BrowserProfileName => "browser_profile_name",
+            FailureKind::Dom => "dom",
         }
     }
 }
@@ -168,6 +171,7 @@ impl From<&Error> for FailureKind {
             Error::Config(_) => FailureKind::Config,
             Error::BrowserProfileLoad(_) => FailureKind::BrowserProfileLoad,
             Error::BrowserProfileName(_) => FailureKind::BrowserProfileName,
+            Error::Dom(_) => FailureKind::Dom,
         }
     }
 }

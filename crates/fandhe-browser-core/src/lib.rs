@@ -107,9 +107,10 @@ pub use cssom_profile::{
     BrowserProfile, GatedStyle, ProfileGate, profile_gate, profile_gate_from_name,
 };
 pub use dom::{
-    Ancestors, Attribute, Children, Descendants, Document, Node, NodeData, NodeId, QuirksMode,
+    Ancestors, Attribute, Children, Descendants, Document, DomLimits, Node, NodeData, NodeId,
+    QuirksMode,
 };
-pub use error::{Error, ParseError, Result};
+pub use error::{DomError, Error, NameKind, ParseError, Result};
 pub use fetch::{FetchOptions, FetchResponse, Fetcher};
 // js crate のワーカー入口をそのまま再エクスポートする（ラッパーを挟まない）。ラッパーで
 // マーカー設定時にも `None` を返すと fail-closed が崩れるため（security.md・`JS-2`・#513）。
