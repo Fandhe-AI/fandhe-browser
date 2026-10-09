@@ -15,6 +15,9 @@
 //!   `unwrap` / `expect` を使わない（coding-rust.md）。
 //! - 戻り値は真偽値にせず `Result` と将来拡張しやすい値（ノード ID・置換前の値）で
 //!   返す（REPAIR-4）。
+//! - 文書全体の保持バイト数（テキスト・名前・属性値の合計）も
+//!   [`DomLimits::max_total_bytes`] で制限する。arena から外したノードの内容も
+//!   保持分に数え、コピー前に `checked_add` で増分を検証する。
 //! - arena は縮まない。[`Document::remove_child`] で外したノードも
 //!   [`DomLimits::max_nodes`] に数えるため、作成と削除の繰り返しで上限をすり抜け
 //!   られない。
@@ -28,7 +31,6 @@
 //! - Document 直下に置ける要素を 1 個に限る制約、DocumentFragment の展開挿入、
 //!   名前空間付きの要素作成、`create_element("template")` 時の template contents
 //!   生成（`template_contents` は `None`）。
-//! - 属性の総バイト数の上限（個数と値 1 個あたりのみ制限する）。
 
 use html5ever::{LocalName, Namespace};
 
@@ -45,6 +47,8 @@ pub const DEFAULT_MAX_NAME_BYTES: usize = 1_024;
 pub const DEFAULT_MAX_TEXT_BYTES: usize = 1024 * 1024;
 /// 要素 1 個あたりの既定の属性個数上限（`JS-6`）。
 pub const DEFAULT_MAX_ATTRIBUTES_PER_ELEMENT: usize = 256;
+/// 文書全体で保持するテキスト・名前・属性値の既定の合計上限（64 MiB。`JS-6`）。
+pub const DEFAULT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 /// 変更 API の上限設定（`JS-6`）。`ParseOptions` と同じビルダー形式。
 ///
@@ -59,6 +63,7 @@ pub struct DomLimits {
     max_name_bytes: usize,
     max_text_bytes: usize,
     max_attributes_per_element: usize,
+    max_total_bytes: usize,
 }
 
 impl Default for DomLimits {
@@ -69,6 +74,7 @@ impl Default for DomLimits {
             max_name_bytes: DEFAULT_MAX_NAME_BYTES,
             max_text_bytes: DEFAULT_MAX_TEXT_BYTES,
             max_attributes_per_element: DEFAULT_MAX_ATTRIBUTES_PER_ELEMENT,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
         }
     }
 }
@@ -102,6 +108,18 @@ impl DomLimits {
     pub fn with_max_attributes_per_element(mut self, count: usize) -> Self {
         self.max_attributes_per_element = count;
         self
+    }
+
+    /// 文書全体の保持バイト数（テキスト・名前・属性値の合計。パース済みの内容と
+    /// 外したノードの内容を含む）の上限を設定する。
+    pub fn with_max_total_bytes(mut self, bytes: usize) -> Self {
+        self.max_total_bytes = bytes;
+        self
+    }
+
+    /// 文書全体の保持バイト数の上限。
+    pub fn max_total_bytes(&self) -> usize {
+        self.max_total_bytes
     }
 
     /// テキスト内容 1 個あたりの最大バイト長。
@@ -165,6 +183,30 @@ fn validate_name(
     Ok(())
 }
 
+/// arena 全体が保持する可変長データの合計バイト数を数える（`parse` が初期値に使う）。
+pub(crate) fn retained_bytes_of(nodes: &[Node]) -> usize {
+    nodes.iter().fold(0usize, |acc, n| {
+        let own = match &n.data {
+            NodeData::Document | NodeData::DocumentFragment => 0,
+            NodeData::Doctype {
+                name,
+                public_id,
+                system_id,
+            } => name.len() + public_id.len() + system_id.len(),
+            NodeData::Element { name, attrs, .. } => {
+                name.local.len()
+                    + attrs
+                        .iter()
+                        .map(|a| a.name.local.len() + a.value.len())
+                        .fold(0usize, usize::saturating_add)
+            }
+            NodeData::Text { contents } | NodeData::Comment { contents } => contents.len(),
+            NodeData::ProcessingInstruction { target, data } => target.len() + data.len(),
+        };
+        acc.saturating_add(own)
+    })
+}
+
 fn not_found(id: NodeId) -> Error {
     DomError::NodeNotFound { index: id.index() }.into()
 }
@@ -205,6 +247,25 @@ impl Document {
         Ok(())
     }
 
+    /// 保持バイト数が `add` バイト増えても上限内かを判定する（コピー前に呼ぶ）。
+    fn check_total_budget(&self, add: usize) -> Result<()> {
+        let limit = self.limits.max_total_bytes;
+        match self.retained_bytes.checked_add(add) {
+            Some(total) if total <= limit => Ok(()),
+            _ => Err(DomError::TotalBytesExceeded {
+                retained: self.retained_bytes,
+                requested: add,
+                limit,
+            }
+            .into()),
+        }
+    }
+
+    /// 検証済みの増減を保持バイト数へ反映する。
+    fn adjust_retained(&mut self, add: usize, sub: usize) {
+        self.retained_bytes = self.retained_bytes.saturating_add(add).saturating_sub(sub);
+    }
+
     /// 未接続の新規ノードを arena に追加する。作成系はすべてここを通る。
     fn push_node(&mut self, data: NodeData) -> Result<NodeId> {
         self.check_node_capacity()?;
@@ -223,30 +284,37 @@ impl Document {
     /// [`DomError::NodeLimitExceeded`]。
     pub fn create_element(&mut self, local_name: &str) -> Result<NodeId> {
         validate_name(NameKind::Element, local_name, self.limits.max_name_bytes)?;
+        self.check_total_budget(local_name.len())?;
         let lowered = local_name.to_ascii_lowercase();
         let name = QualName::new(
             None,
             Namespace::from(HTML_NAMESPACE_URI),
             LocalName::from(lowered.as_str()),
         );
-        self.push_node(NodeData::Element {
+        let id = self.push_node(NodeData::Element {
             name,
             attrs: Vec::new(),
             template_contents: None,
             mathml_annotation_xml_integration_point: false,
-        })
+        })?;
+        self.adjust_retained(local_name.len(), 0);
+        Ok(id)
     }
 
     /// 未接続のテキストノードを作成する（`JS-5` / `JS-6`）。
     ///
     /// 長さが [`DomLimits::max_text_bytes`] を超えれば [`DomError::TextTooLarge`]、
-    /// ノード数上限超過は [`DomError::NodeLimitExceeded`]。どちらもコピー前に判定する。
+    /// ノード数上限超過は [`DomError::NodeLimitExceeded`]、文書全体の保持バイト数が
+    /// 上限を超えれば [`DomError::TotalBytesExceeded`]。いずれもコピー前に判定する。
     pub fn create_text_node(&mut self, data: &str) -> Result<NodeId> {
         self.check_text_len(data.len())?;
         self.check_node_capacity()?;
-        self.push_node(NodeData::Text {
+        self.check_total_budget(data.len())?;
+        let id = self.push_node(NodeData::Text {
             contents: data.to_string(),
-        })
+        })?;
+        self.adjust_retained(data.len(), 0);
+        Ok(id)
     }
 
     /// `child` を `parent` の末尾に追加し、`child` を返す（`JS-5`）。
@@ -352,7 +420,8 @@ impl Document {
     ///
     /// 要素以外は [`DomError::InvalidNodeKind`]、名前の規則違反は
     /// [`DomError::InvalidName`]、値が上限超過なら [`DomError::AttributeValueTooLarge`]、新規属性で個数上限に
-    /// 達していれば [`DomError::TooManyAttributes`]（既存属性の置換は可能）。
+    /// 達していれば [`DomError::TooManyAttributes`]（既存属性の置換は可能）、文書全体の
+    /// 保持バイト数が上限を超えれば [`DomError::TotalBytesExceeded`]。
     /// HTML 要素の属性名は ASCII 小文字化し、照合は [`Document::attribute`] と同じ。
     pub fn set_attribute(
         &mut self,
@@ -375,6 +444,14 @@ impl Document {
             .element_name(element)
             .is_some_and(|n| &*n.ns == HTML_NAMESPACE_URI);
         let existing = self.attribute_index(element, name);
+        let old_len = existing
+            .and_then(|i| self.attributes(element).get(i))
+            .map(|a| a.value.len());
+        let added = match old_len {
+            Some(old) => value.len().saturating_sub(old),
+            None => name.len().saturating_add(value.len()),
+        };
+        self.check_total_budget(added)?;
         if existing.is_none() {
             let count = self.attributes(element).len();
             if count >= self.limits.max_attributes_per_element {
@@ -389,19 +466,29 @@ impl Document {
         } else {
             name.to_string()
         };
-        match self.node_mut(element)?.data {
+        let result = match self.node_mut(element)?.data {
             NodeData::Element { ref mut attrs, .. } => {
                 if let Some(attr) = existing.and_then(|i| attrs.get_mut(i)) {
-                    return Ok(Some(std::mem::replace(&mut attr.value, value.to_string())));
+                    Some(std::mem::replace(&mut attr.value, value.to_string()))
+                } else {
+                    attrs.push(Attribute {
+                        name: QualName::new(
+                            None,
+                            Namespace::from(""),
+                            LocalName::from(local.as_str()),
+                        ),
+                        value: value.to_string(),
+                    });
+                    None
                 }
-                attrs.push(Attribute {
-                    name: QualName::new(None, Namespace::from(""), LocalName::from(local.as_str())),
-                    value: value.to_string(),
-                });
-                Ok(None)
             }
-            _ => Err(kind_err("set_attribute", "node is not an element")),
+            _ => return Err(kind_err("set_attribute", "node is not an element")),
+        };
+        match &result {
+            Some(old) => self.adjust_retained(value.len(), old.len()),
+            None => self.adjust_retained(name.len() + value.len(), 0),
         }
+        Ok(result)
     }
 
     /// 要素 `element` の属性 `name` を削除し、削除した値を返す（`JS-5`）。
@@ -414,13 +501,17 @@ impl Document {
         }
         validate_name(NameKind::Attribute, name, self.limits.max_name_bytes)?;
         let existing = self.attribute_index(element, name);
-        match self.node_mut(element)?.data {
+        let removed = match self.node_mut(element)?.data {
             NodeData::Element { ref mut attrs, .. } => match existing {
-                Some(i) if i < attrs.len() => Ok(Some(attrs.remove(i).value)),
-                _ => Ok(None),
+                Some(i) if i < attrs.len() => Some(attrs.remove(i)),
+                _ => None,
             },
-            _ => Err(kind_err("remove_attribute", "node is not an element")),
-        }
+            _ => return Err(kind_err("remove_attribute", "node is not an element")),
+        };
+        Ok(removed.map(|a| {
+            self.adjust_retained(0, a.name.local.len() + a.value.len());
+            a.value
+        }))
     }
 
     /// `node` のテキスト内容を `text` に置き換える（`JS-5`）。
@@ -431,7 +522,8 @@ impl Document {
     /// （DOM 上は何もしない操作だが fail-closed を優先する。呼び出し側で無視扱いに変換できる）。
     /// ノード数上限に達していれば、子を外す前に [`DomError::NodeLimitExceeded`]。
     /// `text` が [`DomLimits::max_text_bytes`] を超えれば、何も変更せず
-    /// [`DomError::TextTooLarge`]。
+    /// [`DomError::TextTooLarge`]。文書全体の保持バイト数が上限を超える場合も
+    /// 何も変更せず [`DomError::TotalBytesExceeded`]（外した子の内容は保持分に残る）。
     pub fn set_text_content(&mut self, node: NodeId, text: &str) -> Result<Option<NodeId>> {
         self.require_node(node)?;
         self.check_text_len(text.len())?;
@@ -439,6 +531,8 @@ impl Document {
             NodeData::Element { .. } | NodeData::DocumentFragment => {
                 if !text.is_empty() {
                     self.check_node_capacity()?;
+                    // 外した子の内容も arena に残って保持分に数え続けるため、増分は全量。
+                    self.check_total_budget(text.len())?;
                 }
                 let old_children = std::mem::take(&mut self.node_mut(node)?.children);
                 for c in old_children {
@@ -452,23 +546,30 @@ impl Document {
                 let id = self.push_node(NodeData::Text {
                     contents: text.to_string(),
                 })?;
+                self.adjust_retained(text.len(), 0);
                 self.node_mut(node)?.children.push(id);
                 self.node_mut(id)?.parent = Some(node);
                 Ok(Some(id))
             }
-            NodeData::Text { .. } | NodeData::Comment { .. } => {
+            NodeData::Text { contents } | NodeData::Comment { contents } => {
+                let old_len = contents.len();
+                self.check_total_budget(text.len().saturating_sub(old_len))?;
                 if let NodeData::Text { contents } | NodeData::Comment { contents } =
                     &mut self.node_mut(node)?.data
                 {
                     *contents = text.to_string();
                 }
+                self.adjust_retained(text.len(), old_len);
                 Ok(None)
             }
-            NodeData::ProcessingInstruction { .. } => {
+            NodeData::ProcessingInstruction { data, .. } => {
+                let old_len = data.len();
+                self.check_total_budget(text.len().saturating_sub(old_len))?;
                 if let NodeData::ProcessingInstruction { data, .. } = &mut self.node_mut(node)?.data
                 {
                     *data = text.to_string();
                 }
+                self.adjust_retained(text.len(), old_len);
                 Ok(None)
             }
             _ => Err(kind_err(

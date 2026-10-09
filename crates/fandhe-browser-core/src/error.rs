@@ -355,6 +355,15 @@ pub enum DomError {
         /// 上限値。
         limit: usize,
     },
+    /// 文書全体の保持バイト数が `DomLimits::max_total_bytes` を超える変更要求。
+    TotalBytesExceeded {
+        /// 変更前に保持していたバイト数。
+        retained: usize,
+        /// 今回の変更で増えるバイト数。
+        requested: usize,
+        /// 上限値。
+        limit: usize,
+    },
 }
 
 impl fmt::Display for DomError {
@@ -394,6 +403,16 @@ impl fmt::Display for DomError {
             }
             DomError::TooManyAttributes { limit } => {
                 write!(f, "attribute count would exceed limit of {limit}")
+            }
+            DomError::TotalBytesExceeded {
+                retained,
+                requested,
+                limit,
+            } => {
+                write!(
+                    f,
+                    "retained {retained} bytes plus {requested} bytes exceeds document limit of {limit} bytes"
+                )
             }
         }
     }

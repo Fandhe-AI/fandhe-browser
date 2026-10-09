@@ -638,12 +638,17 @@ impl TreeSink for ArenaSink {
         }
 
         Ok(ParsedDocument {
-            document: Document {
-                nodes: self.nodes.into_inner(),
-                root: ROOT_ID,
-                quirks_mode: self.quirks_mode.get(),
-                recorder: self.recorder,
-                limits: crate::dom::DomLimits::default(),
+            document: {
+                let nodes = self.nodes.into_inner();
+                let retained_bytes = crate::dom::retained_bytes_of(&nodes);
+                Document {
+                    nodes,
+                    root: ROOT_ID,
+                    quirks_mode: self.quirks_mode.get(),
+                    recorder: self.recorder,
+                    limits: crate::dom::DomLimits::default(),
+                    retained_bytes,
+                }
             },
             diagnostics,
         })

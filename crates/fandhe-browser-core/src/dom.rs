@@ -155,9 +155,10 @@ pub type QuirksMode = html5ever::interface::QuirksMode;
 pub use html5ever::QualName;
 
 mod mutation;
+pub(crate) use mutation::retained_bytes_of;
 pub use mutation::{
     DEFAULT_DOM_MAX_NODES, DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES, DEFAULT_MAX_ATTRIBUTES_PER_ELEMENT,
-    DEFAULT_MAX_NAME_BYTES, DEFAULT_MAX_TEXT_BYTES, DomLimits,
+    DEFAULT_MAX_NAME_BYTES, DEFAULT_MAX_TEXT_BYTES, DEFAULT_MAX_TOTAL_BYTES, DomLimits,
 };
 
 use std::sync::Arc;
@@ -194,6 +195,10 @@ pub struct Document {
     pub(crate) recorder: RecorderHandle,
     /// 変更 API（`JS-5`/`JS-6`）の上限。`parse` は既定値で初期化する。
     pub(crate) limits: DomLimits,
+    /// arena が保持する可変長データ（テキスト・名前・属性値等）の合計バイト数
+    /// （`JS-6`）。外したノードも arena に残るため減らない。`parse` が初期値を
+    /// 数え、変更 API が増減させる。
+    pub(crate) retained_bytes: usize,
 }
 
 impl Document {
@@ -817,6 +822,7 @@ mod tests {
             quirks_mode: QuirksMode::NoQuirks,
             recorder: RecorderHandle::default(),
             limits: DomLimits::default(),
+            retained_bytes: 0,
         };
 
         let ancestor_count = doc.ancestors(NodeId::new(0)).count();
