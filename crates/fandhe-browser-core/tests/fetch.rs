@@ -225,6 +225,26 @@ async fn js_6_fetch_get_with_max_body_enforces_per_request_limit() {
     );
 }
 
+/// JS-6（TASK-109）: 上限超過の本文でも非 2xx ならステータスを保った空本文で返る
+/// （`src` 取得がステータスで失敗を判定できる）。
+#[tokio::test]
+async fn js_6_fetch_get_with_max_body_keeps_status_for_oversized_error_body() {
+    let port = spawn_loopback_server(|mut stream| {
+        drain_request_head(&mut stream);
+        let head = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(&vec![b'a'; 4096]);
+    });
+
+    let fetcher = Fetcher::new(loopback_allowed_options()).expect("Fetcher::new");
+    let response = fetcher
+        .get_with_max_body(&format!("http://127.0.0.1:{port}/"), 100)
+        .await
+        .expect("非 2xx は上限超過でも Ok");
+    assert_eq!(response.status(), 404);
+    assert!(response.body().is_empty());
+}
+
 /// CORE-1（#36）: `Content-Length` が無い（chunked でも無い）応答でも、
 /// ストリーミング読み込み中の逐次検査で `Error::ResponseTooLarge` を返す。
 #[tokio::test]

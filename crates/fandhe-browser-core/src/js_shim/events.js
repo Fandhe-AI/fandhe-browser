@@ -13,6 +13,8 @@
 //   後続のリスナーを続行する。
 // - `__fandheLifecycle` は non-writable / non-configurable で固定する（__dom と同じ作法）。
 //   再 install 時（同一 global への再評価）は窓口関数を残し、実体とリスナー状態だけを新しい評価のものへ差し替える。
+//   差し替え（setImpl）は core が shim 注入中だけ立てるフラグ（`lifecycleInstallOpen` op）が true のときだけ有効で、
+//   ページ JS が呼んでも dispatcher は変わらない。
 // - DOMContentLoaded は document → window の順（バブリングの近似）、load は window のみ。
 // - ES2015 の範囲に留める（V8 と boa で同一のソースを使うため）。
 //
@@ -123,7 +125,8 @@
             if (entry.once) {
                 remove(target, entry.type, entry.listener);
             }
-            event.currentTarget = currentTarget;
+            // currentTarget は getter 経由（ページ側が event を freeze しても代入で TypeError にならない）。
+            state.current = currentTarget;
             try {
                 if (typeof entry.listener === 'function') {
                     entry.listener.call(currentTarget, event);
@@ -138,11 +141,10 @@
 
     function dispatch(eventName) {
         try {
-            var state = { propagationStopped: false, immediateStopped: false };
+            var state = { propagationStopped: false, immediateStopped: false, current: null };
             var event = {
                 type: eventName,
                 target: eventName === 'load' ? global : global.document,
-                currentTarget: null,
                 bubbles: eventName === 'DOMContentLoaded',
                 cancelable: false,
                 defaultPrevented: false,
@@ -155,6 +157,13 @@
                     state.immediateStopped = true;
                 }
             };
+            Object.defineProperty(event, 'currentTarget', {
+                get: function () {
+                    return state.current;
+                },
+                enumerable: true,
+                configurable: false
+            });
             if (eventName === 'DOMContentLoaded') {
                 fire(documentTarget, global.document, event, eventName, state);
                 if (!state.propagationStopped) {
@@ -187,8 +196,18 @@
         };
         Object.defineProperty(entry, '__fandheImpl', { value: true });
         Object.defineProperty(entry, 'setImpl', {
+            // 差し替えは Rust 側が shim 注入中だけ立てるフラグが true のときに限る。
+            // ページ JS から呼んでも何も起きない（ディスパッチャーの無効化を防ぐ）。
             value: function (impl) {
-                currentImpl = impl;
+                var open = false;
+                try {
+                    open = nativeOp.call(bridge, 'lifecycleInstallOpen') === true;
+                } catch (e) {
+                    open = false;
+                }
+                if (open) {
+                    currentImpl = impl;
+                }
             }
         });
         Object.defineProperty(global, '__fandheLifecycle', {

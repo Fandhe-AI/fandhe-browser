@@ -74,6 +74,38 @@ fn spawn_script_server(body: &'static str) -> u16 {
     port
 }
 
+/// どのパスにも `status` と `body` を返す最小サーバー（非 2xx の検査用）。
+fn spawn_status_server(status: &'static str, body: String) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let body = body.clone();
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut buf = [0u8; 1024];
+                let mut data = Vec::new();
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(buf.get(..n).unwrap_or(&[]));
+                    if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            });
+        }
+    });
+    port
+}
+
 fn append(n: &str) -> String {
     format!(
         "<script>console.log('{n}');var p=document.createElement('p');p.textContent='{n}';\
@@ -253,6 +285,26 @@ pub fn run(engine: &str) {
             .iter()
             .all(|r| !matches!(r.outcome().as_str(), "src_fetch_failed" | "aborted"))
     );
+
+    eprintln!("case: JS-6 large non-2xx src body is a per-script failure, not a page abort");
+    let port = spawn_status_server("404 Not Found", "x".repeat(4096));
+    let small = PageRunOptions::default()
+        .with_max_src_script_bytes(256)
+        .with_max_total_script_bytes(512);
+    let html = format!(
+        "<body><script src=\"/missing.js\"></script>{}</body>",
+        append("after")
+    );
+    let out = run_page_at(
+        engine,
+        &html,
+        &format!("http://127.0.0.1:{port}/"),
+        &small,
+        &loopback,
+    );
+    assert_eq!(out.scripts()[0].outcome().as_str(), "src_fetch_failed");
+    assert!(out.abort().is_none(), "{:?}", out.abort());
+    assert!(out.html().contains("<p>after</p>"), "{}", out.html());
 
     eprintln!("case: JS-8 disallowed src is skipped and the page continues");
     let out = run_page(

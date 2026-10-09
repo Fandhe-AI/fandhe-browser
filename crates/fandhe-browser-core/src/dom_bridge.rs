@@ -322,6 +322,7 @@ enum DomOp {
     NavigatorUserAgent,
     ConsoleMessage,
     LifecycleListenerError,
+    LifecycleInstallOpen,
 }
 
 impl DomOp {
@@ -352,6 +353,7 @@ impl DomOp {
             "navigatorUserAgent" => Self::NavigatorUserAgent,
             "consoleMessage" => Self::ConsoleMessage,
             "lifecycleListenerError" => Self::LifecycleListenerError,
+            "lifecycleInstallOpen" => Self::LifecycleInstallOpen,
             _ => return None,
         })
     }
@@ -383,6 +385,7 @@ impl DomOp {
             Self::NavigatorUserAgent => "navigatorUserAgent",
             Self::ConsoleMessage => "consoleMessage",
             Self::LifecycleListenerError => "lifecycleListenerError",
+            Self::LifecycleInstallOpen => "lifecycleInstallOpen",
         }
     }
 
@@ -394,7 +397,8 @@ impl DomOp {
             | Self::Head
             | Self::ReadyState
             | Self::CurrentScript
-            | Self::NavigatorUserAgent => 0,
+            | Self::NavigatorUserAgent
+            | Self::LifecycleInstallOpen => 0,
             Self::CreateElement
             | Self::CreateTextNode
             | Self::GetElementById
@@ -450,6 +454,8 @@ struct PageState {
     diagnostics: BridgeDiagnostics,
     generation: u32,
     op_count: u64,
+    /// shim 注入中か（[`DomBridge::set_shim_installing`] だけが変更する）。
+    shim_installing: bool,
     op_limit_tripped: bool,
 }
 
@@ -725,6 +731,9 @@ fn execute(
             page.diagnostics.record_console(level, text);
             Ok(JsValue::Undefined)
         }
+        // shim 注入中（Rust 側が立てたフラグ）だけ true。events.js が再 install 時の
+        // ディスパッチャー差し替えを許すかの判定に使う（ページ JS はフラグを変えられない）。
+        DomOp::LifecycleInstallOpen => Ok(JsValue::Bool(page.shim_installing)),
         DomOp::LifecycleListenerError => {
             let name = string_arg(op, args, 1, limits)?;
             let message = string_arg(op, args, 2, limits)?;
@@ -910,6 +919,7 @@ impl DomBridge {
             diagnostics: BridgeDiagnostics::default(),
             generation,
             op_count: 0,
+            shim_installing: false,
             op_limit_tripped: false,
         });
         Ok(())
@@ -982,6 +992,16 @@ impl DomBridge {
         let mut guard = self.lock()?;
         let page = guard.page.as_mut().ok_or(DomBridgeError::Detached)?;
         Ok(std::mem::take(&mut page.diagnostics))
+    }
+
+    /// shim 注入中フラグを設定する。`JsRuntime::install_dom_shim*` が注入の前後で呼ぶ。
+    /// ページが未 attach なら何もしない。
+    pub(crate) fn set_shim_installing(&self, installing: bool) {
+        if let Ok(mut guard) = self.lock()
+            && let Some(page) = guard.page.as_mut()
+        {
+            page.shim_installing = installing;
+        }
     }
 
     /// 同じ内部状態を共有するブリッジか（`JsRuntime::install_dom_shim` が束縛済みの

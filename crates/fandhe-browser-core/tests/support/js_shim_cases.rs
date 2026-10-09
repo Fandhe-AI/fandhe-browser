@@ -444,4 +444,24 @@ fn window_cases(engine: &str) {
     );
     p.eval("__fandheLifecycle('DOMContentLoaded'); __fandheLifecycle('load'); 'fired'");
     check(&mut p, "log.join(',')", "new,load");
+
+    eprintln!("case: JS-4 a frozen event does not stop later listeners");
+    let mut p = setup(engine, None);
+    p.eval(
+        "globalThis.log = []; \
+         document.addEventListener('DOMContentLoaded', function (e) { Object.freeze(e); log.push('a'); }); \
+         window.addEventListener('DOMContentLoaded', function (e) { log.push('b:' + (e.currentTarget === window)); }); 'ok'",
+    );
+    p.eval("__fandheLifecycle('DOMContentLoaded'); 'fired'");
+    check(&mut p, "log.join(',')", "a,b:true");
+
+    eprintln!("case: JS-4 page cannot replace the lifecycle dispatcher");
+    let mut p = setup(engine, None);
+    p.eval(
+        "globalThis.log = []; \
+         document.addEventListener('DOMContentLoaded', function () { log.push('kept'); }); \
+         __fandheLifecycle.setImpl(function () { log.push('hijacked'); }); 'ok'",
+    );
+    p.eval("__fandheLifecycle('DOMContentLoaded'); 'fired'");
+    check(&mut p, "log.join(',')", "kept");
 }

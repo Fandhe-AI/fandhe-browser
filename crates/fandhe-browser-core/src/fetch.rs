@@ -661,7 +661,7 @@ impl Fetcher {
     pub async fn get(&self, url: &str) -> Result<FetchResponse> {
         // 無効時は Instant::now() も呼ばない。
         let start = self.options.recorder.is_enabled().then(Instant::now);
-        let result = self.get_inner(url, u64::MAX).await;
+        let result = self.get_inner(url, u64::MAX, false).await;
         if let Some(start) = start {
             self.options
                 .recorder
@@ -677,7 +677,7 @@ impl Fetcher {
     /// ページランナーの `src` 取得が呼ぶ）。超過時は [`Error::ResponseTooLarge`]（`limit` は実効上限）。
     pub async fn get_with_max_body(&self, url: &str, max_body_bytes: u64) -> Result<FetchResponse> {
         let start = self.options.recorder.is_enabled().then(Instant::now);
-        let result = self.get_inner(url, max_body_bytes).await;
+        let result = self.get_inner(url, max_body_bytes, true).await;
         if let Some(start) = start {
             self.options
                 .recorder
@@ -713,7 +713,17 @@ impl Fetcher {
     }
 
     /// [`Fetcher::get`] の本体（計装の内側。SSRF 検査の順序・内容は不変）。
-    async fn get_inner(&self, url: &str, max_body_bytes: u64) -> Result<FetchResponse> {
+    ///
+    /// `drop_oversized_error_body` が真のとき、2xx 以外の応答で本文が実効上限を超える場合は
+    /// `ResponseTooLarge` にせず、ステータスを保った空本文の応答を返す（呼び出し側が
+    /// ステータスで失敗を判定できるようにする。`src` 取得の非 2xx が本文サイズ超過に
+    /// 化けないための扱い。`JS-6`）。
+    async fn get_inner(
+        &self,
+        url: &str,
+        max_body_bytes: u64,
+        drop_oversized_error_body: bool,
+    ) -> Result<FetchResponse> {
         // 実効上限は設定値と呼び出し単位の上限の小さい方（受信中に強制する）。
         let limit = self.options.max_body_bytes.min(max_body_bytes);
         let parsed = Url::parse(url).map_err(|source| Error::InvalidInput {
@@ -731,6 +741,7 @@ impl Fetcher {
 
         let status = response.status().as_u16();
         reject_unresolved_disallowed_redirect(&response)?;
+        let drop_oversized = drop_oversized_error_body && !(200..300).contains(&status);
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -740,6 +751,17 @@ impl Fetcher {
         if let Some(content_length) = response.content_length()
             && content_length > limit
         {
+            if drop_oversized {
+                let mut url = response.url().clone();
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
+                return Ok(FetchResponse {
+                    status,
+                    final_url: url.to_string(),
+                    content_type,
+                    body: Vec::new(),
+                });
+            }
             return Err(Error::ResponseTooLarge { limit });
         }
 
@@ -782,6 +804,14 @@ impl Fetcher {
             let new_len_u64 =
                 u64::try_from(new_len).map_err(|_| Error::ResponseTooLarge { limit })?;
             if new_len_u64 > limit {
+                if drop_oversized {
+                    return Ok(FetchResponse {
+                        status,
+                        final_url: final_url.to_string(),
+                        content_type,
+                        body: Vec::new(),
+                    });
+                }
                 return Err(Error::ResponseTooLarge { limit });
             }
             body.extend_from_slice(&chunk);
