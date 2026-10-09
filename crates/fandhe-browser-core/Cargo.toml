@@ -111,3 +111,13 @@ path = "../../benches/cssom_profile_cost/control.rs"
 [[example]]
 name = "cssom_profile_cost_profiled"
 path = "../../benches/cssom_profile_cost/profiled.rs"
+
+# TASK-106・`JS-5`・Issue #771: b5・d2・d3 のページ内 JS が要求する Web API を実測する
+# 計測専用スパイク。DOM バインディングを注入しない素のエンジンで bundle を評価し、最初の
+# 未定義 API 名と例外分類を JSONL で出す。取得は `Fetcher` 経由のみ。ソースは harness 配下に
+# 置き、非同期取得に必要な dev-dependency の tokio を再利用するため core の example とした
+# （新規依存なし）。出荷物ではない。`test = true` で自己テストを `cargo test` に載せる。
+[[example]]
+name = "compat_js_api_spike"
+path = "../../harness/compat-practical/js_api_spike/main.rs"
+test = true
