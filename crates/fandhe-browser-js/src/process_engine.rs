@@ -93,7 +93,7 @@
 //! 保持し、子の再起動時に登録順どおり再登録する（`TASK-29.5b`・Issue #525）。
 //!
 //! `NativeFn` の実行時間は、評価開始時に 1 度だけ計算する期限
-//! （[`EVALUATE_RECV_TIMEOUT`]）に含まれる。この期限は
+//! （`options.timeout()` + [`EVALUATE_GRACE`]）に含まれる。この期限は
 //! [`super::engine_trait::NativeCallContext`] 経由で `NativeFn` 自身にも
 //! 渡す（協調的に打ち切れるようにするため）。加えて親は `NativeFn` を
 //! 専用スレッドで実行し、期限まで待ってから戻らなければ待機を打ち切り、
@@ -101,9 +101,9 @@
 //! 無視しても `evaluate_script` は期限内に戻る。codex レビュー指摘対応）。
 //! そのため親側の関数型は `Send` を要求する [`ParentNativeFn`] とする。
 //! 戻った時点で既に期限を過ぎていれば `NATIVE_RETURN` を送らずに `kill`
-//! する（`NativeFn` の実行が 2 秒
-//! （[`super::v8_engine::SCRIPT_EXECUTION_TIMEOUT`]）以上 3 秒
-//! （[`EVALUATE_RECV_TIMEOUT`]）未満であれば、返信を受けた子の watchdog が
+//! する（`NativeFn` の実行が
+//! `options.timeout()` 以上 `options.timeout()` + [`EVALUATE_GRACE`] 未満
+//! であれば、返信を受けた子の watchdog が
 //! 先に発火し `Error{kind=Timeout}` を返す）。
 //!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
@@ -163,7 +163,7 @@
 //! - `super::v8_engine` の `SCRIPT_EXECUTION_TIMEOUT` のドキュメント
 //!   コメントが記す既知の制限（「`v8::Script::compile` 自体は
 //!   `terminate_execution` では打ち切られない場合がある」）は、本モジュール
-//!   の `EVALUATE_RECV_TIMEOUT` による強制 `kill`（`WorkerHandle::drop`
+//!   の 親側期限（`options.timeout()` + `EVALUATE_GRACE`）による強制 `kill`（`WorkerHandle::drop`
 //!   と同じ「stdin を閉じる→待つ→kill→wait」の手順は踏まず、応答待ちの
 //!   `recv_timeout` が切れた時点で直ちに `kill` する）で解消される。
 //!   コンパイルがどれだけ長くかかっても、子プロセスごと強制終了できる
@@ -217,12 +217,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// ハンドシェイクと同じ値を使う。
 const REGISTER_ACK_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
 
-/// 1 回の評価（書き込み＋応答待ちの合計）に許す上限時間（設計書
-/// §3.3「`recv_timeout(2 秒+1 秒)`」）。子の実行時間監視
-/// （[`super::v8_engine::SCRIPT_EXECUTION_TIMEOUT`]）に、IPC 往復・OS
-/// スケジューリングの猶予として 1 秒を足す。定数同士の演算のため
-/// `const` のまま計算でき、`v8_engine.rs` 側の値が変わってもこの余裕
-/// （1 秒）は追随する。
+/// 1 回の評価（書き込み＋応答待ちの合計）の親側の期限は、
+/// 呼び出し側の `options.timeout()`（ワイヤ上の丸め済み値。
+/// [`worker_protocol::wire_timeout`]）にこの猶予を足した値とする（設計書
+/// §3.3。`TASK-109`・Issue #776）。子の実行時間監視（V8 の watchdog）に、
+/// IPC 往復・OS スケジューリングの猶予として 1 秒を足す。既定 options
+/// （[`super::v8_engine::SCRIPT_EXECUTION_TIMEOUT`] = 2 秒）では従来どおり
+/// 3 秒になる。
 ///
 /// **書き込みも含めた合計の期限である**（codex レビュー指摘 #503 P1
 /// 対応）: `Evaluate` フレームの書き込み完了を待つ時間と、応答を待つ
@@ -234,8 +235,7 @@ const REGISTER_ACK_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
 /// `NativeFn` の実行時間・`NATIVE_RETURN` の書き込み待ちのいずれも、この
 /// 1 つの期限を使い回す（`dispatch_native_call`・[`write_frame_with_deadline`]
 /// のドキュメントコメント参照。期限を延長する経路は無い）。
-const EVALUATE_RECV_TIMEOUT: Duration =
-    super::shared::SCRIPT_EXECUTION_TIMEOUT.saturating_add(Duration::from_secs(1));
+const EVALUATE_GRACE: Duration = Duration::from_secs(1);
 
 /// 子の `Drop` 時、stdin を閉じてから強制終了するまでに正常終了を待つ
 /// 上限時間（設計書 §3.2「1 秒だけ `try_wait` で待つ」）。
@@ -1436,15 +1436,18 @@ impl V8ProcessEngine {
     /// 検出していれば、その子は使わず [`JsEngineError::ResourceLimitExceeded`]
     /// を返し、次回の呼び出しで新しい子を起動し直す。
     ///
-    /// `_options` のタイムアウト・結果サイズは子プロセスへまだ渡さない
-    /// （Issue #776 で対応。親の期限は固定の `SCRIPT_EXECUTION_TIMEOUT`
-    /// 基準）。トレイト実装（`impl JsEngine`）がシグネチャを
-    /// そのまま揃えて委譲するために受け取る。
+    /// `options`（`JS-6`・`TASK-109`・Issue #776）は `Evaluate` フレームの
+    /// ヘッダとして子へ送る（タイムアウトは ms へ切り上げ、最大値でクランプ）。
+    /// 親の期限は `options.timeout()` に猶予 1 秒（`EVALUATE_GRACE`）を足した値。
+    /// V8 の子は watchdog が先に発火して Context を保持したまま `Timeout` を
+    /// 返す。boa の子には中断手段が無いため、期限を過ぎると親が子を `kill` し、
+    /// Context を破棄した `Timeout`（メッセージに「context was discarded」）を
+    /// 返す。結果文字列の UTF-8 バイト数上限は子（エンジン）と親の両方で検査する。
     #[doc(hidden)]
     pub fn evaluate_script(
         &mut self,
         script: &str,
-        _options: &EvaluateOptions,
+        options: &EvaluateOptions,
     ) -> Result<JsValue, JsEngineError> {
         // 外部入力（スクリプト文字列）の経路。子を起動する前に検査する
         // （coding-rust.md「外部入力」節）。codex レビュー指摘 #503 P1
@@ -1470,7 +1473,7 @@ impl V8ProcessEngine {
         let mut worker = self.take_live_worker()?;
 
         let (outcome, keep_worker) =
-            Self::send_evaluate_and_await(&mut worker, script, &self.native_fns);
+            Self::send_evaluate_and_await(&mut worker, script, options, &self.native_fns);
         if keep_worker {
             self.worker = Some(worker);
         }
@@ -1940,7 +1943,7 @@ impl V8ProcessEngine {
     /// 次回は新しい子を起動し直す）。
     ///
     /// 書き込み・応答待ち・`NativeCall` の往復すべてを、評価開始時に
-    /// 1 度だけ計算する期限（[`EVALUATE_RECV_TIMEOUT`]）で管理する（codex
+    /// 1 度だけ計算する期限（`options.timeout()` + [`EVALUATE_GRACE`]）で管理する（codex
     /// レビュー指摘 #503 P1「書き込みが呼び出しスレッドで同期的に実行され、
     /// パイプが満杯だと期限も kill も効かない」対応。書き込み自体は writer
     /// スレッドへ委譲し、このスレッドは `write_ack_rx` を期限付きで
@@ -1954,11 +1957,23 @@ impl V8ProcessEngine {
     fn send_evaluate_and_await(
         worker: &mut WorkerHandle,
         script: &str,
+        options: &EvaluateOptions,
         native_fns: &[NativeEntry],
     ) -> (Result<JsValue, JsEngineError>, bool) {
-        let deadline = Instant::now() + EVALUATE_RECV_TIMEOUT;
+        // 期限 = ワイヤ上のタイムアウト + 猶予。`wire_timeout` は上限
+        // （1 時間）でクランプ済みのため `checked_add` は通常失敗しないが、
+        // panic（release は abort）させないため失敗時は fail-closed で返す。
+        let budget = worker_protocol::wire_timeout(options).saturating_add(EVALUATE_GRACE);
+        let Some(deadline) = Instant::now().checked_add(budget) else {
+            return (
+                Err(JsEngineError::EvaluationFailed(
+                    "the evaluation timeout is too large to schedule".to_string(),
+                )),
+                true,
+            );
+        };
 
-        let payload = worker_protocol::encode_evaluate(script);
+        let payload = worker_protocol::encode_evaluate(script, options);
         if let Err(err) =
             write_frame_with_deadline(worker, tag::EVALUATE, &payload, deadline, "the script")
         {
@@ -2005,6 +2020,23 @@ impl V8ProcessEngine {
                                 ))
                             });
                             (Err(converted), false)
+                        }
+                        // 多層防御（`JS-6`）: 子は untrusted。結果文字列が
+                        // 上限を超えていれば、子の検査をすり抜けたものとして
+                        // 切り詰めずに失敗にする（子は生かす）。
+                        Ok((JsValue::String(s), consumed))
+                            if consumed == payload.len()
+                                && s.len() > options.max_result_bytes() =>
+                        {
+                            (
+                                Err(JsEngineError::EvaluationFailed(format!(
+                                    "string result of {} bytes exceeds the result size limit of \
+                                     {} bytes",
+                                    s.len(),
+                                    options.max_result_bytes()
+                                ))),
+                                true,
+                            )
                         }
                         Ok((value, consumed)) if consumed == payload.len() => (Ok(value), true),
                         Ok((_value, consumed)) => {

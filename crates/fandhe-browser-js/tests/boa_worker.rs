@@ -4,9 +4,11 @@
 //! 時間・メモリ使用量に上限が無い」への回答として、boa を V8 と同じ子プロセス
 //! 分離基盤の上で動かしたことを、実際の子プロセスで確認する。
 //!
-//! - 実時間: ループ 1 つあたりの反復上限（boa 内蔵）に当たらないループ反復上限に数えられない処理（正規表現のバックトラッキング）で
-//!   親の期限（3 秒）を超えさせ、`JsEngineError::Timeout` で呼び出しが戻ること
+//! - 実時間: 正規表現のバックトラッキング（既定 options）や `while (true) {}`
+//!   （`timeout = 200ms`。`JS-6`・`TASK-109`・Issue #776）が親の期限を超え、
+//!   `JsEngineError::Timeout` で呼び出しが戻ること
 //!   （子は kill され、次の評価は新しい子で動くこと）
+//! - 結果サイズ上限（`max_result_bytes`）が子プロセス境界を越えて効くこと
 //! - メモリ: 巨大確保が子の中で閉じ、ホストは
 //!   `JsEngineError::ResourceLimitExceeded` を受け取って生き続けること
 //! - 逆方向 RPC（ホスト関数の注入）が子を越えて往復すること
@@ -24,7 +26,7 @@ use fandhe_browser_js::{EngineKind, create_engine};
 #[cfg(not(target_os = "macos"))]
 use fandhe_browser_js::{EvaluateOptions, JsEngine, JsEngineError, JsValue};
 
-/// 親の評価期限（`process_engine::EVALUATE_RECV_TIMEOUT`。3 秒）に猶予を足した
+/// 親の評価期限（既定 options では `timeout` 2 秒 + 猶予 1 秒 = 3 秒）に猶予を足した
 /// 上限。これ以内に呼び出しが戻らなければ実時間の上限が効いていない。
 #[cfg(not(target_os = "macos"))]
 const TIMEOUT_TEST_DEADLINE: Duration = Duration::from_secs(15);
@@ -138,13 +140,42 @@ fn js_1_boa_oversized_buffer_is_rejected_without_killing_the_child() {
     );
 }
 
-/// ループ反復上限（boa 内蔵）は `ResourceLimitExceeded` としてワイヤを越えて伝わり、
-/// 子は kill されず Context も残ること（"context was discarded" を含まない）。
+/// `JS-6`・`TASK-109`・Issue #776: `timeout = 200ms` の `while (true) {}` が
+/// 2 秒未満で `Timeout` になる（boa は親が子を kill して強制するため Context は
+/// 破棄され、メッセージに "context was discarded" を含む）。次の評価は新しい
+/// 子で成功する。
 #[cfg(not(target_os = "macos"))]
-fn js_1_boa_loop_limit_is_reported_as_resource_limit_exceeded() {
+fn js_6_boa_infinite_loop_times_out_with_custom_timeout() {
     let mut engine = boa_engine();
     eval(&mut *engine, "var before = 11").expect("eval");
-    match eval(&mut *engine, "while (true) {}") {
+    let options = EvaluateOptions::default().with_timeout(Duration::from_millis(200));
+    let started = Instant::now();
+    let result = engine.evaluate_script("while (true) {}", &options);
+    let elapsed = started.elapsed();
+    match result {
+        Err(JsEngineError::Timeout(message)) => assert!(
+            message.contains("context was discarded"),
+            "the killed child must be reported as discarded, got {message:?}"
+        ),
+        other => panic!("expected Timeout, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the call must return within 2s, took {elapsed:?}"
+    );
+    assert_eq!(
+        eval(&mut *engine, "typeof before").expect("fresh context"),
+        JsValue::String("undefined".to_string())
+    );
+}
+
+/// `JS-1`: 再帰上限（boa 内蔵）は `ResourceLimitExceeded` としてワイヤを越えて
+/// 伝わり、子は kill されず Context も残ること（"context was discarded" を含まない）。
+#[cfg(not(target_os = "macos"))]
+fn js_1_boa_recursion_limit_is_reported_as_resource_limit_exceeded() {
+    let mut engine = boa_engine();
+    eval(&mut *engine, "var before = 11").expect("eval");
+    match eval(&mut *engine, "function f() { return f() + 1 } f()") {
         Err(JsEngineError::ResourceLimitExceeded(message)) => assert!(
             !message.contains("context was discarded"),
             "the child is alive, got {message:?}"
@@ -155,6 +186,32 @@ fn js_1_boa_loop_limit_is_reported_as_resource_limit_exceeded() {
         eval(&mut *engine, "before").expect("same context"),
         JsValue::Number(11.0)
     );
+}
+
+/// `JS-6`: 結果サイズ上限が子プロセス境界を越えて効く（16 バイトちょうどは成功、
+/// 17 は `EvaluationFailed`。既定 options の UTF-16 上限境界も従来どおり）。
+#[cfg(not(target_os = "macos"))]
+fn js_6_boa_result_size_limit_crosses_the_process_boundary() {
+    let mut engine = boa_engine();
+    let small = EvaluateOptions::default().with_max_result_bytes(16);
+    match engine
+        .evaluate_script("'a'.repeat(16)", &small)
+        .expect("16 bytes is within the limit")
+    {
+        JsValue::String(v) => assert_eq!(v.len(), 16),
+        other => panic!("unexpected value {other:?}"),
+    }
+    match engine.evaluate_script("'a'.repeat(17)", &small) {
+        Err(JsEngineError::EvaluationFailed(message)) => assert_eq!(
+            message,
+            "string result of 17 bytes exceeds the result size limit of 16 bytes"
+        ),
+        other => panic!("expected EvaluationFailed, got {other:?}"),
+    }
+    assert!(matches!(
+        eval(&mut *engine, "'a'.repeat(1048577)"),
+        Err(JsEngineError::EvaluationFailed(_))
+    ));
 }
 
 /// 逆方向 RPC: ホスト関数・DOM 風オブジェクトのメソッドが子を越えて呼べること。
@@ -255,8 +312,12 @@ fn main() -> ExitCode {
         js_1_boa_wall_clock_limit_kills_the_child_and_recovers();
         eprintln!("case: js_1_boa_oversized_buffer_is_rejected_without_killing_the_child");
         js_1_boa_oversized_buffer_is_rejected_without_killing_the_child();
-        eprintln!("case: js_1_boa_loop_limit_is_reported_as_resource_limit_exceeded");
-        js_1_boa_loop_limit_is_reported_as_resource_limit_exceeded();
+        eprintln!("case: js_6_boa_infinite_loop_times_out_with_custom_timeout");
+        js_6_boa_infinite_loop_times_out_with_custom_timeout();
+        eprintln!("case: js_1_boa_recursion_limit_is_reported_as_resource_limit_exceeded");
+        js_1_boa_recursion_limit_is_reported_as_resource_limit_exceeded();
+        eprintln!("case: js_6_boa_result_size_limit_crosses_the_process_boundary");
+        js_6_boa_result_size_limit_crosses_the_process_boundary();
         eprintln!("case: js_1_boa_memory_limit_is_enforced_by_the_child_boundary");
         js_1_boa_memory_limit_is_enforced_by_the_child_boundary();
         eprintln!("case: js_1_boa_buffer_limit_unit_is_bytes");
