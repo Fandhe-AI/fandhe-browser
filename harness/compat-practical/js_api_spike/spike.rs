@@ -177,6 +177,8 @@ pub enum FetchErrorClass {
     Timeout,
     Redirects,
     Network,
+    /// 総時間上限（`--total-timeout`）に達して取得を打ち切った。
+    TotalTimeLimit,
     Other,
 }
 
@@ -190,6 +192,7 @@ impl FetchErrorClass {
             FetchErrorClass::Timeout => "timeout",
             FetchErrorClass::Redirects => "redirects",
             FetchErrorClass::Network => "network",
+            FetchErrorClass::TotalTimeLimit => "total_time_limit",
             FetchErrorClass::Other => "other",
         }
     }
@@ -218,14 +221,55 @@ pub fn resolve_script_url(base: &Url, src: &str) -> Result<Url, FetchErrorClass>
     Ok(url)
 }
 
+/// 取得失敗。非 2xx では数値ステータスを保持する（page_status の 403 / 404 / 503 の区別用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchFailure {
+    pub class: FetchErrorClass,
+    pub status: Option<u16>,
+}
+
+impl FetchFailure {
+    pub fn of(class: FetchErrorClass) -> Self {
+        Self {
+            class,
+            status: None,
+        }
+    }
+}
+
 /// `Fetcher` 経由の取得（独自 HTTP クライアントは作らない）。
-/// 4xx/5xx は `Fetcher` が `Ok` で返すため、ここで `HttpStatus` に落とす。
-pub async fn fetch_script(fetcher: &Fetcher, url: &str) -> Result<FetchResponse, FetchErrorClass> {
-    let resp = fetcher.get(url).await.map_err(|e| map_fetch_error(&e))?;
+/// 4xx/5xx は `Fetcher` が `Ok` で返すため、ここで `HttpStatus`（数値ステータス付き）に落とす。
+pub async fn fetch_script(fetcher: &Fetcher, url: &str) -> Result<FetchResponse, FetchFailure> {
+    let resp = fetcher
+        .get(url)
+        .await
+        .map_err(|e| FetchFailure::of(map_fetch_error(&e)))?;
     if !(200..300).contains(&resp.status()) {
-        return Err(FetchErrorClass::HttpStatus);
+        return Err(FetchFailure {
+            class: FetchErrorClass::HttpStatus,
+            status: Some(resp.status()),
+        });
     }
     Ok(resp)
+}
+
+/// 文書基底 URL。最初に解決できる `<base href>` を `final_url` 基準で解決して返し、
+/// 無ければ（または全て不正なら）`final_url` をそのまま返す。
+/// `<template>` 内の base は `descendants` が含まないため除外される。
+pub fn document_base_url(doc: &Document, final_url: &Url) -> Url {
+    for id in doc.descendants(doc.root()) {
+        if doc.local_name(id) != Some("base")
+            || doc.namespace_url(id) != Some("http://www.w3.org/1999/xhtml")
+        {
+            continue;
+        }
+        if let Some(href) = doc.attribute(id, "href")
+            && let Ok(u) = final_url.join(href.trim())
+        {
+            return u;
+        }
+    }
+    final_url.clone()
 }
 
 /// scheme・host・port が同じか（external script の `same_origin` 用）。
@@ -538,6 +582,10 @@ pub struct SiteRecord {
     pub max_script_bytes: u64,
     pub missing_apis: Vec<String>,
     pub aborted: Option<&'static str>,
+    /// `--max-scripts` 超過で計測しなかった script 件数。
+    pub scripts_over_limit: u64,
+    /// 件数上限で打ち切った理由（`max_scripts`）。打ち切りが無ければ `None`。
+    pub truncated: Option<&'static str>,
     pub elapsed_ms: u64,
 }
 
@@ -579,6 +627,8 @@ impl SiteRecord {
             )
             .strs("missing_apis", &self.missing_apis)
             .opt_s("aborted", self.aborted)
+            .n("scripts_over_limit", self.scripts_over_limit)
+            .opt_s("truncated", self.truncated)
             .n("elapsed_ms", self.elapsed_ms)
             .line()
     }
@@ -689,7 +739,7 @@ mod tests {
                 "{u}"
             );
             assert_eq!(
-                fetch_script(&f, u).await.unwrap_err(),
+                fetch_script(&f, u).await.unwrap_err().class,
                 FetchErrorClass::DisallowedAddress,
                 "{u}"
             );
@@ -700,7 +750,10 @@ mod tests {
             Err(Error::DisallowedAddress { .. })
         ));
         assert_eq!(
-            fetch_script(&f, "file:///etc/passwd").await.unwrap_err(),
+            fetch_script(&f, "file:///etc/passwd")
+                .await
+                .unwrap_err()
+                .class,
             FetchErrorClass::DisallowedScheme
         );
     }
@@ -885,5 +938,39 @@ mod tests {
             (s.scripts_total, s.scripts_failed, s.scripts_evaluated),
             (5, 4, 1)
         );
+    }
+
+    #[test]
+    fn document_base_url_uses_first_valid_base_href() {
+        let page = base();
+        let d = doc(
+            r#"<head><base href="/assets/"><base href="/other/"><script src="bundle.js"></script></head>"#,
+        );
+        let b = document_base_url(&d, &page);
+        assert_eq!(b.as_str(), "https://example.test/assets/");
+        let u = resolve_script_url(&b, "bundle.js").expect("ok");
+        assert_eq!(u.as_str(), "https://example.test/assets/bundle.js");
+        assert!(!same_origin(
+            &u,
+            &Url::parse("https://other.test/").expect("url")
+        ));
+        assert_eq!(document_base_url(&doc("<p>x</p>"), &page), page);
+        let d2 = doc(r#"<base target="_blank"><base href="sub/">"#);
+        assert_eq!(
+            document_base_url(&d2, &page).as_str(),
+            "https://example.test/app/sub/"
+        );
+    }
+
+    #[test]
+    fn site_line_records_script_limit_truncation() {
+        let s = SiteRecord {
+            scripts_over_limit: 1,
+            truncated: Some("max_scripts"),
+            ..Default::default()
+        };
+        let line = s.to_json_line();
+        assert!(line.contains("\"scripts_over_limit\":1"), "{line}");
+        assert!(line.contains("\"truncated\":\"max_scripts\""), "{line}");
     }
 }

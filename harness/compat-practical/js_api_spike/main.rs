@@ -22,13 +22,15 @@ use std::io::Write;
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use fandhe_browser_core::FetchResponse;
 use fandhe_browser_core::config::Config;
 use fandhe_browser_core::js_stub::JsRuntime;
 use fandhe_browser_core::{FetchOptions, Fetcher, ParseOptions, parse_document};
 use reqwest::Url;
 use spike::{
-    Args, MAX_BODY_BYTES, MAX_EVAL_BYTES, ScriptEntry, ScriptRecord, ScriptSource, SiteRecord,
-    fetch_script, meta_line, outcome_of_error, resolve_script_url, same_origin, sanitize_debug,
+    Args, FetchErrorClass, FetchFailure, MAX_BODY_BYTES, MAX_EVAL_BYTES, ScriptEntry, ScriptRecord,
+    ScriptSource, SiteRecord, document_base_url, fetch_script, meta_line, outcome_of_error,
+    resolve_script_url, same_origin, sanitize_debug,
 };
 
 fn elapsed_ms(start: Instant) -> u64 {
@@ -79,16 +81,11 @@ fn run(args: Args) -> ExitCode {
     });
     drop(probe);
 
-    let options = FetchOptions::new()
-        .with_timeout(Duration::from_secs(args.fetch_timeout_sec))
-        .with_max_body_bytes(MAX_BODY_BYTES);
-    let fetcher = match Fetcher::new(options) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("error: cannot build fetcher: {e}");
-            return ExitCode::from(2);
-        }
-    };
+    // 構成の検証だけ（取得ごとの Fetcher は fetch_bounded が残り時間つきで作る）。
+    if let Err(e) = make_fetcher(Duration::from_secs(args.fetch_timeout_sec)) {
+        eprintln!("error: cannot build fetcher: {e}");
+        return ExitCode::from(2);
+    }
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -107,9 +104,7 @@ fn run(args: Args) -> ExitCode {
     let deadline = Instant::now() + Duration::from_secs(args.total_timeout_sec);
     for (id, url) in &args.targets {
         match make_runtime(&args) {
-            Ok(runtime) => rt.block_on(measure_site(
-                &args, &fetcher, runtime, id, url, deadline, &mut lines,
-            )),
+            Ok(runtime) => rt.block_on(measure_site(&args, runtime, id, url, deadline, &mut lines)),
             Err(m) => {
                 eprintln!("error: {m}");
                 return ExitCode::from(2);
@@ -123,6 +118,37 @@ fn run(args: Args) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn make_fetcher(timeout: Duration) -> Result<Fetcher, fandhe_browser_core::Error> {
+    Fetcher::new(
+        FetchOptions::new()
+            .with_timeout(timeout)
+            .with_max_body_bytes(MAX_BODY_BYTES),
+    )
+}
+
+/// 総時間上限の残り時間で打ち切る取得。tokio の time 機能（依存の feature 追加）に頼らず、
+/// 取得ごとの `Fetcher` のタイムアウトを `min(--fetch-timeout, 残り時間)` にして実現する。
+/// 期限切れ（取得前・取得中）は `TotalTimeLimit` として返す。
+async fn fetch_bounded(
+    args: &Args,
+    url: &str,
+    deadline: Instant,
+) -> Result<FetchResponse, FetchFailure> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(FetchFailure::of(FetchErrorClass::TotalTimeLimit));
+    }
+    let timeout = remaining.min(Duration::from_secs(args.fetch_timeout_sec));
+    let fetcher = make_fetcher(timeout).map_err(|_| FetchFailure::of(FetchErrorClass::Other))?;
+    fetch_script(&fetcher, url).await.map_err(|f| {
+        if f.class == FetchErrorClass::Timeout && Instant::now() >= deadline {
+            FetchFailure::of(FetchErrorClass::TotalTimeLimit)
+        } else {
+            f
+        }
+    })
 }
 
 /// 出力先へ書く。`--out` は一時ファイルへ書いてから rename で置換する。
@@ -146,7 +172,6 @@ fn write_output(args: &Args, lines: &[String]) -> std::io::Result<()> {
 /// 1 サイトを計測し、script 行とサイト行を `lines` へ積む。
 async fn measure_site(
     args: &Args,
-    fetcher: &Fetcher,
     mut runtime: JsRuntime,
     id: &str,
     page_url: &Url,
@@ -164,15 +189,11 @@ async fn measure_site(
         lines.push(site.to_json_line());
     };
 
-    if Instant::now() >= deadline {
-        site.page_error = Some("total_time_limit");
-        finish(site, lines);
-        return;
-    }
-    let page = match fetch_script(fetcher, page_url.as_str()).await {
+    let page = match fetch_bounded(args, page_url.as_str(), deadline).await {
         Ok(p) => p,
-        Err(class) => {
-            site.page_error = Some(class.as_str());
+        Err(f) => {
+            site.page_error = Some(f.class.as_str());
+            site.page_status = f.status;
             finish(site, lines);
             return;
         }
@@ -189,7 +210,12 @@ async fn measure_site(
             return;
         }
     };
-    let (entries, _over_limit) = spike::extract_scripts(&parsed.document, args.max_scripts);
+    let doc_base = document_base_url(&parsed.document, &final_url);
+    let (entries, over_limit) = spike::extract_scripts(&parsed.document, args.max_scripts);
+    if over_limit > 0 {
+        site.scripts_over_limit = over_limit as u64;
+        site.truncated = Some("max_scripts");
+    }
 
     for entry in entries {
         if site.aborted.is_some() {
@@ -200,11 +226,11 @@ async fn measure_site(
         } else {
             eval_entry(
                 args,
-                fetcher,
                 &mut runtime,
                 id,
                 &entry,
-                &final_url,
+                (&doc_base, &final_url),
+                deadline,
                 &mut site,
             )
             .await
@@ -228,11 +254,11 @@ fn skipped_record(id: &str, entry: &ScriptEntry, reason: &'static str) -> Script
 
 async fn eval_entry(
     args: &Args,
-    fetcher: &Fetcher,
     runtime: &mut JsRuntime,
     id: &str,
     entry: &ScriptEntry,
-    page_url: &Url,
+    (doc_base, page_url): (&Url, &Url),
+    deadline: Instant,
     site: &mut SiteRecord,
 ) -> ScriptRecord {
     if let Some(reason) = entry.skip {
@@ -248,7 +274,7 @@ async fn eval_entry(
         ScriptSource::Inline(text) => text,
         ScriptSource::External(src) => {
             rec.external = true;
-            let url = match resolve_script_url(page_url, src) {
+            let url = match resolve_script_url(doc_base, src) {
                 Ok(u) => u,
                 Err(class) => {
                     rec.outcome = "fetch_error";
@@ -258,15 +284,18 @@ async fn eval_entry(
             };
             rec.same_origin = Some(same_origin(&url, page_url));
             let fetch_start = Instant::now();
-            match fetch_script(fetcher, url.as_str()).await {
+            match fetch_bounded(args, url.as_str(), deadline).await {
                 Ok(resp) => {
                     external_body = resp.body_text_lossy();
                     rec.elapsed_ms = elapsed_ms(fetch_start);
                     &external_body
                 }
-                Err(class) => {
+                Err(f) if f.class == FetchErrorClass::TotalTimeLimit => {
+                    return skipped_record(id, entry, "total_time_limit");
+                }
+                Err(f) => {
                     rec.outcome = "fetch_error";
-                    rec.fetch_error = Some(class.as_str());
+                    rec.fetch_error = Some(f.class.as_str());
                     return rec;
                 }
             }
@@ -276,6 +305,10 @@ async fn eval_entry(
     if source.len() > MAX_EVAL_BYTES {
         rec.outcome = "too_large";
         return rec;
+    }
+    // 取得中に期限を過ぎた場合は評価を始めない。
+    if Instant::now() >= deadline {
+        return skipped_record(id, entry, "total_time_limit");
     }
     let eval_start = Instant::now();
     let result = runtime.execute(source);

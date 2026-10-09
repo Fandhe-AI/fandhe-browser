@@ -195,7 +195,7 @@ target/release/examples/compat_js_api_spike \
 
 - 引数: `--target <id>=<https url>`（複数可・id は tasks.json と同じ規則）/ `--engine v8|boa` / `--out <path>` / `--max-scripts 1..=256`（既定 64）/ `--fetch-timeout 1..=60`（既定 15）/ `--total-timeout 1..=3600`（既定 600）/ `--debug-messages`（切り詰めた生メッセージを stderr のみへ）
 - 終了コード: 0 = 記録完了（評価失敗はデータ）/ 1 = 書き込み失敗 / 2 = 入力・使用エラー（エンジン未同梱を含む）
-- 出力（`schema_version: 1`）: `meta` 1 行、script ごとの `script` 行（`outcome`・`error_kind`・`message_class`・`missing_api`・`fetch_error` など）、サイトごとの `site` 行（`first_missing_api`・`missing_apis`・件数・バイト数）
+- 出力（`schema_version: 1`）: `meta` 1 行、script ごとの `script` 行（`outcome`・`error_kind`・`message_class`・`missing_api`・`fetch_error` など）、サイトごとの `site` 行（`first_missing_api`・`missing_apis`・件数・バイト数）。`site` 行の `scripts_over_limit` / `truncated`（`--max-scripts` 超過で未計測の件数と理由）、非 2xx のページは `page_error=http_status` と数値の `page_status` を併記。相対 script URL は最初の有効な `<base href>` 基準で解決し、`--total-timeout` は取得中・評価前にも適用（超過は `skip_reason=total_time_limit`）
 - script の URL・本文・ページテキスト・Cookie・ヘッダ・生の例外メッセージは出力しない（external は同一オリジンかの真偽値のみ）
 
 ### 制約（REPAIR-3）
