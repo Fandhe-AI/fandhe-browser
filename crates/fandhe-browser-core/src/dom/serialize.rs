@@ -207,10 +207,10 @@ impl Document {
     /// `REPAIR-9` の計装対象で、recorder が有効なら 1 回につき 1 件（操作種別 `Dom`）を記録する。
     pub fn serialize_node(&self, node: NodeId, scope: SerializeScope) -> Result<SerializeResult> {
         if !self.recorder.is_enabled() {
-            return self.serialize_inner(node, scope);
+            return self.serialize_inner(node, scope, None);
         }
         let start = Instant::now();
-        let result = self.serialize_inner(node, scope);
+        let result = self.serialize_inner(node, scope, None);
         let outcome = match &result {
             Ok(_) => OperationOutcome::Success,
             Err(Error::Dom(DomError::NodeNotFound { .. })) => OperationOutcome::Failure {
@@ -225,13 +225,33 @@ impl Document {
         result
     }
 
+    /// `serialize_node` と同じだが、出力上限を `max_bytes` でさらに絞る（文書側上限との小さい方）。
+    ///
+    /// DOM ブリッジ（`JS-6`・TASK-108）が 1 応答の上限を出力バッファの確保前に効かせるために使う。
+    /// 超過は [`DomError::SerializedOutputTooLarge`]（部分出力は返さない）。計装は行わない
+    /// （ブリッジ 1 操作 = 公開 API 1 件の件数契約を `serialize_node` と揃えるため
+    /// 呼び出し側が必要なら別途記録する）。
+    pub(crate) fn serialize_node_limited(
+        &self,
+        node: NodeId,
+        scope: SerializeScope,
+        max_bytes: usize,
+    ) -> Result<SerializeResult> {
+        self.serialize_inner(node, scope, Some(max_bytes))
+    }
+
     /// 子の列挙元（`<template>` は template contents の子）。
     fn serialize_children(&self, id: NodeId) -> &[NodeId] {
         let target = self.template_contents(id).unwrap_or(id);
         self.node(target).map_or(&[], |n| n.children.as_slice())
     }
 
-    fn serialize_inner(&self, node: NodeId, scope: SerializeScope) -> Result<SerializeResult> {
+    fn serialize_inner(
+        &self,
+        node: NodeId,
+        scope: SerializeScope,
+        extra_limit: Option<usize>,
+    ) -> Result<SerializeResult> {
         if self.node(node).is_none() {
             return Err(DomError::NodeNotFound {
                 index: node.index(),
@@ -240,7 +260,9 @@ impl Document {
         }
         let mut out = Out {
             buf: String::new(),
-            limit: self.limits.max_serialized_bytes(),
+            limit: extra_limit.map_or(self.limits.max_serialized_bytes(), |m| {
+                m.min(self.limits.max_serialized_bytes())
+            }),
         };
         let mut stack: Vec<Frame> = Vec::new();
         match scope {

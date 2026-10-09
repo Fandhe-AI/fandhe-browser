@@ -659,6 +659,33 @@ fn query_selector_inner(
     Ok(None)
 }
 
+/// `query_selector_all_str` と同じだが、一致が `max_results` 件を超えた時点で走査を打ち切り
+/// `Ok(None)` を返す（結果 `Vec` を上限超過分まで確保しない。DOM ブリッジの応答上限用。
+/// `JS-6`・TASK-108）。計装は `query_selector_all_str` と同じく 1 回 1 件。
+pub(crate) fn query_selector_all_str_bounded(
+    document: &Document,
+    scope: NodeId,
+    selector: &str,
+    max_results: usize,
+) -> Result<Option<Vec<NodeId>>> {
+    instrumented(document, || {
+        let selectors = parse_selector_list(selector)?;
+        let mut cache = MatchCache::new();
+        let mut results = Vec::new();
+        for candidate in document.descendants(scope) {
+            if document.is_element(candidate)
+                && list_matches(document, candidate, &selectors, &mut cache)?
+            {
+                if results.len() >= max_results {
+                    return Ok(None);
+                }
+                results.push(candidate);
+            }
+        }
+        Ok(Some(results))
+    })
+}
+
 /// `selector` 文字列を [`parse_selector_list`] で解析してから
 /// [`query_selector_all`] を呼ぶ薄いラッパー。
 ///

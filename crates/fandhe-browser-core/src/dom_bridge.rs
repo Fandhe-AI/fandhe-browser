@@ -41,10 +41,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use fandhe_browser_js::{JsEngine, JsEngineError, JsValue, NativeFn};
 
+use crate::dom::NodeData;
 use crate::dom::{Document, NodeId, SerializeScope};
+use crate::error::DomError;
 use crate::error::Error;
-use crate::query::{query_selector, query_selector_all_str, query_selector_str};
-use crate::selector::SelectorList;
+use crate::query::{query_selector_all_str_bounded, query_selector_str};
 
 /// JS に公開するグローバルオブジェクト名（`__dom.op(...)` の `__dom`）。
 pub const DOM_BRIDGE_OBJECT_NAME: &str = "__dom";
@@ -534,6 +535,33 @@ fn check_response_len(len: usize, limits: &DomBridgeLimits) -> Result<(), DomBri
     Ok(())
 }
 
+/// `getTextContent` の結果バイト数を、文字列を連結せずに数えて応答上限と比較する。
+/// 上限を超えた時点で走査を打ち切る。対象外のノード種別（`text_content` が `None`）は何もしない。
+fn check_text_content_len(
+    document: &Document,
+    node: NodeId,
+    limits: &DomBridgeLimits,
+) -> Result<(), DomBridgeError> {
+    let mut total: usize = 0;
+    let mut add = |n: usize| -> Result<(), DomBridgeError> {
+        total = total.saturating_add(n);
+        check_response_len(total, limits)
+    };
+    match document.node_data(node) {
+        Some(NodeData::Text { contents } | NodeData::Comment { contents }) => add(contents.len()),
+        Some(NodeData::ProcessingInstruction { data, .. }) => add(data.len()),
+        Some(NodeData::Element { .. } | NodeData::DocumentFragment) => {
+            for d in document.descendants(node) {
+                if let Some(NodeData::Text { contents }) = document.node_data(d) {
+                    add(contents.len())?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn string_response(s: String, limits: &DomBridgeLimits) -> Result<JsValue, DomBridgeError> {
     check_response_len(s.len(), limits)?;
     Ok(JsValue::String(s))
@@ -567,8 +595,12 @@ fn execute(
             if id.is_empty() {
                 return Ok(JsValue::Null);
             }
-            let list = SelectorList::id_only(id.to_owned());
-            let found = query_selector(&page.document, page.document.root(), &list)?;
+            // CSS の ID セレクタ照合は Quirks 文書で大文字小文字を無視するため使わず、
+            // DOM の `getElementById` どおり id 属性値を完全一致で文書順に探す。
+            let doc = &page.document;
+            let found = doc
+                .descendants(doc.root())
+                .find(|&n| doc.attribute(n, "id") == Some(id));
             page.encode_optional(found)
         }
         DomOp::QuerySelector => {
@@ -580,7 +612,17 @@ fn execute(
         DomOp::QuerySelectorAll => {
             let scope = page.node_arg(op, args, 1)?;
             let selector = string_arg(op, args, 2, limits)?;
-            let found = query_selector_all_str(&page.document, scope, selector)?;
+            // 各 ID は 1 桁以上 + 区切り 1 バイトのため、N 件の応答は 2N-1 バイト以上。
+            // 応答上限から導く件数を超えた時点で走査を打ち切り、全件 Vec を確保しない。
+            let max_results = limits.max_response_bytes / 2 + 1;
+            let Some(found) =
+                query_selector_all_str_bounded(&page.document, scope, selector, max_results)?
+            else {
+                return Err(DomBridgeError::ResponseTooLarge {
+                    len: limits.max_response_bytes.saturating_add(1),
+                    limit: limits.max_response_bytes,
+                });
+            };
             let mut out = String::new();
             for (i, id) in found.into_iter().enumerate() {
                 if i > 0 {
@@ -628,6 +670,8 @@ fn execute(
         }
         DomOp::GetTextContent => {
             let node = page.node_arg(op, args, 1)?;
+            // 連結結果を確保する前に、テキスト総バイト数が応答上限内かを非確保で検査する。
+            check_text_content_len(&page.document, node, limits)?;
             match page.document.text_content(node) {
                 Some(text) => string_response(text, limits),
                 None => Ok(JsValue::Null),
@@ -642,10 +686,23 @@ fn execute(
         }
         DomOp::GetInnerHtml => {
             let node = page.node_arg(op, args, 1)?;
-            let html = page
-                .document
-                .serialize_node(node, SerializeScope::ChildrenOnly)?
-                .into_html();
+            let html = match page.document.serialize_node_limited(
+                node,
+                SerializeScope::ChildrenOnly,
+                limits.max_response_bytes,
+            ) {
+                Ok(result) => result.into_html(),
+                // 出力バッファが応答上限に達した時点で打ち切られている。
+                Err(Error::Dom(DomError::SerializedOutputTooLarge { limit }))
+                    if limit == limits.max_response_bytes =>
+                {
+                    return Err(DomBridgeError::ResponseTooLarge {
+                        len: limit.saturating_add(1),
+                        limit,
+                    });
+                }
+                Err(e) => return Err(e.into()),
+            };
             string_response(html, limits)
         }
         // 将来仕様: core パーサーでフラグメントを解析して子を置換する（JS-5・TASK-107 残り）。
@@ -964,8 +1021,7 @@ mod tests {
         let a = num(call(&b, &[s("getElementById"), s("a")]));
         call(&b, &[s("setAttribute"), n(a), s("class"), s("k")]).expect("set");
         let doc = b.detach().expect("lock").expect("attached");
-        let list = SelectorList::id_only("a".to_owned());
-        let found = query_selector(&doc, doc.root(), &list)
+        let found = query_selector_str(&doc, doc.root(), "#a")
             .expect("q")
             .expect("found");
         assert_eq!(doc.attribute(found, "class"), Some("k"));
@@ -1133,5 +1189,41 @@ mod tests {
             num(call(&b, &[s("querySelector"), n(root), s("body")])),
             body
         );
+    }
+    #[test]
+    fn js_5_get_element_by_id_is_case_sensitive_even_in_quirks_mode() {
+        // DOCTYPE なし = Quirks。CSS の ID 照合は大文字小文字を無視するが getElementById は完全一致。
+        let b = DomBridge::new(DomBridgeLimits::default());
+        b.attach(parse("<div id=\"A\">x</div><p id=\"a\">y</p>"))
+            .expect("attach");
+        let lower = num(call(&b, &[s("getElementById"), s("a")]));
+        let upper = num(call(&b, &[s("getElementById"), s("A")]));
+        assert_ne!(lower, upper);
+        let got = call(&b, &[s("getTextContent"), n(lower)]).expect("text");
+        assert_eq!(got, s("y"));
+        assert_eq!(
+            call(&b, &[s("getElementById"), s("b")]).expect("none"),
+            JsValue::Null
+        );
+    }
+
+    #[test]
+    fn js_6_oversized_responses_are_rejected_before_allocation() {
+        let b = bridge_with(DomBridgeLimits::default().with_max_response_bytes(8));
+        let root = num(call(&b, &[s("documentRoot")]));
+        let e = call(&b, &[s("getTextContent"), n(root)]);
+        // Document は None（Null）。要素側は上限内/超過を既存テストで確認済み。
+        assert_eq!(e.expect("null"), JsValue::Null);
+        let a = num(call(&b, &[s("getElementById"), s("a")]));
+        call(&b, &[s("setTextContent"), n(a), s("123456789")]).expect("set");
+        let body = num(call(&b, &[s("body")]));
+        assert!(matches!(
+            call(&b, &[s("getTextContent"), n(body)]).expect_err("超過"),
+            DomBridgeError::ResponseTooLarge { limit: 8, .. }
+        ));
+        assert!(matches!(
+            call(&b, &[s("getInnerHTML"), n(body)]).expect_err("超過"),
+            DomBridgeError::ResponseTooLarge { limit: 8, .. }
+        ));
     }
 }
