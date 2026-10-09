@@ -248,7 +248,13 @@ impl Document {
     }
 
     /// 保持バイト数が `add` バイト増えても上限内かを判定する（コピー前に呼ぶ）。
+    ///
+    /// `add == 0`（保持量が増えない操作）は、`set_limits` で上限を下げた後や
+    /// パース結果が上限超の場合でも許可する。縮小・回復の書き込みを拒否しないため。
     fn check_total_budget(&self, add: usize) -> Result<()> {
+        if add == 0 {
+            return Ok(());
+        }
         let limit = self.limits.max_total_bytes;
         match self.retained_bytes.checked_add(add) {
             Some(total) if total <= limit => Ok(()),
@@ -385,6 +391,9 @@ impl Document {
             && let Some(old) = self.nodes.get_mut(old_parent.index())
         {
             old.children.retain(|c| *c != child);
+            // 確保容量が残ると、移動を繰り返すだけで保持メモリがノード数の二乗規模に
+            // 膨らむため、外した分の容量は即座に解放する。
+            old.children.shrink_to_fit();
         }
         let parent_mut = self.node_mut(parent)?;
         let pos = reference.and_then(|r| parent_mut.children.iter().position(|c| *c == r));
@@ -410,7 +419,10 @@ impl Document {
             }
             .into());
         }
-        self.node_mut(parent)?.children.retain(|c| *c != child);
+        let parent_mut = self.node_mut(parent)?;
+        parent_mut.children.retain(|c| *c != child);
+        // 外した分の確保容量を解放する（移動時と同じ理由）。
+        parent_mut.children.shrink_to_fit();
         self.node_mut(child)?.parent = None;
         Ok(child)
     }
@@ -987,5 +999,63 @@ mod tests {
         assert_eq!(doc.set_text_content(d, "").expect("clear"), None);
         doc.set_limits(doc.limits().with_max_nodes(limit + 1));
         assert!(doc.create_element("p").is_ok());
+    }
+    /// JS-6 (TASK-107): 総量上限を超えた状態でも、保持量が増えない縮小・同量書き込みは成功する。
+    #[test]
+    fn js_6_shrinking_writes_allowed_when_over_total_limit() {
+        let mut doc = parse("<body><div id=d>x</div></body>");
+        let d = query_selector_str(&doc, doc.root(), "#d").unwrap().unwrap();
+        let t = doc
+            .create_text_node("abcdefghijklmnopqrst")
+            .expect("20 bytes");
+        doc.set_attribute(d, "title", "0123456789").expect("attr");
+        // 現在の保持量より小さい上限へ下げる。
+        let over = doc.retained_bytes - 10;
+        doc.set_limits(doc.limits().with_max_total_bytes(over));
+        // 増加は拒否される。
+        assert!(matches!(
+            dom_err(doc.set_text_content(t, "abcdefghijklmnopqrstu")),
+            DomError::TotalBytesExceeded { .. }
+        ));
+        let before = doc.retained_bytes;
+        // 縮小は成功し、保持量が 20 バイト減る。
+        assert_eq!(doc.set_text_content(t, "").expect("shrink"), None);
+        assert_eq!(doc.retained_bytes, before - 20);
+        // 同じ長さの属性値の置換も成功する。
+        assert_eq!(
+            doc.set_attribute(d, "title", "9876543210")
+                .expect("same len"),
+            Some("0123456789".to_string())
+        );
+        assert_eq!(doc.retained_bytes, before - 20);
+    }
+
+    /// JS-6 (TASK-107): 子を外した親の children は確保容量を残さない（容量の二乗蓄積防止）。
+    #[test]
+    fn js_6_children_capacity_released_on_move_and_remove() {
+        let mut doc = parse("<body></body>");
+        let b = body(&doc);
+        let a = doc.create_element("div").unwrap();
+        let c = doc.create_element("div").unwrap();
+        doc.append_child(b, a).unwrap();
+        doc.append_child(b, c).unwrap();
+        let mut kids = Vec::new();
+        for _ in 0..64 {
+            let k = doc.create_element("i").unwrap();
+            doc.append_child(a, k).unwrap();
+            kids.push(k);
+        }
+        for k in &kids {
+            doc.append_child(c, *k).unwrap();
+        }
+        let a_node = doc.nodes.get(a.index()).unwrap();
+        assert_eq!(a_node.children.len(), 0);
+        assert_eq!(a_node.children.capacity(), 0);
+        for k in &kids[..63] {
+            doc.remove_child(c, *k).unwrap();
+        }
+        let c_node = doc.nodes.get(c.index()).unwrap();
+        assert_eq!(c_node.children.len(), 1);
+        assert_eq!(c_node.children.capacity(), 1);
     }
 }
