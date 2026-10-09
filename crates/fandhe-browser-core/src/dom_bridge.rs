@@ -31,11 +31,16 @@
 //! 操作回数は検証より前に数え、超過後は同じページで拒否し続ける。ノード数・属性値長等は
 //! `Document` 側の [`crate::DomLimits`] が効く。
 //!
+//! # ページの状態（`readyState` / `currentScript`）
+//!
+//! `document.readyState` と `document.currentScript` は shim（JS 側）ではなく本ブリッジが
+//! Rust 側で保持する。ページ JS から書き換えられないようにするためで、ページ実行ランナー
+//! （TASK-109）が [`DomBridge::set_ready_state`]・[`DomBridge::set_current_script`] で更新し、
+//! shim は引数 0 個の `readyState` / `currentScript` 操作で読む。
+//!
 //! # 未実装（REPAIR-3）
 //!
-//! - `setInnerHTML` は [`DomBridgeError::Unsupported`] を返す。フラグメントパースは
-//!   TASK-107 の残りで、実装後に core パーサー経由で対応する（`JS-5`）。
-//! - #771 のスパイクで判明する追加操作は後続 issue で足す。
+//! - #771 のスパイクで判明する追加操作（`getAttribute`・`parentNode` 等）は後続 issue で足す。
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -278,6 +283,8 @@ enum DomOp {
     SetTextContent,
     GetInnerHtml,
     SetInnerHtml,
+    ReadyState,
+    CurrentScript,
 }
 
 impl DomOp {
@@ -300,6 +307,8 @@ impl DomOp {
             "setTextContent" => Self::SetTextContent,
             "getInnerHTML" => Self::GetInnerHtml,
             "setInnerHTML" => Self::SetInnerHtml,
+            "readyState" => Self::ReadyState,
+            "currentScript" => Self::CurrentScript,
             _ => return None,
         })
     }
@@ -323,13 +332,19 @@ impl DomOp {
             Self::SetTextContent => "setTextContent",
             Self::GetInnerHtml => "getInnerHTML",
             Self::SetInnerHtml => "setInnerHTML",
+            Self::ReadyState => "readyState",
+            Self::CurrentScript => "currentScript",
         }
     }
 
     /// 操作名を除いた引数の個数。
     fn arity(self) -> usize {
         match self {
-            Self::DocumentRoot | Self::Body | Self::Head => 0,
+            Self::DocumentRoot
+            | Self::Body
+            | Self::Head
+            | Self::ReadyState
+            | Self::CurrentScript => 0,
             Self::CreateElement
             | Self::CreateTextNode
             | Self::GetElementById
@@ -347,9 +362,34 @@ impl DomOp {
     }
 }
 
+/// `document.readyState` の値（`JS-5`。ページ実行ランナーが [`DomBridge::set_ready_state`] で進める）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DocumentReadyState {
+    /// `"loading"`（`attach` 直後の既定）。
+    Loading,
+    /// `"interactive"`。
+    Interactive,
+    /// `"complete"`。
+    Complete,
+}
+
+impl DocumentReadyState {
+    /// JS に見せる文字列。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Loading => "loading",
+            Self::Interactive => "interactive",
+            Self::Complete => "complete",
+        }
+    }
+}
+
 /// 取り付け中のページの状態。
 struct PageState {
     document: Document,
+    ready_state: DocumentReadyState,
+    current_script: Option<NodeId>,
     generation: u32,
     op_count: u64,
     op_limit_tripped: bool,
@@ -576,6 +616,8 @@ fn execute(
 ) -> Result<JsValue, DomBridgeError> {
     match op {
         DomOp::DocumentRoot => page.encode(page.document.root()),
+        DomOp::ReadyState => Ok(JsValue::String(page.ready_state.as_str().to_owned())),
+        DomOp::CurrentScript => page.encode_optional(page.current_script),
         DomOp::Body => page.encode_optional(page.html_child("body")),
         DomOp::Head => page.encode_optional(page.html_child("head")),
         DomOp::CreateElement => {
@@ -705,10 +747,15 @@ fn execute(
             };
             string_response(html, limits)
         }
-        // 将来仕様: core パーサーでフラグメントを解析して子を置換する（JS-5・TASK-107 残り）。
-        DomOp::SetInnerHtml => Err(DomBridgeError::Unsupported {
-            operation: op.name(),
-        }),
+        DomOp::SetInnerHtml => {
+            let node = page.node_arg(op, args, 1)?;
+            let html = string_arg(op, args, 2, limits)?;
+            page.ensure_index_space()?;
+            // 解析は core のフラグメントパーサー（JS 側にパーサーは持たない）。
+            // ノード数・保持バイト数の上限は Document 側（DomLimits）が効き、Err では木は不変。
+            page.document.set_inner_html(node, html)?;
+            Ok(JsValue::Undefined)
+        }
     }
 }
 
@@ -739,6 +786,8 @@ impl DomBridge {
         state.next_generation = generation.saturating_add(1);
         state.page = Some(PageState {
             document,
+            ready_state: DocumentReadyState::Loading,
+            current_script: None,
             generation,
             op_count: 0,
             op_limit_tripped: false,
@@ -764,6 +813,39 @@ impl DomBridge {
         let state = self.lock()?;
         let page = state.page.as_ref().ok_or(DomBridgeError::Detached)?;
         encode_node_id(page.generation, id)
+    }
+
+    /// `document.readyState` を更新する（ページ実行ランナー用。TASK-109）。
+    /// 未取り付けなら [`DomBridgeError::Detached`]。
+    pub fn set_ready_state(&self, state: DocumentReadyState) -> Result<(), DomBridgeError> {
+        let mut guard = self.lock()?;
+        let page = guard.page.as_mut().ok_or(DomBridgeError::Detached)?;
+        page.ready_state = state;
+        Ok(())
+    }
+
+    /// `document.currentScript` を更新する（実行中の `<script>` 要素。`None` で `null`）。
+    /// 未取り付けなら [`DomBridgeError::Detached`]、`script` が現在の文書に無ければ
+    /// [`DomBridgeError::InvalidNodeId`]。
+    pub fn set_current_script(&self, script: Option<NodeId>) -> Result<(), DomBridgeError> {
+        let mut guard = self.lock()?;
+        let page = guard.page.as_mut().ok_or(DomBridgeError::Detached)?;
+        if let Some(id) = script
+            && id.index() >= page.document.node_count()
+        {
+            return Err(DomBridgeError::InvalidNodeId {
+                index: 0,
+                reason: "no such node",
+            });
+        }
+        page.current_script = script;
+        Ok(())
+    }
+
+    /// 同じ内部状態を共有するブリッジか（`JsRuntime::install_dom_shim` が束縛済みの
+    /// ブリッジと一致するかの判定に使う）。
+    pub(crate) fn same_instance(&self, other: &DomBridge) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
     }
 
     /// `__dom.op` の本体。`args[0]` が操作名、残りが操作の引数。エンジン無しでも呼べる。
@@ -953,13 +1035,102 @@ mod tests {
     }
 
     #[test]
-    fn js_5_set_inner_html_is_unsupported() {
+    fn js_5_set_inner_html_replaces_children() {
         let b = bridge();
         let a = num(call(&b, &[s("getElementById"), s("a")]));
+        let r = call(
+            &b,
+            &[s("setInnerHTML"), n(a), s("<p id=\"x\">t</p><b>u</b>")],
+        );
+        assert!(matches!(r, Ok(JsValue::Undefined)));
+        let html = b
+            .with_document(|d| d.serialize_html().expect("serialize").into_html())
+            .expect("lock")
+            .expect("attached");
+        assert_eq!(
+            html,
+            "<html><head></head><body><div id=\"a\"><p id=\"x\">t</p><b>u</b></div></body></html>"
+        );
+    }
+
+    #[test]
+    fn js_6_set_inner_html_over_node_limit_keeps_dom_unchanged() {
+        let b = bridge();
+        b.with_document(|_| ()).expect("lock");
+        let a = num(call(&b, &[s("getElementById"), s("a")]));
+        // 上限を現在のノード数ちょうどに絞る。
+        {
+            let mut guard = b.state.lock().expect("lock");
+            let page = guard.page.as_mut().expect("attached");
+            let count = page.document.node_count();
+            page.document
+                .set_limits(crate::DomLimits::default().with_max_nodes(count + 1));
+        }
         let before = snapshot(&b);
-        let err = call(&b, &[s("setInnerHTML"), n(a), s("<p>")]).expect_err("未実装");
-        assert!(matches!(err, DomBridgeError::Unsupported { .. }));
+        let err = call(&b, &[s("setInnerHTML"), n(a), s("<i></i><i></i>")]).expect_err("上限超過");
+        assert!(matches!(
+            err,
+            DomBridgeError::Core(Error::Dom(DomError::NodeLimitExceeded { .. }))
+        ));
         assert_eq!(snapshot(&b), before);
+    }
+
+    #[test]
+    fn js_5_set_inner_html_rejects_non_string() {
+        let b = bridge();
+        let a = num(call(&b, &[s("getElementById"), s("a")]));
+        let err = call(&b, &[s("setInnerHTML"), n(a), n(1.0)]).expect_err("型違反");
+        assert!(matches!(err, DomBridgeError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn js_5_ready_state_and_current_script_are_rust_side_state() {
+        let b = bridge();
+        assert_eq!(
+            call(&b, &[s("readyState")]).expect("ok"),
+            JsValue::String("loading".to_owned())
+        );
+        b.set_ready_state(DocumentReadyState::Complete)
+            .expect("set");
+        assert_eq!(
+            call(&b, &[s("readyState")]).expect("ok"),
+            JsValue::String("complete".to_owned())
+        );
+        assert_eq!(call(&b, &[s("currentScript")]).expect("ok"), JsValue::Null);
+        let a = num(call(&b, &[s("getElementById"), s("a")]));
+        let a_id = NodeId::new((a as u64 & 0xFFFF_FFFF) as usize);
+        b.set_current_script(Some(a_id)).expect("set");
+        assert_eq!(num(call(&b, &[s("currentScript")])), a);
+        b.set_current_script(None).expect("set");
+        assert_eq!(call(&b, &[s("currentScript")]).expect("ok"), JsValue::Null);
+        let err = b
+            .set_current_script(Some(NodeId::new(1_000_000)))
+            .expect_err("範囲外");
+        assert!(matches!(err, DomBridgeError::InvalidNodeId { .. }));
+        // 引数を渡すと arity 違反。
+        let err = call(&b, &[s("readyState"), n(1.0)]).expect_err("arity");
+        assert!(matches!(err, DomBridgeError::ArityMismatch { .. }));
+    }
+
+    #[test]
+    fn js_5_ready_state_resets_on_attach_and_setters_require_page() {
+        let b = bridge();
+        b.set_ready_state(DocumentReadyState::Interactive)
+            .expect("set");
+        b.attach(parse(HTML)).expect("attach");
+        assert_eq!(
+            call(&b, &[s("readyState")]).expect("ok"),
+            JsValue::String("loading".to_owned())
+        );
+        b.detach().expect("detach");
+        assert!(matches!(
+            b.set_ready_state(DocumentReadyState::Complete),
+            Err(DomBridgeError::Detached)
+        ));
+        assert!(matches!(
+            b.set_current_script(None),
+            Err(DomBridgeError::Detached)
+        ));
     }
 
     #[test]

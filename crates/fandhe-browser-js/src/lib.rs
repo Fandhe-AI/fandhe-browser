@@ -215,6 +215,26 @@ pub fn run_js_worker_if_requested() -> Option<std::process::ExitCode> {
 
 #[cfg(any(feature = "js-v8", feature = "js-boa"))]
 fn dispatch_worker(marker_value: &str) -> std::process::ExitCode {
+    // boa は評価・shim の install で再帰が深くなる。Windows のメインスレッドは
+    // 既定 1MB のためスタックオーバーフローする（TASK-108・Issue #778）。
+    // boa には V8 のような「Platform 初期化スレッド」制約が無いので、
+    // 明示的に大きいスタックのスレッドで実行する。V8 は上記不変条件のため
+    // 呼び出しスレッドのまま実行する。
+    if std::env::var(worker::ENGINE_ENV_VAR).as_deref() == Ok("boa") {
+        const BOA_WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
+        let marker = marker_value.to_owned();
+        let spawned = std::thread::Builder::new()
+            .name("boa-worker".into())
+            .stack_size(BOA_WORKER_STACK_BYTES)
+            .spawn(move || worker::worker_main(&marker));
+        return match spawned {
+            Ok(handle) => handle.join().unwrap_or(std::process::ExitCode::FAILURE),
+            Err(err) => {
+                eprintln!("fandhe-browser-js worker: failed to spawn boa worker thread: {err}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     worker::worker_main(marker_value)
 }
 

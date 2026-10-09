@@ -156,8 +156,10 @@ pub type QuirksMode = html5ever::interface::QuirksMode;
 /// 型をここで再エクスポートする。
 pub use html5ever::QualName;
 
+mod fragment;
 mod mutation;
 mod serialize;
+pub use fragment::InnerHtmlOutcome;
 pub(crate) use mutation::retained_bytes_of;
 pub use mutation::{
     DEFAULT_DOM_MAX_NODES, DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES, DEFAULT_MAX_ATTRIBUTES_PER_ELEMENT,
