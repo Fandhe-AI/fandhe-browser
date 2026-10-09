@@ -1,21 +1,77 @@
-//! V8 / boa 共通のページスクリプトランナーのテストケース（TASK-109・Issue #780・
-//! ビヘイビア `JS-4` / `JS-6`）。
+//! V8 / boa 共通のページスクリプトランナーのテストケース（TASK-109・Issue #780・#781・
+//! ビヘイビア `JS-4` / `JS-6` / `JS-8`）。
 //!
 //! `tests/page_runner_v8.rs` と `tests/page_runner_boa.rs` が `#[path]` で取り込む。
 //! 期待値は具体値で書く。
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::time::Duration;
 
+use fandhe_browser_core::fetch::{FetchOptions, Fetcher};
 use fandhe_browser_core::{
-    AbortKind, Config, PageRunInput, PageRunOptions, PageRunOutput, ScriptOutcome, WallTimeScope,
-    run_page_scripts,
+    AbortKind, Config, LifecycleOutcome, PageRunInput, PageRunOptions, PageRunOutput,
+    ScriptOutcome, WallTimeScope, run_page_scripts,
 };
 
 const BASE: &str = "https://example.test/";
 
 fn run_page(engine: &str, html: &str, options: &PageRunOptions) -> PageRunOutput {
+    let fetcher = Fetcher::new(FetchOptions::new()).expect("fetcher");
+    run_page_at(engine, html, BASE, options, &fetcher)
+}
+
+/// 現スレッドの tokio ランタイム上で async のランナーを実行する（`Fetcher` は tokio 前提）。
+fn run_page_at(
+    engine: &str,
+    html: &str,
+    base: &str,
+    options: &PageRunOptions,
+    fetcher: &Fetcher,
+) -> PageRunOutput {
     let cfg = Config::from_toml_str(&format!("[js]\nengine = \"{engine}\"\n")).expect("config");
-    run_page_scripts(&PageRunInput::new(html, BASE), cfg.js(), options).expect("run")
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(run_page_scripts(
+        &PageRunInput::new(html, base),
+        cfg.js(),
+        options,
+        fetcher,
+    ))
+    .expect("run")
+}
+
+/// `127.0.0.1` の空きポートで、どのパスにも `body` を返す最小サーバーを起動する。
+fn spawn_script_server(body: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut buf = [0u8; 1024];
+                let mut data = Vec::new();
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(buf.get(..n).unwrap_or(&[]));
+                    if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            });
+        }
+    });
+    port
 }
 
 fn append(n: &str) -> String {
@@ -164,6 +220,105 @@ pub fn run(engine: &str) {
         out.html().contains(&format!("data-cs=\"{body}\"")),
         "{}",
         out.html()
+    );
+
+    eprintln!("case: JS-4 src from local server runs in document order");
+    let port = spawn_script_server(
+        "var p=document.createElement('p');p.textContent='ext';document.body.appendChild(p)",
+    );
+    let loopback =
+        Fetcher::new(FetchOptions::new().with_allow_private_network_access(true)).expect("fetcher");
+    let html = format!(
+        "<body>{}<script src=\"/app.js\"></script>{}</body>",
+        append("1"),
+        append("3")
+    );
+    let out = run_page_at(
+        engine,
+        &html,
+        &format!("http://127.0.0.1:{port}/"),
+        &opts,
+        &loopback,
+    );
+    assert!(
+        out.html().contains("<p>1</p><p>ext</p><p>3</p>"),
+        "{}",
+        out.html()
+    );
+    // 3 件とも取得・実行まで進んでいる（src 取得失敗でも打ち切りでもない）。
+    assert_eq!(out.scripts().len(), 3);
+    assert!(out.abort().is_none());
+    assert!(
+        out.scripts()
+            .iter()
+            .all(|r| !matches!(r.outcome().as_str(), "src_fetch_failed" | "aborted"))
+    );
+
+    eprintln!("case: JS-8 disallowed src is skipped and the page continues");
+    let out = run_page(
+        engine,
+        &format!(
+            "<body><script src=\"file:///etc/passwd\"></script><script src=\"http://127.0.0.1:1/a.js\"></script>{}</body>",
+            append("2")
+        ),
+        &opts,
+    );
+    assert!(out.html().contains("<p>2</p>"), "{}", out.html());
+    assert_eq!(out.scripts()[0].outcome().as_str(), "src_fetch_failed");
+    assert_eq!(out.scripts()[1].outcome().as_str(), "src_fetch_failed");
+
+    eprintln!("case: JS-4 DOMContentLoaded / load order and readyState");
+    let html = "<body><script>\
+        console.log('s:' + document.readyState);\
+        document.addEventListener('DOMContentLoaded', function () { console.log('dcl:' + document.readyState); });\
+        window.addEventListener('load', function () { console.log('load:' + document.readyState); });\
+        </script></body>";
+    let out = run_page(engine, html, &opts);
+    let texts: Vec<&str> = out
+        .bridge_diagnostics()
+        .console_messages
+        .iter()
+        .map(|m| m.text.as_str())
+        .collect();
+    assert_eq!(texts, vec!["s:loading", "dcl:interactive", "load:complete"]);
+    assert_eq!(
+        out.lifecycle()
+            .iter()
+            .map(|l| l.outcome().clone())
+            .collect::<Vec<_>>(),
+        vec![LifecycleOutcome::Dispatched, LifecycleOutcome::Dispatched]
+    );
+
+    eprintln!("case: JS-4 a throwing listener does not stop the next one");
+    let html = "<body><script>\
+        document.addEventListener('DOMContentLoaded', function () { throw new Error('bad'); });\
+        window.addEventListener('DOMContentLoaded', function () { console.log('second'); });\
+        </script></body>";
+    let out = run_page(engine, html, &opts);
+    assert_eq!(
+        out.bridge_diagnostics()
+            .console_messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["second"]
+    );
+    let errs = &out.bridge_diagnostics().listener_errors;
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].message.contains("bad"), "{}", errs[0].message);
+
+    eprintln!("case: JS-6 lifecycle is not fired after an abort");
+    let o = PageRunOptions::default().with_script_wall_time(Duration::from_millis(200));
+    let out = run_page(
+        engine,
+        "<body><script>window.addEventListener('load', function () { document.body.setAttribute('data-l', '1'); }); while(true){}</script></body>",
+        &o,
+    );
+    assert!(!out.html().contains("data-l=\""), "{}", out.html());
+    assert!(
+        out.lifecycle()
+            .iter()
+            .all(|l| l.outcome().as_str() == "not_fired")
     );
 
     #[cfg(target_os = "linux")]

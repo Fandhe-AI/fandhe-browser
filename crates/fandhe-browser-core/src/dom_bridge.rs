@@ -69,12 +69,13 @@ use crate::query::{query_selector_all_str_bounded, query_selector_str};
 
 mod page_env;
 pub use page_env::{
-    BridgeDiagnostics, ConsoleLevel, ConsoleMessage, IgnoredLocationChange, LocationChangeKind,
-    LocationMember, MAX_BRIDGE_DIAGNOSTICS, MAX_CONSOLE_MESSAGE_BYTES, MAX_LOCATION_URL_BYTES,
+    BridgeDiagnostics, ConsoleLevel, ConsoleMessage, IgnoredLocationChange, LifecycleEvent,
+    ListenerError, LocationChangeKind, LocationMember, MAX_BRIDGE_DIAGNOSTICS,
+    MAX_CONSOLE_MESSAGE_BYTES, MAX_LOCATION_URL_BYTES,
 };
-use page_env::{apply_hash, location_member, parse_location};
+use page_env::{apply_hash, location_member};
 // ページランナーが例外メッセージの切り詰めに再利用する（#780）。
-pub(crate) use page_env::truncate_utf8;
+pub(crate) use page_env::{parse_location, truncate_utf8};
 
 /// JS に公開するグローバルオブジェクト名（`__dom.op(...)` の `__dom`）。
 pub const DOM_BRIDGE_OBJECT_NAME: &str = "__dom";
@@ -320,6 +321,7 @@ enum DomOp {
     IgnoreLocationChange,
     NavigatorUserAgent,
     ConsoleMessage,
+    LifecycleListenerError,
 }
 
 impl DomOp {
@@ -349,6 +351,7 @@ impl DomOp {
             "ignoreLocationChange" => Self::IgnoreLocationChange,
             "navigatorUserAgent" => Self::NavigatorUserAgent,
             "consoleMessage" => Self::ConsoleMessage,
+            "lifecycleListenerError" => Self::LifecycleListenerError,
             _ => return None,
         })
     }
@@ -379,6 +382,7 @@ impl DomOp {
             Self::IgnoreLocationChange => "ignoreLocationChange",
             Self::NavigatorUserAgent => "navigatorUserAgent",
             Self::ConsoleMessage => "consoleMessage",
+            Self::LifecycleListenerError => "lifecycleListenerError",
         }
     }
 
@@ -406,7 +410,8 @@ impl DomOp {
             | Self::SetTextContent
             | Self::SetInnerHtml
             | Self::IgnoreLocationChange
-            | Self::ConsoleMessage => 2,
+            | Self::ConsoleMessage
+            | Self::LifecycleListenerError => 2,
             Self::InsertBefore | Self::SetAttribute => 3,
         }
     }
@@ -718,6 +723,17 @@ fn execute(
                 expected: "a known console level",
             })?;
             page.diagnostics.record_console(level, text);
+            Ok(JsValue::Undefined)
+        }
+        DomOp::LifecycleListenerError => {
+            let name = string_arg(op, args, 1, limits)?;
+            let message = string_arg(op, args, 2, limits)?;
+            let event = LifecycleEvent::parse(name).ok_or(DomBridgeError::TypeMismatch {
+                operation: op.name(),
+                index: 1,
+                expected: "a known lifecycle event",
+            })?;
+            page.diagnostics.record_listener_error(event, message);
             Ok(JsValue::Undefined)
         }
         DomOp::Body => page.encode_optional(page.html_child("body")),
@@ -1692,6 +1708,19 @@ mod tests {
             b.take_diagnostics().expect("empty"),
             BridgeDiagnostics::default()
         );
+    }
+
+    #[test]
+    fn js_4_lifecycle_listener_error_op_validates_event_name() {
+        let b = bridge();
+        call(&b, &[s("lifecycleListenerError"), s("load"), s("boom")]).expect("ok");
+        call(&b, &[s("lifecycleListenerError"), s("click"), s("x")]).expect_err("許可リスト外");
+        call(&b, &[s("lifecycleListenerError"), s("load")]).expect_err("arity");
+        call(&b, &[s("lifecycleListenerError"), s("load"), n(1.0)]).expect_err("type");
+        let d = b.take_diagnostics().expect("diag");
+        assert_eq!(d.listener_errors.len(), 1);
+        assert_eq!(d.listener_errors[0].event, LifecycleEvent::Load);
+        assert_eq!(d.listener_errors[0].message, "boom");
     }
 
     #[test]

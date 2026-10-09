@@ -79,7 +79,7 @@
 //!
 //! - [`cssom`]（`CORE-5`・`TASK-105`・`MS-8`。型定義・宣言パーサー・詳細度計算・ルール分割・スタイル源収集・セレクタマッチング・カスケード解決のみ。`!important`・継承等は未実装）
 //! - [`page_script`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。収集のみ。SVG の script・`language`・module 実行等は未実装）
-//! - [`page_runner`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。inline のみ。`src`・総バイト・DOMContentLoaded / load は #781、アクター化は #784）
+//! - [`page_runner`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。`src` 取得・総バイト上限・DOMContentLoaded / load 発火まで実装済み。アクター化は #784）
 //! - [`dom_bridge`]（`JS-5`・`JS-6`・`TASK-108`・`MS-6`。`setInnerHTML` は `Document::set_inner_html` で置換する。DOM 操作以外の op は未実装）
 //! - [`js_shim`]（`JS-5`・`TASK-108`・`MS-6`。window / location / navigator / console は #779）
 //! - [`js_stub`]（`JS-2`・`TASK-30`・`MS-3`）
@@ -141,9 +141,11 @@ pub use observability::{
     OperationRecord, OperationRecorder, RecorderHandle,
 };
 pub use page_runner::{
-    AbortKind, DEFAULT_PAGE_WALL_TIME, DEFAULT_SCRIPT_WALL_TIME, MAX_SCRIPT_ERROR_MESSAGE_BYTES,
-    PageAbort, PageRunInput, PageRunOptions, PageRunOutput, ScriptOutcome, ScriptRunRecord,
-    WallTimeScope, run_page_scripts,
+    AbortKind, DEFAULT_MAX_SRC_SCRIPT_BYTES, DEFAULT_MAX_TOTAL_SCRIPT_BYTES,
+    DEFAULT_PAGE_WALL_TIME, DEFAULT_SCRIPT_WALL_TIME, LifecycleEvent, LifecycleEventRecord,
+    LifecycleOutcome, MAX_SCRIPT_ERROR_MESSAGE_BYTES, PageAbort, PageRunInput, PageRunOptions,
+    PageRunOutput, ScriptBytesScope, ScriptOutcome, ScriptRunRecord, SrcFetchErrorKind,
+    WallTimeScope, page_script_fetch_options, run_page_scripts,
 };
 pub use page_script::{
     CollectedScripts, DEFAULT_MAX_INLINE_SCRIPT_BYTES, DEFAULT_MAX_PAGE_SCRIPTS,

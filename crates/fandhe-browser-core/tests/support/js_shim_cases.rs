@@ -39,7 +39,10 @@ fn setup(engine: &str, limit_extra_nodes: Option<usize>) -> Page {
     let cfg = Config::from_toml_str(&format!("[js]\nengine = \"{engine}\"\n")).expect("config");
     let mut rt = JsRuntime::from_config(cfg.js()).expect("runtime");
     let installed = rt.install_dom_shim(&bridge).expect("install shim");
-    assert_eq!(installed.evaluated, vec!["dom.js", "window.js"]);
+    assert_eq!(
+        installed.evaluated,
+        vec!["dom.js", "window.js", "events.js"]
+    );
     Page { bridge, rt, script }
 }
 
