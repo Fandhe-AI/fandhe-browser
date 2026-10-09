@@ -208,6 +208,17 @@ fn js_6_set_inner_html_template_context_capacity_exact() {
     assert_eq!(out.inserted_nodes, 1);
 }
 
+/// JS-6: `create_element("template")`（template_contents なし）でも文脈名から補助ノード 4 個と判定する。
+#[test]
+fn js_6_set_inner_html_created_template_context_capacity_exact() {
+    let mut doc = parse("<html><head></head><body></body></html>");
+    let t = doc.create_element("template").expect("create");
+    let limit = doc.node_count() + 1;
+    doc.set_limits(DomLimits::default().with_max_nodes(limit));
+    let out = doc.set_inner_html(t, "x").expect("Text 1 個は収まる");
+    assert_eq!(out.inserted_nodes, 1);
+}
+
 /// JS-5: 文脈要素の属性（annotation-xml の encoding）が HTML integration point 判定に効く。
 #[test]
 fn js_5_set_inner_html_annotation_xml_encoding_is_integration_point() {

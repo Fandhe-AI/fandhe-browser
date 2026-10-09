@@ -121,17 +121,15 @@ impl Document {
         };
         // パース用補助ノード: Document・文脈要素・`<html>`。template 文脈では
         // ArenaSink が文脈用 DocumentFragment も作るため 1 個多い。
-        let aux_nodes: usize = if matches!(
-            &ctx_node.data,
-            NodeData::Element {
-                template_contents: Some(_),
-                ..
-            }
-        ) {
-            4
-        } else {
-            3
-        };
+        // 判定は template_contents の有無ではなく文脈名（HTML 名前空間の `template`）で行う
+        // （`create_element("template")` は template_contents を持たないが、パーサーは
+        // 文脈名から template 用 Fragment を作るため）。
+        let aux_nodes: usize =
+            if &*context.ns == HTML_NAMESPACE_URI && &*context.local == "template" {
+                4
+            } else {
+                3
+            };
         let quirks_mode = self.quirks_mode;
         self.check_text_len(html.len())?;
         // `<template>` の子は template_contents（DocumentFragment）に保持されるため、
