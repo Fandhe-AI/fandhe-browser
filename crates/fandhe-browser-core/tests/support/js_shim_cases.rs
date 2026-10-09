@@ -252,6 +252,19 @@ pub fn run(engine: &str) {
     let err = p.rt.install_dom_shim(&other).expect_err("different bridge");
     assert!(matches!(err, Error::Unsupported { .. }), "{err}");
 
+    eprintln!("case: JS-5 reinstall survives page tampering with __dom");
+    let mut p = setup(engine, None);
+    p.eval(
+        "try { globalThis.__dom = null; } catch (e) {} \
+         try { delete globalThis.__dom; } catch (e) {} \
+         try { globalThis.__dom = { op: function () { return 'fake'; } }; } catch (e) {} \
+         'tampered'",
+    );
+    p.rt.install_dom_shim(&p.bridge)
+        .expect("reinstall after tamper");
+    check(&mut p, "document.readyState", "loading");
+    check(&mut p, "typeof document.createElement('p')", "object");
+
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
     let err = disabled.install_dom_shim(&p.bridge).expect_err("disabled");

@@ -101,6 +101,7 @@ impl Document {
     /// - 取り込み後のノード数が上限を超えれば [`DomError::NodeLimitExceeded`]、保持
     ///   バイト数が超えれば [`DomError::TotalBytesExceeded`]。属性・名前の上限違反も `Err`
     /// - いずれの `Err` でも木は変更されない
+    /// - `<template>` では子の置換先は template contents（`JS-5`）
     /// - 空文字列は子を全て外すだけ（ノードは作らない）
     ///
     /// 挿入した `<script>` の「実行済み」フラグ等は持たない（REPAIR-3）。実行制御は
@@ -113,9 +114,12 @@ impl Document {
             ));
         };
         self.check_text_len(html.len())?;
+        // `<template>` の子は template_contents（DocumentFragment）に保持されるため、
+        // パース文脈は要素のまま、取り外し・接続先だけをその Fragment に切り替える。
+        let target = self.template_contents(node).unwrap_or(node);
 
         if html.is_empty() {
-            let removed = self.detach_all_children(node)?;
+            let removed = self.detach_all_children(target)?;
             return Ok(InnerHtmlOutcome {
                 inserted_nodes: 0,
                 removed_children: removed,
@@ -182,7 +186,7 @@ impl Document {
         self.check_total_budget(incoming_bytes)?;
 
         // 変更フェーズ。
-        let removed = self.detach_all_children(node)?;
+        let removed = self.detach_all_children(target)?;
         let base = self.nodes.len();
         self.nodes.reserve(order.len());
         let mut map: Vec<Option<usize>> = vec![None; frag.nodes.len()];
@@ -193,7 +197,7 @@ impl Document {
                 *slot = Some(dest.index());
             }
             let parent = match src_node.parent {
-                Some(p) if p == frag_html => Some(node),
+                Some(p) if p == frag_html => Some(target),
                 Some(p) => map.get(p.index()).copied().flatten().map(NodeId::new),
                 None => None,
             };

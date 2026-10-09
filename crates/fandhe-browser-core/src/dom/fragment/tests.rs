@@ -110,6 +110,24 @@ fn js_5_set_inner_html_copies_template_contents() {
     );
 }
 
+/// JS-5: `<template>` の innerHTML 設定は template contents を置換し、空文字でクリアする。
+#[test]
+fn js_5_set_inner_html_on_template_replaces_contents() {
+    let mut doc = parse("<html><head></head><body><template><i>old</i></template></body></html>");
+    let t = sel(&doc, "template");
+    doc.set_inner_html(t, "<b>new</b>").expect("ok");
+    assert_eq!(doc.first_child(t), None);
+    assert_eq!(
+        html(&doc),
+        "<html><head></head><body><template><b>new</b></template></body></html>"
+    );
+    doc.set_inner_html(t, "").expect("ok");
+    assert_eq!(
+        html(&doc),
+        "<html><head></head><body><template></template></body></html>"
+    );
+}
+
 /// JS-6: ノード数上限超過は Err で木が不変。
 #[test]
 fn js_6_set_inner_html_node_limit_leaves_tree_unchanged() {

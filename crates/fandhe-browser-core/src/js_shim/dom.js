@@ -9,7 +9,8 @@
 // 設計上の要点:
 // - ノード ID はクロージャ内の WeakMap/Map にだけ置き、ページ JS から直接見えない。
 //   shim を迂回して `__dom.op` を直接呼ばれても、bridge 側が世代・範囲・型・arity を検証する。
-// - `__dom.op` は初期化時に捕捉する。ページが後から `__dom` を上書きしても shim は壊れない。
+// - `__dom.op` は初期化時に捕捉し、`__dom` 自体を固定する。ページが上書き・削除しても
+//   再注入で真正な op が使われる。
 // - readyState / currentScript は bridge（Rust 側）が持つ状態を毎回 op で読む（キャッシュしない）。
 // - 全体を IIFE で包むため、同じコンテキストで再評価（ページごとの再 install）しても
 //   SyntaxError にならない。
@@ -28,6 +29,19 @@
         throw new TypeError('__dom.op is not available');
     }
     var nativeOp = bridge.op;
+    // 再注入（ページごと）でもホストが bind した真正な op を使えるよう、`__dom` を
+    // 書き換え・削除不能（non-writable / non-configurable）に固定し、bridge も凍結する。
+    // 初回注入はページ JS の実行前に行われる前提（JS-5）。
+    var desc = Object.getOwnPropertyDescriptor(global, '__dom');
+    if (desc && desc.configurable) {
+        Object.freeze(bridge);
+        Object.defineProperty(global, '__dom', {
+            value: bridge,
+            writable: false,
+            configurable: false,
+            enumerable: false
+        });
+    }
 
     function op() {
         return nativeOp.apply(bridge, arguments);
