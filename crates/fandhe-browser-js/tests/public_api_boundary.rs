@@ -39,6 +39,18 @@ fn js_1_public_signatures_are_pinned_without_v8_types() {
     ) -> NativeCallContext = NativeCallContext::new;
     let _: fn(&NativeCallContext) -> bool = NativeCallContext::is_cancelled;
     let _: fn() -> EvaluateOptions = EvaluateOptions::default;
+    let _: fn(EvaluateOptions, std::time::Duration) -> EvaluateOptions =
+        EvaluateOptions::with_timeout;
+    let _: fn(EvaluateOptions, usize) -> EvaluateOptions = EvaluateOptions::with_max_result_bytes;
+    let _: fn(&EvaluateOptions) -> std::time::Duration = EvaluateOptions::timeout;
+    let _: fn(&EvaluateOptions) -> usize = EvaluateOptions::max_result_bytes;
+    let _: std::time::Duration = EvaluateOptions::DEFAULT_TIMEOUT;
+    let _: usize = EvaluateOptions::DEFAULT_MAX_RESULT_BYTES;
+    assert_eq!(
+        EvaluateOptions::default().timeout(),
+        std::time::Duration::from_secs(2)
+    );
+    assert_eq!(EvaluateOptions::default().max_result_bytes(), 1_048_576);
     let _: NativeFn = Box::new(|_: &[JsValue]| Ok(JsValue::Undefined));
 
     // トレイトメソッドの署名は、呼び出し形（コンパイルのみ。実行しない）で固定する。

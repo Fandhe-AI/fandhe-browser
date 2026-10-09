@@ -47,9 +47,10 @@
 //!   配線すると `tests/conformance.rs` の同梱エンジン向けコンフォーマンス
 //!   テスト（注入・バインディングの契約検証を含む）が V8 に対しても走る
 //!   ため、29.5 の完了を待つ
-//! - 実行時間・入力サイズ・結果サイズ・ヒープサイズの上限値を呼び出し側
-//!   から調整する経路（[`super::engine_trait::EvaluateOptions`] の拡張。
-//!   `TASK-30`（`MS-3`）で扱う。現状は本モジュールの定数で固定値を使う）
+//! - 入力サイズ・ヒープサイズの上限値を呼び出し側から調整する経路
+//!   （本モジュールの定数で固定。実時間と結果サイズは TASK-109 で
+//!   [`super::engine_trait::EvaluateOptions`] から指定可能。ただし子プロセス
+//!   経路への受け渡しは Issue #776 で扱う）
 //!
 //! # エラー変換（`JS-1`・`TASK-29.6.1`・Issue #547）
 //!
@@ -62,7 +63,7 @@
 //! | V8 側の失敗（`V8Failure`） | 子側 [`JsEngineError`] | ワイヤ `ErrorKind` | 親側 [`JsEngineError`] |
 //! | --- | --- | --- | --- |
 //! | `IsolateAlreadyActive` / `ContextSetup` / `BindingSetup` | `BindingFailed` | `Binding` | `BindingFailed` |
-//! | `Allocation` / `Threw` / `ResultConversion` | `EvaluationFailed` | `Evaluation` | `EvaluationFailed` |
+//! | `Allocation` / `Threw` / `ResultConversion` / `ResultTooLarge` | `EvaluationFailed` | `Evaluation` | `EvaluationFailed` |
 //! | `Terminated` | `Timeout` | `Timeout` | `Timeout`（接頭辞付き） |
 //! | `NativeCallFatal` | `EngineUnavailable` | `Evaluation`（畳まれる） | `EvaluationFailed` |
 //! | （boa のループ・再帰・スタック上限。V8 では発生しない） | `ResourceLimitExceeded` | `ResourceLimit` | `ResourceLimitExceeded`（Context は残る） |
@@ -315,6 +316,9 @@ const MAX_RESULT_STRING_UTF16_UNITS: usize = 1_048_576; // 約 1M 文字（2 MiB
 /// 含まれる」ことであり、「コンパイル処理自体を強制的に打ち切れる」こと
 /// ではない。[`MAX_SCRIPT_SOURCE_BYTES`] による入力サイズ上限が、
 /// コンパイル時間そのものに対する現状の主な緩和策である。
+// TASK-109: 実行時の期限は `EvaluateOptions::timeout()` を使う。本定数は既定値の
+// 参照点（ドキュメント・テスト）として残す。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SCRIPT_EXECUTION_TIMEOUT: Duration = super::shared::SCRIPT_EXECUTION_TIMEOUT;
 
 /// V8 の Platform が protected 版（thread-isolated allocation 有効）か
@@ -512,7 +516,12 @@ enum V8Failure {
     /// コンパイル失敗・実行時例外（切り詰め済みメッセージ）。
     Threw(String),
     /// watchdog 等による打ち切り。`stage` は `"compilation"` / `"execution"`。
-    Terminated { stage: &'static str },
+    Terminated {
+        stage: &'static str,
+        timeout: Duration,
+    },
+    /// 文字列結果が `EvaluateOptions::max_result_bytes` を超えた（UTF-8 バイト数）。
+    ResultTooLarge { bytes: usize, limit: usize },
     /// 評価結果の V8 値から [`JsValue`] への変換失敗。
     ResultConversion(String),
     /// 逆方向 RPC の fatal 記録済み（Context は破棄済み。以後の評価を拒否する）。
@@ -529,9 +538,12 @@ impl From<V8Failure> for JsEngineError {
             V8Failure::Allocation(message)
             | V8Failure::Threw(message)
             | V8Failure::ResultConversion(message) => JsEngineError::EvaluationFailed(message),
-            V8Failure::Terminated { stage } => JsEngineError::Timeout(format!(
+            V8Failure::Terminated { stage, timeout } => JsEngineError::Timeout(format!(
                 "script {stage} exceeded the {} second timeout and was terminated",
-                SCRIPT_EXECUTION_TIMEOUT.as_secs_f64()
+                timeout.as_secs_f64()
+            )),
+            V8Failure::ResultTooLarge { bytes, limit } => JsEngineError::EvaluationFailed(format!(
+                "string result of {bytes} bytes exceeds the result size limit of {limit} bytes"
             )),
             V8Failure::NativeCallFatal(message) => JsEngineError::EngineUnavailable(format!(
                 "a previous native call ended the worker protocol connection; \
@@ -742,7 +754,8 @@ impl V8Engine {
     /// [`V8Engine::context`]（永続 Context）へ入り直すため、`var`/グローバル
     /// 変数などのスクリプト間状態は評価をまたいで引き継がれる。
     ///
-    /// タイムアウトは [`SCRIPT_EXECUTION_TIMEOUT`]（固定値）を使う。
+    /// タイムアウトは `options.timeout()`、結果サイズ上限は
+    /// `options.max_result_bytes()` を使う（TASK-109・`JS-6`）。
     ///
     /// # リソース上限（AGENTS.md「リソース上限」P0。codex レビュー指摘
     /// #154 対応）
@@ -758,7 +771,7 @@ impl V8Engine {
     ///   `super::process_engine` が担う（挙動の詳細は同定数のドキュメント
     ///   コメントを参照。Issue #503・#506）
     /// - 実行時間: 監視は `v8::Script::compile` の**前**から始まり、
-    ///   [`SCRIPT_EXECUTION_TIMEOUT`] を超えると
+    ///   `options.timeout()`（既定 [`SCRIPT_EXECUTION_TIMEOUT`]）を超えると
     ///   `v8::IsolateHandle::terminate_execution` で打ち切って `Err` を
     ///   返す。ただし打ち切りが実際に効くのは `compiled.run`（実行）段階
     ///   であり、`v8::Script::compile` 自体は中断されない（1 MiB までの
@@ -766,12 +779,11 @@ impl V8Engine {
     ///   ントコメントを参照）。`while (true) {}` のような無限ループでも
     ///   呼び出しスレッドは戻る
     /// - 結果サイズ: 文字列型の評価結果は [`MAX_RESULT_STRING_UTF16_UNITS`]
-    ///   を超える場合、変換前に `Err` を返す（[`value_to_js_value`]）
+    ///   または `options.max_result_bytes()`（UTF-8 バイト）を超える場合、
+    ///   変換前に `Err` を返す（[`value_to_js_value`]）
     ///
-    /// これらの上限値は現状すべて本モジュールの定数で固定しており、
-    /// `_options`（[`EvaluateOptions`]）からは調整できない。呼び出し側が
-    /// 上限値を指定できるようにする拡張は `TASK-30`（`MS-3`）で扱う
-    /// （モジュール冒頭「スタブについて」）。
+    /// 実時間と結果サイズは `options`（[`EvaluateOptions`]）で指定できる。
+    /// 入力サイズ・ヒープサイズは本モジュールの定数で固定のまま。
     ///
     /// # 現在の制限（実装済みを装わない。REPAIR-3）
     ///
@@ -1045,8 +1057,9 @@ impl V8Engine {
         isolate: &mut v8::OwnedIsolate,
         context: &v8::Global<v8::Context>,
         script: &str,
-        _options: &EvaluateOptions,
+        options: &EvaluateOptions,
     ) -> Result<JsValue, JsEngineError> {
+        let timeout = options.timeout();
         // タイムアウト監視スレッド（後述）から呼び出す `IsolateHandle` は
         // `isolate` を可変借用する `scope`/`tc` より前に取得する
         // （`Isolate::thread_safe_handle` は `&self` のみで済み、
@@ -1145,7 +1158,7 @@ impl V8Engine {
         // 切られない場合がある」も参照）。
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let watchdog = std::thread::spawn(move || {
-            if done_rx.recv_timeout(SCRIPT_EXECUTION_TIMEOUT).is_err() {
+            if done_rx.recv_timeout(timeout).is_err() {
                 isolate_handle.terminate_execution();
             }
         });
@@ -1213,6 +1226,7 @@ impl V8Engine {
                 if was_terminated {
                     return Err(V8Failure::Terminated {
                         stage: "compilation",
+                        timeout,
                     }
                     .into());
                 }
@@ -1234,7 +1248,11 @@ impl V8Engine {
             Some(result) => result,
             None => {
                 if was_terminated {
-                    return Err(V8Failure::Terminated { stage: "execution" }.into());
+                    return Err(V8Failure::Terminated {
+                        stage: "execution",
+                        timeout,
+                    }
+                    .into());
                 }
                 let message = match message {
                     Some(message) => message,
@@ -1244,7 +1262,7 @@ impl V8Engine {
             }
         };
 
-        value_to_js_value(&tc, result)
+        value_to_js_value(&tc, result, options.max_result_bytes())
     }
 }
 
@@ -1297,6 +1315,7 @@ fn v8_string_prefix_lossy(
 fn value_to_js_value(
     scope: &v8::PinScope<'_, '_>,
     value: v8::Local<v8::Value>,
+    max_result_bytes: usize,
 ) -> Result<JsValue, JsEngineError> {
     if value.is_undefined() {
         Ok(JsValue::Undefined)
@@ -1323,6 +1342,16 @@ fn value_to_js_value(
                 Err(V8Failure::ResultConversion(format!(
                     "string result exceeds the maximum supported length of {MAX_RESULT_STRING_UTF16_UNITS} UTF-16 code units"
                 ))
+                .into())
+            }
+            // TASK-109・`JS-6`: 呼び出し側指定の上限は UTF-8 バイト数で数える。
+            // `utf8_length` は複製を伴わない。UTF-8 は UTF-16 単位数以上になるため、
+            // 上記のエンジン固定上限は options に関係なく先に効く。
+            Some(s) if s.utf8_length(scope) > max_result_bytes => {
+                Err(V8Failure::ResultTooLarge {
+                    bytes: s.utf8_length(scope),
+                    limit: max_result_bytes,
+                }
                 .into())
             }
             Some(s) => Ok(JsValue::String(s.to_rust_string_lossy(scope))),
@@ -1529,7 +1558,7 @@ fn native_proxy_callback(
 
     let mut js_args = Vec::with_capacity(argc as usize);
     for i in 0..argc {
-        match value_to_js_value(scope, args.get(i)) {
+        match value_to_js_value(scope, args.get(i), MAX_RESULT_STRING_UTF16_UNITS) {
             Ok(value) => js_args.push(value),
             Err(err) => {
                 let Some(message) = v8::String::new(scope, &err.to_string()) else {
@@ -1951,6 +1980,87 @@ mod tests {
             }
             other => panic!("expected EvaluationFailed for an oversized script, got: {other:?}"),
         }
+    }
+
+    /// TASK-109・`JS-6`: 200ms 指定の無限ループが 2 秒以内に `Timeout` で
+    /// 返り、同じエンジンで次の評価が成功する。
+    #[test]
+    fn js_6_v8_custom_timeout_terminates_infinite_loop_within_two_seconds() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let options = EvaluateOptions::default().with_timeout(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        let result = engine.evaluate_script("while (true) {}", &options);
+        let elapsed = started.elapsed();
+        match result {
+            Err(JsEngineError::Timeout(msg)) => {
+                assert!(msg.contains("0.2 second"), "unexpected message: {msg}")
+            }
+            other => panic!("expected Timeout, got: {other:?}"),
+        }
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        let next = engine
+            .evaluate_script("1 + 1", &EvaluateOptions::default())
+            .expect("engine must remain usable after a timeout");
+        assert_eq!(next, JsValue::Number(2.0));
+    }
+
+    /// TASK-109・`JS-6`: 既定 1 MiB の境界（ちょうどは成功・+1 は `Err`）。
+    #[test]
+    fn js_6_v8_result_size_limit_boundary_with_default_options() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let options = EvaluateOptions::default();
+        match engine.evaluate_script("'a'.repeat(1048576)", &options) {
+            Ok(JsValue::String(s)) => assert_eq!(s.len(), 1_048_576),
+            other => panic!("expected the exact-limit string, got: {other:?}"),
+        }
+        assert!(matches!(
+            engine.evaluate_script("'a'.repeat(1048577)", &options),
+            Err(JsEngineError::EvaluationFailed(_))
+        ));
+    }
+
+    /// TASK-109・`JS-6`: 小さい上限（16 バイト）の境界とメッセージ。
+    #[test]
+    fn js_6_v8_result_size_limit_boundary_with_small_limit() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let options = EvaluateOptions::default().with_max_result_bytes(16);
+        assert_eq!(
+            engine.evaluate_script("'a'.repeat(16)", &options).unwrap(),
+            JsValue::String("a".repeat(16))
+        );
+        match engine.evaluate_script("'a'.repeat(17)", &options) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert!(msg.contains("17") && msg.contains("16"), "{msg}")
+            }
+            other => panic!("expected EvaluationFailed, got: {other:?}"),
+        }
+    }
+
+    /// TASK-109・`JS-6`: 上限は UTF-8 バイト数で数える。
+    #[test]
+    fn js_6_v8_result_size_limit_counts_utf8_bytes() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let options = EvaluateOptions::default().with_max_result_bytes(9);
+        assert_eq!(
+            engine.evaluate_script("'あ'.repeat(3)", &options).unwrap(),
+            JsValue::String("あ".repeat(3))
+        );
+        assert!(matches!(
+            engine.evaluate_script("'あ'.repeat(3) + 'a'", &options),
+            Err(JsEngineError::EvaluationFailed(_))
+        ));
+    }
+
+    /// TASK-109・`JS-6`: 結果サイズ超過の後も同じエンジンで評価できる。
+    #[test]
+    fn js_6_v8_result_size_limit_exceeded_keeps_engine_usable() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let options = EvaluateOptions::default().with_max_result_bytes(4);
+        assert!(engine.evaluate_script("'a'.repeat(5)", &options).is_err());
+        assert_eq!(
+            engine.evaluate_script("1 + 1", &options).unwrap(),
+            JsValue::Number(2.0)
+        );
     }
 
     /// JS-1・codex レビュー指摘 #154 P0 の回帰確認: `while (true) {}` の
@@ -2819,7 +2929,10 @@ mod tests {
             JsEngineError::EvaluationFailed("conv".to_string()),
         );
         same_error(
-            JsEngineError::from(V8Failure::Terminated { stage: "execution" }),
+            JsEngineError::from(V8Failure::Terminated {
+                stage: "execution",
+                timeout: SCRIPT_EXECUTION_TIMEOUT,
+            }),
             JsEngineError::Timeout(
                 "script execution exceeded the 2 second timeout and was terminated".to_string(),
             ),
@@ -2827,9 +2940,28 @@ mod tests {
         same_error(
             JsEngineError::from(V8Failure::Terminated {
                 stage: "compilation",
+                timeout: SCRIPT_EXECUTION_TIMEOUT,
             }),
             JsEngineError::Timeout(
                 "script compilation exceeded the 2 second timeout and was terminated".to_string(),
+            ),
+        );
+        same_error(
+            JsEngineError::from(V8Failure::Terminated {
+                stage: "execution",
+                timeout: Duration::from_millis(200),
+            }),
+            JsEngineError::Timeout(
+                "script execution exceeded the 0.2 second timeout and was terminated".to_string(),
+            ),
+        );
+        same_error(
+            JsEngineError::from(V8Failure::ResultTooLarge {
+                bytes: 17,
+                limit: 16,
+            }),
+            JsEngineError::EvaluationFailed(
+                "string result of 17 bytes exceeds the result size limit of 16 bytes".to_string(),
             ),
         );
         same_error(

@@ -21,7 +21,10 @@ pub(crate) const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
 /// V8 は子プロセス内の watchdog がこの時間で `terminate_execution` する。
 /// boa には中断 API が無いため、親（[`super::process_engine`]）が
 /// この値に猶予を足した期限で子プロセスごと kill する（`Timeout`）。
-pub(crate) const SCRIPT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(2);
+/// 値の正本は [`super::engine_trait::EvaluateOptions::DEFAULT_TIMEOUT`]
+/// （TASK-109。評価ごとの指定は `EvaluateOptions` で行う）。
+pub(crate) const SCRIPT_EXECUTION_TIMEOUT: Duration =
+    super::engine_trait::EvaluateOptions::DEFAULT_TIMEOUT;
 
 /// 子プロセス側から親プロセスへ逆方向 RPC（`NativeCall`）を送り、
 /// [`NativeReturn`] が届くまで**同期的にブロックする**窓口（`JS-1`・
@@ -60,4 +63,19 @@ pub(crate) enum NativeCallFailure {
     /// プロトコル違反・EOF・I/O エラー（fatal。呼び出し元は評価を打ち切り、
     /// このプロセス自体を終了させる）。
     Fatal(String),
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    /// TASK-109・`JS-6`: 固定の基準値と `EvaluateOptions` の既定値は一致する。
+    #[test]
+    fn js_6_script_execution_timeout_matches_evaluate_options_default() {
+        assert_eq!(SCRIPT_EXECUTION_TIMEOUT, Duration::from_secs(2));
+        assert_eq!(
+            SCRIPT_EXECUTION_TIMEOUT,
+            super::super::engine_trait::EvaluateOptions::DEFAULT_TIMEOUT
+        );
+    }
 }
