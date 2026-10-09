@@ -2,7 +2,8 @@
 //!
 //! `mcp_envelope.rs` の main が、測定したトークン数・レイテンシ列を渡して集計と TSV 整形を行う。
 //! I/O を持たず、`stats_tests.rs` が 3 OS で具体値を検証する。パーセンタイルは nearest-rank 法
-//! （`rank = ceil(p/100 * n)`）。実測値の確定と判断は #386（TASK-97.2）・#387 が担う。
+//! （`rank = ceil(p/100 * n)`）。Markdown 表の整形（`render_*_md`）は
+//! レポート `docs/design/mcp-envelope-report.md`（TASK-97.2・#386）へ貼る出力を作る。判断は #387 が担う。
 
 /// 1 fixture 分のトークン・バイト計測値（4 系列）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,13 @@ impl EnvelopeRow {
     /// エンベロープ分のトークン増分（応答行全体 - 方式 B 本体）。
     pub fn envelope_tokens(&self) -> i64 {
         self.mcp_line_tokens as i64 - self.direct_tokens as i64
+    }
+    /// 方式 B 本体に対するエンベロープ増分の比率（%）。`direct_tokens == 0` は `None`。
+    pub fn envelope_pct(&self) -> Option<f64> {
+        if self.direct_tokens == 0 {
+            return None;
+        }
+        Some(self.envelope_tokens() as f64 / self.direct_tokens as f64 * 100.0)
     }
     /// 方式 B 本体の対生 HTML 削減率（%）。
     pub fn direct_reduction_pct(&self) -> Option<f64> {
@@ -128,4 +136,72 @@ pub fn tsv_row(r: &EnvelopeRow) -> String {
 /// レイテンシ要約の TSV 行（ms、小数 3 桁）。
 pub fn latency_row(label: &str, s: &LatencySummary) -> String {
     format!("{label}\t{:.3}\t{:.3}\t{:.3}", s.p50, s.p95, s.mean)
+}
+
+/// トークン表（Markdown）。レポートへ逐語で貼る決定的な出力で、レイテンシは含まない。
+/// `mcpLineBytes` は JSON-RPC の id 桁数（反復回数）で変わるため載せない（TSV には出る）。
+pub fn render_token_table_md(rows: &[EnvelopeRow]) -> String {
+    let mut out = vec![
+        "| name | rawHtmlTokens | directTokens | mcpTextTokens | mcpLineTokens | envelopeTokens | envelopePct | directBytes | directReductionPct | mcpReductionPct |".to_string(),
+        "| ---- | ------------- | ------------ | ------------- | ------------- | -------------- | ----------- | ----------- | ------------------ | --------------- |".to_string(),
+    ];
+    for r in rows {
+        out.push(format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            r.name,
+            r.raw_html_tokens,
+            r.direct_tokens,
+            r.mcp_text_tokens,
+            r.mcp_line_tokens,
+            r.envelope_tokens(),
+            pct_cell(r.envelope_pct()),
+            r.direct_bytes,
+            pct_cell(r.direct_reduction_pct()),
+            pct_cell(r.mcp_reduction_pct()),
+        ));
+    }
+    out.join("\n")
+}
+
+/// 指標ごとの平均・最小・最大の集計表（Markdown）。集計できない指標があれば `None`。
+pub fn render_token_summary_md(rows: &[EnvelopeRow]) -> Option<String> {
+    let collect = |f: &dyn Fn(&EnvelopeRow) -> Option<f64>| -> Vec<f64> {
+        rows.iter().filter_map(f).collect()
+    };
+    let metrics: [(&str, Vec<f64>); 4] = [
+        ("DirectReductionPct", collect(&|r| r.direct_reduction_pct())),
+        ("McpReductionPct", collect(&|r| r.mcp_reduction_pct())),
+        (
+            "EnvelopeTokens",
+            collect(&|r| Some(r.envelope_tokens() as f64)),
+        ),
+        ("EnvelopePct", collect(&|r| r.envelope_pct())),
+    ];
+    let mut out = vec![
+        "| metric | mean | min | max |".to_string(),
+        "| ------ | ---- | --- | --- |".to_string(),
+    ];
+    for (label, v) in &metrics {
+        let a = aggregate(v)?;
+        out.push(format!(
+            "| {label} | {:.1} | {:.1} | {:.1} |",
+            a.mean, a.min, a.max
+        ));
+    }
+    Some(out.join("\n"))
+}
+
+/// レイテンシ表（Markdown。ms・小数 3 桁）。`rows` は `(fixture, path, 要約)`。
+pub fn render_latency_table_md(rows: &[(String, String, LatencySummary)]) -> String {
+    let mut out = vec![
+        "| fixture | path | p50Ms | p95Ms | meanMs |".to_string(),
+        "| ------- | ---- | ----- | ----- | ------ |".to_string(),
+    ];
+    for (fixture, path, s) in rows {
+        out.push(format!(
+            "| {fixture} | {path} | {:.3} | {:.3} | {:.3} |",
+            s.p50, s.p95, s.mean
+        ));
+    }
+    out.join("\n")
 }

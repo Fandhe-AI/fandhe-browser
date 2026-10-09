@@ -91,3 +91,49 @@ fn plug5_aggregate_mean_min_max() {
     assert_eq!(a.max, 90.0);
     assert_eq!(aggregate(&[]), None);
 }
+
+#[test]
+fn plug5_envelope_pct_value_and_zero_direct() {
+    assert_eq!(row().envelope_pct(), Some(50.0));
+    let mut z = row();
+    z.direct_tokens = 0;
+    assert_eq!(z.envelope_pct(), None);
+}
+
+#[test]
+fn plug5_token_table_md_exact() {
+    let md = render_token_table_md(&[row()]);
+    let lines: Vec<&str> = md.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(
+        lines[2],
+        "| example-minimal | 100 | 20 | 20 | 30 | 10 | 50.0 | 80 | 80.0 | 70.0 |"
+    );
+    assert!(lines[0].starts_with("| name | rawHtmlTokens |"));
+}
+
+#[test]
+fn plug5_token_summary_md_exact() {
+    let mut b = row();
+    b.name = "b".to_string();
+    b.direct_tokens = 40;
+    b.mcp_text_tokens = 40;
+    b.mcp_line_tokens = 50;
+    let md = render_token_summary_md(&[row(), b]).expect("summary");
+    let lines: Vec<&str> = md.lines().collect();
+    assert_eq!(lines[2], "| DirectReductionPct | 70.0 | 60.0 | 80.0 |");
+    assert_eq!(lines[3], "| McpReductionPct | 60.0 | 50.0 | 70.0 |");
+    assert_eq!(lines[4], "| EnvelopeTokens | 10.0 | 10.0 | 10.0 |");
+    assert_eq!(lines[5], "| EnvelopePct | 37.5 | 25.0 | 50.0 |");
+    assert_eq!(render_token_summary_md(&[]), None);
+}
+
+#[test]
+fn plug5_latency_table_md_exact() {
+    let s = summarize_latency(&[1.0, 2.0, 3.0]).expect("summary");
+    let md = render_latency_table_md(&[("ALL".to_string(), "mcp".to_string(), s)]);
+    assert_eq!(
+        md.lines().nth(2),
+        Some("| ALL | mcp | 2.000 | 3.000 | 2.000 |")
+    );
+}

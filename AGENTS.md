@@ -56,7 +56,7 @@ make check-deny-license-reject   # 許可外ライセンス（GPL/AGPL/LGPL/MPL-
 ### MCP エンベロープ測定（PLUG-5・TASK-97.1）
 
 ```bash
-make measure-mcp-envelope   # 方式 B 本体と MCP 応答のトークン・レイテンシを測定（unix のみ。数値確定は #386）
+make measure-mcp-envelope   # 方式 B 本体と MCP 応答のトークン・レイテンシを測定（unix のみ。レポート: docs/design/mcp-envelope-report.md。再生成は MCP_ENVELOPE_ARGS="--iterations 100 --markdown"）
 make check-mcp-envelope     # 実 mcp バイナリでの e2e smoke（`make ci` に含む。unix のみ）
 ```
 

@@ -1,7 +1,7 @@
 //! 方式 B 本体の MCP エンベロープ測定ハーネス（TASK-97.1・Issue #385・`PLUG-5`・`MS-9`）。
 //!
 //! 実行: `make measure-mcp-envelope`（mcp バイナリの release ビルド後に
-//! `cargo bench -p fandhe-browser-ai --bench mcp_envelope -- [--iterations N]`）。
+//! `cargo bench -p fandhe-browser-ai --bench mcp_envelope -- [--iterations N] [--markdown]`）。
 //!
 //! 本物の ai ルータ（`GET /ai/snapshot`）と mcp バイナリ（`snapshot` ツール）を loopback で
 //! 接続し、代表 5 サイトについて生 HTML・方式 B 本体・MCP text・MCP 応答行全体の
@@ -10,10 +10,11 @@
 //!
 //! 終了コード: 計測できれば値に関係なく 0（`PLUG-5` に目標値はなく、判断は #387）。
 //! バイナリ不在・登録失敗・タイムアウト・一致検証失敗・`isError`・非 unix は非 0（fail-closed）。
-//! 数値の確定とレポート化は #386（TASK-97.2）。
+//! `--markdown` 指定時は TSV の後にレポート貼付用の Markdown 2 ブロックを出す。
+//! 実測値は `docs/design/mcp-envelope-report.md`（TASK-97.2・#386）に記録する。
 //!
 //! 将来仕様（REPAIR-3）: ホストに `/ai/navigate` が実装されたら MCP の navigate 経由へ切り替える。
-//! in-process の `dispatch`（TCP なし）系列の追加は #386 への申し送り。
+//! in-process の `dispatch`（TCP なし）系列の追加は別 Issue 候補（#385 からの申し送り）。
 
 #[cfg(unix)]
 #[path = "mcp_envelope/harness.rs"]
@@ -74,6 +75,11 @@ fn run() -> Result<(), String> {
     }
 
     println!("{}", report::render(&results, iterations)?);
+    if args.iter().any(|a| a == "--markdown") {
+        let md = report::render_markdown(&results, iterations)?;
+        println!("\n<!-- tokens -->\n{}", md.tokens);
+        println!("\n<!-- latency -->\n{}", md.latency);
+    }
     Ok(())
 }
 
