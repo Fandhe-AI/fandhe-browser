@@ -257,6 +257,47 @@ fn parse_document_inner(input: &str, options: &ParseOptions) -> Result<ParsedDoc
     html5ever::driver::parse_document(sink, parse_opts).one(input)
 }
 
+/// フラグメント（`innerHTML` 相当）をパースする（TASK-107 残り・TASK-108・Issue #778・`JS-5`）。
+///
+/// `Document::set_inner_html` が呼ぶ内部経路。`context` は innerHTML を設定する要素の
+/// 名前で、`<tbody>` に `<tr>` を入れる場合などの文脈依存パースに使う。html5ever は
+/// 文脈要素（arena の添字 1・未接続）と、フラグメントの親になる `<html>` 要素
+/// （Document の唯一の子）を作るため、呼び出し元は戻り値の `<html>` の子を取り込む。
+/// `options.max_nodes` は Document・文脈要素・`<html>` の 3 個を含む値で指定する。
+/// エラーポリシーは Recover 固定（不正な markup は WHATWG どおり回復する）。
+pub(crate) fn parse_fragment(
+    input: &str,
+    context: &QualName,
+    options: &ParseOptions,
+) -> Result<ParsedDocument> {
+    if options.max_nodes == 0 {
+        return Err(Error::Parse(ParseError::InvalidMaxNodes { requested: 0 }));
+    }
+    if input.len() > options.max_input_bytes {
+        return Err(Error::Parse(ParseError::InputTooLarge {
+            len: input.len(),
+            limit: options.max_input_bytes,
+        }));
+    }
+    let sink = ArenaSink::new(options);
+    let parse_opts = ParseOpts {
+        tree_builder: TreeBuilderOpts {
+            scripting_enabled: options.scripting_enabled,
+            exact_errors: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    html5ever::driver::parse_fragment(
+        sink,
+        parse_opts,
+        context.clone(),
+        Vec::new(),
+        options.scripting_enabled,
+    )
+    .one(input)
+}
+
 /// バイト列を UTF-8 として厳密に検証してから [`parse_document`] を呼ぶ。
 ///
 /// 文字コード検出（`CORE-5` (7)）は行わない。UTF-8 以外のバイト列は

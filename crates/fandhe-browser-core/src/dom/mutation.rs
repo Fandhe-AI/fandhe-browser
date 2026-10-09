@@ -27,8 +27,8 @@
 //!
 //! # 未実装（実装済みを装わない。REPAIR-3）
 //!
-//! - `innerHTML` 設定（フラグメントパース。TASK-107 の残り）。HTML シリアライズ自体は
-//!   `serialize` サブモジュール（Issue #773）に実装済み。
+//! - `innerHTML` 設定は `fragment` サブモジュール（[`Document::set_inner_html`]。
+//!   TASK-108・Issue #778）に実装済み。HTML シリアライズは `serialize`（Issue #773）。
 //! - Document 直下に置ける要素を 1 個に限る制約、DocumentFragment の展開挿入、
 //!   名前空間付きの要素作成、`create_element("template")` 時の template contents
 //!   生成（`template_contents` は `None`）。
@@ -223,25 +223,25 @@ pub(crate) fn retained_bytes_of(nodes: &[Node]) -> usize {
     })
 }
 
-fn not_found(id: NodeId) -> Error {
+pub(super) fn not_found(id: NodeId) -> Error {
     DomError::NodeNotFound { index: id.index() }.into()
 }
 
-fn kind_err(operation: &'static str, reason: &'static str) -> Error {
+pub(super) fn kind_err(operation: &'static str, reason: &'static str) -> Error {
     DomError::InvalidNodeKind { operation, reason }.into()
 }
 
 impl Document {
-    fn require_node(&self, id: NodeId) -> Result<&Node> {
+    pub(super) fn require_node(&self, id: NodeId) -> Result<&Node> {
         self.node(id).ok_or_else(|| not_found(id))
     }
 
-    fn node_mut(&mut self, id: NodeId) -> Result<&mut Node> {
+    pub(super) fn node_mut(&mut self, id: NodeId) -> Result<&mut Node> {
         self.nodes.get_mut(id.index()).ok_or_else(|| not_found(id))
     }
 
     /// ノード数上限を判定する。arena の長さで数えるため、外したノードも含む。
-    fn check_node_capacity(&self) -> Result<()> {
+    pub(super) fn check_node_capacity(&self) -> Result<()> {
         if self.nodes.len() >= self.limits.max_nodes {
             return Err(DomError::NodeLimitExceeded {
                 limit: self.limits.max_nodes,
@@ -252,7 +252,7 @@ impl Document {
     }
 
     /// テキスト内容の長さを上限と照合する（コピー前に呼ぶ）。
-    fn check_text_len(&self, len: usize) -> Result<()> {
+    pub(super) fn check_text_len(&self, len: usize) -> Result<()> {
         if len > self.limits.max_text_bytes {
             return Err(DomError::TextTooLarge {
                 len,
@@ -267,7 +267,7 @@ impl Document {
     ///
     /// `add == 0`（保持量が増えない操作）は、`set_limits` で上限を下げた後や
     /// パース結果が上限超の場合でも許可する。縮小・回復の書き込みを拒否しないため。
-    fn check_total_budget(&self, add: usize) -> Result<()> {
+    pub(super) fn check_total_budget(&self, add: usize) -> Result<()> {
         if add == 0 {
             return Ok(());
         }
@@ -284,7 +284,7 @@ impl Document {
     }
 
     /// 検証済みの増減を保持バイト数へ反映する。
-    fn adjust_retained(&mut self, add: usize, sub: usize) {
+    pub(super) fn adjust_retained(&mut self, add: usize, sub: usize) {
         self.retained_bytes = self.retained_bytes.saturating_add(add).saturating_sub(sub);
     }
 
