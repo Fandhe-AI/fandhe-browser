@@ -661,7 +661,23 @@ impl Fetcher {
     pub async fn get(&self, url: &str) -> Result<FetchResponse> {
         // 無効時は Instant::now() も呼ばない。
         let start = self.options.recorder.is_enabled().then(Instant::now);
-        let result = self.get_inner(url).await;
+        let result = self.get_inner(url, u64::MAX).await;
+        if let Some(start) = start {
+            self.options
+                .recorder
+                .record_result(OperationKind::Fetch, &result, start.elapsed());
+        }
+        result
+    }
+
+    /// [`Fetcher::get`] に、このリクエスト限りの本文上限 `max_body_bytes` を加えた版。
+    ///
+    /// 実効上限は `FetchOptions::max_body_bytes` と引数の小さい方で、`Content-Length` の
+    /// 事前検査と受信中の逐次検査の両方に適用する（上限超過分を確保しない。`JS-6`・
+    /// ページランナーの `src` 取得が呼ぶ）。超過時は [`Error::ResponseTooLarge`]（`limit` は実効上限）。
+    pub async fn get_with_max_body(&self, url: &str, max_body_bytes: u64) -> Result<FetchResponse> {
+        let start = self.options.recorder.is_enabled().then(Instant::now);
+        let result = self.get_inner(url, max_body_bytes).await;
         if let Some(start) = start {
             self.options
                 .recorder
@@ -697,7 +713,9 @@ impl Fetcher {
     }
 
     /// [`Fetcher::get`] の本体（計装の内側。SSRF 検査の順序・内容は不変）。
-    async fn get_inner(&self, url: &str) -> Result<FetchResponse> {
+    async fn get_inner(&self, url: &str, max_body_bytes: u64) -> Result<FetchResponse> {
+        // 実効上限は設定値と呼び出し単位の上限の小さい方（受信中に強制する）。
+        let limit = self.options.max_body_bytes.min(max_body_bytes);
         let parsed = Url::parse(url).map_err(|source| Error::InvalidInput {
             message: format!("invalid URL: {source}"),
         })?;
@@ -720,11 +738,9 @@ impl Fetcher {
             .map(str::to_string);
 
         if let Some(content_length) = response.content_length()
-            && content_length > self.options.max_body_bytes
+            && content_length > limit
         {
-            return Err(Error::ResponseTooLarge {
-                limit: self.options.max_body_bytes,
-            });
+            return Err(Error::ResponseTooLarge { limit });
         }
 
         let mut final_url = response.url().clone();
@@ -744,7 +760,7 @@ impl Fetcher {
         let capacity = response
             .content_length()
             .unwrap_or(0)
-            .min(self.options.max_body_bytes)
+            .min(limit)
             .min(INITIAL_BODY_CAPACITY_LIMIT);
         let mut body = Vec::with_capacity(usize::try_from(capacity).unwrap_or(0));
 
@@ -757,21 +773,16 @@ impl Fetcher {
             let new_len = body
                 .len()
                 .checked_add(chunk.len())
-                .ok_or(Error::ResponseTooLarge {
-                    limit: self.options.max_body_bytes,
-                })?;
+                .ok_or(Error::ResponseTooLarge { limit })?;
             // `new_len`（`usize`）と `max_body_bytes`（`u64`）の比較は、
             // 32bit ターゲットで `usize` が `u64` より小さい可能性があるため
             // `as u64` によるキャストではなく `u64::try_from` を使う
             // （変換失敗時もアロケーション増幅を避けるため安全側の `Err` に
             // 倒す。coding-rust.md「エラーハンドリング」: checked 演算）。
-            let new_len_u64 = u64::try_from(new_len).map_err(|_| Error::ResponseTooLarge {
-                limit: self.options.max_body_bytes,
-            })?;
-            if new_len_u64 > self.options.max_body_bytes {
-                return Err(Error::ResponseTooLarge {
-                    limit: self.options.max_body_bytes,
-                });
+            let new_len_u64 =
+                u64::try_from(new_len).map_err(|_| Error::ResponseTooLarge { limit })?;
+            if new_len_u64 > limit {
+                return Err(Error::ResponseTooLarge { limit });
             }
             body.extend_from_slice(&chunk);
         }

@@ -693,12 +693,19 @@ async fn fetch_src(
     fetcher
         .validate_url(resolved.as_str())
         .map_err(|e| classify_fetch_error(&e))?;
+    // 上限は受信中に強制する（本文全体を確保してから検査しない）。
+    let limit = u64::try_from(max_src_bytes).unwrap_or(u64::MAX);
     let response = fetcher
-        .get(resolved.as_str())
+        .get_with_max_body(resolved.as_str(), limit)
         .await
         .map_err(|e| classify_fetch_error(&e))?;
     check_src_response(response.status(), response.body().len(), max_src_bytes)?;
-    Ok(response.body_text_lossy())
+    let text = response.body_text_lossy();
+    // 非可逆変換は不正バイトを 3 バイトの置換文字にするため、変換後も検査する。
+    if text.len() > max_src_bytes {
+        return Err(SrcFailure::TooLarge);
+    }
+    Ok(text)
 }
 
 /// 文書順にエントリを走査し、`src` を取得しつつスクリプト本文の総バイトを評価する。
@@ -737,7 +744,10 @@ async fn load_sources(
                 loads.push(ScriptLoad::Inline);
             }
             ScriptSource::External(src) => {
-                match fetch_src(fetcher, base, src, options.max_src_script_bytes).await {
+                // 総量の残りも受信上限に含める（超過分を確保しない）。
+                let remaining = options.max_total_script_bytes.saturating_sub(total);
+                let limit = options.max_src_script_bytes.min(remaining);
+                match fetch_src(fetcher, base, src, limit).await {
                     Ok(text) => match total.checked_add(text.len()) {
                         Some(t) if t <= options.max_total_script_bytes => {
                             total = t;
@@ -749,6 +759,10 @@ async fn load_sources(
                         }
                     },
                     Err(SrcFailure::Fetch(kind)) => loads.push(ScriptLoad::Failed(kind)),
+                    Err(SrcFailure::TooLarge) if remaining < options.max_src_script_bytes => {
+                        byte_abort = Some(total_exceeded(entry.index()));
+                        loads.push(ScriptLoad::Unfetched);
+                    }
                     Err(SrcFailure::TooLarge) => {
                         byte_abort = Some((
                             entry.index(),

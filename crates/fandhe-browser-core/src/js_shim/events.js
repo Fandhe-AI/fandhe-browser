@@ -12,7 +12,7 @@
 //   `lifecycleListenerError` op でメッセージ（4097 UTF-16 単位で打ち切り）だけ core に渡して
 //   後続のリスナーを続行する。
 // - `__fandheLifecycle` は non-writable / non-configurable で固定する（__dom と同じ作法）。
-//   再 install 時（同一 global への再評価）は既存を残して何もしない。
+//   再 install 時（同一 global への再評価）は窓口関数を残し、実体とリスナー状態だけを新しい評価のものへ差し替える。
 // - DOMContentLoaded は document → window の順（バブリングの近似）、load は window のみ。
 // - ES2015 の範囲に留める（V8 と boa で同一のソースを使うため）。
 //
@@ -168,9 +168,31 @@
         }
     }
 
-    if (!Object.prototype.hasOwnProperty.call(global, '__fandheLifecycle')) {
+    // 固定の窓口関数は初回だけ定義し、実体（dispatch）は再 install のたびに差し替える。
+    // これで addEventListener の登録先（今回の評価の listeners）と発火先が常に一致し、
+    // ページ間でリスナーを持ち越さない。
+    var existing = Object.prototype.hasOwnProperty.call(global, '__fandheLifecycle')
+        ? global.__fandheLifecycle
+        : null;
+    if (existing !== null && typeof existing === 'function' && existing.__fandheImpl === true) {
+        existing.setImpl(dispatch);
+    } else if (existing === null) {
+        var currentImpl = dispatch;
+        var entry = function __fandheLifecycle(eventName) {
+            try {
+                currentImpl(eventName);
+            } catch (e) {
+                // ディスパッチャーは throw しない。
+            }
+        };
+        Object.defineProperty(entry, '__fandheImpl', { value: true });
+        Object.defineProperty(entry, 'setImpl', {
+            value: function (impl) {
+                currentImpl = impl;
+            }
+        });
         Object.defineProperty(global, '__fandheLifecycle', {
-            value: dispatch,
+            value: entry,
             writable: false,
             configurable: false,
             enumerable: false

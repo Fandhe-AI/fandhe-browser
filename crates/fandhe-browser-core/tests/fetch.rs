@@ -204,6 +204,27 @@ async fn core_1_fetch_rejects_oversized_content_length() {
     );
 }
 
+/// JS-6（TASK-109）: リクエスト単位の本文上限は設定値より小さければ受信中に強制される。
+#[tokio::test]
+async fn js_6_fetch_get_with_max_body_enforces_per_request_limit() {
+    let port = spawn_loopback_server(|mut stream| {
+        drain_request_head(&mut stream);
+        let head = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(&vec![b'a'; 4096]);
+    });
+
+    let fetcher = Fetcher::new(loopback_allowed_options()).expect("Fetcher::new");
+    let err = fetcher
+        .get_with_max_body(&format!("http://127.0.0.1:{port}/"), 100)
+        .await
+        .expect_err("リクエスト単位の上限超過は Err になるはず");
+    assert!(
+        matches!(err, Error::ResponseTooLarge { limit: 100 }),
+        "unexpected error: {err:?}"
+    );
+}
+
 /// CORE-1（#36）: `Content-Length` が無い（chunked でも無い）応答でも、
 /// ストリーミング読み込み中の逐次検査で `Error::ResponseTooLarge` を返す。
 #[tokio::test]

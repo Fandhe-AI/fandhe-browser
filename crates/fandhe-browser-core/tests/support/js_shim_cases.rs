@@ -429,4 +429,19 @@ fn window_cases(engine: &str) {
     check(&mut p, "typeof console.log", "function");
     check(&mut p, "location.href", "https://example.com/x");
     check(&mut p, "window === globalThis", "true");
+
+    eprintln!("case: JS-4 reinstall fires only the new page's lifecycle listeners");
+    let mut p = setup(engine, None);
+    p.eval(
+        "globalThis.log = []; \
+         document.addEventListener('DOMContentLoaded', function () { log.push('old'); }); 'ok'",
+    );
+    p.rt.install_dom_shim(&p.bridge).expect("reinstall");
+    p.eval(
+        "globalThis.log = []; \
+         document.addEventListener('DOMContentLoaded', function () { log.push('new'); }); \
+         window.addEventListener('load', function () { log.push('load'); }); 'ok'",
+    );
+    p.eval("__fandheLifecycle('DOMContentLoaded'); __fandheLifecycle('load'); 'fired'");
+    check(&mut p, "log.join(',')", "new,load");
 }
