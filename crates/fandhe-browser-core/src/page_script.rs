@@ -355,14 +355,25 @@ pub fn collect_page_scripts(
     let mut exceeded = 0usize;
     let mut first_exceeded: Option<(usize, NodeId)> = None;
 
-    for id in document.descendants(document.root()) {
-        if !is_html_element(document, id, "script") {
-            continue;
+    // 前順 DFS。noscript 配下かどうかを子へ引き継ぎ、祖先走査を避けて全体を線形時間にする。
+    // 歩数は node_count で打ち切る（子リンクが壊れていても停止する）。
+    let mut stack: Vec<(NodeId, bool)> = document
+        .children(document.root())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|c| (c, false))
+        .collect();
+    let mut remaining_steps = document.node_count();
+    while let Some((id, in_noscript)) = stack.pop() {
+        if remaining_steps == 0 {
+            break;
         }
-        if document
-            .ancestors(id)
-            .any(|a| is_html_element(document, a, "noscript"))
-        {
+        remaining_steps -= 1;
+        let in_noscript = in_noscript || is_html_element(document, id, "noscript");
+        let children: Vec<NodeId> = document.children(id).collect();
+        stack.extend(children.into_iter().rev().map(|c| (c, in_noscript)));
+        if in_noscript || !is_html_element(document, id, "script") {
             continue;
         }
         let index = out.seen_scripts;
@@ -456,6 +467,9 @@ pub fn collect_page_scripts(
                 options.max_scripts
             ),
         ));
+        // 文書順の契約を保つため、通し番号順に並べ直す（安定ソート）。
+        out.diagnostics
+            .sort_by_key(|d| d.index.unwrap_or(usize::MAX));
     }
     out
 }
@@ -479,6 +493,27 @@ mod tests {
             ScriptSource::Inline(s) => s,
             _ => "<external>",
         }
+    }
+
+    /// JS-6: 上限超過診断も文書順（index 昇順）に並ぶ。
+    #[test]
+    fn js_6_limit_diagnostic_is_in_document_order() {
+        let r = collect_with(
+            "<script>1</script><script>2</script><script type=module></script>",
+            &ScriptCollectionOptions::default().with_max_scripts(1),
+        );
+        let idx: Vec<Option<usize>> = r.diagnostics().iter().map(|d| d.index()).collect();
+        assert_eq!(idx, [Some(1), Some(2)]);
+    }
+
+    /// JS-6: 深い入れ子でも祖先走査せず noscript 配下を除外できる。
+    #[test]
+    fn js_6_deep_nesting_with_noscript_is_linear_and_excluded() {
+        let mut html = String::from("<body><noscript><script>x</script></noscript>");
+        html.push_str(&"<div>".repeat(2000));
+        html.push_str(&"<script></script>".repeat(2000));
+        let r = collect(&html);
+        assert_eq!(r.seen_scripts(), 2000);
     }
 
     /// JS-4: head → body、入れ子の順に文書順で集める。
