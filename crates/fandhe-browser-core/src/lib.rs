@@ -112,10 +112,11 @@ pub use cssom_profile::{
 };
 pub use dom::{
     Ancestors, Attribute, Children, DEFAULT_MAX_SERIALIZED_BYTES, Descendants, Document, DomLimits,
-    Node, NodeData, NodeId, QuirksMode, SerializeResult, SerializeScope,
+    InnerHtmlOutcome, Node, NodeData, NodeId, QuirksMode, SerializeResult, SerializeScope,
 };
 pub use dom_bridge::{
-    DOM_BRIDGE_METHOD_NAME, DOM_BRIDGE_OBJECT_NAME, DomBridge, DomBridgeError, DomBridgeLimits,
+    DOM_BRIDGE_METHOD_NAME, DOM_BRIDGE_OBJECT_NAME, DocumentReadyState, DomBridge, DomBridgeError,
+    DomBridgeLimits,
 };
 pub use error::{DomError, Error, NameKind, ParseError, Result};
 pub use fetch::{FetchOptions, FetchResponse, Fetcher};
