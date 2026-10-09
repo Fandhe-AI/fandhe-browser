@@ -199,6 +199,11 @@ impl FetchOptions {
     }
 }
 
+/// [`Fetcher`] が送る `User-Agent` で、JS shim の `navigator.userAgent` が返す値と同一の
+/// 単一の定義（`JS-5`・`SEC-2`。TASK-108・#779）。自動化ブラウザであることを正直に示し、
+/// 実ブラウザを装う値へ変えない（security.md「偽装・回避機能の禁止」）。
+pub const USER_AGENT: &str = concat!("fandhe-browser/", env!("CARGO_PKG_VERSION"));
+
 /// HTTP/HTTPS でページを取得するクライアント。内部に `reqwest::Client` を
 /// 保持し、接続プールを再利用する（呼び出しのたびに構築しない）。
 ///
@@ -624,7 +629,7 @@ impl Fetcher {
             .redirect(redirect_policy)
             .no_proxy()
             .dns_resolver(resolver)
-            .user_agent(concat!("fandhe-browser/", env!("CARGO_PKG_VERSION")))
+            .user_agent(USER_AGENT)
             .build()
             .map_err(|source| map_reqwest_error(source, &options))?;
 
@@ -974,6 +979,18 @@ impl FetchResponse {
 
 #[cfg(test)]
 mod tests {
+    /// `JS-5`・`SEC-2`: UA は固定書式で、実ブラウザを装う語を含まない。
+    #[test]
+    fn js_5_user_agent_is_honest_and_single_sourced() {
+        assert_eq!(
+            super::USER_AGENT,
+            format!("fandhe-browser/{}", env!("CARGO_PKG_VERSION"))
+        );
+        for banned in ["Chrome", "Mozilla", "Safari", "Headless", "Gecko"] {
+            assert!(!super::USER_AGENT.contains(banned), "{banned}");
+        }
+    }
+
     use super::*;
     use std::net::Ipv6Addr;
 

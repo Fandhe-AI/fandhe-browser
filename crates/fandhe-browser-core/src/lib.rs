@@ -119,11 +119,12 @@ pub use dom::{
     InnerHtmlOutcome, Node, NodeData, NodeId, QuirksMode, SerializeResult, SerializeScope,
 };
 pub use dom_bridge::{
-    DOM_BRIDGE_METHOD_NAME, DOM_BRIDGE_OBJECT_NAME, DocumentReadyState, DomBridge, DomBridgeError,
-    DomBridgeLimits,
+    BridgeDiagnostics, ConsoleLevel, ConsoleMessage, DOM_BRIDGE_METHOD_NAME,
+    DOM_BRIDGE_OBJECT_NAME, DocumentReadyState, DomBridge, DomBridgeError, DomBridgeLimits,
+    IgnoredLocationChange, LocationChangeKind, MAX_BRIDGE_DIAGNOSTICS, MAX_CONSOLE_MESSAGE_BYTES,
 };
 pub use error::{DomError, Error, NameKind, ParseError, Result};
-pub use fetch::{FetchOptions, FetchResponse, Fetcher};
+pub use fetch::{FetchOptions, FetchResponse, Fetcher, USER_AGENT};
 // js crate のワーカー入口をそのまま再エクスポートする（ラッパーを挟まない）。ラッパーで
 // マーカー設定時にも `None` を返すと fail-closed が崩れるため（security.md・`JS-2`・#513）。
 pub use fandhe_browser_js::run_js_worker_if_requested;

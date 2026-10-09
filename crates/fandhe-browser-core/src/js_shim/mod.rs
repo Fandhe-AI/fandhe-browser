@@ -13,12 +13,15 @@
 //!
 //! # 拡張
 //!
-//! `window` / `location` / `navigator` / `console`（#779）は [`JS_SHIM_SOURCES`] に
-//! ソースを足して追加する（評価は配列の順）。
+//! `window` / `self` / `location` / `navigator` / `console`（#779）は `window.js` に置き、
+//! [`JS_SHIM_SOURCES`] の dom.js の後ろに足してある（評価は配列の順）。`navigator` は
+//! 自動化ブラウザであることを正直に示し（`SEC-2`）、`location` はランナーが
+//! [`crate::dom_bridge::DomBridge::set_location`] で設定した URL を読む。
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! `dom.js` 冒頭の「未実装」節を参照（DOMException 写像・NodeList 互換・追加 API）。
+//! `dom.js` / `window.js` 冒頭の「未実装」節を参照（DOMException 写像・NodeList 互換・
+//! イベント系・`document.location`・追加 API）。
 
 use fandhe_browser_js::{EvaluateOptions, JsEngine, JsEngineError};
 
@@ -33,10 +36,16 @@ pub struct JsShimSource {
 }
 
 /// 評価順に並べた shim ソース（`JS-5`）。
-pub const JS_SHIM_SOURCES: &[JsShimSource] = &[JsShimSource {
-    name: "dom.js",
-    source: include_str!("dom.js"),
-}];
+pub const JS_SHIM_SOURCES: &[JsShimSource] = &[
+    JsShimSource {
+        name: "dom.js",
+        source: include_str!("dom.js"),
+    },
+    JsShimSource {
+        name: "window.js",
+        source: include_str!("window.js"),
+    },
+];
 
 /// [`install`] の結果（REPAIR-4: 将来の拡張に備え構造体で返す）。
 #[derive(Debug, Clone, PartialEq, Eq)]
