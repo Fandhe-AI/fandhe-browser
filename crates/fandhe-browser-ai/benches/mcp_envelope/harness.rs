@@ -10,7 +10,7 @@
 //! `/ai/navigate` 実装後は MCP の navigate 経由へ切り替える）。ネットワークは使わない。
 //!
 //! 一致検証（受入基準の根拠）: MCP の text と直接応答本文を `serde_json::Value` として比較し、
-//! 不一致は失敗にする。数値の確定と判断は #386（TASK-97.2）・#387 が担う。
+//! 不一致は失敗にする。実測値は `docs/design/mcp-envelope-report.md`（#386）、判断は #387 が担う。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
