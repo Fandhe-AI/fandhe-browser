@@ -68,6 +68,9 @@
 //! `__dom.op` を core の `Document` へ転送するブリッジ（操作名ディスパッチ・ID 検証・上限）を持つ。
 //! [`js_shim`] モジュール（TASK-108・#778・`JS-5`）は、そのブリッジを呼ぶ JS shim
 //! （`document` / Node 系）を埋め込み、`JsRuntime::install_dom_shim` で注入する。
+//! [`page_runner`] モジュール（TASK-109・#780・`JS-4`・`JS-6`）は、上記を組み合わせて
+//! inline `<script>` を文書順に実行し、例外を集約しつつ実時間上限で打ち切って、変更後の
+//! HTML を返す（`src` の取得・DOMContentLoaded / load は #781）。
 //!
 //! # スタブについて
 //!
@@ -76,6 +79,7 @@
 //!
 //! - [`cssom`]（`CORE-5`・`TASK-105`・`MS-8`。型定義・宣言パーサー・詳細度計算・ルール分割・スタイル源収集・セレクタマッチング・カスケード解決のみ。`!important`・継承等は未実装）
 //! - [`page_script`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。収集のみ。SVG の script・`language`・module 実行等は未実装）
+//! - [`page_runner`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。inline のみ。`src`・総バイト・DOMContentLoaded / load は #781、アクター化は #784）
 //! - [`dom_bridge`]（`JS-5`・`JS-6`・`TASK-108`・`MS-6`。`setInnerHTML` は `Document::set_inner_html` で置換する。DOM 操作以外の op は未実装）
 //! - [`js_shim`]（`JS-5`・`TASK-108`・`MS-6`。window / location / navigator / console は #779）
 //! - [`js_stub`]（`JS-2`・`TASK-30`・`MS-3`）
@@ -96,6 +100,7 @@ pub mod host;
 pub mod js_shim;
 pub mod js_stub;
 pub mod observability;
+pub mod page_runner;
 pub mod page_script;
 pub mod parse;
 pub mod query;
@@ -130,10 +135,15 @@ pub use fetch::{FetchOptions, FetchResponse, Fetcher, USER_AGENT};
 pub use fandhe_browser_js::run_js_worker_if_requested;
 // `JsRuntime::inject_global_function` の引数・エラー型。利用側（WPT ランナー等）が js crate へ
 // 直接依存せず core 経由で扱えるようにする（PLUG-10・TASK-101.2.1・#553）。
-pub use fandhe_browser_js::{JsEngineError, JsValue, NativeFn};
+pub use fandhe_browser_js::{EvaluateOptions, JsEngineError, JsValue, NativeFn};
 pub use observability::{
     FailureKind, InMemoryRecorder, OperationCounts, OperationKind, OperationOutcome,
     OperationRecord, OperationRecorder, RecorderHandle,
+};
+pub use page_runner::{
+    AbortKind, DEFAULT_PAGE_WALL_TIME, DEFAULT_SCRIPT_WALL_TIME, MAX_SCRIPT_ERROR_MESSAGE_BYTES,
+    PageAbort, PageRunInput, PageRunOptions, PageRunOutput, ScriptOutcome, ScriptRunRecord,
+    WallTimeScope, run_page_scripts,
 };
 pub use page_script::{
     CollectedScripts, DEFAULT_MAX_INLINE_SCRIPT_BYTES, DEFAULT_MAX_PAGE_SCRIPTS,

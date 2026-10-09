@@ -211,7 +211,7 @@ impl BridgeDiagnostics {
 }
 
 /// `s` を UTF-8 の文字境界を守って `max` バイト以下に切り詰める（切り詰めたら `true`）。
-pub(super) fn truncate_utf8(s: &str, max: usize) -> (&str, bool) {
+pub(crate) fn truncate_utf8(s: &str, max: usize) -> (&str, bool) {
     if s.len() <= max {
         return (s, false);
     }

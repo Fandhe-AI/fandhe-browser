@@ -1,7 +1,7 @@
 //! パース済み DOM から実行対象の `<script>` を文書順に集めるモジュール
 //! （TASK-109・MS-6・Issue #774・ビヘイビア `JS-4`・`JS-6`）。
 //!
-//! 呼び出し元は、ページスクリプトランナー（inline の評価は #780、`src` の取得と
+//! 呼び出し元は、ページスクリプトランナー（inline の評価は [`crate::page_runner`]（#780）、`src` の取得と
 //! DOMContentLoaded / load の発火は #781）。本モジュールは **収集だけ** を担い、
 //! スクリプトの評価・ネットワークアクセスは一切行わない。
 //!
@@ -25,7 +25,7 @@
 //!
 //! # 責務外・未実装（実装済みを装わない。REPAIR-3）
 //!
-//! - スクリプトの評価（#780）、`src` の URL 検証・取得（#781。`Fetcher` 経由のみ。`JS-8`）、
+//! - スクリプトの評価（[`crate::page_runner`] の担当）、`src` の URL 検証・取得（#781。`Fetcher` 経由のみ。`JS-8`）、
 //!   総バイト上限（#781）、DOMContentLoaded / load（#781）。
 //! - SVG の `<script>`、`language` 属性、`type=module`・import map の実行、
 //!   `crossorigin`・`integrity`・`referrerpolicy`、`charset`、`document.write` で
