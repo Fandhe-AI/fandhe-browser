@@ -50,7 +50,7 @@ fn js_1_public_signatures_are_pinned_without_v8_types() {
         EvaluateOptions::default().timeout(),
         std::time::Duration::from_secs(2)
     );
-    assert_eq!(EvaluateOptions::default().max_result_bytes(), 1_048_576);
+    assert_eq!(EvaluateOptions::default().max_result_bytes(), 3_145_728);
     let _: NativeFn = Box::new(|_: &[JsValue]| Ok(JsValue::Undefined));
 
     // トレイトメソッドの署名は、呼び出し形（コンパイルのみ。実行しない）で固定する。

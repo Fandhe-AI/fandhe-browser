@@ -2057,6 +2057,17 @@ mod tests {
         ));
     }
 
+    /// TASK-109・`JS-6`: 既定オプションでは従来成功していた非 ASCII の
+    /// 大きな結果（400,000 文字 = UTF-8 で 1.2 MB）が引き続き成功する。
+    #[test]
+    fn js_6_v8_default_options_keep_large_non_ascii_result() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let result = engine
+            .evaluate_script("'あ'.repeat(400000)", &EvaluateOptions::default())
+            .unwrap();
+        assert_eq!(result, JsValue::String("あ".repeat(400_000)));
+    }
+
     /// TASK-109・`JS-6`: 結果サイズ超過の後も同じエンジンで評価できる。
     #[test]
     fn js_6_v8_result_size_limit_exceeded_keeps_engine_usable() {

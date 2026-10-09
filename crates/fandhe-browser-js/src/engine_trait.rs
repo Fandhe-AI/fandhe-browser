@@ -247,7 +247,9 @@ pub type NativeFn = Box<dyn FnMut(&[JsValue]) -> Result<JsValue, JsEngineError> 
 ///
 /// 評価 1 回ごとの実時間タイムアウトと結果サイズ上限を呼び出し側（後続の
 /// ページスクリプトランナー）が指定するための型。`Default` は従来の固定値
-/// （タイムアウト 2 秒・結果 1 MiB）と同じで、指定しなければ挙動は変わらない。
+/// （タイムアウト 2 秒・結果 1M UTF-16 単位）と等価で、指定しなければ挙動は変わらない。
+/// 結果上限は UTF-8 バイトで数えるため、既定値は 1M UTF-16 単位の UTF-8 最大長
+/// （3 バイト/単位）にあたる 3 MiB とする。
 ///
 /// # 適用範囲（実装済みを装わない。REPAIR-3）
 ///
@@ -276,8 +278,10 @@ pub struct EvaluateOptions {
 impl EvaluateOptions {
     /// 既定の実時間タイムアウト（2 秒）。`shared::SCRIPT_EXECUTION_TIMEOUT` の正本。
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
-    /// 既定の結果サイズ上限（1 MiB = 1,048,576 バイト）。
-    pub const DEFAULT_MAX_RESULT_BYTES: usize = 1_048_576;
+    /// 既定の結果サイズ上限（3 MiB = 3,145,728 バイト）。従来の固定上限
+    /// （1M UTF-16 単位）の UTF-8 での最大長（3 バイト/単位）と等価で、
+    /// 日本語など非 ASCII の結果も従来どおり通る。
+    pub const DEFAULT_MAX_RESULT_BYTES: usize = 3 * 1_048_576;
 
     /// 実時間タイムアウトを指定する。
     #[must_use]
@@ -624,12 +628,12 @@ fn create_v8_engine() -> Result<Box<dyn JsEngine>, CreateEngineError> {
 mod tests {
     use super::*;
 
-    /// TASK-109・`JS-6`: 既定値は従来の固定値（2 秒・1 MiB）と同じ。
+    /// TASK-109・`JS-6`: 既定値は従来の固定値（2 秒・1M UTF-16 単位 = UTF-8 で 3 MiB）と等価。
     #[test]
     fn js_6_evaluate_options_default_values() {
         let options = EvaluateOptions::default();
         assert_eq!(options.timeout(), Duration::from_secs(2));
-        assert_eq!(options.max_result_bytes(), 1_048_576);
+        assert_eq!(options.max_result_bytes(), 3_145_728);
     }
 
     /// TASK-109・`JS-6`: builder で指定した値が getter で読み戻せる。
