@@ -842,6 +842,12 @@ impl DomBridge {
         Ok(())
     }
 
+    /// 同じ内部状態を共有するブリッジか（`JsRuntime::install_dom_shim` が束縛済みの
+    /// ブリッジと一致するかの判定に使う）。
+    pub(crate) fn same_instance(&self, other: &DomBridge) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     /// `__dom.op` の本体。`args[0]` が操作名、残りが操作の引数。エンジン無しでも呼べる。
     pub fn dispatch(&self, args: &[JsValue]) -> Result<JsValue, DomBridgeError> {
         let mut guard = self.lock()?;

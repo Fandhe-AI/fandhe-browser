@@ -66,6 +66,8 @@
 //! 実行対象の `<script>` を文書順に収集する（評価・`src` 取得は #780・#781 の担当）。
 //! [`dom_bridge`] モジュール（TASK-108・#777・`JS-5`・`JS-6`）は、ページ内 JS の
 //! `__dom.op` を core の `Document` へ転送するブリッジ（操作名ディスパッチ・ID 検証・上限）を持つ。
+//! [`js_shim`] モジュール（TASK-108・#778・`JS-5`）は、そのブリッジを呼ぶ JS shim
+//! （`document` / Node 系）を埋め込み、`JsRuntime::install_dom_shim` で注入する。
 //!
 //! # スタブについて
 //!
@@ -75,6 +77,7 @@
 //! - [`cssom`]（`CORE-5`・`TASK-105`・`MS-8`。型定義・宣言パーサー・詳細度計算・ルール分割・スタイル源収集・セレクタマッチング・カスケード解決のみ。`!important`・継承等は未実装）
 //! - [`page_script`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。収集のみ。SVG の script・`language`・module 実行等は未実装）
 //! - [`dom_bridge`]（`JS-5`・`JS-6`・`TASK-108`・`MS-6`。`setInnerHTML` は未実装で `Unsupported`）
+//! - [`js_shim`]（`JS-5`・`TASK-108`・`MS-6`。window / location / navigator / console は #779）
 //! - [`js_stub`]（`JS-2`・`TASK-30`・`MS-3`）
 //! - [`render::DisabledRenderer`]（`RENDER-1`・`TASK-33`/`TASK-38`・`MS-1`/`MS-4`）
 //! - [`observability::OperationRecord::to_json_line`]（`REPAIR-9`・`TASK-10（10.1）`・
@@ -90,6 +93,7 @@ pub mod dom_bridge;
 pub mod error;
 pub mod fetch;
 pub mod host;
+pub mod js_shim;
 pub mod js_stub;
 pub mod observability;
 pub mod page_script;

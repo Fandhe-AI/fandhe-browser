@@ -32,11 +32,18 @@
 //!   その時点でワーカーが起動する）。呼び出し元が
 //!   [`JsRuntime::inject_global_function`] を明示的に呼んだときだけ注入する
 //!   （`PLUG-10`・TASK-101.2.1・#553。WPT ランナーが結果受け取り用の関数を注入する）。
-//!   DOM バインディングの配線は後続タスクで決める。
+//!   DOM shim も [`JsRuntime::install_dom_shim`] を呼んだときだけ bind・注入する。
+//!
+//! # DOM shim の注入（`JS-5`・TASK-108・Issue #778）
+//!
+//! [`JsRuntime::install_dom_shim`] が呼び出し元の明示指示でのみ `__dom`（DOM ブリッジ）を
+//! bind し、`js_shim` の JS ソースを評価する。ページごと・子プロセス再起動のたびに
+//! 呼び直す契約は同メソッドの doc を参照。
 //!
 //! # スタブ・簡易実装の残り（REPAIR-3）
 //!
-//! - DOM 風オブジェクトのバインド（`bind_dom_like_object`）の配線は未実装（後続）。
+//! - ページ実行ランナーからの `install_dom_shim` の配線（ページごとの再注入・再起動検知）は
+//!   TASK-109（#780・#784）の担当で未実装。
 //!
 //! # 可観測性（`REPAIR-9`・`TASK-10.2.2`・Issue #550）
 //!
@@ -55,6 +62,8 @@ use fandhe_browser_js::{
 pub use fandhe_browser_js::{JsEngineError, NativeFn};
 
 use crate::config::JsConfig;
+use crate::dom_bridge::DomBridge;
+use crate::js_shim::{self, JsShimInstallation};
 use crate::observability::{OperationKind, OperationRecorder, RecorderHandle};
 
 /// [`execute_js_stub_with_options`] の設定（`REPAIR-9`・`TASK-10.2.2`）。
@@ -103,6 +112,9 @@ enum RuntimeState {
     Enabled {
         kind: EngineKind,
         engine: Box<dyn JsEngine>,
+        /// `__dom` を bind 済みのブリッジ（[`JsRuntime::install_dom_shim`]）。同じエンジンへ
+        /// `__dom` を 2 回 bind すると失敗するため、再 install 時の判定に保持する。
+        dom_bridge: Option<DomBridge>,
     },
     /// エンジンなしビルド、または明示的な JS 無効。評価は常に失敗する。
     Disabled,
@@ -150,7 +162,11 @@ impl JsRuntime {
             Some(kind) => {
                 let engine = create_engine(kind).map_err(engine_creation_error)?;
                 Ok(JsRuntime {
-                    state: RuntimeState::Enabled { kind, engine },
+                    state: RuntimeState::Enabled {
+                        kind,
+                        engine,
+                        dom_bridge: None,
+                    },
                 })
             }
         }
@@ -214,10 +230,56 @@ impl JsRuntime {
         }
     }
 
+    /// `document` / Node 系の JS shim を注入する（`JS-5`・TASK-108・Issue #778）。
+    ///
+    /// 初回は `bridge` を `__dom` として bind してから `js_shim::install` で shim を評価する。
+    /// 同じ `bridge` での 2 回目以降は bind を省き shim の再評価だけを行う（同一コンテキストでも
+    /// SyntaxError にならない）。別の `bridge` を渡すと `Err`（`__dom` は 1 回しか bind できない）。
+    ///
+    /// 契約:
+    /// - ページ（`DomBridge::attach`）のたびに呼び直す。shim は文書の ID を内部に持つ
+    /// - 子プロセス版エンジンが再起動した後（`EngineUnavailable` の後）はスクリプト上の状態が
+    ///   失われるため、呼び直す
+    /// - 呼び出し元が明示的に呼んだときだけ bind する（PERF-7 の遅延起動と矛盾しない。V8 では
+    ///   この呼び出しでワーカーが起動する）
+    /// - JS 無効のランタイムは成功を装わず `JsExecutionUnavailable`
+    pub fn install_dom_shim(&mut self, bridge: &DomBridge) -> crate::Result<JsShimInstallation> {
+        match &mut self.state {
+            RuntimeState::Disabled => Err(crate::Error::JsExecutionUnavailable {
+                message: DISABLED_MESSAGE.to_string(),
+            }),
+            RuntimeState::Enabled {
+                engine, dom_bridge, ..
+            } => {
+                match dom_bridge {
+                    Some(bound) if !bound.same_instance(bridge) => {
+                        return Err(crate::Error::Unsupported {
+                            message: "a different DOM bridge is already bound to this JS runtime"
+                                .to_string(),
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        bridge
+                            .register(engine.as_mut())
+                            .map_err(crate::Error::JsEvaluation)?;
+                        *dom_bridge = Some(bridge.clone());
+                    }
+                }
+                js_shim::install(engine.as_mut(), &EvaluateOptions::default())
+                    .map_err(crate::Error::JsEvaluation)
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn from_engine_for_test(kind: EngineKind, engine: Box<dyn JsEngine>) -> Self {
         JsRuntime {
-            state: RuntimeState::Enabled { kind, engine },
+            state: RuntimeState::Enabled {
+                kind,
+                engine,
+                dom_bridge: None,
+            },
         }
     }
 }
