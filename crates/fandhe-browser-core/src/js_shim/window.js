@@ -152,7 +152,14 @@
                 } catch (e) {
                     piece = '[unprintable]';
                 }
-                text += (i > 0 ? ' ' : '') + piece;
+                var sep = i > 0 ? ' ' : '';
+                // 連結前に残り文字数へ切り詰め、巨大文字列の連結を避ける。
+                var room = MAX_TEXT_UNITS - text.length - sep.length;
+                if (room <= 0) {
+                    text += sep;
+                    break;
+                }
+                text += sep + (piece.length > room ? piece.slice(0, room) : piece);
             }
             if (text.length > MAX_TEXT_UNITS) {
                 var end = MAX_TEXT_UNITS;

@@ -239,6 +239,10 @@ pub(super) fn parse_location(input: &str) -> Result<Url, &'static str> {
     // userinfo は公開値から常に取り除く（fetch の final_url と同じ扱い）。
     let _ = url.set_username("");
     let _ = url.set_password(None);
+    // 正規化（パーセントエンコード等）で伸びた後の長さにも上限を適用する。
+    if url.as_str().len() > MAX_LOCATION_URL_BYTES {
+        return Err("URL is too long");
+    }
     Ok(url)
 }
 
@@ -338,6 +342,15 @@ mod tests {
         assert!(parse_location(&at_limit).is_ok());
         let over = format!("{at_limit}a");
         let e = parse_location(&over).expect_err("over");
+        assert_eq!(e, "URL is too long");
+    }
+
+    #[test]
+    fn js_5_parse_location_limits_length_after_normalization() {
+        // 入力は 8192 バイト以下だが、パーセントエンコードで正規化後に上限を超える。
+        let input = format!("https://example.com/{}", "あ".repeat(2000));
+        assert!(input.len() <= MAX_LOCATION_URL_BYTES);
+        let e = parse_location(&input).expect_err("normalized too long");
         assert_eq!(e, "URL is too long");
     }
 
