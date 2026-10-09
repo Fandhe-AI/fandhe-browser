@@ -515,7 +515,13 @@ impl Document {
         let existing = self.attribute_index(element, name);
         let removed = match self.node_mut(element)?.data {
             NodeData::Element { ref mut attrs, .. } => match existing {
-                Some(i) if i < attrs.len() => Some(attrs.remove(i)),
+                Some(i) if i < attrs.len() => {
+                    let a = attrs.remove(i);
+                    // 確保容量は保持バイト数の予算に数えないため、削除のたびに解放する
+                    // （追加と全削除の繰り返しで容量が蓄積するのを防ぐ。AGENTS.md リソース上限）。
+                    attrs.shrink_to_fit();
+                    Some(a)
+                }
                 _ => None,
             },
             _ => return Err(kind_err("remove_attribute", "node is not an element")),
