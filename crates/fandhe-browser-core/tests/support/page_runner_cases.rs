@@ -421,6 +421,26 @@ pub fn run(engine: &str) {
         vec!["second"]
     );
 
+    eprintln!("case: JS-4 tampered push/splice/slice/species does not stop once listeners");
+    let html = "<body><script>\
+        Array.prototype.push = function () { throw new Error('tampered'); };\
+        Array.prototype.splice = function () { throw new Error('tampered'); };\
+        Array.prototype.slice = function () { throw new Error('tampered'); };\
+        Object.defineProperty(Array, Symbol.species, { get: function () { throw new Error('tampered'); } });\
+        document.addEventListener('DOMContentLoaded', function () { console.log('first'); }, { once: true });\
+        document.addEventListener('DOMContentLoaded', function () { console.log('second'); });\
+        window.addEventListener('load', function () { console.log('third'); }, { once: true });\
+        </script></body>";
+    let out = run_page(engine, html, &opts);
+    assert_eq!(
+        out.bridge_diagnostics()
+            .console_messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second", "third"]
+    );
+
     #[cfg(target_os = "linux")]
     {
         eprintln!("case: JS-6 no child process remains");

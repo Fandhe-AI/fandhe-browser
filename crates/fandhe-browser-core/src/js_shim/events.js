@@ -35,8 +35,8 @@
     var callOp = Function.prototype.call.bind(nativeOp, bridge);
     var defineProperty = Object.defineProperty;
     // 発火時にページが書き換え得る組み込みメソッドも、install 時に退避して使う（JS-4）。
-    var arraySlice = Function.prototype.call.bind(Array.prototype.slice);
-    var arrayIndexOf = Function.prototype.call.bind(Array.prototype.indexOf);
+    // 配列の push / splice / slice / indexOf は使わない（ページが差し替えたり、splice / slice が
+    // 参照する Array[Symbol.species] を改変したりしても通知が止まらないよう、添字演算だけで操作する）。
     var fnCall = Function.prototype.call.bind(Function.prototype.call);
     var MAX_TEXT_UNITS = 4097;
     // document / window それぞれの保持件数の上限。確保前に検証し、超過した登録は無視して
@@ -69,14 +69,18 @@
             }
             return;
         }
-        list.push({ type: type, listener: listener, once: once });
+        list[list.length] = { type: type, listener: listener, once: once };
     }
 
     function remove(target, type, listener) {
         var list = target.listeners;
         for (var i = 0; i < list.length; i++) {
             if (list[i].type === type && list[i].listener === listener) {
-                list.splice(i, 1);
+                var len = list.length;
+                for (var j = i; j < len - 1; j++) {
+                    list[j] = list[j + 1];
+                }
+                list.length = len - 1;
                 return;
             }
         }
@@ -128,7 +132,11 @@
 
     function fire(target, currentTarget, event, eventName, state) {
         // 呼び出し中の登録・削除の影響を受けないよう複製して走査する。
-        var snapshot = arraySlice(target.listeners);
+        var source = target.listeners;
+        var snapshot = [];
+        for (var k = 0; k < source.length; k++) {
+            snapshot[k] = source[k];
+        }
         for (var i = 0; i < snapshot.length; i++) {
             if (state.immediateStopped) {
                 return;
@@ -138,7 +146,14 @@
                 continue;
             }
             // 走査中に removeEventListener されたものは呼ばない。
-            if (arrayIndexOf(target.listeners, entry) < 0) {
+            var alive = false;
+            for (var m = 0; m < source.length; m++) {
+                if (source[m] === entry) {
+                    alive = true;
+                    break;
+                }
+            }
+            if (!alive) {
                 continue;
             }
             if (entry.once) {
