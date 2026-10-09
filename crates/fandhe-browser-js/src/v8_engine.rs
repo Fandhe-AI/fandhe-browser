@@ -1060,6 +1060,18 @@ impl V8Engine {
         options: &EvaluateOptions,
     ) -> Result<JsValue, JsEngineError> {
         let timeout = options.timeout();
+        // `Duration::ZERO` は「すぐ打ち切る（fail-closed）」契約（`JS-6`・
+        // TASK-109）。監視スレッドの `recv_timeout(ZERO)` に任せると、
+        // 監視スレッド起動前にスクリプトが完了して成功を返し、副作用も
+        // 先に発生しうる。そのためコンパイル・実行・監視スレッド起動の
+        // 前に同期的に `Timeout` を返し、スクリプトは一切実行しない。
+        if timeout.is_zero() {
+            return Err(V8Failure::Terminated {
+                stage: "execution",
+                timeout,
+            }
+            .into());
+        }
         // タイムアウト監視スレッド（後述）から呼び出す `IsolateHandle` は
         // `isolate` を可変借用する `scope`/`tc` より前に取得する
         // （`Isolate::thread_safe_handle` は `&self` のみで済み、
@@ -1986,6 +1998,32 @@ mod tests {
             }
             other => panic!("expected EvaluationFailed for an oversized script, got: {other:?}"),
         }
+    }
+
+    /// TASK-109・`JS-6`: `Duration::ZERO` はスクリプトを実行せず `Timeout`
+    /// を返す（副作用なし）。エンジンはその後も使える。
+    #[test]
+    fn js_6_v8_zero_timeout_rejects_without_running_script() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let options = EvaluateOptions::default().with_timeout(Duration::ZERO);
+        for _ in 0..20 {
+            match engine.evaluate_script("globalThis.zeroTimeoutSideEffect = 1; 1 + 1", &options) {
+                Err(JsEngineError::Timeout(msg)) => {
+                    assert_eq!(
+                        msg,
+                        "script execution exceeded the 0 second timeout and was terminated"
+                    )
+                }
+                other => panic!("expected Timeout, got: {other:?}"),
+            }
+        }
+        let probe = engine
+            .evaluate_script(
+                "typeof globalThis.zeroTimeoutSideEffect",
+                &EvaluateOptions::default(),
+            )
+            .expect("engine must remain usable after a zero timeout");
+        assert_eq!(probe, JsValue::String("undefined".to_string()));
     }
 
     /// TASK-109・`JS-6`: 200ms 指定の無限ループが 2 秒以内に `Timeout` で
