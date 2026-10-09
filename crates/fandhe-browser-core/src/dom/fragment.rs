@@ -19,7 +19,7 @@
 //!   （[`Document::set_text_content`] と同じ）。
 
 use super::mutation::{kind_err, not_found};
-use super::{Document, HTML_NAMESPACE_URI, Node, NodeData, NodeId, QualName};
+use super::{Attribute, Document, HTML_NAMESPACE_URI, Node, NodeData, NodeId, QualName};
 use crate::error::{DomError, Error, NameKind, ParseError, Result};
 use crate::parse::{ParseOptions, parse_fragment};
 use html5ever::{LocalName, Namespace};
@@ -107,12 +107,32 @@ impl Document {
     /// 挿入した `<script>` の「実行済み」フラグ等は持たない（REPAIR-3）。実行制御は
     /// ページ実行ランナー（TASK-109）側の責務。
     pub fn set_inner_html(&mut self, node: NodeId, html: &str) -> Result<InnerHtmlOutcome> {
-        let Some(context) = context_name(&self.require_node(node)?.data) else {
+        let ctx_node = self.require_node(node)?;
+        let Some(context) = context_name(&ctx_node.data) else {
             return Err(kind_err(
                 "set_inner_html",
                 "node kind cannot have inner HTML",
             ));
         };
+        // 文脈要素の属性（annotation-xml の encoding 等）はパーサーへ引き継ぐ。
+        let context_attrs: Vec<Attribute> = match &ctx_node.data {
+            NodeData::Element { attrs, .. } => attrs.clone(),
+            _ => Vec::new(),
+        };
+        // パース用補助ノード: Document・文脈要素・`<html>`。template 文脈では
+        // ArenaSink が文脈用 DocumentFragment も作るため 1 個多い。
+        let aux_nodes: usize = if matches!(
+            &ctx_node.data,
+            NodeData::Element {
+                template_contents: Some(_),
+                ..
+            }
+        ) {
+            4
+        } else {
+            3
+        };
+        let quirks_mode = self.quirks_mode;
         self.check_text_len(html.len())?;
         // `<template>` の子は template_contents（DocumentFragment）に保持されるため、
         // パース文脈は要素のまま、取り外し・接続先だけをその Fragment に切り替える。
@@ -126,8 +146,8 @@ impl Document {
             });
         }
 
-        // パース自体が残り容量を超えられないよう上限を絞る。+3 は Document・文脈要素・
-        // フラグメントの親 `<html>` の分（parse_fragment の doc 参照）。
+        // パース自体が残り容量を超えられないよう上限を絞る。aux_nodes は Document・文脈要素・
+        // フラグメントの親 `<html>`（template では文脈用 Fragment を加えて 4）の分。
         let remaining = self.limits.max_nodes().saturating_sub(self.nodes.len());
         if remaining == 0 {
             return Err(DomError::NodeLimitExceeded {
@@ -136,9 +156,9 @@ impl Document {
             .into());
         }
         let options = ParseOptions::default()
-            .with_max_nodes(remaining.saturating_add(3))
+            .with_max_nodes(remaining.saturating_add(aux_nodes))
             .with_scripting_enabled(self.scripting_enabled);
-        let parsed = match parse_fragment(html, &context, &options) {
+        let parsed = match parse_fragment(html, &context, &context_attrs, quirks_mode, &options) {
             Ok(p) => p,
             Err(Error::Parse(ParseError::NodeLimitExceeded { .. })) => {
                 return Err(DomError::NodeLimitExceeded {

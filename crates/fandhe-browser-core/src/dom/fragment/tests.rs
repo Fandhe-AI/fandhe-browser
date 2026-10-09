@@ -196,3 +196,50 @@ fn js_6_set_inner_html_deep_nesting_does_not_overflow() {
     assert!(r.is_ok(), "{r:?}");
     assert!(doc.node_count() > 5000);
 }
+
+/// JS-6: template 文脈の補助ノード（文脈用 Fragment）を容量に誤算入しない。
+#[test]
+fn js_6_set_inner_html_template_context_capacity_exact() {
+    let mut doc = parse("<html><head></head><body><template></template></body></html>");
+    let limit = doc.node_count() + 1;
+    doc.set_limits(DomLimits::default().with_max_nodes(limit));
+    let t = sel(&doc, "template");
+    let out = doc.set_inner_html(t, "x").expect("Text 1 個は収まる");
+    assert_eq!(out.inserted_nodes, 1);
+}
+
+/// JS-5: 文脈要素の属性（annotation-xml の encoding）が HTML integration point 判定に効く。
+#[test]
+fn js_5_set_inner_html_annotation_xml_encoding_is_integration_point() {
+    let mut doc = parse(
+        "<html><head></head><body><math><annotation-xml encoding=\"text/html\"></annotation-xml></math></body></html>",
+    );
+    let ax = sel(&doc, "annotation-xml");
+    doc.set_inner_html(ax, "<div>a</div>").expect("ok");
+    let d = doc.first_child(ax).expect("div");
+    assert_eq!(doc.namespace_url(d), Some("http://www.w3.org/1999/xhtml"));
+}
+
+/// JS-5: 対象 Document の quirks mode がフラグメント解析に引き継がれる
+/// （Quirks では `<table>` が `<p>` を閉じない）。
+#[test]
+fn js_5_set_inner_html_inherits_quirks_mode() {
+    let mut quirks = parse("<html><head></head><body><div id=a></div></body></html>");
+    assert_eq!(quirks.quirks_mode(), crate::dom::QuirksMode::Quirks);
+    let a = sel(&quirks, "#a");
+    quirks.set_inner_html(a, "<p>a<table></table>").expect("ok");
+    assert_eq!(
+        html(&quirks),
+        "<html><head></head><body><div id=\"a\"><p>a<table></table></p></div></body></html>"
+    );
+    let mut std_doc =
+        parse("<!DOCTYPE html><html><head></head><body><div id=a></div></body></html>");
+    let a = sel(&std_doc, "#a");
+    std_doc
+        .set_inner_html(a, "<p>a<table></table>")
+        .expect("ok");
+    assert_eq!(
+        html(&std_doc),
+        "<!DOCTYPE html><html><head></head><body><div id=\"a\"><p>a</p><table></table></div></body></html>"
+    );
+}

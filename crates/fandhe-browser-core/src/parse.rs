@@ -263,11 +263,19 @@ fn parse_document_inner(input: &str, options: &ParseOptions) -> Result<ParsedDoc
 /// 名前で、`<tbody>` に `<tr>` を入れる場合などの文脈依存パースに使う。html5ever は
 /// 文脈要素（arena の添字 1・未接続）と、フラグメントの親になる `<html>` 要素
 /// （Document の唯一の子）を作るため、呼び出し元は戻り値の `<html>` の子を取り込む。
-/// `options.max_nodes` は Document・文脈要素・`<html>` の 3 個を含む値で指定する。
+/// `options.max_nodes` は Document・文脈要素・`<html>`（template 文脈ではさらに文脈用
+/// DocumentFragment）を含む値で指定する。
 /// エラーポリシーは Recover 固定（不正な markup は WHATWG どおり回復する）。
+///
+/// `context_attrs` は文脈要素の属性（MathML `annotation-xml` の `encoding` による HTML
+/// integration point 判定に必要）、`quirks_mode` は対象 Document の quirks mode
+/// （`<table>` が `<p>` を閉じるかなどの規則が変わる）。`max_nodes` は template 文脈では
+/// 文脈用 DocumentFragment の分として 1 個多く数える。
 pub(crate) fn parse_fragment(
     input: &str,
     context: &QualName,
+    context_attrs: &[Attribute],
+    quirks_mode: QuirksMode,
     options: &ParseOptions,
 ) -> Result<ParsedDocument> {
     if options.max_nodes == 0 {
@@ -284,15 +292,23 @@ pub(crate) fn parse_fragment(
         tree_builder: TreeBuilderOpts {
             scripting_enabled: options.scripting_enabled,
             exact_errors: false,
+            quirks_mode,
             ..Default::default()
         },
         ..Default::default()
     };
+    let html_attrs: Vec<HtmlAttribute> = context_attrs
+        .iter()
+        .map(|a| HtmlAttribute {
+            name: a.name.clone(),
+            value: StrTendril::from(a.value.as_str()),
+        })
+        .collect();
     html5ever::driver::parse_fragment(
         sink,
         parse_opts,
         context.clone(),
-        Vec::new(),
+        html_attrs,
         options.scripting_enabled,
     )
     .one(input)
