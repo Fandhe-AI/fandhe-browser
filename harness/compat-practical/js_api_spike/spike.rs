@@ -498,7 +498,6 @@ pub struct ScriptRecord {
     pub message_class: Option<&'static str>,
     pub missing_api: Option<String>,
     pub fetch_error: Option<&'static str>,
-    pub http_status: Option<u16>,
 }
 
 impl ScriptRecord {
@@ -521,7 +520,6 @@ impl ScriptRecord {
             .opt_s("message_class", self.message_class)
             .opt_s("missing_api", self.missing_api.as_deref())
             .opt_s("fetch_error", self.fetch_error)
-            .opt_n("http_status", self.http_status.map(u64::from))
             .line()
     }
 }
