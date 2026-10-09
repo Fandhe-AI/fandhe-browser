@@ -988,6 +988,15 @@ fn execute(
         });
     }
 
+    // shim のリスナー保持件数の上限超過は、リソース上限による打ち切りとして確定する（`JS-6`）。
+    // 以降のライフサイクルは発火しない（fail-closed）。
+    if abort.is_none() && bridge.listener_limit_exceeded().map_err(bridge_error)? {
+        abort = Some(PageAbort {
+            kind: AbortKind::ResourceLimit,
+            index: None,
+        });
+    }
+
     let lifecycle = fire_lifecycle(&ctx, runtime.as_mut(), &mut abort)?;
 
     let elapsed = page_start.elapsed();

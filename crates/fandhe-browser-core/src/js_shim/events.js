@@ -35,6 +35,9 @@
     var callOp = Function.prototype.call.bind(nativeOp, bridge);
     var defineProperty = Object.defineProperty;
     var MAX_TEXT_UNITS = 4097;
+    // document / window それぞれの保持件数の上限。確保前に検証し、超過した登録は無視して
+    // `lifecycleListenerLimit` op でランナーへ通知する（ランナーはリソース上限として打ち切る。JS-6）。
+    var MAX_LISTENERS_PER_TARGET = 1024;
 
     var documentTarget = { listeners: [] };
     var windowTarget = { listeners: [] };
@@ -54,6 +57,14 @@
             }
         }
         var once = options !== null && typeof options === 'object' && !!options.once;
+        if (list.length >= MAX_LISTENERS_PER_TARGET) {
+            try {
+                callOp('lifecycleListenerLimit');
+            } catch (e) {
+                // 通知に失敗しても登録は拒否したままにする。
+            }
+            return;
+        }
         list.push({ type: type, listener: listener, once: once });
     }
 

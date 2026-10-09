@@ -323,6 +323,7 @@ enum DomOp {
     ConsoleMessage,
     LifecycleListenerError,
     LifecycleInstallOpen,
+    LifecycleListenerLimit,
 }
 
 impl DomOp {
@@ -354,6 +355,7 @@ impl DomOp {
             "consoleMessage" => Self::ConsoleMessage,
             "lifecycleListenerError" => Self::LifecycleListenerError,
             "lifecycleInstallOpen" => Self::LifecycleInstallOpen,
+            "lifecycleListenerLimit" => Self::LifecycleListenerLimit,
             _ => return None,
         })
     }
@@ -386,6 +388,7 @@ impl DomOp {
             Self::ConsoleMessage => "consoleMessage",
             Self::LifecycleListenerError => "lifecycleListenerError",
             Self::LifecycleInstallOpen => "lifecycleInstallOpen",
+            Self::LifecycleListenerLimit => "lifecycleListenerLimit",
         }
     }
 
@@ -398,7 +401,8 @@ impl DomOp {
             | Self::ReadyState
             | Self::CurrentScript
             | Self::NavigatorUserAgent
-            | Self::LifecycleInstallOpen => 0,
+            | Self::LifecycleInstallOpen
+            | Self::LifecycleListenerLimit => 0,
             Self::CreateElement
             | Self::CreateTextNode
             | Self::GetElementById
@@ -734,6 +738,12 @@ fn execute(
         // shim 注入中（Rust 側が立てたフラグ）だけ true。events.js が再 install 時の
         // ディスパッチャー差し替えを許すかの判定に使う（ページ JS はフラグを変えられない）。
         DomOp::LifecycleInstallOpen => Ok(JsValue::Bool(page.shim_installing)),
+        // shim がリスナー保持件数の上限に達したことを通知する（`JS-6`）。ランナーが
+        // 全スクリプトの実行後に確認し、リソース上限による打ち切りとして扱う。
+        DomOp::LifecycleListenerLimit => {
+            page.diagnostics.listener_limit_exceeded = true;
+            Ok(JsValue::Undefined)
+        }
         DomOp::LifecycleListenerError => {
             let name = string_arg(op, args, 1, limits)?;
             let message = string_arg(op, args, 2, limits)?;
@@ -984,6 +994,14 @@ impl DomBridge {
             parse_location(url).map_err(|reason| DomBridgeError::InvalidLocation { reason })?;
         page.location = Some(parsed);
         Ok(())
+    }
+
+    /// ライフサイクルのリスナー保持件数が上限を超えたか（診断は消費しない。ランナー用）。
+    /// 未取り付けなら [`DomBridgeError::Detached`]。
+    pub fn listener_limit_exceeded(&self) -> Result<bool, DomBridgeError> {
+        let guard = self.lock()?;
+        let page = guard.page.as_ref().ok_or(DomBridgeError::Detached)?;
+        Ok(page.diagnostics.listener_limit_exceeded)
     }
 
     /// 集まった診断（無視した `location` 操作・`console`）を取り出して空にする
@@ -1728,6 +1746,16 @@ mod tests {
             b.take_diagnostics().expect("empty"),
             BridgeDiagnostics::default()
         );
+    }
+
+    #[test]
+    fn js_6_lifecycle_listener_limit_op_sets_flag() {
+        let b = bridge();
+        assert!(!b.listener_limit_exceeded().expect("flag"));
+        call(&b, &[s("lifecycleListenerLimit"), s("x")]).expect_err("arity");
+        call(&b, &[s("lifecycleListenerLimit")]).expect("ok");
+        assert!(b.listener_limit_exceeded().expect("flag"));
+        assert!(b.take_diagnostics().expect("diag").listener_limit_exceeded);
     }
 
     #[test]

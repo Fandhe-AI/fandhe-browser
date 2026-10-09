@@ -238,6 +238,8 @@ pub struct BridgeDiagnostics {
     pub console_messages: Vec<ConsoleMessage>,
     /// ライフサイクルイベントのリスナー例外（先頭から [`MAX_BRIDGE_DIAGNOSTICS`] 件）。
     pub listener_errors: Vec<ListenerError>,
+    /// ライフサイクルのリスナー保持件数が shim の上限を超え、登録を無視したか（`JS-6`）。
+    pub listener_limit_exceeded: bool,
     /// 件数上限で保存しなかった診断の数。
     pub dropped: u64,
 }

@@ -494,4 +494,23 @@ fn window_cases(engine: &str) {
     );
     p.eval("__fandheLifecycle('DOMContentLoaded'); 'fired'");
     check(&mut p, "String(saved.currentTarget)", "null");
+
+    eprintln!("case: JS-6 listener count is capped per target and flagged to the runner");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "globalThis.n = 0; \
+         for (var i = 0; i < 1100; i++) { \
+           document.addEventListener('DOMContentLoaded', function () { n++; }); \
+         } \
+         window.addEventListener('load', function () { n += 1000; }); 'ok'",
+        "ok",
+    );
+    assert!(p.bridge.listener_limit_exceeded().expect("flag"));
+    p.eval("__fandheLifecycle('DOMContentLoaded'); __fandheLifecycle('load'); 'fired'");
+    // document は 1024 件で打ち止め、window は別枠で登録できる。
+    check(&mut p, "String(n)", "2024");
+    let mut p = setup(engine, None);
+    p.eval("document.addEventListener('load', function () {}); 'ok'");
+    assert!(!p.bridge.listener_limit_exceeded().expect("flag"));
 }
