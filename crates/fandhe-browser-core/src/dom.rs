@@ -164,7 +164,7 @@ pub use mutation::{
     DEFAULT_MAX_NAME_BYTES, DEFAULT_MAX_SERIALIZED_BYTES, DEFAULT_MAX_TEXT_BYTES,
     DEFAULT_MAX_TOTAL_BYTES, DomLimits,
 };
-pub use serialize::SerializeScope;
+pub use serialize::{SerializeResult, SerializeScope};
 
 use std::sync::Arc;
 use std::time::Instant;

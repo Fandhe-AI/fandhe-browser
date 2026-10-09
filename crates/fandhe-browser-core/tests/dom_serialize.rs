@@ -29,6 +29,7 @@ fn body_html(html: &str) -> String {
     let body = first(&doc, "body");
     doc.serialize_node(body, SerializeScope::ChildrenOnly)
         .expect("上限内")
+        .html
 }
 
 /// 木構造の署名（種別・名前・名前空間・属性・内容）を反復で並行比較する。
@@ -66,7 +67,7 @@ fn signature(doc: &Document, id: NodeId) -> String {
 
 fn roundtrip(html: &str) {
     let original = parse(html);
-    let serialized = original.serialize_html().expect("上限内");
+    let serialized = original.serialize_html().expect("上限内").html;
     let reparsed = parse(&serialized);
     assert_same_tree(&original, &reparsed);
 }
@@ -90,7 +91,7 @@ fn js_4_raw_text_comment_doctype_and_void() {
          <style>p > a { }</style><br><img src=\"x\"><input>",
     );
     assert_eq!(
-        doc.serialize_html().expect("上限内"),
+        doc.serialize_html().expect("上限内").html,
         "<!DOCTYPE html><html><head><title>t</title><!-- a < b --><script>if (a < b && c) {}</script>\
          <style>p > a { }</style></head><body><br><img src=\"x\"><input></body></html>"
     );
@@ -101,7 +102,7 @@ fn js_4_raw_text_comment_doctype_and_void() {
 fn js_4_whole_document_exact() {
     let doc = parse("<!DOCTYPE html><title>t</title><p class=\"c\">x</p>");
     assert_eq!(
-        doc.serialize_html().expect("上限内"),
+        doc.serialize_html().expect("上限内").html,
         "<!DOCTYPE html><html><head><title>t</title></head><body><p class=\"c\">x</p></body></html>"
     );
 }
@@ -115,7 +116,8 @@ fn js_4_void_element_children_are_not_serialized() {
     doc.append_child(br, text).expect("追加できる");
     assert_eq!(
         doc.serialize_node(br, SerializeScope::IncludeNode)
-            .expect("上限内"),
+            .expect("上限内")
+            .html,
         "<br>"
     );
 }
@@ -132,7 +134,8 @@ fn js_4_noscript_follows_parse_scripting_flag() {
     // scripting 有効ではテキストが raw のまま再パースされ、中身は 1 つのテキストノード。
     assert_eq!(
         doc.serialize_node(noscript, SerializeScope::IncludeNode)
-            .expect("上限内"),
+            .expect("上限内")
+            .html,
         "<noscript><p>a&lt;b</p></noscript>"
     );
 }
@@ -143,7 +146,7 @@ fn js_4_pre_leading_newline_roundtrips() {
     let doc = parse("<pre>\n\nx</pre>");
     let pre = first(&doc, "pre");
     assert_eq!(doc.text_content(pre).as_deref(), Some("\nx"));
-    let out = doc.serialize_html().expect("上限内");
+    let out = doc.serialize_html().expect("上限内").html;
     assert!(out.contains("<pre>\n\nx</pre>"), "{out}");
     let again = parse(&out);
     assert_eq!(
@@ -168,12 +171,14 @@ fn js_4_scope_children_only_and_include_node() {
     let div = first(&doc, "div");
     assert_eq!(
         doc.serialize_node(div, SerializeScope::ChildrenOnly)
-            .expect("上限内"),
+            .expect("上限内")
+            .html,
         "<b>x</b>y"
     );
     assert_eq!(
         doc.serialize_node(div, SerializeScope::IncludeNode)
-            .expect("上限内"),
+            .expect("上限内")
+            .html,
         "<div id=\"d\"><b>x</b>y</div>"
     );
 }
@@ -182,11 +187,11 @@ fn js_4_scope_children_only_and_include_node() {
 #[test]
 fn js_6_limit_boundary_exact_and_one_over() {
     let mut doc = parse("<p>aaaa</p>");
-    let full = doc.serialize_html().expect("既定上限内");
+    let full = doc.serialize_html().expect("既定上限内").html;
     assert_eq!(full, "<html><head></head><body><p>aaaa</p></body></html>");
     let n = full.len();
     doc.set_limits(DomLimits::default().with_max_serialized_bytes(n));
-    assert_eq!(doc.serialize_html().expect("ちょうどは成功"), full);
+    assert_eq!(doc.serialize_html().expect("ちょうどは成功").html, full);
     doc.set_limits(DomLimits::default().with_max_serialized_bytes(n - 1));
     match doc.serialize_html() {
         Err(Error::Dom(DomError::SerializedOutputTooLarge { limit })) => {
@@ -201,11 +206,15 @@ fn js_6_limit_boundary_exact_and_one_over() {
 fn js_6_default_limit_is_8_mib_boundary() {
     assert_eq!(DEFAULT_MAX_SERIALIZED_BYTES, 8 * 1024 * 1024);
     assert_eq!(DomLimits::default().max_serialized_bytes(), 8 * 1024 * 1024);
-    let overhead = parse("<p></p>").serialize_html().expect("上限内").len();
+    let overhead = parse("<p></p>")
+        .serialize_html()
+        .expect("上限内")
+        .html
+        .len();
     let pad = DEFAULT_MAX_SERIALIZED_BYTES - overhead;
 
     let exact = parse(&format!("<p>{}</p>", "a".repeat(pad)));
-    let out = exact.serialize_html().expect("ちょうど 8 MiB は成功");
+    let out = exact.serialize_html().expect("ちょうど 8 MiB は成功").html;
     assert_eq!(out.len(), DEFAULT_MAX_SERIALIZED_BYTES);
 
     let over = parse(&format!("<p>{}</p>", "a".repeat(pad + 1)));
@@ -224,7 +233,7 @@ fn js_6_deep_nesting_10000_succeeds() {
     const DEPTH: usize = 10_000;
     let html = format!("{}{}", "<div>".repeat(DEPTH), "</div>".repeat(DEPTH));
     let doc = parse(&html);
-    let out = doc.serialize_html().expect("深さ 10,000 は成功する");
+    let out = doc.serialize_html().expect("深さ 10,000 は成功する").html;
     assert_eq!(out.matches("<div>").count(), DEPTH);
     assert_eq!(out.matches("</div>").count(), DEPTH);
 }

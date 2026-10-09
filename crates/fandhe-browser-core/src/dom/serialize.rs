@@ -52,6 +52,31 @@ pub enum SerializeScope {
     IncludeNode,
 }
 
+/// シリアライズ結果（[`Document::serialize_node`] / [`Document::serialize_html`] の成功値。
+/// `JS-4`・`REPAIR-4`）。
+///
+/// 文字列のみを返すと将来の付随情報（出力バイト数・打ち切り情報等）を足せないため、
+/// `#[non_exhaustive]` な構造体で包む。外部 crate からは構築できず、フィールド追加は
+/// 破壊的変更にならない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SerializeResult {
+    /// シリアライズした HTML 文字列。
+    pub html: String,
+}
+
+impl SerializeResult {
+    /// HTML 文字列を借用で返す。
+    pub fn as_str(&self) -> &str {
+        &self.html
+    }
+
+    /// HTML 文字列を取り出す。
+    pub fn into_html(self) -> String {
+        self.html
+    }
+}
+
 enum Frame {
     Open(NodeId),
     Close(NodeId),
@@ -169,7 +194,7 @@ impl Document {
     /// `serialize_node(root, ChildrenOnly)` の薄いラッパー。出力が
     /// `DomLimits::max_serialized_bytes`（既定 [`crate::DEFAULT_MAX_SERIALIZED_BYTES`]）を
     /// 超えると [`DomError::SerializedOutputTooLarge`]（`JS-6`）。
-    pub fn serialize_html(&self) -> Result<String> {
+    pub fn serialize_html(&self) -> Result<SerializeResult> {
         self.serialize_node(self.root, SerializeScope::ChildrenOnly)
     }
 
@@ -180,7 +205,7 @@ impl Document {
     /// - 壊れた arena（循環）: [`DomError::HierarchyCycle`]
     ///
     /// `REPAIR-9` の計装対象で、recorder が有効なら 1 回につき 1 件（操作種別 `Dom`）を記録する。
-    pub fn serialize_node(&self, node: NodeId, scope: SerializeScope) -> Result<String> {
+    pub fn serialize_node(&self, node: NodeId, scope: SerializeScope) -> Result<SerializeResult> {
         if !self.recorder.is_enabled() {
             return self.serialize_inner(node, scope);
         }
@@ -206,7 +231,7 @@ impl Document {
         self.node(target).map_or(&[], |n| n.children.as_slice())
     }
 
-    fn serialize_inner(&self, node: NodeId, scope: SerializeScope) -> Result<String> {
+    fn serialize_inner(&self, node: NodeId, scope: SerializeScope) -> Result<SerializeResult> {
         if self.node(node).is_none() {
             return Err(DomError::NodeNotFound {
                 index: node.index(),
@@ -253,7 +278,7 @@ impl Document {
                 }
             }
         }
-        Ok(out.buf)
+        Ok(SerializeResult { html: out.buf })
     }
 
     fn serialize_open(

@@ -108,7 +108,7 @@ pub use cssom_profile::{
 };
 pub use dom::{
     Ancestors, Attribute, Children, DEFAULT_MAX_SERIALIZED_BYTES, Descendants, Document, DomLimits,
-    Node, NodeData, NodeId, QuirksMode, SerializeScope,
+    Node, NodeData, NodeId, QuirksMode, SerializeResult, SerializeScope,
 };
 pub use error::{DomError, Error, NameKind, ParseError, Result};
 pub use fetch::{FetchOptions, FetchResponse, Fetcher};
