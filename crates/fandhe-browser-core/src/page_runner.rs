@@ -953,7 +953,19 @@ fn execute(
                 | (ScriptSource::External(_), ScriptLoad::Ready(src)) => {
                     match runtime.as_mut() {
                         Some(rt) => {
-                            run_one(rt, &ctx, entry.node(), entry.index(), src, &mut abort)?
+                            let o =
+                                run_one(rt, &ctx, entry.node(), entry.index(), src, &mut abort)?;
+                            // リスナー保持件数の上限超過は、超過させたスクリプトの直後に確定し
+                            // 後続のスクリプトを実行しない（`JS-6`）。
+                            if abort.is_none()
+                                && bridge.listener_limit_exceeded().map_err(bridge_error)?
+                            {
+                                abort = Some(PageAbort {
+                                    kind: AbortKind::ResourceLimit,
+                                    index: Some(entry.index()),
+                                });
+                            }
+                            o
                         }
                         // runtime が無いのは abort 済みのときだけ（上の分岐で処理済み）。
                         None => ScriptOutcome::NotExecuted {
@@ -1201,6 +1213,13 @@ fn fire_lifecycle(
             },
             None => LifecycleOutcome::Dispatched,
         };
+        // リスナーが上限を超えて登録された場合は、以降のイベントを発火しない（`JS-6`）。
+        if abort.is_none() && ctx.bridge.listener_limit_exceeded().map_err(bridge_error)? {
+            *abort = Some(PageAbort {
+                kind: AbortKind::ResourceLimit,
+                index: None,
+            });
+        }
         records.push(LifecycleEventRecord { event, outcome });
     }
     Ok(records)

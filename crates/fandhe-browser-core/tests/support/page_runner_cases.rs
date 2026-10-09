@@ -373,6 +373,54 @@ pub fn run(engine: &str) {
             .all(|l| l.outcome().as_str() == "not_fired")
     );
 
+    eprintln!("case: JS-6 listener limit in a script stops following scripts");
+    let html = "<body><script>for (var i = 0; i < 1100; i++) { document.addEventListener('t' + i, function () {}); }</script>\
+        <script>document.body.setAttribute('data-after', '1')</script></body>";
+    let out = run_page(engine, html, &opts);
+    assert!(!out.html().contains("data-after=\""), "{}", out.html());
+    let abort = out.abort().expect("abort");
+    assert_eq!(abort.kind(), &AbortKind::ResourceLimit);
+    assert_eq!(abort.index(), Some(0));
+    assert!(
+        out.lifecycle()
+            .iter()
+            .all(|l| l.outcome().as_str() == "not_fired")
+    );
+
+    eprintln!("case: JS-6 listener limit inside DOMContentLoaded skips load");
+    let html = "<body><script>\
+        document.addEventListener('DOMContentLoaded', function () {\
+            for (var i = 0; i < 1100; i++) { window.addEventListener('t' + i, function () {}); }\
+        });\
+        window.addEventListener('load', function () { document.body.setAttribute('data-load', '1'); });\
+        </script></body>";
+    let out = run_page(engine, html, &opts);
+    assert!(!out.html().contains("data-load=\""), "{}", out.html());
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::ResourceLimit)
+    );
+    assert_eq!(out.lifecycle()[1].outcome().as_str(), "not_fired");
+
+    eprintln!("case: JS-4 tampered Array.prototype does not drop following listeners");
+    let html = "<body><script>\
+        document.addEventListener('DOMContentLoaded', function () {\
+            Array.prototype.indexOf = function () { throw new Error('tampered'); };\
+            Array.prototype.slice = function () { throw new Error('tampered'); };\
+            Function.prototype.call = function () { throw new Error('tampered'); };\
+        });\
+        document.addEventListener('DOMContentLoaded', function () { console.log('second'); });\
+        </script></body>";
+    let out = run_page(engine, html, &opts);
+    assert_eq!(
+        out.bridge_diagnostics()
+            .console_messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["second"]
+    );
+
     #[cfg(target_os = "linux")]
     {
         eprintln!("case: JS-6 no child process remains");
