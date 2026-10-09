@@ -23,6 +23,7 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 | `run_core.mjs` | `run_core.sh` から呼ばれる依存ゼロの CDP クライアント（Node 22 以降） |
 | `fake_cdp_server.mjs` | 自己テスト用の偽 CDP サーバー（loopback のみ） |
 | `self-test.sh` | 上記のオフライン自己テスト（curl はスタブ・CDP は偽サーバー。CI で実行） |
+| `js_api_spike/` | ページ内 JS が要求する Web API の計測スパイク（TASK-106。core の example `compat_js_api_spike` としてビルド） |
 | `results/access_check.jsonl` | 到達可否の実測結果（下記「計測結果」） |
 | `results/core_results.jsonl` | `run_core.sh` の実測結果 |
 
@@ -171,3 +172,38 @@ jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 - b5（Trello）・d2（Saucedemo）・d3（DemoQA）はいずれも失敗（`no_match`）。ページ JS が実行されないため V8 による解消は未確認（上記「制約」）
 - そのほかの失敗: a6（`no_match`・HTTP 403）・c1（`no_match`）・e1（`selector_unsupported`）・e5（`no_match`）
 - ネットワーク環境と時期で変わる。再計測したら実施日と OS をここへ追記する
+
+## js_api_spike（TASK-106）
+
+b5（Trello）・d2（Saucedemo）・d3（DemoQA）の bundle が要求する Web API を実測し、`JS-5`
+（最小 DOM バインディング）の対象範囲を確定する材料を作る計測スパイク。
+spec 対応: TASK-106 / MS-6 / `JS-5`（関連 `JS-2`・`JS-6`）。
+
+- 対象ページの HTML と `<script>` を `Fetcher` 経由だけで取得し、**何も注入しない素の JS エンジン**で文書順に評価する。script ごとの最初の未定義 API 名と例外分類を JSON Lines で出す
+- ソースは `js_api_spike/`。`crates/fandhe-browser-core/Cargo.toml` の `[[example]] compat_js_api_spike` としてビルドする（新規依存なし）
+- 自己テストはオフライン・決定的（`cargo test -p fandhe-browser-core --example compat_js_api_spike`。`cargo test --workspace` にも含まれ、3 OS の CI で走る）。`file:`・内部アドレスの拒否と、独自 HTTP クライアントを持たないことを検査する
+
+### 実行手順（実サイトへ出るため手動実行専用）
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_js_api_spike
+url() { jq -r --arg id "$1" '.[] | select(.id==$id) | .url' harness/compat-practical/tasks.json; }
+target/release/examples/compat_js_api_spike \
+  --target b5="$(url b5)" --target d2="$(url d2)" --target d3="$(url d3)" \
+  --engine v8 --out /tmp/js_api_spike.jsonl
+```
+
+- 引数: `--target <id>=<https url>`（複数可・id は tasks.json と同じ規則）/ `--engine v8|boa` / `--out <path>` / `--max-scripts 1..=256`（既定 64）/ `--fetch-timeout 1..=60`（既定 15）/ `--total-timeout 1..=3600`（既定 600）/ `--debug-messages`（切り詰めた生メッセージを stderr のみへ）
+- 終了コード: 0 = 記録完了（評価失敗はデータ）/ 1 = 書き込み失敗 / 2 = 入力・使用エラー（エンジン未同梱を含む）
+- 出力（`schema_version: 1`）: `meta` 1 行、script ごとの `script` 行（`outcome`・`error_kind`・`message_class`・`missing_api`・`fetch_error` など）、サイトごとの `site` 行（`first_missing_api`・`missing_apis`・件数・バイト数）
+- script の URL・本文・ページテキスト・Cookie・ヘッダ・生の例外メッセージは出力しない（external は同一オリジンかの真偽値のみ）
+
+### 制約（REPAIR-3）
+
+- 評価 1 回あたり 2 秒の上限は変更できない（`JsRuntime::execute` が評価オプションを取らない。#775・#776 が未完了）。setTimeout・イベントループは無い
+- 文書の文字コードは UTF-8 lossy 固定。`type=module`・`nomodule`・データブロックは評価せず skip として数える
+- DOM 無しの素のエンジンのため、最初の未定義 API で script が止まる。1 script につき最初の 1 件のみ分かる（反復プローブは範囲外）
+
+### 人間が行う残作業
+
+実サイトでの実測と記録（b5・d2・d3 の不足 API 一覧）、`JS-5` の API 範囲確定と #777・#778・#779 との差分整理・追加 issue の要否判断、Trello が anti-bot・認証で解消しない場合の記録。結果をコミットするときは API 名と件数だけにし、本文・URL・Cookie は載せない。
