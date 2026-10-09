@@ -27,6 +27,9 @@
 //! - 属性値・テキストは html5ever の `StrTendril`（`Send` でない）ではなく
 //!   `String` に変換して保持する（Issue #35 決定・PoC-5 で判明した
 //!   `scraper::Html` の `!Send` 問題の再発防止）。
+//! - 変更 API（`mutation` サブモジュール。TASK-107・Issue #772・`JS-5`/`JS-6`）は
+//!   検証してから変更する 2 フェーズで、`Err` 時は木を変更しない。arena は縮まない
+//!   ため、外したノードもノード数上限（[`DomLimits`]）に数える。
 //! - 走査系のイテレータ（[`Ancestors`]・[`Descendants`]）は再帰せず明示スタック
 //!   ／歩数カウントで実装し、`parent`/`children` リンクが（万一）壊れていても
 //!   `node_count` を超えて走査を続けない（security.md「不安全な設計」対策。
@@ -151,6 +154,11 @@ pub type QuirksMode = html5ever::interface::QuirksMode;
 /// 型をここで再エクスポートする。
 pub use html5ever::QualName;
 
+mod mutation;
+pub use mutation::{
+    DEFAULT_DOM_MAX_NODES, DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES, DEFAULT_MAX_NAME_BYTES, DomLimits,
+};
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -183,9 +191,24 @@ pub struct Document {
     /// 引き継ぎ、`text_content` が使う。`Arc<dyn OperationRecorder>`（`Send + Sync`）
     /// なので `Document` の `Send + Sync` 契約は保たれる。
     pub(crate) recorder: RecorderHandle,
+    /// 変更 API（`JS-5`/`JS-6`）の上限。`parse` は既定値で初期化する。
+    pub(crate) limits: DomLimits,
 }
 
 impl Document {
+    /// 変更 API の上限設定を返す（TASK-107・`JS-6`）。
+    pub fn limits(&self) -> DomLimits {
+        self.limits
+    }
+
+    /// 変更 API の上限設定を差し替える（TASK-107・`JS-6`）。
+    ///
+    /// 変更 API の既定（100,000 ノード）はパース側の既定（1,000,000）より小さいため、
+    /// それ以上のノードを持つ文書へ変更を加えたい場合に呼び出し側が引き上げる。
+    pub fn set_limits(&mut self, limits: DomLimits) {
+        self.limits = limits;
+    }
+
     /// 操作レコードの記録先を（付け替え）設定する（`REPAIR-9`・`TASK-10.2.1`）。
     ///
     /// recorder なしでパースした文書へ後から付けたい場合に使う。
@@ -357,22 +380,28 @@ impl Document {
     /// （`selector.rs` の属性セレクタ照合契約と揃える）。要素以外・範囲外・
     /// 該当属性なしなら `None`。
     pub fn attribute(&self, id: NodeId, name: &str) -> Option<&str> {
+        let index = self.attribute_index(id, name)?;
+        self.attributes(id)
+            .get(index)
+            .map(|attr| attr.value.as_str())
+    }
+
+    /// `attribute` と同じ照合規則で、属性 `name` の `attrs` 内の位置を返す
+    /// （変更 API の `set_attribute`/`remove_attribute` と照合規則を共用する）。
+    pub(crate) fn attribute_index(&self, id: NodeId, name: &str) -> Option<usize> {
         let is_html = self
             .element_name(id)
             .is_some_and(|n| &*n.ns == HTML_NAMESPACE_URI);
-        self.attributes(id)
-            .iter()
-            .find(|attr| {
-                if !attr.name.ns.is_empty() {
-                    return false;
-                }
-                if is_html {
-                    (*attr.name.local).eq_ignore_ascii_case(name)
-                } else {
-                    &*attr.name.local == name
-                }
-            })
-            .map(|attr| attr.value.as_str())
+        self.attributes(id).iter().position(|attr| {
+            if !attr.name.ns.is_empty() {
+                return false;
+            }
+            if is_html {
+                (*attr.name.local).eq_ignore_ascii_case(name)
+            } else {
+                &*attr.name.local == name
+            }
+        })
     }
 
     /// `id` が要素ノードなら、`class` 属性を ASCII 空白で分割したクラス名を
@@ -547,6 +576,7 @@ const _: () = {
     assert_send_sync::<NodeData>();
     assert_send_sync::<Attribute>();
     assert_send_sync::<NodeId>();
+    assert_send_sync::<DomLimits>();
     assert_send_sync::<QuirksMode>();
 };
 
@@ -785,6 +815,7 @@ mod tests {
             root: NodeId::new(0),
             quirks_mode: QuirksMode::NoQuirks,
             recorder: RecorderHandle::default(),
+            limits: DomLimits::default(),
         };
 
         let ancestor_count = doc.ancestors(NodeId::new(0)).count();

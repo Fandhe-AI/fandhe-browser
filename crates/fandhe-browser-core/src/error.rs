@@ -25,6 +25,10 @@
 //! エラー位置等）を追加できるよう `#[non_exhaustive]` にしてある
 //! （REPAIR-4: 戻り値は将来拡張できる構造にする）。
 //!
+//! `dom` の変更 API（TASK-107・Issue #772・`JS-5`/`JS-6`）は [`Error::Dom`] を追加し、
+//! [`DomError`] を payload として保持する。payload にはインデックス・長さ・上限値・
+//! 静的な理由文字列だけを入れ、入力された名前・値の本文は反響しない（security.md）。
+//!
 //! `config`（TASK-91（91.1）・Issue #214）は [`Error::Config`] を追加し、
 //! [`crate::config::ConfigError`] を payload として保持する（`Parse`/
 //! `ParseError` と同じ「専用エラー型を variant に包む」方式）。
@@ -89,6 +93,9 @@ pub enum Error {
     /// `parse` モジュール（TASK-24.4・#38・ビヘイビア `CORE-1`）が返す
     /// HTML パース固有のエラー。詳細は [`ParseError`] を参照。
     Parse(ParseError),
+    /// `dom` の変更 API（TASK-107・Issue #772・`JS-5`/`JS-6`）が返す DOM 変更エラー。
+    /// 詳細は [`DomError`] を参照。
+    Dom(DomError),
     /// `fetch::Fetcher::get`（TASK-24.2・#36・CORE-1）が、`FetchOptions` の
     /// 全体タイムアウト・接続タイムアウトを超過した場合に返す。
     Timeout {
@@ -186,6 +193,7 @@ impl fmt::Display for Error {
             }
             Error::JsEvaluation(source) => write!(f, "JS evaluation failed: {source}"),
             Error::Parse(source) => write!(f, "parse error: {source}"),
+            Error::Dom(source) => write!(f, "DOM error: {source}"),
             Error::Timeout { limit } => write!(f, "request timed out after {limit:?}"),
             Error::TooManyRedirects { limit } => {
                 write!(f, "too many redirects (limit: {limit})")
@@ -220,6 +228,7 @@ impl std::error::Error for Error {
         match self {
             Error::Io(source) => Some(source),
             Error::Parse(source) => Some(source),
+            Error::Dom(source) => Some(source),
             Error::JsEvaluation(source) => Some(source),
             Error::InvalidInput { .. }
             | Error::Unsupported { .. }
@@ -236,6 +245,12 @@ impl std::error::Error for Error {
             Error::BrowserProfileLoad(source) => Some(source),
             Error::BrowserProfileName(source) => Some(source),
         }
+    }
+}
+
+impl From<DomError> for Error {
+    fn from(source: DomError) -> Self {
+        Error::Dom(source)
     }
 }
 
@@ -262,6 +277,111 @@ impl From<crate::config::ConfigError> for Error {
         Error::Config(source)
     }
 }
+
+/// 変更対象の名前が要素名か属性名かの区別（[`DomError::InvalidName`] の payload）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NameKind {
+    /// 要素のローカル名。
+    Element,
+    /// 属性名。
+    Attribute,
+}
+
+/// `Document` の変更 API（TASK-107・`JS-5`/`JS-6`）固有のエラー（[`Error::Dom`] の payload）。
+///
+/// いずれの場合も木は変更されない（検証してから変更する）。呼び出し元は後続の
+/// `__dom.op` ブリッジ（TASK-108）を想定する。`#[non_exhaustive]` で将来の
+/// variant 追加を非破壊にする（REPAIR-4）。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DomError {
+    /// arena の範囲外の `NodeId` が渡された。
+    NodeNotFound {
+        /// 渡された arena インデックス。
+        index: usize,
+    },
+    /// `child` が `parent` の子でない（`remove_child` / `insert_before` の基準ノード）。
+    NotAChild {
+        /// 親として指定されたノードのインデックス。
+        parent: usize,
+        /// 子として指定されたノードのインデックス。
+        child: usize,
+    },
+    /// 自分自身または祖先を子にする挿入（循環）。
+    HierarchyCycle {
+        /// 親として指定されたノードのインデックス。
+        parent: usize,
+        /// 子として指定されたノードのインデックス。
+        child: usize,
+    },
+    /// ノード種別が操作に適さない。
+    InvalidNodeKind {
+        /// 操作名。
+        operation: &'static str,
+        /// 拒否理由。
+        reason: &'static str,
+    },
+    /// ノード数が `DomLimits::max_nodes` を超える作成要求。
+    NodeLimitExceeded {
+        /// 超過した上限値。
+        limit: usize,
+    },
+    /// 要素名・属性名が長さまたは文字種の規則に違反した。
+    InvalidName {
+        /// 要素名か属性名か。
+        kind: NameKind,
+        /// 渡された名前のバイト長。
+        len: usize,
+        /// 拒否理由。
+        reason: &'static str,
+    },
+    /// 属性値が `DomLimits::max_attribute_value_bytes` を超えた。
+    AttributeValueTooLarge {
+        /// 渡された値のバイト長。
+        len: usize,
+        /// 上限値。
+        limit: usize,
+    },
+}
+
+impl fmt::Display for DomError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DomError::NodeNotFound { index } => write!(f, "node {index} not found"),
+            DomError::NotAChild { parent, child } => {
+                write!(f, "node {child} is not a child of node {parent}")
+            }
+            DomError::HierarchyCycle { parent, child } => {
+                write!(
+                    f,
+                    "inserting node {child} into node {parent} would create a cycle"
+                )
+            }
+            DomError::InvalidNodeKind { operation, reason } => {
+                write!(f, "invalid node kind for {operation}: {reason}")
+            }
+            DomError::NodeLimitExceeded { limit } => {
+                write!(f, "node limit of {limit} exceeded")
+            }
+            DomError::InvalidName { kind, len, reason } => {
+                let kind = match kind {
+                    NameKind::Element => "element",
+                    NameKind::Attribute => "attribute",
+                };
+                write!(f, "invalid {kind} name ({len} bytes): {reason}")
+            }
+            DomError::AttributeValueTooLarge { len, limit } => {
+                write!(
+                    f,
+                    "attribute value of {len} bytes exceeds limit of {limit} bytes"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for DomError {}
 
 /// HTML パース固有のエラー情報（[`Error::Parse`] の payload）。
 ///

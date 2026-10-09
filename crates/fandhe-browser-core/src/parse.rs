@@ -643,6 +643,7 @@ impl TreeSink for ArenaSink {
                 root: ROOT_ID,
                 quirks_mode: self.quirks_mode.get(),
                 recorder: self.recorder,
+                limits: crate::dom::DomLimits::default(),
             },
             diagnostics,
         })
