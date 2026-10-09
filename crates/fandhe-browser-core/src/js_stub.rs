@@ -42,8 +42,9 @@
 //!
 //! # スタブ・簡易実装の残り（REPAIR-3）
 //!
-//! - ページ実行ランナーからの `install_dom_shim` の配線（ページごとの再注入・再起動検知）は
-//!   TASK-109（#780・#784）の担当で未実装。
+//! - `page_runner`（#780）がページごとに新しい [`JsRuntime`] を作って `install_dom_shim_with_options`
+//!   を呼び、エンジン再起動を検知したら打ち切る。専用スレッドのアクター化と
+//!   `Page.navigate` への配線は TASK-112（#784）の担当で未実装。
 //!
 //! # 可観測性（`REPAIR-9`・`TASK-10.2.2`・Issue #550）
 //!
@@ -193,13 +194,25 @@ impl JsRuntime {
     /// エンジンの失敗は [`crate::Error::JsEvaluation`] として種別を保ったまま返す。
     /// エラーメッセージ（core が組み立てる分）に `script` は埋め込まない。
     pub fn execute(&mut self, script: &str) -> crate::Result<JsExecutionOutput> {
+        self.execute_with_options(script, &EvaluateOptions::default())
+    }
+
+    /// [`execute`](Self::execute) に評価オプション（実時間上限・結果サイズ上限）を渡す版。
+    ///
+    /// 呼び出し元: `page_runner`（スクリプト単位・ページ全体の実時間上限を `options` で強制する。
+    /// `JS-6`・TASK-109）。
+    pub fn execute_with_options(
+        &mut self,
+        script: &str,
+        options: &EvaluateOptions,
+    ) -> crate::Result<JsExecutionOutput> {
         match &mut self.state {
             RuntimeState::Disabled => Err(crate::Error::JsExecutionUnavailable {
                 message: DISABLED_MESSAGE.to_string(),
             }),
             RuntimeState::Enabled { engine, .. } => {
                 let js_value = engine
-                    .evaluate_script(script, &EvaluateOptions::default())
+                    .evaluate_script(script, options)
                     .map_err(crate::Error::JsEvaluation)?;
                 let value = js_value_to_display_string(&js_value)?;
                 Ok(JsExecutionOutput { value, js_value })
@@ -248,6 +261,27 @@ impl JsRuntime {
     ///   この呼び出しでワーカーが起動する）
     /// - JS 無効のランタイムは成功を装わず `JsExecutionUnavailable`
     pub fn install_dom_shim(&mut self, bridge: &DomBridge) -> crate::Result<JsShimInstallation> {
+        self.install_dom_shim_with_options(bridge, &EvaluateOptions::default())
+    }
+
+    /// [`install_dom_shim`](Self::install_dom_shim) に評価オプションを渡す版。
+    ///
+    /// 呼び出し元: `page_runner`（shim 評価にもページ予算を超えないタイムアウトを課す。`JS-6`）。
+    pub fn install_dom_shim_with_options(
+        &mut self,
+        bridge: &DomBridge,
+        options: &EvaluateOptions,
+    ) -> crate::Result<JsShimInstallation> {
+        self.install_dom_shim_with(bridge, &mut || Ok(options.clone()))
+    }
+
+    /// shim ごとに評価オプションを決め直す版（`next_options` は各 shim の評価直前に呼ばれ、
+    /// `Err` で打ち切る）。呼び出し元: `page_runner`（ページの残り予算を shim ごとに再計算。`JS-6`）。
+    pub fn install_dom_shim_with(
+        &mut self,
+        bridge: &DomBridge,
+        next_options: &mut dyn FnMut() -> Result<EvaluateOptions, JsEngineError>,
+    ) -> crate::Result<JsShimInstallation> {
         match &mut self.state {
             RuntimeState::Disabled => Err(crate::Error::JsExecutionUnavailable {
                 message: DISABLED_MESSAGE.to_string(),
@@ -270,7 +304,7 @@ impl JsRuntime {
                         *dom_bridge = Some(bridge.clone());
                     }
                 }
-                js_shim::install(engine.as_mut(), &EvaluateOptions::default())
+                js_shim::install_with(engine.as_mut(), next_options)
                     .map_err(crate::Error::JsEvaluation)
             }
         }
@@ -426,6 +460,42 @@ mod tests {
         assert_eq!(*scripts.lock().unwrap(), vec!["'a' + 'b'".to_string()]);
         assert_eq!(*binds.lock().unwrap(), 0);
         assert_eq!(rt.engine_kind(), Some(EngineKind::V8));
+    }
+
+    /// JS-6（TASK-109・#780）: `execute_with_options` の実時間上限がエンジンへそのまま渡る。
+    #[test]
+    fn js_2_execute_with_options_passes_timeout() {
+        struct Probe(Arc<Mutex<Option<std::time::Duration>>>);
+        impl JsEngine for Probe {
+            fn evaluate_script(
+                &mut self,
+                _script: &str,
+                options: &EvaluateOptions,
+            ) -> Result<JsValue, JsEngineError> {
+                *self.0.lock().unwrap() = Some(options.timeout());
+                Ok(JsValue::Undefined)
+            }
+            fn inject_global_function(
+                &mut self,
+                _name: &str,
+                _func: NativeFn,
+            ) -> Result<(), JsEngineError> {
+                Ok(())
+            }
+            fn bind_dom_like_object(
+                &mut self,
+                _name: &str,
+                _methods: Vec<(String, NativeFn)>,
+            ) -> Result<(), JsEngineError> {
+                Ok(())
+            }
+        }
+        let seen = Arc::new(Mutex::new(None));
+        let mut rt = JsRuntime::from_engine_for_test(EngineKind::V8, Box::new(Probe(seen.clone())));
+        let t = std::time::Duration::from_millis(1234);
+        rt.execute_with_options("1", &EvaluateOptions::default().with_timeout(t))
+            .expect("評価成功");
+        assert_eq!(*seen.lock().unwrap(), Some(t));
     }
 
     /// JS-2（TASK-30.3・#161）: `JsEngineError` の各種別が区別されたまま

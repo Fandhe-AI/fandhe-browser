@@ -73,6 +73,8 @@ pub use page_env::{
     LocationMember, MAX_BRIDGE_DIAGNOSTICS, MAX_CONSOLE_MESSAGE_BYTES, MAX_LOCATION_URL_BYTES,
 };
 use page_env::{apply_hash, location_member, parse_location};
+// ページランナーが例外メッセージの切り詰めに再利用する（#780）。
+pub(crate) use page_env::truncate_utf8;
 
 /// JS に公開するグローバルオブジェクト名（`__dom.op(...)` の `__dom`）。
 pub const DOM_BRIDGE_OBJECT_NAME: &str = "__dom";

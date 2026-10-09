@@ -64,9 +64,22 @@ pub fn install(
     engine: &mut dyn JsEngine,
     options: &EvaluateOptions,
 ) -> Result<JsShimInstallation, JsEngineError> {
+    install_with(engine, &mut || Ok(options.clone()))
+}
+
+/// [`install`] の評価オプションを shim ごとに決め直す版。
+///
+/// `next_options` は各 shim の評価直前に呼ばれ、その shim に課す [`EvaluateOptions`] を返す。
+/// `Err` を返すとその時点で打ち切る。ページ実行ランナー（`page_runner`）が、先行 shim の
+/// 消費時間を差し引いたページの残り予算を課すために使う（`JS-6`）。
+pub fn install_with(
+    engine: &mut dyn JsEngine,
+    next_options: &mut dyn FnMut() -> Result<EvaluateOptions, JsEngineError>,
+) -> Result<JsShimInstallation, JsEngineError> {
     let mut evaluated = Vec::with_capacity(JS_SHIM_SOURCES.len());
     for shim in JS_SHIM_SOURCES {
-        engine.evaluate_script(shim.source, options)?;
+        let options = next_options()?;
+        engine.evaluate_script(shim.source, &options)?;
         evaluated.push(shim.name);
     }
     Ok(JsShimInstallation { evaluated })

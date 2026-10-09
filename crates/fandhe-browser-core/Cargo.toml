@@ -107,6 +107,19 @@ name = "js_shim_boa"
 harness = false
 required-features = ["js-boa"]
 
+# TASK-109・Issue #780・`JS-4`/`JS-6`: ページスクリプトランナーを V8・boa それぞれで実行する
+# 結合テスト。ケース本体は `tests/support/page_runner_cases.rs` で共通。ワーカー役を兼ねるため
+# 独自 `main`（`harness = false`）。
+[[test]]
+name = "page_runner_v8"
+harness = false
+required-features = ["js-v8"]
+
+[[test]]
+name = "page_runner_boa"
+harness = false
+required-features = ["js-boa"]
+
 # TASK-30・`JS-2`・Issue #513: core が再エクスポートする `run_js_worker_if_requested` のシグネチャ固定と、
 # エンジン非同梱ビルドでワーカー起動要求を受けたときの fail-closed を検証する。自身を再実行する
 # 独自 `main` を持つため `harness = false`。
