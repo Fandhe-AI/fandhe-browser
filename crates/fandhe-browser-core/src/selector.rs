@@ -107,6 +107,23 @@ impl SelectorList {
     pub fn selectors(&self) -> &[ComplexSelector] {
         &self.selectors
     }
+
+    /// 文字列を組み立てずに「ID が `value` に一致する要素」だけを表すリストを作る。
+    ///
+    /// `dom_bridge` の `getElementById`（`JS-5`・TASK-108）が使う。`#` + 値でセレクタ文字列を
+    /// 作ると、エスケープ（未対応）の取りこぼしと `a, div` のようなセレクタ注入が起きるため、
+    /// AST を直接構築して値をそのまま ID として照合する。
+    pub(crate) fn id_only(value: String) -> SelectorList {
+        SelectorList {
+            selectors: vec![ComplexSelector {
+                first: CompoundSelector {
+                    type_name: None,
+                    simple_selectors: vec![SimpleSelector::Id(value)],
+                },
+                rest: Vec::new(),
+            }],
+        }
+    }
 }
 
 impl std::str::FromStr for SelectorList {
