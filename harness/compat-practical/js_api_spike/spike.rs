@@ -696,6 +696,7 @@ mod tests {
         Url::parse("https://example.test/app/").expect("url")
     }
 
+    /// `JS-5`・TASK-106・SEC 系: https 以外の scheme や不正 URL を取得前に拒否する URL ポリシーの契約を検証する。
     #[test]
     fn url_policy_rejects_non_https_before_fetch() {
         for src in [
@@ -717,6 +718,8 @@ mod tests {
         assert_eq!(rel.as_str(), "https://example.test/app/x/y.js");
     }
 
+    /// `CORE-1`・`JS-5`・TASK-106・SEC 系: `Fetcher` が file: 等の scheme と内部アドレスを
+    /// ネットワークに出る前に拒否する契約を検証する。
     #[tokio::test]
     async fn fetcher_rejects_scheme_and_internal_addresses_offline() {
         let f = fetcher();
@@ -758,6 +761,7 @@ mod tests {
         );
     }
 
+    /// `CORE-1`・TASK-106: 取得は core の `Fetcher` 経由のみで、独自 HTTP クライアントを作らない不変条件をソース検査で守る。
     #[test]
     fn sources_do_not_build_their_own_http_client() {
         // 検査対象の語は分割して書き、このテスト自身に一致しないようにする。
@@ -784,6 +788,7 @@ mod tests {
             .document
     }
 
+    /// `JS-5`・TASK-106: script を文書順に抽出し、inline / external の分類と順序が保たれる契約を検証する。
     #[test]
     fn extract_orders_and_classifies_scripts() {
         let html = r#"<html><head>
@@ -811,6 +816,7 @@ mod tests {
         assert_eq!(orders, vec![0, 1, 2, 3, 4, 5, 6]);
     }
 
+    /// `JS-5`・TASK-106: 抽出件数が `--max-scripts` 上限で打ち切られる契約を検証する。
     #[test]
     fn extract_respects_max_scripts() {
         let html = "<script>1</script><script>2</script><script>3</script>";
@@ -818,6 +824,7 @@ mod tests {
         assert_eq!((e.len(), over), (2, 1));
     }
 
+    /// `JS-1`・`JS-5`・TASK-106: V8 / boa 双方の例外形式を未定義 API・構文エラー等の分類へ正しく写す契約を検証する。
     #[test]
     fn classify_handles_v8_and_boa_forms() {
         let want = |c: Classification, k: Option<&str>, m: &str, a: Option<&str>| {
@@ -861,11 +868,13 @@ mod tests {
         }
     }
 
+    /// `JS-5`・TASK-106: JSONL 出力の文字列エスケープが制御文字・引用符を網羅する契約を検証する。
     #[test]
     fn json_escape_covers_specials() {
         assert_eq!(json_escape("a\"b\\c\n\u{1}é"), "\"a\\\"b\\\\c\\n\\u0001é\"");
     }
 
+    /// `JS-5`・TASK-106・SEC 系: 出力行に script の URL・本文・生の例外メッセージを載せない不変条件を検証する。
     #[test]
     fn output_lines_never_contain_script_text() {
         let mut site = SiteRecord {
@@ -885,6 +894,7 @@ mod tests {
         assert!(all.contains("\"first_missing_api\":\"document\""));
     }
 
+    /// `JS-5`・TASK-106: 引数検証（必須項目・上限・不正値の拒否と既定値）の契約を検証する。
     #[test]
     fn args_validation() {
         let a = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
@@ -918,6 +928,7 @@ mod tests {
         assert_eq!(ok.engine, Some(EngineChoice::Boa));
     }
 
+    /// `JS-5`・TASK-106: サイト単位の集計で API 名が初出順に重複排除される契約を検証する。
     #[test]
     fn site_aggregation_dedups_in_first_seen_order() {
         let mut s = SiteRecord::default();
@@ -940,6 +951,7 @@ mod tests {
         );
     }
 
+    /// `JS-5`・TASK-106: 最初の有効な `<base href>` を文書 base URL に採用する契約を検証する。
     #[test]
     fn document_base_url_uses_first_valid_base_href() {
         let page = base();
@@ -962,6 +974,7 @@ mod tests {
         );
     }
 
+    /// `JS-5`・TASK-106・REPAIR-3: script 件数上限による打ち切りがサイト行に記録される契約を検証する。
     #[test]
     fn site_line_records_script_limit_truncation() {
         let s = SiteRecord {

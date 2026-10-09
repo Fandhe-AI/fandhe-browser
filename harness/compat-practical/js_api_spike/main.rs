@@ -151,22 +151,53 @@ async fn fetch_bounded(
     })
 }
 
-/// 出力先へ書く。`--out` は一時ファイルへ書いてから rename で置換する。
+/// 出力先へ書く。`--out` は一意名の一時ファイル経由（`write_atomic`）で置換する。
 fn write_output(args: &Args, lines: &[String]) -> std::io::Result<()> {
     let mut text = lines.join("\n");
     text.push('\n');
     match &args.out {
         None => std::io::stdout().write_all(text.as_bytes()),
-        Some(path) => {
-            let mut tmp = path.clone().into_os_string();
-            tmp.push(".tmp");
-            let tmp = std::path::PathBuf::from(tmp);
-            std::fs::write(&tmp, text.as_bytes())?;
-            std::fs::rename(&tmp, path).inspect_err(|_| {
-                let _ = std::fs::remove_file(&tmp);
-            })
-        }
+        Some(path) => write_atomic(path, text.as_bytes()),
     }
+}
+
+/// 同一ディレクトリに一意名の一時ファイルを `create_new` で排他作成して書き、rename で置換する。
+/// 既存ファイル・シンボリックリンクを切り詰めず、自分が作成した一時ファイルだけを rename / 削除する。
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("--out has no file name"))?
+        .to_os_string();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    for attempt in 0..16u32 {
+        let mut tmp_name = name.clone();
+        tmp_name.push(format!(".{}.{nanos}.{attempt}.tmp", std::process::id()));
+        let tmp = path.with_file_name(tmp_name);
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let result = file
+            .write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| {
+                drop(file);
+                std::fs::rename(&tmp, path)
+            });
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        return result;
+    }
+    Err(std::io::Error::other("could not create a unique temp file"))
 }
 
 /// 1 サイトを計測し、script 行とサイト行を `lines` へ積む。
