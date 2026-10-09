@@ -1226,4 +1226,41 @@ mod tests {
             DomBridgeError::ResponseTooLarge { limit: 8, .. }
         ));
     }
+
+    /// `REPAIR-9`: getInnerHTML は成功・失敗とも 1 呼び出し 1 件が記録される。
+    #[test]
+    fn repair_9_get_inner_html_is_recorded_once_per_call() {
+        use crate::{InMemoryRecorder, OperationKind, OperationOutcome};
+        use std::sync::Arc;
+
+        let rec = Arc::new(InMemoryRecorder::with_capacity(16));
+        let doc = parse_document(HTML, &ParseOptions::default().with_recorder(rec.clone()))
+            .expect("parse")
+            .document;
+        let limits = DomBridgeLimits {
+            max_response_bytes: 8,
+            ..DomBridgeLimits::default()
+        };
+        let b = DomBridge::new(limits);
+        b.attach(doc).expect("attach");
+        let a = num(call(&b, &[s("getElementById"), s("a")]));
+        let base = rec.records().len();
+        call(&b, &[s("getInnerHTML"), n(a)]).expect("ok");
+        let records = rec.records();
+        assert_eq!(records.len(), base + 1);
+        let last = records[base];
+        assert_eq!(last.operation(), OperationKind::Dom);
+        assert_eq!(last.outcome(), OperationOutcome::Success);
+
+        let body = num(call(&b, &[s("body")]));
+        call(&b, &[s("setTextContent"), n(a), s("0123456789")]).expect("set");
+        let before = rec.records().len();
+        call(&b, &[s("getInnerHTML"), n(body)]).expect_err("超過");
+        let records = rec.records();
+        assert_eq!(records.len(), before + 1);
+        assert!(matches!(
+            records[before].outcome(),
+            OperationOutcome::Failure { .. }
+        ));
+    }
 }

@@ -206,11 +206,35 @@ impl Document {
     ///
     /// `REPAIR-9` の計装対象で、recorder が有効なら 1 回につき 1 件（操作種別 `Dom`）を記録する。
     pub fn serialize_node(&self, node: NodeId, scope: SerializeScope) -> Result<SerializeResult> {
+        self.serialize_instrumented(node, scope, None)
+    }
+
+    /// `serialize_node` と同じだが、出力上限を `max_bytes` でさらに絞る（文書側上限との小さい方）。
+    ///
+    /// DOM ブリッジ（`JS-6`・TASK-108）が 1 応答の上限を出力バッファの確保前に効かせるために使う。
+    /// 超過は [`DomError::SerializedOutputTooLarge`]（部分出力は返さない）。
+    /// `serialize_node` と同じ計装（`REPAIR-9`・1 呼び出し 1 件）を共有する。
+    pub(crate) fn serialize_node_limited(
+        &self,
+        node: NodeId,
+        scope: SerializeScope,
+        max_bytes: usize,
+    ) -> Result<SerializeResult> {
+        self.serialize_instrumented(node, scope, Some(max_bytes))
+    }
+
+    /// `REPAIR-9` の計装（成功・失敗・所要時間を 1 呼び出し 1 件記録）つきの共通経路。
+    fn serialize_instrumented(
+        &self,
+        node: NodeId,
+        scope: SerializeScope,
+        max_bytes: Option<usize>,
+    ) -> Result<SerializeResult> {
         if !self.recorder.is_enabled() {
-            return self.serialize_inner(node, scope, None);
+            return self.serialize_inner(node, scope, max_bytes);
         }
         let start = Instant::now();
-        let result = self.serialize_inner(node, scope, None);
+        let result = self.serialize_inner(node, scope, max_bytes);
         let outcome = match &result {
             Ok(_) => OperationOutcome::Success,
             Err(Error::Dom(DomError::NodeNotFound { .. })) => OperationOutcome::Failure {
@@ -223,21 +247,6 @@ impl Document {
         self.recorder
             .record_outcome(OperationKind::Dom, outcome, start.elapsed());
         result
-    }
-
-    /// `serialize_node` と同じだが、出力上限を `max_bytes` でさらに絞る（文書側上限との小さい方）。
-    ///
-    /// DOM ブリッジ（`JS-6`・TASK-108）が 1 応答の上限を出力バッファの確保前に効かせるために使う。
-    /// 超過は [`DomError::SerializedOutputTooLarge`]（部分出力は返さない）。計装は行わない
-    /// （ブリッジ 1 操作 = 公開 API 1 件の件数契約を `serialize_node` と揃えるため
-    /// 呼び出し側が必要なら別途記録する）。
-    pub(crate) fn serialize_node_limited(
-        &self,
-        node: NodeId,
-        scope: SerializeScope,
-        max_bytes: usize,
-    ) -> Result<SerializeResult> {
-        self.serialize_inner(node, scope, Some(max_bytes))
     }
 
     /// 子の列挙元（`<template>` は template contents の子）。
