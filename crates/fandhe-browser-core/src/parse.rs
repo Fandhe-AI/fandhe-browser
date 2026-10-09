@@ -389,6 +389,8 @@ struct ArenaSink {
     /// ずれた）場合は参照時に不一致を検知して線形探索へフォールバックするため、
     /// 返す位置の正しさ自体は損なわれない。
     last_sibling_pos: Cell<Option<(NodeId, usize)>>,
+    /// `Document::scripting_enabled` へ引き継ぐ（`<noscript>` のシリアライズ規則。TASK-107）。
+    scripting_enabled: bool,
     max_nodes: usize,
     max_recorded_errors: usize,
     strict: bool,
@@ -422,6 +424,7 @@ impl ArenaSink {
             // として残す（`ArenaSink::new` を将来 `parse_document` 以外から
             // 直接呼ぶ経路が増えても Document すら確保できない状態にはしない）。
             max_nodes: options.max_nodes.max(RESERVED_NODE_COUNT),
+            scripting_enabled: options.scripting_enabled,
             max_recorded_errors: options.max_recorded_errors,
             strict: matches!(options.error_policy, ParseErrorPolicy::Strict),
             recorder: options.recorder.clone(),
@@ -648,6 +651,7 @@ impl TreeSink for ArenaSink {
                     recorder: self.recorder,
                     limits: crate::dom::DomLimits::default(),
                     retained_bytes,
+                    scripting_enabled: self.scripting_enabled,
                 }
             },
             diagnostics,
