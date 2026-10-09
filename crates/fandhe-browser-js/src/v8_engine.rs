@@ -1347,14 +1347,18 @@ fn value_to_js_value(
             // TASK-109・`JS-6`: 呼び出し側指定の上限は UTF-8 バイト数で数える。
             // `utf8_length` は複製を伴わない。UTF-8 は UTF-16 単位数以上になるため、
             // 上記のエンジン固定上限は options に関係なく先に効く。
-            Some(s) if s.utf8_length(scope) > max_result_bytes => {
-                Err(V8Failure::ResultTooLarge {
-                    bytes: s.utf8_length(scope),
-                    limit: max_result_bytes,
+            Some(s) => {
+                let utf8_bytes = s.utf8_length(scope);
+                if utf8_bytes > max_result_bytes {
+                    Err(V8Failure::ResultTooLarge {
+                        bytes: utf8_bytes,
+                        limit: max_result_bytes,
+                    }
+                    .into())
+                } else {
+                    Ok(JsValue::String(s.to_rust_string_lossy(scope)))
                 }
-                .into())
             }
-            Some(s) => Ok(JsValue::String(s.to_rust_string_lossy(scope))),
             None => Err(V8Failure::ResultConversion(
                 "failed to convert V8 string result to a UTF-16 string".to_string(),
             )
@@ -1558,7 +1562,9 @@ fn native_proxy_callback(
 
     let mut js_args = Vec::with_capacity(argc as usize);
     for i in 0..argc {
-        match value_to_js_value(scope, args.get(i), MAX_RESULT_STRING_UTF16_UNITS) {
+        // 引数経路は従来どおり UTF-16 単位数の固定上限のみで制限する。
+        // UTF-8 バイト上限は結果経路専用のため `usize::MAX` で無効化する。
+        match value_to_js_value(scope, args.get(i), usize::MAX) {
             Ok(value) => js_args.push(value),
             Err(err) => {
                 let Some(message) = v8::String::new(scope, &err.to_string()) else {
