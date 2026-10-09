@@ -38,11 +38,26 @@
 //! （TASK-109）が [`DomBridge::set_ready_state`]・[`DomBridge::set_current_script`] で更新し、
 //! shim は引数 0 個の `readyState` / `currentScript` 操作で読む。
 //!
+//! # ページの状態（`location`・診断。#779）
+//!
+//! `window.location` の実体も Rust 側が持つ。ランナー（TASK-109・TASK-112）が
+//! [`DomBridge::set_location`] へ取得結果の最終 URL を渡し（http / https のみ・userinfo 除去。
+//! 未設定は `about:blank`）、shim は `getLocation` を毎回 op で読む。ページ JS が変えられるのは
+//! `hash`（`setLocationHash`）だけで、それ以外の遷移系の代入・呼び出しは実行せず
+//! `ignoreLocationChange` として診断に記録する（`JS-5`）。`console` のメッセージも
+//! `consoleMessage` で診断に溜める。診断は [`DomBridge::take_diagnostics`] で回収し、
+//! `attach` ごとに空へ戻る。診断に URL 本文は保存しない（種別と長さのみ）。
+//! `navigatorUserAgent` は [`crate::fetch::USER_AGENT`] を返し、実ブラウザを装わない（`SEC-2`）。
+//!
 //! # 未実装（REPAIR-3）
 //!
+//! - `hashchange` / `popstate` イベントの発火、`document.location` / `document.URL`、
+//!   `location` 代入による実際の遷移は未実装（後続 issue）。
 //! - #771 のスパイクで判明する追加操作（`getAttribute`・`parentNode` 等）は後続 issue で足す。
 
 use std::sync::{Arc, Mutex, MutexGuard};
+
+use reqwest::Url;
 
 use fandhe_browser_js::{JsEngine, JsEngineError, JsValue, NativeFn};
 
@@ -51,6 +66,13 @@ use crate::dom::{Document, NodeId, SerializeScope};
 use crate::error::DomError;
 use crate::error::Error;
 use crate::query::{query_selector_all_str_bounded, query_selector_str};
+
+mod page_env;
+pub use page_env::{
+    BridgeDiagnostics, ConsoleLevel, ConsoleMessage, IgnoredLocationChange, LocationChangeKind,
+    LocationMember, MAX_BRIDGE_DIAGNOSTICS, MAX_CONSOLE_MESSAGE_BYTES, MAX_LOCATION_URL_BYTES,
+};
+use page_env::{apply_hash, location_member, parse_location};
 
 /// JS に公開するグローバルオブジェクト名（`__dom.op(...)` の `__dom`）。
 pub const DOM_BRIDGE_OBJECT_NAME: &str = "__dom";
@@ -192,6 +214,11 @@ pub enum DomBridgeError {
     Detached,
     /// 世代が枯渇して新しい `Document` を取り付けられない。
     GenerationExhausted,
+    /// `set_location` に渡された URL が不正（http / https 以外・解析不能）。URL は反響しない。
+    InvalidLocation {
+        /// 静的な理由。
+        reason: &'static str,
+    },
     /// ノードの arena 添字が ID に載る範囲（`u32`）を超えた。
     NodeIndexOutOfRange,
     /// 未実装の操作（REPAIR-3）。
@@ -241,6 +268,7 @@ impl std::fmt::Display for DomBridgeError {
             }
             Self::Detached => write!(f, "no document is attached to the DOM bridge"),
             Self::GenerationExhausted => write!(f, "DOM bridge generation counter is exhausted"),
+            Self::InvalidLocation { reason } => write!(f, "invalid location: {reason}"),
             Self::NodeIndexOutOfRange => write!(f, "node index does not fit in a node id"),
             Self::Unsupported { operation } => write!(f, "{operation} is not supported yet"),
             Self::StatePoisoned => write!(f, "DOM bridge state is poisoned"),
@@ -285,6 +313,11 @@ enum DomOp {
     SetInnerHtml,
     ReadyState,
     CurrentScript,
+    GetLocation,
+    SetLocationHash,
+    IgnoreLocationChange,
+    NavigatorUserAgent,
+    ConsoleMessage,
 }
 
 impl DomOp {
@@ -309,6 +342,11 @@ impl DomOp {
             "setInnerHTML" => Self::SetInnerHtml,
             "readyState" => Self::ReadyState,
             "currentScript" => Self::CurrentScript,
+            "getLocation" => Self::GetLocation,
+            "setLocationHash" => Self::SetLocationHash,
+            "ignoreLocationChange" => Self::IgnoreLocationChange,
+            "navigatorUserAgent" => Self::NavigatorUserAgent,
+            "consoleMessage" => Self::ConsoleMessage,
             _ => return None,
         })
     }
@@ -334,6 +372,11 @@ impl DomOp {
             Self::SetInnerHtml => "setInnerHTML",
             Self::ReadyState => "readyState",
             Self::CurrentScript => "currentScript",
+            Self::GetLocation => "getLocation",
+            Self::SetLocationHash => "setLocationHash",
+            Self::IgnoreLocationChange => "ignoreLocationChange",
+            Self::NavigatorUserAgent => "navigatorUserAgent",
+            Self::ConsoleMessage => "consoleMessage",
         }
     }
 
@@ -344,19 +387,24 @@ impl DomOp {
             | Self::Body
             | Self::Head
             | Self::ReadyState
-            | Self::CurrentScript => 0,
+            | Self::CurrentScript
+            | Self::NavigatorUserAgent => 0,
             Self::CreateElement
             | Self::CreateTextNode
             | Self::GetElementById
             | Self::GetTextContent
-            | Self::GetInnerHtml => 1,
+            | Self::GetInnerHtml
+            | Self::GetLocation
+            | Self::SetLocationHash => 1,
             Self::QuerySelector
             | Self::QuerySelectorAll
             | Self::AppendChild
             | Self::RemoveChild
             | Self::RemoveAttribute
             | Self::SetTextContent
-            | Self::SetInnerHtml => 2,
+            | Self::SetInnerHtml
+            | Self::IgnoreLocationChange
+            | Self::ConsoleMessage => 2,
             Self::InsertBefore | Self::SetAttribute => 3,
         }
     }
@@ -390,6 +438,9 @@ struct PageState {
     document: Document,
     ready_state: DocumentReadyState,
     current_script: Option<NodeId>,
+    /// `None` は `about:blank`。
+    location: Option<Url>,
+    diagnostics: BridgeDiagnostics,
     generation: u32,
     op_count: u64,
     op_limit_tripped: bool,
@@ -618,6 +669,55 @@ fn execute(
         DomOp::DocumentRoot => page.encode(page.document.root()),
         DomOp::ReadyState => Ok(JsValue::String(page.ready_state.as_str().to_owned())),
         DomOp::CurrentScript => page.encode_optional(page.current_script),
+        DomOp::NavigatorUserAgent => Ok(JsValue::String(crate::fetch::USER_AGENT.to_owned())),
+        DomOp::GetLocation => {
+            let name = string_arg(op, args, 1, limits)?;
+            let member = LocationMember::parse(name).ok_or(DomBridgeError::TypeMismatch {
+                operation: op.name(),
+                index: 1,
+                expected: "a known location member",
+            })?;
+            string_response(location_member(page.location.as_ref(), member), limits)
+        }
+        DomOp::SetLocationHash => {
+            let value = string_arg(op, args, 1, limits)?;
+            match page.location.as_mut() {
+                Some(url) => {
+                    if !apply_hash(url, value) {
+                        // 結果が URL 上限を超える代入は適用せず、無視した事実だけ残す。
+                        page.diagnostics
+                            .record_location_change(LocationChangeKind::Hash, value.len());
+                    }
+                }
+                // about:blank には書き換え先が無い。無視した事実だけ残す。
+                None => page
+                    .diagnostics
+                    .record_location_change(LocationChangeKind::Hash, value.len()),
+            }
+            Ok(JsValue::Undefined)
+        }
+        DomOp::IgnoreLocationChange => {
+            let name = string_arg(op, args, 1, limits)?;
+            let value = string_arg(op, args, 2, limits)?;
+            let kind = LocationChangeKind::parse(name).ok_or(DomBridgeError::TypeMismatch {
+                operation: op.name(),
+                index: 1,
+                expected: "a known location change kind",
+            })?;
+            page.diagnostics.record_location_change(kind, value.len());
+            Ok(JsValue::Undefined)
+        }
+        DomOp::ConsoleMessage => {
+            let name = string_arg(op, args, 1, limits)?;
+            let text = string_arg(op, args, 2, limits)?;
+            let level = ConsoleLevel::parse(name).ok_or(DomBridgeError::TypeMismatch {
+                operation: op.name(),
+                index: 1,
+                expected: "a known console level",
+            })?;
+            page.diagnostics.record_console(level, text);
+            Ok(JsValue::Undefined)
+        }
         DomOp::Body => page.encode_optional(page.html_child("body")),
         DomOp::Head => page.encode_optional(page.html_child("head")),
         DomOp::CreateElement => {
@@ -788,6 +888,8 @@ impl DomBridge {
             document,
             ready_state: DocumentReadyState::Loading,
             current_script: None,
+            location: None,
+            diagnostics: BridgeDiagnostics::default(),
             generation,
             op_count: 0,
             op_limit_tripped: false,
@@ -840,6 +942,28 @@ impl DomBridge {
         }
         page.current_script = script;
         Ok(())
+    }
+
+    /// `window.location` の URL を設定する（ページ実行ランナー用。TASK-109・TASK-112）。
+    /// 取得結果の最終 URL を渡す想定。http / https 以外・解析不能は
+    /// [`DomBridgeError::InvalidLocation`]（URL は反響しない）、userinfo は除去する。
+    /// [`MAX_LOCATION_URL_BYTES`] を超える URL は解析前に拒否する（`SEC-2`）。
+    /// 未取り付けなら [`DomBridgeError::Detached`]。
+    pub fn set_location(&self, url: &str) -> Result<(), DomBridgeError> {
+        let mut guard = self.lock()?;
+        let page = guard.page.as_mut().ok_or(DomBridgeError::Detached)?;
+        let parsed =
+            parse_location(url).map_err(|reason| DomBridgeError::InvalidLocation { reason })?;
+        page.location = Some(parsed);
+        Ok(())
+    }
+
+    /// 集まった診断（無視した `location` 操作・`console`）を取り出して空にする
+    /// （ランナー用）。未取り付けなら [`DomBridgeError::Detached`]。
+    pub fn take_diagnostics(&self) -> Result<BridgeDiagnostics, DomBridgeError> {
+        let mut guard = self.lock()?;
+        let page = guard.page.as_mut().ok_or(DomBridgeError::Detached)?;
+        Ok(std::mem::take(&mut page.diagnostics))
     }
 
     /// 同じ内部状態を共有するブリッジか（`JsRuntime::install_dom_shim` が束縛済みの
@@ -1433,5 +1557,163 @@ mod tests {
             records[before].outcome(),
             OperationOutcome::Failure { .. }
         ));
+    }
+
+    fn text(v: Result<JsValue, DomBridgeError>) -> String {
+        match v.expect("成功するはず") {
+            JsValue::String(x) => x,
+            other => panic!("String を期待: {other:?}"),
+        }
+    }
+
+    fn loc(b: &DomBridge, member: &str) -> String {
+        text(call(b, &[s("getLocation"), s(member)]))
+    }
+
+    #[test]
+    fn js_5_location_defaults_to_about_blank_and_follows_set_location() {
+        let b = bridge();
+        assert_eq!(loc(&b, "href"), "about:blank");
+        assert_eq!(loc(&b, "origin"), "null");
+        assert_eq!(loc(&b, "pathname"), "blank");
+        b.set_location("https://user:pw@example.com:8443/a/b?q=1#f")
+            .expect("set");
+        assert_eq!(loc(&b, "href"), "https://example.com:8443/a/b?q=1#f");
+        assert_eq!(loc(&b, "origin"), "https://example.com:8443");
+        assert_eq!(loc(&b, "port"), "8443");
+        assert_eq!(loc(&b, "search"), "?q=1");
+        assert_eq!(loc(&b, "hash"), "#f");
+        b.set_location("https://example.com/").expect("set");
+        assert_eq!(loc(&b, "port"), "");
+        assert_eq!(loc(&b, "search"), "");
+        assert_eq!(loc(&b, "hash"), "");
+        // attach で about:blank に戻る。
+        b.attach(parse(HTML)).expect("attach");
+        assert_eq!(loc(&b, "href"), "about:blank");
+    }
+
+    #[test]
+    fn js_5_set_location_rejects_bad_urls_without_echo() {
+        let b = bridge();
+        for bad in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "ftp://h/",
+            "about:blank",
+            "::garbage::",
+        ] {
+            let e = b.set_location(bad).expect_err(bad);
+            assert!(matches!(e, DomBridgeError::InvalidLocation { .. }), "{e}");
+            assert!(!e.to_string().contains("passwd"), "{e}");
+        }
+        // 上限超過は解析前に拒否し、URL 本文を反響しない。
+        let long = format!("https://example.com/{}", "SECRETQ".repeat(2000));
+        let e = b.set_location(&long).expect_err("too long");
+        assert!(matches!(e, DomBridgeError::InvalidLocation { .. }), "{e}");
+        assert!(!e.to_string().contains("SECRETQ"), "{e}");
+        assert_eq!(loc(&b, "href"), "about:blank");
+        let detached = DomBridge::new(DomBridgeLimits::default());
+        assert!(matches!(
+            detached.set_location("https://example.com/"),
+            Err(DomBridgeError::Detached)
+        ));
+    }
+
+    #[test]
+    fn js_5_set_location_hash_strips_one_hash_and_clears_when_empty() {
+        let b = bridge();
+        b.set_location("https://example.com/p?x=1").expect("set");
+        call(&b, &[s("setLocationHash"), s("n")]).expect("ok");
+        assert_eq!(loc(&b, "href"), "https://example.com/p?x=1#n");
+        call(&b, &[s("setLocationHash"), s("#m")]).expect("ok");
+        assert_eq!(loc(&b, "hash"), "#m");
+        call(&b, &[s("setLocationHash"), s("")]).expect("ok");
+        assert_eq!(loc(&b, "href"), "https://example.com/p?x=1");
+        // about:blank は書き換えず診断に残す。
+        let blank = bridge();
+        call(&blank, &[s("setLocationHash"), s("z")]).expect("ok");
+        assert_eq!(loc(&blank, "href"), "about:blank");
+        let d = blank.take_diagnostics().expect("diag");
+        assert_eq!(
+            d.location_changes_ignored,
+            vec![IgnoredLocationChange {
+                kind: LocationChangeKind::Hash,
+                value_len: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn js_5_ignore_location_change_records_kind_and_length_only() {
+        let b = bridge();
+        call(
+            &b,
+            &[
+                s("ignoreLocationChange"),
+                s("href"),
+                s("https://secret.test/?t=1"),
+            ],
+        )
+        .expect("ok");
+        call(&b, &[s("ignoreLocationChange"), s("nope"), s("x")]).expect_err("許可リスト外");
+        let d = b.take_diagnostics().expect("diag");
+        assert_eq!(d.location_changes_ignored.len(), 1);
+        assert_eq!(d.location_changes_ignored[0].value_len, 24);
+        assert!(!format!("{d:?}").contains("secret.test"));
+        assert_eq!(
+            b.take_diagnostics().expect("empty"),
+            BridgeDiagnostics::default()
+        );
+    }
+
+    #[test]
+    fn js_5_console_message_truncates_on_char_boundary_and_caps_count() {
+        let b = bridge();
+        let long = "あ".repeat(2000);
+        call(&b, &[s("consoleMessage"), s("log"), s(&long)]).expect("ok");
+        call(&b, &[s("consoleMessage"), s("trace"), s("x")]).expect_err("許可リスト外");
+        let d = b.take_diagnostics().expect("diag");
+        assert_eq!(d.console_messages.len(), 1);
+        assert_eq!(d.console_messages[0].text.len(), 4095);
+        assert!(d.console_messages[0].truncated);
+        assert!(format!("{d:?}").len() < 400);
+        for _ in 0..(MAX_BRIDGE_DIAGNOSTICS + 3) {
+            call(&b, &[s("consoleMessage"), s("warn"), s("m")]).expect("ok");
+        }
+        let d = b.take_diagnostics().expect("diag");
+        assert_eq!(d.console_messages.len(), MAX_BRIDGE_DIAGNOSTICS);
+        assert_eq!(d.dropped, 3);
+        call(&b, &[s("consoleMessage"), s("info"), s("keep")]).expect("ok");
+        b.attach(parse(HTML)).expect("attach");
+        assert_eq!(
+            b.take_diagnostics().expect("empty"),
+            BridgeDiagnostics::default()
+        );
+    }
+
+    #[test]
+    fn js_5_navigator_user_agent_matches_fetcher() {
+        let b = bridge();
+        assert_eq!(
+            text(call(&b, &[s("navigatorUserAgent")])),
+            crate::fetch::USER_AGENT
+        );
+    }
+
+    #[test]
+    fn js_5_page_env_ops_check_arity_and_types() {
+        let b = bridge();
+        for (args, label) in [
+            (vec![s("navigatorUserAgent"), s("x")], "ua arity"),
+            (vec![s("getLocation")], "get arity"),
+            (vec![s("getLocation"), n(1.0)], "get type"),
+            (vec![s("getLocation"), s("nope")], "get member"),
+            (vec![s("setLocationHash"), n(1.0)], "hash type"),
+            (vec![s("ignoreLocationChange"), s("href")], "ignore arity"),
+            (vec![s("consoleMessage"), s("log"), n(1.0)], "console type"),
+        ] {
+            call(&b, &args).expect_err(label);
+        }
     }
 }

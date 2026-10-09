@@ -8,8 +8,8 @@
 use fandhe_browser_core::js_stub::{JsRuntime, execute_js_stub};
 use fandhe_browser_core::selector::parse_selector_list;
 use fandhe_browser_core::{
-    Config, DocumentReadyState, DomBridge, DomBridgeLimits, DomLimits, Error, NodeId, ParseOptions,
-    parse_document, query_selector,
+    Config, DocumentReadyState, DomBridge, DomBridgeLimits, DomLimits, Error, LocationChangeKind,
+    NodeId, ParseOptions, parse_document, query_selector,
 };
 
 const FIXTURE: &str =
@@ -39,7 +39,7 @@ fn setup(engine: &str, limit_extra_nodes: Option<usize>) -> Page {
     let cfg = Config::from_toml_str(&format!("[js]\nengine = \"{engine}\"\n")).expect("config");
     let mut rt = JsRuntime::from_config(cfg.js()).expect("runtime");
     let installed = rt.install_dom_shim(&bridge).expect("install shim");
-    assert_eq!(installed.evaluated, vec!["dom.js"]);
+    assert_eq!(installed.evaluated, vec!["dom.js", "window.js"]);
     Page { bridge, rt, script }
 }
 
@@ -265,8 +265,165 @@ pub fn run(engine: &str) {
     check(&mut p, "document.readyState", "loading");
     check(&mut p, "typeof document.createElement('p')", "object");
 
+    window_cases(engine);
+
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
     let err = disabled.install_dom_shim(&p.bridge).expect_err("disabled");
     assert!(matches!(err, Error::JsExecutionUnavailable { .. }), "{err}");
+}
+/// `window` / `location` / `navigator` / `console`（#779・`JS-5`・`SEC-2`）のケース。
+fn window_cases(engine: &str) {
+    const URL: &str = "https://example.com:8443/a/b?q=1#f";
+
+    eprintln!("case: JS-5 window / self / globalThis");
+    let mut p = setup(engine, None);
+    check(&mut p, "window === self && self === globalThis", "true");
+    check(&mut p, "window.document === document", "true");
+    check(&mut p, "typeof window", "object");
+
+    eprintln!("case: JS-5 location defaults to about:blank");
+    check(&mut p, "location.href", "about:blank");
+    check(&mut p, "location.origin", "null");
+
+    eprintln!("case: JS-5 location reflects the navigated URL");
+    p.bridge
+        .set_location("https://user:pw@example.com:8443/a/b?q=1#f")
+        .expect("set_location");
+    check(&mut p, "location.href", URL);
+    check(&mut p, "location.origin", "https://example.com:8443");
+    check(&mut p, "location.protocol", "https:");
+    check(&mut p, "location.host", "example.com:8443");
+    check(&mut p, "location.hostname", "example.com");
+    check(&mut p, "location.port", "8443");
+    check(&mut p, "location.pathname", "/a/b");
+    check(&mut p, "location.search", "?q=1");
+    check(&mut p, "location.hash", "#f");
+    check(&mut p, "String(location)", URL);
+    check(&mut p, "window.location === location", "true");
+    assert!(p.bridge.set_location("file:///etc/passwd").is_err());
+
+    eprintln!("case: JS-5 navigation attempts are recorded and ignored");
+    for script in [
+        "location.href = 'https://evil.test/'",
+        "location = 'https://evil.test/'",
+        "location.pathname = '/x'",
+        "location.search = '?z'",
+        "location.assign('https://evil.test/a')",
+        "location.replace('https://evil.test/b')",
+        "location.reload()",
+    ] {
+        check(
+            &mut p,
+            &format!("try {{ {script}; 'ok' }} catch (e) {{ 'threw' }}"),
+            "ok",
+        );
+    }
+    check(&mut p, "location.href", URL);
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    let got: Vec<_> = diag
+        .location_changes_ignored
+        .iter()
+        .map(|c| (c.kind, c.value_len))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (LocationChangeKind::Href, 18),
+            (LocationChangeKind::AssignLocation, 18),
+            (LocationChangeKind::Pathname, 2),
+            (LocationChangeKind::Search, 2),
+            (LocationChangeKind::Assign, 19),
+            (LocationChangeKind::Replace, 19),
+            (LocationChangeKind::Reload, 0),
+        ]
+    );
+    assert!(!format!("{diag:?}").contains("evil.test"));
+    assert_eq!(p.bridge.take_diagnostics().expect("empty").dropped, 0);
+
+    eprintln!("case: JS-5 location.hash is the only writable part");
+    check(
+        &mut p,
+        "location.hash = 'n'; location.href",
+        "https://example.com:8443/a/b?q=1#n",
+    );
+    check(&mut p, "location.hash = '#m'; location.hash", "#m");
+    check(
+        &mut p,
+        "location.hash = ''; location.href",
+        "https://example.com:8443/a/b?q=1",
+    );
+
+    eprintln!("case: SEC-2 navigator is honest about being fandhe-browser");
+    let mut p = setup(engine, None);
+    let ua = format!("fandhe-browser/{}", env!("CARGO_PKG_VERSION"));
+    check(&mut p, "navigator.userAgent", &ua);
+    check(&mut p, "navigator.webdriver === true", "true");
+    check(
+        &mut p,
+        "/Chrome|Mozilla|Safari|Headless|Gecko/.test(navigator.userAgent)",
+        "false",
+    );
+    check(&mut p, "typeof window.chrome", "undefined");
+    check(
+        &mut p,
+        "try { navigator.webdriver = false; } catch (e) {} navigator.webdriver",
+        "true",
+    );
+    check(
+        &mut p,
+        "try { new Navigator(); 'ok' } catch (e) { e instanceof TypeError }",
+        "true",
+    );
+
+    eprintln!("case: JS-5 console is a non-throwing recorder");
+    check(&mut p, "typeof console.log", "function");
+    check(&mut p, "String(console.log('a', 1))", "undefined");
+    check(
+        &mut p,
+        "console.log({ toString: function () { throw new Error('x'); } }); 'ok'",
+        "ok",
+    );
+    check(
+        &mut p,
+        "console.group(); console.time('t'); console.timeEnd('t'); console.clear(); \
+         console.assert(true); console.trace('t'); 'ok'",
+        "ok",
+    );
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    assert_eq!(diag.console_messages.len(), 3);
+    assert_eq!(diag.console_messages[0].text, "a 1");
+    assert_eq!(diag.console_messages[1].text, "[unprintable]");
+    assert_eq!(diag.console_messages[2].text, "t");
+
+    eprintln!("case: JS-5 console truncates page strings and caps forwarding");
+    check(&mut p, "console.log('x'.repeat(100000)); 'ok'", "ok");
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    assert_eq!(diag.console_messages.len(), 1);
+    assert_eq!(diag.console_messages[0].text.len(), 4096);
+    assert!(diag.console_messages[0].truncated);
+    // shim の転送上限（64 回）は install ごとに数えるため、新しいページで確かめる。
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "for (var i = 0; i < 100; i++) { console.log(i); } document.getElementById('a') !== null",
+        "true",
+    );
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    assert_eq!(diag.console_messages.len(), 64);
+
+    eprintln!("case: JS-5 reinstall restores the window globals after tampering");
+    let mut p = setup(engine, None);
+    p.bridge.set_location("https://example.com/x").expect("set");
+    p.eval(
+        "try { delete globalThis.location; } catch (e) {} \
+         globalThis.navigator = { userAgent: 'Chrome' }; \
+         globalThis.console = null; \
+         globalThis.window = 1; 'tampered'",
+    );
+    p.rt.install_dom_shim(&p.bridge).expect("reinstall");
+    check(&mut p, "navigator.userAgent", &ua);
+    check(&mut p, "typeof console.log", "function");
+    check(&mut p, "location.href", "https://example.com/x");
+    check(&mut p, "window === globalThis", "true");
 }

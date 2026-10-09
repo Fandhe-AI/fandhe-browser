@@ -230,7 +230,11 @@ impl JsRuntime {
         }
     }
 
-    /// `document` / Node 系の JS shim を注入する（`JS-5`・TASK-108・Issue #778）。
+    /// `document` / Node 系と `window` / `location` / `navigator` / `console` の JS shim を
+    /// 注入する（`JS-5`・TASK-108・Issue #778・#779）。
+    ///
+    /// `location` の URL は `DomBridge::set_location` で設定する（shim は毎回読むため評価の
+    /// 前後どちらでも反映される。未設定は `about:blank`）。
     ///
     /// 初回は `bridge` を `__dom` として bind してから `js_shim::install` で shim を評価する。
     /// 同じ `bridge` での 2 回目以降は bind を省き shim の再評価だけを行う（同一コンテキストでも
