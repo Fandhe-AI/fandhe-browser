@@ -62,6 +62,8 @@
 //! [`cssom_profile`] モジュール（TASK-100.2・#266・`PLUG-8`・MS-8）は `profiles/*.json` を
 //! 埋め込み、CSS プロパティ単位の対応可否を照会する。TASK-100.3（#267）で公開入口
 //! [`profile_gate`] を、TASK-100.4（#268）で gating 本体（宣言の除去）を追加した。
+//! [`page_script`] モジュール（TASK-109・#774・`JS-4`・`JS-6`）は、パース済み DOM から
+//! 実行対象の `<script>` を文書順に収集する（評価・`src` 取得は #780・#781 の担当）。
 //!
 //! # スタブについて
 //!
@@ -69,6 +71,7 @@
 //! 装わない）。crate 直下では対象モジュールの名前のみを挙げる。
 //!
 //! - [`cssom`]（`CORE-5`・`TASK-105`・`MS-8`。型定義・宣言パーサー・詳細度計算・ルール分割・スタイル源収集・セレクタマッチング・カスケード解決のみ。`!important`・継承等は未実装）
+//! - [`page_script`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。収集のみ。SVG の script・`language`・module 実行等は未実装）
 //! - [`js_stub`]（`JS-2`・`TASK-30`・`MS-3`）
 //! - [`render::DisabledRenderer`]（`RENDER-1`・`TASK-33`/`TASK-38`・`MS-1`/`MS-4`）
 //! - [`observability::OperationRecord::to_json_line`]（`REPAIR-9`・`TASK-10（10.1）`・
@@ -85,6 +88,7 @@ pub mod fetch;
 pub mod host;
 pub mod js_stub;
 pub mod observability;
+pub mod page_script;
 pub mod parse;
 pub mod query;
 pub mod render;
@@ -116,6 +120,11 @@ pub use fandhe_browser_js::{JsEngineError, JsValue, NativeFn};
 pub use observability::{
     FailureKind, InMemoryRecorder, OperationCounts, OperationKind, OperationOutcome,
     OperationRecord, OperationRecorder, RecorderHandle,
+};
+pub use page_script::{
+    CollectedScripts, DEFAULT_MAX_INLINE_SCRIPT_BYTES, DEFAULT_MAX_PAGE_SCRIPTS,
+    ScriptCollectionOptions, ScriptDiagnostic, ScriptDiagnosticKind, ScriptEntry, ScriptSource,
+    collect_page_scripts,
 };
 pub use parse::{
     ParseDiagnostics, ParseErrorPolicy, ParseOptions, ParsedDocument, parse_document,
