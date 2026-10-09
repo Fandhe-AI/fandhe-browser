@@ -30,6 +30,8 @@
 //! - 変更 API（`mutation` サブモジュール。TASK-107・Issue #772・`JS-5`/`JS-6`）は
 //!   検証してから変更する 2 フェーズで、`Err` 時は木を変更しない。arena は縮まない
 //!   ため、外したノードもノード数上限（[`DomLimits`]）に数える。
+//! - HTML シリアライズ（`serialize` サブモジュール。TASK-107・Issue #773・`JS-4`/`JS-6`）は
+//!   明示スタックの反復実装で再帰せず、出力は push 前に上限（[`DomLimits`]）を検証する。
 //! - 走査系のイテレータ（[`Ancestors`]・[`Descendants`]）は再帰せず明示スタック
 //!   ／歩数カウントで実装し、`parent`/`children` リンクが（万一）壊れていても
 //!   `node_count` を超えて走査を続けない（security.md「不安全な設計」対策。
@@ -155,11 +157,14 @@ pub type QuirksMode = html5ever::interface::QuirksMode;
 pub use html5ever::QualName;
 
 mod mutation;
+mod serialize;
 pub(crate) use mutation::retained_bytes_of;
 pub use mutation::{
     DEFAULT_DOM_MAX_NODES, DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES, DEFAULT_MAX_ATTRIBUTES_PER_ELEMENT,
-    DEFAULT_MAX_NAME_BYTES, DEFAULT_MAX_TEXT_BYTES, DEFAULT_MAX_TOTAL_BYTES, DomLimits,
+    DEFAULT_MAX_NAME_BYTES, DEFAULT_MAX_SERIALIZED_BYTES, DEFAULT_MAX_TEXT_BYTES,
+    DEFAULT_MAX_TOTAL_BYTES, DomLimits,
 };
+pub use serialize::{SerializeResult, SerializeScope};
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -199,6 +204,10 @@ pub struct Document {
     /// （`JS-6`）。外したノードも arena に残るため減らない。`parse` が初期値を
     /// 数え、変更 API が増減させる。
     pub(crate) retained_bytes: usize,
+    /// パース時の scripting フラグ（`ParseOptions::scripting_enabled`）。WHATWG の
+    /// HTML シリアライズで `<noscript>` の子テキストを無加工にするかの判定に使い、
+    /// 再パース結果がパース時と食い違わないようにする（TASK-107）。
+    pub(crate) scripting_enabled: bool,
 }
 
 impl Document {
@@ -823,6 +832,7 @@ mod tests {
             recorder: RecorderHandle::default(),
             limits: DomLimits::default(),
             retained_bytes: 0,
+            scripting_enabled: false,
         };
 
         let ancestor_count = doc.ancestors(NodeId::new(0)).count();

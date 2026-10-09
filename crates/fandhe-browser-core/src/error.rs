@@ -288,7 +288,7 @@ pub enum NameKind {
     Attribute,
 }
 
-/// `Document` の変更 API（TASK-107・`JS-5`/`JS-6`）固有のエラー（[`Error::Dom`] の payload）。
+/// `Document` の変更 API・HTML シリアライズ（TASK-107・`JS-4`/`JS-5`/`JS-6`）固有のエラー（[`Error::Dom`] の payload）。
 ///
 /// いずれの場合も木は変更されない（検証してから変更する）。呼び出し元は後続の
 /// `__dom.op` ブリッジ（TASK-108）を想定する。`#[non_exhaustive]` で将来の
@@ -364,6 +364,12 @@ pub enum DomError {
         /// 上限値。
         limit: usize,
     },
+    /// HTML シリアライズの出力が `DomLimits::max_serialized_bytes` を超えた
+    /// （TASK-107・Issue #773・`JS-6`）。途中までの出力は返さない。
+    SerializedOutputTooLarge {
+        /// 上限値。
+        limit: usize,
+    },
 }
 
 impl fmt::Display for DomError {
@@ -413,6 +419,9 @@ impl fmt::Display for DomError {
                     f,
                     "retained {retained} bytes plus {requested} bytes exceeds document limit of {limit} bytes"
                 )
+            }
+            DomError::SerializedOutputTooLarge { limit } => {
+                write!(f, "serialized HTML exceeds limit of {limit} bytes")
             }
         }
     }

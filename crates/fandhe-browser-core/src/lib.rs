@@ -107,8 +107,8 @@ pub use cssom_profile::{
     BrowserProfile, GatedStyle, ProfileGate, profile_gate, profile_gate_from_name,
 };
 pub use dom::{
-    Ancestors, Attribute, Children, Descendants, Document, DomLimits, Node, NodeData, NodeId,
-    QuirksMode,
+    Ancestors, Attribute, Children, DEFAULT_MAX_SERIALIZED_BYTES, Descendants, Document, DomLimits,
+    Node, NodeData, NodeId, QuirksMode, SerializeResult, SerializeScope,
 };
 pub use error::{DomError, Error, NameKind, ParseError, Result};
 pub use fetch::{FetchOptions, FetchResponse, Fetcher};

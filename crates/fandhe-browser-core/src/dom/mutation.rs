@@ -22,12 +22,13 @@
 //!   [`DomLimits::max_nodes`] に数えるため、作成と削除の繰り返しで上限をすり抜け
 //!   られない。
 //! - 要素名・属性名の検証は WHATWG DOM より意図的に厳しい ASCII 限定の規則
-//!   （将来の HTML シリアライズでのマークアップ注入を防ぐ）。緩めるかは TASK-108
+//!   （`serialize` での HTML 出力時のマークアップ注入を防ぐ）。緩めるかは TASK-108
 //!   の実測後に判断する。
 //!
 //! # 未実装（実装済みを装わない。REPAIR-3）
 //!
-//! - `innerHTML` 設定・HTML シリアライズ・シリアライズ後サイズの上限（TASK-107 の残り）。
+//! - `innerHTML` 設定（フラグメントパース。TASK-107 の残り）。HTML シリアライズ自体は
+//!   `serialize` サブモジュール（Issue #773）に実装済み。
 //! - Document 直下に置ける要素を 1 個に限る制約、DocumentFragment の展開挿入、
 //!   名前空間付きの要素作成、`create_element("template")` 時の template contents
 //!   生成（`template_contents` は `None`）。
@@ -47,6 +48,8 @@ pub const DEFAULT_MAX_NAME_BYTES: usize = 1_024;
 pub const DEFAULT_MAX_TEXT_BYTES: usize = 1024 * 1024;
 /// 要素 1 個あたりの既定の属性個数上限（`JS-6`）。
 pub const DEFAULT_MAX_ATTRIBUTES_PER_ELEMENT: usize = 256;
+/// HTML シリアライズ出力の既定上限（8 MiB。`JS-6`・TASK-107）。
+pub const DEFAULT_MAX_SERIALIZED_BYTES: usize = 8 * 1024 * 1024;
 /// 文書全体で保持するテキスト・名前・属性値の既定の合計上限（64 MiB。`JS-6`）。
 pub const DEFAULT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
@@ -64,6 +67,7 @@ pub struct DomLimits {
     max_text_bytes: usize,
     max_attributes_per_element: usize,
     max_total_bytes: usize,
+    max_serialized_bytes: usize,
 }
 
 impl Default for DomLimits {
@@ -75,6 +79,7 @@ impl Default for DomLimits {
             max_text_bytes: DEFAULT_MAX_TEXT_BYTES,
             max_attributes_per_element: DEFAULT_MAX_ATTRIBUTES_PER_ELEMENT,
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+            max_serialized_bytes: DEFAULT_MAX_SERIALIZED_BYTES,
         }
     }
 }
@@ -115,6 +120,17 @@ impl DomLimits {
     pub fn with_max_total_bytes(mut self, bytes: usize) -> Self {
         self.max_total_bytes = bytes;
         self
+    }
+
+    /// HTML シリアライズ出力の最大バイト数を設定する（超過は `Err`。`JS-6`）。
+    pub fn with_max_serialized_bytes(mut self, bytes: usize) -> Self {
+        self.max_serialized_bytes = bytes;
+        self
+    }
+
+    /// HTML シリアライズ出力の最大バイト数。
+    pub fn max_serialized_bytes(&self) -> usize {
+        self.max_serialized_bytes
     }
 
     /// 文書全体の保持バイト数の上限。
