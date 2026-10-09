@@ -343,6 +343,18 @@ pub enum DomError {
         /// 上限値。
         limit: usize,
     },
+    /// テキスト内容が `DomLimits::max_text_bytes` を超えた。
+    TextTooLarge {
+        /// 渡されたテキストのバイト長。
+        len: usize,
+        /// 上限値。
+        limit: usize,
+    },
+    /// 新規属性の追加が `DomLimits::max_attributes_per_element` を超える。
+    TooManyAttributes {
+        /// 上限値。
+        limit: usize,
+    },
 }
 
 impl fmt::Display for DomError {
@@ -376,6 +388,12 @@ impl fmt::Display for DomError {
                     f,
                     "attribute value of {len} bytes exceeds limit of {limit} bytes"
                 )
+            }
+            DomError::TextTooLarge { len, limit } => {
+                write!(f, "text of {len} bytes exceeds limit of {limit} bytes")
+            }
+            DomError::TooManyAttributes { limit } => {
+                write!(f, "attribute count would exceed limit of {limit}")
             }
         }
     }

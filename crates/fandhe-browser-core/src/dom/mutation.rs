@@ -28,8 +28,7 @@
 //! - Document 直下に置ける要素を 1 個に限る制約、DocumentFragment の展開挿入、
 //!   名前空間付きの要素作成、`create_element("template")` 時の template contents
 //!   生成（`template_contents` は `None`）。
-//! - テキスト長の上限（本 API は制限しない。`__dom.op` 側で検証する前提）と、
-//!   属性の個数の上限。
+//! - 属性の総バイト数の上限（個数と値 1 個あたりのみ制限する）。
 
 use html5ever::{LocalName, Namespace};
 
@@ -42,6 +41,10 @@ pub const DEFAULT_DOM_MAX_NODES: usize = 100_000;
 pub const DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES: usize = 64 * 1024;
 /// 要素名・属性名の既定の最大バイト長。
 pub const DEFAULT_MAX_NAME_BYTES: usize = 1_024;
+/// テキストノード（コメント・処理命令の内容を含む）1 個あたりの既定上限（1 MiB。`JS-6`）。
+pub const DEFAULT_MAX_TEXT_BYTES: usize = 1024 * 1024;
+/// 要素 1 個あたりの既定の属性個数上限（`JS-6`）。
+pub const DEFAULT_MAX_ATTRIBUTES_PER_ELEMENT: usize = 256;
 
 /// 変更 API の上限設定（`JS-6`）。`ParseOptions` と同じビルダー形式。
 ///
@@ -54,6 +57,8 @@ pub struct DomLimits {
     max_nodes: usize,
     max_attribute_value_bytes: usize,
     max_name_bytes: usize,
+    max_text_bytes: usize,
+    max_attributes_per_element: usize,
 }
 
 impl Default for DomLimits {
@@ -62,6 +67,8 @@ impl Default for DomLimits {
             max_nodes: DEFAULT_DOM_MAX_NODES,
             max_attribute_value_bytes: DEFAULT_MAX_ATTRIBUTE_VALUE_BYTES,
             max_name_bytes: DEFAULT_MAX_NAME_BYTES,
+            max_text_bytes: DEFAULT_MAX_TEXT_BYTES,
+            max_attributes_per_element: DEFAULT_MAX_ATTRIBUTES_PER_ELEMENT,
         }
     }
 }
@@ -83,6 +90,28 @@ impl DomLimits {
     pub fn with_max_name_bytes(mut self, bytes: usize) -> Self {
         self.max_name_bytes = bytes;
         self
+    }
+
+    /// テキスト内容 1 個あたりの最大バイト長を設定する。
+    pub fn with_max_text_bytes(mut self, bytes: usize) -> Self {
+        self.max_text_bytes = bytes;
+        self
+    }
+
+    /// 要素 1 個あたりの属性個数の上限を設定する（既存属性の置換は上限到達後も可能）。
+    pub fn with_max_attributes_per_element(mut self, count: usize) -> Self {
+        self.max_attributes_per_element = count;
+        self
+    }
+
+    /// テキスト内容 1 個あたりの最大バイト長。
+    pub fn max_text_bytes(&self) -> usize {
+        self.max_text_bytes
+    }
+
+    /// 要素 1 個あたりの属性個数の上限。
+    pub fn max_attributes_per_element(&self) -> usize {
+        self.max_attributes_per_element
     }
 
     /// ノード数の上限。
@@ -164,6 +193,18 @@ impl Document {
         Ok(())
     }
 
+    /// テキスト内容の長さを上限と照合する（コピー前に呼ぶ）。
+    fn check_text_len(&self, len: usize) -> Result<()> {
+        if len > self.limits.max_text_bytes {
+            return Err(DomError::TextTooLarge {
+                len,
+                limit: self.limits.max_text_bytes,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     /// 未接続の新規ノードを arena に追加する。作成系はすべてここを通る。
     fn push_node(&mut self, data: NodeData) -> Result<NodeId> {
         self.check_node_capacity()?;
@@ -196,8 +237,13 @@ impl Document {
         })
     }
 
-    /// 未接続のテキストノードを作成する（`JS-5`）。テキスト長は制限しない。
+    /// 未接続のテキストノードを作成する（`JS-5` / `JS-6`）。
+    ///
+    /// 長さが [`DomLimits::max_text_bytes`] を超えれば [`DomError::TextTooLarge`]、
+    /// ノード数上限超過は [`DomError::NodeLimitExceeded`]。どちらもコピー前に判定する。
     pub fn create_text_node(&mut self, data: &str) -> Result<NodeId> {
+        self.check_text_len(data.len())?;
+        self.check_node_capacity()?;
         self.push_node(NodeData::Text {
             contents: data.to_string(),
         })
@@ -305,7 +351,8 @@ impl Document {
     /// （新規なら `None`。`JS-5` / `JS-6`）。
     ///
     /// 要素以外は [`DomError::InvalidNodeKind`]、名前の規則違反は
-    /// [`DomError::InvalidName`]、値が上限超過なら [`DomError::AttributeValueTooLarge`]。
+    /// [`DomError::InvalidName`]、値が上限超過なら [`DomError::AttributeValueTooLarge`]、新規属性で個数上限に
+    /// 達していれば [`DomError::TooManyAttributes`]（既存属性の置換は可能）。
     /// HTML 要素の属性名は ASCII 小文字化し、照合は [`Document::attribute`] と同じ。
     pub fn set_attribute(
         &mut self,
@@ -328,6 +375,15 @@ impl Document {
             .element_name(element)
             .is_some_and(|n| &*n.ns == HTML_NAMESPACE_URI);
         let existing = self.attribute_index(element, name);
+        if existing.is_none() {
+            let count = self.attributes(element).len();
+            if count >= self.limits.max_attributes_per_element {
+                return Err(DomError::TooManyAttributes {
+                    limit: self.limits.max_attributes_per_element,
+                }
+                .into());
+            }
+        }
         let local = if is_html {
             name.to_ascii_lowercase()
         } else {
@@ -374,7 +430,11 @@ impl Document {
     /// 内容を書き換えて `None`。Document・Doctype は [`DomError::InvalidNodeKind`]
     /// （DOM 上は何もしない操作だが fail-closed を優先する。呼び出し側で無視扱いに変換できる）。
     /// ノード数上限に達していれば、子を外す前に [`DomError::NodeLimitExceeded`]。
+    /// `text` が [`DomLimits::max_text_bytes`] を超えれば、何も変更せず
+    /// [`DomError::TextTooLarge`]。
     pub fn set_text_content(&mut self, node: NodeId, text: &str) -> Result<Option<NodeId>> {
+        self.require_node(node)?;
+        self.check_text_len(text.len())?;
         match &self.require_node(node)?.data {
             NodeData::Element { .. } | NodeData::DocumentFragment => {
                 if !text.is_empty() {
@@ -681,6 +741,64 @@ mod tests {
         assert_eq!(doc.text_content(d).as_deref(), Some("bye"));
         assert_eq!(doc.set_text_content(d, "").expect("set"), None);
         assert_eq!(doc.children(d).count(), 0);
+    }
+
+    /// JS-6 (TASK-107): テキスト長上限。超過は Err、ちょうどは成功、Err 時は木が不変。
+    #[test]
+    fn js_6_text_size_limit() {
+        let mut doc = parse("<body><div id=d><b>x</b></div></body>");
+        doc.set_limits(doc.limits().with_max_text_bytes(4));
+        let d = query_selector_str(&doc, doc.root(), "#d").unwrap().unwrap();
+        let before = snapshot(&doc);
+        let n = doc.node_count();
+        assert!(matches!(
+            dom_err(doc.create_text_node("12345")),
+            DomError::TextTooLarge { len: 5, limit: 4 }
+        ));
+        assert!(matches!(
+            dom_err(doc.set_text_content(d, "12345")),
+            DomError::TextTooLarge { len: 5, limit: 4 }
+        ));
+        assert_eq!(doc.node_count(), n);
+        assert_eq!(snapshot(&doc), before);
+        doc.create_text_node("1234").expect("ちょうど上限は成功");
+        let t = doc.set_text_content(d, "1234").expect("set").expect("id");
+        assert_eq!(doc.text_content(d).as_deref(), Some("1234"));
+        assert!(matches!(
+            dom_err(doc.set_text_content(t, "12345")),
+            DomError::TextTooLarge { .. }
+        ));
+    }
+
+    /// JS-6 (TASK-107): ノード数上限到達時の create_text_node はコピー前に Err。
+    #[test]
+    fn js_6_create_text_node_node_limit() {
+        let mut doc = parse("<body></body>");
+        doc.set_limits(doc.limits().with_max_nodes(doc.node_count()));
+        assert!(matches!(
+            dom_err(doc.create_text_node("x")),
+            DomError::NodeLimitExceeded { .. }
+        ));
+    }
+
+    /// JS-6 (TASK-107): 属性個数上限。新規追加は Err、既存の置換は成功。
+    #[test]
+    fn js_6_attribute_count_limit() {
+        let mut doc = parse("<body></body>");
+        doc.set_limits(doc.limits().with_max_attributes_per_element(2));
+        let e = doc.create_element("div").expect("create");
+        doc.set_attribute(e, "a", "1").expect("set");
+        doc.set_attribute(e, "b", "2").expect("set");
+        assert!(matches!(
+            dom_err(doc.set_attribute(e, "c", "3")),
+            DomError::TooManyAttributes { limit: 2 }
+        ));
+        assert_eq!(doc.attributes(e).len(), 2);
+        assert_eq!(
+            doc.set_attribute(e, "A", "9").expect("置換は可能"),
+            Some("1".to_string())
+        );
+        assert_eq!(doc.attributes(e).len(), 2);
     }
 
     /// JS-5 / JS-6 (TASK-107): 名前の検証。
