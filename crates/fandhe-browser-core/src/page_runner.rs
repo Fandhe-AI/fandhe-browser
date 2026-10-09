@@ -34,6 +34,7 @@
 //! - スクリプトの completion 値が結果サイズ上限を超えると例外として扱われる
 //!   （ソースの書き換えによる回避はしない）。
 
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use fandhe_browser_js::{EvaluateOptions, JsEngineError};
@@ -438,27 +439,52 @@ fn run_with_runtime_factory(
     let mut runtime: Option<JsRuntime> = None;
 
     if has_inline {
-        match script_budget(
+        // shim 注入の各評価の直前に、ページ時計から残り予算を再計算する（先行 shim や
+        // 初期化の消費時間を差し引く。期限切れならそこで打ち切る。`JS-6`）。
+        let last_scope = Cell::new(WallTimeScope::Page);
+        let mut next_options = || match script_budget(
             options.script_wall_time,
             options.page_wall_time,
-            Duration::ZERO,
+            page_start.elapsed(),
         ) {
-            None => {
-                abort = Some(PageAbort {
-                    kind: AbortKind::WallTime {
-                        scope: WallTimeScope::Page,
-                        limit: options.page_wall_time,
-                    },
-                    index: None,
-                });
+            Some((budget, scope)) => {
+                last_scope.set(scope);
+                Ok(EvaluateOptions::default().with_timeout(budget))
             }
-            Some((budget, _)) => {
-                let mut rt = make_runtime()?;
-                rt.install_dom_shim_with_options(
-                    &bridge,
-                    &EvaluateOptions::default().with_timeout(budget),
-                )?;
-                runtime = Some(rt);
+            None => {
+                last_scope.set(WallTimeScope::Page);
+                Err(JsEngineError::Timeout(
+                    "page wall time exhausted before shim installation".to_string(),
+                ))
+            }
+        };
+        // 評価前に予算が尽きていれば runtime を作らず打ち切る。
+        if script_budget(
+            options.script_wall_time,
+            options.page_wall_time,
+            page_start.elapsed(),
+        )
+        .is_none()
+        {
+            abort = Some(page_wall_abort(options, None));
+        } else {
+            let mut rt = make_runtime()?;
+            match rt.install_dom_shim_with(&bridge, &mut next_options) {
+                Ok(_) => runtime = Some(rt),
+                // shim 評価がタイムアウトした場合はページの打ち切りとして集約する
+                // （shim が無い runtime では継続できないため runtime は捨てる）。
+                Err(Error::JsEvaluation(JsEngineError::Timeout(_))) => {
+                    let scope = last_scope.get();
+                    let limit = match scope {
+                        WallTimeScope::Script => options.script_wall_time,
+                        WallTimeScope::Page => options.page_wall_time,
+                    };
+                    abort = Some(PageAbort {
+                        kind: AbortKind::WallTime { scope, limit },
+                        index: None,
+                    });
+                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -474,12 +500,14 @@ fn run_with_runtime_factory(
                 } else if let Some(rt) = runtime.as_mut() {
                     run_one(
                         rt,
-                        &bridge,
+                        &RunContext {
+                            bridge: &bridge,
+                            options,
+                            page_start,
+                        },
                         entry.node(),
                         entry.index(),
                         src,
-                        options,
-                        page_start.elapsed(),
                         &mut abort,
                     )?
                 } else {
@@ -519,30 +547,49 @@ fn run_with_runtime_factory(
     ))
 }
 
+/// ページの実時間上限超過による打ち切り記録を作る。
+fn page_wall_abort(options: &PageRunOptions, index: Option<usize>) -> PageAbort {
+    PageAbort {
+        kind: AbortKind::WallTime {
+            scope: WallTimeScope::Page,
+            limit: options.page_wall_time,
+        },
+        index,
+    }
+}
+
+/// [`run_one`] が参照するページ共通の実行コンテキスト。
+struct RunContext<'a> {
+    bridge: &'a DomBridge,
+    options: &'a PageRunOptions,
+    /// ページ実行の開始時刻（ページ時計。`JS-6`）。
+    page_start: Instant,
+}
+
 /// inline スクリプト 1 件を評価し、結果を記録用の [`ScriptOutcome`] に写す。
 /// 打ち切りになる場合は `abort` に理由を入れる。
-#[allow(clippy::too_many_arguments)]
 fn run_one(
     rt: &mut JsRuntime,
-    bridge: &DomBridge,
+    ctx: &RunContext<'_>,
     node: NodeId,
     index: usize,
     src: &str,
-    options: &PageRunOptions,
-    elapsed: Duration,
     abort: &mut Option<PageAbort>,
 ) -> crate::Result<ScriptOutcome> {
-    let Some((timeout, scope)) =
-        script_budget(options.script_wall_time, options.page_wall_time, elapsed)
-    else {
-        let kind = AbortKind::WallTime {
-            scope: WallTimeScope::Page,
-            limit: options.page_wall_time,
-        };
-        *abort = Some(PageAbort {
-            kind: kind.clone(),
-            index: Some(index),
-        });
+    let RunContext {
+        bridge,
+        options,
+        page_start,
+    } = ctx;
+    let Some((timeout, scope)) = script_budget(
+        options.script_wall_time,
+        options.page_wall_time,
+        page_start.elapsed(),
+    ) else {
+        // このスクリプトは実行していない（原因ではない）ので index は付けない。
+        let page_abort = page_wall_abort(options, None);
+        let kind = page_abort.kind.clone();
+        *abort = Some(page_abort);
         return Ok(ScriptOutcome::NotExecuted { kind });
     };
 
@@ -552,11 +599,20 @@ fn run_one(
     let result = rt.execute_with_options(src, &EvaluateOptions::default().with_timeout(timeout));
     bridge.set_current_script(None).map_err(bridge_error)?;
 
+    // 評価後にもページ時計を確認する。子プロセス経路の切り上げ・猶予で、残り時間を
+    // 超えて正常応答が届くことがある（`JS-6`）。
+    let page_expired = page_start.elapsed() > options.page_wall_time;
+
     let (kind, message) = match result {
+        Ok(_) if page_expired => (page_wall_abort(options, None).kind, None),
         Ok(_) => return Ok(ScriptOutcome::Succeeded),
         Err(Error::JsEvaluation(JsEngineError::EvaluationFailed(m))) => {
             let (message, truncated) = truncated_message(&m);
-            return Ok(ScriptOutcome::Exception { message, truncated });
+            if page_expired {
+                (page_wall_abort(options, None).kind, Some(message))
+            } else {
+                return Ok(ScriptOutcome::Exception { message, truncated });
+            }
         }
         Err(Error::JsEvaluation(JsEngineError::Timeout(m))) => {
             let limit = match scope {
@@ -655,6 +711,12 @@ mod tests {
                     .and_then(|(_, n)| n.parse::<usize>().ok())
                     .unwrap_or(1);
                 return Err(JsEngineError::EvaluationFailed("x".repeat(n)));
+            }
+            if let Some(ms) = script.strip_prefix("sleep:") {
+                // 評価が予算を超えて正常応答する経路の再現用。
+                let ms = ms.parse::<u64>().unwrap_or(0);
+                std::thread::sleep(Duration::from_millis(ms));
+                return Ok(JsValue::Undefined);
             }
             match script {
                 "timeout" => Err(JsEngineError::Timeout("t".to_string())),
@@ -929,6 +991,29 @@ mod tests {
             ]
         );
         assert_eq!(out.abort().map(|a| a.kind().clone()), Some(kind));
+    }
+
+    /// JS-6: 最終スクリプトが予算を超えて正常応答してもページ期限超過として記録する。
+    #[test]
+    fn js_6_final_script_over_page_deadline_is_aborted() {
+        let limit = Duration::from_millis(20);
+        let opts = PageRunOptions::default().with_page_wall_time(limit);
+        let (out, _h) = run("<script>sleep:60</script>", &opts);
+        let out = out.expect("run");
+        let kind = AbortKind::WallTime {
+            scope: WallTimeScope::Page,
+            limit,
+        };
+        assert_eq!(
+            out.scripts()[0].outcome(),
+            &ScriptOutcome::Aborted {
+                kind: kind.clone(),
+                message: None
+            }
+        );
+        let abort = out.abort().expect("abort");
+        assert_eq!(abort.kind(), &kind);
+        assert_eq!(abort.index(), Some(0));
     }
 
     /// JS-6: ページの残りが小さいとスクリプトのタイムアウトが丸められ、scope は Page。

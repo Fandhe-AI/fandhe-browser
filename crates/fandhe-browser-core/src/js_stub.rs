@@ -272,6 +272,16 @@ impl JsRuntime {
         bridge: &DomBridge,
         options: &EvaluateOptions,
     ) -> crate::Result<JsShimInstallation> {
+        self.install_dom_shim_with(bridge, &mut || Ok(options.clone()))
+    }
+
+    /// shim ごとに評価オプションを決め直す版（`next_options` は各 shim の評価直前に呼ばれ、
+    /// `Err` で打ち切る）。呼び出し元: `page_runner`（ページの残り予算を shim ごとに再計算。`JS-6`）。
+    pub fn install_dom_shim_with(
+        &mut self,
+        bridge: &DomBridge,
+        next_options: &mut dyn FnMut() -> Result<EvaluateOptions, JsEngineError>,
+    ) -> crate::Result<JsShimInstallation> {
         match &mut self.state {
             RuntimeState::Disabled => Err(crate::Error::JsExecutionUnavailable {
                 message: DISABLED_MESSAGE.to_string(),
@@ -294,7 +304,8 @@ impl JsRuntime {
                         *dom_bridge = Some(bridge.clone());
                     }
                 }
-                js_shim::install(engine.as_mut(), options).map_err(crate::Error::JsEvaluation)
+                js_shim::install_with(engine.as_mut(), next_options)
+                    .map_err(crate::Error::JsEvaluation)
             }
         }
     }
