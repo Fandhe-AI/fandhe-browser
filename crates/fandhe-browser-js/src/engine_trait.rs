@@ -24,6 +24,8 @@
 //! 対応する Cargo feature 名）は TASK-91（91.2・`MS-3`・Issue #215）で確定し、
 //! [`EngineKind::as_str`]・[`EngineKind::from_config_name`] 等として提供する。
 
+use std::time::Duration;
+
 /// 本 crate が抽象化対象とする JS エンジンの種別。
 ///
 /// `docs/spec/04-behavior/js-engine.md` 決定 5 は V8・Boa の 2 種に固定した
@@ -240,17 +242,82 @@ impl NativeCallContext {
 /// 関数は `JsValue` のみを受け渡すため `Send` 境界と衝突しない。
 pub type NativeFn = Box<dyn FnMut(&[JsValue]) -> Result<JsValue, JsEngineError> + Send>;
 
-/// [`JsEngine::evaluate_script`] の実行制御オプション（TASK-28.3・`JS-1`）。
+/// [`JsEngine::evaluate_script`] の実行制御オプション（TASK-28.3・TASK-109・
+/// `JS-1`・`JS-6`）。
 ///
-/// 簡易実装（現在の制限: 現時点ではフィールドを持たず、タイムアウト等の
-/// 無限ループ対策〔OWASP「不安全な設計」・A04〕を指定する手段がない。
-/// 機能があるように見せない。REPAIR-3）。タイムアウトは
-/// `TASK-29`／`TASK-30`（`MS-3`）で本構造体にフィールドを追加して実装する
-/// 差し込み口として用意する。`#[non_exhaustive]` を付け、フィールド追加が
-/// 破壊的変更にならないようにする。
-#[derive(Debug, Clone, Default)]
+/// 評価 1 回ごとの実時間タイムアウトと結果サイズ上限を呼び出し側（後続の
+/// ページスクリプトランナー）が指定するための型。`Default` は従来の固定値
+/// （タイムアウト 2 秒・結果 1M UTF-16 単位）と等価で、指定しなければ挙動は変わらない。
+/// 結果上限は UTF-8 バイトで数えるため、既定値は 1M UTF-16 単位の UTF-8 最大長
+/// （3 バイト/単位）にあたる 3 MiB とする。
+///
+/// # 適用範囲（実装済みを装わない。REPAIR-3）
+///
+/// - V8 の `V8Engine`（子プロセス内で動くエンジン本体）だけが強制する
+/// - boa エンジンと、子プロセス経路（`create_engine` が返すエンジン）は
+///   現時点で本オプションを無視し、固定値のまま動く。ワイヤプロトコルへの
+///   受け渡しと boa 対応は Issue #776（TASK-109 続き）で扱う
+///
+/// # 単位と境界
+///
+/// - `timeout`: 実時間。`Duration::ZERO` はすぐ打ち切る（fail-closed）。
+///   超過時は [`JsEngineError::Timeout`]
+/// - `max_result_bytes`: 文字列結果の UTF-8 バイト数。0 は空でない文字列を
+///   拒否する。超過時は切り詰めず [`JsEngineError::EvaluationFailed`]
+/// - エンジン側の固定上限（V8 の結果文字列は 1M UTF-16 単位）は本値に関係なく
+///   効く。本値で上限を厳しくはできるが、エンジン側の上限より緩くはできない
+///
+/// `#[non_exhaustive]` のためフィールド追加は破壊的変更にならない。
+#[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct EvaluateOptions {}
+pub struct EvaluateOptions {
+    timeout: Duration,
+    max_result_bytes: usize,
+}
+
+impl EvaluateOptions {
+    /// 既定の実時間タイムアウト（2 秒）。`shared::SCRIPT_EXECUTION_TIMEOUT` の正本。
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+    /// 既定の結果サイズ上限（3 MiB = 3,145,728 バイト）。従来の固定上限
+    /// （1M UTF-16 単位）の UTF-8 での最大長（3 バイト/単位）と等価で、
+    /// 日本語など非 ASCII の結果も従来どおり通る。
+    pub const DEFAULT_MAX_RESULT_BYTES: usize = 3 * 1_048_576;
+
+    /// 実時間タイムアウトを指定する。
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// 文字列結果の最大バイト数（UTF-8）を指定する。
+    #[must_use]
+    pub fn with_max_result_bytes(mut self, max_result_bytes: usize) -> Self {
+        self.max_result_bytes = max_result_bytes;
+        self
+    }
+
+    /// 指定された実時間タイムアウト。
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// 指定された結果サイズ上限（UTF-8 バイト）。
+    #[must_use]
+    pub fn max_result_bytes(&self) -> usize {
+        self.max_result_bytes
+    }
+}
+
+impl Default for EvaluateOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Self::DEFAULT_TIMEOUT,
+            max_result_bytes: Self::DEFAULT_MAX_RESULT_BYTES,
+        }
+    }
+}
 
 /// [`JsEngine`] の各操作が失敗した際のエラー（TASK-28.3・`JS-1`）。
 ///
@@ -305,7 +372,7 @@ pub enum JsEngineError {
     /// 理由によってエンジンの状態が変わる:
     ///
     /// - 子の監視スレッド（watchdog）による打ち切り（`v8_engine.rs` の
-    ///   `SCRIPT_EXECUTION_TIMEOUT`）: 子プロセスは生き続け、Context も
+    ///   既定は `EvaluateOptions::DEFAULT_TIMEOUT`）: 子プロセスは生き続け、Context も
     ///   残る（従来と同じ挙動）
     ///   - Context が残る場合、メッセージに "context was discarded" は
     ///     含まれない
@@ -560,6 +627,24 @@ fn create_v8_engine() -> Result<Box<dyn JsEngine>, CreateEngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TASK-109・`JS-6`: 既定値は従来の固定値（2 秒・1M UTF-16 単位 = UTF-8 で 3 MiB）と等価。
+    #[test]
+    fn js_6_evaluate_options_default_values() {
+        let options = EvaluateOptions::default();
+        assert_eq!(options.timeout(), Duration::from_secs(2));
+        assert_eq!(options.max_result_bytes(), 3_145_728);
+    }
+
+    /// TASK-109・`JS-6`: builder で指定した値が getter で読み戻せる。
+    #[test]
+    fn js_6_evaluate_options_builders_round_trip() {
+        let options = EvaluateOptions::default()
+            .with_timeout(Duration::from_millis(200))
+            .with_max_result_bytes(16);
+        assert_eq!(options.timeout(), Duration::from_millis(200));
+        assert_eq!(options.max_result_bytes(), 16);
+    }
 
     /// TASK-91.2: 全種別の設定名・feature 名の対応表。
     #[test]

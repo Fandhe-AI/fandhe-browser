@@ -1436,8 +1436,9 @@ impl V8ProcessEngine {
     /// 検出していれば、その子は使わず [`JsEngineError::ResourceLimitExceeded`]
     /// を返し、次回の呼び出しで新しい子を起動し直す。
     ///
-    /// `_options` は現時点で未使用（[`EvaluateOptions`] は空構造体。
-    /// `engine_trait.rs` 参照）。トレイト実装（`impl JsEngine`）がシグネチャを
+    /// `_options` のタイムアウト・結果サイズは子プロセスへまだ渡さない
+    /// （Issue #776 で対応。親の期限は固定の `SCRIPT_EXECUTION_TIMEOUT`
+    /// 基準）。トレイト実装（`impl JsEngine`）がシグネチャを
     /// そのまま揃えて委譲するために受け取る。
     #[doc(hidden)]
     pub fn evaluate_script(

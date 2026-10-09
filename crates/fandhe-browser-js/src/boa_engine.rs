@@ -166,6 +166,8 @@ impl BoaEngine {
     }
 }
 
+// TASK-109: boa は `EvaluateOptions` のタイムアウト・結果サイズ上限をまだ
+// 強制しない（Issue #776 で対応。REPAIR-3）。
 impl JsEngine for BoaEngine {
     fn evaluate_script(
         &mut self,
