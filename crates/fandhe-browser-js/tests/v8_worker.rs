@@ -37,9 +37,9 @@ use fandhe_browser_js::{EvaluateOptions, JsEngineError, JsValue, NativeCallConte
 /// 更新すること。
 const CHILD_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// `super::process_engine::EVALUATE_RECV_TIMEOUT`（`pub(crate)` で本
-/// クレート外からは参照できない）の値を手作業で複製した値（`TASK-29`・
-/// Issue #526）。`CHILD_WATCHDOG_TIMEOUT` + 1 秒。変更時は両方を更新
+/// 親の評価期限（既定 options での `timeout` + `process_engine::EVALUATE_GRACE`。
+/// `pub(crate)` で本クレート外からは参照できない）の値を手作業で複製した値
+/// （`TASK-29`・Issue #526）。`CHILD_WATCHDOG_TIMEOUT` + 1 秒。変更時は両方を更新
 /// すること。
 const PARENT_EVALUATE_DEADLINE: Duration = Duration::from_secs(3);
 
@@ -129,6 +129,15 @@ fn main() -> ExitCode {
     js_1_native_call_duration_is_included_in_the_watchdog_timeout();
     eprintln!("case: js_1_native_call_exceeding_evaluate_deadline_discards_context");
     js_1_native_call_exceeding_evaluate_deadline_discards_context();
+    eprintln!("case: js_6_custom_options_reach_the_child");
+    js_6_custom_options_reach_the_child();
+    eprintln!("case: js_6_parent_kill_on_timeout_leaves_no_child_process");
+    js_6_parent_kill_on_timeout_leaves_no_child_process();
+    #[cfg(all(feature = "js-boa", not(target_os = "macos")))]
+    {
+        eprintln!("case: js_6_boa_parent_kill_on_timeout_leaves_no_child_process");
+        js_6_boa_parent_kill_on_timeout_leaves_no_child_process();
+    }
     eprintln!("case: js_1_native_call_with_unknown_id_discards_context_and_recovers");
     js_1_native_call_with_unknown_id_discards_context_and_recovers();
     eprintln!("case: js_1_host_registered_native_fn_is_reinstalled_after_worker_respawn");
@@ -1155,6 +1164,145 @@ fn js_1_native_call_duration_is_included_in_the_watchdog_timeout() {
         .evaluate_script("x", &EvaluateOptions::default())
         .unwrap_or_else(|err| panic!("context must survive a watchdog-based timeout: {err}"));
     assert_eq!(result, JsValue::Number(5.0));
+}
+
+/// `JS-6`・`TASK-109`・Issue #776: 呼び出し側の options が子プロセスへ届く。
+/// `timeout = 200ms` の `while (true) {}` は 2 秒未満で子の watchdog により
+/// `Timeout`（Context は残る）になり、`max_result_bytes(16)` の 17 バイトは
+/// `EvaluationFailed` になる。
+fn js_6_custom_options_reach_the_child() {
+    let mut engine = V8ProcessEngine::new();
+    engine
+        .evaluate_script("var keep = 3;", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("marker declaration must succeed: {err}"));
+
+    let short = EvaluateOptions::default().with_timeout(Duration::from_millis(200));
+    let started = Instant::now();
+    let outcome = engine.evaluate_script("while (true) {}", &short);
+    let elapsed = started.elapsed();
+    match outcome {
+        Err(JsEngineError::Timeout(msg)) => assert!(
+            !msg.contains("context was discarded"),
+            "the child watchdog must keep the context, got: {msg}"
+        ),
+        other => panic!("expected Timeout, got: {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the custom timeout must apply, took {elapsed:?}"
+    );
+    assert_eq!(
+        engine
+            .evaluate_script("keep", &EvaluateOptions::default())
+            .unwrap_or_else(|err| panic!("context must survive: {err}")),
+        JsValue::Number(3.0)
+    );
+
+    let small = EvaluateOptions::default().with_max_result_bytes(16);
+    assert_eq!(
+        engine
+            .evaluate_script("'a'.repeat(16)", &small)
+            .unwrap_or_else(|err| panic!("16 bytes must be accepted: {err}")),
+        JsValue::String("a".repeat(16))
+    );
+    match engine.evaluate_script("'a'.repeat(17)", &small) {
+        Err(JsEngineError::EvaluationFailed(msg)) => assert_eq!(
+            msg,
+            "string result of 17 bytes exceeds the result size limit of 16 bytes"
+        ),
+        other => panic!("expected EvaluationFailed, got: {other:?}"),
+    }
+}
+
+/// kill された子 `pid` が reap 済みで残っていないことを確認する。Linux では
+/// `/proc/<pid>` の消滅（reap されていなければゾンビとして残る）、全 OS で
+/// 次の評価が別 pid の新しい子で動くことを確認する。
+fn assert_killed_child_is_gone_and_replaced(engine: &mut V8ProcessEngine, old_pid: u32) {
+    #[cfg(target_os = "linux")]
+    assert!(
+        !std::path::Path::new(&format!("/proc/{old_pid}")).exists(),
+        "the killed child {old_pid} must be reaped (no zombie)"
+    );
+    assert_eq!(
+        engine
+            .evaluate_script("typeof marker", &EvaluateOptions::default())
+            .unwrap_or_else(|err| panic!("the next evaluation must use a fresh child: {err}")),
+        JsValue::String("undefined".to_string())
+    );
+    let new_pid = engine
+        .worker_pid_for_test()
+        .expect("a fresh worker must be running");
+    assert_ne!(new_pid, old_pid, "a new child process must be spawned");
+}
+
+/// `JS-6`・`TASK-109`・Issue #776 受け入れ条件 2: 親が期限で子を kill した後、
+/// 子プロセスが残らない（reap 済み）。期限内に戻らない `NativeFn` と
+/// `timeout = 200ms` で親の kill を起こす（kill・reap の経路はエンジンに
+/// 依存しない）。
+fn js_6_parent_kill_on_timeout_leaves_no_child_process() {
+    let native_fn: ParentNativeFn = Box::new(|_args: &[JsValue], _ctx: &NativeCallContext| {
+        std::thread::sleep(Duration::from_millis(2500));
+        Ok(JsValue::Number(1.0))
+    });
+    let mut engine = engine_with_one_native_fn_for_test(
+        "f",
+        native_fn,
+        WorkerSpawnConfigForTest {
+            heap_limit_bytes: None,
+            protocol_version_override: None,
+            hello_wrong_engine_for_test: false,
+            hello_extra_byte_for_test: false,
+            rss_threshold_bytes_override: None,
+            native_proxies_for_test: Vec::new(),
+            windows_process_memory_limit_bytes_override: None,
+        },
+    );
+    engine
+        .evaluate_script("var marker = 1;", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("marker declaration must succeed: {err}"));
+    let old_pid = engine
+        .worker_pid_for_test()
+        .expect("a worker must be running");
+
+    let options = EvaluateOptions::default().with_timeout(Duration::from_millis(200));
+    let started = Instant::now();
+    let outcome = engine.evaluate_script("f(); 1", &options);
+    let elapsed = started.elapsed();
+    match outcome {
+        Err(JsEngineError::Timeout(msg)) => assert!(
+            msg.contains("context was discarded"),
+            "the parent kill must be reported as discarded, got: {msg}"
+        ),
+        other => panic!("expected Timeout, got: {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the parent deadline is timeout + 1s, took {elapsed:?}"
+    );
+    assert_killed_child_is_gone_and_replaced(&mut engine, old_pid);
+}
+
+/// 上記の boa 版: boa の子には watchdog が無いため `while (true) {}` は親の
+/// kill でのみ止まる。
+#[cfg(all(feature = "js-boa", not(target_os = "macos")))]
+fn js_6_boa_parent_kill_on_timeout_leaves_no_child_process() {
+    let mut engine = V8ProcessEngine::with_engine_kind(fandhe_browser_js::EngineKind::Boa);
+    engine
+        .evaluate_script("var marker = 1;", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("marker declaration must succeed: {err}"));
+    let old_pid = engine
+        .worker_pid_for_test()
+        .expect("a worker must be running");
+    let options = EvaluateOptions::default().with_timeout(Duration::from_millis(200));
+    let started = Instant::now();
+    match engine.evaluate_script("while (true) {}", &options) {
+        Err(JsEngineError::Timeout(msg)) => {
+            assert!(msg.contains("context was discarded"), "got: {msg}")
+        }
+        other => panic!("expected Timeout, got: {other:?}"),
+    }
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_killed_child_is_gone_and_replaced(&mut engine, old_pid);
 }
 
 /// `TASK-29`・Issue #526: `NativeFn` が `PARENT_EVALUATE_DEADLINE` を

@@ -251,12 +251,17 @@ pub type NativeFn = Box<dyn FnMut(&[JsValue]) -> Result<JsValue, JsEngineError> 
 /// 結果上限は UTF-8 バイトで数えるため、既定値は 1M UTF-16 単位の UTF-8 最大長
 /// （3 バイト/単位）にあたる 3 MiB とする。
 ///
-/// # 適用範囲（実装済みを装わない。REPAIR-3）
+/// # 適用範囲
 ///
-/// - V8 の `V8Engine`（子プロセス内で動くエンジン本体）だけが強制する
-/// - boa エンジンと、子プロセス経路（`create_engine` が返すエンジン）は
-///   現時点で本オプションを無視し、固定値のまま動く。ワイヤプロトコルへの
-///   受け渡しと boa 対応は Issue #776（TASK-109 続き）で扱う
+/// - 全構成で強制する: V8・boa の各エンジン本体と、子プロセス経路
+///   （`create_engine` が返すエンジン。options は `Evaluate` フレームのヘッダで
+///   子へ渡す。`TASK-109`・Issue #776）
+/// - タイムアウトは子へ送る際に ms へ切り上げ、最大 1 時間でクランプする。
+///   親の期限は `timeout` + 猶予 1 秒
+/// - 実行中のタイムアウトは、V8 は子の watchdog（Context は残る）、boa は親が
+///   子を kill する（Context は破棄され、メッセージに "context was discarded"
+///   を含む）。いずれも [`JsEngineError::Timeout`]
+/// - 結果サイズ上限は子（エンジン）と親の両方で検査する
 ///
 /// # 単位と境界
 ///

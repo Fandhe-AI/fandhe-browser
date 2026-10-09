@@ -615,8 +615,8 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
 
         match frame_tag {
             tag::EVALUATE => {
-                let script = match worker_protocol::decode_evaluate(&payload) {
-                    Ok(script) => script,
+                let (options, script) = match worker_protocol::decode_evaluate(&payload) {
+                    Ok(decoded) => decoded,
                     Err(err) => {
                         eprintln!(
                             "fandhe-browser-js worker: protocol violation while decoding \
@@ -625,7 +625,7 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                match evaluate_and_respond(engine.as_mut(), &script, &mut stdout) {
+                match evaluate_and_respond(engine.as_mut(), &script, &options, &mut stdout) {
                     Ok(RespondOutcome::Responded) => {}
                     Ok(RespondOutcome::NativeCallProtocolViolation(message)) => {
                         // JS-1・Issue #511: 逆方向 RPC が fatal
@@ -817,9 +817,10 @@ enum RespondOutcome {
 fn evaluate_and_respond(
     engine: &mut dyn ChildEngine,
     script: &str,
+    options: &EvaluateOptions,
     stdout: &mut impl Write,
 ) -> Result<RespondOutcome, ProtocolError> {
-    let evaluation = engine.evaluate_script(script, &EvaluateOptions::default());
+    let evaluation = engine.evaluate_script(script, options);
     if let Some(fatal) = engine.take_native_call_fatal() {
         return Ok(RespondOutcome::NativeCallProtocolViolation(fatal));
     }

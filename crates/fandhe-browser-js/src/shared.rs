@@ -5,6 +5,7 @@
 //! [`super::process_engine`]（親側の期限計算）・[`super::v8_engine`]・
 //! [`super::boa_worker`]。エンジン固有の型（`v8`・`boa_engine`）には依存しない。
 
+#[cfg(any(test, feature = "js-v8"))]
 use std::time::Duration;
 
 #[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
@@ -23,6 +24,7 @@ pub(crate) const MAX_SCRIPT_SOURCE_BYTES: usize = 1_048_576; // 1 MiB
 /// この値に猶予を足した期限で子プロセスごと kill する（`Timeout`）。
 /// 値の正本は [`super::engine_trait::EvaluateOptions::DEFAULT_TIMEOUT`]
 /// （TASK-109。評価ごとの指定は `EvaluateOptions` で行う）。
+#[cfg(any(test, feature = "js-v8"))]
 pub(crate) const SCRIPT_EXECUTION_TIMEOUT: Duration =
     super::engine_trait::EvaluateOptions::DEFAULT_TIMEOUT;
 

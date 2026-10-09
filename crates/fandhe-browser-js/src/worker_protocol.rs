@@ -16,8 +16,9 @@
 //! # tag の一覧（設計書 §3.5）
 //!
 //! - [`tag::HELLO`]: 子 → 親。ハンドシェイク（[`encode_hello`]）
-//! - [`tag::EVALUATE`]: 親 → 子。評価対象のスクリプト全文
-//!   （[`encode_evaluate`]）
+//! - [`tag::EVALUATE`]: 親 → 子。`u64 LE timeout_ms` ＋ `u64 LE
+//!   max_result_bytes` ＋ 評価対象のスクリプト全文（[`encode_evaluate`]。
+//!   `TASK-109`・Issue #776）
 //! - [`tag::RESULT`]: 子 → 親。評価結果（[`encode_js_value`]）
 //! - [`tag::ERROR`]: 子 → 親。評価失敗（[`encode_error`]）
 //! - [`tag::NATIVE_CALL`]: 子 → 親。逆方向 RPC の呼び出し（グローバル関数
@@ -61,8 +62,9 @@
 //!   プロセスを終了させる方針は W3・W4 のドキュメントコメントを参照
 
 use std::io::{self, Read, Write};
+use std::time::Duration;
 
-use super::engine_trait::{EngineKind, JsValue, ObjectHandle};
+use super::engine_trait::{EngineKind, EvaluateOptions, JsValue, ObjectHandle};
 
 /// 子プロセスモードを起動する環境変数名（設計書 §3.1）。値は
 /// [`PROTOCOL_VERSION`] と同じ形式（`u16` の文字列表現）のプロトコル
@@ -96,7 +98,12 @@ pub(crate) const MARKER_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER";
 /// 4: [`ErrorKind::ResourceLimit`]（ワイヤ値 3）を追加（`TASK-32.2`・
 /// Issue #166）。旧世代の親は未知のエラー種別を解釈できないため、世代差を
 /// ハンドシェイクで検出できるよう上げた。
-pub(crate) const PROTOCOL_VERSION: u16 = 4;
+///
+/// 5: [`tag::EVALUATE`] のペイロード先頭に 16 バイトのヘッダ
+/// （`timeout_ms`・`max_result_bytes`）を追加（`TASK-109`・Issue #776）。
+/// ヘッダ無しのフレームをスクリプトと誤解釈しないよう世代差をハンドシェイクで
+/// 検出する。
+pub(crate) const PROTOCOL_VERSION: u16 = 5;
 
 /// フレームの `tag` バイトの値。
 ///
@@ -800,31 +807,80 @@ pub(crate) fn decode_hello(payload: &[u8]) -> Result<(u16, EngineKind), Protocol
     Ok((version, engine))
 }
 
-/// [`tag::EVALUATE`] フレームのペイロードを組み立てる（スクリプト全文の
-/// UTF-8 バイト列そのもの。フレーム長で境界が定まるため追加の長さ
-/// プレフィックスは持たない）。
+/// `EVALUATE` ヘッダで運べる評価タイムアウトの最大値（1 時間）。
 ///
-/// 呼び出し元（将来）: `super::process_engine`（W4）が子へ評価対象の
-/// スクリプトを送る際に使う。
-#[cfg_attr(
-    not(any(test, feature = "js-v8", feature = "js-boa")),
-    allow(dead_code)
-)]
-pub(crate) fn encode_evaluate(script: &str) -> Vec<u8> {
-    script.as_bytes().to_vec()
+/// 親の期限計算（`Instant + Duration`）のオーバーフローと、子へ渡す値の
+/// 異常な巨大化を防ぐための上限（`JS-6`・fail-closed。coding-rust.md
+/// 「外部入力」）。親のエンコード時と子のデコード時の両方で適用する。
+pub(crate) const MAX_EVALUATE_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// `EVALUATE` ヘッダのバイト数（`u64 timeout_ms` ＋ `u64 max_result_bytes`）。
+/// フレーム上限 `MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`（スクリプト上限 1 MiB
+/// ＋ 64 KiB の余白）に十分収まる。
+const EVALUATE_HEADER_BYTES: usize = 16;
+
+/// ワイヤ上の評価タイムアウト（ミリ秒単位へ切り上げ、[`MAX_EVALUATE_TIMEOUT`]
+/// でクランプした値）。
+///
+/// 非ゼロの 1ns〜999µs を 0 ms（即時打ち切り）へ化けさせないため切り上げる。
+/// [`encode_evaluate`] と親の期限計算（`process_engine`）が同じ関数を使い、
+/// 両者の丸め規則がずれないようにする。
+pub(crate) fn wire_timeout(options: &EvaluateOptions) -> Duration {
+    let timeout = options.timeout().min(MAX_EVALUATE_TIMEOUT);
+    let ms = timeout.as_millis() + u128::from(!timeout.subsec_nanos().is_multiple_of(1_000_000));
+    // クランプ済み（1 時間以下）のため `u64` に収まる。
+    Duration::from_millis(u64::try_from(ms).unwrap_or(u64::MAX))
 }
 
-/// [`encode_evaluate`] の逆変換。`js-v8` feature 有効時のみ非テストで
-/// [`super::worker`] から使われる（親からの `Evaluate` フレームを検証
-/// する経路）。
+/// [`tag::EVALUATE`] フレームのペイロードを組み立てる
+/// （`[u64 LE timeout_ms][u64 LE max_result_bytes][スクリプト UTF-8]`）。
+///
+/// 呼び出し元: `super::process_engine` が子へ評価対象のスクリプトと
+/// 評価上限（`JS-6`・`TASK-109`・Issue #776）を送る際に使う。
 #[cfg_attr(
     not(any(test, feature = "js-v8", feature = "js-boa")),
     allow(dead_code)
 )]
-pub(crate) fn decode_evaluate(payload: &[u8]) -> Result<String, ProtocolError> {
-    std::str::from_utf8(payload)
+pub(crate) fn encode_evaluate(script: &str, options: &EvaluateOptions) -> Vec<u8> {
+    let timeout_ms = u64::try_from(wire_timeout(options).as_millis()).unwrap_or(u64::MAX);
+    let max_bytes = u64::try_from(options.max_result_bytes()).unwrap_or(u64::MAX);
+    let mut out = Vec::with_capacity(EVALUATE_HEADER_BYTES + script.len());
+    out.extend_from_slice(&timeout_ms.to_le_bytes());
+    out.extend_from_slice(&max_bytes.to_le_bytes());
+    out.extend_from_slice(script.as_bytes());
+    out
+}
+
+/// [`encode_evaluate`] の逆変換。子（[`super::worker`]）が親からの
+/// `Evaluate` フレーム（untrusted）を検証する経路で使う。ヘッダ不足は
+/// [`ProtocolError::Truncated`]、不正 UTF-8 は [`ProtocolError::InvalidUtf8`]。
+/// タイムアウトは [`MAX_EVALUATE_TIMEOUT`] で再クランプする（多層防御）。
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
+pub(crate) fn decode_evaluate(payload: &[u8]) -> Result<(EvaluateOptions, String), ProtocolError> {
+    let timeout_bytes: [u8; 8] = payload
+        .get(..8)
+        .and_then(|b| b.try_into().ok())
+        .ok_or(ProtocolError::Truncated)?;
+    let max_bytes: [u8; 8] = payload
+        .get(8..EVALUATE_HEADER_BYTES)
+        .and_then(|b| b.try_into().ok())
+        .ok_or(ProtocolError::Truncated)?;
+    let body = payload
+        .get(EVALUATE_HEADER_BYTES..)
+        .ok_or(ProtocolError::Truncated)?;
+    let script = std::str::from_utf8(body)
         .map(str::to_string)
-        .map_err(|_| ProtocolError::InvalidUtf8)
+        .map_err(|_| ProtocolError::InvalidUtf8)?;
+    let timeout =
+        Duration::from_millis(u64::from_le_bytes(timeout_bytes)).min(MAX_EVALUATE_TIMEOUT);
+    let max_result_bytes = usize::try_from(u64::from_le_bytes(max_bytes)).unwrap_or(usize::MAX);
+    let options = EvaluateOptions::default()
+        .with_timeout(timeout)
+        .with_max_result_bytes(max_result_bytes);
+    Ok((options, script))
 }
 
 /// [`tag::ERROR`] フレームが表す失敗の種別（`JS-1`・Issue #503 設計書
@@ -1861,13 +1917,69 @@ mod tests {
         );
     }
 
-    /// JS-1: `Evaluate` フレームの往復。
+    /// JS-1・JS-6: `Evaluate` フレームの往復（options を含む）。
     #[test]
     fn js_1_evaluate_round_trip() {
         let script = "while (true) {}";
-        let payload = encode_evaluate(script);
-        let decoded = decode_evaluate(&payload).expect("decode must succeed");
+        let options = EvaluateOptions::default()
+            .with_timeout(Duration::from_millis(250))
+            .with_max_result_bytes(16);
+        let payload = encode_evaluate(script, &options);
+        let (decoded_opts, decoded) = decode_evaluate(&payload).expect("decode must succeed");
         assert_eq!(decoded, script);
+        assert_eq!(decoded_opts.timeout(), Duration::from_millis(250));
+        assert_eq!(decoded_opts.max_result_bytes(), 16);
+    }
+
+    /// JS-6: ヘッダ（16 バイト）に満たないペイロードは `Truncated`。
+    #[test]
+    fn js_6_evaluate_rejects_payload_shorter_than_header() {
+        assert!(matches!(
+            decode_evaluate(&[0u8; 15]),
+            Err(ProtocolError::Truncated)
+        ));
+        assert!(matches!(
+            decode_evaluate(b""),
+            Err(ProtocolError::Truncated)
+        ));
+    }
+
+    /// JS-6: ヘッダの後ろが不正 UTF-8 なら `InvalidUtf8`。
+    #[test]
+    fn js_6_evaluate_rejects_invalid_utf8_script() {
+        let mut payload = encode_evaluate("", &EvaluateOptions::default());
+        payload.extend_from_slice(&[0xff, 0xfe]);
+        assert!(matches!(
+            decode_evaluate(&payload),
+            Err(ProtocolError::InvalidUtf8)
+        ));
+    }
+
+    /// JS-6: タイムアウトは ms へ切り上げ、最大値でクランプし、0 は 0 のまま。
+    #[test]
+    fn js_6_wire_timeout_rounds_up_clamps_and_keeps_zero() {
+        let w = |d: Duration| wire_timeout(&EvaluateOptions::default().with_timeout(d));
+        assert_eq!(w(Duration::ZERO), Duration::ZERO);
+        assert_eq!(w(Duration::from_nanos(1)), Duration::from_millis(1));
+        assert_eq!(w(Duration::from_micros(1001)), Duration::from_millis(2));
+        assert_eq!(w(Duration::from_millis(7)), Duration::from_millis(7));
+        assert_eq!(w(Duration::MAX), MAX_EVALUATE_TIMEOUT);
+    }
+
+    /// JS-6: 子側でも最大値で再クランプし、`max_result_bytes` は飽和変換する。
+    #[test]
+    fn js_6_decode_evaluate_reclamps_timeout_and_saturates_size() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u64::MAX.to_le_bytes());
+        payload.extend_from_slice(&u64::MAX.to_le_bytes());
+        payload.extend_from_slice(b"1");
+        let (opts, script) = decode_evaluate(&payload).expect("decode must succeed");
+        assert_eq!(script, "1");
+        assert_eq!(opts.timeout(), MAX_EVALUATE_TIMEOUT);
+        assert_eq!(
+            opts.max_result_bytes(),
+            usize::try_from(u64::MAX).unwrap_or(usize::MAX)
+        );
     }
 
     /// JS-1: `Error` フレームの往復（`ErrorKind` の全 variant）。
@@ -2233,7 +2345,7 @@ mod tests {
     #[test]
     fn js_1_marker_env_var_and_protocol_version_have_the_documented_values() {
         assert_eq!(MARKER_ENV_VAR, "FANDHE_BROWSER_JS_WORKER");
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     /// JS-1: 想定される tag 値が予約分も含め重複しないこと（プロトコル

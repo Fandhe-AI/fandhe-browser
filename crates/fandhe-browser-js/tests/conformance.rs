@@ -325,6 +325,60 @@ mod conformance_checks {
         }
     }
 
+    /// `JS-6`・`TASK-109`・Issue #776: `EvaluateOptions` の上限が、エンジンに
+    /// 依らず同じ種別のエラーになること（エンジン非依存）。
+    fn check_evaluate_options(kind: EngineKind, engine: &mut dyn JsEngine) {
+        use std::time::{Duration, Instant};
+
+        let short = EvaluateOptions::default().with_timeout(Duration::from_millis(200));
+        let started = Instant::now();
+        let outcome = engine.evaluate_script("while (true) {}", &short);
+        assert!(
+            matches!(outcome, Err(JsEngineError::Timeout(_))),
+            "[{kind:?}] an infinite loop must time out, got {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "[{kind:?}] the custom timeout must apply, took {:?}",
+            started.elapsed()
+        );
+
+        let zero = EvaluateOptions::default().with_timeout(Duration::ZERO);
+        let outcome = engine.evaluate_script("1 + 1", &zero);
+        assert!(
+            matches!(outcome, Err(JsEngineError::Timeout(_))),
+            "[{kind:?}] a zero timeout must be a Timeout, got {outcome:?}"
+        );
+
+        let small = EvaluateOptions::default().with_max_result_bytes(16);
+        assert_eq!(
+            engine
+                .evaluate_script("'a'.repeat(16)", &small)
+                .unwrap_or_else(|err| panic!("[{kind:?}] 16 bytes must be accepted: {err}")),
+            JsValue::String("a".repeat(16)),
+            "[{kind:?}] result at exactly the limit"
+        );
+        let outcome = engine.evaluate_script("'a'.repeat(17)", &small);
+        assert!(
+            matches!(outcome, Err(JsEngineError::EvaluationFailed(_))),
+            "[{kind:?}] 17 bytes must exceed the 16 byte limit, got {outcome:?}"
+        );
+
+        let outcome = engine.evaluate_script("'a'.repeat(1048577)", &EvaluateOptions::default());
+        assert!(
+            matches!(outcome, Err(JsEngineError::EvaluationFailed(_))),
+            "[{kind:?}] the default limit must reject 1048577 bytes, got {outcome:?}"
+        );
+    }
+
+    /// JS-6: `EvaluateOptions` の上限が同梱された各エンジンで同じ種別になること。
+    pub(super) fn js_6_conformance_evaluate_options_for_each_bundled_engine()
+    -> ConformanceRunSummary {
+        let summary = run_for_each_bundled_engine(check_evaluate_options);
+        assert_conformance_summary_matches_current_contract(&summary);
+        summary
+    }
+
     /// `JS-1`「スクリプト評価」のコンフォーマンス検査（エンジン非依存）。
     fn check_script_evaluation(kind: EngineKind, engine: &mut dyn JsEngine) {
         let options = EvaluateOptions::default();
@@ -584,7 +638,11 @@ mod conformance_checks {
             checked: 1,
             not_yet_implemented: 1,
         };
-        assert_eq!(summaries.len(), 3, "script/function/dom summaries expected");
+        assert_eq!(
+            summaries.len(),
+            4,
+            "script/function/dom/options summaries expected"
+        );
         for (name, summary) in summaries {
             assert_eq!(summary, &expected, "{name}: engines actually checked");
         }
@@ -613,6 +671,9 @@ fn main() -> std::process::ExitCode {
             );
         eprintln!("case: js_1_conformance_dom_like_binding_for_each_bundled_engine");
         let _dom = conformance_checks::js_1_conformance_dom_like_binding_for_each_bundled_engine();
+        eprintln!("case: js_6_conformance_evaluate_options_for_each_bundled_engine");
+        let _options =
+            conformance_checks::js_6_conformance_evaluate_options_for_each_bundled_engine();
         #[cfg(all(feature = "js-v8", feature = "js-boa"))]
         {
             eprintln!("case: js_1_conformance_runs_against_both_engines_when_both_bundled");
@@ -620,6 +681,7 @@ fn main() -> std::process::ExitCode {
                 ("script_evaluation", _script),
                 ("global_function_injection", _function),
                 ("dom_like_binding", _dom),
+                ("evaluate_options", _options),
             ]);
         }
     }

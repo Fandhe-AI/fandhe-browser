@@ -9,7 +9,7 @@
 //! （AGENTS.md「リソース上限」P0。codex レビュー指摘 #656）。
 //!
 //! - **実時間**: 親が評価開始時に決めた期限（`process_engine` の
-//!   `EVALUATE_RECV_TIMEOUT`）を過ぎると子プロセスごと `kill` し、
+//!   `options.timeout()` + 猶予。`TASK-109`・Issue #776）を過ぎると子プロセスごと `kill` し、
 //!   [`crate::JsEngineError::Timeout`] を返す。入れ子ループ・重い組込み関数でも
 //!   子が占有するのは子の CPU だけで、ホストの呼び出しスレッドは期限で戻る
 //! - **メモリ**: 起動直後に [`super::resource_limits::enforce_child_memory_limit`]

@@ -24,23 +24,30 @@
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
 //! boa 0.22 は V8 と同等のリソース制御を持たない。本型の中での打ち切りは
-//! 「ループ 1 つあたりの反復回数」（[`BOA_LOOP_ITERATION_LIMIT`]）・再帰深度・
-//! スタックサイズだけで、**これは実時間・ヒープの上限ではない**（入れ子ループ
-//! や重い組込み関数は上限内で長時間走り・巨大確保もし得る）。実時間とメモリは
-//! 本型を子プロセスの中で動かし、親が強制する（`boa_worker`・`process_engine`・
-//! `resource_limits`）。
+//! 再帰深度・スタックサイズだけで、実時間・ヒープの上限は持たない。実時間と
+//! メモリは本型を子プロセスの中で動かし、親が強制する（`boa_worker`・
+//! `process_engine`・`resource_limits`）。
 //!
-//! - 反復・再帰・スタックの上限は [`JsEngineError::ResourceLimitExceeded`]
-//!   として区別して返す。コンテキストは残るため、メッセージに
+//! - **ループ反復上限は設けない**（`TASK-109`・Issue #776）: 反復上限を
+//!   `EvaluateOptions::timeout` と競合させると `while (true) {}` が
+//!   `Timeout` ではなく `ResourceLimitExceeded` になり、V8 と種別が揃わない。
+//!   実時間は親が子を期限で `kill` して強制する（Context は破棄され、親が
+//!   返す `Timeout` のメッセージに "context was discarded" を含む）
+//! - 再帰・スタックの上限は [`JsEngineError::ResourceLimitExceeded`] として
+//!   区別して返す。コンテキストは残るため、メッセージに
 //!   "context was discarded" は含めない
-//! - 上限を超える反復を必要とする正当なスクリプトは boa では失敗する
-//!   （V8 との挙動差）
+//! - タイムアウト 0 は評価せずに `Timeout`、評価完了後に経過時間が
+//!   `options.timeout()` 以上だった場合は結果を捨てて `Timeout`（fail-closed。
+//!   いずれも Context は残る）
+//! - 結果文字列の UTF-8 バイト数上限（`options.max_result_bytes()`）は本型で
+//!   検査する（`JS-6`）
 //! - [`NativeFn`] は本型を動かすプロセスの中で同期実行する。子プロセスでは
 //!   親へ転送するプロキシ関数（`boa_worker`）で、期限は親が掛ける
 
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use boa_engine::context::HostHooks;
 use boa_engine::error::{EngineError, RuntimeLimitError};
@@ -69,11 +76,6 @@ const MAX_STRING_UTF16_UNITS: usize = 1_048_576;
 /// `v8_engine::MAX_ERROR_MESSAGE_CHARS` と同値に保つ（巨大な throw 値で
 /// エラー値が肥大化しないようにする）。
 const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
-
-/// boa の「ループ 1 つあたりの反復回数」上限。debug ビルドのテストでも 1 秒
-/// 未満で打ち切れる値として選んだ（wall-clock の代替ではない。モジュール
-/// ドキュメントの「既知の制限」参照）。
-const BOA_LOOP_ITERATION_LIMIT: u64 = 1_000_000;
 
 /// `ArrayBuffer`・`SharedArrayBuffer` 1 つあたりの最大バイト数（128 MiB）。
 /// V8 版の `resource_limits::MAX_ARRAY_BUFFER_ALLOCATION_BYTES` と同値に保つ。
@@ -127,6 +129,10 @@ pub(crate) struct BoaEngine {
     /// `process_engine`・`worker` の `registered_count` と同じ数え方）。
     /// 上限は [`MAX_REGISTERED_GLOBAL_FUNCTIONS`]。
     global_function_count: usize,
+    /// ループ反復上限。本番（`new`）は `None`（無効。実時間は親の kill で強制する。
+    /// モジュールドキュメント参照）。`RuntimeLimitError::LoopIteration` の
+    /// 変換経路をテストするためだけに `Some` を指定できる。
+    loop_iteration_limit: Option<u64>,
 }
 
 impl BoaEngine {
@@ -136,7 +142,17 @@ impl BoaEngine {
             context: None,
             defined_names: HashSet::new(),
             global_function_count: 0,
+            loop_iteration_limit: None,
         }
+    }
+
+    /// テスト専用: ループ反復上限を有効にしたエンジンを作る（`LoopIteration` の
+    /// `ResourceLimitExceeded` 変換経路の検証用）。
+    #[cfg(test)]
+    fn with_loop_iteration_limit_for_test(limit: u64) -> Self {
+        let mut engine = Self::new();
+        engine.loop_iteration_limit = Some(limit);
+        engine
     }
 
     /// コンテキストを（未生成なら）作って返す。生成失敗は
@@ -152,8 +168,9 @@ impl BoaEngine {
                         "failed to create boa context: {err}"
                     )))
                 })?;
-            let limits = context.runtime_limits_mut();
-            limits.set_loop_iteration_limit(BOA_LOOP_ITERATION_LIMIT);
+            if let Some(limit) = self.loop_iteration_limit {
+                context.runtime_limits_mut().set_loop_iteration_limit(limit);
+            }
             // recursion・stack_size は boa 既定（512・10240）を維持する。
             context.insert_data(NativeRegistry {
                 functions: RefCell::new(Vec::new()),
@@ -166,22 +183,53 @@ impl BoaEngine {
     }
 }
 
-// TASK-109: boa は `EvaluateOptions` のタイムアウト・結果サイズ上限をまだ
-// 強制しない（Issue #776 で対応。REPAIR-3）。
+/// `Timeout` のメッセージ。V8 版（`V8Failure::Terminated`）と同じ書式。
+fn timeout_message(stage: &str, timeout: Duration) -> String {
+    format!(
+        "script {stage} exceeded the {} second timeout and was terminated",
+        timeout.as_secs_f64()
+    )
+}
+
+/// 評価の経過時間が `timeout` に達したか（評価後の fail-closed 判定。純粋関数）。
+fn exceeded_timeout(elapsed: Duration, timeout: Duration) -> bool {
+    elapsed >= timeout
+}
+
+// TASK-109・`JS-6`: 結果サイズ上限は本型、実行中の実時間上限は親の子 kill で強制する
+// （モジュールドキュメント参照）。
 impl JsEngine for BoaEngine {
     fn evaluate_script(
         &mut self,
         script: &str,
-        _options: &EvaluateOptions,
+        options: &EvaluateOptions,
     ) -> Result<JsValue, JsEngineError> {
         if script.len() > MAX_SCRIPT_SOURCE_BYTES {
             return Err(JsEngineError::EvaluationFailed(format!(
                 "script exceeds the maximum supported size of {MAX_SCRIPT_SOURCE_BYTES} bytes"
             )));
         }
+        // タイムアウト 0 は V8 版と同様、スクリプトを実行せず即 `Timeout`。
+        if options.timeout().is_zero() {
+            return Err(JsEngineError::Timeout(timeout_message(
+                "execution",
+                options.timeout(),
+            )));
+        }
         let context = self.context_mut()?;
-        match context.eval(Source::from_bytes(script)) {
-            Ok(value) => from_boa_value(&value).map_err(JsEngineError::EvaluationFailed),
+        let started = Instant::now();
+        let outcome = context.eval(Source::from_bytes(script));
+        // boa には中断手段が無く、実行中の打ち切りは親の kill に任せる。完了後でも
+        // 期限を過ぎていれば結果を成功扱いにしない（V8 なら打ち切られていた評価）。
+        if exceeded_timeout(started.elapsed(), options.timeout()) {
+            return Err(JsEngineError::Timeout(timeout_message(
+                "execution",
+                options.timeout(),
+            )));
+        }
+        match outcome {
+            Ok(value) => from_boa_value_with_limit(&value, Some(options.max_result_bytes()))
+                .map_err(JsEngineError::EvaluationFailed),
             Err(err) => Err(convert_eval_error(&err, context)),
         }
     }
@@ -396,6 +444,17 @@ fn native_error(message: &str) -> JsError {
 /// boa の値を [`JsValue`] へ変換する。表現できない型（Object・Symbol・BigInt）
 /// と上限超過の文字列は `Err`（切り詰めず、成功を装わない）。
 fn from_boa_value(value: &BoaValue) -> Result<JsValue, String> {
+    from_boa_value_with_limit(value, None)
+}
+
+/// [`from_boa_value`] に評価結果用の UTF-8 バイト上限（`max_result_bytes`）を
+/// 足したもの。`None` はネイティブ関数引数の経路（固定の UTF-16 上限のみ。
+/// V8 版と同じ方針）。バイト数は `to_std_string_lossy` の後で数える（lone
+/// surrogate は U+FFFD = 3 バイト）。巨大確保を避けるため UTF-16 上限を先に判定する。
+fn from_boa_value_with_limit(
+    value: &BoaValue,
+    max_result_bytes: Option<usize>,
+) -> Result<JsValue, String> {
     if value.is_undefined() {
         return Ok(JsValue::Undefined);
     }
@@ -415,7 +474,16 @@ fn from_boa_value(value: &BoaValue) -> Result<JsValue, String> {
                  {MAX_STRING_UTF16_UNITS} UTF-16 code units"
             ));
         }
-        return Ok(JsValue::String(s.to_std_string_lossy()));
+        let converted = s.to_std_string_lossy();
+        if let Some(limit) = max_result_bytes
+            && converted.len() > limit
+        {
+            return Err(format!(
+                "string result of {} bytes exceeds the result size limit of {limit} bytes",
+                converted.len()
+            ));
+        }
+        return Ok(JsValue::String(converted));
     }
     Err(format!(
         "evaluation result of type '{}' is not representable as JsValue",
@@ -590,10 +658,12 @@ mod tests {
         }
     }
 
-    /// JS-1: 無限ループは ResourceLimitExceeded で、その後もエンジンが使える。
+    /// JS-1: テスト用にループ反復上限を有効にした場合のみ、無限ループは
+    /// ResourceLimitExceeded になり、その後もエンジンが使える
+    /// （本番の `new()` は反復上限を持たない。実時間は親の kill で強制する）。
     #[test]
     fn js_1_boa_infinite_loop_hits_resource_limit() {
-        let mut e = BoaEngine::new();
+        let mut e = BoaEngine::with_loop_iteration_limit_for_test(1000);
         match eval(&mut e, "while (true) {}") {
             Err(JsEngineError::ResourceLimitExceeded(msg)) => {
                 assert_eq!(msg, "boa runtime limit reached: loop iteration limit")
@@ -601,6 +671,121 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         assert_eq!(eval(&mut e, "1 + 1").unwrap(), JsValue::Number(2.0));
+    }
+
+    fn eval_with(
+        engine: &mut BoaEngine,
+        script: &str,
+        options: &EvaluateOptions,
+    ) -> Result<JsValue, JsEngineError> {
+        engine.evaluate_script(script, options)
+    }
+
+    /// JS-6: タイムアウト 0 はスクリプトを実行せず、V8 と同じ文言の Timeout。
+    #[test]
+    fn js_6_boa_zero_timeout_rejects_without_running_script() {
+        let mut e = BoaEngine::new();
+        let zero = EvaluateOptions::default().with_timeout(Duration::ZERO);
+        match eval_with(&mut e, "globalThis.x = 1", &zero) {
+            Err(JsEngineError::Timeout(msg)) => assert_eq!(
+                msg,
+                "script execution exceeded the 0 second timeout and was terminated"
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(
+            eval(&mut e, "typeof globalThis.x").unwrap(),
+            JsValue::String("undefined".to_string())
+        );
+    }
+
+    /// JS-6: 評価後の経過時間判定（純粋関数）の境界。
+    #[test]
+    fn js_6_boa_exceeded_timeout_boundary() {
+        let t = Duration::from_millis(10);
+        assert!(!exceeded_timeout(Duration::from_millis(9), t));
+        assert!(exceeded_timeout(t, t));
+        assert!(exceeded_timeout(Duration::from_millis(11), t));
+    }
+
+    /// JS-6: 完了しても期限を過ぎていれば結果を捨てて Timeout（Context は残る）。
+    #[test]
+    fn js_6_boa_late_completion_is_reported_as_timeout() {
+        let mut e = BoaEngine::new();
+        let tiny = EvaluateOptions::default().with_timeout(Duration::from_millis(1));
+        // 少なくとも 1ms はかかる有限ループ（時刻を見て確実に待つ）。
+        let script = "var t = Date.now(); while (Date.now() - t < 20) {} 1";
+        match eval_with(&mut e, script, &tiny) {
+            Err(JsEngineError::Timeout(msg)) => assert_eq!(
+                msg,
+                "script execution exceeded the 0.001 second timeout and was terminated"
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(eval(&mut e, "1 + 1").unwrap(), JsValue::Number(2.0));
+    }
+
+    /// JS-6: 既定 options でも固定の UTF-16 上限（1M 単位）の境界は従来どおり。
+    #[test]
+    fn js_6_boa_result_size_limit_boundary_with_default_options() {
+        let mut e = BoaEngine::new();
+        match eval(&mut e, "'a'.repeat(1048576)") {
+            Ok(JsValue::String(v)) => assert_eq!(v.len(), 1_048_576),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(matches!(
+            eval(&mut e, "'a'.repeat(1048577)"),
+            Err(JsEngineError::EvaluationFailed(_))
+        ));
+    }
+
+    /// JS-6: 明示した結果上限の境界（ちょうどは成功、+1 は Err）。
+    #[test]
+    fn js_6_boa_result_size_limit_boundary_with_small_limit() {
+        let mut e = BoaEngine::new();
+        let opts = EvaluateOptions::default().with_max_result_bytes(16);
+        match eval_with(&mut e, "'a'.repeat(16)", &opts) {
+            Ok(JsValue::String(v)) => assert_eq!(v.len(), 16),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match eval_with(&mut e, "'a'.repeat(17)", &opts) {
+            Err(JsEngineError::EvaluationFailed(msg)) => assert_eq!(
+                msg,
+                "string result of 17 bytes exceeds the result size limit of 16 bytes"
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // 超過後もエンジンは使える。
+        assert_eq!(
+            eval_with(&mut e, "1 + 1", &opts).unwrap(),
+            JsValue::Number(2.0)
+        );
+    }
+
+    /// JS-6: 上限は UTF-8 バイト数で数える（`あ` は 3 バイト）。
+    #[test]
+    fn js_6_boa_result_size_limit_counts_utf8_bytes() {
+        let mut e = BoaEngine::new();
+        let opts = EvaluateOptions::default().with_max_result_bytes(9);
+        assert!(matches!(
+            eval_with(&mut e, "'あ'.repeat(3)", &opts),
+            Ok(JsValue::String(_))
+        ));
+        assert!(matches!(
+            eval_with(&mut e, "'あ'.repeat(3) + 'a'", &opts),
+            Err(JsEngineError::EvaluationFailed(_))
+        ));
+    }
+
+    /// JS-6: 既定上限（3 MiB）は UTF-16 上限内の非 ASCII 結果を通す
+    /// （400000 文字 = 1.2 MB）。
+    #[test]
+    fn js_6_boa_default_options_keep_large_non_ascii_result() {
+        let mut e = BoaEngine::new();
+        match eval(&mut e, "'あ'.repeat(400000)") {
+            Ok(JsValue::String(v)) => assert_eq!(v.len(), 1_200_000),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     /// JS-1: 深い再帰は ResourceLimitExceeded。
