@@ -700,12 +700,29 @@ async fn fetch_src(
         .await
         .map_err(|e| classify_fetch_error(&e))?;
     check_src_response(response.status(), response.body().len(), max_src_bytes)?;
-    let text = response.body_text_lossy();
-    // 非可逆変換は不正バイトを 3 バイトの置換文字にするため、変換後も検査する。
-    if text.len() > max_src_bytes {
+    // 非可逆変換は不正バイトを 3 バイトの置換文字にするため、確保前に変換後の長さを検査する。
+    if lossy_len_exceeds(response.body(), max_src_bytes) {
         return Err(SrcFailure::TooLarge);
     }
-    Ok(text)
+    Ok(response.body_text_lossy())
+}
+
+/// UTF-8 非可逆変換後の長さが `limit` を超えるかを、文字列を確保せずに判定する。
+///
+/// 不正バイト列 1 区間は置換文字（3 バイト）1 個になる。加算は `checked_add` で行う。
+fn lossy_len_exceeds(body: &[u8], limit: usize) -> bool {
+    let mut total: usize = 0;
+    for chunk in body.utf8_chunks() {
+        let add = chunk
+            .valid()
+            .len()
+            .saturating_add(if chunk.invalid().is_empty() { 0 } else { 3 });
+        total = match total.checked_add(add) {
+            Some(t) if t <= limit => t,
+            _ => return true,
+        };
+    }
+    false
 }
 
 /// 文書順にエントリを走査し、`src` を取得しつつスクリプト本文の総バイトを評価する。
@@ -1219,6 +1236,17 @@ mod tests {
     use fandhe_browser_js::{EngineKind, JsEngine, JsValue, NativeFn};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// `JS-6`: 不正バイトは 3 バイトに膨らむ前提で、確保前に上限判定できる。
+    #[test]
+    fn lossy_len_exceeds_counts_replacement_chars() {
+        assert!(!lossy_len_exceeds(b"abc", 3));
+        assert!(lossy_len_exceeds(b"abcd", 3));
+        // 0xff 1 バイトは U+FFFD（3 バイト）になる。
+        assert!(!lossy_len_exceeds(&[0xff], 3));
+        assert!(lossy_len_exceeds(&[0xff, 0xff], 5));
+        assert!(!lossy_len_exceeds(&[0xff, 0xff], 6));
+    }
 
     type Calls = Arc<Mutex<Vec<(String, Duration)>>>;
     type Log = Arc<Mutex<Vec<String>>>;

@@ -464,4 +464,34 @@ fn window_cases(engine: &str) {
     );
     p.eval("__fandheLifecycle('DOMContentLoaded'); 'fired'");
     check(&mut p, "log.join(',')", "kept");
+
+    eprintln!("case: JS-4 own `call` on __dom.op cannot unlock the dispatcher");
+    let mut p = setup(engine, None);
+    p.eval(
+        "globalThis.log = []; \
+         document.addEventListener('DOMContentLoaded', function () { log.push('kept'); }); \
+         try { __dom.op.call = function () { return true; }; } catch (e) {} \
+         __fandheLifecycle.setImpl(function () { log.push('hijacked'); }); 'ok'",
+    );
+    p.eval("__fandheLifecycle('DOMContentLoaded'); 'fired'");
+    check(&mut p, "log.join(',')", "kept");
+
+    eprintln!("case: JS-4 replacing Object.defineProperty does not stop listeners");
+    let mut p = setup(engine, None);
+    p.eval(
+        "globalThis.log = []; \
+         document.addEventListener('DOMContentLoaded', function () { log.push('ran'); }); \
+         Object.defineProperty = function () { throw new Error('x'); }; 'ok'",
+    );
+    p.eval("__fandheLifecycle('DOMContentLoaded'); 'fired'");
+    check(&mut p, "log.join(',')", "ran");
+
+    eprintln!("case: JS-4 saved event currentTarget is null after dispatch");
+    let mut p = setup(engine, None);
+    p.eval(
+        "globalThis.saved = null; \
+         document.addEventListener('DOMContentLoaded', function (e) { saved = e; }); 'ok'",
+    );
+    p.eval("__fandheLifecycle('DOMContentLoaded'); 'fired'");
+    check(&mut p, "String(saved.currentTarget)", "null");
 }

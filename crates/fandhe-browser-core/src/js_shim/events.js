@@ -30,6 +30,10 @@
         throw new TypeError('__dom.op is not available');
     }
     var nativeOp = bridge.op;
+    // ページ JS による Function.prototype.call / Object.defineProperty の差し替えや、
+    // nativeOp への own プロパティ `call` 追加の影響を受けないよう、install 時に束縛・退避する。
+    var callOp = Function.prototype.call.bind(nativeOp, bridge);
+    var defineProperty = Object.defineProperty;
     var MAX_TEXT_UNITS = 4097;
 
     var documentTarget = { listeners: [] };
@@ -101,7 +105,7 @@
                 }
                 text = text.slice(0, end);
             }
-            nativeOp.call(bridge, 'lifecycleListenerError', eventName, text);
+            callOp('lifecycleListenerError', eventName, text);
         } catch (e) {
             // 報告に失敗してもディスパッチは続ける。
         }
@@ -140,8 +144,9 @@
     }
 
     function dispatch(eventName) {
+        var state = null;
         try {
-            var state = { propagationStopped: false, immediateStopped: false, current: null };
+            state = { propagationStopped: false, immediateStopped: false, current: null };
             var event = {
                 type: eventName,
                 target: eventName === 'load' ? global : global.document,
@@ -157,7 +162,7 @@
                     state.immediateStopped = true;
                 }
             };
-            Object.defineProperty(event, 'currentTarget', {
+            defineProperty(event, 'currentTarget', {
                 get: function () {
                     return state.current;
                 },
@@ -174,6 +179,11 @@
             }
         } catch (e) {
             // ディスパッチャーは throw しない。
+        } finally {
+            // 発火終了後は保存されたイベントの currentTarget を null に戻す。
+            if (state !== null) {
+                state.current = null;
+            }
         }
     }
 
@@ -194,14 +204,14 @@
                 // ディスパッチャーは throw しない。
             }
         };
-        Object.defineProperty(entry, '__fandheImpl', { value: true });
-        Object.defineProperty(entry, 'setImpl', {
+        defineProperty(entry, '__fandheImpl', { value: true });
+        defineProperty(entry, 'setImpl', {
             // 差し替えは Rust 側が shim 注入中だけ立てるフラグが true のときに限る。
             // ページ JS から呼んでも何も起きない（ディスパッチャーの無効化を防ぐ）。
             value: function (impl) {
                 var open = false;
                 try {
-                    open = nativeOp.call(bridge, 'lifecycleInstallOpen') === true;
+                    open = callOp('lifecycleInstallOpen') === true;
                 } catch (e) {
                     open = false;
                 }
@@ -210,7 +220,7 @@
                 }
             }
         });
-        Object.defineProperty(global, '__fandheLifecycle', {
+        defineProperty(global, '__fandheLifecycle', {
             value: entry,
             writable: false,
             configurable: false,
