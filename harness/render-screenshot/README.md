@@ -15,7 +15,7 @@ SSIM 0.90 以上・主要レイアウト要素の境界ボックスの 80% 以�
 - SSIM・境界ボックスの算出: `measure_ssim.py`（TASK-37.2。#54 で実装済み）が
   `capture-result.json`（下記スキーマ）を入力として読み、サイトごとの SSIM 値と
   境界ボックス一致率を算出する（下記「`measure_ssim.py`: SSIM・境界ボックス比較」参照）
-- Linux 実機での測定と合否判定: #55（TASK-37.h1。人間が担当）
+- Linux 実機での測定と合否判定: #55（TASK-37.h1。人間が担当。手順は [RUNBOOK.md](RUNBOOK.md)）
 
 ### spec パスからの読み替え
 
