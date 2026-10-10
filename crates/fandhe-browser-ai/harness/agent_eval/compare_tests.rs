@@ -240,12 +240,15 @@ fn aisnap9_packets_cover_25_x_2() {
 /// 出力先の安全弁: 相対パス・`..`・リポジトリ配下を拒否する（誤コミット防止）。
 #[test]
 fn aisnap9_out_dir_check_rejects_unsafe_paths() {
-    let root = Path::new("/repo-root-for-test");
+    // OS ごとに絶対パスとなるよう temp_dir 起点で組み立てる（Windows はドライブ指定が必要）
+    let root_buf = std::env::temp_dir().join("repo-root-for-test");
+    let root = root_buf.as_path();
     assert!(check_out_dir(Path::new("relative/dir"), root).is_err());
-    assert!(check_out_dir(Path::new("/tmp/../etc"), root).is_err());
-    assert!(check_out_dir(Path::new("/repo-root-for-test/out"), root).is_err());
-    assert!(check_out_dir(Path::new("/repo-root-for-test"), root).is_err());
-    assert!(check_out_dir(Path::new("/other-root/out"), root).is_ok());
+    assert!(check_out_dir(&root.join("..").join("etc"), root).is_err());
+    assert!(check_out_dir(&root.join("out"), root).is_err());
+    assert!(check_out_dir(root, root).is_err());
+    let other = std::env::temp_dir().join("other-root").join("out");
+    assert!(check_out_dir(&other, root).is_ok());
 }
 
 /// リポジトリ内・相対パスへは書かない（AISNAP-9・TASK-22.2）。
@@ -369,12 +372,15 @@ fn aisnap9_collect_complete_synthetic() {
 fn aisnap9_write_packets_rejects_symlinked_output_file() {
     let dir = temp_dir("symlink");
     std::fs::create_dir_all(&dir).expect("mkdir");
-    let target = manifest().join("target").join("aisnap9-symlink-victim.txt");
-    let _ = std::fs::remove_file(&target);
+    // 被害側も temp 内に実在する親ディレクトリで用意し、ガードが無ければ実際に書き込まれる状態にする
+    let victim_dir = temp_dir("symlink-victim");
+    std::fs::create_dir_all(&victim_dir).expect("mkdir victim");
+    let target = victim_dir.join("victim.txt");
     std::os::unix::fs::symlink(&target, dir.join("allocation.json")).expect("symlink");
     assert!(write_packets(&fixtures(), &dir).is_err());
     assert!(!target.exists());
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&victim_dir);
 }
 
 /// 欠落・id 不一致・不正 JSON・上限超過は理由付きで記録され、完全にならない。
