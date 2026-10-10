@@ -46,8 +46,9 @@
 //! 操作計測が共通で使うレコード型（[`observability::OperationRecord`] 等）を
 //! 追加した。`fetch`・`parse`・`dom` へは TASK-10.2.1（#549）、`query`・`js_stub` へは
 //! TASK-10.2.2（#550）で recorder（[`observability::OperationRecorder`]）経由の計装を
-//! 組み込み済み。本番の出力先の確定・実装は #221・#218 の担当で含まない
-//! （[`observability::InMemoryRecorder`] はテスト・簡易集計用で本番の出力先ではない）。
+//! 組み込み済み。本番の出力先は TASK-10.3（#221）の [`observability::StderrRecorder`]
+//! （JSON Lines・stderr。config・CLI・ファイル出力は未配線）。
+//! [`observability::InMemoryRecorder`] はテスト・簡易集計用で本番の出力先ではない。
 //! [`config`] モジュールは TASK-91（91.1・Issue #214・対象ビヘイビアなし・
 //! 基盤タスク）で、`fandhe-browser.toml` の `[profile]` セクション
 //! （保存先・分離強度）を読み込む本実装を追加した（`toml`・`serde` は
@@ -85,7 +86,8 @@
 //! - [`js_stub`]（`JS-2`・`TASK-30`・`MS-3`）
 //! - [`render::DisabledRenderer`]（`RENDER-1`・`TASK-33`/`TASK-38`・`MS-1`/`MS-4`）
 //! - [`observability::OperationRecord::to_json_line`]（`REPAIR-9`・`TASK-10（10.1）`・
-//!   `MS-4`。出力形式は Issue #218 で未確定な暫定エンコーダ）
+//!   `MS-4`。JSON Lines の 1 行表現。形式は Issue #218 で決定済み）
+//! - [`observability::StderrRecorder`]（`REPAIR-9`・`TASK-10.3`・#221。stderr 向け JSON Lines 出力）
 //! - [`observability::InMemoryRecorder`]（`REPAIR-9`・`TASK-10.3`・#221。
 //!   テスト・簡易集計用で本番の出力先ではない）
 
@@ -137,8 +139,8 @@ pub use fandhe_browser_js::run_js_worker_if_requested;
 // 直接依存せず core 経由で扱えるようにする（PLUG-10・TASK-101.2.1・#553）。
 pub use fandhe_browser_js::{EvaluateOptions, JsEngineError, JsValue, NativeFn};
 pub use observability::{
-    FailureKind, InMemoryRecorder, OperationCounts, OperationKind, OperationOutcome,
-    OperationRecord, OperationRecorder, RecorderHandle,
+    FailureKind, InMemoryRecorder, JsonLinesRecorder, OperationCounts, OperationKind,
+    OperationOutcome, OperationRecord, OperationRecorder, RecorderHandle, StderrRecorder,
 };
 pub use page_runner::{
     AbortKind, DEFAULT_MAX_SRC_SCRIPT_BYTES, DEFAULT_MAX_TOTAL_SCRIPT_BYTES,
