@@ -110,14 +110,15 @@ jobs:
             emit true true true "unexpected output"
             exit 0
           fi
-          # Rust ソースの差分に OS 分岐（cfg(target_os / windows / unix / target_family)）の
-          # 追加・削除があれば、パスによらず PR でも 3 OS を走らせる
+          # Rust ソースの差分の追加・削除行に OS 分岐の語（target_os・target_family・windows・
+          # unix・macos。cfg_attr や rustfmt で折り返した cfg(all(..)) の 2 行目も拾えるよう、
+          # cfg( と同じ行であることは要求しない）があれば、パスによらず PR でも 3 OS を走らせる
           if ! diff_body="$(git diff --no-renames -U0 "$BASE_SHA...$HEAD_SHA" -- '*.rs')"; then
             echo "::warning::git diff (content) failed; running all jobs (fail-closed)"
             emit true true true "git diff content failed"
             exit 0
           fi
-          os_cfg_re='cfg!?\(.*(target_os|target_family|windows|unix)'
+          os_cfg_re='(target_os|target_family|\bwindows\b|\bunix\b|\bmacos\b)'
           # grep -q は早期終了で上流が SIGPIPE になり pipefail 下で偽になるため、件数で判定する
           os_cfg_hits="$(printf '%s\n' "$diff_body" | grep -E '^[+-]' | grep -cE "$os_cfg_re" || true)"
           if [ "${os_cfg_hits:-0}" != "0" ]; then
