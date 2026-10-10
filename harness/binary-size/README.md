@@ -6,7 +6,7 @@ ID は `RENDER-2`（基準は `CORE-2` と同じ「Chromium 比 80% 以上削減
 SSOT（`docs/spec` の `04-behavior/`）を参照すること
 （[spec-reference](../../.claude/rules/spec-reference.md)）。
 
-親 Issue #48（TASK-34）。兄弟 Issue は #465（TASK-34.1・依存グラフ検査）、#467（TASK-34.3・CI 組込み）、#468（TASK-34.4・確認記録）の 3 件。CI（GitHub Actions）への組込みは #467（TASK-34.3）で完了し、`.github/workflows/ci.yml` の `binary-size` ジョブ（3 OS）が実行する。`make ci` には組み込まない（下記「`make ci` に含めない理由」参照）。
+親 Issue #48（TASK-34）。兄弟 Issue は #465（TASK-34.1・依存グラフ検査）、#467（TASK-34.3・CI 組込み）、#468（TASK-34.4・確認記録）の 3 件。CI（GitHub Actions）への組込みは #467（TASK-34.3）で完了し、`.github/workflows/ci.yml` の `harness-*` ジョブの `[binary-size]` ステップが実行する。`make ci` には組み込まない（下記「`make ci` に含めない理由」参照）。
 
 ## 計測対象と fail-closed 契約
 
@@ -43,7 +43,7 @@ Issue #174・#616 で追加済み）。package が workspace に無い場合は�
 `BINARY_SIZE_LIMIT_BYTES ?= ...`（`?=`）のため、環境変数や `make` 引数
 （`make check-binary-size BINARY_SIZE_LIMIT_BYTES=...`）で上書きできる。
 現時点では OS ごとに上限を分ける必要はなく（全 OS 共通の `CORE-2` 水準）、
-`binary-size` ジョブも 3 OS で同じ値を使う。分ける必要が出た場合は #468
+`harness-*` ジョブの `[binary-size]` ステップも 3 OS で同じ値を使う。分ける必要が出た場合は #468
 （TASK-34.4）の実測後に検討する。
 
 ## 出力形式の契約（#467・#468 が読み取る）
@@ -118,13 +118,13 @@ make check-binary-size
 `check-compat-regression` と同じ方針で fail-closed にする（silent skip に
 しない）。
 
-## CI（`.github/workflows/ci.yml` の `binary-size` ジョブ）
+## CI（`.github/workflows/ci.yml` の `harness-*` ジョブの `[binary-size]` ステップ）
 
 TASK-34.3（#467）で導入。3 OS（ubuntu/macos/windows）の各ネイティブランナーで
 実行し、`make` は使わない（windows-latest に `make` がある保証がないため。
-`compat-regression`・`bench-record-selftest` と同じ方針でスクリプトを直接
-呼ぶ）。cache は使わない（windows-latest には cache prune の既知問題があるため。
-cache 導入は別途検討する）。
+`harness-*` ジョブの他のステップ（`compat-regression`・`bench-record-selftest`）と同じ方針でスクリプトを直接
+呼ぶ）。ubuntu・macos は actions/cache で依存ビルドを再利用し（`scripts/ci-prune-target.sh`
+で workspace 成果物を除いてから保存）、windows-latest のみ cache prune の既知問題で除外する。
 
 上限値・package 名は `Makefile` の `BINARY_SIZE_LIMIT_BYTES` /
 `BINARY_SIZE_PACKAGE` を単一真実源とし、ジョブ側では値を重複定義しない。
@@ -136,15 +136,15 @@ self-test（`self-test.sh`）を実判定の前に毎回実行し、上限超過
 残す。実判定の出力（`binary-size: ...` 行）はジョブログとステップサマリー
 （表形式）の両方に出す。
 
-branch protection の必須チェックに加える場合は OS 数分
-（`binary-size (ubuntu-latest)` / `(macos-latest)` / `(windows-latest)` の
-3 件）を登録する必要がある（ユーザー作業）。
+本ステップは OS ごとの `harness-ubuntu` / `harness-macos` / `harness-windows` ジョブ内で
+実行するため、branch protection の必須チェックはこの 3 件に含まれる
+（`.claude/rules/ci.md` の required checks 一覧を参照）。
 
 ## `make ci` に含めない理由
 
 `make ci`（集約ターゲット）の依存には `check-binary-size` を追加していない。
 `ci:` を実行するたびにリリースビルド（`cargo build --release`）が走るとコスト
-が大きいため（判断済み）。CI での継続的なゲートは上記 `binary-size` ジョブが
+が大きいため（判断済み）。CI での継続的なゲートは上記 `harness-*` ジョブの `[binary-size]` ステップが
 担い、ローカルでは必要に応じて `make check-binary-size` を個別に実行する。
 
 ## JS エンジン構成別サイズ計測（TASK-31.1・#469）

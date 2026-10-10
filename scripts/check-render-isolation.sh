@@ -3,7 +3,7 @@
 # 既定ビルド（feature 指定なし）の依存グラフに Servo 系クレートが混入していない
 # ことを検証する正本スクリプト（TASK-34.1・RENDER-1・MS-1）。
 # 呼び出し元は Makefile の check-render-isolation ターゲット（薄いラッパー）と
-# .github/workflows/ci.yml の render-isolation ジョブ（3 OS matrix）で、判定
+# .github/workflows/ci.yml の harness-* ジョブの [render-isolation] ステップで、判定
 # ロジックの二重管理を避けるためロジックの正本はこのファイルに一本化する。
 #
 # 検査は 2 本立て:

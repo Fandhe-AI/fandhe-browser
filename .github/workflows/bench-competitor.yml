@@ -14,8 +14,8 @@ name: Bench Competitor
 #
 # ci.yml とは分離する理由: ci.yml の on: に schedule を足すと全ジョブが cron
 # 起動時にも実行されてしまう。定期実行はこのワークフローに閉じ、
-# ci.yml 側には bench-record-selftest（record.sh 自体の自己テスト。cargo を
-# 使わず高速）だけを置く。
+# ci.yml 側には harness-* ジョブの bench-record-selftest ステップ（record.sh 自体の
+# 自己テスト。cargo を使わず高速）だけを置く。
 
 on:
   workflow_dispatch:
