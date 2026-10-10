@@ -11,6 +11,8 @@
 # 同じため増分では相殺されるが、絶対値は PoC-9 / PoC-15 の測定方法とは一致しない（README 参照）。
 # 終了コード: 0 成功 / 1 計測失敗（対象コマンドが非 0 終了など）/ 2 使用エラー・前提不足。
 set -euo pipefail
+# awk の printf が LC_NUMERIC（カンマ小数）で不正な JSON を出さないよう C ロケールへ固定する
+export LC_ALL=C
 
 N=50
 WARMUP=3
@@ -37,26 +39,28 @@ USAGE
 }
 
 die() { echo "error: $*" >&2; exit 2; }
+need_value() { [ "$2" -ge 2 ] || die "option $1 requires a value"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --bin-a) BIN_A="${2:-}"; shift 2 ;;
-    --bin-b) BIN_B="${2:-}"; shift 2 ;;
-    --label-a) LABEL_A="${2:-}"; shift 2 ;;
-    --label-b) LABEL_B="${2:-}"; shift 2 ;;
-    -n|--runs) N="${2:-}"; shift 2 ;;
-    --warmup) WARMUP="${2:-}"; shift 2 ;;
-    --threshold-ms) THRESHOLD_MS="${2:-}"; shift 2 ;;
-    --out) OUT="${2:-}"; shift 2 ;;
+    --bin-a) need_value "$1" "$#"; BIN_A="$2"; shift 2 ;;
+    --bin-b) need_value "$1" "$#"; BIN_B="$2"; shift 2 ;;
+    --label-a) need_value "$1" "$#"; LABEL_A="$2"; shift 2 ;;
+    --label-b) need_value "$1" "$#"; LABEL_B="$2"; shift 2 ;;
+    -n|--runs) need_value "$1" "$#"; N="$2"; shift 2 ;;
+    --warmup) need_value "$1" "$#"; WARMUP="$2"; shift 2 ;;
+    --threshold-ms) need_value "$1" "$#"; THRESHOLD_MS="$2"; shift 2 ;;
+    --out) need_value "$1" "$#"; OUT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; CMD_ARGS=("$@"); break ;;
     *) usage >&2; die "unknown option: $1" ;;
   esac
 done
 
-[[ "$N" =~ ^[0-9]+$ ]] && [ "$N" -ge 1 ] && [ "$N" -le 1000 ] || die "--runs must be an integer in 1..1000"
-[[ "$WARMUP" =~ ^[0-9]+$ ]] && [ "$WARMUP" -le 100 ] || die "--warmup must be an integer in 0..100"
-[[ "$THRESHOLD_MS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--threshold-ms must be a number"
+# 先頭ゼロは拒否する（bash 算術で八進数扱いになる・JSON 数値として不正になるため）
+[[ "$N" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$N" -le 1000 ] || die "--runs must be an integer in 1..1000 without leading zeros"
+[[ "$WARMUP" =~ ^(0|[1-9][0-9]{0,2})$ ]] && [ "$WARMUP" -le 100 ] || die "--warmup must be an integer in 0..100 without leading zeros"
+[[ "$THRESHOLD_MS" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] || die "--threshold-ms must be a number without leading zeros"
 for l in "$LABEL_A" "$LABEL_B"; do
   [[ "$l" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "labels must match ^[A-Za-z0-9._-]{1,64}$"
 done
@@ -98,12 +102,16 @@ run_once_us() { # $1=binary
       ;;
     perl)
       # perl 自身が前後の時刻を取り fork+exec で対象を実行する（perl の起動時間は計測に含まれない）
+      # fork/waitpid の失敗とシグナル終了（$? & 127）も失敗として rc を非 0 にする
       line="$(perl -MTime::HiRes=time -e '
         my $t = time;
         my $pid = fork();
+        if (!defined $pid) { print "0 255\n"; exit 0; }
         if (!$pid) { open STDOUT, ">", "/dev/null"; open STDERR, ">&", \*STDOUT; exec { $ARGV[0] } @ARGV; exit 127; }
-        waitpid($pid, 0);
-        printf "%d %d\n", (time - $t) * 1e6, $? >> 8;' -- "$bin" ${CMD_ARGS[@]+"${CMD_ARGS[@]}"})"
+        my $w = waitpid($pid, 0);
+        my $el = (time - $t) * 1e6;
+        my $rc = ($w != $pid) ? 255 : ($? & 127) ? 128 + ($? & 127) : ($? >> 8);
+        printf "%d %d\n", $el, $rc;' -- "$bin" ${CMD_ARGS[@]+"${CMD_ARGS[@]}"})"
       t0=0; t1="${line%% *}"; rc="${line##* }"
       ;;
   esac
@@ -118,8 +126,12 @@ for ((i = 0; i < WARMUP; i++)); do
 done
 SAMPLES_A=(); SAMPLES_B=()
 for ((i = 0; i < N; i++)); do
-  SAMPLES_A+=("$(run_once_us "$BIN_A")")
-  SAMPLES_B+=("$(run_once_us "$BIN_B")")
+  # bash 3.2 は配列追加内のコマンド置換の失敗で set -e が止まらないため、一時変数で明示確認する
+  sample=""
+  sample="$(run_once_us "$BIN_A")" || exit 1
+  SAMPLES_A+=("$sample")
+  sample="$(run_once_us "$BIN_B")" || exit 1
+  SAMPLES_B+=("$sample")
 done
 
 # 統計: 中央値・p95（nearest-rank）・最小・最大・平均をミリ秒で出す
@@ -145,9 +157,33 @@ COMPARISON="$(awk -v ma="$MED_A" -v mb="$MED_B" -v pa="$P95_A" -v pb="$P95_B" -v
   printf "{\"median_increase_ms\":%.3f,\"p95_increase_ms\":%.3f,\"reference_threshold_ms\":%s,\"reference_threshold_met\":%s}", d, pb - pa, th, (d <= th) ? "true" : "false"
 }')"
 
+# 引数を JSON 文字列へエスケープする（" \ と U+0000-U+001F。C ロケールのバイト単位）
+json_escape() { # $1=文字列
+  local s="$1" out="" c i code
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      '"') out+='\"' ;;
+      "\\") out+="\\\\" ;;
+      $'\n') out+='\n' ;;
+      $'\t') out+='\t' ;;
+      $'\r') out+='\r' ;;
+      $'\b') out+='\b' ;;
+      $'\f') out+='\f' ;;
+      *)
+        printf -v code '%d' "'$c"
+        if [ "$code" -lt 32 ] && [ "$code" -gt 0 ]; then
+          printf -v c '\\u%04x' "$code"
+        fi
+        out+="$c"
+        ;;
+    esac
+  done
+  printf '%s' "$out"
+}
 CMD_JSON=""
 for a in ${CMD_ARGS[@]+"${CMD_ARGS[@]}"}; do
-  CMD_JSON+="${CMD_JSON:+,}\"${a//[\"\\]/}\""
+  CMD_JSON+="${CMD_JSON:+,}\"$(json_escape "$a")\""
 done
 
 {

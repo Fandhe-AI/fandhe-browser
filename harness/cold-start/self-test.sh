@@ -23,14 +23,16 @@ num() { grep -o "\"$2\":-\?[0-9.]*" <<<"$1" | head -1 | cut -d: -f2; }
 in_range() { awk -v v="$1" -v lo="$2" -v hi="$3" 'BEGIN{exit !(v >= lo && v <= hi)}'; }
 
 # 入力検証
-for args in "-n 0" "-n 1001" "-n x" "--warmup 101" "--threshold-ms x"; do
+for args in "-n 0" "-n 1001" "-n x" "-n 08" "-n 010" "--warmup 101" "--warmup 03" "--threshold-ms x" "--threshold-ms 03" "--runs" "--bin-a" "--out"; do
   st=0; # shellcheck disable=SC2086
   "$MEASURE" --bin-a "$TRUE_BIN" --bin-b "$TRUE_BIN" $args >/dev/null 2>&1 || st=$?
   [ "$st" -eq 2 ] || fail "'$args' must exit 2 (got $st)"
 done
 st=0; "$MEASURE" --bin-a /nonexistent --bin-b "$TRUE_BIN" >/dev/null 2>&1 || st=$?
 [ "$st" -eq 2 ] || fail "missing binary must exit 2 (got $st)"
-ok "input validation"
+ok "input validation (leading zeros / missing option values exit 2)"
+st=0; "$MEASURE" --bin-a "$TRUE_BIN" --bin-b "$TRUE_BIN" --runs >/dev/null 2>&1 || st=$?
+[ "$st" -eq 2 ] || fail "trailing --runs must exit 2 (got $st)"
 
 # 同一バイナリ同士: 増分はほぼ 0（閾値 3ms 内）
 OUT="$("$MEASURE" --bin-a "$TRUE_BIN" --bin-b "$TRUE_BIN" -n 20 --warmup 2)" || fail "true vs true"
@@ -68,3 +70,31 @@ OUT="$("$MEASURE" --bin-a "$TRUE_BIN" --bin-b "$TRUE_BIN" -n 2 --warmup 0 -- --v
 grep -q '"args":\["--version"\]' <<<"$OUT" || fail "args not recorded"
 ok "arguments after -- are recorded"
 if command -v jq >/dev/null 2>&1; then jq -e '.task == "TASK-104" and .a.runs == 2' <<<"$OUT" >/dev/null || fail "JSON shape"; fi
+
+# 引数の JSON エスケープ（引用符・バックスラッシュ・改行・タブ・制御文字を元のまま記録）
+ARG=$'a"b\\c\nd\te\001'
+OUT="$("$MEASURE" --bin-a "$TRUE_BIN" --bin-b "$TRUE_BIN" -n 1 --warmup 0 -- "$ARG")" || fail "escape run"
+grep -qF '"args":["a\"b\\c\nd\te\u0001"]' <<<"$OUT" || fail "args escape mismatch: $OUT"
+if command -v jq >/dev/null 2>&1; then
+  [ "$(jq -r '.args[0]' <<<"$OUT")" = "$ARG" ] || fail "args must round-trip through JSON"
+fi
+ok "arguments are JSON-escaped"
+
+# シグナル終了は失敗（3 種のタイマーすべて）
+KILLED="$TMP/killed"
+printf '#!/bin/sh\nkill -TERM $$\n' >"$KILLED"; chmod +x "$KILLED"
+for t in epochrealtime date-ns perl; do
+  st=0; COLD_START_TIMER="$t" "$MEASURE" --bin-a "$TRUE_BIN" --bin-b "$KILLED" -n 1 --warmup 0 >/dev/null 2>&1 || st=$?
+  [ "$st" -eq 1 ] || fail "$t: signal termination must exit 1 (got $st)"
+done
+ok "signal termination is a failure"
+
+# カンマ小数ロケールでも JSON が壊れない（ロケールが無い環境では注記のみ）
+for loc in de_DE.UTF-8 de_DE.utf8 fr_FR.UTF-8; do
+  if LC_ALL="$loc" locale -a >/dev/null 2>&1 && locale -a 2>/dev/null | grep -qix "$loc"; then
+    OUT="$(LC_ALL="$loc" "$MEASURE" --bin-a "$TRUE_BIN" --bin-b "$SLOW" -n 3 --warmup 0)" || fail "locale $loc run"
+    grep -q ',[0-9]' <<<"${OUT//,\"/}" && fail "comma decimal in output under $loc"
+    [ "$(num "$OUT" median_ms | head -1)" != "" ] || fail "median_ms missing under $loc"
+    ok "locale $loc"; break
+  fi
+done
