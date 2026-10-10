@@ -4,6 +4,10 @@ TASK-37（37.h1）/ MS-1 / ビヘイビア `RENDER-5`・`MEAS-3` 対応。Issue 
 実機作業（担当: 人間）の手順書である。**この文書は手順の草案であり、測定結果ではない**。
 実機での撮影・測定・合否判定はオーナーが行い、結果は #55 に記録する。
 
+**実サイト（ネットワーク接続下）の Servo 撮影は保留中である**。現行の `servo-embed` は
+検証プロキシを通せず、`--allow-unproxied-engine` は README の安全契約上ネットワークを
+完全に遮断した環境専用のため、接続下では使えない（保留理由は 4.3、再開条件は 5.1）。
+
 ハーネスの仕様（引数・スキーマ・セキュリティ上の注意）は [README.md](README.md) が
 正本で、本書は「実機で何をどの順に実行するか」だけを扱う。
 
@@ -26,7 +30,7 @@ TASK-37（37.h1）/ MS-1 / ビヘイビア `RENDER-5`・`MEAS-3` 対応。Issue 
 | ---- | ---- |
 | OS | Linux x86_64（TASK-36 / #50 で検証に使った Linux 実機と同じ環境が望ましい） |
 | GPU | なし。Mesa の llvmpipe（ソフトウェア GL）で描画する。フォント差などで SSIM が下がり得る点に注意 |
-| ネットワーク | 代表サイト（`sites.json`）へ HTTPS で到達できること。到達不能なサイトは `skipped` / `failed` になり、5 サイト未満だと終了コード 1 になる |
+| ネットワーク | 実サイト撮影の再開後は、代表サイト（`sites.json`）へ HTTPS で到達できること（到達不能なサイトは `skipped` / `failed` になり、5 サイト未満だと終了コード 1）。**現時点では接続下で Servo を撮影しない**（5.1 参照）。ネットワークを完全に遮断した環境では Servo 側のスナップショット取得も失敗するため、`sites.json` の実サイトは `skipped` になる |
 | ツール | `python3`（標準ライブラリのみで動作）、Rust stable（`rust-toolchain.toml`）、`cmake` と C/C++ ビルド環境（Servo のネイティブ依存に必要。PoC-6 の記録による） |
 | ディスク | Servo の release ビルドで `target/` が数 GB（PoC-6 の macOS 実測で約 2.4GB。Linux での診断版ビルドは約 4 分。#50 報告） |
 
@@ -104,24 +108,46 @@ callback が呼ばれないことと推定されている（Servo 0.3.0 の描�
 - 出力寸法は 1280x800 固定。`sites.json` の viewport（1280x800）と一致するので追加指定は不要。
 - 入力は HTML ファイル（`data:` URL として読み込む）。ハーネスの `{html_path}` placeholder が
   この用途にあたり、撮影直前に対象 URL の HTML をスナップショットとして 1 回取得して渡す。
-  Chromium は `{url}` を直接開くため、**両エンジンの入力条件が一致しない**
-  （スナップショットは外部 CSS・画像・スクリプトを含まない HTML 本体のみ）。
-  この差が SSIM に与える影響は測定時に必ず記録する（5 章の記録テンプレート）。
+  Chromium は `{url}` を直接開くため、**両エンジンの入力条件が一致しない**。
+  スナップショットは HTML 本体のみを保存し外部ファイルは同梱しないが、保存 HTML には
+  `<base href>` が注入される（`inject_base_href`）。そのため、ネットワークに接続できる環境では
+  相対 URL の CSS・画像・スクリプトは撮影時に元サイトから取得され得る。
+  `data:` origin に由来する制約、動的リクエスト、取得時刻の差なども残る。
+  ネットワークを完全に遮断した環境ではこれらのサブリソースは取得されず、無スタイルに近い
+  描画になる。いずれの場合も差が SSIM に与える影響は測定時に必ず記録する（7 章の記録テンプレート）。
 - `servo-embed` はプロキシ引数を持たない。ハーネスは `{proxy}` を含まない `--servo-cmd` を
-  既定で拒否するため、Servo 側の撮影は **`--allow-unproxied-engine` を付けて実行する**
-  （オーナー判断 2026-10-10・#55）。
-  これはネットワーク全通信をローカル転送プロキシ越しにフィルタする安全策を Servo 側で外すことを意味する。
-  採用理由は、実機測定が一度きりであること。**対象は `sites.json` の公開サイトのみに限り、
-  認証情報・社内/ローカルのアドレスを含む URL では使わない**。
+  既定で拒否する。`--allow-unproxied-engine` はそれを外すフラグだが、README と CLI の定義どおり
+  **ネットワークを完全に遮断した環境専用**であり、実サイトへ接続できる環境では使わない。
+  理由（SSRF）: スナップショットの `<base href>` により Servo がサブリソースを取得する通信は
+  検証プロキシを迂回するため、内部アドレス・メタデータアドレスへアクセスし得る。
+- **実サイト撮影の保留（オーナー判断 2026-10-10・#55）**: 検証プロキシを通せる Servo 撮影
+  コマンドができるまで、ネットワーク接続下での Servo 撮影は行わない。後続 Issue:
+  #TBD（起票予定: プロキシ対応の Servo 撮影コマンド）。
 
 ## 5. 撮影（`capture_screenshots.py`）
 
-作業用の出力先を決め、まず `--dry-run` で展開後のコマンドを確認する。
+### 5.1 実サイト撮影（保留）
+
+`sites.json` の実サイトを Servo で撮影する手順は、検証プロキシを通せる Servo 撮影コマンド
+（#TBD。起票予定）ができるまで保留とする（4.3 の SSRF の理由）。本書にはネットワーク接続下で
+`--allow-unproxied-engine` を使う手順・コマンド例を載せない。再開時は、その撮影コマンドが
+`{proxy}` を受け取れること（README「Servo（servoshell）のプロキシ対応について」）を確認し、
+本節を更新する。保留中も、2 章のハーネス自己テスト・3 章の Chromium 導入・4.2 の診断版
+servo-embed の単体 PNG 確認までは実行できる。
+
+### 5.2 ネットワークを完全に遮断した環境での実行
+
+`--allow-unproxied-engine` を使えるのは、ネットワークを完全に遮断した環境（外部へ一切到達
+できないことを確認済みの環境）に限る。この環境ではサブリソースは取得されないが、
+`{html_path}` 用の HTML スナップショット取得も失敗するため `sites.json` の実サイトは
+`skipped` になる。したがって用途は、ローカルに用意した fixture によるパイプライン動作確認に
+限られ、`RENDER-5` の判定材料にはならない。まず `--dry-run` で展開後のコマンドを確認する。
 
 ```bash
 OUT=/path/to/render-out
 SERVO_BIN=/path/to/servo-target/release/servo_embed_poc
 
+# ネットワークを完全に遮断した環境でのみ実行すること
 python3 harness/render-screenshot/capture_screenshots.py \
   --out-dir "$OUT" \
   --engines servo,chromium \
@@ -130,7 +156,7 @@ python3 harness/render-screenshot/capture_screenshots.py \
   --dry-run
 ```
 
-内容に問題がなければ `--dry-run` を外して実行する。主な引数（正本は README の「CLI 引数」）:
+主な引数（正本は README の「CLI 引数」）:
 
 | 引数 | 用途 | 既定 |
 | ---- | ---- | ---- |
@@ -141,7 +167,7 @@ python3 harness/render-screenshot/capture_screenshots.py \
 | `--timeout-sec` | 1 回の撮影のタイムアウト | 90 |
 | `--settle-ms` | 描画の待ち時間 | 5000 |
 | `--min-sites` | 両エンジンで共通して `ok` になるべき最低サイト数 | 5 |
-| `--allow-unproxied-engine` | `{proxy}` 無しのテンプレートを許可（4.3 の決定: Servo 側撮影で使用） | 無効 |
+| `--allow-unproxied-engine` | `{proxy}` 無しのテンプレートを許可（ネットワークを完全に遮断した環境専用。接続下では使わない） | 無効 |
 
 終了コードは、両エンジンで共通して `ok` のサイト数が `--min-sites` 以上なら 0、未満なら 1、
 引数不正なら 2。`capture-result.json` の `captures[].status`（`ok` / `failed` / `timeout` /
@@ -202,7 +228,7 @@ Issue #55 へ貼る。数値は `measure-result.json` から転記する。
 | ... | | | | | | |
 
 - 両基準を満たしたサイト数: N / 5（基準 5 以上）
-- 入力条件の差（Servo: スナップショット HTML / Chromium: URL 直接）の影響: 記述
+- 入力条件の差（Servo: スナップショット HTML / Chromium: URL 直接。サブリソースの取得有無・取得時刻・`data:` origin の差を含む）の影響: 記述
 - 失敗・skipped のサイトと stderr_tail の要点: 記述
 - 境界ボックスの取得方法と要素選定: 記述（未測定の場合はその旨）
 
