@@ -22,8 +22,8 @@ use std::collections::HashSet;
 use fandhe_browser_ai::compress_table::MAX_TABLE_ROWS;
 use fandhe_browser_ai::snapshot::element_ref::{ElementSignature, RefAllocator};
 use fandhe_browser_ai::snapshot::{
-    CheckedState, DataLeafKind, HeaderCell, MAX_ROW_CONTROLS, MAX_TABLE_CONTROLS, Node, Snapshot,
-    State, TableRow, TableSummary, build_snapshot, ref_signature,
+    CheckedState, DataLeafKind, HeaderCell, MAX_ROW_CONTROLS, MAX_TABLE_CONTROLS, Node, REF_ROLES,
+    Snapshot, State, TableRow, TableSummary, build_snapshot, ref_signature,
 };
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
 
@@ -41,6 +41,11 @@ fn snap(html: &str) -> Snapshot {
     let parsed =
         parse_document(html, &ParseOptions::default()).expect("フィクスチャのパースは成功する");
     build_snapshot(&parsed.document).expect("フィクスチャの構築は成功する")
+}
+
+/// ref を持たないノードの期待値（TASK-23.4）。
+fn nn(role: &str, name: &str, children: Vec<Node>) -> Node {
+    Node::new(role, name).with_children(children)
 }
 
 /// ref 付きノードの期待値。
@@ -90,11 +95,21 @@ fn assert_common(html: &str, s: &Snapshot) {
     assert!(!s.truncated);
     assert_eq!(&snap(html), s, "同じ HTML は同じ Snapshot になる");
     let nodes = all_nodes(&s.tree);
-    let mut refs: Vec<&str> = nodes
-        .iter()
-        .skip(1)
-        .map(|nd| nd.r#ref.as_deref().expect("ルート以外は ref を持つ"))
-        .collect();
+    // TASK-23.4（AISNAP-1・AISNAP-13）: ref は操作・参照の対象（REF_ROLES・データ葉・圧縮したコンテナ）に限る。
+    // 本フィクスチャには role/tabindex/onclick 付きの要素は無い。
+    let mut refs: Vec<&str> = Vec::new();
+    for nd in nodes.iter().skip(1) {
+        let expected =
+            REF_ROLES.contains(&nd.role.as_str()) || nd.data_leaf.is_some() || nd.table.is_some();
+        assert_eq!(
+            nd.r#ref.is_some(),
+            expected,
+            "ref の有無は対象ノードと一致する: {} {:?}",
+            nd.role,
+            nd.name
+        );
+        refs.extend(nd.r#ref.as_deref());
+    }
     // 圧縮した表のヘッダ ref・行内操作要素の ref も一意性の検査対象に含める
     // （AISNAP-2・TASK-12.5・Issue #632）。
     for nd in &nodes {
@@ -123,7 +138,7 @@ fn aisnap_1_article_snapshot_structure() {
     // 名前のない generic（html・body・p）は折り畳まれ、子が親へ繰り上がる（TASK-23.3）。
     // 残るノードの ref リテラルは折り畳み前と同一（AISNAP-10）。
     let expected = Snapshot::new(Node::new("document", "Rust 入門記事").with_children(vec![
-        n("banner", "", "e02d16e1795403182", vec![]),
+        nn("banner", "", vec![]),
         n("heading", "はじめに", "e300ae11bc252b0fd", vec![]),
         n("link", "公式ドキュメント", "ed45c1d22b4e186f4", vec![]),
         n("heading", "要点", "ee0714a175d20c8b2", vec![]),
@@ -132,7 +147,7 @@ fn aisnap_1_article_snapshot_structure() {
             vec![TableRow::new("所有権", false), TableRow::new("借用", false)],
             0,
         )),
-        n("contentinfo", "", "ec0aa17bccd809080", vec![]),
+        nn("contentinfo", "", vec![]),
     ]));
     assert_eq!(s, expected);
     assert_common(ARTICLE, &s);
@@ -223,33 +238,28 @@ const IRREGULAR_TABLE: &str = r#"<!DOCTYPE html><html><head><title>成績表</ti
 fn aisnap_2_irregular_table_snapshot_is_expanded() {
     let s = snap(IRREGULAR_TABLE);
     let tc = DataLeafKind::TableCell;
-    let expected = Snapshot::new(Node::new("document", "成績表").with_children(vec![n(
+    let expected = Snapshot::new(Node::new("document", "成績表").with_children(vec![nn(
         "table",
         "",
-        "e7c96b5162ee5821b",
         vec![
-            n(
+            nn(
                 "rowgroup",
                 "",
-                "e562e6ae373000aaa",
-                vec![n(
+                vec![nn(
                     "row",
                     "名前点数",
-                    "e3b9ec063bec3ce0d",
                     vec![
                         n("columnheader", "名前", "e895cf72c839b312e", vec![]).with_data_leaf(tc),
                         n("columnheader", "点数", "e4c3266d420a99a2c", vec![]).with_data_leaf(tc),
                     ],
                 )],
             ),
-            n(
+            nn(
                 "rowgroup",
                 "",
-                "e562e6ae373000aaa-2",
-                vec![n(
+                vec![nn(
                     "row",
                     "太郎80",
-                    "e603d30fc95b8b612",
                     vec![
                         n("cell", "太郎", "e8c54b60bbb2904e5", vec![]).with_data_leaf(tc),
                         n("cell", "80", "eb3df38593dc1377c", vec![]).with_data_leaf(tc),
@@ -467,13 +477,15 @@ fn aisnap_10_root_child_ref_matches_signature_digest() {
     let body = alloc
         .allocate_signature(&ElementSignature::new("generic", "").with_scope(html))
         .expect("発行は成功する");
-    let banner = alloc
-        .allocate_signature(&ElementSignature::new("banner", "").with_scope(body))
+    // banner は ref を持たなくなった（TASK-23.4）ので、body 直下の見出しで scope 連鎖を確かめる。
+    assert_eq!(child(&s.tree, 0).r#ref, None);
+    let heading = alloc
+        .allocate_signature(&ElementSignature::new("heading", "はじめに").with_scope(body))
         .expect("発行は成功する");
-    assert_eq!(child(&s.tree, 0).r#ref, Some(banner.to_ref_string()));
+    assert_eq!(child(&s.tree, 1).r#ref, Some(heading.to_ref_string()));
     assert_eq!(
-        child(&s.tree, 0).r#ref.as_deref(),
-        Some("e02d16e1795403182")
+        child(&s.tree, 1).r#ref.as_deref(),
+        Some("e300ae11bc252b0fd")
     );
 }
 

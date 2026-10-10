@@ -294,13 +294,15 @@ fn envelope(url: &str, snapshot: &Snapshot) -> Value {
 /// [`Node`] を JSON にする。`#[non_exhaustive]` 型へフィールドが増えたら本関数の更新が必要。
 ///
 /// 再帰の深さは [`build_snapshot`] が `MAX_TREE_DEPTH` 以下に保証するため有界。
-/// 既定値のフィールド（`disabled: false`・`checked`/`data_leaf`/`table` なし・折り畳み行なし）は
+/// 既定値のフィールド（`ref` なし（TASK-23.4）・`disabled: false`・`checked`/`data_leaf`/`table` なし・折り畳み行なし）は
 /// トークン量削減のため省略する。
 fn node_json(node: &Node) -> Value {
     let mut m = Map::new();
     m.insert("role".into(), json!(node.role));
     m.insert("name".into(), json!(node.name));
-    m.insert("ref".into(), json!(node.r#ref));
+    if let Some(r) = &node.r#ref {
+        m.insert("ref".into(), json!(r));
+    }
     if node.state.disabled {
         m.insert("disabled".into(), json!(true));
     }
@@ -427,7 +429,11 @@ mod tests {
         assert_eq!(v["truncated"], false);
         assert_eq!(v["tree"]["role"], "document");
         assert_eq!(v["tree"]["name"], "Example Domain");
-        assert!(v["tree"]["ref"].is_null());
+        assert!(
+            v["tree"]
+                .as_object()
+                .is_some_and(|o| !o.contains_key("ref"))
+        );
         let link = find_by_name(&v["tree"], "More").expect("link");
         assert_eq!(link["role"], "link");
         assert_eq!(link["name"], "More");

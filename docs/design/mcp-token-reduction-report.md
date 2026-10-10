@@ -25,23 +25,23 @@
 
 | site | rawHtmlTokens | snapshotTokens | reductionPct | truncated |
 | ---- | ------------- | -------------- | ------------ | --------- |
-| example-minimal | 103 | 92 | 10.7 | false |
-| wikipedia-article | 56482 | 41283 | 26.9 | false |
-| hn-list | 10220 | 16350 | -60.0 | true |
-| login-form | 284 | 209 | 26.4 | false |
-| mdn-docs | 19005 | 27817 | -46.4 | false |
+| example-minimal | 103 | 88 | 14.6 | false |
+| wikipedia-article | 56482 | 37779 | 33.1 | false |
+| hn-list | 10220 | 14170 | -38.6 | true |
+| login-form | 284 | 205 | 27.8 | false |
+| mdn-docs | 19005 | 27776 | -46.2 | false |
 
 ### Summary
 
 | pages | meanReductionPct | minReductionPct | maxReductionPct | medianSnapshotTokens |
 | ----- | ---------------- | --------------- | --------------- | -------------------- |
-| 5 | -8.5 | -60.0 | 26.9 | 16350.0 |
+| 5 | -1.9 | -46.2 | 33.1 | 14170.0 |
 
 ### PLUG-4 verdict
 
 | thresholdPct | meanPct | verdict | gapPts |
 | ------------ | ------- | ------- | ------ |
-| 84.0 | -8.5 | Shortfall | 92.5 |
+| 84.0 | -1.9 | Shortfall | 85.9 |
 
 ## 所見
 

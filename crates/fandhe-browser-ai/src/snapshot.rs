@@ -41,6 +41,9 @@
 //! - 名前のない generic 系ノードの折り畳みと空ノードの剪定: TASK-23.3（`AISNAP-1`・
 //!   `AISNAP-10`・Issue #826）で実装済み（子は親の位置へ繰り上がり、残るノードの ref は
 //!   折り畳み前と同一）。`role` 属性つき要素は畳まない既知の制約あり（`build.rs` のモジュール doc）
+//! - ref の付与を操作・参照の対象ノードに限る: TASK-23.4（`AISNAP-1`・`AISNAP-10`・
+//!   `AISNAP-13`・Issue #827）で実装済み（[`REF_ROLES`]・データ葉・操作要素のみ。内部の発行と
+//!   scope 連鎖は全要素で続けるので、残るノードの ref は不変）
 //! - データ葉（`isDataLeaf`）の判定結果の反映: TASK-13.3（`AISNAP-3`・Issue #88）で
 //!   実装済み（[`Node::data_leaf`]。算出は [`crate::data_leaf::classify_data_leaf`]。
 //!   印を付けるだけで、簡約・剪定への利用は後続タスク）。引用要素・地の文クラスへの拡充結果の
@@ -61,7 +64,7 @@ pub mod role;
 pub mod state;
 pub use crate::data_leaf::DataLeafKind;
 pub use build::{
-    MAX_ROW_CONTROLS, MAX_TABLE_CONTROLS, MAX_TREE_DEPTH, SnapshotError, build_snapshot,
+    MAX_ROW_CONTROLS, MAX_TABLE_CONTROLS, MAX_TREE_DEPTH, REF_ROLES, SnapshotError, build_snapshot,
 };
 pub use element_ref::{ElementRef, RefAllocator, RefError, ref_signature};
 pub use name::{AccessibleName, NameIndex, NameSource, compute_name, compute_name_with_index};
@@ -85,7 +88,13 @@ pub use state::{CheckedState, State, compute_state};
 ///   実装済み（TASK-11.4.1・Issue #544）。子孫テキストによる命名・
 ///   文書ルートの `<title>` は TASK-11.4.3（Issue #546）で実装済み
 /// - `r#ref`: role + name シグネチャによる再特定要求（`AISNAP-10`）。
-///   `None` は ref を振らないノード（例: document ルート）を表す。
+///   `None` は ref を振らないノードを表す: document ルートと、操作・参照の対象でないノード
+///   （list・listitem・row・ランドマーク・paragraph・img・データ葉でない cell 等。
+///   `AISNAP-1`・`AISNAP-13`・TASK-23.4・Issue #827）。これらにも内部では `ElementRef` を
+///   発行して子孫の ref の scope に使うため、子孫の ref は変わらない（`AISNAP-10`）。
+///   `None` のノードは ref で指定できず、エージェントは ref を持つ子孫で操作・参照する。
+///   ref を持つのは [`REF_ROLES`]・データ葉・操作要素（`role` 属性付き等を含む）・`option`・
+///   圧縮したコンテナ（[`Node::table`] あり。配下のヘッダ・行内操作要素の ref の scope 元）のノード。
 ///   値の形式は `e<16hex>[v<n>][-n]`（[`RefAllocator`] が発行。TASK-11.6・Issue #75・
 ///   `AISNAP-10`）。木への割り当ては [`build_snapshot`]（TASK-11.7）が担う
 /// - `children`: DOM の親子関係に対応する子ノード（名前のない generic を折り畳んだ場合、
@@ -120,7 +129,8 @@ pub struct Node {
     /// accessible name。算出は TASK-11.4（Issue #73）。ネイティブ分は
     /// [`name::compute_name`]（TASK-11.4.2・Issue #545）で実装済み。
     pub name: String,
-    /// role + name シグネチャによる再特定要求（`AISNAP-10`）。
+    /// role + name シグネチャによる再特定要求（`AISNAP-10`）。`None` は ref を振らない
+    /// ノード（ルート、および操作・参照の対象でないノード。TASK-23.4・Issue #827）。
     /// 形式は `e<16hex>[v<n>][-n]`。生成は [`RefAllocator`]（TASK-11.6・Issue #75）。
     pub r#ref: Option<String>,
     /// DOM の親子関係に対応する子ノード（折り畳まれた generic の子は親へ繰り上がる。TASK-23.3）。
