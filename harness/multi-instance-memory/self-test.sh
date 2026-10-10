@@ -87,6 +87,38 @@ STUB_EOF
     node --import "$TMP/stub.mjs" "$SCRIPT_DIR/navigate.mjs" http://stub https://example.com/ >/dev/null 2>&1 \
     || fail "navigate.mjs must exit 0 without errorText"
   ok "navigate.mjs: errorText -> exit 1, success -> exit 0"
+
+  # 組み込み WebSocket が Origin ヘッダを送らないこと（cdp の ws.rs は Origin 付きを 403 で拒否する）と、
+  # ハンドシェイクに応答しないサーバーへの接続が期限内に非 0 で終了すること（短い期限は環境変数で上書き）
+  cat >"$TMP/origin-check.mjs" <<'ORIGIN_EOF'
+import net from "node:net";
+const srv = net.createServer((c) => {
+  c.once("data", (d) => {
+    const head = String(d).toLowerCase();
+    console.log(head.includes("\r\norigin:") ? "origin-sent" : "origin-absent");
+    c.destroy(); srv.close();
+  });
+});
+srv.listen(0, "127.0.0.1", () => {
+  const w = new WebSocket(`ws://127.0.0.1:${srv.address().port}/x`);
+  w.onerror = () => {};
+});
+ORIGIN_EOF
+  [ "$(timeout 10 node "$TMP/origin-check.mjs")" = "origin-absent" ] \
+    || fail "built-in WebSocket must not send an Origin header"
+  ok "built-in WebSocket sends no Origin header (compatible with cdp check_handshake)"
+  cat >"$TMP/hang.mjs" <<'HANG_EOF'
+import net from "node:net";
+const srv = net.createServer(() => {}).listen(0, "127.0.0.1", () => console.log(srv.address().port));
+HANG_EOF
+  node "$TMP/hang.mjs" >"$TMP/hang.port" & hang_pid=$!
+  for _ in $(seq 1 50); do [ -s "$TMP/hang.port" ] && break; sleep 0.1; done
+  st=0
+  NAVIGATE_CONNECT_TIMEOUT_MS=500 timeout 20 node "$SCRIPT_DIR/navigate.mjs" \
+    "http://127.0.0.1:$(cat "$TMP/hang.port")" https://example.com/ >/dev/null 2>&1 || st=$?
+  kill "$hang_pid" 2>/dev/null || true
+  [ "$st" -eq 1 ] || fail "navigate.mjs must exit 1 on connect timeout (got $st)"
+  ok "navigate.mjs: unresponsive endpoint -> exit 1 within the deadline"
 else
   echo "note: node not found; navigate.mjs errorText handling NOT verified"
 fi

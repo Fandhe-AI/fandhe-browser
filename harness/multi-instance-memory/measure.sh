@@ -192,7 +192,6 @@ IP_FORWARD_ORIG=""   # 変更前の net.ipv4.ip_forward（空なら未変更）
 # ---- 外向き経路（veth＋NAT）----
 # 追加物はすべて下記の teardown_egress で逆順に削除する。ホスト固有の値は持たない。
 setup_nat() {
-  local sub="$EGRESS_BASE.0.0/16"
   IP_FORWARD_ORIG="$(cat /proc/sys/net/ipv4/ip_forward)"
   if [ "$IP_FORWARD_ORIG" != "1" ]; then
     log "enabling net.ipv4.ip_forward (restored to $IP_FORWARD_ORIG on exit)"
@@ -200,9 +199,14 @@ setup_nat() {
   else
     IP_FORWARD_ORIG=""
   fi
-  add_rule nat POSTROUTING -s "$sub" ! -d "$sub" -j MASQUERADE
-  add_rule filter FORWARD -s "$sub" -j ACCEPT
-  add_rule filter FORWARD -d "$sub" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+}
+# インスタンスごとの NAT・FORWARD ルール。実際に作成した veth（-i/-o）と当該 /30 に限定し、
+# 10.213.0.0/16 全体や他のインターフェースへは効かせない。後始末は teardown_nat が NAT_RULES を逆順に -D する。
+add_instance_rules() { # $1=ホスト側 veth 名 $2=サブネット（例 10.213.1.0/30）
+  local host_if="$1" sub="$2"
+  add_rule nat POSTROUTING -s "$sub" ! -d "$sub" ! -o "$host_if" -j MASQUERADE
+  add_rule filter FORWARD -i "$host_if" -s "$sub" -j ACCEPT
+  add_rule filter FORWARD -o "$host_if" -d "$sub" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 }
 add_rule() { # $1=table $2=chain、以降=条件
   local table="$1" chain="$2"; shift 2
@@ -304,6 +308,7 @@ attach_egress() { # $1=index $2=leader pid
   nsenter -t "$pid" -n ip addr add "$peer_ip/30" dev "$peer_if"
   nsenter -t "$pid" -n ip link set "$peer_if" up
   nsenter -t "$pid" -n ip route add default via "$host_ip"
+  add_instance_rules "$host_if" "$EGRESS_BASE.$1.0/30"
 }
 
 launch_chromium() { # $1=index $2=url
@@ -359,22 +364,33 @@ tree_pids() { # $1=leader
 }
 
 sample_cycle() { # $1=target $2=condition。結果を RES_* と RESULTS へ
-  local target="$1" cond="$2" pss=0 rss=0 procs=0 unreadable=0 alive=0 leader p v
+  local target="$1" cond="$2" pss=0 rss=0 procs=0 unreadable=0 lost_leader=0 alive=0 leader leader_read p v
   for leader in "${LEADERS[@]}"; do
     kill -0 "$leader" 2>/dev/null && alive=$((alive + 1))
   done
   [ "$alive" -eq "$N" ] || { echo "error: only $alive/$N $target instances alive before sampling" >&2; return 1; }
   for leader in "${LEADERS[@]}"; do
+    # リーダー自身の smaps_rollup 読み取り成功を必須にする（読めない・消失は失敗扱い）
+    leader_read=0
     while read -r p; do
       [ -n "$p" ] || continue
       if v="$(awk '/^Pss:/{a=$2} /^Rss:/{b=$2} END{ if (a=="") exit 1; print a, b }' "/proc/$p/smaps_rollup" 2>/dev/null)"; then
         pss=$((pss + ${v%% *})); rss=$((rss + ${v##* })); procs=$((procs + 1))
+        [ "$p" != "$leader" ] || leader_read=1
       elif kill -0 "$p" 2>/dev/null; then
         unreadable=$((unreadable + 1))   # 生存しているのに読めない（権限）。合算が過少になるため失敗扱い
       fi
     done < <(tree_pids "$leader")
+    [ "$leader_read" -eq 1 ] || lost_leader=$((lost_leader + 1))
   done
   [ "$unreadable" -eq 0 ] || { echo "error: $unreadable live processes had unreadable smaps_rollup" >&2; return 1; }
+  # 集計中にリーダーが消失するとその PID が黙って除外されるため、終了時にも全リーダーの生存を再確認する
+  [ "$lost_leader" -eq 0 ] || { echo "error: $lost_leader $target leader(s) unreadable or gone during sampling" >&2; return 1; }
+  alive=0
+  for leader in "${LEADERS[@]}"; do
+    kill -0 "$leader" 2>/dev/null && alive=$((alive + 1))
+  done
+  [ "$alive" -eq "$N" ] || { echo "error: only $alive/$N $target instances alive after sampling" >&2; return 1; }
   RES_PSS["$target:$cond"]="$pss"
   RESULTS+=("$(printf '{"target":"%s","condition":"%s","instances":%d,"processes":%d,"pss_kib":%d,"rss_kib":%d,"pss_per_instance_kib":%s}' \
     "$target" "$cond" "$N" "$procs" "$pss" "$rss" "$(awk -v a="$pss" -v n="$N" 'BEGIN{printf "%.1f", a/n}')")")
