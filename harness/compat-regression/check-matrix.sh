@@ -4,7 +4,7 @@
 # 動作率が閾値を下回っていれば非ゼロ終了する回帰チェッカー（TASK-9.2・REPAIR-8）。
 # 閾値の根拠は COMPAT-4（全体動作率 70% 以上）・COMPAT-1（静的・SPA・フォーム等の
 # 類型別動作率 70% 以上）。呼び出し元は .github/workflows/ci.yml の
-# compat-regression ジョブと Makefile の check-compat-regression ターゲット。
+# harness-* ジョブの [compat-regression] ステップと Makefile の check-compat-regression ターゲット。
 # スキーマ契約・終了コードの詳細は同じディレクトリの README.md を参照。
 #
 # 依存は bash + jq のみ（新規 Cargo 依存・新規サードパーティ action を避けるため。

@@ -2,7 +2,7 @@
 #
 # check-matrix.sh の自己テスト（TASK-9.2・REPAIR-8）。合成 fixture（fixtures/*.json）
 # に対してチェッカーを実行し、終了コードと集計値（passed=/total=）を具体値で厳密比較する。
-# 呼び出し元は .github/workflows/ci.yml の compat-regression ジョブと Makefile の
+# 呼び出し元は .github/workflows/ci.yml の harness-* ジョブの [compat-regression] ステップと Makefile の
 # check-compat-regression ターゲットで、実マトリクス（harness/compat-practical/
 # results/matrix.json。TASK-71.3・#312 で導入予定）の判定に先立って毎回実行し、
 # 「閾値未満で fail する」ことをログに証跡として残す。

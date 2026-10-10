@@ -41,14 +41,14 @@ fandhe-browser/
 │   ├── fandhe-browser-cli/        #   CLI（最小雛形: core・profile・cdp・ai を組み立ててサーバー起動。サブコマンドは TASK-47）
 │   └── fandhe-browser-mcp/        #   MCP 参照プラグイン（別バイナリ。stdio サーバー基盤・起動時のホスト自己申告と navigate・snapshot ツールを実装）
 ├── tests/ / benches/              #（予定）結合テスト・ベンチ
-├── scripts/                       # 依存グラフ検査等のスクリプト。check-render-isolation.sh（TASK-34.1・RENDER-1）・check-js-engine-isolation.sh（TASK-32.4・JS-1）
+├── scripts/                       # 依存グラフ検査等のスクリプト。check-render-isolation.sh（TASK-34.1・RENDER-1）・check-js-engine-isolation.sh（TASK-32.4・JS-1）・ci-changes.sh（CI の docs-only 判定）・ci-prune-target.sh（CI cache 保存前の prune）
 ├── profiles/                      # CSSOM gating 用ブラウザ挙動プロファイルデータ（chrome.json・safari.json・README.md。TASK-100.1・PLUG-8）
 ├── harness/                       # 互換性テストハーネス。compat-regression/（TASK-9.2・対象サイト群の動作率回帰チェック）・playwright-trace/（TASK-43.1・Playwright newPage() 到達までの CDP トレース収集）・compat-practical/（TASK-71.1・22 タスク定義・アクセス確認・実行対象バイナリ解決・TASK-71.2・22 タスク実行 run_core.sh・TASK-71.3・Chromium 実測との突合 make_matrix.sh）・puppeteer-connect/（TASK-45.1・Puppeteer 接続試験の実行基盤・TASK-45.2・段階別到達結果の回収）・binary-size/（TASK-34.2・既定 feature リリースバイナリのサイズ検査・TASK-31.1・JS エンジン構成別サイズ計測）実装済み
 ├── docs/
 │   ├── design/                    # 設計ドキュメント（public。render-feature-gate.md 等）
 │   ├── setup/                     # 環境別セットアップ手順書（windows.md）
 │   └── spec/                      # fandhe-browser-spec submodule（private・要アクセス権）
-├── .github/workflows/             # ai-review・update-external・ci（push/pull_request で稼働・3 OS CI 対応済み）/ release（発火条件は workflow_dispatch 限定のまま）
+├── .github/workflows/             # ai-review・update-external・ci（push/pull_request で稼働・PR は ubuntu＋`cross-target-check`、main push で 3 OS・docs-only 判定は `scripts/ci-changes.sh`）/ release（発火条件は workflow_dispatch 限定のまま）
 ├── .agents/skills/                # npx skills add の導入実体
 └── .claude/
     ├── agents/                    # カテゴリ別 subagent 定義
