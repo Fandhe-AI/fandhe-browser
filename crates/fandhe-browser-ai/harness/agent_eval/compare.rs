@@ -395,7 +395,8 @@ pub fn check_out_dir(out_dir: &Path, repo_root: &Path) -> Result<(), CompareErro
             "must not contain '..'".to_owned(),
         ));
     }
-    if canonical_lossy(out_dir).starts_with(repo_root) {
+    // 両辺を同じ正規化（シンボリックリンク・8.3 短縮名・UNC 接頭辞の解決）に通してから比較する
+    if canonical_lossy(out_dir).starts_with(canonical_lossy(repo_root)) {
         return Err(CompareError::OutDirRejected(
             "must be outside the repository (generated files and answers are never committed)"
                 .to_owned(),

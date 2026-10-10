@@ -241,13 +241,17 @@ fn aisnap9_packets_cover_25_x_2() {
 #[test]
 fn aisnap9_out_dir_check_rejects_unsafe_paths() {
     // OS ごとに絶対パスとなるよう temp_dir 起点で組み立てる（Windows はドライブ指定が必要）
-    let root_buf = std::env::temp_dir().join("repo-root-for-test");
+    // macOS の /var→/private/var 等の正規化差でも成立するよう、temp_dir を正規化した上で組み立てる
+    let tmp = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonical temp dir");
+    let root_buf = tmp.join("repo-root-for-test");
     let root = root_buf.as_path();
     assert!(check_out_dir(Path::new("relative/dir"), root).is_err());
     assert!(check_out_dir(&root.join("..").join("etc"), root).is_err());
     assert!(check_out_dir(&root.join("out"), root).is_err());
     assert!(check_out_dir(root, root).is_err());
-    let other = std::env::temp_dir().join("other-root").join("out");
+    let other = tmp.join("other-root").join("out");
     assert!(check_out_dir(&other, root).is_ok());
 }
 
