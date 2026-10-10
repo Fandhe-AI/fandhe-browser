@@ -139,8 +139,9 @@ pub use fandhe_browser_js::run_js_worker_if_requested;
 // 直接依存せず core 経由で扱えるようにする（PLUG-10・TASK-101.2.1・#553）。
 pub use fandhe_browser_js::{EvaluateOptions, JsEngineError, JsValue, NativeFn};
 pub use observability::{
-    FailureKind, InMemoryRecorder, JsonLinesRecorder, OperationCounts, OperationKind,
-    OperationOutcome, OperationRecord, OperationRecorder, RecorderHandle, StderrRecorder,
+    DEFAULT_JSON_LINES_QUEUE_CAPACITY, FailureKind, InMemoryRecorder, JsonLinesRecorder,
+    MAX_JSON_LINES_QUEUE_CAPACITY, OperationCounts, OperationKind, OperationOutcome,
+    OperationRecord, OperationRecorder, RecorderHandle, StderrRecorder,
 };
 pub use page_runner::{
     AbortKind, DEFAULT_MAX_SRC_SCRIPT_BYTES, DEFAULT_MAX_TOTAL_SCRIPT_BYTES,

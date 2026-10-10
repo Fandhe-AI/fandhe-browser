@@ -513,6 +513,10 @@ impl OperationRecorder for InMemoryRecorder {
 /// 満杯時でも保持するメモリは小さい。
 pub const DEFAULT_JSON_LINES_QUEUE_CAPACITY: usize = 1024;
 
+/// 有界キュー容量の上限（件数）。`with_capacity` はこれを超える値を切り詰め、
+/// 巨大値（`usize::MAX` 等）による確保失敗・abort を防ぐ。
+pub const MAX_JSON_LINES_QUEUE_CAPACITY: usize = 65_536;
+
 /// JSON Lines（1 レコード 1 行）で `W` へ書き出す [`OperationRecorder`]
 /// （`REPAIR-9`・`TASK-10.3`・Issue #221。形式は #218 の決定）。
 ///
@@ -528,14 +532,15 @@ pub const DEFAULT_JSON_LINES_QUEUE_CAPACITY: usize = 1024;
 /// キューが満杯（受け手が詰まり writer が進まない場合など）のときは、そのレコードを
 /// 捨てて [`JsonLinesRecorder::dropped`] に数え、操作は継続する。panic しない。
 /// 書き込み・flush の失敗は握りつぶして [`JsonLinesRecorder::write_failures`] に数える
-/// （操作の失敗へ波及させない）。1 行は 1 回の `write_all` で書くため行は混ざらず、
+/// （操作の失敗へ波及させない）。失敗後は行境界を保つため出力を停止し、以後のレコードは
+/// `dropped` に数える。1 行は 1 回の `write_all` で書くため行は混ざらず、
 /// 記録順は（捨てられない限り）キューへ入れた順に保たれる。
 pub struct JsonLinesRecorder<W: Write + Send + 'static> {
     tx: SyncSender<String>,
     /// writer スレッド。起動に失敗した場合は `None`（全レコードを `dropped` に数える）。
     worker: Option<JoinHandle<W>>,
     write_failures: Arc<AtomicU64>,
-    dropped: AtomicU64,
+    dropped: Arc<AtomicU64>,
 }
 
 /// stderr へ JSON Lines を書き出す recorder（`REPAIR-9`・`TASK-10.3`）。
@@ -548,22 +553,35 @@ impl<W: Write + Send + 'static> JsonLinesRecorder<W> {
         Self::with_capacity(writer, DEFAULT_JSON_LINES_QUEUE_CAPACITY)
     }
 
-    /// キュー容量 `capacity` 件（0 は 1 件に切り上げ）で recorder を作る。
+    /// キュー容量 `capacity` 件で recorder を作る。0 は 1 件へ切り上げ、
+    /// [`MAX_JSON_LINES_QUEUE_CAPACITY`] 超過は同値へ切り詰める（巨大値による
+    /// 確保失敗・panic を防ぐ）。
     pub fn with_capacity(writer: W, capacity: usize) -> Self {
-        let (tx, rx) = sync_channel::<String>(capacity.max(1));
+        let capacity = capacity.clamp(1, MAX_JSON_LINES_QUEUE_CAPACITY);
+        let (tx, rx) = sync_channel::<String>(capacity);
         let write_failures = Arc::new(AtomicU64::new(0));
         let failures = Arc::clone(&write_failures);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let worker_dropped = Arc::clone(&dropped);
         let worker = std::thread::Builder::new()
             .name("fandhe-jsonl-recorder".to_owned())
             .spawn(move || {
                 let mut writer = writer;
+                // 書き込み失敗後は行境界が壊れている可能性があるため、以後は出力を
+                // 止めて全レコードを `dropped` に数える（1 レコード 1 行の維持）。
+                let mut broken = false;
                 // 送信側が全て閉じ、キューを掃き終えたら終了する。
                 while let Ok(line) = rx.recv() {
+                    if broken {
+                        worker_dropped.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     let result = writer
                         .write_all(line.as_bytes())
                         .and_then(|()| writer.flush());
                     if result.is_err() {
                         failures.fetch_add(1, Ordering::Relaxed);
+                        broken = true;
                     }
                 }
                 writer
@@ -573,7 +591,7 @@ impl<W: Write + Send + 'static> JsonLinesRecorder<W> {
             tx,
             worker,
             write_failures,
-            dropped: AtomicU64::new(0),
+            dropped,
         }
     }
 
@@ -582,7 +600,7 @@ impl<W: Write + Send + 'static> JsonLinesRecorder<W> {
         self.write_failures.load(Ordering::Relaxed)
     }
 
-    /// キュー満杯（または writer スレッド不在）で捨てたレコード数。
+    /// キュー満杯・writer スレッド不在・書き込み失敗後の停止で捨てたレコード数。
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -991,9 +1009,57 @@ mod tests {
         let r = JsonLinesRecorder::new(FailWrite);
         r.record(&ok);
         r.record(&ok);
-        wait_until(|| r.write_failures() == 2);
-        assert_eq!(r.write_failures(), 2);
-        assert_eq!(r.dropped(), 0);
+        // 1 件目の失敗後は出力を止め、2 件目は dropped に数える。
+        wait_until(|| r.write_failures() == 1 && r.dropped() == 1);
+        assert_eq!(r.write_failures(), 1);
+        assert_eq!(r.dropped(), 1);
+    }
+
+    /// `REPAIR-9`: 巨大な capacity でも panic せず上限へ切り詰められる。
+    #[test]
+    fn repair_9_json_lines_recorder_clamps_huge_capacity() {
+        let (ok, _) = fixed_records();
+        let buf = SharedBuf::default();
+        let r = JsonLinesRecorder::with_capacity(buf.clone(), usize::MAX);
+        r.record(&ok);
+        drop(r.into_inner().expect("writer"));
+        assert_eq!(buf_text(&buf).lines().count(), 1);
+    }
+
+    /// 行の途中まで書いて失敗する writer。
+    struct PartialThenFail {
+        buf: SharedBuf,
+        failed: bool,
+    }
+
+    impl Write for PartialThenFail {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            if self.failed {
+                return self.buf.write(data);
+            }
+            self.failed = true;
+            self.buf.write(&data[..data.len().min(5)])?;
+            Err(io::Error::other("partial"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `REPAIR-9`: 部分書き込み失敗後は出力を止め、次レコードを同一行へ連結しない。
+    #[test]
+    fn repair_9_json_lines_recorder_stops_after_partial_write() {
+        let (ok, _) = fixed_records();
+        let buf = SharedBuf::default();
+        let r = JsonLinesRecorder::new(PartialThenFail {
+            buf: buf.clone(),
+            failed: false,
+        });
+        r.record(&ok);
+        r.record(&ok);
+        wait_until(|| r.write_failures() == 1 && r.dropped() == 1);
+        drop(r.into_inner());
+        assert_eq!(buf_text(&buf).len(), 5);
     }
 
     /// `REPAIR-9`: flush のみ失敗しても失敗として数える。
