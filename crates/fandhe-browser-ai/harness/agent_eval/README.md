@@ -104,3 +104,19 @@ cargo test -p fandhe-browser-ai --test agent_eval_score
 # 実回答を採点して結果を stdout へ出す（results.json は AGENT_EVAL_WRITE=1 併用時のみ書く）
 AGENT_EVAL_ANSWERS=/abs/path/answers.json cargo test -p fandhe-browser-ai --test agent_eval_score -- --nocapture aisnap8_score_real_answers_if_requested
 ```
+
+## 生 DOM 入力（TASK-22.1）
+
+簡約方式との比較相手（`AISNAP-9`・Issue #124・`MS-2`）として、Snapshot を通さない「生 DOM 直渡し」の入力を `generate_reduced.rs` で生成する。
+
+| API | 役割 |
+| --- | ---- |
+| `generate_raw_dom_page` / `generate_raw_dom_all` | 1 ページ / 全 13 ページ（`task_pages()` の順）の生 DOM を返す |
+| `task_inputs(fixtures_dir, InputMode)` | 25 タスクそれぞれへ `Reduced` または `RawDom` の入力を組み立てる（`TASKS` と同順） |
+| `write_raw_dom_inputs(fixtures_dir, out_dir)` | 呼び出し側が指定したディレクトリ直下へ `<page>.html` を書き出す |
+
+- 生 DOM は `AISNAP-15` の分母 `serialize_raw_dom`（`benches/token_reduction/raw_dom.rs`）と同一定義。`script`・`style`・`noscript`・`svg`・`link`・`meta` を除去した `body` の outerHTML 相当で、成形・要約はしない。
+- 暫定（REPAIR-3）: jsdom の outerHTML とは完全一致せず、`<template>` の中身は含まない。
+- 回答形式の提示文は持たない（#125・TASK-22.2 の指示テンプレートの責務）。golden 情報は入力に含めない。
+- 検証 `aisnap9_golden_locators_survive_raw_dom_roundtrip`: 生 DOM を再パースしても、全 golden ロケータ `{selector, index}` が原本と同じ要素（local name・属性・正規化テキスト）を指す。生 DOM 方式の回答を golden で採点できる前提の確認。
+- 生成物はコミットしない。置き場所と `{selector, index}` 回答の採点は #805（TASK-22.1b）で決める。

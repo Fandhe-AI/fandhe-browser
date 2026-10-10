@@ -10,6 +10,9 @@
 #[path = "generate_reduced.rs"]
 mod generate_reduced;
 #[allow(dead_code)]
+#[path = "../../benches/token_reduction/raw_dom.rs"]
+mod raw_dom;
+#[allow(dead_code)]
 #[path = "../../benches/token_reduction/retention_check.rs"]
 mod retention_check;
 #[allow(dead_code)]
@@ -19,9 +22,13 @@ mod snapshot_text;
 #[path = "tasks.rs"]
 mod tasks;
 
+use fandhe_browser_core::dom::{Document, NodeId};
+use fandhe_browser_core::parse::{ParseOptions, parse_document};
+use fandhe_browser_core::query::query_selector_all_str;
 use generate_reduced::{
-    generate_all, generate_page, golden_locators, render_golden_refs_json, resolve_golden,
-    task_pages,
+    InputMode, generate_all, generate_page, generate_raw_dom_all, generate_raw_dom_page,
+    golden_locators, render_golden_refs_json, resolve_golden, task_inputs, task_pages,
+    write_raw_dom_inputs,
 };
 use std::path::PathBuf;
 use tasks::{GOLDEN, TASKS};
@@ -226,4 +233,165 @@ fn aisnap8_reduced_text_keeps_values_needed_by_tasks() {
             .any(|l| l.contains("\"Option 1\"") && l.contains("value=\"1\"")),
         "form-02 option missing: {dd}"
     );
+}
+// ---- TASK-22.1（`AISNAP-9`・Issue #124）: 生 DOM 直渡し方式の入力 ----
+
+#[test]
+fn aisnap9_raw_dom_input_for_every_task() {
+    let inputs = task_inputs(&fixtures(), InputMode::RawDom).expect("inputs");
+    assert_eq!(inputs.len(), 25);
+    for (i, t) in inputs.iter().zip(TASKS.iter()) {
+        assert_eq!(i.id, t.id);
+        assert_eq!(i.page, t.page);
+        assert_eq!(i.prompt, t.prompt);
+        assert_eq!(i.mode, InputMode::RawDom);
+        assert!(
+            i.input.starts_with("<body"),
+            "{}: not a body outerHTML",
+            i.id
+        );
+    }
+    let reduced = task_inputs(&fixtures(), InputMode::Reduced).expect("reduced");
+    assert_eq!(reduced.len(), 25);
+    assert!(reduced.iter().all(|i| i.input.starts_with("- document")));
+}
+
+#[test]
+fn aisnap9_raw_dom_pages_cover_task_pages() {
+    let pages = generate_raw_dom_all(&fixtures()).expect("raw");
+    let names: Vec<&str> = pages.iter().map(|p| p.page.as_str()).collect();
+    assert_eq!(names.len(), 13);
+    assert_eq!(names, task_pages());
+}
+
+#[test]
+fn aisnap9_raw_dom_excludes_removed_tags() {
+    let mut original_has_script_or_style = false;
+    for page in task_pages() {
+        let raw = generate_raw_dom_page(&fixtures(), page).expect("raw");
+        let lower = raw.html.to_ascii_lowercase();
+        for tag in ["<script", "<style", "<noscript", "<svg", "<link", "<meta"] {
+            assert!(!lower.contains(tag), "{page}: {tag} must be removed");
+        }
+        let src = std::fs::read_to_string(fixtures().join(format!("{page}.html"))).expect("read");
+        let src = src.to_ascii_lowercase();
+        if src.contains("<script") || src.contains("<style") {
+            original_has_script_or_style = true;
+        }
+    }
+    assert!(
+        original_has_script_or_style,
+        "removal must actually be exercised"
+    );
+}
+
+#[test]
+fn aisnap9_raw_dom_is_deterministic_and_lf() {
+    let a = generate_raw_dom_all(&fixtures()).expect("a");
+    let b = generate_raw_dom_all(&fixtures()).expect("b");
+    assert_eq!(a, b);
+    for p in &a {
+        assert!(!p.html.contains('\r'), "{}: must be LF only", p.page);
+    }
+}
+
+#[test]
+fn aisnap9_raw_dom_matches_serializer() {
+    for page in task_pages() {
+        let src = std::fs::read_to_string(fixtures().join(format!("{page}.html"))).expect("read");
+        let doc = parse_document(&src, &ParseOptions::default())
+            .expect("parse")
+            .document;
+        let expected = raw_dom::serialize_raw_dom(&doc);
+        let actual = generate_raw_dom_page(&fixtures(), page).expect("raw").html;
+        assert_eq!(actual, expected, "{page}");
+    }
+}
+
+fn normalized_text(doc: &Document, id: NodeId) -> String {
+    doc.text_content(id)
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn attr_list(doc: &Document, id: NodeId) -> Vec<(String, String)> {
+    doc.attributes(id)
+        .iter()
+        .map(|a| (a.name.local.to_string(), a.value.to_string()))
+        .collect()
+}
+
+/// 回答者は生 DOM 文字列からロケータを答え、golden は原本 DOM で定義される。
+/// 両者で同じ `{selector, index}` が同じ要素を指すこと（生 DOM 方式の回答が採点可能であることの裏付け）。
+#[test]
+fn aisnap9_golden_locators_survive_raw_dom_roundtrip() {
+    let mut checked = 0;
+    for t in &TASKS {
+        let src =
+            std::fs::read_to_string(fixtures().join(format!("{}.html", t.page))).expect("read");
+        let orig = parse_document(&src, &ParseOptions::default())
+            .expect("parse")
+            .document;
+        let raw = generate_raw_dom_page(&fixtures(), t.page)
+            .expect("raw")
+            .html;
+        let re = parse_document(&raw, &ParseOptions::default())
+            .expect("reparse")
+            .document;
+        let g = GOLDEN
+            .iter()
+            .find(|(id, _)| *id == t.id)
+            .map(|(_, g)| g)
+            .expect("golden");
+        for l in golden_locators(g) {
+            let o = query_selector_all_str(&orig, orig.root(), l.selector).expect("orig query");
+            let r = query_selector_all_str(&re, re.root(), l.selector).expect("re query");
+            let on = *o.get(l.index).expect("orig locator in range");
+            let rn = *r
+                .get(l.index)
+                .unwrap_or_else(|| panic!("{}: raw dom lacks {} [{}]", t.id, l.selector, l.index));
+            assert_eq!(orig.local_name(on), re.local_name(rn), "{}", t.id);
+            assert_eq!(attr_list(&orig, on), attr_list(&re, rn), "{}", t.id);
+            assert_eq!(
+                normalized_text(&orig, on),
+                normalized_text(&re, rn),
+                "{}",
+                t.id
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 25, "checked {checked}");
+}
+
+/// 生 DOM は性質上 golden の値（価格等）を本文に含むが、それは設計どおりで漏えいではない。
+/// ここでは golden / golden-refs のメタデータ（JSON キー）が入力へ混入しないことだけを固定する。
+#[test]
+fn aisnap9_raw_dom_input_has_no_golden_metadata() {
+    for i in task_inputs(&fixtures(), InputMode::RawDom).expect("inputs") {
+        assert!(!i.input.contains("\"refs\""), "{}", i.id);
+        assert!(!i.input.contains("\"selector\""), "{}", i.id);
+    }
+}
+
+#[test]
+fn aisnap9_write_raw_dom_inputs_writes_under_out_dir() {
+    let out = std::env::temp_dir().join(format!("fandhe-aisnap9-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    let paths = write_raw_dom_inputs(&fixtures(), &out).expect("write");
+    let pages = generate_raw_dom_all(&fixtures()).expect("raw");
+    assert_eq!(paths.len(), 13);
+    for (path, p) in paths.iter().zip(pages.iter()) {
+        assert_eq!(path.parent(), Some(out.as_path()));
+        let expected_name = format!("{}.html", p.page);
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some(expected_name.as_str())
+        );
+        assert_eq!(std::fs::read_to_string(path).expect("read"), p.html);
+    }
+    assert_eq!(std::fs::read_dir(&out).expect("dir").count(), 13);
+    std::fs::remove_dir_all(&out).expect("cleanup");
 }

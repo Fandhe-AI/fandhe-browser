@@ -9,6 +9,9 @@
 #[path = "generate_reduced.rs"]
 mod generate_reduced;
 #[allow(dead_code)]
+#[path = "../../benches/token_reduction/raw_dom.rs"]
+mod raw_dom;
+#[allow(dead_code)]
 #[path = "../../benches/token_reduction/retention_check.rs"]
 mod retention_check;
 #[allow(dead_code)]
