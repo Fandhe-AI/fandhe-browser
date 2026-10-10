@@ -1035,6 +1035,14 @@ impl DomBridge {
         let limits = &state.limits;
         let page = state.page.as_mut().ok_or(DomBridgeError::Detached)?;
 
+        // リスナー上限超過の通知は操作予算の対象外にする（`JS-6`）。ページが予算を使い切った後に
+        // 上限を超えて登録しても、フラグが立たず打ち切りを逃れることを防ぐ。冪等なフラグ設定のみで
+        // 副作用が無く、アロケーションも伴わないため、予算外でも DoS 経路にならない。
+        if matches!(args, [JsValue::String(name)] if name == "lifecycleListenerLimit") {
+            page.diagnostics.listener_limit_exceeded = true;
+            return Ok(JsValue::Undefined);
+        }
+
         // 検証より前に数える（shim を迂回した不正呼び出しの連打も対象）。
         if page.op_limit_tripped || page.op_count >= limits.max_ops_per_page {
             page.op_limit_tripped = true;
@@ -1746,6 +1754,15 @@ mod tests {
             b.take_diagnostics().expect("empty"),
             BridgeDiagnostics::default()
         );
+    }
+
+    #[test]
+    fn js_6_lifecycle_listener_limit_op_is_exempt_from_op_budget() {
+        let b = bridge_with(DomBridgeLimits::default().with_max_ops_per_page(1));
+        call(&b, &[s("body")]).expect("budget consumed");
+        call(&b, &[s("body")]).expect_err("over budget");
+        call(&b, &[s("lifecycleListenerLimit")]).expect("exempt");
+        assert!(b.listener_limit_exceeded().expect("flag"));
     }
 
     #[test]

@@ -399,6 +399,21 @@ pub fn run(engine: &str) {
             .all(|l| l.outcome().as_str() == "not_fired")
     );
 
+    eprintln!("case: JS-6 listener limit is recorded even after the op budget is exhausted");
+    let tight = PageRunOptions::default().with_bridge_limits(
+        fandhe_browser_core::DomBridgeLimits::default().with_max_ops_per_page(200),
+    );
+    let html = "<body><script>\
+        for (var j = 0; j < 400; j++) { try { document.body; } catch (e) {} }\
+        for (var i = 0; i < 1100; i++) { document.addEventListener('t' + i, function () {}); }\
+        </script><script>document.body.setAttribute('data-after', '1')</script></body>";
+    let out = run_page(engine, html, &tight);
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::ResourceLimit)
+    );
+    assert!(!out.html().contains("data-after=\""), "{}", out.html());
+
     eprintln!("case: JS-6 listener limit inside DOMContentLoaded skips load");
     let html = "<body><script>\
         document.addEventListener('DOMContentLoaded', function () {\
