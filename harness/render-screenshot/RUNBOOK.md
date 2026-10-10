@@ -108,11 +108,11 @@ callback が呼ばれないことと推定されている（Servo 0.3.0 の描�
   （スナップショットは外部 CSS・画像・スクリプトを含まない HTML 本体のみ）。
   この差が SSIM に与える影響は測定時に必ず記録する（5 章の記録テンプレート）。
 - `servo-embed` はプロキシ引数を持たない。ハーネスは `{proxy}` を含まない `--servo-cmd` を
-  既定で拒否するため、実機では `--allow-unproxied-engine` が必要になる見込み。
-  これは「ネットワーク全通信をローカル転送プロキシ越しにフィルタする」安全策を Servo 側で
-  外すことを意味する。スナップショットから参照されるサブリソースを Servo が直接取得し得るため、
-  **この扱い（`--allow-unproxied-engine` の採否、またはプロキシ対応した撮影コマンドの用意）は
-  未決定（オーナー判断待ち）**。
+  既定で拒否するため、Servo 側の撮影は **`--allow-unproxied-engine` を付けて実行する**
+  （オーナー判断 2026-10-10・#55）。
+  これはネットワーク全通信をローカル転送プロキシ越しにフィルタする安全策を Servo 側で外すことを意味する。
+  採用理由は、実機測定が一度きりであること。**対象は `sites.json` の公開サイトのみに限り、
+  認証情報・社内/ローカルのアドレスを含む URL では使わない**。
 
 ## 5. 撮影（`capture_screenshots.py`）
 
@@ -141,7 +141,7 @@ python3 harness/render-screenshot/capture_screenshots.py \
 | `--timeout-sec` | 1 回の撮影のタイムアウト | 90 |
 | `--settle-ms` | 描画の待ち時間 | 5000 |
 | `--min-sites` | 両エンジンで共通して `ok` になるべき最低サイト数 | 5 |
-| `--allow-unproxied-engine` | `{proxy}` 無しのテンプレートを許可（4.3 の判断事項） | 無効 |
+| `--allow-unproxied-engine` | `{proxy}` 無しのテンプレートを許可（4.3 の決定: Servo 側撮影で使用） | 無効 |
 
 終了コードは、両エンジンで共通して `ok` のサイト数が `--min-sites` 以上なら 0、未満なら 1、
 引数不正なら 2。`capture-result.json` の `captures[].status`（`ok` / `failed` / `timeout` /
