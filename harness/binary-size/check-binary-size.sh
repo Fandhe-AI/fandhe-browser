@@ -3,7 +3,7 @@
 # feature 無効（既定）でリリースビルドしたバイナリのサイズが RENDER-2（基準は
 # CORE-2 と同じ「Chromium 比 80% 以上削減」）の水準を保っているか検査する
 # （TASK-34.2・Issue #466）。呼び出し元は Makefile の check-binary-size ターゲット、
-# および `.github/workflows/ci.yml` の `binary-size` ジョブ（TASK-34.3・#467）。
+# および `.github/workflows/ci.yml` の `harness-*` ジョブの `[binary-size]` ステップ（TASK-34.3・#467）。
 # 上限値の根拠・出力形式の契約・終了コードは同じディレクトリの README.md を参照。
 #
 # 依存は bash + cargo + jq + rustc + coreutils のみ（新規 Cargo 依存を避けるため。
