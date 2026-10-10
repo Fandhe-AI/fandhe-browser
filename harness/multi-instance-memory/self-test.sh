@@ -46,6 +46,10 @@ for bad in 0 0.0 -1 nan inf abc 1e3; do
   expect_usage_error "poc1 chromium '$bad'" --poc1-chromium-kib "$bad" --poc1-fandhe-kib 100
 done
 expect_usage_error "poc1 single value" --poc1-chromium-kib 100
+for bad in "" ","; do
+  expect_usage_error "conditions '$bad'" --conditions "$bad"
+done
+ok "--conditions rejects an empty list (exit 2; never an empty results with exit 0)"
 ok "PoC-1 baseline validation (0, 0.0, -1, nan, inf, non-number, single -> exit 2)"
 for bad in file:///etc/hostname http://127.0.0.1:18080/ http://localhost/ http://10.0.0.1/ \
   http://192.168.1.1/ http://172.16.0.1/ "http://[::1]/" ftp://example.com/; do
@@ -56,13 +60,17 @@ ok "--url rejects file:, loopback, private and IPv6-literal hosts (SSRF guard pa
 # URL の JSON エスケープ: " \ 制御文字を JSON 規則でエスケープし、元の URL を復元できる
 EVIL_URL='https://example.com/a"b\c?q=x'
 printf '#!/bin/sh\nexec sleep 300\n' >"$TMP/sleeper"; chmod +x "$TMP/sleeper"
+st=0
 OUT="$("$MEASURE" -n 1 --fandhe-bin "$TMP/sleeper" --skip-chromium --conditions idle --settle 0 --net-mode host \
-  --no-ready-check --url "$EVIL_URL" 2>/dev/null)" || true
-if command -v jq >/dev/null 2>&1 && [ -n "$OUT" ]; then
+  --no-ready-check --url "$EVIL_URL" 2>/dev/null)" || st=$?
+if ! command -v jq >/dev/null 2>&1; then
+  # 環境要因の未検証（skip）。計測側の失敗とは区別する
+  echo "note: jq not found; URL JSON round-trip NOT verified (skip)"
+else
+  [ "$st" -eq 0 ] || fail "measure.sh must exit 0 for the URL round-trip run (got $st)"
+  [ -n "$OUT" ] || fail "measure.sh produced empty output for the URL round-trip run"
   [ "$(jq -r .url <<<"$OUT")" = "$EVIL_URL" ] || fail "url must round-trip through JSON escaping"
   ok "URL with quote and backslash round-trips through JSON"
-else
-  echo "note: jq or output missing; URL JSON round-trip NOT verified"
 fi
 
 # navigate.mjs: result.errorText があれば非 0 終了、無ければ 0（WebSocket・fetch を差し替えて検証）

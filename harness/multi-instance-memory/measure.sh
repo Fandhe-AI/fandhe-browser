@@ -119,6 +119,8 @@ if [ "$SKIP_CHROMIUM" -eq 0 ]; then
     || die "--chromium-bin must be an executable file (or pass --skip-chromium)"
 fi
 IFS=',' read -r -a COND_LIST <<<"$CONDITIONS"
+# 空（--conditions ""）だと検証・計測ループを素通りして空の results を成功扱いで出すため、1 条件以上を必須にする
+[ "${#COND_LIST[@]}" -ge 1 ] || die "--conditions must list at least one condition (idle, loaded)"
 for c in "${COND_LIST[@]}"; do
   case "$c" in idle) ;; loaded) [ -n "$URL" ] || die "--url is required for the loaded condition" ;;
     *) die "unknown condition: $c" ;; esac
