@@ -257,8 +257,8 @@ cdp の `String` 戻りは非公開の `protocol` モジュールの `to_json` �
 
 - 現状: 削除結果（削除したエントリ数など）を返さない。`ProfileError::InvalidLayout` / `Unsupported` の `reason` は `&'static str`
 - 改修案: `DeleteReport`（`#[non_exhaustive]`）を返す。`reason` を `#[non_exhaustive]` の enum にする
-- 現状維持の理由案: 削除は「成功か拒否か」が本質で、失敗時は何も削除しない（fail-closed）。`reason` は診断用で、分岐に使わせない設計
-- 判断: **現状維持**（TASK-47 の設計時に判断）。削除は fail-closed（成功か拒否か）で、本番呼び出し元 0（テストのみ）。`reason` は診断用固定英語文言で、`InvalidComponent` は untrusted 入力を保持しない設計（`profile.rs` の `ProfileError` doc）。`reason` の enum 化はフィールド型の変更で破壊的、かつ構築箇所が多い（`profile.rs` 59・`store.rs` 29 ほか）。CLI（TASK-47）の終了コード・機械可読エラーで分岐が必要になった時点で、`ManifestError::code()`（`plugin_api.rs:287`）と同型の `ProfileError::code() -> &'static str` を非破壊追加する。影響範囲: 本番 0・テストのみ
+- 現状維持の理由案: 既知の失敗要因（深さ・マウント・権限）は削除前の検証で拒否し、通常運用では何も削除しないまま失敗する。ただし検証後の競合・I/O 障害では一部削除後にエラーになり得る（`profile.rs` の `Profile::delete` doc「部分削除の契約」）。`reason` は診断用で、分岐に使わせない設計
+- 判断: **現状維持**（TASK-47 の設計時に判断）。削除の成否は「成功かエラーか」で、部分削除は呼び出し元が `Profile::open` で開き直して再試行する契約（件数を返しても回復手段は変わらない）。本番呼び出し元 0（テストのみ）。`reason` は診断用固定英語文言で、`InvalidComponent` は untrusted 入力を保持しない設計（`profile.rs` の `ProfileError` doc）。`reason` の enum 化はフィールド型の変更で破壊的、かつ構築箇所が多い（`profile.rs` 59・`store.rs` 29 ほか）。CLI（TASK-47）の終了コード・機械可読エラーで分岐が必要になった時点で、`ManifestError::code()`（`plugin_api.rs:287`）と同型の `ProfileError::code() -> &'static str` を非破壊追加する。影響範囲: 本番 0・テストのみ
 
 ## 候補一覧と判断
 
