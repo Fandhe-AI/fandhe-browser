@@ -9,6 +9,11 @@
 //! `#[path]` で取り込む。本ファイルは `crate::tasks`・`crate::snapshot_text`・`crate::retention_check`
 //! を参照するため、取り込み側のルートが同名の mod を宣言していること。
 //!
+//! TASK-22.1（`AISNAP-9`・Issue #124・`MS-2`）: 比較相手の「生 DOM 直渡し」入力もここで生成する
+//! （`generate_raw_dom_page` / `task_inputs`）。Snapshot は通さず、`AISNAP-15` の分母と同じ
+//! `serialize_raw_dom` を使うため、取り込み側のルートは `crate::raw_dom` も宣言すること。
+//! 生 DOM 方式の回答（`{selector, index}`）の採点は #805（TASK-22.1b）の担当で、本ファイルは扱わない。
+//!
 //! 暫定（REPAIR-3）: 簡約表現の形式は `snapshot_text` の暫定行形式であり、`AISNAP-8` が前提とする
 //! `GET /ai/snapshot` の確定応答ではない。TASK-19・`AISNAP-6` の確定後に `snapshot_text` 側を
 //! 差し替えれば本ハーネスも追従する。ref 解決は DOM からの再計算で、先行要素が省略されると
@@ -18,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::raw_dom::serialize_raw_dom;
 use crate::retention_check::{FlatEntry, flatten, parse_ref, target_refs};
 use crate::snapshot_text::render_snapshot;
 use crate::tasks::{GOLDEN, Golden, Locator, TASKS, json_str};
@@ -31,6 +37,11 @@ use fandhe_browser_core::query::query_selector_all_str;
 #[derive(Debug)]
 pub enum GenerateError {
     Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// 出力先ディレクトリ作成・ファイル書き込みの失敗（`Io` は読み取り失敗専用）。
+    Write {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -59,6 +70,7 @@ impl fmt::Display for GenerateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { path, source } => write!(f, "cannot read {}: {source}", path.display()),
+            Self::Write { path, source } => write!(f, "cannot write {}: {source}", path.display()),
             Self::Parse { page, message } => write!(f, "parse failed for {page}: {message}"),
             Self::Snapshot { page, message } => write!(f, "snapshot failed for {page}: {message}"),
             Self::Selector {
@@ -326,4 +338,106 @@ pub fn render_golden_refs_json(tasks: &[ResolvedTask]) -> String {
         })
         .collect();
     format!("[\n{}\n]\n", items.join(",\n"))
+}
+
+/// エージェントへ渡す入力の方式（`AISNAP-9`・TASK-22.1）。比較実験の 2 方式を表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    /// 簡約表現（方式 B。`generate_page` の text）。
+    Reduced,
+    /// 生 DOM 直渡し（`serialize_raw_dom` の出力。Snapshot を通さない）。
+    RawDom,
+}
+
+/// 1 ページ分の生 DOM 入力（`AISNAP-9`・TASK-22.1）。
+///
+/// `html` は `serialize_raw_dom` の出力そのもの（`script`・`style`・`noscript`・`svg`・`link`・`meta`
+/// を除去した `body` の outerHTML 相当。成形・要約はしない）。暫定（REPAIR-3）: jsdom の outerHTML と
+/// は完全一致せず、`<template>` の中身は含まない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawDomPage {
+    pub page: String,
+    pub html: String,
+}
+
+/// 1 ページの生 DOM 入力を生成する（`AISNAP-9`・TASK-22.1）。`AISNAP-15` の分母と同一定義。
+pub fn generate_raw_dom_page(fixtures_dir: &Path, page: &str) -> Result<RawDomPage, GenerateError> {
+    let doc = load(fixtures_dir, page)?;
+    Ok(RawDomPage {
+        page: page.to_owned(),
+        html: serialize_raw_dom(&doc),
+    })
+}
+
+/// 全タスク対象ページの生 DOM 入力を `task_pages()` の順で生成する（`AISNAP-9`）。
+pub fn generate_raw_dom_all(fixtures_dir: &Path) -> Result<Vec<RawDomPage>, GenerateError> {
+    task_pages()
+        .into_iter()
+        .map(|p| generate_raw_dom_page(fixtures_dir, p))
+        .collect()
+}
+
+/// 1 タスク分のエージェント入力（`AISNAP-9`・TASK-22.1）。
+///
+/// golden・`golden-refs` の情報は含めない。回答形式（ref かロケータか）の提示文は持たず、
+/// #125（TASK-22.2）の指示テンプレートの責務とする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskInput {
+    pub id: &'static str,
+    pub category: crate::tasks::Category,
+    pub page: &'static str,
+    pub prompt: &'static str,
+    pub mode: InputMode,
+    /// `mode` に応じた入力本文（簡約表現 text または生 DOM html）。
+    pub input: String,
+}
+
+/// 25 タスクそれぞれへ `mode` の入力を組み立てる（`TASKS` と同順。`AISNAP-9`・TASK-22.1）。
+///
+/// 呼び出し元: #125（TASK-22.2）の回答収集。ページ単位で 1 回だけ生成して再利用する。
+pub fn task_inputs(fixtures_dir: &Path, mode: InputMode) -> Result<Vec<TaskInput>, GenerateError> {
+    let mut cache: BTreeMap<&str, String> = BTreeMap::new();
+    let mut out = Vec::with_capacity(TASKS.len());
+    for t in &TASKS {
+        if !cache.contains_key(t.page) {
+            let text = match mode {
+                InputMode::Reduced => generate_page(fixtures_dir, t.page)?.text,
+                InputMode::RawDom => generate_raw_dom_page(fixtures_dir, t.page)?.html,
+            };
+            cache.insert(t.page, text);
+        }
+        out.push(TaskInput {
+            id: t.id,
+            category: t.category,
+            page: t.page,
+            prompt: t.prompt,
+            mode,
+            input: cache.get(t.page).cloned().unwrap_or_default(),
+        });
+    }
+    Ok(out)
+}
+
+/// 生 DOM 入力を `out_dir` 直下に `<page>.html` として書き出し、書いたパスを返す
+/// （`AISNAP-9`・TASK-22.1）。置き場所は呼び出し側が決める（リポ内の保管方針は #805）。
+///
+/// ページ名は `task_pages()` 由来（英小文字・数字・`-` のみ）で、パスは `Path::join` で組み立てる。
+pub fn write_raw_dom_inputs(
+    fixtures_dir: &Path,
+    out_dir: &Path,
+) -> Result<Vec<PathBuf>, GenerateError> {
+    std::fs::create_dir_all(out_dir).map_err(|source| GenerateError::Write {
+        path: out_dir.to_path_buf(),
+        source,
+    })?;
+    let mut paths = Vec::new();
+    for p in generate_raw_dom_all(fixtures_dir)? {
+        let path = out_dir.join(format!("{}.html", p.page));
+        std::fs::write(&path, p.html.as_bytes()).map_err(|source| GenerateError::Write {
+            path: path.clone(),
+            source,
+        })?;
+        paths.push(path);
+    }
+    Ok(paths)
 }
