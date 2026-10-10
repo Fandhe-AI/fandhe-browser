@@ -37,8 +37,11 @@ classify() {
     [ -n "$path" ] || continue
     seen=true
     case "$path" in
+      # docs/design/ はテスト・ビルドが include_str! / read_to_string で読む（host-api.schema.json・
+      # mcp-token-reduction-report.md 等）ため、*.md・docs/* より前で rust 扱いにする
       crates/* | Cargo.* | .github/* | scripts/* | Makefile | deny.toml | \
-        rust-toolchain.toml | profiles/* | benches/* | tests/* | Dockerfile | compose.yaml)
+        rust-toolchain.toml | profiles/* | benches/* | tests/* | Dockerfile | compose.yaml | \
+        docs/design/*)
         rust=true
         ;;
       harness/*)
@@ -73,7 +76,9 @@ self_test() {
       fail=1
     fi
   }
-  expect "docs-only" "rust=false harness=false" $'README.md\ndocs/design/a.md\ndocs/spec'
+  expect "docs-only" "rust=false harness=false" $'README.md\ndocs/setup/windows.md\ndocs/spec'
+  expect "docs/design の json は rust" "rust=true harness=false" $'docs/design/host-api.schema.json'
+  expect "docs/design の md も rust" "rust=true harness=false" $'docs/design/x.md'
   expect "docs-only(allowlist 全種)" "rust=false harness=false" \
     $'CLAUDE.md\n.claude/rules/ci.md\n.agents/skills/a/SKILL.md\nLICENSE-MIT\nNOTICE\nLICENSE-THIRD-PARTY.md\nskills-lock.json\n.markdownlint.jsonc\n.yamllint\n.editorconfig-checker.json\ncommitlint.config.mjs\nlefthook.yml'
   expect "md 任意階層" "rust=false harness=false" $'a/b/c/d.md'
