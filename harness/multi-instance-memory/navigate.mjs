@@ -6,7 +6,11 @@
 // 結果に errorText が含まれる場合（SSRF ガードによる拒否・名前解決失敗等。本番の Page.navigate は
 // 失敗を result.errorText で返す）は非 0 で終了する。loaded 状態の偽装を防ぐ。
 // Chromium 向けには第 3 引数 --page-target を付ける。browser WebSocket では Page.navigate が使えないため、
-// /json/list の page ターゲットへ接続して Page.enable 後に遷移し、Page.loadEventFired まで待つ（失敗時は非 0）。
+// /json/list の page ターゲットへ接続して Page.enable・Page.setLifecycleEventsEnabled 後に遷移し、
+// Page.navigate 応答の loaderId と一致する Page.lifecycleEvent（name=="load"）まで待つ（失敗時は非 0）。
+// 直前の about:blank の遅延 load や別ドキュメントの load で解決しないよう、loaderId で照合する。
+// fandhe 側（--page-target なし）はイベントを待たない。cdp の Page.navigate は確定後に応答を返し
+// （page.rs。TASK-42.3）、lifecycleEvent 未対応のため loaderId 照合に依存させない。
 const [endpoint, url, modeArg] = process.argv.slice(2);
 const pageTarget = modeArg === "--page-target";
 if (!endpoint || !url || (modeArg !== undefined && !pageTarget)) {
@@ -65,18 +69,32 @@ try {
 
 let nextId = 1;
 const pending = new Map();
-const eventWaiters = new Map();
-function waitEvent(method) {
+// 受信イベントは全件バッファし、Page.navigate の応答より先に届いた load も取りこぼさない
+const LOAD_TIMEOUT_MS = Number(process.env.NAVIGATE_LOAD_TIMEOUT_MS) || 60000;
+const events = [];
+const eventListeners = new Set();
+function waitEvent(label, pred) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => (eventWaiters.delete(method), reject(new Error(`${method}: timeout`))), 60000);
-    eventWaiters.set(method, (params) => (clearTimeout(timer), resolve(params)));
+    const hit = events.find(pred);
+    if (hit) return resolve(hit);
+    const check = () => {
+      const found = events.find(pred);
+      if (found) (clearTimeout(timer), eventListeners.delete(check), resolve(found));
+    };
+    const timer = setTimeout(() => (eventListeners.delete(check), reject(new Error(`${label}: timeout`))), LOAD_TIMEOUT_MS);
+    eventListeners.add(check);
   });
 }
 ws.onmessage = (ev) => {
-  const msg = JSON.parse(String(ev.data));
+  let msg;
+  try {
+    msg = JSON.parse(String(ev.data));
+  } catch {
+    return; // 解釈できないフレームは無視する（応答待ちは各 send のタイムアウトで失敗する）
+  }
   if (msg.method) {
-    const w = eventWaiters.get(msg.method);
-    if (w) (eventWaiters.delete(msg.method), w(msg.params ?? {}));
+    events.push({ method: msg.method, params: msg.params ?? {} });
+    for (const l of [...eventListeners]) l();
     return;
   }
   const p = pending.get(msg.id);
@@ -102,11 +120,9 @@ function send(method, params = {}, sessionId) {
 try {
   // 現行の fandhe-browser は Target.createTarget が未実装（method not implemented）のため、
   // browser WebSocket 上で Page.navigate を直接送る。Target.* が実装されたら本手順を見直す。
-  let loaded;
   if (pageTarget) {
     await send("Page.enable");
-    loaded = waitEvent("Page.loadEventFired");
-    loaded.catch(() => {}); // 先に失敗した場合の未処理 rejection を防ぐ（後段で await する）
+    await send("Page.setLifecycleEventsEnabled", { enabled: true });
   }
   const nav = await send("Page.navigate", { url });
   if (typeof nav.errorText === "string" && nav.errorText !== "") {
@@ -114,7 +130,22 @@ try {
     ws.close();
     process.exit(1);
   }
-  if (loaded) await loaded;
+  if (pageTarget) {
+    // 遷移先ドキュメントの loaderId が無い（同一ドキュメント遷移等）と完了を特定できないため失敗扱い
+    if (typeof nav.loaderId !== "string" || nav.loaderId === "") {
+      console.error("error: Page.navigate returned no loaderId; cannot identify the load event");
+      ws.close();
+      process.exit(1);
+    }
+    await waitEvent(
+      "Page.lifecycleEvent(load)",
+      (e) =>
+        e.method === "Page.lifecycleEvent" &&
+        e.params.name === "load" &&
+        e.params.loaderId === nav.loaderId &&
+        (typeof nav.frameId !== "string" || e.params.frameId === nav.frameId),
+    );
+  }
   console.log(JSON.stringify({ ok: true, nav }));
   ws.close();
 } catch (e) {

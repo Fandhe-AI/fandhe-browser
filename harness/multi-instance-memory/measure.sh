@@ -73,24 +73,29 @@ USAGE
 die() { echo "error: $*" >&2; exit 2; }
 log() { echo "[multi-instance-memory] $*" >&2; }
 
+# 127.0.0.1:PORT に待ち受け中のプロセスがあるか（呼び出し元の network namespace で判定）
+port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+# 値を取る全オプションは値の有無を先に確認する（無いまま shift 2 すると set -e で終了コード 1 になるため）
+need_value() { [ "$#" -ge 2 ] || die "option '$1' requires a value"; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    -n|--instances) N="${2:-}"; shift 2 ;;
-    --fandhe-bin) FANDHE_BIN="${2:-}"; shift 2 ;;
-    --chromium-bin) CHROMIUM_BIN="${2:-}"; shift 2 ;;
-    --chromium-extra-args) CHROMIUM_EXTRA="${2:-}"; shift 2 ;;
+    -n|--instances) need_value "$@"; N="$2"; shift 2 ;;
+    --fandhe-bin) need_value "$@"; FANDHE_BIN="$2"; shift 2 ;;
+    --chromium-bin) need_value "$@"; CHROMIUM_BIN="$2"; shift 2 ;;
+    --chromium-extra-args) need_value "$@"; CHROMIUM_EXTRA="$2"; shift 2 ;;
     --skip-chromium) SKIP_CHROMIUM=1; shift ;;
     --skip-fandhe) SKIP_FANDHE=1; shift ;;
-    --url) URL="${2:-}"; shift 2 ;;
-    --conditions) CONDITIONS="${2:-}"; shift 2 ;;
-    --settle) SETTLE="${2:-}"; shift 2 ;;
-    --dns) EGRESS_DNS="${2:-}"; shift 2 ;;
-    --net-mode) NET_MODE="${2:-}"; shift 2 ;;
-    --poc1-chromium-kib) POC1_CHROMIUM_KIB="${2:-}"; shift 2 ;;
-    --poc1-fandhe-kib) POC1_FANDHE_KIB="${2:-}"; shift 2 ;;
+    --url) need_value "$@"; URL="$2"; shift 2 ;;
+    --conditions) need_value "$@"; CONDITIONS="$2"; shift 2 ;;
+    --settle) need_value "$@"; SETTLE="$2"; shift 2 ;;
+    --dns) need_value "$@"; EGRESS_DNS="$2"; shift 2 ;;
+    --net-mode) need_value "$@"; NET_MODE="$2"; shift 2 ;;
+    --poc1-chromium-kib) need_value "$@"; POC1_CHROMIUM_KIB="$2"; shift 2 ;;
+    --poc1-fandhe-kib) need_value "$@"; POC1_FANDHE_KIB="$2"; shift 2 ;;
     --no-ready-check) NO_READY_CHECK=1; shift ;;
     --allow-shared-port) ALLOW_SHARED_PORT=1; shift ;;
-    --out) OUT="${2:-}"; shift 2 ;;
+    --out) need_value "$@"; OUT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown option: $1" ;;
   esac
@@ -99,9 +104,19 @@ done
 # ---- 入力検証（起動前にすべて確定させる） ----
 [ "$(uname -s)" = "Linux" ] && [ -r /proc/self/smaps_rollup ] \
   || die "Linux only: /proc/<pid>/smaps_rollup is required (macOS/Windows are not supported)"
-[[ "$N" =~ ^[0-9]+$ ]] && [ "$N" -ge 1 ] && [ "$N" -le "$MAX_N" ] \
-  || die "--instances must be an integer in 1..$MAX_N (got '$N')"
-[[ "$SETTLE" =~ ^[0-9]+$ ]] || die "--settle must be a non-negative integer"
+# 数値引数は先頭ゼロなしの十進整数のみ受理する（bash 算術・printf %d は先頭 0 を八進数として扱い、
+# 050 が 40、08 が算術エラー、sleep と JSON で値が食い違うため。正規化せず使用エラーにする）
+is_uint() { [[ "$1" =~ ^(0|[1-9][0-9]{0,8})$ ]]; }
+is_uint "$N" && [ "$N" -ge 1 ] && [ "$N" -le "$MAX_N" ] \
+  || die "--instances must be a decimal integer in 1..$MAX_N without leading zeros (got '$N')"
+is_uint "$SETTLE" && [ "$SETTLE" -le 3600 ] \
+  || die "--settle must be a decimal integer in 0..3600 without leading zeros (got '$SETTLE')"
+# 内部の待機上限（自己テスト用の環境変数上書き）も同じ規則で検証する
+if [ -n "${MEASURE_READY_TIMEOUT_SEC:-}" ]; then
+  is_uint "$MEASURE_READY_TIMEOUT_SEC" && [ "$MEASURE_READY_TIMEOUT_SEC" -ge 1 ] \
+    || die "MEASURE_READY_TIMEOUT_SEC must be a positive decimal integer without leading zeros"
+  READY_TIMEOUT="$MEASURE_READY_TIMEOUT_SEC"
+fi
 case "$NET_MODE" in auto|netns|host) ;; *) die "--net-mode must be auto, netns or host" ;; esac
 # PoC-1 の基準値は PSS 専用で、正の有限値のみ受理する（0・負・非数は除算の分母になるため計測前に拒否）
 [ -z "$POC1_CHROMIUM_KIB" ] && [ -z "$POC1_FANDHE_KIB" ] \
@@ -109,11 +124,13 @@ case "$NET_MODE" in auto|netns|host) ;; *) die "--net-mode must be auto, netns o
   || die "--poc1-chromium-kib and --poc1-fandhe-kib must be given together"
 for kib in "$POC1_CHROMIUM_KIB" "$POC1_FANDHE_KIB"; do
   [ -n "$kib" ] || continue
-  if ! [[ "$kib" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v v="$kib" 'BEGIN{ exit !(v + 0 > 0 && v + 0 < 1e15) }'; then
-    die "--poc1-*-kib must be a positive finite number of KiB (PSS), got '$kib'"
+  if ! [[ "$kib" =~ ^(0|[1-9][0-9]{0,14})(\.[0-9]{1,6})?$ ]] || ! awk -v v="$kib" 'BEGIN{ exit !(v + 0 > 0 && v + 0 < 1e15) }'; then
+    die "--poc1-*-kib must be a positive decimal number of KiB (PSS) without leading zeros, got '$kib'"
   fi
 done
-[[ "$EGRESS_DNS" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--dns must be an IPv4 address"
+octet='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+[[ "$EGRESS_DNS" =~ ^$octet\.$octet\.$octet\.$octet$ ]] \
+  || die "--dns must be a dotted-decimal IPv4 address without leading zeros"
 [ "$SKIP_CHROMIUM" -eq 0 ] || [ "$SKIP_FANDHE" -eq 0 ] || die "nothing to measure"
 if [ "$SKIP_FANDHE" -eq 0 ]; then
   [ -n "$FANDHE_BIN" ] && [ -x "$FANDHE_BIN" ] || die "--fandhe-bin must be an executable file"
@@ -129,6 +146,10 @@ for c in "${COND_LIST[@]}"; do
   case "$c" in idle) ;; loaded) [ -n "$URL" ] || die "--url is required for the loaded condition" ;;
     *) die "unknown condition: $c" ;; esac
 done
+# Chromium の後勝ちフラグで、検査したポート・user-data-dir から接続先がずれるのを防ぐ
+case " $CHROMIUM_EXTRA " in
+  *--remote-debugging-*|*--user-data-dir*) die "--chromium-extra-args must not set --remote-debugging-* or --user-data-dir (measure.sh owns them)" ;;
+esac
 if [ -n "$URL" ]; then
   case "$URL" in http://*|https://*) ;; *) die "--url must be a public http(s):// URL (file: is rejected by the SSRF guard)" ;; esac
   # 明らかな loopback・プライベートホストは fandhe の SSRF ガードが拒否するため、計測前に弾く
@@ -161,7 +182,7 @@ resolve_net_mode() {
   fi
   if [ "$NET_MODE" = "host" ]; then
     [ "$N" -eq 1 ] || [ "$ALLOW_SHARED_PORT" -eq 1 ] || die "host mode supports only N=1 (fixed port $FANDHE_PORT); use --net-mode netns"
-    if (exec 3<>"/dev/tcp/127.0.0.1/$FANDHE_PORT") 2>/dev/null; then
+    if port_in_use "$FANDHE_PORT"; then
       die "127.0.0.1:$FANDHE_PORT is already in use; stop the other process first"
     fi
     return 0
@@ -179,6 +200,19 @@ resolve_net_mode() {
   fi
 }
 resolve_net_mode
+# Chromium のデバッグポート 9401..(9400+N) は host の名前空間で待ち受けるため、起動前に全ポートの
+# 使用中を拒否する（既存プロセスの CDP へ繋いで別プロセスを遷移させ成功扱いになるのを防ぐ）。
+# run_cycle でもサイクル開始時に再検査する。
+check_chromium_ports_free() {
+  local i
+  for ((i = 1; i <= N; i++)); do
+    if port_in_use "$((CHROMIUM_PORT_BASE + i))"; then
+      echo "error: 127.0.0.1:$((CHROMIUM_PORT_BASE + i)) is already in use; stop the other process first" >&2
+      return 2
+    fi
+  done
+}
+if [ "$SKIP_CHROMIUM" -eq 0 ]; then check_chromium_ports_free || exit 2; fi
 # 外向き経路は loaded 条件で fandhe を測るときのみ必要（veth・iptables・ip_forward は root 必須）
 if [ "$SKIP_FANDHE" -eq 0 ] && printf '%s\n' "${COND_LIST[@]}" | grep -qx loaded; then
   EGRESS=1
@@ -340,16 +374,53 @@ in_ns() { # $1=leader pid、以降=コマンド。netns 時のみ namespace 内�
   if [ "$NET_MODE" = "netns" ]; then nsenter -t "$pid" "${NSENTER_FLAGS[@]}" "$@"; else "$@"; fi
 }
 
-wait_fandhe_ready() { # 全インスタンスの /json/version 応答を待つ
-  [ "$NO_READY_CHECK" -eq 0 ] || return 0
-  local pid deadline
-  for pid in "${LEADERS[@]}"; do
-    deadline=$((SECONDS + READY_TIMEOUT))
-    until in_ns "$pid" curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$FANDHE_PORT/json/version" 2>/dev/null; do
-      kill -0 "$pid" 2>/dev/null || { echo "error: fandhe instance (pid $pid) exited during startup" >&2; return 1; }
-      [ "$SECONDS" -lt "$deadline" ] || { echo "error: fandhe instance (pid $pid) not ready in ${READY_TIMEOUT}s" >&2; return 1; }
-      sleep 0.2
+# 127.0.0.1:PORT の LISTEN ソケットが、リーダーのプロセスツリー内のプロセスの所有であることを確認する。
+# /proc/<leader>/net/tcp はリーダーの network namespace のテーブルで、inode をツリー内 fd と照合する。
+# 応答した相手が既存の別プロセスだった場合（ポート競合）を成功扱いにしないための検査。
+listener_owned_by_tree() { # $1=leader $2=port
+  local leader="$1" port="$2" hexport inode p fd
+  hexport="$(printf '%04X' "$port")"
+  inode="$(awk -v lp="0100007F:$hexport" '$2 == lp && $4 == "0A" { print $10; exit }' "/proc/$leader/net/tcp" 2>/dev/null)" || return 1
+  [ -n "$inode" ] && [ "$inode" != "0" ] || return 1
+  while read -r p; do
+    [ -n "$p" ] || continue
+    for fd in "/proc/$p"/fd/*; do
+      [ "$(readlink "$fd" 2>/dev/null)" = "socket:[$inode]" ] && return 0
     done
+  done < <(tree_pids "$leader")
+  return 1
+}
+
+# CDP の /json/version が応答するまで待ち、応答した待ち受けが今回起動したツリーの所有であることを確認する
+wait_cdp_ready() { # $1=label $2=leader $3=port $4=netns 内か(1/0)
+  local label="$1" pid="$2" port="$3" use_ns="$4" deadline
+  deadline=$((SECONDS + READY_TIMEOUT))
+  while :; do
+    if [ "$use_ns" -eq 1 ]; then
+      in_ns "$pid" curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$port/json/version" 2>/dev/null && break
+    else
+      curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$port/json/version" 2>/dev/null && break
+    fi
+    kill -0 "$pid" 2>/dev/null || { echo "error: $label (pid $pid) exited during startup" >&2; return 1; }
+    [ "$SECONDS" -lt "$deadline" ] || { echo "error: $label (pid $pid) not ready in ${READY_TIMEOUT}s" >&2; return 1; }
+    sleep 0.2
+  done
+  listener_owned_by_tree "$pid" "$port" \
+    || { echo "error: 127.0.0.1:$port is not owned by $label (pid $pid); another process answered" >&2; return 1; }
+}
+
+wait_fandhe_ready() { # 全インスタンスの /json/version 応答と待ち受けの所有を確認する
+  [ "$NO_READY_CHECK" -eq 0 ] || return 0
+  local pid
+  for pid in "${LEADERS[@]}"; do
+    wait_cdp_ready "fandhe instance" "$pid" "$FANDHE_PORT" 1 || return 1
+  done
+}
+
+wait_chromium_ready() { # loaded 条件で全 Chromium インスタンスの CDP 応答と所有を確認する
+  local i
+  for ((i = 1; i <= N; i++)); do
+    wait_cdp_ready "chromium instance $i" "${LEADERS[$((i - 1))]}" "$((CHROMIUM_PORT_BASE + i))" 0 || return 1
   done
 }
 
@@ -423,6 +494,12 @@ sample_cycle() { # $1=target $2=condition。結果を RES_* と RESULTS へ
 run_cycle() { # $1=target $2=condition
   local target="$1" cond="$2" i
   LEADERS=()
+  # host モードの fandhe（固定ポート）と Chromium は、サイクルごとに起動前の使用中を再検査する
+  if [ "$target" = "chromium" ]; then check_chromium_ports_free || return 2; fi
+  if [ "$target" = "fandhe" ] && [ "$NET_MODE" = "host" ] && port_in_use "$FANDHE_PORT"; then
+    echo "error: 127.0.0.1:$FANDHE_PORT is already in use; stop the other process first" >&2
+    return 2
+  fi
   log "start $N x $target ($cond)"
   for ((i = 1; i <= N; i++)); do
     if [ "$target" = "fandhe" ]; then launch_fandhe "$i"
@@ -431,7 +508,7 @@ run_cycle() { # $1=target $2=condition
   done
   if [ "$target" = "fandhe" ]; then wait_fandhe_ready; fi
   if [ "$target" = "fandhe" ] && [ "$cond" = "loaded" ]; then navigate_all; fi
-  if [ "$target" = "chromium" ] && [ "$cond" = "loaded" ]; then navigate_chromium_all; fi
+  if [ "$target" = "chromium" ] && [ "$cond" = "loaded" ]; then wait_chromium_ready; navigate_chromium_all; fi
   sleep "$SETTLE"
   sample_cycle "$target" "$cond"
   kill_all
@@ -476,7 +553,7 @@ json_escape() {
 join_by() { local IFS=","; echo "$*"; }
 {
   printf '{"schema_version":1,"task":"TASK-81","behaviors":["PERF-4","MEAS-6"],"metric":"pss_kib",'
-  printf '"instances":%d,"net_mode":"%s","url":"%s","settle_sec":%d,' "$N" "${NET_MODE}" "$(json_escape "$URL")" "$SETTLE"
+  printf '"instances":%s,"net_mode":"%s","url":"%s","settle_sec":%s,' "$N" "${NET_MODE}" "$(json_escape "$URL")" "$SETTLE"
   printf '"environment":{"kernel":"%s","arch":"%s","cpus":%s,"mem_total_kib":%s},' \
     "$(uname -r)" "$(uname -m)" "$(nproc 2>/dev/null || echo 0)" "$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
   printf '"results":[%s],"comparisons":[%s]}\n' "$(join_by "${RESULTS[@]}")" "$(join_by "${COMPARISONS[@]:-}")"

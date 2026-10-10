@@ -21,11 +21,19 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
   - `loaded`: 全インスタンスで同一の**公開 URL**（`--url`。http(s) のみ）を読み込み、`--settle` 秒待った状態。
     両者とも CDP の `Page.navigate`（`navigate.mjs`）で遷移させる。Chromium は `about:blank` で起動し
     （idle・loaded で起動条件を揃える）、`--remote-debugging-port`（インスタンス i は 9400+i、127.0.0.1 限定）の
-    page ターゲットへ `--page-target` モードで接続して遷移し、`Page.loadEventFired` まで待つ。
+    page ターゲットへ `--page-target` モードで接続して遷移する。完了は `Page.navigate` 応答の `loaderId` と
+    一致する `Page.lifecycleEvent`（`name=="load"`）で判定し、遅れて届く `about:blank` の load では解決しない。
+    起動前に 9401..9400+N の使用中を拒否し（使用中は終了コード 2）、起動後は `/json/version` の応答元が
+    今回起動したプロセスツリー所有の LISTEN ソケットであること（`/proc/<pid>/net/tcp` の inode と fd の照合）を
+    確認する。fandhe 側の固定ポート 9333 も同じ所有確認を行う。
     `Page.navigate` が `result.errorText` を返した場合（DNS・TLS・接続失敗、fandhe では SSRF ガードによる拒否も）は
     `navigate.mjs` が非 0 で終了し、計測は失敗（終了コード 1）になる。エラーページの PSS を loaded として出さない
 
 ## 前提
+
+- 数値引数（`-n`・`--settle`・`--poc1-*-kib`・`--dns` の各オクテット）は先頭ゼロなしの十進表記のみ受理する
+  （`050`・`08` 等は bash 算術と `printf %d` で八進数扱いになるため使用エラー＝終了コード 2）。
+  `--chromium-extra-args` に `--remote-debugging-*`・`--user-data-dir` は指定できない（検査した接続先とずれるため）
 
 - **Linux 専用**（`/proc/<pid>/smaps_rollup`）。macOS・Windows では終了コード 2 で終わる
 - bash・ps・awk・curl に加え、`loaded` 条件は node 22 以降（fandhe・Chromium 双方の遷移確認に使う）（npm 依存なし）
