@@ -104,7 +104,50 @@ Playwright が接続から `newPage()` 完了までに必要とする項目を�
 
 ## 方針
 
-（未記入。TASK-43.h1・Issue #248 で人間が決定し、ここへ記録する。本 PR では方針を決めていない。）
+TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する。根拠ビヘイビアは `CDP-2`（主）・`CDP-6`・`SEC-2`
+（`docs/spec/04-behavior/api-cdp.md`・`security-policy.md` が SSOT）。
+
+### 範囲
+
+- `newPage()` 到達までの最小実装とする。`goto()`・セレクタ取得は TASK-44（`CDP-2`）で扱う
+- 追加実装は TASK-43.3（Issue #249）。成果物は `crates/fandhe-browser-cdp/src/playwright_compat.rs`（現時点で未作成）
+
+### 進め方（4 段階・段階ごとに実測）
+
+各段階の実装後に `make trace-playwright`（TASK-43.1）で実測し、結果を見て次段階の内容を見直してから進む。
+
+- 実測で停止を確認済みなのは段階 1 の 2 か所のみ（上記 #1・#2。`newpage-trace.jsonl` の seq 2〜3 と seq 4〜6）
+  - 停止 1: `GET /json/version/`（末尾スラッシュ付き）が 404（`connectOverCDP(http://…)`）
+  - 停止 2: `Browser.getVersion` が `-32601`（`connectOverCDP(ws://…)`）
+- 段階 2 以降は**予測**（B: ソース読解）であり、各段階の実測で見直す。下表の「触る箇所」も予測を含む
+
+| 段階 | 内容 | 触る CDP メソッド / エンドポイント | cdp crate 内の該当箇所 | 根拠 |
+| ---- | ---- | ---------------------------------- | ---------------------- | ---- |
+| 1 | 接続の確立 | `GET /json/version/`、`Browser.getVersion` | `server.rs` の `router`（ルート明示登録）、`discovery.rs` の `version_body`（版表記の整合）、`protocol.rs` の `builtin_handlers`（ハンドラ登録） | 実測（#1・#2） |
+| 2 | ターゲットと順序制御 | `Target.setAutoAttach`・`Target.getTargetInfo`・`Browser.setDownloadBehavior`・`Target.createBrowserContext`・`Target.createTarget`、イベント `Target.attachedToTarget`（`browserContextId` を含める） | `target.rs`（`TargetInfo` へ `browserContextId` 追加、`TargetRegistry::create_target`・`attach`）、`protocol.rs` の `DispatchOutcome`（イベントを応答より先に送る順序制御。現状は応答→イベント列で固定） | 予測（#3〜#8） |
+| 3 | ページ初期化系 | `Page.enable`・`Page.getFrameTree`・`Log.enable`・`Page.setLifecycleEventsEnabled`・`Runtime.enable`（`Runtime.executionContextCreated`）・`Page.addScriptToEvaluateOnNewDocument`・`Network.enable`・`Runtime.runIfWaitingForDebugger` ほか（握りつぶされないものから） | `protocol.rs` の `builtin_handlers`、`page.rs`（フレームツリー・実行コンテキストのモデル。`MAIN_FRAME_ID`） | 予測（#9・#10） |
+| 4 | 初期 `about:blank` | `Page.frameNavigated`（`about:blank`）の送出 | `page.rs` の `navigation_events`（`Page.navigate` 専用のため新規ページ作成時の送出経路を追加）、`navigation.rs` | 予測（#11） |
+
+段階 2 の `Target.*` は、実測前の予測として Playwright 1.63.0 の初期化を満たす最小集合を挙げたもの。
+どのメソッドを「実装」し、どのメソッドを「明示エラー」のままにするかは、段階 2・3 の実測後に決める（未決定）。
+
+### 原則
+
+| 原則 | 内容 | ビヘイビア |
+| ---- | ---- | ---------- |
+| 未実装は `-32601` | 未実装メソッドは `-32601`（`method not implemented`）を返し続ける。必要なメソッドだけを個別に実装し、一律の成功フォールバックを入れない | `CDP-6`・`SEC-2` |
+| 空の成功で通さない | 到達性を上げるためだけに、何もしないメソッドへ空の `success` を返さない。実装済みを装わない（スタブは `///` に将来仕様と ID を明記） | `CDP-6`・`REPAIR-3` |
+| Chrome を装わない | `Browser.getVersion` の `userAgent`・`product` 等に Chrome / Chromium を装う値を入れない。`/json/version` と同様に `fandhe-browser/<版>` の実値を返す | `SEC-2` |
+| Host / Origin 検証を緩めない | `/json/version/` の受理は明示ルート追加で行い、Host 検証・Origin 拒否・loopback 限定バインドを緩めない | `SEC-4`・`CDP-1` |
+| 上限の維持 | browser context・ターゲット・セッション追加でも `MAX_TARGETS`・`MAX_SESSIONS` を維持する | `CDP-7` |
+
+`Browser.getVersion` の値の方針（上記「制約との交差」）は、上記原則どおり実値を返し、Playwright 側が通るかを段階 1 の実測で確認する。
+通らなかった場合の扱い（偽装に当たらない範囲での代替）は未決定（オーナー判断待ち）。
+
+### 次の作業
+
+- 草案のマージ後、オーナーが #248 を close する
+- #249 の段階別分割は、オーナー承認後に Issue を起票する（本書では決めない）
 
 ## 未確定事項・再現手順
 
