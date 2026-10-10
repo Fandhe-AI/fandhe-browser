@@ -356,6 +356,24 @@ fn aisnap9_collect_complete_synthetic() {
     assert_eq!(v.as_array().map(Vec::len), Some(25));
     let v: serde_json::Value = serde_json::from_str(&c.raw_json).expect("json");
     assert_eq!(v.as_array().map(Vec::len), Some(25));
+    // 整形せずコンパクトに直列化され、採点入口の上限に収まる（改行は末尾 1 つのみ）
+    assert_eq!(c.reduced_json.matches('\n').count(), 1);
+    assert!(c.reduced_json.len() <= score::MAX_INPUT_BYTES);
+    assert!(c.raw_json.len() <= score::MAX_INPUT_BYTES);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 出力先の既存シンボリックリンクは追跡せず拒否する（リポジトリ外制約の迂回防止）。
+#[cfg(unix)]
+#[test]
+fn aisnap9_write_packets_rejects_symlinked_output_file() {
+    let dir = temp_dir("symlink");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let target = manifest().join("target").join("aisnap9-symlink-victim.txt");
+    let _ = std::fs::remove_file(&target);
+    std::os::unix::fs::symlink(&target, dir.join("allocation.json")).expect("symlink");
+    assert!(write_packets(&fixtures(), &dir).is_err());
+    assert!(!target.exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

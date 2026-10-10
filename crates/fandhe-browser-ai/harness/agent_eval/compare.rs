@@ -414,7 +414,16 @@ fn check_out_dir_here(out_dir: &Path) -> Result<(), CompareError> {
     check_out_dir(out_dir, &root)
 }
 
+/// 出力ファイルを書く。既存のシンボリックリンクは追跡せず拒否する（リポジトリ外制約の迂回防止）。
 fn write_file(path: &Path, content: &str) -> Result<(), CompareError> {
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(CompareError::OutDirRejected(format!(
+            "output path is a symbolic link: {}",
+            path.display()
+        )));
+    }
     std::fs::write(path, content.as_bytes()).map_err(|source| CompareError::Io {
         path: path.to_path_buf(),
         source,
@@ -602,8 +611,8 @@ fn collect_mode<T: Clone>(
         map.insert(t.id.to_owned(), ans.clone());
         values.push(value);
     }
-    let json = serde_json::to_string_pretty(&serde_json::Value::Array(values))
-        .unwrap_or_else(|_| "[]".to_owned());
+    // 採点入口の MAX_INPUT_BYTES を超えないよう、整形せずコンパクトに直列化する
+    let json = serde_json::Value::Array(values).to_string();
     (map, format!("{json}\n"), st)
 }
 
