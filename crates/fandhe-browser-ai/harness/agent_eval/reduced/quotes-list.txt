@@ -66,5 +66,5 @@
   - link "kappa" [eabb736873c2867ad]
   - link "lambda" [e20fbbc8e7692bd19]
   - link "sigma" [e348bcfaa629f3229]
-  - contentinfo [ec0aa17bccd809080]
+  - contentinfo
     - link "Example Source" [e8899f32005111cf5]

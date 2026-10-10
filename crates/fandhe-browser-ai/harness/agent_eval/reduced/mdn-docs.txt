@@ -1,5 +1,5 @@
 - document "Reference Documentation"
-  - banner [e02d16e1795403182]
+  - banner
     - link "Docs" [e048a8f128ac3113e]
     - list [ec34a00c49a7d3dc0]
       header:
@@ -7,7 +7,7 @@
       Guides {link "Guides"=ec0aa3f4f15509171}
       Tools {link "Tools"=e1449f27925e3e81f}
     - searchbox "Search" [ef0c8b601ad402bc1]
-  - generic "Reference sidebar" [e97ed3ac35f63c68b]
+  - generic "Reference sidebar"
     - generic [e90d4f1bdbc9b7c04]
       - generic [e5303a33e7fa57667]
       - list [edd97d613cfb7e475]
@@ -779,4 +779,4 @@
     header:
     theta: Vector lantern market stream ribb… …(text)
     window: Garden bridge pattern signal ome… …(text)
-  - contentinfo [ec0aa17bccd809080]
+  - contentinfo

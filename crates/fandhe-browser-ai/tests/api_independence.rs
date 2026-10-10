@@ -232,11 +232,16 @@ fn leaf(role: &str, name: &str, r: &str) -> Value {
     serde_json::json!({"role": role, "name": name, "ref": r, "children": []})
 }
 
-/// ルート（`document`。ref は `null`）を包むエンベロープ期待 JSON。
+/// ref を持たない葉ノード期待 JSON（`ref` キーは省略される。TASK-23.4）。
+fn leaf_no_ref(role: &str, name: &str) -> Value {
+    serde_json::json!({"role": role, "name": name, "children": []})
+}
+
+/// ルート（`document`。`ref` キーは省略される）を包むエンベロープ期待 JSON。
 fn envelope(url: &str, doc_name: &str, children: Vec<Value>) -> Value {
     serde_json::json!({
         "url": url,
-        "tree": {"role": "document", "name": doc_name, "ref": null, "children": children},
+        "tree": {"role": "document", "name": doc_name, "children": children},
         "truncated": false,
     })
 }
@@ -252,17 +257,17 @@ fn expected_article(url: &str) -> Value {
         "truncated_rows": 0,
         "children": [],
     });
-    // 名前のない generic（html・body・p）は折り畳まれる。ref は折り畳み前と同一（TASK-23.3）。
+    // 名前のない generic（html・body・p）は折り畳まれる。ref は折り畳み前と同一（TASK-23.3）。banner・contentinfo は ref を持たない（TASK-23.4）。
     envelope(
         url,
         "Rust 入門記事",
         vec![
-            leaf("banner", "", "e02d16e1795403182"),
+            leaf_no_ref("banner", ""),
             leaf("heading", "はじめに", "e300ae11bc252b0fd"),
             leaf("link", "公式ドキュメント", "ed45c1d22b4e186f4"),
             leaf("heading", "要点", "ee0714a175d20c8b2"),
             list,
-            leaf("contentinfo", "", "ec0aa17bccd809080"),
+            leaf_no_ref("contentinfo", ""),
         ],
     )
 }

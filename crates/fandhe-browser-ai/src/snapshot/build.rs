@@ -17,7 +17,7 @@
 //!   `hidden` 属性または `aria-hidden="true"` の要素・`input[type=hidden]`。
 //! - データ葉（表セル・価格クラス要素・引用要素・地の文クラス要素。`AISNAP-3`・TASK-13.3・Issue #88、
 //!   拡充は TASK-15.1・15.2）は `Node::data_leaf`（圧縮表では `HeaderCell::data_leaf`）へ印を付けるだけで、
-//!   role・ref・剪定・打ち切りには使わない。展開されたデータ葉は他の要素と同じく ref を持つ。
+//!   role・ref・剪定・打ち切りには使わない。展開されたデータ葉は ref を持つ（下記 TASK-23.4）。
 //!   表・一覧の子孫にある場合は圧縮・畳みを行わず展開を維持する（圧縮行は ref・全文・分類を
 //!   保持できないため。`AISNAP-11`・TASK-15.3・Issue #101）。展開によるトークン増の最適化は未実装。
 //! - 規則的な `table`・`ul`・`ol`（[`crate::compress_table::detect_regular_structure`]
@@ -54,8 +54,15 @@
 //!   深さ判定は DOM 上の深さのままで、折り畳みで深さ制限をすり抜けさせない。
 //!   `option` は選択肢として操作対象のため畳まない。
 //!   既知の制約（REPAIR-3）: `role` 属性つき要素は `is_interactive_element` が真のため畳まない。
-//!   `img alt=""` の `none` 化（role 算出側）は未実装。ref 付与対象の限定は後続タスク。
-//! - 出力されるノードだけが ref を持つ（内部では全要素に発行する）。
+//!   `img alt=""` の `none` 化（role 算出側）は未実装。
+//! - ref の付与は操作・参照の対象ノードに限る（`AISNAP-1`・`AISNAP-10`・`AISNAP-13`・TASK-23.4・
+//!   Issue #827）。出力され、かつ [`REF_ROLES`]・データ葉・`is_interactive_element` のいずれかに
+//!   該当するノードだけが ref を持つ（それ以外は `Node::ref == None`）。内部では全要素に
+//!   `ElementRef` を発行し子の scope に使うので、残るノードの ref 文字列は変わらない。
+//!   圧縮表のヘッダ・行内操作要素の ref も不変。圧縮したコンテナ（`Node::table` あり）自身も、
+//!   配下の ref の scope 元として再特定が照合に使うため ref を残す。
+//!   既知の制約（REPAIR-3）: `role` 属性つき要素は `is_interactive_element` が真のため、
+//!   非操作 role（例: `ul role=list`）でも ref を持つ。
 //! - 深さが [`MAX_TREE_DEPTH`] を超えるサブツリーは省略し `Snapshot::truncated` を立てる。
 //! - いずれかの name が打ち切られた場合（文字数上限・子孫走査の上限・構築全体で共有する
 //!   走査予算）も `Snapshot::truncated` を立てる。
@@ -620,6 +627,44 @@ struct Frame<'a> {
 /// 折り畳み対象の role（`AISNAP-1`・TASK-23.3）。
 const COLLAPSIBLE_ROLES: [&str; 3] = ["generic", "none", "presentation"];
 
+/// 出力上の ref を持たせる role（操作要素・見出し・表ヘッダ。`AISNAP-1`・`AISNAP-10`・
+/// `AISNAP-13`・TASK-23.4・Issue #827）。
+pub const REF_ROLES: [&str; 20] = [
+    "link",
+    "button",
+    "textbox",
+    "searchbox",
+    "checkbox",
+    "radio",
+    "combobox",
+    "listbox",
+    "option",
+    "spinbutton",
+    "slider",
+    "switch",
+    "tab",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "treeitem",
+    "heading",
+    "columnheader",
+    "rowheader",
+];
+
+/// ノードが出力上の `ref` を持つべきか（`AISNAP-1`・`AISNAP-13`・TASK-23.4）。
+///
+/// [`REF_ROLES`]・データ葉（`AISNAP-3`・`AISNAP-11`）・[`is_interactive_element`] が真の
+/// ノードだけが対象。折り畳み対象（[`is_collapsible`]）とは両立する（折り畳まれる
+/// ノードは常に偽）。`build_snapshot_inner` から呼ばれる。
+fn emits_ref(doc: &Document, id: NodeId, node: &Node) -> bool {
+    REF_ROLES.contains(&node.role.as_str())
+        || node.data_leaf.is_some()
+        || is_interactive_element(doc, id)
+        // `option` は role 算出が generic でも選択肢として操作対象（折り畳みの例外と同じ）。
+        || is_html_element_named(doc, id, "option")
+}
+
 /// 情報を持たず出力から省いてよいノードか（`AISNAP-1`・TASK-23.3）。
 ///
 /// role が generic 系・name 空・state 既定・データ葉/表/畳み行なし・操作要素でない場合に真。
@@ -766,18 +811,7 @@ fn build_snapshot_inner(
             sig = sig.with_scope(scope);
         }
         let elem_ref = refs.allocate_signature(&sig)?;
-        #[cfg(test)]
-        if let Some(sink) = sink.as_deref_mut() {
-            sink.push(RefHolder {
-                node: child,
-                role: role.to_string(),
-                name: name.clone(),
-                r#ref: elem_ref.to_ref_string(),
-            });
-        }
-        let mut node = Node::new(role, name)
-            .with_ref(elem_ref.to_ref_string())
-            .with_state(compute_state(doc, child));
+        let mut node = Node::new(role, name.clone()).with_state(compute_state(doc, child));
         node.data_leaf = classify_data_leaf(doc, child);
         // 規則的な表・一覧は子孫を展開せず 1 ノードへ圧縮する（AISNAP-2・TASK-12.5）。
         let compressible_kind = ["table", "ul", "ol"]
@@ -834,6 +868,24 @@ fn build_snapshot_inner(
                 .map(|(r, &(index, _))| FoldedRow::new(index, r.text, r.truncated))
                 .collect();
             folded.extend(ids);
+        }
+        // 圧縮したコンテナは配下のヘッダ・行内操作要素の ref の scope 元で、再特定
+        // （reference_stability・retention_check）がコンテナの ref で照合するため ref を残す。
+        let emit = emits_ref(doc, child, &node) || compressible.is_some();
+        // 出力上の ref は操作・参照の対象ノードだけに付ける（TASK-23.4）。内部の発行
+        // （上の allocate_signature）と子への scope 連鎖は全要素で続けるので、残るノードの
+        // ref は変わらない（AISNAP-10）。
+        if emit {
+            node.r#ref = Some(elem_ref.to_ref_string());
+            #[cfg(test)]
+            if let Some(sink) = sink.as_deref_mut() {
+                sink.push(RefHolder {
+                    node: child,
+                    role: role.to_string(),
+                    name,
+                    r#ref: elem_ref.to_ref_string(),
+                });
+            }
         }
         if let Some((structure, compressed, plans)) = compressible {
             let headers = assign_header_refs(doc, &index, &structure, elem_ref, &mut refs)?;
@@ -1169,6 +1221,121 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), refs.len());
+    }
+
+    /// AISNAP-10・TASK-23.4（Issue #827）: `nav > ul > li > a` で ref を持つのは `a`（link）だけで、
+    /// その ref は scope 連鎖（html > body > nav > ul > li > a）から独立に再計算した値と一致する。
+    #[test]
+    fn aisnap_10_nav_list_only_link_has_ref() {
+        use crate::snapshot::element_ref::{ElementSignature, RefAllocator};
+        // 入れ子の一覧を含めて規則的構造にせず、`a` を展開経路（Node）へ通す。
+        let s = snap(
+            "<body><nav><ul><li>Docs<ul><li>Sub</li></ul></li>\
+             <li><a href=\"/home\">Home</a></li></ul></nav></body>",
+        );
+        // `nav` の暗黙 role は現状 generic のため折り畳まれ、`ul` が document 直下へ繰り上がる。
+        let ul = child(&s.tree, 0);
+        assert_eq!((ul.role.as_str(), ul.table.is_none()), ("list", true));
+        assert_eq!(ul.r#ref, None);
+        let li = child(ul, 1);
+        assert_eq!((li.role.as_str(), li.r#ref.as_deref()), ("listitem", None));
+        let a = child(li, 0);
+        assert_eq!(a.role, "link");
+        let with_refs: Vec<&str> = all_nodes(&s.tree)
+            .into_iter()
+            .filter(|n| n.r#ref.is_some() && n.table.is_none())
+            .map(|n| n.role.as_str())
+            .collect();
+        assert_eq!(with_refs, vec!["link"]);
+
+        let mut alloc = RefAllocator::new();
+        let mut scope = None;
+        let chain = [
+            ("generic", "", None),
+            ("generic", "", None),
+            ("generic", "", None),
+            ("list", "", None),
+            ("listitem", li.name.as_str(), None),
+        ];
+        for (role, name, disc) in chain {
+            let mut sig = ElementSignature::new(role, name);
+            if let Some(d) = disc {
+                sig = sig.with_discriminator(d);
+            }
+            if let Some(sc) = scope {
+                sig = sig.with_scope(sc);
+            }
+            scope = Some(alloc.allocate_signature(&sig).expect("発行は成功する"));
+        }
+        let sig = ElementSignature::new("link", "Home")
+            .with_discriminator("/home")
+            .with_scope(scope.expect("scope"));
+        let expected = alloc.allocate_signature(&sig).expect("発行は成功する");
+        assert_eq!(a.r#ref, Some(expected.to_ref_string()));
+    }
+
+    /// AISNAP-1・AISNAP-13・TASK-23.4: 操作要素・見出し・データ葉・`div[onclick]`・`option` は
+    /// ref を持ち、操作・参照の対象でない名前付きノード（`img` の generic 等）は持たない。
+    #[test]
+    fn aisnap_1_ref_only_on_operation_and_reference_targets() {
+        let s = snap(
+            "<html><body><main>M</main><h1>T</h1><p>text</p><img alt=\"pic\">\
+             <button>B</button><input type=\"text\" aria-label=\"q\">\
+             <input type=\"checkbox\" aria-label=\"c\"><div onclick=\"x()\">tap</div>\
+             <select aria-label=\"s\"><option>o1</option></select>\
+             <p class=\"price_color\">9.9</p></body></html>",
+        );
+        // 暗黙 role の未実装（img・p・option は generic）は現状のまま。ref の有無だけを固定する。
+        let got: Vec<(&str, &str, bool)> = all_nodes(&s.tree)
+            .into_iter()
+            .map(|n| (n.role.as_str(), n.name.as_str(), n.r#ref.is_some()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("document", "", false),
+                ("heading", "T", true),
+                ("generic", "pic", false),
+                ("button", "B", true),
+                ("textbox", "q", true),
+                ("checkbox", "c", true),
+                ("generic", "", true), // div[onclick]
+                ("combobox", "s", true),
+                ("generic", "", true), // option
+                ("generic", "", true), // p.price_color（データ葉）
+            ]
+        );
+    }
+
+    /// TASK-23.4: 圧縮表のヘッダ・行内操作要素は ref を持ち、`build_snapshot_with_holders` の
+    /// holders は ref を持つノード・ヘッダ・行内操作要素と一致する（ref なしノードは含まない）。
+    #[test]
+    fn aisnap_10_holders_match_nodes_with_refs() {
+        use super::build_snapshot_with_holders;
+        let html = "<body><nav><ul><li>Docs<ul><li>Sub</li></ul></li>\
+            <li><a href=\"/home\">Home</a></li></ul></nav>\
+            <table><thead><tr><th>N</th></tr></thead>\
+            <tbody><tr><td>a <button>Del</button></td></tr></tbody></table></body>";
+        let parsed = parse_document(html, &ParseOptions::default()).expect("parse");
+        let (s, holders) = build_snapshot_with_holders(&parsed.document).expect("構築は成功する");
+        let mut expected: Vec<String> = Vec::new();
+        for n in all_nodes(&s.tree) {
+            expected.extend(n.r#ref.clone());
+            if let Some(t) = &n.table {
+                expected.extend(t.header.iter().map(|h| h.r#ref.clone()));
+                expected.extend(
+                    t.rows
+                        .iter()
+                        .flat_map(|r| r.controls.iter())
+                        .map(|c| c.r#ref.clone()),
+                );
+            }
+        }
+        let mut got: Vec<String> = holders.iter().map(|h| h.r#ref.clone()).collect();
+        expected.sort();
+        got.sort();
+        assert_eq!(got, expected);
+        assert!(holders.iter().all(|h| h.role != "listitem"));
     }
 
     /// AISNAP-10: 同名ボタンは別 ref。id 付きは前方への挿入で ref を保つ。
