@@ -62,7 +62,8 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
 
 ## 現時点の到達点（事実のみ。原因分析は #247・`docs/design/playwright-compat.md`）
 
-- `connectOverCDP(http://127.0.0.1:<port>)`: Playwright が `GET /json/version/`（末尾スラッシュ付き）を要求し、
-  サーバーが 404 を返して失敗する（CDP メッセージは 0 件）。`GET /json/version` は 200
-- `connectOverCDP(ws://…/devtools/browser/<id>)`（discovery 回避）: 最初に送る `Browser.getVersion` が
-  `-32601`（未実装。`CDP-6`）となり失敗する。`newContext()`・`newPage()` には到達しない
+- TASK-43.3a（#804）後の実測。`GET /json/version` と `GET /json/version/` はともに 200 で、
+  `Browser.getVersion` は実値（`fandhe-browser/<版>`）で成功する
+- `connectOverCDP(http://…)`・`connectOverCDP(ws://…)` はともに、次に送る `Target.setAutoAttach` と
+  `Browser.setDownloadBehavior` が `-32601`（未実装。`CDP-6`）となり失敗する。
+  `newContext()`・`newPage()` には到達しない

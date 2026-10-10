@@ -159,9 +159,12 @@ async fn cdp1_devtools_browser_ws_handshake_and_roundtrip() {
         assert!(head.contains(&format!("Sec-WebSocket-Accept: {WS_ACCEPT}")));
 
         send_text(&mut s, r#"{"id":1,"method":"Browser.getVersion"}"#);
+        let product = format!("fandhe-browser/{}", env!("CARGO_PKG_VERSION"));
         assert_eq!(
             read_text_json(&mut s),
-            json!({"id": 1, "error": {"code": -32601, "message": "method not implemented"}})
+            json!({"id": 1, "result": {
+                "protocolVersion": "1.3", "product": product, "userAgent": product
+            }})
         );
     })
     .await
@@ -181,12 +184,18 @@ async fn cdp6_unimplemented_method_over_ws_is_error_and_logged() {
             "",
         );
         assert_eq!(status_of(&head), 101, "head: {head}");
-        send_text(&mut s, r#"{"id":1,"method":"Browser.getVersion"}"#);
+        send_text(
+            &mut s,
+            r#"{"id":1,"method":"Emulation.setUserAgentOverride"}"#,
+        );
         assert_eq!(
             read_text_json(&mut s),
             json!({"id": 1, "error": {"code": -32601, "message": "method not implemented"}})
         );
-        send_text(&mut s, r#"{"id":2,"method":"Browser.getVersion"}"#);
+        send_text(
+            &mut s,
+            r#"{"id":2,"method":"Emulation.setUserAgentOverride"}"#,
+        );
         read_text_json(&mut s);
     })
     .await
@@ -195,7 +204,7 @@ async fn cdp6_unimplemented_method_over_ws_is_error_and_logged() {
     let c = snap
         .methods
         .iter()
-        .find(|(k, _)| k == "Browser.getVersion")
+        .find(|(k, _)| k == "Emulation.setUserAgentOverride")
         .map(|(_, c)| *c)
         .expect("logged");
     assert_eq!((c.handled, c.unimplemented), (0, 2));

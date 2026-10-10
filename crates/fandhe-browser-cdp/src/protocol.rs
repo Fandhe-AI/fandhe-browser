@@ -8,7 +8,7 @@
 //!
 //! 公開入口は無く crate 内部専用。後続タスクは [`builtin_handlers`] へメソッドを
 //! 追加するだけでよい（`Page.navigate` は 42.2 で登録済み、イベント送出は 42.3 で実装済み、
-//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657 で登録済み）。
+//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a で登録済み）。
 //!
 //! # 入力の扱い
 //!
@@ -21,7 +21,8 @@
 //! # 未実装メソッドの応答方針（`CDP-6`・`SEC-2`・TASK-42.6・#244）
 //!
 //! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
-//! `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）のみ登録済みで、
+//! `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・
+//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）のみ登録済みで、
 //! それ以外のメソッドは JSON-RPC の「method not implemented」（`-32601`）エラーを返す。
 //! 汎用の空 success フォールバック（PoC-5 の暫定挙動）は採らない。理由は次のとおり。
 //!
@@ -373,6 +374,10 @@ pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
         PageNavigate::new(FetchOptions::default()).map_err(|_| DispatcherError::HandlerInit)?;
     Ok(vec![
         ("Page.navigate", Box::new(navigate)),
+        (
+            "Browser.getVersion",
+            Box::new(crate::playwright_compat::BrowserGetVersion),
+        ),
         ("DOM.getDocument", Box::new(crate::dom::DomGetDocument)),
         ("DOM.querySelector", Box::new(crate::dom::DomQuerySelector)),
         (
@@ -771,7 +776,7 @@ mod tests {
             // 組込み表でも未登録メソッドは同じ。
             let b = Dispatcher::builtin().unwrap();
             let v = frames(
-                b.dispatch(&st, r#"{"id":1,"method":"Browser.getVersion"}"#)
+                b.dispatch(&st, r#"{"id":1,"method":"Emulation.setUserAgentOverride"}"#)
                     .await,
             );
             assert_eq!(
@@ -780,6 +785,50 @@ mod tests {
                     json!({"id": 1, "error": {"code": -32601, "message": "method not implemented"}})
                 ]
             );
+        }
+
+        #[tokio::test]
+        async fn cdp2_builtin_dispatch_browser_get_version_succeeds() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let b = Dispatcher::builtin().unwrap();
+            let product = format!("fandhe-browser/{}", env!("CARGO_PKG_VERSION"));
+            let v = frames(
+                b.dispatch(&st, r#"{"id":1,"method":"Browser.getVersion"}"#)
+                    .await,
+            );
+            assert_eq!(
+                v,
+                vec![json!({"id": 1, "result": {
+                    "protocolVersion": "1.3", "product": product, "userAgent": product
+                }})]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp6_builtin_other_methods_remain_unimplemented() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let b = Dispatcher::builtin().unwrap();
+            for (i, m) in [
+                "Target.setAutoAttach",
+                "Target.getTargetInfo",
+                "Browser.setDownloadBehavior",
+                "Emulation.setUserAgentOverride",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let text = format!(r#"{{"id":{},"method":"{m}"}}"#, i + 1);
+                let v = frames(b.dispatch(&st, &text).await);
+                assert_eq!(
+                    v,
+                    vec![
+                        json!({"id": i + 1, "error": {"code": -32601, "message": "method not implemented"}})
+                    ],
+                    "{m}"
+                );
+            }
         }
 
         #[tokio::test]
