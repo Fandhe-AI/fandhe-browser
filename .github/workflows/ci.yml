@@ -61,6 +61,8 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: ${{ github.event_name == 'pull_request' && 0 || 1 }}
+      - name: "判定スクリプトの自己テスト"
+        run: bash scripts/ci-changes.sh --self-test
       - name: "変更ファイルから実行対象（rust・harness）を判定"
         id: detect
         env:
