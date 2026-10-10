@@ -11,7 +11,7 @@
 
 JS-3・PERF-1 が「検討中」に留まる理由は、V8 統合後の実バイナリでサイズを再計測していないことである。
 本レポートはその実測記録で、TASK-31.1（Issue #469・PR #667）の計測ハーネスと CI の
-`binary-size` ジョブの結果を使う。
+`harness-*` ジョブの `[binary-size]` ステップの結果を使う。
 
 - 判定対象は既定ビルド（V8 のみ同梱）のリリースバイナリ。基準は CORE-2 の
   「Chromium 本体 457.4MB（PoC-2 実測）比 80% 以上削減」、つまり 91,480,000 B 以下
@@ -44,7 +44,7 @@ make measure-js-binary-size JS_BINARY_SIZE_STRIP=1
 | `boa` | `--no-default-features --features js-boa` | boa |
 | `none` | `--no-default-features` | なし |
 
-3 OS の既定ビルドは CI の `binary-size` ジョブ（`make check-binary-size` 相当）の出力
+3 OS の既定ビルドは CI の `harness-*` ジョブの `[binary-size]` ステップ（`make check-binary-size` 相当）の出力
 `binary-size: host=... bytes=...`（strip なし）を出典とする。
 
 ## 結果

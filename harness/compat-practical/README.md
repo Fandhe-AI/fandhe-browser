@@ -146,7 +146,7 @@ jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 
 - この値を `check-matrix.sh --threshold 70 --categories static,spa,form --all-categories` に通すと、全体・form・lazy・table が閾値未満で exit 1 になる（static・spa は通過）
 - 主因は、ナビゲーション経路でページ内 JS が実行されないこと（上記「制約」。b5・d2・d3）と、core のセレクタサブセット外（e1）。閾値・対象類型を下げてゲートを通すことはしない
-- そのため `results/matrix.json` は**コミットしていない**（コミットすると `make check-compat-regression` と CI の `compat-regression` ジョブが閾値未達で赤になる）。実測 15/22（68.2%）が閾値 70% 未満のため、まだコミットできない。閾値・対象類型は下げない。実マトリクスのコミットは #312 の残りの受け入れ条件（閾値 70% 到達後）で、`--allow-missing` は #312 完了後に削除する（main の記述どおり）
+- そのため `results/matrix.json` は**コミットしていない**（コミットすると `make check-compat-regression` と CI の `harness-*` ジョブの `[compat-regression]` ステップが閾値未達で赤になる）。実測 15/22（68.2%）が閾値 70% 未満のため、まだコミットできない。閾値・対象類型は下げない。実マトリクスのコミットは #312 の残りの受け入れ条件（閾値 70% 到達後）で、`--allow-missing` は #312 完了後に削除する（main の記述どおり）
 - 失敗 7 件の内訳と追跡先:
   - b5・d2・d3（`no_match`）: ページ内 JS がナビゲーション経路に未配線のため。扱いは #758（TASK-71.h1・人間判断）で決める
   - e1（`selector_unsupported`）: 属性演算子 `^=` が core のセレクタサブセット外だった（計測時点）。#760（TASK-71.6）で対応済み。再計測は #312

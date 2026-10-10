@@ -302,7 +302,7 @@ endif
 # 判定ロジックの正本は scripts/check-render-isolation.sh に一本化した（TASK-34.1・
 # Issue #465）。同スクリプトは workspace 全体に加え fandhe-browser-cli の既定
 # feature（TASK-41.5・#174。manifest 不在は NG・#633）も検査し、.github/workflows/ci.yml
-# の render-isolation ジョブ（3 OS matrix）から同じスクリプトを直接呼び出す。
+# の harness-* ジョブの [render-isolation] ステップから同じスクリプトを直接呼び出す。
 # `--exclude fandhe-browser-render` の理由・edge に dev を含める理由・
 # fandhe-browser-render 以外の member が無い間 skip する理由などの詳細な設計判断は
 # スクリプト側のコメントを参照。ここでは HAS_CARGO / RENDER_ISOLATION_MEMBERS による
@@ -320,7 +320,7 @@ endif
 # JS エンジンのビルド構成（軽量ビルド・エンジンなし）の依存グラフに、含まれてはならない
 # エンジン crate（v8・boa_engine）が無いことを検証する（TASK-32.4・JS-1・Issue #168）。
 # 判定ロジックの正本は scripts/check-js-engine-isolation.sh で、ci.yml の
-# js-engine-isolation ジョブ（3 OS matrix）も同じスクリプトを直接呼び出す。
+# harness-* ジョブの [js-engine-isolation] ステップも同じスクリプトを直接呼び出す。
 .PHONY: check-js-engine-isolation
 check-js-engine-isolation: ## 軽量ビルド・エンジンなし構成の依存グラフに v8（エンジンなしは boa_engine も）が含まれないことを検証する（scripts/check-js-engine-isolation.sh）
 ifneq ($(and $(HAS_CARGO),$(wildcard crates/fandhe-browser-cli/Cargo.toml)),)
@@ -484,7 +484,7 @@ endif
 # workspace 作成前・render crate 追加前の CI を壊さない。docker-ci は make ci を
 # 呼ぶため自動的にこの検証を含む。
 .PHONY: ci
-ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-js-engine-isolation check-publish-private test test-rendering deny check-deny-license-reject check-compat-regression check-compat-practical check-puppeteer-connect check-bench-record check-mcp-envelope ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-js-engine-isolation check-publish-private test test-rendering deny check-deny-license-reject check-compat-regression check-compat-practical check-puppeteer-connect check-bench-record check-mcp-envelope check-ci-changes ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 実測ハーネス compat-practical の自己テスト（TASK-71.1・MEAS-4。harness/compat-practical/README.md 参照）
@@ -551,6 +551,12 @@ bench-record: ## competitor_lightpanda ベンチを実行し結果を時系列�
 		--history benches/competitor_lightpanda/results/history.jsonl \
 		--source local
 
+# CI の changes ジョブが docs-only 判定に使う scripts/ci-changes.sh の自己テスト
+# （.claude/rules/ci.md「docs-only の判定」）。CI では changes ジョブが同じ自己テストを実行する。
+.PHONY: check-ci-changes
+check-ci-changes: ## CI の docs-only 判定スクリプトの自己テスト
+	@bash scripts/ci-changes.sh --self-test
+
 # record.sh の自己テスト（合成 fixture。cargo を実行しないため高速）。
 .PHONY: check-bench-record
 check-bench-record: ## competitor_lightpanda 記録スクリプトの自己テスト
@@ -571,7 +577,7 @@ check-bench-record: ## competitor_lightpanda 記録スクリプトの自己テ�
 # self-test（合成ファイルによる判定モードの自己テスト）を先に実行してから、
 # 対象 package のリリースビルド・判定に進む。`ci:` の依存には追加しない
 # （cargo build --release のコストが大きいため。判断済み）。GitHub Actions
-# での継続的なゲートは `.github/workflows/ci.yml` の `binary-size` ジョブ
+# での継続的なゲートは `.github/workflows/ci.yml` の `harness-*` ジョブの `[binary-size]` ステップ
 # （TASK-34.3・#467）が 3 OS で担う。harness/binary-size/README.md「CI」
 # 「make ci に含めない理由」参照。
 .PHONY: check-binary-size
