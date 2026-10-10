@@ -5,9 +5,12 @@
 // 手順: /json/version の browser WebSocket へ接続して Page.navigate を送る。error 応答、または
 // 結果に errorText が含まれる場合（SSRF ガードによる拒否・名前解決失敗等。本番の Page.navigate は
 // 失敗を result.errorText で返す）は非 0 で終了する。loaded 状態の偽装を防ぐ。
-const [endpoint, url] = process.argv.slice(2);
-if (!endpoint || !url) {
-  console.error("usage: node navigate.mjs <http-endpoint> <url>");
+// Chromium 向けには第 3 引数 --page-target を付ける。browser WebSocket では Page.navigate が使えないため、
+// /json/list の page ターゲットへ接続して Page.enable 後に遷移し、Page.loadEventFired まで待つ（失敗時は非 0）。
+const [endpoint, url, modeArg] = process.argv.slice(2);
+const pageTarget = modeArg === "--page-target";
+if (!endpoint || !url || (modeArg !== undefined && !pageTarget)) {
+  console.error("usage: node navigate.mjs <http-endpoint> <url> [--page-target]");
   process.exit(2);
 }
 if (typeof WebSocket === "undefined") {
@@ -19,11 +22,34 @@ if (typeof WebSocket === "undefined") {
 const CONNECT_TIMEOUT_MS = Number(process.env.NAVIGATE_CONNECT_TIMEOUT_MS) || 10000;
 let ws;
 try {
-  const res = await fetch(`${endpoint}/json/version`, {
-    signal: AbortSignal.timeout(CONNECT_TIMEOUT_MS),
-  });
-  const version = await res.json();
-  ws = new WebSocket(version.webSocketDebuggerUrl);
+  let wsUrl;
+  if (pageTarget) {
+    // 起動直後は page ターゲットが未登録のことがあるため、期限内で再試行する
+    const deadline = Date.now() + CONNECT_TIMEOUT_MS;
+    for (;;) {
+      try {
+        const res = await fetch(`${endpoint}/json/list`, { signal: AbortSignal.timeout(2000) });
+        const list = await res.json();
+        const page = Array.isArray(list)
+          ? list.find((t) => t?.type === "page" && typeof t.webSocketDebuggerUrl === "string")
+          : undefined;
+        if (page) {
+          wsUrl = page.webSocketDebuggerUrl;
+          break;
+        }
+      } catch {
+        // 未起動の可能性があるため期限まで再試行する
+      }
+      if (Date.now() >= deadline) throw new Error("no page target within the deadline");
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  } else {
+    const res = await fetch(`${endpoint}/json/version`, {
+      signal: AbortSignal.timeout(CONNECT_TIMEOUT_MS),
+    });
+    wsUrl = (await res.json()).webSocketDebuggerUrl;
+  }
+  ws = new WebSocket(wsUrl);
   await new Promise((resolve, reject) => {
     const timer = setTimeout(
       () => reject(new Error(`websocket connect timeout after ${CONNECT_TIMEOUT_MS}ms`)),
@@ -39,8 +65,20 @@ try {
 
 let nextId = 1;
 const pending = new Map();
+const eventWaiters = new Map();
+function waitEvent(method) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => (eventWaiters.delete(method), reject(new Error(`${method}: timeout`))), 60000);
+    eventWaiters.set(method, (params) => (clearTimeout(timer), resolve(params)));
+  });
+}
 ws.onmessage = (ev) => {
   const msg = JSON.parse(String(ev.data));
+  if (msg.method) {
+    const w = eventWaiters.get(msg.method);
+    if (w) (eventWaiters.delete(msg.method), w(msg.params ?? {}));
+    return;
+  }
   const p = pending.get(msg.id);
   if (!p) return;
   pending.delete(msg.id);
@@ -64,12 +102,19 @@ function send(method, params = {}, sessionId) {
 try {
   // 現行の fandhe-browser は Target.createTarget が未実装（method not implemented）のため、
   // browser WebSocket 上で Page.navigate を直接送る。Target.* が実装されたら本手順を見直す。
+  let loaded;
+  if (pageTarget) {
+    await send("Page.enable");
+    loaded = waitEvent("Page.loadEventFired");
+    loaded.catch(() => {}); // 先に失敗した場合の未処理 rejection を防ぐ（後段で await する）
+  }
   const nav = await send("Page.navigate", { url });
   if (typeof nav.errorText === "string" && nav.errorText !== "") {
     console.error(`error: Page.navigate failed: ${nav.errorText}`);
     ws.close();
     process.exit(1);
   }
+  if (loaded) await loaded;
   console.log(JSON.stringify({ ok: true, nav }));
   ws.close();
 } catch (e) {

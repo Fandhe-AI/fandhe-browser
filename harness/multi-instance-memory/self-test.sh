@@ -96,6 +96,37 @@ STUB_EOF
     || fail "navigate.mjs must exit 0 without errorText"
   ok "navigate.mjs: errorText -> exit 1, success -> exit 0"
 
+  # --page-target（Chromium 向け）: /json/list の page ターゲットへ接続し、loadEventFired まで待つ
+  cat >"$TMP/stub-page.mjs" <<'STUBP_EOF'
+globalThis.fetch = async (u) => ({
+  json: async () => (String(u).endsWith("/json/list")
+    ? [{ type: "page", webSocketDebuggerUrl: "ws://stub/page" }]
+    : {}),
+});
+globalThis.WebSocket = class {
+  constructor(u) { if (u !== "ws://stub/page") throw new Error("unexpected ws url"); queueMicrotask(() => this.onopen()); }
+  send(data) {
+    const { id, method } = JSON.parse(data);
+    const result = method === "Page.navigate" ? JSON.parse(process.env.STUB_RESULT) : {};
+    queueMicrotask(() => {
+      this.onmessage({ data: JSON.stringify({ id, result }) });
+      if (method === "Page.navigate" && process.env.STUB_LOAD === "1" && !result.errorText) {
+        this.onmessage({ data: JSON.stringify({ method: "Page.loadEventFired", params: {} }) });
+      }
+    });
+  }
+  close() {}
+};
+STUBP_EOF
+  st=0
+  STUB_LOAD=1 STUB_RESULT='{"frameId":"f","errorText":"net::ERR_NAME_NOT_RESOLVED"}' \
+    node --import "$TMP/stub-page.mjs" "$SCRIPT_DIR/navigate.mjs" http://stub https://example.com/ --page-target >/dev/null 2>&1 || st=$?
+  [ "$st" -eq 1 ] || fail "navigate.mjs --page-target must exit 1 on errorText (got $st)"
+  STUB_LOAD=1 STUB_RESULT='{"frameId":"f"}' \
+    node --import "$TMP/stub-page.mjs" "$SCRIPT_DIR/navigate.mjs" http://stub https://example.com/ --page-target >/dev/null 2>&1 \
+    || fail "navigate.mjs --page-target must exit 0 after loadEventFired"
+  ok "navigate.mjs --page-target: errorText -> exit 1, loadEventFired -> exit 0"
+
   # 組み込み WebSocket が Origin ヘッダを送らないこと（cdp の ws.rs は Origin 付きを 403 で拒否する）と、
   # ハンドシェイクに応答しないサーバーへの接続が期限内に非 0 で終了すること（短い期限は環境変数で上書き）
   cat >"$TMP/origin-check.mjs" <<'ORIGIN_EOF'
@@ -130,6 +161,33 @@ HANG_EOF
 else
   echo "note: node not found; navigate.mjs errorText handling NOT verified"
 fi
+
+# Chromium 経路（オフライン）: 偽 Chromium が受け取った引数を記録し、起動引数の組み立てを検証する
+cat >"$TMP/fake-chromium" <<'FAKECR_EOF'
+#!/bin/sh
+printf '%s\n' "$@" >"$ARGS_DIR/args.$$"
+exec sleep 300
+FAKECR_EOF
+chmod +x "$TMP/fake-chromium"
+mkdir -p "$TMP/cargs"
+ARGS_DIR="$TMP/cargs" "$MEASURE" -n 2 --fandhe-bin /bin/true --skip-fandhe --chromium-bin "$TMP/fake-chromium" \
+  --conditions idle --settle 0 >/dev/null 2>&1 || fail "fake chromium idle run failed"
+cat "$TMP"/cargs/args.* >"$TMP/cargs.all"
+for want in --remote-debugging-address=127.0.0.1 --remote-debugging-port=9401 --remote-debugging-port=9402 about:blank; do
+  grep -qxF -- "$want" "$TMP/cargs.all" || fail "chromium args must include '$want'"
+done
+ok "chromium launch args: loopback-only remote debugging port per instance, about:blank"
+
+# loaded: 遷移確認ができない（偽 Chromium は CDP に応答しない）場合は計測を中断し終了コード 1。
+# URL は起動引数に渡さない
+rm -f "$TMP"/cargs/args.*
+st=0
+ARGS_DIR="$TMP/cargs" NAVIGATE_CONNECT_TIMEOUT_MS=500 "$MEASURE" -n 1 --fandhe-bin /bin/true --skip-fandhe \
+  --chromium-bin "$TMP/fake-chromium" --conditions loaded --url https://example.com/ --settle 0 >/dev/null 2>&1 || st=$?
+[ "$st" -eq 1 ] || fail "chromium loaded without a verified navigation must exit 1 (got $st)"
+if grep -q 'example.com' "$TMP"/cargs/args.* 2>/dev/null; then fail "URL must not be a chromium launch argument"; fi
+ok "chromium loaded: unverified navigation aborts the measurement (exit 1)"
+if pgrep -f "$TMP/fake-chromium" >/dev/null 2>&1; then fail "leftover fake chromium processes"; fi
 
 # 偽バイナリ: 親 sh + 子 sleep 2 本（プロセスツリー走査を検証）。ポートは使わない。
 FAKE="$TMP/fake-fandhe"

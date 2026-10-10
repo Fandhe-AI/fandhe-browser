@@ -19,15 +19,16 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
 - 2 条件（1 インスタンスの定義）:
   - `idle`: 起動して `--settle` 秒待ったアイドル状態（fandhe は JS 子プロセスが遅延起動のため未使用）
   - `loaded`: 全インスタンスで同一の**公開 URL**（`--url`。http(s) のみ）を読み込み、`--settle` 秒待った状態。
-    fandhe は CDP の `Page.navigate`（`navigate.mjs`）、Chromium は起動引数の URL で読み込む。
-    `Page.navigate` が `result.errorText` を返した場合（取得失敗・SSRF ガードによる拒否）は
-    `navigate.mjs` が非 0 で終了し、計測は失敗（終了コード 1）になる。loaded を装わない。
-    Chromium 側はロード完了を検知せず待機時間に頼るため、重いページでは `--settle` を延ばす
+    両者とも CDP の `Page.navigate`（`navigate.mjs`）で遷移させる。Chromium は `about:blank` で起動し
+    （idle・loaded で起動条件を揃える）、`--remote-debugging-port`（インスタンス i は 9400+i、127.0.0.1 限定）の
+    page ターゲットへ `--page-target` モードで接続して遷移し、`Page.loadEventFired` まで待つ。
+    `Page.navigate` が `result.errorText` を返した場合（DNS・TLS・接続失敗、fandhe では SSRF ガードによる拒否も）は
+    `navigate.mjs` が非 0 で終了し、計測は失敗（終了コード 1）になる。エラーページの PSS を loaded として出さない
 
 ## 前提
 
 - **Linux 専用**（`/proc/<pid>/smaps_rollup`）。macOS・Windows では終了コード 2 で終わる
-- bash・ps・awk・curl に加え、`loaded` 条件の fandhe 側は node 22 以降（npm 依存なし）
+- bash・ps・awk・curl に加え、`loaded` 条件は node 22 以降（fandhe・Chromium 双方の遷移確認に使う）（npm 依存なし）
 - fandhe-browser はリリースビルドを推奨（`cargo build --release -p fandhe-browser-cli`）。
   JS エンジン構成を変えた場合は構成を記録に残す
 - Chromium/Chrome の実行ファイル（`--chromium-bin`）。root で実行する場合やコンテナ内では

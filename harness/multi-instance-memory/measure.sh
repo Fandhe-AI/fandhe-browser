@@ -8,7 +8,8 @@
 #
 # Linux 専用（/proc/<pid>/smaps_rollup を使う）。macOS・Windows では終了コード 2 で終わる。
 # 依存: bash・ps・awk・curl・sleep・kill・（netns 分離時）unshare・nsenter・ip、
-#       （loaded 条件の fandhe 側）root・iptables・node 22 以降（navigate.mjs。npm 依存なし）。
+#       （loaded 条件）node 22 以降（navigate.mjs。npm 依存なし。fandhe・Chromium 双方の遷移確認）、
+#       （loaded 条件の fandhe 側）root・iptables。
 # loaded 条件は公開 URL を使う。fandhe の Page.navigate は loopback・プライベートアドレス・file: を
 # SSRF ガードで拒否するため、netns ごとに veth ペア＋ホスト側 NAT（MASQUERADE）で外向き経路を用意する。
 # 終了コード: 0 成功 / 1 計測失敗（起動後のプロセス消失・smaps 読み取り不可など）/ 2 使用エラー・前提不足。
@@ -19,6 +20,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # fandhe-browser は待ち受けアドレスが 127.0.0.1:9333 固定で変更手段が無い（server.rs の DEFAULT_ADDR）
 FANDHE_PORT=9333
 MAX_N=200
+# Chromium のリモートデバッグポート（インスタンス i は CHROMIUM_PORT_BASE+i。127.0.0.1 限定）。
+# loaded 条件で fandhe と同様に取得成功を CDP で確認するために使う。N<=200 なので 9401..9600
+CHROMIUM_PORT_BASE=9400
 # 外向き経路（loaded 条件）用のプライベート帯。インスタンス i に 10.213.i.0/30 を割り当てる
 # （ホスト側 .1・netns 側 .2）。既存ネットワークと衝突する環境では EGRESS_BASE を書き換える。
 EGRESS_BASE="10.213"
@@ -140,6 +144,9 @@ for tool in ps awk curl sleep kill; do
 done
 if printf '%s\n' "${COND_LIST[@]}" | grep -qx loaded && [ "$SKIP_FANDHE" -eq 0 ]; then
   command -v node >/dev/null 2>&1 || die "node (22+) is required for the loaded condition"
+fi
+if printf '%s\n' "${COND_LIST[@]}" | grep -qx loaded && [ "$SKIP_CHROMIUM" -eq 0 ]; then
+  command -v node >/dev/null 2>&1 || die "node (22+) is required for the loaded condition (chromium navigation check)"
 fi
 
 # ---- fandhe のネットワーク分離方式 ----
@@ -313,13 +320,17 @@ attach_egress() { # $1=index $2=leader pid
   add_instance_rules "$host_if" "$EGRESS_BASE.$1.0/30"
 }
 
-launch_chromium() { # $1=index $2=url
-  local i="$1" page="$2" udir="$WORK/chromium/$1"
+# 常に about:blank で起動する（idle・loaded で起動条件を揃える）。loaded の URL は CDP で遷移させ、
+# errorText とロード完了を確認する（launch 引数の URL では取得失敗を検知できないため）。
+launch_chromium() { # $1=index
+  local i="$1" udir="$WORK/chromium/$1"
   local -a extra=()
   mkdir -p "$udir"
   if [ -n "$CHROMIUM_EXTRA" ]; then read -r -a extra <<<"$CHROMIUM_EXTRA"; fi
   setsid "$CHROMIUM_BIN" --headless=new --disable-gpu --no-first-run \
-    --no-default-browser-check "--user-data-dir=$udir" "${extra[@]}" "$page" \
+    --no-default-browser-check "--user-data-dir=$udir" \
+    --remote-debugging-address=127.0.0.1 "--remote-debugging-port=$((CHROMIUM_PORT_BASE + i))" \
+    "${extra[@]}" about:blank \
     >"$WORK/log-chromium-$i.txt" 2>&1 &
   LEADERS+=("$!")
 }
@@ -347,6 +358,16 @@ navigate_all() { # fandhe の全インスタンスで同一 URL を CDP 経由�
   for pid in "${LEADERS[@]}"; do
     in_ns "$pid" node "$SCRIPT_DIR/navigate.mjs" "http://127.0.0.1:$FANDHE_PORT" "$URL" >/dev/null \
       || { echo "error: navigation failed for pid $pid" >&2; return 1; }
+  done
+}
+
+navigate_chromium_all() { # Chromium の全インスタンスで同一 URL を CDP 経由で読み込み、失敗時は中断する
+  local i pid
+  for ((i = 1; i <= N; i++)); do
+    pid="${LEADERS[$((i - 1))]}"
+    kill -0 "$pid" 2>/dev/null || { echo "error: chromium instance $i (pid $pid) exited before navigation" >&2; return 1; }
+    node "$SCRIPT_DIR/navigate.mjs" "http://127.0.0.1:$((CHROMIUM_PORT_BASE + i))" "$URL" --page-target >/dev/null \
+      || { echo "error: navigation failed for chromium instance $i" >&2; return 1; }
   done
 }
 
@@ -400,18 +421,17 @@ sample_cycle() { # $1=target $2=condition。結果を RES_* と RESULTS へ
 }
 
 run_cycle() { # $1=target $2=condition
-  local target="$1" cond="$2" i page="about:blank"
+  local target="$1" cond="$2" i
   LEADERS=()
   log "start $N x $target ($cond)"
   for ((i = 1; i <= N; i++)); do
     if [ "$target" = "fandhe" ]; then launch_fandhe "$i"
-    else
-      [ "$cond" != "loaded" ] || page="$URL"
-      launch_chromium "$i" "$page"
+    else launch_chromium "$i"
     fi
   done
   if [ "$target" = "fandhe" ]; then wait_fandhe_ready; fi
   if [ "$target" = "fandhe" ] && [ "$cond" = "loaded" ]; then navigate_all; fi
+  if [ "$target" = "chromium" ] && [ "$cond" = "loaded" ]; then navigate_chromium_all; fi
   sleep "$SETTLE"
   sample_cycle "$target" "$cond"
   kill_all
