@@ -11,21 +11,27 @@
 //! `TASK-10.2.1`（Issue #549）で、レコードの受け口（[`OperationRecorder`]・
 //! [`RecorderHandle`]）とテスト・簡易集計用の有界メモリ内集計器
 //! （[`InMemoryRecorder`]）を追加し、`fetch`・`parse`・`dom` へ計装を組み込んだ。
-//! `query`・`js_stub` へは Issue #550（`TASK-10.2.2`）で組み込み済み。本番の出力先
-//! （ファイル・外部基盤）・保持期間は Issue #221（`TASK-10.3`）と Issue #218
-//! （`TASK-10（10.h1）`。出力形式・保持期間・収集基盤の決定。担当は人間、
-//! 本 Issue 時点で未決）が担当する。recorder は呼び出し側が options 経由で
-//! 明示注入する方式で、未設定（既定）なら一切記録しない（process-global は
-//! 並列テストで記録が混ざるため採らない）。
+//! `query`・`js_stub` へは Issue #550（`TASK-10.2.2`）で組み込み済み。
 //!
-//! [`OperationRecord::to_json_line`] は、workspace が `serde` 等のシリアライズ
-//! 用クレートを持たない現時点での **暫定** エンコーダである（dependency-policy.md
-//! の依存最小・ユーザー承認制のため、本 Issue では依存を追加しない）。
-//! 出力形式が #218 で確定した際は、本関数の差し替え、または `serde` 導入
-//! （導入する場合は改めてユーザー承認を要る）が見込まれる。
+//! 出力形式・保持期間・収集基盤は Issue #218（`TASK-10（10.h1）`）で決定済みで、
+//! 詳細は `docs/design/observability.md` に記録している（JSON Lines のみ・既定無効・
+//! 有効時の出力先は stderr・外部収集基盤は MVP で採用しない）。Issue #221
+//! （`TASK-10.3`）で、その決定に沿った出力先 [`JsonLinesRecorder`]（stderr 向けの
+//! 別名 [`StderrRecorder`]）を追加した。config の `[observability]` セクション・CLI
+//! フラグ・ファイル出力（ローテーション）・起動時イベントは未配線で、後続の担当
+//! （`REPAIR-9` の残り）である。recorder は呼び出し側が options 経由で明示注入する
+//! 方式で、未設定（既定）なら一切記録しない（process-global は並列テストで記録が
+//! 混ざるため採らない）。
+//!
+//! [`OperationRecord::to_json_line`] は `serde` を使わない自前のエンコーダで、#218 の
+//! 決定により JSON Lines の 1 行表現としてそのまま採用する（依存追加なし）。
 
 use std::fmt;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
@@ -443,7 +449,7 @@ const IN_MEMORY_PREALLOC_LIMIT: usize = 64;
 /// 件数上限付きのメモリ内 [`OperationRecorder`]。
 ///
 /// **テスト・簡易集計用のユーティリティであり、本番の出力先ではない**
-/// （出力先は Issue #218 で決定し #221 で実装する。`REPAIR-9`・`TASK-10.3`）。
+/// （本番の出力先は [`StderrRecorder`]。`REPAIR-9`・`TASK-10.3`・#221）。
 /// 上限超過分は捨てて [`InMemoryRecorder::dropped`] に数える。
 #[derive(Debug, Default)]
 pub struct InMemoryRecorder {
@@ -503,6 +509,139 @@ impl OperationRecorder for InMemoryRecorder {
     }
 }
 
+/// 有界キューの既定容量（件数）。1 件は高々数百バイトの JSON 1 行なので、
+/// 満杯時でも保持するメモリは小さい。
+pub const DEFAULT_JSON_LINES_QUEUE_CAPACITY: usize = 1024;
+
+/// 有界キュー容量の上限（件数）。`with_capacity` はこれを超える値を切り詰め、
+/// 巨大値（`usize::MAX` 等）による確保失敗・abort を防ぐ。
+pub const MAX_JSON_LINES_QUEUE_CAPACITY: usize = 65_536;
+
+/// JSON Lines（1 レコード 1 行）で `W` へ書き出す [`OperationRecorder`]
+/// （`REPAIR-9`・`TASK-10.3`・Issue #221。形式は #218 の決定）。
+///
+/// cli が生成し、`FetchOptions::with_recorder`・`ParseOptions::with_recorder`・
+/// `JsStubOptions::with_recorder`・`Document::set_recorder` へ
+/// `Arc<dyn OperationRecorder>` として注入する想定（現時点で core の外に注入箇所は
+/// なく、config・CLI からの有効化は未配線）。各行は [`OperationRecord::to_json_line`]
+/// の結果に `\n` を 1 つ付けたもので、操作種別・成否・レイテンシ・タイムスタンプを含む。
+///
+/// 契約（`REPAIR-9`・`TASK-10.3`）: [`OperationRecorder::record`] は呼び出し元
+/// （async の fetch 経路を含む）を**ブロックしない**。`record` は行を有界キューへ
+/// `try_send` するだけで、`write_all` と `flush` は専用の writer スレッドが行う。
+/// キューが満杯（受け手が詰まり writer が進まない場合など）のときは、そのレコードを
+/// 捨てて [`JsonLinesRecorder::dropped`] に数え、操作は継続する。panic しない。
+/// 書き込み・flush の失敗は握りつぶして [`JsonLinesRecorder::write_failures`] に数える
+/// （操作の失敗へ波及させない）。失敗後は行境界を保つため出力を停止し、以後のレコードは
+/// `dropped` に数える。1 行は 1 回の `write_all` で書くため行は混ざらず、
+/// 記録順は（捨てられない限り）キューへ入れた順に保たれる。
+pub struct JsonLinesRecorder<W: Write + Send + 'static> {
+    tx: SyncSender<String>,
+    /// writer スレッド。起動に失敗した場合は `None`（全レコードを `dropped` に数える）。
+    worker: Option<JoinHandle<W>>,
+    write_failures: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
+}
+
+/// stderr へ JSON Lines を書き出す recorder（`REPAIR-9`・`TASK-10.3`）。
+pub type StderrRecorder = JsonLinesRecorder<io::Stderr>;
+
+impl<W: Write + Send + 'static> JsonLinesRecorder<W> {
+    /// 既定容量（[`DEFAULT_JSON_LINES_QUEUE_CAPACITY`]）のキューで `writer` へ書き出す
+    /// recorder を作り、writer スレッドを起動する。
+    pub fn new(writer: W) -> Self {
+        Self::with_capacity(writer, DEFAULT_JSON_LINES_QUEUE_CAPACITY)
+    }
+
+    /// キュー容量 `capacity` 件で recorder を作る。0 は 1 件へ切り上げ、
+    /// [`MAX_JSON_LINES_QUEUE_CAPACITY`] 超過は同値へ切り詰める（巨大値による
+    /// 確保失敗・panic を防ぐ）。
+    pub fn with_capacity(writer: W, capacity: usize) -> Self {
+        let capacity = capacity.clamp(1, MAX_JSON_LINES_QUEUE_CAPACITY);
+        let (tx, rx) = sync_channel::<String>(capacity);
+        let write_failures = Arc::new(AtomicU64::new(0));
+        let failures = Arc::clone(&write_failures);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let worker_dropped = Arc::clone(&dropped);
+        let worker = std::thread::Builder::new()
+            .name("fandhe-jsonl-recorder".to_owned())
+            .spawn(move || {
+                let mut writer = writer;
+                // 書き込み失敗後は行境界が壊れている可能性があるため、以後は出力を
+                // 止めて全レコードを `dropped` に数える（1 レコード 1 行の維持）。
+                let mut broken = false;
+                // 送信側が全て閉じ、キューを掃き終えたら終了する。
+                while let Ok(line) = rx.recv() {
+                    if broken {
+                        worker_dropped.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let result = writer
+                        .write_all(line.as_bytes())
+                        .and_then(|()| writer.flush());
+                    if result.is_err() {
+                        failures.fetch_add(1, Ordering::Relaxed);
+                        broken = true;
+                    }
+                }
+                writer
+            })
+            .ok();
+        Self {
+            tx,
+            worker,
+            write_failures,
+            dropped,
+        }
+    }
+
+    /// 書き込み（または flush）に失敗した件数。
+    pub fn write_failures(&self) -> u64 {
+        self.write_failures.load(Ordering::Relaxed)
+    }
+
+    /// キュー満杯・writer スレッド不在・書き込み失敗後の停止で捨てたレコード数。
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// キューを掃き終えるまで待って writer を取り出す（テスト・終了時用）。
+    ///
+    /// writer がブロックしている間は戻らない。writer スレッドが起動できなかった、
+    /// または writer が panic した場合は `None`。
+    pub fn into_inner(self) -> Option<W> {
+        let Self { tx, worker, .. } = self;
+        drop(tx);
+        worker?.join().ok()
+    }
+}
+
+impl JsonLinesRecorder<io::Stderr> {
+    /// stderr 向けの recorder を作る。
+    pub fn stderr() -> Self {
+        Self::new(io::stderr())
+    }
+}
+
+impl<W: Write + Send + 'static> fmt::Debug for JsonLinesRecorder<W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JsonLinesRecorder")
+            .field("write_failures", &self.write_failures())
+            .field("dropped", &self.dropped())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<W: Write + Send + 'static> OperationRecorder for JsonLinesRecorder<W> {
+    fn record(&self, record: &OperationRecord) {
+        let mut line = record.to_json_line();
+        line.push('\n');
+        // ブロックしない。満杯・切断のときは捨てて数える。
+        if self.tx.try_send(line).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,5 +895,306 @@ mod tests {
         assert!(!line.contains('\r'));
         assert!(line.starts_with('{'));
         assert!(line.ends_with('}'));
+    }
+
+    /// 共有バッファへ書く `Write`（poison・並行テスト用）。
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailWrite;
+    impl Write for FailWrite {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("write failed"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailFlush;
+    impl Write for FailFlush {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("flush failed"))
+        }
+    }
+
+    fn fixed_records() -> (OperationRecord, OperationRecord) {
+        let ts = UNIX_EPOCH + Duration::from_millis(1_700_000_000_000);
+        let ok = OperationRecord::new(
+            OperationKind::Fetch,
+            OperationOutcome::Success,
+            Duration::from_micros(1500),
+            ts,
+        )
+        .expect("timestamp is within range");
+        let ng = OperationRecord::new(
+            OperationKind::Fetch,
+            OperationOutcome::Failure {
+                kind: FailureKind::Timeout,
+            },
+            Duration::from_micros(1500),
+            ts,
+        )
+        .expect("timestamp is within range");
+        (ok, ng)
+    }
+
+    /// `REPAIR-9`: 1 レコード 1 行で、各行が `to_json_line()` + 改行と完全一致する。
+    #[test]
+    fn repair_9_json_lines_recorder_writes_one_line_per_record() {
+        let (ok, ng) = fixed_records();
+        let r = JsonLinesRecorder::new(Vec::<u8>::new());
+        r.record(&ok);
+        r.record(&ng);
+        assert_eq!(r.write_failures(), 0);
+        let out = String::from_utf8(r.into_inner().expect("writer")).expect("utf8");
+        assert_eq!(
+            out,
+            format!("{}\n{}\n", ok.to_json_line(), ng.to_json_line())
+        );
+        assert_eq!(out.lines().count(), 2);
+    }
+
+    /// `REPAIR-9`: 出力に操作種別・成否・レイテンシ・タイムスタンプが含まれる。
+    #[test]
+    fn repair_9_json_lines_output_contains_required_fields() {
+        let (_, ng) = fixed_records();
+        let r = JsonLinesRecorder::new(Vec::<u8>::new());
+        r.record(&ng);
+        let out = String::from_utf8(r.into_inner().expect("writer")).expect("utf8");
+        for key in [
+            "\"operation\":\"fetch\"",
+            "\"outcome\":\"failure\"",
+            "\"latency_us\":1500",
+            "\"timestamp_unix_ms\":1700000000000",
+        ] {
+            assert!(out.contains(key), "missing {key} in {out}");
+        }
+    }
+
+    /// 非同期の writer スレッドが条件を満たすまで待つ（最大 10 秒）。
+    fn wait_until(mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn buf_text(buf: &SharedBuf) -> String {
+        let out = buf.0.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8(out.clone()).expect("utf8")
+    }
+
+    /// `REPAIR-9`: 書き込み失敗は握りつぶして数える。
+    #[test]
+    fn repair_9_json_lines_recorder_swallows_write_errors() {
+        let (ok, _) = fixed_records();
+        let r = JsonLinesRecorder::new(FailWrite);
+        r.record(&ok);
+        r.record(&ok);
+        // 1 件目の失敗後は出力を止め、2 件目は dropped に数える。
+        wait_until(|| r.write_failures() == 1 && r.dropped() == 1);
+        assert_eq!(r.write_failures(), 1);
+        assert_eq!(r.dropped(), 1);
+    }
+
+    /// `REPAIR-9`: 巨大な capacity でも panic せず上限へ切り詰められる。
+    #[test]
+    fn repair_9_json_lines_recorder_clamps_huge_capacity() {
+        let (ok, _) = fixed_records();
+        let buf = SharedBuf::default();
+        let r = JsonLinesRecorder::with_capacity(buf.clone(), usize::MAX);
+        r.record(&ok);
+        drop(r.into_inner().expect("writer"));
+        assert_eq!(buf_text(&buf).lines().count(), 1);
+    }
+
+    /// 行の途中まで書いて失敗する writer。
+    struct PartialThenFail {
+        buf: SharedBuf,
+        failed: bool,
+    }
+
+    impl Write for PartialThenFail {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            if self.failed {
+                return self.buf.write(data);
+            }
+            self.failed = true;
+            self.buf.write(&data[..data.len().min(5)])?;
+            Err(io::Error::other("partial"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `REPAIR-9`: 部分書き込み失敗後は出力を止め、次レコードを同一行へ連結しない。
+    #[test]
+    fn repair_9_json_lines_recorder_stops_after_partial_write() {
+        let (ok, _) = fixed_records();
+        let buf = SharedBuf::default();
+        let r = JsonLinesRecorder::new(PartialThenFail {
+            buf: buf.clone(),
+            failed: false,
+        });
+        r.record(&ok);
+        r.record(&ok);
+        wait_until(|| r.write_failures() == 1 && r.dropped() == 1);
+        drop(r.into_inner());
+        assert_eq!(buf_text(&buf).len(), 5);
+    }
+
+    /// `REPAIR-9`: flush のみ失敗しても失敗として数える。
+    #[test]
+    fn repair_9_json_lines_recorder_flush_error_counts_as_failure() {
+        let (ok, _) = fixed_records();
+        let r = JsonLinesRecorder::new(FailFlush);
+        r.record(&ok);
+        wait_until(|| r.write_failures() == 1);
+        assert_eq!(r.write_failures(), 1);
+    }
+
+    /// `REPAIR-9`: `RecorderHandle` 経由でも 1 行出力される。
+    #[test]
+    fn repair_9_json_lines_recorder_via_handle() {
+        let buf = SharedBuf::default();
+        let handle = RecorderHandle::new(Arc::new(JsonLinesRecorder::new(buf.clone())));
+        handle.record_outcome(
+            OperationKind::Parse,
+            OperationOutcome::Success,
+            Duration::from_micros(10),
+        );
+        wait_until(|| buf_text(&buf).lines().count() == 1);
+        let text = buf_text(&buf);
+        assert!(text.contains("\"operation\":\"parse\""), "{text}");
+    }
+
+    /// `REPAIR-9`: 並行記録でも行が混ざらない（4 スレッド × 25 件 = 100 行）。
+    #[test]
+    fn repair_9_json_lines_recorder_concurrent_lines_not_interleaved() {
+        let (ok, _) = fixed_records();
+        let buf = SharedBuf::default();
+        let r = Arc::new(JsonLinesRecorder::new(buf.clone()));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let r = Arc::clone(&r);
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        r.record(&ok);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("join");
+        }
+        assert_eq!(r.dropped(), 0);
+        wait_until(|| buf_text(&buf).lines().count() == 100);
+        let text = buf_text(&buf);
+        for line in text.lines() {
+            assert_eq!(line, ok.to_json_line());
+        }
+    }
+
+    /// 書き込みが始まったら通知し、解放されるまで止まる `Write`（受け手が詰まった
+    /// stderr パイプの模擬）。
+    struct StalledSink {
+        entered: std::sync::mpsc::Sender<()>,
+        gate: std::sync::mpsc::Receiver<()>,
+        out: SharedBuf,
+    }
+
+    impl Write for StalledSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let _ = self.entered.send(());
+            // gate の送信側が drop されると recv が Err で戻り、解放される。
+            let _ = self.gate.recv();
+            self.out.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `REPAIR-9`・`TASK-10.3`: sink が詰まっても `record()` は即座に戻り、
+    /// キュー満杯分は厳密な件数で `dropped()` に数える。解放後は受理済みの行だけが
+    /// 順に出力される。
+    #[test]
+    fn repair_9_json_lines_recorder_does_not_block_on_stalled_sink() {
+        let (ok, _) = fixed_records();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let out = SharedBuf::default();
+        let sink = StalledSink {
+            entered: entered_tx,
+            gate: gate_rx,
+            out: out.clone(),
+        };
+        let r = JsonLinesRecorder::with_capacity(sink, 3);
+
+        // 1 件目を writer が取り出して write 内で詰まるまで待つ（キューは空になる）。
+        r.record(&ok);
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("writer entered");
+
+        // 詰まったまま 3 件はキューに入り、残り 7 件は捨てられる。全体で即座に戻る。
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            r.record(&ok);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "record() blocked on a stalled sink"
+        );
+        assert_eq!(r.dropped(), 7);
+        assert_eq!(r.write_failures(), 0);
+
+        // 解放すると受理済みの 1 + 3 = 4 行だけが出力される。
+        drop(gate_tx);
+        let sink = r.into_inner().expect("writer");
+        drop(sink);
+        let text = buf_text(&out);
+        assert_eq!(text.lines().count(), 4);
+        for line in text.lines() {
+            assert_eq!(line, ok.to_json_line());
+        }
+    }
+
+    /// `REPAIR-9`: 容量 0 は 1 件に切り上げる（以降の `record()` が即座に捨てるだけに
+    /// ならない）。
+    #[test]
+    fn repair_9_json_lines_recorder_zero_capacity_rounds_up_to_one() {
+        let (ok, _) = fixed_records();
+        let r = JsonLinesRecorder::with_capacity(Vec::<u8>::new(), 0);
+        r.record(&ok);
+        let out = String::from_utf8(r.into_inner().expect("writer")).expect("utf8");
+        assert_eq!(out, format!("{}\n", ok.to_json_line()));
+    }
+
+    /// `REPAIR-9`: stderr recorder を構築できる（stderr の内容は検証しない）。
+    #[test]
+    fn repair_9_stderr_recorder_constructs() {
+        let r: StderrRecorder = JsonLinesRecorder::stderr();
+        assert_eq!(r.write_failures(), 0);
+        assert_eq!(r.dropped(), 0);
     }
 }

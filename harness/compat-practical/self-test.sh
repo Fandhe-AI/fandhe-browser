@@ -2,7 +2,7 @@
 #
 # access_check.sh・lib.sh の自己テスト（TASK-71.1・MEAS-4）。オフライン専用:
 # curl は PATH 先頭のスタブへ差し替え、実ネットワークへは出ない。呼び出し元は
-# .github/workflows/ci.yml の compat-regression ジョブと Makefile の
+# .github/workflows/ci.yml の harness-* ジョブの [compat-regression] ステップと Makefile の
 # check-compat-practical ターゲット。一時ファイルはすべて mktemp の絶対パスに置き、
 # trap で削除する（リポジトリ内にはファイルを作らない）。
 set -euo pipefail
