@@ -41,7 +41,7 @@ cargo test --workspace
 - 各 OS のネイティブランナーでビルド・テストする（クロスコンパイル前提にしない）
 - ビルド・テスト（`rust-test-*`・`rust-features-*`）と OS 依存のファイルシステム挙動のテスト（パス・大文字小文字・ロック）は、**main への push と release 前に 3 OS すべてで実行する**（オーナー判断 2026-10-10。CI 待ち行列の解消のため）。main への push が続いた場合は concurrency の `cancel-in-progress` で古い run を中止し、最新のコミットだけを検証する
 - PR では既定で ubuntu のみ検証し、macOS・Windows ジョブ（`*-macos`・`*-windows`・`windows-servo-prereqs`）は skipped にする。ただし `changes` が `xos=true` を出した PR は 3 OS で実行する。`xos=true` になるのは、OS 差異の影響を受けやすいパス（`crates/fandhe-browser-profile/`・`.github/`・`Cargo.toml` / `Cargo.lock`・`rust-toolchain.toml`・`scripts/`・`.gitattributes`・ファイル名に `windows` / `unix` / `macos` を含むもの・`platform/` 配下）を含む PR と、`*.rs` の差分の追加・削除行に `target_os` / `target_family` / `windows` / `unix` / `macos` の語がある PR（`cfg_attr` や折り返した `cfg(all(..))` も拾う）
-- 既存の OS 分岐の中身だけを変える PR や、共通コードの OS 差異は PR では検出できず、main への push で判明する。これはマージ前の待ち時間と引き換えにオーナーが受け入れた残存リスク（2026-10-10）であり、レビューでは P0 にしない
+- 既存の OS 分岐の中身だけを変える PR や、共通コードの OS 差異は PR では検出できず、main への push で判明する。これはマージ前の待ち時間と引き換えにオーナーが判断した残存リスク（2026-10-10）
 - main の push で macOS・Windows だけが失敗した場合は、修正 PR で直す（その PR は `xos=true` になるよう対象を含める。含まれない場合も、修正対象の OS 分岐を触れば content 判定で 3 OS になる）
 - `cargo tree` による分離検証（`harness-*` の `[render-isolation]`・`[js-engine-isolation]`）は target 依存のため 3 OS で実行する。`cargo fmt`・`cargo deny` は OS 非依存のため ubuntu のみ（`rust-lint`）
 - cache（`actions/cache`・`scripts/ci-prune-target.sh` で workspace 成果物を除いてから保存）は ubuntu・macOS のみ。Windows は cache prune の既知問題で除外する（その分 Windows ジョブは所要時間が長いため timeout を長めに取る）

@@ -63,7 +63,7 @@ make check-mcp-envelope     # 実 mcp バイナリでの e2e smoke（`make ci` �
 ### 3 OS 一級対応
 
 - CI は Linux・macOS・Windows の 3 OS ネイティブランナーでビルド・テストする（クロスコンパイル前提にしない）
-- 3 OS の実行タイミングはオーナー判断（2026-10-10）で「main への push・release 前・OS 依存の変更を含む PR（`changes` ジョブの `xos=true`）」とし、それ以外の PR は ubuntu のみで検証する（`.claude/rules/ci.md`「3 OS CI」）。既存の OS 分岐の中身だけを変える PR などの OS 差異が main への push まで判明しないのは、受け入れ済みの残存リスクであり、`ci.yml` の xos 条件そのものを P0 として指摘しない（判定の抜け・fail-open は従来どおり指摘する）
+- 3 OS の実行タイミングはオーナー判断（2026-10-10）で「main への push・release 前・OS 依存の変更を含む PR（`changes` ジョブの `xos=true`）」とし、それ以外の PR は ubuntu のみで検証する（`.claude/rules/ci.md`「3 OS CI」）。既存の OS 分岐の中身だけを変える PR などの OS 差異は main への push まで判明しない（オーナーが待ち時間との引き換えで判断した残存リスク）
 - OS 固有のパス・大文字小文字非区別ファイルシステム・改行コードに関わる変更は、PR 本文に 3 OS での実行結果が記載されているか（同じ PR で CI 設定を変更する場合はその diff で 3 OS のジョブが `xos=true` 時に実行されるか）を確認する
 
 ## レビュー観点
