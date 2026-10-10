@@ -1,46 +1,29 @@
 name: CI
 
 # push/pull_request で自動起動する（TASK-55.2・Issue #59・対象ビヘイビア XOS-1・MS-1）。
-# workflow_dispatch は手動再実行・検証用に併存させる。有効化に伴い、本リポに存在しない
-# make ターゲット・scripts/ を前提にした fandhe-db 由来のジョブ（test-default-build
-# 以降。前バージョンの本ファイル参照）はすべて削除した。lint-docs が参照する設定
-# ファイル（.markdownlint.jsonc 等）の整備・rust-ci の cache-key-prefix のリポ名への
-# 変更は TASK-55.3（Issue #60）で完了済み。3 OS matrix 対応（.claude/rules/ci.md）は
-# rust-ci ジョブで対応済み（TASK-55.1・Issue #58）。lint-docs は引き続き
-# ubuntu-latest 単独実行。clippy -D warnings ゲート（fail-closed）の明文化は
-# TASK-5.2（#32・REPAIR-6）を参照。TASK-7（#335・REPAIR-6）が求める
-# 「clippy 警告 0 件の維持確認」も、下記 rust-ci・rust-ci-default-features の
-# 同ゲートで担保する（新規ジョブ追加ではなく既存ゲートの明文化）。
-# TASK-9.1（#338・REPAIR-8）: 下記 deny-license-reject ジョブを追加した。
-# 受入基準 1（cargo deny check licenses を CI で実行する）は TASK-77（#64）の
-# 時点で rust-ci（deny-checks: ... licenses ...）が満たしており、
-# deny-license-reject はその fail-closed 性（許可外ライセンス混入時に確実に
-# reject するか）を negative test で継続的に検証する
-# TASK-56.1（#195・XOS-6・MS-3）: Servo を組み込む Windows ビルドの前提
-# （Windows SDK 10.0.19041.0 以上・MSVC v143・C++ ATL・Python/uv）を、下記
-# windows-servo-prereqs ジョブで windows-latest 上に検証（不足分は導入）する形で
-# 明記した。Servo 本体の Windows ビルド（--features rendering）の CI 化は
-# TASK-58 以降で、docs/setup/windows.md は TASK-56.2（#196）が作成予定
-# TASK-34.1（Issue #465・RENDER-1）: 下記 render-isolation ジョブを追加した。
-# 従来 `make check-render-isolation` はローカル専用（make ci には含むが CI からは
-# 未実行）だったため、PR で Servo 系が混入しても CI では検出できなかった
-# （最終防御線は deny.toml の MPL-2.0 不許可のみ）。render-isolation ジョブは
-# 同じ判定ロジック（scripts/check-render-isolation.sh）を 3 OS で直接実行する
-# TASK-29.7（Issue #158・JS-1・MS-3）: 下記 rust-ci-js-v8 ジョブを追加した。
-# rust-ci（--all-features）・rust-ci-default-features（既定）のどちらとも異なる
-# `--features js-v8` 単独構成で js crate の TASK-28 共通コンフォーマンステストを
-# V8 に対して 3 OS で検証する
-# TASK-32.4（Issue #168・JS-1・MS-3）: JS エンジンビルド構成表の残り行を追加した。
-# 軽量ビルド（js-boa のみ）は rust-ci-js-boa、依存グラフ検査（軽量ビルドに v8 が
-# 無い・エンジンなしに v8 も boa_engine も無い）は js-engine-isolation、両エンジン
-# 同梱の共通テストは rust-ci-default-features 内のステップで検証する
-# TASK-9.3（#340・REPAIR-8・MS-7）: 受入基準 1（push / pull_request トリガー）は
-# TASK-55.2（#59）で、受入基準 2（9.1・9.2 のジョブ統合）は deny-license-reject
-# （TASK-9.1・#338）・rust-ci の deny-checks（TASK-77・#64）・compat-regression
-# （TASK-9.2・#339）で既に満たしている。本記録は新規ジョブ追加やトリガー変更では
-# なく、TASK-9（9.1〜9.3）の本格 CI パイプライン統合が完了したことの明文化
-# （TASK-7 の記録と同じ扱い）。compat-regression の --allow-missing は #312
-# （TASK-71.3）の完了まで維持する
+# workflow_dispatch は手動再実行・検証用に併存させる。
+#
+# ジョブ構成（時間と過剰なチェックを減らすための統合版）:
+#   changes                      常時。変更ファイルから rust / harness の実行要否を決める
+#   lint-docs                    常時。markdownlint・yamllint・editorconfig-checker・commitlint
+#   rust-lint                    rust 時。fmt・cargo deny・deny-license-reject（ubuntu のみ）
+#   rust-test-{ubuntu,macos,windows}      rust 時。clippy + test（3 OS）
+#   rust-features-{ubuntu,macos,windows}  rust 時。feature 構成別の clippy・test（3 OS）
+#   harness-{ubuntu,macos,windows}        rust または harness 時。分離検証・ハーネス・サイズ検査
+#   windows-servo-prereqs        rust 時。Servo の Windows ビルド前提の検証
+# 詳細・required checks の一覧は .claude/rules/ci.md を参照。
+#
+# 設計上の制約:
+# - required にするジョブは matrix を使わない OS ごとの明示ジョブにする。job-level if で
+#   スキップされた matrix ジョブは展開されず check 名が変わり、required を満たせなくなるため。
+# - reusable workflow 呼び出し（`caller / callee` 形式の check 名）は使わない。
+# - 出る check-run はすべて required にする前提（自動マージは未 required の check-run があると
+#   マージしない）。非 required の補助ジョブを追加しない。
+# - docs-only 判定は fail-closed。allowlist 外のパスが 1 つでもあれば rust=true。
+# - clippy -D warnings ゲートは REPAIR-6（TASK-5.2・#32 / TASK-7・#335）。ライセンス検査は
+#   TASK-77（#64）・TASK-9.1（#338・REPAIR-8）。Servo 前提は TASK-56.1（#195・XOS-6・MS-3）。
+#   TASK-9.3（#340・REPAIR-8・MS-7）: push / pull_request トリガーと本格 CI 統合の完了記録。
+
 on:
   workflow_dispatch:
   pull_request:
@@ -51,455 +34,620 @@ permissions:
   contents: read
 
 concurrency:
-  # PR ごとに一意な番号を group に含める（head_ref のみだと fork 間で同名ブランチの
-  # 別 PR が同一グループになり、互いの CI を cancel し合う。PR #4 codex P2 指摘）
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   # --------------------------------------------------
-  # lint-docs（ドキュメント／設定ファイル系 lint）
+  # changes（変更ファイルから後続ジョブの実行要否を決める。常時実行・required）
   # --------------------------------------------------
-  # Fandhe-AI/actions の lint-docs reusable workflow（lint ツールバージョンは
-  # 共通側で固定。agent-cli-skills の同名ジョブと同型）を呼び出す。
-  # 設定はそれぞれ `.markdownlint.jsonc` / `.markdownlintignore` /
-  # `.editorconfig` + `.editorconfig-checker.json` / `.yamllint` /
-  # `commitlint.config.mjs` を参照する。
-  #
-  # 必須チェックの集約: reusable 側の集約ジョブ `lint-docs / lint-docs-complete`
-  # （fail-closed。各 lint ジョブは boolean input の if: を持つ条件付きジョブとして
-  # 明示リストで skipped を判定する）を branch protection の必須チェックに使う。
-  # rust-base-ci reusable workflow のジョブは下記 rust-ci として本 workflow に
-  # 定義済み（#31。TASK-66 の Cargo.toml 追加で有効化）。3 OS matrix
-  # （TASK-55.1・#58）により OS ごとに別名のチェックが生成されるため、
-  # branch protection の必須チェックへは、その集約ジョブを OS 数分
-  # （`rust-ci (ubuntu-latest|macos-latest|windows-latest) /
-  # rust-base-ci-complete` の 3 件）に加え、既定 feature 検証ジョブ（下記。
-  # 同じく 3 OS matrix のため OS ごとに別名）の
-  # `rust-ci-default-features (ubuntu-latest)`・
-  # `rust-ci-default-features (macos-latest)`・
-  # `rust-ci-default-features (windows-latest)` の 3 件、および js-v8 単独構成の
-  # `rust-ci-js-v8 (ubuntu-latest)`・`rust-ci-js-v8 (macos-latest)`・
-  # `rust-ci-js-v8 (windows-latest)` の 3 件、軽量ビルド（js-boa のみ）の
-  # `rust-ci-js-boa (<os>)` と JS エンジン分離検査の `js-engine-isolation (<os>)`
-  # （いずれも ubuntu-latest・macos-latest・windows-latest の各 3 件）も追加する
-  # 必要がある（TASK-32.4・#168。登録はユーザー作業で本変更の対象外）
-  # （TASK-55.2・#59 時点で
-  # push/pull_request トリガーが有効化されたため、この登録作業はユーザー作業と
-  # して実施可能になった。登録自体は本変更の対象外）。
+  # pull_request のとき docs 扱いの allowlist に全ファイルが一致した場合だけ rust=false に
+  # する（判定本体は scripts/ci-changes.sh。--self-test あり）。push（main）・
+  # workflow_dispatch・merge_group・git diff 失敗・出力不正は常に全実行（fail-closed）。
+  # 下流が skipped になっても、changes 自体が required かつ失敗し得るため見逃さない。
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      rust: ${{ steps.detect.outputs.rust }}
+      harness: ${{ steps.detect.outputs.harness }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ github.event_name == 'pull_request' && 0 || 1 }}
+      - name: "変更ファイルから実行対象（rust・harness）を判定"
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          emit() {
+            echo "rust=$1" >> "$GITHUB_OUTPUT"
+            echo "harness=$2" >> "$GITHUB_OUTPUT"
+            echo "changes: rust=$1 harness=$2 (${3})"
+          }
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            emit true true "event=$EVENT_NAME"
+            exit 0
+          fi
+          if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
+            emit true true "base/head SHA unavailable"
+            exit 0
+          fi
+          if ! files="$(git -c core.quotepath=false diff --name-only "$BASE_SHA...$HEAD_SHA")"; then
+            echo "::warning::git diff failed; running all jobs (fail-closed)"
+            emit true true "git diff failed"
+            exit 0
+          fi
+          echo "changed files:"
+          printf '%s\n' "$files"
+          if ! result="$(printf '%s\n' "$files" | bash scripts/ci-changes.sh)"; then
+            echo "::warning::scripts/ci-changes.sh failed; running all jobs (fail-closed)"
+            emit true true "classifier failed"
+            exit 0
+          fi
+          # 出力は厳密な 2 行形式のみ受理する。欠落・想定外の値は下流ジョブが
+          # skipped（= 成功扱い）になる fail-open を招くため全実行へ倒す
+          if [ "$(printf '%s\n' "$result" | grep -cxE 'rust=(true|false)')" -ne 1 ] \
+            || [ "$(printf '%s\n' "$result" | grep -cxE 'harness=(true|false)')" -ne 1 ] \
+            || [ "$(printf '%s\n' "$result" | wc -l | tr -d ' ')" -ne 2 ]; then
+            echo "::warning::unexpected classifier output; running all jobs (fail-closed)"
+            emit true true "unexpected output"
+            exit 0
+          fi
+          printf '%s\n' "$result" >> "$GITHUB_OUTPUT"
+          echo "changes: $(printf '%s' "$result" | tr '\n' ' ')"
+
+  # --------------------------------------------------
+  # lint-docs（ドキュメント／設定ファイル系 lint。常時実行・required）
+  # --------------------------------------------------
+  # 旧 Fandhe-AI/actions の lint-docs reusable workflow（markdownlint・
+  # editorconfig-checker・yamllint・commitlint・lint-docs-complete の 5 ジョブ）を
+  # 1 ジョブの複数ステップへ畳んだもの。ツール版は reusable の既定値と同じ
+  # （markdownlint-cli 0.49.1・yamllint 1.38.0・editorconfig-checker v3.8.0・
+  # commitlint 21.2.1 / config-conventional 21.2.0）。Makefile の *_VERSION と揃える。
+  # 各ステップは !cancelled() で独立に走らせ、1 回の実行で全指摘を得られるようにする。
   lint-docs:
-    # Fandhe-AI/actions は可変タグ latest（move-latest-tag 管理で main へ追従）で
-    # 参照する（組織現行標準。AGENTS.md「CI・ワークフローの改変」の例外を参照）
-    uses: Fandhe-AI/actions/.github/workflows/lint-docs.yml@latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
-    with:
-      # public リポジトリのため GitHub ホステッド runner を明示指定（組織 runner 方針）
-      runner-label: ubuntu-latest
-      markdownlint: true
-      editorconfig: true
-      yamllint: true
-      # commitlint は PR の base/head から commit 範囲を取るため pull_request 専用
-      # （reusable 側は他イベントを fail-closed で拒否する）。push でも動く本
-      # workflow では event で切り替え、main への push では実行しない
-      commitlint: ${{ github.event_name == 'pull_request' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ github.event_name == 'pull_request' && 0 || 1 }}
+      - name: "Node.js 版の確認（markdownlint-cli・commitlint は 22.12 以上が必要）"
+        run: |
+          node --version
+          node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>22||(a===22&&b>=12)?0:1)' \
+            || { echo "::error::Node.js 22.12 or later is required"; exit 1; }
+      - name: "markdownlint"
+        if: ${{ !cancelled() }}
+        run: npx --yes markdownlint-cli@0.49.1 --ignore-path .markdownlintignore "**/*.md"
+      - name: "yamllint"
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/yamllint-venv"
+          "$RUNNER_TEMP/yamllint-venv/bin/pip" install --quiet --disable-pip-version-check yamllint==1.38.0
+          "$RUNNER_TEMP/yamllint-venv/bin/yamllint" -f parsable .
+      - name: "editorconfig-checker（v3.8.0・sha256 検証）"
+        if: ${{ !cancelled() }}
+        run: |
+          ec_dir="$RUNNER_TEMP/editorconfig-checker"
+          mkdir -p "$ec_dir"
+          curl -fsSL --retry 3 -o "$ec_dir/ec.tar.gz" \
+            https://github.com/editorconfig-checker/editorconfig-checker/releases/download/v3.8.0/ec-linux-amd64.tar.gz
+          echo "613bd88f34165a334adcb6b7e92a123c9de0eada65846d31af63613b779ff3be  $ec_dir/ec.tar.gz" | sha256sum -c -
+          tar -xzf "$ec_dir/ec.tar.gz" -C "$ec_dir"
+          "$ec_dir/bin/ec-linux-amd64"
+      - name: "commitlint（pull_request のみ・PR の commit 範囲）"
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          npx --yes \
+            -p "@commitlint/cli@21.2.1" \
+            -p "@commitlint/config-conventional@21.2.0" \
+            commitlint \
+            --extends "@commitlint/config-conventional" \
+            --from "$BASE_SHA" \
+            --to "$HEAD_SHA" \
+            --verbose
 
   # --------------------------------------------------
-  # rust-ci（Rust ベースライン品質ゲート: fmt / clippy / test / cargo-deny）
+  # rust-lint（OS 非依存の静的検査。ubuntu のみ）
   # --------------------------------------------------
-  # TASK-66 の workspace 追加（Cargo.toml）に伴い有効化。reusable workflow 側の
-  # `test` ジョブが `cargo test --workspace --all-features` を continue-on-error
-  # 無しで実行し、集約ジョブ `rust-base-ci-complete` が fmt/clippy/test/deny 各
-  # ジョブの result を明示チェックしてフェイルクローズで判定する
-  # （TASK-5.1・`REPAIR-5`。本呼び出しからは `rust-ci (<os>) / rust-base-ci-complete`
-  # として見える）。branch protection の必須チェックへ追加する運用はユーザー
-  # 作業（PR 本文参照）。
-  #
-  # clippy -D warnings ゲート（TASK-5.2・`REPAIR-6`）: reusable 側 `clippy` ジョブが
-  # `cargo clippy --workspace --all-targets --all-features -- -D warnings` を
-  # 上記 3 OS で実行し、警告が 1 件でもあれば非ゼロ終了する。`rust-base-ci-complete`
-  # は他ジョブと同様に `needs.clippy.result` を検査するため、clippy 失敗時は
-  # `rust-ci (<os>) / rust-base-ci-complete` 自体が fail-closed で失敗する。
-  # TASK-7（#335・REPAIR-6）の「警告 0 件維持確認」の CI ゲートを兼ねる
-  # （--all-features 構成側。確認記録は #335 の PR 本文を参照）。
-  #
-  # 3 OS 一級対応（.claude/rules/ci.md・XOS-1・TASK-55.1）: Linux・macOS・Windows の
-  # ネイティブ runner で rust-base-ci（fmt/clippy/test/deny）をそれぞれ実行する。
-  # fail-fast: false は 1 OS の失敗で他 OS の実行を打ち切らせないため
-  # （3 OS すべての結果を必ず得る。ci.md「特定 OS のみの skip で CI を通さない」）。
-  # matrix.os の要素数だけ別名のチェックが生成されるため、branch protection の
-  # 必須チェックへは OS 数分（3 件）を追加する必要がある。
-  rust-ci:
-    strategy:
-      fail-fast: false
-      # windows-latest の Servo 組込ビルド前提（Windows SDK・MSVC v143・C++ ATL・
-      # Python/uv。XOS-6・TASK-56.1）は下記 windows-servo-prereqs ジョブが
-      # 検証・導入する。本ジョブは Servo を含まないため追加セットアップ不要
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    uses: Fandhe-AI/actions/.github/workflows/rust-base-ci.yml@latest
-    permissions:
-      contents: read
-    with:
-      # 3 OS matrix。matrix.os をそのまま runner-label へ渡す
-      # （public リポジトリの GitHub ホステッド runner 方針は維持）
-      runner-label: ${{ matrix.os }}
-      # make deny（Makefile の deny ターゲット）と同一のチェック集合。
-      # licenses チェックは TASK-77・OSS-3（MS-1）対応（deny.toml の [licenses] 参照）
-      deny-checks: advisories bans licenses sources
-      # cargo レジストリ・target の cache（reusable 側のオプトイン入力。
-      # `actions/cache`・key は `**/Cargo.lock` のハッシュに加え `runner.os` を
-      # 含む形で reusable workflow 側が OS ごとに分離する）。ホステッド runner は
-      # 毎回まっさらなため、無効のままだと fmt／clippy／test／deny の各ジョブが
-      # 依存クレートを毎回フルビルドすることになる。cache-key-prefix は
-      # 他リポジトリ（既定値 `rust-base-ci` や、CI 設定を輸入した際の残置物
-      # `fandhe-db`）との衝突回避のため本リポ名にする（TASK-55.3・Issue #60）
-      #
-      # windows-latest のみ既定 false（Issue #59 レビュー指摘。PR #409 CI 失敗の
-      # 実測: rust-base-ci.yml（Fandhe-AI/actions・@latest）の
-      # 「workspace メンバー成果物を prune（cache 保存前・cache 有効時のみ）」
-      # ステップが `cargo clippy`/`cargo test` 自体は成功しているにも関わらず、
-      # windows-latest のみ ##[error]想定外の crate / target 名を検出したため
-      # prune を中止します（名前: fandhe-browser-ai）で exit code 1 になり、
-      # rust-ci (windows-latest) / rust-base-ci-complete を fail させていた
-      # （ubuntu-latest・macos-latest では未再現。実行ログでは jq 側のエラー出力は
-      # 見えず、cargo metadata の出力を読む `while IFS= read -r -d ''` ループの
-      # 最初の 1 件目（sort -u で先頭になった fandhe-browser-ai）で即座に失敗して
-      # おり、crate 名自体は `^[\p{L}\p{N}_-]+$` を満たす正当な値のため、
-      # windows-latest（git-bash/MSYS）環境でこの prune スクリプトの
-      # 名前検証ロジックが誤検出している可能性が高い）。原因は本リポではなく
-      # 呼び出し先の reusable workflow（Fandhe-AI/actions）側にあり、本リポの
-      # crate 構成・PR #409 の差分（ci.yml の cache-key-prefix 変更・render crate
-      # 追加等）には起因しない。恒久修正は Fandhe-AI/actions 側の対応を要する
-      # ため、それまでの回避策として windows-latest のみ cache を無効化する
-      # （現時点は各 crate が雛形のみで依存もなく、cache 無効化によるビルド時間
-      # 増加コストは小さい）。Fandhe-AI/actions 側で修正され次第この条件式は削除
-      # してよい
-      cache: ${{ matrix.os != 'windows-latest' }}
-      cache-key-prefix: fandhe-browser
-
-  # --------------------------------------------------
-  # rust-ci-default-features（既定 feature でのローカルゲート再現）
-  # --------------------------------------------------
-  # 上記 rust-ci（reusable workflow）は `cargo clippy/test --all-features` で
-  # 検証するため、既定 feature（`--all-features` なし）の構成は別途検証されない。
-  # AGENTS.md「ローカルゲート」・.claude/rules/ci.md が要求する
-  #   cargo clippy --workspace --all-targets -- -D warnings
-  #   cargo test --workspace
-  # （いずれも既定 feature）を、pull_request/push で自動起動する本 workflow 内で
-  # 直接実行し、既定 feature 側の回帰も CI で検出できるようにする
-  # （TASK-55.2・Issue #59 レビュー指摘。REPAIR-5・REPAIR-6）。
-  # Makefile の `lint`/`test` ターゲット（既定 feature 用）と同一コマンドを実行する。
-  # 3 OS 一級対応（.claude/rules/ci.md・XOS-1）に従い、rust-ci と同じ 3 OS matrix で
-  # 実行する（既定 feature 構成の OS 依存回帰を --all-features 側だけでは検出できない
-  # ため。PR #409 レビュー指摘）。
-  #
-  # clippy -D warnings ゲート（TASK-5.2・`REPAIR-6`）: 下記 `cargo clippy` ステップは
-  # 3 OS すべてで同一コマンドを実行し、1 ステップ 1 コマンドのためステップの
-  # 非ゼロ終了がそのままジョブ失敗になる。windows-latest の既定シェルは pwsh だが、
-  # Actions が単一コマンドステップの末尾に付与する `exit $LASTEXITCODE` 相当の
-  # 挙動により終了コードが伝播し、他 OS と同様に fail-closed で機能する
-  # （`shell:` 明示指定は不要。誤って追加修正しないこと）。
-  # TASK-7（#335・REPAIR-6）の「警告 0 件維持確認」の CI ゲートを兼ねる
-  # （既定 feature 構成側。確認記録は #335 の PR 本文を参照）。
-  rust-ci-default-features:
-    strategy:
-      fail-fast: false
-      # windows-latest の Servo 組込ビルド前提（Windows SDK・MSVC v143・C++ ATL・
-      # Python/uv。XOS-6・TASK-56.1）は下記 windows-servo-prereqs ジョブが
-      # 検証・導入する。本ジョブは Servo を含まないため追加セットアップ不要
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    # ハングしたジョブの無期限実行を防ぐ多層防御（NFR-10・.claude/rules/ci.md）。
-    # 他の raw-step ジョブ（release.yml の verify 等）と同じ 30 分を採用する。
+  # 旧 rust-ci の fmt・deny と旧 deny-license-reject を統合した。
+  # - cargo fmt --all --check: REPAIR-6 のローカルゲートと同じ
+  # - cargo deny check（deny-checks: advisories bans licenses sources）: TASK-77（#64）
+  #   のライセンス検査（licensing.md）。cargo-deny の版は Makefile の CARGO_DENY_VERSION と同期
+  # - check-deny-license-reject（TASK-9.1・#338・REPAIR-8）: GPL/AGPL/LGPL/MPL-2.0・
+  #   ライセンス未記載の canary を cargo deny が reject し続けることの negative test
+  rust-lint:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      CARGO_DENY_VERSION: "0.20.2"
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      # stable（rust-toolchain.toml の channel = "stable" を単一真実源として追従）
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: "cargo fmt --all --check"
+        run: cargo fmt --all --check
+      - name: "cargo-deny の導入キャッシュ復元"
+        if: ${{ !cancelled() }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-${{ env.CARGO_DENY_VERSION }}
+      - name: "cargo-deny の導入（未導入・版不一致のときのみ）"
+        if: ${{ !cancelled() }}
+        run: |
+          if cargo deny --version 2>/dev/null | grep -qF "cargo-deny $CARGO_DENY_VERSION"; then
+            echo "cargo-deny $CARGO_DENY_VERSION is already installed"
+          else
+            cargo install --locked --force "cargo-deny@$CARGO_DENY_VERSION"
+          fi
+          cargo deny --version
+      - name: "cargo deny check（advisories bans licenses sources）"
+        if: ${{ !cancelled() }}
+        run: cargo deny --locked check advisories bans licenses sources
+      - name: "許可外ライセンスの reject 検証（make check-deny-license-reject）"
+        if: ${{ !cancelled() }}
+        run: make check-deny-license-reject
+
+  # --------------------------------------------------
+  # rust-test-{ubuntu,macos,windows}（clippy + test。3 OS 必須・rust 変更時のみ）
+  # --------------------------------------------------
+  # 旧 rust-ci（Fandhe-AI/actions の rust-base-ci.yml）の clippy・test を OS ごとの
+  # 明示ジョブへインライン化した（XOS-1・TASK-55.1）。matrix にしないのは、job-level if で
+  # スキップされた matrix ジョブが展開されず check 名が変わり required を満たさなくなるため。
+  # clippy -D warnings は REPAIR-6（TASK-5.2・#32 / TASK-7・#335）の fail-closed ゲート。
+  # cache は windows のみ除外（cache prune に既知問題。旧 rust-ci と同じ）。
+  # CARGO_INCREMENTAL=0 は cache 利用 OS のみ。
+  rust-test-ubuntu:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
           components: clippy
-      - name: cargo clippy（既定 feature）
+      - name: "cargo cache の復元"
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: fandhe-browser-${{ runner.os }}-test-v4-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            fandhe-browser-${{ runner.os }}-test-v4-
+            fandhe-browser-${{ runner.os }}-test-v3-
+      - name: "cargo clippy（workspace・--all-features・-D warnings）"
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: "cargo test（workspace・--all-features）"
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --all-features
+      - name: "cache 保存前に workspace 成果物を prune"
+        run: bash scripts/ci-prune-target.sh
+
+  rust-test-macos:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: clippy
+      - name: "cargo cache の復元"
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: fandhe-browser-${{ runner.os }}-test-v4-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            fandhe-browser-${{ runner.os }}-test-v4-
+            fandhe-browser-${{ runner.os }}-test-v3-
+      - name: "cargo clippy（workspace・--all-features・-D warnings）"
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: "cargo test（workspace・--all-features）"
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --all-features
+      - name: "cache 保存前に workspace 成果物を prune"
+        run: bash scripts/ci-prune-target.sh
+
+  rust-test-windows:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: clippy
+      - name: "cargo clippy（workspace・--all-features・-D warnings）"
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: "cargo test（workspace・--all-features）"
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --all-features
+
+  # --------------------------------------------------
+  # rust-features-{ubuntu,macos,windows}（feature 構成別の clippy・test。rust 変更時のみ）
+  # --------------------------------------------------
+  # 旧 rust-ci-default-features・rust-ci-js-boa・rust-ci-js-v8 の全コマンドを 1 ジョブへ
+  # 順に束ねた（同一 target dir で依存ビルドを共有する）。ステップ名の接頭辞が旧ジョブ:
+  #   [default] = rust-ci-default-features（既定 feature・エンジンなし・両エンジン同梱の共通
+  #               テスト。TASK-32.4・#168・JS-1。clippy -D warnings は REPAIR-6）
+  #   [js-boa]  = rust-ci-js-boa（軽量ビルド `--no-default-features --features js-boa`。
+  #               TASK-32.4・#168・JS-1）
+  #   [js-v8]   = rust-ci-js-v8（`--features js-v8` 単独で TASK-28 共通コンフォーマンス
+  #               テストを V8 に対して検証。TASK-29.7・#158・JS-1）
+  # 各ステップは !cancelled() で独立に走らせ、失敗構成を 1 回の実行で特定できるようにする。
+  # cache は windows のみ除外（cache prune に既知問題。旧 rust-ci と同じ）。
+  rust-features-ubuntu:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: clippy
+      - name: "cargo cache の復元"
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: fandhe-browser-${{ runner.os }}-features-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: fandhe-browser-${{ runner.os }}-features-v1-
+      - name: "[default] cargo clippy（既定 feature）"
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: cargo test（既定 feature）
+      - name: "[default] cargo test（既定 feature）"
+        if: ${{ !cancelled() }}
         run: cargo test --workspace
-      # TASK-30.4（Issue #162・JS-2）: workspace 全体の検証では cli の
-      # `default = ["js-v8"]` が feature 統合で core に伝わり、エンジンなし構成の
-      # テスト（`cfg(not(any(feature = "js-v8", feature = "js-boa")))`）が
-      # コンパイル対象から外れる。core を単独で選んでエンジンなし構成を検証する
-      # （依存グラフ検査は js-engine-isolation ジョブ・TASK-32.4 が担い、
-      # このテスト実行は含まない）
-      - name: cargo clippy（core 単独・エンジンなし）
+      - name: "[default] cargo clippy（core 単独・エンジンなし）"
+        if: ${{ !cancelled() }}
         run: cargo clippy -p fandhe-browser-core --all-targets -- -D warnings
-      - name: cargo test（core 単独・エンジンなし）
+      - name: "[default] cargo test（core 単独・エンジンなし）"
+        if: ${{ !cancelled() }}
         run: cargo test -p fandhe-browser-core
-      # TASK-32.4（Issue #168・JS-1）: ビルド構成表の「両エンジン同梱」行。既定ビルドの
-      # ジョブ内で共通テスト（js の conformance・core の js_stub_v8 / js_stub_boa）を
-      # 両エンジン有効で追加実行する。rust-ci の --all-features は test-support・
-      # rendering も同時に有効で表の構成そのものではないため明示的に実行する。
-      # macOS では boa が無効（確保時のメモリ上限を強制できず fail-closed）で、
-      # テストは cfg(target_os) で期待値を分けている（skip ではない）。
-      # `--features` は Windows 既定の pwsh でカンマが配列解釈されるため 2 回書く。
-      - name: cargo test（js 両エンジン同梱）
+      - name: "[default] cargo test（js 両エンジン同梱）"
+        if: ${{ !cancelled() }}
         run: cargo test -p fandhe-browser-js --features js-v8 --features js-boa
-      - name: cargo test（core 両エンジン同梱）
+      - name: "[default] cargo test（core 両エンジン同梱）"
+        if: ${{ !cancelled() }}
         run: cargo test -p fandhe-browser-core --features js-v8 --features js-boa
+      - name: "[js-boa] cargo build（cli 軽量ビルド）"
+        if: ${{ !cancelled() }}
+        run: cargo build -p fandhe-browser-cli --no-default-features --features js-boa
+      - name: "[js-boa] cargo clippy（cli 軽量ビルド）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p fandhe-browser-cli --all-targets --no-default-features --features js-boa -- -D warnings
+      - name: "[js-boa] cargo test（cli 軽量ビルド）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-cli --no-default-features --features js-boa
+      - name: "[js-boa] cargo clippy（js js-boa）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p fandhe-browser-js --all-targets --features js-boa -- -D warnings
+      - name: "[js-boa] cargo test（js js-boa）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-js --features js-boa
+      - name: "[js-boa] cargo test（core js-boa）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-core --features js-boa
+      - name: "[js-boa] cargo check（cli エンジンなし）"
+        if: ${{ !cancelled() }}
+        run: cargo check -p fandhe-browser-cli --no-default-features
+      - name: "[js-v8] cargo clippy（js js-v8 単独）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p fandhe-browser-js --all-targets --features js-v8 -- -D warnings
+      - name: "[js-v8] cargo test（js js-v8 単独）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-js --features js-v8
+      - name: "cache 保存前に workspace 成果物を prune"
+        run: bash scripts/ci-prune-target.sh
 
-  # --------------------------------------------------
-  # rust-ci-js-v8（js crate を `--features js-v8` 単独で 3 OS 検証）
-  # --------------------------------------------------
-  # TASK-29.7（Issue #158・JS-1・MS-3）: TASK-28 共通コンフォーマンステスト
-  # （crates/fandhe-browser-js/tests/conformance.rs）が V8 で合格することを CI で
-  # 継続検証する。rust-ci（--all-features）・rust-ci-default-features（既定）では
-  # 検証されない `--features js-v8` 単独構成を対象にする。この構成では js-boa・
-  # test-support・rendering が無効で、`required-features = ["test-support"]` の
-  # v8_worker テストと bench は対象外になる。
-  # テスト出力に `case:` 行と `conformance: all cases passed` が出れば、V8 が
-  # スクリプト評価・グローバル関数注入・DOM 風バインディングの 3 カテゴリに合格
-  # している。`RUSTFLAGS=-D warnings` は Windows の既存リンカ警告（LNK4098）で
-  # 落ちるため test には付けない（clippy はリンクしないため -D warnings 可）。
-  rust-ci-js-v8:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+  rust-features-macos:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: macos-latest
+    timeout-minutes: 60
     permissions:
       contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
           components: clippy
-      - name: cargo clippy（js-v8 単独）
+      - name: "cargo cache の復元"
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: fandhe-browser-${{ runner.os }}-features-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: fandhe-browser-${{ runner.os }}-features-v1-
+      - name: "[default] cargo clippy（既定 feature）"
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: "[default] cargo test（既定 feature）"
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace
+      - name: "[default] cargo clippy（core 単独・エンジンなし）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p fandhe-browser-core --all-targets -- -D warnings
+      - name: "[default] cargo test（core 単独・エンジンなし）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-core
+      - name: "[default] cargo test（js 両エンジン同梱）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-js --features js-v8 --features js-boa
+      - name: "[default] cargo test（core 両エンジン同梱）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-core --features js-v8 --features js-boa
+      - name: "[js-boa] cargo build（cli 軽量ビルド）"
+        if: ${{ !cancelled() }}
+        run: cargo build -p fandhe-browser-cli --no-default-features --features js-boa
+      - name: "[js-boa] cargo clippy（cli 軽量ビルド）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p fandhe-browser-cli --all-targets --no-default-features --features js-boa -- -D warnings
+      - name: "[js-boa] cargo test（cli 軽量ビルド）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-cli --no-default-features --features js-boa
+      - name: "[js-boa] cargo clippy（js js-boa）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p fandhe-browser-js --all-targets --features js-boa -- -D warnings
+      - name: "[js-boa] cargo test（js js-boa）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-js --features js-boa
+      - name: "[js-boa] cargo test（core js-boa）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-core --features js-boa
+      - name: "[js-boa] cargo check（cli エンジンなし）"
+        if: ${{ !cancelled() }}
+        run: cargo check -p fandhe-browser-cli --no-default-features
+      - name: "[js-v8] cargo clippy（js js-v8 単独）"
+        if: ${{ !cancelled() }}
         run: cargo clippy -p fandhe-browser-js --all-targets --features js-v8 -- -D warnings
-      - name: cargo test（js-v8 単独）
+      - name: "[js-v8] cargo test（js js-v8 単独）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-js --features js-v8
+      - name: "cache 保存前に workspace 成果物を prune"
+        run: bash scripts/ci-prune-target.sh
+
+  rust-features-windows:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: clippy
+      - name: "[default] cargo clippy（既定 feature）"
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: "[default] cargo test（既定 feature）"
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace
+      - name: "[default] cargo clippy（core 単独・エンジンなし）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p fandhe-browser-core --all-targets -- -D warnings
+      - name: "[default] cargo test（core 単独・エンジンなし）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-core
+      - name: "[default] cargo test（js 両エンジン同梱）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-js --features js-v8 --features js-boa
+      - name: "[default] cargo test（core 両エンジン同梱）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-core --features js-v8 --features js-boa
+      - name: "[js-boa] cargo build（cli 軽量ビルド）"
+        if: ${{ !cancelled() }}
+        run: cargo build -p fandhe-browser-cli --no-default-features --features js-boa
+      - name: "[js-boa] cargo clippy（cli 軽量ビルド）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p fandhe-browser-cli --all-targets --no-default-features --features js-boa -- -D warnings
+      - name: "[js-boa] cargo test（cli 軽量ビルド）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-cli --no-default-features --features js-boa
+      - name: "[js-boa] cargo clippy（js js-boa）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p fandhe-browser-js --all-targets --features js-boa -- -D warnings
+      - name: "[js-boa] cargo test（js js-boa）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-js --features js-boa
+      - name: "[js-boa] cargo test（core js-boa）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-core --features js-boa
+      - name: "[js-boa] cargo check（cli エンジンなし）"
+        if: ${{ !cancelled() }}
+        run: cargo check -p fandhe-browser-cli --no-default-features
+      - name: "[js-v8] cargo clippy（js js-v8 単独）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p fandhe-browser-js --all-targets --features js-v8 -- -D warnings
+      - name: "[js-v8] cargo test（js js-v8 単独）"
+        if: ${{ !cancelled() }}
         run: cargo test -p fandhe-browser-js --features js-v8
 
   # --------------------------------------------------
-  # rust-ci-js-boa（軽量ビルド `--no-default-features --features js-boa` を 3 OS 検証）
+  # harness-{ubuntu,macos,windows}（分離検証・ハーネス自己テスト・サイズ検査。
+  # rust または harness 変更時）
   # --------------------------------------------------
-  # TASK-32.4（Issue #168・JS-1・MS-3）: ビルド構成表の「軽量ビルド」行。V8 を
-  # 含めない構成で cli のビルド・テストと、js・core の boa 向け共通テスト
-  # （conformance・boa_worker・js_stub_boa）を実行する。`--workspace` と
-  # `--features` は併用せず、必ず `-p` で指定する。
-  # macOS では boa が無効（確保時のメモリ上限を強制できず fail-closed）で、
-  # テストは cfg(target_os) で期待値を分けている（skip による回避ではない）。
-  # 末尾の `cargo check`（エンジンなし）は表の「エンジンなし: 3 OS で check」行。
-  # `RUSTFLAGS=-D warnings` は Windows の既存リンカ警告（LNK4098）で落ちるため
-  # test には付けない。release ビルドのサイズ実測は TASK-31 の範囲で対象外。
-  rust-ci-js-boa:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+  # 旧 render-isolation・js-engine-isolation・compat-regression・puppeteer-connect-selftest・
+  # bench-record-selftest・mcp-envelope-smoke・binary-size の各 3 OS ジョブを OS ごとの
+  # 1 ジョブへ束ねた。ステップ名の接頭辞が旧ジョブ名。各ステップは !cancelled() で独立に
+  # 走らせ、失敗箇所を 1 回の実行で特定できるようにする。
+  #   [render-isolation]       既定ビルドに Servo が無いこと（TASK-34.1・#465・RENDER-1）
+  #   [js-engine-isolation]    JS エンジン構成別の依存グラフ（TASK-32.4・#168・JS-1）
+  #   [compat-regression]      動作率回帰（TASK-9.2・#339・REPAIR-8・COMPAT-1/4）と
+  #                            compat-practical の自己テスト（TASK-71.1〜71.3・MEAS-4）。
+  #                            --allow-missing は #312（TASK-71.3）の完了まで維持
+  #   [bench-record-selftest]  competitor_lightpanda ベンチ記録（TASK-84.2・#212）
+  #   [puppeteer-connect-selftest] Puppeteer 接続試験ハーネス（TASK-45.2・#481・CDP-3）
+  #   [mcp-envelope-smoke]     MCP エンベロープ e2e（TASK-97.1・#385・PLUG-5。unix のみ
+  #                            のため windows ジョブには含めない）
+  #   [binary-size]            feature 無効時のサイズ上限（TASK-34.2・#466 / TASK-34.3・#467・
+  #                            RENDER-2。上限値・package 名は Makefile が単一真実源）。
+  #                            対象 package が workspace に無い場合は exit 2 で fail-closed
+  #                            （TASK-41.5・#174・REPAIR-5・#633）
+  # windows は cache 除外（cache prune に既知問題。旧 rust-ci と同じ）。
+  harness-ubuntu:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.harness == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-        with:
-          toolchain: stable
-          components: clippy
-      - name: cargo build（軽量ビルド）
-        run: cargo build -p fandhe-browser-cli --no-default-features --features js-boa
-      - name: cargo clippy（cli 軽量ビルド）
-        run: cargo clippy -p fandhe-browser-cli --all-targets --no-default-features --features js-boa -- -D warnings
-      - name: cargo test（cli 軽量ビルド）
-        run: cargo test -p fandhe-browser-cli --no-default-features --features js-boa
-      - name: cargo clippy（js js-boa）
-        run: cargo clippy -p fandhe-browser-js --all-targets --features js-boa -- -D warnings
-      - name: cargo test（js js-boa）
-        run: cargo test -p fandhe-browser-js --features js-boa
-      - name: cargo test（core js-boa）
-        run: cargo test -p fandhe-browser-core --features js-boa
-      - name: cargo check（cli エンジンなし）
-        run: cargo check -p fandhe-browser-cli --no-default-features
-
-  # --------------------------------------------------
-  # render-isolation（既定ビルドの依存グラフに Servo 系クレートが混入していないことの検証）
-  # --------------------------------------------------
-  # TASK-34.1（Issue #465・RENDER-1・MS-1）: `make check-render-isolation` は
-  # これまで CI から未実行のローカル専用ゲートだった。
-  # 判定ロジックの正本 scripts/check-render-isolation.sh（Makefile と共有）を
-  # ここで直接実行し、PR で Servo 系が既定ビルドの依存グラフへ混入したら
-  # fail-closed で検出する。
-  #
-  # `cargo tree` は既定でホストのターゲットに絞って依存グラフを表示するため、
-  # cfg(windows)/cfg(unix) の target 依存（windows-sys・rustix 等）はその OS の
-  # ランナーでしか依存グラフに現れない。そのため compat-regression ジョブと同様に
-  # 3 OS matrix（.claude/rules/ci.md・XOS-1）で実行し、shell: bash を明示する
-  # （Windows 既定の pwsh ではなく git-bash で確実に動かすため）。
-  #
-  # fandhe-browser-cli crate は追加済み（TASK-41.5・#174）のため、cli 既定
-  # feature 検査も実行される。cli の manifest が無い場合はスクリプトが NG にする
-  # （fail-closed。REPAIR-5・#633）。
-  #
-  # self-test（合成データに対して NG を検出できることの証跡。compat-regression
-  # ジョブの self-test と同じ趣旨。REPAIR-5・REPAIR-8）を本検査の前に実行し、
-  # ゲートが無言で素通りしないことをログへ残す。
-  #
-  # cargo は依存解決のみを行い（ビルドしない）、cache は使わない。
-  #
-  # branch protection の必須チェックへ追加する場合は OS 数分
-  # （`render-isolation (ubuntu-latest)` / `(macos-latest)` / `(windows-latest)`
-  # の 3 件）を登録する必要がある（ユーザー作業。本変更の対象外）。
-  render-isolation:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
-    permissions:
-      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      # stable（rust-toolchain.toml の channel = "stable" を単一真実源として追従）
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
-      - name: 自己テスト（合成データによる Servo 系検出の証跡確認）
-        run: bash scripts/check-render-isolation.sh --self-test
-      - name: 既定ビルドの依存グラフ検査
-        run: bash scripts/check-render-isolation.sh
-
-  # --------------------------------------------------
-  # mcp-envelope-smoke（MCP エンベロープ測定ハーネスの e2e smoke）
-  # --------------------------------------------------
-  # TASK-97.1（Issue #385・PLUG-5）: #[ignore] の e2e smoke を PR の自動ゲートへ接続する。
-  # 実バイナリを要するため `make check-mcp-envelope`（mcp バイナリのビルド後に
-  # `--ignored` 付きで実行・0 件実行は NG）を呼ぶ。Profile が unix 専用のため
-  # ubuntu / macos のみ（Windows は Makefile 側で非対応として skip する）。
-  mcp-envelope-smoke:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+      - name: "cargo cache の復元"
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          toolchain: stable
-      - name: MCP エンベロープ e2e smoke
-        run: make check-mcp-envelope
-
-  # --------------------------------------------------
-  # js-engine-isolation（JS エンジン構成ごとの依存グラフ検査）
-  # --------------------------------------------------
-  # TASK-32.4（Issue #168・JS-1・MS-3）: 軽量ビルドの依存グラフに v8 が無く、
-  # エンジンなしに v8・boa_engine が無いことを `cargo tree` で検証する。判定ロジックの
-  # 正本は scripts/check-js-engine-isolation.sh（Makefile と共有）。`cargo tree` は
-  # ホストのターゲットに絞るため target 依存は当該 OS でしか現れず、3 OS matrix で
-  # 実行する。self-test を先に実行しゲートが素通りしないことをログへ残す。
-  # cargo は依存解決のみ（ビルドしない）。
-  js-engine-isolation:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-        with:
-          toolchain: stable
-      - name: 自己テスト（合成データによる検出の証跡確認）
-        run: bash scripts/check-js-engine-isolation.sh --self-test
-      - name: JS エンジン構成の依存グラフ検査
-        run: bash scripts/check-js-engine-isolation.sh
-
-  # --------------------------------------------------
-  # compat-regression（対象サイト群の動作率マトリクスに対する回帰チェック）
-  # --------------------------------------------------
-  # TASK-9.2（Issue #339・REPAIR-8。Could）: 対象サイト群の互換性回帰を機械的に
-  # 検出する CI ゲート。閾値の根拠は COMPAT-4（全体動作率 70% 以上）・COMPAT-1
-  # （静的・SPA・フォーム等の類型別動作率 70% 以上）。判定本体は
-  # harness/compat-regression/check-matrix.sh（bash + jq。新規 Cargo 依存・新規
-  # サードパーティ action は追加しない。dependency-policy.md）で、スキーマ契約・
-  # 終了コードは harness/compat-regression/README.md を参照。
-  #
-  # self-test を毎回先に実行し、fixture（合成データ）に対して「閾値未満で fail
-  # する」ことをこのジョブのログへ証跡として残してから、実マトリクスの判定へ進む
-  # （REPAIR-5・REPAIR-8。品質ゲートが無言で素通りしないことの担保）。
-  #
-  # 実マトリクス harness/compat-practical/results/matrix.json は TASK-71.3
-  # （Issue #312）が生成予定でまだ存在しないため、当面 --allow-missing を渡す
-  # （ファイル不在時は ::warning:: を出して exit 0）。#312 がマトリクスをコミット
-  # したら --allow-missing を削除し、ファイル不在を fail-closed（exit 2）に戻す
-  # こと（harness/compat-regression/README.md にも同じ削除条件を明記）。
-  #
-  # 3 OS 一級対応（.claude/rules/ci.md・XOS-1）に合わせ ubuntu/macos/windows の
-  # 3 OS matrix で実行する。全ステップ shell: bash を明示する（rust-ci-default-
-  # features 上部コメントの「shell: 明示不要」は cargo 単一コマンドのステップに
-  # のみ当てはまる注記であり、本ジョブの複数コマンド・jq を含むシェルスクリプト
-  # 実行には当てはまらないため、Windows（既定 pwsh）でも git-bash で確実に動く
-  # よう明示する）。cargo・ネットワークアクセス・secrets は使わない。
-  #
-  # branch protection の必須チェックへ追加する場合は OS 数分
-  # （`compat-regression (ubuntu-latest)` / `(macos-latest)` / `(windows-latest)`
-  # の 3 件）を登録する必要がある（ユーザー作業。本変更の対象外）。
-  compat-regression:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      - name: jq の導入確認
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: fandhe-browser-${{ runner.os }}-harness-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: fandhe-browser-${{ runner.os }}-harness-v1-
+      - name: "前提ツール（jq・node 22 以降）の確認"
         run: |
           if ! command -v jq >/dev/null 2>&1; then
             echo "error: jq is required but was not found on PATH" >&2
             exit 1
           fi
-          # TASK-71.2（#311）: run_core の自己テストは Node 22 以降の組み込み WebSocket を使う
           if ! node -e 'process.exit(typeof WebSocket === "function" ? 0 : 1)'; then
             echo "error: node 22 or later (built-in WebSocket) is required" >&2
             exit 1
           fi
-      - name: 自己テスト（fixture による閾値未満 fail の証跡確認）
+      - name: "[render-isolation] 自己テスト（合成データによる Servo 系検出の証跡確認）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-render-isolation.sh --self-test
+      - name: "[render-isolation] 既定ビルドの依存グラフ検査"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-render-isolation.sh
+      - name: "[js-engine-isolation] 自己テスト（合成データによる検出の証跡確認）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-js-engine-isolation.sh --self-test
+      - name: "[js-engine-isolation] JS エンジン構成の依存グラフ検査"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-js-engine-isolation.sh
+      - name: "[compat-regression] 自己テスト（fixture による閾値未満 fail の証跡確認）"
+        if: ${{ !cancelled() }}
         run: bash harness/compat-regression/self-test.sh
-      # TASK-71.1（#310・MEAS-4）: 実測ハーネス compat-practical の自己テストと
-      # tasks.json のスキーマ検証。curl はスタブ・run_core は偽 CDP サーバーで、
-      # ネットワーク・secrets は使わない。
-      - name: compat-practical 自己テスト・tasks.json スキーマ検証
+      - name: "[compat-regression] compat-practical 自己テスト・tasks.json スキーマ検証"
+        if: ${{ !cancelled() }}
         run: |
           bash harness/compat-practical/self-test.sh
           bash harness/compat-practical/access_check.sh --validate-only
           bash harness/compat-practical/run_core.sh --validate-only
           bash harness/compat-practical/make_matrix.sh --validate-only
-      - name: 対象サイト群の動作率回帰チェック
+      - name: "[compat-regression] 対象サイト群の動作率回帰チェック"
+        if: ${{ !cancelled() }}
         run: |
           bash harness/compat-regression/check-matrix.sh \
             --matrix harness/compat-practical/results/matrix.json \
@@ -507,113 +655,332 @@ jobs:
             --categories static,spa,form \
             --all-categories \
             --allow-missing
+      - name: "[bench-record-selftest] record.sh 自己テスト"
+        if: ${{ !cancelled() }}
+        run: bash benches/competitor_lightpanda/self-test.sh
+      - name: "[puppeteer-connect-selftest] puppeteer-connect 自己テスト・契約テスト"
+        if: ${{ !cancelled() }}
+        run: bash harness/puppeteer-connect/self-test.sh
+      - name: "[mcp-envelope-smoke] MCP エンベロープ e2e smoke"
+        if: ${{ !cancelled() }}
+        run: make check-mcp-envelope
+      - name: "[binary-size] Makefile から上限値・package 名を抽出"
+        id: config
+        if: ${{ !cancelled() }}
+        run: |
+          normalized="$(tr -d '\r' < Makefile)"
+          limit_re='^BINARY_SIZE_LIMIT_BYTES \?= ([0-9]{1,15})$'
+          package_re='^BINARY_SIZE_PACKAGE \?= ([A-Za-z0-9._-]{1,64})$'
+          limit_matches="$(printf '%s\n' "$normalized" | grep -cE "$limit_re" || true)"
+          package_matches="$(printf '%s\n' "$normalized" | grep -cE "$package_re" || true)"
+          if [ "$limit_matches" -ne 1 ]; then
+            echo "::error::BINARY_SIZE_LIMIT_BYTES not found exactly once in Makefile (found: $limit_matches)" >&2
+            exit 1
+          fi
+          if [ "$package_matches" -ne 1 ]; then
+            echo "::error::BINARY_SIZE_PACKAGE not found exactly once in Makefile (found: $package_matches)" >&2
+            exit 1
+          fi
+          limit="$(printf '%s\n' "$normalized" | sed -nE "s/$limit_re/\\1/p")"
+          package="$(printf '%s\n' "$normalized" | sed -nE "s/$package_re/\\1/p")"
+          echo "limit_bytes=$limit" >> "$GITHUB_OUTPUT"
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+      - name: "[binary-size] 自己テスト（fixture による上限超過 fail の証跡確認）"
+        if: ${{ !cancelled() }}
+        run: bash harness/binary-size/self-test.sh
+      - name: "[binary-size] feature 無効時のリリースバイナリサイズ検査"
+        if: ${{ !cancelled() && steps.config.outcome == 'success' }}
+        env:
+          BINARY_SIZE_LIMIT_BYTES: ${{ steps.config.outputs.limit_bytes }}
+          BINARY_SIZE_PACKAGE: ${{ steps.config.outputs.package }}
+        run: |
+          out="$(mktemp)"
+          trap 'rm -f "$out"' EXIT
+          status=0
+          bash harness/binary-size/check-binary-size.sh \
+            --package "$BINARY_SIZE_PACKAGE" \
+            --limit "$BINARY_SIZE_LIMIT_BYTES" | tee "$out" || status=$?
+          {
+            echo "### Binary size ($RUNNER_OS)"
+            echo
+            if grep -q '^binary-size:' "$out"; then
+              echo "| host | package | bin | bytes | limit | result |"
+              echo "| ---- | ------- | --- | ----- | ----- | ------ |"
+              grep '^binary-size:' "$out" | while IFS= read -r line; do
+                host="$(printf '%s\n' "$line" | sed -nE 's/.*host=([A-Za-z0-9._-]{1,64}).*/\1/p')"
+                package="$(printf '%s\n' "$line" | sed -nE 's/.*package=([A-Za-z0-9._-]{1,64}).*/\1/p')"
+                bin="$(printf '%s\n' "$line" | sed -nE 's/.*bin=([A-Za-z0-9._-]{1,64}).*/\1/p')"
+                bytes="$(printf '%s\n' "$line" | sed -nE 's/.*bytes=([0-9]{1,20}).*/\1/p')"
+                limit="$(printf '%s\n' "$line" | sed -nE 's/.*limit=([0-9]{1,20}).*/\1/p')"
+                result="$(printf '%s\n' "$line" | sed -nE 's/.*result=(pass|fail).*/\1/p')"
+                echo "| $host | $package | $bin | $bytes | $limit | $result |"
+              done
+            else
+              echo "(no binary-size output was produced; check-binary-size.sh exited with a usage/build error)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - name: "cache 保存前に workspace 成果物を prune"
+        run: bash scripts/ci-prune-target.sh
 
-  # --------------------------------------------------
-  # puppeteer-connect-selftest（Puppeteer 接続試験ハーネスの自己テスト）
-  # --------------------------------------------------
-  # TASK-45.2（#481・CDP-3）: stages.mjs の段階判定と、Rust 側 script_harness パーサーとの
-  # 契約テスト（node 必須のため cargo test の既定実行では ignore。#[ignore] の代替経路）を
-  # `make check-puppeteer-connect` 相当（self-test.sh）で 3 OS 実行する。Puppeteer・
-  # ネットワーク・secrets は使わない（node は各ランナーに標準で導入済み）。
-  puppeteer-connect-selftest:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+  harness-macos:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.harness == 'true' }}
+    runs-on: macos-latest
+    timeout-minutes: 60
     permissions:
       contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
-      - name: puppeteer-connect 自己テスト・契約テスト
-        run: bash harness/puppeteer-connect/self-test.sh
-
-  # --------------------------------------------------
-  # bench-record-selftest（competitor_lightpanda ベンチ記録スクリプトの自己テスト）
-  # --------------------------------------------------
-  # TASK-84.2（Issue #212）: competitor_lightpanda ベンチ（TASK-84.1・#211）の
-  # 結果を時系列で記録する record.sh（benches/competitor_lightpanda/record.sh）
-  # の自己テスト（self-test.sh）を実行する。合成 fixture（record-fixtures/）に
-  # 対して `--input` 経由で実行するため cargo を使わず高速に回せる
-  # （benches/competitor_lightpanda/README.md 参照）。
-  #
-  # 本ジョブは record.sh 自体（引数検証・JSONL 追記ロジック・終了コード伝播）
-  # の回帰検出が目的で、実際のベンチ実行・実測値の記録（bench-competitor.yml が
-  # 別途 workflow_dispatch・毎週の定期実行で担う）とは分離する。
-  #
-  # 3 OS 一級対応（.claude/rules/ci.md・XOS-1）に合わせ 3 OS matrix で実行する。
-  # compat-regression ジョブと同じ理由で shell: bash を明示する。
-  #
-  # branch protection の必須チェックへ追加する場合は OS 数分
-  # （`bench-record-selftest (ubuntu-latest)` / `(macos-latest)` /
-  # `(windows-latest)` の 3 件）を登録する必要がある（ユーザー作業）。
-  bench-record-selftest:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      - name: jq の導入確認
+      - name: "cargo cache の復元"
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: fandhe-browser-${{ runner.os }}-harness-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: fandhe-browser-${{ runner.os }}-harness-v1-
+      - name: "前提ツール（jq・node 22 以降）の確認"
         run: |
           if ! command -v jq >/dev/null 2>&1; then
             echo "error: jq is required but was not found on PATH" >&2
             exit 1
           fi
-      - name: record.sh 自己テスト
+          if ! node -e 'process.exit(typeof WebSocket === "function" ? 0 : 1)'; then
+            echo "error: node 22 or later (built-in WebSocket) is required" >&2
+            exit 1
+          fi
+      - name: "[render-isolation] 自己テスト（合成データによる Servo 系検出の証跡確認）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-render-isolation.sh --self-test
+      - name: "[render-isolation] 既定ビルドの依存グラフ検査"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-render-isolation.sh
+      - name: "[js-engine-isolation] 自己テスト（合成データによる検出の証跡確認）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-js-engine-isolation.sh --self-test
+      - name: "[js-engine-isolation] JS エンジン構成の依存グラフ検査"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-js-engine-isolation.sh
+      - name: "[compat-regression] 自己テスト（fixture による閾値未満 fail の証跡確認）"
+        if: ${{ !cancelled() }}
+        run: bash harness/compat-regression/self-test.sh
+      - name: "[compat-regression] compat-practical 自己テスト・tasks.json スキーマ検証"
+        if: ${{ !cancelled() }}
+        run: |
+          bash harness/compat-practical/self-test.sh
+          bash harness/compat-practical/access_check.sh --validate-only
+          bash harness/compat-practical/run_core.sh --validate-only
+          bash harness/compat-practical/make_matrix.sh --validate-only
+      - name: "[compat-regression] 対象サイト群の動作率回帰チェック"
+        if: ${{ !cancelled() }}
+        run: |
+          bash harness/compat-regression/check-matrix.sh \
+            --matrix harness/compat-practical/results/matrix.json \
+            --threshold 70 \
+            --categories static,spa,form \
+            --all-categories \
+            --allow-missing
+      - name: "[bench-record-selftest] record.sh 自己テスト"
+        if: ${{ !cancelled() }}
         run: bash benches/competitor_lightpanda/self-test.sh
+      - name: "[puppeteer-connect-selftest] puppeteer-connect 自己テスト・契約テスト"
+        if: ${{ !cancelled() }}
+        run: bash harness/puppeteer-connect/self-test.sh
+      - name: "[mcp-envelope-smoke] MCP エンベロープ e2e smoke"
+        if: ${{ !cancelled() }}
+        run: make check-mcp-envelope
+      - name: "[binary-size] Makefile から上限値・package 名を抽出"
+        id: config
+        if: ${{ !cancelled() }}
+        run: |
+          normalized="$(tr -d '\r' < Makefile)"
+          limit_re='^BINARY_SIZE_LIMIT_BYTES \?= ([0-9]{1,15})$'
+          package_re='^BINARY_SIZE_PACKAGE \?= ([A-Za-z0-9._-]{1,64})$'
+          limit_matches="$(printf '%s\n' "$normalized" | grep -cE "$limit_re" || true)"
+          package_matches="$(printf '%s\n' "$normalized" | grep -cE "$package_re" || true)"
+          if [ "$limit_matches" -ne 1 ]; then
+            echo "::error::BINARY_SIZE_LIMIT_BYTES not found exactly once in Makefile (found: $limit_matches)" >&2
+            exit 1
+          fi
+          if [ "$package_matches" -ne 1 ]; then
+            echo "::error::BINARY_SIZE_PACKAGE not found exactly once in Makefile (found: $package_matches)" >&2
+            exit 1
+          fi
+          limit="$(printf '%s\n' "$normalized" | sed -nE "s/$limit_re/\\1/p")"
+          package="$(printf '%s\n' "$normalized" | sed -nE "s/$package_re/\\1/p")"
+          echo "limit_bytes=$limit" >> "$GITHUB_OUTPUT"
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+      - name: "[binary-size] 自己テスト（fixture による上限超過 fail の証跡確認）"
+        if: ${{ !cancelled() }}
+        run: bash harness/binary-size/self-test.sh
+      - name: "[binary-size] feature 無効時のリリースバイナリサイズ検査"
+        if: ${{ !cancelled() && steps.config.outcome == 'success' }}
+        env:
+          BINARY_SIZE_LIMIT_BYTES: ${{ steps.config.outputs.limit_bytes }}
+          BINARY_SIZE_PACKAGE: ${{ steps.config.outputs.package }}
+        run: |
+          out="$(mktemp)"
+          trap 'rm -f "$out"' EXIT
+          status=0
+          bash harness/binary-size/check-binary-size.sh \
+            --package "$BINARY_SIZE_PACKAGE" \
+            --limit "$BINARY_SIZE_LIMIT_BYTES" | tee "$out" || status=$?
+          {
+            echo "### Binary size ($RUNNER_OS)"
+            echo
+            if grep -q '^binary-size:' "$out"; then
+              echo "| host | package | bin | bytes | limit | result |"
+              echo "| ---- | ------- | --- | ----- | ----- | ------ |"
+              grep '^binary-size:' "$out" | while IFS= read -r line; do
+                host="$(printf '%s\n' "$line" | sed -nE 's/.*host=([A-Za-z0-9._-]{1,64}).*/\1/p')"
+                package="$(printf '%s\n' "$line" | sed -nE 's/.*package=([A-Za-z0-9._-]{1,64}).*/\1/p')"
+                bin="$(printf '%s\n' "$line" | sed -nE 's/.*bin=([A-Za-z0-9._-]{1,64}).*/\1/p')"
+                bytes="$(printf '%s\n' "$line" | sed -nE 's/.*bytes=([0-9]{1,20}).*/\1/p')"
+                limit="$(printf '%s\n' "$line" | sed -nE 's/.*limit=([0-9]{1,20}).*/\1/p')"
+                result="$(printf '%s\n' "$line" | sed -nE 's/.*result=(pass|fail).*/\1/p')"
+                echo "| $host | $package | $bin | $bytes | $limit | $result |"
+              done
+            else
+              echo "(no binary-size output was produced; check-binary-size.sh exited with a usage/build error)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - name: "cache 保存前に workspace 成果物を prune"
+        run: bash scripts/ci-prune-target.sh
 
-  # --------------------------------------------------
-  # deny-license-reject（cargo-deny の許可外ライセンス reject negative test）
-  # --------------------------------------------------
-  # TASK-9.1（#338・REPAIR-8）: 受入基準 2（許可外ライセンスが混入したら fail
-  # することをログで示す）の証跡ジョブ。受入基準 1 の本体（実依存グラフに対する
-  # `cargo deny check licenses` の実行）は上記 rust-ci ジョブ（TASK-77・#64・
-  # `deny-checks: advisories bans licenses sources`）が 3 OS で担っており、
-  # 本ジョブは重ねて追加しない。ここでは `make check-deny-license-reject`
-  # （依存ゼロの canary crate へ本リポの deny.toml を当てる negative test。
-  # Makefile 側のコメント参照）を実行し、GPL/AGPL/LGPL/MPL-2.0・ライセンス欄なし
-  # の canary がいずれも `error[rejected]`/`error[unlicensed]` で reject され、
-  # 陽性対照（`MIT OR Apache-2.0`）は通ることをログに残す（fail-closed 性の
-  # 継続的な証跡）。
-  #
-  # ubuntu-latest 単独にする理由: このジョブが検証するのは deny.toml の
-  # ライセンス評価という設定意味論であり、OS 差異に依存しない
-  # （実依存グラフに対する `cargo deny check` 本体はすでに rust-ci の 3 OS
-  # matrix で走っている。lint-docs も同様の理由で ubuntu-latest 単独）。
-  # 「特定 OS のみ skip して CI を通す」（ci.md）には当たらない。
-  #
-  # cargo-deny の導入は `make check-deny-license-reject`（Makefile の
-  # `CARGO_DENY_VERSION` を単一の版管理箇所とする）に委ねるため、本ジョブでは
-  # 新たに `cargo-deny` 専用の action は追加しない。
-  deny-license-reject:
-    runs-on: ubuntu-latest
-    # ハングしたジョブの無期限実行を防ぐ多層防御（NFR-10・.claude/rules/ci.md）
-    timeout-minutes: 30
+  harness-windows:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.harness == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 120
     permissions:
       contents: read
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      # stable（rust-toolchain.toml の channel = "stable" を単一真実源として追従）
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
-      - name: make check-deny-license-reject
-        run: make check-deny-license-reject
+      - name: "前提ツール（jq・node 22 以降）の確認"
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "error: jq is required but was not found on PATH" >&2
+            exit 1
+          fi
+          if ! node -e 'process.exit(typeof WebSocket === "function" ? 0 : 1)'; then
+            echo "error: node 22 or later (built-in WebSocket) is required" >&2
+            exit 1
+          fi
+      - name: "[render-isolation] 自己テスト（合成データによる Servo 系検出の証跡確認）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-render-isolation.sh --self-test
+      - name: "[render-isolation] 既定ビルドの依存グラフ検査"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-render-isolation.sh
+      - name: "[js-engine-isolation] 自己テスト（合成データによる検出の証跡確認）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-js-engine-isolation.sh --self-test
+      - name: "[js-engine-isolation] JS エンジン構成の依存グラフ検査"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-js-engine-isolation.sh
+      - name: "[compat-regression] 自己テスト（fixture による閾値未満 fail の証跡確認）"
+        if: ${{ !cancelled() }}
+        run: bash harness/compat-regression/self-test.sh
+      - name: "[compat-regression] compat-practical 自己テスト・tasks.json スキーマ検証"
+        if: ${{ !cancelled() }}
+        run: |
+          bash harness/compat-practical/self-test.sh
+          bash harness/compat-practical/access_check.sh --validate-only
+          bash harness/compat-practical/run_core.sh --validate-only
+          bash harness/compat-practical/make_matrix.sh --validate-only
+      - name: "[compat-regression] 対象サイト群の動作率回帰チェック"
+        if: ${{ !cancelled() }}
+        run: |
+          bash harness/compat-regression/check-matrix.sh \
+            --matrix harness/compat-practical/results/matrix.json \
+            --threshold 70 \
+            --categories static,spa,form \
+            --all-categories \
+            --allow-missing
+      - name: "[bench-record-selftest] record.sh 自己テスト"
+        if: ${{ !cancelled() }}
+        run: bash benches/competitor_lightpanda/self-test.sh
+      - name: "[puppeteer-connect-selftest] puppeteer-connect 自己テスト・契約テスト"
+        if: ${{ !cancelled() }}
+        run: bash harness/puppeteer-connect/self-test.sh
+      - name: "[binary-size] Makefile から上限値・package 名を抽出"
+        id: config
+        if: ${{ !cancelled() }}
+        run: |
+          normalized="$(tr -d '\r' < Makefile)"
+          limit_re='^BINARY_SIZE_LIMIT_BYTES \?= ([0-9]{1,15})$'
+          package_re='^BINARY_SIZE_PACKAGE \?= ([A-Za-z0-9._-]{1,64})$'
+          limit_matches="$(printf '%s\n' "$normalized" | grep -cE "$limit_re" || true)"
+          package_matches="$(printf '%s\n' "$normalized" | grep -cE "$package_re" || true)"
+          if [ "$limit_matches" -ne 1 ]; then
+            echo "::error::BINARY_SIZE_LIMIT_BYTES not found exactly once in Makefile (found: $limit_matches)" >&2
+            exit 1
+          fi
+          if [ "$package_matches" -ne 1 ]; then
+            echo "::error::BINARY_SIZE_PACKAGE not found exactly once in Makefile (found: $package_matches)" >&2
+            exit 1
+          fi
+          limit="$(printf '%s\n' "$normalized" | sed -nE "s/$limit_re/\\1/p")"
+          package="$(printf '%s\n' "$normalized" | sed -nE "s/$package_re/\\1/p")"
+          echo "limit_bytes=$limit" >> "$GITHUB_OUTPUT"
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+      - name: "[binary-size] 自己テスト（fixture による上限超過 fail の証跡確認）"
+        if: ${{ !cancelled() }}
+        run: bash harness/binary-size/self-test.sh
+      - name: "[binary-size] feature 無効時のリリースバイナリサイズ検査"
+        if: ${{ !cancelled() && steps.config.outcome == 'success' }}
+        env:
+          BINARY_SIZE_LIMIT_BYTES: ${{ steps.config.outputs.limit_bytes }}
+          BINARY_SIZE_PACKAGE: ${{ steps.config.outputs.package }}
+        run: |
+          out="$(mktemp)"
+          trap 'rm -f "$out"' EXIT
+          status=0
+          bash harness/binary-size/check-binary-size.sh \
+            --package "$BINARY_SIZE_PACKAGE" \
+            --limit "$BINARY_SIZE_LIMIT_BYTES" | tee "$out" || status=$?
+          {
+            echo "### Binary size ($RUNNER_OS)"
+            echo
+            if grep -q '^binary-size:' "$out"; then
+              echo "| host | package | bin | bytes | limit | result |"
+              echo "| ---- | ------- | --- | ----- | ----- | ------ |"
+              grep '^binary-size:' "$out" | while IFS= read -r line; do
+                host="$(printf '%s\n' "$line" | sed -nE 's/.*host=([A-Za-z0-9._-]{1,64}).*/\1/p')"
+                package="$(printf '%s\n' "$line" | sed -nE 's/.*package=([A-Za-z0-9._-]{1,64}).*/\1/p')"
+                bin="$(printf '%s\n' "$line" | sed -nE 's/.*bin=([A-Za-z0-9._-]{1,64}).*/\1/p')"
+                bytes="$(printf '%s\n' "$line" | sed -nE 's/.*bytes=([0-9]{1,20}).*/\1/p')"
+                limit="$(printf '%s\n' "$line" | sed -nE 's/.*limit=([0-9]{1,20}).*/\1/p')"
+                result="$(printf '%s\n' "$line" | sed -nE 's/.*result=(pass|fail).*/\1/p')"
+                echo "| $host | $package | $bin | $bytes | $limit | $result |"
+              done
+            else
+              echo "(no binary-size output was produced; check-binary-size.sh exited with a usage/build error)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
   # --------------------------------------------------
   # windows-servo-prereqs（Servo 組込 Windows ビルドの前提検証）
@@ -623,9 +990,8 @@ jobs:
   # 必要とする。本ジョブはそれらが windows-latest で揃うことを fail-closed で検証し、
   # 不足するもの（v143 向け ATL・uv）だけ導入する。
   #
-  # 別ジョブにした理由: rust-ci は reusable workflow 呼び出しのためステップを足せず、
-  # rust-ci-default-features は Servo を使わないため、前提の不備で既定 feature
-  # ゲートが落ちる（単一責務に反する）のを避ける。将来の Windows rendering ビルド
+  # 別ジョブにした理由: rust-test-*・rust-features-* は Servo を使わないため、前提の不備で既定
+  # feature ゲートが落ちる（単一責務に反する）のを避ける。将来の Windows rendering ビルド
   # ジョブ（TASK-58 等）は本ジョブのステップ群を統合・再利用する。
   #
   # runner の実態（runner-images 公開 README・2026-09 時点）: windows-latest は
@@ -635,12 +1001,12 @@ jobs:
   # sha256 を固定して pip で導入する（iwr | iex や新規サードパーティ action は使わない）。
   #
   # pwsh は末尾でしか $LASTEXITCODE を検査しないため、ネイティブコマンドごとに
-  # 明示判定する（rust-ci-default-features 上部の「shell: 明示不要」注記は cargo
-  # 単一コマンドのステップにのみ当てはまる）。checkout・secrets は不要。
+  # 明示判定する。checkout・secrets は不要。
   #
-  # branch protection の必須チェックへ `windows-servo-prereqs` を追加する場合は
-  # ユーザー作業（本変更の対象外）。
+  # 出る check-run はすべて required にする前提のため、windows-servo-prereqs も required に含める。
   windows-servo-prereqs:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: windows-latest
     # VS Installer の modify に時間がかかりうるため 30 分。ハング防止（NFR-10）
     timeout-minutes: 30
@@ -764,113 +1130,3 @@ jobs:
             exit 1
           }
           Write-Host $ver
-
-  # --------------------------------------------------
-  # binary-size（feature 無効時のリリースバイナリサイズ検査を CI へ組込み）
-  # --------------------------------------------------
-  # TASK-34.3（#467・RENDER-2。基準は CORE-2 と同じ「Chromium 比 80% 以上
-  # 削減」）。判定本体は harness/binary-size/（TASK-34.2・#466 で導入。契約は
-  # 同ディレクトリの README.md を参照）。
-  #
-  # self-test を先に実行する理由: 上限超過時に確実に exit 1 になることの証跡を
-  # 毎回ジョブログへ残すため（compat-regression・deny-license-reject と同じ
-  # fail-closed 性の考え方。REPAIR-5・REPAIR-8）。
-  #
-  # 対象 package（fandhe-browser-cli。TASK-41.5・#174 で追加済み）が workspace
-  # に無い場合は exit 2 で fail-closed になる（harness/binary-size/README.md
-  # 「計測対象と fail-closed 契約」参照。REPAIR-5・#633）。
-  #
-  # make を使わない理由: windows-latest に make がある保証がなく、既存の
-  # 3 OS ジョブ（compat-regression・bench-record-selftest）はどれもスクリプト
-  # を直接呼んでいる（make を使う deny-license-reject は ubuntu 単独ジョブ）。
-  # cache を使わない理由: windows-latest には cache prune の既知問題がある
-  # （rust-ci ジョブのコメント参照）。ビルド時間増加への cache 導入は別途検討する。
-  #
-  # 上限値・package 名は Makefile の BINARY_SIZE_LIMIT_BYTES /
-  # BINARY_SIZE_PACKAGE を単一真実源とし、ここでは値を重複定義しない
-  # （行頭固定の正規表現で 1 件だけ抽出する。0 件・2 件以上は fail-closed）。
-  #
-  # branch protection の必須チェックに加える場合は OS 数分
-  # （`binary-size (ubuntu-latest)` / `(macos-latest)` / `(windows-latest)`
-  # の 3 件）を登録する必要がある（ユーザー作業。本変更の対象外）。
-  binary-size:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    # リリースビルドが走るため rust-ci-default-features と同値にする
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      # stable（rust-toolchain.toml の channel = "stable" を単一真実源として追従）。
-      # self-test の package モードのケースに cargo、スクリプト本体に rustc -vV が必要
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-        with:
-          toolchain: stable
-      - name: jq の導入確認
-        run: |
-          if ! command -v jq >/dev/null 2>&1; then
-            echo "error: jq is required but was not found on PATH" >&2
-            exit 1
-          fi
-      - name: Makefile から上限値・package 名を抽出
-        id: config
-        run: |
-          # Windows（git-bash）の CRLF を落としてから行頭固定の正規表現で照合する。
-          # 0 件（書式変更・削除）・2 件以上（曖昧）はいずれも fail-closed にする。
-          normalized="$(tr -d '\r' < Makefile)"
-          limit_re='^BINARY_SIZE_LIMIT_BYTES \?= ([0-9]{1,15})$'
-          package_re='^BINARY_SIZE_PACKAGE \?= ([A-Za-z0-9._-]{1,64})$'
-          limit_matches="$(printf '%s\n' "$normalized" | grep -cE "$limit_re" || true)"
-          package_matches="$(printf '%s\n' "$normalized" | grep -cE "$package_re" || true)"
-          if [ "$limit_matches" -ne 1 ]; then
-            echo "::error::BINARY_SIZE_LIMIT_BYTES not found exactly once in Makefile (found: $limit_matches)" >&2
-            exit 1
-          fi
-          if [ "$package_matches" -ne 1 ]; then
-            echo "::error::BINARY_SIZE_PACKAGE not found exactly once in Makefile (found: $package_matches)" >&2
-            exit 1
-          fi
-          limit="$(printf '%s\n' "$normalized" | sed -nE "s/$limit_re/\\1/p")"
-          package="$(printf '%s\n' "$normalized" | sed -nE "s/$package_re/\\1/p")"
-          echo "limit_bytes=$limit" >> "$GITHUB_OUTPUT"
-          echo "package=$package" >> "$GITHUB_OUTPUT"
-      - name: 自己テスト（fixture による上限超過 fail の証跡確認）
-        run: bash harness/binary-size/self-test.sh
-      - name: feature 無効時のリリースバイナリサイズ検査
-        env:
-          BINARY_SIZE_LIMIT_BYTES: ${{ steps.config.outputs.limit_bytes }}
-          BINARY_SIZE_PACKAGE: ${{ steps.config.outputs.package }}
-        run: |
-          out="$(mktemp)"
-          trap 'rm -f "$out"' EXIT
-          status=0
-          bash harness/binary-size/check-binary-size.sh \
-            --package "$BINARY_SIZE_PACKAGE" \
-            --limit "$BINARY_SIZE_LIMIT_BYTES" | tee "$out" || status=$?
-          {
-            echo "### Binary size ($RUNNER_OS)"
-            echo
-            if grep -q '^binary-size:' "$out"; then
-              echo "| host | package | bin | bytes | limit | result |"
-              echo "| ---- | ------- | --- | ----- | ----- | ------ |"
-              grep '^binary-size:' "$out" | while IFS= read -r line; do
-                host="$(printf '%s\n' "$line" | sed -nE 's/.*host=([A-Za-z0-9._-]{1,64}).*/\1/p')"
-                package="$(printf '%s\n' "$line" | sed -nE 's/.*package=([A-Za-z0-9._-]{1,64}).*/\1/p')"
-                bin="$(printf '%s\n' "$line" | sed -nE 's/.*bin=([A-Za-z0-9._-]{1,64}).*/\1/p')"
-                bytes="$(printf '%s\n' "$line" | sed -nE 's/.*bytes=([0-9]{1,20}).*/\1/p')"
-                limit="$(printf '%s\n' "$line" | sed -nE 's/.*limit=([0-9]{1,20}).*/\1/p')"
-                result="$(printf '%s\n' "$line" | sed -nE 's/.*result=(pass|fail).*/\1/p')"
-                echo "| $host | $package | $bin | $bytes | $limit | $result |"
-              done
-            else
-              echo "(no binary-size output was produced; check-binary-size.sh exited with a usage/build error)"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-          exit "$status"
