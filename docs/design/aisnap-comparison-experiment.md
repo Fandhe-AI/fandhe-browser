@@ -78,6 +78,8 @@ PoC-4 の追加検証（`03-poc/ai-interface-token-reduction/README.md`「追加
 
 ### サブエージェントへの指示テンプレート（骨子）
 
+割付表の生成・指示テンプレート・実行パケット・回答の回収検査は #125（TASK-22.2）で `crates/fandhe-browser-ai/harness/agent_eval/compare.rs` に実装した（手順は同ディレクトリの README「比較実行」）。以下は骨子で、実際の文面は `instruction` が正本。
+
 ```text
 あなたは Web ページ上の操作を判断するエージェントです。
 入力: 1 つのページの表現（<方式に応じて簡約表現 または 生 DOM>）と、タスク文 1 件。
