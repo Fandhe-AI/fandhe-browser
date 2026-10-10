@@ -3,7 +3,7 @@
 # JS エンジンのビルド構成ごとに、依存グラフへ混入してはならないエンジン crate が
 # 含まれていないことを検証する正本スクリプト（TASK-32.4・JS-1・MS-3・Issue #168）。
 # 呼び出し元は Makefile の check-js-engine-isolation ターゲット（薄いラッパー）と
-# .github/workflows/ci.yml の js-engine-isolation ジョブ（3 OS matrix）で、判定
+# .github/workflows/ci.yml の harness-* ジョブの [js-engine-isolation] ステップで、判定
 # ロジックはこのファイルに一本化する（scripts/check-render-isolation.sh と同じ作法）。
 #
 # 検査は 2 本立て（対象は fandhe-browser-cli。feature は cli -> core -> js と連鎖する）:
