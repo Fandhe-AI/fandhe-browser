@@ -37,7 +37,7 @@ REPAIR-9（Must）は、各モジュールの操作結果を操作種別・成�
 | `OperationRecorder`（トレイト） | レコードの受け口。実装は panic せず、長時間ブロックせず、失敗を操作へ波及させない |
 | `RecorderHandle` | recorder の共有ハンドル。既定は無効（何も記録しない） |
 | `InMemoryRecorder` | 件数上限付きのメモリ内集計器（`dropped` 計数・種別別の成功/失敗件数）。テスト・簡易集計用 |
-| `JsonLinesRecorder<W>` / `StderrRecorder` | `W: Write + Send` へ JSON Lines を書き出す recorder と、stderr 向けの型別名（TASK-10.3・#221）。書き込み失敗は握りつぶして `write_failures()` に数える |
+| `JsonLinesRecorder<W>` / `StderrRecorder` | `W: Write + Send` へ JSON Lines を書き出す recorder と、stderr 向けの型別名（TASK-10.3・#221）。`record()` は有界キューへ積むだけでブロックせず（満杯時は捨てて `dropped()` に計上）、専用 writer スレッドが書き込む。書き込み失敗は握りつぶして `write_failures()` に数える |
 
 出力例（失敗時）:
 
@@ -68,7 +68,7 @@ REPAIR-9（Must）は、各モジュールの操作結果を操作種別・成�
 | ---- | ---- |
 | 実装 | `OperationRecorder` を実装する stderr 書き出し用 recorder を追加する（`StderrRecorder` として #221 で確定・実装済み。実体は `JsonLinesRecorder<std::io::Stderr>`） |
 | 出力 | `to_json_line()` の結果に改行 1 つを付けて 1 レコード 1 行で書く |
-| 契約 | 書き込み失敗は握りつぶし（`write_failures()` に計上）、操作の失敗へ波及させない。panic しない。stderr の受け手が読み出さずパイプが埋まると書き込みがブロックしうる（既知の制約） |
+| 契約 | 書き込み失敗は握りつぶし（`write_failures()` に計上）、操作の失敗へ波及させない。panic しない。書き込みは専用 writer スレッドが行い `record()` は呼び出し元をブロックしない（キュー満杯時はレコードを捨てて `dropped()` に計上。REPAIR-9・TASK-10.3） |
 | 既定 | 無効（`RecorderHandle::disabled()`） |
 
 ### 2. 有効化の入口（config / CLI フラグ）
