@@ -244,7 +244,7 @@ cdp の `String` 戻りは非公開の `protocol` モジュールの `to_json` �
 - 現状: `BorrowedFd<'_>`（unix 限定。Windows では提供されない）。`pub` で公開されている（`profile.rs:682`・`:692`）
 - 改修案: 可視性を `pub(crate)` へ縮小する。OS 非依存のハンドル型で包む案もあるが、Windows のハンドル基準アクセスは別課題のため採らない
 - 現状維持の理由案: ハンドル経由でパスの再解決を避ける目的（テスト名に `handle_not_re_resolved_path` がある）で、unix 限定の最適化として `cfg` で局所化している
-- 判断: **改修**（`pub` → `pub(crate)`）。上位 crate が unix 限定の API を使うと Windows でビルドできないコードを書けてしまい、XOS 一級対応と「OS 固有処理は `cfg` で局所化」（`.claude/rules/coding-rust.md`）に反する。利用者は crate 内の `create_file_in`（`profile.rs:752`）系のみで、crate 外の呼び出しは 0。PR #437 P1 で定めた「後続タスクはハンドルを使う」契約は変更するが、ハンドル基準で境界内へアクセスする目的は `create_file_in` 系の crate 内部実装で維持する（TOCTOU 対策は後退させない）。`profile.rs` の doc（「後続タスクはこのハンドルを使う契約」）は「上位 crate は `create_file_in` 系の OS 非依存操作を使い、ハンドルは内部の実装詳細」へ書き換える。Windows のハンドル基準アクセスは XOS-7〜XOS-10 の別課題。影響範囲: crate 外 0・crate 内 `profile.rs` のみ（公開 API の削除だが利用者 0）。Issue 化: 単独 1 件（0.5h）
+- 判断: **改修**（`pub` → `pub(crate)`）。上位 crate が unix 限定の API を使うと Windows でビルドできないコードを書けてしまい、XOS 一級対応と「OS 固有処理は `cfg` で局所化」（`.claude/rules/coding-rust.md`）に反する。利用者は crate 内の `create_file_in`（`profile.rs:752`）系のみで、crate 外の呼び出しは 0。PR #437 P1 で定めた「後続タスクはハンドルを使う」契約は変更するが、ハンドル基準で境界内へアクセスする目的は `create_file_in` 系の crate 内部実装で維持する（TOCTOU 対策は後退させない）。`profile.rs` の doc（「後続タスクはこのハンドルを使う契約」）は「上位 crate は `create_file_in` 系の操作を使い、ハンドルは内部の実装詳細」へ書き換える。ただし `create_file_in` 自体も現状は `#[cfg(unix)]` 配下（`profile.rs:751`）で Windows では提供されないため、可視性の縮小だけでは 3 OS 共通の代替契約にならない。doc にも unix 限定であることを明記し、OS 非依存の境界内アクセス API の整備（Windows のハンドル基準アクセスを含む）は XOS-7〜XOS-10 の後続課題として区別する。影響範囲: crate 外 0・crate 内 `profile.rs` のみ（公開 API の削除だが利用者 0）。Issue 化: 単独 1 件（0.5h）
 
 #### P-3 `root` が `&Path`、`data_dir` が `PathBuf`
 
