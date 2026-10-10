@@ -1,0 +1,55 @@
+fandhe-browser
+Copyright (c) the fandhe-browser authors
+
+本体は MIT OR Apache-2.0 のデュアルライセンスで提供される
+(LICENSE-MIT / LICENSE-APACHE)。
+
+本ファイルは、配布物に同梱されるサードパーティ部品の帰属表示である
+(OSS-2 / TASK-76)。ライセンス全文は LICENSE-THIRD-PARTY を参照する。
+
+--------------------------------------------------------------------------------
+1. Cargo 外で同梱されるネイティブ部品
+--------------------------------------------------------------------------------
+
+v8 crate 152.2.0 (Cargo.lock の版) は V8 と関連ライブラリを静的リンクする。
+v8 crate はパッケージに LICENSE を含まないため、全文は上流から取得して
+LICENSE-THIRD-PARTY に収録している。
+
+| 部品 | 版 | SPDX | 出典 | 同梱される条件 |
+| ---- | -- | ---- | ---- | -------------- |
+| V8 | 15.2.124.1 (v8 crate 152.2.0 同梱) | BSD-3-Clause | https://github.com/v8/v8 | v8 crate を使うビルド (既定の JS エンジン構成) |
+| libc++ | v8 crate 152.2.0 同梱版 | Apache-2.0 WITH LLVM-exception | https://github.com/llvm/llvm-project | 同上 |
+| libc++abi | v8 crate 152.2.0 同梱版 | Apache-2.0 WITH LLVM-exception | https://github.com/llvm/llvm-project | 同上 |
+| ICU | 78 (v8 crate 152.2.0 同梱版) | Unicode-3.0 | https://github.com/unicode-org/icu | 同上 |
+| musl libc | 版は固定されない (ビルド環境の sysroot 依存) | MIT | https://musl.libc.org/ | Linux musl 静的ビルドのみ |
+| ルート CA 証明書 (Alpine ca-certificates) | 同梱開始時に追記 | MPL-2.0 AND MIT | https://pkgs.alpinelinux.org/package/edge/main/x86_64/ca-certificates | scratch コンテナイメージ (TASK-64・Issue #296) に無改変で同梱する予定。現時点では未同梱 |
+
+ルート CA 証明書について:
+
+- 現時点では配布物に同梱していない。同梱は Issue #296 の作業で行い、
+  その時点で版とライセンス全文を追記する。
+- MPL-2.0 は `fandhe-browser-render` crate 配下に限定する規約 (コード依存が対象) の
+  例外として扱う。CA 証明書バンドルは、コード依存ではなく無改変で同梱する
+  データファイルであり、別枠とする (Issue #63 のオーナー判断)。
+
+--------------------------------------------------------------------------------
+2. Servo (MPL-2.0) の適用範囲
+--------------------------------------------------------------------------------
+
+1. MPL-2.0 が適用されるのは、`fandhe-browser-render` crate と、`rendering`
+   feature を有効にしてビルドしたバイナリのみである。
+2. Servo のソースは改変しない。
+3. Servo のソースは公式リポジトリから入手できる:
+   https://github.com/servo/servo
+4. 現時点の既定ビルドおよび配布物には Servo は含まれない
+   (RENDER-1。feature gate `rendering` 無効時の依存グラフに含めない)。
+
+Servo の版は Servo 導入時 (TASK-38・Issue #229 / #230) に追記する。
+MPL-2.0 全文も同時に LICENSE-THIRD-PARTY へ追加する。
+
+--------------------------------------------------------------------------------
+3. Cargo 依存の帰属表示
+--------------------------------------------------------------------------------
+
+Cargo 依存の帰属表示は、配布開始前までに別途整備する
+(cargo-about 等による生成。別 Issue で扱う)。
