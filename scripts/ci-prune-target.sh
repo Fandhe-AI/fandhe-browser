@@ -13,18 +13,18 @@
 set -euo pipefail
 
 if ! command -v jq >/dev/null 2>&1; then
-  echo "::error::jq が見つかりません（cache: true の prune ステップには jq が必要です）"
+  echo "::error::jq not found (required by the cache prune step)"
   exit 1
 fi
 
 workspace="$(pwd -P)"
 target_dir="${workspace}/target"
 if [ ! -d "${target_dir}" ]; then
-  echo "target が存在しないため prune をスキップします"
+  echo "target does not exist; skipping prune"
   exit 0
 fi
 if [ -L "${target_dir}" ]; then
-  echo "::error::target が symlink のため prune を中止します"
+  echo "::error::target is a symlink; aborting prune"
   exit 1
 fi
 
@@ -37,7 +37,7 @@ done < <(cargo metadata --no-deps --format-version 1 \
   | jq -r '.packages[] | .name, (.targets[] | select(.kind | index("custom-build") | not) | .name)' \
   | sort -u)
 if [ "${#raw[@]}" -eq 0 ]; then
-  echo "::error::cargo metadata から workspace メンバーを取得できませんでした"
+  echo "::error::failed to read workspace members from cargo metadata"
   exit 1
 fi
 
@@ -49,8 +49,8 @@ fi
 pkgs=(); names=()
 for n in "${raw[@]}"; do
   if ! jq -n --arg n "${n}" '$n | test("^[\\p{L}\\p{N}_-]+$")' | grep -q '^true$'; then
-    echo "::error::想定外の crate / target 名を検出したため prune を中止します"
-    echo "名前: ${n}"
+    echo "::error::unexpected crate / target name detected; aborting prune"
+    echo "name: ${n}"
     exit 1
   fi
   pkgs+=("${n}")
@@ -73,13 +73,13 @@ safe_rm() {  # $1=削除対象パス $2=許可される親ディレクトリ（�
   case "${p}" in
     "${base}"/*) ;;
     *)
-      echo "::error::削除対象が想定ディレクトリ配下ではありません"
+      echo "::error::deletion target is outside the expected directory"
       echo "${p}"
       exit 1
       ;;
   esac
   if [ -L "${p}" ]; then
-    echo "::error::symlink は削除対象にしません"
+    echo "::error::refusing to delete a symlink"
     echo "${p}"
     exit 1
   fi
@@ -98,7 +98,7 @@ prune_profile() {  # $1=profile dir（target/debug または target/<triple>/deb
   local profile="$1"
   [ -d "${profile}" ] || return 0
   if [ -L "${profile}" ]; then
-    echo "::error::${profile} が symlink のため prune を中止します"
+    echo "::error::${profile} is a symlink; aborting prune"
     exit 1
   fi
   for d in examples incremental; do
@@ -130,9 +130,9 @@ for profile in "${profiles[@]}"; do
   fi
 done
 if [ "${any_profile}" -eq 0 ]; then
-  echo "target/debug・release が存在しないため prune をスキップします"
+  echo "target/debug and target/release do not exist; skipping prune"
   exit 0
 fi
 
-echo "prune 完了: ${removed} エントリを削除しました"
-echo "対象 package: ${pkgs[*]}"
+echo "prune done: removed ${removed} entries"
+echo "packages: ${pkgs[*]}"
