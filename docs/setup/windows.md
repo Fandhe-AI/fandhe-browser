@@ -7,7 +7,7 @@
 Linux・macOS・Windows の 3 OS 一級対応のうち、Windows でソースからビルド・テストするための手順です。対象は 64bit（`x86_64-pc-windows-msvc`）で、32bit は対象外です。
 
 - 手順は「既定ビルド」と「Servo 組込ビルド」の 2 段に分けます
-- 本手順書は Linux 上で作成しており、実機の Windows での再現は未実施です。既定ビルドについては、現行の `.github/workflows/ci.yml` の `rust-ci` と `rust-ci-default-features` が `windows-latest` を含む 3 OS matrix で稼働しています。一方、Servo 組込ビルドに固有の前提（v143 ツールセット・ATL・uv 等）を検証する Windows CI は未導入です（TASK-56.1・#195）。導入され次第、本手順書の確認コマンドをその判定と突き合わせます
+- 本手順書は Linux 上で作成しており、実機の Windows での再現は未実施です。既定ビルドについては、現行の `.github/workflows/ci.yml` の `rust-test-windows` と `rust-features-windows` が `windows-latest` で稼働しています。一方、Servo 組込ビルドに固有の前提（v143 ツールセット・ATL・uv 等）を検証する Windows CI は未導入です（TASK-56.1・#195）。導入され次第、本手順書の確認コマンドをその判定と突き合わせます
 
 ## 現状
 
