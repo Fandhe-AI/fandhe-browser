@@ -119,4 +119,38 @@ AGENT_EVAL_ANSWERS=/abs/path/answers.json cargo test -p fandhe-browser-ai --test
 - 暫定（REPAIR-3）: jsdom の outerHTML とは完全一致せず、`<template>` の中身は含まない。
 - 回答形式の提示文は持たない（#125・TASK-22.2 の指示テンプレートの責務）。golden 情報は入力に含めない。
 - 検証 `aisnap9_golden_locators_survive_raw_dom_roundtrip`: 生 DOM を再パースしても、全 golden ロケータ `{selector, index}` が原本と同じ要素（local name・属性・正規化テキスト）を指す。生 DOM 方式の回答を golden で採点できる前提の確認。
-- 生成物はコミットしない。置き場所と `{selector, index}` 回答の採点は #805（TASK-22.1b）で決める。
+- 生成物はコミットしない。置き場所と `{selector, index}` 回答の採点は次節（#805・TASK-22.1b）で確定した。
+
+## 生 DOM 方式の回答と採点（TASK-22.1b）
+
+`AISNAP-9`・Issue #805・`MS-2`。生 DOM 方式の回答は `{selector, index}` ロケータで返させ、部分点なしの 0/1 で採点する（#123 のオーナー判断）。簡約方式の採点経路（`judge`・`score`）は変えない。
+
+```json
+[
+  {"id": "click-01", "selector": "form#login button[type=submit]", "index": 0},
+  {"id": "extract-02", "value": "<value>"},
+  {"id": "form-01", "steps": [
+    {"action": "fill", "selector": "input#username", "index": 0, "value": "<value>"},
+    {"action": "click", "selector": "form#login button[type=submit]", "index": 0}
+  ]}
+]
+```
+
+- 照合は「生 DOM（`serialize_raw_dom` の出力）を再パースした Document」上で、回答と golden の両ロケータを解決し、**要素の同一性**で比べる（セレクタ文字列の一致ではない。`#login` と `button[type=submit]` が同じ要素なら合格）。`raw_dom_documents` が Document を返し、`score::resolve_raw_dom` が要素キーへ解決して既存の `score` へ渡す。
+- extract の value と form の action・value・順序・手順数は簡約方式と同じ基準。
+- 分類: `selector` / `index` / `value` / `steps` がすべて欠落または null は `unanswered`。片方だけ・負数・小数・文字列の index・`ref` の混入・排他フィールドの同居は `invalid_shape`。セレクタの構文エラー・未対応構文も `invalid_shape`。index が一致件数以上は `mismatch`。
+- 暫定（REPAIR-3）: core のセレクタは一部の構文にしか対応しない（`*`・疑似クラス・`+` / `~`・`$=` `*=` `~=` `|=`・エスケープは未対応）。生 DOM 方式に不利に働きうるため、指示テンプレート（#125）で使用可能な構文を明示する。差の計算と −5pt 判定は #126（TASK-22.3）の担当。
+- 集計は 2 種類を出す。`ScoreReport` の `overall` / `by_category` は `golden_unresolved` を含み、`excluding_golden_unresolved`（`results.json` の同名キー）はそれを分母から除く。`excluded` に除外 id を列挙し、`summarize` へ任意の除外集合を渡せる（#126 が 2 方式の和集合で分母を揃える入口）。
+
+| 成果物 | 置き場所 | コミット |
+| ------ | -------- | -------- |
+| 生 DOM 入力（13 ページ） | 実験時に `write_raw_dom_inputs` でリポ外の一時ディレクトリへ生成 | しない（fixture と `serialize_raw_dom` から決まる生成物） |
+| 回答 JSON（方式別） | 実施者のローカル（リポ外）。必要なら #122 または結果レポートの PR に添付・リンク | しない（実回答はリポジトリに含めない） |
+| 採点結果 | stdout。必要ならリポ外へ保存し、集計値を結果レポートへ転記 | しない |
+| 割付表 | 実験中はリポ外で回答者に渡さない。実施後に結果レポートの付録へ転記 | レポートの一部として載せる（生成コードは #125） |
+| 結果レポート | `docs/design/aisnap9-comparison-report.md`（作成は #126・TASK-22.3） | する |
+
+```bash
+# 実回答（生 DOM 方式）を採点して結果を stdout へ出す（リポ内へは書かない）
+AGENT_EVAL_RAW_ANSWERS=/abs/path/raw-answers.json cargo test -p fandhe-browser-ai --test agent_eval_score -- --nocapture aisnap9_score_raw_answers_if_requested
+```

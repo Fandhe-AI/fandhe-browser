@@ -14,12 +14,26 @@
 //!
 //! 回答 JSON は LLM 出力由来の外部入力。サイズ・件数・手順数・文字列長を上限検証し、
 //! `get()` 系のみで辿る（`unwrap`・添字アクセスを使わない）。
+//!
+//! TASK-22.1b（`AISNAP-9`・Issue #805・`MS-2`）: 生 DOM 直渡し方式の `{selector, index}` ロケータ回答も
+//! 採点する（`parse_raw_answers` / `resolve_raw_dom`）。回答者が見たのは `serialize_raw_dom` の出力なので、
+//! 回答と golden のロケータは「生 DOM を再パースした Document」上で解決し、要素の同一性
+//! （文書順の位置から作るキー）で比べる。セレクタ文字列の一致では比べない。解決結果は
+//! `Answer::Ref` / `ResolvedTask` のキーへ変換して既存の `judge` / `score` へ渡すため、簡約方式の
+//! 採点経路は変わらない。部分点は付けず（0/1）、`golden_unresolved` を含む集計と除いた集計の
+//! 両方を `ScoreReport` に持たせる（#123 のオーナー判断）。
+//!
+//! 暫定事項（`REPAIR-3`）: 2 方式の差の計算と −5pt 判定は #126（TASK-22.3）の担当で、ここでは行わない。
+//! セレクタは core が対応する一部の構文に限られ、未対応構文の回答は `invalid_shape` になる
+//! （指示テンプレート #125 で使用可能な構文を明示する前提）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::generate_reduced::ResolvedTask;
+use crate::generate_reduced::{ResolvedLocator, ResolvedTask, golden_locators};
 use crate::tasks::{Action, Category, Golden, Task, json_str};
+use fandhe_browser_core::dom::{Document, NodeId};
+use fandhe_browser_core::query::query_selector_all_str;
 
 /// 全体成功率の合格しきい値（`AISNAP-8`: 絶対値 70% 以上）。
 pub const PASS_THRESHOLD_PERCENT: u32 = 70;
@@ -130,14 +144,26 @@ pub struct Verdict {
     pub meets: bool,
 }
 
+/// 種別別・全体の集計。除外したタスク id を併記する（`AISNAP-9`・#805）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Summary {
+    /// click・extract・form・nav の順。
+    pub by_category: [(Category, Tally); 4],
+    pub overall: Tally,
+    /// 分母から除いたタスク id（昇順）。実在する id だけを持つ。
+    pub excluded: Vec<String>,
+}
+
 /// 採点レポート。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScoreReport {
     pub results: Vec<TaskResult>,
-    /// click・extract・form・nav の順。
+    /// click・extract・form・nav の順（`golden_unresolved` を含む集計）。
     pub by_category: [(Category, Tally); 4],
     pub overall: Tally,
     pub verdict: Verdict,
+    /// `golden_unresolved` のタスクを分母から除いた集計（`AISNAP-9`・#805）。
+    pub excluding_golden_unresolved: Summary,
 }
 
 /// 採点・回答パースのエラー。
@@ -149,6 +175,13 @@ pub enum ScoreError {
     UnknownId(String),
     MissingGolden(String),
     MissingResolved(String),
+    /// 生 DOM 方式の採点で、タスクが指すページの Document が渡されていない。
+    MissingPage(String),
+    /// 生 DOM 上で golden のセレクタが評価できない（golden 定義の不備。fail-closed）。
+    GoldenSelector {
+        task: String,
+        message: String,
+    },
 }
 
 impl fmt::Display for ScoreError {
@@ -160,6 +193,10 @@ impl fmt::Display for ScoreError {
             ScoreError::UnknownId(i) => write!(f, "unknown task id: {i}"),
             ScoreError::MissingGolden(i) => write!(f, "missing golden for task: {i}"),
             ScoreError::MissingResolved(i) => write!(f, "missing resolved refs for task: {i}"),
+            ScoreError::MissingPage(p) => write!(f, "missing raw dom page: {p}"),
+            ScoreError::GoldenSelector { task, message } => {
+                write!(f, "{task}: golden selector failed: {message}")
+            }
         }
     }
 }
@@ -247,9 +284,12 @@ fn parse_entry(o: &JsonObject) -> Result<Answer, ScoreError> {
     }
 }
 
-/// 回答 JSON（`[{"id": ..., "ref"|"value"|"steps": ...}, ...]`）を id → 回答へ変換する。
-/// 1 件の形式不備は `Answer::Invalid` に留め、全体のエラーにはしない。
-pub fn parse_answers(tasks: &[Task], json: &str) -> Result<BTreeMap<String, Answer>, ScoreError> {
+/// トップレベル検証（サイズ・配列・件数・id・重複・未知 id）を共通化し、エントリ本体だけ `f` に委ねる。
+fn parse_entries<T>(
+    tasks: &[Task],
+    json: &str,
+    f: fn(&JsonObject) -> Result<T, ScoreError>,
+) -> Result<BTreeMap<String, T>, ScoreError> {
     if json.len() > MAX_INPUT_BYTES {
         return Err(ScoreError::TooLarge("input exceeds size limit".to_owned()));
     }
@@ -275,12 +315,18 @@ pub fn parse_answers(tasks: &[Task], json: &str) -> Result<BTreeMap<String, Answ
         if !tasks.iter().any(|t| t.id == id) {
             return Err(ScoreError::UnknownId(id.to_owned()));
         }
-        let ans = parse_entry(o)?;
+        let ans = f(o)?;
         if out.insert(id.to_owned(), ans).is_some() {
             return Err(ScoreError::DuplicateId(id.to_owned()));
         }
     }
     Ok(out)
+}
+
+/// 回答 JSON（`[{"id": ..., "ref"|"value"|"steps": ...}, ...]`）を id → 回答へ変換する。
+/// 1 件の形式不備は `Answer::Invalid` に留め、全体のエラーにはしない。
+pub fn parse_answers(tasks: &[Task], json: &str) -> Result<BTreeMap<String, Answer>, ScoreError> {
+    parse_entries(tasks, json, parse_entry)
 }
 
 fn normalize(s: &str) -> String {
@@ -360,13 +406,6 @@ pub fn score(
         return Err(ScoreError::UnknownId(id.clone()));
     }
     let mut results = Vec::with_capacity(tasks.len());
-    let mut cats = [
-        (Category::Click, Tally::default()),
-        (Category::Extract, Tally::default()),
-        (Category::Form, Tally::default()),
-        (Category::Nav, Tally::default()),
-    ];
-    let mut overall = Tally::default();
     for t in tasks {
         let g = golden
             .iter()
@@ -381,32 +420,299 @@ pub fn score(
             Some(a) => judge(g, r, a),
             None => Some(FailureClass::Unanswered),
         };
-        let pass = failure.is_none();
-        for (c, tally) in cats.iter_mut() {
-            if *c == t.category {
-                tally.total += 1;
-                tally.pass += u32::from(pass);
-            }
-        }
-        overall.total += 1;
-        overall.pass += u32::from(pass);
         results.push(TaskResult {
             id: t.id.to_owned(),
             category: t.category,
-            pass,
+            pass: failure.is_none(),
             failure,
         });
     }
+    let all = summarize(&results, &BTreeSet::new());
+    let excluded = golden_unresolved_ids(&results);
     let verdict = Verdict {
         threshold_percent: PASS_THRESHOLD_PERCENT,
-        meets: overall.meets(PASS_THRESHOLD_PERCENT),
+        meets: all.overall.meets(PASS_THRESHOLD_PERCENT),
     };
     Ok(ScoreReport {
+        excluding_golden_unresolved: summarize(&results, &excluded),
+        by_category: all.by_category,
+        overall: all.overall,
         results,
-        by_category: cats,
-        overall,
         verdict,
     })
+}
+
+/// 結果のうち `exclude` に含まれる id を分母・分子から除いて集計する（純関数。`AISNAP-9`・#805）。
+///
+/// #126（TASK-22.3）が 2 方式の `golden_unresolved` の和集合を渡し直して分母を揃える入口にもなる。
+/// `Summary::excluded` には `results` に実在した除外 id だけを昇順で入れる。
+pub fn summarize(results: &[TaskResult], exclude: &BTreeSet<String>) -> Summary {
+    let mut cats = [
+        (Category::Click, Tally::default()),
+        (Category::Extract, Tally::default()),
+        (Category::Form, Tally::default()),
+        (Category::Nav, Tally::default()),
+    ];
+    let mut overall = Tally::default();
+    let mut excluded = BTreeSet::new();
+    for r in results {
+        if exclude.contains(&r.id) {
+            excluded.insert(r.id.clone());
+            continue;
+        }
+        for (c, tally) in cats.iter_mut() {
+            if *c == r.category {
+                tally.total += 1;
+                tally.pass += u32::from(r.pass);
+            }
+        }
+        overall.total += 1;
+        overall.pass += u32::from(r.pass);
+    }
+    Summary {
+        by_category: cats,
+        overall,
+        excluded: excluded.into_iter().collect(),
+    }
+}
+
+/// 失敗理由が `golden_unresolved` のタスク id 集合。
+pub fn golden_unresolved_ids(results: &[TaskResult]) -> BTreeSet<String> {
+    results
+        .iter()
+        .filter(|r| r.failure == Some(FailureClass::GoldenUnresolved))
+        .map(|r| r.id.clone())
+        .collect()
+}
+
+// ---- 生 DOM 直渡し方式（`AISNAP-9`・TASK-22.1b・#805） ----
+
+/// 生 DOM 方式の 1 手順（form）。ロケータは生 DOM を再パースした Document 上で解決する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawAnswerStep {
+    pub action: Action,
+    pub selector: String,
+    pub index: usize,
+    pub value: Option<String>,
+}
+
+/// 生 DOM 方式の 1 タスクへの回答。`Answer` と対になる、解決前の形。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawAnswer {
+    /// click・nav の回答（`{selector, index}`）。
+    Locator { selector: String, index: usize },
+    /// extract の回答（値）。
+    Value(String),
+    /// form の回答（操作列）。
+    Steps(Vec<RawAnswerStep>),
+    /// 欠落または全フィールドが null。
+    Unanswered,
+    /// 型・必須項目が不正（`ref` の混入など形式の取り違えを含む）。
+    Invalid,
+}
+
+/// `index` フィールド。内側 `Ok(None)` は欠落または null、内側 `Err(())` は非負整数でない値。
+fn index_field(obj: &JsonObject) -> Result<Option<usize>, ()> {
+    match obj.get("index") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .map(Some)
+            .ok_or(()),
+    }
+}
+
+fn parse_raw_steps(arr: &[serde_json::Value]) -> Result<RawAnswer, ScoreError> {
+    if arr.len() > MAX_STEPS {
+        return Err(ScoreError::TooLarge("steps exceed step limit".to_owned()));
+    }
+    let mut steps = Vec::with_capacity(arr.len());
+    for v in arr {
+        let Some(o) = v.as_object() else {
+            return Ok(RawAnswer::Invalid);
+        };
+        let action = match o.get("action").and_then(|a| a.as_str()) {
+            Some("fill") => Action::Fill,
+            Some("select") => Action::Select,
+            Some("click") => Action::Click,
+            _ => return Ok(RawAnswer::Invalid),
+        };
+        let sel = str_field(o, "selector")?;
+        let rf = str_field(o, "ref")?;
+        let val = str_field(o, "value")?;
+        let (Ok(Some(selector)), Ok(None), Ok(value), Ok(Some(index))) =
+            (sel, rf, val, index_field(o))
+        else {
+            return Ok(RawAnswer::Invalid);
+        };
+        let shape_ok = match action {
+            Action::Click => value.is_none(),
+            Action::Fill | Action::Select => value.is_some(),
+        };
+        if !shape_ok {
+            return Ok(RawAnswer::Invalid);
+        }
+        steps.push(RawAnswerStep {
+            action,
+            selector,
+            index,
+            value,
+        });
+    }
+    Ok(RawAnswer::Steps(steps))
+}
+
+fn parse_raw_entry(o: &JsonObject) -> Result<RawAnswer, ScoreError> {
+    // 文字列長の上限超過は全体エラー。型違いなどはこのタスクだけ Invalid にする
+    let sel = str_field(o, "selector")?;
+    let rf = str_field(o, "ref")?;
+    let val = str_field(o, "value")?;
+    let idx = index_field(o);
+    let steps = match o.get("steps") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(x) => Some(x),
+    };
+    // 簡約方式の `ref` が混ざった回答は形式の取り違えとして Invalid（安全側）
+    let (Ok(sel), Ok(None), Ok(val), Ok(idx)) = (sel, rf, val, idx) else {
+        return Ok(RawAnswer::Invalid);
+    };
+    match (sel, idx, val, steps) {
+        (None, None, None, None) => Ok(RawAnswer::Unanswered),
+        (Some(selector), Some(index), None, None) => Ok(RawAnswer::Locator { selector, index }),
+        (None, None, Some(v), None) => Ok(RawAnswer::Value(v)),
+        (None, None, None, Some(s)) => match s.as_array() {
+            Some(arr) => parse_raw_steps(arr),
+            None => Ok(RawAnswer::Invalid),
+        },
+        _ => Ok(RawAnswer::Invalid),
+    }
+}
+
+/// 生 DOM 方式の回答 JSON（`[{"id", "selector"+"index" | "value" | "steps"}, ...]`）をパースする。
+/// 上限・重複 id・未知 id の扱いは `parse_answers` と同じ。1 件の形式不備は `RawAnswer::Invalid` に留める。
+///
+/// 文字列の上限 `MAX_STRING_BYTES`（4096）は core のセレクタ入力上限と同じ値で、セレクタ用の別上限は設けない。
+pub fn parse_raw_answers(
+    tasks: &[Task],
+    json: &str,
+) -> Result<BTreeMap<String, RawAnswer>, ScoreError> {
+    parse_entries(tasks, json, parse_raw_entry)
+}
+
+/// 回答側が範囲外を指したときのキー。要素同一性キー（`node:<N>`）とは決して一致しない。
+const OUT_OF_RANGE_KEY: &str = "out-of-range";
+
+/// 要素同一性キー。`doc` の文書順（`descendants`）での位置から作る。
+fn element_key(doc: &Document, node: NodeId) -> Option<String> {
+    doc.descendants(doc.root())
+        .position(|n| n == node)
+        .map(|pos| format!("node:{pos}"))
+}
+
+/// 回答ロケータの解決結果。
+enum Located {
+    /// 要素を指した（範囲外は番兵キー）。
+    Key(String),
+    /// セレクタが構文エラー・未対応構文など（`invalid_shape`）。
+    Invalid,
+}
+
+fn locate(doc: &Document, selector: &str, index: usize) -> Located {
+    match query_selector_all_str(doc, doc.root(), selector) {
+        Err(_) => Located::Invalid,
+        Ok(found) => Located::Key(
+            found
+                .get(index)
+                .and_then(|n| element_key(doc, *n))
+                .unwrap_or_else(|| OUT_OF_RANGE_KEY.to_owned()),
+        ),
+    }
+}
+
+fn resolve_raw_answer(doc: &Document, a: &RawAnswer) -> Answer {
+    match a {
+        RawAnswer::Unanswered => Answer::Unanswered,
+        RawAnswer::Invalid => Answer::Invalid,
+        RawAnswer::Value(v) => Answer::Value(v.clone()),
+        RawAnswer::Locator { selector, index } => match locate(doc, selector, *index) {
+            Located::Key(k) => Answer::Ref(k),
+            Located::Invalid => Answer::Invalid,
+        },
+        RawAnswer::Steps(steps) => {
+            let mut out = Vec::with_capacity(steps.len());
+            for s in steps {
+                let Located::Key(k) = locate(doc, &s.selector, s.index) else {
+                    return Answer::Invalid;
+                };
+                out.push(AnswerStep {
+                    action: s.action,
+                    target_ref: k,
+                    value: s.value.clone(),
+                });
+            }
+            Answer::Steps(out)
+        }
+    }
+}
+
+/// 生 DOM 方式の golden と回答を、同じ Document 上の要素同一性キーへ解決する（`AISNAP-9`・#805）。
+///
+/// `pages` は各ページの生 DOM（`serialize_raw_dom` の出力）を再パースした Document。
+/// 戻り値は既存の `score` にそのまま渡せる。golden のロケータが範囲外のときは `refs` を空にして
+/// `golden_unresolved` になる（エラーにしない）。golden のセレクタ自体が評価できない場合は
+/// golden 定義の不備として `ScoreError::GoldenSelector`。
+pub fn resolve_raw_dom(
+    tasks: &[Task],
+    golden: &[(&str, Golden)],
+    pages: &BTreeMap<String, Document>,
+    answers: &BTreeMap<String, RawAnswer>,
+) -> Result<(Vec<ResolvedTask>, BTreeMap<String, Answer>), ScoreError> {
+    if let Some(id) = answers
+        .keys()
+        .find(|k| !tasks.iter().any(|t| t.id == k.as_str()))
+    {
+        return Err(ScoreError::UnknownId(id.clone()));
+    }
+    let mut resolved = Vec::with_capacity(tasks.len());
+    let mut out = BTreeMap::new();
+    for t in tasks {
+        let doc = pages
+            .get(t.page)
+            .ok_or_else(|| ScoreError::MissingPage(t.page.to_owned()))?;
+        let g = golden
+            .iter()
+            .find(|(id, _)| *id == t.id)
+            .map(|(_, g)| g)
+            .ok_or_else(|| ScoreError::MissingGolden(t.id.to_owned()))?;
+        let mut locators = Vec::new();
+        for l in golden_locators(g) {
+            let found = query_selector_all_str(doc, doc.root(), l.selector).map_err(|e| {
+                ScoreError::GoldenSelector {
+                    task: t.id.to_owned(),
+                    message: e.to_string(),
+                }
+            })?;
+            let refs = found
+                .get(l.index)
+                .and_then(|n| element_key(doc, *n))
+                .into_iter()
+                .collect();
+            locators.push(ResolvedLocator {
+                selector: l.selector.to_owned(),
+                index: l.index,
+                refs,
+            });
+        }
+        resolved.push(ResolvedTask {
+            id: t.id.to_owned(),
+            locators,
+        });
+        if let Some(a) = answers.get(t.id) {
+            out.insert(t.id.to_owned(), resolve_raw_answer(doc, a));
+        }
+    }
+    Ok((resolved, out))
 }
 
 fn tally_json(t: &Tally) -> String {
@@ -448,12 +754,32 @@ pub fn render_results_json(r: &ScoreReport) -> String {
             )
         })
         .collect();
+    let ex = &r.excluding_golden_unresolved;
+    let ex_cats: Vec<String> = ex
+        .by_category
+        .iter()
+        .map(|(c, t)| {
+            format!(
+                "      {{\"category\": {}, {}}}",
+                json_str(c.as_str()),
+                tally_json(t)
+            )
+        })
+        .collect();
+    let ex_ids: Vec<String> = ex.excluded.iter().map(|i| json_str(i)).collect();
+    let exclusion = format!(
+        "  \"excluding_golden_unresolved\": {{\n    \"excluded\": [{}],\n    \"overall\": {{{}}},\n    \"by_category\": [\n{}\n    ]\n  }},\n",
+        ex_ids.join(", "),
+        tally_json(&ex.overall),
+        ex_cats.join(",\n")
+    );
     format!(
-        "{{\n  \"threshold_percent\": {},\n  \"meets\": {},\n  \"overall\": {{{}}},\n  \"by_category\": [\n{}\n  ],\n  \"results\": [\n{}\n  ]\n}}\n",
+        "{{\n  \"threshold_percent\": {},\n  \"meets\": {},\n  \"overall\": {{{}}},\n  \"by_category\": [\n{}\n  ],\n{}  \"results\": [\n{}\n  ]\n}}\n",
         r.verdict.threshold_percent,
         r.verdict.meets,
         tally_json(&r.overall),
         cats.join(",\n"),
+        exclusion,
         items.join(",\n")
     )
 }
