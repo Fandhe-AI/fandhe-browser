@@ -17,6 +17,7 @@ Rust 製の軽量・ミニマムなブラウザの実装リポジトリです。
   - プロファイル分離による安全なマルチテナント運用
   - Linux・macOS・Windows 3 OS への一級対応
 - **非目標（コア v1）**: フル Chromium 互換・GPU レンダリングパイプラインは v1 のコアでは対象外です。段階的な互換拡張はコアでなくプラグインとして扱う方針です（`04-behavior/README.md` の判定節、`plugin-extension.md` PLUG-7〔TASK-99・MS-9〕、段階 0 は `compat-level.md` COMPAT-1〔TASK-72・MS-6〕・COMPAT-4〔TASK-71/74・MS-6〕）
+- **対象外サイト（コア v1）**: anti-bot 機構により機械的にブロックされるサイト（Reddit 等）と、robots.txt で対象パスが Disallow のサイトは対象用途・実測対象から除外します。認証突破・anti-bot 回避は実装しません（`security-policy.md` SEC-1・SEC-3、TASK-85・TASK-70・MS-7。除外サイトの一覧は `docs/design/anti-bot-exclusion.md`）。robots.txt は選定基準であり、実行時には解釈しません（利用者側の責任）
 
 ## 到達目標
 

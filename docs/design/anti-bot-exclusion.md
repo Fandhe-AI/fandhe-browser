@@ -1,0 +1,57 @@
+# anti-bot 除外対象サイトの明記確認記録（TASK-85 草案）
+
+**対象**: TASK-85 / SEC-1・SEC-3 / MS-7
+**状態**: 草案（Reddit・Unsplash・robots.txt の扱いはオーナー判断済み。確認の最終判断は人間担当）
+**関連 Issue**: #349
+
+## 目的
+
+anti-bot 機構により機械的にブロックされるサイト（PoC-9: Reddit 等）と、robots.txt で対象パスが Disallow のサイト（TASK-70）が、MVP の対象用途から明示的に除外されていることを、spec の除外事項・対象サイト群カタログ・本リポ README と突き合わせて確認する。
+
+## 除外の根拠
+
+| 区分 | 内容 | 根拠 |
+| ---- | ---- | ---- |
+| anti-bot / UA・ネットワークポリシーでブロックされるサイト | 認証突破・anti-bot 回避機構は実装しないため、対象用途から除外する（PoC-9: Reddit 等は Chromium のフル JS 実行環境でも回避されない） | `security-policy.md` SEC-1・SEC-2、`04-behavior/README.md` 除外事項 |
+| robots.txt で対象パスが Disallow のサイト | 実測対象の選定基準として除外する（RFC 9309 準拠で判定。PoC-9 試行済み 23 サイトには遡及適用しない。ブラウザ実行時に robots.txt を解釈する機能は定めない） | `security-policy.md` SEC-3、TASK-70 |
+
+## 突き合わせ表
+
+| 確認箇所 | 除外の明記 | 結果 |
+| -------- | ---------- | ---- |
+| spec `04-behavior/README.md` 除外事項「anti-bot 回避・フィンガープリンティング偽装」 | Reddit 等（SEC-1）と robots.txt Disallow サイト（SEC-3）を除外と明記 | 明記あり |
+| `docs/design/site-catalog-task70.md`（TASK-70 更新版カタログ） | 下表の除外サイトを理由つきで「除外」と記載 | 明記あり（ただし Reddit は後述の差分あり） |
+| 本リポ `README.md` | 「対象外サイト（コア v1）」項目を本 PR で追記 | 追記前は記載なし。追記後は明記あり |
+
+## カタログ上の除外サイト（TASK-70）
+
+| ID | サイト | 除外理由 |
+| -- | ------ | -------- |
+| a8 | Medium のブログ記事 | 403 ブロック（SEC-1） |
+| b6 | Figma Community | 403 ブロック（SEC-1） |
+| b7 | Airbnb の検索結果 | robots.txt Disallow `/s/*/*`（SEC-3） |
+| b8 | Twitter の公開プロフィール | robots.txt Disallow `/`（SEC-3） |
+| c3 | Pinterest のピン一覧 | robots.txt Disallow `/`（SEC-3） |
+| c5 | Instagram の公開プロフィール | robots.txt Disallow `/`（SEC-3） |
+
+## 確認結果と差分
+
+1. spec 除外事項と SEC-1・SEC-3 の記述は、上記カタログの除外 6 サイトと整合している
+2. 本リポ README の除外事項への反映は、本 PR で追加した（TASK-85 の確認観点。Issue #349 受け入れ条件 2）
+3. Reddit（c1）: spec の除外事項（SSOT）が除外例に挙げているため、spec に従い対象外として扱う（オーナー判断 2026-10-10）。カタログ c1 は TASK-70 で「到達（200）」だったため、カタログの到達結果と spec の除外扱いに差がある。到達できた事実は変えず、MVP の対象用途からは除外する。備考のとおり PoC-9 でブロックページ・ログイン画面の先例がある。カタログ側の表記の整合は spec・カタログの更新時に反映する
+4. Unsplash（c2、401）: anti-bot 除外ではなく「認証必須による到達不能」として別区分で記録する（オーナー判断 2026-10-10）。SEC-1 の anti-bot 除外には含めない
+5. robots.txt の責任分界: SEC-3 は「実測対象の選定基準であり、ブラウザ本体の実行時に robots.txt を解釈する機能は定めない」と定める。したがって、実行時は robots.txt を解釈せず、利用者側（ブラウザを操作する側）の責任とする
+6. 既知の課題（`site-catalog-task70.md` 残課題）: robots.txt を除外基準とする記述の SEC 系への追記は spec 側の対応事項として報告済みで、SEC-3 が確定済みであることを今回確認した
+
+## 認証必須による到達不能（anti-bot 除外とは別区分）
+
+| ID | サイト | 結果 | 区分 |
+| -- | ------ | ---- | ---- |
+| c2 | Unsplash の画像検索 | 401 | 認証必須による到達不能（SEC-1 の anti-bot 除外ではない） |
+
+## 確認記録
+
+| 日付 | 確認内容 | 結果 |
+| ---- | -------- | ---- |
+| 2026-10-10 | spec 除外事項・カタログ・README の突き合わせ（草案作成） | 差分 2 件（Reddit・Unsplash） |
+| 2026-10-10 | オーナー判断の反映（Reddit は spec に従い対象外・Unsplash は別区分・robots.txt の責任分界を明記） | 差分の扱いを確定 |
