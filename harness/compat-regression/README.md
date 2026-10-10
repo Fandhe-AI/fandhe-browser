@@ -79,4 +79,4 @@ make check-compat-regression
 
 内部で `self-test.sh`（fixture による自己テスト。閾値未満で確実に fail することの
 証跡）→ 実マトリクスへの `check-matrix.sh --allow-missing` 呼び出し、の順に実行する
-（CI の `compat-regression` ジョブと同じ手順）。
+（CI の `harness-*` ジョブの `[compat-regression]` ステップと同じ手順）。
