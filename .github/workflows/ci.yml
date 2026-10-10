@@ -60,7 +60,7 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          fetch-depth: ${{ github.event_name == 'pull_request' && 0 || 1 }}
+          fetch-depth: 0
       - name: "判定スクリプトの自己テスト"
         run: bash scripts/ci-changes.sh --self-test
       - name: "変更ファイルから実行対象（rust・harness）を判定"
@@ -84,7 +84,7 @@ jobs:
             emit true true "base/head SHA unavailable"
             exit 0
           fi
-          if ! files="$(git -c core.quotepath=false diff --name-only "$BASE_SHA...$HEAD_SHA")"; then
+          if ! files="$(git -c core.quotepath=false diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA")"; then
             echo "::warning::git diff failed; running all jobs (fail-closed)"
             emit true true "git diff failed"
             exit 0
@@ -129,7 +129,7 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          fetch-depth: ${{ github.event_name == 'pull_request' && 0 || 1 }}
+          fetch-depth: 0
       - name: "Node.js 版の確認（markdownlint-cli・commitlint は 22.12 以上が必要）"
         run: |
           node --version
