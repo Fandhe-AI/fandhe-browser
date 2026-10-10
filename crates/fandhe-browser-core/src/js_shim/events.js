@@ -43,8 +43,16 @@
     // `lifecycleListenerLimit` op でランナーへ通知する（ランナーはリソース上限として打ち切る。JS-6）。
     var MAX_LISTENERS_PER_TARGET = 1024;
 
-    var documentTarget = { listeners: [] };
-    var windowTarget = { listeners: [] };
+    // リスナー保持は配列ではなく「プロトタイプを持たないコンテナ＋件数」で行う。配列の添字代入は
+    // Array.prototype / Object.prototype の '0' 等に定義された setter や書き込み不可プロパティの影響を
+    // 受け、例外でリスナーが呼ばれないまま Dispatched になり得るため（JS-4）。
+    // null プロトタイプのオブジェクトへの代入は継承された setter を経由しない。
+    var createObject = Object.create;
+    function newTarget() {
+        return { items: createObject(null), count: 0 };
+    }
+    var documentTarget = newTarget();
+    var windowTarget = newTarget();
 
     function isListener(l) {
         return typeof l === 'function' || (l !== null && typeof l === 'object');
@@ -54,14 +62,14 @@
         if (typeof type !== 'string' || !isListener(listener)) {
             return;
         }
-        var list = target.listeners;
-        for (var i = 0; i < list.length; i++) {
+        var list = target.items;
+        for (var i = 0; i < target.count; i++) {
             if (list[i].type === type && list[i].listener === listener) {
                 return;
             }
         }
         var once = options !== null && typeof options === 'object' && !!options.once;
-        if (list.length >= MAX_LISTENERS_PER_TARGET) {
+        if (target.count >= MAX_LISTENERS_PER_TARGET) {
             try {
                 callOp('lifecycleListenerLimit');
             } catch (e) {
@@ -69,18 +77,20 @@
             }
             return;
         }
-        list[list.length] = { type: type, listener: listener, once: once };
+        list[target.count] = { type: type, listener: listener, once: once };
+        target.count += 1;
     }
 
     function remove(target, type, listener) {
-        var list = target.listeners;
-        for (var i = 0; i < list.length; i++) {
+        var list = target.items;
+        for (var i = 0; i < target.count; i++) {
             if (list[i].type === type && list[i].listener === listener) {
-                var len = list.length;
+                var len = target.count;
                 for (var j = i; j < len - 1; j++) {
                     list[j] = list[j + 1];
                 }
-                list.length = len - 1;
+                delete list[len - 1];
+                target.count = len - 1;
                 return;
             }
         }
@@ -132,12 +142,13 @@
 
     function fire(target, currentTarget, event, eventName, state) {
         // 呼び出し中の登録・削除の影響を受けないよう複製して走査する。
-        var source = target.listeners;
-        var snapshot = [];
-        for (var k = 0; k < source.length; k++) {
+        var source = target.items;
+        var sourceCount = target.count;
+        var snapshot = createObject(null);
+        for (var k = 0; k < sourceCount; k++) {
             snapshot[k] = source[k];
         }
-        for (var i = 0; i < snapshot.length; i++) {
+        for (var i = 0; i < sourceCount; i++) {
             if (state.immediateStopped) {
                 return;
             }
@@ -147,7 +158,7 @@
             }
             // 走査中に removeEventListener されたものは呼ばない。
             var alive = false;
-            for (var m = 0; m < source.length; m++) {
+            for (var m = 0; m < target.count; m++) {
                 if (source[m] === entry) {
                     alive = true;
                     break;

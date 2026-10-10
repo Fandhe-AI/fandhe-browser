@@ -964,8 +964,14 @@ fn execute(
                                     kind: AbortKind::ResourceLimit,
                                     index: Some(entry.index()),
                                 });
+                                // 原因スクリプト自身の結果も打ち切りとして記録する（`JS-6`）。
+                                ScriptOutcome::Aborted {
+                                    kind: AbortKind::ResourceLimit,
+                                    message: None,
+                                }
+                            } else {
+                                o
                             }
-                            o
                         }
                         // runtime が無いのは abort 済みのときだけ（上の分岐で処理済み）。
                         None => ScriptOutcome::NotExecuted {

@@ -381,6 +381,18 @@ pub fn run(engine: &str) {
     let abort = out.abort().expect("abort");
     assert_eq!(abort.kind(), &AbortKind::ResourceLimit);
     assert_eq!(abort.index(), Some(0));
+    // 原因スクリプト自身の結果も Aborted / ResourceLimit になる。
+    assert!(
+        matches!(
+            out.scripts()[0].outcome(),
+            ScriptOutcome::Aborted {
+                kind: AbortKind::ResourceLimit,
+                ..
+            }
+        ),
+        "{:?}",
+        out.scripts()[0].outcome()
+    );
     assert!(
         out.lifecycle()
             .iter()
@@ -430,6 +442,26 @@ pub fn run(engine: &str) {
         document.addEventListener('DOMContentLoaded', function () { console.log('first'); }, { once: true });\
         document.addEventListener('DOMContentLoaded', function () { console.log('second'); });\
         window.addEventListener('load', function () { console.log('third'); }, { once: true });\
+        </script></body>";
+    let out = run_page(engine, html, &opts);
+    assert_eq!(
+        out.bridge_diagnostics()
+            .console_messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second", "third"]
+    );
+
+    eprintln!(
+        "case: JS-4 index setters on Array.prototype / Object.prototype do not drop listeners"
+    );
+    let html = "<body><script>\
+        Object.defineProperty(Array.prototype, '0', { set: function () { throw new Error('tampered'); }, get: function () { return undefined; }, configurable: true });\
+        Object.defineProperty(Object.prototype, '1', { set: function () { throw new Error('tampered'); }, get: function () { return undefined; }, configurable: true });\
+        document.addEventListener('DOMContentLoaded', function () { console.log('first'); }, { once: true });\
+        document.addEventListener('DOMContentLoaded', function () { console.log('second'); });\
+        window.addEventListener('load', function () { console.log('third'); });\
         </script></body>";
     let out = run_page(engine, html, &opts);
     assert_eq!(
