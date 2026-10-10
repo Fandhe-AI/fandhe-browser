@@ -56,7 +56,7 @@
   {
     "id": "extract-03",
     "locators": [
-      {"selector": "span.score", "index": 0, "refs": ["eb0cf8a56844b70d5"]}
+      {"selector": "span.score", "index": 0, "refs": []}
     ]
   },
   {

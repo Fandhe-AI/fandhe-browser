@@ -10,7 +10,7 @@
 //! コミット済みレポートとの同期は `plug4_committed_report_contains_rendered_block` が検査する。
 //! 再利用が要る場合は判定を `benches/token_reduction/` へ移す。
 //!
-//! 実データの現状: 平均削減率は 84.0% に届いていない（約 -75.7%）。PLUG-4 の前提は PoC-5 の
+//! 実データの現状: 平均削減率は 84.0% に届いていない（約 -8.5%）。PLUG-4 の前提は PoC-5 の
 //! フラット形式だが、現行ホストは JSON ツリーのエンベロープを返し生 HTML より大きいため
 //! （PLUG-5・TASK-97・AISNAP-6 の論点）。実データの verdict は未達のまま固定して事実を記録し
 //! （REPAIR-3）、合否ロジックは合成データで境界値まで検証する。
@@ -110,11 +110,11 @@ fn assert_plug4(summary: &ReductionSummary) -> TestResult<()> {
 /// 現状は JSON エンベロープが生 HTML より大きく削減率は負になる。出力形式の調整は範囲外
 /// （PLUG-4・PLUG-5 側の論点）。
 const PINNED: [(&str, usize, usize, bool); 5] = [
-    ("example-minimal", 103, 202, false),
-    ("wikipedia-article", 56482, 64327, false),
-    ("hn-list", 10220, 21257, true),
-    ("login-form", 284, 553, false),
-    ("mdn-docs", 19005, 31463, false),
+    ("example-minimal", 103, 92, false),
+    ("wikipedia-article", 56482, 41283, false),
+    ("hn-list", 10220, 16350, true),
+    ("login-form", 284, 209, false),
+    ("mdn-docs", 19005, 27817, false),
 ];
 
 /// 代表 5 サイト（`PLUG-4` の列挙順）。
@@ -415,7 +415,7 @@ fn plug4_threshold_nan_is_shortfall() -> TestResult<()> {
     Ok(())
 }
 
-/// `PLUG-4`: 実データの現状 verdict（84.0% 未達・平均約 -75.7%）を固定する。
+/// `PLUG-4`: 実データの現状 verdict（84.0% 未達・平均約 -8.5%）を固定する。
 ///
 /// これは PLUG-4 未達の事実の記録であり、達成を装うものではない（REPAIR-3）。snapshot の出力形式
 /// が縮んで verdict が `Met` に変わったら、本テストを `assert_plug4(&summary)?` による本ゲートに
@@ -457,13 +457,13 @@ fn plug4_mcp_token_reduction_report_prints_markdown() -> TestResult<()> {
     let report = measured_report()?;
     println!("{report}");
     for needle in [
-        "| example-minimal | 103 | 202 | -96.1 | false |",
-        "| wikipedia-article | 56482 | 64327 | -13.9 | false |",
-        "| hn-list | 10220 | 21257 | -108.0 | true |",
-        "| login-form | 284 | 553 | -94.7 | false |",
-        "| mdn-docs | 19005 | 31463 | -65.6 | false |",
-        "| 5 | -75.7 | -108.0 | -13.9 |",
-        "| 84.0 | -75.7 | Shortfall | 159.7 |",
+        "| example-minimal | 103 | 92 | 10.7 | false |",
+        "| wikipedia-article | 56482 | 41283 | 26.9 | false |",
+        "| hn-list | 10220 | 16350 | -60.0 | true |",
+        "| login-form | 284 | 209 | 26.4 | false |",
+        "| mdn-docs | 19005 | 27817 | -46.4 | false |",
+        "| 5 | -8.5 | -60.0 | 26.9 |",
+        "| 84.0 | -8.5 | Shortfall | 92.5 |",
     ] {
         assert!(report.contains(needle), "missing row: {needle}\n{report}");
     }

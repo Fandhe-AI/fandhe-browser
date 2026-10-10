@@ -37,20 +37,20 @@
 
 | name | rawHtmlTokens | directTokens | mcpTextTokens | mcpLineTokens | envelopeTokens | envelopePct | directBytes | directReductionPct | mcpReductionPct |
 | ---- | ------------- | ------------ | ------------- | ------------- | -------------- | ----------- | ----------- | ------------------ | --------------- |
-| example-minimal | 103 | 193 | 193 | 255 | 62 | 32.1 | 646 | -87.4 | -147.6 |
-| wikipedia-article | 56482 | 64318 | 64318 | 74555 | 10237 | 15.9 | 202138 | -13.9 | -32.0 |
-| hn-list | 10220 | 21248 | 21248 | 24490 | 3242 | 15.3 | 66877 | -107.9 | -139.6 |
-| login-form | 284 | 544 | 544 | 666 | 122 | 22.4 | 1710 | -91.5 | -134.5 |
-| mdn-docs | 19005 | 31454 | 31454 | 35222 | 3768 | 12.0 | 96274 | -65.5 | -85.3 |
+| example-minimal | 103 | 83 | 83 | 124 | 41 | 49.4 | 303 | 19.4 | -20.4 |
+| wikipedia-article | 56482 | 41274 | 41274 | 47379 | 6105 | 14.8 | 131984 | 26.9 | 16.1 |
+| hn-list | 10220 | 16341 | 16341 | 18663 | 2322 | 14.2 | 51743 | -59.9 | -82.6 |
+| login-form | 284 | 200 | 200 | 259 | 59 | 29.5 | 679 | 29.6 | 8.8 |
+| mdn-docs | 19005 | 27808 | 27808 | 30844 | 3036 | 10.9 | 85180 | -46.3 | -62.3 |
 
 ### Summary (tokens)
 
 | metric | mean | min | max |
 | ------ | ---- | --- | --- |
-| DirectReductionPct | -73.2 | -107.9 | -13.9 |
-| McpReductionPct | -107.8 | -147.6 | -32.0 |
-| EnvelopeTokens | 3486.2 | 62.0 | 10237.0 |
-| EnvelopePct | 19.5 | 12.0 | 32.1 |
+| DirectReductionPct | -6.1 | -59.9 | 29.6 |
+| McpReductionPct | -28.1 | -82.6 | 16.1 |
+| EnvelopeTokens | 2312.6 | 41.0 | 6105.0 |
+| EnvelopePct | 23.8 | 10.9 | 49.4 |
 
 ### レイテンシ
 
@@ -58,30 +58,30 @@
 
 | fixture | path | p50Ms | p95Ms | meanMs |
 | ------- | ---- | ----- | ----- | ------ |
-| example-minimal | direct | 0.116 | 0.135 | 0.115 |
-| example-minimal | mcp | 0.250 | 0.316 | 0.252 |
-| example-minimal | increment | 0.136 | 0.204 | 0.137 |
-| wikipedia-article | direct | 11.678 | 11.954 | 11.850 |
-| wikipedia-article | mcp | 15.455 | 15.933 | 15.464 |
-| wikipedia-article | increment | 3.719 | 4.096 | 3.614 |
-| hn-list | direct | 3.510 | 3.648 | 3.558 |
-| hn-list | mcp | 4.872 | 5.658 | 5.040 |
-| hn-list | increment | 1.355 | 2.155 | 1.482 |
-| login-form | direct | 0.129 | 0.148 | 0.131 |
-| login-form | mcp | 0.268 | 0.326 | 0.273 |
-| login-form | increment | 0.138 | 0.191 | 0.143 |
-| mdn-docs | direct | 4.803 | 4.901 | 4.812 |
-| mdn-docs | mcp | 6.595 | 7.630 | 6.726 |
-| mdn-docs | increment | 1.772 | 2.786 | 1.914 |
-| ALL | direct | 3.510 | 11.757 | 4.093 |
-| ALL | mcp | 4.872 | 15.581 | 5.551 |
-| ALL | increment | 1.330 | 3.867 | 1.458 |
+| example-minimal | direct | 0.057 | 0.073 | 0.061 |
+| example-minimal | mcp | 0.161 | 0.237 | 0.168 |
+| example-minimal | increment | 0.102 | 0.179 | 0.107 |
+| wikipedia-article | direct | 10.752 | 11.139 | 10.817 |
+| wikipedia-article | mcp | 13.495 | 14.871 | 13.655 |
+| wikipedia-article | increment | 2.680 | 4.001 | 2.838 |
+| hn-list | direct | 3.398 | 3.488 | 3.415 |
+| hn-list | mcp | 4.479 | 5.073 | 4.596 |
+| hn-list | increment | 1.114 | 1.632 | 1.182 |
+| login-form | direct | 0.143 | 0.194 | 0.148 |
+| login-form | mcp | 0.233 | 0.346 | 0.253 |
+| login-form | increment | 0.108 | 0.160 | 0.104 |
+| mdn-docs | direct | 4.659 | 4.810 | 4.704 |
+| mdn-docs | mcp | 6.433 | 7.452 | 6.620 |
+| mdn-docs | increment | 1.720 | 2.642 | 1.916 |
+| ALL | direct | 3.398 | 10.828 | 3.829 |
+| ALL | mcp | 4.479 | 13.760 | 5.058 |
+| ALL | increment | 1.113 | 2.987 | 1.229 |
 
 ## 所見
 
-- 方式 B 本体の対生 HTML 削減率は全 5 サイトで負（平均 -73.2%、範囲 -107.9% から -13.9%）。現行の snapshot が JSON ツリー形式で生 HTML より大きいため（`AISNAP-6`・TASK-19 の論点）。MCP 応答行全体ではさらに悪化し、平均 -107.8%
-- エンベロープ（JSON-RPC フレーム等）のトークン増分は 62 から 10237 トークン（平均 3486.2）、方式 B 本体に対して 12.0% から 32.1%（平均 19.5%）。小さいページほど比率が大きい
-- レイテンシ増分（MCP - 直接）は全体で p50 1.330 ms、p95 3.867 ms、平均 1.458 ms。小ページ（example-minimal・login-form）は約 0.14 ms、wikipedia-article は p50 3.719 ms
+- 方式 B 本体の対生 HTML 削減率は 5 サイト中 3 サイトで正（example-minimal 19.4%・wikipedia-article 26.9%・login-form 29.6%）、hn-list（-59.9%）・mdn-docs（-46.3%）は負（平均 -6.1%、範囲 -59.9% から 29.6%）。名前のない generic の折り畳みと空ノードの剪定（TASK-23.3）で改善したが、現行の snapshot が JSON ツリー形式のため一部ページでは生 HTML より大きい（`AISNAP-6`・TASK-19 の論点）。MCP 応答行全体では平均 -28.1%
+- エンベロープ（JSON-RPC フレーム等）のトークン増分は 41 から 6105 トークン（平均 2312.6）、方式 B 本体に対して 10.9% から 49.4%（平均 23.8%）。小さいページほど比率が大きい
+- レイテンシ増分（MCP - 直接）は全体で p50 1.113 ms、p95 2.987 ms、平均 1.229 ms。小ページ（example-minimal・login-form）は約 0.1 ms、wikipedia-article は p50 2.680 ms
 - PLUG-4 レポートは MCP の text コンテンツのみを数えるが、本レポートの mcpLine は JSON-RPC 応答行全体を数える。両レポートの数値は定義が異なる
 - 入力は合成 fixture であり、実ページの値ではない。レイテンシは測定環境に依存する
 

@@ -25,27 +25,27 @@
 
 | site | rawHtmlTokens | snapshotTokens | reductionPct | truncated |
 | ---- | ------------- | -------------- | ------------ | --------- |
-| example-minimal | 103 | 202 | -96.1 | false |
-| wikipedia-article | 56482 | 64327 | -13.9 | false |
-| hn-list | 10220 | 21257 | -108.0 | true |
-| login-form | 284 | 553 | -94.7 | false |
-| mdn-docs | 19005 | 31463 | -65.6 | false |
+| example-minimal | 103 | 92 | 10.7 | false |
+| wikipedia-article | 56482 | 41283 | 26.9 | false |
+| hn-list | 10220 | 16350 | -60.0 | true |
+| login-form | 284 | 209 | 26.4 | false |
+| mdn-docs | 19005 | 27817 | -46.4 | false |
 
 ### Summary
 
 | pages | meanReductionPct | minReductionPct | maxReductionPct | medianSnapshotTokens |
 | ----- | ---------------- | --------------- | --------------- | -------------------- |
-| 5 | -75.7 | -108.0 | -13.9 | 21257.0 |
+| 5 | -8.5 | -60.0 | 26.9 | 16350.0 |
 
 ### PLUG-4 verdict
 
 | thresholdPct | meanPct | verdict | gapPts |
 | ------------ | ------- | ------- | ------ |
-| 84.0 | -75.7 | Shortfall | 159.7 |
+| 84.0 | -8.5 | Shortfall | 92.5 |
 
 ## 所見
 
-- 全 5 サイトで削減率が負（snapshot が生 HTML より大きい）。現行ホストが PoC-5 のフラット形式ではなく JSON ツリーのエンベロープを返すため
+- `hn-list`・`mdn-docs` は削減率が負（snapshot が生 HTML より大きい）。現行ホストが PoC-5 のフラット形式ではなく JSON ツリーのエンベロープを返すため。TASK-23.3（#826）の名前なし generic の折り畳みで他 3 サイトは正に転じたが、いずれも 84.0% には遠い
 - 合成フィクスチャのため、PoC-15 の実ページ（87.8%）とは厳密に比較できない
 - `hn-list` は snapshot が truncated
 

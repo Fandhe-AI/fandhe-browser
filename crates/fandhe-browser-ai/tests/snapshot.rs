@@ -20,6 +20,7 @@
 use std::collections::HashSet;
 
 use fandhe_browser_ai::compress_table::MAX_TABLE_ROWS;
+use fandhe_browser_ai::snapshot::element_ref::{ElementSignature, RefAllocator};
 use fandhe_browser_ai::snapshot::{
     CheckedState, DataLeafKind, HeaderCell, MAX_ROW_CONTROLS, MAX_TABLE_CONTROLS, Node, Snapshot,
     State, TableRow, TableSummary, build_snapshot, ref_signature,
@@ -119,45 +120,31 @@ fn assert_common(html: &str, s: &Snapshot) {
 #[test]
 fn aisnap_1_article_snapshot_structure() {
     let s = snap(ARTICLE);
-    let expected = Snapshot::new(Node::new("document", "Rust 入門記事").with_children(vec![n(
-        "generic",
-        "",
-        "e65477c205c50fefb",
-        vec![n(
-            "generic",
-            "",
-            "e9c1602d3222315df",
-            vec![
-                n("banner", "", "e02d16e1795403182", vec![]),
-                n("heading", "はじめに", "e300ae11bc252b0fd", vec![]),
-                n(
-                    "generic",
-                    "",
-                    "edf7a99064530f860",
-                    vec![n("link", "公式ドキュメント", "ed45c1d22b4e186f4", vec![])],
-                ),
-                n("heading", "要点", "ee0714a175d20c8b2", vec![]),
-                n("list", "", "ecc842c965dec143a", vec![]).with_table(TableSummary::new(
-                    vec![],
-                    vec![TableRow::new("所有権", false), TableRow::new("借用", false)],
-                    0,
-                )),
-                n("contentinfo", "", "ec0aa17bccd809080", vec![]),
-            ],
-        )],
-    )]));
+    // 名前のない generic（html・body・p）は折り畳まれ、子が親へ繰り上がる（TASK-23.3）。
+    // 残るノードの ref リテラルは折り畳み前と同一（AISNAP-10）。
+    let expected = Snapshot::new(Node::new("document", "Rust 入門記事").with_children(vec![
+        n("banner", "", "e02d16e1795403182", vec![]),
+        n("heading", "はじめに", "e300ae11bc252b0fd", vec![]),
+        n("link", "公式ドキュメント", "ed45c1d22b4e186f4", vec![]),
+        n("heading", "要点", "ee0714a175d20c8b2", vec![]),
+        n("list", "", "ecc842c965dec143a", vec![]).with_table(TableSummary::new(
+            vec![],
+            vec![TableRow::new("所有権", false), TableRow::new("借用", false)],
+            0,
+        )),
+        n("contentinfo", "", "ec0aa17bccd809080", vec![]),
+    ]));
     assert_eq!(s, expected);
     assert_common(ARTICLE, &s);
 
     // 要所の個別確認（失敗時の読みやすさのため）。
-    let body = child(child(&s.tree, 0), 0);
-    assert_eq!(child(body, 1).role, "heading");
-    assert_eq!(child(body, 1).name, "はじめに");
-    let link = child(child(body, 2), 0);
+    assert_eq!(child(&s.tree, 1).role, "heading");
+    assert_eq!(child(&s.tree, 1).name, "はじめに");
+    let link = child(&s.tree, 2);
     assert_eq!(link.role, "link");
     assert_eq!(link.r#ref.as_deref(), Some("ed45c1d22b4e186f4"));
     // 規則的な ul は子孫を展開せず 1 ノードへ圧縮される（AISNAP-2・TASK-12.5）。
-    assert_eq!(child(body, 4).children.len(), 0);
+    assert_eq!(child(&s.tree, 4).children.len(), 0);
 }
 
 /// `AISNAP-1`（TASK-11.8・Issue #77・MS-2）: フォームページの構造・state を具体値で固定し、
@@ -168,60 +155,23 @@ fn aisnap_1_form_snapshot_structure() {
     let checked = State::default().with_checked(Some(CheckedState::Checked));
     let unchecked = State::default().with_checked(Some(CheckedState::Unchecked));
     let disabled = State::default().with_disabled(true);
-    let expected = Snapshot::new(Node::new("document", "登録フォーム").with_children(vec![n(
-        "generic",
-        "",
-        "e65477c205c50fefb",
-        vec![n(
-            "generic",
-            "",
-            "e9c1602d3222315df",
-            vec![
-                n(
-                    "generic",
-                    "",
-                    "edf7a99064530f860",
-                    vec![
-                        n("generic", "", "ec49e5925d2775d07", vec![]),
-                        n("textbox", "ユーザー名", "e60f2465f276d6230", vec![]),
-                    ],
-                ),
-                n(
-                    "generic",
-                    "",
-                    "edf7a99064530f860-2",
-                    vec![n(
-                        "generic",
-                        "",
-                        "ec49e5925d2775d07-2",
-                        vec![
-                            n("checkbox", "規約に同意", "eb4e606a8d0b0322c", vec![])
-                                .with_state(checked),
-                        ],
-                    )],
-                ),
-                n(
-                    "generic",
-                    "",
-                    "edf7a99064530f860-3",
-                    vec![
-                        n("radio", "無料プラン", "e3ca491e4e71deece", vec![]).with_state(unchecked),
-                    ],
-                ),
-                n("combobox", "言語", "ea907649b0395e5e0", vec![]),
-                n("button", "送信", "e764e1c46ab9a2bd6", vec![]),
-                n("button", "取消", "ebc8665358ad3ea30", vec![]).with_state(disabled),
-            ],
-        )],
-    )]));
+    // 名前のない generic（html・body・div・label）は折り畳まれる。ref は折り畳み前と同一
+    // （`-2` 等の出現番号も内部発行を続けるため変わらない。AISNAP-10・TASK-23.3）。
+    let expected = Snapshot::new(Node::new("document", "登録フォーム").with_children(vec![
+        n("textbox", "ユーザー名", "e60f2465f276d6230", vec![]),
+        n("checkbox", "規約に同意", "eb4e606a8d0b0322c", vec![]).with_state(checked),
+        n("radio", "無料プラン", "e3ca491e4e71deece", vec![]).with_state(unchecked),
+        n("combobox", "言語", "ea907649b0395e5e0", vec![]),
+        n("button", "送信", "e764e1c46ab9a2bd6", vec![]),
+        n("button", "取消", "ebc8665358ad3ea30", vec![]).with_state(disabled),
+    ]));
     assert_eq!(s, expected);
     assert_common(FORM, &s);
 
-    let form_root = child(child(&s.tree, 0), 0);
-    let cb = child(child(child(form_root, 1), 0), 0);
+    let cb = child(&s.tree, 1);
     assert_eq!(cb.role, "checkbox");
     assert_eq!(cb.state.checked, Some(CheckedState::Checked));
-    let cancel = child(form_root, 5);
+    let cancel = child(&s.tree, 5);
     assert_eq!(cancel.name, "取消");
     assert!(cancel.state.disabled);
 
@@ -245,31 +195,21 @@ fn aisnap_1_form_snapshot_structure() {
 #[test]
 fn aisnap_2_table_snapshot_is_compressed() {
     let s = snap(TABLE);
-    let expected = Snapshot::new(Node::new("document", "成績表").with_children(vec![n(
-        "generic",
-        "",
-        "e65477c205c50fefb",
-        vec![n(
-            "generic",
-            "",
-            "e9c1602d3222315df",
+    let expected = Snapshot::new(Node::new("document", "成績表").with_children(vec![
+        n("table", "", "e7c96b5162ee5821b", vec![]).with_table(TableSummary::new(
             vec![
-                n("table", "", "e7c96b5162ee5821b", vec![]).with_table(TableSummary::new(
-                    vec![
-                        HeaderCell::new("columnheader", "名前", "ed7fea8519e468d01")
-                            .with_data_leaf(DataLeafKind::TableCell),
-                        HeaderCell::new("columnheader", "点数", "ee748caeae6097f8b")
-                            .with_data_leaf(DataLeafKind::TableCell),
-                    ],
-                    vec![TableRow::new("太郎 | 80", false)],
-                    0,
-                )),
+                HeaderCell::new("columnheader", "名前", "ed7fea8519e468d01")
+                    .with_data_leaf(DataLeafKind::TableCell),
+                HeaderCell::new("columnheader", "点数", "ee748caeae6097f8b")
+                    .with_data_leaf(DataLeafKind::TableCell),
             ],
-        )],
-    )]));
+            vec![TableRow::new("太郎 | 80", false)],
+            0,
+        )),
+    ]));
     assert_eq!(s, expected);
     assert_common(TABLE, &s);
-    let table = child(child(child(&s.tree, 0), 0), 0);
+    let table = child(&s.tree, 0);
     assert_eq!(table.role, "table");
     assert_eq!(table.data_leaf, None);
 }
@@ -284,61 +224,49 @@ fn aisnap_2_irregular_table_snapshot_is_expanded() {
     let s = snap(IRREGULAR_TABLE);
     let tc = DataLeafKind::TableCell;
     let expected = Snapshot::new(Node::new("document", "成績表").with_children(vec![n(
-        "generic",
+        "table",
         "",
-        "e65477c205c50fefb",
-        vec![n(
-            "generic",
-            "",
-            "e9c1602d3222315df",
-            vec![n(
-                "table",
+        "e7c96b5162ee5821b",
+        vec![
+            n(
+                "rowgroup",
                 "",
-                "e7c96b5162ee5821b",
-                vec![
-                    n(
-                        "rowgroup",
-                        "",
-                        "e562e6ae373000aaa",
-                        vec![n(
-                            "row",
-                            "名前点数",
-                            "e3b9ec063bec3ce0d",
-                            vec![
-                                n("columnheader", "名前", "e895cf72c839b312e", vec![])
-                                    .with_data_leaf(tc),
-                                n("columnheader", "点数", "e4c3266d420a99a2c", vec![])
-                                    .with_data_leaf(tc),
-                            ],
-                        )],
-                    ),
-                    n(
-                        "rowgroup",
-                        "",
-                        "e562e6ae373000aaa-2",
-                        vec![n(
-                            "row",
-                            "太郎80",
-                            "e603d30fc95b8b612",
-                            vec![
-                                n("cell", "太郎", "e8c54b60bbb2904e5", vec![]).with_data_leaf(tc),
-                                n("cell", "80", "eb3df38593dc1377c", vec![]).with_data_leaf(tc),
-                            ],
-                        )],
-                    ),
-                ],
-            )],
-        )],
+                "e562e6ae373000aaa",
+                vec![n(
+                    "row",
+                    "名前点数",
+                    "e3b9ec063bec3ce0d",
+                    vec![
+                        n("columnheader", "名前", "e895cf72c839b312e", vec![]).with_data_leaf(tc),
+                        n("columnheader", "点数", "e4c3266d420a99a2c", vec![]).with_data_leaf(tc),
+                    ],
+                )],
+            ),
+            n(
+                "rowgroup",
+                "",
+                "e562e6ae373000aaa-2",
+                vec![n(
+                    "row",
+                    "太郎80",
+                    "e603d30fc95b8b612",
+                    vec![
+                        n("cell", "太郎", "e8c54b60bbb2904e5", vec![]).with_data_leaf(tc),
+                        n("cell", "80", "eb3df38593dc1377c", vec![]).with_data_leaf(tc),
+                    ],
+                )],
+            ),
+        ],
     )]));
     assert_eq!(s, expected);
     assert_common(IRREGULAR_TABLE, &s);
-    let table = child(child(child(&s.tree, 0), 0), 0);
+    let table = child(&s.tree, 0);
     assert_eq!(table.table, None);
 }
 
-/// 表を取り出す（`body` 直下の最初の子）。
+/// 表を取り出す（折り畳み後は `document` 直下の最初の子。TASK-23.3）。
 fn first_table(s: &Snapshot) -> &Node {
-    child(child(child(&s.tree, 0), 0), 0)
+    child(&s.tree, 0)
 }
 
 fn summary(s: &Snapshot) -> &TableSummary {
@@ -520,31 +448,49 @@ fn aisnap_3_price_snapshot_marks_price_leaf() {
     assert_eq!(price.data_leaf, Some(DataLeafKind::PriceClass));
 }
 
-/// `AISNAP-10`（TASK-11.8・Issue #77）: 修飾子（id・name・href・親 ref）を持たない
-/// ルート直下の `html` 要素の ref は `ref_signature(role, name)` のダイジェストと一致する。
-/// 固定リテラルがハッシュ実装と整合していることの独立確認。
+/// `AISNAP-10`（TASK-11.8・TASK-23.3）: 折り畳まれた `html`・`body` を経由する scope 連鎖で
+/// 再計算した ref が、残る `banner` の ref と一致する。`html` の ref は
+/// `ref_signature(role, name)` のダイジェストと一致する。固定リテラルがハッシュ実装・
+/// 内部発行の連鎖と整合していることの独立確認。
 #[test]
 fn aisnap_10_root_child_ref_matches_signature_digest() {
     let s = snap(ARTICLE);
-    let html = child(&s.tree, 0);
+    let mut alloc = RefAllocator::new();
+    let html = alloc
+        .allocate_signature(&ElementSignature::new("generic", ""))
+        .expect("発行は成功する");
     assert_eq!(
-        html.r#ref,
-        Some(format!("e{:016x}", ref_signature("generic", "")))
+        html.to_ref_string(),
+        format!("e{:016x}", ref_signature("generic", ""))
     );
-    assert_eq!(html.r#ref.as_deref(), Some("e65477c205c50fefb"));
+    assert_eq!(html.to_ref_string(), "e65477c205c50fefb");
+    let body = alloc
+        .allocate_signature(&ElementSignature::new("generic", "").with_scope(html))
+        .expect("発行は成功する");
+    let banner = alloc
+        .allocate_signature(&ElementSignature::new("banner", "").with_scope(body))
+        .expect("発行は成功する");
+    assert_eq!(child(&s.tree, 0).r#ref, Some(banner.to_ref_string()));
+    assert_eq!(
+        child(&s.tree, 0).r#ref.as_deref(),
+        Some("e02d16e1795403182")
+    );
 }
 
-/// `AISNAP-10`（TASK-11.8・Issue #77）: 異なるページでも同じシグネチャの要素
-/// （`html`・`body`）の ref は同一で、ページ内容に依存しない。
+/// `AISNAP-10`（TASK-11.8・Issue #77）: 異なるページでも同じシグネチャ・同じ親連鎖の要素
+/// （`body` 直下の「送信」ボタン）の ref は同一で、ページ内容に依存しない。
 #[test]
 fn aisnap_10_ref_is_stable_across_pages() {
-    let a = snap(ARTICLE);
-    let b = snap(TABLE);
-    assert_eq!(child(&a.tree, 0).r#ref, child(&b.tree, 0).r#ref);
-    assert_eq!(
-        child(child(&a.tree, 0), 0).r#ref,
-        child(child(&b.tree, 0), 0).r#ref
-    );
+    let a = snap(FORM);
+    let b = snap(&page("<p>無関係</p><button type=\"submit\">送信</button>"));
+    let pick = |s: &Snapshot| {
+        all_nodes(&s.tree)
+            .into_iter()
+            .find(|nd| nd.role == "button" && nd.name == "送信")
+            .and_then(|nd| nd.r#ref.clone())
+    };
+    assert_eq!(pick(&a), Some("e764e1c46ab9a2bd6".to_string()));
+    assert_eq!(pick(&a), pick(&b));
 }
 
 /// 全ノードを先行順で集める（反復）。

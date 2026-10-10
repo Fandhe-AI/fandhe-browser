@@ -1,15 +1,5 @@
 - document "Checkboxes"
-  - generic [e65477c205c50fefb]
-    - generic [e9c1602d3222315df]
-      - generic [edf7a99064530f860]
-        - generic [e935f359bc1f66afc]
-          - generic [e7a056b2d84fccaab]
-            - heading "Checkboxes" [ecdd814db4ba7fb94]
-            - generic [e8722e2141a2ce4b0]
-              - checkbox [e91f35187869ba882] (unchecked)
-              - generic [e72f529b918c10071]
-              - checkbox [e91f35187869ba882-2] (checked)
-      - generic [ec4c3c26977df6403]
-        - generic [e2437b2a931763f73]
-        - generic [e2437b2a931763f73-2]
-          - link "Example Test Site" [e124daae3ea9f2799]
+  - heading "Checkboxes" [ecdd814db4ba7fb94]
+  - checkbox [e91f35187869ba882] (unchecked)
+  - checkbox [e91f35187869ba882-2] (checked)
+  - link "Example Test Site" [e124daae3ea9f2799]

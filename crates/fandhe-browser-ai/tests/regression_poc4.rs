@@ -317,23 +317,33 @@ fn aisnap_13_extract_05_body_is_not_confused_with_author_or_tags() {
                 .any(|c| c.r#ref.as_deref() == Some(EXTRACT_05_REF))
         })
         .expect("対象の親がある");
-    let target = parent.children.first().expect("先頭の子");
-    assert_eq!(target.r#ref.as_deref(), Some(EXTRACT_05_REF));
-    let author = parent.children.get(1).expect("著者 span");
-    let tags = parent.children.get(2).expect("tags div");
-    assert_eq!(author.data_leaf, None);
-    assert_eq!(tags.data_leaf, None);
-    assert_ne!(author.r#ref, target.r#ref);
-    assert_ne!(tags.r#ref, target.r#ref);
-    let link_names = |n: &Node| -> Vec<String> {
-        all_nodes(n)
-            .into_iter()
-            .filter(|c| c.role == "link")
-            .map(|c| c.name.clone())
-            .collect()
-    };
-    assert_eq!(link_names(author), vec!["(about)"]);
-    assert_eq!(link_names(tags), vec!["alpha", "beta", "gamma"]);
+    let pos = parent
+        .children
+        .iter()
+        .position(|c| c.r#ref.as_deref() == Some(EXTRACT_05_REF))
+        .expect("対象の位置がある");
+    let target = parent.children.get(pos).expect("対象");
+    // 名前なしの generic（著者 span・tags div）は折り畳まれ、その子（著者リンク・タグリンク）が
+    // 親へ繰り上がる（TASK-23.3）。本文以外の兄弟は本文と取り違えられる ref・分類を持たない。
+    // 次の引用本文（ProseClass 葉）までを同じ引用ブロックの兄弟として扱う。
+    let others: Vec<&Node> = parent
+        .children
+        .iter()
+        .skip(pos + 1)
+        .take_while(|c| c.data_leaf != Some(DataLeafKind::ProseClass))
+        .collect();
+    assert!(!others.is_empty());
+    for o in &others {
+        assert_ne!(o.data_leaf, Some(DataLeafKind::ProseClass));
+        assert_ne!(o.r#ref, target.r#ref);
+    }
+    let link_names: Vec<String> = others
+        .iter()
+        .flat_map(|o| all_nodes(o))
+        .filter(|c| c.role == "link")
+        .map(|c| c.name.clone())
+        .collect();
+    assert_eq!(link_names, vec!["(about)", "alpha", "beta", "gamma"]);
 }
 
 /// `AISNAP-13`・TASK-18.2・Issue #116: 実際の引用要素（`blockquote`・`q`）も `Quote` 葉として

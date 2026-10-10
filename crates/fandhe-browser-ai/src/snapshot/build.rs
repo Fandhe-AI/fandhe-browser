@@ -13,8 +13,7 @@
 //!
 //! - 要素のみを `Node` にする。テキスト・コメント等は `Node` にせず、テキストは
 //!   name 算出側が取り込む。
-//! - 次の要素はサブツリーごと省略し、子孫の繰り上げはしない（DOM の親子関係と
-//!   ネストを一致させるため）: `head`・`script`・`style`・`noscript`・`template`・
+//! - 次の要素はサブツリーごと省略し、子孫の繰り上げもしない（描画されない領域のため）: `head`・`script`・`style`・`noscript`・`template`・
 //!   `hidden` 属性または `aria-hidden="true"` の要素・`input[type=hidden]`。
 //! - データ葉（表セル・価格クラス要素・引用要素・地の文クラス要素。`AISNAP-3`・TASK-13.3・Issue #88、
 //!   拡充は TASK-15.1・15.2）は `Node::data_leaf`（圧縮表では `HeaderCell::data_leaf`）へ印を付けるだけで、
@@ -47,9 +46,16 @@
 //!   既知の制約（REPAIR-3）: ヘッダ行（`th`）に操作要素がある表（ソートリンク付き等）は
 //!   圧縮せず展開する。表全体の上限は文書順に消費し、行をまたぐ優先保持はしない
 //!   （暫定。#84・#108 で見直す）。リンクのテキストはセル文字列と control の name の双方に現れる。
-//! - generic の折り畳み・`none`/`presentation` の除去・空ノードの剪定は行わない
-//!   （トークン削減は後続タスク。`AISNAP-1`・`AISNAP-2`）。
-//! - ルート以外の全要素に ref を振る（対話可能な要素への絞り込みは後続タスク）。
+//! - 名前のない generic 系ノードの折り畳みと空ノードの剪定（`AISNAP-1`・`AISNAP-10`・
+//!   TASK-23.3・Issue #826）: role が `generic`/`none`/`presentation`・name 空・state 既定・
+//!   データ葉/表/畳み行なし・操作要素でないノードは出力せず、子を親の位置へ繰り上げる
+//!   （子がなければ消える）。折り畳むノードにも内部で `ElementRef` を発行し続け、子の
+//!   scope と出現番号を変えないので、残るノードの ref は折り畳み前と同一（`AISNAP-10`）。
+//!   深さ判定は DOM 上の深さのままで、折り畳みで深さ制限をすり抜けさせない。
+//!   `option` は選択肢として操作対象のため畳まない。
+//!   既知の制約（REPAIR-3）: `role` 属性つき要素は `is_interactive_element` が真のため畳まない。
+//!   `img alt=""` の `none` 化（role 算出側）は未実装。ref 付与対象の限定は後続タスク。
+//! - 出力されるノードだけが ref を持つ（内部では全要素に発行する）。
 //! - 深さが [`MAX_TREE_DEPTH`] を超えるサブツリーは省略し `Snapshot::truncated` を立てる。
 //! - いずれかの name が打ち切られた場合（文字数上限・子孫走査の上限・構築全体で共有する
 //!   走査予算）も `Snapshot::truncated` を立てる。
@@ -73,7 +79,7 @@ use super::name::{
 };
 use super::role::compute_role;
 use super::state::{compute_state, is_html_element_named};
-use super::{FoldedRow, HeaderCell, Node, RowControl, Snapshot, TableRow, TableSummary};
+use super::{FoldedRow, HeaderCell, Node, RowControl, Snapshot, State, TableRow, TableSummary};
 
 /// 構築するツリーの最大深さ（ルートを 0 とする）。
 ///
@@ -602,7 +608,33 @@ struct Frame<'a> {
     node: Node,
     children: Children<'a>,
     elem_ref: Option<ElementRef>,
+    /// DOM 上の深さ（折り畳みの影響を受けない。[`MAX_TREE_DEPTH`] の判定に使う）。
     depth: usize,
+    /// 折り畳み対象か。真なら pop 時にノード自身は出力せず、子だけを親へ繰り上げる。
+    collapse: bool,
+    /// この Frame の DOM 要素（ルートは `None`）。テストの `RefHolder` 整合にだけ使う。
+    #[cfg_attr(not(test), allow(dead_code))]
+    dom: Option<NodeId>,
+}
+
+/// 折り畳み対象の role（`AISNAP-1`・TASK-23.3）。
+const COLLAPSIBLE_ROLES: [&str; 3] = ["generic", "none", "presentation"];
+
+/// 情報を持たず出力から省いてよいノードか（`AISNAP-1`・TASK-23.3）。
+///
+/// role が generic 系・name 空・state 既定・データ葉/表/畳み行なし・操作要素でない場合に真。
+/// `option` は `select` の選択肢として操作対象になるため畳まない（click-02 等の保持）。
+/// 真のノードは出力せず子を親の位置へ繰り上げる（子がなければ剪定）。ref の発行は
+/// 呼び出し側で続けるため、残るノードの ref は変わらない（`AISNAP-10`）。
+fn is_collapsible(doc: &Document, id: NodeId, node: &Node) -> bool {
+    COLLAPSIBLE_ROLES.contains(&node.role.as_str())
+        && node.name.is_empty()
+        && node.state == State::default()
+        && node.data_leaf.is_none()
+        && node.table.is_none()
+        && node.folded_rows.is_empty()
+        && !is_interactive_element(doc, id)
+        && !is_html_element_named(doc, id, "option")
 }
 
 /// `doc` から `Snapshot` を構築する（`AISNAP-1`・`AISNAP-10`）。
@@ -670,7 +702,12 @@ fn build_snapshot_inner(
         children: doc.children(root_id),
         elem_ref: None,
         depth: 0,
+        collapse: false,
+        dom: None,
     }];
+    // 折り畳んだ要素（テストの RefHolder から除外するため）。
+    #[cfg(test)]
+    let mut collapsed_ids: HashSet<NodeId> = HashSet::new();
 
     loop {
         let Some(top) = stack.last_mut() else {
@@ -682,8 +719,25 @@ fn build_snapshot_inner(
                 continue;
             };
             match stack.last_mut() {
-                Some(parent) => parent.node.push_child(done.node),
-                None => return Ok(Snapshot::new(done.node).with_truncated(truncated)),
+                Some(parent) => {
+                    if done.collapse {
+                        // 子を親の位置へ繰り上げる（文書順は保たれる。子なしなら剪定）。
+                        #[cfg(test)]
+                        if let Some(id) = done.dom {
+                            collapsed_ids.insert(id);
+                        }
+                        parent.node.children.extend(done.node.children);
+                    } else {
+                        parent.node.push_child(done.node);
+                    }
+                }
+                None => {
+                    #[cfg(test)]
+                    if let Some(sink) = sink.as_deref_mut() {
+                        sink.retain(|h| !collapsed_ids.contains(&h.node));
+                    }
+                    return Ok(Snapshot::new(done.node).with_truncated(truncated));
+                }
             }
             continue;
         };
@@ -837,11 +891,14 @@ fn build_snapshot_inner(
             }
             continue;
         }
+        let collapse = is_collapsible(doc, child, &node);
         stack.push(Frame {
             node,
             children: doc.children(child),
             elem_ref: Some(elem_ref),
             depth,
+            collapse,
+            dom: Some(child),
         });
     }
 }
@@ -889,38 +946,113 @@ mod tests {
         <h1>Example Domain</h1><p><a href=\"https://iana.org\">More information...</a></p>\
         </div></body></html>";
 
-    /// AISNAP-1: 受入基準。ネストが DOM の親子関係と一致する。
+    /// AISNAP-1: 名前のない generic（html・body・div・p）は折り畳まれ、子が文書順で繰り上がる
+    /// （TASK-23.3・Issue #826）。
     #[test]
-    fn aisnap_1_build_snapshot_nesting_matches_dom() {
+    fn aisnap_1_build_snapshot_folds_wrappers_keeping_dom_order() {
         let s = snap(PAGE);
         assert_eq!(s.tree.role, "document");
         assert_eq!(s.tree.name, "Example Domain");
         assert_eq!(s.tree.r#ref, None);
         assert!(!s.truncated);
-        assert_eq!(s.tree.children.len(), 1);
-        let html = child(&s.tree, 0);
-        assert_eq!(html.role, "generic");
-        // head は省略され body のみ。
-        assert_eq!(html.children.len(), 1);
-        let body = child(html, 0);
-        assert_eq!(body.role, "generic");
-        let div = child(body, 0);
-        assert_eq!(div.role, "generic");
-        assert_eq!(div.children.len(), 2);
-        let h1 = child(div, 0);
+        assert_eq!(s.tree.children.len(), 2);
+        let h1 = child(&s.tree, 0);
         assert_eq!(
             (h1.role.as_str(), h1.name.as_str()),
             ("heading", "Example Domain")
         );
-        let p = child(div, 1);
-        assert_eq!(p.role, "generic");
-        assert_eq!(p.children.len(), 1);
-        let a = child(p, 0);
+        let a = child(&s.tree, 1);
         assert_eq!(
             (a.role.as_str(), a.name.as_str()),
             ("link", "More information...")
         );
         assert!(a.children.is_empty());
+    }
+
+    /// AISNAP-1: `<div><div><button>` は `document > button` の 2 段になる（TASK-23.3）。
+    #[test]
+    fn aisnap_1_unnamed_generic_wrappers_are_folded() {
+        let s = snap("<div><div><button>OK</button></div></div>");
+        assert_eq!(s.tree.children.len(), 1);
+        let b = child(&s.tree, 0);
+        assert_eq!((b.role.as_str(), b.name.as_str()), ("button", "OK"));
+        assert!(b.children.is_empty());
+        assert_eq!(max_depth(&s.tree), 1);
+    }
+
+    /// AISNAP-1: データ葉の generic は折り畳まず残す（TASK-23.3）。
+    #[test]
+    fn aisnap_1_data_leaf_generic_is_kept() {
+        let s = snap("<body><p class=\"price_color\">¥1</p></body>");
+        assert_eq!(s.tree.children.len(), 1);
+        let p = child(&s.tree, 0);
+        assert_eq!(p.role, "generic");
+        assert_eq!(p.data_leaf, Some(DataLeafKind::PriceClass));
+        assert!(p.r#ref.is_some());
+    }
+
+    /// AISNAP-1: name を持つ generic・操作要素の generic は折り畳まない（TASK-23.3）。
+    #[test]
+    fn aisnap_1_generic_with_name_or_interactive_is_kept() {
+        let s = snap(
+            "<body><div aria-label=\"Box\"><button>B</button></div>\
+             <div tabindex=\"0\"></div><div onclick=\"x()\"></div></body>",
+        );
+        let top: Vec<(&str, &str)> = s
+            .tree
+            .children
+            .iter()
+            .map(|n| (n.role.as_str(), n.name.as_str()))
+            .collect();
+        assert_eq!(
+            top,
+            vec![("generic", "Box"), ("generic", ""), ("generic", "")]
+        );
+        assert_eq!(child(child(&s.tree, 0), 0).name, "B");
+    }
+
+    /// AISNAP-1: 子も name もない非操作の generic は剪定される（TASK-23.3）。
+    #[test]
+    fn aisnap_1_empty_generic_is_pruned() {
+        let s = snap("<body><span></span><div><span></span></div><button>B</button></body>");
+        assert_eq!(s.tree.children.len(), 1);
+        assert_eq!(child(&s.tree, 0).name, "B");
+    }
+
+    /// AISNAP-1: 折り畳みは DOM 深さの打ち切りをすり抜けさせない（TASK-23.3）。
+    #[test]
+    fn aisnap_1_fold_does_not_bypass_depth_limit() {
+        let depth = MAX_TREE_DEPTH + 50;
+        let html = format!(
+            "{}<button>X</button>{}",
+            "<div>".repeat(depth),
+            "</div>".repeat(depth)
+        );
+        let s = snap(&html);
+        assert!(s.truncated);
+        assert!(all_nodes(&s.tree).iter().all(|n| n.role != "button"));
+    }
+
+    /// AISNAP-10: 折り畳みは残るノードの ref と出現番号を変えない（TASK-23.3）。
+    /// 期待 ref は折り畳み前と同じ scope 連鎖（html > body > div > button）から独立に再計算する。
+    #[test]
+    fn aisnap_10_fold_keeps_refs_and_occurrence_suffix() {
+        use crate::snapshot::element_ref::{ElementSignature, RefAllocator};
+        let s = snap("<div><button>A</button></div><div><button>A</button></div>");
+        let mut alloc = RefAllocator::new();
+        let mut alloc_ref =
+            |sig: &ElementSignature| alloc.allocate_signature(sig).expect("発行は成功する");
+        let html = alloc_ref(&ElementSignature::new("generic", ""));
+        let body = alloc_ref(&ElementSignature::new("generic", "").with_scope(html));
+        let div1 = alloc_ref(&ElementSignature::new("generic", "").with_scope(body));
+        let b1 = alloc_ref(&ElementSignature::new("button", "A").with_scope(div1));
+        let div2 = alloc_ref(&ElementSignature::new("generic", "").with_scope(body));
+        let b2 = alloc_ref(&ElementSignature::new("button", "A").with_scope(div2));
+        let got: Vec<Option<String>> = s.tree.children.iter().map(|n| n.r#ref.clone()).collect();
+        assert_eq!(
+            got,
+            vec![Some(b1.to_ref_string()), Some(b2.to_ref_string())]
+        );
     }
 
     /// AISNAP-1: 描画されない要素はサブツリーごと省略され、兄弟の順序は保たれる。
@@ -932,7 +1064,7 @@ mod tests {
              <div hidden><button>H</button></div><div aria-hidden=\"true\"><button>AH</button></div>\
              <input type=\"hidden\" name=\"csrf\" value=\"secret\"><button>B</button></body>",
         );
-        let body = child(child(&s.tree, 0), 0);
+        let body = &s.tree;
         let names: Vec<&str> = body.children.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(names, vec!["A", "B"]);
         let all = all_nodes(&s.tree);
@@ -943,15 +1075,14 @@ mod tests {
     #[test]
     fn aisnap_1_build_snapshot_ignores_text_and_comments() {
         let s = snap("<body><p>hello<!-- c --> world</p></body>");
-        let p = child(child(child(&s.tree, 0), 0), 0);
-        assert_eq!(p.children.len(), 0);
+        assert!(s.tree.children.is_empty());
     }
 
     /// AISNAP-1: state の配線。
     #[test]
     fn aisnap_1_build_snapshot_wires_state() {
         let s = snap("<body><input type=\"checkbox\" checked><button disabled>x</button></body>");
-        let body = child(child(&s.tree, 0), 0);
+        let body = &s.tree;
         let cb = child(body, 0);
         assert_eq!(cb.role, "checkbox");
         assert_eq!(cb.state.checked, Some(CheckedState::Checked));
@@ -964,7 +1095,7 @@ mod tests {
     fn aisnap_1_build_snapshot_wires_name() {
         let s = snap("<body><button>送信</button></body>");
         assert_eq!(s.tree.name, "");
-        assert_eq!(child(child(child(&s.tree, 0), 0), 0).name, "送信");
+        assert_eq!(child(&s.tree, 0).name, "送信");
     }
 
     /// AISNAP-3: 表セル・価格クラス要素にだけ data_leaf が付く（TASK-13.3・Issue #88）。
@@ -988,30 +1119,21 @@ mod tests {
             kinds.contains(&("generic", "", Some(DataLeafKind::PriceClass))),
             "{kinds:?}"
         );
-        assert!(kinds.contains(&("generic", "", None)), "{kinds:?}");
+        // data_leaf を持たない名前なしの generic（外側の div・body 等）は折り畳まれて出ない。
+        assert!(!kinds.contains(&("generic", "", None)), "{kinds:?}");
         let price_leaves = kinds
             .iter()
             .filter(|k| k.2 == Some(DataLeafKind::PriceClass))
             .count();
         assert_eq!(price_leaves, 1);
-        // 外側の price div は子要素を持つのでデータ葉ではない。
-        let outer = all_nodes(&s.tree)
-            .into_iter()
-            .find(|n| {
-                n.role == "generic"
-                    && n.children.len() == 1
-                    && n.children.iter().all(|c| c.data_leaf.is_some())
-            })
-            .expect("外側の div がある");
-        assert_eq!(outer.data_leaf, None);
     }
 
     /// AISNAP-3/AISNAP-10: data_leaf の付与は ref を変えない（TASK-13.3・Issue #88）。
     #[test]
     fn aisnap_3_data_leaf_does_not_change_refs() {
-        let with_class = snap("<body><span class=\"price\">1</span></body>");
-        let without = snap("<body><span class=\"plain\">1</span></body>");
-        let span = |s: &Snapshot| child(child(child(&s.tree, 0), 0), 0).clone();
+        let with_class = snap("<body><span class=\"price\" tabindex=\"0\">1</span></body>");
+        let without = snap("<body><span class=\"plain\" tabindex=\"0\">1</span></body>");
+        let span = |s: &Snapshot| child(&s.tree, 0).clone();
         assert_eq!(span(&with_class).r#ref, span(&without).r#ref);
         assert_eq!(span(&with_class).data_leaf, Some(DataLeafKind::PriceClass));
         assert_eq!(span(&without).data_leaf, None);
@@ -1041,7 +1163,7 @@ mod tests {
             .skip(1)
             .map(|n| n.r#ref.as_deref().expect("非ルートは ref を持つ"))
             .collect();
-        assert_eq!(refs.len(), 6);
+        assert_eq!(refs.len(), 2);
         assert!(refs.iter().all(|r| is_ref_shape(r)));
         let mut sorted = refs.clone();
         sorted.sort_unstable();
@@ -1053,15 +1175,14 @@ mod tests {
     #[test]
     fn aisnap_10_same_name_elements_get_distinct_and_stable_refs() {
         let s = snap("<body><div><button>OK</button><button>OK</button></div></body>");
-        let div = child(child(child(&s.tree, 0), 0), 0);
-        assert_ne!(child(div, 0).r#ref, child(div, 1).r#ref);
+        assert_ne!(child(&s.tree, 0).r#ref, child(&s.tree, 1).r#ref);
 
         let before = snap("<body><div><button id=\"b\">OK</button></div></body>");
         let after = snap(
             "<body><div><button id=\"a\">OK</button><button id=\"b\">OK</button></div></body>",
         );
-        let b_before = child(child(child(child(&before.tree, 0), 0), 0), 0);
-        let b_after = child(child(child(child(&after.tree, 0), 0), 0), 1);
+        let b_before = child(&before.tree, 0);
+        let b_after = child(&after.tree, 1);
         assert_eq!(b_before.r#ref, b_after.r#ref);
     }
 
@@ -1104,7 +1225,7 @@ mod tests {
         let long = "あ".repeat(500);
         let s = snap(&format!("<body><button>{long}</button></body>"));
         assert!(s.truncated);
-        let btn = child(child(child(&s.tree, 0), 0), 0);
+        let btn = child(&s.tree, 0);
         assert!(btn.name.chars().count() <= 120);
     }
 
