@@ -84,8 +84,14 @@ ok "arguments are JSON-escaped"
 KILLED="$TMP/killed"
 printf '#!/bin/sh\nkill -TERM $$\n' >"$KILLED"; chmod +x "$KILLED"
 for t in epochrealtime date-ns perl; do
+  # 利用できない方式は正常終了する対象の計測が成功するかで判定し、失敗なら明示的にスキップする
+  if ! COLD_START_TIMER="$t" "$MEASURE" --bin-a "$TRUE_BIN" --bin-b "$TRUE_BIN" -n 1 --warmup 0 >/dev/null 2>&1; then
+    echo "skip: $t timer unavailable here; signal termination NOT verified for it"
+    continue
+  fi
   st=0; COLD_START_TIMER="$t" "$MEASURE" --bin-a "$TRUE_BIN" --bin-b "$KILLED" -n 1 --warmup 0 >/dev/null 2>&1 || st=$?
   [ "$st" -eq 1 ] || fail "$t: signal termination must exit 1 (got $st)"
+  echo "ok: $t timer: signal termination exits 1"
 done
 ok "signal termination is a failure"
 

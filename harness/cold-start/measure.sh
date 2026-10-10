@@ -70,19 +70,27 @@ done
 command -v awk >/dev/null 2>&1 || die "awk not found"
 
 # ---- タイマー選択 ----
+# 各方式がこの環境で使えるかを判定する（自動選択と COLD_START_TIMER 強制の双方で使う）
+timer_available() { # $1=方式
+  case "$1" in
+    epochrealtime) [ -n "${EPOCHREALTIME:-}" ] ;;
+    date-ns) [[ "$(date +%s%N 2>/dev/null || true)" =~ ^[0-9]{19}$ ]] ;;
+    perl) command -v perl >/dev/null 2>&1 && perl -MTime::HiRes -e 1 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
 TIMER=""
 if [ -n "${COLD_START_TIMER:-}" ]; then
   # 自己テストで方式を強制するための上書き（epochrealtime・date-ns・perl）
   TIMER="$COLD_START_TIMER"
   case "$TIMER" in epochrealtime|date-ns|perl) ;; *) die "COLD_START_TIMER must be epochrealtime, date-ns or perl" ;; esac
-elif [ -n "${EPOCHREALTIME:-}" ]; then
-  TIMER="epochrealtime"
-elif [ "$(date +%s%N 2>/dev/null || true)" != "" ] && [[ "$(date +%s%N 2>/dev/null)" =~ ^[0-9]{19}$ ]]; then
-  TIMER="date-ns"
-elif command -v perl >/dev/null 2>&1 && perl -MTime::HiRes -e 1 2>/dev/null; then
-  TIMER="perl"
+  timer_available "$TIMER" || die "forced timer '$TIMER' is not available in this environment"
 else
-  die "no high-resolution timer (need bash 5, GNU date or perl with Time::HiRes)"
+  for cand in epochrealtime date-ns perl; do
+    if timer_available "$cand"; then TIMER="$cand"; break; fi
+  done
+  [ -n "$TIMER" ] || die "no high-resolution timer (need bash 5, GNU date or perl with Time::HiRes)"
 fi
 
 # 1 回実行して所要マイクロ秒を標準出力へ。対象コマンドの非 0 終了は失敗（成功を装わない）。
