@@ -1,8 +1,9 @@
 // fandhe-browser の CDP エンドポイントで同一 URL を読み込む（TASK-81・PERF-4・MEAS-6）。
 // 呼び出し元は measure.sh の loaded 条件。node 22 以降の組み込み WebSocket のみを使い、
 // npm 依存を持たない。使い方: node navigate.mjs http://127.0.0.1:9333 <url>
-// 手順: /json/version の browser WebSocket へ接続して Page.navigate を送る。error 応答なら
-// 非 0 で終了する（成功を装わない）。
+// 手順: /json/version の browser WebSocket へ接続して Page.navigate を送る。error 応答、または
+// 結果に errorText が含まれる場合（SSRF ガードによる拒否・名前解決失敗等。本番の Page.navigate は
+// 失敗を result.errorText で返す）は非 0 で終了する。loaded 状態の偽装を防ぐ。
 const [endpoint, url] = process.argv.slice(2);
 if (!endpoint || !url) {
   console.error("usage: node navigate.mjs <http-endpoint> <url>");
@@ -48,6 +49,11 @@ try {
   // 現行の fandhe-browser は Target.createTarget が未実装（method not implemented）のため、
   // browser WebSocket 上で Page.navigate を直接送る。Target.* が実装されたら本手順を見直す。
   const nav = await send("Page.navigate", { url });
+  if (typeof nav.errorText === "string" && nav.errorText !== "") {
+    console.error(`error: Page.navigate failed: ${nav.errorText}`);
+    ws.close();
+    process.exit(1);
+  }
   console.log(JSON.stringify({ ok: true, nav }));
   ws.close();
 } catch (e) {

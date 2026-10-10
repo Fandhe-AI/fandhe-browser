@@ -18,8 +18,10 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
   プロセスツリー（子孫と同一プロセスグループ）全体で合算する。`rss_kib` は参考として併記する
 - 2 条件（1 インスタンスの定義）:
   - `idle`: 起動して `--settle` 秒待ったアイドル状態（fandhe は JS 子プロセスが遅延起動のため未使用）
-  - `loaded`: 全インスタンスで同一ページ（`--url`）を読み込み、`--settle` 秒待った状態。
+  - `loaded`: 全インスタンスで同一の**公開 URL**（`--url`。http(s) のみ）を読み込み、`--settle` 秒待った状態。
     fandhe は CDP の `Page.navigate`（`navigate.mjs`）、Chromium は起動引数の URL で読み込む。
+    `Page.navigate` が `result.errorText` を返した場合（取得失敗・SSRF ガードによる拒否）は
+    `navigate.mjs` が非 0 で終了し、計測は失敗（終了コード 1）になる。loaded を装わない。
     Chromium 側はロード完了を検知せず待機時間に頼るため、重いページでは `--settle` を延ばす
 
 ## 前提
@@ -46,6 +48,22 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
 | `netns` | `unshare -n`（root）または `unshare -Urn`（非特権 user namespace）で分離し、namespace 内で `lo` を上げて起動。準備確認は `nsenter` 経由 |
 | `host` | N=1 のみ。起動前に 9333 の使用中を検査し、使用中なら終了コード 2 |
 
+**loaded 条件の外向き経路**: 本番の `Page.navigate` は `FetchOptions::default()` で loopback・
+プライベートアドレス・`file:` を SSRF ガードにより拒否する（`net::ERR_...` を `errorText` で返す）。
+また netns は `lo` のみで外部へ出られない。このため loaded 条件（fandhe 側）の netns モードでは、
+インスタンス i ごとに veth ペア（ホスト側 `fmh<i>`・netns 側 `fmp<i>`）を作り、`10.213.<i>.0/30`
+（スクリプト冒頭の `EGRESS_BASE`。既存ネットワークと衝突する場合は書き換える）でホストと接続し、
+ホスト側で NAT する。
+
+- 追加物: `net.ipv4.ip_forward=1`（元が 0 なら終了時に戻す）・`iptables` の `nat POSTROUTING MASQUERADE` と
+  `filter FORWARD` の ACCEPT 2 本（コメント `fandhe-mim` 付き）・veth・netns 内の `resolv.conf` 差し替え
+  （mount namespace 内の bind mount。ホストのスタブリゾルバは netns から届かないため `--dns`、
+  既定 `1.1.1.1` を使う）
+- 後始末: `trap` が追加したルールを逆順に `-D` で削除し、veth を削除し、`ip_forward` を元に戻す。
+  異常終了後は `iptables -S | grep fandhe-mim`・`ip link show type veth` で残留を確認する
+- root 必須（非特権 user namespace では veth・iptables を扱えない）。idle のみの実行は従来どおり非特権でも可
+- Chromium 側はホストのネットワークをそのまま使い、同じ公開 URL を取得する（両者で URL を共通にする）
+
 `netns` の要件は root か、非特権 user namespace が許可された環境（Ubuntu 24.04 以降は既定で制限される
 ことがあるため `sudo` で実行するか sysctl を確認する）。いずれも満たせない場合は終了コード 2 で止まる。
 各インスタンスのプロファイルは `XDG_DATA_HOME` を個別の一時ディレクトリにして分離する。
@@ -53,16 +71,17 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
 ## 実行方法
 
 ```bash
-# 1. 準備: loaded 条件の対象ページを配信する（同一ページを全インスタンスが取得する。サイズ・内容は記録に残す）
-python3 -m http.server 18080 --bind 127.0.0.1 --directory <fixture-dir> &
+# 1. 準備: loaded 条件の対象として、固定内容の公開 URL を 1 つ決める
+#    （Chromium・fandhe の全インスタンスが同じ URL を取得する。内容・サイズ・取得日時を記録に残す。
+#      loopback・プライベートアドレス・file: は SSRF ガードで拒否されるため使えない）
 
-# 2. 計測（netns に root が必要な場合は sudo。出力は JSON）
-harness/multi-instance-memory/measure.sh -n 50 \
+# 2. 計測（loaded は veth/NAT のため root。sudo で実行。出力は JSON）
+sudo harness/multi-instance-memory/measure.sh -n 50 \
   --fandhe-bin target/release/fandhe-browser \
   --chromium-bin /usr/bin/chromium --chromium-extra-args "--no-sandbox" \
-  --url http://127.0.0.1:18080/index.html \
-  --poc1-chromium-kib <PoC-1 の Chromium 1 インスタンスあたり KiB> \
-  --poc1-fandhe-kib <PoC-1 の fandhe 1 インスタンスあたり KiB> \
+  --url <公開 URL（例: https://example.com/）> \
+  --poc1-chromium-kib <PoC-1 の Chromium 1 インスタンスあたり PSS (KiB)> \
+  --poc1-fandhe-kib <PoC-1 の fandhe 1 インスタンスあたり PSS (KiB)> \
   --out result-50.json
 ```
 
@@ -85,9 +104,11 @@ harness/multi-instance-memory/measure.sh -n 50 \
 
 ## PoC-1 線形外挿との比較方法
 
-1. PoC-1（`docs/spec/03-poc`）の 1/5/10 インスタンス実測から、**同じ指標（PSS か RSS か）** の 1 インスタンスあたり値を
-   Chromium・fandhe それぞれ取り出す（PoC-1 が RSS の場合は本結果の `rss_kib` 側と比較し、指標差を報告に書く）
-2. `--poc1-chromium-kib`・`--poc1-fandhe-kib` に渡すと、`poc1_extrapolation` に N 倍の外挿値と乖離率が出る
+1. PoC-1（`docs/spec/03-poc`）の 1/5/10 インスタンス実測から、**PSS** の 1 インスタンスあたり値を
+   Chromium・fandhe それぞれ取り出す。比較入力は PSS 専用で、RSS 値は渡さない（PoC-1 に PSS が無い
+   場合は PoC-1 側を PSS で再計測するか、外挿比較を省いて報告に理由を書く）
+2. `--poc1-chromium-kib`・`--poc1-fandhe-kib` を**両方**渡すと、`poc1_extrapolation` に N 倍の外挿値と乖離率が出る。
+   基準値は正の有限値のみ受理し、0・負・非数は計測開始前に終了コード 2 で拒否する
 3. 外挿より実測が小さい（負の乖離）場合は共有ページ按分の効果、大きい場合はインスタンス間の干渉
    （CPU・キャッシュ・メモリ圧迫）を疑う。評価はレポートに記述する
 
@@ -98,6 +119,9 @@ FANDHE_BIN=target/debug/fandhe-browser harness/multi-instance-memory/self-test.s
 ```
 
 小さな N（2）で偽バイナリを起動し、プロセスツリー走査・PSS 合算・JSON 出力・残留なしを確認する。
+あわせて PoC-1 基準値・`--url`（loopback/private/`file:` 拒否）の入力検証、URL の JSON エスケープの
+往復、`navigate.mjs` の `errorText` 非 0 終了を確認する。veth/NAT（root）は自己テストの対象外で、
+実機でのオーナー実行時に確認する。
 実バイナリ（N=1）と、可能なら netns の N=2 も確認する。CI には組み込まない。
 終了コード: 0 全検証済み / 1 失敗 / 3 Chromium 不在（Chromium 経路のみ未検証・他は合格。skip で 0 にしない）/ 4 Linux 以外。
 

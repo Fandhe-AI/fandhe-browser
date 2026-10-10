@@ -8,7 +8,9 @@
 #
 # Linux 専用（/proc/<pid>/smaps_rollup を使う）。macOS・Windows では終了コード 2 で終わる。
 # 依存: bash・ps・awk・curl・sleep・kill・（netns 分離時）unshare・nsenter・ip、
-#       （loaded 条件のみ）node 22 以降（navigate.mjs。npm 依存なし）。
+#       （loaded 条件の fandhe 側）root・iptables・node 22 以降（navigate.mjs。npm 依存なし）。
+# loaded 条件は公開 URL を使う。fandhe の Page.navigate は loopback・プライベートアドレス・file: を
+# SSRF ガードで拒否するため、netns ごとに veth ペア＋ホスト側 NAT（MASQUERADE）で外向き経路を用意する。
 # 終了コード: 0 成功 / 1 計測失敗（起動後のプロセス消失・smaps 読み取り不可など）/ 2 使用エラー・前提不足。
 set -euo pipefail
 
@@ -17,6 +19,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # fandhe-browser は待ち受けアドレスが 127.0.0.1:9333 固定で変更手段が無い（server.rs の DEFAULT_ADDR）
 FANDHE_PORT=9333
 MAX_N=200
+# 外向き経路（loaded 条件）用のプライベート帯。インスタンス i に 10.213.i.0/30 を割り当てる
+# （ホスト側 .1・netns 側 .2）。既存ネットワークと衝突する環境では EGRESS_BASE を書き換える。
+EGRESS_BASE="10.213"
+EGRESS_DNS="1.1.1.1"
 
 N=50
 FANDHE_BIN=""
@@ -34,6 +40,7 @@ NO_READY_CHECK=0
 ALLOW_SHARED_PORT=0
 POC1_CHROMIUM_KIB=""
 POC1_FANDHE_KIB=""
+EGRESS=0
 
 usage() {
   cat <<'USAGE'
@@ -45,12 +52,14 @@ usage: measure.sh --fandhe-bin PATH [--chromium-bin PATH | --skip-chromium] [opt
   --chromium-extra-args "..."  extra flags for Chromium (e.g. "--no-sandbox"; split on spaces)
   --skip-chromium              measure fandhe-browser only
   --skip-fandhe                measure Chromium only
-  --url URL                    page for the "loaded" condition (required when loaded is selected)
+  --url URL                    public http(s) URL for the "loaded" condition (required when loaded is
+                               selected; loopback/private/file: are rejected by fandhe's SSRF guard)
+  --dns IP                     resolver used inside netns for the loaded condition (default 1.1.1.1)
   --conditions LIST            comma list of idle,loaded (default idle,loaded)
   --settle SEC                 wait after start/navigation before sampling (default 5)
   --net-mode auto|netns|host   fandhe network isolation (default auto; see README)
-  --poc1-chromium-kib KIB      PoC-1 per-instance PSS/RSS of Chromium, for linear extrapolation
-  --poc1-fandhe-kib KIB        PoC-1 per-instance value of fandhe-browser
+  --poc1-chromium-kib KIB      PoC-1 per-instance PSS of Chromium (positive number), for linear extrapolation
+  --poc1-fandhe-kib KIB        PoC-1 per-instance PSS of fandhe-browser (positive number; give both or neither)
   --no-ready-check             skip the /json/version readiness poll (self-test only)
   --allow-shared-port          allow N>1 in host mode (self-test with a fake binary that binds no port)
   --out FILE                   write JSON to FILE (default stdout)
@@ -71,6 +80,7 @@ while [ $# -gt 0 ]; do
     --url) URL="${2:-}"; shift 2 ;;
     --conditions) CONDITIONS="${2:-}"; shift 2 ;;
     --settle) SETTLE="${2:-}"; shift 2 ;;
+    --dns) EGRESS_DNS="${2:-}"; shift 2 ;;
     --net-mode) NET_MODE="${2:-}"; shift 2 ;;
     --poc1-chromium-kib) POC1_CHROMIUM_KIB="${2:-}"; shift 2 ;;
     --poc1-fandhe-kib) POC1_FANDHE_KIB="${2:-}"; shift 2 ;;
@@ -89,9 +99,17 @@ done
   || die "--instances must be an integer in 1..$MAX_N (got '$N')"
 [[ "$SETTLE" =~ ^[0-9]+$ ]] || die "--settle must be a non-negative integer"
 case "$NET_MODE" in auto|netns|host) ;; *) die "--net-mode must be auto, netns or host" ;; esac
+# PoC-1 の基準値は PSS 専用で、正の有限値のみ受理する（0・負・非数は除算の分母になるため計測前に拒否）
+[ -z "$POC1_CHROMIUM_KIB" ] && [ -z "$POC1_FANDHE_KIB" ] \
+  || { [ -n "$POC1_CHROMIUM_KIB" ] && [ -n "$POC1_FANDHE_KIB" ]; } \
+  || die "--poc1-chromium-kib and --poc1-fandhe-kib must be given together"
 for kib in "$POC1_CHROMIUM_KIB" "$POC1_FANDHE_KIB"; do
-  [ -z "$kib" ] || [[ "$kib" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--poc1-*-kib must be a number"
+  [ -n "$kib" ] || continue
+  if ! [[ "$kib" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v v="$kib" 'BEGIN{ exit !(v + 0 > 0 && v + 0 < 1e15) }'; then
+    die "--poc1-*-kib must be a positive finite number of KiB (PSS), got '$kib'"
+  fi
 done
+[[ "$EGRESS_DNS" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--dns must be an IPv4 address"
 [ "$SKIP_CHROMIUM" -eq 0 ] || [ "$SKIP_FANDHE" -eq 0 ] || die "nothing to measure"
 if [ "$SKIP_FANDHE" -eq 0 ]; then
   [ -n "$FANDHE_BIN" ] && [ -x "$FANDHE_BIN" ] || die "--fandhe-bin must be an executable file"
@@ -106,7 +124,14 @@ for c in "${COND_LIST[@]}"; do
     *) die "unknown condition: $c" ;; esac
 done
 if [ -n "$URL" ]; then
-  case "$URL" in http://*|https://*|file://*) ;; *) die "--url must be http(s):// or file://" ;; esac
+  case "$URL" in http://*|https://*) ;; *) die "--url must be a public http(s):// URL (file: is rejected by the SSRF guard)" ;; esac
+  # 明らかな loopback・プライベートホストは fandhe の SSRF ガードが拒否するため、計測前に弾く
+  url_host="${URL#*://}"; url_host="${url_host%%[/?#]*}"; url_host="${url_host##*@}"
+  case "$url_host" in
+    localhost|localhost:*|*.localhost|*.localhost:*|127.*|10.*|192.168.*|169.254.*|0.*|\[*) \
+      die "--url host '$url_host' is loopback/private/IPv6-literal; use a public URL (SSRF guard)" ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*) die "--url host '$url_host' is private; use a public URL" ;;
+  esac
 fi
 for tool in ps awk curl sleep kill; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
@@ -145,11 +170,62 @@ resolve_net_mode() {
   fi
 }
 resolve_net_mode
+# 外向き経路は loaded 条件で fandhe を測るときのみ必要（veth・iptables・ip_forward は root 必須）
+if [ "$SKIP_FANDHE" -eq 0 ] && printf '%s\n' "${COND_LIST[@]}" | grep -qx loaded; then
+  EGRESS=1
+  [ "$NET_MODE" = "netns" ] || [ "$N" -eq 1 ] \
+    || die "loaded condition with N>1 needs netns mode"
+  if [ "$NET_MODE" = "netns" ]; then
+    [ "$(id -u)" -eq 0 ] || die "loaded condition in netns mode needs root (veth pairs, NAT and ip_forward); idle-only runs can use unprivileged userns"
+    command -v iptables >/dev/null 2>&1 || die "iptables not found (needed for NAT in loaded condition)"
+  fi
+fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fandhe-mim.XXXXXX")"
 LEADERS=()   # 現サイクルの起動リーダー PID（setsid により pgid == pid）
 RESULTS=()   # JSON 断片
 declare -A RES_PSS
+VETH_HOST_IFS=()     # 作成したホスト側 veth（削除対象）
+NAT_RULES=()         # 追加した iptables ルール（"表 チェーン 条件..." 形式。削除時に -D へ置換）
+IP_FORWARD_ORIG=""   # 変更前の net.ipv4.ip_forward（空なら未変更）
+
+# ---- 外向き経路（veth＋NAT）----
+# 追加物はすべて下記の teardown_egress で逆順に削除する。ホスト固有の値は持たない。
+setup_nat() {
+  local sub="$EGRESS_BASE.0.0/16"
+  IP_FORWARD_ORIG="$(cat /proc/sys/net/ipv4/ip_forward)"
+  if [ "$IP_FORWARD_ORIG" != "1" ]; then
+    log "enabling net.ipv4.ip_forward (restored to $IP_FORWARD_ORIG on exit)"
+    echo 1 >/proc/sys/net/ipv4/ip_forward
+  else
+    IP_FORWARD_ORIG=""
+  fi
+  add_rule nat POSTROUTING -s "$sub" ! -d "$sub" -j MASQUERADE
+  add_rule filter FORWARD -s "$sub" -j ACCEPT
+  add_rule filter FORWARD -d "$sub" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+}
+add_rule() { # $1=table $2=chain、以降=条件
+  local table="$1" chain="$2"; shift 2
+  iptables -t "$table" -I "$chain" "$@" -m comment --comment fandhe-mim
+  NAT_RULES+=("$table|$chain|$*")
+}
+teardown_egress() {
+  local i
+  for i in "${VETH_HOST_IFS[@]:-}"; do
+    [ -n "$i" ] && ip link del "$i" 2>/dev/null || true
+  done
+  VETH_HOST_IFS=()
+}
+teardown_nat() {
+  local idx spec table chain rest
+  for ((idx = ${#NAT_RULES[@]} - 1; idx >= 0; idx--)); do
+    spec="${NAT_RULES[$idx]}"; table="${spec%%|*}"; rest="${spec#*|}"; chain="${rest%%|*}"; rest="${rest#*|}"
+    # shellcheck disable=SC2086
+    iptables -t "$table" -D "$chain" $rest -m comment --comment fandhe-mim 2>/dev/null || true
+  done
+  NAT_RULES=()
+  if [ -n "$IP_FORWARD_ORIG" ]; then echo "$IP_FORWARD_ORIG" >/proc/sys/net/ipv4/ip_forward || true; IP_FORWARD_ORIG=""; fi
+}
 
 # ---- 後始末（trap）: 全プロセスグループを停止し作業ディレクトリを削除する ----
 kill_all() {
@@ -165,11 +241,13 @@ kill_all() {
     wait "$pid" 2>/dev/null || true
   done
   LEADERS=()
+  teardown_egress
 }
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM
   kill_all
+  teardown_nat
   rm -rf "$WORK"
   exit "$rc"
 }
@@ -177,11 +255,25 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+if [ "$EGRESS" -eq 1 ] && [ "$NET_MODE" = "netns" ]; then setup_nat; fi
+
 # ---- 起動 ----
 launch_fandhe() { # $1=index
   local data="$WORK/data/$1" logf="$WORK/log-fandhe-$1.txt"
   mkdir -p "$data"
-  if [ "$NET_MODE" = "netns" ]; then
+  if [ "$NET_MODE" = "netns" ] && [ "$EGRESS" -eq 1 ]; then
+    # 外向き経路あり: mount namespace も分け、netns 内だけ resolv.conf を差し替える（ホストの
+    # スタブリゾルバ 127.0.0.53 等は netns から到達できないため）。root 前提（setup 時に確認済み）
+    printf 'nameserver %s\n' "$EGRESS_DNS" >"$WORK/resolv-$1.conf"
+    # sh -c の $0/$1 は後続の引数で、ここでは展開させない
+    # shellcheck disable=SC2016
+    XDG_DATA_HOME="$data" setsid unshare -n -m \
+      sh -c 'ip link set lo up && mount --bind "$1" /etc/resolv.conf && exec "$0"' \
+      "$FANDHE_BIN" "$WORK/resolv-$1.conf" >"$logf" 2>&1 &
+    LEADERS+=("$!")
+    attach_egress "$1" "$!"
+    return 0
+  elif [ "$NET_MODE" = "netns" ]; then
     # sh -c の $0 は後続の引数（fandhe バイナリ）で、ここでは展開させない
     # shellcheck disable=SC2016
     XDG_DATA_HOME="$data" setsid unshare "${NS_FLAGS[@]}" \
@@ -190,6 +282,28 @@ launch_fandhe() { # $1=index
     XDG_DATA_HOME="$data" setsid "$FANDHE_BIN" >"$logf" 2>&1 &
   fi
   LEADERS+=("$!")
+}
+
+# 起動済みリーダーの netns へ veth の片側を移し、アドレス・既定ルートを設定する（root）。
+# リーダー PID が新しい netns に入る（/proc/PID/ns/net がホストと異なる）のを待ってから移す。
+# 待たずに移すとホスト自身の ns に残ってしまうため。
+attach_egress() { # $1=index $2=leader pid
+  local pid="$2" host_if="fmh$1" peer_if="fmp$1" self_ns deadline
+  local host_ip="$EGRESS_BASE.$1.1" peer_ip="$EGRESS_BASE.$1.2"
+  self_ns="$(readlink /proc/self/ns/net)"
+  deadline=$((SECONDS + 10))
+  while [ "$(readlink "/proc/$pid/ns/net" 2>/dev/null)" = "$self_ns" ]; do
+    [ "$SECONDS" -lt "$deadline" ] || { echo "error: netns of pid $pid not created" >&2; return 1; }
+    sleep 0.05
+  done
+  ip link add "$host_if" type veth peer name "$peer_if"
+  VETH_HOST_IFS+=("$host_if")
+  ip link set "$peer_if" netns "$pid"
+  ip addr add "$host_ip/30" dev "$host_if"
+  ip link set "$host_if" up
+  nsenter -t "$pid" -n ip addr add "$peer_ip/30" dev "$peer_if"
+  nsenter -t "$pid" -n ip link set "$peer_if" up
+  nsenter -t "$pid" -n ip route add default via "$host_ip"
 }
 
 launch_chromium() { # $1=index $2=url
@@ -310,10 +424,21 @@ if [ "$SKIP_FANDHE" -eq 0 ] && [ "$SKIP_CHROMIUM" -eq 0 ]; then
   done
 fi
 
+# JSON 文字列として必要なエスケープ（" \ と制御文字 U+0000..U+001F）を行い、元の値を保存する
+json_escape() {
+  LC_ALL=C JE_IN="$1" awk 'BEGIN {
+    for (i = 1; i < 32; i++) esc[sprintf("%c", i)] = sprintf("\\u%04x", i)
+    esc["\n"] = "\\n"; esc["\r"] = "\\r"; esc["\t"] = "\\t"; esc["\b"] = "\\b"; esc["\f"] = "\\f"
+    esc["\\"] = "\\\\"; esc["\""] = "\\\""
+    s = ENVIRON["JE_IN"]; out = ""
+    for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); out = out ((c in esc) ? esc[c] : c) }
+    printf "%s", out }'
+}
+
 join_by() { local IFS=","; echo "$*"; }
 {
   printf '{"schema_version":1,"task":"TASK-81","behaviors":["PERF-4","MEAS-6"],"metric":"pss_kib",'
-  printf '"instances":%d,"net_mode":"%s","url":"%s","settle_sec":%d,' "$N" "${NET_MODE}" "${URL//\"/}" "$SETTLE"
+  printf '"instances":%d,"net_mode":"%s","url":"%s","settle_sec":%d,' "$N" "${NET_MODE}" "$(json_escape "$URL")" "$SETTLE"
   printf '"environment":{"kernel":"%s","arch":"%s","cpus":%s,"mem_total_kib":%s},' \
     "$(uname -r)" "$(uname -m)" "$(nproc 2>/dev/null || echo 0)" "$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
   printf '"results":[%s],"comparisons":[%s]}\n' "$(join_by "${RESULTS[@]}")" "$(join_by "${COMPARISONS[@]:-}")"

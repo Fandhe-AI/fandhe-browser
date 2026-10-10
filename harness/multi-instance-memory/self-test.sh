@@ -35,6 +35,62 @@ ok "instance count validation (0, 201, abc, empty -> exit 2)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/fandhe-mim-selftest.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
+# 使用エラー（計測開始前に終了コード 2）: PoC-1 基準値（正の有限値のみ・PSS 専用・両方指定）と URL
+expect_usage_error() { # $1=説明、以降=measure.sh 追加引数
+  local what="$1" st=0; shift
+  "$MEASURE" --fandhe-bin /bin/true --skip-chromium --conditions idle "$@" >/dev/null 2>&1 || st=$?
+  [ "$st" -eq 2 ] || fail "$what must exit 2 (got $st)"
+}
+for bad in 0 0.0 -1 nan inf abc 1e3; do
+  expect_usage_error "poc1 fandhe '$bad'" --poc1-chromium-kib 100 --poc1-fandhe-kib "$bad"
+  expect_usage_error "poc1 chromium '$bad'" --poc1-chromium-kib "$bad" --poc1-fandhe-kib 100
+done
+expect_usage_error "poc1 single value" --poc1-chromium-kib 100
+ok "PoC-1 baseline validation (0, 0.0, -1, nan, inf, non-number, single -> exit 2)"
+for bad in file:///etc/hostname http://127.0.0.1:18080/ http://localhost/ http://10.0.0.1/ \
+  http://192.168.1.1/ http://172.16.0.1/ "http://[::1]/" ftp://example.com/; do
+  expect_usage_error "url '$bad'" --url "$bad"
+done
+ok "--url rejects file:, loopback, private and IPv6-literal hosts (SSRF guard parity)"
+
+# URL の JSON エスケープ: " \ 制御文字を JSON 規則でエスケープし、元の URL を復元できる
+EVIL_URL='https://example.com/a"b\c?q=x'
+printf '#!/bin/sh\nexec sleep 300\n' >"$TMP/sleeper"; chmod +x "$TMP/sleeper"
+OUT="$("$MEASURE" -n 1 --fandhe-bin "$TMP/sleeper" --skip-chromium --conditions idle --settle 0 --net-mode host \
+  --no-ready-check --url "$EVIL_URL" 2>/dev/null)" || true
+if command -v jq >/dev/null 2>&1 && [ -n "$OUT" ]; then
+  [ "$(jq -r .url <<<"$OUT")" = "$EVIL_URL" ] || fail "url must round-trip through JSON escaping"
+  ok "URL with quote and backslash round-trips through JSON"
+else
+  echo "note: jq or output missing; URL JSON round-trip NOT verified"
+fi
+
+# navigate.mjs: result.errorText があれば非 0 終了、無ければ 0（WebSocket・fetch を差し替えて検証）
+if command -v node >/dev/null 2>&1; then
+  cat >"$TMP/stub.mjs" <<'STUB_EOF'
+globalThis.fetch = async () => ({ json: async () => ({ webSocketDebuggerUrl: "ws://stub/" }) });
+globalThis.WebSocket = class {
+  constructor() { queueMicrotask(() => this.onopen && this.onopen()); }
+  send(data) {
+    const { id } = JSON.parse(data);
+    const result = JSON.parse(process.env.STUB_RESULT);
+    queueMicrotask(() => this.onmessage({ data: JSON.stringify({ id, result }) }));
+  }
+  close() {}
+};
+STUB_EOF
+  st=0
+  STUB_RESULT='{"frameId":"f","errorText":"net::ERR_ADDRESS_INVALID"}' \
+    node --import "$TMP/stub.mjs" "$SCRIPT_DIR/navigate.mjs" http://stub https://example.com/ >/dev/null 2>&1 || st=$?
+  [ "$st" -eq 1 ] || fail "navigate.mjs must exit 1 on errorText (got $st)"
+  STUB_RESULT='{"frameId":"f"}' \
+    node --import "$TMP/stub.mjs" "$SCRIPT_DIR/navigate.mjs" http://stub https://example.com/ >/dev/null 2>&1 \
+    || fail "navigate.mjs must exit 0 without errorText"
+  ok "navigate.mjs: errorText -> exit 1, success -> exit 0"
+else
+  echo "note: node not found; navigate.mjs errorText handling NOT verified"
+fi
+
 # 偽バイナリ: 親 sh + 子 sleep 2 本（プロセスツリー走査を検証）。ポートは使わない。
 FAKE="$TMP/fake-fandhe"
 cat >"$FAKE" <<'FAKE_EOF'
