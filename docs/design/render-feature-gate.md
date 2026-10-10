@@ -12,7 +12,7 @@ feature `rendering`（`Servo` 組込）を有効化した場合のバイナリ�
 
 ## feature 無効時の確認記録（TASK-34・RENDER-1・RENDER-2）
 
-TASK-34 の成果物のうち確認記録の節。スクリプト側は `scripts/check-render-isolation.sh`（TASK-34.1・#465）、`harness/binary-size/`（TASK-34.2・#466）、CI `binary-size` ジョブ（TASK-34.3・#467）で整備済み。
+TASK-34 の成果物のうち確認記録の節。スクリプト側は `scripts/check-render-isolation.sh`（TASK-34.1・#465）、`harness/binary-size/`（TASK-34.2・#466）、CI `harness-*` ジョブの `[binary-size]` ステップ（TASK-34.3・#467）で整備済み。
 
 ### 依存グラフ検査（RENDER-1）
 
@@ -45,11 +45,11 @@ TASK-34 の成果物のうち確認記録の節。スクリプト側は `scripts
 出典: CI run `36814758200`（main `33d7032`、2026-10-01、push）の `binary-size` ジョブ。3 OS とも `result=pass`。削減率は Chromium 457.4MB（10 進 457,400,000 B）との比較。
 
 - **計測対象の限界（REPAIR-3）**: 計測したバイナリは最小雛形で、core の `default = []` のため JS エンジン（V8・boa）を同梱せず、サブコマンドは未実装（TASK-47）、AI ルータ（`/ai/*`）は計測後の TASK-19.3（#225）で合成したため、上表は合成前の計測値である。したがって上表は「現時点の雛形構成での実測で、上限以内」を示すにとどまり、製品構成での `CORE-2` 達成を意味しない。製品構成での判定は、JS エンジンの既定同梱や機能追加の後に再計測する。参考として想定既定 CLI（V8 同梱）は約 42.92MB（出典は「バイナリサイズ増分」節の参考行。`docs/spec/spec.md`）
-- 休眠状態の解消: cli 追加により `make check-binary-size` と CI `binary-size` ジョブは実ビルド・実測を行う（skip による休眠は解消済み。#633）
+- 休眠状態の解消: cli 追加により `make check-binary-size` と CI `harness-*` ジョブの `[binary-size]` ステップは実ビルド・実測を行う（skip による休眠は解消済み。#633）
 - 代替計測を採らない理由: core の example 等を測っても製品バイナリと構成が異なり、RENDER-2 の実測値と誤解されるため
 - 参考値: CORE-2 の比較基準は Chromium 実測 457.4MB（PoC-2）からの 80% 以上削減であり、424KB（PoC-6）は `println!` のみのスタブ（Servo 未リンク）の参考値でゲートではない。上限 91,480,000 B は Chromium 457.4MB（PoC-2）の 20% から導いた値（詳細は `harness/binary-size/README.md`）
 - 上限見直し（回帰予算を厳しくするか・OS 別上限にするか）: 実測値は得られたが、見直しは人間判断として別途扱うため現状は**据え置き**
-- 再計測手順: CI `binary-size` ジョブのサマリー（`binary-size: host=... bytes=... limit=... result=...`）とローカル `make check-binary-size` の結果を転記して本節を更新する。#368 以前の計測値は release プロファイルの `opt-level="z"`・`lto`・`strip` 適用前のもので、大きめ（保守側）に出ている
+- 再計測手順: CI `harness-*` ジョブの `[binary-size]` ステップのサマリー（`binary-size: host=... bytes=... limit=... result=...`）とローカル `make check-binary-size` の結果を転記して本節を更新する。#368 以前の計測値は release プロファイルの `opt-level="z"`・`lto`・`strip` 適用前のもので、大きめ（保守側）に出ている
 
 ### 受け入れ条件との対応（TASK-34.4）
 
