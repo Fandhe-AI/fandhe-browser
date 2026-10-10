@@ -46,7 +46,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-加えて `make lint-docs`（markdownlint・yamllint・editorconfig-checker・commitlint）・`make deny`（`cargo deny check licenses` 等）・`make check-render-isolation`（既定ビルドと `fandhe-browser-cli` の既定 feature に Servo が含まれないことの検証。CI では `render-isolation` ジョブが 3 OS で実行）がある。
+加えて `make lint-docs`（markdownlint・yamllint・editorconfig-checker・commitlint）・`make deny`（`cargo deny check licenses` 等）・`make check-render-isolation`（既定ビルドと `fandhe-browser-cli` の既定 feature に Servo が含まれないことの検証。CI では `harness-*` ジョブの `[render-isolation]` ステップが 3 OS で実行）がある。
 
 feature gate `rendering` に関わる変更を行った場合は、既定ビルドに加えて次も実行する（`RENDER-1`）。
 

@@ -43,7 +43,7 @@ make check-render-isolation   # scripts/check-render-isolation.sh を実行し�
                                # NG。fail-closed・#633）に Servo 系クレートが含まれないことを確認
 ```
 
-CI では `render-isolation` ジョブ（TASK-34.1・#465・3 OS matrix）が同じ `scripts/check-render-isolation.sh` を PR ごとに実行する。
+CI では `harness-*` ジョブの `[render-isolation]` ステップが同じ `scripts/check-render-isolation.sh` を PR ごとに実行する。
 
 ### ライセンス検査
 
@@ -62,8 +62,9 @@ make check-mcp-envelope     # 実 mcp バイナリでの e2e smoke（`make ci` �
 
 ### 3 OS 一級対応
 
-- CI は Linux・macOS・Windows の 3 OS ネイティブランナーでビルド・テストする（クロスコンパイル前提にしない）
-- OS 固有のパス・大文字小文字非区別ファイルシステム・改行コードに関わる変更は、PR 本文に 3 OS での実行結果が記載されているか（同じ PR で CI 設定を変更する場合はその diff に 3 OS matrix でのテスト実行が含まれているか）を確認する
+- PR の CI は ubuntu のネイティブ実行のみで、macOS・Windows のネイティブジョブは skipped になる。代わりに `cross-target-check` が Linux 上で `aarch64-apple-darwin`・`x86_64-pc-windows-msvc` 向けに `cargo check` / `cargo clippy` を行う。ただし `ring`（rustls 経由）がクロスコンパイルできないため、検査対象は `fandhe-browser-js`・`-profile`・`-mcp`・`-render` に限られ、core・ai・cdp・cli の OS 固有分岐は対象外（`.claude/rules/ci.md`「3 OS CI」）
+- main への push と release 前（`gh workflow run ci.yml --ref <ref>` の `workflow_dispatch`）には、Linux・macOS・Windows の 3 OS ネイティブランナーでビルド・テストする（オーナー判断 2026-10-10）。PR で見落とすのは macOS・Windows 固有の実行時の誤りと、上記の対象外 crate の OS 固有コンパイル・lint の誤りで、main への push 後に判明する（待ち時間と引き換えにオーナーが判断した残存リスク）。main で macOS・Windows だけが失敗した場合は修正 PR で直す
+- main への新しい push は実行中の古い main の 3 OS の CI を取り消す（concurrency）。取り消された commit の macOS・Windows の結果は残らず、後続 commit の 3 OS 実行で検出する
 
 ## レビュー観点
 
@@ -148,6 +149,6 @@ spec `docs/spec/04-behavior/self-repair-design.md`「crate 間の依存方向と
 | runner 方針 | public リポジトリのため既定は GitHub ホステッドランナー。self-hosted の使用が許可されるのは `ai-review.yml` の `codex`/`review` ジョブのみ（組織承認済み例外）。`preflight`/`post_feedback` を含む他ジョブ・他 workflow は GitHub ホステッドランナーになっているか（補足: 許可範囲の詳細は Fandhe-AI/actions `ai-review/docs/runner-exception.md` 参照。Codex から読めない場合がある） | P0 |
 | permissions | ワークフロー・ジョブの `permissions` が最小権限で明示されているか | P0 |
 | secrets の扱い | secrets が `pull_request` イベントのログへ出力されていないか | P0 |
-| CI パイプライン本体（`ci.yml`・`release.yml`） | `ci.yml` は TASK-55.2（Issue #59）で `push`（main）/`pull_request` トリガーを有効化済み（`workflow_dispatch` は手動再実行用に併存）。`release.yml` は crates.io 公開用の意図的設計として引き続き `workflow_dispatch` 限定。`ci.yml` への変更では、3 OS matrix（Linux・macOS・Windows）を備えているか、本リポに存在しない `make` ターゲット・`scripts/` を前提にした（fandhe-db 由来のような）ジョブが混入していないかを確認する | P1 |
-| 依存監査パイプライン | `cargo-deny`（advisories/bans/licenses/sources）は 3 OS の `rust-ci` ジョブへ導入済み（TASK-77・#64）。許可外ライセンスを reject する fail-closed 性の negative test（`make check-deny-license-reject`・`deny-license-reject` ジョブ）も導入済み（TASK-9.1・#338・REPAIR-8） | P2 |
-| 対象サイト群の回帰チェック | TASK-9.2（Issue #339・REPAIR-8）で `compat-regression` ジョブ導入済み（`harness/compat-regression/check-matrix.sh`。閾値 70%・COMPAT-1/COMPAT-4）。実マトリクス `harness/compat-practical/results/matrix.json`（TASK-71.3・Issue #312 が生成予定）が未導入のため `--allow-missing` 運用中（ファイル不在時は `::warning::` を出して exit 0）。`ci.yml`・`Makefile` の変更では `--allow-missing` の削除条件（#312 完了）が守られているか確認する。同ジョブは `harness/compat-practical/` の自己テスト・tasks.json 検証も実行する（TASK-71.1・TASK-71.2・MEAS-4。`make check-compat-practical`。要 node 22 以降（組み込み WebSocket）・jq。実バイナリ起動の `run_core.sh` 本番実行は CI 対象外で、自己テストは偽 CDP サーバーのみ使う。ネットワーク・secrets 不使用） | P2 |
+| CI パイプライン本体（`ci.yml`・`release.yml`） | `ci.yml` は TASK-55.2（Issue #59）で `push`（main）/`pull_request` トリガーを有効化済み（`workflow_dispatch` は手動再実行用に併存）。`release.yml` は crates.io 公開用の意図的設計として引き続き `workflow_dispatch` 限定。`ci.yml` への変更では、3 OS（Linux・macOS・Windows）を OS ごとの明示ジョブで備えているか（matrix は required の check 名が変わるため使わない）、`changes` ジョブの docs-only 判定（`scripts/ci-changes.sh`）が fail-closed のままか、本リポに存在しない `make` ターゲット・`scripts/` を前提にした（fandhe-db 由来のような）ジョブが混入していないかを確認する | P1 |
+| 依存監査パイプライン | `cargo-deny`（advisories/bans/licenses/sources）は `rust-lint` ジョブ（ubuntu。OS 非依存）へ導入済み（TASK-77・#64）。許可外ライセンスを reject する fail-closed 性の negative test（`make check-deny-license-reject`・`rust-lint` ジョブ内のステップ）も導入済み（TASK-9.1・#338・REPAIR-8） | P2 |
+| 対象サイト群の回帰チェック | TASK-9.2（Issue #339・REPAIR-8）で `harness-*` ジョブの `[compat-regression]` ステップ導入済み（`harness/compat-regression/check-matrix.sh`。閾値 70%・COMPAT-1/COMPAT-4）。実マトリクス `harness/compat-practical/results/matrix.json`（TASK-71.3・Issue #312 が生成予定）が未導入のため `--allow-missing` 運用中（ファイル不在時は `::warning::` を出して exit 0）。`ci.yml`・`Makefile` の変更では `--allow-missing` の削除条件（#312 完了）が守られているか確認する。同ジョブは `harness/compat-practical/` の自己テスト・tasks.json 検証も実行する（TASK-71.1・TASK-71.2・MEAS-4。`make check-compat-practical`。要 node 22 以降（組み込み WebSocket）・jq。実バイナリ起動の `run_core.sh` 本番実行は CI 対象外で、自己テストは偽 CDP サーバーのみ使う。ネットワーク・secrets 不使用） | P2 |
