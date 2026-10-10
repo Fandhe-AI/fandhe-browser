@@ -11,6 +11,13 @@ name: CI
 #   rust-features-{ubuntu,macos,windows}  rust 時。feature 構成別の clippy・test（3 OS）
 #   harness-{ubuntu,macos,windows}        rust または harness 時。分離検証・ハーネス・サイズ検査
 #   windows-servo-prereqs        rust 時。Servo の Windows ビルド前提の検証
+#   cross-target-check           rust 時。Linux 上で macOS・Windows 向けに型検査（PR でも実行）
+#
+# 3 OS の実行時機（オーナー判断 2026-10-10。.claude/rules/ci.md「3 OS CI」）:
+#   - pull_request: ubuntu のネイティブ実行のみ。macOS・Windows の各ジョブは skipped になり
+#     （required を満たす）、代わりに cross-target-check が Linux 上で型検査する
+#   - push（main）・workflow_dispatch: 3 OS すべてのネイティブ実行（release 前は
+#     `gh workflow run ci.yml --ref <ref>` で 3 OS を回す）
 # 詳細・required checks の一覧は .claude/rules/ci.md を参照。
 #
 # 設計上の制約:
@@ -18,7 +25,8 @@ name: CI
 #   スキップされた matrix ジョブは展開されず check 名が変わり、required を満たせなくなるため。
 # - reusable workflow 呼び出し（`caller / callee` 形式の check 名）は使わない。
 # - 出る check-run はすべて required にする前提（自動マージは未 required の check-run があると
-#   マージしない）。非 required の補助ジョブを追加しない。
+#   マージしない）。非 required の補助ジョブを追加しない（cross-target-check も required に含める）。
+#   macOS・Windows の各ジョブは pull_request で skipped になる（skipped は required を満たす）。
 # - docs-only 判定は fail-closed。allowlist 外のパスが 1 つでもあれば rust=true。
 # - clippy -D warnings ゲートは REPAIR-6（TASK-5.2・#32 / TASK-7・#335）。ライセンス検査は
 #   TASK-77（#64）・TASK-9.1（#338・REPAIR-8）。Servo 前提は TASK-56.1（#195・XOS-6・MS-3）。
@@ -34,7 +42,12 @@ permissions:
   contents: read
 
 # 同じ PR・同じ ref（main への push を含む）の新しい run が始まったら、実行中の古い run は
-# 中止して最新のコミットだけを検証する（main へ続けてマージされても 3 OS の run は 1 本に保つ）
+# 中止して最新のコミットだけを検証する（main へ続けてマージされても 3 OS の run は 1 本に保つ）。
+# push（main）では group が `CI-refs/heads/main` になり、main への新しい push は実行中の古い
+# main の CI（macOS・Windows のネイティブ実行を含む 3 OS）を取り消す。取り消された commit の
+# macOS・Windows の結果は残らず、OS 固有の実行時の誤りは後続 commit の main の CI（最新 commit を
+# 含む 3 OS 実行）で検出する（オーナー承認の挙動。ci.md「3 OS CI」）。workflow_dispatch を main へ
+# 向けて起動した場合も同じ group になる
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -55,7 +68,6 @@ jobs:
     outputs:
       rust: ${{ steps.detect.outputs.rust }}
       harness: ${{ steps.detect.outputs.harness }}
-      xos: ${{ steps.detect.outputs.xos }}
     defaults:
       run:
         shell: bash
@@ -77,53 +89,36 @@ jobs:
           emit() {
             echo "rust=$1" >> "$GITHUB_OUTPUT"
             echo "harness=$2" >> "$GITHUB_OUTPUT"
-            echo "xos=$3" >> "$GITHUB_OUTPUT"
-            echo "changes: rust=$1 harness=$2 xos=$3 (${4})"
+            echo "changes: rust=$1 harness=$2 ($3)"
           }
           if [ "$EVENT_NAME" != "pull_request" ]; then
-            emit true true true "event=$EVENT_NAME"
+            emit true true "event=$EVENT_NAME"
             exit 0
           fi
           if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
-            emit true true true "base/head SHA unavailable"
+            emit true true "base/head SHA unavailable"
             exit 0
           fi
           if ! files="$(git -c core.quotepath=false diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA")"; then
             echo "::warning::git diff failed; running all jobs (fail-closed)"
-            emit true true true "git diff failed"
+            emit true true "git diff failed"
             exit 0
           fi
           echo "changed files:"
           printf '%s\n' "$files"
           if ! result="$(printf '%s\n' "$files" | bash scripts/ci-changes.sh)"; then
             echo "::warning::scripts/ci-changes.sh failed; running all jobs (fail-closed)"
-            emit true true true "classifier failed"
+            emit true true "classifier failed"
             exit 0
           fi
           # 出力は厳密な 2 行形式のみ受理する。欠落・想定外の値は下流ジョブが
           # skipped（= 成功扱い）になる fail-open を招くため全実行へ倒す
           if [ "$(printf '%s\n' "$result" | grep -cxE 'rust=(true|false)')" -ne 1 ] \
             || [ "$(printf '%s\n' "$result" | grep -cxE 'harness=(true|false)')" -ne 1 ] \
-            || [ "$(printf '%s\n' "$result" | grep -cxE 'xos=(true|false)')" -ne 1 ] \
-            || [ "$(printf '%s\n' "$result" | wc -l | tr -d ' ')" -ne 3 ]; then
+            || [ "$(printf '%s\n' "$result" | wc -l | tr -d ' ')" -ne 2 ]; then
             echo "::warning::unexpected classifier output; running all jobs (fail-closed)"
-            emit true true true "unexpected output"
+            emit true true "unexpected output"
             exit 0
-          fi
-          # Rust ソースの差分の追加・削除行に OS 分岐の語（target_os・target_family・windows・
-          # unix・macos。cfg_attr や rustfmt で折り返した cfg(all(..)) の 2 行目も拾えるよう、
-          # cfg( と同じ行であることは要求しない）があれば、パスによらず PR でも 3 OS を走らせる
-          if ! diff_body="$(git diff --no-renames -U0 "$BASE_SHA...$HEAD_SHA" -- '*.rs')"; then
-            echo "::warning::git diff (content) failed; running all jobs (fail-closed)"
-            emit true true true "git diff content failed"
-            exit 0
-          fi
-          os_cfg_re='(target_os|target_family|\bwindows\b|\bunix\b|\bmacos\b)'
-          # grep -q は早期終了で上流が SIGPIPE になり pipefail 下で偽になるため、件数で判定する
-          os_cfg_hits="$(printf '%s\n' "$diff_body" | grep -E '^[+-]' | grep -cE "$os_cfg_re" || true)"
-          if [ "${os_cfg_hits:-0}" != "0" ]; then
-            result="$(printf '%s\n' "$result" | sed 's/^xos=false$/xos=true/')"
-            echo "OS-specific cfg change detected; xos=true"
           fi
           printf '%s\n' "$result" >> "$GITHUB_OUTPUT"
           echo "changes: $(printf '%s' "$result" | tr '\n' ' ')"
@@ -243,7 +238,7 @@ jobs:
         run: make check-deny-license-reject
 
   # --------------------------------------------------
-  # rust-test-{ubuntu,macos,windows}（clippy + test。3 OS 必須・rust 変更時のみ）
+  # rust-test-{ubuntu,macos,windows}（clippy + test。rust 変更時のみ。macOS・Windows は PR では skipped）
   # --------------------------------------------------
   # 旧 rust-ci（Fandhe-AI/actions の rust-base-ci.yml）の clippy・test を OS ごとの
   # 明示ジョブへインライン化した（XOS-1・TASK-55.1）。matrix にしないのは、job-level if で
@@ -293,7 +288,7 @@ jobs:
 
   rust-test-macos:
     needs: changes
-    if: ${{ (needs.changes.outputs.rust == 'true') && needs.changes.outputs.xos == 'true' }}
+    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.rust == 'true' }}
     runs-on: macos-latest
     timeout-minutes: 60
     permissions:
@@ -333,7 +328,7 @@ jobs:
 
   rust-test-windows:
     needs: changes
-    if: ${{ (needs.changes.outputs.rust == 'true') && needs.changes.outputs.xos == 'true' }}
+    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.rust == 'true' }}
     runs-on: windows-latest
     timeout-minutes: 90
     permissions:
@@ -447,7 +442,7 @@ jobs:
 
   rust-features-macos:
     needs: changes
-    if: ${{ (needs.changes.outputs.rust == 'true') && needs.changes.outputs.xos == 'true' }}
+    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.rust == 'true' }}
     runs-on: macos-latest
     timeout-minutes: 60
     permissions:
@@ -524,7 +519,7 @@ jobs:
 
   rust-features-windows:
     needs: changes
-    if: ${{ (needs.changes.outputs.rust == 'true') && needs.changes.outputs.xos == 'true' }}
+    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.rust == 'true' }}
     runs-on: windows-latest
     timeout-minutes: 120
     permissions:
@@ -748,8 +743,8 @@ jobs:
   harness-macos:
     needs: changes
     if: >-
-      ${{ (needs.changes.outputs.rust == 'true' || needs.changes.outputs.harness == 'true')
-      && needs.changes.outputs.xos == 'true' }}
+      ${{ github.event_name != 'pull_request'
+      && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.harness == 'true') }}
     runs-on: macos-latest
     timeout-minutes: 60
     permissions:
@@ -888,8 +883,8 @@ jobs:
   harness-windows:
     needs: changes
     if: >-
-      ${{ (needs.changes.outputs.rust == 'true' || needs.changes.outputs.harness == 'true')
-      && needs.changes.outputs.xos == 'true' }}
+      ${{ github.event_name != 'pull_request'
+      && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.harness == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 120
     permissions:
@@ -1032,7 +1027,7 @@ jobs:
   # 出る check-run はすべて required にする前提のため、windows-servo-prereqs も required に含める。
   windows-servo-prereqs:
     needs: changes
-    if: ${{ (needs.changes.outputs.rust == 'true') && needs.changes.outputs.xos == 'true' }}
+    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.rust == 'true' }}
     runs-on: windows-latest
     # VS Installer の modify に時間がかかりうるため 30 分。ハング防止（NFR-10）
     timeout-minutes: 30
@@ -1156,3 +1151,94 @@ jobs:
             exit 1
           }
           Write-Host $ver
+
+  # --------------------------------------------------
+  # cross-target-check（Linux 上のクロス型検査: macOS・Windows。rust 変更時。PR でも実行）
+  # --------------------------------------------------
+  # pull_request では macOS・Windows のネイティブジョブを走らせない（オーナー判断 2026-10-10）ため、
+  # ubuntu ランナー上で aarch64-apple-darwin と x86_64-pc-windows-msvc 向けに型検査し、OS 固有の
+  # コンパイルエラー・clippy 警告・feature 構成の誤りを PR で検出する。参考: Fandhe-AI/fandhe-container
+  # の cross-target-check。check / clippy のみでリンクもテスト実行もしないため、実行時の挙動
+  # （パス・大文字小文字・改行・OS のツール差）は保証しない。実行時の誤りは push（main）・
+  # workflow_dispatch の 3 OS ネイティブ実行で検出する（ci.md「3 OS CI」）。
+  #
+  # 検査範囲は限定される（2026-10-10 にローカルで実測。REPAIR-3）: 依存の rustls が使う `ring` は
+  # build.rs で cc-rs 経由の C / アセンブラのコンパイルを行い、クロスでは macOS SDK / MSVC の
+  # ツールチェーン（ヘッダ・lib.exe）が要る。ubuntu 上の cc / clang ではヘッダ不足で失敗するため、
+  # `ring` に至る fandhe-browser-core（reqwest / rustls）とそれに依存する -ai・-cdp・-cli、および
+  # wpt-subset-runner は --exclude で外す。残る js（V8・boa）・profile・mcp・render は
+  # `cc` / `ring` / `cmake` を依存に持たず（`cargo tree` で確認。bindgen は v8 の build-dependency
+  # だが prebuilt 利用時は動かない）、check / clippy が両ターゲットで通る。
+  # 未検査の範囲: core・ai・cdp・cli・wpt-subset-runner の OS 固有分岐（cfg(target_os) 等）。
+  # これらの OS 固有のコンパイル・lint の誤りは push（main）の macOS・Windows ネイティブ実行でしか
+  # 検出されない。--exclude 方式のため、除外対象の crate が増えれば ring を引く新しい crate は
+  # ここで失敗として表面化する（黙って検査対象が狭まらない）。cc を使う依存を render・js・profile・
+  # mcp に追加した場合は、その crate もここで --exclude する。
+  # v8 の build.rs は prebuilt の静的ライブラリ（約 150MB / ターゲット）をダウンロードする
+  # （target/ 配下。時間とネットワークを使うため、target は cache しない）。
+  # 実行コマンドはターゲットごとに check（--all-features）・clippy（--all-features と既定 feature）。
+  cross-target-check:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: clippy
+          targets: aarch64-apple-darwin,x86_64-pc-windows-msvc
+      - name: "cargo cache の復元（registry のみ）"
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: fandhe-browser-${{ runner.os }}-cross-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: fandhe-browser-${{ runner.os }}-cross-v1-
+      - name: "cargo check（aarch64-apple-darwin・--all-features）"
+        run: >-
+          cargo check --workspace --all-targets --all-features --target aarch64-apple-darwin
+          --exclude fandhe-browser-core --exclude fandhe-browser-ai --exclude fandhe-browser-cdp
+          --exclude fandhe-browser-cli --exclude wpt-subset-runner
+      - name: "cargo clippy（aarch64-apple-darwin・--all-features・-D warnings）"
+        if: ${{ !cancelled() }}
+        run: >-
+          cargo clippy --workspace --all-targets --all-features --target aarch64-apple-darwin
+          --exclude fandhe-browser-core --exclude fandhe-browser-ai --exclude fandhe-browser-cdp
+          --exclude fandhe-browser-cli --exclude wpt-subset-runner -- -D warnings
+      - name: "cargo clippy（aarch64-apple-darwin・既定 feature・-D warnings）"
+        if: ${{ !cancelled() }}
+        run: >-
+          cargo clippy --workspace --all-targets --target aarch64-apple-darwin
+          --exclude fandhe-browser-core --exclude fandhe-browser-ai --exclude fandhe-browser-cdp
+          --exclude fandhe-browser-cli --exclude wpt-subset-runner -- -D warnings
+      - name: "cargo check（x86_64-pc-windows-msvc・--all-features）"
+        if: ${{ !cancelled() }}
+        run: >-
+          cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
+          --exclude fandhe-browser-core --exclude fandhe-browser-ai --exclude fandhe-browser-cdp
+          --exclude fandhe-browser-cli --exclude wpt-subset-runner
+      - name: "cargo clippy（x86_64-pc-windows-msvc・--all-features・-D warnings）"
+        if: ${{ !cancelled() }}
+        run: >-
+          cargo clippy --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
+          --exclude fandhe-browser-core --exclude fandhe-browser-ai --exclude fandhe-browser-cdp
+          --exclude fandhe-browser-cli --exclude wpt-subset-runner -- -D warnings
+      - name: "cargo clippy（x86_64-pc-windows-msvc・既定 feature・-D warnings）"
+        if: ${{ !cancelled() }}
+        run: >-
+          cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc
+          --exclude fandhe-browser-core --exclude fandhe-browser-ai --exclude fandhe-browser-cdp
+          --exclude fandhe-browser-cli --exclude wpt-subset-runner -- -D warnings

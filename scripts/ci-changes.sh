@@ -12,14 +12,10 @@
 #   scripts/ci-changes.sh --self-test
 #
 # 入力: 標準入力に 1 行 1 パス（リポジトリルート相対）。
-# 出力: 標準出力に `rust=true|false`・`harness=true|false`・`xos=true|false` の 3 行
+# 出力: 標準出力に `rust=true|false`・`harness=true|false` の 2 行
 #       （GITHUB_OUTPUT へそのまま追記できる形式）。
-#
-# xos（PR でも macOS・Windows ジョブを走らせるか）: PR は既定で ubuntu のみ検証し、3 OS は
-#   main への push と release 前に行う（.claude/rules/ci.md「3 OS の扱い」）。OS 差異の
-#   影響を受けやすいパス（profile crate・.github・Cargo.toml / Cargo.lock・
-#   rust-toolchain.toml・scripts）を含む PR だけ xos=true にする。`cfg(target_os)` 等の
-#   差分内容による判定はワークフロー側で行い、ここでの結果と OR する。
+#       macOS・Windows ジョブを pull_request で走らせるかは本スクリプトの判定ではなく、
+#       ワークフロー側がイベント種別で決める（.claude/rules/ci.md「3 OS CI」）。
 #
 # 判定（fail-closed。どれにも当てはまらないパスは rust=true）:
 #   1. ビルド・検査に影響しうるパス（crates・Cargo.*・.github・scripts・Makefile・
@@ -37,21 +33,12 @@ set -euo pipefail
 
 # 1 行 1 パスの入力を判定して `rust=` / `harness=` を出力する。
 classify() {
-  local rust=false harness=false xos=false seen=false path
+  local rust=false harness=false seen=false path
   while IFS= read -r path || [ -n "$path" ]; do
     # 末尾の CR を除去（Windows 由来の改行混入対策）。空行は無視する
     path="${path%$'\r'}"
     [ -n "$path" ] || continue
     seen=true
-    case "$path" in
-      # OS 名を含むファイル（*windows*・*unix*・*macos*・platform/）と .gitattributes（Windows の
-      # CRLF 変換を左右する）も OS 差異の影響を受けやすいため 3 OS で検証する
-      crates/fandhe-browser-profile/* | .github/* | Cargo.toml | Cargo.lock | */Cargo.toml | \
-        rust-toolchain.toml | scripts/* | .gitattributes | *windows* | *unix* | *macos* | \
-        */platform/*)
-        xos=true
-        ;;
-    esac
     case "$path" in
       # docs/design/ はテスト・ビルドが include_str! / read_to_string で読む（host-api.schema.json・
       # mcp-token-reduction-report.md 等）ため、*.md・docs/* より前で rust 扱いにする
@@ -83,9 +70,8 @@ classify() {
   if [ "$seen" = false ]; then
     rust=true
     harness=true
-    xos=true
   fi
-  printf 'rust=%s\nharness=%s\nxos=%s\n' "$rust" "$harness" "$xos"
+  printf 'rust=%s\nharness=%s\n' "$rust" "$harness"
 }
 
 # 自己テスト。期待値は「rust=<値> harness=<値>」の 1 行表記で比較する。
@@ -101,44 +87,38 @@ self_test() {
       fail=1
     fi
   }
-  expect "docs-only" "rust=false harness=false xos=false" $'README.md\ndocs/setup/a.md\ndocs/spec'
-  expect "docs/design json is rust" "rust=true harness=false xos=false" $'docs/design/host-api.schema.json'
-  expect "docs/design md is rust" "rust=true harness=false xos=false" $'docs/design/x.md'
-  expect "docs-only (all allowlist kinds)" "rust=false harness=false xos=false" \
+  expect "docs-only" "rust=false harness=false" $'README.md\ndocs/setup/a.md\ndocs/spec'
+  expect "docs/design json is rust" "rust=true harness=false" $'docs/design/host-api.schema.json'
+  expect "docs/design md is rust" "rust=true harness=false" $'docs/design/x.md'
+  expect "docs-only (all allowlist kinds)" "rust=false harness=false" \
     $'CLAUDE.md\n.claude/rules/ci.md\n.agents/skills/a/SKILL.md\nLICENSE-MIT\nNOTICE\nLICENSE-THIRD-PARTY.md\nskills-lock.json\n.markdownlint.jsonc\n.yamllint\n.editorconfig-checker.json\ncommitlint.config.mjs\nlefthook.yml'
-  expect "md at any depth" "rust=false harness=false xos=false" $'a/b/c/d.md'
-  expect "harness-only (known dirs)" "rust=false harness=true xos=false" \
+  expect "md at any depth" "rust=false harness=false" $'a/b/c/d.md'
+  expect "harness-only (known dirs)" "rust=false harness=true" \
     $'harness/binary-size/README.md\nharness/cold-start/measure.sh\nharness/multi-instance-memory/measure.sh\nharness/render-screenshot/RUNBOOK.md'
-  expect "harness + docs" "rust=false harness=true xos=false" $'docs/a.md\nharness/cold-start/measure.sh'
-  expect "harness fixture read by Rust" "rust=true harness=true xos=false" $'harness/compat_fixtures/a.html'
-  expect "harness trace read by Rust" "rust=true harness=true xos=false" $'harness/playwright-trace/results/newpage-trace.jsonl'
-  expect "harness workspace member" "rust=true harness=true xos=false" $'harness/wpt_subset_runner/src/main.rs'
-  expect "unknown harness dir is rust (fail-closed)" "rust=true harness=true xos=false" $'harness/new-thing/run.sh'
-  expect "crates change" "rust=true harness=false xos=false" $'crates/fandhe-browser-core/src/lib.rs'
-  expect "md under crates is rust" "rust=true harness=false xos=false" $'crates/fandhe-browser-core/README.md'
-  expect ".github change" "rust=true harness=false xos=true" $'.github/workflows/ci.yml'
-  expect "mixed (docs + crates + harness)" "rust=true harness=true xos=false" $'docs/a.md\ncrates/a/src/lib.rs\nharness/cold-start/run.sh'
-  expect "Cargo.lock" "rust=true harness=false xos=true" $'Cargo.lock'
-  expect "scripts" "rust=true harness=false xos=true" $'scripts/ci-changes.sh'
-  expect "Makefile" "rust=true harness=false xos=false" $'Makefile'
-  expect "deny.toml" "rust=true harness=false xos=false" $'deny.toml'
-  expect "rust-toolchain.toml" "rust=true harness=false xos=true" $'rust-toolchain.toml'
-  expect "profiles" "rust=true harness=false xos=false" $'profiles/chrome.json'
-  expect "benches" "rust=true harness=false xos=false" $'benches/a/self-test.sh'
-  expect "tests" "rust=true harness=false xos=false" $'tests/a.rs'
-  expect "Dockerfile / compose.yaml" "rust=true harness=false xos=false" $'Dockerfile\ncompose.yaml'
-  expect "unknown path is rust (fail-closed)" "rust=true harness=false xos=false" $'unknown.txt'
-  expect "not in allowlist (.editorconfig)" "rust=true harness=false xos=false" $'.editorconfig'
-  expect ".gitattributes is xos" "rust=true harness=false xos=true" $'.gitattributes'
-  expect "empty input runs all (fail-closed)" "rust=true harness=true xos=true" ''
-  expect "blank lines only run all" "rust=true harness=true xos=true" $'\n\n'
-  expect "CRLF input" "rust=false harness=false xos=false" $'README.md\r\ndocs/a.md\r\n'
-  expect "no trailing newline" "rust=true harness=false xos=false" $'docs/a.md\ncrates/a.rs'
-  expect "profile crate is xos" "rust=true harness=false xos=true" $'crates/fandhe-browser-profile/src/lib.rs'
-  expect "crate Cargo.toml is xos" "rust=true harness=false xos=true" $'crates/fandhe-browser-ai/Cargo.toml'
-  expect "OS-named file is xos" "rust=true harness=false xos=true" $'crates/fandhe-browser-js/src/windows_job.rs'
-  expect "platform dir is xos" "rust=true harness=false xos=true" $'crates/fandhe-browser-core/src/platform/mod.rs'
-  expect "ordinary crate change is ubuntu only" "rust=true harness=false xos=false" $'crates/fandhe-browser-ai/src/lib.rs'
+  expect "harness + docs" "rust=false harness=true" $'docs/a.md\nharness/cold-start/measure.sh'
+  expect "harness fixture read by Rust" "rust=true harness=true" $'harness/compat_fixtures/a.html'
+  expect "harness trace read by Rust" "rust=true harness=true" $'harness/playwright-trace/results/newpage-trace.jsonl'
+  expect "harness workspace member" "rust=true harness=true" $'harness/wpt_subset_runner/src/main.rs'
+  expect "unknown harness dir is rust (fail-closed)" "rust=true harness=true" $'harness/new-thing/run.sh'
+  expect "crates change" "rust=true harness=false" $'crates/fandhe-browser-core/src/lib.rs'
+  expect "md under crates is rust" "rust=true harness=false" $'crates/fandhe-browser-core/README.md'
+  expect "mixed (docs + crates + harness)" "rust=true harness=true" $'docs/a.md\ncrates/a/src/lib.rs\nharness/cold-start/run.sh'
+  expect "Makefile" "rust=true harness=false" $'Makefile'
+  expect "deny.toml" "rust=true harness=false" $'deny.toml'
+  expect "profiles" "rust=true harness=false" $'profiles/chrome.json'
+  expect "benches" "rust=true harness=false" $'benches/a/self-test.sh'
+  expect "tests" "rust=true harness=false" $'tests/a.rs'
+  expect "Dockerfile / compose.yaml" "rust=true harness=false" $'Dockerfile\ncompose.yaml'
+  expect "unknown path is rust (fail-closed)" "rust=true harness=false" $'unknown.txt'
+  expect "not in allowlist (.editorconfig)" "rust=true harness=false" $'.editorconfig'
+  expect "CRLF input" "rust=false harness=false" $'README.md\r\ndocs/a.md\r\n'
+  expect "no trailing newline" "rust=true harness=false" $'docs/a.md\ncrates/a.rs'
+  expect ".github change" "rust=true harness=false" $'.github/workflows/ci.yml'
+  expect "Cargo.lock" "rust=true harness=false" $'Cargo.lock'
+  expect "scripts" "rust=true harness=false" $'scripts/ci-changes.sh'
+  expect "rust-toolchain.toml" "rust=true harness=false" $'rust-toolchain.toml'
+  expect "empty input runs all (fail-closed)" "rust=true harness=true" ''
+  expect "blank lines only run all" "rust=true harness=true" $'\n\n'
   if [ "$fail" -ne 0 ]; then
     echo "NG: ci-changes.sh self-test failed" >&2
     return 1
