@@ -303,11 +303,6 @@ fn is_ref_shaped(r: &str) -> bool {
     tail.is_empty() || tail.strip_prefix('-').is_some_and(all_digits)
 }
 
-/// `build_snapshot` が `Node` 化する子か（フィクスチャ制約下では要素かつ `head` でない）。
-fn is_snapshot_child(doc: &Document, id: NodeId) -> bool {
-    doc.is_element(id) && doc.local_name(id) != Some("head")
-}
-
 /// 圧縮表の行内操作要素（`a[href]`・`button`）か（フィクスチャでは `tabindex` 等を使わない）。
 fn is_row_control_element(doc: &Document, id: NodeId) -> bool {
     match doc.local_name(id) {
@@ -317,68 +312,97 @@ fn is_row_control_element(doc: &Document, id: NodeId) -> bool {
     }
 }
 
-/// DOM 上の `target` に対応する Snapshot 上の項目を、ルートからの添字で辿って返す。
+/// `head` 配下、または要素でないノードか（`build_snapshot` が `Node` 化しない DOM ノード）。
+fn is_outside_snapshot(doc: &Document, id: NodeId) -> bool {
+    !doc.is_element(id)
+        || doc.ancestors(id).any(|a| doc.local_name(a) == Some("head"))
+        || doc.local_name(id) == Some("head")
+}
+
+/// DOM 要素と Snapshot の通常ノードを文書順で対応付ける（折り畳み対応。TASK-23.3）。
+///
+/// 名前のない generic は `build_snapshot` が折り畳んで出力しないため、DOM の前順走査と
+/// Snapshot の前順走査を並走させ、次の Snapshot ノードと role・name・data_leaf が一致する
+/// DOM 要素だけを対にし、一致しない要素は折り畳まれたものとして読み飛ばす
+/// （折り畳み対象は generic・name 空・data_leaf なし。フィクスチャ制約下で操作要素の generic は
+/// 無いため、残る generic は data_leaf を持ち取り違えない）。圧縮表の内側の DOM 要素は
+/// Snapshot に通常ノードが無いため対にしない。先頭は `(doc.root(), &snapshot.tree)`。
+fn pair_nodes<'a>(doc: &Document, snapshot: &'a Snapshot) -> Vec<(NodeId, &'a Node)> {
+    let mut nodes: Vec<&Node> = Vec::new();
+    let mut stack = vec![&snapshot.tree];
+    while let Some(n) = stack.pop() {
+        nodes.push(n);
+        stack.extend(n.children.iter().rev());
+    }
+    let mut pairs: Vec<(NodeId, &Node)> = Vec::new();
+    let mut tables: Vec<NodeId> = Vec::new();
+    let mut cursor = nodes.iter().copied();
+    pairs.push((doc.root(), cursor.next().expect("ルートがある")));
+    let mut next = cursor.next();
+    for d in doc.descendants(doc.root()) {
+        if is_outside_snapshot(doc, d) || doc.ancestors(d).any(|a| tables.contains(&a)) {
+            continue;
+        }
+        let Some(n) = next else { break };
+        let role = compute_role(doc, d).map_or("generic", |r| r.as_str());
+        if n.role == role
+            && n.name == compute_name(doc, d).text
+            && n.data_leaf == classify_data_leaf(doc, d)
+        {
+            pairs.push((d, n));
+            if n.table.is_some() {
+                tables.push(d);
+            }
+            next = cursor.next();
+        }
+    }
+    pairs
+}
+
+/// DOM 上の `target` に対応する Snapshot 上の項目を返す。
 /// role・name・data_leaf の一致まで確認し、ずれは対応付け自体の不備として失敗させる。
 fn map_to_snapshot<'a>(doc: &Document, snapshot: &'a Snapshot, target: NodeId) -> Item<'a> {
-    // target からルートへ向かって、各段での「Snapshot 上の子としての添字」を集める。
-    let mut path = Vec::new();
-    // chain[k] は深さ k の Snapshot 項目に対応する DOM ノード（後で逆順にする）。
-    let mut chain = vec![target];
-    let mut cur = target;
-    while let Some(parent) = doc.parent(cur) {
-        let idx = doc
-            .children(parent)
-            .filter(|c| is_snapshot_child(doc, *c))
-            .position(|c| c == cur)
-            .expect("対象は親の Snapshot 対象の子に含まれる");
-        path.push(idx);
-        chain.push(parent);
-        cur = parent;
-    }
-    chain.reverse();
-    let mut item = Item::Node(&snapshot.tree);
-    let mut steps = path.iter().rev();
-    let mut depth = 0usize;
-    while let Some(idx) = steps.next() {
-        let Item::Node(node) = item else {
-            panic!("ヘッダセルの下に子はない");
-        };
-        if let Some(table) = &node.table {
-            if is_row_control_element(doc, target) {
-                // 圧縮した表の操作要素: 表内の `a[href]`・`button` の文書順位置で対応付ける
-                // （フィクスチャ制約: 全行が保持され、行・表の上限未満）。
-                let table_dom = *chain.get(depth).expect("表に対応する DOM がある");
-                let pos = doc
-                    .descendants(table_dom)
-                    .filter(|d| is_row_control_element(doc, *d))
-                    .position(|d| d == target)
-                    .expect("対象は表の操作要素に含まれる");
-                let control = table
-                    .rows
-                    .iter()
-                    .flat_map(|r| r.controls.iter())
-                    .nth(pos)
-                    .expect("位置に対応する操作要素がある");
-                item = Item::Control(control);
-            } else {
-                // 圧縮した表: 残りの経路（thead/tr/th）は最後の添字（列位置）のヘッダセルへ畳む。
-                let col = steps.next_back().unwrap_or(idx);
-                item = Item::Header(
-                    table
-                        .header
-                        .get(*col)
-                        .expect("列位置に対応するヘッダセルがある"),
-                );
-            }
-            break;
+    let pairs = pair_nodes(doc, snapshot);
+    let item = if let Some((_, n)) = pairs.iter().find(|(d, _)| *d == target) {
+        Item::Node(n)
+    } else {
+        // 圧縮した表の内側: 表ノードの祖先を探し、ヘッダセル・行内操作要素へ対応付ける。
+        let (table_dom, node) = pairs
+            .iter()
+            .find(|(d, n)| n.table.is_some() && doc.ancestors(target).any(|a| a == *d))
+            .expect("対象は Snapshot の通常ノードか圧縮表の内側にある");
+        let table = node.table.as_ref().expect("表ノード");
+        if is_row_control_element(doc, target) {
+            // 圧縮した表の操作要素: 表内の `a[href]`・`button` の文書順位置で対応付ける
+            // （フィクスチャ制約: 全行が保持され、行・表の上限未満）。
+            let pos = doc
+                .descendants(*table_dom)
+                .filter(|d| is_row_control_element(doc, *d))
+                .position(|d| d == target)
+                .expect("対象は表の操作要素に含まれる");
+            let control = table
+                .rows
+                .iter()
+                .flat_map(|r| r.controls.iter())
+                .nth(pos)
+                .expect("位置に対応する操作要素がある");
+            Item::Control(control)
+        } else {
+            // 圧縮した表: ヘッダセルは親（行）内での列位置で対応付ける。
+            let parent = doc.parent(target).expect("th には親がある");
+            let col = doc
+                .children(parent)
+                .filter(|c| doc.is_element(*c))
+                .position(|c| c == target)
+                .expect("対象は親の子に含まれる");
+            Item::Header(
+                table
+                    .header
+                    .get(col)
+                    .expect("列位置に対応するヘッダセルがある"),
+            )
         }
-        item = Item::Node(
-            node.children
-                .get(*idx)
-                .expect("添字に対応する Snapshot ノードがある"),
-        );
-        depth += 1;
-    }
+    };
     let expected_role = compute_role(doc, target).map_or("generic", |r| r.as_str());
     assert_eq!(item.role(), expected_role, "対応付けの role が一致する");
     assert_eq!(
@@ -412,10 +436,17 @@ fn first_path<'a>(root: Item<'a>, pred: fn(Item<'_>) -> bool) -> Option<Vec<usiz
 
 /// Snapshot 上の添字列を DOM へ逆引きする（`map_to_snapshot` の逆。フィクスチャ制約が前提）。
 fn dom_at_path(doc: &Document, snapshot: &Snapshot, path: &[usize]) -> Option<NodeId> {
-    let mut cur = doc.root();
+    let pairs = pair_nodes(doc, snapshot);
+    let dom_of = |n: &Node| {
+        pairs
+            .iter()
+            .find(|(_, p)| std::ptr::eq(*p, n))
+            .map(|(d, _)| *d)
+    };
     let mut node = &snapshot.tree;
     for idx in path {
         if let Some(table) = &node.table {
+            let cur = dom_of(node)?;
             let header_len = table.header.len();
             if *idx >= header_len {
                 // 圧縮した表の操作要素: 表内の `a[href]`・`button` を文書順で逆引きする。
@@ -425,19 +456,14 @@ fn dom_at_path(doc: &Document, snapshot: &Snapshot, path: &[usize]) -> Option<No
                     .nth(*idx - header_len);
             }
             // 圧縮した表のヘッダセル: 列位置の th を文書順で逆引きする。
-            let th = doc
+            return doc
                 .descendants(cur)
                 .filter(|d| doc.local_name(*d) == Some("th"))
-                .nth(*idx)?;
-            return Some(th);
+                .nth(*idx);
         }
         node = node.children.get(*idx)?;
-        cur = doc
-            .children(cur)
-            .filter(|c| is_snapshot_child(doc, *c))
-            .nth(*idx)?;
     }
-    Some(cur)
+    dom_of(node)
 }
 
 /// 1 タスクの判別結果を返す。
@@ -530,7 +556,11 @@ fn aisnap_3_discriminable_tasks_at_least_6_of_7() {
 #[test]
 fn aisnap_3_data_tasks_rely_on_data_leaf() {
     // 価格: 対象は (generic, "") で、同じ組の非価格ノードが木に存在する。
-    let doc = parse(EC_PRODUCT_LIST);
+    // 名前のない generic の折り畳み（TASK-23.3）で素のラッパーは消えるため、折り畳まれない
+    // 同形ノード（`tabindex` 付きの操作要素 div）を価格より前に置いて、role/name だけでは
+    // 価格を特定できないことを引き続き検証する（以前は html・body 等の generic が担っていた）。
+    let html = EC_PRODUCT_LIST.replace("<body>", r#"<body><div tabindex="0"></div>"#);
+    let doc = parse(&html);
     let snapshot = snap(&doc);
     let target = query_selector_str(&doc, doc.root(), "p.price_color")
         .expect("セレクタは有効")

@@ -162,20 +162,20 @@ fn fixtures_measured_with_concrete_values() {
         );
     }
     let by = |n: &str| rows.iter().find(|r| r.name == n).expect("row");
-    assert_eq!(by("example-minimal.html").snapshot_tokens, 118);
-    assert_eq!(by("login-form.html").snapshot_tokens, 376);
-    assert_eq!(by("wiki-portal-nav.html").snapshot_tokens, 4387);
+    assert_eq!(by("example-minimal.html").snapshot_tokens, 43);
+    assert_eq!(by("login-form.html").snapshot_tokens, 137);
+    assert_eq!(by("wiki-portal-nav.html").snapshot_tokens, 3715);
     assert!(by("large-table.html").snapshot_truncated);
     assert!(!by("login-form.html").snapshot_truncated);
 
     let s = summarize(&rows).expect("summary");
     assert_eq!(s.pages, 17);
-    // 実測値（小数 1 桁）。現行 snapshot は generic 折り畳み未実装のため
-    // 85% 目標（AISNAP-1）に届かない。判定は #97。
-    assert!((s.mean_reduction_pct - (-24.5)).abs() < 0.05, "{s:?}");
-    assert!((s.min_reduction_pct - (-146.9)).abs() < 0.05, "{s:?}");
-    assert!((s.max_reduction_pct - 91.4).abs() < 0.05, "{s:?}");
-    approx(s.median_snapshot_tokens, 4387.0);
+    // 実測値（小数 1 桁）。名前のない generic の折り畳み（TASK-23.3・#826）後も
+    // 85% 目標（AISNAP-1）には届かない。判定は #97。
+    assert!((s.mean_reduction_pct - 17.7).abs() < 0.05, "{s:?}");
+    assert!((s.min_reduction_pct - -146.7).abs() < 0.05, "{s:?}");
+    assert!((s.max_reduction_pct - 92.8).abs() < 0.05, "{s:?}");
+    approx(s.median_snapshot_tokens, 3715.0);
 }
 
 #[test]

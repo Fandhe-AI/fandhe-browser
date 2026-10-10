@@ -232,11 +232,6 @@ fn leaf(role: &str, name: &str, r: &str) -> Value {
     serde_json::json!({"role": role, "name": name, "ref": r, "children": []})
 }
 
-/// ref 付きノード期待 JSON（子あり）。
-fn node(role: &str, name: &str, r: &str, children: Vec<Value>) -> Value {
-    serde_json::json!({"role": role, "name": name, "ref": r, "children": children})
-}
-
 /// ルート（`document`。ref は `null`）を包むエンベロープ期待 JSON。
 fn envelope(url: &str, doc_name: &str, children: Vec<Value>) -> Value {
     serde_json::json!({
@@ -257,32 +252,18 @@ fn expected_article(url: &str) -> Value {
         "truncated_rows": 0,
         "children": [],
     });
+    // 名前のない generic（html・body・p）は折り畳まれる。ref は折り畳み前と同一（TASK-23.3）。
     envelope(
         url,
         "Rust 入門記事",
-        vec![node(
-            "generic",
-            "",
-            "e65477c205c50fefb",
-            vec![node(
-                "generic",
-                "",
-                "e9c1602d3222315df",
-                vec![
-                    leaf("banner", "", "e02d16e1795403182"),
-                    leaf("heading", "はじめに", "e300ae11bc252b0fd"),
-                    node(
-                        "generic",
-                        "",
-                        "edf7a99064530f860",
-                        vec![leaf("link", "公式ドキュメント", "ed45c1d22b4e186f4")],
-                    ),
-                    leaf("heading", "要点", "ee0714a175d20c8b2"),
-                    list,
-                    leaf("contentinfo", "", "ec0aa17bccd809080"),
-                ],
-            )],
-        )],
+        vec![
+            leaf("banner", "", "e02d16e1795403182"),
+            leaf("heading", "はじめに", "e300ae11bc252b0fd"),
+            leaf("link", "公式ドキュメント", "ed45c1d22b4e186f4"),
+            leaf("heading", "要点", "ee0714a175d20c8b2"),
+            list,
+            leaf("contentinfo", "", "ec0aa17bccd809080"),
+        ],
     )
 }
 
@@ -296,37 +277,14 @@ fn expected_form(url: &str) -> Value {
     envelope(
         url,
         "登録フォーム",
-        vec![node(
-            "generic",
-            "",
-            "e65477c205c50fefb",
-            vec![node(
-                "generic",
-                "",
-                "e9c1602d3222315df",
-                vec![
-                    node(
-                        "generic",
-                        "",
-                        "edf7a99064530f860",
-                        vec![
-                            leaf("generic", "", "ec49e5925d2775d07"),
-                            leaf("textbox", "ユーザー名", "e60f2465f276d6230"),
-                        ],
-                    ),
-                    node(
-                        "generic",
-                        "",
-                        "edf7a99064530f860-2",
-                        vec![node("generic", "", "ec49e5925d2775d07-2", vec![checkbox])],
-                    ),
-                    node("generic", "", "edf7a99064530f860-3", vec![radio]),
-                    leaf("combobox", "言語", "ea907649b0395e5e0"),
-                    leaf("button", "送信", "e764e1c46ab9a2bd6"),
-                    cancel,
-                ],
-            )],
-        )],
+        vec![
+            leaf("textbox", "ユーザー名", "e60f2465f276d6230"),
+            checkbox,
+            radio,
+            leaf("combobox", "言語", "ea907649b0395e5e0"),
+            leaf("button", "送信", "e764e1c46ab9a2bd6"),
+            cancel,
+        ],
     )
 }
 

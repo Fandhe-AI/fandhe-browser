@@ -37,7 +37,10 @@
 //!   生成器を実装済み（[`element_ref`]・[`RefAllocator`]）。木への組み込みは [`build_snapshot`]（TASK-11.7・Issue #76）で実装済み
 //! - DOM から `Snapshot` へのツリー構築統合（[`role::compute_role`]・
 //!   [`state::compute_state`] の呼び出し組み込みを含む）: TASK-11.7（Issue #76）で
-//!   実装済み（[`build_snapshot`]。generic の折り畳み等の簡約は未実装）
+//!   実装済み（[`build_snapshot`]）
+//! - 名前のない generic 系ノードの折り畳みと空ノードの剪定: TASK-23.3（`AISNAP-1`・
+//!   `AISNAP-10`・Issue #826）で実装済み（子は親の位置へ繰り上がり、残るノードの ref は
+//!   折り畳み前と同一）。`role` 属性つき要素は畳まない既知の制約あり（`build.rs` のモジュール doc）
 //! - データ葉（`isDataLeaf`）の判定結果の反映: TASK-13.3（`AISNAP-3`・Issue #88）で
 //!   実装済み（[`Node::data_leaf`]。算出は [`crate::data_leaf::classify_data_leaf`]。
 //!   印を付けるだけで、簡約・剪定への利用は後続タスク）。引用要素・地の文クラスへの拡充結果の
@@ -85,8 +88,8 @@ pub use state::{CheckedState, State, compute_state};
 ///   `None` は ref を振らないノード（例: document ルート）を表す。
 ///   値の形式は `e<16hex>[v<n>][-n]`（[`RefAllocator`] が発行。TASK-11.6・Issue #75・
 ///   `AISNAP-10`）。木への割り当ては [`build_snapshot`]（TASK-11.7）が担う
-/// - `children`: DOM の親子関係に対応する子ノード。構築は
-///   [`build_snapshot`]（TASK-11.7・Issue #76）
+/// - `children`: DOM の親子関係に対応する子ノード（名前のない generic を折り畳んだ場合、
+///   その子は親へ繰り上がる。TASK-23.3）。構築は [`build_snapshot`]（TASK-11.7・Issue #76）
 /// - `state`: 要素の状態（`disabled`・`checked`）。算出は
 ///   [`state::compute_state`]（TASK-11.5・Issue #74）が担う。`Node::new` の
 ///   既定値は `State::default()`（`disabled: false`・`checked: None`）
@@ -120,7 +123,8 @@ pub struct Node {
     /// role + name シグネチャによる再特定要求（`AISNAP-10`）。
     /// 形式は `e<16hex>[v<n>][-n]`。生成は [`RefAllocator`]（TASK-11.6・Issue #75）。
     pub r#ref: Option<String>,
-    /// DOM の親子関係に対応する子ノード。構築は [`build_snapshot`]（TASK-11.7・Issue #76）。
+    /// DOM の親子関係に対応する子ノード（折り畳まれた generic の子は親へ繰り上がる。TASK-23.3）。
+    /// 構築は [`build_snapshot`]（TASK-11.7・Issue #76）。
     pub children: Vec<Node>,
     /// 要素の状態（`disabled`・`checked`）。算出は
     /// [`state::compute_state`]（TASK-11.5・Issue #74）。
