@@ -62,9 +62,9 @@ make check-mcp-envelope     # 実 mcp バイナリでの e2e smoke（`make ci` �
 
 ### 3 OS 一級対応
 
-- CI は Linux・macOS・Windows の 3 OS ネイティブランナーでビルド・テストする（クロスコンパイル前提にしない）
-- 3 OS の実行タイミングはオーナー判断（2026-10-10）で「main への push・release 前・OS 依存の変更を含む PR（`changes` ジョブの `xos=true`）」とし、それ以外の PR は ubuntu のみで検証する（`.claude/rules/ci.md`「3 OS CI」）。既存の OS 分岐の中身だけを変える PR などの OS 差異は main への push まで判明しない（オーナーが待ち時間との引き換えで判断した残存リスク）
-- OS 固有のパス・大文字小文字非区別ファイルシステム・改行コードに関わる変更は、PR 本文に 3 OS での実行結果が記載されているか（同じ PR で CI 設定を変更する場合はその diff で 3 OS のジョブが `xos=true` 時に実行されるか）を確認する
+- PR の CI は ubuntu のネイティブ実行のみで、macOS・Windows のネイティブジョブは skipped になる。代わりに `cross-target-check` が Linux 上で `aarch64-apple-darwin`・`x86_64-pc-windows-msvc` 向けに `cargo check` / `cargo clippy` を行う。ただし `ring`（rustls 経由）がクロスコンパイルできないため、検査対象は `fandhe-browser-js`・`-profile`・`-mcp`・`-render` に限られ、core・ai・cdp・cli の OS 固有分岐は対象外（`.claude/rules/ci.md`「3 OS CI」）
+- main への push と release 前（`gh workflow run ci.yml --ref <ref>` の `workflow_dispatch`）には、Linux・macOS・Windows の 3 OS ネイティブランナーでビルド・テストする（オーナー判断 2026-10-10）。PR で見落とすのは macOS・Windows 固有の実行時の誤りと、上記の対象外 crate の OS 固有コンパイル・lint の誤りで、main への push 後に判明する（待ち時間と引き換えにオーナーが判断した残存リスク）。main で macOS・Windows だけが失敗した場合は修正 PR で直す
+- main への新しい push は実行中の古い main の 3 OS の CI を取り消す（concurrency）。取り消された commit の macOS・Windows の結果は残らず、後続 commit の 3 OS 実行で検出する
 
 ## レビュー観点
 
