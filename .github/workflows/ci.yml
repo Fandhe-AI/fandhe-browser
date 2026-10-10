@@ -33,6 +33,8 @@ on:
 permissions:
   contents: read
 
+# 同じ PR・同じ ref（main への push を含む）の新しい run が始まったら、実行中の古い run は
+# 中止して最新のコミットだけを検証する（main へ続けてマージされても 3 OS の run は 1 本に保つ）
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -53,6 +55,7 @@ jobs:
     outputs:
       rust: ${{ steps.detect.outputs.rust }}
       harness: ${{ steps.detect.outputs.harness }}
+      xos: ${{ steps.detect.outputs.xos }}
     defaults:
       run:
         shell: bash
@@ -74,36 +77,52 @@ jobs:
           emit() {
             echo "rust=$1" >> "$GITHUB_OUTPUT"
             echo "harness=$2" >> "$GITHUB_OUTPUT"
-            echo "changes: rust=$1 harness=$2 (${3})"
+            echo "xos=$3" >> "$GITHUB_OUTPUT"
+            echo "changes: rust=$1 harness=$2 xos=$3 (${4})"
           }
           if [ "$EVENT_NAME" != "pull_request" ]; then
-            emit true true "event=$EVENT_NAME"
+            emit true true true "event=$EVENT_NAME"
             exit 0
           fi
           if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
-            emit true true "base/head SHA unavailable"
+            emit true true true "base/head SHA unavailable"
             exit 0
           fi
           if ! files="$(git -c core.quotepath=false diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA")"; then
             echo "::warning::git diff failed; running all jobs (fail-closed)"
-            emit true true "git diff failed"
+            emit true true true "git diff failed"
             exit 0
           fi
           echo "changed files:"
           printf '%s\n' "$files"
           if ! result="$(printf '%s\n' "$files" | bash scripts/ci-changes.sh)"; then
             echo "::warning::scripts/ci-changes.sh failed; running all jobs (fail-closed)"
-            emit true true "classifier failed"
+            emit true true true "classifier failed"
             exit 0
           fi
           # 出力は厳密な 2 行形式のみ受理する。欠落・想定外の値は下流ジョブが
           # skipped（= 成功扱い）になる fail-open を招くため全実行へ倒す
           if [ "$(printf '%s\n' "$result" | grep -cxE 'rust=(true|false)')" -ne 1 ] \
             || [ "$(printf '%s\n' "$result" | grep -cxE 'harness=(true|false)')" -ne 1 ] \
-            || [ "$(printf '%s\n' "$result" | wc -l | tr -d ' ')" -ne 2 ]; then
+            || [ "$(printf '%s\n' "$result" | grep -cxE 'xos=(true|false)')" -ne 1 ] \
+            || [ "$(printf '%s\n' "$result" | wc -l | tr -d ' ')" -ne 3 ]; then
             echo "::warning::unexpected classifier output; running all jobs (fail-closed)"
-            emit true true "unexpected output"
+            emit true true true "unexpected output"
             exit 0
+          fi
+          # Rust ソースの差分に OS 分岐（cfg(target_os / windows / unix / target_family)）の
+          # 追加・削除があれば、パスによらず PR でも 3 OS を走らせる
+          if ! diff_body="$(git diff --no-renames -U0 "$BASE_SHA...$HEAD_SHA" -- '*.rs')"; then
+            echo "::warning::git diff (content) failed; running all jobs (fail-closed)"
+            emit true true true "git diff content failed"
+            exit 0
+          fi
+          os_cfg_re='cfg!?\(.*(target_os|target_family|windows|unix)'
+          # grep -q は早期終了で上流が SIGPIPE になり pipefail 下で偽になるため、件数で判定する
+          os_cfg_hits="$(printf '%s\n' "$diff_body" | grep -E '^[+-]' | grep -cE "$os_cfg_re" || true)"
+          if [ "${os_cfg_hits:-0}" != "0" ]; then
+            result="$(printf '%s\n' "$result" | sed 's/^xos=false$/xos=true/')"
+            echo "OS-specific cfg change detected; xos=true"
           fi
           printf '%s\n' "$result" >> "$GITHUB_OUTPUT"
           echo "changes: $(printf '%s' "$result" | tr '\n' ' ')"
@@ -273,7 +292,7 @@ jobs:
 
   rust-test-macos:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    if: ${{ (needs.changes.outputs.rust == 'true') && needs.changes.outputs.xos == 'true' }}
     runs-on: macos-latest
     timeout-minutes: 60
     permissions:
@@ -313,7 +332,7 @@ jobs:
 
   rust-test-windows:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    if: ${{ (needs.changes.outputs.rust == 'true') && needs.changes.outputs.xos == 'true' }}
     runs-on: windows-latest
     timeout-minutes: 90
     permissions:
@@ -427,7 +446,7 @@ jobs:
 
   rust-features-macos:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    if: ${{ (needs.changes.outputs.rust == 'true') && needs.changes.outputs.xos == 'true' }}
     runs-on: macos-latest
     timeout-minutes: 60
     permissions:
@@ -504,7 +523,7 @@ jobs:
 
   rust-features-windows:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    if: ${{ (needs.changes.outputs.rust == 'true') && needs.changes.outputs.xos == 'true' }}
     runs-on: windows-latest
     timeout-minutes: 120
     permissions:
@@ -727,7 +746,9 @@ jobs:
 
   harness-macos:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.harness == 'true' }}
+    if: >-
+      ${{ (needs.changes.outputs.rust == 'true' || needs.changes.outputs.harness == 'true')
+      && needs.changes.outputs.xos == 'true' }}
     runs-on: macos-latest
     timeout-minutes: 60
     permissions:
@@ -865,7 +886,9 @@ jobs:
 
   harness-windows:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.harness == 'true' }}
+    if: >-
+      ${{ (needs.changes.outputs.rust == 'true' || needs.changes.outputs.harness == 'true')
+      && needs.changes.outputs.xos == 'true' }}
     runs-on: windows-latest
     timeout-minutes: 120
     permissions:
@@ -1008,7 +1031,7 @@ jobs:
   # 出る check-run はすべて required にする前提のため、windows-servo-prereqs も required に含める。
   windows-servo-prereqs:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    if: ${{ (needs.changes.outputs.rust == 'true') && needs.changes.outputs.xos == 'true' }}
     runs-on: windows-latest
     # VS Installer の modify に時間がかかりうるため 30 分。ハング防止（NFR-10）
     timeout-minutes: 30
