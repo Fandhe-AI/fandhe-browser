@@ -18,7 +18,7 @@
 - トークナイザ: `cl100k_base`
 - 系列: rawHtml = 生 HTML、direct = 方式 B 本体（応答本文）、mcpText = MCP の `result.content[0].text`、mcpLine = JSON-RPC 応答行全体（改行除く）
 - 増分: envelope = mcpLine - direct。envelopePct = envelope / direct * 100。削減率 = `(1 - 系列 / raw) * 100`
-- レイテンシ増分（MCP - 直接）は全体で p50 1.113 ms、p95 2.987 ms、平均 1.229 ms。小ページ（example-minimal・login-form）は約 0.1 ms、wikipedia-article は p50 2.680 ms
+- レイテンシ増分: 同じ反復番号どうしの MCP - 直接。MCP 経路は mcp から ai ホストへの HTTP ホップを含む。パーセンタイルは nearest-rank。反復は 1 fixture あたり 100 回（ウォームアップ別）
 - 注記: JSON-RPC 応答行のバイト数は request id の桁数で変わるため、表には載せない（TSV 出力には出る）。トークン数は id が 3 桁以内なら変わらない
 - 同期: トークンブロックは `render_markdown` の出力を逐語で貼ったもので、e2e テスト `plug5_e2e_mcp_snapshot_matches_direct_and_envelope_is_positive` が一致を検査する。snapshot の形が変わったらテストが落ちるので、上記コマンドで再生成して貼り直す。レイテンシは環境依存のため検査しない
 
@@ -81,7 +81,7 @@
 
 - 方式 B 本体の対生 HTML 削減率は 5 サイト中 3 サイトで正（example-minimal 19.4%・wikipedia-article 26.9%・login-form 29.6%）、hn-list（-59.9%）・mdn-docs（-46.3%）は負（平均 -6.1%、範囲 -59.9% から 29.6%）。名前のない generic の折り畳みと空ノードの剪定（TASK-23.3）で改善したが、現行の snapshot が JSON ツリー形式のため一部ページでは生 HTML より大きい（`AISNAP-6`・TASK-19 の論点）。MCP 応答行全体では平均 -28.1%
 - エンベロープ（JSON-RPC フレーム等）のトークン増分は 41 から 6105 トークン（平均 2312.6）、方式 B 本体に対して 10.9% から 49.4%（平均 23.8%）。小さいページほど比率が大きい
-- レイテンシ増分（MCP - 直接）は全体で p50 1.330 ms、p95 3.867 ms、平均 1.458 ms。小ページ（example-minimal・login-form）は約 0.14 ms、wikipedia-article は p50 3.719 ms
+- レイテンシ増分（MCP - 直接）は全体で p50 1.113 ms、p95 2.987 ms、平均 1.229 ms。小ページ（example-minimal・login-form）は約 0.1 ms、wikipedia-article は p50 2.680 ms
 - PLUG-4 レポートは MCP の text コンテンツのみを数えるが、本レポートの mcpLine は JSON-RPC 応答行全体を数える。両レポートの数値は定義が異なる
 - 入力は合成 fixture であり、実ページの値ではない。レイテンシは測定環境に依存する
 
