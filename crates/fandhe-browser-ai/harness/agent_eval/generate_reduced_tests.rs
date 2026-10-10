@@ -26,9 +26,9 @@ use fandhe_browser_core::dom::{Document, NodeId};
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
 use fandhe_browser_core::query::query_selector_all_str;
 use generate_reduced::{
-    InputMode, generate_all, generate_page, generate_raw_dom_all, generate_raw_dom_page,
-    golden_locators, render_golden_refs_json, resolve_golden, task_inputs, task_pages,
-    write_raw_dom_inputs,
+    GenerateError, InputMode, generate_all, generate_page, generate_raw_dom_all,
+    generate_raw_dom_page, golden_locators, render_golden_refs_json, resolve_golden, task_inputs,
+    task_pages, write_raw_dom_inputs,
 };
 use std::path::PathBuf;
 use tasks::{GOLDEN, TASKS};
@@ -394,4 +394,18 @@ fn aisnap9_write_raw_dom_inputs_writes_under_out_dir() {
     }
     assert_eq!(std::fs::read_dir(&out).expect("dir").count(), 13);
     std::fs::remove_dir_all(&out).expect("cleanup");
+}
+
+#[test]
+fn aisnap9_write_failure_reports_cannot_write_not_read() {
+    // out_dir の親が通常ファイルだと create_dir_all が失敗する（書き込み系エラー）。
+    let base = std::env::temp_dir().join(format!("fandhe-aisnap9-wf-{}", std::process::id()));
+    std::fs::write(&base, b"x").expect("setup");
+    let out = base.join("sub");
+    let err = write_raw_dom_inputs(&fixtures(), &out).expect_err("must fail");
+    assert!(matches!(err, GenerateError::Write { .. }), "{err}");
+    let msg = err.to_string();
+    assert!(msg.starts_with("cannot write "), "{msg}");
+    assert!(!msg.contains("cannot read"), "{msg}");
+    std::fs::remove_file(&base).expect("cleanup");
 }

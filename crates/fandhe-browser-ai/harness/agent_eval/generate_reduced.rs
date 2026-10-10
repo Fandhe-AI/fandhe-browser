@@ -40,6 +40,11 @@ pub enum GenerateError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// 出力先ディレクトリ作成・ファイル書き込みの失敗（`Io` は読み取り失敗専用）。
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     Parse {
         page: String,
         message: String,
@@ -65,6 +70,7 @@ impl fmt::Display for GenerateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { path, source } => write!(f, "cannot read {}: {source}", path.display()),
+            Self::Write { path, source } => write!(f, "cannot write {}: {source}", path.display()),
             Self::Parse { page, message } => write!(f, "parse failed for {page}: {message}"),
             Self::Snapshot { page, message } => write!(f, "snapshot failed for {page}: {message}"),
             Self::Selector {
@@ -420,14 +426,14 @@ pub fn write_raw_dom_inputs(
     fixtures_dir: &Path,
     out_dir: &Path,
 ) -> Result<Vec<PathBuf>, GenerateError> {
-    std::fs::create_dir_all(out_dir).map_err(|source| GenerateError::Io {
+    std::fs::create_dir_all(out_dir).map_err(|source| GenerateError::Write {
         path: out_dir.to_path_buf(),
         source,
     })?;
     let mut paths = Vec::new();
     for p in generate_raw_dom_all(fixtures_dir)? {
         let path = out_dir.join(format!("{}.html", p.page));
-        std::fs::write(&path, p.html.as_bytes()).map_err(|source| GenerateError::Io {
+        std::fs::write(&path, p.html.as_bytes()).map_err(|source| GenerateError::Write {
             path: path.clone(),
             source,
         })?;
