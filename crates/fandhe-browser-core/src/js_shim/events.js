@@ -203,13 +203,15 @@
                     state.immediateStopped = true;
                 }
             };
-            defineProperty(event, 'currentTarget', {
-                get: function () {
-                    return state.current;
-                },
-                enumerable: true,
-                configurable: false
-            });
+            // 記述子は null プロトタイプで作る（Object.prototype.value 等の継承汚染で
+            // get と value が混在して TypeError になるのを防ぐ。JS-4）。
+            var descriptor = createObject(null);
+            descriptor.get = function () {
+                return state.current;
+            };
+            descriptor.enumerable = true;
+            descriptor.configurable = false;
+            defineProperty(event, 'currentTarget', descriptor);
             if (eventName === 'DOMContentLoaded') {
                 fire(documentTarget, global.document, event, eventName, state);
                 if (!state.propagationStopped) {

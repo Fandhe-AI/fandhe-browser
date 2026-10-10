@@ -473,6 +473,23 @@ pub fn run(engine: &str) {
         vec!["first", "second", "third"]
     );
 
+    eprintln!("case: JS-4 polluted Object.prototype descriptor fields do not drop listeners");
+    let html = "<body><script>\
+        document.addEventListener('DOMContentLoaded', function () { console.log('first'); });\
+        window.addEventListener('load', function () { console.log('second'); });\
+        Object.prototype.value = 1;\
+        Object.prototype.writable = true;\
+        </script></body>";
+    let out = run_page(engine, html, &opts);
+    assert_eq!(
+        out.bridge_diagnostics()
+            .console_messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second"]
+    );
+
     #[cfg(target_os = "linux")]
     {
         eprintln!("case: JS-6 no child process remains");
