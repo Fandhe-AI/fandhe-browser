@@ -172,11 +172,17 @@ const JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 /// 検証済み Host と [`CdpState::browser_id`] から組み立てる。
 pub(crate) fn router(state: Arc<CdpState>) -> Router {
     let version_state = Arc::clone(&state);
+    let version_slash_state = Arc::clone(&state);
     let list_state = Arc::clone(&state);
     let json_state = state;
     Router::new()
         .route("GET", "/json/version", move |head, _| {
             version_response(&version_state, head)
+        })
+        // Playwright 1.63.0 の `urlToWSEndpoint` は末尾 `/` 付きで要求する互換ルート
+        // （TASK-43.3a・`CDP-2`）。パスの正規化はせず明示登録し、他の `/json/*` には広げない。
+        .route("GET", "/json/version/", move |head, _| {
+            version_response(&version_slash_state, head)
         })
         .route("GET", "/json/list", move |head, _| {
             list_response(&list_state, head)

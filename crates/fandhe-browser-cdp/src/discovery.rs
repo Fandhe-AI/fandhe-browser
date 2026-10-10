@@ -35,8 +35,13 @@ pub(crate) const BROWSER_WS_PATH_PATTERN: &str = "/devtools/browser/{id}";
 /// `webSocketDebuggerUrl` のパス接頭辞（[`BROWSER_WS_PATH_PATTERN`] の `{id}` 直前まで）。
 const BROWSER_WS_PATH_PREFIX: &str = "/devtools/browser/";
 
-/// `Protocol-Version` に返す CDP のバージョン。
-const PROTOCOL_VERSION: &str = "1.3";
+/// `Protocol-Version`・`Browser.getVersion` の `protocolVersion` に返す CDP のバージョン。
+pub(crate) const PROTOCOL_VERSION: &str = "1.3";
+
+/// 製品名と版（`fandhe-browser/<版>`）。`/json/version` の `Browser`・`User-Agent` と
+/// `Browser.getVersion`（[`crate::playwright_compat`]）で共有し、版表記のずれを防ぐ（`CDP-2`・`SEC-2`）。
+/// Chrome / Chromium を装う値は含めない。
+pub(crate) const PRODUCT: &str = concat!("fandhe-browser/", env!("CARGO_PKG_VERSION"));
 
 /// `/json/version` の本体（JSON）を作る。
 ///
@@ -47,11 +52,10 @@ pub(crate) fn version_body(
     authority: &Authority,
     browser_id: &BrowserId,
 ) -> Result<Vec<u8>, serde_json::Error> {
-    let product = concat!("fandhe-browser/", env!("CARGO_PKG_VERSION"));
     let body = json!({
-        "Browser": product,
+        "Browser": PRODUCT,
         "Protocol-Version": PROTOCOL_VERSION,
-        "User-Agent": product,
+        "User-Agent": PRODUCT,
         "webSocketDebuggerUrl": format!(
             "ws://{}{}{}",
             authority.as_str(),

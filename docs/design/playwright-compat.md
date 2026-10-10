@@ -29,8 +29,8 @@ Playwright のソースは長く引用せず、関数名と要約に留める。
 
 | 段階 | 現状 | 根拠 |
 | ---- | ---- | ---- |
-| `connectOverCDP(http://…)` | 失敗。`GET /json/version/`（末尾スラッシュ付き）が 404。CDP メッセージ 0 件 | A: seq 1〜3 |
-| `connectOverCDP(ws://…)` | 失敗。最初の `Browser.getVersion` が `-32601`（`method not implemented`） | A: seq 4〜6 |
+| `connectOverCDP(http://…)` | 失敗。`/json/version/` は 200（TASK-43.3a で解消）。`Browser.getVersion` は成功し、次の `Target.setAutoAttach`・`Browser.setDownloadBehavior` が `-32601` | A（再取得後）: seq 1〜9 |
+| `connectOverCDP(ws://…)` | 失敗。`Browser.getVersion` は成功し（TASK-43.3a で解消）、次の `Target.setAutoAttach`・`Browser.setDownloadBehavior` が `-32601` | A（再取得後）: seq 10〜16 |
 | `newContext()` | 未到達（トレースに該当メッセージなし） | A + B |
 | `newPage()` | 未到達（同上） | A + B |
 
@@ -116,7 +116,7 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
 
 各段階の実装後に `make trace-playwright`（TASK-43.1）で実測し、結果を見て次段階の内容を見直してから進む。
 
-- 実測で停止を確認済みなのは段階 1 の 2 か所のみ（上記 #1・#2。`newpage-trace.jsonl` の seq 2〜3 と seq 4〜6）
+- 実測で停止を確認済みなのは段階 1 の 2 か所のみ（上記 #1・#2。TASK-43.3a で両方解消済み。`newpage-trace.jsonl` の seq 2〜3 と seq 4〜6）
   - 停止 1: `GET /json/version/`（末尾スラッシュ付き）が 404（`connectOverCDP(http://…)`）
   - 停止 2: `Browser.getVersion` が `-32601`（`connectOverCDP(ws://…)`）
 - 段階 2 以降は**予測**（B: ソース読解）であり、各段階の実測で見直す。下表の「触る箇所」も予測を含む
@@ -130,6 +130,19 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
 
 段階 2 の `Target.*` は、実測前の予測として Playwright 1.63.0 の初期化を満たす最小集合を挙げたもの。
 どのメソッドを「実装」し、どのメソッドを「明示エラー」のままにするかは、段階 2・3 の実測後に決める（未決定）。
+
+### 段階 1 の実施結果（TASK-43.3a・#804。実測 A）
+
+- `/json/version/` を `router` へ明示登録し、`Browser.getVersion` を `playwright_compat.rs` に追加した。
+  `product`・`userAgent` は `/json/version` と共通の定数（`discovery::PRODUCT`）で `fandhe-browser/<版>`、
+  `protocolVersion` は `1.3`。`revision`・`jsVersion` は実値を参照できないため**省いたが、
+  Playwright 1.63.0 は通過した**（フォールバックの空文字は使っていない。`SEC-2`・`REPAIR-3`）
+- `make trace-playwright` の再取得結果: 両 `connectOverCDP` が `Browser.getVersion` を通過し、
+  次に同時送信される `Target.setAutoAttach`（id 2）と `Browser.setDownloadBehavior`（id 3）が
+  `-32601` となり `Protocol error (Target.setAutoAttach)` で失敗する（seq 5〜9・12〜16）。
+  これは段階 2 の予測（#3・#4）と一致した
+- 次の停止箇所は段階 2 の `Target.setAutoAttach` 以降。`Target.getTargetInfo` は上記失敗により未送信で、
+  段階 2 の実測で確認する
 
 ### 原則
 
