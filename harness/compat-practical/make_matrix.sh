@@ -10,7 +10,7 @@
 # 実測値は入力のまま写し、補正・推測・書き換えをしない（REPAIR-3: 達成を装わない）。
 #
 # 呼び出し元: 手動実行（再計測後の再生成）、self-test.sh（合成入力と実入力）、Makefile の
-# check-compat-practical と CI の compat-regression ジョブ（--validate-only で入力の整合のみ検査）。
+# check-compat-practical と CI の harness-* ジョブの [compat-regression] ステップ（--validate-only で入力の整合のみ検査）。
 #
 # 使い方: make_matrix.sh [--tasks P] [--core P] [--chromium P] [--out P] [--validate-only]
 # 終了コード: 0=生成（--validate-only では検証）完了  1=書き込み失敗  2=入力・使用エラー

@@ -6,7 +6,7 @@
 # `--input` 経由で record.sh を実行し、終了コードと追記内容を具体値で
 # 検証する。実際に `cargo bench` を実行しないため CI で高速に回せる。
 #
-# 呼び出し元: .github/workflows/ci.yml の bench-record-selftest ジョブ、
+# 呼び出し元: .github/workflows/ci.yml の harness-* ジョブの [bench-record-selftest] ステップ、
 # Makefile の check-bench-record ターゲット。
 set -euo pipefail
 
