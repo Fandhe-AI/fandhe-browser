@@ -12,7 +12,8 @@
 //! TASK-22.1（`AISNAP-9`・Issue #124・`MS-2`）: 比較相手の「生 DOM 直渡し」入力もここで生成する
 //! （`generate_raw_dom_page` / `task_inputs`）。Snapshot は通さず、`AISNAP-15` の分母と同じ
 //! `serialize_raw_dom` を使うため、取り込み側のルートは `crate::raw_dom` も宣言すること。
-//! 生 DOM 方式の回答（`{selector, index}`）の採点は #805（TASK-22.1b）の担当で、本ファイルは扱わない。
+//! 生 DOM 方式の回答（`{selector, index}`）の採点は `score.rs`（#805・TASK-22.1b）が担当し、
+//! 本ファイルは採点用に再パースした Document（`raw_dom_documents`）を返すところまでを持つ。
 //!
 //! 暫定（REPAIR-3）: 簡約表現の形式は `snapshot_text` の暫定行形式であり、`AISNAP-8` が前提とする
 //! `GET /ai/snapshot` の確定応答ではない。TASK-19・`AISNAP-6` の確定後に `snapshot_text` 側を
@@ -414,6 +415,26 @@ pub fn task_inputs(fixtures_dir: &Path, mode: InputMode) -> Result<Vec<TaskInput
             mode,
             input: cache.get(t.page).cloned().unwrap_or_default(),
         });
+    }
+    Ok(out)
+}
+
+/// 生 DOM 入力（`serialize_raw_dom` の出力）を再パースした Document をページ別に返す
+/// （`AISNAP-9`・TASK-22.1b・#805）。
+///
+/// 回答者が見たのは生 DOM 文字列なので、生 DOM 方式の回答と golden のロケータはこの Document 上で
+/// 解決して要素同一性で照合する（`score::resolve_raw_dom`）。golden ロケータが再パース後も同じ要素を
+/// 指すことは `aisnap9_golden_locators_survive_raw_dom_roundtrip` で固定している。
+pub fn raw_dom_documents(fixtures_dir: &Path) -> Result<BTreeMap<String, Document>, GenerateError> {
+    let mut out = BTreeMap::new();
+    for p in generate_raw_dom_all(fixtures_dir)? {
+        let doc = parse_document(&p.html, &ParseOptions::default())
+            .map(|r| r.document)
+            .map_err(|e| GenerateError::Parse {
+                page: p.page.clone(),
+                message: e.to_string(),
+            })?;
+        out.insert(p.page, doc);
     }
     Ok(out)
 }
