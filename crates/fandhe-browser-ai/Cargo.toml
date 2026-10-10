@@ -110,6 +110,11 @@ path = "harness/agent_eval/generate_reduced_tests.rs"
 name = "agent_eval_score"
 path = "harness/agent_eval/score_tests.rs"
 
+# 簡約・生 DOM 両方式の比較実行ハーネス（TASK-22.2・Issue #125・AISNAP-9）。依存は増やさない。
+[[test]]
+name = "agent_eval_compare"
+path = "harness/agent_eval/compare_tests.rs"
+
 # 方式 B 本体の MCP エンベロープ測定ハーネス（TASK-97.1・Issue #385・PLUG-5・MS-9）。
 # mcp バイナリ（別プロセス）を stdio で駆動するため mcp crate へは依存せず、依存も増やさない。
 # 実行は `make measure-mcp-envelope`。unix 以外では測定不能として非 0 で終了する。

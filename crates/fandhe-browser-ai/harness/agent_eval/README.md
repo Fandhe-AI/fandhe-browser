@@ -15,6 +15,8 @@ TASK-21.1（MS-2・`AISNAP-8`・Issue #119）。簡約表現と生 HTML をエ�
 | `generate_reduced_tests.rs` | `[[test]] agent_eval_generate_reduced`。25 タスク全件の生成・生成物一致を固定する |
 | `score.rs` | 回答の採点・種別別集計・70% 判定（TASK-21.3・#121。純ロジック） |
 | `score_tests.rs` | `[[test]] agent_eval_score`。合成回答で採点器を検証する（実回答は含まない） |
+| `compare.rs` | 比較実行の支援（TASK-22.2・#125）。割付表・指示テンプレート・実行パケット生成・回答の回収と完全性検査。LLM は呼ばない |
+| `compare_tests.rs` | `[[test]] agent_eval_compare`。合成回答だけで割付・テンプレート・回収を検証する |
 | `reduced/<page>.txt` | エージェントへ渡す簡約表現（`tasks.rs` が指す 13 ページ分）。生成物。データ葉（価格・引用・地の文クラス）の本文と `option` のラベル・value は snapshot が持たないため、生成器が DOM から補う（回答可能性の確保） |
 | `golden-refs.json` | 採点側。**エージェントへ渡さない**。golden の各ロケータを解決した ref（解決不能は空配列）。生成物 |
 
@@ -117,7 +119,7 @@ AGENT_EVAL_ANSWERS=/abs/path/answers.json cargo test -p fandhe-browser-ai --test
 
 - 生 DOM は `AISNAP-15` の分母 `serialize_raw_dom`（`benches/token_reduction/raw_dom.rs`）と同一定義。`script`・`style`・`noscript`・`svg`・`link`・`meta` を除去した `body` の outerHTML 相当で、成形・要約はしない。
 - 暫定（REPAIR-3）: jsdom の outerHTML とは完全一致せず、`<template>` の中身は含まない。
-- 回答形式の提示文は持たない（#125・TASK-22.2 の指示テンプレートの責務）。golden 情報は入力に含めない。
+- 回答形式の提示文は `task_inputs` 自体は持たない。`compare.rs`（#125・TASK-22.2）の指示テンプレートが付ける。golden 情報は入力に含めない。
 - 検証 `aisnap9_golden_locators_survive_raw_dom_roundtrip`: 生 DOM を再パースしても、全 golden ロケータ `{selector, index}` が原本と同じ要素（local name・属性・正規化テキスト）を指す。生 DOM 方式の回答を golden で採点できる前提の確認。
 - 生成物はコミットしない。置き場所と `{selector, index}` 回答の採点は次節（#805・TASK-22.1b）で確定した。
 
@@ -154,3 +156,25 @@ AGENT_EVAL_ANSWERS=/abs/path/answers.json cargo test -p fandhe-browser-ai --test
 # 実回答（生 DOM 方式）を採点して結果を stdout へ出す（リポ内へは書かない）
 AGENT_EVAL_RAW_ANSWERS=/abs/path/raw-answers.json cargo test -p fandhe-browser-ai --test agent_eval_score -- --nocapture aisnap9_score_raw_answers_if_requested
 ```
+
+## 比較実行（TASK-22.2）
+
+`AISNAP-9`・Issue #125・`MS-2`。簡約方式と生 DOM 方式を同じ 25 タスクで解かせるための**実行支援と回収検査**で、LLM は呼ばない（API 経由の自動実行は採らない。#123 のオーナー判断）。回答者は会話を共有しない独立したサブエージェントによる手動実行（1 実行 = 1 タスク × 1 方式、計 50 実行）。2 方式の差・−5pt 判定は #126（TASK-22.3）の担当で、`compare.rs` にはまだ無い。
+
+- 割付表: `allocation`。id 昇順の通し位置が偶数なら簡約先・奇数なら生 DOM 先（種別ごとの交互割当と同値。全体 13 対 12・種別内の偏り最大 1）。実行番号は 1〜50。
+- 指示テンプレート: `instruction`。生 DOM 方式では使用可能な CSS セレクタ構文を明示する（core のサブセット。テンプレートの例は `aisnap9_raw_template_selectors_match_core` が core の実装と突き合わせる）。`select` の value は option の value 属性値と両方式で同一文言にする。golden・比較の意図は含めない。
+- 暫定（REPAIR-3）: 指示は日本語（入力データ）。実回答の収集は手動で、完全性検査が通ることは「50 件が揃った」ことしか意味しない。
+
+```bash
+# 1. パケット 50 件 + 割付表を生成（出力先はリポジトリ外の絶対パス。リポ内は拒否される）
+AGENT_EVAL_COMPARE_OUT=/abs/packets cargo test -p fandhe-browser-ai --test agent_eval_compare -- --nocapture aisnap9_write_packets_if_requested
+
+# 2. 各パケット本文だけを独立したサブエージェントへインラインで渡す（ファイル・リポジトリは参照させない）。
+#    出力 JSON を /abs/answers/<id>-reduced.json または <id>-raw.json に保存する。allocation.* は回答者へ渡さない。
+
+# 3. 回収検査（欠落・不正があれば失敗）。結合 JSON は既存の採点入口へそのまま渡せる
+AGENT_EVAL_COMPARE_ANSWERS=/abs/answers AGENT_EVAL_COMPARE_MERGED_OUT=/abs/merged cargo test -p fandhe-browser-ai --test agent_eval_compare -- --nocapture aisnap9_collect_answers_if_requested
+```
+
+- 回答ファイルは 1 件 32 KiB まで。`id` がファイル名と一致し、`score.rs` の既存検証（件数・文字列長・形式）を通ったものだけを受理する。`unanswered`（null）は正当な回答として数え、形式不備（`invalid`）は採点で `invalid_shape` になるため回収上は受理する。
+- 実回答・パケット・結合 JSON はコミットしない。割付表は実施後に結果レポート付録へ転記する。
