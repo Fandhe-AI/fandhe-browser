@@ -69,12 +69,13 @@ use crate::query::{query_selector_all_str_bounded, query_selector_str};
 
 mod page_env;
 pub use page_env::{
-    BridgeDiagnostics, ConsoleLevel, ConsoleMessage, IgnoredLocationChange, LocationChangeKind,
-    LocationMember, MAX_BRIDGE_DIAGNOSTICS, MAX_CONSOLE_MESSAGE_BYTES, MAX_LOCATION_URL_BYTES,
+    BridgeDiagnostics, ConsoleLevel, ConsoleMessage, IgnoredLocationChange, LifecycleEvent,
+    ListenerError, LocationChangeKind, LocationMember, MAX_BRIDGE_DIAGNOSTICS,
+    MAX_CONSOLE_MESSAGE_BYTES, MAX_LOCATION_URL_BYTES,
 };
-use page_env::{apply_hash, location_member, parse_location};
+use page_env::{apply_hash, location_member};
 // ページランナーが例外メッセージの切り詰めに再利用する（#780）。
-pub(crate) use page_env::truncate_utf8;
+pub(crate) use page_env::{parse_location, truncate_utf8};
 
 /// JS に公開するグローバルオブジェクト名（`__dom.op(...)` の `__dom`）。
 pub const DOM_BRIDGE_OBJECT_NAME: &str = "__dom";
@@ -320,6 +321,9 @@ enum DomOp {
     IgnoreLocationChange,
     NavigatorUserAgent,
     ConsoleMessage,
+    LifecycleListenerError,
+    LifecycleInstallOpen,
+    LifecycleListenerLimit,
 }
 
 impl DomOp {
@@ -349,6 +353,9 @@ impl DomOp {
             "ignoreLocationChange" => Self::IgnoreLocationChange,
             "navigatorUserAgent" => Self::NavigatorUserAgent,
             "consoleMessage" => Self::ConsoleMessage,
+            "lifecycleListenerError" => Self::LifecycleListenerError,
+            "lifecycleInstallOpen" => Self::LifecycleInstallOpen,
+            "lifecycleListenerLimit" => Self::LifecycleListenerLimit,
             _ => return None,
         })
     }
@@ -379,6 +386,9 @@ impl DomOp {
             Self::IgnoreLocationChange => "ignoreLocationChange",
             Self::NavigatorUserAgent => "navigatorUserAgent",
             Self::ConsoleMessage => "consoleMessage",
+            Self::LifecycleListenerError => "lifecycleListenerError",
+            Self::LifecycleInstallOpen => "lifecycleInstallOpen",
+            Self::LifecycleListenerLimit => "lifecycleListenerLimit",
         }
     }
 
@@ -390,7 +400,9 @@ impl DomOp {
             | Self::Head
             | Self::ReadyState
             | Self::CurrentScript
-            | Self::NavigatorUserAgent => 0,
+            | Self::NavigatorUserAgent
+            | Self::LifecycleInstallOpen
+            | Self::LifecycleListenerLimit => 0,
             Self::CreateElement
             | Self::CreateTextNode
             | Self::GetElementById
@@ -406,7 +418,8 @@ impl DomOp {
             | Self::SetTextContent
             | Self::SetInnerHtml
             | Self::IgnoreLocationChange
-            | Self::ConsoleMessage => 2,
+            | Self::ConsoleMessage
+            | Self::LifecycleListenerError => 2,
             Self::InsertBefore | Self::SetAttribute => 3,
         }
     }
@@ -445,6 +458,8 @@ struct PageState {
     diagnostics: BridgeDiagnostics,
     generation: u32,
     op_count: u64,
+    /// shim 注入中か（[`DomBridge::set_shim_installing`] だけが変更する）。
+    shim_installing: bool,
     op_limit_tripped: bool,
 }
 
@@ -720,6 +735,26 @@ fn execute(
             page.diagnostics.record_console(level, text);
             Ok(JsValue::Undefined)
         }
+        // shim 注入中（Rust 側が立てたフラグ）だけ true。events.js が再 install 時の
+        // ディスパッチャー差し替えを許すかの判定に使う（ページ JS はフラグを変えられない）。
+        DomOp::LifecycleInstallOpen => Ok(JsValue::Bool(page.shim_installing)),
+        // shim がリスナー保持件数の上限に達したことを通知する（`JS-6`）。ランナーが
+        // 全スクリプトの実行後に確認し、リソース上限による打ち切りとして扱う。
+        DomOp::LifecycleListenerLimit => {
+            page.diagnostics.listener_limit_exceeded = true;
+            Ok(JsValue::Undefined)
+        }
+        DomOp::LifecycleListenerError => {
+            let name = string_arg(op, args, 1, limits)?;
+            let message = string_arg(op, args, 2, limits)?;
+            let event = LifecycleEvent::parse(name).ok_or(DomBridgeError::TypeMismatch {
+                operation: op.name(),
+                index: 1,
+                expected: "a known lifecycle event",
+            })?;
+            page.diagnostics.record_listener_error(event, message);
+            Ok(JsValue::Undefined)
+        }
         DomOp::Body => page.encode_optional(page.html_child("body")),
         DomOp::Head => page.encode_optional(page.html_child("head")),
         DomOp::CreateElement => {
@@ -894,6 +929,7 @@ impl DomBridge {
             diagnostics: BridgeDiagnostics::default(),
             generation,
             op_count: 0,
+            shim_installing: false,
             op_limit_tripped: false,
         });
         Ok(())
@@ -960,12 +996,30 @@ impl DomBridge {
         Ok(())
     }
 
+    /// ライフサイクルのリスナー保持件数が上限を超えたか（診断は消費しない。ランナー用）。
+    /// 未取り付けなら [`DomBridgeError::Detached`]。
+    pub fn listener_limit_exceeded(&self) -> Result<bool, DomBridgeError> {
+        let guard = self.lock()?;
+        let page = guard.page.as_ref().ok_or(DomBridgeError::Detached)?;
+        Ok(page.diagnostics.listener_limit_exceeded)
+    }
+
     /// 集まった診断（無視した `location` 操作・`console`）を取り出して空にする
     /// （ランナー用）。未取り付けなら [`DomBridgeError::Detached`]。
     pub fn take_diagnostics(&self) -> Result<BridgeDiagnostics, DomBridgeError> {
         let mut guard = self.lock()?;
         let page = guard.page.as_mut().ok_or(DomBridgeError::Detached)?;
         Ok(std::mem::take(&mut page.diagnostics))
+    }
+
+    /// shim 注入中フラグを設定する。`JsRuntime::install_dom_shim*` が注入の前後で呼ぶ。
+    /// ページが未 attach なら何もしない。
+    pub(crate) fn set_shim_installing(&self, installing: bool) {
+        if let Ok(mut guard) = self.lock()
+            && let Some(page) = guard.page.as_mut()
+        {
+            page.shim_installing = installing;
+        }
     }
 
     /// 同じ内部状態を共有するブリッジか（`JsRuntime::install_dom_shim` が束縛済みの
@@ -980,6 +1034,14 @@ impl DomBridge {
         let state = &mut *guard;
         let limits = &state.limits;
         let page = state.page.as_mut().ok_or(DomBridgeError::Detached)?;
+
+        // リスナー上限超過の通知は操作予算の対象外にする（`JS-6`）。ページが予算を使い切った後に
+        // 上限を超えて登録しても、フラグが立たず打ち切りを逃れることを防ぐ。冪等なフラグ設定のみで
+        // 副作用が無く、アロケーションも伴わないため、予算外でも DoS 経路にならない。
+        if matches!(args, [JsValue::String(name)] if name == "lifecycleListenerLimit") {
+            page.diagnostics.listener_limit_exceeded = true;
+            return Ok(JsValue::Undefined);
+        }
 
         // 検証より前に数える（shim を迂回した不正呼び出しの連打も対象）。
         if page.op_limit_tripped || page.op_count >= limits.max_ops_per_page {
@@ -1692,6 +1754,38 @@ mod tests {
             b.take_diagnostics().expect("empty"),
             BridgeDiagnostics::default()
         );
+    }
+
+    #[test]
+    fn js_6_lifecycle_listener_limit_op_is_exempt_from_op_budget() {
+        let b = bridge_with(DomBridgeLimits::default().with_max_ops_per_page(1));
+        call(&b, &[s("body")]).expect("budget consumed");
+        call(&b, &[s("body")]).expect_err("over budget");
+        call(&b, &[s("lifecycleListenerLimit")]).expect("exempt");
+        assert!(b.listener_limit_exceeded().expect("flag"));
+    }
+
+    #[test]
+    fn js_6_lifecycle_listener_limit_op_sets_flag() {
+        let b = bridge();
+        assert!(!b.listener_limit_exceeded().expect("flag"));
+        call(&b, &[s("lifecycleListenerLimit"), s("x")]).expect_err("arity");
+        call(&b, &[s("lifecycleListenerLimit")]).expect("ok");
+        assert!(b.listener_limit_exceeded().expect("flag"));
+        assert!(b.take_diagnostics().expect("diag").listener_limit_exceeded);
+    }
+
+    #[test]
+    fn js_4_lifecycle_listener_error_op_validates_event_name() {
+        let b = bridge();
+        call(&b, &[s("lifecycleListenerError"), s("load"), s("boom")]).expect("ok");
+        call(&b, &[s("lifecycleListenerError"), s("click"), s("x")]).expect_err("許可リスト外");
+        call(&b, &[s("lifecycleListenerError"), s("load")]).expect_err("arity");
+        call(&b, &[s("lifecycleListenerError"), s("load"), n(1.0)]).expect_err("type");
+        let d = b.take_diagnostics().expect("diag");
+        assert_eq!(d.listener_errors.len(), 1);
+        assert_eq!(d.listener_errors[0].event, LifecycleEvent::Load);
+        assert_eq!(d.listener_errors[0].message, "boom");
     }
 
     #[test]

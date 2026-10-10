@@ -20,8 +20,10 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! `dom.js` / `window.js` 冒頭の「未実装」節を参照（DOMException 写像・NodeList 互換・
-//! イベント系・`document.location`・追加 API）。
+//! `dom.js` / `window.js` / `events.js` 冒頭の「未実装」節を参照（DOMException 写像・
+//! NodeList 互換・要素レベルのイベント系・`document.location`・追加 API）。`events.js`（#781）は
+//! `document` / `window` の最小 `addEventListener` とランナー用ディスパッチャー
+//! `__fandheLifecycle` を提供する。
 
 use fandhe_browser_js::{EvaluateOptions, JsEngine, JsEngineError};
 
@@ -44,6 +46,10 @@ pub const JS_SHIM_SOURCES: &[JsShimSource] = &[
     JsShimSource {
         name: "window.js",
         source: include_str!("window.js"),
+    },
+    JsShimSource {
+        name: "events.js",
+        source: include_str!("events.js"),
     },
 ];
 

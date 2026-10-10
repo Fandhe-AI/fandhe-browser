@@ -39,7 +39,10 @@ fn setup(engine: &str, limit_extra_nodes: Option<usize>) -> Page {
     let cfg = Config::from_toml_str(&format!("[js]\nengine = \"{engine}\"\n")).expect("config");
     let mut rt = JsRuntime::from_config(cfg.js()).expect("runtime");
     let installed = rt.install_dom_shim(&bridge).expect("install shim");
-    assert_eq!(installed.evaluated, vec!["dom.js", "window.js"]);
+    assert_eq!(
+        installed.evaluated,
+        vec!["dom.js", "window.js", "events.js"]
+    );
     Page { bridge, rt, script }
 }
 
@@ -426,4 +429,88 @@ fn window_cases(engine: &str) {
     check(&mut p, "typeof console.log", "function");
     check(&mut p, "location.href", "https://example.com/x");
     check(&mut p, "window === globalThis", "true");
+
+    eprintln!("case: JS-4 reinstall fires only the new page's lifecycle listeners");
+    let mut p = setup(engine, None);
+    p.eval(
+        "globalThis.log = []; \
+         document.addEventListener('DOMContentLoaded', function () { log.push('old'); }); 'ok'",
+    );
+    p.rt.install_dom_shim(&p.bridge).expect("reinstall");
+    p.eval(
+        "globalThis.log = []; \
+         document.addEventListener('DOMContentLoaded', function () { log.push('new'); }); \
+         window.addEventListener('load', function () { log.push('load'); }); 'ok'",
+    );
+    p.eval("__fandheLifecycle('DOMContentLoaded'); __fandheLifecycle('load'); 'fired'");
+    check(&mut p, "log.join(',')", "new,load");
+
+    eprintln!("case: JS-4 a frozen event does not stop later listeners");
+    let mut p = setup(engine, None);
+    p.eval(
+        "globalThis.log = []; \
+         document.addEventListener('DOMContentLoaded', function (e) { Object.freeze(e); log.push('a'); }); \
+         window.addEventListener('DOMContentLoaded', function (e) { log.push('b:' + (e.currentTarget === window)); }); 'ok'",
+    );
+    p.eval("__fandheLifecycle('DOMContentLoaded'); 'fired'");
+    check(&mut p, "log.join(',')", "a,b:true");
+
+    eprintln!("case: JS-4 page cannot replace the lifecycle dispatcher");
+    let mut p = setup(engine, None);
+    p.eval(
+        "globalThis.log = []; \
+         document.addEventListener('DOMContentLoaded', function () { log.push('kept'); }); \
+         __fandheLifecycle.setImpl(function () { log.push('hijacked'); }); 'ok'",
+    );
+    p.eval("__fandheLifecycle('DOMContentLoaded'); 'fired'");
+    check(&mut p, "log.join(',')", "kept");
+
+    eprintln!("case: JS-4 own `call` on __dom.op cannot unlock the dispatcher");
+    let mut p = setup(engine, None);
+    p.eval(
+        "globalThis.log = []; \
+         document.addEventListener('DOMContentLoaded', function () { log.push('kept'); }); \
+         try { __dom.op.call = function () { return true; }; } catch (e) {} \
+         __fandheLifecycle.setImpl(function () { log.push('hijacked'); }); 'ok'",
+    );
+    p.eval("__fandheLifecycle('DOMContentLoaded'); 'fired'");
+    check(&mut p, "log.join(',')", "kept");
+
+    eprintln!("case: JS-4 replacing Object.defineProperty does not stop listeners");
+    let mut p = setup(engine, None);
+    p.eval(
+        "globalThis.log = []; \
+         document.addEventListener('DOMContentLoaded', function () { log.push('ran'); }); \
+         Object.defineProperty = function () { throw new Error('x'); }; 'ok'",
+    );
+    p.eval("__fandheLifecycle('DOMContentLoaded'); 'fired'");
+    check(&mut p, "log.join(',')", "ran");
+
+    eprintln!("case: JS-4 saved event currentTarget is null after dispatch");
+    let mut p = setup(engine, None);
+    p.eval(
+        "globalThis.saved = null; \
+         document.addEventListener('DOMContentLoaded', function (e) { saved = e; }); 'ok'",
+    );
+    p.eval("__fandheLifecycle('DOMContentLoaded'); 'fired'");
+    check(&mut p, "String(saved.currentTarget)", "null");
+
+    eprintln!("case: JS-6 listener count is capped per target and flagged to the runner");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "globalThis.n = 0; \
+         for (var i = 0; i < 1100; i++) { \
+           document.addEventListener('DOMContentLoaded', function () { n++; }); \
+         } \
+         window.addEventListener('load', function () { n += 1000; }); 'ok'",
+        "ok",
+    );
+    assert!(p.bridge.listener_limit_exceeded().expect("flag"));
+    p.eval("__fandheLifecycle('DOMContentLoaded'); __fandheLifecycle('load'); 'fired'");
+    // document は 1024 件で打ち止め、window は別枠で登録できる。
+    check(&mut p, "String(n)", "2024");
+    let mut p = setup(engine, None);
+    p.eval("document.addEventListener('load', function () {}); 'ok'");
+    assert!(!p.bridge.listener_limit_exceeded().expect("flag"));
 }

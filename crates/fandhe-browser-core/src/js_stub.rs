@@ -304,8 +304,11 @@ impl JsRuntime {
                         *dom_bridge = Some(bridge.clone());
                     }
                 }
-                js_shim::install_with(engine.as_mut(), next_options)
-                    .map_err(crate::Error::JsEvaluation)
+                // 注入中だけ events.js の再 install 用の差し替えを許す（ページ JS は呼べない）。
+                bridge.set_shim_installing(true);
+                let result = js_shim::install_with(engine.as_mut(), next_options);
+                bridge.set_shim_installing(false);
+                result.map_err(crate::Error::JsEvaluation)
             }
         }
     }

@@ -139,6 +139,60 @@ impl ConsoleLevel {
     }
 }
 
+/// ページのライフサイクルイベント（許可リスト。`JS-4`・TASK-109・Issue #781）。
+///
+/// ランナーが発火する `DOMContentLoaded` / `load` と、shim の `lifecycleListenerError` op が
+/// 受け取るイベント名の検証に使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LifecycleEvent {
+    /// `document` / `window` の `DOMContentLoaded`。
+    DomContentLoaded,
+    /// `window` の `load`。
+    Load,
+}
+
+impl LifecycleEvent {
+    pub(super) fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "DOMContentLoaded" => Self::DomContentLoaded,
+            "load" => Self::Load,
+            _ => return None,
+        })
+    }
+
+    /// JS 側のイベント名（shim のディスパッチャーへ渡す文字列）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::DomContentLoaded => "DOMContentLoaded",
+            Self::Load => "load",
+        }
+    }
+}
+
+/// ライフサイクルイベントのリスナーが投げた例外 1 件（[`MAX_CONSOLE_MESSAGE_BYTES`] で切り詰め済み）。
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ListenerError {
+    /// 発火中のイベント。
+    pub event: LifecycleEvent,
+    /// 例外メッセージ（ページ由来。切り詰め後）。
+    pub message: String,
+    /// 切り詰めが起きたか。
+    pub truncated: bool,
+}
+
+// ページ由来の文字列は秘密を含み得るため、Debug には長さだけを出す。
+impl std::fmt::Debug for ListenerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ListenerError")
+            .field("event", &self.event)
+            .field("message_len", &self.message.len())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
+}
+
 /// 無視した `location` の遷移系操作 1 件。URL 本文は持たず、種別と長さだけを残す。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -182,6 +236,10 @@ pub struct BridgeDiagnostics {
     pub location_changes_ignored: Vec<IgnoredLocationChange>,
     /// `console` のメッセージ（先頭から [`MAX_BRIDGE_DIAGNOSTICS`] 件）。
     pub console_messages: Vec<ConsoleMessage>,
+    /// ライフサイクルイベントのリスナー例外（先頭から [`MAX_BRIDGE_DIAGNOSTICS`] 件）。
+    pub listener_errors: Vec<ListenerError>,
+    /// ライフサイクルのリスナー保持件数が shim の上限を超え、登録を無視したか（`JS-6`）。
+    pub listener_limit_exceeded: bool,
     /// 件数上限で保存しなかった診断の数。
     pub dropped: u64,
 }
@@ -191,6 +249,19 @@ impl BridgeDiagnostics {
         if self.location_changes_ignored.len() < MAX_BRIDGE_DIAGNOSTICS {
             self.location_changes_ignored
                 .push(IgnoredLocationChange { kind, value_len });
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    pub(super) fn record_listener_error(&mut self, event: LifecycleEvent, message: &str) {
+        if self.listener_errors.len() < MAX_BRIDGE_DIAGNOSTICS {
+            let (kept, truncated) = truncate_utf8(message, MAX_CONSOLE_MESSAGE_BYTES);
+            self.listener_errors.push(ListenerError {
+                event,
+                message: kept.to_owned(),
+                truncated,
+            });
         } else {
             self.dropped = self.dropped.saturating_add(1);
         }
@@ -224,7 +295,7 @@ pub(crate) fn truncate_utf8(s: &str, max: usize) -> (&str, bool) {
 
 /// `set_location` の入力を検証して正規化する（http / https のみ。userinfo を除去）。
 /// 失敗理由は静的文言で、入力 URL は反響しない。
-pub(super) fn parse_location(input: &str) -> Result<Url, &'static str> {
+pub(crate) fn parse_location(input: &str) -> Result<Url, &'static str> {
     // 解析（アロケーション）の前に長さを検証する。
     if input.len() > MAX_LOCATION_URL_BYTES {
         return Err("URL is too long");
@@ -312,6 +383,32 @@ mod tests {
         assert_eq!(kept.len(), 4095);
         assert_eq!(truncate_utf8("abc", 3), ("abc", false));
         assert_eq!(truncate_utf8("あ", 2), ("", true));
+    }
+
+    #[test]
+    fn js_4_lifecycle_event_allow_list() {
+        assert_eq!(
+            LifecycleEvent::parse("DOMContentLoaded"),
+            Some(LifecycleEvent::DomContentLoaded)
+        );
+        assert_eq!(LifecycleEvent::parse("load"), Some(LifecycleEvent::Load));
+        assert_eq!(LifecycleEvent::parse("click"), None);
+        assert_eq!(LifecycleEvent::parse("Load"), None);
+    }
+
+    #[test]
+    fn js_4_listener_errors_truncate_and_cap() {
+        let mut d = BridgeDiagnostics::default();
+        d.record_listener_error(LifecycleEvent::Load, &"x".repeat(4096));
+        d.record_listener_error(LifecycleEvent::Load, &"x".repeat(4097));
+        assert!(!d.listener_errors[0].truncated);
+        assert_eq!(d.listener_errors[1].message.len(), 4096);
+        assert!(d.listener_errors[1].truncated);
+        for _ in 0..(MAX_BRIDGE_DIAGNOSTICS + 3) {
+            d.record_listener_error(LifecycleEvent::DomContentLoaded, "e");
+        }
+        assert_eq!(d.listener_errors.len(), MAX_BRIDGE_DIAGNOSTICS);
+        assert_eq!(d.dropped, 5);
     }
 
     #[test]
