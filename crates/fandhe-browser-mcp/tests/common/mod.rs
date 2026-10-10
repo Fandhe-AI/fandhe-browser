@@ -47,8 +47,30 @@ pub fn body_complete(text: &str) -> bool {
 /// stdio_handshake.rs からは使われないため、この関数に限り dead_code を許容する。
 #[allow(dead_code)]
 pub fn register_then_close() -> String {
-    let (addr, _handle) = register_only();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    thread::spawn(move || serve_register_with_owned(listener));
     addr
+}
+
+/// listener を所有し、成功応答の直前に閉じて（応答後に閉じると、バイナリの次の接続が
+/// 閉じる前に accept キューへ入り Io エラーに分類される競合が起きる）自己申告を 1 回だけ処理する。
+fn serve_register_with_owned(listener: TcpListener) -> String {
+    let Ok((mut s, _)) = listener.accept() else {
+        return String::new();
+    };
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = s.read(&mut buf).unwrap_or(0);
+        raw.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&raw).to_string();
+        if n == 0 || body_complete(&text) {
+            drop(listener);
+            let _ = s.write_all(REGISTER_OK.as_bytes());
+            return text;
+        }
+    }
 }
 
 /// 自己申告だけを受ける偽ホスト（以後の接続は受けない）。受信全文を返すハンドルも返す。
