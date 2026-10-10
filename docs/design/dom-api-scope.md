@@ -5,23 +5,23 @@
 ## 目的
 
 `CORE-5` は、MVP スコープを Must / Should / Could / Won't に切り分ける判断材料として、
-現時点で未実装の DOM/Web API 8 項目を一覧化することを求めている。本ドキュメントはその一覧化のみを行う。
-**MVP スコープの Must/Won't 等の判定自体は本ドキュメントの範囲外**であり、担当は人間（親 Issue #132
-の受入条件）である。本書は各項目の現状（未実装・簡易実装）と本リポジトリの根拠、関連ビヘイビア ID・
-TASK・MS を記録するに留め、実装済みであるかのような記述はしない（REPAIR-3）。
+現時点で未実装の DOM/Web API 8 項目を一覧化することを求めている。本ドキュメントは一覧化と、オーナー判断の MVP 採否の反映を行う。
+MVP 採否の判断はオーナーが行い（Issue #134 の「オーナー判断（2026-10-10）」）、本書は「MVP 判断」列に
+その結果を反映する。各項目の現状（未実装・簡易実装）と本リポジトリの根拠、関連ビヘイビア ID・
+TASK・MS の記録は従来どおりで、実装済みであるかのような記述はしない（REPAIR-3）。
 
 ## 一覧表
 
 | # | 項目 | 現状 | 本リポの根拠 | 関連ビヘイビア ID | 関連 TASK・MS | MVP 判断 |
 | - | ---- | ---- | ------------ | ------------------ | -------------- | -------- |
-| 1 | JS 実行全般（`<script>`・イベントハンドラ・fetch/XHR 起因の DOM 更新） | 未実装（スタブ境界のみ） | `crates/fandhe-browser-core/src/js_stub.rs` の `execute_js_stub`・`crates/fandhe-browser-js` の `create_engine` | `CORE-5` (1)・`JS-1`・`JS-2`・`COMPAT-4` | `TASK-28`・`TASK-29`・`TASK-30`・`TASK-32`・`TASK-71`・`TASK-72`・`TASK-74`・`MS-3`・`MS-6` | 未判定（人間担当・TASK-25 親 #132） |
-| 2 | CSSOM・computed style・レイアウト | 未実装 | `crates/fandhe-browser-core/src/render.rs` の `DisabledRenderer`（`fandhe-browser-render` は雛形のみ） | `CORE-5` (2)・`RENDER-1`・`RENDER-3`・`PLUG-7`・`PLUG-8` | `TASK-33`・`TASK-38`・`TASK-105`・`TASK-100`・`MS-4`・`MS-8` | 未判定（人間担当・TASK-25 親 #132） |
-| 3 | DOM イベントディスパッチ（`click`/`input` の発火） | 未実装 | イベントモデル・ディスパッチのコードなし（JS 実行〔1〕が前提） | `CORE-5` (3)・`JS-2`・`CDP-2`・`CLI-1` | spec 側で対応 TASK が未割当（関連: `TASK-30`・`TASK-42`・`TASK-47`） | 未判定（人間担当・TASK-25 親 #132） |
-| 4 | `<select>` の入れ子 `option` の選択値解決 | 未実装 | フォーム値を解決する API 自体がない（`parse.rs` モジュール doc に範囲外の記載あり） | `CORE-5` (4)・`AISNAP-12`・`COMPAT-1` | spec 側で対応 TASK が未割当（関連: `TASK-72`・`TASK-11`） | 未判定（人間担当・TASK-25 親 #132） |
-| 5 | Shadow DOM・`<iframe>` を跨ぐクロスドキュメント操作 | 未実装（Shadow DOM は明示的に無効化） | `parse.rs` の `TreeSink::allow_declarative_shadow_roots` は常に `false` を返す。`<iframe>` は通常要素としてのみパースし子文書は取得・構築しない | `CORE-5` (5) | spec 側で対応 TASK が未割当 | 未判定（人間担当・TASK-25 親 #132） |
-| 6 | `MutationObserver` 等の DOM 変化監視 | 未実装 | 該当コードなし（DOM を動的に変更する経路〔JS 実行〕自体がまだない） | `CORE-5` (6)・`AISNAP-10`〜`13`・`PLUG-9` | spec 側で対応 TASK が未割当（関連: `TASK-30`） | 未判定（人間担当・TASK-25 親 #132） |
-| 7 | 文字コード検出（UTF-8 以外の明示宣言への対応） | 簡易実装（UTF-8 固定） | `parse.rs` の `parse_document_bytes` は UTF-8 を厳密検証し非 UTF-8 は `ParseError::InvalidUtf8`。`fetch.rs` の `body_text_lossy` は `String::from_utf8_lossy` による簡易変換のみ | `CORE-5` (7) | spec 側で対応 TASK が未割当 | 未判定（人間担当・TASK-25 親 #132） |
-| 8 | Cookie による複数リクエスト間のセッション維持の実地検証 | 未実装 | `reqwest` は `cookies` feature なしで導入（ルート `Cargo.toml`）。`Fetcher` に cookie jar なし。`fandhe-browser-profile` は `DataKind::Cookies` の保管領域のみ持つ | `CORE-5` (8)・`PROF-1`・`PROF-2`・`PROF-3`・`PROF-5` | spec 側で対応 TASK が未割当（関連: `TASK-50`・`TASK-51`・`TASK-52`・`TASK-53`） | 未判定（人間担当・TASK-25 親 #132） |
+| 1 | JS 実行全般（`<script>`・イベントハンドラ・fetch/XHR 起因の DOM 更新） | 未実装（スタブ境界のみ） | `crates/fandhe-browser-core/src/js_stub.rs` の `execute_js_stub`・`crates/fandhe-browser-js` の `create_engine` | `CORE-5` (1)・`JS-1`・`JS-2`・`COMPAT-4` | `TASK-28`・`TASK-29`・`TASK-30`・`TASK-32`・`TASK-71`・`TASK-72`・`TASK-74`・`MS-3`・`MS-6` | MVP 内（TASK-30・TASK-106〜113 で進行中） |
+| 2 | CSSOM・computed style・レイアウト | 未実装 | `crates/fandhe-browser-core/src/render.rs` の `DisabledRenderer`（`fandhe-browser-render` は雛形のみ） | `CORE-5` (2)・`RENDER-1`・`RENDER-3`・`PLUG-7`・`PLUG-8` | `TASK-33`・`TASK-38`・`TASK-105`・`TASK-100`・`MS-4`・`MS-8` | MVP 外（レンダリング層〔TASK-38〕に分離） |
+| 3 | DOM イベントディスパッチ（`click`/`input` の発火） | 未実装 | イベントモデル・ディスパッチのコードなし（JS 実行〔1〕が前提） | `CORE-5` (3)・`JS-2`・`CDP-2`・`CLI-1` | spec 側で対応 TASK が未割当（関連: `TASK-30`・`TASK-42`・`TASK-47`） | JS 実行に従属（JS 実行〔TASK-106〜113〕の範囲で扱う） |
+| 4 | `<select>` の入れ子 `option` の選択値解決 | 未実装 | フォーム値を解決する API 自体がない（`parse.rs` モジュール doc に範囲外の記載あり） | `CORE-5` (4)・`AISNAP-12`・`COMPAT-1` | spec 側で対応 TASK が未割当（関連: `TASK-72`・`TASK-11`） | MVP 内（フォーム操作〔AISNAP-12・COMPAT-1〕に直結）。spec に TASK 追加が必要（オーナーが spec リポで対応） |
+| 5 | Shadow DOM・`<iframe>` を跨ぐクロスドキュメント操作 | 未実装（Shadow DOM は明示的に無効化） | `parse.rs` の `TreeSink::allow_declarative_shadow_roots` は常に `false` を返す。`<iframe>` は通常要素としてのみパースし子文書は取得・構築しない | `CORE-5` (5) | spec 側で対応 TASK が未割当 | MVP 外（後続マイルストーン） |
+| 6 | `MutationObserver` 等の DOM 変化監視 | 未実装 | 該当コードなし（DOM を動的に変更する経路〔JS 実行〕自体がまだない） | `CORE-5` (6)・`AISNAP-10`〜`13`・`PLUG-9` | spec 側で対応 TASK が未割当（関連: `TASK-30`） | MVP 外（後続マイルストーン） |
+| 7 | 文字コード検出（UTF-8 以外の明示宣言への対応） | 簡易実装（UTF-8 固定） | `parse.rs` の `parse_document_bytes` は UTF-8 を厳密検証し非 UTF-8 は `ParseError::InvalidUtf8`。`fetch.rs` の `body_text_lossy` は `String::from_utf8_lossy` による簡易変換のみ | `CORE-5` (7) | spec 側で対応 TASK が未割当 | MVP 内（日本語等の実サイトでほぼ必須）。spec に TASK 追加が必要（オーナーが spec リポで対応） |
+| 8 | Cookie による複数リクエスト間のセッション維持の実地検証 | 未実装 | `reqwest` は `cookies` feature なしで導入（ルート `Cargo.toml`）。`Fetcher` に cookie jar なし。`fandhe-browser-profile` は `DataKind::Cookies` の保管領域のみ持つ | `CORE-5` (8)・`PROF-1`・`PROF-2`・`PROF-3`・`PROF-5` | spec 側で対応 TASK が未割当（関連: `TASK-50`・`TASK-51`・`TASK-52`・`TASK-53`） | MVP 内（ログインを伴う利用に必要）。spec に TASK 追加が必要（オーナーが spec リポで対応） |
 
 ## 項目別詳細
 
@@ -111,8 +111,16 @@ TASK・MS を記録するに留め、実装済みであるかのような記述�
 
 ## スコープ判断の扱い
 
-上記表の「MVP 判断」列はすべて `未判定（人間担当・TASK-25 親 #132）` とする。本ドキュメントは
-一覧化のみを目的とし、Must/Should/Could/Won't の判定は行わない（`delegation-impl.md` の着手条件）。
+「MVP 判断」列は Issue #134 のオーナー判断（2026-10-10・`CORE-5`・`TASK-25`）を反映したもの。
+
+| 区分 | 項目 |
+| ---- | ---- |
+| MVP 内 | (1) JS 実行全般・(4) `<select>` 入れ子 option の選択値解決・(7) 文字コード検出・(8) Cookie によるセッション維持 |
+| MVP 外 | (2) CSSOM・computed style・レイアウト・(5) Shadow DOM・iframe 跨ぎ・(6) MutationObserver |
+| JS 実行に従属 | (3) DOM イベントディスパッチ（JS 実行〔`TASK-106`〜`TASK-113`〕の範囲で扱う） |
+
+- MVP 内とした (4)・(7)・(8) は spec に対応 TASK が無い。spec に TASK 追加が必要（オーナーが spec リポで対応）。本リポからは `docs/spec` を編集しない
+- 本表は MVP 採否のみを定める。Must/Should/Could/Won't の優先度区分は各ビヘイビア・TASK 側の定義に従う
 
 ## 後続タスクとの関係
 
