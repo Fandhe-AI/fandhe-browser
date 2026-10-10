@@ -749,7 +749,10 @@ mod tests {
                 );
                 let nav_resp = ws_read_json(&mut s);
                 // イベントが出ていなければ、次に届くのは続けて送った未実装メソッドの応答。
-                ws_send_text(&mut s, r#"{"id":2,"method":"Browser.getVersion"}"#);
+                ws_send_text(
+                    &mut s,
+                    r#"{"id":2,"method":"Emulation.setUserAgentOverride"}"#,
+                );
                 (nav_resp, ws_read_json(&mut s))
             })
             .await;

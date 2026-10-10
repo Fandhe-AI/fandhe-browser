@@ -6,7 +6,8 @@
 //! 「Playwright が送ったリクエストに対し、現状の実装が記録どおりの応答を返す」ことを具体値で固定する。
 //! Node 不要・ネットワーク不要で常時実行できる回帰フックであり、原因調査（TASK-43.2・#247）と
 //! 追加実装（TASK-43.3・#249）で応答が変わったら、トレースを再取得して本ファイルの期待値
-//! （`EXPECTED_*`）を更新する。ハンドラ・no-op は本タスクでは追加しない（`SEC-2`・`REPAIR-3`）。
+//! （`EXPECTED_*`）を更新する。TASK-43.3a で `/json/version/` と `Browser.getVersion` を追加した。
+//! 以降のメソッドの no-op は追加しない（`SEC-2`・`REPAIR-3`）。
 //!
 //! `CdpState` の構築に `Profile::open` が必要で、非 unix では `ProfileError::Unsupported` を返す仕様のため
 //! `#[cfg(unix)]` とする（任意の skip ではなく `tests/devtools_browser.rs` と同じ理由）。
@@ -33,9 +34,21 @@ const TRACE: &str = include_str!("../../../harness/playwright-trace/results/newp
 const MAX_TRACE_LINES: usize = 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
-/// 現状のトレースが示す到達点（2026-10 時点）。Playwright が最初に送る `Browser.getVersion` が
-/// 未実装（`-32601`。`CDP-6`）で、`connectOverCDP` が失敗する。
-const EXPECTED_SEND_METHODS: [&str; 1] = ["Browser.getVersion"];
+/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3a 後）。`Browser.getVersion` は成功し、
+/// 続く `Target.setAutoAttach`・`Browser.setDownloadBehavior` が未実装（`-32601`。`CDP-6`）で
+/// `connectOverCDP` が失敗する。`connectOverCDP(http)` と `(ws)` の 2 接続分を記録する
+/// （id は接続ごとに 1 から振り直される）。
+///
+/// 注意: `Browser.getVersion` の応答に `CARGO_PKG_VERSION` が入るため、workspace の版を上げたら
+/// `make trace-playwright` でトレースを再取得すること。
+const EXPECTED_SEND_METHODS: [&str; 6] = [
+    "Browser.getVersion",
+    "Target.setAutoAttach",
+    "Browser.setDownloadBehavior",
+    "Browser.getVersion",
+    "Target.setAutoAttach",
+    "Browser.setDownloadBehavior",
+];
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -199,7 +212,8 @@ fn cdp2_playwright_trace_is_well_formed() {
         .map(|r| r["message"]["method"].as_str().expect("method is a string"))
         .collect();
     assert_eq!(sends, EXPECTED_SEND_METHODS);
-    // 現状の到達点: connectOverCDP のみ失敗し、newContext / newPage には到達しない。
+    // 現状の到達点: connectOverCDP のみ失敗し（Target.setAutoAttach 以降が未実装）、
+    // newContext / newPage には到達しない。
     let stages: Vec<(&str, bool)> = recs
         .iter()
         .filter(|r| r["kind"] == "stage")
@@ -228,12 +242,12 @@ async fn cdp2_playwright_trace_http_discovery_matches_recorded_status() {
             )
         })
         .collect();
-    // Playwright は /json/version/（末尾スラッシュ付き）を要求し、現状は 404 になる（#247 の調査対象）。
+    // Playwright は /json/version/（末尾スラッシュ付き）を要求する。TASK-43.3a で 200 になった。
     assert_eq!(
         expected,
         [
             ("/json/version".to_owned(), 200),
-            ("/json/version/".to_owned(), 404)
+            ("/json/version/".to_owned(), 200)
         ]
     );
     tokio::task::spawn_blocking(move || {
@@ -283,9 +297,22 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
     })
     .await
     .unwrap();
+    let product = format!("fandhe-browser/{}", env!("CARGO_PKG_VERSION"));
+    let version = json!({"id": 1, "result": {
+        "protocolVersion": "1.3", "product": product, "userAgent": product
+    }});
+    let unimpl =
+        |id: u32| json!({"id": id, "error": {"code": -32601, "message": "method not implemented"}});
     assert_eq!(
         replayed,
-        [json!({"id": 1, "error": {"code": -32601, "message": "method not implemented"}})]
+        [
+            version.clone(),
+            unimpl(2),
+            unimpl(3),
+            version,
+            unimpl(2),
+            unimpl(3)
+        ]
     );
     assert_eq!(replayed, recvs, "replay must match the recorded responses");
 
@@ -296,5 +323,13 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
         .iter()
         .map(|(k, c)| (k.as_str(), c.handled, c.unimplemented))
         .collect();
-    assert_eq!(logged, [("Browser.getVersion", 0, 1)], "snapshot: {snap:?}");
+    assert_eq!(
+        logged,
+        [
+            ("Browser.getVersion", 2, 0),
+            ("Browser.setDownloadBehavior", 0, 2),
+            ("Target.setAutoAttach", 0, 2)
+        ],
+        "snapshot: {snap:?}"
+    );
 }

@@ -89,6 +89,23 @@ async fn cdp1_json_version_has_ws_url() {
     assert_eq!(v["Protocol-Version"], "1.3");
 }
 
+/// `CDP-2`・TASK-43.3a: Playwright が要求する末尾スラッシュ付きも同じ本体を返す。
+#[tokio::test]
+async fn cdp2_json_version_trailing_slash_matches_json_version() {
+    let dir = TempDir::new();
+    let st = state(&dir);
+    let a = request(&st, "GET", "/json/version", Some("127.0.0.1:9222")).await;
+    let b = request(&st, "GET", "/json/version/", Some("127.0.0.1:9222")).await;
+    assert_eq!(b.status, 200);
+    assert_eq!(b.header("content-type"), Some(JSON_CT));
+    assert_eq!(a.body, b.body);
+    // 他のエンドポイントへは末尾スラッシュ互換を広げない。
+    let c = request(&st, "GET", "/json/list/", Some("127.0.0.1:9222")).await;
+    assert_eq!(c.status, 404);
+    let d = request(&st, "POST", "/json/version/", Some("127.0.0.1:9222")).await;
+    assert_eq!(d.status, 405);
+}
+
 #[tokio::test]
 async fn cdp1_json_version_ws_url_brackets_ipv6_authority() {
     let dir = TempDir::new();
@@ -145,7 +162,7 @@ async fn cdp1_json_alias_matches_json_list() {
 async fn cdp1_json_rejects_foreign_and_missing_host() {
     let dir = TempDir::new();
     let st = state(&dir);
-    for path in ["/json/version", "/json/list", "/json"] {
+    for path in ["/json/version", "/json/version/", "/json/list", "/json"] {
         let res = request(&st, "GET", path, Some("evil.example:9222")).await;
         assert_eq!(res.status, 403, "path {path}");
         assert_eq!(json_of(&res), json!({"error": "host not allowed"}));
