@@ -46,7 +46,7 @@ PoC の golden は連番 ref（`e1`〜）だが、本リポの ref は `AISNAP-1
 - 形式は `benches/token_reduction/snapshot_text.rs` の暫定行形式。`AISNAP-8` が前提とする `GET /ai/snapshot` の確定応答ではない（`REPAIR-3`）。TASK-19・`AISNAP-6` の確定後に `snapshot_text` 側を差し替える。
 - 生成物は行末の空白だけを落としている（`header:` の後ろの空白等。`.editorconfig` の `trim_trailing_whitespace` 検査に通すため。内容は変えない）。
 - ref 解決は DOM からの再計算（`retention_check::target_refs`）。`build_snapshot` が省略する要素（hidden・深さ超過）が先行すると不一致側へ倒れ、`refs` は空配列になる。圧縮行の操作要素は snapshot 上の同一ダイジェスト件数と DOM 上の件数が食い違う（行・表の上限で省略された）場合に候補を出さない（fail-closed）。解決不能はテストの失敗にせず事実として記録する。
-- 現時点で `refs` が空のロケータ: extract-01（`table#table1 tbody td` index 14）のみ。簡約表現上で ref を持たない正解要素であり、読み取れるかどうかは #121 の測定結果で判定する。
+- 現時点で `refs` が空のロケータ: extract-01（`table#table1 tbody td` index 14）と extract-04（`tbody td` index 14。幅広表の畳み行のセルは ref を持たず、値は畳み行 1 行目の 15 番目のセルから読める。TASK-23.7・#829）。簡約表現上で ref を持たない正解要素であり、読み取れるかどうかは #121 の測定結果で判定する。
 - 上限で打ち切られる（`… truncated`）ページは `hn-list`・`large-table`。
 
 ## PoC との差分

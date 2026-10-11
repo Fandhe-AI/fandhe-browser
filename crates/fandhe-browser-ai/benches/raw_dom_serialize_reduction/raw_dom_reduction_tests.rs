@@ -159,7 +159,7 @@ fn aisnap15_real_fixtures_pinned_values_and_summary() {
     }
     let s = summarize(&rows).expect("summary");
     assert_eq!(s.pages, 17);
-    assert!((s.mean_reduction_pct - 12.6).abs() < 0.05, "{s:?}");
-    assert!((s.min_reduction_pct - -129.5).abs() < 0.05);
-    assert!((s.max_reduction_pct - 53.5).abs() < 0.05);
+    assert!((s.mean_reduction_pct - 24.3).abs() < 0.05, "{s:?}");
+    assert!((s.min_reduction_pct - -61.4).abs() < 0.05);
+    assert!((s.max_reduction_pct - 68.3).abs() < 0.05);
 }

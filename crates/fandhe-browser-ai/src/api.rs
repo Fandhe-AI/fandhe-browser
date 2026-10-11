@@ -323,6 +323,12 @@ fn node_json(node: &Node) -> Value {
             .collect();
         m.insert("folded_rows".into(), Value::Array(rows));
     }
+    if node.folded_rows_omitted > 0 {
+        m.insert(
+            "folded_rows_omitted".into(),
+            json!(node.folded_rows_omitted),
+        );
+    }
     m.insert(
         "children".into(),
         Value::Array(node.children.iter().map(node_json).collect()),
@@ -739,5 +745,14 @@ mod tests {
         assert!(!is_json_content_type(Some("text/plain")));
         assert!(!is_json_content_type(Some("")));
         assert!(!is_json_content_type(None));
+    }
+
+    /// AISNAP-2・TASK-23.7: `folded_rows_omitted` は 0 のとき出さず、正のときだけ出す。
+    #[test]
+    fn aisnap2_node_json_emits_folded_rows_omitted_only_when_positive() {
+        let mut n = Node::new("table", "");
+        assert!(node_json(&n).get("folded_rows_omitted").is_none());
+        n.folded_rows_omitted = 30;
+        assert_eq!(node_json(&n)["folded_rows_omitted"], 30);
     }
 }
