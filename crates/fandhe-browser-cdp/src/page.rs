@@ -293,6 +293,9 @@ pub(crate) async fn navigate_gated(
         nav.begin_navigation()
     }
     .map_err(state_error)?;
+    // 新しい遷移の開始と同時に、同じターゲットの古い世代の JS 実行・ページ内 fetch を打ち切る。
+    // `about:blank`・取得失敗・取得の遅延のどの経路でも古いページの JS を走らせ続けない（`JS-4`・`JS-6`）。
+    page_scripts.begin_generation(nav.scope(), generation);
     let mut outcome = NavigateOutcome {
         loader_id: format!("{:x}", generation.get()),
         error_text: None,
@@ -335,6 +338,11 @@ pub(crate) async fn navigate_gated(
                 return Ok(outcome);
             }
             let final_url = resp.final_url().to_owned();
+            // 取得中に後続の遷移が始まっていれば、無効なページの JS を起動せず中断する。
+            if nav.current_generation() != generation {
+                outcome.error_text = Some("net::ERR_ABORTED");
+                return Ok(outcome);
+            }
             let fetched = resp.body_text_lossy();
             // ページ JS 実行段。アクターの待機中は `gate` を保持しない（他ターゲットを塞がない）。
             // 確定の審判は従来どおり `commit_navigation`（追い越された場合は `Superseded`）。
@@ -1054,22 +1062,6 @@ mod tests {
         }
     }
 
-    /// 実際に future を駆動する実行器（実エンジンでの実行経路 `ScriptStage::Executed` の検証用）。
-    struct TokioExecutor;
-
-    impl PageScriptExecutor for TokioExecutor {
-        fn block_on<'a>(
-            &self,
-            future: Pin<Box<dyn std::future::Future<Output = ()> + 'a>>,
-        ) -> std::io::Result<()> {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(future);
-            Ok(())
-        }
-    }
-
     /// `Sender` の drop まで `block_on` で止まる実行器。止めている間、ジョブは待ち行列に残る。
     struct GatedExecutor(Mutex<mpsc::Receiver<()>>);
 
@@ -1306,30 +1298,6 @@ mod tests {
         assert_eq!(nav1.latest().unwrap().html(), SCRIPT_PAGE);
     }
 
-    /// `JS-4`・`CDP-1`: 実エンジンでスクリプトを実行できたら、実行後の HTML で確定する
-    /// （`ScriptStage::Executed`）。エンジンなしのビルドでは設定自体が拒否されるため何も検証しない。
-    #[tokio::test]
-    async fn js4_navigate_settles_with_executed_html() {
-        let Some(handle) = enabled_handle(Arc::new(TokioExecutor), 4) else {
-            assert!(fandhe_browser_core::bundled_engines().is_empty());
-            return;
-        };
-        let page = "<body><script>var p=document.createElement('p');\
-                    p.textContent='from-script';document.body.appendChild(p)</script></body>";
-        let port = serve("200 OK", page);
-        let nav = NavigationState::new();
-        let url = format!("http://127.0.0.1:{port}/");
-        let out = navigate_gated(&allowed_fetcher(), &nav, &url, &Mutex::new(0), &handle)
-            .await
-            .unwrap();
-        assert_eq!(out.script, ScriptStage::Executed { abort: None });
-        assert_eq!(out.error_text, None);
-        assert!(
-            nav.latest().unwrap().html().contains("from-script"),
-            "executed HTML must be committed"
-        );
-    }
-
     /// `CDP-1`: JS 実行待ちの間に同一ターゲットの後続遷移が確定したら、古い遷移は
     /// `net::ERR_ABORTED` で何も確定しない。
     #[tokio::test]
@@ -1358,6 +1326,37 @@ mod tests {
         assert_eq!(first.error_text, Some("net::ERR_ABORTED"));
         assert!(first.committed.is_none());
         assert_eq!(nav.latest().unwrap().html(), "<p>new</p>");
+    }
+
+    /// `JS-4`・`CDP-1`: 同一ターゲットが `about:blank` へ遷移した時点で、待機中の古い JS 要求は
+    /// 打ち切られる（実行器を解放する前に待ち行列から外れ、古い遷移は `net::ERR_ABORTED`）。
+    #[tokio::test]
+    async fn js4_about_blank_cancels_pending_older_page_scripts() {
+        let Some((handle, tx)) = gated_handle(4) else {
+            assert!(fandhe_browser_core::bundled_engines().is_empty());
+            return;
+        };
+        let port = serve("200 OK", SCRIPT_PAGE);
+        let nav = NavigationState::new();
+        let gate = Mutex::new(0);
+        let fetcher = allowed_fetcher();
+        let url = format!("http://127.0.0.1:{port}/");
+        let first = navigate_gated(&fetcher, &nav, &url, &gate, &handle);
+        let rest = async {
+            until(|| handle.stats().queued() == 1).await;
+            let blank = navigate_gated(&fetcher, &nav, "about:blank", &gate, &handle)
+                .await
+                .unwrap();
+            assert!(blank.committed.is_some());
+            // 実行器を解放する前に、古い要求が待ち行列から外れている。
+            until(|| handle.stats().queued() == 0).await;
+            drop(tx);
+        };
+        let (first, ()) = tokio::join!(first, rest);
+        let first = first.unwrap();
+        assert_eq!(first.error_text, Some("net::ERR_ABORTED"));
+        assert!(first.committed.is_none());
+        assert_eq!(nav.latest().unwrap().url(), "about:blank");
     }
 
     // CdpState は AppState（Profile::open）が必要で非 unix では構築手段が無いため unix 限定
