@@ -91,6 +91,8 @@ case "${name}" in
     ;;
   check-ci-changes)
     bash scripts/ci-changes.sh --self-test
+    require_cmd jq "required by ${name}"
+    bash scripts/ci-prune-target.sh --self-test
     ;;
   check-binary-size)
     # `make ci` には含めない（cargo build --release のコストが大きいため）。CI では ci.yml の

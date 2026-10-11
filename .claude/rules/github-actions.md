@@ -42,7 +42,7 @@ lefthook との重複回避は [git-hooks](./git-hooks.md) を参照する。本
 3. 各ステップは `if: ${{ !cancelled() }}` で独立に走らせ、1 回の実行で全指摘を得る（既存方針）
 4. 検査コマンドは `make <target>` か `scripts/*.sh` を呼ぶ。CI 独自にロジックを書かない（ツール版は `scripts/versions.sh`）
 5. checkout は `persist-credentials: false`。`fetch-depth: 0` は差分・commit 範囲が要る `changes`・`lint-docs` のみ
-6. Rust ジョブは `actions/cache/restore` + `actions/cache/save`（保存は main のみ。`target` は `scripts/ci-prune-target.sh` で workspace 成果物を除いてから保存。Windows は除外）と `CARGO_INCREMENTAL=0`・`CARGO_PROFILE_DEV_DEBUG=line-tables-only`。key・保存条件は後述「キャッシュ方針」に従う
+6. Rust ジョブは `actions/cache/restore` + `actions/cache/save`（保存は main のみ。`target` は `scripts/ci-prune-target.sh` で workspace 成果物を除いてから保存。Windows を含む 3 OS 共通。prune は save と同じ条件〔main かつ exact hit でない〕のときだけ走らせ、PR と exact hit の main では省く）と `CARGO_INCREMENTAL=0`・`CARGO_PROFILE_DEV_DEBUG=line-tables-only`（3 OS 共通）。key・保存条件は後述「キャッシュ方針」に従う
 7. action はコミット SHA で固定し（`# vX.Y.Z` コメント付き）、新規 action は安易に追加しない（cache は `actions/cache`〔`/restore`・`/save` を含む〕、toolchain は `dtolnay/rust-toolchain` のみ）。`permissions` は最小権限で明示し、`timeout-minutes` を必ず設定する
 8. `run:` に `${{ }}` を直接埋め込まず `env:` 経由で渡す。secrets を PR ログへ出さない
 9. lefthook と同じ検査を CI に足さない／CI にある検査をフックに足さない（[git-hooks](./git-hooks.md)）
@@ -52,7 +52,7 @@ lefthook との重複回避は [git-hooks](./git-hooks.md) を参照する。本
 
 GitHub Actions の cache はリポジトリ単位で上限があり、超えると最終アクセスが古いものから追い出される（7 日間アクセスが無いものは削除）。
 本リポジトリの上限は **10GB**（Org 設定も 10GB）。Org の Actions 予算は **$0（超過時停止）** のため、10GB を超える上限は使えない（上限を上げると 10GB を超えた時点で cache が読み取り専用になる）。上限・予算の変更はユーザー判断事項。
-目標は「1 世代（全 cache 種別の合計。現状約 6〜7GB）を常時 10GB 以内に収め、追い出されても main の最新 cache に hit し続ける」こと。key 切り替え（`Cargo.lock`・rustc・`-vN` の変更）で新旧 2 世代が並ぶと古い世代が LRU で追い出されるが、新世代が保存された後なのでミスにはならない（2026-10-11 の実測で追い出しによる miss は 0 件。下記「実測」）。毎回読まれる main の最新 cache は LRU で最後まで残るため、この状態を保てていれば上限を上げる必要はない。新しい cache 種別の追加で常時 10GB を超える構成にしない。
+目標は「1 世代（全 cache 種別の合計。現状約 6〜7GB）を常時 10GB 以内に収め、追い出されても main の最新 cache に hit し続ける」こと。key 切り替え（`Cargo.lock`・rustc・`-vN` の変更）で新旧 2 世代が並ぶと古い世代が LRU で追い出されるが、新世代が保存された後なのでミスにはならない（2026-10-11 の実測で追い出しによる miss は 0 件。下記「実測」）。毎回読まれる main の最新 cache は LRU で最後まで残るため、この状態を保てていれば上限を上げる必要はない。新しい cache 種別の追加で常時 10GB を超える構成は避ける。ただし Windows の cache 追加（test・features・harness の 3 種）で 1 世代が 10GB に近づく、または超える場合に古い cache が追い出されることは、オーナー判断（2026-10-11）として許容する（追い出されても main の最新 cache が残ればよい）。Windows 3 種のサイズは `workflow_dispatch` の計測で features 912MB・test 500MB・harness 376MB（圧縮後。合計約 1.8GB）で、Linux・macOS の 1 世代（約 7.1GB）と合わせても 10GB 以内に収まる見込み（`windows-latest` の `Windows` が key に入るため Linux・macOS とは別の cache）。
 
 ### 入れる前に効果を測る
 
@@ -78,9 +78,9 @@ GitHub Actions の cache はリポジトリ単位で上限があり、超える�
 ### サイズ削減
 
 - `target` は保存前に `scripts/ci-prune-target.sh` で workspace メンバーの成果物を除く（依存 crate の成果物だけ残す）。同スクリプトは最後に cache 対象の展開後サイズ（`du -sh`）を出す
-- cache を使う Rust ジョブは `CARGO_INCREMENTAL=0` と `CARGO_PROFILE_DEV_DEBUG=line-tables-only`（workspace メンバーを含む全体の debuginfo を行番号のみにする。release・bench には影響しない）。依存 crate は `Cargo.toml` の `[profile.dev.package."*"]` でも同じ値に固定済み（ローカル開発と共用）で衝突しないが、メンバーまで行番号のみにするのは env だけのため env は維持する
+- Rust ジョブ（Windows を含む 3 OS）は `CARGO_INCREMENTAL=0` と `CARGO_PROFILE_DEV_DEBUG=line-tables-only`（workspace メンバーを含む全体の debuginfo を行番号のみにする。release・bench には影響しない）。依存 crate は `Cargo.toml` の `[profile.dev.package."*"]` でも同じ値に固定済み（ローカル開発と共用）で衝突しないが、メンバーまで行番号のみにするのは env だけのため env は維持する。Windows ではこれに加えて PDB 生成・リンク時間の短縮にもなる（効果は `workflow_dispatch` で計測する）
 - target を cache しても効果が無いジョブは registry のみにする（`cross-target-check`：v8 の prebuilt がターゲットごとに約 150MB あり、check のみで再ビルドが速いため）
-- 新しい cache を足す前に、既存の cache 種別（test・features・harness・cross）と共有できないかを確認し、足す場合は 1 世代の合計が上記の目標に収まるかを見積もる
+- 新しい cache を足す前に、既存の cache 種別（test・features・harness・cross）と共有できないかを確認し、足す場合は 1 世代の合計が上記の目標に収まるかを見積もる（Windows の 3 種は追い出し許容のオーナー判断のうえ導入した。サイズは上記「cache 予算」の通り）
 
 ### 計測方法
 
@@ -138,7 +138,7 @@ gh api repos/Fandhe-AI/fandhe-browser/actions/runs/<run-id>/jobs --paginate   # 
 | ワークフロー | トリガー | 実測 | 備考 |
 | ------------ | -------- | ---- | ---- |
 | `ci.yml`（PR） | pull_request | 中央値 11.0 分・最大 12.5 分（20 件） | 最長は `rust-features-ubuntu` 約 12 分（clippy と test を 14 ステップで直列実行）、次いで `rust-test-ubuntu` 約 7 分。docs-only は `changes` + `lint-docs` のみで約 30 秒 |
-| `ci.yml`（main push） | push | 中央値 22.6 分・最大 30.9 分（6 件） | 3 OS 実行。Windows の `rust-features-windows` が最長（約 31 分） |
+| `ci.yml`（main push） | push | 中央値 22.6 分・最大 30.9 分（6 件） | 3 OS 実行。Windows の `rust-features-windows` が最長（約 31 分。Windows の cache 導入後は約 17 分で、`workflow_dispatch` 1 回の計測。main push の値は未計測） |
 | `ai-review.yml` | pull_request | 約 1〜2 分 | |
 | `update-external.yml` | schedule・dispatch | 約 2 分 | 日次 |
 | `bench-competitor.yml` | schedule・dispatch | 約 2〜3 分 | 週次・3 OS。対象バイナリ未配線のため skipped が多い |

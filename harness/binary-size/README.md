@@ -123,8 +123,8 @@ make check-binary-size
 TASK-34.3（#467）で導入。3 OS（ubuntu/macos/windows）の各ネイティブランナーで
 実行し、`make` は使わない（windows-latest に `make` がある保証がないため。
 `harness-*` ジョブの他のステップ（`compat-regression`・`bench-record-selftest`）と同じ方針でスクリプトを直接
-呼ぶ）。ubuntu・macos は actions/cache で依存ビルドを再利用し（`scripts/ci-prune-target.sh`
-で workspace 成果物を除いてから保存）、windows-latest のみ cache prune の既知問題で除外する。
+呼ぶ）。3 OS とも actions/cache で依存ビルドを再利用する（`scripts/ci-prune-target.sh`
+で workspace 成果物を除いてから保存。Windows の prune 失敗の原因と対処は同スクリプトのヘッダー参照）。
 
 上限値・package 名は `scripts/versions.sh` の `BINARY_SIZE_LIMIT_BYTES` /
 `BINARY_SIZE_PACKAGE` を単一真実源とし、ジョブ側では値を重複定義しない。
