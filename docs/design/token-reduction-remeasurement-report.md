@@ -47,7 +47,7 @@
 
 | name | rawHtmlTokens | rawDomTokens | snapshotTokens | 対生 HTML 削減率（%） | 対生 DOM 削減率（%） |
 | ---- | ------------- | ------------ | -------------- | --------------------- | -------------------- |
-| checkboxes-form | 160 | 108 | 62 | 61.3 | 42.6 |
+| checkboxes-form | 160 | 108 | 72 | 55.0 | 33.3 |
 | dashboard-table | 897 | 846 | 673 | 25.0 | 20.4 |
 | dropdown-form | 188 | 136 | 100 | 46.8 | 26.5 |
 | ec-product-list | 8055 | 7947 | 4275 | 46.9 | 46.2 |

@@ -87,6 +87,10 @@
 //! | `button`（`<button>` 要素） | `button` Element Accessible Name Computation | label → 子孫テキスト（`NameSource::Content`）→ `title` → 名前なし | trim 後に空なら次点へ |
 //! | その他の要素 | 各種 Section/Grouping・Text-level 等の節 | name-from-content role（link・heading・cell 等）なら 子孫テキスト → `title`、それ以外は `title` のみ → 名前なし | trim 後に空なら名前なし |
 //!
+//! 補足（本実装独自・TASK-17・Issue #834）: `checkbox`/`radio` は accname が空のとき、出力 name にだけ
+//! 直後の兄弟テキストを補う（[`compute_adjacent_text_name`]。`NameSource::AdjacentText`）。
+//! accname と ref シグネチャは上表のまま（空）で、ref は不変。
+//!
 //! ラベル関連付け（HTML Standard の labeled control 規則。上表の「label」段）
 //! は `for` 属性（文書順で最初に一致する `id` を持つ要素が対象と同じ場合の
 //! み）または label による包含（label の子孫のうち文書順で最初の
@@ -119,6 +123,11 @@ pub(super) const MAX_DATA_LEAF_VALUE_CHARS: usize = 300;
 /// 超過した断片は [`NameBuffer`] 側で必ず `truncated` になり、切り詰めは
 /// 結果へ伝わる）。
 const NORMALIZED_LABEL_TEXT_CHAR_LIMIT: usize = MAX_NAME_CHARS * 4;
+
+/// [`compute_adjacent_text_name`] が `checkbox`・`radio` の直後から走査する兄弟ノード数の上限
+/// （TASK-17・Issue #834）。コメントノードを大量に並べた入力でも走査量を有界にする
+/// （security.md「不安全な設計」対策）。超過時は `truncated` を立てる。
+pub(super) const MAX_ADJACENT_TEXT_SIBLINGS: usize = 16;
 
 /// [`NameIndex`] が 1 文書につき許す、キャッシュ不能な `aria-labelledby` 参照先
 /// 部分木の走査回数の上限（`AISNAP-1`・TASK-11.4.1）。参照先が対象要素自身を
@@ -259,6 +268,13 @@ pub enum NameSource {
     Content,
     /// 文書ルートの最初の HTML `<title>` 要素により算出した（TASK-11.4.3）。
     DocumentTitle,
+    /// ラベルのない `checkbox`・`radio` の直後の兄弟テキストにより補った
+    /// （[`compute_adjacent_text_name`]。`AISNAP-10`・`AISNAP-12`・TASK-17・Issue #834）。
+    ///
+    /// HTML-AAM の accname 算出には無い本実装独自の補完で、出力 name 専用。
+    /// ref シグネチャには使わない（ref は accname＝空のまま不変）ため、
+    /// [`compute_name_with_index`] がこの出所を返すことはない。
+    AdjacentText,
 }
 
 /// 要素の accessible name（`AISNAP-1`）。[`super::Node::name`] の算出結果。
@@ -1361,6 +1377,72 @@ pub(super) fn compute_data_leaf_value(
     content_name_with_limit(doc, id, MAX_DATA_LEAF_VALUE_CHARS, &index.value_steps_left)
 }
 
+/// ラベルのない `checkbox`・`radio` の出力用 name を、直後の兄弟テキストから補う
+/// （`AISNAP-10`・`AISNAP-12`・TASK-17・Issue #834）。
+///
+/// 呼び出し元: `snapshot::build` が、accname が空で打ち切りのない `checkbox`・`radio` にだけ呼ぶ。
+/// 結果は出力 `Node::name` にのみ使い、ref シグネチャへは渡さない（ref は不変。`AISNAP-10`）。
+/// HTML-AAM の accname（label → title）は [`compute_name_with_index`] のまま変えない。
+///
+/// 規則: `id` の直後の兄弟を最大 [`MAX_ADJACENT_TEXT_SIBLINGS`] 個まで辿り、テキストノードを連結する。
+/// コメントは読み飛ばし、要素（`<br>`・`<label>` 等）に当たったら止める。結果は空白を畳み
+/// [`MAX_NAME_CHARS`] で切り詰める。走査上限で打ち切った場合は `truncated: true`。
+/// 補う文字がなければ `None`（対象外の要素も `None`）。
+///
+/// 既知の制約（REPAIR-3）: 前置テキスト・`<span>` 等で包まれたテキストは拾わない。`<br>` なしで
+/// 1 行に並ぶ `A <input> B <input>` では直後のテキストへ紐付く。row・cell 内では親の残余 name にも
+/// 同じテキストが残る。兄弟の位置探索は親の子数に比例する。
+pub(super) fn compute_adjacent_text_name(doc: &Document, id: NodeId) -> Option<AccessibleName> {
+    if !is_html_element_named(doc, id, "input")
+        || !matches!(
+            normalized_input_type(doc, id).as_str(),
+            "checkbox" | "radio"
+        )
+    {
+        return None;
+    }
+    let parent = doc.parent(id)?;
+    let mut text = String::new();
+    let mut normalized_chars = 0usize;
+    let mut pending_space = false;
+    let mut cut = false;
+    for (scanned, sibling) in doc
+        .children(parent)
+        .skip_while(|&s| s != id)
+        .skip(1)
+        .enumerate()
+    {
+        if scanned >= MAX_ADJACENT_TEXT_SIBLINGS {
+            cut = true;
+            break;
+        }
+        match doc.node_data(sibling) {
+            Some(NodeData::Text { contents }) => {
+                if fold_chars_into(
+                    contents.chars(),
+                    &mut text,
+                    &mut normalized_chars,
+                    &mut pending_space,
+                    NORMALIZED_LABEL_TEXT_CHAR_LIMIT,
+                ) {
+                    break;
+                }
+            }
+            Some(NodeData::Comment { .. }) => {}
+            _ => break,
+        }
+    }
+    let mut buf = NameBuffer::new();
+    buf.push_str(&text);
+    let truncated = cut || buf.truncated;
+    if buf.text.is_empty() && !cut {
+        return None;
+    }
+    let mut result = buf.finish(NameSource::AdjacentText);
+    result.truncated = truncated;
+    Some(result)
+}
+
 /// row・cell の出力 name を、`covered`（部分木のテキストが子孫ノードの name で出力済みの
 /// 要素）を除いた残余テキストへ縮めた name を算出する（`AISNAP-1`・TASK-23.6・Issue #828）。
 ///
@@ -1853,6 +1935,7 @@ mod tests {
         MAX_LABELS_SCANNED, MAX_NAME_CHARS, MAX_UNCACHED_REFERENT_SCANS, NameIndex, NameSource,
         compute_name, compute_name_with_index,
     };
+    use super::{MAX_ADJACENT_TEXT_SIBLINGS, compute_adjacent_text_name};
     use fandhe_browser_core::dom::{Document, NodeId};
     use fandhe_browser_core::parse::{ParseOptions, parse_document};
     use fandhe_browser_core::query::query_selector_str;
@@ -1873,6 +1956,94 @@ mod tests {
     fn name(html: &str, selector: &str) -> AccessibleName {
         let (doc, id) = parse_and_select(html, selector);
         compute_name(&doc, id)
+    }
+
+    // --- 隣接テキスト（TASK-17・Issue #834） ---
+
+    fn adjacent(html: &str, selector: &str) -> Option<AccessibleName> {
+        let (doc, id) = parse_and_select(html, selector);
+        compute_adjacent_text_name(&doc, id)
+    }
+
+    fn adjacent_at(html: &str, selector_all: &str, index: usize) -> Option<AccessibleName> {
+        let parsed = parse_document(html, &ParseOptions::default()).expect("ok");
+        let doc = parsed.document;
+        let all =
+            fandhe_browser_core::query::query_selector_all_str(&doc, doc.root(), selector_all)
+                .expect("セレクタは解釈できる");
+        compute_adjacent_text_name(&doc, *all.get(index).expect("要素がある"))
+    }
+
+    /// AISNAP-10/AISNAP-12・TASK-17（#834）: `<br>` で区切られた checkbox が直後のテキストを得る。
+    #[test]
+    fn task_17_adjacent_text_names_unlabeled_checkboxes() {
+        let html = "<input type=checkbox> checkbox 1<br><input type=checkbox> checkbox 2";
+        let want = |t: &str| {
+            Some(
+                AccessibleName::default()
+                    .with_text(t)
+                    .with_source(NameSource::AdjacentText),
+            )
+        };
+        assert_eq!(adjacent_at(html, "input", 0), want("checkbox 1"));
+        assert_eq!(adjacent_at(html, "input", 1), want("checkbox 2"));
+    }
+
+    /// accname 自体は HTML-AAM どおり空のまま（ref 不変の前提）。
+    #[test]
+    fn task_17_accname_stays_empty_for_unlabeled_checkbox() {
+        let r = name("<input type=checkbox> checkbox 1", "input");
+        assert_eq!(r, AccessibleName::default());
+    }
+
+    #[test]
+    fn task_17_adjacent_text_names_radios() {
+        let html = "<input type=radio name=p> Free<br><input type=radio name=p> Pro";
+        assert_eq!(
+            adjacent_at(html, "input", 0).map(|n| n.text),
+            Some("Free".into())
+        );
+        assert_eq!(
+            adjacent_at(html, "input", 1).map(|n| n.text),
+            Some("Pro".into())
+        );
+    }
+
+    #[test]
+    fn task_17_adjacent_text_none_cases() {
+        assert_eq!(adjacent("<input type=checkbox>   ", "input"), None);
+        assert_eq!(adjacent("<input type=checkbox>", "input"), None);
+        assert_eq!(adjacent("<input type=checkbox><b>x</b> y", "input"), None);
+        assert_eq!(adjacent("<input type=range> foo", "input"), None);
+        assert_eq!(adjacent("<input> foo", "input"), None);
+        assert_eq!(adjacent("<select></select> foo", "select"), None);
+    }
+
+    #[test]
+    fn task_17_adjacent_text_skips_comments() {
+        let r = adjacent("<input type=checkbox><!--c--> foo", "input").expect("some");
+        assert_eq!(r.text, "foo");
+        assert!(!r.truncated);
+    }
+
+    #[test]
+    fn task_17_adjacent_text_truncation_boundary() {
+        let exact = "a".repeat(MAX_NAME_CHARS);
+        let r = adjacent(&format!("<input type=checkbox> {exact}"), "input").expect("some");
+        assert_eq!(r.text.chars().count(), MAX_NAME_CHARS);
+        assert!(!r.truncated);
+        let over = "a".repeat(MAX_NAME_CHARS + 1);
+        let r = adjacent(&format!("<input type=checkbox> {over}"), "input").expect("some");
+        assert_eq!(r.text.chars().count(), MAX_NAME_CHARS);
+        assert!(r.truncated);
+    }
+
+    #[test]
+    fn task_17_adjacent_text_sibling_scan_is_bounded() {
+        let comments = "<!--c-->".repeat(MAX_ADJACENT_TEXT_SIBLINGS + 2);
+        let r = adjacent(&format!("<input type=checkbox>{comments} foo"), "input").expect("some");
+        assert_eq!(r.text, "");
+        assert!(r.truncated);
     }
 
     // --- img ---
