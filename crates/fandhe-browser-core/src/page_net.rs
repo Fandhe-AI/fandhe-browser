@@ -178,6 +178,7 @@ impl NetRejectKind {
             Error::DisallowedScheme { .. } => Self::DisallowedScheme,
             Error::DisallowedAddress { .. } => Self::DisallowedAddress,
             Error::TooManyRedirects { .. } => Self::TooManyRedirects,
+            Error::CrossOriginRedirect => Self::CrossOrigin,
             Error::Timeout { .. } => Self::Timeout,
             Error::Network { .. } | Error::TooManyConcurrentDnsResolutions { .. } => Self::Network,
             _ => Self::Other,

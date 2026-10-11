@@ -44,8 +44,6 @@
     var toStr = String;
     var queueMicro = global.queueMicrotask;
     var MAX_TEXT_UNITS = 4097;
-    // 1 回の配送で読む本文チャンク数の上限（64 KiB × 1024 は累計上限 4 MiB より十分大きい）。
-    var MAX_CHUNKS = 1024;
 
     // 要求 ID → { kind: 'fetch', resolve, reject } | { kind: 'xhr', xhr }。
     var pending = createObject(null);
@@ -319,19 +317,16 @@
         var url = '';
         if (status > 0) {
             try {
-                // 空チャンク（終端）を確認できないまま上限に達したら、切り詰めた本文を成功として
-                // 公開せず失敗にする。
-                var ended = false;
-                for (var i = 0; i < MAX_CHUNKS; i++) {
+                // 空チャンク（終端）まで読む。チャンクの大きさはブリッジの設定上限で変わるため
+                // 固定の回数では打ち切らない。各回は 1 バイト以上進み、本文の総量は Rust 側で
+                // 累計上限に収まっており、読み出しの回数は操作予算と実時間上限（`JS-6`）が
+                // 制限する（超過時は op がエラーになり、下の catch で失敗にする）。
+                for (;;) {
                     var chunk = callOp('netReadBody', id);
                     if (typeof chunk !== 'string' || chunk.length === 0) {
-                        ended = true;
                         break;
                     }
                     body += chunk;
-                }
-                if (!ended) {
-                    throw new NativeError('response body too long to deliver');
                 }
                 url = toStr(callOp('netFinalUrl', id));
             } catch (e) {

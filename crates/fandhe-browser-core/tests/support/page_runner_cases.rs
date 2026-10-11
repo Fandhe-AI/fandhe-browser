@@ -635,7 +635,44 @@ fn net_cases(engine: &str) {
         rejections(&out),
         vec![(NetRequestKind::Xhr, NetRejectKind::CrossOrigin)]
     );
-    let _ = other_hits;
+    // 別オリジンには要求自体が出ない（応答を隠すだけでなく送信前に打ち切る）。
+    assert_eq!(hit_count(&other_hits), 0);
+
+    eprintln!("case: JS-8 an A -> B -> A redirect chain never sends a request to B");
+    let a_port_cell = Arc::new(std::sync::atomic::AtomicU16::new(0));
+    let b_cell = a_port_cell.clone();
+    let (b_port, b_hits) = spawn_recording_server(move |_| {
+        let a = b_cell.load(std::sync::atomic::Ordering::SeqCst);
+        (
+            "302 Found",
+            format!("Location: http://127.0.0.1:{a}/final\r\n"),
+            String::new(),
+        )
+    });
+    let (a_port, a_hits) = spawn_recording_server(move |path| match path {
+        "/final" => ("200 OK", String::new(), "leaked".to_string()),
+        _ => (
+            "302 Found",
+            format!("Location: http://localhost:{b_port}/mid\r\n"),
+            String::new(),
+        ),
+    });
+    a_port_cell.store(a_port, std::sync::atomic::Ordering::SeqCst);
+    let out = run_page_at(
+        engine,
+        &xhr_page("r"),
+        &format!("http://127.0.0.1:{a_port}/page.html"),
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert!(out.html().contains("<p>error:0</p>"), "{}", out.html());
+    assert!(!out.html().contains("leaked"), "{}", out.html());
+    assert_eq!(
+        rejections(&out),
+        vec![(NetRequestKind::Xhr, NetRejectKind::CrossOrigin)]
+    );
+    assert_eq!(hit_count(&b_hits), 0);
+    assert_eq!(hit_count(&a_hits), 1);
 
     eprintln!("case: JS-8 re-opening an XHR drops the stale response");
     let (port, _hits) = spawn_recording_server(|path| match path {
