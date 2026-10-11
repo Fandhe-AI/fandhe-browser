@@ -52,7 +52,7 @@ cargo test --workspace
 - main・`workflow_dispatch` の macOS・Windows ジョブを、特定 OS のみの skip や `continue-on-error` で通さない。PR で省くのはイベント単位の方針であり、個別のテスト・ステップを特定 OS だけ飛ばしてよいという意味ではない
 - クロス型検査（`cross-target-check`）は ubuntu 上で `aarch64-apple-darwin` と `x86_64-pc-windows-msvc` に対し `cargo check --workspace --all-targets --all-features --target <t>` と `cargo clippy ... -- -D warnings`（`--all-features` と既定 feature）を実行する。リンクもテスト実行もしない型検査で、ネイティブ実行の代わりにはならない。**範囲は限定される**（2026-10-10 にローカル実測）: 依存の `rustls` が使う `ring` は build.rs で C / アセンブラをクロスコンパイルし、macOS SDK / MSVC のヘッダ・`lib.exe` が要るため ubuntu 上では成立しない。そのため `ring` を引く `fandhe-browser-core` とそれに依存する `-ai`・`-cdp`・`-cli`、および `wpt-subset-runner` は `--exclude` で外し、`fandhe-browser-js`（V8・boa）・`-profile`・`-mcp`・`-render` だけを検査する（この 4 crate は `cargo tree` で `cc`・`ring`・`cmake` を持たないことを確認済み）。core・ai・cdp・cli の OS 固有分岐のコンパイル・lint の誤りは PR では検出されず、main の macOS・Windows ネイティブ実行で初めて判明する。`--exclude` 方式のため、新たに `ring` 等を引く crate が増えると失敗として表面化する。`cc` を使う依存を js・profile・mcp・render に追加する場合は、その crate もここで `--exclude` する。v8 の build.rs が prebuilt 静的ライブラリ（約 150MB / ターゲット）をダウンロードするため、target は cache しない。将来の拡張候補は Windows 向けの `x86_64-pc-windows-gnu` + mingw（macOS には効かない）で、導入にはユーザー判断が要る
 - `cargo tree` による分離検証（`harness-*` の `[render-isolation]`・`[js-engine-isolation]`）は target 依存のため 3 OS で実行する。`cargo fmt`・`cargo deny` は OS 非依存のため ubuntu のみ（`rust-lint`）
-- cache（`actions/cache`・`scripts/ci-prune-target.sh` で workspace 成果物を除いてから保存）は ubuntu・macOS のみ。Windows は cache prune の既知問題で除外する（その分 Windows ジョブは所要時間が長いため timeout を長めに取る）
+- cache（`actions/cache/restore`・`actions/cache/save`。保存は main のみで、`scripts/ci-prune-target.sh` で workspace 成果物を除いてから保存。key 設計・上限・予算は [github-actions](./github-actions.md)「キャッシュ方針」）は ubuntu・macOS のみ。Windows は cache prune の既知問題で除外する（その分 Windows ジョブは所要時間が長いため timeout を長めに取る）
 
 ## 分離・構成の検証
 
@@ -80,7 +80,7 @@ cargo test --workspace
 
 - ジョブ追加・変更時は [github-actions](./github-actions.md)（runner 方針・発火条件・追加チェックリスト・計測方法）に従う
 
-- GitHub Actions のサードパーティ action はコミット SHA で固定し、新しい action を安易に追加しない（cache は `actions/cache`、toolchain は `dtolnay/rust-toolchain` のみ）
+- GitHub Actions のサードパーティ action はコミット SHA で固定し、新しい action を安易に追加しない（cache は `actions/cache`〔`/restore`・`/save` を含む〕、toolchain は `dtolnay/rust-toolchain` のみ）
 - `permissions` は最小権限で明示する
 - 出る check-run の名前を変える変更（ジョブ・`name:` の追加 / 改名）は ruleset の required checks との同時更新が必要。reusable workflow 呼び出し（`caller / callee` 形式の名前）や matrix は required にするジョブでは使わない
 - secrets を `pull_request` イベントのログへ出力しない
