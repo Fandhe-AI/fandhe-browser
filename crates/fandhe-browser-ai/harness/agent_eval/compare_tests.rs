@@ -250,13 +250,23 @@ fn aisnap9_out_dir_check_rejects_unsafe_paths() {
     let root_buf = tmp.join("repo-root-for-test");
     let root = root_buf.as_path();
     assert!(check_out_dir(Path::new("relative/dir"), root).is_err());
-    assert!(check_out_dir(&root.join("..").join("etc"), root).is_err());
-    // verbatim パス（Windows の canonicalize 結果）でも `..` を ParentDir 以外の要素として拒否する（AISNAP-9）
-    #[cfg(windows)]
-    {
-        let verbatim = Path::new(r"\\?\C:\fandhe-test-root").join("..").join("etc");
-        assert!(check_out_dir(&verbatim, Path::new(r"\\?\C:\fandhe-test-root")).is_err());
-    }
+    // `Path::join("..")` は使えない: Windows の verbatim パス（`\\?\C:\...`。canonicalize の戻り値）では
+    // `PathBuf::push` が `..` を字句的に解決して直前の要素ごと消すため、入力に `..` が残らず
+    // 「リポジトリ外の絶対パス」として受理されるのが仕様どおりになってしまう。
+    // OsString の連結なら push の正規化を通らず、Linux でも Windows（verbatim）でも
+    // components() に ParentDir が残る（parse_single_component は verbatim でも `..` を ParentDir にする）。
+    let mut raw = root.as_os_str().to_owned();
+    raw.push(std::path::MAIN_SEPARATOR_STR);
+    raw.push("..");
+    raw.push(std::path::MAIN_SEPARATOR_STR);
+    raw.push("etc");
+    let with_parent = PathBuf::from(raw);
+    assert!(
+        with_parent
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+    );
+    assert!(check_out_dir(&with_parent, root).is_err());
     assert!(check_out_dir(&root.join("out"), root).is_err());
     assert!(check_out_dir(root, root).is_err());
     let other = tmp.join("other-root").join("out");

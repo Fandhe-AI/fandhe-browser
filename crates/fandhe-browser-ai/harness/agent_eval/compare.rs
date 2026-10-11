@@ -413,13 +413,7 @@ pub fn check_out_dir(out_dir: &Path, repo_root: &Path) -> Result<(), CompareErro
             "must be an absolute path".to_owned(),
         ));
     }
-    // Windows の verbatim パス（`\\?\C:\...`）では `..` が ParentDir でなく Normal("..") として
-    // 解釈されるため、ParentDir に加えて名前が `..` の Normal 要素も拒否する
-    if out_dir.components().any(|c| match c {
-        Component::ParentDir => true,
-        Component::Normal(name) => name == "..",
-        _ => false,
-    }) {
+    if out_dir.components().any(|c| c == Component::ParentDir) {
         return Err(CompareError::OutDirRejected(
             "must not contain '..'".to_owned(),
         ));
