@@ -26,7 +26,7 @@
   {
     "id": "click-05",
     "locators": [
-      {"selector": "span.titleline > a", "index": 1, "refs": ["e59ac323c"]}
+      {"selector": "span.titleline > a", "index": 1, "refs": ["ec1dfbe95"]}
     ]
   },
   {
@@ -120,8 +120,8 @@
   {
     "id": "nav-01",
     "locators": [
-      {"selector": "a#js-link-box-x3", "index": 0, "refs": ["ecfa0575b"]},
-      {"selector": "div.lang3 > a", "index": 0, "refs": ["ecfa0575b"]},
+      {"selector": "a#js-link-box-x3", "index": 0, "refs": ["e768f954a"]},
+      {"selector": "div.lang3 > a", "index": 0, "refs": ["e768f954a"]},
       {"selector": "li.lang-item > a[title=\"Language 3\"]", "index": 0, "refs": ["e93cab2ec"]}
     ]
   },

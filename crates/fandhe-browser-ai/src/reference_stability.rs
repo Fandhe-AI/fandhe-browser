@@ -844,10 +844,12 @@ fn aisnap_10_aria_hidden_with_nbsp_is_not_excluded() {
 fn aisnap_10_name_budget_exhaustion_matches_snapshot() {
     // 1 要素あたりの走査上限（1024）に届く内容を持つ role=button の入れ子を、40 グループ並べる。
     // 入れ子の各祖先が同じ子孫を重複して走査するため、少ないノード数で総予算（2^21）を使い切る。
+    // 葉は空要素にする（要素境界の区切り〔TASK-17・#835〕で文字数上限へ早く届き、
+    // ステップを使い切る前に打ち切られるのを避けるため）。
     let group = format!(
         "{}{}{}",
         "<div role=\"button\">".repeat(60),
-        "<i>x</i>".repeat(1100),
+        "<i></i>".repeat(1100),
         "</div>".repeat(60)
     );
     let html = page(&format!(

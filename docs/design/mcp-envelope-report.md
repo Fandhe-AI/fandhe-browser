@@ -38,8 +38,8 @@
 | name | rawHtmlTokens | directTokens | mcpTextTokens | mcpLineTokens | envelopeTokens | envelopePct | directBytes | directReductionPct | mcpReductionPct |
 | ---- | ------------- | ------------ | ------------- | ------------- | -------------- | ----------- | ----------- | ------------------ | --------------- |
 | example-minimal | 103 | 68 | 68 | 109 | 41 | 60.3 | 276 | 34.0 | -5.8 |
-| wikipedia-article | 56482 | 32174 | 32174 | 38099 | 5925 | 18.4 | 113693 | 43.0 | 32.5 |
-| hn-list | 10220 | 10803 | 10803 | 13073 | 2270 | 21.0 | 37255 | -5.7 | -27.9 |
+| wikipedia-article | 56482 | 32151 | 32151 | 38076 | 5925 | 18.4 | 113733 | 43.1 | 32.6 |
+| hn-list | 10220 | 10788 | 10788 | 13058 | 2270 | 21.0 | 37255 | -5.6 | -27.8 |
 | login-form | 284 | 165 | 165 | 224 | 59 | 35.8 | 620 | 41.9 | 21.1 |
 | mdn-docs | 19005 | 24744 | 24744 | 27780 | 3036 | 12.3 | 79915 | -30.2 | -46.2 |
 
@@ -47,10 +47,10 @@
 
 | metric | mean | min | max |
 | ------ | ---- | --- | --- |
-| DirectReductionPct | 16.6 | -30.2 | 43.0 |
-| McpReductionPct | -5.2 | -46.2 | 32.5 |
+| DirectReductionPct | 16.6 | -30.2 | 43.1 |
+| McpReductionPct | -5.2 | -46.2 | 32.6 |
 | EnvelopeTokens | 2266.2 | 41.0 | 5925.0 |
-| EnvelopePct | 29.5 | 12.3 | 60.3 |
+| EnvelopePct | 29.6 | 12.3 | 60.3 |
 
 ### レイテンシ
 
@@ -79,7 +79,7 @@
 
 ## 所見
 
-- 方式 B 本体の対生 HTML 削減率は 5 サイト中 3 サイトで正（example-minimal 34.0%・wikipedia-article 43.0%・login-form 41.9%）、hn-list（-5.7%）・mdn-docs（-30.2%）は負（平均 16.6%、範囲 -30.2% から 43.0%）。MCP 応答行全体では平均 -5.2%。snapshot が JSON ツリー形式のため一部ページで生 HTML より大きい（`AISNAP-6`・TASK-19 の論点）
+- 方式 B 本体の対生 HTML 削減率は 5 サイト中 3 サイトで正（example-minimal 34.0%・wikipedia-article 43.1%・login-form 41.9%）、hn-list（-5.6%）・mdn-docs（-30.2%）は負（平均 16.6%、範囲 -30.2% から 43.1%）。MCP 応答行全体では平均 -5.2%。snapshot が JSON ツリー形式のため一部ページで生 HTML より大きい（`AISNAP-6`・TASK-19 の論点）
 - エンベロープ（JSON-RPC フレーム等）のトークン増分は 41 から 5925 トークン（平均 2266.2）、方式 B 本体に対して 12.3% から 60.3%（平均 29.5%）。小さいページほど比率が大きい
 - レイテンシ増分（MCP - 直接）は全体で p50 0.940 ms、p95 2.571 ms、平均 1.044 ms。小ページ（example-minimal・login-form）は約 0.1 ms、wikipedia-article は p50 2.307 ms
 - PLUG-4 レポートは MCP の text コンテンツのみを数えるが、本レポートの mcpLine は JSON-RPC 応答行全体を数える。両レポートの数値は定義が異なる

@@ -323,9 +323,36 @@ fn is_outside_snapshot(doc: &Document, id: NodeId) -> bool {
 /// 固定表（`(フル name, 残余 name)`）。残余は子孫ノードに出ないテキストだけで、HN_LIST の
 /// リンクだけを含む行・セルでは区切りの `|` も含め空になる。
 const RESIDUAL_NAMES: [(&str, &str); 2] = [
-    ("Homenew | past", ""),
-    ("Sample Story AlphaSample Story BetaSample Story Gamma", ""),
+    ("Home new | past", ""),
+    (
+        "Sample Story Alpha Sample Story Beta Sample Story Gamma",
+        "",
+    ),
 ];
+
+/// `dom` の子孫テキストを、要素の開始・終了ごとに区切り空白を入れて連結し、空白を折り畳む。
+///
+/// TASK-17（#835）: name from content・データ葉の値は要素境界で区切る。テストが期待値を
+/// 製品コードと独立に組み立てるための参照実装（script・style 等は取り込まない
+/// フィクスチャ制約下で成立する）。
+fn boundary_separated_text(doc: &Document, dom: NodeId) -> String {
+    fn walk(doc: &Document, id: NodeId, out: &mut String) {
+        for child in doc.children(id) {
+            match doc.node_data(child) {
+                Some(NodeData::Text { contents }) => out.push_str(contents),
+                Some(NodeData::Element { .. }) => {
+                    out.push(' ');
+                    walk(doc, child, out);
+                    out.push(' ');
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut raw = String::new();
+    walk(doc, dom, &mut raw);
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 /// Snapshot ノードの name が DOM 側のフル name と対応するか。
 ///
@@ -346,12 +373,7 @@ fn name_matches(doc: &Document, dom: NodeId, role: &str, n: &Node, full_name: &s
             Some(DataLeafKind::PriceClass | DataLeafKind::ProseClass | DataLeafKind::Quote)
         )
     {
-        let value = doc
-            .text_content(dom)
-            .unwrap_or_default()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let value = boundary_separated_text(doc, dom);
         return !value.is_empty() && n.name == value;
     }
     // TASK-17（#834）: accname が空の checkbox・radio は、出力 name が直後の兄弟テキスト
