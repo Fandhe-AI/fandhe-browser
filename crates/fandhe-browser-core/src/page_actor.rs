@@ -8,7 +8,7 @@
 //! await するため。`page_runner` のモジュール doc）。cdp のハンドラ（`Send` な async）は直接
 //! 呼べないので、本モジュールが専用スレッドでランナーを駆動し、ハンドルの
 //! [`PageScriptHandle::run_page_scripts`] が結果を返す。`AppState::page_scripts()`
-//! （`CdpState::app_state()` 経由）で到達でき、`navigate_gated` への接続は TASK-113（#785）が行う。
+//! （`CdpState::app_state()` 経由）で到達でき、cdp の `navigate_gated` が HTML 取得後・確定前に呼ぶ（TASK-112・#785）。
 //! cli が設定 `[js] execute_page_scripts` からハンドルを構築して `AppState` へ渡す。
 //!
 //! # tokio を持たない理由と実行器

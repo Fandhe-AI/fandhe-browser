@@ -169,7 +169,7 @@ pub(crate) fn open_app_state(store: &dyn ProfileStore) -> Result<Arc<AppState>, 
 ///
 /// ハンドルは `main` が設定 `[js] execute_page_scripts` から構築する（無効なら無効ハンドル）。
 /// `AppState` → `CdpState::app_state()` 経由で cdp の `Page.navigate` 経路から到達できる
-/// （接続は TASK-113・#785）。ハンドルを渡してもスレッドは起動しない（遅延起動）。
+/// （cdp の `navigate_gated` へ接続済み。TASK-112・#785）。ハンドルを渡してもスレッドは起動しない（遅延起動）。
 pub(crate) fn open_app_state_with(
     store: &dyn ProfileStore,
     page_scripts: PageScriptHandle,

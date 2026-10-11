@@ -13,7 +13,7 @@
 //!   （黙って無視しない。TASK-47.6・TASK-60.4 で配線する）
 //! - 選択された JS エンジンの検証と、`[js] execute_page_scripts` によるページスクリプト実行
 //!   アクターのハンドル構築（`page_scripts` モジュール。TASK-112）までを行う。`Page.navigate`
-//!   への接続は TASK-113（#785）、起動時の構造化ログ出力（`REPAIR-9`）は後続タスク
+//!   への接続は cdp の `navigate_gated` で実装済み（TASK-112・#785）、起動時の構造化ログ出力（`REPAIR-9`）は後続タスク
 
 use std::ffi::OsString;
 use std::path::Path;

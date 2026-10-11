@@ -339,7 +339,7 @@ impl AppState {
     }
 
     /// ページスクリプトのアクターのハンドルを返す。cdp の `Page.navigate` 経路
-    /// （`CdpState::app_state()` 経由。TASK-113 以降）が使う。
+    /// （`CdpState::app_state()` 経由。TASK-112・#785）が使う。
     pub fn page_scripts(&self) -> &PageScriptHandle {
         &self.page_scripts
     }

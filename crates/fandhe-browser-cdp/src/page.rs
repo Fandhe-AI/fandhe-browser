@@ -18,6 +18,25 @@
 //!   TASK-43（`CDP-2`）で行う。
 //! - `transitionType`・`referrer`・`frameId` 等の他パラメータは現時点では無視する。
 //!
+//! # ページ JS 実行の接続（TASK-112・`JS-4`・`JS-6`）
+//!
+//! `AppState::page_scripts()`（`[js] execute_page_scripts`）が有効なとき、[`navigate_gated`] は
+//! HTML 取得後・確定（commit）前に core のページスクリプト実行アクターを呼び、実行後の HTML を
+//! `NavigationResult` として確定する。`DOM.getDocument` などは確定済みの HTML を読むだけなので、
+//! 有効時は実行後の DOM を返す。無効（既定）時は従来のコードパスだけを通り、応答・イベント順・
+//! DOM は変わらない。
+//!
+//! - アクターの待機中に `gate`・`published` のロックを保持しない（他ターゲットを塞がない）。
+//! - 上限超過・失敗・`Busy`・`Cancelled` でもナビゲーション自体は成功とし、実行前の HTML
+//!   （打ち切り時はその時点の DOM）で確定する。診断は [`ScriptStage`] と stderr の固定 1 行のみ。
+//! - `Page.loadEventFired` 等のイベントは [`navigate_gated`] の戻り後に組み立てるため、
+//!   スクリプト実行（打ち切り含む）の完了後に送出される。追い越された遷移の分は送出しない。
+//!
+//! スタブ・差異（`REPAIR-3`）: 有効化は設定のみ（`Page.navigate` のオプションは未対応）。
+//! `Page.frameStoppedLoading`・`Page.lifecycleEvent` は未送出（`CDP-2`・TASK-43）。
+//! `Page.navigate` の応答自体もスクリプト完了後になる（実 Chromium との差異）。JS 段の全体期限は
+//! cdp 側には無く、アクターの待ち行列上限とランナーの実時間上限に依存する。
+//!
 //! # 失敗時の応答方針（`SEC-2`）
 //!
 //! パラメータ不正は JSON-RPC エラー（`-32602`）。取得失敗は CDP 仕様どおり `result` に
@@ -33,8 +52,9 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use fandhe_browser_core::{
-    Error, FetchOptions, Fetcher, NavigationGeneration, NavigationResult, NavigationState,
-    StateError,
+    ActorFailureKind, Error, FetchOptions, Fetcher, NavigationGeneration, NavigationResult,
+    NavigationState, PageRunRequest, PageScriptError, PageScriptHandle, PageScriptOutcome,
+    PageScriptSkipReason, StateError,
 };
 use serde_json::{Value, json};
 
@@ -60,6 +80,83 @@ pub(crate) struct NavigateOutcome {
     /// 今回の遷移で払い出した世代（検証失敗など世代を払い出す前に返した場合は `None`）。
     /// 取得失敗時に共有状態の古い結果を無効化するかの判定に使う（`CDP-1`）。
     pub began: Option<NavigationGeneration>,
+    /// ページ JS 実行段の結果（どの経路を通ったか。`REPAIR-4`）。
+    pub script: ScriptStage,
+}
+
+/// ページ JS 実行段の結果。テストと診断が通った経路を具体値で確認できるようにする（`REPAIR-4`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScriptStage {
+    /// 設定無効・`about:blank`・取得失敗・検証で弾いた遷移（アクターを呼んでいない）。
+    NotAttempted,
+    /// 最終 URL が `validate_url` を通らないため実行しなかった。
+    BaseUrlRejected,
+    /// アクターが実行しなかった。
+    Skipped(PageScriptSkipReason),
+    /// 実行した。`abort` は打ち切り理由の安定表記（打ち切りなしなら `None`）。
+    Executed { abort: Option<&'static str> },
+    /// 実行できなかった。取得した HTML のまま確定する。
+    Failed(ScriptFailure),
+}
+
+/// [`ScriptStage::Failed`] の理由（入力由来の文字列を持たない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScriptFailure {
+    Busy,
+    Cancelled,
+    ActorUnavailable(ActorFailureKind),
+    Run,
+    Unknown,
+}
+
+/// アクターの結果を「確定する HTML」と [`ScriptStage`] へ畳み込む。`Executed` 以外はすべて
+/// 取得したままの `original` で確定する（fail-closed。`#[non_exhaustive]` の未知の腕も同様）。
+fn settle(
+    original: &str,
+    result: Result<PageScriptOutcome, PageScriptError>,
+) -> (String, ScriptStage) {
+    let fallback = |stage| (original.to_owned(), stage);
+    match result {
+        Ok(PageScriptOutcome::Executed(out)) => {
+            let abort = out.abort().map(|a| a.kind().as_str());
+            (out.into_html(), ScriptStage::Executed { abort })
+        }
+        Ok(PageScriptOutcome::Skipped(reason)) => fallback(ScriptStage::Skipped(reason)),
+        Err(PageScriptError::Busy { .. }) => fallback(ScriptStage::Failed(ScriptFailure::Busy)),
+        Err(PageScriptError::Cancelled) => fallback(ScriptStage::Failed(ScriptFailure::Cancelled)),
+        Err(PageScriptError::ActorUnavailable { kind }) => {
+            fallback(ScriptStage::Failed(ScriptFailure::ActorUnavailable(kind)))
+        }
+        Err(PageScriptError::Run(_)) => fallback(ScriptStage::Failed(ScriptFailure::Run)),
+        Err(_) => fallback(ScriptStage::Failed(ScriptFailure::Unknown)),
+        #[allow(unreachable_patterns)]
+        Ok(_) => fallback(ScriptStage::Failed(ScriptFailure::Unknown)),
+    }
+}
+
+/// 最終 URL に対してページスクリプトを実行してよいか（アクターへ渡す前の再検証。`SEC-2`）。
+fn can_run_scripts(fetcher: &Fetcher, final_url: &str) -> bool {
+    fetcher.validate_url(final_url).is_ok()
+}
+
+/// 通常でない結果だけ stderr へ出す固定 1 行を作る。URL・HTML・例外メッセージは含めない。
+fn script_log_line(stage: &ScriptStage, generation: u64) -> Option<String> {
+    let (status, abort) = match stage {
+        ScriptStage::NotAttempted
+        | ScriptStage::Skipped(_)
+        | ScriptStage::Failed(ScriptFailure::Cancelled) => return None,
+        ScriptStage::Executed { abort: None } => return None,
+        ScriptStage::Executed { abort: Some(k) } => ("aborted", Some(*k)),
+        ScriptStage::BaseUrlRejected => ("base_url_rejected", None),
+        ScriptStage::Failed(ScriptFailure::Busy) => ("busy", None),
+        ScriptStage::Failed(ScriptFailure::ActorUnavailable(_)) => ("actor_unavailable", None),
+        ScriptStage::Failed(ScriptFailure::Run) => ("run_failed", None),
+        ScriptStage::Failed(ScriptFailure::Unknown) => ("unknown", None),
+    };
+    Some(match abort {
+        Some(k) => format!("cdp: page scripts: status={status} generation={generation} abort={k}"),
+        None => format!("cdp: page scripts: status={status} generation={generation}"),
+    })
 }
 
 /// commit に成功した遷移の確定 URL と、commit 直後の世代。
@@ -157,7 +254,14 @@ pub(crate) async fn navigate(
     nav: &NavigationState,
     url: &str,
 ) -> Result<NavigateOutcome, CdpError> {
-    navigate_gated(fetcher, nav, url, &Mutex::new(0)).await
+    navigate_gated(
+        fetcher,
+        nav,
+        url,
+        &Mutex::new(0),
+        &PageScriptHandle::disabled(),
+    )
+    .await
 }
 
 /// [`navigate`] の本体。結果の確定を `gate` のロック内で行い、完了順の通し番号を付ける。
@@ -166,6 +270,7 @@ pub(crate) async fn navigate_gated(
     nav: &NavigationState,
     url: &str,
     gate: &CommitGate,
+    page_scripts: &PageScriptHandle,
 ) -> Result<NavigateOutcome, CdpError> {
     // 共有状態を変更する前に URL の形式・scheme を検証する。不正 URL や `file:` で
     // 保存済みの URL / HTML を失わせない（`about:blank` は下で個別に扱う）。
@@ -177,6 +282,7 @@ pub(crate) async fn navigate_gated(
             error_text: Some(fetch_error_text(&e)),
             committed: None,
             began: None,
+            script: ScriptStage::NotAttempted,
         });
     }
     // 世代の払い出しは `gate` のロック内で行う。呼び出し側（`PageNavigate::handle`）は世代確認から
@@ -192,6 +298,7 @@ pub(crate) async fn navigate_gated(
         error_text: None,
         committed: None,
         began: Some(generation),
+        script: ScriptStage::NotAttempted,
     };
 
     if url == "about:blank" {
@@ -228,7 +335,31 @@ pub(crate) async fn navigate_gated(
                 return Ok(outcome);
             }
             let final_url = resp.final_url().to_owned();
-            let result = NavigationResult::new(&final_url, resp.body_text_lossy());
+            let fetched = resp.body_text_lossy();
+            // ページ JS 実行段。アクターの待機中は `gate` を保持しない（他ターゲットを塞がない）。
+            // 確定の審判は従来どおり `commit_navigation`（追い越された場合は `Superseded`）。
+            let html = if !page_scripts.is_enabled() {
+                fetched
+            } else if !can_run_scripts(fetcher, &final_url) {
+                outcome.script = ScriptStage::BaseUrlRejected;
+                fetched
+            } else {
+                let original: Arc<str> = Arc::from(fetched);
+                let request = PageRunRequest::new(
+                    Arc::clone(&original),
+                    final_url.clone(),
+                    nav.scope(),
+                    generation,
+                );
+                let run = page_scripts.run_page_scripts(request).await;
+                let (html, stage) = settle(&original, run);
+                outcome.script = stage;
+                html
+            };
+            if let Some(line) = script_log_line(&outcome.script, generation.get()) {
+                eprintln!("{line}");
+            }
+            let result = NavigationResult::new(&final_url, html);
             let mut seq = lock_gate(gate);
             match nav.commit_navigation(generation, result) {
                 Ok(()) => {
@@ -444,7 +575,14 @@ impl CommandHandler for PageNavigate {
                         }
                     };
                     let nav = ctx.state.navigations().get_or_create(registry, tid);
-                    let out = navigate_gated(&self.fetcher, &nav, url, &self.gate).await?;
+                    let out = navigate_gated(
+                        &self.fetcher,
+                        &nav,
+                        url,
+                        &self.gate,
+                        ctx.state.app_state().page_scripts(),
+                    )
+                    .await?;
                     // ターゲット表の更新と共有状態へのミラーを 1 つのロック内で行う。
                     let mut published = self
                         .published
@@ -556,7 +694,14 @@ impl CommandHandler for PageNavigate {
                         ctx.state.registry(),
                         &self.gate,
                     ));
-                    let out = navigate_gated(&self.fetcher, app_nav, url, &self.gate).await?;
+                    let out = navigate_gated(
+                        &self.fetcher,
+                        app_nav,
+                        url,
+                        &self.gate,
+                        ctx.state.app_state().page_scripts(),
+                    )
+                    .await?;
                     // ブラウザレベル遷移も確定順（`seq`）の管理に含める。実際に確定し、かつ公開済みより
                     // 新しい場合に限り、共有状態をどのターゲットのミラーでもないものとして記録する。
                     // 失敗・中断・より新しい確定が公開済みの場合は記録を変えない（`CDP-1`）。
@@ -889,6 +1034,291 @@ mod tests {
         assert!(b >= a);
     }
 
+    // --- ページ JS 実行の接続（TASK-112・`JS-4`・`JS-6`・`CDP-1`） ---------------------------
+    // 単体テストのバイナリは JS ワーカーとして再実行できないため、実エンジンは動かさない。
+    // 有効なハンドルは「渡された future を poll しない」実行器だけで作る。
+
+    use fandhe_browser_core::{PageScriptActorOptions, PageScriptExecutor};
+    use std::pin::Pin;
+    use std::sync::mpsc;
+
+    /// `block_on` が直ちに `Err` を返す実行器（要求は `ExecutorFailed` で解決される）。
+    struct FailingExecutor;
+
+    impl PageScriptExecutor for FailingExecutor {
+        fn block_on<'a>(
+            &self,
+            _future: Pin<Box<dyn std::future::Future<Output = ()> + 'a>>,
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::other("test executor"))
+        }
+    }
+
+    /// `Sender` の drop まで `block_on` で止まる実行器。止めている間、ジョブは待ち行列に残る。
+    struct GatedExecutor(Mutex<mpsc::Receiver<()>>);
+
+    impl PageScriptExecutor for GatedExecutor {
+        fn block_on<'a>(
+            &self,
+            _future: Pin<Box<dyn std::future::Future<Output = ()> + 'a>>,
+        ) -> std::io::Result<()> {
+            let rx = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = rx.recv();
+            Err(std::io::Error::other("test executor released"))
+        }
+    }
+
+    /// `execute_page_scripts = true` の設定から有効ハンドルを作る。エンジンなしのビルドでは設定自体が
+    /// 拒否されるため `None`（そのビルドでは「同梱エンジンが無い」ことを呼び出し側で assert する）。
+    fn enabled_handle(
+        executor: Arc<dyn PageScriptExecutor>,
+        capacity: usize,
+    ) -> Option<PageScriptHandle> {
+        let config =
+            fandhe_browser_core::Config::from_toml_str("[js]\nexecute_page_scripts = true\n")
+                .ok()?;
+        Some(PageScriptHandle::with_options(
+            config.js(),
+            executor,
+            PageScriptActorOptions::default().with_queue_capacity(capacity),
+        ))
+    }
+
+    fn gated_handle(capacity: usize) -> Option<(PageScriptHandle, mpsc::Sender<()>)> {
+        let (tx, rx) = mpsc::channel();
+        let h = enabled_handle(Arc::new(GatedExecutor(Mutex::new(rx))), capacity)?;
+        Some((h, tx))
+    }
+
+    async fn until(mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !cond() {
+            assert!(Instant::now() < deadline, "condition not reached");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    const SCRIPT_PAGE: &str = "<p>a</p><script>1</script>";
+
+    /// `JS-1`・`CDP-1`: 無効ハンドルでは取得した HTML のまま確定し、アクターを起動しない。
+    #[tokio::test]
+    async fn cdp1_navigate_with_disabled_page_scripts_keeps_fetched_html() {
+        let port = serve("200 OK", SCRIPT_PAGE);
+        let nav = NavigationState::new();
+        let handle = PageScriptHandle::disabled();
+        let url = format!("http://127.0.0.1:{port}/");
+        let out = navigate_gated(&allowed_fetcher(), &nav, &url, &Mutex::new(0), &handle)
+            .await
+            .unwrap();
+        assert_eq!(out.script, ScriptStage::NotAttempted);
+        assert_eq!(out.error_text, None);
+        assert_eq!(nav.latest().unwrap().html(), SCRIPT_PAGE);
+        assert_eq!(handle.stats().worker_spawns(), 0);
+    }
+
+    /// `JS-4`: `Executed` 以外の結果はすべて取得した HTML で確定する。
+    #[test]
+    fn js4_settle_falls_back_to_original_html() {
+        let cases = [
+            (
+                Ok(PageScriptOutcome::Skipped(
+                    PageScriptSkipReason::NoScriptElement,
+                )),
+                ScriptStage::Skipped(PageScriptSkipReason::NoScriptElement),
+            ),
+            (
+                Err(PageScriptError::Busy { capacity: 1 }),
+                ScriptStage::Failed(ScriptFailure::Busy),
+            ),
+            (
+                Err(PageScriptError::Cancelled),
+                ScriptStage::Failed(ScriptFailure::Cancelled),
+            ),
+            (
+                Err(PageScriptError::ActorUnavailable {
+                    kind: ActorFailureKind::Terminated,
+                }),
+                ScriptStage::Failed(ScriptFailure::ActorUnavailable(
+                    ActorFailureKind::Terminated,
+                )),
+            ),
+            (
+                Err(PageScriptError::Run(Error::InvalidInput {
+                    message: "x".to_owned(),
+                })),
+                ScriptStage::Failed(ScriptFailure::Run),
+            ),
+        ];
+        for (result, expected) in cases {
+            let (html, stage) = settle("orig", result);
+            assert_eq!(html, "orig");
+            assert_eq!(stage, expected);
+        }
+    }
+
+    /// `SEC-2`: 実行可否は `validate_url`。`file:` と内部アドレスは不可、公開ホストの https は可。
+    #[test]
+    fn sec2_can_run_scripts_follows_url_validation() {
+        let f = Fetcher::new(FetchOptions::default()).unwrap();
+        assert!(!can_run_scripts(&f, "file:///etc/passwd"));
+        assert!(!can_run_scripts(&f, "http://127.0.0.1/"));
+        assert!(can_run_scripts(&f, "https://example.com/"));
+    }
+
+    /// `JS-6`: ログ行は固定文言とラベル・数値のみ。通常の結果では出さない。
+    #[test]
+    fn js6_script_log_line_is_fixed_text() {
+        let line = script_log_line(
+            &ScriptStage::Executed {
+                abort: Some("wall_time"),
+            },
+            3,
+        );
+        assert_eq!(
+            line.as_deref(),
+            Some("cdp: page scripts: status=aborted generation=3 abort=wall_time")
+        );
+        let line = script_log_line(&ScriptStage::Failed(ScriptFailure::Busy), 7);
+        assert_eq!(
+            line.as_deref(),
+            Some("cdp: page scripts: status=busy generation=7")
+        );
+        assert_eq!(script_log_line(&ScriptStage::NotAttempted, 1), None);
+        assert_eq!(
+            script_log_line(&ScriptStage::Executed { abort: None }, 1),
+            None
+        );
+        assert_eq!(
+            script_log_line(&ScriptStage::Failed(ScriptFailure::Cancelled), 1),
+            None
+        );
+    }
+
+    /// `JS-4`: 実行器が失敗しても遷移は成功し、取得した HTML で確定する。
+    #[tokio::test]
+    async fn js4_executor_failure_commits_fetched_html() {
+        let port = serve("200 OK", SCRIPT_PAGE);
+        let nav = NavigationState::new();
+        let Some(handle) = enabled_handle(Arc::new(FailingExecutor), 4) else {
+            assert!(fandhe_browser_core::bundled_engines().is_empty());
+            return;
+        };
+        let url = format!("http://127.0.0.1:{port}/");
+        let out = navigate_gated(&allowed_fetcher(), &nav, &url, &Mutex::new(0), &handle)
+            .await
+            .unwrap();
+        assert_eq!(out.error_text, None);
+        assert_eq!(
+            out.script,
+            ScriptStage::Failed(ScriptFailure::ActorUnavailable(
+                ActorFailureKind::ExecutorFailed
+            ))
+        );
+        assert_eq!(nav.latest().unwrap().html(), SCRIPT_PAGE);
+    }
+
+    /// `JS-4`・`CDP-1`: `<script>` なしのページ・`about:blank`・`file:` ではアクターを起動しない。
+    #[tokio::test]
+    async fn js4_no_script_blank_and_rejected_urls_do_not_spawn_worker() {
+        let Some(handle) = enabled_handle(Arc::new(FailingExecutor), 4) else {
+            assert!(fandhe_browser_core::bundled_engines().is_empty());
+            return;
+        };
+        let nav = NavigationState::new();
+        let gate = Mutex::new(0);
+        let port = serve("200 OK", "<p>plain</p>");
+        let url = format!("http://127.0.0.1:{port}/");
+        let out = navigate_gated(&allowed_fetcher(), &nav, &url, &gate, &handle)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.script,
+            ScriptStage::Skipped(PageScriptSkipReason::NoScriptElement)
+        );
+        assert_eq!(nav.latest().unwrap().html(), "<p>plain</p>");
+        for u in ["about:blank", "file:///etc/passwd"] {
+            let out = navigate_gated(&allowed_fetcher(), &nav, u, &gate, &handle)
+                .await
+                .unwrap();
+            assert_eq!(out.script, ScriptStage::NotAttempted, "{u}");
+        }
+        assert_eq!(handle.stats().worker_spawns(), 0);
+    }
+
+    /// `JS-6`・`CDP-1`: 待ち行列が満杯なら待たずに `Busy` となり、取得した HTML で確定する。
+    /// 待機中の別ターゲットの遷移（`<script>` なし）は塞がれずに完了する。
+    #[tokio::test]
+    async fn js6_busy_commits_original_and_waiting_run_does_not_block_others() {
+        let Some((handle, tx)) = gated_handle(1) else {
+            assert!(fandhe_browser_core::bundled_engines().is_empty());
+            return;
+        };
+        let (p1, p2, p3) = (
+            serve("200 OK", SCRIPT_PAGE),
+            serve("200 OK", "<p>other</p>"),
+            serve("200 OK", "<p>b</p><script>2</script>"),
+        );
+        let (nav1, nav2, nav3) = (
+            NavigationState::new(),
+            NavigationState::new(),
+            NavigationState::new(),
+        );
+        let gate = Mutex::new(0);
+        let fetcher = allowed_fetcher();
+        let u = |p: u16| format!("http://127.0.0.1:{p}/");
+        let url1 = u(p1);
+        let first = navigate_gated(&fetcher, &nav1, &url1, &gate, &handle);
+        let rest = async {
+            until(|| handle.stats().queued() == 1).await;
+            // 別ターゲット（`<script>` なし）は待機中でも完了する。
+            let other = navigate_gated(&fetcher, &nav2, &u(p2), &gate, &handle)
+                .await
+                .unwrap();
+            assert_eq!(other.error_text, None);
+            assert_eq!(handle.stats().queued(), 1);
+            // 満杯なので `<script>` ありの別遷移は待たされず Busy。
+            let busy = navigate_gated(&fetcher, &nav3, &u(p3), &gate, &handle)
+                .await
+                .unwrap();
+            assert_eq!(busy.script, ScriptStage::Failed(ScriptFailure::Busy));
+            assert_eq!(nav3.latest().unwrap().html(), "<p>b</p><script>2</script>");
+            drop(tx);
+        };
+        let (first, ()) = tokio::join!(first, rest);
+        let first = first.unwrap();
+        assert!(matches!(first.script, ScriptStage::Failed(_)));
+        assert_eq!(nav1.latest().unwrap().html(), SCRIPT_PAGE);
+    }
+
+    /// `CDP-1`: JS 実行待ちの間に同一ターゲットの後続遷移が確定したら、古い遷移は
+    /// `net::ERR_ABORTED` で何も確定しない。
+    #[tokio::test]
+    async fn cdp1_navigation_superseded_while_scripts_pending_is_aborted() {
+        let Some((handle, tx)) = gated_handle(4) else {
+            assert!(fandhe_browser_core::bundled_engines().is_empty());
+            return;
+        };
+        let (p1, p2) = (serve("200 OK", SCRIPT_PAGE), serve("200 OK", "<p>new</p>"));
+        let nav = NavigationState::new();
+        let gate = Mutex::new(0);
+        let fetcher = allowed_fetcher();
+        let u = |p: u16| format!("http://127.0.0.1:{p}/");
+        let url1 = u(p1);
+        let first = navigate_gated(&fetcher, &nav, &url1, &gate, &handle);
+        let rest = async {
+            until(|| handle.stats().queued() == 1).await;
+            let second = navigate_gated(&fetcher, &nav, &u(p2), &gate, &handle)
+                .await
+                .unwrap();
+            assert!(second.committed.is_some());
+            drop(tx);
+        };
+        let (first, ()) = tokio::join!(first, rest);
+        let first = first.unwrap();
+        assert_eq!(first.error_text, Some("net::ERR_ABORTED"));
+        assert!(first.committed.is_none());
+        assert_eq!(nav.latest().unwrap().html(), "<p>new</p>");
+    }
     // CdpState は AppState（Profile::open）が必要で非 unix では構築手段が無いため unix 限定
     // （protocol.rs の `mod dispatch` と同じ理由）。
     #[cfg(unix)]

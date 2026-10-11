@@ -84,7 +84,7 @@
 //! - [`page_script`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。収集のみ。SVG の script・`language`・module 実行等は未実装）
 //! - [`page_runner`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。`src` 取得・総バイト上限・DOMContentLoaded / load 発火・仮想時間のタイマーループ（#782）まで実装済み。アクター化は `page_actor`＝#784 で実装済み）
 //! - [`dom_bridge`]（`JS-5`・`JS-6`・`TASK-108`・`MS-6`。`setInnerHTML` は `Document::set_inner_html` で置換する。DOM 操作以外の op は未実装）
-//! - [`page_actor`]（`JS-4`・`JS-6`・`JS-1`・`TASK-112`・`MS-6`・#784。ページスクリプトを専用スレッドで実行するアクター。遅延起動・世代による打ち切り・待ち行列の上限。`AppState` が保持する。`navigate_gated` への接続は #785）
+//! - [`page_actor`]（`JS-4`・`JS-6`・`JS-1`・`TASK-112`・`MS-6`・#784。ページスクリプトを専用スレッドで実行するアクター。遅延起動・世代による打ち切り・待ち行列の上限。`AppState` が保持する。cdp の `navigate_gated` へ接続済み・#785）
 //! - [`page_net`]（`JS-8`・`JS-6`・`TASK-111`・`MS-6`・#783。ページ内 `fetch` / `XMLHttpRequest` の GET 最小版。取得は Fetcher 経由のみ。要求件数・累計バイトの上限。GET 以外・ヘッダ・CORS は未実装）
 //! - [`js_shim`]（`JS-5`・`TASK-108`・`MS-6`。window / location / navigator / console は #779）
 //! - [`js_stub`]（`JS-2`・`TASK-30`・`MS-3`）

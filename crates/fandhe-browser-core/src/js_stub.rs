@@ -45,7 +45,7 @@
 //! - `page_runner`（#780）がページごとに新しい [`JsRuntime`] を作って `install_dom_shim_with_options`
 //!   を呼び、エンジン再起動を検知したら打ち切る。専用スレッドのアクターは
 //!   [`crate::page_actor`]（TASK-112・#784）で実装済み。`Page.navigate` への配線は
-//!   TASK-113（#785）の担当で未実装。
+//!   cdp の `navigate_gated`（TASK-112・#785）で実装済み。
 //!
 //! # 可観測性（`REPAIR-9`・`TASK-10.2.2`・Issue #550）
 //!
