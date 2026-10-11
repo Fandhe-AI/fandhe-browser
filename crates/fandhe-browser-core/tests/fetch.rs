@@ -1090,3 +1090,82 @@ async fn core_1_fetch_rejects_internal_ip_literals_before_send() {
         );
     }
 }
+
+/// CORE-1（#37。TASK-24.3・MS-1・security.md 「SSRF」）: IP リテラルではなく
+/// DNS 名（`localhost`）を host に持つ URL も、`SafeResolver`（`resolve_blocking`
+/// 経由）が解決結果の IP を検査して拒否する。既存の内部アドレス拒否テストは
+/// いずれも IP リテラル host（送信前検査）を対象にしており、DNS 名解決を
+/// 経由する経路（`Policy::redirect` からも共有される `SafeResolver`）は
+/// 単体テスト（`fetch.rs` の `mod tests`）でのみ検証されていたため、
+/// end-to-end（`Fetcher::get` から）でも確認する。OS のリゾルバ設定により
+/// `127.0.0.1`・`::1` のいずれに解決されても拒否対象であることを許容する。
+#[tokio::test]
+async fn core_1_fetch_rejects_localhost_dns_name_by_default() {
+    let port = spawn_loopback_server(|mut stream| {
+        drain_request_head(&mut stream);
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(head.as_bytes());
+    });
+
+    let fetcher = Fetcher::new(FetchOptions::new()).expect("Fetcher::new が失敗しないこと");
+
+    let err = fetcher
+        .get(&format!("http://localhost:{port}/"))
+        .await
+        .expect_err("localhost という DNS 名もループバックへ解決され拒否されるはず");
+    assert!(
+        matches!(
+            err,
+            Error::DisallowedAddress { ref address } if address == "127.0.0.1" || address == "::1"
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// CORE-1（#37。TASK-24.3・MS-1）: `Content-Type` ヘッダを持たない応答は
+/// `content_type()` が `None` を返す（ヘッダ有無で分岐する経路の具体値検証）。
+#[tokio::test]
+async fn core_1_fetch_content_type_is_none_when_header_absent() {
+    let port = spawn_loopback_server(|mut stream| {
+        drain_request_head(&mut stream);
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(b"ok");
+    });
+
+    let fetcher = Fetcher::new(loopback_allowed_options()).expect("Fetcher::new が失敗しないこと");
+
+    let ok = fetcher
+        .get(&format!("http://127.0.0.1:{port}/"))
+        .await
+        .expect("正常応答が得られるはず");
+    assert_eq!(ok.content_type(), None);
+}
+
+/// CORE-1（#37。TASK-24.3・MS-1）: 本文が有効な UTF-8 でない場合、
+/// `body()` は生バイト列をそのまま保持し、`body_text_lossy()` は不正な
+/// バイト列を U+FFFD（置換文字）に置き換えた文字列を返す
+/// （`String::from_utf8_lossy` への委譲を具体値で確認する）。
+#[tokio::test]
+async fn core_1_fetch_body_text_lossy_replaces_invalid_utf8() {
+    const RAW_BODY: [u8; 3] = [0x61, 0xFF, 0x62];
+
+    let port = spawn_loopback_server(|mut stream| {
+        drain_request_head(&mut stream);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            RAW_BODY.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(&RAW_BODY);
+    });
+
+    let fetcher = Fetcher::new(loopback_allowed_options()).expect("Fetcher::new が失敗しないこと");
+
+    let ok = fetcher
+        .get(&format!("http://127.0.0.1:{port}/"))
+        .await
+        .expect("正常応答が得られるはず");
+    assert_eq!(ok.body(), &RAW_BODY);
+    assert_eq!(ok.body_text_lossy(), "a\u{FFFD}b");
+}

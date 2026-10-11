@@ -9,6 +9,7 @@
 use fandhe_browser_core::selector::parse_selector_list;
 use fandhe_browser_core::{
     Document, ParseOptions, element_matches, parse_document, query_selector, query_selector_all,
+    query_selector_all_str, query_selector_str,
 };
 
 fn parse(html: &str) -> Document {
@@ -130,5 +131,35 @@ fn core_1_no_match_from_outside_crate() {
     assert_eq!(
         query_selector(&doc, root, &selectors).expect("キャッシュ上限に達しない"),
         None
+    );
+}
+
+/// CORE-1: 文字列版の re-export（`query_selector_str`・`query_selector_all_str`）を
+/// crate 外から呼び、具体的な件数・要素・テキストが得られる
+/// （両者が同じ先頭要素を指すことも確認する）。
+#[test]
+fn core_1_str_query_api_is_usable_from_outside_crate() {
+    let doc = parse(r#"<ul><li id="a">1</li><li id="b">2</li><li id="c">3</li></ul>"#);
+    let root = doc.root();
+
+    let first = query_selector_str(&doc, root, "li")
+        .expect("li は解析できる")
+        .expect("li が存在する");
+    assert_eq!(doc.attribute(first, "id"), Some("a"));
+    assert_eq!(doc.text_content(first).as_deref(), Some("1"));
+
+    let all = query_selector_all_str(&doc, root, "li").expect("li は解析できる");
+    assert_eq!(all.len(), 3);
+    assert_eq!(all.first().copied(), Some(first));
+    assert_eq!(doc.attribute(all[2], "id"), Some("c"));
+
+    assert_eq!(
+        query_selector_str(&doc, root, "table").expect("table は解析できる"),
+        None
+    );
+    assert!(
+        query_selector_all_str(&doc, root, "table")
+            .expect("table は解析できる")
+            .is_empty()
     );
 }
