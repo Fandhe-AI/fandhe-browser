@@ -70,12 +70,34 @@ pre-commit:
         '
         tmp="$(mktemp -d)" || exit 1
         trap 'rm -rf "$tmp"' EXIT
-        git diff --cached --diff-filter=ACMR -U0 -- . | awk -v cf="$tmp/content" -v nf="$tmp/names" '
+        # diff の取得・追加行の抽出のどちらかが失敗した場合（一時領域の容量不足等）は、
+        # 検査できていない行が残るため fail-closed でコミットを拒否する。パイプの左辺の
+        # 終了状態は sh では取れないため、diff を一度ファイルへ書き出してから awk に渡す。
+        # awk は書き出した件数と行数を照合し、書き込み失敗（close の失敗）も非ゼロで返す
+        if ! git diff --cached --diff-filter=ACMR -U0 -- . > "$tmp/diff"; then
+          echo "NG: staged diff を取得できないため秘密情報の検査を完了できません" >&2
+          exit 1
+        fi
+        if ! awk -v cf="$tmp/content" -v nf="$tmp/names" '
           /^\+\+\+ b\// { file = substr($0, 7); next }
           /^\+\+\+ /    { next }
-          /^\+/         { print substr($0, 2) > cf; print (file == "" ? "(unknown)" : file) > nf }
-        '
-        [ -s "$tmp/content" ] || exit 0
+          /^\+/         { print substr($0, 2) > cf; print (file == "" ? "(unknown)" : file) > nf; n++ }
+          END {
+            if (n > 0 && (close(cf) != 0 || close(nf) != 0)) exit 2
+            print n + 0 > "/dev/stderr"
+          }
+        ' "$tmp/diff" 2> "$tmp/count"; then
+          echo "NG: 追加行の抽出に失敗したため秘密情報の検査を完了できません" >&2
+          exit 1
+        fi
+        n="$(cat "$tmp/count")"
+        if [ "$n" -eq 0 ] 2>/dev/null; then
+          exit 0
+        fi
+        if [ "$(wc -l < "$tmp/content" | tr -d ' ')" != "$n" ]; then
+          echo "NG: 追加行の抽出結果が不完全なため秘密情報の検査を完了できません" >&2
+          exit 1
+        fi
         rc=0
         printf '%s\n' "$patterns" | {
           while IFS='|' read -r pat kind; do
