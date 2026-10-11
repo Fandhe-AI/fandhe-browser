@@ -29,14 +29,16 @@ mod snapshot_text;
 mod tasks;
 
 use compare::{
-    Collected, RAW_ALLOWED_SELECTOR_EXAMPLES, RAW_FORBIDDEN_SELECTOR_EXAMPLES, SELECT_VALUE_NOTE,
-    allocation, check_out_dir, collect, instruction, packets, render_allocation_json,
-    render_allocation_markdown, render_status_json, write_merged, write_packets,
+    Collected, DIFF_THRESHOLD_POINTS, MethodDiff, RAW_ALLOWED_SELECTOR_EXAMPLES,
+    RAW_FORBIDDEN_SELECTOR_EXAMPLES, ReportMeta, SELECT_VALUE_NOTE, allocation, build_report,
+    check_out_dir, collect, compare_results, instruction, packets, render_allocation_json,
+    render_allocation_markdown, render_report_json, render_report_markdown, render_status_json,
+    write_merged, write_packets, write_report,
 };
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
 use fandhe_browser_core::query::query_selector_all_str;
 use generate_reduced::{InputMode, raw_dom_documents, resolve_golden, task_inputs};
-use score::{resolve_raw_dom, score};
+use score::{FailureClass, Tally, TaskResult, resolve_raw_dom, score};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tasks::{Category, GOLDEN, Golden, TASKS};
@@ -483,5 +485,325 @@ fn aisnap9_collect_answers_if_requested() {
     assert!(c.status.is_complete(), "answers are incomplete");
     if let Some(out) = env_dir("AGENT_EVAL_COMPARE_MERGED_OUT") {
         write_merged(&c, &out).expect("write merged");
+    }
+}
+// ---- 比較測定レポート（TASK-22.3・Issue #126） ----
+
+fn meta() -> ReportMeta {
+    ReportMeta::from_parts(
+        Some("abc1234"),
+        Some("2026-10-10"),
+        Some("test-model"),
+        None,
+    )
+    .expect("meta")
+}
+
+/// 合成回答（全問正解）から、簡約側だけ `reduced_null_ids` を回答不能に書き換えて回収する。
+fn collect_with_reduced_nulls(name: &str, reduced_null_ids: &[&str]) -> Collected {
+    let dir = temp_dir(name);
+    write_synthetic_answers(&dir, &[]);
+    for id in reduced_null_ids {
+        let body = if id.starts_with("extract") {
+            format!("{{\"id\": \"{id}\", \"value\": null}}")
+        } else {
+            format!("{{\"id\": \"{id}\", \"ref\": null}}")
+        };
+        std::fs::write(dir.join(format!("{id}-reduced.json")), body).expect("w");
+    }
+    let c = collect(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    c
+}
+
+/// 全タスクの `TaskResult` を `f(id)` の失敗分類で組む（None = 合格）。
+fn results_with(f: impl Fn(&str) -> Option<FailureClass>) -> Vec<TaskResult> {
+    TASKS
+        .iter()
+        .map(|t| {
+            let failure = f(t.id);
+            TaskResult {
+                id: t.id.to_owned(),
+                category: t.category,
+                pass: failure.is_none(),
+                failure,
+            }
+        })
+        .collect()
+}
+
+fn tally(pass: u32, total: u32) -> Tally {
+    Tally { pass, total }
+}
+
+/// 両方式とも全問正解なら全体は 25/25 で差 +0.0、達成（AISNAP-9・TASK-22.3）。
+#[test]
+fn aisnap9_report_all_pass() {
+    let dir = temp_dir("rep-all");
+    write_synthetic_answers(&dir, &[]);
+    let c = collect(&dir);
+    let r = build_report(&fixtures(), &c).expect("report");
+    let md = render_report_markdown(&r, &meta());
+    assert!(md.contains("| 全体 | 25 | 25 | 100.0% | 25 | 100.0% | +0.0 |\n"));
+    assert!(r.including.meets && r.excluding_union.meets);
+    assert!(md.contains("差 +0.0 pt → 達成"));
+    assert!(md.contains("- 基準コミット: abc1234\n"));
+    assert!(md.contains("- 関連 Issue: 未記入\n"));
+    assert!(!md.contains('\r') && md.ends_with("|\n") && !md.ends_with("\n\n"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 簡約側だけ 2 件回答不能なら 23/25 対 25/25 で -8.0、未達。種別行にも具体値が出る。
+#[test]
+fn aisnap9_report_reduced_two_misses() {
+    let c = collect_with_reduced_nulls("rep-two", &["click-01", "extract-02"]);
+    let r = build_report(&fixtures(), &c).expect("report");
+    let md = render_report_markdown(&r, &meta());
+    assert!(md.contains("| 全体 | 25 | 23 | 92.0% | 25 | 100.0% | -8.0 |\n"));
+    assert!(md.contains("| click | 7 | 6 | 85.7% | 7 | 100.0% | -14.3 |\n"));
+    assert!(!r.including.meets);
+    assert!(md.contains("差 -8.0 pt → 未達（しきい値 -5pt）"));
+}
+
+/// 1 件差（24/25 対 25/25 = -4.0）は達成。
+#[test]
+fn aisnap9_report_one_miss_meets() {
+    let c = collect_with_reduced_nulls("rep-one", &["click-01"]);
+    let r = build_report(&fixtures(), &c).expect("report");
+    assert_eq!(r.including.overall.diff_text(), "-4.0");
+    assert!(r.including.meets);
+}
+
+/// 生 DOM 方式の方が悪い場合は符号が正（25 対 23 = +8.0）で達成。
+#[test]
+fn aisnap9_report_raw_worse_is_positive() {
+    let red = results_with(|_| None);
+    let raw =
+        results_with(|id| (id == "click-01" || id == "nav-01").then_some(FailureClass::Mismatch));
+    let r = compare_results(&TASKS, &red, &raw).expect("compare");
+    assert_eq!(r.including.overall.diff_text(), "+8.0");
+    assert!(r.including.meets);
+}
+
+/// 整数比較の境界: 19/20 対 20/20 は -5.0 で達成（>=）、17/20 対 19/20 は -10.0 で未達。
+#[test]
+fn aisnap9_diff_threshold_boundary() {
+    let a = MethodDiff {
+        reduced: tally(19, 20),
+        raw: tally(20, 20),
+    };
+    assert_eq!(a.diff_text(), "-5.0");
+    assert!(a.meets(DIFF_THRESHOLD_POINTS));
+    let b = MethodDiff {
+        reduced: tally(17, 20),
+        raw: tally(19, 20),
+    };
+    assert_eq!(b.diff_text(), "-10.0");
+    assert!(!b.meets(DIFF_THRESHOLD_POINTS));
+}
+
+/// 丸めはゼロから遠い側へ寄せ、符号が対称になる。
+#[test]
+fn aisnap9_diff_rounding_is_symmetric() {
+    let d = |p, r| MethodDiff {
+        reduced: tally(p, 3),
+        raw: tally(r, 3),
+    };
+    assert_eq!(d(1, 0).diff_text(), "+33.3");
+    assert_eq!(d(0, 1).diff_text(), "-33.3");
+    assert_eq!(d(2, 0).diff_text(), "+66.7");
+    assert_eq!(d(0, 2).diff_text(), "-66.7");
+}
+
+/// 分母 0 または不一致は n/a・未達で、panic しない。
+#[test]
+fn aisnap9_diff_zero_or_mismatched_total_is_na() {
+    let z = MethodDiff {
+        reduced: tally(0, 0),
+        raw: tally(0, 0),
+    };
+    assert_eq!((z.diff_text().as_str(), z.meets(-5)), ("n/a", false));
+    let m = MethodDiff {
+        reduced: tally(1, 2),
+        raw: tally(1, 3),
+    };
+    assert_eq!((m.diff_text().as_str(), m.meets(-5)), ("n/a", false));
+}
+
+/// 和集合除外: 簡約側 A・生 DOM 側 B が golden_unresolved なら両方式から A・B を除き 23 件分母になる。
+#[test]
+fn aisnap9_union_exclusion() {
+    let red = results_with(|id| (id == "click-01").then_some(FailureClass::GoldenUnresolved));
+    let raw = results_with(|id| (id == "click-02").then_some(FailureClass::GoldenUnresolved));
+    let r = compare_results(&TASKS, &red, &raw).expect("compare");
+    assert_eq!(r.excluding_union.excluded, ["click-01", "click-02"]);
+    assert_eq!(r.excluding_union.overall.reduced, tally(23, 23));
+    assert_eq!(r.excluding_union.overall.raw, tally(23, 23));
+    assert_eq!(r.including.overall.reduced, tally(24, 25));
+    assert_eq!(r.including.overall.raw, tally(24, 25));
+    let md = render_report_markdown(&r, &meta());
+    assert!(md.contains("除外タスク: click-01, click-02\n"));
+}
+
+/// 種別を丸ごと除外すると、その行の差は n/a・未達になり panic しない。
+#[test]
+fn aisnap9_fully_excluded_category_is_na() {
+    let click_ids: Vec<&str> = TASKS
+        .iter()
+        .filter(|t| t.category == Category::Click)
+        .map(|t| t.id)
+        .collect();
+    let red = results_with(|id| {
+        click_ids
+            .contains(&id)
+            .then_some(FailureClass::GoldenUnresolved)
+    });
+    let raw = results_with(|_| None);
+    let r = compare_results(&TASKS, &red, &raw).expect("compare");
+    let md = render_report_markdown(&r, &meta());
+    assert!(md.contains("| click | 0 | 0 | n/a | 0 | n/a | n/a |\n"));
+    let (_, click) = r.excluding_union.by_category[0];
+    assert!(!click.meets(DIFF_THRESHOLD_POINTS));
+    assert_eq!(r.excluding_union.overall.reduced.total, 18);
+}
+
+/// 回答ファイルが 1 つ欠けた状態ではレポートを作らない（fail-closed）。
+#[test]
+fn aisnap9_report_rejects_incomplete() {
+    let dir = temp_dir("rep-inc");
+    write_synthetic_answers(&dir, &[]);
+    std::fs::remove_file(dir.join("click-01-raw.json")).expect("rm");
+    let c = collect(&dir);
+    assert!(matches!(
+        build_report(&fixtures(), &c),
+        Err(compare::CompareError::Incomplete)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// id 集合が tasks と一致しない入力は拒否する。
+#[test]
+fn aisnap9_compare_rejects_mismatched_ids() {
+    let red = results_with(|_| None);
+    let mut raw = results_with(|_| None);
+    raw.pop();
+    assert!(compare_results(&TASKS, &red, &raw).is_err());
+    let mut dup = results_with(|_| None);
+    dup.pop();
+    dup.push(dup[0].clone());
+    assert!(compare_results(&TASKS, &dup, &red).is_err());
+}
+
+/// ページ別は task_pages() の順で、件数の合計が 25 になる。
+#[test]
+fn aisnap9_report_by_page_order_and_sum() {
+    let red = results_with(|_| None);
+    let r = compare_results(&TASKS, &red, &red).expect("compare");
+    let names: Vec<&str> = r.including.by_page.iter().map(|(p, _)| *p).collect();
+    assert_eq!(names, generate_reduced::task_pages());
+    assert_eq!(names.len(), 13);
+    let sum: u32 = r
+        .including
+        .by_page
+        .iter()
+        .map(|(_, d)| d.reduced.total)
+        .sum();
+    assert_eq!(sum, 25);
+}
+
+/// 付録のタスク別行は割付表と同じ「先に提示した方式」を示し、割付表と限界節の固定文を含む。
+#[test]
+fn aisnap9_report_appendix_and_limits() {
+    let red = results_with(|_| None);
+    let r = compare_results(&TASKS, &red, &red).expect("compare");
+    let md = render_report_markdown(&r, &meta());
+    let line = |id: &str| {
+        md.lines()
+            .find(|l| l.starts_with(&format!("| {id} |")))
+            .unwrap_or_else(|| panic!("{id} row"))
+            .to_owned()
+    };
+    assert!(line("click-01").contains("| 簡約 | 合格 | 合格 |"));
+    assert!(line("extract-01").contains("| 生 DOM | 合格 | 合格 |"));
+    assert!(md.contains("| タスク id | 種別 | ページ | 先に提示する方式 |"));
+    assert!(md.contains("1 件 = 4pt"));
+    assert!(md.contains("簡約方式に甘い"));
+}
+
+/// メタ情報は禁止文字・長さ超過を拒否し、未指定は「未記入」になる。
+#[test]
+fn aisnap9_report_meta_validation() {
+    for bad in ["a|b", "a\nb", "<x>", "a\u{7}b"] {
+        assert!(ReportMeta::from_parts(Some(bad), None, None, None).is_err());
+    }
+    let long = "a".repeat(129);
+    assert!(ReportMeta::from_parts(None, Some(&long), None, None).is_err());
+    let ok = "a".repeat(128);
+    assert!(ReportMeta::from_parts(None, Some(&ok), None, None).is_ok());
+    let m = ReportMeta::from_parts(None, Some("  "), None, None).expect("meta");
+    assert_eq!(m.date, "未記入");
+}
+
+/// JSON 出力はパースでき、主判定の具体値を持つ。
+#[test]
+fn aisnap9_report_json() {
+    let c = collect_with_reduced_nulls("rep-json", &["click-01", "extract-02"]);
+    let r = build_report(&fixtures(), &c).expect("report");
+    let v: serde_json::Value = serde_json::from_str(&render_report_json(&r)).expect("json");
+    assert_eq!(v["threshold_points"], -5);
+    assert_eq!(v["including"]["overall"]["diff_points"], "-8.0");
+    assert_eq!(v["including"]["meets"], false);
+    assert_eq!(v["rows"].as_array().map(Vec::len), Some(25));
+    assert_eq!(v["including"]["by_page"].as_array().map(Vec::len), Some(13));
+}
+
+/// write_report はリポ内・相対パスを拒否し、temp には LF のみの 2 ファイルを書く。
+#[test]
+fn aisnap9_write_report_paths() {
+    let red = results_with(|_| None);
+    let r = compare_results(&TASKS, &red, &red).expect("compare");
+    let (md, json) = (render_report_markdown(&r, &meta()), render_report_json(&r));
+    assert!(
+        write_report(
+            &md,
+            &json,
+            &manifest().join("target").join("aisnap9-report-no")
+        )
+        .is_err()
+    );
+    assert!(write_report(&md, &json, Path::new("relative/dir")).is_err());
+    let dir = temp_dir("rep-out");
+    let paths = write_report(&md, &json, &dir).expect("write");
+    assert_eq!(paths.len(), 2);
+    for p in &paths {
+        let body = std::fs::read_to_string(p).expect("read");
+        assert!(!body.contains('\r') && body.ends_with('\n'));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 実験用: `AGENT_EVAL_COMPARE_ANSWERS=/abs/dir` の回答からレポートを作り stdout へ出す。不完全なら失敗。
+/// `AGENT_EVAL_COMPARE_REPORT_OUT=/abs/dir` があればリポ外へ書く。メタ情報は
+/// `AGENT_EVAL_REPORT_COMMIT`・`_DATE`・`_MODEL`・`_ISSUES`。
+#[test]
+fn aisnap9_report_if_requested() {
+    let Some(dir) = env_dir("AGENT_EVAL_COMPARE_ANSWERS") else {
+        return;
+    };
+    let c = collect(&dir);
+    assert!(c.status.is_complete(), "answers are incomplete");
+    let r = build_report(&fixtures(), &c).expect("report");
+    let var = |k: &str| std::env::var(k).ok();
+    let m = ReportMeta::from_parts(
+        var("AGENT_EVAL_REPORT_COMMIT").as_deref(),
+        var("AGENT_EVAL_REPORT_DATE").as_deref(),
+        var("AGENT_EVAL_REPORT_MODEL").as_deref(),
+        var("AGENT_EVAL_REPORT_ISSUES").as_deref(),
+    )
+    .expect("meta");
+    let md = render_report_markdown(&r, &m);
+    println!("{md}");
+    if let Some(out) = env_dir("AGENT_EVAL_COMPARE_REPORT_OUT") {
+        write_report(&md, &render_report_json(&r), &out).expect("write report");
     }
 }
