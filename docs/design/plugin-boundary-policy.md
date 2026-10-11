@@ -1,6 +1,6 @@
 # プラグイン境界ポリシー
 
-対応 `TASK-93`（93.1）/ `MS-9` / ビヘイビア `PLUG-1`（[spec-reference](../../.claude/rules/spec-reference.md)）。
+対応 `TASK-93`（93.1・93.2）/ `MS-9` / ビヘイビア `PLUG-1`（[spec-reference](../../.claude/rules/spec-reference.md)）。
 
 ## 目的
 
@@ -42,7 +42,7 @@ spec 本文中の旧称 `rust-browser` は `fandhe-browser` に読み替える�
 
 | 観点 | 現状 |
 | ---- | ---- |
-| コンパイル時プラグインの例 | `fandhe-browser-cli` の feature `js-v8`（既定）・`js-boa`・`rendering`（`JS-1`・`RENDER-1`）。feature と配布プロファイルの対応表は #361 で追加する |
+| コンパイル時プラグインの例 | `fandhe-browser-cli` の feature `js-v8`（既定）・`js-boa`・`rendering`（`JS-1`・`RENDER-1`）。feature と配布プロファイルの対応は下記「feature と配布プロファイルの対応」を参照 |
 | 実行時拡張の例 | `fandhe-browser-mcp`（別バイナリ・stdio）。ホストとは HTTP と [host-api.schema.json](host-api.schema.json) の契約のみで接続する（`PLUG-2`・`PLUG-3`、依存方向は `REPAIR-1`） |
 | WASM ランタイム | `Cargo.lock` に `wasmtime`・`wasmer`・`wasmi` なし（`Cargo.lock` の `name` 行を grep して 0 件。確認コマンドは下記） |
 | `libloading` | `Cargo.lock` に存在するが、`v8` の build-dependency 経由（`v8` → `bindgen` → `clang-sys` → `libloading`）のビルド時のみ。通常依存のグラフには現れない |
@@ -63,6 +63,40 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 前者は上記の build-dependency 経路のみを示し、後者は `nothing to print` となる（一致 0 件は警告で、これが合格の状態）。
 これを CI でゲート化するかは #362 以降の検討候補であり、現時点では未実装である。
 
+## feature と配布プロファイルの対応
+
+対応 `TASK-93`（93.2）/ `PLUG-1`。確認日 2026-10-11、基準コミット `c48cbf40`（`origin/main`）。
+
+- 起点は `fandhe-browser-cli`。非空の `default` を持つ crate は cli だけで、feature は `cli → core → js` の順に転送される（ai・cdp・`wpt_subset_runner` は core への転送のみ）
+- 出典は spec「JS エンジンの切替方式」のビルド構成表と「コンテナイメージの構成」（`JS-1`・`CTR-1`・`CTR-4`）。詳細は ID から spec を参照する
+
+### 表 A: 配布プロファイルと feature の組み合わせ
+
+| 配布プロファイル | 有効な cli feature | cli のビルド指定 | 同梱エンジン | `rendering` | 配布経路 | 検証 |
+| ---------------- | ------------------ | ---------------- | ------------ | ----------- | -------- | ---- |
+| 互換（既定） | `js-v8` | 指定なし | V8 | 無効 | `docker/Dockerfile.release` の `--target default` | `[default]`（`rust-features-*`）・`[binary-size]`（`harness-*`） |
+| 軽量 | `js-boa` | `--no-default-features --features js-boa` | boa | 無効 | `docker/Dockerfile.release` の `--target lite` | `[js-boa]`（`rust-features-*`）・`[js-engine-isolation]` 検査 A |
+| 両エンジン同梱（配布しない） | `js-v8` + `js-boa` | `--features js-boa` | V8・boa | 無効 | 配布しない | `[default]` の両エンジンテスト・`rust-test-*` の `--all-features` |
+| エンジンなし（配布しない） | なし | `--no-default-features` | なし | 無効 | 配布の要否は未決 | `[js-boa]` の `cargo check`（cli エンジンなし）・`[js-engine-isolation]` 検査 B |
+
+- 軽量は `--no-default-features` が必須。`--features js-boa` だけでは両エンジン同梱になり `CTR-1` に反する
+- 同梱していないエンジンを設定で指定すると設定エラーで起動せず、別エンジンへのフォールバックはしない（`JS-1`「設定ファイルとの関係・エラー挙動」）
+- 軽量コンテナは現時点で main からビルドできない。`scripts/gen-cargo-licenses.sh` が boa 系 9 crate のライセンス文書不足で fail-closed するため（[container-size-measurement.md](container-size-measurement.md)「限界・残課題」）。表の「軽量」は feature 構成の定義であり、配布可能な状態を示すものではない（`REPAIR-3`）
+- ネイティブ配布物の配布経路は未整備（`release.yml` は `workflow_dispatch` 限定でバイナリ配布を行わない）。動的リンク方針は #363 の判断待ち
+- サイズの出典は [js-binary-size-report.md](js-binary-size-report.md)（#368 の release プロファイル変更前の値）と [container-size-measurement.md](container-size-measurement.md)（lite は由来不明イメージによる暫定値）。数値は本表に転記しない
+
+### 表 B: feature 別の一覧
+
+| feature | 定義 crate | 役割 | 含まれる配布プロファイル |
+| ------- | ---------- | ---- | ------------------------ |
+| `js-v8` | cli（既定）→ core → js。ai・cdp・`wpt_subset_runner` は転送のみ | V8 を同梱する | 互換 |
+| `js-boa` | 同上 | boa を同梱する | 軽量 |
+| `rendering` | cli のみ | render crate を optional 依存として有効化する | なし。render は Servo 未同梱の雛形で、オプトイン配布は `RENDER-3`・TASK-35。コンテナ配布の対象外 |
+| `test-support` | js・cdp | テスト専用の入口 | なし（dev-dependencies でのみ有効化） |
+
+- `rendering` は JS エンジンの feature と独立に組み合わせられる。検証は `[render-isolation]`・`make lint-rendering`・`make test-rendering`
+- `fandhe-browser-mcp` は feature ではなく別バイナリ・別プロセスの実行時拡張で、本表の対象外（「本リポジトリでの現状」の「実行時拡張の例」を参照）
+
 ## 関連ビヘイビアとの整合
 
 | ID | 本ポリシーとの関係 |
@@ -77,7 +111,7 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 
 | Issue | 内容 | 状態 |
 | ----- | ---- | ---- |
-| #361 | feature と配布プロファイルの対応表（`TASK-93.2`） | 未作成 |
+| #361 | feature と配布プロファイルの対応表（`TASK-93.2`） | 作成済み（「feature と配布プロファイルの対応」） |
 | #363 | 3 OS ネイティブ配布物の動的リンク方針（人間判断） | 判断待ち |
 | #362 | Linux 向け動的リンクなし検査スクリプト（`TASK-93.3`） | 未実装 |
 | #364 | macOS 向け動的リンク検査スクリプト（`TASK-93.4`） | 未実装 |
@@ -99,4 +133,5 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 - [host-api.schema.json](host-api.schema.json): ホスト API の契約
 - [render-feature-gate.md](render-feature-gate.md): `rendering` feature gate
 - [security](../../.claude/rules/security.md)・`AGENTS.md`: プラグイン境界のレビュー観点
-- Issue #359（親）・#360（本ドキュメント）・#361〜#365
+- [js-binary-size-report.md](js-binary-size-report.md)・[container-size-measurement.md](container-size-measurement.md): エンジン構成別・コンテナのサイズ計測
+- Issue #359（親）・#360（本ドキュメント）・#361（対応表）・#362〜#365
