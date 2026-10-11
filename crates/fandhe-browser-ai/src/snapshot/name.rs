@@ -3856,15 +3856,10 @@ mod tests {
         let none = HashSet::new();
         let same = compute_residual_content_name(&doc, &index, cell, &none).expect("残余");
         assert_eq!(same.text, full.text);
-        let (_, link) = parse_and_select(
-            "<table><tr><td>20 points by <a href=\"/u\">bob</a> | hide</td></tr></table>",
-            "a",
-        );
         // 別 Document の NodeId は流用できないため、同じ文書で a を引き直す。
         let a = query_selector_str(&doc, doc.root(), "a")
             .expect("セレクタは有効")
             .expect("a がある");
-        let _ = link;
         let covered: HashSet<NodeId> = [a].into_iter().collect();
         let r = compute_residual_content_name(&doc, &index, cell, &covered).expect("残余");
         assert_eq!(r.text, "20 points by | hide");
