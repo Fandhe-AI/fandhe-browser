@@ -6,8 +6,10 @@
 //! 「Playwright が送ったリクエストに対し、現状の実装が記録どおりの応答を返す」ことを具体値で固定する。
 //! Node 不要・ネットワーク不要で常時実行できる回帰フックであり、原因調査（TASK-43.2・#247）と
 //! 追加実装（TASK-43.3・#249）で応答が変わったら、トレースを再取得して本ファイルの期待値
-//! （`EXPECTED_*`）を更新する。TASK-43.3a で `/json/version/` と `Browser.getVersion` を追加した。
-//! 以降のメソッドの no-op は追加しない（`SEC-2`・`REPAIR-3`）。
+//! （`EXPECTED_*`）を更新する。TASK-43.3a で `/json/version/` と `Browser.getVersion` を、
+//! TASK-43.3b（段階 2a）で `Target.setAutoAttach`・`Browser.setDownloadBehavior`・
+//! `Target.getTargetInfo` を追加した。状態を保持する個別実装のみ追加し、一律成功は入れない
+//! （`SEC-2`・`REPAIR-3`）。
 //!
 //! `CdpState` の構築に `Profile::open` が必要で、非 unix では `ProfileError::Unsupported` を返す仕様のため
 //! `#[cfg(unix)]` とする（任意の skip ではなく `tests/devtools_browser.rs` と同じ理由）。
@@ -34,20 +36,19 @@ const TRACE: &str = include_str!("../../../harness/playwright-trace/results/newp
 const MAX_TRACE_LINES: usize = 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
-/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3a 後）。`Browser.getVersion` は成功し、
-/// 続く `Target.setAutoAttach`・`Browser.setDownloadBehavior` が未実装（`-32601`。`CDP-6`）で
-/// `connectOverCDP` が失敗する。`connectOverCDP(http)` と `(ws)` の 2 接続分を記録する
-/// （id は接続ごとに 1 から振り直される）。
+/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3b 後）。`connectOverCDP(http)` が成功し
+/// （`Browser.getVersion`・`Target.setAutoAttach`・`Browser.setDownloadBehavior`・
+/// `Target.getTargetInfo`）、続く `newContext` の `Target.createBrowserContext` が未実装
+/// （`-32601`。`CDP-6`）で失敗する。http 成功のため `connectOverCDP(ws)` 段階は実行されない。
 ///
 /// 注意: `Browser.getVersion` の応答に `CARGO_PKG_VERSION` が入るため、workspace の版を上げたら
 /// `make trace-playwright` でトレースを再取得すること。
-const EXPECTED_SEND_METHODS: [&str; 6] = [
+const EXPECTED_SEND_METHODS: [&str; 5] = [
     "Browser.getVersion",
     "Target.setAutoAttach",
     "Browser.setDownloadBehavior",
-    "Browser.getVersion",
-    "Target.setAutoAttach",
-    "Browser.setDownloadBehavior",
+    "Target.getTargetInfo",
+    "Target.createBrowserContext",
 ];
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -212,8 +213,8 @@ fn cdp2_playwright_trace_is_well_formed() {
         .map(|r| r["message"]["method"].as_str().expect("method is a string"))
         .collect();
     assert_eq!(sends, EXPECTED_SEND_METHODS);
-    // 現状の到達点: connectOverCDP のみ失敗し（Target.setAutoAttach 以降が未実装）、
-    // newContext / newPage には到達しない。
+    // 現状の到達点: connectOverCDP(http) は成功し、newContext が Target.createBrowserContext
+    // の未実装（-32601）で失敗する。newPage には到達しない。
     let stages: Vec<(&str, bool)> = recs
         .iter()
         .filter(|r| r["kind"] == "stage")
@@ -221,10 +222,16 @@ fn cdp2_playwright_trace_is_well_formed() {
         .collect();
     assert_eq!(
         stages,
-        [
-            ("connectOverCDP(http)", false),
-            ("connectOverCDP(ws)", false)
-        ]
+        [("connectOverCDP(http)", true), ("newContext", false)]
+    );
+    let ctx_error = recs
+        .iter()
+        .find(|r| r["kind"] == "stage" && r["name"] == "newContext")
+        .and_then(|r| r["error"].as_str())
+        .expect("newContext error");
+    assert!(
+        ctx_error.contains("Protocol error (Target.createBrowserContext): method not implemented"),
+        "{ctx_error}"
     );
 }
 
@@ -303,15 +310,18 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
     }});
     let unimpl =
         |id: u32| json!({"id": id, "error": {"code": -32601, "message": "method not implemented"}});
+    let browser_info = json!({"id": 4, "result": {"targetInfo": {
+        "targetId": "trace-1", "type": "browser", "title": "", "url": "",
+        "attached": true, "canAccessOpener": false
+    }}});
     assert_eq!(
         replayed,
         [
-            version.clone(),
-            unimpl(2),
-            unimpl(3),
             version,
-            unimpl(2),
-            unimpl(3)
+            json!({"id": 2, "result": {}}),
+            json!({"id": 3, "result": {}}),
+            browser_info,
+            unimpl(5)
         ]
     );
     assert_eq!(replayed, recvs, "replay must match the recorded responses");
@@ -326,9 +336,11 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
     assert_eq!(
         logged,
         [
-            ("Browser.getVersion", 2, 0),
-            ("Browser.setDownloadBehavior", 0, 2),
-            ("Target.setAutoAttach", 0, 2)
+            ("Browser.getVersion", 1, 0),
+            ("Browser.setDownloadBehavior", 1, 0),
+            ("Target.createBrowserContext", 0, 1),
+            ("Target.getTargetInfo", 1, 0),
+            ("Target.setAutoAttach", 1, 0)
         ],
         "snapshot: {snap:?}"
     );
