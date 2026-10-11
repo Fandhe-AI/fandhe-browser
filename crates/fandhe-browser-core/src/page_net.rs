@@ -477,7 +477,8 @@ impl NetQueue {
             started: self.accepted,
             completed: self.completed,
             response_bytes: self.used_bytes,
-            pending_at_end: self.pending.len(),
+            // 取得中に打ち切った要求も含めるため、受理数と配送数から算出する。
+            pending_at_end: self.accepted.saturating_sub(self.completed),
         }
     }
 }
@@ -596,6 +597,18 @@ mod tests {
         assert_eq!(req(&mut queue, "a"), Err(NetRejectKind::RequestLimit));
         assert_eq!(queue.report().started(), 50);
         assert_eq!(queue.pending_len(), 50);
+    }
+
+    /// JS-8: 取得中に打ち切った（キューから外したが未配送の）要求も未配送件数に含める。
+    #[test]
+    fn js_8_pending_at_end_counts_requests_taken_but_undelivered() {
+        let mut queue = q(PageNetLimits::default());
+        req(&mut queue, "a").expect("accepted");
+        assert!(queue.pop_pending().is_some());
+        let report = queue.report();
+        assert_eq!(report.started(), 1);
+        assert_eq!(report.completed(), 0);
+        assert_eq!(report.pending_at_end(), 1);
     }
 
     fn ok_body(len: usize) -> NetOutcome {

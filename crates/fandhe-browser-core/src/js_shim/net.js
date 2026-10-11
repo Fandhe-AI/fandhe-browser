@@ -183,30 +183,38 @@
     // ---- XMLHttpRequest（最小。非同期 GET のみ） ----
 
     function callHandler(xhr, name) {
-        var handler = xhr[name];
-        if (typeof handler === 'function') {
-            try {
+        // ハンドラの取得（getter の例外を含む）も診断へ集約し、後続の処理を続ける。
+        try {
+            var handler = xhr[name];
+            if (typeof handler === 'function') {
                 fnCall(handler, xhr);
-            } catch (e) {
-                reportError('xhr', e);
             }
+        } catch (e) {
+            reportError('xhr', e);
         }
     }
 
+    // readystatechange の後に abort() / open() で要求世代が変わったら、後続イベントは発火しない。
     function xhrFail(xhr) {
+        var gen = xhr._g;
         xhr.readyState = 4;
         xhr.status = 0;
         callHandler(xhr, 'onreadystatechange');
-        callHandler(xhr, 'onerror');
+        if (xhr._g === gen) {
+            callHandler(xhr, 'onerror');
+        }
     }
 
     function xhrDone(xhr, status, url, body) {
+        var gen = xhr._g;
         xhr.readyState = 4;
         xhr.status = status;
         xhr.responseURL = url;
         xhr.responseText = body;
         callHandler(xhr, 'onreadystatechange');
-        callHandler(xhr, 'onload');
+        if (xhr._g === gen) {
+            callHandler(xhr, 'onload');
+        }
     }
 
     function later(fn) {
@@ -311,12 +319,19 @@
         var url = '';
         if (status > 0) {
             try {
+                // 空チャンク（終端）を確認できないまま上限に達したら、切り詰めた本文を成功として
+                // 公開せず失敗にする。
+                var ended = false;
                 for (var i = 0; i < MAX_CHUNKS; i++) {
                     var chunk = callOp('netReadBody', id);
                     if (typeof chunk !== 'string' || chunk.length === 0) {
+                        ended = true;
                         break;
                     }
                     body += chunk;
+                }
+                if (!ended) {
+                    throw new NativeError('response body too long to deliver');
                 }
                 url = toStr(callOp('netFinalUrl', id));
             } catch (e) {

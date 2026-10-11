@@ -979,7 +979,9 @@ fn execute(
             let Some(id) = decode_net_id(args.first()) else {
                 return Ok(JsValue::String(String::new()));
             };
-            let max = NET_BODY_CHUNK_BYTES.min(limits.max_response_bytes);
+            // UTF-8 の 1 文字（最大 4 バイト）より小さいと未読本文があるのに空文字を返し、
+            // 終端と誤認されるため、下限を 4 バイトにする。
+            let max = NET_BODY_CHUNK_BYTES.min(limits.max_response_bytes).max(4);
             Ok(JsValue::String(page.net.read_chunk(id, max)))
         }
         DomOp::NetFinalUrl => {
