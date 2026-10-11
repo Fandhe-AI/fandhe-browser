@@ -121,7 +121,7 @@ fake_image() {
 
 reset_fake() {
   rm -f "${FAKE}"/*
-  fake_image "$REF_PIN" "$ID_REF" 1000000000 amd64 "[\"${REF_PIN}\"]" '1000000000\n0\n'
+  fake_image "$REF_PIN" "$ID_REF" 1500000000 amd64 "[\"${REF_PIN}\"]" '1000000000\n0\n'
   fake_image "fandhe-browser:default" "$ID_DEF" 72563283 amd64 '[]' '0\n0\n8192\n1495040\n51470336\n200704\n'
   fake_image "fandhe-browser:lite" "$ID_LITE" 16178674 amd64 '[]' '12271616\n'
 }
@@ -144,13 +144,13 @@ case "$ENV_LINE" in
   *) ng "shim: env line [$ENV_LINE]" ;;
 esac
 expect_eq "shim: reference row" \
-  "container-size: role=reference image=${REF_TAG} digest=${REF_DIGEST} id=${ID_REF} platform=linux/amd64 method=history-sum bytes=1000000000 mb=1000.00 docker_size_bytes=1000000000 docker_size_mb=1000.00" \
+  "container-size: role=reference image=${REF_TAG} digest=${REF_DIGEST} id=${ID_REF} platform=linux/amd64 method=history-sum bytes=1000000000 mb=1000.00 docker_size_bytes=1500000000 docker_size_mb=1500.00" \
   "$(sed -n '2p' "$OUT")"
 expect_eq "shim: default row" \
-  "container-size: role=default image=fandhe-browser:default digest=none id=${ID_DEF} platform=linux/amd64 method=history-sum bytes=53174272 mb=53.17 docker_size_bytes=72563283 docker_size_mb=72.56 reference_bytes=1000000000 reduction_pct=94.68 docker_size_reduction_pct=92.74" \
+  "container-size: role=default image=fandhe-browser:default digest=none id=${ID_DEF} platform=linux/amd64 method=history-sum bytes=53174272 mb=53.17 docker_size_bytes=72563283 docker_size_mb=72.56 reference_bytes=1000000000 reduction_pct=94.68 docker_size_reduction_pct=95.16" \
   "$(sed -n '3p' "$OUT")"
 expect_eq "shim: lite row" \
-  "container-size: role=lite image=fandhe-browser:lite digest=none id=${ID_LITE} platform=linux/amd64 method=history-sum bytes=12271616 mb=12.27 docker_size_bytes=16178674 docker_size_mb=16.18 reference_bytes=1000000000 reduction_pct=98.77 docker_size_reduction_pct=98.38" \
+  "container-size: role=lite image=fandhe-browser:lite digest=none id=${ID_LITE} platform=linux/amd64 method=history-sum bytes=12271616 mb=12.27 docker_size_bytes=16178674 docker_size_mb=16.18 reference_bytes=1000000000 reduction_pct=98.77 docker_size_reduction_pct=98.92" \
   "$(sed -n '4p' "$OUT")"
 expect_eq "shim: stdout has 4 lines" "4" "$(wc -l <"$OUT" | tr -d '[:space:]')"
 expect_eq "shim: no build/pull/run with --skip-build" "0" "$(grep -cE '^(build|pull|run) ' "${FAKE}/calls.log" || true)"

@@ -54,7 +54,7 @@ CONTAINER_SIZE_SKIP_BUILD=1 make measure-container-size    # ビルド済みイ�
   （`container-size-env` の `image_store=containerd-snapshotter`）では圧縮 blob 分だけ大きくなる。
   graph driver の `docker images` の SIZE とは意味が異なるため、机上概算との比較には `bytes` を使う
 - 圧縮サイズ（レジストリ転送サイズ）は計測しない
-- 削減率は同一実行で測った比較対象の `bytes` に対して算出し、小数第 2 位で **切り捨てる**
+- 削減率 `reduction_pct` は同一実行で測った比較対象の `bytes` に対して、`docker_size_reduction_pct` は比較対象の `docker_size_bytes`（`.Size`）に対して算出し、小数第 2 位で **切り捨てる**
   （閾値を跨いで過大表示しないため）。`mb` は 10 進（10^6）
 
 ## 出力契約

@@ -160,11 +160,12 @@ measure_image() {
 }
 
 # $1=role $2=image label $3=platform $4=reference_bytes（空なら参照行）
+# $5=reference の docker_size_bytes（.Size。docker_size_reduction_pct の分母）
 print_row() {
-  local role="$1" label="$2" platform="$3" refb="$4" line
+  local role="$1" label="$2" platform="$3" refb="$4" refd="${5:-}" line
   line="container-size: role=${role} image=${label} digest=${M_DIGEST} id=${M_ID} platform=${platform} method=history-sum bytes=${M_BYTES} mb=$(bytes_to_mb "$M_BYTES") docker_size_bytes=${M_DSIZE} docker_size_mb=$(bytes_to_mb "$M_DSIZE")"
   if [ -n "$refb" ]; then
-    line="${line} reference_bytes=${refb} reduction_pct=$(reduction_pct "$M_BYTES" "$refb") docker_size_reduction_pct=$(reduction_pct "$M_DSIZE" "$refb")"
+    line="${line} reference_bytes=${refb} reduction_pct=$(reduction_pct "$M_BYTES" "$refb") docker_size_reduction_pct=$(reduction_pct "$M_DSIZE" "$refd")"
   fi
   echo "$line"
 }
@@ -264,14 +265,14 @@ main() {
   echo "container-size-env: docker_server=${DOCKER_VER} storage_driver=${STORAGE_DRIVER} image_store=${STORE_KIND} platform=${PLATFORM} commit=${COMMIT} dirty=${DIRTY} built=${BUILT}"
 
   measure_image reference "$REF_PIN" "$PLATFORM" "$REF_PIN"
-  local REF_BYTES="$M_BYTES"
+  local REF_BYTES="$M_BYTES" REF_DSIZE="$M_DSIZE"
   print_row reference "$REF_IMAGE" "$PLATFORM" ""
 
   measure_image default "$DEFAULT_IMAGE" "$PLATFORM" ""
-  print_row default "$DEFAULT_IMAGE" "$PLATFORM" "$REF_BYTES"
+  print_row default "$DEFAULT_IMAGE" "$PLATFORM" "$REF_BYTES" "$REF_DSIZE"
 
   measure_image lite "$LITE_IMAGE" "$PLATFORM" ""
-  print_row lite "$LITE_IMAGE" "$PLATFORM" "$REF_BYTES"
+  print_row lite "$LITE_IMAGE" "$PLATFORM" "$REF_BYTES" "$REF_DSIZE"
 }
 
 # self-test から関数を source できるよう、直接実行時のみ main を呼ぶ。
