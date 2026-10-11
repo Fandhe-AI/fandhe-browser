@@ -11,7 +11,7 @@
 //!
 //! 方針:
 //! - `Snapshot` が保持する情報（role・name・ref・state・children・table・
-//!   folded_rows・各 truncated）を落とさず出す。目標値に合わせて削らない。
+//!   folded_rows・folded_rows_omitted・各 truncated）を落とさず出す。目標値に合わせて削らない。
 //! - `data_leaf` は分類用メタデータでエージェントへ渡す本文ではないため出さない。
 //! - 再帰の深さは `MAX_TREE_DEPTH`（256）で有界。name は構築側で空白正規化済みの
 //!   前提だが、改行・タブが残っていても行形式を壊さないよう空白 1 個へ置換する。
@@ -76,7 +76,12 @@ fn render_node(node: &Node, depth: usize, lines: &mut Vec<String>) {
     render_head(node, depth, lines);
     let mut merge = Merge::new(node);
     render_children(&node.children, depth + 1, &mut merge, lines);
-    merge.flush(&"  ".repeat(depth + 1), lines);
+    let sub = "  ".repeat(depth + 1);
+    merge.flush(&sub, lines);
+    // 幅広表（TASK-23.7）で省略した葉セル行の件数。圧縮表の `… +N rows` と同じ書式。
+    if node.folded_rows_omitted > 0 {
+        lines.push(format!("{sub}… +{} rows", node.folded_rows_omitted));
+    }
 }
 
 /// ノード自身の行と、圧縮表（`table`）の行までを出す（子ノードと畳んだ行は含まない）。

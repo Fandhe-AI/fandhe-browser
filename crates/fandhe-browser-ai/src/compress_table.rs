@@ -16,6 +16,8 @@
 //! 行選択は固定の先頭 20 行ではなく `retention` の優先保持
 //! （`AISNAP-12`・TASK-16.4・Issue #107）で行う。
 //! `tfoot` 行は統合時に除外と決めた（`rows`・`truncated_rows` に含めない）。
+//! 列数が [`MAX_COLUMNS`] を超えるだけの表は [`detect_wide_table`] で構造を取り出し、
+//! 葉セル行を [`fold_wide_table_rows`] で畳む（TASK-23.7・Issue #829）。
 //!
 //! # 判定規則（table）
 //!
@@ -65,6 +67,8 @@ pub enum StructureKind {
 }
 
 /// 規則的と判定された構造。後続タスク（#80〜#83）が利用する。
+///
+/// [`detect_wide_table`] 経由の場合のみ `column_count` が [`MAX_COLUMNS`] を超えることがある。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RegularStructure {
@@ -266,7 +270,13 @@ fn collect_rows(doc: &Document, table: NodeId) -> Result<(Vec<Row>, usize), Irre
     Ok((rows, skipped))
 }
 
-fn detect_table(doc: &Document, table: NodeId) -> TableDetection {
+/// `table` の規則性を判定する。`max_columns` が `Some` なら実効列数の上限として扱い、
+/// `None` なら列数上限だけを外す（幅広表の検出用。[`detect_wide_table`]）。
+fn detect_table_with_cap(
+    doc: &Document,
+    table: NodeId,
+    max_columns: Option<usize>,
+) -> TableDetection {
     use IrregularReason as R;
     let irregular = TableDetection::Irregular;
 
@@ -294,10 +304,12 @@ fn detect_table(doc: &Document, table: NodeId) -> TableDetection {
     }
 
     let expected = first.columns;
-    if expected > MAX_COLUMNS {
+    if let Some(max) = max_columns
+        && expected > max
+    {
         return irregular(R::TooManyColumns {
             count: expected,
-            max: MAX_COLUMNS,
+            max,
         });
     }
     if let Some(bad) = rows.iter().find(|r| r.columns != expected) {
@@ -341,6 +353,10 @@ fn detect_table(doc: &Document, table: NodeId) -> TableDetection {
         column_count: expected,
         skipped_empty_rows,
     })
+}
+
+fn detect_table(doc: &Document, table: NodeId) -> TableDetection {
+    detect_table_with_cap(doc, table, Some(MAX_COLUMNS))
 }
 
 fn detect_list(doc: &Document, list: NodeId) -> TableDetection {
@@ -402,6 +418,37 @@ pub fn detect_regular_structure(doc: &Document, id: NodeId) -> TableDetection {
         detect_list(doc, id)
     } else {
         TableDetection::Irregular(IrregularReason::NotTableOrList)
+    }
+}
+
+// ---- 幅広表（列数上限超過）の検出（TASK-23.7・Issue #829） ----
+
+/// 幅広表として畳む場合の実効列数の上限（暫定値。REPAIR-3）。
+///
+/// これを超える表は畳まず従来どおり全展開する（黙って切り詰めるより安全側に倒す）。
+pub const MAX_WIDE_COLUMNS: usize = 256;
+
+/// 列数上限（[`MAX_COLUMNS`]）だけが原因で不規則になった表の構造を返す
+/// （`AISNAP-2`・TASK-23.7・Issue #829）。
+///
+/// 呼び出し文脈: `snapshot::build_snapshot` が [`detect_regular_structure`] で
+/// `TooManyColumns` を得た表に対して呼ぶ。列数上限以外の規則（role・入れ子・
+/// `rowspan`・ヘッダ行数・全行の列数一致）はすべて適用し、満たさない表と
+/// [`MAX_WIDE_COLUMNS`] を超える表は `None`（従来どおり全展開）。
+/// 返す [`RegularStructure::column_count`] は [`MAX_COLUMNS`] を超える。
+pub fn detect_wide_table(doc: &Document, id: NodeId) -> Option<RegularStructure> {
+    if !is_html(doc, id, "table") {
+        return None;
+    }
+    if !matches!(
+        detect_table_with_cap(doc, id, Some(MAX_COLUMNS)),
+        TableDetection::Irregular(IrregularReason::TooManyColumns { .. })
+    ) {
+        return None;
+    }
+    match detect_table_with_cap(doc, id, None) {
+        TableDetection::Regular(s) if s.column_count <= MAX_WIDE_COLUMNS => Some(s),
+        _ => None,
     }
 }
 
@@ -507,6 +554,59 @@ pub fn rows_to_fold(
         .collect()
 }
 
+/// 幅広表（TASK-23.7）の行の分類結果。
+///
+/// `#[non_exhaustive]` により、フィールド追加は外部 crate に対して非破壊で行える。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct WideTableFold {
+    /// 1 行文字列へ畳む行（「表示する行」の中での index, 行）。文書順。
+    pub folded: Vec<(usize, NodeId)>,
+    /// 優先保持に選ばれず省略する行（文書順。件数が「他 N 行」になる）。
+    pub omitted: Vec<NodeId>,
+}
+
+/// 幅広表の表示対象データ行を、畳む行・省略する行・展開する行に分類する
+/// （`AISNAP-2`・`AISNAP-12`・TASK-23.7・Issue #829）。
+///
+/// - `must_keep(row)` が真の行は展開のまま残す（保持の可否に関係なく省略しない）
+/// - それ以外で優先保持に選ばれた行は `folded`、選ばれなかった行は `omitted`
+/// - 表示対象行が [`MAX_TABLE_ROWS`] 以下なら、`must_keep` でない行はすべて畳む
+///
+/// [`rows_to_fold`] との違い: 通常表では保持されない行を畳み保持行を展開するが、
+/// 幅広表は 1 行あたりのトークンが大きいため、保持行を畳み、保持されない行は省略する。
+/// `folded` の index は「畳む行と展開する行（省略行を除く）」を文書順に数えた位置で、
+/// 展開側の行は畳んだ行が使わない index を昇順に占める（`FoldedRow::index` の契約）。
+pub fn fold_wide_table_rows(
+    doc: &Document,
+    structure: &RegularStructure,
+    must_keep: impl Fn(NodeId) -> bool,
+) -> WideTableFold {
+    let visible = visible_body_rows(doc, structure);
+    let kept: Option<std::collections::HashSet<usize>> = if visible.len() > MAX_TABLE_ROWS {
+        let candidates = priority_candidates(doc, &visible);
+        let policy = RetentionPolicy::new(MAX_TABLE_ROWS, TABLE_HEAD_KEEP);
+        let retention = select_retained_with_priority(visible.len(), &policy, &candidates);
+        Some(retention.kept.iter().map(|k| k.index).collect())
+    } else {
+        None
+    };
+    let mut out = WideTableFold::default();
+    let mut shown = 0usize;
+    for (i, &row) in visible.iter().enumerate() {
+        let is_kept = kept.as_ref().is_none_or(|k| k.contains(&i));
+        if must_keep(row) {
+            shown += 1;
+        } else if is_kept {
+            out.folded.push((shown, row));
+            shown += 1;
+        } else {
+            out.omitted.push(row);
+        }
+    }
+    out
+}
+
 /// 明示した行要素の列を 1 行 1 文字列へ圧縮する（文書順を保つ。行の省略はしない）。
 ///
 /// [`compress_rows`] の行文字列化部分を切り出したもの。`build_snapshot` が畳む行
@@ -517,22 +617,41 @@ pub fn compress_row_list(
     rows: &[NodeId],
 ) -> Vec<CompressedRow> {
     rows.iter()
-        .map(|&row| compress_one_row(doc, kind, row))
+        .map(|&row| compress_one_row(doc, kind, row, MAX_COLUMNS))
         .collect()
 }
 
-fn compress_one_row(doc: &Document, kind: StructureKind, row: NodeId) -> CompressedRow {
+/// 幅広表（[`detect_wide_table`]）の行を 1 行 1 文字列へ圧縮する（TASK-23.7）。
+///
+/// [`compress_row_list`] との違いはセル数の上限が [`MAX_WIDE_COLUMNS`] である点だけ。
+/// 上限を超えたセルは落とし、`truncated` を立てて通知する。
+pub fn compress_wide_row_list(doc: &Document, rows: &[NodeId]) -> Vec<CompressedRow> {
+    rows.iter()
+        .map(|&row| compress_one_row(doc, StructureKind::Table, row, MAX_WIDE_COLUMNS))
+        .collect()
+}
+
+fn compress_one_row(
+    doc: &Document,
+    kind: StructureKind,
+    row: NodeId,
+    max_cells: usize,
+) -> CompressedRow {
+    let mut over_cap = false;
     let cells: Vec<NodeId> = match kind {
-        StructureKind::Table => doc
-            .children(row)
-            .filter(|&c| is_html(doc, c, "td") || is_html(doc, c, "th"))
-            .take(MAX_COLUMNS)
-            .collect(),
+        StructureKind::Table => {
+            let mut it = doc
+                .children(row)
+                .filter(|&c| is_html(doc, c, "td") || is_html(doc, c, "th"));
+            let taken: Vec<NodeId> = it.by_ref().take(max_cells).collect();
+            over_cap = it.next().is_some();
+            taken
+        }
         // List と将来の種別は行要素自身を 1 セルとする。
         _ => vec![row],
     };
     let mut text = String::new();
-    let mut truncated = false;
+    let mut truncated = over_cap;
     for (i, cell) in cells.into_iter().enumerate() {
         if i > 0 {
             text.push_str(CELL_SEPARATOR);
@@ -1524,5 +1643,81 @@ mod tests {
         let doc = parse("<table><thead hidden><tr><th>a<th>b</thead><tbody><tr><td>1<td>2</table>");
         let (out, _) = header_refs(&doc, &mut RefAllocator::new(), "table");
         assert_eq!(out, Vec::<HeaderCellRef>::new());
+    }
+
+    // ---- 幅広表（TASK-23.7・Issue #829） ----
+
+    fn grid(cols: usize, rows: usize) -> String {
+        let head: String = (0..cols).map(|c| format!("<th>H{c}</th>")).collect();
+        let body: String = (0..rows)
+            .map(|r| {
+                let cells: String = (0..cols).map(|c| format!("<td>r{r}c{c}</td>")).collect();
+                format!("<tr>{cells}</tr>")
+            })
+            .collect();
+        format!("<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
+    }
+
+    /// AISNAP-2: 列数上限だけが原因の 21 列表は幅広表として構造を取り出せる。
+    #[test]
+    fn aisnap_2_wide_table_detected_when_only_column_cap_exceeded() {
+        let html = grid(21, 3);
+        let doc = parse(&html);
+        let id = select(&doc, "table");
+        assert_eq!(
+            detect_regular_structure(&doc, id),
+            TableDetection::Irregular(IrregularReason::TooManyColumns { count: 21, max: 20 })
+        );
+        let s = detect_wide_table(&doc, id).expect("幅広表");
+        assert_eq!(s.column_count, 21);
+        assert_eq!(s.body_rows.len(), 3);
+    }
+
+    /// AISNAP-2: 列数不一致の幅広表・上限超過の表・20 列以下の表は幅広表ではない。
+    #[test]
+    fn aisnap_2_wide_table_rejects_irregular_over_cap_and_narrow() {
+        let bad = grid(21, 2).replacen("<td>r1c20</td>", "", 1);
+        let doc = parse(&bad);
+        assert_eq!(detect_wide_table(&doc, select(&doc, "table")), None);
+        let doc = parse(&grid(MAX_WIDE_COLUMNS + 1, 1));
+        assert_eq!(detect_wide_table(&doc, select(&doc, "table")), None);
+        let doc = parse(&grid(MAX_COLUMNS, 1));
+        assert_eq!(detect_wide_table(&doc, select(&doc, "table")), None);
+    }
+
+    /// AISNAP-12: 50 行の幅広表は畳む 20 行（index 0..19）と省略 30 行に分かれる。
+    #[test]
+    fn aisnap_12_fold_wide_rows_partitions_kept_and_omitted() {
+        let doc = parse(&grid(21, 50));
+        let s = detect_wide_table(&doc, select(&doc, "table")).expect("幅広表");
+        let f = fold_wide_table_rows(&doc, &s, |_| false);
+        let idx: Vec<usize> = f.folded.iter().map(|&(i, _)| i).collect();
+        assert_eq!(idx, (0..20).collect::<Vec<_>>());
+        assert_eq!(f.omitted.len(), 30);
+    }
+
+    /// AISNAP-12: 展開する行（`must_keep`）は省略せず、畳み行の index はその位置を飛ばす。
+    #[test]
+    fn aisnap_12_fold_wide_rows_skips_index_of_expanded_row() {
+        let doc = parse(&grid(21, 50));
+        let s = detect_wide_table(&doc, select(&doc, "table")).expect("幅広表");
+        let keep = *s.body_rows.get(25).expect("行 25");
+        let f = fold_wide_table_rows(&doc, &s, |r| r == keep);
+        let idx: Vec<usize> = f.folded.iter().map(|&(i, _)| i).collect();
+        assert_eq!(idx, (0..20).collect::<Vec<_>>());
+        assert!(!f.omitted.contains(&keep));
+        assert_eq!(f.omitted.len(), 29);
+    }
+
+    /// AISNAP-2: 幅広行の圧縮は 21 列目以降も落とさない（`MAX_COLUMNS` で切らない）。
+    #[test]
+    fn aisnap_2_compress_wide_row_list_keeps_all_cells() {
+        let doc = parse(&grid(50, 1));
+        let s = detect_wide_table(&doc, select(&doc, "table")).expect("幅広表");
+        let rows = compress_wide_row_list(&doc, &s.body_rows);
+        let r = rows.first().expect("1 行");
+        assert_eq!(r.text.split(" | ").count(), 50);
+        assert_eq!(r.text.split(" | ").nth(49), Some("r0c49"));
+        assert!(!r.truncated);
     }
 }

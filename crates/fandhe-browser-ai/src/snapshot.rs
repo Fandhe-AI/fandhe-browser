@@ -160,6 +160,14 @@ pub struct Node {
     /// （圧縮表の「データ行は ref を持たない」を展開表の通常行へ広げる）。ref を持つべき行は
     /// `children` に残る。元の順序は [`FoldedRow::index`] で復元する。
     pub folded_rows: Vec<FoldedRow>,
+    /// 幅広表（実効列数が `MAX_COLUMNS` を超える表。`AISNAP-2`・TASK-23.7・Issue #829）で、
+    /// 優先保持（`AISNAP-12`）に選ばれず省略した葉セル行の件数（`AISNAP-2` の「他 N 行」）。
+    /// 圧縮表の `TableSummary::truncated_rows` に対応する。0 は省略なし。
+    ///
+    /// 幅広表では、子が葉セルだけの行を [`Node::folded_rows`] へ畳み、上限を超えた分は
+    /// 省略してここで数える。畳んだ行のセルは ref を持たない（TASK-23.4 の「展開した
+    /// データ葉は ref を持つ」方針の例外で、圧縮表の「データ行は ref を持たない」と同じ契約）。
+    pub folded_rows_omitted: usize,
 }
 
 /// 展開した表・一覧で 1 行文字列へ畳んだ通常行（`AISNAP-12`・TASK-16.4）。
@@ -167,9 +175,13 @@ pub struct Node {
 /// [`Node::folded_rows`] の要素。ref・`data_leaf` は持たない（`AISNAP-2` の
 /// 「データ行は ref を持たない」と同じ契約）。
 ///
+/// 幅広表（TASK-23.7）では、子が葉セルだけの行を畳み、そのセルは ref を持たない
+/// （TASK-23.4 の例外）。省略した行は [`Node::folded_rows_omitted`] で数える。
+///
 /// `index` は、表・一覧の表示対象データ行（ヘッダ行・`tfoot` 行・非表示行を除く）を
 /// 文書順に数えたときの 0 起点の位置。展開側（`children` 配下）に残る表示対象データ行は、
-/// 畳んだ行が使っていない index を文書順に昇順で占める。したがって両者を index で
+/// 畳んだ行が使っていない index を文書順に昇順で占める。幅広表では省略した行を
+/// 数えず、「表示する行（省略行を除く）」の中の位置とする。したがって両者を index で
 /// 統合すれば元の文書順を復元できる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -378,6 +390,7 @@ impl Node {
             data_leaf: None,
             table: None,
             folded_rows: Vec::new(),
+            folded_rows_omitted: 0,
         }
     }
 

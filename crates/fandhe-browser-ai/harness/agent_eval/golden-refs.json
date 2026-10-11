@@ -62,7 +62,7 @@
   {
     "id": "extract-04",
     "locators": [
-      {"selector": "tbody td", "index": 14, "refs": ["e7b0a026b4af3d2a1"]}
+      {"selector": "tbody td", "index": 14, "refs": []}
     ]
   },
   {

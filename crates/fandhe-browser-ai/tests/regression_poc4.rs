@@ -6,7 +6,8 @@
 //! 欠落して失敗した。
 //!
 //! 2 層構成の理由: 実フィクスチャ `benches/fixtures/large-table.html` は 50 列で
-//! `MAX_COLUMNS`（20）を超えるため圧縮せず展開経路（`row` -> `cell`）を通る（層 A）。
+//! `MAX_COLUMNS`（20）を超えるため圧縮表にならず、幅広表の経路（TASK-23.7・Issue #829。
+//! ヘッダは展開、データ行は `Node::folded_rows` の畳み行）を通る（層 A）。
 //! 圧縮 `TableSummary::rows` 経路は 20 列以下の合成表で確かめる（層 B）。
 //!
 //! extract-05 節（TASK-18.2・Issue #116）: `quotes-list` の 1 件目の引用文本文の抽出。
@@ -44,9 +45,6 @@ use fandhe_browser_ai::snapshot::{
 use fandhe_browser_core::dom::{Document, NodeId};
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
 use fandhe_browser_core::query::{query_selector_all_str, query_selector_str};
-
-/// `AISNAP-10` の ref 安定性に基づく固定値（`harness/agent_eval/golden-refs.json` の extract-04）。
-const EXTRACT_04_REF: &str = "e7b0a026b4af3d2a1";
 
 /// `AISNAP-10` の ref 安定性に基づく固定値（`golden-refs.json` の extract-05。`span.text` 0 番目）。
 const EXTRACT_05_REF: &str = "e784578bcfc4c2ad1";
@@ -132,46 +130,49 @@ fn only_table(s: &Snapshot) -> &Node {
     tables.first().copied().expect("直前で件数を確認済み")
 }
 
-/// 先頭データ行（最初のセルが `r0c0-0` の `row`）を返す。row の name は空白有無が
-/// 入力 HTML で変わるため、子セルで特定する。
-fn first_data_row(table: &Node) -> &Node {
-    let rows: Vec<&Node> = all_nodes(table)
-        .into_iter()
-        .filter(|n| n.role == "row" && n.children.first().is_some_and(|c| c.name == "r0c0-0"))
-        .collect();
-    assert_eq!(rows.len(), 1, "1 行目はちょうど 1 つ");
-    rows.first().copied().expect("直前で件数を確認済み")
+/// 畳み行 1 行目の `i` 番目セルのテキストを返す。
+fn folded_first_row_cell(table: &Node, i: usize) -> Option<String> {
+    table
+        .folded_rows
+        .first()
+        .and_then(|r| r.text.split(" | ").nth(i).map(str::to_string))
 }
 
-/// `AISNAP-13`・TASK-18.1・Issue #115: Snapshot が打ち切られても 1 行目 15 列目が残る。
+/// `AISNAP-13`・`AISNAP-2`・TASK-18.1・TASK-23.7・Issue #115・#829: 幅広表でも 1 行目 15 列目の値が
+/// 畳み行から抽出できる。幅広表の葉セル行は 1 行に畳まれセルは ref を持たない（TASK-23.4 の例外）。
 #[test]
-fn aisnap_13_extract_04_large_table_back_column_cell_survives_truncation() {
+fn aisnap_13_extract_04_large_table_back_column_cell_survives_wide_fold() {
     let s = snap(&read_fixture("large-table.html"));
-    // TASK-23.6（Issue #828）: row・cell の出力 name が子孫に出ないテキストだけへ縮み、
-    // フル name の 120 文字打ち切りが出力から消えたため truncated は立たない（実測で固定）。
-    assert!(!s.truncated, "row の name 打ち切りは出力から消えている前提");
+    assert!(!s.truncated, "行の省略は truncated を立てない");
     let table = only_table(&s);
-    assert!(table.table.is_none(), "50 列は展開経路");
-    let row = first_data_row(table);
-    let cell = row.children.get(14).expect("15 列目が残る");
-    assert_eq!(cell.role, "cell");
-    assert_eq!(cell.name, "r0c14-14");
-    assert_eq!(cell.r#ref.as_deref(), Some(EXTRACT_04_REF));
-    assert_eq!(cell.data_leaf, Some(DataLeafKind::TableCell));
+    assert!(table.table.is_none(), "50 列は圧縮表ではない");
+    assert_eq!(table.folded_rows.len(), MAX_TABLE_ROWS);
+    assert_eq!(table.folded_rows_omitted, 30);
+    let first = table.folded_rows.first().expect("1 行目は畳み行");
+    assert_eq!(first.index, 0);
+    assert_eq!(first.text.split(" | ").count(), 50);
+    assert_eq!(
+        folded_first_row_cell(table, 14).as_deref(),
+        Some("r0c14-14")
+    );
     // 隣接セルとの取り違え防止。
     assert_eq!(
-        row.children.get(13).map(|n| n.name.as_str()),
+        folded_first_row_cell(table, 13).as_deref(),
         Some("r0c13-13")
     );
     assert_eq!(
-        row.children.get(15).map(|n| n.name.as_str()),
+        folded_first_row_cell(table, 15).as_deref(),
         Some("r0c15-15")
     );
-    let hits = all_nodes(&s.tree)
+    let hits: usize = all_nodes(&s.tree)
         .into_iter()
-        .filter(|n| n.name == "r0c14-14")
-        .count();
+        .flat_map(|n| n.folded_rows.iter())
+        .map(|r| r.text.split(" | ").filter(|c| *c == "r0c14-14").count())
+        .sum();
     assert_eq!(hits, 1, "値は Snapshot 内で一意に抽出できる");
+    // 畳んだセルは ref を持たず、Node としても現れない。
+    assert!(all_nodes(&s.tree).iter().all(|n| n.name != "r0c14-14"));
+    assert!(all_nodes(&s.tree).iter().all(|n| n.role != "cell"));
 }
 
 /// `AISNAP-13`・TASK-18.1・Issue #115: ヘッダ 15 番目が列位置と見出しを対応づける。
@@ -239,17 +240,22 @@ fn aisnap_13_extract_04_compressed_rows_keep_back_column_value() {
     assert_eq!(got, want);
 }
 
-/// `AISNAP-13`・TASK-18.1・Issue #115: 列数上限の境界両側で後方列が抽出できる。
+/// `AISNAP-13`・TASK-23.7・Issue #115・#829: 列数上限の境界両側で後方列が抽出できる
+/// （20 列は圧縮 rows、21 列は幅広表の畳み行）。
 #[test]
 fn aisnap_13_extract_04_column_cap_boundary_switches_path() {
     let s = snap(&grid_html(MAX_COLUMNS + 1, 25));
     let table = only_table(&s);
-    assert!(table.table.is_none(), "21 列は展開経路");
-    let row = first_data_row(table);
-    let cell = row.children.get(14).expect("15 列目が残る");
+    assert!(table.table.is_none(), "21 列は圧縮表ではない");
+    assert_eq!(table.folded_rows.len(), MAX_TABLE_ROWS);
+    assert_eq!(table.folded_rows_omitted, 5);
     assert_eq!(
-        (cell.role.as_str(), cell.name.as_str()),
-        ("cell", "r0c14-14")
+        folded_first_row_cell(table, 14).as_deref(),
+        Some("r0c14-14")
+    );
+    assert_eq!(
+        folded_first_row_cell(table, 20).as_deref(),
+        Some("r0c20-20")
     );
 }
 

@@ -40,6 +40,15 @@
 //!   圧縮できない規則的構造で表示対象行が `MAX_TABLE_ROWS` 超のときは、優先保持
 //!   （`AISNAP-12`・TASK-16.4。ページネーション・送信ボタン）で選ばれた行と ref・state 等を
 //!   持つ行を展開のまま残し、それ以外の通常行は `Node::folded_rows` へ文字列で畳む（内容は省略しない）。
+//!   列数が `MAX_COLUMNS` を超えるだけの幅広表（`detect_wide_table`。`AISNAP-2`・`AISNAP-12`・
+//!   TASK-23.7・Issue #829）は、ヘッダを展開（個別 ref）したまま、子が葉セル（子要素なし）だけで
+//!   操作要素等を持たない行を `Node::folded_rows` へ畳む。畳んだ行のセルは ref を持たない
+//!   （TASK-23.4 の「展開したデータ葉は ref を持つ」方針の例外で、圧縮表の「データ行は ref を
+//!   持たない」と同じ契約）。表示対象行が `MAX_TABLE_ROWS` 超なら優先保持で残す行を選び、
+//!   選ばれなかった葉セル行は省略して `Node::folded_rows_omitted`（「他 N 行」）で数える。
+//!   操作要素・`<b>` 等の子要素を含むセルの行は展開のまま残す。`MAX_WIDE_COLUMNS` 超の表と
+//!   列数が不一致の表は従来どおり全展開する。既知の制約: セルは 40 文字で切り詰める
+//!   （`FoldedRow::truncated` で通知）。
 //!   検出は table/list ごとに子孫を走査するが、走査量はコンテナごと
 //!   （`MAX_COMPRESS_SCAN_NODES`）と 1 回の構築全体（`MAX_TOTAL_COMPRESS_SCAN_NODES`）
 //!   で有界とし、超過したコンテナは圧縮せず展開する。
@@ -87,7 +96,8 @@ use std::fmt;
 use fandhe_browser_core::dom::{Children, Document, NodeId};
 
 use crate::compress_table::{
-    TableDetection, assign_header_refs, compress_row_list, compress_rows, detect_regular_structure,
+    IrregularReason, TableDetection, assign_header_refs, compress_row_list, compress_rows,
+    compress_wide_row_list, detect_regular_structure, detect_wide_table, fold_wide_table_rows,
     rows_to_fold,
 };
 use crate::data_leaf::{DataLeafKind, classify_data_leaf};
@@ -271,6 +281,26 @@ fn subtree_has_lossy(
         stack.extend(doc.children(id).map(|c| (c, child_in_row)));
     }
     false
+}
+
+/// 幅広表の行が「葉セル行」か（TASK-23.7・Issue #829）。真なら畳み・省略の対象にできる。
+///
+/// 呼び出し元: `build_snapshot_inner` が [`fold_wide_table_rows`] の `must_keep`（の否定）として渡す。
+/// 条件は、行の部分木に畳むと失われる内容がなく（[`subtree_has_lossy`]）、`tr` の子が
+/// すべて `td`/`th` で、各セルが子要素を持たないこと（テキストだけのセル）。除外要素
+/// （非表示・`script` 等）は数えない。`<b>`・`<br>` を含むセルの行は安全側で展開のまま残す。
+fn is_wide_leaf_row(doc: &Document, index: &NameIndex<'_>, row: NodeId) -> bool {
+    if subtree_has_lossy(doc, index, row, true, None) {
+        return false;
+    }
+    doc.children(row)
+        .filter(|&c| doc.is_element(c) && !is_excluded(doc, c))
+        .all(|c| {
+            (is_html_element_named(doc, c, "td") || is_html_element_named(doc, c, "th"))
+                && !doc
+                    .children(c)
+                    .any(|g| doc.is_element(g) && !is_excluded(doc, g))
+        })
 }
 
 /// 表セル以外のデータ葉（価格クラス要素・引用要素・地の文クラス要素等）か
@@ -667,9 +697,11 @@ fn is_foldable_listitem(doc: &Document, id: NodeId, node: &Node, parent: &Node) 
         && node.table.is_none()
         && node.r#ref.is_none()
         && node.folded_rows.is_empty()
+        && node.folded_rows_omitted == 0
         && !is_interactive_element(doc, id)
         && parent.role == "list"
         && parent.folded_rows.is_empty()
+        && parent.folded_rows_omitted == 0
 }
 
 /// 要素の部分木のテキストが、自身または子孫の出力ノードの name で全部表示される要素か
@@ -745,6 +777,7 @@ fn is_collapsible(doc: &Document, id: NodeId, node: &Node) -> bool {
         && node.data_leaf.is_none()
         && node.table.is_none()
         && node.folded_rows.is_empty()
+        && node.folded_rows_omitted == 0
         && !is_interactive_element(doc, id)
         && !is_html_element_named(doc, id, "option")
 }
@@ -924,9 +957,15 @@ fn build_snapshot_inner(
             compress_budget = compress_budget.saturating_sub(scanned.unwrap_or(limit));
             scanned.is_some() && subtree_fits_depth(doc, child, MAX_TREE_DEPTH - depth)
         };
+        let mut wide = None;
         let regular = if within_budget {
             match detect_regular_structure(doc, child) {
                 TableDetection::Regular(structure) => Some(structure),
+                // 列数上限だけが原因の表は幅広表として葉セル行を畳む（TASK-23.7）。
+                TableDetection::Irregular(IrregularReason::TooManyColumns { .. }) => {
+                    wide = detect_wide_table(doc, child);
+                    None
+                }
                 _ => None,
             }
         } else {
@@ -975,6 +1014,28 @@ fn build_snapshot_inner(
                 .map(|(r, &(index, _))| FoldedRow::new(index, r.text, r.truncated))
                 .collect();
             folded.extend(ids);
+        }
+        if let Some(structure) = wide {
+            let plan =
+                fold_wide_table_rows(doc, &structure, |row| !is_wide_leaf_row(doc, &index, row));
+            let ids: Vec<NodeId> = plan.folded.iter().map(|&(_, id)| id).collect();
+            let compressed_rows = compress_wide_row_list(doc, &ids);
+            // 切り詰めのない畳み行だけ covered に入れる。省略行は出力に出ないので入れない。
+            covered.extend(
+                ids.iter()
+                    .zip(compressed_rows.iter())
+                    .filter(|(_, r)| !r.truncated)
+                    .map(|(&id, _)| id),
+            );
+            node.folded_rows = compressed_rows
+                .into_iter()
+                .zip(plan.folded.iter())
+                .map(|(r, &(index, _))| FoldedRow::new(index, r.text, r.truncated))
+                .collect();
+            node.folded_rows_omitted = plan.omitted.len();
+            // 省略行を入れ忘れると主ループが展開してしまう。
+            folded.extend(ids);
+            folded.extend(plan.omitted);
         }
         // 圧縮したコンテナは配下のヘッダ・行内操作要素の ref の scope 元で、再特定
         // （reference_stability・retention_check）がコンテナの ref で照合するため ref を残す。
@@ -2242,5 +2303,142 @@ mod tests {
                 .iter()
                 .any(|n| n.role == "textbox" && n.name == "Next")
         );
+    }
+
+    // ---- 幅広表（TASK-23.7・Issue #829） ----
+
+    /// `cols` 列 × `rows` 行の表。`extra` は (行, 列, セルの innerHTML) でセルを差し替える。
+    /// セルは `r{r}c{c}-{c}`、ヘッダは `Column {c}`。
+    fn wide_table(cols: usize, rows: usize, extra: &[(usize, usize, &str)]) -> String {
+        let head: String = (0..cols).map(|c| format!("<th>Column {c}</th>")).collect();
+        let body: String = (0..rows)
+            .map(|r| {
+                let cells: String = (0..cols)
+                    .map(|c| {
+                        let inner = extra
+                            .iter()
+                            .find(|(er, ec, _)| *er == r && *ec == c)
+                            .map_or_else(|| format!("r{r}c{c}-{c}"), |(_, _, h)| (*h).to_string());
+                        format!("<td>{inner}</td>")
+                    })
+                    .collect();
+                format!("<tr>{cells}</tr>")
+            })
+            .collect();
+        format!(
+            "<html><body><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>\
+             </body></html>"
+        )
+    }
+
+    fn table_node(s: &Snapshot) -> &Node {
+        all_nodes(&s.tree)
+            .into_iter()
+            .find(|n| n.role == "table")
+            .expect("table ノードがある")
+    }
+
+    /// AISNAP-2・AISNAP-12: 50 列 × 50 行は、ヘッダ 50 セルが ref 付きで残り、データ行は
+    /// 20 行の畳み行と「他 30 行」になる。セルのノードは出ない。
+    #[test]
+    fn aisnap_2_wide_table_folds_leaf_rows_and_keeps_headers() {
+        let s = snap(&wide_table(50, 50, &[]));
+        let nodes = all_nodes(&s.tree);
+        let table = table_node(&s);
+        assert!(table.table.is_none());
+        let headers: Vec<&&Node> = nodes.iter().filter(|n| n.role == "columnheader").collect();
+        assert_eq!(headers.len(), 50);
+        assert!(headers.iter().all(|h| h.r#ref.is_some()));
+        assert_eq!(table.folded_rows.len(), 20);
+        let idx: Vec<usize> = table.folded_rows.iter().map(|r| r.index).collect();
+        assert_eq!(idx, (0..20).collect::<Vec<_>>());
+        let first = table.folded_rows.first().expect("1 行目");
+        let cells: Vec<&str> = first.text.split(" | ").collect();
+        assert_eq!(cells.len(), 50);
+        assert_eq!(cells.get(14).copied(), Some("r0c14-14"));
+        assert_eq!(table.folded_rows_omitted, 30);
+        assert_eq!(nodes.iter().filter(|n| n.role == "cell").count(), 0);
+        assert!(!s.truncated);
+    }
+
+    /// AISNAP-12・AISNAP-2: ページネーションリンクを含む行は 20 行の枠に入らなくても残り、
+    /// チェックボックスの行は展開のまま ref・state を保つ。
+    #[test]
+    fn aisnap_12_wide_table_keeps_rows_with_controls_expanded() {
+        let s = snap(&wide_table(
+            50,
+            50,
+            &[
+                (45, 3, "<a href=\"?page=2\">Next</a>"),
+                (40, 7, "<input type=\"checkbox\" checked>"),
+            ],
+        ));
+        let nodes = all_nodes(&s.tree);
+        let table = table_node(&s);
+        let link = nodes
+            .iter()
+            .find(|n| n.role == "link" && n.name == "Next")
+            .expect("Next リンクが残る");
+        assert!(link.r#ref.is_some());
+        let cb = nodes
+            .iter()
+            .find(|n| n.role == "checkbox")
+            .expect("チェックボックスが残る");
+        assert!(cb.r#ref.is_some());
+        assert_eq!(cb.state.checked, Some(CheckedState::Checked));
+        // 展開行 2 つ（40・45）を除く 48 行が葉セル行。優先保持の枠は 20 行から展開行を含めて選ぶ。
+        let total = table.folded_rows.len() + table.folded_rows_omitted;
+        assert_eq!(total, 48);
+        assert!(table.folded_rows_omitted > 0);
+        // 畳み行の index は表示する行（省略行を除く）の位置で、重複しない。
+        let mut idx: Vec<usize> = table.folded_rows.iter().map(|r| r.index).collect();
+        idx.dedup();
+        assert_eq!(idx.len(), table.folded_rows.len());
+    }
+
+    /// AISNAP-2・TASK-23.4: 畳んだ行・省略した行のセルは ref を発行されない。
+    #[test]
+    fn aisnap_2_wide_table_folded_cells_hold_no_ref() {
+        let doc = parse_document(&wide_table(25, 40, &[]), &ParseOptions::default())
+            .expect("パースは成功する")
+            .document;
+        let (_, holders) = super::build_snapshot_with_holders(&doc).expect("構築は成功する");
+        assert!(holders.iter().all(|h| h.role != "cell"));
+        assert_eq!(
+            holders.iter().filter(|h| h.role == "columnheader").count(),
+            25
+        );
+    }
+
+    /// AISNAP-2: 21 列 × 5 行は全行を畳み、省略はない。
+    #[test]
+    fn aisnap_2_wide_table_small_row_count_folds_all_without_omission() {
+        let s = snap(&wide_table(21, 5, &[]));
+        let table = table_node(&s);
+        assert_eq!(table.folded_rows.len(), 5);
+        assert_eq!(table.folded_rows_omitted, 0);
+    }
+
+    /// AISNAP-2: 列数が不一致の幅広表は従来どおり全展開する。
+    #[test]
+    fn aisnap_2_wide_table_inconsistent_columns_stays_expanded() {
+        let mut html = wide_table(21, 3, &[]);
+        html = html.replacen("<td>r1c20-20</td>", "", 1);
+        let s = snap(&html);
+        let table = table_node(&s);
+        assert!(table.folded_rows.is_empty());
+        assert_eq!(table.folded_rows_omitted, 0);
+        assert!(all_nodes(&s.tree).iter().any(|n| n.role == "cell"));
+    }
+
+    /// AISNAP-2: 子要素を含むセルの行は展開のまま残る。
+    #[test]
+    fn aisnap_2_wide_table_row_with_inline_markup_stays_expanded() {
+        let s = snap(&wide_table(21, 3, &[(1, 2, "<b>bold</b>")]));
+        let table = table_node(&s);
+        assert_eq!(table.folded_rows.len(), 2);
+        let idx: Vec<usize> = table.folded_rows.iter().map(|r| r.index).collect();
+        assert_eq!(idx, vec![0, 2]);
+        assert!(all_nodes(&s.tree).iter().any(|n| n.role == "cell"));
     }
 }

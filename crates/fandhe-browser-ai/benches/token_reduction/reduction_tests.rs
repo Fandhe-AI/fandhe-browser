@@ -167,14 +167,17 @@ fn fixtures_measured_with_concrete_values() {
     // TASK-23.6（#828）: row の name が残余へ縮み、large-table の name 打ち切りが出力から消えた。
     assert_eq!(by("wiki-portal-nav.html").snapshot_tokens, 2175);
     assert!(!by("large-table.html").snapshot_truncated);
+    // TASK-23.7（#829）: 幅広表の葉セル行を畳み、large-table が 9,000 トークン以下になった。
+    assert_eq!(by("large-table.html").snapshot_tokens, 8150);
+    assert!(by("large-table.html").snapshot_tokens <= 9000);
     assert!(!by("login-form.html").snapshot_truncated);
 
     let s = summarize(&rows).expect("summary");
     assert_eq!(s.pages, 17);
     // 実測値（小数 1 桁）。row・cell の name の重複除去と無名 listitem の折り畳み（TASK-23.6・#828）後も
     // 85% 目標（AISNAP-1）には届かない。判定は #97。
-    assert!((s.mean_reduction_pct - 28.0).abs() < 0.05, "{s:?}");
-    assert!((s.min_reduction_pct - -129.2).abs() < 0.05, "{s:?}");
+    assert!((s.mean_reduction_pct - 39.6).abs() < 0.05, "{s:?}");
+    assert!((s.min_reduction_pct - -1.7).abs() < 0.05, "{s:?}");
     assert!((s.max_reduction_pct - 95.8).abs() < 0.05, "{s:?}");
     approx(s.median_snapshot_tokens, 2205.0);
 }
@@ -214,6 +217,17 @@ fn render_folded_row_follows_header_row_in_document_order() {
         "  row2",
     ]
     .join("\n");
+    assert_eq!(text, expected);
+}
+
+/// AISNAP-2・TASK-23.7: 幅広表で省略した行数は最終行に `… +N rows` で出る。
+#[test]
+fn render_wide_table_omitted_rows_note_follows_folded_rows() {
+    let mut table = Node::new("table", "T").with_ref("e1");
+    table.folded_rows = vec![FoldedRow::new(0, "a | b", false)];
+    table.folded_rows_omitted = 30;
+    let text = render_snapshot(&Snapshot::new(table));
+    let expected = ["- table \"T\" [e1]", "  a | b", "  … +30 rows"].join("\n");
     assert_eq!(text, expected);
 }
 
