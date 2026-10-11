@@ -80,6 +80,7 @@ clippy 警告は 0 件を維持する。テストの skip・ignore やアサー�
 
 以下の各ルールに従う。
 
+- [ARCHITECTURE.md](./ARCHITECTURE.md): 二層アーキテクチャ・crate 構成・依存方向
 - [coding-rust.md](.claude/rules/coding-rust.md): Rust 規約（crate 境界・外部入力の扱い・unsafe / FFI・クロスプラットフォーム対応・テスト方針）
 - [code-comment-style.md](.claude/rules/code-comment-style.md): コメント規約（役割・呼び出し文脈・未実装箇所の将来仕様の書き方）
 - [security.md](.claude/rules/security.md): セキュリティ規約（秘密情報・偽装機能禁止・プロファイル / プラグイン境界・OWASP Top 10）
