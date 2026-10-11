@@ -27,7 +27,7 @@
 | ---- | ------------- | -------------- | ------------ | --------- |
 | example-minimal | 103 | 88 | 14.6 | false |
 | wikipedia-article | 56482 | 37240 | 34.1 | false |
-| hn-list | 10220 | 12541 | -22.7 | false |
+| hn-list | 10220 | 12571 | -23.0 | false |
 | login-form | 284 | 205 | 27.8 | false |
 | mdn-docs | 19005 | 27776 | -46.2 | false |
 
@@ -35,7 +35,7 @@
 
 | pages | meanReductionPct | minReductionPct | maxReductionPct | medianSnapshotTokens |
 | ----- | ---------------- | --------------- | --------------- | -------------------- |
-| 5 | 1.5 | -46.2 | 34.1 | 12541.0 |
+| 5 | 1.5 | -46.2 | 34.1 | 12571.0 |
 
 ### PLUG-4 verdict
 

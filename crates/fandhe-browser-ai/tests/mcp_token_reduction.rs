@@ -112,7 +112,7 @@ fn assert_plug4(summary: &ReductionSummary) -> TestResult<()> {
 const PINNED: [(&str, usize, usize, bool); 5] = [
     ("example-minimal", 103, 88, false),
     ("wikipedia-article", 56482, 37240, false),
-    ("hn-list", 10220, 12541, false),
+    ("hn-list", 10220, 12571, false),
     ("login-form", 284, 205, false),
     ("mdn-docs", 19005, 27776, false),
 ];
@@ -459,7 +459,7 @@ fn plug4_mcp_token_reduction_report_prints_markdown() -> TestResult<()> {
     for needle in [
         "| example-minimal | 103 | 88 | 14.6 | false |",
         "| wikipedia-article | 56482 | 37240 | 34.1 | false |",
-        "| hn-list | 10220 | 12541 | -22.7 | false |",
+        "| hn-list | 10220 | 12571 | -23.0 | false |",
         "| login-form | 284 | 205 | 27.8 | false |",
         "| mdn-docs | 19005 | 27776 | -46.2 | false |",
         "| 5 | 1.5 | -46.2 | 34.1 |",

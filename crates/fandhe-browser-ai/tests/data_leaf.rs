@@ -319,15 +319,29 @@ fn is_outside_snapshot(doc: &Document, id: NodeId) -> bool {
         || doc.local_name(id) == Some("head")
 }
 
+/// 子を持つ row・cell・gridcell について、DOM 側のフル name ごとに期待する出力 name（残余）の
+/// 固定表（`(フル name, 残余 name)`）。残余は子孫ノードに出ないテキストだけで、HN_LIST の
+/// リンクだけを含む行・セルでは区切りの `|` も含め空になる。
+const RESIDUAL_NAMES: [(&str, &str); 2] = [
+    ("Homenew | past", ""),
+    ("Sample Story AlphaSample Story BetaSample Story Gamma", ""),
+];
+
 /// Snapshot ノードの name が DOM 側のフル name と対応するか。
 ///
 /// TASK-23.6（`AISNAP-1`）: 子を持つ row・cell・gridcell の出力 name は子孫ノードに出ない
-/// テキストだけへ縮むため、フル name との完全一致ではなく role と子の有無で対応付ける。
+/// テキストだけへ縮む。DOM 要素との対応付けは role と子の有無で絞り、出力 name の検証は
+/// [`RESIDUAL_NAMES`] の具体値との完全一致で行う（部分一致・空文字許容にしない）。
+/// 表に無いフル name の縮約は不一致（対応付け失敗）として扱う。
 fn name_matches(role: &str, n: &Node, full_name: &str) -> bool {
-    n.name == full_name
-        || (matches!(role, "row" | "cell" | "gridcell")
-            && !n.children.is_empty()
-            && (n.name.is_empty() || full_name.contains(n.name.split(" | ").next().unwrap_or(""))))
+    if n.name == full_name {
+        return true;
+    }
+    matches!(role, "row" | "cell" | "gridcell")
+        && !n.children.is_empty()
+        && RESIDUAL_NAMES
+            .iter()
+            .any(|(full, residual)| *full == full_name && *residual == n.name)
 }
 
 /// DOM 要素と Snapshot の通常ノードを文書順で対応付ける（折り畳み対応。TASK-23.3）。

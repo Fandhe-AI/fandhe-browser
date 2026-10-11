@@ -769,7 +769,12 @@ fn collect_content_text(
                 }
                 // 被覆済み（部分木のテキストが子孫ノードの name で出力済み）の要素は
                 // 降りず、折り込まない（TASK-23.6）。
+                // 除去箇所は別々のテキスト片の境界なので、区切り空白を 1 個残して前後が連結される
+                // のを防ぐ（`1<a> x </a>2` が `12` にならず `1 2` になる）。
                 if opts.skip.is_some_and(|set| set.contains(&current)) {
+                    if !out.is_empty() {
+                        pending_space = true;
+                    }
                     continue;
                 }
                 // accname 2C: 再帰中の埋め込みコントロール（2E）では `aria-label` を無視して
@@ -3864,6 +3869,18 @@ mod tests {
         let r = compute_residual_content_name(&doc, &index, cell, &covered).expect("残余");
         assert_eq!(r.text, "20 points by | hide");
         assert_eq!(r.source, NameSource::Content);
+        // 被覆部分木の前後が空白なしで隣接していても連結しない。
+        let (doc2, cell2) = parse_and_select(
+            "<table><tr><td>1<a href=\"/x\"> x </a>2</td></tr></table>",
+            "td",
+        );
+        let index2 = NameIndex::build(&doc2);
+        let a2 = query_selector_str(&doc2, doc2.root(), "a")
+            .expect("セレクタは有効")
+            .expect("a がある");
+        let covered2: HashSet<NodeId> = [a2].into_iter().collect();
+        let r2 = compute_residual_content_name(&doc2, &index2, cell2, &covered2).expect("残余");
+        assert_eq!(r2.text, "1 2");
         let exhausted = NameIndex::build(&doc).with_content_budget(0);
         assert_eq!(
             compute_residual_content_name(&doc, &exhausted, cell, &covered),
