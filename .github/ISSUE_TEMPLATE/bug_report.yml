@@ -1,0 +1,118 @@
+name: 不具合報告
+description: 期待と異なる挙動・クラッシュ・誤動作を報告する
+title: "fix: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        - 脆弱性は公開 Issue に書かず、SECURITY.md の手順（private vulnerability reporting）で報告してください。
+        - 実トークン・Cookie・個人情報・実プロファイルデータは貼らないでください（ダミー値に置き換える）。
+        - 仕様のビヘイビア ID（例: `CORE-1`）が分かれば併記してください。分からなければ空欄で構いません。
+  - type: textarea
+    id: summary
+    attributes:
+      label: 概要
+      description: 何が起きたかを簡潔に書いてください。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 再現手順
+      description: 最小の入力（HTML / JS / CDP メッセージ / コマンド）を含めてください。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待した挙動
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 実際の挙動
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: 対象のコミット SHA
+      description: リリース未実施のため、版ではなくコミット SHA を書いてください。
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - その他
+    validations:
+      required: true
+  - type: input
+    id: arch
+    attributes:
+      label: アーキテクチャと OS の版
+      description: 例は x86_64、aarch64 と OS の版です。
+  - type: dropdown
+    id: js-engine
+    attributes:
+      label: JS エンジン
+      options:
+        - V8（既定）
+        - boa
+        - エンジンなし
+        - 不明
+    validations:
+      required: true
+  - type: dropdown
+    id: rendering
+    attributes:
+      label: rendering feature
+      options:
+        - 無効（既定）
+        - 有効（--features rendering）
+        - 不明
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: 関連する領域
+      multiple: true
+      options:
+        - core
+        - js
+        - ai
+        - cdp
+        - render
+        - profile
+        - cli
+        - mcp
+        - harness・CI
+        - 不明
+  - type: input
+    id: spec
+    attributes:
+      label: 関連する TASK-n・ビヘイビア ID
+  - type: textarea
+    id: logs
+    attributes:
+      label: ログ・エラー出力
+      description: 秘密情報を除去してから貼ってください。
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 確認事項
+      options:
+        - label: 既存の Issue を検索した
+          required: true
+        - label: 脆弱性の報告ではない（脆弱性は SECURITY.md の手順で報告する）
+          required: true
+        - label: 実トークン・Cookie・個人情報を含めていない
+          required: true
