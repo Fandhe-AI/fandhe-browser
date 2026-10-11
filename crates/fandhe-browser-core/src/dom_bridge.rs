@@ -342,6 +342,7 @@ enum DomOp {
     TimerSet,
     TimerClear,
     TimerConsume,
+    TimerPending,
     MicrotaskLimit,
     TimerCallbackError,
     TimerStringHandlerIgnored,
@@ -380,6 +381,7 @@ impl DomOp {
             "timerSet" => Self::TimerSet,
             "timerClear" => Self::TimerClear,
             "timerConsume" => Self::TimerConsume,
+            "timerPending" => Self::TimerPending,
             "microtaskLimit" => Self::MicrotaskLimit,
             "timerCallbackError" => Self::TimerCallbackError,
             "timerStringHandlerIgnored" => Self::TimerStringHandlerIgnored,
@@ -419,6 +421,7 @@ impl DomOp {
             Self::TimerSet => "timerSet",
             Self::TimerClear => "timerClear",
             Self::TimerConsume => "timerConsume",
+            Self::TimerPending => "timerPending",
             Self::MicrotaskLimit => "microtaskLimit",
             Self::TimerCallbackError => "timerCallbackError",
             Self::TimerStringHandlerIgnored => "timerStringHandlerIgnored",
@@ -446,7 +449,8 @@ impl DomOp {
             | Self::GetLocation
             | Self::SetLocationHash
             | Self::TimerClear
-            | Self::TimerConsume => 1,
+            | Self::TimerConsume
+            | Self::TimerPending => 1,
             Self::QuerySelector
             | Self::QuerySelectorAll
             | Self::AppendChild
@@ -845,6 +849,25 @@ fn execute(
                 // 範囲を検証済みのため切り詰めなく変換できる。
                 && page.timers.consume_armed(TimerId::from_raw(*raw as u32));
             Ok(JsValue::Bool(ok))
+        }
+        // shim が JS 側に保持しているコールバックのうち、Rust 側で既に無効な ID を回収するための照会
+        // （`JS-6`）。`__dom.op('timerClear', id)` の直接呼びで Rust 側だけ解放されても、shim が
+        // 定期的にこの op で掃除するため、JS 側の保持件数は Rust 側の登録上限の範囲に収まる。
+        DomOp::TimerPending => {
+            let Some(JsValue::Number(raw)) = args.first() else {
+                return Err(DomBridgeError::TypeMismatch {
+                    operation: op.name(),
+                    index: 1,
+                    expected: "a timer id number",
+                });
+            };
+            let alive = raw.is_finite()
+                && raw.fract() == 0.0
+                && *raw >= 1.0
+                && *raw <= f64::from(u32::MAX)
+                // 範囲を検証済みのため切り詰めなく変換できる。
+                && page.timers.is_alive(TimerId::from_raw(*raw as u32));
+            Ok(JsValue::Bool(alive))
         }
         // microtask の保留数が shim の上限を超えたことの通知。通常は予算外で処理済み（下記）。
         DomOp::MicrotaskLimit => {
@@ -2047,6 +2070,31 @@ mod tests {
         assert_eq!(b.event_loop_state().expect("state").2, 1);
         call(&b, &[s("timerClear"), n(1.0)]).expect("clear");
         assert_eq!(b.event_loop_state().expect("state").2, 0);
+    }
+
+    /// JS-6: `timerPending` は登録中の ID だけ true を返し、取り消し済み・不正な ID は false。
+    #[test]
+    fn js_6_timer_pending_op_reports_liveness() {
+        let b = bridge();
+        call(&b, &[s("timerSet"), n(1.0), b_bool(false)]).expect("set");
+        assert_eq!(
+            call(&b, &[s("timerPending"), n(1.0)]).expect("p"),
+            JsValue::Bool(true)
+        );
+        assert_eq!(
+            call(&b, &[s("timerPending"), n(2.0)]).expect("p"),
+            JsValue::Bool(false)
+        );
+        assert_eq!(
+            call(&b, &[s("timerPending"), n(f64::NAN)]).expect("p"),
+            JsValue::Bool(false)
+        );
+        call(&b, &[s("timerPending"), s("1")]).expect_err("type");
+        call(&b, &[s("timerClear"), n(1.0)]).expect("clear");
+        assert_eq!(
+            call(&b, &[s("timerPending"), n(1.0)]).expect("p"),
+            JsValue::Bool(false)
+        );
     }
 
     /// JS-7: `timerCallbackError` は種別を許可リストで検証し、メッセージを切り詰めて件数を頭打ちにする。

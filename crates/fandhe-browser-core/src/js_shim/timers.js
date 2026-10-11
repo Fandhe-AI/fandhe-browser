@@ -49,6 +49,10 @@
 
     // id → { fn, args, repeat }。null プロトタイプ（継承された setter / 'toString' 等の影響を避ける）。
     var timers = createObject(null);
+    // timers の保持件数と、次に Rust 側の生存確認で掃除する閾値（JS-6）。
+    var retained = 0;
+    var SWEEP_MIN = 64;
+    var sweepAt = SWEEP_MIN;
     // microtask キュー（head 以上 tail 未満が保留中）。
     var queue = createObject(null);
     var head = 0;
@@ -85,6 +89,27 @@
         }
     }
 
+    // Rust 側で既に無効な ID（__dom.op の直接 timerClear 等）の保持を解放する。生存件数の倍で
+    // 次の掃除を行い、償却コストを一定に保つ。保持件数は Rust 側の登録上限の高々 2 倍に収まる。
+    function sweep() {
+        var kept = 0;
+        for (var key in timers) {
+            var alive = false;
+            try {
+                alive = callOp('timerPending', toNumber(key)) === true;
+            } catch (e) {
+                alive = false;
+            }
+            if (alive) {
+                kept += 1;
+            } else {
+                delete timers[key];
+            }
+        }
+        retained = kept;
+        sweepAt = kept * 2 > SWEEP_MIN ? kept * 2 : SWEEP_MIN;
+    }
+
     function schedule(handler, delay, repeat, extra, extraStart) {
         if (typeof handler !== 'function') {
             try {
@@ -105,7 +130,11 @@
             n += 1;
         }
         args.length = n;
+        if (retained >= sweepAt) {
+            sweep();
+        }
         timers[id] = { fn: handler, args: args, repeat: repeat };
+        retained += 1;
         return id;
     }
 
@@ -119,7 +148,10 @@
         if (!isFinite_(n) || n !== floor(n) || n < 1) {
             return;
         }
-        delete timers[n];
+        if (hasOwn(timers, n)) {
+            delete timers[n];
+            retained -= 1;
+        }
         try {
             callOp('timerClear', n);
         } catch (e) {
@@ -158,6 +190,7 @@
         if (entry !== undefined) {
             if (!entry.repeat) {
                 delete timers[id];
+                retained -= 1;
             }
             try {
                 fnApply(entry.fn, global, entry.args);

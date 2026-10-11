@@ -298,6 +298,11 @@ impl TimerQueue {
         self.order.insert(key, id);
     }
 
+    /// ID が登録中、または `next` が選んだ未消費の発火かを返す（shim の保持掃除用。`JS-6`）。
+    pub fn is_alive(&self, id: TimerId) -> bool {
+        self.entries.contains_key(&id) || self.armed == Some(id)
+    }
+
     /// 保留中のタイマー数。
     pub fn pending(&self) -> usize {
         self.entries.len()

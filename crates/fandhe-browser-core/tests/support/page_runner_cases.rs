@@ -230,6 +230,20 @@ fn timer_cases(engine: &str) {
     );
     assert_eq!(out.event_loop().fired(), 0);
 
+    eprintln!("case: JS-6 direct timerClear loop keeps registration and sweeps shim retention");
+    let out = run_page(
+        engine,
+        &page(
+            "for(var i=0;i<5000;i++){var id=setTimeout(function(){a('x')},100);\
+             __dom.op('timerClear',id)}\
+             setTimeout(function(){a('ok')},1);",
+        ),
+        &few,
+    );
+    assert_eq!(out.abort().map(|a| a.kind().clone()), None);
+    assert_eq!(out.event_loop().fired(), 1);
+    assert!(out.html().contains("ok"), "{}", out.html());
+
     eprintln!("case: JS-7 untrusted delays are normalized");
     let out = run_page(
         engine,
