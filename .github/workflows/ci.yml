@@ -756,6 +756,11 @@ jobs:
   #                            RENDER-2。上限値・package 名は scripts/versions.sh が単一真実源）。
   #                            対象 package が workspace に無い場合は exit 2 で fail-closed
   #                            （TASK-41.5・#174・REPAIR-5・#633）
+  #   [static-link]            musl 配布バイナリ（既定・軽量）の動的リンクなし検査（TASK-93.3・#362・
+  #                            PLUG-1・CTR-4）。Linux の ELF 成果物の検査のため ubuntu のみ
+  #                            （macOS は #364・Windows は #365 が別手段で担う。前例は unix のみの
+  #                            [mcp-envelope-smoke]）。`*-linux-gnu` のネイティブ配布物は対象外（#363）。
+  #                            ビルド先は target/ の外（RUNNER_TEMP）に置き、cache に入れない
   # cache・CARGO_INCREMENTAL=0・CARGO_PROFILE_DEV_DEBUG は 3 OS 共通（上記 rust-test と同じ）。
   harness-ubuntu:
     needs: changes
@@ -782,6 +787,7 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
+          targets: x86_64-unknown-linux-musl
       - name: "cargo cache の復元"
         id: cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -899,6 +905,20 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
+      - name: "[static-link] musl 用 C コンパイラ（musl-tools）の確認・導入"
+        if: ${{ !cancelled() }}
+        run: |
+          if ! command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends musl-tools
+          fi
+          dpkg -s musl-tools | grep -E '^(Package|Version):'
+      - name: "[static-link] 自己テスト（合成データ・陰性対照による検出の証跡確認）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-static-link.sh --self-test
+      - name: "[static-link] musl 配布バイナリ（既定・軽量）の動的リンクなし検査"
+        if: ${{ !cancelled() }}
+        run: STATIC_LINK_TARGET_DIR="${RUNNER_TEMP}/static-link-target" make check-static-link
       - name: "cache 保存前に workspace 成果物を prune"
         if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         run: bash scripts/ci-prune-target.sh
