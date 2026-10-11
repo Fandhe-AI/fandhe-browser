@@ -43,62 +43,38 @@ type Expected = (
 );
 
 const EXPECTED: [Expected; 7] = [
-    (
-        "login-button",
-        1,
-        1,
-        "e7e730a2753f66c98",
-        None,
-        "Login",
-        false,
-    ),
+    ("login-button", 1, 1, "e7e730a27", None, "Login", false),
     (
         "price-first",
         20,
         1,
-        "eebd41136ac2ff69e-6",
+        "eebd41136-6",
         Some(DataLeafKind::PriceClass),
         "",
         false,
     ),
-    (
-        "number-input",
-        1,
-        1,
-        "e07e25f719b2299fb",
-        None,
-        "Number",
-        false,
-    ),
+    ("number-input", 1, 1, "e07e25f71", None, "Number", false),
     (
         "table-header-first",
         6,
         1,
-        "e091124527e8c0f5e",
+        "e09112452",
         Some(DataLeafKind::TableCell),
         "Last Name",
         false,
     ),
-    (
-        "dropdown-select",
-        1,
-        1,
-        "eb9b697ed4f125035",
-        None,
-        "",
-        false,
-    ),
+    ("dropdown-select", 1, 1, "eb9b697ed", None, "", false),
     (
         "top-story-link",
         30,
         1,
-        "ebd9595753298b235",
+        "ebd959575",
         None,
         "Compass pattern beta anchor lantern sigma ribbon",
         // TASK-23.6（Issue #828）: row・cell の name が残余へ縮み、フル name の打ち切りが消えた。
         false,
     ),
-    ("checkbox-first", 2, 1, "e91f35187869ba882", None, "", false),
+    ("checkbox-first", 2, 1, "e91f35187", None, "", false),
 ];
 
 #[test]
@@ -156,22 +132,35 @@ fn aisnap_3_current_baseline_identifies_all_seven() {
 /// 再計算した ref ダイジェストと一致しなければ Identified にしない。
 #[test]
 fn aisnap_3_same_signature_other_element_is_not_identified() {
-    let root = Node::new("document", "").with_children(vec![
-        Node::new("combobox", "").with_ref("e0000000000000001"),
-    ]);
+    let root = Node::new("document", "")
+        .with_children(vec![Node::new("combobox", "").with_ref("e12345678")]);
     let task = TASKS
         .iter()
         .find(|t| t.id == "dropdown-select")
         .expect("task");
-    let c = judge(task, 1, None, &[(0x2, 1)], &flatten(&root), false);
+    let c = judge(
+        task,
+        1,
+        None,
+        &[(0x8765_4321_0000_0000, 1)],
+        &flatten(&root),
+        false,
+    );
     assert_eq!(
         c.verdict,
         Verdict::NotIdentified {
             reason: NotIdentifiedReason::NoMatchingNode
         }
     );
-    let ok = judge(task, 1, None, &[(0x1, 1)], &flatten(&root), false);
-    assert_eq!(ok.verdict, ident("e0000000000000001"));
+    let ok = judge(
+        task,
+        1,
+        None,
+        &[(0x1234_5678_9abc_def0, 1)],
+        &flatten(&root),
+        false,
+    );
+    assert_eq!(ok.verdict, ident("e12345678"));
 }
 
 /// 同一性検証: ダイジェストが同じでも出現番号が異なる兄弟（`-2`）は対象（出現番号 1）と
@@ -182,18 +171,31 @@ fn aisnap_3_same_digest_different_occurrence_is_not_identified() {
         .iter()
         .find(|t| t.id == "dropdown-select")
         .expect("task");
-    let sibling = Node::new("document", "").with_children(vec![
-        Node::new("combobox", "").with_ref("e0000000000000001-2"),
-    ]);
-    let c = judge(task, 1, None, &[(0x1, 1)], &flatten(&sibling), false);
+    let sibling = Node::new("document", "")
+        .with_children(vec![Node::new("combobox", "").with_ref("e12345678-2")]);
+    let c = judge(
+        task,
+        1,
+        None,
+        &[(0x1234_5678_9abc_def0, 1)],
+        &flatten(&sibling),
+        false,
+    );
     assert_eq!(
         c.verdict,
         Verdict::NotIdentified {
             reason: NotIdentifiedReason::NoMatchingNode
         }
     );
-    let ok = judge(task, 1, None, &[(0x1, 2)], &flatten(&sibling), false);
-    assert_eq!(ok.verdict, ident("e0000000000000001-2"));
+    let ok = judge(
+        task,
+        1,
+        None,
+        &[(0x1234_5678_9abc_def0, 2)],
+        &flatten(&sibling),
+        false,
+    );
+    assert_eq!(ok.verdict, ident("e12345678-2"));
 }
 
 #[test]
@@ -274,13 +276,13 @@ fn aisnap_3_tsv_rows_have_header_column_count_and_concrete_text() {
     assert_eq!(
         c.first().map(format_row).as_deref(),
         Some(
-            "login-button\tlogin-form.html\tbutton[type=submit]\tyes\t1\t1\te7e730a2753f66c98\t-\tLogin\tfalse\t-"
+            "login-button\tlogin-form.html\tbutton[type=submit]\tyes\t1\t1\te7e730a27\t-\tLogin\tfalse\t-"
         )
     );
     assert_eq!(
         c.get(1).map(format_row).as_deref(),
         Some(
-            "price-first\tec-product-list.html\tp.price_color\tyes\t20\t1\teebd41136ac2ff69e-6\tPriceClass\t-\tfalse\t-"
+            "price-first\tec-product-list.html\tp.price_color\tyes\t20\t1\teebd41136-6\tPriceClass\t-\tfalse\t-"
         )
     );
 }
@@ -307,7 +309,7 @@ fn aisnap_13_same_signature_compressed_tables_resolve_each_control() {
     use fandhe_browser_ai::snapshot::build_snapshot;
     use fandhe_browser_core::parse::{ParseOptions, parse_document};
     use fandhe_browser_core::query::query_selector_all_str;
-    use retention_check::{parse_ref, target_refs};
+    use retention_check::{ParsedRef, any_ref_matches, parse_ref, target_refs};
 
     let rows: String = (0..120)
         .map(|i| {
@@ -325,7 +327,7 @@ fn aisnap_13_same_signature_compressed_tables_resolve_each_control() {
     let entries = flatten(&build_snapshot(doc).expect("snapshot").tree);
     let buttons = query_selector_all_str(doc, doc.root(), "button").expect("query");
     assert_eq!(buttons.len(), 2);
-    let snap_refs: Vec<(u64, u32)> = entries
+    let snap_refs: Vec<ParsedRef> = entries
         .iter()
         .filter(|e| e.role == "button")
         .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
@@ -333,7 +335,7 @@ fn aisnap_13_same_signature_compressed_tables_resolve_each_control() {
     for id in buttons {
         let cands = target_refs(doc, id, &entries);
         assert!(
-            cands.iter().any(|c| snap_refs.contains(c)),
+            cands.iter().any(|c| any_ref_matches(&snap_refs, c)),
             "candidates {cands:?} not in {snap_refs:?}"
         );
     }
@@ -346,7 +348,7 @@ fn aisnap_13_uncompressed_same_signature_table_does_not_break_compressed_control
     use fandhe_browser_ai::snapshot::build_snapshot;
     use fandhe_browser_core::parse::{ParseOptions, parse_document};
     use fandhe_browser_core::query::query_selector_all_str;
-    use retention_check::{parse_ref, target_refs};
+    use retention_check::{ParsedRef, any_ref_matches, parse_ref, target_refs};
 
     let rows: String = (0..120)
         .map(|i| {
@@ -365,14 +367,14 @@ fn aisnap_13_uncompressed_same_signature_table_does_not_break_compressed_control
     let entries = flatten(&build_snapshot(doc).expect("snapshot").tree);
     let buttons = query_selector_all_str(doc, doc.root(), "button").expect("query");
     assert_eq!(buttons.len(), 2);
-    let snap_refs: Vec<(u64, u32)> = entries
+    let snap_refs: Vec<ParsedRef> = entries
         .iter()
         .filter(|e| e.role == "button")
         .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
         .collect();
     let first = target_refs(doc, buttons[0], &entries);
     assert!(
-        first.iter().any(|c| snap_refs.contains(c)),
+        first.iter().any(|c| any_ref_matches(&snap_refs, c)),
         "candidates {first:?} not in {snap_refs:?} (compressed={})",
         entries.iter().filter(|e| e.compressed).count()
     );
@@ -385,7 +387,7 @@ fn aisnap_13_uncompressed_control_before_compressed_stays_unresolved() {
     use fandhe_browser_ai::snapshot::build_snapshot;
     use fandhe_browser_core::parse::{ParseOptions, parse_document};
     use fandhe_browser_core::query::query_selector_all_str;
-    use retention_check::{parse_ref, target_refs};
+    use retention_check::{ParsedRef, any_ref_matches, parse_ref, target_refs};
 
     let rows: String = (0..120)
         .map(|i| {
@@ -406,7 +408,7 @@ fn aisnap_13_uncompressed_control_before_compressed_stays_unresolved() {
     let entries = flatten(&build_snapshot(doc).expect("snapshot").tree);
     let buttons = query_selector_all_str(doc, doc.root(), "button").expect("query");
     assert_eq!(buttons.len(), 2);
-    let snap_refs: Vec<(u64, u32)> = entries
+    let snap_refs: Vec<ParsedRef> = entries
         .iter()
         .filter(|e| e.role == "button")
         .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
@@ -419,7 +421,7 @@ fn aisnap_13_uncompressed_control_before_compressed_stays_unresolved() {
     let compressed_ref = big_cands
         .iter()
         .copied()
-        .find(|c| snap_refs.contains(c) && !small_cands.contains(c))
+        .find(|c| any_ref_matches(&snap_refs, c) && !small_cands.contains(c))
         .expect("compressed control must resolve");
     assert!(
         !small_cands.contains(&compressed_ref),
@@ -427,8 +429,87 @@ fn aisnap_13_uncompressed_control_before_compressed_stays_unresolved() {
     );
     // 展開側は自身の通常 ref にだけ解決する。
     assert_eq!(
-        small_cands.iter().filter(|c| snap_refs.contains(c)).count(),
+        small_cands
+            .iter()
+            .filter(|c| any_ref_matches(&snap_refs, c))
+            .count(),
         1,
         "{small_cands:?} vs {snap_refs:?}"
     );
+}
+
+/// TASK-23.5: `parse_ref` は 8〜16 桁の hex 部と `v`/`-` 付きの形を分解し、桁数が範囲外なら弾く。
+#[test]
+fn task_23_5_parse_ref_accepts_8_to_16_hex_digits_only() {
+    let p = retention_check::parse_ref("eccfd6f8d").expect("8 桁");
+    assert_eq!((p.prefix, p.hex_len, p.occurrence), (0xccfd_6f8d, 8, 1));
+    let p = retention_check::parse_ref("e12345678bv1-3").expect("9 桁 + variant + 出現番号");
+    assert_eq!((p.prefix, p.hex_len, p.occurrence), (0x1_2345_678b, 9, 3));
+    let p = retention_check::parse_ref("e0123456789abcdef-2").expect("16 桁");
+    assert_eq!((p.hex_len, p.occurrence), (16, 2));
+    assert!(
+        retention_check::parse_ref("e1234567").is_none(),
+        "7 桁は不正"
+    );
+    assert!(
+        retention_check::parse_ref("e0123456789abcdef0").is_none(),
+        "17 桁は不正"
+    );
+    assert!(retention_check::parse_ref("e12345678x").is_none());
+    assert!(retention_check::parse_ref("12345678").is_none());
+}
+
+/// TASK-23.5: 前方一致照合は全桁ダイジェストの先頭 `hex_len` 桁と出現番号で判定する。
+#[test]
+fn task_23_5_parsed_ref_matches_digest_prefix_and_occurrence() {
+    let digest = 0x1234_5678_b000_0000_u64;
+    let short = retention_check::parse_ref("e12345678-2").expect("8 桁");
+    assert!(short.matches(&(digest, 2), &[]));
+    assert!(!short.matches(&(digest, 1), &[]));
+    let long = retention_check::parse_ref("e12345678b").expect("9 桁");
+    assert!(long.matches(&(digest, 1), &[]));
+    assert!(!long.matches(&(0x1234_5678_a000_0000, 1), &[]));
+    let full = retention_check::parse_ref("e12345678b0000000").expect("16 桁");
+    assert!(full.matches_digest(digest));
+    assert!(!full.matches_digest(digest + 1));
+}
+
+/// TASK-23.5・Issue #836: 先着 `0x12345678a…`（`e12345678`）と後着 `0x12345678b…`
+/// （`e12345678b`）の表示衝突ペアで、先着 ref を後着ダイジェストの同一性に使わない。
+#[test]
+fn task_23_5_display_collision_does_not_identify_later_digest_by_earlier_ref() {
+    let first = 0x1234_5678_a000_0000_u64;
+    let later = 0x1234_5678_b000_0000_u64;
+    let p_first = retention_check::parse_ref("e12345678").expect("8 桁");
+    let p_later = retention_check::parse_ref("e12345678b").expect("9 桁");
+    let all = [p_first, p_later];
+    // 先着側は自身にだけ一致し、後着ダイジェストには一致しない。
+    assert!(p_first.matches(&(first, 1), &all));
+    assert!(!p_first.matches(&(later, 1), &all));
+    assert!(p_later.matches(&(later, 1), &all));
+    assert!(!p_later.matches(&(first, 1), &all));
+    assert!(retention_check::any_ref_matches(&all, &(later, 1)));
+    assert!(retention_check::any_ref_matches(&all, &(first, 1)));
+    // 後着側 ref が snapshot にあれば、先着 ref だけの集合から後着を誤同定しない。
+    assert!(!p_first.matches_any(&[(later, 1)], &all));
+}
+
+/// TASK-23.5・Issue #836: 衝突相手（`0x12345678b…`）が snapshot から省略され、先着の
+/// `e12345678` だけが出力に残る場合、出力済み ref 集合では相手の存在を検出できない。
+/// DOM 全体のダイジェスト集合で先頭 8 桁を共有する別ダイジェストがある候補は一意でないとする。
+#[test]
+fn task_23_5_omitted_collision_partner_makes_digest_ambiguous() {
+    let first = 0x1234_5678_a000_0000_u64;
+    let target = 0x1234_5678_b000_0000_u64;
+    let other = 0x9abc_def0_1234_5678_u64;
+    let p_first = retention_check::parse_ref("e12345678").expect("8 桁");
+    // snapshot には先着 ref しか無い。ref 集合だけの判定では target に誤一致する（旧挙動）。
+    assert!(p_first.matches(&(target, 1), &[p_first]));
+    // DOM 全体では先着・後着が共存するため、どちらの候補も曖昧として除かれる。
+    let dom = [first, target, other];
+    assert!(!retention_check::digest_is_display_unique(target, &dom));
+    assert!(!retention_check::digest_is_display_unique(first, &dom));
+    // 先頭 8 桁を共有する相手がいなければ一意。自分自身だけの集合も一意。
+    assert!(retention_check::digest_is_display_unique(other, &dom));
+    assert!(retention_check::digest_is_display_unique(target, &[target]));
 }

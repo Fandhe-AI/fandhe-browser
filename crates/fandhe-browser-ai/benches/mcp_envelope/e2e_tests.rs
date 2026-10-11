@@ -27,11 +27,11 @@ mod tokens;
 /// snapshot の形が変わったら `make measure-mcp-envelope MCP_ENVELOPE_ARGS="--iterations 100 --markdown"`
 /// で再生成し、こことレポートを貼り直す。
 const PINNED: [(&str, [usize; 5]); 5] = [
-    ("example-minimal", [103, 79, 79, 120, 292]),
-    ("wikipedia-article", [56482, 37231, 37231, 43156, 122589]),
-    ("hn-list", [10220, 12562, 12562, 14832, 40343]),
-    ("login-form", [284, 196, 196, 255, 668]),
-    ("mdn-docs", [19005, 27767, 27767, 30803, 85091]),
+    ("example-minimal", [103, 68, 68, 109, 276]),
+    ("wikipedia-article", [56482, 32174, 32174, 38099, 113693]),
+    ("hn-list", [10220, 10803, 10803, 13073, 37255]),
+    ("login-form", [284, 165, 165, 224, 620]),
+    ("mdn-docs", [19005, 24744, 24744, 27780, 79915]),
 ];
 
 #[test]

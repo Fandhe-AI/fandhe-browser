@@ -262,23 +262,99 @@ pub fn flatten(root: &Node) -> Vec<FlatEntry> {
     out
 }
 
-/// `ref` 文字列（`e<16hex>[v<n>][-<n>]`）をダイジェストと出現番号（無印は 1）へ分解する。
-/// 形式に合わない文字列は `None`（同一性を確認できないため一致扱いにしない）。
+/// `parse_ref` の結果。表示 ref はダイジェスト先頭の 8〜16 桁だけを持つため、全桁の
+/// ダイジェストではなく先頭 `hex_len` 桁（`prefix`）と出現番号を保持し、前方一致で照合する
+/// （TASK-23.5・Issue #836）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedRef {
+    /// ダイジェスト先頭 `hex_len` 桁を数値にしたもの。
+    pub prefix: u64,
+    /// 表示された 16 進桁数（8..=16）。
+    pub hex_len: u32,
+    /// 出現番号（無印は 1）。
+    pub occurrence: u32,
+}
+
+impl ParsedRef {
+    /// 全桁ダイジェストの先頭 `hex_len` 桁がこの ref の `prefix` と一致するか（前方一致のみ）。
+    ///
+    /// 前方一致だけでは同一性を保証しない。先着 `0x12345678a…` が `e12345678`、後着
+    /// `0x12345678b…` が `e12345678b` を受ける表示衝突ペアでは、先着 ref が後着ダイジェストにも
+    /// 前方一致する。同一性の判定には snapshot 側の ref 集合で曖昧性を除く [`ParsedRef::matches`]
+    /// 以降を使うこと。
+    pub fn matches_digest(&self, digest: u64) -> bool {
+        let shift = 64u32.saturating_sub(4 * self.hex_len);
+        digest.checked_shr(shift).unwrap_or(digest) == self.prefix
+    }
+
+    /// snapshot 側の全 ref（`all`）のうち、この ref より長い表示桁で同じダイジェストへ前方一致
+    /// するものがあるか。ある場合、そのダイジェストの発行 ref はより長い側であり（桁延長は
+    /// 後着側にだけ起き、延長後の桁は先着ダイジェストと異なる）、短い ref は別要素のものである。
+    fn shadowed_by(&self, digest: u64, all: &[ParsedRef]) -> bool {
+        all.iter()
+            .any(|q| q.hex_len > self.hex_len && q.matches_digest(digest))
+    }
+
+    /// （全桁ダイジェスト, 出現番号）の候補と一致するか。`all` は snapshot 側の全 ref。
+    /// 前方一致に加え、より長い ref に遮蔽される（別要素の短い ref）場合は一致扱いにしない
+    /// （表示衝突ペアの誤同定防止。TASK-23.5・Issue #836）。
+    ///
+    /// 衝突相手の ref が snapshot に無い（省略された）場合は ref 集合からは区別できないため、
+    /// 候補側（[`target_refs`]）が DOM 全体のダイジェストで曖昧な候補を事前に除く
+    /// （[`digest_is_display_unique`]）。
+    pub fn matches(&self, cand: &(u64, u32), all: &[ParsedRef]) -> bool {
+        self.occurrence == cand.1 && self.matches_digest(cand.0) && !self.shadowed_by(cand.0, all)
+    }
+
+    /// 候補のいずれかと一致するか。
+    pub fn matches_any(&self, cands: &[(u64, u32)], all: &[ParsedRef]) -> bool {
+        cands.iter().any(|c| self.matches(c, all))
+    }
+}
+
+/// snapshot 側の ref 集合のいずれかが候補（全桁ダイジェスト, 出現番号）と一致するか。
+pub fn any_ref_matches(refs: &[ParsedRef], cand: &(u64, u32)) -> bool {
+    refs.iter().any(|p| p.matches(cand, refs))
+}
+
+/// エントリの ref をすべて解釈した集合（表示衝突の遮蔽判定に使う）。
+pub fn all_parsed_refs(entries: &[FlatEntry]) -> Vec<ParsedRef> {
+    entries
+        .iter()
+        .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
+        .collect()
+}
+
+/// `ref` 文字列（`e<8..16hex>[v<n>][-<n>]`）を表示桁・先頭桁の値・出現番号（無印は 1）へ
+/// 分解する。hex 部は `[0-9a-f]` の貪欲読み取りで、桁数が 8..=16 以外や形式に合わない
+/// 文字列は `None`（同一性を確認できないため一致扱いにしない）。
 /// agent_eval（TASK-21.2・#120）の ref 解決からも使う。
-pub fn parse_ref(r: &str) -> Option<(u64, u32)> {
+pub fn parse_ref(r: &str) -> Option<ParsedRef> {
     let rest = r.strip_prefix('e')?;
-    let digest = u64::from_str_radix(rest.get(..16)?, 16).ok()?;
-    let mut tail = rest.get(16..)?;
+    let hex_end = rest
+        .find(|c: char| !matches!(c, '0'..='9' | 'a'..='f'))
+        .unwrap_or(rest.len());
+    if !(8..=16).contains(&hex_end) {
+        return None;
+    }
+    let prefix = u64::from_str_radix(rest.get(..hex_end)?, 16).ok()?;
+    let hex_len = u32::try_from(hex_end).ok()?;
+    let mut tail = rest.get(hex_end..)?;
     if let Some(v) = tail.strip_prefix('v') {
         let end = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
         v.get(..end)?.parse::<u32>().ok()?;
         tail = v.get(end..)?;
     }
-    match tail.strip_prefix('-') {
-        None if tail.is_empty() => Some((digest, 1)),
-        Some(n) => Some((digest, n.parse().ok()?)),
-        None => None,
-    }
+    let occurrence = match tail.strip_prefix('-') {
+        None if tail.is_empty() => 1,
+        Some(n) => n.parse().ok()?,
+        None => return None,
+    };
+    Some(ParsedRef {
+        prefix,
+        hex_len,
+        occurrence,
+    })
 }
 
 /// `build_snapshot` の `discriminator`（`id` → フォーム部品の `name` → `a`/`area` の `href`）と同じ規則。
@@ -337,6 +413,109 @@ fn preceding_count(doc: &Document, id: NodeId, same: impl Fn(NodeId) -> bool) ->
     n
 }
 
+/// 表のヘッダ・データセル `e` が圧縮経路で受ける ref ダイジェスト（表 ref 直下スコープ。
+/// `id` 属性のみを識別属性とする）。`target_refs` と `dom_digests` が共有する。
+fn scoped_cell_digest(
+    doc: &Document,
+    index: &NameIndex<'_>,
+    e: NodeId,
+    table_ref: ElementRef,
+) -> Option<u64> {
+    let role = compute_role(doc, e)?;
+    let name = compute_name_with_index(doc, index, e);
+    let mut sig = ElementSignature::new(role.as_str(), &name.text);
+    if let Some(d) = doc.attribute(e, "id").filter(|s| !s.is_empty()) {
+        sig = sig.with_discriminator(d);
+    }
+    sig = sig.with_scope(table_ref);
+    RefAllocator::new()
+        .allocate_signature(&sig)
+        .ok()
+        .map(|r| r.digest)
+}
+
+/// 圧縮コンテナ `scope` 直下で行内操作要素 `e` が受ける ref ダイジェスト
+/// （role 無しは `a`→link・他→button）。`target_refs` と `dom_digests` が共有する。
+fn control_digest(
+    doc: &Document,
+    index: &NameIndex<'_>,
+    e: NodeId,
+    scope: ElementRef,
+) -> Option<u64> {
+    let role = compute_role(doc, e)
+        .map(|r| r.as_str().to_string())
+        .unwrap_or_else(|| {
+            if doc.local_name(e) == Some("a") {
+                "link".to_string()
+            } else {
+                "button".to_string()
+            }
+        });
+    let name = compute_name_with_index(doc, index, e);
+    let mut sig = ElementSignature::new(&role, &name.text).with_scope(scope);
+    if let Some(d) = discriminator(doc, e) {
+        sig = sig.with_discriminator(d);
+    }
+    RefAllocator::new()
+        .allocate_signature(&sig)
+        .ok()
+        .map(|r| r.digest)
+}
+
+/// DOM 全体の要素が ref 発行時に取りうるダイジェストの集合（重複除去済み）を返す。
+/// 祖先鎖 ref・表セルの表スコープ ref・圧縮コンテナ直下の操作要素 ref を網羅する。
+///
+/// snapshot は hidden・上限超過で要素を省略するため、snapshot 側の ref 集合だけでは
+/// 「省略された表示衝突の相手」を検出できない。DOM 全体から発行規則を再現して、
+/// 同一性判定の曖昧性（[`digest_is_display_unique`]）を求めるために使う（Issue #836）。
+fn dom_digests(doc: &Document, index: &NameIndex<'_>) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    for e in doc.descendants(doc.root()) {
+        if !doc.is_element(e) {
+            continue;
+        }
+        if let Some(r) = chain_ref(doc, index, e) {
+            out.push(r.digest);
+        }
+        let local = doc.local_name(e).unwrap_or("");
+        if matches!(local, "th" | "td")
+            && let Some(table) = doc
+                .ancestors(e)
+                .find(|&a| doc.local_name(a) == Some("table"))
+            && let Some(table_ref) = chain_ref(doc, index, table)
+            && let Some(d) = scoped_cell_digest(doc, index, e, table_ref)
+        {
+            out.push(d);
+        }
+        if (local == "a" && doc.attribute(e, "href").is_some()) || local == "button" {
+            for c in doc
+                .ancestors(e)
+                .filter(|&a| matches!(doc.local_name(a), Some("table" | "ul" | "ol")))
+            {
+                if let Some(scope) = chain_ref(doc, index, c)
+                    && let Some(d) = control_digest(doc, index, e, scope)
+                {
+                    out.push(d);
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// `digest` と先頭 8 桁（上位 32bit）が一致する別ダイジェストが `all` に無いか。
+///
+/// 表示 ref は先頭 8 桁で発行し、衝突した後着側だけを延長する。先頭 8 桁を共有する別ダイジェストが
+/// DOM に存在すると、表示 ref（先頭 8 桁以上の前方一致）が自身のものか相手のものか snapshot の
+/// 出力だけでは決まらない（相手が省略されて出力に現れない場合を含む）。そのため曖昧な候補は
+/// 一致させない（fail-closed。Issue #836）。
+pub fn digest_is_display_unique(digest: u64, all: &[u64]) -> bool {
+    all.iter()
+        .all(|&o| o == digest || (o >> 32) != (digest >> 32))
+}
+
 /// DOM 要素 `id` に対応しうる snapshot ref の（ダイジェスト, 出現番号）の集合を返す。
 /// 通常要素は祖先鎖の ref と、先行する同一ダイジェスト要素数から求めた出現番号。
 /// 表のヘッダセルは圧縮経路が表 ref 直下のスコープで発行する（`id` 属性のみを
@@ -363,19 +542,7 @@ pub fn target_refs(doc: &Document, id: NodeId, entries: &[FlatEntry]) -> Vec<(u6
             .find(|&a| doc.local_name(a) == Some("table"))
         && let Some(table_ref) = chain_ref(doc, &index, table)
     {
-        let scoped = |e: NodeId| -> Option<u64> {
-            let role = compute_role(doc, e)?;
-            let name = compute_name_with_index(doc, &index, e);
-            let mut sig = ElementSignature::new(role.as_str(), &name.text);
-            if let Some(d) = doc.attribute(e, "id").filter(|s| !s.is_empty()) {
-                sig = sig.with_discriminator(d);
-            }
-            sig = sig.with_scope(table_ref);
-            RefAllocator::new()
-                .allocate_signature(&sig)
-                .ok()
-                .map(|r| r.digest)
-        };
+        let scoped = |e: NodeId| scoped_cell_digest(doc, &index, e, table_ref);
         if let Some(d) = scoped(id) {
             let before = preceding_count(doc, id, |e| {
                 matches!(doc.local_name(e), Some("th" | "td")) && scoped(e) == Some(d)
@@ -384,6 +551,10 @@ pub fn target_refs(doc: &Document, id: NodeId, entries: &[FlatEntry]) -> Vec<(u6
         }
     }
     out.extend(compressed_control_refs(doc, &index, id, entries));
+    // 先頭 8 桁を共有する別ダイジェストが DOM にある候補は、省略された衝突相手の ref と
+    // 区別できないため捨てる（fail-closed。Issue #836）。
+    let all = dom_digests(doc, &index);
+    out.retain(|(d, _)| digest_is_display_unique(*d, &all));
     out
 }
 
@@ -409,32 +580,14 @@ fn compressed_control_refs(
     if !is_control(id) {
         return Vec::new();
     }
-    let control_sig = |e: NodeId, scope: ElementRef| {
-        let role = compute_role(doc, e)
-            .map(|r| r.as_str().to_string())
-            .unwrap_or_else(|| {
-                if doc.local_name(e) == Some("a") {
-                    "link".to_string()
-                } else {
-                    "button".to_string()
-                }
-            });
-        let name = compute_name_with_index(doc, index, e);
-        let mut sig = ElementSignature::new(&role, &name.text).with_scope(scope);
-        if let Some(d) = discriminator(doc, e) {
-            sig = sig.with_discriminator(d);
-        }
-        RefAllocator::new()
-            .allocate_signature(&sig)
-            .ok()
-            .map(|r| r.digest)
-    };
+    let control_sig = |e: NodeId, scope: ElementRef| control_digest(doc, index, e, scope);
     // snapshot 側で圧縮されたコンテナ（`Node::table` を持つ Node）の ref（ダイジェスト, 出現番号）。
-    let compressed_containers: Vec<(u64, u32)> = entries
+    let compressed_containers: Vec<ParsedRef> = entries
         .iter()
         .filter(|e| e.compressed)
         .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
         .collect();
+    let all_refs = all_parsed_refs(entries);
     let mut out = Vec::new();
     for container in doc
         .ancestors(id)
@@ -468,7 +621,7 @@ fn compressed_control_refs(
                                         .is_some_and(|y| y.digest == c.digest)
                             })
                             .saturating_add(1);
-                            compressed_containers.contains(&(c.digest, occ))
+                            any_ref_matches(&compressed_containers, &(c.digest, occ))
                         }
                     })
             })
@@ -488,10 +641,9 @@ fn compressed_control_refs(
                     && control_sig(e, scope) == Some(digest)
             })
             .count();
-        let snapshot_total = entries
+        let snapshot_total = all_refs
             .iter()
-            .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
-            .filter(|&(d, _)| d == digest)
+            .filter(|p| p.matches_digest(digest) && !p.shadowed_by(digest, &all_refs))
             .count();
         if dom_total != snapshot_total {
             continue;
@@ -519,6 +671,7 @@ pub fn judge(
     entries: &[FlatEntry],
     snapshot_truncated: bool,
 ) -> TaskCheck {
+    let all_refs = all_parsed_refs(entries);
     let matches: Vec<&FlatEntry> = entries
         .iter()
         .filter(|e| task.role.is_none_or(|r| e.role == r))
@@ -530,7 +683,7 @@ pub fn judge(
         .filter(|e| task.data_leaf.is_none_or(|k| e.data_leaf == Some(k)))
         .filter(|e| match e.r#ref.as_deref() {
             None | Some("") => true,
-            Some(r) => parse_ref(r).is_some_and(|p| target_refs.contains(&p)),
+            Some(r) => parse_ref(r).is_some_and(|p| p.matches_any(target_refs, &all_refs)),
         })
         .collect();
     let first = matches.first();

@@ -142,9 +142,9 @@ fn aisnap15_real_fixtures_formula_and_order() {
 
 /// 実測の具体値（名前, 生 DOM, snapshot, 削減率）。bench 出力（小数 1 桁）と一致させる。
 const EXPECTED: [(&str, usize, usize, f64); 3] = [
-    ("example-minimal.html", 52, 43, 17.3),
-    ("login-form.html", 233, 137, 41.2),
-    ("wikipedia-article.html", 55_917, 26_011, 53.5),
+    ("example-minimal.html", 52, 32, 38.5),
+    ("login-form.html", 233, 106, 54.5),
+    ("wikipedia-article.html", 55_917, 20_954, 62.5),
 ];
 
 #[test]
@@ -159,7 +159,7 @@ fn aisnap15_real_fixtures_pinned_values_and_summary() {
     }
     let s = summarize(&rows).expect("summary");
     assert_eq!(s.pages, 17);
-    assert!((s.mean_reduction_pct - 24.3).abs() < 0.05, "{s:?}");
-    assert!((s.min_reduction_pct - -61.4).abs() < 0.05);
-    assert!((s.max_reduction_pct - 68.3).abs() < 0.05);
+    assert!((s.mean_reduction_pct - 40.2).abs() < 0.05, "{s:?}");
+    assert!((s.min_reduction_pct - -28.8).abs() < 0.05);
+    assert!((s.max_reduction_pct - 69.3).abs() < 0.05);
 }

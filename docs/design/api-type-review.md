@@ -81,7 +81,7 @@ cdp の `String` 戻りは非公開の `protocol` モジュールの `to_json` �
 | `snapshot::build` | `build_snapshot` | `Result<Snapshot, SnapshotError>` | 構造体 + enum エラー | 付与 | |
 | `snapshot::element_ref` | `RefAllocator::allocate` / `allocate_signature` | `Result<ElementRef, RefError>` | 構造体（`digest`・`variant`・`occurrence`）+ enum エラー | 付与 | `RefError` は単位バリアント 1 つ（`OccurrenceOverflow`） |
 | `snapshot::element_ref` | `ref_signature`・`ElementSignature::digest` | `u64` | 素の数値 | — | `ElementRef` に包まれる前の中間値 |
-| `snapshot::element_ref` | `ElementRef::to_ref_string` | `String` | 素の文字列 | — | `e<16hex>[v<variant>][-<n>]` 形式（`AISNAP-10`）を固定して返す |
+| `snapshot::element_ref` | `ElementRef::to_ref_string` | `String` | 素の文字列 | — | `e<8..16hex>[v<variant>][-<n>]` 形式（`AISNAP-10`・TASK-23.5。通常 8 桁、先頭 8 桁の表示衝突時のみ後着側を延長）を固定して返す |
 | `snapshot::name` | `compute_name`・`compute_name_with_index` | `AccessibleName` | 構造体（text・source・truncated 等） | 付与 | |
 | `snapshot::role` | `compute_role`・`ComputedRole::source`・`RoleSource::as_str` | `Option<ComputedRole>`・`RoleSource`・`&'static str` | 構造体 / enum | 付与 | |
 | `snapshot::state` | `compute_state`・`State::with_*` | `State`・`Self` | 構造体 | 付与 | |

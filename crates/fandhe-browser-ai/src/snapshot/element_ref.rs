@@ -12,25 +12,45 @@
 //!
 //! # 形式
 //!
-//! `e` + 16 桁の小文字 16 進ダイジェスト（例: `eccfd6f8d27bb0f9b`）。同じ
-//! シグネチャの 2 個目以降には `-<出現番号>` を付ける（例: `e78faeeefec1c2870-2`）。
+//! `e` + 8 桁の小文字 16 進（64bit ダイジェストの先頭 8 桁。例: `eccfd6f8d`）。
+//! 同じシグネチャの 2 個目以降には `-<出現番号>` を付ける（例: `e78faeeef-2`）。
 //! 使う文字は `[a-z0-9-]` のみで、name（ページ由来の untrusted な文字列）は ref に
 //! 入らない。読める形（`button:Submit` 等）にしないのは、`AISNAP-1` のトークン削減の
-//! ため ref を固定長にするためである。
+//! ため ref を短く保つためである。
+//!
+//! # 表示長（8 桁）と延長規則（TASK-23.5・Issue #836）
+//!
+//! ref は snapshot の総トークンの大半を占める（1 個あたり約 12 トークン）ため、
+//! 表示を 16 桁から 8 桁へ短縮した（オーナー判断 2026-10-10。ref 3,000 個での表示
+//! 衝突の期待値は 8 桁で約 0.001 件、6 桁だと約 0.27 件）。内部の 64bit ダイジェスト
+//! （FNV-1a 主 + 検査ダイジェスト）と、子の `scope` へ折り込む値は変えない。
+//!
+//! 先頭 8 桁が既発行の別ダイジェストと衝突した場合は、**後から現れた側だけ**を
+//! 一意になる最小の桁数（9〜16 桁）まで延ばす。先に発行した側は 8 桁のまま変わらない。
+//! 桁数はダイジェストの初回発行時に 1 度だけ決め、以後変えない（同一ダイジェストの
+//! `variant` 同士は桁数を共有する）。`scope` には桁数を折り込まない。折り込むと
+//! 親の表示衝突が全子孫のダイジェストへ波及するためである。
+//!
+//! 桁の確定は発行時点で行うため、ref を表示しない内部ノード（折り畳み対象等）も桁を
+//! 確保する。そのため表示ノードが不要に延長されることがまれにあるが、一意性は保たれ、
+//! 確率も無視できる（約 N²/2³³）。
 //!
 //! # 一意性と衝突
 //!
 //! 出現番号のカウンタはダイジェストではなくシグネチャ自身（64bit の主ダイジェスト +
 //! 独立な 64bit の検査ダイジェストの組）をキーにする。別シグネチャの主ダイジェストが
 //! 衝突しても、互いの出現番号は消費し合わない。衝突したシグネチャには最初に見た順で
-//! `variant`（1 始まり。最初のものは 0）を振り、`e<16hex>v<variant>[-<n>]` とする。
-//! これにより ref は常に一意になり、通常のページ（衝突なし）では別シグネチャの挿入で
-//! 既存要素の ref は変わらない。
+//! `variant`（1 始まり。最初のものは 0）を振り、`e<8..16hex>v<variant>[-<n>]` とする。
+//! 衝突は 2 段階ある。先頭 8 桁だけが衝突する「表示衝突」は後着側の桁延長で、64bit
+//! 全体が衝突する「完全衝突」は `variant` で解消する。これにより ref は常に一意に
+//! なり、通常のページ（衝突なし）では別シグネチャの挿入で既存要素の ref は変わらない。
 //!
 //! ただし主ダイジェストが衝突する別シグネチャを意図的に作れる敵対的ページでは、
-//! 衝突相手を先に置くことで `variant` を押し出せる。ref 全体を可逆にしない限り
-//! 一意性と順序非依存は両立しないため、影響は「その衝突ペアの安定性が落ちる」ことに
-//! 限定される。FNV は暗号学的ハッシュではなく、ref は認可トークンでもない。
+//! 衝突相手を先に置くことで `variant` や後着側の桁数を押し出せる。表示衝突ペアでは
+//! 後着側の桁数が出現順に依存する（先着側の 8 桁表示は後着側にも前方一致しうる）。
+//! ref 全体を可逆にしない限り一意性と順序非依存は両立しないため、影響は「その衝突
+//! ペアの安定性が落ちる」ことに限定される。FNV は暗号学的ハッシュではなく、ref は
+//! 認可トークンでもない。
 //!
 //! # 再特定の安定性（同名要素）
 //!
@@ -77,6 +97,21 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const CHECK_OFFSET: u64 = 0x9e37_79b9_7f4a_7c15;
 /// 検査ダイジェストの乗数（主と異なる奇数。主の衝突が検査へ波及しにくくする）。
 const CHECK_PRIME: u64 = 0x9e37_79b1_85eb_ca87;
+
+/// ref 表示の最小桁数（16 進。ダイジェスト先頭 32bit）。
+const MIN_HEX_LEN: u8 = 8;
+/// ref 表示の最大桁数（ダイジェスト全体）。
+const MAX_HEX_LEN: u8 = 16;
+/// 同一先頭 8 桁のバケットを桁数決定のために走査する上限。敵対的ページが大量の
+/// 表示衝突を作っても発行コストが二乗化しないよう、超えたら即最大桁にする。
+const BUCKET_SCAN_LIMIT: usize = 64;
+
+/// ダイジェストの先頭 `hex_len` 桁ぶん（上位 `4 * hex_len` ビット）を返す。
+/// `hex_len` は 8..=16 に丸める（シフト量が 64 以上にならない）。
+pub(crate) fn digest_prefix(digest: u64, hex_len: u8) -> u64 {
+    let len = u32::from(hex_len.clamp(MIN_HEX_LEN, MAX_HEX_LEN));
+    digest.checked_shr(64 - 4 * len).unwrap_or(digest)
+}
 
 /// 主・検査の 2 系統ハッシュ状態。
 #[derive(Clone, Copy)]
@@ -195,13 +230,16 @@ impl<'a> ElementSignature<'a> {
     }
 }
 
-/// 生成された ref（ダイジェスト・衝突 variant・出現番号）。`Node::ref` へは
+/// 生成された ref（ダイジェスト・表示桁数・衝突 variant・出現番号）。`Node::ref` へは
 /// [`ElementRef::to_ref_string`] で文字列化して入れる（`AISNAP-10`）。
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ElementRef {
     /// role + name（+ 識別属性・親スコープ）シグネチャの 64bit ダイジェスト。
     pub digest: u64,
+    /// 表示するダイジェスト先頭の 16 進桁数（8..=16。通常は 8、先頭 8 桁が既発行の
+    /// 別ダイジェストと衝突した後着側のみ延長。TASK-23.5）。
+    pub hex_len: u8,
     /// 主ダイジェストが衝突した別シグネチャの区別番号（衝突なしは 0）。
     pub variant: u32,
     /// 同じシグネチャの中での先行順の出現番号（1 始まり）。
@@ -209,7 +247,7 @@ pub struct ElementRef {
 }
 
 impl ElementRef {
-    /// `Node::ref` に入れる文字列（`e<16hex>[v<variant>][-<n>]`）を返す。
+    /// `Node::ref` に入れる文字列（`e<8..16hex>[v<variant>][-<n>]`）を返す。
     pub fn to_ref_string(&self) -> String {
         self.to_string()
     }
@@ -217,7 +255,13 @@ impl ElementRef {
 
 impl fmt::Display for ElementRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "e{:016x}", self.digest)?;
+        let len = usize::from(self.hex_len.clamp(MIN_HEX_LEN, MAX_HEX_LEN));
+        write!(
+            f,
+            "e{:0width$x}",
+            digest_prefix(self.digest, self.hex_len),
+            width = len
+        )?;
         if self.variant > 0 {
             write!(f, "v{}", self.variant)?;
         }
@@ -259,12 +303,22 @@ struct Slot {
     count: u32,
 }
 
+/// 1 つの主ダイジェストの状態（表示桁数と、衝突 variant ごとの [`Slot`]）。
+#[derive(Debug)]
+struct DigestEntry {
+    /// 初回発行時に決めた表示桁数。以後変えない。
+    hex_len: u8,
+    slots: Vec<Slot>,
+}
+
 /// 1 スナップショット分の ref アロケータ（`AISNAP-10`）。
 ///
 /// メモリ使用量は異なるシグネチャの種類数に比例し、name の長さに依存しない。
 #[derive(Debug, Default)]
 pub struct RefAllocator {
-    seen: HashMap<u64, Vec<Slot>>,
+    seen: HashMap<u64, DigestEntry>,
+    /// 先頭 8 桁（`digest >> 32`）ごとの既発行ダイジェスト。表示衝突の検出用。
+    buckets: HashMap<u32, Vec<u64>>,
 }
 
 impl RefAllocator {
@@ -289,13 +343,57 @@ impl RefAllocator {
         self.allocate_with_hashes(h.primary, h.check)
     }
 
+    /// 先頭 8 桁（上位 32bit）をバケットのキーにする。
+    fn bucket_key(digest: u64) -> u32 {
+        u32::try_from(digest >> 32).unwrap_or(u32::MAX)
+    }
+
+    /// 初回発行のダイジェストの表示桁数を決める（TASK-23.5）。
+    ///
+    /// 既発行ダイジェストと先頭 8 桁が衝突しなければ 8、衝突すれば先頭 L 桁が
+    /// バケット内の全ダイジェストと異なる最小の L（9..=16）。バケットが走査上限を
+    /// 超えていれば最大桁にする。ダイジェストは互いに異なるので 16 で必ず一意になる。
+    fn decide_hex_len(&self, digest: u64) -> u8 {
+        let Some(bucket) = self.buckets.get(&Self::bucket_key(digest)) else {
+            return MIN_HEX_LEN;
+        };
+        if bucket.len() > BUCKET_SCAN_LIMIT {
+            return MAX_HEX_LEN;
+        }
+        (MIN_HEX_LEN..=MAX_HEX_LEN)
+            .find(|&l| {
+                let mine = digest_prefix(digest, l);
+                bucket.iter().all(|&o| digest_prefix(o, l) != mine)
+            })
+            .unwrap_or(MAX_HEX_LEN)
+    }
+
     /// ダイジェストを直接指定して発行する。衝突経路のテスト用で crate 外へは出さない。
     pub(crate) fn allocate_with_hashes(
         &mut self,
         digest: u64,
         check: u64,
     ) -> Result<ElementRef, RefError> {
-        let slots = self.seen.entry(digest).or_default();
+        if !self.seen.contains_key(&digest) {
+            let hex_len = self.decide_hex_len(digest);
+            self.buckets
+                .entry(Self::bucket_key(digest))
+                .or_default()
+                .push(digest);
+            self.seen.insert(
+                digest,
+                DigestEntry {
+                    hex_len,
+                    slots: Vec::new(),
+                },
+            );
+        }
+        let entry = self
+            .seen
+            .get_mut(&digest)
+            .ok_or(RefError::OccurrenceOverflow)?;
+        let hex_len = entry.hex_len;
+        let slots = &mut entry.slots;
         let idx = match slots.iter().position(|s| s.check == check) {
             Some(i) => i,
             None => {
@@ -317,6 +415,7 @@ impl RefAllocator {
         slot.count = occurrence;
         Ok(ElementRef {
             digest,
+            hex_len,
             variant: slot.variant,
             occurrence,
         })
@@ -336,13 +435,10 @@ mod tests {
     #[test]
     fn aisnap_10_ref_signature_is_deterministic_fnv1a() {
         let mut a = RefAllocator::new();
-        assert_eq!(
-            s(a.allocate("button", "Submit").unwrap()),
-            "eccfd6f8d27bb0f9b"
-        );
+        assert_eq!(s(a.allocate("button", "Submit").unwrap()), "eccfd6f8d");
         assert_eq!(
             s(a.allocate("heading", "Example Domain").unwrap()),
-            "e287a7dcba36a4eea"
+            "e287a7dcb"
         );
     }
 
@@ -353,14 +449,7 @@ mod tests {
         let refs: Vec<String> = (0..3)
             .map(|_| s(a.allocate("link", "More").unwrap()))
             .collect();
-        assert_eq!(
-            refs,
-            vec![
-                "e78faeeefec1c2870",
-                "e78faeeefec1c2870-2",
-                "e78faeeefec1c2870-3"
-            ]
-        );
+        assert_eq!(refs, vec!["e78faeeef", "e78faeeef-2", "e78faeeef-3"]);
         assert_eq!(refs.iter().collect::<HashSet<_>>().len(), 3);
     }
 
@@ -379,13 +468,13 @@ mod tests {
             ("heading", "Example Domain"),
             ("button", "Submit"),
         ];
-        assert_eq!(run(&base).last().unwrap(), "eccfd6f8d27bb0f9b");
-        assert_eq!(run(&with_banner).last().unwrap(), "eccfd6f8d27bb0f9b");
+        assert_eq!(run(&base).last().unwrap(), "eccfd6f8d");
+        assert_eq!(run(&with_banner).last().unwrap(), "eccfd6f8d");
 
         let links = [("link", "More"), ("link", "More")];
         let links_banner = [("generic", "banner"), ("link", "More"), ("link", "More")];
-        assert_eq!(run(&links).last().unwrap(), "e78faeeefec1c2870-2");
-        assert_eq!(run(&links_banner).last().unwrap(), "e78faeeefec1c2870-2");
+        assert_eq!(run(&links).last().unwrap(), "e78faeeef-2");
+        assert_eq!(run(&links_banner).last().unwrap(), "e78faeeef-2");
     }
 
     /// `AISNAP-10`: 識別属性が違う同名要素は、前方への挿入・並び替えで ref が入れ替わらない。
@@ -416,11 +505,13 @@ mod tests {
         let mut a = RefAllocator::new();
         let p1 = ElementRef {
             digest: 1,
+            hex_len: 8,
             variant: 0,
             occurrence: 1,
         };
         let p2 = ElementRef {
             digest: 2,
+            hex_len: 8,
             variant: 0,
             occurrence: 1,
         };
@@ -484,8 +575,8 @@ mod tests {
         assert_eq!(before["/a"], inserted["/a"]);
         assert_eq!(before["/b"], inserted["/b"]);
         assert_ne!(before["/a"], before["/b"]);
-        assert_eq!(before["/a"], "e081f3e4f8974fb31");
-        assert_eq!(before["/b"], "e004e3575fb2b5dca");
+        assert_eq!(before["/a"], "e081f3e4f");
+        assert_eq!(before["/b"], "e004e3575");
     }
 
     /// `AISNAP-10`: 子に識別属性があれば、同じ role + name の親が前に挿入されても
@@ -546,8 +637,8 @@ mod tests {
     fn aisnap_10_signature_is_unambiguous() {
         assert_ne!(ref_signature("ab", "c"), ref_signature("a", "bc"));
         let mut a = RefAllocator::new();
-        assert_eq!(s(a.allocate("ab", "c").unwrap()), "e606a0cce17a38ee9");
-        assert_eq!(s(a.allocate("a", "bc").unwrap()), "eb60b96e484addb6c");
+        assert_eq!(s(a.allocate("ab", "c").unwrap()), "e606a0cce");
+        assert_eq!(s(a.allocate("a", "bc").unwrap()), "eb60b96e4");
     }
 
     /// `AISNAP-10`: 主ダイジェストが衝突しても ref は一意で、先に発行した
@@ -556,15 +647,15 @@ mod tests {
     fn aisnap_10_digest_collision_still_unique_and_stable() {
         let mut a = RefAllocator::new();
         let first = a.allocate_with_hashes(0xdead_beef, 1).unwrap();
-        assert_eq!(s(first), "e00000000deadbeef");
+        assert_eq!(s(first), "e00000000");
         // 別シグネチャ（検査ダイジェストが異なる）が衝突。
         let other = a.allocate_with_hashes(0xdead_beef, 2).unwrap();
-        assert_eq!(s(other), "e00000000deadbeefv1");
+        assert_eq!(s(other), "e00000000v1");
         // 衝突相手の挿入後も、元シグネチャの 2 個目は出現番号を消費されない。
         let again = a.allocate_with_hashes(0xdead_beef, 1).unwrap();
-        assert_eq!(s(again), "e00000000deadbeef-2");
+        assert_eq!(s(again), "e00000000-2");
         let other2 = a.allocate_with_hashes(0xdead_beef, 2).unwrap();
-        assert_eq!(s(other2), "e00000000deadbeefv1-2");
+        assert_eq!(s(other2), "e00000000v1-2");
     }
 
     /// `AISNAP-10`: 出現番号のあふれは panic せず Err を返し、状態を壊さない。
@@ -573,26 +664,32 @@ mod tests {
         let mut a = RefAllocator::new();
         a.seen.insert(
             7,
-            vec![Slot {
-                check: 3,
-                variant: 0,
-                count: u32::MAX,
-            }],
+            DigestEntry {
+                hex_len: 8,
+                slots: vec![Slot {
+                    check: 3,
+                    variant: 0,
+                    count: u32::MAX,
+                }],
+            },
         );
         assert_eq!(
             a.allocate_with_hashes(7, 3),
             Err(RefError::OccurrenceOverflow)
         );
-        assert_eq!(a.seen.get(&7).unwrap().first().unwrap().count, u32::MAX);
+        assert_eq!(
+            a.seen.get(&7).unwrap().slots.first().unwrap().count,
+            u32::MAX
+        );
     }
 
-    /// `AISNAP-10`: 空 name・非 ASCII でも `e` + 16 桁 16 進になる。
+    /// `AISNAP-10`: 空 name・非 ASCII でも `e` + 8 桁 16 進になる。
     #[test]
     fn aisnap_10_empty_name_and_non_ascii() {
         let mut a = RefAllocator::new();
         for (r, n) in [("generic", ""), ("button", "送信")] {
             let text = s(a.allocate(r, n).unwrap());
-            assert_eq!(text.len(), 17);
+            assert_eq!(text.len(), 9);
             assert!(text.starts_with('e'));
             assert!(
                 text[1..]
@@ -600,5 +697,107 @@ mod tests {
                     .all(|c| matches!(c, '0'..='9' | 'a'..='f'))
             );
         }
+    }
+
+    /// 表示 ref の hex 部（`e` の後ろから `v`/`-` の手前まで）を返す。
+    fn hex_part(text: &str) -> &str {
+        let body = text.strip_prefix('e').unwrap();
+        let end = body.find(['v', '-']).unwrap_or(body.len());
+        &body[..end]
+    }
+
+    /// `AISNAP-10`/TASK-23.5: 先頭 8 桁が衝突したら後着側だけが最小桁（9 桁）に延びる。
+    #[test]
+    fn aisnap_10_display_prefix_collision_extends_later_side_only() {
+        let mut a = RefAllocator::new();
+        let first = s(a.allocate_with_hashes(0x1234_5678_a000_0000, 1).unwrap());
+        let second = s(a.allocate_with_hashes(0x1234_5678_b000_0000, 2).unwrap());
+        assert_eq!(first, "e12345678");
+        assert_eq!(second, "e12345678b");
+        assert_ne!(first, second);
+    }
+
+    /// TASK-23.5: 先頭 12 桁まで一致する組は、後着側が必要最小の 13 桁に延びる。
+    #[test]
+    fn aisnap_10_display_extension_is_minimal() {
+        let mut a = RefAllocator::new();
+        let first = s(a.allocate_with_hashes(0x1234_5678_9abc_0000, 1).unwrap());
+        let second = s(a.allocate_with_hashes(0x1234_5678_9abc_d000, 2).unwrap());
+        assert_eq!(first, "e12345678");
+        assert_eq!(second, "e123456789abcd");
+        assert_eq!(hex_part(&second).len(), 13);
+    }
+
+    /// TASK-23.5: 無関係なダイジェストを挿入しても、先着側・後着側・無関係側の ref は不変。
+    #[test]
+    fn aisnap_10_unrelated_insertion_keeps_prefix_collision_refs_stable() {
+        let run = |with_unrelated: bool| {
+            let mut a = RefAllocator::new();
+            let mut out = Vec::new();
+            if with_unrelated {
+                out.push(s(a.allocate_with_hashes(0x00ab_cdef_0000_0001, 9).unwrap()));
+            }
+            out.push(s(a.allocate_with_hashes(0x1234_5678_a000_0000, 1).unwrap()));
+            if with_unrelated {
+                out.push(s(a.allocate_with_hashes(0x7777_7777_0000_0002, 8).unwrap()));
+            }
+            out.push(s(a.allocate_with_hashes(0x1234_5678_b000_0000, 2).unwrap()));
+            out
+        };
+        let base = run(false);
+        let with = run(true);
+        assert_eq!(base, vec!["e12345678", "e12345678b"]);
+        assert_eq!(
+            with,
+            vec!["e00abcdef", "e12345678", "e77777777", "e12345678b"]
+        );
+    }
+
+    /// TASK-23.5: 延長側にも出現番号・variant の規則が同じく適用される。
+    #[test]
+    fn aisnap_10_extended_ref_keeps_occurrence_and_variant_rules() {
+        let mut a = RefAllocator::new();
+        a.allocate_with_hashes(0x1234_5678_a000_0000, 1).unwrap();
+        let b1 = s(a.allocate_with_hashes(0x1234_5678_b000_0000, 2).unwrap());
+        let b2 = s(a.allocate_with_hashes(0x1234_5678_b000_0000, 2).unwrap());
+        let bv = s(a.allocate_with_hashes(0x1234_5678_b000_0000, 3).unwrap());
+        assert_eq!(b1, "e12345678b");
+        assert_eq!(b2, "e12345678b-2");
+        assert_eq!(bv, "e12345678bv1");
+    }
+
+    /// TASK-23.5: hex 部は自ダイジェストの先頭 L 桁と一致する（ハーネスの前方一致照合の前提）。
+    #[test]
+    fn aisnap_10_hex_part_is_prefix_of_own_digest() {
+        let mut a = RefAllocator::new();
+        for (d, c) in [
+            (0x1234_5678_a000_0000_u64, 1_u64),
+            (0x1234_5678_b000_0000, 2),
+            (0x1234_5678_b000_0000, 3),
+            (0x1234_5678_9abc_d000, 4),
+        ] {
+            let r = a.allocate_with_hashes(d, c).unwrap();
+            let text = s(r);
+            let hex = hex_part(&text);
+            assert_eq!(hex.len(), usize::from(r.hex_len));
+            assert_eq!(
+                u64::from_str_radix(hex, 16).unwrap(),
+                digest_prefix(d, r.hex_len)
+            );
+            assert!(format!("{d:016x}").starts_with(hex));
+        }
+    }
+
+    /// TASK-23.5: 走査上限を超えたバケットは最大桁（16 桁）で発行し、状態は壊れない。
+    #[test]
+    fn aisnap_10_oversized_bucket_falls_back_to_full_digest() {
+        let mut a = RefAllocator::new();
+        for i in 0..=(BUCKET_SCAN_LIMIT as u64 + 1) {
+            a.allocate_with_hashes(0x1234_5678_0000_0000 | (i << 8), i)
+                .unwrap();
+        }
+        let last = a.allocate_with_hashes(0x1234_5678_ffff_0000, 999).unwrap();
+        assert_eq!(last.hex_len, 16);
+        assert_eq!(s(last), "e12345678ffff0000");
     }
 }

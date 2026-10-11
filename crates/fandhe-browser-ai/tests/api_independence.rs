@@ -248,7 +248,7 @@ fn envelope(url: &str, doc_name: &str, children: Vec<Value>) -> Value {
 
 fn expected_article(url: &str) -> Value {
     let list = serde_json::json!({
-        "role": "list", "name": "", "ref": "ecc842c965dec143a",
+        "role": "list", "name": "", "ref": "ecc842c96",
         "header": [],
         "rows": [
             {"text": "所有権", "truncated": false, "controls": [], "controls_truncated": false},
@@ -263,9 +263,9 @@ fn expected_article(url: &str) -> Value {
         "Rust 入門記事",
         vec![
             leaf_no_ref("banner", ""),
-            leaf("heading", "はじめに", "e300ae11bc252b0fd"),
-            leaf("link", "公式ドキュメント", "ed45c1d22b4e186f4"),
-            leaf("heading", "要点", "ee0714a175d20c8b2"),
+            leaf("heading", "はじめに", "e300ae11b"),
+            leaf("link", "公式ドキュメント", "ed45c1d22"),
+            leaf("heading", "要点", "ee0714a17"),
             list,
             leaf_no_ref("contentinfo", ""),
         ],
@@ -273,21 +273,21 @@ fn expected_article(url: &str) -> Value {
 }
 
 fn expected_form(url: &str) -> Value {
-    let mut checkbox = leaf("checkbox", "規約に同意", "eb4e606a8d0b0322c");
+    let mut checkbox = leaf("checkbox", "規約に同意", "eb4e606a8");
     checkbox["checked"] = Value::Bool(true);
-    let mut radio = leaf("radio", "無料プラン", "e3ca491e4e71deece");
+    let mut radio = leaf("radio", "無料プラン", "e3ca491e4");
     radio["checked"] = Value::Bool(false);
-    let mut cancel = leaf("button", "取消", "ebc8665358ad3ea30");
+    let mut cancel = leaf("button", "取消", "ebc866535");
     cancel["disabled"] = Value::Bool(true);
     envelope(
         url,
         "登録フォーム",
         vec![
-            leaf("textbox", "ユーザー名", "e60f2465f276d6230"),
+            leaf("textbox", "ユーザー名", "e60f2465f"),
             checkbox,
             radio,
-            leaf("combobox", "言語", "ea907649b0395e5e0"),
-            leaf("button", "送信", "e764e1c46ab9a2bd6"),
+            leaf("combobox", "言語", "ea907649b"),
+            leaf("button", "送信", "e764e1c46"),
             cancel,
         ],
     )

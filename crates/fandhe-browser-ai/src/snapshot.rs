@@ -95,7 +95,7 @@ pub use state::{CheckedState, State, compute_state};
 ///   `None` のノードは ref で指定できず、エージェントは ref を持つ子孫で操作・参照する。
 ///   ref を持つのは [`REF_ROLES`]・データ葉・操作要素（`role` 属性付き等を含む）・`option`・
 ///   圧縮したコンテナ（[`Node::table`] あり。配下のヘッダ・行内操作要素の ref の scope 元）のノード。
-///   値の形式は `e<16hex>[v<n>][-n]`（[`RefAllocator`] が発行。TASK-11.6・Issue #75・
+///   値の形式は `e<8..16hex>[v<n>][-n]`（[`RefAllocator`] が発行。TASK-11.6・Issue #75・
 ///   `AISNAP-10`）。木への割り当ては [`build_snapshot`]（TASK-11.7）が担う
 /// - `children`: DOM の親子関係に対応する子ノード（名前のない generic を折り畳んだ場合、
 ///   その子は親へ繰り上がる。TASK-23.3）。構築は [`build_snapshot`]（TASK-11.7・Issue #76）
@@ -135,7 +135,7 @@ pub struct Node {
     pub name: String,
     /// role + name シグネチャによる再特定要求（`AISNAP-10`）。`None` は ref を振らない
     /// ノード（ルート、および操作・参照の対象でないノード。TASK-23.4・Issue #827）。
-    /// 形式は `e<16hex>[v<n>][-n]`。生成は [`RefAllocator`]（TASK-11.6・Issue #75）。
+    /// 形式は `e<8..16hex>[v<n>][-n]`。生成は [`RefAllocator`]（TASK-11.6・Issue #75）。
     pub r#ref: Option<String>,
     /// DOM の親子関係に対応する子ノード（折り畳まれた generic の子は親へ繰り上がる。TASK-23.3）。
     /// 構築は [`build_snapshot`]（TASK-11.7・Issue #76）。
@@ -255,7 +255,7 @@ impl HeaderCell {
 ///
 /// [`Node`] の role・name・ref・state に対応する。`ref` は圧縮行に操作要素を載せる目的
 /// （ref での再特定。`AISNAP-10`）そのものなので `Option` にせず必須とし、形式は
-/// [`Node::ref`] と同じ（`e<16hex>[v<n>][-n]`）。
+/// [`Node::ref`] と同じ（`e<8..16hex>[v<n>][-n]`）。
 ///
 /// [`build_snapshot`] の圧縮経路が、保持した行の中の `a[href]`・`button` から生成する
 /// （`RefAllocator` で発行した ref。セル内に複数あっても行あたり [`MAX_ROW_CONTROLS`]・

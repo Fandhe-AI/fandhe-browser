@@ -1,5 +1,5 @@
 - document "Checkboxes"
-  - heading "Checkboxes" [ecdd814db4ba7fb94]
-  - checkbox [e91f35187869ba882] (unchecked)
-  - checkbox [e91f35187869ba882-2] (checked)
-  - link "Example Test Site" [e124daae3ea9f2799]
+  - heading "Checkboxes" [ecdd814db]
+  - checkbox [e91f35187] (unchecked)
+  - checkbox [e91f35187-2] (checked)
+  - link "Example Test Site" [e124daae3]

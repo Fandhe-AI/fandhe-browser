@@ -1,7 +1,7 @@
 - document "Login Page"
-  - heading "Login Page" [e59c6dd5251e72d4a]
-  - heading "This is where you can log into the secure area. Enter dummy-user and dummy-pass to continue." [ee58116411c920e64]
-  - textbox "Username" [ebeb72b7112c3c6c8]
-  - textbox "Password" [ea9274c8151c72700]
-  - button "Login" [e7e730a2753f66c98]
-  - link "Example Test Site" [e124daae3ea9f2799]
+  - heading "Login Page" [e59c6dd52]
+  - heading "This is where you can log into the secure area. Enter dummy-user and dummy-pass to continue." [ee5811641]
+  - textbox "Username" [ebeb72b71]
+  - textbox "Password" [ea9274c81]
+  - button "Login" [e7e730a27]
+  - link "Example Test Site" [e124daae3]

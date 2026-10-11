@@ -1390,12 +1390,14 @@ mod tests {
         let Some(rest) = r.strip_prefix('e') else {
             return false;
         };
-        let hex: String = rest.chars().take(16).collect();
-        hex.len() == 16
-            && hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+        let hex_len = rest
+            .chars()
+            .take_while(|c| matches!(c, '0'..='9' | 'a'..='f'))
+            .count();
+        (8..=16).contains(&hex_len)
             && rest
                 .chars()
-                .skip(16)
+                .skip(hex_len)
                 .all(|c| matches!(c, '0'..='9' | 'a'..='z' | '-'))
     }
 
