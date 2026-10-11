@@ -8,6 +8,8 @@
 
 use reqwest::Url;
 
+use crate::page_net::{NetRejectKind, NetRejection, NetRequestKind};
+
 /// 種別ごとの診断の保持上限（件数）。超過分は [`BridgeDiagnostics::dropped`] に数える。
 pub const MAX_BRIDGE_DIAGNOSTICS: usize = 64;
 /// `console` で記録するページ由来文字列の上限（UTF-8 バイト。文字境界で切り詰める）。
@@ -248,6 +250,29 @@ impl std::fmt::Debug for TimerError {
     }
 }
 
+/// `fetch` / `XMLHttpRequest` のコールバックが投げた例外 1 件（[`MAX_CONSOLE_MESSAGE_BYTES`] で切り詰め済み。`JS-8`）。
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NetCallbackError {
+    /// 例外を投げたコールバックの発行元 API。
+    pub request: NetRequestKind,
+    /// 例外メッセージ（ページ由来。切り詰め後）。
+    pub message: String,
+    /// 切り詰めが起きたか。
+    pub truncated: bool,
+}
+
+// ページ由来の文字列は秘密を含み得るため、Debug には長さだけを出す。
+impl std::fmt::Debug for NetCallbackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetCallbackError")
+            .field("request", &self.request)
+            .field("message_len", &self.message.len())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
+}
+
 /// 無視した `location` の遷移系操作 1 件。URL 本文は持たず、種別と長さだけを残す。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -301,6 +326,14 @@ pub struct BridgeDiagnostics {
     pub timer_errors: Vec<TimerError>,
     /// 文字列ハンドラ（`setTimeout("code", ...)`）として渡され、評価せず無視した件数（`JS-7`）。
     pub timer_string_handlers_ignored: u64,
+    /// reject したページ内 fetch / XHR（先頭から [`MAX_BRIDGE_DIAGNOSTICS`] 件。URL は持たない。`JS-8`・`JS-6`）。
+    pub net_rejections: Vec<NetRejection>,
+    /// fetch / XHR のコールバック例外（先頭から [`MAX_BRIDGE_DIAGNOSTICS`] 件。`JS-8`）。
+    pub net_callback_errors: Vec<NetCallbackError>,
+    /// 累計レスポンス本文バイト数の上限に達したか（`JS-6`）。
+    pub net_limit_exceeded: bool,
+    /// `fetch` の init で無視したオプション（headers / credentials 等）の件数（`JS-8`）。
+    pub net_options_ignored: u64,
     /// 件数上限で保存しなかった診断の数。
     pub dropped: u64,
 }
@@ -333,6 +366,30 @@ impl BridgeDiagnostics {
             let (kept, truncated) = truncate_utf8(message, MAX_CONSOLE_MESSAGE_BYTES);
             self.timer_errors.push(TimerError {
                 source,
+                message: kept.to_owned(),
+                truncated,
+            });
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    pub(super) fn record_net_rejection(&mut self, request: NetRequestKind, kind: NetRejectKind) {
+        if matches!(kind, NetRejectKind::ResponseBytesLimit) {
+            self.net_limit_exceeded = true;
+        }
+        if self.net_rejections.len() < MAX_BRIDGE_DIAGNOSTICS {
+            self.net_rejections.push(NetRejection { request, kind });
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    pub(super) fn record_net_callback_error(&mut self, request: NetRequestKind, message: &str) {
+        if self.net_callback_errors.len() < MAX_BRIDGE_DIAGNOSTICS {
+            let (kept, truncated) = truncate_utf8(message, MAX_CONSOLE_MESSAGE_BYTES);
+            self.net_callback_errors.push(NetCallbackError {
+                request,
                 message: kept.to_owned(),
                 truncated,
             });

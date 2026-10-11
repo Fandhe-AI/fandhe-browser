@@ -25,7 +25,9 @@
 //! `document` / `window` の最小 `addEventListener` とランナー用ディスパッチャー
 //! `__fandheLifecycle` を提供する。`timers.js`（#782・`JS-7`）は `setTimeout` / `setInterval` /
 //! `queueMicrotask` とランナー用ディスパッチャー `__fandheRunTimer` / `__fandheRunMicrotasks` を
-//! 提供する（期限・順序・上限の実体は core の `event_loop`）。
+//! 提供する（期限・順序・上限の実体は core の `event_loop`）。`net.js`（#783・`JS-8`）は GET だけの
+//! 最小の `fetch` / `XMLHttpRequest` とランナー用ディスパッチャー `__fandheNetDeliver` を提供する
+//! （取得・上限・SSRF 検査の実体は core の `page_net` と Fetcher）。
 
 use fandhe_browser_js::{EvaluateOptions, JsEngine, JsEngineError};
 
@@ -56,6 +58,10 @@ pub const JS_SHIM_SOURCES: &[JsShimSource] = &[
     JsShimSource {
         name: "timers.js",
         source: include_str!("timers.js"),
+    },
+    JsShimSource {
+        name: "net.js",
+        source: include_str!("net.js"),
     },
 ];
 

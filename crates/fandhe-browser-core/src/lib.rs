@@ -84,6 +84,7 @@
 //! - [`page_script`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。収集のみ。SVG の script・`language`・module 実行等は未実装）
 //! - [`page_runner`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。`src` 取得・総バイト上限・DOMContentLoaded / load 発火・仮想時間のタイマーループ（#782）まで実装済み。アクター化は #784）
 //! - [`dom_bridge`]（`JS-5`・`JS-6`・`TASK-108`・`MS-6`。`setInnerHTML` は `Document::set_inner_html` で置換する。DOM 操作以外の op は未実装）
+//! - [`page_net`]（`JS-8`・`JS-6`・`TASK-111`・`MS-6`・#783。ページ内 `fetch` / `XMLHttpRequest` の GET 最小版。取得は Fetcher 経由のみ。要求件数・累計バイトの上限。GET 以外・ヘッダ・CORS は未実装）
 //! - [`js_shim`]（`JS-5`・`TASK-108`・`MS-6`。window / location / navigator / console は #779）
 //! - [`js_stub`]（`JS-2`・`TASK-30`・`MS-3`）
 //! - [`render::DisabledRenderer`]（`RENDER-1`・`TASK-33`/`TASK-38`・`MS-1`/`MS-4`）
@@ -105,6 +106,7 @@ pub mod host;
 pub mod js_shim;
 pub mod js_stub;
 pub mod observability;
+pub mod page_net;
 pub mod page_runner;
 pub mod page_script;
 pub mod parse;
@@ -149,6 +151,10 @@ pub use observability::{
     DEFAULT_JSON_LINES_QUEUE_CAPACITY, FailureKind, InMemoryRecorder, JsonLinesRecorder,
     MAX_JSON_LINES_QUEUE_CAPACITY, OperationCounts, OperationKind, OperationOutcome,
     OperationRecord, OperationRecorder, RecorderHandle, StderrRecorder,
+};
+pub use page_net::{
+    DEFAULT_MAX_PAGE_NET_REQUESTS, DEFAULT_MAX_PAGE_NET_RESPONSE_BYTES, NetRejectKind,
+    NetRejection, NetReport, NetRequestKind, PageNetLimits,
 };
 pub use page_runner::{
     AbortKind, DEFAULT_MAX_SRC_SCRIPT_BYTES, DEFAULT_MAX_TOTAL_SCRIPT_BYTES,
