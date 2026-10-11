@@ -21,6 +21,8 @@
 | x86_64-unknown-linux-musl | `librusty_v8_release_x86_64-unknown-linux-musl.a.gz` | `68f284fb8184b9f9e8d7e23b8f2675dbe464f43f77c0bf152f705bf7ead29558` | `fb89ba94eb80ebeddb2828341f345d0196455a1da4fc120553abcdefb2532841` |
 | x86_64-pc-windows-msvc | `rusty_v8_release_x86_64-pc-windows-msvc.lib.gz` | `0b17ca072bae37dd4ff00e6014d2b413becb031c9342ee11cb8226a5881f62b2` | `b62b3d08cc4e1350275a97136efaffd5232fefdccd2597f193b817b80d58d627` |
 
+aarch64-unknown-linux-musl の prebuilt（TASK-64.3）も部品照合は未実施で、同梱部品の照合は別途行う（`docker/release-build.sh` には SHA-256 のピンのみ入れた）。
+
 macOS（aarch64-apple-darwin）の prebuilt は実測していない（`NOTICE` にも明記）。macOS で別の部品が入る可能性は未確認で、#486 などで最終バイナリの確認時に補う。
 
 ## 手法

@@ -1,7 +1,7 @@
 # fandhe-browser の配布コンテナ（既定: V8 のみ / 軽量: boa のみ）。
 #
-# TASK-64（64.1・64.2）・CTR-1・CTR-4・MS-5。fandhe-browser-cli を
-# x86_64-unknown-linux-musl の静的リンク単一バイナリとしてビルドし、scratch イメージに
+# TASK-64（64.1・64.2・64.3）・CTR-1・CTR-4・MS-5。fandhe-browser-cli を
+# musl の静的リンク単一バイナリ（x86_64 必須・aarch64 任意）としてビルドし、scratch イメージに
 # バイナリ・CA 証明書バンドル・ライセンス文書・データディレクトリだけを入れる。
 #   - default: 既定 feature（V8 のみ同梱）。--target 省略時もこちら（最終ステージ）。
 #   - lite:    --no-default-features --features js-boa（boa のみ同梱）。
@@ -9,6 +9,10 @@
 #
 # ビルド: docker build -f docker/Dockerfile.release --target default -t fandhe-browser:default .
 #         docker build -f docker/Dockerfile.release --target lite -t fandhe-browser:lite .
+# aarch64（任意。TASK-64.3）: `--platform linux/arm64` を付ける。BuildKit が TARGETARCH=arm64 を設定し、
+#   ビルダーのホスト三つ組が aarch64-unknown-linux-musl になる（クロスコンパイルはしない）。
+#         docker buildx build -f docker/Dockerfile.release --platform linux/arm64 --target default --load -t fandhe-browser:default-arm64 .
+#   x86_64 ホストでは QEMU（binfmt）が要り非常に遅いため、arm64 ネイティブホストでのビルドを推奨する。
 #   （ビルドコンテキストは docker/Dockerfile.release.dockerignore の allowlist で絞られる）
 #
 # 設計（container-cloud.md の決定 1〜5）:
@@ -24,19 +28,15 @@
 # digest（multi-arch manifest list）を転記する。ベースイメージを更新したら
 # NOTICE の CA 証明書の版の記載も見直す。
 #
-# RUSTY_V8_ARCHIVE_SHA256（build-default のみ。lite は v8 を使わない）は Cargo.lock の v8 =152.2.0 と連動する。v8 を更新するときは
-# rusty_v8 の該当リリースの librusty_v8_release_x86_64-unknown-linux-musl.a.gz の
-# SHA-256 に同時に差し替える。
-#
-# 後続: #299（TASK-64.3）が aarch64 を追加する。
+# V8 prebuilt の SHA-256 ピン（RUSTY_V8_ARCHIVE_SHA256）はアーキ別で docker/release-build.sh が持つ。
 FROM rust:1-alpine@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627 AS base
 
 # ビルド専用ツール（配布イメージには入らない）。curl は v8 の prebuilt 取得、
 # file / binutils は verify-* ステージの検査用、bash / jq は Cargo 依存のライセンス文書生成用。
 RUN apk add --no-cache musl-dev curl file binutils bash jq
 
-# 64.3 では値を足すだけで済むよう引数化する。
-ARG RUST_TARGET=x86_64-unknown-linux-musl
+# BuildKit が --platform から設定する（amd64 / arm64）。release-build.sh が三つ組へ写像する。
+ARG TARGETARCH
 
 WORKDIR /build
 # rust-toolchain.toml は意図的にコンテキストから外している（dockerignore 参照）。
@@ -47,21 +47,21 @@ COPY . .
 
 # 既定コンテナのビルド（V8）。feature は既定のまま。
 FROM base AS build-default
-# prebuilt（.gz）の完全性検証。不一致なら v8 の build.rs が失敗する。
-ENV RUSTY_V8_ARCHIVE_SHA256=68f284fb8184b9f9e8d7e23b8f2675dbe464f43f77c0bf152f705bf7ead29558
-# target キャッシュは並列ビルド時の競合を避けるためフレーバーごとに id を分ける。
+ARG TARGETARCH
+# target キャッシュは並列ビルド時の競合を避けるためフレーバー・アーキごとに id を分ける。
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target,id=fandhe-release-target-default \
-    docker/release-build.sh "${RUST_TARGET}" "" v8
+    --mount=type=cache,target=/build/target,id=fandhe-release-target-default-${TARGETARCH} \
+    docker/release-build.sh "${TARGETARCH}" "" v8
 
 # 軽量コンテナのビルド（boa）。フラグはここに固定し、--target lite だけでビルドできるようにする。
 # js-boa を --features で足すだけでは両エンジン同梱になる（CTR-1 違反）ため --no-default-features が必須。
 FROM base AS build-lite
+ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target,id=fandhe-release-target-lite \
-    docker/release-build.sh "${RUST_TARGET}" "--no-default-features --features js-boa" boa_engine
+    --mount=type=cache,target=/build/target,id=fandhe-release-target-lite-${TARGETARCH} \
+    docker/release-build.sh "${TARGETARCH}" "--no-default-features --features js-boa" boa_engine
 
 # 静的リンク検査（CTR-4・決定 5）。検査ロジックは docker/verify-static.sh。
 FROM build-default AS verify-default
