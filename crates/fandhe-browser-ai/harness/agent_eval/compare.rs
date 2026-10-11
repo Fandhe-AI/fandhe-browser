@@ -13,8 +13,8 @@
 //!
 //! # 呼び出し元と責務境界
 //!
-//! - 呼び出し元: `compare_tests.rs`。後続の #126（TASK-22.3）が同ファイルへ差分算出・レポート生成を
-//!   追記する。2 方式の差・−5pt 判定・和集合分母の揃えは本モジュールでは行わない。
+//! - 呼び出し元: `compare_tests.rs`。末尾の「差分算出・レポート生成」節（TASK-22.3・Issue #126）が
+//!   2 方式の採点結果から差（pt）・−5pt 判定・和集合除外後の集計を算出し、Markdown / JSON を出力する。
 //! - 取り込み側ルートが `tasks`・`generate_reduced`・`score` を同名 mod で `#[path]` 宣言している前提で
 //!   `crate::` 参照する。
 //!
@@ -22,6 +22,8 @@
 //!
 //! - 実回答の収集は手動。本モジュールの完全性検査が通ることは「25 × 2 の回答が揃った」ことしか
 //!   意味せず、成功率の比較結果ではない。
+//! - レポート生成器（TASK-22.3）は合成回答で検算済みだが、実測結果は持たない。実測は親 #122、
+//!   結果判定は人間レビュー（#127）が行う。
 //! - 指示テンプレートは日本語。エージェントへの入力データであり、プログラムの出力文字列ではない
 //!   （タスク文 `prompt` が日本語であることに揃える）。
 //!
@@ -30,12 +32,15 @@
 //! パケット・回答・結合 JSON はコミットしない。[`write_packets`] と [`write_merged`] は出力先が
 //! リポジトリ配下なら拒否する（誤コミット防止。fail-closed）。
 
-use crate::generate_reduced::{GenerateError, InputMode, task_inputs};
-use crate::score::{
-    Answer, MAX_INPUT_BYTES, RawAnswer, ScoreError, parse_answers, parse_raw_answers,
+use crate::generate_reduced::{
+    GenerateError, InputMode, raw_dom_documents, resolve_golden, task_inputs, task_pages,
 };
-use crate::tasks::{Category, TASKS, Task};
-use std::collections::BTreeMap;
+use crate::score::{
+    Answer, MAX_INPUT_BYTES, RawAnswer, ScoreError, Tally, TaskResult, golden_unresolved_ids,
+    parse_answers, parse_raw_answers, resolve_raw_dom, score, summarize,
+};
+use crate::tasks::{Category, GOLDEN, TASKS, Task};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -57,6 +62,14 @@ pub enum CompareError {
     },
     /// 出力先がリポジトリ配下・相対パス等で拒否された。
     OutDirRejected(String),
+    /// 採点（`score`）の失敗。
+    Score(ScoreError),
+    /// 回収が不完全（欠落・不受理あり）な状態でのレポート生成要求。
+    Incomplete,
+    /// レポートのメタ情報が不正（長さ超過・禁止文字）。
+    InvalidMeta(String),
+    /// 結果の id 集合が一致しない等、比較できない入力。
+    Mismatched(String),
 }
 
 impl fmt::Display for CompareError {
@@ -65,6 +78,10 @@ impl fmt::Display for CompareError {
             Self::Generate(e) => write!(f, "input generation failed: {e}"),
             Self::Io { path, source } => write!(f, "cannot write {}: {source}", path.display()),
             Self::OutDirRejected(r) => write!(f, "output directory rejected: {r}"),
+            Self::Score(e) => write!(f, "scoring failed: {e}"),
+            Self::Incomplete => write!(f, "answers are incomplete; refusing to build a report"),
+            Self::InvalidMeta(r) => write!(f, "invalid report metadata: {r}"),
+            Self::Mismatched(r) => write!(f, "results cannot be compared: {r}"),
         }
     }
 }
@@ -74,6 +91,12 @@ impl std::error::Error for CompareError {}
 impl From<GenerateError> for CompareError {
     fn from(e: GenerateError) -> Self {
         Self::Generate(e)
+    }
+}
+
+impl From<ScoreError> for CompareError {
+    fn from(e: ScoreError) -> Self {
+        Self::Score(e)
     }
 }
 
@@ -678,6 +701,435 @@ pub fn write_merged(c: &Collected, out_dir: &Path) -> Result<Vec<PathBuf>, Compa
     for (name, content) in [
         ("answers-reduced.json", &c.reduced_json),
         ("answers-raw.json", &c.raw_json),
+    ] {
+        let path = out_dir.join(name);
+        write_file(&path, content)?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+// ---- 差分算出・レポート生成（TASK-22.3・`AISNAP-9`・Issue #126） ----
+//
+// 呼び出し元は `compare_tests.rs` の実験用入口。入力は本モジュールの [`collect`] の結果で、
+// 採点は `score` に委ねる。純関数層（[`compare_results`]）と I/O 層（[`build_report`]・[`write_report`]）を分ける。
+
+/// 簡約方式の成功率が生 DOM 方式に対して許容される差の下限（pt。`AISNAP-9`: 差 −5pt 以内）。
+pub const DIFF_THRESHOLD_POINTS: i64 = -5;
+
+/// 同一区分における 2 方式の集計。差は常に「簡約 − 生 DOM」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MethodDiff {
+    pub reduced: Tally,
+    pub raw: Tally,
+}
+
+impl MethodDiff {
+    fn comparable(&self) -> bool {
+        self.reduced.total > 0 && self.reduced.total == self.raw.total
+    }
+
+    /// 差（簡約 − 生 DOM）を千分率で返す。ゼロから遠い側へ丸め、符号は対称。
+    /// 分母が 0、または 2 方式で一致しないときは `None`（fail-closed）。
+    pub fn diff_permille(&self) -> Option<i64> {
+        if !self.comparable() {
+            return None;
+        }
+        let total = i64::from(self.reduced.total);
+        let n = (i64::from(self.reduced.pass) - i64::from(self.raw.pass)) * 1000;
+        let q = (n.abs() * 2 + total) / (2 * total);
+        Some(if n < 0 { -q } else { q })
+    }
+
+    /// `"+0.0"` / `"-8.0"` / `"+33.3"` 形式。算出できなければ `"n/a"`。
+    pub fn diff_text(&self) -> String {
+        match self.diff_permille() {
+            Some(p) => {
+                let sign = if p < 0 { '-' } else { '+' };
+                format!("{sign}{}.{}", p.abs() / 10, p.abs() % 10)
+            }
+            None => "n/a".to_owned(),
+        }
+    }
+
+    /// 差が `threshold_points`（pt）以上か。丸め前の整数比較で、算出できない場合は未達。
+    pub fn meets(&self, threshold_points: i64) -> bool {
+        if !self.comparable() {
+            return false;
+        }
+        let d = i64::from(self.reduced.pass) - i64::from(self.raw.pass);
+        d * 100 >= threshold_points * i64::from(self.reduced.total)
+    }
+}
+
+/// タスク 1 件の 2 方式対比（付録用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRow {
+    pub id: String,
+    pub category: Category,
+    pub page: &'static str,
+    /// 先に提示した方式（割付表）。
+    pub first: InputMode,
+    pub reduced: TaskResult,
+    pub raw: TaskResult,
+}
+
+/// 除外条件を揃えた集計。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComparisonSummary {
+    /// 両方式から除いたタスク id（昇順）。
+    pub excluded: Vec<String>,
+    pub overall: MethodDiff,
+    pub by_category: [(Category, MethodDiff); 4],
+    /// `task_pages()` の順。
+    pub by_page: Vec<(&'static str, MethodDiff)>,
+    /// 全体の差が [`DIFF_THRESHOLD_POINTS`] 以上か。
+    pub meets: bool,
+}
+
+/// 比較レポートの計算結果。実測値を持つのは呼び出し側が実回答を渡したときだけ（REPAIR-3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComparisonReport {
+    pub rows: Vec<TaskRow>,
+    /// `golden_unresolved` を含む集計。主判定に使う。
+    pub including: ComparisonSummary,
+    /// 2 方式の `golden_unresolved` の和集合を両方式から除いた集計。常に併記する。
+    pub excluding_union: ComparisonSummary,
+    pub threshold_points: i64,
+}
+
+fn id_set(results: &[TaskResult]) -> Option<BTreeSet<&str>> {
+    let set: BTreeSet<&str> = results.iter().map(|r| r.id.as_str()).collect();
+    (set.len() == results.len()).then_some(set)
+}
+
+fn tally_pages(
+    tasks: &[Task],
+    results: &[TaskResult],
+    exclude: &BTreeSet<String>,
+) -> BTreeMap<&'static str, Tally> {
+    let mut m: BTreeMap<&'static str, Tally> = BTreeMap::new();
+    for r in results {
+        if exclude.contains(&r.id) {
+            continue;
+        }
+        if let Some(t) = tasks.iter().find(|t| t.id == r.id) {
+            let e = m.entry(t.page).or_default();
+            e.total += 1;
+            e.pass += u32::from(r.pass);
+        }
+    }
+    m
+}
+
+fn build_summary(
+    tasks: &[Task],
+    reduced: &[TaskResult],
+    raw: &[TaskResult],
+    exclude: &BTreeSet<String>,
+) -> ComparisonSummary {
+    let (sr, sw) = (summarize(reduced, exclude), summarize(raw, exclude));
+    let overall = MethodDiff {
+        reduced: sr.overall,
+        raw: sw.overall,
+    };
+    let by_category = std::array::from_fn(|i| {
+        let (c, tr) = sr.by_category[i];
+        let tw = sw.by_category[i].1;
+        (
+            c,
+            MethodDiff {
+                reduced: tr,
+                raw: tw,
+            },
+        )
+    });
+    let (pr, pw) = (
+        tally_pages(tasks, reduced, exclude),
+        tally_pages(tasks, raw, exclude),
+    );
+    let by_page = task_pages()
+        .into_iter()
+        .map(|p| {
+            let d = MethodDiff {
+                reduced: pr.get(p).copied().unwrap_or_default(),
+                raw: pw.get(p).copied().unwrap_or_default(),
+            };
+            (p, d)
+        })
+        .collect();
+    ComparisonSummary {
+        excluded: sr.excluded,
+        overall,
+        by_category,
+        by_page,
+        meets: overall.meets(DIFF_THRESHOLD_POINTS),
+    }
+}
+
+/// 2 方式の採点結果（`score()` の `results`）から差分とレポート用集計を作る（純関数）。
+///
+/// 両方式の id 集合が `tasks` と一致しなければ `Err`。
+pub fn compare_results(
+    tasks: &[Task],
+    reduced: &[TaskResult],
+    raw: &[TaskResult],
+) -> Result<ComparisonReport, CompareError> {
+    let expected: BTreeSet<&str> = tasks.iter().map(|t| t.id).collect();
+    let ok = expected.len() == tasks.len()
+        && id_set(reduced).is_some_and(|s| s == expected)
+        && id_set(raw).is_some_and(|s| s == expected);
+    if !ok {
+        return Err(CompareError::Mismatched(
+            "result ids do not match the task set".to_owned(),
+        ));
+    }
+    let union: BTreeSet<String> = golden_unresolved_ids(reduced)
+        .union(&golden_unresolved_ids(raw))
+        .cloned()
+        .collect();
+    let mut rows = Vec::with_capacity(tasks.len());
+    for a in &allocation(tasks) {
+        let find = |rs: &[TaskResult]| rs.iter().find(|r| r.id == a.id).cloned();
+        let (Some(r), Some(w)) = (find(reduced), find(raw)) else {
+            return Err(CompareError::Mismatched("missing task result".to_owned()));
+        };
+        rows.push(TaskRow {
+            id: a.id.to_owned(),
+            category: a.category,
+            page: a.page,
+            first: a.first,
+            reduced: r,
+            raw: w,
+        });
+    }
+    Ok(ComparisonReport {
+        rows,
+        including: build_summary(tasks, reduced, raw, &BTreeSet::new()),
+        excluding_union: build_summary(tasks, reduced, raw, &union),
+        threshold_points: DIFF_THRESHOLD_POINTS,
+    })
+}
+
+/// 回収結果を両方式で採点し、比較レポートを作る。回収が不完全なら `Err(Incomplete)`。
+///
+/// 欠落回答は採点上 `Unanswered` として数えられ率が黙って歪むため、ここで拒否する（fail-closed）。
+pub fn build_report(fixtures_dir: &Path, c: &Collected) -> Result<ComparisonReport, CompareError> {
+    if !c.status.is_complete() {
+        return Err(CompareError::Incomplete);
+    }
+    let resolved = resolve_golden(fixtures_dir)?;
+    let red = score(&TASKS, &GOLDEN, &resolved, &c.reduced)?;
+    let pages = raw_dom_documents(fixtures_dir)?;
+    let (res, ans) = resolve_raw_dom(&TASKS, &GOLDEN, &pages, &c.raw)?;
+    let raw = score(&TASKS, &GOLDEN, &res, &ans)?;
+    compare_results(&TASKS, &red.results, &raw.results)
+}
+
+/// レポート冒頭に載せる実施情報。外部入力（環境変数）なので長さと文字を検証する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportMeta {
+    pub base_commit: String,
+    pub date: String,
+    pub model: String,
+    pub issues: String,
+}
+
+/// メタ情報 1 値の最大バイト数。
+pub const MAX_META_BYTES: usize = 128;
+
+fn check_meta(name: &str, v: Option<&str>) -> Result<String, CompareError> {
+    let Some(v) = v.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok("未記入".to_owned());
+    };
+    if v.len() > MAX_META_BYTES {
+        return Err(CompareError::InvalidMeta(format!("{name} is too long")));
+    }
+    if v.chars()
+        .any(|c| c.is_control() || matches!(c, '|' | '<' | '>'))
+    {
+        return Err(CompareError::InvalidMeta(format!(
+            "{name} contains a forbidden character"
+        )));
+    }
+    Ok(v.to_owned())
+}
+
+impl ReportMeta {
+    /// 未指定は `"未記入"` で埋める。`|`・`<`・`>`・制御文字を含む値と 128 バイト超は拒否する
+    /// （Markdown 表・HTML への注入防止）。
+    pub fn from_parts(
+        base_commit: Option<&str>,
+        date: Option<&str>,
+        model: Option<&str>,
+        issues: Option<&str>,
+    ) -> Result<Self, CompareError> {
+        Ok(Self {
+            base_commit: check_meta("base_commit", base_commit)?,
+            date: check_meta("date", date)?,
+            model: check_meta("model", model)?,
+            issues: check_meta("issues", issues)?,
+        })
+    }
+}
+
+fn judge_text(meets: bool) -> &'static str {
+    if meets { "達成" } else { "未達" }
+}
+
+fn diff_row(label: &str, d: &MethodDiff) -> String {
+    format!(
+        "| {label} | {} | {} | {} | {} | {} | {} |\n",
+        d.reduced.total,
+        d.reduced.pass,
+        d.reduced.rate_text(),
+        d.raw.pass,
+        d.raw.rate_text(),
+        d.diff_text()
+    )
+}
+
+fn summary_tables(s: &ComparisonSummary) -> String {
+    let mut o = String::from(
+        "| 区分 | 件数 | 簡約 合格 | 簡約 率 | 生 DOM 合格 | 生 DOM 率 | 差 (pt) |\n\
+         | ---- | ---- | --------- | ------- | ----------- | --------- | ------- |\n",
+    );
+    o.push_str(&diff_row("全体", &s.overall));
+    for (c, d) in &s.by_category {
+        o.push_str(&diff_row(c.as_str(), d));
+    }
+    o.push_str(
+        "\n| ページ | 件数 | 簡約 合格 | 生 DOM 合格 | 差 (pt) |\n\
+         | ------ | ---- | --------- | ----------- | ------- |\n",
+    );
+    for (p, d) in &s.by_page {
+        o.push_str(&format!(
+            "| {p} | {} | {} | {} | {} |\n",
+            d.reduced.total,
+            d.reduced.pass,
+            d.raw.pass,
+            d.diff_text()
+        ));
+    }
+    o
+}
+
+fn result_cell(r: &TaskResult) -> String {
+    match r.failure {
+        None => "合格".to_owned(),
+        Some(f) => format!("不合格 ({})", f.as_str()),
+    }
+}
+
+/// 比較レポートを Markdown で返す（設計書「記録様式」の順序。LF・末尾改行 1 つ）。
+pub fn render_report_markdown(r: &ComparisonReport, meta: &ReportMeta) -> String {
+    let mut s = String::new();
+    s.push_str("# AISNAP-9 比較測定レポート\n\n");
+    s.push_str(&format!(
+        "- 対象: `AISNAP-9`・TASK-22・MS-2\n- 基準コミット: {}\n- 実施日: {}\n- 使用モデル: {}\n- 関連 Issue: {}\n\n",
+        meta.base_commit, meta.date, meta.model, meta.issues
+    ));
+    s.push_str("## 測定方法\n\n`docs/design/aisnap-comparison-experiment.md` の手順に従い、同一の 25 タスクを簡約方式と生 DOM 方式で解かせた。差は「簡約 − 生 DOM」で、判定式は差 ≥ −5pt（丸め前の整数比較）。\n\n");
+    s.push_str("## 結果\n\n### 全体・種別別・ページ別（golden_unresolved を含む。主判定）\n\n");
+    s.push_str(&summary_tables(&r.including));
+    s.push_str("\n### 2 方式の golden_unresolved の和集合を除いた集計（併記）\n\n");
+    if r.excluding_union.excluded.is_empty() {
+        s.push_str("除外タスク: なし\n\n");
+    } else {
+        s.push_str(&format!(
+            "除外タスク: {}\n\n",
+            r.excluding_union.excluded.join(", ")
+        ));
+    }
+    s.push_str(&summary_tables(&r.excluding_union));
+    s.push_str(&format!(
+        "\n## 判定\n\n- 主判定（除外なし）: 差 {} pt → {}（しきい値 {}pt）\n- 除外後: 差 {} pt → {}\n\n",
+        r.including.overall.diff_text(),
+        judge_text(r.including.meets),
+        r.threshold_points,
+        r.excluding_union.overall.diff_text(),
+        judge_text(r.excluding_union.meets)
+    ));
+    s.push_str("## 限界\n\n- 粒度が粗い: 25 件のため 1 件 = 4pt で、しきい値 −5pt は 1 件差までを許容し、2 件差（−8pt）で未達になる。\n- 簡約方式に甘い: 簡約方式の ref は生成側が付与したもので、回答者に有利な形で提示される。生 DOM 方式はセレクタ構文の制約で不利になりうる。結果は人間レビュー（#127）で解釈する。\n- 回答者は独立したサブエージェントによる手動実行で、試行のばらつきは考慮していない。\n\n");
+    s.push_str("## 付録\n\n### タスク別結果\n\n| タスク id | 種別 | ページ | 先に提示した方式 | 簡約 | 生 DOM |\n| --------- | ---- | ------ | ---------------- | ---- | ------ |\n");
+    for t in &r.rows {
+        s.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            t.id,
+            t.category.as_str(),
+            t.page,
+            mode_label(t.first),
+            result_cell(&t.reduced),
+            result_cell(&t.raw)
+        ));
+    }
+    s.push_str("\n### 割付表\n\n");
+    s.push_str(&render_allocation_markdown(&allocation(&TASKS)));
+    s
+}
+
+fn diff_json(d: &MethodDiff) -> serde_json::Value {
+    serde_json::json!({
+        "reduced": {"pass": d.reduced.pass, "total": d.reduced.total, "rate": d.reduced.rate_text()},
+        "raw": {"pass": d.raw.pass, "total": d.raw.total, "rate": d.raw.rate_text()},
+        "diff_points": d.diff_text(),
+    })
+}
+
+fn summary_json(s: &ComparisonSummary) -> serde_json::Value {
+    serde_json::json!({
+        "excluded": s.excluded,
+        "overall": diff_json(&s.overall),
+        "by_category": s.by_category.iter().map(|(c, d)| {
+            let mut v = diff_json(d);
+            v["category"] = c.as_str().into();
+            v
+        }).collect::<Vec<_>>(),
+        "by_page": s.by_page.iter().map(|(p, d)| {
+            let mut v = diff_json(d);
+            v["page"] = (*p).into();
+            v
+        }).collect::<Vec<_>>(),
+        "meets": s.meets,
+    })
+}
+
+/// 機械可読な JSON（英語キー）。回答本文は含めない。
+pub fn render_report_json(r: &ComparisonReport) -> String {
+    let rows: Vec<serde_json::Value> = r
+        .rows
+        .iter()
+        .map(|t| {
+            let f = |x: &TaskResult| x.failure.map(|c| c.as_str());
+            serde_json::json!({
+                "id": t.id,
+                "category": t.category.as_str(),
+                "page": t.page,
+                "first": mode_key(t.first),
+                "reduced": {"pass": t.reduced.pass, "failure": f(&t.reduced)},
+                "raw": {"pass": t.raw.pass, "failure": f(&t.raw)},
+            })
+        })
+        .collect();
+    let v = serde_json::json!({
+        "threshold_points": r.threshold_points,
+        "including": summary_json(&r.including),
+        "excluding_union": summary_json(&r.excluding_union),
+        "rows": rows,
+    });
+    let mut s = serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".to_owned());
+    s.push('\n');
+    s
+}
+
+/// `comparison-report.md`・`comparison-report.json` を `out_dir` へ書く。
+/// 出力先の制約は [`write_packets`] と同じ（リポジトリ外の絶対パス・シンボリックリンク拒否）。
+pub fn write_report(md: &str, json: &str, out_dir: &Path) -> Result<Vec<PathBuf>, CompareError> {
+    check_out_dir_here(out_dir)?;
+    create_dir(out_dir)?;
+    let mut paths = Vec::new();
+    for (name, content) in [
+        ("comparison-report.md", md),
+        ("comparison-report.json", json),
     ] {
         let path = out_dir.join(name);
         write_file(&path, content)?;

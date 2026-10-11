@@ -141,7 +141,7 @@ AGENT_EVAL_ANSWERS=/abs/path/answers.json cargo test -p fandhe-browser-ai --test
 - 照合は「生 DOM（`serialize_raw_dom` の出力）を再パースした Document」上で、回答と golden の両ロケータを解決し、**要素の同一性**で比べる（セレクタ文字列の一致ではない。`#login` と `button[type=submit]` が同じ要素なら合格）。`raw_dom_documents` が Document を返し、`score::resolve_raw_dom` が要素キーへ解決して既存の `score` へ渡す。
 - extract の value と form の action・value・順序・手順数は簡約方式と同じ基準。
 - 分類: `selector` / `index` / `value` / `steps` がすべて欠落または null は `unanswered`。片方だけ・負数・小数・文字列の index・`ref` の混入・排他フィールドの同居は `invalid_shape`。セレクタの構文エラー・未対応構文も `invalid_shape`。index が一致件数以上は `mismatch`。
-- 暫定（REPAIR-3）: core のセレクタは一部の構文にしか対応しない（`*`・疑似クラス・`+` / `~`・`$=` `*=` `~=` `|=`・エスケープは未対応）。生 DOM 方式に不利に働きうるため、指示テンプレート（#125）で使用可能な構文を明示する。差の計算と −5pt 判定は #126（TASK-22.3）の担当。
+- 暫定（REPAIR-3）: core のセレクタは一部の構文にしか対応しない（`*`・疑似クラス・`+` / `~`・`$=` `*=` `~=` `|=`・エスケープは未対応）。生 DOM 方式に不利に働きうるため、指示テンプレート（#125）で使用可能な構文を明示する。差の計算と −5pt 判定は `compare.rs`（#126・TASK-22.3。「比較レポート」節）が担う。
 - 集計は 2 種類を出す。`ScoreReport` の `overall` / `by_category` は `golden_unresolved` を含み、`excluding_golden_unresolved`（`results.json` の同名キー）はそれを分母から除く。`excluded` に除外 id を列挙し、`summarize` へ任意の除外集合を渡せる（#126 が 2 方式の和集合で分母を揃える入口）。
 
 | 成果物 | 置き場所 | コミット |
@@ -150,7 +150,7 @@ AGENT_EVAL_ANSWERS=/abs/path/answers.json cargo test -p fandhe-browser-ai --test
 | 回答 JSON（方式別） | 実施者のローカル（リポ外）。必要なら #122 または結果レポートの PR に添付・リンク | しない（実回答はリポジトリに含めない） |
 | 採点結果 | stdout。必要ならリポ外へ保存し、集計値を結果レポートへ転記 | しない |
 | 割付表 | 実験中はリポ外で回答者に渡さない。実施後に結果レポートの付録へ転記 | レポートの一部として載せる（生成コードは #125） |
-| 結果レポート | `docs/design/aisnap9-comparison-report.md`（作成は #126・TASK-22.3） | する |
+| 結果レポート | `docs/design/aisnap9-comparison-report.md`（生成器は #126・TASK-22.3。実測後に転記して作成） | する |
 
 ```bash
 # 実回答（生 DOM 方式）を採点して結果を stdout へ出す（リポ内へは書かない）
@@ -159,7 +159,7 @@ AGENT_EVAL_RAW_ANSWERS=/abs/path/raw-answers.json cargo test -p fandhe-browser-a
 
 ## 比較実行（TASK-22.2）
 
-`AISNAP-9`・Issue #125・`MS-2`。簡約方式と生 DOM 方式を同じ 25 タスクで解かせるための**実行支援と回収検査**で、LLM は呼ばない（API 経由の自動実行は採らない。#123 のオーナー判断）。回答者は会話を共有しない独立したサブエージェントによる手動実行（1 実行 = 1 タスク × 1 方式、計 50 実行）。2 方式の差・−5pt 判定は #126（TASK-22.3）の担当で、`compare.rs` にはまだ無い。
+`AISNAP-9`・Issue #125・`MS-2`。簡約方式と生 DOM 方式を同じ 25 タスクで解かせるための**実行支援と回収検査**で、LLM は呼ばない（API 経由の自動実行は採らない。#123 のオーナー判断）。回答者は会話を共有しない独立したサブエージェントによる手動実行（1 実行 = 1 タスク × 1 方式、計 50 実行）。2 方式の差・−5pt 判定は「比較レポート（TASK-22.3）」節を参照。
 
 - 割付表: `allocation`。id 昇順の通し位置が偶数なら簡約先・奇数なら生 DOM 先（種別ごとの交互割当と同値。全体 13 対 12・種別内の偏り最大 1）。実行番号は 1〜50。
 - 指示テンプレート: `instruction`。生 DOM 方式では使用可能な CSS セレクタ構文を明示する（core のサブセット。テンプレートの例は `aisnap9_raw_template_selectors_match_core` が core の実装と突き合わせる）。`select` の value は option の value 属性値と両方式で同一文言にする。golden・比較の意図は含めない。
@@ -178,3 +178,22 @@ AGENT_EVAL_COMPARE_ANSWERS=/abs/answers AGENT_EVAL_COMPARE_MERGED_OUT=/abs/merge
 
 - 回答ファイルは 1 件 32 KiB まで。`id` がファイル名と一致し、`score.rs` の既存検証（件数・文字列長・形式）を通ったものだけを受理する。`unanswered`（null）は正当な回答として数え、形式不備（`invalid`）は採点で `invalid_shape` になるため回収上は受理する。
 - 実回答・パケット・結合 JSON はコミットしない。割付表は実施後に結果レポート付録へ転記する。
+
+## 比較レポート（TASK-22.3）
+
+`AISNAP-9`・Issue #126・`MS-2`。回収した 2 方式の回答を採点し、成功率・差（pt）・−5pt 判定・種別別とページ別の内訳・和集合除外後の集計を Markdown と JSON で出す（`compare.rs` の `build_report` / `render_report_markdown` / `render_report_json`）。LLM は呼ばない。
+
+- 差は「簡約 − 生 DOM」。判定式は差 ≥ −5pt で、丸め前の整数比較（`(簡約合格 − 生 DOM 合格) × 100 ≥ −5 × 件数`）。25 件なら 1 件差（−4.0pt）は達成、2 件差（−8.0pt）は未達。表示の差は千分率でゼロから遠い側へ丸める。
+- 主判定は `golden_unresolved` を含む集計。2 方式の `golden_unresolved` の和集合を両方式から除いた集計を常に併記する（#123 の決定）。分母が 0 または 2 方式で不一致の行は `n/a`・未達。
+- 回収が不完全（欠落・不受理）ならレポートを作らず失敗する（fail-closed）。
+- 暫定（REPAIR-3）: 生成器は合成回答で検算済みで、実測値を持たない。50 実行は親 #122、結果判定は人間レビュー（#127）。実測後に出力を `docs/design/aisnap9-comparison-report.md` へ転記する（実測前には作成しない）。
+
+```bash
+# 回収済みの回答からレポートを生成して stdout へ出す。REPORT_OUT があればリポ外の絶対パスへ 2 ファイルを書く
+AGENT_EVAL_COMPARE_ANSWERS=/abs/answers AGENT_EVAL_COMPARE_REPORT_OUT=/abs/report \
+  AGENT_EVAL_REPORT_COMMIT=<sha> AGENT_EVAL_REPORT_DATE=<yyyy-mm-dd> AGENT_EVAL_REPORT_MODEL=<model> AGENT_EVAL_REPORT_ISSUES='#122 #126' \
+  cargo test -p fandhe-browser-ai --test agent_eval_compare -- --nocapture aisnap9_report_if_requested
+```
+
+- メタ情報の環境変数（`AGENT_EVAL_REPORT_COMMIT` / `_DATE` / `_MODEL` / `_ISSUES`）は各 128 バイト以下で、`|`・`<`・`>`・制御文字を含む値は拒否する。未指定は「未記入」。
+- 出力（`comparison-report.md` / `.json`）はコミットしない。
