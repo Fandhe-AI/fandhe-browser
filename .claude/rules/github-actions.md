@@ -41,11 +41,71 @@ lefthook との重複回避は [git-hooks](./git-hooks.md) を参照する。本
 3. 各ステップは `if: ${{ !cancelled() }}` で独立に走らせ、1 回の実行で全指摘を得る（既存方針）
 4. 検査コマンドは `make <target>` か `scripts/*.sh` を呼ぶ。CI 独自にロジックを書かない（ツール版は `scripts/versions.sh`）
 5. checkout は `persist-credentials: false`。`fetch-depth: 0` は差分・commit 範囲が要る `changes`・`lint-docs` のみ
-6. Rust ジョブは `actions/cache`（`target` は `scripts/ci-prune-target.sh` で workspace 成果物を除いてから保存。Windows は除外）と `CARGO_INCREMENTAL=0`
-7. action はコミット SHA で固定し（`# vX.Y.Z` コメント付き）、新規 action は安易に追加しない（cache は `actions/cache`、toolchain は `dtolnay/rust-toolchain` のみ）。`permissions` は最小権限で明示し、`timeout-minutes` を必ず設定する
+6. Rust ジョブは `actions/cache/restore` + `actions/cache/save`（保存は main のみ。`target` は `scripts/ci-prune-target.sh` で workspace 成果物を除いてから保存。Windows は除外）と `CARGO_INCREMENTAL=0`・`CARGO_PROFILE_DEV_DEBUG=line-tables-only`。key・保存条件は後述「キャッシュ方針」に従う
+7. action はコミット SHA で固定し（`# vX.Y.Z` コメント付き）、新規 action は安易に追加しない（cache は `actions/cache`〔`/restore`・`/save` を含む〕、toolchain は `dtolnay/rust-toolchain` のみ）。`permissions` は最小権限で明示し、`timeout-minutes` を必ず設定する
 8. `run:` に `${{ }}` を直接埋め込まず `env:` 経由で渡す。secrets を PR ログへ出さない
 9. lefthook と同じ検査を CI に足さない／CI にある検査をフックに足さない（[git-hooks](./git-hooks.md)）
 10. 所要時間の目安: PR の `ci.yml` 全体は約 11 分以内、`lint-docs`・`changes`・`rust-lint` は 30 秒未満。超える見込みなら PR 本文に理由を書く
+
+## キャッシュ方針
+
+GitHub Actions の cache はリポジトリ単位で上限があり、超えると最終アクセスが古いものから追い出される（7 日間アクセスが無いものは削除）。
+本リポジトリの上限は **20GB**（2026-10-11 に 10GB から引き上げ）。Actions の予算は **$10/月（超過時停止）** で、**10GB を超えた分は 1GB あたり月 $0.07 の課金**になる。
+目標は「1 世代（全 cache 種別の合計。現状約 6〜7GB）を常時 10GB 以内に収め、key 切り替え（`Cargo.lock`・rustc・`-vN` の変更）で新旧 2 世代が並ぶ間だけ 20GB の枠で吸収する」こと。旧世代は参照されなくなってから 7 日で消え、その間の 10GB 超過分だけが課金される（例: 超過 4GB × 7 日 ≈ $0.07）。新しい cache 種別の追加で常時 10GB を超える構成にしない。
+
+### key 設計
+
+- 形式は `rust-<runner.os>-<種別>-vN-<rustc cachekey>-<hashFiles('Cargo.lock')>`（`cross` は registry のみのため rustc を含めない）。restore-keys は `rust-<runner.os>-<種別>-vN-<rustc cachekey>-` までにする
+- lockfile は **ルートの `Cargo.lock` だけ** を hash する。`hashFiles('**/Cargo.lock')` は `.agents/skills/**/samples` 等の無関係な lockfile まで拾い、依存が変わらないのに全 cache を作り直す（2026-10-11 に #859 のスキル追加で約 7.1GB の新世代が作られ、旧世代が LRU で追い出された）
+- rustc 版（`dtolnay/rust-toolchain` の出力 `cachekey`。step に `id: toolchain` を付ける）を key に含め、restore-keys も同じ rustc に限る。`rust-toolchain.toml` は `stable` 追従のため、含めないと stable 更新後に古い rustc の target を exact hit で復元し続け、再保存もされず依存を毎回ビルドし直す
+- key・restore-keys に SHA・run_id・日付などの一意値を入れない（毎回 miss して保存し、cache を食い潰す）
+- cache 内容（path・ビルド条件・prune の仕方）を変えたら `-vN` を上げる。restore-keys に旧 `-vN` を残さない
+
+### 保存は main のみ
+
+- 復元は `actions/cache/restore`（全イベント）、保存は `actions/cache/save` を `if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}` で行う。`actions/cache`（post で自動保存）を Rust の大きな cache に使わない
+- PR が保存した cache はその PR（`refs/pull/<n>/merge`）からしか読めず、main の cache と同内容の重複になって main の cache を追い出す。PR は main の cache を読むだけにする
+- トレードオフ: `Cargo.lock` を変える PR は、2 回目以降の push でも main の旧 lock の cache から部分復元し、変わった依存だけ毎回ビルドし直す（2026-10-11 の実測では依存が同じ PR の部分復元と exact hit で依存の再コンパイルは 0 件・所要時間差は誤差の範囲）
+- `ci.yml` の concurrency は main でも `cancel-in-progress: true` のため、取り消された main の run は保存しない。新しい key の cache は、その後最初に完走した main の run が保存する
+- 例外: `rust-lint` の cargo-deny 導入 cache（約 5MB・版のみの key で作り直しが起きない）は `actions/cache` のままでよい
+
+### サイズ削減
+
+- `target` は保存前に `scripts/ci-prune-target.sh` で workspace メンバーの成果物を除く（依存 crate の成果物だけ残す）。同スクリプトは最後に cache 対象の展開後サイズ（`du -sh`）を出す
+- cache を使う Rust ジョブは `CARGO_INCREMENTAL=0` と `CARGO_PROFILE_DEV_DEBUG=line-tables-only`（依存の debuginfo を行番号のみにする。CI 限定で `Cargo.toml` は変えない。release・bench には影響しない）
+- target を cache しても効果が無いジョブは registry のみにする（`cross-target-check`：v8 の prebuilt がターゲットごとに約 150MB あり、check のみで再ビルドが速いため）
+- 新しい cache を足す前に、既存の cache 種別（test・features・harness・cross）と共有できないかを確認し、足す場合は 1 世代の合計が上記の目標に収まるかを見積もる
+
+### 計測方法
+
+```bash
+gh api repos/Fandhe-AI/fandhe-browser/actions/cache/usage                       # 合計サイズ・件数
+gh api --paginate "repos/Fandhe-AI/fandhe-browser/actions/caches?per_page=100" \
+  --jq '.actions_caches[]|[.key,.size_in_bytes,.ref,.created_at,.last_accessed_at]|@tsv'
+gh run view <run-id> --log | grep -E "Cache restored from key|Cache not found|Cache saved with key|Cache Size|cache size \(uncompressed\)" -A4
+```
+
+- exact hit は `Cache restored from key: <primary key>`（save step は skipped）、部分復元は restore-keys 側の key、miss は `Cache not found`
+- 追い出しの有無は cache 一覧で「7 日以内に作られた main の key が消えているか」と、miss の key が以前存在したかで判定する
+- 効いているかは、hit したジョブのログで依存 crate の `Compiling` が出ていないこと（workspace メンバーのみ）で確認する
+
+### 実測（2026-10-11）
+
+| 項目 | 変更前 |
+| ---- | ------ |
+| 1 世代の内訳（圧縮後） | Linux: test 1.63GB・features 1.29GB・harness 0.49GB・cross 0.07GB／macOS: test 1.52GB・features 1.32GB・harness 0.49GB（計約 7.1GB）＋ cargo-deny 5MB |
+| 使用量 | 最大 12.3GB（2 世代）→ LRU 追い出し後 9.3GB・9 件 |
+| ヒット率（CI 52 run・restore 301 件） | exact 約 279 件・部分復元 約 20 件（世代交代直後）・miss 2 件（key 種別の新設時のみ）。追い出しによる miss は 0 件（旧世代は追い出されたが、新世代の作成後だった） |
+| 無駄な保存 | `**/Cargo.lock` による無関係な世代交代 1 回（約 7.1GB）、PR scope の保存 4 件（約 3.5GB。main の保存前に始まった PR の重複を含む） |
+
+| 項目 | 変更後（PR #865 の CI。いずれも cache なしのコールドビルド） |
+| ---- | ------ |
+| key | `rust-Linux-test-v5-20260928b940-1e44cdd8…`（rustc 1.99.0 + ルート `Cargo.lock`。`.agents` のサンプルを拾っていた旧 key の hash `68f04b0b…` から、依存不変の本来の hash に戻った） |
+| target の展開後サイズ（debuginfo 既定 → `line-tables-only`） | test 2.3G → 2.0G・features 5.7G → 4.5G・harness 1.8G → 1.6G（registry 約 90MB は共通） |
+| コールドビルドの所要時間（既定 → `line-tables-only`） | rust-test-ubuntu 550 → 506 秒・rust-features-ubuntu 1201 → 901 秒・harness-ubuntu 113 → 118 秒（cache hit 時は従来それぞれ約 430・700・85 秒） |
+| PR の保存 | なし（save step は skipped） |
+
+圧縮後の世代サイズと main での exact hit は main マージ後に cache 一覧で確認する。
 
 ## 計測方法
 
