@@ -63,6 +63,10 @@ if re_ok "$DIGEST_RE" "sha256:$(printf 'A%.0s' $(seq 1 64))"; then ng "digest re
 expect_match "platform accepts linux/arm64" "$PLATFORM_RE" "linux/arm64"
 if re_ok "$PLATFORM_RE" "windows/amd64"; then ng "platform rejects windows"; else ok "platform rejects windows"; fi
 
+expect_eq "normalize adds :latest" "fandhe-browser:latest" "$(normalize_image_ref fandhe-browser)"
+expect_eq "normalize keeps tag" "fandhe-browser:lite" "$(normalize_image_ref fandhe-browser:lite)"
+expect_eq "normalize registry port without tag" "localhost:5000/img:latest" "$(normalize_image_ref localhost:5000/img)"
+
 # --- 偽 docker シム ---
 FAKE="${TMP}/fake"
 BIN="${TMP}/bin"
@@ -199,6 +203,9 @@ reset_fake
 expect_exit "args: unknown option" 2 run_measure --bogus
 expect_exit "args: option without value" 2 run_measure --platform
 expect_exit "args: invalid platform" 2 run_measure --platform windows/amd64
+expect_exit "args: same default/lite ref" 2 run_measure --default-image x:y --lite-image x:y
+expect_exit "args: same ref, tag omitted vs :latest" 2 run_measure --default-image fb --lite-image fb:latest
+expect_exit "args: same ref, :latest vs tag omitted" 2 run_measure --default-image fb:latest --lite-image fb
 expect_exit "args: invalid image ref" 2 run_measure --default-image 'a b'
 expect_exit "args: missing --reference-digest" 2 bash -c "FAKE_DIR='${FAKE}' PATH='${BIN}:${PATH}' bash '${HERE}/measure.sh' --reference-image '${REF_TAG}'"
 expect_exit "args: invalid digest" 2 bash -c "FAKE_DIR='${FAKE}' PATH='${BIN}:${PATH}' bash '${HERE}/measure.sh' --reference-image '${REF_TAG}' --reference-digest sha256:abc"

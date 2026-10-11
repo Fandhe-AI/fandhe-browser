@@ -159,6 +159,18 @@ measure_image() {
   fi
 }
 
+# イメージ参照を正規化する（最終パス要素にタグが無ければ :latest を補う）。
+# default / lite の同一参照を検出するための比較用（CTR-1・CTR-5。ビルド前の衝突拒否）。
+normalize_image_ref() {
+  local ref="$1" last="${1##*/}"
+  case "$last" in
+    *:*) printf '%s
+' "$ref" ;;
+    *) printf '%s:latest
+' "$ref" ;;
+  esac
+}
+
 # $1=role $2=image label $3=platform $4=reference_bytes（空なら参照行）
 # $5=reference の docker_size_bytes（.Size。docker_size_reduction_pct の分母）
 print_row() {
@@ -194,6 +206,11 @@ main() {
   [ -n "$REF_DIGEST" ] || { echo "error: --reference-digest is required" >&2; usage; exit 2; }
   require_match "--default-image" "$DEFAULT_IMAGE" "$IMAGE_REF_RE"
   require_match "--lite-image" "$LITE_IMAGE" "$IMAGE_REF_RE"
+  # 同一参照だと lite のビルドが default のタグを上書きし、両 role に lite の値が出てしまう
+  if [ "$(normalize_image_ref "$DEFAULT_IMAGE")" = "$(normalize_image_ref "$LITE_IMAGE")" ]; then
+    echo "error: --default-image and --lite-image must differ (both resolve to $(normalize_image_ref "$DEFAULT_IMAGE"))" >&2
+    exit 2
+  fi
   require_match "--reference-image" "$REF_IMAGE" "$REFERENCE_REF_RE"
   require_match "--reference-digest" "$REF_DIGEST" "$DIGEST_RE"
   [ -z "$PLATFORM" ] || require_match "--platform" "$PLATFORM" "$PLATFORM_RE"
