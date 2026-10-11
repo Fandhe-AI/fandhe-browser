@@ -747,6 +747,8 @@ fn net_cases(engine: &str) {
     assert_eq!(hit_count(&hits), 1);
     // 受理数は中止しても戻さない（要求数上限の迂回防止）。ネットへ出たのは 1 件だけ。
     assert_eq!(out.net().started(), 3);
+    assert_eq!(out.net().cancelled(), 2);
+    assert_eq!(out.net().pending_at_end(), 0);
 
     eprintln!("case: JS-6 request count: the Nth request is accepted, the N+1th rejected");
     let (port, hits) = spawn_recording_server(|_| ("200 OK", String::new(), "ok".to_string()));

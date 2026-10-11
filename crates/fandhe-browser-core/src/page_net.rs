@@ -202,6 +202,7 @@ pub struct NetRejection {
 pub struct NetReport {
     pub(crate) started: usize,
     pub(crate) completed: usize,
+    pub(crate) cancelled: usize,
     pub(crate) response_bytes: u64,
     pub(crate) pending_at_end: usize,
 }
@@ -215,6 +216,12 @@ impl NetReport {
     /// JS へ配送した件数（取得に失敗して reject を配送したものを含む）。
     pub fn completed(&self) -> usize {
         self.completed
+    }
+
+    /// 取得前に中止（XHR の `abort()` / 再 `open()`）して取り除いた件数。
+    /// `started` には含まれたままで、`pending_at_end` からは除かれる。
+    pub fn cancelled(&self) -> usize {
+        self.cancelled
     }
 
     /// 累計で保持したレスポンス本文のバイト数（非可逆変換後）。
@@ -270,6 +277,7 @@ pub(crate) struct NetQueue {
     limit_hit: bool,
     delivering: Option<Delivery>,
     completed: usize,
+    cancelled: usize,
 }
 
 /// 相対 URL を `base`（ページの URL）基準で解決し、http / https かつ同一オリジンかつ userinfo 無しだけを通す。
@@ -304,6 +312,7 @@ impl NetQueue {
             limit_hit: false,
             delivering: None,
             completed: 0,
+            cancelled: 0,
         }
     }
 
@@ -331,7 +340,13 @@ impl NetQueue {
     /// 中止の連打で上限を迂回させない）。着手済み・配送済み・未知の ID は何もしない。
     pub(crate) fn cancel(&mut self, id: u32) -> bool {
         match self.pending.iter().position(|r| r.id == id) {
-            Some(index) => self.pending.remove(index).is_some(),
+            Some(index) => {
+                let removed = self.pending.remove(index).is_some();
+                if removed {
+                    self.cancelled += 1;
+                }
+                removed
+            }
             None => false,
         }
     }
@@ -488,9 +503,13 @@ impl NetQueue {
         NetReport {
             started: self.accepted,
             completed: self.completed,
+            cancelled: self.cancelled,
             response_bytes: self.used_bytes,
-            // 取得中に打ち切った要求も含めるため、受理数と配送数から算出する。
-            pending_at_end: self.accepted.saturating_sub(self.completed),
+            // 取得中に打ち切った要求も含めるため、受理数から配送数と中止数を引いて算出する。
+            pending_at_end: self
+                .accepted
+                .saturating_sub(self.completed)
+                .saturating_sub(self.cancelled),
         }
     }
 }
@@ -528,6 +547,13 @@ mod tests {
         assert!(q.cancel(b));
         assert!(!q.cancel(b));
         assert_eq!(q.pending_len(), 0);
+        // 中止分は started に残り（上限判定用）、pending_at_end からは除かれる。
+        // 着手済みの a だけが未配送として残る。
+        let report = q.report();
+        assert_eq!(report.started(), 2);
+        assert_eq!(report.cancelled(), 1);
+        assert_eq!(report.completed(), 0);
+        assert_eq!(report.pending_at_end(), 1);
     }
 
     #[test]
