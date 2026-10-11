@@ -128,7 +128,7 @@ check-compat-regression: ## 対象サイト群の動作率マトリクスに対�
 bench-record: ## competitor_lightpanda ベンチを実行し結果を時系列で記録する
 	@scripts/harness.sh bench-record
 
-check-ci-changes: ## CI の docs-only 判定スクリプトの自己テスト
+check-ci-changes: ## CI の docs-only 判定・cache prune スクリプトの自己テスト
 	@scripts/harness.sh check-ci-changes
 
 check-bench-record: ## competitor_lightpanda 記録スクリプトの自己テスト

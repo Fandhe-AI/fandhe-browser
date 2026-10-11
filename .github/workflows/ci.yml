@@ -46,6 +46,9 @@ name: CI
 #   ことによる bump（依存のビルドスクリプト・proc-macro が debuginfo なし → 行番号付きに変わり、
 #   それらに依存する crate の `-C metadata` も連鎖して変わるため、旧版の blob では依存を毎回
 #   再ビルドする）。registry のみの cross は target を含まないため上げない
+# - Windows も同じ形で cache する。以前は prune が「想定外の crate / target 名」で fail したため
+#   除外していた（Windows の jq の CRLF 出力が原因と推定。対処は scripts/ci-prune-target.sh の
+#   ヘッダー参照）。Windows の key は runner.os が `Windows` になるため Linux・macOS と衝突しない
 
 on:
   workflow_dispatch:
@@ -259,9 +262,8 @@ jobs:
   # 明示ジョブへインライン化した（XOS-1・TASK-55.1）。matrix にしないのは、job-level if で
   # スキップされた matrix ジョブが展開されず check 名が変わり required を満たさなくなるため。
   # clippy -D warnings は REPAIR-6（TASK-5.2・#32 / TASK-7・#335）の fail-closed ゲート。
-  # cache は windows のみ除外（cache prune に既知問題。旧 rust-ci と同じ）。
-  # CARGO_INCREMENTAL=0・CARGO_PROFILE_DEV_DEBUG は 3 OS 共通（windows は cache 目的でなく
-  # リンク・PDB 生成時間の短縮目的）。
+  # cache は 3 OS 共通（Windows の prune 失敗の原因と対処は scripts/ci-prune-target.sh の
+  # ヘッダー参照）。CARGO_INCREMENTAL=0・CARGO_PROFILE_DEV_DEBUG も 3 OS 共通。
   rust-test-ubuntu:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
@@ -304,7 +306,11 @@ jobs:
       - name: "cargo test（workspace・--all-features）"
         if: ${{ !cancelled() }}
         run: cargo test --workspace --all-features
+      # prune は save のためだけの処理なので、save と同じ条件（main かつ exact hit でない）のときだけ
+      # 走らせる。PR と exact hit の main では prune に Windows で約 1 分、ubuntu・macOS で
+      # 7〜20 秒かかるため省く。9 ジョブ（rust-test・rust-features・harness の 3 OS）で同じ形にする
       - name: "cache 保存前に workspace 成果物を prune"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         run: bash scripts/ci-prune-target.sh
       - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
         if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
@@ -360,6 +366,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --workspace --all-features
       - name: "cache 保存前に workspace 成果物を prune"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         run: bash scripts/ci-prune-target.sh
       - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
         if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
@@ -380,10 +387,11 @@ jobs:
     permissions:
       contents: read
     env:
-      # Windows は cache を使わず incremental の成果物が再利用されないため、書き込みコストだけを
-      # 避ける（cache サイズ削減が目的の ubuntu・macOS とは目的が異なる）。debuginfo も
-      # workspace メンバーを行番号のみにして PDB 生成・リンク時間を短縮する（CI 限定。
-      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      # cache サイズ削減に加え、Windows では PDB 生成・リンク時間の短縮にもなる:
+      # workspace メンバーを含む全体の debuginfo を行番号のみにする（CI 限定。
+      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）。
+      # 依存 crate は Cargo.toml の `[profile.dev.package."*"]` でも同じ値に固定済みで衝突
+      # しない（package 指定が優先されるが値が同じ）。メンバーまで行番号のみにするのは本 env だけ
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
@@ -393,15 +401,40 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
           components: clippy
+      - name: "cargo cache の復元"
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: rust-${{ runner.os }}-test-v6-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-test-v6-${{ steps.toolchain.outputs.cachekey }}-
       - name: "cargo clippy（workspace・--all-features・-D warnings）"
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: "cargo test（workspace・--all-features）"
         if: ${{ !cancelled() }}
         run: cargo test --workspace --all-features
+      - name: "cache 保存前に workspace 成果物を prune"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        run: bash scripts/ci-prune-target.sh
+      - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   # --------------------------------------------------
   # rust-features-{ubuntu,macos,windows}（feature 構成別の clippy・test。rust 変更時のみ）
@@ -415,8 +448,7 @@ jobs:
   #   [js-v8]   = rust-ci-js-v8（`--features js-v8` 単独で TASK-28 共通コンフォーマンス
   #               テストを V8 に対して検証。TASK-29.7・#158・JS-1）
   # 各ステップは !cancelled() で独立に走らせ、失敗構成を 1 回の実行で特定できるようにする。
-  # cache は windows のみ除外（cache prune に既知問題。旧 rust-ci と同じ）。
-  # CARGO_INCREMENTAL=0・CARGO_PROFILE_DEV_DEBUG は 3 OS 共通（windows の目的は上記と同じ）。
+  # cache・CARGO_INCREMENTAL=0・CARGO_PROFILE_DEV_DEBUG は 3 OS 共通（上記 rust-test と同じ）。
   rust-features-ubuntu:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
@@ -499,6 +531,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test -p fandhe-browser-js --features js-v8
       - name: "cache 保存前に workspace 成果物を prune"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         run: bash scripts/ci-prune-target.sh
       - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
         if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
@@ -593,6 +626,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test -p fandhe-browser-js --features js-v8
       - name: "cache 保存前に workspace 成果物を prune"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         run: bash scripts/ci-prune-target.sh
       - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
         if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
@@ -613,10 +647,11 @@ jobs:
     permissions:
       contents: read
     env:
-      # Windows は cache を使わず incremental の成果物が再利用されないため、書き込みコストだけを
-      # 避ける（cache サイズ削減が目的の ubuntu・macOS とは目的が異なる）。debuginfo も
-      # workspace メンバーを行番号のみにして PDB 生成・リンク時間を短縮する（CI 限定。
-      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      # cache サイズ削減に加え、Windows では PDB 生成・リンク時間の短縮にもなる:
+      # workspace メンバーを含む全体の debuginfo を行番号のみにする（CI 限定。
+      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）。
+      # 依存 crate は Cargo.toml の `[profile.dev.package."*"]` でも同じ値に固定済みで衝突
+      # しない（package 指定が優先されるが値が同じ）。メンバーまで行番号のみにするのは本 env だけ
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
@@ -626,10 +661,22 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
           components: clippy
+      - name: "cargo cache の復元"
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: rust-${{ runner.os }}-features-v3-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-features-v3-${{ steps.toolchain.outputs.cachekey }}-
       - name: "[default] cargo clippy（既定 feature）"
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: "[default] cargo test（既定 feature）"
@@ -674,6 +721,19 @@ jobs:
       - name: "[js-v8] cargo test（js js-v8 単独）"
         if: ${{ !cancelled() }}
         run: cargo test -p fandhe-browser-js --features js-v8
+      - name: "cache 保存前に workspace 成果物を prune"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        run: bash scripts/ci-prune-target.sh
+      - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   # --------------------------------------------------
   # harness-{ubuntu,macos,windows}（分離検証・ハーネス自己テスト・サイズ検査。
@@ -696,8 +756,7 @@ jobs:
   #                            RENDER-2。上限値・package 名は scripts/versions.sh が単一真実源）。
   #                            対象 package が workspace に無い場合は exit 2 で fail-closed
   #                            （TASK-41.5・#174・REPAIR-5・#633）
-  # windows は cache 除外（cache prune に既知問題。旧 rust-ci と同じ）。
-  # CARGO_INCREMENTAL=0・CARGO_PROFILE_DEV_DEBUG は 3 OS 共通（windows の目的は時間短縮）。
+  # cache・CARGO_INCREMENTAL=0・CARGO_PROFILE_DEV_DEBUG は 3 OS 共通（上記 rust-test と同じ）。
   harness-ubuntu:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.harness == 'true' }}
@@ -841,6 +900,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
       - name: "cache 保存前に workspace 成果物を prune"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         run: bash scripts/ci-prune-target.sh
       - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
         if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
@@ -998,6 +1058,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
       - name: "cache 保存前に workspace 成果物を prune"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         run: bash scripts/ci-prune-target.sh
       - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
         if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
@@ -1020,10 +1081,11 @@ jobs:
     permissions:
       contents: read
     env:
-      # Windows は cache を使わず incremental の成果物が再利用されないため、書き込みコストだけを
-      # 避ける（cache サイズ削減が目的の ubuntu・macOS とは目的が異なる）。debuginfo も
-      # workspace メンバーを行番号のみにして PDB 生成・リンク時間を短縮する（CI 限定。
-      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      # cache サイズ削減に加え、Windows では PDB 生成・リンク時間の短縮にもなる:
+      # workspace メンバーを含む全体の debuginfo を行番号のみにする（CI 限定。
+      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）。
+      # 依存 crate は Cargo.toml の `[profile.dev.package."*"]` でも同じ値に固定済みで衝突
+      # しない（package 指定が優先されるが値が同じ）。メンバーまで行番号のみにするのは本 env だけ
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
@@ -1033,9 +1095,21 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
+      - name: "cargo cache の復元"
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: rust-${{ runner.os }}-harness-v3-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-harness-v3-${{ steps.toolchain.outputs.cachekey }}-
       - name: "前提ツール（jq・node 22 以降）の確認"
         run: |
           if ! command -v jq >/dev/null 2>&1; then
@@ -1139,6 +1213,19 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
+      - name: "cache 保存前に workspace 成果物を prune"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        run: bash scripts/ci-prune-target.sh
+      - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   # --------------------------------------------------
   # windows-servo-prereqs（Servo 組込 Windows ビルドの前提検証）

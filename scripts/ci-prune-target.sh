@@ -10,7 +10,81 @@
 # harness-* の binary-size が生成する release プロファイルも debug と同様に扱う
 # （元の rust-base-ci.yml は debug のみ。ci.yml 側の要件で release を追加）。
 # 要 jq・cargo（ジョブ側で導入済みの前提）。
+#
+# Windows（git-bash）対応（Windows ジョブへ cache を入れるための修正）:
+# 旧 rust-ci では Windows だけ「想定外の crate / target 名を検出」で fail し cache を除外していた。
+# 原因は、Windows の jq が出力を CRLF で書き、名前の末尾の CR が検証
+# （`^[\p{L}\p{N}_-]+$` と `grep '^true$'`）に一致しなかったためと推定している
+# （jq の CRLF 出力自体は直接観測していない）。修正後に Windows の 3 ジョブで prune と save が
+# 通ることは workflow_dispatch で確認済み。
+# jq の出力を読む箇所はすべて `tr -d '\r'` で CR を落とし、CRLF でも LF でも同じ結果にする
+# （検証自体は緩めない）。併せて Windows の成果物名（`.exe`・`.pdb`・`.dll` 系、
+# `name_<hash>.pdb`）も削除対象の正規表現に含めた。`--self-test` は CRLF を出す jq と
+# Windows 風の成果物名を Linux 上で模擬して検証する（scripts/harness.sh 経由で make ci に含む）。
 set -euo pipefail
+
+if [ "${1:-}" = "--self-test" ]; then
+  # 合成 workspace を一時ディレクトリに作り、CRLF を出す jq のシムを PATH 先頭に置いて自身を実行する。
+  self="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+  tmp="$(mktemp -d)"
+  trap 'rm -rf -- "${tmp}"' EXIT
+  mkdir -p "${tmp}/bin" "${tmp}/ws"
+  JQ_REAL="$(command -v jq)"
+  export JQ_REAL
+  # jq の出力の各行末へ CR を付ける（Windows の jq を模擬）。
+  cat > "${tmp}/bin/jq" <<'SHIM'
+#!/usr/bin/env bash
+"${JQ_REAL}" "$@" | sed 's/$/\r/'
+exit "${PIPESTATUS[0]}"
+SHIM
+  # cargo metadata の代わりに固定 JSON を返す。
+  cat > "${tmp}/bin/cargo" <<'SHIM'
+#!/usr/bin/env bash
+echo '{"packages":[{"name":"fandhe-browser-ai","targets":[{"name":"fandhe_browser_ai","kind":["lib"]},{"name":"build-script-build","kind":["custom-build"]}]},{"name":"fandhe-browser-cli","targets":[{"name":"fandhe-browser","kind":["bin"]}]}]}'
+SHIM
+  chmod +x "${tmp}/bin/jq" "${tmp}/bin/cargo"
+  h="0123456789abcdef"
+  for prof in debug release; do
+    t="${tmp}/ws/target/${prof}"
+    mkdir -p "${t}/deps" "${t}/.fingerprint/fandhe-browser-ai-${h}" "${t}/.fingerprint/serde-${h}" "${t}/build/fandhe-browser-ai-${h}"
+    for f in "fandhe_browser_ai-${h}.pdb" "fandhe_browser_ai-${h}.d" "libfandhe_browser_ai-${h}.rlib" \
+      "libfandhe_browser_ai-${h}.rmeta" "fandhe_browser-${h}.exe" "fandhe_browser-${h}.pdb" "fandhe-browser-${h}.d" \
+      "fandhe_browser_ai-${h}.dll" "fandhe_browser_ai-${h}.dll.lib" "fandhe_browser_ai-${h}.dll.exp"; do
+      : > "${t}/deps/${f}"
+    done
+    for f in "serde-${h}.pdb" "libserde-${h}.rlib" "serde_json-${h}.d" "libserde-${h}.rmeta"; do
+      : > "${t}/deps/${f}"
+    done
+    for f in fandhe-browser.exe fandhe_browser.pdb fandhe-browser.d libfandhe_browser_ai.rlib fandhe_browser_ai.dll \
+      fandhe_browser_ai.dll.lib fandhe_browser_ai.dll.exp; do
+      : > "${t}/${f}"
+    done
+  done
+  (cd "${tmp}/ws" && PATH="${tmp}/bin:${PATH}" bash "${self}" > "${tmp}/out.txt" 2>&1) || {
+    echo "NG: prune failed under CRLF jq" >&2
+    cat "${tmp}/out.txt" >&2
+    exit 1
+  }
+  ng=0
+  for prof in debug release; do
+    t="${tmp}/ws/target/${prof}"
+    for f in "deps/fandhe_browser_ai-${h}.pdb" "deps/fandhe_browser-${h}.exe" "deps/fandhe_browser_ai-${h}.dll.lib" \
+      "deps/libfandhe_browser_ai-${h}.rlib" ".fingerprint/fandhe-browser-ai-${h}" "build/fandhe-browser-ai-${h}" \
+      fandhe-browser.exe fandhe_browser.pdb fandhe_browser_ai.dll fandhe_browser_ai.dll.exp libfandhe_browser_ai.rlib; do
+      if [ -e "${t}/${f}" ]; then echo "NG(self-test): workspace artifact kept: ${prof}/${f}" >&2; ng=1; fi
+    done
+    for f in "deps/serde-${h}.pdb" "deps/libserde-${h}.rlib" "deps/serde_json-${h}.d" ".fingerprint/serde-${h}"; do
+      if [ ! -e "${t}/${f}" ]; then echo "NG(self-test): dependency artifact removed: ${prof}/${f}" >&2; ng=1; fi
+    done
+  done
+  if [ "${ng}" -ne 0 ]; then
+    cat "${tmp}/out.txt" >&2
+    echo "NG: ci-prune-target.sh self-test failed" >&2
+    exit 1
+  fi
+  echo "OK: ci-prune-target.sh self-test passed"
+  exit 0
+fi
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "::error::jq not found (required by the cache prune step)"
@@ -35,7 +109,7 @@ while IFS= read -r n; do
   [ -n "${n}" ] && raw+=("${n}")
 done < <(cargo metadata --no-deps --format-version 1 \
   | jq -r '.packages[] | .name, (.targets[] | select(.kind | index("custom-build") | not) | .name)' \
-  | sort -u)
+  | tr -d '\r' | sort -u)
 if [ "${#raw[@]}" -eq 0 ]; then
   echo "::error::failed to read workspace members from cargo metadata"
   exit 1
@@ -48,7 +122,7 @@ fi
 # 無エスケープのまま正規表現へ埋め込んでも安全（#133 レビュー指摘対応）。
 pkgs=(); names=()
 for n in "${raw[@]}"; do
-  if ! jq -n --arg n "${n}" '$n | test("^[\\p{L}\\p{N}_-]+$")' | grep -q '^true$'; then
+  if [ "$(jq -n --arg n "${n}" '$n | test("^[\\p{L}\\p{N}_-]+$")' | tr -d '\r')" != "true" ]; then
     echo "::error::unexpected crate / target name detected; aborting prune"
     echo "name: ${n}"
     exit 1
@@ -64,8 +138,10 @@ names=("${mapfile_names[@]}")
 alt_pkgs="$(IFS='|'; printf '%s' "${pkgs[*]}")"
 alt_names="$(IFS='|'; printf '%s' "${names[*]}")"
 re_unit="^(${alt_pkgs})-[0-9a-f]{16}$"                 # .fingerprint/ build/（package 名・ハイフンのまま）
-re_dep="^(lib)?(${alt_names})-[0-9a-f]{16}(\..+)?$"    # deps/（target 名・`_` 正規化）
-re_top="^(lib)?(${alt_names})(\.(d|rlib|rmeta|so|a|dylib))?$"  # <profile> 直下の uplift バイナリ（lib prefix・rlib 等の拡張子込み）
+# deps/（target 名・`_` 正規化）。Windows の `name_<hash>.pdb` に備え区切りは `-` と `_` の両方
+re_dep="^(lib)?(${alt_names})[-_][0-9a-f]{16}(\..+)?$"
+# <profile> 直下の uplift バイナリ（lib prefix・拡張子込み。Windows の exe・pdb・dll 系を含む）
+re_top="^(lib)?(${alt_names})(\.(d|rlib|rmeta|so|a|dylib|exe|pdb|dll|dll\.lib|dll\.exp|lib|exp))?$"
 
 removed=0
 safe_rm() {  # $1=削除対象パス $2=許可される親ディレクトリ（境界チェック用）
