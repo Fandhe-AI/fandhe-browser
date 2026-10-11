@@ -933,6 +933,10 @@ pub struct NameIndex<'doc> {
     /// `content_steps_left` を使うと後続要素の name の打ち切り位置が変わって ref が変わり、
     /// `judge_steps_left` を使うと圧縮判定が変わるため、独立した別枠にする。
     dedup_steps_left: Cell<usize>,
+    /// データ葉の値テキスト収集（[`compute_data_leaf_value`]。TASK-17）専用の残りステップ数。
+    /// `content_steps_left` を消費すると後続の button・link 等の name が打ち切られて
+    /// ref が変わる（`AISNAP-10`）ため、独立した別枠にする。
+    value_steps_left: Cell<usize>,
     /// 文書順で最初の HTML 名前空間の `<title>` 要素（文書ルートの名前用。
     /// SVG の `<title>` は含めない）。構築時の単一走査で記録する。
     first_title: Option<NodeId>,
@@ -947,6 +951,7 @@ impl<'doc> NameIndex<'doc> {
         self.content_steps_left.set(steps);
         self.judge_steps_left.set(steps);
         self.dedup_steps_left.set(steps);
+        self.value_steps_left.set(steps);
         self
     }
 
@@ -1141,6 +1146,7 @@ impl<'doc> NameIndex<'doc> {
             content_steps_left: Cell::new(usize::MAX),
             judge_steps_left: Cell::new(usize::MAX),
             dedup_steps_left: Cell::new(usize::MAX),
+            value_steps_left: Cell::new(usize::MAX),
             first_title,
         }
     }
@@ -1302,18 +1308,18 @@ fn allows_name_from_content(doc: &Document, id: NodeId) -> bool {
 /// - テキストなし・打ち切りあり: `Some` の空の名前（`truncated: true`。走査しきれて
 ///   いない以上「名前なし」と確定できないため `title` へフォールバックさせない）
 fn content_name(doc: &Document, index: &NameIndex, id: NodeId) -> Option<AccessibleName> {
-    content_name_with_limit(doc, index, id, MAX_NAME_CHARS)
+    content_name_with_limit(doc, id, MAX_NAME_CHARS, &index.content_steps_left)
 }
 
 /// [`content_name`] の本体。文字数上限だけ呼び出し側が指定する。
 fn content_name_with_limit(
     doc: &Document,
-    index: &NameIndex,
     id: NodeId,
     max_chars: usize,
+    steps_left: &Cell<usize>,
 ) -> Option<AccessibleName> {
-    // 索引（= 1 回のスナップショット構築）全体で共有する残り予算で上限する。
-    let budget = index.content_steps_left.get();
+    // 索引（= 1 回のスナップショット構築）全体で共有する残り予算（`steps_left`）で上限する。
+    let budget = steps_left.get();
     let mut text = String::new();
     let scan = collect_content_text(
         doc,
@@ -1326,9 +1332,7 @@ fn content_name_with_limit(
         },
         &mut text,
     );
-    index
-        .content_steps_left
-        .set(budget.saturating_sub(scan.steps_used));
+    steps_left.set(budget.saturating_sub(scan.steps_used));
 
     let mut buf = NameBuffer::with_limit(max_chars);
     buf.push_str(&text);
@@ -1346,14 +1350,15 @@ fn content_name_with_limit(
 ///
 /// 呼び出し元: `snapshot::build` が、accname が空のデータ葉（PriceClass・ProseClass・Quote）に
 /// だけ呼ぶ。値は出力 `Node::name` にのみ使い、ref シグネチャへは渡さない（`AISNAP-10`）。
-/// 走査規則・予算・戻り値の契約は [`content_name`] と同じで、文字数上限だけ
-/// [`MAX_DATA_LEAF_VALUE_CHARS`] を使う。
+/// 走査規則・戻り値の契約は [`content_name`] と同じだが、文字数上限は
+/// [`MAX_DATA_LEAF_VALUE_CHARS`]、予算は参照生成用の `content_steps_left` を消費しない
+/// 専用枠（`value_steps_left`）を使う（後続要素の name・ref を変えないため）。
 pub(super) fn compute_data_leaf_value(
     doc: &Document,
     index: &NameIndex,
     id: NodeId,
 ) -> Option<AccessibleName> {
-    content_name_with_limit(doc, index, id, MAX_DATA_LEAF_VALUE_CHARS)
+    content_name_with_limit(doc, id, MAX_DATA_LEAF_VALUE_CHARS, &index.value_steps_left)
 }
 
 /// row・cell の出力 name を、`covered`（部分木のテキストが子孫ノードの name で出力済みの
@@ -2697,6 +2702,33 @@ mod tests {
                 compute_name_with_index(&doc, &index, find("button#a"))
             });
             assert_eq!(judged.text, "あいうえお");
+        }
+        let later = compute_name_with_index(&doc, &index, find("button#b"));
+        assert_eq!(later.text, "かきくけこ");
+        assert!(!later.truncated);
+    }
+
+    /// AISNAP-10（TASK-17・Issue #833）: データ葉の値収集は専用予算を使い、
+    /// 参照生成用の共有予算（`with_content_budget`）を消費しない。
+    /// 何度収集しても後続 button の name は従来どおり取得できる。
+    #[test]
+    fn aisnap_10_data_leaf_value_does_not_consume_shared_budget() {
+        use super::{NameIndex, compute_data_leaf_value, compute_name_with_index};
+
+        let html = r#"<span id="p">あいうえお</span><button id="b">かきくけこ</button>"#;
+        let parsed =
+            parse_document(html, &ParseOptions::default()).expect("テスト入力は必ず成功する");
+        let doc = parsed.document;
+        let root = doc.root();
+        let index = NameIndex::build(&doc).with_content_budget(64);
+        let find = |sel: &str| {
+            query_selector_str(&doc, root, sel)
+                .expect("セレクタは解釈できる")
+                .expect("対象要素が見つかる")
+        };
+        for _ in 0..32 {
+            let v = compute_data_leaf_value(&doc, &index, find("span#p"));
+            assert!(v.is_some());
         }
         let later = compute_name_with_index(&doc, &index, find("button#b"));
         assert_eq!(later.text, "かきくけこ");
