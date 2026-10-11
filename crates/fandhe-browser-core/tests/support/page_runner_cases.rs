@@ -327,10 +327,15 @@ fn timer_cases(engine: &str) {
     assert_eq!(out.event_loop().fired(), 0);
 
     eprintln!("case: JS-6 pending microtasks are capped and abort the page");
+    // 上限（10000）を 1 件だけ超える回数で止め、遅い環境でも wall time より先に件数上限へ
+    // 当たるよう、このケースだけ script / page wall time を十分大きくして判定を決定的にする。
+    let microtask_opts = PageRunOptions::default()
+        .with_script_wall_time(Duration::from_secs(60))
+        .with_page_wall_time(Duration::from_secs(120));
     let out = run_page(
         engine,
-        &page("for(var i=0;i<20000;i++){queueMicrotask(function(){})}"),
-        &opts,
+        &page("for(var i=0;i<10001;i++){queueMicrotask(function(){})}"),
+        &microtask_opts,
     );
     assert_eq!(
         out.abort().map(|a| a.kind().clone()),
