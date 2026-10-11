@@ -57,6 +57,8 @@ fn profile_error_label(e: &fandhe_browser_profile::ProfileError) -> String {
 /// ホスト・AppState・一時ディレクトリの束。フィールドの宣言順が Drop 順（host → app → dir）。
 pub struct AppHost {
     host: BenchHost,
+    // plugin_overhead ベンチ（TASK-95.1）は本項目を使わないが、mcp_envelope ベンチと共有するソースのため残す。
+    #[allow(dead_code)]
     app: Arc<AppState>,
     _dir: TempDir,
 }
@@ -87,6 +89,8 @@ impl AppHost {
     }
 
     /// ホストが公開している AppState。
+    // plugin_overhead ベンチ（TASK-95.1）は本項目を使わないが、mcp_envelope ベンチと共有するソースのため残す。
+    #[allow(dead_code)]
     pub fn app(&self) -> &Arc<AppState> {
         &self.app
     }

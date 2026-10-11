@@ -17,23 +17,18 @@
 //! 追加し、TASK-10 形式のレポート化は TASK-95.4 が担う。
 
 #[cfg(unix)]
-#[allow(dead_code)]
 #[path = "../crates/fandhe-browser-ai/benches/mcp_envelope/app_host.rs"]
 mod app_host;
-// 本ベンチが使わない項目（http_get 等）は TASK-95.3 で使い始めたら外す。
 #[cfg(unix)]
-#[allow(dead_code)]
 #[path = "../crates/fandhe-browser-ai/benches/mcp_envelope/host.rs"]
 mod host;
 #[cfg(unix)]
 #[path = "plugin_overhead/idle_rss.rs"]
 mod idle_rss;
 #[cfg(unix)]
-#[allow(dead_code)]
 #[path = "../crates/fandhe-browser-ai/benches/mcp_envelope/jsonrpc.rs"]
 mod jsonrpc;
 #[cfg(unix)]
-#[allow(dead_code)]
 #[path = "../crates/fandhe-browser-ai/benches/mcp_envelope/mcp_client.rs"]
 mod mcp_client;
 #[cfg(unix)]

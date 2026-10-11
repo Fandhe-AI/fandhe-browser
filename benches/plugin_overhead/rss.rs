@@ -6,6 +6,7 @@
 //! 外部コマンドの出力は untrusted として扱い、添字アクセス・`unwrap` を使わない。
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 
 /// `ps` 1 行分（pid・親 pid・RSS KiB）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,4 +181,14 @@ pub fn render_idle_rss(m: &IdleRssMeasurement, target_bytes: u64) -> Result<Stri
         m.host_plus_plugin_kib.len(),
         inc_mb,
     ))
+}
+
+/// `r` から最大 `limit + 1` バイトを読む（上限超過を呼び出し側が検出できるよう 1 バイト余分に読む）。
+/// 読み取り途中の I/O エラーは部分的な表を成功扱いにしないためエラーとして返す（`PLUG-3`・採取失敗は非 0）。
+pub fn read_limited<R: Read>(r: R, limit: u64) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    r.take(limit.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|_| "failed to read ps output".to_string())?;
+    Ok(buf)
 }

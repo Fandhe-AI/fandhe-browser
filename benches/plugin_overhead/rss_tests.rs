@@ -220,3 +220,32 @@ fn plug3_options_reject_invalid_input() {
         );
     }
 }
+
+/// 途中で I/O エラーになる reader。先頭に有効な行を返してから失敗する。
+struct FailingReader {
+    sent: bool,
+}
+
+impl std::io::Read for FailingReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.sent {
+            return Err(std::io::Error::other("boom"));
+        }
+        self.sent = true;
+        let data = b"100 1 4000\n";
+        buf[..data.len()].copy_from_slice(data);
+        Ok(data.len())
+    }
+}
+
+#[test]
+fn plug3_read_limited_propagates_mid_read_io_error() {
+    let r = rss::read_limited(FailingReader { sent: false }, 1024);
+    assert_eq!(r, Err("failed to read ps output".to_string()));
+}
+
+#[test]
+fn plug3_read_limited_reads_one_byte_past_limit() {
+    let r = rss::read_limited(&b"abcdef"[..], 4).expect("read");
+    assert_eq!(r, b"abcde".to_vec());
+}

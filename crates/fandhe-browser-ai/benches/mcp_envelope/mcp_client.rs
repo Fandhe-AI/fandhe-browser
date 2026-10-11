@@ -125,6 +125,8 @@ impl McpSession {
     }
 
     /// `tools/call snapshot` を送り、(応答行全体, 経過 ms, `result.content[0].text`) を返す。
+    // plugin_overhead ベンチ（TASK-95.1）は本項目を使わないが、mcp_envelope ベンチと共有するソースのため残す。
+    #[allow(dead_code)]
     pub fn call_snapshot(&mut self) -> Result<(String, f64, String), String> {
         let id = self.next_id;
         let (line, ms) = self.request("tools/call", jsonrpc::snapshot_call_params())?;

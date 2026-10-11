@@ -5,7 +5,6 @@
 //! (b) の木に含まれる。PoC-15 の手法（静置後に一定間隔で複数回採取して中央値）を移植している。
 //! `ps` は固定の絶対パス候補だけを使い（PATH を探索しない）、出力量と実行時間に上限を設ける。
 
-use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -13,7 +12,9 @@ use std::time::{Duration, Instant};
 use crate::app_host::AppHost;
 use crate::mcp_client::McpSession;
 use crate::options::Options;
-use crate::rss::{IdleRssMeasurement, PsRow, contains_in_tree, parse_ps_table, tree_rss};
+use crate::rss::{
+    IdleRssMeasurement, PsRow, contains_in_tree, parse_ps_table, read_limited, tree_rss,
+};
 
 const PS_CANDIDATES: [&str; 2] = ["/bin/ps", "/usr/bin/ps"];
 const PS_MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
@@ -38,12 +39,9 @@ fn snapshot() -> Result<(Vec<PsRow>, u32), String> {
     let ps_pid = child.id();
     let out = child.stdout.take();
     // 出力は別スレッドで上限付きに読む（パイプ満杯で ps が止まらないように）。
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(o) = out {
-            let _ = o.take(PS_MAX_OUTPUT_BYTES + 1).read_to_end(&mut buf);
-        }
-        buf
+    let reader = std::thread::spawn(move || match out {
+        Some(o) => read_limited(o, PS_MAX_OUTPUT_BYTES),
+        None => Err("ps stdout is unavailable".to_string()),
     });
     let deadline = Instant::now() + PS_TIMEOUT;
     let status = loop {
@@ -59,10 +57,12 @@ fn snapshot() -> Result<(Vec<PsRow>, u32), String> {
             }
         }
     };
-    let buf = reader.join().map_err(|_| "ps reader failed".to_string())?;
+    let read_result = reader.join().map_err(|_| "ps reader failed".to_string())?;
     if !status.success() {
         return Err("ps exited with failure".to_string());
     }
+    // 読み取り途中の I/O エラーは部分的な表を成功扱いにしないため、ここで採取失敗として伝播する。
+    let buf = read_result?;
     if buf.len() as u64 > PS_MAX_OUTPUT_BYTES {
         return Err("ps output exceeds 4 MiB".to_string());
     }

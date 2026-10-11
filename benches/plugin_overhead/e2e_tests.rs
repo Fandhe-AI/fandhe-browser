@@ -6,18 +6,14 @@
 
 #![cfg(unix)]
 
-#[allow(dead_code)]
 #[path = "../../crates/fandhe-browser-ai/benches/mcp_envelope/app_host.rs"]
 mod app_host;
-#[allow(dead_code)]
 #[path = "../../crates/fandhe-browser-ai/benches/mcp_envelope/host.rs"]
 mod host;
 #[path = "idle_rss.rs"]
 mod idle_rss;
-#[allow(dead_code)]
 #[path = "../../crates/fandhe-browser-ai/benches/mcp_envelope/jsonrpc.rs"]
 mod jsonrpc;
-#[allow(dead_code)]
 #[path = "../../crates/fandhe-browser-ai/benches/mcp_envelope/mcp_client.rs"]
 mod mcp_client;
 #[path = "options.rs"]
