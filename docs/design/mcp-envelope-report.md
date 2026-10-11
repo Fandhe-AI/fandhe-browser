@@ -39,7 +39,7 @@
 | ---- | ------------- | ------------ | ------------- | ------------- | -------------- | ----------- | ----------- | ------------------ | --------------- |
 | example-minimal | 103 | 79 | 79 | 120 | 41 | 51.9 | 292 | 23.3 | -16.5 |
 | wikipedia-article | 56482 | 37231 | 37231 | 43156 | 5925 | 15.9 | 122589 | 34.1 | 23.6 |
-| hn-list | 10220 | 12532 | 12532 | 14802 | 2270 | 18.1 | 40313 | -22.6 | -44.8 |
+| hn-list | 10220 | 12562 | 12562 | 14832 | 2270 | 18.1 | 40343 | -22.9 | -45.1 |
 | login-form | 284 | 196 | 196 | 255 | 59 | 30.1 | 668 | 31.0 | 10.2 |
 | mdn-docs | 19005 | 27767 | 27767 | 30803 | 3036 | 10.9 | 85091 | -46.1 | -62.1 |
 
@@ -48,7 +48,7 @@
 | metric | mean | min | max |
 | ------ | ---- | --- | --- |
 | DirectReductionPct | 3.9 | -46.1 | 34.1 |
-| McpReductionPct | -17.9 | -62.1 | 23.6 |
+| McpReductionPct | -18.0 | -62.1 | 23.6 |
 | EnvelopeTokens | 2266.2 | 41.0 | 5925.0 |
 | EnvelopePct | 25.4 | 10.9 | 51.9 |
 
@@ -58,30 +58,30 @@
 
 | fixture | path | p50Ms | p95Ms | meanMs |
 | ------- | ---- | ----- | ----- | ------ |
-| example-minimal | direct | 0.057 | 0.073 | 0.061 |
-| example-minimal | mcp | 0.161 | 0.237 | 0.168 |
-| example-minimal | increment | 0.102 | 0.179 | 0.107 |
-| wikipedia-article | direct | 10.752 | 11.139 | 10.817 |
-| wikipedia-article | mcp | 13.495 | 14.871 | 13.655 |
-| wikipedia-article | increment | 2.680 | 4.001 | 2.838 |
-| hn-list | direct | 3.398 | 3.488 | 3.415 |
-| hn-list | mcp | 4.479 | 5.073 | 4.596 |
-| hn-list | increment | 1.114 | 1.632 | 1.182 |
-| login-form | direct | 0.143 | 0.194 | 0.148 |
-| login-form | mcp | 0.233 | 0.346 | 0.253 |
-| login-form | increment | 0.108 | 0.160 | 0.104 |
-| mdn-docs | direct | 4.659 | 4.810 | 4.704 |
-| mdn-docs | mcp | 6.433 | 7.452 | 6.620 |
-| mdn-docs | increment | 1.720 | 2.642 | 1.916 |
-| ALL | direct | 3.398 | 10.828 | 3.829 |
-| ALL | mcp | 4.479 | 13.760 | 5.058 |
-| ALL | increment | 1.113 | 2.987 | 1.229 |
+| example-minimal | direct | 0.089 | 0.117 | 0.086 |
+| example-minimal | mcp | 0.203 | 0.266 | 0.205 |
+| example-minimal | increment | 0.115 | 0.191 | 0.119 |
+| wikipedia-article | direct | 11.100 | 11.567 | 11.190 |
+| wikipedia-article | mcp | 13.705 | 14.833 | 13.808 |
+| wikipedia-article | increment | 2.580 | 3.737 | 2.617 |
+| hn-list | direct | 3.525 | 4.106 | 3.612 |
+| hn-list | mcp | 4.736 | 5.176 | 4.762 |
+| hn-list | increment | 1.105 | 1.617 | 1.150 |
+| login-form | direct | 0.128 | 0.196 | 0.143 |
+| login-form | mcp | 0.261 | 0.318 | 0.254 |
+| login-form | increment | 0.104 | 0.182 | 0.111 |
+| mdn-docs | direct | 4.723 | 5.633 | 4.860 |
+| mdn-docs | mcp | 6.571 | 7.538 | 6.762 |
+| mdn-docs | increment | 1.806 | 2.682 | 1.903 |
+| ALL | direct | 3.525 | 11.164 | 3.978 |
+| ALL | mcp | 4.736 | 13.890 | 5.158 |
+| ALL | increment | 1.068 | 2.826 | 1.180 |
 
 ## 所見
 
-- 方式 B 本体の対生 HTML 削減率は 5 サイト中 3 サイトで正（example-minimal 23.3%・wikipedia-article 33.1%・login-form 31.0%）、hn-list（-38.6%）・mdn-docs（-46.1%）は負（平均 0.6%、範囲 -46.1% から 33.1%）。名前のない generic の折り畳みと空ノードの剪定（TASK-23.3）、ref の付与を操作・参照の対象ノードに限る変更（TASK-23.4）で改善したが、現行の snapshot が JSON ツリー形式のため一部ページでは生 HTML より大きい（`AISNAP-6`・TASK-19 の論点）。MCP 応答行全体では平均 -21.5%
-- エンベロープ（JSON-RPC フレーム等）のトークン増分は 41 から 6105 トークン（平均 2312.6）、方式 B 本体に対して 10.9% から 51.9%（平均 25.1%）。小さいページほど比率が大きい
-- レイテンシ増分（MCP - 直接）は全体で p50 1.113 ms、p95 2.987 ms、平均 1.229 ms。小ページ（example-minimal・login-form）は約 0.1 ms、wikipedia-article は p50 2.680 ms
+- 方式 B 本体の対生 HTML 削減率は 5 サイト中 3 サイトで正（example-minimal 23.3%・wikipedia-article 34.1%・login-form 31.0%）、hn-list（-22.9%）・mdn-docs（-46.1%）は負（平均 3.9%、範囲 -46.1% から 34.1%）。名前のない generic の折り畳みと空ノードの剪定（TASK-23.3）、ref の付与を操作・参照の対象ノードに限る変更（TASK-23.4）で改善したが、現行の snapshot が JSON ツリー形式のため一部ページでは生 HTML より大きい（`AISNAP-6`・TASK-19 の論点）。MCP 応答行全体では平均 -18.0%
+- エンベロープ（JSON-RPC フレーム等）のトークン増分は 41 から 5925 トークン（平均 2266.2）、方式 B 本体に対して 10.9% から 51.9%（平均 25.4%）。小さいページほど比率が大きい
+- レイテンシ増分（MCP - 直接）は全体で p50 1.068 ms、p95 2.826 ms、平均 1.180 ms。小ページ（example-minimal・login-form）は約 0.1 ms、wikipedia-article は p50 2.580 ms
 - PLUG-4 レポートは MCP の text コンテンツのみを数えるが、本レポートの mcpLine は JSON-RPC 応答行全体を数える。両レポートの数値は定義が異なる
 - 入力は合成 fixture であり、実ページの値ではない。レイテンシは測定環境に依存する
 
