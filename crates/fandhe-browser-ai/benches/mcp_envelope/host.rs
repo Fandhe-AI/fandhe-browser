@@ -22,6 +22,8 @@ use fandhe_backend_routes::Router;
 
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+// plugin_overhead ベンチ（TASK-95.1）は本項目を使わないが、mcp_envelope ベンチと共有するソースのため残す。
+#[allow(dead_code)]
 const MAX_DIRECT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// 1 接続の受信全体の絶対期限（少量ずつ送られる低速送信で受信が長引くのを防ぐ）。
@@ -179,12 +181,16 @@ fn reject(stream: &mut TcpStream) -> io::Result<()> {
 }
 
 /// ホストへの直接 GET の結果（ステータスと本文）。
+// plugin_overhead ベンチ（TASK-95.1）は本項目を使わないが、mcp_envelope ベンチと共有するソースのため残す。
+#[allow(dead_code)]
 pub struct DirectResponse {
     pub status: u16,
     pub body: Vec<u8>,
 }
 
 /// 直接 GET（接続から読了まで）。応答は 8 MiB で打ち切って失敗にする。
+// plugin_overhead ベンチ（TASK-95.1）は本項目を使わないが、mcp_envelope ベンチと共有するソースのため残す。
+#[allow(dead_code)]
 pub fn http_get(addr: SocketAddr, path: &str) -> Result<DirectResponse, String> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
         .map_err(|_| "failed to connect to bench host".to_string())?;
@@ -205,6 +211,8 @@ pub fn http_get(addr: SocketAddr, path: &str) -> Result<DirectResponse, String> 
 }
 
 /// 応答バイト列をステータスと本文へ分解する（chunked は使わない前提）。
+// plugin_overhead ベンチ（TASK-95.1）は本項目を使わないが、mcp_envelope ベンチと共有するソースのため残す。
+#[allow(dead_code)]
 fn parse_response(raw: &[u8]) -> Result<DirectResponse, String> {
     let malformed = || "malformed bench host response".to_string();
     let sep = raw

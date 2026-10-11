@@ -117,7 +117,30 @@ impl McpSession {
         Ok(session)
     }
 
+    /// 子プロセス（mcp）の pid。`plugin_overhead` が RSS 採取の根に使う（TASK-95.1・`PLUG-3`）。
+    /// `mcp_envelope` 側のターゲットでは使わないため dead_code を許可する。
+    #[allow(dead_code)]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// 子プロセスが生存しているか確認する。終了済みなら Err（TASK-95.1・`PLUG-3`）。
+    /// 終了した子は Drop まで回収されずゾンビとして `ps` の表に残り、RSS 0 で採取に成功してしまうため、
+    /// `plugin_overhead` が各採取の前後で呼んでアイドル計測の前提（プラグイン生存）を検証する。
+    #[allow(dead_code)]
+    pub fn ensure_alive(&mut self) -> Result<(), String> {
+        match self.child.try_wait() {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => {
+                Err(self.with_stderr("plugin process exited during measurement".to_string()))
+            }
+            Err(_) => Err("failed to check plugin process status".to_string()),
+        }
+    }
+
     /// `tools/call snapshot` を送り、(応答行全体, 経過 ms, `result.content[0].text`) を返す。
+    // plugin_overhead ベンチ（TASK-95.1）は本項目を使わないが、mcp_envelope ベンチと共有するソースのため残す。
+    #[allow(dead_code)]
     pub fn call_snapshot(&mut self) -> Result<(String, f64, String), String> {
         let id = self.next_id;
         let (line, ms) = self.request("tools/call", jsonrpc::snapshot_call_params())?;

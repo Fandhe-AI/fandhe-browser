@@ -27,7 +27,7 @@
 	check-workspace-manifest fmt fmt-check lint test test-harness lint-rendering test-rendering \
 	check-render-isolation check-js-engine-isolation check-publish-private deny check-deny-license-reject ci \
 	check-compat-practical check-compat-regression bench-record check-ci-changes check-bench-record \
-	check-binary-size measure-mcp-envelope check-mcp-envelope measure-js-binary-size measure-container-size measure-cssom-profile-cost \
+	check-binary-size measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size measure-cssom-profile-cost \
 	docker-build docker-shell docker-ci trace-playwright check-playwright-trace check-puppeteer-connect
 
 help: ## ターゲット一覧を表示する（Make 非依存の一覧: scripts/help.sh）
@@ -142,6 +142,12 @@ measure-mcp-envelope: ## 方式 B 本体と MCP エンベロープのトーク�
 
 check-mcp-envelope: ## MCP エンベロープ測定ハーネスの e2e smoke を実バイナリで実行する（PLUG-5・TASK-97.1。unix のみ）
 	@scripts/harness.sh check-mcp-envelope
+
+measure-plugin-overhead: ## mcp プラグインのアイドル RSS 増分を測定する（PLUG-3・TASK-95.1。unix のみ。PLUGIN_OVERHEAD_ARGS で引数指定）
+	@scripts/harness.sh measure-plugin-overhead
+
+check-plugin-overhead: ## プラグイン RSS 増分計測の e2e smoke を実バイナリで実行する（PLUG-3・TASK-95.1。unix のみ）
+	@scripts/harness.sh check-plugin-overhead
 
 measure-js-binary-size: ## JS エンジン構成別（既定 V8 / 軽量 boa / エンジンなし）のリリースバイナリサイズを計測する（TASK-31.1）
 	@scripts/harness.sh measure-js-binary-size
