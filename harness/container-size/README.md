@@ -36,8 +36,11 @@ CONTAINER_SIZE_SKIP_BUILD=1 make measure-container-size    # ビルド済みイ�
 ## 比較対象のピン
 
 `CTR-1` が指定する `mcr.microsoft.com/playwright:v1.49.0-noble` を tag と digest の両方で固定し、
-`scripts/versions.sh` を正本とする。取得は digest 指定で行い、取得後に `RepoDigests` と照合する
-（不一致は fail-closed）。
+`scripts/versions.sh` を正本とする。取得は digest 指定で行い、取得後に `RepoDigests` と照合する。
+`--platform` 付き pull では platform 固有 digest が入るため、ピンした index digest に加え、
+`docker buildx imagetools inspect --raw` で index から引いた platform 一致 digest も受理する
+（いずれも無い・index 取得不能は fail-closed）。default と lite は参照の別名（`docker.io/library/` 等）を
+正規化して衝突を拒否し、さらに計測前に両イメージ ID が異なることを検証する。
 
 | 対象 | digest |
 | ---- | ------ |

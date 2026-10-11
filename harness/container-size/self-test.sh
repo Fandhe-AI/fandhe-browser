@@ -65,6 +65,9 @@ if re_ok "$PLATFORM_RE" "windows/amd64"; then ng "platform rejects windows"; els
 
 expect_eq "normalize adds :latest" "fandhe-browser:latest" "$(normalize_image_ref fandhe-browser)"
 expect_eq "normalize keeps tag" "fandhe-browser:lite" "$(normalize_image_ref fandhe-browser:lite)"
+expect_eq "normalize docker.io/library alias" "fandhe-browser:default" "$(normalize_image_ref docker.io/library/fandhe-browser:default)"
+expect_eq "normalize library alias" "fandhe-browser:latest" "$(normalize_image_ref library/fandhe-browser)"
+expect_eq "normalize keeps library/ with namespace" "library/a/b:latest" "$(normalize_image_ref library/a/b)"
 expect_eq "normalize registry port without tag" "localhost:5000/img:latest" "$(normalize_image_ref localhost:5000/img)"
 
 # --- 偽 docker シム ---
@@ -88,6 +91,10 @@ case "$1" in
       *) echo "overlayfs" ;;
     esac ;;
   build|pull) exit 0 ;;
+  buildx)
+    # imagetools inspect --raw: index（manifest list）を返す
+    [ -f "${FAKE_DIR}/index.json" ] || exit 1
+    cat "${FAKE_DIR}/index.json" ;;
   image)
     ref="${*: -1}"
     f="${FAKE_DIR}/inspect-$(key "$ref").json"
@@ -123,8 +130,12 @@ fake_image() {
   printf '%b' "$6" >"${FAKE}/history-${k}.txt"
 }
 
+PLAT_DIGEST="sha256:$(printf 'b%.0s' $(seq 1 64))"
+ZERO_DIGEST="sha256:$(printf '0%.0s' $(seq 1 64))"
+
 reset_fake() {
   rm -f "${FAKE}"/*
+  jq -n --arg d "$PLAT_DIGEST" --arg z "$ZERO_DIGEST" '{manifests:[{digest:$d,platform:{os:"linux",architecture:"amd64"}},{digest:$z,platform:{os:"linux",architecture:"arm64"}}]}' >"${FAKE}/index.json"
   fake_image "$REF_PIN" "$ID_REF" 1500000000 amd64 "[\"${REF_PIN}\"]" '1000000000\n0\n'
   fake_image "fandhe-browser:default" "$ID_DEF" 72563283 amd64 '[]' '0\n0\n8192\n1495040\n51470336\n200704\n'
   fake_image "fandhe-browser:lite" "$ID_LITE" 16178674 amd64 '[]' '12271616\n'
@@ -192,6 +203,27 @@ fake_image "$REF_PIN" "$ID_REF" 1000000000 amd64 '["mcr.microsoft.com/playwright
 rc=0; run_measure --skip-build >/dev/null 2>&1 || rc=$?
 expect_eq "shim: digest mismatch fails" "1" "$rc"
 
+# --platform 付き pull では RepoDigests に platform 固有 digest が入る（index digest は無い）
+reset_fake
+fake_image "$REF_PIN" "$ID_REF" 1500000000 amd64 "[\"${REF_REPO}@${PLAT_DIGEST}\"]" '1000000000\n0\n'
+rc=0; run_measure --skip-build >/dev/null 2>&1 || rc=$?
+expect_eq "shim: platform digest in RepoDigests accepted" "0" "$rc"
+# 別 platform の digest は受理しない
+fake_image "$REF_PIN" "$ID_REF" 1500000000 amd64 "[\"${REF_REPO}@${ZERO_DIGEST}\"]" '1000000000\n'
+rc=0; run_measure --skip-build >/dev/null 2>&1 || rc=$?
+expect_eq "shim: other-platform digest rejected" "1" "$rc"
+# index を取得できなければ fail-closed
+rm -f "${FAKE}/index.json"
+fake_image "$REF_PIN" "$ID_REF" 1500000000 amd64 "[\"${REF_REPO}@${PLAT_DIGEST}\"]" '1000000000\n'
+rc=0; run_measure --skip-build >/dev/null 2>&1 || rc=$?
+expect_eq "shim: unresolvable index fails closed" "1" "$rc"
+
+# default / lite が同一イメージ ID（別名衝突）
+reset_fake
+fake_image "fandhe-browser:lite" "$ID_DEF" 72563283 amd64 '[]' '51470336\n'
+rc=0; run_measure --skip-build >/dev/null 2>&1 || rc=$?
+expect_eq "shim: same image id for default/lite fails" "1" "$rc"
+
 # アーキ不一致
 reset_fake
 fake_image "fandhe-browser:lite" "$ID_LITE" 16178674 arm64 '[]' '12271616\n'
@@ -206,6 +238,7 @@ expect_exit "args: invalid platform" 2 run_measure --platform windows/amd64
 expect_exit "args: same default/lite ref" 2 run_measure --default-image x:y --lite-image x:y
 expect_exit "args: same ref, tag omitted vs :latest" 2 run_measure --default-image fb --lite-image fb:latest
 expect_exit "args: same ref, :latest vs tag omitted" 2 run_measure --default-image fb:latest --lite-image fb
+expect_exit "args: docker.io/library alias collision" 2 run_measure --default-image fb:default --lite-image docker.io/library/fb:default
 expect_exit "args: invalid image ref" 2 run_measure --default-image 'a b'
 expect_exit "args: missing --reference-digest" 2 bash -c "FAKE_DIR='${FAKE}' PATH='${BIN}:${PATH}' bash '${HERE}/measure.sh' --reference-image '${REF_TAG}'"
 expect_exit "args: invalid digest" 2 bash -c "FAKE_DIR='${FAKE}' PATH='${BIN}:${PATH}' bash '${HERE}/measure.sh' --reference-image '${REF_TAG}' --reference-digest sha256:abc"

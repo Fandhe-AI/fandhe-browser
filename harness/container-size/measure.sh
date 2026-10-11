@@ -115,6 +115,22 @@ image_exists() {
 # 計測結果の受け渡し用グローバル（サブシェルだと exit が伝わらないため）。
 M_BYTES="" M_DSIZE="" M_ID="" M_DIGEST="none"
 
+# $1=inspect JSON $2=ピン留めした `repo@sha256:...`（manifest list の digest）$3=platform
+# RepoDigests にピン digest、または --platform 付き pull で入る platform 固有 digest のいずれかが
+# あれば 0。platform digest は registry の index（--raw）から platform 一致の manifest を引いて得る。
+# 取得できなければ不一致扱い（fail-closed）。
+repo_digest_matches() {
+  local info="$1" pin="$2" platform="$3" raw pd
+  if printf '%s' "$info" | jq -e --arg d "$pin" '(.RepoDigests // []) | index($d) != null' >/dev/null; then
+    return 0
+  fi
+  raw=$(docker buildx imagetools inspect --raw "$pin" 2>/dev/null) || return 1
+  pd=$(printf '%s' "$raw" | jq -r --arg os "${platform%/*}" --arg arch "${platform#*/}" \
+    '[.manifests[]? | select(.platform.os == $os and .platform.architecture == $arch) | .digest][0] // empty' | tr -d '\r')
+  [[ "$pd" =~ $DIGEST_RE ]] || return 1
+  printf '%s' "$info" | jq -e --arg d "${pin%@*}@${pd}" '(.RepoDigests // []) | index($d) != null' >/dev/null
+}
+
 # $1=role $2=inspect/history に渡す参照 $3=期待 platform $4=期待 RepoDigest（空なら検証しない）
 # inspect と history から M_* を設定する。検証失敗は fail-closed で exit 1。
 measure_image() {
@@ -140,8 +156,8 @@ measure_image() {
     exit 1
   fi
   if [ -n "$want_repo_digest" ]; then
-    if ! printf '%s' "$info" | jq -e --arg d "$want_repo_digest" '(.RepoDigests // []) | index($d) != null' >/dev/null; then
-      echo "error: role=${role} RepoDigests does not contain the pinned digest" >&2
+    if ! repo_digest_matches "$info" "$want_repo_digest" "$platform"; then
+      echo "error: role=${role} RepoDigests does not contain the pinned digest (nor its platform digest)" >&2
       exit 1
     fi
     M_DIGEST="${want_repo_digest#*@}"
@@ -159,15 +175,21 @@ measure_image() {
   fi
 }
 
-# イメージ参照を正規化する（最終パス要素にタグが無ければ :latest を補う）。
+# イメージ参照を正規化する。Docker が同一タグとして扱う別名を同一視する:
+# 既定レジストリ（docker.io / index.docker.io / registry-1.docker.io）の除去、
+# 単一要素名の library/ 接頭辞の除去、最終パス要素にタグが無ければ :latest の補完。
 # default / lite の同一参照を検出するための比較用（CTR-1・CTR-5。ビルド前の衝突拒否）。
 normalize_image_ref() {
-  local ref="$1" last="${1##*/}"
-  case "$last" in
-    *:*) printf '%s
-' "$ref" ;;
-    *) printf '%s:latest
-' "$ref" ;;
+  local ref="$1"
+  case "$ref" in
+    docker.io/*|index.docker.io/*|registry-1.docker.io/*) ref="${ref#*/}" ;;
+  esac
+  case "$ref" in
+    library/*) [[ "${ref#library/}" == */* ]] || ref="${ref#library/}" ;;
+  esac
+  case "${ref##*/}" in
+    *:*) printf '%s\n' "$ref" ;;
+    *) printf '%s:latest\n' "$ref" ;;
   esac
 }
 
@@ -284,6 +306,16 @@ main() {
   measure_image reference "$REF_PIN" "$PLATFORM" "$REF_PIN"
   local REF_BYTES="$M_BYTES" REF_DSIZE="$M_DSIZE"
   print_row reference "$REF_IMAGE" "$PLATFORM" ""
+
+  # 別名衝突の最終防衛線: 両タグが同じイメージを指していれば（正規化で検出できない別名など）
+  # 一方のビルドが他方を上書きしており、計測値が無意味になるため fail-closed
+  local ID_DEFAULT ID_LITE
+  ID_DEFAULT=$(docker image inspect --format '{{.Id}}' "$DEFAULT_IMAGE" | tr -d '\r')
+  ID_LITE=$(docker image inspect --format '{{.Id}}' "$LITE_IMAGE" | tr -d '\r')
+  if [ -z "$ID_DEFAULT" ] || [ "$ID_DEFAULT" = "$ID_LITE" ]; then
+    echo "error: default and lite resolve to the same image id (tag alias collision or identical build)" >&2
+    exit 1
+  fi
 
   measure_image default "$DEFAULT_IMAGE" "$PLATFORM" ""
   print_row default "$DEFAULT_IMAGE" "$PLATFORM" "$REF_BYTES" "$REF_DSIZE"
