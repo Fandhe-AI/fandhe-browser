@@ -4,7 +4,8 @@ paths:
   - ".github/actions/**"
 description: >
   GitHub Actions のワークフローを追加・変更する際の方針。runner（public リポジトリ）、必須チェックと
-  ジョブ名、発火条件・concurrency・paths の扱い、新規ジョブ追加チェックリスト、所要時間の計測方法と棚卸し結果を規定する。
+  ジョブ名、発火条件・concurrency・paths の扱い、新規ジョブ追加チェックリスト、キャッシュ方針（上限・key 設計・保存条件）、
+  所要時間の計測方法と棚卸し結果を規定する。
 ---
 
 # GitHub Actions 編集ルール
@@ -50,8 +51,13 @@ lefthook との重複回避は [git-hooks](./git-hooks.md) を参照する。本
 ## キャッシュ方針
 
 GitHub Actions の cache はリポジトリ単位で上限があり、超えると最終アクセスが古いものから追い出される（7 日間アクセスが無いものは削除）。
-本リポジトリの上限は **20GB**（2026-10-11 に 10GB から引き上げ）。Actions の予算は **$10/月（超過時停止）** で、**10GB を超えた分は 1GB あたり月 $0.07 の課金**になる。
-目標は「1 世代（全 cache 種別の合計。現状約 6〜7GB）を常時 10GB 以内に収め、key 切り替え（`Cargo.lock`・rustc・`-vN` の変更）で新旧 2 世代が並ぶ間だけ 20GB の枠で吸収する」こと。旧世代は参照されなくなってから 7 日で消え、その間の 10GB 超過分だけが課金される（例: 超過 4GB × 7 日 ≈ $0.07）。新しい cache 種別の追加で常時 10GB を超える構成にしない。
+本リポジトリの上限は **10GB**（Org 設定も 10GB）。Org の Actions 予算は **$0（超過時停止）** のため、10GB を超える上限は使えない（上限を上げると 10GB を超えた時点で cache が読み取り専用になる）。上限・予算の変更はユーザー判断事項。
+目標は「1 世代（全 cache 種別の合計。現状約 6〜7GB）を常時 10GB 以内に収め、追い出されても main の最新 cache に hit し続ける」こと。key 切り替え（`Cargo.lock`・rustc・`-vN` の変更）で新旧 2 世代が並ぶと古い世代が LRU で追い出されるが、新世代が保存された後なのでミスにはならない（2026-10-11 の実測で追い出しによる miss は 0 件。下記「実測」）。毎回読まれる main の最新 cache は LRU で最後まで残るため、この状態を保てていれば上限を上げる必要はない。新しい cache 種別の追加で常時 10GB を超える構成にしない。
+
+### 入れる前に効果を測る
+
+- cache を足す・残す前に、ログで効果を確かめる（hit したジョブで依存 crate の `Compiling` が出ないこと、restore にかかった秒数とコールドビルドとの差）。効果が無いものは入れない（例: `cross-target-check` は target を cache しても効果が薄いため registry のみ。後述「サイズ削減」）
+- 本リポジトリの cache を使うジョブは GitHub-hosted runner（毎回空の環境）で動く。self-hosted runner ではツールチェーン・`CARGO_HOME`・`CARGO_TARGET_DIR` 等がジョブをまたいで残り、GitHub の cache が復元時間だけかかって無意味になることがある（Org の実例: mirror-ui は pnpm cache の復元に 1 ジョブ平均 75 秒かけて `downloaded 0` だったため撤去。team-hub は `Swatinem/rust-cache` が runner の `CARGO_TARGET_DIR` を保存できず registry しか保存しておらず、後処理が共有 `CARGO_HOME` の crate を消していたため撤去）
 
 ### key 設計
 
@@ -80,14 +86,26 @@ GitHub Actions の cache はリポジトリ単位で上限があり、超える�
 
 ```bash
 gh api repos/Fandhe-AI/fandhe-browser/actions/cache/usage                       # 合計サイズ・件数
+gh cache list -R Fandhe-AI/fandhe-browser -L 100                                # key・サイズ・ref の一覧
 gh api --paginate "repos/Fandhe-AI/fandhe-browser/actions/caches?per_page=100" \
   --jq '.actions_caches[]|[.key,.size_in_bytes,.ref,.created_at,.last_accessed_at]|@tsv'
 gh run view <run-id> --log | grep -E "Cache restored from key|Cache not found|Cache saved with key|Cache Size|cache size \(uncompressed\)" -A4
+gh cache delete <id> -R Fandhe-AI/fandhe-browser                                # 不要になった cache の削除
 ```
 
 - exact hit は `Cache restored from key: <primary key>`（save step は skipped）、部分復元は restore-keys 側の key、miss は `Cache not found`
 - 追い出しの有無は cache 一覧で「7 日以内に作られた main の key が消えているか」と、miss の key が以前存在したかで判定する
 - 効いているかは、hit したジョブのログで依存 crate の `Compiling` が出ていないこと（workspace メンバーのみ）で確認する
+- cache は全 PR・main で共有する状態のため、`gh cache delete` は一覧で対象（key・ref・最終アクセス）を確認してから行う
+
+### PR での確認
+
+ワークフローの cache を追加・変更する PR では、次を確認したことを PR 本文に書く。
+
+- 効果を測った（上記「入れる前に効果を測る」。restore 秒数・依存の再ビルド有無）
+- 保存は main への push のみ（PR は restore だけ）
+- key はルートの `Cargo.lock` と rustc 版から作り、SHA・run_id 等の一意値を含まない。restore-keys で部分復元できる
+- 1 世代の合計サイズ（1 件のサイズ × 種別 × OS）を見積もり、10GB に余裕をもって収まる
 
 ### 実測（2026-10-11）
 
@@ -105,7 +123,7 @@ gh run view <run-id> --log | grep -E "Cache restored from key|Cache not found|Ca
 | コールドビルドの所要時間（既定 → `line-tables-only`） | rust-test-ubuntu 550 → 506 秒・rust-features-ubuntu 1201 → 901 秒・harness-ubuntu 113 → 118 秒（cache hit 時は従来それぞれ約 430・700・85 秒） |
 | PR の保存 | なし（save step は skipped） |
 
-圧縮後の世代サイズと main での exact hit は main マージ後に cache 一覧で確認する。
+圧縮後の世代サイズと main での exact hit は main マージ後に cache 一覧で確認する（#865 マージ後の 2026-10-11 時点の使用量は 2.67GB・8 件）。
 
 ## 計測方法
 

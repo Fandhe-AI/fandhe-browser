@@ -122,7 +122,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 | [licensing.md](.claude/rules/licensing.md) | **リポ固有**: デュアルライセンス・Servo MPL 隔離・GPL 系禁止・NOTICE |
 | [ci.md](.claude/rules/ci.md) | **リポ固有**: ローカルゲート・3 OS CI・feature 分離検証 |
 | [makefile.md](.claude/rules/makefile.md) | **リポ固有**: Makefile は薄い入口・処理は scripts/ に置く・ターゲット追加手順・スクリプト規約 |
-| [github-actions.md](.claude/rules/github-actions.md) | **リポ固有**: runner 方針（public → GitHub-hosted）・必須チェック・発火条件・ジョブ追加チェックリスト・所要時間 |
+| [github-actions.md](.claude/rules/github-actions.md) | **リポ固有**: runner 方針（public → GitHub-hosted）・必須チェック・発火条件・ジョブ追加チェックリスト・キャッシュ方針（上限 10GB・key 設計・保存条件）・所要時間 |
 | [git-hooks.md](.claude/rules/git-hooks.md) | **リポ固有**: lefthook のフック編集方針（時間予算・CI と重複する検査を置かない・明示的な例外） |
 
 ## Current Skills
