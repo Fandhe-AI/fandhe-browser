@@ -55,7 +55,7 @@ nm -u <archive> | awk '{print $2}' | grep -c 'temporal_rs_'
 | ---- | -------------- | ---- | ------------------------------------------- |
 | abseil-cpp | `_ZN4absl` 定義 4291 個 | 確認 | Apache-2.0 |
 | llvm-libc | `__llvm_libc_` を含むシンボル 93 個 | 確認 | Apache-2.0 WITH LLVM-exception |
-| highway | `_ZN3hwy` 定義 92 個 | 確認 | Apache-2.0 OR BSD-3-Clause（`random-inl.h` のみ CC0-1.0。同ファイルの文字列は 3 ターゲットとも 0 件） |
+| highway | `_ZN3hwy` 定義 92 個 | 確認 | Apache-2.0 OR BSD-3-Clause（`random-inl.h` のみ CC0-1.0。同ファイルの文字列は 3 ターゲットとも 0 件だったが、パス文字列のみの確認のため同梱の有無は確定していない） |
 | simdutf | `_ZN7simdutf` 定義 247 個 | 確認 | MIT（Chromium 同梱コピーの `README.chromium`。上流は Apache-2.0 OR MIT）。版は `SIMDUTF_VERSION` が 7.7.0 |
 | inspector_protocol (crdtp) | `_ZN8v8_crdtp` 定義 326 個 | 確認 | BSD-3-Clause（V8 の LICENSE は「サブディレクトリの LICENSE に従う」とするだけで V8 の行では覆えない） |
 | fast_float | `_ZN10fast_float` 定義 17 個 | 確認 | Apache-2.0 OR BSL-1.0 OR MIT |
@@ -70,9 +70,9 @@ musl の prebuilt は gnu とほぼ同じ集合（名前空間ごとのシンボ
 - prebuilt には未定義シンボル `temporal_rs_*` が 307 個あり、定義は 0 個。v8 crate の Cargo 依存 `temporal_capi` が満たす。prebuilt 内のパス `third_party/rust/chromium_crates_io/vendor/temporal_capi-v0_2/bindings/cpp` は C++ バインディングヘッダのもの。
 - 推移的に入る `temporal_rs`・`icu_*`（ICU4X）・`timezone_provider`・`zoneinfo64` は `Cargo.lock` に載り、cargo-deny / cargo-about の棚卸し（#483・#484・#486）で扱う。二重計上と漏れを避けるため `NOTICE` 第 1 節には書かない。
 
-### 区分 D: 調べたが同梱されていないもの
+### 区分 D: 調べたが同梱を確認できなかったもの
 
-パス・シンボルとも 0 件（gnu・musl・MSVC で確認。ただし utf8-decoder・valgrind・wasm-api はパスのみ確認）。
+パス・シンボルとも 0 件で、同梱を確認できなかったもの（gnu・musl・MSVC で確認。utf8-decoder・valgrind・wasm-api はパス文字列のみの確認で、インライン展開や文字列除去による見落としを排除できていない。「非同梱」の断定ではない）。
 
 | 部品 | 確認したシンボル |
 | ---- | ---------------- |
@@ -92,7 +92,7 @@ musl の prebuilt は gnu とほぼ同じ集合（名前空間ごとのシンボ
 | 一致（区分 A） | 4（V8・libc++・libc++abi・ICU）。ただし libc++abi は MSVC では同梱されない |
 | 差分（区分 B。`NOTICE` へ追記） | 9 |
 | Cargo 側で扱う（区分 C） | `temporal_rs` を中心とする Rust 製部品（#483・#484・#486） |
-| 非同梱（区分 D） | 10 |
+| 同梱を確認できなかった（区分 D。非同梱の断定ではない） | 10 |
 
 ## TASK-76 の「実リビジョンとの一致は未検証」の解消範囲
 
@@ -113,7 +113,7 @@ DEPS が固定するリビジョンと v8 crate 内蔵コピーを、代表フ�
 
 ## 要判断事項（オーナーへ報告。承認は得ていない）
 
-1. **CC0-1.0**（siphash。highway の `random-inl.h` は prebuilt に入っていない）は `.claude/rules/licensing.md` の許可ライセンス列挙に無い。許可するか。CC0 は法的に帰属表示を要しないが、安全側として載せている。
+1. **CC0-1.0**（siphash。highway の `random-inl.h` は prebuilt への同梱を確認できていない）は `.claude/rules/licensing.md` の許可ライセンス列挙に無い。許可するか。CC0 は法的に帰属表示を要しないが、安全側として載せている。
 2. **複数ライセンスから選べる部品**（highway・simdutf〔Chromium 同梱コピーは MIT 宣言〕・fast_float・dragonbox）でどの選択肢を適用するか。ここでは選ばず、SPDX 式と上流の LICENSE 全文をそのまま載せた。
 3. **帰属表示を必須としないライセンス**（BSL-1.0・LLVM-exception・CC0）の部品も載せるか。安全側として載せている。
 4. **ヘッダのインライン展開だけで入る部品**（fast_float・dragonbox・rapidhash）の扱い。安全側として載せている。

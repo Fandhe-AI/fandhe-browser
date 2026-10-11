@@ -2009,7 +2009,7 @@ SOFTWARE.
 
 ================================================================================
 7. highway (v8 crate 同梱)
-SPDX: Apache-2.0 OR BSD-3-Clause (hwy/contrib/random/random-inl.h のみ CC0-1.0。同ファイルは調べた prebuilt に含まれない)
+SPDX: Apache-2.0 OR BSD-3-Clause (hwy/contrib/random/random-inl.h のみ CC0-1.0。同ファイルの同梱は調べた prebuilt で確認できていない)
 取得元: https://chromium.googlesource.com/external/github.com/google/highway.git/+/2607d3b5b0113992fe84d3848859eae13b3b52c1/LICENSE
 リビジョン: 2607d3b5b0113992fe84d3848859eae13b3b52c1 (V8 15.2.124.1 の DEPS が固定するリビジョン。v8 crate 内蔵コピーの実リビジョンとの一致は未検証)。LICENSE は 1 ファイルに 3 本文を含む
 ================================================================================
