@@ -319,6 +319,17 @@ fn is_outside_snapshot(doc: &Document, id: NodeId) -> bool {
         || doc.local_name(id) == Some("head")
 }
 
+/// Snapshot ノードの name が DOM 側のフル name と対応するか。
+///
+/// TASK-23.6（`AISNAP-1`）: 子を持つ row・cell・gridcell の出力 name は子孫ノードに出ない
+/// テキストだけへ縮むため、フル name との完全一致ではなく role と子の有無で対応付ける。
+fn name_matches(role: &str, n: &Node, full_name: &str) -> bool {
+    n.name == full_name
+        || (matches!(role, "row" | "cell" | "gridcell")
+            && !n.children.is_empty()
+            && (n.name.is_empty() || full_name.contains(n.name.split(" | ").next().unwrap_or(""))))
+}
+
 /// DOM 要素と Snapshot の通常ノードを文書順で対応付ける（折り畳み対応。TASK-23.3）。
 ///
 /// 名前のない generic は `build_snapshot` が折り畳んで出力しないため、DOM の前順走査と
@@ -346,7 +357,7 @@ fn pair_nodes<'a>(doc: &Document, snapshot: &'a Snapshot) -> Vec<(NodeId, &'a No
         let Some(n) = next else { break };
         let role = compute_role(doc, d).map_or("generic", |r| r.as_str());
         if n.role == role
-            && n.name == compute_name(doc, d).text
+            && name_matches(role, n, &compute_name(doc, d).text)
             && n.data_leaf == classify_data_leaf(doc, d)
         {
             pairs.push((d, n));
@@ -405,11 +416,15 @@ fn map_to_snapshot<'a>(doc: &Document, snapshot: &'a Snapshot, target: NodeId) -
     };
     let expected_role = compute_role(doc, target).map_or("generic", |r| r.as_str());
     assert_eq!(item.role(), expected_role, "対応付けの role が一致する");
-    assert_eq!(
-        item.name(),
-        compute_name(doc, target).text,
-        "対応付けの name が一致する"
-    );
+    let full_name = compute_name(doc, target).text;
+    match item {
+        Item::Node(n) => assert!(
+            name_matches(expected_role, n, &full_name),
+            "対応付けの name が一致する: {:?} vs {full_name:?}",
+            n.name
+        ),
+        _ => assert_eq!(item.name(), full_name, "対応付けの name が一致する"),
+    }
     assert_eq!(
         item.data_leaf(),
         classify_data_leaf(doc, target),

@@ -12,126 +12,66 @@
   - heading "Discussion" [ec85b07b3643c5b86]
     - link "Discussion" [e16503b9cdf26df21]
   - list
-    - listitem
-      - link "community0" [e54e8a1f5ed34fd99]
-    - listitem
-      - link "community1" [e7bf16a4f15ceb25b]
-    - listitem
-      - link "community2" [eebbdffc7f5d6da2d]
-    - listitem
-      - link "community3" [e9f09b835401afacb]
-    - listitem
-      - link "community4" [ebc40879c44a3ca21]
-    - listitem
-      - link "community5" [ec558d93354d60d43]
-    - listitem
-      - link "community6" [e38b608729253f96d]
-    - listitem
-      - link "community7" [e200b813424409983]
-    - listitem
-      - link "community8" [e970653bc17eda689]
-    - listitem
-      - link "community9" [e9c8b963c977fd5cb]
-    - listitem
-      - link "community10" [e684d4e11b4369859]
-    - listitem
-      - link "community11" [e1cb17652388ec14d]
-    - listitem
-      - link "community12" [e17bb5d1b5d6234d5]
-    - listitem
-      - link "community13" [ec5b0a203d0238499]
-    - listitem
-      - link "community14" [e2a9cd2cdaf8e1b99]
-    - listitem
-      - link "community15" [ed596946bf260dfa5]
-    - listitem
-      - link "community16" [e5a6c54118a90039d]
-    - listitem
-      - link "community17" [e638bbbede32a5c59]
-    - listitem
-      - link "community18" [ec56090e893c2bcf9]
-    - listitem
-      - link "community19" [e38966b16fb0270ad]
-    - listitem
-      - link "community20" [e7e5677dc0329e05d]
-    - listitem
-      - link "community21" [e72ae073235bb3e39]
-    - listitem
-      - link "community22" [edaf09379b44b1f45]
-    - listitem
-      - link "community23" [edb128a5f4ee37219]
-    - listitem
-      - link "community24" [e5f02d7756e4e1875]
-    - listitem
-      - link "community25" [e7ce0b4c100d1d7b9]
-    - listitem
-      - link "community26" [ecf6c6634515331dd]
-    - listitem
-      - link "community27" [ed67758a98e32ddc9]
-    - listitem
-      - link "community28" [e2985790b0f77c8ad]
-    - listitem
-      - link "community29" [eb41b471b60b98209]
-    - listitem
-      - link "community30" [ea63e67bce42e1985]
-    - listitem
-      - link "community31" [e2e6804ed3d141125]
-    - listitem
-      - link "community32" [e41edf2c2e58d4579]
-    - listitem
-      - link "community33" [e681caea3aca6a471]
-    - listitem
-      - link "community34" [eeeafb3f4f9d3bb0d]
-    - listitem
-      - link "community35" [e11d76ecc78b2d83d]
-    - listitem
-      - link "community36" [eaba385dc1ef3aab9]
-    - listitem
-      - link "community37" [e0be3f9613de99a31]
-    - listitem
-      - link "community38" [e53aa1699696063a5]
-    - listitem
-      - link "community39" [ea281f432c22f6805]
-    - listitem
-      - link "community40" [ed4171f7667bc9d99]
-    - listitem
-      - link "community41" [e65732122d0149d49]
-    - listitem
-      - link "community42" [ea094b2c563e979c1]
-    - listitem
-      - link "community43" [e8396ff3311a81459]
-    - listitem
-      - link "community44" [efed979ef93a36b41]
-    - listitem
-      - link "community45" [e0df7b0b4ece4aea1]
-    - listitem
-      - link "community46" [e0ccbb36462af28e9]
-    - listitem
-      - link "community47" [e4da00fefc0a17b31]
-    - listitem
-      - link "community48" [ee715952e5f336839]
-    - listitem
-      - link "community49" [edd75bdb24586a129]
-    - listitem
-      - link "community50" [ebe7e5cf8c2ac0c89]
-    - listitem
-      - link "community51" [ecc6d2c1f33fa9fc5]
-    - listitem
-      - link "community52" [ea58bfd3c5202143d]
-    - listitem
-      - link "community53" [e3668b718bcc61a31]
-    - listitem
-      - link "community54" [ea95cb235ccb60ff9]
-    - listitem
-      - link "community55" [e00d9d844595d0f3d]
-    - listitem
-      - link "community56" [e64712e0f1a87f345]
-    - listitem
-      - link "community57" [e26090ef519779551]
-    - listitem
-      - link "community58" [e16793cfb126f4f19]
-    - listitem
-      - link "community59" [e49b0e6f0c2aa5da5]
+    - link "community0" [e54e8a1f5ed34fd99]
+    - link "community1" [e7bf16a4f15ceb25b]
+    - link "community2" [eebbdffc7f5d6da2d]
+    - link "community3" [e9f09b835401afacb]
+    - link "community4" [ebc40879c44a3ca21]
+    - link "community5" [ec558d93354d60d43]
+    - link "community6" [e38b608729253f96d]
+    - link "community7" [e200b813424409983]
+    - link "community8" [e970653bc17eda689]
+    - link "community9" [e9c8b963c977fd5cb]
+    - link "community10" [e684d4e11b4369859]
+    - link "community11" [e1cb17652388ec14d]
+    - link "community12" [e17bb5d1b5d6234d5]
+    - link "community13" [ec5b0a203d0238499]
+    - link "community14" [e2a9cd2cdaf8e1b99]
+    - link "community15" [ed596946bf260dfa5]
+    - link "community16" [e5a6c54118a90039d]
+    - link "community17" [e638bbbede32a5c59]
+    - link "community18" [ec56090e893c2bcf9]
+    - link "community19" [e38966b16fb0270ad]
+    - link "community20" [e7e5677dc0329e05d]
+    - link "community21" [e72ae073235bb3e39]
+    - link "community22" [edaf09379b44b1f45]
+    - link "community23" [edb128a5f4ee37219]
+    - link "community24" [e5f02d7756e4e1875]
+    - link "community25" [e7ce0b4c100d1d7b9]
+    - link "community26" [ecf6c6634515331dd]
+    - link "community27" [ed67758a98e32ddc9]
+    - link "community28" [e2985790b0f77c8ad]
+    - link "community29" [eb41b471b60b98209]
+    - link "community30" [ea63e67bce42e1985]
+    - link "community31" [e2e6804ed3d141125]
+    - link "community32" [e41edf2c2e58d4579]
+    - link "community33" [e681caea3aca6a471]
+    - link "community34" [eeeafb3f4f9d3bb0d]
+    - link "community35" [e11d76ecc78b2d83d]
+    - link "community36" [eaba385dc1ef3aab9]
+    - link "community37" [e0be3f9613de99a31]
+    - link "community38" [e53aa1699696063a5]
+    - link "community39" [ea281f432c22f6805]
+    - link "community40" [ed4171f7667bc9d99]
+    - link "community41" [e65732122d0149d49]
+    - link "community42" [ea094b2c563e979c1]
+    - link "community43" [e8396ff3311a81459]
+    - link "community44" [efed979ef93a36b41]
+    - link "community45" [e0df7b0b4ece4aea1]
+    - link "community46" [e0ccbb36462af28e9]
+    - link "community47" [e4da00fefc0a17b31]
+    - link "community48" [ee715952e5f336839]
+    - link "community49" [edd75bdb24586a129]
+    - link "community50" [ebe7e5cf8c2ac0c89]
+    - link "community51" [ecc6d2c1f33fa9fc5]
+    - link "community52" [ea58bfd3c5202143d]
+    - link "community53" [e3668b718bcc61a31]
+    - link "community54" [ea95cb235ccb60ff9]
+    - link "community55" [e00d9d844595d0f3d]
+    - link "community56" [e64712e0f1a87f345]
+    - link "community57" [e26090ef519779551]
+    - link "community58" [e16793cfb126f4f19]
+    - link "community59" [e49b0e6f0c2aa5da5]
   - main [eadf524388bac193b]
     - button "upvote" [e1be29768009a0f76]
     - generic "50"

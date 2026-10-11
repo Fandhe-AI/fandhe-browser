@@ -147,7 +147,9 @@ fn first_data_row(table: &Node) -> &Node {
 #[test]
 fn aisnap_13_extract_04_large_table_back_column_cell_survives_truncation() {
     let s = snap(&read_fixture("large-table.html"));
-    assert!(s.truncated, "上限打ち切りが起きている前提");
+    // TASK-23.6（Issue #828）: row・cell の出力 name が子孫に出ないテキストだけへ縮み、
+    // フル name の 120 文字打ち切りが出力から消えたため truncated は立たない（実測で固定）。
+    assert!(!s.truncated, "row の name 打ち切りは出力から消えている前提");
     let table = only_table(&s);
     assert!(table.table.is_none(), "50 列は展開経路");
     let row = first_data_row(table);
@@ -179,7 +181,11 @@ fn aisnap_13_extract_04_column_header_identifies_back_column() {
     let table = only_table(&s);
     let header: Vec<&Node> = all_nodes(table)
         .into_iter()
-        .filter(|n| n.role == "row" && n.name.starts_with("Column 0 "))
+        .filter(|n| {
+            n.role == "row"
+                && !n.children.is_empty()
+                && n.children.iter().all(|c| c.role == "columnheader")
+        })
         .collect();
     assert_eq!(header.len(), 1, "ヘッダ行はちょうど 1 つ");
     let h = header
@@ -400,7 +406,9 @@ fn nav_cell(s: &Snapshot) -> &Node {
 #[test]
 fn aisnap_13_nav_04_links_sharing_one_cell_each_keep_a_ref() {
     let s = snap(&read_fixture("hn-list.html"));
-    assert!(s.truncated, "上限打ち切りが起きている前提");
+    // TASK-23.6（Issue #828）: row・cell の出力 name が子孫に出ないテキストだけへ縮み、
+    // フル name の 120 文字打ち切りが出力から消えたため truncated は立たない（実測で固定）。
+    assert!(!s.truncated, "row の name 打ち切りは出力から消えている前提");
     let cell = nav_cell(&s);
     let links = links_under(cell);
     let names: Vec<&str> = links.iter().map(|l| l.name.as_str()).collect();
@@ -557,4 +565,31 @@ fn aisnap_13_nav_04_dashboard_action_links_keep_distinct_refs() {
     refs.sort_unstable();
     refs.dedup();
     assert_eq!(refs.len(), 16, "全 16 リンクの ref は一意");
+}
+
+/// `AISNAP-1`・TASK-23.6・Issue #828: HN の subtext 行で「points by」は name に残り、
+/// `link "member0"` と同じ文字列は親の cell・row の name に重複しない。
+#[test]
+fn aisnap_1_hn_subtext_name_keeps_points_by_without_duplicating_member_link() {
+    let s = snap(&read_fixture("hn-list.html"));
+    let nodes = all_nodes(&s.tree);
+    let is_member = |n: &&Node| n.role == "link" && n.name == "member0";
+    let cell = nodes
+        .iter()
+        .find(|n| {
+            n.role == "cell"
+                && n.children.iter().any(|c| is_member(&c))
+                && !n
+                    .children
+                    .iter()
+                    .any(|c| all_nodes(c).iter().any(|d| d.role == "cell"))
+        })
+        .expect("member0 を子に持つ最内 cell");
+    assert_eq!(cell.name, "20 points by | |");
+    let row = nodes
+        .iter()
+        .find(|n| n.role == "row" && n.children.iter().any(|c| std::ptr::eq(c, *cell)))
+        .expect("cell を子に持つ row");
+    assert_eq!(row.name, "");
+    assert!(!cell.name.contains("member0") && !row.name.contains("member0"));
 }
