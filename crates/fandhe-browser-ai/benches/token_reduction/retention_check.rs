@@ -276,29 +276,51 @@ pub struct ParsedRef {
 }
 
 impl ParsedRef {
-    /// 全桁ダイジェストの先頭 `hex_len` 桁がこの ref の `prefix` と一致するか。
+    /// 全桁ダイジェストの先頭 `hex_len` 桁がこの ref の `prefix` と一致するか（前方一致のみ）。
     ///
-    /// 限界: 先頭 8 桁が衝突した表示衝突ペアでは、先着側の 8 桁表示が後着側ダイジェストにも
-    /// 前方一致しうる（ページあたり約 0.001 件。かつ対象要素がそのペアに入る場合のみ）。
+    /// 前方一致だけでは同一性を保証しない。先着 `0x12345678a…` が `e12345678`、後着
+    /// `0x12345678b…` が `e12345678b` を受ける表示衝突ペアでは、先着 ref が後着ダイジェストにも
+    /// 前方一致する。同一性の判定には snapshot 側の ref 集合で曖昧性を除く [`ParsedRef::matches`]
+    /// 以降を使うこと。
     pub fn matches_digest(&self, digest: u64) -> bool {
         let shift = 64u32.saturating_sub(4 * self.hex_len);
         digest.checked_shr(shift).unwrap_or(digest) == self.prefix
     }
 
-    /// （全桁ダイジェスト, 出現番号）の候補と一致するか。
-    pub fn matches(&self, cand: &(u64, u32)) -> bool {
-        self.occurrence == cand.1 && self.matches_digest(cand.0)
+    /// snapshot 側の全 ref（`all`）のうち、この ref より長い表示桁で同じダイジェストへ前方一致
+    /// するものがあるか。ある場合、そのダイジェストの発行 ref はより長い側であり（桁延長は
+    /// 後着側にだけ起き、延長後の桁は先着ダイジェストと異なる）、短い ref は別要素のものである。
+    fn shadowed_by(&self, digest: u64, all: &[ParsedRef]) -> bool {
+        all.iter()
+            .any(|q| q.hex_len > self.hex_len && q.matches_digest(digest))
+    }
+
+    /// （全桁ダイジェスト, 出現番号）の候補と一致するか。`all` は snapshot 側の全 ref。
+    /// 前方一致に加え、より長い ref に遮蔽される（別要素の短い ref）場合は一致扱いにしない
+    /// （表示衝突ペアの誤同定防止。TASK-23.5・Issue #836）。
+    ///
+    /// 残る限界: 遮蔽する長い側の ref 自体が snapshot に無い（省略された）場合は区別できない。
+    pub fn matches(&self, cand: &(u64, u32), all: &[ParsedRef]) -> bool {
+        self.occurrence == cand.1 && self.matches_digest(cand.0) && !self.shadowed_by(cand.0, all)
     }
 
     /// 候補のいずれかと一致するか。
-    pub fn matches_any(&self, cands: &[(u64, u32)]) -> bool {
-        cands.iter().any(|c| self.matches(c))
+    pub fn matches_any(&self, cands: &[(u64, u32)], all: &[ParsedRef]) -> bool {
+        cands.iter().any(|c| self.matches(c, all))
     }
 }
 
 /// snapshot 側の ref 集合のいずれかが候補（全桁ダイジェスト, 出現番号）と一致するか。
 pub fn any_ref_matches(refs: &[ParsedRef], cand: &(u64, u32)) -> bool {
-    refs.iter().any(|p| p.matches(cand))
+    refs.iter().any(|p| p.matches(cand, refs))
+}
+
+/// エントリの ref をすべて解釈した集合（表示衝突の遮蔽判定に使う）。
+pub fn all_parsed_refs(entries: &[FlatEntry]) -> Vec<ParsedRef> {
+    entries
+        .iter()
+        .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
+        .collect()
 }
 
 /// `ref` 文字列（`e<8..16hex>[v<n>][-<n>]`）を表示桁・先頭桁の値・出現番号（無印は 1）へ
@@ -487,6 +509,7 @@ fn compressed_control_refs(
         .filter(|e| e.compressed)
         .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
         .collect();
+    let all_refs = all_parsed_refs(entries);
     let mut out = Vec::new();
     for container in doc
         .ancestors(id)
@@ -540,10 +563,9 @@ fn compressed_control_refs(
                     && control_sig(e, scope) == Some(digest)
             })
             .count();
-        let snapshot_total = entries
+        let snapshot_total = all_refs
             .iter()
-            .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
-            .filter(|p| p.matches_digest(digest))
+            .filter(|p| p.matches_digest(digest) && !p.shadowed_by(digest, &all_refs))
             .count();
         if dom_total != snapshot_total {
             continue;
@@ -571,6 +593,7 @@ pub fn judge(
     entries: &[FlatEntry],
     snapshot_truncated: bool,
 ) -> TaskCheck {
+    let all_refs = all_parsed_refs(entries);
     let matches: Vec<&FlatEntry> = entries
         .iter()
         .filter(|e| task.role.is_none_or(|r| e.role == r))
@@ -582,7 +605,7 @@ pub fn judge(
         .filter(|e| task.data_leaf.is_none_or(|k| e.data_leaf == Some(k)))
         .filter(|e| match e.r#ref.as_deref() {
             None | Some("") => true,
-            Some(r) => parse_ref(r).is_some_and(|p| p.matches_any(target_refs)),
+            Some(r) => parse_ref(r).is_some_and(|p| p.matches_any(target_refs, &all_refs)),
         })
         .collect();
     let first = matches.first();

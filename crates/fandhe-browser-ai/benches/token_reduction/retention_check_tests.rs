@@ -464,12 +464,32 @@ fn task_23_5_parse_ref_accepts_8_to_16_hex_digits_only() {
 fn task_23_5_parsed_ref_matches_digest_prefix_and_occurrence() {
     let digest = 0x1234_5678_b000_0000_u64;
     let short = retention_check::parse_ref("e12345678-2").expect("8 桁");
-    assert!(short.matches(&(digest, 2)));
-    assert!(!short.matches(&(digest, 1)));
+    assert!(short.matches(&(digest, 2), &[]));
+    assert!(!short.matches(&(digest, 1), &[]));
     let long = retention_check::parse_ref("e12345678b").expect("9 桁");
-    assert!(long.matches(&(digest, 1)));
-    assert!(!long.matches(&(0x1234_5678_a000_0000, 1)));
+    assert!(long.matches(&(digest, 1), &[]));
+    assert!(!long.matches(&(0x1234_5678_a000_0000, 1), &[]));
     let full = retention_check::parse_ref("e12345678b0000000").expect("16 桁");
     assert!(full.matches_digest(digest));
     assert!(!full.matches_digest(digest + 1));
+}
+
+/// TASK-23.5・Issue #836: 先着 `0x12345678a…`（`e12345678`）と後着 `0x12345678b…`
+/// （`e12345678b`）の表示衝突ペアで、先着 ref を後着ダイジェストの同一性に使わない。
+#[test]
+fn task_23_5_display_collision_does_not_identify_later_digest_by_earlier_ref() {
+    let first = 0x1234_5678_a000_0000_u64;
+    let later = 0x1234_5678_b000_0000_u64;
+    let p_first = retention_check::parse_ref("e12345678").expect("8 桁");
+    let p_later = retention_check::parse_ref("e12345678b").expect("9 桁");
+    let all = [p_first, p_later];
+    // 先着側は自身にだけ一致し、後着ダイジェストには一致しない。
+    assert!(p_first.matches(&(first, 1), &all));
+    assert!(!p_first.matches(&(later, 1), &all));
+    assert!(p_later.matches(&(later, 1), &all));
+    assert!(!p_later.matches(&(first, 1), &all));
+    assert!(retention_check::any_ref_matches(&all, &(later, 1)));
+    assert!(retention_check::any_ref_matches(&all, &(first, 1)));
+    // 後着側 ref が snapshot にあれば、先着 ref だけの集合から後着を誤同定しない。
+    assert!(!p_first.matches_any(&[(later, 1)], &all));
 }

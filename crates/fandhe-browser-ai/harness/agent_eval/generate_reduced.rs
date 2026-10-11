@@ -25,7 +25,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::raw_dom::serialize_raw_dom;
-use crate::retention_check::{FlatEntry, flatten, parse_ref, target_refs};
+use crate::retention_check::{FlatEntry, all_parsed_refs, flatten, parse_ref, target_refs};
 use crate::snapshot_text::render_snapshot;
 use crate::tasks::{GOLDEN, Golden, Locator, TASKS, json_str};
 use fandhe_browser_ai::data_leaf::{DataLeafKind, classify_data_leaf};
@@ -176,10 +176,11 @@ const NOTE_MAX_CHARS: usize = 300;
 /// 要素に対応する snapshot ref 文字列（文書順・重複なし。解決不能は空）。
 fn refs_of(doc: &Document, node: NodeId, entries: &[FlatEntry]) -> Vec<String> {
     let cands = target_refs(doc, node, entries);
+    let all_refs = all_parsed_refs(entries);
     let mut refs: Vec<String> = Vec::new();
     for e in entries {
         if let Some(r) = &e.r#ref
-            && parse_ref(r).is_some_and(|p| p.matches_any(&cands))
+            && parse_ref(r).is_some_and(|p| p.matches_any(&cands, &all_refs))
             && !refs.contains(r)
         {
             refs.push(r.clone());
