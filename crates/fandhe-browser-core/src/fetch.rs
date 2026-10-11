@@ -589,14 +589,6 @@ fn build_client(options: &FetchOptions, same_origin_only: bool) -> Result<Client
     let max_redirects = options.max_redirects;
     let allow_private_network_access = options.allow_private_network_access;
     let redirect_policy = Policy::custom(move |attempt| {
-        if same_origin_only
-            && attempt
-                .previous()
-                .first()
-                .is_none_or(|first| first.origin() != attempt.url().origin())
-        {
-            return attempt.error(RedirectMarker::CrossOriginRedirect);
-        }
         if attempt.previous().len() > max_redirects {
             return attempt.error(RedirectMarker::TooManyRedirects {
                 limit: max_redirects,
@@ -610,6 +602,17 @@ fn build_client(options: &FetchOptions, same_origin_only: bool) -> Result<Client
                     scheme: other.to_string(),
                 });
             }
+        }
+        // scheme 検査より後に置く。先に origin を比べると `file:`/`ftp:` 等の
+        // Location が `CrossOriginRedirect` に化け、`DisallowedScheme` の分類が
+        // 遮られる（origin は scheme を含むため必ず不一致になる）。
+        if same_origin_only
+            && attempt
+                .previous()
+                .first()
+                .is_none_or(|first| first.origin() != attempt.url().origin())
+        {
+            return attempt.error(RedirectMarker::CrossOriginRedirect);
         }
         // `SafeResolver` は DNS 名の解決結果しか検証しない（IP リテラル
         // host は hyper-util が DNS 解決を経由せず直接使うため）。
