@@ -493,3 +493,23 @@ fn task_23_5_display_collision_does_not_identify_later_digest_by_earlier_ref() {
     // 後着側 ref が snapshot にあれば、先着 ref だけの集合から後着を誤同定しない。
     assert!(!p_first.matches_any(&[(later, 1)], &all));
 }
+
+/// TASK-23.5・Issue #836: 衝突相手（`0x12345678b…`）が snapshot から省略され、先着の
+/// `e12345678` だけが出力に残る場合、出力済み ref 集合では相手の存在を検出できない。
+/// DOM 全体のダイジェスト集合で先頭 8 桁を共有する別ダイジェストがある候補は一意でないとする。
+#[test]
+fn task_23_5_omitted_collision_partner_makes_digest_ambiguous() {
+    let first = 0x1234_5678_a000_0000_u64;
+    let target = 0x1234_5678_b000_0000_u64;
+    let other = 0x9abc_def0_1234_5678_u64;
+    let p_first = retention_check::parse_ref("e12345678").expect("8 桁");
+    // snapshot には先着 ref しか無い。ref 集合だけの判定では target に誤一致する（旧挙動）。
+    assert!(p_first.matches(&(target, 1), &[p_first]));
+    // DOM 全体では先着・後着が共存するため、どちらの候補も曖昧として除かれる。
+    let dom = [first, target, other];
+    assert!(!retention_check::digest_is_display_unique(target, &dom));
+    assert!(!retention_check::digest_is_display_unique(first, &dom));
+    // 先頭 8 桁を共有する相手がいなければ一意。自分自身だけの集合も一意。
+    assert!(retention_check::digest_is_display_unique(other, &dom));
+    assert!(retention_check::digest_is_display_unique(target, &[target]));
+}
