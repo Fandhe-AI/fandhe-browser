@@ -53,3 +53,42 @@
 
 - 出力形式の縮小は `PLUG-5`・TASK-97・`AISNAP-6` 側の論点
 - verdict が `Met` に変わったら、`plug4_mcp_token_reduction_current_verdict_is_pinned_shortfall` を `assert_plug4` による本ゲートに置き換え、本レポートを再生成する
+
+## JS 実行有効時の参考測定（TASK-113・`JS-4`・`PLUG-4`）
+
+設定 `[js] execute_page_scripts = true` のとき、`GET /ai/snapshot` の入力はページ JS の実行後 DOM になる（`AISNAP-6`・`JS-4`）。
+その影響を確認した参考測定で、上の「結果」ブロックとは別物である。**テストによる同期検査の対象外**（数値の出どころはテストログ。固定値は `tests/mcp_token_reduction.rs` の `PINNED` が正本）。
+
+- 実行: `cargo test -p fandhe-browser-ai --features js-v8 --test page_scripts_snapshot_v8`（boa は `--features js-boa --test page_scripts_snapshot_boa`。macOS の boa は fail-closed のため V8 版が 3 OS を担う）
+- 経路: cdp の `navigate_gated` と同じ（実行 → 実行後 HTML を確定 → `snapshot_body`）を core の公開 API で再現。ai ⇔ cdp の依存禁止のためこの形にしている
+- 分母: 取得した生 HTML のトークン数（`PLUG-4` の定義どおり）。実行後 HTML のトークン数は参考として併記
+- 基準コミット: `dd92eab3`（V8・boa で数値は一致）
+
+### JS 有効時: サイト別
+
+| site | rawHtmlTokens | snapshotTokens | reductionPct | truncated | executedHtmlTokens | script stage |
+| ---- | ------------- | -------------- | ------------ | --------- | ------------------ | ------------ |
+| example-minimal | 103 | 77 | 25.2 | false | 103 | Skipped(NoScriptElement) |
+| wikipedia-article | 56482 | 32160 | 43.1 | false | 56482 | Skipped(NoScriptElement) |
+| hn-list | 10220 | 10797 | -5.6 | false | 10220 | Skipped(NoScriptElement) |
+| login-form | 284 | 174 | 38.7 | false | 283 | Executed |
+| mdn-docs | 19005 | 24753 | -30.2 | false | 19005 | Skipped(NoScriptElement) |
+
+### JS 有効時: 集計
+
+| pages | meanReductionPct | minReductionPct | maxReductionPct | medianSnapshotTokens | 84.0% との差（pt・表示のみ） |
+| ----- | ---------------- | --------------- | --------------- | -------------------- | ---------------------------- |
+| 5 | 14.2 | -30.2 | 43.1 | 10797.0 | 69.8 |
+
+### SPA 風フィクスチャ（テスト内蔵・JS が見出し・リスト・フォームを描画）
+
+| rawHtmlTokens | executedHtmlTokens | snapshotTokens（オフ） | snapshotTokens（オン） | reductionPct（オフ） | reductionPct（オン） |
+| ------------- | ------------------ | ---------------------- | ---------------------- | -------------------- | -------------------- |
+| 318 | 398 | 76 | 251 | 76.1 | 21.1 |
+
+### 所見
+
+- 5 サイトの snapshot は、有効時も既定オフと同一（トークン数・truncated・`login-form` を含むバイト列）。`<script` を持つのは `login-form` のみで、`<script src>` は loopback のためアクターの `Fetcher` が接続前に拒否し（`SrcFetchFailed`・`DisallowedAddress`）、JS は 1 行も実行されない。他 4 サイトは `Skipped(NoScriptElement)`。再シリアライズ由来の差も出なかった
+- 平均 14.2% は既定オフと同じで、84.0% 未達のまま。原因は JS 実行ではなく、応答が JSON ツリーのエンベロープであること（上の「所見」と同じ）。しきい値は変更していない
+- 描画を伴うページでは snapshot が JS 描画分だけ増える（SPA 風フィクスチャで 76 → 251 トークン）。これは取得対象が実行後 DOM になる `JS-4` の意図どおりの挙動
+- 例外メッセージ・console 出力・スクリプト本文は AI 向け出力（snapshot 本文・MCP テキスト）に混入しない。静的要素の `ref` は JS 実行の有無で一致し、再読み出し・再ナビゲーションでもバイト一致する（`AISNAP-6`・`AISNAP-10`）
