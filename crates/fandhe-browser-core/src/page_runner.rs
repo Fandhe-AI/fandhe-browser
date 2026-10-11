@@ -1386,6 +1386,18 @@ fn run_event_loop(
                 *abort = Some(PageAbort { kind, index: None });
                 break;
             }
+            // ページの残り時間が無いなら、タイマーを取り出して発火回数に数える前に打ち切る
+            // （取り出すと評価されないまま one-shot が失われ、報告が実態とずれる）。
+            if script_budget(
+                ctx.options.script_wall_time,
+                ctx.options.page_wall_time,
+                ctx.page_start.elapsed(),
+            )
+            .is_none()
+            {
+                *abort = Some(page_wall_abort(ctx.options, None));
+                break;
+            }
             let id = match ctx.bridge.next_timer().map_err(bridge_error)? {
                 NextStep::Due(id) => id,
                 NextStep::Idle => break,
@@ -1414,6 +1426,15 @@ fn run_event_loop(
                     *abort = Some(page_wall_abort(ctx.options, None));
                     break;
                 }
+            }
+            // shim は op のエラー（操作予算切れ）を握りつぶし、コールバックが走らないまま
+            // 完了する。予算切れはここで検出して打ち切る（`JS-6`）。
+            if ctx.bridge.op_limit_tripped().map_err(bridge_error)? {
+                *abort = Some(PageAbort {
+                    kind: AbortKind::ResourceLimit,
+                    index: None,
+                });
+                break;
             }
             ctx.bridge.rearm_timer(id).map_err(bridge_error)?;
         }

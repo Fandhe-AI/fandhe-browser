@@ -1170,6 +1170,17 @@ impl DomBridge {
         })
     }
 
+    /// 操作回数の予算（`max_ops_per_page`）を使い切ったかを返す（ランナー用。`JS-6`）。
+    ///
+    /// shim は `timerConsume` 等の op のエラーを握りつぶすため、予算切れはコールバックが
+    /// 黙って実行されない形で現れる。ランナーはタイマー評価後にこれを確認して打ち切る。
+    /// 未取り付けなら [`DomBridgeError::Detached`]。
+    pub fn op_limit_tripped(&self) -> Result<bool, DomBridgeError> {
+        let guard = self.lock()?;
+        let page = guard.page.as_ref().ok_or(DomBridgeError::Detached)?;
+        Ok(page.op_limit_tripped)
+    }
+
     /// イベントループの上限を設定する（ランナー用。`attach` のたびに既定へ戻る）。
     pub fn set_event_loop_limits(&self, limits: EventLoopLimits) -> Result<(), DomBridgeError> {
         let mut guard = self.lock()?;

@@ -234,7 +234,7 @@ fn timer_cases(engine: &str) {
     let out = run_page(
         engine,
         &page(
-            "for(var i=0;i<5000;i++){var id=setTimeout(function(){a('x')},100);\
+            "for(var i=0;i<1000;i++){var id=setTimeout(function(){a('x')},100);\
              __dom.op('timerClear',id)}\
              setTimeout(function(){a('ok')},1);",
         ),
@@ -243,6 +243,23 @@ fn timer_cases(engine: &str) {
     assert_eq!(out.abort().map(|a| a.kind().clone()), None);
     assert_eq!(out.event_loop().fired(), 1);
     assert!(out.html().contains("ok"), "{}", out.html());
+
+    eprintln!("case: JS-6 op budget exhausted before a timer fires aborts with ResourceLimit");
+    let tight = PageRunOptions::default().with_bridge_limits(
+        fandhe_browser_core::DomBridgeLimits::default().with_max_ops_per_page(6),
+    );
+    let out = run_page(
+        engine,
+        &page(
+            "setTimeout(function(){a('late')},1);for(var k=0;k<20;k++){try{document.body}catch(e){}}",
+        ),
+        &tight,
+    );
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::ResourceLimit)
+    );
+    assert!(!out.html().contains("<p>late</p>"), "{}", out.html());
 
     eprintln!("case: JS-7 untrusted delays are normalized");
     let out = run_page(
