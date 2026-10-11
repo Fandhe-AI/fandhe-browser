@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use fandhe_browser_profile::Profile;
 
+use crate::page_actor::PageScriptHandle;
 use crate::render::{DisabledRenderer, Renderer};
 
 /// 直近のナビゲート結果（最終 URL と HTML）。
@@ -97,6 +98,19 @@ impl NavigationGeneration {
     }
 }
 
+/// 遷移系列（[`NavigationState`] 1 つ）の識別子（TASK-112・`JS-4`）。
+///
+/// [`NavigationGeneration`] は [`NavigationState`] ごとの連番で、cdp はターゲットごとに別の
+/// [`NavigationState`] を持つため、世代の大小だけではターゲットをまたいだ比較ができない。
+/// ページスクリプトのアクター（`page_actor`）は「同じ scope で世代が新しい要求」だけを
+/// 古い要求の打ち切り対象にし、別ターゲットの実行を巻き込まない。
+/// 値はプロセス内で一意に採番する（比較・ハッシュ以外の意味は持たない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NavigationScope(u64);
+
+/// [`NavigationScope`] の採番元（プロセス内で単調増加）。
+static NEXT_NAVIGATION_SCOPE: AtomicU64 = AtomicU64::new(1);
+
 /// [`NavigationState`] の操作が失敗した理由（`CDP-1`）。
 ///
 /// 本モジュール内に閉じた契約であり、crate 全体の [`crate::error::Error`] には統合しない。
@@ -140,10 +154,16 @@ impl std::error::Error for StateError {}
 /// [`AppState`] が内包する。`Profile::open` が使えない OS でも単体で生成・テストできるよう
 /// 別型に切り出している。cdp の `Page.navigate` ハンドラが [`Self::begin_navigation`] →
 /// 取得 → [`Self::commit_navigation`] の順で呼び、ai は [`Self::latest`] で読む想定。
-#[derive(Default)]
 pub struct NavigationState {
     latest: Mutex<Option<Arc<NavigationResult>>>,
     generation: AtomicU64,
+    scope: NavigationScope,
+}
+
+impl Default for NavigationState {
+    fn default() -> Self {
+        Self::with_initial_generation(0)
+    }
 }
 
 impl fmt::Debug for NavigationState {
@@ -167,12 +187,23 @@ impl NavigationState {
         Self::default()
     }
 
-    #[cfg(test)]
-    fn with_generation(generation: u64) -> Self {
+    fn with_initial_generation(generation: u64) -> Self {
         Self {
             latest: Mutex::new(None),
             generation: AtomicU64::new(generation),
+            // wrap は実用上起こらない（u64）。起きても scope が重なるだけで安全側（打ち切り過多）。
+            scope: NavigationScope(NEXT_NAVIGATION_SCOPE.fetch_add(1, Ordering::Relaxed)),
         }
+    }
+
+    #[cfg(test)]
+    fn with_generation(generation: u64) -> Self {
+        Self::with_initial_generation(generation)
+    }
+
+    /// この遷移系列の識別子を返す（インスタンスの生存中は不変。TASK-112・`JS-4`）。
+    pub fn scope(&self) -> NavigationScope {
+        self.scope
     }
 
     /// 世代番号をインクリメントし、新しい世代を返す。
@@ -283,6 +314,7 @@ pub struct AppState {
     navigation: NavigationState,
     profile: Arc<Profile>,
     renderer: Arc<dyn Renderer>,
+    page_scripts: PageScriptHandle,
 }
 
 impl AppState {
@@ -293,7 +325,23 @@ impl AppState {
             navigation: NavigationState::new(),
             profile,
             renderer,
+            // 既定は無効（スレッドも子プロセスも作らない。`JS-1`）。有効化は `with_page_scripts`。
+            page_scripts: PageScriptHandle::disabled(),
         }
+    }
+
+    /// ページスクリプトのアクターのハンドルを差し替える（TASK-112・`JS-4`）。cli が設定
+    /// `[js] execute_page_scripts` から構築したハンドルを起動時に 1 度だけ渡す。
+    #[must_use]
+    pub fn with_page_scripts(mut self, handle: PageScriptHandle) -> Self {
+        self.page_scripts = handle;
+        self
+    }
+
+    /// ページスクリプトのアクターのハンドルを返す。cdp の `Page.navigate` 経路
+    /// （`CdpState::app_state()` 経由。TASK-113 以降）が使う。
+    pub fn page_scripts(&self) -> &PageScriptHandle {
+        &self.page_scripts
     }
 
     /// 描画ハンドルに [`DisabledRenderer`]（常に `RenderingDisabled` を返す）を使って構築する。
@@ -325,6 +373,7 @@ impl fmt::Debug for AppState {
         f.debug_struct("AppState")
             .field("profile_root", &self.profile.root())
             .field("generation", &self.navigation.current_generation().get())
+            .field("page_scripts_enabled", &self.page_scripts.is_enabled())
             .finish_non_exhaustive()
     }
 }

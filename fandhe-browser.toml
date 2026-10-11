@@ -16,6 +16,9 @@ isolation = "data-directory"
 # JS エンジン。"v8" または "boa"。省略時は同梱エンジンから v8、boa の順で選ぶ。
 # 未同梱のエンジンを指定すると設定エラーになる（別エンジンへはフォールバックしない）。
 # engine = "v8"
+# ページ内の <script> を実行するか（既定 false。TASK-112・JS-1・JS-4）。
+# true にはエンジンの同梱が必要で、エンジンなしのビルドでは設定エラーになる。
+execute_page_scripts = false
 
 [rendering]
 # レンダリング層（Servo）の有効化。既定は false。

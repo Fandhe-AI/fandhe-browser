@@ -11,8 +11,9 @@
 //!   存廃もそこで判断する。未設定時は設定なし（既定値）で従来どおり起動する
 //! - `[profile] root` は cli のプロファイル選択へ未配線のため、指定された設定は拒否する
 //!   （黙って無視しない。TASK-47.6・TASK-60.4 で配線する）
-//! - 選択された JS エンジンは検証のみで、`JsRuntime` の `AppState` への配線・起動時の
-//!   構造化ログ出力（`REPAIR-9`）は後続タスクで行う
+//! - 選択された JS エンジンの検証と、`[js] execute_page_scripts` によるページスクリプト実行
+//!   アクターのハンドル構築（`page_scripts` モジュール。TASK-112）までを行う。`Page.navigate`
+//!   への接続は TASK-113（#785）、起動時の構造化ログ出力（`REPAIR-9`）は後続タスク
 
 use std::ffi::OsString;
 use std::path::Path;
