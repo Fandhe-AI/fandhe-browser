@@ -26,8 +26,8 @@
 | site | rawHtmlTokens | snapshotTokens | reductionPct | truncated |
 | ---- | ------------- | -------------- | ------------ | --------- |
 | example-minimal | 103 | 77 | 25.2 | false |
-| wikipedia-article | 56482 | 32183 | 43.0 | false |
-| hn-list | 10220 | 10812 | -5.8 | false |
+| wikipedia-article | 56482 | 32160 | 43.1 | false |
+| hn-list | 10220 | 10797 | -5.6 | false |
 | login-form | 284 | 174 | 38.7 | false |
 | mdn-docs | 19005 | 24753 | -30.2 | false |
 
@@ -35,7 +35,7 @@
 
 | pages | meanReductionPct | minReductionPct | maxReductionPct | medianSnapshotTokens |
 | ----- | ---------------- | --------------- | --------------- | -------------------- |
-| 5 | 14.2 | -30.2 | 43.0 | 10812.0 |
+| 5 | 14.2 | -30.2 | 43.1 | 10797.0 |
 
 ### PLUG-4 verdict
 

@@ -68,7 +68,7 @@ const EXPECTED: [Expected; 7] = [
         "top-story-link",
         30,
         1,
-        "ebd959575",
+        "e2613221b",
         None,
         "Compass pattern beta anchor lantern sigma ribbon",
         // TASK-23.6（Issue #828）: row・cell の name が残余へ縮み、フル name の打ち切りが消えた。

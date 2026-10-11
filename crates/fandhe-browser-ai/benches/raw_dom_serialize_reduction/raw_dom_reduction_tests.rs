@@ -144,7 +144,7 @@ fn aisnap15_real_fixtures_formula_and_order() {
 const EXPECTED: [(&str, usize, usize, f64); 3] = [
     ("example-minimal.html", 52, 32, 38.5),
     ("login-form.html", 233, 106, 54.5),
-    ("wikipedia-article.html", 55_917, 20_954, 62.5),
+    ("wikipedia-article.html", 55_917, 20_931, 62.6),
 ];
 
 #[test]

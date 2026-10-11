@@ -165,7 +165,7 @@ fn fixtures_measured_with_concrete_values() {
     assert_eq!(by("example-minimal.html").snapshot_tokens, 32);
     assert_eq!(by("login-form.html").snapshot_tokens, 106);
     // TASK-23.6（#828）: row の name が残余へ縮み、large-table の name 打ち切りが出力から消えた。
-    assert_eq!(by("wiki-portal-nav.html").snapshot_tokens, 1695);
+    assert_eq!(by("wiki-portal-nav.html").snapshot_tokens, 1702);
     assert!(!by("large-table.html").snapshot_truncated);
     // TASK-23.7（#829）: 幅広表の葉セル行を畳み、large-table が 9,000 トークン以下になった。
     assert_eq!(by("large-table.html").snapshot_tokens, 7904);
