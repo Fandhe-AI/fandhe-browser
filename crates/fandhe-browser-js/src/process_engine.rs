@@ -1613,6 +1613,23 @@ impl V8ProcessEngine {
         MAX_RAW_FRAME_BYTES_FOR_TEST
     }
 
+    /// テスト専用: 保持している子プロセスを終了させて stderr の末尾を回収
+    /// して返す（子が未起動なら `None`）。
+    ///
+    /// `JS-1`・`TASK-29`・Issue #520: 子の V8 Platform が Protected で初期化
+    /// されたことを、`worker_main` が常に出す
+    /// `"v8 platform initialized as {:?}"` 診断行から検証するために使う
+    /// （`tests/v8_worker.rs`）。[`WorkerHandle::reap_and_collect_stderr`] を
+    /// 呼ぶため子は終了し、`self.worker` は `None` に戻る（次回の
+    /// `evaluate_script` が新しい子を起動する）。feature `test-support` 有効
+    /// 時のみ存在する。
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn stderr_tail_for_test(&mut self) -> Option<String> {
+        let mut worker = self.worker.take()?;
+        Some(worker.reap_and_collect_stderr())
+    }
+
     /// 子プロセスを起動し、ハンドシェイクの後、ホスト登録簿の注入関数を
     /// 登録フレームで登録し直す（初回・再起動とも。`TASK-29.4`・Issue #155、
     /// #527）。登録に失敗した子は破棄して `EngineUnavailable` を返す。

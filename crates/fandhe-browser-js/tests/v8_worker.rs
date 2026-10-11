@@ -81,6 +81,8 @@ fn main() -> ExitCode {
 
     eprintln!("case: js_1_normal_evaluation_returns_expected_value");
     js_1_normal_evaluation_returns_expected_value();
+    eprintln!("case: js_1_worker_process_initializes_v8_platform_as_protected");
+    js_1_worker_process_initializes_v8_platform_as_protected();
     eprintln!("case: js_1_state_persists_across_evaluations");
     js_1_state_persists_across_evaluations();
     eprintln!("case: js_1_infinite_loop_times_out_but_context_survives");
@@ -203,6 +205,47 @@ fn js_1_normal_evaluation_returns_expected_value() {
         .evaluate_script("1 + 2 * 3", &EvaluateOptions::default())
         .unwrap_or_else(|err| panic!("arithmetic expression must evaluate successfully: {err}"));
     assert_eq!(result, JsValue::Number(7.0));
+}
+
+/// `JS-1`・`TASK-29`・Issue #520 レビュー指摘対応: 通常の起動経路
+/// （このテスト固有の環境変数上書きは一切使わない）で子プロセスが実際に
+/// [`fandhe_browser_js::process_engine::V8ProcessEngine`] 経由で起動され、
+/// V8 の Platform を `V8PlatformKind::Protected` で初期化したことを検証
+/// する回帰テスト。
+///
+/// `super::worker::worker_main` は実際に選ばれた Platform 種別を
+/// stderr へ `"v8 platform initialized as {:?}"` として常に出力する
+/// （`worker.rs` 参照）。本テストは評価を 1 回成功させたあと
+/// `stderr_tail_for_test` で子の stderr を回収し、この行に `Protected`
+/// が含まれる（`Unprotected` ではない）ことをアサートする。
+///
+/// 将来、`worker_main` 内でプロトコルバージョン検証より前・
+/// `enforce_child_memory_limit()` より前に誤って `ensure_v8_initialized`
+/// （Unprotected 版）を呼ぶコードが混入した場合、`V8_PLATFORM` の
+/// `OnceLock` が先に `Unprotected` で確定してしまい、本来の
+/// `ensure_v8_initialized_with(Protected)` 呼び出しは要求どおりの結果を
+/// 得られず `actual_platform` が `Unprotected` のままになる
+/// （`v8_engine.rs` の `ensure_v8_initialized_with` ドキュメントコメント
+/// 参照）。このとき stderr の診断行は `"initialized as Unprotected"` に
+/// なり、本テストはこの回帰を検出して失敗する。
+fn js_1_worker_process_initializes_v8_platform_as_protected() {
+    let mut engine = V8ProcessEngine::new();
+    let result = engine
+        .evaluate_script("1 + 1", &EvaluateOptions::default())
+        .unwrap_or_else(|err| panic!("arithmetic expression must evaluate successfully: {err}"));
+    assert_eq!(result, JsValue::Number(2.0));
+
+    let tail = engine
+        .stderr_tail_for_test()
+        .unwrap_or_else(|| panic!("worker process must have been spawned by evaluate_script"));
+    assert!(
+        tail.contains("v8 platform initialized as Protected"),
+        "expected the worker process stderr to report the Protected platform kind, got: {tail}"
+    );
+    assert!(
+        !tail.contains("thread-isolated allocation is not active"),
+        "worker process reported that thread-isolated allocation is not active; stderr: {tail}"
+    );
 }
 
 /// JS-1・Issue #503 W6 観点 2「評価をまたいだ状態の保持」: `var` で定義
