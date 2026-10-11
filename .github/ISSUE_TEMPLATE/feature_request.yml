@@ -1,0 +1,61 @@
+name: 機能要望・改善提案
+description: 新機能や改善を提案する
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        - UA 文字列・フィンガープリントの偽装、anti-bot 回避、認証突破を目的とする機能は受け付けません（`SEC-1`・`SEC-2`）。
+        - 依存の追加を伴う提案は、実装 PR の前にこの Issue で相談してください（CONTRIBUTING.md「依存の追加」）。
+        - 仕様（ビヘイビア定義）自体の変更が必要な提案は、spec リポ側での判断になります。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 解決したい課題・ユースケース
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 提案する挙動・API
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 検討した代替案
+  - type: dropdown
+    id: area
+    attributes:
+      label: 関連する領域
+      multiple: true
+      options:
+        - core
+        - js
+        - ai
+        - cdp
+        - render
+        - profile
+        - cli
+        - mcp
+        - harness・CI
+        - 不明
+  - type: input
+    id: spec
+    attributes:
+      label: 関連する TASK-n・ビヘイビア ID・MS-n
+  - type: textarea
+    id: impact
+    attributes:
+      label: 影響の見込み
+      description: 新規依存の要否・バイナリサイズ・3 OS 対応・既定ビルドへの影響を書いてください。
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 確認事項
+      options:
+        - label: 既存の Issue を検索した
+          required: true
+        - label: 偽装・検出回避を目的とする機能の要望ではない
+          required: true

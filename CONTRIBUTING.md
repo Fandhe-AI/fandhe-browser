@@ -59,6 +59,8 @@ clippy 警告は 0 件を維持する。テストの skip・ignore やアサー�
 
 ## コミット・PR 手順
 
+不具合報告・機能要望は [Issue テンプレート](.github/ISSUE_TEMPLATE/)から起票する。
+
 1. `main` からブランチを作成する
 2. コミットは [Conventional Commits](.claude/rules/conventional-commits.md) 形式で書く: `<type>(<scope>): <日本語の説明>`
    - type は 9 種（feat / fix / refactor / perf / test / docs / ci / build / chore）に限る
@@ -71,7 +73,7 @@ clippy 警告は 0 件を維持する。テストの skip・ignore やアサー�
    - フックを追加・変更する場合は [git-hooks.md](.claude/rules/git-hooks.md) の方針（時間予算・CI と重複する検査を置かない）に従う
    - **`--no-verify` の使用は禁止**（フックを必ず通す）
 4. 1 つの PR には 1 つの関心事だけを含める。実装中にスコープ外と判断した事項は放置せず [out-of-scope-tracking.md](.claude/rules/out-of-scope-tracking.md) の手順で Issue に記録する
-5. PR 本文にはローカルゲートの実行結果を記載する。OS 依存の変更を含む場合は 3 OS（Linux・macOS・Windows）での結果も記載する
+5. PR 本文には [PR テンプレート](.github/PULL_REQUEST_TEMPLATE.md) の各節を埋め、ローカルゲートの実行結果を記載する。OS 依存の変更を含む場合は 3 OS（Linux・macOS・Windows）での結果も記載する
 6. CI は Linux・macOS・Windows の 3 OS ネイティブランナーで実行される
 7. AI レビュー（`.github/workflows/ai-review.yml`）は [AGENTS.md](./AGENTS.md) をレビュー観点として参照する（優先度 P0〜P2）
 8. 提出前に OWASP Top 10・偽装機能の禁止・プロファイル境界の観点でセキュリティを確認する（[security.md](.claude/rules/security.md)）

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 脆弱性の報告
+    url: https://github.com/Fandhe-AI/fandhe-browser/security/advisories/new
+    about: 脆弱性は公開 Issue に書かず、こちらから非公開で報告してください。
+  - name: 貢献手順
+    url: https://github.com/Fandhe-AI/fandhe-browser/blob/main/CONTRIBUTING.md
+    about: 開発環境構築・ローカル検証・PR 手順を確認できます。
