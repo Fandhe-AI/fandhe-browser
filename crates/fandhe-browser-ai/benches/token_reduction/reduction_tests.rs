@@ -75,6 +75,27 @@ fn render_covers_every_output_field() {
     assert_eq!(TokenCounter::new().expect("tokenizer").count(&text), 105);
 }
 
+/// AISNAP-1・Issue #874: placeholder 由来の name にだけ出所を付記する。
+#[test]
+fn render_annotates_placeholder_name_source_only() {
+    use fandhe_browser_ai::snapshot::NameSource;
+    let ph = Snapshot::new(
+        Node::new("textbox", "search")
+            .with_ref("e1")
+            .with_name_source(NameSource::Placeholder),
+    );
+    assert_eq!(
+        render_snapshot(&ph),
+        "- textbox \"search\" (placeholder) [e1]"
+    );
+    let label = Snapshot::new(
+        Node::new("textbox", "search")
+            .with_ref("e1")
+            .with_name_source(NameSource::Label),
+    );
+    assert_eq!(render_snapshot(&label), "- textbox \"search\" [e1]");
+}
+
 #[test]
 fn render_omits_data_leaf_marker() {
     let plain = Snapshot::new(Node::new("cell", "x").with_ref("e1"));

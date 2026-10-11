@@ -7,7 +7,7 @@
     rising {link "rising"=e9e36ecc5}
     top {link "top"=e1030202e}
   - link "login or register" [ec05ccea3]
-  - textbox "search" [e3ab79c93]
+  - textbox "search" (placeholder) [e3ab79c93]
   - button [ed694293c]
   - heading "Discussion" [ec85b07b3]
     - link "Discussion" [e16503b9c]

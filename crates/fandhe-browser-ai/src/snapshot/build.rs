@@ -965,15 +965,17 @@ fn build_snapshot_inner(
                 None
             }
         });
-        let (out_name, covering) = match value {
+        // 出力 name の出所も併せて決める（Issue #874）。補完値があればその出所を優先する。
+        let (out_name, covering, out_source) = match value {
             Some(v) => {
                 truncated |= v.truncated;
                 let covering = is_name_covering(doc, child, &v);
-                (v.text, covering)
+                (v.text, covering, v.source)
             }
             None => (
                 accessible.text.clone(),
                 is_name_covering(doc, child, &accessible),
+                accessible.source,
             ),
         };
         let name = accessible.text;
@@ -985,7 +987,10 @@ fn build_snapshot_inner(
             sig = sig.with_scope(scope);
         }
         let elem_ref = refs.allocate_signature(&sig)?;
-        let mut node = Node::new(role, out_name.clone()).with_state(compute_state(doc, child));
+        // TASK-23.6 の残余への縮約は Content 由来のときだけ働くので placeholder とは干渉しない。
+        let mut node = Node::new(role, out_name.clone())
+            .with_name_source(out_source)
+            .with_state(compute_state(doc, child));
         node.data_leaf = data_leaf;
         // 規則的な表・一覧は子孫を展開せず 1 ノードへ圧縮する（AISNAP-2・TASK-12.5）。
         let compressible_kind = ["table", "ul", "ol"]
@@ -1667,6 +1672,68 @@ mod tests {
         got.sort();
         assert_eq!(got, expected);
         assert!(holders.iter().all(|h| h.role != "listitem"));
+    }
+
+    /// 指定 role の最初のノードの (name, name_source, ref) を返す（テスト用）。
+    fn first_of_role(
+        s: &Snapshot,
+        role: &str,
+    ) -> (String, crate::snapshot::NameSource, Option<String>) {
+        let n = all_nodes(&s.tree)
+            .into_iter()
+            .find(|n| n.role == role)
+            .expect("該当 role のノードが存在する");
+        (n.name.clone(), n.name_source, n.r#ref.clone())
+    }
+
+    /// AISNAP-1・Issue #874: name の出所を Node に保持する（placeholder・label 優先・他の出所）。
+    #[test]
+    fn aisnap_1_name_source_is_recorded() {
+        use crate::snapshot::NameSource;
+        let s = snap("<body><input type=\"search\" placeholder=\"Find\"></body>");
+        let (name, src, _) = first_of_role(&s, "searchbox");
+        assert_eq!((name.as_str(), src), ("Find", NameSource::Placeholder));
+
+        // python-portal と同じ構成: label[for] があれば placeholder ではなく Label。
+        let s = snap(
+            "<body><label for=\"q\">Search</label><input id=\"q\" type=\"search\" placeholder=\"Find\"></body>",
+        );
+        let (name, src, _) = first_of_role(&s, "searchbox");
+        assert_eq!((name.as_str(), src), ("Search", NameSource::Label));
+
+        let s = snap("<body><input type=\"text\" aria-label=\"Q\" placeholder=\"Find\"></body>");
+        let (name, src, _) = first_of_role(&s, "textbox");
+        assert_eq!((name.as_str(), src), ("Q", NameSource::AriaLabel));
+
+        let s = snap("<body><button>Go</button></body>");
+        let (name, src, _) = first_of_role(&s, "button");
+        assert_eq!((name.as_str(), src), ("Go", NameSource::Content));
+
+        let s = snap("<body><input type=\"text\" title=\"T\"></body>");
+        let (name, src, _) = first_of_role(&s, "textbox");
+        assert_eq!((name.as_str(), src), ("T", NameSource::Title));
+    }
+
+    /// AISNAP-1・Issue #874: 隣接テキストで補った checkbox の出所は AdjacentText。
+    #[test]
+    fn aisnap_1_adjacent_text_name_source() {
+        use crate::snapshot::NameSource;
+        let s = snap("<body><div><input type=\"checkbox\">Remember me</div></body>");
+        let (name, src, _) = first_of_role(&s, "checkbox");
+        assert_eq!(name, "Remember me");
+        assert_eq!(src, NameSource::AdjacentText);
+    }
+
+    /// AISNAP-10・Issue #874: 出所は ref シグネチャに混ざらない（同じ accname なら出所が違っても同 ref）。
+    #[test]
+    fn aisnap_10_ref_is_independent_of_name_source() {
+        let a = snap("<body><input type=\"text\" placeholder=\"x\"></body>");
+        let b = snap("<body><input type=\"text\" title=\"x\"></body>");
+        let (_, sa, ra) = first_of_role(&a, "textbox");
+        let (_, sb, rb) = first_of_role(&b, "textbox");
+        assert_ne!(sa, sb);
+        assert!(ra.is_some());
+        assert_eq!(ra, rb);
     }
 
     /// AISNAP-10: 同名ボタンは別 ref。id 付きは前方への挿入で ref を保つ。

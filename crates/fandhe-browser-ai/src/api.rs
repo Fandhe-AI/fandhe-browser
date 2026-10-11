@@ -309,6 +309,9 @@ fn node_json(node: &Node) -> Value {
     if let Some(c) = node.state.checked {
         m.insert("checked".into(), json!(c == CheckedState::Checked));
     }
+    if let Some(h) = node.name_source.output_hint() {
+        m.insert("name_source".into(), json!(h));
+    }
     if let Some(k) = node.data_leaf {
         m.insert("data_leaf".into(), json!(data_leaf_str(k)));
     }
@@ -754,5 +757,21 @@ mod tests {
         assert!(node_json(&n).get("folded_rows_omitted").is_none());
         n.folded_rows_omitted = 30;
         assert_eq!(node_json(&n)["folded_rows_omitted"], 30);
+    }
+
+    /// AISNAP-1・Issue #874: `name_source` は placeholder 由来のときだけ出す。
+    #[test]
+    fn aisnap1_node_json_emits_name_source_only_for_placeholder() {
+        use crate::snapshot::NameSource;
+        let n = Node::new("textbox", "search").with_name_source(NameSource::Placeholder);
+        assert_eq!(node_json(&n)["name_source"], "placeholder");
+        for s in [
+            NameSource::Label,
+            NameSource::AriaLabel,
+            NameSource::Content,
+        ] {
+            let n = Node::new("textbox", "search").with_name_source(s);
+            assert!(node_json(&n).get("name_source").is_none(), "{s:?}");
+        }
     }
 }
