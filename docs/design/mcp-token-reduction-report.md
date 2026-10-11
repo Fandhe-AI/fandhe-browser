@@ -45,7 +45,7 @@
 
 ## 所見
 
-- `hn-list`・`mdn-docs` は削減率が負（snapshot が生 HTML より大きい）。現行ホストが PoC-5 のフラット形式ではなく JSON ツリーのエンベロープを返すため。TASK-23.3（#826）の名前なし generic の折り畳みで他 3 サイトは正に転じたが、いずれも 84.0% には遠い。TASK-23.6（#828）の row・cell の name 重複除去と無名 listitem の折り畳みで wikipedia-article・hn-list がさらに縮み、平均は 2.2% になった
+- `hn-list`・`mdn-docs` は削減率が負（snapshot が生 HTML より大きい）。現行ホストが PoC-5 のフラット形式ではなく JSON ツリーのエンベロープを返すため。TASK-23.3（#826）の名前なし generic の折り畳みで他 3 サイトは正に転じたが、いずれも 84.0% には遠い。TASK-23.6（#828）の row・cell の name 重複除去と無名 listitem の折り畳みで wikipedia-article・hn-list がさらに縮み、平均は 1.5% になった
 - 合成フィクスチャのため、PoC-15 の実ページ（87.8%）とは厳密に比較できない
 - TASK-23.6 以降、`hn-list` の snapshot は truncated ではない（フル name の 120 文字打ち切りが出力から消えたため）
 

@@ -1000,6 +1000,19 @@ fn build_snapshot_inner(
                 && compressed.rows.iter().all(|r| !r.truncated)
                 && !headers.iter().any(|h| h.name_truncated);
             truncated |= headers.iter().any(|h| h.name_truncated);
+            // 打ち切り・省略があるときは、全文を出せた行・ヘッダーだけを covered に入れる。
+            // 切り詰められた行・セルと省略行は親 name 側に残し、可視の行だけが残余 name の
+            // 上限を消費しないようにする（TASK-23.6）。
+            if !table_complete {
+                covered.extend(headers.iter().filter(|h| !h.name_truncated).map(|h| h.cell));
+                covered.extend(
+                    compressed
+                        .rows
+                        .iter()
+                        .filter(|r| !r.truncated)
+                        .map(|r| r.row),
+                );
+            }
             #[cfg(test)]
             if let Some(sink) = sink.as_deref_mut() {
                 for h in &headers {
@@ -1049,7 +1062,7 @@ fn build_snapshot_inner(
                 compressed.truncated_rows,
             ));
             // 圧縮したコンテナのテキストはヘッダ・行・controls に出る（TASK-23.6）。
-            // 打ち切り・省略があれば完全被覆ではないので親 name に残す。
+            // 打ち切り・省略があれば表全体は被覆せず、上で行・ヘッダー単位で被覆済み。
             if table_complete {
                 covered.insert(child);
             }

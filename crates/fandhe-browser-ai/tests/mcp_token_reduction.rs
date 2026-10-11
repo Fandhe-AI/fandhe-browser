@@ -10,7 +10,7 @@
 //! コミット済みレポートとの同期は `plug4_committed_report_contains_rendered_block` が検査する。
 //! 再利用が要る場合は判定を `benches/token_reduction/` へ移す。
 //!
-//! 実データの現状: 平均削減率は 84.0% に届いていない（約 2.2%）。PLUG-4 の前提は PoC-5 の
+//! 実データの現状: 平均削減率は 84.0% に届いていない（約 1.5%）。PLUG-4 の前提は PoC-5 の
 //! フラット形式だが、現行ホストは JSON ツリーのエンベロープを返し生 HTML より大きいため
 //! （PLUG-5・TASK-97・AISNAP-6 の論点）。実データの verdict は未達のまま固定して事実を記録し
 //! （REPAIR-3）、合否ロジックは合成データで境界値まで検証する。
@@ -415,7 +415,7 @@ fn plug4_threshold_nan_is_shortfall() -> TestResult<()> {
     Ok(())
 }
 
-/// `PLUG-4`: 実データの現状 verdict（84.0% 未達・平均約 2.2%）を固定する。
+/// `PLUG-4`: 実データの現状 verdict（84.0% 未達・平均約 1.5%）を固定する。
 ///
 /// これは PLUG-4 未達の事実の記録であり、達成を装うものではない（REPAIR-3）。snapshot の出力形式
 /// が縮んで verdict が `Met` に変わったら、本テストを `assert_plug4(&summary)?` による本ゲートに
