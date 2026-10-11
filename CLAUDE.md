@@ -121,6 +121,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 | [dependency-policy.md](.claude/rules/dependency-policy.md) | **リポ固有**: 依存最小・`=x.y.z` 固定・ユーザー承認制 |
 | [licensing.md](.claude/rules/licensing.md) | **リポ固有**: デュアルライセンス・Servo MPL 隔離・GPL 系禁止・NOTICE |
 | [ci.md](.claude/rules/ci.md) | **リポ固有**: ローカルゲート・3 OS CI・feature 分離検証 |
+| [git-hooks.md](.claude/rules/git-hooks.md) | **リポ固有**: lefthook のフック編集方針（時間予算・CI と重複する検査を置かない・明示的な例外） |
 
 ## Current Skills
 
