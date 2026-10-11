@@ -459,6 +459,24 @@ else
   expect_exit "run_core total timeout" 0 bash "$RUN_CORE" --no-spawn --endpoint "$EP" --tasks "$WORK/hang.json" --out "$WORK/hang2.out.jsonl" --task-timeout 5 --total-timeout 1
   expect_eq "$(jq -sc '[.[] | select(.type=="result") | .reason]' "$WORK/hang2.out.jsonl")" '["blocked","blocked"]' "run_core blocked after total timeout"
 
+  # 回帰（Issue #844・MEAS-4）: タイマー発火が時計上の期限より僅かに早い状況を preload で再現し、
+  # 全体期限のタスクが timeout に化けず blocked で確定すること、個別期限のタスクは blocked に化けないことを確認する
+  cat >"$WORK/early_timer.cjs" <<'EARLY'
+const orig = globalThis.setTimeout;
+globalThis.setTimeout = (fn, ms, ...rest) => orig(fn, Math.max(0, ms - 5), ...rest);
+EARLY
+  rc_early() { # $1=task-timeout(ms) $2=total-timeout(ms) $3=出力先
+    FC_ENDPOINT="$EP" FC_TASKS="$WORK/hang.json" FC_TASK_TIMEOUT_MS="$1" FC_TOTAL_TIMEOUT_MS="$2" \
+      "$NODE_BIN" --require "$WORK/early_timer.cjs" "$SCRIPT_DIR/run_core.mjs" >"$3" 2>/dev/null
+  }
+  expect_exit "run_core early timer total" 0 rc_early 5000 1000 "$WORK/early1.out.jsonl"
+  expect_eq "$(jq -sc '[.[] | select(.type=="result") | .reason]' "$WORK/early1.out.jsonl")" '["blocked","blocked"]' "run_core blocked despite early timer"
+  expect_exit "run_core early timer task" 0 rc_early 1000 1200000 "$WORK/early2.out.jsonl"
+  expect_eq "$(jq -sc '[.[] | select(.type=="result") | .reason]' "$WORK/early2.out.jsonl")" '["timeout",null]' "run_core timeout stays timeout with early timer"
+  # 同値（--task-timeout == --total-timeout）は全体期限を優先する
+  expect_exit "run_core equal timeouts" 0 bash "$RUN_CORE" --no-spawn --endpoint "$EP" --tasks "$WORK/hang.json" --out "$WORK/hang3.out.jsonl" --task-timeout 1 --total-timeout 1
+  expect_eq "$(jq -sc '[.[] | select(.type=="result") | .reason]' "$WORK/hang3.out.jsonl")" '["blocked","blocked"]' "run_core equal timeouts prefer total"
+
   # 出力の原子性: 失敗時は既存の --out を壊さない
   printf 'KEEP\n' >"$WORK/keep.jsonl"
   expect_exit "run_core no endpoint" 2 bash "$RUN_CORE" --no-spawn --endpoint "http://127.0.0.1:1" --out "$WORK/keep.jsonl"
