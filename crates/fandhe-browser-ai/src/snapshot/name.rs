@@ -108,6 +108,11 @@ use super::state::is_html_element_named;
 /// ための上限（security.md「不安全な設計」対策）。
 const MAX_NAME_CHARS: usize = 120;
 
+/// データ葉（価格・本文 span・引用）の値テキストの文字数上限（`AISNAP-3`・`AISNAP-11`・
+/// TASK-17・Issue #833）。通常の name 上限（[`MAX_NAME_CHARS`]）だと長い引用本文が欠けるため、
+/// 注釈側の上限（300 文字）と揃えた専用値を使う。超過分は `truncated` で通知する。
+pub(super) const MAX_DATA_LEAF_VALUE_CHARS: usize = 300;
+
 /// 1 断片（label・`aria-labelledby` の参照先）から折り畳み後に集めるテキストの
 /// 文字数上限。マルチバイト文字・複数断片分の余裕を見込み [`MAX_NAME_CHARS`] の
 /// 数倍を確保する。これを超える分は集めない（[`MAX_NAME_CHARS`] < 本値のため、
@@ -339,6 +344,9 @@ fn has_non_whitespace(s: &str) -> bool {
 ///   これにより `text` が空白で終わることは絶対にない
 struct NameBuffer {
     text: String,
+    /// 文字数の上限。既定は [`MAX_NAME_CHARS`]、データ葉の値だけ
+    /// [`MAX_DATA_LEAF_VALUE_CHARS`]（[`NameBuffer::with_limit`]）。
+    max_chars: usize,
     char_count: usize,
     pending_space: bool,
     truncated: bool,
@@ -346,8 +354,14 @@ struct NameBuffer {
 
 impl NameBuffer {
     fn new() -> Self {
+        Self::with_limit(MAX_NAME_CHARS)
+    }
+
+    /// 文字数上限を指定して作る（データ葉の値テキスト用。TASK-17・Issue #833）。
+    fn with_limit(max_chars: usize) -> Self {
         Self {
             text: String::new(),
+            max_chars,
             char_count: 0,
             pending_space: false,
             truncated: false,
@@ -356,7 +370,7 @@ impl NameBuffer {
 
     /// 上限に達し、これ以上文字を追記できない状態かどうか。
     fn is_full(&self) -> bool {
-        self.char_count >= MAX_NAME_CHARS
+        self.char_count >= self.max_chars
     }
 
     /// 後続に非空白文字が来たときだけ実体化する区切りを予約する
@@ -387,7 +401,7 @@ impl NameBuffer {
             if self.pending_space && !self.text.is_empty() {
                 // 区切りと直後の 1 文字の両方が入るときだけ区切りを実体化する。
                 // 入らない場合は両方を捨てる（`text` が空白で終わらない）。
-                if self.char_count + 2 > MAX_NAME_CHARS {
+                if self.char_count + 2 > self.max_chars {
                     self.truncated = true;
                     self.pending_space = false;
                     return;
@@ -1288,6 +1302,16 @@ fn allows_name_from_content(doc: &Document, id: NodeId) -> bool {
 /// - テキストなし・打ち切りあり: `Some` の空の名前（`truncated: true`。走査しきれて
 ///   いない以上「名前なし」と確定できないため `title` へフォールバックさせない）
 fn content_name(doc: &Document, index: &NameIndex, id: NodeId) -> Option<AccessibleName> {
+    content_name_with_limit(doc, index, id, MAX_NAME_CHARS)
+}
+
+/// [`content_name`] の本体。文字数上限だけ呼び出し側が指定する。
+fn content_name_with_limit(
+    doc: &Document,
+    index: &NameIndex,
+    id: NodeId,
+    max_chars: usize,
+) -> Option<AccessibleName> {
     // 索引（= 1 回のスナップショット構築）全体で共有する残り予算で上限する。
     let budget = index.content_steps_left.get();
     let mut text = String::new();
@@ -1306,7 +1330,7 @@ fn content_name(doc: &Document, index: &NameIndex, id: NodeId) -> Option<Accessi
         .content_steps_left
         .set(budget.saturating_sub(scan.steps_used));
 
-    let mut buf = NameBuffer::new();
+    let mut buf = NameBuffer::with_limit(max_chars);
     buf.push_str(&text);
     let truncated = scan.cut || buf.truncated;
     if buf.text.is_empty() {
@@ -1315,6 +1339,21 @@ fn content_name(doc: &Document, index: &NameIndex, id: NodeId) -> Option<Accessi
     let mut result = buf.finish(NameSource::Content);
     result.truncated = truncated;
     Some(result)
+}
+
+/// データ葉（価格・本文 span・引用）の値テキストを、出力用 name として算出する
+/// （`AISNAP-3`・`AISNAP-11`・TASK-17・Issue #833）。
+///
+/// 呼び出し元: `snapshot::build` が、accname が空のデータ葉（PriceClass・ProseClass・Quote）に
+/// だけ呼ぶ。値は出力 `Node::name` にのみ使い、ref シグネチャへは渡さない（`AISNAP-10`）。
+/// 走査規則・予算・戻り値の契約は [`content_name`] と同じで、文字数上限だけ
+/// [`MAX_DATA_LEAF_VALUE_CHARS`] を使う。
+pub(super) fn compute_data_leaf_value(
+    doc: &Document,
+    index: &NameIndex,
+    id: NodeId,
+) -> Option<AccessibleName> {
+    content_name_with_limit(doc, index, id, MAX_DATA_LEAF_VALUE_CHARS)
 }
 
 /// row・cell の出力 name を、`covered`（部分木のテキストが子孫ノードの name で出力済みの

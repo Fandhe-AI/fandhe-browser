@@ -50,7 +50,7 @@ const EXPECTED: [Expected; 7] = [
         1,
         "eebd41136-6",
         Some(DataLeafKind::PriceClass),
-        "",
+        "£10.00",
         false,
     ),
     ("number-input", 1, 1, "e07e25f71", None, "Number", false),
@@ -282,7 +282,7 @@ fn aisnap_3_tsv_rows_have_header_column_count_and_concrete_text() {
     assert_eq!(
         c.get(1).map(format_row).as_deref(),
         Some(
-            "price-first\tec-product-list.html\tp.price_color\tyes\t20\t1\teebd41136-6\tPriceClass\t-\tfalse\t-"
+            "price-first\tec-product-list.html\tp.price_color\tyes\t20\t1\teebd41136-6\tPriceClass\t£10.00\tfalse\t-"
         )
     );
 }
@@ -512,4 +512,23 @@ fn task_23_5_omitted_collision_partner_makes_digest_ambiguous() {
     // 先頭 8 桁を共有する相手がいなければ一意。自分自身だけの集合も一意。
     assert!(retention_check::digest_is_display_unique(other, &dom));
     assert!(retention_check::digest_is_display_unique(target, &[target]));
+}
+
+/// AISNAP-3・TASK-17（#833）: 値（name）が空のデータ葉は、印と ref があっても一致としない。
+#[test]
+fn task_17_data_leaf_with_empty_name_is_not_identified() {
+    let root = Node::new("document", "").with_children(vec![
+        Node::new("generic", "")
+            .with_ref("eeb")
+            .with_data_leaf(DataLeafKind::PriceClass),
+    ]);
+    let task = TASKS.iter().find(|t| t.id == "price-first").expect("task");
+    let c = judge(task, 1, Some("£10.00"), &[], &flatten(&root), false);
+    assert_eq!(c.snapshot_matches, 0);
+    assert_eq!(
+        c.verdict,
+        Verdict::NotIdentified {
+            reason: NotIdentifiedReason::NoMatchingNode
+        }
+    );
 }

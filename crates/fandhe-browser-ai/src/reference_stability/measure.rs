@@ -415,11 +415,11 @@ fn aisnap_10_measure_break_rate() {
             ("03-dropdown-select", st),
             ("04-checkbox-first", amb),
             ("05-number-input", st),
-            ("06-quote-text", amb),
+            ("06-quote-text", st),
             ("07-quote-tag-link", amb),
             ("08-hn-first-title", st),
             ("09-hn-more-link", st),
-            ("10-ec-price", amb),
+            ("10-ec-price", st),
             ("11-ec-product-link", st),
             ("12-table-header-cell", amb),
             ("13-table-data-cell", Verdict::Excluded),
@@ -447,11 +447,11 @@ fn aisnap_10_measure_break_rate() {
             ("03-dropdown-select", 1, Same),
             ("04-checkbox-first", 2, Same),
             ("05-number-input", 1, Same),
-            ("06-quote-text", 10, Same),
+            ("06-quote-text", 1, Same),
             ("07-quote-tag-link", 2, Same),
             ("08-hn-first-title", 1, Same),
             ("09-hn-more-link", 1, Same),
-            ("10-ec-price", 22, Same),
+            ("10-ec-price", 1, Same),
             ("11-ec-product-link", 1, Same),
             ("12-table-header-cell", 2, Same),
             ("13-table-data-cell", 0, NoRefBefore),
@@ -476,21 +476,21 @@ fn aisnap_10_measure_break_rate() {
         all,
         Summary {
             measured: 18,
-            broken: 6,
+            broken: 4,
             excluded: 1
         }
     );
-    assert_eq!(percent(all.broken, all.measured).as_deref(), Ok("33.3"));
+    assert_eq!(percent(all.broken, all.measured).as_deref(), Ok("22.2"));
     let poc = summarize(rows.iter().filter(|r| r.def.poc_case.is_some()));
     assert_eq!(
         poc,
         Summary {
             measured: 14,
-            broken: 5,
+            broken: 3,
             excluded: 1
         }
     );
-    assert_eq!(percent(poc.broken, poc.measured).as_deref(), Ok("35.7"));
+    assert_eq!(percent(poc.broken, poc.measured).as_deref(), Ok("21.4"));
 }
 
 /// AISNAP-10・TASK-17.3・Issue #112: ref 同一性ベースの診断値（判定ヘルパーのシグネチャ一意性
