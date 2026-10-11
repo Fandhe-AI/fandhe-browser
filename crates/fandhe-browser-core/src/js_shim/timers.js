@@ -165,7 +165,7 @@
             delete queue[head];
             head += 1;
             try {
-                fnCall(fn, global);
+                fnCall(fn, undefined);
             } catch (e) {
                 report('microtask', e);
             }

@@ -1038,7 +1038,10 @@ fn execute(
                             let mut o =
                                 run_one(rt, &ctx, entry.node(), entry.index(), src, &mut abort)?;
                             // microtask checkpoint（スクリプト末尾の `queueMicrotask` を実行する。`JS-7`）。
+                            // 上限超過済みなら checkpoint を回さない（超過後に callback が DOM を
+                            // 変更しないよう、下の上限判定で打ち切る。`JS-6`）。
                             if abort.is_none()
+                                && tripped_abort_kind(&ctx)?.is_none()
                                 && let Some((kind, message)) = microtask_checkpoint(rt, &ctx)
                             {
                                 abort = Some(PageAbort {
@@ -1316,7 +1319,9 @@ fn fire_lifecycle(
         };
         // microtask checkpoint（リスナー内の `queueMicrotask` を実行する。`JS-7`）。
         let outcome = match (outcome, runtime.as_deref_mut()) {
-            (LifecycleOutcome::Dispatched, Some(rt)) if abort.is_none() => {
+            (LifecycleOutcome::Dispatched, Some(rt))
+                if abort.is_none() && tripped_abort_kind(ctx)?.is_none() =>
+            {
                 match microtask_checkpoint(rt, ctx) {
                     Some((kind, _)) => {
                         *abort = Some(PageAbort {
