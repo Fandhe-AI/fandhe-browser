@@ -106,6 +106,8 @@ pub enum FailureKind {
     DisallowedScheme,
     /// [`Error::DisallowedAddress`] に対応。
     DisallowedAddress,
+    /// [`Error::CrossOriginRedirect`] に対応。
+    CrossOriginRedirect,
     /// [`Error::TooManyConcurrentDnsResolutions`] に対応。
     TooManyConcurrentDnsResolutions,
     /// [`Error::Network`] に対応。
@@ -137,6 +139,7 @@ impl FailureKind {
             FailureKind::ResponseTooLarge => "response_too_large",
             FailureKind::DisallowedScheme => "disallowed_scheme",
             FailureKind::DisallowedAddress => "disallowed_address",
+            FailureKind::CrossOriginRedirect => "cross_origin_redirect",
             FailureKind::TooManyConcurrentDnsResolutions => "too_many_concurrent_dns_resolutions",
             FailureKind::Network => "network",
             FailureKind::MatchCacheLimitExceeded => "match_cache_limit_exceeded",
@@ -169,6 +172,7 @@ impl From<&Error> for FailureKind {
             Error::ResponseTooLarge { .. } => FailureKind::ResponseTooLarge,
             Error::DisallowedScheme { .. } => FailureKind::DisallowedScheme,
             Error::DisallowedAddress { .. } => FailureKind::DisallowedAddress,
+            Error::CrossOriginRedirect => FailureKind::CrossOriginRedirect,
             Error::TooManyConcurrentDnsResolutions { .. } => {
                 FailureKind::TooManyConcurrentDnsResolutions
             }

@@ -72,11 +72,16 @@ mod page_env;
 pub use page_env::{
     BridgeDiagnostics, ConsoleLevel, ConsoleMessage, IgnoredLocationChange, LifecycleEvent,
     ListenerError, LocationChangeKind, LocationMember, MAX_BRIDGE_DIAGNOSTICS,
-    MAX_CONSOLE_MESSAGE_BYTES, MAX_LOCATION_URL_BYTES, TimerCallbackSource, TimerError,
+    MAX_CONSOLE_MESSAGE_BYTES, MAX_LOCATION_URL_BYTES, NetCallbackError, TimerCallbackSource,
+    TimerError,
 };
 use page_env::{apply_hash, location_member};
 
 use crate::event_loop::{EventLoopLimits, NextStep, TimerId, TimerQueue, normalize_delay};
+use crate::page_net::{
+    NET_BODY_CHUNK_BYTES, NetOutcome, NetQueue, NetReport, NetRequestKind, PageNetLimits,
+    PendingRequest,
+};
 // ページランナーが例外メッセージの切り詰めに再利用する（#780）。
 pub(crate) use page_env::{parse_location, truncate_utf8};
 
@@ -346,6 +351,13 @@ enum DomOp {
     MicrotaskLimit,
     TimerCallbackError,
     TimerStringHandlerIgnored,
+    NetRequest,
+    NetConsume,
+    NetReadBody,
+    NetFinalUrl,
+    NetCallbackError,
+    NetOptionsIgnored,
+    NetCancel,
 }
 
 impl DomOp {
@@ -385,6 +397,13 @@ impl DomOp {
             "microtaskLimit" => Self::MicrotaskLimit,
             "timerCallbackError" => Self::TimerCallbackError,
             "timerStringHandlerIgnored" => Self::TimerStringHandlerIgnored,
+            "netRequest" => Self::NetRequest,
+            "netConsume" => Self::NetConsume,
+            "netReadBody" => Self::NetReadBody,
+            "netFinalUrl" => Self::NetFinalUrl,
+            "netCallbackError" => Self::NetCallbackError,
+            "netOptionsIgnored" => Self::NetOptionsIgnored,
+            "netCancel" => Self::NetCancel,
             _ => return None,
         })
     }
@@ -425,6 +444,13 @@ impl DomOp {
             Self::MicrotaskLimit => "microtaskLimit",
             Self::TimerCallbackError => "timerCallbackError",
             Self::TimerStringHandlerIgnored => "timerStringHandlerIgnored",
+            Self::NetRequest => "netRequest",
+            Self::NetConsume => "netConsume",
+            Self::NetReadBody => "netReadBody",
+            Self::NetFinalUrl => "netFinalUrl",
+            Self::NetCallbackError => "netCallbackError",
+            Self::NetOptionsIgnored => "netOptionsIgnored",
+            Self::NetCancel => "netCancel",
         }
     }
 
@@ -450,7 +476,12 @@ impl DomOp {
             | Self::SetLocationHash
             | Self::TimerClear
             | Self::TimerConsume
-            | Self::TimerPending => 1,
+            | Self::TimerPending
+            | Self::NetConsume
+            | Self::NetReadBody
+            | Self::NetFinalUrl
+            | Self::NetOptionsIgnored
+            | Self::NetCancel => 1,
             Self::QuerySelector
             | Self::QuerySelectorAll
             | Self::AppendChild
@@ -462,8 +493,10 @@ impl DomOp {
             | Self::ConsoleMessage
             | Self::LifecycleListenerError
             | Self::TimerSet
-            | Self::TimerCallbackError => 2,
+            | Self::TimerCallbackError
+            | Self::NetCallbackError => 2,
             Self::InsertBefore | Self::SetAttribute => 3,
+            Self::NetRequest => 4,
         }
     }
 }
@@ -508,6 +541,8 @@ struct PageState {
     timers: TimerQueue,
     /// タイマーの上限（ランナーが [`DomBridge::set_event_loop_limits`] で設定する）。
     event_loop_limits: EventLoopLimits,
+    /// ページ内 fetch / XHR の要求キューと上限（`JS-8`・`JS-6`）。
+    net: NetQueue,
 }
 
 struct BridgeState {
@@ -649,6 +684,22 @@ impl PageState {
         self.document
             .children(html)
             .find(|&c| self.document.local_name(c) == Some(name))
+    }
+}
+
+/// 数値引数を要求 ID（1 以上の u32 に収まる整数）として検証する。範囲外は `None`。
+fn decode_net_id(value: Option<&JsValue>) -> Option<u32> {
+    match value {
+        Some(JsValue::Number(raw))
+            if raw.is_finite()
+                && raw.fract() == 0.0
+                && *raw >= 1.0
+                && *raw <= f64::from(u32::MAX) =>
+        {
+            // 範囲を検証済みのため切り詰めなく変換できる。
+            Some(*raw as u32)
+        }
+        _ => None,
     }
 }
 
@@ -892,6 +943,105 @@ fn execute(
                 .saturating_add(1);
             Ok(JsValue::Undefined)
         }
+        // ページ内 fetch / XHR の要求の受理（`JS-8`・`JS-6`）。受理したら要求 ID、reject なら 0。
+        // reject の理由は診断に残す。取得そのものはランナーが Fetcher 経由で行う。
+        DomOp::NetRequest => {
+            let kind = string_arg(op, args, 1, limits)?;
+            let method = string_arg(op, args, 2, limits)?;
+            let Some(JsValue::Bool(has_body)) = args.get(2) else {
+                return Err(DomBridgeError::TypeMismatch {
+                    operation: op.name(),
+                    index: 3,
+                    expected: "a boolean",
+                });
+            };
+            let url = string_arg(op, args, 4, limits)?;
+            let (request, result) = page
+                .net
+                .request(page.location.as_ref(), kind, method, *has_body, url)
+                .ok_or(DomBridgeError::TypeMismatch {
+                    operation: op.name(),
+                    index: 1,
+                    expected: "a known request kind",
+                })?;
+            match result {
+                Ok(id) => Ok(JsValue::Number(f64::from(id))),
+                Err(reason) => {
+                    page.diagnostics.record_net_rejection(request, reason);
+                    Ok(JsValue::Number(0.0))
+                }
+            }
+        }
+        // 配送中の ID に対する一回限りの許可。status（失敗は 0）か、不許可の -1 を返す。
+        DomOp::NetConsume => {
+            let Some(id) = decode_net_id(args.first()) else {
+                return Ok(JsValue::Number(-1.0));
+            };
+            Ok(JsValue::Number(f64::from(page.net.consume(id))))
+        }
+        DomOp::NetReadBody => {
+            // UTF-8 の 1 文字（最大 4 バイト）より小さい上限では、未読本文があっても空文字しか
+            // 返せず終端と誤認される。上限を超えて返すこともできないため、明示的なエラーにする。
+            if limits.max_response_bytes < 4 {
+                return Err(DomBridgeError::ResponseTooLarge {
+                    len: 4,
+                    limit: limits.max_response_bytes,
+                });
+            }
+            let Some(id) = decode_net_id(args.first()) else {
+                return Ok(JsValue::String(String::new()));
+            };
+            let max = NET_BODY_CHUNK_BYTES.min(limits.max_response_bytes);
+            string_response(page.net.read_chunk(id, max), limits)
+        }
+        DomOp::NetFinalUrl => {
+            let Some(id) = decode_net_id(args.first()) else {
+                return Ok(JsValue::String(String::new()));
+            };
+            string_response(page.net.final_url(id), limits)
+        }
+        DomOp::NetCallbackError => {
+            let kind = string_arg(op, args, 1, limits)?;
+            let message = string_arg(op, args, 2, limits)?;
+            let request = match kind {
+                "fetch" => NetRequestKind::Fetch,
+                "xhr" => NetRequestKind::Xhr,
+                _ => {
+                    return Err(DomBridgeError::TypeMismatch {
+                        operation: op.name(),
+                        index: 1,
+                        expected: "a known request kind",
+                    });
+                }
+            };
+            page.diagnostics.record_net_callback_error(request, message);
+            Ok(JsValue::Undefined)
+        }
+        // XHR の abort() / 再 open() による未送信要求の取り消し。取得前なら要求キューから除外し、
+        // 取得に着手済み・配送済み・未知の ID は何もしない（旧世代の応答は shim 側で破棄する）。
+        DomOp::NetCancel => {
+            if let Some(id) = decode_net_id(args.first()) {
+                page.net.cancel(id);
+            }
+            Ok(JsValue::Undefined)
+        }
+        // `fetch` の init で無視したオプション（headers / credentials 等）の件数。
+        DomOp::NetOptionsIgnored => {
+            let Some(JsValue::Number(count)) = args.first() else {
+                return Err(DomBridgeError::TypeMismatch {
+                    operation: op.name(),
+                    index: 1,
+                    expected: "a count number",
+                });
+            };
+            if count.is_finite() && *count >= 1.0 {
+                // 1 回の通知で数える上限（巨大な値で飽和させない）。
+                let add = count.min(64.0) as u64;
+                page.diagnostics.net_options_ignored =
+                    page.diagnostics.net_options_ignored.saturating_add(add);
+            }
+            Ok(JsValue::Undefined)
+        }
         DomOp::LifecycleListenerError => {
             let name = string_arg(op, args, 1, limits)?;
             let message = string_arg(op, args, 2, limits)?;
@@ -1081,6 +1231,7 @@ impl DomBridge {
             op_limit_tripped: false,
             timers: TimerQueue::new(),
             event_loop_limits: EventLoopLimits::default(),
+            net: NetQueue::new(PageNetLimits::default()),
         });
         Ok(())
     }
@@ -1215,6 +1366,65 @@ impl DomBridge {
         ))
     }
 
+    /// ページ内 fetch / XHR の上限を設定する（ランナー用。`attach` のたびに既定へ戻る）。
+    pub fn set_net_limits(&self, limits: PageNetLimits) -> Result<(), DomBridgeError> {
+        let mut guard = self.lock()?;
+        let page = guard.page.as_mut().ok_or(DomBridgeError::Detached)?;
+        page.net.set_limits(limits);
+        Ok(())
+    }
+
+    /// 保留中のネットワーク要求の件数（ランナー用）。
+    pub(crate) fn net_pending(&self) -> Result<usize, DomBridgeError> {
+        let guard = self.lock()?;
+        let page = guard.page.as_ref().ok_or(DomBridgeError::Detached)?;
+        Ok(page.net.pending_len())
+    }
+
+    /// 次に取得すべき要求を取り出す（ランナー用。受理順）。
+    pub(crate) fn take_next_net_request(&self) -> Result<Option<PendingRequest>, DomBridgeError> {
+        let mut guard = self.lock()?;
+        let page = guard.page.as_mut().ok_or(DomBridgeError::Detached)?;
+        Ok(page.net.pop_pending())
+    }
+
+    /// 累計バイト上限までの残り（ランナー用。到達済みは 0）。
+    pub(crate) fn net_remaining_bytes(&self) -> Result<u64, DomBridgeError> {
+        let guard = self.lock()?;
+        let page = guard.page.as_ref().ok_or(DomBridgeError::Detached)?;
+        Ok(page.net.remaining_bytes())
+    }
+
+    /// 取得結果の配送を開始する（ランナー用）。reject は診断に残す（URL は残さない）。
+    pub(crate) fn begin_net_delivery(
+        &self,
+        request: &PendingRequest,
+        outcome: NetOutcome,
+    ) -> Result<(), DomBridgeError> {
+        let mut guard = self.lock()?;
+        let page = guard.page.as_mut().ok_or(DomBridgeError::Detached)?;
+        if let NetOutcome::Rejected(kind) = &outcome {
+            page.diagnostics.record_net_rejection(request.kind, *kind);
+        }
+        page.net.begin_delivery(request.id, outcome);
+        Ok(())
+    }
+
+    /// 配送を終え、保持していた本文を解放する（ランナー用）。
+    pub(crate) fn finish_net_delivery(&self) -> Result<(), DomBridgeError> {
+        let mut guard = self.lock()?;
+        let page = guard.page.as_mut().ok_or(DomBridgeError::Detached)?;
+        page.net.finish_delivery();
+        Ok(())
+    }
+
+    /// ネットワーク要求の実行結果（ランナー用）。
+    pub(crate) fn net_report(&self) -> Result<NetReport, DomBridgeError> {
+        let guard = self.lock()?;
+        let page = guard.page.as_ref().ok_or(DomBridgeError::Detached)?;
+        Ok(page.net.report())
+    }
+
     /// 集まった診断（無視した `location` 操作・`console`）を取り出して空にする
     /// （ランナー用）。未取り付けなら [`DomBridgeError::Detached`]。
     pub fn take_diagnostics(&self) -> Result<BridgeDiagnostics, DomBridgeError> {
@@ -1311,6 +1521,7 @@ impl DomBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::page_net::NetRejectKind;
     use crate::parse::{ParseOptions, parse_document};
 
     const HTML: &str = "<html><head></head><body><div id=\"a\"></div></body></html>";
@@ -2128,5 +2339,143 @@ mod tests {
         assert!(d.timer_errors[0].truncated);
         assert_eq!(d.dropped, 4);
         assert_eq!(d.timer_string_handlers_ignored, 1);
+    }
+
+    fn net_bridge() -> DomBridge {
+        let b = bridge();
+        b.set_location("https://example.test/dir/page.html")
+            .expect("location");
+        b
+    }
+
+    fn net_request(b: &DomBridge, kind: &str, method: &str, body: bool, url: &str) -> f64 {
+        num(call(
+            b,
+            &[s("netRequest"), s(kind), s(method), b_bool(body), s(url)],
+        ))
+    }
+
+    /// JS-8: `netRequest` は相対 URL を location 基準で解決して受理し、拒否は 0 と診断で表す。
+    #[test]
+    fn js_8_net_request_op_validates_and_records_rejections() {
+        let b = net_bridge();
+        assert_eq!(net_request(&b, "fetch", "GET", false, "a.json"), 1.0);
+        assert_eq!(net_request(&b, "xhr", "get", false, "../b"), 2.0);
+        assert_eq!(net_request(&b, "fetch", "POST", false, "a"), 0.0);
+        assert_eq!(net_request(&b, "xhr", "GET", true, "a"), 0.0);
+        assert_eq!(net_request(&b, "xhr_sync", "GET", false, "a"), 0.0);
+        assert_eq!(
+            net_request(&b, "fetch", "GET", false, "file:///etc/passwd"),
+            0.0
+        );
+        assert_eq!(
+            net_request(&b, "fetch", "GET", false, "https://u:p@example.test/"),
+            0.0
+        );
+        // 未知の種別・型の不一致・arity は拒否する。
+        call(
+            &b,
+            &[
+                s("netRequest"),
+                s("beacon"),
+                s("GET"),
+                b_bool(false),
+                s("a"),
+            ],
+        )
+        .expect_err("kind");
+        call(
+            &b,
+            &[s("netRequest"), s("fetch"), s("GET"), s("no"), s("a")],
+        )
+        .expect_err("type");
+        call(&b, &[s("netRequest"), s("fetch"), s("GET"), b_bool(false)]).expect_err("arity");
+        let kinds: Vec<_> = b
+            .take_diagnostics()
+            .expect("diag")
+            .net_rejections
+            .iter()
+            .map(|r| r.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                NetRejectKind::UnsupportedMethod,
+                NetRejectKind::RequestBody,
+                NetRejectKind::SyncXhr,
+                NetRejectKind::InvalidUrl,
+                NetRejectKind::Credentials,
+            ]
+        );
+    }
+
+    /// JS-8: 応答上限が 4 バイト未満なら netReadBody は明示的なエラーにし、上限超過の文字列を返さない。
+    #[test]
+    fn js_8_net_read_body_rejects_tiny_response_limit() {
+        let b = bridge_with(DomBridgeLimits {
+            max_response_bytes: 3,
+            ..DomBridgeLimits::default()
+        });
+        let err = call(&b, &[s("netReadBody"), n(1.0)]).expect_err("tiny limit");
+        assert!(matches!(
+            err,
+            DomBridgeError::ResponseTooLarge { len: 4, limit: 3 }
+        ));
+    }
+
+    /// JS-8: 未配送の ID は消費も本文の読み出しもできない（配送の偽造を許さない）。
+    #[test]
+    fn js_8_net_consume_and_read_require_runner_delivery() {
+        let b = net_bridge();
+        assert_eq!(net_request(&b, "fetch", "GET", false, "a"), 1.0);
+        assert_eq!(num(call(&b, &[s("netConsume"), n(1.0)])), -1.0);
+        assert_eq!(num(call(&b, &[s("netConsume"), n(f64::NAN)])), -1.0);
+        assert_eq!(
+            call(&b, &[s("netReadBody"), n(1.0)]).expect("read"),
+            JsValue::String(String::new())
+        );
+        let req = b.take_next_net_request().expect("take").expect("pending");
+        b.begin_net_delivery(
+            &req,
+            NetOutcome::Response {
+                status: 200,
+                body: "hi".to_string(),
+                final_url: "https://example.test/dir/a".to_string(),
+            },
+        )
+        .expect("begin");
+        assert_eq!(num(call(&b, &[s("netConsume"), n(2.0)])), -1.0);
+        assert_eq!(num(call(&b, &[s("netConsume"), n(1.0)])), 200.0);
+        assert_eq!(num(call(&b, &[s("netConsume"), n(1.0)])), -1.0);
+        assert_eq!(
+            call(&b, &[s("netReadBody"), n(1.0)]).expect("read"),
+            JsValue::String("hi".to_string())
+        );
+        b.finish_net_delivery().expect("finish");
+        assert_eq!(
+            call(&b, &[s("netReadBody"), n(1.0)]).expect("read"),
+            JsValue::String(String::new())
+        );
+    }
+
+    /// JS-8: コールバック例外は種別を許可リストで検証し、メッセージを切り詰めて保持する。
+    #[test]
+    fn js_8_net_callback_error_and_ignored_options_are_bounded() {
+        let b = net_bridge();
+        call(&b, &[s("netCallbackError"), s("beacon"), s("x")]).expect_err("kind");
+        let big = "e".repeat(MAX_CONSOLE_MESSAGE_BYTES + 10);
+        call(&b, &[s("netCallbackError"), s("xhr"), s(&big)]).expect("ok");
+        call(&b, &[s("netOptionsIgnored"), n(2.0)]).expect("ok");
+        call(&b, &[s("netOptionsIgnored"), n(f64::INFINITY)]).expect("ok");
+        call(&b, &[s("netOptionsIgnored"), s("1")]).expect_err("type");
+        let d = b.take_diagnostics().expect("diag");
+        assert_eq!(d.net_callback_errors.len(), 1);
+        assert_eq!(d.net_callback_errors[0].request, NetRequestKind::Xhr);
+        assert_eq!(
+            d.net_callback_errors[0].message.len(),
+            MAX_CONSOLE_MESSAGE_BYTES
+        );
+        assert!(d.net_callback_errors[0].truncated);
+        assert_eq!(d.net_options_ignored, 2);
     }
 }

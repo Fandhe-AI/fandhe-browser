@@ -1,12 +1,13 @@
 //! ページスクリプトランナー: `<script>` の順次実行・`src` の取得・総量上限・
-//! DOMContentLoaded / load の発火・仮想時間のタイマーループと失敗の集約
-//! （TASK-109・TASK-110・MS-6・Issue #780・#781・#782・ビヘイビア `JS-4`・`JS-6`・`JS-7`・`JS-8`）。
+//! DOMContentLoaded / load の発火・仮想時間のタイマーループ・ページ内 `fetch` / XHR の取得と失敗の集約
+//! （TASK-109・TASK-110・TASK-111・MS-6・Issue #780・#781・#782・#783・ビヘイビア `JS-4`・`JS-6`・`JS-7`・`JS-8`）。
 //!
 //! 「HTML を受け取り、`<script>` を文書順に実行し、変更後の HTML と実行結果の診断を返す」
 //! 入口。部品は次のとおり組み合わせる。
 //!
 //! - [`crate::page_script::collect_page_scripts`]（#774）: 実行対象の収集
-//! - [`crate::fetch::Fetcher`]: `src` の取得（`JS-8`。別の HTTP クライアントは作らない）
+//! - [`crate::fetch::Fetcher`]: `src` とページ内 `fetch` / XHR の取得（`JS-8`。別の HTTP クライアントは作らない）
+//! - [`crate::page_net`]（#783）: ページ内 `fetch` / XHR の要求キューと件数・累計バイトの上限
 //! - [`crate::dom_bridge::DomBridge`]（#777）と `JsRuntime::install_dom_shim_with_options`
 //!   （#778・#779・#781）: ページ内 JS から DOM を操作する経路とイベント shim
 //! - [`fandhe_browser_js::EvaluateOptions`]（#776）: スクリプトごとの実時間上限の強制
@@ -18,13 +19,14 @@
 //!
 //! 1. **prepare（同期）**: パースと収集、base URL の検証。
 //! 2. **load（async）**: 文書順に `src` を [`Fetcher`] で取得しつつ、スクリプト総バイトを
-//!    評価する。すべての `.await` は [`JsRuntime`] / [`DomBridge`] の生成より前に置き、
-//!    future を `Send` に保つ。
-//! 3. **execute（同期）**: 取得済みのソースを文書順に実行し、打ち切られていなければ
+//!    評価する。この段の `.await` は [`JsRuntime`] / [`DomBridge`] の生成より前にある。
+//! 3. **execute（async）**: 取得済みのソースを文書順に実行し、打ち切られていなければ
 //!    DOMContentLoaded → load を発火する。各 `<script>` とライフサイクルイベントの後に
 //!    microtask checkpoint（`__fandheRunMicrotasks()`）を評価する。
-//! 4. **event loop（同期。`JS-7`）**: load の後に、保留中のタイマーを仮想時間の期限順に
-//!    `__fandheRunTimer(id)` で発火する（実時間は待たない）。発火回数・仮想時間・保留中タイマー数の
+//! 4. **event loop（async。`JS-7`・`JS-8`）**: load の後に、保留中のネットワーク要求（ページ内
+//!    `fetch` / XHR）を 1 件ずつ Fetcher で取得して `__fandheNetDeliver(id)` で配送し、要求が無ければ
+//!    保留中のタイマーを仮想時間の期限順に `__fandheRunTimer(id)` で発火する（実時間は待たない）。
+//!    終了条件は「保留中の要求とタイマーが 0」。発火回数・仮想時間・保留中タイマー数の
 //!    上限を超えたら [`AbortKind`] で打ち切り、その時点の DOM を確定する。実時間の上限
 //!    （スクリプト単位・ページ全体）はタイマーの評価にも課す。
 //!
@@ -35,6 +37,13 @@
 //! - 解放の順序は「診断の取得、`DomBridge::detach`、`JsRuntime` の drop、シリアライズ」。
 //!   打ち切り後に放棄されたネイティブ呼び出しが遅れて DOM を変更しても、detach 済みのため
 //!   結果には影響せず、子プロセス版エンジンは drop で kill / wait される（`JS-6`）。
+//! - **future は `Send` ではない**（TASK-111）。ネットワーク取得を runtime が生きている間の
+//!   イベントループ段で `.await` するため。`Send + Sync` が要る呼び出し元（TASK-112 のアクター）は、
+//!   専用スレッドが runtime とランナーを所有する形で使い、この future をそのスレッド上で駆動する。
+//! - ページ内 `fetch` / XHR の取得は呼び出し側が所有する [`Fetcher`] 経由のみ（`JS-8`）。scheme・
+//!   内部アドレス・リダイレクト先の検査は Fetcher に一元化し、拒否は reject / `onerror` と
+//!   [`BridgeDiagnostics::net_rejections`] で表す（URL は残さない）。件数・累計バイトの上限は
+//!   [`PageNetLimits`]（`JS-6`）。上限超過でもページは打ち切らず、以降の要求を reject する。
 //! - 打ち切り後はイベントループを回さない。タイマーのコールバック例外は
 //!   [`BridgeDiagnostics::timer_errors`] に集約し、後続のタイマーを続ける。
 //! - 例外は集約して後続を続ける。実時間超過・リソース上限・エンジン不能・件数 / バイト上限は
@@ -64,6 +73,11 @@
 //!   `Date` は実時間のままで仮想時間と連動しない。
 //! - 仮想時間の上限（既定 30 秒）より後に期限を持つタイマーが残るページは、load の後に
 //!   [`AbortKind::VirtualTime`] の診断が付く（DOM の確定には影響しない。TASK-113 で再評価）。
+//! - ページ内 `fetch` / XHR（#783）: GET のみ。ヘッダ・Cookie・認証は送らない。CORS 判定・
+//!   Content-Type / charset 判定・ネットワーク待ちの独立した時間予算は未実装（待ちはページ時計に含み、
+//!   1 件の待ちは Fetcher のタイムアウトで頭打ち）。応答は仮想時間 0 の遅延として、同時刻のタイマーより
+//!   先に配送する近似。boa ではネイティブ `Promise` のジョブが drain されず、`fetch` の続きが走らない
+//!   （XHR は動く。js crate の `run_jobs` 未対応。TASK-30）。
 //! - 可観測性（対応する `OperationKind` が無い）は未対応。
 //! - パースは既定の `scripting_enabled = false` のため `<noscript>` の扱いが実ブラウザと異なる。
 //! - スクリプトの completion 値が結果サイズ上限を超えると例外として扱われる
@@ -85,6 +99,7 @@ use crate::error::Error;
 use crate::event_loop::{EventLoopLimits, NextStep, TimerLimitKind};
 use crate::fetch::{FetchOptions, Fetcher};
 use crate::js_stub::JsRuntime;
+use crate::page_net::{NetOutcome, NetRejectKind, NetReport, PageNetLimits};
 use crate::page_script::{
     CollectedScripts, ScriptCollectionOptions, ScriptDiagnosticKind, ScriptSource,
     collect_page_scripts,
@@ -156,6 +171,7 @@ pub struct PageRunOptions {
     max_total_script_bytes: usize,
     max_src_script_bytes: usize,
     event_loop: EventLoopLimits,
+    net_limits: PageNetLimits,
 }
 
 impl Default for PageRunOptions {
@@ -169,6 +185,7 @@ impl Default for PageRunOptions {
             max_total_script_bytes: DEFAULT_MAX_TOTAL_SCRIPT_BYTES,
             max_src_script_bytes: DEFAULT_MAX_SRC_SCRIPT_BYTES,
             event_loop: EventLoopLimits::default(),
+            net_limits: PageNetLimits::default(),
         }
     }
 }
@@ -228,6 +245,18 @@ impl PageRunOptions {
     pub fn with_event_loop_limits(mut self, limits: EventLoopLimits) -> Self {
         self.event_loop = limits;
         self
+    }
+
+    /// ページ内 `fetch` / `XMLHttpRequest` の上限（要求件数・累計バイト）を差し替える（`JS-6`・`JS-8`）。
+    #[must_use]
+    pub fn with_net_limits(mut self, limits: PageNetLimits) -> Self {
+        self.net_limits = limits;
+        self
+    }
+
+    /// ページ内 `fetch` / `XMLHttpRequest` の上限。
+    pub fn net_limits(&self) -> &PageNetLimits {
+        &self.net_limits
     }
 
     /// イベントループ（タイマー）の上限。
@@ -603,6 +632,7 @@ pub struct PageRunOutput {
     bridge_diagnostics: BridgeDiagnostics,
     elapsed: Duration,
     event_loop: EventLoopReport,
+    net: NetReport,
 }
 
 impl PageRunOutput {
@@ -644,6 +674,11 @@ impl PageRunOutput {
     /// イベントループ（仮想時間のタイマー）の結果（`JS-7`）。
     pub fn event_loop(&self) -> &EventLoopReport {
         &self.event_loop
+    }
+
+    /// ページ内 `fetch` / `XMLHttpRequest` の実行結果（`JS-8`）。
+    pub fn net(&self) -> &NetReport {
+        &self.net
     }
 
     /// ページ時計で測った経過時間（JS 実行の開始から。`src` の取得時間は含まない）。
@@ -786,6 +821,11 @@ async fn fetch_src(
     Ok(response.body_text_lossy())
 }
 
+/// `final_url` が `request` と同一オリジン（scheme・host・port）かを判定する。解析不能は偽。
+fn same_origin_url(request: &Url, final_url: &str) -> bool {
+    Url::parse(final_url).is_ok_and(|u| u.origin() == request.origin())
+}
+
 /// UTF-8 非可逆変換後の長さが `limit` を超えるかを、文字列を確保せずに判定する。
 ///
 /// 不正バイト列 1 区間は置換文字（3 バイト）1 個になる。加算は `checked_add` で行う。
@@ -917,17 +957,21 @@ async fn run_with_fetcher_and_factory(
     make_runtime: impl FnOnce() -> crate::Result<JsRuntime>,
 ) -> crate::Result<PageRunOutput> {
     let prepared = prepare(input, options)?;
-    // すべての await はここまで（JsRuntime / DomBridge の生成前）に済ませる。
     let loaded = load_sources(&prepared.collected, &prepared.base, fetcher, options).await;
-    execute(input, options, prepared, loaded, make_runtime)
+    execute(input, options, prepared, loaded, fetcher, make_runtime).await
 }
 
-/// 取得済みのソースを実行する（同期）。ネットワークを使わない単体テストの継ぎ目でもある。
-fn execute(
+/// 取得済みのソースを実行する。ネットワークを使うのはイベントループ段のページ内
+/// `fetch` / `XMLHttpRequest` の取得（`JS-8`）だけで、`src` の取得は済んでいる。
+/// ネットワークを使わない単体テストの継ぎ目でもある。
+///
+/// runtime を保持したまま `.await` するため、この future は `Send` ではない（TASK-111）。
+async fn execute(
     input: &PageRunInput<'_>,
     options: &PageRunOptions,
     prepared: PreparedPage,
     loaded: LoadedScripts,
+    fetcher: &Fetcher,
     make_runtime: impl FnOnce() -> crate::Result<JsRuntime>,
 ) -> crate::Result<PageRunOutput> {
     let PreparedPage {
@@ -942,6 +986,9 @@ fn execute(
     bridge.set_location(input.base_url).map_err(bridge_error)?;
     bridge
         .set_event_loop_limits(options.event_loop.clone())
+        .map_err(bridge_error)?;
+    bridge
+        .set_net_limits(options.net_limits)
         .map_err(bridge_error)?;
 
     // 実行され得るソース（バイト上限の超過位置より前の inline / 取得成功した src）の有無。
@@ -1110,9 +1157,10 @@ fn execute(
     }
 
     let lifecycle = fire_lifecycle(&ctx, runtime.as_mut(), &mut abort)?;
-    let event_loop = run_event_loop(&ctx, runtime.as_mut(), &mut abort)?;
+    let event_loop = run_event_loop(&ctx, fetcher, runtime.as_mut(), &mut abort).await?;
 
     let elapsed = page_start.elapsed();
+    let net = bridge.net_report().map_err(bridge_error)?;
     let bridge_diagnostics = bridge.take_diagnostics().map_err(bridge_error)?;
     // detach で DOM を確定してから runtime を解放する（遅れた変更を結果へ混ぜない）。
     let document = bridge
@@ -1134,6 +1182,7 @@ fn execute(
             bridge_diagnostics,
             elapsed,
             event_loop,
+            net,
         },
     ))
 }
@@ -1383,8 +1432,9 @@ fn microtask_checkpoint(
 /// 打ち切り済み・runtime 無しなら回さない。1 周ごとに「保留中タイマー数の超過 → 次のタイマー
 /// （空なら正常終了、仮想時間・発火回数の超過は打ち切り）→ 評価（実時間の上限つき）」の順で判定する。
 /// 評価する文字列は固定の関数名と整数の ID だけで、ページ由来の値を埋め込まない。
-fn run_event_loop(
+async fn run_event_loop(
     ctx: &RunContext<'_>,
+    fetcher: &Fetcher,
     runtime: Option<&mut JsRuntime>,
     abort: &mut Option<PageAbort>,
 ) -> crate::Result<EventLoopReport> {
@@ -1395,6 +1445,24 @@ fn run_event_loop(
             if let Some(kind) = tripped_abort_kind(ctx)? {
                 *abort = Some(PageAbort { kind, index: None });
                 break;
+            }
+            // 保留中のネットワーク要求（ページ内 fetch / XHR。`JS-8`）は、タイマーより先に
+            // 1 件ずつ取得して配送する（応答は仮想時間 0 の遅延の近似）。
+            if ctx.bridge.net_pending().map_err(bridge_error)? > 0 {
+                if script_budget(
+                    ctx.options.script_wall_time,
+                    ctx.options.page_wall_time,
+                    ctx.page_start.elapsed(),
+                )
+                .is_none()
+                {
+                    *abort = Some(page_wall_abort(ctx.options, None));
+                    break;
+                }
+                if !pump_one_net_request(ctx, fetcher, rt, abort).await? {
+                    break;
+                }
+                continue;
             }
             // 待機すべきタイマーが無ければ正常終了する（残り時間 0 でも abort 扱いにしない）。
             let (_, _, pending) = ctx.bridge.event_loop_state().map_err(bridge_error)?;
@@ -1463,12 +1531,104 @@ fn run_event_loop(
     })
 }
 
+/// 保留中のネットワーク要求を 1 件、Fetcher で取得して JS へ配送する（`JS-8`・`JS-6`）。
+///
+/// 取得は [`Fetcher::get_with_max_body`] だけを使い、scheme・内部アドレス・リダイレクト先の
+/// 検査は Fetcher に任せる（別の HTTP クライアントは作らない。SSRF 対策。`SEC-2`）。本文の上限は
+/// 累計の残りバイト数で受信中に強制する。評価する文字列は固定の関数名と整数 ID だけで、
+/// ページ由来の値は埋め込まない。打ち切った場合は `abort` に理由を入れて `false` を返す。
+async fn pump_one_net_request(
+    ctx: &RunContext<'_>,
+    fetcher: &Fetcher,
+    rt: &mut JsRuntime,
+    abort: &mut Option<PageAbort>,
+) -> crate::Result<bool> {
+    let Some(request) = ctx.bridge.take_next_net_request().map_err(bridge_error)? else {
+        return Ok(true);
+    };
+    let remaining = ctx.bridge.net_remaining_bytes().map_err(bridge_error)?;
+    let outcome = if remaining == 0 {
+        NetOutcome::Rejected(NetRejectKind::ResponseBytesLimit)
+    } else {
+        // 取得待ちもページの残り実時間で打ち切る（応答しない取得先で Fetcher の既定まで待たない）。
+        let page_left = ctx
+            .options
+            .page_wall_time
+            .saturating_sub(ctx.page_start.elapsed());
+        match fetcher
+            .get_for_page_net(request.url.as_str(), remaining, page_left)
+            .await
+        {
+            Ok(response) => {
+                let cap = usize::try_from(remaining).unwrap_or(usize::MAX);
+                // 非可逆変換で膨らむ分も、確保前に累計の残りへ収まるか判定する。
+                if lossy_len_exceeds(response.body(), cap) {
+                    NetOutcome::Rejected(NetRejectKind::ResponseBytesLimit)
+                } else if !same_origin_url(&request.url, response.final_url()) {
+                    // CORS 未実装の間は別オリジンへのリダイレクト先の応答を公開しない。
+                    NetOutcome::Rejected(NetRejectKind::CrossOrigin)
+                } else {
+                    NetOutcome::Response {
+                        status: response.status(),
+                        body: response.body_text_lossy(),
+                        final_url: response.final_url().to_owned(),
+                    }
+                }
+            }
+            // 実効上限が累計の残り由来なら累計上限、それより小さければ 1 件の上限。
+            Err(Error::ResponseTooLarge { limit }) if limit >= remaining => {
+                NetOutcome::Rejected(NetRejectKind::ResponseBytesLimit)
+            }
+            Err(Error::Timeout { .. })
+                if ctx.page_start.elapsed() >= ctx.options.page_wall_time =>
+            {
+                // ページの実時間上限による取得のキャンセル。配送せずページを打ち切る。
+                *abort = Some(page_wall_abort(ctx.options, None));
+                return Ok(false);
+            }
+            Err(e) => NetOutcome::Rejected(NetRejectKind::from_fetch_error(&e)),
+        }
+    };
+    ctx.bridge
+        .begin_net_delivery(&request, outcome)
+        .map_err(bridge_error)?;
+    let delivered = evaluate_with_budget(rt, ctx, &format!("__fandheNetDeliver({})", request.id));
+    // 配送後は JS の振る舞いに依存せず、Rust 側の本文を必ず解放する。
+    ctx.bridge.finish_net_delivery().map_err(bridge_error)?;
+    match delivered {
+        Evaluated::Completed | Evaluated::Exception { .. } => {}
+        Evaluated::Aborted { kind, .. } => {
+            *abort = Some(PageAbort { kind, index: None });
+            return Ok(false);
+        }
+        Evaluated::BudgetExhausted(_) => {
+            *abort = Some(page_wall_abort(ctx.options, None));
+            return Ok(false);
+        }
+    }
+    // shim は op のエラー（操作予算切れ）を握りつぶすため、ここで検出して打ち切る（`JS-6`）。
+    if ctx.bridge.op_limit_tripped().map_err(bridge_error)? {
+        *abort = Some(PageAbort {
+            kind: AbortKind::ResourceLimit,
+            index: None,
+        });
+        return Ok(false);
+    }
+    // Promise の反応・XHR コールバック内の `queueMicrotask` を実行する。
+    if let Some((kind, _)) = microtask_checkpoint(rt, ctx) {
+        *abort = Some(PageAbort { kind, index: None });
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// [`finish`] へ渡す、スクリプト実行以外の実行結果。
 struct RunTail {
     lifecycle: Vec<LifecycleEventRecord>,
     bridge_diagnostics: BridgeDiagnostics,
     elapsed: Duration,
     event_loop: EventLoopReport,
+    net: NetReport,
 }
 
 /// 実行結果と収集時の診断を通し番号で統合して出力にまとめる。
@@ -1500,6 +1660,7 @@ fn finish(
         bridge_diagnostics: tail.bridge_diagnostics,
         elapsed: tail.elapsed,
         event_loop: tail.event_loop,
+        net: tail.net,
     }
 }
 
@@ -1713,6 +1874,15 @@ mod tests {
         }
     }
 
+    /// 現スレッドの tokio ランタイムで future を完了させる（同期テストの継ぎ目）。
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(f)
+    }
+
     /// 既定の load 結果: inline は `Inline`、`src` は `Unfetched`。
     fn default_loads(collected: &CollectedScripts) -> LoadedScripts {
         LoadedScripts {
@@ -1738,15 +1908,17 @@ mod tests {
     ) -> (crate::Result<PageRunOutput>, Harness) {
         let h = Harness::new();
         let input = PageRunInput::new(html, "https://example.test/");
+        let fetcher = Fetcher::new(FetchOptions::new()).expect("fetcher");
         let out = prepare(&input, options).and_then(|prepared| {
             let loaded = build(&prepared.collected);
-            execute(
+            block_on(execute(
                 &input,
                 options,
                 prepared,
                 loaded,
+                &fetcher,
                 h.factory(lifecycle_timeout),
-            )
+            ))
         });
         (out, h)
     }
@@ -2039,7 +2211,9 @@ mod tests {
         let err = prepare(&input, &options)
             .and_then(|p| {
                 let l = default_loads(&p.collected);
-                execute(&input, &options, p, l, || Ok(JsRuntime::disabled()))
+                block_on(execute(&input, &options, p, l, &fetcher_loopback(), || {
+                    Ok(JsRuntime::disabled())
+                }))
             })
             .expect_err("disabled");
         assert!(matches!(err, Error::JsExecutionUnavailable { .. }));
@@ -2624,16 +2798,11 @@ mod tests {
         }
     }
 
-    /// 公開 API の future が Send であること（await は runtime / bridge 生成前に済ませる）。
-    #[test]
-    fn js_4_run_page_scripts_future_is_send() {
-        fn assert_send<T: Send>(_: &T) {}
-        let fetcher = Fetcher::new(FetchOptions::new()).expect("fetcher");
-        let js = JsConfig::default();
-        let options = PageRunOptions::default();
-        let input = PageRunInput::new("<p>x</p>", "https://example.test/");
-        assert_send(&run_page_scripts(&input, &js, &options, &fetcher));
-    }
+    // 注: 以前はここで公開 API の future が `Send` であることを検査していた（await を runtime /
+    // bridge の生成前に済ませる契約）。TASK-111（#783）でページ内 fetch / XHR の取得を
+    // runtime が生きている間のイベントループ段で `.await` するため、future は `!Send` になった。
+    // `Send + Sync` が必要な呼び出し元（TASK-112 のアクター）は、専用スレッドが runtime と
+    // ランナーを所有する形で使う。
 
     fn timer_log(h: &Harness) -> Vec<String> {
         h.log()
@@ -2789,7 +2958,14 @@ mod tests {
         let out = prepare(&input, &options)
             .and_then(|prepared| {
                 let loaded = default_loads(&prepared.collected);
-                execute(&input, &options, prepared, loaded, h.factory(false))
+                block_on(execute(
+                    &input,
+                    &options,
+                    prepared,
+                    loaded,
+                    &fetcher_loopback(),
+                    h.factory(false),
+                ))
             })
             .expect("run");
         assert_eq!(

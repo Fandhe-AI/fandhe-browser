@@ -136,6 +136,10 @@ pub enum Error {
         /// URL 全体（userinfo・パス等）はここへ埋め込まない。
         address: String,
     },
+    /// `fetch::Fetcher::get_for_page_net`（ページ内 fetch / XHR）が、リダイレクト先が
+    /// 最初の要求と別オリジンになったため送信前に打ち切った場合に返す（`JS-8`）。
+    /// CORS 未実装の間は別オリジンへ要求を出さない。
+    CrossOriginRedirect,
     /// `fetch::Fetcher::get` が、同時実行できる DNS 解決スレッド数の上限
     /// （`fetch::resolve_blocking` が管理するプロセス全体のカウンタ）に
     /// 達しているときに返す。`fetch::SafeResolver::resolve` は名前解決の
@@ -207,6 +211,9 @@ impl fmt::Display for Error {
             Error::DisallowedAddress { address } => {
                 write!(f, "disallowed target address: {address}")
             }
+            Error::CrossOriginRedirect => {
+                write!(f, "cross-origin redirect is not allowed")
+            }
             Error::TooManyConcurrentDnsResolutions { limit } => {
                 write!(f, "too many concurrent DNS resolutions (limit: {limit})")
             }
@@ -238,6 +245,7 @@ impl std::error::Error for Error {
             | Error::ResponseTooLarge { .. }
             | Error::DisallowedScheme { .. }
             | Error::DisallowedAddress { .. }
+            | Error::CrossOriginRedirect
             | Error::TooManyConcurrentDnsResolutions { .. }
             | Error::Network { .. }
             | Error::MatchCacheLimitExceeded { .. } => None,

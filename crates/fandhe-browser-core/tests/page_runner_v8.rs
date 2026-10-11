@@ -14,6 +14,7 @@ fn main() -> ExitCode {
         return code;
     }
     cases::run("v8");
+    cases::run_fetch_promises("v8");
     eprintln!("page_runner_v8: all cases passed");
     ExitCode::SUCCESS
 }

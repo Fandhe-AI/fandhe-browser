@@ -211,6 +211,8 @@ pub const USER_AGENT: &str = concat!("fandhe-browser/", env!("CARGO_PKG_VERSION"
 /// [`Fetcher::get`] を介して呼び出される想定（TASK-24.2・CORE-1）。
 pub struct Fetcher {
     client: Client,
+    /// ページ内取得専用。リダイレクト先が最初の要求と別オリジンなら送信前に打ち切る。
+    page_client: Client,
     options: FetchOptions,
 }
 
@@ -253,6 +255,9 @@ enum RedirectMarker {
     DisallowedAddress {
         address: String,
     },
+    /// ページ内取得（[`Fetcher::get_for_page_net`]）で、リダイレクト先が最初の要求と
+    /// 別オリジンになった場合（`JS-8`）。CORS 未実装の間は送信前に打ち切る。
+    CrossOriginRedirect,
 }
 
 impl std::fmt::Display for RedirectMarker {
@@ -263,6 +268,9 @@ impl std::fmt::Display for RedirectMarker {
             }
             RedirectMarker::DisallowedScheme { scheme } => {
                 write!(f, "disallowed redirect scheme: {scheme}")
+            }
+            RedirectMarker::CrossOriginRedirect => {
+                write!(f, "cross-origin redirect is not allowed")
             }
             RedirectMarker::DisallowedAddress { address } => {
                 write!(f, "disallowed redirect target address: {address}")
@@ -574,6 +582,69 @@ fn resolve_blocking(host: String) -> BlockingDnsFuture {
     BlockingDnsFuture(state)
 }
 
+/// `reqwest::Client` を構築する。`same_origin_only` が真なら、リダイレクト先が最初の要求と
+/// 別オリジンの時点で [`Error::CrossOriginRedirect`] として打ち切る（ページ内取得用。
+/// 送信前に検査するため、別オリジンへ要求が出ない。`JS-8`・`SEC-2`）。
+fn build_client(options: &FetchOptions, same_origin_only: bool) -> Result<Client> {
+    let max_redirects = options.max_redirects;
+    let allow_private_network_access = options.allow_private_network_access;
+    let redirect_policy = Policy::custom(move |attempt| {
+        if attempt.previous().len() > max_redirects {
+            return attempt.error(RedirectMarker::TooManyRedirects {
+                limit: max_redirects,
+            });
+        }
+        let scheme = attempt.url().scheme().to_string();
+        match scheme.as_str() {
+            "http" | "https" => {}
+            other => {
+                return attempt.error(RedirectMarker::DisallowedScheme {
+                    scheme: other.to_string(),
+                });
+            }
+        }
+        // scheme 検査より後に置く。先に origin を比べると `file:`/`ftp:` 等の
+        // Location が `CrossOriginRedirect` に化け、`DisallowedScheme` の分類が
+        // 遮られる（origin は scheme を含むため必ず不一致になる）。
+        if same_origin_only
+            && attempt
+                .previous()
+                .first()
+                .is_none_or(|first| first.origin() != attempt.url().origin())
+        {
+            return attempt.error(RedirectMarker::CrossOriginRedirect);
+        }
+        // `SafeResolver` は DNS 名の解決結果しか検証しない（IP リテラル
+        // host は hyper-util が DNS 解決を経由せず直接使うため）。
+        // リダイレクト先の host が IP リテラルの場合はここで直接検証する
+        // （`reject_disallowed_address` のドキュメント参照）。
+        if let Some(ip) = url_ip_literal(attempt.url())
+            && !allow_private_network_access
+            && is_disallowed_address(ip)
+        {
+            return attempt.error(RedirectMarker::DisallowedAddress {
+                address: ip.to_string(),
+            });
+        }
+        attempt.follow()
+    });
+
+    let resolver = Arc::new(SafeResolver {
+        allow_private_network_access: options.allow_private_network_access,
+    });
+    let client = ClientBuilder::new()
+        .timeout(options.timeout)
+        .connect_timeout(options.connect_timeout)
+        .redirect(redirect_policy)
+        .no_proxy()
+        .dns_resolver(resolver)
+        .user_agent(USER_AGENT)
+        .build()
+        .map_err(|source| map_reqwest_error(source, options))?;
+
+    Ok(client)
+}
+
 impl Fetcher {
     /// `options` を検証したうえで `Fetcher` を構築する。
     ///
@@ -588,52 +659,14 @@ impl Fetcher {
         ensure_crypto_provider_installed();
         options.validate()?;
 
-        let max_redirects = options.max_redirects;
-        let allow_private_network_access = options.allow_private_network_access;
-        let redirect_policy = Policy::custom(move |attempt| {
-            if attempt.previous().len() > max_redirects {
-                return attempt.error(RedirectMarker::TooManyRedirects {
-                    limit: max_redirects,
-                });
-            }
-            let scheme = attempt.url().scheme().to_string();
-            match scheme.as_str() {
-                "http" | "https" => {}
-                other => {
-                    return attempt.error(RedirectMarker::DisallowedScheme {
-                        scheme: other.to_string(),
-                    });
-                }
-            }
-            // `SafeResolver` は DNS 名の解決結果しか検証しない（IP リテラル
-            // host は hyper-util が DNS 解決を経由せず直接使うため）。
-            // リダイレクト先の host が IP リテラルの場合はここで直接検証する
-            // （`reject_disallowed_address` のドキュメント参照）。
-            if let Some(ip) = url_ip_literal(attempt.url())
-                && !allow_private_network_access
-                && is_disallowed_address(ip)
-            {
-                return attempt.error(RedirectMarker::DisallowedAddress {
-                    address: ip.to_string(),
-                });
-            }
-            attempt.follow()
-        });
+        let client = build_client(&options, false)?;
+        let page_client = build_client(&options, true)?;
 
-        let resolver = Arc::new(SafeResolver {
-            allow_private_network_access: options.allow_private_network_access,
-        });
-        let client = ClientBuilder::new()
-            .timeout(options.timeout)
-            .connect_timeout(options.connect_timeout)
-            .redirect(redirect_policy)
-            .no_proxy()
-            .dns_resolver(resolver)
-            .user_agent(USER_AGENT)
-            .build()
-            .map_err(|source| map_reqwest_error(source, &options))?;
-
-        Ok(Self { client, options })
+        Ok(Self {
+            client,
+            page_client,
+            options,
+        })
     }
 
     /// `url` を GET で取得する。
@@ -661,7 +694,7 @@ impl Fetcher {
     pub async fn get(&self, url: &str) -> Result<FetchResponse> {
         // 無効時は Instant::now() も呼ばない。
         let start = self.options.recorder.is_enabled().then(Instant::now);
-        let result = self.get_inner(url, u64::MAX, false).await;
+        let result = self.get_inner(url, u64::MAX, false, None, false).await;
         if let Some(start) = start {
             self.options
                 .recorder
@@ -677,7 +710,37 @@ impl Fetcher {
     /// ページランナーの `src` 取得が呼ぶ）。超過時は [`Error::ResponseTooLarge`]（`limit` は実効上限）。
     pub async fn get_with_max_body(&self, url: &str, max_body_bytes: u64) -> Result<FetchResponse> {
         let start = self.options.recorder.is_enabled().then(Instant::now);
-        let result = self.get_inner(url, max_body_bytes, true).await;
+        let result = self.get_inner(url, max_body_bytes, true, None, false).await;
+        if let Some(start) = start {
+            self.options
+                .recorder
+                .record_result(OperationKind::Fetch, &result, start.elapsed());
+        }
+        result
+    }
+
+    /// ページ内 `fetch` / `XMLHttpRequest` 用の取得（`JS-8`・`JS-6`）。
+    ///
+    /// [`Fetcher::get_with_max_body`] との違いは 2 点。(1) 本文上限超過は非 2xx でも
+    /// [`Error::ResponseTooLarge`] にする（空本文の成功に化けさせず、呼び出し側が上限超過を
+    /// 検出できるようにする）。(2) このリクエスト限りの `deadline`（ページの残り実時間）を
+    /// `FetchOptions::timeout` との小さい方で全体タイムアウトに適用し、期限到達時は取得を
+    /// キャンセルして [`Error::Timeout`] を返す。`deadline` が 0 なら送信せず [`Error::Timeout`]。
+    pub async fn get_for_page_net(
+        &self,
+        url: &str,
+        max_body_bytes: u64,
+        deadline: Duration,
+    ) -> Result<FetchResponse> {
+        if deadline.is_zero() {
+            return Err(Error::Timeout {
+                limit: Duration::ZERO,
+            });
+        }
+        let start = self.options.recorder.is_enabled().then(Instant::now);
+        let result = self
+            .get_inner(url, max_body_bytes, false, Some(deadline), true)
+            .await;
         if let Some(start) = start {
             self.options
                 .recorder
@@ -723,6 +786,8 @@ impl Fetcher {
         url: &str,
         max_body_bytes: u64,
         drop_oversized_error_body: bool,
+        deadline: Option<Duration>,
+        same_origin_only: bool,
     ) -> Result<FetchResponse> {
         // 実効上限は設定値と呼び出し単位の上限の小さい方（受信中に強制する）。
         let limit = self.options.max_body_bytes.min(max_body_bytes);
@@ -732,9 +797,17 @@ impl Fetcher {
         reject_disallowed_scheme(&parsed)?;
         reject_disallowed_address(&parsed, self.options.allow_private_network_access)?;
 
-        let response = self
-            .client
-            .get(parsed)
+        let client = if same_origin_only {
+            &self.page_client
+        } else {
+            &self.client
+        };
+        let mut request = client.get(parsed);
+        if let Some(deadline) = deadline {
+            // リクエスト単位の全体タイムアウト（本文受信を含む）。クライアント既定より長くしない。
+            request = request.timeout(deadline.min(self.options.timeout));
+        }
+        let response = request
             .send()
             .await
             .map_err(|source| map_reqwest_error(source, &self.options))?;
@@ -951,6 +1024,7 @@ fn map_reqwest_error(source: reqwest::Error, options: &FetchOptions) -> Error {
                 RedirectMarker::DisallowedAddress { address } => Error::DisallowedAddress {
                     address: address.clone(),
                 },
+                RedirectMarker::CrossOriginRedirect => Error::CrossOriginRedirect,
             };
         }
         if let Some(marker) = err.downcast_ref::<DisallowedAddressMarker>() {

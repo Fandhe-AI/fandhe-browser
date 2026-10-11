@@ -8,11 +8,14 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::time::Duration;
 
+use std::sync::{Arc, Mutex};
+
 use fandhe_browser_core::dom_bridge::TimerCallbackSource;
 use fandhe_browser_core::fetch::{FetchOptions, Fetcher};
 use fandhe_browser_core::{
-    AbortKind, Config, EventLoopLimits, LifecycleOutcome, PageRunInput, PageRunOptions,
-    PageRunOutput, ScriptOutcome, WallTimeScope, run_page_scripts,
+    AbortKind, Config, EventLoopLimits, LifecycleOutcome, NetRejectKind, NetRequestKind,
+    PageNetLimits, PageRunInput, PageRunOptions, PageRunOutput, ScriptOutcome, USER_AGENT,
+    WallTimeScope, run_page_scripts,
 };
 
 const BASE: &str = "https://example.test/";
@@ -384,9 +387,616 @@ fn child_process_count() -> usize {
 }
 
 /// 全ケースを `engine`（`"v8"` / `"boa"`）で実行する。
+/// 受信した要求の先頭行とヘッダを記録する最小サーバー（到達回数・ヘッダの検査用）。
+/// `respond` はパスから `(status 行, 追加ヘッダ, 本文)` を返す。
+type Hits = Arc<Mutex<Vec<String>>>;
+
+fn spawn_recording_server(
+    respond: impl Fn(&str) -> (&'static str, String, String) + Send + Sync + 'static,
+) -> (u16, Hits) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let hits: Hits = Arc::new(Mutex::new(Vec::new()));
+    let respond = Arc::new(respond);
+    let recorded = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let (respond, recorded) = (respond.clone(), recorded.clone());
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut buf = [0u8; 1024];
+                let mut data = Vec::new();
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(buf.get(..n).unwrap_or(&[]));
+                    if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&data).into_owned();
+                let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                if let Ok(mut r) = recorded.lock() {
+                    r.push(head);
+                }
+                let (status, extra, body) = respond(&path);
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            });
+        }
+    });
+    (port, hits)
+}
+
+fn hit_count(hits: &Hits) -> usize {
+    hits.lock().map(|h| h.len()).unwrap_or(usize::MAX)
+}
+
+fn loopback_fetcher() -> Fetcher {
+    Fetcher::new(FetchOptions::new().with_allow_private_network_access(true)).expect("fetcher")
+}
+
+fn rejections(out: &PageRunOutput) -> Vec<(NetRequestKind, NetRejectKind)> {
+    out.bridge_diagnostics()
+        .net_rejections
+        .iter()
+        .map(|r| (r.request, r.kind))
+        .collect()
+}
+
+/// XHR の本文を `<p>` として DOM に書くページ（`onload` と `onerror` で別の目印を出す）。
+fn xhr_page(url: &str) -> String {
+    format!(
+        "<body><script>function a(t){{var p=document.createElement('p');p.textContent=t;\
+         document.body.appendChild(p)}}\
+         var x=new XMLHttpRequest();x.open('GET','{url}');\
+         x.onload=function(){{a('load:'+x.status+':'+x.responseText)}};\
+         x.onerror=function(){{a('error:'+x.status)}};x.send();</script></body>"
+    )
+}
+
+/// ページ内 `XMLHttpRequest` の共通ケース（両エンジン。`JS-8`・`JS-6`・`SEC-2`）。
+fn net_cases(engine: &str) {
+    let opts = PageRunOptions::default();
+
+    eprintln!("case: JS-8 XHR GET resolves against the page URL and sees status + body");
+    let (port, hits) = spawn_recording_server(|path| match path {
+        "/dir/data.txt" => ("200 OK", String::new(), "hello".to_string()),
+        _ => ("404 Not Found", String::new(), "nope".to_string()),
+    });
+    let base = format!("http://127.0.0.1:{port}/dir/page.html");
+    let out = run_page_at(
+        engine,
+        &xhr_page("data.txt"),
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert!(
+        out.html().contains("<p>load:200:hello</p>"),
+        "{}",
+        out.html()
+    );
+    assert!(out.abort().is_none(), "{:?}", out.abort());
+    assert_eq!(hit_count(&hits), 1);
+    assert_eq!(out.net().started(), 1);
+    assert_eq!(out.net().completed(), 1);
+    assert_eq!(out.net().response_bytes(), 5);
+    assert_eq!(out.net().pending_at_end(), 0);
+    assert!(rejections(&out).is_empty());
+
+    eprintln!("case: JS-8 a fire-and-forget fetch is accepted and delivered on both engines");
+    let out = run_page_at(
+        engine,
+        "<body><script>fetch('data.txt')</script></body>",
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert_eq!(hit_count(&hits), 2);
+    assert_eq!(out.net().started(), 1);
+    assert_eq!(out.net().completed(), 1);
+    assert_eq!(out.net().response_bytes(), 5);
+
+    eprintln!("case: JS-8 XHR sends no Cookie / Authorization and keeps the honest User-Agent");
+    {
+        let recorded = hits.lock().expect("hits");
+        let head = recorded.first().expect("one request").to_ascii_lowercase();
+        assert!(head.starts_with("get /dir/data.txt "), "{head}");
+        assert!(!head.contains("cookie:"), "{head}");
+        assert!(!head.contains("authorization:"), "{head}");
+        assert!(
+            head.contains(&format!("user-agent: {}", USER_AGENT.to_ascii_lowercase())),
+            "{head}"
+        );
+    }
+
+    eprintln!("case: JS-8 XHR calls onload with status 404 for an HTTP error");
+    let out = run_page_at(
+        engine,
+        &xhr_page("missing.txt"),
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert!(
+        out.html().contains("<p>load:404:nope</p>"),
+        "{}",
+        out.html()
+    );
+
+    eprintln!("case: JS-8 XHR rejects non-GET, request bodies and synchronous mode");
+    let (port, hits) = spawn_recording_server(|_| ("200 OK", String::new(), "x".to_string()));
+    let base = format!("http://127.0.0.1:{port}/page.html");
+    let html = "<body><script>function a(t){var p=document.createElement('p');p.textContent=t;\
+        document.body.appendChild(p)}\
+        var x=new XMLHttpRequest();x.open('POST','a');x.onerror=function(){a('e1')};x.send();\
+        var y=new XMLHttpRequest();y.open('GET','a');y.onerror=function(){a('e2')};y.send('body');\
+        var z=new XMLHttpRequest();try{z.open('GET','a',false)}catch(e){a('sync-throws')}\
+        </script></body>";
+    let out = run_page_at(engine, html, &base, &opts, &loopback_fetcher());
+    assert!(
+        out.html().contains("<p>sync-throws</p><p>e1</p><p>e2</p>"),
+        "{}",
+        out.html()
+    );
+    assert_eq!(
+        rejections(&out),
+        vec![
+            (NetRequestKind::Xhr, NetRejectKind::UnsupportedMethod),
+            (NetRequestKind::Xhr, NetRejectKind::RequestBody),
+            (NetRequestKind::Xhr, NetRejectKind::SyncXhr),
+        ]
+    );
+    assert_eq!(hit_count(&hits), 0);
+    assert_eq!(out.net().started(), 0);
+
+    eprintln!(
+        "case: JS-8 cross-origin and unsafe targets are refused without touching the network"
+    );
+    let (port, hits) = spawn_recording_server(|_| ("200 OK", String::new(), "secret".to_string()));
+    let fetcher = Fetcher::new(FetchOptions::new()).expect("fetcher");
+    let targets = [
+        (
+            format!("http://127.0.0.1:{port}/x?secret=1"),
+            NetRejectKind::CrossOrigin,
+        ),
+        ("http://10.0.0.1/".to_string(), NetRejectKind::CrossOrigin),
+        ("http://[::1]/".to_string(), NetRejectKind::CrossOrigin),
+        (
+            "http://169.254.169.254/latest".to_string(),
+            NetRejectKind::CrossOrigin,
+        ),
+        ("file:///etc/passwd".to_string(), NetRejectKind::InvalidUrl),
+        ("ftp://example.test/".to_string(), NetRejectKind::InvalidUrl),
+    ];
+    for (url, want) in targets {
+        let out = run_page_at(
+            engine,
+            &xhr_page(&url),
+            "https://example.test/",
+            &opts,
+            &fetcher,
+        );
+        assert!(
+            out.html().contains("<p>error:0</p>"),
+            "{url}: {}",
+            out.html()
+        );
+        assert_eq!(rejections(&out), vec![(NetRequestKind::Xhr, want)], "{url}");
+        // 診断に URL・クエリ・パスを残さない。
+        let dump = format!("{:?}", out.bridge_diagnostics());
+        for banned in ["127.0.0.1", "secret", "passwd", "169.254"] {
+            assert!(!dump.contains(banned), "{banned} in {dump}");
+        }
+    }
+    assert_eq!(hit_count(&hits), 0);
+
+    eprintln!("case: JS-8 SSRF: a same-origin internal address is refused by the Fetcher");
+    let out = run_page_at(
+        engine,
+        &xhr_page("/x"),
+        &format!("http://127.0.0.1:{port}/page.html"),
+        &opts,
+        &fetcher,
+    );
+    assert!(out.html().contains("<p>error:0</p>"), "{}", out.html());
+    assert_eq!(
+        rejections(&out),
+        vec![(NetRequestKind::Xhr, NetRejectKind::DisallowedAddress)]
+    );
+    assert_eq!(hit_count(&hits), 0);
+
+    eprintln!("case: JS-8 a cross-origin redirect response is not exposed to the page");
+    let (other_port, other_hits) =
+        spawn_recording_server(|_| ("200 OK", String::new(), "leaked".to_string()));
+    let (port, _hits) = spawn_recording_server(move |_| {
+        (
+            "302 Found",
+            format!("Location: http://localhost:{other_port}/secret\r\n"),
+            String::new(),
+        )
+    });
+    let out = run_page_at(
+        engine,
+        &xhr_page("r"),
+        &format!("http://127.0.0.1:{port}/page.html"),
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert!(out.html().contains("<p>error:0</p>"), "{}", out.html());
+    assert!(!out.html().contains("leaked"), "{}", out.html());
+    assert_eq!(
+        rejections(&out),
+        vec![(NetRequestKind::Xhr, NetRejectKind::CrossOrigin)]
+    );
+    // 別オリジンには要求自体が出ない（応答を隠すだけでなく送信前に打ち切る）。
+    assert_eq!(hit_count(&other_hits), 0);
+
+    eprintln!("case: JS-8 an A -> B -> A redirect chain never sends a request to B");
+    let a_port_cell = Arc::new(std::sync::atomic::AtomicU16::new(0));
+    let b_cell = a_port_cell.clone();
+    let (b_port, b_hits) = spawn_recording_server(move |_| {
+        let a = b_cell.load(std::sync::atomic::Ordering::SeqCst);
+        (
+            "302 Found",
+            format!("Location: http://127.0.0.1:{a}/final\r\n"),
+            String::new(),
+        )
+    });
+    let (a_port, a_hits) = spawn_recording_server(move |path| match path {
+        "/final" => ("200 OK", String::new(), "leaked".to_string()),
+        _ => (
+            "302 Found",
+            format!("Location: http://localhost:{b_port}/mid\r\n"),
+            String::new(),
+        ),
+    });
+    a_port_cell.store(a_port, std::sync::atomic::Ordering::SeqCst);
+    let out = run_page_at(
+        engine,
+        &xhr_page("r"),
+        &format!("http://127.0.0.1:{a_port}/page.html"),
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert!(out.html().contains("<p>error:0</p>"), "{}", out.html());
+    assert!(!out.html().contains("leaked"), "{}", out.html());
+    assert_eq!(
+        rejections(&out),
+        vec![(NetRequestKind::Xhr, NetRejectKind::CrossOrigin)]
+    );
+    assert_eq!(hit_count(&b_hits), 0);
+    assert_eq!(hit_count(&a_hits), 1);
+
+    eprintln!("case: JS-8 re-opening an XHR drops the stale response");
+    let (port, _hits) = spawn_recording_server(|path| match path {
+        "/old" => ("200 OK", String::new(), "OLD".to_string()),
+        _ => ("200 OK", String::new(), "NEW".to_string()),
+    });
+    let html = "<body><script>function a(t){var p=document.createElement('p');p.textContent=t;\
+        document.body.appendChild(p)}\
+        var x=new XMLHttpRequest();x.onload=function(){a('load:'+x.responseText)};\
+        x.open('GET','old');x.send();x.open('GET','new');x.send();</script></body>";
+    let out = run_page_at(
+        engine,
+        html,
+        &format!("http://127.0.0.1:{port}/page.html"),
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert!(
+        out.html().contains("<p>load:NEW</p>") && !out.html().contains("OLD"),
+        "{}",
+        out.html()
+    );
+    assert_eq!(out.html().matches("<p>load:").count(), 1, "{}", out.html());
+
+    eprintln!("case: JS-8 dangerous redirects are refused by the Fetcher");
+    let (port, hits) = spawn_recording_server(|path| match path {
+        "/to-file" => (
+            "302 Found",
+            "Location: file:///etc/passwd\r\n".to_string(),
+            String::new(),
+        ),
+        _ => (
+            "302 Found",
+            "Location: ftp://example.test/x\r\n".to_string(),
+            String::new(),
+        ),
+    });
+    let base = format!("http://127.0.0.1:{port}/page.html");
+    for path in ["to-file", "to-ftp"] {
+        let out = run_page_at(engine, &xhr_page(path), &base, &opts, &loopback_fetcher());
+        assert!(
+            out.html().contains("<p>error:0</p>"),
+            "{path}: {}",
+            out.html()
+        );
+        assert_eq!(
+            rejections(&out),
+            vec![(NetRequestKind::Xhr, NetRejectKind::DisallowedScheme)],
+            "{path}"
+        );
+    }
+    assert_eq!(hit_count(&hits), 2);
+
+    eprintln!(
+        "case: JS-8 abort() / re-open() drop an unsent request before it reaches the network"
+    );
+    let (port, hits) = spawn_recording_server(|path| match path {
+        "/kept" => ("200 OK", String::new(), "kept".to_string()),
+        _ => ("200 OK", String::new(), "stale".to_string()),
+    });
+    let base = format!("http://127.0.0.1:{port}/page.html");
+    let html = "<body><script>function a(t){var p=document.createElement('p');p.textContent=t;\
+        document.body.appendChild(p)}\
+        var x=new XMLHttpRequest();x.onload=function(){a('x:'+x.responseText)};\
+        x.open('GET','aborted');x.send();x.abort();\
+        var y=new XMLHttpRequest();y.onload=function(){a('y:'+y.responseText)};\
+        y.open('GET','reopened-old');y.send();y.open('GET','kept');y.send();</script></body>";
+    let out = run_page_at(engine, html, &base, &opts, &loopback_fetcher());
+    assert!(out.html().contains("<p>y:kept</p>"), "{}", out.html());
+    assert!(!out.html().contains("<p>y:stale"), "{}", out.html());
+    assert!(!out.html().contains("<p>x:"), "{}", out.html());
+    assert_eq!(hit_count(&hits), 1);
+    // 受理数は中止しても戻さない（要求数上限の迂回防止）。ネットへ出たのは 1 件だけ。
+    assert_eq!(out.net().started(), 3);
+    assert_eq!(out.net().cancelled(), 2);
+    assert_eq!(out.net().pending_at_end(), 0);
+
+    eprintln!("case: JS-6 request count: the Nth request is accepted, the N+1th rejected");
+    let (port, hits) = spawn_recording_server(|_| ("200 OK", String::new(), "ok".to_string()));
+    let base = format!("http://127.0.0.1:{port}/page.html");
+    let html = "<body><script>function a(t){var p=document.createElement('p');p.textContent=t;\
+        document.body.appendChild(p)}\
+        for(var i=0;i<3;i++){(function(n){var x=new XMLHttpRequest();x.open('GET','r'+n);\
+        x.onload=function(){a('ok'+n)};x.onerror=function(){a('err'+n)};x.send()})(i)}\
+        </script></body>";
+    let limited =
+        PageRunOptions::default().with_net_limits(PageNetLimits::default().with_max_requests(2));
+    let out = run_page_at(engine, html, &base, &limited, &loopback_fetcher());
+    assert!(out.html().contains("<p>err2</p>"), "{}", out.html());
+    assert!(
+        out.html().contains("<p>ok0</p><p>ok1</p>"),
+        "{}",
+        out.html()
+    );
+    assert_eq!(
+        rejections(&out),
+        vec![(NetRequestKind::Xhr, NetRejectKind::RequestLimit)]
+    );
+    assert_eq!(hit_count(&hits), 2);
+    assert_eq!(out.net().started(), 2);
+    assert_eq!(PageNetLimits::default().max_requests(), 50);
+
+    eprintln!(
+        "case: JS-6 cumulative bytes: exactly the limit is accepted, then requests are rejected"
+    );
+    let (port, hits) =
+        spawn_recording_server(|_| ("200 OK", String::new(), "0123456789".to_string()));
+    let base = format!("http://127.0.0.1:{port}/page.html");
+    let limited = PageRunOptions::default()
+        .with_net_limits(PageNetLimits::default().with_max_response_bytes(10));
+    let html = "<body><script>function a(t){var p=document.createElement('p');p.textContent=t;\
+        document.body.appendChild(p)}\
+        for(var i=0;i<2;i++){(function(n){var x=new XMLHttpRequest();x.open('GET','r'+n);\
+        x.onload=function(){a('ok'+n)};x.onerror=function(){a('err'+n)};x.send()})(i)}\
+        </script></body>";
+    let out = run_page_at(engine, html, &base, &limited, &loopback_fetcher());
+    assert!(
+        out.html().contains("<p>ok0</p><p>err1</p>"),
+        "{}",
+        out.html()
+    );
+    assert_eq!(out.net().response_bytes(), 10);
+    assert!(out.bridge_diagnostics().net_limit_exceeded);
+    assert_eq!(
+        rejections(&out),
+        vec![(NetRequestKind::Xhr, NetRejectKind::ResponseBytesLimit)]
+    );
+    // 2 件目は上限到達後なのでネットワークへ出ない。
+    assert_eq!(hit_count(&hits), 1);
+
+    eprintln!("case: JS-6 a response over the remaining bytes is rejected");
+    let limited = PageRunOptions::default()
+        .with_net_limits(PageNetLimits::default().with_max_response_bytes(9));
+    let out = run_page_at(engine, &xhr_page("r"), &base, &limited, &loopback_fetcher());
+    assert!(out.html().contains("<p>error:0</p>"), "{}", out.html());
+    assert_eq!(
+        rejections(&out),
+        vec![(NetRequestKind::Xhr, NetRejectKind::ResponseBytesLimit)]
+    );
+    assert_eq!(out.net().response_bytes(), 0);
+
+    eprintln!("case: JS-6 an over-limit non-2xx body is rejected, not delivered as empty success");
+    let (port, _hits) =
+        spawn_recording_server(|_| ("404 Not Found", String::new(), "0123456789".to_string()));
+    let base = format!("http://127.0.0.1:{port}/page.html");
+    let out = run_page_at(engine, &xhr_page("r"), &base, &limited, &loopback_fetcher());
+    assert!(out.html().contains("<p>error:0</p>"), "{}", out.html());
+    assert!(out.bridge_diagnostics().net_limit_exceeded);
+    assert_eq!(
+        rejections(&out),
+        vec![(NetRequestKind::Xhr, NetRejectKind::ResponseBytesLimit)]
+    );
+
+    eprintln!("case: JS-6 a stalled response is cut off by the page wall time");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming().flatten() {
+            held.push(stream);
+        }
+    });
+    let base = format!("http://127.0.0.1:{port}/page.html");
+    let timed = PageRunOptions::default().with_page_wall_time(Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    let out = run_page_at(engine, &xhr_page("r"), &base, &timed, &loopback_fetcher());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(
+            out.abort().map(|a| a.kind()),
+            Some(AbortKind::WallTime { .. })
+        ),
+        "{:?}",
+        out.abort()
+    );
+}
+
+/// ページ内 `fetch`（ネイティブ Promise）のケース。
+///
+/// boa は `evaluate_script` の後に Promise ジョブを drain しないため `.then` の続きが走らない
+/// （js crate の制約。TASK-30）。そのため V8 のテストだけが呼ぶ。
+#[allow(dead_code)]
+pub fn run_fetch_promises(engine: &str) {
+    let opts = PageRunOptions::default();
+    let (port, hits) = spawn_recording_server(|path| match path {
+        "/dir/data.json" => (
+            "200 OK",
+            String::new(),
+            "{\"name\":\"fandhe\",\"n\":3}".to_string(),
+        ),
+        "/dir/bad.json" => ("200 OK", String::new(), "{oops".to_string()),
+        _ => ("404 Not Found", String::new(), "nope".to_string()),
+    });
+    let base = format!("http://127.0.0.1:{port}/dir/page.html");
+    let helper = "function a(t){var p=document.createElement('p');p.textContent=t;\
+        document.body.appendChild(p)}";
+    let page = |script: &str| format!("<body><script>{helper}{script}</script></body>");
+
+    eprintln!("case: JS-8 fetch().then(json) reaches the DOM with status / ok");
+    let out = run_page_at(
+        engine,
+        &page(
+            "fetch('data.json').then(function(r){a('s'+r.status+':'+r.ok);return r.json()})\
+             .then(function(o){a(o.name+o.n)})",
+        ),
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert!(
+        out.html().contains("<p>s200:true</p><p>fandhe3</p>"),
+        "{}",
+        out.html()
+    );
+    assert_eq!(out.net().completed(), 1);
+    assert_eq!(hit_count(&hits), 1);
+
+    eprintln!("case: JS-8 fetch 404 resolves with ok=false");
+    let out = run_page_at(
+        engine,
+        &page("fetch('zzz').then(function(r){a('s'+r.status+':'+r.ok);return r.text()}).then(a)"),
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert!(
+        out.html().contains("<p>s404:false</p><p>nope</p>"),
+        "{}",
+        out.html()
+    );
+
+    eprintln!("case: JS-8 text() twice and invalid JSON reject");
+    let out = run_page_at(
+        engine,
+        &page(
+            "fetch('data.json').then(function(r){return r.text().then(function(){return r.text()})})\
+             .catch(function(e){a('twice:'+e.name)});\
+             fetch('bad.json').then(function(r){return r.json()}).catch(function(e){a('badjson')})",
+        ),
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert!(
+        out.html().contains("<p>twice:TypeError</p>"),
+        "{}",
+        out.html()
+    );
+    assert!(out.html().contains("<p>badjson</p>"), "{}", out.html());
+
+    eprintln!("case: JS-8 fetch rejects POST / body / unresolvable URL and records it");
+    let before = hit_count(&hits);
+    let out = run_page_at(
+        engine,
+        &page(
+            "fetch('a',{method:'POST'}).catch(function(){a('post')});\
+             fetch('a',{body:'x'}).catch(function(){a('body')});\
+             fetch('http://[bad').catch(function(){a('url')})",
+        ),
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert!(
+        out.html().contains("<p>post</p><p>body</p><p>url</p>"),
+        "{}",
+        out.html()
+    );
+    assert_eq!(
+        rejections(&out),
+        vec![
+            (NetRequestKind::Fetch, NetRejectKind::UnsupportedMethod),
+            (NetRequestKind::Fetch, NetRejectKind::RequestBody),
+            (NetRequestKind::Fetch, NetRejectKind::InvalidUrl),
+        ]
+    );
+    assert_eq!(hit_count(&hits), before);
+
+    eprintln!("case: JS-8 fetch never sends headers / credentials from init");
+    let out = run_page_at(
+        engine,
+        &page(
+            "fetch('data.json',{headers:{Authorization:'x'},credentials:'include'})\
+             .then(function(r){a('ok'+r.status)})",
+        ),
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert!(out.html().contains("<p>ok200</p>"), "{}", out.html());
+    assert_eq!(out.bridge_diagnostics().net_options_ignored, 2);
+    let recorded = hits.lock().expect("hits");
+    let head = recorded.last().expect("request").to_ascii_lowercase();
+    assert!(!head.contains("authorization:"), "{head}");
+    assert!(!head.contains("cookie:"), "{head}");
+    drop(recorded);
+
+    eprintln!("case: JS-8 fetch to an internal address rejects without reaching the server");
+    let fetcher = Fetcher::new(FetchOptions::new()).expect("fetcher");
+    let before = hit_count(&hits);
+    let out = run_page_at(
+        engine,
+        &page(&format!(
+            "fetch('http://127.0.0.1:{port}/dir/data.json').catch(function(e){{a('blocked:'+e.name)}})"
+        )),
+        "https://example.test/",
+        &opts,
+        &fetcher,
+    );
+    assert!(
+        out.html().contains("<p>blocked:TypeError</p>"),
+        "{}",
+        out.html()
+    );
+    assert_eq!(hit_count(&hits), before);
+}
 pub fn run(engine: &str) {
     let opts = PageRunOptions::default();
     timer_cases(engine);
+    net_cases(engine);
 
     eprintln!("case: JS-4 document order + console order");
     let html = format!("<body>{}{}{}</body>", append("1"), append("2"), append("3"));
