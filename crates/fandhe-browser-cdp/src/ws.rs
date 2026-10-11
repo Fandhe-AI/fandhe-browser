@@ -9,7 +9,7 @@
 //! # スタブについて
 //!
 //! [`BrowserSessionHandler`] は `crate::protocol::Dispatcher` へ委譲するだけで、組込み
-//! メソッド表は `Page.navigate`・`DOM.getDocument`・`DOM.querySelector`・`DOM.requestChildNodes`（TASK-42.2・42.4・42.5・#657）。未実装メソッドの応答方針は
+//! メソッド表は `protocol::builtin_handlers` を参照。未実装メソッドの応答方針は
 //! 確定済み（`-32601` を返し受信ログに記録。`protocol.rs` 参照。`CDP-6`）で、成功を返さない（`SEC-2`）。
 
 use std::collections::HashMap;
@@ -85,7 +85,7 @@ impl BrowserSessionHandler {
         *conns.entry(id).or_insert_with(|| {
             let conn = ConnId::new(self.next_conn.fetch_add(1, Ordering::Relaxed));
             // 生存中として登録する（切断後の記録を拒否するため。`SEC-2`）。
-            self.state.dom_issued().open_connection(conn);
+            self.state.open_connection(conn);
             conn
         })
     }
@@ -124,7 +124,7 @@ impl WsMessageHandler for BrowserSessionHandler {
         })
     }
 
-    /// 切断時にその接続の接続 ID と nodeId 払い出し記録を解放する（`CDP-1`・`SEC-2`）。
+    /// 切断時にその接続の接続 ID と接続別状態（nodeId 払い出し記録など）を解放する（`CDP-1`・`SEC-2`）。
     fn on_close(&self, ctx: &WsConnContext, _reason: CloseReason) {
         let removed = self
             .conns
@@ -132,7 +132,7 @@ impl WsMessageHandler for BrowserSessionHandler {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&ctx.conn_id());
         if let Some(conn) = removed {
-            self.state.dom_issued().release_connection(conn);
+            self.state.release_connection(conn);
         }
     }
 }

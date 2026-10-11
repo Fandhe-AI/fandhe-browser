@@ -29,8 +29,8 @@ Playwright のソースは長く引用せず、関数名と要約に留める。
 
 | 段階 | 現状 | 根拠 |
 | ---- | ---- | ---- |
-| `connectOverCDP(http://…)` | 失敗。`/json/version/` は 200（TASK-43.3a で解消）。`Browser.getVersion` は成功し、次の `Target.setAutoAttach`・`Browser.setDownloadBehavior` が `-32601` | A（再取得後）: seq 1〜9 |
-| `connectOverCDP(ws://…)` | 失敗。`Browser.getVersion` は成功し（TASK-43.3a で解消）、次の `Target.setAutoAttach`・`Browser.setDownloadBehavior` が `-32601` | A（再取得後）: seq 10〜16 |
+| `connectOverCDP(http://…)` | 失敗。`/json/version/` は 200（TASK-43.3a で解消）。`Browser.getVersion` は成功し、次の `Target.setAutoAttach`・`Browser.setDownloadBehavior` が `-32601`（実体未接続のため未登録。TASK-43.3b のレビューで成功応答を取り下げた） | A（TASK-43.3a 後の再取得）: seq 1〜9 |
+| `connectOverCDP(ws://…)` | 失敗。`Browser.getVersion` は成功し、次の `Target.setAutoAttach`・`Browser.setDownloadBehavior` が `-32601` | A（同上）: seq 10〜16 |
 | `newContext()` | 未到達（トレースに該当メッセージなし） | A + B |
 | `newPage()` | 未到達（同上） | A + B |
 
@@ -54,7 +54,7 @@ Playwright が接続から `newPage()` 完了までに必要とする項目を�
 | 8 | `newPage()` | `CRBrowser._onAttachedToTarget` | イベント `Target.attachedToTarget`（root session 宛て） | `sessionId`・`targetInfo.targetId`・`targetInfo.type`（`page`）・`targetInfo.browserContextId`（必須。欠けると assert 失敗）・`targetInfo.url`・`waitingForDebugger` | 送出経路なし。現実装のイベントはコマンド応答に同伴する形のみ（`HandlerOutput.events`）で、`Target.*` イベントは未定義 | `Target.attachedToTarget` の生成と、`createTarget` の応答より前に届く順序の保証 | B・C |
 | 9 | ページ初期化 | `FrameSession._initialize` | `sessionId` 付きで `Page.enable`・`Page.getFrameTree`・`Log.enable`・`Page.setLifecycleEventsEnabled` `{enabled:true}`・`Runtime.enable`・`Page.addScriptToEvaluateOnNewDocument`・`Network.enable`・`Target.setAutoAttach`・`Runtime.runIfWaitingForDebugger` を並行送信 | `Page.getFrameTree` の `frameTree.frame`（`id`・`url`・`loaderId` 等）で frame を構築。`Runtime.executionContextCreated` の `context.auxData.frameId`・`auxData.isDefault`・`context.id` で実行コンテキストを構築 | 全て `-32601`。`Page.navigate` 側が出すのは `Page.frameNavigated`・`Page.loadEventFired` のみ | 上記メソッド群のハンドラとフレームツリー・実行コンテキストのモデル。いずれかが失敗するとページ初期化が失敗する | B |
 | 10 | ページ初期化 | `FrameSession._initialize` | 条件付き: `Emulation.setFocusEmulationEnabled`・`Emulation.setDeviceMetricsOverride`（`newContext()` が既定ビューポートを持つ場合）・`Emulation.setEmulatedMedia`・`Page.setInterceptFileChooserDialog`（失敗は握りつぶし）・`Browser.getWindowForTarget`（失敗は握りつぶし）・`Page.createIsolatedWorld`（失敗無視送信）。headless 判定時のみ `Page.setFontFamilies` | 結果は使わない（失敗で初期化が止まるのは握りつぶしでないもの） | 全て `-32601` | 握りつぶされないメソッドのハンドラ。握りつぶされるものは未実装でも初期化は進むとソース上読める | B |
-| 11 | ページ初期化 | `FrameSession._initialize` | （メソッドではなくイベント待ち）初期の `about:blank` では `Page.frameNavigated` が非初回として届くまで `_firstNonInitialNavigationCommittedPromise` が解決しないとソース上読める | `Page.frameNavigated` イベント（`frame.id`・`url`・`loaderId`）、`Page.lifecycleEvent` | イベントを送るのは `Page.navigate` のみ。ターゲット生成時の送出なし | 新規ページ作成時の `Page.frameNavigated`（`about:blank`）の送出。未送出だと `newPage()` が初期化待ちでタイムアウトする可能性がある（実測していない） | B |
+| 11 | ページ初期化 | `FrameSession._initialize` | （メソッドではなくイベント待ち）初期の `about:blank` では `Page.frameNavigated` が非初回として届くまで `_firstNonInitialNavigationCommittedPromise` が解決しないとソース上読める | `Page.frameNavigated` イベント（`frame.id`・`url`・`loaderId`）、`Page.lifecycleEvent` | イベントを送るのは `Page.navigate` のみ。ターゲット生成時の送出なし | 新規ページ作成時の `Page.frameNavigated`（`about:blank`）の送出。未送出だと `newPage()` が初期化待ちでタイムアウトする可能性がある（実測していない。**訂正あり**: 「段階 2a の実施結果」の末尾参照） | B |
 
 ### 実測で確認できた停止点と予測の境界
 
@@ -126,7 +126,7 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
 | 1 | 接続の確立 | `GET /json/version/`、`Browser.getVersion` | `server.rs` の `router`（ルート明示登録）、`discovery.rs` の `version_body`（版表記の整合）、`protocol.rs` の `builtin_handlers`（ハンドラ登録） | 実測（#1・#2） |
 | 2 | ターゲットと順序制御 | `Target.setAutoAttach`・`Target.getTargetInfo`・`Browser.setDownloadBehavior`・`Target.createBrowserContext`・`Target.createTarget`、イベント `Target.attachedToTarget`（`browserContextId` を含める） | `target.rs`（`TargetInfo` へ `browserContextId` 追加、`TargetRegistry::create_target`・`attach`）、`protocol.rs` の `DispatchOutcome`（イベントを応答より先に送る順序制御。現状は応答→イベント列で固定） | 予測（#3〜#8） |
 | 3 | ページ初期化系 | `Page.enable`・`Page.getFrameTree`・`Log.enable`・`Page.setLifecycleEventsEnabled`・`Runtime.enable`（`Runtime.executionContextCreated`）・`Page.addScriptToEvaluateOnNewDocument`・`Network.enable`・`Runtime.runIfWaitingForDebugger` ほか（握りつぶされないものから） | `protocol.rs` の `builtin_handlers`、`page.rs`（フレームツリー・実行コンテキストのモデル。`MAIN_FRAME_ID`） | 予測（#9・#10） |
-| 4 | 初期 `about:blank` | `Page.frameNavigated`（`about:blank`）の送出 | `page.rs` の `navigation_events`（`Page.navigate` 専用のため新規ページ作成時の送出経路を追加）、`navigation.rs` | 予測（#11） |
+| 4 | 初期 `about:blank` | `Page.frameNavigated`（`about:blank`）の送出 | `page.rs` の `navigation_events`（`Page.navigate` 専用のため新規ページ作成時の送出経路を追加）、`navigation.rs` | 予測（#11。要否は段階 3 の実測で再判断。訂正は「段階 2a の実施結果」末尾） |
 
 段階 2 の `Target.*` は、実測前の予測として Playwright 1.63.0 の初期化を満たす最小集合を挙げたもの。
 どのメソッドを「実装」し、どのメソッドを「明示エラー」のままにするかは、段階 2・3 の実測後に決める（未決定）。
@@ -143,6 +143,27 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
   これは段階 2 の予測（#3・#4）と一致した
 - 次の停止箇所は段階 2 の `Target.setAutoAttach` 以降。`Target.getTargetInfo` は上記失敗により未送信で、
   段階 2 の実測で確認する
+
+### 段階 2a の実施結果（TASK-43.3b・#862）
+
+- 実装したのは `Target.getTargetInfo` のみ（`playwright_compat.rs`。`sessionId` 付きは `-32602`）。
+  引数なしは `type:"browser"`・`attached:true` の実値（`CdpState` のブラウザ ID）。`targetId` 指定は
+  `TargetRegistry` の実値（`attached` は実セッションの有無）で、未知・不正は `-32602`
+- `Target.setAutoAttach` と `Browser.setDownloadBehavior` は**登録を取り下げた**（`-32601` のまま）。
+  設定を保存して `{}` を返すだけでは、実セッションの attach・`Target.attachedToTarget` の送出や
+  ダウンロード処理（`downloadPath` の保存・イベント通知）に接続されておらず、クライアントに有効化済みと
+  誤認させる（`CDP-6`・`REPAIR-3`）。実体と接続できる段階（段階 2b・2c 以降）で改めて実装する
+- このため `connectOverCDP` の到達点は TASK-43.3a 後と同じ（`Target.setAutoAttach` で停止。
+  `Target.getTargetInfo` は送られない）。トレース（`newpage-trace.jsonl`）も TASK-43.3a 後の内容に戻した
+
+#### 予測 #11（`Page.frameNavigated`）の訂正（種別 B・未実測）
+
+playwright-core 1.63.0 のソース読解では、`FrameSession._initialize` の `isInitialEmptyPage` は
+`Page.getFrameTree` で得たメインフレーム URL が `":"` または空文字のときだけ真になる。
+`about:blank` を返せば偽となり、同関数内で `_firstNonInitialNavigationCommittedFulfill()` が即座に呼ばれ、
+`Page.frameNavigated` の非初回イベントを待たない。したがって元の予測（初期 `about:blank` の
+`Page.frameNavigated` が無いと `newPage()` がタイムアウトし得る）は当たらない見込み。
+段階 4 の要否は段階 3 の実測で再判断する（過去の記録は残し、本訂正で上書きしない）。
 
 ### 原則
 

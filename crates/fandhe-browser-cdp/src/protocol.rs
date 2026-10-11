@@ -8,7 +8,7 @@
 //!
 //! 公開入口は無く crate 内部専用。後続タスクは [`builtin_handlers`] へメソッドを
 //! 追加するだけでよい（`Page.navigate` は 42.2 で登録済み、イベント送出は 42.3 で実装済み、
-//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a で登録済み）。
+//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b で登録済み。`Target.setAutoAttach`・`Browser.setDownloadBehavior` は実体未接続のため未登録）。
 //!
 //! # 入力の扱い
 //!
@@ -22,7 +22,7 @@
 //!
 //! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 //! `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・
-//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）のみ登録済みで、
+//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）のみ登録済みで、
 //! それ以外のメソッドは JSON-RPC の「method not implemented」（`-32601`）エラーを返す。
 //! 汎用の空 success フォールバック（PoC-5 の暫定挙動）は採らない。理由は次のとおり。
 //!
@@ -366,7 +366,8 @@ impl std::error::Error for DispatcherError {}
 type HandlerTable = Vec<(&'static str, Box<dyn CommandHandler>)>;
 
 /// 組込みハンドラ表。`Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
-/// `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）を登録済み（`CDP-1`）。
+/// `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・`Browser.getVersion`（TASK-43.3a）・
+/// `Target.getTargetInfo`（TASK-43.3b）を登録済み（`Target.setAutoAttach`・`Browser.setDownloadBehavior` は実体未接続のため未登録）（`CDP-1`・`CDP-2`）。
 ///
 /// `Page.navigate` は既定の `FetchOptions`（内部アドレス拒否）で `Fetcher` を構築する。
 pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
@@ -377,6 +378,10 @@ pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
         (
             "Browser.getVersion",
             Box::new(crate::playwright_compat::BrowserGetVersion),
+        ),
+        (
+            "Target.getTargetInfo",
+            Box::new(crate::playwright_compat::TargetGetTargetInfo),
         ),
         ("DOM.getDocument", Box::new(crate::dom::DomGetDocument)),
         ("DOM.querySelector", Box::new(crate::dom::DomQuerySelector)),
@@ -805,6 +810,46 @@ mod tests {
             );
         }
 
+        async fn one(st: &Arc<CdpState>, conn: Option<ConnId>, text: &str) -> Value {
+            let b = Dispatcher::builtin().unwrap();
+            frames(b.dispatch_on(st, conn, text).await).remove(0)
+        }
+
+        #[tokio::test]
+        async fn cdp2_builtin_get_target_info() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let v = one(&st, None, r#"{"id":1,"method":"Target.getTargetInfo"}"#).await;
+            assert_eq!(
+                v,
+                json!({"id": 1, "result": {"targetInfo": {"targetId": st.browser_id().as_str(), "type": "browser", "title": "", "url": "", "attached": true, "canAccessOpener": false}}})
+            );
+            for bad in [r#""ABC""#, r#""bad id!""#, "1"] {
+                let t = format!(
+                    r#"{{"id":2,"method":"Target.getTargetInfo","params":{{"targetId":{bad}}}}}"#
+                );
+                let v = one(&st, None, &t).await;
+                assert_eq!(v["error"]["code"], -32602, "{bad}");
+            }
+            let id = st
+                .registry()
+                .create_target(crate::target::TargetKind::Page, "about:blank")
+                .unwrap();
+            let t = format!(
+                r#"{{"id":3,"method":"Target.getTargetInfo","params":{{"targetId":"{}"}}}}"#,
+                id.as_str()
+            );
+            let v = one(&st, None, &t).await;
+            let ti = &v["result"]["targetInfo"];
+            assert_eq!(
+                (ti["type"].as_str(), ti["attached"].as_bool()),
+                (Some("page"), Some(false))
+            );
+            st.registry().attach(&id).unwrap();
+            let v = one(&st, None, &t).await;
+            assert_eq!(v["result"]["targetInfo"]["attached"], true);
+        }
+
         #[tokio::test]
         async fn cdp6_builtin_other_methods_remain_unimplemented() {
             let dir = TempDir::new();
@@ -812,9 +857,13 @@ mod tests {
             let b = Dispatcher::builtin().unwrap();
             for (i, m) in [
                 "Target.setAutoAttach",
-                "Target.getTargetInfo",
                 "Browser.setDownloadBehavior",
+                "Target.createBrowserContext",
+                "Target.createTarget",
+                "Target.attachToTarget",
                 "Emulation.setUserAgentOverride",
+                "Network.setUserAgentOverride",
+                "Page.addScriptToEvaluateOnNewDocument",
             ]
             .iter()
             .enumerate()

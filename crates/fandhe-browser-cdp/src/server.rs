@@ -9,8 +9,8 @@
 //!
 //! `/json/*` ルータ（[`router`]。TASK-41.3）と `/devtools/browser/{id}` の WS 受け口設定
 //! （[`browser_websocket_config`]。TASK-41.4。公開入口は [`endpoints`]）は実装済み。WS のメッセージハンドラは
-//! [`crate::protocol`] のディスパッチャへ委譲する（TASK-42.1）。組込みメソッドは `Page.navigate`（TASK-42.2）のみで、残りの個別メソッドは
-//! TASK-42.2 以降（REPAIR-3）。
+//! [`crate::protocol`] のディスパッチャへ委譲する（TASK-42.1）。組込みメソッドは `protocol::builtin_handlers` の登録表を参照（`Page.*`・`DOM.*`・
+//! Playwright 互換の `Browser.*`・`Target.*` の一部。残りは未実装で `-32601`。REPAIR-3）。
 //! 初期ターゲット（`about:blank`）の自動作成は行わず、後続タスクの判断に委ねる。
 
 use std::fmt;
@@ -31,7 +31,7 @@ use crate::discovery::{self, Authority, BROWSER_WS_PATH_PATTERN, HostError};
 use crate::dom::IssuedDocuments;
 use crate::method_log::{ReceivedMethodLog, ReceivedMethodsSnapshot};
 use crate::navigation::TargetNavigations;
-use crate::protocol::Dispatcher;
+use crate::protocol::{ConnId, Dispatcher};
 use crate::target::{BrowserId, TargetRegistry};
 use crate::ws;
 
@@ -71,6 +71,17 @@ impl CdpState {
             dom_issued: IssuedDocuments::new(),
             method_log: ReceivedMethodLog::new(),
         }
+    }
+
+    /// 接続を生存中として登録する（`crate::ws` が接続の初回要求時に呼ぶ）。接続別状態を
+    /// ここへ集約し、解放漏れを防ぐ。
+    pub(crate) fn open_connection(&self, conn: ConnId) {
+        self.dom_issued.open_connection(conn);
+    }
+
+    /// 接続の終了で接続別状態をすべて解放する（`crate::ws` の `on_close` から呼ぶ）。
+    pub(crate) fn release_connection(&self, conn: ConnId) {
+        self.dom_issued.release_connection(conn);
     }
 
     /// 受信メソッド集計（`Dispatcher::dispatch_on` が記録する）。

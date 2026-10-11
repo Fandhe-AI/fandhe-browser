@@ -67,3 +67,4 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
 - `connectOverCDP(http://…)`・`connectOverCDP(ws://…)` はともに、次に送る `Target.setAutoAttach` と
   `Browser.setDownloadBehavior` が `-32601`（未実装。`CDP-6`）となり失敗する。
   `newContext()`・`newPage()` には到達しない
+  （`Target.getTargetInfo` は実装済みだが、上記の失敗により Playwright は送らない）

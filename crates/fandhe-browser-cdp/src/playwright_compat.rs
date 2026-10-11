@@ -1,15 +1,20 @@
-//! Playwright `connectOverCDP` 互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a）。
+//! Playwright `connectOverCDP` 互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b）。
 //!
-//! `protocol::builtin_handlers` から登録される。Playwright が接続直後に送る
-//! `Browser.getVersion` だけを実装する。値は fandhe-browser 自身の実値に限り、
-//! Chrome / Chromium を装わない（`SEC-2`）。段階 2 以降の `Target.*` などは `-32601` のまま
-//! 残し、実測で必要なものだけを個別に追加する（`CDP-6`・`REPAIR-3`。
-//! 方針は `docs/design/playwright-compat.md`）。
+//! `protocol::builtin_handlers` から登録される。`Browser.getVersion`（43.3a）と
+//! `Target.getTargetInfo`（43.3b）を実装する。値は fandhe-browser 自身の実値に限り、
+//! Chrome / Chromium を装わない（`SEC-2`）。
+//!
+//! `Target.setAutoAttach`・`Browser.setDownloadBehavior` は、実セッションの attach と
+//! `Target.attachedToTarget` の送出、ダウンロード処理への接続が未実装のため登録しない
+//! （`-32601` のまま。設定を保存するだけの成功応答は実装済みを装うため。`CDP-6`・`REPAIR-3`）。
+//! 登録するのは実体と接続できた段階（TASK-43.3b の後続）に限る。方針は
+//! `docs/design/playwright-compat.md`。
 
 use serde_json::{Value, json};
 
 use crate::discovery::{PRODUCT, PROTOCOL_VERSION};
 use crate::protocol::{BoxFuture, CdpError, CommandContext, CommandHandler, HandlerOutput};
+use crate::target::TargetId;
 
 /// `Browser.getVersion`（`CDP-2`・TASK-43.3a）。
 ///
@@ -27,6 +32,60 @@ impl CommandHandler for BrowserGetVersion {
     ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
         Box::pin(async move { Ok(HandlerOutput::result(version_result())) })
     }
+}
+
+/// `Target.getTargetInfo`（`CDP-2`・TASK-43.3b）。
+///
+/// `targetId` 省略はブラウザ自身（`type:"browser"`・`attached:true`）。指定時は
+/// [`crate::target::TargetRegistry`] の実値から組み立てる。`browserContextId`・`openerId` は
+/// 実体がないため出さない（2b）。未知・不正な `targetId` は `-32602`。
+pub(crate) struct TargetGetTargetInfo;
+
+impl CommandHandler for TargetGetTargetInfo {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            if ctx.session_id.is_some() {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let info = match params.get("targetId") {
+                None => browser_target_info(ctx.state.browser_id().as_str()),
+                Some(v) => {
+                    let s = v.as_str().ok_or(CdpError::INVALID_PARAMS)?;
+                    let id = TargetId::parse(s).map_err(|_| CdpError::INVALID_PARAMS)?;
+                    let (t, attached) = ctx
+                        .state
+                        .registry()
+                        .target_with_attached(&id)
+                        .ok_or(CdpError::INVALID_PARAMS)?;
+                    json!({
+                        "targetId": t.target_id().as_str(),
+                        "type": t.kind().as_str(),
+                        "title": t.url(),
+                        "url": t.url(),
+                        "attached": attached,
+                        "canAccessOpener": false,
+                    })
+                }
+            };
+            Ok(HandlerOutput::result(json!({ "targetInfo": info })))
+        })
+    }
+}
+
+/// ブラウザ自身の `targetInfo`。
+fn browser_target_info(browser_id: &str) -> Value {
+    json!({
+        "targetId": browser_id,
+        "type": "browser",
+        "title": "",
+        "url": "",
+        "attached": true,
+        "canAccessOpener": false,
+    })
 }
 
 /// `Browser.getVersion` の結果本体。定数のみから組み立てる。
@@ -74,5 +133,18 @@ mod tests {
         assert_eq!(v["product"], j["Browser"]);
         assert_eq!(v["userAgent"], j["User-Agent"]);
         assert_eq!(v["protocolVersion"], j["Protocol-Version"]);
+    }
+
+    #[test]
+    fn cdp2_browser_target_info_has_real_values_only() {
+        let v = json!({"targetInfo": browser_target_info("fixed-1")});
+        assert_eq!(
+            v,
+            json!({"targetInfo": {"targetId": "fixed-1", "type": "browser", "title": "", "url": "", "attached": true, "canAccessOpener": false}})
+        );
+        let s = v.to_string();
+        for bad in ["Chrome", "Chromium", "HeadlessChrome"] {
+            assert!(!s.contains(bad), "{bad} in {s}");
+        }
     }
 }
