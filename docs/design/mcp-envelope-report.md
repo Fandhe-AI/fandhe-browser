@@ -4,8 +4,8 @@
 - **対応タスク**: TASK-97（97.2）
 - **マイルストーン**: MS-9
 - **参考**: 方式 B（`AISNAP-1`・`GET /ai/snapshot`）・PoC-15・[PLUG-4 レポート](./mcp-token-reduction-report.md)
-- **基準コミット**: `5142a53`（本測定時点の `origin/main` HEAD）
-- **関連 Issue**: #385（ハーネス）・#386（本 Issue・実測とレポート化）・#387（目標妥当性の判断）
+- **基準コミット**: `5383534`（TASK-23.8 の再測定時点の `origin/main` HEAD。当初の測定は `5142a53`）
+- **関連 Issue**: #385（ハーネス）・#386（実測とレポート化）・#830（TASK-23.8 の再測定）・#387（目標妥当性の判断）
 
 本レポートは測定結果の記録であり、`PLUG-5` に数値目標はないため判定は含まない。目標としての妥当性の判断は #387 が行う。
 
@@ -58,32 +58,44 @@
 
 | fixture | path | p50Ms | p95Ms | meanMs |
 | ------- | ---- | ----- | ----- | ------ |
-| example-minimal | direct | 0.089 | 0.117 | 0.086 |
-| example-minimal | mcp | 0.203 | 0.266 | 0.205 |
-| example-minimal | increment | 0.115 | 0.191 | 0.119 |
-| wikipedia-article | direct | 11.100 | 11.567 | 11.190 |
-| wikipedia-article | mcp | 13.705 | 14.833 | 13.808 |
-| wikipedia-article | increment | 2.580 | 3.737 | 2.617 |
-| hn-list | direct | 3.525 | 4.106 | 3.612 |
-| hn-list | mcp | 4.736 | 5.176 | 4.762 |
-| hn-list | increment | 1.105 | 1.617 | 1.150 |
-| login-form | direct | 0.128 | 0.196 | 0.143 |
-| login-form | mcp | 0.261 | 0.318 | 0.254 |
-| login-form | increment | 0.104 | 0.182 | 0.111 |
-| mdn-docs | direct | 4.723 | 5.633 | 4.860 |
-| mdn-docs | mcp | 6.571 | 7.538 | 6.762 |
-| mdn-docs | increment | 1.806 | 2.682 | 1.903 |
-| ALL | direct | 3.525 | 11.164 | 3.978 |
-| ALL | mcp | 4.736 | 13.890 | 5.158 |
-| ALL | increment | 1.068 | 2.826 | 1.180 |
+| example-minimal | direct | 0.060 | 0.075 | 0.064 |
+| example-minimal | mcp | 0.161 | 0.186 | 0.160 |
+| example-minimal | increment | 0.097 | 0.126 | 0.097 |
+| wikipedia-article | direct | 11.325 | 11.790 | 11.475 |
+| wikipedia-article | mcp | 13.645 | 14.275 | 13.721 |
+| wikipedia-article | increment | 2.307 | 2.868 | 2.247 |
+| hn-list | direct | 3.598 | 3.666 | 3.613 |
+| hn-list | mcp | 4.567 | 5.045 | 4.650 |
+| hn-list | increment | 0.957 | 1.451 | 1.036 |
+| login-form | direct | 0.117 | 0.163 | 0.128 |
+| login-form | mcp | 0.207 | 0.240 | 0.211 |
+| login-form | increment | 0.085 | 0.110 | 0.083 |
+| mdn-docs | direct | 4.784 | 5.025 | 4.854 |
+| mdn-docs | mcp | 6.470 | 7.393 | 6.612 |
+| mdn-docs | increment | 1.665 | 2.594 | 1.758 |
+| ALL | direct | 3.598 | 11.410 | 4.027 |
+| ALL | mcp | 4.567 | 13.829 | 5.071 |
+| ALL | increment | 0.940 | 2.571 | 1.044 |
 
 ## 所見
 
-- 方式 B 本体の対生 HTML 削減率は 5 サイト中 3 サイトで正（example-minimal 34.0%・wikipedia-article 43.0%・login-form 41.9%）、hn-list（-5.7%）・mdn-docs（-30.2%）は負（平均 16.6%、範囲 -30.2% から 43.0%）。名前のない generic の折り畳みと空ノードの剪定（TASK-23.3）、ref の付与を操作・参照の対象ノードに限る変更（TASK-23.4）、ref の表示長を 16 桁から 8 桁へ短縮する変更（TASK-23.5・#836）で改善したが、現行の snapshot が JSON ツリー形式のため一部ページでは生 HTML より大きい（`AISNAP-6`・TASK-19 の論点）。MCP 応答行全体では平均 -5.2%
+- 方式 B 本体の対生 HTML 削減率は 5 サイト中 3 サイトで正（example-minimal 34.0%・wikipedia-article 43.0%・login-form 41.9%）、hn-list（-5.7%）・mdn-docs（-30.2%）は負（平均 16.6%、範囲 -30.2% から 43.0%）。MCP 応答行全体では平均 -5.2%。snapshot が JSON ツリー形式のため一部ページで生 HTML より大きい（`AISNAP-6`・TASK-19 の論点）
 - エンベロープ（JSON-RPC フレーム等）のトークン増分は 41 から 5925 トークン（平均 2266.2）、方式 B 本体に対して 12.3% から 60.3%（平均 29.5%）。小さいページほど比率が大きい
-- レイテンシ増分（MCP - 直接）は全体で p50 1.068 ms、p95 2.826 ms、平均 1.180 ms。小ページ（example-minimal・login-form）は約 0.1 ms、wikipedia-article は p50 2.580 ms
+- レイテンシ増分（MCP - 直接）は全体で p50 0.940 ms、p95 2.571 ms、平均 1.044 ms。小ページ（example-minimal・login-form）は約 0.1 ms、wikipedia-article は p50 2.307 ms
 - PLUG-4 レポートは MCP の text コンテンツのみを数えるが、本レポートの mcpLine は JSON-RPC 応答行全体を数える。両レポートの数値は定義が異なる
 - 入力は合成 fixture であり、実ページの値ではない。レイテンシは測定環境に依存する
+
+### TASK-23 改善前後（#830）
+
+| 指標 | 改善前（`82ab0dd` のレポート値） | 改善後（`5383534`） |
+| ---- | -------------------------------- | ------------------- |
+| DirectReductionPct の平均 | -73.2% | 16.6% |
+| McpReductionPct の平均 | -107.8% | -5.2% |
+| EnvelopeTokens の平均 | 3486.2 | 2266.2 |
+| EnvelopePct の平均（最小〜最大） | 19.5%（12.0〜32.1） | 29.5%（12.3〜60.3） |
+| レイテンシ増分 全体 p50 / p95 | 1.330 / 3.867 ms | 0.940 / 2.571 ms |
+
+改善前のレイテンシは別コミット・別の実行での計測のため、参考比較にとどまる。達成可否の判断はしない（#387）。全体の対照表は [TASK-23 再測定レポート](./token-reduction-remeasurement-report.md) を参照。
 
 ## 引き継ぎ・スコープ外
 
