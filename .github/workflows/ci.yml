@@ -40,6 +40,12 @@ name: CI
 #   lockfile はルートのみ（`**/Cargo.lock` は .agents 配下のサンプルまで拾い、依存不変でも
 #   全 cache が作り直されるため使わない）。rustc を含めるのは stable 更新後に古い target を
 #   exact hit で復元し続けないため。restore-keys は同じ rustc の範囲に限る
+# - `-vN` は cache 内容（path・ビルド条件・prune・profile）を変えたら上げる（既存 key に exact hit
+#   すると保存がスキップされ、新しい内容が保存されないため。restore-keys に旧版を残さない）。
+#   test v6・features v3・harness v3 は Cargo.toml へ `[profile.dev.package."*"]` を追加した
+#   ことによる bump（依存のビルドスクリプト・proc-macro が debuginfo なし → 行番号付きに変わり、
+#   それらに依存する crate の `-C metadata` も連鎖して変わるため、旧版の blob では依存を毎回
+#   再ビルドする）。registry のみの cross は target を含まないため上げない
 
 on:
   workflow_dispatch:
@@ -264,8 +270,10 @@ jobs:
       contents: read
     env:
       CARGO_INCREMENTAL: "0"
-      # cache サイズ削減: 依存 crate の debuginfo を行番号のみにする（CI 限定。backtrace の
-      # ファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      # cache サイズ削減: workspace メンバーを含む全体の debuginfo を行番号のみにする（CI 限定。
+      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）。
+      # 依存 crate は Cargo.toml の `[profile.dev.package."*"]` でも同じ値に固定済みで衝突
+      # しない（package 指定が優先されるが値が同じ）。メンバーまで行番号のみにするのは本 env だけ
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
@@ -288,8 +296,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-${{ runner.os }}-test-v5-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: rust-${{ runner.os }}-test-v5-${{ steps.toolchain.outputs.cachekey }}-
+          key: rust-${{ runner.os }}-test-v6-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-test-v6-${{ steps.toolchain.outputs.cachekey }}-
       - name: "cargo clippy（workspace・--all-features・-D warnings）"
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: "cargo test（workspace・--all-features）"
@@ -317,8 +325,10 @@ jobs:
       contents: read
     env:
       CARGO_INCREMENTAL: "0"
-      # cache サイズ削減: 依存 crate の debuginfo を行番号のみにする（CI 限定。backtrace の
-      # ファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      # cache サイズ削減: workspace メンバーを含む全体の debuginfo を行番号のみにする（CI 限定。
+      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）。
+      # 依存 crate は Cargo.toml の `[profile.dev.package."*"]` でも同じ値に固定済みで衝突
+      # しない（package 指定が優先されるが値が同じ）。メンバーまで行番号のみにするのは本 env だけ
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
@@ -341,8 +351,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-${{ runner.os }}-test-v5-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: rust-${{ runner.os }}-test-v5-${{ steps.toolchain.outputs.cachekey }}-
+          key: rust-${{ runner.os }}-test-v6-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-test-v6-${{ steps.toolchain.outputs.cachekey }}-
       - name: "cargo clippy（workspace・--all-features・-D warnings）"
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: "cargo test（workspace・--all-features）"
@@ -407,8 +417,10 @@ jobs:
       contents: read
     env:
       CARGO_INCREMENTAL: "0"
-      # cache サイズ削減: 依存 crate の debuginfo を行番号のみにする（CI 限定。backtrace の
-      # ファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      # cache サイズ削減: workspace メンバーを含む全体の debuginfo を行番号のみにする（CI 限定。
+      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）。
+      # 依存 crate は Cargo.toml の `[profile.dev.package."*"]` でも同じ値に固定済みで衝突
+      # しない（package 指定が優先されるが値が同じ）。メンバーまで行番号のみにするのは本 env だけ
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
@@ -431,8 +443,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-${{ runner.os }}-features-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: rust-${{ runner.os }}-features-v2-${{ steps.toolchain.outputs.cachekey }}-
+          key: rust-${{ runner.os }}-features-v3-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-features-v3-${{ steps.toolchain.outputs.cachekey }}-
       - name: "[default] cargo clippy（既定 feature）"
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: "[default] cargo test（既定 feature）"
@@ -499,8 +511,10 @@ jobs:
       contents: read
     env:
       CARGO_INCREMENTAL: "0"
-      # cache サイズ削減: 依存 crate の debuginfo を行番号のみにする（CI 限定。backtrace の
-      # ファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      # cache サイズ削減: workspace メンバーを含む全体の debuginfo を行番号のみにする（CI 限定。
+      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）。
+      # 依存 crate は Cargo.toml の `[profile.dev.package."*"]` でも同じ値に固定済みで衝突
+      # しない（package 指定が優先されるが値が同じ）。メンバーまで行番号のみにするのは本 env だけ
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
@@ -523,8 +537,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-${{ runner.os }}-features-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: rust-${{ runner.os }}-features-v2-${{ steps.toolchain.outputs.cachekey }}-
+          key: rust-${{ runner.os }}-features-v3-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-features-v3-${{ steps.toolchain.outputs.cachekey }}-
       - name: "[default] cargo clippy（既定 feature）"
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: "[default] cargo test（既定 feature）"
@@ -676,8 +690,10 @@ jobs:
       contents: read
     env:
       CARGO_INCREMENTAL: "0"
-      # cache サイズ削減: 依存 crate の debuginfo を行番号のみにする（CI 限定。backtrace の
-      # ファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      # cache サイズ削減: workspace メンバーを含む全体の debuginfo を行番号のみにする（CI 限定。
+      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）。
+      # 依存 crate は Cargo.toml の `[profile.dev.package."*"]` でも同じ値に固定済みで衝突
+      # しない（package 指定が優先されるが値が同じ）。メンバーまで行番号のみにするのは本 env だけ
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
@@ -699,8 +715,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-${{ runner.os }}-harness-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: rust-${{ runner.os }}-harness-v2-${{ steps.toolchain.outputs.cachekey }}-
+          key: rust-${{ runner.os }}-harness-v3-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-harness-v3-${{ steps.toolchain.outputs.cachekey }}-
       - name: "前提ツール（jq・node 22 以降）の確認"
         run: |
           if ! command -v jq >/dev/null 2>&1; then
@@ -831,8 +847,10 @@ jobs:
       contents: read
     env:
       CARGO_INCREMENTAL: "0"
-      # cache サイズ削減: 依存 crate の debuginfo を行番号のみにする（CI 限定。backtrace の
-      # ファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      # cache サイズ削減: workspace メンバーを含む全体の debuginfo を行番号のみにする（CI 限定。
+      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）。
+      # 依存 crate は Cargo.toml の `[profile.dev.package."*"]` でも同じ値に固定済みで衝突
+      # しない（package 指定が優先されるが値が同じ）。メンバーまで行番号のみにするのは本 env だけ
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
@@ -854,8 +872,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-${{ runner.os }}-harness-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: rust-${{ runner.os }}-harness-v2-${{ steps.toolchain.outputs.cachekey }}-
+          key: rust-${{ runner.os }}-harness-v3-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-harness-v3-${{ steps.toolchain.outputs.cachekey }}-
       - name: "前提ツール（jq・node 22 以降）の確認"
         run: |
           if ! command -v jq >/dev/null 2>&1; then

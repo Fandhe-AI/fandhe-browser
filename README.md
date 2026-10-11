@@ -97,6 +97,8 @@ make ci
 
 `docs/spec`（`fandhe-browser-spec`）は private リポジトリのため、アクセス権のない環境では submodule 取得が失敗しますが、実装コードのビルド・テストは `docs/spec` 抜きでも成立するよう維持します。
 
+ビルド成果物（`target/`）は数十 GB に膨らみやすいため、ルート `Cargo.toml` の `[profile.dev.package."*"]` で依存クレート（workspace 外）のデバッグ情報を行番号のみにしています（`dev`・`test` に効き、本リポのクレートは full debuginfo のままです。panic 位置・バックトレースの行番号は残り、デバッガで依存の変数・型を見られなくなるだけです）。溜まった古い成果物は `cargo install cargo-sweep` のうえ `cargo sweep --time 14`（14 日以上使われていない成果物を削除）や `cargo sweep --installed`（rustup に現存しないツールチェーンでビルドした成果物を削除）で消せます。
+
 ## ライセンス
 
 MIT OR Apache-2.0 のデュアルライセンスです（[LICENSE-MIT](./LICENSE-MIT) / [LICENSE-APACHE](./LICENSE-APACHE)）。レンダリング層で組み込む `Servo` は MPL-2.0 です。
