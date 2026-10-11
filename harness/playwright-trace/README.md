@@ -62,8 +62,9 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
 
 ## 現時点の到達点（事実のみ。原因分析は #247・`docs/design/playwright-compat.md`）
 
-- TASK-43.3a（#804）後の実測。`GET /json/version` と `GET /json/version/` はともに 200 で、
+- TASK-43.3b（#862・段階 2a）後の実測。`GET /json/version` と `GET /json/version/` はともに 200 で、
   `Browser.getVersion` は実値（`fandhe-browser/<版>`）で成功する
-- `connectOverCDP(http://…)`・`connectOverCDP(ws://…)` はともに、次に送る `Target.setAutoAttach` と
-  `Browser.setDownloadBehavior` が `-32601`（未実装。`CDP-6`）となり失敗する。
-  `newContext()`・`newPage()` には到達しない
+- `Target.setAutoAttach`・`Browser.setDownloadBehavior`・`Target.getTargetInfo` が成功し、
+  `connectOverCDP(http://…)` は成功する（`connectOverCDP(ws://…)` 段階は実行されない）
+- `newContext()` が送る `Target.createBrowserContext` が `-32601`（未実装。`CDP-6`）となり失敗する。
+  `newPage()` には到達しない
