@@ -24,6 +24,11 @@ const MAX_DISCOVERY_BYTES = 64 * 1024;
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 const SAMPLE_MAX = 300;
 
+// 期限計算は単調時計を使う。壁時計（Date.now）は setTimeout と ms の丸め位相が異なり、
+// 時計補正も受けるため、タイマー発火直後の境界判定が 1ms 前後して不定期に分類が揺れた（Issue #844）
+const now = () => performance.now();
+const timeoutError = () => Object.assign(new Error("timeout"), { timeout: true });
+
 function emit(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
@@ -132,7 +137,7 @@ class Cdp {
     return new Promise((resolve, reject) => {
       const t = setTimeout(() => {
         this.pending.delete(id);
-        reject(Object.assign(new Error("timeout"), { timeout: true }));
+        reject(timeoutError());
       }, timeoutMs);
       this.pending.set(id, {
         resolve: (v) => (clearTimeout(t), resolve(v)),
@@ -143,18 +148,18 @@ class Cdp {
   }
   // 条件に合うイベントを待つ（先に届いて溜まっているものも対象。見つけたら取り除く）
   async waitEvent(pred, timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
+    const deadline = now() + timeoutMs;
     for (;;) {
       const i = this.events.findIndex(pred);
       if (i >= 0) return this.events.splice(i, 1)[0];
-      const left = deadline - Date.now();
-      if (left <= 0) throw Object.assign(new Error("timeout"), { timeout: true });
+      const left = deadline - now();
+      if (left <= 0) throw timeoutError();
       await new Promise((resolve, reject) => {
         const w = { resolve: () => (clearTimeout(t), resolve()), reject: (e) => (clearTimeout(t), reject(e)) };
         const t = setTimeout(() => {
           this.waiters = this.waiters.filter((x) => x !== w);
           resolve();
-        }, left);
+        }, Math.ceil(left));
         this.waiters.push(w);
       });
     }
@@ -205,16 +210,15 @@ async function runTask(cdp, t, budgetMs) {
   const fail = (reason, detail = null, extra = {}) => ({
     ...base, success: false, reason, detail, method: "first_match", match_count: null, output_sample: "", ...extra,
   });
-  // タスク期限は開始時に 1 回だけ確定する（--task-timeout と --total-timeout の残りの小さい方）。
-  // 各 CDP 操作へは「期限までの残り時間」を渡し、操作ごとに予算が再付与されないようにする
-  const startedAt = Date.now();
-  const totalDeadline = startedAt + budgetMs;
-  const taskDeadline = startedAt + Math.min(taskTimeoutMs, budgetMs);
+  // どちらの期限が効くかを開始時に確定する（--task-timeout と全体期限の残りの小さい方）。
+  // 期限到達時は時計を読み直さず、この区分で blocked / timeout を決める（同値は全体期限を優先。
+  // MEAS-4・TASK-71.2・Issue #844）。各 CDP 操作へは期限までの残り時間を渡し、予算は再付与しない
+  const boundByTotal = budgetMs <= taskTimeoutMs;
+  const deadline = now() + Math.min(taskTimeoutMs, budgetMs);
   const stepTimeout = () => {
-    const now = Date.now();
-    if (now >= totalDeadline) throw Object.assign(new Error("total time limit exceeded"), { totalExceeded: true });
-    if (now >= taskDeadline) throw Object.assign(new Error("timeout"), { timeout: true });
-    return taskDeadline - now;
+    const left = deadline - now();
+    if (left <= 0) throw timeoutError();
+    return Math.ceil(left);
   };
   try {
     const nav = await cdp.send("Page.navigate", { url: t.url }, stepTimeout());
@@ -241,7 +245,9 @@ async function runTask(cdp, t, budgetMs) {
     return { ...base, success: true, reason: null, detail: null, method: "first_match", match_count: null, output_sample: sanitizeSample(text) };
   } catch (e) {
     if (cdp.closed) return fail("cdp_error", "connection closed", { closed: true });
-    if (e?.totalExceeded || Date.now() >= totalDeadline) return fail("blocked", "total time limit exceeded");
+    if (e?.timeout) {
+      return boundByTotal ? fail("blocked", "total time limit exceeded", { totalExceeded: true }) : fail("timeout");
+    }
     return fail(classifyError(e));
   }
 }
@@ -263,7 +269,7 @@ async function main() {
   const ws = new WebSocket(disc.ws);
   // 接続待ちにも期限を適用する（/json/version は応答するが handshake が完了しないサーバー対策）。
   // 期限は --total-timeout と --task-timeout の小さい方で、接続に使った時間は総予算から差し引く
-  const start = Date.now();
+  const start = now();
   const connectMs = Math.min(taskTimeoutMs, totalTimeoutMs);
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("websocket connect timeout")), connectMs);
@@ -279,18 +285,24 @@ async function main() {
   });
   emit({ type: "browser", cdp_browser: disc.browser });
   const cdp = new Cdp(ws);
+  const totalDeadline = start + totalTimeoutMs;
+  // 一度全体期限で打ち切ったら時計を読み直さず、以降のタスクをすべて blocked にする
+  let totalExceeded = false;
   for (const t of tasks) {
-    const left = totalTimeoutMs - (Date.now() - start);
+    const left = totalDeadline - now();
     let r;
-    if (left <= 0) {
+    if (totalExceeded || left <= 0) {
+      totalExceeded = true;
       r = { type: "result", id: t.id, cat: t.cat, url: t.url, kind: t.kind, selector: t.selector, success: false, reason: "blocked", detail: "total time limit exceeded", method: "first_match", match_count: null, output_sample: "" };
     } else if (cdp.closed) {
       r = { type: "result", id: t.id, cat: t.cat, url: t.url, kind: t.kind, selector: t.selector, success: false, reason: "cdp_error", detail: "connection closed", method: "first_match", match_count: null, output_sample: "" };
     } else {
-      const t0 = Date.now();
+      const t0 = now();
       r = await runTask(cdp, t, left);
-      r.elapsed_ms = Date.now() - t0;
+      r.elapsed_ms = Math.round(now() - t0);
+      if (r.totalExceeded) totalExceeded = true;
       delete r.closed;
+      delete r.totalExceeded;
     }
     if (r.elapsed_ms === undefined) r.elapsed_ms = 0;
     emit(r);
