@@ -136,3 +136,8 @@ fi
 
 echo "prune done: removed ${removed} entries"
 echo "packages: ${pkgs[*]}"
+
+# cache 対象の展開後サイズ（圧縮前）。PR は save しないため、サイズの推移はこの出力で計測する
+# （.claude/rules/github-actions.md「キャッシュ方針」）。計測用のため失敗しても prune は成功扱い。
+echo "cache size (uncompressed):"
+du -sh "${target_dir}" "${HOME}/.cargo/registry/index" "${HOME}/.cargo/registry/cache" "${HOME}/.cargo/git/db" 2>/dev/null || true
