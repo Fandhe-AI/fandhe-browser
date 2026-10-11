@@ -4,7 +4,7 @@ fandhe-browser 同梱ネイティブ部品のライセンス全文
 本ファイルは、Cargo 外で配布物へ同梱されるネイティブ部品のライセンス全文を、
 上流の一次ソースから取得した本文のまま (改変・要約なし) 収録する。
 節 1〜4 は TASK-76、節 5〜13 は v8 prebuilt の実測による追加 (TASK-78.3・OSS-4。
-docs/design/v8-prebuilt-components.md)、節 14 は既定コンテナ同梱の CA バンドル (TASK-64.1)。
+docs/design/v8-prebuilt-components.md)、節 14 は既定・軽量コンテナ同梱の CA バンドル (TASK-64.1)。
 部品の一覧・版・SPDX・同梱条件は NOTICE を参照する。
 
 各節の見出し直下に取得元 URL とリビジョンを記録する。
@@ -1308,7 +1308,7 @@ SOFTWARE.
 5. musl libc (Linux musl 静的ビルド時のみ)
 SPDX: MIT
 取得元: https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.6
-リビジョン: タグ v1.2.6 (既定コンテナの builder に固定したベースイメージ rust:1-alpine の Alpine musl 1.2.6-r2 に対応。docker/Dockerfile.release の musl 版検査が不一致なら失敗させる)
+リビジョン: タグ v1.2.6 (既定・軽量コンテナの builder に固定したベースイメージ rust:1-alpine の Alpine musl 1.2.6-r2 に対応。docker/Dockerfile.release の musl 版検査が不一致なら失敗させる)
 
 ================================================================================
 
@@ -3129,7 +3129,7 @@ SPDX: BSD-2-Clause
 14. ルート CA 証明書バンドル (Alpine ca-certificates-bundle 20260909-r0)
 SPDX: MPL-2.0 AND MIT
 取得元: https://pkgs.alpinelinux.org/package/edge/main/x86_64/ca-certificates (aports の APKBUILD の license 欄が "MPL-2.0 AND MIT")
-同梱条件: 既定コンテナ (docker/Dockerfile.release、TASK-64・Issue #297) の /etc/ssl/certs/ca-certificates.crt に無改変で同梱する
+同梱条件: 既定・軽量コンテナ (docker/Dockerfile.release、TASK-64・Issue #297・#298) の /etc/ssl/certs/ca-certificates.crt に無改変で同梱する
 ================================================================================
 
 バンドルのデータ部分 (Mozilla の CA 証明書リスト) は MPL-2.0、パッケージ付属の

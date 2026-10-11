@@ -5,32 +5,57 @@
 # ソースが展開済みの状態）に呼ばれる。新規の Cargo 依存は追加せず、cargo metadata /
 # cargo tree / jq（ビルド専用ツール）だけで生成する。
 #
-# 使い方: scripts/gen-cargo-licenses.sh <出力ファイル> <ターゲット三つ組> [features]
-#   features が空なら既定 feature。ワークスペース内の crate（source なし）は本体の
+# 使い方: scripts/gen-cargo-licenses.sh <出力ファイル> <ターゲット三つ組> [cargo-feature-flags]
+#   cargo-feature-flags は cargo に渡す feature フラグ文字列で、空なら既定 feature。
+#   許可するのは `--no-default-features` と `--features <名前[,名前]>` だけ
+#   （例: "--no-default-features --features js-boa" は軽量コンテナ向け。それ以外は exit 2）。
+#   TASK-64.2 で docker/release-build.sh（build-default / build-lite 両ステージ）から呼ぶ形になった。
+#   ワークスペース内の crate（source なし）は本体の
 #   LICENSE-MIT / LICENSE-APACHE でカバーされるため対象外。
 # ライセンスファイルを持たない crate は docker/license-supplements/ に同梱した上流正本の
 # 文書（タグ付きリビジョンから取得したもの）で補う。補う文書も無い crate が 1 件でもあれば
 # 失敗にする（fail-closed。著作権表示・許諾文を欠いたイメージを生成しない）。
 set -euo pipefail
 
-out="${1:?usage: gen-cargo-licenses.sh <out> <target> [features]}"
+out="${1:?usage: gen-cargo-licenses.sh <out> <target> [cargo-feature-flags]}"
 target="${2:?target triple required}"
-features="${3:-}"
+flags="${3:-}"
 
-feat_args=""
-if [ -n "${features}" ]; then feat_args="--features ${features}"; fi
+# feature フラグ文字列を許可リストで検証して配列へ入れる（未クォート展開による引数注入を防ぐ）。
+feat_args=()
+read -r -a tokens <<<"${flags}"
+i=0
+while [ "${i}" -lt "${#tokens[@]}" ]; do
+  case "${tokens[$i]}" in
+    --no-default-features) feat_args+=(--no-default-features) ;;
+    --features)
+      i=$((i + 1))
+      val="${tokens[$i]:-}"
+      if ! [[ "${val}" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; then
+        echo "error: invalid feature list: '${val}'" >&2
+        exit 2
+      fi
+      feat_args+=(--features "${val}")
+      ;;
+    *)
+      echo "error: unsupported cargo flag: '${tokens[$i]}'" >&2
+      exit 2
+      ;;
+  esac
+  i=$((i + 1))
+done
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "${tmp}"' EXIT
 
 # 通常依存（build / dev を除く）の "name vX.Y.Z" 一覧。
-# shellcheck disable=SC2086
 cargo tree --locked -p fandhe-browser-cli --edges normal --target "${target}" \
-  ${feat_args} --prefix none --format '{p}' |
+  ${feat_args[@]+"${feat_args[@]}"} --prefix none --format '{p}' |
   awk 'NF >= 2 {print $1 " " $2}' | sort -u >"${tmp}/used.txt"
 
 # 外部 crate（source あり）の name / version / license / manifest_path。
-cargo metadata --format-version 1 --locked |
+# 軽量ビルドの boa 系は既定 feature の metadata に現れないため --all-features で全 crate を列挙し、used.txt で絞る。
+cargo metadata --format-version 1 --locked --all-features |
   jq -r '.packages[] | select(.source != null)
          | [.name, "v" + .version, (.license // "UNKNOWN"), .manifest_path] | @tsv' \
     >"${tmp}/meta.tsv"
@@ -45,6 +70,7 @@ nofile=0
 {
   echo "Cargo 依存の帰属表示 (fandhe-browser-cli のビルドに静的リンクされる通常依存・推移依存)"
   echo "ターゲット: ${target}"
+  echo "ビルド構成: ${flags:-default}"
   echo "生成元: scripts/gen-cargo-licenses.sh (cargo tree / cargo metadata)"
   echo
   while IFS="${tab}" read -r name ver lic manifest; do
