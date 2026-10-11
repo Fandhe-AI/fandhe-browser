@@ -134,7 +134,7 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
 ### 段階 1 の実施結果（TASK-43.3a・#804。実測 A）
 
 - `/json/version/` を `router` へ明示登録し、`Browser.getVersion` を `playwright_compat.rs` に追加した。
-  `product`・`userAgent` は `/json/version` と共通の定数（`discovery::PRODUCT`）で `fandhe-browser/<版>`、
+  `product`・`userAgent` は `/json/version` と共通の定数（`discovery::PRODUCT`。core の `USER_AGENT` の別名。#814）で `fandhe-browser/<版>`、
   `protocolVersion` は `1.3`。`revision`・`jsVersion` は実値を参照できないため**省いたが、
   Playwright 1.63.0 は通過した**（フォールバックの空文字は使っていない。`SEC-2`・`REPAIR-3`）
 - `make trace-playwright` の再取得結果: 両 `connectOverCDP` が `Browser.getVersion` を通過し、

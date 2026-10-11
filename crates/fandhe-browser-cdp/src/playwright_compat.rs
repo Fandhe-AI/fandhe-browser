@@ -104,6 +104,13 @@ mod tests {
     use crate::target::BrowserId;
 
     #[test]
+    fn sec2_browser_get_version_product_derives_from_core_user_agent() {
+        let v = version_result();
+        assert_eq!(v["product"], fandhe_browser_core::USER_AGENT);
+        assert_eq!(v["userAgent"], fandhe_browser_core::USER_AGENT);
+    }
+
+    #[test]
     fn cdp2_browser_get_version_returns_real_values_only() {
         let v = version_result();
         let product = format!("fandhe-browser/{}", env!("CARGO_PKG_VERSION"));
