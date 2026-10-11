@@ -251,6 +251,12 @@ fn aisnap9_out_dir_check_rejects_unsafe_paths() {
     let root = root_buf.as_path();
     assert!(check_out_dir(Path::new("relative/dir"), root).is_err());
     assert!(check_out_dir(&root.join("..").join("etc"), root).is_err());
+    // verbatim パス（Windows の canonicalize 結果）でも `..` を ParentDir 以外の要素として拒否する（AISNAP-9）
+    #[cfg(windows)]
+    {
+        let verbatim = Path::new(r"\\?\C:\fandhe-test-root").join("..").join("etc");
+        assert!(check_out_dir(&verbatim, Path::new(r"\\?\C:\fandhe-test-root")).is_err());
+    }
     assert!(check_out_dir(&root.join("out"), root).is_err());
     assert!(check_out_dir(root, root).is_err());
     let other = tmp.join("other-root").join("out");
