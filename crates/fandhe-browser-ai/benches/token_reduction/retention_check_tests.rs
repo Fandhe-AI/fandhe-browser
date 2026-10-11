@@ -74,7 +74,15 @@ const EXPECTED: [Expected; 7] = [
         // TASK-23.6（Issue #828）: row・cell の name が残余へ縮み、フル name の打ち切りが消えた。
         false,
     ),
-    ("checkbox-first", 2, 1, "e91f35187", None, "", false),
+    (
+        "checkbox-first",
+        2,
+        1,
+        "e91f35187",
+        None,
+        "checkbox 1",
+        false,
+    ),
 ];
 
 #[test]

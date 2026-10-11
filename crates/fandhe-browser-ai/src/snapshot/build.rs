@@ -25,6 +25,9 @@
 //!   ref シグネチャへは従来の accname（空）を渡すので ref は不変（`AISNAP-10`）。`aria-label`/`title` を
 //!   持つ場合はそれを優先し値で上書きしない。引用内のリンクのテキストは引用 name とリンク name の
 //!   両方に出る（既知の制約。REPAIR-3）。
+//! - ラベルのない `checkbox`・`radio` は accname が空のとき、直後の兄弟テキストを出力 `Node::name` に
+//!   補う（TASK-17・Issue #834・`AISNAP-12`）。ref シグネチャは accname（空）のままなので ref は不変
+//!   （`AISNAP-10`）。前置テキスト・インライン要素で包んだテキストは補わない（既知の制約。REPAIR-3）。
 //! - 規則的な `table`・`ul`・`ol`（[`crate::compress_table::detect_regular_structure`]
 //!   が `Regular`。`AISNAP-2`・TASK-12.5・Issue #83）は子孫を展開せず、ヘッダ
 //!   （個別 ref）・圧縮行・超過行数を持つ 1 ノード（[`Node::table`]）へ置き換える。
@@ -110,9 +113,9 @@ use crate::retention::priority_candidates;
 
 use super::element_ref::{ElementRef, ElementSignature, RefAllocator, RefError};
 use super::name::{
-    MAX_TOTAL_CONTENT_STEPS, NameIndex, NameSource, SKIPPED_SUBTREES, compute_data_leaf_value,
-    compute_name_with_index, compute_residual_content_name, is_hidden_element,
-    normalized_input_type,
+    MAX_TOTAL_CONTENT_STEPS, NameIndex, NameSource, SKIPPED_SUBTREES, compute_adjacent_text_name,
+    compute_data_leaf_value, compute_name_with_index, compute_residual_content_name,
+    is_hidden_element, normalized_input_type,
 };
 use super::role::compute_role;
 use super::state::{compute_state, is_html_element_named};
@@ -950,6 +953,18 @@ fn build_snapshot_inner(
             }
             _ => None,
         };
+        // ラベルのない checkbox・radio は直後の兄弟テキストを出力 name に補う
+        // （TASK-17・Issue #834）。accname が空のときだけなので label・aria・title が優先される。
+        // 直後の兄弟は走査中の親 Frame のイテレータ（child の次から）を複製して渡す。
+        // 位置探索を伴わないので、兄弟が多くても全体で線形に収まる。
+        let following = top.children.clone();
+        let value = value.or_else(|| {
+            if accessible.text.is_empty() && !accessible.truncated {
+                compute_adjacent_text_name(doc, child, following)
+            } else {
+                None
+            }
+        });
         let (out_name, covering) = match value {
             Some(v) => {
                 truncated |= v.truncated;
@@ -1447,6 +1462,60 @@ mod tests {
         let s = snap(&format!("<body><p class=\"price_color\">{long}</p></body>"));
         let p = child(&s.tree, 0);
         assert_eq!(p.name.chars().count(), 300);
+        assert!(s.truncated);
+    }
+
+    /// AISNAP-10/AISNAP-12・TASK-17（#834）: ラベルのない checkbox は直後のテキストを name に持ち、
+    /// ref は補完の有無で変わらない。
+    #[test]
+    fn task_17_unlabeled_checkbox_gets_adjacent_text_name_without_ref_change() {
+        let s = snap(
+            "<body><input type=checkbox> checkbox 1<br><input type=checkbox> checkbox 2</body>",
+        );
+        let got: Vec<&str> = s.tree.children.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(got, vec!["checkbox 1", "checkbox 2"]);
+        let bare = snap("<body><input type=checkbox><br><input type=checkbox></body>");
+        let refs = |s: &Snapshot| -> Vec<String> {
+            s.tree
+                .children
+                .iter()
+                .map(|n| n.r#ref.clone().unwrap_or_default())
+                .collect()
+        };
+        assert_eq!(refs(&s), refs(&bare));
+    }
+
+    /// AISNAP-1・TASK-17（#834）: label・aria-label・title があれば隣接テキストで上書きしない。
+    #[test]
+    fn task_17_existing_names_win_over_adjacent_text() {
+        let cases = [
+            (
+                "<label for=a>Agree</label><input type=checkbox id=a> other",
+                "Agree",
+            ),
+            (
+                "<label><input type=checkbox> Wrapped</label> other",
+                "Wrapped",
+            ),
+            ("<input type=checkbox aria-label=X> other", "X"),
+            ("<input type=checkbox title=T> other", "T"),
+        ];
+        for (html, want) in cases {
+            let s = snap(&format!("<body>{html}</body>"));
+            let n = all_nodes(&s.tree)
+                .into_iter()
+                .find(|n| n.role == "checkbox")
+                .expect("checkbox がある");
+            assert_eq!(n.name, want, "{html}");
+        }
+    }
+
+    /// TASK-17（#834）: 隣接テキストの切り詰めは Snapshot::truncated へ伝播する。
+    #[test]
+    fn task_17_adjacent_text_truncation_propagates() {
+        let long = "a".repeat(200);
+        let s = snap(&format!("<body><input type=checkbox> {long}</body>"));
+        assert_eq!(child(&s.tree, 0).name.chars().count(), 120);
         assert!(s.truncated);
     }
 

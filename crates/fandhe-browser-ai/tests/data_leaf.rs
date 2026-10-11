@@ -57,7 +57,7 @@ use fandhe_browser_ai::snapshot::{
     CheckedState, DataLeafKind, HeaderCell, Node, RowControl, Snapshot, build_snapshot,
     compute_name, compute_role,
 };
-use fandhe_browser_core::dom::{Document, NodeId};
+use fandhe_browser_core::dom::{Document, NodeData, NodeId};
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
 use fandhe_browser_core::query::{query_selector_all_str, query_selector_str};
 
@@ -352,6 +352,22 @@ fn name_matches(doc: &Document, dom: NodeId, role: &str, n: &Node, full_name: &s
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
+        return !value.is_empty() && n.name == value;
+    }
+    // TASK-17（#834）: accname が空の checkbox・radio は、出力 name が直後の兄弟テキスト
+    // （コメントは読み飛ばし、要素で止まる）の空白折り畳み値になる。
+    if full_name.is_empty() && matches!(role, "checkbox" | "radio") {
+        let mut text = String::new();
+        let mut sibling = doc.next_sibling(dom);
+        while let Some(s) = sibling {
+            match doc.node_data(s) {
+                Some(NodeData::Text { contents }) => text.push_str(contents),
+                Some(NodeData::Comment { .. }) => {}
+                _ => break,
+            }
+            sibling = doc.next_sibling(s);
+        }
+        let value = text.split_whitespace().collect::<Vec<_>>().join(" ");
         return !value.is_empty() && n.name == value;
     }
     matches!(role, "row" | "cell" | "gridcell")

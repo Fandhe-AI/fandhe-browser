@@ -413,7 +413,7 @@ fn aisnap_10_measure_break_rate() {
             ("01-login-submit", st),
             ("02-login-username", st),
             ("03-dropdown-select", st),
-            ("04-checkbox-first", amb),
+            ("04-checkbox-first", st),
             ("05-number-input", st),
             ("06-quote-text", st),
             ("07-quote-tag-link", amb),
@@ -445,7 +445,7 @@ fn aisnap_10_measure_break_rate() {
             ("01-login-submit", 1, Same),
             ("02-login-username", 1, Same),
             ("03-dropdown-select", 1, Same),
-            ("04-checkbox-first", 2, Same),
+            ("04-checkbox-first", 1, Same),
             ("05-number-input", 1, Same),
             ("06-quote-text", 1, Same),
             ("07-quote-tag-link", 2, Same),
@@ -476,21 +476,21 @@ fn aisnap_10_measure_break_rate() {
         all,
         Summary {
             measured: 18,
-            broken: 4,
+            broken: 3,
             excluded: 1
         }
     );
-    assert_eq!(percent(all.broken, all.measured).as_deref(), Ok("22.2"));
+    assert_eq!(percent(all.broken, all.measured).as_deref(), Ok("16.7"));
     let poc = summarize(rows.iter().filter(|r| r.def.poc_case.is_some()));
     assert_eq!(
         poc,
         Summary {
             measured: 14,
-            broken: 3,
+            broken: 2,
             excluded: 1
         }
     );
-    assert_eq!(percent(poc.broken, poc.measured).as_deref(), Ok("21.4"));
+    assert_eq!(percent(poc.broken, poc.measured).as_deref(), Ok("14.3"));
 }
 
 /// AISNAP-10・TASK-17.3・Issue #112: ref 同一性ベースの診断値（判定ヘルパーのシグネチャ一意性
