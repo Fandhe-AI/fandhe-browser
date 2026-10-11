@@ -13,6 +13,10 @@
 #     リンクできない場合は glibc + distroless へ逃げず停止して報告する（決定 4・オーナー判断）。
 #   - verify ステージで動的リンク 0 件を検査し、落ちたバイナリは最終イメージに入らない（CTR-4）。
 #
+# musl の版（Alpine の musl-1.2.6）は LICENSE-THIRD-PARTY 節 5 の COPYRIGHT 全文と連動する。
+# builder ステージが版を検査し、不一致ならビルドを失敗させる。ベースイメージ更新時は
+# 該当版の COPYRIGHT で節 5 と NOTICE の musl 行を更新してから検査値を差し替える。
+#
 # digest の更新手順: `docker buildx imagetools inspect rust:1-alpine` の
 # digest（multi-arch manifest list）を転記する。ベースイメージを更新したら
 # NOTICE の CA 証明書の版の記載も見直す。
@@ -51,6 +55,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     if [ "${host}" != "x86_64-unknown-linux-musl" ]; then \
       echo "error: unsupported build host: ${host} (x86_64-unknown-linux-musl only)" >&2; exit 1; \
     fi; \
+    musl_ver="$(apk info -v musl)"; \
+    case "${musl_ver}" in \
+      musl-1.2.6-*) ;; \
+      *) echo "error: musl ${musl_ver} does not match LICENSE-THIRD-PARTY section 5 (v1.2.6); update the license text" >&2; exit 1 ;; \
+    esac; \
     features=""; \
     if [ -n "${CARGO_FEATURES}" ]; then features="--features ${CARGO_FEATURES}"; fi; \
     cargo build --release --locked -p fandhe-browser-cli --bin fandhe-browser \

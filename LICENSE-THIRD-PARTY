@@ -1307,8 +1307,8 @@ SOFTWARE.
 ================================================================================
 5. musl libc (Linux musl 静的ビルド時のみ)
 SPDX: MIT
-取得元: https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5
-リビジョン: タグ v1.2.5 (v8 crate は musl の版を固定しない。実際にリンクする musl の版はビルド環境の sysroot に依存するため、配布開始前に実使用版へ合わせて再確認する)
+取得元: https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.6
+リビジョン: タグ v1.2.6 (既定コンテナの builder に固定したベースイメージ rust:1-alpine の Alpine musl 1.2.6-r2 に対応。docker/Dockerfile.release の musl 版検査が不一致なら失敗させる)
 
 ================================================================================
 
@@ -1388,6 +1388,7 @@ Kylie McClain
 Leah Neukirchen
 Luca Barbato
 Luka Perkov
+Lynn Ochs
 M Farkas-Dyck (Strake)
 Mahesh Bodapati
 Markus Wichmann
@@ -1417,7 +1418,6 @@ Stefan O'Rear
 Szabolcs Nagy
 Timo Teräs
 Trutz Behn
-Valentin Ochs
 Will Dietz
 William Haddon
 William Pitcock
@@ -1457,7 +1457,7 @@ domain. The code also comes with a fallback permissive license for use
 in jurisdictions that may not recognize the public domain.
 
 The smoothsort implementation (src/stdlib/qsort.c) is Copyright © 2011
-Valentin Ochs and is licensed under an MIT-style license.
+Lynn Ochs and is licensed under an MIT-style license.
 
 The x86_64 port was written by Nicholas J. Kain and is licensed under
 the standard MIT terms.

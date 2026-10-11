@@ -30,7 +30,7 @@ LICENSE-THIRD-PARTY に収録している。
 | siphash (halfsiphash) | V8 15.2.124.1 ツリー内 (v8 crate 152.2.0 同梱) | CC0-1.0 | https://github.com/veorq/SipHash | 同上 (v8 crate を使うビルド。Linux gnu・musl・Windows MSVC の prebuilt で実測) |
 | rapidhash-v8 | V8 15.2.124.1 ツリー内 (v8 crate 152.2.0 同梱) | BSD-2-Clause | https://github.com/Nicoshev/rapidhash | 同上 (v8 crate を使うビルド。Linux gnu・musl・Windows MSVC の prebuilt で実測) |
 | ICU | 78 (v8 crate 152.2.0 同梱版) | Unicode-3.0 | https://github.com/unicode-org/icu | 同上 |
-| musl libc | 版は固定されない (ビルド環境の sysroot 依存) | MIT | https://musl.libc.org/ | Linux musl 静的ビルドのみ |
+| musl libc | 1.2.6 (既定コンテナの builder の Alpine musl 1.2.6-r2。Dockerfile.release が版を検査する。著作権表示・許諾文は LICENSE-THIRD-PARTY 節 5) | MIT | https://musl.libc.org/ | Linux musl 静的ビルドのみ |
 | ルート CA 証明書 (Alpine ca-certificates-bundle) | 20260909-r0 (rust:1-alpine の digest 固定版) | MPL-2.0 AND MIT | https://pkgs.alpinelinux.org/package/edge/main/x86_64/ca-certificates | 既定コンテナ (docker/Dockerfile.release・TASK-64・Issue #297) の /etc/ssl/certs/ca-certificates.crt に無改変で同梱 |
 
 v8 prebuilt の同梱部品は、採用版 (v8 crate 152.2.0) の prebuilt 静的ライブラリを

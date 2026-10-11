@@ -8,7 +8,9 @@
 # 使い方: scripts/gen-cargo-licenses.sh <出力ファイル> <ターゲット三つ組> [features]
 #   features が空なら既定 feature。ワークスペース内の crate（source なし）は本体の
 #   LICENSE-MIT / LICENSE-APACHE でカバーされるため対象外。
-# ライセンスファイルを持たない crate は SPDX 宣言のみを記し、警告を標準エラーへ出す。
+# ライセンスファイルを持たない crate は docker/license-supplements/ に同梱した上流正本の
+# 文書（タグ付きリビジョンから取得したもの）で補う。補う文書も無い crate が 1 件でもあれば
+# 失敗にする（fail-closed。著作権表示・許諾文を欠いたイメージを生成しない）。
 set -euo pipefail
 
 out="${1:?usage: gen-cargo-licenses.sh <out> <target> [features]}"
@@ -34,6 +36,10 @@ cargo metadata --format-version 1 --locked |
     >"${tmp}/meta.tsv"
 
 tab="$(printf '\t')"
+# リポジトリルート（本スクリプトの 1 階層上）。補完文書の置き場の解決に使う。
+root="$(cd "$(dirname "$0")/.." && pwd)"
+supp_root="${root}/docker/license-supplements"
+missing=0
 count=0
 nofile=0
 {
@@ -60,16 +66,35 @@ nofile=0
     done
     if [ "${found}" = "0" ]; then
       nofile=$((nofile + 1))
-      echo "(ライセンスファイルはパッケージに含まれない。上記 SPDX の宣言のみ)"
-      echo "${name} ${ver}: no license file in package (SPDX: ${lic})" >&2
-      echo
+      # fandhe-backend-* は同一リポジトリ（同一タグ）の crate 群で補完文書を共有する。
+      key="${name}-${ver#v}"
+      case "${name}" in fandhe-backend-*) key="fandhe-backend-${ver#v}" ;; esac
+      sdir="${supp_root}/${key}"
+      sfound=0
+      for f in "${sdir}"/*; do
+        if [ -f "${f}" ]; then
+          sfound=1
+          echo "--- $(basename "${f}") (上流リポジトリの該当タグから取得した補完文書) ---"
+          cat "${f}"
+          echo
+        fi
+      done
+      if [ "${sfound}" = "0" ]; then
+        missing=$((missing + 1))
+        echo "error: ${name} ${ver}: no license file in package and no supplement in docker/license-supplements/${key}" >&2
+      fi
     fi
   done <"${tmp}/meta.tsv"
 } >"${out}"
 
+# ライセンス文書を用意できない依存があれば失敗にする（fail-closed）。
+if [ "${missing}" -ne 0 ]; then
+  echo "error: ${missing} crate(s) without license documents" >&2
+  exit 1
+fi
 # 外部 crate が 1 件も突合できなければ失敗にする（fail-closed）。
 if [ "${count}" -eq 0 ]; then
   echo "error: no external crates matched" >&2
   exit 1
 fi
-echo "gen-cargo-licenses: ${count} external crates (${nofile} without license file)" >&2
+echo "gen-cargo-licenses: ${count} external crates (${nofile} supplemented from docker/license-supplements)" >&2
