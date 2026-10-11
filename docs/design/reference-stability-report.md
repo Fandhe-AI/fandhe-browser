@@ -4,8 +4,8 @@
 - **対応タスク**: TASK-17（17.3）
 - **マイルストーン**: MS-2
 - **参考**: PoC-4（`stability_check.mjs`。改善前 26.7% = 4/15）
-- **基準コミット**: `865879f`（本測定時点の `origin/main` HEAD）
-- **関連 Issue**: #110（判定ヘルパー）・#111（フィクスチャ）・#112（本 Issue・算出とレポート）・#113（達成可否の判断。人間担当）
+- **基準コミット**: `5383534`（TASK-23.8 の再測定時点の `origin/main` HEAD。当初の測定は `865879f`）
+- **関連 Issue**: #110（判定ヘルパー）・#111（フィクスチャ）・#112（本 Issue・算出とレポート）・#113（達成可否の判断。人間担当）・#830（TASK-23.8 の再測定）
 
 本レポートは測定結果の記録であり、10% 以下の達成可否・どの指標を正とするかの判断は含まない（#113）。
 
@@ -47,11 +47,11 @@ ref 同一性は「変化前の ref が変化後も同じ対象を一意に指�
 | 03-dropdown-select | 3 | combobox | （空） | Stable | 1 | Same |
 | 04-checkbox-first | 4 | checkbox | （空） | Ambiguous | 2 | Same |
 | 05-number-input | 5 | spinbutton | Number | Stable | 1 | Same |
-| 06-quote-text | 6 | generic | （空） | Ambiguous | 71 | Same |
+| 06-quote-text | 6 | generic | （空） | Ambiguous | 10 | Same |
 | 07-quote-tag-link | 7 | link | alpha | Ambiguous | 2 | Same |
 | 08-hn-first-title | 8 | link | （長い名前） | Stable | 1 | Same |
 | 09-hn-more-link | 9 | link | More | Stable | 1 | Same |
-| 10-ec-price | 10 | generic | （空） | Ambiguous | 286 | Same |
+| 10-ec-price | 10 | generic | （空） | Ambiguous | 22 | Same |
 | 11-ec-product-link | 11 | link | （長い名前） | Stable | 1 | Same |
 | 12-table-header-cell | 12 | columnheader | Last Name | Ambiguous | 2 | Same |
 | 13-table-data-cell | 13 | cell | Beta | 除外（`ref_expected: false`） | - | ref なし |
@@ -61,6 +61,18 @@ ref 同一性は「変化前の ref が変化後も同じ対象を一意に指�
 | 17-hn-second-title | - | link | （長い名前） | Stable | 1 | Same |
 | 18-quotes-author-link | - | link | (about) | Ambiguous | 10 | Same |
 | 19-quotes-login-link | - | link | Login | Stable | 1 | Same |
+
+## TASK-23 改善前後（#830）
+
+| 集計 | 改善前（`5786055`） | 改善後（`5383534`） |
+| ---- | ------------------- | ------------------- |
+| 全ケース（ヘルパー判定） | 6/18 = 33.3% | 6/18 = 33.3% |
+| PoC-4 相当（ヘルパー判定） | 5/14 = 35.7% | 5/14 = 35.7% |
+| 全ケース（ref 同一性） | 0/18 = 0.0% | 0/18 = 0.0% |
+| 06-quote-text の同シグネチャ候補数 | 71 | 10 |
+| 10-ec-price の同シグネチャ候補数 | 286 | 22 |
+
+破損率に変化はない。達成可否の判断はしない（#113）。全体の対照表は [TASK-23 再測定レポート](./token-reduction-remeasurement-report.md) を参照。
 
 ## PoC-4 との手法差
 
@@ -74,7 +86,7 @@ ref 同一性は「変化前の ref が変化後も同じ対象を一意に指�
 ## 所見（判断はしない）
 
 - 破損 6 件はすべて `Ambiguous`（変化後に同じ role+name の候補が複数）。いずれも ref は変化前後で同一で、対象は ref なら一意に指せている。シグネチャの重複は変化前から存在する
-- 06・10 は role が generic で名前が空のデータ葉で、候補が 71・286 件に上る
+- 06・10 は role が generic で名前が空のデータ葉。同シグネチャの候補は 10・22 件で、無名 generic の折り畳み（TASK-23.3）により、改善前の 71・286 件から減った。判定は Ambiguous のまま
 - 04 は名前なしの checkbox、07・12・18 は同名リンク・見出しセルが複数あるページ
 
 ## #113 への引き継ぎ
