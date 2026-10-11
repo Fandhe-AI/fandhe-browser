@@ -1036,8 +1036,12 @@ fn windows_profile_is_unsupported() {
     let dir = std::env::temp_dir().join(format!("fandhe-cdp-page-js-{}", std::process::id()));
     let result = fandhe_browser_profile::Profile::open(&dir);
     assert!(
-        result.is_err(),
-        "Profile::open is expected to be unsupported"
+        matches!(
+            result,
+            Err(fandhe_browser_profile::ProfileError::Unsupported { .. })
+        ),
+        "Profile::open is expected to be Unsupported: {:?}",
+        result.as_ref().err()
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
