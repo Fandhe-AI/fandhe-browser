@@ -30,3 +30,10 @@
 # （`npm view playwright-core@<版> dist.integrity`）。run.sh が版・integrity の一致を検証する。
 : "${PLAYWRIGHT_VERSION:=1.63.0}"
 : "${PLAYWRIGHT_INTEGRITY:=sha512-rYCsBF/M5HjUch52bbtVONEFjv6Xu8sm8h72dNlR5bzIE1fvC/bxgspzkjSfU+MweEMmPM8KJebG6nnyxo5mCg==}"
+
+# measure-container-size（TASK-65.1・CTR-1・CTR-5。harness/container-size/README.md 参照）の比較対象。
+# tag は CTR-1 が指定する Playwright 公式イメージ。digest は manifest list（amd64・arm64 共通）で、
+# 取得時は digest 指定で pull し、取得後に RepoDigests と照合する（不一致は fail-closed）。
+# 更新手順: `docker buildx imagetools inspect <image>` の Digest を転記する。
+: "${CONTAINER_SIZE_REFERENCE_IMAGE:=mcr.microsoft.com/playwright:v1.49.0-noble}"
+: "${CONTAINER_SIZE_REFERENCE_DIGEST:=sha256:0fc07c73230cb7c376a528d7ffc83c4bdcdcd3fc7efbe54a2eed72b1ec118377}"
