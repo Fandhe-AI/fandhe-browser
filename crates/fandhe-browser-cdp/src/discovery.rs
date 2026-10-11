@@ -38,10 +38,12 @@ const BROWSER_WS_PATH_PREFIX: &str = "/devtools/browser/";
 /// `Protocol-Version`・`Browser.getVersion` の `protocolVersion` に返す CDP のバージョン。
 pub(crate) const PROTOCOL_VERSION: &str = "1.3";
 
-/// 製品名と版（`fandhe-browser/<版>`）。`/json/version` の `Browser`・`User-Agent` と
-/// `Browser.getVersion`（[`crate::playwright_compat`]）で共有し、版表記のずれを防ぐ（`CDP-2`・`SEC-2`）。
-/// Chrome / Chromium を装う値は含めない。
-pub(crate) const PRODUCT: &str = concat!("fandhe-browser/", env!("CARGO_PKG_VERSION"));
+/// 製品名と版（`fandhe-browser/<版>`）。core の `fetch::USER_AGENT`（Fetcher の `User-Agent`・
+/// `navigator.userAgent` の定義元）の別名で、`/json/version` の `Browser`・`User-Agent` と
+/// `Browser.getVersion`（[`crate::playwright_compat`]）で共有し、識別面のずれを防ぐ
+/// （`CDP-2`・`SEC-2`・TASK-86・#814）。
+/// 不変条件: cdp 内でこの文字列を再定義しない。Chrome / Chromium を装う値にしない。
+pub(crate) const PRODUCT: &str = fandhe_browser_core::USER_AGENT;
 
 /// `/json/version` の本体（JSON）を作る。
 ///
@@ -92,6 +94,14 @@ mod tests {
         let a = Authority::from_host_header(Some(host)).unwrap();
         let b = BrowserId::parse(id).unwrap();
         serde_json::from_slice(&version_body(&a, &b).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn sec2_json_version_product_derives_from_core_user_agent() {
+        let v = version("127.0.0.1:9222", "fixed-1");
+        assert_eq!(v["Browser"], fandhe_browser_core::USER_AGENT);
+        assert_eq!(v["User-Agent"], fandhe_browser_core::USER_AGENT);
+        assert_eq!(PRODUCT, fandhe_browser_core::USER_AGENT);
     }
 
     #[test]
