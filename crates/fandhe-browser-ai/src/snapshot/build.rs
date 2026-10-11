@@ -955,9 +955,12 @@ fn build_snapshot_inner(
         };
         // ラベルのない checkbox・radio は直後の兄弟テキストを出力 name に補う
         // （TASK-17・Issue #834）。accname が空のときだけなので label・aria・title が優先される。
+        // 直後の兄弟は走査中の親 Frame のイテレータ（child の次から）を複製して渡す。
+        // 位置探索を伴わないので、兄弟が多くても全体で線形に収まる。
+        let following = top.children.clone();
         let value = value.or_else(|| {
             if accessible.text.is_empty() && !accessible.truncated {
-                compute_adjacent_text_name(doc, child)
+                compute_adjacent_text_name(doc, child, following)
             } else {
                 None
             }

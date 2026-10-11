@@ -1384,6 +1384,8 @@ pub(super) fn compute_data_leaf_value(
 /// 結果は出力 `Node::name` にのみ使い、ref シグネチャへは渡さない（ref は不変。`AISNAP-10`）。
 /// HTML-AAM の accname（label → title）は [`compute_name_with_index`] のまま変えない。
 ///
+/// 引数 `following`: `id` の直後から始まる兄弟イテレータ（`snapshot::build` の親 Frame の残り）。
+///
 /// 規則: `id` の直後の兄弟を最大 [`MAX_ADJACENT_TEXT_SIBLINGS`] 個まで辿り、テキストノードを連結する。
 /// コメントは読み飛ばし、要素（`<br>`・`<label>` 等）に当たったら止める。結果は空白を畳み
 /// [`MAX_NAME_CHARS`] で切り詰める。走査上限で打ち切った場合は `truncated: true`。
@@ -1391,8 +1393,13 @@ pub(super) fn compute_data_leaf_value(
 ///
 /// 既知の制約（REPAIR-3）: 前置テキスト・`<span>` 等で包まれたテキストは拾わない。`<br>` なしで
 /// 1 行に並ぶ `A <input> B <input>` では直後のテキストへ紐付く。row・cell 内では親の残余 name にも
-/// 同じテキストが残る。兄弟の位置探索は親の子数に比例する。
-pub(super) fn compute_adjacent_text_name(doc: &Document, id: NodeId) -> Option<AccessibleName> {
+/// 同じテキストが残る。`following` は呼び出し側が持つ親の子イテレータの残りで、位置探索をしないため走査量は
+/// 要素ごとに高々 [`MAX_ADJACENT_TEXT_SIBLINGS`] + 1 に収まる。
+pub(super) fn compute_adjacent_text_name(
+    doc: &Document,
+    id: NodeId,
+    following: Children<'_>,
+) -> Option<AccessibleName> {
     if !is_html_element_named(doc, id, "input")
         || !matches!(
             normalized_input_type(doc, id).as_str(),
@@ -1401,17 +1408,11 @@ pub(super) fn compute_adjacent_text_name(doc: &Document, id: NodeId) -> Option<A
     {
         return None;
     }
-    let parent = doc.parent(id)?;
     let mut text = String::new();
     let mut normalized_chars = 0usize;
     let mut pending_space = false;
     let mut cut = false;
-    for (scanned, sibling) in doc
-        .children(parent)
-        .skip_while(|&s| s != id)
-        .skip(1)
-        .enumerate()
-    {
+    for (scanned, sibling) in following.enumerate() {
         if scanned >= MAX_ADJACENT_TEXT_SIBLINGS {
             cut = true;
             break;
@@ -1936,7 +1937,7 @@ mod tests {
         compute_name, compute_name_with_index,
     };
     use super::{MAX_ADJACENT_TEXT_SIBLINGS, compute_adjacent_text_name};
-    use fandhe_browser_core::dom::{Document, NodeId};
+    use fandhe_browser_core::dom::{Children, Document, NodeId};
     use fandhe_browser_core::parse::{ParseOptions, parse_document};
     use fandhe_browser_core::query::query_selector_str;
 
@@ -1960,9 +1961,20 @@ mod tests {
 
     // --- 隣接テキスト（TASK-17・Issue #834） ---
 
+    /// テスト用: 実行時は build が親 Frame から渡す「`id` の直後の兄弟」イテレータを再現する。
+    fn following_of(doc: &Document, id: NodeId) -> Children<'_> {
+        let mut it = doc.children(doc.parent(id).expect("親がある"));
+        for s in it.by_ref() {
+            if s == id {
+                break;
+            }
+        }
+        it
+    }
+
     fn adjacent(html: &str, selector: &str) -> Option<AccessibleName> {
         let (doc, id) = parse_and_select(html, selector);
-        compute_adjacent_text_name(&doc, id)
+        compute_adjacent_text_name(&doc, id, following_of(&doc, id))
     }
 
     fn adjacent_at(html: &str, selector_all: &str, index: usize) -> Option<AccessibleName> {
@@ -1971,7 +1983,39 @@ mod tests {
         let all =
             fandhe_browser_core::query::query_selector_all_str(&doc, doc.root(), selector_all)
                 .expect("セレクタは解釈できる");
-        compute_adjacent_text_name(&doc, *all.get(index).expect("要素がある"))
+        let id = *all.get(index).expect("要素がある");
+        compute_adjacent_text_name(&doc, id, following_of(&doc, id))
+    }
+
+    /// AISNAP-10・TASK-17（#834）: 同じ親に大量の無ラベル checkbox が並んでも build 全体が
+    /// 線形で終わり、全要素に隣接テキスト由来の name が付く（位置探索の二乗走査の回帰防止）。
+    #[test]
+    fn task_17_many_unlabeled_checkboxes_snapshot_linear() {
+        let n = 20_000;
+        let html: String = (0..n)
+            .map(|i| format!("<input type=checkbox> item{i}<br>"))
+            .collect();
+        let parsed = parse_document(&html, &ParseOptions::default()).expect("ok");
+        let started = std::time::Instant::now();
+        let snap = crate::snapshot::build::build_snapshot(&parsed.document).expect("ok");
+        let elapsed = started.elapsed();
+        let checkboxes: Vec<&crate::snapshot::Node> = {
+            let mut out = Vec::new();
+            let mut stack = vec![&snap.tree];
+            while let Some(node) = stack.pop() {
+                if node.role == "checkbox" {
+                    out.push(node);
+                }
+                stack.extend(node.children.iter());
+            }
+            out
+        };
+        assert!(!checkboxes.is_empty());
+        assert!(checkboxes.iter().any(|c| c.name == "item0"));
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "elapsed={elapsed:?}"
+        );
     }
 
     /// AISNAP-10/AISNAP-12・TASK-17（#834）: `<br>` で区切られた checkbox が直後のテキストを得る。
