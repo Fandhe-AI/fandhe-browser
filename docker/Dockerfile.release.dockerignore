@@ -12,6 +12,8 @@
 !docs/design/host-api.schema.json
 !scripts/gen-cargo-licenses.sh
 !docker/license-supplements/
+!docker/release-build.sh
+!docker/verify-static.sh
 !NOTICE
 !LICENSE-THIRD-PARTY
 !LICENSE-MIT
