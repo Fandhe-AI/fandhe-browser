@@ -4,7 +4,10 @@
 # - --no-verify によるスキップは禁止
 # - Cargo.toml 未追加（workspace 作成予定）の間、cargo 系ジョブはスキップする
 #   （Makefile の HAS_CARGO 判定と同一方針）
-# - 重いチェック（clippy・test）は pre-push に置き、pre-commit は整形チェックのみで軽量に保つ
+# - GitHub Actions（ci.yml の rust-lint・rust-test 等の required チェック）で実行する検査は
+#   フックで重複実行しない。フックは CI に無い秘密情報検査と、軽量な整形・コミット
+#   メッセージ検査に限る（開発速度を落とさないため clippy・test は pre-push に置かない）
+# - ローカルゲート（fmt・clippy・test。ci.md）の規約自体は変わらず、フックで強制しないだけ
 
 pre-commit:
   parallel: true
@@ -52,6 +55,10 @@ pre-commit:
     # 出力しない。
     - name: secrets-content-guard
       run: |
+        # プロセス起動回数を diff 行数に比例させないため、awk 1 本で追加行の本文と
+        # ファイル名を行対応の一時ファイルへ書き出し、パターンごとに grep -E を 1 回だけ
+        # 実行する（awk の `{n}` 区間指定は古い mawk / BSD awk で使えないため grep -E 側で
+        # 照合する。BSD / GNU の両方で動く）
         patterns='
         -----BEGIN [A-Z ]*PRIVATE KEY-----|private-key
         AKIA[0-9A-Z]{16}|aws-access-key-id
@@ -61,26 +68,27 @@ pre-commit:
         xox[abprs]-[A-Za-z0-9-]{10,}|slack-token
         AIza[0-9A-Za-z_-]{35}|google-api-key
         '
-        file=""
-        git diff --cached --diff-filter=ACMR -U0 -- . | while IFS= read -r line; do
-          case "$line" in
-            "+++ b/"*)
-              file="${line#+++ b/}"
-              ;;
-            "+++ "*)
-              ;;
-            "+"*)
-              content="${line#+}"
-              printf '%s\n' "$patterns" | while IFS='|' read -r pat kind; do
-                [ -z "$pat" ] && continue
-                if printf '%s' "$content" | grep -Eq -- "$pat"; then
-                  echo "NG: 秘密情報らしき文字列を検出しました: file=${file:-(unknown)} pattern=$kind" >&2
-                  exit 1
-                fi
-              done || exit 1
-              ;;
-          esac
-        done
+        tmp="$(mktemp -d)" || exit 1
+        trap 'rm -rf "$tmp"' EXIT
+        git diff --cached --diff-filter=ACMR -U0 -- . | awk -v cf="$tmp/content" -v nf="$tmp/names" '
+          /^\+\+\+ b\// { file = substr($0, 7); next }
+          /^\+\+\+ /    { next }
+          /^\+/         { print substr($0, 2) > cf; print (file == "" ? "(unknown)" : file) > nf }
+        '
+        [ -s "$tmp/content" ] || exit 0
+        rc=0
+        printf '%s\n' "$patterns" | {
+          while IFS='|' read -r pat kind; do
+            [ -z "$pat" ] && continue
+            ln="$(grep -En -m1 -- "$pat" "$tmp/content" | head -n1 | cut -d: -f1)"
+            if [ -n "$ln" ]; then
+              file="$(sed -n "${ln}p" "$tmp/names")"
+              echo "NG: 秘密情報らしき文字列を検出しました: file=${file} pattern=$kind" >&2
+              rc=1
+            fi
+          done
+          exit "$rc"
+        }
 
 commit-msg:
   jobs:
@@ -98,30 +106,4 @@ commit-msg:
           echo "NG: Conventional Commits 形式ではありません: $msg" >&2
           echo "形式: <type>(<scope>): <説明>  （type: feat|fix|perf|refactor|test|docs|build|ci|chore）" >&2
           exit 1
-        fi
-
-pre-push:
-  jobs:
-    # clippy・test は Makefile の lint / test ターゲットへ委譲し、既定 feature のみで
-    # 実行する（`--all-features` は付けない。RENDER-1・licensing.md。Servo（`rendering`
-    # feature）を既定ビルドの依存グラフへ混入させない方針のため）。
-    # pre-push は Servo 込み（--features rendering）のビルド・テストまでは行わない:
-    # git push のたびに Servo の初回ビルド・テストが走ると重く、日常の pre-push を
-    # 阻害するため。`rendering` 込みの検証（make lint-rendering / test-rendering）は
-    # make ci が引き受ける（ci.md「既定ビルドと --features rendering の両方で検証」。
-    # PR 前・CI で必ず実行される）。Cargo.toml 未追加なら make 側の HAS_CARGO 判定で
-    # skip する
-    - name: clippy
-      run: |
-        if [ -f Cargo.toml ]; then
-          make lint
-        else
-          echo "skip: Cargo.toml 未追加"
-        fi
-    - name: test
-      run: |
-        if [ -f Cargo.toml ]; then
-          make test
-        else
-          echo "skip: Cargo.toml 未追加"
         fi
