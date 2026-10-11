@@ -193,6 +193,61 @@ impl std::fmt::Debug for ListenerError {
     }
 }
 
+/// タイマー / microtask のコールバックの種別（`timerCallbackError` op の許可リスト。`JS-7`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TimerCallbackSource {
+    /// `setTimeout`。
+    Timeout,
+    /// `setInterval`。
+    Interval,
+    /// `queueMicrotask`。
+    Microtask,
+}
+
+impl TimerCallbackSource {
+    pub(super) fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "timeout" => Self::Timeout,
+            "interval" => Self::Interval,
+            "microtask" => Self::Microtask,
+            _ => return None,
+        })
+    }
+
+    /// ログ・診断で使う安定した表記。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Interval => "interval",
+            Self::Microtask => "microtask",
+        }
+    }
+}
+
+/// タイマー / microtask のコールバックが投げた例外 1 件（[`MAX_CONSOLE_MESSAGE_BYTES`] で切り詰め済み）。
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TimerError {
+    /// 例外を投げたコールバックの種別。
+    pub source: TimerCallbackSource,
+    /// 例外メッセージ（ページ由来。切り詰め後）。
+    pub message: String,
+    /// 切り詰めが起きたか。
+    pub truncated: bool,
+}
+
+// ページ由来の文字列は秘密を含み得るため、Debug には長さだけを出す。
+impl std::fmt::Debug for TimerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TimerError")
+            .field("source", &self.source)
+            .field("message_len", &self.message.len())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
+}
+
 /// 無視した `location` の遷移系操作 1 件。URL 本文は持たず、種別と長さだけを残す。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -240,6 +295,10 @@ pub struct BridgeDiagnostics {
     pub listener_errors: Vec<ListenerError>,
     /// ライフサイクルのリスナー保持件数が shim の上限を超え、登録を無視したか（`JS-6`）。
     pub listener_limit_exceeded: bool,
+    /// タイマー / microtask のコールバック例外（先頭から [`MAX_BRIDGE_DIAGNOSTICS`] 件。`JS-7`）。
+    pub timer_errors: Vec<TimerError>,
+    /// 文字列ハンドラ（`setTimeout("code", ...)`）として渡され、評価せず無視した件数（`JS-7`）。
+    pub timer_string_handlers_ignored: u64,
     /// 件数上限で保存しなかった診断の数。
     pub dropped: u64,
 }
@@ -259,6 +318,19 @@ impl BridgeDiagnostics {
             let (kept, truncated) = truncate_utf8(message, MAX_CONSOLE_MESSAGE_BYTES);
             self.listener_errors.push(ListenerError {
                 event,
+                message: kept.to_owned(),
+                truncated,
+            });
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    pub(super) fn record_timer_error(&mut self, source: TimerCallbackSource, message: &str) {
+        if self.timer_errors.len() < MAX_BRIDGE_DIAGNOSTICS {
+            let (kept, truncated) = truncate_utf8(message, MAX_CONSOLE_MESSAGE_BYTES);
+            self.timer_errors.push(TimerError {
+                source,
                 message: kept.to_owned(),
                 truncated,
             });

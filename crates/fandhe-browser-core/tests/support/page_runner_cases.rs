@@ -1,5 +1,5 @@
 //! V8 / boa 共通のページスクリプトランナーのテストケース（TASK-109・Issue #780・#781・
-//! ビヘイビア `JS-4` / `JS-6` / `JS-8`）。
+//! ビヘイビア `JS-4` / `JS-6` / `JS-8`。タイマー・microtask は TASK-110・Issue #782・`JS-7`）。
 //!
 //! `tests/page_runner_v8.rs` と `tests/page_runner_boa.rs` が `#[path]` で取り込む。
 //! 期待値は具体値で書く。
@@ -8,10 +8,11 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::time::Duration;
 
+use fandhe_browser_core::dom_bridge::TimerCallbackSource;
 use fandhe_browser_core::fetch::{FetchOptions, Fetcher};
 use fandhe_browser_core::{
-    AbortKind, Config, LifecycleOutcome, PageRunInput, PageRunOptions, PageRunOutput,
-    ScriptOutcome, WallTimeScope, run_page_scripts,
+    AbortKind, Config, EventLoopLimits, LifecycleOutcome, PageRunInput, PageRunOptions,
+    PageRunOutput, ScriptOutcome, WallTimeScope, run_page_scripts,
 };
 
 const BASE: &str = "https://example.test/";
@@ -113,6 +114,191 @@ fn append(n: &str) -> String {
     )
 }
 
+/// タイマー・microtask の共通ケース（`JS-7`・`JS-6`）。
+fn timer_cases(engine: &str) {
+    // 本文へ `<p>` を足すヘルパーを各ページの先頭に置く。
+    let page = |script: &str| {
+        format!(
+            "<body><script>function a(t){{var p=document.createElement('p');\
+             p.textContent=t;document.body.appendChild(p)}}{script}</script></body>"
+        )
+    };
+    let opts = PageRunOptions::default();
+
+    eprintln!("case: JS-7 timers fire in deadline order on a virtual clock");
+    let out = run_page(
+        engine,
+        &page("setTimeout(function(){a('100')},100);setTimeout(function(){a('50')},50);"),
+        &opts,
+    );
+    assert!(out.html().contains("<p>50</p><p>100</p>"), "{}", out.html());
+    assert!(out.abort().is_none(), "{:?}", out.abort());
+    assert_eq!(out.event_loop().fired(), 2);
+    assert_eq!(
+        out.event_loop().virtual_elapsed(),
+        Duration::from_millis(100)
+    );
+    assert_eq!(out.event_loop().pending_at_end(), 0);
+
+    eprintln!("case: JS-7 a 29s timer does not wait in real time");
+    let out = run_page(
+        engine,
+        &page("setTimeout(function(){a('late')},29000);"),
+        &opts,
+    );
+    assert!(out.abort().is_none(), "{:?}", out.abort());
+    assert!(out.html().contains("<p>late</p>"), "{}", out.html());
+    assert_eq!(out.event_loop().virtual_elapsed(), Duration::from_secs(29));
+    assert!(
+        out.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        out.elapsed()
+    );
+
+    eprintln!("case: JS-7 microtask runs before the timer of the same task");
+    let out = run_page(
+        engine,
+        &page("setTimeout(function(){a('t')},0);queueMicrotask(function(){a('m')});a('s');"),
+        &opts,
+    );
+    assert!(
+        out.html().contains("<p>s</p><p>m</p><p>t</p>"),
+        "{}",
+        out.html()
+    );
+
+    eprintln!("case: JS-7 clearTimeout / clearInterval cancel timers");
+    let out = run_page(
+        engine,
+        &page(
+            "var x=setTimeout(function(){a('x')},10);clearTimeout(x);\
+             setTimeout(function(){a('y')},20);\
+             var n=0;var i=setInterval(function(){n++;a('i'+n);if(n==3){clearInterval(i)}},5);",
+        ),
+        &opts,
+    );
+    assert!(!out.html().contains("<p>x</p>"), "{}", out.html());
+    assert!(
+        out.html().contains("<p>i1</p><p>i2</p><p>i3</p><p>y</p>"),
+        "{}",
+        out.html()
+    );
+    assert!(!out.html().contains("<p>i4</p>"), "{}", out.html());
+    assert_eq!(out.event_loop().fired(), 4);
+    assert!(out.abort().is_none(), "{:?}", out.abort());
+
+    eprintln!("case: JS-6 runaway setInterval(0) and recursive setTimeout are bounded");
+    let small = PageRunOptions::default()
+        .with_event_loop_limits(EventLoopLimits::default().with_max_timer_fires(50));
+    let out = run_page(
+        engine,
+        &page(
+            "var n=0;setInterval(function(){n++;document.body.setAttribute('data-n',String(n))},0);",
+        ),
+        &small,
+    );
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::TimerFires { limit: 50 })
+    );
+    assert!(out.html().contains("data-n=\"50\""), "{}", out.html());
+    let out = run_page(
+        engine,
+        &page(
+            "var n=0;function r(){n++;document.body.setAttribute('data-n',String(n));\
+             setTimeout(r,0)}r();",
+        ),
+        &small,
+    );
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::TimerFires { limit: 50 })
+    );
+    assert!(out.html().contains("data-n=\"51\""), "{}", out.html());
+
+    eprintln!("case: JS-6 registered timers limit aborts the page");
+    let few = PageRunOptions::default()
+        .with_event_loop_limits(EventLoopLimits::default().with_max_registered_timers(5));
+    let out = run_page(
+        engine,
+        &page("for(var i=0;i<6;i++){setTimeout(function(){a('z')},1000)}"),
+        &few,
+    );
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::RegisteredTimers { limit: 5 })
+    );
+    assert_eq!(out.event_loop().fired(), 0);
+
+    eprintln!("case: JS-7 untrusted delays are normalized");
+    let out = run_page(
+        engine,
+        &page(
+            "setTimeout(function(){a('neg')},-5);setTimeout(function(){a('nan')},NaN);\
+             setTimeout(function(){a('str')},'abc');setTimeout(function(){a('inf')},Infinity);",
+        ),
+        &opts,
+    );
+    assert!(
+        out.html().contains("<p>neg</p><p>nan</p><p>str</p>"),
+        "{}",
+        out.html()
+    );
+    assert!(!out.html().contains("<p>inf</p>"), "{}", out.html());
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::VirtualTime {
+            limit: Duration::from_secs(30)
+        })
+    );
+    assert_eq!(out.event_loop().fired(), 3);
+
+    eprintln!("case: JS-7 callback exceptions are aggregated and later timers continue");
+    let out = run_page(
+        engine,
+        &page(
+            "setTimeout(function(){a('1')},1);setTimeout(function(){throw new Error('boom')},2);\
+             setTimeout(function(){a('3')},3);",
+        ),
+        &opts,
+    );
+    assert!(out.html().contains("<p>1</p><p>3</p>"), "{}", out.html());
+    let errors = &out.bridge_diagnostics().timer_errors;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].source, TimerCallbackSource::Timeout);
+    assert_eq!(errors[0].message, "boom");
+    assert!(out.abort().is_none(), "{:?}", out.abort());
+
+    eprintln!("case: JS-7 string handlers are not evaluated");
+    let out = run_page(
+        engine,
+        &page("setTimeout(\"document.body.setAttribute('data-x','1')\",0);"),
+        &opts,
+    );
+    assert!(!out.html().contains("data-x=\"1\""), "{}", out.html());
+    assert_eq!(out.bridge_diagnostics().timer_string_handlers_ignored, 1);
+    assert!(out.abort().is_none(), "{:?}", out.abort());
+
+    eprintln!(
+        "case: JS-7 extra arguments, TypeError for non-function microtask, locked dispatcher"
+    );
+    let out = run_page(
+        engine,
+        &page(
+            "setTimeout(function(x,y){a(x+y)},0,'a','b');\
+             try{queueMicrotask(1)}catch(e){a(e.name)}\
+             try{Object.defineProperty(globalThis,'__fandheRunTimer',{value:1})}catch(e){a('locked')}",
+        ),
+        &opts,
+    );
+    assert!(
+        out.html()
+            .contains("<p>TypeError</p><p>locked</p><p>ab</p>"),
+        "{}",
+        out.html()
+    );
+}
+
 /// 直下の子プロセス数（Linux のみ。`/proc/*/stat` の ppid を走査する）。
 #[cfg(target_os = "linux")]
 fn child_process_count() -> usize {
@@ -135,6 +321,7 @@ fn child_process_count() -> usize {
 /// 全ケースを `engine`（`"v8"` / `"boa"`）で実行する。
 pub fn run(engine: &str) {
     let opts = PageRunOptions::default();
+    timer_cases(engine);
 
     eprintln!("case: JS-4 document order + console order");
     let html = format!("<body>{}{}{}</body>", append("1"), append("2"), append("3"));

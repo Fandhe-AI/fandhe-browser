@@ -41,7 +41,7 @@ fn setup(engine: &str, limit_extra_nodes: Option<usize>) -> Page {
     let installed = rt.install_dom_shim(&bridge).expect("install shim");
     assert_eq!(
         installed.evaluated,
-        vec!["dom.js", "window.js", "events.js"]
+        vec!["dom.js", "window.js", "events.js", "timers.js"]
     );
     Page { bridge, rt, script }
 }

@@ -56,6 +56,7 @@
 //! - #771 のスパイクで判明する追加操作（`getAttribute`・`parentNode` 等）は後続 issue で足す。
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use reqwest::Url;
 
@@ -71,9 +72,11 @@ mod page_env;
 pub use page_env::{
     BridgeDiagnostics, ConsoleLevel, ConsoleMessage, IgnoredLocationChange, LifecycleEvent,
     ListenerError, LocationChangeKind, LocationMember, MAX_BRIDGE_DIAGNOSTICS,
-    MAX_CONSOLE_MESSAGE_BYTES, MAX_LOCATION_URL_BYTES,
+    MAX_CONSOLE_MESSAGE_BYTES, MAX_LOCATION_URL_BYTES, TimerCallbackSource, TimerError,
 };
 use page_env::{apply_hash, location_member};
+
+use crate::event_loop::{EventLoopLimits, NextStep, TimerId, TimerQueue, normalize_delay};
 // ページランナーが例外メッセージの切り詰めに再利用する（#780）。
 pub(crate) use page_env::{parse_location, truncate_utf8};
 
@@ -88,6 +91,16 @@ pub const DEFAULT_MAX_STRING_ARG_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// 1 ページあたりの操作回数の既定上限。
 pub const DEFAULT_MAX_OPS_PER_PAGE: u64 = 100_000;
+
+/// ランナーが打ち切りに使うリソース上限の種別（`JS-6`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResourceLimitKind {
+    /// ライフサイクルのリスナー保持件数。
+    Listeners,
+    /// 保留中のタイマー数。
+    RegisteredTimers,
+}
 
 /// 世代の上限（排他）。`generation << 32` が `2^53` 未満に収まる値。
 const GENERATION_LIMIT: u32 = 1 << 21;
@@ -324,6 +337,10 @@ enum DomOp {
     LifecycleListenerError,
     LifecycleInstallOpen,
     LifecycleListenerLimit,
+    TimerSet,
+    TimerClear,
+    TimerCallbackError,
+    TimerStringHandlerIgnored,
 }
 
 impl DomOp {
@@ -356,6 +373,10 @@ impl DomOp {
             "lifecycleListenerError" => Self::LifecycleListenerError,
             "lifecycleInstallOpen" => Self::LifecycleInstallOpen,
             "lifecycleListenerLimit" => Self::LifecycleListenerLimit,
+            "timerSet" => Self::TimerSet,
+            "timerClear" => Self::TimerClear,
+            "timerCallbackError" => Self::TimerCallbackError,
+            "timerStringHandlerIgnored" => Self::TimerStringHandlerIgnored,
             _ => return None,
         })
     }
@@ -389,6 +410,10 @@ impl DomOp {
             Self::LifecycleListenerError => "lifecycleListenerError",
             Self::LifecycleInstallOpen => "lifecycleInstallOpen",
             Self::LifecycleListenerLimit => "lifecycleListenerLimit",
+            Self::TimerSet => "timerSet",
+            Self::TimerClear => "timerClear",
+            Self::TimerCallbackError => "timerCallbackError",
+            Self::TimerStringHandlerIgnored => "timerStringHandlerIgnored",
         }
     }
 
@@ -402,14 +427,16 @@ impl DomOp {
             | Self::CurrentScript
             | Self::NavigatorUserAgent
             | Self::LifecycleInstallOpen
-            | Self::LifecycleListenerLimit => 0,
+            | Self::LifecycleListenerLimit
+            | Self::TimerStringHandlerIgnored => 0,
             Self::CreateElement
             | Self::CreateTextNode
             | Self::GetElementById
             | Self::GetTextContent
             | Self::GetInnerHtml
             | Self::GetLocation
-            | Self::SetLocationHash => 1,
+            | Self::SetLocationHash
+            | Self::TimerClear => 1,
             Self::QuerySelector
             | Self::QuerySelectorAll
             | Self::AppendChild
@@ -419,7 +446,9 @@ impl DomOp {
             | Self::SetInnerHtml
             | Self::IgnoreLocationChange
             | Self::ConsoleMessage
-            | Self::LifecycleListenerError => 2,
+            | Self::LifecycleListenerError
+            | Self::TimerSet
+            | Self::TimerCallbackError => 2,
             Self::InsertBefore | Self::SetAttribute => 3,
         }
     }
@@ -461,6 +490,10 @@ struct PageState {
     /// shim 注入中か（[`DomBridge::set_shim_installing`] だけが変更する）。
     shim_installing: bool,
     op_limit_tripped: bool,
+    /// 仮想時間のタイマーキュー（`JS-7`）。
+    timers: TimerQueue,
+    /// タイマーの上限（ランナーが [`DomBridge::set_event_loop_limits`] で設定する）。
+    event_loop_limits: EventLoopLimits,
 }
 
 struct BridgeState {
@@ -744,6 +777,65 @@ fn execute(
             page.diagnostics.listener_limit_exceeded = true;
             Ok(JsValue::Undefined)
         }
+        // タイマーの登録（`JS-7`）。遅延はページ由来の untrusted 入力で、ここで丸める。
+        // 保留中の件数上限で拒否したときは 0 を返し、ランナーが確認できるフラグを立てる（`JS-6`）。
+        DomOp::TimerSet => {
+            let Some(JsValue::Number(delay)) = args.first() else {
+                return Err(DomBridgeError::TypeMismatch {
+                    operation: op.name(),
+                    index: 1,
+                    expected: "a delay number",
+                });
+            };
+            let Some(JsValue::Bool(repeat)) = args.get(1) else {
+                return Err(DomBridgeError::TypeMismatch {
+                    operation: op.name(),
+                    index: 2,
+                    expected: "a boolean",
+                });
+            };
+            let delay_ms = normalize_delay(*delay);
+            match page
+                .timers
+                .register(delay_ms, *repeat, &page.event_loop_limits)
+            {
+                Ok(id) => Ok(JsValue::Number(f64::from(id.get()))),
+                Err(_) => Ok(JsValue::Number(0.0)),
+            }
+        }
+        // 非有限・非整数・範囲外・未知の ID は HTML の作法どおり黙って無視する。
+        DomOp::TimerClear => {
+            let Some(JsValue::Number(raw)) = args.first() else {
+                return Err(DomBridgeError::TypeMismatch {
+                    operation: op.name(),
+                    index: 1,
+                    expected: "a timer id number",
+                });
+            };
+            if raw.is_finite() && raw.fract() == 0.0 && *raw >= 1.0 && *raw <= f64::from(u32::MAX) {
+                // 範囲を検証済みのため切り詰めなく変換できる。
+                page.timers.clear(TimerId::from_raw(*raw as u32));
+            }
+            Ok(JsValue::Undefined)
+        }
+        DomOp::TimerCallbackError => {
+            let name = string_arg(op, args, 1, limits)?;
+            let message = string_arg(op, args, 2, limits)?;
+            let source = TimerCallbackSource::parse(name).ok_or(DomBridgeError::TypeMismatch {
+                operation: op.name(),
+                index: 1,
+                expected: "a known timer callback source",
+            })?;
+            page.diagnostics.record_timer_error(source, message);
+            Ok(JsValue::Undefined)
+        }
+        DomOp::TimerStringHandlerIgnored => {
+            page.diagnostics.timer_string_handlers_ignored = page
+                .diagnostics
+                .timer_string_handlers_ignored
+                .saturating_add(1);
+            Ok(JsValue::Undefined)
+        }
         DomOp::LifecycleListenerError => {
             let name = string_arg(op, args, 1, limits)?;
             let message = string_arg(op, args, 2, limits)?;
@@ -931,6 +1023,8 @@ impl DomBridge {
             op_count: 0,
             shim_installing: false,
             op_limit_tripped: false,
+            timers: TimerQueue::new(),
+            event_loop_limits: EventLoopLimits::default(),
         });
         Ok(())
     }
@@ -1002,6 +1096,54 @@ impl DomBridge {
         let guard = self.lock()?;
         let page = guard.page.as_ref().ok_or(DomBridgeError::Detached)?;
         Ok(page.diagnostics.listener_limit_exceeded)
+    }
+
+    /// リソース上限（リスナー保持件数・保留中タイマー数）に達したかを返す（ランナー用。
+    /// 診断は消費しない）。未取り付けなら [`DomBridgeError::Detached`]。
+    pub fn resource_limit_tripped(&self) -> Result<Option<ResourceLimitKind>, DomBridgeError> {
+        let guard = self.lock()?;
+        let page = guard.page.as_ref().ok_or(DomBridgeError::Detached)?;
+        Ok(if page.diagnostics.listener_limit_exceeded {
+            Some(ResourceLimitKind::Listeners)
+        } else if page.timers.registration_refused() {
+            Some(ResourceLimitKind::RegisteredTimers)
+        } else {
+            None
+        })
+    }
+
+    /// イベントループの上限を設定する（ランナー用。`attach` のたびに既定へ戻る）。
+    pub fn set_event_loop_limits(&self, limits: EventLoopLimits) -> Result<(), DomBridgeError> {
+        let mut guard = self.lock()?;
+        let page = guard.page.as_mut().ok_or(DomBridgeError::Detached)?;
+        page.event_loop_limits = limits;
+        Ok(())
+    }
+
+    /// 次に発火すべきタイマーを選ぶ（ランナー用。仮想時計を進め、発火回数に数える）。
+    pub fn next_timer(&self) -> Result<NextStep, DomBridgeError> {
+        let mut guard = self.lock()?;
+        let page = guard.page.as_mut().ok_or(DomBridgeError::Detached)?;
+        Ok(page.timers.next(&page.event_loop_limits))
+    }
+
+    /// コールバック評価後に interval を積み直す（ランナー用）。
+    pub fn rearm_timer(&self, id: TimerId) -> Result<(), DomBridgeError> {
+        let mut guard = self.lock()?;
+        let page = guard.page.as_mut().ok_or(DomBridgeError::Detached)?;
+        page.timers.rearm_if_alive(id);
+        Ok(())
+    }
+
+    /// イベントループの現況 `(仮想経過, 発火回数, 保留中)`（ランナー用）。
+    pub fn event_loop_state(&self) -> Result<(Duration, usize, usize), DomBridgeError> {
+        let guard = self.lock()?;
+        let page = guard.page.as_ref().ok_or(DomBridgeError::Detached)?;
+        Ok((
+            page.timers.virtual_now(),
+            page.timers.fired(),
+            page.timers.pending(),
+        ))
     }
 
     /// 集まった診断（無視した `location` 操作・`console`）を取り出して空にする
@@ -1811,5 +1953,80 @@ mod tests {
         ] {
             call(&b, &args).expect_err(label);
         }
+    }
+
+    fn b_bool(v: bool) -> JsValue {
+        JsValue::Bool(v)
+    }
+
+    /// JS-7: `timerSet` は遅延を丸めて登録し、型の不一致・arity は拒否する。
+    #[test]
+    fn js_7_timer_set_op_validates_and_registers() {
+        let b = bridge();
+        assert_eq!(num(call(&b, &[s("timerSet"), n(-5.0), b_bool(false)])), 1.0);
+        assert_eq!(
+            num(call(&b, &[s("timerSet"), n(f64::NAN), b_bool(true)])),
+            2.0
+        );
+        call(&b, &[s("timerSet"), s("10"), b_bool(false)]).expect_err("type");
+        call(&b, &[s("timerSet"), n(10.0), n(1.0)]).expect_err("type");
+        call(&b, &[s("timerSet"), n(10.0)]).expect_err("arity");
+        assert_eq!(b.event_loop_state().expect("state").2, 2);
+    }
+
+    /// JS-6: 保留中の件数の上限を超えると 0 を返し、ランナー向けフラグが立つ。
+    #[test]
+    fn js_6_timer_set_op_flags_registered_limit() {
+        let b = bridge();
+        b.set_event_loop_limits(EventLoopLimits::default().with_max_registered_timers(2))
+            .expect("limits");
+        assert_eq!(b.resource_limit_tripped().expect("flag"), None);
+        assert_eq!(num(call(&b, &[s("timerSet"), n(1.0), b_bool(false)])), 1.0);
+        assert_eq!(num(call(&b, &[s("timerSet"), n(1.0), b_bool(false)])), 2.0);
+        assert_eq!(num(call(&b, &[s("timerSet"), n(1.0), b_bool(false)])), 0.0);
+        assert_eq!(
+            b.resource_limit_tripped().expect("flag"),
+            Some(ResourceLimitKind::RegisteredTimers)
+        );
+        // attach し直すと状態も上限も初期化される。
+        b.attach(parse(HTML)).expect("attach");
+        assert_eq!(b.resource_limit_tripped().expect("flag"), None);
+        assert_eq!(b.event_loop_state().expect("state").2, 0);
+    }
+
+    /// JS-7: `timerClear` は不正な ID を黙って無視し、有効な ID を取り消す。
+    #[test]
+    fn js_7_timer_clear_op_ignores_invalid_ids() {
+        let b = bridge();
+        call(&b, &[s("timerSet"), n(1.0), b_bool(false)]).expect("set");
+        for bad in [f64::NAN, f64::INFINITY, -1.0, 0.0, 1.5, 1e300] {
+            call(&b, &[s("timerClear"), n(bad)]).expect("ignored");
+        }
+        call(&b, &[s("timerClear"), s("1")]).expect_err("type");
+        assert_eq!(b.event_loop_state().expect("state").2, 1);
+        call(&b, &[s("timerClear"), n(1.0)]).expect("clear");
+        assert_eq!(b.event_loop_state().expect("state").2, 0);
+    }
+
+    /// JS-7: `timerCallbackError` は種別を許可リストで検証し、メッセージを切り詰めて件数を頭打ちにする。
+    #[test]
+    fn js_7_timer_callback_error_op_is_bounded() {
+        let b = bridge();
+        call(&b, &[s("timerCallbackError"), s("click"), s("x")]).expect_err("許可リスト外");
+        call(&b, &[s("timerCallbackError"), s("timeout")]).expect_err("arity");
+        call(&b, &[s("timerCallbackError"), s("timeout"), n(1.0)]).expect_err("type");
+        let big = "x".repeat(MAX_CONSOLE_MESSAGE_BYTES + 1);
+        call(&b, &[s("timerCallbackError"), s("interval"), s(&big)]).expect("ok");
+        for _ in 0..(MAX_BRIDGE_DIAGNOSTICS + 3) {
+            call(&b, &[s("timerCallbackError"), s("microtask"), s("e")]).expect("ok");
+        }
+        call(&b, &[s("timerStringHandlerIgnored")]).expect("ok");
+        let d = b.take_diagnostics().expect("diag");
+        assert_eq!(d.timer_errors.len(), MAX_BRIDGE_DIAGNOSTICS);
+        assert_eq!(d.timer_errors[0].source, TimerCallbackSource::Interval);
+        assert_eq!(d.timer_errors[0].message.len(), MAX_CONSOLE_MESSAGE_BYTES);
+        assert!(d.timer_errors[0].truncated);
+        assert_eq!(d.dropped, 4);
+        assert_eq!(d.timer_string_handlers_ignored, 1);
     }
 }
