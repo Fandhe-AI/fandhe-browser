@@ -261,6 +261,17 @@ fn timer_cases(engine: &str) {
     );
     assert!(!out.html().contains("<p>late</p>"), "{}", out.html());
 
+    eprintln!("case: JS-6 op budget exhausted inside a microtask aborts with ResourceLimit");
+    let out = run_page(
+        engine,
+        &page("queueMicrotask(function(){for(var k=0;k<20;k++){try{document.body}catch(e){}}});"),
+        &tight,
+    );
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::ResourceLimit)
+    );
+
     eprintln!("case: JS-7 untrusted delays are normalized");
     let out = run_page(
         engine,

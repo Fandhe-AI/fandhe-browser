@@ -1343,6 +1343,11 @@ fn fire_lifecycle(
 
 /// ブリッジのリソース上限（リスナー・保留中タイマー数）の超過を [`AbortKind`] に写す（`JS-6`）。
 fn tripped_abort_kind(ctx: &RunContext<'_>) -> crate::Result<Option<AbortKind>> {
+    // shim は op のエラー（操作予算切れ）を握りつぶし評価が完了扱いになるため、microtask
+    // checkpoint などの後でもここで検出して打ち切る（`JS-6`・fail-closed）。
+    if ctx.bridge.op_limit_tripped().map_err(bridge_error)? {
+        return Ok(Some(AbortKind::ResourceLimit));
+    }
     Ok(
         match ctx.bridge.resource_limit_tripped().map_err(bridge_error)? {
             None => None,
@@ -1384,6 +1389,11 @@ fn run_event_loop(
         loop {
             if let Some(kind) = tripped_abort_kind(ctx)? {
                 *abort = Some(PageAbort { kind, index: None });
+                break;
+            }
+            // 待機すべきタイマーが無ければ正常終了する（残り時間 0 でも abort 扱いにしない）。
+            let (_, _, pending) = ctx.bridge.event_loop_state().map_err(bridge_error)?;
+            if pending == 0 {
                 break;
             }
             // ページの残り時間が無いなら、タイマーを取り出して発火回数に数える前に打ち切る

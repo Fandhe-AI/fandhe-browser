@@ -1,5 +1,5 @@
 // js_shim/timers.js: setTimeout / setInterval / queueMicrotask の shim
-// （TASK-110・Issue #782・ビヘイビア JS-7・JS-6。SSOT: js-engine.md「ページ内 JS 実行の設計制約」）。
+// （TASK-110・MS-6・Issue #782・ビヘイビア JS-7・JS-6。SSOT: js-engine.md「ページ内 JS 実行の設計制約」）。
 //
 // 役割: ページの bundle が登録したタイマーのコールバックを保持し、タイマーの期限・順序・上限の
 // 管理は core 側（event_loop.rs / dom_bridge の timerSet・timerClear op）に任せる。ランナー
