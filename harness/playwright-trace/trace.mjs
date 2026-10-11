@@ -4,13 +4,15 @@
 // 呼び出し元は run.sh（一時サーバー起動後に実行）。段階ごとに成否を記録し、失敗した段階で
 // 止める（newPage より先へ進まない・goto しない）。メッセージは DEBUG=pw:protocol の
 // stderr 出力を横取りして取得する（playwright-core は logger オプションを公開しないため）。
-// 出力は JSONL（スキーマは README・lib.mjs）。ポートは <PORT> へ正規化して決定的にする。
+// 出力は JSONL（スキーマは README・lib.mjs）。ポートは <PORT>、一時ディレクトリ（os.tmpdir()/playwright-artifacts-XXXXXX）は
+// <ARTIFACTS_DIR> へ正規化して決定的にする。
 //
 // 使い方: node trace.mjs --endpoint http://127.0.0.1:<port> --out <path>
 //         --module-dir <playwright-core を install した dir> --playwright-version <x.y.z> [--force]
 
 import { createRequire } from "node:module";
 import { existsSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import {
   SCHEMA_VERSION,
@@ -26,6 +28,9 @@ import {
   validateEndpoint,
   validateOutPath,
 } from "./lib.mjs";
+
+// Playwright と同一プロセスなので os.tmpdir() が playwright-artifacts- の親と一致する。
+const tmpDir = os.tmpdir();
 
 let STAGE_TIMEOUT_MS = 10_000;
 
@@ -115,7 +120,7 @@ process.stderr.write = (chunk, ...rest) => {
     let rec = null;
     try {
       const parsed = parseProtocolLine(line);
-      if (parsed) rec = { kind: "cdp", dir: parsed.dir, message: normalizeValue(parsed.message, port, host) };
+      if (parsed) rec = { kind: "cdp", dir: parsed.dir, message: normalizeValue(parsed.message, port, host, tmpDir) };
     } catch (e) {
       // 解析不能行はレコード欠落になるため収集全体を失敗させる。
       fatal(`unparsable protocol line: ${e.message}`);
@@ -157,7 +162,7 @@ async function stage(name, fn) {
     return { ok: true, value: v };
   } catch (e) {
     if (/timed out after/.test(String(e.message))) timedOutStage ??= name;
-    push({ kind: "stage", name, ok: false, error: normalizeString(String(e.message), port, host) });
+    push({ kind: "stage", name, ok: false, error: normalizeString(String(e.message), port, host, tmpDir) });
     return { ok: false };
   }
 }
@@ -175,7 +180,7 @@ for (const p of ["/json/version", "/json/version/"]) {
       if (typeof body.webSocketDebuggerUrl === "string") wsUrl = body.webSocketDebuggerUrl;
     }
   } catch (e) {
-    push({ kind: "http", method: "GET", path: p, error: normalizeString(String(e.message), port, host) });
+    push({ kind: "http", method: "GET", path: p, error: normalizeString(String(e.message), port, host, tmpDir) });
   }
 }
 
