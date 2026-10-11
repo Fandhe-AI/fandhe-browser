@@ -12,16 +12,13 @@
 //! 一致検証（受入基準の根拠）: MCP の text と直接応答本文を `serde_json::Value` として比較し、
 //! 不一致は失敗にする。実測値は `docs/design/mcp-envelope-report.md`（#386）、判断は #387 が担う。
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
 
-use fandhe_browser_ai::api::router;
-use fandhe_browser_core::{AppState, NavigationResult};
-use fandhe_browser_profile::Profile;
+use fandhe_browser_core::NavigationResult;
 use serde_json::Value;
 
-use crate::host::{BenchHost, http_get};
+use crate::app_host::AppHost;
+use crate::host::http_get;
 use crate::mcp_client::McpSession;
 use crate::stats::EnvelopeRow;
 use crate::tokens::{TokenCounter, fixtures_dir};
@@ -35,45 +32,6 @@ pub const FIXTURES: [&str; 5] = [
     "mdn-docs",
 ];
 
-static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-/// 一時ディレクトリ（Drop で再帰削除）。
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        // Profile::open は root 経路上の symlink を拒否する（macOS の /var -> /private/var 等）ため、
-        // 既存の一時ディレクトリを事前に実体パスへ解決する（profile 側の検査は緩めない。PROF 境界）。
-        let tmp = std::env::temp_dir();
-        let base = std::fs::canonicalize(&tmp).unwrap_or(tmp);
-        Self(base.join(format!(
-            "fandhe-mcp-envelope-{}-{n}-{nanos}",
-            std::process::id()
-        )))
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// CI 診断用にパスを含まない ProfileError の種別ラベルを返す。
-fn profile_error_label(e: &fandhe_browser_profile::ProfileError) -> String {
-    use fandhe_browser_profile::ProfileError;
-    match e {
-        ProfileError::Io(io) => format!("io:{:?}", io.kind()),
-        ProfileError::InvalidLayout { reason, .. } => format!("invalid-layout:{reason}"),
-        ProfileError::Unsupported { .. } => "unsupported-platform".to_string(),
-        _ => "other".to_string(),
-    }
-}
-
 /// 1 fixture 分の計測結果。
 pub struct FixtureResult {
     pub row: EnvelopeRow,
@@ -83,38 +41,22 @@ pub struct FixtureResult {
     pub mcp_ms: Vec<f64>,
 }
 
-/// ホスト・AppState・mcp セッションの束。フィールドの宣言順が Drop 順（mcp → host → app → dir）。
+/// ホスト・mcp セッションの束。フィールドの宣言順が Drop 順（mcp → host）。
 pub struct Harness {
     mcp: McpSession,
-    host: BenchHost,
-    app: Arc<AppState>,
-    _dir: TempDir,
+    host: AppHost,
 }
 
 impl Harness {
     /// 一時プロファイル・ホスト・mcp（起動時に登録が 1 回発生）を立ち上げる。
     pub fn start(bin: &Path) -> Result<Self, String> {
-        let dir = TempDir::new();
-        let profile = Profile::open(&dir.0).map_err(|e| {
-            format!(
-                "failed to open temporary profile: {}",
-                profile_error_label(&e)
-            )
-        })?;
-        let app = Arc::new(AppState::with_disabled_renderer(Arc::new(profile)));
-        let host = BenchHost::start(router(Arc::clone(&app)))
-            .map_err(|_| "failed to start bench host".to_string())?;
+        let host = AppHost::start()?;
         let mcp = McpSession::start(bin, host.addr())?;
-        Ok(Self {
-            mcp,
-            host,
-            app,
-            _dir: dir,
-        })
+        Ok(Self { mcp, host })
     }
 
     fn commit(&self, url: &str, html: &str) -> Result<(), String> {
-        let nav = self.app.navigation();
+        let nav = self.host.app().navigation();
         let g = nav
             .begin_navigation()
             .map_err(|_| "begin_navigation failed".to_string())?;

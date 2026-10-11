@@ -117,6 +117,13 @@ impl McpSession {
         Ok(session)
     }
 
+    /// 子プロセス（mcp）の pid。`plugin_overhead` が RSS 採取の根に使う（TASK-95.1・`PLUG-3`）。
+    /// `mcp_envelope` 側のターゲットでは使わないため dead_code を許可する。
+    #[allow(dead_code)]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// `tools/call snapshot` を送り、(応答行全体, 経過 ms, `result.content[0].text`) を返す。
     pub fn call_snapshot(&mut self) -> Result<(String, f64, String), String> {
         let id = self.next_id;

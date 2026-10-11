@@ -17,6 +17,9 @@
 //! in-process の `dispatch`（TCP なし）系列の追加は別 Issue 候補（#385 からの申し送り）。
 
 #[cfg(unix)]
+#[path = "mcp_envelope/app_host.rs"]
+mod app_host;
+#[cfg(unix)]
 #[path = "mcp_envelope/harness.rs"]
 mod harness;
 #[cfg(unix)]

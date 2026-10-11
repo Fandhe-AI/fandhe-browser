@@ -8,6 +8,8 @@
 
 #![cfg(unix)]
 
+#[path = "app_host.rs"]
+mod app_host;
 #[path = "harness.rs"]
 mod harness;
 #[path = "host.rs"]
