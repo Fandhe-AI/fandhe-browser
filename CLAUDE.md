@@ -28,6 +28,7 @@ fandhe-browser/
 ├── lefthook.yml                   # git hooks（整形・秘密情報検査・commit-msg。clippy・test は CI に任せ pre-push は置かない）
 ├── commitlint.config.mjs          # commitlint 設定（type を 9 種に限定）
 ├── Dockerfile / compose.yaml      # 開発コンテナ（環境非依存の `make docker-ci`）
+├── docker/                        # 配布用 Dockerfile（Dockerfile.release: 既定コンテナ・musl 静的・scratch。TASK-64.1・CTR-1・CTR-4）
 ├── .markdownlint.jsonc / .yamllint / .editorconfig-checker.json  # lint-docs 設定
 ├── Cargo.toml                     #（予定）workspace 定義
 ├── deny.toml                      # cargo-deny 設定（ライセンス・advisories 検査。MPL-2.0 は未許可）
