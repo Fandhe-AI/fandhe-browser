@@ -651,17 +651,17 @@ struct Frame<'a> {
 /// 由来のみ）で重複が起きないため含めず、無名のものを [`is_foldable_listitem`] で畳むだけにする。
 const NAME_DEDUP_ROLES: [&str; 3] = ["row", "cell", "gridcell"];
 
-/// 子を持つ無名 `listitem` を出力せず子を親へ繰り上げてよいか（`AISNAP-1`・`AISNAP-10`・
+/// 子をちょうど 1 つ持つ無名 `listitem` を出力せず子を親へ繰り上げてよいか（`AISNAP-1`・`AISNAP-10`・
 /// `AISNAP-12`・TASK-23.6・Issue #828）。pop 時（子の有無が確定した時点）に判定する。
 ///
 /// 親が `folded_rows` を持たない `list` に限る。畳み行の `FoldedRow::index` は展開側の
 /// listitem / row を数えて文書順を復元する前提のため、畳み行を持つ list では畳まない。
-/// 子のない無名 listitem は残す。`ref` は visit 時に確定済みで子の scope 連鎖も変わらないので、
+/// 子が 2 つ以上（項目境界）または 0 の無名 listitem は残す。`ref` は visit 時に確定済みで子の scope 連鎖も変わらないので、
 /// 残るノードの ref は不変。
 fn is_foldable_listitem(doc: &Document, id: NodeId, node: &Node, parent: &Node) -> bool {
     node.role == "listitem"
         && node.name.is_empty()
-        && !node.children.is_empty()
+        && node.children.len() == 1
         && node.state == State::default()
         && node.data_leaf.is_none()
         && node.table.is_none()
@@ -961,13 +961,19 @@ fn build_snapshot_inner(
                 subtree_has_lossy(doc, &index, row, true, None)
             });
             let ids: Vec<NodeId> = fold_rows.iter().map(|&(_, id)| id).collect();
-            node.folded_rows = compress_row_list(doc, structure.kind, &ids)
+            let compressed_rows = compress_row_list(doc, structure.kind, &ids);
+            // 40 文字等で打ち切られた行は親 name 側に全文を残すため covered に含めない。
+            covered.extend(
+                ids.iter()
+                    .zip(compressed_rows.iter())
+                    .filter(|(_, r)| !r.truncated)
+                    .map(|(&id, _)| id),
+            );
+            node.folded_rows = compressed_rows
                 .into_iter()
                 .zip(fold_rows.iter())
                 .map(|(r, &(index, _))| FoldedRow::new(index, r.text, r.truncated))
                 .collect();
-            // 畳んだ行のテキストは `FoldedRow::text` に出る（TASK-23.6）。
-            covered.extend(ids.iter().copied());
             folded.extend(ids);
         }
         // 圧縮したコンテナは配下のヘッダ・行内操作要素の ref の scope 元で、再特定
@@ -990,6 +996,9 @@ fn build_snapshot_inner(
         }
         if let Some((structure, compressed, plans)) = compressible {
             let headers = assign_header_refs(doc, &index, &structure, elem_ref, &mut refs)?;
+            let table_complete = compressed.truncated_rows == 0
+                && compressed.rows.iter().all(|r| !r.truncated)
+                && !headers.iter().any(|h| h.name_truncated);
             truncated |= headers.iter().any(|h| h.name_truncated);
             #[cfg(test)]
             if let Some(sink) = sink.as_deref_mut() {
@@ -1040,7 +1049,10 @@ fn build_snapshot_inner(
                 compressed.truncated_rows,
             ));
             // 圧縮したコンテナのテキストはヘッダ・行・controls に出る（TASK-23.6）。
-            covered.insert(child);
+            // 打ち切り・省略があれば完全被覆ではないので親 name に残す。
+            if table_complete {
+                covered.insert(child);
+            }
             if let Some(parent) = stack.last_mut() {
                 parent.node.push_child(node);
             }
@@ -2148,6 +2160,20 @@ mod tests {
             .with_scope(scope.expect("scope"));
         let expected = alloc.allocate_signature(&sig).expect("発行は成功する");
         assert_eq!(link.r#ref, Some(expected.to_ref_string()));
+    }
+
+    /// AISNAP-1・TASK-23.6: 子を 2 つ以上持つ無名 listitem は項目境界として残す。
+    #[test]
+    fn aisnap_1_multi_child_nameless_listitem_is_kept() {
+        let s = snap(
+            "<body><ul><li><a href=\"/a\">A</a><a href=\"/b\">B</a></li><li><a href=\"/c\">C</a></li><li></li><li><span title=\"t\">k</span></li></ul></body>",
+        );
+        let nodes = all_nodes(&s.tree);
+        let li = nodes
+            .iter()
+            .find(|n| n.role == "listitem")
+            .expect("listitem は残る");
+        assert_eq!(li.children.len(), 2);
     }
 
     /// AISNAP-1・AISNAP-12・TASK-23.6: 子を持つ無名 listitem は畳まれて子が list 直下へ上がり、

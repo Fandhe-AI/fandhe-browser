@@ -38,8 +38,8 @@
 | name | rawHtmlTokens | directTokens | mcpTextTokens | mcpLineTokens | envelopeTokens | envelopePct | directBytes | directReductionPct | mcpReductionPct |
 | ---- | ------------- | ------------ | ------------- | ------------- | -------------- | ----------- | ----------- | ------------------ | --------------- |
 | example-minimal | 103 | 79 | 79 | 120 | 41 | 51.9 | 292 | 23.3 | -16.5 |
-| wikipedia-article | 56482 | 37770 | 37770 | 43875 | 6105 | 16.2 | 124971 | 33.1 | 22.3 |
-| hn-list | 10220 | 14161 | 14161 | 16483 | 2322 | 16.4 | 47412 | -38.6 | -61.3 |
+| wikipedia-article | 56482 | 37231 | 37231 | 43156 | 5925 | 15.9 | 122589 | 34.1 | 23.6 |
+| hn-list | 10220 | 12532 | 12532 | 14802 | 2270 | 18.1 | 40313 | -22.6 | -44.8 |
 | login-form | 284 | 196 | 196 | 255 | 59 | 30.1 | 668 | 31.0 | 10.2 |
 | mdn-docs | 19005 | 27767 | 27767 | 30803 | 3036 | 10.9 | 85091 | -46.1 | -62.1 |
 
@@ -47,10 +47,10 @@
 
 | metric | mean | min | max |
 | ------ | ---- | --- | --- |
-| DirectReductionPct | 0.6 | -46.1 | 33.1 |
-| McpReductionPct | -21.5 | -62.1 | 22.3 |
-| EnvelopeTokens | 2312.6 | 41.0 | 6105.0 |
-| EnvelopePct | 25.1 | 10.9 | 51.9 |
+| DirectReductionPct | 3.9 | -46.1 | 34.1 |
+| McpReductionPct | -17.9 | -62.1 | 23.6 |
+| EnvelopeTokens | 2266.2 | 41.0 | 5925.0 |
+| EnvelopePct | 25.4 | 10.9 | 51.9 |
 
 ### レイテンシ
 

@@ -173,7 +173,7 @@ fn fixtures_measured_with_concrete_values() {
     assert_eq!(s.pages, 17);
     // 実測値（小数 1 桁）。row・cell の name の重複除去と無名 listitem の折り畳み（TASK-23.6・#828）後も
     // 85% 目標（AISNAP-1）には届かない。判定は #97。
-    assert!((s.mean_reduction_pct - 28.5).abs() < 0.05, "{s:?}");
+    assert!((s.mean_reduction_pct - 28.0).abs() < 0.05, "{s:?}");
     assert!((s.min_reduction_pct - -129.2).abs() < 0.05, "{s:?}");
     assert!((s.max_reduction_pct - 95.8).abs() < 0.05, "{s:?}");
     approx(s.median_snapshot_tokens, 2205.0);
