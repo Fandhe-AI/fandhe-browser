@@ -78,6 +78,8 @@ cargo test --workspace
 
 ## ワークフロー変更時の注意
 
+- ジョブ追加・変更時は [github-actions](./github-actions.md)（runner 方針・発火条件・追加チェックリスト・計測方法）に従う
+
 - GitHub Actions のサードパーティ action はコミット SHA で固定し、新しい action を安易に追加しない（cache は `actions/cache`、toolchain は `dtolnay/rust-toolchain` のみ）
 - `permissions` は最小権限で明示する
 - 出る check-run の名前を変える変更（ジョブ・`name:` の追加 / 改名）は ruleset の required checks との同時更新が必要。reusable workflow 呼び出し（`caller / callee` 形式の名前）や matrix は required にするジョブでは使わない

@@ -25,10 +25,10 @@ make trace-playwright        # 再取得（要 node / npm / ネットワーク�
 make check-playwright-trace  # オフライン自己テスト（要 node）
 ```
 
-- playwright-core は Makefile の `PLAYWRIGHT_VERSION`（exact 固定）を `mktemp -d` へ一時導入する。
+- playwright-core は scripts/versions.sh の `PLAYWRIGHT_VERSION`（exact 固定）を `mktemp -d` へ一時導入する。
   `package.json`・lockfile・`node_modules` はコミットしない。代わりに導入後に `verify-install.mjs` が
   `node_modules/.package-lock.json` を検証し、導入物が playwright-core 単独（推移的依存なし）で、
-  版と npm 整合性ハッシュ（Makefile の `PLAYWRIGHT_INTEGRITY`）が一致しなければ失敗する。
+  版と npm 整合性ハッシュ（scripts/versions.sh の `PLAYWRIGHT_INTEGRITY`）が一致しなければ失敗する。
   版を上げるときは integrity も更新するブラウザ本体は取得しない
   （`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1`・`--ignore-scripts`）
 - 接続先は loopback の IP リテラル（`127.0.0.1` / `[::1]`）のみ許可し、`goto()` など外部アクセスは行わない

@@ -1,5 +1,6 @@
 name: CI
 
+# ジョブ追加・変更時は .claude/rules/github-actions.md に従う。
 # push/pull_request で自動起動する（TASK-55.2・Issue #59・対象ビヘイビア XOS-1・MS-1）。
 # workflow_dispatch は手動再実行・検証用に併存させる。
 #
@@ -130,7 +131,7 @@ jobs:
   # editorconfig-checker・yamllint・commitlint・lint-docs-complete の 5 ジョブ）を
   # 1 ジョブの複数ステップへ畳んだもの。ツール版は reusable の既定値と同じ
   # （markdownlint-cli 0.49.1・yamllint 1.38.0・editorconfig-checker v3.8.0・
-  # commitlint 21.2.1 / config-conventional 21.2.0）。Makefile の *_VERSION と揃える。
+  # commitlint 21.2.1 / config-conventional 21.2.0）。scripts/versions.sh の *_VERSION と揃える。
   # 各ステップは !cancelled() で独立に走らせ、1 回の実行で全指摘を得られるようにする。
   lint-docs:
     runs-on: ubuntu-latest
@@ -190,7 +191,7 @@ jobs:
   # 旧 rust-ci の fmt・deny と旧 deny-license-reject を統合した。
   # - cargo fmt --all --check: REPAIR-6 のローカルゲートと同じ
   # - cargo deny check（deny-checks: advisories bans licenses sources）: TASK-77（#64）
-  #   のライセンス検査（licensing.md）。cargo-deny の版は Makefile の CARGO_DENY_VERSION と同期
+  #   のライセンス検査（licensing.md）。cargo-deny の版は scripts/versions.sh の CARGO_DENY_VERSION と同期
   # - check-deny-license-reject（TASK-9.1・#338・REPAIR-8）: GPL/AGPL/LGPL/MPL-2.0・
   #   ライセンス未記載の canary を cargo deny が reject し続けることの negative test
   rust-lint:
@@ -598,7 +599,7 @@ jobs:
   #   [mcp-envelope-smoke]     MCP エンベロープ e2e（TASK-97.1・#385・PLUG-5。unix のみ
   #                            のため windows ジョブには含めない）
   #   [binary-size]            feature 無効時のサイズ上限（TASK-34.2・#466 / TASK-34.3・#467・
-  #                            RENDER-2。上限値・package 名は Makefile が単一真実源）。
+  #                            RENDER-2。上限値・package 名は scripts/versions.sh が単一真実源）。
   #                            対象 package が workspace に無い場合は exit 2 で fail-closed
   #                            （TASK-41.5・#174・REPAIR-5・#633）
   # windows は cache 除外（cache prune に既知問題。旧 rust-ci と同じ）。
@@ -681,21 +682,21 @@ jobs:
       - name: "[mcp-envelope-smoke] MCP エンベロープ e2e smoke"
         if: ${{ !cancelled() }}
         run: make check-mcp-envelope
-      - name: "[binary-size] Makefile から上限値・package 名を抽出"
+      - name: "[binary-size] scripts/versions.sh から上限値・package 名を抽出"
         id: config
         if: ${{ !cancelled() }}
         run: |
-          normalized="$(tr -d '\r' < Makefile)"
-          limit_re='^BINARY_SIZE_LIMIT_BYTES \?= ([0-9]{1,15})$'
-          package_re='^BINARY_SIZE_PACKAGE \?= ([A-Za-z0-9._-]{1,64})$'
+          normalized="$(tr -d '\r' < scripts/versions.sh)"
+          limit_re='^: "\$\{BINARY_SIZE_LIMIT_BYTES:=([0-9]{1,15})\}"$'
+          package_re='^: "\$\{BINARY_SIZE_PACKAGE:=([A-Za-z0-9._-]{1,64})\}"$'
           limit_matches="$(printf '%s\n' "$normalized" | grep -cE "$limit_re" || true)"
           package_matches="$(printf '%s\n' "$normalized" | grep -cE "$package_re" || true)"
           if [ "$limit_matches" -ne 1 ]; then
-            echo "::error::BINARY_SIZE_LIMIT_BYTES not found exactly once in Makefile (found: $limit_matches)" >&2
+            echo "::error::BINARY_SIZE_LIMIT_BYTES not in versions.sh exactly once (found: $limit_matches)" >&2
             exit 1
           fi
           if [ "$package_matches" -ne 1 ]; then
-            echo "::error::BINARY_SIZE_PACKAGE not found exactly once in Makefile (found: $package_matches)" >&2
+            echo "::error::BINARY_SIZE_PACKAGE not in versions.sh exactly once (found: $package_matches)" >&2
             exit 1
           fi
           limit="$(printf '%s\n' "$normalized" | sed -nE "s/$limit_re/\\1/p")"
@@ -821,21 +822,21 @@ jobs:
       - name: "[mcp-envelope-smoke] MCP エンベロープ e2e smoke"
         if: ${{ !cancelled() }}
         run: make check-mcp-envelope
-      - name: "[binary-size] Makefile から上限値・package 名を抽出"
+      - name: "[binary-size] scripts/versions.sh から上限値・package 名を抽出"
         id: config
         if: ${{ !cancelled() }}
         run: |
-          normalized="$(tr -d '\r' < Makefile)"
-          limit_re='^BINARY_SIZE_LIMIT_BYTES \?= ([0-9]{1,15})$'
-          package_re='^BINARY_SIZE_PACKAGE \?= ([A-Za-z0-9._-]{1,64})$'
+          normalized="$(tr -d '\r' < scripts/versions.sh)"
+          limit_re='^: "\$\{BINARY_SIZE_LIMIT_BYTES:=([0-9]{1,15})\}"$'
+          package_re='^: "\$\{BINARY_SIZE_PACKAGE:=([A-Za-z0-9._-]{1,64})\}"$'
           limit_matches="$(printf '%s\n' "$normalized" | grep -cE "$limit_re" || true)"
           package_matches="$(printf '%s\n' "$normalized" | grep -cE "$package_re" || true)"
           if [ "$limit_matches" -ne 1 ]; then
-            echo "::error::BINARY_SIZE_LIMIT_BYTES not found exactly once in Makefile (found: $limit_matches)" >&2
+            echo "::error::BINARY_SIZE_LIMIT_BYTES not in versions.sh exactly once (found: $limit_matches)" >&2
             exit 1
           fi
           if [ "$package_matches" -ne 1 ]; then
-            echo "::error::BINARY_SIZE_PACKAGE not found exactly once in Makefile (found: $package_matches)" >&2
+            echo "::error::BINARY_SIZE_PACKAGE not in versions.sh exactly once (found: $package_matches)" >&2
             exit 1
           fi
           limit="$(printf '%s\n' "$normalized" | sed -nE "s/$limit_re/\\1/p")"
@@ -946,21 +947,21 @@ jobs:
       - name: "[puppeteer-connect-selftest] puppeteer-connect 自己テスト・契約テスト"
         if: ${{ !cancelled() }}
         run: bash harness/puppeteer-connect/self-test.sh
-      - name: "[binary-size] Makefile から上限値・package 名を抽出"
+      - name: "[binary-size] scripts/versions.sh から上限値・package 名を抽出"
         id: config
         if: ${{ !cancelled() }}
         run: |
-          normalized="$(tr -d '\r' < Makefile)"
-          limit_re='^BINARY_SIZE_LIMIT_BYTES \?= ([0-9]{1,15})$'
-          package_re='^BINARY_SIZE_PACKAGE \?= ([A-Za-z0-9._-]{1,64})$'
+          normalized="$(tr -d '\r' < scripts/versions.sh)"
+          limit_re='^: "\$\{BINARY_SIZE_LIMIT_BYTES:=([0-9]{1,15})\}"$'
+          package_re='^: "\$\{BINARY_SIZE_PACKAGE:=([A-Za-z0-9._-]{1,64})\}"$'
           limit_matches="$(printf '%s\n' "$normalized" | grep -cE "$limit_re" || true)"
           package_matches="$(printf '%s\n' "$normalized" | grep -cE "$package_re" || true)"
           if [ "$limit_matches" -ne 1 ]; then
-            echo "::error::BINARY_SIZE_LIMIT_BYTES not found exactly once in Makefile (found: $limit_matches)" >&2
+            echo "::error::BINARY_SIZE_LIMIT_BYTES not in versions.sh exactly once (found: $limit_matches)" >&2
             exit 1
           fi
           if [ "$package_matches" -ne 1 ]; then
-            echo "::error::BINARY_SIZE_PACKAGE not found exactly once in Makefile (found: $package_matches)" >&2
+            echo "::error::BINARY_SIZE_PACKAGE not in versions.sh exactly once (found: $package_matches)" >&2
             exit 1
           fi
           limit="$(printf '%s\n' "$normalized" | sed -nE "s/$limit_re/\\1/p")"

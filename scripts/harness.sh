@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# 実測ハーネス・ベンチ・計測系ターゲットの実体。Makefile の各ターゲットはここへ 1 行で委譲する。
+# 使い方: scripts/harness.sh <name>
+#   check-compat-practical   実測ハーネス（22 タスク定義・アクセス確認・run_core）の自己テスト（MEAS-4。要 jq・node）
+#   check-compat-regression  対象サイト群の動作率回帰チェック（COMPAT-1・COMPAT-4。要 jq）
+#   bench-record             competitor_lightpanda ベンチを実行し結果を時系列で記録（要 jq）
+#   check-bench-record       record.sh の自己テスト（要 jq）
+#   check-ci-changes         CI の docs-only 判定スクリプトの自己テスト
+#   check-binary-size        既定 feature のリリースバイナリサイズ検査（RENDER-2。要 jq）
+#   measure-mcp-envelope     方式 B 本体と MCP エンベロープの測定（PLUG-5。unix のみ）
+#   check-mcp-envelope       上記ハーネスの e2e smoke（unix のみ。0 件実行は NG）
+#   measure-js-binary-size   JS エンジン構成別バイナリサイズ計測（JS-3・PERF-1。要 jq）
+#   measure-cssom-profile-cost  CSSOM プロファイル読み込みのコスト計測（PLUG-8。要 jq）
+#   trace-playwright | check-playwright-trace | check-puppeteer-connect   CDP トレース収集・自己テスト（要 node）
+#   test-harness             harness/render-screenshot のユニット・結合テスト（要 python3）
+#
+# 上書き可能な環境変数（`make <target> VAR=value` も可）: BINARY_SIZE_PACKAGE・BINARY_SIZE_LIMIT_BYTES・
+# JS_BINARY_SIZE_STRIP（非空で --strip）・CSSOM_PROFILE_COST_ARGS・MCP_ENVELOPE_ARGS・
+# MCP_ENVELOPE_TARGET_DIR・PLAYWRIGHT_VERSION・PLAYWRIGHT_INTEGRITY（既定値は scripts/versions.sh）。
+# 各ハーネスの詳細は harness/*/README.md・benches/*/README.md を参照。
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib.sh
+source "${DIR}/lib.sh"
+
+[ "$#" -eq 1 ] || { echo "usage: $(basename "$0") <name>" >&2; exit 2; }
+name="$1"
+
+# 空白区切りの追加引数（意図的に単語分割する）
+: "${MCP_ENVELOPE_ARGS:=}"
+: "${JS_BINARY_SIZE_STRIP:=}"
+: "${CSSOM_PROFILE_COST_ARGS:=--out benches/cssom_profile_cost/results/cssom-profile-cost.json}"
+
+# 相対 CARGO_TARGET_DIR でも resolve_bin（絶対パス必須）を通すため絶対化する。
+mcp_target_dir() {
+  local t="${MCP_ENVELOPE_TARGET_DIR:-${CARGO_TARGET_DIR:-${ROOT_DIR}/target}}"
+  case "${t}" in
+    /*) printf '%s\n' "${t}" ;;
+    *) printf '%s\n' "${ROOT_DIR}/${t}" ;;
+  esac
+}
+
+unix_only() {
+  case "$(uname -s)" in
+    Linux|Darwin) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+case "${name}" in
+  check-compat-practical)
+    require_cmd jq "required by ${name}"
+    require_cmd node "Node.js 22 or later is required by ${name}"
+    bash harness/compat-practical/self-test.sh
+    bash harness/compat-practical/access_check.sh --validate-only
+    bash harness/compat-practical/run_core.sh --validate-only
+    bash harness/compat-practical/make_matrix.sh --validate-only
+    ;;
+  check-compat-regression)
+    # self-test（合成データで「閾値未満で fail する」ことをログに残す）を先に実行してから実マトリクスを判定する。
+    # 実マトリクスは TASK-71.3（#312）が生成予定でまだ無いため当面 --allow-missing を渡す
+    # （#312 で導入され次第このフラグを削除し fail-closed に戻す）。
+    require_cmd jq "required by ${name}"
+    bash harness/compat-regression/self-test.sh
+    bash harness/compat-regression/check-matrix.sh \
+      --matrix harness/compat-practical/results/matrix.json \
+      --threshold 70 \
+      --categories static,spa,form \
+      --all-categories \
+      --allow-missing
+    ;;
+  bench-record)
+    # LIGHTPANDA_BIN・FANDHE_BROWSER_BIN・CHROMIUM_IDLE_RSS_KB を事前に export しておくと実測値を得る
+    # （未設定の対象は skipped になる。benches/competitor_lightpanda/README.md「現状の限界」）。
+    require_cmd jq "required by ${name}"
+    bash benches/competitor_lightpanda/record.sh \
+      --history benches/competitor_lightpanda/results/history.jsonl \
+      --source local
+    ;;
+  check-bench-record)
+    require_cmd jq "required by ${name}"
+    bash benches/competitor_lightpanda/self-test.sh
+    ;;
+  check-ci-changes)
+    bash scripts/ci-changes.sh --self-test
+    ;;
+  check-binary-size)
+    # `make ci` には含めない（cargo build --release のコストが大きいため）。CI では ci.yml の
+    # harness-* ジョブ [binary-size] ステップが 3 OS で担う。
+    require_cmd jq "required by ${name}"
+    bash harness/binary-size/self-test.sh
+    bash harness/binary-size/check-binary-size.sh \
+      --package "${BINARY_SIZE_PACKAGE}" \
+      --limit "${BINARY_SIZE_LIMIT_BYTES}"
+    ;;
+  measure-mcp-envelope)
+    unix_only || { echo "error: ${name} supports unix only" >&2; exit 1; }
+    # cargo bench は他 package の bin をビルドしないため mcp バイナリを先に release ビルドして渡す。
+    cargo build --release -p fandhe-browser-mcp
+    # shellcheck disable=SC2086 # 引数文字列は意図的に単語分割する
+    FANDHE_BROWSER_MCP_BIN="$(mcp_target_dir)/release/fandhe-browser-mcp" \
+      cargo bench -p fandhe-browser-ai --bench mcp_envelope -- ${MCP_ENVELOPE_ARGS}
+    ;;
+  check-mcp-envelope)
+    unix_only || skip "${name} supports unix only (Profile is unix-only)"
+    cargo build -p fandhe-browser-mcp
+    out="$(mktemp)"
+    trap 'rm -f "${out}"' EXIT
+    FANDHE_BROWSER_MCP_BIN="$(mcp_target_dir)/debug/fandhe-browser-mcp" \
+      cargo test -p fandhe-browser-ai --test mcp_envelope_e2e -- --ignored 2>&1 | tee "${out}"
+    if ! grep -q "test result: ok. 1 passed" "${out}"; then
+      echo "error: mcp_envelope_e2e did not pass exactly 1 test" >&2
+      exit 1
+    fi
+    ;;
+  measure-js-binary-size)
+    # 計測のみでゲートではない（閾値判定は #470）。V8 を含むリリースビルドを 3 回行うため
+    # `make ci` には含めない。JS_BINARY_SIZE_STRIP が非空なら strip=symbols で計測する。
+    require_cmd jq "required by ${name}"
+    bash harness/binary-size/measure-js-engine-configs-self-test.sh
+    strip_arg=()
+    [ -z "${JS_BINARY_SIZE_STRIP}" ] || strip_arg=(--strip)
+    bash harness/binary-size/measure-js-engine-configs.sh \
+      --package "${BINARY_SIZE_PACKAGE}" \
+      ${strip_arg[@]+"${strip_arg[@]}"}
+    ;;
+  measure-cssom-profile-cost)
+    # release ビルドを伴う一度きりの記録で RSS がランナー差で揺れるため `make ci` には含めない。
+    require_cmd jq "required by ${name}"
+    bash benches/cssom_profile_cost/self-test.sh
+    # shellcheck disable=SC2086 # 引数文字列は意図的に単語分割する
+    bash benches/cssom_profile_cost.sh ${CSSOM_PROFILE_COST_ARGS}
+    ;;
+  trace-playwright)
+    bash harness/playwright-trace/run.sh "${PLAYWRIGHT_VERSION}" "${PLAYWRIGHT_INTEGRITY}" \
+      harness/playwright-trace/results/newpage-trace.jsonl --force
+    ;;
+  check-playwright-trace)
+    bash harness/playwright-trace/self-test.sh
+    ;;
+  check-puppeteer-connect)
+    bash harness/puppeteer-connect/self-test.sh
+    ;;
+  test-harness)
+    # harness/render-screenshot は Rust workspace に属さない Python 標準ライブラリのみのスクリプト
+    # （TASK-37.1・RENDER-5）。Cargo.toml の有無に関係なく実行できる。
+    require_cmd python3 "see https://www.python.org/"
+    python3 -B -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
+    ;;
+  *)
+    echo "error: unknown harness: ${name}" >&2
+    exit 2
+    ;;
+esac

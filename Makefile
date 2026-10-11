@@ -1,686 +1,172 @@
 # fandhe-browser の開発タスクランナー。
 #
+# Make は scripts/*.sh（と 1 行で済む docker compose 呼び出し）を呼ぶだけの薄い入口であり、
+# 処理の定義（条件分岐・ツール導入・複数行シェル）は scripts/ 側にのみ置く。各レシピは 1 行の
+# 呼び出しに限定し、ここでチェック内容を二重定義しない。Make を使わない場合の同等コマンドは
+# scripts/help.sh を参照。変更時は .claude/rules/makefile.md に従う。
+#
 # `make setup` 一発で開発環境（サブモジュール・rustup・lefthook）を構築し、
 # `make ci` でローカル検証（.claude/rules/ci.md のローカルゲート）を一括実行する。
-# 実装は未着手（`crates/` 配下に実クレート未追加）のため、cargo 系ターゲットは
-# HAS_CARGO / HAS_MEMBERS 判定でスキップし、workspace 作成後に自動で有効化される
-# （冪等セルフヒール。deny も deny.toml + Cargo.toml + メンバー crate が揃った
-# 時点で有効化）。
+# 実装が未整備の段階（Cargo.toml・member crate・deny.toml が無い等）では cargo 系ターゲットは
+# scripts/cargo-gate.sh が skip し、揃った時点で自動的に有効化される（冪等セルフヒール）。
 # Docker で環境非依存に開発・検証する場合は docker-* ターゲットを使う（compose.yaml 参照）。
+# ツール版・上限値の正本は scripts/versions.sh（環境変数または `make <target> VAR=value` で上書き可）。
+#
+# GNU Make 3.81（macOS 標準）で動作する。3.82+ 専用機能（.ONESHELL・.RECIPEPREFIX 等）は使わない。
+#
+# 使い方: `make help`（既定ターゲット）でターゲット一覧を表示する。
+# 一覧は下記の `## ` コメントから生成されるため、`## ` の無いターゲットは表示されない。
+# ターゲットを追加・改名・削除したら scripts/help.sh も同じ変更で更新すること。
+# 中身の無いターゲット（`@true` 等）は呼び出し元が終了コードを信用してしまうため置かない。
 # Fandhe-AI/rust-ai-library の Makefile と同一方針。
 
 .DEFAULT_GOAL := help
-SHELL := /bin/bash
 
-# Cargo.toml の有無（無ければ cargo 系をスキップ。workspace 作成後に有効化）
-HAS_CARGO := $(wildcard Cargo.toml)
-HAS_DENY := $(wildcard deny.toml)
-# workspace のメンバー crate（`crates/*/Cargo.toml`）の有無。member crate が
-# 1 つも無い仮想 workspace（`members = []`）に対しては `cargo fmt --all --check`・
-# `cargo clippy --workspace`・`cargo test --workspace`・`cargo tree --workspace`・
-# `cargo deny check ...` のいずれも「対象パッケージが無い」エラーで落ちる
-# （cargo の仕様。実機検証済み。フォーマット・lint・テストの対象コードが
-# 実在しないため妥当な失敗であり、これらのターゲットは HAS_MEMBERS でスキップする）。
-# 一方 Cargo.toml 自体の構文・workspace 定義としての妥当性は member の有無に
-# 依存せず常に検証可能なため、`check-workspace-manifest`（下記）は HAS_CARGO のみで
-# 判定し、TASK-1.1 完了直後〜TASK-1.2 以降で最初の crate が追加されるまでの
-# 中間状態でも Cargo.toml の妥当性検証をスキップしない。
-HAS_MEMBERS := $(wildcard crates/*/Cargo.toml)
+.PHONY: help setup rustup submodule hooks \
+	lint-md lint-yaml lint-editorconfig lint-commits lint-docs \
+	check-workspace-manifest fmt fmt-check lint test test-harness lint-rendering test-rendering \
+	check-render-isolation check-js-engine-isolation check-publish-private deny check-deny-license-reject ci \
+	check-compat-practical check-compat-regression bench-record check-ci-changes check-bench-record \
+	check-binary-size measure-mcp-envelope check-mcp-envelope measure-js-binary-size measure-cssom-profile-cost \
+	docker-build docker-shell docker-ci trace-playwright check-playwright-trace check-puppeteer-connect
 
-# lint ツールの固定バージョン。CI（Fandhe-AI/actions の lint-docs reusable workflow）の
-# 既定値に合わせる（CI 側が正。乖離したらこちらを追従させる）。
-# EC_NPM_VERSION のみ npm ラッパーパッケージの版（CI は Go バイナリ release タグ v3.8.0 を
-# 直接取得するため版番号体系が異なる。ローカル再現用の近似として npm 最新安定を固定する）。
-MARKDOWNLINT_VERSION := 0.49.1
-YAMLLINT_VERSION := 1.38.0
-EC_NPM_VERSION := 6.1.1
-COMMITLINT_VERSION := 21.2.1
-COMMITLINT_CONFIG_VERSION := 21.2.0
-
-# 導入系ツールの固定バージョン（`=x.y.z` 完全固定方針に合わせ exact 固定。
-# CARGO_DENY_VERSION は Dockerfile の先行導入と値を同期させる）。
-LEFTHOOK_VERSION := 2.1.10
-CARGO_DENY_VERSION := 0.20.2
-
-# check-deny-license-reject（TASK-9.1・REPAIR-8）が生成する canary crate の
-# ライセンス識別子（SPDX。空白を含まないもののみ）。GPL/AGPL/LGPL の代表と、
-# Servo を fandhe-browser-render に隔離する方針（RENDER-1・licensing.md）を
-# 裏付けるため MPL-2.0 も加える。陽性対照（MIT OR Apache-2.0）は空白を含むため
-# ここには入れず、レシピ内に直書きする。
-DENY_LICENSE_REJECT_CASES := GPL-3.0-only AGPL-3.0-only LGPL-2.1-only MPL-2.0
-
-# check-binary-size（TASK-34.2・RENDER-2。harness/binary-size/README.md 参照）
-# の対象 package と上限バイト数。`?=` のため環境変数や `make` 引数で上書き
-# できる（#467 が OS ごとに調整する余地を残す）。対象 package は cli crate
-# （TASK-41.5・Issue #174 で追加済み）で、workspace に無い場合は
-# check-binary-size.sh が exit 2 で失敗する（fail-closed・#633）。
-# 上限値の根拠（CORE-2 / RENDER-2 の「Chromium 比 80% 以上
-# 削減」・Chromium 実測 457.4MB（PoC-2）の 20%・release プロファイル未整備
-# による保守側の見積り等）は harness/binary-size/README.md「上限値と根拠」を
-# 参照。
-BINARY_SIZE_PACKAGE ?= fandhe-browser-cli
-BINARY_SIZE_LIMIT_BYTES ?= 91480000
-
-# trace-playwright（TASK-43.1・CDP-2。harness/playwright-trace/README.md 参照）が
-# npm から一時導入する playwright-core の版（exact 固定。package.json・lockfile は置かない）。
-# 版を上げるときは PLAYWRIGHT_INTEGRITY も更新する（`npm view playwright-core@<版> dist.integrity`）。
-# run.sh が導入結果を検証し、playwright-core 単独・版・integrity が一致しなければ失敗する。
-PLAYWRIGHT_VERSION := 1.63.0
-PLAYWRIGHT_INTEGRITY := sha512-rYCsBF/M5HjUch52bbtVONEFjv6Xu8sm8h72dNlR5bzIE1fvC/bxgspzkjSfU+MweEMmPM8KJebG6nnyxo5mCg==
-
-.PHONY: help
-help: ## ターゲット一覧を表示する
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
+help: ## ターゲット一覧を表示する（Make 非依存の一覧: scripts/help.sh）
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(firstword $(MAKEFILE_LIST)) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2}'
 
 # --------------------------------------------------
 # 環境構築
 # --------------------------------------------------
 
-# 依存ターゲット並記だと -j 実行時に順序が保証されず、cargo フォールバックを持つ hooks が
-# rustup より先に走りうるため、再帰 make で「submodule → rustup → hooks」の順を明示する
-# （rust-ai-library と同一方針）。
-.PHONY: setup
 setup: ## 開発環境を一括構築する（サブモジュール → rustup → lefthook の順を保証）
-	$(MAKE) submodule
-	$(MAKE) rustup
-	$(MAKE) hooks
-	@echo "setup 完了"
+	@scripts/setup.sh
 
-# rustup は前提条件として確認のみ行い、自動導入はしない。取得したインストーラを検証なしに
-# 実行する経路（curl | sh）を作らないため（security.md・サプライチェーン対策）。未導入時は
-# 公式の導入手順を案内して停止する。toolchain は rust-toolchain.toml が単一真実源。
-.PHONY: rustup
 rustup: ## rustup（cargo）の導入を確認する（未導入なら公式手順を案内して停止）
-	@if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$$HOME/.cargo/bin/rustup" ]; then \
-		echo "error: rustup が見つかりません。公式手順（https://rustup.rs/）で導入してから再実行してください" >&2; \
-		exit 1; \
-	fi
+	@scripts/rustup-check.sh
 
-# docs/spec（fandhe-browser-spec）は private リポジトリのため、アクセス権のない環境では
-# 取得に失敗する。実装コードのビルド・テストは docs/spec 抜きでも成立させる方針
-# （CLAUDE.md）のため、失敗しても setup 全体は止めない。
-.PHONY: submodule
 submodule: ## docs/spec サブモジュールを初期化・更新する（private・アクセス権が無ければ警告のみ）
-	@git submodule update --init || \
-		echo "警告: docs/spec（private）の取得に失敗しました。アクセス権のない環境では想定内です（ビルド・テストは spec 抜きで成立します）"
+	@scripts/submodule.sh
 
-# lefthook（Go 製。crates.io には存在しないため cargo フォールバックは置かない）は
-# brew（バージョン固定不可だが常用導線）を優先し、無ければ npm 配布版を exact 固定の
-# npx ワンショットで実行する（lefthook が生成する hook スクリプトは PATH → npx の順で
-# 本体を解決するため、npx 経由の導入でもコミット時にフックが機能する）。
-.PHONY: hooks
 hooks: ## lefthook の git hooks を導入する（未導入なら lefthook 本体も導入）
-	@if command -v lefthook >/dev/null 2>&1; then \
-		lefthook install; \
-	elif command -v brew >/dev/null 2>&1; then \
-		echo "lefthook を導入します"; \
-		brew install lefthook && lefthook install; \
-	elif command -v npx >/dev/null 2>&1; then \
-		echo "lefthook（npx 固定版）で hooks を導入します"; \
-		npx --yes lefthook@$(LEFTHOOK_VERSION) install; \
-	else \
-		echo "brew / npx が見つかりません。https://lefthook.dev/installation/ を参照してください" >&2; \
-		exit 1; \
-	fi
+	@scripts/install-hooks.sh
 
 # --------------------------------------------------
 # ドキュメント／設定ファイル系 lint（CI の lint-docs ジョブと同等の内容）
 # --------------------------------------------------
 
-.PHONY: lint-md
 lint-md: ## markdownlint（.markdownlint.jsonc / .markdownlintignore 参照）
-	npx --yes markdownlint-cli@$(MARKDOWNLINT_VERSION) --ignore-path .markdownlintignore "**/*.md"
+	@scripts/lint-docs.sh md
 
-# yamllint は Python 製のため npx で賄えない。導入済みの実体（brew / pip）を優先し、
-# uvx があれば固定版のワンショット実行で代替する。いずれも無ければ fail-closed で
-# 導入方法を案内して失敗する（silent skip は CI との false-green 乖離になるため行わない）。
-.PHONY: lint-yaml
 lint-yaml: ## yamllint（.yamllint 参照）
-	@if command -v yamllint >/dev/null 2>&1; then \
-		yamllint .; \
-	elif command -v uvx >/dev/null 2>&1; then \
-		uvx yamllint==$(YAMLLINT_VERSION) .; \
-	else \
-		echo "yamllint 未導入: brew install yamllint / pip install yamllint==$(YAMLLINT_VERSION) で導入してください" >&2; \
-		exit 1; \
-	fi
+	@scripts/lint-docs.sh yaml
 
-.PHONY: lint-editorconfig
 lint-editorconfig: ## editorconfig-checker（.editorconfig + .editorconfig-checker.json 参照）
-	npx --yes editorconfig-checker@$(EC_NPM_VERSION)
+	@scripts/lint-docs.sh editorconfig
 
-# main からの分岐点以降のコミットを CI（lint-docs の commitlint ジョブ）と同じ
-# extends 構成で検証する。origin/main が未取得の環境では範囲を決められないためスキップする。
-# `git rev-parse --verify --quiet refs/remotes/origin/main` は「参照が存在しない」場合に
-# 終了コード 1 を返す（`--quiet` は該当時の "not a valid ref" 系メッセージを抑制する）。
-# これだけを skip 条件にし、終了コードが 1 以外の失敗（`fatal: detected dubious
-# ownership` 等。git がリポジトリを開く時点で発生し、`--quiet` の有無や対象 ref の
-# 存在有無に関係なく典型的には終了コード 128 になる）は「参照が存在しない」とは別扱いにし、
-# エラーメッセージを表示して非 0 終了する（fail-closed。Bugbot 指摘の是正: 以前は
-# `git rev-parse --verify origin/main` の失敗全般（終了コードを問わない）を
-# 「origin/main 未取得」とみなして stderr を捨てていたため、dubious ownership 等の
-# 実エラーも無音 skip になっていた。単に非 0 かどうかだけで判定すると dubious
-# ownership も終了コード 1 以外の非 0 になるだけで区別できないため、終了コードの値まで見る）。
-.PHONY: lint-commits
 lint-commits: ## commitlint（origin/main からの分岐点以降のコミットを検証）
-	@out=$$(git rev-parse --verify --quiet refs/remotes/origin/main 2>&1 >/dev/null); st=$$?; \
-	if [ "$$st" -eq 1 ]; then \
-		echo "skip: origin/main が未取得のため commitlint をスキップ"; \
-		exit 0; \
-	elif [ "$$st" -ne 0 ]; then \
-		printf '%s\n' "$$out" >&2; \
-		echo "NG: origin/main の参照確認に失敗しました（git rev-parse exit=$$st ）" >&2; \
-		exit 1; \
-	fi; \
-	base=$$(git merge-base origin/main HEAD) || { \
-		echo "NG: git merge-base の実行に失敗しました" >&2; \
-		exit 1; \
-	}; \
-	npx --yes -p @commitlint/cli@$(COMMITLINT_VERSION) -p @commitlint/config-conventional@$(COMMITLINT_CONFIG_VERSION) \
-		commitlint --extends @commitlint/config-conventional --from "$$base" --to HEAD
+	@scripts/lint-docs.sh commits
 
-.PHONY: lint-docs
 lint-docs: lint-md lint-yaml lint-editorconfig lint-commits ## ドキュメント／設定ファイル系 lint を一括実行する
 
 # --------------------------------------------------
-# 品質チェック（Rust。Cargo.toml 追加後に有効化）
+# 品質チェック（Rust。Cargo.toml・member crate 追加後に有効化）
 # --------------------------------------------------
 
-# workspace 仮想 manifest（Cargo.toml）自体の構文・定義としての妥当性を検証する。
-# `cargo verify-project` は member crate が 0 件の仮想 workspace でも成功する
-# （fmt/clippy/test 等の「対象パッケージが無い」失敗とは異なる。実機検証済み）ため、
-# HAS_MEMBERS を条件にせず HAS_CARGO のみで常時実行する。TASK-1.1（root Cargo.toml
-# 追加）のように member crate がまだ 1 つも無い段階でも、追加した Cargo.toml が
-# cargo にとって解釈可能な manifest であることをこのターゲットが保証する。
-.PHONY: check-workspace-manifest
 check-workspace-manifest: ## cargo verify-project で workspace manifest の妥当性を検証する
-ifneq ($(HAS_CARGO),)
-	@out=$$(cargo verify-project 2>&1) || { \
-		echo "$$out" >&2; \
-		echo "NG: Cargo.toml が cargo にとって不正な manifest です" >&2; \
-		exit 1; \
-	}; \
-	if ! printf '%s\n' "$$out" | grep -q '"success"'; then \
-		echo "$$out" >&2; \
-		echo "NG: cargo verify-project が success を返しませんでした" >&2; \
-		exit 1; \
-	fi
-else
-	@echo "skip: Cargo.toml 未追加のため check-workspace-manifest をスキップ"
-endif
+	@scripts/cargo-gate.sh check-workspace-manifest
 
-.PHONY: fmt
 fmt: ## cargo fmt --all で整形する
-ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
-	cargo fmt --all
-else
-	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため fmt をスキップ"
-endif
+	@scripts/cargo-gate.sh fmt
 
-.PHONY: fmt-check
 fmt-check: ## cargo fmt --check（整形差分の検出）
-ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
-	cargo fmt --all --check
-else
-	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため fmt-check をスキップ"
-endif
+	@scripts/cargo-gate.sh fmt-check
 
-# 既定 feature のみで検証する（RENDER-1・licensing.md）。Servo（`rendering` feature）は
-# 既定ビルドの依存グラフへ混入させない方針のため、`--all-features` は付けない。
-# `rendering` 込みの検証は lint-rendering / test-rendering が担う（ci.md「既定ビルドと
-# --features rendering の両方で検証」）。
-.PHONY: lint
 lint: ## cargo clippy -D warnings（既定 feature。lint ゲート）
-ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
-	cargo clippy --workspace --all-targets -- -D warnings
-else
-	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため lint をスキップ"
-endif
+	@scripts/cargo-gate.sh lint
 
-.PHONY: test
 test: ## cargo test（既定 feature。workspace 全体）
-ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
-	cargo test --workspace
-else
-	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test をスキップ"
-endif
+	@scripts/cargo-gate.sh test
 
-# harness/render-screenshot（TASK-37.1・RENDER-5）は Rust workspace に属さない
-# Python 標準ライブラリのみのスクリプトのため、Cargo.toml の有無に関係なく実行できる。
-# `make ci` への組み込みは行わない（スコープ外。PR 本文に後続候補として記載）。
-.PHONY: test-harness
 test-harness: ## harness/render-screenshot のユニットテスト・結合テストを実行する（Python 標準ライブラリのみ）
-	@if ! command -v python3 >/dev/null 2>&1; then \
-		echo "error: python3 が見つかりません。https://www.python.org/ を参照して導入してください" >&2; \
-		exit 1; \
-	fi
-	python3 -B -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v
+	@scripts/harness.sh test-harness
 
-# `rendering` feature（Servo。RENDER-1）は fandhe-browser-render crate 追加まで
-# workspace に存在しない。`cargo metadata` の feature 一覧に無い間は誤ってビルド
-# エラーとして落とさず skip する（cargo 未導入 / Cargo.toml 未追加の HAS_CARGO 判定と
-# 同じ「未整備段階は skip」方針）。ただし `cargo metadata` 自体の失敗（Cargo.toml の
-# 構文エラー・ロックファイル不整合等）は「feature 未定義」と区別し、標準エラーを
-# 表示して fail-closed にする（以前は 2>/dev/null で標準エラーを常に捨てていたため、
-# cargo metadata 自体の失敗も「feature 未定義」扱いで無音 skip になっていた）。
-.PHONY: lint-rendering
 lint-rendering: ## cargo clippy -D warnings（--features rendering。Servo 込みの検証）
-ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
-	@meta=$$(cargo metadata --no-deps --format-version 1 2>&1) || { \
-		echo "$$meta" >&2; \
-		echo "NG: cargo metadata の実行に失敗しました" >&2; \
-		exit 1; \
-	}; \
-	if printf '%s\n' "$$meta" | grep -q '"rendering":'; then \
-		cargo clippy --workspace --all-targets --features rendering -- -D warnings; \
-	else \
-		echo "skip: rendering feature が未定義のため lint-rendering をスキップ"; \
-	fi
-else
-	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため lint-rendering をスキップ"
-endif
+	@scripts/cargo-gate.sh lint-rendering
 
-.PHONY: test-rendering
 test-rendering: ## cargo test（--features rendering。Servo 込みの検証）
-ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
-	@meta=$$(cargo metadata --no-deps --format-version 1 2>&1) || { \
-		echo "$$meta" >&2; \
-		echo "NG: cargo metadata の実行に失敗しました" >&2; \
-		exit 1; \
-	}; \
-	if printf '%s\n' "$$meta" | grep -q '"rendering":'; then \
-		cargo test --workspace --features rendering; \
-	else \
-		echo "skip: rendering feature が未定義のため test-rendering をスキップ"; \
-	fi
-else
-	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test-rendering をスキップ"
-endif
+	@scripts/cargo-gate.sh test-rendering
 
-# 既定ビルド（feature 指定なし）の依存グラフに Servo 系クレートが混入していないことを
-# 検証する（RENDER-1・ci.md「既定ビルドに Servo が含まれないことを cargo tree で検証」）。
-# 判定ロジックの正本は scripts/check-render-isolation.sh に一本化した（TASK-34.1・
-# Issue #465）。同スクリプトは workspace 全体に加え fandhe-browser-cli の既定
-# feature（TASK-41.5・#174。manifest 不在は NG・#633）も検査し、.github/workflows/ci.yml
-# の harness-* ジョブの [render-isolation] ステップから同じスクリプトを直接呼び出す。
-# `--exclude fandhe-browser-render` の理由・edge に dev を含める理由・
-# fandhe-browser-render 以外の member が無い間 skip する理由などの詳細な設計判断は
-# スクリプト側のコメントを参照。ここでは HAS_CARGO / RENDER_ISOLATION_MEMBERS による
-# skip 判定のみを Makefile 側に残す。最終的な防御線は deny.toml（Servo（MPL-2.0）が
-# [licenses] の allow に無いことを検出して fail-closed する）である。
-RENDER_ISOLATION_MEMBERS := $(filter-out crates/fandhe-browser-render/Cargo.toml,$(HAS_MEMBERS))
-.PHONY: check-render-isolation
-check-render-isolation: ## 既定ビルド（cli 既定 feature 含む）の依存グラフに Servo 系クレートが含まれないことを検証する（scripts/check-render-isolation.sh）
-ifneq ($(and $(HAS_CARGO),$(RENDER_ISOLATION_MEMBERS)),)
-	@bash scripts/check-render-isolation.sh
-else
-	@echo "skip: Cargo.toml 未追加、または fandhe-browser-render 以外の member crate が無いため check-render-isolation をスキップ"
-endif
+check-render-isolation: ## 既定ビルド（cli 既定 feature 含む）の依存グラフに Servo 系クレートが含まれないことを検証する
+	@scripts/cargo-gate.sh check-render-isolation
 
-# JS エンジンのビルド構成（軽量ビルド・エンジンなし）の依存グラフに、含まれてはならない
-# エンジン crate（v8・boa_engine）が無いことを検証する（TASK-32.4・JS-1・Issue #168）。
-# 判定ロジックの正本は scripts/check-js-engine-isolation.sh で、ci.yml の
-# harness-* ジョブの [js-engine-isolation] ステップも同じスクリプトを直接呼び出す。
-.PHONY: check-js-engine-isolation
-check-js-engine-isolation: ## 軽量ビルド・エンジンなし構成の依存グラフに v8（エンジンなしは boa_engine も）が含まれないことを検証する（scripts/check-js-engine-isolation.sh）
-ifneq ($(and $(HAS_CARGO),$(wildcard crates/fandhe-browser-cli/Cargo.toml)),)
-	@bash scripts/check-js-engine-isolation.sh
-else
-	@echo "skip: Cargo.toml 未追加、または fandhe-browser-cli が無いため check-js-engine-isolation をスキップ"
-endif
+check-js-engine-isolation: ## 軽量ビルド・エンジンなし構成の依存グラフに v8（エンジンなしは boa_engine も）が含まれないことを検証する
+	@scripts/cargo-gate.sh check-js-engine-isolation
 
-# workspace 内の全 member crate が非公開（`publish = false` 相当）であることを
-# 検証する（Cargo.toml の `[workspace.package]` 契約・deny.toml の
-# `allow-wildcard-paths = true` が前提とする private crate 方針）。
-# `publish` は `version`/`edition`/`license` と異なり、member crate が
-# `publish.workspace = true`（または直接 `publish = false`）を明記しない限り
-# 自動継承されず、省略すると Cargo の既定値 `publish = true`（公開可能）になる
-# ため、コメントでの申し送りだけでなく機械的に検証する。
-# `cargo metadata` の出力では公開可能な crate は `"publish": null`、
-# 非公開（`false` または `[]` 空リスト）指定の crate は `"publish": []` になる
-# （`cargo metadata --format-version 1` の仕様。crates.io 限定公開等の
-# registry 名リスト指定は本 workspace では使わない前提のため対象外）。
-.PHONY: check-publish-private
 check-publish-private: ## workspace 内の全 member crate が publish = false であることを検証する
-ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
-	@command -v jq >/dev/null 2>&1 || { \
-		echo "NG: jq が未導入のため check-publish-private を実行できません" >&2; \
-		exit 1; \
-	}
-	@meta=$$(cargo metadata --no-deps --format-version 1 2>&1) || { \
-		echo "$$meta" >&2; \
-		echo "NG: cargo metadata の実行に失敗しました" >&2; \
-		exit 1; \
-	}; \
-	bad=$$(printf '%s\n' "$$meta" | jq -r '.packages[] | select(.publish != []) | .name') || { \
-		echo "NG: jq による publish 判定の実行に失敗しました" >&2; \
-		exit 1; \
-	}; \
-	if [ -n "$$bad" ]; then \
-		echo "NG: 以下の crate が publish = false（または publish.workspace = true）を設定していません:" >&2; \
-		printf '%s\n' "$$bad" >&2; \
-		exit 1; \
-	fi
-else
-	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため check-publish-private をスキップ"
-endif
+	@scripts/cargo-gate.sh check-publish-private
 
-.PHONY: deny
 deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
-ifneq ($(and $(HAS_CARGO),$(HAS_DENY),$(HAS_MEMBERS)),)
-	@export PATH="$$HOME/.cargo/bin:$$PATH"; \
-	command -v cargo-deny >/dev/null 2>&1 || { \
-		echo "cargo-deny を導入します"; \
-		cargo install cargo-deny@$(CARGO_DENY_VERSION) --locked; \
-	}; \
-	cargo deny --locked check advisories bans licenses sources
-else
-	@echo "skip: Cargo.toml・deny.toml のいずれか未追加、または workspace にメンバー crate が無いため deny をスキップ"
-endif
+	@scripts/deny.sh
 
-# 受入基準 2（許可外ライセンスが混入したら fail することをログで示す。TASK-9.1・
-# REPAIR-8・OSS-3・RENDER-1）の negative test。deny.toml の [licenses] allow は
-# 実依存グラフの現状に依存するため、`deny` ターゲット（実 workspace の依存監査）
-# だけでは「許可外ライセンスを実際に reject できるか」を継続的に検証できない
-# （allow が広がりすぎて骨抜きになっても実依存グラフにたまたま該当ライセンスが
-# 無ければ検出できない）。本ターゲットは、依存ゼロの canary crate を
-# `mktemp -d`（リポジトリ外）に都度生成し、本リポの deny.toml をそのまま当てて
-# `cargo deny check licenses` を実行することで、fail-closed 性そのものを検証する。
-#
-# - `--config` はグローバルオプションのため `check` より前に置く（`check --config`
-#   の順だと `unexpected argument '--config'` で失敗する。実機検証済み）
-# - canary は依存ゼロなので `cargo generate-lockfile --offline` 後
-#   `--locked --offline` で実行でき、ネットワークも advisory DB も使わない
-# - canary の `Cargo.toml` には `publish` を書かない。脅威モデルは「サードパーティ
-#   crate の混入」であり、公開可能な crate と同じ扱いで監査対象に含める必要がある
-#   （`[licenses.private] ignore = true` 相当の設定が将来入っても検証が骨抜きに
-#   ならないようにするため）
-# - MPL-2.0 を negative ケースに含めるのは、Servo を fandhe-browser-render に
-#   隔離する方針（RENDER-1・licensing.md）を裏付けるため
-# - 陽性対照（`MIT OR Apache-2.0`）を先に走らせ、deny.toml の破損や cargo-deny の
-#   実行環境の問題を「reject された」と取り違えないようにする（fail-closed の
-#   自己検証）
-# - `warning[license-not-encountered]`（allow にあるが canary では使われていない
-#   識別子）は正常なノイズ。判定は `error` の部分一致ではなく、行全体で
-#   `error[rejected]` または `error[unlicensed]` を含むかで行う
-# - cargo-deny の出力は抑止せず、`error[` 周辺を標準出力へ残す。これが受入基準 2
-#   （CI ログでの証跡）になる
-# - cargo-deny を別バージョンへ上げると診断文字列（`error[rejected]` /
-#   `error[unlicensed]`）が変わる可能性がある。上げる際は本ターゲットも
-#   合わせて確認すること（`CARGO_DENY_VERSION` を単一の版管理箇所とする）
-# - `run_case` 内の `cargo deny` 呼び出しは `if out=$(...); then code=0; else
-#   code=$?; fi` の形にし、`out=$(cmd); code=$?` の素の代入にはしない。
-#   `errexit` が有効なシェル（`.SHELLFLAGS` が `-ec` の環境・親シェルの
-#   `SHELLOPTS` を継承する環境等）では代入コマンド自体の失敗でシェルが
-#   即終了し、reject 期待ケース（非 0 終了）で後続の診断アサーションへ
-#   到達できなくなるおそれがある。`if` の条件式に置くことで、どちらの
-#   シェル設定でも exit code を確実に読み取れるようにする
-.PHONY: check-deny-license-reject
 check-deny-license-reject: ## cargo deny が許可外ライセンスを reject することを canary で検証する（受入基準2の証跡）
-ifneq ($(HAS_DENY),)
-	@export PATH="$$HOME/.cargo/bin:$$PATH"; \
-	command -v cargo-deny >/dev/null 2>&1 || { \
-		echo "cargo-deny を導入します"; \
-		cargo install cargo-deny@$(CARGO_DENY_VERSION) --locked; \
-	}; \
-	tmp=$$(mktemp -d) || { echo "NG: mktemp -d に失敗しました" >&2; exit 1; }; \
-	trap 'rm -rf "$$tmp"' EXIT; \
-	deny_cfg="$$(pwd)/deny.toml"; \
-	make_canary() { \
-		dir="$$tmp/$$1"; \
-		mkdir -p "$$dir/src"; \
-		{ \
-			echo '[package]'; \
-			echo 'name = "deny-license-canary"'; \
-			echo 'version = "0.0.0"'; \
-			echo 'edition = "2024"'; \
-			if [ -n "$$2" ]; then echo "license = \"$$2\""; fi; \
-			echo ''; \
-			echo '[workspace]'; \
-		} > "$$dir/Cargo.toml"; \
-		touch "$$dir/src/lib.rs"; \
-		cargo generate-lockfile --offline --manifest-path "$$dir/Cargo.toml" >/dev/null 2>&1 || { \
-			echo "NG: canary（$$1）の Cargo.lock 生成に失敗しました" >&2; \
-			exit 1; \
-		}; \
-	}; \
-	run_case() { \
-		label="$$1"; expect_diag="$$2"; manifest="$$3"; \
-		if out=$$(cargo deny --manifest-path "$$manifest" --config "$$deny_cfg" --locked --offline check licenses 2>&1); then \
-			code=0; \
-		else \
-			code=$$?; \
-		fi; \
-		printf '%s\n' "$$out" | grep -F -A6 'error[' || true; \
-		if [ -z "$$expect_diag" ]; then \
-			if [ "$$code" -ne 0 ]; then \
-				echo "NG: 陽性対照（$$label）が失敗しました（exit=$$code）。deny.toml の構文エラーや実行環境の問題の可能性があります" >&2; \
-				exit 1; \
-			fi; \
-			echo "OK: $$label ok (exit=$$code)"; \
-		else \
-			if [ "$$code" -eq 0 ] || ! printf '%s\n' "$$out" | grep -qF "$$expect_diag"; then \
-				echo "NG: $$label が reject されませんでした（exit=$$code。期待した診断 $$expect_diag が出ていません）" >&2; \
-				exit 1; \
-			fi; \
-			echo "OK: $$label rejected (exit=$$code)"; \
-		fi; \
-	}; \
-	make_canary positive "MIT OR Apache-2.0"; \
-	run_case "MIT OR Apache-2.0" "" "$$tmp/positive/Cargo.toml"; \
-	for lic in $(DENY_LICENSE_REJECT_CASES); do \
-		make_canary "case-$$lic" "$$lic"; \
-		run_case "$$lic" "error[rejected]" "$$tmp/case-$$lic/Cargo.toml"; \
-	done; \
-	make_canary unlicensed ""; \
-	run_case "unlicensed（license 欄なし）" "error[unlicensed]" "$$tmp/unlicensed/Cargo.toml"
-else
-	@echo "skip: deny.toml 未追加のため check-deny-license-reject をスキップ"
-endif
+	@scripts/check-deny-license-reject.sh
 
-# `rendering` feature（Servo）を含めた検証（ci.md「既定ビルドと --features rendering
-# の両方で検証」）も make ci に含める。lint-rendering / test-rendering は
-# `rendering` feature 未定義の段階では skip メッセージを出して 0 終了するため、
-# workspace 作成前・render crate 追加前の CI を壊さない。docker-ci は make ci を
-# 呼ぶため自動的にこの検証を含む。
-.PHONY: ci
+# `rendering` feature（Servo）を含めた検証（ci.md「既定ビルドと --features rendering の両方で検証」）も
+# make ci に含める。lint-rendering / test-rendering は feature 未定義の段階では skip して 0 終了するため、
+# workspace 作成前・render crate 追加前の CI を壊さない。docker-ci は make ci を呼ぶため自動的に含む。
 ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-js-engine-isolation check-publish-private test test-rendering deny check-deny-license-reject check-compat-regression check-compat-practical check-puppeteer-connect check-bench-record check-mcp-envelope check-ci-changes ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
-# 実測ハーネス compat-practical の自己テスト（TASK-71.1・MEAS-4。harness/compat-practical/README.md 参照）
+# 実測ハーネス・ベンチ・計測（各 README: harness/*/README.md・benches/*/README.md）
 # --------------------------------------------------
 
-# オフラインのみ（curl はスタブ・run_core は偽 CDP サーバー。TASK-71.2）。実ネットワークを使う実計測は README の手順で手動実行する。
-# jq 未導入時は check-compat-regression と同じ方針で fail-closed。
-.PHONY: check-compat-practical
 check-compat-practical: ## 実測ハーネス（22 タスク定義・アクセス確認・run_core 実行）の自己テストとスキーマ検証（MEAS-4）
-	@command -v jq >/dev/null 2>&1 || { \
-		echo "NG: jq が未導入のため check-compat-practical を実行できません" >&2; \
-		exit 1; \
-	}
-	@command -v node >/dev/null 2>&1 || { \
-		echo "NG: node(22 以降)が未導入のため check-compat-practical を実行できません" >&2; \
-		exit 1; \
-	}
-	bash harness/compat-practical/self-test.sh
-	bash harness/compat-practical/access_check.sh --validate-only
-	bash harness/compat-practical/run_core.sh --validate-only
-	bash harness/compat-practical/make_matrix.sh --validate-only
+	@scripts/harness.sh check-compat-practical
 
-# --------------------------------------------------
-# 対象サイト群の動作率回帰チェック（TASK-9.2・REPAIR-8。harness/compat-regression/README.md 参照）
-# --------------------------------------------------
-
-# HAS_CARGO / HAS_MEMBERS に依存しない（harness/compat-regression は workspace の
-# 有無と無関係に bash + jq のみで動く）。jq 未導入時は check-publish-private と
-# 同じ方針で fail-closed（silent skip にしない）。self-test を先に実行し、
-# fixture（合成データ）に対して「閾値未満で fail する」ことをログに残してから
-# 実マトリクスを判定する。実マトリクス harness/compat-practical/results/matrix.json
-# は TASK-71.3（#312）が生成予定でまだ無いため、当面 --allow-missing を渡す
-# （#312 で導入され次第このフラグを削除し fail-closed に戻す）。
-.PHONY: check-compat-regression
 check-compat-regression: ## 対象サイト群の動作率マトリクスに対する回帰チェック（COMPAT-1・COMPAT-4）
-	@command -v jq >/dev/null 2>&1 || { \
-		echo "NG: jq が未導入のため check-compat-regression を実行できません" >&2; \
-		exit 1; \
-	}
-	bash harness/compat-regression/self-test.sh
-	bash harness/compat-regression/check-matrix.sh \
-		--matrix harness/compat-practical/results/matrix.json \
-		--threshold 70 \
-		--categories static,spa,form \
-		--all-categories \
-		--allow-missing
+	@scripts/harness.sh check-compat-regression
 
-# --------------------------------------------------
-# competitor_lightpanda ベンチの継続実行結果記録（TASK-84.2・Issue #212。
-# benches/competitor_lightpanda/README.md 参照）
-# --------------------------------------------------
-
-# `cargo bench` を実行し、結果を results/history.jsonl へ追記する。実測値を
-# 得るには LIGHTPANDA_BIN・FANDHE_BROWSER_BIN・CHROMIUM_IDLE_RSS_KB を
-# 事前に export しておくこと（未設定の対象は skipped になる。
-# benches/competitor_lightpanda/README.md「現状の限界」参照）。
-.PHONY: bench-record
 bench-record: ## competitor_lightpanda ベンチを実行し結果を時系列で記録する
-	@command -v jq >/dev/null 2>&1 || { \
-		echo "NG: jq が未導入のため bench-record を実行できません" >&2; \
-		exit 1; \
-	}
-	bash benches/competitor_lightpanda/record.sh \
-		--history benches/competitor_lightpanda/results/history.jsonl \
-		--source local
+	@scripts/harness.sh bench-record
 
-# CI の changes ジョブが docs-only 判定に使う scripts/ci-changes.sh の自己テスト
-# （.claude/rules/ci.md「docs-only の判定」）。CI では changes ジョブが同じ自己テストを実行する。
-.PHONY: check-ci-changes
 check-ci-changes: ## CI の docs-only 判定スクリプトの自己テスト
-	@bash scripts/ci-changes.sh --self-test
+	@scripts/harness.sh check-ci-changes
 
-# record.sh の自己テスト（合成 fixture。cargo を実行しないため高速）。
-.PHONY: check-bench-record
 check-bench-record: ## competitor_lightpanda 記録スクリプトの自己テスト
-	@command -v jq >/dev/null 2>&1 || { \
-		echo "NG: jq が未導入のため check-bench-record を実行できません" >&2; \
-		exit 1; \
-	}
-	bash benches/competitor_lightpanda/self-test.sh
+	@scripts/harness.sh check-bench-record
 
-# --------------------------------------------------
-# feature 無効（既定）のリリースバイナリサイズ検査（TASK-34.2・Issue #466。
-# harness/binary-size/README.md 参照）
-# --------------------------------------------------
-
-# HAS_CARGO / HAS_MEMBERS に依存しない（対象 package の不在は
-# check-binary-size.sh 自身が exit 2 で拒否するため。cargo 系ターゲットと同様、
-# jq 未導入時は check-compat-regression と同じ方針で fail-closed にする）。
-# self-test（合成ファイルによる判定モードの自己テスト）を先に実行してから、
-# 対象 package のリリースビルド・判定に進む。`ci:` の依存には追加しない
-# （cargo build --release のコストが大きいため。判断済み）。GitHub Actions
-# での継続的なゲートは `.github/workflows/ci.yml` の `harness-*` ジョブの `[binary-size]` ステップ
-# （TASK-34.3・#467）が 3 OS で担う。harness/binary-size/README.md「CI」
-# 「make ci に含めない理由」参照。
-.PHONY: check-binary-size
 check-binary-size: ## feature 無効（既定）のリリースバイナリサイズが CORE-2 水準の上限以下か検査する（RENDER-2）
-	@command -v jq >/dev/null 2>&1 || { \
-		echo "NG: jq が未導入のため check-binary-size を実行できません" >&2; \
-		exit 1; \
-	}
-	bash harness/binary-size/self-test.sh
-	bash harness/binary-size/check-binary-size.sh \
-		--package "$(BINARY_SIZE_PACKAGE)" \
-		--limit "$(BINARY_SIZE_LIMIT_BYTES)"
+	@scripts/harness.sh check-binary-size
 
-# --------------------------------------------------
-# 方式 B 本体の MCP エンベロープ測定ハーネス（TASK-97.1・Issue #385・PLUG-5・MS-9。
-# crates/fandhe-browser-ai/benches/mcp_envelope.rs 参照）
-# --------------------------------------------------
-
-# 実測値は docs/design/mcp-envelope-report.md（TASK-97.2・#386）。MCP_ENVELOPE_ARGS で bench へ引数を渡せる。cargo bench は他 package の bin をビルドしないため
-# mcp バイナリを先に release ビルドして FANDHE_BROWSER_MCP_BIN で渡す。unix 専用（Profile が unix のみ）。
-# 相対 CARGO_TARGET_DIR でも resolve_bin（絶対パス必須）を通すため abspath で絶対化する。
-MCP_ENVELOPE_ARGS ?=
-MCP_ENVELOPE_TARGET_DIR ?= $(abspath $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(CURDIR)/target))
-
-.PHONY: measure-mcp-envelope
 measure-mcp-envelope: ## 方式 B 本体と MCP エンベロープのトークン・レイテンシを測定する（PLUG-5・TASK-97.1。unix のみ）
-	@case "$$(uname -s)" in Linux|Darwin) ;; *) echo "NG: measure-mcp-envelope は unix のみ対応です" >&2; exit 1;; esac
-	cargo build --release -p fandhe-browser-mcp
-	FANDHE_BROWSER_MCP_BIN="$(MCP_ENVELOPE_TARGET_DIR)/release/fandhe-browser-mcp" \
-		cargo bench -p fandhe-browser-ai --bench mcp_envelope -- $(MCP_ENVELOPE_ARGS)
+	@scripts/harness.sh measure-mcp-envelope
 
-.PHONY: check-mcp-envelope
-check-mcp-envelope: ## MCP エンベロープ測定ハーネスの e2e smoke を実バイナリで実行する（PLUG-5・TASK-97.1。unix のみ・0 件実行は NG）
-	@case "$$(uname -s)" in Linux|Darwin) ;; *) echo "skip: check-mcp-envelope は unix のみ対応のためスキップ（Profile が unix 専用）"; exit 0;; esac; \
-	cargo build -p fandhe-browser-mcp || exit 1; \
-	out="$$(mktemp)"; \
-	FANDHE_BROWSER_MCP_BIN="$(MCP_ENVELOPE_TARGET_DIR)/debug/fandhe-browser-mcp" \
-		cargo test -p fandhe-browser-ai --test mcp_envelope_e2e -- --ignored 2>&1 | tee "$$out"; \
-	if grep -q "test result: ok. 1 passed" "$$out"; then rc=0; else echo "NG: mcp_envelope_e2e が 1 件成功していません" >&2; rc=1; fi; \
-	rm -f "$$out"; exit $$rc
+check-mcp-envelope: ## MCP エンベロープ測定ハーネスの e2e smoke を実バイナリで実行する（PLUG-5・TASK-97.1。unix のみ）
+	@scripts/harness.sh check-mcp-envelope
 
-# --------------------------------------------------
-# JS エンジン構成別リリースバイナリサイズ計測（TASK-31.1・Issue #469・JS-3・PERF-1。
-# harness/binary-size/README.md 参照）
-# --------------------------------------------------
+measure-js-binary-size: ## JS エンジン構成別（既定 V8 / 軽量 boa / エンジンなし）のリリースバイナリサイズを計測する（TASK-31.1）
+	@scripts/harness.sh measure-js-binary-size
 
-# 計測のみでゲートではない（閾値判定は #470）。V8 を含むリリースビルドを 3 回
-# 行うためコストが大きく、`ci:` の依存には追加しない（check-binary-size と同じ判断）。
-# JS_BINARY_SIZE_STRIP を空でない値にすると strip=symbols で計測する。
-JS_BINARY_SIZE_STRIP ?=
-
-.PHONY: measure-js-binary-size
-measure-js-binary-size: ## JS エンジン構成別（既定 V8 / 軽量 boa / エンジンなし）のリリースバイナリサイズを計測する（TASK-31.1・JS-3・PERF-1）
-	@command -v jq >/dev/null 2>&1 || { \
-		echo "NG: jq が未導入のため measure-js-binary-size を実行できません" >&2; \
-		exit 1; \
-	}
-	bash harness/binary-size/measure-js-engine-configs-self-test.sh
-	bash harness/binary-size/measure-js-engine-configs.sh \
-		--package "$(BINARY_SIZE_PACKAGE)" \
-		$(if $(JS_BINARY_SIZE_STRIP),--strip)
-
-# CSSOM プロファイル読み込みのバイナリ増分・アイドル RSS 増分の計測（TASK-100.6・PLUG-8・Issue #270）。
-# release ビルドを伴う一度きりの記録で RSS がランナー差で揺れるため `ci` には含めない。
-# 例: make measure-cssom-profile-cost CSSOM_PROFILE_COST_ARGS="--strip --out benches/cssom_profile_cost/results/cssom-profile-cost-strip.json"
-CSSOM_PROFILE_COST_ARGS ?= --out benches/cssom_profile_cost/results/cssom-profile-cost.json
-
-.PHONY: measure-cssom-profile-cost
 measure-cssom-profile-cost: ## CSSOM プロファイル読み込みのバイナリ増分・アイドル RSS 増分を計測する（TASK-100.6・PLUG-8）
-	@command -v jq >/dev/null 2>&1 || { \
-		echo "NG: jq が未導入のため measure-cssom-profile-cost を実行できません" >&2; \
-		exit 1; \
-	}
-	bash benches/cssom_profile_cost/self-test.sh
-	bash benches/cssom_profile_cost.sh $(CSSOM_PROFILE_COST_ARGS)
+	@scripts/harness.sh measure-cssom-profile-cost
+
+trace-playwright: ## Playwright newPage() 到達までの CDP トレースを再取得する（手動・要 node/npm/ネットワーク。CI 対象外）
+	@scripts/harness.sh trace-playwright
+
+check-playwright-trace: ## harness/playwright-trace のオフライン自己テストを実行する（Playwright・ネットワーク不要。要 node）
+	@scripts/harness.sh check-playwright-trace
+
+check-puppeteer-connect: ## harness/puppeteer-connect のオフライン自己テストと Rust 契約テスト（puppeteer_contract）を実行する（要 node。TASK-45.2）
+	@scripts/harness.sh check-puppeteer-connect
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
 # --------------------------------------------------
 
-.PHONY: docker-build
 docker-build: ## 開発コンテナイメージをビルドする
 	docker compose build
 
-.PHONY: docker-shell
 docker-shell: ## 開発コンテナのシェルに入る
 	docker compose run --rm dev
 
-.PHONY: docker-ci
 docker-ci: ## コンテナ内で make ci を実行する（環境非依存の検証）
 	docker compose run --rm dev make ci
-
-# --------------------------------------------------
-# Playwright トレース収集（TASK-43.1・CDP-2。harness/playwright-trace/README.md 参照）
-# --------------------------------------------------
-.PHONY: trace-playwright
-trace-playwright: ## Playwright newPage() 到達までの CDP トレースを再取得する（手動・要 node/npm/ネットワーク。CI 対象外）
-	bash harness/playwright-trace/run.sh $(PLAYWRIGHT_VERSION) $(PLAYWRIGHT_INTEGRITY) harness/playwright-trace/results/newpage-trace.jsonl --force
-
-.PHONY: check-playwright-trace
-check-playwright-trace: ## harness/playwright-trace のオフライン自己テストを実行する（Playwright・ネットワーク不要。要 node）
-	bash harness/playwright-trace/self-test.sh
-
-.PHONY: check-puppeteer-connect
-check-puppeteer-connect: ## harness/puppeteer-connect のオフライン自己テストと Rust 契約テスト（puppeteer_contract）を実行する（Puppeteer・ネットワーク不要。要 node。TASK-45.2）
-	bash harness/puppeteer-connect/self-test.sh

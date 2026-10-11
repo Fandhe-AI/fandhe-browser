@@ -15,7 +15,7 @@ JS-3・PERF-1 が「検討中」に留まる理由は、V8 統合後の実バイ
 
 - 判定対象は既定ビルド（V8 のみ同梱）のリリースバイナリ。基準は CORE-2 の
   「Chromium 本体 457.4MB（PoC-2 実測）比 80% 以上削減」、つまり 91,480,000 B 以下
-  （`Makefile` の `BINARY_SIZE_LIMIT_BYTES` と同値）
+  （`scripts/versions.sh` の `BINARY_SIZE_LIMIT_BYTES` と同値）
 - 軽量ビルド（boa のみ）・エンジンなしビルドは参考値
 - MB は 10 進（10^6 B）
 - ルート `Cargo.toml` の `[profile.release]` は計測時点では `panic = "abort"` のみで、CORE-2 の前提

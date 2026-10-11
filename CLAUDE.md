@@ -24,7 +24,7 @@ fandhe-browser/
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
 ├── .editorconfig                  # インデント・改行・文字コード規約
 ├── skills-lock.json               # 導入スキルのロックファイル
-├── Makefile                       # 開発タスク集約（lint-docs・fmt・clippy・test・deny・Servo 隔離検査。`make help`）
+├── Makefile                       # 開発タスク集約の薄い入口（処理の定義は scripts/。`make help`。編集は makefile.md）
 ├── lefthook.yml                   # git hooks（整形・秘密情報検査・commit-msg。clippy・test は CI に任せ pre-push は置かない）
 ├── commitlint.config.mjs          # commitlint 設定（type を 9 種に限定）
 ├── Dockerfile / compose.yaml      # 開発コンテナ（環境非依存の `make docker-ci`）
@@ -41,7 +41,7 @@ fandhe-browser/
 │   ├── fandhe-browser-cli/        #   CLI（最小雛形: core・profile・cdp・ai を組み立ててサーバー起動。サブコマンドは TASK-47）
 │   └── fandhe-browser-mcp/        #   MCP 参照プラグイン（別バイナリ。stdio サーバー基盤・起動時のホスト自己申告と navigate・snapshot ツールを実装）
 ├── tests/ / benches/              #（予定）結合テスト・ベンチ
-├── scripts/                       # 依存グラフ検査等のスクリプト。check-render-isolation.sh（TASK-34.1・RENDER-1）・check-js-engine-isolation.sh（TASK-32.4・JS-1）・ci-changes.sh（CI の docs-only 判定）・ci-prune-target.sh（CI cache 保存前の prune）
+├── scripts/                       # Makefile の実体（lib.sh・versions.sh・cargo-gate.sh・harness.sh・lint-docs.sh・setup.sh・deny.sh・help.sh 等）と依存グラフ検査等のスクリプト。check-render-isolation.sh（TASK-34.1・RENDER-1）・check-js-engine-isolation.sh（TASK-32.4・JS-1）・ci-changes.sh（CI の docs-only 判定）・ci-prune-target.sh（CI cache 保存前の prune）
 ├── profiles/                      # CSSOM gating 用ブラウザ挙動プロファイルデータ（chrome.json・safari.json・README.md。TASK-100.1・PLUG-8）
 ├── harness/                       # 互換性テストハーネス。compat-regression/（TASK-9.2・対象サイト群の動作率回帰チェック）・playwright-trace/（TASK-43.1・Playwright newPage() 到達までの CDP トレース収集）・compat-practical/（TASK-71.1・22 タスク定義・アクセス確認・実行対象バイナリ解決・TASK-71.2・22 タスク実行 run_core.sh・TASK-71.3・Chromium 実測との突合 make_matrix.sh）・puppeteer-connect/（TASK-45.1・Puppeteer 接続試験の実行基盤・TASK-45.2・段階別到達結果の回収）・binary-size/（TASK-34.2・既定 feature リリースバイナリのサイズ検査・TASK-31.1・JS エンジン構成別サイズ計測）実装済み
 ├── docs/
@@ -121,6 +121,8 @@ main セッションはオーケストレーションに徹し、調査・実装
 | [dependency-policy.md](.claude/rules/dependency-policy.md) | **リポ固有**: 依存最小・`=x.y.z` 固定・ユーザー承認制 |
 | [licensing.md](.claude/rules/licensing.md) | **リポ固有**: デュアルライセンス・Servo MPL 隔離・GPL 系禁止・NOTICE |
 | [ci.md](.claude/rules/ci.md) | **リポ固有**: ローカルゲート・3 OS CI・feature 分離検証 |
+| [makefile.md](.claude/rules/makefile.md) | **リポ固有**: Makefile は薄い入口・処理は scripts/ に置く・ターゲット追加手順・スクリプト規約 |
+| [github-actions.md](.claude/rules/github-actions.md) | **リポ固有**: runner 方針（public → GitHub-hosted）・必須チェック・発火条件・ジョブ追加チェックリスト・所要時間 |
 | [git-hooks.md](.claude/rules/git-hooks.md) | **リポ固有**: lefthook のフック編集方針（時間予算・CI と重複する検査を置かない・明示的な例外） |
 
 ## Current Skills
@@ -129,7 +131,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 
 - **ワークフロー系**: create-commit / create-pr / create-issue / create-issue-tree / create-plan / implement-issue / implement-issue-tree / implement-review / implement-review-pr / update-issue-tree / update-docs / comment-code
 - **メンテ系**: init-claude / update-claude / contribute-skill / setup-repo-guards
-- **リファレンス系**: rust / github-docs / commitlint / lefthook / editorconfig / anthropic-claude-code / anthropic-claude-code-extend / anthropic-api-tools-mcp / anthropic-agent-sdk / openai-agents / playwright / fandhe-backend / windows-interop-modernize
+- **リファレンス系**: make / rust / github-docs / commitlint / lefthook / editorconfig / anthropic-claude-code / anthropic-claude-code-extend / anthropic-api-tools-mcp / anthropic-agent-sdk / openai-agents / playwright / fandhe-backend / windows-interop-modernize
 
 ## Conventions
 

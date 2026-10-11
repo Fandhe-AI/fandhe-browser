@@ -19,7 +19,7 @@ Issue #174・#616 で追加済み）。package が workspace に無い場合は�
 
 ## 上限値と根拠
 
-`BINARY_SIZE_LIMIT_BYTES`（`Makefile`）の既定値は `91480000`（約 91.48MB）。
+`BINARY_SIZE_LIMIT_BYTES`（`scripts/versions.sh`）の既定値は `91480000`（約 91.48MB）。
 
 - `CORE-2` / `RENDER-2` の判定基準は「Chromium 比 80% 以上削減」。spec が基準に
   する Chromium 実測 457.4MB（PoC-2）の 20% は 91.48MB
@@ -126,7 +126,7 @@ TASK-34.3（#467）で導入。3 OS（ubuntu/macos/windows）の各ネイティ�
 呼ぶ）。ubuntu・macos は actions/cache で依存ビルドを再利用し（`scripts/ci-prune-target.sh`
 で workspace 成果物を除いてから保存）、windows-latest のみ cache prune の既知問題で除外する。
 
-上限値・package 名は `Makefile` の `BINARY_SIZE_LIMIT_BYTES` /
+上限値・package 名は `scripts/versions.sh` の `BINARY_SIZE_LIMIT_BYTES` /
 `BINARY_SIZE_PACKAGE` を単一真実源とし、ジョブ側では値を重複定義しない。
 行頭固定の正規表現でちょうど 1 件だけ抽出し、0 件（削除・書式変更）・2 件
 以上（曖昧）はいずれも `::error::` を出して fail-closed にする。
