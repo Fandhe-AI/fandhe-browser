@@ -50,7 +50,7 @@
 //! - 上限値（待ち行列・実時間）の設定ファイルからの読み込みは未対応（定数とオプション型で持つ）。
 
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -436,7 +436,13 @@ struct State {
     worker_alive: bool,
     worker_spawns: u64,
     next_id: u64,
+    /// scope ごとに受け付けた最新の世代（完了・`Skipped` 後も残す。`JS-4`）。
+    latest: HashMap<NavigationScope, NavigationGeneration>,
 }
+
+/// `State::latest` の保持上限。超えたら待ち・実行中でない scope の記録から捨てる
+/// （捨てた scope の遅延要求は打ち切れないが、無制限の増加を避ける）。
+const MAX_TRACKED_SCOPES: usize = 1024;
 
 struct Shared {
     state: Mutex<State>,
@@ -573,6 +579,7 @@ impl PageScriptHandle {
                         worker_alive: false,
                         worker_spawns: 0,
                         next_id: 0,
+                        latest: HashMap::new(),
                     }),
                 }),
             }),
@@ -610,18 +617,21 @@ impl PageScriptHandle {
         let scope = request.scope;
         let generation = request.generation;
 
-        // 同じ遷移系列でより新しい世代が待ち / 実行中なら、この要求は古い。
-        let newer_queued = st
-            .queue
-            .iter()
-            .any(|j| j.request.scope == scope && j.request.generation > generation);
-        let newer_running = st
-            .running
-            .as_ref()
-            .is_some_and(|r| r.scope == scope && r.generation > generation);
-        if newer_queued || newer_running {
+        // 同じ遷移系列で既により新しい世代を受け付けていれば（待ち・実行中・完了・Skipped を
+        // 問わず）この要求は古い。
+        if st.latest.get(&scope).is_some_and(|g| *g > generation) {
             return PageRunFuture::ready(Err(PageScriptError::Cancelled));
         }
+        if st.latest.len() >= MAX_TRACKED_SCOPES && !st.latest.contains_key(&scope) {
+            let live: Vec<NavigationScope> = st
+                .queue
+                .iter()
+                .map(|j| j.request.scope)
+                .chain(st.running.as_ref().map(|r| r.scope))
+                .collect();
+            st.latest.retain(|k, _| live.contains(k));
+        }
+        st.latest.insert(scope, generation);
 
         // より古い待ちジョブは取り除いてから打ち切る（待ち枠を即座に空け、不変条件
         // 「待ち行列に残るのは打ち切られていないジョブだけ」を保つ）。実行中のより古い
@@ -1236,6 +1246,61 @@ mod tests {
         assert!(matches!(rt.block_on(late), Err(PageScriptError::Cancelled)));
         driver.gate_open.store(true, Ordering::SeqCst);
         assert!(executed_html(rt.block_on(newer)).contains("gate-gen-2"));
+    }
+
+    /// `JS-4`: 新しい世代が完了した後に届いた古い世代も `Cancelled`（実行しない）。
+    #[test]
+    fn js_4_older_generation_after_newer_completed_is_cancelled() {
+        let driver = Arc::new(FakeDriver::default());
+        let handle = handle(Arc::clone(&driver));
+        let state = NavigationState::new();
+        let rt = rt();
+
+        let older_req = req("gen-1", &state, 1);
+        let newer = handle.run_page_scripts(req("gen-2", &state, 2));
+        assert!(executed_html(rt.block_on(newer)).contains("gen-2"));
+        let started = driver.started.load(Ordering::SeqCst);
+
+        let late = handle.run_page_scripts(older_req);
+        let r = rt.block_on(late);
+        assert!(matches!(r, Err(PageScriptError::Cancelled)), "{r:?}");
+        assert_eq!(
+            driver.started.load(Ordering::SeqCst),
+            started,
+            "実行されない"
+        );
+    }
+
+    /// `JS-4`: `<script` の無い新しい世代が `Skipped` で終わった後に届いた古い世代も `Cancelled`。
+    #[test]
+    fn js_4_older_generation_after_newer_skipped_is_cancelled() {
+        let driver = Arc::new(FakeDriver::default());
+        let handle = handle(Arc::clone(&driver));
+        let state = NavigationState::new();
+        let rt = rt();
+
+        let older_req = req("gen-1", &state, 1);
+        let newer = handle.run_page_scripts(PageRunRequest::new(
+            Arc::from("<p>no scripts</p>"),
+            "https://example.com/",
+            state.scope(),
+            nth_generation(&state, 2),
+        ));
+        let r2 = rt.block_on(newer);
+        assert!(
+            matches!(
+                r2,
+                Ok(PageScriptOutcome::Skipped(
+                    PageScriptSkipReason::NoScriptElement
+                ))
+            ),
+            "{r2:?}"
+        );
+
+        let late = handle.run_page_scripts(older_req);
+        let r = rt.block_on(late);
+        assert!(matches!(r, Err(PageScriptError::Cancelled)), "{r:?}");
+        assert_eq!(driver.started.load(Ordering::SeqCst), 0, "実行されない");
     }
 
     /// 別の遷移系列（ターゲット）は同じ世代番号でも互いを打ち切らない。
