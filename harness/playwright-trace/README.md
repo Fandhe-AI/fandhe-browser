@@ -52,7 +52,7 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
 | `cdp` | `dir`（`send` / `recv`）・`message` | CDP メッセージ本体（`id`・`method`・`params` / `result` / `error` を含む元 JSON）。送受信順 |
 | `stage` | `name`・`ok`（失敗時 `error`） | 段階の成否。失敗した段階で止め、`newPage` 到達後は先へ進まない |
 
-ポートは `<PORT>` へ、ANSI エスケープは除去して正規化し、2 回実行して同一内容になることを確認している。
+ポートは `<PORT>` へ、`downloadPath` 等に現れる一時ディレクトリ（`<os.tmpdir()>/playwright-artifacts-XXXXXX`）は `<ARTIFACTS_DIR>` へ置き換え、ANSI エスケープは除去して正規化し、2 回実行して同一内容になることを確認している。
 
 ## 再生テストの更新手順
 

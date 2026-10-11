@@ -6,6 +6,8 @@
 
 export const SCHEMA_VERSION = 1;
 export const PLACEHOLDER_PORT = "<PORT>";
+// Playwright の一時成果物ディレクトリ（`<os.tmpdir()>/playwright-artifacts-XXXXXX`）の置換先。
+export const PLACEHOLDER_ARTIFACTS_DIR = "<ARTIFACTS_DIR>";
 // 1 行あたり・総行数の上限（無制限確保の防止。security.md「不安全な設計」）。
 export const MAX_LINE_BYTES = 64 * 1024;
 export const MAX_RECORDS = 1024;
@@ -89,31 +91,49 @@ export function drainLines(pending, chunk) {
   return { lines: parts, rest };
 }
 
+/** 正規表現メタ文字をエスケープする（host・tmpDir から RegExp を組み立てるための共通部品）。 */
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /**
- * 文字列中の接続先（host:port）・ANSI を固定表現へ置換する。
+ * 文字列中の接続先（host:port）・一時ディレクトリ・ANSI を固定表現へ置換する（trace.mjs が呼ぶ。CDP-2・TASK-43）。
  * `host` は endpoint の URL ホスト表記（`127.0.0.1` / `[::1]`）。host:port に一致し、ポート直後が
  * 数字でない箇所だけを置換するため、無関係な URL・数値（例: `example.com:12345`）は変えない。
  * host 未指定時はポート置換を行わない。
+ * `tmpDir` は同一プロセスの `os.tmpdir()`（Playwright が `playwright-artifacts-` を作る場所）で、
+ * `<tmpDir>/playwright-artifacts-XXXXXX`（XXXXXX は英数字 6 文字）だけを `<ARTIFACTS_DIR>` へ置換する。
+ * 汎用のパス推定はせず大文字小文字も区別する。未指定・空なら置換しない（純粋関数を保つため os は import しない）。
  */
-export function normalizeString(s, port, host) {
+export function normalizeString(s, port, host, tmpDir) {
   let out = s.replace(ANSI, "");
   if (port && host) {
-    const esc = host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const esc = escapeRegExp(host);
     const re = new RegExp(`(?<![0-9A-Za-z.\\-])${esc}:${port}(?![0-9])`, "g");
     out = out.replace(re, `${host}:${PLACEHOLDER_PORT}`);
+  }
+  if (typeof tmpDir === "string") {
+    const base = tmpDir.replace(/[\\/]+$/, "");
+    if (base !== "") {
+      const re = new RegExp(
+        `(?<![0-9A-Za-z._~\\\\/-])${escapeRegExp(base)}[\\\\/]playwright-artifacts-[A-Za-z0-9]{6}(?![0-9A-Za-z._-])`,
+        "g",
+      );
+      out = out.replace(re, PLACEHOLDER_ARTIFACTS_DIR);
+    }
   }
   return out;
 }
 
 /** JSON 値を再帰的に走査して全文字列を正規化する。 */
-export function normalizeValue(v, port, host) {
-  if (typeof v === "string") return normalizeString(v, port, host);
-  if (Array.isArray(v)) return v.map((x) => normalizeValue(x, port, host));
+export function normalizeValue(v, port, host, tmpDir) {
+  if (typeof v === "string") return normalizeString(v, port, host, tmpDir);
+  if (Array.isArray(v)) return v.map((x) => normalizeValue(x, port, host, tmpDir));
   if (v !== null && typeof v === "object") {
     const o = {};
     for (const [k, x] of Object.entries(v)) {
       // `o[k] =` だと `__proto__` キーがプロトタイプ変更になり直列化で失われるため、own property として定義する。
-      Object.defineProperty(o, k, { value: normalizeValue(x, port, host), enumerable: true, writable: true, configurable: true });
+      Object.defineProperty(o, k, { value: normalizeValue(x, port, host, tmpDir), enumerable: true, writable: true, configurable: true });
     }
     return o;
   }

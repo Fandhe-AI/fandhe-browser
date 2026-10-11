@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import {
   checkCollection,
   normalizeString,
+  PLACEHOLDER_ARTIFACTS_DIR,
   verifyInstalledPackages,
   normalizeValue,
   parseProtocolLine,
@@ -167,11 +168,47 @@ t("drainLines rejects an oversized chunk before splitting", () => {
   assert.throws(() => drainLines("", many), /chunk exceeds buffer limit/);
 });
 
+t("normalize replaces playwright-artifacts temp dir (Linux/macOS/Windows)", () => {
+  const A = PLACEHOLDER_ARTIFACTS_DIR;
+  assert.equal(A, "<ARTIFACTS_DIR>");
+  const n = (s, tmp) => normalizeString(s, undefined, undefined, tmp);
+  assert.equal(n("/tmp/playwright-artifacts-dLodID", "/tmp"), A);
+  assert.equal(n("/tmp/playwright-artifacts-dLodID", "/tmp/"), A);
+  assert.equal(n("/var/folders/xx/yy1234/T/playwright-artifacts-AbC123", "/var/folders/xx/yy1234/T"), A);
+  const win = "C:\\Users\\runner\\AppData\\Local\\Temp";
+  assert.equal(n(`${win}\\playwright-artifacts-xY9zQ1`, win), A);
+  assert.equal(n("/tmp/playwright-artifacts-abcDEF/file.txt", "/tmp"), `${A}/file.txt`);
+  assert.deepEqual(
+    normalizeValue({ params: { downloadPath: "/tmp/playwright-artifacts-dLodID", behavior: "allowAndName" } }, "1", "127.0.0.1", "/tmp"),
+    { params: { downloadPath: A, behavior: "allowAndName" } },
+  );
+  assert.equal(
+    normalizeString("ws://127.0.0.1:44337/x /tmp/playwright-artifacts-dLodID", "44337", "127.0.0.1", "/tmp"),
+    `ws://127.0.0.1:<PORT>/x ${A}`,
+  );
+  assert.equal(n(A, "/tmp"), A);
+});
+
+t("normalize leaves non-matching temp dir shapes unchanged", () => {
+  const same = (s, tmp = "/tmp") => assert.equal(normalizeString(s, undefined, undefined, tmp), s);
+  same("/home/u/playwright-artifacts-abcdef");
+  same("/tmpx/playwright-artifacts-abcdef");
+  same("/foo/tmp/playwright-artifacts-abcdef");
+  same("/tmp/playwright-artifacts-abcde");
+  same("/tmp/playwright-artifacts-abcdefg");
+  same("/tmp/playwright-other-abcdef");
+  same("/tmp/xplaywright-artifacts-abcdef");
+  same("/TMP/playwright-artifacts-abcdef");
+  assert.equal(normalizeString("/tmp/playwright-artifacts-abcdef", "1", "127.0.0.1"), "/tmp/playwright-artifacts-abcdef");
+  same("/tmp/playwright-artifacts-abcdef", "");
+});
+
 t("committed trace conforms to schema", () => {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const text = readFileSync(path.join(here, "results", "newpage-trace.jsonl"), "utf8");
   assert.deepEqual(validateJsonl(text), []);
   assert.ok(!text.includes("/home/"), "no local absolute paths");
+  assert.ok(!text.includes("playwright-artifacts-"), "temp dir is normalized");
 });
 
 await Promise.all(asyncCases);
