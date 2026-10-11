@@ -32,6 +32,14 @@ name: CI
 # - clippy -D warnings ゲートは REPAIR-6（TASK-5.2・#32 / TASK-7・#335）。ライセンス検査は
 #   TASK-77（#64）・TASK-9.1（#338・REPAIR-8）。Servo 前提は TASK-56.1（#195・XOS-6・MS-3）。
 #   TASK-9.3（#340・REPAIR-8・MS-7）: push / pull_request トリガーと本格 CI 統合の完了記録。
+#
+# cargo cache（詳細は .claude/rules/github-actions.md「キャッシュ方針」）:
+# - restore（actions/cache/restore）は全イベント、save（actions/cache/save）は main（refs/heads/main）
+#   で exact hit しなかったときだけ。PR は main の cache を読むだけで書かない
+# - key は `rust-<OS>-<種別>-vN-<rustc cachekey>-<hashFiles('Cargo.lock')>`。
+#   lockfile はルートのみ（`**/Cargo.lock` は .agents 配下のサンプルまで拾い、依存不変でも
+#   全 cache が作り直されるため使わない）。rustc を含めるのは stable 更新後に古い target を
+#   exact hit で復元し続けないため。restore-keys は同じ rustc の範囲に限る
 
 on:
   workflow_dispatch:
@@ -263,22 +271,22 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
           components: clippy
       - name: "cargo cache の復元"
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: fandhe-browser-${{ runner.os }}-test-v4-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            fandhe-browser-${{ runner.os }}-test-v4-
-            fandhe-browser-${{ runner.os }}-test-v3-
+          key: rust-${{ runner.os }}-test-v5-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-test-v5-${{ steps.toolchain.outputs.cachekey }}-
       - name: "cargo clippy（workspace・--all-features・-D warnings）"
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: "cargo test（workspace・--all-features）"
@@ -286,6 +294,16 @@ jobs:
         run: cargo test --workspace --all-features
       - name: "cache 保存前に workspace 成果物を prune"
         run: bash scripts/ci-prune-target.sh
+      - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   rust-test-macos:
     needs: changes
@@ -303,22 +321,22 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
           components: clippy
       - name: "cargo cache の復元"
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: fandhe-browser-${{ runner.os }}-test-v4-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            fandhe-browser-${{ runner.os }}-test-v4-
-            fandhe-browser-${{ runner.os }}-test-v3-
+          key: rust-${{ runner.os }}-test-v5-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-test-v5-${{ steps.toolchain.outputs.cachekey }}-
       - name: "cargo clippy（workspace・--all-features・-D warnings）"
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: "cargo test（workspace・--all-features）"
@@ -326,6 +344,16 @@ jobs:
         run: cargo test --workspace --all-features
       - name: "cache 保存前に workspace 成果物を prune"
         run: bash scripts/ci-prune-target.sh
+      - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   rust-test-windows:
     needs: changes
@@ -380,20 +408,22 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
           components: clippy
       - name: "cargo cache の復元"
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: fandhe-browser-${{ runner.os }}-features-v1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: fandhe-browser-${{ runner.os }}-features-v1-
+          key: rust-${{ runner.os }}-features-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-features-v2-${{ steps.toolchain.outputs.cachekey }}-
       - name: "[default] cargo clippy（既定 feature）"
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: "[default] cargo test（既定 feature）"
@@ -440,6 +470,16 @@ jobs:
         run: cargo test -p fandhe-browser-js --features js-v8
       - name: "cache 保存前に workspace 成果物を prune"
         run: bash scripts/ci-prune-target.sh
+      - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   rust-features-macos:
     needs: changes
@@ -457,20 +497,22 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
           components: clippy
       - name: "cargo cache の復元"
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: fandhe-browser-${{ runner.os }}-features-v1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: fandhe-browser-${{ runner.os }}-features-v1-
+          key: rust-${{ runner.os }}-features-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-features-v2-${{ steps.toolchain.outputs.cachekey }}-
       - name: "[default] cargo clippy（既定 feature）"
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: "[default] cargo test（既定 feature）"
@@ -517,6 +559,16 @@ jobs:
         run: cargo test -p fandhe-browser-js --features js-v8
       - name: "cache 保存前に workspace 成果物を prune"
         run: bash scripts/ci-prune-target.sh
+      - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   rust-features-windows:
     needs: changes
@@ -619,19 +671,21 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
       - name: "cargo cache の復元"
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: fandhe-browser-${{ runner.os }}-harness-v1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: fandhe-browser-${{ runner.os }}-harness-v1-
+          key: rust-${{ runner.os }}-harness-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-harness-v2-${{ steps.toolchain.outputs.cachekey }}-
       - name: "前提ツール（jq・node 22 以降）の確認"
         run: |
           if ! command -v jq >/dev/null 2>&1; then
@@ -740,6 +794,16 @@ jobs:
           exit "$status"
       - name: "cache 保存前に workspace 成果物を prune"
         run: bash scripts/ci-prune-target.sh
+      - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   harness-macos:
     needs: changes
@@ -759,19 +823,21 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
       - name: "cargo cache の復元"
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: fandhe-browser-${{ runner.os }}-harness-v1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: fandhe-browser-${{ runner.os }}-harness-v1-
+          key: rust-${{ runner.os }}-harness-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-harness-v2-${{ steps.toolchain.outputs.cachekey }}-
       - name: "前提ツール（jq・node 22 以降）の確認"
         run: |
           if ! command -v jq >/dev/null 2>&1; then
@@ -880,6 +946,16 @@ jobs:
           exit "$status"
       - name: "cache 保存前に workspace 成果物を prune"
         run: bash scripts/ci-prune-target.sh
+      - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   harness-windows:
     needs: changes
@@ -1200,14 +1276,15 @@ jobs:
           components: clippy
           targets: aarch64-apple-darwin,x86_64-pc-windows-msvc
       - name: "cargo cache の復元（registry のみ）"
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: fandhe-browser-${{ runner.os }}-cross-v1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: fandhe-browser-${{ runner.os }}-cross-v1-
+          key: rust-${{ runner.os }}-cross-v2-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-cross-v2-
       - name: "cargo check（aarch64-apple-darwin・--all-features）"
         run: >-
           cargo check --workspace --all-targets --all-features --target aarch64-apple-darwin
@@ -1243,3 +1320,12 @@ jobs:
           cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc
           --exclude fandhe-browser-core --exclude fandhe-browser-ai --exclude fandhe-browser-cdp
           --exclude fandhe-browser-cli --exclude wpt-subset-runner -- -D warnings
+      - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache.outputs.cache-primary-key }}
