@@ -40,7 +40,7 @@ Rust checks (skipped while Cargo.toml or member crates are absent)
 Harnesses, benches, measurements (scripts/harness.sh <name>)
   test-harness  check-compat-practical  check-compat-regression  bench-record  check-ci-changes
   check-bench-record  check-binary-size  measure-mcp-envelope  check-mcp-envelope
-  measure-js-binary-size  measure-cssom-profile-cost  trace-playwright  check-playwright-trace
+  measure-js-binary-size  measure-container-size  measure-cssom-profile-cost  trace-playwright  check-playwright-trace
   check-puppeteer-connect
 
 Docker (one-line calls, not wrapped in scripts/)

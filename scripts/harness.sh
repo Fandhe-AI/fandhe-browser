@@ -10,12 +10,15 @@
 #   measure-mcp-envelope     方式 B 本体と MCP エンベロープの測定（PLUG-5。unix のみ）
 #   check-mcp-envelope       上記ハーネスの e2e smoke（unix のみ。0 件実行は NG）
 #   measure-js-binary-size   JS エンジン構成別バイナリサイズ計測（JS-3・PERF-1。要 jq）
+#   measure-container-size   既定・軽量コンテナと比較対象（Playwright 公式）のイメージサイズ計測（CTR-1・CTR-5。要 docker・jq）
 #   measure-cssom-profile-cost  CSSOM プロファイル読み込みのコスト計測（PLUG-8。要 jq）
 #   trace-playwright | check-playwright-trace | check-puppeteer-connect   CDP トレース収集・自己テスト（要 node）
 #   test-harness             harness/render-screenshot のユニット・結合テスト（要 python3）
 #
 # 上書き可能な環境変数（`make <target> VAR=value` も可）: BINARY_SIZE_PACKAGE・BINARY_SIZE_LIMIT_BYTES・
 # JS_BINARY_SIZE_STRIP（非空で --strip）・CSSOM_PROFILE_COST_ARGS・MCP_ENVELOPE_ARGS・
+# CONTAINER_SIZE_REFERENCE_IMAGE・CONTAINER_SIZE_REFERENCE_DIGEST・CONTAINER_SIZE_DEFAULT_IMAGE・
+# CONTAINER_SIZE_LITE_IMAGE・CONTAINER_SIZE_PLATFORM・CONTAINER_SIZE_SKIP_BUILD・CONTAINER_SIZE_NO_PULL（非空で有効）・
 # MCP_ENVELOPE_TARGET_DIR・PLAYWRIGHT_VERSION・PLAYWRIGHT_INTEGRITY（既定値は scripts/versions.sh）。
 # 各ハーネスの詳細は harness/*/README.md・benches/*/README.md を参照。
 set -euo pipefail
@@ -29,6 +32,11 @@ name="$1"
 # 空白区切りの追加引数（意図的に単語分割する）
 : "${MCP_ENVELOPE_ARGS:=}"
 : "${JS_BINARY_SIZE_STRIP:=}"
+: "${CONTAINER_SIZE_DEFAULT_IMAGE:=fandhe-browser:default}"
+: "${CONTAINER_SIZE_LITE_IMAGE:=fandhe-browser:lite}"
+: "${CONTAINER_SIZE_PLATFORM:=}"
+: "${CONTAINER_SIZE_SKIP_BUILD:=}"
+: "${CONTAINER_SIZE_NO_PULL:=}"
 : "${CSSOM_PROFILE_COST_ARGS:=--out benches/cssom_profile_cost/results/cssom-profile-cost.json}"
 
 # 相対 CARGO_TARGET_DIR でも resolve_bin（絶対パス必須）を通すため絶対化する。
@@ -123,6 +131,23 @@ case "${name}" in
     bash harness/binary-size/measure-js-engine-configs.sh \
       --package "${BINARY_SIZE_PACKAGE}" \
       ${strip_arg[@]+"${strip_arg[@]}"}
+    ;;
+  measure-container-size)
+    # 計測のみでゲートではない（70% 判定は #488・95% 判定は TASK-68）。docker build（release）と
+    # 比較対象の pull（数 GB）を伴うため `make ci` には含めない。値は配列で渡し単語分割しない。
+    require_cmd docker "required by ${name}"
+    require_cmd jq "required by ${name}"
+    bash harness/container-size/self-test.sh
+    cs_args=()
+    [ -z "${CONTAINER_SIZE_PLATFORM}" ] || cs_args+=(--platform "${CONTAINER_SIZE_PLATFORM}")
+    [ -z "${CONTAINER_SIZE_SKIP_BUILD}" ] || cs_args+=(--skip-build)
+    [ -z "${CONTAINER_SIZE_NO_PULL}" ] || cs_args+=(--no-pull)
+    bash harness/container-size/measure.sh \
+      --reference-image "${CONTAINER_SIZE_REFERENCE_IMAGE}" \
+      --reference-digest "${CONTAINER_SIZE_REFERENCE_DIGEST}" \
+      --default-image "${CONTAINER_SIZE_DEFAULT_IMAGE}" \
+      --lite-image "${CONTAINER_SIZE_LITE_IMAGE}" \
+      ${cs_args[@]+"${cs_args[@]}"}
     ;;
   measure-cssom-profile-cost)
     # release ビルドを伴う一度きりの記録で RSS がランナー差で揺れるため `make ci` には含めない。
