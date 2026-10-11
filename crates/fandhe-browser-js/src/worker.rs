@@ -718,6 +718,12 @@ fn create_v8_child_engine() -> Result<Box<dyn ChildEngine>, String> {
     // ならないようにするため。Issue #520 実装計画）。
     let actual_platform =
         super::v8_engine::ensure_v8_initialized_with(super::v8_engine::V8PlatformKind::Protected);
+    // 実際に選ばれた Platform 種別を常に 1 行だけ stderr へ出す（`JS-1`・
+    // `TASK-29`・Issue #520）。結合テスト
+    // `js_1_worker_process_initializes_v8_platform_as_protected` が
+    // `V8ProcessEngine::stderr_tail_for_test` 経由でこの行を読み、Protected
+    // 初期化の退行を検出する。stdout はプロトコル専用のため使わない。
+    eprintln!("fandhe-browser-js worker: v8 platform initialized as {actual_platform:?}");
     if actual_platform != super::v8_engine::V8PlatformKind::Protected {
         // 正規の子プロセスでは起こり得ない。保護が有効であるかのように
         // 装わず、診断を出して評価は継続する（unprotected のままでも従来と
