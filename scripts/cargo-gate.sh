@@ -43,7 +43,8 @@ rendering_gate() {
   local sub="$1" meta
   need_members
   meta="$(cargo_metadata)"
-  if ! printf '%s\n' "${meta}" | grep -q '"rendering":'; then
+  # `printf | grep -q` は pipefail 下で grep の早期終了により SIGPIPE となり誤って skip するため、パイプを使わない
+  if [[ "${meta}" != *'"rendering":'* ]]; then
     skip "the rendering feature is not defined; ${gate} skipped"
   fi
   if [ "${sub}" = lint ]; then
@@ -61,7 +62,7 @@ case "${gate}" in
       echo "error: Cargo.toml is not a valid manifest for cargo" >&2
       exit 1
     }
-    if ! printf '%s\n' "${out}" | grep -q '"success"'; then
+    if [[ "${out}" != *'"success"'* ]]; then
       echo "${out}" >&2
       echo "error: cargo verify-project did not report success" >&2
       exit 1
