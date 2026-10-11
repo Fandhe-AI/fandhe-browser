@@ -194,6 +194,8 @@ count_shared_libs() {
   cid="${cid//$'\r'/}"
   CIDS="${CIDS} ${cid}"
   if ! listing=$(docker export "$cid" 2>/dev/null | tar -t 2>/dev/null); then
+    # コマンド置換（サブシェル）内のため CIDS が親へ伝わらない。ここで明示的に後始末する。
+    docker rm -f "$cid" >/dev/null 2>&1 || true
     echo "error: docker export failed for shared library check" >&2
     exit 1
   fi
