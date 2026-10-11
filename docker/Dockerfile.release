@@ -1,0 +1,102 @@
+# fandhe-browser の既定コンテナ（配布用）。
+#
+# TASK-64（64.1）・CTR-1・CTR-4・MS-5。既定 feature（V8 のみ同梱）の
+# fandhe-browser-cli を x86_64-unknown-linux-musl の静的リンク単一バイナリとして
+# ビルドし、scratch イメージにバイナリ・CA 証明書バンドル・ライセンス文書・データディレクトリだけを入れる。
+# リポジトリルートの開発用 Dockerfile（lint・テスト用）とは別物で、配布には使わない。
+#
+# ビルド: docker build -f docker/Dockerfile.release --target default -t fandhe-browser:default .
+#   （ビルドコンテキストは docker/Dockerfile.release.dockerignore の allowlist で絞られる）
+#
+# 設計（container-cloud.md の決定 1〜5）:
+#   - v8 crate の musl 向け prebuilt をリンクする。V8_FROM_SOURCE は使わない（決定 3）。
+#     リンクできない場合は glibc + distroless へ逃げず停止して報告する（決定 4・オーナー判断）。
+#   - verify ステージで動的リンク 0 件を検査し、落ちたバイナリは最終イメージに入らない（CTR-4）。
+#
+# digest の更新手順: `docker buildx imagetools inspect rust:1-alpine` の
+# digest（multi-arch manifest list）を転記する。ベースイメージを更新したら
+# NOTICE の CA 証明書の版の記載も見直す。
+#
+# RUSTY_V8_ARCHIVE_SHA256 は Cargo.lock の v8 =152.2.0 と連動する。v8 を更新するときは
+# rusty_v8 の該当リリースの librusty_v8_release_x86_64-unknown-linux-musl.a.gz の
+# SHA-256 に同時に差し替える。
+#
+# 後続: #298（TASK-64.2）が lite ターゲット、#299（TASK-64.3）が aarch64 を追加する。
+FROM rust:1-alpine@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627 AS builder
+
+# ビルド専用ツール（配布イメージには入らない）。curl は v8 の prebuilt 取得、
+# file / binutils は verify ステージの検査用。
+RUN apk add --no-cache musl-dev curl file binutils
+
+# 64.2・64.3 では値を足すだけで済むよう引数化する。CARGO_FEATURES が空なら既定 feature。
+ARG RUST_TARGET=x86_64-unknown-linux-musl
+ARG CARGO_FEATURES=
+
+# prebuilt（.gz）の完全性検証。不一致なら v8 の build.rs が失敗する。
+ENV RUSTY_V8_ARCHIVE_SHA256=68f284fb8184b9f9e8d7e23b8f2675dbe464f43f77c0bf152f705bf7ead29558
+
+WORKDIR /build
+# rust-toolchain.toml は意図的にコンテキストから外している（dockerignore 参照）。
+# 含めるとイメージ内の rustup が stable と rustfmt / clippy をネットワーク経由で
+# 追加導入し、digest 固定の再現性が崩れるため。配布ビルドに限る例外で、
+# ツールチェーンの正本は rust-toolchain.toml のまま。
+COPY . .
+
+# 64.1 は x86_64 専用（aarch64 は #299）。
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    set -eu; \
+    host="$(rustc -vV | sed -n 's/^host: //p')"; \
+    if [ "${host}" != "x86_64-unknown-linux-musl" ]; then \
+      echo "error: unsupported build host: ${host} (x86_64-unknown-linux-musl only)" >&2; exit 1; \
+    fi; \
+    features=""; \
+    if [ -n "${CARGO_FEATURES}" ]; then features="--features ${CARGO_FEATURES}"; fi; \
+    cargo build --release --locked -p fandhe-browser-cli --bin fandhe-browser \
+      --target "${RUST_TARGET}" ${features}; \
+    mkdir -p /out; \
+    cp "target/${RUST_TARGET}/release/fandhe-browser" /out/fandhe-browser; \
+    mkdir -p /out/data /out/licenses; \
+    chown 65532:65532 /out/data; \
+    cp NOTICE LICENSE-THIRD-PARTY LICENSE-MIT LICENSE-APACHE /out/licenses/
+
+# 静的リンク検査（CTR-4・決定 5）。合否は NEEDED=0 と INTERP 無しで判定する。
+# static-pie では file が "static-pie linked" を示し動的セクションも持つため、
+# file の文言一致や動的セクション有無は判定に使わず記録のみ行う。musl の ldd は
+# 静的 PIE でもローダ自身（ld-musl）の 1 行を出すため、依存を示す "=>" 行のみ失敗にする。
+FROM builder AS verify
+RUN set -eu; \
+    file /out/fandhe-browser; \
+    readelf -d /out/fandhe-browser || true; \
+    needed="$(readelf -d /out/fandhe-browser | grep -c NEEDED || true)"; \
+    interp="absent"; \
+    if readelf -l /out/fandhe-browser | grep -q INTERP; then interp="present"; fi; \
+    echo "static-link check: NEEDED=${needed}, INTERP=${interp}"; \
+    ldd_out="$(ldd /out/fandhe-browser 2>&1 || true)"; \
+    echo "ldd: ${ldd_out}"; \
+    if [ "${needed}" != "0" ] || [ "${interp}" != "absent" ]; then \
+      echo "error: binary is not statically linked" >&2; exit 1; \
+    fi; \
+    if echo "${ldd_out}" | grep -q -e '=>'; then \
+      echo "error: ldd reports shared libraries" >&2; exit 1; \
+    fi; \
+    test -s /etc/ssl/certs/ca-certificates.crt || { echo "error: CA bundle missing or empty" >&2; exit 1; }; \
+    apk info --who-owns /etc/ssl/certs/ca-certificates.crt
+
+# 既定コンテナ。中身はバイナリ・CA 証明書バンドル（Alpine 由来・無改変）・ライセンス文書・
+# 非 root 用のデータディレクトリだけ。CA 証明書の帰属表示は NOTICE / LICENSE-THIRD-PARTY
+# （OSS-2・TASK-76）。静的リンクした V8 等の著作権表示・ライセンス条文を配布イメージ単体で
+# 受領者へ渡すため、これらを /licenses/ へ同梱する。
+FROM scratch AS default
+COPY --from=verify /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=verify /out/fandhe-browser /fandhe-browser
+COPY --from=verify /out/licenses /licenses
+# プロファイル保存先（OsDefaultStore は $XDG_DATA_HOME/fandhe-browser を使う）。
+# scratch には HOME も書き込み可能なディレクトリも無いため、UID 65532 所有の /data を用意する。
+COPY --from=verify --chown=65532:65532 /out/data /data
+ENV HOME=/data \
+    XDG_DATA_HOME=/data
+# scratch には /etc/passwd が無いため数値 UID で非 root 実行にする。
+USER 65532:65532
+ENTRYPOINT ["/fandhe-browser"]
