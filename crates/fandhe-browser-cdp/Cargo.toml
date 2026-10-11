@@ -16,8 +16,24 @@ fandhe-backend-http = { workspace = true }
 fandhe-backend-routes = { workspace = true }
 serde_json = { workspace = true }
 
+# feature は新規依存を増やさない転送のみ。`test-support` は結合テスト専用の入口
+# （`test_support`）を有効にする。js-v8 / js-boa は core の同名 feature を転送する。
+[features]
+default = []
+js-v8 = ["fandhe-browser-core/js-v8"]
+js-boa = ["fandhe-browser-core/js-boa"]
+test-support = []
+
 [dev-dependencies]
 # テストで AppState 構築に使う Profile::open 専用
 fandhe-browser-profile = { path = "../fandhe-browser-profile" }
 # 結合テストの #[tokio::test]（feature は workspace 定義のまま）
 tokio = { workspace = true }
+
+# TASK-112・Issue #785・`JS-4`/`CDP-1`: `Page.navigate` がページ JS を実行した後の DOM を
+# `DOM.getDocument` で取得できることと、イベント送出順を実エンジン（boa）で検証する結合テスト。
+# JS ワーカー役を兼ねるため独自 `main`（`harness = false`）。
+[[test]]
+name = "page_scripts_navigate"
+harness = false
+required-features = ["js-boa", "test-support"]

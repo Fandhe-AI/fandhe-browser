@@ -32,6 +32,48 @@ pub mod server;
 pub mod target;
 mod ws;
 
+/// 結合テスト専用の薄い入口（feature `test-support`・`#[doc(hidden)]`）。ループバック取得を許可した
+/// `Page.navigate` と `DOM.getDocument` だけのディスパッチャを公開 API 越しに駆動する。
+/// 本番の組込み表（`Dispatcher::builtin`）は内部アドレスを拒否するため、実ページ JS 実行の
+/// 成功経路（`PageScriptOutcome::Executed`）を CDP の入口から検証する唯一の手段として置く
+/// （`JS-4`・`CDP-1`）。既定ビルドには含まれない。
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support {
+    use std::sync::Arc;
+
+    use fandhe_browser_core::{Error, FetchOptions};
+
+    use crate::CdpState;
+    use crate::dom::DomGetDocument;
+    use crate::page::PageNavigate;
+    use crate::protocol::Dispatcher;
+
+    /// ループバック許可の `Page.navigate` と `DOM.getDocument` を持つディスパッチャ。
+    pub struct LoopbackDispatcher(Dispatcher);
+
+    impl LoopbackDispatcher {
+        /// 構築する。`Fetcher` 構築失敗のみ `Err`。
+        pub fn new() -> Result<Self, Error> {
+            let nav =
+                PageNavigate::new(FetchOptions::new().with_allow_private_network_access(true))?;
+            let d = Dispatcher::from_handlers(vec![
+                ("Page.navigate", Box::new(nav)),
+                ("DOM.getDocument", Box::new(DomGetDocument)),
+            ])
+            .map_err(|_| Error::InvalidInput {
+                message: "dispatcher".to_owned(),
+            })?;
+            Ok(Self(d))
+        }
+
+        /// 1 リクエストを処理し、送出順（応答 → イベント列）の JSON フレームを返す。
+        pub async fn dispatch(&self, state: &Arc<CdpState>, text: &str) -> Vec<String> {
+            self.0.dispatch_on(state, None, text).await.into_frames()
+        }
+    }
+}
+
 pub use method_log::{MethodCounts, ReceivedMethodsSnapshot};
 pub use server::{CdpEndpoints, CdpState, WsConfigError, endpoints};
 pub use target::{

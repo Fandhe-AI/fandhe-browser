@@ -8,7 +8,7 @@
 //! await するため。`page_runner` のモジュール doc）。cdp のハンドラ（`Send` な async）は直接
 //! 呼べないので、本モジュールが専用スレッドでランナーを駆動し、ハンドルの
 //! [`PageScriptHandle::run_page_scripts`] が結果を返す。`AppState::page_scripts()`
-//! （`CdpState::app_state()` 経由）で到達でき、`navigate_gated` への接続は TASK-113（#785）が行う。
+//! （`CdpState::app_state()` 経由）で到達でき、cdp の `navigate_gated` が HTML 取得後・確定前に呼ぶ（TASK-112・#785）。
 //! cli が設定 `[js] execute_page_scripts` からハンドルを構築して `AppState` へ渡す。
 //!
 //! # tokio を持たない理由と実行器
@@ -440,6 +440,41 @@ struct State {
     latest: HashMap<NavigationScope, NavigationGeneration>,
 }
 
+impl State {
+    /// `scope` の最新世代を `generation` に記録し、より古い世代の待ちジョブを取り除いて打ち切り、
+    /// 実行中のより古い要求へ打ち切りを通知する。呼び出し側は「より新しい世代を受け付け済み」で
+    /// ないことを確認してから呼ぶ（待ち枠を即座に空け、待ち行列に残るのは打ち切られていない
+    /// ジョブだけという不変条件を保つ）。
+    fn note_generation(&mut self, scope: NavigationScope, generation: NavigationGeneration) {
+        if self.latest.len() >= MAX_TRACKED_SCOPES && !self.latest.contains_key(&scope) {
+            let live: Vec<NavigationScope> = self
+                .queue
+                .iter()
+                .map(|j| j.request.scope)
+                .chain(self.running.as_ref().map(|r| r.scope))
+                .collect();
+            self.latest.retain(|k, _| live.contains(k));
+        }
+        self.latest.insert(scope, generation);
+        let mut kept = VecDeque::with_capacity(self.queue.len());
+        for job in self.queue.drain(..) {
+            if job.request.scope == scope && job.request.generation < generation {
+                job.state.cancel();
+            } else {
+                kept.push_back(job);
+            }
+        }
+        self.queue = kept;
+        if let Some(r) = self
+            .running
+            .as_ref()
+            .filter(|r| r.scope == scope && r.generation < generation)
+        {
+            r.state.cancel();
+        }
+    }
+}
+
 /// `State::latest` の保持上限。超えたら待ち・実行中でない scope の記録から捨てる
 /// （捨てた scope の遅延要求は打ち切れないが、無制限の増加を避ける）。
 const MAX_TRACKED_SCOPES: usize = 1024;
@@ -602,6 +637,22 @@ impl PageScriptHandle {
         }
     }
 
+    /// 遷移の開始を通知し、同じ遷移系列の古い世代の要求（待ち・実行中）を直ちに打ち切る。
+    ///
+    /// HTML の取得中・`about:blank` への遷移・取得失敗でも古いページの JS とページ内 fetch を
+    /// 続けさせないために、呼び出し側（cdp の `Page.navigate`）が世代の払い出し直後に呼ぶ
+    /// （`JS-4`・`JS-6`）。無効なハンドルでは何もしない。
+    pub fn begin_generation(&self, scope: NavigationScope, generation: NavigationGeneration) {
+        if self.inner.executor.is_none() {
+            return;
+        }
+        let mut st = self.inner.shared.lock();
+        if st.latest.get(&scope).is_some_and(|g| *g > generation) {
+            return;
+        }
+        st.note_generation(scope, generation);
+    }
+
     /// ページのスクリプトを専用スレッドで実行する要求を出す。
     ///
     /// 受付（無効・世代の比較と古い要求の打ち切り・`<script>` なし・上限の判定・ワーカーの起動）は呼び出した時点で
@@ -622,36 +673,7 @@ impl PageScriptHandle {
         if st.latest.get(&scope).is_some_and(|g| *g > generation) {
             return PageRunFuture::ready(Err(PageScriptError::Cancelled));
         }
-        if st.latest.len() >= MAX_TRACKED_SCOPES && !st.latest.contains_key(&scope) {
-            let live: Vec<NavigationScope> = st
-                .queue
-                .iter()
-                .map(|j| j.request.scope)
-                .chain(st.running.as_ref().map(|r| r.scope))
-                .collect();
-            st.latest.retain(|k, _| live.contains(k));
-        }
-        st.latest.insert(scope, generation);
-
-        // より古い待ちジョブは取り除いてから打ち切る（待ち枠を即座に空け、不変条件
-        // 「待ち行列に残るのは打ち切られていないジョブだけ」を保つ）。実行中のより古い
-        // 要求は打ち切りを通知する。
-        let mut kept = VecDeque::with_capacity(st.queue.len());
-        for job in st.queue.drain(..) {
-            if job.request.scope == scope && job.request.generation < generation {
-                job.state.cancel();
-            } else {
-                kept.push_back(job);
-            }
-        }
-        st.queue = kept;
-        if let Some(r) = st
-            .running
-            .as_ref()
-            .filter(|r| r.scope == scope && r.generation < generation)
-        {
-            r.state.cancel();
-        }
+        st.note_generation(scope, generation);
 
         // `<script` が無い要求はスレッドを起動せず Skipped にするが、古い世代の打ち切り（JS-4）は
         // 上で済ませてから返す（取得・実行を続けさせない）。
@@ -1227,6 +1249,28 @@ mod tests {
         let (rb, rn) = rt.block_on(async { tokio::join!(blocker, newer) });
         assert!(executed_html(rb).contains("gate-blocker"));
         assert!(executed_html(rn).contains("gen-2"));
+    }
+
+    /// `JS-4`: 遷移の開始通知（`begin_generation`）だけで、実行中の古い世代が打ち切られる
+    /// （後続の要求が来なくても、`about:blank`・取得失敗で古いページの JS を続けない）。
+    #[test]
+    fn js_4_begin_generation_cancels_running_older_without_new_request() {
+        let driver = Arc::new(FakeDriver::default());
+        let handle = handle(Arc::clone(&driver));
+        let state = NavigationState::new();
+        let rt = rt();
+
+        let late_req = req("late", &state, 1);
+        let first = handle.run_page_scripts(req("hang-gen-1", &state, 1));
+        wait_until("first started", || {
+            driver.started.load(Ordering::SeqCst) == 1
+        });
+        handle.begin_generation(state.scope(), nth_generation(&state, 2));
+        let r = rt.block_on(first);
+        assert!(matches!(r, Err(PageScriptError::Cancelled)), "{r:?}");
+        // 通知済みの世代より古い要求は実行されない。
+        let late = handle.run_page_scripts(late_req);
+        assert!(matches!(rt.block_on(late), Err(PageScriptError::Cancelled)));
     }
 
     /// `JS-4`: 遅れて届いた古い世代は即 `Cancelled`。
