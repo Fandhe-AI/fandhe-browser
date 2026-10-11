@@ -112,4 +112,4 @@ DCO（Developer Certificate of Origin）/ CLA（Contributor License Agreement）
 
 - セキュリティ上の脆弱性は公開 Issue では報告しない
 - 脆弱性の報告窓口は今後 `SECURITY.md` で整備する予定（TASK-79.4）
-- 行動規範は今後 `CODE_OF_CONDUCT.md` で整備する予定（TASK-79.3）
+- 行動規範は [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) を参照する（報告窓口の連絡先は TASK-79（79.h1）で確定する）
