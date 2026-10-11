@@ -72,6 +72,8 @@
 //! [`page_runner`] モジュール（TASK-109・#780・`JS-4`・`JS-6`）は、上記を組み合わせて
 //! inline `<script>` を文書順に実行し、例外を集約しつつ実時間上限で打ち切って、変更後の
 //! HTML を返す（`src` の取得・DOMContentLoaded / load は #781）。
+//! [`event_loop`] モジュール（TASK-110・#782・`JS-7`・`JS-6`）は、`setTimeout` / `setInterval` を
+//! 実時間を待たずに期限順で発火させる仮想時間のタイマーキューと上限を持つ。
 //!
 //! # スタブについて
 //!
@@ -80,7 +82,7 @@
 //!
 //! - [`cssom`]（`CORE-5`・`TASK-105`・`MS-8`。型定義・宣言パーサー・詳細度計算・ルール分割・スタイル源収集・セレクタマッチング・カスケード解決のみ。`!important`・継承等は未実装）
 //! - [`page_script`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。収集のみ。SVG の script・`language`・module 実行等は未実装）
-//! - [`page_runner`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。`src` 取得・総バイト上限・DOMContentLoaded / load 発火まで実装済み。アクター化は #784）
+//! - [`page_runner`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。`src` 取得・総バイト上限・DOMContentLoaded / load 発火・仮想時間のタイマーループ（#782）まで実装済み。アクター化は #784）
 //! - [`dom_bridge`]（`JS-5`・`JS-6`・`TASK-108`・`MS-6`。`setInnerHTML` は `Document::set_inner_html` で置換する。DOM 操作以外の op は未実装）
 //! - [`js_shim`]（`JS-5`・`TASK-108`・`MS-6`。window / location / navigator / console は #779）
 //! - [`js_stub`]（`JS-2`・`TASK-30`・`MS-3`）
@@ -97,6 +99,7 @@ pub mod cssom_profile;
 pub mod dom;
 pub mod dom_bridge;
 pub mod error;
+pub mod event_loop;
 pub mod fetch;
 pub mod host;
 pub mod js_shim;
@@ -131,6 +134,10 @@ pub use dom_bridge::{
     IgnoredLocationChange, LocationChangeKind, MAX_BRIDGE_DIAGNOSTICS, MAX_CONSOLE_MESSAGE_BYTES,
 };
 pub use error::{DomError, Error, NameKind, ParseError, Result};
+pub use event_loop::{
+    DEFAULT_MAX_REGISTERED_TIMERS, DEFAULT_MAX_TIMER_FIRES, DEFAULT_MAX_VIRTUAL_TIME,
+    EventLoopLimits, MAX_TIMER_DELAY_MS,
+};
 pub use fetch::{FetchOptions, FetchResponse, Fetcher, USER_AGENT};
 // js crate のワーカー入口をそのまま再エクスポートする（ラッパーを挟まない）。ラッパーで
 // マーカー設定時にも `None` を返すと fail-closed が崩れるため（security.md・`JS-2`・#513）。
@@ -145,10 +152,10 @@ pub use observability::{
 };
 pub use page_runner::{
     AbortKind, DEFAULT_MAX_SRC_SCRIPT_BYTES, DEFAULT_MAX_TOTAL_SCRIPT_BYTES,
-    DEFAULT_PAGE_WALL_TIME, DEFAULT_SCRIPT_WALL_TIME, LifecycleEvent, LifecycleEventRecord,
-    LifecycleOutcome, MAX_SCRIPT_ERROR_MESSAGE_BYTES, PageAbort, PageRunInput, PageRunOptions,
-    PageRunOutput, ScriptBytesScope, ScriptOutcome, ScriptRunRecord, SrcFetchErrorKind,
-    WallTimeScope, page_script_fetch_options, run_page_scripts,
+    DEFAULT_PAGE_WALL_TIME, DEFAULT_SCRIPT_WALL_TIME, EventLoopReport, LifecycleEvent,
+    LifecycleEventRecord, LifecycleOutcome, MAX_SCRIPT_ERROR_MESSAGE_BYTES, PageAbort,
+    PageRunInput, PageRunOptions, PageRunOutput, ScriptBytesScope, ScriptOutcome, ScriptRunRecord,
+    SrcFetchErrorKind, WallTimeScope, page_script_fetch_options, run_page_scripts,
 };
 pub use page_script::{
     CollectedScripts, DEFAULT_MAX_INLINE_SCRIPT_BYTES, DEFAULT_MAX_PAGE_SCRIPTS,

@@ -1,6 +1,6 @@
 //! ページスクリプトランナー: `<script>` の順次実行・`src` の取得・総量上限・
-//! DOMContentLoaded / load の発火と失敗の集約
-//! （TASK-109・MS-6・Issue #780・#781・ビヘイビア `JS-4`・`JS-6`・`JS-8`）。
+//! DOMContentLoaded / load の発火・仮想時間のタイマーループと失敗の集約
+//! （TASK-109・TASK-110・MS-6・Issue #780・#781・#782・ビヘイビア `JS-4`・`JS-6`・`JS-7`・`JS-8`）。
 //!
 //! 「HTML を受け取り、`<script>` を文書順に実行し、変更後の HTML と実行結果の診断を返す」
 //! 入口。部品は次のとおり組み合わせる。
@@ -14,14 +14,19 @@
 //! 呼び出し元は、TASK-112（#784）の専用スレッド上のアクター（`Page.navigate` への配線）を
 //! 想定する。
 //!
-//! # 処理の 3 段構成
+//! # 処理の 4 段構成
 //!
 //! 1. **prepare（同期）**: パースと収集、base URL の検証。
 //! 2. **load（async）**: 文書順に `src` を [`Fetcher`] で取得しつつ、スクリプト総バイトを
 //!    評価する。すべての `.await` は [`JsRuntime`] / [`DomBridge`] の生成より前に置き、
 //!    future を `Send` に保つ。
 //! 3. **execute（同期）**: 取得済みのソースを文書順に実行し、打ち切られていなければ
-//!    DOMContentLoaded → load を発火する。
+//!    DOMContentLoaded → load を発火する。各 `<script>` とライフサイクルイベントの後に
+//!    microtask checkpoint（`__fandheRunMicrotasks()`）を評価する。
+//! 4. **event loop（同期。`JS-7`）**: load の後に、保留中のタイマーを仮想時間の期限順に
+//!    `__fandheRunTimer(id)` で発火する（実時間は待たない）。発火回数・仮想時間・保留中タイマー数の
+//!    上限を超えたら [`AbortKind`] で打ち切り、その時点の DOM を確定する。実時間の上限
+//!    （スクリプト単位・ページ全体）はタイマーの評価にも課す。
 //!
 //! # 契約
 //!
@@ -30,6 +35,8 @@
 //! - 解放の順序は「診断の取得、`DomBridge::detach`、`JsRuntime` の drop、シリアライズ」。
 //!   打ち切り後に放棄されたネイティブ呼び出しが遅れて DOM を変更しても、detach 済みのため
 //!   結果には影響せず、子プロセス版エンジンは drop で kill / wait される（`JS-6`）。
+//! - 打ち切り後はイベントループを回さない。タイマーのコールバック例外は
+//!   [`BridgeDiagnostics::timer_errors`] に集約し、後続のタイマーを続ける。
 //! - 例外は集約して後続を続ける。実時間超過・リソース上限・エンジン不能・件数 / バイト上限は
 //!   fail-closed で以降の実行を打ち切り、残りを [`ScriptOutcome::NotExecuted`] にする。
 //!   打ち切り後は DOMContentLoaded / load を発火せず、その時点の DOM を確定して返す。
@@ -50,6 +57,13 @@
 //! - 要素レベルの EventTarget・`onload` / `onreadystatechange` プロパティ・
 //!   キャプチャ / 完全なバブリング、`async` / `defer` の順序近似（全て文書順で実行する）。
 //! - 上限値の設定ファイルからの読み込みと専用スレッド化は TASK-112（#784）の担当。
+//! - イベントループは全スクリプトと load の後に回す近似で、実ブラウザのようにスクリプトの間へ
+//!   0ms タイマーが割り込む順序にはならない。ネイティブ `Promise` のジョブは仮想ループへ
+//!   統合しない（エンジン依存。TASK-30）。HTML のネスト時 4ms クランプも行わない。
+//!   文字列ハンドラ（`setTimeout("code")`）は評価せず診断のみ残す（意図的な差異）。
+//!   `Date` は実時間のままで仮想時間と連動しない。
+//! - 仮想時間の上限（既定 30 秒）より後に期限を持つタイマーが残るページは、load の後に
+//!   [`AbortKind::VirtualTime`] の診断が付く（DOM の確定には影響しない。TASK-113 で再評価）。
 //! - 可観測性（対応する `OperationKind` が無い）は未対応。
 //! - パースは既定の `scripting_enabled = false` のため `<noscript>` の扱いが実ブラウザと異なる。
 //! - スクリプトの completion 値が結果サイズ上限を超えると例外として扱われる
@@ -65,9 +79,10 @@ use crate::config::JsConfig;
 use crate::dom::Document;
 use crate::dom_bridge::{
     BridgeDiagnostics, DocumentReadyState, DomBridge, DomBridgeError, DomBridgeLimits,
-    parse_location,
+    ResourceLimitKind, parse_location,
 };
 use crate::error::Error;
+use crate::event_loop::{EventLoopLimits, NextStep, TimerLimitKind};
 use crate::fetch::{FetchOptions, Fetcher};
 use crate::js_stub::JsRuntime;
 use crate::page_script::{
@@ -140,6 +155,7 @@ pub struct PageRunOptions {
     page_wall_time: Duration,
     max_total_script_bytes: usize,
     max_src_script_bytes: usize,
+    event_loop: EventLoopLimits,
 }
 
 impl Default for PageRunOptions {
@@ -152,6 +168,7 @@ impl Default for PageRunOptions {
             page_wall_time: DEFAULT_PAGE_WALL_TIME,
             max_total_script_bytes: DEFAULT_MAX_TOTAL_SCRIPT_BYTES,
             max_src_script_bytes: DEFAULT_MAX_SRC_SCRIPT_BYTES,
+            event_loop: EventLoopLimits::default(),
         }
     }
 }
@@ -204,6 +221,18 @@ impl PageRunOptions {
     pub fn with_max_src_script_bytes(mut self, limit: usize) -> Self {
         self.max_src_script_bytes = limit;
         self
+    }
+
+    /// イベントループ（タイマー）の上限を差し替える（`JS-6`・`JS-7`）。
+    #[must_use]
+    pub fn with_event_loop_limits(mut self, limits: EventLoopLimits) -> Self {
+        self.event_loop = limits;
+        self
+    }
+
+    /// イベントループ（タイマー）の上限。
+    pub fn event_loop_limits(&self) -> &EventLoopLimits {
+        &self.event_loop
     }
 
     /// パース設定。
@@ -311,6 +340,21 @@ pub enum AbortKind {
         /// 超過した上限の値。
         limit: usize,
     },
+    /// タイマーの発火回数の上限を超えた（`JS-6`・`JS-7`）。
+    TimerFires {
+        /// 超過した上限の値。
+        limit: usize,
+    },
+    /// 仮想時間の上限を超える期限のタイマーが残った（`JS-6`・`JS-7`）。
+    VirtualTime {
+        /// 超過した上限の値。
+        limit: Duration,
+    },
+    /// 保留中のタイマー数の上限を超えた（`JS-6`・`JS-7`）。
+    RegisteredTimers {
+        /// 超過した上限の値。
+        limit: usize,
+    },
 }
 
 impl AbortKind {
@@ -323,6 +367,9 @@ impl AbortKind {
             Self::EngineError => "engine_error",
             Self::ScriptCount { .. } => "script_count",
             Self::ScriptBytes { .. } => "script_bytes",
+            Self::TimerFires { .. } => "timer_fires",
+            Self::VirtualTime { .. } => "virtual_time",
+            Self::RegisteredTimers { .. } => "registered_timers",
         }
     }
 }
@@ -518,6 +565,32 @@ impl PageAbort {
     }
 }
 
+/// イベントループ（仮想時間のタイマー）の実行結果（`JS-7`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EventLoopReport {
+    fired: usize,
+    virtual_elapsed: Duration,
+    pending_at_end: usize,
+}
+
+impl EventLoopReport {
+    /// 発火したタイマーの回数（interval は発火ごとに数える）。
+    pub fn fired(&self) -> usize {
+        self.fired
+    }
+
+    /// 仮想時計の進み（実時間ではない）。
+    pub fn virtual_elapsed(&self) -> Duration {
+        self.virtual_elapsed
+    }
+
+    /// 終了時点で保留中だったタイマー数（上限で打ち切ったときに残る）。
+    pub fn pending_at_end(&self) -> usize {
+        self.pending_at_end
+    }
+}
+
 /// ランナーの結果。
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -529,6 +602,7 @@ pub struct PageRunOutput {
     lifecycle: Vec<LifecycleEventRecord>,
     bridge_diagnostics: BridgeDiagnostics,
     elapsed: Duration,
+    event_loop: EventLoopReport,
 }
 
 impl PageRunOutput {
@@ -565,6 +639,11 @@ impl PageRunOutput {
     /// ブリッジが集めた診断（`console`・無視した `location` 操作・リスナー例外）。
     pub fn bridge_diagnostics(&self) -> &BridgeDiagnostics {
         &self.bridge_diagnostics
+    }
+
+    /// イベントループ（仮想時間のタイマー）の結果（`JS-7`）。
+    pub fn event_loop(&self) -> &EventLoopReport {
+        &self.event_loop
     }
 
     /// ページ時計で測った経過時間（JS 実行の開始から。`src` の取得時間は含まない）。
@@ -861,6 +940,9 @@ fn execute(
     let bridge = DomBridge::new(options.bridge_limits.clone());
     bridge.attach(doc).map_err(bridge_error)?;
     bridge.set_location(input.base_url).map_err(bridge_error)?;
+    bridge
+        .set_event_loop_limits(options.event_loop.clone())
+        .map_err(bridge_error)?;
 
     // 実行され得るソース（バイト上限の超過位置より前の inline / 取得成功した src）の有無。
     let abort_index = byte_abort.as_ref().map(|(i, _)| *i);
@@ -953,20 +1035,33 @@ fn execute(
                 | (ScriptSource::External(_), ScriptLoad::Ready(src)) => {
                     match runtime.as_mut() {
                         Some(rt) => {
-                            let o =
+                            let mut o =
                                 run_one(rt, &ctx, entry.node(), entry.index(), src, &mut abort)?;
-                            // リスナー保持件数の上限超過は、超過させたスクリプトの直後に確定し
-                            // 後続のスクリプトを実行しない（`JS-6`）。
+                            // microtask checkpoint（スクリプト末尾の `queueMicrotask` を実行する。`JS-7`）。
+                            // 上限超過済みなら checkpoint を回さない（超過後に callback が DOM を
+                            // 変更しないよう、下の上限判定で打ち切る。`JS-6`）。
                             if abort.is_none()
-                                && bridge.listener_limit_exceeded().map_err(bridge_error)?
+                                && tripped_abort_kind(&ctx)?.is_none()
+                                && let Some((kind, message)) = microtask_checkpoint(rt, &ctx)
                             {
                                 abort = Some(PageAbort {
-                                    kind: AbortKind::ResourceLimit,
+                                    kind: kind.clone(),
+                                    index: Some(entry.index()),
+                                });
+                                o = ScriptOutcome::Aborted { kind, message };
+                            }
+                            // リスナー・タイマーの保持件数の上限超過は、超過させたスクリプトの直後に
+                            // 確定し後続のスクリプトを実行しない（`JS-6`）。
+                            if abort.is_none()
+                                && let Some(kind) = tripped_abort_kind(&ctx)?
+                            {
+                                abort = Some(PageAbort {
+                                    kind: kind.clone(),
                                     index: Some(entry.index()),
                                 });
                                 // 原因スクリプト自身の結果も打ち切りとして記録する（`JS-6`）。
                                 ScriptOutcome::Aborted {
-                                    kind: AbortKind::ResourceLimit,
+                                    kind,
                                     message: None,
                                 }
                             } else {
@@ -1008,14 +1103,14 @@ fn execute(
 
     // shim のリスナー保持件数の上限超過は、リソース上限による打ち切りとして確定する（`JS-6`）。
     // 以降のライフサイクルは発火しない（fail-closed）。
-    if abort.is_none() && bridge.listener_limit_exceeded().map_err(bridge_error)? {
-        abort = Some(PageAbort {
-            kind: AbortKind::ResourceLimit,
-            index: None,
-        });
+    if abort.is_none()
+        && let Some(kind) = tripped_abort_kind(&ctx)?
+    {
+        abort = Some(PageAbort { kind, index: None });
     }
 
     let lifecycle = fire_lifecycle(&ctx, runtime.as_mut(), &mut abort)?;
+    let event_loop = run_event_loop(&ctx, runtime.as_mut(), &mut abort)?;
 
     let elapsed = page_start.elapsed();
     let bridge_diagnostics = bridge.take_diagnostics().map_err(bridge_error)?;
@@ -1034,9 +1129,12 @@ fn execute(
         records,
         &collected,
         abort,
-        lifecycle,
-        bridge_diagnostics,
-        elapsed,
+        RunTail {
+            lifecycle,
+            bridge_diagnostics,
+            elapsed,
+            event_loop,
+        },
     ))
 }
 
@@ -1219,16 +1317,158 @@ fn fire_lifecycle(
             },
             None => LifecycleOutcome::Dispatched,
         };
-        // リスナーが上限を超えて登録された場合は、以降のイベントを発火しない（`JS-6`）。
-        if abort.is_none() && ctx.bridge.listener_limit_exceeded().map_err(bridge_error)? {
-            *abort = Some(PageAbort {
-                kind: AbortKind::ResourceLimit,
-                index: None,
-            });
+        // microtask checkpoint（リスナー内の `queueMicrotask` を実行する。`JS-7`）。
+        let outcome = match (outcome, runtime.as_deref_mut()) {
+            (LifecycleOutcome::Dispatched, Some(rt))
+                if abort.is_none() && tripped_abort_kind(ctx)?.is_none() =>
+            {
+                match microtask_checkpoint(rt, ctx) {
+                    Some((kind, _)) => {
+                        *abort = Some(PageAbort {
+                            kind: kind.clone(),
+                            index: None,
+                        });
+                        LifecycleOutcome::Aborted { kind }
+                    }
+                    None => LifecycleOutcome::Dispatched,
+                }
+            }
+            (other, _) => other,
+        };
+        // リスナー・タイマーが上限を超えて登録された場合は、以降のイベントを発火しない（`JS-6`）。
+        if abort.is_none()
+            && let Some(kind) = tripped_abort_kind(ctx)?
+        {
+            *abort = Some(PageAbort { kind, index: None });
         }
         records.push(LifecycleEventRecord { event, outcome });
     }
     Ok(records)
+}
+
+/// ブリッジのリソース上限（リスナー・保留中タイマー数）の超過を [`AbortKind`] に写す（`JS-6`）。
+fn tripped_abort_kind(ctx: &RunContext<'_>) -> crate::Result<Option<AbortKind>> {
+    // shim は op のエラー（操作予算切れ）を握りつぶし評価が完了扱いになるため、microtask
+    // checkpoint などの後でもここで検出して打ち切る（`JS-6`・fail-closed）。
+    if ctx.bridge.op_limit_tripped().map_err(bridge_error)? {
+        return Ok(Some(AbortKind::ResourceLimit));
+    }
+    Ok(
+        match ctx.bridge.resource_limit_tripped().map_err(bridge_error)? {
+            None => None,
+            Some(ResourceLimitKind::RegisteredTimers) => Some(AbortKind::RegisteredTimers {
+                limit: ctx.options.event_loop.max_registered_timers(),
+            }),
+            // 未知の種別も含め、リソース上限として打ち切る（fail-closed）。
+            Some(_) => Some(AbortKind::ResourceLimit),
+        },
+    )
+}
+
+/// microtask checkpoint を評価する。打ち切りになる場合だけ理由とエンジンのメッセージを返す
+/// （例外は shim が `timer_errors` に集約するため、ここでは継続扱い。`JS-7`）。
+fn microtask_checkpoint(
+    rt: &mut JsRuntime,
+    ctx: &RunContext<'_>,
+) -> Option<(AbortKind, Option<String>)> {
+    match evaluate_with_budget(rt, ctx, "__fandheRunMicrotasks()") {
+        Evaluated::Completed | Evaluated::Exception { .. } => None,
+        Evaluated::Aborted { kind, message } => Some((kind, message)),
+        Evaluated::BudgetExhausted(kind) => Some((kind, None)),
+    }
+}
+
+/// load の後に、保留中のタイマーを仮想時間の期限順に発火する（`JS-7`・`JS-6`）。
+///
+/// 打ち切り済み・runtime 無しなら回さない。1 周ごとに「保留中タイマー数の超過 → 次のタイマー
+/// （空なら正常終了、仮想時間・発火回数の超過は打ち切り）→ 評価（実時間の上限つき）」の順で判定する。
+/// 評価する文字列は固定の関数名と整数の ID だけで、ページ由来の値を埋め込まない。
+fn run_event_loop(
+    ctx: &RunContext<'_>,
+    runtime: Option<&mut JsRuntime>,
+    abort: &mut Option<PageAbort>,
+) -> crate::Result<EventLoopReport> {
+    if abort.is_none()
+        && let Some(rt) = runtime
+    {
+        loop {
+            if let Some(kind) = tripped_abort_kind(ctx)? {
+                *abort = Some(PageAbort { kind, index: None });
+                break;
+            }
+            // 待機すべきタイマーが無ければ正常終了する（残り時間 0 でも abort 扱いにしない）。
+            let (_, _, pending) = ctx.bridge.event_loop_state().map_err(bridge_error)?;
+            if pending == 0 {
+                break;
+            }
+            // ページの残り時間が無いなら、タイマーを取り出して発火回数に数える前に打ち切る
+            // （取り出すと評価されないまま one-shot が失われ、報告が実態とずれる）。
+            if script_budget(
+                ctx.options.script_wall_time,
+                ctx.options.page_wall_time,
+                ctx.page_start.elapsed(),
+            )
+            .is_none()
+            {
+                *abort = Some(page_wall_abort(ctx.options, None));
+                break;
+            }
+            let id = match ctx.bridge.next_timer().map_err(bridge_error)? {
+                NextStep::Due(id) => id,
+                NextStep::Idle => break,
+                NextStep::Limit(kind) => {
+                    let limits = &ctx.options.event_loop;
+                    let kind = match kind {
+                        TimerLimitKind::VirtualTime => AbortKind::VirtualTime {
+                            limit: limits.max_virtual_time(),
+                        },
+                        // 未知の種別も発火回数の超過として打ち切る（fail-closed）。
+                        _ => AbortKind::TimerFires {
+                            limit: limits.max_timer_fires(),
+                        },
+                    };
+                    *abort = Some(PageAbort { kind, index: None });
+                    break;
+                }
+            };
+            match evaluate_with_budget(rt, ctx, &format!("__fandheRunTimer({})", id.get())) {
+                Evaluated::Completed | Evaluated::Exception { .. } => {}
+                Evaluated::Aborted { kind, .. } => {
+                    *abort = Some(PageAbort { kind, index: None });
+                    break;
+                }
+                Evaluated::BudgetExhausted(_) => {
+                    *abort = Some(page_wall_abort(ctx.options, None));
+                    break;
+                }
+            }
+            // shim は op のエラー（操作予算切れ）を握りつぶし、コールバックが走らないまま
+            // 完了する。予算切れはここで検出して打ち切る（`JS-6`）。
+            if ctx.bridge.op_limit_tripped().map_err(bridge_error)? {
+                *abort = Some(PageAbort {
+                    kind: AbortKind::ResourceLimit,
+                    index: None,
+                });
+                break;
+            }
+            ctx.bridge.rearm_timer(id).map_err(bridge_error)?;
+        }
+    }
+    let (virtual_elapsed, fired, pending_at_end) =
+        ctx.bridge.event_loop_state().map_err(bridge_error)?;
+    Ok(EventLoopReport {
+        fired,
+        virtual_elapsed,
+        pending_at_end,
+    })
+}
+
+/// [`finish`] へ渡す、スクリプト実行以外の実行結果。
+struct RunTail {
+    lifecycle: Vec<LifecycleEventRecord>,
+    bridge_diagnostics: BridgeDiagnostics,
+    elapsed: Duration,
+    event_loop: EventLoopReport,
 }
 
 /// 実行結果と収集時の診断を通し番号で統合して出力にまとめる。
@@ -1237,9 +1477,7 @@ fn finish(
     mut scripts: Vec<ScriptRunRecord>,
     collected: &CollectedScripts,
     abort: Option<PageAbort>,
-    lifecycle: Vec<LifecycleEventRecord>,
-    bridge_diagnostics: BridgeDiagnostics,
-    elapsed: Duration,
+    tail: RunTail,
 ) -> PageRunOutput {
     for d in collected.diagnostics() {
         scripts.push(ScriptRunRecord {
@@ -1258,17 +1496,19 @@ fn finish(
         scripts,
         dropped_collection_diagnostics: collected.dropped_diagnostics(),
         abort,
-        lifecycle,
-        bridge_diagnostics,
-        elapsed,
+        lifecycle: tail.lifecycle,
+        bridge_diagnostics: tail.bridge_diagnostics,
+        elapsed: tail.elapsed,
+        event_loop: tail.event_loop,
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::js_shim::JS_SHIM_SOURCES;
     use fandhe_browser_js::{EngineKind, JsEngine, JsValue, NativeFn};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// `JS-6`: 不正バイトは 3 バイトに膨らむ前提で、確保前に上限判定できる。
@@ -1295,6 +1535,8 @@ mod tests {
         log: Log,
         /// ライフサイクルの発火評価をタイムアウトさせる。
         lifecycle_timeout: bool,
+        /// タイマー評価（`__fandheRunTimer`）で眠る時間（ミリ秒。予算超過の再現用）。
+        timer_sleep_ms: Arc<AtomicU64>,
     }
 
     impl FakeEngine {
@@ -1337,8 +1579,43 @@ mod tests {
                 }
                 return Ok(JsValue::Undefined);
             }
+            // microtask checkpoint とタイマー発火の固定ディスパッチャー評価は、スクリプトの
+            // 観測（`calls`）に混ぜない。タイマー発火は `timer:<id>` として `log` に残す。
+            if script == "__fandheRunMicrotasks()" {
+                return Ok(JsValue::Undefined);
+            }
+            if let Some(id) = script
+                .strip_prefix("__fandheRunTimer(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
+                if let Ok(mut log) = self.log.lock() {
+                    log.push(format!("timer:{id}"));
+                }
+                let sleep = self.timer_sleep_ms.load(Ordering::SeqCst);
+                if sleep > 0 {
+                    std::thread::sleep(Duration::from_millis(sleep));
+                }
+                return Ok(JsValue::Undefined);
+            }
             if let Ok(mut calls) = self.calls.lock() {
                 calls.push((script.to_string(), options.timeout()));
+            }
+            if let Some(spec) = script.strip_prefix("settimeout:") {
+                // "settimeout:<ms>[:<repeat 0|1>[:<count>]]" で `timerSet` op を count 回呼ぶ。
+                let mut it = spec.split(':');
+                let ms = it.next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+                let repeat = it.next() == Some("1");
+                let count = it.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+                for _ in 0..count {
+                    if let Some(op) = self.op.as_mut() {
+                        let _ = op(&[
+                            JsValue::String("timerSet".to_string()),
+                            JsValue::Number(ms),
+                            JsValue::Bool(repeat),
+                        ]);
+                    }
+                }
+                return Ok(JsValue::Undefined);
             }
             if script == "ready" {
                 let state = self.ready_state();
@@ -1392,6 +1669,7 @@ mod tests {
         dropped: Arc<AtomicBool>,
         factory_called: Arc<AtomicBool>,
         log: Log,
+        timer_sleep_ms: Arc<AtomicU64>,
     }
 
     impl Harness {
@@ -1401,16 +1679,18 @@ mod tests {
                 dropped: Arc::new(AtomicBool::new(false)),
                 factory_called: Arc::new(AtomicBool::new(false)),
                 log: Arc::new(Mutex::new(Vec::new())),
+                timer_sleep_ms: Arc::new(AtomicU64::new(0)),
             }
         }
 
         /// FakeEngine を返す runtime factory（呼ばれたら `factory_called` を立てる）。
         fn factory(&self, lifecycle_timeout: bool) -> impl FnOnce() -> crate::Result<JsRuntime> {
-            let (calls, dropped, called, log) = (
+            let (calls, dropped, called, log, timer_sleep_ms) = (
                 self.calls.clone(),
                 self.dropped.clone(),
                 self.factory_called.clone(),
                 self.log.clone(),
+                self.timer_sleep_ms.clone(),
             );
             move || {
                 called.store(true, Ordering::SeqCst);
@@ -1422,6 +1702,7 @@ mod tests {
                         op: None,
                         log,
                         lifecycle_timeout,
+                        timer_sleep_ms,
                     }),
                 ))
             }
@@ -2352,5 +2633,172 @@ mod tests {
         let options = PageRunOptions::default();
         let input = PageRunInput::new("<p>x</p>", "https://example.test/");
         assert_send(&run_page_scripts(&input, &js, &options, &fetcher));
+    }
+
+    fn timer_log(h: &Harness) -> Vec<String> {
+        h.log()
+            .into_iter()
+            .filter(|l| l.starts_with("timer:"))
+            .collect()
+    }
+
+    /// JS-7: タイマーは仮想時間の期限順に発火し、仮想時計だけが進む。
+    #[test]
+    fn js_7_timers_fire_in_deadline_order_on_virtual_clock() {
+        let (out, h) = run(
+            "<script>settimeout:100</script><script>settimeout:50</script>",
+            &PageRunOptions::default(),
+        );
+        let out = out.expect("run");
+        assert!(out.abort().is_none());
+        assert_eq!(timer_log(&h), vec!["timer:2", "timer:1"]);
+        let r = out.event_loop();
+        assert_eq!(r.fired(), 2);
+        assert_eq!(r.virtual_elapsed(), Duration::from_millis(100));
+        assert_eq!(r.pending_at_end(), 0);
+        // load の後に回る。
+        let log = h.log();
+        let load = log
+            .iter()
+            .position(|l| l.starts_with("load@"))
+            .expect("load");
+        let first = log.iter().position(|l| l == "timer:2").expect("timer");
+        assert!(load < first);
+    }
+
+    /// JS-6: 発火回数は 1,000 回目まで発火し、1,001 回目で打ち切る。
+    #[test]
+    fn js_6_timer_fire_limit_aborts_runaway_interval() {
+        let (out, h) = run(
+            "<script>settimeout:0:1</script>",
+            &PageRunOptions::default(),
+        );
+        let out = out.expect("run");
+        assert_eq!(timer_log(&h).len(), 1000);
+        assert_eq!(
+            out.abort().map(|a| a.kind().clone()),
+            Some(AbortKind::TimerFires { limit: 1000 })
+        );
+        assert_eq!(out.event_loop().fired(), 1000);
+        assert_eq!(out.event_loop().pending_at_end(), 1);
+    }
+
+    /// JS-6: 上限値は設定できる。
+    #[test]
+    fn js_6_timer_fire_limit_is_configurable() {
+        let options = PageRunOptions::default()
+            .with_event_loop_limits(EventLoopLimits::default().with_max_timer_fires(3));
+        let (out, h) = run("<script>settimeout:5:1</script>", &options);
+        let out = out.expect("run");
+        assert_eq!(timer_log(&h).len(), 3);
+        assert_eq!(
+            out.abort().map(|a| a.kind().clone()),
+            Some(AbortKind::TimerFires { limit: 3 })
+        );
+        assert_eq!(
+            out.event_loop().virtual_elapsed(),
+            Duration::from_millis(15)
+        );
+    }
+
+    /// JS-6: 保留中のタイマー数は 1,000 件まで登録でき、1,001 件目でスクリプトを打ち切る。
+    #[test]
+    fn js_6_registered_timers_boundary() {
+        let (out, h) = run(
+            "<script>settimeout:0:0:1000</script>",
+            &PageRunOptions::default(),
+        );
+        let out = out.expect("run");
+        assert!(out.abort().is_none());
+        assert_eq!(out.event_loop().fired(), 1000);
+        assert_eq!(timer_log(&h).len(), 1000);
+
+        let (out, h) = run(
+            "<script>settimeout:0:0:1001</script><script>after</script>",
+            &PageRunOptions::default(),
+        );
+        let out = out.expect("run");
+        let kind = AbortKind::RegisteredTimers { limit: 1000 };
+        assert_eq!(out.abort().map(|a| a.kind().clone()), Some(kind.clone()));
+        assert_eq!(
+            out.scripts()[0].outcome(),
+            &ScriptOutcome::Aborted {
+                kind: kind.clone(),
+                message: None
+            }
+        );
+        assert_eq!(
+            out.scripts()[1].outcome(),
+            &ScriptOutcome::NotExecuted { kind: kind.clone() }
+        );
+        assert!(timer_log(&h).is_empty());
+        assert_eq!(out.event_loop().pending_at_end(), 1000);
+        assert_eq!(out.lifecycle()[0].outcome().as_str(), "not_fired");
+    }
+
+    /// JS-6: 仮想時間は 30,000ms の期限までは発火し、30,001ms で打ち切る。
+    #[test]
+    fn js_6_virtual_time_limit_boundary() {
+        let (out, h) = run(
+            "<script>settimeout:30000</script>",
+            &PageRunOptions::default(),
+        );
+        let out = out.expect("run");
+        assert!(out.abort().is_none());
+        assert_eq!(timer_log(&h), vec!["timer:1"]);
+        assert_eq!(out.event_loop().virtual_elapsed(), Duration::from_secs(30));
+
+        let (out, h) = run(
+            "<script>settimeout:30001</script>",
+            &PageRunOptions::default(),
+        );
+        let out = out.expect("run");
+        assert_eq!(
+            out.abort().map(|a| a.kind().clone()),
+            Some(AbortKind::VirtualTime {
+                limit: Duration::from_secs(30)
+            })
+        );
+        assert!(timer_log(&h).is_empty());
+        assert_eq!(out.event_loop().pending_at_end(), 1);
+        // load は発火済みで、DOM の確定には影響しない。
+        assert_eq!(out.lifecycle()[1].outcome().as_str(), "dispatched");
+    }
+
+    /// JS-6: 打ち切り済みならイベントループを回さない。
+    #[test]
+    fn js_6_aborted_page_does_not_run_event_loop() {
+        let (out, h) = run(
+            "<script>settimeout:10</script><script>timeout</script>",
+            &PageRunOptions::default(),
+        );
+        let out = out.expect("run");
+        assert!(out.abort().is_some());
+        assert!(timer_log(&h).is_empty());
+        assert_eq!(out.event_loop().fired(), 0);
+    }
+
+    /// JS-6: タイマーの評価にも実時間の上限を課す。
+    #[test]
+    fn js_6_timer_evaluation_is_bounded_by_page_wall_time() {
+        let options = PageRunOptions::default().with_page_wall_time(Duration::from_millis(100));
+        let h = Harness::new();
+        h.timer_sleep_ms.store(300, Ordering::SeqCst);
+        let html = "<script>settimeout:1:1</script>";
+        let input = PageRunInput::new(html, "https://example.test/");
+        let out = prepare(&input, &options)
+            .and_then(|prepared| {
+                let loaded = default_loads(&prepared.collected);
+                execute(&input, &options, prepared, loaded, h.factory(false))
+            })
+            .expect("run");
+        assert_eq!(
+            out.abort().map(|a| a.kind().clone()),
+            Some(AbortKind::WallTime {
+                scope: WallTimeScope::Page,
+                limit: Duration::from_millis(100)
+            })
+        );
+        assert_eq!(timer_log(&h).len(), 1);
     }
 }
