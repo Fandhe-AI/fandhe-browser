@@ -65,7 +65,7 @@ GitHub Actions の cache はリポジトリ単位で上限があり、超える�
 - lockfile は **ルートの `Cargo.lock` だけ** を hash する。`hashFiles('**/Cargo.lock')` は `.agents/skills/**/samples` 等の無関係な lockfile まで拾い、依存が変わらないのに全 cache を作り直す（2026-10-11 に #859 のスキル追加で約 7.1GB の新世代が作られ、旧世代が LRU で追い出された）
 - rustc 版（`dtolnay/rust-toolchain` の出力 `cachekey`。step に `id: toolchain` を付ける）を key に含め、restore-keys も同じ rustc に限る。`rust-toolchain.toml` は `stable` 追従のため、含めないと stable 更新後に古い rustc の target を exact hit で復元し続け、再保存もされず依存を毎回ビルドし直す
 - key・restore-keys に SHA・run_id・日付などの一意値を入れない（毎回 miss して保存し、cache を食い潰す）
-- cache 内容（path・ビルド条件・prune の仕方）を変えたら `-vN` を上げる。restore-keys に旧 `-vN` を残さない
+- cache 内容（path・ビルド条件・prune の仕方・`Cargo.toml` の `[profile]`）を変えたら `-vN` を上げる。restore-keys に旧 `-vN` を残さない。key に `Cargo.toml` のハッシュは入らないため、`[profile]` の変更は `-vN` で切り替えないと既存 key に exact hit したまま依存を毎回再ビルドし、再保存もされない（2026-10-11 に `[profile.dev.package."*"]` の追加で test `v5` → `v6`・features / harness `v2` → `v3`。依存のビルドスクリプト・proc-macro が行番号付きに変わり、それらに依存する crate の `-C metadata` も連鎖して変わるため。registry のみの cross は上げない）
 
 ### 保存は main のみ
 
@@ -78,7 +78,7 @@ GitHub Actions の cache はリポジトリ単位で上限があり、超える�
 ### サイズ削減
 
 - `target` は保存前に `scripts/ci-prune-target.sh` で workspace メンバーの成果物を除く（依存 crate の成果物だけ残す）。同スクリプトは最後に cache 対象の展開後サイズ（`du -sh`）を出す
-- cache を使う Rust ジョブは `CARGO_INCREMENTAL=0` と `CARGO_PROFILE_DEV_DEBUG=line-tables-only`（依存の debuginfo を行番号のみにする。CI 限定で `Cargo.toml` は変えない。release・bench には影響しない）
+- cache を使う Rust ジョブは `CARGO_INCREMENTAL=0` と `CARGO_PROFILE_DEV_DEBUG=line-tables-only`（workspace メンバーを含む全体の debuginfo を行番号のみにする。release・bench には影響しない）。依存 crate は `Cargo.toml` の `[profile.dev.package."*"]` でも同じ値に固定済み（ローカル開発と共用）で衝突しないが、メンバーまで行番号のみにするのは env だけのため env は維持する
 - target を cache しても効果が無いジョブは registry のみにする（`cross-target-check`：v8 の prebuilt がターゲットごとに約 150MB あり、check のみで再ビルドが速いため）
 - 新しい cache を足す前に、既存の cache 種別（test・features・harness・cross）と共有できないかを確認し、足す場合は 1 世代の合計が上記の目標に収まるかを見積もる
 
