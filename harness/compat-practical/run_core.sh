@@ -6,12 +6,13 @@
 #
 # 実行経路は CDP クライアント方式。CLI サブコマンド（TASK-47）は未実装で、バイナリは引数なしで
 # 127.0.0.1:9333 に CDP サーバーを立てるだけのため、run_core.mjs が Page.navigate・DOM.* を送る。
-# 重要（REPAIR-3）: 現状 Page.navigate は fetch して HTML を保存するだけでページ内 JS は実行されない
-# （JS エンジンはナビゲーション経路に未配線）。b5・d2・d3 の「V8 統合による解消」は示せず、
-# 結果は meta の page_js_executed=false とともに実測のまま記録する。
+# ページ内 JS（JS-4〜JS-6）は既定オフ。--page-js <v8|boa> を付けると、固定文面の設定ファイル
+# （[js] engine=<..>, execute_page_scripts=true）を FANDHE_BROWSER_CONFIG で渡して起動する。
+# 付けない起動では呼び出し元の FANDHE_BROWSER_CONFIG を外し、meta の page_js_executed=false を事実と一致させる（REPAIR-3）。
+# page_js_executed は「実行を有効にして起動した」意味で、ページごとの実行成否ではない。--no-spawn では確認できないため併用不可。
 #
 # 使い方: run_core.sh [--tasks P] [--out P] [--bin P] [--endpoint URL] [--no-spawn]
-#                     [--task-timeout SEC] [--total-timeout SEC] [--startup-timeout SEC] [--validate-only]
+#                     [--page-js v8|boa] [--log ABS_PATH] [--task-timeout SEC] [--total-timeout SEC] [--startup-timeout SEC] [--validate-only]
 # 終了コード: 0=記録完了（失敗タスクがあっても 0。成否は計測結果でありゲートではない）
 #            1=記録の書き込み失敗・結果件数/id 集合の不一致
 #            2=入力・使用エラー（スキーマ違反・引数不正・jq/node 無し・バイナリ検証/起動失敗）
@@ -27,6 +28,8 @@ OUT="$SCRIPT_DIR/results/core_results.jsonl"
 ENDPOINT="http://127.0.0.1:9333"
 BIN_ARG=""
 NO_SPAWN=0
+PAGE_JS=""
+LOG_OUT=""
 VALIDATE_ONLY=0
 TASK_TIMEOUT=45
 TOTAL_TIMEOUT=1200
@@ -46,6 +49,8 @@ while [ $# -gt 0 ]; do
     --task-timeout) [ $# -ge 2 ] || die "--task-timeout requires a value"; TASK_TIMEOUT="$2"; shift 2 ;;
     --total-timeout) [ $# -ge 2 ] || die "--total-timeout requires a value"; TOTAL_TIMEOUT="$2"; shift 2 ;;
     --startup-timeout) [ $# -ge 2 ] || die "--startup-timeout requires a value"; STARTUP_TIMEOUT="$2"; shift 2 ;;
+    --page-js) [ $# -ge 2 ] || die "--page-js requires a value"; PAGE_JS="$2"; shift 2 ;;
+    --log) [ $# -ge 2 ] || die "--log requires a value"; LOG_OUT="$2"; shift 2 ;;
     --no-spawn) NO_SPAWN=1; shift ;;
     --validate-only) VALIDATE_ONLY=1; shift ;;
     *) die "unknown argument: $1" ;;
@@ -60,6 +65,17 @@ in_range "$STARTUP_TIMEOUT" 60 || die "--startup-timeout must be an integer in 1
 # 取得先は loopback の CDP サーバーに限る（SEC-4。接続先をスクリプト引数で外へ向けさせない）
 if ! [[ "$ENDPOINT" =~ ^http://127\.0\.0\.1:([1-9][0-9]{0,4})$ ]] || [ "${BASH_REMATCH[1]}" -gt 65535 ]; then
   die "--endpoint must be http://127.0.0.1:<port>"
+fi
+
+# --page-js は列挙値のみ（設定ファイルは固定文面で、引数を連結しない）。起動モード専用
+case "$PAGE_JS" in
+  "" | v8 | boa) ;;
+  *) die "--page-js must be v8 or boa" ;;
+esac
+[ -z "$PAGE_JS" ] || [ "$NO_SPAWN" -eq 0 ] || die "--page-js cannot be combined with --no-spawn (server configuration is not verifiable)"
+if [ -n "$LOG_OUT" ]; then
+  [ "$NO_SPAWN" -eq 0 ] || die "--log cannot be combined with --no-spawn"
+  case "$LOG_OUT" in /*) ;; *) die "--log must be an absolute path" ;; esac
 fi
 
 # tasks.json の検証は access_check.sh と同一規則（重複実装しない）。違反は exit 2 で伝わる
@@ -82,6 +98,7 @@ probe() {
 
 PID=""
 PROFILE_DIR=""
+CONF_DIR=""
 OUT_DIR="$(dirname "$OUT")"
 mkdir -p "$OUT_DIR" || { echo "error: cannot create $OUT_DIR" >&2; exit 1; }
 TMP="$(mktemp "$OUT_DIR/.core_results.XXXXXX")" || { echo "error: cannot create temp file" >&2; exit 1; }
@@ -94,6 +111,7 @@ cleanup() {
     wait "$PID" 2>/dev/null || true
   fi
   [ -z "$PROFILE_DIR" ] || rm -rf "$PROFILE_DIR"
+  [ -z "$CONF_DIR" ] || rm -rf "$CONF_DIR"
   rm -f "$TMP" "$RAW" "$LOG"
 }
 trap cleanup EXIT
@@ -114,7 +132,14 @@ if [ "$NO_SPAWN" -eq 0 ]; then
   if probe; then die "endpoint is already responding: $ENDPOINT (stop the other process first)"; fi
   # 利用者の実プロファイルに触れず Locked 衝突も避けるため、計測用プロファイルを一時ディレクトリへ隔離する
   PROFILE_DIR="$(mktemp -d)" || die "cannot create profile dir"
-  env XDG_DATA_HOME="$PROFILE_DIR" HOME="$PROFILE_DIR" "$BIN_RESOLVED" >"$LOG" 2>&1 &
+  if [ -n "$PAGE_JS" ]; then
+    CONF_DIR="$(mktemp -d)" || die "cannot create config dir"
+    # [profile] は書かない（cli は profile root を含む設定を拒否する）。エンジン未同梱のバイナリは起動前に非 0 終了する
+    printf '[js]\nengine = "%s"\nexecute_page_scripts = true\n' "$PAGE_JS" >"$CONF_DIR/config.toml"
+    env XDG_DATA_HOME="$PROFILE_DIR" HOME="$PROFILE_DIR" FANDHE_BROWSER_CONFIG="$CONF_DIR/config.toml" "$BIN_RESOLVED" >"$LOG" 2>&1 &
+  else
+    env -u FANDHE_BROWSER_CONFIG XDG_DATA_HOME="$PROFILE_DIR" HOME="$PROFILE_DIR" "$BIN_RESOLVED" >"$LOG" 2>&1 &
+  fi
   PID=$!
   start=$SECONDS
   until probe; do
@@ -158,10 +183,14 @@ CDP_BROWSER=$(jq -r 'select(.type=="browser") | .cdp_browser' "$RAW" | head -n 1
 
 MSYS2_ARG_CONV_EXCL='*' jq -cn --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg sha "$(sha256_of "$TASKS")" \
   --arg bin "$BIN_REC" --arg ep "$ENDPOINT" --arg cb "$CDP_BROWSER" --arg os "$(uname -s)" \
-  --argjson tt "$TASK_TIMEOUT" --argjson tot "$TOTAL_TIMEOUT" \
-  '{type:"meta",schema_version:1,measured_at:$at,tasks_sha256:$sha,bin:(if $bin=="" then null else $bin end),endpoint:$ep,cdp_browser:$cb,driver:"cdp",page_js_executed:false,task_timeout_sec:$tt,total_timeout_sec:$tot,os:$os}' >"$TMP"
+  --arg pjs "$PAGE_JS" --argjson tt "$TASK_TIMEOUT" --argjson tot "$TOTAL_TIMEOUT" \
+  '{type:"meta",schema_version:1,measured_at:$at,tasks_sha256:$sha,bin:(if $bin=="" then null else $bin end),endpoint:$ep,cdp_browser:$cb,driver:"cdp",page_js_executed:($pjs!=""),page_js_engine:(if $pjs=="" then null else $pjs end),task_timeout_sec:$tt,total_timeout_sec:$tot,os:$os}' >"$TMP"
 jq -c 'select(.type=="result")' "$RAW" >>"$TMP"
 
+# 起動したバイナリの stdout / stderr を残す（固定診断行 `cdp: page scripts: ...` の回収用。非信頼データでコミットしない）
+if [ -n "$LOG_OUT" ]; then
+  cp -f "$LOG" "$LOG_OUT" || { echo "error: cannot write $LOG_OUT" >&2; exit 1; }
+fi
 mv -f "$TMP" "$OUT" || { echo "error: cannot write $OUT" >&2; exit 1; }
 SUCCESS=$(jq -s '[.[] | select(.type=="result" and .success==true)] | length' "$OUT")
 echo "success=$SUCCESS/$COUNT"

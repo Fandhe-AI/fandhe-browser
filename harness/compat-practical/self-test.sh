@@ -494,6 +494,9 @@ EARLY
   cat >"$STUB_BIN/ok" <<STUB
 #!/bin/sh
 echo "\$XDG_DATA_HOME" >"$WORK/profile.path"
+echo "\${FANDHE_BROWSER_CONFIG:-unset}" >"$WORK/stub.cfgpath"
+if [ -n "\${FANDHE_BROWSER_CONFIG:-}" ]; then cat "\$FANDHE_BROWSER_CONFIG" >"$WORK/stub.cfg"; else : >"$WORK/stub.cfg"; fi
+echo "stub-diagnostic-line" >&2
 exec "$NODE_BIN" "$FAKE" --port $RC_PORT
 STUB
   printf '#!/bin/sh\nsleep 30\n' >"$STUB_BIN/never"
@@ -510,6 +513,20 @@ STUB
       expect_exit "run_core spawn" 0 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/ok" --endpoint "http://127.0.0.1:$RC_PORT" --tasks "$WORK/rc.json" --out "$WORK/sp.jsonl"
       expect_eq "$(jq -r 'select(.type=="meta") | .bin' "$WORK/sp.jsonl")" "$STUB_BIN/ok" "run_core meta bin"
       expect_eq "$([ -d "$(cat "$WORK/profile.path")" ] && echo present || echo removed)" "removed" "run_core isolated profile removed"
+      # 既定の起動は呼び出し元の FANDHE_BROWSER_CONFIG を外し、メタは page_js_executed=false / page_js_engine=null
+      expect_exit "run_core spawn drops inherited config" 0 env FANDHE_BROWSER_CONFIG=/x FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/ok" --endpoint "http://127.0.0.1:$RC_PORT" --tasks "$WORK/rc.json" --out "$WORK/sp_d.jsonl"
+      expect_eq "$(cat "$WORK/stub.cfgpath")" "unset" "run_core default start has no config env"
+      expect_eq "$(jq -c 'select(.type=="meta") | [.page_js_executed,.page_js_engine]' "$WORK/sp_d.jsonl")" "[false,null]" "run_core default meta page_js"
+      # --page-js v8: 固定文面の設定を渡し、終了後に一時設定が消える
+      expect_exit "run_core --page-js v8" 0 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --page-js v8 --log "$WORK/stub.log" --bin "$STUB_BIN/ok" --endpoint "http://127.0.0.1:$RC_PORT" --tasks "$WORK/rc.json" --out "$WORK/sp_j.jsonl"
+      expect_eq "$(cat "$WORK/stub.cfg")" "$(printf '[js]\nengine = "v8"\nexecute_page_scripts = true')" "run_core --page-js config content"
+      expect_eq "$([ -e "$(cat "$WORK/stub.cfgpath")" ] && echo present || echo removed)" "removed" "run_core --page-js config removed"
+      expect_eq "$(jq -c 'select(.type=="meta") | [.page_js_executed,.page_js_engine]' "$WORK/sp_j.jsonl")" '[true,"v8"]' "run_core --page-js meta"
+      expect_contains "$(cat "$WORK/stub.log")" "stub-diagnostic-line" "run_core --log keeps binary stderr"
+      expect_exit "run_core --page-js bogus" 2 bash "$RUN_CORE" --page-js bogus --bin "$STUB_BIN/ok" --out "$WORK/sp_b.jsonl"
+      expect_exit "run_core --page-js with --no-spawn" 2 bash "$RUN_CORE" --page-js v8 --no-spawn --out "$WORK/sp_n.jsonl"
+      expect_exit "run_core --log relative" 2 bash "$RUN_CORE" --log relative.log --bin "$STUB_BIN/ok" --out "$WORK/sp_r.jsonl"
+      expect_exit "run_core --log with --no-spawn" 2 bash "$RUN_CORE" --log "$WORK/x.log" --no-spawn --out "$WORK/sp_l.jsonl"
       expect_exit "run_core child stopped" 2 bash "$RUN_CORE" --no-spawn --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp2.jsonl"
       expect_exit "run_core startup timeout" 2 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/never" --endpoint "http://127.0.0.1:$RC_PORT" --startup-timeout 1 --out "$WORK/sp3.jsonl"
       expect_contains "$LAST_OUTPUT" "did not become ready" "run_core startup timeout message"
