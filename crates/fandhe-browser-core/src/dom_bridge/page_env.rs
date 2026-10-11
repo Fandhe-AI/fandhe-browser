@@ -295,6 +295,8 @@ pub struct BridgeDiagnostics {
     pub listener_errors: Vec<ListenerError>,
     /// ライフサイクルのリスナー保持件数が shim の上限を超え、登録を無視したか（`JS-6`）。
     pub listener_limit_exceeded: bool,
+    /// 保留中の microtask 数が shim の上限を超え、登録を無視したか（`JS-6`）。
+    pub microtask_limit_exceeded: bool,
     /// タイマー / microtask のコールバック例外（先頭から [`MAX_BRIDGE_DIAGNOSTICS`] 件。`JS-7`）。
     pub timer_errors: Vec<TimerError>,
     /// 文字列ハンドラ（`setTimeout("code", ...)`）として渡され、評価せず無視した件数（`JS-7`）。

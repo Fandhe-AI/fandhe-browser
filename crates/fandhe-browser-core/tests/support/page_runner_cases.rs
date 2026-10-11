@@ -269,6 +269,29 @@ fn timer_cases(engine: &str) {
     assert_eq!(errors[0].message, "boom");
     assert!(out.abort().is_none(), "{:?}", out.abort());
 
+    eprintln!("case: JS-6 page cannot invoke the timer dispatcher directly to bypass limits");
+    let out = run_page(
+        engine,
+        &page(
+            "var n=0;var id=setInterval(function(){n++},40000);\
+             for(var i=0;i<2000;i++){__fandheRunTimer(id)}a('n'+n);",
+        ),
+        &opts,
+    );
+    assert!(out.html().contains("<p>n0</p>"), "{}", out.html());
+    assert_eq!(out.event_loop().fired(), 0);
+
+    eprintln!("case: JS-6 pending microtasks are capped and abort the page");
+    let out = run_page(
+        engine,
+        &page("for(var i=0;i<20000;i++){queueMicrotask(function(){})}"),
+        &opts,
+    );
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::ResourceLimit)
+    );
+
     eprintln!("case: JS-7 string handlers are not evaluated");
     let out = run_page(
         engine,

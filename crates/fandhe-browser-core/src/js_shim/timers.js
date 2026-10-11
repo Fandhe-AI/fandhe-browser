@@ -12,6 +12,7 @@
 //   上限は回避できない。遅延値は Number に変換して渡すだけで、丸めは Rust 側で行う。
 // - 文字列ハンドラ（setTimeout("code", ...)）は eval 相当のため評価しない。0 を返し、
 //   `timerStringHandlerIgnored` op で件数だけ通知する（インジェクション面を作らない）。
+// - __fandheRunTimer は `timerConsume` op（Rust が選んだ発火の一回限りの許可）が true のときだけ実行する。
 // - ディスパッチャー（__fandheRunTimer / __fandheRunMicrotasks）は決して throw しない。
 //   コールバックの例外は try/catch で捕捉し、`timerCallbackError` op でメッセージだけ通知して
 //   後続を続行する。両者は non-writable / non-configurable で固定し、再 install 時の実体の
@@ -43,6 +44,8 @@
     var floor = Math.floor;
     var isFinite_ = Number.isFinite;
     var MAX_TEXT_UNITS = 4097;
+    // 保留中の microtask 数の上限。超過分は破棄して Rust 側へ通知し、ランナーが打ち切る（JS-6）。
+    var MAX_PENDING_MICROTASKS = 10000;
 
     // id → { fn, args, repeat }。null プロトタイプ（継承された setter / 'toString' 等の影響を避ける）。
     var timers = createObject(null);
@@ -140,6 +143,17 @@
     }
 
     function runTimer(id) {
+        // Rust 側が選んだ発火を一度だけ消費できたときだけ実行する。ページが直接呼んでも
+        // 発火回数・仮想時間の上限を回避できない（JS-6）。
+        var allowed = false;
+        try {
+            allowed = callOp('timerConsume', id) === true;
+        } catch (e) {
+            allowed = false;
+        }
+        if (!allowed) {
+            return;
+        }
         var entry = timers[id];
         if (entry !== undefined) {
             if (!entry.repeat) {
@@ -178,6 +192,14 @@
     defineMethod('queueMicrotask', function queueMicrotask(callback) {
         if (typeof callback !== 'function') {
             throw new TypeError('queueMicrotask: callback must be a function');
+        }
+        if (tail - head >= MAX_PENDING_MICROTASKS) {
+            try {
+                callOp('microtaskLimit');
+            } catch (e) {
+                // 通知に失敗しても破棄は維持する。
+            }
+            return;
         }
         queue[tail] = callback;
         tail += 1;

@@ -100,6 +100,8 @@ pub enum ResourceLimitKind {
     Listeners,
     /// 保留中のタイマー数。
     RegisteredTimers,
+    /// 保留中の microtask 数（`queueMicrotask`。shim が上限超過を通知する。`JS-6`）。
+    Microtasks,
 }
 
 /// 世代の上限（排他）。`generation << 32` が `2^53` 未満に収まる値。
@@ -339,6 +341,8 @@ enum DomOp {
     LifecycleListenerLimit,
     TimerSet,
     TimerClear,
+    TimerConsume,
+    MicrotaskLimit,
     TimerCallbackError,
     TimerStringHandlerIgnored,
 }
@@ -375,6 +379,8 @@ impl DomOp {
             "lifecycleListenerLimit" => Self::LifecycleListenerLimit,
             "timerSet" => Self::TimerSet,
             "timerClear" => Self::TimerClear,
+            "timerConsume" => Self::TimerConsume,
+            "microtaskLimit" => Self::MicrotaskLimit,
             "timerCallbackError" => Self::TimerCallbackError,
             "timerStringHandlerIgnored" => Self::TimerStringHandlerIgnored,
             _ => return None,
@@ -412,6 +418,8 @@ impl DomOp {
             Self::LifecycleListenerLimit => "lifecycleListenerLimit",
             Self::TimerSet => "timerSet",
             Self::TimerClear => "timerClear",
+            Self::TimerConsume => "timerConsume",
+            Self::MicrotaskLimit => "microtaskLimit",
             Self::TimerCallbackError => "timerCallbackError",
             Self::TimerStringHandlerIgnored => "timerStringHandlerIgnored",
         }
@@ -428,6 +436,7 @@ impl DomOp {
             | Self::NavigatorUserAgent
             | Self::LifecycleInstallOpen
             | Self::LifecycleListenerLimit
+            | Self::MicrotaskLimit
             | Self::TimerStringHandlerIgnored => 0,
             Self::CreateElement
             | Self::CreateTextNode
@@ -436,7 +445,8 @@ impl DomOp {
             | Self::GetInnerHtml
             | Self::GetLocation
             | Self::SetLocationHash
-            | Self::TimerClear => 1,
+            | Self::TimerClear
+            | Self::TimerConsume => 1,
             Self::QuerySelector
             | Self::QuerySelectorAll
             | Self::AppendChild
@@ -818,6 +828,29 @@ fn execute(
             }
             Ok(JsValue::Undefined)
         }
+        // ランナーが `next_timer` で選んだ発火を、shim のディスパッチャーが一度だけ消費する（`JS-6`）。
+        // ページが `__fandheRunTimer(id)` を直接呼んでも、許可（armed）が無ければ false になり実行されない。
+        DomOp::TimerConsume => {
+            let Some(JsValue::Number(raw)) = args.first() else {
+                return Err(DomBridgeError::TypeMismatch {
+                    operation: op.name(),
+                    index: 1,
+                    expected: "a timer id number",
+                });
+            };
+            let ok = raw.is_finite()
+                && raw.fract() == 0.0
+                && *raw >= 1.0
+                && *raw <= f64::from(u32::MAX)
+                // 範囲を検証済みのため切り詰めなく変換できる。
+                && page.timers.consume_armed(TimerId::from_raw(*raw as u32));
+            Ok(JsValue::Bool(ok))
+        }
+        // microtask の保留数が shim の上限を超えたことの通知。通常は予算外で処理済み（下記）。
+        DomOp::MicrotaskLimit => {
+            page.diagnostics.microtask_limit_exceeded = true;
+            Ok(JsValue::Undefined)
+        }
         DomOp::TimerCallbackError => {
             let name = string_arg(op, args, 1, limits)?;
             let message = string_arg(op, args, 2, limits)?;
@@ -1105,6 +1138,8 @@ impl DomBridge {
         let page = guard.page.as_ref().ok_or(DomBridgeError::Detached)?;
         Ok(if page.diagnostics.listener_limit_exceeded {
             Some(ResourceLimitKind::Listeners)
+        } else if page.diagnostics.microtask_limit_exceeded {
+            Some(ResourceLimitKind::Microtasks)
         } else if page.timers.registration_refused() {
             Some(ResourceLimitKind::RegisteredTimers)
         } else {
@@ -1182,6 +1217,12 @@ impl DomBridge {
         // 副作用が無く、アロケーションも伴わないため、予算外でも DoS 経路にならない。
         if matches!(args, [JsValue::String(name)] if name == "lifecycleListenerLimit") {
             page.diagnostics.listener_limit_exceeded = true;
+            return Ok(JsValue::Undefined);
+        }
+
+        // microtask 上限超過の通知も同様に予算外で処理する（`JS-6`。冪等なフラグ設定のみ）。
+        if matches!(args, [JsValue::String(name)] if name == "microtaskLimit") {
+            page.diagnostics.microtask_limit_exceeded = true;
             return Ok(JsValue::Undefined);
         }
 

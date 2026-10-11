@@ -184,6 +184,8 @@ pub struct TimerQueue {
     now_ms: u64,
     fired: usize,
     registration_refused: bool,
+    /// `next` が選び、まだ shim に消費されていない発火（`JS-6`）。
+    armed: Option<TimerId>,
 }
 
 impl TimerQueue {
@@ -258,7 +260,21 @@ impl TimerQueue {
         if !is_interval {
             self.entries.remove(&id);
         }
+        self.armed = Some(id);
         NextStep::Due(id)
+    }
+
+    /// `next` が選んだ発火を一度だけ消費する。許可が無い・ID が違うなら false（`JS-6`）。
+    ///
+    /// shim のディスパッチャーがコールバック実行前に呼ぶ。ページが直接ディスパッチャーを呼んでも
+    /// 発火回数・仮想時間の上限を回避できないようにする。
+    pub fn consume_armed(&mut self, id: TimerId) -> bool {
+        if self.armed == Some(id) {
+            self.armed = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// コールバック評価後に interval を積み直す。取り消し済み・one-shot は何もしない。
