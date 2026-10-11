@@ -19,10 +19,30 @@ LICENSE-THIRD-PARTY に収録している。
 | ---- | -- | ---- | ---- | -------------- |
 | V8 | 15.2.124.1 (v8 crate 152.2.0 同梱) | BSD-3-Clause | https://github.com/v8/v8 | v8 crate を使うビルド (既定の JS エンジン構成) |
 | libc++ | v8 crate 152.2.0 同梱版 | Apache-2.0 WITH LLVM-exception | https://github.com/llvm/llvm-project | 同上 |
-| libc++abi | v8 crate 152.2.0 同梱版 | Apache-2.0 WITH LLVM-exception | https://github.com/llvm/llvm-project | 同上 |
+| libc++abi | v8 crate 152.2.0 同梱版 | Apache-2.0 WITH LLVM-exception | https://github.com/llvm/llvm-project | 同上。ただし実測では Linux (gnu・musl) の prebuilt のみ。Windows (MSVC) の prebuilt には含まれない |
+| abseil-cpp | V8 15.2.124.1 の DEPS 固定版 (v8 crate 152.2.0 同梱) | Apache-2.0 | https://github.com/abseil/abseil-cpp | 同上 (v8 crate を使うビルド。Linux gnu・musl・Windows MSVC の prebuilt で実測) |
+| llvm-libc | 同上 | Apache-2.0 WITH LLVM-exception | https://github.com/llvm/llvm-project | 同上 (v8 crate を使うビルド。Linux gnu・musl・Windows MSVC の prebuilt で実測) |
+| highway | 同上 | Apache-2.0 OR BSD-3-Clause (random-inl.h のみ CC0-1.0。同ファイルの同梱は確認できていない) | https://github.com/google/highway | 同上 (v8 crate を使うビルド。Linux gnu・musl・Windows MSVC の prebuilt で実測) |
+| simdutf | 7.7.0 (同上) | MIT (Chromium 同梱コピーの宣言。上流は Apache-2.0 OR MIT) | https://github.com/simdutf/simdutf | 同上 (v8 crate を使うビルド。Linux gnu・musl・Windows MSVC の prebuilt で実測) |
+| inspector_protocol (crdtp) | V8 15.2.124.1 ツリー内 (v8 crate 152.2.0 同梱) | BSD-3-Clause | https://chromium.googlesource.com/deps/inspector_protocol | 同上 (v8 crate を使うビルド。Linux gnu・musl・Windows MSVC の prebuilt で実測) |
+| fast_float | V8 15.2.124.1 の DEPS 固定版 (v8 crate 152.2.0 同梱) | Apache-2.0 OR BSL-1.0 OR MIT | https://github.com/fastfloat/fast_float | 同上 (v8 crate を使うビルド。Linux gnu・musl・Windows MSVC の prebuilt で実測) |
+| dragonbox | 同上 | Apache-2.0 WITH LLVM-exception OR BSL-1.0 | https://github.com/jk-jeon/dragonbox | 同上 (v8 crate を使うビルド。Linux gnu・musl・Windows MSVC の prebuilt で実測) |
+| siphash (halfsiphash) | V8 15.2.124.1 ツリー内 (v8 crate 152.2.0 同梱) | CC0-1.0 | https://github.com/veorq/SipHash | 同上 (v8 crate を使うビルド。Linux gnu・musl・Windows MSVC の prebuilt で実測) |
+| rapidhash-v8 | V8 15.2.124.1 ツリー内 (v8 crate 152.2.0 同梱) | BSD-2-Clause | https://github.com/Nicoshev/rapidhash | 同上 (v8 crate を使うビルド。Linux gnu・musl・Windows MSVC の prebuilt で実測) |
 | ICU | 78 (v8 crate 152.2.0 同梱版) | Unicode-3.0 | https://github.com/unicode-org/icu | 同上 |
 | musl libc | 版は固定されない (ビルド環境の sysroot 依存) | MIT | https://musl.libc.org/ | Linux musl 静的ビルドのみ |
 | ルート CA 証明書 (Alpine ca-certificates) | 同梱開始時に追記 | MPL-2.0 AND MIT | https://pkgs.alpinelinux.org/package/edge/main/x86_64/ca-certificates | scratch コンテナイメージ (TASK-64・Issue #296) に無改変で同梱する予定。現時点では未同梱 |
+
+v8 prebuilt の同梱部品は、採用版 (v8 crate 152.2.0) の prebuilt 静的ライブラリを
+実測して列挙した (TASK-78.3・OSS-4。手法と結果は
+docs/design/v8-prebuilt-components.md)。補足:
+
+- 静的アーカイブの中身はリンクされ得る部品の上限であり、帰属表示は安全側として
+  実測で見つかった全部品を載せている。
+- `temporal_rs`・ICU4X (`icu_*`)・`timezone_provider`・`zoneinfo64` などの Rust 製部品は
+  v8 crate の Cargo 依存として入る。prebuilt 内には未定義シンボルとして現れるだけで、
+  同梱物ではないため本表には載せない。第 3 節の Cargo 依存の帰属表示で扱う。
+- macOS 向け prebuilt は実測していない。
 
 ルート CA 証明書について:
 
