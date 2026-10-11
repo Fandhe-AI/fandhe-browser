@@ -80,6 +80,7 @@ clippy 警告は 0 件を維持する。テストの skip・ignore やアサー�
 
 以下の各ルールに従う。
 
+- [ARCHITECTURE.md](./ARCHITECTURE.md): 二層アーキテクチャ・crate 構成・依存方向
 - [coding-rust.md](.claude/rules/coding-rust.md): Rust 規約（crate 境界・外部入力の扱い・unsafe / FFI・クロスプラットフォーム対応・テスト方針）
 - [code-comment-style.md](.claude/rules/code-comment-style.md): コメント規約（役割・呼び出し文脈・未実装箇所の将来仕様の書き方）
 - [security.md](.claude/rules/security.md): セキュリティ規約（秘密情報・偽装機能禁止・プロファイル / プラグイン境界・OWASP Top 10）
@@ -111,5 +112,5 @@ DCO（Developer Certificate of Origin）/ CLA（Contributor License Agreement）
 ## 脆弱性報告・行動規範
 
 - セキュリティ上の脆弱性は公開 Issue では報告しない
-- 脆弱性の報告窓口は今後 `SECURITY.md` で整備する予定（TASK-79.4）
+- 脆弱性の報告手順・対応方針は [SECURITY.md](./SECURITY.md) を参照する（正式な報告窓口の連絡先は TASK-79（79.h1）で確定する）
 - 行動規範は [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) を参照する（報告窓口の連絡先は TASK-79（79.h1）で確定する）
