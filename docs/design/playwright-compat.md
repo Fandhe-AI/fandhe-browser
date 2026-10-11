@@ -5,7 +5,7 @@
 - **マイルストーン**: MS-4
 - **基準コミット**: `fe3ac01`（`origin/main`）
 - **調査日**: 2026-10-05
-- **調査対象の版**: playwright-core 1.63.0（`Makefile` の `PLAYWRIGHT_VERSION` と同一）・node v24.21.0
+- **調査対象の版**: playwright-core 1.63.0（`scripts/versions.sh` の `PLAYWRIGHT_VERSION` と同一）・node v24.21.0
 
 ## 目的・前提
 

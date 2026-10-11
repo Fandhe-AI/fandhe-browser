@@ -93,7 +93,7 @@ cargo test --workspace
 make ci
 ```
 
-環境に依存させたくない場合は `make docker-ci` でコンテナ内から同じゲートを実行できます。`make help` でターゲット一覧を確認できます。
+環境に依存させたくない場合は `make docker-ci` でコンテナ内から同じゲートを実行できます。`make help` でターゲット一覧を確認できます。Makefile は薄い入口で、処理の定義は `scripts/` にあります（Make 非依存の一覧は `scripts/help.sh`。編集方針は `.claude/rules/makefile.md`）。
 
 `docs/spec`（`fandhe-browser-spec`）は private リポジトリのため、アクセス権のない環境では submodule 取得が失敗しますが、実装コードのビルド・テストは `docs/spec` 抜きでも成立するよう維持します。
 
