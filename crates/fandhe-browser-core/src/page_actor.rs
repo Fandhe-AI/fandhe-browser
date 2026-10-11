@@ -597,7 +597,7 @@ impl PageScriptHandle {
 
     /// ページのスクリプトを専用スレッドで実行する要求を出す。
     ///
-    /// 受付（無効・`<script>` なし・世代の比較・上限の判定・ワーカーの起動）は呼び出した時点で
+    /// 受付（無効・世代の比較と古い要求の打ち切り・`<script>` なし・上限の判定・ワーカーの起動）は呼び出した時点で
     /// 同期に済ませ、即時に決まる結果は初回 poll で必ず Ready になる（待たせない）。
     pub fn run_page_scripts(&self, request: PageRunRequest) -> PageRunFuture {
         let Some(executor) = self.inner.executor.as_ref() else {
@@ -605,12 +605,6 @@ impl PageScriptHandle {
                 PageScriptSkipReason::Disabled,
             )));
         };
-        if !contains_script_start_tag(&request.html) {
-            return PageRunFuture::ready(Ok(PageScriptOutcome::Skipped(
-                PageScriptSkipReason::NoScriptElement,
-            )));
-        }
-
         let shared = &self.inner.shared;
         let mut st = shared.lock();
         let scope = request.scope;
@@ -647,6 +641,14 @@ impl PageScriptHandle {
             .filter(|r| r.scope == scope && r.generation < generation)
         {
             r.state.cancel();
+        }
+
+        // `<script` が無い要求はスレッドを起動せず Skipped にするが、古い世代の打ち切り（JS-4）は
+        // 上で済ませてから返す（取得・実行を続けさせない）。
+        if !contains_script_start_tag(&request.html) {
+            return PageRunFuture::ready(Ok(PageScriptOutcome::Skipped(
+                PageScriptSkipReason::NoScriptElement,
+            )));
         }
 
         if st.queue.len() >= self.inner.capacity {
@@ -1158,6 +1160,37 @@ mod tests {
             .expect("commit");
         let latest = state.latest().expect("結果あり");
         assert!(latest.html().contains("gen-2"));
+    }
+
+    /// `JS-4`: `<script` の無い新しい要求でも、同じ scope の実行中の古い要求は `Cancelled` になる。
+    #[test]
+    fn js_4_scriptless_newer_request_cancels_running_older() {
+        let driver = Arc::new(FakeDriver::default());
+        let handle = handle(Arc::clone(&driver));
+        let state = NavigationState::new();
+        let rt = rt();
+
+        let first = handle.run_page_scripts(req("hang-gen-1", &state, 1));
+        wait_until("first started", || {
+            driver.started.load(Ordering::SeqCst) == 1
+        });
+        let second = handle.run_page_scripts(PageRunRequest::new(
+            Arc::from("<p>no scripts</p>"),
+            "https://example.com/",
+            state.scope(),
+            nth_generation(&state, 2),
+        ));
+        let (r1, r2) = rt.block_on(async { tokio::join!(first, second) });
+        assert!(matches!(r1, Err(PageScriptError::Cancelled)), "{r1:?}");
+        assert!(
+            matches!(
+                r2,
+                Ok(PageScriptOutcome::Skipped(
+                    PageScriptSkipReason::NoScriptElement
+                ))
+            ),
+            "{r2:?}"
+        );
     }
 
     /// `JS-4`: 待ち中の古い世代は、実行中のジョブが終わる前に打ち切られ、待ち枠が空く。
