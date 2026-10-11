@@ -6,10 +6,10 @@
 // 入力は環境変数（URL を引数に載せない）: FC_ENDPOINT・FC_TASKS・FC_TASK_TIMEOUT_MS・
 // FC_TOTAL_TIMEOUT_MS。依存ゼロ（Node 22 以降の組み込み WebSocket / fetch）。
 //
-// 重要な前提（REPAIR-3・JS-2）: core の `Page.navigate` は fetch して HTML を保存するだけで、
-// ページ内 JS は実行されない（js_stub / JsRuntime はナビゲーション経路に未配線）。そのため
-// b5・d2・d3 のような JS 必須ページの「V8 統合による解消」はここでは示せず、実測のまま記録する。
-// 配線された時点で meta の page_js_executed と本コメントを見直すこと。
+// 前提（REPAIR-3・JS-4〜JS-6）: ページ内 JS の実行は既定オフで、サーバー側設定
+// （`[js] execute_page_scripts = true`）で有効になる。有効時の `Page.navigate` はスクリプト完了後に
+// 応答し、`DOM.getDocument` は実行後の DOM を返すため、本クライアントの手順は JS 有無で変わらない。
+// 有効化は run_core.sh の --page-js が担い、meta の page_js_executed / page_js_engine はそちらが記録する。
 //
 // 非信頼データの扱い: ページ由来テキストは output_sample としてのみ出力し、300 文字で切り詰め、
 // 制御文字を空白へ置換する。stderr・進捗には出さない（CI ログでのワークフローコマンド注入対策）。

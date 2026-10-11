@@ -8,7 +8,7 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 | ---- | ---- |
 | #311（TASK-71.2） | 22 タスクの実行スクリプト `run_core.sh`（本 README「run_core.sh」節） |
 | #312（TASK-71.3） | Chromium 実測との突合・`results/matrix.json` 生成（本 README「make_matrix.sh」節。生成スクリプトは導入済み、マトリクス自体は未コミット。マトリクスのコミットと回帰ゲートの有効化は #312 の残りの受け入れ条件） |
-| #309（TASK-71） | 測定レポート |
+| #313（TASK-71.4） | 測定レポート `REPORT.md`（JS 有効の再計測と b5・d2・d3 の解消確認） |
 
 ## ファイル
 
@@ -25,7 +25,9 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 | `self-test.sh` | 上記のオフライン自己テスト（curl はスタブ・CDP は偽サーバー。CI で実行） |
 | `js_api_spike/` | ページ内 JS が要求する Web API の計測スパイク（TASK-106。core の example `compat_js_api_spike` としてビルド） |
 | `results/access_check.jsonl` | 到達可否の実測結果（下記「計測結果」） |
-| `results/core_results.jsonl` | `run_core.sh` の実測結果 |
+| `results/core_results.jsonl` | `run_core.sh --page-js v8` の実測結果（ページ JS 有効） |
+| `results/core_results_js_off.jsonl` | 同一バイナリ・同日の対照（ページ JS 無効） |
+| `REPORT.md` | 測定レポート（TASK-71.4） |
 
 ## tasks.json
 
@@ -77,6 +79,7 @@ bash harness/compat-practical/access_check.sh [--tasks P] [--out P] [--timeout S
 
 ```bash
 bash harness/compat-practical/run_core.sh [--tasks P] [--out P] [--bin P] [--endpoint URL] [--no-spawn] \
+  [--page-js v8|boa] [--log ABS_PATH] \
   [--task-timeout SEC] [--total-timeout SEC] [--startup-timeout SEC] [--validate-only]
 ```
 
@@ -89,7 +92,7 @@ bash harness/compat-practical/run_core.sh [--tasks P] [--out P] [--bin P] [--end
 - 出力は JSONL（メタ行 1 行 + タスクごとに 1 行）。`output_sample` はページ由来の非信頼テキストで、300 文字で切り詰め・制御文字を空白へ置換する（進捗出力にはページ由来テキストを出さない）
 
 ```json
-{"type":"meta","schema_version":1,"measured_at":"...","tasks_sha256":"...","bin":"target/release/fandhe-browser","endpoint":"http://127.0.0.1:9333","cdp_browser":"fandhe-browser/0.1.0","driver":"cdp","page_js_executed":false,"task_timeout_sec":45,"total_timeout_sec":1200,"os":"Linux"}
+{"type":"meta","schema_version":1,"measured_at":"...","tasks_sha256":"...","bin":"target/release/fandhe-browser","endpoint":"http://127.0.0.1:9333","cdp_browser":"fandhe-browser/0.1.0","driver":"cdp","page_js_executed":false,"page_js_engine":null,"task_timeout_sec":45,"total_timeout_sec":1200,"os":"Linux"}
 {"type":"result","id":"b5","cat":"spa","url":"https://trello.com","kind":"text","selector":"h1","success":false,"reason":"no_match","detail":null,"method":"first_match","match_count":null,"elapsed_ms":1234,"output_sample":""}
 ```
 
@@ -99,9 +102,11 @@ bash harness/compat-practical/run_core.sh [--tasks P] [--out P] [--bin P] [--end
 
 ### 制約（REPAIR-3・JS-2）
 
-core の `Page.navigate` は fetch して HTML を保存するだけで、**ページ内 JS は実行されない**（JS エンジンはナビゲーション経路に未配線）。
-V8 が同梱されていてもページスクリプトは走らないため、本実測は「V8 統合による解消」を示さない。
-メタ行の `page_js_executed` は `false` 固定で、配線された時点で見直す。b5・d2・d3 の結果は実測のまま記録し、解消を装わない。
+ページ内 JS（`JS-4`〜`JS-6`）の実行は**既定オフ**で、`run_core.sh --page-js <v8|boa>` が固定文面の設定（`[js] engine`・`execute_page_scripts = true`）を `FANDHE_BROWSER_CONFIG` で渡して有効にする。
+`--page-js` なしの起動は呼び出し元の `FANDHE_BROWSER_CONFIG` を外し、メタ行を `page_js_executed:false`・`page_js_engine:null` にする。有効時は `true`・`"v8"` 等。`--no-spawn` は接続先の設定を確認できないため併用不可（exit 2）。
+`page_js_executed` は「実行を有効にして起動した」意味で、ページごとの実行成否ではない。実行上限（1 script 2 秒・ページ 5 秒・`src` 1 MiB / 件・合計 4 MiB）は固定で、設定から変えられない。
+`--log <絶対パス>` は起動したバイナリの stdout / stderr を保存する（固定診断行 `cdp: page scripts: ...` の回収用。ページ由来の非信頼データを含みうるためコミットしない）。
+b5・d2・d3 の結果は実測のまま記録し、解消を装わない（結果は `REPORT.md`）。
 属性演算子 `^=` は TASK-71.6（#760）で core のセレクタサブセットに入った。e1 の再計測と `matrix.json` の更新は #312 で扱う。
 
 ## make_matrix.sh
@@ -145,10 +150,10 @@ jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 | table（e） | 1/3 | 1/3 |
 
 - この値を `check-matrix.sh --threshold 70 --categories static,spa,form --all-categories` に通すと、全体・form・lazy・table が閾値未満で exit 1 になる（static・spa は通過）
-- 主因は、ナビゲーション経路でページ内 JS が実行されないこと（上記「制約」。b5・d2・d3）と、core のセレクタサブセット外（e1）。閾値・対象類型を下げてゲートを通すことはしない
+- 値は 2026-10-07 の実測（ページ JS 未実行）のもの。2026-10-11 の JS 有効の再計測（`REPORT.md`）でも 15/22 で、成否は変わらなかった。閾値・対象類型を下げてゲートを通すことはしない
 - そのため `results/matrix.json` は**コミットしていない**（コミットすると `make check-compat-regression` と CI の `harness-*` ジョブの `[compat-regression]` ステップが閾値未達で赤になる）。実測 15/22（68.2%）が閾値 70% 未満のため、まだコミットできない。閾値・対象類型は下げない。実マトリクスのコミットは #312 の残りの受け入れ条件（閾値 70% 到達後）で、`--allow-missing` は #312 完了後に削除する（main の記述どおり）
 - 失敗 7 件の内訳と追跡先:
-  - b5・d2・d3（`no_match`）: ページ内 JS がナビゲーション経路に未配線のため。扱いは #758（TASK-71.h1・人間判断）で決める
+  - b5・d2・d3（`no_match`）: 2026-10-11 の JS 有効の再計測でも未解消（原因は `REPORT.md`）。扱いは #758（TASK-71.h1・人間判断）で決める
   - e1（`selector_unsupported`）: 属性演算子 `^=` が core のセレクタサブセット外だった（計測時点）。#760（TASK-71.6）で対応済み。再計測は #312
   - a6（`no_match`）: HTTP 403 でコンテンツを取得できない
   - c1（`no_match`）・e5（`no_match`）: 本 PR では原因を未調査（実測のまま記録。解消を装わない。REPAIR-3）
@@ -172,6 +177,13 @@ jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 - b5（Trello）・d2（Saucedemo）・d3（DemoQA）はいずれも失敗（`no_match`）。ページ JS が実行されないため V8 による解消は未確認（上記「制約」）
 - そのほかの失敗: a6（`no_match`・HTTP 403）・c1（`no_match`）・e1（`selector_unsupported`）・e5（`no_match`）
 - ネットワーク環境と時期で変わる。再計測したら実施日と OS をここへ追記する
+
+### 2026-10-11 の再計測（TASK-71.4）
+
+- 実施日: 2026-10-11 / OS: Linux / バイナリ: 同上（main + `--page-js` 拡張）
+- `results/core_results.jsonl`: `--page-js v8`（ページ JS 有効）で 15/22。`results/core_results_js_off.jsonl`: 同日・同一バイナリの対照（無効）で 15/22。成否は全 id で一致
+- b5・d2・d3 は 3 件とも未解消。数値・原因・残存失敗の扱いは `REPORT.md` を参照（二重管理しない）
+- `results/access_check.jsonl` は今回の環境で一部ホストが `curl_exit 7` となったため更新していない（2026-10-03 のまま）
 
 ## js_api_spike（TASK-106）
 
