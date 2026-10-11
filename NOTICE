@@ -30,8 +30,8 @@ LICENSE-THIRD-PARTY に収録している。
 | siphash (halfsiphash) | V8 15.2.124.1 ツリー内 (v8 crate 152.2.0 同梱) | CC0-1.0 | https://github.com/veorq/SipHash | 同上 (v8 crate を使うビルド。Linux gnu・musl・Windows MSVC の prebuilt で実測) |
 | rapidhash-v8 | V8 15.2.124.1 ツリー内 (v8 crate 152.2.0 同梱) | BSD-2-Clause | https://github.com/Nicoshev/rapidhash | 同上 (v8 crate を使うビルド。Linux gnu・musl・Windows MSVC の prebuilt で実測) |
 | ICU | 78 (v8 crate 152.2.0 同梱版) | Unicode-3.0 | https://github.com/unicode-org/icu | 同上 |
-| musl libc | 版は固定されない (ビルド環境の sysroot 依存) | MIT | https://musl.libc.org/ | Linux musl 静的ビルドのみ |
-| ルート CA 証明書 (Alpine ca-certificates) | 同梱開始時に追記 | MPL-2.0 AND MIT | https://pkgs.alpinelinux.org/package/edge/main/x86_64/ca-certificates | scratch コンテナイメージ (TASK-64・Issue #296) に無改変で同梱する予定。現時点では未同梱 |
+| musl libc | 1.2.6 (既定コンテナの builder の Alpine musl 1.2.6-r2。Dockerfile.release が版を検査する。著作権表示・許諾文は LICENSE-THIRD-PARTY 節 5) | MIT | https://musl.libc.org/ | Linux musl 静的ビルドのみ |
+| ルート CA 証明書 (Alpine ca-certificates-bundle) | 20260909-r0 (rust:1-alpine の digest 固定版) | MPL-2.0 AND MIT | https://pkgs.alpinelinux.org/package/edge/main/x86_64/ca-certificates | 既定コンテナ (docker/Dockerfile.release・TASK-64・Issue #297) の /etc/ssl/certs/ca-certificates.crt に無改変で同梱 |
 
 v8 prebuilt の同梱部品は、採用版 (v8 crate 152.2.0) の prebuilt 静的ライブラリを
 実測して列挙した (TASK-78.3・OSS-4。手法と結果は
@@ -46,8 +46,9 @@ docs/design/v8-prebuilt-components.md)。補足:
 
 ルート CA 証明書について:
 
-- 現時点では配布物に同梱していない。同梱は Issue #296 の作業で行い、
-  その時点で版とライセンス全文を追記する。
+- 既定コンテナイメージ (scratch) に同梱する。版は docker/Dockerfile.release の
+  ベースイメージ digest で決まるため、digest を更新したら上表の版も見直す。
+  ライセンス全文は LICENSE-THIRD-PARTY に収録している。
 - MPL-2.0 は `fandhe-browser-render` crate 配下に限定する規約 (コード依存が対象) の
   例外として扱う。CA 証明書バンドルは、コード依存ではなく無改変で同梱する
   データファイルであり、別枠とする (Issue #63 のオーナー判断)。
@@ -71,5 +72,15 @@ MPL-2.0 全文も同時に LICENSE-THIRD-PARTY へ追加する。
 3. Cargo 依存の帰属表示
 --------------------------------------------------------------------------------
 
-Cargo 依存の帰属表示は、配布開始前までに別途整備する
-(cargo-about 等による生成。別 Issue で扱う)。
+既定コンテナ (docker/Dockerfile.release・TASK-64・Issue #297) では、静的リンクされる
+Cargo 依存 (通常依存・推移依存) の著作権表示・許諾文を、ビルド時に
+scripts/gen-cargo-licenses.sh (cargo tree / cargo metadata による生成。新規依存なし) が
+各 crate パッケージ同梱の LICENSE / COPYING / NOTICE ファイルから連結し、
+イメージの /licenses/LICENSE-CARGO-DEPENDENCIES として同梱する。
+パッケージにライセンスファイルを含まない crate (v8・fandhe-backend 系) は、
+docker/license-supplements/ に同梱した上流正本の全文 (タグ付きリビジョンから取得) で補う。
+補完文書も無い crate が 1 件でもあればスクリプトは失敗し (fail-closed)、
+著作権表示・許諾文を欠いたイメージは生成されない。SPDX 宣言のみで済ませることはしない。
+
+コンテナ以外の配布形態 (バイナリ単体配布等) の帰属表示は、配布開始前までに別途整備する
+(同スクリプトの流用を想定。別 Issue で扱う)。

@@ -1,0 +1,18 @@
+# Dockerfile.release 専用のビルドコンテキスト allowlist（BuildKit が Dockerfile 名で自動選択）。
+# 全除外してからビルドに必要なものだけ戻す。.git・.env*・target/・_/・docs/spec・
+# rust-toolchain.toml（理由は Dockerfile.release 参照）は含めない。NOTICE・LICENSE-* は配布イメージへ同梱する。
+# include_str! 等で外部ファイル参照を追加したら、ここも更新すること。
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+!harness/wpt_subset_runner/
+!benches/
+!profiles/
+!docs/design/host-api.schema.json
+!scripts/gen-cargo-licenses.sh
+!docker/license-supplements/
+!NOTICE
+!LICENSE-THIRD-PARTY
+!LICENSE-MIT
+!LICENSE-APACHE
