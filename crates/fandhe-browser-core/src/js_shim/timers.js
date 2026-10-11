@@ -57,6 +57,9 @@
     var queue = createObject(null);
     var head = 0;
     var tail = 0;
+    // 上限超過を Rust 側へ通知済みか。Rust 側のフラグは冪等なので、2 回目以降は op 呼び出しを省き、
+    // 超過後に登録を繰り返すページが遅い環境で wall time を先に消費することを避ける（JS-6）。
+    var microtaskLimitNotified = false;
 
     function report(source, error) {
         try {
@@ -227,10 +230,13 @@
             throw new TypeError('queueMicrotask: callback must be a function');
         }
         if (tail - head >= MAX_PENDING_MICROTASKS) {
-            try {
-                callOp('microtaskLimit');
-            } catch (e) {
-                // 通知に失敗しても破棄は維持する。
+            if (!microtaskLimitNotified) {
+                microtaskLimitNotified = true;
+                try {
+                    callOp('microtaskLimit');
+                } catch (e) {
+                    // 通知に失敗しても破棄は維持する。
+                }
             }
             return;
         }
