@@ -33,7 +33,7 @@ pub mod target;
 mod ws;
 
 /// 結合テスト専用の薄い入口（feature `test-support`・`#[doc(hidden)]`）。ループバック取得を許可した
-/// `Page.navigate` と `DOM.getDocument` だけのディスパッチャを公開 API 越しに駆動する。
+/// `Page.navigate`・`DOM.getDocument`・`DOM.querySelector`・`DOM.requestChildNodes` だけのディスパッチャを公開 API 越しに駆動する。
 /// 本番の組込み表（`Dispatcher::builtin`）は内部アドレスを拒否するため、実ページ JS 実行の
 /// 成功経路（`PageScriptOutcome::Executed`）を CDP の入口から検証する唯一の手段として置く
 /// （`JS-4`・`CDP-1`）。既定ビルドには含まれない。
@@ -45,11 +45,12 @@ pub mod test_support {
     use fandhe_browser_core::{Error, FetchOptions};
 
     use crate::CdpState;
-    use crate::dom::DomGetDocument;
+    use crate::dom::{DomGetDocument, DomQuerySelector, DomRequestChildNodes};
     use crate::page::PageNavigate;
     use crate::protocol::Dispatcher;
 
-    /// ループバック許可の `Page.navigate` と `DOM.getDocument` を持つディスパッチャ。
+    /// ループバック許可の `Page.navigate` と `DOM.getDocument`・`DOM.querySelector`・
+    /// `DOM.requestChildNodes` を持つディスパッチャ（TASK-113・#786 の結合テスト用）。
     pub struct LoopbackDispatcher(Dispatcher);
 
     impl LoopbackDispatcher {
@@ -60,6 +61,8 @@ pub mod test_support {
             let d = Dispatcher::from_handlers(vec![
                 ("Page.navigate", Box::new(nav)),
                 ("DOM.getDocument", Box::new(DomGetDocument)),
+                ("DOM.querySelector", Box::new(DomQuerySelector)),
+                ("DOM.requestChildNodes", Box::new(DomRequestChildNodes)),
             ])
             .map_err(|_| Error::InvalidInput {
                 message: "dispatcher".to_owned(),
