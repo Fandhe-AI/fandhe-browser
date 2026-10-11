@@ -47,17 +47,17 @@ use fandhe_browser_core::parse::{ParseOptions, parse_document};
 use fandhe_browser_core::query::{query_selector_all_str, query_selector_str};
 
 /// `AISNAP-10` の ref 安定性に基づく固定値（`golden-refs.json` の extract-05。`span.text` 0 番目）。
-const EXTRACT_05_REF: &str = "e784578bcfc4c2ad1";
+const EXTRACT_05_REF: &str = "e784578bc";
 
 /// 1 件目の引用文本文（`golden-answers.json` の extract-05。フィクスチャは `&ldquo;`/`&rdquo;`）。
 const EXTRACT_05_QUOTE: &str =
     "\u{201c}River stone beta garden prism record valley vector record theta delta system.\u{201d}";
 
 /// `golden-refs.json` の nav-04（`span.pagetop > a[href="login?goto=news"]`。`login` リンク）。
-const NAV_04_LOGIN_REF: &str = "e83c7716163c6b424";
+const NAV_04_LOGIN_REF: &str = "e83c77161";
 
 /// `reduced/hn-list.txt` の `link "past"`（PoC の nav-04 の対象。同一セルに 8 リンクが並ぶ）。
-const NAV_04_PAST_REF: &str = "ebb42928eda4ec7d6";
+const NAV_04_PAST_REF: &str = "ebb42928e";
 
 /// 上部ナビの 1 セルに並ぶリンク名（文書順）。
 const NAV_04_CELL_LINKS: [&str; 8] = [
@@ -562,11 +562,11 @@ fn aisnap_13_nav_04_dashboard_action_links_keep_distinct_refs() {
     let first = tables.first().and_then(|t| t.rows.first()).expect("先頭行");
     assert_eq!(
         first.controls.first().map(|c| c.r#ref.as_str()),
-        Some("ed42c6b3dec4e715c")
+        Some("ed42c6b3d")
     );
     assert_eq!(
         first.controls.get(1).map(|c| c.r#ref.as_str()),
-        Some("e5cfbb88de0597dda")
+        Some("e5cfbb88d")
     );
     refs.sort_unstable();
     refs.dedup();

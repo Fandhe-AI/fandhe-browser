@@ -69,7 +69,7 @@ fn all_nodes(root: &Node) -> Vec<&Node> {
     out
 }
 
-/// ref が `e` + 16 桁の小文字 16 進 + 任意の `-<n>` の形か（本フィクスチャで現れる形）。
+/// ref が `e` + 8〜16 桁の小文字 16 進 + 任意の `-<n>` の形か（本フィクスチャで現れる形）。
 fn is_ref_shaped(r: &str) -> bool {
     let Some(rest) = r.strip_prefix('e') else {
         return false;
@@ -78,10 +78,10 @@ fn is_ref_shaped(r: &str) -> bool {
         .chars()
         .take_while(|c| matches!(c, '0'..='9' | 'a'..='f'))
         .count();
-    if hex_len != 16 {
+    if !(8..=16).contains(&hex_len) {
         return false;
     }
-    let tail: String = rest.chars().skip(16).collect();
+    let tail: String = rest.chars().skip(hex_len).collect();
     tail.is_empty()
         || tail
             .strip_prefix('-')
@@ -139,10 +139,10 @@ fn aisnap_1_article_snapshot_structure() {
     // 残るノードの ref リテラルは折り畳み前と同一（AISNAP-10）。
     let expected = Snapshot::new(Node::new("document", "Rust 入門記事").with_children(vec![
         nn("banner", "", vec![]),
-        n("heading", "はじめに", "e300ae11bc252b0fd", vec![]),
-        n("link", "公式ドキュメント", "ed45c1d22b4e186f4", vec![]),
-        n("heading", "要点", "ee0714a175d20c8b2", vec![]),
-        n("list", "", "ecc842c965dec143a", vec![]).with_table(TableSummary::new(
+        n("heading", "はじめに", "e300ae11b", vec![]),
+        n("link", "公式ドキュメント", "ed45c1d22", vec![]),
+        n("heading", "要点", "ee0714a17", vec![]),
+        n("list", "", "ecc842c96", vec![]).with_table(TableSummary::new(
             vec![],
             vec![TableRow::new("所有権", false), TableRow::new("借用", false)],
             0,
@@ -157,7 +157,7 @@ fn aisnap_1_article_snapshot_structure() {
     assert_eq!(child(&s.tree, 1).name, "はじめに");
     let link = child(&s.tree, 2);
     assert_eq!(link.role, "link");
-    assert_eq!(link.r#ref.as_deref(), Some("ed45c1d22b4e186f4"));
+    assert_eq!(link.r#ref.as_deref(), Some("ed45c1d22"));
     // 規則的な ul は子孫を展開せず 1 ノードへ圧縮される（AISNAP-2・TASK-12.5）。
     assert_eq!(child(&s.tree, 4).children.len(), 0);
 }
@@ -173,12 +173,12 @@ fn aisnap_1_form_snapshot_structure() {
     // 名前のない generic（html・body・div・label）は折り畳まれる。ref は折り畳み前と同一
     // （`-2` 等の出現番号も内部発行を続けるため変わらない。AISNAP-10・TASK-23.3）。
     let expected = Snapshot::new(Node::new("document", "登録フォーム").with_children(vec![
-        n("textbox", "ユーザー名", "e60f2465f276d6230", vec![]),
-        n("checkbox", "規約に同意", "eb4e606a8d0b0322c", vec![]).with_state(checked),
-        n("radio", "無料プラン", "e3ca491e4e71deece", vec![]).with_state(unchecked),
-        n("combobox", "言語", "ea907649b0395e5e0", vec![]),
-        n("button", "送信", "e764e1c46ab9a2bd6", vec![]),
-        n("button", "取消", "ebc8665358ad3ea30", vec![]).with_state(disabled),
+        n("textbox", "ユーザー名", "e60f2465f", vec![]),
+        n("checkbox", "規約に同意", "eb4e606a8", vec![]).with_state(checked),
+        n("radio", "無料プラン", "e3ca491e4", vec![]).with_state(unchecked),
+        n("combobox", "言語", "ea907649b", vec![]),
+        n("button", "送信", "e764e1c46", vec![]),
+        n("button", "取消", "ebc866535", vec![]).with_state(disabled),
     ]));
     assert_eq!(s, expected);
     assert_common(FORM, &s);
@@ -211,11 +211,11 @@ fn aisnap_1_form_snapshot_structure() {
 fn aisnap_2_table_snapshot_is_compressed() {
     let s = snap(TABLE);
     let expected = Snapshot::new(Node::new("document", "成績表").with_children(vec![
-        n("table", "", "e7c96b5162ee5821b", vec![]).with_table(TableSummary::new(
+        n("table", "", "e7c96b516", vec![]).with_table(TableSummary::new(
             vec![
-                HeaderCell::new("columnheader", "名前", "ed7fea8519e468d01")
+                HeaderCell::new("columnheader", "名前", "ed7fea851")
                     .with_data_leaf(DataLeafKind::TableCell),
-                HeaderCell::new("columnheader", "点数", "ee748caeae6097f8b")
+                HeaderCell::new("columnheader", "点数", "ee748caea")
                     .with_data_leaf(DataLeafKind::TableCell),
             ],
             vec![TableRow::new("太郎 | 80", false)],
@@ -249,8 +249,8 @@ fn aisnap_2_irregular_table_snapshot_is_expanded() {
                     "row",
                     "",
                     vec![
-                        n("columnheader", "名前", "e895cf72c839b312e", vec![]).with_data_leaf(tc),
-                        n("columnheader", "点数", "e4c3266d420a99a2c", vec![]).with_data_leaf(tc),
+                        n("columnheader", "名前", "e895cf72c", vec![]).with_data_leaf(tc),
+                        n("columnheader", "点数", "e4c3266d4", vec![]).with_data_leaf(tc),
                     ],
                 )],
             ),
@@ -261,8 +261,8 @@ fn aisnap_2_irregular_table_snapshot_is_expanded() {
                     "row",
                     "",
                     vec![
-                        n("cell", "太郎", "e8c54b60bbb2904e5", vec![]).with_data_leaf(tc),
-                        n("cell", "80", "eb3df38593dc1377c", vec![]).with_data_leaf(tc),
+                        n("cell", "太郎", "e8c54b60b", vec![]).with_data_leaf(tc),
+                        n("cell", "80", "eb3df3859", vec![]).with_data_leaf(tc),
                     ],
                 )],
             ),
@@ -471,9 +471,9 @@ fn aisnap_10_root_child_ref_matches_signature_digest() {
         .expect("発行は成功する");
     assert_eq!(
         html.to_ref_string(),
-        format!("e{:016x}", ref_signature("generic", ""))
+        format!("e{:08x}", ref_signature("generic", "") >> 32)
     );
-    assert_eq!(html.to_ref_string(), "e65477c205c50fefb");
+    assert_eq!(html.to_ref_string(), "e65477c20");
     let body = alloc
         .allocate_signature(&ElementSignature::new("generic", "").with_scope(html))
         .expect("発行は成功する");
@@ -483,10 +483,7 @@ fn aisnap_10_root_child_ref_matches_signature_digest() {
         .allocate_signature(&ElementSignature::new("heading", "はじめに").with_scope(body))
         .expect("発行は成功する");
     assert_eq!(child(&s.tree, 1).r#ref, Some(heading.to_ref_string()));
-    assert_eq!(
-        child(&s.tree, 1).r#ref.as_deref(),
-        Some("e300ae11bc252b0fd")
-    );
+    assert_eq!(child(&s.tree, 1).r#ref.as_deref(), Some("e300ae11b"));
 }
 
 /// `AISNAP-10`（TASK-11.8・Issue #77）: 異なるページでも同じシグネチャ・同じ親連鎖の要素
@@ -501,7 +498,7 @@ fn aisnap_10_ref_is_stable_across_pages() {
             .find(|nd| nd.role == "button" && nd.name == "送信")
             .and_then(|nd| nd.r#ref.clone())
     };
-    assert_eq!(pick(&a), Some("e764e1c46ab9a2bd6".to_string()));
+    assert_eq!(pick(&a), Some("e764e1c46".to_string()));
     assert_eq!(pick(&a), pick(&b));
 }
 
@@ -674,7 +671,7 @@ fn aisnap_10_row_control_ref_literal_is_pinned() {
         .first()
         .and_then(|r| r.controls.first())
         .expect("control がある");
-    assert_eq!(c.r#ref, "eca61c2b53fd46633");
+    assert_eq!(c.r#ref, "eca61c2b5");
 }
 
 /// AISNAP-2・Issue #632: 維持される拒否条件（ref・name・分類を失う構造）では、従来どおり

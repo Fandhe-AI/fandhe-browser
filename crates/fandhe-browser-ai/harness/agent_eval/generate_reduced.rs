@@ -179,7 +179,7 @@ fn refs_of(doc: &Document, node: NodeId, entries: &[FlatEntry]) -> Vec<String> {
     let mut refs: Vec<String> = Vec::new();
     for e in entries {
         if let Some(r) = &e.r#ref
-            && parse_ref(r).is_some_and(|p| cands.contains(&p))
+            && parse_ref(r).is_some_and(|p| p.matches_any(&cands))
             && !refs.contains(r)
         {
             refs.push(r.clone());

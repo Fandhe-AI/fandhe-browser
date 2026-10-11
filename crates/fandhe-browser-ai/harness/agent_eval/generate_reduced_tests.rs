@@ -169,13 +169,13 @@ fn aisnap8_click01_resolves_to_login_button_ref() {
         .find(|r| r.id == "click-01")
         .expect("click-01");
     assert_eq!(c.locators.len(), 1);
-    assert_eq!(c.locators[0].refs, vec!["e7e730a2753f66c98".to_owned()]);
+    assert_eq!(c.locators[0].refs, vec!["e7e730a27".to_owned()]);
     let text = generate_page(&fixtures(), "login-form")
         .expect("generate")
         .text;
     assert!(
         text.lines()
-            .any(|l| l.contains("button") && l.contains("[e7e730a2753f66c98]"))
+            .any(|l| l.contains("button") && l.contains("[e7e730a27]"))
     );
 }
 
@@ -184,9 +184,9 @@ fn aisnap8_click01_resolves_to_login_button_ref() {
 fn aisnap8_compressed_row_controls_resolve_to_refs() {
     let resolved = resolve_golden(&fixtures()).expect("resolve");
     for (id, expected) in [
-        ("click-04", "ed42c6b3dec4e715c-2"),
-        ("nav-02", "eaa09f8e5a0ba62fc"),
-        ("nav-05", "eecb7a375060b0fc8"),
+        ("click-04", "ed42c6b3d-2"),
+        ("nav-02", "eaa09f8e5"),
+        ("nav-05", "eecb7a375"),
     ] {
         let t = resolved.iter().find(|r| r.id == id).expect(id);
         assert_eq!(t.locators[0].refs, vec![expected.to_owned()], "{id}");

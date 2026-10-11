@@ -262,23 +262,75 @@ pub fn flatten(root: &Node) -> Vec<FlatEntry> {
     out
 }
 
-/// `ref` 文字列（`e<16hex>[v<n>][-<n>]`）をダイジェストと出現番号（無印は 1）へ分解する。
-/// 形式に合わない文字列は `None`（同一性を確認できないため一致扱いにしない）。
+/// `parse_ref` の結果。表示 ref はダイジェスト先頭の 8〜16 桁だけを持つため、全桁の
+/// ダイジェストではなく先頭 `hex_len` 桁（`prefix`）と出現番号を保持し、前方一致で照合する
+/// （TASK-23.5・Issue #836）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedRef {
+    /// ダイジェスト先頭 `hex_len` 桁を数値にしたもの。
+    pub prefix: u64,
+    /// 表示された 16 進桁数（8..=16）。
+    pub hex_len: u32,
+    /// 出現番号（無印は 1）。
+    pub occurrence: u32,
+}
+
+impl ParsedRef {
+    /// 全桁ダイジェストの先頭 `hex_len` 桁がこの ref の `prefix` と一致するか。
+    ///
+    /// 限界: 先頭 8 桁が衝突した表示衝突ペアでは、先着側の 8 桁表示が後着側ダイジェストにも
+    /// 前方一致しうる（ページあたり約 0.001 件。かつ対象要素がそのペアに入る場合のみ）。
+    pub fn matches_digest(&self, digest: u64) -> bool {
+        let shift = 64u32.saturating_sub(4 * self.hex_len);
+        digest.checked_shr(shift).unwrap_or(digest) == self.prefix
+    }
+
+    /// （全桁ダイジェスト, 出現番号）の候補と一致するか。
+    pub fn matches(&self, cand: &(u64, u32)) -> bool {
+        self.occurrence == cand.1 && self.matches_digest(cand.0)
+    }
+
+    /// 候補のいずれかと一致するか。
+    pub fn matches_any(&self, cands: &[(u64, u32)]) -> bool {
+        cands.iter().any(|c| self.matches(c))
+    }
+}
+
+/// snapshot 側の ref 集合のいずれかが候補（全桁ダイジェスト, 出現番号）と一致するか。
+pub fn any_ref_matches(refs: &[ParsedRef], cand: &(u64, u32)) -> bool {
+    refs.iter().any(|p| p.matches(cand))
+}
+
+/// `ref` 文字列（`e<8..16hex>[v<n>][-<n>]`）を表示桁・先頭桁の値・出現番号（無印は 1）へ
+/// 分解する。hex 部は `[0-9a-f]` の貪欲読み取りで、桁数が 8..=16 以外や形式に合わない
+/// 文字列は `None`（同一性を確認できないため一致扱いにしない）。
 /// agent_eval（TASK-21.2・#120）の ref 解決からも使う。
-pub fn parse_ref(r: &str) -> Option<(u64, u32)> {
+pub fn parse_ref(r: &str) -> Option<ParsedRef> {
     let rest = r.strip_prefix('e')?;
-    let digest = u64::from_str_radix(rest.get(..16)?, 16).ok()?;
-    let mut tail = rest.get(16..)?;
+    let hex_end = rest
+        .find(|c: char| !matches!(c, '0'..='9' | 'a'..='f'))
+        .unwrap_or(rest.len());
+    if !(8..=16).contains(&hex_end) {
+        return None;
+    }
+    let prefix = u64::from_str_radix(rest.get(..hex_end)?, 16).ok()?;
+    let hex_len = u32::try_from(hex_end).ok()?;
+    let mut tail = rest.get(hex_end..)?;
     if let Some(v) = tail.strip_prefix('v') {
         let end = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
         v.get(..end)?.parse::<u32>().ok()?;
         tail = v.get(end..)?;
     }
-    match tail.strip_prefix('-') {
-        None if tail.is_empty() => Some((digest, 1)),
-        Some(n) => Some((digest, n.parse().ok()?)),
-        None => None,
-    }
+    let occurrence = match tail.strip_prefix('-') {
+        None if tail.is_empty() => 1,
+        Some(n) => n.parse().ok()?,
+        None => return None,
+    };
+    Some(ParsedRef {
+        prefix,
+        hex_len,
+        occurrence,
+    })
 }
 
 /// `build_snapshot` の `discriminator`（`id` → フォーム部品の `name` → `a`/`area` の `href`）と同じ規則。
@@ -430,7 +482,7 @@ fn compressed_control_refs(
             .map(|r| r.digest)
     };
     // snapshot 側で圧縮されたコンテナ（`Node::table` を持つ Node）の ref（ダイジェスト, 出現番号）。
-    let compressed_containers: Vec<(u64, u32)> = entries
+    let compressed_containers: Vec<ParsedRef> = entries
         .iter()
         .filter(|e| e.compressed)
         .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
@@ -468,7 +520,7 @@ fn compressed_control_refs(
                                         .is_some_and(|y| y.digest == c.digest)
                             })
                             .saturating_add(1);
-                            compressed_containers.contains(&(c.digest, occ))
+                            any_ref_matches(&compressed_containers, &(c.digest, occ))
                         }
                     })
             })
@@ -491,7 +543,7 @@ fn compressed_control_refs(
         let snapshot_total = entries
             .iter()
             .filter_map(|e| e.r#ref.as_deref().and_then(parse_ref))
-            .filter(|&(d, _)| d == digest)
+            .filter(|p| p.matches_digest(digest))
             .count();
         if dom_total != snapshot_total {
             continue;
@@ -530,7 +582,7 @@ pub fn judge(
         .filter(|e| task.data_leaf.is_none_or(|k| e.data_leaf == Some(k)))
         .filter(|e| match e.r#ref.as_deref() {
             None | Some("") => true,
-            Some(r) => parse_ref(r).is_some_and(|p| target_refs.contains(&p)),
+            Some(r) => parse_ref(r).is_some_and(|p| p.matches_any(target_refs)),
         })
         .collect();
     let first = matches.first();

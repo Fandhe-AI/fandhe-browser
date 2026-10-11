@@ -1,8 +1,8 @@
 - document "Dropdown List"
-  - heading "Dropdown List" [e21c0d868cc6084c7]
-  - combobox [eb9b697ed4f125035]
-    - generic "Please select an option" [e6cd3a2321c2a2551] (disabled) value=""
-    - generic "Option 1" [e6cd3a2321c2a2551-2] value="1"
-    - generic "Option 2" [e6cd3a2321c2a2551-3] value="2"
-    - generic "Option 3" [e6cd3a2321c2a2551-4] value="3"
-  - link "Example Test Site" [e124daae3ea9f2799]
+  - heading "Dropdown List" [e21c0d868]
+  - combobox [eb9b697ed]
+    - generic "Please select an option" [e6cd3a232] (disabled) value=""
+    - generic "Option 1" [e6cd3a232-2] value="1"
+    - generic "Option 2" [e6cd3a232-3] value="2"
+    - generic "Option 3" [e6cd3a232-4] value="3"
+  - link "Example Test Site" [e124daae3]

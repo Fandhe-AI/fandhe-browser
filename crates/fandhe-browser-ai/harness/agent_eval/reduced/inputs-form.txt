@@ -1,4 +1,4 @@
 - document "Inputs"
-  - heading "Inputs" [e56fa7b39e0098720]
-  - spinbutton "Number" [e07e25f719b2299fb]
-  - link "Example Test Site" [e124daae3ea9f2799]
+  - heading "Inputs" [e56fa7b39]
+  - spinbutton "Number" [e07e25f71]
+  - link "Example Test Site" [e124daae3]

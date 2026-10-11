@@ -372,7 +372,7 @@ fn aisnap_10_unchanged_fixture_is_stable() {
     };
     assert_eq!(role, "button");
     assert_eq!(name, "Login");
-    assert_eq!(r#ref, "e7e730a2753f66c98");
+    assert_eq!(r#ref, "e7e730a27");
 }
 
 /// AISNAP-10・TASK-17.1・Issue #110: バナー追加の軽微変化でも ref が前後で同一。
@@ -390,7 +390,7 @@ fn aisnap_10_banner_added_keeps_ref() {
         Reidentification::Stable {
             role: "button".into(),
             name: "Go".into(),
-            r#ref: "ee727a43f79604781".into(),
+            r#ref: "ee727a43f".into(),
         }
     );
 }
@@ -410,8 +410,8 @@ fn aisnap_10_changed_id_is_detected_as_ref_changed() {
     assert_eq!(
         result,
         Reidentification::RefChanged {
-            before: "ee727a43f79604781".into(),
-            after: "e5254037ee0b5e5cf".into(),
+            before: "ee727a43f".into(),
+            after: "e5254037e".into(),
         }
     );
 }

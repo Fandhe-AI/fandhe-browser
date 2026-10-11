@@ -278,7 +278,7 @@ fn all_nodes(root: &Node) -> Vec<Item<'_>> {
     out
 }
 
-/// ref が `ElementRef::to_ref_string` の契約 `e<16hex>[v<n>][-<n>]` の形か。
+/// ref が `ElementRef::to_ref_string` の契約 `e<8..16hex>[v<n>][-<n>]` の形か。
 fn is_ref_shaped(r: &str) -> bool {
     let Some(rest) = r.strip_prefix('e') else {
         return false;
@@ -287,11 +287,11 @@ fn is_ref_shaped(r: &str) -> bool {
         .chars()
         .take_while(|c| matches!(c, '0'..='9' | 'a'..='f'))
         .count();
-    if hex_len != 16 {
+    if !(8..=16).contains(&hex_len) {
         return false;
     }
     let all_digits = |d: &str| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit());
-    let mut tail: &str = rest.get(16..).unwrap_or("");
+    let mut tail: &str = rest.get(hex_len..).unwrap_or("");
     if let Some(after_v) = tail.strip_prefix('v') {
         let end = after_v.find('-').unwrap_or(after_v.len());
         let (variant, remain) = after_v.split_at(end);
@@ -720,12 +720,15 @@ fn aisnap_11_snapshot_marks_quote_elements_with_children() {
     assert_eq!(link.data_leaf(), None);
 }
 
-/// AISNAP-3: `is_ref_shaped` は `e<16hex>[v<n>][-<n>]` の全組み合わせを受け入れ、不正形を弾く。
+/// AISNAP-3: `is_ref_shaped` は `e<8..16hex>[v<n>][-<n>]` の全組み合わせを受け入れ、不正形を弾く。
 #[test]
 fn aisnap_3_is_ref_shaped_follows_ref_contract() {
     let h = "0123456789abcdef";
     for ok in [
         format!("e{h}"),
+        format!("e{}", &h[..8]),
+        format!("e{}-2", &h[..12]),
+        format!("e{}v1", &h[..9]),
         format!("e{h}-2"),
         format!("e{h}v1"),
         format!("e{h}v12-3"),
@@ -739,6 +742,8 @@ fn aisnap_3_is_ref_shaped_follows_ref_contract() {
         format!("e{h}-"),
         format!("e{h}x"),
         "e0123".to_string(),
+        format!("e{}", &h[..7]),
+        format!("e{h}0"),
         format!("x{h}"),
     ] {
         assert!(!is_ref_shaped(&ng), "{ng}");
