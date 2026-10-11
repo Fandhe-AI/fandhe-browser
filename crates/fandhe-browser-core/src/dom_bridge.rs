@@ -976,19 +976,25 @@ fn execute(
             Ok(JsValue::Number(f64::from(page.net.consume(id))))
         }
         DomOp::NetReadBody => {
+            // UTF-8 の 1 文字（最大 4 バイト）より小さい上限では、未読本文があっても空文字しか
+            // 返せず終端と誤認される。上限を超えて返すこともできないため、明示的なエラーにする。
+            if limits.max_response_bytes < 4 {
+                return Err(DomBridgeError::ResponseTooLarge {
+                    len: 4,
+                    limit: limits.max_response_bytes,
+                });
+            }
             let Some(id) = decode_net_id(args.first()) else {
                 return Ok(JsValue::String(String::new()));
             };
-            // UTF-8 の 1 文字（最大 4 バイト）より小さいと未読本文があるのに空文字を返し、
-            // 終端と誤認されるため、下限を 4 バイトにする。
-            let max = NET_BODY_CHUNK_BYTES.min(limits.max_response_bytes).max(4);
-            Ok(JsValue::String(page.net.read_chunk(id, max)))
+            let max = NET_BODY_CHUNK_BYTES.min(limits.max_response_bytes);
+            string_response(page.net.read_chunk(id, max), limits)
         }
         DomOp::NetFinalUrl => {
             let Some(id) = decode_net_id(args.first()) else {
                 return Ok(JsValue::String(String::new()));
             };
-            Ok(JsValue::String(page.net.final_url(id)))
+            string_response(page.net.final_url(id), limits)
         }
         DomOp::NetCallbackError => {
             let kind = string_arg(op, args, 1, limits)?;
@@ -2389,6 +2395,20 @@ mod tests {
                 NetRejectKind::Credentials,
             ]
         );
+    }
+
+    /// JS-8: 応答上限が 4 バイト未満なら netReadBody は明示的なエラーにし、上限超過の文字列を返さない。
+    #[test]
+    fn js_8_net_read_body_rejects_tiny_response_limit() {
+        let b = bridge_with(DomBridgeLimits {
+            max_response_bytes: 3,
+            ..DomBridgeLimits::default()
+        });
+        let err = call(&b, &[s("netReadBody"), n(1.0)]).expect_err("tiny limit");
+        assert!(matches!(
+            err,
+            DomBridgeError::ResponseTooLarge { len: 4, limit: 3 }
+        ));
     }
 
     /// JS-8: 未配送の ID は消費も本文の読み出しもできない（配送の偽造を許さない）。

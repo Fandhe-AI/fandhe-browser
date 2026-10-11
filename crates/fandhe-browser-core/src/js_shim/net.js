@@ -144,19 +144,19 @@
                     ? input.href
                     : toStr(input);
             if (init !== undefined && init !== null && typeof init === 'object') {
+                // method / body は列挙可能性・own かどうかに依存せず通常のプロパティ取得で読む
+                // （プロトタイプ上や非列挙の指定を無視して GET を送らないため）。
+                var m = init.method;
+                if (m !== undefined) {
+                    method = toStr(m);
+                }
+                var b = init.body;
+                if (b !== undefined && b !== null) {
+                    hasBody = true;
+                }
+                // 無視したオプションの集計は method / body と分離する。
                 for (var key in init) {
-                    if (!hasOwn(init, key)) {
-                        continue;
-                    }
-                    if (key === 'method') {
-                        if (init.method !== undefined) {
-                            method = toStr(init.method);
-                        }
-                    } else if (key === 'body') {
-                        if (init.body !== undefined && init.body !== null) {
-                            hasBody = true;
-                        }
-                    } else {
+                    if (hasOwn(init, key) && key !== 'method' && key !== 'body') {
                         ignored += 1;
                     }
                 }
