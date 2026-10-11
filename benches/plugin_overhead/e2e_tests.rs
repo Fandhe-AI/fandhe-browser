@@ -57,3 +57,34 @@ fn plug3_e2e_idle_rss_increment_is_measured_with_real_binary() {
     let out = rss::render_idle_rss(&m, 10 * 1024 * 1024).expect("render");
     assert!(out.contains("idle_rss\t3\t"), "{out}");
 }
+
+/// 初期化後にプラグインが終了した場合、ゾンビの RSS 0 を採取せず計測失敗になる（TASK-95.1・`PLUG-3`）。
+#[test]
+fn plug3_measure_fails_when_plugin_exits_after_initialize() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("fandhe-idle-rss-exit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let script = dir.join("fake-mcp.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nread line\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\nsleep 0.2\nexit 0\n",
+    )
+    .expect("write script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let opts = options::Options::parse(
+        &[
+            "--samples",
+            "2",
+            "--settle-ms",
+            "800",
+            "--interval-ms",
+            "20",
+        ]
+        .map(String::from),
+    )
+    .expect("options");
+    let result = idle_rss::measure(&script, &opts);
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = result.expect_err("measurement must fail when the plugin has exited");
+    assert!(err.contains("plugin process exited"), "{err}");
+}

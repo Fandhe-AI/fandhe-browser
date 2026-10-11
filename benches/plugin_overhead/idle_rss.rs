@@ -97,7 +97,7 @@ pub fn measure(bin: &Path, opts: &Options) -> Result<IdleRssMeasurement, String>
     }
 
     eprintln!("starting plugin");
-    let session = McpSession::start(bin, host.addr())?;
+    let mut session = McpSession::start(bin, host.addr())?;
     let mcp_pid = session.pid();
     std::thread::sleep(settle);
     let mut both = Vec::with_capacity(opts.samples);
@@ -106,7 +106,10 @@ pub fn measure(bin: &Path, opts: &Options) -> Result<IdleRssMeasurement, String>
         if i > 0 {
             std::thread::sleep(interval);
         }
+        // 採取の前後でプラグインの生存を確認する（終了後はゾンビが RSS 0 で残り増分を過小報告するため）。
+        session.ensure_alive()?;
         let (rows, ps_pid) = snapshot()?;
+        session.ensure_alive()?;
         if !contains_in_tree(&rows, me, mcp_pid) {
             return Err("plugin process is not in the bench process tree".to_string());
         }
