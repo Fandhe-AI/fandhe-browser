@@ -260,7 +260,8 @@ jobs:
   # スキップされた matrix ジョブが展開されず check 名が変わり required を満たさなくなるため。
   # clippy -D warnings は REPAIR-6（TASK-5.2・#32 / TASK-7・#335）の fail-closed ゲート。
   # cache は windows のみ除外（cache prune に既知問題。旧 rust-ci と同じ）。
-  # CARGO_INCREMENTAL=0 は cache 利用 OS のみ。
+  # CARGO_INCREMENTAL=0・CARGO_PROFILE_DEV_DEBUG は 3 OS 共通（windows は cache 目的でなく
+  # リンク・PDB 生成時間の短縮目的）。
   rust-test-ubuntu:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
@@ -378,6 +379,13 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+    env:
+      # Windows は cache を使わず incremental の成果物が再利用されないため、書き込みコストだけを
+      # 避ける（cache サイズ削減が目的の ubuntu・macOS とは目的が異なる）。debuginfo も
+      # workspace メンバーを行番号のみにして PDB 生成・リンク時間を短縮する（CI 限定。
+      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
         shell: bash
@@ -408,6 +416,7 @@ jobs:
   #               テストを V8 に対して検証。TASK-29.7・#158・JS-1）
   # 各ステップは !cancelled() で独立に走らせ、失敗構成を 1 回の実行で特定できるようにする。
   # cache は windows のみ除外（cache prune に既知問題。旧 rust-ci と同じ）。
+  # CARGO_INCREMENTAL=0・CARGO_PROFILE_DEV_DEBUG は 3 OS 共通（windows の目的は上記と同じ）。
   rust-features-ubuntu:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
@@ -603,6 +612,13 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: read
+    env:
+      # Windows は cache を使わず incremental の成果物が再利用されないため、書き込みコストだけを
+      # 避ける（cache サイズ削減が目的の ubuntu・macOS とは目的が異なる）。debuginfo も
+      # workspace メンバーを行番号のみにして PDB 生成・リンク時間を短縮する（CI 限定。
+      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
         shell: bash
@@ -681,6 +697,7 @@ jobs:
   #                            対象 package が workspace に無い場合は exit 2 で fail-closed
   #                            （TASK-41.5・#174・REPAIR-5・#633）
   # windows は cache 除外（cache prune に既知問題。旧 rust-ci と同じ）。
+  # CARGO_INCREMENTAL=0・CARGO_PROFILE_DEV_DEBUG は 3 OS 共通（windows の目的は時間短縮）。
   harness-ubuntu:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.harness == 'true' }}
@@ -1002,6 +1019,13 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: read
+    env:
+      # Windows は cache を使わず incremental の成果物が再利用されないため、書き込みコストだけを
+      # 避ける（cache サイズ削減が目的の ubuntu・macOS とは目的が異なる）。debuginfo も
+      # workspace メンバーを行番号のみにして PDB 生成・リンク時間を短縮する（CI 限定。
+      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
         shell: bash

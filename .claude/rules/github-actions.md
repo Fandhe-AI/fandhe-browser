@@ -42,7 +42,7 @@ lefthook との重複回避は [git-hooks](./git-hooks.md) を参照する。本
 3. 各ステップは `if: ${{ !cancelled() }}` で独立に走らせ、1 回の実行で全指摘を得る（既存方針）
 4. 検査コマンドは `make <target>` か `scripts/*.sh` を呼ぶ。CI 独自にロジックを書かない（ツール版は `scripts/versions.sh`）
 5. checkout は `persist-credentials: false`。`fetch-depth: 0` は差分・commit 範囲が要る `changes`・`lint-docs` のみ
-6. Rust ジョブは `actions/cache/restore` + `actions/cache/save`（保存は main のみ。`target` は `scripts/ci-prune-target.sh` で workspace 成果物を除いてから保存。Windows は除外）と `CARGO_INCREMENTAL=0`・`CARGO_PROFILE_DEV_DEBUG=line-tables-only`。key・保存条件は後述「キャッシュ方針」に従う
+6. Rust ジョブは `actions/cache/restore` + `actions/cache/save`（保存は main のみ。`target` は `scripts/ci-prune-target.sh` で workspace 成果物を除いてから保存。Windows は除外）。`CARGO_INCREMENTAL=0`・`CARGO_PROFILE_DEV_DEBUG=line-tables-only` は cache の有無によらず Windows を含む 3 OS の Rust ジョブに付ける。key・保存条件は後述「キャッシュ方針」に従う
 7. action はコミット SHA で固定し（`# vX.Y.Z` コメント付き）、新規 action は安易に追加しない（cache は `actions/cache`〔`/restore`・`/save` を含む〕、toolchain は `dtolnay/rust-toolchain` のみ）。`permissions` は最小権限で明示し、`timeout-minutes` を必ず設定する
 8. `run:` に `${{ }}` を直接埋め込まず `env:` 経由で渡す。secrets を PR ログへ出さない
 9. lefthook と同じ検査を CI に足さない／CI にある検査をフックに足さない（[git-hooks](./git-hooks.md)）
@@ -78,7 +78,7 @@ GitHub Actions の cache はリポジトリ単位で上限があり、超える�
 ### サイズ削減
 
 - `target` は保存前に `scripts/ci-prune-target.sh` で workspace メンバーの成果物を除く（依存 crate の成果物だけ残す）。同スクリプトは最後に cache 対象の展開後サイズ（`du -sh`）を出す
-- cache を使う Rust ジョブは `CARGO_INCREMENTAL=0` と `CARGO_PROFILE_DEV_DEBUG=line-tables-only`（workspace メンバーを含む全体の debuginfo を行番号のみにする。release・bench には影響しない）。依存 crate は `Cargo.toml` の `[profile.dev.package."*"]` でも同じ値に固定済み（ローカル開発と共用）で衝突しないが、メンバーまで行番号のみにするのは env だけのため env は維持する
+- Rust ジョブ（Windows を含む 3 OS）は `CARGO_INCREMENTAL=0` と `CARGO_PROFILE_DEV_DEBUG=line-tables-only`（workspace メンバーを含む全体の debuginfo を行番号のみにする。release・bench には影響しない）。依存 crate は `Cargo.toml` の `[profile.dev.package."*"]` でも同じ値に固定済み（ローカル開発と共用）で衝突しないが、メンバーまで行番号のみにするのは env だけのため env は維持する。Windows は cache を使わないため、ここでの目的は cache サイズ削減でなく incremental の書き込み・PDB 生成・リンク時間の短縮（効果は `workflow_dispatch` で計測する）
 - target を cache しても効果が無いジョブは registry のみにする（`cross-target-check`：v8 の prebuilt がターゲットごとに約 150MB あり、check のみで再ビルドが速いため）
 - 新しい cache を足す前に、既存の cache 種別（test・features・harness・cross）と共有できないかを確認し、足す場合は 1 世代の合計が上記の目標に収まるかを見積もる
 
