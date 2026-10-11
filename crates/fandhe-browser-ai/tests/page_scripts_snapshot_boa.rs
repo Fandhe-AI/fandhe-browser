@@ -8,15 +8,18 @@
 use std::process::ExitCode;
 
 #[cfg(not(target_os = "macos"))]
+// テスト間共有モジュールのため、取り込み側のテストバイナリで使わない項目は未使用警告になる。それを許容する。
 #[allow(dead_code)]
 #[path = "../benches/token_reduction/reduction.rs"]
 mod reduction;
 #[cfg(not(target_os = "macos"))]
+// テスト間共有モジュールのため、取り込み側のテストバイナリで使わない項目は未使用警告になる。それを許容する。
 #[allow(dead_code)]
 #[path = "../benches/token_reduction/snapshot_text.rs"]
 mod snapshot_text;
 #[cfg(not(target_os = "macos"))]
 // 共有モジュールはクレートルートに置く（`reduction.rs` が `crate::tokens` を参照するため）。
+// テスト間共有モジュールのため、取り込み側のテストバイナリで使わない項目は未使用警告になる。それを許容する。
 #[allow(dead_code)]
 #[path = "../benches/token_reduction/tokens.rs"]
 mod tokens;

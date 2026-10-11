@@ -26,6 +26,7 @@ use fandhe_browser_core::{
 };
 use serde_json::Value;
 
+// テスト間共有モジュールのため、取り込み側のテストバイナリで使わない項目は未使用警告になる。それを許容する。
 #[allow(dead_code)]
 #[path = "page_scripts_fixtures.rs"]
 mod fixtures;
