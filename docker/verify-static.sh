@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 配布バイナリの静的リンク検査（TASK-64.1・64.2・CTR-4・決定 5）。
+# 配布バイナリの静的リンク検査（TASK-64.1・64.2・64.3・CTR-4・決定 5）。
 # docker/Dockerfile.release の verify-default / verify-lite ステージから呼ばれ、失敗すると
 # そのステージが落ちて最終 scratch イメージにバイナリが入らない。
 #
@@ -12,6 +12,7 @@ set -euo pipefail
 
 bin="${1:?usage: verify-static.sh <binary>}"
 
+echo "arch: $(uname -m)"
 file "${bin}"
 readelf -d "${bin}" || true
 needed="$(readelf -d "${bin}" | grep -c NEEDED || true)"
