@@ -1054,6 +1054,22 @@ mod tests {
         }
     }
 
+    /// 実際に future を駆動する実行器（実エンジンでの実行経路 `ScriptStage::Executed` の検証用）。
+    struct TokioExecutor;
+
+    impl PageScriptExecutor for TokioExecutor {
+        fn block_on<'a>(
+            &self,
+            future: Pin<Box<dyn std::future::Future<Output = ()> + 'a>>,
+        ) -> std::io::Result<()> {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(future);
+            Ok(())
+        }
+    }
+
     /// `Sender` の drop まで `block_on` で止まる実行器。止めている間、ジョブは待ち行列に残る。
     struct GatedExecutor(Mutex<mpsc::Receiver<()>>);
 
@@ -1290,6 +1306,30 @@ mod tests {
         assert_eq!(nav1.latest().unwrap().html(), SCRIPT_PAGE);
     }
 
+    /// `JS-4`・`CDP-1`: 実エンジンでスクリプトを実行できたら、実行後の HTML で確定する
+    /// （`ScriptStage::Executed`）。エンジンなしのビルドでは設定自体が拒否されるため何も検証しない。
+    #[tokio::test]
+    async fn js4_navigate_settles_with_executed_html() {
+        let Some(handle) = enabled_handle(Arc::new(TokioExecutor), 4) else {
+            assert!(fandhe_browser_core::bundled_engines().is_empty());
+            return;
+        };
+        let page = "<body><script>var p=document.createElement('p');\
+                    p.textContent='from-script';document.body.appendChild(p)</script></body>";
+        let port = serve("200 OK", page);
+        let nav = NavigationState::new();
+        let url = format!("http://127.0.0.1:{port}/");
+        let out = navigate_gated(&allowed_fetcher(), &nav, &url, &Mutex::new(0), &handle)
+            .await
+            .unwrap();
+        assert_eq!(out.script, ScriptStage::Executed { abort: None });
+        assert_eq!(out.error_text, None);
+        assert!(
+            nav.latest().unwrap().html().contains("from-script"),
+            "executed HTML must be committed"
+        );
+    }
+
     /// `CDP-1`: JS 実行待ちの間に同一ターゲットの後続遷移が確定したら、古い遷移は
     /// `net::ERR_ABORTED` で何も確定しない。
     #[tokio::test]
@@ -1319,6 +1359,7 @@ mod tests {
         assert!(first.committed.is_none());
         assert_eq!(nav.latest().unwrap().html(), "<p>new</p>");
     }
+
     // CdpState は AppState（Profile::open）が必要で非 unix では構築手段が無いため unix 限定
     // （protocol.rs の `mod dispatch` と同じ理由）。
     #[cfg(unix)]
