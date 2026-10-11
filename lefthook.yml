@@ -1,12 +1,14 @@
 # Git hooks 定義（lefthook）。`make hooks`（lefthook install）で導入する。
 #
 # 方針（.claude/rules/conventional-commits.md・security.md。Fandhe-AI/rust-ai-library と同一）:
+# - フックの追加・変更時は .claude/rules/git-hooks.md の方針（時間予算・CI との役割分担）に従う
 # - --no-verify によるスキップは禁止
 # - Cargo.toml 未追加（workspace 作成予定）の間、cargo 系ジョブはスキップする
 #   （Makefile の HAS_CARGO 判定と同一方針）
 # - GitHub Actions（ci.yml の rust-lint・rust-test 等の required チェック）で実行する検査は
 #   フックで重複実行しない。フックは CI に無い秘密情報検査と、軽量な整形・コミット
-#   メッセージ検査に限る（開発速度を落とさないため clippy・test は pre-push に置かない）
+#   メッセージ検査に限る（開発速度を落とさないため clippy・test は置かず、pre-push も置かない。
+#   CI と重複して残す検査は git-hooks.md の「明示的な例外」に列挙する）
 # - ローカルゲート（fmt・clippy・test。ci.md）の規約自体は変わらず、フックで強制しないだけ
 
 pre-commit:
@@ -14,7 +16,9 @@ pre-commit:
   jobs:
     # staged の .rs のみ rustfmt --check（整形は make fmt / PostToolUse フックで実施済みの想定）。
     # rustfmt 単体は Cargo.toml を読まず既定 edition 2015 で検査してしまうため、
-    # workspace の正である Cargo.toml の edition を明示指定する
+    # workspace の正である Cargo.toml の edition を明示指定する。
+    # CI（ci.yml の rust-lint の cargo fmt --all --check）と重複するが、staged の .rs に限定して
+    # 軽量なため例外として残す（.claude/rules/git-hooks.md「明示的な例外」）
     - name: rustfmt-check
       glob: "*.rs"
       run: |
@@ -116,7 +120,8 @@ commit-msg:
   jobs:
     # Conventional Commits 形式の検証（.claude/rules/conventional-commits.md）。
     # オフラインで完結する軽量な正規表現検査とし、正式な commitlint（config-conventional +
-    # commitlint.config.mjs）は CI（lint-docs の commitlint ジョブ）・make lint-commits が担う。
+    # commitlint.config.mjs）は CI（lint-docs ジョブの commitlint ステップ。PR のみ）・
+    # make lint-commits が担う。
     # Merge / Revert / fixup コミットは対象外とする
     - name: conventional-commits
       run: |

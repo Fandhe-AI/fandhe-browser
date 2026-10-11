@@ -68,6 +68,7 @@ clippy 警告は 0 件を維持する。テストの skip・ignore やアサー�
    - pre-commit: rustfmt チェック・秘密情報検査
    - commit-msg: コミットメッセージの形式検査
    - clippy・test はフックでは実行しない（GitHub Actions の required チェックと重複するため）。PR 前のローカルゲートとして手動で実行する
+   - フックを追加・変更する場合は [git-hooks.md](.claude/rules/git-hooks.md) の方針（時間予算・CI と重複する検査を置かない）に従う
    - **`--no-verify` の使用は禁止**（フックを必ず通す）
 4. 1 つの PR には 1 つの関心事だけを含める。実装中にスコープ外と判断した事項は放置せず [out-of-scope-tracking.md](.claude/rules/out-of-scope-tracking.md) の手順で Issue に記録する
 5. PR 本文にはローカルゲートの実行結果を記載する。OS 依存の変更を含む場合は 3 OS（Linux・macOS・Windows）での結果も記載する
@@ -87,6 +88,7 @@ clippy 警告は 0 件を維持する。テストの skip・ignore やアサー�
 - [japanese-style.md](.claude/rules/japanese-style.md): 日本語出力スタイル（コメント・ドキュメントは日本語、プログラムの出力文字列は英語）
 - [spec-reference.md](.claude/rules/spec-reference.md): spec（SSOT）の参照・ビヘイビア ID 併記の規約
 - [ci.md](.claude/rules/ci.md): CI・ローカル検証規約
+- [git-hooks.md](.claude/rules/git-hooks.md): git hooks（lefthook）の編集方針（時間予算・CI との役割分担）
 - [conventional-commits.md](.claude/rules/conventional-commits.md): Conventional Commits の type / scope 詳細
 - [docs/design/contribution-guidelines.md](docs/design/contribution-guidelines.md): REPAIR-3 に基づく、未実装・簡易実装箇所へのコメント運用のみを扱うドキュメント（本 CONTRIBUTING.md とは対象が異なる）
 
