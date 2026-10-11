@@ -158,3 +158,22 @@ required-features = ["js-v8"]
 name = "page_scripts_snapshot_boa"
 harness = false
 required-features = ["js-boa"]
+
+# MCP 参照プラグインのアイドル RSS 増分の計測ベンチ（TASK-95.1・Issue #375・PLUG-3・MS-9）。
+# ファイルは root の benches/ に置き、mcp_envelope の共有モジュール（app_host・host・mcp_client）を
+# #[path] で再利用する。mcp crate へは依存せず、依存も増やさない。実行は `make measure-plugin-overhead`。
+[[bench]]
+name = "plugin_overhead"
+path = "../../benches/plugin_overhead.rs"
+harness = false
+
+# RSS 解析・引数解析のユニットテスト（PLUG-3・TASK-95.1）。bench は cargo test で実行されないため別 [[test]]。
+[[test]]
+name = "plugin_overhead_rss"
+path = "../../benches/plugin_overhead/rss_tests.rs"
+
+# 実バイナリを使う e2e smoke（PLUG-3・TASK-95.1）。#[ignore] のため `make check-plugin-overhead` が
+# `--ignored` 付きで実行する。
+[[test]]
+name = "plugin_overhead_e2e"
+path = "../../benches/plugin_overhead/e2e_tests.rs"

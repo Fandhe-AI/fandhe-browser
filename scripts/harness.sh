@@ -9,6 +9,8 @@
 #   check-binary-size        既定 feature のリリースバイナリサイズ検査（RENDER-2。要 jq）
 #   measure-mcp-envelope     方式 B 本体と MCP エンベロープの測定（PLUG-5。unix のみ）
 #   check-mcp-envelope       上記ハーネスの e2e smoke（unix のみ。0 件実行は NG）
+#   measure-plugin-overhead  mcp プラグインのアイドル RSS 増分の測定（PLUG-3・TASK-95.1。unix のみ）
+#   check-plugin-overhead    上記の e2e smoke（unix のみ。0 件実行は NG）
 #   measure-js-binary-size   JS エンジン構成別バイナリサイズ計測（JS-3・PERF-1。要 jq）
 #   measure-container-size   既定・軽量コンテナと比較対象（Playwright 公式）のイメージサイズ計測（CTR-1・CTR-5。要 docker・jq）
 #   measure-cssom-profile-cost  CSSOM プロファイル読み込みのコスト計測（PLUG-8。要 jq）
@@ -31,6 +33,7 @@ name="$1"
 
 # 空白区切りの追加引数（意図的に単語分割する）
 : "${MCP_ENVELOPE_ARGS:=}"
+: "${PLUGIN_OVERHEAD_ARGS:=}"
 : "${JS_BINARY_SIZE_STRIP:=}"
 : "${CONTAINER_SIZE_DEFAULT_IMAGE:=fandhe-browser:default}"
 : "${CONTAINER_SIZE_LITE_IMAGE:=fandhe-browser:lite}"
@@ -120,6 +123,26 @@ case "${name}" in
       cargo test -p fandhe-browser-ai --test mcp_envelope_e2e -- --ignored 2>&1 | tee "${out}"
     if ! grep -q "test result: ok. 1 passed" "${out}"; then
       echo "error: mcp_envelope_e2e did not pass exactly 1 test" >&2
+      exit 1
+    fi
+    ;;
+  measure-plugin-overhead)
+    unix_only || { echo "error: ${name} supports unix only" >&2; exit 1; }
+    # cargo bench は他 package の bin をビルドしないため mcp バイナリを先に release ビルドして渡す。
+    cargo build --release -p fandhe-browser-mcp
+    # shellcheck disable=SC2086 # 引数文字列は意図的に単語分割する
+    FANDHE_BROWSER_MCP_BIN="$(mcp_target_dir)/release/fandhe-browser-mcp" \
+      cargo bench -p fandhe-browser-ai --bench plugin_overhead -- ${PLUGIN_OVERHEAD_ARGS}
+    ;;
+  check-plugin-overhead)
+    unix_only || skip "${name} supports unix only (Profile is unix-only)"
+    cargo build -p fandhe-browser-mcp
+    out="$(mktemp)"
+    trap 'rm -f "${out}"' EXIT
+    FANDHE_BROWSER_MCP_BIN="$(mcp_target_dir)/debug/fandhe-browser-mcp" \
+      cargo test -p fandhe-browser-ai --test plugin_overhead_e2e -- --ignored 2>&1 | tee "${out}"
+    if ! grep -q "test result: ok. 1 passed" "${out}"; then
+      echo "error: plugin_overhead_e2e did not pass exactly 1 test" >&2
       exit 1
     fi
     ;;
