@@ -229,6 +229,16 @@
         defineProperty(this, '_m', { value: 'GET', writable: true });
         defineProperty(this, '_u', { value: '', writable: true });
         defineProperty(this, '_sent', { value: false, writable: true });
+        // 要求世代。open() / abort() で進め、旧世代の配送・失敗通知を破棄する。
+        defineProperty(this, '_g', { value: 0, writable: true });
+    }
+
+    function xhrReset(xhr) {
+        xhr._g += 1;
+        xhr.status = 0;
+        xhr.statusText = '';
+        xhr.responseText = '';
+        xhr.responseURL = '';
     }
 
     XMLHttpRequest.prototype.open = function open(method, url, isAsync) {
@@ -240,6 +250,7 @@
         this._m = toStr(method);
         this._u = toStr(url);
         this._sent = false;
+        xhrReset(this);
         this.readyState = 1;
         callHandler(this, 'onreadystatechange');
     };
@@ -253,12 +264,15 @@
         var id = requestId('xhr', this._m, hasBody, this._u);
         if (id === 0) {
             var self = this;
+            var failGen = this._g;
             later(function () {
-                xhrFail(self);
+                if (self._g === failGen) {
+                    xhrFail(self);
+                }
             });
             return;
         }
-        pending[id] = { kind: 'xhr', xhr: this };
+        pending[id] = { kind: 'xhr', xhr: this, gen: this._g };
     };
 
     // 未実装のメソッドは何もしない（ヘッダは送らない。REPAIR-3）。
@@ -269,7 +283,12 @@
             // 通知に失敗しても無視する。
         }
     };
-    XMLHttpRequest.prototype.abort = function abort() {};
+    XMLHttpRequest.prototype.abort = function abort() {
+        // 送信済みの要求の配送を無効化する（世代を進める）。
+        xhrReset(this);
+        this._sent = false;
+        this.readyState = 0;
+    };
 
     // ---- 配送（ランナーが `__fandheNetDeliver(id)` を評価する） ----
 
@@ -314,6 +333,9 @@
             } catch (e) {
                 reportError('fetch', e);
             }
+        } else if (entry.xhr._g !== entry.gen) {
+            // open() / abort() 後に届いた旧世代の応答は破棄する。
+            return;
         } else if (status === 0) {
             xhrFail(entry.xhr);
         } else {

@@ -661,7 +661,7 @@ impl Fetcher {
     pub async fn get(&self, url: &str) -> Result<FetchResponse> {
         // 無効時は Instant::now() も呼ばない。
         let start = self.options.recorder.is_enabled().then(Instant::now);
-        let result = self.get_inner(url, u64::MAX, false).await;
+        let result = self.get_inner(url, u64::MAX, false, None).await;
         if let Some(start) = start {
             self.options
                 .recorder
@@ -677,7 +677,37 @@ impl Fetcher {
     /// ページランナーの `src` 取得が呼ぶ）。超過時は [`Error::ResponseTooLarge`]（`limit` は実効上限）。
     pub async fn get_with_max_body(&self, url: &str, max_body_bytes: u64) -> Result<FetchResponse> {
         let start = self.options.recorder.is_enabled().then(Instant::now);
-        let result = self.get_inner(url, max_body_bytes, true).await;
+        let result = self.get_inner(url, max_body_bytes, true, None).await;
+        if let Some(start) = start {
+            self.options
+                .recorder
+                .record_result(OperationKind::Fetch, &result, start.elapsed());
+        }
+        result
+    }
+
+    /// ページ内 `fetch` / `XMLHttpRequest` 用の取得（`JS-8`・`JS-6`）。
+    ///
+    /// [`Fetcher::get_with_max_body`] との違いは 2 点。(1) 本文上限超過は非 2xx でも
+    /// [`Error::ResponseTooLarge`] にする（空本文の成功に化けさせず、呼び出し側が上限超過を
+    /// 検出できるようにする）。(2) このリクエスト限りの `deadline`（ページの残り実時間）を
+    /// `FetchOptions::timeout` との小さい方で全体タイムアウトに適用し、期限到達時は取得を
+    /// キャンセルして [`Error::Timeout`] を返す。`deadline` が 0 なら送信せず [`Error::Timeout`]。
+    pub async fn get_for_page_net(
+        &self,
+        url: &str,
+        max_body_bytes: u64,
+        deadline: Duration,
+    ) -> Result<FetchResponse> {
+        if deadline.is_zero() {
+            return Err(Error::Timeout {
+                limit: Duration::ZERO,
+            });
+        }
+        let start = self.options.recorder.is_enabled().then(Instant::now);
+        let result = self
+            .get_inner(url, max_body_bytes, false, Some(deadline))
+            .await;
         if let Some(start) = start {
             self.options
                 .recorder
@@ -723,6 +753,7 @@ impl Fetcher {
         url: &str,
         max_body_bytes: u64,
         drop_oversized_error_body: bool,
+        deadline: Option<Duration>,
     ) -> Result<FetchResponse> {
         // 実効上限は設定値と呼び出し単位の上限の小さい方（受信中に強制する）。
         let limit = self.options.max_body_bytes.min(max_body_bytes);
@@ -732,9 +763,12 @@ impl Fetcher {
         reject_disallowed_scheme(&parsed)?;
         reject_disallowed_address(&parsed, self.options.allow_private_network_access)?;
 
-        let response = self
-            .client
-            .get(parsed)
+        let mut request = self.client.get(parsed);
+        if let Some(deadline) = deadline {
+            // リクエスト単位の全体タイムアウト（本文受信を含む）。クライアント既定より長くしない。
+            request = request.timeout(deadline.min(self.options.timeout));
+        }
+        let response = request
             .send()
             .await
             .map_err(|source| map_reqwest_error(source, &self.options))?;

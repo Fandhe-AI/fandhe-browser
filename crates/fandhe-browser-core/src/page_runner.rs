@@ -821,6 +821,11 @@ async fn fetch_src(
     Ok(response.body_text_lossy())
 }
 
+/// `final_url` が `request` と同一オリジン（scheme・host・port）かを判定する。解析不能は偽。
+fn same_origin_url(request: &Url, final_url: &str) -> bool {
+    Url::parse(final_url).is_ok_and(|u| u.origin() == request.origin())
+}
+
 /// UTF-8 非可逆変換後の長さが `limit` を超えるかを、文字列を確保せずに判定する。
 ///
 /// 不正バイト列 1 区間は置換文字（3 バイト）1 個になる。加算は `checked_add` で行う。
@@ -1545,8 +1550,13 @@ async fn pump_one_net_request(
     let outcome = if remaining == 0 {
         NetOutcome::Rejected(NetRejectKind::ResponseBytesLimit)
     } else {
+        // 取得待ちもページの残り実時間で打ち切る（応答しない取得先で Fetcher の既定まで待たない）。
+        let page_left = ctx
+            .options
+            .page_wall_time
+            .saturating_sub(ctx.page_start.elapsed());
         match fetcher
-            .get_with_max_body(request.url.as_str(), remaining)
+            .get_for_page_net(request.url.as_str(), remaining, page_left)
             .await
         {
             Ok(response) => {
@@ -1554,6 +1564,9 @@ async fn pump_one_net_request(
                 // 非可逆変換で膨らむ分も、確保前に累計の残りへ収まるか判定する。
                 if lossy_len_exceeds(response.body(), cap) {
                     NetOutcome::Rejected(NetRejectKind::ResponseBytesLimit)
+                } else if !same_origin_url(&request.url, response.final_url()) {
+                    // CORS 未実装の間は別オリジンへのリダイレクト先の応答を公開しない。
+                    NetOutcome::Rejected(NetRejectKind::CrossOrigin)
                 } else {
                     NetOutcome::Response {
                         status: response.status(),
@@ -1565,6 +1578,13 @@ async fn pump_one_net_request(
             // 実効上限が累計の残り由来なら累計上限、それより小さければ 1 件の上限。
             Err(Error::ResponseTooLarge { limit }) if limit >= remaining => {
                 NetOutcome::Rejected(NetRejectKind::ResponseBytesLimit)
+            }
+            Err(Error::Timeout { .. })
+                if ctx.page_start.elapsed() >= ctx.options.page_wall_time =>
+            {
+                // ページの実時間上限による取得のキャンセル。配送せずページを打ち切る。
+                *abort = Some(page_wall_abort(ctx.options, None));
+                return Ok(false);
             }
             Err(e) => NetOutcome::Rejected(NetRejectKind::from_fetch_error(&e)),
         }

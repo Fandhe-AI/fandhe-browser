@@ -2349,7 +2349,7 @@ mod tests {
             0.0
         );
         assert_eq!(
-            net_request(&b, "fetch", "GET", false, "http://u:p@h.test/"),
+            net_request(&b, "fetch", "GET", false, "https://u:p@example.test/"),
             0.0
         );
         // 未知の種別・型の不一致・arity は拒否する。

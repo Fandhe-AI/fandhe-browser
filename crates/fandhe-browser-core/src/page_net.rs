@@ -24,6 +24,7 @@
 //! # スタブ・簡易実装の残り（REPAIR-3）
 //!
 //! - GET 以外のメソッド・要求ボディ・同期 XHR は reject する（`UnsupportedMethod` 等）。
+//! - 別オリジンの要求・リダイレクト先は reject する（`CrossOrigin`。CORS 実装までの暫定。`SEC-2`）。
 //! - ヘッダ・Cookie・認証情報は送らない（Fetcher の既定のみ）。`fetch` の `init` の
 //!   `headers` / `credentials` 等は無視し、件数だけ診断に残す。
 //! - CORS 判定・Content-Type と charset の判定（`CORE-5` (7)）・ネットワーク待ちの独立した
@@ -119,6 +120,8 @@ pub enum NetRejectKind {
     InvalidUrl,
     /// URL に userinfo（`user:pass@`）を含む。
     Credentials,
+    /// ページと別オリジン（要求先またはリダイレクト先）。CORS 未実装の間は応答を公開しない。
+    CrossOrigin,
     /// 要求件数の上限超過。
     RequestLimit,
     /// 累計レスポンス本文バイト数の上限超過。
@@ -150,6 +153,7 @@ impl NetRejectKind {
             Self::SyncXhr => "sync_xhr",
             Self::InvalidUrl => "invalid_url",
             Self::Credentials => "credentials",
+            Self::CrossOrigin => "cross_origin",
             Self::RequestLimit => "request_limit",
             Self::ResponseBytesLimit => "response_bytes_limit",
             Self::ResponseTooLarge => "response_too_large",
@@ -267,7 +271,7 @@ pub(crate) struct NetQueue {
     completed: usize,
 }
 
-/// 相対 URL を `base`（ページの URL）基準で解決し、http / https かつ userinfo 無しだけを通す。
+/// 相対 URL を `base`（ページの URL）基準で解決し、http / https かつ同一オリジンかつ userinfo 無しだけを通す。
 ///
 /// scheme の早期拒否であり、最終判定（内部アドレス・リダイレクト先）は Fetcher が行う。
 /// 解決できない・`about:blank`（`base` が `None`）は [`NetRejectKind::InvalidUrl`]。
@@ -276,6 +280,10 @@ pub(crate) fn resolve_request_url(base: Option<&Url>, raw: &str) -> Result<Url, 
     let url = base.join(raw).map_err(|_| NetRejectKind::InvalidUrl)?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(NetRejectKind::InvalidUrl);
+    }
+    // CORS は未実装のため、同一オリジンの要求だけを通す（別オリジンの応答本文を公開しない）。
+    if url.origin() != base.origin() {
+        return Err(NetRejectKind::CrossOrigin);
     }
     // reqwest は userinfo から Basic 認証を自動付与するため、認証情報を載せた URL は取得しない。
     if !url.username().is_empty() || url.password().is_some() {
@@ -500,8 +508,8 @@ mod tests {
         let cases = [
             ("a.json", "https://example.test/app/a.json"),
             ("../x", "https://example.test/x"),
-            ("//other.test/p", "https://other.test/p"),
-            ("http://abs.test/q?z=1", "http://abs.test/q?z=1"),
+            ("/p?z=1", "https://example.test/p?z=1"),
+            ("https://example.test/abs", "https://example.test/abs"),
         ];
         for (raw, want) in cases {
             assert_eq!(
@@ -518,13 +526,24 @@ mod tests {
     fn js_8_reject_userinfo_and_non_http_schemes() {
         let b = base();
         assert_eq!(
-            resolve_request_url(Some(&b), "http://u:p@h.test/"),
+            resolve_request_url(Some(&b), "https://u:p@example.test/"),
             Err(NetRejectKind::Credentials)
         );
         assert_eq!(
-            resolve_request_url(Some(&b), "//u@h.test/"),
+            resolve_request_url(Some(&b), "//u@example.test/"),
             Err(NetRejectKind::Credentials)
         );
+        for raw in [
+            "//other.test/p",
+            "http://example.test/p",
+            "https://example.test:8443/p",
+        ] {
+            assert_eq!(
+                resolve_request_url(Some(&b), raw),
+                Err(NetRejectKind::CrossOrigin),
+                "{raw}"
+            );
+        }
         for raw in [
             "file:///etc/passwd",
             "data:text/plain,x",

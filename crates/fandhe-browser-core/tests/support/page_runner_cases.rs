@@ -556,26 +556,21 @@ fn net_cases(engine: &str) {
     assert_eq!(hit_count(&hits), 0);
     assert_eq!(out.net().started(), 0);
 
-    eprintln!("case: JS-8 SSRF: internal addresses are refused without touching the network");
+    eprintln!(
+        "case: JS-8 cross-origin and unsafe targets are refused without touching the network"
+    );
     let (port, hits) = spawn_recording_server(|_| ("200 OK", String::new(), "secret".to_string()));
-    // 既定の Fetcher（内部アドレス不許可）。ページ自体は公開名の URL。
     let fetcher = Fetcher::new(FetchOptions::new()).expect("fetcher");
     let targets = [
         (
             format!("http://127.0.0.1:{port}/x?secret=1"),
-            NetRejectKind::DisallowedAddress,
+            NetRejectKind::CrossOrigin,
         ),
-        (
-            "http://10.0.0.1/".to_string(),
-            NetRejectKind::DisallowedAddress,
-        ),
-        (
-            "http://[::1]/".to_string(),
-            NetRejectKind::DisallowedAddress,
-        ),
+        ("http://10.0.0.1/".to_string(), NetRejectKind::CrossOrigin),
+        ("http://[::1]/".to_string(), NetRejectKind::CrossOrigin),
         (
             "http://169.254.169.254/latest".to_string(),
-            NetRejectKind::DisallowedAddress,
+            NetRejectKind::CrossOrigin,
         ),
         ("file:///etc/passwd".to_string(), NetRejectKind::InvalidUrl),
         ("ftp://example.test/".to_string(), NetRejectKind::InvalidUrl),
@@ -601,6 +596,69 @@ fn net_cases(engine: &str) {
         }
     }
     assert_eq!(hit_count(&hits), 0);
+
+    eprintln!("case: JS-8 SSRF: a same-origin internal address is refused by the Fetcher");
+    let out = run_page_at(
+        engine,
+        &xhr_page("/x"),
+        &format!("http://127.0.0.1:{port}/page.html"),
+        &opts,
+        &fetcher,
+    );
+    assert!(out.html().contains("<p>error:0</p>"), "{}", out.html());
+    assert_eq!(
+        rejections(&out),
+        vec![(NetRequestKind::Xhr, NetRejectKind::DisallowedAddress)]
+    );
+    assert_eq!(hit_count(&hits), 0);
+
+    eprintln!("case: JS-8 a cross-origin redirect response is not exposed to the page");
+    let (other_port, other_hits) =
+        spawn_recording_server(|_| ("200 OK", String::new(), "leaked".to_string()));
+    let (port, _hits) = spawn_recording_server(move |_| {
+        (
+            "302 Found",
+            format!("Location: http://localhost:{other_port}/secret\r\n"),
+            String::new(),
+        )
+    });
+    let out = run_page_at(
+        engine,
+        &xhr_page("r"),
+        &format!("http://127.0.0.1:{port}/page.html"),
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert!(out.html().contains("<p>error:0</p>"), "{}", out.html());
+    assert!(!out.html().contains("leaked"), "{}", out.html());
+    assert_eq!(
+        rejections(&out),
+        vec![(NetRequestKind::Xhr, NetRejectKind::CrossOrigin)]
+    );
+    let _ = other_hits;
+
+    eprintln!("case: JS-8 re-opening an XHR drops the stale response");
+    let (port, _hits) = spawn_recording_server(|path| match path {
+        "/old" => ("200 OK", String::new(), "OLD".to_string()),
+        _ => ("200 OK", String::new(), "NEW".to_string()),
+    });
+    let html = "<body><script>function a(t){var p=document.createElement('p');p.textContent=t;\
+        document.body.appendChild(p)}\
+        var x=new XMLHttpRequest();x.onload=function(){a('load:'+x.responseText)};\
+        x.open('GET','old');x.send();x.open('GET','new');x.send();</script></body>";
+    let out = run_page_at(
+        engine,
+        html,
+        &format!("http://127.0.0.1:{port}/page.html"),
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert!(
+        out.html().contains("<p>load:NEW</p>") && !out.html().contains("OLD"),
+        "{}",
+        out.html()
+    );
+    assert_eq!(out.html().matches("<p>load:").count(), 1, "{}", out.html());
 
     eprintln!("case: JS-8 dangerous redirects are refused by the Fetcher");
     let (port, hits) = spawn_recording_server(|path| match path {
@@ -694,6 +752,45 @@ fn net_cases(engine: &str) {
         vec![(NetRequestKind::Xhr, NetRejectKind::ResponseBytesLimit)]
     );
     assert_eq!(out.net().response_bytes(), 0);
+
+    eprintln!("case: JS-6 an over-limit non-2xx body is rejected, not delivered as empty success");
+    let (port, _hits) =
+        spawn_recording_server(|_| ("404 Not Found", String::new(), "0123456789".to_string()));
+    let base = format!("http://127.0.0.1:{port}/page.html");
+    let out = run_page_at(engine, &xhr_page("r"), &base, &limited, &loopback_fetcher());
+    assert!(out.html().contains("<p>error:0</p>"), "{}", out.html());
+    assert!(out.bridge_diagnostics().net_limit_exceeded);
+    assert_eq!(
+        rejections(&out),
+        vec![(NetRequestKind::Xhr, NetRejectKind::ResponseBytesLimit)]
+    );
+
+    eprintln!("case: JS-6 a stalled response is cut off by the page wall time");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming().flatten() {
+            held.push(stream);
+        }
+    });
+    let base = format!("http://127.0.0.1:{port}/page.html");
+    let timed = PageRunOptions::default().with_page_wall_time(Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    let out = run_page_at(engine, &xhr_page("r"), &base, &timed, &loopback_fetcher());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(
+            out.abort().map(|a| a.kind()),
+            Some(AbortKind::WallTime { .. })
+        ),
+        "{:?}",
+        out.abort()
+    );
 }
 
 /// ページ内 `fetch`（ネイティブ Promise）のケース。
