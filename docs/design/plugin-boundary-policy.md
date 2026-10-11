@@ -44,9 +44,14 @@ spec 本文中の旧称 `rust-browser` は `fandhe-browser` に読み替える�
 | ---- | ---- |
 | コンパイル時プラグインの例 | `fandhe-browser-cli` の feature `js-v8`（既定）・`js-boa`・`rendering`（`JS-1`・`RENDER-1`）。feature と配布プロファイルの対応表は #361 で追加する |
 | 実行時拡張の例 | `fandhe-browser-mcp`（別バイナリ・stdio）。ホストとは HTTP と [host-api.schema.json](host-api.schema.json) の契約のみで接続する（`PLUG-2`・`PLUG-3`、依存方向は `REPAIR-1`） |
-| WASM ランタイム | `Cargo.lock` に `wasmtime`・`wasmer`・`wasmi` なし（`Cargo.lock` の `name` 行を grep して 0 件） |
-| WASM ランタイム | `Cargo.lock` に `wasmtime`・`wasmer`・`wasmi` なし（`grep -c -i -E '^name = "(wasmtime\|wasmer\|wasmi)"' Cargo.lock` が 0） |
+| WASM ランタイム | `Cargo.lock` に `wasmtime`・`wasmer`・`wasmi` なし（`Cargo.lock` の `name` 行を grep して 0 件。確認コマンドは下記） |
 | `libloading` | `Cargo.lock` に存在するが、`v8` の build-dependency 経由（`v8` → `bindgen` → `clang-sys` → `libloading`）のビルド時のみ。通常依存のグラフには現れない |
+
+WASM ランタイムの確認コマンドは次のとおり（一致数 0 が合格）。
+
+```bash
+grep -c -i -E '^name = "(wasmtime|wasmer|wasmi)"' Cargo.lock
+```
 
 `libloading` の確認コマンドは次のとおり。
 
