@@ -29,7 +29,7 @@
 //!
 //! - 再帰中の子孫 `aria-labelledby` の追跡・子孫の `title` フォールバック
 //!   （accname 2I の再帰適用）・`aria-valuetext`/range の値・参照先の label/`title`
-//!   の適用・CSS のブロック要素間の区切りと生成コンテンツ: 担当 Issue 未確定
+//!   の適用・display に基づく block/inline の区切り分け（要素境界は一律に区切る。TASK-17・#835）と生成コンテンツ: 担当 Issue 未確定
 //! - `option`・`summary`・`menuitem` 等の暗黙 role が role.rs で未対応のため、
 //!   これらの要素は name from content の対象にならない（role.rs 側の課題）
 //! - `fieldset`→`legend`・`table`→`caption`・`figure`→`figcaption`・SVG の
@@ -564,6 +564,14 @@ struct ContentWalk<'a> {
     /// 子孫ノードの name で既に出力済みのテキストを、row・cell の name から除くための
     /// 残余算出（[`compute_residual_content_name`]）だけが `Some` を渡す。他の経路は `None`。
     skip: Option<&'a HashSet<NodeId>>,
+    /// `true` なら要素の開始・終了の境界で区切りの空白を 1 個予約する
+    /// （`AISNAP-1`・TASK-17・Issue #835）。`<h2>a<a>b</a></h2>` を `ab` でなく
+    /// `a b` にするため。スタイルを評価しないので display による block/inline の
+    /// 区別はせず一律に区切る（`<b>H</b>ello` は `H ello` になる既知の制約）。
+    /// name from content の経路（[`content_name_with_limit`]・
+    /// [`compute_residual_content_name`]）だけが `true` を渡し、label・
+    /// `aria-labelledby`・`<title>`・埋め込みコントロールの値は従来どおり連結する。
+    separate_elements: bool,
 }
 
 /// [`collect_content_text`] の走査結果（`AISNAP-1`・TASK-11.4.3）。
@@ -650,6 +658,7 @@ fn embedded_control_text(
                 max_steps,
                 include_hidden: true,
                 skip: None,
+                separate_elements: false,
             },
             &mut out,
         );
@@ -697,6 +706,7 @@ fn embedded_control_text(
                     max_steps: max_steps.saturating_sub(scan.steps_used),
                     include_hidden: false,
                     skip: None,
+                    separate_elements: false,
                 },
                 &mut out,
             );
@@ -723,8 +733,13 @@ fn embedded_control_text(
 /// `exclude`（名前を算出している対象自身）の部分木、および
 /// [`ContentWalk::include_hidden`] が `false` のときの hidden 部分木は除外する。
 ///
+/// 要素境界の区切り（TASK-17・Issue #835）: [`ContentWalk::separate_elements`] が
+/// `true` のとき、要素の開始・終了で区切りの空白を予約し、語が連結されないようにする
+/// （連続は 1 個へ畳み、先頭・末尾には出ない）。
+///
 /// 未実装（実装済みを装わない。REPAIR-3）: 再帰中の子孫 `aria-labelledby` の
-/// 追跡・子孫の `title` フォールバック・CSS のブロック要素間の区切り。
+/// 追跡・子孫の `title` フォールバック・display に基づく block/inline の区別
+/// （要素境界は一律に区切るため `<b>H</b>ello` は `H ello` になる）。
 ///
 /// 明示スタックで非再帰に走査し、訪問数を [`ContentWalk::max_steps`] で上限する
 /// ため、深いネストでも必ず停止する（security.md「不安全な設計」対策）。
@@ -751,7 +766,9 @@ fn collect_content_text(
     let mut scan = ContentScan::default();
     // 子を全件確保せず遅延イテレータのスタックで辿る（確保は階層数に比例し、
     // 1 ステップごとにしか増えないため `max_steps` で有界）。
-    let mut stack: Vec<Children<'_>> = vec![doc.children(start)];
+    // 各要素は「子の走査が終わったとき終了境界の区切りを予約するか」を持つ
+    // （走査の起点 `start` は境界を作らない）。
+    let mut stack: Vec<(Children<'_>, bool)> = vec![(doc.children(start), false)];
     let mut normalized_chars = 0usize;
     let mut pending_space = false;
 
@@ -770,8 +787,20 @@ fn collect_content_text(
         };
     }
 
-    while let Some(top) = stack.last_mut() {
+    // 子へ降りない要素（値・`aria-label`・`img`）の終了境界。
+    macro_rules! close_leaf {
+        () => {
+            if opts.separate_elements && !out.is_empty() {
+                pending_space = true;
+            }
+        };
+    }
+
+    while let Some((top, closes_boundary)) = stack.last_mut() {
         let Some(current) = top.next() else {
+            if *closes_boundary && !out.is_empty() {
+                pending_space = true;
+            }
             stack.pop();
             continue;
         };
@@ -796,6 +825,11 @@ fn collect_content_text(
                 }
                 if !opts.include_hidden && is_hidden_element(doc, current) {
                     continue;
+                }
+                // 要素の開始境界（TASK-17・#835）。以降の分岐（値・aria-label・alt・子孫）の
+                // どれに進んでも直前のテキストと連結しない。
+                if opts.separate_elements && !out.is_empty() {
+                    pending_space = true;
                 }
                 // 被覆済み（部分木のテキストが子孫ノードの name で出力済み）の要素は
                 // 降りず、折り込まない（TASK-23.6）。
@@ -823,6 +857,7 @@ fn collect_content_text(
                     // `scan.cut` へ伝播済みで、残り予算がある限り兄弟の走査は続ける。
                     if has_non_whitespace(text) || inner.cut {
                         fold!(text.chars());
+                        close_leaf!();
                         continue;
                     }
                 }
@@ -830,6 +865,7 @@ fn collect_content_text(
                     && has_non_whitespace(label)
                 {
                     fold!(label.chars());
+                    close_leaf!();
                     continue;
                 }
                 if embedded.is_some() {
@@ -843,9 +879,10 @@ fn collect_content_text(
                     if let Some(alt) = doc.attribute(current, "alt") {
                         fold!(alt.chars());
                     }
+                    close_leaf!();
                     continue;
                 }
-                stack.push(doc.children(current));
+                stack.push((doc.children(current), opts.separate_elements));
             }
             _ => {}
         }
@@ -1232,6 +1269,7 @@ fn label_name(doc: &Document, index: &NameIndex, target: NodeId) -> Option<Acces
                 max_steps: doc.node_count(),
                 include_hidden: false,
                 skip: None,
+                separate_elements: false,
             },
             &mut label_text,
         );
@@ -1345,6 +1383,7 @@ fn content_name_with_limit(
             max_steps: MAX_CONTENT_STEPS.min(budget),
             include_hidden: false,
             skip: None,
+            separate_elements: true,
         },
         &mut text,
     );
@@ -1470,6 +1509,7 @@ pub(super) fn compute_residual_content_name(
             max_steps: MAX_CONTENT_STEPS.min(budget),
             include_hidden: false,
             skip: Some(covered),
+            separate_elements: true,
         },
         &mut text,
     );
@@ -1570,6 +1610,7 @@ fn referent_text(
                 max_steps: doc.node_count(),
                 include_hidden: is_hidden_element(doc, referent),
                 skip: None,
+                separate_elements: false,
             },
             &mut out,
         );
@@ -1871,6 +1912,7 @@ fn document_title_name(doc: &Document, index: &NameIndex) -> AccessibleName {
             max_steps: doc.node_count(),
             include_hidden: true,
             skip: None,
+            separate_elements: false,
         },
         &mut text,
     );
@@ -2392,6 +2434,71 @@ mod tests {
                 truncated: false,
             }
         );
+    }
+
+    /// 要素境界の区切りを content name 用に検証する小ヘルパー（TASK-17・#835）。
+    fn content_text(html: &str, tag: &str) -> AccessibleName {
+        name(html, tag)
+    }
+
+    /// AISNAP-1（TASK-17・#835）: 要素の開始境界で語がつながらない。
+    #[test]
+    fn task_17_aisnap_1_element_start_boundary_inserts_space() {
+        let result = content_text("<h2>Topic 12 signal meadow<a>edit</a></h2>", "h2");
+        assert_eq!(
+            result,
+            AccessibleName {
+                text: "Topic 12 signal meadow edit".to_string(),
+                source: NameSource::Content,
+                truncated: false,
+            }
+        );
+    }
+
+    /// AISNAP-1（TASK-17・#835）: 要素の終了境界でも語がつながらない。
+    #[test]
+    fn task_17_aisnap_1_element_end_boundary_inserts_space() {
+        let result = content_text(r##"<a href="#"><span>edit</span>more</a>"##, "a");
+        assert_eq!(result.text, "edit more");
+        assert_eq!(result.source, NameSource::Content);
+    }
+
+    /// AISNAP-1（TASK-17・#835）: セル同士・`br` で区切られる。
+    #[test]
+    fn task_17_aisnap_1_cells_and_br_are_separated() {
+        let row = content_text("<table><tr><td>A</td><td>B</td></tr></table>", "tr");
+        assert_eq!(row.text, "A B");
+        let button = content_text("<button>a<br>b</button>", "button");
+        assert_eq!(button.text, "a b");
+    }
+
+    /// AISNAP-1（TASK-17・#835）: 連続する区切りは 1 個に畳み、先頭・末尾に空白は出ない。
+    #[test]
+    fn task_17_aisnap_1_boundaries_collapse_and_trim() {
+        let result = content_text("<h2>  x <b> </b>  <a> y </a> </h2>", "h2");
+        assert_eq!(result.text, "x y");
+        assert!(!result.truncated);
+    }
+
+    /// AISNAP-1（TASK-17・#835）: aria-labelledby の参照先は従来どおり連結する（適用範囲の固定）。
+    #[test]
+    fn task_17_aisnap_1_labelledby_referent_keeps_concatenation() {
+        let result = name(
+            r#"<span id="l">a<b>b</b></span><input aria-labelledby="l">"#,
+            "input",
+        );
+        assert_eq!(result.text, "ab");
+        assert_eq!(result.source, NameSource::AriaLabelledBy);
+    }
+
+    /// AISNAP-1（TASK-17・#835）: 上限で切り詰めても末尾が空白にならない。
+    #[test]
+    fn task_17_aisnap_1_truncation_never_ends_with_space() {
+        let html = format!("<h2>{}</h2>", "<b>word</b>".repeat(MAX_NAME_CHARS));
+        let result = content_text(&html, "h2");
+        assert!(result.truncated);
+        assert!(!result.text.ends_with(' '));
+        assert!(result.text.starts_with("word word"));
     }
 
     /// AISNAP-1（TASK-11.4.2・#545・PR #567 レビュー指摘の P1 修正）:
@@ -3717,7 +3824,7 @@ mod tests {
         );
         assert_eq!(
             name("<button><span>保</span><b>存</b></button>", "button"),
-            named("保存", NameSource::Content, false)
+            named("保 存", NameSource::Content, false)
         );
     }
 
@@ -3737,7 +3844,7 @@ mod tests {
                 r#"<button>送信<span aria-hidden="false">見える</span></button>"#,
                 "button"
             ),
-            named("送信見える", NameSource::Content, false)
+            named("送信 見える", NameSource::Content, false)
         );
     }
 
@@ -3865,18 +3972,24 @@ mod tests {
         let r = name(&format!("<button>{over}</button>"), "button");
         assert_eq!(r, named(&exact, NameSource::Content, true));
 
+        // 要素境界の区切り 1 文字も文字数に数える（TASK-17・#835）。
         let half = "い".repeat(MAX_NAME_CHARS / 2);
+        let rest = "い".repeat(MAX_NAME_CHARS / 2 - 1);
         let r = name(
             &format!("<button><span>{half}</span><span>{half}</span><span>末</span></button>"),
             "button",
         );
         assert_eq!(
             r,
-            named(&"い".repeat(MAX_NAME_CHARS), NameSource::Content, true)
+            named(&format!("{half} {rest}"), NameSource::Content, true)
         );
         let r = name(
-            &format!("<button><span>{half}</span><span>{half}</span></button>"),
+            &format!("<button><span>{half}</span><span>{rest}</span></button>"),
             "button",
+        );
+        assert_eq!(
+            r,
+            named(&format!("{half} {rest}"), NameSource::Content, false)
         );
         assert_eq!(r.text.chars().count(), MAX_NAME_CHARS);
         assert!(!r.truncated);

@@ -249,8 +249,8 @@ fn aisnap_2_irregular_table_snapshot_is_expanded() {
                     "row",
                     "",
                     vec![
-                        n("columnheader", "名前", "e895cf72c", vec![]).with_data_leaf(tc),
-                        n("columnheader", "点数", "e4c3266d4", vec![]).with_data_leaf(tc),
+                        n("columnheader", "名前", "ecedf1953", vec![]).with_data_leaf(tc),
+                        n("columnheader", "点数", "e06eb386c", vec![]).with_data_leaf(tc),
                     ],
                 )],
             ),
@@ -261,8 +261,8 @@ fn aisnap_2_irregular_table_snapshot_is_expanded() {
                     "row",
                     "",
                     vec![
-                        n("cell", "太郎", "e8c54b60b", vec![]).with_data_leaf(tc),
-                        n("cell", "80", "eb3df3859", vec![]).with_data_leaf(tc),
+                        n("cell", "太郎", "e2b8d96d8", vec![]).with_data_leaf(tc),
+                        n("cell", "80", "e7f4182d0", vec![]).with_data_leaf(tc),
                     ],
                 )],
             ),
