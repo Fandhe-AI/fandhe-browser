@@ -46,7 +46,9 @@ fn child_texts(doc: &Document, parent: NodeId) -> Vec<String> {
 // 対象 API は `dom` モジュール（ビヘイビア CORE-1）の走査系と、
 // `parse` モジュール（CORE-1）の入力サイズ上限検査。
 // 本セクションのテストは、以下の境界を 1 つずらす変更を本番コードへ注入
-// すると red になることを確認済み（PR 本文の「注入検証記録」参照）:
+// すると red になることを確認済み（記録は
+// `docs/design/break-detection-report.md`（TASK-6.4・#333）の
+// 「結果一覧表」注入 I-1a〜I-1c）:
 // - `Document::children` の `front` 初期値（0 → 1 で先頭の子が落ちる）
 // - `parse_document`/`parse_document_bytes` の
 //   `input.len() > options.max_input_bytes`（`>=` にすると上限ちょうどの
@@ -319,8 +321,9 @@ fn repair_5_checkbox_inversion_type_equals_excludes_radio_and_text() {
 // オフバイワン（6.1）や真偽判定反転（6.2）と異なり、「対応済みの経路
 // （match の腕・分岐）を丸ごと削除する」変更を仕様後退として注入する。
 // 対象は `selector`・`query` モジュール（CORE-1）で、以下の 3 か所を
-// それぞれ削除すると red になることを確認済み（PR 本文の
-// 「注入検証記録」参照）:
+// それぞれ削除すると red になることを確認済み（記録は
+// `docs/design/break-detection-report.md`（TASK-6.4・#333）の
+// 「結果一覧表」注入 I-3a〜I-3c）:
 // - `selector::parse_attribute_selector` の
 //   `Some('\'') | Some('"') => parse_quoted_string(cursor)?,` の腕
 //   （属性値の引用符対応が消え、空白を含む値が解析できなくなる）
