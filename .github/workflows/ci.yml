@@ -264,6 +264,9 @@ jobs:
       contents: read
     env:
       CARGO_INCREMENTAL: "0"
+      # cache サイズ削減: 依存 crate の debuginfo を行番号のみにする（CI 限定。backtrace の
+      # ファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
         shell: bash
@@ -314,6 +317,9 @@ jobs:
       contents: read
     env:
       CARGO_INCREMENTAL: "0"
+      # cache サイズ削減: 依存 crate の debuginfo を行番号のみにする（CI 限定。backtrace の
+      # ファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
         shell: bash
@@ -401,6 +407,9 @@ jobs:
       contents: read
     env:
       CARGO_INCREMENTAL: "0"
+      # cache サイズ削減: 依存 crate の debuginfo を行番号のみにする（CI 限定。backtrace の
+      # ファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
         shell: bash
@@ -490,6 +499,9 @@ jobs:
       contents: read
     env:
       CARGO_INCREMENTAL: "0"
+      # cache サイズ削減: 依存 crate の debuginfo を行番号のみにする（CI 限定。backtrace の
+      # ファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
         shell: bash
@@ -664,6 +676,9 @@ jobs:
       contents: read
     env:
       CARGO_INCREMENTAL: "0"
+      # cache サイズ削減: 依存 crate の debuginfo を行番号のみにする（CI 限定。backtrace の
+      # ファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
         shell: bash
@@ -816,6 +831,9 @@ jobs:
       contents: read
     env:
       CARGO_INCREMENTAL: "0"
+      # cache サイズ削減: 依存 crate の debuginfo を行番号のみにする（CI 限定。backtrace の
+      # ファイル名・行番号は残る。release / bench プロファイルには影響しない）
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
         shell: bash
