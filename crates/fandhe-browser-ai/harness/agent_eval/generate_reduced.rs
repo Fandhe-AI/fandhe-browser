@@ -28,7 +28,6 @@ use crate::raw_dom::serialize_raw_dom;
 use crate::retention_check::{FlatEntry, all_parsed_refs, flatten, parse_ref, target_refs};
 use crate::snapshot_text::render_snapshot;
 use crate::tasks::{GOLDEN, Golden, Locator, TASKS, json_str};
-use fandhe_browser_ai::data_leaf::{DataLeafKind, classify_data_leaf};
 use fandhe_browser_ai::snapshot::{Snapshot, build_snapshot};
 use fandhe_browser_core::dom::{Document, NodeId};
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
@@ -191,10 +190,10 @@ fn refs_of(doc: &Document, node: NodeId, entries: &[FlatEntry]) -> Vec<String> {
 
 /// 簡約表現へ補う値注釈（ref → 表示文字列。`"本文"` と任意の `value="…"` 接尾辞）。
 ///
-/// snapshot はデータ葉（価格クラス・引用・地の文クラス）の本文と `option` のラベル / value を
-/// 持たない（値は ref で別途取得する前提。`AISNAP-3`）。エージェント評価（#121）が値抽出・
-/// 選択肢の特定に回答できるよう、本ハーネスの出力に限り DOM から本文を補う（`snapshot_text` の
-/// 暫定形式は変えない）。名前を持たない generic 行のみが対象。ref を一意に解決できた要素だけ補う。
+/// snapshot は `option` のラベル / value を持たない。エージェント評価（#121）が選択肢の特定に
+/// 回答できるよう、本ハーネスの出力に限り DOM から本文を補う（`snapshot_text` の暫定形式は
+/// 変えない）。データ葉（価格クラス・引用・地の文クラス）の本文は TASK-17（Issue #833）以降
+/// snapshot の name に入るため補わない。名前を持たない generic 行のみが対象。ref を一意に解決できた要素だけ補う。
 fn value_annotations(doc: &Document, entries: &[FlatEntry]) -> BTreeMap<String, (String, String)> {
     let mut out = BTreeMap::new();
     for id in doc.descendants(doc.root()) {
@@ -202,11 +201,8 @@ fn value_annotations(doc: &Document, entries: &[FlatEntry]) -> BTreeMap<String, 
             continue;
         }
         let is_option = doc.local_name(id) == Some("option");
-        let leaf = matches!(
-            classify_data_leaf(doc, id),
-            Some(DataLeafKind::PriceClass | DataLeafKind::ProseClass | DataLeafKind::Quote)
-        );
-        if !is_option && !leaf {
+        // データ葉の値は snapshot 自身が name として持つ（TASK-17・Issue #833）ので対象外。
+        if !is_option {
             continue;
         }
         let raw = doc.text_content(id).unwrap_or_default();

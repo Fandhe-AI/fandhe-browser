@@ -31,9 +31,10 @@
 //! 省略する要素（hidden・圧縮等）が先行すると実番号とずれうるが、その場合は一致しない側
 //! （NotIdentified）へ倒れる（fail-closed）。
 //!
-//! 「対象を判別できる」ことと「値を読める」ことは別である。たとえば価格（`p.price_color`）は
-//! `data_leaf = PriceClass` と ref で判別できるが、role `generic`・name 空で価格文字列は
-//! snapshot に入らない。一致エントリの name を出力（`matched_name`）して、この差が見えるようにする。
+//! 「対象を判別できる」ことと「値を読める」ことは別である。価格（`p.price_color`）などのデータ葉は
+//! TASK-17（Issue #833）以降、値テキストを name に持つ。`price-first` は DOM 先頭一致要素の
+//! テキストとの一致（`NameExpect::DomText`）を要求し、データ葉は name が空なら一致としない
+//! （印と ref だけで合格させない）。一致エントリの name は `matched_name` として出力する。
 
 use std::fmt;
 use std::fs;
@@ -82,7 +83,7 @@ pub const TASKS: [Task; 7] = [
         fixture: "ec-product-list.html",
         selector: "p.price_color",
         role: None,
-        name: NameExpect::Any,
+        name: NameExpect::DomText,
         data_leaf: Some(DataLeafKind::PriceClass),
     },
     Task {
@@ -681,6 +682,8 @@ pub fn judge(
             (NameExpect::Any, _) => true,
         })
         .filter(|e| task.data_leaf.is_none_or(|k| e.data_leaf == Some(k)))
+        // データ葉は値（name）が空なら一致としない（印と ref だけで合格しない。TASK-17）。
+        .filter(|e| task.data_leaf.is_none() || !e.name.is_empty())
         .filter(|e| match e.r#ref.as_deref() {
             None | Some("") => true,
             Some(r) => parse_ref(r).is_some_and(|p| p.matches_any(target_refs, &all_refs)),

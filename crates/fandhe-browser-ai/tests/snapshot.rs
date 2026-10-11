@@ -454,7 +454,7 @@ fn aisnap_3_price_snapshot_marks_price_leaf() {
     assert_eq!(marked.len(), 1);
     let price = marked.first().expect("価格ノードが 1 件ある");
     assert_eq!(price.role, "generic");
-    assert_eq!(price.name, "");
+    assert_eq!(price.name, "¥1,980");
     assert_eq!(price.data_leaf, Some(DataLeafKind::PriceClass));
 }
 

@@ -20,6 +20,11 @@
 //!   role・ref・剪定・打ち切りには使わない。展開されたデータ葉は ref を持つ（下記 TASK-23.4）。
 //!   表・一覧の子孫にある場合は圧縮・畳みを行わず展開を維持する（圧縮行は ref・全文・分類を
 //!   保持できないため。`AISNAP-11`・TASK-15.3・Issue #101）。展開によるトークン増の最適化は未実装。
+//! - 価格クラス・地の文クラス・引用のデータ葉は accname が空なら、子孫テキスト（name from content と
+//!   同じ規則・上限 `MAX_DATA_LEAF_VALUE_CHARS`）を出力 `Node::name` に補う（TASK-17・Issue #833）。
+//!   ref シグネチャへは従来の accname（空）を渡すので ref は不変（`AISNAP-10`）。`aria-label`/`title` を
+//!   持つ場合はそれを優先し値で上書きしない。引用内のリンクのテキストは引用 name とリンク name の
+//!   両方に出る（既知の制約。REPAIR-3）。
 //! - 規則的な `table`・`ul`・`ol`（[`crate::compress_table::detect_regular_structure`]
 //!   が `Regular`。`AISNAP-2`・TASK-12.5・Issue #83）は子孫を展開せず、ヘッダ
 //!   （個別 ref）・圧縮行・超過行数を持つ 1 ノード（[`Node::table`]）へ置き換える。
@@ -105,8 +110,9 @@ use crate::retention::priority_candidates;
 
 use super::element_ref::{ElementRef, ElementSignature, RefAllocator, RefError};
 use super::name::{
-    MAX_TOTAL_CONTENT_STEPS, NameIndex, NameSource, SKIPPED_SUBTREES, compute_name_with_index,
-    compute_residual_content_name, is_hidden_element, normalized_input_type,
+    MAX_TOTAL_CONTENT_STEPS, NameIndex, NameSource, SKIPPED_SUBTREES, compute_data_leaf_value,
+    compute_name_with_index, compute_residual_content_name, is_hidden_element,
+    normalized_input_type,
 };
 use super::role::compute_role;
 use super::state::{compute_state, is_html_element_named};
@@ -933,7 +939,28 @@ fn build_snapshot_inner(
         if !dedup {
             truncated |= accessible.truncated;
         }
-        let covering = is_name_covering(doc, child, &accessible);
+        let data_leaf = classify_data_leaf(doc, child);
+        // 値を持たないデータ葉（価格・本文 span・引用）は子孫テキストを出力 name に補う
+        // （TASK-17・Issue #833）。シグネチャには従来の accname（空）を渡すので ref は不変。
+        let value = match data_leaf {
+            Some(DataLeafKind::PriceClass | DataLeafKind::ProseClass | DataLeafKind::Quote)
+                if accessible.text.is_empty() && !accessible.truncated =>
+            {
+                compute_data_leaf_value(doc, &index, child)
+            }
+            _ => None,
+        };
+        let (out_name, covering) = match value {
+            Some(v) => {
+                truncated |= v.truncated;
+                let covering = is_name_covering(doc, child, &v);
+                (v.text, covering)
+            }
+            None => (
+                accessible.text.clone(),
+                is_name_covering(doc, child, &accessible),
+            ),
+        };
         let name = accessible.text;
         let mut sig = ElementSignature::new(role, &name);
         if let Some(d) = discriminator(doc, child) {
@@ -943,8 +970,8 @@ fn build_snapshot_inner(
             sig = sig.with_scope(scope);
         }
         let elem_ref = refs.allocate_signature(&sig)?;
-        let mut node = Node::new(role, name.clone()).with_state(compute_state(doc, child));
-        node.data_leaf = classify_data_leaf(doc, child);
+        let mut node = Node::new(role, out_name.clone()).with_state(compute_state(doc, child));
+        node.data_leaf = data_leaf;
         // 規則的な表・一覧は子孫を展開せず 1 ノードへ圧縮する（AISNAP-2・TASK-12.5）。
         let compressible_kind = ["table", "ul", "ol"]
             .iter()
@@ -1050,7 +1077,7 @@ fn build_snapshot_inner(
                 sink.push(RefHolder {
                     node: child,
                     role: role.to_string(),
-                    name,
+                    name: out_name,
                     r#ref: elem_ref.to_ref_string(),
                 });
             }
@@ -1234,6 +1261,7 @@ mod tests {
         let p = child(&s.tree, 0);
         assert_eq!(p.role, "generic");
         assert_eq!(p.data_leaf, Some(DataLeafKind::PriceClass));
+        assert_eq!(p.name, "¥1");
         assert!(p.r#ref.is_some());
     }
 
@@ -1363,7 +1391,7 @@ mod tests {
         assert!(kinds.contains(&("cell", "", tc)), "{kinds:?}");
         assert!(kinds.contains(&("link", "詳細", None)), "{kinds:?}");
         assert!(
-            kinds.contains(&("generic", "", Some(DataLeafKind::PriceClass))),
+            kinds.contains(&("generic", "1", Some(DataLeafKind::PriceClass))),
             "{kinds:?}"
         );
         // data_leaf を持たない名前なしの generic（外側の div・body 等）は折り畳まれて出ない。
@@ -1384,6 +1412,42 @@ mod tests {
         assert_eq!(span(&with_class).r#ref, span(&without).r#ref);
         assert_eq!(span(&with_class).data_leaf, Some(DataLeafKind::PriceClass));
         assert_eq!(span(&without).data_leaf, None);
+    }
+
+    /// AISNAP-3/AISNAP-11・TASK-17（#833）: 引用（子要素あり）・地の文のデータ葉は子孫テキストを
+    /// name に持ち、`aria-label` があればそれを優先する。ref は値の有無で変わらない。
+    #[test]
+    fn task_17_data_leaf_value_becomes_name() {
+        let s = snap(
+            "<body><blockquote><p>Hello  <b>big</b>\nworld</p></blockquote>\
+             <span class=\"text\">Prose</span>\
+             <p class=\"price_color\" aria-label=\"Cost\">9</p></body>",
+        );
+        let got: Vec<(&str, &str)> = s
+            .tree
+            .children
+            .iter()
+            .map(|n| (n.role.as_str(), n.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("generic", "Hello big world"),
+                ("generic", "Prose"),
+                ("generic", "Cost")
+            ]
+        );
+        assert!(!s.truncated);
+    }
+
+    /// AISNAP-11・TASK-17（#833）: 値は 300 文字で打ち切り、`truncated` を立てる。
+    #[test]
+    fn task_17_data_leaf_value_is_capped_at_300_chars() {
+        let long = "あ".repeat(301);
+        let s = snap(&format!("<body><p class=\"price_color\">{long}</p></body>"));
+        let p = child(&s.tree, 0);
+        assert_eq!(p.name.chars().count(), 300);
+        assert!(s.truncated);
     }
 
     fn is_ref_shape(r: &str) -> bool {
@@ -1499,8 +1563,8 @@ mod tests {
                 ("checkbox", "c", true),
                 ("generic", "", true), // div[onclick]
                 ("combobox", "s", true),
-                ("generic", "", true), // option
-                ("generic", "", true), // p.price_color（データ葉）
+                ("generic", "", true),    // option
+                ("generic", "9.9", true), // p.price_color（データ葉。値が name。TASK-17）
             ]
         );
     }

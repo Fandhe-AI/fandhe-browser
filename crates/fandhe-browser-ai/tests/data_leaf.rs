@@ -333,9 +333,26 @@ const RESIDUAL_NAMES: [(&str, &str); 2] = [
 /// テキストだけへ縮む。DOM 要素との対応付けは role と子の有無で絞り、出力 name の検証は
 /// [`RESIDUAL_NAMES`] の具体値との完全一致で行う（部分一致・空文字許容にしない）。
 /// 表に無いフル name の縮約は不一致（対応付け失敗）として扱う。
-fn name_matches(role: &str, n: &Node, full_name: &str) -> bool {
+///
+/// TASK-17（#833）: accname が空の価格・地の文・引用のデータ葉は、出力 name が子孫テキストの
+/// 空白折り畳み値になる（`dom` が要素）。
+fn name_matches(doc: &Document, dom: NodeId, role: &str, n: &Node, full_name: &str) -> bool {
     if n.name == full_name {
         return true;
+    }
+    if full_name.is_empty()
+        && matches!(
+            classify_data_leaf(doc, dom),
+            Some(DataLeafKind::PriceClass | DataLeafKind::ProseClass | DataLeafKind::Quote)
+        )
+    {
+        let value = doc
+            .text_content(dom)
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        return !value.is_empty() && n.name == value;
     }
     matches!(role, "row" | "cell" | "gridcell")
         && !n.children.is_empty()
@@ -371,7 +388,7 @@ fn pair_nodes<'a>(doc: &Document, snapshot: &'a Snapshot) -> Vec<(NodeId, &'a No
         let Some(n) = next else { break };
         let role = compute_role(doc, d).map_or("generic", |r| r.as_str());
         if n.role == role
-            && name_matches(role, n, &compute_name(doc, d).text)
+            && name_matches(doc, d, role, n, &compute_name(doc, d).text)
             && n.data_leaf == classify_data_leaf(doc, d)
         {
             pairs.push((d, n));
@@ -433,7 +450,7 @@ fn map_to_snapshot<'a>(doc: &Document, snapshot: &'a Snapshot, target: NodeId) -
     let full_name = compute_name(doc, target).text;
     match item {
         Item::Node(n) => assert!(
-            name_matches(expected_role, n, &full_name),
+            name_matches(doc, target, expected_role, n, &full_name),
             "対応付けの name が一致する: {:?} vs {full_name:?}",
             n.name
         ),
@@ -584,7 +601,8 @@ fn aisnap_3_discriminable_tasks_at_least_6_of_7() {
 /// `data_leaf` を併用して初めて対象を選べる（同 role・name の別ノードの存在を検証）。
 #[test]
 fn aisnap_3_data_tasks_rely_on_data_leaf() {
-    // 価格: 対象は (generic, "") で、同じ組の非価格ノードが木に存在する。
+    // 価格: 対象は (generic, "10.00")（TASK-17・#833 以降は値が name）。無名 generic の
+    // 述語 (generic, "") は価格ではなく別ノードを選ぶ。
     // 名前のない generic の折り畳み（TASK-23.3）で素のラッパーは消えるため、折り畳まれない
     // 同形ノード（`tabindex` 付きの操作要素 div）を価格より前に置いて、role/name だけでは
     // 価格を特定できないことを引き続き検証する（以前は html・body 等の generic が担っていた）。
@@ -595,15 +613,15 @@ fn aisnap_3_data_tasks_rely_on_data_leaf() {
         .expect("セレクタは有効")
         .expect("価格要素がある");
     let mapped = map_to_snapshot(&doc, &snapshot, target);
-    assert_eq!((mapped.role(), mapped.name()), ("generic", ""));
+    assert_eq!((mapped.role(), mapped.name()), ("generic", "10.00"));
     let nodes = all_nodes(&snapshot.tree);
     let same_shape = nodes
         .iter()
         .filter(|n| n.role() == "generic" && n.name().is_empty())
         .count();
     assert!(
-        same_shape > 1,
-        "role/name だけでは価格を特定できない: {same_shape}"
+        same_shape >= 1,
+        "無名 generic の述語は価格以外を選ぶ: {same_shape}"
     );
     let price_leaves = nodes
         .iter()
