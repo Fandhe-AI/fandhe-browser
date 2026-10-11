@@ -31,7 +31,6 @@ use crate::discovery::{self, Authority, BROWSER_WS_PATH_PATTERN, HostError};
 use crate::dom::IssuedDocuments;
 use crate::method_log::{ReceivedMethodLog, ReceivedMethodsSnapshot};
 use crate::navigation::TargetNavigations;
-use crate::playwright_compat::{AutoAttachStates, DownloadPolicyState};
 use crate::protocol::{ConnId, Dispatcher};
 use crate::target::{BrowserId, TargetRegistry};
 use crate::ws;
@@ -51,10 +50,6 @@ pub struct CdpState {
     navigations: TargetNavigations,
     /// `DOM.getDocument` が nodeId を払い出した文書の記録（`DOM.querySelector` が世代検証に使う。`CDP-1`）。
     dom_issued: IssuedDocuments,
-    /// `Target.setAutoAttach` の接続別設定（`CDP-2`）。
-    auto_attach: AutoAttachStates,
-    /// `Browser.setDownloadBehavior` のブラウザ全体の挙動（`CDP-2`）。
-    download_policy: DownloadPolicyState,
     /// 受信メソッド名の集計（`Dispatcher::dispatch_on` が書く。`CDP-6`）。
     method_log: ReceivedMethodLog,
 }
@@ -74,8 +69,6 @@ impl CdpState {
             registry: TargetRegistry::new(),
             navigations: TargetNavigations::new(),
             dom_issued: IssuedDocuments::new(),
-            auto_attach: AutoAttachStates::new(),
-            download_policy: DownloadPolicyState::new(),
             method_log: ReceivedMethodLog::new(),
         }
     }
@@ -84,23 +77,11 @@ impl CdpState {
     /// ここへ集約し、解放漏れを防ぐ。
     pub(crate) fn open_connection(&self, conn: ConnId) {
         self.dom_issued.open_connection(conn);
-        self.auto_attach.open_connection(conn);
     }
 
     /// 接続の終了で接続別状態をすべて解放する（`crate::ws` の `on_close` から呼ぶ）。
     pub(crate) fn release_connection(&self, conn: ConnId) {
         self.dom_issued.release_connection(conn);
-        self.auto_attach.release_connection(conn);
-    }
-
-    /// `Target.setAutoAttach` の接続別設定表（crate 内部専用）。
-    pub(crate) fn auto_attach(&self) -> &AutoAttachStates {
-        &self.auto_attach
-    }
-
-    /// ダウンロード挙動（crate 内部専用）。
-    pub(crate) fn download_policy(&self) -> &DownloadPolicyState {
-        &self.download_policy
     }
 
     /// 受信メソッド集計（`Dispatcher::dispatch_on` が記録する）。
@@ -148,7 +129,6 @@ impl fmt::Debug for CdpState {
             .field("browser_id", &self.browser_id)
             .field("targets", &self.registry.target_count())
             .field("sessions", &self.registry.session_count())
-            .field("download_policy", &self.download_policy.get())
             .finish()
     }
 }

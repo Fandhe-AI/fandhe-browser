@@ -29,10 +29,10 @@ Playwright のソースは長く引用せず、関数名と要約に留める。
 
 | 段階 | 現状 | 根拠 |
 | ---- | ---- | ---- |
-| `connectOverCDP(http://…)` | 成功（TASK-43.3a で `/json/version/`・`Browser.getVersion`、TASK-43.3b で `Target.setAutoAttach`・`Browser.setDownloadBehavior`・`Target.getTargetInfo` を実装） | A（段階 2a 後の再取得）: seq 1〜11 |
-| `connectOverCDP(ws://…)` | 段階なし（http が成功したため実行されない） | A（同上） |
-| `newContext()` | 失敗。`Target.createBrowserContext`（id 5）が `-32601`（段階 2b の範囲） | A（同上）: seq 12〜14 |
-| `newPage()` | 未到達（`newContext` の失敗で止まる） | A + B |
+| `connectOverCDP(http://…)` | 失敗。`/json/version/` は 200（TASK-43.3a で解消）。`Browser.getVersion` は成功し、次の `Target.setAutoAttach`・`Browser.setDownloadBehavior` が `-32601`（実体未接続のため未登録。TASK-43.3b のレビューで成功応答を取り下げた） | A（TASK-43.3a 後の再取得）: seq 1〜9 |
+| `connectOverCDP(ws://…)` | 失敗。`Browser.getVersion` は成功し、次の `Target.setAutoAttach`・`Browser.setDownloadBehavior` が `-32601` | A（同上）: seq 10〜16 |
+| `newContext()` | 未到達（トレースに該当メッセージなし） | A + B |
+| `newPage()` | 未到達（同上） | A + B |
 
 `-32601` は未実装メソッドへ成功を捏造しない `CDP-6`・`SEC-2` の方針どおりの挙動で、バグではない。
 
@@ -144,25 +144,17 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
 - 次の停止箇所は段階 2 の `Target.setAutoAttach` 以降。`Target.getTargetInfo` は上記失敗により未送信で、
   段階 2 の実測で確認する
 
-### 段階 2a の実施結果（TASK-43.3b・#862。実測 A）
+### 段階 2a の実施結果（TASK-43.3b・#862）
 
-- `playwright_compat.rs` に次の 3 メソッドを個別実装した。いずれも `sessionId` 付きは `-32602` で拒否する
-  - `Target.setAutoAttach`: ルートの `flatten:true` のみ受理し、設定を接続別に保持して `{}` を返す。
-    `Target.attachedToTarget` の送出と既存ターゲットへの自動 attach は未実装（段階 2c）。
-    非 flatten・`filter`（Puppeteer が送る。扱い未確定）は明示的に `-32602`（`unsupported params`）。
-    接続を閉じると設定を解放する
-  - `Browser.setDownloadBehavior`: `behavior` の列挙検査と `downloadPath` の長さ検査（4096 バイト）のみで
-    ブラウザ全体の挙動を保持し `{}` を返す。`downloadPath` はファイルシステムを触らない不透明な文字列。
-    ダウンロード機能は未実装で保持値はどこからも参照されない。`browserContextId` 付きは段階 2b の範囲で `-32602`
-  - `Target.getTargetInfo`: 引数なしは `type:"browser"`・`attached:true` の実値（`CdpState` のブラウザ ID）。
-    `targetId` 指定は `TargetRegistry` の実値（`attached` は実セッションの有無）で、未知・不正は `-32602`
-- `make trace-playwright` の再取得結果（2 回実行して内容が同一）: `Browser.getVersion`（id 1）、
-  `Target.setAutoAttach`（id 2）・`Browser.setDownloadBehavior`（id 3）が成功し、`Target.getTargetInfo`（id 4）も成功して
-  `connectOverCDP(http)` が成功する（seq 3〜11）。続く `newContext()` が送る `Target.createBrowserContext`（id 5）が
-  `-32601` で失敗する（seq 12〜14）。`connectOverCDP(ws)` は http 成功のため実行されず、`newPage()` には未到達。
-  予測 #3・#4 と一致した
-- 次の停止箇所は `Target.createBrowserContext`（段階 2b）。それ以降の `Target.createTarget` と
-  `Target.attachedToTarget` の応答前送出（段階 2c）は未実測
+- 実装したのは `Target.getTargetInfo` のみ（`playwright_compat.rs`。`sessionId` 付きは `-32602`）。
+  引数なしは `type:"browser"`・`attached:true` の実値（`CdpState` のブラウザ ID）。`targetId` 指定は
+  `TargetRegistry` の実値（`attached` は実セッションの有無）で、未知・不正は `-32602`
+- `Target.setAutoAttach` と `Browser.setDownloadBehavior` は**登録を取り下げた**（`-32601` のまま）。
+  設定を保存して `{}` を返すだけでは、実セッションの attach・`Target.attachedToTarget` の送出や
+  ダウンロード処理（`downloadPath` の保存・イベント通知）に接続されておらず、クライアントに有効化済みと
+  誤認させる（`CDP-6`・`REPAIR-3`）。実体と接続できる段階（段階 2b・2c 以降）で改めて実装する
+- このため `connectOverCDP` の到達点は TASK-43.3a 後と同じ（`Target.setAutoAttach` で停止。
+  `Target.getTargetInfo` は送られない）。トレース（`newpage-trace.jsonl`）も TASK-43.3a 後の内容に戻した
 
 #### 予測 #11（`Page.frameNavigated`）の訂正（種別 B・未実測）
 

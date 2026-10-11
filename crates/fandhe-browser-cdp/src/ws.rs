@@ -124,7 +124,7 @@ impl WsMessageHandler for BrowserSessionHandler {
         })
     }
 
-    /// 切断時にその接続の接続 ID と接続別状態（nodeId 払い出し記録・autoAttach 設定）を解放する（`CDP-1`・`SEC-2`）。
+    /// 切断時にその接続の接続 ID と接続別状態（nodeId 払い出し記録など）を解放する（`CDP-1`・`SEC-2`）。
     fn on_close(&self, ctx: &WsConnContext, _reason: CloseReason) {
         let removed = self
             .conns

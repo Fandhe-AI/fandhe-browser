@@ -8,7 +8,7 @@
 //!
 //! 公開入口は無く crate 内部専用。後続タスクは [`builtin_handlers`] へメソッドを
 //! 追加するだけでよい（`Page.navigate` は 42.2 で登録済み、イベント送出は 42.3 で実装済み、
-//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.setAutoAttach`・`Browser.setDownloadBehavior`・`Target.getTargetInfo` は TASK-43.3b で登録済み）。
+//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b で登録済み。`Target.setAutoAttach`・`Browser.setDownloadBehavior` は実体未接続のため未登録）。
 //!
 //! # 入力の扱い
 //!
@@ -22,8 +22,7 @@
 //!
 //! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 //! `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・
-//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.setAutoAttach`・
-//! `Browser.setDownloadBehavior`・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）のみ登録済みで、
+//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）のみ登録済みで、
 //! それ以外のメソッドは JSON-RPC の「method not implemented」（`-32601`）エラーを返す。
 //! 汎用の空 success フォールバック（PoC-5 の暫定挙動）は採らない。理由は次のとおり。
 //!
@@ -368,7 +367,7 @@ type HandlerTable = Vec<(&'static str, Box<dyn CommandHandler>)>;
 
 /// 組込みハンドラ表。`Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 /// `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・`Browser.getVersion`（TASK-43.3a）・
-/// `Target.setAutoAttach`・`Browser.setDownloadBehavior`・`Target.getTargetInfo`（TASK-43.3b）を登録済み（`CDP-1`・`CDP-2`）。
+/// `Target.getTargetInfo`（TASK-43.3b）を登録済み（`Target.setAutoAttach`・`Browser.setDownloadBehavior` は実体未接続のため未登録）（`CDP-1`・`CDP-2`）。
 ///
 /// `Page.navigate` は既定の `FetchOptions`（内部アドレス拒否）で `Fetcher` を構築する。
 pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
@@ -379,14 +378,6 @@ pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
         (
             "Browser.getVersion",
             Box::new(crate::playwright_compat::BrowserGetVersion),
-        ),
-        (
-            "Target.setAutoAttach",
-            Box::new(crate::playwright_compat::TargetSetAutoAttach),
-        ),
-        (
-            "Browser.setDownloadBehavior",
-            Box::new(crate::playwright_compat::BrowserSetDownloadBehavior),
         ),
         (
             "Target.getTargetInfo",
@@ -825,65 +816,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn cdp2_builtin_set_auto_attach_root_succeeds_and_is_released_on_close() {
-            let dir = TempDir::new();
-            let st = state(&dir);
-            let conn = ConnId::new(1);
-            st.open_connection(conn);
-            let ok = r#"{"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true}}"#;
-            assert_eq!(
-                one(&st, Some(conn), ok).await,
-                json!({"id": 1, "result": {}})
-            );
-            let got = st.auto_attach().get(Some(conn)).unwrap();
-            assert!(got.auto_attach && got.wait_for_debugger_on_start);
-            st.release_connection(conn);
-            assert!(st.auto_attach().get(Some(conn)).is_none());
-            // 切断後の書き込みは保存されない。
-            let v = one(&st, Some(conn), ok).await;
-            assert_eq!(v["error"]["code"], -32000);
-            assert_eq!(st.auto_attach().len(), 0);
-            let unsup =
-                json!({"id": 2, "error": {"code": -32602, "message": "unsupported params"}});
-            let nf = r#"{"id":2,"method":"Target.setAutoAttach","params":{"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":false}}"#;
-            assert_eq!(one(&st, None, nf).await, unsup);
-            let sess = r#"{"id":2,"method":"Target.setAutoAttach","sessionId":"S-1","params":{"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true}}"#;
-            let v = one(&st, None, sess).await;
-            assert_eq!(v["error"]["code"], -32602);
-        }
-
-        #[tokio::test]
-        async fn cdp2_builtin_set_download_behavior() {
-            let dir = TempDir::new();
-            let st = state(&dir);
-            let path = dir.0.join("never-created");
-            let text = json!({"id": 1, "method": "Browser.setDownloadBehavior", "params": {"behavior": "allowAndName", "downloadPath": path.to_string_lossy(), "eventsEnabled": true}}).to_string();
-            assert_eq!(one(&st, None, &text).await, json!({"id": 1, "result": {}}));
-            let p = st.download_policy().get();
-            assert_eq!(
-                (p.behavior, p.events_enabled),
-                (
-                    crate::playwright_compat::DownloadBehavior::AllowAndName,
-                    true
-                )
-            );
-            assert!(!path.exists());
-            for body in [
-                r#"{"behavior":"bogus"}"#,
-                r#"{"behavior":"deny","browserContextId":"X"}"#,
-            ] {
-                let t =
-                    format!(r#"{{"id":3,"method":"Browser.setDownloadBehavior","params":{body}}}"#);
-                let v = one(&st, None, &t).await;
-                assert_eq!(v["error"]["code"], -32602);
-            }
-            assert_eq!(
-                st.download_policy().get().behavior,
-                crate::playwright_compat::DownloadBehavior::AllowAndName
-            );
-        }
-
-        #[tokio::test]
         async fn cdp2_builtin_get_target_info() {
             let dir = TempDir::new();
             let st = state(&dir);
@@ -924,6 +856,8 @@ mod tests {
             let st = state(&dir);
             let b = Dispatcher::builtin().unwrap();
             for (i, m) in [
+                "Target.setAutoAttach",
+                "Browser.setDownloadBehavior",
                 "Target.createBrowserContext",
                 "Target.createTarget",
                 "Target.attachToTarget",
