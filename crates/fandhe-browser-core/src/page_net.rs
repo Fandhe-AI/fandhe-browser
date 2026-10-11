@@ -325,6 +325,17 @@ impl NetQueue {
         self.pending.len()
     }
 
+    /// まだ取得に着手していない要求を `id` で取り除く。除外できたら真。
+    ///
+    /// 受理済みの件数（`accepted`）は戻さない（中止しても要求数の上限は消費済みのまま。
+    /// 中止の連打で上限を迂回させない）。着手済み・配送済み・未知の ID は何もしない。
+    pub(crate) fn cancel(&mut self, id: u32) -> bool {
+        match self.pending.iter().position(|r| r.id == id) {
+            Some(index) => self.pending.remove(index).is_some(),
+            None => false,
+        }
+    }
+
     pub(crate) fn pop_pending(&mut self) -> Option<PendingRequest> {
         self.pending.pop_front()
     }
@@ -504,6 +515,21 @@ mod tests {
     }
 
     /// JS-8: 相対 URL は navigate 先 URL を基準に解決する。
+    #[test]
+    fn js_8_cancel_removes_only_unsent_requests() {
+        let mut q = q(PageNetLimits::default());
+        let a = req(&mut q, "a").expect("a");
+        let b = req(&mut q, "b").expect("b");
+        let taken = q.pop_pending().expect("a is taken first");
+        assert_eq!(taken.id, a);
+        // 着手済み・未知の ID は取り消せない。
+        assert!(!q.cancel(a));
+        assert!(!q.cancel(999));
+        assert!(q.cancel(b));
+        assert!(!q.cancel(b));
+        assert_eq!(q.pending_len(), 0);
+    }
+
     #[test]
     fn js_8_resolve_relative_against_location() {
         let b = base();

@@ -357,6 +357,7 @@ enum DomOp {
     NetFinalUrl,
     NetCallbackError,
     NetOptionsIgnored,
+    NetCancel,
 }
 
 impl DomOp {
@@ -402,6 +403,7 @@ impl DomOp {
             "netFinalUrl" => Self::NetFinalUrl,
             "netCallbackError" => Self::NetCallbackError,
             "netOptionsIgnored" => Self::NetOptionsIgnored,
+            "netCancel" => Self::NetCancel,
             _ => return None,
         })
     }
@@ -448,6 +450,7 @@ impl DomOp {
             Self::NetFinalUrl => "netFinalUrl",
             Self::NetCallbackError => "netCallbackError",
             Self::NetOptionsIgnored => "netOptionsIgnored",
+            Self::NetCancel => "netCancel",
         }
     }
 
@@ -477,7 +480,8 @@ impl DomOp {
             | Self::NetConsume
             | Self::NetReadBody
             | Self::NetFinalUrl
-            | Self::NetOptionsIgnored => 1,
+            | Self::NetOptionsIgnored
+            | Self::NetCancel => 1,
             Self::QuerySelector
             | Self::QuerySelectorAll
             | Self::AppendChild
@@ -1011,6 +1015,14 @@ fn execute(
                 }
             };
             page.diagnostics.record_net_callback_error(request, message);
+            Ok(JsValue::Undefined)
+        }
+        // XHR の abort() / 再 open() による未送信要求の取り消し。取得前なら要求キューから除外し、
+        // 取得に着手済み・配送済み・未知の ID は何もしない（旧世代の応答は shim 側で破棄する）。
+        DomOp::NetCancel => {
+            if let Some(id) = decode_net_id(args.first()) {
+                page.net.cancel(id);
+            }
             Ok(JsValue::Undefined)
         }
         // `fetch` の init で無視したオプション（headers / credentials 等）の件数。

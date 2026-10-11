@@ -726,6 +726,28 @@ fn net_cases(engine: &str) {
     }
     assert_eq!(hit_count(&hits), 2);
 
+    eprintln!(
+        "case: JS-8 abort() / re-open() drop an unsent request before it reaches the network"
+    );
+    let (port, hits) = spawn_recording_server(|path| match path {
+        "/kept" => ("200 OK", String::new(), "kept".to_string()),
+        _ => ("200 OK", String::new(), "stale".to_string()),
+    });
+    let base = format!("http://127.0.0.1:{port}/page.html");
+    let html = "<body><script>function a(t){var p=document.createElement('p');p.textContent=t;\
+        document.body.appendChild(p)}\
+        var x=new XMLHttpRequest();x.onload=function(){a('x:'+x.responseText)};\
+        x.open('GET','aborted');x.send();x.abort();\
+        var y=new XMLHttpRequest();y.onload=function(){a('y:'+y.responseText)};\
+        y.open('GET','reopened-old');y.send();y.open('GET','kept');y.send();</script></body>";
+    let out = run_page_at(engine, html, &base, &opts, &loopback_fetcher());
+    assert!(out.html().contains("<p>y:kept</p>"), "{}", out.html());
+    assert!(!out.html().contains("<p>y:stale"), "{}", out.html());
+    assert!(!out.html().contains("<p>x:"), "{}", out.html());
+    assert_eq!(hit_count(&hits), 1);
+    // 受理数は中止しても戻さない（要求数上限の迂回防止）。ネットへ出たのは 1 件だけ。
+    assert_eq!(out.net().started(), 3);
+
     eprintln!("case: JS-6 request count: the Nth request is accepted, the N+1th rejected");
     let (port, hits) = spawn_recording_server(|_| ("200 OK", String::new(), "ok".to_string()));
     let base = format!("http://127.0.0.1:{port}/page.html");

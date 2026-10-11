@@ -237,9 +237,26 @@
         defineProperty(this, '_sent', { value: false, writable: true });
         // 要求世代。open() / abort() で進め、旧世代の配送・失敗通知を破棄する。
         defineProperty(this, '_g', { value: 0, writable: true });
+        // 送信中の要求 ID（0 は無し）。abort() / open() で Rust 側の未送信要求を取り消す。
+        defineProperty(this, '_id', { value: 0, writable: true });
+    }
+
+    function xhrCancel(xhr) {
+        var id = xhr._id;
+        xhr._id = 0;
+        if (id === 0) {
+            return;
+        }
+        delete pending[id];
+        try {
+            callOp('netCancel', id);
+        } catch (e) {
+            // 取り消せなくても、旧世代の応答は世代検査で破棄される。
+        }
     }
 
     function xhrReset(xhr) {
+        xhrCancel(xhr);
         xhr._g += 1;
         xhr.status = 0;
         xhr.statusText = '';
@@ -278,6 +295,7 @@
             });
             return;
         }
+        this._id = id;
         pending[id] = { kind: 'xhr', xhr: this, gen: this._g };
     };
 
@@ -313,6 +331,9 @@
         }
         var entry = pending[id];
         delete pending[id];
+        if (entry.kind === 'xhr' && entry.xhr._id === id) {
+            entry.xhr._id = 0;
+        }
         var body = '';
         var url = '';
         if (status > 0) {
