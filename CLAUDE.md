@@ -25,7 +25,7 @@ fandhe-browser/
 ├── .editorconfig                  # インデント・改行・文字コード規約
 ├── skills-lock.json               # 導入スキルのロックファイル
 ├── Makefile                       # 開発タスク集約（lint-docs・fmt・clippy・test・deny・Servo 隔離検査。`make help`）
-├── lefthook.yml                   # git hooks（整形・秘密情報検査・commit-msg・pre-push）
+├── lefthook.yml                   # git hooks（整形・秘密情報検査・commit-msg。clippy・test は CI に任せ pre-push は置かない）
 ├── commitlint.config.mjs          # commitlint 設定（type を 9 種に限定）
 ├── Dockerfile / compose.yaml      # 開発コンテナ（環境非依存の `make docker-ci`）
 ├── .markdownlint.jsonc / .yamllint / .editorconfig-checker.json  # lint-docs 設定
