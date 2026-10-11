@@ -88,6 +88,19 @@
 
 - snapshot が 10 トークン増えたのは、name を持たなかった checkbox・radio に隣接テキストの name が付いたため。
 
+## 追補: name の出所（placeholder）付記後の変化（#874）
+
+上の表・所見・集計は `5383534` の測定値のままで、本節の値は含めない。#874（`AISNAP-1`）で、簡約表現に accessible name の出所を付記するようにした後の差分だけを、ここに別記する。付記するのは name が `placeholder` 由来のときだけ（測定用テキストでは quoted name の直後に `(placeholder)`、`/ai/snapshot` の JSON では `name_source: "placeholder"`）。label・aria-label・子孫テキスト由来の出力は変えていない。
+
+| name | rawHtmlTokens | rawDomTokens | snapshotTokens | 対生 HTML 削減率（%） | 対生 DOM 削減率（%） |
+| ---- | ------------- | ------------ | -------------- | --------------------- | -------------------- |
+| reddit-list（`5383534`） | 33111 | 33051 | 14492 | 56.2 | 56.2 |
+| reddit-list（#874 後） | 33111 | - | 14495 | 56.2 | - |
+
+- 影響を受けるフィクスチャは `reddit-list` の `<input placeholder="search">`（`textbox "search"` 行）のみ。出力の差分は 1 行で、`golden-refs.json` を含む他の `reduced/` 生成物は変わらない。
+- snapshot が 3 トークン増えた（`(placeholder)` の分）。削減率は小数 1 桁で変わらず、平均（50.7%）の判定に影響しない。`mcp_token_reduction` の PINNED 5 サイトは placeholder 属性を持たず不変。ref のシグネチャは出所を使わないため ref も不変（`AISNAP-10`）。
+- `python-portal` の検索 input は `<label for>` があるため name の出所は `Label` で、本変更では出力が変わらない（AISNAP-9 の extract-06 は本変更では回復しない。`aisnap9-comparison-report.md` の原因説明の見直しは後続課題）。
+
 ## 引き継ぎ
 
 - #97（TASK-14 の 85% 目標）・#131（TASK-23）: 対照表の AISNAP-1・4・5・15 の値を判断の材料にする。

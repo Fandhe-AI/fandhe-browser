@@ -133,6 +133,10 @@ pub struct Node {
     /// だけを持つ（重複の除去。`AISNAP-1`・TASK-23.6・Issue #828）。ref のシグネチャには
     /// 従来のフル name を使うため、縮めても `ref` は変わらない（`AISNAP-10`）。
     pub name: String,
+    /// [`Node::name`] の出所（`AISNAP-1`・Issue #874）。簡約表現は
+    /// [`NameSource::output_hint`] が `Some` のとき（placeholder 由来）だけ出所を付記する。
+    /// ref のシグネチャには使わない（`AISNAP-10`）。
+    pub name_source: NameSource,
     /// role + name シグネチャによる再特定要求（`AISNAP-10`）。`None` は ref を振らない
     /// ノード（ルート、および操作・参照の対象でないノード。TASK-23.4・Issue #827）。
     /// 形式は `e<8..16hex>[v<n>][-n]`。生成は [`RefAllocator`]（TASK-11.6・Issue #75）。
@@ -384,6 +388,7 @@ impl Node {
         Self {
             role: role.into(),
             name: name.into(),
+            name_source: NameSource::None,
             r#ref: None,
             children: Vec::new(),
             state: State::default(),
@@ -398,6 +403,13 @@ impl Node {
     #[must_use]
     pub fn with_ref(mut self, r: impl Into<String>) -> Self {
         self.r#ref = Some(r.into());
+        self
+    }
+
+    /// `name_source` を設定した `Node` を返す（ビルダー。`AISNAP-1`・Issue #874）。
+    #[must_use]
+    pub fn with_name_source(mut self, source: NameSource) -> Self {
+        self.name_source = source;
         self
     }
 

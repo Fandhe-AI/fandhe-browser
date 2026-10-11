@@ -12,6 +12,8 @@
 //! 方針:
 //! - `Snapshot` が保持する情報（role・name・ref・state・children・table・
 //!   folded_rows・folded_rows_omitted・各 truncated）を落とさず出す。目標値に合わせて削らない。
+//! - name の出所は placeholder 由来のときだけ ` (placeholder)` と付記する（`AISNAP-1`・Issue #874。
+//!   label 等は付記しない）。
 //! - `data_leaf` は分類用メタデータでエージェントへ渡す本文ではないため出さない。
 //! - 再帰の深さは `MAX_TREE_DEPTH`（256）で有界。name は構築側で空白正規化済みの
 //!   前提だが、改行・タブが残っていても行形式を壊さないよう空白 1 個へ置換する。
@@ -90,6 +92,10 @@ fn render_head(node: &Node, depth: usize, lines: &mut Vec<String>) {
     let mut line = format!("{indent}- {}", node.role);
     if !node.name.is_empty() {
         line.push_str(&format!(" {}", quoted(&node.name)));
+        // 名前が placeholder 由来のときだけ出所を付記する（AISNAP-1・Issue #874）。
+        if let Some(h) = node.name_source.output_hint() {
+            line.push_str(&format!(" ({h})"));
+        }
     }
     if let Some(r) = &node.r#ref {
         line.push_str(&format!(" [{r}]"));

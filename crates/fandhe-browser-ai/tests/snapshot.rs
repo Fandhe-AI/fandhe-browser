@@ -22,8 +22,8 @@ use std::collections::HashSet;
 use fandhe_browser_ai::compress_table::MAX_TABLE_ROWS;
 use fandhe_browser_ai::snapshot::element_ref::{ElementSignature, RefAllocator};
 use fandhe_browser_ai::snapshot::{
-    CheckedState, DataLeafKind, HeaderCell, MAX_ROW_CONTROLS, MAX_TABLE_CONTROLS, Node, REF_ROLES,
-    Snapshot, State, TableRow, TableSummary, build_snapshot, ref_signature,
+    CheckedState, DataLeafKind, HeaderCell, MAX_ROW_CONTROLS, MAX_TABLE_CONTROLS, NameSource, Node,
+    REF_ROLES, Snapshot, State, TableRow, TableSummary, build_snapshot, ref_signature,
 };
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
 
@@ -41,6 +41,20 @@ fn snap(html: &str) -> Snapshot {
     let parsed =
         parse_document(html, &ParseOptions::default()).expect("フィクスチャのパースは成功する");
     build_snapshot(&parsed.document).expect("フィクスチャの構築は成功する")
+}
+
+/// 全ノードの `name_source` を `NameSource::None` に戻した複製を返す。
+///
+/// 期待木は role・name・ref・state の具体値で組むため、出所（Issue #874）は比較から外す。
+/// 出所そのものは `src/snapshot/build.rs` のユニットテストで固定している。
+fn without_name_sources(s: &Snapshot) -> Snapshot {
+    let mut out = s.clone();
+    let mut stack = vec![&mut out.tree];
+    while let Some(node) = stack.pop() {
+        node.name_source = NameSource::None;
+        stack.extend(node.children.iter_mut());
+    }
+    out
 }
 
 /// ref を持たないノードの期待値（TASK-23.4）。
@@ -149,7 +163,7 @@ fn aisnap_1_article_snapshot_structure() {
         )),
         nn("contentinfo", "", vec![]),
     ]));
-    assert_eq!(s, expected);
+    assert_eq!(without_name_sources(&s), expected);
     assert_common(ARTICLE, &s);
 
     // 要所の個別確認（失敗時の読みやすさのため）。
@@ -180,7 +194,7 @@ fn aisnap_1_form_snapshot_structure() {
         n("button", "送信", "e764e1c46", vec![]),
         n("button", "取消", "ebc866535", vec![]).with_state(disabled),
     ]));
-    assert_eq!(s, expected);
+    assert_eq!(without_name_sources(&s), expected);
     assert_common(FORM, &s);
 
     let cb = child(&s.tree, 1);
@@ -222,7 +236,7 @@ fn aisnap_2_table_snapshot_is_compressed() {
             0,
         )),
     ]));
-    assert_eq!(s, expected);
+    assert_eq!(without_name_sources(&s), expected);
     assert_common(TABLE, &s);
     let table = child(&s.tree, 0);
     assert_eq!(table.role, "table");
@@ -268,7 +282,7 @@ fn aisnap_2_irregular_table_snapshot_is_expanded() {
             ),
         ],
     )]));
-    assert_eq!(s, expected);
+    assert_eq!(without_name_sources(&s), expected);
     assert_common(IRREGULAR_TABLE, &s);
     let table = child(&s.tree, 0);
     assert_eq!(table.table, None);

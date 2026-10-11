@@ -277,6 +277,23 @@ pub enum NameSource {
     AdjacentText,
 }
 
+impl NameSource {
+    /// 簡約表現へ付記する出所ヒントを返す（`AISNAP-1`・Issue #874）。
+    ///
+    /// `Placeholder` だけが `Some("placeholder")` を返す。placeholder は入力例・ヒントで、
+    /// 「ラベル」と意味が異なる（項目名とは限らない）ため、出所を明示してエージェントの
+    /// 誤読を防ぐ。label・aria-label・子孫テキスト等は名前が画面の表示と一致するので、
+    /// トークンを増やさず付記しない。JSON（`api.rs`）と測定用テキスト描画
+    /// （`benches/token_reduction/snapshot_text.rs`）が共通でこの判定を使う。
+    #[must_use]
+    pub const fn output_hint(self) -> Option<&'static str> {
+        match self {
+            NameSource::Placeholder => Some("placeholder"),
+            _ => None,
+        }
+    }
+}
+
 /// 要素の accessible name（`AISNAP-1`）。[`super::Node::name`] の算出結果。
 ///
 /// `#[non_exhaustive]` により、将来のフィールド追加が非破壊になる
@@ -4285,5 +4302,26 @@ mod tests {
             compute_residual_content_name(&doc, &exhausted, cell, &covered),
             None
         );
+    }
+
+    /// `AISNAP-1`・Issue #874: 付記対象は placeholder のみ。
+    #[test]
+    fn output_hint_is_placeholder_only() {
+        assert_eq!(NameSource::Placeholder.output_hint(), Some("placeholder"));
+        for s in [
+            NameSource::None,
+            NameSource::AriaLabelledBy,
+            NameSource::AriaLabel,
+            NameSource::Label,
+            NameSource::Alt,
+            NameSource::Value,
+            NameSource::DefaultButtonLabel,
+            NameSource::Title,
+            NameSource::Content,
+            NameSource::DocumentTitle,
+            NameSource::AdjacentText,
+        ] {
+            assert_eq!(s.output_hint(), None, "{s:?}");
+        }
     }
 }
