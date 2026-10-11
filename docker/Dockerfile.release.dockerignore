@@ -10,6 +10,7 @@
 !benches/
 !profiles/
 !docs/design/host-api.schema.json
+!scripts/gen-cargo-licenses.sh
 !NOTICE
 !LICENSE-THIRD-PARTY
 !LICENSE-MIT

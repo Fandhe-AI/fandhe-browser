@@ -72,5 +72,13 @@ MPL-2.0 全文も同時に LICENSE-THIRD-PARTY へ追加する。
 3. Cargo 依存の帰属表示
 --------------------------------------------------------------------------------
 
-Cargo 依存の帰属表示は、配布開始前までに別途整備する
-(cargo-about 等による生成。別 Issue で扱う)。
+既定コンテナ (docker/Dockerfile.release・TASK-64・Issue #297) では、静的リンクされる
+Cargo 依存 (通常依存・推移依存) の著作権表示・許諾文を、ビルド時に
+scripts/gen-cargo-licenses.sh (cargo tree / cargo metadata による生成。新規依存なし) が
+各 crate パッケージ同梱の LICENSE / COPYING / NOTICE ファイルから連結し、
+イメージの /licenses/LICENSE-CARGO-DEPENDENCIES として同梱する。
+パッケージにライセンスファイルを含まない crate は SPDX 宣言のみを記す
+(v8 crate の全文は第 1 節のとおり LICENSE-THIRD-PARTY に収録)。
+
+コンテナ以外の配布形態 (バイナリ単体配布等) の帰属表示は、配布開始前までに別途整備する
+(同スクリプトの流用を想定。別 Issue で扱う)。

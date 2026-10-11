@@ -25,8 +25,8 @@
 FROM rust:1-alpine@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627 AS builder
 
 # ビルド専用ツール（配布イメージには入らない）。curl は v8 の prebuilt 取得、
-# file / binutils は verify ステージの検査用。
-RUN apk add --no-cache musl-dev curl file binutils
+# file / binutils は verify ステージの検査用、bash / jq は Cargo 依存のライセンス文書生成用。
+RUN apk add --no-cache musl-dev curl file binutils bash jq
 
 # 64.2・64.3 では値を足すだけで済むよう引数化する。CARGO_FEATURES が空なら既定 feature。
 ARG RUST_TARGET=x86_64-unknown-linux-musl
@@ -59,7 +59,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp "target/${RUST_TARGET}/release/fandhe-browser" /out/fandhe-browser; \
     mkdir -p /out/data /out/licenses; \
     chown 65532:65532 /out/data; \
-    cp NOTICE LICENSE-THIRD-PARTY LICENSE-MIT LICENSE-APACHE /out/licenses/
+    cp NOTICE LICENSE-THIRD-PARTY LICENSE-MIT LICENSE-APACHE /out/licenses/; \
+    scripts/gen-cargo-licenses.sh /out/licenses/LICENSE-CARGO-DEPENDENCIES "${RUST_TARGET}" "${CARGO_FEATURES}"
 
 # 静的リンク検査（CTR-4・決定 5）。合否は NEEDED=0 と INTERP 無しで判定する。
 # static-pie では file が "static-pie linked" を示し動的セクションも持つため、
