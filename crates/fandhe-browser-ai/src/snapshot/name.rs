@@ -55,6 +55,11 @@
 //! [`MAX_TOTAL_CONTENT_STEPS`] を有効にし、入れ子要素による重複走査の総量を頭打ちにする
 //! （超過後の name from content は空の名前＋`truncated`。この場合のみ算出順に依存する）。`input[type=password]` の `value` は名前へ取り込まない。
 //!
+//! 残余 name（TASK-23.6・Issue #828）: row・cell の出力 name を子孫ノードに出ないテキストへ縮める
+//! [`compute_residual_content_name`] は、被覆済み要素の部分木を飛ばして同じ規則で再走査する。
+//! 専用予算 `dedup_steps_left` を使い、`content_steps_left`（後続 name の打ち切り位置が変わり
+//! ref がずれる）と `judge_steps_left`（圧縮判定が変わる）には影響させない。
+//!
 //! 呼び出し文脈: `snapshot::build::build_snapshot`（TASK-11.7・Issue #76）が、
 //! 文書ごとに [`NameIndex::build`] を 1 回呼んだうえで、ツリー構築時に要素ごとへ
 //! [`compute_name_with_index`] を呼ぶ。
@@ -89,7 +94,7 @@
 //! [`label_name`] を参照。
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use fandhe_browser_core::dom::{Children, Document, NodeData, NodeId};
 
@@ -519,12 +524,16 @@ pub(super) fn normalized_input_type(doc: &Document, id: NodeId) -> String {
 /// label・`aria-labelledby` の参照先・対象要素自身の子孫（name from content）の
 /// 3 経路が同じ走査関数を共有するための差分だけを持つ非公開の引数。
 #[derive(Debug, Clone, Copy)]
-struct ContentWalk {
+struct ContentWalk<'a> {
     /// 訪問するノード数の上限。超えたら走査を打ち切り [`ContentScan::cut`] を立てる。
     max_steps: usize,
     /// `true` なら `hidden`/`aria-hidden="true"` の子孫も取り込む
     /// （accname 2A: 直接参照された hidden な参照先の内側だけで使う）。
     include_hidden: bool,
+    /// 部分木ごと取り込まない要素の集合（`AISNAP-1`・TASK-23.6・Issue #828）。
+    /// 子孫ノードの name で既に出力済みのテキストを、row・cell の name から除くための
+    /// 残余算出（[`compute_residual_content_name`]）だけが `Some` を渡す。他の経路は `None`。
+    skip: Option<&'a HashSet<NodeId>>,
 }
 
 /// [`collect_content_text`] の走査結果（`AISNAP-1`・TASK-11.4.3）。
@@ -610,6 +619,7 @@ fn embedded_control_text(
             ContentWalk {
                 max_steps,
                 include_hidden: true,
+                skip: None,
             },
             &mut out,
         );
@@ -656,6 +666,7 @@ fn embedded_control_text(
                 ContentWalk {
                     max_steps: max_steps.saturating_sub(scan.steps_used),
                     include_hidden: false,
+                    skip: None,
                 },
                 &mut out,
             );
@@ -754,6 +765,16 @@ fn collect_content_text(
                     continue;
                 }
                 if !opts.include_hidden && is_hidden_element(doc, current) {
+                    continue;
+                }
+                // 被覆済み（部分木のテキストが子孫ノードの name で出力済み）の要素は
+                // 降りず、折り込まない（TASK-23.6）。
+                // 除去箇所は別々のテキスト片の境界なので、区切り空白を 1 個残して前後が連結される
+                // のを防ぐ（`1<a> x </a>2` が `12` にならず `1 2` になる）。
+                if opts.skip.is_some_and(|set| set.contains(&current)) {
+                    if !out.is_empty() {
+                        pending_space = true;
+                    }
                     continue;
                 }
                 // accname 2C: 再帰中の埋め込みコントロール（2E）では `aria-label` を無視して
@@ -894,6 +915,10 @@ pub struct NameIndex<'doc> {
     /// 圧縮可否の判定専用の残りステップ数（[`NameIndex::with_isolated_content_budget`]）。
     /// 判定が `content_steps_left` を消費して後続の name 算出を空にしないための別枠。
     judge_steps_left: Cell<usize>,
+    /// 残余 name の算出（[`compute_residual_content_name`]。TASK-23.6）専用の残りステップ数。
+    /// `content_steps_left` を使うと後続要素の name の打ち切り位置が変わって ref が変わり、
+    /// `judge_steps_left` を使うと圧縮判定が変わるため、独立した別枠にする。
+    dedup_steps_left: Cell<usize>,
     /// 文書順で最初の HTML 名前空間の `<title>` 要素（文書ルートの名前用。
     /// SVG の `<title>` は含めない）。構築時の単一走査で記録する。
     first_title: Option<NodeId>,
@@ -907,6 +932,7 @@ impl<'doc> NameIndex<'doc> {
     pub(super) fn with_content_budget(self, steps: usize) -> Self {
         self.content_steps_left.set(steps);
         self.judge_steps_left.set(steps);
+        self.dedup_steps_left.set(steps);
         self
     }
 
@@ -1100,6 +1126,7 @@ impl<'doc> NameIndex<'doc> {
             first_scans_left: Cell::new(MAX_CACHEABLE_REFERENT_SCANS),
             content_steps_left: Cell::new(usize::MAX),
             judge_steps_left: Cell::new(usize::MAX),
+            dedup_steps_left: Cell::new(usize::MAX),
             first_title,
         }
     }
@@ -1168,6 +1195,7 @@ fn label_name(doc: &Document, index: &NameIndex, target: NodeId) -> Option<Acces
             ContentWalk {
                 max_steps: doc.node_count(),
                 include_hidden: false,
+                skip: None,
             },
             &mut label_text,
         );
@@ -1270,6 +1298,7 @@ fn content_name(doc: &Document, index: &NameIndex, id: NodeId) -> Option<Accessi
         ContentWalk {
             max_steps: MAX_CONTENT_STEPS.min(budget),
             include_hidden: false,
+            skip: None,
         },
         &mut text,
     );
@@ -1286,6 +1315,46 @@ fn content_name(doc: &Document, index: &NameIndex, id: NodeId) -> Option<Accessi
     let mut result = buf.finish(NameSource::Content);
     result.truncated = truncated;
     Some(result)
+}
+
+/// row・cell の出力 name を、`covered`（部分木のテキストが子孫ノードの name で出力済みの
+/// 要素）を除いた残余テキストへ縮めた name を算出する（`AISNAP-1`・TASK-23.6・Issue #828）。
+///
+/// 呼び出し元: `snapshot::build` が row・cell・gridcell の pop 時に呼ぶ。ref シグネチャには
+/// 従来のフル name を使い続けるので、ここで縮めた name は出力にしか影響しない（`AISNAP-10`）。
+/// 走査は [`ContentWalk::skip`] で被覆済みの部分木を飛ばす以外は [`content_name`] と同じ規則。
+/// 専用予算（[`NameIndex`] の `dedup_steps_left`）で有界にする。
+///
+/// 走査が打ち切られた場合（上限到達・予算枯渇）は `None` を返す。呼び出し側はフル name を
+/// そのまま表示する（テキストを落とさない側に倒す）。
+pub(super) fn compute_residual_content_name(
+    doc: &Document,
+    index: &NameIndex,
+    id: NodeId,
+    covered: &HashSet<NodeId>,
+) -> Option<AccessibleName> {
+    let budget = index.dedup_steps_left.get();
+    let mut text = String::new();
+    let scan = collect_content_text(
+        doc,
+        id,
+        id,
+        ContentWalk {
+            max_steps: MAX_CONTENT_STEPS.min(budget),
+            include_hidden: false,
+            skip: Some(covered),
+        },
+        &mut text,
+    );
+    index
+        .dedup_steps_left
+        .set(budget.saturating_sub(scan.steps_used));
+    if scan.cut {
+        return None;
+    }
+    let mut buf = NameBuffer::new();
+    buf.push_str(&text);
+    Some(buf.finish(NameSource::Content))
 }
 
 /// `aria-label` 属性から accessible name を算出する（accname 1.2 step 2C。
@@ -1373,6 +1442,7 @@ fn referent_text(
             ContentWalk {
                 max_steps: doc.node_count(),
                 include_hidden: is_hidden_element(doc, referent),
+                skip: None,
             },
             &mut out,
         );
@@ -1673,6 +1743,7 @@ fn document_title_name(doc: &Document, index: &NameIndex) -> AccessibleName {
         ContentWalk {
             max_steps: doc.node_count(),
             include_hidden: true,
+            skip: None,
         },
         &mut text,
     );
@@ -3772,5 +3843,48 @@ mod tests {
                 compute_name(&doc, id)
             );
         }
+    }
+
+    /// AISNAP-1・TASK-23.6: 被覆集合の部分木を飛ばした残余が、兄弟テキストと区切りを残して
+    /// 算出される。集合が空ならフル name と一致し、予算が尽きると `None`（フル name へ戻す）。
+    #[test]
+    fn aisnap_1_residual_content_name_skips_covered_subtrees() {
+        use super::compute_residual_content_name;
+        use std::collections::HashSet;
+        let (doc, cell) = parse_and_select(
+            "<table><tr><td>20 points by <a href=\"/u\">bob</a> | hide</td></tr></table>",
+            "td",
+        );
+        let index = NameIndex::build(&doc);
+        let full = compute_name_with_index(&doc, &index, cell);
+        assert_eq!(full.text, "20 points by bob | hide");
+        let none = HashSet::new();
+        let same = compute_residual_content_name(&doc, &index, cell, &none).expect("残余");
+        assert_eq!(same.text, full.text);
+        // 別 Document の NodeId は流用できないため、同じ文書で a を引き直す。
+        let a = query_selector_str(&doc, doc.root(), "a")
+            .expect("セレクタは有効")
+            .expect("a がある");
+        let covered: HashSet<NodeId> = [a].into_iter().collect();
+        let r = compute_residual_content_name(&doc, &index, cell, &covered).expect("残余");
+        assert_eq!(r.text, "20 points by | hide");
+        assert_eq!(r.source, NameSource::Content);
+        // 被覆部分木の前後が空白なしで隣接していても連結しない。
+        let (doc2, cell2) = parse_and_select(
+            "<table><tr><td>1<a href=\"/x\"> x </a>2</td></tr></table>",
+            "td",
+        );
+        let index2 = NameIndex::build(&doc2);
+        let a2 = query_selector_str(&doc2, doc2.root(), "a")
+            .expect("セレクタは有効")
+            .expect("a がある");
+        let covered2: HashSet<NodeId> = [a2].into_iter().collect();
+        let r2 = compute_residual_content_name(&doc2, &index2, cell2, &covered2).expect("残余");
+        assert_eq!(r2.text, "1 2");
+        let exhausted = NameIndex::build(&doc).with_content_budget(0);
+        assert_eq!(
+            compute_residual_content_name(&doc, &exhausted, cell, &covered),
+            None
+        );
     }
 }

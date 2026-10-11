@@ -195,17 +195,17 @@ fn aisnap8_compressed_row_controls_resolve_to_refs() {
 
 #[test]
 fn aisnap8_truncated_pages_are_those_with_snapshot_cap() {
-    // 上限で打ち切られるページは 2 件。測定結果の解釈に必要な事実の固定。
+    // 上限で打ち切られるページは 0 件。測定結果の解釈に必要な事実の固定。
+    // TASK-23.6（Issue #828）以前は hn-list・large-table の row の name（フル name が 120 文字
+    // 上限で打ち切られていた）で立っていたが、row・cell の出力 name が子孫に出ない
+    // テキストだけへ縮んだため、表示 name の打ち切りが出力から消えた（AISNAP-1）。
     let truncated: Vec<String> = generate_all(&fixtures())
         .expect("generate")
         .into_iter()
         .filter(|p| p.truncated)
         .map(|p| p.page)
         .collect();
-    assert_eq!(
-        truncated,
-        vec!["hn-list".to_owned(), "large-table".to_owned()]
-    );
+    assert_eq!(truncated, Vec::<String>::new());
 }
 
 /// golden の値・選択肢が簡約表現から回答可能であること（PR #706 指摘・`AISNAP-8`・`AISNAP-3`）。

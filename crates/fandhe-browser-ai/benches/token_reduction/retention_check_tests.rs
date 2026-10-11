@@ -95,7 +95,8 @@ const EXPECTED: [Expected; 7] = [
         "ebd9595753298b235",
         None,
         "Compass pattern beta anchor lantern sigma ribbon",
-        true,
+        // TASK-23.6（Issue #828）: row・cell の name が残余へ縮み、フル name の打ち切りが消えた。
+        false,
     ),
     ("checkbox-first", 2, 1, "e91f35187869ba882", None, "", false),
 ];

@@ -128,6 +128,10 @@ pub struct Node {
     pub role: String,
     /// accessible name。算出は TASK-11.4（Issue #73）。ネイティブ分は
     /// [`name::compute_name`]（TASK-11.4.2・Issue #545）で実装済み。
+    ///
+    /// 子を持つ `row`・`cell`・`gridcell` の name は、子孫ノードの name として出ないテキスト
+    /// だけを持つ（重複の除去。`AISNAP-1`・TASK-23.6・Issue #828）。ref のシグネチャには
+    /// 従来のフル name を使うため、縮めても `ref` は変わらない（`AISNAP-10`）。
     pub name: String,
     /// role + name シグネチャによる再特定要求（`AISNAP-10`）。`None` は ref を振らない
     /// ノード（ルート、および操作・参照の対象でないノード。TASK-23.4・Issue #827）。

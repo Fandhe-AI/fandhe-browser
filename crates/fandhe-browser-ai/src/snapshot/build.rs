@@ -63,6 +63,20 @@
 //!   配下の ref の scope 元として再特定が照合に使うため ref を残す。
 //!   既知の制約（REPAIR-3）: `role` 属性つき要素は `is_interactive_element` が真のため、
 //!   非操作 role（例: `ul role=list`）でも ref を持つ。
+//! - row・cell・gridcell の name from content の重複除去と無名 listitem の折り畳み
+//!   （`AISNAP-1`・`AISNAP-10`・`AISNAP-12`・TASK-23.6・Issue #828）: 部分木のテキストが自身か
+//!   子孫の出力ノードの name で全部表示される要素（出所が `Content`・`AriaLabel`・`Alt` で
+//!   打ち切りなし。圧縮したコンテナと畳み行も含む）を被覆集合へ入れ、子を持つ row・cell の
+//!   出力 name を pop 時にその部分木を飛ばした残余テキストへ縮める（テキストは落とさない）。
+//!   ref のシグネチャは visit 時のフル name のままなので ref は不変。残余の走査は専用予算
+//!   （`NameIndex` の `dedup_steps_left`）で有界にし、打ち切られたらフル name を表示する。
+//!   `Snapshot::truncated` は残余を算出できた対象では表示 name の打ち切りで判定する。
+//!   出力 name が空で子を持つ `listitem` は、畳み行（`folded_rows`）を持たない `list` の直下に
+//!   限り出力せず子を繰り上げる（畳み行の `FoldedRow::index` が展開側の listitem を数えて
+//!   文書順を復元する前提のため。`AISNAP-12`）。
+//!   既知の制約（REPAIR-3）: `select` の選択中 option テキストは親の残余と option ノードの両方に
+//!   出ることがある。圧縮表の省略行（`truncated_rows`）は残余に含めない。区切り記号だけの残余
+//!   （`| |` 等）は除去しない。`heading`・`columnheader` と子リンクの重複は未対応。
 //! - 深さが [`MAX_TREE_DEPTH`] を超えるサブツリーは省略し `Snapshot::truncated` を立てる。
 //! - いずれかの name が打ち切られた場合（文字数上限・子孫走査の上限・構築全体で共有する
 //!   走査予算）も `Snapshot::truncated` を立てる。
@@ -82,7 +96,7 @@ use crate::retention::priority_candidates;
 use super::element_ref::{ElementRef, ElementSignature, RefAllocator, RefError};
 use super::name::{
     MAX_TOTAL_CONTENT_STEPS, NameIndex, NameSource, SKIPPED_SUBTREES, compute_name_with_index,
-    is_hidden_element, normalized_input_type,
+    compute_residual_content_name, is_hidden_element, normalized_input_type,
 };
 use super::role::compute_role;
 use super::state::{compute_state, is_html_element_named};
@@ -619,9 +633,62 @@ struct Frame<'a> {
     depth: usize,
     /// 折り畳み対象か。真なら pop 時にノード自身は出力せず、子だけを親へ繰り上げる。
     collapse: bool,
-    /// この Frame の DOM 要素（ルートは `None`）。テストの `RefHolder` 整合にだけ使う。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// pop 時に出力 name を残余（子孫ノードに出ないテキスト）へ縮める対象か
+    /// （[`NAME_DEDUP_ROLES`]・`AISNAP-1`・TASK-23.6）。
+    dedup: bool,
+    /// `dedup` 対象のフル name が打ち切られていたか。残余を算出できた場合は表示 name の
+    /// 打ち切りで `Snapshot::truncated` を判定するため、visit 時には集約せず退避する。
+    full_truncated: bool,
+    /// この Frame の DOM 要素（ルートは `None`）。残余 name の算出・無名 listitem の判定・
+    /// テストの `RefHolder` 整合に使う。
     dom: Option<NodeId>,
+}
+
+/// 出力 name を残余へ縮める role（`AISNAP-1`・TASK-23.6・Issue #828）。
+///
+/// row・cell・gridcell は name from content が子孫ノードの name と同じ文字列を二重に出す
+/// 主因だった。`listitem` は `allows_name_from_content` の対象外（name は `aria-label`/`title`
+/// 由来のみ）で重複が起きないため含めず、無名のものを [`is_foldable_listitem`] で畳むだけにする。
+const NAME_DEDUP_ROLES: [&str; 3] = ["row", "cell", "gridcell"];
+
+/// 子をちょうど 1 つ持つ無名 `listitem` を出力せず子を親へ繰り上げてよいか（`AISNAP-1`・`AISNAP-10`・
+/// `AISNAP-12`・TASK-23.6・Issue #828）。pop 時（子の有無が確定した時点）に判定する。
+///
+/// 親が `folded_rows` を持たない `list` に限る。畳み行の `FoldedRow::index` は展開側の
+/// listitem / row を数えて文書順を復元する前提のため、畳み行を持つ list では畳まない。
+/// 子が 2 つ以上（項目境界）または 0 の無名 listitem は残す。`ref` は visit 時に確定済みで子の scope 連鎖も変わらないので、
+/// 残るノードの ref は不変。
+fn is_foldable_listitem(doc: &Document, id: NodeId, node: &Node, parent: &Node) -> bool {
+    node.role == "listitem"
+        && node.name.is_empty()
+        && node.children.len() == 1
+        && node.state == State::default()
+        && node.data_leaf.is_none()
+        && node.table.is_none()
+        && node.r#ref.is_none()
+        && node.folded_rows.is_empty()
+        && !is_interactive_element(doc, id)
+        && parent.role == "list"
+        && parent.folded_rows.is_empty()
+}
+
+/// 要素の部分木のテキストが、自身または子孫の出力ノードの name で全部表示される要素か
+/// （`AISNAP-1`・TASK-23.6）。親の row・cell の残余算出が飛ばす集合 `covered` への挿入条件。
+///
+/// 親の content walk がその要素へ到達したときに取り込むテキストが、要素自身の name と
+/// 一致する出所（`Content`・`AriaLabel`・`Alt`）に限る。`Title`・`Label`・`Value` 等は
+/// 親の walk が別のテキストを取り込むため対象外（飛ばすとテキストが落ちる）。埋め込み
+/// コントロールは walk が値を優先するため対象外。name が打ち切られた要素も対象外。
+fn is_name_covering(doc: &Document, id: NodeId, name: &super::name::AccessibleName) -> bool {
+    !name.text.is_empty()
+        && !name.truncated
+        && matches!(
+            name.source,
+            NameSource::Content | NameSource::AriaLabel | NameSource::Alt
+        )
+        && !["input", "select", "textarea"]
+            .iter()
+            .any(|n| is_html_element_named(doc, id, n))
 }
 
 /// 折り畳み対象の role（`AISNAP-1`・TASK-23.3）。
@@ -734,6 +801,9 @@ fn build_snapshot_inner(
     let mut compress_budget = MAX_TOTAL_COMPRESS_SCAN_NODES;
     // 展開する表・一覧で `Node::folded_rows` へ畳んだ行。主ループは子ノード化しない。
     let mut folded: HashSet<NodeId> = HashSet::new();
+    // 部分木のテキストが自身か子孫の出力ノードの name で全部表示される要素（TASK-23.6）。
+    // 親の row・cell の出力 name から重複を除く残余算出が、この部分木を飛ばす。
+    let mut covered: HashSet<NodeId> = HashSet::new();
 
     let root_id = doc.root();
     let root_role = compute_role(doc, root_id)
@@ -748,6 +818,8 @@ fn build_snapshot_inner(
         elem_ref: None,
         depth: 0,
         collapse: false,
+        dedup: false,
+        full_truncated: false,
         dom: None,
     }];
     // 折り畳んだ要素（テストの RefHolder から除外するため）。
@@ -760,12 +832,33 @@ fn build_snapshot_inner(
             return Ok(Snapshot::new(Node::new("document", "")).with_truncated(truncated));
         };
         let Some(child) = top.children.next() else {
-            let Some(done) = stack.pop() else {
+            let Some(mut done) = stack.pop() else {
                 continue;
             };
+            if done.dedup {
+                // 出力 name を子孫ノードに出ないテキストだけへ縮める（TASK-23.6）。
+                // ref シグネチャは visit 時のフル name のまま。
+                let residual = match done.dom {
+                    Some(id) if !done.node.children.is_empty() => {
+                        compute_residual_content_name(doc, &index, id, &covered)
+                    }
+                    _ => None,
+                };
+                match residual {
+                    Some(r) => {
+                        truncated |= r.truncated;
+                        done.node.name = r.text;
+                    }
+                    None => truncated |= done.full_truncated,
+                }
+            }
             match stack.last_mut() {
                 Some(parent) => {
-                    if done.collapse {
+                    let foldable_listitem = !done.collapse
+                        && done.dom.is_some_and(|id| {
+                            is_foldable_listitem(doc, id, &done.node, &parent.node)
+                        });
+                    if done.collapse || foldable_listitem {
                         // 子を親の位置へ繰り上げる（文書順は保たれる。子なしなら剪定）。
                         #[cfg(test)]
                         if let Some(id) = done.dom {
@@ -800,8 +893,14 @@ fn build_snapshot_inner(
         };
         let role = role.as_str();
         let accessible = compute_name_with_index(doc, &index, child);
-        // 名前の打ち切り（文字数・走査量の上限）も Snapshot 全体へ通知する。
-        truncated |= accessible.truncated;
+        // 名前の打ち切り（文字数・走査量の上限）も Snapshot 全体へ通知する。ただし
+        // 出力 name を残余へ縮める対象（TASK-23.6）は pop 時に表示 name で判定する。
+        let dedup = NAME_DEDUP_ROLES.contains(&role) && accessible.source == NameSource::Content;
+        let full_truncated = accessible.truncated;
+        if !dedup {
+            truncated |= accessible.truncated;
+        }
+        let covering = is_name_covering(doc, child, &accessible);
         let name = accessible.text;
         let mut sig = ElementSignature::new(role, &name);
         if let Some(d) = discriminator(doc, child) {
@@ -862,7 +961,15 @@ fn build_snapshot_inner(
                 subtree_has_lossy(doc, &index, row, true, None)
             });
             let ids: Vec<NodeId> = fold_rows.iter().map(|&(_, id)| id).collect();
-            node.folded_rows = compress_row_list(doc, structure.kind, &ids)
+            let compressed_rows = compress_row_list(doc, structure.kind, &ids);
+            // 40 文字等で打ち切られた行は親 name 側に全文を残すため covered に含めない。
+            covered.extend(
+                ids.iter()
+                    .zip(compressed_rows.iter())
+                    .filter(|(_, r)| !r.truncated)
+                    .map(|(&id, _)| id),
+            );
+            node.folded_rows = compressed_rows
                 .into_iter()
                 .zip(fold_rows.iter())
                 .map(|(r, &(index, _))| FoldedRow::new(index, r.text, r.truncated))
@@ -889,7 +996,23 @@ fn build_snapshot_inner(
         }
         if let Some((structure, compressed, plans)) = compressible {
             let headers = assign_header_refs(doc, &index, &structure, elem_ref, &mut refs)?;
+            let table_complete = compressed.truncated_rows == 0
+                && compressed.rows.iter().all(|r| !r.truncated)
+                && !headers.iter().any(|h| h.name_truncated);
             truncated |= headers.iter().any(|h| h.name_truncated);
+            // 打ち切り・省略があるときは、全文を出せた行・ヘッダーだけを covered に入れる。
+            // 切り詰められた行・セルと省略行は親 name 側に残し、可視の行だけが残余 name の
+            // 上限を消費しないようにする（TASK-23.6）。
+            if !table_complete {
+                covered.extend(headers.iter().filter(|h| !h.name_truncated).map(|h| h.cell));
+                covered.extend(
+                    compressed
+                        .rows
+                        .iter()
+                        .filter(|r| !r.truncated)
+                        .map(|r| r.row),
+                );
+            }
             #[cfg(test)]
             if let Some(sink) = sink.as_deref_mut() {
                 for h in &headers {
@@ -938,18 +1061,28 @@ fn build_snapshot_inner(
                 rows,
                 compressed.truncated_rows,
             ));
+            // 圧縮したコンテナのテキストはヘッダ・行・controls に出る（TASK-23.6）。
+            // 打ち切り・省略があれば表全体は被覆せず、上で行・ヘッダー単位で被覆済み。
+            if table_complete {
+                covered.insert(child);
+            }
             if let Some(parent) = stack.last_mut() {
                 parent.node.push_child(node);
             }
             continue;
         }
         let collapse = is_collapsible(doc, child, &node);
+        if !collapse && covering {
+            covered.insert(child);
+        }
         stack.push(Frame {
             node,
             children: doc.children(child),
             elem_ref: Some(elem_ref),
             depth,
             collapse,
+            dedup,
+            full_truncated,
             dom: Some(child),
         });
     }
@@ -1165,7 +1298,8 @@ mod tests {
         let tc = Some(DataLeafKind::TableCell);
         assert!(kinds.contains(&("columnheader", "名前", tc)), "{kinds:?}");
         assert!(kinds.contains(&("cell", "80", tc)), "{kinds:?}");
-        assert!(kinds.contains(&("cell", "詳細", tc)), "{kinds:?}");
+        // TASK-23.6: 子の link が name を出すため、cell の出力 name は残余（空）になる。
+        assert!(kinds.contains(&("cell", "", tc)), "{kinds:?}");
         assert!(kinds.contains(&("link", "詳細", None)), "{kinds:?}");
         assert!(
             kinds.contains(&("generic", "", Some(DataLeafKind::PriceClass))),
@@ -1237,9 +1371,10 @@ mod tests {
         let ul = child(&s.tree, 0);
         assert_eq!((ul.role.as_str(), ul.table.is_none()), ("list", true));
         assert_eq!(ul.r#ref, None);
-        let li = child(ul, 1);
-        assert_eq!((li.role.as_str(), li.r#ref.as_deref()), ("listitem", None));
-        let a = child(li, 0);
+        // TASK-23.6: 子を持つ無名 listitem は畳まれ、`ul` の子は [list, link] になる。
+        let kinds: Vec<&str> = ul.children.iter().map(|n| n.role.as_str()).collect();
+        assert_eq!(kinds, vec!["list", "link"]);
+        let a = child(ul, 1);
         assert_eq!(a.role, "link");
         let with_refs: Vec<&str> = all_nodes(&s.tree)
             .into_iter()
@@ -1255,7 +1390,7 @@ mod tests {
             ("generic", "", None),
             ("generic", "", None),
             ("list", "", None),
-            ("listitem", li.name.as_str(), None),
+            ("listitem", "", None),
         ];
         for (role, name, disc) in chain {
             let mut sig = ElementSignature::new(role, name);
@@ -1771,7 +1906,11 @@ mod tests {
         let expanded_body: Vec<&Node> = nodes
             .iter()
             .copied()
-            .filter(|n| n.role == "row" && n.name != "n")
+            .filter(|n| {
+                n.role == "row"
+                    && !(!n.children.is_empty()
+                        && n.children.iter().all(|c| c.role == "columnheader"))
+            })
             .collect();
         let folded_idx: Vec<usize> = table.folded_rows.iter().map(|r| r.index).collect();
         let free: Vec<usize> = (0..40).filter(|i| !folded_idx.contains(i)).collect();
@@ -1948,5 +2087,160 @@ mod tests {
         let s = snap(&html);
         let nodes = all_nodes(&s.tree);
         assert!(nodes.iter().any(|n| n.table.is_some()));
+    }
+
+    /// 規則的構造にならない（`span[title]` が展開を維持させる）1 行の表の snapshot。
+    fn irregular_row_snapshot(cell_html: &str) -> Snapshot {
+        snap(&format!(
+            "<table><tr><td>{cell_html}</td><td>plain</td></tr><tr><td><span title=\"t\">k</span></td></tr></table>"
+        ))
+    }
+
+    /// AISNAP-1・TASK-23.6（Issue #828）: 子孫リンクの name は親 cell に重複せず、リンク以外の
+    /// テキストは cell の name に残り、子を持つ row の name は空になる。ref は変わらない。
+    #[test]
+    fn aisnap_1_cell_and_row_names_drop_text_shown_by_descendants() {
+        let s = irregular_row_snapshot("Total <a href=\"/a\">alpha</a> beta");
+        let nodes = all_nodes(&s.tree);
+        let cell = nodes
+            .iter()
+            .find(|n| n.role == "cell" && n.children.iter().any(|c| c.role == "link"))
+            .expect("link を子に持つ cell");
+        assert_eq!(cell.name, "Total beta");
+        let link = cell
+            .children
+            .iter()
+            .find(|c| c.role == "link")
+            .expect("link");
+        assert_eq!(link.name, "alpha");
+        let row = nodes
+            .iter()
+            .find(|n| n.role == "row" && n.children.iter().any(|c| std::ptr::eq(c, *cell)))
+            .expect("cell を子に持つ row");
+        assert_eq!(row.name, "");
+        // 子のない cell は従来どおりフル name。
+        assert!(nodes.iter().any(|n| n.role == "cell" && n.name == "plain"));
+        // フル name 由来の打ち切りは立たない。
+        assert!(!s.truncated);
+    }
+
+    /// AISNAP-1・TASK-23.6: `aria-label` 付き子孫・`img alt` は被覆され、`title` 由来の generic は
+    /// 親の walk がテキストを取り込むため被覆されない（テキストを落とさない）。
+    #[test]
+    fn aisnap_1_cell_residual_covers_aria_label_and_alt_but_not_title() {
+        let s = irregular_row_snapshot(
+            "Pic <img alt=\"logo\"> <span aria-label=\"al\">z</span> <span title=\"tt\">kept</span> end",
+        );
+        let cell = all_nodes(&s.tree)
+            .into_iter()
+            .find(|n| n.role == "cell" && n.children.iter().any(|c| c.name == "logo"))
+            .expect("img を子に持つ cell");
+        assert_eq!(cell.name, "Pic kept end");
+    }
+
+    /// AISNAP-1・AISNAP-10・TASK-23.6: 重複除去は出力 name だけを縮め、ref は変えない
+    /// （フル name のシグネチャのまま）。
+    #[test]
+    fn aisnap_10_dedup_keeps_ref_of_descendant_link() {
+        use crate::snapshot::element_ref::{ElementSignature, RefAllocator};
+        let s = snap(
+            "<table><tr><td>Total <a href=\"/a\">alpha</a></td></tr>\
+             <tr><td><span title=\"t\">k</span></td></tr></table>",
+        );
+        let link = all_nodes(&s.tree)
+            .into_iter()
+            .find(|n| n.role == "link")
+            .expect("link");
+        let mut alloc = RefAllocator::new();
+        let mut scope = None;
+        // html > body > table > rowgroup > row > cell > link（generic は name 空）。
+        for (role, name) in [
+            ("generic", ""),
+            ("generic", ""),
+            ("table", ""),
+            ("rowgroup", ""),
+            ("row", "Total alpha"),
+            ("cell", "Total alpha"),
+        ] {
+            let mut sig = ElementSignature::new(role, name);
+            if let Some(sc) = scope {
+                sig = sig.with_scope(sc);
+            }
+            scope = Some(alloc.allocate_signature(&sig).expect("発行は成功する"));
+        }
+        let sig = ElementSignature::new("link", "alpha")
+            .with_discriminator("/a")
+            .with_scope(scope.expect("scope"));
+        let expected = alloc.allocate_signature(&sig).expect("発行は成功する");
+        assert_eq!(link.r#ref, Some(expected.to_ref_string()));
+    }
+
+    /// AISNAP-1・TASK-23.6: 子を 2 つ以上持つ無名 listitem は項目境界として残す。
+    #[test]
+    fn aisnap_1_multi_child_nameless_listitem_is_kept() {
+        let s = snap(
+            "<body><ul><li><a href=\"/a\">A</a><a href=\"/b\">B</a></li><li><a href=\"/c\">C</a></li><li></li><li><span title=\"t\">k</span></li></ul></body>",
+        );
+        let nodes = all_nodes(&s.tree);
+        let li = nodes
+            .iter()
+            .find(|n| n.role == "listitem")
+            .expect("listitem は残る");
+        assert_eq!(li.children.len(), 2);
+    }
+
+    /// AISNAP-1・AISNAP-12・TASK-23.6: 子を持つ無名 listitem は畳まれて子が list 直下へ上がり、
+    /// 子のない無名 listitem は残る。
+    #[test]
+    fn aisnap_1_nameless_listitem_with_children_is_folded() {
+        let s = snap(
+            "<body><ul><li><a href=\"/a\">A</a></li><li></li><li><a href=\"/b\">B</a></li><li><span title=\"t\">k</span></li></ul></body>",
+        );
+        let ul = all_nodes(&s.tree)
+            .into_iter()
+            .find(|n| n.role == "list")
+            .expect("list");
+        let roles: Vec<&str> = ul.children.iter().map(|n| n.role.as_str()).collect();
+        assert_eq!(roles, vec!["link", "listitem", "link", "generic"]);
+    }
+
+    /// AISNAP-12・TASK-23.6: 畳み行（`folded_rows`）を持つ list では listitem を畳まず、
+    /// 畳み行と展開行を index で統合すると文書順に欠けず並ぶ。
+    #[test]
+    fn aisnap_12_list_with_folded_rows_keeps_listitems() {
+        let mut html = String::from("<ul>");
+        for i in 0..40 {
+            if i == 30 {
+                html.push_str("<li><input type=\"text\" aria-label=\"Next\"></li>");
+            } else {
+                html.push_str(&format!("<li>row{i}</li>"));
+            }
+        }
+        html.push_str("</ul>");
+        let s = snap(&html);
+        let nodes = all_nodes(&s.tree);
+        let list = nodes.iter().find(|n| n.role == "list").expect("list");
+        assert!(!list.folded_rows.is_empty(), "畳み行を持つ list");
+        let folded_idx: Vec<usize> = list.folded_rows.iter().map(|r| r.index).collect();
+        let expanded: Vec<&Node> = list
+            .children
+            .iter()
+            .filter(|n| n.role == "listitem")
+            .collect();
+        assert!(
+            list.children.iter().all(|n| n.role == "listitem"),
+            "listitem は畳まれず list 直下に並ぶ"
+        );
+        assert_eq!(expanded.len() + folded_idx.len(), 40);
+        let free: Vec<usize> = (0..40).filter(|i| !folded_idx.contains(i)).collect();
+        assert!(free.contains(&30));
+        assert_eq!(free.len(), expanded.len());
+        let pos30 = free.iter().position(|i| *i == 30).expect("index 30");
+        let kept = expanded.get(pos30).expect("展開行");
+        assert!(
+            all_nodes(kept)
+                .iter()
+                .any(|n| n.role == "textbox" && n.name == "Next")
+        );
     }
 }

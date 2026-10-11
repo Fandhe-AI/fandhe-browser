@@ -247,7 +247,7 @@ fn aisnap_2_irregular_table_snapshot_is_expanded() {
                 "",
                 vec![nn(
                     "row",
-                    "名前点数",
+                    "",
                     vec![
                         n("columnheader", "名前", "e895cf72c839b312e", vec![]).with_data_leaf(tc),
                         n("columnheader", "点数", "e4c3266d420a99a2c", vec![]).with_data_leaf(tc),
@@ -259,7 +259,7 @@ fn aisnap_2_irregular_table_snapshot_is_expanded() {
                 "",
                 vec![nn(
                     "row",
-                    "太郎80",
+                    "",
                     vec![
                         n("cell", "太郎", "e8c54b60bbb2904e5", vec![]).with_data_leaf(tc),
                         n("cell", "80", "eb3df38593dc1377c", vec![]).with_data_leaf(tc),
