@@ -49,6 +49,15 @@
 //! 同梱判定は設定読み込み時と `fandhe_browser_js::create_engine` の 2 箇所で
 //! 二重に行われる（後者は設定を経由しない呼び出しへの防御）。
 //!
+//! # `[js] execute_page_scripts` の解決規則（JS-1・JS-4・TASK-112）
+//!
+//! ページ内 `<script>` の実行（専用スレッドのアクター。`page_actor`）を有効にするか。
+//!
+//! 1. 省略・`false`: 無効（既定。`true` を既定にしない）
+//! 2. `true` かつエンジンあり: 有効
+//! 3. `true` かつエンジンなし（エンジンなしビルド）: [`ConfigError::PageScriptsRequireJsEngine`]
+//! 4. 真偽値以外（文字列・数値）: [`ConfigError::Syntax`]
+//!
 //! # serde/toml を公開 API に漏らさない方針
 //!
 //! `error.rs` が `reqwest`/`html5ever` の具象型を公開 API に漏らさない方針と
@@ -174,9 +183,14 @@ impl Config {
         let profile =
             ProfileConfig::from_raw(raw.profile.unwrap_or_default(), allow_absolute_root)?;
 
-        let requested = raw.js.and_then(|js| js.engine);
+        let raw_js = raw.js.unwrap_or_default();
+        let engine = resolve_engine(raw_js.engine.as_deref(), bundled_engines())?;
         let js = JsConfig {
-            engine: resolve_engine(requested.as_deref(), bundled_engines())?,
+            engine,
+            execute_page_scripts: resolve_execute_page_scripts(
+                raw_js.execute_page_scripts,
+                engine,
+            )?,
         };
 
         let rendering = resolve_rendering(raw.rendering, RENDERING_COMPILED)?;
@@ -374,6 +388,7 @@ fn resolve_rendering(raw: Option<RawRendering>, compiled: bool) -> Result<Render
 #[non_exhaustive]
 pub struct JsConfig {
     engine: Option<EngineKind>,
+    execute_page_scripts: bool,
 }
 
 impl JsConfig {
@@ -381,6 +396,13 @@ impl JsConfig {
     /// （エンジンなしビルド）ため JS が無効であることを表す。
     pub fn engine(&self) -> Option<EngineKind> {
         self.engine
+    }
+
+    /// ページ内 `<script>` を実行するか（`[js] execute_page_scripts`。既定 `false`。
+    /// TASK-112・Issue #784・`JS-1`・`JS-4`）。`true` はエンジンが同梱されている場合に限り
+    /// 受理される（読み込み時に検証済み）。
+    pub fn execute_page_scripts(&self) -> bool {
+        self.execute_page_scripts
     }
 }
 
@@ -391,6 +413,8 @@ impl Default for JsConfig {
     fn default() -> Self {
         JsConfig {
             engine: select_default_engine(bundled_engines()),
+            // 実行は明示的な opt-in（`true` を既定にしない。`JS-1`）。
+            execute_page_scripts: false,
         }
     }
 }
@@ -401,6 +425,18 @@ fn select_default_engine(bundled: &[EngineKind]) -> Option<EngineKind> {
     EngineKind::ALL
         .into_iter()
         .find(|kind| bundled.contains(kind))
+}
+
+/// `[js] execute_page_scripts` の設定値を確定する（モジュール doc「`[js] execute_page_scripts`
+/// の解決規則」）。省略・`false` は `false`。`true` はエンジンがあるときだけ受理し、
+/// エンジンなしビルドでは黙って無効のまま成功させず [`ConfigError::PageScriptsRequireJsEngine`]
+/// にする（`RenderingNotCompiled` と同じ fail-closed。`JS-1`）。
+fn resolve_execute_page_scripts(raw: Option<bool>, engine: Option<EngineKind>) -> Result<bool> {
+    match (raw.unwrap_or(false), engine) {
+        (false, _) => Ok(false),
+        (true, Some(_)) => Ok(true),
+        (true, None) => Err(Error::from(ConfigError::PageScriptsRequireJsEngine)),
+    }
 }
 
 /// `[js] engine` の設定値を同梱一覧と照合して選択を確定する
@@ -787,6 +823,7 @@ struct RawRendering {
 #[serde(deny_unknown_fields)]
 struct RawJs {
     engine: Option<String>,
+    execute_page_scripts: Option<bool>,
 }
 
 /// `[profile]` セクションの生 TOML 構造（非公開）。
@@ -856,6 +893,9 @@ pub enum ConfigError {
     /// されていない（無視して成功させない）。暫定挙動で、最終仕様は
     /// `rendering-layer.md` と合わせて決める（`RENDER-1`・TASK-91.3・Issue #216）。
     RenderingNotCompiled,
+    /// `[js] execute_page_scripts = true` だが、JS エンジンが 1 つも同梱されていない
+    /// （無視して成功させない。TASK-112・Issue #784・`JS-1`）。
+    PageScriptsRequireJsEngine,
 }
 
 impl ConfigError {
@@ -942,6 +982,12 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "rendering.enabled = true but the rendering layer is not compiled into \
                  this binary (no build currently links it); set rendering.enabled = false"
+            ),
+            ConfigError::PageScriptsRequireJsEngine => write!(
+                f,
+                "js.execute_page_scripts = true but no js engine is compiled into this binary; \
+                 rebuild with --features js-v8 or --features js-boa, or set \
+                 js.execute_page_scripts = false"
             ),
             ConfigError::UnknownJsEngine { value, compiled } => write!(
                 f,
@@ -1365,5 +1411,51 @@ mod tests {
         });
         let config = resolve_rendering(raw, true).expect("同梱なら受理");
         assert!(config.enabled());
+    }
+
+    /// TASK-112（`JS-1`・`JS-4`）: `execute_page_scripts` の省略・`false` は `false`。
+    #[test]
+    fn task_112_execute_page_scripts_defaults_to_false() {
+        for input in ["", "[js]\n", "[js]\nexecute_page_scripts = false\n"] {
+            let config = Config::from_toml_str(input).expect("読める");
+            assert!(!config.js().execute_page_scripts(), "{input:?}");
+        }
+        assert!(!JsConfig::default().execute_page_scripts());
+    }
+
+    /// TASK-112（`JS-1`）: `true` はエンジンがあるときだけ受理（両分岐をビルドに依らず検査）。
+    #[test]
+    fn task_112_resolve_execute_page_scripts_requires_engine() {
+        assert!(matches!(
+            resolve_execute_page_scripts(Some(true), Some(EngineKind::V8)),
+            Ok(true)
+        ));
+        assert!(matches!(
+            resolve_execute_page_scripts(None, None),
+            Ok(false)
+        ));
+        let err = resolve_execute_page_scripts(Some(true), None).expect_err("エンジンなしは拒否");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::PageScriptsRequireJsEngine)
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("execute_page_scripts"), "{msg}");
+        assert!(msg.contains("--features js-boa"), "{msg}");
+    }
+
+    /// TASK-112（`JS-1`）: 真偽値以外は構文エラーで、`true` に倒れない。
+    #[test]
+    fn task_112_execute_page_scripts_wrong_type_is_syntax_error() {
+        for bad in [
+            "[js]\nexecute_page_scripts = \"true\"\n",
+            "[js]\nexecute_page_scripts = 1\n",
+        ] {
+            let err = Config::from_toml_str(bad).expect_err("型不正");
+            assert!(
+                matches!(err, Error::Config(ConfigError::Syntax { .. })),
+                "{bad}"
+            );
+        }
     }
 }

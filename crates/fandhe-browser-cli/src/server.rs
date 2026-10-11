@@ -38,7 +38,7 @@ use std::sync::Arc;
 use fandhe_backend_core::server::{BoundServer, Server};
 use fandhe_backend_routes::{Router, RouterMergeError};
 use fandhe_browser_cdp::{CdpState, WsConfigError, endpoints};
-use fandhe_browser_core::AppState;
+use fandhe_browser_core::{AppState, PageScriptHandle};
 use fandhe_browser_profile::{ProfileError, ProfileStore};
 
 /// 既定の待ち受けアドレス。9333 は spec `api-cdp.md` のレスポンス例（`CDP-1`）に合わせた値。
@@ -158,12 +158,26 @@ impl std::error::Error for StartupError {
 
 /// ストアからプロファイルを開き、`AppState` を 1 つだけ生成する（`AISNAP-6`・`PROF-1`）。
 ///
-/// `run` から呼ばれる。描画実装は未注入（スタブ節参照）のため無効レンダラーを使う。
+/// ページスクリプト無効の既定構成（テスト用の薄いラッパー。本番は `run` が [`open_app_state_with`] を呼ぶ）。
+/// 描画実装は未注入（スタブ節参照）のため無効レンダラーを使う。
+#[cfg(test)]
 pub(crate) fn open_app_state(store: &dyn ProfileStore) -> Result<Arc<AppState>, StartupError> {
+    open_app_state_with(store, PageScriptHandle::disabled())
+}
+
+/// [`open_app_state`] に、ページスクリプト実行アクターのハンドルを渡す版（TASK-112・`JS-1`・`JS-4`）。
+///
+/// ハンドルは `main` が設定 `[js] execute_page_scripts` から構築する（無効なら無効ハンドル）。
+/// `AppState` → `CdpState::app_state()` 経由で cdp の `Page.navigate` 経路から到達できる
+/// （接続は TASK-113・#785）。ハンドルを渡してもスレッドは起動しない（遅延起動）。
+pub(crate) fn open_app_state_with(
+    store: &dyn ProfileStore,
+    page_scripts: PageScriptHandle,
+) -> Result<Arc<AppState>, StartupError> {
     let profile = store.open_or_create().map_err(StartupError::Profile)?;
-    Ok(Arc::new(AppState::with_disabled_renderer(Arc::new(
-        profile,
-    ))))
+    Ok(Arc::new(
+        AppState::with_disabled_renderer(Arc::new(profile)).with_page_scripts(page_scripts),
+    ))
 }
 
 /// loopback 以外（`0.0.0.0`・`::`・LAN アドレス）を bind 前に拒否する。
@@ -215,8 +229,9 @@ pub(crate) async fn run(
     store: &dyn ProfileStore,
     addr: SocketAddr,
     extra: Vec<RouterFactory>,
+    page_scripts: PageScriptHandle,
 ) -> Result<(), StartupError> {
-    let app = open_app_state(store)?;
+    let app = open_app_state_with(store, page_scripts)?;
     let (bound, cdp) = bind(&app, addr, extra).await?;
     let local = bound.local_addr().map_err(StartupError::Bind)?;
     eprintln!(
@@ -402,6 +417,26 @@ mod tests {
                 err,
                 StartupError::Profile(ProfileError::Locked { .. })
             ));
+        }
+
+        /// TASK-112（`JS-1`・`JS-4`）: `open_app_state_with` に渡したハンドルが、bind 後の
+        /// `CdpState::app_state()` から同じ状態で見える。既定の `open_app_state` は無効ハンドル。
+        #[tokio::test]
+        async fn js4_page_script_handle_reaches_cdp_state() {
+            let dir = TempDir::new();
+            let default = open_app_state(&FixedStore(dir.path.clone())).unwrap();
+            assert!(!default.page_scripts().is_enabled());
+            drop(default);
+
+            let handle = crate::page_scripts::test_enabled_handle();
+            let enabled = handle.is_enabled();
+            let app = open_app_state_with(&FixedStore(dir.path.clone()), handle).unwrap();
+            let (bound, cdp) = bind(&app, "127.0.0.1:0".parse().unwrap(), vec![])
+                .await
+                .unwrap();
+            drop(bound);
+            assert_eq!(cdp.app_state().page_scripts().is_enabled(), enabled);
+            assert_eq!(cdp.app_state().page_scripts().stats().worker_spawns(), 0);
         }
 
         #[tokio::test]

@@ -82,8 +82,9 @@
 //!
 //! - [`cssom`]（`CORE-5`・`TASK-105`・`MS-8`。型定義・宣言パーサー・詳細度計算・ルール分割・スタイル源収集・セレクタマッチング・カスケード解決のみ。`!important`・継承等は未実装）
 //! - [`page_script`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。収集のみ。SVG の script・`language`・module 実行等は未実装）
-//! - [`page_runner`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。`src` 取得・総バイト上限・DOMContentLoaded / load 発火・仮想時間のタイマーループ（#782）まで実装済み。アクター化は #784）
+//! - [`page_runner`]（`JS-4`・`JS-6`・`TASK-109`・`MS-6`。`src` 取得・総バイト上限・DOMContentLoaded / load 発火・仮想時間のタイマーループ（#782）まで実装済み。アクター化は `page_actor`＝#784 で実装済み）
 //! - [`dom_bridge`]（`JS-5`・`JS-6`・`TASK-108`・`MS-6`。`setInnerHTML` は `Document::set_inner_html` で置換する。DOM 操作以外の op は未実装）
+//! - [`page_actor`]（`JS-4`・`JS-6`・`JS-1`・`TASK-112`・`MS-6`・#784。ページスクリプトを専用スレッドで実行するアクター。遅延起動・世代による打ち切り・待ち行列の上限。`AppState` が保持する。`navigate_gated` への接続は #785）
 //! - [`page_net`]（`JS-8`・`JS-6`・`TASK-111`・`MS-6`・#783。ページ内 `fetch` / `XMLHttpRequest` の GET 最小版。取得は Fetcher 経由のみ。要求件数・累計バイトの上限。GET 以外・ヘッダ・CORS は未実装）
 //! - [`js_shim`]（`JS-5`・`TASK-108`・`MS-6`。window / location / navigator / console は #779）
 //! - [`js_stub`]（`JS-2`・`TASK-30`・`MS-3`）
@@ -106,6 +107,7 @@ pub mod host;
 pub mod js_shim;
 pub mod js_stub;
 pub mod observability;
+pub mod page_actor;
 pub mod page_net;
 pub mod page_runner;
 pub mod page_script;
@@ -152,6 +154,11 @@ pub use observability::{
     MAX_JSON_LINES_QUEUE_CAPACITY, OperationCounts, OperationKind, OperationOutcome,
     OperationRecord, OperationRecorder, RecorderHandle, StderrRecorder,
 };
+pub use page_actor::{
+    ActorFailureKind, DEFAULT_PAGE_SCRIPT_QUEUE_CAPACITY, PageRunFuture, PageRunRequest,
+    PageScriptActorOptions, PageScriptActorStats, PageScriptError, PageScriptExecutor,
+    PageScriptHandle, PageScriptOutcome, PageScriptSkipReason,
+};
 pub use page_net::{
     DEFAULT_MAX_PAGE_NET_REQUESTS, DEFAULT_MAX_PAGE_NET_RESPONSE_BYTES, NetRejectKind,
     NetRejection, NetReport, NetRequestKind, PageNetLimits,
@@ -175,4 +182,6 @@ pub use parse::{
 pub use query::{
     element_matches, query_selector, query_selector_all, query_selector_all_str, query_selector_str,
 };
-pub use state::{AppState, NavigationGeneration, NavigationResult, NavigationState, StateError};
+pub use state::{
+    AppState, NavigationGeneration, NavigationResult, NavigationScope, NavigationState, StateError,
+};

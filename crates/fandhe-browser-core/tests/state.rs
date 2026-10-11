@@ -27,13 +27,26 @@ fn cdp1_public_api_supersede_flow() {
     assert_eq!((r.url(), r.html()), ("https://new/", "<b>new</b>"));
 }
 
+/// TASK-112（`JS-4`）: 遷移系列の識別子はインスタンスごとに異なり、インスタンスの生存中は不変。
+#[test]
+fn js4_navigation_scope_is_unique_per_state_and_stable() {
+    let a = NavigationState::new();
+    let b = NavigationState::new();
+    assert_ne!(a.scope(), b.scope());
+    let before = a.scope();
+    a.begin_navigation().unwrap();
+    assert_eq!(a.scope(), before);
+}
+
 #[cfg(unix)]
 mod app_state {
     use fandhe_browser_core::render::{
         BoundingBox, ElementRef, ElementVisibility, RenderError, Renderer, Screenshot,
         ScreenshotOptions,
     };
-    use fandhe_browser_core::{AppState, NavigationResult};
+    use fandhe_browser_core::{
+        AppState, Config, NavigationResult, PageScriptExecutor, PageScriptHandle,
+    };
     use fandhe_browser_profile::Profile;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -130,5 +143,46 @@ mod app_state {
         let state = AppState::with_disabled_renderer(open(&dir));
         assert_eq!(state.profile().root(), dir.0.as_path());
         assert!(format!("{state:?}").contains("generation"));
+    }
+
+    /// TASK-112（`JS-1`）: 既定の `AppState` は無効なハンドルを持ち、スレッドを起動しない。
+    #[test]
+    fn js1_default_app_state_has_disabled_page_scripts() {
+        let dir = TempDir::new();
+        let state = AppState::with_disabled_renderer(open(&dir));
+        assert!(!state.page_scripts().is_enabled());
+        assert_eq!(state.page_scripts().stats().worker_spawns(), 0);
+        assert!(format!("{state:?}").contains("page_scripts_enabled: false"));
+    }
+
+    /// 実行器を呼ばない（呼ばれたら `Err` を返す）テスト用の実行器。
+    struct NeverExecutor;
+
+    impl PageScriptExecutor for NeverExecutor {
+        fn block_on<'a>(
+            &self,
+            _: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>,
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::other("never"))
+        }
+    }
+
+    /// TASK-112（`JS-1`・`JS-4`）: `with_page_scripts` で渡したハンドルが `AppState` から見える。
+    /// エンジンなしビルドでは `true` の設定自体がエラーになるため、その分岐も検査する。
+    #[test]
+    fn js4_with_page_scripts_exposes_the_given_handle() {
+        let dir = TempDir::new();
+        let result = Config::from_toml_str("[js]\nexecute_page_scripts = true\n");
+        if fandhe_browser_core::bundled_engines().is_empty() {
+            assert!(result.is_err());
+            return;
+        }
+        let config = result.expect("エンジンありなら受理");
+        let handle = PageScriptHandle::new(config.js(), Arc::new(NeverExecutor));
+        assert!(handle.is_enabled());
+        let state = AppState::with_disabled_renderer(open(&dir)).with_page_scripts(handle);
+        assert!(state.page_scripts().is_enabled());
+        assert_eq!(state.page_scripts().stats().worker_spawns(), 0);
+        assert!(format!("{state:?}").contains("page_scripts_enabled: true"));
     }
 }

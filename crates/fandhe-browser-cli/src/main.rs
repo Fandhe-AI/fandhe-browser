@@ -12,6 +12,7 @@
 //!
 //! Windows では profile crate の ACL 実装（`XOS-7`〜`XOS-10`）待ちのため起動不可（fail-closed）。
 //! `ProfileError::Unsupported` の場合は理由を示す固定の英語メッセージで非ゼロ終了する。
+mod page_scripts;
 mod server;
 mod startup_config;
 
@@ -45,8 +46,10 @@ fn main() -> ExitCode {
 /// [`StartupError::Runtime`] として返す（release は `panic = "abort"`）。
 fn run_main() -> Result<(), StartupError> {
     // 設定エラーはプロファイル open・bind より前に確定させる（サーバーを起動しない）。
-    // 選択エンジンの `JsRuntime` 配線は後続（startup_config のスタブ節参照）。
-    let _config = startup_config::load_startup_config()?;
+    // `[js] execute_page_scripts` からページスクリプト実行アクターのハンドルを作る（TASK-112・
+    // `JS-1`・`JS-4`）。ハンドルの構築だけではスレッドも JS 子プロセスも作らない（遅延起動）。
+    let config = startup_config::load_startup_config()?;
+    let page_scripts = page_scripts::handle_from_config(config.js());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -56,5 +59,6 @@ fn run_main() -> Result<(), StartupError> {
         &OsDefaultStore::new(),
         server::DEFAULT_ADDR,
         server::default_router_factories(),
+        page_scripts,
     ))
 }

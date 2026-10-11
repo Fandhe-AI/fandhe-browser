@@ -38,3 +38,27 @@ fn task_91_3_sample_enabled_true_is_rejected() {
         Error::Config(ConfigError::RenderingNotCompiled)
     ));
 }
+
+/// TASK-112（`JS-1`）: サンプルの `execute_page_scripts` は `false` で読め、`true` へ置換すると
+/// エンジンなしビルドでは設定エラー、エンジンありビルドでは受理される。
+#[test]
+fn task_112_sample_execute_page_scripts_toggle() {
+    let config = Config::load(&sample_path()).expect("サンプルは読み込める");
+    assert!(!config.js().execute_page_scripts());
+
+    let text = std::fs::read_to_string(sample_path()).expect("サンプルを読める");
+    let enabled = text.replace(
+        "execute_page_scripts = false",
+        "execute_page_scripts = true",
+    );
+    assert_ne!(text, enabled);
+    let result = Config::from_toml_str(&enabled);
+    if fandhe_browser_core::bundled_engines().is_empty() {
+        assert!(matches!(
+            result.expect_err("エンジンなしは拒否"),
+            Error::Config(ConfigError::PageScriptsRequireJsEngine)
+        ));
+    } else {
+        assert!(result.expect("受理").js().execute_page_scripts());
+    }
+}
