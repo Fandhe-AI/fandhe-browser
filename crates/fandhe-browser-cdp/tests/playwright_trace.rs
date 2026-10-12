@@ -42,12 +42,13 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 ///
 /// 注意: `Browser.getVersion` の応答に `CARGO_PKG_VERSION` が入るため、workspace の版を上げたら
 /// `make trace-playwright` でトレースを再取得すること。
-const EXPECTED_SEND_METHODS: [&str; 5] = [
+const EXPECTED_SEND_METHODS: [&str; 6] = [
     "Browser.getVersion",
     "Target.setAutoAttach",
     "Browser.setDownloadBehavior",
-    "Target.getTargetInfo",
-    "Target.createBrowserContext",
+    "Browser.getVersion",
+    "Target.setAutoAttach",
+    "Browser.setDownloadBehavior",
 ];
 
 /// トレース内で一時ディレクトリを表すプレースホルダ（収集ハーネスが正規化した値）。
@@ -216,8 +217,8 @@ fn cdp2_playwright_trace_is_well_formed() {
         .map(|r| r["message"]["method"].as_str().expect("method is a string"))
         .collect();
     assert_eq!(sends, EXPECTED_SEND_METHODS);
-    // 現状の到達点: connectOverCDP(http) は成功し、newContext が失敗する
-    // （Target.createBrowserContext が未実装）。newPage には到達しない。
+    // 現状の到達点: connectOverCDP は http・ws のどちらも `Target.setAutoAttach`
+    // （`waitForDebuggerOnStart:true` の拒否）で失敗する。newContext・newPage には到達しない。
     let stages: Vec<(&str, bool)> = recs
         .iter()
         .filter(|r| r["kind"] == "stage")
@@ -225,7 +226,10 @@ fn cdp2_playwright_trace_is_well_formed() {
         .collect();
     assert_eq!(
         stages,
-        [("connectOverCDP(http)", true), ("newContext", false)]
+        [
+            ("connectOverCDP(http)", false),
+            ("connectOverCDP(ws)", false)
+        ]
     );
 }
 
@@ -311,31 +315,17 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
     assert_eq!(
         replayed,
         [
-            version,
+            version.clone(),
             // 録画時の `waitForDebuggerOnStart:true` はターゲット一時停止が未実装のため拒否される（CDP-6・REPAIR-3）。
             json!({"id": 2, "error": {"code": -32602, "message": "unsupported params"}}),
             // 録画時の `allowAndName`・`eventsEnabled:true` は実行系が無いため拒否される（CDP-6・REPAIR-3）。
             json!({"id": 3, "error": {"code": -32602, "message": "unsupported params"}}),
-            json!({"id": 4, "result": {"targetInfo": {
-                "targetId": "trace-1", "type": "browser", "title": "", "url": "",
-                "attached": true, "canAccessOpener": false
-            }}}),
-            json!({"id": 5, "error": {"code": -32601, "message": "method not implemented"}}),
+            version,
+            json!({"id": 2, "error": {"code": -32602, "message": "unsupported params"}}),
+            json!({"id": 3, "error": {"code": -32602, "message": "unsupported params"}}),
         ]
     );
-    // 録画は拒否導入前の実測のため、id 2（setAutoAttach）・3（setDownloadBehavior）以外が録画と一致することを確認する。
-    // トレースは `make trace-playwright` で再取得するまで旧挙動のまま残る。
-    let without_dl = |v: &[Value]| -> Vec<Value> {
-        v.iter()
-            .filter(|m| m["id"] != 2 && m["id"] != 3)
-            .cloned()
-            .collect()
-    };
-    assert_eq!(
-        without_dl(&replayed),
-        without_dl(&recvs),
-        "replay must match the recorded responses"
-    );
+    assert_eq!(replayed, recvs, "replay must match the recorded responses");
 
     // 受信メソッドログ（CDP-6）がトレースの送信メソッドと一致する。
     let snap = st.received_methods();
@@ -347,11 +337,9 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
     assert_eq!(
         logged,
         [
-            ("Browser.getVersion", 1, 0),
-            ("Browser.setDownloadBehavior", 1, 0),
-            ("Target.createBrowserContext", 0, 1),
-            ("Target.getTargetInfo", 1, 0),
-            ("Target.setAutoAttach", 1, 0)
+            ("Browser.getVersion", 2, 0),
+            ("Browser.setDownloadBehavior", 2, 0),
+            ("Target.setAutoAttach", 2, 0)
         ],
         "snapshot: {snap:?}"
     );
