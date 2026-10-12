@@ -1896,12 +1896,25 @@ def capture_one(
             if stderr_path is not None:
                 stderr_path.unlink(missing_ok=True)
 
+        # 監査区間は全終了経路（timeout・起動失敗・guard 検出・通常終了）で一度だけ閉じる。
+        # 閉じ忘れると後続撮影の拒否先が区間に蓄積し続ける。
+        audit_report: dict[str, Any] | None = (
+            proxy_audit.delta_since(audit_base)
+            if proxy_audit is not None and audit_base is not None
+            else None
+        )
+
+        def _with_proxy(rec: dict[str, Any], guard_state: str) -> dict[str, Any]:
+            if audit_report is not None and needs_proxy:
+                rec["proxy"] = {**audit_report, "egress_guard": guard_state}
+            return rec
+
         if guard_violation is not None or guard_unavailable is not None:
             # 迂回を検出してツリーを終了した場合、または FD・ソケット表を読めず監視不能に
             # なった場合は、タイムアウトや PNG の有無にかかわらず failed にする
             # （直接接続した時点、または迂回の有無を確認できない時点で撮影条件が崩れている。
             # 監視不能を `enforced` と記録しない）。
-            report = proxy_audit.delta_since(audit_base) if proxy_audit is not None else None
+            report = dict(audit_report) if audit_report is not None else None
             record_v: dict[str, Any] = {
                 "site_id": site.site_id,
                 "engine": engine,
@@ -1927,8 +1940,9 @@ def capture_one(
                 record_v["proxy"] = report
             return record_v
 
+        guard_state = "enforced" if guard_enabled else "off"
         if timed_out:
-            return {
+            return _with_proxy({
                 "site_id": site.site_id,
                 "engine": engine,
                 "status": "timeout",
@@ -1940,10 +1954,10 @@ def capture_one(
                 "stderr_tail": stderr_tail,
                 "command": argv,
                 "input": input_kind,
-            }
+            }, guard_state)
 
         if engine_missing:
-            return {
+            return _with_proxy({
                 "site_id": site.site_id,
                 "engine": engine,
                 "status": "failed",
@@ -1955,7 +1969,7 @@ def capture_one(
                 "stderr_tail": stderr_tail,
                 "command": argv,
                 "input": input_kind,
-            }
+            }, guard_state)
 
         status = "failed"
         png_width: int | None = None
@@ -1977,9 +1991,8 @@ def capture_one(
                 stderr_tail = (stderr_tail + f"\n{exc}")[-STDERR_TAIL_CHARS:]
 
         proxy_report: dict[str, Any] | None = None
-        if proxy_audit is not None and audit_base is not None and needs_proxy:
-            proxy_report = proxy_audit.delta_since(audit_base)
-            proxy_report["egress_guard"] = "enforced" if guard_enabled else "off"
+        if audit_report is not None and needs_proxy:
+            proxy_report = {**audit_report, "egress_guard": guard_state}
             if (
                 status == "ok"
                 and needs_html

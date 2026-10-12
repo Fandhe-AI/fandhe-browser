@@ -2786,6 +2786,22 @@ class EgressGuardTest(unittest.TestCase):
         self.assertEqual(record["status"], "ok")
         self.assertEqual(record["proxy"]["egress_guard"], "off")
 
+    def test_missing_engine_binary_still_closes_audit_window(self) -> None:
+        record = self._capture(["/nonexistent/engine-binary", "{html_path}", "{proxy}", "{out}"])
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["proxy"]["egress_guard"], "enforced")
+        self.assertEqual(self.server.audit._windows, {})
+
+    def test_process_listing_over_cap_is_unavailable(self) -> None:
+        with mock.patch.object(eg, "MAX_PROCESSES", 1):
+            with self.assertRaises(eg.GuardUnavailable):
+                eg._descendant_pids(os.getpid())
+
+    def test_fd_listing_over_cap_is_unavailable(self) -> None:
+        with mock.patch.object(eg, "MAX_FDS_PER_PROCESS", 0):
+            with self.assertRaises(eg.GuardUnavailable):
+                eg._socket_inodes({os.getpid()})
+
     def test_guarded_engine_is_skipped_when_platform_is_unsupported(self) -> None:
         with mock.patch.object(eg, "egress_guard_supported", return_value=False):
             record = self._capture(probe_template("silent"))

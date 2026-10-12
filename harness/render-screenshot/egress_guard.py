@@ -19,6 +19,9 @@
       `EgressGuard.unavailable` に理由を残してツリーを終了する。呼び出し側は撮影を
       `failed` にし、`egress_guard` を `enforced` と記録しない。プロセス終了による
       正常な消失（ENOENT / ESRCH）は監視不能として扱わない
+    - プロセス一覧・FD 一覧・ソケット表が上限（MAX_*）を超える、または stat 等の読み取りに
+      失敗した場合は、切り捨てて正常扱いにせず `GuardUnavailable`（撮影は failed）とする
+    - `/proc/net/tcp6`・`udp6` が無い（IPv6 無効）環境では IPv4 表のみで監視する
     - 完全な保証ではなく、ネットワーク名前空間による隔離の代わりにはならない
 """
 
@@ -28,6 +31,7 @@ import ipaddress
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -60,9 +64,12 @@ def egress_guard_supported() -> bool:
     if not sys.platform.startswith("linux"):
         return False
     try:
+        # IPv4 の tcp / udp は必須。tcp6 / udp6 は IPv6 無効カーネルで存在しないため任意
+        # （不在なら IPv6 ソケットも存在し得ないので IPv4 のみの監視で足りる）。
         (_PROC / "net" / "tcp").read_text(encoding="ascii", errors="replace")
+        (_PROC / "net" / "udp").read_text(encoding="ascii", errors="replace")
         fd_dir = _PROC / "self" / "fd"
-        names = os.listdir(fd_dir)
+        names = _retry_transient(lambda: os.listdir(fd_dir))  # type: ignore[assignment]
         if names:
             os.readlink(fd_dir / names[0])
     except OSError:
@@ -117,18 +124,27 @@ def _descendant_pids(root_pid: int) -> set[int]:
     children: dict[int, list[int]] = {}
     try:
         names = os.listdir(_PROC)
-    except OSError:
-        return {root_pid}
-    for name in names[:MAX_PROCESSES]:
+    except OSError as exc:
+        raise GuardUnavailable(f"cannot list {_PROC}: {exc}") from exc
+    # 上限超過は子孫の取りこぼしになるため、切り捨てず監視不能として扱う。
+    if len(names) > MAX_PROCESSES:
+        raise GuardUnavailable(f"too many entries in {_PROC}: {len(names)} > {MAX_PROCESSES}")
+    for name in names:
         if not name.isdigit():
             continue
         try:
             stat = (_PROC / name / "stat").read_text(encoding="utf-8", errors="replace")
+            if not stat:
+                continue  # 終了処理中のプロセスは空を返すことがある（正常な消失）
             # comm は括弧内に空白・括弧を含みうるため、最後の ')' 以降を解析する。
             rest = stat[stat.rindex(")") + 2 :].split()
             ppid = int(rest[1])
-        except (OSError, ValueError, IndexError):
-            continue
+        except OSError as exc:
+            if _is_vanished(exc):
+                continue
+            raise GuardUnavailable(f"cannot read /proc/{name}/stat: {exc}") from exc
+        except (ValueError, IndexError) as exc:
+            raise GuardUnavailable(f"cannot parse /proc/{name}/stat: {exc}") from exc
         children.setdefault(ppid, []).append(int(name))
     seen = {root_pid}
     stack = [root_pid]
@@ -140,19 +156,34 @@ def _descendant_pids(root_pid: int) -> set[int]:
     return seen
 
 
+def _retry_transient(fn: Callable[[], object]) -> object:
+    """fork 直後・exec 中のプロセスは /proc/<pid>/fd が一瞬 EACCES になるため短く再試行する。
+
+    恒久的な権限不足は再試行後も EACCES のままなので、呼び出し側が監視不能として扱う。
+    """
+    for _ in range(20):
+        try:
+            return fn()
+        except PermissionError:
+            time.sleep(0.005)
+    return fn()
+
+
 def _socket_inodes(pids: set[int]) -> set[int]:
     inodes: set[int] = set()
     for pid in pids:
         fd_dir = _PROC / str(pid) / "fd"
         try:
-            names = os.listdir(fd_dir)[:MAX_FDS_PER_PROCESS]
+            names = _retry_transient(lambda: os.listdir(fd_dir))  # type: ignore[assignment]
         except OSError as exc:
             if _is_vanished(exc):
                 continue
             raise GuardUnavailable(f"cannot list {fd_dir}: {exc}") from exc
+        if len(names) > MAX_FDS_PER_PROCESS:
+            raise GuardUnavailable(f"too many fds in {fd_dir}: {len(names)} > {MAX_FDS_PER_PROCESS}")
         for name in names:
             try:
-                target = os.readlink(fd_dir / name)
+                target = _retry_transient(lambda: os.readlink(fd_dir / name))  # type: ignore[assignment]
             except OSError as exc:
                 if _is_vanished(exc):
                     continue
@@ -181,10 +212,14 @@ def find_unproxied_connections(root_pid: int, proxy_port: int) -> list[str]:
             with open(_PROC / "net" / table, encoding="ascii", errors="replace") as fh:
                 for index, line in enumerate(fh):
                     if index >= MAX_NET_LINES:
-                        break
+                        raise GuardUnavailable(f"/proc/net/{table} exceeds {MAX_NET_LINES} lines")
                     parsed = parse_net_line(line)
                     if parsed is not None and parsed[3] in inodes:
                         rows.append((*parsed, is_udp))
+        except FileNotFoundError:
+            if table in ("tcp6", "udp6"):
+                continue  # IPv6 無効カーネル。IPv4 表のみで監視する
+            raise GuardUnavailable(f"missing /proc/net/{table}") from None
         except OSError as exc:
             raise GuardUnavailable(f"cannot read /proc/net/{table}: {exc}") from exc
     own_listen_ports = {local for _, _, state, _, local, udp in rows if not udp and state == _TCP_LISTEN}
