@@ -211,7 +211,10 @@ import net from "node:net";
 const srv = net.createServer(() => {}).listen(0, "127.0.0.1", () => console.log(srv.address().port));
 HANG_EOF
   node "$TMP/hang.mjs" >"$TMP/hang.port" & hang_pid=$!
-  for _ in $(seq 1 50); do [ -s "$TMP/hang.port" ] && break; sleep 0.1; done
+  # 待ち上限は 30 秒（遅い CI ランナーで node の起動が 5 秒を超えた実例があるため。#938）。空のポートのまま進むと
+  # navigate.mjs が URL 不正で exit 1 になり、タイムアウト検証が偽の成功になるため、取得できなければ失敗にする
+  for _ in $(seq 1 300); do [ -s "$TMP/hang.port" ] && break; sleep 0.1; done
+  [ -s "$TMP/hang.port" ] || fail "hang server did not report its port within 30s"
   st=0
   NAVIGATE_CONNECT_TIMEOUT_MS=500 timeout 20 node "$SCRIPT_DIR/navigate.mjs" \
     "http://127.0.0.1:$(cat "$TMP/hang.port")" https://example.com/ >/dev/null 2>&1 || st=$?
@@ -255,7 +258,9 @@ LISTEN_EOF
   else
     # (a) 既に使用中 -> 起動前に終了コード 2
     node "$TMP/listener.mjs" 9401 & lp=$!
-    for _ in $(seq 1 50); do port_busy 9401 && break; sleep 0.1; done
+    # 待ち上限は 30 秒（#938 と同じ理由）。listener が立たないまま測定すると原因の分かりにくい失敗になるため先に検出する
+    for _ in $(seq 1 300); do port_busy 9401 && break; sleep 0.1; done
+    port_busy 9401 || fail "listener did not bind 127.0.0.1:9401 within 30s"
     st=0
     "$MEASURE" -n 1 --fandhe-bin /bin/true --skip-fandhe --chromium-bin "$TMP/fake-chromium" \
       --conditions idle --settle 0 >/dev/null 2>&1 || st=$?

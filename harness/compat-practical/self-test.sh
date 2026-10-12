@@ -375,15 +375,28 @@ FAKE_PIDS=()
 trap 'for p in ${FAKE_PIDS[@]+"${FAKE_PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done; rm -rf "$WORK"' EXIT
 
 # start_fake [<fake の追加引数>...]: 偽サーバーを起動して FAKE_PORT へポートを設定する（親シェルで実行すること）
+# ポートの待ち上限は 30 秒（0.1 秒 × 300 回）。成功時はポートが書かれた時点で抜けるため通常の所要時間は変わらない。
+# 上限の根拠: Windows ランナーで node の起動に 5 秒を超えた実例がある（#938。旧上限 5 秒で 31 件が連鎖失敗した）。
+# 取得できない場合（上限超過・偽サーバーの早期終了・数字でない出力）は FAIL を 1 件数えて FAKE_PORT を空にする。
+# 後続ケースはそのまま走るため、原因の行が連鎖失敗より先に出る。
 start_fake() {
-  local portfile="$WORK/fake.port.$RANDOM"
+  local portfile="$WORK/fake.port.$RANDOM" pid
   "$NODE_BIN" "$FAKE" "$@" >"$portfile" &
-  FAKE_PIDS+=("$!")
-  for _ in $(seq 1 50); do
+  pid=$!
+  FAKE_PIDS+=("$pid")
+  for _ in $(seq 1 300); do
     [ -s "$portfile" ] && break
+    kill -0 "$pid" 2>/dev/null || break
     sleep 0.1
   done
   FAKE_PORT="$(tr -d '\r\n' <"$portfile")"
+  case "$FAKE_PORT" in
+    '' | *[!0-9]*)
+      echo "FAIL [start_fake]: fake CDP server did not report a numeric port (waited up to 30s; got '$FAKE_PORT', args: $*)" >&2
+      FAILURES=$((FAILURES + 1))
+      FAKE_PORT=""
+      ;;
+  esac
 }
 rc_task() { printf '{"id":"%s","cat":"%s","url":"%s","selector":"%s","kind":"%s"}' "$1" "$2" "$3" "$4" "$5"; }
 
