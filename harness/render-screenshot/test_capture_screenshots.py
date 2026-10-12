@@ -2658,6 +2658,14 @@ class ProxyAuditCaptureTest(unittest.TestCase):
         page.write_text('<base href="file:///tmp/"><img src="a.png"><link rel="canonical" href="https://x.test/">', encoding="utf-8")
         self.assertFalse(cs.snapshot_references_network_subresources(page))
 
+    def test_subresource_detection_fails_closed_when_ref_cap_is_exceeded(self) -> None:
+        page = self.root / "cap.html"
+        data_imgs = '<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">' * cs.SNAPSHOT_MAX_SUBRESOURCE_REFS
+        page.write_text(data_imgs + '<img src="https://example.test/late.png">', encoding="utf-8")
+        self.assertTrue(cs.snapshot_references_network_subresources(page))
+        page.write_text(data_imgs, encoding="utf-8")
+        self.assertFalse(cs.snapshot_references_network_subresources(page))
+
     def test_servo_template_with_proxy_flag_expands_in_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             sites = Path(tmp) / "sites.json"
@@ -2786,6 +2794,7 @@ class EgressGuardTest(unittest.TestCase):
         self.assertEqual(record["status"], "ok")
         self.assertEqual(record["proxy"]["egress_guard"], "off")
 
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
     def test_missing_engine_binary_still_closes_audit_window(self) -> None:
         record = self._capture(["/nonexistent/engine-binary", "{html_path}", "{proxy}", "{out}"])
         self.assertEqual(record["status"], "failed")
@@ -2797,6 +2806,7 @@ class EgressGuardTest(unittest.TestCase):
             with self.assertRaises(eg.GuardUnavailable):
                 eg._descendant_pids(os.getpid())
 
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
     def test_fd_listing_over_cap_is_unavailable(self) -> None:
         with mock.patch.object(eg, "MAX_FDS_PER_PROCESS", 0):
             with self.assertRaises(eg.GuardUnavailable):

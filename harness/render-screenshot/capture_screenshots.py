@@ -1524,7 +1524,8 @@ class _SubresourceCollector(html.parser.HTMLParser):
     `capture_one` の fail-closed 判定（プロキシ未使用の検出）専用。対象は
     `script[src]`・`img[src]`・`source[src]`・`iframe[src]` と、`rel` が
     stylesheet / icon / preload 系の `link[href]`。`<a href>` 等の遷移リンクは
-    取得されないため対象外。参照は `SNAPSHOT_MAX_SUBRESOURCE_REFS` 件で打ち切る。
+    取得されないため対象外。参照は `SNAPSHOT_MAX_SUBRESOURCE_REFS` 件で打ち切り、
+    超過分は `overflow` を立てる（判定不能として呼び出し側が fail-closed に倒す）。
     """
 
     _LINK_RELS = frozenset({"stylesheet", "icon", "preload", "modulepreload"})
@@ -1533,6 +1534,7 @@ class _SubresourceCollector(html.parser.HTMLParser):
         super().__init__(convert_charrefs=True)
         self.base_href: str | None = None
         self.refs: list[str] = []
+        self.overflow = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr = {k.lower(): v for k, v in attrs if v is not None}
@@ -1544,15 +1546,18 @@ class _SubresourceCollector(html.parser.HTMLParser):
             ref = attr.get("src")
         elif tag == "link" and self._LINK_RELS & set(attr.get("rel", "").lower().split()):
             ref = attr.get("href")
-        if ref and len(self.refs) < SNAPSHOT_MAX_SUBRESOURCE_REFS:
-            self.refs.append(ref)
+        if ref:
+            if len(self.refs) < SNAPSHOT_MAX_SUBRESOURCE_REFS:
+                self.refs.append(ref)
+            else:
+                self.overflow = True
 
 
 def snapshot_references_network_subresources(snapshot_path: Path) -> bool:
     """スナップショットが http(s) で解決される外部サブリソースを 1 件でも参照するかを返す。
 
     相対 URL は注入済みの `<base href>` で解決する。読めない・パースできない場合は
-    False（判定を適用しない側）に倒す。誤失敗より、実際に迂回した場合の検出漏れを
+    False（判定を適用しない側）に倒す。参照数が上限超過のときは判定不能として True に倒す。誤失敗より、実際に迂回した場合の検出漏れを
     README に限界として明記する方針（REPAIR-3）。
     """
     try:
@@ -1562,6 +1567,11 @@ def snapshot_references_network_subresources(snapshot_path: Path) -> bool:
         collector.close()
     except (OSError, ValueError):
         return False
+    if collector.overflow:
+        # 参照数が上限を超えると以降の参照を評価できない。data: 参照で上限を
+        # 埋めて後続の https: 参照を隠せるため、判定不能として「参照あり」
+        # （fail-closed）に倒す。
+        return True
     base = collector.base_href or ""
     for ref in collector.refs:
         try:
