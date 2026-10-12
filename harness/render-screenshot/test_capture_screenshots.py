@@ -2812,6 +2812,25 @@ class EgressGuardTest(unittest.TestCase):
             with self.assertRaises(eg.GuardUnavailable):
                 eg._socket_inodes({os.getpid()})
 
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
+    def test_different_network_namespace_is_unavailable(self) -> None:
+        """監視対象が別ネットワーク名前空間なら /proc/net に現れないため GuardUnavailable（RENDER-5）。"""
+        real = os.readlink
+
+        def fake_readlink(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if str(path) == f"/proc/{os.getpid()}/ns/net":
+                return "net:[4026539999]"
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(eg.os, "readlink", side_effect=fake_readlink):
+            with self.assertRaises(eg.GuardUnavailable) as ctx:
+                eg.find_unproxied_connections(os.getpid(), 1)
+        self.assertIn("different network namespace", str(ctx.exception))
+
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
+    def test_same_network_namespace_is_accepted(self) -> None:
+        eg._check_same_netns({os.getpid()})
+
     def test_guarded_engine_is_skipped_when_platform_is_unsupported(self) -> None:
         with mock.patch.object(eg, "egress_guard_supported", return_value=False):
             record = self._capture(probe_template("silent"))

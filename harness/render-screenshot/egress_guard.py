@@ -22,6 +22,10 @@
     - プロセス一覧・FD 一覧・ソケット表が上限（MAX_*）を超える、または stat 等の読み取りに
       失敗した場合は、切り捨てて正常扱いにせず `GuardUnavailable`（撮影は failed）とする
     - `/proc/net/tcp6`・`udp6` が無い（IPv6 無効）環境では IPv4 表のみで監視する
+    - ソケット表は監視プロセス自身のネットワーク名前空間の `/proc/net/*` を読むため、
+      監視対象ツリーのプロセスが別のネットワーク名前空間（`/proc/<pid>/ns/net` の readlink 値が
+      監視プロセスと異なる）にいる場合は inode が表に現れず迂回を検出できない。この場合は
+      `GuardUnavailable` を送出し、`enforced` と記録しない（fail-closed）
     - 完全な保証ではなく、ネットワーク名前空間による隔離の代わりにはならない
 """
 
@@ -68,6 +72,7 @@ def egress_guard_supported() -> bool:
         # （不在なら IPv6 ソケットも存在し得ないので IPv4 のみの監視で足りる）。
         (_PROC / "net" / "tcp").read_text(encoding="ascii", errors="replace")
         (_PROC / "net" / "udp").read_text(encoding="ascii", errors="replace")
+        os.readlink(_PROC / "self" / "ns" / "net")
         fd_dir = _PROC / "self" / "fd"
         names = _retry_transient(lambda: os.listdir(fd_dir))  # type: ignore[assignment]
         if names:
@@ -179,6 +184,32 @@ def _retry_transient(fn: Callable[[], object]) -> object:
     return fn()
 
 
+def _check_same_netns(pids: set[int], should_abort: Callable[[], bool] | None = None) -> None:
+    """監視対象の全プロセスが監視プロセスと同じネットワーク名前空間にいることを確認する。
+
+    `/proc/net/*` は監視プロセス自身の名前空間の表のため、異なる名前空間のソケットは
+    表に現れず迂回を取りこぼす。異なる場合・判定できない場合は `GuardUnavailable`。
+    """
+    try:
+        own = os.readlink(_PROC / "self" / "ns" / "net")
+    except OSError as exc:
+        raise GuardUnavailable(f"cannot read {_PROC}/self/ns/net: {exc}") from exc
+    for pid in pids:
+        _check_abort(should_abort)
+        ns_path = _PROC / str(pid) / "ns" / "net"
+        try:
+            target = _retry_transient(lambda: os.readlink(ns_path))
+        except OSError as exc:
+            if _is_vanished(exc):
+                continue
+            raise GuardUnavailable(f"cannot read {ns_path}: {exc}") from exc
+        if target != own:
+            raise GuardUnavailable(
+                f"pid {pid} is in a different network namespace ({target} != {own}); "
+                "/proc/net of the monitor does not list its sockets"
+            )
+
+
 def _socket_inodes(pids: set[int], should_abort: Callable[[], bool] | None = None) -> set[int]:
     inodes: set[int] = set()
     for pid in pids:
@@ -220,7 +251,9 @@ def find_unproxied_connections(
     FD・ソケット表を読めない場合は `GuardUnavailable` を送出する（接続なしとは扱わない）。
     `should_abort` が真を返した時点で `_ScanAborted` を送出して走査を中断する（`EgressGuard.stop` 用）。
     """
-    inodes = _socket_inodes(_descendant_pids(root_pid, should_abort), should_abort)
+    pids = _descendant_pids(root_pid, should_abort)
+    _check_same_netns(pids, should_abort)
+    inodes = _socket_inodes(pids, should_abort)
     if not inodes:
         return []
     rows: list[tuple[str, int, int, int, int, bool]] = []

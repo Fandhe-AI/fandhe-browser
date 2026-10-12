@@ -201,6 +201,11 @@ python3 harness/render-screenshot/capture_screenshots.py \
 - `proxy.egress_guard` が `enforced` であること。`violation` は直接接続の検出で、その撮影は
   `failed`（`stderr_tail` に `unproxied connection detected`）。この場合は pref が効いていない
   可能性があるので結果を 7 章に記録し、PNG を比較に使わない
+- エンジンだけを別ネットワーク名前空間へ隔離した場合、`egress_guard` は監視プロセスの
+  `/proc/net` に対象のソケットが現れないため `GuardUnavailable`（`proxy.egress_guard` が
+  `unavailable`、撮影は `failed`）になる。`enforced` とは記録されない。隔離下で撮影を再開する
+  際は、ガードを `enforced` に頼らず名前空間側の遮断を正とし、ガードの対応（対象 pid の
+  `/proc/<pid>/net` 参照）を別途実装してから再開する
 - `stderr_tail` に `no connections through the filtering proxy` があれば、エンジンがプロキシを
   使っていない。同様に失敗として記録する
 
