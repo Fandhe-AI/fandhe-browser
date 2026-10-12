@@ -1354,7 +1354,7 @@ mod tests {
     }
 
     /// PROF-1: `..` を含む明示パスでも、最終ルートの外に途中要素が作成される前に畳み込まれる。
-    /// `Profile::open` は unix のみ対応（Windows は XOS-7..10 で未実装）のため unix に限る。
+    /// unix 側の `Profile::open` の挙動を検証するため unix に限る（Windows は `%LOCALAPPDATA%` 配下のみ許可で、`local_root.rs` のテストが担う）。
     #[test]
     #[cfg(unix)]
     fn prof_1_explicit_dotdot_creates_nothing_outside_final_root() {

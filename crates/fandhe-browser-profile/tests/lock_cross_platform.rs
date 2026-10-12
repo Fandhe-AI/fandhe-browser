@@ -11,8 +11,9 @@
 //! `Profile::open` は Windows では `%LOCALAPPDATA%` 配下のルートに限り成功する
 //! （Issue #928。`XOS-7`・`XOS-10`）が、本ファイルの Windows 側は別プロセスからの
 //! `Profile::open` 経由のロック競合を確認しない（`Profile::open` 経由の 3 OS 化は
-//! 本 Issue の範囲外。子プロセスが `LOCALAPPDATA` 配下のルートを用意する前提が要る）。また `lock::try_acquire`/`LOCK_FILE_NAME` は `pub(crate)`
-//! であり、crate 境界の変更は本 Issue の範囲外（結合テストから直接呼べない）。
+//! 本 Issue の範囲外。子プロセスが `LOCALAPPDATA` 配下のルートを用意する前提が要る）。
+//! また `lock::try_acquire`/`LOCK_FILE_NAME` は `pub(crate)` であり、crate 境界の変更は
+//! 本 Issue の範囲外（結合テストから直接呼べない）。
 //! そのため、3 OS 共通の確認は std の `File::try_lock`（`lock.rs` が実際に
 //! 使っているのと同じ API）を直接使う形で行い、`Profile::open` を経由した
 //! 確認は Unix 限定のケースに分離する。

@@ -21,16 +21,18 @@ Linux ext4・macOS APFS・Windows NTFS の実機で確認する（`XOS-10`・`ME
 
 ### Windows NTFS が実行不能である根拠
 
-- `crates/fandhe-browser-profile/src/profile.rs` の `Profile::open_impl` は、`#[cfg(not(unix))]` で
-  ディレクトリを作成せず `ProfileError::Unsupported`（理由: ACL-based directory isolation is not
-  implemented on this platform yet, tracked by XOS-7..XOS-10）を返す。ACL 隔離（`XOS-7`）が未実装のため、
-  継承された無制限の権限でプロファイルを作らない（fail-closed）設計である
-- `crates/fandhe-browser-profile/src/store.rs` のモジュール doc（「Windows の ACL 隔離が未実装のため、現状
-  Windows の `Profile::open` は `Unsupported` を返し」）と `open_or_create` の注記（「現状は `Profile::open` が
-  ACL 未実装（`XOS-7`）で先に `Unsupported` を返す」）も同じ事実を述べている
-- `crates/fandhe-browser-profile/tests/isolation.rs` の冒頭 doc も、3 OS での分離テスト実行（`XOS-10`）は
-  Windows ACL 実装後の課題と明記している。Windows 側は `src/profile.rs` の
-  `prof_1_open_is_unsupported_on_windows` が `Unsupported` を返すことを確認するのみ
+- Windows の `Profile::open` は、ルートが `%LOCALAPPDATA%` 配下のときだけ成功する（Issue #928。
+  アクセス制限は既定の継承 ACL に依存し、ACL の設定・検証はしない）。配下外は
+  `ProfileError::Unsupported` でディレクトリを作らない（fail-closed）。ACL を明示設定して任意のパスを
+  許可する第 2 段階（`XOS-7`）は未実装である（`crates/fandhe-browser-profile/src/local_root.rs`・
+  `src/profile.rs` の `Profile::open_impl`）
+- `crates/fandhe-browser-profile/src/store.rs` のモジュール doc も同じ事実（配下では成功・配下外は
+  `Unsupported`）を述べている
+- `crates/fandhe-browser-profile/tests/isolation.rs` と `tests/concurrent_isolation.rs` は `#![cfg(unix)]` の
+  ままで、分離テストの Windows 対応は別 Issue である。Windows 側は `src/profile.rs` の `#[cfg(windows)]`
+  テスト（`prof1_windows_open_succeeds_under_real_local_app_data`、
+  `xos10_windows_open_rejects_outside_roots_without_creating` など）が、配下では成功し配下外では
+  `Unsupported` を返すことを確認するのみ
 - Windows ACL 実装方式の判断は #813 が追跡している（本書作成時点で OPEN）。Windows の実施は #813 と
   後続の ACL 実装の完了待ちで、**実施時期・順序は未決定（オーナー判断待ち）**
 
@@ -163,7 +165,8 @@ Windows が未実施の間は、Linux・macOS の結果を #295 に部分報告�
 
 - 実施済み: Linux ext4（合格 / 不合格）、macOS APFS（合格 / 不合格）。詳細は各表のとおり
 - 未実施: Windows NTFS
-  - 理由: `Profile::open` が `Unsupported` を返す（`XOS-7` の ACL 隔離が未実装。#813 で方式を判断中）
+  - 理由: 分離テスト（`tests/isolation.rs`）が `#![cfg(unix)]` のまま。`Profile::open` は
+    `%LOCALAPPDATA%` 配下で成功する（Issue #928）が、配下外は `Unsupported`（#813 で方式を判断中）
   - 再開条件: Windows の ACL 実装完了後に本手順（`tests/isolation.rs` の `#![cfg(unix)]` の扱いを含む）を
     Windows 向けに見直して実施する
 - 本 Issue の受け入れ条件（3 OS 分の測定レポート）は未達のため、close しない

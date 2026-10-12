@@ -27,11 +27,9 @@
 //! 本体（`src/`）は変更しない。新規外部依存も追加しない
 //! （dependency-policy.md）。
 //!
-//! Windows では ACL 隔離（`XOS-7`〜`XOS-10`）が未実装のため `Profile::open`
-//! は常に `ProfileError::Unsupported` を返す（`tests/profile_open.rs` と同じ
-//! 契約。この契約は `src/profile.rs` の `#[cfg(windows)]` テストが確認して
-//! いる）。本ファイルはディレクトリが実際に作られ書き込まれることを前提と
-//! するため Unix 専用とする。
+//! Windows の `Profile::open` は `%LOCALAPPDATA%` 配下では成功する（Issue #928）が、
+//! 本ファイルはディレクトリが実際に作られ書き込まれることを前提とするため
+//! Unix 専用とする。分離テストの Windows 対応は別 Issue の課題。
 
 #![cfg(unix)]
 

@@ -37,10 +37,9 @@
 //!
 //! ## Windows を対象外にする理由
 //!
-//! `Profile::open` は Windows では ACL 隔離が未実装のため常に
-//! `ProfileError::Unsupported` を返す（`XOS-7`〜`XOS-10`）。本ファイルは
-//! 実際に `Profile::open`・ファイル作成を行う内容のため Unix 専用とする。
-//! 3 OS での分離テスト実行（`XOS-10`）は Windows ACL 実装後の課題であり、
+//! 本ファイルは実際に `Profile::open`・ファイル作成を行う内容のため Unix 専用とする。
+//! Windows の `Profile::open` は `%LOCALAPPDATA%` 配下では成功する（Issue #928）が、
+//! 3 OS での分離テスト実行（`XOS-10`）の Windows 対応は別 Issue の課題で、
 //! 本タスクのスコープ外。
 
 #![cfg(unix)]
