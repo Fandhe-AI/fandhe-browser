@@ -2503,6 +2503,190 @@ class ArgValidationTest(unittest.TestCase):
         self.assertEqual(args.settle_ms, 1000)
         self.assertEqual(args.min_sites, 3)
 
+PROXY_PROBE_ENGINE = FIXTURES_DIR / "proxy_probe_engine.py"
+
+
+def probe_template(mode: str = "proxied", *, extra: list[str] | None = None) -> list[str]:
+    """`proxy_probe_engine.py` を `{html_path}` + `{proxy}` で起動するテンプレート。"""
+    return [
+        sys.executable,
+        str(PROXY_PROBE_ENGINE),
+        "--mode",
+        mode,
+        "--html",
+        "{html_path}",
+        "--out",
+        "{out}",
+        "--width",
+        "{width}",
+        "--height",
+        "{height}",
+        "--proxy",
+        "{proxy}",
+        *(extra or []),
+    ]
+
+
+class ProxyAuditCaptureTest(unittest.TestCase):
+    """RENDER-5 / TASK-37: 検証プロキシの通信監査・fail-closed・環境変数の強制。"""
+
+    def setUp(self) -> None:
+        self.server, self.thread, self.proxy_url = cs.start_filtering_proxy()
+        self.addCleanup(cs.stop_filtering_proxy, self.server, self.thread)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def _page(self, body: str) -> cs.Site:
+        page = self.root / "page.html"
+        page.write_text(f"<html><head></head><body>{body}</body></html>", encoding="utf-8")
+        return cs.Site(site_id="probe", url=page.as_uri(), category="static", catalog_id="z1")
+
+    def _capture(self, site: cs.Site, template: list[str], **kwargs: object) -> dict:
+        return cs.capture_one(
+            site,
+            "servo",
+            template,
+            out_dir=self.root / "out",
+            snapshots_dir=self.root / "out" / "snapshots",
+            chromium_bin=None,
+            width=64,
+            height=48,
+            settle_ms=0,
+            timeout_sec=20,
+            allow_file_url=True,
+            dry_run=False,
+            proxy_url=self.proxy_url,
+            proxy_audit=self.server.audit,
+            **kwargs,
+        )
+
+    def test_internal_address_subresources_are_denied_and_never_reach_canary(self) -> None:
+        import socket as socket_module  # noqa: PLC0415
+
+        canary = socket_module.socket()
+        canary.bind(("127.0.0.1", 0))
+        canary.listen(8)
+        canary.settimeout(0.3)
+        self.addCleanup(canary.close)
+        canary_port = canary.getsockname()[1]
+        body = (
+            f'<img src="http://127.0.0.1:{canary_port}/x">'
+            '<img src="http://169.254.169.254/latest/meta-data/">'
+            '<script src="http://localhost/a.js"></script>'
+            '<img src="http://[::1]/b.png">'
+            '<link rel="stylesheet" href="https://10.0.0.1/c.css">'
+        )
+        record = self._capture(self._page(body), probe_template(extra=["--report", str(self.root / "report.json")]))
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(record["proxy"]["allowed"], 0)
+        self.assertEqual(record["proxy"]["denied"], 5)
+        targets = record["proxy"]["denied_targets"]
+        for expected in ("169.254.169.254:80", "localhost:80", "::1:80", "10.0.0.1:443"):
+            self.assertIn(expected, targets)
+        report = json.loads((self.root / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual([r["status"] for r in report], [403, 403, 403, 403, None])
+        with self.assertRaises(OSError):
+            canary.accept()  # canary への接続は 0 件
+
+    def test_public_address_subresource_is_allowed_and_counted(self) -> None:
+        # 実ネットワークに出ないよう、名前解決を TEST-NET ではなく公開扱いの
+        # ループバック上の待受へ差し替える。
+        import socket as socket_module  # noqa: PLC0415
+
+        upstream = socket_module.socket()
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen(4)
+        upstream.settimeout(5)
+        self.addCleanup(upstream.close)
+        up_port = upstream.getsockname()[1]
+
+        def serve() -> None:
+            try:
+                conn, _ = upstream.accept()
+                conn.recv(4096)
+                conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                conn.close()
+            except OSError:
+                pass
+
+        threading.Thread(target=serve, daemon=True).start()
+        site = self._page('<img src="http://example.test/a.png">')
+        with mock.patch.object(cs, "_resolve_public_addresses", return_value=[("127.0.0.1", up_port)]):
+            record = self._capture(site, probe_template())
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(record["proxy"], {"allowed": 1, "denied": 0, "denied_targets": []})
+
+    def test_engine_that_never_uses_proxy_fails_when_snapshot_has_subresources(self) -> None:
+        record = self._capture(self._page('<img src="https://example.test/a.png">'), probe_template("silent"))
+        self.assertEqual(record["status"], "failed")
+        self.assertIsNone(record["png"])
+        self.assertIn("no connections through the filtering proxy", record["stderr_tail"])
+        self.assertEqual(record["proxy"]["allowed"] + record["proxy"]["denied"], 0)
+
+    def test_engine_without_proxy_use_is_ok_when_snapshot_has_no_subresources(self) -> None:
+        record = self._capture(self._page('<a href="https://example.test/">x</a><img src="data:image/png;base64,AA==">'), probe_template("silent"))
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(record["proxy"], {"allowed": 0, "denied": 0, "denied_targets": []})
+
+    def test_engine_environment_forces_proxy_and_drops_no_proxy(self) -> None:
+        dump = self.root / "env.json"
+        hostile = {"NO_PROXY": "*", "no_proxy": "*", "http_proxy": "http://evil.invalid:1", "ALL_PROXY": "http://evil.invalid:2"}
+        with mock.patch.dict(os.environ, hostile):
+            record = self._capture(
+                self._page("<p>no refs</p>"), probe_template("silent", extra=["--dump-env", str(dump)])
+            )
+        self.assertEqual(record["status"], "ok")
+        env = json.loads(dump.read_text(encoding="utf-8"))
+        for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            self.assertEqual(env[key], self.proxy_url)
+        for key in ("no_proxy", "NO_PROXY", "all_proxy", "ALL_PROXY"):
+            self.assertIsNone(env[key])
+
+    def test_subresource_detection_resolves_relative_refs_with_base_href(self) -> None:
+        page = self.root / "s.html"
+        page.write_text('<base href="https://example.test/"><link rel="stylesheet" href="a.css">', encoding="utf-8")
+        self.assertTrue(cs.snapshot_references_network_subresources(page))
+        page.write_text('<base href="file:///tmp/"><img src="a.png"><link rel="canonical" href="https://x.test/">', encoding="utf-8")
+        self.assertFalse(cs.snapshot_references_network_subresources(page))
+
+    def test_servo_template_with_proxy_flag_expands_in_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sites = Path(tmp) / "sites.json"
+            write_sites_json(sites, [make_site(f"s{i}") for i in range(5)])
+            template = json.dumps(["servo_embed_poc", "{html_path}", "{out}", "--proxy", "{proxy}"])
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cs.main(
+                    ["--sites", str(sites), "--out-dir", str(Path(tmp) / "o"), "--engines", "servo",
+                     "--servo-cmd", template, "--dry-run"]
+                )
+            self.assertEqual(code, 0)
+            self.assertIn("servo_embed_poc", out.getvalue())
+            self.assertIn("--proxy <proxy>", out.getvalue())
+
+    def test_measure_ssim_ignores_proxy_key_in_capture_result(self) -> None:
+        import measure_ssim as ms  # noqa: PLC0415
+
+        out_dir = self.root / "m"
+        out_dir.mkdir()
+        record = {
+            "site_id": "s0", "engine": "servo", "status": "failed", "png": None, "width": None,
+            "height": None, "duration_ms": 1, "exit_code": 0, "stderr_tail": "", "command": ["x"],
+            "input": "snapshot", "proxy": {"allowed": 0, "denied": 1, "denied_targets": ["a:80"]},
+        }
+        payload = {
+            "schema_version": 1, "generated_at": "2026-01-01T00:00:00Z",
+            "viewport": {"width": 64, "height": 48},
+            "sites": [{"id": "s0", "url": "https://example.test/", "category": "static", "catalog_id": "z1"}],
+            "captures": [record],
+        }
+        (out_dir / "capture-result.json").write_text(json.dumps(payload), encoding="utf-8")
+        viewport, pairs, skipped = ms.load_capture_result(out_dir)
+        self.assertEqual(viewport, {"width": 64, "height": 48})
+        self.assertEqual(pairs, [])
+        self.assertEqual([entry["site_id"] for entry in skipped], ["s0"])
+
 
 if __name__ == "__main__":
     unittest.main()

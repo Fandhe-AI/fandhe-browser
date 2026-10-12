@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import html
 import http.server
+import html.parser
 import ipaddress
 import json
 import math
@@ -51,7 +52,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 # --- 定数 -------------------------------------------------------------
 
@@ -124,6 +125,18 @@ PROXY_IDLE_TIMEOUT_SEC = 30
 PROXY_MAX_BYTES_PER_CONNECTION = 256 * 1024 * 1024
 # リクエストボディの上限（バイト）。
 PROXY_MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024
+
+# プロキシ監査（`ProxyAudit`）が結果 JSON へ載せる拒否先の最大件数（無制限確保の
+# 防止。超過分は件数だけ数える）。
+PROXY_AUDIT_MAX_DENIED_TARGETS = 50
+# スナップショット中のサブリソース参照を数える上限（fail-closed 判定用）。
+SNAPSHOT_MAX_SUBRESOURCE_REFS = 1000
+# 撮影エンジンの環境から取り除く / 上書きするプロキシ系環境変数。Servo の
+# `Preferences::default()` は `http_proxy`・`https_proxy`・`no_proxy` を環境変数から
+# 読むため、`no_proxy` による除外迂回を防ぐ多層防御として `capture_one` が制御する
+# （RENDER-5 / TASK-37）。
+PROXY_ENV_SET_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
+PROXY_ENV_DROP_KEYS = ("no_proxy", "NO_PROXY", "all_proxy", "ALL_PROXY")
 
 CHROMIUM_BIN_CANDIDATES = ("chromium", "chromium-browser", "google-chrome")
 
@@ -701,6 +714,51 @@ def _connect_to_first_verified_address(addresses: list[tuple[str, int]], timeout
     raise SnapshotError(f"could not connect to any resolved address: {last_exc}")
 
 
+class ProxyAudit:
+    """検証プロキシが受けた接続要求の許可・拒否を数えるスレッドセーフな監査記録。
+
+    `_ProxyRequestHandler` が宛先判定のたびに `record` し、`capture_one` が
+    エンジン実行の前後で `snapshot` の差分を取って結果 JSON の `proxy` キーへ
+    載せる（RENDER-5 / TASK-37）。URL のクエリ部は記録せず host:port のみを保持し、
+    拒否先は `PROXY_AUDIT_MAX_DENIED_TARGETS` 件で打ち切る。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._allowed = 0
+        self._denied = 0
+        self._denied_targets: list[str] = []
+
+    @staticmethod
+    def _label(host: str | None, port: int) -> str:
+        text = "".join(ch for ch in (host or "?") if ch.isprintable())[:255] or "?"
+        return f"{text}:{port}"
+
+    def record(self, host: str | None, port: int, *, allowed: bool) -> None:
+        with self._lock:
+            if allowed:
+                self._allowed += 1
+                return
+            self._denied += 1
+            label = self._label(host, port)
+            if label not in self._denied_targets and len(self._denied_targets) < PROXY_AUDIT_MAX_DENIED_TARGETS:
+                self._denied_targets.append(label)
+
+    def snapshot(self) -> tuple[int, int, int]:
+        """`(allowed, denied, 拒否先リスト長)` を返す。差分計算の基点に使う。"""
+        with self._lock:
+            return self._allowed, self._denied, len(self._denied_targets)
+
+    def delta_since(self, base: tuple[int, int, int]) -> dict[str, Any]:
+        """`base` 以降に増えた件数と、新たに現れた拒否先を結果 JSON 用の dict で返す。"""
+        with self._lock:
+            return {
+                "allowed": self._allowed - base[0],
+                "denied": self._denied - base[1],
+                "denied_targets": list(self._denied_targets[base[2] :]),
+            }
+
+
 class _ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
     """宛先を検証してから中継する、撮影プロセス専用のローカル転送プロキシハンドラ。
 
@@ -724,20 +782,30 @@ class _ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
         # 標準エラーへ大量にログを出さない（呼び出し元の撮影ログと混在させない）。
         pass
 
+    def _audit(self, host: str | None, port: int, *, allowed: bool) -> None:
+        audit = getattr(self.server, "audit", None)
+        if audit is not None:
+            audit.record(host, port, allowed=allowed)
+
     def _deny_if_not_public(self, host: str | None, port: int) -> list[tuple[str, int]] | None:
         if port not in PROXY_ALLOWED_PORTS:
+            self._audit(host, port, allowed=False)
             self.send_error(403, f"port {port} is not allowed by the filtering proxy")
             return None
         try:
-            return _resolve_public_addresses(host, port, context=f"proxy target {host}:{port}")
+            addresses = _resolve_public_addresses(host, port, context=f"proxy target {host}:{port}")
         except SnapshotError as exc:
+            self._audit(host, port, allowed=False)
             self.send_error(403, str(exc))
             return None
+        self._audit(host, port, allowed=True)
+        return addresses
 
     def do_CONNECT(self) -> None:  # noqa: N802
         try:
             host, port = _split_host_port(self.path, 443)
         except SnapshotError as exc:
+            self._audit(None, 0, allowed=False)
             self.send_error(400, str(exc))
             return
         addresses = self._deny_if_not_public(host, port)
@@ -798,6 +866,7 @@ class _ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
     def _forward(self, method: str) -> None:
         parsed = urlparse(self.path)
         if parsed.scheme != "http" or not parsed.hostname:
+            self._audit(None, 0, allowed=False)
             self.send_error(400, "proxy requires an absolute-form http URL in the request line")
             return
         host = parsed.hostname
@@ -808,6 +877,7 @@ class _ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
             # `handle_error` が撮影ログへトレースバックを撒き散らす。
             port = parsed.port or 80
         except ValueError:
+            self._audit(host, 0, allowed=False)
             self.send_error(400, "invalid port in request-target")
             return
 
@@ -913,6 +983,8 @@ class _FilteringProxyServer(socketserver.ThreadingMixIn, http.server.HTTPServer)
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._connection_semaphore = threading.BoundedSemaphore(PROXY_MAX_CONNECTIONS)
+        # 許可・拒否の件数記録。`capture_one` が実行前後の差分を結果 JSON に載せる。
+        self.audit = ProxyAudit()
 
     def process_request(self, request: socket.socket, client_address: Any) -> None:
         self._connection_semaphore.acquire()
@@ -1428,6 +1500,77 @@ def _count_common_ok_sites(captures: list[dict[str, Any]], engines: list[str]) -
     return len(set.intersection(*ok_site_ids_by_engine.values()))
 
 
+class _SubresourceCollector(html.parser.HTMLParser):
+    """スナップショット HTML から、エンジンが取得しうる外部サブリソース参照を集める。
+
+    `capture_one` の fail-closed 判定（プロキシ未使用の検出）専用。対象は
+    `script[src]`・`img[src]`・`source[src]`・`iframe[src]` と、`rel` が
+    stylesheet / icon / preload 系の `link[href]`。`<a href>` 等の遷移リンクは
+    取得されないため対象外。参照は `SNAPSHOT_MAX_SUBRESOURCE_REFS` 件で打ち切る。
+    """
+
+    _LINK_RELS = frozenset({"stylesheet", "icon", "preload", "modulepreload"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.base_href: str | None = None
+        self.refs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr = {k.lower(): v for k, v in attrs if v is not None}
+        if tag == "base" and self.base_href is None and attr.get("href"):
+            self.base_href = attr["href"]
+            return
+        ref: str | None = None
+        if tag in {"script", "img", "source", "iframe"}:
+            ref = attr.get("src")
+        elif tag == "link" and self._LINK_RELS & set(attr.get("rel", "").lower().split()):
+            ref = attr.get("href")
+        if ref and len(self.refs) < SNAPSHOT_MAX_SUBRESOURCE_REFS:
+            self.refs.append(ref)
+
+
+def snapshot_references_network_subresources(snapshot_path: Path) -> bool:
+    """スナップショットが http(s) で解決される外部サブリソースを 1 件でも参照するかを返す。
+
+    相対 URL は注入済みの `<base href>` で解決する。読めない・パースできない場合は
+    False（判定を適用しない側）に倒す。誤失敗より、実際に迂回した場合の検出漏れを
+    README に限界として明記する方針（REPAIR-3）。
+    """
+    try:
+        text = snapshot_path.read_bytes()[:SNAPSHOT_MAX_BYTES].decode("utf-8", errors="replace")
+        collector = _SubresourceCollector()
+        collector.feed(text)
+        collector.close()
+    except (OSError, ValueError):
+        return False
+    base = collector.base_href or ""
+    for ref in collector.refs:
+        try:
+            resolved = urlparse(urljoin(base, ref.strip()))
+        except ValueError:
+            continue
+        if resolved.scheme in {"http", "https"} and resolved.hostname:
+            return True
+    return False
+
+
+def build_engine_env(proxy_url: str) -> dict[str, str]:
+    """検証プロキシを強制する環境変数つきの環境を返す（Servo の既定 pref 読み取り対策）。
+
+    親環境を引き継ぎつつ、プロキシ系を `proxy_url` に揃え、`no_proxy` 系と
+    `all_proxy` 系を取り除く。埋め込み側の pref 設定漏れや環境由来の除外指定
+    （`NO_PROXY=*` 等）で検証プロキシを迂回されないための多層防御で、識別面
+    （UA 等）は変更しない（SEC-2）。
+    """
+    env = dict(os.environ)
+    for key in PROXY_ENV_DROP_KEYS:
+        env.pop(key, None)
+    for key in PROXY_ENV_SET_KEYS:
+        env[key] = proxy_url
+    return env
+
+
 def _skip_result(site: Site, engine: str, argv: list[str], detail: str) -> dict[str, Any]:
     return {
         "site_id": site.site_id,
@@ -1460,6 +1603,7 @@ def capture_one(
     dry_run: bool,
     proxy_url: str | None = None,
     allow_unproxied_engine: bool = False,
+    proxy_audit: ProxyAudit | None = None,
 ) -> dict[str, Any]:
     """1 サイト × 1 エンジンの撮影を実行し、結果レコード（dict）を返す。
 
@@ -1473,6 +1617,12 @@ def capture_one(
     （codex P0 再指摘: 最初の URL だけの検証では、撮影プロセス自身が読み込む
     サブリソースやリダイレクト先を制限できないため、通信経路そのものを
     プロキシへ強制することを既定にする）。
+
+    `proxy_audit` が渡され、テンプレートが `{proxy}` と `{html_path}` を使う場合は、
+    エンジン実行中のプロキシ許可・拒否件数を結果の `proxy` キーへ載せる。
+    スナップショットが外部サブリソースを参照するのにエンジンがプロキシを一度も
+    使わなかった場合は PNG が出ていても `failed` にする（fail-closed。RENDER-5 /
+    TASK-37。一部だけ迂回するケースは検出できない）。
     """
     out_path = out_dir / engine / f"{site.site_id}.png"
     # `resolve()` した出力先が out-dir 配下にあることを確認する（パストラバーサル対策）。
@@ -1635,6 +1785,10 @@ def capture_one(
             except SnapshotError as exc:
                 return _skip_result(site, engine, argv, str(exc))
 
+        audit_base = proxy_audit.snapshot() if proxy_audit is not None else None
+        # `{proxy}` を使うときだけ環境変数でもプロキシを強制する。使わない
+        # （`--allow-unproxied-engine`）場合は現行どおり親環境をそのまま渡す。
+        engine_env = build_engine_env(proxy_url) if needs_proxy and proxy_url is not None else None
         start = time.monotonic()
         stderr_path: Path | None = None
         try:
@@ -1653,6 +1807,7 @@ def capture_one(
                     stdout=subprocess.DEVNULL,
                     stderr=stderr_file,
                     shell=False,
+                    env=engine_env,
                     **_process_group_popen_kwargs(),
                 )
                 try:
@@ -1740,7 +1895,27 @@ def capture_one(
             except PngError as exc:
                 stderr_tail = (stderr_tail + f"\n{exc}")[-STDERR_TAIL_CHARS:]
 
-        return {
+        proxy_report: dict[str, Any] | None = None
+        if proxy_audit is not None and audit_base is not None and needs_proxy:
+            proxy_report = proxy_audit.delta_since(audit_base)
+            if (
+                status == "ok"
+                and needs_html
+                and proxy_report["allowed"] + proxy_report["denied"] == 0
+                and snapshot_references_network_subresources(snapshot_path)
+            ):
+                # fail-closed: スナップショットが外部サブリソースを参照するのに
+                # エンジンが検証プロキシを 1 度も使っていない。サブリソースを
+                # 直接取得（SSRF 経路）したか、取得せずに描画した可能性がある。
+                status = "failed"
+                png_rel = None
+                stderr_tail = (
+                    stderr_tail
+                    + "\nengine made no connections through the filtering proxy although "
+                    "the snapshot references subresources"
+                )[-STDERR_TAIL_CHARS:]
+
+        record: dict[str, Any] = {
             "site_id": site.site_id,
             "engine": engine,
             "status": status,
@@ -1753,6 +1928,9 @@ def capture_one(
             "command": argv,
             "input": input_kind,
         }
+        if proxy_report is not None:
+            record["proxy"] = proxy_report
+        return record
     finally:
         if user_data_dir is not None:
             shutil.rmtree(user_data_dir, ignore_errors=True)
@@ -2021,6 +2199,7 @@ def main(argv: list[str] | None = None) -> int:
                         dry_run=args.dry_run,
                         proxy_url=proxy_url,
                         allow_unproxied_engine=args.allow_unproxied_engine,
+                        proxy_audit=proxy_server.audit if proxy_server is not None else None,
                     )
                     captures.append(record)
         except CaptureError as exc:
