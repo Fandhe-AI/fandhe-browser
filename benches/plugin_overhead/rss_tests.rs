@@ -179,6 +179,24 @@ fn plug3_options_defaults_match_poc15() {
     let o = Options::parse(&[]).expect("defaults");
     assert_eq!(o.metrics, vec![Metric::IdleRss]);
     assert_eq!((o.samples, o.settle_ms, o.interval_ms), (3, 800, 200));
+    assert_eq!(o.trials, 5);
+}
+
+#[test]
+fn plug3_options_accept_cold_start_metric_and_trials() {
+    let o = Options::parse(&args(&[
+        "--metric",
+        "cold-start",
+        "--metric",
+        "idle-rss",
+        "--metric",
+        "cold-start",
+        "--trials",
+        "7",
+    ]))
+    .expect("parse");
+    assert_eq!(o.metrics, vec![Metric::ColdStart, Metric::IdleRss]);
+    assert_eq!(o.trials, 7);
 }
 
 #[test]
@@ -210,7 +228,11 @@ fn plug3_options_reject_invalid_input() {
         &["--samples", "x"],
         &["--settle-ms", "30001"],
         &["--interval-ms", "5001"],
-        &["--metric", "cold-start"],
+        &["--trials", "0"],
+        &["--trials", "21"],
+        &["--trials"],
+        &["--trials", "x"],
+        &["--metric", "latency"],
         &["--metric"],
         &["--unknown"],
     ] {

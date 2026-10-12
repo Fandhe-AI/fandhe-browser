@@ -2,8 +2,11 @@
 //! （TASK-95.1・Issue #375・`PLUG-3`・`MS-9`）。
 //!
 //! 実行: `make measure-plugin-overhead`（mcp の release ビルド後に
-//! `cargo bench -p fandhe-browser-ai --bench plugin_overhead -- [--metric idle-rss] [--samples N] ...`）。
+//! `cargo bench -p fandhe-browser-ai --bench plugin_overhead -- [--metric idle-rss|cold-start] [--samples N] [--trials N] ...`）。
 //! 詳細な手法・単位・PoC-15 との差は `benches/plugin_overhead/README.md`。
+//!
+//! cold start（TASK-95.2・Issue #376）: `--metric cold-start [--trials N]` でプラグイン起動から MCP
+//! ハンドシェイク完了までの壁時計時間を試行ごと（新しいホスト・新しいプロセス）に ms で採取する。
 //!
 //! 計測: 本物の ai ルータを in-process で loopback 公開した本体（ベンチ自身）の RSS と、mcp を接続して
 //! アイドル（登録・initialize 済み・ツール未呼び出し）にした状態の RSS を `ps` で採取し、中央値の差を
@@ -13,12 +16,18 @@
 //! バイナリ不在・登録失敗・採取失敗・引数不正・非 unix は非 0（fail-closed）。
 //!
 //! 将来仕様（REPAIR-3）: cli が引数（ポート・プロファイル）を持ったら in-process ホストを実バイナリへ
-//! 切り替える（TASK-47・`CLI-1`）。cold start（TASK-95.2）・レイテンシ（TASK-95.3）は `--metric` として
-//! 追加し、TASK-10 形式のレポート化は TASK-95.4 が担う。
+//! 切り替える（TASK-47・`CLI-1`）。レイテンシ（TASK-95.3）は `--metric` として追加し、
+//! TASK-10 形式のレポート化は TASK-95.4 が担う。
 
 #[cfg(unix)]
 #[path = "../crates/fandhe-browser-ai/benches/mcp_envelope/app_host.rs"]
 mod app_host;
+#[cfg(unix)]
+#[path = "plugin_overhead/cold_start.rs"]
+mod cold_start;
+#[cfg(unix)]
+#[path = "plugin_overhead/cold_start_stats.rs"]
+mod cold_start_stats;
 #[cfg(unix)]
 #[path = "../crates/fandhe-browser-ai/benches/mcp_envelope/host.rs"]
 mod host;
@@ -58,6 +67,14 @@ fn run() -> Result<(), String> {
                 println!(
                     "{}",
                     rss::render_idle_rss(&m, target).map_err(|e| e.to_string())?
+                );
+            }
+            Metric::ColdStart => {
+                let m = cold_start::measure(&bin, &opts)?;
+                let target = fandhe_browser_ai::plugin_api::PLUG3_TARGETS.cold_start_max_ms();
+                println!(
+                    "{}",
+                    cold_start_stats::render_cold_start(&m, target).map_err(|e| e.to_string())?
                 );
             }
         }

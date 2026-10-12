@@ -146,10 +146,10 @@ measure-mcp-envelope: ## 方式 B 本体と MCP エンベロープのトーク�
 check-mcp-envelope: ## MCP エンベロープ測定ハーネスの e2e smoke を実バイナリで実行する（PLUG-5・TASK-97.1。unix のみ）
 	@scripts/harness.sh check-mcp-envelope
 
-measure-plugin-overhead: ## mcp プラグインのアイドル RSS 増分を測定する（PLUG-3・TASK-95.1。unix のみ。PLUGIN_OVERHEAD_ARGS で引数指定）
+measure-plugin-overhead: ## mcp プラグインのアイドル RSS 増分・cold start を測定する（PLUG-3・TASK-95.1・95.2。unix のみ。PLUGIN_OVERHEAD_ARGS で引数指定）
 	@scripts/harness.sh measure-plugin-overhead
 
-check-plugin-overhead: ## プラグイン RSS 増分計測の e2e smoke を実バイナリで実行する（PLUG-3・TASK-95.1。unix のみ）
+check-plugin-overhead: ## プラグイン性能計測（RSS 増分・cold start）の e2e smoke を実バイナリで実行する（PLUG-3・TASK-95.1・95.2。unix のみ）
 	@scripts/harness.sh check-plugin-overhead
 
 measure-js-binary-size: ## JS エンジン構成別（既定 V8 / 軽量 boa / エンジンなし）のリリースバイナリサイズを計測する（TASK-31.1）
