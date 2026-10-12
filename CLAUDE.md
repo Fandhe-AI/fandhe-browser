@@ -6,7 +6,7 @@ Rust 製の軽量・ミニマムなブラウザの実装リポジトリ。AI エ
 
 - **本リポは public**。仕様・ビヘイビア定義の SSOT は private リポ [fandhe-browser-spec](https://github.com/Fandhe-AI/fandhe-browser-spec)（`docs/spec` submodule の `04-behavior/`）。spec の内容は本リポに載せてよい（機密なし）が、ビヘイビア ID を併記して SSOT へ辿れるようにする（[spec-reference](.claude/rules/spec-reference.md)）。spec 本文に残る旧称 `rust-browser` は `fandhe-browser` に読み替える
 - 実装方針の要点は README「実装方針（要点）」を参照（二層アーキテクチャ・V8 既定 / boa 切替・AI 最適化 API・CDP 互換・プラグイン境界・プロファイル分離・3 OS 一級対応・AI 自己補修）
-- 依存は最小・`=x.y.z` 完全固定・ユーザー承認制（[dependency-policy](.claude/rules/dependency-policy.md)）。ライセンスは MIT OR Apache-2.0、Servo（MPL-2.0）は render crate に隔離（[licensing](.claude/rules/licensing.md)）
+- 依存は最小・`=x.y.z` 完全固定・ユーザー承認制（[dependency-policy](.claude/rules/dependency-policy.md)）。ライセンスは MIT OR Apache-2.0、Servo（MPL-2.0）は本体の workspace に入れず、別 workspace・別プロセスの Servo ホストに隔離する（[licensing](.claude/rules/licensing.md)）
 - **実装の着手はユーザーの明示指示を経てから**行う。タスク定義は spec の `05-tasks.md`（TASK-n）、マイルストーンは `06-roadmap.md`（MS-n）
 - 進捗・ステータスは本ファイルに逐次記録しない（Issue で管理する）
 
@@ -37,7 +37,7 @@ fandhe-browser/
 │   ├── fandhe-browser-js/         #   JS エンジン抽象（V8 既定 / boa）
 │   ├── fandhe-browser-ai/         #   AI 最適化 API（アクセシビリティツリー・簡約 DOM）・プラグイン API
 │   ├── fandhe-browser-cdp/        #   CDP 互換サーバー
-│   ├── fandhe-browser-render/     #   Servo 組込（feature gate `rendering`・MPL-2.0 隔離）
+│   ├── fandhe-browser-render/     #   レンダリング層（feature gate `rendering`。Servo 自体は別 workspace の Servo ホストに置く方針で、本 crate の役割は設計で決める。licensing.md）
 │   ├── fandhe-browser-profile/    #   プロファイル分離
 │   ├── fandhe-browser-cli/        #   CLI（最小雛形: core・profile・cdp・ai を組み立ててサーバー起動。サブコマンドは TASK-47）
 │   └── fandhe-browser-mcp/        #   MCP 参照プラグイン（別バイナリ。stdio サーバー基盤・起動時のホスト自己申告と navigate・snapshot ツールを実装）
