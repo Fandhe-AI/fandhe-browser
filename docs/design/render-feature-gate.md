@@ -103,6 +103,8 @@ Issue #50 がクローズされ実測が確定した際は、本セクション�
 
 ## オプトイン配布方式の比較
 
+別 workspace・別プロセスで Servo を組み込む構成の試作・計測結果は [servo-out-of-process-prototype](./servo-out-of-process-prototype.md)（#914。採否判断は #915）を参照。
+
 RENDER-3 が求める設計判断材料として、`fandhe-browser-render` crate（`Servo`、MPL-2.0）を配布する 3 方式を比較する。Servo（MPL-2.0）は `fandhe-browser-render` crate 配下に隔離する方針（[licensing](../../.claude/rules/licensing.md)）を前提とする。コンテナは `RENDER-3` の対象外と `docs/spec/04-behavior/container-cloud.md` が明記しており、比較表の「別コンテナイメージ」列はその前提を踏まえた設計候補として参考記載する。
 
 | 方式 | サイズへの影響 | ビルド時間への影響 | 配布の複雑さ | MPL-2.0 隔離との整合 |
