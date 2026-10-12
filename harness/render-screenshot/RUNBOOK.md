@@ -4,9 +4,13 @@ TASK-37（37.h1）/ MS-1 / ビヘイビア `RENDER-5`・`MEAS-3` 対応。Issue 
 実機作業（担当: 人間）の手順書である。**この文書は手順の草案であり、測定結果ではない**。
 実機での撮影・測定・合否判定はオーナーが行い、結果は #55 に記録する。
 
-**実サイト（ネットワーク接続下）の Servo 撮影は保留中である**。現行の `servo-embed` は
-検証プロキシを通せず、`--allow-unproxied-engine` は README の安全契約上ネットワークを
-完全に遮断した環境専用のため、接続下では使えない（保留理由は 4.3、再開条件は 5.1）。
+**実サイト（ネットワーク接続下）の Servo 撮影は保留を維持する**。`--proxy` 対応版 `servo-embed`
+（4.2）と `--egress-guard` を用いても、Servo の WebSocket はプロキシへ強制されず、
+`egress_guard` は接続後に検出して終了するだけの事後検出である。ページ JS が内部アドレスへ
+WebSocket 接続すると HTTP Upgrade リクエストが内部サービスへ届き得て（短命なら検出もされない）、
+SSRF の副作用は事後に `failed` にしても取り消せない。**エンジンからプロキシ以外への通信を
+事前に遮断する隔離（ネットワーク名前空間等）ができるまで、接続下での撮影は行わない**
+（再開条件は 5.1）。`--allow-unproxied-engine` も完全遮断環境専用で、接続下では使わない。
 
 ハーネスの仕様（引数・スキーマ・セキュリティ上の注意）は [README.md](README.md) が
 正本で、本書は「実機で何をどの順に実行するか」だけを扱う。
@@ -91,10 +95,11 @@ callback が呼ばれないことと推定されている（Servo 0.3.0 の描�
 
    本リポの `Cargo.toml` / `Cargo.lock` は変更しない（依存は `=x.y.z` 固定・承認制。
    複製側の依存は PoC の `Cargo.lock` に従う）。
-4. 単体で PNG が出ることを確認してから、ハーネスに繋ぐ。
+4. 通信を検証プロキシへ強制する `--proxy` 対応の差分を当てる（次項「`--proxy` 対応の差分」）。
+5. 単体で PNG が出ることを確認してから、ハーネスに繋ぐ。
 
    ```bash
-   /path/to/servo-target/release/servo_embed_poc page.html out.png
+   /path/to/servo-target/release/servo_embed_poc page.html out.png --proxy http://127.0.0.1:PORT
    file out.png   # PNG image data, 1280 x 800, 8-bit/color RGBA を確認
    ```
 
@@ -102,9 +107,44 @@ callback が呼ばれないことと推定されている（Servo 0.3.0 の描�
    `LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe`、`EGL_PLATFORM=surfaceless`、
    または `xvfb-run -a -s "-screen 0 1280x800x24"`。
 
+#### `--proxy` 対応の差分（TASK-37 / #837）
+
+複製した `src/main.rs` に次の内容を足す。Servo 本体は改変しない。**以下は Servo 0.3.0 の
+ソース（`servo-config`・`servo-net`・`servo` クレート）で API 名を確認して書いた差分で、
+本リポではコンパイル確認をしていない（未検証。実ビルドでの確認は #55 の作業）**。
+本リポにはビルド対象の Servo 埋め込みコードをチェックインしない（MPL 隔離・依存承認制）。
+
+1. 引数 `--proxy URL` を解析する。**未指定なら `exit(2)`**（プロキシなしで走らせない）。
+   URL は `http://127.0.0.1:<port>`（loopback のみ）を要求し、それ以外は `exit(2)`。
+2. `Preferences::default()` から作った値に、次を**明示**して `ServoBuilder::preferences(...)` へ渡す。
+   `Preferences::default()` は環境変数から `no_proxy` を読むため、空文字の明示が要る。
+
+   ```rust
+   let mut prefs = Preferences::default();
+   prefs.network_http_proxy_uri = proxy_url.clone();
+   prefs.network_https_proxy_uri = proxy_url.clone();
+   prefs.network_http_no_proxy = String::new();
+   ```
+
+3. `WebViewDelegate::load_web_resource` で、各リクエストの scheme・host・port だけを stderr に出す
+   （クエリは出さない）。ログ出力のみで介入せず、通常どおりロードを続行する。
+
+   ```rust
+   fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
+       let url = &load.request.url;
+       eprintln!("servo-embed: load {}://{}:{}", url.scheme(), url.host_str().unwrap_or("?"), url.port_or_known_default().unwrap_or(0));
+       // intercept() を呼ばなければロードは続行される
+   }
+   ```
+
+4. 位置引数 `html_path`・`out.png` の仕様は維持する。
+
+注意: pref は HTTP(S) のサブリソース取得に効くが、WebSocket は `websocket_loader.rs` が直接接続
+するため強制されない（README「このプロキシで防げないこと」）。`--egress-guard`（Linux）が補う。
+
 ### 4.3 servo-embed の入出力仕様と制約
 
-- 引数は `servo_embed_poc <html_path> <out.png>` の位置引数 2 つのみ（`--proxy` 等のオプションは無い）。
+- 引数は `servo_embed_poc <html_path> <out.png>` の位置引数 2 つに加え、4.2 の差分で `--proxy URL`（必須）を受け取る。元の PoC は `--proxy` を持たない。
 - 出力寸法は 1280x800 固定。`sites.json` の viewport（1280x800）と一致するので追加指定は不要。
 - 入力は HTML ファイル（`data:` URL として読み込む）。ハーネスの `{html_path}` placeholder が
   この用途にあたり、撮影直前に対象 URL の HTML をスナップショットとして 1 回取得して渡す。
@@ -115,25 +155,62 @@ callback が呼ばれないことと推定されている（Servo 0.3.0 の描�
   `data:` origin に由来する制約、動的リクエスト、取得時刻の差なども残る。
   ネットワークを完全に遮断した環境ではこれらのサブリソースは取得されず、無スタイルに近い
   描画になる。いずれの場合も差が SSIM に与える影響は測定時に必ず記録する（7 章の記録テンプレート）。
-- `servo-embed` はプロキシ引数を持たない。ハーネスは `{proxy}` を含まない `--servo-cmd` を
-  既定で拒否する。`--allow-unproxied-engine` はそれを外すフラグだが、README と CLI の定義どおり
-  **ネットワークを完全に遮断した環境専用**であり、実サイトへ接続できる環境では使わない。
-  理由（SSRF）: スナップショットの `<base href>` により Servo がサブリソースを取得する通信は
-  検証プロキシを迂回するため、内部アドレス・メタデータアドレスへアクセスし得る。
-- **実サイト撮影の保留（オーナー判断 2026-10-10・#55）**: 検証プロキシを通せる Servo 撮影
-  コマンドができるまで、ネットワーク接続下での Servo 撮影は行わない。後続 Issue:
-  #837（プロキシ対応の Servo 撮影コマンド）。
+- 元の `servo-embed` はプロキシ引数を持たないが、4.2 の差分を当てたものは `{proxy}` を受け取る。
+  ハーネスは `{proxy}` を含まない `--servo-cmd` を既定で拒否する。`--allow-unproxied-engine` は
+  **ネットワークを完全に遮断した環境専用**であり、実サイトへ接続できる環境では使わない
+  （スナップショットの `<base href>` で Servo が取得するサブリソースが検証プロキシを迂回し、
+  内部アドレス・メタデータアドレスへアクセスし得るため。SSRF）。
+- 経路強制の検証（多層防御。WebSocket はプロキシに強制されないため隔離の代替にはならない）: ハーネスは `{proxy}` 使用時にエンジン環境へプロキシを設定し `no_proxy` を除去する。
+  外部サブリソースを参照するページでプロキシ接続が 0 件なら `failed`、Linux では直接接続も検出する
+  （README「Servo 撮影コマンド」）。実 Servo で実際に強制されるかは本作業で確認する。
 
 ## 5. 撮影（`capture_screenshots.py`）
 
-### 5.1 実サイト撮影（保留）
+### 5.1 実サイト撮影（保留。ネットワーク隔離が再開条件）
 
-`sites.json` の実サイトを Servo で撮影する手順は、検証プロキシを通せる Servo 撮影コマンド
-（#837）ができるまで保留とする（4.3 の SSRF の理由）。本書にはネットワーク接続下で
-`--allow-unproxied-engine` を使う手順・コマンド例を載せない。再開時は、その撮影コマンドが
-`{proxy}` を受け取れること（README「Servo（servoshell）のプロキシ対応について」）を確認し、
-本節を更新する。保留中も、2 章のハーネス自己テスト・3 章の Chromium 導入・4.2 の診断版
-servo-embed の単体 PNG 確認までは実行できる。
+**保留中は本節のコマンドを接続下で実行しない**。再開条件は、撮影プロセスツリーがプロキシ
+以外へ通信できないことを事前に強制する隔離（ネットワーク名前空間等でループバックの
+検証プロキシのみ到達可能にする）が用意され、その効果を確認できていること。`--egress-guard`
+単独では再開条件を満たさない（事後検出のため）。以下は隔離が整った環境向けの手順の草案。
+
+前提: 4.2 の `--proxy` 対応版 `servo_embed_poc` をビルド済みで、Linux 上で実行する
+（`--egress-guard` は Linux 専用。非 Linux では Servo が `skipped` になる）。
+
+```bash
+OUT=/path/to/render-out
+SERVO_BIN=/path/to/servo-target/release/servo_embed_poc
+
+# 1) 展開後のコマンドを確認する（{proxy} が含まれること）
+python3 harness/render-screenshot/capture_screenshots.py \
+  --out-dir "$OUT" \
+  --engines servo,chromium \
+  --servo-cmd "[\"$SERVO_BIN\", \"{html_path}\", \"{out}\", \"--proxy\", \"{proxy}\"]" \
+  --dry-run
+
+# 2) 実行する（--dry-run を外す）
+python3 harness/render-screenshot/capture_screenshots.py \
+  --out-dir "$OUT" \
+  --engines servo,chromium \
+  --servo-cmd "[\"$SERVO_BIN\", \"{html_path}\", \"{out}\", \"--proxy\", \"{proxy}\"]"
+```
+
+3) `$OUT/capture-result.json` の `captures[]` を確認する。
+
+- Servo の各行の `proxy.allowed`（プロキシ経由で通った件数）が、サブリソースを持つサイトで 1 以上であること
+- `proxy.denied` / `denied_targets` に内部アドレス宛の拒否があれば記録する（拒否自体は正常動作）
+- `proxy.egress_guard` が `enforced` であること。`violation` は直接接続の検出で、その撮影は
+  `failed`（`stderr_tail` に `unproxied connection detected`）。この場合は pref が効いていない
+  可能性があるので結果を 7 章に記録し、PNG を比較に使わない
+- エンジンだけを別ネットワーク名前空間へ隔離した場合、`egress_guard` は監視プロセスの
+  `/proc/net` に対象のソケットが現れないため `GuardUnavailable`（`proxy.egress_guard` が
+  `unavailable`、撮影は `failed`）になる。`enforced` とは記録されない。隔離下で撮影を再開する
+  際は、ガードを `enforced` に頼らず名前空間側の遮断を正とし、ガードの対応（対象 pid の
+  `/proc/<pid>/net` 参照）を別途実装してから再開する
+- `stderr_tail` に `no connections through the filtering proxy` があれば、エンジンがプロキシを
+  使っていない。同様に失敗として記録する
+
+異常があるサイトは失敗として記録し、プロキシを経由しないテンプレートや
+`--allow-unproxied-engine` に切り替えて撮り直さない。
 
 ### 5.2 ネットワークを完全に遮断した環境での実行
 
@@ -167,6 +244,7 @@ python3 harness/render-screenshot/capture_screenshots.py \
 | `--timeout-sec` | 1 回の撮影のタイムアウト | 90 |
 | `--settle-ms` | 描画の待ち時間 | 5000 |
 | `--min-sites` | 両エンジンで共通して `ok` になるべき最低サイト数 | 5 |
+| `--egress-guard` | 直接接続の検出対象（`servo`・`all`・`none`。Linux 専用） | `servo` |
 | `--allow-unproxied-engine` | `{proxy}` 無しのテンプレートを許可（ネットワークを完全に遮断した環境専用。接続下では使わない） | 無効 |
 
 終了コードは、両エンジンで共通して `ok` のサイト数が `--min-sites` 以上なら 0、未満なら 1、
@@ -215,7 +293,7 @@ Issue #55 へ貼る。数値は `measure-result.json` から転記する。
 | CPU / メモリ | |
 | GL | llvmpipe（Mesa x.y.z） |
 | Chromium | バージョン |
-| Servo | 0.3.0（servo-embed 診断版。paint() 追加の有無: あり / なし） |
+| Servo | 0.3.0（servo-embed 診断版。paint() 追加の有無: あり / なし。`--proxy` 差分: あり） |
 | ハーネス | コミット（git rev-parse --short HEAD） |
 | 実行コマンド | capture_screenshots.py / measure_ssim.py の引数一式 |
 | viewport / settle | 1280x800 / 5000ms |
@@ -228,6 +306,7 @@ Issue #55 へ貼る。数値は `measure-result.json` から転記する。
 | ... | | | | | | |
 
 - 両基準を満たしたサイト数: N / 5（基準 5 以上）
+- 検証プロキシの結果（Servo の `proxy.allowed` / `proxy.denied` の有無と `denied_targets`、`egress_guard` の結果）: 記述
 - 入力条件の差（Servo: スナップショット HTML / Chromium: URL 直接。サブリソースの取得有無・取得時刻・`data:` origin の差を含む）の影響: 記述
 - 失敗・skipped のサイトと stderr_tail の要点: 記述
 - 境界ボックスの取得方法と要素選定: 記述（未測定の場合はその旨）

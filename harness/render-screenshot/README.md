@@ -84,6 +84,7 @@ Chromium 側はローカルに `chromium` / `chromium-browser` / `google-chrome`
 | `--min-sites` | 最低サイト数（`[1, 50]` の範囲のみ許可） | 5 |
 | `--dry-run` | 展開後のコマンドを表示するだけで、実行もファイル作成もしない | ― |
 | `--allow-file-url` | `{html_path}` 用スナップショット取得で `file:` を許可する（テスト専用） | ― |
+| `--egress-guard` | 撮影プロセスの検証プロキシ迂回（直接接続）を Linux の `/proc` で検出する対象。`servo`（既定。Servo のみ）・`all`・`none`（完全遮断環境専用）。非 Linux では対象エンジンを `skipped` にする（下記「Servo 撮影コマンド」） | `servo` |
 | `--allow-unproxied-engine` | コマンドテンプレートが `{proxy}` を使わなくても撮影を許可する（ネットワークを完全に遮断したテスト環境専用。下記「ローカル転送プロキシ」参照） | ― |
 
 `--engines` にカンマ区切りで同じエンジン名を重複指定した場合（例: `servo,servo`）は
@@ -180,6 +181,12 @@ script/img/css・`{url}` 直接ナビゲーションのリダイレクト先・�
 **このプロキシで防げないこと（正直に書く。REPAIR-3）**:
 
 - UDP（WebRTC/STUN・QUIC 等）はプロキシを経由しないため制限できない
+- **WebSocket の直接接続**: Servo 0.3.0 の `servo-net/websocket_loader.rs` は
+  `TcpStream::connect` で直接接続し、HTTP クライアントの `ProxyConnector` を通らない。
+  プロキシ preference では強制できず、WebSocket を無効にする preference も無い（ソース確認）。
+  Linux では `--egress-guard`（`/proc` のポーリング）が検出して撮影を `failed` にするが、
+  短命な接続は取りこぼす best-effort である。撮影中の JS 無効化は Chromium との入力条件が
+  ずれて SSIM 比較の意味が変わるため採っていない（オーナー判断事項）
 - `file:` 等プロキシの対象外のスキームは制限できない
 - エンジンがプロキシ設定を無視・迂回する実装だった場合は防げない（`{proxy}`
   を含むテンプレートで起動していることは確認できるが、エンジンが実際に
@@ -196,16 +203,47 @@ script/img/css・`{url}` 直接ナビゲーションのリダイレクト先・�
 #### Servo（servoshell）のプロキシ対応について
 
 Servo 本体は `network_http_proxy_uri` / `network_https_proxy_uri` /
-`network_http_no_proxy` という preference を持ち（`components/config/prefs.rs`）、
-servoshell の `--pref` 引数から設定できる（例:
-`--pref network_http_proxy_uri=http://127.0.0.1:PORT --pref
-network_https_proxy_uri=http://127.0.0.1:PORT`）。ソースコードの調査では
-この preference の存在までは確認できたが、**実機の servoshell バイナリで
-実際にこのプロキシ経由の通信が強制されることまでは本ハーネスから検証していない**
-（TASK-36／#50・#55 の人間による実機検証の範囲）。そのため `--servo-cmd` の
-テンプレートにも他エンジンと同様 `{proxy}` を必須にし（`--allow-unproxied-engine`
-無しでは `{proxy}` を含まない `--servo-cmd` は撮影を拒否する）、実際に上記の
-`--pref` を使うかはユーザー・実機検証側の判断とする。
+`network_http_no_proxy` という preference を持つ（`components/config/prefs.rs`）。
+`Preferences::default()` は環境変数 `http_proxy`・`https_proxy`・`no_proxy` を読み、
+HTTP クライアントの `ProxyConnector` が起動時に設定した preference を参照する
+（Servo 0.3.0 のソースで確認）。ただし**実機の Servo バイナリが実際に全通信を
+プロキシへ流すことは本ハーネスの自己テスト（偽エンジン）では検証できない**。
+それは #55 の人間による実機検証の範囲で、下記「Servo 撮影コマンド」の
+`proxy` キーと `--egress-guard` の結果で確認する。
+
+### Servo 撮影コマンド（検証プロキシ経由。TASK-37 / RENDER-5）
+
+`servo-embed` の複製に `--proxy` 対応の差分を当てたバイナリ（差分は
+[RUNBOOK.md](RUNBOOK.md) 4.2）を、`{proxy}` つきのテンプレートで起動する。
+
+```json
+["servo_embed_poc", "{html_path}", "{out}", "--proxy", "{proxy}"]
+```
+
+ハーネスは次の多層防御を行う（いずれも通信経路の強制が目的で、UA 等の識別面は変えない）。
+
+- `{proxy}` 使用時、エンジンの環境変数 `http_proxy`・`https_proxy`（大文字も）を
+  検証プロキシに揃え、`no_proxy`・`all_proxy`（大文字も）を取り除く。Servo の
+  `Preferences::default()` が環境変数を読むため、`NO_PROXY=*` 等による除外迂回を防ぐ。
+  `{proxy}` を使わないテンプレート（`--allow-unproxied-engine`）では環境に手を入れない
+- プロキシは許可・拒否を数え、結果 JSON の各 capture に任意キー `proxy` を付ける:
+  `{"allowed": N, "denied": M, "denied_targets": ["169.254.169.254:80", ...], "egress_guard": "off|enforced|violation|unavailable"}`
+  （`{proxy}` 使用時のみ。`denied_targets` は host:port で、撮影単位で重複排除し最大 50 件（別サイト・別エンジンで同じ宛先が拒否されても、その撮影の行に現れる）、クエリは記録しない。
+  `measure_ssim.py` は未知キーを無視する）
+- **fail-closed（プロキシ未使用）**: `{html_path}` のスナップショットが `http(s)` で解決される
+  外部サブリソース（`script`・`img`・`source`・`iframe` の `src`、stylesheet / icon / preload の
+  `link[href]`。相対 URL は `<base href>` で解決）を参照するのに、エンジン実行中のプロキシ接続が
+  0 件なら、PNG が出ていても `failed` にし `stderr_tail` に理由を残す。参照ゼロのページには
+  適用しない。**「一度もプロキシを使わなかった」ことの検出であり、一部だけ迂回する場合は検出できない**
+- **fail-closed（直接接続）**: `--egress-guard`（既定 `servo`）が有効なエンジンのプロセスツリーの
+  ソケットを `/proc` から 25 ms 間隔で調べ、`127.0.0.1` の検証プロキシ以外への接続を見つけたら
+  ツリーを終了して `failed`（`unproxied connection detected: <addr>`）にする。Linux 専用で、
+  非 Linux では対象エンジンを `skipped` にする（`--egress-guard none` でのみ解除。完全遮断環境専用）。
+  Chromium は背景通信の誤検出リスクがあるため既定では対象外。短命な接続の取りこぼし、未接続 UDP の
+  送信先が見えないことなど限界がある。FD・ソケット表を読めず監視できなくなった場合は
+  ツリーを終了して `failed`（`egress guard unavailable: ...`・`egress_guard` は `unavailable`）にし、
+  `enforced` とは記録しない。接続後の事後検出のため SSRF の副作用は防げず、実サイト撮影の再開には
+  ネットワーク隔離が要る（RUNBOOK 5.1）。ネットワーク名前空間での隔離は将来の拡張候補
 
 ### `{url}` 直接ナビゲーションの許可リスト（多層防御）
 
@@ -332,6 +370,7 @@ servoshell 系（TASK-36 で確定したオプション名に合わせて読み�
 `viewport` と不一致・エンジンバイナリ不在等でプロセスを起動できなかった場合を含む）/
 `timeout` / `skipped`（`{html_path}` のスナップショット取得に失敗した場合）のいずれか。
 `partial` キーは `--engines` で 1 エンジンのみを指定した実行にのみ付く。
+`captures[].proxy` は任意キー（上記「Servo 撮影コマンド」）。
 `input` は `"url"`（テンプレートが `{url}` を直接使う）・`"snapshot"`
 （`{html_path}` 経由でスナップショットを使う）・`"snapshot+url"`
 （`{html_path}` と `{url}` を両方使うテンプレートで、エンジンへスナップショットの

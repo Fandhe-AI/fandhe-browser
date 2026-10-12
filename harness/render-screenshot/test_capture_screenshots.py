@@ -24,11 +24,19 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import capture_screenshots as cs  # noqa: E402
+import egress_guard as eg  # noqa: E402
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 FAKE_ENGINE = FIXTURES_DIR / "fake_engine.py"
 SITE_CONDITIONAL_ENGINE = FIXTURES_DIR / "site_conditional_engine.py"
 DEFAULT_SITES_PATH = Path(__file__).resolve().parent / "sites.json"
+
+
+def setUpModule() -> None:  # noqa: N802
+    # 既存の結合テストは OS 非依存（macOS・Windows でも実行）なので、CLI 既定の
+    # 送信先ソケット監視（Linux のみ）を切る。監視自体は EgressGuardTest が
+    # `egress_guard_mode="servo"` を明示して検証する。
+    cs.DEFAULT_EGRESS_GUARD = "none"
 
 
 def fake_engine_template(mode: str = "ok") -> list[str]:
@@ -2502,6 +2510,426 @@ class ArgValidationTest(unittest.TestCase):
         self.assertEqual(args.timeout_sec, 30.0)
         self.assertEqual(args.settle_ms, 1000)
         self.assertEqual(args.min_sites, 3)
+
+PROXY_PROBE_ENGINE = FIXTURES_DIR / "proxy_probe_engine.py"
+
+
+def probe_template(mode: str = "proxied", *, extra: list[str] | None = None) -> list[str]:
+    """`proxy_probe_engine.py` を `{html_path}` + `{proxy}` で起動するテンプレート。"""
+    return [
+        sys.executable,
+        str(PROXY_PROBE_ENGINE),
+        "--mode",
+        mode,
+        "--html",
+        "{html_path}",
+        "--out",
+        "{out}",
+        "--width",
+        "{width}",
+        "--height",
+        "{height}",
+        "--proxy",
+        "{proxy}",
+        *(extra or []),
+    ]
+
+
+class ProxyAuditCaptureTest(unittest.TestCase):
+    """RENDER-5 / TASK-37: 検証プロキシの通信監査・fail-closed・環境変数の強制。"""
+
+    def setUp(self) -> None:
+        self.server, self.thread, self.proxy_url = cs.start_filtering_proxy()
+        self.addCleanup(cs.stop_filtering_proxy, self.server, self.thread)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def _page(self, body: str) -> cs.Site:
+        page = self.root / "page.html"
+        page.write_text(f"<html><head></head><body>{body}</body></html>", encoding="utf-8")
+        return cs.Site(site_id="probe", url=page.as_uri(), category="static", catalog_id="z1")
+
+    def _capture(self, site: cs.Site, template: list[str], **kwargs: object) -> dict:
+        return cs.capture_one(
+            site,
+            "servo",
+            template,
+            out_dir=self.root / "out",
+            snapshots_dir=self.root / "out" / "snapshots",
+            chromium_bin=None,
+            width=64,
+            height=48,
+            settle_ms=0,
+            timeout_sec=20,
+            allow_file_url=True,
+            dry_run=False,
+            proxy_url=self.proxy_url,
+            proxy_audit=self.server.audit,
+            **kwargs,
+        )
+
+    def test_internal_address_subresources_are_denied_and_never_reach_canary(self) -> None:
+        import socket as socket_module  # noqa: PLC0415
+
+        canary = socket_module.socket()
+        canary.bind(("127.0.0.1", 0))
+        canary.listen(8)
+        canary.settimeout(0.3)
+        self.addCleanup(canary.close)
+        canary_port = canary.getsockname()[1]
+        body = (
+            f'<img src="http://127.0.0.1:{canary_port}/x">'
+            '<img src="http://169.254.169.254/latest/meta-data/">'
+            '<script src="http://localhost/a.js"></script>'
+            '<img src="http://[::1]/b.png">'
+            '<link rel="stylesheet" href="https://10.0.0.1/c.css">'
+        )
+        record = self._capture(self._page(body), probe_template(extra=["--report", str(self.root / "report.json")]))
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(record["proxy"]["allowed"], 0)
+        self.assertEqual(record["proxy"]["denied"], 5)
+        targets = record["proxy"]["denied_targets"]
+        for expected in ("169.254.169.254:80", "localhost:80", "::1:80", "10.0.0.1:443"):
+            self.assertIn(expected, targets)
+        report = json.loads((self.root / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual([r["status"] for r in report], [403, 403, 403, 403, None])
+        with self.assertRaises(OSError):
+            canary.accept()  # canary への接続は 0 件
+
+    def test_public_address_subresource_is_allowed_and_counted(self) -> None:
+        # 実ネットワークに出ないよう、名前解決を TEST-NET ではなく公開扱いの
+        # ループバック上の待受へ差し替える。
+        import socket as socket_module  # noqa: PLC0415
+
+        upstream = socket_module.socket()
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen(4)
+        upstream.settimeout(5)
+        self.addCleanup(upstream.close)
+        up_port = upstream.getsockname()[1]
+
+        def serve() -> None:
+            try:
+                conn, _ = upstream.accept()
+                conn.recv(4096)
+                conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                conn.close()
+            except OSError:
+                pass
+
+        threading.Thread(target=serve, daemon=True).start()
+        site = self._page('<img src="http://example.test/a.png">')
+        with mock.patch.object(cs, "_resolve_public_addresses", return_value=[("127.0.0.1", up_port)]):
+            record = self._capture(site, probe_template())
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(record["proxy"], {"allowed": 1, "denied": 0, "denied_targets": [], "egress_guard": "off"})
+
+    def test_engine_that_never_uses_proxy_fails_when_snapshot_has_subresources(self) -> None:
+        record = self._capture(self._page('<img src="https://example.test/a.png">'), probe_template("silent"))
+        self.assertEqual(record["status"], "failed")
+        self.assertIsNone(record["png"])
+        self.assertIn("no connections through the filtering proxy", record["stderr_tail"])
+        self.assertEqual(record["proxy"]["allowed"] + record["proxy"]["denied"], 0)
+
+    def test_engine_without_proxy_use_is_ok_when_snapshot_has_no_subresources(self) -> None:
+        record = self._capture(self._page('<a href="https://example.test/">x</a><img src="data:image/png;base64,AA==">'), probe_template("silent"))
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(record["proxy"], {"allowed": 0, "denied": 0, "denied_targets": [], "egress_guard": "off"})
+
+    def test_engine_environment_forces_proxy_and_drops_no_proxy(self) -> None:
+        dump = self.root / "env.json"
+        hostile = {"NO_PROXY": "*", "no_proxy": "*", "http_proxy": "http://evil.invalid:1", "ALL_PROXY": "http://evil.invalid:2"}
+        with mock.patch.dict(os.environ, hostile):
+            record = self._capture(
+                self._page("<p>no refs</p>"), probe_template("silent", extra=["--dump-env", str(dump)])
+            )
+        self.assertEqual(record["status"], "ok")
+        env = json.loads(dump.read_text(encoding="utf-8"))
+        for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            self.assertEqual(env[key], self.proxy_url)
+        for key in ("no_proxy", "NO_PROXY", "all_proxy", "ALL_PROXY"):
+            self.assertIsNone(env[key])
+
+    def test_subresource_detection_resolves_relative_refs_with_base_href(self) -> None:
+        page = self.root / "s.html"
+        page.write_text('<base href="https://example.test/"><link rel="stylesheet" href="a.css">', encoding="utf-8")
+        self.assertTrue(cs.snapshot_references_network_subresources(page))
+        page.write_text('<base href="file:///tmp/"><img src="a.png"><link rel="canonical" href="https://x.test/">', encoding="utf-8")
+        self.assertFalse(cs.snapshot_references_network_subresources(page))
+
+    def test_subresource_detection_fails_closed_when_ref_cap_is_exceeded(self) -> None:
+        page = self.root / "cap.html"
+        data_imgs = '<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">' * cs.SNAPSHOT_MAX_SUBRESOURCE_REFS
+        page.write_text(data_imgs + '<img src="https://example.test/late.png">', encoding="utf-8")
+        self.assertTrue(cs.snapshot_references_network_subresources(page))
+        page.write_text(data_imgs, encoding="utf-8")
+        self.assertFalse(cs.snapshot_references_network_subresources(page))
+
+    def test_servo_template_with_proxy_flag_expands_in_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sites = Path(tmp) / "sites.json"
+            write_sites_json(sites, [make_site(f"s{i}") for i in range(5)])
+            template = json.dumps(["servo_embed_poc", "{html_path}", "{out}", "--proxy", "{proxy}"])
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cs.main(
+                    ["--sites", str(sites), "--out-dir", str(Path(tmp) / "o"), "--engines", "servo",
+                     "--servo-cmd", template, "--dry-run"]
+                )
+            self.assertEqual(code, 0)
+            self.assertIn("servo_embed_poc", out.getvalue())
+            self.assertIn("--proxy <proxy>", out.getvalue())
+
+    def test_measure_ssim_ignores_proxy_key_in_capture_result(self) -> None:
+        import measure_ssim as ms  # noqa: PLC0415
+
+        out_dir = self.root / "m"
+        out_dir.mkdir()
+        record = {
+            "site_id": "s0", "engine": "servo", "status": "failed", "png": None, "width": None,
+            "height": None, "duration_ms": 1, "exit_code": 0, "stderr_tail": "", "command": ["x"],
+            "input": "snapshot", "proxy": {"allowed": 0, "denied": 1, "denied_targets": ["a:80"]},
+        }
+        payload = {
+            "schema_version": 1, "generated_at": "2026-01-01T00:00:00Z",
+            "viewport": {"width": 64, "height": 48},
+            "sites": [{"id": "s0", "url": "https://example.test/", "category": "static", "catalog_id": "z1"}],
+            "captures": [record],
+        }
+        (out_dir / "capture-result.json").write_text(json.dumps(payload), encoding="utf-8")
+        viewport, pairs, skipped = ms.load_capture_result(out_dir)
+        self.assertEqual(viewport, {"width": 64, "height": 48})
+        self.assertEqual(pairs, [])
+        self.assertEqual([entry["site_id"] for entry in skipped], ["s0"])
+
+
+class ParseNetLineTest(unittest.TestCase):
+    """RENDER-5 / TASK-37: /proc/net/tcp 行のパース（IPv4・IPv6・v4-mapped）。"""
+
+    def test_ipv4_established(self) -> None:
+        line = "   0: 0100007F:C350 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000000 20 4 30 10 -1"
+        self.assertEqual(eg.parse_net_line(line), ("127.0.0.1", 8080, 1, 12345, 50000))
+
+    def test_ipv6_loopback(self) -> None:
+        line = "   0: 00000000000000000000000001000000:C350 00000000000000000000000001000000:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 777 1 0000000000000000 20 4 30 10 -1"
+        self.assertEqual(eg.parse_net_line(line), ("::1", 443, 1, 777, 50000))
+
+    def test_ipv6_v4_mapped_is_folded_to_ipv4(self) -> None:
+        line = "   0: 0000000000000000FFFF00000100007F:C350 0000000000000000FFFF00000100A8C0:0050 01 00000000:00000000 00:00000000 00000000  1000        0 888 1 0000000000000000 20 4 30 10 -1"
+        self.assertEqual(eg.parse_net_line(line), ("192.168.0.1", 80, 1, 888, 50000))
+
+    def test_header_and_garbage_lines_are_rejected(self) -> None:
+        self.assertIsNone(eg.parse_net_line("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"))
+        self.assertIsNone(eg.parse_net_line("zz"))
+        self.assertIsNone(eg.parse_net_line("0: XYZ:1 XYZ:2 01 0 0 0 0 0 5"))
+
+
+class EgressGuardTest(unittest.TestCase):
+    """RENDER-5 / TASK-37: 送信先ソケット監視（Linux のみ・best-effort）。"""
+
+    def setUp(self) -> None:
+        self.server, self.thread, self.proxy_url = cs.start_filtering_proxy()
+        self.addCleanup(cs.stop_filtering_proxy, self.server, self.thread)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        page = self.root / "page.html"
+        page.write_text("<html><body><p>no refs</p></body></html>", encoding="utf-8")
+        self.site = cs.Site(site_id="g", url=page.as_uri(), category="static", catalog_id="z1")
+
+    def _capture(self, template: list[str], engine: str = "servo", mode: str = "servo") -> dict:
+        return cs.capture_one(
+            self.site,
+            engine,
+            template,
+            out_dir=self.root / "out",
+            snapshots_dir=self.root / "out" / "snapshots",
+            chromium_bin=None,
+            width=64,
+            height=48,
+            settle_ms=0,
+            timeout_sec=20,
+            allow_file_url=True,
+            dry_run=False,
+            proxy_url=self.proxy_url,
+            proxy_audit=self.server.audit,
+            egress_guard_mode=mode,
+        )
+
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
+    def test_direct_connection_is_detected_and_fails_capture(self) -> None:
+        import socket as socket_module  # noqa: PLC0415
+
+        canary = socket_module.socket()
+        canary.bind(("127.0.0.1", 0))
+        canary.listen(4)
+        self.addCleanup(canary.close)
+        port = canary.getsockname()[1]
+        record = self._capture(
+            probe_template("direct", extra=["--direct-connect", f"127.0.0.1:{port}", "--hold-ms", "5000"])
+        )
+        self.assertEqual(record["status"], "failed")
+        self.assertIn(f"unproxied connection detected: 127.0.0.1:{port}", record["stderr_tail"])
+        self.assertEqual(record["proxy"]["egress_guard"], "violation")
+
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
+    def test_engine_using_only_the_proxy_stays_ok(self) -> None:
+        record = self._capture(probe_template("silent"))
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(record["proxy"]["egress_guard"], "enforced")
+
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
+    def test_chromium_is_not_guarded_by_default_servo_mode(self) -> None:
+        import socket as socket_module  # noqa: PLC0415
+
+        canary = socket_module.socket()
+        canary.bind(("127.0.0.1", 0))
+        canary.listen(4)
+        self.addCleanup(canary.close)
+        record = self._capture(
+            probe_template("direct", extra=["--direct-connect", f"127.0.0.1:{canary.getsockname()[1]}", "--hold-ms", "200"]),
+            engine="chromium",
+        )
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(record["proxy"]["egress_guard"], "off")
+
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
+    def test_missing_engine_binary_still_closes_audit_window(self) -> None:
+        record = self._capture(["/nonexistent/engine-binary", "{html_path}", "{proxy}", "{out}"])
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["proxy"]["egress_guard"], "enforced")
+        self.assertEqual(self.server.audit._windows, {})
+
+    def test_process_listing_over_cap_is_unavailable(self) -> None:
+        with mock.patch.object(eg, "MAX_PROCESSES", 1):
+            with self.assertRaises(eg.GuardUnavailable):
+                eg._descendant_pids(os.getpid())
+
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
+    def test_fd_listing_over_cap_is_unavailable(self) -> None:
+        with mock.patch.object(eg, "MAX_FDS_PER_PROCESS", 0):
+            with self.assertRaises(eg.GuardUnavailable):
+                eg._socket_inodes({os.getpid()})
+
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
+    def test_different_network_namespace_is_unavailable(self) -> None:
+        """監視対象が別ネットワーク名前空間なら /proc/net に現れないため GuardUnavailable（RENDER-5）。"""
+        real = os.readlink
+
+        def fake_readlink(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if str(path) == f"/proc/{os.getpid()}/ns/net":
+                return "net:[4026539999]"
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(eg.os, "readlink", side_effect=fake_readlink):
+            with self.assertRaises(eg.GuardUnavailable) as ctx:
+                eg.find_unproxied_connections(os.getpid(), 1)
+        self.assertIn("different network namespace", str(ctx.exception))
+
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
+    def test_same_network_namespace_is_accepted(self) -> None:
+        eg._check_same_netns({os.getpid()})
+
+    def test_guarded_engine_is_skipped_when_platform_is_unsupported(self) -> None:
+        with mock.patch.object(eg, "egress_guard_supported", return_value=False):
+            record = self._capture(probe_template("silent"))
+        self.assertEqual(record["status"], "skipped")
+        self.assertIn("egress guard is unavailable on this platform", record["stderr_tail"])
+        self.assertFalse((self.root / "out" / "servo" / "g.png").exists())
+
+    def test_none_mode_runs_even_when_platform_is_unsupported(self) -> None:
+        with mock.patch.object(eg, "egress_guard_supported", return_value=False):
+            record = self._capture(probe_template("silent"), mode="none")
+        self.assertEqual(record["status"], "ok")
+
+
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
+    def test_unmonitorable_guard_fails_capture_and_is_not_recorded_as_enforced(self) -> None:
+        import socket as socket_module  # noqa: PLC0415
+
+        canary = socket_module.socket()
+        canary.bind(("127.0.0.1", 0))
+        canary.listen(4)
+        self.addCleanup(canary.close)
+        port = canary.getsockname()[1]
+        with mock.patch.object(eg, "find_unproxied_connections", side_effect=eg.GuardUnavailable("denied")):
+            record = self._capture(
+                probe_template("direct", extra=["--direct-connect", f"127.0.0.1:{port}", "--hold-ms", "5000"])
+            )
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("egress guard unavailable: GuardUnavailable: denied", record["stderr_tail"])
+        self.assertEqual(record["proxy"]["egress_guard"], "unavailable")
+
+    def test_fd_permission_error_is_unmonitorable_but_vanished_process_is_not(self) -> None:
+        with mock.patch.object(eg.os, "listdir", side_effect=PermissionError("eacces")):
+            with self.assertRaises(eg.GuardUnavailable):
+                eg._socket_inodes({4242})
+        with mock.patch.object(eg.os, "listdir", side_effect=FileNotFoundError("gone")):
+            self.assertEqual(eg._socket_inodes({4242}), set())
+
+    def test_supported_requires_readable_fd_links(self) -> None:
+        with mock.patch.object(eg.sys, "platform", "linux"), mock.patch.object(
+            eg.os, "readlink", side_effect=PermissionError("eacces")
+        ):
+            self.assertFalse(eg.egress_guard_supported())
+
+    def test_stop_marks_unavailable_when_thread_stuck(self) -> None:
+        # RENDER-5: 走査が終わらず join が期限切れなら enforced にせず unavailable にし、
+        # 遅れて戻った監視スレッドは on_violation を呼ばない。
+        release = threading.Event()
+        killed: list[int] = []
+
+        def slow_scan(*_a: object, **_k: object) -> list[str]:
+            release.wait(5)
+            return ["203.0.113.1:80"]
+
+        with mock.patch.object(eg, "find_unproxied_connections", side_effect=slow_scan):
+            guard = eg.EgressGuard(1, 1, lambda: killed.append(1))
+            guard.start()
+            guard.stop(join_timeout_sec=0.1)
+            self.assertIn("did not exit", guard.unavailable or "")
+            release.set()
+            guard._thread.join(timeout=5)
+        self.assertEqual(killed, [])
+        self.assertIsNone(guard.violation)
+
+    def test_stop_aborts_scan_in_progress(self) -> None:
+        stop = threading.Event()
+        stop.set()
+        with self.assertRaises(eg._ScanAborted):
+            eg._socket_inodes({os.getpid()}, stop.is_set)
+
+
+class ProxyAuditWindowTest(unittest.TestCase):
+    """RENDER-5 / TASK-37: 拒否先の重複排除と上限は撮影単位の区間で適用する。"""
+
+    def test_same_target_denied_in_later_window_is_reported_again(self) -> None:
+        audit = cs.ProxyAudit()
+        first = audit.snapshot()
+        audit.record("169.254.169.254", 80, allowed=False)
+        audit.record("169.254.169.254", 80, allowed=False)
+        self.assertEqual(
+            audit.delta_since(first),
+            {"allowed": 0, "denied": 2, "denied_targets": ["169.254.169.254:80"]},
+        )
+        second = audit.snapshot()
+        audit.record("169.254.169.254", 80, allowed=False)
+        self.assertEqual(
+            audit.delta_since(second),
+            {"allowed": 0, "denied": 1, "denied_targets": ["169.254.169.254:80"]},
+        )
+
+    def test_cap_applies_per_window_not_globally(self) -> None:
+        audit = cs.ProxyAudit()
+        cap = cs.PROXY_AUDIT_MAX_DENIED_TARGETS
+        first = audit.snapshot()
+        for i in range(cap + 5):
+            audit.record(f"10.0.0.{i % 250}", 1000 + i, allowed=False)
+        self.assertEqual(len(audit.delta_since(first)["denied_targets"]), cap)
+        second = audit.snapshot()
+        audit.record("192.168.0.1", 80, allowed=False)
+        self.assertEqual(audit.delta_since(second)["denied_targets"], ["192.168.0.1:80"])
 
 
 if __name__ == "__main__":
