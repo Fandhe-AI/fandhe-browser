@@ -3,8 +3,8 @@
 //!
 //! `PROF-5` は「プロファイルを削除するとロックが解放され、ルートディレクトリ
 //! ごと全データ（Cookie・KV・キャッシュ・履歴）が消える」ことを定める。
-//! Windows では `Profile::open` が `Unsupported` を返すため Unix 専用とする
-//! （Windows 側の契約は `src/profile.rs` の `#[cfg(windows)]` テストが担う）。
+//! `Profile::delete` は Windows では未実装（常に `Unsupported`。`PROF-5`・TASK-53）の
+//! ため Unix 専用とする。
 
 #![cfg(unix)]
 

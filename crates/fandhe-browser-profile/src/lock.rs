@@ -1,6 +1,6 @@
 //! プロファイルルートの二重 open を防ぐ advisory lock を担うモジュール。
 //!
-//! `profile.rs` の `Profile::open`（unix）から呼ばれ、プロファイルルート
+//! `profile.rs` の `Profile::open`（unix・Windows）から呼ばれ、プロファイルルート
 //! 直下の `profile.lock`（[`LOCK_FILE_NAME`]）に対して排他ロックを取る
 //! （ビヘイビア `PROF-1`、TASK-50（50.3）・#178）。
 //!
@@ -28,12 +28,6 @@
 //! すると、別プロセスが旧 inode のハンドルでロックを保持したまま、新しい
 //! プロセスが新規作成した別 inode に対してロックを取得できてしまい、
 //! 二重 open の検出という目的そのものが壊れるため。
-#![cfg_attr(not(unix), allow(dead_code))]
-// Windows の ACL 隔離（`XOS-7`〜`XOS-10`）が入るまで `Profile::open` が
-// 早期に `Unsupported` を返すため、非 unix ビルドでは本モジュールの型・関数が
-// 未使用（dead_code）になる。テストビルドでは単体テストが使うため許可は不要
-// だが、非テストの Windows ビルドで `-D warnings` に引っかからないよう
-// 明示的に許可する。
 
 use std::fs::{File, TryLockError};
 use std::path::Path;

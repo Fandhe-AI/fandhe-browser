@@ -14,13 +14,16 @@
 //! 差し込む契約であり、本モジュールは実装済みを装わない（REPAIR-3・
 //! code-comment-style.md）。
 //!
-//! - Windows での ACL によるアクセス制限（`XOS-7`〜`XOS-10`）。実装がないため
-//!   `Profile::open` は Windows では常に `Err(ProfileError::Unsupported)` を
-//!   返し、既定 ACL のまま機密データを書き込む偽装成功を避ける（security.md
-//!   「偽装・回避機能の禁止」）。ハンドル基準の作成（unix。下記参照）は
-//!   Windows へは移植しておらず、XOS-7〜XOS-10 実装時にパス文字列でなく
-//!   ハンドル相対（`FILE_FLAG_OPEN_REPARSE_POINT` 等）で作成する要件を
-//!   引き継ぐ（REPAIR-3）
+//! - Windows のアクセス制限（`XOS-7`〜`XOS-10`）は第 1 段階（Issue #928）として、
+//!   ルートが `%LOCALAPPDATA%` 配下のときだけ `Profile::open` が成功する
+//!   （[`crate::local_root`]）。アクセス制限は既定の継承 ACL に依存し（Administrators
+//!   と SYSTEM は読める）、ACL の設定・検証はしない。配下外のルートは
+//!   `Err(ProfileError::Unsupported)` を返してディレクトリを作らず、既定 ACL のまま
+//!   機密データを書き込む偽装成功を避ける（security.md「偽装・回避機能の禁止」）。
+//!   ACL を明示設定して任意のパスを許可する第 2 段階は未実装（後続・未判断）。
+//!   ハンドル基準の作成（unix。下記参照）は Windows へは移植しておらず、境界は
+//!   `canonicalize` による作成前後の判定で守る。ハンドル相対（`FILE_FLAG_OPEN_REPARSE_POINT`
+//!   等）での作成は第 2 段階の要件として引き継ぐ（REPAIR-3）
 //!
 //! 並行アクセス時のデータ分離はデータディレクトリ分離（`PROF-6`）自体で成立し、
 //! `PROF-2`（`tests/isolation.rs`）・`PROF-3`（`tests/concurrent_isolation.rs`。
@@ -53,9 +56,14 @@
 //! でも参照先が変わり得る）。境界判定やファイル操作は unix 限定の
 //! `Profile::root_fd`・`Profile::data_dir_fd` が返す検証済みハンドルを
 //! 起点に `openat` 系 API で行う契約とする。後続タスク（Cookie・Storage 等
-//! の実データ操作）はこの契約に従う。Windows はハンドル基準 API を持たず
-//! （ACL 隔離が未実装で `open` 自体が `Unsupported` になるため）、この契約は
-//! unix 限定である。
+//! の実データ操作）はこの契約に従う。Windows の `open` は、`canonicalize` による事前判定に加え、
+//! ルートまでの各ディレクトリと `profile.lock` を `FILE_SHARE_DELETE` なしで開いて保持し
+//! （`Profile` はルートのディレクトリハンドルと `profile.lock` のハンドルを生存中持つ）、
+//! 改名・削除による別実体への差し替えを防ぐ。ただし保持するハンドルを起点にした
+//! `root_fd`・`data_dir_fd` 相当の操作は Windows に無く（子の作成・オープンはパス基準）、
+//! 空のディレクトリを再解析ポイント化する競合は防げないため、この契約は unix 限定である
+//! （残る競合は `local_root.rs` のモジュール doc「限界」。ハンドル基準への移行は第 2 段階（後続）。Issue #928 の
+//! PR #945 のレビューで判明。Issue #948・#950）。
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -79,8 +87,10 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 // 限定すると Windows ビルドで未使用（`-D warnings`）になる。
 use std::path::Component;
 
+#[cfg(any(unix, windows))]
+use crate::lock;
 #[cfg(unix)]
-use crate::lock::{self, LOCK_FILE_NAME};
+use crate::lock::LOCK_FILE_NAME;
 
 /// プロファイルディレクトリ構築に失敗した際のエラー。
 ///
@@ -116,12 +126,15 @@ pub enum ProfileError {
     /// 現在のプラットフォームではプロファイルの隔離を安全に実施できないため、
     /// あえてプロファイルを作成せず `open` を失敗させる場合に返す。
     ///
-    /// Windows は ACL によるアクセス制限が未実装（`XOS-7`〜`XOS-10`。
-    /// TASK-50（50.1）・#176 のスコープ外）であり、何もせず成功を返すと
-    /// 既定 ACL（親から継承した権限）のまま Cookie・Storage 等の機密データを
-    /// 書き込むことになる。「未実装の機能で成功を一律に返すフォールバックを
-    /// 禁止する」方針（security.md・REPAIR-3）に従い、実効的な隔離ができる
-    /// ようになるまで `open` 自体を拒否する。
+    /// Windows は ACL の設定・検証を実装していない（`XOS-7`〜`XOS-10`）。既定の継承 ACL
+    /// のままであれば本人・Administrators・SYSTEM に限られる `%LOCALAPPDATA%` 配下の
+    /// ルートだけを許可し（Issue #928。配下の既存ディレクトリに独自の ACL が設定されていれば
+    /// この前提は成り立たず、本 crate はそれを確認しない）、それ以外のルートでは
+    /// 何もせず成功を返すと Cookie・Storage 等の機密データが他ユーザーから読める
+    /// 場所に置かれ得るため、`open` 自体を拒否する。「未実装の機能で成功を一律に
+    /// 返すフォールバックを禁止する」方針（security.md・REPAIR-3）による。
+    /// `LOCALAPPDATA` が未設定・相対パス・UNC・`AppData\Local` で終わらない場合、
+    /// 判定に必要な正規化の失敗、不正な名前（予約デバイス名・`:` 等）でも同じ。
     Unsupported {
         /// 未対応の理由を示す英語メッセージ。
         reason: &'static str,
@@ -500,8 +513,13 @@ pub struct Profile {
     // 最後に解放される。一度も読まないため `_` を付けて dead_code を避ける
     // （`ProfileLock` は `Drop` でアンロックする副作用のためだけに保持する。
     // PROF-1、TASK-50（50.3）・#178）。
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     _lock: lock::ProfileLock,
+    /// Windows 限定: 検証済みルートのディレクトリハンドル（削除・改名を共有しない）。
+    /// `Profile` の生存中、ルートを改名・削除によって別実体へ差し替えられないように
+    /// 固定する（空のディレクトリの再解析ポイント化は防げない。`local_root.rs` の「限界」）。`_lock` の後に宣言して、先にロックを解放し、その後にルートの固定を解く。
+    #[cfg(windows)]
+    _root_dir: std::fs::File,
 }
 
 impl Profile {
@@ -525,9 +543,28 @@ impl Profile {
     /// を drop した後もこのファイル自体は残り続ける（unlink しない理由は
     /// [`crate::lock`] のモジュール doc を参照）。
     ///
-    /// Windows では現時点で ACL による隔離を実装していないため、常に
-    /// [`ProfileError::Unsupported`] を返す（何も作成しない。`XOS-7`〜
-    /// `XOS-10` で解消するまでの既知の制約）。
+    /// Windows ではパーミッション 700 の代わりに OS の既定の継承 ACL に依存し、
+    /// ルートが `%LOCALAPPDATA%` の厳密な配下にあるときだけ許可する（新規ルートも
+    /// 既存ルートも通る。Issue #928。`PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`）。既定の
+    /// 継承 ACL のままであれば、`%LOCALAPPDATA%` 配下のディレクトリは SYSTEM・
+    /// Administrators・本人のみにアクセス権が付き、別の標準ユーザーからは読めない
+    /// （Administrators と SYSTEM は読める。実測は #813）。ACL の設定と検証はしない。
+    /// `%LOCALAPPDATA%` 自体、配下外、`LOCALAPPDATA` が未設定・相対パス・UNC・
+    /// `...\AppData\Local` で終わらない場合、不正な名前（予約デバイス名・`:` 等）は何も作らず
+    /// [`ProfileError::Unsupported`] を返す。判定は `canonicalize` 後のパスをコンポーネント
+    /// 単位で比べ（8.3 短縮名・大文字小文字・`\\?\` 表記・`..`・symlink・ジャンクションを
+    /// 正規化または拒否）、`%LOCALAPPDATA%` からルートまでの経路を 1 要素ずつ
+    /// `FILE_SHARE_DELETE` なしで開いてハンドルを保持し（無ければ作る）、`profile.lock` も同様に
+    /// 保持して、改名・削除による差し替えを防ぐ。`Profile` はルートのハンドルと `profile.lock`
+    /// を生存中持つ。ACL を明示設定して任意のパスを許可する第 2 段階は未実装（後続・未判断）。
+    ///
+    /// Windows の限界（作成の途中で空のディレクトリが再解析ポイント化される競合は防げず、
+    /// 配下外に空のディレクトリ・`profile.lock` が作られ得ること、その状態から元に戻されると
+    /// `PROF-1` の二重 open の拒否が破れ得ること、子の作成・オープンがパス基準であること、
+    /// 内側へ向くジャンクションを許可すること、既存ディレクトリの ACL を確認しないこと、
+    /// `profile.lock` の所有者・ハードリンク数を検査しないこと等）は `local_root.rs` の
+    /// モジュール doc「限界」を参照。第 2 段階（親のハンドルを起点にした作成。後続。Issue #928 の
+    /// PR #945 のレビューで判明。Issue #948・#950）で解消する想定。
     ///
     /// # エラー
     ///
@@ -542,8 +579,11 @@ impl Profile {
     /// - 既に別の `Profile` が同じルートの `profile.lock` を保持している場合
     ///   [`ProfileError::Locked`]（この場合データ種別ディレクトリは一切
     ///   作成・変更しない）
-    /// - Windows など ACL 隔離が未実装のプラットフォームでは常に
-    ///   [`ProfileError::Unsupported`]
+    /// - Windows で `%LOCALAPPDATA%` 配下でないルート（`LOCALAPPDATA` の未設定・相対パス・
+    ///   判定不能を含む）、およびその他のプラットフォームでは [`ProfileError::Unsupported`]
+    ///   （何も作成しない）
+    /// - Windows で作成後の再確認が差し替え（ジャンクション等）を検出した場合
+    ///   [`ProfileError::InvalidLayout`]（それまでに作ったディレクトリ・ファイルは消さない）
     pub fn open(root: impl AsRef<Path>) -> Result<Profile, ProfileError> {
         Self::open_impl(root.as_ref(), false)
     }
@@ -556,18 +596,32 @@ impl Profile {
     /// `fchmod` の間の差し替え（TOCTOU）を避ける。新規作成したディレクトリは
     /// `mkdirat(0700)` で作られるため誤って拒否されない。`ExplicitStore` の
     /// `open_or_create` から呼ばれる。
+    ///
+    /// Windows では ACL を検証しない（オーナー判断）ため共有ルートの検査は行わず、
+    /// [`Profile::open`] と同じ `%LOCALAPPDATA%` 配下の判定だけが拒否の根拠になる
+    /// （`PROF-1`・`XOS-10`）。
     pub(crate) fn open_rejecting_shared_root(root: &Path) -> Result<Profile, ProfileError> {
         Self::open_impl(root, true)
     }
 
     fn open_impl(root: &Path, reject_shared_root: bool) -> Result<Profile, ProfileError> {
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // Windows は ACL を設定・検証しないため、`%LOCALAPPDATA%` 配下のルートに限って
+            // 開く（Issue #928。`PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`）。共有ルートの
+            // 拒否（unix の group/other 権限検査）は ACL の検証が要るため行わず、
+            // 配下判定が同じ役割（他者が読めない場所のみ許可）を担う。
+            let _ = reject_shared_root;
+            Self::open_under_local_app_data(root, std::env::var_os("LOCALAPPDATA"))
+        }
+
+        #[cfg(not(any(unix, windows)))]
         {
             // ディレクトリを一切作成せず即座に拒否する（fail-closed。
             // 上記モジュール doc・`ProfileError::Unsupported` 参照）。
             let _ = (root, reject_shared_root);
             Err(ProfileError::Unsupported {
-                reason: "ACL-based directory isolation is not implemented on this platform yet (tracked by XOS-7..XOS-10); refusing to create a profile with inherited, unrestricted permissions",
+                reason: "directory isolation is not implemented on this platform; refusing to create a profile with unrestricted permissions",
             })
         }
 
@@ -648,6 +702,52 @@ impl Profile {
                 _lock: profile_lock,
             })
         }
+    }
+
+    /// Windows 向けの `open` 本体。`local_app_data` は `LOCALAPPDATA` の値で、テストから
+    /// 差し替えられるよう引数で受ける（公開 API は `std::env::var_os` の結果を渡す）。
+    ///
+    /// 手順（詳細は [`crate::local_root`]）: ① 作成前に、ルートが `%LOCALAPPDATA%` の
+    /// 厳密な配下であることを正規化後のパスで判定する（配下外・判定不能は何も作らず
+    /// [`ProfileError::Unsupported`]）、② `%LOCALAPPDATA%` からルートまでを 1 要素ずつ
+    /// 改名・削除を共有しないハンドルで開いて保持し（無ければ作る）、実体が判定どおりで
+    /// あることを `canonicalize` で再確認する、③ `profile.lock` を開いてロックを取る、
+    /// ④ 4 つのデータ種別ディレクトリを作る。③④ の対象はパスで再解決するため、②の後に
+    /// 空のルートが再解析ポイント化される競合は防げない（`local_root.rs` の「限界」）。アクセス制限は既定の継承 ACL に依存し、ACL の
+    /// 設定・検証はしない（`PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`）。
+    #[cfg(windows)]
+    pub(crate) fn open_under_local_app_data(
+        root: &Path,
+        local_app_data: Option<std::ffi::OsString>,
+    ) -> Result<Profile, ProfileError> {
+        use crate::local_root;
+
+        let plan = local_root::plan_root(root, local_app_data)?;
+        // 表示用のルートは unix 側と同じく絶対化した入力（検証済みの実体は `plan` が持つ）。
+        let display_root = std::path::absolute(root)?;
+
+        // `LOCALAPPDATA` からルートまでを 1 要素ずつ開き（無ければ作り）、削除・改名を共有
+        // しないハンドルを保持して経路を固定する（`create_dir_all` は使わない）。これで防げる
+        // のは改名・削除による差し替えまで。空のディレクトリの再解析ポイント化は防げず、後続の
+        // ロックとサブディレクトリの作成はパスで行うため、空のルートが再解析ポイント化されて
+        // 元に戻されると配下外の `profile.lock` のロックを持った `Profile` が返り得る
+        // （`PROF-1` の限界。`local_root.rs` のモジュール doc「限界」。親のハンドルを起点にした作成へ移行して解消する後続課題）。
+        let pinned = local_root::pin_root(&plan)?;
+
+        // ロックはデータ種別ディレクトリより先に取る。2 回目の opener は
+        // ここで `Locked` を返し、data dir には触れない（unix 側と同じ）。
+        let (lock_file, lock_path) = local_root::open_lock_file(plan.expected())?;
+        let profile_lock = lock::try_acquire(lock_file, &lock_path)?;
+
+        local_root::ensure_data_dirs(plan.expected())?;
+
+        // 途中の要素のハンドルはここで閉じ、ルートのハンドルだけを `Profile` が保持する。
+        let root_dir = pinned.into_root_handle()?;
+        Ok(Profile {
+            root: display_root,
+            _lock: profile_lock,
+            _root_dir: root_dir,
+        })
     }
 
     /// プロファイルルートのパスを返す（表示・ログ用）。
@@ -835,8 +935,9 @@ impl Profile {
     /// unlink は無いため、一意名の確認から `rmdir` までの極小の窓は残る
     /// （一意名は推測困難。同一ユーザーの書き込み権限が前提）。
     ///
-    /// Windows では `open` が常に失敗するため到達しないが、成功を装わず
-    /// [`ProfileError::Unsupported`] を返す（`XOS-7`〜`XOS-10`、REPAIR-3）。
+    /// Windows では `open` が `%LOCALAPPDATA%` 配下のルートで成功するため到達し得るが、
+    /// 削除は未実装のため何も消さず [`ProfileError::Unsupported`] を返す
+    /// （`PROF-5`・TASK-53。成功を装わない。REPAIR-3）。
     pub fn delete(self) -> Result<(), ProfileError> {
         #[cfg(not(unix))]
         {
@@ -1854,11 +1955,10 @@ fn open_dir_all_verified(path: &Path) -> Result<OwnedFd, ProfileError> {
 /// 呼び出しの直前に対象を symlink へ差し替える TOCTOU が原理的に生じない
 /// （PR #437 レビュー指摘）。
 ///
-/// Windows は POSIX パーミッションを持たないため、`Profile::open` は本関数へ
-/// 到達する前に `ProfileError::Unsupported` で拒否する（ACL による隔離は
-/// 本 crate の未実装範囲。`XOS-7`〜`XOS-10`。TASK-50（50.1）・#176 のスコープ
-/// 外。coding-rust.md「クロスプラットフォーム」で OS 固有処理を
-/// `cfg(target_os = ...)` に局所化する方針に従う）。
+/// Windows は POSIX パーミッションを持たないため本関数は unix 限定で、Windows の
+/// `Profile::open` は既定の継承 ACL に依存する（`%LOCALAPPDATA%` 配下のみ許可。
+/// `XOS-7`〜`XOS-10`・Issue #928）。coding-rust.md「クロスプラットフォーム」で
+/// OS 固有処理を `cfg(target_os = ...)` に局所化する方針に従う。
 /// ハンドル `fd` のディレクトリが他者にアクセス可能な形（group/other の権限ビット・
 /// setuid/sticky のいずれかが立っている。継承され得る setgid は除く）なら拒否する。
 ///
@@ -2633,18 +2733,358 @@ mod tests {
         drop(first);
     }
 
-    /// PROF-1（Windows 固有）: ACL 隔離が未実装のため、`open` は常に
-    /// `Unsupported` を返し、ディレクトリを一切作成しない（security.md
-    /// 「偽装・回避機能の禁止」。PR #437 レビュー指摘への対応）。
+    // ---- Windows: `%LOCALAPPDATA%` 配下のルートのみ許可（Issue #928。PROF-1・PROF-6・XOS-7・XOS-10） ----
+
+    /// 実環境の `LOCALAPPDATA`（テストの前提。未設定なら失敗させる）。
+    #[cfg(windows)]
+    fn real_local_app_data() -> std::ffi::OsString {
+        std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA must be set on Windows")
+    }
+
+    /// `cmd /C mklink /J` でジャンクションを作る（管理者権限は不要）。失敗はテスト失敗にする。
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) {
+        // cmd.exe は `\\?\` 付きパスを扱えないため、ドライブ形式へ戻して渡す。
+        let plain = |p: &Path| PathBuf::from(p.to_string_lossy().trim_start_matches(r"\\?\"));
+        let output = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(plain(link))
+            .arg(plain(target))
+            .output()
+            .expect("cmd.exe を起動できる");
+        assert!(
+            output.status.success(),
+            "mklink /J failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// 配下判定用の `LOCALAPPDATA` 相当（`<tmp>/AppData/Local`。末尾の形は検証される）を作る。
+    #[cfg(windows)]
+    fn fake_local_app_data(tmp: &TempDir) -> PathBuf {
+        let lad = tmp.path().join("AppData").join("Local");
+        std::fs::create_dir_all(&lad).expect("fake LOCALAPPDATA の作成");
+        lad
+    }
+
+    /// PROF-1・XOS-10（Windows）: 実環境の `%LOCALAPPDATA%` 配下（`std::env::temp_dir()`、
+    /// 8.3 短縮名のままの表記）のルートで `open` が成功し、`profile.lock` と 4 サブ
+    /// ディレクトリが作られる。再 open は成功、二重 open は `Locked`。
+    /// 前提（TEMP が LOCALAPPDATA 配下）が崩れたら skip せず失敗させる。
     #[cfg(windows)]
     #[test]
-    fn prof_1_open_is_unsupported_on_windows() {
-        let tmp = TempDir::new();
-        let err = Profile::open(tmp.path()).expect_err("Windows では常に失敗する");
-        assert!(matches!(err, ProfileError::Unsupported { .. }));
+    fn prof1_windows_open_succeeds_under_real_local_app_data() {
+        let lad = std::fs::canonicalize(real_local_app_data()).expect("LOCALAPPDATA の正規化");
+        let temp = std::fs::canonicalize(std::env::temp_dir()).expect("TEMP の正規化");
         assert!(
-            !tmp.path().exists(),
-            "ACL 隔離を実装できないプラットフォームではディレクトリを作成しない"
+            lad.to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(r"\appdata\local"),
+            "テストの前提: LOCALAPPDATA ({lad:?}) が ...\\AppData\\Local であること"
+        );
+        assert!(
+            crate::local_root::is_strictly_under(&temp, &lad),
+            "テストの前提: TEMP ({temp:?}) が LOCALAPPDATA ({lad:?}) 配下にあること"
+        );
+
+        let tmp = TempDir::new();
+        // 正規化していない `std::env::temp_dir()` 基点（短縮名の可能性）で開く。
+        let root = std::env::temp_dir()
+            .join(tmp.path().file_name().expect("file_name"))
+            .join("root");
+        let first = Profile::open(&root).expect("LOCALAPPDATA 配下のルートは open できる");
+        assert!(root.join("profile.lock").is_file());
+        for name in ["cookies", "storage", "cache", "history"] {
+            assert!(root.join(name).is_dir(), "{name} が作られていない");
+        }
+        assert_eq!(first.root(), std::path::absolute(&root).unwrap().as_path());
+
+        let second = Profile::open(&root).expect_err("二重 open は拒否される");
+        assert!(matches!(second, ProfileError::Locked { .. }), "{second:?}");
+        drop(first);
+        drop(Profile::open(&root).expect("解放後の再 open は成功する"));
+    }
+
+    /// XOS-10（Windows）: `LOCALAPPDATA` 配下の判定は大文字小文字の違い・verbatim 表記・
+    /// 既存ルートの再 open でも成功する。
+    #[cfg(windows)]
+    #[test]
+    fn xos10_windows_open_accepts_case_variant_and_verbatim() {
+        let tmp = TempDir::new();
+        let lad = fake_local_app_data(&tmp);
+        let env = Some(lad.clone().into_os_string());
+
+        // 大文字小文字だけが異なる表記（NTFS の既定は大文字小文字を区別しない）。
+        let upper = PathBuf::from(lad.to_string_lossy().to_uppercase()).join("case");
+        drop(Profile::open_under_local_app_data(&upper, env.clone()).expect("大文字表記"));
+        assert!(lad.join("case").join("profile.lock").is_file());
+
+        // verbatim 表記（`TempDir` は正規化済みのため `\\?\` 付き）。
+        assert!(lad.to_string_lossy().starts_with(r"\\?\"), "{lad:?}");
+        let verbatim = lad.join("verbatim");
+        drop(Profile::open_under_local_app_data(&verbatim, env.clone()).expect("verbatim 表記"));
+        assert!(verbatim.join("cookies").is_dir());
+
+        // 非 verbatim の LOCALAPPDATA 表記でも、同じ実体なら配下と判定される。
+        let plain_env = Some(
+            lad.to_string_lossy()
+                .trim_start_matches(r"\\?\")
+                .to_string()
+                .into(),
+        );
+        drop(
+            Profile::open_under_local_app_data(&verbatim, plain_env).expect("非 verbatim の base"),
+        );
+    }
+
+    /// PROF-1・XOS-10（Windows）: 配下外・`LOCALAPPDATA` と同一・親・兄弟・前方一致だけの
+    /// 名前・UNC・デバイスパスは `Unsupported` で、ディレクトリを作らない。
+    #[cfg(windows)]
+    #[test]
+    fn xos10_windows_open_rejects_outside_roots_without_creating() {
+        let tmp = TempDir::new();
+        let lad = fake_local_app_data(&tmp);
+        let evil = tmp.path().join("AppData").join("LocalEvil");
+        std::fs::create_dir(&evil).unwrap();
+        let env = Some(lad.clone().into_os_string());
+
+        let candidates = [
+            lad.clone(),
+            tmp.path().join("AppData"),
+            tmp.path().join("sibling"),
+            evil.join("p"),
+            PathBuf::from(r"\\server\share\p"),
+            PathBuf::from(r"\\.\C:\fandhe-928-device"),
+            PathBuf::from(r"\\?\GLOBALROOT\Device\fandhe-928"),
+            PathBuf::from(r"C:fandhe-928-drive-relative"),
+        ];
+        for root in candidates {
+            let err = Profile::open_under_local_app_data(&root, env.clone())
+                .expect_err("配下外は拒否される");
+            assert!(
+                matches!(err, ProfileError::Unsupported { .. }),
+                "{root:?}: {err:?}"
+            );
+        }
+        assert!(!tmp.path().join("sibling").exists());
+        assert!(!evil.join("p").exists());
+        assert!(
+            !lad.join("profile.lock").exists(),
+            "LOCALAPPDATA そのものには作らない"
+        );
+    }
+
+    /// XOS-10（Windows）: `LOCALAPPDATA` が未設定・空・相対・存在しない場合は何も作らず拒否。
+    #[cfg(windows)]
+    #[test]
+    fn xos10_windows_open_rejects_unusable_local_app_data() {
+        let tmp = TempDir::new();
+        let root = tmp.path().join("root");
+        for value in [
+            None,
+            Some(std::ffi::OsString::new()),
+            Some(std::ffi::OsString::from(r"relative\dir")),
+            Some(tmp.path().join("missing").into_os_string()),
+        ] {
+            let err = Profile::open_under_local_app_data(&root, value.clone())
+                .expect_err("LOCALAPPDATA が不正なら拒否される");
+            assert!(
+                matches!(err, ProfileError::Unsupported { .. }),
+                "{value:?}: {err:?}"
+            );
+        }
+        assert!(!tmp.path().exists(), "何も作らない");
+    }
+
+    /// PROF-4・XOS-10（Windows）: `..` で配下外へ出るパスは、通常表記・verbatim 表記とも拒否される。
+    #[cfg(windows)]
+    #[test]
+    fn xos10_windows_open_rejects_dotdot_escape() {
+        let tmp = TempDir::new();
+        let lad = fake_local_app_data(&tmp);
+        let env = Some(lad.clone().into_os_string());
+        let plain = PathBuf::from(
+            lad.to_string_lossy()
+                .trim_start_matches(r"\\?\")
+                .to_string(),
+        )
+        .join("..")
+        .join("escaped");
+        let verbatim = lad.join("..").join("escaped");
+        for root in [plain, verbatim] {
+            let err = Profile::open_under_local_app_data(&root, env.clone())
+                .expect_err(".. による脱出は拒否される");
+            assert!(
+                matches!(err, ProfileError::Unsupported { .. }),
+                "{root:?}: {err:?}"
+            );
+        }
+        assert!(!tmp.path().join("AppData").join("escaped").exists());
+    }
+
+    /// PROF-4・XOS-10（Windows）: 配下のジャンクションが配下外を指すパスは拒否され、
+    /// 配下外には何も作られない。
+    #[cfg(windows)]
+    #[test]
+    fn xos10_windows_open_rejects_junction_escape() {
+        let tmp = TempDir::new();
+        let lad = fake_local_app_data(&tmp);
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        make_junction(&lad.join("jct"), &outside);
+        let env = Some(lad.clone().into_os_string());
+
+        let err = Profile::open_under_local_app_data(&lad.join("jct").join("p"), env.clone())
+            .expect_err("ジャンクション経由の脱出は拒否される");
+        assert!(matches!(err, ProfileError::Unsupported { .. }), "{err:?}");
+        let err = Profile::open_under_local_app_data(&lad.join("jct"), env)
+            .expect_err("ジャンクション自体をルートにはできない");
+        assert!(matches!(err, ProfileError::Unsupported { .. }), "{err:?}");
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "配下外に作られた"
+        );
+    }
+
+    /// PROF-1・PROF-4（Windows）: `Profile` を開いている間、ルートの改名は共有違反で失敗し
+    /// （ハンドルによる固定）、drop 後は改名できる。二重 open は `Locked` のまま。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_windows_open_pins_root_while_profile_is_alive() {
+        let tmp = TempDir::new();
+        let lad = fake_local_app_data(&tmp);
+        let env = Some(lad.clone().into_os_string());
+        let root = lad.join("p");
+        let profile = Profile::open_under_local_app_data(&root, env.clone()).expect("open");
+        assert!(
+            std::fs::rename(&root, lad.join("p2")).is_err(),
+            "改名できてしまった"
+        );
+        assert!(root.join("profile.lock").is_file());
+        let second = Profile::open_under_local_app_data(&root, env.clone())
+            .map(|_| ())
+            .expect_err("二重 open は拒否される");
+        assert!(matches!(second, ProfileError::Locked { .. }), "{second:?}");
+        drop(profile);
+        std::fs::rename(&root, lad.join("p2")).expect("drop 後は改名できる");
+        std::fs::rename(lad.join("p2"), &root).unwrap();
+        drop(Profile::open_under_local_app_data(&root, env).expect("再 open"));
+    }
+
+    /// PROF-1（Windows）: `Profile` の生存中は `profile.lock` の改名・削除が失敗し
+    /// （共有モードに `FILE_SHARE_DELETE` なし）、二重 open は `Locked` のまま。drop 後は
+    /// 改名・削除でき、元に戻せば再 open できる。
+    ///
+    /// 失敗の種類は ERROR_SHARING_VIOLATION（32）と推測するが、Windows のランナーで未確認の
+    /// ため `is_err()` に留める。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_windows_open_pins_lock_file_while_profile_is_alive() {
+        let tmp = TempDir::new();
+        let lad = fake_local_app_data(&tmp);
+        let env = Some(lad.clone().into_os_string());
+        let root = lad.join("p");
+        let lock = root.join("profile.lock");
+        let moved = root.join("profile.lock.moved");
+        let profile = Profile::open_under_local_app_data(&root, env.clone()).expect("open");
+        assert!(
+            std::fs::rename(&lock, &moved).is_err(),
+            "改名できてしまった"
+        );
+        assert!(std::fs::remove_file(&lock).is_err(), "削除できてしまった");
+        assert!(lock.is_file());
+        assert!(!moved.exists());
+        let second = Profile::open_under_local_app_data(&root, env.clone())
+            .map(|_| ())
+            .expect_err("二重 open は拒否される");
+        assert!(matches!(second, ProfileError::Locked { .. }), "{second:?}");
+        drop(profile);
+        std::fs::rename(&lock, &moved).expect("drop 後は改名できる");
+        std::fs::rename(&moved, &lock).unwrap();
+        drop(Profile::open_under_local_app_data(&root, env.clone()).expect("再 open"));
+        std::fs::remove_file(&lock).expect("drop 後は削除できる");
+        drop(Profile::open_under_local_app_data(&root, env).expect("削除後の再 open"));
+    }
+
+    /// XOS-10（Windows）: verbatim 表記の予約デバイス名・代替データストリーム `name:stream`・
+    /// 末尾ドット／空白の要素を含むルートは `Unsupported` で、何も作られない。
+    #[cfg(windows)]
+    #[test]
+    fn xos10_windows_open_rejects_bad_names_without_creating() {
+        let tmp = TempDir::new();
+        let lad = fake_local_app_data(&tmp);
+        let env = Some(lad.clone().into_os_string());
+        // `lad` は正規化済みで `\\?\` 付きのため、リテラル名のまま渡る。
+        for name in [
+            "CON",
+            "nul.txt",
+            "COM1",
+            "LPT9",
+            "name:stream",
+            "dot.",
+            "space ",
+        ] {
+            let root = lad.join("parent").join(name);
+            let err = Profile::open_under_local_app_data(&root, env.clone())
+                .expect_err("不正な名前は拒否される");
+            assert!(
+                matches!(err, ProfileError::Unsupported { .. }),
+                "{name:?}: {err:?}"
+            );
+        }
+        assert!(!lad.join("parent").exists(), "何も作られていない");
+    }
+
+    /// PROF-4・XOS-10（Windows）: `profile.lock` の位置にジャンクションがある場合は開けず、
+    /// ジャンクションの先には何も作られない。
+    #[cfg(windows)]
+    #[test]
+    fn prof4_windows_open_rejects_junction_in_lock_position() {
+        let tmp = TempDir::new();
+        let lad = fake_local_app_data(&tmp);
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let root = lad.join("p");
+        std::fs::create_dir(&root).unwrap();
+        make_junction(&root.join("profile.lock"), &outside);
+        let result = Profile::open_under_local_app_data(&root, Some(lad.into_os_string()));
+        // 開く前に `symlink_metadata` で通常ファイルでない既存物を検出して確定させる。
+        assert!(
+            matches!(result, Err(ProfileError::InvalidLayout { .. })),
+            "{:?}",
+            result.map(|_| ())
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "配下外に作られた"
+        );
+    }
+
+    /// PROF-4・XOS-10（Windows）: データ種別ディレクトリ（`cookies`）の位置にジャンクションが
+    /// ある場合は `InvalidLayout` で拒否され、ジャンクションの先には何も作られない。
+    #[cfg(windows)]
+    #[test]
+    fn prof4_windows_open_rejects_junction_in_subdir_position() {
+        let tmp = TempDir::new();
+        let lad = fake_local_app_data(&tmp);
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let root = lad.join("p");
+        std::fs::create_dir(&root).unwrap();
+        make_junction(&root.join("cookies"), &outside);
+        let err = Profile::open_under_local_app_data(&root, Some(lad.into_os_string()))
+            .map(|_| ())
+            .expect_err("ジャンクションのサブディレクトリは拒否される");
+        assert!(matches!(err, ProfileError::InvalidLayout { .. }), "{err:?}");
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "配下外に作られた"
         );
     }
 

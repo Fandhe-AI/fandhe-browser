@@ -29,10 +29,11 @@
 //!   成功を装わず [`ProfileError::Unsupported`] を返す
 //! - Windows 長パス（`XOS-8`）は [`to_long_path`] として実装済み（TASK-61（61.1）・#205）。
 //!   `LongPathsEnabled` 非依存の結合テストは `tests/long_path.rs`（TASK-61（61.2）・#206）。
-//!   [`ProfileStore::open_or_create`] が適用するが、[`Profile::open`] が実際に使うのは
-//!   `XOS-7` の ACL 実装後になる
-//! - 名前正規化（`XOS-9`、TASK-62）は将来この層へ差し込む。Windows の ACL 隔離が未実装のため、現状 Windows の
-//!   [`Profile::open`] は `Unsupported` を返し、[`ProfileStore::open_or_create`] も
+//!   [`ProfileStore::open_or_create`] が適用するが、Windows の [`Profile::open`] は
+//!   verbatim ルートも `canonicalize` して `%LOCALAPPDATA%` 配下かを判定する（Issue #928）
+//! - 名前正規化（`XOS-9`、TASK-62）は将来この層へ差し込む。Windows の [`Profile::open`] は
+//!   `%LOCALAPPDATA%` 配下のルートだけ成功し、配下外は `Unsupported` を返す
+//!   （ACL は設定・検証しない。`XOS-7`・`XOS-10`）。[`ProfileStore::open_or_create`] も
 //!   それをそのまま伝える
 
 use std::ffi::OsString;
@@ -108,10 +109,10 @@ pub trait ProfileStore {
             });
         }
         // Windows では 260 文字制約を避けるため verbatim パスへ変換してから渡す（`XOS-8`、
-        // TASK-61（61.1））。現状は `Profile::open` が ACL 未実装（`XOS-7`）で先に
-        // `Unsupported` を返すため観測できない。ACL 実装時は `Profile::open` 側が
-        // verbatim ルートを受け取る前提で、`assert_within_root` の比較対象も verbatim 形へ
-        // 揃える必要がある（REPAIR-3 の引き継ぎ事項）。
+        // TASK-61（61.1））。`Profile::open` の Windows 分岐は verbatim ルートも
+        // `canonicalize` して `%LOCALAPPDATA%` 配下かを判定する（`local_root.rs`。Issue #928）。
+        // `assert_within_root` の比較対象を verbatim 形へ揃える件は、Windows でハンドル基準の
+        // ファイル操作を実装する際の引き継ぎ事項（REPAIR-3）。
         #[cfg(windows)]
         let target = to_long_path(resolved.path())?.into_path();
         #[cfg(not(windows))]
@@ -825,10 +826,10 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     struct TempDir(PathBuf);
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl TempDir {
         fn new() -> Self {
             use std::sync::atomic::{AtomicUsize, Ordering};
@@ -843,7 +844,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
@@ -901,11 +902,39 @@ mod tests {
         assert_eq!(profile.root(), tmp.0.as_path());
     }
 
-    /// XOS-7: Windows では既存の fail-closed（`Unsupported`）を伝え、作成しない。
-    #[cfg(not(unix))]
+    /// XOS-7・XOS-10（Windows）: `%LOCALAPPDATA%` 配下（`TEMP` は通常その配下）のルートは
+    /// `open_or_create` で開け、`profile.lock` と 4 サブディレクトリが作られる。
+    /// 前提（TEMP が LOCALAPPDATA 配下）が崩れたら skip せず失敗させる。
+    #[cfg(windows)]
     #[test]
-    fn xos_7_open_or_create_is_unsupported_on_windows() {
-        let root = std::env::temp_dir().join("fandhe-store-win-unsupported");
+    fn xos_7_open_or_create_succeeds_under_local_app_data_on_windows() {
+        let lad = std::fs::canonicalize(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA"))
+            .expect("canonicalize LOCALAPPDATA");
+        let tmp = TempDir::new();
+        let base = tmp.0.parent().expect("parent").to_path_buf();
+        assert!(
+            base.starts_with(&lad) && base != lad,
+            "テストの前提: TEMP ({base:?}) が LOCALAPPDATA ({lad:?}) 配下にあること"
+        );
+        let store = FixedStore {
+            resolved: ResolvedRoot::new(tmp.0.clone(), RootSource::OsDefault),
+        };
+        let profile = store.open_or_create().expect("配下のルートは開ける");
+        assert!(tmp.0.join("profile.lock").is_file());
+        for name in ["cookies", "storage", "cache", "history"] {
+            assert!(tmp.0.join(name).is_dir(), "{name} が作られていない");
+        }
+        drop(profile);
+    }
+
+    /// XOS-7・XOS-10（Windows）: `%LOCALAPPDATA%` 配下でないルートは `Unsupported` で、作成しない。
+    #[cfg(windows)]
+    #[test]
+    fn xos_7_open_or_create_outside_local_app_data_is_unsupported_on_windows() {
+        let drive = std::env::var_os("SystemDrive").unwrap_or_else(|| "C:".into());
+        let mut root = PathBuf::from(drive);
+        root.push("\\");
+        root.push("fandhe-928-store-outside");
         let store = FixedStore {
             resolved: ResolvedRoot::new(root.clone(), RootSource::OsDefault),
         };
@@ -1325,7 +1354,7 @@ mod tests {
     }
 
     /// PROF-1: `..` を含む明示パスでも、最終ルートの外に途中要素が作成される前に畳み込まれる。
-    /// `Profile::open` は unix のみ対応（Windows は XOS-7..10 で未実装）のため unix に限る。
+    /// unix 側の `Profile::open` の挙動を検証するため unix に限る（Windows は `%LOCALAPPDATA%` 配下のみ許可で、`local_root.rs` のテストが担う）。
     #[test]
     #[cfg(unix)]
     fn prof_1_explicit_dotdot_creates_nothing_outside_final_root() {
@@ -1496,18 +1525,28 @@ mod tests {
         assert!(!default.exists());
     }
 
-    /// PROF-1: Windows では明示ストアでも既存の fail-closed（`Unsupported`）を伝える。
-    #[cfg(not(unix))]
+    /// PROF-1・XOS-10（Windows）: 明示ストアでも `%LOCALAPPDATA%` 配下なら開け、配下外は
+    /// `Unsupported` で作成しない。
+    #[cfg(windows)]
     #[test]
-    fn prof_1_explicit_open_or_create_is_unsupported_on_windows() {
-        let root = std::env::temp_dir().join("fandhe-store-win-explicit");
-        let store = ExplicitStore::new(root.clone()).unwrap();
+    fn prof_1_explicit_open_or_create_is_limited_to_local_app_data_on_windows() {
+        let tmp = TempDir::new();
+        let store = ExplicitStore::new(tmp.0.clone()).unwrap();
+        drop(store.open_or_create().expect("配下のルートは開ける"));
+        assert!(tmp.0.join("profile.lock").is_file());
+
+        let drive = std::env::var_os("SystemDrive").unwrap_or_else(|| "C:".into());
+        let mut outside = PathBuf::from(drive);
+        outside.push("\\");
+        outside.push("fandhe-928-explicit-outside");
+        let store = ExplicitStore::new(outside.clone()).unwrap();
         assert!(matches!(
             store.open_or_create(),
             Err(ProfileError::Unsupported { .. })
         ));
-        assert!(!root.exists());
+        assert!(!outside.exists());
     }
+
     // ---- XOS-8（TASK-61（61.1））: 長パス変換 ----
 
     fn w(s: &str) -> Vec<u16> {

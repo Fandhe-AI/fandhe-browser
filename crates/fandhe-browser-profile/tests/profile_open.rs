@@ -18,11 +18,11 @@
 //! 定義済み、実際の書き込みと漏洩 0 件のアサートは TASK-51.2・#182 が
 //! 担う）であり、本ファイルでは扱わない。
 //!
-//! Windows では ACL 隔離が未実装のため `Profile::open` は常に
-//! `ProfileError::Unsupported` を返す（`XOS-7`〜`XOS-10`。PR #437 レビュー
-//! 指摘への対応）。本ファイルの受入テストは実際にディレクトリが作られる
-//! ことを検証する内容のため Unix 専用とし、Windows 側の契約は
-//! `src/profile.rs` の `#[cfg(windows)]` テストで確認する。
+//! Windows では `Profile::open` は `%LOCALAPPDATA%` 配下のルートに限り成功し、
+//! それ以外は `ProfileError::Unsupported` を返す（Issue #928。`XOS-7`・`XOS-10`）。
+//! 本ファイルの受入テストはパーミッション 700 を検証する内容のため Unix 専用とし、
+//! Windows 側の契約は `src/profile.rs`・`src/store.rs` の `#[cfg(windows)]`
+//! テストで確認する。
 
 #![cfg(unix)]
 
