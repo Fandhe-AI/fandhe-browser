@@ -2,19 +2,25 @@
 //! ルート・`profile.lock`・データ種別ディレクトリを作る補助モジュール。
 //!
 //! `profile.rs` の `Profile::open`（Windows 分岐）から呼ばれる。Windows には
-//! unix の `openat` + `NOFOLLOW` に相当するハンドル基準の走査（std だけでは書けない。
-//! Win32 API の直接呼び出しと `unsafe` は使わない方針）がないため、次の方針で境界を守る。
+//! unix の `openat` + `NOFOLLOW` に相当するハンドル基準の API（Win32 の直接呼び出しと
+//! `unsafe` は使わない方針のため std だけでは書けない）がないため、次の方針で境界を守る。
 //!
-//! - 作成前: ルートの絶対パスから、存在する最も深い祖先を `canonicalize`（短縮名・
-//!   大文字小文字・`\\?\` 表記・symlink／ジャンクションを実体に解決）し、まだ存在しない
+//! - 作成前（[`plan_root`]）: ルートの絶対パスから、存在する最も深い祖先を `canonicalize`
+//!   （短縮名・大文字小文字・`\\?\` 表記・symlink／ジャンクションを実体に解決）し、まだ存在しない
 //!   残りの要素を足した「期待する実体パス」が、同じく `canonicalize` した
 //!   `%LOCALAPPDATA%` の**厳密な配下**であることをコンポーネント単位で確認する
 //!   （文字列の前方一致ではない。`...\Local` と `...\LocalEvil` を取り違えない）。
 //!   `LOCALAPPDATA` 自体も、実体が `...\AppData\Local` で終わり UNC でないことを要求する。
-//! - 作成時: 存在する最深の祖先から 1 要素ずつ `create_dir` し、作るたびにその要素の
-//!   `canonicalize` が期待する実体パスと一致することを確認する（[`create_root`]）。
-//!   食い違い（ジャンクション・symlink への差し替え）を見つけた時点で止める。
-//! - 作成後: `profile.lock` とデータ種別ディレクトリも、作る・開くたびに実体を確認する。
+//! - 経路の固定（[`pin_root`]）: `LOCALAPPDATA` からルートまで 1 要素ずつ、削除・改名を
+//!   共有しないモード（`read(true)` + `FILE_SHARE_READ | FILE_SHARE_WRITE`）で開き（無ければ
+//!   `create_dir`）、ハンドルを保持する。保持している間、その要素の改名・削除（`DELETE`
+//!   アクセスを要する open）は共有違反で失敗するため、ジャンクションへ差し替えられない。
+//!   `FILE_FLAG_OPEN_REPARSE_POINT` でリンク自体を開き、属性で再解析ポイントを検出して
+//!   `InvalidLayout` にする。親のハンドルを保持したまま子を開くので、子は検証済みの親の直下の
+//!   実体になる。固定した後に `canonicalize` の結果も再確認する。
+//! - 固定後: `profile.lock` とデータ種別ディレクトリは、固定したルートの下で扱う。
+//!   サブディレクトリも開いて再解析ポイントでないことを確認する。ルートのハンドルは
+//!   `Profile` が生存中保持し、途中の要素のハンドルは `open` の終了時に閉じる。
 //!   検出時に、それまでに作ったディレクトリは削除しない（削除先が差し替え後の実体だと
 //!   境界外を消しかねないため。unix 側も途中で作ったディレクトリを戻さない方針に揃える）。
 //!
@@ -34,23 +40,23 @@
 //!
 //! ## 限界（`REPAIR-3`。実装済みを装わない）
 //!
-//! - 判定と作成の間に差し替えられると、検出して拒否する前に、配下外へ空ディレクトリが
-//!   最大 1 つ作られ得る（1 要素ずつ作り、作るたびに確認するため）。作ったものは消さない
-//!   （削除先が差し替え後の実体である恐れがあるため。unix 側も戻さない）。
-//! - 作成後の確認の後にルートが差し替えられると、差し替え先に空の `profile.lock` と
-//!   空のサブディレクトリ 1 つが作られ得る。その場合は `InvalidLayout` で `Profile` は返らない。
-//! - `open` の成功後は、`Profile` がパスだけを持つため、ルートの差し替えを検出できない。
-//!   Windows では書き込み系の操作（`delete` 等）が未実装で現時点の実害は無いが、書き込み系を
-//!   Windows で有効にする際はハンドル基準の実装が必須。
-//! - `%LOCALAPPDATA%` の内側へ向くジャンクションは許可する（unix は途中の symlink を
-//!   すべて拒否する。差がある）。
+//! - 保護はハンドルの共有モード（`FILE_SHARE_DELETE` なし）に依存する。Windows の挙動として
+//!   期待しているもので、ランナーで確認できる範囲はテストにしているが、`LOCALAPPDATA` より
+//!   上の祖先は直接は保持していない（子のハンドルが開いている間は祖先の改名も失敗する
+//!   と期待しているが、未確認〔Windows で要確認〕）。
+//! - `open` の成功後に固定されるのはルート自身だけ。ルートの下のファイル・サブディレクトリは
+//!   `Profile` がパスでしか持たない。Windows では書き込み系の操作（`delete` 等）が未実装で
+//!   現時点の実害は無いが、書き込み系を Windows で有効にする際はハンドル基準の実装が必須。
+//! - 入力パスの中に `%LOCALAPPDATA%` の内側へ向くジャンクションがある場合は、`plan_root` が
+//!   実体に解決した（正規化後の）パスを開く（拒否はしない。unix は途中の symlink を
+//!   すべて拒否するので差がある）。固定の段階で見つかる再解析ポイントは拒否する。
+//!   `Local` 配下に OneDrive 等の再解析ポイントがある環境では、それを通る経路は拒否される。
 //! - 既存のルート・既存の中間ディレクトリの ACL は確認しない。独自の ACL が設定されて
 //!   いれば、継承 ACL の前提は成り立たない。
 //! - `profile.lock` の所有者・ハードリンク数は検査しない（unix との差）。
 //!
 //! 判定ロジックは `std::fs` と `std::path` だけで書いてあり、Linux・macOS でも
 //! コンパイル・テストできる（Windows 形式のパス固有の挙動は `cfg(windows)` のテストが担う）。
-#![cfg_attr(not(any(windows, test)), allow(dead_code))]
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -147,10 +153,6 @@ pub(crate) fn is_invalid_new_name(name: &OsStr) -> bool {
 pub(crate) struct RootPlan {
     /// `canonicalize` した `%LOCALAPPDATA%`。
     base: PathBuf,
-    /// 存在する最も深い祖先の実体パス（これ以降の要素を 1 つずつ作る）。
-    anchor: PathBuf,
-    /// `anchor` の下に作る要素（すべて `Normal`、名前検査済み）。
-    rest: Vec<OsString>,
     /// 作成後にルートがあるべき実体パス（`anchor` + `rest`）。
     expected: PathBuf,
 }
@@ -270,10 +272,9 @@ pub(crate) fn plan_root(
     let rest_path = absolute
         .strip_prefix(existing)
         .map_err(|_| unsupported(REASON_CANNOT_VERIFY))?;
-    let mut rest = Vec::new();
     for component in rest_path.components() {
         match component {
-            Component::Normal(name) if !is_invalid_new_name(name) => rest.push(name.to_os_string()),
+            Component::Normal(name) if !is_invalid_new_name(name) => {}
             Component::Normal(_) => return Err(unsupported(REASON_BAD_NAME)),
             _ => return Err(unsupported(REASON_UNSUPPORTED_FORM)),
         }
@@ -289,49 +290,146 @@ pub(crate) fn plan_root(
             reason: "an existing path component of the profile root is not a directory",
         });
     }
-    Ok(RootPlan {
-        base,
-        anchor: canonical_existing,
-        rest,
-        expected,
-    })
+    Ok(RootPlan { base, expected })
 }
 
-/// ルートを、存在する最深の祖先から 1 要素ずつ作り、作るたびに実体を確認する。
+/// `FILE_SHARE_READ`。ディレクトリのハンドルを開くときの共有モード（読み取りの共有を許す）。
+#[cfg(windows)]
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+/// `FILE_SHARE_WRITE`。同上（書き込みの共有を許す）。`FILE_SHARE_DELETE`（0x4）は意図的に付けない。
+#[cfg(windows)]
+const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+/// `FILE_FLAG_BACKUP_SEMANTICS`。ディレクトリを `CreateFile` で開くために必要。
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+/// `FILE_FLAG_OPEN_REPARSE_POINT`。リンク先を辿らず再解析ポイント自体を開く
+/// （std の `OpenOptionsExt::custom_flags` に渡すだけで Win32 の直接呼び出しではない）。
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+/// `FILE_ATTRIBUTE_REPARSE_POINT`。ジャンクション・symlink 等の再解析ポイントを示す属性ビット。
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// ディレクトリのハンドルを開く。無ければ `Ok(None)`。
 ///
-/// `create_dir_all` と違い、差し替えられたジャンクション・symlink の先に未存在の要素を
-/// 複数作らない。各要素を `create_dir` した直後にその `canonicalize` が期待する実体パスと
-/// 一致することを確認し、不一致ならそこで [`ProfileError::InvalidLayout`] を返して止める
-/// （配下外に作られ得るのは最大で空ディレクトリ 1 つ。作ったものは消さない）。
-/// `AlreadyExists`（並行して同じルートを開く別プロセスや既存の要素）は成功扱いにして
-/// 同じ確認へ進む。全要素を作り終えたら [`verify_created_root`] で最終確認する
-/// （`PROF-1`・`PROF-4`、TOCTOU 対策）。OS 非依存。
-pub(crate) fn create_root(plan: &RootPlan) -> Result<(), ProfileError> {
-    let mut current = plan.anchor.clone();
-    for name in &plan.rest {
-        current.push(name);
-        match std::fs::create_dir(&current) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(ProfileError::Io(err)),
-        }
-        let actual = std::fs::canonicalize(&current).map_err(ProfileError::Io)?;
-        let is_dir = std::fs::symlink_metadata(&actual).is_ok_and(|m| m.is_dir());
-        if actual != current || !is_dir {
-            return Err(ProfileError::InvalidLayout {
-                path: current,
-                reason: "profile root path component was replaced, redirected (symlink/junction) or is not a directory",
-            });
-        }
+/// Windows では `read(true)` + `FILE_SHARE_READ | FILE_SHARE_WRITE`（`FILE_SHARE_DELETE` なし）
+/// で開くため、このハンドルを保持している間、そのディレクトリの改名・削除（`DELETE`
+/// アクセスを要する open）は共有違反で失敗し、ジャンクション等へ差し替えられない
+/// （属性アクセスだけのハンドルは共有モードの検査に参加しないので `read(true)` は必須）。
+/// `FILE_FLAG_OPEN_REPARSE_POINT` により、その名前がジャンクション・symlink ならリンク
+/// 自体が開き、ハンドルの属性で再解析ポイントを検出して [`ProfileError::InvalidLayout`]
+/// にする。Windows 以外ではハンドルによる固定はなく、通常の open 後にパスが symlink で
+/// ないことを確認するだけ（3 OS で動く骨格のテスト用。本番は Windows のみ）。
+fn try_open_dir(path: &Path) -> Result<Option<File>, ProfileError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    verify_created_root(plan)
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(ProfileError::Io(err)),
+    };
+    let metadata = file.metadata().map_err(ProfileError::Io)?;
+    #[cfg(windows)]
+    let is_reparse = {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    #[cfg(not(windows))]
+    let is_reparse = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    if is_reparse {
+        return Err(ProfileError::InvalidLayout {
+            path: path.to_path_buf(),
+            reason: "profile path component is a symlink or junction (reparse point)",
+        });
+    }
+    if !metadata.is_dir() {
+        return Err(ProfileError::InvalidLayout {
+            path: path.to_path_buf(),
+            reason: "profile path component is not a directory",
+        });
+    }
+    Ok(Some(file))
+}
+
+/// [`try_open_dir`] で、無ければ `NotFound` の入出力エラーにする。
+fn open_dir(path: &Path) -> Result<File, ProfileError> {
+    try_open_dir(path)?.ok_or_else(|| ProfileError::Io(std::io::ErrorKind::NotFound.into()))
+}
+
+/// `LOCALAPPDATA` からルートまでの各ディレクトリのハンドル（先頭が `LOCALAPPDATA`、
+/// 末尾がルート）。保持している間、Windows ではそれらの改名・削除ができない。
+#[derive(Debug)]
+pub(crate) struct PinnedPath {
+    dirs: Vec<File>,
+}
+
+impl PinnedPath {
+    /// 途中の要素のハンドルを閉じ、ルートのハンドルだけを返す。`Profile` が生存中保持する
+    /// （ルートの改名・削除・差し替えを防ぐ）。
+    pub(crate) fn into_root_handle(mut self) -> Result<File, ProfileError> {
+        self.dirs.pop().ok_or(ProfileError::InvalidLayout {
+            path: PathBuf::new(),
+            reason: "no pinned directory handle",
+        })
+    }
+
+    /// 保持しているハンドルの数（`LOCALAPPDATA` を含む）。
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.dirs.len()
+    }
+}
+
+/// `LOCALAPPDATA` からルートまでを 1 要素ずつ開き（無ければ作り）、各ディレクトリの
+/// ハンドルを保持して経路を固定する。
+///
+/// 親のハンドルを保持したまま子を開くので、開いた子は検証済みの親の直下の実体になる。
+/// 各ハンドルは通常のディレクトリ（再解析ポイントでない）であることを確認する。
+/// `create_dir_all` と違い、差し替えられたジャンクションの先に未存在の要素を複数作らない
+/// （再解析ポイントは開いた時点で検出され、そこで止まる）。`AlreadyExists`（並行して同じ
+/// ルートを開く別プロセス）は成功扱いにして開き直す。固定後に [`verify_created_root`] で
+/// `canonicalize` の結果も確認する（OS 非依存の骨格。`PROF-1`・`PROF-4`、TOCTOU 対策）。
+pub(crate) fn pin_root(plan: &RootPlan) -> Result<PinnedPath, ProfileError> {
+    let relative = plan
+        .expected
+        .strip_prefix(&plan.base)
+        .map_err(|_| unsupported(REASON_OUTSIDE))?;
+    let mut dirs = vec![open_dir(&plan.base)?];
+    let mut current = plan.base.clone();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(unsupported(REASON_UNSUPPORTED_FORM));
+        };
+        current.push(name);
+        let handle = match try_open_dir(&current)? {
+            Some(handle) => handle,
+            None => {
+                match std::fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(err) => return Err(ProfileError::Io(err)),
+                }
+                open_dir(&current)?
+            }
+        };
+        dirs.push(handle);
+    }
+    verify_created_root(plan)?;
+    Ok(PinnedPath { dirs })
 }
 
 /// ルートの実体が作成前の判定どおりであることを再確認する。
 ///
 /// 食い違い（ジャンクション・symlink への差し替え）は [`ProfileError::InvalidLayout`]
 /// （作ったものは消さない。モジュール doc の「限界」）。
-pub(crate) fn verify_created_root(plan: &RootPlan) -> Result<(), ProfileError> {
+fn verify_created_root(plan: &RootPlan) -> Result<(), ProfileError> {
     let actual = std::fs::canonicalize(&plan.expected).map_err(ProfileError::Io)?;
     if actual != plan.expected || !is_strictly_under(&actual, &plan.base) {
         return Err(ProfileError::InvalidLayout {
@@ -349,11 +447,6 @@ pub(crate) fn verify_created_root(plan: &RootPlan) -> Result<(), ProfileError> {
     Ok(())
 }
 
-/// `FILE_FLAG_OPEN_REPARSE_POINT`。リンク先を辿らず再解析ポイント自体を開く
-/// （std の `OpenOptionsExt::custom_flags` に渡すだけで Win32 の直接呼び出しではない）。
-#[cfg(windows)]
-const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-
 /// `root`（検証済みの実体パス）直下の `profile.lock` を開く（無ければ作る）。
 ///
 /// symlink 等はリンク先を辿らず開き、通常ファイルでなければ
@@ -361,6 +454,19 @@ const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 /// 検査に相当するものは Windows にはない（ACL は継承に依存し検証しない。REPAIR-3）。
 pub(crate) fn open_lock_file(root: &Path) -> Result<(File, PathBuf), ProfileError> {
     let path = root.join(LOCK_FILE_NAME);
+    // 既存物が通常ファイルでない（ディレクトリ・ジャンクション・symlink 等）場合は、開く前に
+    // `InvalidLayout` に確定させる。
+    match std::fs::symlink_metadata(&path) {
+        Ok(m) if !m.file_type().is_file() => {
+            return Err(ProfileError::InvalidLayout {
+                path,
+                reason: "profile lock path is not a regular file",
+            });
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(ProfileError::Io(err)),
+    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(windows)]
@@ -380,7 +486,8 @@ pub(crate) fn open_lock_file(root: &Path) -> Result<(File, PathBuf), ProfileErro
 }
 
 /// `root`（検証済みの実体パス）直下に 4 つのデータ種別ディレクトリを作り、
-/// 実体が `root` の直下であること（symlink・ジャンクションでないこと）を確認する。
+/// 実体が `root` の直下の通常のディレクトリであること（symlink・ジャンクションでないこと）を
+/// ハンドルで確認する（確認後はハンドルを閉じる。`root` は呼び出し側が固定済み）。
 pub(crate) fn ensure_data_dirs(root: &Path) -> Result<(), ProfileError> {
     for kind in DataKind::ALL {
         let path = root.join(kind.dir_name());
@@ -389,6 +496,7 @@ pub(crate) fn ensure_data_dirs(root: &Path) -> Result<(), ProfileError> {
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(err) => return Err(ProfileError::Io(err)),
         }
+        open_dir(&path)?;
         let actual = std::fs::canonicalize(&path).map_err(ProfileError::Io)?;
         let is_dir = std::fs::symlink_metadata(&actual).is_ok_and(|m| m.is_dir());
         if !is_dir || actual.parent() != Some(root) || actual.file_name() != path.file_name() {
@@ -710,13 +818,13 @@ mod tests {
 
     /// PROF-1: 正常系は要素を 1 つずつ作り、ロックファイルと 4 サブディレクトリも作られる。
     #[test]
-    fn prof1_create_root_lock_and_data_dirs() {
+    fn prof1_pin_root_lock_and_data_dirs() {
         let tmp = TempDir::new();
         let lad = tmp.lad();
         let root = lad.join("p").join("q");
         let plan = plan_root(&root, env(&lad)).unwrap();
-        create_root(&plan).expect("通常のディレクトリは作れる");
-        create_root(&plan).expect("既存（AlreadyExists）でも成功する");
+        pin_root(&plan).expect("通常のディレクトリは作れる");
+        pin_root(&plan).expect("既存（AlreadyExists）でも成功する");
         let (_file, lock_path) = open_lock_file(plan.expected()).unwrap();
         assert_eq!(lock_path, root.join("profile.lock"));
         ensure_data_dirs(plan.expected()).unwrap();
@@ -729,12 +837,12 @@ mod tests {
     /// PROF-1: 作成の途中の要素が（判定後に）通常ファイルへ差し替わった場合は `InvalidLayout`
     /// で止まり、その先を作らない。
     #[test]
-    fn prof1_create_root_stops_at_non_directory_component() {
+    fn prof1_pin_root_stops_at_non_directory_component() {
         let tmp = TempDir::new();
         let lad = tmp.lad();
         let plan = plan_root(&lad.join("p").join("q").join("r"), env(&lad)).unwrap();
         std::fs::write(lad.join("p"), b"x").unwrap();
-        let err = create_root(&plan).expect_err("非ディレクトリで止まる");
+        let err = pin_root(&plan).expect_err("非ディレクトリで止まる");
         assert!(matches!(err, ProfileError::InvalidLayout { .. }), "{err:?}");
         assert!(lad.join("p").is_file());
     }
@@ -743,14 +851,14 @@ mod tests {
     /// 検出して拒否し、配下外に子を作らない（unix で検証）。
     #[cfg(unix)]
     #[test]
-    fn prof1_create_root_detects_redirect_after_plan() {
+    fn prof1_pin_root_detects_redirect_after_plan() {
         let tmp = TempDir::new();
         let lad = tmp.lad();
         let outside = tmp.0.join("outside");
         std::fs::create_dir(&outside).unwrap();
         let plan = plan_root(&lad.join("p"), env(&lad)).unwrap();
         std::os::unix::fs::symlink(&outside, lad.join("p")).unwrap();
-        let err = create_root(&plan).expect_err("差し替えを検出する");
+        let err = pin_root(&plan).expect_err("差し替えを検出する");
         assert!(matches!(err, ProfileError::InvalidLayout { .. }), "{err:?}");
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     }
@@ -759,14 +867,14 @@ mod tests {
     /// （`q`）が作られていない（unix で検証。`create_dir_all` では `outside/q` ができる）。
     #[cfg(unix)]
     #[test]
-    fn prof1_create_root_stops_after_one_level_when_intermediate_swapped() {
+    fn prof1_pin_root_stops_after_one_level_when_intermediate_swapped() {
         let tmp = TempDir::new();
         let lad = tmp.lad();
         let outside = tmp.0.join("outside");
         std::fs::create_dir(&outside).unwrap();
         let plan = plan_root(&lad.join("p").join("q").join("r"), env(&lad)).unwrap();
         std::os::unix::fs::symlink(&outside, lad.join("p")).unwrap();
-        let err = create_root(&plan).expect_err("途中の差し替えを検出する");
+        let err = pin_root(&plan).expect_err("途中の差し替えを検出する");
         assert!(matches!(err, ProfileError::InvalidLayout { .. }), "{err:?}");
         assert!(!outside.join("q").exists(), "2 段目が配下外に作られた");
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
@@ -781,7 +889,10 @@ mod tests {
         let root = lad.join("p");
         std::fs::create_dir_all(root.join("profile.lock")).unwrap();
         let result = open_lock_file(&root);
-        assert!(result.is_err(), "{result:?}");
+        assert!(
+            matches!(result, Err(ProfileError::InvalidLayout { .. })),
+            "{result:?}"
+        );
     }
 
     /// PROF-1: データ種別ディレクトリの位置が通常ファイルなら `InvalidLayout`。
@@ -793,13 +904,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("cookies"), b"x").unwrap();
         let err = ensure_data_dirs(&root).expect_err("ファイルは拒否される");
-        assert!(
-            matches!(
-                err,
-                ProfileError::InvalidLayout { .. } | ProfileError::Io(_)
-            ),
-            "{err:?}"
-        );
+        assert!(matches!(err, ProfileError::InvalidLayout { .. }), "{err:?}");
     }
 
     /// XOS-10（Windows）: Windows 形式のパス（ドライブ・verbatim）でもコンポーネント単位で判定する。
@@ -834,7 +939,7 @@ mod tests {
     /// 差し替えられても、作成時の確認が検出し、配下外に何も作らない。
     #[cfg(windows)]
     #[test]
-    fn prof1_windows_create_root_detects_junction_swapped_after_plan() {
+    fn prof1_windows_pin_root_detects_junction_swapped_after_plan() {
         let tmp = TempDir::new();
         let lad = tmp.lad();
         let outside = tmp.0.join("outside");
@@ -856,8 +961,73 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let err = create_root(&plan).expect_err("差し替えを検出する");
+        let err = pin_root(&plan).expect_err("差し替えを検出する");
         assert!(matches!(err, ProfileError::InvalidLayout { .. }), "{err:?}");
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "配下外に作られた"
+        );
+    }
+
+    /// PROF-1: 固定したハンドルは `LOCALAPPDATA` からルートまで 1 要素ごと（基点を含む）で、
+    /// ルートのハンドルだけを取り出せる。
+    #[test]
+    fn prof1_pin_root_holds_one_handle_per_component() {
+        let tmp = TempDir::new();
+        let lad = tmp.lad();
+        let plan = plan_root(&lad.join("p").join("q"), env(&lad)).unwrap();
+        let pinned = pin_root(&plan).unwrap();
+        assert_eq!(pinned.len(), 3);
+        pinned.into_root_handle().expect("ルートのハンドル");
+    }
+
+    /// PROF-1（Windows）: ハンドルを保持している間は途中の要素・ルートの改名が共有違反で失敗し、
+    /// ジャンクションへ差し替えられない。解放後は改名できる。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_windows_pinned_components_cannot_be_renamed() {
+        let tmp = TempDir::new();
+        let lad = tmp.lad();
+        let plan = plan_root(&lad.join("a").join("b"), env(&lad)).unwrap();
+        let pinned = pin_root(&plan).unwrap();
+        assert!(std::fs::rename(lad.join("a").join("b"), lad.join("a").join("b2")).is_err());
+        assert!(std::fs::rename(lad.join("a"), lad.join("a2")).is_err());
+        assert!(lad.join("a").join("b").is_dir());
+        assert!(!lad.join("a2").exists());
+        drop(pinned);
+        std::fs::rename(lad.join("a"), lad.join("a2")).expect("解放後は改名できる");
+        std::fs::rename(lad.join("a2"), lad.join("a")).expect("戻せる");
+    }
+
+    /// PROF-1・PROF-4（Windows）: 存在する途中の要素・ルートがジャンクションなら
+    /// 固定の段階で `InvalidLayout` になり、先には何も作られない。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_windows_pin_root_rejects_junction_components() {
+        let tmp = TempDir::new();
+        let lad = tmp.lad();
+        let outside = tmp.0.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        // 途中の要素 `a` と、ルート `r` をそれぞれ判定後にジャンクションへ差し替える。
+        let plan_mid = plan_root(&lad.join("a").join("b"), env(&lad)).unwrap();
+        let plan_root_ = plan_root(&lad.join("r"), env(&lad)).unwrap();
+        let plain = |p: &Path| PathBuf::from(p.to_string_lossy().trim_start_matches(r"\\?\"));
+        for link in ["a", "r"] {
+            let output = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(plain(&lad.join(link)))
+                .arg(plain(&outside))
+                .output()
+                .expect("cmd.exe を起動できる");
+            assert!(output.status.success(), "mklink /J failed");
+        }
+        for plan in [&plan_mid, &plan_root_] {
+            let err = pin_root(plan).expect_err("ジャンクションは拒否される");
+            assert!(matches!(err, ProfileError::InvalidLayout { .. }), "{err:?}");
+        }
         assert_eq!(
             std::fs::read_dir(&outside).unwrap().count(),
             0,

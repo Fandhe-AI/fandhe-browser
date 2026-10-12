@@ -510,6 +510,11 @@ pub struct Profile {
     // PROF-1、TASK-50（50.3）・#178）。
     #[cfg(any(unix, windows))]
     _lock: lock::ProfileLock,
+    /// Windows 限定: 検証済みルートのディレクトリハンドル（削除・改名を共有しない）。
+    /// `Profile` の生存中、ルートを改名・削除・ジャンクションへ差し替えられないように
+    /// 固定する。`_lock` の後に宣言して、先にロックを解放し、その後にルートの固定を解く。
+    #[cfg(windows)]
+    _root_dir: std::fs::File,
 }
 
 impl Profile {
@@ -708,8 +713,11 @@ impl Profile {
         // 表示用のルートは unix 側と同じく絶対化した入力（検証済みの実体は `plan` が持つ）。
         let display_root = std::path::absolute(root)?;
 
-        // 1 要素ずつ作り、作るたびに実体を確認する（`create_dir_all` は使わない）。
-        local_root::create_root(&plan)?;
+        // `LOCALAPPDATA` からルートまでを 1 要素ずつ開き（無ければ作り）、削除・改名を共有
+        // しないハンドルを保持して経路を固定する（`create_dir_all` は使わない）。固定した
+        // 後でロックとサブディレクトリを扱うので、判定後にルートを別の実体へ差し替えて
+        // 戻す競合でも、別の実体のロックを保持した `Profile` が返ることはない（`PROF-1`）。
+        let pinned = local_root::pin_root(&plan)?;
 
         // ロックはデータ種別ディレクトリより先に取る。2 回目の opener は
         // ここで `Locked` を返し、data dir には触れない（unix 側と同じ）。
@@ -718,9 +726,12 @@ impl Profile {
 
         local_root::ensure_data_dirs(plan.expected())?;
 
+        // 途中の要素のハンドルはここで閉じ、ルートのハンドルだけを `Profile` が保持する。
+        let root_dir = pinned.into_root_handle()?;
         Ok(Profile {
             root: display_root,
             _lock: profile_lock,
+            _root_dir: root_dir,
         })
     }
 
@@ -2924,6 +2935,31 @@ mod tests {
         );
     }
 
+    /// PROF-1・PROF-4（Windows）: `Profile` を開いている間、ルートの改名は共有違反で失敗し
+    /// （ハンドルによる固定）、drop 後は改名できる。二重 open は `Locked` のまま。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_windows_open_pins_root_while_profile_is_alive() {
+        let tmp = TempDir::new();
+        let lad = fake_local_app_data(&tmp);
+        let env = Some(lad.clone().into_os_string());
+        let root = lad.join("p");
+        let profile = Profile::open_under_local_app_data(&root, env.clone()).expect("open");
+        assert!(
+            std::fs::rename(&root, lad.join("p2")).is_err(),
+            "改名できてしまった"
+        );
+        assert!(root.join("profile.lock").is_file());
+        let second = Profile::open_under_local_app_data(&root, env.clone())
+            .map(|_| ())
+            .expect_err("二重 open は拒否される");
+        assert!(matches!(second, ProfileError::Locked { .. }), "{second:?}");
+        drop(profile);
+        std::fs::rename(&root, lad.join("p2")).expect("drop 後は改名できる");
+        std::fs::rename(lad.join("p2"), &root).unwrap();
+        drop(Profile::open_under_local_app_data(&root, env).expect("再 open"));
+    }
+
     /// XOS-10（Windows）: verbatim 表記の予約デバイス名・代替データストリーム `name:stream`・
     /// 末尾ドット／空白の要素を含むルートは `Unsupported` で、何も作られない。
     #[cfg(windows)]
@@ -2966,13 +3002,9 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         make_junction(&root.join("profile.lock"), &outside);
         let result = Profile::open_under_local_app_data(&root, Some(lad.into_os_string()));
-        // ディレクトリ（再解析ポイント）を通常ファイルとして開けない。`Io`（アクセス拒否）か
-        // `InvalidLayout`（通常ファイルでない）のどちらでも拒否として扱う。
+        // 開く前に `symlink_metadata` で通常ファイルでない既存物を検出して確定させる。
         assert!(
-            matches!(
-                result,
-                Err(ProfileError::InvalidLayout { .. } | ProfileError::Io(_))
-            ),
+            matches!(result, Err(ProfileError::InvalidLayout { .. })),
             "{:?}",
             result.map(|_| ())
         );

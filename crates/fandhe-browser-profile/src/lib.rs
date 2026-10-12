@@ -61,7 +61,12 @@ pub mod normalize;
 pub mod profile;
 pub mod store;
 
+// Windows の実装と、他 OS では単体テストだけが使う（未使用警告をモジュール単位の
+// `allow` で消さず、コンパイル対象を cfg で絞る）。
+#[cfg(any(windows, test))]
 mod local_root;
+// unix・Windows の `Profile::open` と単体テストが使う。それ以外の OS では未使用。
+#[cfg(any(unix, windows, test))]
 mod lock;
 
 pub use normalize::{MAX_REGISTRY_ENTRIES, NameRegistry, NormalizedName, normalize_name};

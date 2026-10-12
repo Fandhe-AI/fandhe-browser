@@ -28,10 +28,6 @@
 //! すると、別プロセスが旧 inode のハンドルでロックを保持したまま、新しい
 //! プロセスが新規作成した別 inode に対してロックを取得できてしまい、
 //! 二重 open の検出という目的そのものが壊れるため。
-#![cfg_attr(not(any(unix, windows)), allow(dead_code))]
-// unix・Windows 以外では `Profile::open` が早期に `Unsupported` を返すため、本モジュールの
-// 型・関数が未使用（dead_code）になる。テストビルドでは単体テストが使うため許可は不要
-// だが、非テストの当該ビルドで `-D warnings` に引っかからないよう明示的に許可する。
 
 use std::fs::{File, TryLockError};
 use std::path::Path;
