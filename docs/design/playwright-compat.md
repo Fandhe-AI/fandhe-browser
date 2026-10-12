@@ -29,10 +29,10 @@ Playwright のソースは長く引用せず、関数名と要約に留める。
 
 | 段階 | 現状 | 根拠 |
 | ---- | ---- | ---- |
-| `connectOverCDP(http://…)` | 失敗。`/json/version/` は 200（TASK-43.3a で解消）。`Browser.getVersion` は成功し、次の `Target.setAutoAttach`・`Browser.setDownloadBehavior` が `-32601`（実体未接続のため未登録。TASK-43.3b のレビューで成功応答を取り下げた） | A（TASK-43.3a 後の再取得）: seq 1〜9 |
-| `connectOverCDP(ws://…)` | 失敗。`Browser.getVersion` は成功し、次の `Target.setAutoAttach`・`Browser.setDownloadBehavior` が `-32601` | A（同上）: seq 10〜16 |
-| `newContext()` | 未到達（トレースに該当メッセージなし） | A + B |
-| `newPage()` | 未到達（同上） | A + B |
+| `connectOverCDP(http://…)` | 失敗。`Browser.getVersion` は成功するが、`Target.setAutoAttach` の `waitForDebuggerOnStart:true`（ターゲット一時停止が未実装）と `Browser.setDownloadBehavior` の `allowAndName`・`eventsEnabled:true`（実行系が未実装）がともに `-32602` で拒否され、`Protocol error (Target.setAutoAttach)` で止まる（`CDP-6`・`REPAIR-3`） | A（現行 head での再取得）: seq 1〜9 |
+| `connectOverCDP(ws://…)` | 失敗。http 経由が失敗するため収集ハーネスが ws 直接も実行し、同じ送信列が同じ `-32602` で拒否される。`tests/playwright_trace.rs` の再生テストも同一の応答列を固定している | A: seq 10〜16 |
+| `newContext()` | 未到達（接続段階で停止するため `Target.createBrowserContext` はトレースに現れない。実装上は `-32601`。段階 2b の対象） | A: 到達なし |
+| `newPage()` | 未到達（`newContext()` の失敗による） | A |
 
 `-32601` は未実装メソッドへ成功を捏造しない `CDP-6`・`SEC-2` の方針どおりの挙動で、バグではない。
 
@@ -149,12 +149,45 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
 - 実装したのは `Target.getTargetInfo` のみ（`playwright_compat.rs`。`sessionId` 付きは `-32602`）。
   引数なしは `type:"browser"`・`attached:true` の実値（`CdpState` のブラウザ ID）。`targetId` 指定は
   `TargetRegistry` の実値（`attached` は実セッションの有無）で、未知・不正は `-32602`
-- `Target.setAutoAttach` と `Browser.setDownloadBehavior` は**登録を取り下げた**（`-32601` のまま）。
+- `Target.setAutoAttach` と `Browser.setDownloadBehavior` は**登録を取り下げた**（`-32601` のまま。段階 2c〔TASK-43.3c・#908〕で実体に接続して登録し直した）。
   設定を保存して `{}` を返すだけでは、実セッションの attach・`Target.attachedToTarget` の送出や
   ダウンロード処理（`downloadPath` の保存・イベント通知）に接続されておらず、クライアントに有効化済みと
   誤認させる（`CDP-6`・`REPAIR-3`）。実体と接続できる段階（段階 2b・2c 以降）で改めて実装する
 - このため `connectOverCDP` の到達点は TASK-43.3a 後と同じ（`Target.setAutoAttach` で停止。
   `Target.getTargetInfo` は送られない）。トレース（`newpage-trace.jsonl`）も TASK-43.3a 後の内容に戻した
+
+### 段階 2c の実施結果（TASK-43.3c・#908。実測 A）
+
+段階 2a で取り下げた 2 メソッドを、実体に接続して登録し直した（`playwright_compat.rs`・`conn_state.rs`）。
+
+- `Target.setAutoAttach`（root セッションのみ）:
+  - `autoAttach:true` は、この接続がまだ attach していない既存ターゲットすべてへ `TargetRegistry::attach` し、
+    ターゲットごとに `Target.attachedToTarget`（`sessionId`・`targetInfo`・`waitingForDebugger:false`）を
+    応答の後に送出する。重複呼び出しは冪等。途中失敗（`MAX_SESSIONS` 到達等）は巻き戻す（`CDP-7`）
+  - 有効状態を接続ごとに保持し、有効化後に registry へ現れたターゲットも attach する。push 経路が無いため
+    `Target.attachedToTarget` は当該接続の次のコマンド応答の後に送出する（`ConnectionScoped::reconcile_auto_attach`）
+  - `autoAttach:false` はこの接続が attach したセッションを外し、`Target.detachedFromTarget` を送出する
+  - セッションの所有は接続スコープで、切断（`ws.rs` の `on_close`）で解放する
+  - 拒否（`-32602`）: `filter`（Puppeteer の除外フィルタ。黙って無視すると除外すべきターゲットまで attach するため）、
+    `flatten` が `true` 以外（`sendMessageToTarget` 方式は未実装）、`sessionId` 付き（子ターゲットのモデルが無い）。
+    `waitForDebuggerOnStart:true`（`autoAttach:true` 時）もターゲットの一時停止が未実装のため `-32602` で拒否する（成功を装わない。`REPAIR-3`・`CDP-6`）。Playwright の `CRBrowser.connect` が渡す値のため、一時停止の実装までは Playwright の接続は `Target.setAutoAttach` で失敗する
+  - 接続なしの直接 dispatch は `-32000`（`no connection`）
+- `Browser.setDownloadBehavior`:
+  - ダウンロード実行系（保存・`Browser.downloadWillBegin`・`downloadProgress`）は未実装で、現状ダウンロードは発生しない。
+    保証できる `deny`・`default`（イベントなし）だけを受理して接続スコープで保持し、`allow`・`allowAndName` と
+    `eventsEnabled:true` は成功を装わず `-32602`（`unsupported params`）で拒否する（`CDP-6`・`REPAIR-3`）。
+    このため Playwright の接続シーケンス（`allowAndName`・`eventsEnabled:true`）もこの段で拒否される（ただし現行サーバーでは、それより前の `Target.setAutoAttach` の `waitForDebuggerOnStart:true` が先に `-32602` で拒否されるため、接続は `Target.setAutoAttach` の段で止まる）
+    （実行系の実装〔`CDP-2`〕まで許容。トレースは現行 head で再取得済み）
+  - `behavior` は `deny`・`allow`・`allowAndName`・`default`（`allow*` は上記のとおり拒否）
+  - `downloadPath` は絶対パス・`..` なし・NUL なし・4096 バイト以下。**サーバーはこのパスに一切ファイル操作をしない**
+    （作成・書き込み・存在確認なし）。実行系で書き込む際はプロファイル境界（`PROF`）を踏まえた別途のセキュリティ設計を要する
+  - `browserContextId` 指定は `-32602`（browser context は段階 2b で導入）。`eventsEnabled` は保持するがイベントは送出しない
+  - 寿命は接続スコープ（切断で破棄・プロファイルへ永続化しない）
+- `make trace-playwright` の再取得結果（現行 head）: 両 `connectOverCDP` が `Target.setAutoAttach`（id 2）・`Browser.setDownloadBehavior`（id 3）の `-32602` で失敗し、`newContext()` には到達しない（seq 5〜9・12〜16）。**次に止まるのは `waitForDebuggerOnStart:true` の拒否**で、解消にはターゲット一時停止の実装（`CDP-2`）が要る。`Target.createBrowserContext`（段階 2b）はその先で再び問題になる見込み（B）
+- 既知の制約: `Target.attachedToTarget` の `targetInfo` に `browserContextId` が無い。トレースサーバーは
+  ターゲットを事前作成しないため今回の到達には影響しないが、既存ターゲットがある状態の Playwright は
+  `browserContextId` を要する見込み（B）。段階 2b で追加する
+- 送出順は応答 → イベント列のまま（`CDP-5`）。Chromium 流の並べ替えは `Target.createTarget` を実装する段階 2b 以降で判断する
 
 #### 予測 #11（`Page.frameNavigated`）の訂正（種別 B・未実測）
 
