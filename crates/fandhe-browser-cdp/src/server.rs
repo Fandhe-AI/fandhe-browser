@@ -27,6 +27,7 @@ use fandhe_backend_http::response::Response;
 use fandhe_backend_routes::Router;
 use fandhe_browser_core::AppState;
 
+use crate::conn_state::ConnectionScoped;
 use crate::discovery::{self, Authority, BROWSER_WS_PATH_PATTERN, HostError};
 use crate::dom::IssuedDocuments;
 use crate::method_log::{ReceivedMethodLog, ReceivedMethodsSnapshot};
@@ -52,6 +53,8 @@ pub struct CdpState {
     dom_issued: IssuedDocuments,
     /// 受信メソッド名の集計（`Dispatcher::dispatch_on` が書く。`CDP-6`）。
     method_log: ReceivedMethodLog,
+    /// 接続スコープの状態（自動 attach のセッション所有・ダウンロード設定。`CDP-2`・`CDP-7`）。
+    conn_scoped: ConnectionScoped,
 }
 
 impl CdpState {
@@ -70,6 +73,7 @@ impl CdpState {
             navigations: TargetNavigations::new(),
             dom_issued: IssuedDocuments::new(),
             method_log: ReceivedMethodLog::new(),
+            conn_scoped: ConnectionScoped::new(),
         }
     }
 
@@ -77,11 +81,22 @@ impl CdpState {
     /// ここへ集約し、解放漏れを防ぐ。
     pub(crate) fn open_connection(&self, conn: ConnId) {
         self.dom_issued.open_connection(conn);
+        self.conn_scoped.open(conn);
     }
 
     /// 接続の終了で接続別状態をすべて解放する（`crate::ws` の `on_close` から呼ぶ）。
     pub(crate) fn release_connection(&self, conn: ConnId) {
         self.dom_issued.release_connection(conn);
+        // 自動 attach が払い出したセッションを registry へ返す（解放漏れはセッション枠の
+        // 枯渇になる。`CDP-7`）。接続状態のロックを手放してから registry を触る。
+        for sid in self.conn_scoped.release(conn) {
+            let _ = self.registry.detach(&sid);
+        }
+    }
+
+    /// 接続スコープの状態表（crate 内部専用。`CDP-2`）。
+    pub(crate) fn conn_scoped(&self) -> &ConnectionScoped {
+        &self.conn_scoped
     }
 
     /// 受信メソッド集計（`Dispatcher::dispatch_on` が記録する）。

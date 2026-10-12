@@ -29,10 +29,10 @@ Playwright のソースは長く引用せず、関数名と要約に留める。
 
 | 段階 | 現状 | 根拠 |
 | ---- | ---- | ---- |
-| `connectOverCDP(http://…)` | 失敗。`/json/version/` は 200（TASK-43.3a で解消）。`Browser.getVersion` は成功し、次の `Target.setAutoAttach`・`Browser.setDownloadBehavior` が `-32601`（実体未接続のため未登録。TASK-43.3b のレビューで成功応答を取り下げた） | A（TASK-43.3a 後の再取得）: seq 1〜9 |
-| `connectOverCDP(ws://…)` | 失敗。`Browser.getVersion` は成功し、次の `Target.setAutoAttach`・`Browser.setDownloadBehavior` が `-32601` | A（同上）: seq 10〜16 |
-| `newContext()` | 未到達（トレースに該当メッセージなし） | A + B |
-| `newPage()` | 未到達（同上） | A + B |
+| `connectOverCDP(http://…)` | 成功（TASK-43.3c 後）。`Browser.getVersion`・`Target.setAutoAttach`・`Browser.setDownloadBehavior`・`Target.getTargetInfo` がすべて成功する（TASK-43.3a 後は `Target.setAutoAttach` 以降が `-32601` で失敗していた） | A（TASK-43.3c 後の再取得）: seq 1〜11 |
+| `connectOverCDP(ws://…)` | トレース未収録。収集ハーネスは http 経由が成功すると ws 直接の段階を実行しない。同じ送信列を ws 接続で再生する `tests/playwright_trace.rs` の再生テストが、同一の応答になることを固定している | A（再生テスト）。実 Playwright での ws 直接の再収集は未実施 |
+| `newContext()` | 失敗。`Target.createBrowserContext` が `-32601`（段階 2b の対象） | A: seq 12〜14 |
+| `newPage()` | 未到達（`newContext()` の失敗による） | A |
 
 `-32601` は未実装メソッドへ成功を捏造しない `CDP-6`・`SEC-2` の方針どおりの挙動で、バグではない。
 
@@ -149,12 +149,44 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
 - 実装したのは `Target.getTargetInfo` のみ（`playwright_compat.rs`。`sessionId` 付きは `-32602`）。
   引数なしは `type:"browser"`・`attached:true` の実値（`CdpState` のブラウザ ID）。`targetId` 指定は
   `TargetRegistry` の実値（`attached` は実セッションの有無）で、未知・不正は `-32602`
-- `Target.setAutoAttach` と `Browser.setDownloadBehavior` は**登録を取り下げた**（`-32601` のまま）。
+- `Target.setAutoAttach` と `Browser.setDownloadBehavior` は**登録を取り下げた**（`-32601` のまま。段階 2c〔TASK-43.3c・#908〕で実体に接続して登録し直した）。
   設定を保存して `{}` を返すだけでは、実セッションの attach・`Target.attachedToTarget` の送出や
   ダウンロード処理（`downloadPath` の保存・イベント通知）に接続されておらず、クライアントに有効化済みと
   誤認させる（`CDP-6`・`REPAIR-3`）。実体と接続できる段階（段階 2b・2c 以降）で改めて実装する
 - このため `connectOverCDP` の到達点は TASK-43.3a 後と同じ（`Target.setAutoAttach` で停止。
   `Target.getTargetInfo` は送られない）。トレース（`newpage-trace.jsonl`）も TASK-43.3a 後の内容に戻した
+
+### 段階 2c の実施結果（TASK-43.3c・#908。実測 A）
+
+段階 2a で取り下げた 2 メソッドを、実体に接続して登録し直した（`playwright_compat.rs`・`conn_state.rs`）。
+
+- `Target.setAutoAttach`（root セッションのみ）:
+  - `autoAttach:true` は、この接続がまだ attach していない既存ターゲットすべてへ `TargetRegistry::attach` し、
+    ターゲットごとに `Target.attachedToTarget`（`sessionId`・`targetInfo`・`waitingForDebugger:false`）を
+    応答の後に送出する。重複呼び出しは冪等。途中失敗（`MAX_SESSIONS` 到達等）は巻き戻す（`CDP-7`）
+  - `autoAttach:false` はこの接続が attach したセッションを外し、`Target.detachedFromTarget` を送出する
+  - セッションの所有は接続スコープで、切断（`ws.rs` の `on_close`）で解放する
+  - 拒否（`-32602`）: `filter`（Puppeteer の除外フィルタ。黙って無視すると除外すべきターゲットまで attach するため）、
+    `flatten` が `true` 以外（`sendMessageToTarget` 方式は未実装）、`sessionId` 付き（子ターゲットのモデルが無い）。
+    `waitForDebuggerOnStart` は型のみ検証し、ターゲットを一時停止しないためイベントは常に `waitingForDebugger:false`
+  - 接続なしの直接 dispatch は `-32000`（`no connection`）
+- `Browser.setDownloadBehavior`:
+  - **設定の検証と接続スコープでの保持のみ**。ダウンロード実行系（保存・`Browser.downloadWillBegin`・
+    `downloadProgress`）は未実装で、現状ダウンロードは発生しない（`deny` 相当）。Playwright の接続シーケンスを通すために
+    `allowAndName` を受理するが、ダウンロードが動くことは意味しない（`CDP-6`・`REPAIR-3`。判断が割れる点としてレビュー対象）
+  - `behavior` は `deny`・`allow`・`allowAndName`・`default`。`allow`・`allowAndName` は `downloadPath` 必須
+  - `downloadPath` は絶対パス・`..` なし・NUL なし・4096 バイト以下。**サーバーはこのパスに一切ファイル操作をしない**
+    （作成・書き込み・存在確認なし）。実行系で書き込む際はプロファイル境界（`PROF`）を踏まえた別途のセキュリティ設計を要する
+  - `browserContextId` 指定は `-32602`（browser context は段階 2b で導入）。`eventsEnabled` は保持するがイベントは送出しない
+  - 寿命は接続スコープ（切断で破棄・プロファイルへ永続化しない）
+- `make trace-playwright` の再取得結果: `connectOverCDP(http)` は成功し（seq 3〜11）、続く `newContext()` で
+  `Target.createBrowserContext` が `-32601` となり停止する（seq 12〜14）。**次に止まるメソッドは
+  `Target.createBrowserContext`**（段階 2b）。段階 2a の予測（`Target.getTargetInfo` 以降または
+  `Target.createBrowserContext`）と一致した
+- 既知の制約: `Target.attachedToTarget` の `targetInfo` に `browserContextId` が無い。トレースサーバーは
+  ターゲットを事前作成しないため今回の到達には影響しないが、既存ターゲットがある状態の Playwright は
+  `browserContextId` を要する見込み（B）。段階 2b で追加する
+- 送出順は応答 → イベント列のまま（`CDP-5`）。Chromium 流の並べ替えは `Target.createTarget` を実装する段階 2b 以降で判断する
 
 #### 予測 #11（`Page.frameNavigated`）の訂正（種別 B・未実測）
 

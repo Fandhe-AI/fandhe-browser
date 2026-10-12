@@ -34,21 +34,25 @@ const TRACE: &str = include_str!("../../../harness/playwright-trace/results/newp
 const MAX_TRACE_LINES: usize = 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
-/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3a 後）。`Browser.getVersion` は成功し、
-/// 続く `Target.setAutoAttach`・`Browser.setDownloadBehavior` が未実装（`-32601`。`CDP-6`）で
-/// `connectOverCDP` が失敗する。`connectOverCDP(http)` と `(ws)` の 2 接続分を記録する
-/// （id は接続ごとに 1 から振り直される）。
+/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3c 後）。`connectOverCDP(http)` が成功し
+/// （`Browser.getVersion`・`Target.setAutoAttach`・`Browser.setDownloadBehavior`・`Target.getTargetInfo` が成功）、
+/// 続く `newContext()` の `Target.createBrowserContext` が未実装（`-32601`。`CDP-6`）で失敗する。
+/// http 経由が成功すると収集ハーネスは ws 直接の段階を実行しないため、ws の経路は
+/// 再生テスト（ws 接続でこの送信列を再生する）が担う。
 ///
 /// 注意: `Browser.getVersion` の応答に `CARGO_PKG_VERSION` が入るため、workspace の版を上げたら
 /// `make trace-playwright` でトレースを再取得すること。
-const EXPECTED_SEND_METHODS: [&str; 6] = [
+const EXPECTED_SEND_METHODS: [&str; 5] = [
     "Browser.getVersion",
     "Target.setAutoAttach",
     "Browser.setDownloadBehavior",
-    "Browser.getVersion",
-    "Target.setAutoAttach",
-    "Browser.setDownloadBehavior",
+    "Target.getTargetInfo",
+    "Target.createBrowserContext",
 ];
+
+/// トレース内で一時ディレクトリを表すプレースホルダ（収集ハーネスが正規化した値）。
+/// 再生時は実在しうる絶対パスへ置き換える（`downloadPath` は絶対パスのみ受理される）。
+const ARTIFACTS_PLACEHOLDER: &str = "<ARTIFACTS_DIR>";
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -212,8 +216,8 @@ fn cdp2_playwright_trace_is_well_formed() {
         .map(|r| r["message"]["method"].as_str().expect("method is a string"))
         .collect();
     assert_eq!(sends, EXPECTED_SEND_METHODS);
-    // 現状の到達点: connectOverCDP のみ失敗し（Target.setAutoAttach 以降が未実装）、
-    // newContext / newPage には到達しない。
+    // 現状の到達点: connectOverCDP(http) は成功し、newContext が失敗する
+    // （Target.createBrowserContext が未実装）。newPage には到達しない。
     let stages: Vec<(&str, bool)> = recs
         .iter()
         .filter(|r| r["kind"] == "stage")
@@ -221,10 +225,7 @@ fn cdp2_playwright_trace_is_well_formed() {
         .collect();
     assert_eq!(
         stages,
-        [
-            ("connectOverCDP(http)", false),
-            ("connectOverCDP(ws)", false)
-        ]
+        [("connectOverCDP(http)", true), ("newContext", false)]
     );
 }
 
@@ -267,7 +268,13 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
     let sends: Vec<Value> = recs
         .iter()
         .filter(|r| r["kind"] == "cdp" && r["dir"] == "send")
-        .map(|r| r["message"].clone())
+        .map(|r| {
+            let mut m = r["message"].clone();
+            if m["params"]["downloadPath"] == ARTIFACTS_PLACEHOLDER {
+                m["params"]["downloadPath"] = json!(dir.0.to_str().expect("utf-8 temp path"));
+            }
+            m
+        })
         .collect();
     let recvs: Vec<Value> = recs
         .iter()
@@ -301,17 +308,17 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
     let version = json!({"id": 1, "result": {
         "protocolVersion": "1.3", "product": product, "userAgent": product
     }});
-    let unimpl =
-        |id: u32| json!({"id": id, "error": {"code": -32601, "message": "method not implemented"}});
     assert_eq!(
         replayed,
         [
-            version.clone(),
-            unimpl(2),
-            unimpl(3),
             version,
-            unimpl(2),
-            unimpl(3)
+            json!({"id": 2, "result": {}}),
+            json!({"id": 3, "result": {}}),
+            json!({"id": 4, "result": {"targetInfo": {
+                "targetId": "trace-1", "type": "browser", "title": "", "url": "",
+                "attached": true, "canAccessOpener": false
+            }}}),
+            json!({"id": 5, "error": {"code": -32601, "message": "method not implemented"}}),
         ]
     );
     assert_eq!(replayed, recvs, "replay must match the recorded responses");
@@ -326,10 +333,55 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
     assert_eq!(
         logged,
         [
-            ("Browser.getVersion", 2, 0),
-            ("Browser.setDownloadBehavior", 0, 2),
-            ("Target.setAutoAttach", 0, 2)
+            ("Browser.getVersion", 1, 0),
+            ("Browser.setDownloadBehavior", 1, 0),
+            ("Target.createBrowserContext", 0, 1),
+            ("Target.getTargetInfo", 1, 0),
+            ("Target.setAutoAttach", 1, 0)
         ],
         "snapshot: {snap:?}"
     );
+}
+
+#[tokio::test]
+async fn cdp2_auto_attach_over_websocket_emits_event_after_response_and_frees_session_on_close() {
+    let dir = TempDir::new();
+    let (addr, st) = start(&dir).await;
+    let target = st
+        .registry()
+        .create_target(fandhe_browser_cdp::TargetKind::Page, "about:blank")
+        .unwrap();
+    let st2 = Arc::clone(&st);
+    let target_id = target.as_str().to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut s = connect(addr);
+        assert_eq!(
+            upgrade(&mut s, "/devtools/browser/trace-1", addr.port()),
+            101
+        );
+        let req = json!({"id": 1, "method": "Target.setAutoAttach",
+            "params": {"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true}});
+        send_text(&mut s, &req.to_string());
+        // 送出順は応答 → イベント（CDP-5）。
+        assert_eq!(read_text_json(&mut s), json!({"id": 1, "result": {}}));
+        let ev = read_text_json(&mut s);
+        assert_eq!(ev["method"], "Target.attachedToTarget");
+        assert_eq!(ev["params"]["targetInfo"]["targetId"], target_id);
+        assert_eq!(ev["params"]["targetInfo"]["attached"], true);
+        assert_eq!(ev["params"]["waitingForDebugger"], false);
+        assert_eq!(st2.registry().session_count(), 1);
+        // 切断でこの接続の自動 attach セッションが解放される（CDP-7）。
+        drop(s);
+        let mut freed = false;
+        for _ in 0..100 {
+            if st2.registry().session_count() == 0 {
+                freed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(freed, "session must be released on disconnect");
+    })
+    .await
+    .unwrap();
 }

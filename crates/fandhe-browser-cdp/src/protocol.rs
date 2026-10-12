@@ -8,7 +8,7 @@
 //!
 //! 公開入口は無く crate 内部専用。後続タスクは [`builtin_handlers`] へメソッドを
 //! 追加するだけでよい（`Page.navigate` は 42.2 で登録済み、イベント送出は 42.3 で実装済み、
-//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b で登録済み。`Target.setAutoAttach`・`Browser.setDownloadBehavior` は実体未接続のため未登録）。
+//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b、`Target.setAutoAttach`・`Browser.setDownloadBehavior` は TASK-43.3c で登録済み）。
 //!
 //! # 入力の扱い
 //!
@@ -22,7 +22,7 @@
 //!
 //! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 //! `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・
-//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）のみ登録済みで、
+//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c・`CDP-2`）のみ登録済みで、
 //! それ以外のメソッドは JSON-RPC の「method not implemented」（`-32601`）エラーを返す。
 //! 汎用の空 success フォールバック（PoC-5 の暫定挙動）は採らない。理由は次のとおり。
 //!
@@ -90,6 +90,9 @@ impl CdpError {
     pub const INVALID_PARAMS: Self = Self::new(-32602, "invalid params");
     /// ハンドラ内部エラー（CDP の server error 帯）。
     pub const SERVER_ERROR: Self = Self::new(-32000, "server error");
+    /// WebSocket 接続を要するコマンドが接続なし（直接 dispatch）で呼ばれた、または接続が既に閉じている
+    /// （`Target.setAutoAttach`・`Browser.setDownloadBehavior`。接続スコープの状態を持てない。`CDP-2`）。
+    pub const NO_CONNECTION: Self = Self::new(-32000, "no connection");
     /// 直近の navigate 結果が無い（未 navigate・取得中・取得失敗を区別しない。`DOM.getDocument`）。
     pub const NO_DOCUMENT: Self = Self::new(-32000, "no document loaded");
     /// 未実装のオプション（`DOM.getDocument` の `pierce: true` 等）。成功を装わず明示的に拒否する（`REPAIR-3`）。
@@ -367,7 +370,7 @@ type HandlerTable = Vec<(&'static str, Box<dyn CommandHandler>)>;
 
 /// 組込みハンドラ表。`Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 /// `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・`Browser.getVersion`（TASK-43.3a）・
-/// `Target.getTargetInfo`（TASK-43.3b）を登録済み（`Target.setAutoAttach`・`Browser.setDownloadBehavior` は実体未接続のため未登録）（`CDP-1`・`CDP-2`）。
+/// `Target.getTargetInfo`（TASK-43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。実体に接続済み）を登録済み（`CDP-1`・`CDP-2`）。
 ///
 /// `Page.navigate` は既定の `FetchOptions`（内部アドレス拒否）で `Fetcher` を構築する。
 pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
@@ -382,6 +385,14 @@ pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
         (
             "Target.getTargetInfo",
             Box::new(crate::playwright_compat::TargetGetTargetInfo),
+        ),
+        (
+            "Target.setAutoAttach",
+            Box::new(crate::playwright_compat::TargetSetAutoAttach),
+        ),
+        (
+            "Browser.setDownloadBehavior",
+            Box::new(crate::playwright_compat::BrowserSetDownloadBehavior),
         ),
         ("DOM.getDocument", Box::new(crate::dom::DomGetDocument)),
         ("DOM.querySelector", Box::new(crate::dom::DomQuerySelector)),
@@ -856,8 +867,6 @@ mod tests {
             let st = state(&dir);
             let b = Dispatcher::builtin().unwrap();
             for (i, m) in [
-                "Target.setAutoAttach",
-                "Browser.setDownloadBehavior",
                 "Target.createBrowserContext",
                 "Target.createTarget",
                 "Target.attachToTarget",

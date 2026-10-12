@@ -34,7 +34,7 @@
 | P2-1 | P2 | robots.txt（SEC-3）の実行時の扱いが設計書に明記されていない | 解消（下記「robots.txt の責任分界」） |
 | P3-1 | P3 | 製品名定義が 2 箇所に重複（core の `fetch::USER_AGENT` と cdp の `discovery::PRODUCT`〔PR #808〕）。将来ずれる余地があった | 解消（#814）。cdp の `discovery::PRODUCT` を core の `fetch::USER_AGENT` の別名にし、一致を回帰テスト（`sec2_json_version_product_derives_from_core_user_agent`・`sec2_browser_get_version_product_derives_from_core_user_agent`）で固定 |
 | P3-2 | P3 | 識別面の不変条件が未明文化 | 下記「不変条件」として本書に明文化し、`.claude/rules/security.md` の偽装禁止節にも 1 行追記した |
-| P3-3 | P3 | CDP-6 方針の継続監視（今後 `Target.setAutoAttach`・`Browser.setDownloadBehavior` 等が個別登録される見込み） | `AGENTS.md` の AI PR レビュー観点に 1 項目追記した（下記「CDP-6 の継続監視」） |
+| P3-3 | P3 | CDP-6 方針の継続監視（`Target.setAutoAttach`・`Browser.setDownloadBehavior` は TASK-43.3c〔#908〕で実体に接続して個別登録した。UA 等の識別面を変更せず、`filter` 等の未対応入力は `-32602` で拒否、ダウンロード実行系は未実装で保持のみ。今後も同様に個別登録を監視する） | `AGENTS.md` の AI PR レビュー観点に 1 項目追記した（下記「CDP-6 の継続監視」） |
 
 ## robots.txt の責任分界（P2-1 の解消）
 

@@ -1,20 +1,27 @@
-//! Playwright `connectOverCDP` 互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b）。
+//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c）。
 //!
-//! `protocol::builtin_handlers` から登録される。`Browser.getVersion`（43.3a）と
-//! `Target.getTargetInfo`（43.3b）を実装する。値は fandhe-browser 自身の実値に限り、
-//! Chrome / Chromium を装わない（`SEC-2`）。
+//! `protocol::builtin_handlers` から登録される。`Browser.getVersion`（43.3a）・
+//! `Target.getTargetInfo`（43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（43.3c）を
+//! 実装する。値は fandhe-browser 自身の実値に限り、Chrome / Chromium を装わない（`SEC-2`）。
+//! `Target.setAutoAttach` は Playwright（`CRBrowser.connect`）だけでなく Puppeteer
+//! （`TargetManager.initialize`。TASK-45）も使う共用メソッド。
 //!
-//! `Target.setAutoAttach`・`Browser.setDownloadBehavior` は、実セッションの attach と
-//! `Target.attachedToTarget` の送出、ダウンロード処理への接続が未実装のため登録しない
-//! （`-32601` のまま。設定を保存するだけの成功応答は実装済みを装うため。`CDP-6`・`REPAIR-3`）。
-//! 登録するのは実体と接続できた段階（TASK-43.3b の後続）に限る。方針は
-//! `docs/design/playwright-compat.md`。
+//! 43.3b では実体未接続のため登録を取り下げた 2 メソッドを、43.3c で実体に接続して登録した。
+//! `Target.setAutoAttach` は `TargetRegistry::attach` と `Target.attachedToTarget` の送出に繋ぐ。
+//! `Browser.setDownloadBehavior` は設定の検証と接続スコープでの保持までで、ダウンロード実行系
+//! （保存・`Browser.downloadWillBegin`・`downloadProgress`）は未実装（`CDP-6`・`REPAIR-3`）。
+//! 接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
 
 use serde_json::{Value, json};
 
+use crate::conn_state::{
+    ConnStateError, DownloadBehavior, DownloadSettings, validate_download_path,
+};
 use crate::discovery::{PRODUCT, PROTOCOL_VERSION};
-use crate::protocol::{BoxFuture, CdpError, CommandContext, CommandHandler, HandlerOutput};
-use crate::target::TargetId;
+use crate::protocol::{
+    BoxFuture, CdpError, CdpEvent, CommandContext, CommandHandler, HandlerOutput,
+};
+use crate::target::{TargetId, TargetInfo};
 
 /// `Browser.getVersion`（`CDP-2`・TASK-43.3a）。
 ///
@@ -61,19 +68,182 @@ impl CommandHandler for TargetGetTargetInfo {
                         .registry()
                         .target_with_attached(&id)
                         .ok_or(CdpError::INVALID_PARAMS)?;
-                    json!({
-                        "targetId": t.target_id().as_str(),
-                        "type": t.kind().as_str(),
-                        "title": t.url(),
-                        "url": t.url(),
-                        "attached": attached,
-                        "canAccessOpener": false,
-                    })
+                    page_target_info(&t, attached)
                 }
             };
             Ok(HandlerOutput::result(json!({ "targetInfo": info })))
         })
     }
+}
+
+/// `Target.setAutoAttach`（`CDP-2`・`CDP-7`・TASK-43.3c）。
+///
+/// `autoAttach:true` で、この接続がまだ attach していない既存ターゲットすべてへ
+/// [`crate::target::TargetRegistry::attach`] し、ターゲットごとに `Target.attachedToTarget`
+/// （flatten）を応答の後に送出する。2 回目以降は重複 attach しない。途中で失敗したら
+/// この呼び出しの attach を巻き戻す。`autoAttach:false` はこの接続が attach したセッションを
+/// 外して `Target.detachedFromTarget` を送出する。セッションの所有は接続スコープで、切断で解放する。
+///
+/// スコープ外の入力は成功を装わず `-32602` で拒否する: `sessionId` 付き（子ターゲットの自動 attach は
+/// 子ターゲットのモデルが無く未実装）、`autoAttach:true` で `flatten` が `true` 以外
+/// （`sendMessageToTarget` 方式は未実装）、`filter`（Puppeteer の除外フィルタを黙って無視すると
+/// 除外すべきターゲットまで attach するため）。`waitForDebuggerOnStart` は型のみ検証し、fandhe は
+/// ターゲットを一時停止しないためイベントの `waitingForDebugger` は常に `false`。
+/// 接続なしの直接 dispatch は `NO_CONNECTION`。
+/// イベントの `targetInfo` に `browserContextId` は載らない（段階 2b で追加）。
+pub(crate) struct TargetSetAutoAttach;
+
+impl CommandHandler for TargetSetAutoAttach {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            if ctx.session_id.is_some() {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let auto_attach = params
+                .get("autoAttach")
+                .and_then(Value::as_bool)
+                .ok_or(CdpError::INVALID_PARAMS)?;
+            if params.get("filter").is_some() {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            if params
+                .get("waitForDebuggerOnStart")
+                .is_some_and(|v| !v.is_boolean())
+            {
+                return Err(CdpError::INVALID_PARAMS);
+            }
+            let flatten = match params.get("flatten") {
+                None | Some(Value::Bool(false)) => false,
+                Some(Value::Bool(true)) => true,
+                Some(_) => return Err(CdpError::INVALID_PARAMS),
+            };
+            let conn = ctx.conn.ok_or(CdpError::NO_CONNECTION)?;
+            let state = ctx.state;
+            if !auto_attach {
+                let detached = state
+                    .conn_scoped()
+                    .disable_auto_attach(conn, state.registry())
+                    .map_err(conn_error)?;
+                let mut out = HandlerOutput::result(json!({}));
+                for (target_id, session_id) in detached {
+                    out = out.with_event(CdpEvent {
+                        method: "Target.detachedFromTarget",
+                        params: json!({
+                            "sessionId": session_id.as_str(),
+                            "targetId": target_id.as_str(),
+                        }),
+                        session_id: None,
+                    });
+                }
+                return Ok(out);
+            }
+            if !flatten {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let attached = state
+                .conn_scoped()
+                .enable_auto_attach(conn, state.registry())
+                .map_err(conn_error)?;
+            let mut out = HandlerOutput::result(json!({}));
+            for (info, session_id) in attached {
+                out = out.with_event(CdpEvent {
+                    method: "Target.attachedToTarget",
+                    params: json!({
+                        "sessionId": session_id.as_str(),
+                        "targetInfo": page_target_info(&info, true),
+                        "waitingForDebugger": false,
+                    }),
+                    session_id: None,
+                });
+            }
+            Ok(out)
+        })
+    }
+}
+
+/// 接続状態の失敗を CDP エラーへ写す（入力値を含めない固定文言）。
+fn conn_error(e: ConnStateError) -> CdpError {
+    match e {
+        ConnStateError::NotLive => CdpError::NO_CONNECTION,
+        ConnStateError::Registry(_) => CdpError::SERVER_ERROR,
+    }
+}
+
+/// `Browser.setDownloadBehavior`（`CDP-2`・TASK-43.3c）。
+///
+/// **設定の受理と保持のみ**で、ダウンロード実行系（ファイル保存・`Browser.downloadWillBegin`・
+/// `Browser.downloadProgress` の送出）は未実装（`CDP-6`・`REPAIR-3`）。fandhe-browser は現状ダウンロードを
+/// 行わないため、受理しても実際にファイルが保存されることはない（`deny` 相当）。将来の実行系が
+/// 保持した設定を参照する。設定は接続スコープで、切断で破棄する（プロファイルへ永続化しない）。
+///
+/// 検証: `behavior` は `deny`・`allow`・`allowAndName`・`default` のみ。`allow`・`allowAndName` は
+/// `downloadPath` 必須。`downloadPath` は絶対パス・`..` なし・NUL なし・長さ上限内で、サーバーは
+/// そのパスに対して一切のファイル操作をしない（プロファイル境界・パストラバーサルを持ち込まない）。
+/// `browserContextId` は browser context が未導入（段階 2b）のため指定を `-32602` で拒否する
+/// （省略はブラウザ全体）。`eventsEnabled` は型検証して保持するがイベントは送出しない。
+/// `sessionId` 付き（ブラウザドメインのコマンド）は拒否。接続なしは `NO_CONNECTION`。
+pub(crate) struct BrowserSetDownloadBehavior;
+
+impl CommandHandler for BrowserSetDownloadBehavior {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            if ctx.session_id.is_some() || params.get("browserContextId").is_some() {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let behavior = params
+                .get("behavior")
+                .and_then(Value::as_str)
+                .and_then(DownloadBehavior::parse)
+                .ok_or(CdpError::INVALID_PARAMS)?;
+            let events_enabled = match params.get("eventsEnabled") {
+                None => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => return Err(CdpError::INVALID_PARAMS),
+            };
+            let download_path = match params.get("downloadPath") {
+                None if behavior.needs_path() => return Err(CdpError::INVALID_PARAMS),
+                None => None,
+                Some(v) => {
+                    let s = v.as_str().ok_or(CdpError::INVALID_PARAMS)?;
+                    Some(validate_download_path(s).ok_or(CdpError::INVALID_PARAMS)?)
+                }
+            };
+            let conn = ctx.conn.ok_or(CdpError::NO_CONNECTION)?;
+            ctx.state
+                .conn_scoped()
+                .set_download(
+                    conn,
+                    DownloadSettings {
+                        behavior,
+                        download_path,
+                        events_enabled,
+                    },
+                )
+                .map_err(conn_error)?;
+            Ok(HandlerOutput::result(json!({})))
+        })
+    }
+}
+
+/// registry 上のターゲットの `targetInfo`。`browserContextId`・`openerId` は実体がないため出さない
+/// （browser context は段階 2b の `Target.createBrowserContext` で導入する。`CDP-2`）。
+fn page_target_info(t: &TargetInfo, attached: bool) -> Value {
+    json!({
+        "targetId": t.target_id().as_str(),
+        "type": t.kind().as_str(),
+        "title": t.url(),
+        "url": t.url(),
+        "attached": attached,
+        "canAccessOpener": false,
+    })
 }
 
 /// ブラウザ自身の `targetInfo`。
@@ -152,6 +322,330 @@ mod tests {
         let s = v.to_string();
         for bad in ["Chrome", "Chromium", "HeadlessChrome"] {
             assert!(!s.contains(bad), "{bad} in {s}");
+        }
+    }
+
+    mod handlers {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use fandhe_browser_core::AppState;
+        use fandhe_browser_profile::Profile;
+
+        use super::*;
+        use crate::conn_state::DownloadBehavior;
+        use crate::protocol::{ConnId, Dispatcher};
+        use crate::server::CdpState;
+        use crate::target::{MAX_SESSIONS, SessionId, TargetKind};
+
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+        struct TempDir(std::path::PathBuf);
+
+        impl TempDir {
+            fn new() -> Self {
+                let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+                let base = std::env::temp_dir()
+                    .canonicalize()
+                    .unwrap_or_else(|_| std::env::temp_dir());
+                Self(base.join(format!("fandhe-cdp-compat-test-{}-{n}", std::process::id())))
+            }
+        }
+
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn state(dir: &TempDir) -> Arc<CdpState> {
+            let profile = Arc::new(Profile::open(&dir.0).expect("profile open"));
+            Arc::new(CdpState::new(Arc::new(AppState::with_disabled_renderer(
+                profile,
+            ))))
+        }
+
+        /// 接続 `conn`（None なら接続なし）で 1 リクエストを処理し、フレームを JSON で返す。
+        async fn call(st: &Arc<CdpState>, conn: Option<ConnId>, text: &str) -> Vec<Value> {
+            Dispatcher::builtin()
+                .unwrap()
+                .dispatch_on(st, conn, text)
+                .await
+                .into_frames()
+                .iter()
+                .map(|f| serde_json::from_str(f).unwrap())
+                .collect()
+        }
+
+        fn err(code: i64, msg: &str, id: i64) -> Value {
+            json!({"id": id, "error": {"code": code, "message": msg}})
+        }
+
+        fn auto_attach(id: i64, extra: &str) -> String {
+            format!(r#"{{"id":{id},"method":"Target.setAutoAttach","params":{{{extra}}}}}"#)
+        }
+
+        fn dl(id: i64, extra: &str) -> String {
+            format!(r#"{{"id":{id},"method":"Browser.setDownloadBehavior","params":{{{extra}}}}}"#)
+        }
+
+        fn open_conn(st: &Arc<CdpState>, n: u64) -> ConnId {
+            let c = ConnId::new(n);
+            st.open_connection(c);
+            c
+        }
+
+        fn new_page(st: &Arc<CdpState>, url: &str) -> TargetId {
+            st.registry().create_target(TargetKind::Page, url).unwrap()
+        }
+
+        const ON: &str = r#""autoAttach":true,"flatten":true"#;
+
+        #[tokio::test]
+        async fn cdp2_set_auto_attach_attaches_existing_targets_and_emits_events() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t1 = new_page(&st, "about:blank");
+            let t2 = new_page(&st, "https://example.test/");
+            let req = auto_attach(
+                7,
+                r#""autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true"#,
+            );
+            let f = call(&st, Some(c), &req).await;
+            assert_eq!(f.len(), 3);
+            assert_eq!(f[0], json!({"id": 7, "result": {}}));
+            let expected = [(&t1, "about:blank"), (&t2, "https://example.test/")];
+            for (ev, (t, url)) in f[1..].iter().zip(expected) {
+                assert_eq!(ev["method"], "Target.attachedToTarget");
+                assert!(ev.get("sessionId").is_none());
+                let p = &ev["params"];
+                assert_eq!(p["waitingForDebugger"], false);
+                let sid = SessionId::parse(p["sessionId"].as_str().unwrap()).unwrap();
+                assert_eq!(st.registry().session_target(&sid), Some(t.clone()));
+                assert_eq!(
+                    p["targetInfo"],
+                    json!({
+                        "targetId": t.as_str(), "type": "page", "title": url, "url": url,
+                        "attached": true, "canAccessOpener": false
+                    })
+                );
+            }
+            assert_eq!(st.registry().session_count(), 2);
+        }
+
+        #[tokio::test]
+        async fn cdp2_set_auto_attach_is_idempotent() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let req = auto_attach(1, ON);
+            assert_eq!(call(&st, Some(c), &req).await.len(), 1);
+            new_page(&st, "about:blank");
+            assert_eq!(call(&st, Some(c), &req).await.len(), 2);
+            assert_eq!(call(&st, Some(c), &req).await.len(), 1);
+            assert_eq!(st.registry().session_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn cdp2_set_auto_attach_rejects_bad_params_without_touching_registry() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            new_page(&st, "about:blank");
+            let unsupported = err(-32602, "unsupported params", 1);
+            let invalid = err(-32602, "invalid params", 1);
+            let cases = [
+                (
+                    r#""autoAttach":true,"flatten":true,"filter":[{"type":"page","exclude":true}]"#,
+                    &unsupported,
+                ),
+                (r#""autoAttach":true"#, &unsupported),
+                (r#""autoAttach":true,"flatten":false"#, &unsupported),
+                (r#""autoAttach":true,"flatten":"yes""#, &invalid),
+                (r#""flatten":true"#, &invalid),
+                (r#""autoAttach":"true","flatten":true"#, &invalid),
+                (
+                    r#""autoAttach":true,"flatten":true,"waitForDebuggerOnStart":1"#,
+                    &invalid,
+                ),
+            ];
+            for (extra, want) in cases {
+                let f = call(&st, Some(c), &auto_attach(1, extra)).await;
+                assert_eq!(f, vec![want.clone()], "{extra}");
+            }
+            let with_session = r#"{"id":1,"method":"Target.setAutoAttach","sessionId":"S1","params":{"autoAttach":true,"flatten":true}}"#;
+            assert_eq!(
+                call(&st, Some(c), with_session).await,
+                vec![
+                    json!({"id":1,"sessionId":"S1","error":{"code":-32602,"message":"unsupported params"}})
+                ]
+            );
+            assert_eq!(
+                call(&st, None, &auto_attach(1, ON)).await,
+                vec![err(-32000, "no connection", 1)]
+            );
+            assert_eq!(st.registry().session_count(), 0);
+        }
+
+        #[tokio::test]
+        async fn cdp2_set_auto_attach_false_detaches_and_emits_detached() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            let foreign = st.registry().attach(&t).unwrap();
+            let on = call(&st, Some(c), &auto_attach(1, ON)).await;
+            let sid = on[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            let off = call(&st, Some(c), &auto_attach(2, r#""autoAttach":false"#)).await;
+            assert_eq!(off.len(), 2);
+            assert_eq!(off[0], json!({"id": 2, "result": {}}));
+            assert_eq!(
+                off[1],
+                json!({"method": "Target.detachedFromTarget", "params": {"sessionId": sid, "targetId": t.as_str()}})
+            );
+            assert_eq!(st.registry().session_count(), 1);
+            assert_eq!(st.registry().session_target(&foreign), Some(t));
+            let again = call(&st, Some(c), &auto_attach(3, r#""autoAttach":false"#)).await;
+            assert_eq!(again.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn cdp7_set_auto_attach_session_limit_rolls_back_and_errors() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t1 = new_page(&st, "about:blank");
+            new_page(&st, "about:blank");
+            for _ in 0..(MAX_SESSIONS - 1) {
+                st.registry().attach(&t1).unwrap();
+            }
+            let before = st.registry().session_count();
+            let f = call(&st, Some(c), &auto_attach(1, ON)).await;
+            assert_eq!(f, vec![err(-32000, "server error", 1)]);
+            assert_eq!(st.registry().session_count(), before);
+        }
+
+        #[tokio::test]
+        async fn cdp7_release_connection_frees_auto_attached_sessions_only() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let (c1, c2) = (open_conn(&st, 1), open_conn(&st, 2));
+            new_page(&st, "about:blank");
+            let req = auto_attach(1, ON);
+            call(&st, Some(c1), &req).await;
+            call(&st, Some(c2), &req).await;
+            assert_eq!(st.registry().session_count(), 2);
+            st.release_connection(c1);
+            assert_eq!(st.registry().session_count(), 1);
+            // 解放後の接続は状態を持てない。
+            assert_eq!(
+                call(&st, Some(c1), &req).await,
+                vec![err(-32000, "no connection", 1)]
+            );
+            st.release_connection(c2);
+            assert_eq!(st.registry().session_count(), 0);
+        }
+
+        #[tokio::test]
+        async fn cdp2_set_download_behavior_stores_validated_settings_per_connection() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let abs = std::env::temp_dir().join("fandhe-dl-not-created");
+            let path_json = serde_json::to_string(abs.to_str().unwrap()).unwrap();
+            let ok = format!(
+                r#""behavior":"allowAndName","downloadPath":{path_json},"eventsEnabled":true"#
+            );
+            assert_eq!(
+                call(&st, Some(c), &dl(4, &ok)).await,
+                vec![json!({"id":4,"result":{}})]
+            );
+            let s = st.conn_scoped().download(c).unwrap();
+            assert_eq!(s.behavior, DownloadBehavior::AllowAndName);
+            assert_eq!(s.download_path, Some(abs.clone()));
+            assert!(s.events_enabled);
+            // サーバーは downloadPath に触れない（作成しない）。
+            assert!(!abs.exists());
+            assert_eq!(
+                call(&st, Some(c), &dl(5, r#""behavior":"deny""#)).await,
+                vec![json!({"id":5,"result":{}})]
+            );
+            let s = st.conn_scoped().download(c).unwrap();
+            assert_eq!(
+                (s.behavior, s.download_path, s.events_enabled),
+                (DownloadBehavior::Deny, None, false)
+            );
+            st.release_connection(c);
+            assert!(st.conn_scoped().download(c).is_none());
+        }
+
+        #[tokio::test]
+        async fn cdp2_set_download_behavior_rejects_bad_params_and_keeps_previous() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(&st, Some(c), &dl(1, r#""behavior":"deny""#)).await;
+            let tmp = std::env::temp_dir();
+            let abs = serde_json::to_string(tmp.to_str().unwrap()).unwrap();
+            let dotdot = serde_json::to_string(tmp.join("..").join("x").to_str().unwrap()).unwrap();
+            let long = format!("\"{}\"", "a".repeat(5000));
+            let invalid = err(-32602, "invalid params", 2);
+            let cases: Vec<(String, Value)> = vec![
+                (r#""behavior":"nope""#.into(), invalid.clone()),
+                (r#""behavior":5"#.into(), invalid.clone()),
+                (String::new(), invalid.clone()),
+                (r#""behavior":"allow""#.into(), invalid.clone()),
+                (
+                    r#""behavior":"allowAndName","downloadPath":"relative/dir""#.into(),
+                    invalid.clone(),
+                ),
+                (
+                    format!(r#""behavior":"allow","downloadPath":{dotdot}"#),
+                    invalid.clone(),
+                ),
+                (
+                    r#""behavior":"allow","downloadPath":"/tmp/a\u0000b""#.into(),
+                    invalid.clone(),
+                ),
+                (
+                    format!(r#""behavior":"allow","downloadPath":{long}"#),
+                    invalid.clone(),
+                ),
+                (
+                    format!(r#""behavior":"allow","downloadPath":{abs},"eventsEnabled":"x""#),
+                    invalid.clone(),
+                ),
+                (
+                    r#""behavior":"deny","browserContextId":"X""#.into(),
+                    err(-32602, "unsupported params", 2),
+                ),
+            ];
+            for (extra, want) in cases {
+                assert_eq!(
+                    call(&st, Some(c), &dl(2, &extra)).await,
+                    vec![want],
+                    "{extra}"
+                );
+            }
+            assert_eq!(
+                st.conn_scoped().download(c).unwrap().behavior,
+                DownloadBehavior::Deny
+            );
+            assert_eq!(
+                call(&st, None, &dl(3, r#""behavior":"deny""#)).await,
+                vec![err(-32000, "no connection", 3)]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp2_set_download_behavior_is_isolated_between_connections() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let (c1, c2) = (open_conn(&st, 1), open_conn(&st, 2));
+            call(&st, Some(c1), &dl(1, r#""behavior":"deny""#)).await;
+            assert!(st.conn_scoped().download(c1).is_some());
+            assert!(st.conn_scoped().download(c2).is_none());
         }
     }
 }
