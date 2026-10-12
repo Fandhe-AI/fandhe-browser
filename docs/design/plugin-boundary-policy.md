@@ -71,7 +71,7 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
   - `readelf -d` の `(NEEDED)` が 0 件
   - `readelf -l` に `INTERP` セグメントが無い
   - `ldd` に共有ライブラリ依存を示す `=>` 行が無い（`INTERP` があるバイナリには `ldd` を実行しない）
-  - `file` が `static-pie linked` または `statically linked` を示す（実物は `static-pie linked`）
+  - `file` の文言（`static-pie linked` / `statically linked`）は記録のみで判定に使わない（古い `file` は static-pie でも `dynamically linked` と出すため）
 - 非 ELF・不在・`readelf` の失敗は NG（fail-closed）。`--self-test` は合成データと、実物の動的 ELF を検出できる陰性対照を含む
 - 実行方法は `make check-static-link`（Linux のみ・要 musl ターゲットと `musl-tools`）。musl 三つ組で `fandhe-browser-cli` の既定（V8）と軽量（`--no-default-features --features js-boa`）を release ビルドして検査する。V8 prebuilt の SHA-256 ピンは `docker/release-build.sh` の値を使う。`make ci` には含めない
 - CI では `harness-ubuntu` の `[static-link]` ステップが実行する。ビルド先は `target/` の外で、cache には入れない
