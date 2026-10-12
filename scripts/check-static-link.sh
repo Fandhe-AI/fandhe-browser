@@ -13,7 +13,8 @@
 # glibc の ldd は対象のローダを起動しうるため、信頼できる（同じジョブでビルドした）バイナリにだけ使う。
 #
 # 判定（全て満たしたときだけ pass）: readelf -d の (NEEDED) が 0 件 / readelf -l に INTERP が無い /
-#   ldd に "=>" 行が無い / file が static-pie または statically linked を示す。
+#   ldd に "=>" 行が無い。file の文言は記録のみで判定に使わない
+#   （古い file は static-pie でも dynamically linked と出すため。旧 verify-static.sh と同じ方針）。
 # 非 ELF・不在・ツール出力の取得失敗は fail-open にせず NG とする。
 #
 # 使い方: check-static-link.sh <binary>...   |   check-static-link.sh --self-test
@@ -64,7 +65,7 @@ classify_file() {
 
 # judge <needed> <interp> <ldd_deps> <file_class>: pass / fail
 judge() {
-  if [ "$1" = "0" ] && [ "$2" = "absent" ] && [ "$3" = "0" ] && [ "$4" != "other" ]; then
+  if [ "$1" = "0" ] && [ "$2" = "absent" ] && [ "$3" = "0" ]; then
     printf 'pass\n'
   else
     printf 'fail\n'
@@ -169,7 +170,7 @@ self_test() {
   expect "judge: needed" fail "$(judge 1 absent 0 static-pie)"
   expect "judge: interp" fail "$(judge 0 present 0 static-pie)"
   expect "judge: ldd deps" fail "$(judge 0 absent 1 static-pie)"
-  expect "judge: file class" fail "$(judge 0 absent 0 other)"
+  expect "judge: file class is informational" pass "$(judge 0 absent 0 other)"
 
   if [ "$(uname -s)" != "Linux" ]; then
     echo "note: not Linux; skipping real-binary cases" >&2

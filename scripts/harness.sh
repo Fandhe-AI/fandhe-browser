@@ -113,7 +113,7 @@ case "${name}" in
     # 出荷物そのものの関門は docker/Dockerfile.release の verify-* ステージ（判定ロジックは同じ scripts/check-static-link.sh）。
     [ "$(uname -s)" = "Linux" ] || skip "${name} supports Linux only (macOS: #364, Windows: #365)"
     case "$(uname -m)" in
-      x86_64) triple="x86_64-unknown-linux-musl"; musl_cc="x86_64-linux-musl-gcc" ;;
+      x86_64) triple="x86_64-unknown-linux-musl"; musl_cc="musl-gcc" ;;
       aarch64) triple="aarch64-unknown-linux-musl"; musl_cc="aarch64-linux-musl-gcc" ;;
       *) echo "error: unsupported architecture for ${name}: $(uname -m)" >&2; exit 2 ;;
     esac
