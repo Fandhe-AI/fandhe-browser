@@ -342,6 +342,9 @@ mod tests {
         }
     }
 
+    // CdpState は AppState（Profile::open）が必要で、非 unix では構築手段が無い
+    // （protocol.rs のテストと同じ理由）ため、状態を要するハンドラのテストは unix 限定。
+    #[cfg(unix)]
     mod handlers {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};

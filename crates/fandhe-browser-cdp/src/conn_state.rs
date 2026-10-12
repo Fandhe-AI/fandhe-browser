@@ -294,7 +294,10 @@ impl ConnectionScoped {
     }
 
     /// 保持中のダウンロード設定（実行系が未実装のためテストのみが読む）。
-    #[cfg(test)]
+    ///
+    /// 読み手は `playwright_compat` の unix 限定ハンドラテスト（`CdpState` の構築に要る
+    /// `Profile::open` が非 unix で `Unsupported` を返す）だけのため、非 unix では未使用になる。
+    #[cfg(all(test, unix))]
     pub(crate) fn download(&self, conn: ConnId) -> Option<DownloadSettings> {
         self.lock().get(&conn).and_then(|e| e.download.clone())
     }
