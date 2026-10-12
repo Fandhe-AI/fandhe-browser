@@ -59,6 +59,13 @@ pub fn resolve_bin(env_value: Option<&str>, manifest_dir: &Path) -> Result<PathB
     Ok(path)
 }
 
+/// 書き込みスレッドへ渡す 1 行分の仕事。`ack` があれば `write_all` と `flush` の成否を通知する
+/// （cold start 計測が通知の送信完了まで窓に含めるため。TASK-95.2・`PLUG-3`）。
+struct WriteJob {
+    bytes: Vec<u8>,
+    ack: Option<SyncSender<bool>>,
+}
+
 enum LineEvent {
     Line(String),
     Eof,
@@ -70,7 +77,7 @@ enum LineEvent {
 pub struct McpSession {
     child: Child,
     /// stdin への書き込みは専用スレッドが担う（パイプ満杯で呼び出し側が無期限に止まらないため）。
-    writer: Option<SyncSender<Vec<u8>>>,
+    writer: Option<SyncSender<WriteJob>>,
     rx: Receiver<LineEvent>,
     stderr: Arc<Mutex<Vec<u8>>>,
     next_id: u64,
@@ -88,7 +95,7 @@ impl McpSession {
             .spawn()
             .map_err(|_| "failed to spawn fandhe-browser-mcp".to_string())?;
         let writer = child.stdin.take().map(|stdin| {
-            let (wtx, wrx) = sync_channel::<Vec<u8>>(MAX_PENDING_WRITES);
+            let (wtx, wrx) = sync_channel::<WriteJob>(MAX_PENDING_WRITES);
             std::thread::spawn(move || write_lines(stdin, wrx));
             wtx
         });
@@ -113,7 +120,9 @@ impl McpSession {
         };
         let (line, _) = session.request("initialize", jsonrpc::initialize_params())?;
         jsonrpc::expect_ok_response(&line, 1).map_err(|e| session.with_stderr(e.to_string()))?;
-        session.send_line(&jsonrpc::notification_line("notifications/initialized"))?;
+        // 通知は書き込み・flush の完了と成功を確認してから返す（キュー投入だけで返すと、
+        // 未送信の時間を計測窓から除外し、書き込み失敗も成功として扱ってしまう）。
+        session.send_line_confirmed(&jsonrpc::notification_line("notifications/initialized"))?;
         Ok(session)
     }
 
@@ -149,6 +158,28 @@ impl McpSession {
     /// 1 行を書き込みスレッドへ渡す（非ブロッキング）。実際の書き込みが止まっても期限は
     /// `request` の `recv_timeout` と Drop の kill が担う。
     fn send_line(&mut self, line: &str) -> Result<(), String> {
+        self.enqueue(line, None)
+    }
+
+    /// 1 行を送り、書き込みスレッドの `write_all` と `flush` の成功を `CALL_TIMEOUT`（セッション残り時間で
+    /// 切り詰め）まで待つ。失敗・期限超過は Err。
+    fn send_line_confirmed(&mut self, line: &str) -> Result<(), String> {
+        let (ack_tx, ack_rx) = sync_channel::<bool>(1);
+        self.enqueue(line, Some(ack_tx))?;
+        let remaining = SESSION_TIMEOUT.saturating_sub(self.started.elapsed());
+        if remaining.is_zero() {
+            return Err("mcp session deadline exceeded".to_string());
+        }
+        match ack_rx.recv_timeout(CALL_TIMEOUT.min(remaining)) {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(RecvTimeoutError::Disconnected) => {
+                Err(self.with_stderr("failed to write to mcp stdin".to_string()))
+            }
+            Err(RecvTimeoutError::Timeout) => Err("mcp stdin write timed out".to_string()),
+        }
+    }
+
+    fn enqueue(&mut self, line: &str, ack: Option<SyncSender<bool>>) -> Result<(), String> {
         let writer = self
             .writer
             .as_ref()
@@ -157,7 +188,7 @@ impl McpSession {
         bytes.extend_from_slice(line.as_bytes());
         bytes.push(b'\n');
         writer
-            .try_send(bytes)
+            .try_send(WriteJob { bytes, ack })
             .map_err(|_| self.with_stderr("failed to write to mcp stdin".to_string()))
     }
 
@@ -222,13 +253,16 @@ impl Drop for McpSession {
 
 /// 送信キューの行を子プロセスの stdin へ書く。書き込み失敗・チャネル切断（Drop）で終了する。
 /// 書き込みが詰まっても本スレッドだけが止まり、Drop の kill でパイプが閉じて解放される。
-fn write_lines(mut stdin: ChildStdin, rx: Receiver<Vec<u8>>) {
-    while let Ok(bytes) = rx.recv() {
-        if stdin
-            .write_all(&bytes)
+fn write_lines(mut stdin: ChildStdin, rx: Receiver<WriteJob>) {
+    while let Ok(job) = rx.recv() {
+        let ok = stdin
+            .write_all(&job.bytes)
             .and_then(|()| stdin.flush())
-            .is_err()
-        {
+            .is_ok();
+        if let Some(ack) = job.ack {
+            let _ = ack.try_send(ok);
+        }
+        if !ok {
             return;
         }
     }

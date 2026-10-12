@@ -1,12 +1,13 @@
 //! `plugin_overhead` ベンチの引数解析（TASK-95.1・Issue #375・`PLUG-3`）。
 //!
 //! `plugin_overhead.rs` の main が `cargo bench ... -- <args>` の引数を渡す。純関数で I/O を持たず、
-//! 資源枯渇を防ぐため回数・待ち時間に上限を設ける。`--metric` は TASK-95.2・95.3 が指標を足す拡張点。
+//! 資源枯渇を防ぐため回数・待ち時間に上限を設ける。`--metric` は指標の拡張点（cold start は TASK-95.2 で追加済み、レイテンシは TASK-95.3）。
 
-/// 計測する指標。`idle-rss`（TASK-95.1）・`call-latency`（TASK-95.3）。cold start は TASK-95.2。
+/// 計測する指標。`idle-rss`（TASK-95.1）・`cold-start`（TASK-95.2）・`call-latency`（TASK-95.3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Metric {
     IdleRss,
+    ColdStart,
     CallLatency,
 }
 
@@ -15,6 +16,8 @@ pub enum Metric {
 pub struct Options {
     pub metrics: Vec<Metric>,
     pub samples: usize,
+    /// cold start の試行回数（`--trials`。RSS の `--samples` とは別物）。
+    pub trials: usize,
     pub settle_ms: u64,
     pub interval_ms: u64,
     /// `call-latency` の計測呼び出し回数（既定 30 は `PLUG-3` の n=30）。
@@ -37,10 +40,11 @@ fn int_arg<T: std::str::FromStr + PartialOrd>(
 }
 
 impl Options {
-    /// 既定: `idle-rss`・3 サンプル・静置 800ms・間隔 200ms（PoC-15 と同じ）。
+    /// 既定: `idle-rss`・3 サンプル・5 試行（cold start）・静置 800ms・間隔 200ms（PoC-15 と同じ）。
     pub fn parse(args: &[String]) -> Result<Self, String> {
         let mut metrics: Vec<Metric> = Vec::new();
         let mut samples = 3usize;
+        let mut trials = 5usize;
         let mut settle_ms = 800u64;
         let mut interval_ms = 200u64;
         let mut calls = 30usize;
@@ -55,6 +59,11 @@ impl Options {
                             metrics.push(Metric::IdleRss);
                         }
                     }
+                    Some("cold-start") => {
+                        if !metrics.contains(&Metric::ColdStart) {
+                            metrics.push(Metric::ColdStart);
+                        }
+                    }
                     Some("call-latency") => {
                         if !metrics.contains(&Metric::CallLatency) {
                             metrics.push(Metric::CallLatency);
@@ -64,6 +73,7 @@ impl Options {
                     None => return Err("--metric requires a value".to_string()),
                 },
                 "--samples" => samples = int_arg("--samples", it.next(), 1, 20)?,
+                "--trials" => trials = int_arg("--trials", it.next(), 1, 20)?,
                 "--settle-ms" => settle_ms = int_arg("--settle-ms", it.next(), 0, 30_000)?,
                 "--interval-ms" => interval_ms = int_arg("--interval-ms", it.next(), 0, 5_000)?,
                 "--calls" => calls = int_arg("--calls", it.next(), 1, 1_000)?,
@@ -76,6 +86,7 @@ impl Options {
         Ok(Self {
             metrics,
             samples,
+            trials,
             settle_ms,
             interval_ms,
             calls,

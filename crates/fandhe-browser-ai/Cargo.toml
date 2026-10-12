@@ -172,7 +172,12 @@ harness = false
 name = "plugin_overhead_rss"
 path = "../../benches/plugin_overhead/rss_tests.rs"
 
-# 実バイナリを使う e2e smoke（PLUG-3・TASK-95.1）。#[ignore] のため `make check-plugin-overhead` が
+# cold start 計測の純関数のユニットテスト（PLUG-3・TASK-95.2・Issue #376）。
+[[test]]
+name = "plugin_overhead_cold_start"
+path = "../../benches/plugin_overhead/cold_start_tests.rs"
+
+# 実バイナリを使う e2e smoke（PLUG-3・TASK-95.1・TASK-95.2）。#[ignore] のため `make check-plugin-overhead` が
 # `--ignored` 付きで実行する。
 [[test]]
 name = "plugin_overhead_e2e"

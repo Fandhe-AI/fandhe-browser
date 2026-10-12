@@ -58,7 +58,7 @@ make check-deny-license-reject   # 許可外ライセンス（GPL/AGPL/LGPL/MPL-
 ```bash
 make measure-mcp-envelope   # 方式 B 本体と MCP 応答のトークン・レイテンシを測定（unix のみ。レポート: docs/design/mcp-envelope-report.md。再生成は MCP_ENVELOPE_ARGS="--iterations 100 --markdown"）
 make check-mcp-envelope     # 実 mcp バイナリでの e2e smoke（`make ci` に含む。unix のみ）
-make measure-plugin-overhead # mcp プラグインのアイドル RSS 増分・呼び出しレイテンシ p50/p95 を測定（PLUG-3。unix のみ。引数は PLUGIN_OVERHEAD_ARGS="--samples 5" または "--metric call-latency"。手法は benches/plugin_overhead/README.md）
+make measure-plugin-overhead # mcp プラグインのアイドル RSS 増分・cold start・呼び出しレイテンシ p50/p95 を測定（PLUG-3。unix のみ。引数は PLUGIN_OVERHEAD_ARGS="--samples 5"・"--metric cold-start --trials 5"・"--metric call-latency"。手法は benches/plugin_overhead/README.md）
 make check-plugin-overhead   # 上記計測の e2e smoke を実バイナリで実行（unix のみ。`make ci` には含めない）
 ```
 

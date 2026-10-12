@@ -12,6 +12,10 @@ mod app_host;
 mod call_latency;
 #[path = "call_latency_stats.rs"]
 mod call_latency_stats;
+#[path = "cold_start.rs"]
+mod cold_start;
+#[path = "cold_start_stats.rs"]
+mod cold_start_stats;
 #[path = "../../crates/fandhe-browser-ai/benches/mcp_envelope/host.rs"]
 mod host;
 #[path = "idle_rss.rs"]
@@ -93,6 +97,64 @@ fn plug3_measure_fails_when_plugin_exits_after_initialize() {
     assert!(err.contains("plugin process exited"), "{err}");
 }
 
+/// 実バイナリで cold start を計測できる（TASK-95.2・Issue #376・`PLUG-3`）。50ms との大小は検査しない
+/// （debug ビルドで走るため。達成判定は #379）。
+#[test]
+#[ignore = "requires the fandhe-browser-mcp binary (FANDHE_BROWSER_MCP_BIN); run via make check-plugin-overhead"]
+fn plug3_e2e_cold_start_is_measured_with_real_binary() {
+    let env_bin = std::env::var(mcp_client::BIN_ENV).ok();
+    let bin = mcp_client::resolve_bin(
+        env_bin.as_deref(),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+    .expect("mcp binary");
+    let opts = options::Options::parse(
+        &[
+            "--metric",
+            "cold-start",
+            "--trials",
+            "3",
+            "--interval-ms",
+            "20",
+        ]
+        .map(String::from),
+    )
+    .expect("options");
+    let m = cold_start::measure(&bin, &opts).expect("measure");
+    assert_eq!(m.handshake_ms.len(), 3);
+    for v in &m.handshake_ms {
+        assert!(*v > 0.0 && *v < 35_000.0, "unexpected cold start {v} ms");
+    }
+    assert!(m.median_ms().is_some());
+    let out = cold_start_stats::render_cold_start(&m, 50).expect("render");
+    assert!(out.contains("cold_start\t3\t"), "{out}");
+}
+
+/// ハンドシェイク前にプラグインが終了したら計測失敗になる（TASK-95.2・`PLUG-3`）。
+/// 偽プラグインはシステムの `false(1)`（スクリプトを書き出すと ETXTBSY の競合が起き得るため）。
+#[test]
+fn plug3_cold_start_fails_when_plugin_exits_without_handshake() {
+    let fake = ["/bin/false", "/usr/bin/false"]
+        .iter()
+        .map(std::path::Path::new)
+        .find(|p| p.is_file())
+        .expect("false(1) not found");
+    let opts = options::Options::parse(
+        &[
+            "--metric",
+            "cold-start",
+            "--trials",
+            "2",
+            "--interval-ms",
+            "0",
+        ]
+        .map(String::from),
+    )
+    .expect("options");
+    let err = cold_start::measure(fake, &opts).expect_err("measure must fail");
+    assert!(err.contains("cold start trial 0 failed"), "{err}");
+}
+
 /// 実バイナリで `tools/call snapshot` を N 回計測できる（TASK-95.3・`PLUG-3`）。目標値との大小は
 /// debug ビルドで走るため検査しない（達成判定は #379）。
 #[test]
@@ -118,8 +180,12 @@ fn plug3_e2e_call_latency_is_measured_with_real_binary() {
 }
 
 /// ツールが isError を返したら標本に数えず計測失敗になる（TASK-95.3・`PLUG-3`）。
+/// fixture は 100755 で管理されるが、チェックアウト環境で実行ビットが失われても spawn 失敗と
+/// 取り違えないよう、テスト内で 0o755 を明示する（spawn 失敗なら "isError" を含まず assert が落ちる）。
 #[test]
 fn plug3_call_latency_fails_when_tool_returns_error() {
+    use std::os::unix::fs::PermissionsExt;
+
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -127,6 +193,14 @@ fn plug3_call_latency_fails_when_tool_returns_error() {
         .join("plugin_overhead")
         .join("fixtures")
         .join("fake-mcp-tool-error.sh");
+    let mode = std::fs::metadata(&script)
+        .expect("fixture")
+        .permissions()
+        .mode();
+    if mode & 0o111 == 0 {
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fixture");
+    }
     let opts =
         options::Options::parse(&["--metric", "call-latency", "--calls", "3"].map(String::from))
             .expect("options");
