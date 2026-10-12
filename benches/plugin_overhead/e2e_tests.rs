@@ -8,6 +8,10 @@
 
 #[path = "../../crates/fandhe-browser-ai/benches/mcp_envelope/app_host.rs"]
 mod app_host;
+#[path = "cold_start.rs"]
+mod cold_start;
+#[path = "cold_start_stats.rs"]
+mod cold_start_stats;
 #[path = "../../crates/fandhe-browser-ai/benches/mcp_envelope/host.rs"]
 mod host;
 #[path = "idle_rss.rs"]
@@ -87,4 +91,62 @@ fn plug3_measure_fails_when_plugin_exits_after_initialize() {
     let _ = std::fs::remove_dir_all(&dir);
     let err = result.expect_err("measurement must fail when the plugin has exited");
     assert!(err.contains("plugin process exited"), "{err}");
+}
+
+/// 実バイナリで cold start を計測できる（TASK-95.2・Issue #376・`PLUG-3`）。50ms との大小は検査しない
+/// （debug ビルドで走るため。達成判定は #379）。
+#[test]
+#[ignore = "requires the fandhe-browser-mcp binary (FANDHE_BROWSER_MCP_BIN); run via make check-plugin-overhead"]
+fn plug3_e2e_cold_start_is_measured_with_real_binary() {
+    let env_bin = std::env::var(mcp_client::BIN_ENV).ok();
+    let bin = mcp_client::resolve_bin(
+        env_bin.as_deref(),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+    .expect("mcp binary");
+    let opts = options::Options::parse(
+        &[
+            "--metric",
+            "cold-start",
+            "--trials",
+            "3",
+            "--interval-ms",
+            "20",
+        ]
+        .map(String::from),
+    )
+    .expect("options");
+    let m = cold_start::measure(&bin, &opts).expect("measure");
+    assert_eq!(m.handshake_ms.len(), 3);
+    for v in &m.handshake_ms {
+        assert!(*v > 0.0 && *v < 35_000.0, "unexpected cold start {v} ms");
+    }
+    assert!(m.median_ms().is_some());
+    let out = cold_start_stats::render_cold_start(&m, 50).expect("render");
+    assert!(out.contains("cold_start\t3\t"), "{out}");
+}
+
+/// ハンドシェイク前にプラグインが終了したら計測失敗になる（TASK-95.2・`PLUG-3`）。
+/// 偽プラグインはシステムの `false(1)`（スクリプトを書き出すと ETXTBSY の競合が起き得るため）。
+#[test]
+fn plug3_cold_start_fails_when_plugin_exits_without_handshake() {
+    let fake = ["/bin/false", "/usr/bin/false"]
+        .iter()
+        .map(std::path::Path::new)
+        .find(|p| p.is_file())
+        .expect("false(1) not found");
+    let opts = options::Options::parse(
+        &[
+            "--metric",
+            "cold-start",
+            "--trials",
+            "2",
+            "--interval-ms",
+            "0",
+        ]
+        .map(String::from),
+    )
+    .expect("options");
+    let err = cold_start::measure(fake, &opts).expect_err("measure must fail");
+    assert!(err.contains("cold start trial 0 failed"), "{err}");
 }
