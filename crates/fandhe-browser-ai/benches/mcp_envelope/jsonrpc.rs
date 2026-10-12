@@ -27,8 +27,6 @@ pub enum EnvelopeError {
     /// JSON-RPC `error` 応答（code のみ保持）。
     RpcError { code: Option<i64> },
     /// `result.isError` が true。
-    // plugin_overhead ベンチ（TASK-95.1）は本項目を使わないが、mcp_envelope ベンチと共有するソースのため残す。
-    #[allow(dead_code)]
     ToolError,
     /// `result.content[0].text` が無い。
     MissingText,
@@ -73,8 +71,6 @@ pub fn initialize_params() -> Value {
 }
 
 /// `tools/call snapshot` の params。
-// plugin_overhead ベンチ（TASK-95.1）は本項目を使わないが、mcp_envelope ベンチと共有するソースのため残す。
-#[allow(dead_code)]
 pub fn snapshot_call_params() -> Value {
     json!({"name": "snapshot", "arguments": {}})
 }
@@ -95,8 +91,6 @@ fn parse_with_id(line: &str, expected_id: u64) -> Result<Value, EnvelopeError> {
 }
 
 /// 応答行が `id` に対応する成功応答であることを検証し、`result.content[0].text` を返す。
-// plugin_overhead ベンチ（TASK-95.1）は本項目を使わないが、mcp_envelope ベンチと共有するソースのため残す。
-#[allow(dead_code)]
 pub fn extract_snapshot_text(line: &str, expected_id: u64) -> Result<String, EnvelopeError> {
     let v = parse_with_id(line, expected_id)?;
     let result = v.get("result").ok_or(EnvelopeError::MissingText)?;
