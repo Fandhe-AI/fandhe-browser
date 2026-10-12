@@ -24,15 +24,15 @@
 //! ことで担保する
 //! （`tests/lock_cross_platform.rs`、`PROF-1`、TASK-54（54.3）・#193。std
 //! レベルの確認は 3 OS 共通、`Profile::open` 経由の確認は Unix 限定。Windows
-//! で `Profile::open` 経由の確認をするには下記の `XOS-7`〜`XOS-10` の実装が
-//! 前提）。パーミッション（ルート・4 サブディレクトリの `0o700`）・データ隔離
+//! の `Profile::open` は `%LOCALAPPDATA%` 配下のルートに限り成功するが、別プロセスからの
+//! 競合確認は未追加）。パーミッション（ルート・4 サブディレクトリの `0o700`）・データ隔離
 //! （各データ種別の書き込みが対応するサブディレクトリ配下にだけ置かれること）
 //! の網羅的な確認も実装済み（TASK-50（50.4）・#179、
 //! `crates/fandhe-browser-profile/tests/profile_open.rs`）。並行アクセス時の
 //! データ分離は新規コードではなくデータディレクトリ分離（`PROF-6`）自体で
 //! 成立し、`PROF-2`（TASK-51・#182）は `tests/isolation.rs`、`PROF-3`
 //! （TASK-52・#184・#185）は `tests/concurrent_isolation.rs` が Unix 上で
-//! 確認する（Windows は下記 `XOS-7`〜`XOS-10` の実装後の課題）。プロファイル削除
+//! 確認する（Windows 版の追加は別 Issue の課題）。プロファイル削除
 //! （`Profile::delete`。`PROF-5`、TASK-53（53.2）・#188）も実装済み。以下はいずれも
 //! 未実装であり、実装済みを装う公開 API・ダミー実装は置かない。
 //!
@@ -47,16 +47,21 @@
 //!   正規化と大文字小文字衝突検出を実装済み。非 ASCII の明示的エンコードと、
 //!   `Profile::create_file_in`・`ProfileStore` への組み込みは未実装
 //! - Windows 長パス（`XOS-8`、TASK-61（61.1）・#205）は `store::to_long_path` として実装済み。
-//!   `Profile::open` が verbatim ルートを使うのは下記 ACL 実装後
-//! - Windows での ACL によるアクセス制限（`XOS-7`〜`XOS-10`。Unix の
-//!   パーミッション 0o700 相当の隔離を Windows でも実現する。TASK-50・#176
-//!   では意図的にスコープ外とした。新規依存が必要になるため、導入時は
-//!   dependency-policy.md に従いユーザー承認を経る）
+//!   `Profile::open`（Windows）は verbatim ルートも `canonicalize` して判定する
+//! - Windows のアクセス制限（`XOS-7`〜`XOS-10`）は第 1 段階として実装済み（Issue #928）。
+//!   プロファイルルートが `%LOCALAPPDATA%` 配下のときだけ `Profile::open` が成功し、
+//!   アクセス制限は OS の既定の継承 ACL（SYSTEM・Administrators・本人のみ。Administrators
+//!   と SYSTEM は読める）に依存する。ACL の設定・検証はせず、配下外のルートは
+//!   `ProfileError::Unsupported` で拒否してディレクトリを作らない。Win32 API で ACL を
+//!   明示設定して任意のパスを許可する第 2 段階は、依存の feature 追加と `unsafe` の
+//!   承認が要るため未実装（後続。未判断）。Windows ではハンドル基準の走査・
+//!   `Profile::create_file_in`・`Profile::delete` も未実装
 
 pub mod normalize;
 pub mod profile;
 pub mod store;
 
+mod local_root;
 mod lock;
 
 pub use normalize::{MAX_REGISTRY_ENTRIES, NameRegistry, NormalizedName, normalize_name};

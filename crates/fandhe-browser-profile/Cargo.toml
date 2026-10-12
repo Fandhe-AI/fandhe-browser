@@ -8,6 +8,6 @@ description = "プロファイル分離 crate（fandhe-browser）。Profile 型�
 
 # unix 限定。ディレクトリハンドル基準の openat/mkdirat/fchmod で TOCTOU を
 # 解消するために使う（PR #437 レビュー指摘対応・ビヘイビア PROF-1）。
-# Windows では ACL 隔離が未実装（XOS-7〜XOS-10）のため参照しない。
+# Windows は std だけで実装する（%LOCALAPPDATA% 配下のみ許可。XOS-7・XOS-10）ため参照しない。
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }

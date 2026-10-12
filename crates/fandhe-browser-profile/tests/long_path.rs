@@ -24,11 +24,11 @@
 //! 成立することだけを示し、それ以上は主張しない。レジストリ切替の E2E と
 //! `longPathAware` マニフェスト比較は TASK-63（実機測定）の範囲。
 //!
-//! Windows では ACL 隔離が未実装（`XOS-7`）のため、`open_or_create` は常に
-//! `Unsupported` を返し、`to_long_path` 変換後のパスを公開 API から観測できない。
-//! そのため Windows での `open_or_create` 経路の変換検証は行わず（変換の回帰は
-//! `to_long_path` 単体とファイル操作のテストが担う）、fail-closed の維持のみ確認する。
-//! `open_or_create` 側の変換検証は ACL 実装時（`XOS-7`）に追加する。
+//! Windows では `Profile::open` が `%LOCALAPPDATA%` 配下のルートに限り成功する
+//! （Issue #928。`XOS-7`・`XOS-10`）。`TEMP` は通常その配下のため、260 文字超のルートの
+//! `open_or_create` が長パスで成功し `profile.lock` と 4 サブディレクトリが作られることを
+//! 確認する。配下外が `Unsupported` になる契約は `src/profile.rs`・`src/store.rs` の
+//! `#[cfg(windows)]` テストが担う。
 
 use fandhe_browser_profile::{ExplicitStore, LongPathKind, ProfileStore, to_long_path};
 use std::path::{Path, PathBuf};
@@ -173,25 +173,26 @@ fn xos_8_windows_file_ops_at_boundary_lengths() {
     }
 }
 
-/// XOS-7: Windows で 260 文字超のルートの `open_or_create` は、ACL 未実装ゲートにより
-/// 成功を装わず `Unsupported` を返す（fail-closed の維持のみを確認する）。
-/// `open_or_create` 内の `to_long_path` 呼び出しの有無はここでは検出できない
-/// （`Unsupported` は変換有無に関わらず返るため。検証範囲は上記モジュール doc 参照）。
+/// XOS-7・XOS-8: Windows で 260 文字超のルートの `open_or_create` は、`%LOCALAPPDATA%` 配下
+/// （`TEMP` は通常その配下）なら成功し、`\\?\` 付きの長パスで `profile.lock` と 4 サブ
+/// ディレクトリを作る。前提が崩れても skip せず失敗させる（成功しなければ失敗）。
 #[cfg(windows)]
 #[test]
-fn xos_7_windows_open_or_create_with_long_root_stays_unsupported() {
-    use fandhe_browser_profile::ProfileError;
-
+fn xos_7_windows_open_or_create_with_long_root_succeeds_under_local_app_data() {
     let guard = Guard::new();
     let root = path_with_units(&guard.root, 300);
     let long_parent = to_long_path(root.parent().expect("root has a parent")).expect("parent");
     std::fs::create_dir_all(long_parent.path()).expect("create parents");
 
     let store = ExplicitStore::new(&root).expect("explicit store");
-    let result = store.open_or_create();
-    assert!(
-        matches!(result, Err(ProfileError::Unsupported { .. })),
-        "unexpected result: {:?}",
-        result.err()
-    );
+    let profile = store
+        .open_or_create()
+        .expect("long root under LOCALAPPDATA");
+    let long_root = to_long_path(&root).expect("long root");
+    assert!(units(&root) > 260);
+    assert!(long_root.path().join("profile.lock").is_file());
+    for name in ["cookies", "storage", "cache", "history"] {
+        assert!(long_root.path().join(name).is_dir(), "{name} is missing");
+    }
+    drop(profile);
 }

@@ -8,10 +8,10 @@
 //!
 //! ## Windows で `Profile::open` を使わない理由
 //!
-//! `Profile::open` は Windows では ACL 隔離（`XOS-7`〜`XOS-10`）が未実装の
-//! ため常に `ProfileError::Unsupported` を返し（`src/profile.rs` の
-//! `#[cfg(not(unix))]` 分岐）、公開 API 経由では Windows 上のロック競合を
-//! 確認できない。また `lock::try_acquire`/`LOCK_FILE_NAME` は `pub(crate)`
+//! `Profile::open` は Windows では `%LOCALAPPDATA%` 配下のルートに限り成功する
+//! （Issue #928。`XOS-7`・`XOS-10`）が、本ファイルの Windows 側は別プロセスからの
+//! `Profile::open` 経由のロック競合を確認しない（`Profile::open` 経由の 3 OS 化は
+//! 本 Issue の範囲外。子プロセスが `LOCALAPPDATA` 配下のルートを用意する前提が要る）。また `lock::try_acquire`/`LOCK_FILE_NAME` は `pub(crate)`
 //! であり、crate 境界の変更は本 Issue の範囲外（結合テストから直接呼べない）。
 //! そのため、3 OS 共通の確認は std の `File::try_lock`（`lock.rs` が実際に
 //! 使っているのと同じ API）を直接使う形で行い、`Profile::open` を経由した
@@ -107,7 +107,7 @@ fn run_std_mode(path: &Path) -> i32 {
 
 /// `Profile::open` レベルのモード（Unix 限定）。`<path>` をプロファイル
 /// ルートとして開き、crate 自体がプロセス間の二重 open を拒否することを
-/// 確かめる。Windows は `Profile::open` が常に `Unsupported` を返すため
+/// 確かめる。Windows では本ファイルは `Profile::open` を使わない（未対応）ため
 /// [`EXIT_OTHER_ERROR`] になる（呼び出し元は Unix 限定ケースでしか
 /// このモードを使わない）。
 #[cfg(unix)]
@@ -250,9 +250,9 @@ fn prof_1_cross_process_lock_acquire_without_holder_succeeds() {
 
 /// PROF-1（TASK-54（54.3）・#193）: `Profile::open` 経由でも、別プロセスが
 /// 既にロックを保持していれば `ProfileError::Locked` を返す。crate 自体が
-/// プロセス間の二重 open を拒否することの確認（Unix 限定。Windows は
-/// `Profile::open` 自体が ACL 未実装で `Unsupported` を返すため対象外。
-/// `XOS-7`〜`XOS-10` 完了後の課題）。
+/// プロセス間の二重 open を拒否することの確認（Unix 限定。Windows の
+/// `Profile::open` 経由のプロセス間確認は、`%LOCALAPPDATA%` 配下のルートを子プロセスへ
+/// 渡す形で別途追加する課題。`XOS-7`・`XOS-10`）。
 #[cfg(unix)]
 #[test]
 fn prof_1_cross_process_profile_open_returns_locked() {

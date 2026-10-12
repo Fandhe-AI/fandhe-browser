@@ -20,8 +20,8 @@
 //!
 //! ## cfg 方針
 //!
-//! `Profile::open` は Windows では `Unsupported` を返し `create_file_in` は unix
-//! 限定のため、ファイルシステムを使うテストと補助コードだけ `#[cfg(unix)]` とする。
+//! `create_file_in` は unix 限定（Windows の `Profile::open` は `%LOCALAPPDATA%`
+//! 配下のみ成功する）のため、ファイルシステムを使うテストと補助コードだけ `#[cfg(unix)]` とする。
 //! 字句検証のテストは 3 OS で実行する（XOS 系）。そのため兄弟ファイルと違い
 //! ファイル全体には `#![cfg(unix)]` を置かない。
 //!
