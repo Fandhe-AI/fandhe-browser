@@ -24,11 +24,19 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import capture_screenshots as cs  # noqa: E402
+import egress_guard as eg  # noqa: E402
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 FAKE_ENGINE = FIXTURES_DIR / "fake_engine.py"
 SITE_CONDITIONAL_ENGINE = FIXTURES_DIR / "site_conditional_engine.py"
 DEFAULT_SITES_PATH = Path(__file__).resolve().parent / "sites.json"
+
+
+def setUpModule() -> None:  # noqa: N802
+    # 既存の結合テストは OS 非依存（macOS・Windows でも実行）なので、CLI 既定の
+    # 送信先ソケット監視（Linux のみ）を切る。監視自体は EgressGuardTest が
+    # `egress_guard_mode="servo"` を明示して検証する。
+    cs.DEFAULT_EGRESS_GUARD = "none"
 
 
 def fake_engine_template(mode: str = "ok") -> list[str]:
@@ -2615,7 +2623,7 @@ class ProxyAuditCaptureTest(unittest.TestCase):
         with mock.patch.object(cs, "_resolve_public_addresses", return_value=[("127.0.0.1", up_port)]):
             record = self._capture(site, probe_template())
         self.assertEqual(record["status"], "ok")
-        self.assertEqual(record["proxy"], {"allowed": 1, "denied": 0, "denied_targets": []})
+        self.assertEqual(record["proxy"], {"allowed": 1, "denied": 0, "denied_targets": [], "egress_guard": "off"})
 
     def test_engine_that_never_uses_proxy_fails_when_snapshot_has_subresources(self) -> None:
         record = self._capture(self._page('<img src="https://example.test/a.png">'), probe_template("silent"))
@@ -2627,7 +2635,7 @@ class ProxyAuditCaptureTest(unittest.TestCase):
     def test_engine_without_proxy_use_is_ok_when_snapshot_has_no_subresources(self) -> None:
         record = self._capture(self._page('<a href="https://example.test/">x</a><img src="data:image/png;base64,AA==">'), probe_template("silent"))
         self.assertEqual(record["status"], "ok")
-        self.assertEqual(record["proxy"], {"allowed": 0, "denied": 0, "denied_targets": []})
+        self.assertEqual(record["proxy"], {"allowed": 0, "denied": 0, "denied_targets": [], "egress_guard": "off"})
 
     def test_engine_environment_forces_proxy_and_drops_no_proxy(self) -> None:
         dump = self.root / "env.json"
@@ -2686,6 +2694,109 @@ class ProxyAuditCaptureTest(unittest.TestCase):
         self.assertEqual(viewport, {"width": 64, "height": 48})
         self.assertEqual(pairs, [])
         self.assertEqual([entry["site_id"] for entry in skipped], ["s0"])
+
+
+class ParseNetLineTest(unittest.TestCase):
+    """RENDER-5 / TASK-37: /proc/net/tcp 行のパース（IPv4・IPv6・v4-mapped）。"""
+
+    def test_ipv4_established(self) -> None:
+        line = "   0: 0100007F:C350 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000000 20 4 30 10 -1"
+        self.assertEqual(eg.parse_net_line(line), ("127.0.0.1", 8080, 1, 12345, 50000))
+
+    def test_ipv6_loopback(self) -> None:
+        line = "   0: 00000000000000000000000001000000:C350 00000000000000000000000001000000:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 777 1 0000000000000000 20 4 30 10 -1"
+        self.assertEqual(eg.parse_net_line(line), ("::1", 443, 1, 777, 50000))
+
+    def test_ipv6_v4_mapped_is_folded_to_ipv4(self) -> None:
+        line = "   0: 0000000000000000FFFF00000100007F:C350 0000000000000000FFFF00000100A8C0:0050 01 00000000:00000000 00:00000000 00000000  1000        0 888 1 0000000000000000 20 4 30 10 -1"
+        self.assertEqual(eg.parse_net_line(line), ("192.168.0.1", 80, 1, 888, 50000))
+
+    def test_header_and_garbage_lines_are_rejected(self) -> None:
+        self.assertIsNone(eg.parse_net_line("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"))
+        self.assertIsNone(eg.parse_net_line("zz"))
+        self.assertIsNone(eg.parse_net_line("0: XYZ:1 XYZ:2 01 0 0 0 0 0 5"))
+
+
+class EgressGuardTest(unittest.TestCase):
+    """RENDER-5 / TASK-37: 送信先ソケット監視（Linux のみ・best-effort）。"""
+
+    def setUp(self) -> None:
+        self.server, self.thread, self.proxy_url = cs.start_filtering_proxy()
+        self.addCleanup(cs.stop_filtering_proxy, self.server, self.thread)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        page = self.root / "page.html"
+        page.write_text("<html><body><p>no refs</p></body></html>", encoding="utf-8")
+        self.site = cs.Site(site_id="g", url=page.as_uri(), category="static", catalog_id="z1")
+
+    def _capture(self, template: list[str], engine: str = "servo", mode: str = "servo") -> dict:
+        return cs.capture_one(
+            self.site,
+            engine,
+            template,
+            out_dir=self.root / "out",
+            snapshots_dir=self.root / "out" / "snapshots",
+            chromium_bin=None,
+            width=64,
+            height=48,
+            settle_ms=0,
+            timeout_sec=20,
+            allow_file_url=True,
+            dry_run=False,
+            proxy_url=self.proxy_url,
+            proxy_audit=self.server.audit,
+            egress_guard_mode=mode,
+        )
+
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
+    def test_direct_connection_is_detected_and_fails_capture(self) -> None:
+        import socket as socket_module  # noqa: PLC0415
+
+        canary = socket_module.socket()
+        canary.bind(("127.0.0.1", 0))
+        canary.listen(4)
+        self.addCleanup(canary.close)
+        port = canary.getsockname()[1]
+        record = self._capture(
+            probe_template("direct", extra=["--direct-connect", f"127.0.0.1:{port}", "--hold-ms", "5000"])
+        )
+        self.assertEqual(record["status"], "failed")
+        self.assertIn(f"unproxied connection detected: 127.0.0.1:{port}", record["stderr_tail"])
+        self.assertEqual(record["proxy"]["egress_guard"], "violation")
+
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
+    def test_engine_using_only_the_proxy_stays_ok(self) -> None:
+        record = self._capture(probe_template("silent"))
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(record["proxy"]["egress_guard"], "enforced")
+
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
+    def test_chromium_is_not_guarded_by_default_servo_mode(self) -> None:
+        import socket as socket_module  # noqa: PLC0415
+
+        canary = socket_module.socket()
+        canary.bind(("127.0.0.1", 0))
+        canary.listen(4)
+        self.addCleanup(canary.close)
+        record = self._capture(
+            probe_template("direct", extra=["--direct-connect", f"127.0.0.1:{canary.getsockname()[1]}", "--hold-ms", "200"]),
+            engine="chromium",
+        )
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(record["proxy"]["egress_guard"], "off")
+
+    def test_guarded_engine_is_skipped_when_platform_is_unsupported(self) -> None:
+        with mock.patch.object(eg, "egress_guard_supported", return_value=False):
+            record = self._capture(probe_template("silent"))
+        self.assertEqual(record["status"], "skipped")
+        self.assertIn("egress guard is unavailable on this platform", record["stderr_tail"])
+        self.assertFalse((self.root / "out" / "servo" / "g.png").exists())
+
+    def test_none_mode_runs_even_when_platform_is_unsupported(self) -> None:
+        with mock.patch.object(eg, "egress_guard_supported", return_value=False):
+            record = self._capture(probe_template("silent"), mode="none")
+        self.assertEqual(record["status"], "ok")
 
 
 if __name__ == "__main__":

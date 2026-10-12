@@ -54,6 +54,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+import egress_guard
+
 # --- 定数 -------------------------------------------------------------
 
 # site id はファイル名の一部として使うため、パストラバーサル対策と OS 間の
@@ -126,6 +128,11 @@ PROXY_MAX_BYTES_PER_CONNECTION = 256 * 1024 * 1024
 # リクエストボディの上限（バイト）。
 PROXY_MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024
 
+# 送信先ソケット監視（`egress_guard`）の既定。`servo` は Servo のみ（Chromium は
+# 背景通信での誤検出リスクがあるため既定では対象外）、`all` は全エンジン、`none` は
+# 完全遮断環境専用。
+EGRESS_GUARD_CHOICES = ("servo", "all", "none")
+DEFAULT_EGRESS_GUARD = "servo"
 # プロキシ監査（`ProxyAudit`）が結果 JSON へ載せる拒否先の最大件数（無制限確保の
 # 防止。超過分は件数だけ数える）。
 PROXY_AUDIT_MAX_DENIED_TARGETS = 50
@@ -1604,6 +1611,7 @@ def capture_one(
     proxy_url: str | None = None,
     allow_unproxied_engine: bool = False,
     proxy_audit: ProxyAudit | None = None,
+    egress_guard_mode: str = "none",
 ) -> dict[str, Any]:
     """1 サイト × 1 エンジンの撮影を実行し、結果レコード（dict）を返す。
 
@@ -1621,7 +1629,8 @@ def capture_one(
     `proxy_audit` が渡され、テンプレートが `{proxy}` と `{html_path}` を使う場合は、
     エンジン実行中のプロキシ許可・拒否件数を結果の `proxy` キーへ載せる。
     スナップショットが外部サブリソースを参照するのにエンジンがプロキシを一度も
-    使わなかった場合は PNG が出ていても `failed` にする（fail-closed。RENDER-5 /
+    使わなかった場合、または `egress_guard_mode` の対象エンジンが検証プロキシ以外へ
+    直接接続した場合（Linux のみ。`egress_guard.py`）は PNG が出ていても `failed` にする（fail-closed。RENDER-5 /
     TASK-37。一部だけ迂回するケースは検出できない）。
     """
     out_path = out_dir / engine / f"{site.site_id}.png"
@@ -1724,6 +1733,21 @@ def capture_one(
                 "--allow-unproxied-engine for network-isolated test environments only",
             )
 
+        guard_enabled = needs_proxy and (
+            egress_guard_mode == "all" or (egress_guard_mode == "servo" and engine == "servo")
+        )
+        if guard_enabled and not egress_guard.egress_guard_supported():
+            # fail-closed: 直接接続を検出できない環境で、迂回を許す可能性のある
+            # エンジンを黙って走らせない。完全遮断環境では `--egress-guard none`。
+            return _skip_result(
+                site,
+                engine,
+                argv,
+                "egress guard is unavailable on this platform (Linux /proc required); "
+                "refusing to run the engine unguarded; pass --egress-guard none only "
+                "for network-isolated environments",
+            )
+
         if needs_html:
             # `snapshots/<site_id>.html` の保存先が out-dir 配下にあることを
             # `resolved_out`（PNG 出力先）と同じ方針で確認する（codex P0）。
@@ -1785,6 +1809,7 @@ def capture_one(
             except SnapshotError as exc:
                 return _skip_result(site, engine, argv, str(exc))
 
+        guard_violation: str | None = None
         audit_base = proxy_audit.snapshot() if proxy_audit is not None else None
         # `{proxy}` を使うときだけ環境変数でもプロキシを強制する。使わない
         # （`--allow-unproxied-engine`）場合は現行どおり親環境をそのまま渡す。
@@ -1810,6 +1835,14 @@ def capture_one(
                     env=engine_env,
                     **_process_group_popen_kwargs(),
                 )
+                guard: egress_guard.EgressGuard | None = None
+                if guard_enabled and proxy_url is not None:
+                    guard = egress_guard.EgressGuard(
+                        proc.pid,
+                        urlparse(proxy_url).port or 0,
+                        lambda: _kill_process_tree(proc),
+                    )
+                    guard.start()
                 try:
                     exit_code: int | None = proc.wait(timeout=timeout_sec)
                     timed_out = False
@@ -1829,6 +1862,10 @@ def capture_one(
                     # 削除（このあとの `finally`）だけが先に走ってしまう。
                     _kill_process_tree(proc)
                     raise
+                finally:
+                    if guard is not None:
+                        guard.stop()
+                        guard_violation = guard.violation
             duration_ms = int((time.monotonic() - start) * 1000)
             stderr_tail = _read_tail(stderr_path, STDERR_TAIL_CHARS)
             engine_missing = False
@@ -1845,6 +1882,30 @@ def capture_one(
         finally:
             if stderr_path is not None:
                 stderr_path.unlink(missing_ok=True)
+
+        if guard_violation is not None:
+            # 迂回を検出してツリーを終了した場合は、タイムアウトや PNG の有無に
+            # かかわらず failed にする（直接接続した時点で撮影条件が崩れている）。
+            report = proxy_audit.delta_since(audit_base) if proxy_audit is not None else None
+            record_v: dict[str, Any] = {
+                "site_id": site.site_id,
+                "engine": engine,
+                "status": "failed",
+                "png": None,
+                "width": None,
+                "height": None,
+                "duration_ms": duration_ms,
+                "exit_code": exit_code,
+                "stderr_tail": (
+                    stderr_tail + f"\nunproxied connection detected: {guard_violation}"
+                )[-STDERR_TAIL_CHARS:],
+                "command": argv,
+                "input": input_kind,
+            }
+            if report is not None:
+                report["egress_guard"] = "violation"
+                record_v["proxy"] = report
+            return record_v
 
         if timed_out:
             return {
@@ -1898,6 +1959,7 @@ def capture_one(
         proxy_report: dict[str, Any] | None = None
         if proxy_audit is not None and audit_base is not None and needs_proxy:
             proxy_report = proxy_audit.delta_since(audit_base)
+            proxy_report["egress_guard"] = "enforced" if guard_enabled else "off"
             if (
                 status == "ok"
                 and needs_html
@@ -2094,6 +2156,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Allow file: URLs when fetching {html_path} snapshots (test fixtures only).",
     )
     parser.add_argument(
+        "--egress-guard",
+        choices=EGRESS_GUARD_CHOICES,
+        default=DEFAULT_EGRESS_GUARD,
+        help=(
+            "Detect engines connecting around the filtering proxy by polling /proc "
+            "(Linux only, best-effort): 'servo' (default) guards the servo engine, "
+            "'all' guards every engine, 'none' disables it (network-isolated "
+            "environments only). On platforms without /proc a guarded engine is skipped."
+        ),
+    )
+    parser.add_argument(
         "--allow-unproxied-engine",
         action="store_true",
         help=(
@@ -2200,6 +2273,7 @@ def main(argv: list[str] | None = None) -> int:
                         proxy_url=proxy_url,
                         allow_unproxied_engine=args.allow_unproxied_engine,
                         proxy_audit=proxy_server.audit if proxy_server is not None else None,
+                        egress_guard_mode=args.egress_guard,
                     )
                     captures.append(record)
         except CaptureError as exc:
