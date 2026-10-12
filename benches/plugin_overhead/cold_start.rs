@@ -4,7 +4,7 @@
 //! `plugin_overhead.rs` の main と `e2e_tests.rs` から呼ばれる。値の型・整形は `cold_start_stats.rs`。
 //!
 //! 計測窓: `McpSession::start`（`Command::spawn` → 起動時の自己申告 `POST /ai/plugins/register` →
-//! rmcp stdio 初期化 → `initialize` 応答検証 → `notifications/initialized` 送信）の直前から返却直後まで。
+//! rmcp stdio 初期化 → `initialize` 応答検証 → `notifications/initialized` の書き込み・flush 完了を期限付きで確認）の直前から返却直後まで。書き込み失敗は計測エラー。
 //! ホスト起動（in-process の `AppHost`）・ツール呼び出し・終了処理は窓に含めない。
 //! 各試行で新しいホストとプロセスを使う。同一ホストへの 2 回目以降の接続は 409
 //! `duplicate_plugin_id` の警告継続経路になり、試行間で経路が揃わないため。
