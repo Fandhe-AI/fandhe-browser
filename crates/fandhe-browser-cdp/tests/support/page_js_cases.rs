@@ -6,10 +6,11 @@
 //!
 //! # 二層で検証する
 //!
-//! - **CDP 層（unix のみ）**: `test_support::LoopbackDispatcher` で `Page.navigate` → `DOM.*` を
-//!   実行し、イベント列・DOM・所要時間・フィクスチャの到達数を検証する。`Profile::open` が非 unix で
-//!   `Unsupported` のため `AppState` を構築できず、Windows では実行できない（任意の skip ではない。
-//!   `windows_profile_is_unsupported` が `Unsupported` を確認し、対応が入った時点で落ちて有効化を促す）。
+//! - **CDP 層（全 OS）**: `test_support::LoopbackDispatcher` で `Page.navigate` → `DOM.*` を
+//!   実行し、イベント列・DOM・所要時間・フィクスチャの到達数を検証する。`Profile::open` は
+//!   Windows では `%LOCALAPPDATA%` 配下のルートに限り成功する（Issue #928）ため、一時ディレクトリは
+//!   `std::env::temp_dir()` 配下に作る。配下でない環境では `Profile::open` が `Unsupported` で失敗し、
+//!   テストも失敗する（skip しない）。
 //! - **アクター層（全 OS）**: 同じフィクスチャ HTML・同じハンドル構成で `PageScriptHandle` を直接
 //!   呼び、CDP 経路が捨てる診断（`PageRunOutput` の打ち切り種別・スクリプト別結果・
 //!   `net_rejections`）を具体値で検証する。
@@ -259,11 +260,8 @@ const SPA_JS: &str = "var app=document.getElementById('app');\
     var h=document.createElement('h1');h.textContent='Hello SPA';app.appendChild(h);\
     for(var i=1;i<=3;i++){var li=document.createElement('li');li.textContent='item-'+i;app.appendChild(li)}void 0";
 
-// CDP 層（unix のみ）のケースからだけ参照されるため、非 unix では定義しない（dead_code 回避）。
-#[cfg(unix)]
 const FORM_HTML: &str = "<html><body><script src=\"/form.js\"></script></body></html>";
 /// `form` と、`name` 付き input / textarea / select 各 1 個・`name` なし input 1 個を生成する。
-#[cfg(unix)]
 const FORM_JS: &str = "var f=document.createElement('form');f.setAttribute('id','signup');\
     var a=document.createElement('input');a.setAttribute('name','email');f.appendChild(a);\
     var b=document.createElement('textarea');b.setAttribute('name','note');f.appendChild(b);\
@@ -561,8 +559,8 @@ fn actor_cases(engine: &str) {
         ));
     }
 
-    // ページ単位の実時間上限は約 5 秒かかるため、CDP 層を実行できない OS（非 unix）だけアクター層で見る。
-    #[cfg(not(unix))]
+    // ページ単位の実時間上限（約 5 秒）の打ち切り種別 `AbortKind::WallTime { scope: Page }` は、
+    // CDP 経路が捨てる診断のため、アクター層で全 OS 共通に具体値で確認する（JS-6）。
     {
         eprintln!("case: JS-6 actor layer aborts cumulative script time at the 5s page wall time");
         let started = Instant::now();
@@ -642,10 +640,9 @@ fn actor_cases(engine: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// CDP 層のケース（unix のみ。Profile::open が非 unix で Unsupported）
+// CDP 層のケース（全 OS。Windows は temp_dir() が %LOCALAPPDATA% 配下であることが前提）
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
 mod cdp_layer {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1034,31 +1031,11 @@ mod cdp_layer {
     }
 }
 
-/// Windows など非 unix: `Profile::open` が `Unsupported` のため CDP 層を実行できないことを確認する。
-/// 対応（XOS-7〜10）が入ると失敗し、CDP 層ケースの有効化を促す。
-#[cfg(not(unix))]
-fn windows_profile_is_unsupported() {
-    let dir = std::env::temp_dir().join(format!("fandhe-cdp-page-js-{}", std::process::id()));
-    let result = fandhe_browser_profile::Profile::open(&dir);
-    assert!(
-        matches!(
-            result,
-            Err(fandhe_browser_profile::ProfileError::Unsupported { .. })
-        ),
-        "Profile::open is expected to be Unsupported: {:?}",
-        result.as_ref().err()
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// 全ケースを `engine`（`"v8"` / `"boa"`）で実行する。
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn run(engine: &str) {
     actor_cases(engine);
-    #[cfg(unix)]
     cdp_layer::run(engine);
-    #[cfg(not(unix))]
-    windows_profile_is_unsupported();
 }
 
 /// macOS では boa のランタイム生成が失敗し、アクターは `Err(Run(_))` を返す（成功を装わない）。
