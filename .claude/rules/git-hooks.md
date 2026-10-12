@@ -33,7 +33,7 @@ description: >
 | 検査 | 担う CI ジョブ |
 | ---- | -------------- |
 | clippy・`cargo test`（全 feature） | `rust-test-{ubuntu,macos,windows}` |
-| feature 構成別の clippy・test・build | `rust-features-{ubuntu,macos,windows}` |
+| feature 構成別の clippy・test・build | `rust-features-{ubuntu,macos}`・`rust-features-windows-{default,engines,boa}` |
 | `cargo fmt --all --check`（workspace 全体）・`cargo deny` | `rust-lint` |
 | markdownlint・yamllint・editorconfig-checker・commitlint | `lint-docs` |
 | Servo / JS エンジン分離検証・ハーネス自己テスト・サイズ検査 | `harness-{ubuntu,macos,windows}` |

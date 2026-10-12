@@ -22,14 +22,15 @@ cargo test --workspace
 | `lint-docs` | ubuntu | 常時 | markdownlint・yamllint・editorconfig-checker・commitlint（PR のみ） |
 | `rust-lint` | ubuntu | rust | `cargo fmt --all --check`・`cargo deny check`・`make check-deny-license-reject` |
 | `rust-test-{ubuntu,macos,windows}` | 3 OS（macOS・Windows は PR では skipped） | rust | clippy（`--all-features -D warnings`）・`cargo test --workspace --all-features` |
-| `rust-features-{ubuntu,macos,windows}` | 3 OS（macOS・Windows は PR では skipped） | rust | 既定 feature・エンジンなし・両エンジン同梱・`js-boa` 軽量ビルド・`js-v8` 単独の clippy / test |
+| `rust-features-{ubuntu,macos}` | ubuntu・macOS（macOS は PR では skipped） | rust | 既定 feature・エンジンなし・両エンジン同梱・`js-boa` 軽量ビルド・`js-v8` 単独の clippy / test |
+| `rust-features-windows-{default,engines,boa}` | windows（PR は skipped） | rust | 上と同じ検査を feature 構成の組ごとに 3 ジョブへ並列分割（`rust-features-windows` 1 ジョブでは cache なしで約 32 分・cache ありでも 15〜17 分かかったため。オーナー判断 2026-10-12。`default`: 既定 feature・`js-v8` 単独・cli エンジンなし check、`engines`: core 単独・両エンジン同梱、`boa`: `js-boa` 軽量ビルド・`js-boa` 単独） |
 | `harness-{ubuntu,macos,windows}` | 3 OS（macOS・Windows は PR では skipped） | rust または harness | 分離検証・ハーネス自己テスト・サイズ検査（後述。`mcp-envelope` は unix のみ） |
 | `windows-servo-prereqs` | windows（PR は skipped） | rust | Servo の Windows ビルド前提（SDK・MSVC v143・ATL・Python・uv）の検証 |
 | `cross-target-check` | ubuntu | rust（PR でも実行） | macOS・Windows 向けのクロス型検査（`aarch64-apple-darwin`・`x86_64-pc-windows-msvc`。後述の範囲に限る） |
 
-- required checks は上表のジョブ名 14 件（`{ubuntu,macos,windows}` は各 3 件で展開）に加え、`ai-review.yml` の `codex / review`・`codex / preflight`・`codex / post_feedback` と `Cursor Bugbot`。ジョブの追加・改名時は GitHub の ruleset の required checks を同時に更新する
+- required checks は上表のジョブ名 16 件（`{...}` は展開して数える）に加え、`ai-review.yml` の `codex / review`・`codex / preflight`・`codex / post_feedback` と `Cursor Bugbot`。ジョブの追加・改名時は GitHub の ruleset の required checks を同時に更新する
 - macOS・Windows のジョブは `pull_request` では `if:` により skipped になる（skipped は required を満たす）。push（main）・`workflow_dispatch` では実行される
-- 旧ジョブ名との対応: `rust-ci`（fmt・deny は `rust-lint`、clippy・test は `rust-test-*`）、`rust-ci-default-features`・`rust-ci-js-boa`・`rust-ci-js-v8` は `rust-features-*`、`render-isolation`・`js-engine-isolation`・`compat-regression`・`puppeteer-connect-selftest`・`bench-record-selftest`・`mcp-envelope-smoke`・`binary-size` は `harness-*` のステップ（ステップ名の `[...]` 接頭辞が旧ジョブ名）、`deny-license-reject` は `rust-lint` のステップ
+- 旧ジョブ名との対応: `rust-ci`（fmt・deny は `rust-lint`、clippy・test は `rust-test-*`）、`rust-ci-default-features`・`rust-ci-js-boa`・`rust-ci-js-v8` は `rust-features-*`（Windows は `rust-features-windows-*`）、`render-isolation`・`js-engine-isolation`・`compat-regression`・`puppeteer-connect-selftest`・`bench-record-selftest`・`mcp-envelope-smoke`・`binary-size` は `harness-*` のステップ（ステップ名の `[...]` 接頭辞が旧ジョブ名）、`deny-license-reject` は `rust-lint` のステップ
 
 ### docs-only の判定（fail-closed）
 

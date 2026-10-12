@@ -22,7 +22,7 @@ lefthook との重複回避は [git-hooks](./git-hooks.md) を参照する。本
 
 ## 必須チェックとジョブ名
 
-- ruleset `main-protection` の required status checks（2026-10-11 時点）: `changes`・`lint-docs`・`rust-lint`・`rust-test-{ubuntu,macos,windows}`・`rust-features-{ubuntu,macos,windows}`・`harness-{ubuntu,macos,windows}`・`windows-servo-prereqs`・`cross-target-check`・`codex / preflight`・`codex / review`・`codex / post_feedback`・`Cursor Bugbot`。branch protection（旧方式）は未設定
+- ruleset `main-protection` の required status checks（2026-10-11 時点）: `changes`・`lint-docs`・`rust-lint`・`rust-test-{ubuntu,macos,windows}`・`rust-features-{ubuntu,macos}`・`rust-features-windows-{default,engines,boa}`・`harness-{ubuntu,macos,windows}`・`windows-servo-prereqs`・`cross-target-check`・`codex / preflight`・`codex / review`・`codex / post_feedback`・`Cursor Bugbot`。計 20 件（`{...}` は展開して数える。うち `ci.yml` が 16 件）。`rust-features-windows` の 3 分割（2026-10-12）で 1 件 → 3 件に差し替える。branch protection（旧方式）は未設定
 - 集約ジョブ（`ci-complete` 等）は無い。出る check-run をすべて required にする構成のため、**ジョブ名・`name:` を変える／ジョブを足す／消すときは ruleset の required checks を同時に更新する**（ユーザー判断事項。Claude は ruleset を変更しない）
 - required にするジョブでは matrix・reusable workflow 呼び出し（`caller / callee` 形式の名前）を使わない（skipped の matrix は展開されず check 名が変わる）
 - 非 required の補助ジョブを `ci.yml` に足さない
@@ -52,7 +52,7 @@ lefthook との重複回避は [git-hooks](./git-hooks.md) を参照する。本
 
 GitHub Actions の cache はリポジトリ単位で上限があり、超えると最終アクセスが古いものから追い出される（7 日間アクセスが無いものは削除）。
 本リポジトリの上限は **10GB**（Org 設定も 10GB）。Org の Actions 予算は **$0（超過時停止）** のため、10GB を超える上限は使えない（上限を上げると 10GB を超えた時点で cache が読み取り専用になる）。上限・予算の変更はユーザー判断事項。
-目標は「1 世代（全 cache 種別の合計。現状約 6〜7GB）を常時 10GB 以内に収め、追い出されても main の最新 cache に hit し続ける」こと。key 切り替え（`Cargo.lock`・rustc・`-vN` の変更）で新旧 2 世代が並ぶと古い世代が LRU で追い出されるが、新世代が保存された後なのでミスにはならない（2026-10-11 の実測で追い出しによる miss は 0 件。下記「実測」）。毎回読まれる main の最新 cache は LRU で最後まで残るため、この状態を保てていれば上限を上げる必要はない。新しい cache 種別の追加で常時 10GB を超える構成は避ける。ただし Windows の cache 追加（test・features・harness の 3 種）で 1 世代が 10GB に近づく、または超える場合に古い cache が追い出されることは、オーナー判断（2026-10-11）として許容する（追い出されても main の最新 cache が残ればよい）。Windows 3 種のサイズは `workflow_dispatch` の計測で features 912MB・test 500MB・harness 376MB（圧縮後。合計約 1.8GB）で、Linux・macOS の 1 世代（約 7.1GB）と合わせても 10GB 以内に収まる見込み（`windows-latest` の `Windows` が key に入るため Linux・macOS とは別の cache）。
+目標は「1 世代（全 cache 種別の合計。現状約 6〜7GB）を常時 10GB 以内に収め、追い出されても main の最新 cache に hit し続ける」こと。key 切り替え（`Cargo.lock`・rustc・`-vN` の変更）で新旧 2 世代が並ぶと古い世代が LRU で追い出されるが、新世代が保存された後なのでミスにはならない（2026-10-11 の実測で追い出しによる miss は 0 件。下記「実測」）。毎回読まれる main の最新 cache は LRU で最後まで残るため、この状態を保てていれば上限を上げる必要はない。新しい cache 種別の追加で常時 10GB を超える構成は避ける。ただし Windows の cache 追加（test・features・harness の 3 種）で 1 世代が 10GB に近づく、または超える場合に古い cache が追い出されることは、オーナー判断（2026-10-11）として許容する（追い出されても main の最新 cache が残ればよい）。Windows 3 種のサイズは `workflow_dispatch` の計測で features 912MB・test 500MB・harness 376MB（圧縮後。合計約 1.8GB）で、Linux・macOS の 1 世代（約 7.1GB）と合わせても 10GB 以内に収まる見込み（`windows-latest` の `Windows` が key に入るため Linux・macOS とは別の cache）。2026-10-12 に Windows の features を 3 ジョブへ分割したため、features の cache は 1 個（912MB）から 3 個（`features-default-v1`・`features-engines-v1`・`features-boa-v1`）になる。3 個の合計サイズは main で未計測（分割前の 912MB より増える見込みだが、数値は計測後に追記する）。
 
 ### 入れる前に効果を測る
 
@@ -138,7 +138,7 @@ gh api repos/Fandhe-AI/fandhe-browser/actions/runs/<run-id>/jobs --paginate   # 
 | ワークフロー | トリガー | 実測 | 備考 |
 | ------------ | -------- | ---- | ---- |
 | `ci.yml`（PR） | pull_request | 中央値 11.0 分・最大 12.5 分（20 件） | 最長は `rust-features-ubuntu` 約 12 分（clippy と test を 14 ステップで直列実行）、次いで `rust-test-ubuntu` 約 7 分。docs-only は `changes` + `lint-docs` のみで約 30 秒 |
-| `ci.yml`（main push） | push | 中央値 22.6 分・最大 30.9 分（6 件） | 3 OS 実行。Windows の `rust-features-windows` が最長（約 31 分。Windows の cache 導入後は約 17 分で、`workflow_dispatch` 1 回の計測。main push の値は未計測） |
+| `ci.yml`（main push） | push | 中央値 22.6 分・最大 30.9 分（6 件） | 3 OS 実行。分割前は Windows の `rust-features-windows` が最長（main push で cache なし 31.8 分、cache ありで 16.1 分・17.2 分、`workflow_dispatch` で 15.2 分）。オーナー判断（2026-10-12）で 15 分以内にするため `rust-features-windows-{default,engines,boa}` の 3 ジョブへ分割した（cache だけでは 15〜17 分で、cache が外れると約 32 分に戻るため）。分割の根拠は cache 導入前の試作での計測（cache なしで 7.9 分・8.5 分・6.9 分。run 38158384892）。分割後の cache ありの所要時間は未計測 |
 | `ai-review.yml` | pull_request | 約 1〜2 分 | |
 | `update-external.yml` | schedule・dispatch | 約 2 分 | 日次 |
 | `bench-competitor.yml` | schedule・dispatch | 約 2〜3 分 | 週次・3 OS。対象バイナリ未配線のため skipped が多い |

@@ -9,7 +9,8 @@ name: CI
 #   lint-docs                    常時。markdownlint・yamllint・editorconfig-checker・commitlint
 #   rust-lint                    rust 時。fmt・cargo deny・deny-license-reject（ubuntu のみ）
 #   rust-test-{ubuntu,macos,windows}      rust 時。clippy + test（3 OS）
-#   rust-features-{ubuntu,macos,windows}  rust 時。feature 構成別の clippy・test（3 OS）
+#   rust-features-{ubuntu,macos}          rust 時。feature 構成別の clippy・test
+#   rust-features-windows-{default,engines,boa}  rust 時。Windows の feature 構成別を 3 並列に分割
 #   harness-{ubuntu,macos,windows}        rust または harness 時。分離検証・ハーネス・サイズ検査
 #   windows-servo-prereqs        rust 時。Servo の Windows ビルド前提の検証
 #   cross-target-check           rust 時。Linux 上で macOS・Windows 向けに型検査（PR でも実行）
@@ -437,7 +438,7 @@ jobs:
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
   # --------------------------------------------------
-  # rust-features-{ubuntu,macos,windows}（feature 構成別の clippy・test。rust 変更時のみ）
+  # rust-features-{ubuntu,macos}・rust-features-windows-{default,engines,boa}（feature 構成別の clippy・test。rust 変更時のみ）
   # --------------------------------------------------
   # 旧 rust-ci-default-features・rust-ci-js-boa・rust-ci-js-v8 の全コマンドを 1 ジョブへ
   # 順に束ねた（同一 target dir で依存ビルドを共有する）。ステップ名の接頭辞が旧ジョブ:
@@ -449,6 +450,18 @@ jobs:
   #               テストを V8 に対して検証。TASK-29.7・#158・JS-1）
   # 各ステップは !cancelled() で独立に走らせ、失敗構成を 1 回の実行で特定できるようにする。
   # cache・CARGO_INCREMENTAL=0・CARGO_PROFILE_DEV_DEBUG は 3 OS 共通（上記 rust-test と同じ）。
+  #
+  # Windows だけ 3 ジョブ（rust-features-windows-{default,engines,boa}）に分ける。1 ジョブだと
+  # cache なしで約 32 分、cache ありでも 15〜17 分かかるため、feature 構成の組ごとに並列化して
+  # 15 分以内に収める（オーナー判断 2026-10-12）。ステップ名・コマンドは分割前と同一で、
+  # 配分だけが異なる。cache の key は target の中身が違うためジョブごとに別
+  # （features-{default,engines,boa}-v1）:
+  #   -default : [default] clippy・test（既定 feature）、[js-boa] check（cli エンジンなし）、
+  #              [js-v8] clippy・test（js js-v8 単独）
+  #   -engines : [default] clippy・test（core 単独・エンジンなし）、
+  #              [default] test（js 両エンジン同梱・core 両エンジン同梱）
+  #   -boa     : [js-boa] build・clippy・test（cli 軽量ビルド）、[js-boa] clippy・test（js js-boa）、
+  #              [js-boa] test（core js-boa）
   rust-features-ubuntu:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
@@ -639,11 +652,11 @@ jobs:
             target
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
-  rust-features-windows:
+  rust-features-windows-default:
     needs: changes
     if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.rust == 'true' }}
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -675,13 +688,77 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-${{ runner.os }}-features-v3-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: rust-${{ runner.os }}-features-v3-${{ steps.toolchain.outputs.cachekey }}-
+          # yamllint disable-line rule:line-length
+          key: rust-${{ runner.os }}-features-default-v1-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-features-default-v1-${{ steps.toolchain.outputs.cachekey }}-
       - name: "[default] cargo clippy（既定 feature）"
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: "[default] cargo test（既定 feature）"
         if: ${{ !cancelled() }}
         run: cargo test --workspace
+      - name: "[js-boa] cargo check（cli エンジンなし）"
+        if: ${{ !cancelled() }}
+        run: cargo check -p fandhe-browser-cli --no-default-features
+      - name: "[js-v8] cargo clippy（js js-v8 単独）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p fandhe-browser-js --all-targets --features js-v8 -- -D warnings
+      - name: "[js-v8] cargo test（js js-v8 単独）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-js --features js-v8
+      - name: "cache 保存前に workspace 成果物を prune"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        run: bash scripts/ci-prune-target.sh
+      - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+
+  rust-features-windows-engines:
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.rust == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      # cache サイズ削減に加え、Windows では PDB 生成・リンク時間の短縮にもなる:
+      # workspace メンバーを含む全体の debuginfo を行番号のみにする（CI 限定。
+      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）。
+      # 依存 crate は Cargo.toml の `[profile.dev.package."*"]` でも同じ値に固定済みで衝突
+      # しない（package 指定が優先されるが値が同じ）。メンバーまで行番号のみにするのは本 env だけ
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: clippy
+      - name: "cargo cache の復元"
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # yamllint disable-line rule:line-length
+          key: rust-${{ runner.os }}-features-engines-v1-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-features-engines-v1-${{ steps.toolchain.outputs.cachekey }}-
       - name: "[default] cargo clippy（core 単独・エンジンなし）"
         if: ${{ !cancelled() }}
         run: cargo clippy -p fandhe-browser-core --all-targets -- -D warnings
@@ -694,6 +771,60 @@ jobs:
       - name: "[default] cargo test（core 両エンジン同梱）"
         if: ${{ !cancelled() }}
         run: cargo test -p fandhe-browser-core --features js-v8 --features js-boa
+      - name: "cache 保存前に workspace 成果物を prune"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        run: bash scripts/ci-prune-target.sh
+      - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+
+  rust-features-windows-boa:
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.rust == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      # cache サイズ削減に加え、Windows では PDB 生成・リンク時間の短縮にもなる:
+      # workspace メンバーを含む全体の debuginfo を行番号のみにする（CI 限定。
+      # backtrace のファイル名・行番号は残る。release / bench プロファイルには影響しない）。
+      # 依存 crate は Cargo.toml の `[profile.dev.package."*"]` でも同じ値に固定済みで衝突
+      # しない（package 指定が優先されるが値が同じ）。メンバーまで行番号のみにするのは本 env だけ
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: clippy
+      - name: "cargo cache の復元"
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # yamllint disable-line rule:line-length
+          key: rust-${{ runner.os }}-features-boa-v1-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-features-boa-v1-${{ steps.toolchain.outputs.cachekey }}-
       - name: "[js-boa] cargo build（cli 軽量ビルド）"
         if: ${{ !cancelled() }}
         run: cargo build -p fandhe-browser-cli --no-default-features --features js-boa
@@ -712,15 +843,6 @@ jobs:
       - name: "[js-boa] cargo test（core js-boa）"
         if: ${{ !cancelled() }}
         run: cargo test -p fandhe-browser-core --features js-boa
-      - name: "[js-boa] cargo check（cli エンジンなし）"
-        if: ${{ !cancelled() }}
-        run: cargo check -p fandhe-browser-cli --no-default-features
-      - name: "[js-v8] cargo clippy（js js-v8 単独）"
-        if: ${{ !cancelled() }}
-        run: cargo clippy -p fandhe-browser-js --all-targets --features js-v8 -- -D warnings
-      - name: "[js-v8] cargo test（js js-v8 単独）"
-        if: ${{ !cancelled() }}
-        run: cargo test -p fandhe-browser-js --features js-v8
       - name: "cache 保存前に workspace 成果物を prune"
         if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         run: bash scripts/ci-prune-target.sh
