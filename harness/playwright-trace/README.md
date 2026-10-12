@@ -62,9 +62,10 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
 
 ## 現時点の到達点（事実のみ。原因分析は #247・`docs/design/playwright-compat.md`）
 
-- TASK-43.3a（#804）後の実測。`GET /json/version` と `GET /json/version/` はともに 200 で、
-  `Browser.getVersion` は実値（`fandhe-browser/<版>`）で成功する
-- `connectOverCDP(http://…)`・`connectOverCDP(ws://…)` はともに、次に送る `Target.setAutoAttach` と
-  `Browser.setDownloadBehavior` が `-32601`（未実装。`CDP-6`）となり失敗する。
-  `newContext()`・`newPage()` には到達しない
-  （`Target.getTargetInfo` は実装済みだが、上記の失敗により Playwright は送らない）
+- TASK-43.3c（#908）後の実測（現行 head で再取得済み）。`GET /json/version` と `GET /json/version/` はともに 200 で、
+  `Browser.getVersion` は成功する。続く `Target.setAutoAttach`（`waitForDebuggerOnStart:true`。ターゲット一時停止が
+  未実装のため）と `Browser.setDownloadBehavior`（`allowAndName`・`eventsEnabled:true`。実行系が無いため）は
+  ともに `-32602`（`UNSUPPORTED_PARAMS`。`CDP-6`・`REPAIR-3`）で拒否され、`connectOverCDP(http)` と
+  `connectOverCDP(ws)` はいずれも `Target.setAutoAttach` の段で失敗する。`newContext()`・`newPage()` には到達しない
+  （そのため `Target.getTargetInfo`・`Target.createBrowserContext` はトレースに現れない）
+- 再生テスト（`tests/playwright_trace.rs`）は録画の応答列と現行サーバーの応答列を比較除外なしで完全一致させる

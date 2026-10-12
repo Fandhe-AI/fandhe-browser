@@ -8,7 +8,7 @@
 //!
 //! 公開入口は無く crate 内部専用。後続タスクは [`builtin_handlers`] へメソッドを
 //! 追加するだけでよい（`Page.navigate` は 42.2 で登録済み、イベント送出は 42.3 で実装済み、
-//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b で登録済み。`Target.setAutoAttach`・`Browser.setDownloadBehavior` は実体未接続のため未登録）。
+//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b、`Target.setAutoAttach`・`Browser.setDownloadBehavior` は TASK-43.3c で登録済み）。
 //!
 //! # 入力の扱い
 //!
@@ -22,7 +22,7 @@
 //!
 //! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 //! `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・
-//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）のみ登録済みで、
+//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c・`CDP-2`）のみ登録済みで、
 //! それ以外のメソッドは JSON-RPC の「method not implemented」（`-32601`）エラーを返す。
 //! 汎用の空 success フォールバック（PoC-5 の暫定挙動）は採らない。理由は次のとおり。
 //!
@@ -90,6 +90,9 @@ impl CdpError {
     pub const INVALID_PARAMS: Self = Self::new(-32602, "invalid params");
     /// ハンドラ内部エラー（CDP の server error 帯）。
     pub const SERVER_ERROR: Self = Self::new(-32000, "server error");
+    /// WebSocket 接続を要するコマンドが接続なし（直接 dispatch）で呼ばれた、または接続が既に閉じている
+    /// （`Target.setAutoAttach`・`Browser.setDownloadBehavior`。接続スコープの状態を持てない。`CDP-2`）。
+    pub const NO_CONNECTION: Self = Self::new(-32000, "no connection");
     /// 直近の navigate 結果が無い（未 navigate・取得中・取得失敗を区別しない。`DOM.getDocument`）。
     pub const NO_DOCUMENT: Self = Self::new(-32000, "no document loaded");
     /// 未実装のオプション（`DOM.getDocument` の `pierce: true` 等）。成功を装わず明示的に拒否する（`REPAIR-3`）。
@@ -367,7 +370,7 @@ type HandlerTable = Vec<(&'static str, Box<dyn CommandHandler>)>;
 
 /// 組込みハンドラ表。`Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 /// `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・`Browser.getVersion`（TASK-43.3a）・
-/// `Target.getTargetInfo`（TASK-43.3b）を登録済み（`Target.setAutoAttach`・`Browser.setDownloadBehavior` は実体未接続のため未登録）（`CDP-1`・`CDP-2`）。
+/// `Target.getTargetInfo`（TASK-43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。実体に接続済み）を登録済み（`CDP-1`・`CDP-2`）。
 ///
 /// `Page.navigate` は既定の `FetchOptions`（内部アドレス拒否）で `Fetcher` を構築する。
 pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
@@ -382,6 +385,14 @@ pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
         (
             "Target.getTargetInfo",
             Box::new(crate::playwright_compat::TargetGetTargetInfo),
+        ),
+        (
+            "Target.setAutoAttach",
+            Box::new(crate::playwright_compat::TargetSetAutoAttach),
+        ),
+        (
+            "Browser.setDownloadBehavior",
+            Box::new(crate::playwright_compat::BrowserSetDownloadBehavior),
         ),
         ("DOM.getDocument", Box::new(crate::dom::DomGetDocument)),
         ("DOM.querySelector", Box::new(crate::dom::DomQuerySelector)),
@@ -435,7 +446,8 @@ impl Dispatcher {
         let req = match parse_request(text) {
             Ok(r) => r,
             Err(f) => {
-                return outcome(f.id, None, ResponseBody::Error(f.error), Vec::new());
+                let events = auto_attach_events(state, conn, true);
+                return outcome(f.id, None, ResponseBody::Error(f.error), events);
             }
         };
         let handler = self.handlers.get(req.method.as_str());
@@ -460,7 +472,7 @@ impl Dispatcher {
                 Some(req.id),
                 req.session_id,
                 ResponseBody::Error(CdpError::METHOD_NOT_FOUND),
-                Vec::new(),
+                auto_attach_events(state, conn, true),
             );
         };
         let ctx = CommandContext {
@@ -470,7 +482,7 @@ impl Dispatcher {
         };
         match handler.handle(ctx, &req.params).await {
             Ok(out) => {
-                let events = out
+                let mut events: Vec<CdpEvent> = out
                     .events
                     .into_iter()
                     .map(|mut e| {
@@ -480,6 +492,7 @@ impl Dispatcher {
                         e
                     })
                     .collect();
+                events.extend(auto_attach_events(state, conn, true));
                 outcome(
                     Some(req.id),
                     req.session_id,
@@ -491,10 +504,39 @@ impl Dispatcher {
                 Some(req.id),
                 req.session_id,
                 ResponseBody::Error(e),
-                Vec::new(),
+                // 失敗した要求（原子的 attach の巻き戻し直後等）では新規 attach を再試行しない。
+                auto_attach_events(state, conn, false),
             ),
         }
     }
+}
+
+/// 自動 attach 有効中の接続について、新ターゲットの attach と消失セッションの回収を行い、
+/// ブラウザレベルのイベントとして返す（push 経路が無いため次のコマンド応答に同伴する。
+/// 成功・失敗・未実装メソッドの全経路から呼び、取りこぼしを防ぐ（ハンドラ失敗時は `attach_new=false` で回収のみ）。`CDP-2`・`CDP-7`）。
+/// セッション枠の枯渇は応答を失敗にせず stderr へ記録し、次回に再試行する。
+fn auto_attach_events(
+    state: &Arc<CdpState>,
+    conn: Option<ConnId>,
+    attach_new: bool,
+) -> Vec<CdpEvent> {
+    let Some(c) = conn else {
+        return Vec::new();
+    };
+    let rec = state
+        .conn_scoped()
+        .reconcile_auto_attach(c, state.registry(), attach_new);
+    if rec.error.is_some() {
+        eprintln!("cdp: auto-attach could not attach every target (session limit); will retry");
+    }
+    let mut events = Vec::new();
+    for (target_id, sid) in &rec.detached {
+        events.push(crate::playwright_compat::detached_event(target_id, sid));
+    }
+    for (info, sid) in &rec.attached {
+        events.push(crate::playwright_compat::attached_event(info, sid));
+    }
+    events
 }
 
 fn outcome(
@@ -856,8 +898,6 @@ mod tests {
             let st = state(&dir);
             let b = Dispatcher::builtin().unwrap();
             for (i, m) in [
-                "Target.setAutoAttach",
-                "Browser.setDownloadBehavior",
                 "Target.createBrowserContext",
                 "Target.createTarget",
                 "Target.attachToTarget",
