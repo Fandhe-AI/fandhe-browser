@@ -1,6 +1,6 @@
 # プラグイン境界ポリシー
 
-対応 `TASK-93`（93.1・93.2）/ `MS-9` / ビヘイビア `PLUG-1`（[spec-reference](../../.claude/rules/spec-reference.md)）。
+対応 `TASK-93`（93.1・93.2・93.3）/ `MS-9` / ビヘイビア `PLUG-1`（[spec-reference](../../.claude/rules/spec-reference.md)）。
 
 ## 目的
 
@@ -33,7 +33,7 @@ spec 本文中の旧称 `rust-browser` は `fandhe-browser` に読み替える�
 ## ロード時動的リンクと実行時ロードの区別
 
 - `ldd`・`readelf -d` の `NEEDED`・`otool -L`・`dumpbin /dependents` が検出するのはロード時の動的リンクである。`dlopen` / `LoadLibrary` による実行時ロードは別の機構で、これらでは検出できない
-- 後続の CI 検査（#362・#364・#365）が担うのは前者である。後者は本ポリシーとレビュー（`AGENTS.md` のレビュー観点「プラグイン境界」・[security](../../.claude/rules/security.md)）で防ぐ。CI 検査が `dlopen` まで網羅するものとは扱わない
+- CI 検査（Linux は #362 で実装済み。macOS・Windows は後続の #364・#365）が担うのは前者である。後者は本ポリシーとレビュー（`AGENTS.md` のレビュー観点「プラグイン境界」・[security](../../.claude/rules/security.md)）で防ぐ。CI 検査が `dlopen` まで網羅するものとは扱わない
 - コンテナ配布物（musl・`scratch`）は動的リンク 0 件が前提である（`CTR-4`）。ネイティブ配布物（`*-linux-gnu`・`*-apple-darwin`・`*-pc-windows-msvc`）は OS のシステムライブラリへの動的リンクが避けられず、その扱いは判断待ち（#363）である。本ドキュメントでは決めない
 
 ## 本リポジトリでの現状
@@ -61,7 +61,22 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 ```
 
 前者は上記の build-dependency 経路のみを示し、後者は `nothing to print` となる（一致 0 件は警告で、これが合格の状態）。
-これを CI でゲート化するかは #362 以降の検討候補であり、現時点では未実装である。
+これを CI でゲート化するかは検討候補であり、現時点では未実装である（#362 の検査の対象外）。
+
+## Linux（musl）配布バイナリの動的リンクなし検査
+
+対応 `TASK-93`（93.3）/ `PLUG-1` / `CTR-4`。Issue #362。
+
+- 判定の正本は `scripts/check-static-link.sh`。次の 4 点を全て満たしたときだけ pass とする（container-cloud「コンテナイメージの構成」決定 5）
+  - `readelf -d` の `(NEEDED)` が 0 件
+  - `readelf -l` に `INTERP` セグメントが無い
+  - `ldd` に共有ライブラリ依存を示す `=>` 行が無い（`INTERP` があるバイナリには `ldd` を実行しない）
+  - `file` の文言（`static-pie linked` / `statically linked`）は記録のみで判定に使わない（古い `file` は static-pie でも `dynamically linked` と出すため）
+- 非 ELF・不在・`readelf` の失敗は NG（fail-closed）。`--self-test` は合成データと、実物の動的 ELF を検出できる陰性対照を含む
+- 実行方法は `make check-static-link`（Linux のみ・要 musl ターゲットと `musl-tools`）。musl 三つ組で `fandhe-browser-cli` の既定（V8）と軽量（`--no-default-features --features js-boa`）を release ビルドして検査する。V8 prebuilt の SHA-256 ピンは `docker/release-build.sh` の値を使う。`make ci` には含めない
+- CI では `harness-ubuntu` の `[static-link]` ステップが実行する。ビルド先は `target/` の外で、cache には入れない
+- 出荷物そのものの関門は従来どおり `docker/Dockerfile.release` の `verify-*` ステージで、同じ正本スクリプトを呼ぶ。軽量コンテナの Docker ビルドは boa 系 crate のライセンス文書不足で `verify-lite` に到達しない（`docs/design/container-size-measurement.md`）ため、軽量の検査は cargo 直ビルド経路が担う
+- 対象外: `*-linux-gnu` のネイティブ配布物（方針は #363 待ち）。`dlopen` による実行時ロード（レビューで防ぐ）
 
 ## feature と配布プロファイルの対応
 
@@ -113,7 +128,7 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 | ----- | ---- | ---- |
 | #361 | feature と配布プロファイルの対応表（`TASK-93.2`） | 作成済み（「feature と配布プロファイルの対応」） |
 | #363 | 3 OS ネイティブ配布物の動的リンク方針（人間判断） | 判断待ち |
-| #362 | Linux 向け動的リンクなし検査スクリプト（`TASK-93.3`） | 未実装 |
+| #362 | Linux 向け動的リンクなし検査スクリプト（`TASK-93.3`） | 実装済み（「Linux（musl）配布バイナリの動的リンクなし検査」） |
 | #364 | macOS 向け動的リンク検査スクリプト（`TASK-93.4`） | 未実装 |
 | #365 | Windows 向け動的リンク検査スクリプト（`TASK-93.5`） | 未実装 |
 
@@ -125,7 +140,7 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 - WASM ランタイムのサイズ増分は未実測の目安である
 - PoC-15 の実測は macOS ローカルのみ。3 OS 横断の確認は XOS 系へ申し送り済み
 - 本ドキュメントは新規の実測を含まない
-- 動的リンクの CI による機械検査は未実装である（#362・#364・#365）
+- 動的リンクの CI による機械検査は Linux（musl）のみ実装済みで、macOS・Windows は未実装である（#364・#365）
 
 ## 関連
 

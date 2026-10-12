@@ -58,6 +58,7 @@ cargo test --workspace
 
 - 既定ビルドに Servo が含まれないことを `cargo tree` で検証する（RENDER-1）。判定ロジックの正本は `scripts/check-render-isolation.sh`（`make check-render-isolation` から呼ぶ薄いラッパー）で、CI では `harness-*` ジョブの `[render-isolation]` ステップが同スクリプトを直接実行する（TASK-34.1・Issue #465）。`fandhe-browser-cli` の既定 feature も検査対象だが、cli の manifest が無い場合は NG（fail-closed。TASK-41.5・#174・#633）
 - JS エンジン構成の依存グラフを `cargo tree` で検証する（TASK-32.4・`JS-1`・Issue #168）。軽量ビルド（`--no-default-features --features js-boa`）に `v8` が、エンジンなし（`--no-default-features`）に `v8`・`boa_engine` が含まれないことを `scripts/check-js-engine-isolation.sh`（`make check-js-engine-isolation`）で判定し、CI では `harness-*` ジョブの `[js-engine-isolation]` ステップが直接実行する。軽量ビルドの build・test は `rust-features-*` ジョブの `[js-boa]` ステップ、両エンジン同梱の共通テストは同ジョブの `[default]` ステップで実行する
+- musl 配布バイナリ（既定・軽量）の動的リンクなし検査（TASK-93.3・`PLUG-1`・`CTR-4`・Issue #362）: 判定の正本は `scripts/check-static-link.sh`（`make check-static-link`）。CI では `harness-ubuntu` の `[static-link]` ステップ（musl-tools の導入・自己テスト・検査）が実行する。Linux の ELF 成果物の検査のため ubuntu のみ（macOS・Windows は #364・#365。`[mcp-envelope-smoke]` と同様に OS 固有の検査で、3 OS 共通の検査を特定 OS だけ飛ばすものではない）。`make ci` には含めない。ビルド先は `target/` の外（`RUNNER_TEMP`）で cache 対象外。`*-linux-gnu` のネイティブ配布物は対象外（#363）
 - ライセンス検査は `rust-lint` ジョブの `cargo deny check advisories bans licenses sources` で行う（[licensing](./licensing.md)）
 - 対象サイト群の動作率回帰チェック（`REPAIR-8`・`COMPAT-1`・`COMPAT-4`。TASK-9.2）:
   `make check-compat-regression`（CI では `harness-*` ジョブの `[compat-regression]` ステップ）が

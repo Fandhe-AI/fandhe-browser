@@ -11,6 +11,7 @@
 !profiles/
 !docs/design/host-api.schema.json
 !scripts/gen-cargo-licenses.sh
+!scripts/check-static-link.sh
 !docker/license-supplements/
 !docker/release-build.sh
 !docker/verify-static.sh

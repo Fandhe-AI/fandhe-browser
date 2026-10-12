@@ -7,6 +7,7 @@
 #   check-bench-record       record.sh の自己テスト（要 jq）
 #   check-ci-changes         CI の docs-only 判定スクリプトの自己テスト
 #   check-binary-size        既定 feature のリリースバイナリサイズ検査（RENDER-2。要 jq）
+#   check-static-link        musl 配布バイナリ（既定・軽量）の動的リンクなし検査（PLUG-1・CTR-4・TASK-93.3。Linux のみ）
 #   measure-mcp-envelope     方式 B 本体と MCP エンベロープの測定（PLUG-5。unix のみ）
 #   check-mcp-envelope       上記ハーネスの e2e smoke（unix のみ。0 件実行は NG）
 #   measure-plugin-overhead  mcp プラグインのアイドル RSS 増分の測定（PLUG-3・TASK-95.1。unix のみ）
@@ -21,7 +22,7 @@
 # JS_BINARY_SIZE_STRIP（非空で --strip）・CSSOM_PROFILE_COST_ARGS・MCP_ENVELOPE_ARGS・
 # CONTAINER_SIZE_REFERENCE_IMAGE・CONTAINER_SIZE_REFERENCE_DIGEST・CONTAINER_SIZE_DEFAULT_IMAGE・
 # CONTAINER_SIZE_LITE_IMAGE・CONTAINER_SIZE_PLATFORM・CONTAINER_SIZE_SKIP_BUILD・CONTAINER_SIZE_NO_PULL（非空で有効）・
-# MCP_ENVELOPE_TARGET_DIR・PLAYWRIGHT_VERSION・PLAYWRIGHT_INTEGRITY（既定値は scripts/versions.sh）。
+# MCP_ENVELOPE_TARGET_DIR・STATIC_LINK_TARGET_DIR・PLAYWRIGHT_VERSION・PLAYWRIGHT_INTEGRITY（既定値は scripts/versions.sh）。
 # 各ハーネスの詳細は harness/*/README.md・benches/*/README.md を参照。
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -105,6 +106,61 @@ case "${name}" in
     bash harness/binary-size/check-binary-size.sh \
       --package "${BINARY_SIZE_PACKAGE}" \
       --limit "${BINARY_SIZE_LIMIT_BYTES}"
+    ;;
+  check-static-link)
+    # `make ci` には含めない（release ビルド 2 回と musl ツールチェーンを要するため。check-binary-size と同じ扱い）。
+    # CI では ci.yml の harness-ubuntu [static-link] ステップが担う。macOS は #364、Windows は #365 が別手段で担う。
+    # 出荷物そのものの関門は docker/Dockerfile.release の verify-* ステージ（判定ロジックは同じ scripts/check-static-link.sh）。
+    [ "$(uname -s)" = "Linux" ] || skip "${name} supports Linux only (macOS: #364, Windows: #365)"
+    case "$(uname -m)" in
+      x86_64) triple="x86_64-unknown-linux-musl"; musl_cc="musl-gcc" ;;
+      aarch64) triple="aarch64-unknown-linux-musl"; musl_cc="aarch64-linux-musl-gcc" ;;
+      *) echo "error: unsupported architecture for ${name}: $(uname -m)" >&2; exit 2 ;;
+    esac
+    require_cmd cargo "required by ${name}"
+    require_cmd rustc "required by ${name}"
+    require_cmd file "required by ${name}"
+    require_cmd readelf "required by ${name}"
+    require_cmd ldd "required by ${name}"
+    host_triple="$(rustc -vV | sed -n 's/^host: //p')"
+    if [ "${host_triple}" != "${triple}" ]; then
+      require_cmd "${musl_cc}" "install musl-tools; ring needs a musl C compiler"
+    fi
+    if [ ! -d "$(rustc --print target-libdir --target "${triple}")" ]; then
+      echo "error: rust target ${triple} is not installed (run: rustup target add ${triple})" >&2
+      exit 1
+    fi
+    bash scripts/check-static-link.sh --self-test
+    # 出力先は target/ の外に置ける（CI は cache 対象外にするため RUNNER_TEMP 配下を渡す）。相対なら ROOT_DIR 基準。
+    st_dir="${STATIC_LINK_TARGET_DIR:-${CARGO_TARGET_DIR:-${ROOT_DIR}/target}}"
+    case "${st_dir}" in
+      /*) ;;
+      *) st_dir="${ROOT_DIR}/${st_dir}" ;;
+    esac
+    # V8 prebuilt の SHA-256 ピンは docker/release-build.sh を正本とし、三つ組の行の直後 1 行から厳格に抽出する。
+    v8_pin="$(awk -v t="${triple})" '$1 == t {getline; print; exit}' docker/release-build.sh)"
+    pin_re='^[[:space:]]*RUSTY_V8_ARCHIVE_SHA256=([0-9a-f]{64}) ;;$'
+    if [[ ! "${v8_pin}" =~ ${pin_re} ]]; then
+      echo "error: could not extract RUSTY_V8_ARCHIVE_SHA256 for ${triple} from docker/release-build.sh" >&2
+      exit 1
+    fi
+    v8_sha="${BASH_REMATCH[1]}"
+    sl_bin="${st_dir}/${triple}/release/fandhe-browser"
+    sl_rc=0
+    # 2 構成は同じ出力パスへ上書きされるため、各ビルドの直後に検査する。片方が NG でももう片方を実行する。
+    for flavor in default lite; do
+      echo "static-link: flavor=${flavor} target=${triple}"
+      if [ "${flavor}" = "default" ]; then
+        RUSTY_V8_ARCHIVE_SHA256="${v8_sha}" cargo build --release --locked -p fandhe-browser-cli \
+          --bin fandhe-browser --target "${triple}" --target-dir "${st_dir}" || { sl_rc=1; continue; }
+      else
+        cargo build --release --locked -p fandhe-browser-cli --bin fandhe-browser \
+          --target "${triple}" --target-dir "${st_dir}" --no-default-features --features js-boa || { sl_rc=1; continue; }
+      fi
+      echo "static-link: flavor=${flavor} size=$(stat -c %s "${sl_bin}")"
+      bash scripts/check-static-link.sh "${sl_bin}" || sl_rc=1
+    done
+    exit "${sl_rc}"
     ;;
   measure-mcp-envelope)
     unix_only || { echo "error: ${name} supports unix only" >&2; exit 1; }

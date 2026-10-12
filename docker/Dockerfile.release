@@ -63,7 +63,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target,id=fandhe-release-target-lite-${TARGETARCH} \
     docker/release-build.sh "${TARGETARCH}" "--no-default-features --features js-boa" boa_engine
 
-# 静的リンク検査（CTR-4・決定 5）。検査ロジックは docker/verify-static.sh。
+# 静的リンク検査（CTR-4・決定 5）。docker/verify-static.sh が Alpine 固有の検査を行い、ELF の動的リンク判定は
+# 正本の scripts/check-static-link.sh（TASK-93.3）へ委譲する。
 FROM build-default AS verify-default
 RUN docker/verify-static.sh /out/fandhe-browser
 
