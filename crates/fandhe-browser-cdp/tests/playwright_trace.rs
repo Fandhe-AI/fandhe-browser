@@ -34,11 +34,9 @@ const TRACE: &str = include_str!("../../../harness/playwright-trace/results/newp
 const MAX_TRACE_LINES: usize = 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
-/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3c 後）。`connectOverCDP(http)` が成功し
-/// （`Browser.getVersion`・`Target.setAutoAttach`・`Browser.setDownloadBehavior`・`Target.getTargetInfo` が成功）、
-/// 続く `newContext()` の `Target.createBrowserContext` が未実装（`-32601`。`CDP-6`）で失敗する。
-/// http 経由が成功すると収集ハーネスは ws 直接の段階を実行しないため、ws の経路は
-/// 再生テスト（ws 接続でこの送信列を再生する）が担う。
+/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3c 後）。`connectOverCDP` は http・ws のどちらも
+/// 接続段階の `Target.setAutoAttach`（`waitForDebuggerOnStart:true` の拒否）で失敗し、
+/// `newContext()`・`newPage()` には到達しない（`CDP-6`）。
 ///
 /// 注意: `Browser.getVersion` の応答に `CARGO_PKG_VERSION` が入るため、workspace の版を上げたら
 /// `make trace-playwright` でトレースを再取得すること。
