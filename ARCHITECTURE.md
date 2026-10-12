@@ -75,6 +75,7 @@ workspace メンバーには上記 8 crate の他にツール crate `harness/wpt
 
 - `make check-render-isolation`（`scripts/check-render-isolation.sh`・`RENDER-1`）: 既定ビルドに Servo が含まれないことを検査する
 - `make check-js-engine-isolation`（`scripts/check-js-engine-isolation.sh`・`JS-1`）: エンジン構成別の依存グラフを検査する
+- `make check-static-link`（`scripts/check-static-link.sh`・`PLUG-1`・`CTR-4`）: musl 配布バイナリ（既定・軽量）に動的リンクが無いことを検査する（Linux のみ）
 - 依存方向の表全体を検査するスクリプトは無く、レビュー観点（AGENTS.md・P0）で確認する
 - 現在の依存辺は `cargo tree -p <crate> -e normal` または `cargo metadata --no-deps` で確認できる
 
