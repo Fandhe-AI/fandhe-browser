@@ -2845,6 +2845,32 @@ class EgressGuardTest(unittest.TestCase):
         ):
             self.assertFalse(eg.egress_guard_supported())
 
+    def test_stop_marks_unavailable_when_thread_stuck(self) -> None:
+        # RENDER-5: 走査が終わらず join が期限切れなら enforced にせず unavailable にし、
+        # 遅れて戻った監視スレッドは on_violation を呼ばない。
+        release = threading.Event()
+        killed: list[int] = []
+
+        def slow_scan(*_a: object, **_k: object) -> list[str]:
+            release.wait(5)
+            return ["203.0.113.1:80"]
+
+        with mock.patch.object(eg, "find_unproxied_connections", side_effect=slow_scan):
+            guard = eg.EgressGuard(1, 1, lambda: killed.append(1))
+            guard.start()
+            guard.stop(join_timeout_sec=0.1)
+            self.assertIn("did not exit", guard.unavailable or "")
+            release.set()
+            guard._thread.join(timeout=5)
+        self.assertEqual(killed, [])
+        self.assertIsNone(guard.violation)
+
+    def test_stop_aborts_scan_in_progress(self) -> None:
+        stop = threading.Event()
+        stop.set()
+        with self.assertRaises(eg._ScanAborted):
+            eg._socket_inodes({os.getpid()}, stop.is_set)
+
 
 class ProxyAuditWindowTest(unittest.TestCase):
     """RENDER-5 / TASK-37: 拒否先の重複排除と上限は撮影単位の区間で適用する。"""

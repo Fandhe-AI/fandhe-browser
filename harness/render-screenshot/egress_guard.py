@@ -119,7 +119,16 @@ def parse_net_line(line: str) -> tuple[str, int, int, int, int] | None:
     return str(remote_ip), remote[1], state, inode, local[1]
 
 
-def _descendant_pids(root_pid: int) -> set[int]:
+class _ScanAborted(Exception):
+    """停止要求により走査を中断したことを表す内部用例外（監視不能ではない）。"""
+
+
+def _check_abort(should_abort: Callable[[], bool] | None) -> None:
+    if should_abort is not None and should_abort():
+        raise _ScanAborted
+
+
+def _descendant_pids(root_pid: int, should_abort: Callable[[], bool] | None = None) -> set[int]:
     """`root_pid` とその子孫の pid 集合を /proc/<pid>/stat の ppid から求める。"""
     children: dict[int, list[int]] = {}
     try:
@@ -130,6 +139,7 @@ def _descendant_pids(root_pid: int) -> set[int]:
     if len(names) > MAX_PROCESSES:
         raise GuardUnavailable(f"too many entries in {_PROC}: {len(names)} > {MAX_PROCESSES}")
     for name in names:
+        _check_abort(should_abort)
         if not name.isdigit():
             continue
         try:
@@ -169,9 +179,10 @@ def _retry_transient(fn: Callable[[], object]) -> object:
     return fn()
 
 
-def _socket_inodes(pids: set[int]) -> set[int]:
+def _socket_inodes(pids: set[int], should_abort: Callable[[], bool] | None = None) -> set[int]:
     inodes: set[int] = set()
     for pid in pids:
+        _check_abort(should_abort)
         fd_dir = _PROC / str(pid) / "fd"
         try:
             names = _retry_transient(lambda: os.listdir(fd_dir))  # type: ignore[assignment]
@@ -182,6 +193,7 @@ def _socket_inodes(pids: set[int]) -> set[int]:
         if len(names) > MAX_FDS_PER_PROCESS:
             raise GuardUnavailable(f"too many fds in {fd_dir}: {len(names)} > {MAX_FDS_PER_PROCESS}")
         for name in names:
+            _check_abort(should_abort)
             try:
                 target = _retry_transient(lambda: os.readlink(fd_dir / name))  # type: ignore[assignment]
             except OSError as exc:
@@ -196,14 +208,19 @@ def _socket_inodes(pids: set[int]) -> set[int]:
     return inodes
 
 
-def find_unproxied_connections(root_pid: int, proxy_port: int) -> list[str]:
+def find_unproxied_connections(
+    root_pid: int,
+    proxy_port: int,
+    should_abort: Callable[[], bool] | None = None,
+) -> list[str]:
     """`root_pid` 以下のプロセスが張る、検証プロキシ以外への接続を `host:port` の一覧で返す。
 
     許可するのは remote が 127.0.0.1 の `proxy_port` のみ。ツリー内の待受ポートへの
     ループバック接続（プロセス間通信）、LISTEN ソケット、未接続の UDP は除外する。
     FD・ソケット表を読めない場合は `GuardUnavailable` を送出する（接続なしとは扱わない）。
+    `should_abort` が真を返した時点で `_ScanAborted` を送出して走査を中断する（`EgressGuard.stop` 用）。
     """
-    inodes = _socket_inodes(_descendant_pids(root_pid))
+    inodes = _socket_inodes(_descendant_pids(root_pid, should_abort), should_abort)
     if not inodes:
         return []
     rows: list[tuple[str, int, int, int, int, bool]] = []
@@ -211,6 +228,8 @@ def find_unproxied_connections(root_pid: int, proxy_port: int) -> list[str]:
         try:
             with open(_PROC / "net" / table, encoding="ascii", errors="replace") as fh:
                 for index, line in enumerate(fh):
+                    if index % 1024 == 0:
+                        _check_abort(should_abort)
                     if index >= MAX_NET_LINES:
                         raise GuardUnavailable(f"/proc/net/{table} exceeds {MAX_NET_LINES} lines")
                     parsed = parse_net_line(line)
@@ -238,13 +257,21 @@ def find_unproxied_connections(root_pid: int, proxy_port: int) -> list[str]:
 
 
 class EgressGuard:
-    """エンジン実行中に別スレッドで送信先ソケットを監視し、迂回を検出したらツリーを終了する。"""
+    """エンジン実行中に別スレッドで送信先ソケットを監視し、迂回を検出したらツリーを終了する。
+
+    `stop()` 後は結果（`violation` / `unavailable`）が確定し、監視スレッドは以後 `on_violation` を
+    呼ばない。スレッドが期限内に終了しなかった場合は `unavailable` を設定する（fail-closed。
+    撮影は enforced と記録せず failed になる）。
+    """
 
     def __init__(self, root_pid: int, proxy_port: int, on_violation: Callable[[], None]) -> None:
         self._root_pid = root_pid
         self._proxy_port = proxy_port
         self._on_violation = on_violation
         self._stop = threading.Event()
+        # 結果確定と on_violation 呼び出しを直列化する（確定後の遅延 kill = PID 再利用事故を防ぐ）。
+        self._lock = threading.Lock()
+        self._finalized = False
         self._thread = threading.Thread(target=self._run, name="egress-guard", daemon=True)
         self.violation: str | None = None
         # 監視不能（FD・ソケット表の読み取り失敗等）の理由。設定された撮影は failed にする。
@@ -253,20 +280,33 @@ class EgressGuard:
     def start(self) -> None:
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, join_timeout_sec: float = 5.0) -> None:
         self._stop.set()
-        self._thread.join(timeout=5)
+        self._thread.join(timeout=join_timeout_sec)
+        with self._lock:
+            self._finalized = True
+            if self._thread.is_alive() and self.violation is None and self.unavailable is None:
+                self.unavailable = "monitor thread did not exit within timeout"
+
+    def _report(self, *, violation: str | None = None, unavailable: str | None = None) -> None:
+        """結果を記録して `on_violation` を呼ぶ。`stop()` で確定済みなら何もしない。"""
+        with self._lock:
+            if self._finalized:
+                return
+            self.violation = violation
+            self.unavailable = unavailable
+            self._on_violation()
 
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                found = find_unproxied_connections(self._root_pid, self._proxy_port)
+                found = find_unproxied_connections(self._root_pid, self._proxy_port, self._stop.is_set)
+            except _ScanAborted:
+                return
             except Exception as exc:  # noqa: BLE001 - 監視不能を「接続なし」にしない（fail-closed）
-                self.unavailable = f"{type(exc).__name__}: {exc}"[:300]
-                self._on_violation()
+                self._report(unavailable=f"{type(exc).__name__}: {exc}"[:300])
                 return
             if found:
-                self.violation = found[0]
-                self._on_violation()
+                self._report(violation=found[0])
                 return
             self._stop.wait(POLL_INTERVAL_SEC)
