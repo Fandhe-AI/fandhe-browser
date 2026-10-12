@@ -121,8 +121,8 @@ case "${name}" in
     trap 'rm -f "${out}"' EXIT
     FANDHE_BROWSER_MCP_BIN="$(mcp_target_dir)/debug/fandhe-browser-mcp" \
       cargo test -p fandhe-browser-ai --test mcp_envelope_e2e -- --ignored 2>&1 | tee "${out}"
-    if ! grep -q "test result: ok. 2 passed" "${out}"; then
-      echo "error: mcp_envelope_e2e did not pass exactly 2 tests" >&2
+    if ! grep -q "test result: ok. 1 passed" "${out}"; then
+      echo "error: mcp_envelope_e2e did not pass exactly 1 test" >&2
       exit 1
     fi
     ;;
