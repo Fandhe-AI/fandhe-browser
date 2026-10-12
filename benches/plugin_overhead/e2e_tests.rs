@@ -8,6 +8,10 @@
 
 #[path = "../../crates/fandhe-browser-ai/benches/mcp_envelope/app_host.rs"]
 mod app_host;
+#[path = "call_latency.rs"]
+mod call_latency;
+#[path = "call_latency_stats.rs"]
+mod call_latency_stats;
 #[path = "../../crates/fandhe-browser-ai/benches/mcp_envelope/host.rs"]
 mod host;
 #[path = "idle_rss.rs"]
@@ -87,4 +91,45 @@ fn plug3_measure_fails_when_plugin_exits_after_initialize() {
     let _ = std::fs::remove_dir_all(&dir);
     let err = result.expect_err("measurement must fail when the plugin has exited");
     assert!(err.contains("plugin process exited"), "{err}");
+}
+
+/// 実バイナリで `tools/call snapshot` を N 回計測できる（TASK-95.3・`PLUG-3`）。目標値との大小は
+/// debug ビルドで走るため検査しない（達成判定は #379）。
+#[test]
+#[ignore = "requires the fandhe-browser-mcp binary (FANDHE_BROWSER_MCP_BIN); run via make check-plugin-overhead"]
+fn plug3_e2e_call_latency_is_measured_with_real_binary() {
+    let env_bin = std::env::var(mcp_client::BIN_ENV).ok();
+    let bin = mcp_client::resolve_bin(
+        env_bin.as_deref(),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+    .expect("mcp binary");
+    let opts =
+        options::Options::parse(&["--metric", "call-latency", "--calls", "5"].map(String::from))
+            .expect("options");
+    let m = call_latency::measure(&bin, &opts).expect("measure");
+    assert_eq!(m.samples_ms.len(), 5);
+    for v in &m.samples_ms {
+        assert!(v.is_finite() && *v > 0.0 && *v < 30_000.0, "{v}");
+    }
+    assert!(m.p50_ms().expect("p50") <= m.p95_ms().expect("p95"));
+    let out = call_latency_stats::render_call_latency(&m, 20, 100).expect("render");
+    assert!(out.contains("call_latency\t5\t"), "{out}");
+}
+
+/// ツールが isError を返したら標本に数えず計測失敗になる（TASK-95.3・`PLUG-3`）。
+#[test]
+fn plug3_call_latency_fails_when_tool_returns_error() {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("benches")
+        .join("plugin_overhead")
+        .join("fixtures")
+        .join("fake-mcp-tool-error.sh");
+    let opts =
+        options::Options::parse(&["--metric", "call-latency", "--calls", "3"].map(String::from))
+            .expect("options");
+    let err = call_latency::measure(&script, &opts).expect_err("tool error must fail");
+    assert!(err.contains("isError"), "{err}");
 }
