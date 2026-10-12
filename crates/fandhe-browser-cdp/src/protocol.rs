@@ -446,7 +446,7 @@ impl Dispatcher {
         let req = match parse_request(text) {
             Ok(r) => r,
             Err(f) => {
-                let events = auto_attach_events(state, conn);
+                let events = auto_attach_events(state, conn, true);
                 return outcome(f.id, None, ResponseBody::Error(f.error), events);
             }
         };
@@ -472,7 +472,7 @@ impl Dispatcher {
                 Some(req.id),
                 req.session_id,
                 ResponseBody::Error(CdpError::METHOD_NOT_FOUND),
-                auto_attach_events(state, conn),
+                auto_attach_events(state, conn, true),
             );
         };
         let ctx = CommandContext {
@@ -492,7 +492,7 @@ impl Dispatcher {
                         e
                     })
                     .collect();
-                events.extend(auto_attach_events(state, conn));
+                events.extend(auto_attach_events(state, conn, true));
                 outcome(
                     Some(req.id),
                     req.session_id,
@@ -504,7 +504,8 @@ impl Dispatcher {
                 Some(req.id),
                 req.session_id,
                 ResponseBody::Error(e),
-                auto_attach_events(state, conn),
+                // 失敗した要求（原子的 attach の巻き戻し直後等）では新規 attach を再試行しない。
+                auto_attach_events(state, conn, false),
             ),
         }
     }
@@ -512,15 +513,19 @@ impl Dispatcher {
 
 /// 自動 attach 有効中の接続について、新ターゲットの attach と消失セッションの回収を行い、
 /// ブラウザレベルのイベントとして返す（push 経路が無いため次のコマンド応答に同伴する。
-/// 成功・失敗・未実装メソッドの全経路から呼び、取りこぼしを防ぐ。`CDP-2`・`CDP-7`）。
+/// 成功・失敗・未実装メソッドの全経路から呼び、取りこぼしを防ぐ（ハンドラ失敗時は `attach_new=false` で回収のみ）。`CDP-2`・`CDP-7`）。
 /// セッション枠の枯渇は応答を失敗にせず stderr へ記録し、次回に再試行する。
-fn auto_attach_events(state: &Arc<CdpState>, conn: Option<ConnId>) -> Vec<CdpEvent> {
+fn auto_attach_events(
+    state: &Arc<CdpState>,
+    conn: Option<ConnId>,
+    attach_new: bool,
+) -> Vec<CdpEvent> {
     let Some(c) = conn else {
         return Vec::new();
     };
     let rec = state
         .conn_scoped()
-        .reconcile_auto_attach(c, state.registry());
+        .reconcile_auto_attach(c, state.registry(), attach_new);
     if rec.error.is_some() {
         eprintln!("cdp: auto-attach could not attach every target (session limit); will retry");
     }

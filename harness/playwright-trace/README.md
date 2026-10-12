@@ -69,7 +69,8 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
   `newPage()` には到達しない。http 経由が成功するため、ws 直接の段階（`connectOverCDP(ws://…)`）は
   トレースに記録されない（ws 経路は `tests/playwright_trace.rs` の再生テストが担う）
 
-- 注意: 上記の録画は `Browser.setDownloadBehavior`（`allowAndName`・`eventsEnabled:true`）が成功していた時点の実測。
-  その後、実行系が無いため許可系・イベント有効は `-32602`（`UNSUPPORTED_PARAMS`。`CDP-6`・`REPAIR-3`）で
-  拒否するよう変更したため、現行サーバーでは Playwright の `connectOverCDP` はこの段で失敗する。
-  トレースは `make trace-playwright` で再取得するまで旧状態のままで、再生テストは id 3 の差分を明示して扱う
+- 注意: 上記の録画は拒否導入前の実測。その後、ターゲット一時停止が未実装のため `Target.setAutoAttach` の
+  `waitForDebuggerOnStart:true`（id 2）を、実行系が無いため `Browser.setDownloadBehavior` の許可系・イベント有効
+  （`allowAndName`・`eventsEnabled:true`。id 3）を、それぞれ `-32602`（`UNSUPPORTED_PARAMS`。`CDP-6`・`REPAIR-3`）で
+  拒否するよう変更した。現行サーバーでは Playwright の `connectOverCDP` は最初に拒否される `Target.setAutoAttach`（id 2）の段で失敗する。
+  トレースは `make trace-playwright` で再取得するまで旧状態のままで、再生テストは id 2・id 3 の両方の差分を明示して扱う

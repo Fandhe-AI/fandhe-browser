@@ -176,7 +176,7 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
   - ダウンロード実行系（保存・`Browser.downloadWillBegin`・`downloadProgress`）は未実装で、現状ダウンロードは発生しない。
     保証できる `deny`・`default`（イベントなし）だけを受理して接続スコープで保持し、`allow`・`allowAndName` と
     `eventsEnabled:true` は成功を装わず `-32602`（`unsupported params`）で拒否する（`CDP-6`・`REPAIR-3`）。
-    このため録画した Playwright の接続シーケンス（`allowAndName`・`eventsEnabled:true`）は現行サーバーではこの段で失敗する
+    このため録画した Playwright の接続シーケンス（`allowAndName`・`eventsEnabled:true`）もこの段で拒否される（ただし現行サーバーでは、それより前の `Target.setAutoAttach` の `waitForDebuggerOnStart:true` が先に `-32602` で拒否されるため、接続は `Target.setAutoAttach` の段で止まる）
     （実行系の実装〔`CDP-2`〕まで許容。トレースは `make trace-playwright` で再取得が必要）
   - `behavior` は `deny`・`allow`・`allowAndName`・`default`（`allow*` は上記のとおり拒否）
   - `downloadPath` は絶対パス・`..` なし・NUL なし・4096 バイト以下。**サーバーはこのパスに一切ファイル操作をしない**
