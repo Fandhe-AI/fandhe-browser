@@ -10,7 +10,7 @@
 //! （`JS-2`・TASK-30.5）。
 
 //!
-//! Windows では profile crate の ACL 実装（`XOS-7`〜`XOS-10`）待ちのため起動不可（fail-closed）。
+//! Windows ではプロファイルルートが `%LOCALAPPDATA%` 配下のときだけ起動できる（`XOS-7`・`XOS-10`）。
 //! `ProfileError::Unsupported` の場合は理由を示す固定の英語メッセージで非ゼロ終了する。
 mod page_scripts;
 mod server;

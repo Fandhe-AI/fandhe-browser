@@ -20,9 +20,11 @@
 //!
 //! # 対応 OS
 //!
-//! Windows では profile crate の ACL 実装（`XOS-7`〜`XOS-10`）待ちのため起動できない
-//! （fail-closed）。`Profile::open` が `ProfileError::Unsupported` を返し、cli は
-//! [`UNSUPPORTED_OS_MESSAGE`] を出して非ゼロ終了する。成功を装うことはしない。
+//! Windows ではプロファイルルートが `%LOCALAPPDATA%` 配下のときだけ起動できる
+//! （`XOS-7`・`XOS-10`・Issue #928。ACL は設定・検証せず OS 既定の継承 ACL に依存する）。
+//! 配下外・`LOCALAPPDATA` 未設定などでは `Profile::open` が `ProfileError::Unsupported` を
+//! 返し、cli は [`UNSUPPORTED_OS_MESSAGE`] を出して非ゼロ終了する（fail-closed）。
+//! Windows・unix 以外の OS も同じく `Unsupported` で終了する。成功を装うことはしない。
 //!
 //! # セキュリティ
 //!
@@ -58,12 +60,20 @@ pub(crate) fn default_router_factories() -> Vec<RouterFactory> {
     vec![Box::new(fandhe_browser_ai::api::router)]
 }
 
-/// プロファイル隔離が未対応の OS（現状 Windows）で起動に失敗した際の固定文言。
+/// `Profile::open` が `ProfileError::Unsupported` を返して起動に失敗した際の固定文言（`XOS-7`・`XOS-10`）。
 ///
-/// profile crate の Windows ACL（`XOS-7`〜`XOS-10`）が未実装のため、既定 ACL で機密データを
-/// 書く偽装成功を避けて `Profile::open` が `Unsupported` を返す。その意図した fail-closed を
-/// 利用者へ伝える。`main` が `error: ` を前置して stderr へ出し、非ゼロで終了する。
-pub(crate) const UNSUPPORTED_OS_MESSAGE: &str = "profile isolation is not yet supported on this OS (Windows ACL not implemented; XOS-7..XOS-10)";
+/// Windows では、プロファイルルートが `%LOCALAPPDATA%` 配下でない（`LOCALAPPDATA` 未設定・
+/// 判定不能を含む）ことが拒否理由で、ACL を設定しない代わりに配下のルートだけを許す
+/// fail-closed の意図を伝える。それ以外の OS（unix 以外）はプロファイル隔離が未対応であることを伝える。
+/// 入力のパス・環境変数の値は含めない。`main` が `error: ` を前置して stderr へ出し、非ゼロで終了する。
+#[cfg(windows)]
+pub(crate) const UNSUPPORTED_OS_MESSAGE: &str =
+    "on Windows, the profile root must be located under %LOCALAPPDATA% (XOS-7, XOS-10)";
+
+/// 非 Windows 版の固定文言（上記 Windows 版の doc 参照）。unix では通常到達しない。
+#[cfg(not(windows))]
+pub(crate) const UNSUPPORTED_OS_MESSAGE: &str =
+    "profile isolation is not supported on this OS (XOS-7, XOS-10)";
 
 /// `FANDHE_BROWSER_CONFIG` が空文字だった場合の固定文言（`startup_config` が返す）。
 pub(crate) const CONFIG_PATH_EMPTY_MESSAGE: &str = "FANDHE_BROWSER_CONFIG is set but empty";
@@ -99,7 +109,7 @@ pub(crate) enum StartupError {
     ConfigPathEmpty,
     /// `[profile] root` 指定は cli 未配線のため拒否した。
     ProfileRootNotWired,
-    /// プロファイルのルート解決・open の失敗（Windows の `Unsupported`・二重起動の `Locked` を含む）。
+    /// プロファイルのルート解決・open の失敗（Windows で `%LOCALAPPDATA%` 配下でない場合などの `Unsupported`・二重起動の `Locked` を含む）。
     Profile(ProfileError),
     /// CDP の WebSocket 設定の構築失敗。
     WebSocketConfig(WsConfigError),
@@ -259,15 +269,17 @@ mod tests {
         }
     }
 
-    /// `XOS-7`〜`XOS-10`: `Unsupported` だけが固定の理由文言になり、他のプロファイル
-    /// エラーの表示は変わらない（OS 非依存で 3 OS とも実行）。
+    /// `XOS-7`・`XOS-10`: `Unsupported` だけが固定の理由文言になり（パスは含まない）、他の
+    /// プロファイルエラーの表示は変わらない（3 OS とも実行。文言は OS ごとに `cfg` で分かれる）。
     #[test]
     fn xos7_unsupported_profile_error_displays_fixed_message() {
         let err = StartupError::Profile(ProfileError::Unsupported { reason: "x" });
-        assert_eq!(
-            err.to_string(),
-            "profile isolation is not yet supported on this OS (Windows ACL not implemented; XOS-7..XOS-10)"
-        );
+        #[cfg(windows)]
+        let expected =
+            "on Windows, the profile root must be located under %LOCALAPPDATA% (XOS-7, XOS-10)";
+        #[cfg(not(windows))]
+        let expected = "profile isolation is not supported on this OS (XOS-7, XOS-10)";
+        assert_eq!(err.to_string(), expected);
         let other = StartupError::Profile(ProfileError::Locked {
             path: std::path::PathBuf::from("p"),
         });
@@ -304,25 +316,72 @@ mod tests {
         assert_eq!(DEFAULT_ADDR.to_string(), "127.0.0.1:9333");
     }
 
-    #[cfg(not(unix))]
-    mod non_unix {
+    // Windows 以外の非 unix は `Profile::open` が常に `Unsupported` を返すが、CI に該当 OS が
+    // 無いため、そのためのテストは置かない。
+    #[cfg(windows)]
+    mod windows {
+        use std::path::{Path, PathBuf};
+
         use super::super::*;
         use crate::server::tests::support::{FixedStore, TempDir};
 
+        /// `%LOCALAPPDATA%` を `canonicalize` して返す。未設定・解決不能なら失敗させる（黙って通さない）。
+        fn local_app_data() -> PathBuf {
+            let raw = std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA must be set");
+            std::fs::canonicalize(&raw).expect("LOCALAPPDATA must exist")
+        }
+
+        /// `XOS-7`・`XOS-10`（Issue #928）: `%LOCALAPPDATA%` 配下のルートで `open_app_state` が成功し、
+        /// ルートに `profile.lock` が作られる。
         #[test]
-        fn cdp1_open_app_state_is_unsupported_on_non_unix() {
+        fn xos7_open_app_state_succeeds_under_local_app_data_on_windows() {
             let dir = TempDir::new();
-            let err = open_app_state(&FixedStore(dir.path.clone())).unwrap_err();
+            // 前提: 一時ディレクトリ（`temp_dir()` 基点）が `%LOCALAPPDATA%` 配下であること。
+            let base = local_app_data();
+            let owned = std::fs::canonicalize(&dir.owned).expect("temp dir exists");
+            assert!(
+                owned.starts_with(&base),
+                "test precondition: temp dir {owned:?} must be under %LOCALAPPDATA% {base:?}"
+            );
+
+            let app =
+                open_app_state(&FixedStore(dir.path.clone())).expect("open under LOCALAPPDATA");
+            let root = app.profile().root();
+            assert!(
+                std::fs::canonicalize(root)
+                    .expect("root exists")
+                    .starts_with(&base),
+                "{root:?}"
+            );
+            assert!(root.join("profile.lock").is_file(), "{root:?}");
+        }
+
+        /// `XOS-7`・`XOS-10`: `%LOCALAPPDATA%` 配下でないルートは `Unsupported` で拒否され、
+        /// 固定文言が表示され、ディレクトリは作られない。
+        #[test]
+        fn xos10_open_app_state_rejects_root_outside_local_app_data_on_windows() {
+            let base = local_app_data();
+            let parent = base.parent().expect("LOCALAPPDATA has a parent");
+            // 判定だけで拒否される、`%LOCALAPPDATA%` の親直下の存在しない名前（何も作らない）。
+            let root = parent.join(format!("fandhe-cli-test-outside-{}", std::process::id()));
+            assert!(!Path::new(&root).exists(), "test precondition: {root:?}");
+
+            let err = open_app_state(&FixedStore(root.clone())).unwrap_err();
             assert!(matches!(
                 err,
                 StartupError::Profile(ProfileError::Unsupported { .. })
             ));
-            assert_eq!(err.to_string(), UNSUPPORTED_OS_MESSAGE);
+            assert_eq!(
+                err.to_string(),
+                "on Windows, the profile root must be located under %LOCALAPPDATA% (XOS-7, XOS-10)"
+            );
+            assert!(!root.exists(), "directory must not be created: {root:?}");
         }
     }
 
-    // `Profile::open` は非 unix では `Unsupported` を返す仕様のため、プロファイルを
-    // 開く必要があるテストは unix 限定（任意の skip ではない。cdp の結合テストと同じ扱い）。
+    // Windows でも `%LOCALAPPDATA%` 配下なら `Profile::open` で構築できるようになった（Issue #928）。
+    // 本モジュールの Windows 対応（`cfg(unix)` の解除）は後続 issue で扱う。それまでは unix 限定
+    // （任意の skip ではない。cdp の結合テストと同じ扱い）。
     #[cfg(unix)]
     mod unix {
         use std::io::{Read, Write};
