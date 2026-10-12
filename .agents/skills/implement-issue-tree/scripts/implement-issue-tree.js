@@ -1385,9 +1385,9 @@ sig: { type: 'number', description: 'コマンド出力の sig をそのまま�
 },
 description: 'コマンド出力の各行（{"number": N, "deps": [...], "sig": S}）をそのまま転記した配列',
 },
-rateLimited: { type: 'boolean', description: '標準エラーにレート制限（HTTP 403・429・rate limit）が出たら true' },
-resetAt: { type: 'string', description: 'gh api rate_limit が返した resetAt をそのまま写す' },
-waitSeconds: { type: 'number', description: 'gh api rate_limit が返した waitSeconds をそのまま写す' },
+rateLimited: { type: 'boolean', description: 'レート制限と確認できたときだけ true（メッセージに rate limit / secondary rate limit / RATE_LIMITED がある、または core の remaining が 0）。権限・SSO などの 403 は false' },
+resetAt: { type: 'string', description: 'core の枯渇のとき gh api rate_limit が返した resetAt をそのまま写す（secondary は省略）' },
+waitSeconds: { type: 'number', description: 'core の枯渇なら gh api rate_limit の waitSeconds、secondary rate limit なら retry-after の秒数。どちらも無ければ省略（ホストが固定の短い待機にする）' },
 },
 }
 
@@ -1415,7 +1415,11 @@ MACHINE_SCOPE_LINE,
 '標準出力は成功したイシューにつき 1 行の JSON（{"number": N, "deps": [...], "sig": S}）。標準出力の全行を entries 配列へそのまま転記して返す（number・deps〔要素の順序も含む〕・sig を出力どおりに写す。行の省略以外の加工・推測による追加をしない。sig はホストが deps との整合を検査する値）。',
 '標準エラーに FAILED と出たイシューは entries に含めない（ホストが欠落を検出して再試行する）。',
 
-`標準エラーに HTTP 403・429・rate limit が出たら rateLimited を true にし、gh api rate_limit --jq '.resources.core | {resetAt: (.reset | todate), waitSeconds: ([.reset - now, 0] | max | ceil)}' を 1 回実行して resetAt と waitSeconds を出力どおりに返す（待機はホストが行う。sleep しない）。`,
+
+
+
+
+`標準エラーのメッセージに rate limit・secondary rate limit・RATE_LIMITED がある、または HTTP 403・429 で gh api rate_limit --jq '.resources.core | {remaining, resetAt: (.reset | todate), waitSeconds: ([.reset - now, 0] | max | ceil)}' の remaining が 0 のときだけ rateLimited を true にする。権限・SSO など他の 403 は rateLimited にしない（通常の失敗として扱う）。core の枯渇なら resetAt と waitSeconds を出力どおりに返し、secondary rate limit なら resetAt は省略して waitSeconds に retry-after の秒数を入れる（無ければ省略）。待機はホストが行う。sleep しない。`,
 ].join('\n')
 }
 
@@ -1493,17 +1497,19 @@ const RATE_LIMIT_MAX_WAITS = 2
 
 
 
-async function mapBounded(items, limit, fn) {
+
+
+
+async function mapBounded(items, limit, fn, signal = { aborted: false }) {
 const results = new Array(items.length)
 let next = 0
-let failed = false
 const worker = async () => {
-while (!failed && next < items.length) {
+while (!signal.aborted && next < items.length) {
 const i = next++
 try {
 results[i] = await fn(items[i], i)
 } catch (e) {
-failed = true
+signal.aborted = true
 throw e
 }
 }
@@ -1532,6 +1538,9 @@ resetAt: typeof result.resetAt === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\
 
 
 async function extractDeclaredDeps(chunks, sleep = typeof setTimeout === 'function' ? (ms) => new Promise((r) => setTimeout(r, ms)) : null) {
+
+
+const signal = { aborted: false }
 const runChunk = async (requested, index) => {
 const merged = new Map()
 let pending = requested
@@ -1539,6 +1548,7 @@ let calls = 0
 let waits = 0
 let rate = null
 for (let attempt = 1; attempt <= 2 && pending.length > 0;) {
+if (signal.aborted) return merged
 let result = null
 try {
 result = await agent(declaredDepsPrompt(pending), {
@@ -1551,6 +1561,7 @@ schema: DECLARED_DEPS_SCHEMA,
 } catch (e) {
 log(`⚠️ 依存宣言の抽出（チャンク ${index + 1}・${attempt} 回目）が失敗した: ${sanitize(String(e?.message ?? e))}`)
 }
+if (signal.aborted) return merged
 rate = parseRateLimit(result)
 
 
@@ -1587,7 +1598,7 @@ throw new Error(
 return merged
 }
 const declaredByNumber = new Map()
-for (const m of await mapBounded(chunks, DECLARED_DEPS_CONCURRENCY, runChunk)) {
+for (const m of await mapBounded(chunks, DECLARED_DEPS_CONCURRENCY, runChunk, signal)) {
 for (const [n, s] of m) declaredByNumber.set(n, s)
 }
 return declaredByNumber
@@ -4419,7 +4430,7 @@ const AGENT_CALLS_PER_ISSUE = { implement: 30, resume: 12, close: 6 }
 
 
 const AGENT_CALLS_TERMINAL_BASE = 20
-const agentBudget = { limit: parseAgentCallLimit(parsedArgs && typeof parsedArgs === 'object' ? parsedArgs.agentCallLimit : undefined), used: 0, enforced: false, stoppedDispatchAt: null, starts: 0 }
+const agentBudget = { limit: parseAgentCallLimit(parsedArgs && typeof parsedArgs === 'object' ? parsedArgs.agentCallLimit : undefined), used: 0, enforced: false, stoppedDispatchAt: null, starts: 0, starved: false, neededLimit: null }
 
 function wrapAgentCounting(raw, budget, warn = () => {}) {
 let warned = false
@@ -6736,7 +6747,8 @@ const e = unmonitoredPrs.get(n)
 if (e && e.pr === pr && (status === 'monitoring' || status === 'blocked') && Number.isInteger(pr) && pr > 0 && isValidBranchName(branch) && branchMatchesIssue(branch, n)) e.resumable = true
 }
 
-const agentBudgetHeld = new Set()
+
+const agentBudgetHeld = new Map()
 let consecutiveFailures = 0
 
 
@@ -9650,8 +9662,12 @@ if (agentBudget.stoppedDispatchAt === null) {
 agentBudget.stoppedDispatchAt = agentBudget.used
 log(`⚠️ エージェント呼び出し数が上限 ${agentBudget.limit} に近いため新規着手を停止する（使用 ${agentBudget.used}・残り ${budgetHold.remaining}・#${n} に必要 ${budgetHold.required}）。実行中の issue の完了を優先する`)
 }
-agentBudgetHeld.add(n)
-if (budgetKind === 'resume') monitoringResumeGateDeferred.set(n, `エージェント呼び出し数の予算不足で monitoring 再開を見送った（使用 ${agentBudget.used}/${agentBudget.limit}）。同じ引数で再実行すると monitor から再開する`)
+
+agentBudgetHeld.set(n, { kind: item.kind, required: budgetHold.required, used: agentBudget.used })
+
+
+
+
 continue
 }
 agentBudgetHeld.delete(n)
@@ -10129,8 +10145,23 @@ const notStartedNoteBase = halted
 : newStartSuppressed
 ? `残置 worktree 上限ゲートにより新規着手を抑止（理由: ${newStartSuppressed.reason}）`
 : 'スケジューラ終了時に未着手（キュー未到達）'
+
+
+
+const budgetOnly = (n) => agentBudgetHeld.has(n) && !halted && !monitoringResumeGateDeferred.has(n) && (isActiveMonitoring(n) || !shouldSkipForNewStartSuppressed(newStartSuppressed, agentBudgetHeld.get(n).kind))
+
+
+
+
+
+
+const starvedHeld = agentBudget.starts === 0 ? pending.filter(budgetOnly) : []
+agentBudget.starved = starvedHeld.length > 0
+if (agentBudget.starved) agentBudget.neededLimit = agentBudget.used + Math.min(...starvedHeld.map((n) => agentBudgetHeld.get(n).required))
+const budgetFloor = '（下限値。保存された状態が大きいと開始処理の分だけさらに要る）'
+const budgetRerun = (act) => agentBudget.starved ? `args.agentCallLimit を少なくとも ${agentBudget.neededLimit} にして再実行すると${act}しうる${budgetFloor}` : `同じ引数で再実行すると${act}する`
 for (const n of notStarted) {
-const notStartedNote = agentBudgetHeld.has(n) ? `エージェント呼び出し数の予算不足により新規着手を停止（使用 ${agentBudget.used}/${agentBudget.limit}。同じ引数で再実行すると着手する）` : notStartedNoteBase
+const notStartedNote = budgetOnly(n) ? `エージェント呼び出し数の予算不足により新規着手を停止（使用 ${agentBudget.used}/${agentBudget.limit}。${budgetRerun('着手')}）` : notStartedNoteBase
 results.push({ issue: n, status: 'not-started', note: notStartedNote })
 
 
@@ -10142,7 +10173,14 @@ for (const n of interrupted) {
 
 const { pr, status } = savedItems[String(n)]
 
-const deferredReason = monitoringResumeGateDeferred.get(n)
+
+
+const gate = monitoringResumeGateDeferred.get(n)
+const held = agentBudgetHeld.get(n)
+const heldFact = held ? `エージェント呼び出し数の予算も不足していた（保留時の使用 ${held.used}/${agentBudget.limit}。この周回の使用量では再開に args.agentCallLimit が少なくとも ${held.used + held.required} 要った）` : ''
+const deferredReason = gate
+? (held ? `${gate}（この理由は前回の評価。予算で保留した周回では再評価していない）。${heldFact}` : gate)
+: held ? (halted ? `halt のため再開しなかった。${heldFact}` : `エージェント呼び出し数の予算不足で monitoring 再開を見送った（使用 ${agentBudget.used}/${agentBudget.limit}）。${budgetRerun(' monitor から再開')}`) : ''
 const note = deferredReason
 ? `中断時に ${status}（${PR_RECORD_UNVERIFIED(pr)}）。${deferredReason}`
 : `中断時に ${status}（${PR_RECORD_UNVERIFIED(pr)}）。同じ引数で再実行すると monitor から再開する`
@@ -10176,6 +10214,7 @@ const unmonitoredFmt = (resumable) => unmonitoredPrList.filter((e) => e.resumabl
 if (unmonitoredFmt(true)) log(`⚠️ PR 作成済みで未監視（状態ファイルに pr 保存済み）: ${unmonitoredFmt(true)}。同じ引数で再実行すると monitor から再開する`)
 if (unmonitoredFmt(false)) log(`⚠️ PR 作成済みで未監視（状態ファイルに pr が無い／照合未了）: ${unmonitoredFmt(false)}。再実行では monitor から再開しない。GitHub 上で PR を手動確認すること（状態ファイルの unverifiedPr があれば再実行で再照合される）`)
 log(`エージェント呼び出し数: ${agentBudget.used}/${agentBudget.limit}（新規着手停止時点 ${agentBudget.stoppedDispatchAt ?? 'なし'}）`)
+if (agentBudget.starved) log(`⚠️ 予算を使い切り 1 件も着手していない。args.agentCallLimit を少なくとも ${agentBudget.neededLimit} にして再実行すること${budgetFloor}${agentBudget.neededLimit > AGENT_RUN_LIMIT ? `（ランタイムの上限 ${AGENT_RUN_LIMIT} を超えるため対象ツリーを分けて実行する）` : ''}`)
 
 if (halted) log(`中断: ${halted.reason}（直近の停滞イシュー: ${halted.issues.map((n) => `#${n}`).join(', ')}）`)
 
