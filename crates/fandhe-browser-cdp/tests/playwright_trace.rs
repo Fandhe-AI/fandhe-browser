@@ -313,7 +313,8 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
         [
             version,
             json!({"id": 2, "result": {}}),
-            json!({"id": 3, "result": {}}),
+            // 録画時の `allowAndName`・`eventsEnabled:true` は実行系が無いため拒否される（CDP-6・REPAIR-3）。
+            json!({"id": 3, "error": {"code": -32602, "message": "unsupported params"}}),
             json!({"id": 4, "result": {"targetInfo": {
                 "targetId": "trace-1", "type": "browser", "title": "", "url": "",
                 "attached": true, "canAccessOpener": false
@@ -321,7 +322,15 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
             json!({"id": 5, "error": {"code": -32601, "message": "method not implemented"}}),
         ]
     );
-    assert_eq!(replayed, recvs, "replay must match the recorded responses");
+    // 録画は拒否導入前の実測のため、id 3（setDownloadBehavior）以外が録画と一致することを確認する。
+    // トレースは `make trace-playwright` で再取得するまで旧挙動のまま残る。
+    let without_dl =
+        |v: &[Value]| -> Vec<Value> { v.iter().filter(|m| m["id"] != 3).cloned().collect() };
+    assert_eq!(
+        without_dl(&replayed),
+        without_dl(&recvs),
+        "replay must match the recorded responses"
+    );
 
     // 受信メソッドログ（CDP-6）がトレースの送信メソッドと一致する。
     let snap = st.received_methods();

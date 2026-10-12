@@ -68,3 +68,8 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
 - 続く `newContext()` で送る `Target.createBrowserContext` が `-32601`（未実装。`CDP-6`）となり失敗する。
   `newPage()` には到達しない。http 経由が成功するため、ws 直接の段階（`connectOverCDP(ws://…)`）は
   トレースに記録されない（ws 経路は `tests/playwright_trace.rs` の再生テストが担う）
+
+- 注意: 上記の録画は `Browser.setDownloadBehavior`（`allowAndName`・`eventsEnabled:true`）が成功していた時点の実測。
+  その後、実行系が無いため許可系・イベント有効は `-32602`（`UNSUPPORTED_PARAMS`。`CDP-6`・`REPAIR-3`）で
+  拒否するよう変更したため、現行サーバーでは Playwright の `connectOverCDP` はこの段で失敗する。
+  トレースは `make trace-playwright` で再取得するまで旧状態のままで、再生テストは id 3 の差分を明示して扱う

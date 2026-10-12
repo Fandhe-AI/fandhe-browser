@@ -481,7 +481,7 @@ impl Dispatcher {
         };
         match handler.handle(ctx, &req.params).await {
             Ok(out) => {
-                let events = out
+                let mut events: Vec<CdpEvent> = out
                     .events
                     .into_iter()
                     .map(|mut e| {
@@ -491,6 +491,16 @@ impl Dispatcher {
                         e
                     })
                     .collect();
+                // 自動 attach 有効中に現れた新ターゲットを attach し、ブラウザレベルのイベントとして続ける
+                // （push 経路が無いため次のコマンド応答に同伴する。`CDP-2`・`CDP-7`）。
+                if let Some(c) = conn {
+                    for (info, sid) in state
+                        .conn_scoped()
+                        .reconcile_auto_attach(c, state.registry())
+                    {
+                        events.push(crate::playwright_compat::attached_event(&info, &sid));
+                    }
+                }
                 outcome(
                     Some(req.id),
                     req.session_id,

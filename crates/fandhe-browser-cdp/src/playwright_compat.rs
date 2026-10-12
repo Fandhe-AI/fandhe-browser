@@ -21,7 +21,7 @@ use crate::discovery::{PRODUCT, PROTOCOL_VERSION};
 use crate::protocol::{
     BoxFuture, CdpError, CdpEvent, CommandContext, CommandHandler, HandlerOutput,
 };
-use crate::target::{TargetId, TargetInfo};
+use crate::target::{SessionId, TargetId, TargetInfo};
 
 /// `Browser.getVersion`（`CDP-2`・TASK-43.3a）。
 ///
@@ -149,19 +149,24 @@ impl CommandHandler for TargetSetAutoAttach {
                 .enable_auto_attach(conn, state.registry())
                 .map_err(conn_error)?;
             let mut out = HandlerOutput::result(json!({}));
-            for (info, session_id) in attached {
-                out = out.with_event(CdpEvent {
-                    method: "Target.attachedToTarget",
-                    params: json!({
-                        "sessionId": session_id.as_str(),
-                        "targetInfo": page_target_info(&info, true),
-                        "waitingForDebugger": false,
-                    }),
-                    session_id: None,
-                });
+            for (info, session_id) in &attached {
+                out = out.with_event(attached_event(info, session_id));
             }
             Ok(out)
         })
+    }
+}
+
+/// `Target.attachedToTarget`（flatten・ブラウザレベル）イベントを組み立てる。
+pub(crate) fn attached_event(info: &TargetInfo, session_id: &SessionId) -> CdpEvent {
+    CdpEvent {
+        method: "Target.attachedToTarget",
+        params: json!({
+            "sessionId": session_id.as_str(),
+            "targetInfo": page_target_info(info, true),
+            "waitingForDebugger": false,
+        }),
+        session_id: None,
     }
 }
 
@@ -175,13 +180,14 @@ fn conn_error(e: ConnStateError) -> CdpError {
 
 /// `Browser.setDownloadBehavior`（`CDP-2`・TASK-43.3c）。
 ///
-/// **設定の受理と保持のみ**で、ダウンロード実行系（ファイル保存・`Browser.downloadWillBegin`・
-/// `Browser.downloadProgress` の送出）は未実装（`CDP-6`・`REPAIR-3`）。fandhe-browser は現状ダウンロードを
-/// 行わないため、受理しても実際にファイルが保存されることはない（`deny` 相当）。将来の実行系が
-/// 保持した設定を参照する。設定は接続スコープで、切断で破棄する（プロファイルへ永続化しない）。
+/// ダウンロード実行系（ファイル保存・`Browser.downloadWillBegin`・`Browser.downloadProgress` の送出）は
+/// 未実装（`CDP-6`・`REPAIR-3`）。fandhe-browser は現状ダウンロードを行わないため、実際に保証できる
+/// `deny`・`default`（保存しない・イベントなし）だけを受理して保持する。`allow`・`allowAndName` と
+/// `eventsEnabled:true` は成功を装わず `-32602`（`UNSUPPORTED_PARAMS`）で拒否する。
+/// 設定は接続スコープで、切断で破棄する（プロファイルへ永続化しない）。
 ///
-/// 検証: `behavior` は `deny`・`allow`・`allowAndName`・`default` のみ。`allow`・`allowAndName` は
-/// `downloadPath` 必須。`downloadPath` は絶対パス・`..` なし・NUL なし・長さ上限内で、サーバーは
+/// 検証: `behavior` は `deny`・`allow`・`allowAndName`・`default` のみ（`allow*` は上記のとおり拒否）。
+/// `downloadPath` を与える場合の検証は`downloadPath` は絶対パス・`..` なし・NUL なし・長さ上限内で、サーバーは
 /// そのパスに対して一切のファイル操作をしない（プロファイル境界・パストラバーサルを持ち込まない）。
 /// `browserContextId` は browser context が未導入（段階 2b）のため指定を `-32602` で拒否する
 /// （省略はブラウザ全体）。`eventsEnabled` は型検証して保持するがイベントは送出しない。
@@ -208,6 +214,11 @@ impl CommandHandler for BrowserSetDownloadBehavior {
                 Some(Value::Bool(b)) => *b,
                 Some(_) => return Err(CdpError::INVALID_PARAMS),
             };
+            // 実行系が無く実際には保存もイベント送出もできないため、保証できない許可・イベント要求は
+            // 成功を捏造せず拒否する（`CDP-6`・`REPAIR-3`）。受理するのは `deny`・`default` のみ。
+            if behavior.needs_path() || events_enabled {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
             let download_path = match params.get("downloadPath") {
                 None if behavior.needs_path() => return Err(CdpError::INVALID_PARAMS),
                 None => None,
@@ -552,21 +563,15 @@ mod tests {
             let dir = TempDir::new();
             let st = state(&dir);
             let c = open_conn(&st, 1);
-            let abs = std::env::temp_dir().join("fandhe-dl-not-created");
-            let path_json = serde_json::to_string(abs.to_str().unwrap()).unwrap();
-            let ok = format!(
-                r#""behavior":"allowAndName","downloadPath":{path_json},"eventsEnabled":true"#
-            );
             assert_eq!(
-                call(&st, Some(c), &dl(4, &ok)).await,
+                call(&st, Some(c), &dl(4, r#""behavior":"default""#)).await,
                 vec![json!({"id":4,"result":{}})]
             );
             let s = st.conn_scoped().download(c).unwrap();
-            assert_eq!(s.behavior, DownloadBehavior::AllowAndName);
-            assert_eq!(s.download_path, Some(abs.clone()));
-            assert!(s.events_enabled);
-            // サーバーは downloadPath に触れない（作成しない）。
-            assert!(!abs.exists());
+            assert_eq!(
+                (s.behavior, s.download_path, s.events_enabled),
+                (DownloadBehavior::Default, None, false)
+            );
             assert_eq!(
                 call(&st, Some(c), &dl(5, r#""behavior":"deny""#)).await,
                 vec![json!({"id":5,"result":{}})]
@@ -591,29 +596,42 @@ mod tests {
             let dotdot = serde_json::to_string(tmp.join("..").join("x").to_str().unwrap()).unwrap();
             let long = format!("\"{}\"", "a".repeat(5000));
             let invalid = err(-32602, "invalid params", 2);
+            let unsupported = err(-32602, "unsupported params", 2);
             let cases: Vec<(String, Value)> = vec![
                 (r#""behavior":"nope""#.into(), invalid.clone()),
                 (r#""behavior":5"#.into(), invalid.clone()),
                 (String::new(), invalid.clone()),
-                (r#""behavior":"allow""#.into(), invalid.clone()),
+                // 実行系が無いため許可系・イベント有効は成功を装わず拒否する（CDP-6・REPAIR-3）。
+                (r#""behavior":"allow""#.into(), unsupported.clone()),
                 (
-                    r#""behavior":"allowAndName","downloadPath":"relative/dir""#.into(),
+                    format!(
+                        r#""behavior":"allowAndName","downloadPath":{abs},"eventsEnabled":true"#
+                    ),
+                    unsupported.clone(),
+                ),
+                (
+                    r#""behavior":"deny","eventsEnabled":true"#.into(),
+                    unsupported.clone(),
+                ),
+                // パス検証（deny でも downloadPath を与えた場合は検証する）。
+                (
+                    r#""behavior":"deny","downloadPath":"relative/dir""#.into(),
                     invalid.clone(),
                 ),
                 (
-                    format!(r#""behavior":"allow","downloadPath":{dotdot}"#),
+                    format!(r#""behavior":"deny","downloadPath":{dotdot}"#),
                     invalid.clone(),
                 ),
                 (
-                    r#""behavior":"allow","downloadPath":"/tmp/a\u0000b""#.into(),
+                    r#""behavior":"deny","downloadPath":"/tmp/a\u0000b""#.into(),
                     invalid.clone(),
                 ),
                 (
-                    format!(r#""behavior":"allow","downloadPath":{long}"#),
+                    format!(r#""behavior":"deny","downloadPath":{long}"#),
                     invalid.clone(),
                 ),
                 (
-                    format!(r#""behavior":"allow","downloadPath":{abs},"eventsEnabled":"x""#),
+                    format!(r#""behavior":"deny","downloadPath":{abs},"eventsEnabled":"x""#),
                     invalid.clone(),
                 ),
                 (

@@ -29,7 +29,7 @@ Playwright のソースは長く引用せず、関数名と要約に留める。
 
 | 段階 | 現状 | 根拠 |
 | ---- | ---- | ---- |
-| `connectOverCDP(http://…)` | 成功（TASK-43.3c 後）。`Browser.getVersion`・`Target.setAutoAttach`・`Browser.setDownloadBehavior`・`Target.getTargetInfo` がすべて成功する（TASK-43.3a 後は `Target.setAutoAttach` 以降が `-32601` で失敗していた） | A（TASK-43.3c 後の再取得）: seq 1〜11 |
+| `connectOverCDP(http://…)` | 録画時点では成功（TASK-43.3c 後）。ただし `Browser.setDownloadBehavior` の `allowAndName` 受理は後に取り下げ（下記）。`Browser.getVersion`・`Target.setAutoAttach`・`Browser.setDownloadBehavior`・`Target.getTargetInfo` がすべて成功する（TASK-43.3a 後は `Target.setAutoAttach` 以降が `-32601` で失敗していた） | A（TASK-43.3c 後の再取得）: seq 1〜11 |
 | `connectOverCDP(ws://…)` | トレース未収録。収集ハーネスは http 経由が成功すると ws 直接の段階を実行しない。同じ送信列を ws 接続で再生する `tests/playwright_trace.rs` の再生テストが、同一の応答になることを固定している | A（再生テスト）。実 Playwright での ws 直接の再収集は未実施 |
 | `newContext()` | 失敗。`Target.createBrowserContext` が `-32601`（段階 2b の対象） | A: seq 12〜14 |
 | `newPage()` | 未到達（`newContext()` の失敗による） | A |
@@ -164,6 +164,8 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
   - `autoAttach:true` は、この接続がまだ attach していない既存ターゲットすべてへ `TargetRegistry::attach` し、
     ターゲットごとに `Target.attachedToTarget`（`sessionId`・`targetInfo`・`waitingForDebugger:false`）を
     応答の後に送出する。重複呼び出しは冪等。途中失敗（`MAX_SESSIONS` 到達等）は巻き戻す（`CDP-7`）
+  - 有効状態を接続ごとに保持し、有効化後に registry へ現れたターゲットも attach する。push 経路が無いため
+    `Target.attachedToTarget` は当該接続の次のコマンド応答の後に送出する（`ConnectionScoped::reconcile_auto_attach`）
   - `autoAttach:false` はこの接続が attach したセッションを外し、`Target.detachedFromTarget` を送出する
   - セッションの所有は接続スコープで、切断（`ws.rs` の `on_close`）で解放する
   - 拒否（`-32602`）: `filter`（Puppeteer の除外フィルタ。黙って無視すると除外すべきターゲットまで attach するため）、
@@ -171,10 +173,12 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
     `waitForDebuggerOnStart` は型のみ検証し、ターゲットを一時停止しないためイベントは常に `waitingForDebugger:false`
   - 接続なしの直接 dispatch は `-32000`（`no connection`）
 - `Browser.setDownloadBehavior`:
-  - **設定の検証と接続スコープでの保持のみ**。ダウンロード実行系（保存・`Browser.downloadWillBegin`・
-    `downloadProgress`）は未実装で、現状ダウンロードは発生しない（`deny` 相当）。Playwright の接続シーケンスを通すために
-    `allowAndName` を受理するが、ダウンロードが動くことは意味しない（`CDP-6`・`REPAIR-3`。判断が割れる点としてレビュー対象）
-  - `behavior` は `deny`・`allow`・`allowAndName`・`default`。`allow`・`allowAndName` は `downloadPath` 必須
+  - ダウンロード実行系（保存・`Browser.downloadWillBegin`・`downloadProgress`）は未実装で、現状ダウンロードは発生しない。
+    保証できる `deny`・`default`（イベントなし）だけを受理して接続スコープで保持し、`allow`・`allowAndName` と
+    `eventsEnabled:true` は成功を装わず `-32602`（`unsupported params`）で拒否する（`CDP-6`・`REPAIR-3`）。
+    このため録画した Playwright の接続シーケンス（`allowAndName`・`eventsEnabled:true`）は現行サーバーではこの段で失敗する
+    （実行系の実装〔`CDP-2`〕まで許容。トレースは `make trace-playwright` で再取得が必要）
+  - `behavior` は `deny`・`allow`・`allowAndName`・`default`（`allow*` は上記のとおり拒否）
   - `downloadPath` は絶対パス・`..` なし・NUL なし・4096 バイト以下。**サーバーはこのパスに一切ファイル操作をしない**
     （作成・書き込み・存在確認なし）。実行系で書き込む際はプロファイル境界（`PROF`）を踏まえた別途のセキュリティ設計を要する
   - `browserContextId` 指定は `-32602`（browser context は段階 2b で導入）。`eventsEnabled` は保持するがイベントは送出しない
