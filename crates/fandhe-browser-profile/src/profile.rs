@@ -2960,6 +2960,41 @@ mod tests {
         drop(Profile::open_under_local_app_data(&root, env).expect("再 open"));
     }
 
+    /// PROF-1（Windows）: `Profile` の生存中は `profile.lock` の改名・削除が失敗し
+    /// （共有モードに `FILE_SHARE_DELETE` なし）、二重 open は `Locked` のまま。drop 後は
+    /// 改名・削除でき、元に戻せば再 open できる。
+    ///
+    /// 失敗の種類は ERROR_SHARING_VIOLATION（32）と推測するが、Windows のランナーで未確認の
+    /// ため `is_err()` に留める。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_windows_open_pins_lock_file_while_profile_is_alive() {
+        let tmp = TempDir::new();
+        let lad = fake_local_app_data(&tmp);
+        let env = Some(lad.clone().into_os_string());
+        let root = lad.join("p");
+        let lock = root.join("profile.lock");
+        let moved = root.join("profile.lock.moved");
+        let profile = Profile::open_under_local_app_data(&root, env.clone()).expect("open");
+        assert!(
+            std::fs::rename(&lock, &moved).is_err(),
+            "改名できてしまった"
+        );
+        assert!(std::fs::remove_file(&lock).is_err(), "削除できてしまった");
+        assert!(lock.is_file());
+        assert!(!moved.exists());
+        let second = Profile::open_under_local_app_data(&root, env.clone())
+            .map(|_| ())
+            .expect_err("二重 open は拒否される");
+        assert!(matches!(second, ProfileError::Locked { .. }), "{second:?}");
+        drop(profile);
+        std::fs::rename(&lock, &moved).expect("drop 後は改名できる");
+        std::fs::rename(&moved, &lock).unwrap();
+        drop(Profile::open_under_local_app_data(&root, env.clone()).expect("再 open"));
+        std::fs::remove_file(&lock).expect("drop 後は削除できる");
+        drop(Profile::open_under_local_app_data(&root, env).expect("削除後の再 open"));
+    }
+
     /// XOS-10（Windows）: verbatim 表記の予約デバイス名・代替データストリーム `name:stream`・
     /// 末尾ドット／空白の要素を含むルートは `Unsupported` で、何も作られない。
     #[cfg(windows)]

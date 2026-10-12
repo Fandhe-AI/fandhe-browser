@@ -19,7 +19,8 @@
 //!   `InvalidLayout` にする。親のハンドルを保持したまま子を開くので、子は検証済みの親の直下の
 //!   実体になる。固定した後に `canonicalize` の結果も再確認する。
 //! - 固定後: `profile.lock` とデータ種別ディレクトリは、固定したルートの下で扱う。
-//!   サブディレクトリも開いて再解析ポイントでないことを確認する。ルートのハンドルは
+//!   サブディレクトリも開いて再解析ポイントでないことを確認する。`profile.lock` も改名・削除を
+//!   共有しないモードで開き、ロックの生存中は別実体へ差し替えられない。ルートのハンドルは
 //!   `Profile` が生存中保持し、途中の要素のハンドルは `open` の終了時に閉じる。
 //!   検出時に、それまでに作ったディレクトリは削除しない（削除先が差し替え後の実体だと
 //!   境界外を消しかねないため。unix 側も途中で作ったディレクトリを戻さない方針に揃える）。
@@ -53,6 +54,11 @@
 //!   `Local` 配下に OneDrive 等の再解析ポイントがある環境では、それを通る経路は拒否される。
 //! - 既存のルート・既存の中間ディレクトリの ACL は確認しない。独自の ACL が設定されて
 //!   いれば、継承 ACL の前提は成り立たない。
+//! - `LOCALAPPDATA` が既知フォルダの実体かどうかは確認しない。環境変数の値を使い、実体が
+//!   ローカルドライブ上で `AppData\Local` で終わることだけを見る（既知フォルダ API は `unsafe`
+//!   か依存の追加が要るため未実装）。環境変数が共有場所に作った同名の階層を指していれば、
+//!   継承 ACL の前提は成り立たない。#813 の実測は実際の `%LOCALAPPDATA%` 配下で行ったもので、
+//!   この場合は測っていない。
 //! - `profile.lock` の所有者・ハードリンク数は検査しない（unix との差）。
 //!
 //! 判定ロジックは `std::fs` と `std::path` だけで書いてあり、Linux・macOS でも
@@ -452,6 +458,13 @@ fn verify_created_root(plan: &RootPlan) -> Result<(), ProfileError> {
 /// symlink 等はリンク先を辿らず開き、通常ファイルでなければ
 /// [`ProfileError::InvalidLayout`] で拒否する。unix 側が行う所有者・ハードリンク数の
 /// 検査に相当するものは Windows にはない（ACL は継承に依存し検証しない。REPAIR-3）。
+///
+/// Windows では `FILE_SHARE_READ | FILE_SHARE_WRITE`（`FILE_SHARE_DELETE` なし）で開く。
+/// 返したハンドルを `ProfileLock` が保持している間、`profile.lock` の改名・削除は共有違反で
+/// 失敗し、別実体の `profile.lock` を作って二重 open をすり抜けることはできない（`PROF-1`）。
+/// READ・WRITE の共有は残すので、2 つ目の open は共有違反でなくロック取得失敗
+/// （[`ProfileError::Locked`]）で拒否される。親ディレクトリの固定は子の改名を防がないため、
+/// ファイル自身のハンドルで守る。
 pub(crate) fn open_lock_file(root: &Path) -> Result<(File, PathBuf), ProfileError> {
     let path = root.join(LOCK_FILE_NAME);
     // 既存物が通常ファイルでない（ディレクトリ・ジャンクション・symlink 等）場合は、開く前に
@@ -472,7 +485,9 @@ pub(crate) fn open_lock_file(root: &Path) -> Result<(File, PathBuf), ProfileErro
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options.open(&path).map_err(ProfileError::Io)?;
     let metadata = file.metadata().map_err(ProfileError::Io)?;
