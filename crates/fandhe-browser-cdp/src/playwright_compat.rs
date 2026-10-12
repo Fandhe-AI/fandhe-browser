@@ -87,8 +87,8 @@ impl CommandHandler for TargetGetTargetInfo {
 /// スコープ外の入力は成功を装わず `-32602` で拒否する: `sessionId` 付き（子ターゲットの自動 attach は
 /// 子ターゲットのモデルが無く未実装）、`autoAttach:true` で `flatten` が `true` 以外
 /// （`sendMessageToTarget` 方式は未実装）、`filter`（Puppeteer の除外フィルタを黙って無視すると
-/// 除外すべきターゲットまで attach するため）。`waitForDebuggerOnStart` は型のみ検証し、fandhe は
-/// ターゲットを一時停止しないためイベントの `waitingForDebugger` は常に `false`。
+/// 除外すべきターゲットまで attach するため）、`autoAttach:true` で `waitForDebuggerOnStart:true`
+/// （ターゲットの一時停止が未実装。イベントの `waitingForDebugger` は常に `false`）。
 /// 接続なしの直接 dispatch は `NO_CONNECTION`。
 /// イベントの `targetInfo` に `browserContextId` は載らない（段階 2b で追加）。
 pub(crate) struct TargetSetAutoAttach;
@@ -110,12 +110,11 @@ impl CommandHandler for TargetSetAutoAttach {
             if params.get("filter").is_some() {
                 return Err(CdpError::UNSUPPORTED_PARAMS);
             }
-            if params
-                .get("waitForDebuggerOnStart")
-                .is_some_and(|v| !v.is_boolean())
-            {
-                return Err(CdpError::INVALID_PARAMS);
-            }
+            let wait_for_debugger = match params.get("waitForDebuggerOnStart") {
+                None => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => return Err(CdpError::INVALID_PARAMS),
+            };
             let flatten = match params.get("flatten") {
                 None | Some(Value::Bool(false)) => false,
                 Some(Value::Bool(true)) => true,
@@ -129,19 +128,14 @@ impl CommandHandler for TargetSetAutoAttach {
                     .disable_auto_attach(conn, state.registry())
                     .map_err(conn_error)?;
                 let mut out = HandlerOutput::result(json!({}));
-                for (target_id, session_id) in detached {
-                    out = out.with_event(CdpEvent {
-                        method: "Target.detachedFromTarget",
-                        params: json!({
-                            "sessionId": session_id.as_str(),
-                            "targetId": target_id.as_str(),
-                        }),
-                        session_id: None,
-                    });
+                for (target_id, session_id) in &detached {
+                    out = out.with_event(detached_event(target_id, session_id));
                 }
                 return Ok(out);
             }
-            if !flatten {
+            // ターゲットの一時停止（`Runtime.runIfWaitingForDebugger` での再開）は未実装で、
+            // 成功を装うと待機前提のクライアントが先に進めない（`REPAIR-3`・`CDP-6`）。
+            if !flatten || wait_for_debugger {
                 return Err(CdpError::UNSUPPORTED_PARAMS);
             }
             let attached = state
@@ -165,6 +159,18 @@ pub(crate) fn attached_event(info: &TargetInfo, session_id: &SessionId) -> CdpEv
             "sessionId": session_id.as_str(),
             "targetInfo": page_target_info(info, true),
             "waitingForDebugger": false,
+        }),
+        session_id: None,
+    }
+}
+
+/// `Target.detachedFromTarget`（flatten・ブラウザレベル）イベントを組み立てる。
+pub(crate) fn detached_event(target_id: &TargetId, session_id: &SessionId) -> CdpEvent {
+    CdpEvent {
+        method: "Target.detachedFromTarget",
+        params: json!({
+            "sessionId": session_id.as_str(),
+            "targetId": target_id.as_str(),
         }),
         session_id: None,
     }
@@ -421,7 +427,7 @@ mod tests {
             let t2 = new_page(&st, "https://example.test/");
             let req = auto_attach(
                 7,
-                r#""autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true"#,
+                r#""autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true"#,
             );
             let f = call(&st, Some(c), &req).await;
             assert_eq!(f.len(), 3);
@@ -472,6 +478,10 @@ mod tests {
                     &unsupported,
                 ),
                 (r#""autoAttach":true"#, &unsupported),
+                (
+                    r#""autoAttach":true,"flatten":true,"waitForDebuggerOnStart":true"#,
+                    &unsupported,
+                ),
                 (r#""autoAttach":true,"flatten":false"#, &unsupported),
                 (r#""autoAttach":true,"flatten":"yes""#, &invalid),
                 (r#""flatten":true"#, &invalid),
@@ -535,6 +545,42 @@ mod tests {
             let f = call(&st, Some(c), &auto_attach(1, ON)).await;
             assert_eq!(f, vec![err(-32000, "server error", 1)]);
             assert_eq!(st.registry().session_count(), before);
+        }
+
+        #[tokio::test]
+        async fn cdp7_reconcile_runs_on_error_paths_and_reports_vanished_sessions() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t1 = new_page(&st, "about:blank");
+            let on = call(&st, Some(c), &auto_attach(1, ON)).await;
+            let sid = on[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            // 未実装メソッドの応答（エラー）にも新ターゲットの attach が同伴する。
+            let t2 = new_page(&st, "https://example.test/");
+            let f = call(
+                &st,
+                Some(c),
+                r#"{"id":2,"method":"Nope.nothing","params":{}}"#,
+            )
+            .await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(f[0]["id"], 2);
+            assert_eq!(f[1]["method"], "Target.attachedToTarget");
+            assert_eq!(f[1]["params"]["targetInfo"]["targetId"], t2.as_str());
+            // ターゲットが閉じられたら detachedFromTarget を送ってから所有記録を落とす。
+            st.registry().close_target(&t1).unwrap();
+            let f = call(
+                &st,
+                Some(c),
+                r#"{"id":3,"method":"Nope.nothing","params":{}}"#,
+            )
+            .await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(
+                f[1],
+                json!({"method": "Target.detachedFromTarget", "params": {"sessionId": sid, "targetId": t1.as_str()}})
+            );
+            assert_eq!(st.registry().session_count(), 1);
         }
 
         #[tokio::test]

@@ -170,7 +170,7 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
   - セッションの所有は接続スコープで、切断（`ws.rs` の `on_close`）で解放する
   - 拒否（`-32602`）: `filter`（Puppeteer の除外フィルタ。黙って無視すると除外すべきターゲットまで attach するため）、
     `flatten` が `true` 以外（`sendMessageToTarget` 方式は未実装）、`sessionId` 付き（子ターゲットのモデルが無い）。
-    `waitForDebuggerOnStart` は型のみ検証し、ターゲットを一時停止しないためイベントは常に `waitingForDebugger:false`
+    `waitForDebuggerOnStart:true`（`autoAttach:true` 時）もターゲットの一時停止が未実装のため `-32602` で拒否する（成功を装わない。`REPAIR-3`・`CDP-6`）。Playwright の `CRBrowser.connect` が渡す値のため、一時停止の実装までは Playwright の接続は `Target.setAutoAttach` で失敗する
   - 接続なしの直接 dispatch は `-32000`（`no connection`）
 - `Browser.setDownloadBehavior`:
   - ダウンロード実行系（保存・`Browser.downloadWillBegin`・`downloadProgress`）は未実装で、現状ダウンロードは発生しない。

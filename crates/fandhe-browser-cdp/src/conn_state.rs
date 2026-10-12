@@ -103,6 +103,8 @@ struct Entry {
     auto_attached: Vec<(TargetId, SessionId)>,
     /// `Target.setAutoAttach` が有効か（有効の間、後から現れたターゲットも attach 対象にする）。
     auto_attach_enabled: bool,
+    /// registry 側で消えたため所有記録から落としたが、まだ `Target.detachedFromTarget` を送出していないもの。
+    pending_detached: Vec<(TargetId, SessionId)>,
     download: Option<DownloadSettings>,
 }
 
@@ -113,6 +115,17 @@ pub(crate) enum ConnStateError {
     NotLive,
     /// セッション枠の枯渇など registry 側の失敗。
     Registry(CdpStateError),
+}
+
+/// [`ConnectionScoped::reconcile_auto_attach`] の結果。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Reconciled {
+    /// 新たに attach した `(targetInfo, sessionId)`（`Target.attachedToTarget` の送出対象）。
+    pub attached: Vec<(TargetInfo, SessionId)>,
+    /// 消失した `(targetId, sessionId)`（`Target.detachedFromTarget` の送出対象）。
+    pub detached: Vec<(TargetId, SessionId)>,
+    /// attach の途中失敗（セッション枠の枯渇等）。
+    pub error: Option<ConnStateError>,
 }
 
 /// 接続別の状態表。
@@ -155,38 +168,61 @@ impl ConnectionScoped {
     ) -> Result<Vec<(TargetInfo, SessionId)>, ConnStateError> {
         let mut map = self.lock();
         let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
-        let added = Self::attach_missing(entry, registry)?;
+        let (added, err) = Self::attach_missing(entry, registry, true);
+        if let Some(e) = err {
+            return Err(e);
+        }
         entry.auto_attach_enabled = true;
         Ok(added)
     }
 
-    /// 自動 attach が有効な接続について、有効化後に registry へ現れたターゲットへ attach する。
-    /// 無効・未登録の接続は空を返す。ディスパッチ後に呼ばれる（push 型の通知経路が無いため、
-    /// 新ターゲットのイベントは当該接続の次のコマンド応答に続けて送出される）。
-    /// セッション枠の枯渇等で失敗した場合は巻き戻して空を返し、次回に再試行する。
+    /// 自動 attach が有効な接続について、有効化後に registry へ現れたターゲットへ attach し、
+    /// ターゲットの close 等で消えたセッションを回収する。無効・未登録の接続は空の結果を返す。
+    /// ディスパッチ後（成功・失敗を問わず）に呼ばれる（push 型の通知経路が無いため、
+    /// イベントは当該接続の次のコマンド応答に続けて送出される）。
+    /// セッション枠の枯渇等で失敗しても、そこまでに attach できた分は残して `error` に失敗を載せる
+    /// （全件ロールバックすると枠が空くまで永久に attach できないため。次回に残りを再試行する）。
     pub(crate) fn reconcile_auto_attach(
         &self,
         conn: ConnId,
         registry: &TargetRegistry,
-    ) -> Vec<(TargetInfo, SessionId)> {
+    ) -> Reconciled {
         let mut map = self.lock();
         match map.get_mut(&conn) {
             Some(entry) if entry.auto_attach_enabled => {
-                Self::attach_missing(entry, registry).unwrap_or_default()
+                let (attached, error) = Self::attach_missing(entry, registry, false);
+                Reconciled {
+                    attached,
+                    detached: std::mem::take(&mut entry.pending_detached),
+                    error,
+                }
             }
-            _ => Vec::new(),
+            Some(entry) => Reconciled {
+                detached: std::mem::take(&mut entry.pending_detached),
+                ..Reconciled::default()
+            },
+            None => Reconciled::default(),
         }
     }
 
+    /// 未 attach のターゲットへ attach する。`atomic` なら失敗時にこの呼び出しの attach を全て巻き戻して
+    /// 空を返し、そうでなければ成功分を残す。registry 側で消えたセッションは所有記録から落として
+    /// `pending_detached` に積む（通知は呼び出し側。`CDP-7`）。
     fn attach_missing(
         entry: &mut Entry,
         registry: &TargetRegistry,
-    ) -> Result<Vec<(TargetInfo, SessionId)>, ConnStateError> {
-        // ターゲットが閉じられて registry 側で消えたセッションは所有記録からも落とす。
-        entry
-            .auto_attached
-            .retain(|(_, s)| registry.session_target(s).is_some());
+        atomic: bool,
+    ) -> (Vec<(TargetInfo, SessionId)>, Option<ConnStateError>) {
+        let owned = std::mem::take(&mut entry.auto_attached);
+        for (t, s) in owned {
+            if registry.session_target(&s).is_some() {
+                entry.auto_attached.push((t, s));
+            } else {
+                entry.pending_detached.push((t, s));
+            }
+        }
         let mut added: Vec<(TargetInfo, SessionId)> = Vec::new();
+        let mut error = None;
         for info in registry.targets() {
             if entry
                 .auto_attached
@@ -198,22 +234,27 @@ impl ConnectionScoped {
             match registry.attach(info.target_id()) {
                 Ok(sid) => added.push((info, sid)),
                 Err(e) => {
-                    for (_, sid) in &added {
-                        let _ = registry.detach(sid);
-                    }
-                    return Err(ConnStateError::Registry(e));
+                    error = Some(ConnStateError::Registry(e));
+                    break;
                 }
             }
+        }
+        if error.is_some() && atomic {
+            for (_, sid) in &added {
+                let _ = registry.detach(sid);
+            }
+            return (Vec::new(), error);
         }
         for (info, sid) in &added {
             entry
                 .auto_attached
                 .push((info.target_id().clone(), sid.clone()));
         }
-        Ok(added)
+        (added, error)
     }
 
-    /// この接続が自動 attach したセッションを detach し、実際に外れた `(targetId, sessionId)` を返す。
+    /// この接続が自動 attach したセッションを detach し、通知すべき `(targetId, sessionId)` を返す。
+    /// registry 側で既に消えていて `detach` が失敗したセッションも通知対象に含める（`CDP-7`）。
     pub(crate) fn disable_auto_attach(
         &self,
         conn: ConnId,
@@ -222,11 +263,12 @@ impl ConnectionScoped {
         let mut map = self.lock();
         let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
         entry.auto_attach_enabled = false;
-        let owned = std::mem::take(&mut entry.auto_attached);
-        Ok(owned
-            .into_iter()
-            .filter(|(_, s)| registry.detach(s).is_ok())
-            .collect())
+        let mut out = std::mem::take(&mut entry.pending_detached);
+        for (t, s) in std::mem::take(&mut entry.auto_attached) {
+            let _ = registry.detach(&s);
+            out.push((t, s));
+        }
+        Ok(out)
     }
 
     /// ダウンロード設定を保持する（接続あたり 1 件。置き換え）。
@@ -286,20 +328,62 @@ mod tests {
         cs.open(c);
         // 無効の間は何も attach しない。
         let _early = page(&r);
-        assert!(cs.reconcile_auto_attach(c, &r).is_empty());
+        assert_eq!(cs.reconcile_auto_attach(c, &r), Reconciled::default());
         assert_eq!(r.session_count(), 0);
         // 空でない registry で有効化した後に現れたターゲットも attach される。
         assert_eq!(cs.enable_auto_attach(c, &r).unwrap().len(), 1);
         let later = page(&r);
-        let added = cs.reconcile_auto_attach(c, &r);
+        let added = cs.reconcile_auto_attach(c, &r).attached;
         assert_eq!(added.len(), 1);
         assert_eq!(added[0].0.target_id(), &later);
-        assert!(cs.reconcile_auto_attach(c, &r).is_empty());
+        assert_eq!(cs.reconcile_auto_attach(c, &r), Reconciled::default());
         // 無効化後は追従しない。
         cs.disable_auto_attach(c, &r).unwrap();
         let _third = page(&r);
-        assert!(cs.reconcile_auto_attach(c, &r).is_empty());
+        assert_eq!(cs.reconcile_auto_attach(c, &r), Reconciled::default());
         assert_eq!(r.session_count(), 0);
+    }
+
+    #[test]
+    fn cdp7_reconcile_reports_vanished_sessions_once() {
+        let r = TargetRegistry::new();
+        let t = page(&r);
+        let cs = ConnectionScoped::new();
+        let c = ConnId::new(1);
+        cs.open(c);
+        let sid = cs.enable_auto_attach(c, &r).unwrap().remove(0).1;
+        r.close_target(&t).unwrap();
+        let rec = cs.reconcile_auto_attach(c, &r);
+        assert!(rec.attached.is_empty());
+        assert_eq!(rec.detached, vec![(t, sid)]);
+        assert_eq!(rec.error, None);
+        assert_eq!(cs.reconcile_auto_attach(c, &r), Reconciled::default());
+        assert!(cs.release(c).is_empty());
+    }
+
+    #[test]
+    fn cdp7_reconcile_keeps_partial_progress_on_session_limit() {
+        let r = TargetRegistry::new();
+        let t1 = page(&r);
+        let cs = ConnectionScoped::new();
+        let c = ConnId::new(1);
+        cs.open(c);
+        cs.enable_auto_attach(c, &r).unwrap();
+        let _t2 = page(&r);
+        let _t3 = page(&r);
+        // 残り枠を 1 に絞る。
+        while r.session_count() < MAX_SESSIONS - 1 {
+            r.attach(&t1).unwrap();
+        }
+        let rec = cs.reconcile_auto_attach(c, &r);
+        assert_eq!(rec.attached.len(), 1);
+        assert_eq!(
+            rec.error,
+            Some(ConnStateError::Registry(CdpStateError::TooManySessions {
+                limit: MAX_SESSIONS
+            }))
+        );
+        assert_eq!(r.session_count(), MAX_SESSIONS);
     }
 
     #[test]
@@ -356,6 +440,18 @@ mod tests {
         assert_eq!(out, vec![(t.clone(), added[0].1.clone())]);
         assert_eq!(r.session_count(), 1);
         assert_eq!(r.session_target(&foreign), Some(t));
+    }
+
+    #[test]
+    fn cdp7_disable_auto_attach_notifies_already_vanished_sessions() {
+        let r = TargetRegistry::new();
+        let t = page(&r);
+        let cs = ConnectionScoped::new();
+        let c = ConnId::new(1);
+        cs.open(c);
+        let sid = cs.enable_auto_attach(c, &r).unwrap().remove(0).1;
+        r.close_target(&t).unwrap();
+        assert_eq!(cs.disable_auto_attach(c, &r).unwrap(), vec![(t, sid)]);
     }
 
     #[test]

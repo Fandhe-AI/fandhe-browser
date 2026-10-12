@@ -123,7 +123,7 @@ Playwright と異なり、`browserWSEndpoint` 指定の接続では HTTP の `/j
 - 実測が未実施。`puppeteer-core` の導入承認後に次を実測値で更新する: 段階別 status・失敗段階のエラー名とメッセージ・
   `CdpState::received_methods()`・本書の B の予測との差分
 - #8 のうち握りつぶしの有無、#10 の `page.$` の呼び出し連鎖、#11 の切断時の送信有無は精査が不完全
-- `Target.setAutoAttach` の `filter` 引数は `-32602`（`unsupported params`）で拒否すると確定（TASK-43.3c・#908。黙って無視すると除外すべき `page` まで attach するため）。`waitForDebuggerOnStart` は型のみ検証し、ターゲットを一時停止しないためイベントは常に `waitingForDebugger:false`。このため Puppeteer の `TargetManager.initialize` の `filter` 付き呼び出しは現状 `-32602` で失敗する（Puppeteer 側の対応は TASK-45 で再判断）
+- `Target.setAutoAttach` の `filter` 引数は `-32602`（`unsupported params`）で拒否すると確定（TASK-43.3c・#908。黙って無視すると除外すべき `page` まで attach するため）。`autoAttach:true` と `waitForDebuggerOnStart:true` の組み合わせも、ターゲットの一時停止が未実装のため `-32602` で拒否する。このため Puppeteer の `TargetManager.initialize` の `filter` 付き呼び出しは現状 `-32602` で失敗する（Puppeteer 側の対応は TASK-45 で再判断）
 - spec（`docs/spec`）は本調査環境で再照合しておらず、C の記述は spec 本文と未照合
 - 再現（ソース確認）: `npm pack puppeteer-core@25.12.0` で得た tarball を一時ディレクトリへ展開し、`src/cdp/` を閲覧のみする（展開物内でスクリプトは実行しない）
 - 再現（実測。承認後）: `harness/puppeteer-connect/README.md` の導入手順に従う

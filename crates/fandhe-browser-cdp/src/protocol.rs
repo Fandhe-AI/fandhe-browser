@@ -446,7 +446,8 @@ impl Dispatcher {
         let req = match parse_request(text) {
             Ok(r) => r,
             Err(f) => {
-                return outcome(f.id, None, ResponseBody::Error(f.error), Vec::new());
+                let events = auto_attach_events(state, conn);
+                return outcome(f.id, None, ResponseBody::Error(f.error), events);
             }
         };
         let handler = self.handlers.get(req.method.as_str());
@@ -471,7 +472,7 @@ impl Dispatcher {
                 Some(req.id),
                 req.session_id,
                 ResponseBody::Error(CdpError::METHOD_NOT_FOUND),
-                Vec::new(),
+                auto_attach_events(state, conn),
             );
         };
         let ctx = CommandContext {
@@ -491,16 +492,7 @@ impl Dispatcher {
                         e
                     })
                     .collect();
-                // 自動 attach 有効中に現れた新ターゲットを attach し、ブラウザレベルのイベントとして続ける
-                // （push 経路が無いため次のコマンド応答に同伴する。`CDP-2`・`CDP-7`）。
-                if let Some(c) = conn {
-                    for (info, sid) in state
-                        .conn_scoped()
-                        .reconcile_auto_attach(c, state.registry())
-                    {
-                        events.push(crate::playwright_compat::attached_event(&info, &sid));
-                    }
-                }
+                events.extend(auto_attach_events(state, conn));
                 outcome(
                     Some(req.id),
                     req.session_id,
@@ -512,10 +504,34 @@ impl Dispatcher {
                 Some(req.id),
                 req.session_id,
                 ResponseBody::Error(e),
-                Vec::new(),
+                auto_attach_events(state, conn),
             ),
         }
     }
+}
+
+/// 自動 attach 有効中の接続について、新ターゲットの attach と消失セッションの回収を行い、
+/// ブラウザレベルのイベントとして返す（push 経路が無いため次のコマンド応答に同伴する。
+/// 成功・失敗・未実装メソッドの全経路から呼び、取りこぼしを防ぐ。`CDP-2`・`CDP-7`）。
+/// セッション枠の枯渇は応答を失敗にせず stderr へ記録し、次回に再試行する。
+fn auto_attach_events(state: &Arc<CdpState>, conn: Option<ConnId>) -> Vec<CdpEvent> {
+    let Some(c) = conn else {
+        return Vec::new();
+    };
+    let rec = state
+        .conn_scoped()
+        .reconcile_auto_attach(c, state.registry());
+    if rec.error.is_some() {
+        eprintln!("cdp: auto-attach could not attach every target (session limit); will retry");
+    }
+    let mut events = Vec::new();
+    for (target_id, sid) in &rec.detached {
+        events.push(crate::playwright_compat::detached_event(target_id, sid));
+    }
+    for (info, sid) in &rec.attached {
+        events.push(crate::playwright_compat::attached_event(info, sid));
+    }
+    events
 }
 
 fn outcome(

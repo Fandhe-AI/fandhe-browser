@@ -312,7 +312,8 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
         replayed,
         [
             version,
-            json!({"id": 2, "result": {}}),
+            // 録画時の `waitForDebuggerOnStart:true` はターゲット一時停止が未実装のため拒否される（CDP-6・REPAIR-3）。
+            json!({"id": 2, "error": {"code": -32602, "message": "unsupported params"}}),
             // 録画時の `allowAndName`・`eventsEnabled:true` は実行系が無いため拒否される（CDP-6・REPAIR-3）。
             json!({"id": 3, "error": {"code": -32602, "message": "unsupported params"}}),
             json!({"id": 4, "result": {"targetInfo": {
@@ -322,10 +323,14 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
             json!({"id": 5, "error": {"code": -32601, "message": "method not implemented"}}),
         ]
     );
-    // 録画は拒否導入前の実測のため、id 3（setDownloadBehavior）以外が録画と一致することを確認する。
+    // 録画は拒否導入前の実測のため、id 2（setAutoAttach）・3（setDownloadBehavior）以外が録画と一致することを確認する。
     // トレースは `make trace-playwright` で再取得するまで旧挙動のまま残る。
-    let without_dl =
-        |v: &[Value]| -> Vec<Value> { v.iter().filter(|m| m["id"] != 3).cloned().collect() };
+    let without_dl = |v: &[Value]| -> Vec<Value> {
+        v.iter()
+            .filter(|m| m["id"] != 2 && m["id"] != 3)
+            .cloned()
+            .collect()
+    };
     assert_eq!(
         without_dl(&replayed),
         without_dl(&recvs),
@@ -369,7 +374,7 @@ async fn cdp2_auto_attach_over_websocket_emits_event_after_response_and_frees_se
             101
         );
         let req = json!({"id": 1, "method": "Target.setAutoAttach",
-            "params": {"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true}});
+            "params": {"autoAttach": true, "flatten": true}});
         send_text(&mut s, &req.to_string());
         // 送出順は応答 → イベント（CDP-5）。
         assert_eq!(read_text_json(&mut s), json!({"id": 1, "result": {}}));
