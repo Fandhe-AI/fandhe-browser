@@ -178,13 +178,15 @@ fn handle_with_run(engine: &str, allow_loopback: bool, run: PageRunOptions) -> P
     PageScriptHandle::with_options(cfg.js(), Arc::new(TokioExecutor), options)
 }
 
-/// タイマー上限（1000 回）を実時間上限と切り離して検証するためのハンドル。V8 は発火ごとに
-/// 子プロセスと往復するため、負荷の高い環境では既定の 5 秒に先に当たる。実時間上限だけを緩め、
-/// 件数上限（`TimerFires`）は既定のままにする。
-fn timer_handle(engine: &str) -> PageScriptHandle {
+/// 件数・サイズ系の上限（タイマー 1000 回・スクリプト 64 件・ノード数・出力 8 MiB）を実時間上限と
+/// 切り離して検証するためのハンドル。V8 は呼び出しごとに子プロセスと往復するため、負荷の高い環境
+/// （macOS ランナー等）では既定の script 2 秒 / page 5 秒に先に当たり、件数上限より先に
+/// `WallTime` で中断される（JS-6）。実時間上限だけを緩め、検証対象の上限は既定のままにする。
+/// 実時間上限そのものを検証するケース（無限ループ・累積時間）では使わない。
+fn limit_handle(engine: &str, allow_loopback: bool) -> PageScriptHandle {
     handle_with_run(
         engine,
-        false,
+        allow_loopback,
         PageRunOptions::default()
             .with_script_wall_time(Duration::from_secs(120))
             .with_page_wall_time(Duration::from_secs(120)),
@@ -257,8 +259,11 @@ const SPA_JS: &str = "var app=document.getElementById('app');\
     var h=document.createElement('h1');h.textContent='Hello SPA';app.appendChild(h);\
     for(var i=1;i<=3;i++){var li=document.createElement('li');li.textContent='item-'+i;app.appendChild(li)}void 0";
 
+// CDP 層（unix のみ）のケースからだけ参照されるため、非 unix では定義しない（dead_code 回避）。
+#[cfg(unix)]
 const FORM_HTML: &str = "<html><body><script src=\"/form.js\"></script></body></html>";
 /// `form` と、`name` 付き input / textarea / select 各 1 個・`name` なし input 1 個を生成する。
+#[cfg(unix)]
 const FORM_JS: &str = "var f=document.createElement('form');f.setAttribute('id','signup');\
     var a=document.createElement('input');a.setAttribute('name','email');f.appendChild(a);\
     var b=document.createElement('textarea');b.setAttribute('name','note');f.appendChild(b);\
@@ -449,7 +454,7 @@ fn actor_cases(engine: &str) {
     {
         let out = executed(actor_run(
             &rt,
-            &handle(engine, false),
+            &limit_handle(engine, false),
             &many_scripts_html(),
             "http://127.0.0.1:1/page",
         ));
@@ -479,7 +484,7 @@ fn actor_cases(engine: &str) {
     {
         let out = executed(actor_run(
             &rt,
-            &timer_handle(engine),
+            &limit_handle(engine, false),
             TIMER_HTML,
             "http://127.0.0.1:1/page",
         ));
@@ -495,7 +500,7 @@ fn actor_cases(engine: &str) {
     {
         let out = executed(actor_run(
             &rt,
-            &handle(engine, false),
+            &limit_handle(engine, false),
             NODES_HTML,
             "http://127.0.0.1:1/page",
         ));
@@ -517,7 +522,7 @@ fn actor_cases(engine: &str) {
     {
         let result = actor_run(
             &rt,
-            &handle(engine, false),
+            &limit_handle(engine, false),
             BIG_HTML,
             "http://127.0.0.1:1/page",
         );
@@ -925,7 +930,7 @@ mod cdp_layer {
     async fn many_scripts(engine: &str) {
         eprintln!("case: JS-6 only 64 of 65 scripts run and DOMContentLoaded is not fired");
         let (port, _hits) = serve_routes(vec![("/many", "html", many_scripts_html())]);
-        let mut on = Cdp::new(Some(handle(engine, false)));
+        let mut on = Cdp::new(Some(limit_handle(engine, false)));
         on.navigate(&format!("http://127.0.0.1:{port}/many")).await;
         let html = on.html();
         assert!(html.contains("data-s64=\"1\""), "{html}");
@@ -936,7 +941,7 @@ mod cdp_layer {
     async fn timers(engine: &str) {
         eprintln!("case: JS-6/JS-7 a setInterval(0) runaway ends at 1000 fires with the DOM fixed");
         let (port, _hits) = serve_routes(vec![("/timer", "html", TIMER_HTML.to_owned())]);
-        let mut on = Cdp::new(Some(timer_handle(engine)));
+        let mut on = Cdp::new(Some(limit_handle(engine, false)));
         on.navigate(&format!("http://127.0.0.1:{port}/timer")).await;
         let root = on.root_node_id().await;
         let hit = on.query(root, "body[data-ticks=\"1000\"]").await;
@@ -946,7 +951,7 @@ mod cdp_layer {
     async fn nodes(engine: &str) {
         eprintln!("case: JS-6 node over-generation stops at the node limit and later scripts run");
         let (port, _hits) = serve_routes(vec![("/nodes", "html", NODES_HTML.to_owned())]);
-        let mut on = Cdp::new(Some(handle(engine, false)));
+        let mut on = Cdp::new(Some(limit_handle(engine, false)));
         on.navigate(&format!("http://127.0.0.1:{port}/nodes")).await;
         let html = on.html();
         assert!(html.contains("data-after=\"1\""), "{html}");
@@ -961,7 +966,7 @@ mod cdp_layer {
     async fn big_output(engine: &str) {
         eprintln!("case: JS-6 over-8MiB output keeps the fetched HTML and the navigation succeeds");
         let (port, _hits) = serve_routes(vec![("/big", "html", BIG_HTML.to_owned())]);
-        let mut on = Cdp::new(Some(handle(engine, false)));
+        let mut on = Cdp::new(Some(limit_handle(engine, false)));
         on.navigate(&format!("http://127.0.0.1:{port}/big")).await;
         // 実行結果は破棄され、取得時の HTML で確定する（途中の DOM の確定ではない）。
         assert_eq!(
