@@ -727,14 +727,18 @@ class ProxyAudit:
     `_ProxyRequestHandler` が宛先判定のたびに `record` し、`capture_one` が
     エンジン実行の前後で `snapshot` の差分を取って結果 JSON の `proxy` キーへ
     載せる（RENDER-5 / TASK-37）。URL のクエリ部は記録せず host:port のみを保持し、
-    拒否先は `PROXY_AUDIT_MAX_DENIED_TARGETS` 件で打ち切る。
+    拒否先は撮影単位の区間ごとに重複排除し `PROXY_AUDIT_MAX_DENIED_TARGETS` 件で打ち切る。
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._allowed = 0
         self._denied = 0
-        self._denied_targets: list[str] = []
+        # 撮影単位の監査区間。`snapshot()` が開き `delta_since()` が閉じる。拒否先の
+        # 重複排除と件数上限は区間ごとに適用し、別サイト・別エンジンで同じ宛先が
+        # 拒否されても、その撮影の `denied_targets` に必ず現れるようにする。
+        self._next_window = 0
+        self._windows: dict[int, list[str]] = {}
 
     @staticmethod
     def _label(host: str | None, port: int) -> str:
@@ -748,21 +752,28 @@ class ProxyAudit:
                 return
             self._denied += 1
             label = self._label(host, port)
-            if label not in self._denied_targets and len(self._denied_targets) < PROXY_AUDIT_MAX_DENIED_TARGETS:
-                self._denied_targets.append(label)
+            for targets in self._windows.values():
+                if label not in targets and len(targets) < PROXY_AUDIT_MAX_DENIED_TARGETS:
+                    targets.append(label)
 
     def snapshot(self) -> tuple[int, int, int]:
-        """`(allowed, denied, 拒否先リスト長)` を返す。差分計算の基点に使う。"""
+        """`(allowed, denied, 区間 ID)` を返し、新しい拒否先の記録区間を開く。
+
+        戻り値は `delta_since` に渡す。区間は `delta_since` で閉じるまで拒否先を保持する。
+        """
         with self._lock:
-            return self._allowed, self._denied, len(self._denied_targets)
+            window = self._next_window
+            self._next_window += 1
+            self._windows[window] = []
+            return self._allowed, self._denied, window
 
     def delta_since(self, base: tuple[int, int, int]) -> dict[str, Any]:
-        """`base` 以降に増えた件数と、新たに現れた拒否先を結果 JSON 用の dict で返す。"""
+        """`base` 以降の件数と、その区間内の拒否先を結果 JSON 用の dict で返し、区間を閉じる。"""
         with self._lock:
             return {
                 "allowed": self._allowed - base[0],
                 "denied": self._denied - base[1],
-                "denied_targets": list(self._denied_targets[base[2] :]),
+                "denied_targets": list(self._windows.pop(base[2], [])),
             }
 
 
@@ -1810,6 +1821,7 @@ def capture_one(
                 return _skip_result(site, engine, argv, str(exc))
 
         guard_violation: str | None = None
+        guard_unavailable: str | None = None
         audit_base = proxy_audit.snapshot() if proxy_audit is not None else None
         # `{proxy}` を使うときだけ環境変数でもプロキシを強制する。使わない
         # （`--allow-unproxied-engine`）場合は現行どおり親環境をそのまま渡す。
@@ -1866,6 +1878,7 @@ def capture_one(
                     if guard is not None:
                         guard.stop()
                         guard_violation = guard.violation
+                        guard_unavailable = guard.unavailable
             duration_ms = int((time.monotonic() - start) * 1000)
             stderr_tail = _read_tail(stderr_path, STDERR_TAIL_CHARS)
             engine_missing = False
@@ -1883,9 +1896,11 @@ def capture_one(
             if stderr_path is not None:
                 stderr_path.unlink(missing_ok=True)
 
-        if guard_violation is not None:
-            # 迂回を検出してツリーを終了した場合は、タイムアウトや PNG の有無に
-            # かかわらず failed にする（直接接続した時点で撮影条件が崩れている）。
+        if guard_violation is not None or guard_unavailable is not None:
+            # 迂回を検出してツリーを終了した場合、または FD・ソケット表を読めず監視不能に
+            # なった場合は、タイムアウトや PNG の有無にかかわらず failed にする
+            # （直接接続した時点、または迂回の有無を確認できない時点で撮影条件が崩れている。
+            # 監視不能を `enforced` と記録しない）。
             report = proxy_audit.delta_since(audit_base) if proxy_audit is not None else None
             record_v: dict[str, Any] = {
                 "site_id": site.site_id,
@@ -1897,13 +1912,18 @@ def capture_one(
                 "duration_ms": duration_ms,
                 "exit_code": exit_code,
                 "stderr_tail": (
-                    stderr_tail + f"\nunproxied connection detected: {guard_violation}"
+                    stderr_tail
+                    + (
+                        f"\nunproxied connection detected: {guard_violation}"
+                        if guard_violation is not None
+                        else f"\negress guard unavailable: {guard_unavailable}"
+                    )
                 )[-STDERR_TAIL_CHARS:],
                 "command": argv,
                 "input": input_kind,
             }
             if report is not None:
-                report["egress_guard"] = "violation"
+                report["egress_guard"] = "violation" if guard_violation is not None else "unavailable"
                 record_v["proxy"] = report
             return record_v
 

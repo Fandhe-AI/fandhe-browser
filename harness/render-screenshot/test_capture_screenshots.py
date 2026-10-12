@@ -2799,5 +2799,67 @@ class EgressGuardTest(unittest.TestCase):
         self.assertEqual(record["status"], "ok")
 
 
+    @unittest.skipUnless(eg.egress_guard_supported(), "Linux /proc required")
+    def test_unmonitorable_guard_fails_capture_and_is_not_recorded_as_enforced(self) -> None:
+        import socket as socket_module  # noqa: PLC0415
+
+        canary = socket_module.socket()
+        canary.bind(("127.0.0.1", 0))
+        canary.listen(4)
+        self.addCleanup(canary.close)
+        port = canary.getsockname()[1]
+        with mock.patch.object(eg, "find_unproxied_connections", side_effect=eg.GuardUnavailable("denied")):
+            record = self._capture(
+                probe_template("direct", extra=["--direct-connect", f"127.0.0.1:{port}", "--hold-ms", "5000"])
+            )
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("egress guard unavailable: GuardUnavailable: denied", record["stderr_tail"])
+        self.assertEqual(record["proxy"]["egress_guard"], "unavailable")
+
+    def test_fd_permission_error_is_unmonitorable_but_vanished_process_is_not(self) -> None:
+        with mock.patch.object(eg.os, "listdir", side_effect=PermissionError("eacces")):
+            with self.assertRaises(eg.GuardUnavailable):
+                eg._socket_inodes({4242})
+        with mock.patch.object(eg.os, "listdir", side_effect=FileNotFoundError("gone")):
+            self.assertEqual(eg._socket_inodes({4242}), set())
+
+    def test_supported_requires_readable_fd_links(self) -> None:
+        with mock.patch.object(eg.sys, "platform", "linux"), mock.patch.object(
+            eg.os, "readlink", side_effect=PermissionError("eacces")
+        ):
+            self.assertFalse(eg.egress_guard_supported())
+
+
+class ProxyAuditWindowTest(unittest.TestCase):
+    """RENDER-5 / TASK-37: 拒否先の重複排除と上限は撮影単位の区間で適用する。"""
+
+    def test_same_target_denied_in_later_window_is_reported_again(self) -> None:
+        audit = cs.ProxyAudit()
+        first = audit.snapshot()
+        audit.record("169.254.169.254", 80, allowed=False)
+        audit.record("169.254.169.254", 80, allowed=False)
+        self.assertEqual(
+            audit.delta_since(first),
+            {"allowed": 0, "denied": 2, "denied_targets": ["169.254.169.254:80"]},
+        )
+        second = audit.snapshot()
+        audit.record("169.254.169.254", 80, allowed=False)
+        self.assertEqual(
+            audit.delta_since(second),
+            {"allowed": 0, "denied": 1, "denied_targets": ["169.254.169.254:80"]},
+        )
+
+    def test_cap_applies_per_window_not_globally(self) -> None:
+        audit = cs.ProxyAudit()
+        cap = cs.PROXY_AUDIT_MAX_DENIED_TARGETS
+        first = audit.snapshot()
+        for i in range(cap + 5):
+            audit.record(f"10.0.0.{i % 250}", 1000 + i, allowed=False)
+        self.assertEqual(len(audit.delta_since(first)["denied_targets"]), cap)
+        second = audit.snapshot()
+        audit.record("192.168.0.1", 80, allowed=False)
+        self.assertEqual(audit.delta_since(second)["denied_targets"], ["192.168.0.1:80"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,8 +13,12 @@
 限界（実装済みを装わない。REPAIR-3）:
     - ポーリング（既定 25 ms）のため、それより短命な接続は取りこぼす
     - 接続先が見えるのは接続済みソケットのみ（未接続 UDP の送信先は見えない）
-    - Linux 専用。macOS / Windows と `/proc` が読めない環境では `egress_guard_supported()`
-      が False を返し、呼び出し側が撮影を skipped にする（fail-closed）
+    - Linux 専用。macOS / Windows と `/proc`（ソケット表・自プロセスの FD）が読めない環境
+      では `egress_guard_supported()` が False を返し、呼び出し側が撮影を skipped にする（fail-closed）
+    - 監視中に FD・ソケット表を読めなくなった場合（権限等）は `GuardUnavailable` を送出し、
+      `EgressGuard.unavailable` に理由を残してツリーを終了する。呼び出し側は撮影を
+      `failed` にし、`egress_guard` を `enforced` と記録しない。プロセス終了による
+      正常な消失（ENOENT / ESRCH）は監視不能として扱わない
     - 完全な保証ではなく、ネットワーク名前空間による隔離の代わりにはならない
 """
 
@@ -38,12 +42,29 @@ _TCP_LISTEN = 0x0A
 _PROC = Path("/proc")
 
 
+class GuardUnavailable(Exception):
+    """監視対象の FD・ソケット表を読めず、迂回の有無を判定できないことを表す。"""
+
+
+def _is_vanished(exc: OSError) -> bool:
+    """プロセス終了などによる正常な消失（監視不能ではない）かを返す。"""
+    return isinstance(exc, (FileNotFoundError, ProcessLookupError))
+
+
 def egress_guard_supported() -> bool:
-    """このプラットフォームで送信先ソケット監視が使えるかを返す（Linux かつ /proc が読める）。"""
+    """このプラットフォームで送信先ソケット監視が使えるかを返す。
+
+    Linux で、`/proc/net/tcp` に加えて自プロセスの FD 一覧とそのリンク先を読めることを要する
+    （子プロセスの FD も同じ権限で読む前提の事前確認）。
+    """
     if not sys.platform.startswith("linux"):
         return False
     try:
         (_PROC / "net" / "tcp").read_text(encoding="ascii", errors="replace")
+        fd_dir = _PROC / "self" / "fd"
+        names = os.listdir(fd_dir)
+        if names:
+            os.readlink(fd_dir / names[0])
     except OSError:
         return False
     return True
@@ -125,13 +146,17 @@ def _socket_inodes(pids: set[int]) -> set[int]:
         fd_dir = _PROC / str(pid) / "fd"
         try:
             names = os.listdir(fd_dir)[:MAX_FDS_PER_PROCESS]
-        except OSError:
-            continue
+        except OSError as exc:
+            if _is_vanished(exc):
+                continue
+            raise GuardUnavailable(f"cannot list {fd_dir}: {exc}") from exc
         for name in names:
             try:
                 target = os.readlink(fd_dir / name)
-            except OSError:
-                continue
+            except OSError as exc:
+                if _is_vanished(exc):
+                    continue
+                raise GuardUnavailable(f"cannot read {fd_dir / name}: {exc}") from exc
             if target.startswith("socket:[") and target.endswith("]"):
                 try:
                     inodes.add(int(target[8:-1]))
@@ -145,6 +170,7 @@ def find_unproxied_connections(root_pid: int, proxy_port: int) -> list[str]:
 
     許可するのは remote が 127.0.0.1 の `proxy_port` のみ。ツリー内の待受ポートへの
     ループバック接続（プロセス間通信）、LISTEN ソケット、未接続の UDP は除外する。
+    FD・ソケット表を読めない場合は `GuardUnavailable` を送出する（接続なしとは扱わない）。
     """
     inodes = _socket_inodes(_descendant_pids(root_pid))
     if not inodes:
@@ -159,8 +185,8 @@ def find_unproxied_connections(root_pid: int, proxy_port: int) -> list[str]:
                     parsed = parse_net_line(line)
                     if parsed is not None and parsed[3] in inodes:
                         rows.append((*parsed, is_udp))
-        except OSError:
-            continue
+        except OSError as exc:
+            raise GuardUnavailable(f"cannot read /proc/net/{table}: {exc}") from exc
     own_listen_ports = {local for _, _, state, _, local, udp in rows if not udp and state == _TCP_LISTEN}
     found: list[str] = []
     for remote_ip, remote_port, state, _, local_port, is_udp in rows:
@@ -186,6 +212,8 @@ class EgressGuard:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="egress-guard", daemon=True)
         self.violation: str | None = None
+        # 監視不能（FD・ソケット表の読み取り失敗等）の理由。設定された撮影は failed にする。
+        self.unavailable: str | None = None
 
     def start(self) -> None:
         self._thread.start()
@@ -198,8 +226,10 @@ class EgressGuard:
         while not self._stop.is_set():
             try:
                 found = find_unproxied_connections(self._root_pid, self._proxy_port)
-            except Exception:  # noqa: BLE001 - 監視の失敗で撮影全体を落とさない
-                found = []
+            except Exception as exc:  # noqa: BLE001 - 監視不能を「接続なし」にしない（fail-closed）
+                self.unavailable = f"{type(exc).__name__}: {exc}"[:300]
+                self._on_violation()
+                return
             if found:
                 self.violation = found[0]
                 self._on_violation()

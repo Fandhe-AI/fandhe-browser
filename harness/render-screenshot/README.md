@@ -227,8 +227,8 @@ HTTP クライアントの `ProxyConnector` が起動時に設定した preferen
   `Preferences::default()` が環境変数を読むため、`NO_PROXY=*` 等による除外迂回を防ぐ。
   `{proxy}` を使わないテンプレート（`--allow-unproxied-engine`）では環境に手を入れない
 - プロキシは許可・拒否を数え、結果 JSON の各 capture に任意キー `proxy` を付ける:
-  `{"allowed": N, "denied": M, "denied_targets": ["169.254.169.254:80", ...], "egress_guard": "off|enforced|violation"}`
-  （`{proxy}` 使用時のみ。`denied_targets` は host:port で最大 50 件、クエリは記録しない。
+  `{"allowed": N, "denied": M, "denied_targets": ["169.254.169.254:80", ...], "egress_guard": "off|enforced|violation|unavailable"}`
+  （`{proxy}` 使用時のみ。`denied_targets` は host:port で、撮影単位で重複排除し最大 50 件（別サイト・別エンジンで同じ宛先が拒否されても、その撮影の行に現れる）、クエリは記録しない。
   `measure_ssim.py` は未知キーを無視する）
 - **fail-closed（プロキシ未使用）**: `{html_path}` のスナップショットが `http(s)` で解決される
   外部サブリソース（`script`・`img`・`source`・`iframe` の `src`、stylesheet / icon / preload の
@@ -240,7 +240,10 @@ HTTP クライアントの `ProxyConnector` が起動時に設定した preferen
   ツリーを終了して `failed`（`unproxied connection detected: <addr>`）にする。Linux 専用で、
   非 Linux では対象エンジンを `skipped` にする（`--egress-guard none` でのみ解除。完全遮断環境専用）。
   Chromium は背景通信の誤検出リスクがあるため既定では対象外。短命な接続の取りこぼし、未接続 UDP の
-  送信先が見えないことなど限界がある。ネットワーク名前空間での隔離は将来の拡張候補
+  送信先が見えないことなど限界がある。FD・ソケット表を読めず監視できなくなった場合は
+  ツリーを終了して `failed`（`egress guard unavailable: ...`・`egress_guard` は `unavailable`）にし、
+  `enforced` とは記録しない。接続後の事後検出のため SSRF の副作用は防げず、実サイト撮影の再開には
+  ネットワーク隔離が要る（RUNBOOK 5.1）。ネットワーク名前空間での隔離は将来の拡張候補
 
 ### `{url}` 直接ナビゲーションの許可リスト（多層防御）
 
