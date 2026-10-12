@@ -54,7 +54,10 @@
 //!   と SYSTEM は読める）に依存する。ACL の設定・検証はせず、配下外のルートは
 //!   `ProfileError::Unsupported` で拒否してディレクトリを作らない。Win32 API で ACL を
 //!   明示設定して任意のパスを許可する第 2 段階は、依存の feature 追加と `unsafe` の
-//!   承認が要るため未実装（後続。未判断）。Windows ではハンドル基準の走査・
+//!   承認が要るため未実装（後続。未判断）。Windows の `Profile` はルートのディレクトリ
+//!   ハンドルと `profile.lock` を改名・削除を共有しない形で保持するが、空のディレクトリの
+//!   再解析ポイント化は防げない（`local_root.rs` の「限界」。親のハンドルを起点にした作成への移行は後続。Issue #928 の PR #945 のレビューで判明。Issue #948・#950）。Windows では
+//!   ハンドル基準の走査・
 //!   `Profile::create_file_in`・`Profile::delete` も未実装
 
 pub mod normalize;
