@@ -15,7 +15,8 @@
 //!
 //! # スタブについて（実装済みを装わない。`REPAIR-3`）
 //!
-//! ダウンロード設定は検証して保持するだけで、保存処理・`Browser.downloadWillBegin` 等の送出は
+//! ダウンロード設定は検証して保持するだけ（受理は `deny` と `default` のみ。`deny` では
+//! `downloadPath` を保持しない）で、保存処理・`Browser.downloadWillBegin` 等の送出は
 //! 未実装（将来 `CDP-2` の実行系で参照する）。サーバーは `downloadPath` に対して一切の
 //! ファイル操作をしない。実行系で書き込む際は、プロファイル境界（`PROF`）を踏まえた別途の
 //! セキュリティ設計を要する。
@@ -50,11 +51,6 @@ impl DownloadBehavior {
             "default" => Some(Self::Default),
             _ => None,
         }
-    }
-
-    /// 保存先ディレクトリを要する挙動か。
-    pub(crate) fn needs_path(self) -> bool {
-        matches!(self, Self::Allow | Self::AllowAndName)
     }
 }
 
@@ -103,6 +99,10 @@ struct Entry {
     auto_attached: Vec<(TargetId, SessionId)>,
     /// `Target.setAutoAttach` が有効か（有効の間、後から現れたターゲットも attach 対象にする）。
     auto_attach_enabled: bool,
+    /// `Target.setAutoAttach` の `waitForDebuggerOnStart`（`autoAttach:true` の間だけ有効）。
+    /// 以後に attach される新しいターゲットを一時停止する指示で、既存ターゲットには適用しない。
+    /// 新しいターゲットの停止そのものは `Target.createTarget`（#910）で実装する（`REPAIR-3`）。
+    wait_for_debugger_on_start: bool,
     /// registry 側で消えたため所有記録から落としたが、まだ `Target.detachedFromTarget` を送出していないもの。
     pending_detached: Vec<(TargetId, SessionId)>,
     download: Option<DownloadSettings>,
@@ -160,11 +160,13 @@ impl ConnectionScoped {
 
     /// 自動 attach を有効にし、未 attach の既存ターゲットすべてへ attach して
     /// `(targetInfo, sessionId)` を昇順で返す。
-    /// 途中で失敗したらこの呼び出しの attach を巻き戻して `Err`（部分成功を残さず、有効化もしない。`CDP-7`）。
+    /// 途中で失敗したらこの呼び出しの attach を巻き戻して `Err`（部分成功を残さず、有効化もしない。
+    /// `wait_for_debugger_on_start` も更新しない。`CDP-7`）。成功時は値を置き換えて保持する。
     pub(crate) fn enable_auto_attach(
         &self,
         conn: ConnId,
         registry: &TargetRegistry,
+        wait_for_debugger_on_start: bool,
     ) -> Result<Vec<(TargetInfo, SessionId)>, ConnStateError> {
         let mut map = self.lock();
         let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
@@ -173,6 +175,7 @@ impl ConnectionScoped {
             return Err(e);
         }
         entry.auto_attach_enabled = true;
+        entry.wait_for_debugger_on_start = wait_for_debugger_on_start;
         Ok(added)
     }
 
@@ -273,6 +276,7 @@ impl ConnectionScoped {
         let mut map = self.lock();
         let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
         entry.auto_attach_enabled = false;
+        entry.wait_for_debugger_on_start = false;
         let mut out = std::mem::take(&mut entry.pending_detached);
         for (t, s) in std::mem::take(&mut entry.auto_attached) {
             let _ = registry.detach(&s);
@@ -291,6 +295,15 @@ impl ConnectionScoped {
         let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
         entry.download = Some(settings);
         Ok(())
+    }
+
+    /// 保持中の `waitForDebuggerOnStart`。`Target.createTarget`（#910）が新しいターゲットを
+    /// 一時停止するか決める際に参照する。実行系が未実装のためテストのみが読む（`REPAIR-3`）。
+    #[cfg(test)]
+    pub(crate) fn wait_for_debugger_on_start(&self, conn: ConnId) -> bool {
+        self.lock()
+            .get(&conn)
+            .is_some_and(|e| e.wait_for_debugger_on_start)
     }
 
     /// 保持中のダウンロード設定（実行系が未実装のためテストのみが読む）。
@@ -322,11 +335,11 @@ mod tests {
         let cs = ConnectionScoped::new();
         let c = ConnId::new(1);
         cs.open(c);
-        let added = cs.enable_auto_attach(c, &r).unwrap();
+        let added = cs.enable_auto_attach(c, &r, false).unwrap();
         let ids: Vec<&TargetId> = added.iter().map(|(i, _)| i.target_id()).collect();
         assert_eq!(ids, vec![&a, &b]);
         assert_eq!(r.session_count(), 2);
-        assert!(cs.enable_auto_attach(c, &r).unwrap().is_empty());
+        assert!(cs.enable_auto_attach(c, &r, false).unwrap().is_empty());
         assert_eq!(r.session_count(), 2);
     }
 
@@ -341,7 +354,7 @@ mod tests {
         assert_eq!(cs.reconcile_auto_attach(c, &r, true), Reconciled::default());
         assert_eq!(r.session_count(), 0);
         // 空でない registry で有効化した後に現れたターゲットも attach される。
-        assert_eq!(cs.enable_auto_attach(c, &r).unwrap().len(), 1);
+        assert_eq!(cs.enable_auto_attach(c, &r, false).unwrap().len(), 1);
         let later = page(&r);
         let added = cs.reconcile_auto_attach(c, &r, true).attached;
         assert_eq!(added.len(), 1);
@@ -361,7 +374,7 @@ mod tests {
         let cs = ConnectionScoped::new();
         let c = ConnId::new(1);
         cs.open(c);
-        let sid = cs.enable_auto_attach(c, &r).unwrap().remove(0).1;
+        let sid = cs.enable_auto_attach(c, &r, false).unwrap().remove(0).1;
         r.close_target(&t).unwrap();
         let rec = cs.reconcile_auto_attach(c, &r, true);
         assert!(rec.attached.is_empty());
@@ -378,7 +391,7 @@ mod tests {
         let cs = ConnectionScoped::new();
         let c = ConnId::new(1);
         cs.open(c);
-        cs.enable_auto_attach(c, &r).unwrap();
+        cs.enable_auto_attach(c, &r, false).unwrap();
         let _t2 = page(&r);
         let _t3 = page(&r);
         // 残り枠を 1 に絞る。
@@ -405,14 +418,14 @@ mod tests {
         let cs = ConnectionScoped::new();
         let c = ConnId::new(1);
         cs.open(c);
-        cs.enable_auto_attach(c, &r).unwrap();
+        cs.enable_auto_attach(c, &r, false).unwrap();
         let _t2 = page(&r);
         let _t3 = page(&r);
         while r.session_count() < MAX_SESSIONS - 1 {
             r.attach(&t1).unwrap();
         }
         let before = r.session_count();
-        assert!(cs.enable_auto_attach(c, &r).is_err());
+        assert!(cs.enable_auto_attach(c, &r, false).is_err());
         assert_eq!(r.session_count(), before);
         let rec = cs.reconcile_auto_attach(c, &r, false);
         assert!(rec.attached.is_empty());
@@ -433,7 +446,7 @@ mod tests {
         cs.open(c);
         let before = r.session_count();
         assert_eq!(
-            cs.enable_auto_attach(c, &r),
+            cs.enable_auto_attach(c, &r, false),
             Err(ConnStateError::Registry(CdpStateError::TooManySessions {
                 limit: MAX_SESSIONS
             }))
@@ -450,14 +463,17 @@ mod tests {
         let (c1, c2) = (ConnId::new(1), ConnId::new(2));
         cs.open(c1);
         cs.open(c2);
-        let s1 = cs.enable_auto_attach(c1, &r).unwrap();
+        let s1 = cs.enable_auto_attach(c1, &r, false).unwrap();
         assert_eq!(s1.len(), 1);
         // 別接続は同じターゲットへ独立に attach する。
-        assert_eq!(cs.enable_auto_attach(c2, &r).unwrap().len(), 1);
+        assert_eq!(cs.enable_auto_attach(c2, &r, false).unwrap().len(), 1);
         assert_eq!(r.session_count(), 2);
         assert_eq!(cs.release(c1), vec![s1[0].1.clone()]);
         assert_eq!(cs.len(), 1);
-        assert_eq!(cs.enable_auto_attach(c1, &r), Err(ConnStateError::NotLive));
+        assert_eq!(
+            cs.enable_auto_attach(c1, &r, false),
+            Err(ConnStateError::NotLive)
+        );
         let _ = t;
     }
 
@@ -469,7 +485,7 @@ mod tests {
         let cs = ConnectionScoped::new();
         let c = ConnId::new(1);
         cs.open(c);
-        let added = cs.enable_auto_attach(c, &r).unwrap();
+        let added = cs.enable_auto_attach(c, &r, false).unwrap();
         let out = cs.disable_auto_attach(c, &r).unwrap();
         assert_eq!(out, vec![(t.clone(), added[0].1.clone())]);
         assert_eq!(r.session_count(), 1);
@@ -483,7 +499,7 @@ mod tests {
         let cs = ConnectionScoped::new();
         let c = ConnId::new(1);
         cs.open(c);
-        let sid = cs.enable_auto_attach(c, &r).unwrap().remove(0).1;
+        let sid = cs.enable_auto_attach(c, &r, false).unwrap().remove(0).1;
         r.close_target(&t).unwrap();
         assert_eq!(cs.disable_auto_attach(c, &r).unwrap(), vec![(t, sid)]);
     }

@@ -34,24 +34,19 @@ const TRACE: &str = include_str!("../../../harness/playwright-trace/results/newp
 const MAX_TRACE_LINES: usize = 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
-/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3c 後）。`connectOverCDP` は http・ws のどちらも
-/// 接続段階の `Target.setAutoAttach`（`waitForDebuggerOnStart:true` の拒否）で失敗し、
-/// `newContext()`・`newPage()` には到達しない（`CDP-6`）。
+/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3g 後）。`connectOverCDP(noDefaults:true)` は
+/// `Target.setAutoAttach`（`waitForDebuggerOnStart:true`）・`Target.getTargetInfo` を経て成功し、
+/// `newContext({acceptDownloads:false})` が `Target.createBrowserContext` の `-32601` で失敗する。
+/// `newPage()` には到達しない（`CDP-6`）。
 ///
 /// 注意: `Browser.getVersion` の応答に `CARGO_PKG_VERSION` が入るため、workspace の版を上げたら
 /// `make trace-playwright` でトレースを再取得すること。
-const EXPECTED_SEND_METHODS: [&str; 6] = [
+const EXPECTED_SEND_METHODS: [&str; 4] = [
     "Browser.getVersion",
     "Target.setAutoAttach",
-    "Browser.setDownloadBehavior",
-    "Browser.getVersion",
-    "Target.setAutoAttach",
-    "Browser.setDownloadBehavior",
+    "Target.getTargetInfo",
+    "Target.createBrowserContext",
 ];
-
-/// トレース内で一時ディレクトリを表すプレースホルダ（収集ハーネスが正規化した値）。
-/// 再生時は実在しうる絶対パスへ置き換える（`downloadPath` は絶対パスのみ受理される）。
-const ARTIFACTS_PLACEHOLDER: &str = "<ARTIFACTS_DIR>";
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -215,8 +210,8 @@ fn cdp2_playwright_trace_is_well_formed() {
         .map(|r| r["message"]["method"].as_str().expect("method is a string"))
         .collect();
     assert_eq!(sends, EXPECTED_SEND_METHODS);
-    // 現状の到達点: connectOverCDP は http・ws のどちらも `Target.setAutoAttach`
-    // （`waitForDebuggerOnStart:true` の拒否）で失敗する。newContext・newPage には到達しない。
+    // 現状の到達点: connectOverCDP(http) が成功し（`Target.setAutoAttach` と `Browser.setDownloadBehavior` より
+    // 先へ進んだ）、newContext が `Target.createBrowserContext` の `-32601` で失敗する。newPage には到達しない。
     let stages: Vec<(&str, bool)> = recs
         .iter()
         .filter(|r| r["kind"] == "stage")
@@ -224,10 +219,7 @@ fn cdp2_playwright_trace_is_well_formed() {
         .collect();
     assert_eq!(
         stages,
-        [
-            ("connectOverCDP(http)", false),
-            ("connectOverCDP(ws)", false)
-        ]
+        [("connectOverCDP(http)", true), ("newContext", false)]
     );
 }
 
@@ -270,13 +262,7 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
     let sends: Vec<Value> = recs
         .iter()
         .filter(|r| r["kind"] == "cdp" && r["dir"] == "send")
-        .map(|r| {
-            let mut m = r["message"].clone();
-            if m["params"]["downloadPath"] == ARTIFACTS_PLACEHOLDER {
-                m["params"]["downloadPath"] = json!(dir.0.to_str().expect("utf-8 temp path"));
-            }
-            m
-        })
+        .map(|r| r["message"].clone())
         .collect();
     let recvs: Vec<Value> = recs
         .iter()
@@ -313,14 +299,15 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
     assert_eq!(
         replayed,
         [
-            version.clone(),
-            // 録画時の `waitForDebuggerOnStart:true` はターゲット一時停止が未実装のため拒否される（CDP-6・REPAIR-3）。
-            json!({"id": 2, "error": {"code": -32602, "message": "unsupported params"}}),
-            // 録画時の `allowAndName`・`eventsEnabled:true` は実行系が無いため拒否される（CDP-6・REPAIR-3）。
-            json!({"id": 3, "error": {"code": -32602, "message": "unsupported params"}}),
             version,
-            json!({"id": 2, "error": {"code": -32602, "message": "unsupported params"}}),
-            json!({"id": 3, "error": {"code": -32602, "message": "unsupported params"}}),
+            // `waitForDebuggerOnStart:true` は受理される（43.3g。既存ターゲットは無く、イベントも付かない）。
+            json!({"id": 2, "result": {}}),
+            json!({"id": 3, "result": {"targetInfo": {
+                "attached": true, "canAccessOpener": false,
+                "targetId": "trace-1", "title": "", "type": "browser", "url": ""
+            }}}),
+            // browser context は未実装（段階 2b）。成功を装わず `-32601`（CDP-6・REPAIR-3）。
+            json!({"id": 4, "error": {"code": -32601, "message": "method not implemented"}}),
         ]
     );
     assert_eq!(replayed, recvs, "replay must match the recorded responses");
@@ -335,9 +322,10 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
     assert_eq!(
         logged,
         [
-            ("Browser.getVersion", 2, 0),
-            ("Browser.setDownloadBehavior", 2, 0),
-            ("Target.setAutoAttach", 2, 0)
+            ("Browser.getVersion", 1, 0),
+            ("Target.createBrowserContext", 0, 1),
+            ("Target.getTargetInfo", 1, 0),
+            ("Target.setAutoAttach", 1, 0)
         ],
         "snapshot: {snap:?}"
     );

@@ -1,4 +1,4 @@
-//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c）。
+//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c、段階 2g は 43.3g）。
 //!
 //! `protocol::builtin_handlers` から登録される。`Browser.getVersion`（43.3a）・
 //! `Target.getTargetInfo`（43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（43.3c）を
@@ -10,6 +10,8 @@
 //! `Target.setAutoAttach` は `TargetRegistry::attach` と `Target.attachedToTarget` の送出に繋ぐ。
 //! `Browser.setDownloadBehavior` は設定の検証と接続スコープでの保持までで、ダウンロード実行系
 //! （保存・`Browser.downloadWillBegin`・`downloadProgress`）は未実装（`CDP-6`・`REPAIR-3`）。
+//! 43.3g（#942）で `Target.setAutoAttach` の `waitForDebuggerOnStart:true`（保持のみ。新ターゲットの
+//! 停止は #910）と `Browser.setDownloadBehavior` の `deny` + `eventsEnabled:true` を受理する。
 //! 接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
 
 use serde_json::{Value, json};
@@ -87,8 +89,13 @@ impl CommandHandler for TargetGetTargetInfo {
 /// スコープ外の入力は成功を装わず `-32602` で拒否する: `sessionId` 付き（子ターゲットの自動 attach は
 /// 子ターゲットのモデルが無く未実装）、`autoAttach:true` で `flatten` が `true` 以外
 /// （`sendMessageToTarget` 方式は未実装）、`filter`（Puppeteer の除外フィルタを黙って無視すると
-/// 除外すべきターゲットまで attach するため）、`autoAttach:true` で `waitForDebuggerOnStart:true`
-/// （ターゲットの一時停止が未実装。イベントの `waitingForDebugger` は常に `false`）。
+/// 除外すべきターゲットまで attach するため）。
+///
+/// `waitForDebuggerOnStart:true` は受理して接続状態に保持する（TASK-43.3g・#942）。CDP の定義
+/// （Target.pdl）で止める対象は「以後に attach される新しいターゲット」で、Chromium も既存ターゲットを
+/// `waiting_for_debugger=false` で attach する（`target_handler.cc` の `AutoAttach(..., false)`）。
+/// 既存ターゲットの `Target.attachedToTarget` は `waitingForDebugger:false`。新しいターゲットの
+/// 実際の一時停止は `Target.createTarget`（#910）で実装し、現状は新ターゲットが現れる本番経路が無い。
 /// 接続なしの直接 dispatch は `NO_CONNECTION`。
 /// イベントの `targetInfo` に `browserContextId` は載らない（段階 2b で追加）。
 pub(crate) struct TargetSetAutoAttach;
@@ -133,14 +140,17 @@ impl CommandHandler for TargetSetAutoAttach {
                 }
                 return Ok(out);
             }
-            // ターゲットの一時停止（`Runtime.runIfWaitingForDebugger` での再開）は未実装で、
-            // 成功を装うと待機前提のクライアントが先に進めない（`REPAIR-3`・`CDP-6`）。
-            if !flatten || wait_for_debugger {
+            if !flatten {
                 return Err(CdpError::UNSUPPORTED_PARAMS);
             }
+            // `waitForDebuggerOnStart` は以後に attach される新しいターゲットだけを止める指示で、
+            // 既存ターゲットは止めない（このため下の既存ターゲット通知は `waitingForDebugger:false`）。
+            // 新しいターゲットの実際の一時停止は `Target.createTarget`（#910）で実装し、それまでは
+            // 値の保持のみ。新ターゲットを生む経路を #910 より前に足す場合は、停止と
+            // `waitingForDebugger:true` の通知を同時に実装すること（`REPAIR-3`・`CDP-6`）。
             let attached = state
                 .conn_scoped()
-                .enable_auto_attach(conn, state.registry())
+                .enable_auto_attach(conn, state.registry(), wait_for_debugger)
                 .map_err(conn_error)?;
             let mut out = HandlerOutput::result(json!({}));
             for (info, session_id) in &attached {
@@ -188,8 +198,15 @@ fn conn_error(e: ConnStateError) -> CdpError {
 ///
 /// ダウンロード実行系（ファイル保存・`Browser.downloadWillBegin`・`Browser.downloadProgress` の送出）は
 /// 未実装（`CDP-6`・`REPAIR-3`）。fandhe-browser は現状ダウンロードを行わないため、実際に保証できる
-/// `deny`・`default`（保存しない・イベントなし）だけを受理して保持する。`allow`・`allowAndName` と
-/// `eventsEnabled:true` は成功を装わず `-32602`（`UNSUPPORTED_PARAMS`）で拒否する。
+/// `deny`（`eventsEnabled` は省略・`true`・`false` のいずれも）と `default`（`eventsEnabled` 省略または
+/// `false`）だけを受理して保持する。`allow`・`allowAndName` と `default` + `eventsEnabled:true` は
+/// 成功を装わず `-32602`（`UNSUPPORTED_PARAMS`）で拒否する。
+///
+/// `deny` + `eventsEnabled:true` は Playwright の `newContext({acceptDownloads:false})` が送る組
+/// （playwright 1.63.0 `crBrowser.ts`。`connectOverCDP` の `noDefaults:true` なら接続直後には送らない）。
+/// `deny` ではダウンロードが起きないため、`eventsEnabled:true` を受理してもイベントは送出しない
+/// （Browser.pdl の `behavior`・`eventsEnabled`。TASK-43.3g・#942）。`allow*` は既定の
+/// `acceptDownloads` が送る `allowAndName` を含め拒否のままで、Playwright の既定のオプションでは通らない。
 /// 設定は接続スコープで、切断で破棄する（プロファイルへ永続化しない）。
 ///
 /// 検証: `behavior` は `deny`・`allow`・`allowAndName`・`default` のみ（`allow*` は上記のとおり拒否）。
@@ -221,16 +238,23 @@ impl CommandHandler for BrowserSetDownloadBehavior {
                 Some(_) => return Err(CdpError::INVALID_PARAMS),
             };
             // 実行系が無く実際には保存もイベント送出もできないため、保証できない許可・イベント要求は
-            // 成功を捏造せず拒否する（`CDP-6`・`REPAIR-3`）。受理するのは `deny`・`default` のみ。
-            if behavior.needs_path() || events_enabled {
+            // 成功を捏造せず拒否する（`CDP-6`・`REPAIR-3`）。受理するのは `deny`（`eventsEnabled` 不問。
+            // ダウンロードが起きないので送出すべきイベントが無い）と、`eventsEnabled` なしの `default` のみ。
+            let accepted = match behavior {
+                DownloadBehavior::Deny => true,
+                DownloadBehavior::Default => !events_enabled,
+                _ => false,
+            };
+            if !accepted {
                 return Err(CdpError::UNSUPPORTED_PARAMS);
             }
+            // 不正な `downloadPath` は従来どおり拒否する。`deny` では保存しないためパスは保持しない。
             let download_path = match params.get("downloadPath") {
-                None if behavior.needs_path() => return Err(CdpError::INVALID_PARAMS),
                 None => None,
                 Some(v) => {
                     let s = v.as_str().ok_or(CdpError::INVALID_PARAMS)?;
-                    Some(validate_download_path(s).ok_or(CdpError::INVALID_PARAMS)?)
+                    let p = validate_download_path(s).ok_or(CdpError::INVALID_PARAMS)?;
+                    (behavior != DownloadBehavior::Deny).then_some(p)
                 }
             };
             let conn = ctx.conn.ok_or(CdpError::NO_CONNECTION)?;
@@ -497,10 +521,6 @@ mod tests {
                     &unsupported,
                 ),
                 (r#""autoAttach":true"#, &unsupported),
-                (
-                    r#""autoAttach":true,"flatten":true,"waitForDebuggerOnStart":true"#,
-                    &unsupported,
-                ),
                 (r#""autoAttach":true,"flatten":false"#, &unsupported),
                 (r#""autoAttach":true,"flatten":"yes""#, &invalid),
                 (r#""flatten":true"#, &invalid),
@@ -675,7 +695,11 @@ mod tests {
                     unsupported.clone(),
                 ),
                 (
-                    r#""behavior":"deny","eventsEnabled":true"#.into(),
+                    r#""behavior":"allow","eventsEnabled":true"#.into(),
+                    unsupported.clone(),
+                ),
+                (
+                    r#""behavior":"default","eventsEnabled":true"#.into(),
                     unsupported.clone(),
                 ),
                 // パス検証（deny でも downloadPath を与えた場合は検証する）。
@@ -719,6 +743,149 @@ mod tests {
                 call(&st, None, &dl(3, r#""behavior":"deny""#)).await,
                 vec![err(-32000, "no connection", 3)]
             );
+        }
+
+        /// CDP-2・CDP-6・REPAIR-3: Playwright の `acceptDownloads:false` が送る `deny` + `eventsEnabled:true`
+        /// を受理する。イベントは送出せず、`deny` では `downloadPath` を保持しない。
+        #[tokio::test]
+        async fn cdp2_set_download_behavior_accepts_deny_with_events_enabled() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c),
+                    &dl(1, r#""behavior":"deny","eventsEnabled":true"#)
+                )
+                .await,
+                vec![json!({"id":1,"result":{}})]
+            );
+            let s = st.conn_scoped().download(c).unwrap();
+            assert_eq!(
+                (s.behavior, s.download_path, s.events_enabled),
+                (DownloadBehavior::Deny, None, true)
+            );
+            // 存在しない絶対パスでも成功し、パスは保持せず、ディレクトリも作らない。
+            let missing = std::env::temp_dir().join("fandhe-cdp-no-such-dir-942");
+            let p = serde_json::to_string(missing.to_str().unwrap()).unwrap();
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c),
+                    &dl(
+                        2,
+                        &format!(r#""behavior":"deny","downloadPath":{p},"eventsEnabled":false"#)
+                    )
+                )
+                .await,
+                vec![json!({"id":2,"result":{}})]
+            );
+            let s = st.conn_scoped().download(c).unwrap();
+            assert_eq!(
+                (s.behavior, s.download_path, s.events_enabled),
+                (DownloadBehavior::Deny, None, false)
+            );
+            assert!(!missing.exists());
+        }
+
+        /// CDP-6: `deny` 受理後も `allow*` は拒否され、保持済みの設定は変わらない。
+        #[tokio::test]
+        async fn cdp6_set_download_behavior_rejects_allow_after_deny() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(
+                &st,
+                Some(c),
+                &dl(1, r#""behavior":"deny","eventsEnabled":true"#),
+            )
+            .await;
+            for b in ["allow", "allowAndName"] {
+                let extra = format!(r#""behavior":"{b}","eventsEnabled":true"#);
+                assert_eq!(
+                    call(&st, Some(c), &dl(2, &extra)).await,
+                    vec![err(-32602, "unsupported params", 2)],
+                    "{b}"
+                );
+            }
+            let s = st.conn_scoped().download(c).unwrap();
+            assert_eq!(
+                (s.behavior, s.download_path, s.events_enabled),
+                (DownloadBehavior::Deny, None, true)
+            );
+        }
+
+        /// CDP-2・CDP-7: `waitForDebuggerOnStart:true` を受理して保持する。既存ターゲットは
+        /// `waitingForDebugger:false` で通知される（止める対象は以後の新ターゲットのみ）。
+        #[tokio::test]
+        async fn cdp2_set_auto_attach_accepts_wait_for_debugger_on_start() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            new_page(&st, "about:blank");
+            let f = call(
+                &st,
+                Some(c),
+                &auto_attach(
+                    1,
+                    r#""autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true"#,
+                ),
+            )
+            .await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(f[0], json!({"id":1,"result":{}}));
+            assert_eq!(f[1]["method"], "Target.attachedToTarget");
+            assert_eq!(f[1]["params"]["waitingForDebugger"], false);
+            assert!(st.conn_scoped().wait_for_debugger_on_start(c));
+            // 再度の有効化は値を置き換える。
+            call(
+                &st,
+                Some(c),
+                &auto_attach(
+                    2,
+                    r#""autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true"#,
+                ),
+            )
+            .await;
+            assert!(!st.conn_scoped().wait_for_debugger_on_start(c));
+            call(
+                &st,
+                Some(c),
+                &auto_attach(
+                    3,
+                    r#""autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true"#,
+                ),
+            )
+            .await;
+            assert!(st.conn_scoped().wait_for_debugger_on_start(c));
+            // autoAttach:false で戻る。
+            call(&st, Some(c), &auto_attach(4, r#""autoAttach":false"#)).await;
+            assert!(!st.conn_scoped().wait_for_debugger_on_start(c));
+        }
+
+        /// CDP-7: セッション上限で失敗した場合、`waitForDebuggerOnStart` の保持値は変わらない。
+        #[tokio::test]
+        async fn cdp7_set_auto_attach_failure_keeps_wait_for_debugger_value() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t1 = new_page(&st, "about:blank");
+            new_page(&st, "about:blank");
+            for _ in 0..(MAX_SESSIONS - 1) {
+                st.registry().attach(&t1).unwrap();
+            }
+            let f = call(
+                &st,
+                Some(c),
+                &auto_attach(
+                    1,
+                    r#""autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true"#,
+                ),
+            )
+            .await;
+            assert_eq!(f, vec![err(-32000, "server error", 1)]);
+            assert!(!st.conn_scoped().wait_for_debugger_on_start(c));
         }
 
         #[tokio::test]
