@@ -118,6 +118,25 @@ if [ "$status" -ne 0 ] || ! grep -q '"method":"A.b"' "$FAKE_DIR/out5.jsonl"; the
 fi
 echo "ok: protocol lines after capture stops are discarded"
 
+# connectOverCDP に noDefaults:true、newContext に acceptDownloads:false を渡すこと（TASK-43.3g・#942）。
+cat >"$FAKE_DIR/node_modules/playwright-core/index.js" <<'JS'
+const fs = require("node:fs");
+const rec = (k, v) => fs.appendFileSync(process.env.OPTS_LOG, k + " " + JSON.stringify(v) + "\n");
+exports.chromium = { connectOverCDP: async (_u, o) => {
+  rec("connect", o);
+  process.stderr.write('t pw:protocol SEND ► {"id":1,"method":"A.b"}\n');
+  return {
+    newContext: async (c) => { rec("context", c); return { newPage: async () => ({}) }; },
+    close: async () => {},
+  };
+} };
+JS
+OPTS_LOG="$FAKE_DIR/opts.log" node "$SCRIPT_DIR/trace.mjs" --endpoint http://127.0.0.1:9 --out "$FAKE_DIR/out6.jsonl" \
+  --module-dir "$FAKE_DIR" --playwright-version 0.0.0 >/dev/null 2>&1
+grep -q '^connect .*"noDefaults":true' "$FAKE_DIR/opts.log" || { echo "FAIL: connectOverCDP must receive noDefaults:true" >&2; exit 1; }
+grep -q '^context {"acceptDownloads":false}$' "$FAKE_DIR/opts.log" || { echo "FAIL: newContext must receive acceptDownloads:false" >&2; exit 1; }
+echo "ok: noDefaults and acceptDownloads:false are passed to Playwright"
+
 # verify-install.mjs が導入結果の不一致を exit 1 で拒否し、一致なら 0 を返すこと（オフライン）。
 VDIR="$(mktemp -d)"
 trap 'rm -rf "$FAKE_DIR" "$VDIR"' EXIT

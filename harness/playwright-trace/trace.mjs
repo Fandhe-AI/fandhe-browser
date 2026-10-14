@@ -184,9 +184,16 @@ for (const p of ["/json/version", "/json/version/"]) {
   }
 }
 
+// fandhe-browser は Browser.setDownloadBehavior の allow / allowAndName を拒否する（ダウンロード実行系が
+// 未実装。CDP-6・TASK-43.3g・#942）。既定のオプションでは Playwright が allowAndName を送って先へ進めないため、
+// noDefaults:true（接続直後の Browser.setDownloadBehavior を省く）と acceptDownloads:false（newContext で
+// deny + eventsEnabled:true を送る）を指定する。
+const CONNECT_OPTIONS = { timeout: STAGE_TIMEOUT_MS, noDefaults: true };
+const CONTEXT_OPTIONS = { acceptDownloads: false };
+
 let browser;
 if (endpoint.protocol === "http:") {
-  const r = await stage("connectOverCDP(http)", () => chromium.connectOverCDP(origin, { timeout: STAGE_TIMEOUT_MS }));
+  const r = await stage("connectOverCDP(http)", () => chromium.connectOverCDP(origin, CONNECT_OPTIONS));
   if (r.ok) browser = r.value;
 }
 if (!browser) {
@@ -195,7 +202,7 @@ if (!browser) {
   if (target) {
     const wsEndpoint = validateDiscoveredWs(target, endpoint);
     const r = await stage("connectOverCDP(ws)", () =>
-      chromium.connectOverCDP(wsEndpoint.href, { timeout: STAGE_TIMEOUT_MS }),
+      chromium.connectOverCDP(wsEndpoint.href, CONNECT_OPTIONS),
     );
     if (r.ok) browser = r.value;
   }
@@ -204,7 +211,7 @@ if (!browser) {
 if (browser) {
   // 既存 context の有無に関わらず newContext から newPage までの CDP 列を必ず収集する。
   let context;
-  const r = await stage("newContext", () => browser.newContext());
+  const r = await stage("newContext", () => browser.newContext(CONTEXT_OPTIONS));
   if (r.ok) context = r.value;
   if (context) {
     // newPage 到達後は goto 等へ進まない（スコープは newPage まで）。

@@ -72,7 +72,8 @@ Playwright と異なり、`browserWSEndpoint` 指定の接続では HTTP の `/j
   応答とイベントの到着順への依存は緩いとソース上読める（B）。ただしイベントが一度も届かなければ待ち続け、`stages.mjs` の期限で `StageTimeout` になる
 - 現実装は応答を先に送る規約（`protocol.rs` の `DispatchOutcome`。`CDP-5`）。Puppeteer では順序入れ替えが必須かは未確定
 - 接続直後は `Target.setAutoAttach` に `waitForDebuggerOnStart:true` を渡す。attach 後に `Runtime.runIfWaitingForDebugger` を送る前提のため、
-  サーバー側が「デバッガ待ち」状態を表現しない場合は、属性を偽らず実装方針を決める必要がある（未確定）
+  サーバー側が「デバッガ待ち」状態を表現しない場合は、属性を偽らず実装方針を決める必要がある（未確定。
+  `waitForDebuggerOnStart:true` の受理自体は TASK-43.3g〔#942〕で行い、新ターゲットの停止は #910 で実装する）
 - `Page.getFrameTree` の応答処理前にイベントが届いた場合は Puppeteer 側でバッファされる（`frameTreeHandled`。B）
 
 ## Playwright との比較・追加実装コストの見込み
@@ -123,7 +124,7 @@ Playwright と異なり、`browserWSEndpoint` 指定の接続では HTTP の `/j
 - 実測が未実施。`puppeteer-core` の導入承認後に次を実測値で更新する: 段階別 status・失敗段階のエラー名とメッセージ・
   `CdpState::received_methods()`・本書の B の予測との差分
 - #8 のうち握りつぶしの有無、#10 の `page.$` の呼び出し連鎖、#11 の切断時の送信有無は精査が不完全
-- `Target.setAutoAttach` の `filter` 引数は `-32602`（`unsupported params`）で拒否すると確定（TASK-43.3c・#908。黙って無視すると除外すべき `page` まで attach するため）。`autoAttach:true` と `waitForDebuggerOnStart:true` の組み合わせも、ターゲットの一時停止が未実装のため `-32602` で拒否する。このため Puppeteer の `TargetManager.initialize` の `filter` 付き呼び出しは現状 `-32602` で失敗する（Puppeteer 側の対応は TASK-45 で再判断）
+- `Target.setAutoAttach` の `filter` 引数は `-32602`（`unsupported params`）で拒否すると確定（TASK-43.3c・#908。黙って無視すると除外すべき `page` まで attach するため）。`autoAttach:true` と `waitForDebuggerOnStart:true` の組み合わせは、当初拒否していたが TASK-43.3g（#942）で受理に変わった（保持のみ。新しいターゲットの停止は #910）。`filter` の拒否は残るため Puppeteer の `TargetManager.initialize` の `filter` 付き呼び出しは現状 `-32602` で失敗する（Puppeteer 側の対応は TASK-45 で再判断）
 - spec（`docs/spec`）は本調査環境で再照合しておらず、C の記述は spec 本文と未照合
 - 再現（ソース確認）: `npm pack puppeteer-core@25.12.0` で得た tarball を一時ディレクトリへ展開し、`src/cdp/` を閲覧のみする（展開物内でスクリプトは実行しない）
 - 再現（実測。承認後）: `harness/puppeteer-connect/README.md` の導入手順に従う
