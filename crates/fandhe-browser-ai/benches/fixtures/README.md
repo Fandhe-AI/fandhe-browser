@@ -65,3 +65,5 @@ snapshot のテキスト化は測定用の暫定形式で、`/ai/snapshot` の�
 `AISNAP-15`（TASK-23.1・Issue #129）の分母となる全フィクスチャの生 DOM シリアライズのトークン量は `cargo bench -p fandhe-browser-ai --bench raw_dom_serialize_reduction` で TSV 出力する（`name` / `bytes` / `rawHtmlTokens` / `rawDomTokens`、続けて TASK-23.2・Issue #130 で追加した `snapshotTokens` / `reductionVsRawDomPct` / `reductionVsRawHtmlPct` / `truncated`）。生 DOM の定義は `raw_dom.rs` と同一。対生 DOM 比の削減率と全ページ平均は同コマンドの `# token reduction vs raw DOM serialize (AISNAP-15)` セクションに出力する（`met` は参考表示で終了コードに反映しない）。TASK-23.3〜23.7 の改善後（`5383534`）の実測は 17 件の平均 40.2%（最小 -28.8%・最大 69.3%）で、最小は ssr-next-prerendered。改善前は平均 -56.4%（最小 -147.2%・最大 19.0%）。達成判断は #131 の担当。対照表は [再測定レポート](../../../../docs/design/token-reduction-remeasurement-report.md) を参照。対象は実ディレクトリの 17 件で、spec の「14 ページ」とは食い違う。
 
 現行実測（`5383534`）は生 DOM 55,917 トークン・snapshot 20,954 トークンで削減率 62.5%（生 HTML 比 62.9%）。改善前は snapshot 45,300 トークン・削減率 19.0%（生 HTML 比 19.8%）。判定は #97 の担当。フィクスチャは合成ページのため、PoC-4 の実ページ値（92.3%）とは参考比較に留まる。
+
+実ページ HTML を測る場合は、環境変数 `FANDHE_BROWSER_BENCH_HTML_DIR` で入力ディレクトリを切り替えられる（Issue #927）。実ページ HTML はコミットしない。手順は [実ページ測定手順](../../../../docs/design/token-reduction-real-page-measurement.md) を参照。

@@ -32,7 +32,9 @@ use std::process::ExitCode;
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let counter = tokens::TokenCounter::new()?;
-    let rows = raw_dom_reduction::measure_raw_dom_reduction(&counter, &tokens::fixtures_dir())?;
+    let input = tokens::input_from_env()?;
+    println!("input\t{}\t{}", input.label(), input.dir().display());
+    let rows = raw_dom_reduction::measure_raw_dom_reduction(&counter, input.dir())?;
     println!("# raw DOM serialize tokens (AISNAP-15)");
     println!(
         "name\tbytes\trawHtmlTokens\trawDomTokens\tsnapshotTokens\treductionVsRawDomPct\treductionVsRawHtmlPct\ttruncated"
@@ -57,6 +59,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("meanReductionPct\t{:.1}", summary.mean_reduction_pct);
     println!("minReductionPct\t{:.1}", summary.min_reduction_pct);
     println!("maxReductionPct\t{:.1}", summary.max_reduction_pct);
+    println!("medianReductionPct\t{:.1}", summary.median_reduction_pct);
     println!("targetPct\t{:.1}", raw_dom_reduction::TARGET_PCT);
     println!(
         "met\t{}",

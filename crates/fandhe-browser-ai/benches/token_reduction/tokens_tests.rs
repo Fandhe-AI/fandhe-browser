@@ -3,7 +3,12 @@
 #[path = "tokens.rs"]
 mod tokens;
 
-use tokens::{TokenCounter, fixtures_dir, measure_raw_html};
+use std::ffi::OsString;
+use std::fs;
+use std::path::PathBuf;
+use tokens::{
+    InputDirError, InputSource, TokenCounter, fixtures_dir, measure_raw_html, resolve_input,
+};
 
 /// フィクスチャ 17 件の期待値（名前, トークン数）。
 const EXPECTED: [(&str, usize); 17] = [
@@ -68,4 +73,103 @@ fn fixture_bytes_match_file_size() {
         .find(|r| r.name == "example-minimal.html")
         .expect("row");
     assert_eq!(r.bytes, 355);
+}
+
+/// テスト専用の一時ディレクトリ（PID とテスト名で一意）。
+fn temp_dir(test: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("fb-927-{}-{test}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// AISNAP-1: 環境変数が未設定なら同梱 fixture を測り、従来の測定入力を変えない。
+#[test]
+fn resolve_input_unset_is_builtin_fixtures() {
+    let r = resolve_input(None).unwrap();
+    assert_eq!(r, InputSource::Fixtures(fixtures_dir()));
+    assert!(!r.is_external());
+    assert_eq!(r.label(), "fixtures");
+}
+
+/// AISNAP-1: 空文字の指定は暗黙に fixture へ戻さず、固定文言のエラーにする。
+#[test]
+fn resolve_input_empty_value_is_error() {
+    let e = resolve_input(Some(OsString::new())).unwrap_err();
+    assert!(matches!(e, InputDirError::Empty));
+    assert_eq!(
+        e.to_string(),
+        "FANDHE_BROWSER_BENCH_HTML_DIR is set but empty"
+    );
+}
+
+/// AISNAP-1: 存在しないパスはエラーになり、メッセージに指定パスを含む。
+#[test]
+fn resolve_input_missing_path_is_error_with_path() {
+    let p = std::env::temp_dir().join(format!("fb-927-{}-missing", std::process::id()));
+    let e = resolve_input(Some(p.clone().into_os_string())).unwrap_err();
+    assert!(matches!(e, InputDirError::NotADirectory { .. }));
+    assert!(e.to_string().contains(&p.display().to_string()));
+}
+
+/// AISNAP-1: ファイルを指定してもディレクトリではないとしてエラーになる。
+#[test]
+fn resolve_input_file_is_not_a_directory() {
+    let dir = temp_dir("file");
+    let f = dir.join("a.html");
+    fs::write(&f, "<p>x</p>").unwrap();
+    let e = resolve_input(Some(f.into_os_string())).unwrap_err();
+    assert!(matches!(e, InputDirError::NotADirectory { .. }));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// AISNAP-1: `*.html` が 0 件（空・`.txt`・`.htm` のみ）のディレクトリはエラーになる。
+#[test]
+fn resolve_input_dir_without_html_is_error() {
+    let empty = temp_dir("nohtml-empty");
+    let e = resolve_input(Some(empty.clone().into_os_string())).unwrap_err();
+    assert!(matches!(e, InputDirError::NoHtml { .. }));
+    assert!(e.to_string().starts_with("no *.html files found in "));
+    fs::remove_dir_all(&empty).unwrap();
+
+    let other = temp_dir("nohtml-other");
+    fs::write(other.join("a.txt"), "x").unwrap();
+    fs::write(other.join("b.htm"), "x").unwrap();
+    let e = resolve_input(Some(other.clone().into_os_string())).unwrap_err();
+    assert!(matches!(e, InputDirError::NoHtml { .. }));
+    fs::remove_dir_all(&other).unwrap();
+}
+
+/// AISNAP-1: `*.html` を含むディレクトリは外部入力として解決され、ラベルは `external`。
+#[test]
+fn resolve_input_dir_with_html_is_external() {
+    let dir = temp_dir("external");
+    fs::write(dir.join("a.html"), "<p>x</p>").unwrap();
+    let r = resolve_input(Some(dir.clone().into_os_string())).unwrap();
+    assert_eq!(r, InputSource::External(dir.clone()));
+    assert!(r.is_external());
+    assert_eq!(r.label(), "external");
+    assert_eq!(r.dir(), dir.as_path());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// AISNAP-1: 相対パスは `std::path::absolute` で cwd（`cargo bench` では package ルート）基準の
+/// 絶対パスに解決され、解決後のパスが `External` と `dir()`（`input` 行の表示）に入る。
+#[test]
+fn resolve_input_relative_path_is_absolutized() {
+    let rel = PathBuf::from("benches").join("fixtures");
+    let r = resolve_input(Some(rel.clone().into_os_string())).unwrap();
+    let expected = std::path::absolute(&rel).unwrap();
+    assert!(expected.is_absolute());
+    assert_eq!(r, InputSource::External(expected.clone()));
+    assert_eq!(r.dir(), expected.as_path());
+}
+
+/// AISNAP-1: 相対パスのエラーメッセージにも絶対化後のパスを表示する。
+#[test]
+fn resolve_input_relative_missing_path_reports_absolute() {
+    let rel = PathBuf::from("fb-927-no-such-relative-dir");
+    let e = resolve_input(Some(rel.clone().into_os_string())).unwrap_err();
+    let expected = std::path::absolute(&rel).unwrap();
+    assert!(e.to_string().contains(&expected.display().to_string()));
 }

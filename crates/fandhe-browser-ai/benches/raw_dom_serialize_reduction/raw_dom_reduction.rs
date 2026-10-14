@@ -16,7 +16,9 @@ use std::fmt;
 use std::path::Path;
 
 use crate::raw_dom_tokens::{RawDomTokens, RawDomTokensError, measure_raw_dom};
-use crate::reduction::{ReductionError, ReductionRow, measure_reduction, reduction_pct};
+use crate::reduction::{
+    ReductionError, ReductionRow, measure_reduction, median_f64, reduction_pct,
+};
 use crate::tokens::TokenCounter;
 
 /// `AISNAP-15` の目標削減率（%）。参考表示専用で、判定は #131 が担う。
@@ -71,6 +73,8 @@ pub struct RawDomReductionSummary {
     pub pages: usize,
     /// ページごとの削減率の算術平均（`reduction::summarize` と同じ定義）。
     pub mean_reduction_pct: f64,
+    /// ページごとの削減率の中央値（Issue #927）。
+    pub median_reduction_pct: f64,
     pub min_reduction_pct: f64,
     pub max_reduction_pct: f64,
 }
@@ -116,8 +120,10 @@ pub fn summarize(rows: &[RawDomReductionRow]) -> Option<RawDomReductionSummary> 
         return None;
     }
     let pcts = || rows.iter().map(|r| r.reduction_vs_raw_dom_pct);
+    let all: Vec<f64> = pcts().collect();
     Some(RawDomReductionSummary {
         pages: rows.len(),
+        median_reduction_pct: median_f64(&all)?,
         mean_reduction_pct: pcts().sum::<f64>() / rows.len() as f64,
         min_reduction_pct: pcts().fold(f64::INFINITY, f64::min),
         max_reduction_pct: pcts().fold(f64::NEG_INFINITY, f64::max),
