@@ -156,6 +156,7 @@ ref 保持要素には、通常ノード、圧縮表のヘッダセル（`Header
 - 重複判定のキーは `RefHolder` の `(role, name)` と同じ定義にそろえる
 - 付与は `build_snapshot_inner` の末尾で行う。対象は ref 保持ノード、`TableSummary.header` の `HeaderCell`、`TableRow.controls` の `RowControl`
 - 付与後の name がページ由来の name と衝突する場合は、次の出現番号で解消する。反復回数に上限を設け、超えたら `Ambiguous` として検出できる状態にする（fail-closed）
+- `build_snapshot_inner` は木の構築途中で `RefHolder.name` を複製して記録し、`reference_stability` はその記録で判定する。後段パスで `Node`・`HeaderCell`・`RowControl` の name だけを変えると、`RefHolder` は元の重複した name のままになり `Ambiguous` が残る。そのため後段パスは、ref をキーに区別子付与後の name を `RefHolder` へも同期する（ヘルパーの契約・`RefHolder` の型は変えない）。この同期は実装 Issue 1 に含める
 - 付与後の name の長さは既存の name 上限の内に収め、超える分は元の name 側を切り詰める
 - グループ化は `HashMap` で行い、計算量を要素数に対して線形に保つ
 - 副作用として `Node::name` は、重複時のみアクセシブルネームそのものではなくなる。#833・#834 にも出力 name の補完の前例がある
@@ -166,7 +167,7 @@ ref 保持要素には、通常ノード、圧縮表のヘッダセル（`Header
 
 | # | タイトル（案） | 依存 | 内容 |
 | - | -------------- | ---- | ---- |
-| 1 | `feat(ai): 同じ role・name の ref 保持要素へ出現順の区別子を付与する後段パスを追加（AISNAP-10）` | なし | 純関数 `disambiguate_names` を `snapshot/` 配下に追加。ノード・`HeaderCell`・`RowControl` を文書順に走査し、2 件目以降に `#n`（直前に半角スペース） を付ける。ref・accname は不変 |
+| 1 | `feat(ai): 同じ role・name の ref 保持要素へ出現順の区別子を付与する後段パスを追加（AISNAP-10）` | なし | 純関数 `disambiguate_names` を `snapshot/` 配下に追加。ノード・`HeaderCell`・`RowControl` を文書順に走査し、2 件目以降に `#n`（直前に半角スペース） を付ける。ref・accname は不変。付与後の name を ref をキーに `RefHolder` へ同期する（`Ambiguous` を残さないため） |
 | 2 | `feat(ai): 区別子と既存の name の衝突解消を追加（AISNAP-10）` | 1 | ページ由来の name との衝突の反復解消と上限。外部入力経路のため上限を検証する |
 | 3 | `test(ai): 参照破損率の測定を区別子付与後の値へ更新（AISNAP-10）` | 1 | `reference_stability/measure.rs` の期待値と測定レポートを更新（3/18 → 0/18 を見込む） |
 | 4 | `docs(ai): 区別子付与後の削減率・トークン量を再測定（AISNAP-1・AISNAP-4）` | 1 | 再測定レポートに追記。目標達成の判断はしない |
