@@ -25,7 +25,7 @@
 
 ## 実行コマンド
 
-`FANDHE_BROWSER_BENCH_HTML_DIR` に入力ディレクトリを渡す。未指定のときは従来どおり同梱の合成 fixture を測る。
+`FANDHE_BROWSER_BENCH_HTML_DIR` に入力ディレクトリを渡す。未指定のときは従来どおり同梱の合成 fixture を測る。相対パスは `cargo bench` の cwd（`fandhe-browser-ai` の package ルート `crates/fandhe-browser-ai/`）基準で絶対化するため、シェルの cwd からの相対指定は意図と異なるディレクトリを指す。絶対パスを渡すこと。
 
 ```bash
 FANDHE_BROWSER_BENCH_HTML_DIR=/path/to/pages cargo bench -p fandhe-browser-ai --bench token_reduction
@@ -34,7 +34,7 @@ FANDHE_BROWSER_BENCH_HTML_DIR=/path/to/pages cargo bench -p fandhe-browser-ai --
 
 ## 出力の読み方
 
-- `input` 行は入力の種別（`fixtures` / `external`）とディレクトリを示す。
+- `input` 行は入力の種別（`fixtures` / `external`）と、絶対化後のディレクトリを示す。
 - ページ別の TSV に続き、`pages`・`meanReductionPct`・`medianReductionPct`・`minReductionPct`・`maxReductionPct` を出す。`token_reduction` は `medianSnapshotTokens`（AISNAP-4 の参考値）も出す。
 - `met` は 85% に対する参考表示で、終了コードには反映しない。
 - 外部ディレクトリ指定時、同梱 fixture の名前に依存する `AISNAP-3`（情報保持チェック）と `AISNAP-5`（巨大静的ページ）は実行せず、`skipped` 行を出す。

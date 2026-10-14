@@ -164,6 +164,7 @@ fn aisnap15_real_fixtures_pinned_values_and_summary() {
     assert!((s.max_reduction_pct - 69.3).abs() < 0.05);
 }
 
+/// AISNAP-1・AISNAP-15: 外部ディレクトリの `*.html` を生 DOM シリアライズ比で測り、中央値を出す。
 #[test]
 fn external_directory_is_measured_with_median() {
     let dir = std::env::temp_dir().join(format!("fb-927-{}-rawdom", std::process::id()));

@@ -226,7 +226,7 @@ impl std::error::Error for InputDirError {}
 
 /// 環境変数の値（未設定は `None`）から測定入力を解決する純関数。
 ///
-/// `None` は同梱 fixture（中身は検査しない。現状維持）。値があれば、空文字・非ディレクトリ・
+/// `None` は同梱 fixture（中身は検査しない。現状維持）。値があれば、相対パスを cwd 基準で絶対化し、空文字・非ディレクトリ・
 /// `*.html` 0 件をエラーにする。環境変数を直接読まないのでテストで `set_var` が要らない。
 #[allow(
     dead_code,
@@ -239,7 +239,10 @@ pub fn resolve_input(value: Option<OsString>) -> Result<InputSource, InputDirErr
     if value.is_empty() {
         return Err(InputDirError::Empty);
     }
+    // 相対パスは cwd 基準で絶対化する（`cargo bench` の cwd は package ルート）。
+    // エラー表示と `input` 行にも解決後のパスを使う。
     let path = PathBuf::from(value);
+    let path = std::path::absolute(&path).unwrap_or(path);
     if !fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false) {
         return Err(InputDirError::NotADirectory { path });
     }

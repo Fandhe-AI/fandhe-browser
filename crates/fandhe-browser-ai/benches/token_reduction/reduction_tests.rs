@@ -357,6 +357,7 @@ fn render_escapes_quotes_in_names() {
     assert_eq!(text, "- button \"Say \\\"hi\\\" \\\\o/\" [e1]");
 }
 
+/// AISNAP-1: 中央値は空で `None`、奇数件は中央の値、偶数件は中央 2 値の平均を返す。
 #[test]
 fn median_f64_odd_even_and_empty() {
     assert_eq!(median_f64(&[]), None);
@@ -365,6 +366,7 @@ fn median_f64_odd_even_and_empty() {
     assert_eq!(median_f64(&[40.0, 10.0, 20.0, 30.0]), Some(25.0));
 }
 
+/// AISNAP-1・AISNAP-4: 外部ディレクトリの `*.html` をファイル名昇順に測り、削減率の中央値を出す。
 #[test]
 fn external_directory_is_measured_with_median() {
     let dir = std::env::temp_dir().join(format!("fb-927-{}-reduction", std::process::id()));
