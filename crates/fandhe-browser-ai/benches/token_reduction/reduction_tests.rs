@@ -18,7 +18,9 @@ use fandhe_browser_ai::snapshot::{
     CheckedState, DataLeafKind, FoldedRow, HeaderCell, Node, RowControl, Snapshot, State, TableRow,
     TableSummary,
 };
-use reduction::{ReductionError, ReductionRow, measure_reduction, reduction_pct, summarize};
+use reduction::{
+    ReductionError, ReductionRow, measure_reduction, median_f64, reduction_pct, summarize,
+};
 use snapshot_text::render_snapshot;
 use tokens::{TokenCounter, fixtures_dir};
 
@@ -353,4 +355,40 @@ fn render_escapes_quotes_in_names() {
     let n = Node::new("button", "Say \"hi\" \\o/").with_ref("e1");
     let text = render_snapshot(&Snapshot::new(n));
     assert_eq!(text, "- button \"Say \\\"hi\\\" \\\\o/\" [e1]");
+}
+
+#[test]
+fn median_f64_odd_even_and_empty() {
+    assert_eq!(median_f64(&[]), None);
+    assert_eq!(median_f64(&[7.0]), Some(7.0));
+    assert_eq!(median_f64(&[30.0, 10.0, 20.0]), Some(20.0));
+    assert_eq!(median_f64(&[40.0, 10.0, 20.0, 30.0]), Some(25.0));
+}
+
+#[test]
+fn external_directory_is_measured_with_median() {
+    let dir = std::env::temp_dir().join(format!("fb-927-{}-reduction", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("b.html"),
+        "<html><body><h1>Title</h1><p>Some text here</p></body></html>",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("a.html"),
+        "<html><body><button>Go</button></body></html>",
+    )
+    .unwrap();
+    let counter = TokenCounter::new().unwrap();
+    let rows = measure_reduction(&counter, &dir).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["a.html", "b.html"]);
+    let s = summarize(&rows).unwrap();
+    assert_eq!(s.pages, 2);
+    approx(
+        s.median_reduction_pct,
+        (rows[0].reduction_pct + rows[1].reduction_pct) / 2.0,
+    );
 }

@@ -36,10 +36,11 @@ use std::process::ExitCode;
 /// `AISNAP-1` の目標削減率（%）。参考表示専用。
 const TARGET_PCT: f64 = 85.0;
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run(input: &tokens::InputSource) -> Result<(), Box<dyn std::error::Error>> {
     let counter = tokens::TokenCounter::new()?;
-    let rows = reduction::measure_reduction(&counter, &tokens::fixtures_dir())?;
+    let rows = reduction::measure_reduction(&counter, input.dir())?;
     let summary = reduction::summarize(&rows).ok_or("no fixtures found")?;
+    println!("input\t{}\t{}", input.label(), input.dir().display());
     println!("name\tbytes\trawHtmlTokens\tsnapshotTokens\treductionPct\ttruncated");
     for r in &rows {
         println!(
@@ -58,6 +59,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("meanReductionPct\t{:.1}", summary.mean_reduction_pct);
     println!("minReductionPct\t{:.1}", summary.min_reduction_pct);
     println!("maxReductionPct\t{:.1}", summary.max_reduction_pct);
+    println!("medianReductionPct\t{:.1}", summary.median_reduction_pct);
     println!(
         "medianSnapshotTokens\t{:.1}\t(AISNAP-4 reference)",
         summary.median_snapshot_tokens
@@ -68,19 +70,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => match print_huge_static() {
-            Ok(()) => print_retention_checks(),
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::FAILURE
-            }
-        },
+    let input = match tokens::input_from_env() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = run(&input) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
+    // AISNAP-5・AISNAP-3 は同梱 fixture の名前に依存するため、外部入力では実行しない。
+    if input.is_external() {
+        print_skipped("huge static page reduction vs raw DOM (AISNAP-5)");
+        print_skipped("retention check (AISNAP-3)");
+        return ExitCode::SUCCESS;
+    }
+    match print_huge_static() {
+        Ok(()) => print_retention_checks(),
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// 外部入力で実行しなかった検査を、実行しなかったと分かる形で出す。
+fn print_skipped(title: &str) {
+    println!();
+    println!("# {title}");
+    println!(
+        "skipped\tdepends on built-in fixture names; not run for {} input",
+        tokens::INPUT_DIR_ENV
+    );
 }
 
 /// 巨大静的ページ単体の生 DOM 比削減率（`AISNAP-5`）を出す。判定は #97 のため終了コードへ反映しない。

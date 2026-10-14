@@ -68,6 +68,8 @@ pub struct ReductionSummary {
     pub mean_reduction_pct: f64,
     /// snapshot トークン数の中央値（`AISNAP-4` の参考値）。
     pub median_snapshot_tokens: f64,
+    /// ページごとの削減率の中央値（実ページ測定での外れ値耐性のため。Issue #927）。
+    pub median_reduction_pct: f64,
     pub min_reduction_pct: f64,
     pub max_reduction_pct: f64,
 }
@@ -78,6 +80,18 @@ pub fn reduction_pct(raw: usize, reduced: usize) -> Option<f64> {
         return None;
     }
     Some((1.0 - reduced as f64 / raw as f64) * 100.0)
+}
+
+/// 中央値。空なら `None`、偶数件は中央 2 値の平均。
+pub fn median_f64(values: &[f64]) -> Option<f64> {
+    let mut v = values.to_vec();
+    v.sort_by(f64::total_cmp);
+    let mid = v.len() / 2;
+    if v.len() % 2 == 1 {
+        v.get(mid).copied()
+    } else {
+        Some((*v.get(mid.checked_sub(1)?)? + *v.get(mid)?) / 2.0)
+    }
 }
 
 /// 行の集計。空なら `None`。
@@ -103,8 +117,10 @@ pub fn summarize(rows: &[ReductionRow]) -> Option<ReductionSummary> {
     } else {
         (*toks.get(mid.checked_sub(1)?)? + *toks.get(mid)?) as f64 / 2.0
     };
+    let pcts: Vec<f64> = rows.iter().map(|r| r.reduction_pct).collect();
     Some(ReductionSummary {
         pages: rows.len(),
+        median_reduction_pct: median_f64(&pcts)?,
         mean_reduction_pct: mean,
         median_snapshot_tokens: median,
         min_reduction_pct: min,

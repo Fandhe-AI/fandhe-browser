@@ -163,3 +163,29 @@ fn aisnap15_real_fixtures_pinned_values_and_summary() {
     assert!((s.min_reduction_pct - -37.5).abs() < 0.05);
     assert!((s.max_reduction_pct - 69.3).abs() < 0.05);
 }
+
+#[test]
+fn external_directory_is_measured_with_median() {
+    let dir = std::env::temp_dir().join(format!("fb-927-{}-rawdom", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("b.html"),
+        "<html><body><h1>Title</h1><p>Some text here</p></body></html>",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("a.html"),
+        "<html><body><button>Go</button></body></html>",
+    )
+    .unwrap();
+    let counter = TokenCounter::new().unwrap();
+    let rows = measure_raw_dom_reduction(&counter, &dir).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["a.html", "b.html"]);
+    let s = summarize(&rows).unwrap();
+    assert_eq!(s.pages, 2);
+    let expected = (rows[0].reduction_vs_raw_dom_pct + rows[1].reduction_vs_raw_dom_pct) / 2.0;
+    assert!((s.median_reduction_pct - expected).abs() < 1e-9);
+}
