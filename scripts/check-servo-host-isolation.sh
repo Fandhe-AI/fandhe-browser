@@ -29,11 +29,11 @@ MEMBER_NAME_PATTERN='^(servo-host|fandhe-browser-servo-host)$'
 # detect_members <package 名を 1 行ずつ並べた文字列>: Servo ホストが members にいれば 1。
 detect_members() {
   if grep -Eq -- "$MEMBER_NAME_PATTERN" <<<"$1"; then
-    echo "NG: workspace members に Servo ホストが含まれています（exclude = [\"servo-host\"] を確認）" >&2
+    echo "NG: workspace members include the Servo host (check exclude = [\"servo-host\"] in the root Cargo.toml)" >&2
     grep -E -- "$MEMBER_NAME_PATTERN" <<<"$1" >&2
     return 1
   fi
-  echo "OK: workspace members に Servo ホストは含まれていません"
+  echo "OK: workspace members do not include the Servo host"
 }
 
 # detect_lock <Cargo.lock の全文>: Servo / mozjs 系パッケージがあれば 1。
@@ -43,46 +43,46 @@ detect_lock() {
   names="$(grep -E '^name = "' <<<"$1" | sed -E 's/^name = "([^"]*)".*$/\1/' || true)"
   hits="$(grep -E -- "$LOCK_NAME_PATTERN" <<<"$names" || true)"
   if [ -n "$hits" ]; then
-    echo "NG: ルート Cargo.lock に Servo / mozjs 系パッケージが含まれています" >&2
+    echo "NG: root Cargo.lock contains Servo / mozjs packages" >&2
     printf '%s\n' "$hits" >&2
     return 1
   fi
-  echo "OK: ルート Cargo.lock に Servo / mozjs 系パッケージは含まれていません"
+  echo "OK: root Cargo.lock contains no Servo / mozjs packages"
 }
 
 self_test() {
   local failures=0
   expect_fail() { # <説明> <関数> <入力>
     if "$2" "$3" >/dev/null 2>&1; then
-      echo "NG(self-test): $1 を検出できませんでした" >&2
+      echo "NG(self-test): failed to detect: $1" >&2
       failures=$((failures + 1))
     else
-      echo "OK(self-test): $1 を検出しました"
+      echo "OK(self-test): detected: $1"
     fi
   }
   expect_pass() {
     if ! "$2" "$3" >/dev/null 2>&1; then
-      echo "NG(self-test): $1 を誤検出しました" >&2
+      echo "NG(self-test): false positive: $1" >&2
       failures=$((failures + 1))
     else
-      echo "OK(self-test): $1 は誤検出しませんでした"
+      echo "OK(self-test): no false positive: $1"
     fi
   }
-  expect_fail "members への fandhe-browser-servo-host 混入" detect_members $'fandhe-browser-core\nfandhe-browser-servo-host'
-  expect_fail "members への servo-host 混入" detect_members $'servo-host'
-  expect_pass "members の通常構成" detect_members $'fandhe-browser-core\nfandhe-browser-render\nwpt-subset-runner'
-  expect_fail "Cargo.lock の servo" detect_lock $'[[package]]\nname = "servo"\nversion = "0.6.0"\n'
-  expect_fail "Cargo.lock の servo_arc" detect_lock $'[[package]]\nname = "tokio"\n\n[[package]]\nname = "servo_arc"\nversion = "0.4.0"\n'
-  expect_fail "Cargo.lock の servo-url" detect_lock $'name = "servo-url"\n'
-  expect_fail "Cargo.lock の mozjs" detect_lock $'name = "mozjs"\n'
-  expect_fail "Cargo.lock の mozjs_sys" detect_lock $'name = "mozjs_sys"\n'
-  expect_pass "Cargo.lock の無関係クレート" detect_lock $'name = "tokio"\nname = "observo"\nname = "fandhe-browser-render"\nname = "reservoir"\n'
-  expect_pass "空の Cargo.lock" detect_lock $'version = 4\n'
+  expect_fail "fandhe-browser-servo-host in members" detect_members $'fandhe-browser-core\nfandhe-browser-servo-host'
+  expect_fail "servo-host in members" detect_members $'servo-host'
+  expect_pass "regular members" detect_members $'fandhe-browser-core\nfandhe-browser-render\nwpt-subset-runner'
+  expect_fail "servo in Cargo.lock" detect_lock $'[[package]]\nname = "servo"\nversion = "0.6.0"\n'
+  expect_fail "servo_arc in Cargo.lock" detect_lock $'[[package]]\nname = "tokio"\n\n[[package]]\nname = "servo_arc"\nversion = "0.4.0"\n'
+  expect_fail "servo-url in Cargo.lock" detect_lock $'name = "servo-url"\n'
+  expect_fail "mozjs in Cargo.lock" detect_lock $'name = "mozjs"\n'
+  expect_fail "mozjs_sys in Cargo.lock" detect_lock $'name = "mozjs_sys"\n'
+  expect_pass "unrelated crates in Cargo.lock" detect_lock $'name = "tokio"\nname = "observo"\nname = "fandhe-browser-render"\nname = "reservoir"\n'
+  expect_pass "empty Cargo.lock" detect_lock $'version = 4\n'
   if [ "$failures" -ne 0 ]; then
-    echo "NG: self-test に ${failures} 件の失敗があります" >&2
+    echo "NG: self-test had ${failures} failure(s)" >&2
     return 1
   fi
-  echo "OK: self-test はすべて成功しました"
+  echo "OK: all self-test cases passed"
 }
 
 if [ "${1:-}" = "--self-test" ]; then
@@ -91,17 +91,17 @@ if [ "${1:-}" = "--self-test" ]; then
 fi
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required by $(basename "$0")" >&2; exit 2; }
-[ -f Cargo.lock ] || { echo "NG: ルート Cargo.lock が見つかりません" >&2; exit 1; }
+[ -f Cargo.lock ] || { echo "NG: root Cargo.lock not found" >&2; exit 1; }
 
 meta="$(cargo metadata --no-deps --format-version 1)" || {
-  echo "NG: cargo metadata に失敗しました" >&2
+  echo "NG: cargo metadata failed" >&2
   exit 1
 }
 members="$(jq -r '. as $m | $m.packages[] | select(.id as $id | $m.workspace_members | index($id)) | .name' <<<"$meta" | tr -d '\r')" || {
-  echo "NG: cargo metadata の解析に失敗しました" >&2
+  echo "NG: failed to parse cargo metadata output" >&2
   exit 1
 }
-[ -n "$members" ] || { echo "NG: workspace members を取得できませんでした" >&2; exit 1; }
+[ -n "$members" ] || { echo "NG: could not read workspace members" >&2; exit 1; }
 # manifest のパスでも検査する（package 名を変えても servo-host/ 配下なら検出する）。
 paths="$(jq -r '. as $m | $m.packages[] | select(.id as $id | $m.workspace_members | index($id)) | .manifest_path' <<<"$meta" | tr -d '\r')"
 # Windows の jq は CRLF で出力することがあるため CR を落とす（scripts/ci-prune-target.sh と同じ理由）。
@@ -109,7 +109,7 @@ paths="$(jq -r '. as $m | $m.packages[] | select(.id as $id | $m.workspace_membe
 STATUS=0
 detect_members "$members" || STATUS=1
 if grep -Eq '(^|[/\\])servo-host[/\\]' <<<"$paths"; then
-  echo "NG: servo-host/ 配下の manifest が workspace members に含まれています" >&2
+  echo "NG: a manifest under servo-host/ is a workspace member" >&2
   STATUS=1
 fi
 detect_lock "$(cat Cargo.lock)" || STATUS=1
