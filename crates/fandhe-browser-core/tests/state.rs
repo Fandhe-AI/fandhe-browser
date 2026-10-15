@@ -41,8 +41,8 @@ fn js4_navigation_scope_is_unique_per_state_and_stable() {
 #[cfg(unix)]
 mod app_state {
     use fandhe_browser_core::render::{
-        BoundingBox, ElementRef, ElementVisibility, RenderError, Renderer, Screenshot,
-        ScreenshotOptions,
+        BoundingBox, ElementRef, ElementVisibility, PageLoad, PageRef, RenderError, Renderer,
+        Screenshot, ScreenshotOptions,
     };
     use fandhe_browser_core::{
         AppState, Config, NavigationResult, PageScriptExecutor, PageScriptHandle,
@@ -87,6 +87,62 @@ mod app_state {
         fn bounding_box(&self, _: &ElementRef) -> Result<BoundingBox, RenderError> {
             Ok(BoundingBox::new(1.0, 2.0, 3.0, 4.0))
         }
+    }
+
+    /// `load` の呼び出し回数を数える fake（`RENDER-3`・TASK-38）。
+    struct LoadCountingRenderer(Arc<AtomicUsize>);
+
+    impl Renderer for LoadCountingRenderer {
+        fn load(&self, page: &PageRef) -> Result<PageLoad, RenderError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(PageLoad::new(page.url()))
+        }
+        fn capture_screenshot(&self, _: &ScreenshotOptions) -> Result<Screenshot, RenderError> {
+            Err(RenderError::RenderingDisabled)
+        }
+        fn element_visibility(&self, _: &ElementRef) -> Result<ElementVisibility, RenderError> {
+            Err(RenderError::RenderingDisabled)
+        }
+        fn bounding_box(&self, _: &ElementRef) -> Result<BoundingBox, RenderError> {
+            Ok(BoundingBox::new(1.0, 2.0, 3.0, 4.0))
+        }
+    }
+
+    #[test]
+    fn render3_app_state_loads_only_when_generation_changes() {
+        let dir = TempDir::new();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let state = AppState::new(open(&dir), Arc::new(LoadCountingRenderer(loads.clone())));
+        let el = ElementRef::Selector("p".into());
+
+        // ページが無い間は load も描画も行わない。
+        assert!(matches!(
+            state.bounding_box(&el),
+            Err(RenderError::PageNotLoaded)
+        ));
+        assert_eq!(loads.load(Ordering::SeqCst), 0);
+
+        let g = state.navigation().begin_navigation().unwrap();
+        state
+            .navigation()
+            .commit_navigation(g, NavigationResult::new("https://a.example/", "<p>a</p>"))
+            .unwrap();
+        let bb = BoundingBox::new(1.0, 2.0, 3.0, 4.0);
+        assert_eq!(state.bounding_box(&el).unwrap(), bb);
+        assert_eq!(state.bounding_box(&el).unwrap(), bb);
+        assert!(matches!(
+            state.capture_screenshot(&ScreenshotOptions::new()),
+            Err(RenderError::RenderingDisabled)
+        ));
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        let g = state.navigation().begin_navigation().unwrap();
+        state
+            .navigation()
+            .commit_navigation(g, NavigationResult::new("https://b.example/", "<p>b</p>"))
+            .unwrap();
+        assert_eq!(state.bounding_box(&el).unwrap(), bb);
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
     }
 
     fn open(dir: &TempDir) -> Arc<Profile> {
