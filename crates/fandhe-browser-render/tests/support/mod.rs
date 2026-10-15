@@ -9,16 +9,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use fandhe_browser_core::render::{ElementRef, RenderError};
 use fandhe_browser_render::codec::{
     MAX_REQUEST_FRAME_BYTES, MAX_SCREENSHOT_RESPONSE_FRAME_BYTES, parse_json, read_frame,
     write_frame,
 };
 use fandhe_browser_render::host_process::{
-    HOST_ARGS, HostProcess, HostProcessConfig, HostTimeouts, resolve_host_binary,
+    HOST_ARGS, HostProcessConfig, HostTimeouts, resolve_host_binary,
 };
-use fandhe_browser_render::host_renderer::{HostRenderer, HostRendererConfig};
-use fandhe_browser_render::protocol::{LoadParams, Request, ScreenshotParams};
 use serde_json::{Value, json};
 
 const HELLO_OK: &str = include_str!("../fixtures/protocol/hello-ok.json");
@@ -270,9 +267,6 @@ impl Root {
         std::fs::write(p.join("scenario"), scenario).expect("scenario");
         Self(p)
     }
-    pub fn host(&self, timeouts: HostTimeouts) -> HostProcess {
-        HostProcess::new(self.config(timeouts))
-    }
     pub fn config(&self, timeouts: HostTimeouts) -> HostProcessConfig {
         let exe = std::env::current_exe().expect("exe");
         let copy = exe;
@@ -303,14 +297,6 @@ pub fn short_timeouts() -> HostTimeouts {
         .with_shutdown_grace(Duration::from_millis(300))
 }
 
-pub fn page() -> LoadParams {
-    LoadParams::new("https://example.com/", None).expect("page")
-}
-
-pub fn shot() -> Request {
-    Request::Screenshot(ScreenshotParams::new(false))
-}
-
 pub fn child_pid(root: &Root, n: usize) -> u32 {
     std::fs::read_to_string(root.0.join(format!("pid-{n}")))
         .expect("pid file")
@@ -327,30 +313,6 @@ pub fn assert_gone(pid: u32) {
         );
     }
 }
-pub fn renderer(root: &Root, timeouts: HostTimeouts, allow_private: bool) -> HostRenderer {
-    HostRenderer::new(
-        HostRendererConfig::new(root.config(timeouts))
-            .with_allow_private_network_access(allow_private),
-    )
-}
-
-pub fn sel(s: &str) -> ElementRef {
-    ElementRef::Selector(s.to_owned())
-}
-
-pub fn variant(e: &RenderError) -> &'static str {
-    match e {
-        RenderError::RenderingDisabled => "RenderingDisabled",
-        RenderError::ElementNotFound => "ElementNotFound",
-        RenderError::Timeout => "Timeout",
-        RenderError::HostUnavailable => "HostUnavailable",
-        RenderError::ProtocolMismatch => "ProtocolMismatch",
-        RenderError::PageNotLoaded => "PageNotLoaded",
-        RenderError::Internal(_) => "Internal",
-        _ => "Other",
-    }
-}
-
 /// 偽ホストとして再実行された場合は `fake_host` で終了しない。通常実行なら何もしない。
 pub fn maybe_run_fake_host() {
     let args: Vec<String> = std::env::args().skip(1).collect();

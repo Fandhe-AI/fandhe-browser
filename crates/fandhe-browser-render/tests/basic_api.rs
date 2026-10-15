@@ -7,14 +7,40 @@
 //! 試験は #998（TASK-38.8b）。HostProcess 層の試験は `host_process.rs`。
 //! 外部入力の経路ではないため `unwrap` / `expect` / `panic!` を使う。
 
-#[allow(dead_code)]
 mod support;
 
 use std::time::{Duration, Instant};
 
-use fandhe_browser_core::render::{ImageFormat, PageRef, Renderer, ScreenshotOptions};
-use fandhe_browser_render::host_renderer::HostRenderer;
+use fandhe_browser_core::render::{
+    ElementRef, ImageFormat, PageRef, RenderError, Renderer, ScreenshotOptions,
+};
+use fandhe_browser_render::host_process::HostTimeouts;
+use fandhe_browser_render::host_renderer::{HostRenderer, HostRendererConfig};
 use support::*;
+
+pub fn renderer(root: &Root, timeouts: HostTimeouts, allow_private: bool) -> HostRenderer {
+    HostRenderer::new(
+        HostRendererConfig::new(root.config(timeouts))
+            .with_allow_private_network_access(allow_private),
+    )
+}
+
+pub fn sel(s: &str) -> ElementRef {
+    ElementRef::Selector(s.to_owned())
+}
+
+pub fn variant(e: &RenderError) -> &'static str {
+    match e {
+        RenderError::RenderingDisabled => "RenderingDisabled",
+        RenderError::ElementNotFound => "ElementNotFound",
+        RenderError::Timeout => "Timeout",
+        RenderError::HostUnavailable => "HostUnavailable",
+        RenderError::ProtocolMismatch => "ProtocolMismatch",
+        RenderError::PageNotLoaded => "PageNotLoaded",
+        RenderError::Internal(_) => "Internal",
+        _ => "Other",
+    }
+}
 
 fn t_renderer_roundtrip() {
     let root = Root::new("r-ok", "ok");

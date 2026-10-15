@@ -6,7 +6,6 @@
 //! 待ち時間は短縮値で検証し、実秒（10 s・30 s）は待たない。既定値の assert は単体テスト側。
 //! 外部入力の経路ではないため `unwrap` / `expect` / `panic!` を使う。
 
-#[allow(dead_code)]
 mod support;
 
 #[cfg(unix)]
@@ -15,12 +14,34 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use fandhe_browser_render::host_process::{FORCED_ENV_NAMES, PASSTHROUGH_ENV_NAMES};
-use fandhe_browser_render::host_process::{HOST_ARGS, HostProcess, HostProcessError, TimeoutPhase};
+use fandhe_browser_render::host_process::{
+    HOST_ARGS, HostProcess, HostProcessError, HostTimeouts, TimeoutPhase,
+};
 use fandhe_browser_render::protocol::{
-    BoundingBoxParams, MethodResult, ProtocolError, Request, VisibilityParams,
+    BoundingBoxParams, LoadParams, MethodResult, ProtocolError, Request, ScreenshotParams,
+    VisibilityParams,
 };
 use serde_json::Value;
 use support::*;
+
+/// `Root` から `HostProcess` を組み立てる（HostProcess 層専用のため `support` には置かない）。
+trait RootHost {
+    fn host(&self, timeouts: HostTimeouts) -> HostProcess;
+}
+
+impl RootHost for Root {
+    fn host(&self, timeouts: HostTimeouts) -> HostProcess {
+        HostProcess::new(self.config(timeouts))
+    }
+}
+
+pub fn page() -> LoadParams {
+    LoadParams::new("https://example.com/", None).expect("page")
+}
+
+pub fn shot() -> Request {
+    Request::Screenshot(ScreenshotParams::new(false))
+}
 
 fn t_ok_roundtrip() {
     let root = Root::new("ok", "ok");
