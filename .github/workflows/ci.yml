@@ -87,6 +87,7 @@ jobs:
     outputs:
       rust: ${{ steps.detect.outputs.rust }}
       harness: ${{ steps.detect.outputs.harness }}
+      servo: ${{ steps.detect.outputs.servo }}
     defaults:
       run:
         shell: bash
@@ -108,35 +109,37 @@ jobs:
           emit() {
             echo "rust=$1" >> "$GITHUB_OUTPUT"
             echo "harness=$2" >> "$GITHUB_OUTPUT"
-            echo "changes: rust=$1 harness=$2 ($3)"
+            echo "servo=$3" >> "$GITHUB_OUTPUT"
+            echo "changes: rust=$1 harness=$2 servo=$3 ($4)"
           }
           if [ "$EVENT_NAME" != "pull_request" ]; then
-            emit true true "event=$EVENT_NAME"
+            emit true true true "event=$EVENT_NAME"
             exit 0
           fi
           if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
-            emit true true "base/head SHA unavailable"
+            emit true true true "base/head SHA unavailable"
             exit 0
           fi
           if ! files="$(git -c core.quotepath=false diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA")"; then
             echo "::warning::git diff failed; running all jobs (fail-closed)"
-            emit true true "git diff failed"
+            emit true true true "git diff failed"
             exit 0
           fi
           echo "changed files:"
           printf '%s\n' "$files"
           if ! result="$(printf '%s\n' "$files" | bash scripts/ci-changes.sh)"; then
             echo "::warning::scripts/ci-changes.sh failed; running all jobs (fail-closed)"
-            emit true true "classifier failed"
+            emit true true true "classifier failed"
             exit 0
           fi
-          # 出力は厳密な 2 行形式のみ受理する。欠落・想定外の値は下流ジョブが
+          # 出力は厳密な 3 行形式のみ受理する。欠落・想定外の値は下流ジョブが
           # skipped（= 成功扱い）になる fail-open を招くため全実行へ倒す
           if [ "$(printf '%s\n' "$result" | grep -cxE 'rust=(true|false)')" -ne 1 ] \
             || [ "$(printf '%s\n' "$result" | grep -cxE 'harness=(true|false)')" -ne 1 ] \
-            || [ "$(printf '%s\n' "$result" | wc -l | tr -d ' ')" -ne 2 ]; then
+            || [ "$(printf '%s\n' "$result" | grep -cxE 'servo=(true|false)')" -ne 1 ] \
+            || [ "$(printf '%s\n' "$result" | wc -l | tr -d ' ')" -ne 3 ]; then
             echo "::warning::unexpected classifier output; running all jobs (fail-closed)"
-            emit true true "unexpected output"
+            emit true true true "unexpected output"
             exit 0
           fi
           printf '%s\n' "$result" >> "$GITHUB_OUTPUT"
