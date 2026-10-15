@@ -1,0 +1,13 @@
+{
+  "case": "error-load-failed",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 22,
+    "error": {
+      "kind": "load_failed",
+      "message": "Navigation failed."
+    }
+  }
+}

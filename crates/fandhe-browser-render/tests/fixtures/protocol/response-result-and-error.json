@@ -1,0 +1,19 @@
+{
+  "case": "result-and-error",
+  "direction": "response",
+  "method": "load",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 60,
+    "result": {
+      "final_url": "https://example.com/",
+      "status": 200
+    },
+    "error": {
+      "kind": "internal",
+      "message": "Internal host error."
+    }
+  },
+  "note": "result and error must not coexist."
+}

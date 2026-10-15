@@ -1,0 +1,13 @@
+{
+  "case": "error-not-found",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 20,
+    "error": {
+      "kind": "not_found",
+      "message": "No element matches the selector."
+    }
+  }
+}

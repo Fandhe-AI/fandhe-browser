@@ -1,0 +1,11 @@
+{
+  "case": "shutdown-ok",
+  "direction": "response",
+  "method": "shutdown",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 8,
+    "result": {}
+  }
+}

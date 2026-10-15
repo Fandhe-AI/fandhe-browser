@@ -1,0 +1,20 @@
+{
+  "case": "load-missing-url",
+  "direction": "request",
+  "method": "load",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 56,
+    "method": "load",
+    "params": {}
+  },
+  "expected_response": {
+    "v": 1,
+    "id": 56,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  }
+}

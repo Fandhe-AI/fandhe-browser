@@ -1,0 +1,7 @@
+{
+  "case": "truncated-json",
+  "direction": "request",
+  "expect": "invalid",
+  "raw": "{\"v\":1,",
+  "note": "Not parseable as JSON. The host sends no response and treats it as a protocol violation."
+}

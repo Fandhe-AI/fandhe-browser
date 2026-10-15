@@ -1,0 +1,22 @@
+{
+  "case": "unknown-method",
+  "direction": "request",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 10,
+    "method": "evaluate",
+    "params": {
+      "script": "1"
+    }
+  },
+  "expected_response": {
+    "v": 1,
+    "id": 10,
+    "error": {
+      "kind": "unsupported",
+      "message": "Method is not supported."
+    }
+  },
+  "note": "Unknown methods are valid envelopes; the host answers unsupported and never pretends success (SEC-2)."
+}

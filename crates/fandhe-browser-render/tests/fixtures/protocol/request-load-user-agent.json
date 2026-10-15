@@ -1,0 +1,24 @@
+{
+  "case": "load-user-agent",
+  "direction": "request",
+  "method": "load",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 42,
+    "method": "load",
+    "params": {
+      "url": "https://example.com/",
+      "user_agent": "x"
+    }
+  },
+  "expected_response": {
+    "v": 1,
+    "id": 42,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  },
+  "note": "Identity-surface parameters do not exist in the protocol (SEC-2)."
+}

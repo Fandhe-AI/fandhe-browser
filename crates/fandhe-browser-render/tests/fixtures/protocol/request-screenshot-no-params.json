@@ -1,0 +1,11 @@
+{
+  "case": "screenshot-no-params",
+  "direction": "request",
+  "method": "screenshot",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 5,
+    "method": "screenshot"
+  }
+}

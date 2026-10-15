@@ -1,0 +1,21 @@
+{
+  "case": "missing-v",
+  "direction": "request",
+  "method": "load",
+  "expect": "invalid",
+  "message": {
+    "id": 50,
+    "method": "load",
+    "params": {
+      "url": "https://example.com/"
+    }
+  },
+  "expected_response": {
+    "v": 1,
+    "id": 50,
+    "error": {
+      "kind": "invalid_request",
+      "message": "Invalid request."
+    }
+  }
+}

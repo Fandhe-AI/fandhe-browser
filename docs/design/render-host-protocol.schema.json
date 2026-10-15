@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Fandhe-AI/fandhe-browser/blob/main/docs/design/render-host-protocol.schema.json",
+  "title": "fandhe-browser render host protocol (v1)",
+  "description": "本体（fandhe-browser-render の IPC クライアント）と Servo ホスト（別 workspace の servo-host/）の間の stdio プロトコル契約（TASK-38・PLUG-1・SEC-2・REPAIR-4。設計は docs/design/servo-host-design.md §2.1〜§2.5・§3.1）。両側は型を共有しないため、本スキーマと crates/fandhe-browser-render/tests/fixtures/protocol/ のゴールデン fixture を契約の正本とし、型・コーデックは各側（#989・#993）で実装する。トランスポートは stdio のみ（ポートを開かない）で、フレームは u32 LE の長さ接頭辞 + UTF-8 JSON。ホストは起動直後に HelloEvent（{\"v\":1,\"event\":\"hello\",\"data\":{...}}。id を持たず応答と区別できる）を 1 回送る。要求は Request、応答は Response（result か error のどちらか一方）。暫定上限（実測後に確定。設計 §2.4）: 要求フレーム 64 KiB、応答フレーム 1 MiB、hello フレーム 16 KiB、スクリーンショット応答フレーム 24 MiB、url 2048 B、selector 1024 B、エラーメッセージ 512 B。上限は確保前に検証する（実装側の契約）。maxLength は文字数であり、UTF-8 バイト数の上限は実装が強制する。未知フィールドの方針（REPAIR-4）: 応答側（Response・result・error・Hello・HelloLimits）は additionalProperties: true で、クライアントは未知フィールドを無視する。要求側（Request・各 *Params）は additionalProperties: false で、ホストは invalid_request / invalid_params で拒否する（fail-closed）。識別面（SEC-2）: どの *Params にも UA・ヘッダ・Cookie・locale・タイムゾーン・TLS・proxy・ビューポート・画面サイズのパラメータを置かない。未実装メソッドは成功を装わず unsupported を返す。ホストからの応答も untrusted として、クライアントがスキーマ相当の検証をする。url の scheme は http / https のみで、file:・data:・javascript:・about:・userinfo 付きは invalid_params で拒否する（実装側の二重検証。設計 §2.5）。Servo 内部のリダイレクト・サブリソースの制限は #1003 に委ねる。",
+  "$defs": {
+    "Version": {
+      "description": "プロトコル版。v1 は 1 固定。",
+      "const": 1
+    },
+    "RequestId": {
+      "description": "要求と応答の対応付け。f64 で数値を扱う JSON 実装との相互運用のため 2^53-1 以下に限る。",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "Request": {
+      "description": "要求エンベロープ。method は未知の値もスキーマ上は有効で、ホストが unsupported を返す。params の中身は <Method>Params で検証する（shutdown では省略できる）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "id", "method"],
+      "properties": {
+        "v": { "$ref": "#/$defs/Version" },
+        "id": { "$ref": "#/$defs/RequestId" },
+        "method": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "params": { "type": "object" }
+      }
+    },
+    "Response": {
+      "description": "応答エンベロープ。result と error はどちらか一方だけを持つ。未知フィールドはクライアントが無視する（REPAIR-4）。",
+      "oneOf": [
+        { "$ref": "#/$defs/ResultResponse" },
+        { "$ref": "#/$defs/ErrorResponse" }
+      ]
+    },
+    "ResultResponse": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["v", "id", "result"],
+      "properties": {
+        "v": { "$ref": "#/$defs/Version" },
+        "id": { "$ref": "#/$defs/RequestId" },
+        "result": { "type": "object" }
+      }
+    },
+    "ErrorResponse": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["v", "id", "error"],
+      "properties": {
+        "v": { "$ref": "#/$defs/Version" },
+        "id": { "$ref": "#/$defs/RequestId" },
+        "error": { "$ref": "#/$defs/Error" }
+      }
+    },
+    "Error": {
+      "description": "エラー。kind は v1 のホストが返す値の集合で、クライアントは未知の kind を汎用エラーにマップする。message は入力値（URL のクエリ等）・機密を含まない固定の英語で、512 文字以下。",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["kind", "message"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "unsupported",
+            "invalid_request",
+            "invalid_params",
+            "not_loaded",
+            "not_found",
+            "timeout",
+            "load_failed",
+            "internal"
+          ]
+        },
+        "message": { "type": "string", "maxLength": 512 }
+      }
+    },
+    "HelloEvent": {
+      "description": "ホストが起動直後に 1 回送るイベント。id を持たない。",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["v", "event", "data"],
+      "properties": {
+        "v": { "$ref": "#/$defs/Version" },
+        "event": { "const": "hello" },
+        "data": { "$ref": "#/$defs/Hello" }
+      }
+    },
+    "Hello": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["host_version", "servo_version", "protocol", "capabilities", "limits"],
+      "properties": {
+        "host_version": { "type": "string", "maxLength": 64 },
+        "servo_version": { "type": "string", "maxLength": 64 },
+        "protocol": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["min", "max"],
+          "properties": {
+            "min": { "type": "integer", "minimum": 1 },
+            "max": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "capabilities": {
+          "description": "ホストが実装しているメソッド名。",
+          "type": "array",
+          "maxItems": 32,
+          "items": { "type": "string", "maxLength": 64 }
+        },
+        "limits": { "$ref": "#/$defs/HelloLimits" }
+      }
+    },
+    "HelloLimits": {
+      "description": "ホストが申告する上限とタイムアウト。default は暫定値で、実測後に確定する（設計 §2.4）。",
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "request_frame_bytes",
+        "response_frame_bytes",
+        "hello_frame_bytes",
+        "screenshot_frame_bytes",
+        "url_bytes",
+        "selector_bytes",
+        "error_message_bytes"
+      ],
+      "properties": {
+        "request_frame_bytes": { "type": "integer", "minimum": 1, "default": 65536 },
+        "response_frame_bytes": { "type": "integer", "minimum": 1, "default": 1048576 },
+        "hello_frame_bytes": { "type": "integer", "minimum": 1, "default": 16384 },
+        "screenshot_frame_bytes": { "type": "integer", "minimum": 1, "default": 25165824 },
+        "url_bytes": { "type": "integer", "minimum": 1, "default": 2048 },
+        "selector_bytes": { "type": "integer", "minimum": 1, "default": 1024 },
+        "error_message_bytes": { "type": "integer", "minimum": 1, "default": 512 },
+        "max_in_flight": { "type": "integer", "minimum": 1, "default": 1 },
+        "handshake_timeout_ms": { "type": "integer", "minimum": 1, "default": 10000 },
+        "load_timeout_default_ms": { "type": "integer", "minimum": 1, "default": 30000 },
+        "load_timeout_max_ms": { "type": "integer", "minimum": 1, "default": 60000 },
+        "screenshot_timeout_ms": { "type": "integer", "minimum": 1, "default": 20000 },
+        "query_timeout_ms": { "type": "integer", "minimum": 1, "default": 5000 },
+        "shutdown_grace_ms": { "type": "integer", "minimum": 1, "default": 3000 }
+      }
+    },
+    "LoadParams": {
+      "description": "ページ読み込み。url は http / https のみ。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url"],
+      "properties": {
+        "url": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 60000, "default": 30000 }
+      }
+    },
+    "LoadResult": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["final_url", "status"],
+      "properties": {
+        "final_url": { "type": "string", "maxLength": 2048 },
+        "status": { "type": "integer", "minimum": 100, "maximum": 599 }
+      }
+    },
+    "ScreenshotParams": {
+      "description": "スクリーンショット。ビューポートは v1 では固定（例 1280x800）で API にしない（SEC-2）。",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "full_page": { "type": "boolean", "default": false }
+      }
+    },
+    "ScreenshotResult": {
+      "description": "バイナリは base64 inline で返し、一時ファイルのパスは返さない。",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["format", "width", "height", "data_base64"],
+      "properties": {
+        "format": { "const": "png" },
+        "width": { "type": "integer", "minimum": 1, "maximum": 16384 },
+        "height": { "type": "integer", "minimum": 1, "maximum": 16384 },
+        "data_base64": { "type": "string", "maxLength": 25165824 }
+      }
+    },
+    "VisibilityParams": {
+      "description": "セレクタは上限付きの文字列で、JS 評価文字列へ連結しない（設計 §2.5）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selector"],
+      "properties": {
+        "selector": { "type": "string", "minLength": 1, "maxLength": 1024 }
+      }
+    },
+    "VisibilityResult": {
+      "description": "一致する要素が無いときは not_found エラー。reason の既知の値は display_none・visibility_hidden・zero_size・offscreen 等。",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["visible"],
+      "properties": {
+        "visible": { "type": "boolean" },
+        "reason": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "BoundingBoxParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selector"],
+      "properties": {
+        "selector": { "type": "string", "minLength": 1, "maxLength": 1024 }
+      }
+    },
+    "BoundingBoxResult": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["x", "y", "width", "height"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "width": { "type": "number", "minimum": 0 },
+        "height": { "type": "number", "minimum": 0 }
+      }
+    },
+    "ShutdownParams": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "ShutdownResult": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

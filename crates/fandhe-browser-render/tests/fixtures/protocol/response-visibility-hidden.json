@@ -1,0 +1,14 @@
+{
+  "case": "visibility-hidden",
+  "direction": "response",
+  "method": "visibility",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 6,
+    "result": {
+      "visible": false,
+      "reason": "display_none"
+    }
+  }
+}

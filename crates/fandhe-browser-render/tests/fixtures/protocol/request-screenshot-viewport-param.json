@@ -1,0 +1,23 @@
+{
+  "case": "screenshot-viewport-param",
+  "direction": "request",
+  "method": "screenshot",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 43,
+    "method": "screenshot",
+    "params": {
+      "width": 800
+    }
+  },
+  "expected_response": {
+    "v": 1,
+    "id": 43,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  },
+  "note": "Viewport size is not an API (SEC-2)."
+}

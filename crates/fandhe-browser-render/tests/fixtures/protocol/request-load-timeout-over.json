@@ -1,0 +1,23 @@
+{
+  "case": "load-timeout-over",
+  "direction": "request",
+  "method": "load",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 54,
+    "method": "load",
+    "params": {
+      "url": "https://example.com/",
+      "timeout_ms": 60001
+    }
+  },
+  "expected_response": {
+    "v": 1,
+    "id": 54,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  }
+}

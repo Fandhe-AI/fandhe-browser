@@ -1,0 +1,15 @@
+{
+  "case": "load-ok",
+  "direction": "request",
+  "method": "load",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "method": "load",
+    "params": {
+      "url": "https://example.com/",
+      "timeout_ms": 10000
+    }
+  }
+}

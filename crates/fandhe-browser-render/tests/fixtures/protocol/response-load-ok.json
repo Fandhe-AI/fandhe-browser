@@ -1,0 +1,14 @@
+{
+  "case": "load-ok",
+  "direction": "response",
+  "method": "load",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "result": {
+      "final_url": "https://example.com/",
+      "status": 200
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "case": "error-unsupported",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 27,
+    "error": {
+      "kind": "unsupported",
+      "message": "Method is not supported."
+    }
+  }
+}

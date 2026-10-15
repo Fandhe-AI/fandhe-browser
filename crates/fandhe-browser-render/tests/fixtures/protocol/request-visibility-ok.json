@@ -1,0 +1,14 @@
+{
+  "case": "visibility-ok",
+  "direction": "request",
+  "method": "visibility",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 6,
+    "method": "visibility",
+    "params": {
+      "selector": "#main"
+    }
+  }
+}
