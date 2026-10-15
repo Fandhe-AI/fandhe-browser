@@ -1,7 +1,6 @@
 {
   "case": "error-and-bad-result",
   "direction": "response",
-  "method": "load",
   "expect": "invalid",
   "message": {
     "v": 1,
@@ -12,5 +11,5 @@
       "message": "Internal host error."
     }
   },
-  "note": "A valid error with a malformed result must not pass."
+  "note": "Envelope only (no method, so no LoadResult check): a valid error with a malformed result must not pass via ErrorResponse; only the not rule can reject this."
 }
