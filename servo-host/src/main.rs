@@ -10,7 +10,7 @@
 //!   ネットワークへは出ない。呼び出し元は開発者と CI のみ。
 //! - `--stdio`: 本体 render crate から起動される stdio サーバー（#993。`server`）。`load`（#231）と
 //!   `screenshot`（PNG の base64 inline。#232）・`visibility`（JS 評価。#233。`layout`）は
-//!   `page::ServoHandler` で実装済み。bounding_box は未実装で `unsupported` を返す（成功を装わない。REPAIR-3）。
+//!   `page::ServoHandler` で実装済み。`bounding_box`（JS 評価。#234）も同じ `layout` 経由で実装済み。
 //! - それ以外: 標準エラーに示し、非ゼロで終了する（固定の許可リスト。SEC-2）。
 //!
 //! Servo と描画コンテキストの生成・破棄は `engine` が担う（RENDER-3・#230）。
@@ -19,9 +19,7 @@
 //!
 //! PNG エンコードと base64 化は Servo 非依存の `screenshot` が担う（RENDER-3・#232）。
 //!
-//! 可視性判定のスクリプト生成と結果解釈は Servo 非依存の `layout` が担う（RENDER-3・#233）。
-//!
-//! 将来仕様: 境界ボックス（RENDER-4。#234）を `page::ServoHandler` に実装する。
+//! 可視性判定・境界ボックス取得のスクリプト生成と結果解釈は Servo 非依存の `layout` が担う（RENDER-3・#233・#234）。
 
 mod engine;
 mod layout;

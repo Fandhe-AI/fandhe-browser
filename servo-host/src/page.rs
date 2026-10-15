@@ -6,7 +6,7 @@
 //! （低レベルの [`navigate`]）。スクリーンショット（TASK-38.3・#232）はこの層が保持する現在ページの
 //! 上で `WebView::take_screenshot` を期限付きで待ち、PNG 化は `screenshot` モジュールに任せる。
 //! 可視性（TASK-38.4・#233）は同じ上で `WebView::evaluate_javascript` を期限付きで待ち、
-//! スクリプト生成と結果解釈は `layout` に任せる。境界ボックスは #234 が載る。
+//! スクリプト生成と結果解釈は `layout` に任せる。境界ボックスも同じ経路で取得する（#234）。
 //!
 //! 待機の方針（PoC-13 の失敗の再発防止）: 条件は「`LoadStatus::Complete` かつ受信フレーム数が 1 以上」。
 //! Complete より前に届いたフレームも数え、「Complete より後の新しいフレーム」は要求しない
@@ -323,7 +323,12 @@ impl ServoHandler {
 
 impl Handler for ServoHandler {
     fn capabilities(&self) -> &'static [Method] {
-        &[Method::Load, Method::Screenshot, Method::Visibility]
+        &[
+            Method::Load,
+            Method::Screenshot,
+            Method::Visibility,
+            Method::BoundingBox,
+        ]
     }
 
     fn load(&mut self, p: &LoadParams) -> Result<LoadResult, HandlerError> {
@@ -365,26 +370,39 @@ impl Handler for ServoHandler {
     /// セレクタの検証を最初に行うため、未ロードでも不正なセレクタは `invalid_params`。
     fn visibility(&mut self, p: &SelectorParams) -> Result<VisibilityResult, HandlerError> {
         let script = layout::visibility_script(&p.selector).map_err(|e| HandlerError(e.kind()))?;
+        let value = self.run_query(script)?;
+        layout::parse_visibility(value).map_err(|e| HandlerError(e.kind()))
+    }
+
+    /// 現在ページで `selector` の最初の一致要素の境界ボックスを返す（`RENDER-3`・TASK-38.5・#234）。
+    ///
+    /// 座標はビューポート相対の CSS px。描画されない要素は (0,0,0,0)（`layout` の `//!` 参照）。
+    /// セレクタの検証を最初に行うため、未ロードでも不正なセレクタは `invalid_params`。
+    fn bounding_box(&mut self, p: &SelectorParams) -> Result<BoundingBoxResult, HandlerError> {
+        let script =
+            layout::bounding_box_script(&p.selector).map_err(|e| HandlerError(e.kind()))?;
+        let value = self.run_query(script)?;
+        layout::parse_bounding_box(value).map_err(|e| HandlerError(e.kind()))
+    }
+}
+
+impl ServoHandler {
+    /// 要素クエリ用スクリプトを現在ページで 5 秒の期限付きで評価する（visibility・bounding_box 共通）。
+    fn run_query(&mut self, script: String) -> Result<servo::JSValue, HandlerError> {
         let (Some(page), Some(engine)) = (self.page.as_ref(), self.engine.as_ref()) else {
             return Err(HandlerError(ErrorKind::NotLoaded));
         };
         let deadline = Instant::now() + layout::QUERY_TIMEOUT;
-        let value = match page.evaluate(engine, script, deadline) {
-            Ok(v) => v,
+        match page.evaluate(engine, script, deadline) {
+            Ok(v) => Ok(v),
             Err(e) => {
                 // クラッシュ・文書消失したページは保持しない（以後は not_loaded になる）。
                 if matches!(e, PageError::Crashed | PageError::DocumentGone) {
                     self.page = None;
                 }
-                return Err(HandlerError(e.kind()));
+                Err(HandlerError(e.kind()))
             }
-        };
-        layout::parse_visibility(value).map_err(|e| HandlerError(e.kind()))
-    }
-
-    // 以下は #234 で置き換える。成功を装わない（REPAIR-3）。
-    fn bounding_box(&mut self, _p: &SelectorParams) -> Result<BoundingBoxResult, HandlerError> {
-        Err(HandlerError(ErrorKind::Unsupported))
+        }
     }
 }
 
@@ -462,10 +480,15 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_list_load_screenshot_and_visibility() {
+    fn capabilities_list_all_implemented_methods() {
         assert_eq!(
             ServoHandler::new().capabilities(),
-            &[Method::Load, Method::Screenshot, Method::Visibility]
+            &[
+                Method::Load,
+                Method::Screenshot,
+                Method::Visibility,
+                Method::BoundingBox,
+            ]
         );
     }
 
@@ -479,6 +502,20 @@ mod tests {
         let err = h.visibility(&params("#a")).err().expect("must fail");
         assert_eq!(err.0, ErrorKind::NotLoaded);
         let err = h.visibility(&params("a\u{1}")).err().expect("must fail");
+        assert_eq!(err.0, ErrorKind::InvalidParams);
+        assert!(h.engine.is_none());
+    }
+
+    /// RENDER-3（TASK-38.5・#234）: 未ロードは not_loaded、不正なセレクタは未ロードでも invalid_params。
+    #[test]
+    fn bounding_box_without_page_is_rejected() {
+        let mut h = ServoHandler::new();
+        let params = |s: &str| SelectorParams {
+            selector: s.to_string(),
+        };
+        let err = h.bounding_box(&params("#a")).err().expect("must fail");
+        assert_eq!(err.0, ErrorKind::NotLoaded);
+        let err = h.bounding_box(&params("a\u{1}")).err().expect("must fail");
         assert_eq!(err.0, ErrorKind::InvalidParams);
         assert!(h.engine.is_none());
     }
