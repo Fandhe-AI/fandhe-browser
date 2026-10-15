@@ -5,7 +5,8 @@
 #   servo-host: ホストのみ検査する（それ以外の引数は exit 2）
 # 本体は Cargo.toml・deny.toml・member crate のいずれかが未整備なら skip。ホストは servo-host/Cargo.toml が
 # 無ければ skip、あるのに servo-host/deny.toml が無ければ fail-closed でエラーにする（TASK-38・#991。OSS-2・OSS-3）。
-# CI の rust-lint は cargo deny を直接呼び本スクリプトを通らない（ホストの CI ステップは #995）。
+# CI では rust-lint の servo-host ステップが `scripts/deny.sh servo-host` を呼ぶ（servo=true 時。#995）。
+# 本体側は rust-lint が cargo deny を直接呼び、本スクリプトを通らない。
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./lib.sh

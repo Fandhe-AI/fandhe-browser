@@ -7,12 +7,13 @@ name: CI
 # ジョブ構成（時間と過剰なチェックを減らすための統合版）:
 #   changes                      常時。変更ファイルから rust / harness の実行要否を決める
 #   lint-docs                    常時。markdownlint・yamllint・editorconfig-checker・commitlint
-#   rust-lint                    rust 時。fmt・cargo deny・deny-license-reject（ubuntu のみ）
+#   rust-lint                    rust または servo 時。fmt・cargo deny（本体・Servo ホスト）・deny-license-reject（ubuntu のみ）
 #   rust-test-{ubuntu,macos,windows}      rust 時。clippy + test（3 OS）
 #   rust-features-{ubuntu,macos}          rust 時。feature 構成別の clippy・test
 #   rust-features-windows-{default,engines,boa}  rust 時。Windows の feature 構成別を 3 並列に分割
 #   harness-{ubuntu,macos,windows}        rust または harness 時。分離検証・ハーネス・サイズ検査
 #   windows-servo-prereqs        rust 時。Servo の Windows ビルド前提の検証
+#   servo-host-ubuntu            servo 時（PR でも実行）。Servo ホストの fmt・clippy・test・分離検証・release（main/dispatch のみ）
 #   cross-target-check           rust 時。Linux 上で macOS・Windows 向けに型検査（PR でも実行）
 #
 # 3 OS の実行時機（オーナー判断 2026-10-10。.claude/rules/ci.md「3 OS CI」）:
@@ -39,7 +40,8 @@ name: CI
 #   で exact hit しなかったときだけ。PR は main の cache を読むだけで書かない
 # - key は `rust-<OS>-<種別>-vN-<rustc cachekey>-<hashFiles('Cargo.lock')>`。
 #   lockfile はルートのみ（`**/Cargo.lock` は .agents 配下のサンプルまで拾い、依存不変でも
-#   全 cache が作り直されるため使わない）。rustc を含めるのは stable 更新後に古い target を
+#   全 cache が作り直されるため使わない）。例外は servo-host-ubuntu の種別 `servohost` だけで、
+#   別 workspace の `servo-host/Cargo.lock` を単一ファイルで hash する（ルートの cache と独立）。rustc を含めるのは stable 更新後に古い target を
 #   exact hit で復元し続けないため。restore-keys は同じ rustc の範囲に限る
 # - `-vN` は cache 内容（path・ビルド条件・prune・profile）を変えたら上げる（既存 key に exact hit
 #   すると保存がスキップされ、新しい内容が保存されないため。restore-keys に旧版を残さない）。
@@ -215,9 +217,13 @@ jobs:
   #   のライセンス検査（licensing.md）。cargo-deny の版は scripts/versions.sh の CARGO_DENY_VERSION と同期
   # - check-deny-license-reject（TASK-9.1・#338・REPAIR-8）: GPL/AGPL/LGPL/MPL-2.0・
   #   ライセンス未記載の canary を cargo deny が reject し続けることの negative test
+  # - Servo ホストの cargo deny（TASK-38・#991・#995・OSS-2・OSS-3）: servo=true のときだけ
+  #   `scripts/deny.sh servo-host`（ホスト用 deny.toml。MPL-2.0 の許可はホスト側のみ）を実行する。
+  #   servo-host-ubuntu に置かないのは、新しい check-run を増やさず rust-lint の一部とするため
+  #   （docs/design/servo-host-design.md §6.2）
   rust-lint:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.servo == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -258,6 +264,9 @@ jobs:
       - name: "許可外ライセンスの reject 検証（make check-deny-license-reject）"
         if: ${{ !cancelled() }}
         run: make check-deny-license-reject
+      - name: "cargo deny check（servo-host・servo-host/deny.toml）"
+        if: ${{ !cancelled() && needs.changes.outputs.servo == 'true' }}
+        run: bash scripts/deny.sh servo-host
 
   # --------------------------------------------------
   # rust-test-{ubuntu,macos,windows}（clippy + test。rust 変更時のみ。macOS・Windows は PR では skipped）
@@ -940,12 +949,6 @@ jobs:
       - name: "[render-isolation] 既定ビルドの依存グラフ検査"
         if: ${{ !cancelled() }}
         run: bash scripts/check-render-isolation.sh
-      - name: "[render-isolation] Servo ホスト分離の自己テスト（TASK-38・#985）"
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-servo-host-isolation.sh --self-test
-      - name: "[render-isolation] Servo ホスト分離検査（members・ルート Cargo.lock）"
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-servo-host-isolation.sh
       - name: "[js-engine-isolation] 自己テスト（合成データによる検出の証跡確認）"
         if: ${{ !cancelled() }}
         run: bash scripts/check-js-engine-isolation.sh --self-test
@@ -1064,6 +1067,136 @@ jobs:
             target
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
+  # --------------------------------------------------
+  # servo-host-ubuntu（Servo ホストの fmt・clippy・test・分離検証・release。servo 時。PR でも実行）
+  # --------------------------------------------------
+  # TASK-38（#995・MS-4・RENDER-1）: Servo ホスト（servo-host/。別 workspace・別 Cargo.lock）は
+  # 本体の `cargo fmt/clippy/test --workspace` に入らない（exclude）ため、専用ジョブで検査する。
+  # 設計 docs/design/servo-host-design.md §4.1・§6.2・§6.3 の案 S2（ubuntu の明示ジョブ）。
+  # - 実行条件は servo=true（servo-host/**・crates/fandhe-browser-render/**・scripts/**・.github/** 等。
+  #   判定は scripts/ci-changes.sh）。イベントでは絞らず PR・main・workflow_dispatch で走る
+  # - ホストの cargo deny は新しい check-run を増やさないよう rust-lint のステップに置く
+  # - 分離検証 A〜E は scripts/check-render-isolation.sh（C〜E がホスト側。harness-* の重複ステップは本ジョブへ集約）
+  # - release ビルドは main・workflow_dispatch のみ。成果物は RUNNER_TEMP に出し cache しない
+  #   （[static-link] と同じ方式）。cache は ubuntu のみ（設計 §6.3）で、key 種別は servohost
+  # - 出る check-run は required にする前提（ruleset の更新はオーナーが行う）
+  servo-host-ubuntu:
+    needs: changes
+    if: ${{ needs.changes.outputs.servo == 'true' }}
+    runs-on: ubuntu-latest
+    # 仮置き。cache なし・ありの計測値 × 約 1.5 に確定する（#995。根拠の run ID は確定時に追記）
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+      # cache サイズ削減: servo-host/Cargo.toml には `[profile.dev.package."*"]` が無いため、
+      # この env が依存を含む全体の debuginfo を行番号のみにする（CI 限定。release には影響しない）
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: "Servo ホストの system 依存の確認・導入"
+        run: |
+          df -h /
+          sudo apt-get update -qq
+          # docs/setup/linux.md の apt パッケージ（Ubuntu 公式リポジトリのみ）
+          sudo apt-get install -y --no-install-recommends \
+            libfontconfig1-dev libfreetype-dev libgl1-mesa-dev libx11-dev libssl-dev
+          for t in clang cmake pkg-config python3 make; do
+            if ! command -v "$t" >/dev/null 2>&1; then
+              echo "error: $t is required but was not found on PATH" >&2
+              exit 1
+            fi
+          done
+          clang --version | head -1
+          cmake --version | head -1
+          python3 --version
+          make --version | head -1
+      - name: "cargo cache の復元（servo-host）"
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            servo-host/target
+          key: "rust-${{ runner.os }}-servohost-v1-${{ steps.toolchain.outputs.cachekey }}-\
+            ${{ hashFiles('servo-host/Cargo.lock') }}"
+          restore-keys: rust-${{ runner.os }}-servohost-v1-${{ steps.toolchain.outputs.cachekey }}-
+      - name: "[servo-host] cargo fmt --check"
+        if: ${{ !cancelled() }}
+        run: cargo fmt --manifest-path servo-host/Cargo.toml --all --check
+      - name: "[servo-host] cargo clippy（dev・--all-targets・-D warnings）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy --manifest-path servo-host/Cargo.toml --locked --all-targets -- -D warnings
+      - name: "[servo-host] cargo test（dev・契約テストを含む）"
+        if: ${{ !cancelled() }}
+        run: cargo test --manifest-path servo-host/Cargo.toml --locked
+      - name: "[render-isolation] 自己テスト（合成データによる Servo 系検出の証跡確認）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-render-isolation.sh --self-test
+      - name: "[render-isolation] 分離検証 A〜E（C〜E がホスト側）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-render-isolation.sh
+      # 保存は release ビルドより前に置く。main は cancel-in-progress のため、最長の release の
+      # 途中で次の push が来てジョブごと取り消されても dev の成果物の保存を失わないため
+      - name: "cache 保存前に servo-host の成果物を prune"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        run: bash scripts/ci-prune-target.sh --workspace-root servo-host
+      - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            servo-host/target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: "[servo-host-release] release ビルド（main・workflow_dispatch のみ）"
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        env:
+          SERVO_HOST_RELEASE_TARGET_DIR: ${{ runner.temp }}/servo-host-release
+        run: |
+          cargo build --manifest-path servo-host/Cargo.toml --locked --release \
+            --target-dir "$SERVO_HOST_RELEASE_TARGET_DIR"
+      # 記録のみ。閾値で fail させない: ホストのバイナリに SSOT 上の閾値は無い
+      # （RENDER-2・BINARY_SIZE_LIMIT_BYTES は既定ビルドの cli 向け）。ゲート化はオーナー判断
+      - name: "[servo-host-release] リリースバイナリのサイズ記録（main・workflow_dispatch のみ）"
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        env:
+          SERVO_HOST_RELEASE_TARGET_DIR: ${{ runner.temp }}/servo-host-release
+        run: |
+          bin="$SERVO_HOST_RELEASE_TARGET_DIR/release/fandhe-browser-servo-host"
+          if [ ! -f "$bin" ]; then
+            echo "error: release binary not found: $bin" >&2
+            exit 1
+          fi
+          size="$(wc -c < "$bin" | tr -d ' ')"
+          if [ "$size" -le 0 ]; then
+            echo "error: release binary is empty" >&2
+            exit 1
+          fi
+          echo "servo-host release binary: ${size} bytes"
+          {
+            echo "### servo-host release binary size"
+            echo
+            echo "| host | bin | bytes |"
+            echo "| ---- | --- | ----- |"
+            echo "| ubuntu | fandhe-browser-servo-host | ${size} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   harness-macos:
     needs: changes
     if: >-
@@ -1118,12 +1251,6 @@ jobs:
       - name: "[render-isolation] 既定ビルドの依存グラフ検査"
         if: ${{ !cancelled() }}
         run: bash scripts/check-render-isolation.sh
-      - name: "[render-isolation] Servo ホスト分離の自己テスト（TASK-38・#985）"
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-servo-host-isolation.sh --self-test
-      - name: "[render-isolation] Servo ホスト分離検査（members・ルート Cargo.lock）"
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-servo-host-isolation.sh
       - name: "[js-engine-isolation] 自己テスト（合成データによる検出の証跡確認）"
         if: ${{ !cancelled() }}
         run: bash scripts/check-js-engine-isolation.sh --self-test
@@ -1283,12 +1410,6 @@ jobs:
       - name: "[render-isolation] 既定ビルドの依存グラフ検査"
         if: ${{ !cancelled() }}
         run: bash scripts/check-render-isolation.sh
-      - name: "[render-isolation] Servo ホスト分離の自己テスト（TASK-38・#985）"
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-servo-host-isolation.sh --self-test
-      - name: "[render-isolation] Servo ホスト分離検査（members・ルート Cargo.lock）"
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-servo-host-isolation.sh
       - name: "[js-engine-isolation] 自己テスト（合成データによる検出の証跡確認）"
         if: ${{ !cancelled() }}
         run: bash scripts/check-js-engine-isolation.sh --self-test
