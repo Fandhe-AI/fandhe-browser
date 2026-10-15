@@ -778,6 +778,9 @@ impl Hello {
             .ok_or(bad("hello protocol missing"))?;
         let min = uint_field(proto, "min", "invalid protocol min")?;
         let max = uint_field(proto, "max", "invalid protocol max")?;
+        if min < 1 || max < 1 {
+            return Err(bad("protocol min and max must be at least 1"));
+        }
         if min > max {
             return Err(bad("protocol min exceeds max"));
         }

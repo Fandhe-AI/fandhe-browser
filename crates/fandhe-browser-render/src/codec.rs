@@ -297,10 +297,13 @@ mod tests {
             decode_hello(hello(2, 3).as_bytes()).unwrap_err(),
             ProtocolError::ProtocolMismatch { min: 2, max: 3 }
         );
-        assert_eq!(
-            decode_hello(hello(0, 0).as_bytes()).unwrap_err(),
-            ProtocolError::ProtocolMismatch { min: 0, max: 0 }
-        );
+        // スキーマは min・max とも minimum: 1 のため、0 は互換性判定の前に不正メッセージ
+        for (min, max) in [(0, 0), (0, 1), (1, 0)] {
+            assert!(matches!(
+                decode_hello(hello(min, max).as_bytes()),
+                Err(ProtocolError::InvalidMessage(_))
+            ));
+        }
         assert!(matches!(
             decode_hello(hello(3, 2).as_bytes()),
             Err(ProtocolError::InvalidMessage(_))
