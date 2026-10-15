@@ -8,6 +8,9 @@ export const SCHEMA_VERSION = 1;
 export const PLACEHOLDER_PORT = "<PORT>";
 // Playwright の一時成果物ディレクトリ（`<os.tmpdir()>/playwright-artifacts-XXXXXX`）の置換先。
 export const PLACEHOLDER_ARTIFACTS_DIR = "<ARTIFACTS_DIR>";
+// Playwright が実行ごとに乱数で作る utility world 名（`__playwright_utility_world_page@<32 桁 16 進>`。
+// `Page.addScriptToEvaluateOnNewDocument` の `worldName`）のハッシュ部の置換先。決定的なトレースにする（#910）。
+export const PLACEHOLDER_WORLD_HASH = "<WORLD_HASH>";
 // 1 行あたり・総行数の上限（無制限確保の防止。security.md「不安全な設計」）。
 export const MAX_LINE_BYTES = 64 * 1024;
 export const MAX_RECORDS = 1024;
@@ -106,7 +109,7 @@ function escapeRegExp(str) {
  * 汎用のパス推定はせず大文字小文字も区別する。未指定・空なら置換しない（純粋関数を保つため os は import しない）。
  */
 export function normalizeString(s, port, host, tmpDir) {
-  let out = s.replace(ANSI, "");
+  let out = s.replace(ANSI, "").replace(/(__playwright_utility_world_[a-z]+@)[0-9a-f]{32}(?![0-9a-f])/g, `$1${PLACEHOLDER_WORLD_HASH}`);
   if (port && host) {
     const esc = escapeRegExp(host);
     const re = new RegExp(`(?<![0-9A-Za-z.\\-])${esc}:${port}(?![0-9])`, "g");

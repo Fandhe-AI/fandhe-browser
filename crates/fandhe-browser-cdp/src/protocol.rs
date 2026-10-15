@@ -8,7 +8,7 @@
 //!
 //! 公開入口は無く crate 内部専用。後続タスクは [`builtin_handlers`] へメソッドを
 //! 追加するだけでよい（`Page.navigate` は 42.2 で登録済み、イベント送出は 42.3 で実装済み、
-//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b、`Target.setAutoAttach`・`Browser.setDownloadBehavior` は TASK-43.3c、`Target.createBrowserContext` は TASK-43.3d、`Target.closeTarget` は TASK-43.3h で登録済み）。
+//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b、`Target.setAutoAttach`・`Browser.setDownloadBehavior` は TASK-43.3c、`Target.createBrowserContext` は TASK-43.3d、`Target.closeTarget` は TASK-43.3h、`Target.createTarget`・`Runtime.runIfWaitingForDebugger` は TASK-43.3e で登録済み）。
 //!
 //! # 入力の扱い
 //!
@@ -22,7 +22,7 @@
 //!
 //! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 //! `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・
-//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c・`CDP-2`）・`Target.createBrowserContext`（TASK-43.3d・`CDP-2`）・`Target.closeTarget`（TASK-43.3h・`CDP-2`）のみ登録済みで、
+//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c・`CDP-2`）・`Target.createBrowserContext`（TASK-43.3d・`CDP-2`）・`Target.closeTarget`（TASK-43.3h・`CDP-2`）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e・#910・`CDP-2`）のみ登録済みで、
 //! それ以外のメソッドは JSON-RPC の「method not implemented」（`-32601`）エラーを返す。
 //! 汎用の空 success フォールバック（PoC-5 の暫定挙動）は採らない。理由は次のとおり。
 //!
@@ -103,6 +103,10 @@ impl CdpError {
     /// 空文書を捏造せず明示エラーにする。`CDP-1`・`REPAIR-3`・`SEC-2`）。
     pub const TARGET_DOCUMENT_UNAVAILABLE: Self =
         Self::new(-32000, "document not available for target");
+    /// `waitForDebuggerOnStart` で止めたターゲットが再開前に `Page.navigate` を受けた（再開時の初期読み込みと
+    /// 競合して遷移を中断するのを防ぐ。`Runtime.runIfWaitingForDebugger` で再開する。#910・`CDP-2`）。
+    pub const TARGET_WAITING_FOR_DEBUGGER: Self =
+        Self::new(-32000, "target is waiting for debugger");
     /// 指定 nodeId が現在の文書の採番表に無い（形式は正しいが対象が無い。`DOM.querySelector`。`CDP-1`）。
     pub const NODE_NOT_FOUND: Self = Self::new(-32000, "node not found");
     /// nodeId の払い出し記録が件数上限に達した（`DOM.getDocument`。他クライアントの記録を
@@ -205,8 +209,12 @@ impl CdpEvent {
 pub(crate) struct HandlerOutput {
     /// `result` に入れる JSON オブジェクト。
     pub result: Value,
-    /// このコマンドに伴って送出するイベント（順序どおり）。
+    /// 応答の**後**に送出するイベント（順序どおり。既定）。
     pub events: Vec<CdpEvent>,
+    /// 応答の**前**に送出するイベント（順序どおり。opt-in）。`Target.createTarget` の
+    /// `Target.attachedToTarget` 用で、Playwright は応答を受けた時点で当該ターゲットのページが
+    /// 存在する前提で動くため（`CDP-5`・`CDP-2`・#910）。他のハンドラは使わない。
+    pub pre_events: Vec<CdpEvent>,
 }
 
 impl HandlerOutput {
@@ -215,7 +223,14 @@ impl HandlerOutput {
         Self {
             result,
             events: Vec::new(),
+            pre_events: Vec::new(),
         }
+    }
+
+    /// 応答より前に送出するイベントを末尾へ追加する（`CDP-5`。使い所は `Target.createTarget` のみ）。
+    pub fn with_pre_event(mut self, event: CdpEvent) -> Self {
+        self.pre_events.push(event);
+        self
     }
 
     /// 同伴イベントを末尾へ追加する。
@@ -225,10 +240,13 @@ impl HandlerOutput {
     }
 }
 
-/// [`Dispatcher::dispatch`] の結果。送出順は「レスポンス → イベント列」
-/// （42.3 で確定。Chromium 流の並べ替えの要否は TASK-43・`CDP-2` で判断。`CDP-5`）。
+/// [`Dispatcher::dispatch`] の結果。送出順は「応答前イベント → レスポンス → イベント列」
+/// （既定は応答前イベントなしの「レスポンス → イベント列」。応答前に送るのは
+/// `Target.createTarget` の attach 通知だけ。`CDP-5`・`CDP-2`・#910）。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DispatchOutcome {
+    /// 応答の前に送るイベント（[`HandlerOutput::pre_events`]）。
+    pub pre_events: Vec<CdpEvent>,
     /// コマンドへの応答。
     pub response: CdpResponse,
     /// 応答の後に送るイベント。
@@ -238,7 +256,8 @@ pub(crate) struct DispatchOutcome {
 impl DispatchOutcome {
     /// 送出すべき JSON 文字列を順序どおり返す（レスポンス、イベント列）。
     pub fn into_frames(self) -> Vec<String> {
-        let mut frames = Vec::with_capacity(1 + self.events.len());
+        let mut frames = Vec::with_capacity(1 + self.pre_events.len() + self.events.len());
+        frames.extend(self.pre_events.iter().map(CdpEvent::to_json));
         frames.push(self.response.to_json());
         frames.extend(self.events.iter().map(CdpEvent::to_json));
         frames
@@ -370,7 +389,7 @@ type HandlerTable = Vec<(&'static str, Box<dyn CommandHandler>)>;
 
 /// 組込みハンドラ表。`Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 /// `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・`Browser.getVersion`（TASK-43.3a）・
-/// `Target.getTargetInfo`（TASK-43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。実体に接続済み）・`Target.createBrowserContext`（TASK-43.3d）・`Target.closeTarget`（TASK-43.3h）を登録済み（`CDP-1`・`CDP-2`）。
+/// `Target.getTargetInfo`（TASK-43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。実体に接続済み）・`Target.createBrowserContext`（TASK-43.3d）・`Target.closeTarget`（TASK-43.3h）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e）を登録済み（`CDP-1`・`CDP-2`）。
 ///
 /// `Page.navigate` は既定の `FetchOptions`（内部アドレス拒否）で `Fetcher` を構築する。
 pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
@@ -401,6 +420,14 @@ pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
         (
             "Target.closeTarget",
             Box::new(crate::playwright_compat::TargetCloseTarget),
+        ),
+        (
+            "Target.createTarget",
+            Box::new(crate::playwright_compat::TargetCreateTarget),
+        ),
+        (
+            "Runtime.runIfWaitingForDebugger",
+            Box::new(crate::playwright_compat::RuntimeRunIfWaitingForDebugger),
         ),
         ("DOM.getDocument", Box::new(crate::dom::DomGetDocument)),
         ("DOM.querySelector", Box::new(crate::dom::DomQuerySelector)),
@@ -490,23 +517,23 @@ impl Dispatcher {
         };
         match handler.handle(ctx, &req.params).await {
             Ok(out) => {
-                let mut events: Vec<CdpEvent> = out
-                    .events
-                    .into_iter()
-                    .map(|mut e| {
-                        if e.session_id.is_none() {
-                            e.session_id = req.session_id.clone();
-                        }
-                        e
-                    })
-                    .collect();
+                let fill = |mut e: CdpEvent| {
+                    if e.session_id.is_none() {
+                        e.session_id = req.session_id.clone();
+                    }
+                    e
+                };
+                let pre_events: Vec<CdpEvent> = out.pre_events.into_iter().map(fill).collect();
+                let mut events: Vec<CdpEvent> = out.events.into_iter().map(fill).collect();
                 events.extend(auto_attach_events(state, conn, true));
-                outcome(
+                let mut o = outcome(
                     Some(req.id),
-                    req.session_id,
+                    req.session_id.clone(),
                     ResponseBody::Result(out.result),
                     events,
-                )
+                );
+                o.pre_events = pre_events;
+                o
             }
             Err(e) => outcome(
                 Some(req.id),
@@ -528,6 +555,8 @@ fn auto_attach_events(
     conn: Option<ConnId>,
     attach_new: bool,
 ) -> Vec<CdpEvent> {
+    // 止めたセッションが外れたターゲットを再開する（永久停止を残さない。`CDP-7`・#910）。
+    state.resume_orphaned_paused();
     let Some(c) = conn else {
         return Vec::new();
     };
@@ -542,7 +571,7 @@ fn auto_attach_events(
         events.push(crate::playwright_compat::detached_event(target_id, sid));
     }
     for (info, sid) in &rec.attached {
-        events.push(crate::playwright_compat::attached_event(info, sid));
+        events.push(crate::playwright_compat::attached_event(info, sid, false));
     }
     events
 }
@@ -554,6 +583,7 @@ fn outcome(
     events: Vec<CdpEvent>,
 ) -> DispatchOutcome {
     DispatchOutcome {
+        pre_events: Vec::new(),
         response: CdpResponse {
             id,
             session_id,
@@ -793,6 +823,45 @@ mod tests {
             assert_eq!(b[0], json!({"id": 11, "result": {"x": [1, 2]}}));
         }
 
+        /// 応答前イベントを 1 件、応答後イベントを 1 件同伴する。
+        struct PreAndPost;
+        impl CommandHandler for PreAndPost {
+            fn handle<'a>(
+                &'a self,
+                _: CommandContext<'a>,
+                _: &'a Value,
+            ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+                Box::pin(async {
+                    let ev = |m| CdpEvent {
+                        method: m,
+                        params: json!({}),
+                        session_id: None,
+                    };
+                    Ok(HandlerOutput::result(json!({}))
+                        .with_pre_event(ev("Test.pre"))
+                        .with_event(ev("Test.post")))
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn cdp5_dispatch_emits_pre_events_before_response() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let d = Dispatcher::from_handlers(vec![("Gamma.three", Box::new(PreAndPost))]).unwrap();
+            let f = frames(
+                d.dispatch(&st, r#"{"id":1,"method":"Gamma.three","sessionId":"S-1"}"#)
+                    .await,
+            );
+            assert_eq!(
+                f,
+                vec![
+                    json!({"method": "Test.pre", "params": {}, "sessionId": "S-1"}),
+                    json!({"id": 1, "result": {}, "sessionId": "S-1"}),
+                    json!({"method": "Test.post", "params": {}, "sessionId": "S-1"}),
+                ]
+            );
+        }
         #[tokio::test]
         async fn cdp1_dispatch_emits_response_then_events_in_order_with_session() {
             let dir = TempDir::new();
@@ -907,7 +976,6 @@ mod tests {
             let b = Dispatcher::builtin().unwrap();
             for (i, m) in [
                 "Target.disposeBrowserContext",
-                "Target.createTarget",
                 "Target.attachToTarget",
                 "Emulation.setUserAgentOverride",
                 "Network.setUserAgentOverride",

@@ -103,6 +103,18 @@ impl CdpState {
         for ctx in &released.contexts {
             let _ = self.registry.dispose_browser_context(ctx);
         }
+        // 切断した接続が止めていたターゲットを再開する（永久停止を残さない。`CDP-7`・#910）。
+        self.resume_orphaned_paused();
+    }
+
+    /// 止めたセッションが外れた（detach・切断）ターゲットの初期 `about:blank` 読み込みを行う
+    /// （`Target.createTarget` の `waitForDebuggerOnStart`。`CDP-2`・`CDP-7`・#910）。
+    /// ディスパッチ後（`protocol::auto_attach_events`）と接続解放から呼ばれる。ロックは
+    /// registry → navigations の順に別々に取り、同時保持しない。
+    pub(crate) fn resume_orphaned_paused(&self) {
+        for tid in self.registry.take_orphaned_paused() {
+            self.navigations.commit_initial_blank(&self.registry, &tid);
+        }
     }
 
     /// 接続スコープの状態表（crate 内部専用。`CDP-2`）。

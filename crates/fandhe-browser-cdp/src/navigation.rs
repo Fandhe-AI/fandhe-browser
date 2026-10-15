@@ -50,6 +50,28 @@ impl TargetNavigations {
         )
     }
 
+    /// 新規ターゲットの初期 `about:blank` 文書を確定する（`Target.createTarget`・`Runtime.runIfWaitingForDebugger`
+    /// から呼ばれる。#910・`CDP-2`）。取得を伴わない。
+    ///
+    /// 登録済みのターゲットで、遷移状態がまだ無いときだけ確定して `true` を返す。既に状態がある
+    /// （`Page.navigate` が先に走った等）・未登録のターゲットは何もせず `false`（遷移を中断しない。表にも入れない）。
+    pub(crate) fn commit_initial_blank(&self, registry: &TargetRegistry, tid: &TargetId) -> bool {
+        let mut m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        m.retain(|id, _| registry.target(id).is_some());
+        if registry.target(tid).is_none() || m.contains_key(tid) {
+            return false;
+        }
+        let nav = NavigationState::new();
+        let committed = nav
+            .begin_navigation()
+            .and_then(|g| nav.clear_navigation(g))
+            .is_ok();
+        if committed {
+            m.insert(tid.clone(), Arc::new(nav));
+        }
+        committed
+    }
+
     /// 読み取り専用。表に無ければ `None`（作成しない）。
     pub(crate) fn get(&self, tid: &TargetId) -> Option<Arc<NavigationState>> {
         let m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
@@ -84,6 +106,26 @@ impl fmt::Debug for TargetNavigations {
 mod tests {
     use super::*;
     use crate::target::{MAX_TARGETS, TargetKind};
+
+    #[test]
+    fn cdp2_commit_initial_blank_commits_once_and_skips_unknown_or_existing() {
+        let reg = TargetRegistry::new();
+        let t = reg.create_target(TargetKind::Page, "about:blank").unwrap();
+        let n = TargetNavigations::new();
+        assert!(n.commit_initial_blank(&reg, &t));
+        assert!(n.get(&t).unwrap().latest().is_some());
+        // 2 回目は何もしない。
+        assert!(!n.commit_initial_blank(&reg, &t));
+        // 既に状態がある（get_or_create 済み）ターゲットは中断しない。
+        let t2 = reg.create_target(TargetKind::Page, "about:blank").unwrap();
+        let st = n.get_or_create(&reg, &t2);
+        assert!(!n.commit_initial_blank(&reg, &t2));
+        assert!(st.latest().is_none());
+        // 未登録のターゲットは表へ入れない。
+        let ghost = TargetId::parse("ghost-1").unwrap();
+        assert!(!n.commit_initial_blank(&reg, &ghost));
+        assert_eq!(n.len(), 2);
+    }
 
     #[test]
     fn cdp1_get_does_not_create_and_get_or_create_is_stable() {

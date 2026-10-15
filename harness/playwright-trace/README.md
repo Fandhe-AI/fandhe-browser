@@ -62,11 +62,12 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
 
 ## 現時点の到達点（事実のみ。原因分析は #247・`docs/design/playwright-compat.md`）
 
-- TASK-43.3d（#909）後の実測（現行 head で再取得済み）。`GET /json/version` と `GET /json/version/` はともに 200 で、
+- TASK-43.3e（#910）後の実測（現行 head で再取得済み・2 回の実行で同一出力）。`GET /json/version` と `GET /json/version/` はともに 200 で、
   `Browser.getVersion`・`Target.setAutoAttach`（`waitForDebuggerOnStart:true` は受理）・`Target.getTargetInfo` が成功し、
   `connectOverCDP(http)` が成功する。`newContext()` は `Target.createBrowserContext` と `browserContextId` 付き
-  `Browser.setDownloadBehavior` が成功して通り、`newPage()` は `Target.createTarget` の `-32601`
-  （`method not implemented`。`CDP-6`・`REPAIR-3`）で失敗する
+  `Browser.setDownloadBehavior` が成功して通る。`newPage()` は `Target.createTarget` が成功し（`Target.attachedToTarget` が応答の前に届く）、
+  セッション付きの `Page.enable` の `-32601`（`method not implemented`。`CDP-6`・`REPAIR-3`）で失敗して `Target.closeTarget` を送る
+- `Page.addScriptToEvaluateOnNewDocument` の `worldName` に含まれる乱数ハッシュは `<WORLD_HASH>` へ正規化する（決定的にするため）
 - 収集は `connectOverCDP(..., { noDefaults: true })` と `newContext({ acceptDownloads: false })` で行う。fandhe-browser は
   ダウンロード実行系が無く `Browser.setDownloadBehavior` の `allow`・`allowAndName` を拒否するため、Playwright の
   既定のオプション（接続直後の `Browser.setDownloadBehavior`、`newContext` の `allowAndName`）では通らない
