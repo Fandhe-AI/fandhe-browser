@@ -59,11 +59,11 @@ pub fn fake_host() -> ! {
         .or(lines.last())
         .copied()
         .expect("scenario line");
-    std::fs::write(
-        root.join(format!("pid-{n}")),
-        std::process::id().to_string(),
-    )
-    .expect("pid");
+    // 作成と書き込みの間に親が kill しても空の pid ファイルを観測させないよう、
+    // 一時ファイルへ書いてから rename で原子的に公開する。
+    let tmp = root.join(format!("pid-{n}.tmp"));
+    std::fs::write(&tmp, std::process::id().to_string()).expect("pid tmp");
+    std::fs::rename(&tmp, root.join(format!("pid-{n}"))).expect("pid");
 
     #[cfg(unix)]
     if scenario == "dump" {
