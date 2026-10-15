@@ -211,8 +211,33 @@ fn validate_url(url: &str) -> Result<(), ProtocolError> {
             "url must not contain userinfo",
         ));
     }
-    if authority.is_empty() {
+    // userinfo は上で拒否済み。authority を host と port に分け、host 部の空を拒否する
+    // （`https://:80/` のようなポートだけの URL を弾く。IPv6 リテラルは括弧内を host とする）。
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        let (host, tail) = inner
+            .split_once(']')
+            .ok_or(ProtocolError::InvalidParams("url host is malformed"))?;
+        match tail {
+            "" => (host, None),
+            t => (
+                host,
+                Some(
+                    t.strip_prefix(':')
+                        .ok_or(ProtocolError::InvalidParams("url host is malformed"))?,
+                ),
+            ),
+        }
+    } else {
+        match authority.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
         return Err(ProtocolError::InvalidParams("url host is empty"));
+    }
+    if port.is_some_and(|p| !p.bytes().all(|b| b.is_ascii_digit())) {
+        return Err(ProtocolError::InvalidParams("url port is malformed"));
     }
     Ok(())
 }
@@ -849,6 +874,9 @@ mod tests {
         assert!(LoadParams::new("HTTPS://example.com/", None).is_ok());
         assert!(LoadParams::new("https://user@example.com/", None).is_err());
         assert!(LoadParams::new("https://example.com/path@x", None).is_ok());
+        assert!(LoadParams::new("https://example.com:8443/", None).is_ok());
+        assert!(LoadParams::new("http://[::1]:80/", None).is_ok());
+        assert!(LoadParams::new("http://[::1]/", None).is_ok());
         for u in [
             "file:///etc/passwd",
             "data:text/html,x",
@@ -858,6 +886,12 @@ mod tests {
             "https://",
             "https:///x",
             "https://a b/",
+            "https://:80/",
+            "https://:/",
+            "https://@:80/",
+            "http://[]:80/",
+            "http://[::1/",
+            "https://e.com:x/",
         ] {
             assert!(LoadParams::new(u, None).is_err(), "{u}");
         }
