@@ -8,7 +8,7 @@
 
 ## crate 構成と境界
 
-- workspace は `crates/fandhe-browser-*` で構成する（core / js / ai / cdp / render / profile / cli / mcp）
+- workspace は `crates/fandhe-browser-*` で構成する（core / js / ai / cdp / render / profile / cli / mcp）。Servo ホスト `servo-host/` は本体 workspace（`members`）の外にある別 workspace
 - 1 回の改修が波及する crate・モジュールを最小に保つ（単一責務・疎結合。AI 自己補修の前提。REPAIR 系ビヘイビア）
 - 循環依存を作らない。複数 crate が共有する型は下位 crate（core 等）へ置き、上位から下位への一方向依存を保つ
 - レンダリング層（`fandhe-browser-render`・Servo）は Servo 系クレートに依存させず（Servo は別 workspace の子プロセス）、既定ビルドの依存グラフへ混入させない（RENDER-1。[licensing](./licensing.md)）

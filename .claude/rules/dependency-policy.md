@@ -17,7 +17,7 @@
 ## 既定の採用済み方針
 
 - JS エンジン: V8（`rusty_v8`）既定・`boa` へ切替可能（README「実装方針（要点）」参照。バージョン確定は導入時にユーザー承認）
-- レンダリング: `Servo`（feature gate 配下のオプトイン。バージョン確定は導入時にユーザー承認）
+- レンダリング: `Servo`（`servo =0.6.0`。#915 で採用、#988 で追加。本体 workspace には入れず、`servo-host/` の別 workspace の依存に限る。[licensing](./licensing.md)）
 
 ## subagent への適用
 

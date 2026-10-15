@@ -14,7 +14,7 @@ CLI・ビルド基盤・CI・計測基盤の実装を担当する builder エー
 - `crates/fandhe-browser-cli`（CLI 系ビヘイビア）
 - ルート `Cargo.toml`（workspace 定義・`[workspace.package]`・release プロファイル）
 - `.github/workflows/`（3 OS CI・`cargo deny`・feature 分離検証）（`.claude/rules/ci.md`）
-- `deny.toml`・`NOTICE`（`.claude/rules/licensing.md`）・`Dockerfile`（CTR 系ビヘイビア）
+- `deny.toml`（`servo-host/deny.toml` を含む）・`NOTICE`（`.claude/rules/licensing.md`）・`Dockerfile`（CTR 系ビヘイビア）
 - `benches/`・`harness/`（性能計測・互換性テストハーネス）
 
 ## 固有の遵守事項
