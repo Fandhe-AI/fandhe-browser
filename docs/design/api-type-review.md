@@ -8,13 +8,13 @@
 
 PR #817 のアーキテクチャ観点の推奨（問題候補 15 件）どおり採用する。
 
-- 採否: 改修 2（A-1・P-2）・現状維持 11（A-2・A-3・A-4・A-5・A-6・A-7・C-2・C-4・P-1・P-3・P-4）・保留 2（C-1・C-3）
+- 採否: 改修 2（A-1・P-2）・現状維持 12（A-2・A-3・A-4・A-5・A-6・A-7・C-2・C-3・C-4・P-1・P-3・P-4）・保留 1（C-1）
 - 非破壊か置換か: 原則は R-4/R-5 の非破壊追加とする。置換は次の 2 条件に限って許容する。(a) 呼び出し元が同一 crate 内で 1 件以下（A-1・C-3）、(b) 既存を残すと契約を黙って破る（C-1）。全 crate が `publish = false` のため、置換の影響は workspace 内のコンパイルエラーで検出できる
 - 後続:
   - A-1: 実装 Issue #838（`fandhe-browser-ai`・単独 1 件）
   - P-2: 実装 Issue #839（`fandhe-browser-profile`・単独 1 件）
   - C-1: page WS 実装 Issue（起票時）に内包（`CdpEndpoints::into_parts` の置換を前段サブタスクに含める）
-  - C-3: ハンドラ実装 Issue（起票時）に内包（`close_target` の戻り値型を確定する）
+  - C-3: #1028 で現状維持に確定
 
 ## 位置づけ
 
@@ -221,7 +221,7 @@ cdp の `String` 戻りは非公開の `protocol` モジュールの `to_json` �
 - 現状: 閉じたターゲットの切断されたセッション ID の列だけを返す
 - 改修案: `CloseOutcome { target, detached_sessions }`（`#[non_exhaustive]`）を返す
 - 現状維持の理由案: CDP の `Target.detachedFromTarget` イベント発行に必要な情報はこれで足りる
-- 判断: **保留**（トリガー: `Target.closeTarget`・`Target.detachedFromTarget` ハンドラの実装 Issue）。本番呼び出し元 0（`navigation.rs`・`page.rs` の呼び出しはすべて `#[cfg(test)]` 以降）で、doc も「将来 `Target.detachedFromTarget` の送出に使う」（`target.rs:292-294`）と未使用を明示している。必要な情報は現行型で足りる見込みで、追加情報が要るかはハンドラ設計時に確定する。追加が必要なら置換（`CloseOutcome`）を採る。影響範囲: 本番 0・テスト等 7
+- 判断: **現状維持**（TASK-43.3h・#1028 で `Target.closeTarget` ハンドラを実装して確定）。`Target.detachedFromTarget` の送出に必要な情報は、`targetId` が入力値、`sessionId` が戻り値の `Vec<SessionId>` でそろう。接続ごとの所有判定は crate 内部の `close_target_in_contexts` に分け、公開 API の `close_target` の戻り値型は変えない
 
 #### C-4 `TargetInfo::url` が `&str`
 
@@ -282,7 +282,7 @@ cdp の `String` 戻りは非公開の `protocol` モジュールの `to_json` �
 | P-3 | profile | `root` / `data_dir` | 現状維持 | 借用と都度生成の違いは自然。doc 化済み | — | なし |
 | P-4 | profile | `Profile::delete`・`reason` | 現状維持 | fail-closed で成功値不要。`reason` の型変更は破壊的 | 本番 0 / テストのみ | なし（TASK-47 時に判断） |
 
-内訳: 改修 2（A-1・P-2）・現状維持 11（A-2・A-3・A-4・A-5・A-6・A-7・C-2・C-4・P-1・P-3・P-4）・保留 2（C-1・C-3）。
+内訳: 改修 2（A-1・P-2）・現状維持 12（A-2・A-3・A-4・A-5・A-6・A-7・C-2・C-3・C-4・P-1・P-3・P-4）・保留 1（C-1）。
 
 ## 関連
 

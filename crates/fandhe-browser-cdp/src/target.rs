@@ -379,10 +379,36 @@ impl TargetRegistry {
         Ok(())
     }
 
-    /// ターゲットを閉じ、配下セッションを削除して、その SessionId を返す
-    /// （将来 `Target.detachedFromTarget` の送出に使う）。
+    /// ターゲットを所有判定なしで閉じ、配下セッションを削除して、その SessionId を昇順で返す。
+    /// 接続の権限を確認する経路（`Target.closeTarget`）は [`Self::close_target_in_contexts`] を使う。
     pub fn close_target(&self, id: &TargetId) -> Result<Vec<SessionId>, CdpStateError> {
         let mut t = self.lock();
+        Self::remove_target(&mut t, id)
+    }
+
+    /// 閉じてよい context に属するときだけターゲットを閉じる（`Target.closeTarget`・TASK-43.3h・`CDP-7`・`SEC-2`）。
+    ///
+    /// 許可されるのは既定 context か `allowed`（呼び出し接続が所有する context）に属するターゲット。
+    /// 判定と削除は 1 回のロックで行い（TOCTOU 回避）、未知・許可外はどちらも
+    /// [`CdpStateError::UnknownTarget`] にして存在を漏らさず、表は変えない。
+    /// ターゲット単位の所有（`Target.createTarget`〔#910〕が作ったもの）が入ったら判定を広げる。
+    pub(crate) fn close_target_in_contexts(
+        &self,
+        id: &TargetId,
+        allowed: &[BrowserContextId],
+    ) -> Result<Vec<SessionId>, CdpStateError> {
+        let mut t = self.lock();
+        let permitted = t.targets.get(id).is_some_and(|info| {
+            info.browser_context_id == t.default_context
+                || allowed.contains(&info.browser_context_id)
+        });
+        if !permitted {
+            return Err(CdpStateError::UnknownTarget);
+        }
+        Self::remove_target(&mut t, id)
+    }
+
+    fn remove_target(t: &mut Tables, id: &TargetId) -> Result<Vec<SessionId>, CdpStateError> {
         if t.targets.remove(id).is_none() {
             return Err(CdpStateError::UnknownTarget);
         }
@@ -574,6 +600,38 @@ mod tests {
         assert_eq!(r.detach(&s), Ok(t));
         assert_eq!(r.session_target(&s), None);
         assert_eq!(r.detach(&s), Err(CdpStateError::UnknownSession));
+    }
+
+    #[test]
+    fn cdp7_close_target_in_contexts_checks_ownership() {
+        let r = TargetRegistry::new();
+        let own = r.create_browser_context().unwrap();
+        let other = r.create_browser_context().unwrap();
+        let d = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        let a = r
+            .create_target_in(&own, TargetKind::Page, "about:blank")
+            .unwrap();
+        let b = r
+            .create_target_in(&other, TargetKind::Page, "about:blank")
+            .unwrap();
+        let sb = r.attach(&b).unwrap();
+        let sd = r.attach(&d).unwrap();
+        assert_eq!(r.close_target_in_contexts(&d, &[]), Ok(vec![sd]));
+        assert_eq!(
+            r.close_target_in_contexts(&a, std::slice::from_ref(&own)),
+            Ok(vec![])
+        );
+        assert_eq!(
+            r.close_target_in_contexts(&b, std::slice::from_ref(&own)),
+            Err(CdpStateError::UnknownTarget)
+        );
+        assert!(r.target(&b).is_some());
+        assert_eq!(r.session_target(&sb), Some(b.clone()));
+        let ghost = TargetId::from_counter(9999);
+        assert_eq!(
+            r.close_target_in_contexts(&ghost, &[]),
+            Err(CdpStateError::UnknownTarget)
+        );
     }
 
     #[test]

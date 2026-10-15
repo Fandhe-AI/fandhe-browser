@@ -350,6 +350,35 @@ impl ConnectionScoped {
         self.lock().get(&conn).and_then(|e| e.download.clone())
     }
 
+    /// 接続が閉じてよいターゲットを閉じ、自接続の自動 attach 記録から該当セッションを落として
+    /// その SessionId を昇順で返す（`Target.closeTarget`・TASK-43.3h・`CDP-2`・`CDP-7`）。
+    /// 落とした分は `pending_detached` に積まない（`Target.detachedFromTarget` の送出は呼び出し側の
+    /// ハンドラに一本化し、続く `reconcile_auto_attach` での二重送出を防ぐ）。他接続のセッションは
+    /// その接続の次の reconcile で通知される。ロック順序は本表 → registry。
+    pub(crate) fn close_target(
+        &self,
+        conn: ConnId,
+        registry: &TargetRegistry,
+        tid: &TargetId,
+    ) -> Result<Vec<SessionId>, ConnStateError> {
+        let mut map = self.lock();
+        let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
+        registry
+            .close_target_in_contexts(tid, &entry.owned_contexts)
+            .map_err(ConnStateError::Registry)?;
+        let mut own: Vec<SessionId> = Vec::new();
+        entry.auto_attached.retain(|(t, s)| {
+            if t == tid {
+                own.push(s.clone());
+                false
+            } else {
+                true
+            }
+        });
+        own.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        Ok(own)
+    }
+
     /// この接続が所有する browser context（テスト用）。
     #[cfg(test)]
     pub(crate) fn owned_contexts(&self, conn: ConnId) -> Vec<BrowserContextId> {
@@ -555,6 +584,46 @@ mod tests {
         let sid = cs.enable_auto_attach(c, &r, false).unwrap().remove(0).1;
         r.close_target(&t).unwrap();
         assert_eq!(cs.disable_auto_attach(c, &r).unwrap(), vec![(t, sid)]);
+    }
+
+    #[test]
+    fn cdp7_close_target_drops_own_sessions_without_pending_and_notifies_others_once() {
+        let r = TargetRegistry::new();
+        let c = ConnectionScoped::new();
+        let (a, b) = (ConnId::new(1), ConnId::new(2));
+        c.open(a);
+        c.open(b);
+        let t = page(&r);
+        c.enable_auto_attach(a, &r, false).unwrap();
+        c.enable_auto_attach(b, &r, false).unwrap();
+        let sa = c.close_target(a, &r, &t).unwrap();
+        assert_eq!(sa.len(), 1);
+        assert!(c.reconcile_auto_attach(a, &r, true).detached.is_empty());
+        assert_eq!(c.reconcile_auto_attach(b, &r, true).detached.len(), 1);
+        assert!(c.reconcile_auto_attach(b, &r, true).detached.is_empty());
+    }
+
+    #[test]
+    fn cdp7_close_target_rejects_foreign_context_and_unregistered_connection() {
+        let r = TargetRegistry::new();
+        let c = ConnectionScoped::new();
+        let (a, b) = (ConnId::new(1), ConnId::new(2));
+        c.open(a);
+        c.open(b);
+        let ctx = c.create_owned_browser_context(a, &r).unwrap();
+        let t = r
+            .create_target_in(&ctx, TargetKind::Page, "about:blank")
+            .unwrap();
+        assert_eq!(
+            c.close_target(b, &r, &t),
+            Err(ConnStateError::Registry(CdpStateError::UnknownTarget))
+        );
+        assert!(r.target(&t).is_some());
+        assert_eq!(
+            c.close_target(ConnId::new(9), &r, &t),
+            Err(ConnStateError::NotLive)
+        );
+        assert_eq!(c.close_target(a, &r, &t), Ok(vec![]));
     }
 
     #[test]
