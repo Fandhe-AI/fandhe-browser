@@ -5,13 +5,14 @@
 //! （[licensing](../../../.claude/rules/licensing.md)・RENDER-1）。
 //! 対応: TASK-1（1.4）・REPAIR-1・MS-1。
 //!
-//! 現状はディレクトリ・manifest のみの雛形であり、本 crate に公開 API は
-//! まだ存在せず、「実装済みを装う」スタブ関数も置かない（REPAIR-3）。
+//! 本 crate は Servo に依存しない IPC クライアント（設計 §3.1）で、公開 API は
+//! プロトコル型・コーデックのみ。「実装済みを装う」スタブ関数は置かない（REPAIR-3）。
 //!
 //! 本体とレンダリングホストの stdio プロトコル契約の正本は
 //! `docs/design/render-host-protocol.schema.json` と `tests/fixtures/protocol/`
 //! （契約テスト `tests/protocol_fixtures.rs`。PLUG-1・SEC-2・REPAIR-4・TASK-38）。
-//! プロトコル型・コーデックの実装は #989 で行う。
+//! クライアント側のプロトコル型は [`protocol`]、フレームコーデックは [`codec`]
+//! （済み。RENDER-3・TASK-38・#989）。
 //!
 //! # スタブについて
 //!
@@ -21,3 +22,10 @@
 //!   cli による `AppState` への注入（RENDER-1・TASK-38・MS-4）
 //! - Servo の組込・スクリーンショット取得等の本実装（RENDER-1・TASK-38・
 //!   MS-4）
+//! - 子プロセス（Servo ホスト）の起動・タイムアウト・kill・再起動、`hello` 申告値の
+//!   実運用への反映（RENDER-3・TASK-38・K2）
+//! - `ProtocolError` の core `RenderError` への写像、`data_base64` のデコード、
+//!   プライベート IP / loopback ポリシーとの統合（HostRenderer #235。RENDER-3）
+
+pub mod codec;
+pub mod protocol;
