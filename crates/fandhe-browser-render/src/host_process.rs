@@ -605,8 +605,14 @@ impl HostProcess {
             LoadParams::new(page.url(), Some(ms)).map_err(|_| HostProcessError::InvalidRequest)?;
         let request = Request::Load(params);
         let (wait, phase) = self.wait_for(&request);
-        self.loaded = None;
-        match self.exchange(&request, wait, phase)? {
+        let previous = self.loaded.take();
+        let result = self.exchange(&request, wait, phase);
+        // 送信前に拒否された要求（InvalidRequest）ではホストの状態が変わらないため、
+        // ロード済みページの記録を復元してクライアントとホストの食い違いを防ぐ。
+        if matches!(result, Err(HostProcessError::InvalidRequest)) {
+            self.loaded = previous;
+        }
+        match result? {
             MethodResult::Load(l) => {
                 self.loaded = Some(LoadedPage {
                     url: page.url().to_string(),

@@ -88,7 +88,8 @@ fn validate(path: &Path) -> Result<HostBinary, HostProcessError> {
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = meta.permissions().mode();
-        if mode & 0o002 != 0 {
+        // グループ書き込み可（0o020）も他者書き込み可（0o002）も拒否する（設計 §2.6）。
+        if mode & 0o022 != 0 {
             return invalid(InvalidBinaryReason::WorldWritable);
         }
         if mode & 0o111 == 0 {
@@ -213,6 +214,21 @@ mod tests {
         let w = t.file("w", 0o777);
         assert_eq!(
             reason(resolve_host_binary(Some(&w), None, None)),
+            InvalidBinaryReason::WorldWritable
+        );
+        let g = t.file("g", 0o775);
+        assert_eq!(
+            reason(resolve_host_binary(Some(&g), None, None)),
+            InvalidBinaryReason::WorldWritable
+        );
+        let g2 = t.file("g2", 0o720);
+        assert_eq!(
+            reason(resolve_host_binary(Some(&g2), None, None)),
+            InvalidBinaryReason::WorldWritable
+        );
+        let o = t.file("o", 0o702);
+        assert_eq!(
+            reason(resolve_host_binary(Some(&o), None, None)),
             InvalidBinaryReason::WorldWritable
         );
         let n = t.file("n", 0o644);
