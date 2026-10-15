@@ -316,6 +316,9 @@ jobs:
           restore-keys: rust-${{ runner.os }}-test-v6-${{ steps.toolchain.outputs.cachekey }}-
       - name: "cargo clippy（workspace・--all-features・-D warnings）"
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # real_host は test = false で --all-targets から外れる。コンパイル崩れを PR で検出する（実行はしない）
+      - name: "cargo clippy（real_host・コンパイル確認のみ）"
+        run: cargo clippy -p fandhe-browser-render --test real_host --all-features -- -D warnings
       - name: "cargo test（workspace・--all-features）"
         if: ${{ !cancelled() }}
         run: cargo test --workspace --all-features
@@ -1145,6 +1148,32 @@ jobs:
       - name: "[servo-host] cargo test（dev・契約テストを含む）"
         if: ${{ !cancelled() }}
         run: cargo test --manifest-path servo-host/Cargo.toml --locked
+      # 本体の HostRenderer と実 Servo ホストを繋ぐ結合テスト（TASK-38.8b・#998）。real_host は
+      # test = false のため --all-targets の clippy にも入らず、ここで明示 clippy・明示実行する。
+      - name: "[render-real-host] ホストバイナリの用意（dev）"
+        if: ${{ !cancelled() }}
+        run: cargo build --manifest-path servo-host/Cargo.toml --locked
+      - name: "[render-real-host] cargo clippy（real_host・-D warnings）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p fandhe-browser-render --locked --test real_host -- -D warnings
+      - name: "[render-real-host] 実ホスト結合テスト（TASK-38.8b・#998）"
+        if: ${{ !cancelled() }}
+        env:
+          FANDHE_BROWSER_RENDER_HOST: ${{ github.workspace }}/servo-host/target/debug/fandhe-browser-servo-host
+        run: |
+          set -euo pipefail
+          if [ ! -x "$FANDHE_BROWSER_RENDER_HOST" ]; then
+            echo "error: servo host binary not found: $FANDHE_BROWSER_RENDER_HOST" >&2
+            exit 1
+          fi
+          log="$RUNNER_TEMP/real_host.log"
+          cargo test -p fandhe-browser-render --locked --test real_host -- --test-threads=1 2>&1 | tee "$log"
+          # 0 件実行で通さない（fail-closed）
+          passed="$(grep -Eo 'test result: ok\. [0-9]+ passed' "$log" | grep -Eo '[0-9]+' | head -1 || true)"
+          if [ -z "$passed" ] || [ "$passed" -lt 4 ]; then
+            echo "error: real_host ran ${passed:-0} tests (expected >= 4)" >&2
+            exit 1
+          fi
       - name: "[render-isolation] 自己テスト（合成データによる Servo 系検出の証跡確認）"
         if: ${{ !cancelled() }}
         run: bash scripts/check-render-isolation.sh --self-test
