@@ -36,7 +36,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use fandhe_browser_profile::Profile;
 
 use crate::page_actor::PageScriptHandle;
-use crate::render::{DisabledRenderer, Renderer};
+use crate::render::{
+    BoundingBox, DisabledRenderer, ElementRef, ElementVisibility, PageRef, RenderError, Renderer,
+    Screenshot, ScreenshotOptions,
+};
 
 /// 直近のナビゲート結果（最終 URL と HTML）。
 ///
@@ -299,9 +302,69 @@ impl NavigationState {
         Ok(())
     }
 
+    /// 世代と直近結果の組を同じロック内で取得する（`RENDER-3`・TASK-38）。
+    ///
+    /// `begin_navigation` / `replace_if_current` は世代と結果を同じロック内で更新するため、
+    /// 食い違った組（新しい世代に古い結果）は観測されない。[`RenderGate`] が使う。
+    fn snapshot(&self) -> (NavigationGeneration, Option<Arc<NavigationResult>>) {
+        let guard = self.lock();
+        (self.current_generation(), guard.clone())
+    }
+
     fn lock(&self) -> MutexGuard<'_, Option<Arc<NavigationResult>>> {
         // 書き込みは値全体の置き換えのみで途中状態が無いため、poison は回復して使う。
         self.latest.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// ナビゲーション世代を見て [`Renderer::load`] を挟む内部ゲート（`RENDER-1`・`RENDER-3`・
+/// TASK-38。`servo-host-design.md` §3.3）。
+///
+/// [`AppState`] が内包し、描画系メソッドの呼び出しごとに [`NavigationState`] の世代を
+/// 比べる。最後に `load` が成功した世代と異なるときだけ `load` を呼ぶ。`Profile` に依存しない
+/// 型として切り出し、3 OS で単体テストできるようにしている。
+///
+/// `load` から描画までを 1 つのロックで直列化する（設計 §2.4「同時に処理中の要求は 1」）。
+/// ロック取得順は「gate → navigation（短時間）」に固定する。`NavigationState` 側は gate を
+/// 取らず、`Renderer` は `AppState` を参照しないためデッドロックも再入も起きない。
+/// 残るリスク: snapshot 後に `begin_navigation` が走ると、その 1 回の描画は直前のページに
+/// 対して行われうる。次の呼び出しで世代の違いが検出され再ロードされる。ホストの起動世代
+/// （設計 §2.7）の管理は `HostRenderer`（#235）側の責務。
+struct RenderGate {
+    renderer: Arc<dyn Renderer>,
+    /// 最後に `load` が成功した世代。
+    loaded: Mutex<Option<NavigationGeneration>>,
+}
+
+impl RenderGate {
+    fn new(renderer: Arc<dyn Renderer>) -> Self {
+        Self {
+            renderer,
+            loaded: Mutex::new(None),
+        }
+    }
+
+    /// 必要なら `load` を呼んでから `f` を実行する。
+    ///
+    /// ページが無い（結果が `None`）ときは [`RenderError::PageNotLoaded`] を返し、前のページの
+    /// 描画を返さない（fail-closed）。`load` が失敗したら世代を記録せず、そのエラーを返す
+    /// （次の呼び出しで再試行する）。
+    fn with_page<T>(
+        &self,
+        nav: &NavigationState,
+        f: impl FnOnce(&dyn Renderer) -> Result<T, RenderError>,
+    ) -> Result<T, RenderError> {
+        // 書き込みは値全体の置き換えのみで途中状態が無いため、poison は回復して使う。
+        let mut loaded = self.loaded.lock().unwrap_or_else(PoisonError::into_inner);
+        let (generation, latest) = nav.snapshot();
+        let Some(latest) = latest else {
+            return Err(RenderError::PageNotLoaded);
+        };
+        if *loaded != Some(generation) {
+            self.renderer.load(&PageRef::new(latest.url()))?;
+            *loaded = Some(generation);
+        }
+        f(self.renderer.as_ref())
     }
 }
 
@@ -313,7 +376,7 @@ impl NavigationState {
 pub struct AppState {
     navigation: NavigationState,
     profile: Arc<Profile>,
-    renderer: Arc<dyn Renderer>,
+    render: RenderGate,
     page_scripts: PageScriptHandle,
 }
 
@@ -324,7 +387,7 @@ impl AppState {
         Self {
             navigation: NavigationState::new(),
             profile,
-            renderer,
+            render: RenderGate::new(renderer),
             // 既定は無効（スレッドも子プロセスも作らない。`JS-1`）。有効化は `with_page_scripts`。
             page_scripts: PageScriptHandle::disabled(),
         }
@@ -356,8 +419,42 @@ impl AppState {
     }
 
     /// 描画ハンドルを返す。
+    ///
+    /// 世代の判定（`load` の挿入）を経ない生のハンドル。ページを描画するときは、世代を
+    /// 判定する [`Self::capture_screenshot`]・[`Self::element_visibility`]・
+    /// [`Self::bounding_box`] を使うこと（`RENDER-3`・TASK-38）。
     pub fn renderer(&self) -> &Arc<dyn Renderer> {
-        &self.renderer
+        &self.render.renderer
+    }
+
+    /// 現在のページのスクリーンショットを取得する（`RENDER-1`・`RENDER-3`・TASK-38）。
+    ///
+    /// ナビゲーション世代が前回の `load` 成功時から変わっていれば、先に [`Renderer::load`] を
+    /// 呼ぶ。ページが無ければ [`RenderError::PageNotLoaded`]。同期でブロックしうるため、
+    /// async の呼び出し元（cdp・ai。結線は別 issue）は `spawn_blocking` 等で呼ぶこと。
+    pub fn capture_screenshot(
+        &self,
+        options: &ScreenshotOptions,
+    ) -> Result<Screenshot, RenderError> {
+        self.render
+            .with_page(&self.navigation, |r| r.capture_screenshot(options))
+    }
+
+    /// 現在のページ上の要素の可視性を判定する（`RENDER-1`・`RENDER-3`・TASK-38）。
+    /// 世代の扱いとブロッキングの注意は [`Self::capture_screenshot`] と同じ。
+    pub fn element_visibility(
+        &self,
+        element: &ElementRef,
+    ) -> Result<ElementVisibility, RenderError> {
+        self.render
+            .with_page(&self.navigation, |r| r.element_visibility(element))
+    }
+
+    /// 現在のページ上の要素の境界ボックスを取得する（`RENDER-1`・`RENDER-3`・TASK-38）。
+    /// 世代の扱いとブロッキングの注意は [`Self::capture_screenshot`] と同じ。
+    pub fn bounding_box(&self, element: &ElementRef) -> Result<BoundingBox, RenderError> {
+        self.render
+            .with_page(&self.navigation, |r| r.bounding_box(element))
     }
 
     /// ナビゲート状態を返す。
@@ -631,6 +728,154 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `load` と描画の呼び出し回数・渡された URL を記録するテスト用レンダラー。
+    struct CountingRenderer {
+        loads: std::sync::atomic::AtomicUsize,
+        renders: std::sync::atomic::AtomicUsize,
+        urls: Mutex<Vec<String>>,
+        load_error: Mutex<Option<RenderError>>,
+    }
+
+    impl CountingRenderer {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                loads: Default::default(),
+                renders: Default::default(),
+                urls: Mutex::new(Vec::new()),
+                load_error: Mutex::new(None),
+            })
+        }
+        fn loads(&self) -> usize {
+            self.loads.load(Ordering::SeqCst)
+        }
+        fn renders(&self) -> usize {
+            self.renders.load(Ordering::SeqCst)
+        }
+        fn urls(&self) -> Vec<String> {
+            self.urls.lock().unwrap().clone()
+        }
+        fn fail_load_with(&self, e: Option<RenderError>) {
+            *self.load_error.lock().unwrap() = e;
+        }
+    }
+
+    impl Renderer for CountingRenderer {
+        fn load(&self, page: &PageRef) -> Result<crate::render::PageLoad, RenderError> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            self.urls.lock().unwrap().push(page.url().to_string());
+            match self.load_error.lock().unwrap().take() {
+                Some(e) => Err(e),
+                None => Ok(crate::render::PageLoad::new(page.url())),
+            }
+        }
+        fn capture_screenshot(&self, _: &ScreenshotOptions) -> Result<Screenshot, RenderError> {
+            self.renders.fetch_add(1, Ordering::SeqCst);
+            Ok(Screenshot::new(
+                crate::render::ImageFormat::Png,
+                1,
+                1,
+                vec![0],
+            ))
+        }
+        fn element_visibility(&self, _: &ElementRef) -> Result<ElementVisibility, RenderError> {
+            self.renders.fetch_add(1, Ordering::SeqCst);
+            Ok(ElementVisibility::new(true))
+        }
+        fn bounding_box(&self, _: &ElementRef) -> Result<BoundingBox, RenderError> {
+            self.renders.fetch_add(1, Ordering::SeqCst);
+            Ok(BoundingBox::new(1.0, 2.0, 3.0, 4.0))
+        }
+    }
+
+    fn navigate(nav: &NavigationState, url: &str) {
+        let g = nav.begin_navigation().unwrap();
+        nav.commit_navigation(g, NavigationResult::new(url, "<p></p>"))
+            .unwrap();
+    }
+
+    fn shot(gate: &RenderGate, nav: &NavigationState) -> Result<Screenshot, RenderError> {
+        gate.with_page(nav, |r| r.capture_screenshot(&ScreenshotOptions::new()))
+    }
+
+    #[test]
+    fn render3_gate_returns_page_not_loaded_without_navigation() {
+        let r = CountingRenderer::new();
+        let gate = RenderGate::new(r.clone());
+        let nav = NavigationState::new();
+        assert!(matches!(shot(&gate, &nav), Err(RenderError::PageNotLoaded)));
+        assert_eq!((r.loads(), r.renders()), (0, 0));
+    }
+
+    #[test]
+    fn render3_gate_loads_once_then_reuses_same_generation() {
+        let r = CountingRenderer::new();
+        let gate = RenderGate::new(r.clone());
+        let nav = NavigationState::new();
+        navigate(&nav, "https://a.example/");
+        shot(&gate, &nav).unwrap();
+        shot(&gate, &nav).unwrap();
+        assert_eq!((r.loads(), r.renders()), (1, 2));
+        assert_eq!(r.urls(), vec!["https://a.example/".to_string()]);
+    }
+
+    #[test]
+    fn render3_gate_reloads_after_generation_change() {
+        let r = CountingRenderer::new();
+        let gate = RenderGate::new(r.clone());
+        let nav = NavigationState::new();
+        navigate(&nav, "https://a.example/");
+        shot(&gate, &nav).unwrap();
+        navigate(&nav, "https://b.example/");
+        shot(&gate, &nav).unwrap();
+        assert_eq!((r.loads(), r.renders()), (2, 2));
+        assert_eq!(
+            r.urls(),
+            vec![
+                "https://a.example/".to_string(),
+                "https://b.example/".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn render3_gate_does_not_record_failed_load() {
+        let r = CountingRenderer::new();
+        let gate = RenderGate::new(r.clone());
+        let nav = NavigationState::new();
+        navigate(&nav, "https://a.example/");
+        r.fail_load_with(Some(RenderError::HostUnavailable));
+        assert!(matches!(
+            shot(&gate, &nav),
+            Err(RenderError::HostUnavailable)
+        ));
+        assert_eq!((r.loads(), r.renders()), (1, 0));
+        shot(&gate, &nav).unwrap();
+        assert_eq!((r.loads(), r.renders()), (2, 1));
+    }
+
+    #[test]
+    fn render3_gate_page_not_loaded_while_navigating() {
+        let r = CountingRenderer::new();
+        let gate = RenderGate::new(r.clone());
+        let nav = NavigationState::new();
+        navigate(&nav, "https://a.example/");
+        shot(&gate, &nav).unwrap();
+        nav.begin_navigation().unwrap();
+        assert!(matches!(shot(&gate, &nav), Err(RenderError::PageNotLoaded)));
+        assert_eq!((r.loads(), r.renders()), (1, 1));
+    }
+
+    #[test]
+    fn render3_gate_disabled_renderer_propagates_rendering_disabled() {
+        let gate = RenderGate::new(Arc::new(DisabledRenderer::new()));
+        let nav = NavigationState::new();
+        navigate(&nav, "https://a.example/");
+        assert!(matches!(
+            shot(&gate, &nav),
+            Err(RenderError::RenderingDisabled)
+        ));
     }
 
     #[test]
