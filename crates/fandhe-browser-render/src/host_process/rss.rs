@@ -83,6 +83,11 @@ fn probe_macos(pid: u32) -> Option<u64> {
     Some(kib.saturating_mul(1024))
 }
 
+/// 監視スレッドを起動できなかった（スレッド資源不足など）。
+/// 「この OS に RSS プローブが無い」こと（`Ok(None)`）とは区別する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RssStartError;
+
 /// 監視スレッドのハンドル。Drop で停止を通知する（スレッドは detach され、次の待機で終わる）。
 #[derive(Debug)]
 pub struct RssMonitor {
@@ -90,7 +95,8 @@ pub struct RssMonitor {
 }
 
 impl RssMonitor {
-    /// 監視を始める。プローブが無い OS では `None`（監視しない）。
+    /// 監視を始める。プローブが無い OS では `Ok(None)`（監視しない）。
+    /// スレッドを起動できなければ `Err`（呼び出し側が子を kill・wait して失敗を返す）。
     /// 上限超過または連続読み取り失敗で `exceeded` を立てて `child` を kill する。
     pub fn start(
         pid: u32,
@@ -98,12 +104,12 @@ impl RssMonitor {
         interval: Duration,
         child: Arc<Mutex<Child>>,
         exceeded: Arc<AtomicBool>,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, RssStartError> {
         if !probe_supported() {
-            return None;
+            return Ok(None);
         }
         let (tx, rx) = mpsc::channel::<()>();
-        let spawned = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("render-host-rss".into())
             .spawn(move || {
                 let mut failures = 0u32;
@@ -130,8 +136,9 @@ impl RssMonitor {
                         return;
                     }
                 }
-            });
-        spawned.ok().map(|_| Self { _stop: tx })
+            })
+            .map_err(|_| RssStartError)?;
+        Ok(Some(Self { _stop: tx }))
     }
 }
 

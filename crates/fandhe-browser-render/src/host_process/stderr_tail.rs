@@ -11,6 +11,8 @@ pub const STDERR_TAIL_BYTES: usize = 8 * 1024;
 #[derive(Debug, Default)]
 pub struct StderrTail {
     buf: Vec<u8>,
+    /// 先頭側を捨てたか。捨てた場合、先頭の語は途中で切れており伏字化できないため破棄する。
+    truncated: bool,
 }
 
 impl StderrTail {
@@ -23,10 +25,14 @@ impl StderrTail {
     pub fn push(&mut self, data: &[u8]) {
         // 巨大な入力でも確保が上限を大きく超えないよう、末尾だけを取り込む。
         let start = data.len().saturating_sub(STDERR_TAIL_BYTES);
+        if start > 0 {
+            self.truncated = true;
+        }
         if let Some(tail) = data.get(start..) {
             self.buf.extend_from_slice(tail);
         }
         if self.buf.len() > STDERR_TAIL_BYTES {
+            self.truncated = true;
             let excess = self.buf.len() - STDERR_TAIL_BYTES;
             self.buf.drain(..excess);
         }
@@ -40,8 +46,20 @@ impl StderrTail {
 
     /// 伏字化した文字列。語中の `?` 以降を `?<redacted>` にし、
     /// `scheme://userinfo@` の userinfo を除く。
+    ///
+    /// 先頭を切り捨てている場合は、切断位置にかかった先頭の語（`scheme://` や `?` を欠いて
+    /// 機密部分だけが残りうる）を空白まで破棄してから伏字化する（設計 §2.6）。
     pub fn redacted(&self) -> String {
-        redact(&String::from_utf8_lossy(&self.buf))
+        let text = String::from_utf8_lossy(&self.buf);
+        if self.truncated {
+            let rest = text
+                .find(char::is_whitespace)
+                .and_then(|i| text.get(i..))
+                .unwrap_or("");
+            redact(rest)
+        } else {
+            redact(&text)
+        }
     }
 }
 
@@ -105,5 +123,38 @@ mod tests {
             t.redacted(),
             "load https://a.example/b?<redacted> failed\nnext https://h.example/p#f ok\n"
         );
+    }
+
+    #[test]
+    fn render3_drops_cut_leading_word_so_query_secret_never_leaks() {
+        // 切断位置が URL の `?` の直後に来るように詰める。
+        let head = "https://h.example/p?";
+        let mut tail = String::from("token=SECRET123 rest\n");
+        tail.push_str(&" ".repeat(STDERR_TAIL_BYTES - tail.len()));
+        let expect = format!(" rest\n{}", " ".repeat(STDERR_TAIL_BYTES - 21));
+        let mut data = vec![b'a'; 50];
+        data.extend_from_slice(head.as_bytes());
+        data.extend_from_slice(tail.as_bytes());
+
+        // 1 回の push（入力側の切り捨て）。
+        let mut t = StderrTail::new();
+        t.push(&data);
+        assert_eq!(t.as_bytes().len(), STDERR_TAIL_BYTES);
+        assert!(t.as_bytes().starts_with(b"token=SECRET123"));
+        assert_eq!(t.redacted(), expect);
+
+        // 2 回の push（drain による切り捨て）。
+        let mut t = StderrTail::new();
+        let (a, b) = data.split_at(100);
+        t.push(a);
+        t.push(b);
+        assert_eq!(t.redacted(), expect);
+    }
+
+    #[test]
+    fn render3_untruncated_buffer_keeps_first_word() {
+        let mut t = StderrTail::new();
+        t.push(b"first https://h.example/p?token=SECRET123\n");
+        assert_eq!(t.redacted(), "first https://h.example/p?<redacted>\n");
     }
 }

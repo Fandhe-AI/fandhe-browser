@@ -66,8 +66,9 @@ use crate::codec::{
     encode_request, read_frame, response_frame_limit, write_frame,
 };
 use crate::protocol::{
-    Hello, HostError, HostErrorKind, LoadParams, LoadResult, MAX_LOAD_TIMEOUT_MS, Method,
-    MethodResult, PROTOCOL_VERSION, ProtocolError, Request, RequestId,
+    Hello, HelloLimits, HostError, HostErrorKind, LoadParams, LoadResult, MAX_LOAD_TIMEOUT_MS,
+    MAX_SELECTOR_BYTES, MAX_URL_BYTES, Method, MethodResult, PROTOCOL_VERSION, ProtocolError,
+    Request, RequestId,
 };
 use breaker::CircuitBreaker;
 use rss::RssMonitor;
@@ -402,6 +403,28 @@ impl fmt::Debug for HostProcess {
     }
 }
 
+/// 要求フレーム長と URL・セレクタ長が、固定上限とホスト申告値の小さい方（実効上限）に
+/// 収まるか。`limits` が無い（hello 前）場合は固定上限だけで判定する。
+fn request_within_limits(
+    limits: Option<&HelloLimits>,
+    request: &Request,
+    frame_len: usize,
+) -> bool {
+    let frame_max = effective_limit(
+        MAX_REQUEST_FRAME_BYTES,
+        limits.map(|l| l.request_frame_bytes),
+    );
+    let url_max = effective_limit(MAX_URL_BYTES, limits.map(|l| l.url_bytes));
+    let selector_max = effective_limit(MAX_SELECTOR_BYTES, limits.map(|l| l.selector_bytes));
+    let param_ok = match request {
+        Request::Load(p) => p.url().len() <= url_max,
+        Request::Visibility(p) => p.selector().len() <= selector_max,
+        Request::BoundingBox(p) => p.selector().len() <= selector_max,
+        Request::Screenshot(_) | Request::Shutdown => true,
+    };
+    param_ok && frame_len <= frame_max
+}
+
 fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
@@ -531,7 +554,13 @@ impl HostProcess {
             let deadline = Instant::now() + self.config.timeouts.shutdown_grace;
             if let Ok(id) = RequestId::new(self.next_id) {
                 self.next_id += 1;
-                if let Ok(bytes) = encode_request(id, &Request::Shutdown) {
+                if let Ok(bytes) = encode_request(id, &Request::Shutdown)
+                    && request_within_limits(
+                        r.hello.as_ref().map(|h| &h.limits),
+                        &Request::Shutdown,
+                        bytes.len(),
+                    )
+                {
                     let limit = response_frame_limit(Method::Shutdown);
                     // 応答の中身は見ない。受け取れても受け取れなくても、猶予の間に終了を待つ。
                     let _ = roundtrip(r, bytes, limit, deadline, TimeoutPhase::Shutdown);
@@ -607,6 +636,11 @@ impl HostProcess {
             let Some(r) = self.running.as_ref() else {
                 return Err(HostProcessError::Crashed);
             };
+            // ホストが申告した上限（固定上限との min）を超える要求は送らない。
+            // 呼び出し側の入力の問題でありホストの失敗ではないため、破棄もブレーカー記録もしない。
+            if !request_within_limits(r.hello.as_ref().map(|h| &h.limits), request, payload.len()) {
+                return Err(HostProcessError::InvalidRequest);
+            }
             let declared = r.hello.as_ref().map(|h| {
                 if method == Method::Screenshot {
                     h.limits.screenshot_frame_bytes
@@ -788,13 +822,23 @@ impl HostProcess {
 
         let child = Arc::new(Mutex::new(child));
         let exceeded = Arc::new(AtomicBool::new(false));
-        let monitor = RssMonitor::start(
+        let monitor = match RssMonitor::start(
             pid,
             self.config.rss_limit_bytes,
             self.config.rss_poll_interval,
             Arc::clone(&child),
             Arc::clone(&exceeded),
-        );
+        ) {
+            Ok(m) => m,
+            Err(_) => {
+                // 監視できないまま走らせない（RSS 上限が黙って無効になるのを防ぐ）。
+                if let Ok(mut c) = child.lock() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                return Err(self.fail_spawn());
+            }
+        };
         self.running = Some(Running {
             child,
             pid,
@@ -861,6 +905,7 @@ impl Drop for HostProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::VisibilityParams;
 
     fn loaded() -> LoadedPage {
         LoadedPage {
@@ -909,5 +954,66 @@ mod tests {
         assert_eq!(HostProcessError::CircuitOpen.to_string(), {
             "render host restarts are suspended after repeated failures"
         });
+    }
+
+    fn limits(request: u64, url: u64, selector: u64) -> HelloLimits {
+        HelloLimits {
+            request_frame_bytes: request,
+            response_frame_bytes: 1024,
+            hello_frame_bytes: 1024,
+            screenshot_frame_bytes: 1024,
+            url_bytes: url,
+            selector_bytes: selector,
+            error_message_bytes: 512,
+            max_in_flight: 1,
+        }
+    }
+
+    #[test]
+    fn render3_request_limits_use_min_of_fixed_and_declared() {
+        let url = "https://example.com/aaaaaaaaaa"; // 30 バイト
+        let load = Request::Load(LoadParams::new(url, None).unwrap());
+        // 申告 url_bytes 29 < 30 は拒否、30 は許可。
+        assert!(!request_within_limits(
+            Some(&limits(65536, 29, 1024)),
+            &load,
+            100
+        ));
+        assert!(request_within_limits(
+            Some(&limits(65536, 30, 1024)),
+            &load,
+            100
+        ));
+        // 要求フレーム上限 99 < 100 は拒否。
+        assert!(!request_within_limits(
+            Some(&limits(99, 2048, 1024)),
+            &load,
+            100
+        ));
+        // 固定上限（64 KiB）を申告値が引き上げても越えられない。
+        assert!(!request_within_limits(
+            Some(&limits(u64::MAX, 2048, 1024)),
+            &load,
+            MAX_REQUEST_FRAME_BYTES + 1
+        ));
+        // セレクタ。
+        let sel = Request::Visibility(VisibilityParams::new("div.item").unwrap()); // 8 バイト
+        assert!(!request_within_limits(
+            Some(&limits(65536, 2048, 7)),
+            &sel,
+            50
+        ));
+        assert!(request_within_limits(
+            Some(&limits(65536, 2048, 8)),
+            &sel,
+            50
+        ));
+        // shutdown はフレーム上限のみ。
+        assert!(!request_within_limits(
+            Some(&limits(10, 2048, 1024)),
+            &Request::Shutdown,
+            11
+        ));
+        assert!(request_within_limits(None, &Request::Shutdown, 11));
     }
 }

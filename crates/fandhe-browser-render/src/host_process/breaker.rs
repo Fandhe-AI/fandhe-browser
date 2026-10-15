@@ -65,10 +65,14 @@ impl CircuitBreaker {
         }
     }
 
-    /// 成功（正常な応答）を記録する。履歴と半開き状態を解除する。
+    /// 成功（正常な応答）を記録する。通常時は窓内の失敗履歴を維持する
+    /// （load だけ成功し screenshot で毎回落ちるホストでもブレーカーが作動するように。
+    /// 設計 §2.7・RENDER-4）。履歴を消すのは半開きからの復帰のときだけ。
     pub fn record_success(&mut self) {
-        self.failures.clear();
-        self.half_open = false;
+        if self.half_open {
+            self.failures.clear();
+            self.half_open = false;
+        }
     }
 
     fn trip(&mut self, now: Instant) {
@@ -132,5 +136,20 @@ mod tests {
         b.record_success();
         b.record_failure(at(t0, 130));
         assert!(b.check(at(t0, 131)).is_ok());
+    }
+
+    #[test]
+    fn render4_success_between_failures_does_not_reset_history() {
+        let t0 = Instant::now();
+        let mut b = CircuitBreaker::new();
+        // load 成功 → screenshot クラッシュ、を繰り返す。
+        for i in 0..3u64 {
+            b.record_success();
+            b.record_failure(at(t0, i * 5));
+        }
+        assert!(matches!(
+            b.check(at(t0, 11)),
+            Err(HostProcessError::CircuitOpen)
+        ));
     }
 }
