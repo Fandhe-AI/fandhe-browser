@@ -165,6 +165,234 @@ fn be32(data: &[u8], at: usize) -> u32 {
     u32::from_be_bytes(b)
 }
 
+/// テスト用の最小 DEFLATE 伸長（RFC 1951。puff 方式）。依存を増やさず PNG の画素を検証するために置く。
+struct Bits<'a> {
+    d: &'a [u8],
+    pos: usize,
+    bit: u32,
+}
+
+impl Bits<'_> {
+    fn one(&mut self) -> u32 {
+        let byte = *self.d.get(self.pos).expect("deflate eof");
+        let v = (u32::from(byte) >> self.bit) & 1;
+        self.bit += 1;
+        if self.bit == 8 {
+            self.bit = 0;
+            self.pos += 1;
+        }
+        v
+    }
+    fn bits(&mut self, n: u32) -> u32 {
+        (0..n).fold(0, |acc, i| acc | (self.one() << i))
+    }
+}
+
+/// 正準 Huffman 表（長さ別の個数とシンボル列）。
+struct Huff {
+    count: [u16; 16],
+    symbol: Vec<u16>,
+}
+
+impl Huff {
+    fn new(lengths: &[u8]) -> Self {
+        let mut count = [0u16; 16];
+        for &l in lengths {
+            count[usize::from(l)] += 1;
+        }
+        let mut offs = [0u16; 16];
+        for i in 1..15 {
+            offs[i + 1] = offs[i] + count[i];
+        }
+        let mut symbol = vec![0u16; lengths.len()];
+        for (s, &l) in lengths.iter().enumerate() {
+            if l != 0 {
+                symbol[usize::from(offs[usize::from(l)])] = u16::try_from(s).expect("sym");
+                offs[usize::from(l)] += 1;
+            }
+        }
+        Self { count, symbol }
+    }
+    fn decode(&self, b: &mut Bits) -> usize {
+        let (mut code, mut first, mut index) = (0i32, 0i32, 0i32);
+        for len in 1..16 {
+            code |= i32::try_from(b.one()).expect("bit");
+            let c = i32::from(self.count[len]);
+            if code - c < first {
+                return usize::from(
+                    self.symbol[usize::try_from(index + (code - first)).expect("idx")],
+                );
+            }
+            index += c;
+            first = (first + c) << 1;
+            code <<= 1;
+        }
+        panic!("bad huffman code");
+    }
+}
+
+fn inflate(data: &[u8]) -> Vec<u8> {
+    const LBASE: [u16; 29] = [
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
+        131, 163, 195, 227, 258,
+    ];
+    const LEXT: [u8; 29] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+    ];
+    const DBASE: [u16; 30] = [
+        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+        2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+    ];
+    const DEXT: [u8; 30] = [
+        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12,
+        13, 13,
+    ];
+    let mut b = Bits {
+        d: data,
+        pos: 0,
+        bit: 0,
+    };
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let last = b.one();
+        match b.bits(2) {
+            0 => {
+                if b.bit != 0 {
+                    b.bit = 0;
+                    b.pos += 1;
+                }
+                let len = usize::from(data[b.pos]) | (usize::from(data[b.pos + 1]) << 8);
+                out.extend_from_slice(&data[b.pos + 4..b.pos + 4 + len]);
+                b.pos += 4 + len;
+            }
+            t @ (1 | 2) => {
+                let (lit, dist) = if t == 1 {
+                    let mut l = [8u8; 288];
+                    l[144..256].fill(9);
+                    l[256..280].fill(7);
+                    (Huff::new(&l), Huff::new(&[5u8; 30]))
+                } else {
+                    let nlen = usize::try_from(b.bits(5)).expect("n") + 257;
+                    let ndist = usize::try_from(b.bits(5)).expect("n") + 1;
+                    let ncode = usize::try_from(b.bits(4)).expect("n") + 4;
+                    const ORDER: [usize; 19] = [
+                        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+                    ];
+                    let mut cl = [0u8; 19];
+                    for &o in ORDER.iter().take(ncode) {
+                        cl[o] = u8::try_from(b.bits(3)).expect("len");
+                    }
+                    let clh = Huff::new(&cl);
+                    let mut lens = vec![0u8; nlen + ndist];
+                    let mut i = 0;
+                    while i < nlen + ndist {
+                        let sym = clh.decode(&mut b);
+                        if sym < 16 {
+                            lens[i] = u8::try_from(sym).expect("len");
+                            i += 1;
+                        } else {
+                            let (v, rep) = match sym {
+                                16 => (lens[i - 1], 3 + b.bits(2)),
+                                17 => (0, 3 + b.bits(3)),
+                                _ => (0, 11 + b.bits(7)),
+                            };
+                            for _ in 0..rep {
+                                lens[i] = v;
+                                i += 1;
+                            }
+                        }
+                    }
+                    (Huff::new(&lens[..nlen]), Huff::new(&lens[nlen..]))
+                };
+                loop {
+                    let sym = lit.decode(&mut b);
+                    if sym < 256 {
+                        out.push(u8::try_from(sym).expect("lit"));
+                    } else if sym == 256 {
+                        break;
+                    } else {
+                        let s = sym - 257;
+                        let len = usize::from(LBASE[s])
+                            + usize::try_from(b.bits(u32::from(LEXT[s]))).expect("e");
+                        let ds = dist.decode(&mut b);
+                        let d = usize::from(DBASE[ds])
+                            + usize::try_from(b.bits(u32::from(DEXT[ds]))).expect("e");
+                        for _ in 0..len {
+                            out.push(out[out.len() - d]);
+                        }
+                    }
+                }
+            }
+            _ => panic!("bad deflate block"),
+        }
+        if last == 1 {
+            return out;
+        }
+    }
+}
+
+/// 8bit RGBA・非インターレースの PNG を復号して (x, y) の画素を返す。IDAT を連結して zlib を剥がし、
+/// 行フィルタ（None/Sub/Up/Average/Paeth）を戻す。
+fn png_pixel(png: &[u8], x: usize, y: usize) -> [u8; 4] {
+    assert_eq!(
+        png.get(24..29),
+        Some(&[8u8, 6, 0, 0, 0][..]),
+        "RGBA8 non-interlaced"
+    );
+    let (w, h) = (be32(png, 16) as usize, be32(png, 20) as usize);
+    let mut idat = Vec::new();
+    let mut at = 8;
+    while at + 8 <= png.len() {
+        let len = be32(png, at) as usize;
+        if png.get(at + 4..at + 8) == Some(&b"IDAT"[..]) {
+            idat.extend_from_slice(&png[at + 8..at + 8 + len]);
+        }
+        at += 12 + len;
+    }
+    let raw = inflate(&idat[2..]);
+    let stride = w * 4;
+    assert_eq!(raw.len(), (stride + 1) * h);
+    let mut img = vec![0u8; stride * h];
+    for r in 0..h {
+        let f = raw[r * (stride + 1)];
+        for i in 0..stride {
+            let cur = raw[r * (stride + 1) + 1 + i];
+            let a = if i >= 4 { img[r * stride + i - 4] } else { 0 };
+            let b = if r > 0 { img[(r - 1) * stride + i] } else { 0 };
+            let c = if r > 0 && i >= 4 {
+                img[(r - 1) * stride + i - 4]
+            } else {
+                0
+            };
+            let pred = match f {
+                0 => 0,
+                1 => a,
+                2 => b,
+                3 => u8::try_from((u16::from(a) + u16::from(b)) / 2).expect("avg"),
+                4 => {
+                    let p = i32::from(a) + i32::from(b) - i32::from(c);
+                    let (pa, pb, pc) = (
+                        (p - i32::from(a)).abs(),
+                        (p - i32::from(b)).abs(),
+                        (p - i32::from(c)).abs(),
+                    );
+                    if pa <= pb && pa <= pc {
+                        a
+                    } else if pb <= pc {
+                        b
+                    } else {
+                        c
+                    }
+                }
+                _ => panic!("bad filter"),
+            };
+            img[r * stride + i] = cur.wrapping_add(pred);
+        }
+    }
+    let o = y * stride + x * 4;
+    [img[o], img[o + 1], img[o + 2], img[o + 3]]
+}
+
 /// RENDER-3: load・screenshot・visibility・bounding_box が実ホストで具体値どおりに返る。
 #[test]
 fn render3_real_host_roundtrip() {
@@ -187,6 +415,9 @@ fn render3_real_host_roundtrip() {
     );
     assert_eq!(shot.data.get(12..16), Some(&b"IHDR"[..]));
     assert_eq!((be32(&shot.data, 16), be32(&shot.data, 20)), (1280, 800));
+    // 描画内容: 上部は赤（#f00）、下部は青（#00f）。白紙や前ページの画像を返す回帰を検出する。
+    assert_eq!(png_pixel(&shot.data, 640, 100), [255, 0, 0, 255]);
+    assert_eq!(png_pixel(&shot.data, 640, 700), [0, 0, 255, 255]);
 
     // 未対応の full_page は成功を装わない。
     let e = r
