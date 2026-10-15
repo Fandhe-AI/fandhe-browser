@@ -48,16 +48,7 @@ license = "MIT OR Apache-2.0"
 # `publish = false` の private crate」という前提に立っているため、ここで明示する。
 publish = false
 
-# TASK-33（33.1）・RENDER-1・MS-1: `fandhe-browser-render`（Servo・MPL-2.0）を
-# feature gate `rendering` 経由の optional 依存として持つのは唯一
-# `fandhe-browser-cli`（`optional = true` + `rendering = ["dep:fandhe-browser-render"]`）
-# の想定（PoC-6 `docs/spec/03-poc/rendering-layer-servo/two-layer-workspace/` 準拠）。
-# ここでは cli 側から `{ workspace = true }` で参照できるよう path 参照のみを
-# 登録し、cli crate が `optional = true` で参照する（TASK-33.4・Issue #459）。
-# 外部（registry）クレートの追加・更新は本エントリと異なり、
-# dependency-policy.md のユーザー承認制（`=x.y.z` 完全固定）に従う。
 [workspace.dependencies]
-fandhe-browser-render = { path = "crates/fandhe-browser-render" }
 
 # TASK-14.2（Issue #93・AISNAP-1）: 生 HTML のトークン量（cl100k_base）計測用。
 # 採否・バージョンは Issue #92 に記録済み。ライセンスは MIT。配置は

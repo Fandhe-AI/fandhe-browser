@@ -23,18 +23,12 @@ fandhe-backend-core = { workspace = true }
 fandhe-backend-routes = { workspace = true }
 # ランタイム構築（#35 で承認済み。feature は workspace 定義のまま）
 tokio = { workspace = true }
-# render（Servo・MPL-2.0）の optional 依存。workspace 内 path 依存（TASK-33.1・#45 で登録済み。registry クレートではない）。
-# `dep:` 経由でのみ有効化し、暗黙の feature は作らない
-fandhe-browser-render = { workspace = true, optional = true }
+# render は Servo 非依存の IPC クライアント（MPL-2.0 の Servo は別 workspace のホストに隔離）で、無条件依存。
+# ホストバイナリはパスが解決できたときだけ `HostRenderer` として遅延起動する（TASK-38.7・#236・設計 §3.2・RENDER-1）。
+# workspace 内 path 依存で registry クレートの追加ではない。既定ビルドに Servo 系が入らないことは
+# scripts/check-render-isolation.sh が担保する。
+fandhe-browser-render = { path = "../fandhe-browser-render" }
 
-# TASK-33.4・RENDER-1・MS-1（#459）: render を optional 依存に持つのは cli だけ（spec TASK-33）。
-# `rendering` は既定 feature に含めないオプトイン。`dep:` 接頭辞により、外から有効にできる入口を
-# `rendering` だけにする（暗黙の feature `fandhe-browser-render` を作らない）。
-# 既定ビルドの依存グラフに Servo 系クレートが入らないことは scripts/check-render-isolation.sh の検査 A〜E が担保する
-# （render crate 自体は Servo 非依存の IPC クライアントのため許容される。#992）。
-# 現状は依存の結線だけで挙動は変わらない（REPAIR-3）。render crate はまだ雛形で `Renderer` 実装を持たず、
-# cli のコードからも参照していない。将来、core::render の描画トレイトへ render 実装を結線し
-# Servo を組み込む（TASK-38・RENDER-1 系）。
 [features]
 # TASK-30.2・JS-2・JS-1「JS エンジンの切替方式」決定 2・3・MS-3（#160）: JS エンジンの同梱を決める
 # feature 連鎖 `cli → core → js` の最上流。JS エンジンの `default` を持つのは cli だけにする
@@ -48,8 +42,6 @@ fandhe-browser-render = { workspace = true, optional = true }
 default = ["js-v8"]
 js-v8 = ["fandhe-browser-core/js-v8"]
 js-boa = ["fandhe-browser-core/js-boa"]
-# `rendering` は JS の feature と独立に組み合わせられる（既定には含めない）
-rendering = ["dep:fandhe-browser-render"]
 
 [dev-dependencies]
 # テストでの JSON 検証（#419 で承認済み）

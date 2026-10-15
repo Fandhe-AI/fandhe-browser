@@ -15,8 +15,9 @@
 //!   正常停止には tokio の `signal` feature（依存変更・要承認）が要る
 //! - ポート・bind 先・プロファイルの明示指定: TASK-47（`CLI-1`）・TASK-60.4 で追加する。
 //!   現状は [`DEFAULT_ADDR`] 固定
-//! - feature `rendering` 時の描画実装の注入: render crate が `Renderer` を実装した時点
-//!   （TASK-33・`RENDER-1`）で `AppState::new` へ渡す。現状は常に無効レンダラー
+//! - 描画実装のホストパスを設定ファイルから渡すこと: 設定キーが core の `Config` に未定義のため、
+//!   現状はホストパスを環境変数・本体の隣の実行ファイルからだけ解決する
+//!   （`render_host`。TASK-38.7・#236・`RENDER-3`。設定キーの追加は後続課題）
 //!
 //! # 対応 OS
 //!
@@ -40,8 +41,10 @@ use std::sync::Arc;
 use fandhe_backend_core::server::{BoundServer, Server};
 use fandhe_backend_routes::{Router, RouterMergeError};
 use fandhe_browser_cdp::{CdpState, WsConfigError, endpoints};
+use fandhe_browser_core::render::Renderer;
 use fandhe_browser_core::{AppState, PageScriptHandle};
 use fandhe_browser_profile::{ProfileError, ProfileStore};
+use fandhe_browser_render::host_process::HostProcessError;
 
 /// 既定の待ち受けアドレス。9333 は spec `api-cdp.md` のレスポンス例（`CDP-1`）に合わせた値。
 pub(crate) const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9333);
@@ -93,6 +96,9 @@ pub(crate) const CONFIG_IO_MESSAGE: &str = "failed to read the config file";
 pub(crate) const CONFIG_PROFILE_ROOT_INVALID_MESSAGE: &str =
     "profile.root in the config file is invalid";
 
+/// 描画ホストのバイナリが不正だった場合の固定文言（`RENDER-3`・TASK-38.7）。パスは含めない。
+pub(crate) const RENDER_HOST_INVALID_MESSAGE: &str = "render host binary is invalid (FANDHE_BROWSER_RENDER_HOST or the adjacent fandhe-browser-servo-host)";
+
 /// 起動時のエラー。`Display` は固定の英語文言で、入力値（パス・アドレス等）を埋め込まない。
 ///
 /// 例外は [`StartupError::Config`] のみで、core の設定エラー文言（指定値・同梱エンジン一覧・
@@ -119,6 +125,8 @@ pub(crate) enum StartupError {
     NonLoopbackAddr,
     /// bind の失敗。
     Bind(io::Error),
+    /// 描画ホストの解決の失敗（未設定の `Disabled` は無効レンダラーになり、ここへは来ない）。
+    RenderHost(HostProcessError),
     /// 非同期ランタイムの構築失敗。
     Runtime(io::Error),
     /// 待ち受けループの異常終了。
@@ -145,6 +153,7 @@ impl fmt::Display for StartupError {
             Self::WebSocketConfig(_) => f.write_str("failed to build websocket config"),
             Self::RouteConflict(_) => f.write_str("router merge conflict"),
             Self::NonLoopbackAddr => f.write_str("refusing to bind a non-loopback address"),
+            Self::RenderHost(_) => f.write_str(RENDER_HOST_INVALID_MESSAGE),
             Self::Bind(_) => f.write_str("failed to bind listener"),
             Self::Runtime(_) => f.write_str("failed to build async runtime"),
             Self::Serve(_) => f.write_str("server terminated abnormally"),
@@ -161,6 +170,7 @@ impl std::error::Error for StartupError {
             Self::WebSocketConfig(e) => Some(e),
             Self::RouteConflict(e) => Some(e),
             Self::NonLoopbackAddr => None,
+            Self::RenderHost(e) => Some(e),
             Self::Bind(e) | Self::Runtime(e) | Self::Serve(e) => Some(e),
         }
     }
@@ -169,10 +179,14 @@ impl std::error::Error for StartupError {
 /// ストアからプロファイルを開き、`AppState` を 1 つだけ生成する（`AISNAP-6`・`PROF-1`）。
 ///
 /// ページスクリプト無効の既定構成（テスト用の薄いラッパー。本番は `run` が [`open_app_state_with`] を呼ぶ）。
-/// 描画実装は未注入（スタブ節参照）のため無効レンダラーを使う。
+/// 描画実装は常に無効レンダラーを使う。
 #[cfg(test)]
 pub(crate) fn open_app_state(store: &dyn ProfileStore) -> Result<Arc<AppState>, StartupError> {
-    open_app_state_with(store, PageScriptHandle::disabled())
+    open_app_state_with(
+        store,
+        PageScriptHandle::disabled(),
+        Arc::new(fandhe_browser_core::render::DisabledRenderer::new()),
+    )
 }
 
 /// [`open_app_state`] に、ページスクリプト実行アクターのハンドルを渡す版（TASK-112・`JS-1`・`JS-4`）。
@@ -180,13 +194,17 @@ pub(crate) fn open_app_state(store: &dyn ProfileStore) -> Result<Arc<AppState>, 
 /// ハンドルは `main` が設定 `[js] execute_page_scripts` から構築する（無効なら無効ハンドル）。
 /// `AppState` → `CdpState::app_state()` 経由で cdp の `Page.navigate` 経路から到達できる
 /// （cdp の `navigate_gated` へ接続済み。TASK-112・#785）。ハンドルを渡してもスレッドは起動しない（遅延起動）。
+///
+/// `renderer` は `main` が `render_host` で選んだ描画実装（ホスト解決時のみ `HostRenderer`、
+/// 未設定なら無効レンダラー。TASK-38.7・#236・`RENDER-3`）。
 pub(crate) fn open_app_state_with(
     store: &dyn ProfileStore,
     page_scripts: PageScriptHandle,
+    renderer: Arc<dyn Renderer>,
 ) -> Result<Arc<AppState>, StartupError> {
     let profile = store.open_or_create().map_err(StartupError::Profile)?;
     Ok(Arc::new(
-        AppState::with_disabled_renderer(Arc::new(profile)).with_page_scripts(page_scripts),
+        AppState::new(Arc::new(profile), renderer).with_page_scripts(page_scripts),
     ))
 }
 
@@ -240,8 +258,9 @@ pub(crate) async fn run(
     addr: SocketAddr,
     extra: Vec<RouterFactory>,
     page_scripts: PageScriptHandle,
+    renderer: Arc<dyn Renderer>,
 ) -> Result<(), StartupError> {
-    let app = open_app_state_with(store, page_scripts)?;
+    let app = open_app_state_with(store, page_scripts, renderer)?;
     let (bound, cdp) = bind(&app, addr, extra).await?;
     let local = bound.local_addr().map_err(StartupError::Bind)?;
     eprintln!(
@@ -252,7 +271,7 @@ pub(crate) async fn run(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -309,6 +328,15 @@ mod tests {
         let shown = StartupError::Config(e).to_string();
         assert_eq!(shown, "profile.root in the config file is invalid");
         assert!(!shown.contains("/secret"));
+    }
+
+    /// `RENDER-3`・TASK-38.7: 描画ホストの不正は固定文言で表示し（パスを含めない）、原因を連鎖する。
+    #[test]
+    fn render_host_error_displays_fixed_message_and_chains_source() {
+        use std::error::Error;
+        let err = StartupError::RenderHost(HostProcessError::Disabled);
+        assert_eq!(err.to_string(), RENDER_HOST_INVALID_MESSAGE);
+        assert!(err.source().is_some());
     }
 
     #[test]
@@ -489,7 +517,12 @@ mod tests {
 
             let handle = crate::page_scripts::test_enabled_handle();
             let enabled = handle.is_enabled();
-            let app = open_app_state_with(&FixedStore(dir.path.clone()), handle).unwrap();
+            let app = open_app_state_with(
+                &FixedStore(dir.path.clone()),
+                handle,
+                Arc::new(fandhe_browser_core::render::DisabledRenderer::new()),
+            )
+            .unwrap();
             let (bound, cdp) = bind(&app, "127.0.0.1:0".parse().unwrap(), vec![])
                 .await
                 .unwrap();
@@ -877,7 +910,7 @@ mod tests {
         }
     }
 
-    mod support {
+    pub(crate) mod support {
         use std::path::PathBuf;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -890,13 +923,13 @@ mod tests {
         /// `.0` は自前で新規作成した親ディレクトリ配下の未作成パス（プロファイルルート用）。
         /// 親は `create_dir` の排他的作成に成功したものだけを使い、既存パスと衝突した場合は
         /// 連番を進めて別名を選ぶ。drop では自分が作った親だけを削除する。
-        pub(super) struct TempDir {
-            pub(super) owned: PathBuf,
-            pub(super) path: PathBuf,
+        pub(crate) struct TempDir {
+            pub(crate) owned: PathBuf,
+            pub(crate) path: PathBuf,
         }
 
         impl TempDir {
-            pub(super) fn new() -> Self {
+            pub(crate) fn new() -> Self {
                 let base = std::env::temp_dir()
                     .canonicalize()
                     .unwrap_or_else(|_| std::env::temp_dir());
@@ -922,7 +955,7 @@ mod tests {
         }
 
         /// 固定パスを返すストア（テスト専用）。
-        pub(super) struct FixedStore(pub(super) PathBuf);
+        pub(crate) struct FixedStore(pub(crate) PathBuf);
 
         impl ProfileStore for FixedStore {
             fn resolve_root(&self) -> Result<ResolvedRoot, ProfileError> {
