@@ -11,6 +11,12 @@
 # （元の rust-base-ci.yml は debug のみ。ci.yml 側の要件で release を追加）。
 # 要 jq・cargo（ジョブ側で導入済みの前提）。
 #
+# 使い方: 引数なしは cwd を workspace ルートとして扱う。`--workspace-root <dir>` を渡すと、
+# その dir（Cargo.toml を持つ別 workspace のルート）の target/ を対象にする。Servo ホスト
+# （`servo-host/`。別 workspace・別 Cargo.lock）の cache を保存する servo-host-ubuntu ジョブ
+# （TASK-38・Issue #995）が `--workspace-root servo-host` で呼ぶ。dir は symlink を拒否し、
+# 実体パスへ解決してから使う。
+#
 # Windows（git-bash）対応（Windows ジョブへ cache を入れるための修正）:
 # 旧 rust-ci では Windows だけ「想定外の crate / target 名を検出」で fail し cache を除外していた。
 # 原因は、Windows の jq が出力を CRLF で書き、名前の末尾の CR が検証
@@ -40,6 +46,12 @@ SHIM
   # cargo metadata の代わりに固定 JSON を返す。
   cat > "${tmp}/bin/cargo" <<'SHIM'
 #!/usr/bin/env bash
+case "$*" in
+  *--manifest-path*servo-host/Cargo.toml*)
+    echo '{"packages":[{"name":"fandhe-browser-servo-host","targets":[{"name":"fandhe-browser-servo-host","kind":["bin"]},{"name":"build-script-build","kind":["custom-build"]}]}]}'
+    exit 0
+    ;;
+esac
 echo '{"packages":[{"name":"fandhe-browser-ai","targets":[{"name":"fandhe_browser_ai","kind":["lib"]},{"name":"build-script-build","kind":["custom-build"]}]},{"name":"fandhe-browser-cli","targets":[{"name":"fandhe-browser","kind":["bin"]}]}]}'
 SHIM
   chmod +x "${tmp}/bin/jq" "${tmp}/bin/cargo"
@@ -77,6 +89,44 @@ SHIM
       if [ ! -e "${t}/${f}" ]; then echo "NG(self-test): dependency artifact removed: ${prof}/${f}" >&2; ng=1; fi
     done
   done
+  # --- workspace-root 指定（servo-host の別 workspace）---
+  # 本体 workspace（cwd）の target は 1 ファイルも変えず、指定先のメンバー成果物だけを消す。
+  hh="fedcba9876543210"
+  mkdir -p "${tmp}/ws/servo-host/target/debug/deps" "${tmp}/ws/servo-host/target/debug/.fingerprint/fandhe-browser-servo-host-${hh}"
+  : > "${tmp}/ws/servo-host/Cargo.toml"
+  for f in "fandhe_browser_servo_host-${hh}.d" "fandhe_browser_servo_host-${hh}" "fandhe-browser-servo-host-${hh}.d"; do
+    : > "${tmp}/ws/servo-host/target/debug/deps/${f}"
+  done
+  : > "${tmp}/ws/servo-host/target/debug/deps/libservo-${hh}.rlib"
+  : > "${tmp}/ws/servo-host/target/debug/fandhe-browser-servo-host"
+  main_before="$(cd "${tmp}/ws" && find target | LC_ALL=C sort)"
+  (cd "${tmp}/ws" && PATH="${tmp}/bin:${PATH}" bash "${self}" --workspace-root servo-host > "${tmp}/out2.txt" 2>&1) || {
+    echo "NG: prune with --workspace-root failed" >&2
+    cat "${tmp}/out2.txt" >&2
+    exit 1
+  }
+  sh="${tmp}/ws/servo-host/target/debug"
+  for f in "deps/fandhe_browser_servo_host-${hh}.d" "deps/fandhe_browser_servo_host-${hh}" ".fingerprint/fandhe-browser-servo-host-${hh}" fandhe-browser-servo-host; do
+    if [ -e "${sh}/${f}" ]; then echo "NG(self-test): host artifact kept: ${f}" >&2; ng=1; fi
+  done
+  if [ ! -e "${sh}/deps/libservo-${hh}.rlib" ]; then echo "NG(self-test): host dependency artifact removed" >&2; ng=1; fi
+  if [ "$(cd "${tmp}/ws" && find target | LC_ALL=C sort)" != "${main_before}" ]; then
+    echo "NG(self-test): cwd workspace target changed by --workspace-root run" >&2; ng=1
+  fi
+  # 異常系: 存在しない dir・symlink・Cargo.toml なし・値なしは非ゼロで終わる
+  mkdir -p "${tmp}/ws/nomanifest"
+  ln -s servo-host "${tmp}/ws/link-host"
+  for bad in missing-dir link-host nomanifest; do
+    if (cd "${tmp}/ws" && PATH="${tmp}/bin:${PATH}" bash "${self}" --workspace-root "${bad}" >/dev/null 2>&1); then
+      echo "NG(self-test): --workspace-root ${bad} unexpectedly succeeded" >&2; ng=1
+    fi
+  done
+  if (cd "${tmp}/ws" && PATH="${tmp}/bin:${PATH}" bash "${self}" --workspace-root >/dev/null 2>&1); then
+    echo "NG(self-test): --workspace-root without value unexpectedly succeeded" >&2; ng=1
+  fi
+  if (cd "${tmp}/ws" && PATH="${tmp}/bin:${PATH}" bash "${self}" --bogus >/dev/null 2>&1); then
+    echo "NG(self-test): unknown argument unexpectedly succeeded" >&2; ng=1
+  fi
   if [ "${ng}" -ne 0 ]; then
     cat "${tmp}/out.txt" >&2
     echo "NG: ci-prune-target.sh self-test failed" >&2
@@ -86,9 +136,39 @@ SHIM
   exit 0
 fi
 
+# 引数: なし（cwd がルート）または `--workspace-root <dir>`。それ以外は exit 2。
+root_arg=""
+case "$#" in
+  0) ;;
+  2)
+    if [ "$1" != "--workspace-root" ] || [ -z "$2" ]; then
+      echo "::error::usage: ci-prune-target.sh [--workspace-root <dir>]"
+      exit 2
+    fi
+    root_arg="$2"
+    ;;
+  *)
+    echo "::error::usage: ci-prune-target.sh [--workspace-root <dir>]"
+    exit 2
+    ;;
+esac
+
 if ! command -v jq >/dev/null 2>&1; then
   echo "::error::jq not found (required by the cache prune step)"
   exit 1
+fi
+
+if [ -n "${root_arg}" ]; then
+  # 指定ルートは実在するディレクトリで symlink でなく、Cargo.toml を持つこと（fail-closed）。
+  if [ -L "${root_arg}" ] || [ ! -d "${root_arg}" ]; then
+    echo "::error::--workspace-root must be an existing non-symlink directory"
+    exit 1
+  fi
+  if [ ! -f "${root_arg}/Cargo.toml" ]; then
+    echo "::error::--workspace-root has no Cargo.toml"
+    exit 1
+  fi
+  cd -- "${root_arg}"
 fi
 
 workspace="$(pwd -P)"
@@ -107,7 +187,7 @@ fi
 raw=()
 while IFS= read -r n; do
   [ -n "${n}" ] && raw+=("${n}")
-done < <(cargo metadata --no-deps --format-version 1 \
+done < <(cargo metadata --no-deps --format-version 1 --manifest-path "${workspace}/Cargo.toml" \
   | jq -r '.packages[] | .name, (.targets[] | select(.kind | index("custom-build") | not) | .name)' \
   | tr -d '\r' | sort -u)
 if [ "${#raw[@]}" -eq 0 ]; then

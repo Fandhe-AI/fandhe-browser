@@ -30,7 +30,7 @@ cargo test --workspace
 
 - clippy 警告は 0 件を維持する。理由コメントなしで `#[allow(...)]` により警告を握りつぶす差分は P1。crate・モジュール全体に及ぶ広範な `#[allow(...)]`（`#![allow(...)]` 等）や、`unsafe` 関連 lint（`unsafe_code`・`clippy::undocumented_unsafe_blocks` 等）・外部入力の検証を隠す lint（`clippy::unwrap_used`・`clippy::expect_used`・`clippy::indexing_slicing` 等。「外部入力の検証」観点）の外部入力経路での抑止は、理由コメントの有無を問わず P0
 - テストの skip・ignore・アサーション弱体化で CI を通す差分は P0（回帰検出の後退を招くため）
-- `servo-host/`（Servo ホストの別 workspace。本体の workspace には含まれない）を変更した PR は、同じゲートを `--manifest-path servo-host/Cargo.toml` を付けて実行したかを PR 本文で確認する。CI ジョブ `servo-host-ubuntu` は #995 で追加し、追加後は PR の CI でも同じ検査が走る
+- `servo-host/`（Servo ホストの別 workspace。本体の workspace には含まれない）を変更した PR は、同じゲートを `--manifest-path servo-host/Cargo.toml` を付けて実行したかを PR 本文で確認する。CI ジョブ `servo-host-ubuntu`（#995）が PR の CI でも同じ検査（fmt・clippy・test）を実行する
 
 ### feature 分離の検証（RENDER-1）
 
