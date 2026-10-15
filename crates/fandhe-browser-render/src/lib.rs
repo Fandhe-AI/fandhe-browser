@@ -18,10 +18,9 @@
 //!
 //! # スタブについて
 //!
-//! - （済み）feature `rendering` の Cargo 定義（workspace 登録 #45・cli 側の結線
-//!   TASK-33.4・#459。RENDER-1・MS-1）
+//! - （廃止）feature `rendering` の Cargo 定義。cli の無条件依存になった（#236。RENDER-1・MS-1）
 //! - （済み）core の描画トレイト（`Renderer`）の実装 `HostRenderer`（RENDER-3・TASK-38・#235）
-//! - cli による `HostRenderer` の `AppState` への注入（RENDER-1・TASK-38・#236・MS-4）
+//! - （済み）cli による `HostRenderer` の `AppState` への注入（ホストパス解決時のみ。RENDER-1・TASK-38・#236・MS-4）
 //! - Servo の組込・スクリーンショット取得等の本実装（RENDER-1・TASK-38・
 //!   MS-4）
 //! - （済み）子プロセス（Servo ホスト）の起動・タイムアウト・kill・再起動・サーキット

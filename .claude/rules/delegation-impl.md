@@ -12,7 +12,7 @@
 | `crates/fandhe-browser-js/`（JS エンジン抽象トレイト・V8（rusty_v8）・boa） | js-engine-builder | sonnet |
 | `crates/fandhe-browser-ai/`・`crates/fandhe-browser-mcp/`（AI 最適化 API・プラグイン API・MCP 参照プラグイン） | ai-api-builder | sonnet |
 | `crates/fandhe-browser-cdp/`（CDP 互換サーバー・Playwright/Puppeteer 互換） | cdp-builder | sonnet |
-| `crates/fandhe-browser-render/`（Servo 組込・feature gate `rendering`） | render-builder | sonnet |
+| `crates/fandhe-browser-render/`（Servo ホストへの IPC クライアント） | render-builder | sonnet |
 | `crates/fandhe-browser-profile/`・OS 差異吸収（パス・ロック・正規化） | profile-platform-builder | sonnet |
 | `crates/fandhe-browser-cli/`・`.github/workflows/`・`deny.toml`・`NOTICE`・`Dockerfile`・`benches/`・`harness/` | infra-builder | sonnet |
 | テスト実行・失敗解析（`cargo test` / `cargo clippy`） | test-runner | sonnet |

@@ -18,9 +18,8 @@ serde_json = { workspace = true }
 # （依存承認は不要。core の既定 feature は空で v8・boa は入らず、Servo 系も入らない。RENDER-1）。
 # core は reqwest/rustls/ring を引くため、ci.yml の `cross-target-check` では本 crate を除外している。
 fandhe-browser-core = { path = "../fandhe-browser-core" }
-# feature `rendering` は cli 側に定義済み（TASK-33.4・#459。workspace 登録は #45）で、
-# 本 crate を optional 依存として有効化する。Servo（MPL-2.0）の導入は TASK-38
-# （ビヘイビア RENDER-1）でユーザー承認を経て行う。
+# 本 crate は cli の無条件依存（TASK-38.7・#236。feature `rendering` は廃止）。Servo（MPL-2.0）は
+# 別 workspace のホストに隔離し、本 crate には入れない（RENDER-1）。
 
 # 偽ホスト結合テスト（TASK-38・#994）。テストバイナリ自身が `--stdio` 付きで再実行されて
 # 偽ホストとして動く。そのときの stdout はフレーム専用で、libtest の出力が混ざると壊れるため

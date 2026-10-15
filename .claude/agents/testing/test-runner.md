@@ -13,7 +13,7 @@ tools: [Bash, Read, Glob, Grep]
 
 - `cargo test --workspace` の実行と失敗テストの原因解析
 - `cargo clippy --workspace --all-targets -- -D warnings` の実行と警告の整理
-- feature gate を含む変更では `--features rendering` 付きの検証も行う
+- feature gate を含む変更では該当 feature の有無の両方で検証する
 - 失敗の再現手順・該当箇所（`path:line`）・推定原因・関連ビヘイビア ID の報告
 
 ## 制約

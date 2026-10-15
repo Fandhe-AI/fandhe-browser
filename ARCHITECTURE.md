@@ -9,7 +9,7 @@ fandhe-browser の二層アーキテクチャと crate 分割方針の要約。�
 | 層 | 内容 | ビルド上の扱い |
 | -- | ---- | -------------- |
 | 非レンダリング基盤層 | fetch・HTML パース・DOM・query・CSSOM・JS 実行 | 既定ビルド |
-| レンダリング層 | Servo による描画 | feature gate `rendering` 有効時のみ依存グラフに入る（オプトイン） |
+| レンダリング層 | Servo による描画 | cli から常に依存するが Servo 本体は別 workspace の子プロセス。設定でホストパスを与えたときだけ起動する（オプトイン） |
 
 - Servo（MPL-2.0）は `fandhe-browser-render` に隔離し、ライセンス境界と crate 境界を一致させる（`RENDER-1`、`REPAIR-1`）
 - 詳細は [docs/design/render-feature-gate.md](docs/design/render-feature-gate.md) と [.claude/rules/licensing.md](.claude/rules/licensing.md) を参照する
@@ -23,7 +23,7 @@ fandhe-browser の二層アーキテクチャと crate 分割方針の要約。�
 | `fandhe-browser-js` | 最下層 | JS エンジン抽象トレイト（V8 既定・`boa` 切替。`JS-1`） |
 | `fandhe-browser-profile` | 最下層 | プロファイル（ユーザーデータディレクトリ）分離 |
 | `fandhe-browser-core` | 基盤層 | fetch・HTML パース・DOM・query・CSSOM・config・可観測性。共有状態 `AppState` と描画トレイト `Renderer` を持つ |
-| `fandhe-browser-render` | 基盤層の上（オプトイン） | Servo 組込。feature `rendering` 配下（`RENDER-1`） |
+| `fandhe-browser-render` | 基盤層の上（オプトイン） | Servo ホスト（別 workspace の子プロセス）への IPC クライアント。Servo 系クレートには依存しない（`RENDER-1`） |
 | `fandhe-browser-ai` | プロトコル層 | AI 最適化 API（アクセシビリティツリー・簡約 DOM）・プラグイン API |
 | `fandhe-browser-cdp` | プロトコル層 | CDP 互換サーバー（Playwright / Puppeteer 互換） |
 | `fandhe-browser-cli` | 組み立て | CLI 本体。各 crate を組み立ててサーバーを起動する |
@@ -43,13 +43,13 @@ workspace メンバーには上記 8 crate の他にツール crate `harness/wpt
 | `fandhe-browser-render` | core |
 | `fandhe-browser-ai` | core・profile |
 | `fandhe-browser-cdp` | core・profile |
-| `fandhe-browser-cli` | core・profile・ai・cdp・render（feature `rendering` 有効時のみ） |
+| `fandhe-browser-cli` | core・profile・ai・cdp・render |
 | `fandhe-browser-mcp` | なし（HTTP・stdio・JSON Schema の契約のみ） |
 
 - 依存は上位から下位への一方向に限り、表にない依存はすべて禁止する
 - 同じ層の crate 間（ai ⇔ cdp）の依存は禁止する
 - js は core からのみ依存される。V8 / boa の具象型は core より上位へ出さない
-- render は cli からのみ、feature `rendering` 有効時に依存される
+- render は cli からのみ無条件に依存される（ホストはパス設定時だけ起動）
 - mcp は workspace 内 crate に依存しない
 - 依存を追加する場合は下位方向に限り、先に spec 側の節を更新する。レビューでは [AGENTS.md](AGENTS.md)「crate 間の許可依存」で確認する（P0）
 
@@ -68,7 +68,7 @@ workspace メンバーには上記 8 crate の他にツール crate `harness/wpt
 
 `REPAIR-3`（実装済みを装わない）に基づく記録。進捗の詳細は GitHub Issues で管理する。
 
-- `fandhe-browser-render` は雛形で、core への依存も `Renderer` 実装も未結線（TASK-38）。cli は feature `rendering` を付けても常に無効レンダラーを使う
+- `fandhe-browser-render` は雛形で、core への依存も `Renderer` 実装も未結線（TASK-38）。cli はホストパスが解決できたときだけ `HostRenderer` を注入し、未設定なら無効レンダラーを使う（TASK-38.7）
 - ai・cdp の profile 依存は現状 dev-dependencies のみ（設計上は通常依存も許可）
 
 ## 境界の検証

@@ -59,7 +59,7 @@ workspace と crate 骨格（`crates/fandhe-browser-*`）の実装段階です�
 | `fandhe-browser-js` | JS エンジン抽象トレイト（V8／`rusty_v8` を既定とし `boa` へ切替可能） |
 | `fandhe-browser-ai` | AI 最適化 API（アクセシビリティツリー・簡約 DOM）・プラグイン API |
 | `fandhe-browser-cdp` | CDP（Chrome DevTools Protocol）互換サーバー。Playwright / Puppeteer 互換 |
-| `fandhe-browser-render` | Servo 組込。feature gate `rendering` 配下のオプトインとし、MPL-2.0 を本 crate 内に隔離（`RENDER-1`、TASK-33/34・MS-1） |
+| `fandhe-browser-render` | Servo は別 workspace・別プロセスの Servo ホストに隔離（本体の依存グラフに MPL-2.0 を入れない。cli が無条件に依存し、ホストパスが設定されたときだけ有効化）（`RENDER-1`、TASK-33/34・MS-1） |
 | `fandhe-browser-profile` | プロファイル（ユーザーデータディレクトリ）分離 |
 | `fandhe-browser-cli`（予定） | CLI 本体 |
 | `fandhe-browser-mcp` | MCP 参照プラグイン（別バイナリ） |
@@ -88,7 +88,7 @@ make setup
 cargo build --workspace
 cargo test --workspace
 
-# fmt・clippy・test・--features rendering・Servo 隔離検査・cargo deny 等の
+# fmt・clippy・test・Servo 隔離検査・cargo deny 等の
 # ローカルゲート一式（.claude/rules/ci.md と同等）
 make ci
 ```

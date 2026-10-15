@@ -15,7 +15,7 @@
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo test --workspace`
 - [ ] ドキュメント・設定ファイルを変更した場合: `make lint-docs`
-- [ ] feature gate `rendering` に関わる場合: `make lint-rendering`・`make test-rendering`（`RENDER-1`）
+- [ ] レンダリング層に関わる場合: `make check-render-isolation`（`RENDER-1`）
 - [ ] OS 依存の変更を含む場合: Linux・macOS・Windows での結果を記載
 - [ ] 実行していない項目は理由を書いた
 - [ ] テストの skip・ignore・アサーション弱体化で通していない

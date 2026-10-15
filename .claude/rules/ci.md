@@ -9,7 +9,7 @@ cargo test --workspace
 ```
 
 - テストは変更のたびに全件実行し、失敗・警告を 1 件でも残したまま進めない（fail-closed。REPAIR-5・REPAIR-6）
-- feature gate を触った場合は既定ビルドと `--features rendering` の両方で検証する
+- feature gate を触った場合は該当 feature の有無の両方で検証する（`rendering` feature は #236 で廃止済み。Servo 隔離は `make check-render-isolation`）
 - 上記ゲートは手動で実行する規約で、git hooks（lefthook）では強制しない。GitHub Actions で実行する検査は hooks で重複実行せず、hooks は CI に無い秘密情報検査と軽量な整形・コミットメッセージ検査に限る（`lefthook.yml`。pre-push は置かない。フック編集の方針・時間予算は [git-hooks](./git-hooks.md)）
 
 ## ジョブ構成と required checks

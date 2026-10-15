@@ -34,11 +34,9 @@ cargo test --workspace
 
 ### feature 分離の検証（RENDER-1）
 
-`fandhe-browser-render`（Servo 非依存の IPC クライアント。Servo 本体は `servo-host/` の別 workspace）に触れる変更では、既定ビルドで確認する。feature gate `rendering` は廃止予定（オーナー判断 2026-10-15・#236 で実装）のため、その feature が存在する間は `--features rendering` の確認も行う。廃止後は `--features rendering` の確認は不要。PR 本文に次のコマンドの実行結果が記載されているか（同じ PR で CI 設定を変更する場合はその diff に含まれているか）を確認する。
+`fandhe-browser-render`（Servo 非依存の IPC クライアント。Servo 本体は `servo-host/` の別 workspace）に触れる変更では、既定ビルドで確認する。feature gate `rendering` は廃止済み（オーナー判断 2026-10-15・#236）のため `--features rendering` の確認は不要。PR 本文に次のコマンドの実行結果が記載されているか（同じ PR で CI 設定を変更する場合はその diff に含まれているか）を確認する。
 
 ```bash
-make lint-rendering   # feature `rendering` が存在する間のみ: cargo clippy --workspace --all-targets --features rendering -- -D warnings
-make test-rendering   # feature `rendering` が存在する間のみ: cargo test --workspace --features rendering
 make check-render-isolation   # scripts/check-render-isolation.sh を実行し、既定ビルド（feature なし）
                                # の依存グラフと fandhe-browser-cli の既定 feature（cli の manifest が無い場合は
                                # NG。fail-closed・#633）に Servo 系クレートが含まれないことを確認
@@ -98,7 +96,7 @@ make check-plugin-overhead   # 上記計測の e2e smoke を実バイナリで�
 | ---- | -------- | ------ |
 | crate 境界 | 変更が `crates/fandhe-browser-{core,js,ai,cdp,render,profile,cli,mcp}` の想定責務（core: fetch・HTML パース・DOM・query・CSSOM・config・可観測性／js: エンジン抽象・V8・boa／ai: AI 最適化 API・プラグイン API／cdp: CDP 互換／render: Servo ホストへの IPC クライアント（Servo 自体は `servo-host/` 別 workspace）／profile: プロファイル分離／cli: 組み立て・CLI／mcp: 参照プラグイン）に収まっているか（REPAIR-1）。`servo-host/` は本体 workspace の外に置かれ、本体の `members` に入っていないか | P1 |
 | 依存方向 | 下記「crate 間の許可依存」節に記載した依存方向に沿っているか・循環がないか・共有型（`AppState` 等）が下位 crate（core）にあるか | P0 |
-| レンダリング層の隔離 | `fandhe-browser-render` が Servo 系クレートに依存していないか（Servo は本体 workspace に入れない）。既定ビルド（cli の既定 feature を含む）の依存グラフに Servo 系が含まれないか（RENDER-1）。feature `rendering` は廃止予定（#236 で実装）のため、存在する間は同 feature 配下に隔離されているかも確認する | P0 |
+| レンダリング層の隔離 | `fandhe-browser-render` が Servo 系クレートに依存していないか（Servo は本体 workspace に入れない）。既定ビルド（cli の既定 feature を含む）の依存グラフに Servo 系が含まれないか（RENDER-1）。feature `rendering` は廃止済み（#236）で、render は cli の無条件依存。Servo 本体は別 workspace の子プロセスに限られているかも確認する | P0 |
 | JS エンジン抽象 | V8（`rusty_v8`）・`boa` の具象型が `fandhe-browser-js` の外（上位 crate）へ漏れていないか。トレイト抽象越しに利用しているか（JS-1） | P1 |
 | 3 OS 対応 | パスを `PathBuf`/`Path::join` で組み立てているか（文字列連結・区切り文字のハードコードがないか）。Windows の長パス・大文字小文字非区別ファイルシステムを考慮しているか。内部データファイルの改行が LF 固定か。OS 固有処理が `cfg(target_os = ...)` で局所化されているか | P1 |
 | `docs/spec` 非依存ビルド | コード・`build.rs`・テストが `docs/spec` 配下を読み込んでいないか（`docs/spec` 抜きでビルド・テストが成立するか） | P0 |
@@ -117,12 +115,12 @@ spec `docs/spec/04-behavior/self-repair-design.md`「crate 間の依存方向と
 | `fandhe-browser-render` | core |
 | `fandhe-browser-ai` | core・profile |
 | `fandhe-browser-cdp` | core・profile |
-| `fandhe-browser-cli` | core・profile・ai・cdp・render（現在は feature `rendering` 有効時のみ。#236 以後は無条件に依存し、ホストはパスを設定したときだけ起動する） |
+| `fandhe-browser-cli` | core・profile・ai・cdp・render（無条件に依存し、ホストはパスを設定したときだけ起動する。#236） |
 | `fandhe-browser-mcp` | なし（HTTP・stdio・JSON Schema の契約のみ） |
 
 - 同じ層の crate 間（ai ⇔ cdp）の依存は禁止する
 - `fandhe-browser-js` は core からのみ依存される。cli・ai・cdp・render・mcp は直接依存しない（エンジン feature `js-v8`/`js-boa` は cli → core → js の順に転送し、選択は core の設定で行う）
-- `fandhe-browser-render` は cli からのみ依存される（現在は feature `rendering` 有効時のみ。#236 以後は無条件）。render は Servo 系に依存せず core のみに依存する（Servo ホストは `servo-host/` の別 workspace で、本体からは子プロセスとして起動する）。ai・cdp は core が定義する `Renderer` トレイト経由で呼び出し、render に直接依存しない
+- `fandhe-browser-render` は cli からのみ依存される（無条件。#236）。render は Servo 系に依存せず core のみに依存する（Servo ホストは `servo-host/` の別 workspace で、本体からは子プロセスとして起動する）。ai・cdp は core が定義する `Renderer` トレイト経由で呼び出し、render に直接依存しない
 - 共有型（`AppState` 等）は下位 crate（core）に置く
 - 上表に記載のない依存はすべて禁止する（依存は上位から下位への一方向に限る）。追加する場合は下位方向への追加に限り、先に spec 側「crate 間の依存方向と `AppState` の配置」節の更新を PR 説明で示していることを確認する
 
