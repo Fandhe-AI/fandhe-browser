@@ -31,8 +31,8 @@ Playwright のソースは長く引用せず、関数名と要約に留める。
 | ---- | ---- | ---- |
 | `connectOverCDP(http://…)` | 成功（`noDefaults:true` 指定時。TASK-43.3g・#942 で到達）。`Browser.getVersion`・`Target.setAutoAttach`（`waitForDebuggerOnStart:true` は受理）・`Target.getTargetInfo` が成功する。指定なしの既定オプションでは接続直後の `Browser.setDownloadBehavior`（`allowAndName`）が `-32602` で拒否され通らない（後述「段階 2g」） | A（現行 head での再取得）: seq 1〜9 |
 | `connectOverCDP(ws://…)` | 未実行（http 経由が成功するため、収集ハーネスの ws 直接の再試行は行われない） | A |
-| `newContext()` | 失敗（`acceptDownloads:false` 指定時）。`Target.createBrowserContext` が `-32601`（`method not implemented`）。段階 2b の対象 | A: seq 10〜12 |
-| `newPage()` | 未到達（`newContext()` の失敗による） | A |
+| `newContext()` | 成功（`acceptDownloads:false` 指定時。TASK-43.3d・#909 で到達）。`Target.createBrowserContext`（`disposeOnDetach:true`）と `browserContextId` 付き `Browser.setDownloadBehavior`（`deny` + `eventsEnabled:true`）が成功する（後述「段階 2b の実施結果」） | A: seq 10〜14 |
+| `newPage()` | 失敗。`Target.createTarget` が `-32601`（`method not implemented`）。#910 の対象 | A: seq 15〜17 |
 
 `-32601` は未実装メソッドへ成功を捏造しない `CDP-6`・`SEC-2` の方針どおりの挙動で、バグではない。
 
@@ -181,12 +181,12 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
   - `behavior` は `deny`・`allow`・`allowAndName`・`default`（`allow*` は上記のとおり拒否）
   - `downloadPath` は絶対パス・`..` なし・NUL なし・4096 バイト以下。**サーバーはこのパスに一切ファイル操作をしない**
     （作成・書き込み・存在確認なし）。実行系で書き込む際はプロファイル境界（`PROF`）を踏まえた別途のセキュリティ設計を要する
-  - `browserContextId` 指定は `-32602`（browser context は段階 2b で導入）。`eventsEnabled` は保持するがイベントは送出しない
+  - `browserContextId` 指定は段階 2b（TASK-43.3d・#909）で context 単位の保持に対応した（不正・未知の ID は `-32602`）。`eventsEnabled` は保持するがイベントは送出しない
   - 寿命は接続スコープ（切断で破棄・プロファイルへ永続化しない）
 - 段階 2c 時点の `make trace-playwright` の再取得結果: 両 `connectOverCDP` が `Target.setAutoAttach`（id 2）・`Browser.setDownloadBehavior`（id 3）の `-32602` で失敗し、`newContext()` には到達しなかった（当時の記録。次に止まるのは `waitForDebuggerOnStart:true` の拒否だった。**段階 2g で解消済み**）
 - 既知の制約: `Target.attachedToTarget` の `targetInfo` に `browserContextId` が無い。トレースサーバーは
   ターゲットを事前作成しないため今回の到達には影響しないが、既存ターゲットがある状態の Playwright は
-  `browserContextId` を要する見込み（B）。段階 2b で追加する
+  `browserContextId` を要する見込み（B）。段階 2b（TASK-43.3d・#909）で追加した
 - 送出順は応答 → イベント列のまま（`CDP-5`）。Chromium 流の並べ替えは `Target.createTarget` を実装する段階 2b 以降で判断する
 
 ### 段階 2g の実施結果（TASK-43.3g・#942。実測 A）
@@ -218,6 +218,36 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
   `content/browser/devtools/protocol/target_handler.cc` の `AutoAttach(..., false)`、CDP `Browser.setDownloadBehavior` の
   `behavior`・`eventsEnabled`（Browser.pdl）、Playwright 1.63.0 の `crBrowser.ts`・`chromium.ts`（`noDefaults:true` なら接続直後に
   送らない。`newContext` は `acceptDownloads` の既定で `allowAndName`、`false` で `deny`、どちらも `eventsEnabled:true` 付き）
+
+### 段階 2b の実施結果（TASK-43.3d・#909。実測 A）
+
+実装範囲（`CDP-2`・`CDP-6`・`CDP-7`・`SEC-2`・`REPAIR-3`）:
+
+- browser context をモデルに入れた（`target.rs`）。既定 context の ID は固定で `00000000000000000000000000000001`、
+  `Target.createBrowserContext` が払い出す ID は `…0002` から。全ページターゲットの `targetInfo`
+  （`Target.getTargetInfo`・`Target.attachedToTarget`）に `browserContextId` を載せる（既存ページは既定 context）。
+  ブラウザ自身（`type:"browser"`）の `targetInfo` には載せない
+- `Target.createBrowserContext` は `disposeOnDetach:true` だけを受理する。省略・`false` は `-32602`（`unsupported params`）で拒否する。
+  解放手段の `Target.disposeBrowserContext` が未実装で、永続 context を作ると枠が枯渇する（`CDP-7`）ため。受理した context は作成した
+  接続が所有し、切断で所属ターゲット・セッションごと破棄する。`proxyServer`・`proxyBypassList`・
+  `originsWithUniversalNetworkAccess` は未実装で、黙って無視すると proxy 経由と誤認させるため `-32602`（`unsupported params`）で拒否する
+- `browserContextId` 付き `Browser.setDownloadBehavior` は、受理する組み合わせを接続単位の場合（#942）と同じにする（`deny`〔`eventsEnabled` 不問〕と
+  `eventsEnabled` なしの `default`）。設定は context 単位で保持し（Chromium と同じ）、context の破棄で消える。`downloadPath` は検証のみで、
+  `deny` では保持せずファイル操作もしない。不正・未知の `browserContextId` は `-32602`（`invalid params`）
+- 上限: 新規 context は 64 件（`MAX_BROWSER_CONTEXTS`。既定 context を除く）。`MAX_TARGETS`・`MAX_SESSIONS` は全 context 共通で維持する
+- 未実装のまま: `Target.disposeBrowserContext`・`Target.getBrowserContexts`・`Target.createTarget`（#910）
+
+実測（`make trace-playwright`。2 回の実行で同一出力）: `Target.createBrowserContext` → `{"browserContextId":"…0002"}`、
+`Browser.setDownloadBehavior`（`deny`・`browserContextId`・`downloadPath`・`eventsEnabled:true`）→ `{}` で `newContext()` が成功し、
+`newPage()` が **`Target.createTarget` の `-32601`（`method not implemented`）** で失敗する
+（`browserContext.newPage: Protocol error (Target.createTarget): method not implemented`）。次に止まるのは #910 の範囲で、
+`newContext()`・`newPage()` 到達の結合確認は #911 で行う。
+
+停止条件の判断: #942 後の停止点は `browserContextId` の assert ではなく `Target.createBrowserContext` の `-32601` だった。
+トレースサーバーは既存ページを作らないため assert には到達しない。停止点は本 Issue の表題のメソッドそのものであるため、
+スコープ内として実装を進めた。既存ページがある経路（`browserContextId` の assert）は実測ではなく Rust のテスト
+（`cdp2_target_info_includes_browser_context_id`・WebSocket 経由の自動 attach テスト）で担保している。
+ハーネスにページを事前作成させる変更は別 issue とする。
 
 #### 予測 #11（`Page.frameNavigated`）の訂正（種別 B・未実測）
 

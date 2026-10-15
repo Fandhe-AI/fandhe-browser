@@ -17,8 +17,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use crate::conn_state::DownloadSettings;
+
 /// 同時に保持できるターゲット数の上限（無制限確保による DoS の防止）。
 pub const MAX_TARGETS: usize = 64;
+/// 既定 context を除く、同時に保持できる browser context 数の上限（`CDP-7`。無制限確保の防止）。
+pub const MAX_BROWSER_CONTEXTS: usize = 64;
 /// 同時に保持できるセッション数の上限。
 pub const MAX_SESSIONS: usize = 256;
 /// 外部入力から ID を組み立てる際の最大バイト長。
@@ -55,6 +59,15 @@ pub enum CdpStateError {
         /// 上限値（バイト）。
         limit: usize,
     },
+    /// 指定 ID の browser context が存在しない。
+    UnknownBrowserContext,
+    /// browser context 数が上限（[`MAX_BROWSER_CONTEXTS`]）に達している。
+    TooManyBrowserContexts {
+        /// 上限値。
+        limit: usize,
+    },
+    /// 既定 browser context は破棄できない。
+    DefaultBrowserContext,
 }
 
 impl fmt::Display for CdpStateError {
@@ -67,6 +80,13 @@ impl fmt::Display for CdpStateError {
             Self::IdExhausted => f.write_str("id counter exhausted"),
             Self::InvalidId => f.write_str("invalid id"),
             Self::UrlTooLong { limit } => write!(f, "url too long (limit {limit} bytes)"),
+            Self::UnknownBrowserContext => f.write_str("unknown browser context"),
+            Self::TooManyBrowserContexts { limit } => {
+                write!(f, "too many browser contexts (limit {limit})")
+            }
+            Self::DefaultBrowserContext => {
+                f.write_str("default browser context cannot be disposed")
+            }
         }
     }
 }
@@ -131,6 +151,13 @@ id_type!(
     BrowserId
 );
 id_type!(
+    /// browser context（シークレットウィンドウ相当の分離単位）の識別子。`CDP-2`。
+    ///
+    /// 名前空間は [`TargetId`] 等とは別で、桁・書式が同じためカウンタ値が一致すれば文字列も一致し得るが、
+    /// 機能上の意味は持たない（衝突の扱いは `Target.createTarget`〔#910〕の担当）。
+    BrowserContextId
+);
+id_type!(
     /// ターゲット（ページ等）の識別子。`CDP-1`。
     TargetId
 );
@@ -167,6 +194,7 @@ pub struct TargetInfo {
     target_id: TargetId,
     kind: TargetKind,
     url: String,
+    browser_context_id: BrowserContextId,
 }
 
 impl TargetInfo {
@@ -184,6 +212,11 @@ impl TargetInfo {
     pub fn url(&self) -> &str {
         &self.url
     }
+
+    /// 所属する browser context の ID（`targetInfo.browserContextId`。`CDP-2`）。
+    pub fn browser_context_id(&self) -> &BrowserContextId {
+        &self.browser_context_id
+    }
 }
 
 impl fmt::Debug for TargetInfo {
@@ -191,17 +224,30 @@ impl fmt::Debug for TargetInfo {
         f.debug_struct("TargetInfo")
             .field("target_id", &self.target_id)
             .field("kind", &self.kind)
+            .field("browser_context_id", &self.browser_context_id)
             .field("url_len", &self.url.len())
             .finish()
     }
+}
+
+/// browser context 1 件の状態。
+#[derive(Debug, Default)]
+struct ContextEntry {
+    /// context 単位のダウンロード設定（保持のみ。実行系は未実装で `REPAIR-3`）。
+    /// context の破棄で一緒に消える。
+    download: Option<DownloadSettings>,
 }
 
 #[derive(Debug)]
 struct Tables {
     targets: HashMap<TargetId, TargetInfo>,
     sessions: HashMap<SessionId, TargetId>,
+    /// 既定 context を含む browser context 表。
+    contexts: HashMap<BrowserContextId, ContextEntry>,
+    default_context: BrowserContextId,
     next_target: u64,
     next_session: u64,
+    next_context: u64,
 }
 
 /// ターゲット表とセッション表。単一 `Mutex` で保護し、
@@ -220,16 +266,23 @@ impl Default for TargetRegistry {
 impl TargetRegistry {
     /// 空の表を作る。
     pub fn new() -> Self {
-        Self::with_counters(1, 1)
+        Self::with_counters(1, 1, 2)
     }
 
-    fn with_counters(next_target: u64, next_session: u64) -> Self {
+    /// `next_context` は既定 context（カウンタ 1 固定）の次から払い出す値。
+    fn with_counters(next_target: u64, next_session: u64, next_context: u64) -> Self {
+        let default_context = BrowserContextId::from_counter(1);
+        let mut contexts = HashMap::new();
+        contexts.insert(default_context.clone(), ContextEntry::default());
         Self {
             inner: Mutex::new(Tables {
                 targets: HashMap::new(),
                 sessions: HashMap::new(),
+                contexts,
+                default_context,
                 next_target,
                 next_session,
+                next_context,
             }),
         }
     }
@@ -239,14 +292,41 @@ impl TargetRegistry {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// ターゲットを作成して ID を返す。件数・URL 長の上限超過・ID 枯渇時は表を変更しない。
+    /// 既定 browser context にターゲットを作成して ID を返す。件数・URL 長の上限超過・ID 枯渇時は
+    /// 表を変更しない。
     pub fn create_target(&self, kind: TargetKind, url: &str) -> Result<TargetId, CdpStateError> {
+        self.create_target_impl(None, kind, url)
+    }
+
+    /// 指定 browser context にターゲットを作成する（`Target.createTarget`〔#910〕が呼ぶ想定）。
+    /// 未知の context は [`CdpStateError::UnknownBrowserContext`]。上限は全 context 共通で、
+    /// 失敗時は表を変更しない。
+    pub fn create_target_in(
+        &self,
+        context: &BrowserContextId,
+        kind: TargetKind,
+        url: &str,
+    ) -> Result<TargetId, CdpStateError> {
+        self.create_target_impl(Some(context), kind, url)
+    }
+
+    fn create_target_impl(
+        &self,
+        context: Option<&BrowserContextId>,
+        kind: TargetKind,
+        url: &str,
+    ) -> Result<TargetId, CdpStateError> {
         // 借用したまま長さを検証し、超過入力は所有 String へ複製する前に拒否する（巨大入力による DoS 対策）。
         if url.len() > MAX_URL_LEN {
             return Err(CdpStateError::UrlTooLong { limit: MAX_URL_LEN });
         }
         let url = url.to_owned();
         let mut t = self.lock();
+        let context = match context {
+            Some(c) if t.contexts.contains_key(c) => c.clone(),
+            Some(_) => return Err(CdpStateError::UnknownBrowserContext),
+            None => t.default_context.clone(),
+        };
         if t.targets.len() >= MAX_TARGETS {
             return Err(CdpStateError::TooManyTargets { limit: MAX_TARGETS });
         }
@@ -257,6 +337,7 @@ impl TargetRegistry {
             target_id: id.clone(),
             kind,
             url,
+            browser_context_id: context,
         };
         t.next_target = next;
         t.targets.insert(id.clone(), info);
@@ -348,6 +429,103 @@ impl TargetRegistry {
     /// セッションの attach 先ターゲットを返す。
     pub fn session_target(&self, id: &SessionId) -> Option<TargetId> {
         self.lock().sessions.get(id).cloned()
+    }
+
+    /// 既定 browser context の ID。既存ページの `targetInfo.browserContextId` に使う。
+    pub fn default_browser_context(&self) -> BrowserContextId {
+        self.lock().default_context.clone()
+    }
+
+    /// 指定 ID の browser context が存在するか。
+    pub fn has_browser_context(&self, id: &BrowserContextId) -> bool {
+        self.lock().contexts.contains_key(id)
+    }
+
+    /// 新しい browser context を作り ID を返す（既定 context は含まない件数で上限検証）。
+    /// 上限超過・ID 枯渇時は表を変更しない。`Target.createBrowserContext` から呼ばれる（`CDP-2`・`CDP-7`）。
+    pub fn create_browser_context(&self) -> Result<BrowserContextId, CdpStateError> {
+        let mut t = self.lock();
+        // 既定 context は上限の外。
+        if t.contexts.len() > MAX_BROWSER_CONTEXTS {
+            return Err(CdpStateError::TooManyBrowserContexts {
+                limit: MAX_BROWSER_CONTEXTS,
+            });
+        }
+        let n = t.next_context;
+        let next = n.checked_add(1).ok_or(CdpStateError::IdExhausted)?;
+        let id = BrowserContextId::from_counter(n);
+        t.next_context = next;
+        t.contexts.insert(id.clone(), ContextEntry::default());
+        Ok(id)
+    }
+
+    /// browser context を破棄し、所属ターゲットと配下セッションも原子的に削除する。
+    /// 閉じた `(targetId, 配下 SessionId)` を targetId 昇順で返す。既定 context は
+    /// [`CdpStateError::DefaultBrowserContext`]、未知は [`CdpStateError::UnknownBrowserContext`]。
+    pub fn dispose_browser_context(
+        &self,
+        id: &BrowserContextId,
+    ) -> Result<Vec<(TargetId, Vec<SessionId>)>, CdpStateError> {
+        let mut t = self.lock();
+        if *id == t.default_context {
+            return Err(CdpStateError::DefaultBrowserContext);
+        }
+        if t.contexts.remove(id).is_none() {
+            return Err(CdpStateError::UnknownBrowserContext);
+        }
+        let mut targets: Vec<TargetId> = t
+            .targets
+            .values()
+            .filter(|i| i.browser_context_id == *id)
+            .map(|i| i.target_id.clone())
+            .collect();
+        targets.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut closed = Vec::with_capacity(targets.len());
+        for tid in targets {
+            t.targets.remove(&tid);
+            let mut sids: Vec<SessionId> = t
+                .sessions
+                .iter()
+                .filter(|(_, x)| **x == tid)
+                .map(|(s, _)| s.clone())
+                .collect();
+            sids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            for s in &sids {
+                t.sessions.remove(s);
+            }
+            closed.push((tid, sids));
+        }
+        Ok(closed)
+    }
+
+    /// context 単位のダウンロード設定を置き換える（存在確認と設定を 1 回のロックで行う）。
+    pub(crate) fn set_context_download(
+        &self,
+        id: &BrowserContextId,
+        settings: DownloadSettings,
+    ) -> Result<(), CdpStateError> {
+        let mut t = self.lock();
+        let c = t
+            .contexts
+            .get_mut(id)
+            .ok_or(CdpStateError::UnknownBrowserContext)?;
+        c.download = Some(settings);
+        Ok(())
+    }
+
+    /// context のダウンロード設定（実行系が未実装のためテストのみが読む）。
+    #[cfg(test)]
+    pub(crate) fn context_download(&self, id: &BrowserContextId) -> Option<DownloadSettings> {
+        self.lock()
+            .contexts
+            .get(id)
+            .and_then(|c| c.download.clone())
+    }
+
+    /// 既定 context を除く browser context 数（テスト用）。
+    #[cfg(test)]
+    pub(crate) fn browser_context_count(&self) -> usize {
+        self.lock().contexts.len().saturating_sub(1)
     }
 
     /// ターゲット数。
@@ -460,14 +638,14 @@ mod tests {
 
     #[test]
     fn cdp1_id_counter_exhaustion_does_not_wrap() {
-        let r = TargetRegistry::with_counters(u64::MAX, u64::MAX);
+        let r = TargetRegistry::with_counters(u64::MAX, u64::MAX, 2);
         assert_eq!(
             r.create_target(TargetKind::Page, "about:blank"),
             Err(CdpStateError::IdExhausted)
         );
         assert_eq!(r.target_count(), 0);
 
-        let r = TargetRegistry::with_counters(1, u64::MAX);
+        let r = TargetRegistry::with_counters(1, u64::MAX, 2);
         let t = page(&r);
         assert_eq!(r.attach(&t), Err(CdpStateError::IdExhausted));
         assert_eq!(r.session_count(), 0);
@@ -484,6 +662,12 @@ mod tests {
             "ABCDEF0123"
         );
         assert_eq!(SessionId::parse("a-b").unwrap().as_str(), "a-b");
+        assert_eq!(
+            BrowserContextId::parse("../x"),
+            Err(CdpStateError::InvalidId)
+        );
+        assert_eq!(BrowserContextId::parse(""), Err(CdpStateError::InvalidId));
+        assert_eq!(BrowserContextId::parse("C-1").unwrap().as_str(), "C-1");
         assert_eq!(
             BrowserId::parse(&"a".repeat(64)).unwrap().as_str().len(),
             64
@@ -527,5 +711,165 @@ mod tests {
             r.target_with_attached(&TargetId::parse("nope").unwrap())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn cdp2_targets_get_default_browser_context() {
+        let r = TargetRegistry::new();
+        let t = page(&r);
+        let d = r.default_browser_context();
+        assert_eq!(d.as_str(), "00000000000000000000000000000001");
+        assert_eq!(r.target(&t).unwrap().browser_context_id(), &d);
+        assert!(r.has_browser_context(&d));
+        assert_eq!(r.browser_context_count(), 0);
+    }
+
+    #[test]
+    fn cdp2_create_browser_context_assigns_distinct_deterministic_ids() {
+        let r = TargetRegistry::new();
+        let a = r.create_browser_context().unwrap();
+        let b = r.create_browser_context().unwrap();
+        assert_eq!(a.as_str(), "00000000000000000000000000000002");
+        assert_eq!(b.as_str(), "00000000000000000000000000000003");
+        assert_eq!(r.browser_context_count(), 2);
+    }
+
+    #[test]
+    fn cdp2_create_target_in_context_and_unknown_context_rejected() {
+        let r = TargetRegistry::new();
+        let c = r.create_browser_context().unwrap();
+        let t = r
+            .create_target_in(&c, TargetKind::Page, "about:blank")
+            .unwrap();
+        assert_eq!(r.target(&t).unwrap().browser_context_id(), &c);
+        let ghost = BrowserContextId::parse("GHOST").unwrap();
+        assert_eq!(
+            r.create_target_in(&ghost, TargetKind::Page, "about:blank"),
+            Err(CdpStateError::UnknownBrowserContext)
+        );
+        assert_eq!(r.target_count(), 1);
+    }
+
+    #[test]
+    fn cdp7_browser_context_limit_leaves_table_unchanged() {
+        let r = TargetRegistry::new();
+        for _ in 0..MAX_BROWSER_CONTEXTS {
+            r.create_browser_context().unwrap();
+        }
+        assert_eq!(
+            r.create_browser_context(),
+            Err(CdpStateError::TooManyBrowserContexts {
+                limit: MAX_BROWSER_CONTEXTS
+            })
+        );
+        assert_eq!(r.browser_context_count(), MAX_BROWSER_CONTEXTS);
+    }
+
+    #[test]
+    fn cdp7_target_limit_applies_across_contexts() {
+        let r = TargetRegistry::new();
+        let c = r.create_browser_context().unwrap();
+        for i in 0..MAX_TARGETS {
+            if i % 2 == 0 {
+                page(&r);
+            } else {
+                r.create_target_in(&c, TargetKind::Page, "about:blank")
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            r.create_target(TargetKind::Page, "about:blank"),
+            Err(CdpStateError::TooManyTargets { limit: MAX_TARGETS })
+        );
+        assert_eq!(
+            r.create_target_in(&c, TargetKind::Page, "about:blank"),
+            Err(CdpStateError::TooManyTargets { limit: MAX_TARGETS })
+        );
+        assert_eq!(r.target_count(), MAX_TARGETS);
+    }
+
+    #[test]
+    fn cdp7_session_limit_unchanged_with_contexts() {
+        let r = TargetRegistry::new();
+        let c = r.create_browser_context().unwrap();
+        let t = r
+            .create_target_in(&c, TargetKind::Page, "about:blank")
+            .unwrap();
+        for _ in 0..MAX_SESSIONS {
+            r.attach(&t).unwrap();
+        }
+        assert_eq!(
+            r.attach(&t),
+            Err(CdpStateError::TooManySessions {
+                limit: MAX_SESSIONS
+            })
+        );
+    }
+
+    #[test]
+    fn cdp7_dispose_browser_context_closes_its_targets_and_sessions_only() {
+        let r = TargetRegistry::new();
+        let keep = page(&r);
+        let keep_s = r.attach(&keep).unwrap();
+        let c = r.create_browser_context().unwrap();
+        let other = r.create_browser_context().unwrap();
+        let t1 = r
+            .create_target_in(&c, TargetKind::Page, "about:blank")
+            .unwrap();
+        let t2 = r
+            .create_target_in(&c, TargetKind::Page, "about:blank")
+            .unwrap();
+        let o = r
+            .create_target_in(&other, TargetKind::Page, "about:blank")
+            .unwrap();
+        let s1 = r.attach(&t1).unwrap();
+        let s2 = r.attach(&t1).unwrap();
+        assert_eq!(
+            r.dispose_browser_context(&c),
+            Ok(vec![(t1.clone(), vec![s1, s2]), (t2, vec![])])
+        );
+        assert!(!r.has_browser_context(&c));
+        assert!(r.target(&t1).is_none());
+        assert_eq!(r.target_count(), 2);
+        assert!(r.target(&o).is_some() && r.has_browser_context(&other));
+        assert_eq!(r.session_target(&keep_s), Some(keep));
+        assert_eq!(r.session_count(), 1);
+        assert_eq!(
+            r.dispose_browser_context(&c),
+            Err(CdpStateError::UnknownBrowserContext)
+        );
+        assert_eq!(
+            r.dispose_browser_context(&r.default_browser_context()),
+            Err(CdpStateError::DefaultBrowserContext)
+        );
+    }
+
+    #[test]
+    fn cdp7_context_id_counter_exhaustion_does_not_wrap() {
+        let r = TargetRegistry::with_counters(1, 1, u64::MAX);
+        assert_eq!(r.create_browser_context(), Err(CdpStateError::IdExhausted));
+        assert_eq!(r.browser_context_count(), 0);
+    }
+
+    #[test]
+    fn cdp2_set_context_download_unknown_id_and_dropped_with_context() {
+        use crate::conn_state::{DownloadBehavior, DownloadSettings};
+        let settings = || DownloadSettings {
+            behavior: DownloadBehavior::Deny,
+            download_path: None,
+            events_enabled: true,
+        };
+        let r = TargetRegistry::new();
+        let ghost = BrowserContextId::parse("GHOST").unwrap();
+        assert_eq!(
+            r.set_context_download(&ghost, settings()),
+            Err(CdpStateError::UnknownBrowserContext)
+        );
+        let c = r.create_browser_context().unwrap();
+        assert!(r.context_download(&c).is_none());
+        r.set_context_download(&c, settings()).unwrap();
+        assert_eq!(r.context_download(&c), Some(settings()));
+        r.dispose_browser_context(&c).unwrap();
+        assert!(r.context_download(&c).is_none());
     }
 }

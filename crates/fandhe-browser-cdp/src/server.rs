@@ -89,8 +89,14 @@ impl CdpState {
         self.dom_issued.release_connection(conn);
         // 自動 attach が払い出したセッションを registry へ返す（解放漏れはセッション枠の
         // 枯渇になる。`CDP-7`）。接続状態のロックを手放してから registry を触る。
-        for sid in self.conn_scoped.release(conn) {
-            let _ = self.registry.detach(&sid);
+        let released = self.conn_scoped.release(conn);
+        for sid in &released.sessions {
+            let _ = self.registry.detach(sid);
+        }
+        // 接続が所有していた browser context を所属ターゲットごと破棄する（既に無ければ無視）。
+        // 他接続が自動 attach していたセッションは、その接続の次の reconcile で detach が通知される。
+        for ctx in &released.contexts {
+            let _ = self.registry.dispose_browser_context(ctx);
         }
     }
 

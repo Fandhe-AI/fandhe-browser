@@ -9,5 +9,10 @@
 {"seq":8,"kind":"cdp","dir":"recv","message":{"id":3,"result":{"targetInfo":{"attached":true,"canAccessOpener":false,"targetId":"trace-1","title":"","type":"browser","url":""}}}}
 {"seq":9,"kind":"stage","name":"connectOverCDP(http)","ok":true}
 {"seq":10,"kind":"cdp","dir":"send","message":{"id":4,"method":"Target.createBrowserContext","params":{"disposeOnDetach":true}}}
-{"seq":11,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":4}}
-{"seq":12,"kind":"stage","name":"newContext","ok":false,"error":"browser.newContext: Protocol error (Target.createBrowserContext): method not implemented"}
+{"seq":11,"kind":"cdp","dir":"recv","message":{"id":4,"result":{"browserContextId":"00000000000000000000000000000002"}}}
+{"seq":12,"kind":"cdp","dir":"send","message":{"id":5,"method":"Browser.setDownloadBehavior","params":{"behavior":"deny","browserContextId":"00000000000000000000000000000002","downloadPath":"<ARTIFACTS_DIR>","eventsEnabled":true}}}
+{"seq":13,"kind":"cdp","dir":"recv","message":{"id":5,"result":{}}}
+{"seq":14,"kind":"stage","name":"newContext","ok":true}
+{"seq":15,"kind":"cdp","dir":"send","message":{"id":6,"method":"Target.createTarget","params":{"url":"about:blank","browserContextId":"00000000000000000000000000000002"}}}
+{"seq":16,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":6}}
+{"seq":17,"kind":"stage","name":"newPage","ok":false,"error":"browserContext.newPage: Protocol error (Target.createTarget): method not implemented"}

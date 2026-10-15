@@ -1,4 +1,4 @@
-//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c、段階 2g は 43.3g）。
+//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c、段階 2b は 43.3d、段階 2g は 43.3g）。
 //!
 //! `protocol::builtin_handlers` から登録される。`Browser.getVersion`（43.3a）・
 //! `Target.getTargetInfo`（43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（43.3c）を
@@ -12,6 +12,9 @@
 //! （保存・`Browser.downloadWillBegin`・`downloadProgress`）は未実装（`CDP-6`・`REPAIR-3`）。
 //! 43.3g（#942）で `Target.setAutoAttach` の `waitForDebuggerOnStart:true`（保持のみ。新ターゲットの
 //! 停止は #910）と `Browser.setDownloadBehavior` の `deny` + `eventsEnabled:true` を受理する。
+//! 43.3d（#909）で `Target.createBrowserContext`（`disposeOnDetach:true` のみ。接続切断で破棄）と
+//! `browserContextId` 付き `Browser.setDownloadBehavior`（context 単位で保持）を足し、全ページターゲットの
+//! `targetInfo` に `browserContextId` を載せる。`Target.disposeBrowserContext` は未実装（`REPAIR-3`）。
 //! 接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
 
 use serde_json::{Value, json};
@@ -23,7 +26,7 @@ use crate::discovery::{PRODUCT, PROTOCOL_VERSION};
 use crate::protocol::{
     BoxFuture, CdpError, CdpEvent, CommandContext, CommandHandler, HandlerOutput,
 };
-use crate::target::{SessionId, TargetId, TargetInfo};
+use crate::target::{BrowserContextId, SessionId, TargetId, TargetInfo};
 
 /// `Browser.getVersion`（`CDP-2`・TASK-43.3a）。
 ///
@@ -46,8 +49,8 @@ impl CommandHandler for BrowserGetVersion {
 /// `Target.getTargetInfo`（`CDP-2`・TASK-43.3b）。
 ///
 /// `targetId` 省略はブラウザ自身（`type:"browser"`・`attached:true`）。指定時は
-/// [`crate::target::TargetRegistry`] の実値から組み立てる。`browserContextId`・`openerId` は
-/// 実体がないため出さない（2b）。未知・不正な `targetId` は `-32602`。
+/// [`crate::target::TargetRegistry`] の実値から組み立てる。`browserContextId` は所属 context の実値
+/// （既存ページは既定 context。`CDP-2`）、`openerId` は実体がないため出さない。未知・不正な `targetId` は `-32602`。
 pub(crate) struct TargetGetTargetInfo;
 
 impl CommandHandler for TargetGetTargetInfo {
@@ -97,7 +100,7 @@ impl CommandHandler for TargetGetTargetInfo {
 /// 既存ターゲットの `Target.attachedToTarget` は `waitingForDebugger:false`。新しいターゲットの
 /// 実際の一時停止は `Target.createTarget`（#910）で実装し、現状は新ターゲットが現れる本番経路が無い。
 /// 接続なしの直接 dispatch は `NO_CONNECTION`。
-/// イベントの `targetInfo` に `browserContextId` は載らない（段階 2b で追加）。
+/// イベントの `targetInfo` には所属 context の `browserContextId` が載る（TASK-43.3d・#909）。
 pub(crate) struct TargetSetAutoAttach;
 
 impl CommandHandler for TargetSetAutoAttach {
@@ -186,6 +189,57 @@ pub(crate) fn detached_event(target_id: &TargetId, session_id: &SessionId) -> Cd
     }
 }
 
+/// `Target.createBrowserContext`（`CDP-2`・`CDP-7`・TASK-43.3d・#909）。
+///
+/// 接続が所有する browser context を作り `{"browserContextId"}` を返す。所有する context は接続の
+/// 切断で所属ターゲットごと破棄される（[`crate::conn_state`]。`CdpState::release_connection`）。
+/// Playwright の `newContext()` が `{disposeOnDetach:true}` で送る。
+///
+/// 受理するのは `disposeOnDetach:true` のみ。省略・`false` は、解放手段の `Target.disposeBrowserContext` が
+/// 未実装で永続 context を作ると枠が枯渇する（`CDP-7`）ため `UNSUPPORTED_PARAMS`。`proxyServer`・
+/// `proxyBypassList`・`originsWithUniversalNetworkAccess` は未実装で、黙って無視するとクライアントが
+/// proxy 経由と誤認する（取得経路・識別面に関わる。`CDP-6`・`SEC-2`・`REPAIR-3`）ため `UNSUPPORTED_PARAMS`。
+/// `disposeOnDetach` が bool でなければ `INVALID_PARAMS`。`sessionId` 付きは `UNSUPPORTED_PARAMS`、
+/// 接続なしは `NO_CONNECTION`。上限（[`crate::target::MAX_BROWSER_CONTEXTS`]）超過は `SERVER_ERROR`。
+pub(crate) struct TargetCreateBrowserContext;
+
+impl CommandHandler for TargetCreateBrowserContext {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            if ctx.session_id.is_some() {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            for unsupported in [
+                "proxyServer",
+                "proxyBypassList",
+                "originsWithUniversalNetworkAccess",
+            ] {
+                if params.get(unsupported).is_some() {
+                    return Err(CdpError::UNSUPPORTED_PARAMS);
+                }
+            }
+            match params.get("disposeOnDetach") {
+                Some(Value::Bool(true)) => {}
+                None | Some(Value::Bool(false)) => return Err(CdpError::UNSUPPORTED_PARAMS),
+                Some(_) => return Err(CdpError::INVALID_PARAMS),
+            }
+            let conn = ctx.conn.ok_or(CdpError::NO_CONNECTION)?;
+            let state = ctx.state;
+            let id = state
+                .conn_scoped()
+                .create_owned_browser_context(conn, state.registry())
+                .map_err(conn_error)?;
+            Ok(HandlerOutput::result(
+                json!({ "browserContextId": id.as_str() }),
+            ))
+        })
+    }
+}
+
 /// 接続状態の失敗を CDP エラーへ写す（入力値を含めない固定文言）。
 fn conn_error(e: ConnStateError) -> CdpError {
     match e {
@@ -212,8 +266,10 @@ fn conn_error(e: ConnStateError) -> CdpError {
 /// 検証: `behavior` は `deny`・`allow`・`allowAndName`・`default` のみ（`allow*` は上記のとおり拒否）。
 /// `downloadPath` を与える場合の検証は`downloadPath` は絶対パス・`..` なし・NUL なし・長さ上限内で、サーバーは
 /// そのパスに対して一切のファイル操作をしない（プロファイル境界・パストラバーサルを持ち込まない）。
-/// `browserContextId` は browser context が未導入（段階 2b）のため指定を `-32602` で拒否する
-/// （省略はブラウザ全体）。`eventsEnabled` は型検証して保持するがイベントは送出しない。
+/// `browserContextId`（TASK-43.3d・#909）を与えると設定はその context 単位で registry に保持する
+/// （Chromium と同じく接続単位ではない。context の破棄で消える）。文字列でない・書式不正・未知の ID は
+/// `-32602`（`INVALID_PARAMS`）。省略は従来どおり接続スコープ。受理する組み合わせは同じ。
+/// `eventsEnabled` は型検証して保持するがイベントは送出しない。
 /// `sessionId` 付き（ブラウザドメインのコマンド）は拒否。接続なしは `NO_CONNECTION`。
 pub(crate) struct BrowserSetDownloadBehavior;
 
@@ -224,9 +280,16 @@ impl CommandHandler for BrowserSetDownloadBehavior {
         params: &'a Value,
     ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
         Box::pin(async move {
-            if ctx.session_id.is_some() || params.get("browserContextId").is_some() {
+            if ctx.session_id.is_some() {
                 return Err(CdpError::UNSUPPORTED_PARAMS);
             }
+            let context_id = match params.get("browserContextId") {
+                None => None,
+                Some(v) => {
+                    let s = v.as_str().ok_or(CdpError::INVALID_PARAMS)?;
+                    Some(BrowserContextId::parse(s).map_err(|_| CdpError::INVALID_PARAMS)?)
+                }
+            };
             let behavior = params
                 .get("behavior")
                 .and_then(Value::as_str)
@@ -258,24 +321,31 @@ impl CommandHandler for BrowserSetDownloadBehavior {
                 }
             };
             let conn = ctx.conn.ok_or(CdpError::NO_CONNECTION)?;
-            ctx.state
-                .conn_scoped()
-                .set_download(
-                    conn,
-                    DownloadSettings {
-                        behavior,
-                        download_path,
-                        events_enabled,
-                    },
-                )
-                .map_err(conn_error)?;
+            let settings = DownloadSettings {
+                behavior,
+                download_path,
+                events_enabled,
+            };
+            match context_id {
+                // 存在確認と設定は registry の 1 回のロックで行う（破棄との競合を防ぐ）。
+                Some(id) => ctx
+                    .state
+                    .registry()
+                    .set_context_download(&id, settings)
+                    .map_err(|_| CdpError::INVALID_PARAMS)?,
+                None => ctx
+                    .state
+                    .conn_scoped()
+                    .set_download(conn, settings)
+                    .map_err(conn_error)?,
+            }
             Ok(HandlerOutput::result(json!({})))
         })
     }
 }
 
-/// registry 上のターゲットの `targetInfo`。`browserContextId`・`openerId` は実体がないため出さない
-/// （browser context は段階 2b の `Target.createBrowserContext` で導入する。`CDP-2`）。
+/// registry 上のターゲットの `targetInfo`。`browserContextId` は所属 context の実値
+/// （Playwright の `CRBrowser._onAttachedToTarget` が必須とする。`CDP-2`）。`openerId` は実体がないため出さない。
 fn page_target_info(t: &TargetInfo, attached: bool) -> Value {
     json!({
         "targetId": t.target_id().as_str(),
@@ -284,6 +354,7 @@ fn page_target_info(t: &TargetInfo, attached: bool) -> Value {
         "url": t.url(),
         "attached": attached,
         "canAccessOpener": false,
+        "browserContextId": t.browser_context_id().as_str(),
     })
 }
 
@@ -377,7 +448,7 @@ mod tests {
         use crate::conn_state::DownloadBehavior;
         use crate::protocol::{ConnId, Dispatcher};
         use crate::server::CdpState;
-        use crate::target::{MAX_SESSIONS, SessionId, TargetKind};
+        use crate::target::{BrowserContextId, MAX_SESSIONS, SessionId, TargetKind};
 
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -487,7 +558,8 @@ mod tests {
                     p["targetInfo"],
                     json!({
                         "targetId": t.as_str(), "type": "page", "title": url, "url": url,
-                        "attached": true, "canAccessOpener": false
+                        "attached": true, "canAccessOpener": false,
+                        "browserContextId": st.registry().default_browser_context().as_str()
                     })
                 );
             }
@@ -723,9 +795,18 @@ mod tests {
                     format!(r#""behavior":"deny","downloadPath":{abs},"eventsEnabled":"x""#),
                     invalid.clone(),
                 ),
+                // 書式は正しいが未知の browserContextId は invalid params（Chromium も失敗を返す）。
                 (
                     r#""behavior":"deny","browserContextId":"X""#.into(),
-                    err(-32602, "unsupported params", 2),
+                    invalid.clone(),
+                ),
+                (
+                    r#""behavior":"deny","browserContextId":5"#.into(),
+                    invalid.clone(),
+                ),
+                (
+                    r#""behavior":"deny","browserContextId":"../x""#.into(),
+                    invalid.clone(),
                 ),
             ];
             for (extra, want) in cases {
@@ -886,6 +967,251 @@ mod tests {
             .await;
             assert_eq!(f, vec![err(-32000, "server error", 1)]);
             assert!(!st.conn_scoped().wait_for_debugger_on_start(c));
+        }
+
+        fn create_ctx(id: i64) -> String {
+            format!(
+                r#"{{"id":{id},"method":"Target.createBrowserContext","params":{{"disposeOnDetach":true}}}}"#
+            )
+        }
+
+        async fn make_context(st: &Arc<CdpState>, c: ConnId) -> BrowserContextId {
+            let f = call(st, Some(c), &create_ctx(1)).await;
+            BrowserContextId::parse(f[0]["result"]["browserContextId"].as_str().unwrap()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn cdp2_create_browser_context_returns_id_and_registers_owned_context() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let f = call(&st, Some(c), &create_ctx(10)).await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"id":10,"result":{"browserContextId":"00000000000000000000000000000002"}})
+                ]
+            );
+            let id = BrowserContextId::parse("00000000000000000000000000000002").unwrap();
+            assert!(st.registry().has_browser_context(&id));
+            assert_eq!(st.conn_scoped().owned_contexts(c), vec![id]);
+            // 2 つ目は別 ID。
+            let f = call(&st, Some(c), &create_ctx(11)).await;
+            assert_eq!(
+                f[0]["result"]["browserContextId"],
+                "00000000000000000000000000000003"
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp2_create_browser_context_rejects_unsupported_params() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let unsupported = err(-32602, "unsupported params", 1);
+            let invalid = err(-32602, "invalid params", 1);
+            let cases = [
+                (
+                    r#""disposeOnDetach":true,"proxyServer":"http://p:1""#,
+                    &unsupported,
+                ),
+                (
+                    r#""disposeOnDetach":true,"proxyBypassList":"a""#,
+                    &unsupported,
+                ),
+                (
+                    r#""disposeOnDetach":true,"originsWithUniversalNetworkAccess":[]"#,
+                    &unsupported,
+                ),
+                ("", &unsupported),
+                (r#""disposeOnDetach":false"#, &unsupported),
+                (r#""disposeOnDetach":"true""#, &invalid),
+                (r#""disposeOnDetach":1"#, &invalid),
+            ];
+            for (extra, want) in cases {
+                let req = format!(
+                    r#"{{"id":1,"method":"Target.createBrowserContext","params":{{{extra}}}}}"#
+                );
+                assert_eq!(
+                    call(&st, Some(c), &req).await,
+                    vec![want.clone()],
+                    "{extra}"
+                );
+            }
+            let with_session = r#"{"id":1,"method":"Target.createBrowserContext","sessionId":"S1","params":{"disposeOnDetach":true}}"#;
+            assert_eq!(
+                call(&st, Some(c), with_session).await,
+                vec![
+                    json!({"id":1,"sessionId":"S1","error":{"code":-32602,"message":"unsupported params"}})
+                ]
+            );
+            assert_eq!(
+                call(&st, None, &create_ctx(1)).await,
+                vec![err(-32000, "no connection", 1)]
+            );
+            assert_eq!(st.registry().browser_context_count(), 0);
+        }
+
+        #[tokio::test]
+        async fn cdp7_create_browser_context_limit_returns_server_error() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            for i in 0..crate::target::MAX_BROWSER_CONTEXTS {
+                let f = call(&st, Some(c), &create_ctx(i as i64)).await;
+                assert!(f[0].get("result").is_some(), "{i}");
+            }
+            assert_eq!(
+                call(&st, Some(c), &create_ctx(99)).await,
+                vec![err(-32000, "server error", 99)]
+            );
+            assert_eq!(
+                st.registry().browser_context_count(),
+                crate::target::MAX_BROWSER_CONTEXTS
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp7_release_connection_disposes_owned_contexts_and_their_targets() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let (c1, c2) = (open_conn(&st, 1), open_conn(&st, 2));
+            let keep = new_page(&st, "about:blank");
+            let ctx = make_context(&st, c1).await;
+            let t = st
+                .registry()
+                .create_target_in(&ctx, TargetKind::Page, "about:blank")
+                .unwrap();
+            // c2 は自動 attach で context 内のターゲットにも attach する。
+            let on = call(&st, Some(c2), &auto_attach(1, ON)).await;
+            assert_eq!(on.len(), 3);
+            let sid = on
+                .iter()
+                .find(|e| e["params"]["targetInfo"]["targetId"] == t.as_str())
+                .unwrap()["params"]["sessionId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            st.release_connection(c1);
+            assert!(!st.registry().has_browser_context(&ctx));
+            assert!(st.registry().target(&t).is_none());
+            assert!(st.registry().target(&keep).is_some());
+            // c2 は次のコマンドで detach を通知される。
+            let f = call(
+                &st,
+                Some(c2),
+                r#"{"id":2,"method":"Nope.nothing","params":{}}"#,
+            )
+            .await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(
+                f[1],
+                json!({"method": "Target.detachedFromTarget", "params": {"sessionId": sid, "targetId": t.as_str()}})
+            );
+            assert_eq!(st.registry().session_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn cdp2_target_info_includes_browser_context_id() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let existing = new_page(&st, "about:blank");
+            let ctx = make_context(&st, c).await;
+            let created = st
+                .registry()
+                .create_target_in(&ctx, TargetKind::Page, "about:blank")
+                .unwrap();
+            let default = st.registry().default_browser_context();
+            for (t, want) in [(&existing, default.as_str()), (&created, ctx.as_str())] {
+                let req = format!(
+                    r#"{{"id":3,"method":"Target.getTargetInfo","params":{{"targetId":"{}"}}}}"#,
+                    t.as_str()
+                );
+                let f = call(&st, Some(c), &req).await;
+                assert_eq!(f[0]["result"]["targetInfo"]["browserContextId"], want);
+            }
+            let f = call(&st, Some(c), &auto_attach(4, ON)).await;
+            assert_eq!(f.len(), 3);
+            assert_eq!(
+                f[1]["params"]["targetInfo"]["browserContextId"],
+                default.as_str()
+            );
+            assert_eq!(
+                f[2]["params"]["targetInfo"]["browserContextId"],
+                ctx.as_str()
+            );
+            // ブラウザ自身の targetInfo には載せない。
+            let f = call(
+                &st,
+                Some(c),
+                r#"{"id":5,"method":"Target.getTargetInfo","params":{}}"#,
+            )
+            .await;
+            assert!(
+                f[0]["result"]["targetInfo"]
+                    .get("browserContextId")
+                    .is_none()
+            );
+        }
+
+        /// CDP-2・CDP-6・REPAIR-3: Playwright の `newContext({acceptDownloads:false})` が送る
+        /// `deny` + `eventsEnabled:true` + 絶対 `downloadPath` + `browserContextId` を受理し、context に保持する。
+        #[tokio::test]
+        async fn cdp2_set_download_behavior_with_browser_context_id_accepts_deny() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let ctx = make_context(&st, c).await;
+            let missing = std::env::temp_dir().join("fandhe-cdp-no-such-dir-909");
+            let p = serde_json::to_string(missing.to_str().unwrap()).unwrap();
+            let extra = format!(
+                r#""behavior":"deny","browserContextId":"{}","downloadPath":{p},"eventsEnabled":true"#,
+                ctx.as_str()
+            );
+            assert_eq!(
+                call(&st, Some(c), &dl(2, &extra)).await,
+                vec![json!({"id":2,"result":{}})]
+            );
+            let s = st.registry().context_download(&ctx).unwrap();
+            assert_eq!(
+                (s.behavior, s.download_path, s.events_enabled),
+                (DownloadBehavior::Deny, None, true)
+            );
+            // 接続単位の設定には影響しない。ディレクトリも作らない。
+            assert!(st.conn_scoped().download(c).is_none());
+            assert!(!missing.exists());
+            // 破棄で設定も消える。
+            st.release_connection(c);
+            assert!(st.registry().context_download(&ctx).is_none());
+        }
+
+        #[tokio::test]
+        async fn cdp6_set_download_behavior_with_browser_context_id_rejects_allow() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let ctx = make_context(&st, c).await;
+            for b in ["allow", "allowAndName"] {
+                let extra = format!(
+                    r#""behavior":"{b}","browserContextId":"{}","eventsEnabled":true"#,
+                    ctx.as_str()
+                );
+                assert_eq!(
+                    call(&st, Some(c), &dl(2, &extra)).await,
+                    vec![err(-32602, "unsupported params", 2)],
+                    "{b}"
+                );
+            }
+            assert!(st.registry().context_download(&ctx).is_none());
+            // 破棄済み context への設定は invalid params。
+            st.release_connection(c);
+            let c2 = open_conn(&st, 2);
+            let extra = format!(r#""behavior":"deny","browserContextId":"{}""#, ctx.as_str());
+            assert_eq!(
+                call(&st, Some(c2), &dl(3, &extra)).await,
+                vec![err(-32602, "invalid params", 3)]
+            );
         }
 
         #[tokio::test]
