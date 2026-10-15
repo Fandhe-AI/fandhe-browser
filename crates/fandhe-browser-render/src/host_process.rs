@@ -16,7 +16,7 @@
 //!   次の呼び出しで再起動する。60 秒内に 3 回失敗したらサーキットブレーカーが作動する。
 //! - ホスト起動世代とナビゲーション世代を保持し、どちらかが変われば再ロードしてから描画する。
 //!
-//! # `RenderError` との対応（写像の実装は core に依存する #235 で行う）
+//! # `RenderError` との対応（写像は `host_renderer` で実装済み。#235）
 //!
 //! | [`HostProcessError`] | core の `RenderError` |
 //! | -------------------- | --------------------- |
@@ -542,6 +542,21 @@ impl HostProcess {
         nav_generation: u64,
         request: Request,
     ) -> Result<MethodResult, HostProcessError> {
+        self.call_on_page_checked(page, nav_generation, request, |_| Ok(()))
+    }
+
+    /// [`Self::call_on_page`] に、再ロードの結果を検査するフックを足したもの。
+    ///
+    /// 再ロードが起きたときだけ `on_reload` が呼ばれ、`Err` なら描画要求を送らずその
+    /// エラーを返す（クラッシュ後の再ロードでリダイレクト先が変わっても、呼び出し側が
+    /// `final_url` を再検査できるようにする。SSRF 緩和。#235）。
+    pub fn call_on_page_checked(
+        &mut self,
+        page: &LoadParams,
+        nav_generation: u64,
+        request: Request,
+        on_reload: impl FnOnce(&LoadResult) -> Result<(), HostProcessError>,
+    ) -> Result<MethodResult, HostProcessError> {
         if matches!(request, Request::Load(_) | Request::Shutdown) {
             return Err(HostProcessError::InvalidRequest);
         }
@@ -552,7 +567,12 @@ impl HostProcess {
             nav_generation,
             self.host_generation,
         ) {
-            self.load_inner(page, nav_generation)?;
+            let loaded = self.load_inner(page, nav_generation)?;
+            if let Err(e) = on_reload(&loaded) {
+                // 不許可のページがホストに載ったままにならないよう、記録を捨てて次回は再ロードさせる。
+                self.loaded = None;
+                return Err(e);
+            }
         }
         let (wait, phase) = self.wait_for(&request);
         self.exchange(&request, wait, phase)

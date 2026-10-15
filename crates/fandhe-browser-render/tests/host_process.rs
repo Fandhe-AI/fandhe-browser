@@ -16,6 +16,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use fandhe_browser_core::render::{
+    ElementRef, ImageFormat, PageRef, RenderError, Renderer, ScreenshotOptions,
+};
 use fandhe_browser_render::codec::{MAX_REQUEST_FRAME_BYTES, parse_json, read_frame, write_frame};
 #[cfg(unix)]
 use fandhe_browser_render::host_process::{FORCED_ENV_NAMES, PASSTHROUGH_ENV_NAMES};
@@ -23,6 +26,7 @@ use fandhe_browser_render::host_process::{
     HOST_ARGS, HostProcess, HostProcessConfig, HostProcessError, HostTimeouts, TimeoutPhase,
     resolve_host_binary,
 };
+use fandhe_browser_render::host_renderer::{HostRenderer, HostRendererConfig};
 use fandhe_browser_render::protocol::{
     BoundingBoxParams, LoadParams, MethodResult, ProtocolError, Request, ScreenshotParams,
     VisibilityParams,
@@ -50,6 +54,11 @@ fn count(root: &Path, name: &str) -> usize {
 
 fn send(out: &mut impl Write, id: u64, result: Value) {
     let msg = json!({"v": 1, "id": id, "result": result});
+    write_frame(out, &serde_json::to_vec(&msg).unwrap(), 1 << 20).expect("write");
+}
+
+fn send_error(out: &mut impl Write, id: u64, kind: &str) {
+    let msg = json!({"v": 1, "id": id, "error": {"kind": kind, "message": "https://secret.example/?t=1"}});
     write_frame(out, &serde_json::to_vec(&msg).unwrap(), 1 << 20).expect("write");
 }
 
@@ -118,6 +127,35 @@ fn fake_host() -> ! {
                 std::thread::sleep(Duration::from_secs(60));
             }
             ("slow-shutdown", "shutdown") => std::thread::sleep(Duration::from_secs(60)),
+            ("not-found", "visibility" | "bounding_box") => {
+                send_error(&mut stdout, id, "not_found");
+                continue;
+            }
+            ("bad-base64", "screenshot") => {
+                send(
+                    &mut stdout,
+                    id,
+                    json!({"format": "png", "width": 4, "height": 4, "data_base64": "!!!!"}),
+                );
+                continue;
+            }
+            ("not-png", "screenshot") => {
+                send(
+                    &mut stdout,
+                    id,
+                    json!({"format": "png", "width": 4, "height": 4, "data_base64": "aGVsbG8gd29ybGQ="}),
+                );
+                continue;
+            }
+            ("redirect-private", "load") => {
+                append(&root.join("loads"), "x");
+                send(
+                    &mut stdout,
+                    id,
+                    json!({"final_url": "http://127.0.0.1/", "status": 200}),
+                );
+                continue;
+            }
             ("garbage-frame", _) => {
                 write_frame(&mut stdout, b"not json", 1 << 20).expect("garbage");
                 continue;
@@ -536,6 +574,185 @@ fn t_rss_limit() {
     assert_gone(child_pid(&root, 1));
 }
 
+// ---------------------------------------------------------------------------
+// HostRenderer（core `Renderer` の実装。RENDER-3・TASK-38・#235）
+// ---------------------------------------------------------------------------
+
+fn renderer(root: &Root, timeouts: HostTimeouts, allow_private: bool) -> HostRenderer {
+    HostRenderer::new(
+        HostRendererConfig::new(root.config(timeouts))
+            .with_allow_private_network_access(allow_private),
+    )
+}
+
+fn sel(s: &str) -> ElementRef {
+    ElementRef::Selector(s.to_owned())
+}
+
+fn variant(e: &RenderError) -> &'static str {
+    match e {
+        RenderError::RenderingDisabled => "RenderingDisabled",
+        RenderError::ElementNotFound => "ElementNotFound",
+        RenderError::Timeout => "Timeout",
+        RenderError::HostUnavailable => "HostUnavailable",
+        RenderError::ProtocolMismatch => "ProtocolMismatch",
+        RenderError::PageNotLoaded => "PageNotLoaded",
+        RenderError::Internal(_) => "Internal",
+        _ => "Other",
+    }
+}
+
+fn t_renderer_roundtrip() {
+    let root = Root::new("r-ok", "ok");
+    let concrete = renderer(&root, base_timeouts(), false);
+    let r: &dyn Renderer = &concrete;
+    let loaded = r
+        .load(&PageRef::new("https://example.com/a"))
+        .expect("load");
+    assert_eq!(loaded.final_url(), "https://example.com/a");
+    let shot = r
+        .capture_screenshot(&ScreenshotOptions::new())
+        .expect("shot");
+    assert_eq!(shot.format, ImageFormat::Png);
+    assert_eq!((shot.width, shot.height), (1280, 800));
+    assert_eq!(
+        shot.data,
+        vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+    );
+    assert!(r.element_visibility(&sel("#a")).expect("vis").visible);
+    let bb = r.bounding_box(&sel("#a")).expect("bb");
+    assert_eq!((bb.x, bb.y, bb.width, bb.height), (8.5, -2.0, 120.25, 18.0));
+    assert_eq!(count(&root.0, "loads"), 1);
+    // 2 回目の load（別 URL）はナビゲーション世代が進み、ホストへ再 load される。
+    r.load(&PageRef::new("https://example.com/b"))
+        .expect("load2");
+    r.capture_screenshot(&ScreenshotOptions::new())
+        .expect("shot2");
+    assert_eq!(count(&root.0, "loads"), 2);
+    assert_eq!(count(&root.0, "spawns"), 1);
+}
+
+fn t_renderer_not_loaded_before_load() {
+    let root = Root::new("r-notloaded", "ok");
+    let r = renderer(&root, base_timeouts(), false);
+    let e = r
+        .capture_screenshot(&ScreenshotOptions::new())
+        .expect_err("shot");
+    assert_eq!(variant(&e), "PageNotLoaded");
+    let e = r.element_visibility(&sel("#a")).expect_err("vis");
+    assert_eq!(variant(&e), "PageNotLoaded");
+    let e = r.bounding_box(&sel("#a")).expect_err("bb");
+    assert_eq!(variant(&e), "PageNotLoaded");
+    assert_eq!(count(&root.0, "spawns"), 0, "no host spawn before load");
+}
+
+fn t_renderer_rejects_urls() {
+    let root = Root::new("r-urls", "ok");
+    let r = renderer(&root, base_timeouts(), false);
+    for (url, expected) in [
+        ("file:///etc/passwd", "Internal"),
+        ("javascript:alert(1)", "Internal"),
+        ("https://user:pw@example.com/", "Internal"),
+        ("http://127.0.0.1/", "Internal"),
+        ("http://localhost/", "Internal"),
+        ("http://2130706433/", "Internal"),
+        ("about:blank", "PageNotLoaded"),
+    ] {
+        let e = r.load(&PageRef::new(url)).expect_err(url);
+        assert_eq!(variant(&e), expected, "{url}");
+        if let Some(d) = e.internal_detail() {
+            assert!(!d.contains("127.0.0.1") && !d.contains("passwd"), "{d}");
+        }
+    }
+    assert_eq!(
+        count(&root.0, "spawns"),
+        0,
+        "rejected URLs never spawn the host"
+    );
+
+    // allow=true なら loopback も load できる。
+    let root2 = Root::new("r-urls-allow", "ok");
+    let r2 = renderer(&root2, base_timeouts(), true);
+    let loaded = r2
+        .load(&PageRef::new("http://127.0.0.1/"))
+        .expect("allowed");
+    assert_eq!(loaded.final_url(), "http://127.0.0.1/");
+}
+
+fn t_renderer_host_failures() {
+    let root = Root::new("r-crash", "crash-on-screenshot");
+    let r = renderer(&root, short_timeouts(), false);
+    r.load(&PageRef::new("https://example.com/")).expect("load");
+    let e = r
+        .capture_screenshot(&ScreenshotOptions::new())
+        .expect_err("crash");
+    assert_eq!(variant(&e), "HostUnavailable");
+
+    let root = Root::new("r-hang", "hang-query");
+    let r = renderer(&root, short_timeouts(), false);
+    r.load(&PageRef::new("https://example.com/")).expect("load");
+    let e = r.element_visibility(&sel("#a")).expect_err("hang");
+    assert_eq!(variant(&e), "Timeout");
+
+    let root = Root::new("r-garbage", "garbage-frame");
+    let r = renderer(&root, short_timeouts(), false);
+    let e = r
+        .load(&PageRef::new("https://example.com/"))
+        .expect_err("garbage");
+    assert_eq!(variant(&e), "ProtocolMismatch");
+
+    let root = Root::new("r-range", "bad-protocol-range");
+    let r = renderer(&root, short_timeouts(), false);
+    let e = r
+        .load(&PageRef::new("https://example.com/"))
+        .expect_err("range");
+    assert_eq!(variant(&e), "ProtocolMismatch");
+}
+
+fn t_renderer_untrusted_responses() {
+    let root = Root::new("r-b64", "bad-base64");
+    let r = renderer(&root, short_timeouts(), false);
+    r.load(&PageRef::new("https://example.com/")).expect("load");
+    let e = r
+        .capture_screenshot(&ScreenshotOptions::new())
+        .expect_err("b64");
+    assert_eq!(variant(&e), "ProtocolMismatch");
+
+    let root = Root::new("r-notpng", "not-png");
+    let r = renderer(&root, short_timeouts(), false);
+    r.load(&PageRef::new("https://example.com/")).expect("load");
+    let e = r
+        .capture_screenshot(&ScreenshotOptions::new())
+        .expect_err("png");
+    assert_eq!(variant(&e), "ProtocolMismatch");
+
+    let root = Root::new("r-nf", "not-found");
+    let r = renderer(&root, short_timeouts(), false);
+    r.load(&PageRef::new("https://example.com/")).expect("load");
+    let e = r.element_visibility(&sel("#a")).expect_err("nf");
+    assert_eq!(variant(&e), "ElementNotFound");
+    let e = r.bounding_box(&sel("#a")).expect_err("nf");
+    assert_eq!(variant(&e), "ElementNotFound");
+    assert!(!format!("{e:?}{e}").contains("secret.example"));
+}
+
+fn t_renderer_final_url_rechecked() {
+    let root = Root::new("r-redirect", "redirect-private");
+    let r = renderer(&root, short_timeouts(), false);
+    let e = r
+        .load(&PageRef::new("https://example.com/"))
+        .expect_err("redirect");
+    assert_eq!(variant(&e), "Internal");
+    let e = r
+        .capture_screenshot(&ScreenshotOptions::new())
+        .expect_err("after");
+    assert_eq!(
+        variant(&e),
+        "PageNotLoaded",
+        "failed load must not leave a page"
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args == HOST_ARGS {
@@ -557,6 +774,12 @@ fn main() {
         ("circuit_breaker", t_circuit_breaker),
         ("profile_isolation", t_profile_isolation),
         ("stderr_tail", t_stderr_tail),
+        ("renderer_roundtrip", t_renderer_roundtrip),
+        ("renderer_not_loaded", t_renderer_not_loaded_before_load),
+        ("renderer_rejects_urls", t_renderer_rejects_urls),
+        ("renderer_host_failures", t_renderer_host_failures),
+        ("renderer_untrusted", t_renderer_untrusted_responses),
+        ("renderer_final_url", t_renderer_final_url_rechecked),
     ];
     #[cfg(unix)]
     tests.push(("dump_env_args_cwd", t_dump_env_args_cwd));

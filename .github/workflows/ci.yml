@@ -1553,13 +1553,14 @@ jobs:
   # build.rs で cc-rs 経由の C / アセンブラのコンパイルを行い、クロスでは macOS SDK / MSVC の
   # ツールチェーン（ヘッダ・lib.exe）が要る。ubuntu 上の cc / clang ではヘッダ不足で失敗するため、
   # `ring` に至る fandhe-browser-core（reqwest / rustls）とそれに依存する -ai・-cdp・-cli、および
-  # wpt-subset-runner は --exclude で外す。残る js（V8・boa）・profile・mcp・render は
+  # wpt-subset-runner は --exclude で外す。render も fandhe-browser-core に依存する（HostRenderer。
+  # TASK-38・#235）ため同様に外す。残る js（V8・boa）・profile・mcp は
   # `cc` / `ring` / `cmake` を依存に持たず（`cargo tree` で確認。bindgen は v8 の build-dependency
   # だが prebuilt 利用時は動かない）、check / clippy が両ターゲットで通る。
-  # 未検査の範囲: core・ai・cdp・cli・wpt-subset-runner の OS 固有分岐（cfg(target_os) 等）。
+  # 未検査の範囲: core・ai・cdp・cli・render・wpt-subset-runner の OS 固有分岐（cfg(target_os) 等）。
   # これらの OS 固有のコンパイル・lint の誤りは push（main）の macOS・Windows ネイティブ実行でしか
   # 検出されない。--exclude 方式のため、除外対象の crate が増えれば ring を引く新しい crate は
-  # ここで失敗として表面化する（黙って検査対象が狭まらない）。cc を使う依存を render・js・profile・
+  # ここで失敗として表面化する（黙って検査対象が狭まらない）。cc を使う依存を js・profile・
   # mcp に追加した場合は、その crate もここで --exclude する。
   # v8 の build.rs は prebuilt の静的ライブラリ（約 150MB / ターゲット）をダウンロードする
   # （target/ 配下。時間とネットワークを使うため、target は cache しない）。
@@ -1599,37 +1600,37 @@ jobs:
         run: >-
           cargo check --workspace --all-targets --all-features --target aarch64-apple-darwin
           --exclude fandhe-browser-core --exclude fandhe-browser-ai --exclude fandhe-browser-cdp
-          --exclude fandhe-browser-cli --exclude wpt-subset-runner
+          --exclude fandhe-browser-cli --exclude wpt-subset-runner --exclude fandhe-browser-render
       - name: "cargo clippy（aarch64-apple-darwin・--all-features・-D warnings）"
         if: ${{ !cancelled() }}
         run: >-
           cargo clippy --workspace --all-targets --all-features --target aarch64-apple-darwin
           --exclude fandhe-browser-core --exclude fandhe-browser-ai --exclude fandhe-browser-cdp
-          --exclude fandhe-browser-cli --exclude wpt-subset-runner -- -D warnings
+          --exclude fandhe-browser-cli --exclude wpt-subset-runner --exclude fandhe-browser-render -- -D warnings
       - name: "cargo clippy（aarch64-apple-darwin・既定 feature・-D warnings）"
         if: ${{ !cancelled() }}
         run: >-
           cargo clippy --workspace --all-targets --target aarch64-apple-darwin
           --exclude fandhe-browser-core --exclude fandhe-browser-ai --exclude fandhe-browser-cdp
-          --exclude fandhe-browser-cli --exclude wpt-subset-runner -- -D warnings
+          --exclude fandhe-browser-cli --exclude wpt-subset-runner --exclude fandhe-browser-render -- -D warnings
       - name: "cargo check（x86_64-pc-windows-msvc・--all-features）"
         if: ${{ !cancelled() }}
         run: >-
           cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
           --exclude fandhe-browser-core --exclude fandhe-browser-ai --exclude fandhe-browser-cdp
-          --exclude fandhe-browser-cli --exclude wpt-subset-runner
+          --exclude fandhe-browser-cli --exclude wpt-subset-runner --exclude fandhe-browser-render
       - name: "cargo clippy（x86_64-pc-windows-msvc・--all-features・-D warnings）"
         if: ${{ !cancelled() }}
         run: >-
           cargo clippy --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
           --exclude fandhe-browser-core --exclude fandhe-browser-ai --exclude fandhe-browser-cdp
-          --exclude fandhe-browser-cli --exclude wpt-subset-runner -- -D warnings
+          --exclude fandhe-browser-cli --exclude wpt-subset-runner --exclude fandhe-browser-render -- -D warnings
       - name: "cargo clippy（x86_64-pc-windows-msvc・既定 feature・-D warnings）"
         if: ${{ !cancelled() }}
         run: >-
           cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc
           --exclude fandhe-browser-core --exclude fandhe-browser-ai --exclude fandhe-browser-cdp
-          --exclude fandhe-browser-cli --exclude wpt-subset-runner -- -D warnings
+          --exclude fandhe-browser-cli --exclude wpt-subset-runner --exclude fandhe-browser-render -- -D warnings
       - name: "cargo cache の保存（main のみ・exact hit 時は不要）"
         if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

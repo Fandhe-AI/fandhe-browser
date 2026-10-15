@@ -14,6 +14,10 @@ publish.workspace = true
 # 辺を足すだけで、新しいパッケージは Cargo.lock に入らない。serde（derive）は core 限定の
 # 配置方針のため使わず、`Value` から手作業で解釈する。
 serde_json = { workspace = true }
+# core の `Renderer` トレイトの実装（`HostRenderer`。TASK-38・#235）のための workspace 内 path 依存
+# （依存承認は不要。core の既定 feature は空で v8・boa は入らず、Servo 系も入らない。RENDER-1）。
+# core は reqwest/rustls/ring を引くため、ci.yml の `cross-target-check` では本 crate を除外している。
+fandhe-browser-core = { path = "../fandhe-browser-core" }
 # feature `rendering` は cli 側に定義済み（TASK-33.4・#459。workspace 登録は #45）で、
 # 本 crate を optional 依存として有効化する。Servo（MPL-2.0）の導入は TASK-38
 # （ビヘイビア RENDER-1）でユーザー承認を経て行う。

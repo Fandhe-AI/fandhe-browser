@@ -13,22 +13,23 @@
 //! （契約テスト `tests/protocol_fixtures.rs`。PLUG-1・SEC-2・REPAIR-4・TASK-38）。
 //! クライアント側のプロトコル型は [`protocol`]、フレームコーデックは [`codec`]
 //! （済み。RENDER-3・TASK-38・#989）。子プロセス管理は [`host_process`]
-//! （済み。RENDER-3・RENDER-4・PLUG-1・TASK-38・#994）。
+//! （済み。RENDER-3・RENDER-4・PLUG-1・TASK-38・#994）。core の `Renderer` の実装は
+//! [`host_renderer`]（済み。RENDER-3・TASK-38・#235）。
 //!
 //! # スタブについて
 //!
 //! - （済み）feature `rendering` の Cargo 定義（workspace 登録 #45・cli 側の結線
 //!   TASK-33.4・#459。RENDER-1・MS-1）
-//! - core の描画トレイト（`Renderer`。`fandhe-browser-core::render`）の実装と、
-//!   cli による `AppState` への注入（RENDER-1・TASK-38・MS-4）
+//! - （済み）core の描画トレイト（`Renderer`）の実装 `HostRenderer`（RENDER-3・TASK-38・#235）
+//! - cli による `HostRenderer` の `AppState` への注入（RENDER-1・TASK-38・#236・MS-4）
 //! - Servo の組込・スクリーンショット取得等の本実装（RENDER-1・TASK-38・
 //!   MS-4）
 //! - （済み）子プロセス（Servo ホスト）の起動・タイムアウト・kill・再起動・サーキット
 //!   ブレーカー・RSS 監視（Windows の RSS 監視は未実装。RENDER-3・RENDER-4・TASK-38・#994）
-//! - `ProtocolError` の core `RenderError` への写像、`data_base64` のデコード、
-//!   プライベート IP / loopback ポリシーとの統合、`HostProcessError` の `RenderError` への写像
-//!   （HostRenderer #235。RENDER-3）
+//! - （済み）`HostProcessError` の `RenderError` への写像、`data_base64` のデコード、
+//!   プライベート IP / loopback ポリシーとの統合（HostRenderer #235。RENDER-3）
 
 pub mod codec;
 pub mod host_process;
+pub mod host_renderer;
 pub mod protocol;

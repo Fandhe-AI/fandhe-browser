@@ -948,6 +948,35 @@ fn reject_disallowed_address(url: &Url, allow_private_network_access: bool) -> R
     Ok(())
 }
 
+/// 描画ホスト（別プロセスの Servo ホスト）へ渡す URL のネットワーク到達先を検証し、
+/// 正規化した文字列を返す（`RENDER-3`・`SEC-2`・TASK-38・#235。設計 `servo-host-design.md` §2.5）。
+///
+/// `fandhe-browser-render` の `HostRenderer` が `load` の送信前と、ホストが返した `final_url` の
+/// 再検査に呼ぶ。検査内容は [`Fetcher::validate_url`] と同じ scheme（`http`/`https` のみ）・
+/// IP リテラルに加え、ホスト名 `localhost`・`*.localhost`（大文字小文字と末尾ドットを
+/// 正規化して判定）を `allow_private_network_access == false` のとき拒否する。
+/// 解析は `Url`（rust-url）で行うため、数値・16 進・パーセントエンコードで書かれたホストも
+/// Servo と同じ形に正規化されてから判定される。
+///
+/// 残存リスク（クライアント側では防げない。設計 §2.5・§13 のオーナー判断事項）: DNS 名が
+/// プライベート IP に解決される場合、DNS リバインディング、ホスト内部のサブリソース取得。
+pub fn check_network_target_url(url: &str, allow_private_network_access: bool) -> Result<String> {
+    let parsed = Url::parse(url).map_err(|source| Error::InvalidInput {
+        message: format!("invalid URL: {source}"),
+    })?;
+    reject_disallowed_scheme(&parsed)?;
+    reject_disallowed_address(&parsed, allow_private_network_access)?;
+    if !allow_private_network_access && let Some(host) = parsed.host_str() {
+        let host = host.trim_end_matches('.');
+        if host == "localhost" || host.ends_with(".localhost") {
+            return Err(Error::DisallowedAddress {
+                address: "localhost".to_string(),
+            });
+        }
+    }
+    Ok(parsed.to_string())
+}
+
 /// `Fetcher::new` のリダイレクトポリシー（`Policy::custom`）が発火しない
 /// リダイレクトを検出し、scheme を検証する。
 ///
@@ -1550,6 +1579,42 @@ mod tests {
         assert!(
             reject_disallowed_address(&domain, true).is_ok(),
             "DNS 名の host は allow=true でも Ok のはず"
+        );
+    }
+
+    /// RENDER-3・CORE-1（TASK-38・#235）: `check_network_target_url` は許可外の到達先を拒否し、
+    /// 許可時は正規化した URL を返す。
+    #[test]
+    fn render_3_check_network_target_url_table() {
+        for url in [
+            "http://127.0.0.1/",
+            "http://[::1]/",
+            "http://2130706433/",
+            "http://0x7f.1/",
+            "http://LOCALHOST./",
+            "http://a.localhost/",
+            "http://10.0.0.1/",
+        ] {
+            assert!(
+                check_network_target_url(url, false).is_err(),
+                "{url} は拒否されるはず"
+            );
+            assert!(
+                check_network_target_url(url, true).is_ok(),
+                "{url} は allow=true で許可されるはず"
+            );
+        }
+        for url in ["file:///etc/passwd", "data:text/html,x", "javascript:1"] {
+            assert!(check_network_target_url(url, true).is_err(), "{url}");
+        }
+        assert!(check_network_target_url("not a url", true).is_err());
+        assert_eq!(
+            check_network_target_url("https://Example.com/a?b", false).expect("ok"),
+            "https://example.com/a?b"
+        );
+        assert_eq!(
+            check_network_target_url("http://2130706433/", true).expect("ok"),
+            "http://127.0.0.1/"
         );
     }
 }
