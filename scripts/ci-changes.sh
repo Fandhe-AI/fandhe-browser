@@ -69,6 +69,11 @@ classify() {
       # servo-host/ は別 workspace で本体のビルド・テストは読まないため rust・harness は変えない
       # （servo 軸は下の 2 つ目の case で立てる）。未知のパスは従来どおり rust=true の *) に落ちるが、
       # servo-host/ だけはここで先に受けて rust=false を保つ
+      # 例外: servo-host/deny.toml は make check-deny-license-reject（rust-lint）が読むため rust=true にする
+      # （rust=false だと deny.toml だけの変更で canary が走らない fail-open になる。#991）
+      servo-host/deny.toml)
+        rust=true
+        ;;
       servo-host/*)
         ;;
       *.md | docs/* | .claude/* | .agents/* | LICENSE-* | NOTICE | \
@@ -140,6 +145,7 @@ self_test() {
   expect ".github change" "rust=true harness=false servo=true" $'.github/workflows/ci.yml'
   expect "Cargo.lock" "rust=true harness=false servo=false" $'Cargo.lock'
   expect "servo-host only (rust=false; host is separate workspace)" "rust=false harness=false servo=true" $'servo-host/Cargo.toml\nservo-host/src/main.rs\nservo-host/Cargo.lock'
+  expect "servo-host deny.toml is rust (canary reads it)" "rust=true harness=false servo=true" $'servo-host/deny.toml'
   expect "servo-host main.rs only" "rust=false harness=false servo=true" $'servo-host/src/main.rs'
   expect "servo-host README only" "rust=false harness=false servo=true" $'servo-host/README.md'
   expect "servo-host + docs" "rust=false harness=false servo=true" $'servo-host/src/main.rs\ndocs/a.md'

@@ -9,8 +9,11 @@
 # - canary は依存ゼロなので `--locked --offline` で実行でき、ネットワークも advisory DB も使わない
 # - canary の Cargo.toml には `publish` を書かない（脅威モデルはサードパーティ crate の混入であり、
 #   公開可能な crate と同じ扱いで監査対象に含めるため）
-# - MPL-2.0 を negative ケースに含めるのは Servo を fandhe-browser-render に隔離する方針
-#   （RENDER-1・licensing.md）を裏付けるため
+# - 本体の deny.toml は MPL-2.0 を拒否し、Servo ホストの servo-host/deny.toml は MPL-2.0 を許可する
+#   （RENDER-1・licensing.md・TASK-38・#991）。本体の MPL-2.0 拒否と、ホストの GPL/AGPL/LGPL 拒否、
+#   ホストの webpki-roots 以外の CDLA-Permissive-2.0 拒否（OSS-2・OSS-3）を両設定で検証する
+# - ホストの webpki-roots 例外は版を固定しない。名前一致の canary で例外が効くことを示す
+#   （例外に版を足すと本ケースが壊れる）
 # - 陽性対照（MIT OR Apache-2.0）を先に走らせ、deny.toml の破損や実行環境の問題を
 #   「reject された」と取り違えないようにする
 # - `warning[license-not-encountered]` は正常なノイズ。判定は行全体で `error[rejected]` /
@@ -26,10 +29,21 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${DIR}/lib.sh"
 reject_args "$(basename "$0")" "$@"
 
-# GPL/AGPL/LGPL の代表と MPL-2.0。陽性対照は空白を含むため含めない。
+# 本体: GPL/AGPL/LGPL の代表と MPL-2.0。陽性対照は空白を含むため含めない。
 DENY_LICENSE_REJECT_CASES="GPL-3.0-only AGPL-3.0-only LGPL-2.1-only MPL-2.0"
+# ホスト: MPL-2.0 は許可されるため GPL/AGPL/LGPL の代表と、例外外の CDLA-Permissive-2.0 のみ。
+DENY_HOST_REJECT_CASES="GPL-3.0-only AGPL-3.0-only LGPL-2.1-only CDLA-Permissive-2.0"
 
 [ -f deny.toml ] || skip "no deny.toml; check-deny-license-reject skipped"
+host_cfg="${ROOT_DIR}/servo-host/deny.toml"
+have_host=false
+if [ -f servo-host/Cargo.toml ]; then
+  # ホストがあるのに設定が無い状態は silent skip にせず fail-closed
+  [ -f "${host_cfg}" ] || { echo "error: servo-host/Cargo.toml exists but servo-host/deny.toml is missing" >&2; exit 1; }
+  have_host=true
+else
+  echo "skip: servo-host/ is missing; servo-host canary cases skipped"
+fi
 
 export PATH="${HOME}/.cargo/bin:${PATH}"
 if ! command -v cargo-deny >/dev/null 2>&1; then
@@ -41,13 +55,13 @@ tmp="$(mktemp -d)" || { echo "error: mktemp -d failed" >&2; exit 1; }
 trap 'rm -rf "${tmp}"' EXIT
 deny_cfg="${ROOT_DIR}/deny.toml"
 
-# make_canary <dir-name> <license-or-empty>
+# make_canary <dir-name> <license-or-empty> [crate-name]
 make_canary() {
   local dir="${tmp}/$1"
   mkdir -p "${dir}/src"
   {
     echo '[package]'
-    echo 'name = "deny-license-canary"'
+    echo "name = \"${3:-deny-license-canary}\""
     echo 'version = "0.0.0"'
     echo 'edition = "2024"'
     if [ -n "$2" ]; then echo "license = \"$2\""; fi
@@ -61,10 +75,10 @@ make_canary() {
   }
 }
 
-# run_case <label> <expected-diagnostic-or-empty> <manifest>
+# run_case <label> <expected-diagnostic-or-empty> <manifest> <deny-config>
 run_case() {
-  local label="$1" expect_diag="$2" manifest="$3" out code
-  if out="$(cargo deny --manifest-path "${manifest}" --config "${deny_cfg}" --locked --offline check licenses 2>&1)"; then
+  local label="$1" expect_diag="$2" manifest="$3" cfg="$4" out code
+  if out="$(cargo deny --manifest-path "${manifest}" --config "${cfg}" --locked --offline check licenses 2>&1)"; then
     code=0
   else
     code=$?
@@ -86,10 +100,23 @@ run_case() {
 }
 
 make_canary positive "MIT OR Apache-2.0"
-run_case "MIT OR Apache-2.0" "" "${tmp}/positive/Cargo.toml"
+run_case "[main] MIT OR Apache-2.0" "" "${tmp}/positive/Cargo.toml" "${deny_cfg}"
 for lic in ${DENY_LICENSE_REJECT_CASES}; do
   make_canary "case-${lic}" "${lic}"
-  run_case "${lic}" "error[rejected]" "${tmp}/case-${lic}/Cargo.toml"
+  run_case "[main] ${lic}" "error[rejected]" "${tmp}/case-${lic}/Cargo.toml" "${deny_cfg}"
 done
 make_canary unlicensed ""
-run_case "unlicensed (no license field)" "error[unlicensed]" "${tmp}/unlicensed/Cargo.toml"
+run_case "[main] unlicensed (no license field)" "error[unlicensed]" "${tmp}/unlicensed/Cargo.toml" "${deny_cfg}"
+
+if [ "${have_host}" = true ]; then
+  run_case "[servo-host] MIT OR Apache-2.0" "" "${tmp}/positive/Cargo.toml" "${host_cfg}"
+  make_canary host-mpl "MPL-2.0"
+  run_case "[servo-host] MPL-2.0 (allowed)" "" "${tmp}/host-mpl/Cargo.toml" "${host_cfg}"
+  make_canary host-webpki "CDLA-Permissive-2.0" "webpki-roots"
+  run_case "[servo-host] CDLA-Permissive-2.0 on webpki-roots (exception)" "" "${tmp}/host-webpki/Cargo.toml" "${host_cfg}"
+  for lic in ${DENY_HOST_REJECT_CASES}; do
+    make_canary "host-${lic}" "${lic}"
+    run_case "[servo-host] ${lic}" "error[rejected]" "${tmp}/host-${lic}/Cargo.toml" "${host_cfg}"
+  done
+  run_case "[servo-host] unlicensed (no license field)" "error[unlicensed]" "${tmp}/unlicensed/Cargo.toml" "${host_cfg}"
+fi

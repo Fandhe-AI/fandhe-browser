@@ -1,0 +1,95 @@
+# Servo ホスト専用の cargo-deny 設定（TASK-38・Issue #991。OSS-2・OSS-3・RENDER-1）。
+# servo-host/ は別 workspace・別 Cargo.lock の子プロセスで、Servo（MPL-2.0）はここだけに閉じる
+# （licensing.md・設計 docs/design/servo-host-design.md §4・§4.1・Issue #915・#935）。
+# 本体の ./deny.toml は MPL-2.0 を許可しないまま変えない。`make deny`（scripts/deny.sh）が
+# 本体とホストの両方を検査し、`make deny-servo-host` はホストのみを検査する。
+# 許可外ライセンスを reject できることは `make check-deny-license-reject` の canary で検証する。
+
+[graph]
+# ホストは default-features = false と baked-in-resources で固定している。全 feature を
+# 監査すると使わない構成（gstreamer・webgpu 等）が対象に入って誤検出になるため false にする。
+all-features = false
+# 本体の 8 ターゲットとは異なり、aarch64-windows と musl は設計 §7 の検証が済むまで外す。
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+# ignore は unmaintained のみ（脆弱性ではない）。vulnerability・unsound は ignore しない。
+# いずれも servo の推移依存で、本リポ側では差し替えられない。
+# 解消予定: servo の更新で依存が無くなった時点で外す（追跡先: TASK-38 親 #228）。
+version = 2
+ignore = [
+  { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 は webrender 0.70.0 経由の servo 推移依存（unmaintained のみ）。上流に更新版が無く、servo の更新で解消し #228 で追跡する" },
+  { id = "RUSTSEC-2025-0081", reason = "unic-char-property 0.9.0 は urlpattern 0.3.0 経由の servo 推移依存（unmaintained のみ）。上流に更新版が無く、servo の更新で解消し #228 で追跡する" },
+  { id = "RUSTSEC-2025-0075", reason = "unic-char-range 0.9.0 は urlpattern 0.3.0 経由の servo 推移依存（unmaintained のみ）。上流に更新版が無く、servo の更新で解消し #228 で追跡する" },
+  { id = "RUSTSEC-2025-0080", reason = "unic-common 0.9.0 は urlpattern 0.3.0 経由の servo 推移依存（unmaintained のみ）。上流に更新版が無く、servo の更新で解消し #228 で追跡する" },
+  { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident 0.9.0 は urlpattern 0.3.0 経由の servo 推移依存（unmaintained のみ）。上流に更新版が無く、servo の更新で解消し #228 で追跡する" },
+  { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version 0.9.0 は urlpattern 0.3.0 経由の servo 推移依存（unmaintained のみ）。上流に更新版が無く、servo の更新で解消し #228 で追跡する" },
+]
+
+[licenses]
+version = 2
+include-dev = true
+# 本体と同じ許可集合に MPL-2.0 だけを足す。MPL-2.0 は crate ごとの例外にしない
+# （対象が多く Servo 更新のたびに壊れる。ホスト workspace 全体が MPL の適用範囲という決定のため）。
+# `MPL-2.0 AND BSD-3-Clause` は両識別子が allow にあるため追加不要。
+# LGPL・GPL・AGPL は allow に列挙しないことで fail-closed に検出する。
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unlicense",
+  "MPL-2.0",
+]
+confidence-threshold = 0.8
+
+# CDLA-Permissive-2.0 は allow に入れず webpki-roots の 1 crate に限って許可する。
+# 版は固定しない（固定すると servo の更新のたびに壊れ、canary の陽性側も成立しなくなる）。
+[[licenses.exceptions]]
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
+[sources]
+# crates.io のみ許可（git 依存・代替レジストリを拒否）。
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+# default-features = false の効果が退行して不要な描画バックエンドやコピーレフトのメディア層が
+# 入ることを検出する。「LGPL 系」を名前で表せる crate は無く、LGPL を持ち込む gstreamer 系を
+# 名前で明示し、残りは [licenses] の allow 外として二重に検出する。
+deny = [
+  { crate = "mozangle", reason = "WebGL 用 ANGLE バインディング。ホストは WebGL を使わない" },
+  { crate = "servo-webgl", reason = "WebGL バックエンド。ホストは使わない" },
+  { crate = "wgpu", reason = "WebGPU バックエンド。ホストは使わない" },
+  { crate = "wgpu-core", reason = "WebGPU バックエンド。ホストは使わない" },
+  { crate = "wgpu-hal", reason = "WebGPU バックエンド。ホストは使わない" },
+  { crate = "wgpu-types", reason = "WebGPU バックエンド。ホストは使わない" },
+  { crate = "servo-webgpu", reason = "WebGPU バックエンド。ホストは使わない" },
+  { crate = "servo-media-gstreamer", reason = "gstreamer（LGPL）のメディア層。ホストは使わない" },
+  { crate = "gstreamer", reason = "LGPL のメディア層。ホストは使わない" },
+  { crate = "gstreamer-sys", reason = "LGPL のメディア層。ホストは使わない" },
+  { crate = "gstreamer-base", reason = "LGPL のメディア層。ホストは使わない" },
+  { crate = "gstreamer-app", reason = "LGPL のメディア層。ホストは使わない" },
+  { crate = "gstreamer-audio", reason = "LGPL のメディア層。ホストは使わない" },
+  { crate = "gstreamer-video", reason = "LGPL のメディア層。ホストは使わない" },
+  { crate = "gstreamer-gl", reason = "LGPL のメディア層。ホストは使わない" },
+  { crate = "gstreamer-play", reason = "LGPL のメディア層。ホストは使わない" },
+  { crate = "gstreamer-player", reason = "LGPL のメディア層。ホストは使わない" },
+  { crate = "gstreamer-webrtc", reason = "LGPL のメディア層。ホストは使わない" },
+  { crate = "gstreamer-sdp", reason = "LGPL のメディア層。ホストは使わない" },
+]
