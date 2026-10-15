@@ -72,10 +72,10 @@ body:
   - type: dropdown
     id: rendering
     attributes:
-      label: rendering feature
+      label: Servo ホスト（レンダリング）
       options:
-        - 無効（既定）
-        - 有効（--features rendering）
+        - 未使用（既定）
+        - 使用（ホストパスを設定）
         - 不明
     validations:
       required: true

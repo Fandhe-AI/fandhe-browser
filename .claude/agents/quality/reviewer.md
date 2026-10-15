@@ -11,7 +11,7 @@ tools: [Read, Glob, Grep, Bash]
 
 ## 役割
 
-- 設計原則への準拠確認: crate 境界・一方向依存・エンジン抽象の維持・`rendering` feature gate の隔離
+- 設計原則への準拠確認: crate 境界・一方向依存・エンジン抽象の維持・Servo ホストの隔離（本体の依存グラフへ Servo 系を入れない）
 - AI 自己補修性の確認: 変更の波及範囲・戻り値型の拡張性・スタブの将来仕様コメント・具体値による assert
 - `.claude/rules/` の各規約（coding-rust・conventional-commits・code-comment-style・licensing・dependency-policy）への準拠確認
 - `AGENTS.md` のレビュー観点に従う

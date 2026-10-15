@@ -37,7 +37,7 @@ fandhe-browser/
 │   ├── fandhe-browser-js/         #   JS エンジン抽象（V8 既定 / boa）
 │   ├── fandhe-browser-ai/         #   AI 最適化 API（アクセシビリティツリー・簡約 DOM）・プラグイン API
 │   ├── fandhe-browser-cdp/        #   CDP 互換サーバー
-│   ├── fandhe-browser-render/     #   レンダリング層（feature gate `rendering`。Servo 自体は別 workspace の Servo ホストに置く方針で、本 crate の役割は設計で決める。licensing.md）
+│   ├── fandhe-browser-render/     #   レンダリング層（Servo ホストへの IPC クライアント。Servo 自体は別 workspace の Servo ホストに置く方針で、本 crate の役割は設計で決める。licensing.md）
 │   ├── fandhe-browser-profile/    #   プロファイル分離
 │   ├── fandhe-browser-cli/        #   CLI（最小雛形: core・profile・cdp・ai を組み立ててサーバー起動。サブコマンドは TASK-47）
 │   └── fandhe-browser-mcp/        #   MCP 参照プラグイン（別バイナリ。stdio サーバー基盤・起動時のホスト自己申告と navigate・snapshot ツールを実装）
