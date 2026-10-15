@@ -40,7 +40,7 @@ workspace と crate 骨格（`crates/fandhe-browser-*`）の実装段階です�
 
 ## 実装方針（要点）
 
-- **二層アーキテクチャ**: 非レンダリング基盤層（HTML パース・DOM・要素操作）を既定とし、レンダリング層（`Servo` 組込）は feature gate 配下のオプトインとして隔離します
+- **二層アーキテクチャ**: 非レンダリング基盤層（HTML パース・DOM・要素操作）を既定とし、レンダリング層は `Servo` を別 workspace・別 `Cargo.lock` の子プロセス（Servo ホスト、`servo-host/`）に隔離し、設定でホストのパスを与えたときだけ起動するオプトインとします。本体バイナリに Servo は含まれません
 - **JS エンジン**: V8（`rusty_v8`）を既定とし、トレイト抽象化で `boa` へ切り替え可能にします
 - **AI 最適化 API**: アクセシビリティツリー・簡約 DOM を第一級 API として提供し、AI へ渡すトークン量を削減します
 - **自動化プロトコル**: CDP 互換レイヤー（既存 Playwright / Puppeteer 資産の流用）と独自 AI 最適化 API を併設します
@@ -59,10 +59,12 @@ workspace と crate 骨格（`crates/fandhe-browser-*`）の実装段階です�
 | `fandhe-browser-js` | JS エンジン抽象トレイト（V8／`rusty_v8` を既定とし `boa` へ切替可能） |
 | `fandhe-browser-ai` | AI 最適化 API（アクセシビリティツリー・簡約 DOM）・プラグイン API |
 | `fandhe-browser-cdp` | CDP（Chrome DevTools Protocol）互換サーバー。Playwright / Puppeteer 互換 |
-| `fandhe-browser-render` | Servo は別 workspace・別プロセスの Servo ホストに隔離（本体の依存グラフに MPL-2.0 を入れない。cli が無条件に依存し、ホストパスが設定されたときだけ有効化）（`RENDER-1`、TASK-33/34・MS-1） |
+| `fandhe-browser-render` | Servo ホストへの IPC クライアント（core の `Renderer` を実装する `HostRenderer`・子プロセス管理・プロトコルコーデック）。Servo 系には依存しない。cli が無条件に依存し、ホストパスが設定されたときだけ有効（`RENDER-1`、TASK-33/34/38・MS-1/MS-4） |
 | `fandhe-browser-profile` | プロファイル（ユーザーデータディレクトリ）分離 |
 | `fandhe-browser-cli`（予定） | CLI 本体 |
 | `fandhe-browser-mcp` | MCP 参照プラグイン（別バイナリ） |
+
+`servo-host/` は上の crate 一覧（本体 workspace）の外にある別 workspace で、バイナリ `fandhe-browser-servo-host` を作ります（ルート `Cargo.toml` の `exclude`）。
 
 ## クイックスタート
 
@@ -101,4 +103,4 @@ make ci
 
 ## ライセンス
 
-MIT OR Apache-2.0 のデュアルライセンスです（[LICENSE-MIT](./LICENSE-MIT) / [LICENSE-APACHE](./LICENSE-APACHE)）。レンダリング層で組み込む `Servo` は MPL-2.0 です。
+MIT OR Apache-2.0 のデュアルライセンスです（[LICENSE-MIT](./LICENSE-MIT) / [LICENSE-APACHE](./LICENSE-APACHE)）。`Servo`（MPL-2.0）は Servo ホスト（`servo-host/`）の配布物にだけ含まれ、本体バイナリと既定・軽量コンテナには含まれません。適用範囲と帰属表示は `NOTICE`・`LICENSE-THIRD-PARTY` を参照してください。

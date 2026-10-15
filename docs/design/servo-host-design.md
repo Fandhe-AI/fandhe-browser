@@ -3,8 +3,8 @@
 対応 `TASK-33` / `TASK-34` / `TASK-38` / `MS-4` / ビヘイビア `RENDER-1`〜`RENDER-4` / `OSS-2` / `OSS-3` / `PLUG-1` / `SEC-2`（[spec-reference](../../.claude/rules/spec-reference.md)）。
 
 - 関連 Issue: #935（本設計）・#915（構成・採用版・ライセンス判断。本書は `Refs` で参照し、閉じない）・#914（試作）・#230〜#237（TASK-38 の実装 Issue）
-- 状態: **設計（レビュー待ち）**
-- 範囲: 設計文書のみ。実装・依存追加・既存 Issue の本文書き換え・追加起票・ruleset 変更は行わない（設計レビュー後に別途行う）
+- 状態: **確定**（オーナー判断 2026-10-15・#228）。実装は TASK-38 の issue（#228 配下）で進行中
+- 範囲: 本書の作成時点では設計文書のみ。実装・依存追加・既存 Issue の本文書き換え・追加起票・ruleset 変更は行わない（設計レビュー後に別途行う）
 - 数値の出典: #914 の試作（[servo-out-of-process-prototype.md](./servo-out-of-process-prototype.md)）と #915 の記録。計測は Linux x86_64 のみで、macOS・Windows・実ページ・musl / scratch 配布・IPC 実装は**未検証**
 - spec の確認元: `docs/spec` の記録コミット f7cb79e（`RENDER-1`〜`RENDER-3`・`OSS-2`・`OSS-3` 注記、`TASK-33`・`TASK-34`・`TASK-38`）
 
@@ -16,13 +16,16 @@
 | 決定済み | 採用版は `servo =0.6.0` | #915 |
 | 決定済み | Servo ホスト側 `deny.toml` だけで `MPL-2.0`・`MPL-2.0 AND BSD-3-Clause` を許可し、`CDLA-Permissive-2.0` は `webpki-roots` 1 件に限る。本体の `deny.toml` は変えない | #915・[licensing](../../.claude/rules/licensing.md) |
 | 決定済み | FreeType は FTL を選び、`NOTICE` に帰属表示を載せる | #915 |
-| 推奨 | 配置は `servo-host/`、通信は stdio + 長さ接頭辞 JSON | 本書 §1・§2 |
-| 推奨・要確認 | feature `rendering` を廃止し、設定でホストパスを与えたときだけ起動する | 本書 §3 |
-| 推奨・要確認 | v1 は URL のみをホストへ送り、ホストが自分で取得する | 本書 §3 |
-| 推奨・要確認 | core の `Renderer` にページ指定メソッドを追加する | 本書 §3 |
-| 推奨・要確認 | CI は明示ジョブ 3 本を追加し、required check-run が 16 件から 19 件に増える | 本書 §6 |
+| 決定済み | 配置は `servo-host/`、通信は stdio + 長さ接頭辞 JSON | 本書 §1・§2（実装済み: #1005・#1021） |
+| 決定済み | feature `rendering` を廃止し、設定でホストパスを与えたときだけ起動する | オーナー判断 2026-10-15（#228。本書 §3） |
+| 決定済み | v1 は URL のみをホストへ送り、ホストが自分で取得する | オーナー判断 2026-10-15（#228。本書 §3） |
+| 決定済み | core の `Renderer` にページ指定メソッドを追加する | オーナー判断 2026-10-15（#228。本書 §3） |
+| 決定済み | CI は明示ジョブ 3 本を追加する（ジョブ 16 → 19、required 合計 20 → 23）。ruleset はジョブ追加 PR のマージ時に更新する | オーナー判断 2026-10-15（#228。本書 §6） |
+| 決定済み | ホストのビルド cache は ubuntu のみ | オーナー判断 2026-10-15（#228。本書 §6.3） |
+| 保留 | egress 方針（Servo 内部通信の制限）は GA 前に判断する | #1003（本書 §2.5） |
+| 保留 | 配布方式は spec の整理（`TASK-64`・`CTR-4`）後に起票する | 本書 §8.2・§10 |
 
-「要確認」はオーナー判断が要る項目で、§13 に集約する。
+オーナー判断の結果は §13 に記録する。
 
 ## 1. Servo ホスト workspace の配置
 
@@ -153,7 +156,7 @@ servo-host/
 - `docs/design/render-host-protocol.schema.json`
 - ゴールデン JSON fixture を `crates/fandhe-browser-render/tests/fixtures/protocol/` に置き、クライアント側・ホスト側の契約テストの双方が読む（puppeteer 契約テストの先例）
 
-### 3.2 feature `rendering` の扱い（要確認）
+### 3.2 feature `rendering` の扱い（決定 2026-10-15）
 
 | 案 | 利点 | 欠点 |
 | -- | ---- | ---- |
@@ -174,7 +177,7 @@ servo-host/
 - 代替: クライアントにナビゲーション世代の取得関数を注入する。`AppState` と `Renderer` が相互参照して循環するため採らない。
 - `RenderError` に `Timeout` / `HostUnavailable` / `ProtocolMismatch` 等の variant を追加する（`#[non_exhaustive]`）。内部詳細は引き続き `Display` / `Debug` に出さない。
 
-### 3.4 描画対象の取得（要確認）
+### 3.4 描画対象の取得（決定 2026-10-15）
 
 v1 はホストが自分で fetch する（URL のみ送る）。Cookie・セッションは本体と共有しない（PROF 境界）。本体が取得済みの HTML との乖離が起きうることを制約とする。
 
@@ -390,15 +393,17 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | #230〜#237 の書き換え案と依存順 | §8 |
 | spec 側の課題 | §10 |
 
-## 13. オーナー確認事項
+## 13. オーナー判断（2026-10-15）
 
-1. feature `rendering` の廃止と、設定によるホスト起動（§3.2）
-2. v1 は URL のみ送り、ホストが自分で取得する方式（§3.4）
-3. core `Renderer` へのページ指定メソッド追加（§3.3）
-4. ホストの cache 方針（ubuntu のみ cache。§6.3）
-5. required check-run の 16 件から 19 件への増加と ruleset 更新（§6.2）
-6. egress 方針（Servo 内部のリダイレクト・サブリソース・DNS リバインディング。§2.5）
-7. 配布方式（ホスト単体 release・コンテナ。§8.2・§10）
+出典は #228。各項目の結果を記す。
+
+1. feature `rendering` を廃止し、設定でホストパスを与えたときだけホストを起動する（§3.2）: 決定
+2. v1 は URL のみ送り、ホストが自分で取得する。Cookie は共有しない（§3.4）: 決定
+3. core `Renderer` に描画対象ページを指定するメソッドを追加する（§3.3）: 決定
+4. ホストのビルド cache は ubuntu のみ（§6.3）: 決定
+5. `ci.yml` のジョブは 16 → 19、required の合計は 20 → 23。ruleset はジョブ追加 PR のマージ時に更新する（§6.2）: 決定
+6. egress 方針（Servo 内部のリダイレクト・サブリソース・DNS リバインディング。§2.5）: GA 前に判断する（#1003）
+7. 配布方式（ホスト単体 release・コンテナ。§8.2・§10）: spec の整理（`TASK-64`・`CTR-4`）後に起票する
 
 ## 付録 A. 依存追加の承認提示雛形
 

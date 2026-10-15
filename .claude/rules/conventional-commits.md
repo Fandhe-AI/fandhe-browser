@@ -32,7 +32,7 @@ commit-msg フック（lefthook の正規表現検査）と `make lint-commits`�
 | js | `crates/fandhe-browser-js` |
 | ai | `crates/fandhe-browser-ai` |
 | cdp | `crates/fandhe-browser-cdp` |
-| render | `crates/fandhe-browser-render` |
+| render | `crates/fandhe-browser-render`・`servo-host/` |
 | profile | `crates/fandhe-browser-profile` |
 | cli | `crates/fandhe-browser-cli` |
 | mcp | `crates/fandhe-browser-mcp` |

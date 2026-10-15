@@ -2,6 +2,8 @@
 
 対応 `TASK-34` / `TASK-35` / `MS-1` / ビヘイビア `RENDER-1` / `RENDER-2` / `RENDER-3`（[spec-reference](../../.claude/rules/spec-reference.md)）。
 
+- 状態: feature `rendering` は廃止済み（オーナー判断 2026-10-15・#236）。現行の構成（別 workspace・別プロセスの Servo ホスト）と分離検証は [servo-host-design.md](./servo-host-design.md)（§3.2・§4.2）を正とする。本書は TASK-34 の確認記録と PoC-6 の数値の記録として残す
+
 ## 目的
 
 feature `rendering`（`Servo` 組込）を有効化した場合のバイナリサイズ増分・ビルド時間を数値化し、

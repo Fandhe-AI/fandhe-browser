@@ -20,7 +20,7 @@ fandhe-browser/
 ├── AGENTS.md                      # ビルド・テスト・回帰確認コマンド / AI PR レビュー観点集（REPAIR-7）
 ├── README.md                      # 概要・実装方針（要点）・開発環境構築
 ├── LICENSE-MIT / LICENSE-APACHE   # デュアルライセンス
-├── NOTICE                         #（予定）サードパーティ帰属表示・MPL 適用範囲
+├── NOTICE                         # サードパーティ帰属表示・MPL 適用範囲（Servo ホストの配布物）。全文は LICENSE-THIRD-PARTY
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
 ├── .editorconfig                  # インデント・改行・文字コード規約
 ├── skills-lock.json               # 導入スキルのロックファイル
@@ -31,22 +31,27 @@ fandhe-browser/
 ├── docker/                        # 配布用 Dockerfile（Dockerfile.release: 既定コンテナ（V8）・軽量コンテナ（`--target lite`・boa のみ）・musl 静的・scratch。x86_64 必須・aarch64 任意〔`--platform linux/arm64`〕。TASK-64.1・64.2・64.3・CTR-1・CTR-4）
 ├── .markdownlint.jsonc / .yamllint / .editorconfig-checker.json  # lint-docs 設定
 ├── Cargo.toml                     #（予定）workspace 定義
-├── deny.toml                      # cargo-deny 設定（ライセンス・advisories 検査。MPL-2.0 は未許可）
+├── deny.toml                      # cargo-deny 設定（ライセンス・advisories 検査。本体用で MPL-2.0 は未許可。Servo ホスト側は servo-host/deny.toml）
 ├── crates/                        # 各 crate（mcp は stdio サーバー基盤のみ）
 │   ├── fandhe-browser-core/       #   fetch・HTML パース・DOM・query・CSSOM・config・可観測性
 │   ├── fandhe-browser-js/         #   JS エンジン抽象（V8 既定 / boa）
 │   ├── fandhe-browser-ai/         #   AI 最適化 API（アクセシビリティツリー・簡約 DOM）・プラグイン API
 │   ├── fandhe-browser-cdp/        #   CDP 互換サーバー
-│   ├── fandhe-browser-render/     #   レンダリング層（Servo ホストへの IPC クライアント。Servo 自体は別 workspace の Servo ホストに置く方針で、本 crate の役割は設計で決める。licensing.md）
+│   ├── fandhe-browser-render/     #   レンダリング層（Servo ホストへの IPC クライアント: `HostRenderer`・子プロセス管理・プロトコル。Servo 自体は `servo-host/`。licensing.md）
 │   ├── fandhe-browser-profile/    #   プロファイル分離
 │   ├── fandhe-browser-cli/        #   CLI（最小雛形: core・profile・cdp・ai を組み立ててサーバー起動。サブコマンドは TASK-47）
 │   └── fandhe-browser-mcp/        #   MCP 参照プラグイン（別バイナリ。stdio サーバー基盤・起動時のホスト自己申告と navigate・snapshot ツールを実装）
+├── servo-host/                    # Servo ホスト（別 workspace・別 Cargo.lock・本体 members の外でルート exclude。バイナリ fandhe-browser-servo-host。TASK-38・RENDER-1）
+│   ├── Cargo.toml / Cargo.lock    #   自前の [workspace]（単一 package）。本体と独立
+│   ├── deny.toml                  #   MPL-2.0 等の例外許可はここだけ
+│   ├── src/                       #   main・server・engine・page・screenshot・layout
+│   └── tests/                     #   結合テスト
 ├── tests/ / benches/              #（予定）結合テスト・ベンチ
-├── scripts/                       # Makefile の実体（lib.sh・versions.sh・cargo-gate.sh・harness.sh・lint-docs.sh・setup.sh・deny.sh・help.sh 等）と依存グラフ検査等のスクリプト。check-render-isolation.sh（TASK-34.1・RENDER-1）・check-js-engine-isolation.sh（TASK-32.4・JS-1）・check-static-link.sh（TASK-93.3・PLUG-1・musl 配布バイナリの動的リンクなし検査）・ci-changes.sh（CI の docs-only 判定）・ci-prune-target.sh（CI cache 保存前の prune）
+├── scripts/                       # Makefile の実体（lib.sh・versions.sh・cargo-gate.sh・harness.sh・lint-docs.sh・setup.sh・deny.sh・help.sh 等）と依存グラフ検査等のスクリプト。check-render-isolation.sh（TASK-34.1・RENDER-1）・check-servo-host-isolation.sh（TASK-38・RENDER-1・servo-host が本体 members に無いこととルート Cargo.lock に Servo 系が無いことの検査）・check-js-engine-isolation.sh（TASK-32.4・JS-1）・check-static-link.sh（TASK-93.3・PLUG-1・musl 配布バイナリの動的リンクなし検査）・ci-changes.sh（CI の docs-only 判定）・ci-prune-target.sh（CI cache 保存前の prune）
 ├── profiles/                      # CSSOM gating 用ブラウザ挙動プロファイルデータ（chrome.json・safari.json・README.md。TASK-100.1・PLUG-8）
 ├── harness/                       # 互換性テストハーネス。compat-regression/（TASK-9.2・対象サイト群の動作率回帰チェック）・playwright-trace/（TASK-43.1・Playwright newPage() 到達までの CDP トレース収集）・compat-practical/（TASK-71.1・22 タスク定義・アクセス確認・実行対象バイナリ解決・TASK-71.2・22 タスク実行 run_core.sh・TASK-71.3・Chromium 実測との突合 make_matrix.sh）・puppeteer-connect/（TASK-45.1・Puppeteer 接続試験の実行基盤・TASK-45.2・段階別到達結果の回収）・binary-size/（TASK-34.2・既定 feature リリースバイナリのサイズ検査・TASK-31.1・JS エンジン構成別サイズ計測）・container-size/（TASK-65.1・コンテナイメージサイズ計測）実装済み
 ├── docs/
-│   ├── design/                    # 設計ドキュメント（public。render-feature-gate.md 等）
+│   ├── design/                    # 設計ドキュメント（public。servo-host-design.md・render-host-protocol.schema.json 等）
 │   ├── setup/                     # 環境別セットアップ手順書（windows.md）
 │   └── spec/                      # fandhe-browser-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・update-external・ci（push/pull_request で稼働・PR は ubuntu＋`cross-target-check`、main push で 3 OS・docs-only 判定は `scripts/ci-changes.sh`）/ release（発火条件は workflow_dispatch 限定のまま）
@@ -71,9 +76,9 @@ main セッションはオーケストレーションに徹し、調査・実装
 | `crates/fandhe-browser-js/` | explorer | js-engine-builder |
 | `crates/fandhe-browser-ai/`・`crates/fandhe-browser-mcp/` | explorer | ai-api-builder |
 | `crates/fandhe-browser-cdp/` | explorer | cdp-builder |
-| `crates/fandhe-browser-render/` | explorer | render-builder |
+| `crates/fandhe-browser-render/`・`servo-host/`（`deny.toml` を除く） | explorer | render-builder |
 | `crates/fandhe-browser-profile/`・OS 差異吸収 | explorer | profile-platform-builder |
-| `crates/fandhe-browser-cli/`・`Cargo.toml`・CI・`deny.toml`・`NOTICE`・`Dockerfile`・`benches/`・`harness/` | explorer | infra-builder |
+| `crates/fandhe-browser-cli/`・`Cargo.toml`・CI・`deny.toml`（`servo-host/deny.toml` を含む）・`NOTICE`・`Dockerfile`・`benches/`・`harness/` | explorer | infra-builder |
 | `docs/spec/`（private） | explorer | 変更しない（spec リポ側で管理） |
 | 外部仕様（WHATWG・CDP・V8・boa・Servo・MCP） | reference-researcher | — |
 | テスト・lint | test-runner / linter | — |
@@ -97,7 +102,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 | implement | js-engine-builder | sonnet | js crate（エンジン抽象・V8 FFI・boa） |
 | implement | ai-api-builder | sonnet | ai crate（AI 最適化 API・プラグイン API）・mcp crate |
 | implement | cdp-builder | sonnet | cdp crate（CDP 互換サーバー・Playwright/Puppeteer 互換） |
-| implement | render-builder | sonnet | render crate（Servo・feature gate・MPL 隔離） |
+| implement | render-builder | sonnet | render crate（Servo ホストへの IPC クライアント）・`servo-host/`（Servo 組込・MPL 隔離） |
 | implement | profile-platform-builder | sonnet | profile crate・OS 差異吸収 |
 | implement | infra-builder | sonnet | cli crate・workspace・3 OS CI・deny/NOTICE・Dockerfile・benches・harness |
 | testing | test-runner | sonnet | cargo test / clippy 実行と失敗解析 |
