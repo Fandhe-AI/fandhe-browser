@@ -3,8 +3,9 @@
 //! 役割: `engine` が作った Servo 上で WebView を 1 枚生成し、読み込み完了と最初の描画フレームを
 //! 期限付きで待つ層（`RENDER-3`・`RENDER-4`・TASK-38.2・#231。設計 §2.2・§2.4・§2.5）。
 //! 呼び出し元は `server` のディスパッチ（[`ServoHandler`] 経由）と `main` の `--selftest`
-//! （低レベルの [`navigate`]）。スクリーンショット・可視性・境界ボックスは #232〜#234 が
-//! この層が保持する現在ページの上に載る。
+//! （低レベルの [`navigate`]）。スクリーンショット（TASK-38.3・#232）はこの層が保持する現在ページの
+//! 上で `WebView::take_screenshot` を期限付きで待ち、PNG 化は `screenshot` モジュールに任せる。
+//! 可視性・境界ボックスは #233・#234 が同じ上に載る。
 //!
 //! 待機の方針（PoC-13 の失敗の再発防止）: 条件は「`LoadStatus::Complete` かつ受信フレーム数が 1 以上」。
 //! Complete より前に届いたフレームも数え、「Complete より後の新しいフレーム」は要求しない
@@ -21,9 +22,13 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use servo::{LoadStatus, ServoUrl, WebView, WebViewBuilder, WebViewDelegate};
+use servo::{
+    LoadStatus, RgbaImage, ScreenshotCaptureError, ServoUrl, WebView, WebViewBuilder,
+    WebViewDelegate,
+};
 
 use crate::engine::Engine;
+use crate::screenshot::{self, SCREENSHOT_TIMEOUT};
 use crate::server::{
     BoundingBoxResult, ErrorKind, Handler, HandlerError, LoadParams, LoadResult, Method,
     ScreenshotParams, ScreenshotResult, SelectorParams, VisibilityResult, is_valid_url,
@@ -51,6 +56,8 @@ pub(crate) enum PageError {
     Crashed,
     /// Servo の生成に失敗した（再生成は不可。設計 §2.7）。
     Engine,
+    /// 描画結果の取得に失敗した（コンテキストからの読み出し失敗）。
+    Capture,
 }
 
 impl PageError {
@@ -59,8 +66,32 @@ impl PageError {
             Self::InvalidUrl => ErrorKind::InvalidParams,
             Self::Timeout => ErrorKind::Timeout,
             Self::LoadFailed | Self::Crashed => ErrorKind::LoadFailed,
-            Self::Engine => ErrorKind::Internal,
+            Self::Engine | Self::Capture => ErrorKind::Internal,
         }
+    }
+}
+
+/// `poll` が値を返すまでイベントループを回して待つ。`deadline` 超過は `Timeout`、
+/// `crashed` が真なら `Crashed`（フレーム・コールバックが来ない場合も待ち続けない。`RENDER-4`）。
+///
+/// `navigate` と `CurrentPage::capture` が共有する。Servo に依存しない形にして単体テストできる。
+fn wait_until<T>(
+    deadline: Instant,
+    mut poll: impl FnMut() -> Option<T>,
+    crashed: impl Fn() -> bool,
+    mut spin: impl FnMut(),
+) -> Result<T, PageError> {
+    loop {
+        if let Some(v) = poll() {
+            return Ok(v);
+        }
+        if crashed() {
+            return Err(PageError::Crashed);
+        }
+        if Instant::now() >= deadline {
+            return Err(PageError::Timeout);
+        }
+        spin();
     }
 }
 
@@ -99,6 +130,32 @@ pub(crate) struct CurrentPage {
     delegate: Rc<PageDelegate>,
 }
 
+impl CurrentPage {
+    /// 現在のビューポート全体を `deadline` まで待って取得する（`take_screenshot`。TASK-38.3）。
+    ///
+    /// コールバックが来ない場合も `deadline` で `Timeout` を返す。
+    fn capture(&self, engine: &Engine, deadline: Instant) -> Result<RgbaImage, PageError> {
+        let slot: Rc<Cell<Option<Result<RgbaImage, ScreenshotCaptureError>>>> =
+            Rc::new(Cell::new(None));
+        let writer = slot.clone();
+        self.webview
+            .take_screenshot(None, move |r| writer.set(Some(r)));
+        let result = wait_until(
+            deadline,
+            || slot.take(),
+            || self.delegate.crashed.get(),
+            || {
+                engine.servo().spin_event_loop();
+                std::thread::sleep(POLL_INTERVAL);
+            },
+        )?;
+        result.map_err(|e| match e {
+            ScreenshotCaptureError::WebViewDoesNotExist => PageError::Crashed,
+            _ => PageError::Capture,
+        })
+    }
+}
+
 /// WebView を生成し、`Complete` と最初のフレームを `deadline` まで待つ。
 ///
 /// URL の scheme 検証はしない（`--selftest` の `data:` を通すため）。外部入力の経路
@@ -118,26 +175,21 @@ pub(crate) fn navigate(
         engine.servo().spin_event_loop();
         std::thread::sleep(POLL_INTERVAL);
     };
-    while webview.load_status() != LoadStatus::Complete {
-        if delegate.crashed.get() {
-            return Err(PageError::Crashed);
-        }
-        if Instant::now() >= deadline {
-            return Err(PageError::Timeout);
-        }
-        spin();
-    }
+    let crashed = || delegate.crashed.get();
+    wait_until(
+        deadline,
+        || (webview.load_status() == LoadStatus::Complete).then_some(()),
+        crashed,
+        spin,
+    )?;
     // Complete より前に届いたフレームも数える。上限は全体の期限と専用上限の小さい方。
     let frame_deadline = deadline.min(Instant::now() + POST_LOAD_FRAME_WAIT_MAX);
-    while delegate.frames.get() == 0 {
-        if delegate.crashed.get() {
-            return Err(PageError::Crashed);
-        }
-        if Instant::now() >= frame_deadline {
-            return Err(PageError::Timeout);
-        }
-        spin();
-    }
+    wait_until(
+        frame_deadline,
+        || (delegate.frames.get() > 0).then_some(()),
+        crashed,
+        spin,
+    )?;
     // コンテキストに最新フレームが描かれた状態を保証する。
     webview.paint();
     Ok(CurrentPage { webview, delegate })
@@ -234,7 +286,7 @@ impl ServoHandler {
 
 impl Handler for ServoHandler {
     fn capabilities(&self) -> &'static [Method] {
-        &[Method::Load]
+        &[Method::Load, Method::Screenshot]
     }
 
     fn load(&mut self, p: &LoadParams) -> Result<LoadResult, HandlerError> {
@@ -245,10 +297,32 @@ impl Handler for ServoHandler {
         })
     }
 
-    // 以下は #232〜#234 で置き換える。成功を装わない（REPAIR-3）。
-    fn screenshot(&mut self, _p: &ScreenshotParams) -> Result<ScreenshotResult, HandlerError> {
-        Err(HandlerError(ErrorKind::Unsupported))
+    /// 現在ページのビューポート（固定 1280x800）を PNG の base64 で返す（`RENDER-3`・TASK-38.3）。
+    ///
+    /// 将来仕様: `full_page=true` は文書の高さに合わせた撮影が要り、固定ビューポート（設計 §2.3・
+    /// `SEC-2`）と衝突するため v1 では `unsupported` を返す（成功を装わない。`REPAIR-3`）。
+    fn screenshot(&mut self, p: &ScreenshotParams) -> Result<ScreenshotResult, HandlerError> {
+        if p.full_page {
+            return Err(HandlerError(ErrorKind::Unsupported));
+        }
+        let (Some(page), Some(engine)) = (self.page.as_ref(), self.engine.as_ref()) else {
+            return Err(HandlerError(ErrorKind::NotLoaded));
+        };
+        let deadline = Instant::now() + SCREENSHOT_TIMEOUT;
+        let image = match page.capture(engine, deadline) {
+            Ok(img) => img,
+            Err(e) => {
+                // クラッシュしたページは保持しない（以後は not_loaded になる）。
+                if e == PageError::Crashed {
+                    self.page = None;
+                }
+                return Err(HandlerError(e.kind()));
+            }
+        };
+        screenshot::build_result(image.width(), image.height(), image.as_raw())
+            .map_err(|e| HandlerError(e.kind()))
     }
+    // 以下は #233・#234 で置き換える。成功を装わない（REPAIR-3）。
     fn visibility(&mut self, _p: &SelectorParams) -> Result<VisibilityResult, HandlerError> {
         Err(HandlerError(ErrorKind::Unsupported))
     }
@@ -269,6 +343,55 @@ mod tests {
         assert_eq!(PageError::LoadFailed.kind(), ErrorKind::LoadFailed);
         assert_eq!(PageError::Crashed.kind(), ErrorKind::LoadFailed);
         assert_eq!(PageError::Engine.kind(), ErrorKind::Internal);
+        assert_eq!(PageError::Capture.kind(), ErrorKind::Internal);
+    }
+
+    /// RENDER-4: 来ないフレーム・コールバックを待ち続けず、期限で Timeout を返す。
+    #[test]
+    fn wait_until_times_out_when_nothing_arrives() {
+        let started = Instant::now();
+        let r: Result<(), PageError> = wait_until(
+            started + Duration::from_millis(50),
+            || None,
+            || false,
+            || std::thread::sleep(Duration::from_millis(1)),
+        );
+        assert_eq!(r, Err(PageError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn wait_until_reports_crash_and_value() {
+        let far = Instant::now() + Duration::from_secs(60);
+        let crashed: Result<(), PageError> = wait_until(far, || None, || true, || {});
+        assert_eq!(crashed, Err(PageError::Crashed));
+        let mut n = 0;
+        let value = wait_until(
+            far,
+            || {
+                n += 1;
+                (n == 3).then_some(n)
+            },
+            || false,
+            || {},
+        );
+        assert_eq!(value, Ok(3));
+    }
+
+    /// RENDER-3: 未ロードは not_loaded、full_page は unsupported（Engine を作らない）。
+    #[test]
+    fn screenshot_without_page_is_rejected() {
+        let mut h = ServoHandler::new();
+        let err = h
+            .screenshot(&ScreenshotParams { full_page: false })
+            .err()
+            .expect("must fail");
+        assert_eq!(err.0, ErrorKind::NotLoaded);
+        let err = h
+            .screenshot(&ScreenshotParams { full_page: true })
+            .err()
+            .expect("must fail");
+        assert_eq!(err.0, ErrorKind::Unsupported);
     }
 
     #[test]
@@ -280,7 +403,10 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_list_only_load() {
-        assert_eq!(ServoHandler::new().capabilities(), &[Method::Load]);
+    fn capabilities_list_load_and_screenshot() {
+        assert_eq!(
+            ServoHandler::new().capabilities(),
+            &[Method::Load, Method::Screenshot]
+        );
     }
 }

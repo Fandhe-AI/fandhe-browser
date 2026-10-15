@@ -2,9 +2,9 @@
 //! （`RENDER-3`・`RENDER-4`・`PLUG-1`・`SEC-2`・#993・#231）。
 //!
 //! フレーム（u32 LE 長さ接頭辞 + UTF-8 JSON）を対話的に読み書きし、hello・`load`（ループバック
-//! HTTP サーバー相手。外部ネットワークへ出ない）・未実装メソッドの `unsupported`・`shutdown`・
-//! プロトコル違反時の終了コード・stdout の純粋性・ログの秘匿を確かめる。
-//! このテストバイナリ自体は Servo をリンクしない。
+//! HTTP サーバー相手。外部ネットワークへ出ない）・`screenshot`（PNG の復号と上下の色。#232）・
+//! 未実装メソッドの `unsupported`・`shutdown`・プロトコル違反時の終了コード・stdout の純粋性・
+//! ログの秘匿を確かめる。このテストバイナリ自体は Servo をリンクしない（`image` は PNG の復号のみ）。
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -107,7 +107,7 @@ fn hello_then_unsupported_then_shutdown() {
     assert_eq!(hello["event"], "hello");
     assert_eq!(
         hello["data"]["capabilities"],
-        serde_json::json!(["load", "shutdown"])
+        serde_json::json!(["load", "screenshot", "shutdown"])
     );
 
     h.send(r#"{"v":1,"id":1,"method":"evaluate","params":{"script":"1"}}"#);
@@ -128,11 +128,11 @@ fn hello_then_unsupported_then_shutdown() {
         h.recv(),
         r#"{"v":1,"id":3,"error":{"kind":"invalid_params","message":"Invalid parameters."}}"#
     );
-    // 未実装メソッドは成功を装わない（REPAIR-3）。
+    // 未ロードの screenshot は成功を装わない（REPAIR-3）。
     h.send(r#"{"v":1,"id":4,"method":"screenshot"}"#);
     assert_eq!(
         h.recv(),
-        r#"{"v":1,"id":4,"error":{"kind":"unsupported","message":"Method is not supported."}}"#
+        r#"{"v":1,"id":4,"error":{"kind":"not_loaded","message":"No page is loaded."}}"#
     );
     h.send(r#"{"v":1,"id":5,"method":"shutdown"}"#);
     assert_eq!(h.recv(), r#"{"v":1,"id":5,"result":{}}"#);
@@ -161,7 +161,7 @@ fn serve_http(hang: bool) -> (u16, std::thread::JoinHandle<()>, mpsc::Sender<()>
                     }
                     let mut buf = [0u8; 4096];
                     let _ = conn.read(&mut buf);
-                    let body = "<html><head><title>fixture</title></head><body><h1>hello</h1></body></html>";
+                    let body = "<html><head><title>fixture</title></head><body style=\"margin:0\"><div style=\"height:400px;background:#f00\"></div><div style=\"height:400px;background:#00f\"></div></body></html>";
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -251,6 +251,91 @@ fn load_succeeds_fails_and_recovers_in_one_process() {
     let _ = hang_stop.send(());
     let _ = srv.join();
     let _ = hang_srv.join();
+}
+
+/// 標準アルファベットの base64 を復号する（テスト用。パディングは無視）。
+fn decode_b64(s: &str) -> Vec<u8> {
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes().filter(|c| *c != b'=') {
+        let v = alphabet.iter().position(|a| *a == c).expect("alphabet") as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    out
+}
+
+/// RENDER-3・RENDER-4: load 後の screenshot は 1280x800 の有効な PNG で、上半分が赤・下半分が青。
+/// full_page は unsupported、load 失敗後は not_loaded（前ページの描画を返さない）。
+#[test]
+fn screenshot_returns_decodable_png_after_load() {
+    let (port, srv, stop) = serve_http(false);
+    let closed_port = {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").port()
+    };
+    let mut h = spawn(&["--stdio"]);
+    let _hello = h.recv();
+
+    h.send(&load_req(
+        1,
+        &format!("http://127.0.0.1:{port}/shot"),
+        20_000,
+    ));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert!(r["result"].is_object(), "{r}");
+
+    h.send(r#"{"v":1,"id":2,"method":"screenshot"}"#);
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert_eq!(r["result"]["format"], "png", "{}", r["error"]);
+    assert_eq!(r["result"]["width"], 1280);
+    assert_eq!(r["result"]["height"], 800);
+    let png = decode_b64(r["result"]["data_base64"].as_str().expect("data_base64"));
+    let img = image::load_from_memory(&png)
+        .expect("decode png")
+        .to_rgba8();
+    assert_eq!((img.width(), img.height()), (1280, 800));
+    let top = img.get_pixel(640, 100).0;
+    let bottom = img.get_pixel(640, 700).0;
+    assert!(top[0] > 200 && top[1] < 60 && top[2] < 60, "top {top:?}");
+    assert!(
+        bottom[2] > 200 && bottom[0] < 60 && bottom[1] < 60,
+        "bottom {bottom:?}"
+    );
+
+    h.send(r#"{"v":1,"id":3,"method":"screenshot","params":{"full_page":true}}"#);
+    assert_eq!(
+        h.recv(),
+        r#"{"v":1,"id":3,"error":{"kind":"unsupported","message":"Method is not supported."}}"#
+    );
+
+    h.send(&load_req(
+        4,
+        &format!("http://127.0.0.1:{closed_port}/"),
+        20_000,
+    ));
+    let _ = h.recv();
+    h.send(r#"{"v":1,"id":5,"method":"screenshot"}"#);
+    assert_eq!(
+        h.recv(),
+        r#"{"v":1,"id":5,"error":{"kind":"not_loaded","message":"No page is loaded."}}"#
+    );
+
+    h.send(r#"{"v":1,"id":6,"method":"shutdown"}"#);
+    assert_eq!(h.recv(), r#"{"v":1,"id":6,"result":{}}"#);
+    let (code, rest, stderr) = h.finish();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(rest, 0, "stdout must contain frames only");
+    assert!(!stderr.contains("127.0.0.1"), "{stderr}");
+
+    let _ = stop.send(());
+    let _ = srv.join();
 }
 
 #[test]

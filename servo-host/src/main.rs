@@ -8,20 +8,22 @@
 //! - `--selftest`: Servo の初期化・小さな `data:` ページの読み込み完了・終了までを行い、
 //!   成功時のみ終了コード 0 を返す（RENDER-3・#988。設計 §1.4・§2.6・§2.7）。
 //!   ネットワークへは出ない。呼び出し元は開発者と CI のみ。
-//! - `--stdio`: 本体 render crate から起動される stdio サーバー（#993。`server`）。`load` は
-//!   `page::ServoHandler` で実装済み（#231）。screenshot・visibility・bounding_box は未実装で
-//!   `unsupported` を返す（成功を装わない。REPAIR-3）。
+//! - `--stdio`: 本体 render crate から起動される stdio サーバー（#993。`server`）。`load`（#231）と
+//!   `screenshot`（PNG の base64 inline。#232）は `page::ServoHandler` で実装済み。visibility・
+//!   bounding_box は未実装で `unsupported` を返す（成功を装わない。REPAIR-3）。
 //! - それ以外: 標準エラーに示し、非ゼロで終了する（固定の許可リスト。SEC-2）。
 //!
 //! Servo と描画コンテキストの生成・破棄は `engine` が担う（RENDER-3・#230）。
 //!
 //! WebView の生成・読み込み・フレーム待機は `page` が担う（RENDER-3・RENDER-4・#231）。
 //!
-//! 将来仕様: スクリーンショット（#232）、可視性・境界ボックス（RENDER-4。#233・#234）を
-//! `page::ServoHandler` に実装する。
+//! PNG エンコードと base64 化は Servo 非依存の `screenshot` が担う（RENDER-3・#232）。
+//!
+//! 将来仕様: 可視性・境界ボックス（RENDER-4。#233・#234）を `page::ServoHandler` に実装する。
 
 mod engine;
 mod page;
+mod screenshot;
 mod server;
 
 use std::process::ExitCode;

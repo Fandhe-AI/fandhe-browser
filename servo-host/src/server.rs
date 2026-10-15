@@ -33,6 +33,8 @@ pub(crate) const MAX_RESPONSE_FRAME_BYTES: usize = 1_048_576;
 pub(crate) const MAX_HELLO_FRAME_BYTES: usize = 16_384;
 /// `screenshot` 応答フレームの上限。
 pub(crate) const MAX_SCREENSHOT_FRAME_BYTES: usize = 25_165_824;
+/// `screenshot` の待機上限（ミリ秒。20 秒。`RENDER-4`）。hello の `limits` と共有する。
+pub(crate) const SCREENSHOT_TIMEOUT_MS: u64 = 20_000;
 pub(crate) const MAX_URL_BYTES: usize = 2048;
 pub(crate) const MAX_SELECTOR_BYTES: usize = 1024;
 pub(crate) const MAX_ERROR_MESSAGE_BYTES: usize = 512;
@@ -87,9 +89,8 @@ pub(crate) enum ErrorKind {
     InvalidRequest,
     InvalidParams,
     Unsupported,
-    // `NotLoaded`・`NotFound` は Handler 実装（#232〜#234）が返すまで本体コードから構築されない。
-    #[allow(dead_code)]
     NotLoaded,
+    // `NotFound` は Handler 実装（#233・#234）が返すまで本体コードから構築されない。
     #[allow(dead_code)]
     NotFound,
     Timeout,
@@ -138,7 +139,7 @@ pub(crate) struct LoadResult {
     pub status: Option<u16>,
 }
 
-/// `screenshot` の結果（`format` は常に `png` でサーバーが付ける。PNG と base64 の生成は #232）。
+/// `screenshot` の結果（`format` は常に `png` でサーバーが付ける。PNG と base64 の生成は `screenshot` モジュール。#232）。
 pub(crate) struct ScreenshotResult {
     pub width: u32,
     pub height: u32,
@@ -295,7 +296,7 @@ fn hello_message(caps: &[Method]) -> Value {
                 "handshake_timeout_ms": 10_000,
                 "load_timeout_default_ms": LOAD_TIMEOUT_DEFAULT_MS,
                 "load_timeout_max_ms": LOAD_TIMEOUT_MAX_MS,
-                "screenshot_timeout_ms": 20_000,
+                "screenshot_timeout_ms": SCREENSHOT_TIMEOUT_MS,
                 "query_timeout_ms": 5_000,
                 "shutdown_grace_ms": 3_000
             }
