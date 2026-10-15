@@ -214,6 +214,26 @@ v1 はホストが自分で fetch する（URL のみ送る）。Cookie・セッ
 - FreeType は `bundled_freetype` でも `libfreetype` へ動的リンクされる（試作の `ldd` で 13 ライブラリ）。同梱版と system 版のどちらが使われるかは**未検証**で、配布形態で `NOTICE` の内容が変わるため §7 の配布検証と対にする。
 - ライセンス判断が要る事項は Agent が決めず、オーナーへ報告する。
 
+### 5.1 `servo-default-resources` 埋め込みリソースの手動確認（TASK-38・Issue #996）
+
+`servo-default-resources` 0.6.0（crate の SPDX は MPL-2.0、上流タグ `v0.6.0` の `components/default-resources`）が `include_bytes!` で埋め込む 11 ファイルを確認した。ファイル個別のライセンスヘッダは `gatt_blocklist.txt` のみにあり、他は crate の SPDX（MPL-2.0）に従う。上流に個別の出所表記が無いものは推測で埋めず「未確認」とする。
+
+| ファイル | 出所 | ライセンス | 確認状態 |
+| -------- | ---- | ---------- | -------- |
+| `about-memory.html` | Servo | MPL-2.0（crate の SPDX） | ヘッダ無し。crate の SPDX に従う |
+| `badcert.html` | Servo | MPL-2.0（同上） | 同上 |
+| `crash.html` | Servo | MPL-2.0（同上） | 同上 |
+| `debugger.js` | Servo（SpiderMonkey Debugger API 向け。Mozilla のドキュメントへのリンクコメントのみで、コード引用は確認していない） | MPL-2.0（同上） | 同上 |
+| `directory-listing.html` | Servo | MPL-2.0（同上） | 同上 |
+| `json-viewer.html` | Servo | MPL-2.0（同上） | 同上 |
+| `neterror.html` | Servo | MPL-2.0（同上） | 同上 |
+| `rippy.png` | Servo（20x20 の小アイコン） | MPL-2.0（同上） | 出所の一次資料は未確認 |
+| `gatt_blocklist.txt` | WebBluetoothCG/registries の `gatt_blocklist.txt`（ファイル先頭に Source・License の記載） | Apache-2.0（上流 `LICENSE` を取得して確認） | 確認済み。Apache-2.0 の著作権表示・許諾文の扱いは未判断（オーナー確認事項） |
+| `public_domains.txt` | Public Suffix List 由来と推定（8818 行） | 未確認（PSL 自体は MPL-2.0 と記憶しているが一次資料で未確認） | 未確認 |
+| `hsts_preload.fstmap` | HSTS preload list から生成されたバイナリと推定 | 未確認 | 未確認（バイナリで先頭ヘッダ無し） |
+
+未確認の 3 件（`rippy.png`・`public_domains.txt`・`hsts_preload.fstmap`）の出所・ライセンスは Servo の履歴を一次資料として後続で確認する。
+
 ## 6. CI への影響
 
 ### 6.1 変更検出
