@@ -33,7 +33,8 @@ Rust checks (skipped while Cargo.toml or member crates are absent)
   check-render-isolation     scripts/cargo-gate.sh check-render-isolation  Servo isolation check
   check-js-engine-isolation  scripts/cargo-gate.sh check-js-engine-isolation  JS engine isolation check
   check-publish-private      scripts/cargo-gate.sh check-publish-private   every member crate has publish = false
-  deny                       scripts/deny.sh                               cargo deny check
+  deny                       scripts/deny.sh                               cargo deny check (main + servo-host)
+  deny-servo-host            scripts/deny.sh servo-host                    cargo deny check (servo-host only)
   check-deny-license-reject  scripts/check-deny-license-reject.sh         canary check that disallowed licenses are rejected
   ci                         (runs the gates above plus harness self-tests) full local gate
 
