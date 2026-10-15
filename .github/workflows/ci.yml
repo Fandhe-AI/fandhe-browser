@@ -14,6 +14,7 @@ name: CI
 #   harness-{ubuntu,macos,windows}        rust または harness 時。分離検証・ハーネス・サイズ検査
 #   windows-servo-prereqs        rust 時。Servo の Windows ビルド前提の検証
 #   servo-host-ubuntu            servo 時（PR でも実行）。Servo ホストの fmt・clippy・test・分離検証・release（main/dispatch のみ）
+#   servo-host-{macos,windows}   servo 時（main・dispatch のみ。PR は skipped）。ホストの --locked ビルド・--selftest・test（cache なし）
 #   cross-target-check           rust 時。Linux 上で macOS・Windows 向けに型検査（PR でも実行）
 #
 # 3 OS の実行時機（オーナー判断 2026-10-10。.claude/rules/ci.md「3 OS CI」）:
@@ -49,6 +50,7 @@ name: CI
 #   ことによる bump（依存のビルドスクリプト・proc-macro が debuginfo なし → 行番号付きに変わり、
 #   それらに依存する crate の `-C metadata` も連鎖して変わるため、旧版の blob では依存を毎回
 #   再ビルドする）。registry のみの cross は target を含まないため上げない
+# - servo-host-macos・servo-host-windows は cache なし（servohost の cache は ubuntu のみ。設計 §6.3）
 # - Windows も同じ形で cache する。以前は prune が「想定外の crate / target 名」で fail したため
 #   除外していた（Windows の jq の CRLF 出力が原因と推定。対処は scripts/ci-prune-target.sh の
 #   ヘッダー参照）。Windows の key は runner.os が `Windows` になるため Linux・macOS と衝突しない
@@ -1228,6 +1230,284 @@ jobs:
             echo "| ubuntu | fandhe-browser-servo-host | ${size} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # --------------------------------------------------
+  # servo-host-macos / servo-host-windows（Servo ホストの macOS・Windows ネイティブ検証。#999・TASK-38・RENDER-1）
+  # --------------------------------------------------
+  # macOS・Windows で Servo ホスト（servo-host/。別 workspace）の --locked ビルド・--selftest・test を回す。
+  # 実行は push（main）・workflow_dispatch のみ（PR は skipped。ci.md「3 OS CI」）。cache なし
+  # （servohost の cache は ubuntu のみ。1 世代の合計を 10GB 以内に保つ設計 §6.3 の v1 方針）。
+  # 意図的に含めないもの（OS 非依存または別の関心事）: fmt・分離検証 C〜E（servo-host-ubuntu で実行済み）、
+  # clippy（check 成果物が build と共有されず依存を再コンパイルするため）、release ビルド・real_host 結合テスト。
+  # 特定 OS だけ skip したり continue-on-error で通したりしない。失敗は原因を報告しオーナーが判断する（#1000）。
+  servo-host-macos:
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.servo == 'true' }}
+    runs-on: macos-latest
+    # 暫定。cache なしのコールドビルド。workflow_dispatch の計測値 × 約 1.5 に確定する（#999。根拠の run ID は確定時に追記）
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - name: "Servo ホストの system 依存の確認"
+        run: |
+          df -h /
+          # mozjs_sys の build.rs が llvm-objdump を要求する。macos-latest の PATH に無い場合は
+          # 導入済みの Homebrew llvm の bin を PATH に足す（新規導入はしない）
+          if ! command -v llvm-objdump >/dev/null 2>&1; then
+            for prefix in "$(brew --prefix llvm 2>/dev/null || true)" /opt/homebrew/opt/llvm /usr/local/opt/llvm; do
+              if [ -n "$prefix" ] && [ -x "$prefix/bin/llvm-objdump" ]; then
+                echo "$prefix/bin" >> "$GITHUB_PATH"
+                export PATH="$prefix/bin:$PATH"
+                break
+              fi
+            done
+          fi
+          for t in clang cmake pkg-config python3 make llvm-objdump; do
+            if ! command -v "$t" >/dev/null 2>&1; then
+              echo "error: $t is required but was not found on PATH" >&2
+              exit 1
+            fi
+          done
+          clang --version | head -1
+          cmake --version | head -1
+          python3 --version
+          make --version | head -1
+      - name: "[servo-host] cargo build（dev・--locked）"
+        run: cargo build --manifest-path servo-host/Cargo.toml --locked
+      - name: "[servo-host] --selftest"
+        run: |
+          set -euo pipefail
+          bin="servo-host/target/debug/fandhe-browser-servo-host"
+          if [ ! -x "$bin" ]; then
+            echo "error: servo host binary not found: $bin" >&2
+            exit 1
+          fi
+          out="$("$bin" --selftest)"
+          echo "$out"
+          case "$out" in
+            "selftest ok:"*) ;;
+            *) echo "error: unexpected --selftest output" >&2; exit 1 ;;
+          esac
+      - name: "[servo-host] cargo test（dev・--locked）"
+        run: cargo test --manifest-path servo-host/Cargo.toml --locked
+
+  # Windows 版。前提検証（SDK・MSVC v143・ATL・Python・uv）は windows-servo-prereqs と同一内容を内包する
+  # （ATL の導入は VM をまたいで持ち越せず、ビルドするジョブ自身が持つ必要があるため）。2 か所は同一に保つこと
+  # （統合・windows-servo-prereqs の削除は ruleset の更新を伴うため後続 issue）。
+  # inline pwsh は windows-servo-prereqs の既存例外を引き継ぐ（.ps1 は makefile.md のスクリプト規約外のため切り出さない）。
+  servo-host-windows:
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.servo == 'true' }}
+    runs-on: windows-latest
+    # 暫定。cache なしのコールドビルド。workflow_dispatch の計測値 × 約 1.5 に確定する（#999。根拠の run ID は確定時に追記）
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # 長パス回避のための短い target-dir
+      SERVO_HOST_TARGET_DIR: C:\st
+      # Servo の Windows 前提の下限（XOS-6）
+      MIN_WINDOWS_SDK: "10.0.19041.0"
+      # v143 向け C++ ATL の VS コンポーネント ID（VS 2026 の 14.44 サイドバイサイド）
+      ATL_V143_COMPONENT: Microsoft.VisualStudio.Component.VC.14.44.17.14.ATL
+      # uv は完全固定（win_amd64 wheel の sha256 で完全性を検証）
+      UV_VERSION: "0.12.20"
+      UV_WHEEL_SHA256: 1502e03f4da3280cbb493d356d59bdd401bf23197cd71df64e1c6feac156090c
+    steps:
+      - name: "長パスの有効化と空き容量の記録"
+        run: |
+          git config --global core.longpaths true
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, Used, Free
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - name: Windows SDK の検証
+        run: |
+          $min = [version]$env:MIN_WINDOWS_SDK
+          $root = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Include'
+          $found = @()
+          if (Test-Path $root) {
+            $found = Get-ChildItem $root -Directory |
+              Where-Object { $_.Name -match '^10\.\d+\.\d+\.\d+$' } |
+              ForEach-Object { [version]$_.Name } |
+              Where-Object { $_ -ge $min } | Sort-Object -Descending
+          }
+          if ($found.Count -eq 0) {
+            Write-Host "::error::Windows SDK >= $min not found under $root"
+            exit 1
+          }
+          Write-Host "Windows SDK: $($found[0])"
+      - name: VS と MSVC v143 ツールセットの検証
+        run: |
+          $vsInstaller = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
+          $vswhere = Join-Path $vsInstaller 'vswhere.exe'
+          $installPath = & $vswhere -products * -latest `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($installPath)) {
+            Write-Host "::error::Visual Studio with the MSVC toolset not found"
+            exit 1
+          }
+          $installPath = $installPath.Trim()
+          $msvcRoot = Join-Path $installPath 'VC\Tools\MSVC'
+          # v143 のうち ATL 導入対象（ATL_V143_COMPONENT）と対になる 14.44 系のみを
+          # 検証対象にする（ATL は 14.44 固定のため、別版を選ぶと atlbase.h が見つからない）
+          $v143 = @()
+          if (Test-Path $msvcRoot) {
+            $v143 = Get-ChildItem $msvcRoot -Directory |
+              Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
+              Where-Object { [version]$_.Name -ge [version]'14.44' } |
+              Where-Object { [version]$_.Name -lt [version]'14.45' } |
+              Sort-Object { [version]$_.Name } -Descending
+          }
+          if ($v143.Count -eq 0) {
+            Write-Host "::error::MSVC v143 toolset 14.44 (paired with the ATL component) not found under $msvcRoot"
+            exit 1
+          }
+          Write-Host "VS: $installPath"
+          Write-Host "MSVC v143 toolset: $($v143[0].Name)"
+          "VS_INSTALL_PATH=$installPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "MSVC_V143_DIR=$($v143[0].FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: v143 向け C++ ATL の検証（無ければ導入）
+        run: |
+          $header = Join-Path $env:MSVC_V143_DIR 'atlmfc\include\atlbase.h'
+          if (-not (Test-Path $header)) {
+            Write-Host "ATL for v143 not found; installing $env:ATL_V143_COMPONENT"
+            $setup = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\setup.exe'
+            $p = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+              'modify', '--installPath', "`"$env:VS_INSTALL_PATH`"",
+              '--add', $env:ATL_V143_COMPONENT,
+              '--quiet', '--norestart', '--nocache')
+            if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+              Write-Host "::error::VS Installer failed with exit code $($p.ExitCode)"
+              exit 1
+            }
+          }
+          if (-not (Test-Path $header)) {
+            Write-Host "::error::C++ ATL for v143 (atlbase.h) not found under $env:MSVC_V143_DIR"
+            exit 1
+          }
+          Write-Host "C++ ATL for v143: $header"
+      - name: Python の検証
+        run: |
+          $out = python --version
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch '^Python 3\.') {
+            Write-Host "::error::Python 3.x not found (got: $out)"
+            exit 1
+          }
+          Write-Host $out
+      - name: uv の導入（バージョン・ハッシュ固定）
+        run: |
+          # 導入済みの uv があっても sha256 検証を必ず通すため、まず wheel を
+          # 明示取得（--require-hashes で検証）し、その wheel を強制再導入する
+          $work = Join-Path $env:RUNNER_TEMP 'uv-wheel'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $req = Join-Path $work 'uv-requirements.txt'
+          "uv==$env:UV_VERSION --hash=sha256:$env:UV_WHEEL_SHA256" | Out-File -FilePath $req -Encoding ascii
+          python -m pip download --disable-pip-version-check --no-cache-dir `
+            --require-hashes --only-binary=:all: --no-deps -d $work -r $req
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::hash-verified download of pinned uv failed"
+            Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          python -m pip install --disable-pip-version-check --no-cache-dir `
+            --require-hashes --only-binary=:all: --no-deps --force-reinstall `
+            --no-index --find-links $work -r $req
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::pip install of pinned uv failed"
+            Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+          # 出力は "uv 0.12.20 (<hash> <date> <target>)" 形式のため前方一致で比較する
+          $ver = python -m uv --version
+          if ($LASTEXITCODE -ne 0 -or $ver -notlike "uv $env:UV_VERSION *") {
+            Write-Host "::error::unexpected uv version: $ver"
+            exit 1
+          }
+          Write-Host $ver
+      - name: "MSVC v143 環境の選択（vcvarsall -vcvars_ver）"
+        run: |
+          $vcvars = Join-Path $env:VS_INSTALL_PATH 'VC\Auxiliary\Build\vcvarsall.bat'
+          if (-not (Test-Path $vcvars)) {
+            Write-Host "::error::vcvarsall.bat not found: $vcvars"
+            exit 1
+          }
+          $ver = Split-Path $env:MSVC_V143_DIR -Leaf
+          $allowed = @('PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCToolsVersion', 'VCToolsInstallDir',
+            'VCINSTALLDIR', 'VSINSTALLDIR', 'WindowsSdkDir', 'WindowsSDKVersion', 'UCRTVersion',
+            'UniversalCRTSdkDir', 'WindowsLibPath', 'WindowsSdkBinPath', 'WindowsSdkVerBinPath')
+          $lines = cmd /c "`"$vcvars`" x64 -vcvars_ver=$ver >nul && set"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::vcvarsall.bat failed with exit code $LASTEXITCODE"
+            exit 1
+          }
+          $tools = $null
+          foreach ($line in $lines) {
+            if ($line -match '^([A-Za-z0-9_]+)=(.*)$' -and $allowed -contains $Matches[1]) {
+              "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              if ($Matches[1] -eq 'VCToolsVersion') { $tools = [version]$Matches[2].Trim() }
+            }
+          }
+          if ($null -eq $tools -or $tools -lt [version]'14.30' -or $tools -ge [version]'14.50') {
+            Write-Host "::error::VCToolsVersion is not v143 (got: $tools)"
+            exit 1
+          }
+          Write-Host "VCToolsVersion: $tools"
+      - name: "libclang の検出（bindgen 用）"
+        run: |
+          $dirs = @("$env:ProgramFiles\LLVM\bin", "${env:ProgramFiles(x86)}\LLVM\bin")
+          $found = $dirs | Where-Object { Test-Path (Join-Path $_ 'libclang.dll') } | Select-Object -First 1
+          if (-not $found) {
+            Write-Host "::error::libclang.dll not found under $($dirs -join ', ')"
+            exit 1
+          }
+          Write-Host "LIBCLANG_PATH: $found"
+          "LIBCLANG_PATH=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # mozjs_sys の build.rs が llvm-objdump を要求するため、同じ LLVM の bin を PATH に足す
+          if (-not (Get-Command llvm-objdump -ErrorAction SilentlyContinue)) {
+            "$found" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          }
+      - name: "[servo-host] cargo build（dev・--locked）"
+        run: cargo build --manifest-path servo-host/Cargo.toml --locked --target-dir $env:SERVO_HOST_TARGET_DIR
+      - name: "[servo-host] --selftest"
+        run: |
+          $bin = Join-Path $env:SERVO_HOST_TARGET_DIR 'debug\fandhe-browser-servo-host.exe'
+          if (-not (Test-Path $bin)) {
+            Write-Host "::error::servo host binary not found: $bin"
+            exit 1
+          }
+          $out = (& $bin --selftest) -join "`n"
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 0 -or -not $out.StartsWith('selftest ok:')) {
+            Write-Host "::error::--selftest failed (exit code $code)"
+            exit 1
+          }
+      - name: "[servo-host] cargo test（dev・--locked）"
+        run: cargo test --manifest-path servo-host/Cargo.toml --locked --target-dir $env:SERVO_HOST_TARGET_DIR
+
   harness-macos:
     needs: changes
     if: >-
@@ -1564,6 +1844,7 @@ jobs:
   # 明示判定する。checkout・secrets は不要。
   #
   # 出る check-run はすべて required にする前提のため、windows-servo-prereqs も required に含める。
+  # servo-host-windows が同一の前提検証を内包している。本ジョブの削除は ruleset の更新を伴うため後続 issue
   windows-servo-prereqs:
     needs: changes
     if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.rust == 'true' }}
