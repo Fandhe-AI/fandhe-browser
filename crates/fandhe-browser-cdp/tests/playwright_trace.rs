@@ -6,8 +6,9 @@
 //! 「Playwright が送ったリクエストに対し、現状の実装が記録どおりの応答を返す」ことを具体値で固定する。
 //! Node 不要・ネットワーク不要で常時実行できる回帰フックであり、原因調査（TASK-43.2・#247）と
 //! 追加実装（TASK-43.3・#249）で応答が変わったら、トレースを再取得して本ファイルの期待値
-//! （`EXPECTED_*`）を更新する。TASK-43.3a で `/json/version/` と `Browser.getVersion` を追加した。
-//! 以降のメソッドの no-op は追加しない（`SEC-2`・`REPAIR-3`）。
+//! （`EXPECTED_*`）を更新する。TASK-43.3a で `/json/version/` と `Browser.getVersion` を追加し、
+//! TASK-43.3e（#910）で `Target.createTarget`（応答前の `Target.attachedToTarget`）と
+//! `Runtime.runIfWaitingForDebugger` を追加した。以降のメソッドの no-op は追加しない（`SEC-2`・`REPAIR-3`）。
 //!
 //! `CdpState` の構築に `Profile::open` が必要で、非 unix では `ProfileError::Unsupported` を返す仕様のため
 //! `#[cfg(unix)]` とする（任意の skip ではなく `tests/devtools_browser.rs` と同じ理由）。
@@ -34,21 +35,36 @@ const TRACE: &str = include_str!("../../../harness/playwright-trace/results/newp
 const MAX_TRACE_LINES: usize = 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
-/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3d 後）。`connectOverCDP(noDefaults:true)` は
+/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3e 後）。`connectOverCDP(noDefaults:true)` は
 /// `Target.setAutoAttach`（`waitForDebuggerOnStart:true`）・`Target.getTargetInfo` を経て成功し、
 /// `newContext({acceptDownloads:false})` は `Target.createBrowserContext` と
-/// `browserContextId` 付き `Browser.setDownloadBehavior` を経て成功する。`newPage()` が
-/// `Target.createTarget` の `-32601` で失敗する（#910。`CDP-6`）。
+/// `browserContextId` 付き `Browser.setDownloadBehavior` を経て成功する。`newPage()` は
+/// `Target.createTarget` が成功して `Target.attachedToTarget`（`waitingForDebugger:true`）を応答の前に受け、
+/// セッション付きの初期化（`Page.enable` 等。未実装で `-32601`）で失敗して `Target.closeTarget` を送る（`CDP-6`）。
 ///
 /// 注意: `Browser.getVersion` の応答に `CARGO_PKG_VERSION` が入るため、workspace の版を上げたら
 /// `make trace-playwright` でトレースを再取得すること。
-const EXPECTED_SEND_METHODS: [&str; 6] = [
+const EXPECTED_SEND_METHODS: [&str; 20] = [
     "Browser.getVersion",
     "Target.setAutoAttach",
     "Target.getTargetInfo",
     "Target.createBrowserContext",
     "Browser.setDownloadBehavior",
     "Target.createTarget",
+    "Browser.getWindowForTarget",
+    "Page.enable",
+    "Page.getFrameTree",
+    "Log.enable",
+    "Page.setLifecycleEventsEnabled",
+    "Runtime.enable",
+    "Page.addScriptToEvaluateOnNewDocument",
+    "Network.enable",
+    "Target.setAutoAttach",
+    "Emulation.setFocusEmulationEnabled",
+    "Emulation.setDeviceMetricsOverride",
+    "Emulation.setEmulatedMedia",
+    "Runtime.runIfWaitingForDebugger",
+    "Target.closeTarget",
 ];
 
 /// トレース内の `downloadPath` の正規化済みプレースホルダ（`harness/playwright-trace/lib.mjs` の
@@ -217,8 +233,8 @@ fn cdp2_playwright_trace_is_well_formed() {
         .map(|r| r["message"]["method"].as_str().expect("method is a string"))
         .collect();
     assert_eq!(sends, EXPECTED_SEND_METHODS);
-    // 現状の到達点: connectOverCDP(http) と newContext が成功し、newPage が `Target.createTarget` の
-    // `-32601` で失敗する（#910 で実装）。
+    // 現状の到達点: connectOverCDP(http) と newContext が成功し、newPage は `Target.createTarget` が
+    // 通った後、セッション付きの初期化（`Page.enable`。未実装）で失敗する。
     let stages: Vec<(&str, bool)> = recs
         .iter()
         .filter(|r| r["kind"] == "stage")
@@ -290,6 +306,7 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
         .filter(|r| r["kind"] == "cdp" && r["dir"] == "recv")
         .map(|r| r["message"].clone())
         .collect();
+    let expected_len = recvs.len();
     let replayed = tokio::task::spawn_blocking(move || {
         let mut s = connect(addr);
         assert_eq!(
@@ -309,11 +326,18 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
                 }
             }
         }
+        // 最後の `Target.closeTarget` は応答の後に `Target.detachedFromTarget` を送る（CDP-5）。
+        while got.len() < expected_len {
+            got.push(read_text_json(&mut s));
+        }
         got
     })
     .await
     .unwrap();
     let product = format!("fandhe-browser/{}", env!("CARGO_PKG_VERSION"));
+    // セッション付きの未実装メソッド（`Page.enable` 等）は成功を装わず `-32601`（CDP-6・REPAIR-3）。
+    let sid = "00000000000000000000000000000001";
+    let not_impl = |id: i64| json!({"id": id, "sessionId": sid, "error": {"code": -32601, "message": "method not implemented"}});
     let version = json!({"id": 1, "result": {
         "protocolVersion": "1.3", "product": product, "userAgent": product
     }});
@@ -331,8 +355,36 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
             json!({"id": 4, "result": {"browserContextId": "00000000000000000000000000000002"}}),
             // `browserContextId` 付きの `deny` + `eventsEnabled:true` を受理する（ダウンロード実行系は未実装）。
             json!({"id": 5, "result": {}}),
-            // `Target.createTarget` は未実装（#910）。成功を装わず `-32601`（CDP-6・REPAIR-3）。
-            json!({"id": 6, "error": {"code": -32601, "message": "method not implemented"}}),
+            // `Target.createTarget`（43.3e）: `Target.attachedToTarget` が応答より前に届く（CDP-5）。
+            // `waitForDebuggerOnStart:true` の接続なので `waitingForDebugger:true`。
+            json!({"method": "Target.attachedToTarget", "params": {
+                "sessionId": sid,
+                "targetInfo": {
+                    "attached": true, "browserContextId": "00000000000000000000000000000002",
+                    "canAccessOpener": false, "targetId": "00000000000000000000000000000001",
+                    "title": "about:blank", "type": "page", "url": "about:blank"
+                },
+                "waitingForDebugger": true
+            }}),
+            json!({"id": 6, "result": {"targetId": "00000000000000000000000000000001"}}),
+            // 以降のセッション付き初期化メソッドは未実装（`Page.enable` が最初の失敗で newPage が止まる）。
+            not_impl(7),
+            not_impl(8),
+            not_impl(9),
+            not_impl(10),
+            not_impl(11),
+            not_impl(12),
+            not_impl(13),
+            not_impl(14),
+            // 子ターゲットの自動 attach（`sessionId` 付き `Target.setAutoAttach`）は未実装（43.3c）。
+            json!({"id": 15, "sessionId": sid, "error": {"code": -32602, "message": "unsupported params"}}),
+            not_impl(16),
+            not_impl(17),
+            not_impl(18),
+            // 止めたセッションの `Runtime.runIfWaitingForDebugger` は実際に再開して `{}`。
+            json!({"id": 19, "sessionId": sid, "result": {}}),
+            json!({"id": 20, "result": {"success": true}}),
+            json!({"method": "Target.detachedFromTarget", "params": {"sessionId": sid, "targetId": "00000000000000000000000000000001"}}),
         ]
     );
     assert!(!artifacts.exists(), "downloadPath must not be created");
@@ -349,11 +401,24 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
         logged,
         [
             ("Browser.getVersion", 1, 0),
+            ("Browser.getWindowForTarget", 0, 1),
             ("Browser.setDownloadBehavior", 1, 0),
+            ("Emulation.setDeviceMetricsOverride", 0, 1),
+            ("Emulation.setEmulatedMedia", 0, 1),
+            ("Emulation.setFocusEmulationEnabled", 0, 1),
+            ("Log.enable", 0, 1),
+            ("Network.enable", 0, 1),
+            ("Page.addScriptToEvaluateOnNewDocument", 0, 1),
+            ("Page.enable", 0, 1),
+            ("Page.getFrameTree", 0, 1),
+            ("Page.setLifecycleEventsEnabled", 0, 1),
+            ("Runtime.enable", 0, 1),
+            ("Runtime.runIfWaitingForDebugger", 1, 0),
+            ("Target.closeTarget", 1, 0),
             ("Target.createBrowserContext", 1, 0),
-            ("Target.createTarget", 0, 1),
+            ("Target.createTarget", 1, 0),
             ("Target.getTargetInfo", 1, 0),
-            ("Target.setAutoAttach", 1, 0)
+            ("Target.setAutoAttach", 2, 0)
         ],
         "snapshot: {snap:?}"
     );
@@ -451,6 +516,60 @@ async fn cdp2_close_target_over_websocket_emits_detached_after_response() {
         assert_eq!(read_text_json(&mut s)["id"], 3);
         assert!(st2.registry().target(&target).is_none());
         assert_eq!(st2.registry().session_count(), 0);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn cdp2_create_target_over_websocket_emits_attached_before_response_and_waits_for_debugger() {
+    let dir = TempDir::new();
+    let (addr, st) = start(&dir).await;
+    let st2 = Arc::clone(&st);
+    tokio::task::spawn_blocking(move || {
+        let mut s = connect(addr);
+        assert_eq!(
+            upgrade(&mut s, "/devtools/browser/trace-1", addr.port()),
+            101
+        );
+        let req = json!({"id": 1, "method": "Target.setAutoAttach",
+            "params": {"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true}});
+        send_text(&mut s, &req.to_string());
+        assert_eq!(read_text_json(&mut s), json!({"id": 1, "result": {}}));
+        let req = json!({"id": 2, "method": "Target.createTarget",
+            "params": {"url": "about:blank"}});
+        send_text(&mut s, &req.to_string());
+        // 送出順は attachedToTarget → 応答（CDP-5。Playwright は応答時点でページがある前提）。
+        let ev = read_text_json(&mut s);
+        assert_eq!(ev["method"], "Target.attachedToTarget");
+        assert_eq!(ev["params"]["waitingForDebugger"], true);
+        let target_id = ev["params"]["targetInfo"]["targetId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let session_id = ev["params"]["sessionId"].as_str().unwrap().to_owned();
+        assert_eq!(
+            read_text_json(&mut s),
+            json!({"id": 2, "result": {"targetId": target_id}})
+        );
+        // ブラウザ ID（trace-1）とは別。再開前は文書が無く、再開後に確定する。
+        assert_ne!(target_id, "trace-1");
+        let doc = json!({"id": 3, "method": "DOM.getDocument", "sessionId": session_id});
+        send_text(&mut s, &doc.to_string());
+        assert_eq!(read_text_json(&mut s)["error"]["code"], -32000);
+        let run =
+            json!({"id": 4, "method": "Runtime.runIfWaitingForDebugger", "sessionId": session_id});
+        send_text(&mut s, &run.to_string());
+        assert_eq!(
+            read_text_json(&mut s),
+            json!({"id": 4, "result": {}, "sessionId": session_id})
+        );
+        send_text(
+            &mut s,
+            &json!({"id": 5, "method": "DOM.getDocument", "sessionId": session_id}).to_string(),
+        );
+        assert!(read_text_json(&mut s)["result"]["root"].is_object());
+        assert_eq!(st2.registry().target_count(), 1);
     })
     .await
     .unwrap();

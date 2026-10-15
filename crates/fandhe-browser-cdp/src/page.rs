@@ -545,6 +545,13 @@ impl CommandHandler for PageNavigate {
                 ),
                 None => None,
             };
+            // `waitForDebuggerOnStart` で止めたターゲットは再開前の遷移を拒否する（再開時の
+            // 初期読み込みが実行中の遷移を中断する競合を防ぐ。#910・`CDP-2`）。
+            if let Some(tid) = &target_id
+                && ctx.state.registry().is_paused(tid)
+            {
+                return Err(CdpError::TARGET_WAITING_FOR_DEBUGGER);
+            }
             let url = params
                 .get("url")
                 .and_then(Value::as_str)

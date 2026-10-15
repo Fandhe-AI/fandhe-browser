@@ -32,7 +32,7 @@ Playwright のソースは長く引用せず、関数名と要約に留める。
 | `connectOverCDP(http://…)` | 成功（`noDefaults:true` 指定時。TASK-43.3g・#942 で到達）。`Browser.getVersion`・`Target.setAutoAttach`（`waitForDebuggerOnStart:true` は受理）・`Target.getTargetInfo` が成功する。指定なしの既定オプションでは接続直後の `Browser.setDownloadBehavior`（`allowAndName`）が `-32602` で拒否され通らない（後述「段階 2g」） | A（現行 head での再取得）: seq 1〜9 |
 | `connectOverCDP(ws://…)` | 未実行（http 経由が成功するため、収集ハーネスの ws 直接の再試行は行われない） | A |
 | `newContext()` | 成功（`acceptDownloads:false` 指定時。TASK-43.3d・#909 で到達）。`Target.createBrowserContext`（`disposeOnDetach:true`）と `browserContextId` 付き `Browser.setDownloadBehavior`（`deny` + `eventsEnabled:true`）が成功する（後述「段階 2b の実施結果」） | A: seq 10〜14 |
-| `newPage()` | 失敗。`Target.createTarget` が `-32601`（`method not implemented`）。#910 の対象 | A: seq 15〜17 |
+| `newPage()` | 失敗。`Target.createTarget` は成功し（TASK-43.3e・#910）、`Target.attachedToTarget` が応答の前に届く。セッション付きの初期化の最初の失敗 `Page.enable` の `-32601`（`method not implemented`）で止まる（後述「段階 2e の実施結果」） | A: seq 15〜47 |
 
 `-32601` は未実装メソッドへ成功を捏造しない `CDP-6`・`SEC-2` の方針どおりの挙動で、バグではない。
 
@@ -187,7 +187,7 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
 - 既知の制約: `Target.attachedToTarget` の `targetInfo` に `browserContextId` が無い。トレースサーバーは
   ターゲットを事前作成しないため今回の到達には影響しないが、既存ターゲットがある状態の Playwright は
   `browserContextId` を要する見込み（B）。段階 2b（TASK-43.3d・#909）で追加した
-- 送出順は応答 → イベント列のまま（`CDP-5`）。Chromium 流の並べ替えは `Target.createTarget` を実装する段階 2b 以降で判断する
+- 送出順は応答 → イベント列のまま（`CDP-5`）。`Target.createTarget` だけは `Target.attachedToTarget` を応答の前に送る（段階 2e〔#910〕で実装）
 
 ### 段階 2g の実施結果（TASK-43.3g・#942。実測 A）
 
@@ -196,7 +196,7 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
 - `Target.setAutoAttach` の `waitForDebuggerOnStart:true` を受理して接続状態に保持する。CDP の定義（Target.pdl）で止める
   対象は「以後に attach される新しいターゲット」で、既存ターゲットは止めない（Chromium の `target_handler.cc` も既存を
   `AutoAttach(..., false)` で attach する）。既存ターゲットの `Target.attachedToTarget` は `waitingForDebugger:false`。
-  新しいターゲットを実際に止める処理は `Target.createTarget`（#910）で実装する（現状は新ターゲットが現れる本番経路が無い）。
+  新しいターゲットを実際に止める処理は `Target.createTarget`（段階 2e・#910）で実装した。
   `filter`・`flatten` が `true` 以外・`sessionId` 付き・型不正は従来どおり拒否する
 - `Browser.setDownloadBehavior` は `deny`（`eventsEnabled` は省略・`true`・`false` のいずれも）と、`eventsEnabled` なしの `default` だけを
   受理する。`deny` ではダウンロードが起きないため、`eventsEnabled:true` を受理してもダウンロードのイベントは送出しない。
@@ -219,6 +219,43 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
   `behavior`・`eventsEnabled`（Browser.pdl）、Playwright 1.63.0 の `crBrowser.ts`・`chromium.ts`（`noDefaults:true` なら接続直後に
   送らない。`newContext` は `acceptDownloads` の既定で `allowAndName`、`false` で `deny`、どちらも `eventsEnabled:true` 付き）
 
+### 段階 2e の実施結果（TASK-43.3e・#910。実測 A）
+
+実装範囲（`CDP-2`・`CDP-5`・`CDP-6`・`CDP-7`・`SEC-2`・`REPAIR-3`。`protocol.rs`・`playwright_compat.rs`・`conn_state.rs`・`target.rs`・`navigation.rs`）:
+
+- 送出順: `HandlerOutput` と `DispatchOutcome` に opt-in の `pre_events` を足した。順序は pre_events → 応答 → events。
+  既定（既存ハンドラ）は応答 → events のまま。応答の前に送るのは `Target.createTarget` の `Target.attachedToTarget` だけ
+- `Target.createTarget` が受理する `params` は `url`（`"about:blank"` のみ。取得を伴わず SSRF の面を作らない）と `browserContextId`
+  （省略時は既定 context。指定できるのは既定 context か自接続が作った context だけ）。他の `url`・他のキー
+  （`newWindow`・`background`・`width` 等）は黙って無視せず `-32602`（`unsupported params`）、`url` の欠落・型不正と
+  `browserContextId` の型・書式不正・未知・他接続の context は `-32602`（`invalid params`。未知と権限外は同じ文言で存在を漏らさない）。
+  応答は `{"targetId"}` のみ。上限超過は `-32000`（`server error`）で、セッション枠が足りない場合は作成を巻き戻す
+- 呼び出し接続の自動 attach が有効なら、作成と attach を 1 回のロックで行い、`Target.attachedToTarget` を応答の前に送る。
+  attach は接続の所有記録に載るため、直後の reconcile で二重に attach しない。他接続は次のコマンドの応答に続けて
+  `waitingForDebugger:false` で追従 attach する（push 経路が無いため）
+- `waitForDebuggerOnStart:true` の接続が作ったターゲットは止める: `waitingForDebugger:true` で通知し、そのセッションへの
+  `Runtime.runIfWaitingForDebugger` が届くまで初期 `about:blank` 文書を確定しない（確定前の `DOM.getDocument` は
+  `-32000 document not available for target`、`Page.navigate` は `-32000 target is waiting for debugger`）。止めていない
+  ターゲットは作成時に確定する。止まっていないターゲットへの `Runtime.runIfWaitingForDebugger` は何もせず `{}`（Chromium と同じ）。
+  止めたセッションが外れた（切断・`autoAttach:false`）ときも再開して永久停止を残さない
+- ブラウザ ID は別名前空間（最上位ビット）で払い出すため、ページの `targetId` と衝突しない
+- Chromium との差異（`REPAIR-3`）: `waitingForDebugger:true` は作成した接続にだけ通知しクライアントごとの待ちは持たない。
+  既定 context に作ったターゲットは作成接続の切断では閉じない（`Target.closeTarget` で閉じる。`MAX_TARGETS` が歯止め）
+- 未実装: 任意 URL の読み込み、`Target.targetCreated`（`Target.setDiscoverTargets` が未実装）、window 系 params、
+  初期読み込み時の `Page.frameNavigated` 等（`Page.enable` が未実装）
+
+実測（`make trace-playwright`。`playwright-core` 1.63.0。`worldName` の乱数ハッシュを `<WORLD_HASH>` へ正規化した上で、2 回の実行で同一出力）:
+予測どおり、`Target.attachedToTarget`（`waitingForDebugger:true`）が `Target.createTarget` の応答より前に届き、`newPage()` は
+`Target.createTarget` を通過する。続けて Playwright が送るセッション付きの初期化メソッド
+（`Browser.getWindowForTarget`・`Page.enable`・`Page.getFrameTree`・`Log.enable`・`Page.setLifecycleEventsEnabled`・`Runtime.enable`・
+`Page.addScriptToEvaluateOnNewDocument`・`Network.enable`・`Emulation.setFocusEmulationEnabled`・`Emulation.setDeviceMetricsOverride`・
+`Emulation.setEmulatedMedia`）は未実装で `-32601`、セッション付き `Target.setAutoAttach`（子ターゲットの自動 attach）は `-32602`
+（`unsupported params`）、`Runtime.runIfWaitingForDebugger` は `{}` で成功する。`newPage()` は最初の失敗の
+**`Page.enable` の `-32601`**（`browserContext.newPage: Protocol error (Page.enable): method not implemented`）で失敗し、
+Playwright が `Target.closeTarget` を送って `Target.detachedFromTarget` が届く。次に実装すべきは、`newPage()` の初期化で
+Playwright が応答を待つ `Page.enable`・`Page.getFrameTree` 以降のセッション付きメソッド群（段階 3）で、各メソッドの
+必要最小限の応答は `Emulation.*`・`Network.enable` を含め個別に `SEC-2` の観点で判断する。
+
 ### 段階 2b の実施結果（TASK-43.3d・#909。実測 A）
 
 実装範囲（`CDP-2`・`CDP-6`・`CDP-7`・`SEC-2`・`REPAIR-3`）:
@@ -235,7 +272,7 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
   `eventsEnabled` なしの `default`）。設定は context 単位で保持し（Chromium と同じ）、context の破棄で消える。`downloadPath` は検証のみで、
   `deny` では保持せずファイル操作もしない。不正・未知の `browserContextId` は `-32602`（`invalid params`）
 - 上限: 新規 context は 64 件（`MAX_BROWSER_CONTEXTS`。既定 context を除く）。`MAX_TARGETS`・`MAX_SESSIONS` は全 context 共通で維持する
-- 未実装のまま: `Target.disposeBrowserContext`・`Target.getBrowserContexts`・`Target.createTarget`（#910）
+- 未実装のまま: `Target.disposeBrowserContext`・`Target.getBrowserContexts`（`Target.createTarget` は段階 2e〔#910〕で実装）
 
 実測（`make trace-playwright`。2 回の実行で同一出力）: `Target.createBrowserContext` → `{"browserContextId":"…0002"}`、
 `Browser.setDownloadBehavior`（`deny`・`browserContextId`・`downloadPath`・`eventsEnabled:true`）→ `{}` で `newContext()` が成功し、
