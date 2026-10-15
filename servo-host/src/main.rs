@@ -10,17 +10,19 @@
 //!   ネットワークへは出ない。呼び出し元は開発者と CI のみ。
 //! - それ以外: 未実装として標準エラーに示し、非ゼロで終了する（REPAIR-3）。
 //!
-//! 将来仕様: 本体 render crate からの stdio サーバー（#993）、スクリーンショット
-//! （RENDER-3・#230）、可視性・境界ボックス（RENDER-4）。
+//! Servo と描画コンテキストの生成・破棄は `engine` が担う（RENDER-3・#230）。
+//!
+//! 将来仕様: 本体 render crate からの stdio サーバー（#993）、WebView・読み込み（#231）、
+//! スクリーンショット（#232）、可視性・境界ボックス（RENDER-4）。
+
+mod engine;
 
 use std::process::ExitCode;
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use servo::{LoadStatus, ServoBuilder, ServoUrl, SoftwareRenderingContext, WebViewBuilder};
+use engine::{Engine, EngineError};
+use servo::{LoadStatus, ServoUrl, WebViewBuilder};
 
-/// セルフテストで描画する画面の一辺（px）。初期化確認に足りる最小限にする。
-const SELFTEST_SIZE: u32 = 64;
 /// ページ読み込み完了を待つ上限。超過は失敗として扱い、成功を装わない。
 const SELFTEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// セルフテストで読み込むページ。`data:` のためネットワークアクセスは発生しない。
@@ -53,18 +55,17 @@ fn main() -> ExitCode {
     }
 }
 
-/// Servo を初期化して `data:` ページの読み込み完了を待ち、所要時間を返す。
+/// Servo を生成して `data:` ページの読み込み完了を待ち、破棄と解放を確かめて所要時間を返す。
 ///
-/// 失敗（コンテキスト作成・URL 解析・タイムアウト）は `Err` に倒す。`Servo` は
-/// スコープ終了の `Drop` で停止する。
+/// 失敗（生成・URL 解析・タイムアウト・解放漏れ・二重生成の許容）は `Err` に倒す。
+/// WebView の生成と読み込み待ちは #231 で `page` へ移すまでここに置く。
 fn selftest() -> Result<Duration, String> {
-    let context = SoftwareRenderingContext::new((SELFTEST_SIZE, SELFTEST_SIZE).into())
-        .map_err(|e| format!("cannot create software rendering context: {e:?}"))?;
-    let servo = ServoBuilder::default().build();
+    let engine = Engine::new().map_err(|e| e.to_string())?;
+    let weak_context = engine.context_weak();
     let url = ServoUrl::parse(SELFTEST_URL)
         .map_err(|e| format!("invalid selftest url: {e}"))?
         .into_url();
-    let webview = WebViewBuilder::new(&servo, Rc::new(context))
+    let webview = WebViewBuilder::new(engine.servo(), engine.rendering_context())
         .url(url)
         .build();
 
@@ -75,8 +76,22 @@ fn selftest() -> Result<Duration, String> {
                 "page load did not complete within {SELFTEST_TIMEOUT:?}"
             ));
         }
-        servo.spin_event_loop();
+        engine.servo().spin_event_loop();
         std::thread::sleep(Duration::from_millis(5));
     }
-    Ok(start.elapsed())
+    let elapsed = start.elapsed();
+
+    // WebView を先に解放してから Engine を破棄する（Servo の Drop が終了を待つ）。
+    drop(webview);
+    drop(engine);
+    if weak_context.upgrade().is_some() {
+        return Err("rendering context leaked after engine drop".to_string());
+    }
+    // 1 プロセス 1 回の制約: 2 回目の生成は panic せず AlreadyCreated で拒否される。
+    match Engine::new() {
+        Err(EngineError::AlreadyCreated) => {}
+        Err(e) => return Err(format!("unexpected error on second engine: {e}")),
+        Ok(_) => return Err("second engine creation was not rejected".to_string()),
+    }
+    Ok(elapsed)
 }
