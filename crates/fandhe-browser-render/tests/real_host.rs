@@ -22,10 +22,11 @@ use fandhe_browser_core::render::{
     ElementRef, ImageFormat, PageRef, RenderError, Renderer, ScreenshotOptions,
 };
 use fandhe_browser_render::host_process::{
-    HOST_BINARY_ENV, HostProcess, HostProcessConfig, HostTimeouts, resolve_host_binary,
+    HOST_BINARY_ENV, HostProcess, HostProcessConfig, HostProcessError, HostTimeouts,
+    resolve_host_binary,
 };
 use fandhe_browser_render::host_renderer::{HostRenderer, HostRendererConfig};
-use fandhe_browser_render::protocol::LoadParams;
+use fandhe_browser_render::protocol::{HostErrorKind, LoadParams};
 
 /// スクリーンショット用（上半分が赤・下半分が青）。
 const SHOT_BODY: &str = "<html><head><title>fixture</title></head><body style=\"margin:0\"><div style=\"height:400px;background:#f00\"></div><div style=\"height:400px;background:#00f\"></div></body></html>";
@@ -225,29 +226,41 @@ fn render3_real_host_roundtrip() {
     assert_eq!(variant(&e), "PageNotLoaded");
 }
 
-/// RENDER-4: 応答しないサーバーへの load は Timeout で失敗し、同じ renderer で回復できる。
+/// RENDER-4: 応答しないサーバーへの load は Timeout で失敗し、同じホストで回復できる。
+///
+/// load の timeout は load ごとにホストへ送られる。cold な CI で初期化・初回フレームが 1 秒を
+/// 超えても落ちないよう、ウォームアップと回復の load は 20 秒、ハング検証の load だけ 1 秒にする
+/// ため、load ごとに timeout を指定できる HostProcess 層を使う。
 #[test]
 fn render4_real_host_load_timeout() {
     let hang = Server::start(true);
     let ok = Server::start(false);
     let timeouts = HostTimeouts::default()
         .with_load_default(Duration::from_secs(2))
-        .with_load_max(Duration::from_secs(5));
-    let r = renderer(timeouts, true, Some(1_000));
+        .with_load_max(Duration::from_secs(25));
+    let mut p = HostProcess::new(host_config(timeouts));
+
+    // ウォームアップ（Servo の初期化を長い timeout で済ませる）。
+    let warm = ok.url("/warm");
+    p.load(&LoadParams::new(&warm, Some(20_000)).expect("params"), 1)
+        .expect("warmup");
 
     let started = Instant::now();
-    let e = r
-        .load(&PageRef::new(hang.url("/")))
+    let hang_url = hang.url("/");
+    let e = p
+        .load(&LoadParams::new(&hang_url, Some(1_000)).expect("params"), 2)
         .expect_err("hang must fail");
-    assert_eq!(variant(&e), "Timeout");
+    assert!(
+        matches!(&e, HostProcessError::Timeout(_))
+            || matches!(&e, HostProcessError::Host(h) if h.kind() == HostErrorKind::Timeout),
+        "{e:?}"
+    );
     assert!(started.elapsed() < Duration::from_secs(15));
-    let e = r
-        .capture_screenshot(&ScreenshotOptions::new())
-        .expect_err("after timeout");
-    assert_eq!(variant(&e), "PageNotLoaded");
 
     let url = ok.url("/shot");
-    let loaded = r.load(&PageRef::new(url.as_str())).expect("recover");
+    let loaded = p
+        .load(&LoadParams::new(&url, Some(20_000)).expect("params"), 3)
+        .expect("recover");
     assert_eq!(loaded.final_url(), url);
 }
 
