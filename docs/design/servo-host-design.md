@@ -129,6 +129,10 @@ servo-host/
 - シェルを介さず引数配列で起動し、`env_clear` のうえ許可リストで環境変数を渡す（許可リストは Linux の `HOME`・fontconfig 関連、Windows の `SystemRoot` 等を実機で確認してから確定する。**未検証**）。
 - 作業ディレクトリと Servo のユーザーデータは専用の一時ディレクトリ（0700、終了時に削除）で、永続しない。プロファイルごとに別のホストプロセスを使い、共有しない（PROF 境界）。
 - stderr は末尾 8 KiB を上限付きでバッファし、失敗時のログに使う。URL のクエリや機密をログに出さない。
+- **実装（TASK-38・#994・`fandhe_browser_render::host_process`）で決めた値**:
+  - 起動引数は固定の `--stdio` のみ（`HOST_ARGS`）。ホスト側のサーバーモード（#993）はこの引数で stdio モードに入る。クライアントから任意引数は渡さない。
+  - 環境変数は `env_clear` 後に、workdir 配下を指す強制設定（Unix: `HOME`・`TMPDIR`、Linux はさらに `XDG_CONFIG_HOME`・`XDG_CACHE_HOME`・`XDG_DATA_HOME`。Windows: `TMP`・`TEMP`）と、親に値があるときだけ引き継ぐ変数（Linux: `FONTCONFIG_FILE`・`FONTCONFIG_PATH`、Windows: `SystemRoot`、macOS: なし）だけを渡す。`PATH`・`LANG`・`LC_*`・`TZ`・`*_PROXY`（識別面。SEC-2）、`LD_*`・`DYLD_*`（注入経路）は渡さない。実機確認の状態は**すべて未確認**（Windows の `SystemRoot` は js 子プロセスでは実績あり・Servo ホストでは未確認）。HOME を一時ディレクトリにした場合の fontconfig キャッシュ再生成コストも未確認。
+  - タイムアウトは handshake 10 s・load 既定 30 s（上限 60 s）・screenshot 20 s・visibility / bounding_box 5 s・shutdown 猶予 3 s。load はホスト自身の `timeout` 応答が先に届くよう、待ち時間に暫定 2 s を上乗せする。タイムアウト時は kill してホストを破棄する。
 
 ### 2.7 資源制限・クラッシュ・ライフサイクル
 
@@ -136,6 +140,7 @@ servo-host/
 - クラッシュ・タイムアウト・プロトコル違反は、当該呼び出しを `RenderError`（§3 の新 variant）で失敗させ、成功を装わない。ホストは破棄し、次回呼び出しで再起動する。サーキットブレーカーとして 60 秒内に 3 回失敗したら一定時間再起動しない。
 - ホスト再起動後は、ロード済みページの状態をホストの起動世代にも対応づける。クライアントはナビゲーション世代に加えて「ページをロードしたホストの起動世代」を保持し、どちらかが現在値と異なれば現在のページを再ロードしてから描画する。これにより、同じページでのスクリーンショット再試行がクラッシュ後の新しいホストでも空ページにならない。
 - 遅延起動（最初の描画要求時）とし、`AppState` / クライアントの drop 時に `shutdown`、猶予後に kill する。
+- **実装で決めた値（TASK-38・#994）**: サーキットブレーカーの冷却時間は設計に値が無いため暫定 60 秒（半開き 1 回で、失敗なら再作動）。RSS 上限の既定は暫定 2 GiB（Servo の実測は TASK-82）。**Windows の RSS 監視と Job Object は未実装**（`windows-sys` への依存辺と新規 `unsafe` が要るため承認事項。プローブが無い OS では監視しない）。Linux は `/proc/<pid>/status`、macOS は `/bin/ps` で測る。
 
 ## 3. 本体側の境界
 

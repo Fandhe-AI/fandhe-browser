@@ -17,3 +17,11 @@ serde_json = { workspace = true }
 # feature `rendering` は cli 側に定義済み（TASK-33.4・#459。workspace 登録は #45）で、
 # 本 crate を optional 依存として有効化する。Servo（MPL-2.0）の導入は TASK-38
 # （ビヘイビア RENDER-1）でユーザー承認を経て行う。
+
+# 偽ホスト結合テスト（TASK-38・#994）。テストバイナリ自身が `--stdio` 付きで再実行されて
+# 偽ホストとして動く。そのときの stdout はフレーム専用で、libtest の出力が混ざると壊れるため
+# `harness = false` にして自前の main を持つ（js の `v8_worker`、core の
+# `config_js_engine` が先例）。feature 条件は付けず既定の `cargo test` で実行する。
+[[test]]
+name = "host_process"
+harness = false
