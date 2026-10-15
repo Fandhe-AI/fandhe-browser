@@ -17,6 +17,28 @@ fn run(args: &[&str]) -> (Option<i32>, String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn servo host");
+    // パイプ満杯で子が書き込み停止しないよう、待機中から別スレッドで並行して読み出す。
+    let drain = |s: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut s) = s {
+                let _ = s.read_to_string(&mut buf);
+            }
+            buf
+        })
+    };
+    let out_h = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let err_h = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
     let start = Instant::now();
     let status = loop {
         if let Some(s) = child.try_wait().expect("try_wait") {
@@ -29,14 +51,8 @@ fn run(args: &[&str]) -> (Option<i32>, String, String) {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let mut out = String::new();
-    let mut err = String::new();
-    if let Some(mut s) = child.stdout.take() {
-        let _ = s.read_to_string(&mut out);
-    }
-    if let Some(mut s) = child.stderr.take() {
-        let _ = s.read_to_string(&mut err);
-    }
+    let out = out_h.join().unwrap_or_default();
+    let err = err_h.join().unwrap_or_default();
     (status.code(), out, err)
 }
 

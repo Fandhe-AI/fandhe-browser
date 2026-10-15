@@ -56,8 +56,8 @@ impl std::error::Error for EngineError {}
 ///
 /// `hard_fail: true`（既定）はスレッド失敗時に終了する fail-closed 側なので変えない。
 /// `temporary_storage` でホストがディスクへデータを残さないようにする（設計 §2.6）。
-/// `Opts::default()` の `DiagnosticsLogging` は環境変数（`SERVO_DIAGNOSTICS`）を読まない
-/// `Default` 経由。`HOST_FILE` は Servo 側が読むため、親プロセスの `env_clear`（#994）で防ぐ。
+/// `Opts::default()` の `debug` は `Default::default()` を使い、環境変数（`SERVO_DIAGNOSTICS`）を
+/// 読む `DiagnosticsLogging::new` を経由しない。`HOST_FILE` は Servo 側が読むため、親プロセスの `env_clear`（#994）で防ぐ。
 fn fixed_opts() -> Opts {
     Opts {
         temporary_storage: true,
