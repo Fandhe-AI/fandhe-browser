@@ -575,6 +575,7 @@ async fn cdp2_create_target_over_websocket_emits_attached_before_response_and_wa
     .await
     .unwrap();
 }
+
 /// 到達レポートの失敗した 1 呼び出し（エラー応答を同じ `id` の送信と突き合わせたもの）。
 #[derive(Debug, PartialEq)]
 struct FailedCall {
