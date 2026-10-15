@@ -416,8 +416,14 @@ fn render3_real_host_roundtrip() {
     assert_eq!(shot.data.get(12..16), Some(&b"IHDR"[..]));
     assert_eq!((be32(&shot.data, 16), be32(&shot.data, 20)), (1280, 800));
     // 描画内容: 上部は赤（#f00）、下部は青（#00f）。白紙や前ページの画像を返す回帰を検出する。
-    assert_eq!(png_pixel(&shot.data, 640, 100), [255, 0, 0, 255]);
-    assert_eq!(png_pixel(&shot.data, 640, 700), [0, 0, 255, 255]);
+    // ソフトウェアレンダラは厳密な色値を保証しないため、ホスト側テストと同じ許容帯で判定する。
+    let top = png_pixel(&shot.data, 640, 100);
+    let bottom = png_pixel(&shot.data, 640, 700);
+    assert!(top[0] > 200 && top[1] < 60 && top[2] < 60, "top {top:?}");
+    assert!(
+        bottom[2] > 200 && bottom[0] < 60 && bottom[1] < 60,
+        "bottom {bottom:?}"
+    );
 
     // 未対応の full_page は成功を装わない。
     let e = r
