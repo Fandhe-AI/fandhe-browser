@@ -4,7 +4,7 @@
 //! Servo を含まない偽ホスト（`support/mod.rs`。プロトコルを話すだけのテスト用プロセス）を相手に、
 //! 正常系 4 API（load・screenshot・visibility・bounding_box）と異常系（タイムアウト・プロトコル
 //! 違反・巨大フレーム・不正 JSON・クラッシュ後の再起動）を既定 feature で検証する。実ホストでの
-//! 試験は #998（TASK-38.8b）。HostProcess 層の試験は `host_process.rs`。
+//! 試験は `real_host.rs`（#998・TASK-38.8b）。HostProcess 層の試験は `host_process.rs`。
 //! 外部入力の経路ではないため `unwrap` / `expect` / `panic!` を使う。
 
 mod support;

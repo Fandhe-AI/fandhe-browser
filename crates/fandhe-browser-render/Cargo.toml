@@ -34,3 +34,12 @@ harness = false
 [[test]]
 name = "basic_api"
 harness = false
+
+# 実 Servo ホストとの結合テスト（TASK-38.8b・#998）。ホストバイナリが要るため既定の
+# `cargo test`（`--all-targets`・`--all-features` を含む）からは外し（test = false）、
+# servo-host-ubuntu が `FANDHE_BROWSER_RENDER_HOST=<絶対パス> cargo test -p fandhe-browser-render
+# --test real_host -- --test-threads=1` で明示実行する。`--all-targets` の clippy からも外れるため、
+# ci.yml で `--test real_host` の clippy を明示している。`#[ignore]` は使わない（弱体化の禁止）。
+[[test]]
+name = "real_host"
+test = false
