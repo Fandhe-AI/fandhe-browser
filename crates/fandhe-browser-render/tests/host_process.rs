@@ -92,7 +92,9 @@ fn t_invalid_request() {
 
 fn t_hello_timeout() {
     let root = Root::new("hello-timeout", "hello-timeout");
-    let mut h = root.host(short_timeouts().with_handshake(Duration::from_millis(200)));
+    // 遅い CI（Windows 等）でも偽ホストが pid を書き終えてから kill されるよう、
+    // ハンドシェイク待ちは起動時間より十分長い 2 秒にする。
+    let mut h = root.host(short_timeouts().with_handshake(Duration::from_secs(2)));
     let start = Instant::now();
     let e = h.load(&page(), 1).expect_err("timeout");
     assert!(
