@@ -65,7 +65,7 @@ make check-plugin-overhead   # 上記計測の e2e smoke を実バイナリで�
 
 ### 3 OS 一級対応
 
-- PR の CI は ubuntu のネイティブ実行のみで、macOS・Windows のネイティブジョブは skipped になる。代わりに `cross-target-check` が Linux 上で `aarch64-apple-darwin`・`x86_64-pc-windows-msvc` 向けに `cargo check` / `cargo clippy` を行う。ただし `ring`（rustls 経由）がクロスコンパイルできないため、検査対象は `fandhe-browser-js`・`-profile`・`-mcp`・`-render` に限られ、core・ai・cdp・cli の OS 固有分岐は対象外（`.claude/rules/ci.md`「3 OS CI」）
+- PR の CI は ubuntu のネイティブ実行のみで、macOS・Windows のネイティブジョブは skipped になる。代わりに `cross-target-check` が Linux 上で `aarch64-apple-darwin`・`x86_64-pc-windows-msvc` 向けに `cargo check` / `cargo clippy` を行う。ただし `ring`（rustls 経由）がクロスコンパイルできないため、検査対象は `fandhe-browser-js`・`-profile`・`-mcp` に限られ、core・ai・cdp・cli・render（core 経由で `ring` を引く）の OS 固有分岐は対象外（`.claude/rules/ci.md`「3 OS CI」）
 - main への push と release 前（`gh workflow run ci.yml --ref <ref>` の `workflow_dispatch`）には、Linux・macOS・Windows の 3 OS ネイティブランナーでビルド・テストする（オーナー判断 2026-10-10）。PR で見落とすのは macOS・Windows 固有の実行時の誤りと、上記の対象外 crate の OS 固有コンパイル・lint の誤りで、main への push 後に判明する（待ち時間と引き換えにオーナーが判断した残存リスク）。main で macOS・Windows だけが失敗した場合は修正 PR で直す
 - main への新しい push は実行中の古い main の 3 OS の CI を取り消す（concurrency）。取り消された commit の macOS・Windows の結果は残らず、後続 commit の 3 OS 実行で検出する
 
