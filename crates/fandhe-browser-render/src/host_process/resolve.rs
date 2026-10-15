@@ -88,8 +88,8 @@ fn validate(path: &Path) -> Result<HostBinary, HostProcessError> {
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = meta.permissions().mode();
-        // グループ書き込み可（0o020）も他者書き込み可（0o002）も拒否する（設計 §2.6）。
-        if mode & 0o022 != 0 {
+        // 他者書き込み可（0o002）のみ拒否する（設計 §2.6）。umask 002 の cargo ビルド（0775）は通す。
+        if mode & 0o002 != 0 {
             return invalid(InvalidBinaryReason::WorldWritable);
         }
         if mode & 0o111 == 0 {
@@ -216,15 +216,13 @@ mod tests {
             reason(resolve_host_binary(Some(&w), None, None)),
             InvalidBinaryReason::WorldWritable
         );
+        // group-writable は通る（0775）。実行不可なら NotExecutable。
         let g = t.file("g", 0o775);
-        assert_eq!(
-            reason(resolve_host_binary(Some(&g), None, None)),
-            InvalidBinaryReason::WorldWritable
-        );
-        let g2 = t.file("g2", 0o720);
+        assert!(resolve_host_binary(Some(&g), None, None).is_ok());
+        let g2 = t.file("g2", 0o664);
         assert_eq!(
             reason(resolve_host_binary(Some(&g2), None, None)),
-            InvalidBinaryReason::WorldWritable
+            InvalidBinaryReason::NotExecutable
         );
         let o = t.file("o", 0o702);
         assert_eq!(

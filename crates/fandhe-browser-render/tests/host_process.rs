@@ -200,22 +200,7 @@ impl Root {
     }
     fn config(&self, timeouts: HostTimeouts) -> HostProcessConfig {
         let exe = std::env::current_exe().expect("exe");
-        // cargo が作るテスト実行ファイルは umask 次第でグループ書き込み可になり、
-        // 解決時の権限検査（0o022 拒否）で弾かれる。0o755 のコピーを使う。
-        let copy = self.0.join(if cfg!(windows) {
-            "host-bin.exe"
-        } else {
-            "host-bin"
-        });
-        if !copy.exists() {
-            std::fs::copy(&exe, &copy).expect("copy exe");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755))
-                    .expect("chmod");
-            }
-        }
+        let copy = exe;
         let bin = resolve_host_binary(Some(&copy), None, None).expect("binary");
         HostProcessConfig::new(bin)
             .with_timeouts(timeouts)

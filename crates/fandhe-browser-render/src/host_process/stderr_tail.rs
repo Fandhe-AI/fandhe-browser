@@ -56,9 +56,9 @@ impl StderrTail {
                 .find(char::is_whitespace)
                 .and_then(|i| text.get(i..))
                 .unwrap_or("");
-            redact(rest)
+            cap_tail(redact(rest))
         } else {
-            redact(&text)
+            cap_tail(redact(&text))
         }
     }
 }
@@ -79,22 +79,47 @@ fn redact(text: &str) -> String {
     out
 }
 
+/// 1 語内のすべての `scheme://` を走査して userinfo を除き、最初の `?` 以降を伏字にする。
+///
+/// 空白なしで複数の URL が並ぶ場合（JSON 等）に備え、各 URL の authority は
+/// `/`・`?`・`#`・次の `://` の手前までとする。
 fn redact_word(word: &str) -> String {
-    let mut w = word.to_string();
-    if let Some(scheme_end) = w.find("://") {
-        let rest_start = scheme_end + 3;
-        let rest = w.get(rest_start..).unwrap_or("");
-        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        if let Some(at) = rest.get(..authority_end).and_then(|a| a.rfind('@')) {
-            let keep = rest.get(at + 1..).unwrap_or("").to_string();
-            w = format!("{}{}", w.get(..rest_start).unwrap_or(""), keep);
+    let mut out = String::with_capacity(word.len());
+    let mut pos = 0;
+    while let Some(rel) = word.get(pos..).and_then(|r| r.find("://")) {
+        let rest_start = pos + rel + 3;
+        let rest = word.get(rest_start..).unwrap_or("");
+        let authority_end = rest
+            .find(['/', '?', '#'])
+            .unwrap_or(rest.len())
+            .min(rest.find("://").unwrap_or(rest.len()));
+        let authority = rest.get(..authority_end).unwrap_or("");
+        out.push_str(word.get(pos..rest_start).unwrap_or(""));
+        match authority.rfind('@') {
+            Some(at) => out.push_str(authority.get(at + 1..).unwrap_or("")),
+            None => out.push_str(authority),
         }
+        pos = rest_start + authority_end;
     }
-    if let Some(q) = w.find('?') {
-        w.truncate(q);
-        w.push_str("?<redacted>");
+    out.push_str(word.get(pos..).unwrap_or(""));
+    if let Some(q) = out.find('?') {
+        out.truncate(q);
+        out.push_str("?<redacted>");
     }
-    w
+    out
+}
+
+/// 伏字化後の文字列が [`STDERR_TAIL_BYTES`] を超えたら、末尾側を UTF-8 境界で残す。
+fn cap_tail(mut s: String) -> String {
+    if s.len() <= STDERR_TAIL_BYTES {
+        return s;
+    }
+    let mut cut = s.len() - STDERR_TAIL_BYTES;
+    while !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    s.drain(..cut);
+    s
 }
 
 #[cfg(test)]
@@ -156,5 +181,27 @@ mod tests {
         let mut t = StderrTail::new();
         t.push(b"first https://h.example/p?token=SECRET123\n");
         assert_eq!(t.redacted(), "first https://h.example/p?<redacted>\n");
+    }
+
+    #[test]
+    fn render3_redacts_every_url_in_one_word() {
+        let mut t = StderrTail::new();
+        t.push(br#"{"from":"https://a.example/","to":"https://user:password@b.example/"}"#);
+        let r = t.redacted();
+        assert!(!r.contains("password"), "{r}");
+        assert!(!r.contains("user:"), "{r}");
+        let mut t = StderrTail::new();
+        t.push(b"x://u:p@a.example,y://q:w@b.example");
+        assert_eq!(t.redacted(), "x://a.example,y://b.example");
+    }
+
+    #[test]
+    fn render3_redacted_output_is_capped_at_8kib() {
+        let mut t = StderrTail::new();
+        t.push("a ? ".repeat(STDERR_TAIL_BYTES / 4).as_bytes());
+        assert!(t.redacted().len() <= STDERR_TAIL_BYTES);
+        let mut t = StderrTail::new();
+        t.push(&vec![0xffu8; STDERR_TAIL_BYTES]);
+        assert!(t.redacted().len() <= STDERR_TAIL_BYTES);
     }
 }

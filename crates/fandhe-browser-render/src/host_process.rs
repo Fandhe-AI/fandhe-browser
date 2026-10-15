@@ -237,12 +237,12 @@ impl Default for HostTimeouts {
 impl HostTimeouts {
     /// `hello` 待ちを変える。
     pub fn with_handshake(mut self, d: Duration) -> Self {
-        self.handshake = d;
+        self.handshake = d.min(MAX_STAGE_TIMEOUT);
         self
     }
     /// `load` の既定を変える。
     pub fn with_load_default(mut self, d: Duration) -> Self {
-        self.load_default = d;
+        self.load_default = d.min(MAX_STAGE_TIMEOUT);
         self
     }
     /// `load` の上限を変える（[`MAX_LOAD_TIMEOUT_MS`] を超える値は丸める）。
@@ -252,22 +252,22 @@ impl HostTimeouts {
     }
     /// `screenshot` を変える。
     pub fn with_screenshot(mut self, d: Duration) -> Self {
-        self.screenshot = d;
+        self.screenshot = d.min(MAX_STAGE_TIMEOUT);
         self
     }
     /// 要素クエリを変える。
     pub fn with_element_query(mut self, d: Duration) -> Self {
-        self.element_query = d;
+        self.element_query = d.min(MAX_STAGE_TIMEOUT);
         self
     }
     /// `shutdown` の猶予を変える。
     pub fn with_shutdown_grace(mut self, d: Duration) -> Self {
-        self.shutdown_grace = d;
+        self.shutdown_grace = d.min(MAX_STAGE_TIMEOUT);
         self
     }
     /// `load` の上乗せを変える。
     pub fn with_load_grace(mut self, d: Duration) -> Self {
-        self.load_grace = d;
+        self.load_grace = d.min(MAX_STAGE_TIMEOUT);
         self
     }
 
@@ -425,6 +425,16 @@ fn request_within_limits(
     param_ok && frame_len <= frame_max
 }
 
+/// 段階タイムアウトの上限（1 時間）。設定値がこれを超えても丸める。
+const MAX_STAGE_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// 現在時刻に `d` を足した期限。`d` は [`MAX_STAGE_TIMEOUT`] に丸め、
+/// 加算がオーバーフローしても panic せず現在時刻（即期限切れ）に倒す。
+fn deadline_after(d: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(d.min(MAX_STAGE_TIMEOUT)).unwrap_or(now)
+}
+
 fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
@@ -551,7 +561,7 @@ impl HostProcess {
     /// `shutdown` 要求 → 猶予 → kill → wait → 一時ディレクトリ削除。何度呼んでもよい。
     pub fn shutdown(&mut self) {
         if let Some(r) = self.running.as_ref() {
-            let deadline = Instant::now() + self.config.timeouts.shutdown_grace;
+            let deadline = deadline_after(self.config.timeouts.shutdown_grace);
             if let Ok(id) = RequestId::new(self.next_id) {
                 self.next_id += 1;
                 if let Ok(bytes) = encode_request(id, &Request::Shutdown)
@@ -587,7 +597,8 @@ impl HostProcess {
         match request {
             Request::Screenshot(_) => (t.screenshot, TimeoutPhase::Screenshot),
             Request::Load(p) => (
-                Duration::from_millis(u64::from(t.load_timeout_ms(p.timeout_ms()))) + t.load_grace,
+                Duration::from_millis(u64::from(t.load_timeout_ms(p.timeout_ms())))
+                    .saturating_add(t.load_grace),
                 TimeoutPhase::Load,
             ),
             Request::Shutdown => (t.shutdown_grace, TimeoutPhase::Shutdown),
@@ -655,7 +666,7 @@ impl HostProcess {
                 }
             });
             let limit = effective_limit(response_frame_limit(method), declared);
-            roundtrip(r, payload, limit, Instant::now() + wait, phase)
+            roundtrip(r, payload, limit, deadline_after(wait), phase)
         };
         let bytes = match outcome {
             Ok(b) => b,
@@ -717,7 +728,7 @@ impl HostProcess {
         }
         // stderr は子の終了で EOF になる。診断に取り込むため少しだけ待つ（上限付き）。
         if let Some(h) = r.stderr_thread.take() {
-            let deadline = Instant::now() + Duration::from_millis(500);
+            let deadline = deadline_after(Duration::from_millis(500));
             while !h.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -867,7 +878,7 @@ impl HostProcess {
     }
 
     fn handshake(&mut self) -> Result<(), HostProcessError> {
-        let deadline = Instant::now() + self.config.timeouts.handshake;
+        let deadline = deadline_after(self.config.timeouts.handshake);
         let outcome = {
             let Some(r) = self.running.as_ref() else {
                 return Err(HostProcessError::Crashed);
@@ -949,6 +960,12 @@ mod tests {
         assert_eq!(t.load_timeout_ms(None), 30_000);
         assert_eq!(t.load_timeout_ms(Some(45_000)), 45_000);
         assert_eq!(t.load_timeout_ms(Some(90_000)), 60_000);
+        let max = HostTimeouts::default()
+            .with_handshake(Duration::MAX)
+            .with_shutdown_grace(Duration::MAX)
+            .with_load_grace(Duration::MAX);
+        assert_eq!(max.handshake, MAX_STAGE_TIMEOUT);
+        let _ = deadline_after(Duration::MAX);
         let over = HostTimeouts::default().with_load_max(Duration::from_secs(600));
         assert_eq!(over.load_max, Duration::from_secs(60));
     }
