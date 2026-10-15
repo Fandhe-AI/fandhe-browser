@@ -51,7 +51,7 @@ impl Handler for FakeHandler {
         self.record("load")?;
         Ok(LoadResult {
             final_url: self.final_url.clone(),
-            status: 200,
+            status: Some(200),
         })
     }
     fn screenshot(&mut self, _p: &ScreenshotParams) -> Result<ScreenshotResult, HandlerError> {

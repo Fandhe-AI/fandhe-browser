@@ -155,10 +155,13 @@
     "LoadResult": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["final_url", "status"],
+      "required": ["final_url"],
       "properties": {
         "final_url": { "type": "string", "maxLength": 2048 },
-        "status": { "type": "integer", "minimum": 100, "maximum": 599 }
+        "status": {
+          "description": "HTTP ステータス。ホストが取得できない場合（Servo 0.6.0 等）はキーごと省略する。ホストは成功を装う値を入れない（REPAIR-3）。",
+          "type": "integer", "minimum": 100, "maximum": 599
+        }
       }
     },
     "ScreenshotParams": {

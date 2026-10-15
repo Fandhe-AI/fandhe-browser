@@ -92,7 +92,10 @@ fn render3_response_fixtures_with_method() {
     let Ok(MethodResult::Load(l)) = r.outcome else {
         panic!("load result expected")
     };
-    assert_eq!((l.final_url(), l.status()), ("https://example.com/", 200));
+    assert_eq!(
+        (l.final_url(), l.status()),
+        ("https://example.com/", Some(200))
+    );
 
     for name in [
         "response-load-unknown-field",
@@ -150,8 +153,16 @@ fn render3_response_fixtures_with_method() {
         Ok(MethodResult::Shutdown(_))
     ));
 
+    // status はホストが取得できない場合に省略される（Servo 0.6.0）。None として受理する。
+    let (m, b, _) = fixture("response-load-no-status");
+    let r = decode_response(&b, m.expect("method")).expect("load-no-status");
+    let Ok(MethodResult::Load(l)) = r.outcome else {
+        panic!("load result expected")
+    };
+    assert_eq!((l.final_url(), l.status()), ("https://example.com/", None));
+
     for name in [
-        "response-load-missing-status",
+        "response-load-status-out-of-range",
         "response-screenshot-jpeg",
         "response-result-and-error",
     ] {
@@ -351,7 +362,8 @@ fn render3_every_fixture_is_classified() {
         "response-visibility-hidden",
         "response-bounding-box-ok",
         "response-shutdown-ok",
-        "response-load-missing-status",
+        "response-load-no-status",
+        "response-load-status-out-of-range",
         "response-screenshot-jpeg",
         "response-result-and-error",
         "response-error-unknown-field",
