@@ -81,7 +81,7 @@ servo-host/
 
 | メソッド | params | result |
 | -------- | ------ | ------ |
-| `load` | `url`, `timeout_ms` | `final_url`, `status` |
+| `load` | `url`, `timeout_ms` | `final_url`, `status?`（Servo 0.6.0 では省略） |
 | `screenshot` | `full_page` | `format:"png"`, `width`, `height`, `data_base64` |
 | `visibility` | `selector` | `visible`, `reason?` |
 | `bounding_box` | `selector` | `x`, `y`, `width`, `height` |
