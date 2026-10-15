@@ -231,11 +231,17 @@ fn t_dump_env_args_cwd() {
     for forced in FORCED_ENV_NAMES {
         assert!(names.contains(*forced), "missing forced {forced}");
     }
-    let allowed: BTreeSet<String> = FORCED_ENV_NAMES
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut allowed: BTreeSet<String> = FORCED_ENV_NAMES
         .iter()
         .chain(PASSTHROUGH_ENV_NAMES)
         .map(|s| s.to_string())
         .collect();
+    // macOS は `env_clear` 後でもプロセス起動時に CoreFoundation が
+    // `__CF_USER_TEXT_ENCODING` を子の環境へ注入する。親から継承した値ではなく
+    // 本 crate の許可リストの漏れでもないため、OS 注入名に限って許容する。
+    #[cfg(target_os = "macos")]
+    allowed.insert("__CF_USER_TEXT_ENCODING".to_string());
     assert_eq!(
         names.difference(&allowed).count(),
         0,
