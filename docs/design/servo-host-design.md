@@ -268,7 +268,7 @@ v1 はホストが自分で fetch する（URL のみ送る）。Cookie・セッ
 
 - cache 対象は `~/.cargo/registry` と `servo-host/target`（`scripts/ci-prune-target.sh` を workspace ルート指定に対応させる）。key は `rust-<os>-servohost-vN-<rustc cachekey>-<hashFiles('servo-host/Cargo.lock')>` とし、ルート `Cargo.lock` と独立にする。
 - 現状 3 OS で約 6.3 GB に、Linux のホスト（`target` 約 8 GB から**推定**で数 GB。要実測）が加わり上限 10 GB に迫る。推奨は v1 では ubuntu のみ cache し、macOS / Windows は main のみ実行・cache なしとして `timeout-minutes` は実測で決める。
-- 所要時間は試作の実測（コールド 8 分 28 秒〜13 分 10 秒、再リンク約 3 分）に基づく**推定**で、CI 上は未計測。macOS / Windows は未計測。計測は `workflow_dispatch` で cache なし / ありを各 1 回行い、`github-actions.md` の所要時間表の形式で記録する。
+- 所要時間は試作の実測（コールド 8 分 28 秒〜13 分 10 秒、再リンク約 3 分）に基づく推定だったが、ubuntu の CI 上は実測済み（#1029）。cache なしの main は 49 分 10 秒、cache ありは 17〜22 分で、`timeout-minutes` は 75 分に確定した。実測値は `github-actions.md` の所要時間表を参照する。macOS / Windows は未計測。
 
 ## 7. 未検証の点と検証計画
 

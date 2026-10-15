@@ -73,7 +73,7 @@ GitHub Actions の cache はリポジトリ単位で上限があり、超える�
 - PR が保存した cache はその PR（`refs/pull/<n>/merge`）からしか読めず、main の cache と同内容の重複になって main の cache を追い出す。PR は main の cache を読むだけにする
 - トレードオフ: `Cargo.lock` を変える PR は、2 回目以降の push でも main の旧 lock の cache から部分復元し、変わった依存だけ毎回ビルドし直す（2026-10-11 の実測では依存が同じ PR の部分復元と exact hit で依存の再コンパイルは 0 件・所要時間差は誤差の範囲）
 - `ci.yml` の concurrency は main でも `cancel-in-progress: true` のため、取り消された main の run は保存しない。新しい key の cache は、その後最初に完走した main の run が保存する
-- 例外: Servo ホストの cache（`servo-host-ubuntu`。種別 `servohost`）だけは、別 workspace のため `hashFiles('servo-host/Cargo.lock')`（単一ファイルで glob の問題は無い）で hash し、path は `servo-host/target`。ubuntu のみ・保存は main のみ・保存前に `scripts/ci-prune-target.sh --workspace-root servo-host` を呼ぶ。release の成果物は `RUNNER_TEMP` に出して cache しない。圧縮後サイズと 1 世代の合計（10GB の余裕）はマージ後に main で計測して追記する（未計測）
+- 例外: Servo ホストの cache（`servo-host-ubuntu`。種別 `servohost`）だけは、別 workspace のため `hashFiles('servo-host/Cargo.lock')`（単一ファイルで glob の問題は無い）で hash し、path は `servo-host/target`。ubuntu のみ・保存は main のみ・保存前に `scripts/ci-prune-target.sh --workspace-root servo-host` を呼ぶ。release の成果物は `RUNNER_TEMP` に出して cache しない。圧縮後サイズは 3,112,680,683 B（約 3.1GB。run 38779636655・2026-10-15）。servohost を足した後の 1 世代の合計は 14 件・10,202,200,444 B（約 10.2GB。2026-10-15 に cache 一覧 API で確認）で、上限 10GB にほぼ達している（足す前は約 7.1GB）。同日の時点で現行の key 種別 14 件はすべてそろい、追い出しによる miss は見つかっていない。ただし余裕が無く、cache 種別の追加や key 切り替えで追い出しが始まりうるため、対策（servohost を registry のみにする・`servo-host/target` をさらに prune する等）はオーナー判断の事項とする（#1029）
 - 例外: `rust-lint` の cargo-deny 導入 cache（約 5MB・版のみの key で作り直しが起きない）は `actions/cache` のままでよい
 
 ### サイズ削減
@@ -138,8 +138,8 @@ gh api repos/Fandhe-AI/fandhe-browser/actions/runs/<run-id>/jobs --paginate   # 
 
 | ワークフロー | トリガー | 実測 | 備考 |
 | ------------ | -------- | ---- | ---- |
-| `ci.yml`（PR） | pull_request | 中央値 11.0 分・最大 12.5 分（20 件） | `servo=true` の PR は `servo-host-ubuntu`（Servo のコールドビルド。実測は #995 の PR で追記）が最長になり約 11 分を超える。 最長は `rust-features-ubuntu` 約 12 分（clippy と test を 14 ステップで直列実行）、次いで `rust-test-ubuntu` 約 7 分。docs-only は `changes` + `lint-docs` のみで約 30 秒 |
-| `ci.yml`（main push） | push | 中央値 22.6 分・最大 30.9 分（6 件） | 3 OS 実行。分割前は Windows の `rust-features-windows` が最長（main push で cache なし 31.8 分、cache ありで 16.1 分・17.2 分、`workflow_dispatch` で 15.2 分）。オーナー判断（2026-10-12）で 15 分以内にするため `rust-features-windows-{default,engines,boa}` の 3 ジョブへ分割した（cache だけでは 15〜17 分で、cache が外れると約 32 分に戻るため）。分割の根拠は cache 導入前の試作での計測（cache なしで 7.9 分・8.5 分・6.9 分。run 38158384892）。分割後の cache ありの所要時間は、main push の 2 件で `default` 6.6 分・8.7 分、`engines` 5.3 分・4.3 分、`boa` 4.1 分・3.2 分（run 38201432465・38246355255。2026-10-12）で、15 分以内に収まった |
+| `ci.yml`（PR） | pull_request | 中央値 11.0 分・最大 12.5 分（20 件） | `servo=true` の PR は `servo-host-ubuntu`（Servo のコールドビルド。cache ありで約 2.5 分〔run 38803361812 など〕、cache なしで約 30 分〔run 38748905100〕。#1029）は cache なしのときに最長になる。 最長は `rust-features-ubuntu` 約 12 分（clippy と test を 14 ステップで直列実行）、次いで `rust-test-ubuntu` 約 7 分。docs-only は `changes` + `lint-docs` のみで約 30 秒 |
+| `ci.yml`（main push） | push | 中央値 22.6 分・最大 30.9 分（6 件） | 3 OS 実行。`servo-host-ubuntu` は release ビルド（毎回コールドで約 15 分）を含み、cache ありで 17〜22 分（run 38794320825・38805174165）、cache なしで 49 分（run 38779636655。timeout 75 分の根拠。#1029）。分割前は Windows の `rust-features-windows` が最長（main push で cache なし 31.8 分、cache ありで 16.1 分・17.2 分、`workflow_dispatch` で 15.2 分）。オーナー判断（2026-10-12）で 15 分以内にするため `rust-features-windows-{default,engines,boa}` の 3 ジョブへ分割した（cache だけでは 15〜17 分で、cache が外れると約 32 分に戻るため）。分割の根拠は cache 導入前の試作での計測（cache なしで 7.9 分・8.5 分・6.9 分。run 38158384892）。分割後の cache ありの所要時間は、main push の 2 件で `default` 6.6 分・8.7 分、`engines` 5.3 分・4.3 分、`boa` 4.1 分・3.2 分（run 38201432465・38246355255。2026-10-12）で、15 分以内に収まった |
 | `ai-review.yml` | pull_request | 約 1〜2 分 | |
 | `update-external.yml` | schedule・dispatch | 約 2 分 | 日次 |
 | `bench-competitor.yml` | schedule・dispatch | 約 2〜3 分 | 週次・3 OS。対象バイナリ未配線のため skipped が多い |
