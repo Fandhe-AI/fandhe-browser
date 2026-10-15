@@ -4,7 +4,9 @@
 # 別の workspace・別の Cargo.lock を持つ単一 package として置く（#915・#935。
 # docs/design/servo-host-design.md §1.1〜§1.3）。ルート Cargo.toml は
 # `exclude = ["servo-host"]` で本ディレクトリを物理的に除外している。
-# 現時点（TASK-38・H0 #985）は足場のみで依存を持たない。Servo の追加は #988、
+# Servo は #988（TASK-38）で `=0.6.0` 完全固定・default-features 無効で追加した
+# （`baked-in-resources` は起動に必須。オーナー承認 2026-10-15）。`dpi`・`url`・画像 crate
+# は未承認のため直接依存にせず、Servo の再エクスポート（`ServoUrl` 等）を使う。
 # stdio サーバーは #993 で行う。toolchain は親ディレクトリの
 # rust-toolchain.toml を rustup が探索して使う（ここにはコピーを置かない）。
 
@@ -18,6 +20,9 @@ publish = false
 [[bin]]
 name = "fandhe-browser-servo-host"
 path = "src/main.rs"
+
+[dependencies]
+servo = { version = "=0.6.0", default-features = false, features = ["baked-in-resources"] }
 
 # 本体とは独立した workspace ルートであることを宣言する（空テーブル）。
 [workspace]
