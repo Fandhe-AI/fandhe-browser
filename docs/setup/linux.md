@@ -20,7 +20,7 @@ Servo ホスト（`servo-host/`・別 workspace）を Linux x86_64 でビルド�
 | `clang` / libclang | 21.1.8（`libclang1-21`） | 導入済みでビルド成功 |
 | `cmake` | 4.2.3 | 導入済みでビルド成功 |
 | `pkg-config` | 導入済み | 導入済みでビルド成功 |
-| apt パッケージ | `libfontconfig1-dev`・`libfreetype-dev`・`libgl1-mesa-dev`・`libx11-dev`・`libssl-dev` | 導入済みでビルド成功 |
+| apt パッケージ | `libfontconfig1-dev`・`libfreetype-dev`・`libgl1-mesa-dev`・`libx11-dev`・`libssl-dev`・`llvm`（llvm-objdump。mozjs_sys が要求） | 導入済みでビルド成功 |
 
 - `mozjs_sys` は C++ のソースからビルドされます（`jsapi.o` 等をビルドしたことを確認）。ビルドには
   crates.io への接続が要ります。
