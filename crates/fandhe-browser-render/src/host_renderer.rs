@@ -18,7 +18,8 @@
 //!   本モジュールは base64 の出力サイズ（確保前）と PNG シグネチャを追加で検査する。期待と違う
 //!   結果 variant・不正な画像は [`RenderError::ProtocolMismatch`] にし、成功を装わない。
 //! - `load` の送信前に URL の到達先を core の [`check_network_target_url`] で検査する
-//!   （scheme・IP リテラル・`localhost`）。ホストが返した `final_url` も同じ検査を通す。
+//!   （scheme・IP リテラル・`localhost`）。ホストが返した `final_url`（クラッシュ後の再ロード分を含む）も同じ検査を通し、userinfo を含む
+//!   URL は拒否する。
 //!   これは Servo 内部のリダイレクトやサブリソース取得の部分的な緩和にすぎず、DNS 名が
 //!   プライベート IP に解決される場合・DNS リバインディングは防げない（設計 §2.5・§13 の
 //!   オーナー判断待ち）。
@@ -128,6 +129,9 @@ impl HostRenderer {
     }
 
     /// 現在のページに対する描画系要求を送る共通経路。
+    ///
+    /// クラッシュ後の再ロードが起きた場合、その `final_url` も `load` と同じ検査にかける。
+    /// 不許可なら描画要求を送らず、現在のページを無効化する（以降は `PageNotLoaded`）。
     fn call(&self, request: Request) -> Result<MethodResult, RenderError> {
         let mut inner = self.lock()?;
         let Inner {
@@ -136,10 +140,40 @@ impl HostRenderer {
             current,
         } = &mut *inner;
         let page = current.as_ref().ok_or(RenderError::PageNotLoaded)?;
-        process
-            .call_on_page(page, *nav_generation, request)
-            .map_err(map_host_error)
+        let allow = self.allow_private_network_access;
+        let mut rejected = false;
+        let result = process.call_on_page_checked(page, *nav_generation, request, |loaded| {
+            if validate_final_url(loaded.final_url(), allow).is_err() {
+                rejected = true;
+                // 送信中止の目印。呼び出し側は `rejected` を見て写像する。
+                return Err(HostProcessError::InvalidRequest);
+            }
+            Ok(())
+        });
+        if rejected {
+            *current = None;
+            return Err(internal("final url rejected"));
+        }
+        result.map_err(map_host_error)
     }
+}
+
+/// ホストが返した `final_url` を検査して正規化済み文字列を返す。
+///
+/// core の [`check_network_target_url`] に加え、userinfo（`user:pass@host`）を含む URL は
+/// 拒否する（untrusted な応答の資格情報を `PageLoad` へ載せない。core の fetch は除去するが、
+/// 本 crate は URL パーサーを持たないため拒否で代える）。
+fn validate_final_url(raw: &str, allow_private: bool) -> Result<String, ()> {
+    let url = check_network_target_url(raw, allow_private).map_err(|_| ())?;
+    let after_scheme = url.split_once("://").map(|(_, r)| r).ok_or(())?;
+    let authority = after_scheme
+        .split(['/', '?', '#', '\\'])
+        .next()
+        .unwrap_or_default();
+    if authority.contains('@') {
+        return Err(());
+    }
+    Ok(url)
 }
 
 impl fmt::Debug for HostRenderer {
@@ -198,6 +232,16 @@ fn selector_of(element: &ElementRef) -> Result<&str, RenderError> {
 
 impl Renderer for HostRenderer {
     fn load(&self, page: &PageRef) -> Result<PageLoad, RenderError> {
+        // 失敗経路（入力検証の拒否を含む）のあとの描画が前ページを返さないよう、検証より前に
+        // ロックを取って現在のページを捨てる（RenderGate と同じ fail-closed）。
+        let mut inner = self.lock()?;
+        inner.current = None;
+        inner.nav_generation = inner
+            .nav_generation
+            .checked_add(1)
+            .ok_or_else(|| internal("navigation generation overflow"))?;
+        let generation = inner.nav_generation;
+
         if page.url() == "about:blank" {
             return Err(RenderError::PageNotLoaded);
         }
@@ -206,22 +250,13 @@ impl Renderer for HostRenderer {
         let params = LoadParams::new(&url, self.load_timeout_ms)
             .map_err(|_| internal("invalid load parameters"))?;
 
-        let mut inner = self.lock()?;
-        // 失敗した load のあとの描画が前ページを返さないよう、先に捨てる（RenderGate と同じ fail-closed）。
-        inner.current = None;
-        inner.nav_generation = inner
-            .nav_generation
-            .checked_add(1)
-            .ok_or_else(|| internal("navigation generation overflow"))?;
-        let generation = inner.nav_generation;
         let result = inner
             .process
             .load(&params, generation)
             .map_err(map_host_error)?;
         // ホストが返した最終 URL も同じポリシーで再検査する（Servo 内部リダイレクトの部分的な緩和）。
-        let final_url =
-            check_network_target_url(result.final_url(), self.allow_private_network_access)
-                .map_err(|_| internal("final url rejected"))?;
+        let final_url = validate_final_url(result.final_url(), self.allow_private_network_access)
+            .map_err(|_| internal("final url rejected"))?;
         inner.current = Some(params);
         Ok(PageLoad::new(final_url))
     }
@@ -344,5 +379,46 @@ mod tests {
         let s = format!("{r:?}");
         assert!(s.contains("nav_generation"), "{s}");
         assert!(!s.contains("http"), "{s}");
+    }
+
+    /// SEC: ホストの `final_url` は userinfo を含むと拒否し、不許可アドレスも拒否する。
+    #[test]
+    fn render_3_final_url_rejects_userinfo_and_private() {
+        assert_eq!(
+            validate_final_url("https://example.com/a", false),
+            Ok("https://example.com/a".to_owned())
+        );
+        for bad in [
+            "https://user:pw@example.com/",
+            "https://user@example.com/",
+            "http://127.0.0.1/",
+            "file:///etc/passwd",
+        ] {
+            assert_eq!(validate_final_url(bad, false), Err(()), "{bad}");
+        }
+        // userinfo 風の文字列がパス・クエリにあるだけなら許可する。
+        assert!(validate_final_url("https://example.com/p?x=a@b", false).is_ok());
+    }
+
+    /// 入力検証で拒否された `load` も現在のページを捨て、以降の描画系は `PageNotLoaded` になる。
+    #[test]
+    fn render_3_rejected_load_clears_current_page() {
+        let bin = crate::host_process::resolve_host_binary(
+            std::env::current_exe().ok().as_deref(),
+            None,
+            None,
+        )
+        .expect("binary");
+        let r = HostRenderer::new(HostRendererConfig::new(HostProcessConfig::new(bin)));
+        for url in ["about:blank", "http://127.0.0.1/", "file:///etc/passwd"] {
+            r.inner.lock().expect("lock").current =
+                Some(LoadParams::new("https://example.com/", None).expect("params"));
+            assert!(r.load(&PageRef::new(url)).is_err(), "{url}");
+            assert!(r.inner.lock().expect("lock").current.is_none(), "{url}");
+            assert!(matches!(
+                r.element_visibility(&ElementRef::Selector("a".to_owned())),
+                Err(RenderError::PageNotLoaded)
+            ));
+        }
     }
 }

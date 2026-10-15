@@ -542,6 +542,21 @@ impl HostProcess {
         nav_generation: u64,
         request: Request,
     ) -> Result<MethodResult, HostProcessError> {
+        self.call_on_page_checked(page, nav_generation, request, |_| Ok(()))
+    }
+
+    /// [`Self::call_on_page`] に、再ロードの結果を検査するフックを足したもの。
+    ///
+    /// 再ロードが起きたときだけ `on_reload` が呼ばれ、`Err` なら描画要求を送らずその
+    /// エラーを返す（クラッシュ後の再ロードでリダイレクト先が変わっても、呼び出し側が
+    /// `final_url` を再検査できるようにする。SSRF 緩和。#235）。
+    pub fn call_on_page_checked(
+        &mut self,
+        page: &LoadParams,
+        nav_generation: u64,
+        request: Request,
+        on_reload: impl FnOnce(&LoadResult) -> Result<(), HostProcessError>,
+    ) -> Result<MethodResult, HostProcessError> {
         if matches!(request, Request::Load(_) | Request::Shutdown) {
             return Err(HostProcessError::InvalidRequest);
         }
@@ -552,7 +567,12 @@ impl HostProcess {
             nav_generation,
             self.host_generation,
         ) {
-            self.load_inner(page, nav_generation)?;
+            let loaded = self.load_inner(page, nav_generation)?;
+            if let Err(e) = on_reload(&loaded) {
+                // 不許可のページがホストに載ったままにならないよう、記録を捨てて次回は再ロードさせる。
+                self.loaded = None;
+                return Err(e);
+            }
         }
         let (wait, phase) = self.wait_for(&request);
         self.exchange(&request, wait, phase)
