@@ -105,6 +105,8 @@ impl Server {
                             held.push(conn);
                             continue;
                         }
+                        // 無送信の接続で read が無期限に塞がり停止通知を確認できなくなるのを防ぐ
+                        let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
                         let mut buf = [0u8; 4096];
                         let n = conn.read(&mut buf).unwrap_or(0);
                         let head = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[]));
