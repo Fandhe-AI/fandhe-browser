@@ -3,7 +3,7 @@
 //! 呼び出し元は `main` の `--stdio`（本体 `fandhe-browser-render` の `host_process` が固定引数
 //! `HOST_ARGS` で起動する）。実処理（load・screenshot・visibility・bounding_box）は [`Handler`] の
 //! 向こうに置き、本モジュールは Servo に依存しない（`servo::*` を import しない）。後続の
-//! `page::ServoHandler`（load は #231、screenshot は #232、visibility は #233 で実装済み。#234 が残りを実装する）を `main` が使う。
+//! `page::ServoHandler`（load は #231、screenshot は #232、visibility は #233、bounding_box は #234 で実装済み）を `main` が使う。
 //!
 //! 契約の正本は `docs/design/render-host-protocol.schema.json` と
 //! `crates/fandhe-browser-render/tests/fixtures/protocol/`（本体側とは型を共有しない）。
@@ -153,7 +153,7 @@ pub(crate) struct VisibilityResult {
     pub reason: Option<&'static str>,
 }
 
-/// `bounding_box` の結果。
+/// `bounding_box` の結果（ビューポート相対の CSS px。有限で width・height は 0 以上。#234）。
 pub(crate) struct BoundingBoxResult {
     pub x: f64,
     pub y: f64,
@@ -173,7 +173,7 @@ pub(crate) trait Handler {
 
 /// 全メソッドを `unsupported` で拒否するスタブ（サーバーループの単体テスト専用）。
 ///
-/// 将来仕様: 実ハンドラは `page::ServoHandler`（#234 の bounding_box は未実装）。
+/// 将来仕様: 実ハンドラは `page::ServoHandler`（全メソッド実装済み）。
 /// Servo を使うハンドラに置き換える（`RENDER-3`・`RENDER-4`）。それまで成功を装わず、
 /// `hello.capabilities` にも載せない（`REPAIR-3`・`SEC-2`）。
 #[cfg(test)]

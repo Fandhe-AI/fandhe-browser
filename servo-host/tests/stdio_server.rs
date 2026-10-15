@@ -107,7 +107,13 @@ fn hello_then_unsupported_then_shutdown() {
     assert_eq!(hello["event"], "hello");
     assert_eq!(
         hello["data"]["capabilities"],
-        serde_json::json!(["load", "screenshot", "visibility", "shutdown"])
+        serde_json::json!([
+            "load",
+            "screenshot",
+            "visibility",
+            "bounding_box",
+            "shutdown"
+        ])
     );
 
     h.send(r#"{"v":1,"id":1,"method":"evaluate","params":{"script":"1"}}"#);
@@ -157,6 +163,15 @@ const VIS_BODY: &str = "<html><head><title>vis</title></head><body style=\"margi
 <div id=\"zero\" style=\"width:0;height:0\"></div>\
 <div id=\"off\" style=\"position:absolute;top:-1000px;width:50px;height:50px\">d</div>\
 <div data-k=\"x'y\" style=\"width:10px;height:10px\">e</div>\
+</body></html>";
+
+/// 境界ボックス用の fixture 本文（全要素が絶対配置で、期待矩形が既知）。
+const BOX_BODY: &str = "<html><head><title>box</title></head><body style=\"margin:0\">\
+<div id=\"abs\" style=\"position:absolute;left:10px;top:20px;width:30px;height:40px\"></div>\
+<div id=\"frac\" style=\"position:absolute;left:5.5px;top:7.25px;width:12.5px;height:3.75px\"></div>\
+<div id=\"off\" style=\"position:absolute;left:0;top:-1000px;width:50px;height:50px\"></div>\
+<div id=\"none\" style=\"display:none\"></div>\
+<div data-k=\"x'y\" style=\"position:absolute;left:100px;top:200px;width:60px;height:70px\"></div>\
 </body></html>";
 
 /// スクリーンショット用の fixture 本文（上半分が赤・下半分が青）。
@@ -431,6 +446,105 @@ fn visibility_reports_known_states_after_load() {
     ));
     let _ = h.recv();
     h.send(&vis(31, r##""#shown""##));
+    assert_eq!(
+        h.recv(),
+        r#"{"v":1,"id":31,"error":{"kind":"not_loaded","message":"No page is loaded."}}"#
+    );
+
+    h.send(r#"{"v":1,"id":32,"method":"shutdown"}"#);
+    assert_eq!(h.recv(), r#"{"v":1,"id":32,"result":{}}"#);
+    let (code, rest, stderr) = h.finish();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(rest, 0, "stdout must contain frames only");
+    assert!(
+        !stderr.contains("data-k") && !stderr.contains("missing") && !stderr.contains("127.0.0.1"),
+        "{stderr}"
+    );
+
+    let _ = stop.send(());
+    let _ = srv.join();
+}
+
+/// RENDER-3（TASK-38.5・#234）: 既知のレイアウトの要素に対し正しい境界ボックスを返す。
+/// 描画されない要素は (0,0,0,0)、引用符を含むセレクタはデータとして解釈され、不正・制御文字は
+/// invalid_params、一致なしは not_found。
+#[test]
+fn bounding_box_reports_known_layout_after_load() {
+    let (port, srv, stop) = serve_http_with(BOX_BODY, false);
+    let closed_port = {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").port()
+    };
+    let mut h = spawn(&["--stdio"]);
+    let _hello = h.recv();
+
+    let req = |id: u64, selector_json: &str| {
+        format!(
+            r#"{{"v":1,"id":{id},"method":"bounding_box","params":{{"selector":{selector_json}}}}}"#
+        )
+    };
+    h.send(&req(1, r##""#abs""##));
+    assert_eq!(
+        h.recv(),
+        r#"{"v":1,"id":1,"error":{"kind":"not_loaded","message":"No page is loaded."}}"#
+    );
+
+    h.send(&load_req(
+        2,
+        &format!("http://127.0.0.1:{port}/box"),
+        20_000,
+    ));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert!(r["result"].is_object(), "{r}");
+
+    let cases: [(&str, [f64; 4]); 5] = [
+        (r##""#abs""##, [10.0, 20.0, 30.0, 40.0]),
+        (r##""#frac""##, [5.5, 7.25, 12.5, 3.75]),
+        (r##""#off""##, [0.0, -1000.0, 50.0, 50.0]),
+        (r##""#none""##, [0.0, 0.0, 0.0, 0.0]),
+        (r#""div[data-k=\"x'y\"]""#, [100.0, 200.0, 60.0, 70.0]),
+    ];
+    for (i, (sel, expected)) in cases.iter().enumerate() {
+        let id = 10 + i as u64;
+        h.send(&req(id, sel));
+        let v: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+        assert!(v.get("error").is_none(), "selector {sel}: {v}");
+        let result = v["result"].as_object().expect("result object");
+        let mut keys: Vec<&str> = result.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["height", "width", "x", "y"], "selector {sel}");
+        let got = [
+            result["x"].as_f64().unwrap(),
+            result["y"].as_f64().unwrap(),
+            result["width"].as_f64().unwrap(),
+            result["height"].as_f64().unwrap(),
+        ];
+        assert_eq!(&got, expected, "selector {sel}");
+    }
+    h.send(&req(20, r##""#missing""##));
+    assert_eq!(
+        h.recv(),
+        r#"{"v":1,"id":20,"error":{"kind":"not_found","message":"No element matches the selector."}}"#
+    );
+    for (id, sel) in [(21, r#""[[""#), (22, r#""a\u0001""#)] {
+        h.send(&req(id, sel));
+        assert_eq!(
+            h.recv(),
+            format!(
+                r#"{{"v":1,"id":{id},"error":{{"kind":"invalid_params","message":"Invalid parameters."}}}}"#
+            ),
+            "selector {sel}"
+        );
+    }
+
+    // load 失敗後は前ページの結果を返さない。
+    h.send(&load_req(
+        30,
+        &format!("http://127.0.0.1:{closed_port}/"),
+        20_000,
+    ));
+    let _ = h.recv();
+    h.send(&req(31, r##""#abs""##));
     assert_eq!(
         h.recv(),
         r#"{"v":1,"id":31,"error":{"kind":"not_loaded","message":"No page is loaded."}}"#
