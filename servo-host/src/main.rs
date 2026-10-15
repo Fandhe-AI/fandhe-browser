@@ -8,24 +8,28 @@
 //! - `--selftest`: Servo の初期化・小さな `data:` ページの読み込み完了・終了までを行い、
 //!   成功時のみ終了コード 0 を返す（RENDER-3・#988。設計 §1.4・§2.6・§2.7）。
 //!   ネットワークへは出ない。呼び出し元は開発者と CI のみ。
-//! - `--stdio`: 本体 render crate から起動される stdio サーバー（#993。`server`）。今は全メソッドを
-//!   `unsupported` で拒否するスタブハンドラで動く（成功を装わない。REPAIR-3）。
+//! - `--stdio`: 本体 render crate から起動される stdio サーバー（#993。`server`）。`load` は
+//!   `page::ServoHandler` で実装済み（#231）。screenshot・visibility・bounding_box は未実装で
+//!   `unsupported` を返す（成功を装わない。REPAIR-3）。
 //! - それ以外: 標準エラーに示し、非ゼロで終了する（固定の許可リスト。SEC-2）。
 //!
 //! Servo と描画コンテキストの生成・破棄は `engine` が担う（RENDER-3・#230）。
 //!
-//! 将来仕様: WebView・読み込み（#231）、スクリーンショット（#232）、可視性・境界ボックス
-//! （RENDER-4。#233・#234）のハンドラを実装して `--stdio` のスタブと差し替える。
+//! WebView の生成・読み込み・フレーム待機は `page` が担う（RENDER-3・RENDER-4・#231）。
+//!
+//! 将来仕様: スクリーンショット（#232）、可視性・境界ボックス（RENDER-4。#233・#234）を
+//! `page::ServoHandler` に実装する。
 
 mod engine;
+mod page;
 mod server;
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use engine::{Engine, EngineError};
-use server::{ServeOutcome, UnimplementedHandler};
-use servo::{LoadStatus, ServoUrl, WebViewBuilder};
+use server::ServeOutcome;
+use servo::ServoUrl;
 
 /// ページ読み込み完了を待つ上限。超過は失敗として扱い、成功を装わない。
 const SELFTEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -69,10 +73,10 @@ fn main() -> ExitCode {
 /// stdio サーバーを標準入出力で動かし、終了理由を終了コードへ対応づける。
 ///
 /// stdout はフレーム専用（`println!` 等を stdio 経路に置かない）。ログは stderr のみ。
-/// #231 への申し送り: `Engine`（Servo）は hello の送信後に作ること（ハンドシェイクの 10 秒以内に
+/// `Engine`（Servo）は hello の送信後、最初の `load` で作る（ハンドシェイクの 10 秒以内に
 /// hello を出すため）。Servo 自身が stdout へ書き出すリスクは設計 §2.1 を参照。
 fn run_stdio() -> ExitCode {
-    let mut handler = UnimplementedHandler;
+    let mut handler = page::ServoHandler::new();
     let outcome = server::serve(
         std::io::stdin().lock(),
         std::io::stdout().lock(),
@@ -89,27 +93,14 @@ fn run_stdio() -> ExitCode {
 /// Servo を生成して `data:` ページの読み込み完了を待ち、破棄と解放を確かめて所要時間を返す。
 ///
 /// 失敗（生成・URL 解析・タイムアウト・解放漏れ・二重生成の許容）は `Err` に倒す。
-/// WebView の生成と読み込み待ちは #231 で `page` へ移すまでここに置く。
+/// WebView の生成と読み込み待ちは `page::navigate` を使う。
 fn selftest() -> Result<Duration, String> {
     let engine = Engine::new().map_err(|e| e.to_string())?;
     let weak_context = engine.context_weak();
-    let url = ServoUrl::parse(SELFTEST_URL)
-        .map_err(|e| format!("invalid selftest url: {e}"))?
-        .into_url();
-    let webview = WebViewBuilder::new(engine.servo(), engine.rendering_context())
-        .url(url)
-        .build();
-
+    let url = ServoUrl::parse(SELFTEST_URL).map_err(|e| format!("invalid selftest url: {e}"))?;
     let start = Instant::now();
-    while webview.load_status() != LoadStatus::Complete {
-        if start.elapsed() > SELFTEST_TIMEOUT {
-            return Err(format!(
-                "page load did not complete within {SELFTEST_TIMEOUT:?}"
-            ));
-        }
-        engine.servo().spin_event_loop();
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    let webview = page::navigate(&engine, url, start + SELFTEST_TIMEOUT)
+        .map_err(|e| format!("page load did not complete within {SELFTEST_TIMEOUT:?}: {e:?}"))?;
     let elapsed = start.elapsed();
 
     // WebView を先に解放してから Engine を破棄する（Servo の Drop が終了を待つ）。

@@ -376,7 +376,7 @@ impl Request {
 #[non_exhaustive]
 pub struct LoadResult {
     final_url: String,
-    status: u16,
+    status: Option<u16>,
 }
 
 impl LoadResult {
@@ -385,8 +385,8 @@ impl LoadResult {
         &self.final_url
     }
 
-    /// HTTP ステータス（100..=599）。
-    pub fn status(&self) -> u16 {
+    /// HTTP ステータス（100..=599）。ホストが取得できない場合は `None`（応答に `status` キーが無い）。
+    pub fn status(&self) -> Option<u16> {
         self.status
     }
 }
@@ -701,11 +701,18 @@ fn parse_result(v: &Value, method: Method) -> Result<MethodResult, ProtocolError
     match method {
         Method::Load => {
             let final_url = str_field(obj, "final_url", MAX_URL_BYTES, "invalid final_url")?;
-            let status = uint_field(obj, "status", "invalid status")?;
-            let status = u16::try_from(status)
-                .ok()
-                .filter(|s| (100..=599).contains(s))
-                .ok_or(bad("status out of range"))?;
+            let status = match obj.get("status") {
+                None => None,
+                Some(_) => {
+                    let raw = uint_field(obj, "status", "invalid status")?;
+                    Some(
+                        u16::try_from(raw)
+                            .ok()
+                            .filter(|s| (100..=599).contains(s))
+                            .ok_or(bad("status out of range"))?,
+                    )
+                }
+            };
             Ok(MethodResult::Load(LoadResult {
                 final_url: final_url.to_owned(),
                 status,

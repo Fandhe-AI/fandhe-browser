@@ -17,13 +17,9 @@ use super::{
 
 /// `load` のパラメータ。UA・ヘッダ等の識別面を持たない（`SEC-2`）。
 pub(crate) struct LoadParams {
-    /// 検証済みの http / https URL（`ServoUrl` での再解析は #231 のハンドラ側）。
-    // Handler 実装（#231）が読むまで未使用。
-    #[allow(dead_code)]
+    /// 検証済みの http / https URL（`page` のハンドラが `ServoUrl` で再解析・再検証する）。
     pub url: String,
     /// 読み込みの待機上限（省略時は既定 30 秒を適用済み）。
-    // Handler 実装（#231）が読むまで未使用。
-    #[allow(dead_code)]
     pub timeout: Duration,
 }
 
@@ -183,7 +179,7 @@ fn as_uint(v: &Value, max: u64) -> Option<u64> {
 ///
 /// 残存リスク: プライベート IP の扱いは本体側（#235）、Servo 内部のリダイレクトと
 /// サブリソースは #1003（判断待ち）で、ここでは検証しない（SSRF）。
-fn is_valid_url(url: &str) -> bool {
+pub(crate) fn is_valid_url(url: &str) -> bool {
     if url.is_empty() || url.len() > MAX_URL_BYTES {
         return false;
     }

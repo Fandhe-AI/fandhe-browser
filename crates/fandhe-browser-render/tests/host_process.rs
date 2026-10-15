@@ -53,7 +53,7 @@ fn t_ok_roundtrip() {
     assert_eq!(h.host_generation(), 0);
     let r = h.load(&page(), 1).expect("load");
     assert_eq!(r.final_url(), "https://example.com/");
-    assert_eq!(r.status(), 200);
+    assert_eq!(r.status(), Some(200));
     assert_eq!(h.host_generation(), 1);
     assert_eq!(h.hello().expect("hello").host_version, "0.0.0");
     match h.call_on_page(&page(), 1, shot()).expect("shot") {

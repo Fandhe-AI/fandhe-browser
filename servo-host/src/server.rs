@@ -3,7 +3,7 @@
 //! 呼び出し元は `main` の `--stdio`（本体 `fandhe-browser-render` の `host_process` が固定引数
 //! `HOST_ARGS` で起動する）。実処理（load・screenshot・visibility・bounding_box）は [`Handler`] の
 //! 向こうに置き、本モジュールは Servo に依存しない（`servo::*` を import しない）。後続の
-//! #231〜#234 が Servo を使うハンドラを実装し、`main` の `UnimplementedHandler` と差し替える。
+//! `page::ServoHandler`（load は #231 で実装済み。#232〜#234 が残りを実装する）を `main` が使う。
 //!
 //! 契約の正本は `docs/design/render-host-protocol.schema.json` と
 //! `crates/fandhe-browser-render/tests/fixtures/protocol/`（本体側とは型を共有しない）。
@@ -21,7 +21,9 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use request::{LoadParams, Request, ScreenshotParams, SelectorParams, parse_request};
+pub(crate) use request::is_valid_url;
+pub(crate) use request::{LoadParams, ScreenshotParams, SelectorParams};
+use request::{Request, parse_request};
 
 /// 要求フレームの上限（バイト）。長さ接頭辞の段階で確保前に検証する。
 pub(crate) const MAX_REQUEST_FRAME_BYTES: usize = 65_536;
@@ -85,14 +87,12 @@ pub(crate) enum ErrorKind {
     InvalidRequest,
     InvalidParams,
     Unsupported,
-    // 以下 4 種は Handler 実装（#231〜#234）が返すまで本体コードから構築されない。
+    // `NotLoaded`・`NotFound` は Handler 実装（#232〜#234）が返すまで本体コードから構築されない。
     #[allow(dead_code)]
     NotLoaded,
     #[allow(dead_code)]
     NotFound,
-    #[allow(dead_code)]
     Timeout,
-    #[allow(dead_code)]
     LoadFailed,
     Internal,
 }
@@ -133,7 +133,9 @@ pub(crate) struct HandlerError(pub ErrorKind);
 /// `load` の結果。
 pub(crate) struct LoadResult {
     pub final_url: String,
-    pub status: u16,
+    /// HTTP ステータス。取得できない場合は `None` で、応答に `status` キーを出さない
+    /// （固定値で成功を装わない。`REPAIR-3`・`REPAIR-4`）。
+    pub status: Option<u16>,
 }
 
 /// `screenshot` の結果（`format` は常に `png` でサーバーが付ける。PNG と base64 の生成は #232）。
@@ -167,13 +169,15 @@ pub(crate) trait Handler {
     fn bounding_box(&mut self, p: &SelectorParams) -> Result<BoundingBoxResult, HandlerError>;
 }
 
-/// 全メソッドを `unsupported` で拒否するスタブ。
+/// 全メソッドを `unsupported` で拒否するスタブ（サーバーループの単体テスト専用）。
 ///
-/// 将来仕様: #231（load）・#232（screenshot）・#233（visibility）・#234（bounding_box）で
+/// 将来仕様: #232（screenshot）・#233（visibility）・#234（bounding_box）で
 /// Servo を使うハンドラに置き換える（`RENDER-3`・`RENDER-4`）。それまで成功を装わず、
 /// `hello.capabilities` にも載せない（`REPAIR-3`・`SEC-2`）。
+#[cfg(test)]
 pub(crate) struct UnimplementedHandler;
 
+#[cfg(test)]
 impl Handler for UnimplementedHandler {
     fn capabilities(&self) -> &'static [Method] {
         &[]
@@ -312,7 +316,10 @@ fn dispatch<H: Handler>(h: &mut H, id: u64, req: &Request) -> (Value, &'static s
     let result = match req {
         Request::Load(p) => h
             .load(p)
-            .map(|r| json!({ "final_url": r.final_url, "status": r.status })),
+            .map(|r| match r.status {
+                Some(status) => json!({ "final_url": r.final_url, "status": status }),
+                None => json!({ "final_url": r.final_url }),
+            }),
         Request::Screenshot(p) => h.screenshot(p).map(|r| {
             json!({ "format": "png", "width": r.width, "height": r.height, "data_base64": r.data_base64 })
         }),
