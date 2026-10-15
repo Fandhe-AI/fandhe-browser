@@ -1,0 +1,13 @@
+{
+  "case": "error-internal",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 24,
+    "error": {
+      "kind": "internal",
+      "message": "Internal host error."
+    }
+  }
+}

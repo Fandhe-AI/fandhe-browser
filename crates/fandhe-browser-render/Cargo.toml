@@ -10,7 +10,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-# 依存最小方針（dependency-policy.md）: 本 crate は雛形段階のため依存はゼロ。
+# 依存最小方針（dependency-policy.md）: 本 crate は雛形段階のため通常依存はゼロ（dev-dependency はテスト用の serde_json のみ）。
 # feature `rendering` は cli 側に定義済み（TASK-33.4・#459。workspace 登録は #45）で、
 # 本 crate を optional 依存として有効化する。Servo（MPL-2.0）の導入は TASK-38
 # （ビヘイビア RENDER-1）でユーザー承認を経て行う。
+
+[dev-dependencies]
+# プロトコル契約テスト（tests/protocol_fixtures.rs。TASK-38・PLUG-1）専用。workspace 承認済み
+# （Issue #419）の固定版への辺を足すだけで、新しいパッケージは Cargo.lock に入らない。
+serde_json = { workspace = true }

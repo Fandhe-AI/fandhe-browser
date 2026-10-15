@@ -1,0 +1,13 @@
+{
+  "case": "load-missing-status",
+  "direction": "response",
+  "method": "load",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 64,
+    "result": {
+      "final_url": "https://example.com/"
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "case": "unknown-top-level",
+  "direction": "request",
+  "method": "load",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 41,
+    "method": "load",
+    "params": {
+      "url": "https://example.com/"
+    },
+    "trace": "x"
+  },
+  "expected_response": {
+    "v": 1,
+    "id": 41,
+    "error": {
+      "kind": "invalid_request",
+      "message": "Invalid request."
+    }
+  }
+}

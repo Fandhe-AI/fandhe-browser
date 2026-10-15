@@ -1,0 +1,13 @@
+{
+  "case": "error-invalid-request",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 26,
+    "error": {
+      "kind": "invalid_request",
+      "message": "Invalid request."
+    }
+  }
+}

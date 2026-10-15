@@ -1,0 +1,22 @@
+{
+  "case": "screenshot-full-page-string",
+  "direction": "request",
+  "method": "screenshot",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 55,
+    "method": "screenshot",
+    "params": {
+      "full_page": "true"
+    }
+  },
+  "expected_response": {
+    "v": 1,
+    "id": 55,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  }
+}

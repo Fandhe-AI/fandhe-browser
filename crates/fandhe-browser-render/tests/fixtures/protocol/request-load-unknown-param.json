@@ -1,0 +1,23 @@
+{
+  "case": "load-unknown-param",
+  "direction": "request",
+  "method": "load",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 40,
+    "method": "load",
+    "params": {
+      "url": "https://example.com/",
+      "extra": 1
+    }
+  },
+  "expected_response": {
+    "v": 1,
+    "id": 40,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  }
+}

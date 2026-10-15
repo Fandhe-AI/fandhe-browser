@@ -1,0 +1,16 @@
+{
+  "case": "load-timeout-fractional",
+  "direction": "request",
+  "method": "load",
+  "expect": "invalid",
+  "raw": "{\"v\":1,\"id\":1,\"method\":\"load\",\"params\":{\"url\":\"https://example.com/\",\"timeout_ms\":10000.5}}",
+  "expected_response": {
+    "v": 1,
+    "id": 1,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  },
+  "note": "A number with a non-zero fractional part is not an integer."
+}

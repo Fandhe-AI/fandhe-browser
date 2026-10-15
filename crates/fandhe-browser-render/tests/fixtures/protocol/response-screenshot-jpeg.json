@@ -1,0 +1,16 @@
+{
+  "case": "screenshot-jpeg",
+  "direction": "response",
+  "method": "screenshot",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 63,
+    "result": {
+      "format": "jpeg",
+      "width": 1280,
+      "height": 800,
+      "data_base64": ""
+    }
+  }
+}

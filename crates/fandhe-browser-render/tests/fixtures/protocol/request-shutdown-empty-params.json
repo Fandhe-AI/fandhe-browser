@@ -1,0 +1,12 @@
+{
+  "case": "shutdown-empty-params",
+  "direction": "request",
+  "method": "shutdown",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 9,
+    "method": "shutdown",
+    "params": {}
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "case": "error-not-loaded",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 23,
+    "error": {
+      "kind": "not_loaded",
+      "message": "No page is loaded."
+    }
+  }
+}

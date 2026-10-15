@@ -74,6 +74,9 @@ servo-host/
 
 - 要求: `{"v":1,"id":<u64>,"method":"...","params":{...}}`
 - 応答: `{"v":1,"id":...,"result":{...}}` または `{"v":1,"id":...,"error":{"kind":"...","message":"..."}}`
+- 要求の `id` が有効な `RequestId`（0 以上 2^53-1 以下の整数）として取り出せない場合（欠落・負数・文字列・範囲外）と、JSON として解釈できない場合、ホストは応答を返さずプロトコル違反として接続を閉じる（対応付けできない無関係な `id` の応答は返さない。fixture `request-id-*`・`request-truncated-json`）。`id` が有効なら、`v` 不一致・未知フィールド等も `invalid_request` を同じ `id` で返す
+- `params` を省略した要求は空オブジェクトとして各 `Params` に照合する（必須項目を持つ `load`・`visibility`・`bounding_box` は `invalid_params`、`screenshot`・`shutdown` は許可）
+- 応答は `result` か `error` のどちらか一方だけで、反対側のキーは `null` でも持たない
 - 起動直後にホストが `hello` イベントを最初に送る。内容は `host_version`・`servo_version`・`protocol{min,max}`・`capabilities[]`・`limits{...}`。クライアントは `protocol` の互換性を検証し、不一致は接続を閉じて `ProtocolMismatch` 相当のエラーにする。
 
 | メソッド | params | result |

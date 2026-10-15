@@ -8,6 +8,11 @@
 //! 現状はディレクトリ・manifest のみの雛形であり、本 crate に公開 API は
 //! まだ存在せず、「実装済みを装う」スタブ関数も置かない（REPAIR-3）。
 //!
+//! 本体とレンダリングホストの stdio プロトコル契約の正本は
+//! `docs/design/render-host-protocol.schema.json` と `tests/fixtures/protocol/`
+//! （契約テスト `tests/protocol_fixtures.rs`。PLUG-1・SEC-2・REPAIR-4・TASK-38）。
+//! プロトコル型・コーデックの実装は #989 で行う。
+//!
 //! # スタブについて
 //!
 //! - （済み）feature `rendering` の Cargo 定義（workspace 登録 #45・cli 側の結線

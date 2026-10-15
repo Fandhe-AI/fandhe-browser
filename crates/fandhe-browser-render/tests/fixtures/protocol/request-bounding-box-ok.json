@@ -1,0 +1,14 @@
+{
+  "case": "bounding-box-ok",
+  "direction": "request",
+  "method": "bounding_box",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 7,
+    "method": "bounding_box",
+    "params": {
+      "selector": "a.link"
+    }
+  }
+}

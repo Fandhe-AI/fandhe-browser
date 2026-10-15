@@ -1,0 +1,8 @@
+{
+  "case": "truncated-json",
+  "direction": "request",
+  "expect": "invalid",
+  "raw": "{\"v\":1,",
+  "expected_host_action": "close_connection",
+  "note": "Not parseable as JSON. The host sends no response, treats it as a protocol violation and closes the connection."
+}

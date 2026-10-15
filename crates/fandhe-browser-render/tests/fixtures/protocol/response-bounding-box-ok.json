@@ -1,0 +1,16 @@
+{
+  "case": "bounding-box-ok",
+  "direction": "response",
+  "method": "bounding_box",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 7,
+    "result": {
+      "x": 8.5,
+      "y": -2,
+      "width": 120.25,
+      "height": 18
+    }
+  }
+}

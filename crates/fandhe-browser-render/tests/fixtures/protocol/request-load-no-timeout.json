@@ -1,0 +1,14 @@
+{
+  "case": "load-no-timeout",
+  "direction": "request",
+  "method": "load",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 2,
+    "method": "load",
+    "params": {
+      "url": "https://example.com/"
+    }
+  }
+}

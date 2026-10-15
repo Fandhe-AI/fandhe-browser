@@ -1,0 +1,14 @@
+{
+  "case": "error-unknown-kind",
+  "direction": "response",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 61,
+    "error": {
+      "kind": "bogus",
+      "message": "x"
+    }
+  },
+  "note": "Outside the v1 kind set; the client maps an unknown kind to a generic error."
+}

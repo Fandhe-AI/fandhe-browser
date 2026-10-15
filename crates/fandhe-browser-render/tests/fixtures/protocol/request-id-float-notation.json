@@ -1,0 +1,8 @@
+{
+  "case": "id-float-notation",
+  "direction": "request",
+  "method": "load",
+  "expect": "valid",
+  "raw": "{\"v\":1,\"id\":1e0,\"method\":\"load\",\"params\":{\"url\":\"https://example.com/\"}}",
+  "note": "Integer-valued number notation (1e0) is a valid integer under JSON Schema semantics."
+}

@@ -1,0 +1,14 @@
+{
+  "case": "error-unknown-field",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 30,
+    "error": {
+      "kind": "timeout",
+      "message": "Operation timed out.",
+      "retry_after_ms": 100
+    }
+  }
+}

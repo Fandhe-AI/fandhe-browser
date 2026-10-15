@@ -1,0 +1,12 @@
+{
+  "case": "result-null-error",
+  "direction": "response",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 61,
+    "result": {},
+    "error": null
+  },
+  "note": "Envelope only (no method, so no LoadResult check): ResultResponse rejects an error key even when null; only the not rule can reject this."
+}

@@ -1,0 +1,19 @@
+{
+  "case": "visibility-no-params",
+  "direction": "request",
+  "method": "visibility",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 64,
+    "method": "visibility"
+  },
+  "expected_response": {
+    "v": 1,
+    "id": 64,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  }
+}

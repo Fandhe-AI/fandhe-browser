@@ -1,0 +1,14 @@
+{
+  "case": "screenshot-full-page",
+  "direction": "request",
+  "method": "screenshot",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 3,
+    "method": "screenshot",
+    "params": {
+      "full_page": true
+    }
+  }
+}

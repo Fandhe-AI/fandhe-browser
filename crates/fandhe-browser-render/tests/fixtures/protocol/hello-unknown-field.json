@@ -1,0 +1,46 @@
+{
+  "case": "unknown-field",
+  "direction": "hello",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "event": "hello",
+    "data": {
+      "host_version": "0.0.0",
+      "servo_version": "0.6.0",
+      "protocol": {
+        "min": 1,
+        "max": 1
+      },
+      "capabilities": [
+        "load",
+        "screenshot",
+        "visibility",
+        "bounding_box",
+        "shutdown"
+      ],
+      "limits": {
+        "request_frame_bytes": 65536,
+        "response_frame_bytes": 1048576,
+        "hello_frame_bytes": 16384,
+        "screenshot_frame_bytes": 25165824,
+        "url_bytes": 2048,
+        "selector_bytes": 1024,
+        "error_message_bytes": 512,
+        "max_in_flight": 1,
+        "handshake_timeout_ms": 10000,
+        "load_timeout_default_ms": 30000,
+        "load_timeout_max_ms": 60000,
+        "screenshot_timeout_ms": 20000,
+        "query_timeout_ms": 5000,
+        "shutdown_grace_ms": 3000,
+        "future_limit": 7
+      },
+      "future_field": {
+        "a": 1
+      }
+    },
+    "future_field": "ignored"
+  },
+  "note": "Unknown fields in hello are ignored by the client (REPAIR-4)."
+}

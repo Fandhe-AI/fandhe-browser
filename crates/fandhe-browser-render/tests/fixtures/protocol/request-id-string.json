@@ -1,0 +1,16 @@
+{
+  "case": "id-string",
+  "direction": "request",
+  "method": "load",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": "50",
+    "method": "load",
+    "params": {
+      "url": "https://example.com/"
+    }
+  },
+  "expected_host_action": "close_connection",
+  "note": "The id is not a valid RequestId, so the host cannot correlate a reply. It sends no response and closes the connection."
+}

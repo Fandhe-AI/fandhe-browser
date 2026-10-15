@@ -1,0 +1,23 @@
+{
+  "case": "load-userinfo",
+  "direction": "request",
+  "method": "load",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 72,
+    "method": "load",
+    "params": {
+      "url": "https://user:pass@example.com/"
+    }
+  },
+  "expected_response": {
+    "v": 1,
+    "id": 72,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  },
+  "note": "Valid at schema level; the host rejects it by double validation (servo-host-design section 2.5)."
+}

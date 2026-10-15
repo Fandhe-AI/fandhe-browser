@@ -1,0 +1,16 @@
+{
+  "case": "load-unknown-field",
+  "direction": "response",
+  "method": "load",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "result": {
+      "final_url": "https://example.com/",
+      "status": 200,
+      "redirect_count": 2
+    }
+  },
+  "note": "Unknown fields in result are ignored by the client (REPAIR-4)."
+}

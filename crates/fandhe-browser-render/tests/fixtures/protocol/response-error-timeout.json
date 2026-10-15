@@ -1,0 +1,13 @@
+{
+  "case": "error-timeout",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 21,
+    "error": {
+      "kind": "timeout",
+      "message": "Operation timed out."
+    }
+  }
+}
