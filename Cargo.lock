@@ -830,6 +830,7 @@ dependencies = [
 name = "fandhe-browser-render"
 version = "0.1.0"
 dependencies = [
+ "fandhe-browser-core",
  "serde_json",
 ]
 
