@@ -9,6 +9,9 @@
 //! （または `fandhe-browser-cli` 側で具象実装がまだ結線されていない時）に用いる既定実装
 //! [`DisabledRenderer`] を提供する（TASK-33（サブタスク 33.3）・issue #47）。
 //!
+//! ページ指定（[`Renderer::load`]・[`PageRef`]・[`PageLoad`]）は TASK-38・#987（`RENDER-1`・
+//! `RENDER-3`）で追加した。`HostRenderer` による実装は #235。
+//!
 //! ## 本モジュールの範囲外（将来仕様。REPAIR-3: 実装済みを装わない）
 //!
 //! - （済み）feature `rendering` の Cargo 定義: workspace 登録は #45、cli 側の feature 結線は TASK-33.4・#459（`RENDER-1`、`MS-1`）
@@ -26,6 +29,21 @@
 /// 非同期ランタイムへの依存を本 crate に持ち込まないため、メソッドは `async fn` にせず
 /// 同期シグネチャとする（実装側で必要であれば内部的にブロッキング呼び出しへ変換する）。
 pub trait Renderer: Send + Sync {
+    /// 描画対象のページを読み込ませる（RENDER-1・RENDER-3・TASK-38）。
+    ///
+    /// Servo ホスト方式（別プロセス。`docs/design/servo-host-design.md` §3.3）では、描画系
+    /// メソッドの前にホストへ URL を `load` させる必要がある。[`crate::state::AppState`] の
+    /// 描画ラッパーがナビゲーション世代の変化を検出したときだけ本メソッドを呼ぶ。
+    ///
+    /// 既定実装は常に [`RenderError::RenderingDisabled`] を返す。`Ok` を返さないのは
+    /// 成功を装わないため（REPAIR-3・security.md「偽装・回避機能の禁止」）。ページ指定を
+    /// 必要としない実装（テスト用のモック等）は本メソッドを実装せず、既存コードを
+    /// 無改修のままコンパイルできる。
+    fn load(&self, page: &PageRef) -> Result<PageLoad, RenderError> {
+        let _ = page;
+        Err(RenderError::RenderingDisabled)
+    }
+
     /// 現在の描画内容のスクリーンショットを取得する（RENDER-1）。
     fn capture_screenshot(&self, options: &ScreenshotOptions) -> Result<Screenshot, RenderError>;
 
@@ -62,6 +80,10 @@ impl DisabledRenderer {
 }
 
 impl Renderer for DisabledRenderer {
+    fn load(&self, _page: &PageRef) -> Result<PageLoad, RenderError> {
+        Err(RenderError::RenderingDisabled)
+    }
+
     fn capture_screenshot(&self, _options: &ScreenshotOptions) -> Result<Screenshot, RenderError> {
         Err(RenderError::RenderingDisabled)
     }
@@ -72,6 +94,74 @@ impl Renderer for DisabledRenderer {
 
     fn bounding_box(&self, _element: &ElementRef) -> Result<BoundingBox, RenderError> {
         Err(RenderError::RenderingDisabled)
+    }
+}
+
+/// 描画対象ページの参照（RENDER-1・RENDER-3・TASK-38）。
+///
+/// v1 は URL だけを運ぶ（`servo-host-design.md` §3.4）。core は値を運ぶだけで検証しない。
+/// scheme（`http` / `https` のみ）・userinfo・プライベート IP の検証と `about:blank` の扱いは
+/// IPC クライアント側（`fandhe-browser-render`。設計 §2.5・#235）の責務。UA・ヘッダ等の
+/// 識別面を変えるパラメータは持たない（SEC-2）。将来のフィールド追加に備え
+/// `#[non_exhaustive]` とし、フィールドは非公開とする（REPAIR-4）。
+#[non_exhaustive]
+#[derive(Clone, PartialEq, Eq)]
+pub struct PageRef {
+    url: String,
+}
+
+impl PageRef {
+    /// URL から [`PageRef`] を構築する（RENDER-1・RENDER-3・TASK-38）。
+    pub fn new(url: impl Into<String>) -> Self {
+        Self { url: url.into() }
+    }
+
+    /// URL を返す。
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+impl std::fmt::Debug for PageRef {
+    /// URL のクエリ等にトークンが入りうるため、長さだけを出力する（OWASP A02）。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageRef")
+            .field("url_len", &self.url.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// [`Renderer::load`] の成功結果（RENDER-1・RENDER-3・TASK-38）。
+///
+/// 真偽値や `()` で済ませず構造体にする（REPAIR-4）。v1 は最終 URL だけを持つ。
+/// 将来仕様: プロトコルの `load -> final_url, status`（設計 §2.2）に合わせて HTTP
+/// ステータス等を追加する（未実装。REPAIR-3）。
+#[non_exhaustive]
+#[derive(Clone, PartialEq, Eq)]
+pub struct PageLoad {
+    final_url: String,
+}
+
+impl PageLoad {
+    /// 最終 URL から [`PageLoad`] を構築する。`HostRenderer`（#235）が成功結果を作る経路。
+    pub fn new(final_url: impl Into<String>) -> Self {
+        Self {
+            final_url: final_url.into(),
+        }
+    }
+
+    /// リダイレクト後の最終 URL を返す。
+    pub fn final_url(&self) -> &str {
+        &self.final_url
+    }
+}
+
+impl std::fmt::Debug for PageLoad {
+    /// URL にトークンが入りうるため、長さだけを出力する（OWASP A02）。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageLoad")
+            .field("final_url_len", &self.final_url.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -236,6 +326,17 @@ pub enum RenderError {
     RenderingDisabled,
     /// 指定した要素が見つからない場合。
     ElementNotFound,
+    /// load・描画・ハンドシェイクがタイムアウトした（RENDER-3・TASK-38。設計 §2.4）。
+    Timeout,
+    /// ホストが未起動・クラッシュ済み、またはサーキットブレーカー作動中（RENDER-3・TASK-38。
+    /// 設計 §2.6・§2.7）。
+    HostUnavailable,
+    /// `hello` のプロトコル版の不一致、またはプロトコル違反（RENDER-3・TASK-38。設計 §2.2）。
+    ProtocolMismatch,
+    /// 描画するページがない（ナビゲーション未実行、または遷移中で結果なし）。
+    /// [`crate::state::AppState`] が前ページの描画を返さず fail-closed にするために使う
+    /// （RENDER-3・TASK-38）。要素が無い [`RenderError::ElementNotFound`] とは意味が異なる。
+    PageNotLoaded,
     /// 上記に分類できない内部エラー。
     ///
     /// `message` はファイルパス等の内部実装詳細を含みうるため、`Display` と `Debug`
@@ -252,6 +353,10 @@ impl std::fmt::Debug for RenderError {
         match self {
             Self::RenderingDisabled => f.write_str("RenderingDisabled"),
             Self::ElementNotFound => f.write_str("ElementNotFound"),
+            Self::Timeout => f.write_str("Timeout"),
+            Self::HostUnavailable => f.write_str("HostUnavailable"),
+            Self::ProtocolMismatch => f.write_str("ProtocolMismatch"),
+            Self::PageNotLoaded => f.write_str("PageNotLoaded"),
             // 内部詳細（ファイルパス等）を含みうるため、variant 名のみを出力し
             // メッセージ本体は伏せる。詳細取得は `internal_detail()` を使うこと。
             Self::Internal(_) => f.write_str("Internal(..)"),
@@ -278,6 +383,10 @@ impl std::fmt::Display for RenderError {
         match self {
             Self::RenderingDisabled => write!(f, "rendering layer is disabled"),
             Self::ElementNotFound => write!(f, "element not found"),
+            Self::Timeout => write!(f, "render operation timed out"),
+            Self::HostUnavailable => write!(f, "render host is unavailable"),
+            Self::ProtocolMismatch => write!(f, "render host protocol mismatch"),
+            Self::PageNotLoaded => write!(f, "no page is loaded for rendering"),
             Self::Internal(_) => write!(f, "internal render error"),
         }
     }
@@ -476,6 +585,76 @@ mod tests {
             RenderError::Internal("boom".to_string()).to_string(),
             "internal render error"
         );
+        assert_eq!(
+            RenderError::Timeout.to_string(),
+            "render operation timed out"
+        );
+        assert_eq!(
+            RenderError::HostUnavailable.to_string(),
+            "render host is unavailable"
+        );
+        assert_eq!(
+            RenderError::ProtocolMismatch.to_string(),
+            "render host protocol mismatch"
+        );
+        assert_eq!(
+            RenderError::PageNotLoaded.to_string(),
+            "no page is loaded for rendering"
+        );
+    }
+
+    /// RENDER-3: 新 variant の `Debug` は variant 名のみ。
+    #[test]
+    fn render3_new_variants_debug_is_variant_name() {
+        assert_eq!(format!("{:?}", RenderError::Timeout), "Timeout");
+        assert_eq!(
+            format!("{:?}", RenderError::HostUnavailable),
+            "HostUnavailable"
+        );
+        assert_eq!(
+            format!("{:?}", RenderError::ProtocolMismatch),
+            "ProtocolMismatch"
+        );
+        assert_eq!(format!("{:?}", RenderError::PageNotLoaded), "PageNotLoaded");
+    }
+
+    /// RENDER-3: `load` を実装しないレンダラーの既定実装は `RenderingDisabled`。
+    #[test]
+    fn render3_renderer_load_default_returns_rendering_disabled() {
+        let renderer = MockRenderer {
+            screenshot_ok: true,
+            visible: true,
+            bounding_box_ok: true,
+        };
+        let err = renderer
+            .load(&PageRef::new("https://a.example/"))
+            .expect_err("default load must not succeed");
+        assert!(matches!(err, RenderError::RenderingDisabled));
+    }
+
+    /// RENDER-3: `DisabledRenderer::load` は常に `RenderingDisabled`。
+    #[test]
+    fn render3_disabled_renderer_load_always_returns_rendering_disabled() {
+        let err = DisabledRenderer::new()
+            .load(&PageRef::new("https://a.example/"))
+            .expect_err("rendering is disabled");
+        assert!(matches!(err, RenderError::RenderingDisabled));
+    }
+
+    /// RENDER-3: `PageRef` / `PageLoad` の `Debug` は URL を出さず長さだけを出す。
+    #[test]
+    fn render3_page_ref_debug_hides_url() {
+        let page = PageRef::new("https://a.example/?token=secret");
+        assert_eq!(page.url(), "https://a.example/?token=secret");
+        let d = format!("{page:?}");
+        assert!(d.contains("url_len: 31"), "{d}");
+        assert!(!d.contains("secret"), "{d}");
+        assert!(!d.contains("a.example"), "{d}");
+        let load = PageLoad::new("https://b.example/?token=secret");
+        assert_eq!(load.final_url(), "https://b.example/?token=secret");
+        let d = format!("{load:?}");
+        assert!(d.contains("final_url_len: 31"), "{d}");
+        assert!(!d.contains("secret"), "{d}");
     }
 
     /// RENDER-1: `Internal` の `Display` が内部詳細（ファイルパス等になりうる `message`）を
@@ -494,6 +673,10 @@ mod tests {
     fn render_error_internal_detail_none_for_other_variants() {
         assert_eq!(RenderError::RenderingDisabled.internal_detail(), None);
         assert_eq!(RenderError::ElementNotFound.internal_detail(), None);
+        assert_eq!(RenderError::Timeout.internal_detail(), None);
+        assert_eq!(RenderError::HostUnavailable.internal_detail(), None);
+        assert_eq!(RenderError::ProtocolMismatch.internal_detail(), None);
+        assert_eq!(RenderError::PageNotLoaded.internal_detail(), None);
     }
 
     /// RENDER-1: `Internal` の `Debug`（`format!("{err:?}")`）も内部詳細（ファイルパス等に
