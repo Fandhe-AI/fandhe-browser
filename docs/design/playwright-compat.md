@@ -295,6 +295,39 @@ playwright-core 1.63.0 のソース読解では、`FrameSession._initialize` の
 `Page.frameNavigated` が無いと `newPage()` がタイムアウトし得る）は当たらない見込み。
 段階 4 の要否は段階 3 の実測で再判断する（過去の記録は残し、本訂正で上書きしない）。
 
+### 到達結果（TASK-43.3f・#911。実測 A）
+
+`newPage()` 到達の結合確認の結果は **未到達**。基準は #1035 後の main（`08ab781c`）で再取得済みのトレース
+（`playwright-core` 1.63.0・node v24.21.0。収集オプションは `connectOverCDP` の `noDefaults:true` と
+`newContext` の `acceptDownloads:false`）。`connectOverCDP(http)` と `newContext` は成功し、`newPage` は最初の停止
+**`Page.enable` の `-32601`**（`browserContext.newPage: Protocol error (Page.enable): method not implemented`）で失敗する。
+空の成功やスタブで通さず、停止点を固定する（`CDP-2`・`CDP-6`・`SEC-2`・`REPAIR-3`）。
+
+停止したメソッドの一覧（トレース seq 19・32・34〜43。すべてセッション付き。`sessionId` は正規化済みの `…0001`）:
+
+| id | メソッド | エラー（code / message） | Playwright 側の扱い |
+| -- | -------- | ------------------------ | ------------------- |
+| 7 | `Browser.getWindowForTarget` | `-32601` / `method not implemented` | 握りつぶす（不足箇所一覧 #10・種別 B） |
+| 8 | `Page.enable` | `-32601` / `method not implemented` | 待つ（失敗で初期化が止まる。`newPage` の最初の停止） |
+| 9 | `Page.getFrameTree` | `-32601` / `method not implemented` | 待つ（不足箇所一覧 #9・種別 B） |
+| 10 | `Log.enable` | `-32601` / `method not implemented` | 待つ（同上） |
+| 11 | `Page.setLifecycleEventsEnabled` | `-32601` / `method not implemented` | 待つ（同上） |
+| 12 | `Runtime.enable` | `-32601` / `method not implemented` | 待つ（同上） |
+| 13 | `Page.addScriptToEvaluateOnNewDocument` | `-32601` / `method not implemented` | 待つ（同上） |
+| 14 | `Network.enable` | `-32601` / `method not implemented` | 待つ（同上） |
+| 15 | `Target.setAutoAttach` | `-32602` / `unsupported params` | 待つ（同上） |
+| 16 | `Emulation.setFocusEmulationEnabled` | `-32601` / `method not implemented` | 待つ（不足箇所一覧 #10） |
+| 17 | `Emulation.setDeviceMetricsOverride` | `-32601` / `method not implemented` | 待つ（同上） |
+| 18 | `Emulation.setEmulatedMedia` | `-32601` / `method not implemented` | 待つ（同上） |
+
+結合テスト `cdp2_playwright_newpage_reach_report_lists_first_stop_and_failures`
+（`crates/fandhe-browser-cdp/tests/playwright_trace.rs`。CI では unix の `rust-test-*` で実行）が、stage の成否・最初の停止・
+上表の失敗一覧を具体値で固定する。
+
+次の作業: ページ初期化メソッド群（上表の `Page.enable` 以降。`Browser.getWindowForTarget` は握りつぶされるため `-32601` のままでよい見込み）の
+実装 issue を起票して #911 の依存に加える。実装後にトレースを再取得し、テストを到達確認（stage がすべて成功・停止なし）へ切り替える。
+それまで #911 は open のまま残す。
+
 ### 原則
 
 | 原則 | 内容 | ビヘイビア |
