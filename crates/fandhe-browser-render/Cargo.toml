@@ -28,3 +28,9 @@ fandhe-browser-core = { path = "../fandhe-browser-core" }
 [[test]]
 name = "host_process"
 harness = false
+
+# HostRenderer（core `Renderer` 越し）の結合テスト（TASK-38.8a・#237）。偽ホストは
+# `host_process` と共有（`tests/support/mod.rs`）で、同じ理由で `harness = false`。
+[[test]]
+name = "basic_api"
+harness = false
