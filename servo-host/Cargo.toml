@@ -1,0 +1,31 @@
+# Servo ホスト（fandhe-browser-servo-host）の manifest。
+#
+# 役割: Servo（MPL-2.0）を本体の依存グラフから隔離するため、本体の workspace とは
+# 別の workspace・別の Cargo.lock を持つ単一 package として置く（#915・#935。
+# docs/design/servo-host-design.md §1.1〜§1.3）。ルート Cargo.toml は
+# `exclude = ["servo-host"]` で本ディレクトリを物理的に除外している。
+# 現時点（TASK-38・H0 #985）は足場のみで依存を持たない。Servo の追加は #988、
+# stdio サーバーは #993 で行う。toolchain は親ディレクトリの
+# rust-toolchain.toml を rustup が探索して使う（ここにはコピーを置かない）。
+
+[package]
+name = "fandhe-browser-servo-host"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "fandhe-browser-servo-host"
+path = "src/main.rs"
+
+# 本体とは独立した workspace ルートであることを宣言する（空テーブル）。
+[workspace]
+
+# ルート Cargo.toml の [profile.release] と同一にする（本体と同じサイズ最小化方針。
+# `[profile.*]` は workspace ルートでしか効かないため、本 workspace にも複製が要る）。
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+strip = true

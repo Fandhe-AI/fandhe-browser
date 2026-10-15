@@ -937,6 +937,12 @@ jobs:
       - name: "[render-isolation] 既定ビルドの依存グラフ検査"
         if: ${{ !cancelled() }}
         run: bash scripts/check-render-isolation.sh
+      - name: "[render-isolation] Servo ホスト分離の自己テスト（TASK-38・#985）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-servo-host-isolation.sh --self-test
+      - name: "[render-isolation] Servo ホスト分離検査（members・ルート Cargo.lock）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-servo-host-isolation.sh
       - name: "[js-engine-isolation] 自己テスト（合成データによる検出の証跡確認）"
         if: ${{ !cancelled() }}
         run: bash scripts/check-js-engine-isolation.sh --self-test
@@ -1109,6 +1115,12 @@ jobs:
       - name: "[render-isolation] 既定ビルドの依存グラフ検査"
         if: ${{ !cancelled() }}
         run: bash scripts/check-render-isolation.sh
+      - name: "[render-isolation] Servo ホスト分離の自己テスト（TASK-38・#985）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-servo-host-isolation.sh --self-test
+      - name: "[render-isolation] Servo ホスト分離検査（members・ルート Cargo.lock）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-servo-host-isolation.sh
       - name: "[js-engine-isolation] 自己テスト（合成データによる検出の証跡確認）"
         if: ${{ !cancelled() }}
         run: bash scripts/check-js-engine-isolation.sh --self-test
@@ -1268,6 +1280,12 @@ jobs:
       - name: "[render-isolation] 既定ビルドの依存グラフ検査"
         if: ${{ !cancelled() }}
         run: bash scripts/check-render-isolation.sh
+      - name: "[render-isolation] Servo ホスト分離の自己テスト（TASK-38・#985）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-servo-host-isolation.sh --self-test
+      - name: "[render-isolation] Servo ホスト分離検査（members・ルート Cargo.lock）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-servo-host-isolation.sh
       - name: "[js-engine-isolation] 自己テスト（合成データによる検出の証跡確認）"
         if: ${{ !cancelled() }}
         run: bash scripts/check-js-engine-isolation.sh --self-test
