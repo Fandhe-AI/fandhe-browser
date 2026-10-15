@@ -9,6 +9,7 @@
 //! （`EXPECTED_*`）を更新する。TASK-43.3a で `/json/version/` と `Browser.getVersion` を追加し、
 //! TASK-43.3e（#910）で `Target.createTarget`（応答前の `Target.attachedToTarget`）と
 //! `Runtime.runIfWaitingForDebugger` を追加した。以降のメソッドの no-op は追加しない（`SEC-2`・`REPAIR-3`）。
+//! TASK-43.3f（#911）で `newPage()` の到達レポート（停止メソッドの一覧）を具体値で固定した（未到達の記録）。
 //!
 //! `CdpState` の構築に `Profile::open` が必要で、非 unix では `ProfileError::Unsupported` を返す仕様のため
 //! `#[cfg(unix)]` とする（任意の skip ではなく `tests/devtools_browser.rs` と同じ理由）。
@@ -573,4 +574,179 @@ async fn cdp2_create_target_over_websocket_emits_attached_before_response_and_wa
     })
     .await
     .unwrap();
+}
+/// 到達レポートの失敗した 1 呼び出し（エラー応答を同じ `id` の送信と突き合わせたもの）。
+#[derive(Debug, PartialEq)]
+struct FailedCall {
+    id: u64,
+    method: String,
+    /// `sessionId` 付き（ページセッション宛て）か。
+    session: bool,
+    code: i64,
+    message: String,
+}
+
+/// `newPage()` が最初に止まった地点（失敗した stage の `error` から取り出す）。
+#[derive(Debug, PartialEq)]
+struct FirstStop {
+    stage: String,
+    method: String,
+    error: String,
+}
+
+/// トレースから作る到達レポート。戻り値を構造体にして将来の項目追加に備える（`REPAIR-4`）。
+#[derive(Debug, PartialEq)]
+struct ReachReport {
+    stages: Vec<(String, bool)>,
+    first_stop: Option<FirstStop>,
+    failed: Vec<FailedCall>,
+}
+
+/// Playwright のエラー文言 `... Protocol error (<Method>): ...` からメソッド名を取り出す。
+/// 外部入力（トレース）のため `find`・`get` だけで処理し、panic しない。
+fn method_from_protocol_error(error: &str) -> Option<String> {
+    const MARK: &str = "Protocol error (";
+    let start = error.find(MARK)? + MARK.len();
+    let rest = error.get(start..)?;
+    let end = rest.find(')')?;
+    rest.get(..end).map(str::to_owned)
+}
+
+/// トレースを走査して到達レポートを作る。
+/// 最小 id のエラーは握りつぶされる `Browser.getWindowForTarget` で停止原因ではないため、
+/// 最初の停止は失敗した stage の `error` 文字列から決める。
+fn reach_report(recs: &[Value]) -> ReachReport {
+    let mut stages = Vec::new();
+    let mut first_stop = None;
+    let mut sent: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    let mut failed = Vec::new();
+    for r in recs {
+        match r.get("kind").and_then(Value::as_str) {
+            Some("stage") => {
+                let name = r.get("name").and_then(Value::as_str).unwrap_or("");
+                let ok = r.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                stages.push((name.to_owned(), ok));
+                if !ok && first_stop.is_none() {
+                    let error = r.get("error").and_then(Value::as_str).unwrap_or("");
+                    first_stop = Some(FirstStop {
+                        stage: name.to_owned(),
+                        method: method_from_protocol_error(error).unwrap_or_default(),
+                        error: error.to_owned(),
+                    });
+                }
+            }
+            Some("cdp") => {
+                let dir = r.get("dir").and_then(Value::as_str);
+                let Some(msg) = r.get("message") else {
+                    continue;
+                };
+                let id = msg.get("id").and_then(Value::as_u64);
+                if dir == Some("send") {
+                    if let (Some(id), Some(m)) = (id, msg.get("method").and_then(Value::as_str)) {
+                        sent.insert(id, m.to_owned());
+                    }
+                } else if let (Some(id), Some(err)) = (id, msg.get("error")) {
+                    failed.push(FailedCall {
+                        id,
+                        method: sent.get(&id).cloned().unwrap_or_default(),
+                        session: msg.get("sessionId").is_some(),
+                        code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
+                        message: err
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    failed.sort_by_key(|f| f.id);
+    ReachReport {
+        stages,
+        first_stop,
+        failed,
+    }
+}
+
+/// `newPage()` 到達状況の結合テスト（TASK-43.3f・#911、`CDP-2`・`CDP-6`・MS-4）。
+///
+/// 現状は **未到達の事実を固定するテスト**であり、到達確認ではない。`newPage()` はセッション付き
+/// 初期化の最初の `Page.enable`（`-32601`）で止まる。ページ初期化メソッド群の実装後は、トレースを
+/// `make trace-playwright` で再取得し、`stages` がすべて成功・`first_stop` が `None`・`failed` が空
+/// （または Playwright が握りつぶすものだけ）になるよう本テストを到達確認へ切り替える（#911 は open のまま）。
+/// 期待値を緩めたり `#[ignore]` で通したりしない。
+#[test]
+fn cdp2_playwright_newpage_reach_report_lists_first_stop_and_failures() {
+    let report = reach_report(&records());
+    let pretty = format!("{report:#?}");
+    let stages: Vec<(&str, bool)> = report
+        .stages
+        .iter()
+        .map(|(n, ok)| (n.as_str(), *ok))
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            ("connectOverCDP(http)", true),
+            ("newContext", true),
+            ("newPage", false)
+        ],
+        "{pretty}"
+    );
+    assert_eq!(
+        report.first_stop,
+        Some(FirstStop {
+            stage: "newPage".to_owned(),
+            method: "Page.enable".to_owned(),
+            error: "browserContext.newPage: Protocol error (Page.enable): method not implemented"
+                .to_owned(),
+        }),
+        "{pretty}"
+    );
+    let failed: Vec<(u64, &str, bool, i64, &str)> = report
+        .failed
+        .iter()
+        .map(|f| {
+            (
+                f.id,
+                f.method.as_str(),
+                f.session,
+                f.code,
+                f.message.as_str(),
+            )
+        })
+        .collect();
+    let nf = "method not implemented";
+    assert_eq!(
+        failed,
+        [
+            (7, "Browser.getWindowForTarget", true, -32601, nf),
+            (8, "Page.enable", true, -32601, nf),
+            (9, "Page.getFrameTree", true, -32601, nf),
+            (10, "Log.enable", true, -32601, nf),
+            (11, "Page.setLifecycleEventsEnabled", true, -32601, nf),
+            (12, "Runtime.enable", true, -32601, nf),
+            (
+                13,
+                "Page.addScriptToEvaluateOnNewDocument",
+                true,
+                -32601,
+                nf
+            ),
+            (14, "Network.enable", true, -32601, nf),
+            (
+                15,
+                "Target.setAutoAttach",
+                true,
+                -32602,
+                "unsupported params"
+            ),
+            (16, "Emulation.setFocusEmulationEnabled", true, -32601, nf),
+            (17, "Emulation.setDeviceMetricsOverride", true, -32601, nf),
+            (18, "Emulation.setEmulatedMedia", true, -32601, nf),
+        ],
+        "{pretty}"
+    );
 }
