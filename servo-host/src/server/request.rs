@@ -25,8 +25,6 @@ pub(crate) struct LoadParams {
 
 /// `screenshot` のパラメータ。ビューポートは固定で指定できない（`SEC-2`）。
 pub(crate) struct ScreenshotParams {
-    // Handler 実装（#232）が読むまで未使用。
-    #[allow(dead_code)]
     pub full_page: bool,
 }
 
