@@ -29,10 +29,8 @@ pub(crate) struct ScreenshotParams {
 }
 
 /// `visibility`・`bounding_box` のパラメータ。セレクタは長さだけ検証した値で、JS 評価文字列へ
-/// 埋め込む場合は #233・#234 側で JSON エスケープを必須とする。
+/// 埋め込む場合は `layout` が検証・JSON エスケープする。
 pub(crate) struct SelectorParams {
-    // Handler 実装（#233・#234）が読むまで未使用。
-    #[allow(dead_code)]
     pub selector: String,
 }
 

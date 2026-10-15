@@ -3,7 +3,7 @@
 //! 呼び出し元は `main` の `--stdio`（本体 `fandhe-browser-render` の `host_process` が固定引数
 //! `HOST_ARGS` で起動する）。実処理（load・screenshot・visibility・bounding_box）は [`Handler`] の
 //! 向こうに置き、本モジュールは Servo に依存しない（`servo::*` を import しない）。後続の
-//! `page::ServoHandler`（load は #231 で実装済み。#232〜#234 が残りを実装する）を `main` が使う。
+//! `page::ServoHandler`（load は #231、screenshot は #232、visibility は #233 で実装済み。#234 が残りを実装する）を `main` が使う。
 //!
 //! 契約の正本は `docs/design/render-host-protocol.schema.json` と
 //! `crates/fandhe-browser-render/tests/fixtures/protocol/`（本体側とは型を共有しない）。
@@ -36,6 +36,9 @@ pub(crate) const MAX_SCREENSHOT_FRAME_BYTES: usize = 25_165_824;
 /// `screenshot` の待機上限（ミリ秒。20 秒。`RENDER-4`）。hello の `limits` と共有する。
 pub(crate) const SCREENSHOT_TIMEOUT_MS: u64 = 20_000;
 pub(crate) const MAX_URL_BYTES: usize = 2048;
+/// 要素クエリ（visibility・bounding_box）の待機上限（ミリ秒。`RENDER-4`）。
+pub(crate) const QUERY_TIMEOUT_MS: u64 = 5_000;
+/// セレクタ長の上限（バイト）。
 pub(crate) const MAX_SELECTOR_BYTES: usize = 1024;
 pub(crate) const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 pub(crate) const MAX_METHOD_BYTES: usize = 64;
@@ -90,8 +93,6 @@ pub(crate) enum ErrorKind {
     InvalidParams,
     Unsupported,
     NotLoaded,
-    // `NotFound` は Handler 実装（#233・#234）が返すまで本体コードから構築されない。
-    #[allow(dead_code)]
     NotFound,
     Timeout,
     LoadFailed,
@@ -172,7 +173,7 @@ pub(crate) trait Handler {
 
 /// 全メソッドを `unsupported` で拒否するスタブ（サーバーループの単体テスト専用）。
 ///
-/// 将来仕様: #232（screenshot）・#233（visibility）・#234（bounding_box）で
+/// 将来仕様: 実ハンドラは `page::ServoHandler`（#234 の bounding_box は未実装）。
 /// Servo を使うハンドラに置き換える（`RENDER-3`・`RENDER-4`）。それまで成功を装わず、
 /// `hello.capabilities` にも載せない（`REPAIR-3`・`SEC-2`）。
 #[cfg(test)]
@@ -297,7 +298,7 @@ fn hello_message(caps: &[Method]) -> Value {
                 "load_timeout_default_ms": LOAD_TIMEOUT_DEFAULT_MS,
                 "load_timeout_max_ms": LOAD_TIMEOUT_MAX_MS,
                 "screenshot_timeout_ms": SCREENSHOT_TIMEOUT_MS,
-                "query_timeout_ms": 5_000,
+                "query_timeout_ms": QUERY_TIMEOUT_MS,
                 "shutdown_grace_ms": 3_000
             }
         }

@@ -5,7 +5,8 @@
 //! 呼び出し元は `server` のディスパッチ（[`ServoHandler`] 経由）と `main` の `--selftest`
 //! （低レベルの [`navigate`]）。スクリーンショット（TASK-38.3・#232）はこの層が保持する現在ページの
 //! 上で `WebView::take_screenshot` を期限付きで待ち、PNG 化は `screenshot` モジュールに任せる。
-//! 可視性・境界ボックスは #233・#234 が同じ上に載る。
+//! 可視性（TASK-38.4・#233）は同じ上で `WebView::evaluate_javascript` を期限付きで待ち、
+//! スクリプト生成と結果解釈は `layout` に任せる。境界ボックスは #234 が載る。
 //!
 //! 待機の方針（PoC-13 の失敗の再発防止）: 条件は「`LoadStatus::Complete` かつ受信フレーム数が 1 以上」。
 //! Complete より前に届いたフレームも数え、「Complete より後の新しいフレーム」は要求しない
@@ -23,11 +24,12 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use servo::{
-    LoadStatus, RgbaImage, ScreenshotCaptureError, ServoUrl, WebView, WebViewBuilder,
-    WebViewDelegate,
+    JSValue, JavaScriptEvaluationError, LoadStatus, RgbaImage, ScreenshotCaptureError, ServoUrl,
+    WebView, WebViewBuilder, WebViewDelegate,
 };
 
 use crate::engine::Engine;
+use crate::layout;
 use crate::screenshot::{self, SCREENSHOT_TIMEOUT};
 use crate::server::{
     BoundingBoxResult, ErrorKind, Handler, HandlerError, LoadParams, LoadResult, Method,
@@ -58,6 +60,10 @@ pub(crate) enum PageError {
     Engine,
     /// 描画結果の取得に失敗した（コンテキストからの読み出し失敗）。
     Capture,
+    /// スクリプト評価が失敗した（コンパイル・実行・シリアライズ・WebView 未準備）。
+    Script,
+    /// 評価対象の文書が既に無い（ページを破棄する）。
+    DocumentGone,
 }
 
 impl PageError {
@@ -66,7 +72,8 @@ impl PageError {
             Self::InvalidUrl => ErrorKind::InvalidParams,
             Self::Timeout => ErrorKind::Timeout,
             Self::LoadFailed | Self::Crashed => ErrorKind::LoadFailed,
-            Self::Engine | Self::Capture => ErrorKind::Internal,
+            Self::Engine | Self::Capture | Self::Script => ErrorKind::Internal,
+            Self::DocumentGone => ErrorKind::NotLoaded,
         }
     }
 }
@@ -152,6 +159,36 @@ impl CurrentPage {
         result.map_err(|e| match e {
             ScreenshotCaptureError::WebViewDoesNotExist => PageError::Crashed,
             _ => PageError::Capture,
+        })
+    }
+
+    /// 読み取り専用スクリプトを `deadline` まで待って評価する（`evaluate_javascript`。TASK-38.4）。
+    ///
+    /// エラー詳細（メッセージ・スタック）はセレクタ等を含みうるため捨てる。呼び出しごとに新しい
+    /// スロットを使い、期限後に届いたコールバックは捨てられたスロットへ書くだけで実害はない。
+    fn evaluate(
+        &self,
+        engine: &Engine,
+        script: String,
+        deadline: Instant,
+    ) -> Result<JSValue, PageError> {
+        let slot: Rc<Cell<Option<Result<JSValue, JavaScriptEvaluationError>>>> =
+            Rc::new(Cell::new(None));
+        let writer = slot.clone();
+        self.webview
+            .evaluate_javascript(script, move |r| writer.set(Some(r)));
+        let result = wait_until(
+            deadline,
+            || slot.take(),
+            || self.delegate.crashed.get(),
+            || {
+                engine.servo().spin_event_loop();
+                std::thread::sleep(POLL_INTERVAL);
+            },
+        )?;
+        result.map_err(|e| match e {
+            JavaScriptEvaluationError::DocumentNotFound => PageError::DocumentGone,
+            _ => PageError::Script,
         })
     }
 }
@@ -286,7 +323,7 @@ impl ServoHandler {
 
 impl Handler for ServoHandler {
     fn capabilities(&self) -> &'static [Method] {
-        &[Method::Load, Method::Screenshot]
+        &[Method::Load, Method::Screenshot, Method::Visibility]
     }
 
     fn load(&mut self, p: &LoadParams) -> Result<LoadResult, HandlerError> {
@@ -322,10 +359,30 @@ impl Handler for ServoHandler {
         screenshot::build_result(image.width(), image.height(), image.as_raw())
             .map_err(|e| HandlerError(e.kind()))
     }
-    // 以下は #233・#234 で置き換える。成功を装わない（REPAIR-3）。
-    fn visibility(&mut self, _p: &SelectorParams) -> Result<VisibilityResult, HandlerError> {
-        Err(HandlerError(ErrorKind::Unsupported))
+
+    /// 現在ページで `selector` の最初の一致要素が描画されるかを返す（`RENDER-3`・TASK-38.4）。
+    ///
+    /// セレクタの検証を最初に行うため、未ロードでも不正なセレクタは `invalid_params`。
+    fn visibility(&mut self, p: &SelectorParams) -> Result<VisibilityResult, HandlerError> {
+        let script = layout::visibility_script(&p.selector).map_err(|e| HandlerError(e.kind()))?;
+        let (Some(page), Some(engine)) = (self.page.as_ref(), self.engine.as_ref()) else {
+            return Err(HandlerError(ErrorKind::NotLoaded));
+        };
+        let deadline = Instant::now() + layout::QUERY_TIMEOUT;
+        let value = match page.evaluate(engine, script, deadline) {
+            Ok(v) => v,
+            Err(e) => {
+                // クラッシュ・文書消失したページは保持しない（以後は not_loaded になる）。
+                if matches!(e, PageError::Crashed | PageError::DocumentGone) {
+                    self.page = None;
+                }
+                return Err(HandlerError(e.kind()));
+            }
+        };
+        layout::parse_visibility(value).map_err(|e| HandlerError(e.kind()))
     }
+
+    // 以下は #234 で置き換える。成功を装わない（REPAIR-3）。
     fn bounding_box(&mut self, _p: &SelectorParams) -> Result<BoundingBoxResult, HandlerError> {
         Err(HandlerError(ErrorKind::Unsupported))
     }
@@ -344,6 +401,8 @@ mod tests {
         assert_eq!(PageError::Crashed.kind(), ErrorKind::LoadFailed);
         assert_eq!(PageError::Engine.kind(), ErrorKind::Internal);
         assert_eq!(PageError::Capture.kind(), ErrorKind::Internal);
+        assert_eq!(PageError::Script.kind(), ErrorKind::Internal);
+        assert_eq!(PageError::DocumentGone.kind(), ErrorKind::NotLoaded);
     }
 
     /// RENDER-4: 来ないフレーム・コールバックを待ち続けず、期限で Timeout を返す。
@@ -403,10 +462,24 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_list_load_and_screenshot() {
+    fn capabilities_list_load_screenshot_and_visibility() {
         assert_eq!(
             ServoHandler::new().capabilities(),
-            &[Method::Load, Method::Screenshot]
+            &[Method::Load, Method::Screenshot, Method::Visibility]
         );
+    }
+
+    /// RENDER-3: 未ロードは not_loaded、不正なセレクタは未ロードでも invalid_params。
+    #[test]
+    fn visibility_without_page_is_rejected() {
+        let mut h = ServoHandler::new();
+        let params = |s: &str| SelectorParams {
+            selector: s.to_string(),
+        };
+        let err = h.visibility(&params("#a")).err().expect("must fail");
+        assert_eq!(err.0, ErrorKind::NotLoaded);
+        let err = h.visibility(&params("a\u{1}")).err().expect("must fail");
+        assert_eq!(err.0, ErrorKind::InvalidParams);
+        assert!(h.engine.is_none());
     }
 }

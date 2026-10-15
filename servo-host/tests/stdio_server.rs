@@ -107,7 +107,7 @@ fn hello_then_unsupported_then_shutdown() {
     assert_eq!(hello["event"], "hello");
     assert_eq!(
         hello["data"]["capabilities"],
-        serde_json::json!(["load", "screenshot", "shutdown"])
+        serde_json::json!(["load", "screenshot", "visibility", "shutdown"])
     );
 
     h.send(r#"{"v":1,"id":1,"method":"evaluate","params":{"script":"1"}}"#);
@@ -145,6 +145,28 @@ fn hello_then_unsupported_then_shutdown() {
 /// ループバックの小さな HTTP サーバー。`hang` なら接続を受けても応答しない。
 /// 戻り値は (ポート, スレッド, 停止通知)。
 fn serve_http(hang: bool) -> (u16, std::thread::JoinHandle<()>, mpsc::Sender<()>) {
+    serve_http_with(SHOT_BODY, hang)
+}
+
+/// 可視性判定用の fixture 本文。
+const VIS_BODY: &str = "<html><head><title>vis</title></head><body style=\"margin:0\">\
+<div id=\"shown\" style=\"width:100px;height:100px\">a</div>\
+<div id=\"none\" style=\"display:none\">b</div>\
+<div style=\"display:none\"><span id=\"child\">x</span></div>\
+<div id=\"vh\" style=\"visibility:hidden;width:50px;height:50px\">c</div>\
+<div id=\"zero\" style=\"width:0;height:0\"></div>\
+<div id=\"off\" style=\"position:absolute;top:-1000px;width:50px;height:50px\">d</div>\
+<div data-k=\"x'y\" style=\"width:10px;height:10px\">e</div>\
+</body></html>";
+
+/// スクリーンショット用の fixture 本文（上半分が赤・下半分が青）。
+const SHOT_BODY: &str = "<html><head><title>fixture</title></head><body style=\"margin:0\"><div style=\"height:400px;background:#f00\"></div><div style=\"height:400px;background:#00f\"></div></body></html>";
+
+/// `serve_http` の本文を指定できる版。
+fn serve_http_with(
+    body: &'static str,
+    hang: bool,
+) -> (u16, std::thread::JoinHandle<()>, mpsc::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     listener.set_nonblocking(true).expect("nonblocking");
@@ -161,7 +183,6 @@ fn serve_http(hang: bool) -> (u16, std::thread::JoinHandle<()>, mpsc::Sender<()>
                     }
                     let mut buf = [0u8; 4096];
                     let _ = conn.read(&mut buf);
-                    let body = "<html><head><title>fixture</title></head><body style=\"margin:0\"><div style=\"height:400px;background:#f00\"></div><div style=\"height:400px;background:#00f\"></div></body></html>";
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -333,6 +354,97 @@ fn screenshot_returns_decodable_png_after_load() {
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert_eq!(rest, 0, "stdout must contain frames only");
     assert!(!stderr.contains("127.0.0.1"), "{stderr}");
+
+    let _ = stop.send(());
+    let _ = srv.join();
+}
+
+/// RENDER-3: 既知の表示・非表示要素に対し正しい可視性と理由を返す。引用符を含むセレクタは
+/// データとして解釈され、不正・制御文字は invalid_params、一致なしは not_found。
+#[test]
+fn visibility_reports_known_states_after_load() {
+    let (port, srv, stop) = serve_http_with(VIS_BODY, false);
+    let closed_port = {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").port()
+    };
+    let mut h = spawn(&["--stdio"]);
+    let _hello = h.recv();
+
+    let vis = |id: u64, selector_json: &str| {
+        format!(
+            r#"{{"v":1,"id":{id},"method":"visibility","params":{{"selector":{selector_json}}}}}"#
+        )
+    };
+    h.send(&vis(1, r##""#shown""##));
+    assert_eq!(
+        h.recv(),
+        r#"{"v":1,"id":1,"error":{"kind":"not_loaded","message":"No page is loaded."}}"#
+    );
+
+    h.send(&load_req(
+        2,
+        &format!("http://127.0.0.1:{port}/vis"),
+        20_000,
+    ));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert!(r["result"].is_object(), "{r}");
+
+    let visible = |id: u64| format!(r#"{{"v":1,"id":{id},"result":{{"visible":true}}}}"#);
+    let hidden = |id: u64, reason: &str| {
+        format!(r#"{{"v":1,"id":{id},"result":{{"visible":false,"reason":"{reason}"}}}}"#)
+    };
+    let cases: [(&str, String); 7] = [
+        (r##""#shown""##, visible(10)),
+        (r##""#none""##, hidden(11, "display_none")),
+        (r##""#child""##, hidden(12, "display_none")),
+        (r##""#vh""##, hidden(13, "visibility_hidden")),
+        (r##""#zero""##, hidden(14, "zero_size")),
+        (r##""#off""##, hidden(15, "offscreen")),
+        (r#""div[data-k=\"x'y\"]""#, visible(16)),
+    ];
+    for (i, (sel, expected)) in cases.iter().enumerate() {
+        h.send(&vis(10 + i as u64, sel));
+        assert_eq!(&h.recv(), expected, "selector {sel}");
+    }
+    h.send(&vis(20, r##""#missing""##));
+    assert_eq!(
+        h.recv(),
+        r#"{"v":1,"id":20,"error":{"kind":"not_found","message":"No element matches the selector."}}"#
+    );
+    for (id, sel) in [(21, r#""[[""#), (22, r#""a\u0001""#)] {
+        h.send(&vis(id, sel));
+        assert_eq!(
+            h.recv(),
+            format!(
+                r#"{{"v":1,"id":{id},"error":{{"kind":"invalid_params","message":"Invalid parameters."}}}}"#
+            ),
+            "selector {sel}"
+        );
+    }
+
+    // load 失敗後は前ページの結果を返さない。
+    h.send(&load_req(
+        30,
+        &format!("http://127.0.0.1:{closed_port}/"),
+        20_000,
+    ));
+    let _ = h.recv();
+    h.send(&vis(31, r##""#shown""##));
+    assert_eq!(
+        h.recv(),
+        r#"{"v":1,"id":31,"error":{"kind":"not_loaded","message":"No page is loaded."}}"#
+    );
+
+    h.send(r#"{"v":1,"id":32,"method":"shutdown"}"#);
+    assert_eq!(h.recv(), r#"{"v":1,"id":32,"result":{}}"#);
+    let (code, rest, stderr) = h.finish();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(rest, 0, "stdout must contain frames only");
+    assert!(
+        !stderr.contains("data-k") && !stderr.contains("missing") && !stderr.contains("127.0.0.1"),
+        "{stderr}"
+    );
 
     let _ = stop.send(());
     let _ = srv.join();
