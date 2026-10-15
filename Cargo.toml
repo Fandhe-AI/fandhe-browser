@@ -23,6 +23,11 @@ resolver = "3"
 # `make check-workspace-manifest`（`make ci` に含む）が `cargo verify-project`
 # で常時この manifest の妥当性を検証する。
 members = ["crates/*", "harness/wpt_subset_runner"]
+# Servo ホスト（`servo-host/`。TASK-38・RENDER-1・#985）は Servo（MPL-2.0）を隔離するため
+# 別 workspace・別 Cargo.lock の package とする。`crates/*` の外に置いても親 workspace に
+# 自動取り込みされないよう明示的に除外する。`make check-workspace-manifest` が
+# members への混入と、ルート Cargo.lock の servo / mozjs 系を検査する。
+exclude = ["servo-host"]
 
 [workspace.package]
 # 各 crate 側は `version.workspace = true` 等（`edition`/`license` も同様）で

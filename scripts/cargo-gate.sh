@@ -2,7 +2,8 @@
 # Cargo 系ローカルゲート。Cargo.toml / member crate が未整備の段階では誤って落とさず skip する
 # （workspace 作成後に自動で有効化される冪等セルフヒール）。
 # 使い方: scripts/cargo-gate.sh <gate>
-#   check-workspace-manifest  cargo verify-project（member の有無に依らず Cargo.toml のみで判定）
+#   check-workspace-manifest  cargo verify-project（member の有無に依らず Cargo.toml のみで判定）＋
+#                             Servo ホスト分離検査（check-servo-host-isolation.sh。TASK-38・#985）
 #   fmt | fmt-check | lint | test                 既定 feature の整形・clippy・test
 #   lint-rendering | test-rendering               --features rendering（Servo 込み。feature 未定義の間は skip）
 #   check-render-isolation | check-js-engine-isolation   依存グラフ分離検証（正本は各 check-*-isolation.sh）
@@ -67,6 +68,8 @@ case "${gate}" in
       echo "error: cargo verify-project did not report success" >&2
       exit 1
     fi
+    # servo-host/ が members に現れず、ルート Cargo.lock に servo / mozjs 系が無いこと（RENDER-1）。
+    bash scripts/check-servo-host-isolation.sh
     ;;
   fmt) need_members; cargo fmt --all ;;
   fmt-check) need_members; cargo fmt --all --check ;;

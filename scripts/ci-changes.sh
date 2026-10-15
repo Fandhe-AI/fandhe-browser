@@ -115,6 +115,7 @@ self_test() {
   expect "no trailing newline" "rust=true harness=false" $'docs/a.md\ncrates/a.rs'
   expect ".github change" "rust=true harness=false" $'.github/workflows/ci.yml'
   expect "Cargo.lock" "rust=true harness=false" $'Cargo.lock'
+  expect "servo-host (separate workspace; fail-closed)" "rust=true harness=false" $'servo-host/Cargo.toml\nservo-host/src/main.rs\nservo-host/Cargo.lock'
   expect "scripts" "rust=true harness=false" $'scripts/ci-changes.sh'
   expect "rust-toolchain.toml" "rust=true harness=false" $'rust-toolchain.toml'
   expect "empty input runs all (fail-closed)" "rust=true harness=true" ''

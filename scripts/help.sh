@@ -26,7 +26,7 @@ Docs / config lint
   lint-docs                  (runs the four above in order)                all docs/config lint
 
 Rust checks (skipped while Cargo.toml or member crates are absent)
-  check-workspace-manifest   scripts/cargo-gate.sh check-workspace-manifest  cargo verify-project
+  check-workspace-manifest   scripts/cargo-gate.sh check-workspace-manifest  cargo verify-project + servo-host isolation
   fmt / fmt-check            scripts/cargo-gate.sh fmt | fmt-check         format / detect formatting diffs
   lint / test                scripts/cargo-gate.sh lint | test             clippy -D warnings / cargo test (default features)
   lint-rendering / test-rendering  scripts/cargo-gate.sh lint-rendering | test-rendering  --features rendering (with Servo)
