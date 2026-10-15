@@ -201,6 +201,7 @@ mod tests {
         assert_eq!(visibility_script("a\nb"), Err(LayoutError::InvalidSelector));
     }
 
+    /// RENDER-3（TASK-38.4・#233）: 既知の結果形状を受理する。
     #[test]
     fn parse_visibility_accepts_known_shapes() {
         let r = parse_visibility(obj(&[
@@ -230,6 +231,7 @@ mod tests {
         );
     }
 
+    /// RENDER-3（TASK-38.4・#233）: 不正な結果や未知 reason を MalformedResult で拒否する。
     #[test]
     fn parse_visibility_rejects_malformed_results() {
         let hidden = |extra: &[(&str, JSValue)]| {
@@ -260,6 +262,7 @@ mod tests {
         }
     }
 
+    /// RENDER-3（TASK-38.4・#233）: LayoutError を ErrorKind へ写像する。
     #[test]
     fn layout_error_maps_to_error_kind() {
         assert_eq!(
@@ -270,6 +273,7 @@ mod tests {
         assert_eq!(LayoutError::MalformedResult.kind(), ErrorKind::Internal);
     }
 
+    /// RENDER-4（TASK-38.4・#233）: 要素クエリの待機上限が 5 秒である。
     #[test]
     fn query_timeout_is_five_seconds() {
         assert_eq!(QUERY_TIMEOUT, Duration::from_secs(5));
