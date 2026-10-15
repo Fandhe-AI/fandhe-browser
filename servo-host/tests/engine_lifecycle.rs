@@ -69,7 +69,7 @@ fn unknown_and_missing_args_are_rejected() {
         let (code, _out, err) = run(args);
         assert_eq!(code, Some(1), "args: {args:?}");
         assert!(
-            err.contains("supports only --version and --selftest"),
+            err.contains("supports only --version, --selftest and --stdio"),
             "stderr: {err}"
         );
     }
