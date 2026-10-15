@@ -39,6 +39,11 @@ use crate::ws;
 /// `CdpState::new` が払い出すブラウザ ID 用のプロセス内連番。
 static BROWSER_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// ブラウザ ID の連番に立てる最上位ビット。ターゲット ID は 1 から昇順に払い出すため、
+/// 名前空間を分けて両者が衝突しないようにする（`Target.closeTarget` はブラウザ ID を拒否するため、
+/// 衝突すると最初のページが閉じられなくなる。`CDP-1`）。
+const BROWSER_ID_NAMESPACE: u64 = 1 << 63;
+
 /// CDP サーバーのルータ・ハンドラが共有する状態。共有は `Arc<CdpState>` で行う（`Clone` なし）。
 ///
 /// ブラウザ ID は識別子であって認証情報ではない。アクセス制御は `SEC-4`
@@ -61,7 +66,7 @@ impl CdpState {
     /// 決定的（プロセス内連番）なブラウザ ID で構築する。
     pub fn new(app: Arc<AppState>) -> Self {
         let n = BROWSER_SEQ.fetch_add(1, Ordering::Relaxed);
-        Self::with_browser_id(app, BrowserId::from_counter(n))
+        Self::with_browser_id(app, BrowserId::from_counter(n | BROWSER_ID_NAMESPACE))
     }
 
     /// ブラウザ ID を指定して構築する（テスト・cli からの注入用）。

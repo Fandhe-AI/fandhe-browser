@@ -1,4 +1,4 @@
-//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c、段階 2b は 43.3d、段階 2g は 43.3g）。
+//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c、段階 2b は 43.3d、段階 2g は 43.3g、段階 2h は 43.3h）。
 //!
 //! `protocol::builtin_handlers` から登録される。`Browser.getVersion`（43.3a）・
 //! `Target.getTargetInfo`（43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（43.3c）を
@@ -236,6 +236,63 @@ impl CommandHandler for TargetCreateBrowserContext {
             Ok(HandlerOutput::result(
                 json!({ "browserContextId": id.as_str() }),
             ))
+        })
+    }
+}
+
+/// `Target.closeTarget`（`CDP-2`・`CDP-7`・`SEC-2`・`REPAIR-3`・TASK-43.3h・#1028）。
+///
+/// Playwright は `newPage()` の初期化失敗時に `page._close()` でこれを送り、応答の成否は見ずに
+/// `Target.detachedFromTarget` 等の close イベントを待つ。成功時は `{"success":true}` を返し、
+/// 自接続が attach 済みのセッションごとに `Target.detachedFromTarget` を応答の後に送出する
+/// （`DispatchOutcome` の規約どおり応答 → イベント）。他接続のセッションの通知は、その接続の
+/// 次のコマンドに同伴する（push 経路が無いため。`ConnectionScoped::reconcile_auto_attach`）。
+///
+/// 閉じてよいのは既定 context か自接続が所有する context のターゲットだけ（判定は
+/// `TargetRegistry::close_target_in_contexts`。ターゲット単位の所有は #910 で広げる）。
+/// 未知・他接続の context・ブラウザ自身の ID・不正な ID はすべて同じ固定文言の `INVALID_PARAMS`
+/// にして存在を問い合わせる手段にしない。`sessionId` 付きは `UNSUPPORTED_PARAMS`、接続なしは
+/// `NO_CONNECTION`。ブラウザ全体は終了しない。
+///
+/// 未実装（`REPAIR-3`）: `Target.targetDestroyed` は `Target.setDiscoverTargets` が未実装で
+/// discover 有効な接続が存在しないため送らない。実装時は下の `detachedFromTarget` の後ろへ足す。
+pub(crate) struct TargetCloseTarget;
+
+impl CommandHandler for TargetCloseTarget {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            if ctx.session_id.is_some() {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let s = params
+                .get("targetId")
+                .and_then(Value::as_str)
+                .ok_or(CdpError::INVALID_PARAMS)?;
+            let id = TargetId::parse(s).map_err(|_| CdpError::INVALID_PARAMS)?;
+            let state = ctx.state;
+            // ブラウザ ID は registry を引く前に拒否する（TargetId と書式が同じで衝突し得る）。
+            if id.as_str() == state.browser_id().as_str() {
+                return Err(CdpError::INVALID_PARAMS);
+            }
+            let conn = ctx.conn.ok_or(CdpError::NO_CONNECTION)?;
+            let sessions = state
+                .conn_scoped()
+                .close_target(conn, state.registry(), &id)
+                .map_err(|e| match e {
+                    ConnStateError::NotLive => CdpError::NO_CONNECTION,
+                    ConnStateError::Registry(_) => CdpError::INVALID_PARAMS,
+                })?;
+            state.navigations().forget(&id);
+            let mut out = HandlerOutput::result(json!({ "success": true }));
+            for sid in &sessions {
+                out = out.with_event(detached_event(&id, sid));
+            }
+            // TODO(REPAIR-3): `Target.setDiscoverTargets` 実装時にここへ `Target.targetDestroyed` を足す。
+            Ok(out)
         })
     }
 }
@@ -1222,6 +1279,207 @@ mod tests {
             call(&st, Some(c1), &dl(1, r#""behavior":"deny""#)).await;
             assert!(st.conn_scoped().download(c1).is_some());
             assert!(st.conn_scoped().download(c2).is_none());
+        }
+
+        fn close_req(id: i64, tid: &str) -> String {
+            format!(
+                r#"{{"id":{id},"method":"Target.closeTarget","params":{{"targetId":"{tid}"}}}}"#
+            )
+        }
+
+        fn detached(t: &TargetId, s: &str) -> Value {
+            json!({"method":"Target.detachedFromTarget","params":{"sessionId":s,"targetId":t.as_str()}})
+        }
+
+        #[tokio::test]
+        async fn cdp2_close_target_returns_success_then_detaches_once() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            let f = call(&st, Some(c), &auto_attach(1, ON)).await;
+            let sid = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            let f = call(&st, Some(c), &close_req(2, t.as_str())).await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"id":2,"result":{"success":true}}),
+                    detached(&t, &sid)
+                ]
+            );
+            assert!(st.registry().target(&t).is_none());
+            assert_eq!(st.registry().session_count(), 0);
+            // 二重送出しない。
+            let f = call(&st, Some(c), r#"{"id":3,"method":"Browser.getVersion"}"#).await;
+            assert_eq!(f.len(), 1);
+            // 閉じたターゲットは getTargetInfo で引けない。
+            let req = format!(
+                r#"{{"id":4,"method":"Target.getTargetInfo","params":{{"targetId":"{}"}}}}"#,
+                t.as_str()
+            );
+            assert_eq!(
+                call(&st, Some(c), &req).await,
+                vec![err(-32602, "invalid params", 4)]
+            );
+            // 接続・ブラウザ ID は使い続けられる。
+            let f = call(&st, Some(c), r#"{"id":5,"method":"Target.getTargetInfo"}"#).await;
+            assert_eq!(
+                f[0]["result"]["targetInfo"]["targetId"],
+                st.browser_id().as_str()
+            );
+            assert!(st.navigations().get(&t).is_none());
+        }
+
+        #[tokio::test]
+        async fn cdp2_close_target_without_attach_emits_only_response() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            let f = call(&st, Some(c), &close_req(1, t.as_str())).await;
+            assert_eq!(f, vec![json!({"id":1,"result":{"success":true}})]);
+        }
+
+        #[tokio::test]
+        async fn sec2_close_target_rejects_unknown_invalid_and_browser_id() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            let bad = err(-32602, "invalid params", 1);
+            let ghost = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+            for req in [
+                close_req(1, ghost),
+                close_req(1, "bad id!"),
+                close_req(1, st.browser_id().as_str()),
+                r#"{"id":1,"method":"Target.closeTarget","params":{"targetId":5}}"#.to_owned(),
+                r#"{"id":1,"method":"Target.closeTarget","params":{}}"#.to_owned(),
+            ] {
+                assert_eq!(call(&st, Some(c), &req).await, vec![bad.clone()], "{req}");
+            }
+            assert!(st.registry().target(&t).is_some());
+        }
+
+        /// 新規構築直後の最初のページ ID がブラウザ ID と衝突せず、閉じられて
+        /// `detachedFromTarget` が送られる一方、ブラウザ ID は拒否される（`CDP-2`・`SEC-2`）。
+        #[tokio::test]
+        async fn cdp2_close_target_first_page_on_fresh_state_is_closable() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            assert_ne!(t.as_str(), st.browser_id().as_str());
+            let f = call(&st, Some(c), &auto_attach(1, ON)).await;
+            let sid = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            assert_eq!(
+                call(&st, Some(c), &close_req(2, t.as_str())).await,
+                vec![
+                    json!({"id":2,"result":{"success":true}}),
+                    detached(&t, &sid)
+                ]
+            );
+            assert!(st.registry().target(&t).is_none());
+            assert_eq!(
+                call(&st, Some(c), &close_req(3, st.browser_id().as_str())).await,
+                vec![err(-32602, "invalid params", 3)]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp7_close_target_rejects_other_connections_context() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let (a, b) = (open_conn(&st, 1), open_conn(&st, 2));
+            let ctx = make_context(&st, a).await;
+            let t = st
+                .registry()
+                .create_target_in(&ctx, TargetKind::Page, "about:blank")
+                .unwrap();
+            assert_eq!(
+                call(&st, Some(b), &close_req(1, t.as_str())).await,
+                vec![err(-32602, "invalid params", 1)]
+            );
+            assert!(st.registry().target(&t).is_some());
+            assert_eq!(
+                call(&st, Some(a), &close_req(2, t.as_str())).await,
+                vec![json!({"id":2,"result":{"success":true}})]
+            );
+            assert!(st.registry().target(&t).is_none());
+        }
+
+        #[tokio::test]
+        async fn cdp7_close_target_notifies_other_connection_once() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let (a, b) = (open_conn(&st, 1), open_conn(&st, 2));
+            let t = new_page(&st, "about:blank");
+            call(&st, Some(a), &auto_attach(1, ON)).await;
+            let fb = call(&st, Some(b), &auto_attach(1, ON)).await;
+            let sb = fb[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            let f = call(&st, Some(a), &close_req(2, t.as_str())).await;
+            assert_eq!(f.len(), 2);
+            let ver = r#"{"id":3,"method":"Browser.getVersion"}"#;
+            let f = call(&st, Some(b), ver).await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(f[1], detached(&t, &sb));
+            assert_eq!(call(&st, Some(b), ver).await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn cdp2_close_target_rejects_session_and_requires_connection() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            let with_session = format!(
+                r#"{{"id":1,"method":"Target.closeTarget","sessionId":"S1","params":{{"targetId":"{}"}}}}"#,
+                t.as_str()
+            );
+            assert_eq!(
+                call(&st, Some(c), &with_session).await,
+                vec![
+                    json!({"id":1,"sessionId":"S1","error":{"code":-32602,"message":"unsupported params"}})
+                ]
+            );
+            assert_eq!(
+                call(&st, None, &close_req(2, t.as_str())).await,
+                vec![err(-32000, "no connection", 2)]
+            );
+            assert!(st.registry().target(&t).is_some());
+        }
+
+        #[tokio::test]
+        async fn cdp1_commands_to_closed_session_are_rejected() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            let f = call(&st, Some(c), &auto_attach(1, ON)).await;
+            let sid = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            call(&st, Some(c), &close_req(2, t.as_str())).await;
+            for (i, m) in [
+                ("DOM.getDocument", "{}"),
+                ("Page.navigate", r#"{"url":"about:blank"}"#),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let req = format!(
+                    r#"{{"id":{},"method":"{}","sessionId":"{sid}","params":{}}}"#,
+                    10 + i,
+                    m.0,
+                    m.1
+                );
+                let id = 10 + i as i64;
+                assert_eq!(
+                    call(&st, Some(c), &req).await,
+                    vec![
+                        json!({"id":id,"sessionId":sid,"error":{"code":-32602,"message":"invalid params"}})
+                    ],
+                    "{}",
+                    m.0
+                );
+            }
         }
     }
 }

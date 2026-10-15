@@ -407,3 +407,51 @@ async fn cdp2_auto_attach_over_websocket_emits_event_after_response_and_frees_se
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn cdp2_close_target_over_websocket_emits_detached_after_response() {
+    let dir = TempDir::new();
+    let (addr, st) = start(&dir).await;
+    let target = st
+        .registry()
+        .create_target(fandhe_browser_cdp::TargetKind::Page, "about:blank")
+        .unwrap();
+    let st2 = Arc::clone(&st);
+    let target_id = target.as_str().to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut s = connect(addr);
+        assert_eq!(
+            upgrade(&mut s, "/devtools/browser/trace-1", addr.port()),
+            101
+        );
+        let req = json!({"id": 1, "method": "Target.setAutoAttach",
+            "params": {"autoAttach": true, "flatten": true}});
+        send_text(&mut s, &req.to_string());
+        assert_eq!(read_text_json(&mut s), json!({"id": 1, "result": {}}));
+        let attached = read_text_json(&mut s);
+        let session_id = attached["params"]["sessionId"].as_str().unwrap().to_owned();
+        let req = json!({"id": 2, "method": "Target.closeTarget",
+            "params": {"targetId": target_id}});
+        send_text(&mut s, &req.to_string());
+        // 送出順は応答 → detachedFromTarget（CDP-5）。
+        assert_eq!(
+            read_text_json(&mut s),
+            json!({"id": 2, "result": {"success": true}})
+        );
+        assert_eq!(
+            read_text_json(&mut s),
+            json!({"method": "Target.detachedFromTarget",
+                "params": {"sessionId": session_id, "targetId": target_id}})
+        );
+        // 接続は閉じたページの後も使える。
+        send_text(
+            &mut s,
+            &json!({"id": 3, "method": "Browser.getVersion"}).to_string(),
+        );
+        assert_eq!(read_text_json(&mut s)["id"], 3);
+        assert!(st2.registry().target(&target).is_none());
+        assert_eq!(st2.registry().session_count(), 0);
+    })
+    .await
+    .unwrap();
+}
