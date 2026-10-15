@@ -2,6 +2,7 @@
 //! （RENDER-1・RENDER-3・PLUG-1・SEC-2。TASK-38（38.6）・#235・設計
 //! `docs/design/servo-host-design.md` §2.2・§2.4・§2.5・§2.7・§3.1・§3.3）。
 //!
+//! `dyn Renderer` 越しの結合テストは `tests/basic_api.rs`（偽ホスト。TASK-38.8a・#237）。
 //! cdp・ai は `AppState` 経由の `dyn Renderer` でしか描画に触れない。本型は [`HostProcess`]
 //! （子プロセス管理）を包み、ホストのメソッドを次のように対応させる。cli への注入は #236。
 //!

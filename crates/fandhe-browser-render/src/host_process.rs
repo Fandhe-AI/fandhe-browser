@@ -5,7 +5,7 @@
 //! （static・プールは置かない。PROF 境界）。後続の `HostRenderer`（#235）が core の
 //! `Renderer` として本型を包み、cli（#236）が設定 `render.host_path` を
 //! [`resolve_host_binary_from_process`] へ渡す。偽ホストを使う結合テストは
-//! `tests/host_process.rs`。
+//! `tests/host_process.rs`（HostProcess 層）・`tests/basic_api.rs`（Renderer 層。TASK-38.8a）。
 //!
 //! # 方針
 //!
