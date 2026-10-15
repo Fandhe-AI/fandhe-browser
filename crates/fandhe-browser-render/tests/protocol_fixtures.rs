@@ -428,13 +428,24 @@ fn plug1_fixture_coverage() {
         Some("invalid")
     );
     // 有効な id を導出できない要求には、無関係な id の応答を返さず接続を閉じる。
-    for n in ["request-id-negative.json", "request-id-string.json"] {
+    for n in [
+        "request-id-negative.json",
+        "request-id-string.json",
+        "request-truncated-json.json",
+    ] {
         assert_eq!(
             by(n).s("expected_host_action"),
             Some("close_connection"),
             "{n}"
         );
     }
+    // id が有効な不正 load には同じ id で invalid_params を返す。
+    let frac = by("request-load-timeout-fractional.json");
+    assert_eq!(frac.v["expected_response"]["id"], 1);
+    assert_eq!(
+        frac.v["expected_response"]["error"]["kind"],
+        "invalid_params"
+    );
     for n in [
         "request-load-no-params.json",
         "request-visibility-no-params.json",
