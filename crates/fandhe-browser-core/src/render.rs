@@ -10,7 +10,7 @@
 //! [`DisabledRenderer`] を提供する（TASK-33（サブタスク 33.3）・issue #47）。
 //!
 //! ページ指定（[`Renderer::load`]・[`PageRef`]・[`PageLoad`]）は TASK-38・#987（`RENDER-1`・
-//! `RENDER-3`）で追加した。`HostRenderer` による実装は #235。
+//! `RENDER-3`）で追加した。`HostRenderer` による実装は #235（済み）。
 //!
 //! ## 本モジュールの範囲外（将来仕様。REPAIR-3: 実装済みを装わない）
 //!
