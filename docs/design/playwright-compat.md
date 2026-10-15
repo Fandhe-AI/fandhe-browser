@@ -303,7 +303,7 @@ playwright-core 1.63.0 のソース読解では、`FrameSession._initialize` の
 **`Page.enable` の `-32601`**（`browserContext.newPage: Protocol error (Page.enable): method not implemented`）で失敗する。
 空の成功やスタブで通さず、停止点を固定する（`CDP-2`・`CDP-6`・`SEC-2`・`REPAIR-3`）。
 
-停止したメソッドの一覧（トレース seq 19・32〜43。すべてセッション付き。`sessionId` は正規化済みの `…0001`）:
+停止したメソッドの一覧（トレース seq 19・32・34〜43。すべてセッション付き。`sessionId` は正規化済みの `…0001`）:
 
 | id | メソッド | エラー（code / message） | Playwright 側の扱い |
 | -- | -------- | ------------------------ | ------------------- |
