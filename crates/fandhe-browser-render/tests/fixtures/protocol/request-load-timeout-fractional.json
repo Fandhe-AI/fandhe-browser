@@ -1,0 +1,8 @@
+{
+  "case": "load-timeout-fractional",
+  "direction": "request",
+  "method": "load",
+  "expect": "invalid",
+  "raw": "{\"v\":1,\"id\":1,\"method\":\"load\",\"params\":{\"url\":\"https://example.com/\",\"timeout_ms\":10000.5}}",
+  "note": "A number with a non-zero fractional part is not an integer."
+}

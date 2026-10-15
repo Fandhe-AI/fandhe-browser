@@ -1,0 +1,8 @@
+{
+  "case": "load-timeout-float-notation",
+  "direction": "request",
+  "method": "load",
+  "expect": "valid",
+  "raw": "{\"v\":1,\"id\":1,\"method\":\"load\",\"params\":{\"url\":\"https://example.com/\",\"timeout_ms\":10000.0}}",
+  "note": "Integer-valued number notation (10000.0) is a valid integer under JSON Schema semantics."
+}

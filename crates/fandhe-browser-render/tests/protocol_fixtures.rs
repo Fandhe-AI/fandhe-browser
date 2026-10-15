@@ -113,7 +113,13 @@ fn validate(root: &Value, sch: &Value, v: &Value, path: &str, errs: &mut Vec<Str
             "array" => v.is_array(),
             "string" => v.is_string(),
             "boolean" => v.is_boolean(),
-            "integer" => v.is_i64() || v.is_u64(),
+            // JSON Schema の integer は小数部ゼロの数値（1.0・1e0）も含む。
+            "integer" => {
+                v.is_i64()
+                    || v.is_u64()
+                    || v.as_f64()
+                        .is_some_and(|x| x.is_finite() && x.fract() == 0.0)
+            }
             "number" => v.is_number(),
             other => panic!("unsupported type {other}"),
         };
@@ -449,6 +455,14 @@ fn plug1_fixture_coverage() {
         by("response-error-and-bad-result.json").s("expect"),
         Some("invalid")
     );
+    // 数値表記の揺れ: 小数部ゼロは整数として有効、小数部ありは無効。
+    for (n, e) in [
+        ("request-id-float-notation.json", "valid"),
+        ("request-load-timeout-float-notation.json", "valid"),
+        ("request-load-timeout-fractional.json", "invalid"),
+    ] {
+        assert_eq!(by(n).s("expect"), Some(e), "{n}");
+    }
     assert!(
         fixtures.iter().any(|f| f.s("raw").is_some()),
         "no raw fixture"
