@@ -1,13 +1,14 @@
 {
-  "case": "load-missing-status",
+  "case": "load-status-out-of-range",
   "direction": "response",
   "method": "load",
   "expect": "invalid",
   "message": {
     "v": 1,
-    "id": 64,
+    "id": 65,
     "result": {
-      "final_url": "https://example.com/"
+      "final_url": "https://example.com/",
+      "status": 99
     }
   }
 }

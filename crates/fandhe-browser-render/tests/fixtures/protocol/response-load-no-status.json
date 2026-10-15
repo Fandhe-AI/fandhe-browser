@@ -1,0 +1,13 @@
+{
+  "case": "load-no-status",
+  "direction": "response",
+  "method": "load",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 64,
+    "result": {
+      "final_url": "https://example.com/"
+    }
+  }
+}
