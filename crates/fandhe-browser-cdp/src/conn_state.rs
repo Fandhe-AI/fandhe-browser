@@ -6,6 +6,11 @@
 //! 構造は `dom::IssuedDocuments` と同じく「生存中の接続のみ記録を受け付ける」表で、切断との競合で
 //! 閉じた接続の状態が残らないようにする。
 //!
+//! `Target.createBrowserContext`（`disposeOnDetach:true`。TASK-43.3d・#909）で作った browser context も
+//! 接続が所有し、切断で [`ConnectionScoped::release`] が返す ID を呼び出し側が
+//! `TargetRegistry::dispose_browser_context` して破棄する（永続 context は `Target.disposeBrowserContext`
+//! 未実装のため作らせない。`CDP-7`）。
+//!
 //! # 資源の所有と解放（`CDP-7`）
 //!
 //! [`crate::target::TargetRegistry`] のセッション表は全接続共有で [`crate::target::MAX_SESSIONS`] 件の
@@ -27,7 +32,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use crate::protocol::ConnId;
-use crate::target::{CdpStateError, SessionId, TargetId, TargetInfo, TargetRegistry};
+use crate::target::{
+    BrowserContextId, CdpStateError, SessionId, TargetId, TargetInfo, TargetRegistry,
+};
 
 /// `downloadPath` の最大バイト長（巨大入力による無制限消費の防止）。
 pub(crate) const MAX_DOWNLOAD_PATH_LEN: usize = 4096;
@@ -106,6 +113,18 @@ struct Entry {
     /// registry 側で消えたため所有記録から落としたが、まだ `Target.detachedFromTarget` を送出していないもの。
     pending_detached: Vec<(TargetId, SessionId)>,
     download: Option<DownloadSettings>,
+    /// この接続が `Target.createBrowserContext` で作った browser context（切断で破棄する）。
+    /// 件数は registry 側の `MAX_BROWSER_CONTEXTS` で抑えられる。
+    owned_contexts: Vec<BrowserContextId>,
+}
+
+/// [`ConnectionScoped::release`] が返す、切断時に解放すべき資源。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Released {
+    /// 自動 attach が払い出したセッション。
+    pub sessions: Vec<SessionId>,
+    /// この接続が所有していた browser context。
+    pub contexts: Vec<BrowserContextId>,
 }
 
 /// 接続操作の失敗。
@@ -149,13 +168,32 @@ impl ConnectionScoped {
         self.lock().entry(conn).or_default();
     }
 
-    /// 接続の状態を取り除き、所有していた自動 attach のセッション ID を返す。
-    /// 呼び出し側（`CdpState::release_connection`）が registry で `detach` する。
-    pub(crate) fn release(&self, conn: ConnId) -> Vec<SessionId> {
+    /// 接続の状態を取り除き、所有していた自動 attach のセッション ID と browser context を返す。
+    /// 呼び出し側（`CdpState::release_connection`）が registry で `detach`・`dispose_browser_context` する。
+    pub(crate) fn release(&self, conn: ConnId) -> Released {
         self.lock()
             .remove(&conn)
-            .map(|e| e.auto_attached.into_iter().map(|(_, s)| s).collect())
+            .map(|e| Released {
+                sessions: e.auto_attached.into_iter().map(|(_, s)| s).collect(),
+                contexts: e.owned_contexts,
+            })
             .unwrap_or_default()
+    }
+
+    /// 生存中の接続の所有として browser context を作る。接続が生存中でなければ作らない
+    /// （切断との競合で、誰も破棄しない context が残らないようにする。`CDP-7`）。
+    pub(crate) fn create_owned_browser_context(
+        &self,
+        conn: ConnId,
+        registry: &TargetRegistry,
+    ) -> Result<BrowserContextId, ConnStateError> {
+        let mut map = self.lock();
+        let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
+        let id = registry
+            .create_browser_context()
+            .map_err(ConnStateError::Registry)?;
+        entry.owned_contexts.push(id.clone());
+        Ok(id)
     }
 
     /// 自動 attach を有効にし、未 attach の既存ターゲットすべてへ attach して
@@ -312,6 +350,15 @@ impl ConnectionScoped {
         self.lock().get(&conn).and_then(|e| e.download.clone())
     }
 
+    /// この接続が所有する browser context（テスト用）。
+    #[cfg(test)]
+    pub(crate) fn owned_contexts(&self, conn: ConnId) -> Vec<BrowserContextId> {
+        self.lock()
+            .get(&conn)
+            .map(|e| e.owned_contexts.clone())
+            .unwrap_or_default()
+    }
+
     /// 生存中の接続数（テスト用）。
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -381,7 +428,7 @@ mod tests {
         assert_eq!(rec.detached, vec![(t, sid)]);
         assert_eq!(rec.error, None);
         assert_eq!(cs.reconcile_auto_attach(c, &r, true), Reconciled::default());
-        assert!(cs.release(c).is_empty());
+        assert!(cs.release(c).sessions.is_empty());
     }
 
     #[test]
@@ -452,7 +499,7 @@ mod tests {
             }))
         );
         assert_eq!(r.session_count(), before);
-        assert!(cs.release(c).is_empty());
+        assert!(cs.release(c).sessions.is_empty());
     }
 
     #[test]
@@ -468,7 +515,13 @@ mod tests {
         // 別接続は同じターゲットへ独立に attach する。
         assert_eq!(cs.enable_auto_attach(c2, &r, false).unwrap().len(), 1);
         assert_eq!(r.session_count(), 2);
-        assert_eq!(cs.release(c1), vec![s1[0].1.clone()]);
+        assert_eq!(
+            cs.release(c1),
+            Released {
+                sessions: vec![s1[0].1.clone()],
+                contexts: vec![]
+            }
+        );
         assert_eq!(cs.len(), 1);
         assert_eq!(
             cs.enable_auto_attach(c1, &r, false),
@@ -502,6 +555,40 @@ mod tests {
         let sid = cs.enable_auto_attach(c, &r, false).unwrap().remove(0).1;
         r.close_target(&t).unwrap();
         assert_eq!(cs.disable_auto_attach(c, &r).unwrap(), vec![(t, sid)]);
+    }
+
+    #[test]
+    fn cdp7_owned_browser_contexts_are_returned_on_release_only_for_owner() {
+        let r = TargetRegistry::new();
+        let cs = ConnectionScoped::new();
+        let (c1, c2) = (ConnId::new(1), ConnId::new(2));
+        cs.open(c1);
+        cs.open(c2);
+        let a = cs.create_owned_browser_context(c1, &r).unwrap();
+        let b = cs.create_owned_browser_context(c2, &r).unwrap();
+        assert_eq!(cs.owned_contexts(c1), vec![a.clone()]);
+        let rel = cs.release(c1);
+        assert_eq!(rel.contexts, vec![a]);
+        assert!(rel.sessions.is_empty());
+        assert_eq!(cs.owned_contexts(c2), vec![b]);
+    }
+
+    #[test]
+    fn cdp7_create_owned_browser_context_requires_live_connection() {
+        let r = TargetRegistry::new();
+        let cs = ConnectionScoped::new();
+        let c = ConnId::new(1);
+        assert_eq!(
+            cs.create_owned_browser_context(c, &r),
+            Err(ConnStateError::NotLive)
+        );
+        cs.open(c);
+        cs.release(c);
+        assert_eq!(
+            cs.create_owned_browser_context(c, &r),
+            Err(ConnStateError::NotLive)
+        );
+        assert_eq!(r.browser_context_count(), 0);
     }
 
     #[test]
