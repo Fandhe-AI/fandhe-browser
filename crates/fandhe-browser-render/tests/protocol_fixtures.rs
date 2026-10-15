@@ -89,6 +89,28 @@ fn resolve<'a>(root: &'a Value, r: &str) -> &'a Value {
     def(root, name)
 }
 
+/// JSON Schema の `const` 等価性。数値は表記ではなく値で比較する（1 と 1.0・1e0 は等価）。
+fn json_const_eq(c: &Value, v: &Value) -> bool {
+    match (c, v) {
+        (Value::Number(a), Value::Number(b)) => match (a.as_f64(), b.as_f64()) {
+            (Some(x), Some(y)) => x == y,
+            _ => a == b,
+        },
+        _ => c == v,
+    }
+}
+
+/// フレーム上限（バイト）。screenshot 応答だけ専用上限を使う（設計の limits 既定値）。
+fn frame_limit(direction: &str, method: Option<&str>) -> usize {
+    match (direction, method) {
+        ("request", _) => 65536,
+        ("response", Some("screenshot")) => 25_165_824,
+        ("response", _) => 1_048_576,
+        ("hello", _) => 16384,
+        other => panic!("direction {other:?}"),
+    }
+}
+
 /// 最小検証器。違反を `path: 理由` の形で `errs` に積む。
 fn validate(root: &Value, sch: &Value, v: &Value, path: &str, errs: &mut Vec<String>) {
     let Some(obj) = sch.as_object() else {
@@ -98,7 +120,7 @@ fn validate(root: &Value, sch: &Value, v: &Value, path: &str, errs: &mut Vec<Str
         validate(root, resolve(root, r), v, path, errs);
     }
     if let Some(c) = obj.get("const")
-        && c != v
+        && !json_const_eq(c, v)
     {
         errs.push(format!("{path}: const {c} expected"));
     }
@@ -592,12 +614,7 @@ fn plug1_limits_defaults_are_consistent() {
 fn plug1_fixture_messages_fit_frame_limits() {
     for f in load_fixtures() {
         let Some(m) = message(&f) else { continue };
-        let limit = match f.s("direction") {
-            Some("request") => 65536,
-            Some("response") => 1_048_576,
-            Some("hello") => 16384,
-            other => panic!("{}: direction {other:?}", f.file),
-        };
+        let limit = frame_limit(f.s("direction").unwrap_or("?"), f.s("method"));
         let len = serde_json::to_string(&m).expect("serialize").len();
         assert!(len <= limit, "{}: {len} bytes exceeds {limit}", f.file);
     }
@@ -619,4 +636,21 @@ fn plug1_method_defs_are_paired() {
             .collect();
         assert_eq!(got, want, "*{suffix} defs must match the method list");
     }
+}
+
+#[test]
+fn plug1_screenshot_response_uses_dedicated_frame_limit() {
+    // 2 MiB の正常な screenshot 応答は通常の 1 MiB 上限を超えるが、専用の 24 MiB 上限には収まる。
+    let data = "A".repeat(2 * 1024 * 1024);
+    let m = serde_json::json!({
+        "v": 1, "id": 3,
+        "result": {"format": "png", "width": 1280, "height": 800, "data_base64": data}
+    });
+    let root = schema();
+    let mut errs = Vec::new();
+    validate(&root, &root["$defs"]["Response"], &m, "$", &mut errs);
+    assert!(errs.is_empty(), "{errs:?}");
+    let len = serde_json::to_string(&m).expect("serialize").len();
+    assert!(len > frame_limit("response", Some("load")));
+    assert!(len <= frame_limit("response", Some("screenshot")));
 }

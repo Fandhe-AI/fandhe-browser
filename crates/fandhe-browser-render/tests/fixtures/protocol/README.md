@@ -31,7 +31,8 @@
 - `expect`: スキーマ検証の期待。`valid` は Request / Response / HelloEvent と
   （既知メソッドなら）`<Method>Params` / `<Method>Result` に適合する
 - `expected_response`: ホストが返すべき応答（Response スキーマに適合する）。省略時は
-  応答しない（プロトコル違反として扱う）
+  具体的な応答期待値を指定しない（正常要求などで応答の中身を固定しない場合）。無応答・切断は
+  `expected_host_action: close_connection` で明示する
 - `expected_host_action`: `close_connection` は応答を返さず接続を閉じる（`id` を導出できない要求。設計 §2.2）。
   `expected_response` と排他
 - `valid` でも `expected_response` がエラーのケース（`request-load-file-scheme` 等）は、

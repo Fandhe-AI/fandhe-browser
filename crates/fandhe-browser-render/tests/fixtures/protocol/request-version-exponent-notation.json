@@ -1,0 +1,8 @@
+{
+  "case": "version-exponent-notation",
+  "direction": "request",
+  "method": "shutdown",
+  "expect": "valid",
+  "raw": "{\"v\":1e0,\"id\":8,\"method\":\"shutdown\"}",
+  "note": "Integer-valued number notation (1e0) equals const 1 under JSON Schema numeric equality."
+}
