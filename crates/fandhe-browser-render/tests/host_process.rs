@@ -13,14 +13,17 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
+use fandhe_browser_render::host_process::HOST_ARGS;
+#[cfg(unix)]
 use fandhe_browser_render::host_process::{FORCED_ENV_NAMES, PASSTHROUGH_ENV_NAMES};
 use fandhe_browser_render::host_process::{
-    HOST_ARGS, HostProcess, HostProcessError, HostTimeouts, TimeoutPhase,
+    HostProcess, HostProcessError, HostTimeouts, TimeoutPhase,
 };
 use fandhe_browser_render::protocol::{
     BoundingBoxParams, LoadParams, MethodResult, ProtocolError, Request, ScreenshotParams,
     VisibilityParams,
 };
+#[cfg(unix)]
 use serde_json::Value;
 use support::*;
 
@@ -231,18 +234,29 @@ fn t_dump_env_args_cwd() {
     for forced in FORCED_ENV_NAMES {
         assert!(names.contains(*forced), "missing forced {forced}");
     }
-    let allowed: BTreeSet<String> = FORCED_ENV_NAMES
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut allowed: BTreeSet<String> = FORCED_ENV_NAMES
         .iter()
         .chain(PASSTHROUGH_ENV_NAMES)
         .map(|s| s.to_string())
         .collect();
+    // macOS は `env_clear` 後でもプロセス起動時に CoreFoundation が
+    // `__CF_USER_TEXT_ENCODING` を子の環境へ注入する。親から継承した値ではなく
+    // 本 crate の許可リストの漏れでもないため、OS 注入名に限って許容する。
+    #[cfg(target_os = "macos")]
+    allowed.insert("__CF_USER_TEXT_ENCODING".to_string());
     assert_eq!(
         names.difference(&allowed).count(),
         0,
         "extra env: {names:?}"
     );
     assert!(!names.contains("PATH"));
-    assert_eq!(obs["cwd"].as_str().unwrap(), workdir.to_string_lossy());
+    // macOS では `/var` が `/private/var` への symlink で、子は正規化済みの cwd を報告する。
+    // 両辺を canonicalize してから完全一致で比べる。
+    assert_eq!(
+        std::fs::canonicalize(obs["cwd"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(&workdir).unwrap()
+    );
     assert_eq!(obs["mode"].as_u64().unwrap(), 0o700);
     let name = workdir.file_name().unwrap().to_string_lossy().into_owned();
     assert!(name.starts_with("fandhe-render-"), "{name}");
