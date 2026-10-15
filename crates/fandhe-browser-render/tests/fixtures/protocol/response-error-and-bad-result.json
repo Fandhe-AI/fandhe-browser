@@ -1,0 +1,16 @@
+{
+  "case": "error-and-bad-result",
+  "direction": "response",
+  "method": "load",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 62,
+    "result": "x",
+    "error": {
+      "kind": "internal",
+      "message": "Internal host error."
+    }
+  },
+  "note": "A valid error with a malformed result must not pass."
+}

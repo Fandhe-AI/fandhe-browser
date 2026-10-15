@@ -32,6 +32,8 @@
   （既知メソッドなら）`<Method>Params` / `<Method>Result` に適合する
 - `expected_response`: ホストが返すべき応答（Response スキーマに適合する）。省略時は
   応答しない（プロトコル違反として扱う）
+- `expected_host_action`: `close_connection` は応答を返さず接続を閉じる（`id` を導出できない要求。設計 §2.2）。
+  `expected_response` と排他
 - `valid` でも `expected_response` がエラーのケース（`request-load-file-scheme` 等）は、
   スキーマでは表せない振る舞い（scheme 制限。設計 §2.5）を固定する
 

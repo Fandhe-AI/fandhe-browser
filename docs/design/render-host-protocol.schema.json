@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Fandhe-AI/fandhe-browser/blob/main/docs/design/render-host-protocol.schema.json",
   "title": "fandhe-browser render host protocol (v1)",
-  "description": "本体（fandhe-browser-render の IPC クライアント）と Servo ホスト（別 workspace の servo-host/）の間の stdio プロトコル契約（TASK-38・PLUG-1・SEC-2・REPAIR-4。設計は docs/design/servo-host-design.md §2.1〜§2.5・§3.1）。両側は型を共有しないため、本スキーマと crates/fandhe-browser-render/tests/fixtures/protocol/ のゴールデン fixture を契約の正本とし、型・コーデックは各側（#989・#993）で実装する。トランスポートは stdio のみ（ポートを開かない）で、フレームは u32 LE の長さ接頭辞 + UTF-8 JSON。ホストは起動直後に HelloEvent（{\"v\":1,\"event\":\"hello\",\"data\":{...}}。id を持たず応答と区別できる）を 1 回送る。要求は Request、応答は Response（result か error のどちらか一方）。暫定上限（実測後に確定。設計 §2.4）: 要求フレーム 64 KiB、応答フレーム 1 MiB、hello フレーム 16 KiB、スクリーンショット応答フレーム 24 MiB、url 2048 B、selector 1024 B、エラーメッセージ 512 B。上限は確保前に検証する（実装側の契約）。maxLength は文字数であり、UTF-8 バイト数の上限は実装が強制する。未知フィールドの方針（REPAIR-4）: 応答側（Response・result・error・Hello・HelloLimits）は additionalProperties: true で、クライアントは未知フィールドを無視する。要求側（Request・各 *Params）は additionalProperties: false で、ホストは invalid_request / invalid_params で拒否する（fail-closed）。識別面（SEC-2）: どの *Params にも UA・ヘッダ・Cookie・locale・タイムゾーン・TLS・proxy・ビューポート・画面サイズのパラメータを置かない。未実装メソッドは成功を装わず unsupported を返す。ホストからの応答も untrusted として、クライアントがスキーマ相当の検証をする。url の scheme は http / https のみで、file:・data:・javascript:・about:・userinfo 付きは invalid_params で拒否する（実装側の二重検証。設計 §2.5）。Servo 内部のリダイレクト・サブリソースの制限は #1003 に委ねる。",
+  "description": "本体（fandhe-browser-render の IPC クライアント）と Servo ホスト（別 workspace の servo-host/）の間の stdio プロトコル契約（TASK-38・PLUG-1・SEC-2・REPAIR-4。設計は docs/design/servo-host-design.md §2.1〜§2.5・§3.1）。両側は型を共有しないため、本スキーマと crates/fandhe-browser-render/tests/fixtures/protocol/ のゴールデン fixture を契約の正本とし、型・コーデックは各側（#989・#993）で実装する。トランスポートは stdio のみ（ポートを開かない）で、フレームは u32 LE の長さ接頭辞 + UTF-8 JSON。ホストは起動直後に HelloEvent（{\"v\":1,\"event\":\"hello\",\"data\":{...}}。id を持たず応答と区別できる）を 1 回送る。要求は Request、応答は Response（result か error のどちらか一方。反対側のキーの存在は null でも禁止）。要求の id が有効な RequestId として取り出せない場合（欠落・負数・文字列・範囲外）と JSON として解釈できない場合、ホストは応答を返さずプロトコル違反として接続を閉じる（無関係な id の応答は返さない。設計 §2.2）。暫定上限（実測後に確定。設計 §2.4）: 要求フレーム 64 KiB、応答フレーム 1 MiB、hello フレーム 16 KiB、スクリーンショット応答フレーム 24 MiB、url 2048 B、selector 1024 B、エラーメッセージ 512 B。上限は確保前に検証する（実装側の契約）。maxLength は文字数であり、UTF-8 バイト数の上限は実装が強制する。未知フィールドの方針（REPAIR-4）: 応答側（Response・result・error・Hello・HelloLimits）は additionalProperties: true で、クライアントは未知フィールドを無視する。要求側（Request・各 *Params）は additionalProperties: false で、ホストは invalid_request / invalid_params で拒否する（fail-closed）。識別面（SEC-2）: どの *Params にも UA・ヘッダ・Cookie・locale・タイムゾーン・TLS・proxy・ビューポート・画面サイズのパラメータを置かない。未実装メソッドは成功を装わず unsupported を返す。ホストからの応答も untrusted として、クライアントがスキーマ相当の検証をする。url の scheme は http / https のみで、file:・data:・javascript:・about:・userinfo 付きは invalid_params で拒否する（実装側の二重検証。設計 §2.5）。Servo 内部のリダイレクト・サブリソースの制限は #1003 に委ねる。",
   "$defs": {
     "Version": {
       "description": "プロトコル版。v1 は 1 固定。",
@@ -36,6 +36,7 @@
     "ResultResponse": {
       "type": "object",
       "additionalProperties": true,
+      "not": { "required": ["error"] },
       "required": ["v", "id", "result"],
       "properties": {
         "v": { "$ref": "#/$defs/Version" },
@@ -46,6 +47,7 @@
     "ErrorResponse": {
       "type": "object",
       "additionalProperties": true,
+      "not": { "required": ["result"] },
       "required": ["v", "id", "error"],
       "properties": {
         "v": { "$ref": "#/$defs/Version" },

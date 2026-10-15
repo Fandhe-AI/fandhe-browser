@@ -1,0 +1,20 @@
+{
+  "case": "load-no-params",
+  "direction": "request",
+  "method": "load",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 63,
+    "method": "load"
+  },
+  "expected_response": {
+    "v": 1,
+    "id": 63,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  },
+  "note": "Omitted params are treated as an empty object, so required fields are still enforced."
+}

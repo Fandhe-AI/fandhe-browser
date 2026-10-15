@@ -32,7 +32,8 @@ const ERROR_KINDS: [&str; 8] = [
 ];
 
 /// 検証器が解釈するキーワード（これ以外がスキーマに現れたらテストを失敗させる）。
-const SUPPORTED: [&str; 14] = [
+const SUPPORTED: [&str; 15] = [
+    "not",
     "type",
     "const",
     "enum",
@@ -187,6 +188,13 @@ fn validate(root: &Value, sch: &Value, v: &Value, path: &str, errs: &mut Vec<Str
             }
         }
     }
+    if let Some(n) = obj.get("not") {
+        let mut e = Vec::new();
+        validate(root, n, v, path, &mut e);
+        if e.is_empty() {
+            errs.push(format!("{path}: matches a forbidden (not) schema"));
+        }
+    }
     if let Some(Value::Array(alts)) = obj.get("oneOf") {
         let matched = alts
             .iter()
@@ -271,9 +279,10 @@ fn violations(root: &Value, f: &Fixture) -> Vec<String> {
             if let Some(name) = method {
                 assert_eq!(mm, Some(name), "{}: method mismatch", f.file);
             }
-            if let Some(name) = mm.filter(|n| METHODS.contains(n))
-                && let Some(p) = m.get("params")
-            {
+            if let Some(name) = mm.filter(|n| METHODS.contains(n)) {
+                // params 省略は空オブジェクトとして照合する（必須項目は省略でも強制する）。
+                let empty = Value::Object(serde_json::Map::new());
+                let p = m.get("params").unwrap_or(&empty);
                 let d = format!("{}Params", pascal(name));
                 errs.extend(check(root, &d, p));
             }
@@ -310,6 +319,7 @@ fn plug1_schema_uses_only_supported_keywords() {
                         walk(root, v, &p);
                     }
                 }
+                "not" => walk(root, v, &p),
                 "oneOf" => {
                     for (i, s) in v.as_array().expect("oneOf array").iter().enumerate() {
                         walk(root, s, &format!("{p}/{i}"));
@@ -346,6 +356,19 @@ fn plug1_fixtures_match_schema() {
             ),
             "invalid" => assert!(!errs.is_empty(), "{}: expected invalid but valid", f.file),
             other => panic!("{}: bad expect {other}", f.file),
+        }
+        if f.s("expected_host_action").is_some() {
+            assert_eq!(
+                f.s("expected_host_action"),
+                Some("close_connection"),
+                "{}: unknown expected_host_action",
+                f.file
+            );
+            assert!(
+                f.v.get("expected_response").is_none(),
+                "{}: expected_host_action excludes expected_response",
+                f.file
+            );
         }
         if let Some(er) = f.v.get("expected_response") {
             let e = check(&root, "Response", er);
@@ -396,6 +419,34 @@ fn plug1_fixture_coverage() {
     );
     assert_eq!(
         by("request-load-unknown-param.json").s("expect"),
+        Some("invalid")
+    );
+    // 有効な id を導出できない要求には、無関係な id の応答を返さず接続を閉じる。
+    for n in ["request-id-negative.json", "request-id-string.json"] {
+        assert_eq!(
+            by(n).s("expected_host_action"),
+            Some("close_connection"),
+            "{n}"
+        );
+    }
+    for n in [
+        "request-load-no-params.json",
+        "request-visibility-no-params.json",
+        "request-bounding-box-no-params.json",
+    ] {
+        assert_eq!(by(n).s("expect"), Some("invalid"), "{n}");
+    }
+    assert_eq!(by("request-shutdown-ok.json").s("expect"), Some("valid"));
+    assert_eq!(
+        by("request-screenshot-no-params.json").s("expect"),
+        Some("valid")
+    );
+    assert_eq!(
+        by("response-result-null-error.json").s("expect"),
+        Some("invalid")
+    );
+    assert_eq!(
+        by("response-error-and-bad-result.json").s("expect"),
         Some("invalid")
     );
     assert!(

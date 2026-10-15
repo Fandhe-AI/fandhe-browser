@@ -1,0 +1,13 @@
+{
+  "case": "result-null-error",
+  "direction": "response",
+  "method": "load",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 61,
+    "result": {},
+    "error": null
+  },
+  "note": "error key must not coexist with result even when null."
+}

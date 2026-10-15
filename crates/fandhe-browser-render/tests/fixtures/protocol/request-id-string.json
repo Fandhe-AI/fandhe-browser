@@ -11,12 +11,6 @@
       "url": "https://example.com/"
     }
   },
-  "expected_response": {
-    "v": 1,
-    "id": 50,
-    "error": {
-      "kind": "invalid_request",
-      "message": "Invalid request."
-    }
-  }
+  "expected_host_action": "close_connection",
+  "note": "The id is not a valid RequestId, so the host cannot correlate a reply. It sends no response and closes the connection."
 }

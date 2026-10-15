@@ -1,0 +1,19 @@
+{
+  "case": "bounding-box-no-params",
+  "direction": "request",
+  "method": "bounding_box",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 65,
+    "method": "bounding_box"
+  },
+  "expected_response": {
+    "v": 1,
+    "id": 65,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  }
+}
