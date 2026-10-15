@@ -7,7 +7,8 @@
 # Servo は #988（TASK-38）で `=0.6.0` 完全固定・default-features 無効で追加した
 # （`baked-in-resources` は起動に必須。オーナー承認 2026-10-15）。`dpi`・`url`・画像 crate
 # は未承認のため直接依存にせず、Servo の再エクスポート（`ServoUrl` 等）を使う。
-# stdio サーバーは #993 で行う。toolchain は親ディレクトリの
+# `serde_json` は stdio サーバー（#993）のフレーム JSON 用（オーナー承認済み。Servo 経由で
+# Cargo.lock に同版が既にあり新規 crate は増えない）。`serde` の derive は未承認で使わない。toolchain は親ディレクトリの
 # rust-toolchain.toml を rustup が探索して使う（ここにはコピーを置かない）。
 
 [package]
@@ -23,6 +24,7 @@ path = "src/main.rs"
 
 [dependencies]
 servo = { version = "=0.6.0", default-features = false, features = ["baked-in-resources"] }
+serde_json = "=1.0.154"
 
 # 本体とは独立した workspace ルートであることを宣言する（空テーブル）。
 [workspace]

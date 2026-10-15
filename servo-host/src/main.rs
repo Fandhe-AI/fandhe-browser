@@ -8,19 +8,23 @@
 //! - `--selftest`: Servo の初期化・小さな `data:` ページの読み込み完了・終了までを行い、
 //!   成功時のみ終了コード 0 を返す（RENDER-3・#988。設計 §1.4・§2.6・§2.7）。
 //!   ネットワークへは出ない。呼び出し元は開発者と CI のみ。
-//! - それ以外: 未実装として標準エラーに示し、非ゼロで終了する（REPAIR-3）。
+//! - `--stdio`: 本体 render crate から起動される stdio サーバー（#993。`server`）。今は全メソッドを
+//!   `unsupported` で拒否するスタブハンドラで動く（成功を装わない。REPAIR-3）。
+//! - それ以外: 標準エラーに示し、非ゼロで終了する（固定の許可リスト。SEC-2）。
 //!
 //! Servo と描画コンテキストの生成・破棄は `engine` が担う（RENDER-3・#230）。
 //!
-//! 将来仕様: 本体 render crate からの stdio サーバー（#993）、WebView・読み込み（#231）、
-//! スクリーンショット（#232）、可視性・境界ボックス（RENDER-4）。
+//! 将来仕様: WebView・読み込み（#231）、スクリーンショット（#232）、可視性・境界ボックス
+//! （RENDER-4。#233・#234）のハンドラを実装して `--stdio` のスタブと差し替える。
 
 mod engine;
+mod server;
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use engine::{Engine, EngineError};
+use server::{ServeOutcome, UnimplementedHandler};
 use servo::{LoadStatus, ServoUrl, WebViewBuilder};
 
 /// ページ読み込み完了を待つ上限。超過は失敗として扱い、成功を装わない。
@@ -28,9 +32,17 @@ const SELFTEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// セルフテストで読み込むページ。`data:` のためネットワークアクセスは発生しない。
 const SELFTEST_URL: &str = "data:text/html,<h1>selftest</h1>";
 
-/// 引数に応じて `--version`・`--selftest` を処理し、他は未実装として失敗終了する。
+/// `--stdio` の終了コード: プロトコル違反（応答なしで終了した）。
+const EXIT_PROTOCOL_VIOLATION: u8 = 2;
+
+/// 引数に応じて `--version`・`--selftest`・`--stdio` を処理し、他は失敗終了する。
 fn main() -> ExitCode {
-    match std::env::args().nth(1).as_deref() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--stdio` は単独でのみ受け付ける（後続の引数は拒否。固定の許可リスト）。
+    if args.first().map(String::as_str) == Some("--stdio") && args.len() == 1 {
+        return run_stdio();
+    }
+    match args.first().map(String::as_str).filter(|_| args.len() == 1) {
         Some("--version") => {
             println!("fandhe-browser-servo-host {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -47,11 +59,30 @@ fn main() -> ExitCode {
         },
         _ => {
             eprintln!(
-                "error: fandhe-browser-servo-host supports only --version and --selftest \
-                 (stdio server is not implemented yet)"
+                "error: fandhe-browser-servo-host supports only --version, --selftest and --stdio"
             );
             ExitCode::FAILURE
         }
+    }
+}
+
+/// stdio サーバーを標準入出力で動かし、終了理由を終了コードへ対応づける。
+///
+/// stdout はフレーム専用（`println!` 等を stdio 経路に置かない）。ログは stderr のみ。
+/// #231 への申し送り: `Engine`（Servo）は hello の送信後に作ること（ハンドシェイクの 10 秒以内に
+/// hello を出すため）。Servo 自身が stdout へ書き出すリスクは設計 §2.1 を参照。
+fn run_stdio() -> ExitCode {
+    let mut handler = UnimplementedHandler;
+    let outcome = server::serve(
+        std::io::stdin().lock(),
+        std::io::stdout().lock(),
+        &mut handler,
+        &mut std::io::stderr().lock(),
+    );
+    match outcome {
+        ServeOutcome::Shutdown | ServeOutcome::InputClosed => ExitCode::SUCCESS,
+        ServeOutcome::ProtocolViolation(_) => ExitCode::from(EXIT_PROTOCOL_VIOLATION),
+        ServeOutcome::Io(_) => ExitCode::FAILURE,
     }
 }
 
