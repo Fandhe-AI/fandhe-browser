@@ -190,11 +190,16 @@ remove_run_containers() {
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM
-  local pids
+  local pids p
   pids=$(jobs -p 2>/dev/null || true)
-  # shellcheck disable=SC2086 # PID 列の単語分割は意図的
-  [ -z "$pids" ] || kill $pids 2>/dev/null || true
-  if ! remove_run_containers; then
+  # バックグラウンドのサブシェルだけでなく、その子の docker クライアントも止めてから回収する。
+  # 回収（wait）前にラベル検索へ進むと、作成中の補助コンテナを取りこぼすため。
+  for p in $pids; do
+    if command -v pkill >/dev/null 2>&1; then pkill -TERM -P "$p" 2>/dev/null || true; fi
+    kill "$p" 2>/dev/null || true
+  done
+  [ -z "$pids" ] || wait 2>/dev/null || true
+  if ! remove_run_containers && { sleep 1; ! remove_run_containers; }; then
     echo "error: failed to remove containers labeled ${LABEL_KEY}=${RUN_ID:-}; remove them manually" >&2
     [ "$rc" -ne 0 ] || rc=1
   fi
@@ -356,8 +361,16 @@ run_step() {
     if [ -n "$cg" ] && [ -d "$cg" ]; then
       if p=$(read_cg_value "${cg}/memory.peak"); then peak=$p; fi
       if c=$(read_cg_value "${cg}/memory.current"); then cur=$c; fi
-      if [ -r "${cg}/memory.events" ]; then
-        oomn=$(read_oom_kill "${cg}/memory.events") || oomn=0
+      # 稼働中コンテナの memory.events が読めない・解析できない場合は「OOM なし」にせず測定エラーにする
+      # （コンテナ内の子プロセスだけが OOM kill された場合は State.OOMKilled で検出できないため。fail-closed）
+      if [ -r "${cg}/memory.events" ] && oomn=$(read_oom_kill "${cg}/memory.events"); then
+        :
+      else
+        oomn=0
+        if [ "$running" = true ]; then
+          echo "error: cannot read memory.events of a running container (fail-closed)" >&2
+          exit 1
+        fi
       fi
     fi
     if [ "$running" = true ] && { [ "$peak" = null ] || [ "$cur" = null ]; }; then
@@ -372,6 +385,9 @@ run_step() {
       status=exited
     elif [ "$rok" -eq 0 ]; then
       status=ready_timeout
+    elif [ "$cond" = loaded ] && [ -z "$nrc" ]; then
+      # ホストメモリ上限でナビゲートが未実行（STEP_COMPLETE=0）。失敗ではないため破綻には数えない
+      status=navigate_not_run
     elif [ "$cond" = loaded ] && [ "$nrc" != 0 ]; then
       status=navigate_failed
     fi
@@ -400,10 +416,12 @@ run_step() {
            unit: $unit};
       {oom_kill: cnt("oom_kill"), start_failed: $start_failed, ready_timeout: cnt("ready_timeout"),
        exited: cnt("exited"), navigate_failed: cnt("navigate_failed")} as $b
+      | cnt("navigate_not_run") as $nnr
     | {n: $n, complete: ($complete == 1), started: $started,
        ready: ([$r[] | select(.[2] == "1")] | length),
        measured: ([$r[] | select(.[4] != "null")] | length),
        breakdowns: ($b + {total: ($b | add)}),
+       navigate_not_run: $nnr,
        oom_detail: {memory_events_oom_kill_total: $oom_events, state_oom_killed_count: $oom_flag},
        memory_peak_bytes: agg(4), memory_current_bytes: agg(5), ready_time: rt,
        host_mem_used_pct: $host}' <"$sd/rows.tsv" >>"${WORK}/steps-${cond}.ndjson"

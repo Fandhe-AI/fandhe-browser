@@ -385,6 +385,8 @@ export NAV_RAISE_MEM="$TMP/meminfo85"
 expect_rc "navigate host limit run" 0 --n-list 3 --no-doubling --conditions loaded --navigate-concurrency 1 --url https://example.com/
 expect_jq "navigate host limit: step incomplete" "false" '.conditions[0].steps[0].complete'
 expect_jq "navigate host limit: stop_reason" "host_memory_limit" '.conditions[0].stop_reason'
+expect_jq "navigate host limit: not-run is not a failure" "0" '.conditions[0].steps[0].breakdowns.navigate_failed'
+expect_jq "navigate host limit: not-run counted separately" "2" '.conditions[0].steps[0].navigate_not_run'
 expect_eq "navigate host limit: navigation aborted after the first batch" "1" "$(grep -c 'navigate.mjs' "$S/calls.log")"
 expect_eq "navigate host limit: containers removed" "0" "$(wc -l <"$S/containers" | tr -d ' ')"
 new_scene
