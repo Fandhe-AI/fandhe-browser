@@ -467,9 +467,11 @@ fn run_fake_sleep_parent() {
 }
 
 /// プロセスグループ終了テスト用の「孫」役。生存確認できる程度の時間
-/// （テストの期限より十分長い）だけ何もせず眠り続ける。
+/// （テストの期限より十分長い）だけ何もせず眠り続ける。Windows の CIM 照会は
+/// 初回の期限 60 秒 + 待機後の再試行（Issue #1051）まで root_pid が生存している必要が
+/// あるため、最大照会時間（約 2 分）を十分上回る 300 秒とする。テストは終了時に kill する。
 fn run_fake_sleep_grandchild() {
-    std::thread::sleep(Duration::from_secs(60));
+    std::thread::sleep(Duration::from_secs(300));
 }
 
 /// 通常のテスト実行（`--fandhe-fake-role` を伴わない起動）。`#[test]` 属性は

@@ -4168,6 +4168,7 @@ mod tests {
 
     // --- retry_on_err ---
 
+    /// PERF-3/PERF-6（TASK-84.6・Issue #1051）: 初回が成功なら再試行せず 1 回だけ呼ぶ。
     #[test]
     fn retry_on_err_returns_first_success_without_retrying() {
         let mut calls = 0;
@@ -4179,6 +4180,7 @@ mod tests {
         assert_eq!(calls, 1);
     }
 
+    /// PERF-3/PERF-6（TASK-84.6・Issue #1051）: 初回失敗・2 回目成功なら 2 回目の値を返す。
     #[test]
     fn retry_on_err_succeeds_on_second_attempt() {
         let r = retry_on_err(2, |n| {
@@ -4191,6 +4193,7 @@ mod tests {
         assert_eq!(r, Ok(1));
     }
 
+    /// PERF-3/PERF-6（TASK-84.6・Issue #1051）: 全試行失敗なら各試行の Err を試行順に集め、上限回数で止める。
     #[test]
     fn retry_on_err_collects_all_errors_and_stops_at_max_attempts() {
         let mut calls = 0;
@@ -4202,6 +4205,7 @@ mod tests {
         assert_eq!(calls, 2);
     }
 
+    /// PERF-3/PERF-6（TASK-84.6・Issue #1051）: 上限 0 回なら一度も呼ばず空の Err を返す。
     #[test]
     fn retry_on_err_with_zero_attempts_never_calls() {
         let mut calls = 0;
