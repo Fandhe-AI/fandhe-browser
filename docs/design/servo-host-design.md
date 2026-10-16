@@ -191,7 +191,7 @@ v1 はホストが自分で fetch する（URL のみ送る）。Cookie・セッ
 - `CDLA-Permissive-2.0` は `[[licenses.exceptions]]` で `crate = "webpki-roots"` に限る（版固定の併記案あり）。許可リストには入れない。
 - `MPL-2.0` を crate ごとの例外にしない。83 件が対象で版更新のたびに壊れ、ホスト workspace 全体が MPL の範囲という決定とも合うため。
 - 本体の `deny.toml` は変更しない（`OSS-2`・`OSS-3`）。
-- `[bans]` に `gstreamer` 系・`wgpu` 系・LGPL 系を明示し、`default-features = false` の効果の回帰を検出する。`[sources]` は crates.io のみとし git ソースを拒否する。`mozangle` は Windows の `no-wgl`（ANGLE）で要るため ban しない（#999）。
+- `[bans]` に `mozangle`・`gstreamer` 系・`wgpu` 系・LGPL 系を明示し、`default-features = false` の効果の回帰を検出する。`[sources]` は crates.io のみとし git ソースを拒否する。`mozangle` は `wrappers = ["servo"]` で、Windows の `no-wgl`（ANGLE）に限り servo からの直接依存だけ許す（#999）。
 - `[graph]` は `all-features = false`、`targets` は 3 OS の主要ターゲットに限定する（aarch64-windows / musl は検証待ち）。
 - 試作の `cargo deny` は拒否 85 件（`MPL-2.0` 83・`MPL-2.0 AND BSD-3-Clause` 1・`CDLA-Permissive-2.0` 1）。FreeType 本体（FTL）と同梱 libpng は `cargo deny` で検出できないため手動確認項目とする（§5）。
 
@@ -206,7 +206,7 @@ v1 はホストが自分で fetch する（URL のみ送る）。Cookie・セッ
 - 本体側の既存検査 A / B は維持する（PATTERN は §3.2 のとおり調整）。
 - C: 本体の `cargo metadata` に `servo-host` が含まれず、ルート `Cargo.lock` に `servo` / `mozjs` 系が無い。
 - D: `servo-host` の依存ツリーに本体 workspace の package 名（`cargo metadata` で得た本体メンバーの集合。ホスト自身の `fandhe-browser-servo-host` は集合に含まれないため `fandhe-browser-*` の前方一致では判定しない）・`v8`・`boa_engine` が含まれない（逆方向の混入防止）。
-- E: `servo-host` の依存ツリーに `webgl|webgpu|gstreamer|lgpl` が含まれない（試作の検査パターン。`mozangle` は Windows の `no-wgl` で要るため #999 で除外）。
+- E: `servo-host` の依存ツリーに `webgl|webgpu|mozangle|gstreamer|lgpl` が含まれない（試作の検査パターン）。`mozangle` は Windows ターゲットの `no-wgl` に限り許可し、`cargo tree --target` でターゲット別に検査する（非 Windows は mozangle を含めて NG、Windows は除く。#999）。
 - 自己テスト（合成した `cargo tree` 出力）を追加し、大量一致時の fail-open を防ぐヒアストリング方式を踏襲する。
 
 ## 5. NOTICE・帰属表示

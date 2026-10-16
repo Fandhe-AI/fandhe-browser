@@ -18,8 +18,9 @@
 #      （逆方向の混入。package 名の完全一致で判定する。ホスト lock の keyboard-types が
 #      部分文字列 boa に一致するため部分一致にしない。前方一致 fandhe-browser-* もホスト自身
 #      を誤検出するため使わない）
-#   E. servo-host の依存ツリーに webgl|webgpu|gstreamer|lgpl 系が無いこと
-#      （mozangle は Windows の `no-wgl` で要るため対象外。#999）
+#   E. servo-host の依存ツリーに webgl|webgpu|mozangle|gstreamer|lgpl 系が無いこと。
+#      ただし mozangle は Windows ターゲットに限り許す（`no-wgl`・ANGLE。#999）ため、ターゲットごとに
+#      検査し、非 Windows では mozangle を含め、Windows では除いたパターンで判定する
 #      （既定で無効にしたはずの GPU・メディア・LGPL 系の混入検出）
 #   servo-host の manifest / Cargo.lock が無い場合は D・E を NG とする（fail-closed）。
 #
@@ -45,7 +46,12 @@ cd "$REPO_ROOT"
 # Servo 非依存の IPC クライアントとして cli の常時依存になり得るため含めない。
 SERVO_PATTERN='servo'
 # E 用: ホストが既定で無効にしたはずの GPU・メディア・LGPL 系。
-HOST_FORBIDDEN_PATTERN='webgl|webgpu|gstreamer|lgpl'
+HOST_FORBIDDEN_PATTERN='webgl|webgpu|mozangle|gstreamer|lgpl'
+# E 用（Windows ターゲット）: Windows は `no-wgl` で mozangle（ANGLE）を許す（#999）。
+HOST_FORBIDDEN_PATTERN_WINDOWS='webgl|webgpu|gstreamer|lgpl'
+# E 用: ターゲット別に検査する。servo-host/deny.toml の [graph] targets と揃える。
+HOST_TARGETS_NON_WINDOWS=(x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin)
+HOST_TARGETS_WINDOWS=(x86_64-pc-windows-msvc)
 # D 用: メンバー以外に、ホストへ入ってはならない JS エンジンの package 名。
 JS_ENGINE_NAMES=$'v8\nboa_engine'
 
@@ -207,12 +213,15 @@ self_test() {
 
   # --- 検査 E（GPU・メディア・LGPL 系） ---
   local n
-  for n in servo-webgl webgpu-sys gstreamer-sys lgpl-thing; do
+  for n in servo-webgl webgpu-sys mozangle gstreamer-sys lgpl-thing; do
     expect "E: ${n} is detected" ng detect t "$HOST_FORBIDDEN_PATTERN" "$(printf 'tokio v1.0.0\n%s v0.1.0\n' "$n")"
   done
-  for n in glow surfman servo-canvas mozjs_sys mozangle; do
+  for n in glow surfman servo-canvas mozjs_sys; do
     expect "E: ${n} is not detected" ok detect t "$HOST_FORBIDDEN_PATTERN" "$(printf '%s v0.1.0\n' "$n")"
   done
+  expect "E: mozangle is allowed on Windows targets" ok detect t "$HOST_FORBIDDEN_PATTERN_WINDOWS" "$(printf 'servo v0.6.0\nmozangle v0.7.1\n')"
+  expect "E: gstreamer is still detected on Windows targets" ng detect t "$HOST_FORBIDDEN_PATTERN_WINDOWS" "$(printf 'mozangle v0.7.1\ngstreamer v0.1.0\n')"
+  expect "E: Windows pattern has no mozangle (non-Windows pattern does)" ng detect t "$HOST_FORBIDDEN_PATTERN" "$(printf 'mozangle v0.7.1\n')"
   expect "E: bulk lines with one match at the end are detected" ng detect t "$HOST_FORBIDDEN_PATTERN" "${big_clean}├── gstreamer v0.1.0"$'\n'
   expect "E: bulk unrelated lines are not detected" ok detect t "$HOST_FORBIDDEN_PATTERN" "$big_clean"
 
@@ -317,7 +326,7 @@ require_file "$HOST_LOCK" "servo-host dependency tree" || HOST_OK=0
 if [ "$HOST_OK" -eq 0 ]; then
   STATUS=1
 else
-  # --target all: lock に載る全ターゲット分を調べ、OS 固有の依存を ubuntu でも検出する。
+  # 検査 D は --target all で lock に載る全ターゲット分を調べ、OS 固有の依存を ubuntu でも検出する。
   if ! OUT_HOST=$(cargo tree --manifest-path "$HOST_MANIFEST" --locked -e normal,build,dev --prefix none --target all); then
     echo "NG: cargo tree (servo-host) failed" >&2
     STATUS=1
@@ -334,7 +343,18 @@ else
       detect_exact "servo-host" "${MEMBER_NAMES}"$'\n'"${JS_ENGINE_NAMES}" "$OUT_HOST" || STATUS=1
     fi
     # 検査 E
-    detect "servo-host" "$HOST_FORBIDDEN_PATTERN" "$OUT_HOST" || STATUS=1
+    # ターゲット別に取得する（取得失敗は NG。fail-closed）。非 Windows は mozangle を含めて、
+    # Windows は除いたパターンで判定する。
+    for t in "${HOST_TARGETS_NON_WINDOWS[@]}" "${HOST_TARGETS_WINDOWS[@]}"; do
+      if ! OUT_T=$(cargo tree --manifest-path "$HOST_MANIFEST" --locked -e normal,build,dev --prefix none --target "$t"); then
+        echo "NG: cargo tree (servo-host, target $t) failed" >&2
+        STATUS=1
+        continue
+      fi
+      pat="$HOST_FORBIDDEN_PATTERN"
+      case "$t" in *-windows-*) pat="$HOST_FORBIDDEN_PATTERN_WINDOWS" ;; esac
+      detect "servo-host ($t)" "$pat" "$OUT_T" || STATUS=1
+    done
   fi
 fi
 
