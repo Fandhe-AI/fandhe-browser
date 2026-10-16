@@ -383,6 +383,33 @@ id 7・11・13・15・16・17・18。
 
 次の作業: #1039〜#1042（ページ初期化メソッド群の残り）。frame id と targetId の関係は別途判断が要る。
 
+### 段階 3c の実施結果（TASK-43.3k・#1039。実測 A と種別 B）
+
+**実装範囲**（`CDP-2`・`CDP-6`・`SEC-2`・`REPAIR-3`・`CDP-7`）:
+
+| メソッド | 受理条件 | エラー |
+| -------- | -------- | ------ |
+| `Page.setLifecycleEventsEnabled` | 生存セッションの `sessionId` 付き・`params` が `{"enabled": bool}` のみ。`{}` を返し、セッションの lifecycle 有効フラグを設定する（true・false とも冪等）。止めたターゲットでも受理する | `sessionId` なし・`enabled` 以外のキーは `-32602 unsupported params`、`enabled` が無い・bool でない・未知／閉じたセッションは `-32602 invalid params`（いずれもフラグは変えない） |
+
+- フラグは `target.rs` の `Tables.lifecycle_events_enabled` に置く（Issue 記載の `conn_state.rs` から外れる。理由は段階 3a と同じ）。
+  セッション削除と同じロックで消え、件数は `MAX_SESSIONS` 以下。
+- **送出**: `Page.enable` 済みかつ lifecycle 有効なセッションの `Page.navigate` が確定したとき、`Page.lifecycleEvent` を送る。
+  順序は 応答 → `init` → `Page.frameNavigated` → `Page.loadEventFired` → `load`（`page.rs` の `navigation_events` が正本）。
+  `frameId` は `main`、`loaderId` は応答と `frameNavigated` に一致し、`timestamp` は 3 イベントで同じ値。失敗・中断・追い越された遷移・
+  閉じたターゲットでは `frameNavigated` と同じ条件ブロックの中で判定するため送らない。順序の根拠（`init` は `load` より前、`load` は
+  `frameNavigated` より後）は Playwright / Puppeteer のソース読解による推定で、**種別 B（未実測）**。
+- **送らない名前**（`REPAIR-3`）: `DOMContentLoaded`・`networkAlmostIdle`・`networkIdle`・`commit`・`firstPaint` 系・`InteractiveTime`。実体が無く、
+  偽の値で埋めない。将来仕様は TASK-43・TASK-44（`CDP-2`）。
+- **差異**: 有効化時に現在の文書の lifecycle を再送しない（Chromium は再送する）。送り先は `Page.navigate` を送ったセッションだけ。
+  `Runtime.runIfWaitingForDebugger` による初期 `about:blank` の確定では送らない。
+- フラグは fetch・ヘッダ・UA・`navigator` を何も変えない（`SEC-2`）。
+
+**実測**（`playwright-core` 1.63.0。トレースを再取得し 2 回の実行で同一出力）: id 11（`Page.setLifecycleEventsEnabled`）は `{}` で成功する。
+`newPage` の失敗は `browserContext.newPage: Frame has been detached.` のまま変わらない。`failed` の残りは id 7・13・15・16・17・18。
+この trace は `Page.navigate` を含まないため、Playwright が `lifecycleEvent` を待つかは実測できていない（種別 B のまま）。
+
+次の作業: #1040〜#1042（ページ初期化メソッド群の残り）。
+
 ### 原則
 
 | 原則 | 内容 | ビヘイビア |

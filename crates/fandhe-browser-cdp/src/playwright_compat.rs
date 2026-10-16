@@ -1,4 +1,4 @@
-//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c、段階 2b は 43.3d、段階 2g は 43.3g、段階 2h は 43.3h、段階 3a は 43.3i、段階 3b は 43.3j）。
+//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c、段階 2b は 43.3d、段階 2g は 43.3g、段階 2h は 43.3h、段階 3a は 43.3i、段階 3b は 43.3j、段階 3c は 43.3k）。
 //!
 //! `protocol::builtin_handlers` から登録される。`Browser.getVersion`（43.3a）・
 //! `Target.getTargetInfo`（43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（43.3c）を
@@ -17,10 +17,12 @@
 //! `targetInfo` に `browserContextId` を載せる。`Target.disposeBrowserContext` は未実装（`REPAIR-3`）。
 //! 43.3e（#910）で `Target.createTarget`（応答の前に `Target.attachedToTarget` を送出）と
 //! `Runtime.runIfWaitingForDebugger` を足す。
-//! 43.3i（#1037）で `Page.enable`（セッション単位の有効フラグ。実効果は #1039 の `Page.lifecycleEvent` 送出ゲートのみ）と
+//! 43.3i（#1037）で `Page.enable`（セッション単位の有効フラグ。実効果は `Page.lifecycleEvent` 送出ゲートの片方のみ）と
 //! `Page.getFrameTree`（メインフレームのみ）を足す。
 //! 43.3j（#1038）で `Log.enable`・`Runtime.enable`・`Network.enable`（セッション単位の有効フラグのみ。
-//! イベントは送らない。`REPAIR-3`）を足す。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
+//! イベントは送らない。`REPAIR-3`）を足す。
+//! 43.3k（#1039）で `Page.setLifecycleEventsEnabled`（セッション単位の有効フラグ。`Page.enable` 済みの
+//! セッションの `Page.navigate` が `Page.lifecycleEvent` の `init`・`load` を送る）を足す。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
 
 use serde_json::{Value, json};
 
@@ -433,8 +435,9 @@ impl CommandHandler for RuntimeRunIfWaitingForDebugger {
 ///
 /// `sessionId` 付きで、そのセッションに有効フラグを立てて `{}` を返す（冪等）。フラグは registry の
 /// セッション表と同じロック・寿命で持つ（`conn_state` でなく `target.rs` に置く理由: 自動 attach 由来でない
-/// セッションも扱え、セッション削除と同時に消えて TOCTOU が起きないため）。実効果は #1039 の
-/// `Page.lifecycleEvent` 送出ゲートだけで、現時点ではイベント送出を何も変えない。
+/// セッションも扱え、セッション削除と同時に消えて TOCTOU が起きないため）。実効果は
+/// `Page.lifecycleEvent` 送出ゲートの片方（もう片方は [`PageSetLifecycleEventsEnabled`]。43.3k・#1039）だけで、
+/// `Page.frameNavigated` 等の既存イベントの送出は変えない。
 ///
 /// 差異（`REPAIR-3`）: 既存の `Page.frameNavigated`・`Page.loadEventFired` は `Page.enable` なしでも従来どおり
 /// 送出する（Chromium は有効化後のみ。`Page.enable` を送らない既存の利用と Puppeteer 系の回帰を避けるため）。
@@ -459,6 +462,47 @@ impl CommandHandler for PageEnable {
             ctx.state
                 .registry()
                 .enable_page(sid)
+                .map_err(|_| CdpError::INVALID_PARAMS)?;
+            Ok(HandlerOutput::result(json!({})))
+        })
+    }
+}
+
+/// `Page.setLifecycleEventsEnabled`（`CDP-2`・TASK-43.3k・#1039）。
+///
+/// `sessionId` 付きで `{"enabled": bool}` を受け、セッションの lifecycle 有効フラグを設定して `{}` を返す
+/// （true・false とも冪等）。実効果は `Page.navigate`（`page.rs`）の送出ゲート: `Page.enable` 済みかつ本フラグが
+/// 有効なセッションにだけ、確定した遷移で `Page.lifecycleEvent`（`init`・`load`）を送る。
+/// 検証順: `sessionId` なしは `UNSUPPORTED_PARAMS`、`params` が非オブジェクトは `INVALID_PARAMS`、
+/// `enabled` 以外のキーは `UNSUPPORTED_PARAMS`（黙って無視しない）、`enabled` が無い・bool でないは
+/// `INVALID_PARAMS`、未知・閉じたセッションは `INVALID_PARAMS`。いずれも状態を変えない。
+/// 止めたターゲット（`Runtime.runIfWaitingForDebugger` より前）でも受理する（Playwright は再開前に送る）。
+///
+/// 差異（`REPAIR-3`）: 送る名前は `init`・`load` のみ（他は `page::lifecycle_event` の doc 参照）。
+/// 有効化時に現在の文書の lifecycle を再送しない（Chromium は再送する）。送り先は `Page.navigate` を送った
+/// セッションだけで、同じターゲットの他セッションへは送らない（セッション単位の配送は TASK-43・`CDP-2`）。
+/// フラグは fetch・ヘッダ・UA・`navigator` に影響しない（`SEC-2`）。実際の状態変更であり一律成功ではない（`CDP-6`）。
+pub(crate) struct PageSetLifecycleEventsEnabled;
+
+impl CommandHandler for PageSetLifecycleEventsEnabled {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            let sid = ctx.session_id.ok_or(CdpError::UNSUPPORTED_PARAMS)?;
+            let obj = params.as_object().ok_or(CdpError::INVALID_PARAMS)?;
+            if obj.keys().any(|k| k != "enabled") {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let enabled = obj
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or(CdpError::INVALID_PARAMS)?;
+            ctx.state
+                .registry()
+                .set_lifecycle_events(sid, enabled)
                 .map_err(|_| CdpError::INVALID_PARAMS)?;
             Ok(HandlerOutput::result(json!({})))
         })
@@ -2471,6 +2515,230 @@ mod tests {
                 &st,
                 Some(c),
                 &sreq(9, "Page.navigate", &sid, r#"{"url":"about:blank"}"#),
+            )
+            .await;
+            let methods: Vec<&str> = nav.iter().filter_map(|v| v["method"].as_str()).collect();
+            assert_eq!(methods, ["Page.frameNavigated", "Page.loadEventFired"]);
+        }
+
+        // ---- Page.setLifecycleEventsEnabled（TASK-43.3k・#1039） ----
+
+        #[tokio::test]
+        async fn cdp2_set_lifecycle_events_enabled_toggles_flag() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let m = "Page.setLifecycleEventsEnabled";
+            assert_eq!(
+                call(&st, Some(c), &sreq(2, m, &sid, r#"{"enabled":true}"#)).await,
+                vec![json!({"id":2,"sessionId":sid,"result":{}})]
+            );
+            assert!(st.registry().is_lifecycle_events_enabled(&s));
+            assert_eq!(
+                call(&st, Some(c), &sreq(3, m, &sid, r#"{"enabled":false}"#)).await,
+                vec![json!({"id":3,"sessionId":sid,"result":{}})]
+            );
+            assert!(!st.registry().is_lifecycle_events_enabled(&s));
+        }
+
+        #[tokio::test]
+        async fn cdp2_set_lifecycle_events_enabled_rejects_invalid_params() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let m = "Page.setLifecycleEventsEnabled";
+            for (id, p) in [
+                (2, "{}"),
+                (3, r#"{"enabled":"true"}"#),
+                (4, r#"{"enabled":1}"#),
+                (5, r#"{"enabled":null}"#),
+            ] {
+                assert_eq!(
+                    call(&st, Some(c), &sreq(id, m, &sid, p)).await,
+                    vec![serr(-32602, "invalid params", id, &sid)],
+                    "{p}"
+                );
+            }
+            assert_eq!(
+                call(&st, Some(c), &sreq(7, m, &sid, r#"{"enabled":true,"x":1}"#)).await,
+                vec![serr(-32602, "unsupported params", 7, &sid)]
+            );
+            assert!(!st.registry().is_lifecycle_events_enabled(&s));
+        }
+
+        #[tokio::test]
+        async fn cdp2_set_lifecycle_events_enabled_rejects_missing_or_unknown_session() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c),
+                    r#"{"id":1,"method":"Page.setLifecycleEventsEnabled","params":{"enabled":true}}"#
+                )
+                .await,
+                vec![err(-32602, "unsupported params", 1)]
+            );
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c),
+                    &sreq(
+                        2,
+                        "Page.setLifecycleEventsEnabled",
+                        "NoSuch-1",
+                        r#"{"enabled":true}"#
+                    )
+                )
+                .await,
+                vec![serr(-32602, "invalid params", 2, "NoSuch-1")]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp2_set_lifecycle_events_enabled_accepted_on_paused_target() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(
+                &st,
+                Some(c),
+                &auto_attach(
+                    1,
+                    r#""autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true"#,
+                ),
+            )
+            .await;
+            let f = call(&st, Some(c), &create_req(2, BLANK)).await;
+            assert_eq!(f[0]["params"]["waitingForDebugger"], true, "{f:?}");
+            let sid = f[0]["params"]["sessionId"].as_str().unwrap().to_owned();
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c),
+                    &sreq(
+                        10,
+                        "Page.setLifecycleEventsEnabled",
+                        &sid,
+                        r#"{"enabled":true}"#
+                    )
+                )
+                .await,
+                vec![json!({"id":10,"sessionId":sid,"result":{}})]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp2_navigate_with_lifecycle_enabled_emits_lifecycle_events() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            call(&st, Some(c), &sreq(2, "Page.enable", &sid, "{}")).await;
+            call(
+                &st,
+                Some(c),
+                &sreq(
+                    3,
+                    "Page.setLifecycleEventsEnabled",
+                    &sid,
+                    r#"{"enabled":true}"#,
+                ),
+            )
+            .await;
+            let nav = call(
+                &st,
+                Some(c),
+                &sreq(9, "Page.navigate", &sid, r#"{"url":"about:blank"}"#),
+            )
+            .await;
+            let methods: Vec<&str> = nav.iter().filter_map(|v| v["method"].as_str()).collect();
+            assert_eq!(
+                methods,
+                [
+                    "Page.lifecycleEvent",
+                    "Page.frameNavigated",
+                    "Page.loadEventFired",
+                    "Page.lifecycleEvent"
+                ]
+            );
+            assert_eq!(nav.len(), 5);
+            let loader = nav[0]["result"]["loaderId"].as_str().unwrap();
+            assert_eq!(nav[2]["params"]["frame"]["loaderId"], loader);
+            let names: Vec<&str> = [&nav[1], &nav[4]]
+                .iter()
+                .map(|v| v["params"]["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, ["init", "load"]);
+            for ev in [&nav[1], &nav[4]] {
+                assert_eq!(ev["params"]["frameId"], "main");
+                assert_eq!(ev["params"]["loaderId"], loader);
+                assert_eq!(ev["sessionId"], sid.as_str());
+            }
+            assert_eq!(nav[1]["params"]["timestamp"], nav[3]["params"]["timestamp"]);
+            assert_eq!(nav[4]["params"]["timestamp"], nav[3]["params"]["timestamp"]);
+        }
+
+        #[tokio::test]
+        async fn cdp2_navigate_emits_no_lifecycle_unless_both_enabled() {
+            let m = "Page.setLifecycleEventsEnabled";
+            // (Page.enable を送る, lifecycle を true にする, 直後に false に戻す) の組。
+            for (page_enable, lifecycle, disable_again) in [
+                (false, true, false),
+                (true, false, false),
+                (true, true, true),
+            ] {
+                let dir = TempDir::new();
+                let st = state(&dir);
+                let c = open_conn(&st, 1);
+                let sid = attached_session(&st, c).await;
+                if page_enable {
+                    call(&st, Some(c), &sreq(2, "Page.enable", &sid, "{}")).await;
+                }
+                if lifecycle {
+                    call(&st, Some(c), &sreq(3, m, &sid, r#"{"enabled":true}"#)).await;
+                }
+                if disable_again {
+                    call(&st, Some(c), &sreq(4, m, &sid, r#"{"enabled":false}"#)).await;
+                }
+                let nav = call(
+                    &st,
+                    Some(c),
+                    &sreq(9, "Page.navigate", &sid, r#"{"url":"about:blank"}"#),
+                )
+                .await;
+                let methods: Vec<&str> = nav.iter().filter_map(|v| v["method"].as_str()).collect();
+                assert_eq!(methods, ["Page.frameNavigated", "Page.loadEventFired"]);
+            }
+        }
+
+        #[tokio::test]
+        async fn cdp2_browser_level_navigate_emits_no_lifecycle() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            call(&st, Some(c), &sreq(2, "Page.enable", &sid, "{}")).await;
+            call(
+                &st,
+                Some(c),
+                &sreq(
+                    3,
+                    "Page.setLifecycleEventsEnabled",
+                    &sid,
+                    r#"{"enabled":true}"#,
+                ),
+            )
+            .await;
+            let nav = call(
+                &st,
+                Some(c),
+                r#"{"id":9,"method":"Page.navigate","params":{"url":"about:blank"}}"#,
             )
             .await;
             let methods: Vec<&str> = nav.iter().filter_map(|v| v["method"].as_str()).collect();

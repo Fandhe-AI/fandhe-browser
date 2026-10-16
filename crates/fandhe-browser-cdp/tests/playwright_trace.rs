@@ -46,7 +46,8 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 /// 原因は playwright-core 1.63.0 の `CRPage._sessionForFrame` が `_sessions.has(frame._id)`（セッションを targetId で
 /// 引く）を前提にすること。`frame.id` が `"main"` のままだと一致しない（`docs/design/playwright-compat.md`）。
 /// `Log.enable`・`Runtime.enable`・`Network.enable`（43.3j）は有効フラグを立てて `{}` を返す（イベントは送らない。`REPAIR-3`）。
-/// 残りの `Page.setLifecycleEventsEnabled` 等は未実装で `-32601`。
+/// `Page.setLifecycleEventsEnabled`（43.3k）は有効フラグを立てて `{}` を返す。この trace は遷移を含まないため
+/// `Page.lifecycleEvent` は現れない。残りの `Page.addScriptToEvaluateOnNewDocument` 等は未実装で `-32601`。
 ///
 /// 注意: `Browser.getVersion` の応答に `CARGO_PKG_VERSION` が入るため、workspace の版を上げたら
 /// `make trace-playwright` でトレースを再取得すること。
@@ -382,9 +383,10 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
                 "id": "main", "loaderId": "2", "url": "about:blank", "mimeType": "text/html"
             }}}}),
             // `Log.enable`・`Runtime.enable`・`Network.enable`（43.3j）は受理して `{}`（イベントなし）。
-            // 他のセッション付き初期化メソッドは未実装。
+            // 他のセッション付き初期化メソッド（id 13, 16-18）は未実装。
             json!({"id": 10, "sessionId": sid, "result": {}}),
-            not_impl(11),
+            // `Page.setLifecycleEventsEnabled`（43.3k）は有効フラグを立てて `{}`（この trace は遷移を含まず lifecycle は現れない）。
+            json!({"id": 11, "sessionId": sid, "result": {}}),
             json!({"id": 12, "sessionId": sid, "result": {}}),
             not_impl(13),
             json!({"id": 14, "sessionId": sid, "result": {}}),
@@ -423,7 +425,7 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
             ("Page.addScriptToEvaluateOnNewDocument", 0, 1),
             ("Page.enable", 1, 0),
             ("Page.getFrameTree", 1, 0),
-            ("Page.setLifecycleEventsEnabled", 0, 1),
+            ("Page.setLifecycleEventsEnabled", 1, 0),
             ("Runtime.enable", 1, 0),
             ("Runtime.runIfWaitingForDebugger", 1, 0),
             ("Target.closeTarget", 1, 0),
@@ -736,7 +738,6 @@ fn cdp2_playwright_newpage_reach_report_lists_first_stop_and_failures() {
         failed,
         [
             (7, "Browser.getWindowForTarget", true, -32601, nf),
-            (11, "Page.setLifecycleEventsEnabled", true, -32601, nf),
             (
                 13,
                 "Page.addScriptToEvaluateOnNewDocument",

@@ -275,9 +275,13 @@ struct Tables {
     /// `waitForDebuggerOnStart` で止めたターゲットと、止めた（再開を待つ）セッション（#910・`CDP-2`）。
     /// ターゲットの閉鎖・context の破棄で消える。件数はターゲット数以下。
     paused: HashMap<TargetId, SessionId>,
-    /// `Page.enable` 済みのセッション（43.3i・#1037・`CDP-2`）。#1039 の `Page.lifecycleEvent` 送出ゲートが読む。
+    /// `Page.enable` 済みのセッション（43.3i・#1037・`CDP-2`）。`Page.lifecycleEvent` 送出ゲートの片方
+    /// （[`TargetRegistry::lifecycle_events_active`]。43.3k・#1039）。
     /// 寿命は `sessions` と同じで、削除と同じロック内で消す。件数は `MAX_SESSIONS` 以下（`CDP-7`）。
     page_enabled: HashSet<SessionId>,
+    /// `Page.setLifecycleEventsEnabled{enabled:true}` 済みのセッション（43.3k・#1039・`CDP-2`）。
+    /// 寿命は `sessions` と同じで削除と同じロック内で消す。件数は `MAX_SESSIONS` 以下（`CDP-7`）。
+    lifecycle_events_enabled: HashSet<SessionId>,
     /// `Log.enable`・`Runtime.enable`・`Network.enable` 済みのセッション（43.3j・#1038・`CDP-2`）。
     /// 寿命は `sessions` と同じで削除と同じロック内で消す。件数は `MAX_SESSIONS` 以下（`CDP-7`）。
     domains_enabled: HashMap<SessionId, SessionDomains>,
@@ -318,6 +322,7 @@ impl TargetRegistry {
                 default_context,
                 paused: HashMap::new(),
                 page_enabled: HashSet::new(),
+                lifecycle_events_enabled: HashSet::new(),
                 domains_enabled: HashMap::new(),
                 next_target,
                 next_session,
@@ -463,6 +468,7 @@ impl TargetRegistry {
         for sid in &removed {
             t.sessions.remove(sid);
             t.page_enabled.remove(sid);
+            t.lifecycle_events_enabled.remove(sid);
             t.domains_enabled.remove(sid);
         }
         Ok(removed)
@@ -491,6 +497,7 @@ impl TargetRegistry {
     pub fn detach(&self, id: &SessionId) -> Result<TargetId, CdpStateError> {
         let mut t = self.lock();
         t.page_enabled.remove(id);
+        t.lifecycle_events_enabled.remove(id);
         t.domains_enabled.remove(id);
         t.sessions.remove(id).ok_or(CdpStateError::UnknownSession)
     }
@@ -508,10 +515,42 @@ impl TargetRegistry {
         Ok(())
     }
 
-    /// `Page.enable` 済みか。#1039 の `Page.lifecycleEvent` 送出ゲートが読む（それまで本番からは未使用）。
+    /// `Page.enable` 済みか（テスト用。本番の送出ゲートは [`Self::lifecycle_events_active`]）。
     #[cfg(test)]
     pub(crate) fn is_page_enabled(&self, sid: &SessionId) -> bool {
         self.lock().page_enabled.contains(sid)
+    }
+
+    /// セッションの lifecycle 有効フラグを設定する（`true` で insert・`false` で remove。冪等。
+    /// 43.3k・#1039・`CDP-2`）。存在確認と設定を 1 回のロックで行う。置き場所の理由は [`Self::enable_page`]。
+    pub(crate) fn set_lifecycle_events(
+        &self,
+        sid: &SessionId,
+        enabled: bool,
+    ) -> Result<(), CdpStateError> {
+        let mut t = self.lock();
+        if !t.sessions.contains_key(sid) {
+            return Err(CdpStateError::UnknownSession);
+        }
+        if enabled {
+            t.lifecycle_events_enabled.insert(sid.clone());
+        } else {
+            t.lifecycle_events_enabled.remove(sid);
+        }
+        Ok(())
+    }
+
+    /// `Page.lifecycleEvent` を送ってよいか（`Page.enable` 済みかつ lifecycle 有効）を 1 回のロックで返す。
+    /// `Page.navigate` の送出ゲートが読む（43.3k・#1039）。
+    pub(crate) fn lifecycle_events_active(&self, sid: &SessionId) -> bool {
+        let t = self.lock();
+        t.page_enabled.contains(sid) && t.lifecycle_events_enabled.contains(sid)
+    }
+
+    /// lifecycle 有効フラグのみを返す（テスト用）。
+    #[cfg(test)]
+    pub(crate) fn is_lifecycle_events_enabled(&self, sid: &SessionId) -> bool {
+        self.lock().lifecycle_events_enabled.contains(sid)
     }
 
     /// セッションに `Log`・`Runtime`・`Network` のいずれかの有効印を付ける（冪等。43.3j・#1038・`CDP-2`）。
@@ -694,6 +733,7 @@ impl TargetRegistry {
             for s in &sids {
                 t.sessions.remove(s);
                 t.page_enabled.remove(s);
+                t.lifecycle_events_enabled.remove(s);
                 t.domains_enabled.remove(s);
             }
             closed.push((tid, sids));
@@ -1190,6 +1230,63 @@ mod tests {
         r.enable_page(&s3).unwrap();
         r.dispose_browser_context(&c).unwrap();
         assert!(!r.is_page_enabled(&s3));
+    }
+
+    #[test]
+    fn cdp2_set_lifecycle_events_toggles_and_rejects_unknown_session() {
+        let r = TargetRegistry::new();
+        let t = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        let s = r.attach(&t).unwrap();
+        assert!(!r.is_lifecycle_events_enabled(&s));
+        r.set_lifecycle_events(&s, true).unwrap();
+        r.set_lifecycle_events(&s, true).unwrap();
+        assert!(r.is_lifecycle_events_enabled(&s));
+        r.set_lifecycle_events(&s, false).unwrap();
+        r.set_lifecycle_events(&s, false).unwrap();
+        assert!(!r.is_lifecycle_events_enabled(&s));
+        let ghost = SessionId::parse("ghost-1").unwrap();
+        assert_eq!(
+            r.set_lifecycle_events(&ghost, true),
+            Err(CdpStateError::UnknownSession)
+        );
+        assert!(!r.is_lifecycle_events_enabled(&ghost));
+    }
+
+    #[test]
+    fn cdp2_lifecycle_events_active_requires_page_enable_and_flag() {
+        let r = TargetRegistry::new();
+        let t = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        let s = r.attach(&t).unwrap();
+        r.set_lifecycle_events(&s, true).unwrap();
+        assert!(!r.lifecycle_events_active(&s));
+        r.enable_page(&s).unwrap();
+        assert!(r.lifecycle_events_active(&s));
+        r.set_lifecycle_events(&s, false).unwrap();
+        assert!(!r.lifecycle_events_active(&s));
+        let s2 = r.attach(&t).unwrap();
+        r.enable_page(&s2).unwrap();
+        assert!(!r.lifecycle_events_active(&s2));
+    }
+
+    #[test]
+    fn cdp7_lifecycle_flag_is_dropped_on_detach_close_and_dispose() {
+        let r = TargetRegistry::new();
+        let t1 = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        let s1 = r.attach(&t1).unwrap();
+        r.set_lifecycle_events(&s1, true).unwrap();
+        r.detach(&s1).unwrap();
+        assert!(!r.is_lifecycle_events_enabled(&s1));
+        let s1b = r.attach(&t1).unwrap();
+        r.set_lifecycle_events(&s1b, true).unwrap();
+        r.close_target(&t1).unwrap();
+        assert!(!r.is_lifecycle_events_enabled(&s1b));
+        let c = r.create_browser_context().unwrap();
+        let (_t3, s3) = r
+            .create_target_attached(Some(&c), TargetKind::Page, "about:blank", false)
+            .unwrap();
+        r.set_lifecycle_events(&s3, true).unwrap();
+        r.dispose_browser_context(&c).unwrap();
+        assert!(!r.is_lifecycle_events_enabled(&s3));
     }
 
     #[test]

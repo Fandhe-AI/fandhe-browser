@@ -65,3 +65,4 @@ SEC-3 は「本項は実測対象の選定基準であり、ブラウザ本体�
 | 2026-10-10 | 観点 1〜8 の設計・コード確認（草案作成） | 偽装機能なし。P2 1 件（解消）・P3 3 件 |
 | 2026-10-14 | TASK-43.3g（#942）: `Browser.setDownloadBehavior` の `deny` + `eventsEnabled:true` と `Target.setAutoAttach` の `waitForDebuggerOnStart:true` の受理を確認（UA・ヘッダ・`navigator`・画面・TLS・locale に触れない。`Emulation.*` は -32601 のまま） | 偽装機能なし |
 | 2026-10-16 | TASK-43.3j（#1038）: セッション付き Log.enable・Runtime.enable・Network.enable の受理（フラグのみ・イベントなし）。UA・ヘッダ・navigator・画面・TLS・locale に触れない。Network.setUserAgentOverride・Emulation.setUserAgentOverride は -32601 のまま（tests/devtools_browser.rs・cdp6_builtin_other_methods_remain_unimplemented の固定を維持） | 偽装機能なし |
+| 2026-10-16 | TASK-43.3k（#1039）: セッション付き Page.setLifecycleEventsEnabled の受理と Page.lifecycleEvent（init・load）の固定名での送出。UA・ヘッダ・navigator・画面・TLS・locale に触れない | 偽装機能なし |
