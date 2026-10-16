@@ -1537,6 +1537,34 @@ jobs:
           "MOZTOOLS_PATH=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: "[servo-host] cargo build（dev・--locked）"
         run: cargo build --manifest-path servo-host/Cargo.toml --locked --target-dir $env:SERVO_HOST_TARGET_DIR
+      - name: "[servo-host] ANGLE の DLL を配置（libEGL.dll・libGLESv2.dll）"
+        run: |
+          # Windows は `no-wgl`（ANGLE）で動く。mozangle の build.rs が OUT_DIR に作る DLL は、
+          # 実行時に exe の隣か PATH に要る。exe（debug）とテストバイナリ（debug\deps）の隣へ置く。
+          # OUT_DIR（out）を持つ mozangle-* ディレクトリが 1 件でない・DLL が欠けるときは fail する
+          $build = Join-Path $env:SERVO_HOST_TARGET_DIR 'debug\build'
+          $outs = @(Get-ChildItem -Path $build -Directory -Filter 'mozangle-*' |
+            ForEach-Object { Join-Path $_.FullName 'out' } |
+            Where-Object {
+              (Test-Path (Join-Path $_ 'libEGL.dll')) -and
+              (Test-Path (Join-Path $_ 'libGLESv2.dll'))
+            })
+          if ($outs.Count -ne 1) {
+            Write-Host "::error::expected 1 mozangle OUT_DIR with the ANGLE DLLs under $build (found: $($outs.Count))"
+            exit 1
+          }
+          foreach ($dest in @('debug', 'debug\deps')) {
+            $dir = Join-Path $env:SERVO_HOST_TARGET_DIR $dest
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            foreach ($dll in @('libEGL.dll', 'libGLESv2.dll')) {
+              Copy-Item -Path (Join-Path $outs[0] $dll) -Destination $dir -Force
+              if (-not (Test-Path (Join-Path $dir $dll))) {
+                Write-Host "::error::failed to place $dll in $dir"
+                exit 1
+              }
+            }
+            Write-Host "ANGLE DLLs placed in $dir"
+          }
       - name: "[servo-host] --selftest"
         run: |
           $bin = Join-Path $env:SERVO_HOST_TARGET_DIR 'debug\fandhe-browser-servo-host.exe'

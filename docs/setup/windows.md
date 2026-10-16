@@ -123,6 +123,17 @@ VS 2026 では、v143 を導入しても既定のツールセットは v145 の�
   $env:MOZTOOLS_PATH = "C:\path\to\moztools-4.0"
   ```
 
+### ANGLE（`no-wgl`）と DLL の配置
+
+- Servo ホスト（`servo-host/`）は Windows では `servo` の `no-wgl` feature を有効にして ANGLE（`mozangle`）を使います（`servo-host/Cargo.toml` の `[target.'cfg(windows)'.dependencies]`。#999）。既定の WGL バックエンドは `WGL_NV_DX_interop` を必須とし、GPU の無い環境（CI の runner 等）では `cannot set up software rendering context: RequiredExtensionUnavailable` で失敗するためです。ANGLE では software adapter が D3D11 WARP になります。
+- `mozangle` の `build.rs` が `libEGL.dll`・`libGLESv2.dll` を `<target>\debug\build\mozangle-*\out` に作ります。実行時は exe の隣か `PATH` にこれらが要ります。ビルド後、exe（`<target>\debug`）とテストバイナリ（`<target>\debug\deps`）の隣へコピーしてから `--selftest`・`cargo test` を実行してください（CI の `servo-host-windows` の「ANGLE の DLL を配置」ステップと同じ手順です）。
+- ANGLE は BSD-3-Clause で、DLL を配布物に同梱するため `NOTICE` に帰属表示があります。
+
+  ```powershell
+  $out = Get-ChildItem C:\st\debug\build -Directory -Filter 'mozangle-*' | ForEach-Object { Join-Path $_.FullName 'out' } | Where-Object { Test-Path (Join-Path $_ 'libEGL.dll') }
+  Copy-Item "$out\libEGL.dll", "$out\libGLESv2.dll" C:\st\debug\, C:\st\debug\deps\
+  ```
+
 ### 注意点
 
 - Servo の `target/` は 10〜15GB に達すると公称されています（PoC-12）。空き容量を確認し、長パスを避けるため `CARGO_TARGET_DIR` は短いパス（例: `C:\t`）に置くことを推奨します。
