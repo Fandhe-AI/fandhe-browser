@@ -33,6 +33,8 @@ Playwright のソースは長く引用せず、関数名と要約に留める。
 | `connectOverCDP(ws://…)` | 未実行（http 経由が成功するため、収集ハーネスの ws 直接の再試行は行われない） | A |
 | `newContext()` | 成功（`acceptDownloads:false` 指定時。TASK-43.3d・#909 で到達）。`Target.createBrowserContext`（`disposeOnDetach:true`）と `browserContextId` 付き `Browser.setDownloadBehavior`（`deny` + `eventsEnabled:true`）が成功する（後述「段階 2b の実施結果」） | A: seq 10〜14 |
 | `newPage()` | 成功（`connectOverCDP(noDefaults:true)`・`newContext({acceptDownloads:false, viewport:null})` 指定時。TASK-43.3n・#1042 で到達を確認。後述「到達結果（TASK-43.3n）」）。`Page.createIsolatedWorld`・`Browser.getWindowForTarget` は `-32601` のまま残るが `newPage()` は失敗しない | A: seq 15〜41 |
+| `goto`（ローカル fixture） | 成功（TASK-44.3・TASK-44.4 で確認。後述「テスト結果レポート（TASK-44.4）」） | A |
+| `selector`（`#target`） | 失敗（`StageTimeout` 10 秒。Runtime ドメイン未実装。後述「テスト結果レポート（TASK-44.4）」） | A |
 
 `-32601` は未実装メソッドへ成功を捏造しない `CDP-6`・`SEC-2` の方針どおりの挙動で、バグではない。
 
@@ -534,6 +536,66 @@ TASK-43.3o（#1050）の取り込み後に再取得した同梱トレース（3 
 - 原因の見立て（B）: locator は utility world に注入スクリプトを載せて評価する。`Runtime.executionContextCreated` を送らず実行コンテキストが成立しないため、応答待ちで止まる。
 - 扱い: 未実装を成功に見せるフォールバックは入れない（`CDP-6`・`SEC-2`）。期待値の弱体化・skip もしない。実テストは `#[ignore]` のまま失敗が正で、
   Runtime ドメインの実装 Issue の完了後に通る見込み。受入基準のうちセレクタ取得は未達。
+
+### テスト結果レポート（TASK-44.4・#479。実測 A）
+
+`CDP-2`（関連: `CDP-6`・`SEC-2`・`REPAIR-3`）・TASK-44（44.4）・MS-4。Playwright の一連フロー（TASK-44.1〜44.3 で整備）の到達可否を記録する。
+
+#### 実測条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 基準コミット | main の `61ffb1c4` |
+| 実測日 | 2026-10-16 |
+| playwright-core | 1.63.0（出典: `scripts/versions.sh` の `PLAYWRIGHT_VERSION`。integrity は `verify-install.mjs` で検証。`--ignore-scripts`・ブラウザ本体は取得しない） |
+| node | v24.21.0 |
+| 接続オプション | `connectOverCDP(noDefaults:true)`・`newContext({acceptDownloads:false, viewport:null})` |
+| ループバック | feature `test-support` の `endpoints_allowing_loopback` のみ。本番の `endpoints()` の内部アドレス拒否（SSRF ガード）は変えていない |
+| fixture | `127.0.0.1` だけに配信。期待値は `#target` のテキスト `Hello fixture`・属性 `data-role="greeting"` |
+
+#### 5 段階の到達結果
+
+| 段階 | 結果 | 失敗コード・内容 | 根拠 |
+| ---- | ---- | ---------------- | ---- |
+| `connect` | 成功 | なし | A（`make test-playwright-connect`） |
+| `newContext` | 成功 | なし | A |
+| `newPage` | 成功 | なし | A |
+| `goto` | 成功 | なし（`Page.navigate` が `loaderId` を返し、`Page.frameNavigated`・`Page.loadEventFired` が届く） | A |
+| `selector` | 失敗 | `StageTimeout`: `stage timed out after 10000 ms` | A |
+
+`make test-playwright-connect` は `cdp2_real_playwright_goto_and_selector` が `selector` 段階の失敗で終了コード 2 になる。これは現状の正しい結果であり、skip・期待値の弱体化・成功フォールバックは入れていない（`CDP-6`・`SEC-2`）。
+
+#### 失敗段階（selector）の CDP トレース
+
+実測 A。`DEBUG=pw:protocol` を付けて `harness/playwright-connect/connect.mjs` を直接実行して採取した。
+採取にはサーバー起動用の `examples/trace_server.rs` へ、feature `test-support` のときだけ `endpoints_allowing_loopback` を使う一時変更を入れた（採取後に元へ戻し、コミットしていない）。
+ポートは `<PORT>`、一時パスは `<ARTIFACTS_DIR>` と読み替え、時刻・ANSI は除いて要約した。`goto` 以降の区間は次のとおり。
+
+| 順 | 方向 | メッセージ | 結果 |
+| -- | ---- | ---------- | ---- |
+| 1 | send | `Page.createIsolatedWorld`（id 18。`worldName` は `__playwright_utility_world_page@…`） | `-32601` `method not implemented`（サーバー側ログに `unimplemented method received: Page.createIsolatedWorld`） |
+| 2 | send | `Page.navigate`（id 19。`http://127.0.0.1:<PORT2>/index.html`） | 成功（`frameId`・`loaderId`） |
+| 3 | recv | `Page.lifecycleEvent`（`init`）・`Page.frameNavigated`・`Page.loadEventFired`・`Page.lifecycleEvent`（`load`） | 届く |
+| 4 | - | （以降、クライアントは何も送らず、サーバーも何も送らない） | 10 秒後に `StageTimeout` |
+
+- 応答の無い要求: なし（送った 19 件すべてに応答がある）
+- `-32601` を返したメソッド: `Page.createIsolatedWorld` の 1 件のみ
+- 重要な事実: `Runtime.enable` は空の成功（`{}`）を返すが、`Runtime.executionContextCreated` は 1 件も送られない。Playwright は `Runtime.callFunctionOn`・`Runtime.evaluate` を一度も送らずに実行コンテキストの成立を待ち続ける。TASK-44.3 の記述にあった「`Runtime.callFunctionOn`・`Runtime.evaluate` も `-32601`」は、実測では送信自体されていない（実行コンテキストが無い段階で止まるため）。
+
+#### 原因の見立て（B）
+
+実測ではなくソース読解（playwright-core 1.63.0 の `lib/coreBundle.js`）に基づく。locator は frame の utility world の実行コンテキストへ注入スクリプトを載せて評価する。
+サーバーが `Runtime.executionContextCreated` を送らず、`Page.createIsolatedWorld` も `-32601` のため、コンテキストが成立せず `StageTimeout` になる。
+
+#### 扱い・未達の明示
+
+- #250 の受入基準（セレクタで要素を取得すること）は未達。解消の前提は Runtime ドメインの最小実装（`Runtime.executionContextCreated` の送出・`Page.createIsolatedWorld`・`Runtime.callFunctionOn`・`Runtime.evaluate`）で、後続 Issue は未起票
+- 実装済みを装わない（`REPAIR-3`）。Runtime 実装後に `selector` が通ることを再実測して本節を更新する
+
+#### 再現手順
+
+1. `make test-playwright-connect`（要 node/npm/ネットワーク。CI 対象外）で 5 段階の結果を得る
+2. トレースは、上記の一時変更を入れた `trace_server` を `cargo run -p fandhe-browser-cdp --features test-support --example trace_server` で起動し、`DEBUG=pw:protocol`・`FANDHE_CDP_WS_ENDPOINT`・`FANDHE_PLAYWRIGHT_MODULE_DIR`・`FANDHE_FIXTURE_URL` を渡して `node harness/playwright-connect/connect.mjs` を実行する。ハーネスとしての恒久化は今後の課題
 
 ### 原則
 
