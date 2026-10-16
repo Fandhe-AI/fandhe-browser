@@ -29,6 +29,10 @@ pub const MAX_SESSIONS: usize = 256;
 const MAX_ID_LEN: usize = 64;
 /// ターゲット URL の最大バイト長（巨大 URL によるメモリ無制限消費の防止）。
 pub const MAX_URL_LEN: usize = 8192;
+/// `Page.addScriptToEvaluateOnNewDocument` の `worldName` の最大バイト長（`CDP-7`。無制限入力の防止）。
+pub(crate) const MAX_WORLD_NAME_LEN: usize = 256;
+/// 1 セッションあたりの `Page.addScriptToEvaluateOnNewDocument` 登録数の上限（`CDP-7`）。
+pub(crate) const MAX_INIT_SCRIPTS_PER_SESSION: u32 = 64;
 
 /// cdp 状態型の操作エラー。表は失敗時に変更されない。
 ///
@@ -68,6 +72,16 @@ pub enum CdpStateError {
     },
     /// 既定 browser context は破棄できない。
     DefaultBrowserContext,
+    /// セッションあたりの init script 登録数が上限（[`MAX_INIT_SCRIPTS_PER_SESSION`]）に達している。
+    TooManyInitScripts {
+        /// 上限値。
+        limit: u32,
+    },
+    /// `worldName` がバイト長の上限（[`MAX_WORLD_NAME_LEN`]）を超えている。
+    WorldNameTooLong {
+        /// 上限値（バイト）。
+        limit: usize,
+    },
 }
 
 impl fmt::Display for CdpStateError {
@@ -87,11 +101,27 @@ impl fmt::Display for CdpStateError {
             Self::DefaultBrowserContext => {
                 f.write_str("default browser context cannot be disposed")
             }
+            Self::TooManyInitScripts { limit } => {
+                write!(f, "too many init scripts (limit {limit})")
+            }
+            Self::WorldNameTooLong { limit } => {
+                write!(f, "world name too long (limit {limit} bytes)")
+            }
         }
     }
 }
 
 impl std::error::Error for CdpStateError {}
+
+/// セッション表以外にある、セッション単位の付随状態を消す（`remove_target`・`detach`・
+/// `dispose_browser_context` から削除と同じロック内で呼ぶ。消し忘れ防止のため 1 か所に集約。`CDP-7`）。
+fn drop_session_state(t: &mut Tables, sid: &SessionId) {
+    t.page_enabled.remove(sid);
+    t.lifecycle_events_enabled.remove(sid);
+    t.domains_enabled.remove(sid);
+    t.init_scripts.remove(sid);
+    t.child_auto_attach.remove(sid);
+}
 
 /// 外部入力の ID 文字列を検証する（長さ・文字種）。
 fn validate_id(s: &str) -> Result<(), CdpStateError> {
@@ -285,6 +315,16 @@ struct Tables {
     /// `Log.enable`・`Runtime.enable`・`Network.enable` 済みのセッション（43.3j・#1038・`CDP-2`）。
     /// 寿命は `sessions` と同じで削除と同じロック内で消す。件数は `MAX_SESSIONS` 以下（`CDP-7`）。
     domains_enabled: HashMap<SessionId, SessionDomains>,
+    /// セッションごとの `Page.addScriptToEvaluateOnNewDocument` 登録数（43.3l・#1040・`CDP-2`）。
+    /// `source` は常に空で `Page.removeScriptToEvaluateOnNewDocument` も未実装のため、件数だけを持つ。
+    /// 将来は登録内容（world 名・source）を持ちページ JS 実行と繋ぐ（`JS-4`・TASK-112・`REPAIR-3`）。
+    /// 寿命は `sessions` と同じ。件数は `MAX_SESSIONS` × 上限以下（`CDP-7`）。
+    init_scripts: HashMap<SessionId, u32>,
+    /// init script identifier の連番（registry 全体。初期値 1。枯渇時は `IdExhausted`）。
+    next_init_script: u64,
+    /// セッション付き `Target.setAutoAttach` の状態（値は `waitForDebuggerOnStart`。43.3l・#1040）。
+    /// 子ターゲット（iframe・worker）のモデルが無いので保持するだけで効果は無い。
+    child_auto_attach: HashMap<SessionId, bool>,
     next_target: u64,
     next_session: u64,
     next_context: u64,
@@ -324,6 +364,9 @@ impl TargetRegistry {
                 page_enabled: HashSet::new(),
                 lifecycle_events_enabled: HashSet::new(),
                 domains_enabled: HashMap::new(),
+                init_scripts: HashMap::new(),
+                next_init_script: 1,
+                child_auto_attach: HashMap::new(),
                 next_target,
                 next_session,
                 next_context,
@@ -467,9 +510,7 @@ impl TargetRegistry {
         removed.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         for sid in &removed {
             t.sessions.remove(sid);
-            t.page_enabled.remove(sid);
-            t.lifecycle_events_enabled.remove(sid);
-            t.domains_enabled.remove(sid);
+            drop_session_state(t, sid);
         }
         Ok(removed)
     }
@@ -496,9 +537,7 @@ impl TargetRegistry {
     /// セッションを切り離し、attach 先のターゲット ID を返す。
     pub fn detach(&self, id: &SessionId) -> Result<TargetId, CdpStateError> {
         let mut t = self.lock();
-        t.page_enabled.remove(id);
-        t.lifecycle_events_enabled.remove(id);
-        t.domains_enabled.remove(id);
+        drop_session_state(&mut t, id);
         t.sessions.remove(id).ok_or(CdpStateError::UnknownSession)
     }
 
@@ -576,6 +615,64 @@ impl TargetRegistry {
             .domains_enabled
             .get_mut(sid)
             .is_some_and(|x| *x.slot(d))
+    }
+
+    /// セッションに空 source の init script を 1 件登録し、identifier（registry 全体の連番）を返す
+    /// （43.3l・#1040・`CDP-2`）。
+    ///
+    /// 存在確認・上限検査・採番を 1 回のロックで行い、失敗時は件数も連番も変えない。source は常に空で
+    /// 実行されない。identifier を接続スコープでなく registry 全体にするのは、採番を原子的にし
+    /// 同一接続での再登録が別 identifier になることを保証するため。
+    pub(crate) fn add_init_script(&self, sid: &SessionId) -> Result<u64, CdpStateError> {
+        let mut t = self.lock();
+        if !t.sessions.contains_key(sid) {
+            return Err(CdpStateError::UnknownSession);
+        }
+        let count = t.init_scripts.get(sid).copied().unwrap_or(0);
+        if count >= MAX_INIT_SCRIPTS_PER_SESSION {
+            return Err(CdpStateError::TooManyInitScripts {
+                limit: MAX_INIT_SCRIPTS_PER_SESSION,
+            });
+        }
+        let n = t.next_init_script;
+        let next = n.checked_add(1).ok_or(CdpStateError::IdExhausted)?;
+        t.next_init_script = next;
+        t.init_scripts.insert(sid.clone(), count.saturating_add(1));
+        Ok(n)
+    }
+
+    /// セッション付き `Target.setAutoAttach` の状態を設定する（`Some(wait)` で設定、`None` で解除。
+    /// 冪等。43.3l・#1040・`CDP-2`）。存在確認と設定を 1 回のロックで行う。
+    pub(crate) fn set_child_auto_attach(
+        &self,
+        sid: &SessionId,
+        state: Option<bool>,
+    ) -> Result<(), CdpStateError> {
+        let mut t = self.lock();
+        if !t.sessions.contains_key(sid) {
+            return Err(CdpStateError::UnknownSession);
+        }
+        match state {
+            Some(wait) => {
+                t.child_auto_attach.insert(sid.clone(), wait);
+            }
+            None => {
+                t.child_auto_attach.remove(sid);
+            }
+        }
+        Ok(())
+    }
+
+    /// セッションの子 auto attach 状態（テスト用）。
+    #[cfg(test)]
+    pub(crate) fn child_auto_attach(&self, sid: &SessionId) -> Option<bool> {
+        self.lock().child_auto_attach.get(sid).copied()
+    }
+
+    /// セッションの init script 登録数（テスト用）。
+    #[cfg(test)]
+    pub(crate) fn init_script_count(&self, sid: &SessionId) -> u32 {
+        self.lock().init_scripts.get(sid).copied().unwrap_or(0)
     }
 
     /// セッションの attach 先ターゲットを返す。
@@ -732,9 +829,7 @@ impl TargetRegistry {
             sids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             for s in &sids {
                 t.sessions.remove(s);
-                t.page_enabled.remove(s);
-                t.lifecycle_events_enabled.remove(s);
-                t.domains_enabled.remove(s);
+                drop_session_state(&mut t, s);
             }
             closed.push((tid, sids));
         }
@@ -1230,6 +1325,90 @@ mod tests {
         r.enable_page(&s3).unwrap();
         r.dispose_browser_context(&c).unwrap();
         assert!(!r.is_page_enabled(&s3));
+    }
+
+    #[test]
+    fn cdp2_add_init_script_returns_increasing_ids_and_rejects_unknown_session() {
+        let r = TargetRegistry::new();
+        let t = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        let s = r.attach(&t).unwrap();
+        assert_eq!(r.add_init_script(&s), Ok(1));
+        assert_eq!(r.add_init_script(&s), Ok(2));
+        assert_eq!(r.init_script_count(&s), 2);
+        let ghost = SessionId::parse("ghost").unwrap();
+        assert_eq!(
+            r.add_init_script(&ghost),
+            Err(CdpStateError::UnknownSession)
+        );
+    }
+
+    #[test]
+    fn cdp7_add_init_script_limit_keeps_count_and_counter() {
+        let r = TargetRegistry::new();
+        let t = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        let s = r.attach(&t).unwrap();
+        let other = r.attach(&t).unwrap();
+        for i in 0..MAX_INIT_SCRIPTS_PER_SESSION {
+            assert_eq!(r.add_init_script(&s), Ok(u64::from(i) + 1));
+        }
+        assert_eq!(
+            r.add_init_script(&s),
+            Err(CdpStateError::TooManyInitScripts {
+                limit: MAX_INIT_SCRIPTS_PER_SESSION
+            })
+        );
+        assert_eq!(r.init_script_count(&s), MAX_INIT_SCRIPTS_PER_SESSION);
+        // 失敗では連番が進まず、別セッションには影響しない。
+        assert_eq!(
+            r.add_init_script(&other),
+            Ok(u64::from(MAX_INIT_SCRIPTS_PER_SESSION) + 1)
+        );
+    }
+
+    #[test]
+    fn cdp2_set_child_auto_attach_sets_and_clears() {
+        let r = TargetRegistry::new();
+        let t = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        let s = r.attach(&t).unwrap();
+        assert_eq!(r.child_auto_attach(&s), None);
+        r.set_child_auto_attach(&s, Some(true)).unwrap();
+        assert_eq!(r.child_auto_attach(&s), Some(true));
+        r.set_child_auto_attach(&s, Some(false)).unwrap();
+        assert_eq!(r.child_auto_attach(&s), Some(false));
+        r.set_child_auto_attach(&s, None).unwrap();
+        assert_eq!(r.child_auto_attach(&s), None);
+        let ghost = SessionId::parse("ghost").unwrap();
+        assert_eq!(
+            r.set_child_auto_attach(&ghost, Some(true)),
+            Err(CdpStateError::UnknownSession)
+        );
+    }
+
+    #[test]
+    fn cdp7_init_scripts_and_child_auto_attach_are_dropped_on_detach_close_and_dispose() {
+        let r = TargetRegistry::new();
+        let t1 = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        let s1 = r.attach(&t1).unwrap();
+        r.add_init_script(&s1).unwrap();
+        r.set_child_auto_attach(&s1, Some(true)).unwrap();
+        r.detach(&s1).unwrap();
+        assert_eq!(r.init_script_count(&s1), 0);
+        assert_eq!(r.child_auto_attach(&s1), None);
+        let s1b = r.attach(&t1).unwrap();
+        r.add_init_script(&s1b).unwrap();
+        r.set_child_auto_attach(&s1b, Some(false)).unwrap();
+        r.close_target(&t1).unwrap();
+        assert_eq!(r.init_script_count(&s1b), 0);
+        assert_eq!(r.child_auto_attach(&s1b), None);
+        let c = r.create_browser_context().unwrap();
+        let (_t3, s3) = r
+            .create_target_attached(Some(&c), TargetKind::Page, "about:blank", false)
+            .unwrap();
+        r.add_init_script(&s3).unwrap();
+        r.set_child_auto_attach(&s3, Some(true)).unwrap();
+        r.dispose_browser_context(&c).unwrap();
+        assert_eq!(r.init_script_count(&s3), 0);
+        assert_eq!(r.child_auto_attach(&s3), None);
     }
 
     #[test]

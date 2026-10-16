@@ -36,7 +36,7 @@ const TRACE: &str = include_str!("../../../harness/playwright-trace/results/newp
 const MAX_TRACE_LINES: usize = 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
-/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3j 後）。`connectOverCDP(noDefaults:true)` は
+/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3l 後）。`connectOverCDP(noDefaults:true)` は
 /// `Target.setAutoAttach`（`waitForDebuggerOnStart:true`）・`Target.getTargetInfo` を経て成功し、
 /// `newContext({acceptDownloads:false})` は `Target.createBrowserContext` と
 /// `browserContextId` 付き `Browser.setDownloadBehavior` を経て成功する。`newPage()` は
@@ -47,7 +47,9 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 /// 引く）を前提にすること。`frame.id` が `"main"` のままだと一致しない（`docs/design/playwright-compat.md`）。
 /// `Log.enable`・`Runtime.enable`・`Network.enable`（43.3j）は有効フラグを立てて `{}` を返す（イベントは送らない。`REPAIR-3`）。
 /// `Page.setLifecycleEventsEnabled`（43.3k）は有効フラグを立てて `{}` を返す。この trace は遷移を含まないため
-/// `Page.lifecycleEvent` は現れない。残りの `Page.addScriptToEvaluateOnNewDocument` 等は未実装で `-32601`。
+/// `Page.lifecycleEvent` は現れない。`Page.addScriptToEvaluateOnNewDocument`（空 `source` のみ。43.3l）は
+/// `{"identifier":"1"}`、セッション付き `Target.setAutoAttach`（43.3l）は状態を保持して `{}`（子 attach は 0 件）を返す。
+/// 残りの `Browser.getWindowForTarget`・`Emulation.*` 等は未実装で `-32601`。
 ///
 /// 注意: `Browser.getVersion` の応答に `CARGO_PKG_VERSION` が入るため、workspace の版を上げたら
 /// `make trace-playwright` でトレースを再取得すること。
@@ -383,15 +385,16 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
                 "id": "main", "loaderId": "2", "url": "about:blank", "mimeType": "text/html"
             }}}}),
             // `Log.enable`・`Runtime.enable`・`Network.enable`（43.3j）は受理して `{}`（イベントなし）。
-            // 他のセッション付き初期化メソッド（id 13, 16-18）は未実装。
+            // 他のセッション付き初期化メソッド（id 16-18）は未実装。
             json!({"id": 10, "sessionId": sid, "result": {}}),
             // `Page.setLifecycleEventsEnabled`（43.3k）は有効フラグを立てて `{}`（この trace は遷移を含まず lifecycle は現れない）。
             json!({"id": 11, "sessionId": sid, "result": {}}),
             json!({"id": 12, "sessionId": sid, "result": {}}),
-            not_impl(13),
+            // 空 `source` の `Page.addScriptToEvaluateOnNewDocument`（43.3l）は no-op で、最初の identifier は "1"。
+            json!({"id": 13, "sessionId": sid, "result": {"identifier": "1"}}),
             json!({"id": 14, "sessionId": sid, "result": {}}),
-            // 子ターゲットの自動 attach（`sessionId` 付き `Target.setAutoAttach`）は未実装（43.3c）。
-            json!({"id": 15, "sessionId": sid, "error": {"code": -32602, "message": "unsupported params"}}),
+            // セッション付き `Target.setAutoAttach`（43.3l）は状態を保持するだけ。子ターゲットは作らず `{}`。
+            json!({"id": 15, "sessionId": sid, "result": {}}),
             not_impl(16),
             not_impl(17),
             not_impl(18),
@@ -422,7 +425,7 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
             ("Emulation.setFocusEmulationEnabled", 0, 1),
             ("Log.enable", 1, 0),
             ("Network.enable", 1, 0),
-            ("Page.addScriptToEvaluateOnNewDocument", 0, 1),
+            ("Page.addScriptToEvaluateOnNewDocument", 1, 0),
             ("Page.enable", 1, 0),
             ("Page.getFrameTree", 1, 0),
             ("Page.setLifecycleEventsEnabled", 1, 0),
@@ -686,7 +689,7 @@ fn reach_report(recs: &[Value]) -> ReachReport {
 
 /// `newPage()` 到達状況の結合テスト（TASK-43.3f・#911、`CDP-2`・`CDP-6`・MS-4）。
 ///
-/// 現状は **未到達の事実を固定するテスト**であり、到達確認ではない。`newPage()` は 43.3i・43.3j 後、
+/// 現状は **未到達の事実を固定するテスト**であり、到達確認ではない。`newPage()` は 43.3i・43.3j・43.3l 後、
 /// `Page.getFrameTree` の応答の処理で `Frame has been detached.` を投げて止まる（frame id が targetId と
 /// 一致しないため。`Page.enable`・`Page.getFrameTree` 自体は成功）。ページ初期化メソッド群の実装後は、トレースを
 /// `make trace-playwright` で再取得し、`stages` がすべて成功・`first_stop` が `None`・`failed` が空
@@ -738,20 +741,6 @@ fn cdp2_playwright_newpage_reach_report_lists_first_stop_and_failures() {
         failed,
         [
             (7, "Browser.getWindowForTarget", true, -32601, nf),
-            (
-                13,
-                "Page.addScriptToEvaluateOnNewDocument",
-                true,
-                -32601,
-                nf
-            ),
-            (
-                15,
-                "Target.setAutoAttach",
-                true,
-                -32602,
-                "unsupported params"
-            ),
             (16, "Emulation.setFocusEmulationEnabled", true, -32601, nf),
             (17, "Emulation.setDeviceMetricsOverride", true, -32601, nf),
             (18, "Emulation.setEmulatedMedia", true, -32601, nf),
