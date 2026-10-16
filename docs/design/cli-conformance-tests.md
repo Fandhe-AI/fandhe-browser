@@ -21,7 +21,7 @@ OS 間で違ってよいのは、spec が OS 固有と定める点だけ。具�
 
 | 項目 | 状況 |
 | ---- | ---- |
-| `--port`・ポート 0 | 未実装（`CLI-3`・#823）。待ち受けは `127.0.0.1:9333` 固定 |
+| `--port`・ポート 0 | 実装済み（`CLI-3`・#823）。`launch --port <PORT>`（既定 9333・0 は OS 割り当て）。待ち受け IP は `127.0.0.1` 固定（`SEC-4`）。通知行の出力形式は暫定。期待値は末尾の補足節 |
 | `<cmd> --help` | 未対応。help は `--help`・`-h`・`help` のトップレベルのみ |
 | `screenshot --full-page` | v1 ホスト未対応。usage エラーで拒否（補助ケース） |
 | プロファイルデータの実利用 | TASK-116・`PROF-7` |
@@ -217,3 +217,11 @@ ID は `CT-<コマンド>-E<n>`（3 OS 共通。結果は OS ごとに記録す�
 - SSRF の既定拒否を緩める手順は存在せず、本書でも追加しない。拒否は `CT-NAV-E2` で固定する
 - `launch` は loopback（`127.0.0.1:9333`）だけで待ち受ける。非 loopback での公開を試みない
 - Cookie・トークン・実在のプロファイルデータを検証に使わない。UA など識別面を変える手順は含めない（`SEC-2`）
+
+## 補足: `launch --port`（`CLI-3`・#823）
+
+| 引数 | 期待 |
+| ---- | ---- |
+| `["launch", "--port", "0"]` | stderr の 1 行が `DevTools listening on ws://127.0.0.1:<1-65535>/devtools/browser/<[0-9A-F]{32}>`。`/json/version` の `webSocketDebuggerUrl` と一致する |
+| `["launch", "--port", "65536"]` | 終了コード 2。`invalid value for option '--port'; run 'fandhe-browser --help' for usage` |
+| `["launch", "--port"]` | 終了コード 2。`missing required argument 'PORT'; run 'fandhe-browser --help' for usage` |

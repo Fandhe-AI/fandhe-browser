@@ -473,3 +473,95 @@ fn prof1_profile_dir_symlink_then_dotdot_is_rejected() {
     assert_eq!(out.code, Some(2), "{}", out.stderr);
     assert!(!created);
 }
+
+#[test]
+fn cli3_launch_invalid_port_exits_with_usage_error() {
+    let out = run("port-bad", &["launch", "--port", "65536"]);
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: invalid value for option '--port'; run 'fandhe-browser --help' for usage"
+    );
+}
+
+#[test]
+fn cli3_launch_port_without_value_exits_with_usage_error() {
+    let out = run("port-missing", &["launch", "--port"]);
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: missing required argument 'PORT'; run 'fandhe-browser --help' for usage"
+    );
+}
+
+/// `CLI-3`（#823）: ポート 0 で実起動し、stderr の 1 行に実ポートが出て `/json/version` に応答する。
+/// `#[cfg(unix)]` の理由: Windows は既定プロファイルルートが `%LOCALAPPDATA%` 配下
+/// （`...\AppData\Local` 終端）に限られ、一時ディレクトリでは起動できないため
+/// （既存の `prof1_*` と同じ制約。3 OS 共通検査を飛ばす意図ではない）。
+#[cfg(unix)]
+#[test]
+fn cli3_launch_port_zero_announces_assigned_port() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+    use std::sync::mpsc;
+
+    let home = std::env::temp_dir().join(format!("fandhe-cli-port0-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir(&home).expect("home dir");
+    let profile = home.join("p");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-browser"))
+        .args(["launch", "--port", "0", "--profile-dir"])
+        .arg(&profile)
+        .env_remove("FANDHE_BROWSER_CONFIG")
+        .env_remove("FANDHE_BROWSER_RENDER_HOST")
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary can be spawned");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stderr).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx.recv_timeout(DEADLINE);
+    let result = std::panic::catch_unwind(|| {
+        let line = line.expect("startup line within deadline");
+        let line = line.trim();
+        let rest = line
+            .strip_prefix("DevTools listening on ws://127.0.0.1:")
+            .unwrap_or_else(|| panic!("unexpected line: {line}"));
+        let (port, id) = rest
+            .split_once("/devtools/browser/")
+            .unwrap_or_else(|| panic!("unexpected line: {line}"));
+        let port: u16 = port.parse().expect("numeric port");
+        assert_ne!(port, 0);
+        assert_eq!(id.len(), 32, "{id}");
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b)),
+            "{id}"
+        );
+        let mut conn = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        conn.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        write!(
+            conn,
+            "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("send");
+        let mut resp = String::new();
+        conn.read_to_string(&mut resp).expect("read");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains(id), "{resp}");
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&home);
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}

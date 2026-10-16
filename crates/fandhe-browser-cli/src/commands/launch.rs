@@ -8,8 +8,9 @@
 //!
 //! 以下は未実装で、実装済みを装わない（REPAIR-3）。
 //!
-//! - `--port`・ポート 0・起動後の実アドレスの機械可読通知（`CLI-3`）: #823 で
-//!   [`LaunchOptions::addr`] に追加する。現状は [`server::DEFAULT_ADDR`] 固定
+//! - 起動後の実アドレスの機械可読通知（`CLI-3`）: `--port <PORT>`・ポート 0 は #823 で実装済み
+//!   （待ち受け IP は 127.0.0.1 固定。SEC-4）。実ポートは stderr の
+//!   `DevTools listening on ...` 1 行で通知する暫定形式で、出力形式は CLI-3 の確定時に見直す
 //! - `launch --help`: ハンドラは出力先を受け取らないため未対応（`--help` は未知のオプション扱い。
 //!   トップレベルの `--help` に `launch` が載る）
 
@@ -27,7 +28,7 @@ pub(crate) const SPEC: CommandSpec = CommandSpec {
     run,
 };
 
-/// 起動オプション。後続の `--port`（#823）の拡張点。`--profile-dir`（#287）は [`profile`] が解釈する。
+/// 起動オプション。`--port`（#823・`CLI-3`）は本モジュール、`--profile-dir`（#287）は [`profile`] が解釈する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) struct LaunchOptions {
@@ -46,11 +47,60 @@ impl Default for LaunchOptions {
     }
 }
 
-/// `launch` の引数を解析する（副作用なし）。受け付けるのは `--profile-dir <PATH>` だけ。
+/// ポート指定オプション名。
+const PORT_OPTION: &str = "--port";
+/// ポート値の名前（欠落エラーの表示用）。
+const PORT_VALUE_NAME: &str = "PORT";
+
+/// `--port` の値を解析する（副作用なし・外部入力）。ASCII 数字だけの 1〜5 文字で `u16` に収まるもの。
+/// `0`（OS 割り当て）以外の先頭ゼロは 8 進誤読を避けるため拒否する。`+`・空白・非 ASCII 数字も拒否する。
+fn parse_port(value: &str) -> Result<u16, UsageError> {
+    let invalid = UsageError::InvalidOptionValue {
+        option: PORT_OPTION,
+    };
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > 5 || !bytes.iter().all(u8::is_ascii_digit) {
+        return Err(invalid);
+    }
+    if bytes.len() > 1 && bytes.first() == Some(&b'0') {
+        return Err(invalid);
+    }
+    value.parse::<u16>().map_err(|_| invalid)
+}
+
+/// `--port <PORT>` を 1 つ消費する。該当しなければ `Ok(false)`。重複指定・値の欠落は拒否する。
+fn take_port<'a>(
+    arg: &str,
+    iter: &mut impl Iterator<Item = &'a String>,
+    current: &mut Option<u16>,
+) -> Result<bool, UsageError> {
+    if arg != PORT_OPTION {
+        return Ok(false);
+    }
+    if current.is_some() {
+        return Err(UsageError::UnexpectedArgument(arg.to_string()));
+    }
+    let value = iter
+        .next()
+        .ok_or(UsageError::MissingArgument(PORT_VALUE_NAME))?;
+    if value.starts_with('-') {
+        // 後続のオプションを値として飲み込まない。
+        return Err(UsageError::MissingArgument(PORT_VALUE_NAME));
+    }
+    *current = Some(parse_port(value)?);
+    Ok(true)
+}
+
+/// `launch` の引数を解析する（副作用なし）。受け付けるのは `--profile-dir <PATH>` と `--port <PORT>`。
+/// 待ち受け IP は 127.0.0.1 固定で、ホストやアドレスを指定する手段は設けない（SEC-4）。
 pub(crate) fn parse_launch_args(args: &CommandArgs) -> Result<LaunchOptions, UsageError> {
     let mut options = LaunchOptions::default();
+    let mut port = None;
     let mut iter = args.as_slice().iter();
     while let Some(arg) = iter.next() {
+        if take_port(arg, &mut iter, &mut port)? {
+            continue;
+        }
         if profile::take_profile_dir(arg, &mut iter, &mut options.profile)? {
             continue;
         }
@@ -59,6 +109,9 @@ pub(crate) fn parse_launch_args(args: &CommandArgs) -> Result<LaunchOptions, Usa
         } else {
             UsageError::UnexpectedArgument(arg.clone())
         });
+    }
+    if let Some(port) = port {
+        options.addr = std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port);
     }
     Ok(options)
 }
@@ -169,5 +222,103 @@ mod tests {
             format!("{:?}", ce.exit_code()),
             format!("{:?}", std::process::ExitCode::from(2))
         );
+    }
+
+    #[test]
+    fn cli3_launch_port_sets_loopback_addr() {
+        let o = parse_launch_args(&args(&["--port", "9444"])).expect("ok");
+        assert_eq!(o.addr.to_string(), "127.0.0.1:9444");
+        let o = parse_launch_args(&args(&["--port", "0"])).expect("ok");
+        assert_eq!(o.addr.to_string(), "127.0.0.1:0");
+        let o = parse_launch_args(&args(&["--port", "1"])).expect("ok");
+        assert_eq!(o.addr.to_string(), "127.0.0.1:1");
+        let o = parse_launch_args(&args(&["--port", "65535"])).expect("ok");
+        assert_eq!(o.addr.to_string(), "127.0.0.1:65535");
+    }
+
+    #[test]
+    fn cli3_launch_port_combines_with_profile_dir() {
+        for a in [
+            ["--port", "0", "--profile-dir", "p"],
+            ["--profile-dir", "p", "--port", "0"],
+        ] {
+            let o = parse_launch_args(&args(&a)).expect("ok");
+            assert_eq!(o.addr.to_string(), "127.0.0.1:0");
+            assert_eq!(o.profile, ProfileSelection::Explicit("p".into()));
+        }
+    }
+
+    #[test]
+    fn cli3_launch_rejects_invalid_port_values() {
+        for bad in [
+            "",
+            "65536",
+            "99999",
+            "123456",
+            "abc",
+            "9333a",
+            "+9333",
+            " 9333",
+            "9333 ",
+            "0x10",
+            "9333.0",
+            "09333",
+            "00",
+            "\u{661}\u{662}\u{663}",
+        ] {
+            let e = parse_launch_args(&args(&["--port", bad])).expect_err(bad);
+            assert_eq!(
+                e,
+                UsageError::InvalidOptionValue { option: "--port" },
+                "{bad:?}"
+            );
+            let ce = CommandError::from(e);
+            assert_eq!(
+                ce.to_string(),
+                "invalid value for option '--port'; run 'fandhe-browser --help' for usage"
+            );
+            assert_eq!(
+                format!("{:?}", ce.exit_code()),
+                format!("{:?}", std::process::ExitCode::from(2))
+            );
+        }
+    }
+
+    #[test]
+    fn cli3_launch_port_missing_value() {
+        for a in [
+            vec!["--port"],
+            vec!["--port", "--profile-dir", "p"],
+            vec!["--port", "-1"],
+        ] {
+            assert_eq!(
+                parse_launch_args(&args(&a)),
+                Err(UsageError::MissingArgument("PORT"))
+            );
+        }
+    }
+
+    #[test]
+    fn cli3_launch_port_duplicate_is_rejected() {
+        assert_eq!(
+            parse_launch_args(&args(&["--port", "1", "--port", "2"])),
+            Err(UsageError::UnexpectedArgument("--port".into()))
+        );
+    }
+
+    #[test]
+    fn sec4_launch_has_no_host_option() {
+        for (opt, v) in [
+            ("--host", "0.0.0.0"),
+            ("--bind", "0.0.0.0:9333"),
+            ("--address", "0.0.0.0"),
+        ] {
+            assert_eq!(
+                parse_launch_args(&args(&[opt, v])),
+                Err(UsageError::UnknownOption(opt.into()))
+            );
+        }
+        let o = parse_launch_args(&args(&["--port", "8080"])).expect("ok");
+        assert_eq!(o.addr.ip(), std::net::Ipv4Addr::LOCALHOST);
     }
 }
