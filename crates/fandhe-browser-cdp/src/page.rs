@@ -64,7 +64,11 @@ use crate::protocol::{
 use crate::target::{CdpStateError, MAX_URL_LEN, TargetId, TargetRegistry};
 
 /// メインフレームの `frameId`（スタブ。将来はセッション → ターゲット ID。`CDP-2`・TASK-43）。
+/// `Page.frameNavigated` と `Page.getFrameTree`（43.3i）が同じ値を使う。
 pub(crate) const MAIN_FRAME_ID: &str = "main";
+
+/// メインフレームの `mimeType`（固定値。`Page.frameNavigated` と `Page.getFrameTree` で共有し食い違いを防ぐ）。
+pub(crate) const MAIN_FRAME_MIME_TYPE: &str = "text/html";
 
 /// [`navigate`] の結果。将来の拡張（イベント用情報など）に備えて構造体にする（`REPAIR-4`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,8 +218,9 @@ fn monotonic_seconds() -> f64 {
 /// - `frame.mimeType` は固定値 `text/html`（`NavigationResult` が Content-Type を保持しないため。
 ///   実値化は `CORE-5`・TASK-25 以降）。
 /// - `securityOrigin` 等の他フィールドは出さない。
-/// - `Page.enable` による購読ゲート・`frameStartedLoading`・`domContentEventFired` 等は未実装
-///   （TASK-43・`CDP-2`）。
+/// - `Page.enable` は実装済み（43.3i）だが、`Page.frameNavigated`・`Page.loadEventFired` は意図的に
+///   購読ゲートしない（Chromium との差異。`Page.enable` を送らない既存の利用を壊さないため。`REPAIR-3`）。
+///   `frameStartedLoading`・`domContentEventFired` 等は未実装（TASK-43・`CDP-2`）。
 fn navigation_events(loader_id: &str, url: &str, timestamp: f64) -> [CdpEvent; 2] {
     [
         CdpEvent {
@@ -225,7 +230,7 @@ fn navigation_events(loader_id: &str, url: &str, timestamp: f64) -> [CdpEvent; 2
                     "id": MAIN_FRAME_ID,
                     "loaderId": loader_id,
                     "url": url,
-                    "mimeType": "text/html",
+                    "mimeType": MAIN_FRAME_MIME_TYPE,
                 },
                 "type": "Navigation",
             }),
@@ -2251,6 +2256,45 @@ mod tests {
                 .into_frames()
                 .remove(0);
             assert!(!raw.contains("dummy-secret") && !raw.contains("127.0.0.1"));
+        }
+
+        /// 遷移確定後の `Page.getFrameTree` が、確定した URL と `loaderId` を返す（43.3i・#1037・`CDP-2`）。
+        #[tokio::test]
+        async fn cdp2_page_get_frame_tree_reflects_committed_url() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let tid = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let sid = st.registry().attach(&tid).unwrap();
+            let h = PageNavigate::new(FetchOptions::new().with_allow_private_network_access(true))
+                .unwrap();
+            let d = Dispatcher::from_handlers(vec![
+                ("Page.navigate", Box::new(h)),
+                (
+                    "Page.getFrameTree",
+                    Box::new(crate::playwright_compat::PageGetFrameTree),
+                ),
+            ])
+            .unwrap();
+            let port = serve("200 OK", "<p>tree</p>");
+            let url = format!("http://127.0.0.1:{port}/");
+            let nav = json!({"id": 1, "method": "Page.navigate", "sessionId": sid.as_str(),
+                "params": {"url": url}});
+            let f = frames(d.dispatch(&st, &nav.to_string()).await);
+            assert_eq!(f[0]["result"]["loaderId"], json!("1"), "{f:?}");
+            assert_eq!(f[1]["params"]["frame"]["loaderId"], json!("1"));
+            let req = json!({"id": 2, "method": "Page.getFrameTree", "sessionId": sid.as_str()});
+            let g = frames(d.dispatch(&st, &req.to_string()).await);
+            assert_eq!(
+                g,
+                vec![
+                    json!({"id": 2, "sessionId": sid.as_str(), "result": {"frameTree": {"frame": {
+                    "id": "main", "loaderId": "1", "url": url, "mimeType": "text/html"}}}})
+                ]
+            );
         }
 
         #[tokio::test]

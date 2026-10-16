@@ -328,6 +328,39 @@ playwright-core 1.63.0 のソース読解では、`FrameSession._initialize` の
 実装 issue を起票して #911 の依存に加える。実装後にトレースを再取得し、テストを到達確認（stage がすべて成功・停止なし）へ切り替える。
 それまで #911 は open のまま残す。
 
+### 段階 3a の実施結果（TASK-43.3i・#1037。実測 A）
+
+**実装範囲**（`CDP-2`・`CDP-6`・`SEC-2`・`REPAIR-3`・`CDP-7`）:
+
+| メソッド | 受理条件 | エラー |
+| -------- | -------- | ------ |
+| `Page.enable` | 生存セッションの `sessionId` 付き・`params` なし（または `{}`）。`{}` を返し、セッションに有効フラグを立てる（冪等） | `sessionId` なし・`params` にキーあり（`enableFileChooserOpenedEvent` を含む）は `-32602 unsupported params`、未知・閉じたセッションは `-32602 invalid params` |
+| `Page.getFrameTree` | 生存セッション付き。`frameTree.frame`（`id:"main"`・`loaderId`・`url`・`mimeType:"text/html"`）のみ返す。`Page.enable` は前提にしない | `Page.enable` と同じ分け方 |
+
+- フラグは `target.rs` の `Tables.page_enabled` に置く（Issue 記載の `conn_state.rs` から外れる）。セッション削除（detach・`closeTarget`・
+  `disposeBrowserContext`）と同じロックで消えて TOCTOU が起きず、自動 attach 由来でないセッションも扱える。件数は `MAX_SESSIONS` 以下。
+- `Page.enable` の実効果は #1039 の `Page.lifecycleEvent` 送出ゲートだけで、現時点ではイベント送出を何も変えない。既存の
+  `Page.frameNavigated`・`Page.loadEventFired` は `Page.enable` なしでも従来どおり送出する（Chromium との差異）。
+- `getFrameTree` の `loaderId` は遷移状態の世代の hex。止めたターゲットは再開前後で同じ値（初期 `about:blank` 確定後の `"2"`）。
+  `childFrames`・`securityOrigin`・`parentId` は返さない。遷移中・取得失敗後は「進行中または失敗した世代」と registry の URL を返し、
+  Chromium（確定済みの直前文書）と異なる。
+
+**実測**（`playwright-core` 1.63.0・node v24.21.0。トレースを再取得し 2 回の実行で同一出力）: id 8（`Page.enable`）は `{}`、
+id 9（`Page.getFrameTree`）は `frameTree.frame = {id:"main", loaderId:"2", url:"about:blank", mimeType:"text/html"}` で成功する。
+`newPage` の失敗は `Protocol error` から **`browserContext.newPage: Frame has been detached.`** に変わった。この失敗は
+`Log.enable`（id 10）の `-32601` より前に起き、`Target.closeTarget` は id 9 の応答の直後に送られる（`Log.enable` 以降の `-32601` は
+後から届く）。`failed` の一覧から id 8・9 が消え、`Page.createIsolatedWorld` は送られていない。
+
+**`Page.frameNavigated` 待ちの有無**: 停止は `Frame has been detached.` で、`Page.frameNavigated` を待ったタイムアウトではない
+（再取得トレースで `frameNavigated` 待ちの停止は観測していない）。
+
+**停止原因（種別 B・ソース読み）**: playwright-core 1.63.0 の `CRPage._sessionForFrame` は `this._sessions.has(frame._id)`
+（セッションを targetId で引く）を前提にし、無ければ親フレームを辿って `Frame has been detached.` を投げる。`frame.id` を
+`"main"` で返しているため、targetId と一致せず止まる可能性が高い。どのコード経路で投げられたかは未確認。対処（frame id を targetId にする等）は
+`Page.frameNavigated` の `frame.id` と併せた設計判断になるため本 issue では行っていない（TASK-44 の `page.goto()` にも影響し得る）。
+
+次の作業: #1038〜#1042（ページ初期化メソッド群の残り）。frame id と targetId の関係は別途判断が要る。
+
 ### 原則
 
 | 原則 | 内容 | ビヘイビア |

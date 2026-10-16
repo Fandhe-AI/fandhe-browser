@@ -8,7 +8,7 @@
 //!
 //! 公開入口は無く crate 内部専用。後続タスクは [`builtin_handlers`] へメソッドを
 //! 追加するだけでよい（`Page.navigate` は 42.2 で登録済み、イベント送出は 42.3 で実装済み、
-//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b、`Target.setAutoAttach`・`Browser.setDownloadBehavior` は TASK-43.3c、`Target.createBrowserContext` は TASK-43.3d、`Target.closeTarget` は TASK-43.3h、`Target.createTarget`・`Runtime.runIfWaitingForDebugger` は TASK-43.3e で登録済み）。
+//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b、`Target.setAutoAttach`・`Browser.setDownloadBehavior` は TASK-43.3c、`Target.createBrowserContext` は TASK-43.3d、`Target.closeTarget` は TASK-43.3h、`Target.createTarget`・`Runtime.runIfWaitingForDebugger` は TASK-43.3e、`Page.enable`・`Page.getFrameTree` は TASK-43.3i で登録済み）。
 //!
 //! # 入力の扱い
 //!
@@ -22,7 +22,7 @@
 //!
 //! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 //! `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・
-//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c・`CDP-2`）・`Target.createBrowserContext`（TASK-43.3d・`CDP-2`）・`Target.closeTarget`（TASK-43.3h・`CDP-2`）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e・#910・`CDP-2`）のみ登録済みで、
+//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c・`CDP-2`）・`Target.createBrowserContext`（TASK-43.3d・`CDP-2`）・`Target.closeTarget`（TASK-43.3h・`CDP-2`）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e・#910・`CDP-2`）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037・`CDP-2`）のみ登録済みで、
 //! それ以外のメソッドは JSON-RPC の「method not implemented」（`-32601`）エラーを返す。
 //! 汎用の空 success フォールバック（PoC-5 の暫定挙動）は採らない。理由は次のとおり。
 //!
@@ -389,7 +389,7 @@ type HandlerTable = Vec<(&'static str, Box<dyn CommandHandler>)>;
 
 /// 組込みハンドラ表。`Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 /// `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・`Browser.getVersion`（TASK-43.3a）・
-/// `Target.getTargetInfo`（TASK-43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。実体に接続済み）・`Target.createBrowserContext`（TASK-43.3d）・`Target.closeTarget`（TASK-43.3h）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e）を登録済み（`CDP-1`・`CDP-2`）。
+/// `Target.getTargetInfo`（TASK-43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。実体に接続済み）・`Target.createBrowserContext`（TASK-43.3d）・`Target.closeTarget`（TASK-43.3h）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037）を登録済み（`CDP-1`・`CDP-2`）。
 ///
 /// `Page.navigate` は既定の `FetchOptions`（内部アドレス拒否）で `Fetcher` を構築する。
 pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
@@ -428,6 +428,14 @@ pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
         (
             "Runtime.runIfWaitingForDebugger",
             Box::new(crate::playwright_compat::RuntimeRunIfWaitingForDebugger),
+        ),
+        (
+            "Page.enable",
+            Box::new(crate::playwright_compat::PageEnable),
+        ),
+        (
+            "Page.getFrameTree",
+            Box::new(crate::playwright_compat::PageGetFrameTree),
         ),
         ("DOM.getDocument", Box::new(crate::dom::DomGetDocument)),
         ("DOM.querySelector", Box::new(crate::dom::DomQuerySelector)),
