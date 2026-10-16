@@ -5,7 +5,7 @@
 //! 明示したときだけ走り、launch・navigate・query・screenshot・`--profile-dir` の経路からは呼ばない。
 //! 引数は取らない（`--profile-dir` も無意味なため黙って受け入れず usage エラーにする。REPAIR-3）。
 //! 不足が 1 件でもあれば [`SetupError::MissingPrerequisites`] で終了コード 1。
-//! `cfg(target_os)` 分岐はここには置かない（`crate::setup` に局所化。TASK-48.2・#291 が検証する）。
+//! `cfg(target_os)` 分岐はここには置かない（`crate::setup` に局所化。検証は `cli2_daily_command_sources_have_no_os_specific_branches`。TASK-48.2・#291）。
 
 use std::fmt;
 use std::io::{self, Write};
@@ -181,5 +181,119 @@ mod tests {
             assert!(!src.contains("crate::setup"), "{name} references setup");
             assert!(!src.contains("detect_current"), "{name} calls detection");
         }
+    }
+
+    /// 日常操作コマンドのソース 1 本から OS 固有分岐の疑いがある行を集める（`CLI-2`・TASK-48.2）。
+    ///
+    /// `#[cfg(test)]` の直後に `mod tests {` が来る境界より前（本番コード）だけを行単位で調べ、
+    /// 境界が無ければ全体を調べる。`mod tests` がファイル末尾の最後の item でない場合は
+    /// 本番コードが検査から漏れるため、その旨も違反として返す（fail-closed）。
+    fn os_specific_branch_lines(name: &str, src: &str) -> Vec<String> {
+        let lines: Vec<&str> = src.lines().collect();
+        let boundary = lines.windows(2).position(|w| {
+            w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests {")
+        });
+        let mut found = Vec::new();
+        let production = match boundary {
+            Some(b) => {
+                let tail = lines.get(b + 2..).unwrap_or(&[]);
+                let closers: Vec<usize> = tail
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| **l == "}")
+                    .map(|(i, _)| i)
+                    .collect();
+                let last_nonempty = tail.iter().rposition(|l| !l.trim().is_empty());
+                if closers.len() != 1 || closers.first().copied() != last_nonempty {
+                    found.push(format!("{name}: tests module is not the last item"));
+                }
+                lines.get(..b).unwrap_or(&[])
+            }
+            None => &lines[..],
+        };
+        for (i, raw) in production.iter().enumerate() {
+            let line = raw.trim();
+            if line.starts_with("//") {
+                continue;
+            }
+            if line_has_os_branch(line) {
+                found.push(format!("{name}:{}: {line}", i + 1));
+            }
+        }
+        found
+    }
+
+    /// 1 行（trim 済み・コメント行除外済み）が OS 固有分岐を含むか。`cfg(test)` だけは許可する。
+    fn line_has_os_branch(line: &str) -> bool {
+        for pat in ["cfg(", "cfg!(", "cfg_attr("] {
+            for (idx, _) in line.match_indices(pat) {
+                let rest = &line[idx + pat.len()..];
+                let inner = rest.split(')').next().unwrap_or("").trim();
+                if inner != "test" {
+                    return true;
+                }
+            }
+        }
+        [
+            "target_os",
+            "target_family",
+            "target_vendor",
+            "target_env",
+            "std::os::",
+            "consts::OS",
+            "consts::FAMILY",
+        ]
+        .iter()
+        .any(|p| line.contains(p))
+    }
+
+    /// 受入基準 1・2: 日常操作コマンド（launch・navigate・query・screenshot・profile）と
+    /// 共通ディスパッチ（`mod.rs`）の本番コードに OS 固有分岐が無い（`CLI-2`・TASK-48.2・#291・MS-5）。
+    /// `server.rs`（本番コードに `cfg(windows)` を持つ既定サーバー）と setup 系（OS 分岐を置く場所）は
+    /// 日常操作コマンドではないため対象外。テストモジュールは挙動ではないので除外する。
+    #[test]
+    fn cli2_daily_command_sources_have_no_os_specific_branches() {
+        let sources = [
+            ("launch", include_str!("launch.rs")),
+            ("navigate", include_str!("navigate.rs")),
+            ("query", include_str!("query.rs")),
+            ("screenshot", include_str!("screenshot.rs")),
+            ("profile", include_str!("profile.rs")),
+            ("dispatch", include_str!("mod.rs")),
+        ];
+        let mut violations = Vec::new();
+        for (name, src) in sources {
+            assert!(src.contains("fn "), "{name} source looks empty");
+            violations.extend(os_specific_branch_lines(name, src));
+        }
+        assert_eq!(violations, Vec::<String>::new());
+    }
+
+    /// 検査ヘルパ自体の陰性テスト（検出すべきものを検出し、許可すべきものを通す）。
+    #[test]
+    fn cli2_os_branch_checker_reports_violations_with_location() {
+        let bad = "fn a() {}\n\n#[cfg(target_os = \"windows\")]\nfn b() {}\n";
+        assert_eq!(
+            os_specific_branch_lines("fixture", bad),
+            vec!["fixture:3: #[cfg(target_os = \"windows\")]".to_string()]
+        );
+        for line in [
+            "if cfg!(windows) {}",
+            "#[cfg_attr(unix, allow(dead_code))]",
+            "use std::os::unix::fs::symlink;",
+            "let o = std::env::consts::OS;",
+        ] {
+            assert!(line_has_os_branch(line), "{line}");
+        }
+        let ok = "//! cfg(target_os) 分岐は置かない\n#[cfg(test)]\nfn new() {}\nfn x() {}\n\n#[cfg(test)]\nmod tests {\n    #[cfg(unix)]\n    fn t() {}\n}\n";
+        assert_eq!(
+            os_specific_branch_lines("fixture", ok),
+            Vec::<String>::new()
+        );
+        let broken = "fn a() {}\n#[cfg(test)]\nmod tests {\n}\nfn late() {}\n";
+        assert_eq!(
+            os_specific_branch_lines("fixture", broken),
+            vec!["fixture: tests module is not the last item".to_string()]
+        );
     }
 }
