@@ -341,7 +341,7 @@ struct Tables {
 /// どの API も読まない。画面・UA・locale・タイムゾーンは含めない（`SEC-2`・`CDP-6`）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SessionEmulation {
-    /// `setFocusEmulationEnabled` の直近の値。
+    /// `setFocusEmulationEnabled` で受理した値（ハンドラが `true` のみ通すため実質 `Some(true)` だけ）。
     pub(crate) focus: Option<bool>,
     /// `setEmulatedMedia` で既定値を受理済みか。
     pub(crate) media_default: bool,
@@ -1537,11 +1537,11 @@ mod tests {
             })
         );
         r.set_emulated_media_default(&s).unwrap();
-        r.set_focus_emulation(&s, false).unwrap();
+        r.set_focus_emulation(&s, true).unwrap();
         assert_eq!(
             r.emulation_of(&s),
             Some(SessionEmulation {
-                focus: Some(false),
+                focus: Some(true),
                 media_default: true
             })
         );

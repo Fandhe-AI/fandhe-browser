@@ -25,7 +25,7 @@
 //! セッションの `Page.navigate` が `Page.lifecycleEvent` の `init`・`load` を送る）を足す。
 //! 43.3l（#1040）で `Page.addScriptToEvaluateOnNewDocument`（空 `source` のみ受理・非空は拒否）と
 //! セッション付き `Target.setAutoAttach`（状態の保持のみ・子 attach は 0 件）を足す。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
-//! 43.3m（#1041）で `Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia` を足す。Playwright 既定値（`enabled` の bool、
+//! 43.3m（#1041）で `Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia` を足す。Playwright 既定値（`enabled:true`、
 //! `media:""` と既定 4 feature）だけを受理して検証済みの値をセッション状態に保持し、どの API からも読まない（観測できる
 //! 効果は無い。`REPAIR-3`）。`setDeviceMetricsOverride`・`setUserAgentOverride`・`setLocaleOverride`・`setTimezoneOverride` は
 //! `-32601` のまま（`SEC-2`・`CDP-6`）。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
@@ -599,11 +599,11 @@ impl CommandHandler for PageAddScriptToEvaluateOnNewDocument {
 
 /// `Emulation.setFocusEmulationEnabled`（`CDP-2`・TASK-43.3m・#1041）。
 ///
-/// `sessionId` 付きで `{"enabled": bool}` だけを受け、検証済みの値をセッション状態として保持して `{}` を返す
-/// （true・false とも冪等）。検証順は [`PageSetLifecycleEventsEnabled`] と同じ: `sessionId` なしは
-/// `UNSUPPORTED_PARAMS`、`params` が非オブジェクトは `INVALID_PARAMS`、`enabled` 以外のキーは
-/// `UNSUPPORTED_PARAMS`、`enabled` が無い・bool でないは `INVALID_PARAMS`、未知・閉じたセッションは
-/// `INVALID_PARAMS`。いずれも状態を変えない。止めたターゲット（`Runtime.runIfWaitingForDebugger` より前）でも
+/// `sessionId` 付きで `{"enabled": true}`（Playwright 既定値。AGENTS.md の CDP-6 例外）だけを受け、
+/// 受理した印をセッション状態として保持して `{}` を返す（冪等）。検証順は [`PageSetLifecycleEventsEnabled`] と
+/// 同じ: `sessionId` なしは `UNSUPPORTED_PARAMS`、`params` が非オブジェクトは `INVALID_PARAMS`、`enabled` 以外の
+/// キーは `UNSUPPORTED_PARAMS`、`enabled` が無い・bool でないは `INVALID_PARAMS`、`enabled:false`（既定値以外）は
+/// `UNSUPPORTED_PARAMS`、未知・閉じたセッションは `INVALID_PARAMS`。いずれも状態を変えない。止めたターゲット（`Runtime.runIfWaitingForDebugger` より前）でも
 /// 受理する（Playwright は再開前に送る）。
 ///
 /// 差異（`REPAIR-3`）: 保持値はどの API からも読まれず、今は観測できる効果が無い（フォーカス状態の
@@ -628,6 +628,10 @@ impl CommandHandler for EmulationSetFocusEmulationEnabled {
                 .get("enabled")
                 .and_then(Value::as_bool)
                 .ok_or(CdpError::INVALID_PARAMS)?;
+            // 既定値（true）以外は受理しない（CDP-6 例外は Playwright 既定値に限る）。
+            if !enabled {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
             ctx.state
                 .registry()
                 .set_focus_emulation(sid, enabled)
@@ -3282,20 +3286,24 @@ mod tests {
                     media_default: true
                 })
             );
-            call(
-                &st,
-                Some(c),
-                &sreq(
-                    6,
-                    "Emulation.setFocusEmulationEnabled",
-                    &sid,
-                    r#"{"enabled":false}"#,
-                ),
-            )
-            .await;
+            // `enabled:false` は既定値以外のため拒否され、直前の保持値（true）は変わらない。
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c),
+                    &sreq(
+                        6,
+                        "Emulation.setFocusEmulationEnabled",
+                        &sid,
+                        r#"{"enabled":false}"#,
+                    ),
+                )
+                .await,
+                vec![serr(-32602, "unsupported params", 6, &sid)]
+            );
             assert_eq!(
                 st.registry().emulation_of(&s).map(|e| e.focus),
-                Some(Some(false))
+                Some(Some(true))
             );
             // features は順不同で受理する。
             let reordered = r#"{"media":"","features":[{"name":"prefers-contrast","value":"no-preference"},{"name":"forced-colors","value":"none"},{"name":"prefers-reduced-motion","value":"no-preference"},{"name":"prefers-color-scheme","value":"light"}]}"#;
@@ -3323,6 +3331,8 @@ mod tests {
                 (3, r#"{"enabled":"true"}"#, -32602, "invalid params"),
                 (4, r#"{"enabled":1}"#, -32602, "invalid params"),
                 (6, r#"{"enabled":true,"x":1}"#, -32602, "unsupported params"),
+                // 既定値以外（false）は拒否し、状態を作らない。
+                (7, r#"{"enabled":false}"#, -32602, "unsupported params"),
             ] {
                 assert_eq!(
                     call(&st, Some(c), &sreq(id, m, &sid, p)).await,

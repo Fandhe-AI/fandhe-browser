@@ -474,7 +474,7 @@ id 7・11・13・15・16・17・18。
 
 | メソッド | 受理条件 | エラー |
 | -------- | -------- | ------ |
-| `Emulation.setFocusEmulationEnabled` | 生存セッションの `sessionId` 付き・`params` が `{"enabled": bool}` のみ。`{}` を返し、検証済みの値を保持する（true・false とも冪等）。止めたターゲットでも受理する | `sessionId` なし・`enabled` 以外のキーは `-32602 unsupported params`、`enabled` が無い・bool でない・未知／閉じたセッションは `-32602 invalid params` |
+| `Emulation.setFocusEmulationEnabled` | 生存セッションの `sessionId` 付き・`params` が `{"enabled": true}`（Playwright 既定値）のみ。`{}` を返し、受理した印を保持する（冪等）。止めたターゲットでも受理する | `sessionId` なし・`enabled` 以外のキー・`enabled:false` は `-32602 unsupported params`、`enabled` が無い・bool でない・未知／閉じたセッションは `-32602 invalid params` |
 | `Emulation.setEmulatedMedia` | 生存セッションの `sessionId` 付き。`media` は `""` のみ、`features` は Playwright 既定の 4 件（`prefers-color-scheme:light`・`prefers-reduced-motion:no-preference`・`forced-colors:none`・`prefers-contrast:no-preference`）をちょうど 1 回ずつ（順不同）。`{}` を返し、既定値を受理した印を保持する | 既定値以外の値・未知の feature 名・重複・欠落・5 件以上・要素の余分なキー・`media` か `features` の欠落・未知のキーは `-32602 unsupported params`、型の不正・未知／閉じたセッションは `-32602 invalid params`（いずれも状態は変えない） |
 
 - `Emulation.setDeviceMetricsOverride` は `viewport: null` で送られなくなったため**実装しない**（`-32601` のまま。`cdp6_builtin_other_methods_remain_unimplemented`
