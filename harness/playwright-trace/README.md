@@ -72,6 +72,8 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
   `browserContext.newPage: Frame has been detached.` に変わる（`Log.enable` 以降は引き続き `-32601`）。`Page.frameNavigated` 待ちの停止は観測していない
 - TASK-43.3j（#1038）後の実測（2 回の実行で同一出力）。セッション付きの `Log.enable`・`Runtime.enable`・`Network.enable` が `{}` で成功する
   （有効フラグのみでイベントは送らない）。`newPage()` の失敗は `Frame has been detached.` のまま。`failed` は id 7・11・13・15・16・17・18
+- TASK-43.3k（#1039）後の実測（2 回の実行で同一出力）。セッション付きの `Page.setLifecycleEventsEnabled` が `{}` で成功する。この trace は遷移を含まず
+  `Page.lifecycleEvent` は現れない。`newPage()` の失敗は `Frame has been detached.` のまま。`failed` は id 7・13・15・16・17・18
 - `Page.addScriptToEvaluateOnNewDocument` の `worldName` に含まれる乱数ハッシュは `<WORLD_HASH>` へ正規化する（決定的にするため）
 - 収集は `connectOverCDP(..., { noDefaults: true })` と `newContext({ acceptDownloads: false })` で行う。fandhe-browser は
   ダウンロード実行系が無く `Browser.setDownloadBehavior` の `allow`・`allowAndName` を拒否するため、Playwright の
