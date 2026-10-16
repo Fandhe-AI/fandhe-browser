@@ -28,6 +28,17 @@ for ep in "http://example.com:9222" "ws://127.0.0.1:9222/x" "http://127.0.0.1:1@
 done
 echo "ok: non-loopback / non-http endpoints are rejected with a result line"
 
+# fixture URL も同様に（外部ホスト・ローカルファイル・ユーザー情報偽装・https・未設定は goto 段階で結果行つき exit 1）。
+for fx in "http://example.com:80/x" "file:///tmp/x" "http://127.0.0.1:1@evil.example:80/" "https://127.0.0.1:1/" ""; do
+  status=0
+  out="$(FANDHE_CDP_WS_ENDPOINT="http://127.0.0.1:1" FANDHE_FIXTURE_URL="$fx" FANDHE_PLAYWRIGHT_MODULE_DIR=/nonexistent node "$SCRIPT_DIR/connect.mjs" 2>/dev/null)" || status=$?
+  if [ "$status" -ne 1 ] || ! grep -q '^FANDHE_SCRIPT_RESULT {"ok":false,"step":"goto"' <<<"$out"; then
+    echo "FAIL: fixture url '$fx' must be rejected (got $status: $out)" >&2
+    exit 1
+  fi
+done
+echo "ok: non-loopback / non-http fixture urls are rejected with a result line"
+
 # stages.mjs の結果行が Rust 側パーサー（script_harness）の契約を満たすこと。
 cd "$SCRIPT_DIR/../.."
 contract_out="$(cargo test -p fandhe-browser-cdp --test playwright_contract -- --ignored --exact cdp2_stages_mjs_result_line_satisfies_rust_contract 2>&1)" || {

@@ -130,6 +130,22 @@ impl Drop for TestServer {
 /// ランタイムで動かす（workspace の tokio は `rt-multi-thread` を持たず、feature 追加は
 /// 依存変更になるため行わない）。スレッドは [`TestServer`] の drop で停止・終了を待つ。
 pub fn start_server() -> TestServer {
+    start_server_with(endpoints)
+}
+
+/// [`start_server`] のループバック許可版（`Page.navigate` が `127.0.0.1` の fixture へ届く。
+/// feature `test-support` 限定。`CDP-2`・TASK-44.3）。本番の `endpoints()` は内部アドレスを拒否する。
+#[cfg(feature = "test-support")]
+#[allow(dead_code)] // 取り込むテストバイナリごとに使う項目が異なる（未使用は当該バイナリのみ）
+pub fn start_server_allowing_loopback() -> TestServer {
+    start_server_with(fandhe_browser_cdp::test_support::endpoints_allowing_loopback)
+}
+
+fn start_server_with(
+    build: fn(
+        &Arc<CdpState>,
+    ) -> Result<fandhe_browser_cdp::CdpEndpoints, fandhe_browser_cdp::WsConfigError>,
+) -> TestServer {
     let dir = TempDir::new();
     let profile = Arc::new(Profile::open(&dir.0).expect("profile open"));
     let app = Arc::new(AppState::with_disabled_renderer(profile));
@@ -145,7 +161,7 @@ pub fn start_server() -> TestServer {
             .build()
             .expect("runtime");
         let _ = rt.block_on(async move {
-            let (router, ws_config) = endpoints(&st).expect("endpoints").into_parts();
+            let (router, ws_config) = build(&st).expect("endpoints").into_parts();
             let bound = Server::new()
                 .handler(router)
                 .websocket(ws_config)

@@ -44,9 +44,9 @@ fn cdp2_stages_mjs_result_line_satisfies_rust_contract() {
         run_script(&cmd("ok"), "http://127.0.0.1:1", D),
         ScriptOutcome::Completed {
             ok: true,
-            step: "newPage".into(),
+            step: "selector".into(),
             error: None,
-            stages: ["connect", "newContext", "newPage"]
+            stages: ["connect", "newContext", "newPage", "goto", "selector"]
                 .map(|n| stage(n, StageStatus::Ok, None))
                 .to_vec(),
         }
@@ -65,6 +65,30 @@ fn cdp2_stages_mjs_result_line_satisfies_rust_contract() {
                 stage("connect", StageStatus::Ok, None),
                 stage("newContext", StageStatus::Failed, Some(err)),
                 stage("newPage", StageStatus::NotReached, None),
+                stage("goto", StageStatus::NotReached, None),
+                stage("selector", StageStatus::NotReached, None),
+            ],
+        }
+    );
+    let mm = (
+        "SelectorMismatch",
+        "expected text \"Hello fixture\" got \"Bye\"",
+    );
+    assert_eq!(
+        run_script(&cmd("selector_mismatch"), "http://127.0.0.1:1", D),
+        ScriptOutcome::Completed {
+            ok: false,
+            step: "selector".into(),
+            error: Some(ScriptError {
+                name: mm.0.into(),
+                message: mm.1.into()
+            }),
+            stages: vec![
+                stage("connect", StageStatus::Ok, None),
+                stage("newContext", StageStatus::Ok, None),
+                stage("newPage", StageStatus::Ok, None),
+                stage("goto", StageStatus::Ok, None),
+                stage("selector", StageStatus::Failed, Some(mm)),
             ],
         }
     );

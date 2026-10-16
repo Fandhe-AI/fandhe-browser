@@ -203,6 +203,21 @@ pub fn endpoints(state: &Arc<CdpState>) -> Result<CdpEndpoints, WsConfigError> {
     })
 }
 
+/// ループバック取得を許可した組込み表で [`CdpEndpoints`] を構築する（feature `test-support`
+/// 専用。`CDP-2`・TASK-44.3）。実ブラウザ相当のクライアント（Playwright）がローカル fixture へ
+/// `Page.navigate` する結合テストのためだけにあり、公開の [`endpoints`] は内部アドレス拒否のまま。
+#[cfg(feature = "test-support")]
+pub(crate) fn endpoints_allowing_loopback(
+    state: &Arc<CdpState>,
+) -> Result<CdpEndpoints, WsConfigError> {
+    let fetch = fandhe_browser_core::FetchOptions::new().with_allow_private_network_access(true);
+    let dispatcher = Dispatcher::builtin_with(fetch).map_err(|_| WsConfigError::Dispatcher)?;
+    Ok(CdpEndpoints {
+        router: router(Arc::clone(state)),
+        websocket: browser_websocket_config_with(state, dispatcher)?,
+    })
+}
+
 /// JSON 応答の `Content-Type`（Chromium 互換）。
 const JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 
@@ -298,8 +313,17 @@ impl std::error::Error for WsConfigError {
 pub(crate) fn browser_websocket_config(
     state: &Arc<CdpState>,
 ) -> Result<WebSocketConfig, WsConfigError> {
-    let browser_id = state.browser_id().clone();
     let dispatcher = Dispatcher::builtin().map_err(|_| WsConfigError::Dispatcher)?;
+    browser_websocket_config_with(state, dispatcher)
+}
+
+/// [`browser_websocket_config`] のディスパッチャ差し替え版。本番は組込み表の
+/// [`browser_websocket_config`] 経由のみで、差し替えは `test-support` の入口が使う。
+pub(crate) fn browser_websocket_config_with(
+    state: &Arc<CdpState>,
+    dispatcher: Dispatcher,
+) -> Result<WebSocketConfig, WsConfigError> {
+    let browser_id = state.browser_id().clone();
     let config = WebSocketConfig::default()
         .with_path_pattern(BROWSER_WS_PATH_PATTERN)
         .map_err(WsConfigError::PathPattern)?

@@ -50,6 +50,15 @@ pub mod test_support {
     use crate::page::PageNavigate;
     use crate::protocol::Dispatcher;
 
+    /// ループバック取得を許可した組込み表の [`CdpEndpoints`] を返す（`CDP-2`・TASK-44.3）。
+    /// 実 Playwright が `127.0.0.1` の fixture へ `goto` する結合テスト専用で、本番の
+    /// [`endpoints`](crate::endpoints) は内部アドレスを拒否したまま（SSRF 防御）。
+    pub fn endpoints_allowing_loopback(
+        state: &Arc<CdpState>,
+    ) -> Result<crate::CdpEndpoints, crate::WsConfigError> {
+        crate::server::endpoints_allowing_loopback(state)
+    }
+
     /// ループバック許可の `Page.navigate` と `DOM.getDocument`・`DOM.querySelector`・
     /// `DOM.requestChildNodes` を持つディスパッチャ（TASK-113・#786 の結合テスト用）。
     pub struct LoopbackDispatcher(Dispatcher);

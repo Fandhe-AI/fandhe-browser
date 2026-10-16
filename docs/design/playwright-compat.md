@@ -522,6 +522,19 @@ TASK-43.3o（#1050）の取り込み後に再取得した同梱トレース（3 
 - 範囲外: `goto()`・セレクタ取得は TASK-44（`CDP-2`）。
 - 固定するテスト: `cdp2_playwright_newpage_is_reached_without_failures_or_cleanup`（`tests/playwright_trace.rs`）。
 
+### 段階 TASK-44.3 の実施結果（#478。実測 A）
+
+`CDP-2`・MS-4。基準は main の `fd7bbb72`、playwright-core 1.63.0、`connectOverCDP(noDefaults:true)`・`newContext({acceptDownloads:false, viewport:null})`。
+
+- ループバック許可: 本番の `endpoints()` の `Page.navigate` は内部アドレス拒否（SSRF ガード）のまま。実テストは feature `test-support` の
+  `test_support::endpoints_allowing_loopback` で、`FetchOptions` を差し替えた組込み表のサーバーを起動する（既定ビルドには含まれない）。
+- 5 段階: `connect` → `newContext` → `newPage` → `goto`（ローカル fixture）→ `selector`（`#target` のテキスト `Hello fixture`・属性 `data-role="greeting"` を具体値で照合）。
+- 実測結果（`make test-playwright-connect`）: `connect`・`newContext`・`newPage`・`goto` は成功。`goto` 段階の成功を確認した（fixture への到達 assert は全段階成功後のため未実行）。
+  `selector` は `StageTimeout`（10 秒）で失敗した。サーバー側ログに `Page.createIsolatedWorld` の未実装受信があり、`Runtime.callFunctionOn`・`Runtime.evaluate` も未実装（`-32601`）。
+- 原因の見立て（B）: locator は utility world に注入スクリプトを載せて評価する。`Runtime.executionContextCreated` を送らず実行コンテキストが成立しないため、応答待ちで止まる。
+- 扱い: 未実装を成功に見せるフォールバックは入れない（`CDP-6`・`SEC-2`）。期待値の弱体化・skip もしない。実テストは `#[ignore]` のまま失敗が正で、
+  Runtime ドメインの実装 Issue の完了後に通る見込み。受入基準のうちセレクタ取得は未達。
+
 ### 原則
 
 | 原則 | 内容 | ビヘイビア |
