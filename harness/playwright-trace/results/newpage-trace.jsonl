@@ -33,9 +33,9 @@
 {"seq":32,"kind":"cdp","dir":"recv","message":{"id":9,"result":{},"sessionId":"00000000000000000000000000000001"}}
 {"seq":33,"kind":"cdp","dir":"recv","message":{"id":10,"result":{},"sessionId":"00000000000000000000000000000001"}}
 {"seq":34,"kind":"cdp","dir":"recv","message":{"id":11,"result":{},"sessionId":"00000000000000000000000000000001"}}
-{"seq":35,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":12,"sessionId":"00000000000000000000000000000001"}}
+{"seq":35,"kind":"cdp","dir":"recv","message":{"id":12,"result":{"identifier":"1"},"sessionId":"00000000000000000000000000000001"}}
 {"seq":36,"kind":"cdp","dir":"recv","message":{"id":13,"result":{},"sessionId":"00000000000000000000000000000001"}}
-{"seq":37,"kind":"cdp","dir":"recv","message":{"error":{"code":-32602,"message":"unsupported params"},"id":14,"sessionId":"00000000000000000000000000000001"}}
+{"seq":37,"kind":"cdp","dir":"recv","message":{"id":14,"result":{},"sessionId":"00000000000000000000000000000001"}}
 {"seq":38,"kind":"cdp","dir":"recv","message":{"id":15,"result":{},"sessionId":"00000000000000000000000000000001"}}
 {"seq":39,"kind":"cdp","dir":"recv","message":{"id":16,"result":{},"sessionId":"00000000000000000000000000000001"}}
 {"seq":40,"kind":"cdp","dir":"recv","message":{"id":17,"result":{},"sessionId":"00000000000000000000000000000001"}}

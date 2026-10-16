@@ -23,6 +23,8 @@
 //! イベントは送らない。`REPAIR-3`）を足す。
 //! 43.3k（#1039）で `Page.setLifecycleEventsEnabled`（セッション単位の有効フラグ。`Page.enable` 済みの
 //! セッションの `Page.navigate` が `Page.lifecycleEvent` の `init`・`load` を送る）を足す。
+//! 43.3l（#1040）で `Page.addScriptToEvaluateOnNewDocument`（空 `source` のみ受理・非空は拒否）と
+//! セッション付き `Target.setAutoAttach`（状態の保持のみ・子 attach は 0 件）を足す。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
 //! 43.3m（#1041）で `Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia` を足す。Playwright 既定値（`enabled` の bool、
 //! `media:""` と既定 4 feature）だけを受理して検証済みの値をセッション状態に保持し、どの API からも読まない（観測できる
 //! 効果は無い。`REPAIR-3`）。`setDeviceMetricsOverride`・`setUserAgentOverride`・`setLocaleOverride`・`setTimezoneOverride` は
@@ -103,8 +105,15 @@ impl CommandHandler for TargetGetTargetInfo {
 /// この呼び出しの attach を巻き戻す。`autoAttach:false` はこの接続が attach したセッションを
 /// 外して `Target.detachedFromTarget` を送出する。セッションの所有は接続スコープで、切断で解放する。
 ///
-/// スコープ外の入力は成功を装わず `-32602` で拒否する: `sessionId` 付き（子ターゲットの自動 attach は
-/// 子ターゲットのモデルが無く未実装）、`autoAttach:true` で `flatten` が `true` 以外
+/// `sessionId` 付き（子ターゲットの自動 attach。TASK-43.3l・#1040）は、`autoAttach` と
+/// `waitForDebuggerOnStart` をセッションの状態として保持して `{}` を返す。イベントは 0 件で、
+/// `conn_scoped` には触れないため接続なしの直接 dispatch でも成功する。差異（`REPAIR-3`）: 子ターゲット
+/// （iframe・worker・OOPIF）のモデルが無く attach 対象は常に 0 件で、これは事実と一致する応答であり
+/// 一律の成功ではない（`CDP-6`）。`waitForDebuggerOnStart` は保持するだけ。将来、子ターゲットのモデルを
+/// 作ったらこの状態を読んで attach する（TASK-43・`CDP-2`）。未知・閉じたセッションは `INVALID_PARAMS`。
+/// 状態はセッションの切断・ターゲットの close・context の破棄で消える。
+///
+/// スコープ外の入力は成功を装わず `-32602` で拒否する: `autoAttach:true` で `flatten` が `true` 以外
 /// （`sendMessageToTarget` 方式は未実装）、`filter`（Puppeteer の除外フィルタを黙って無視すると
 /// 除外すべきターゲットまで attach するため）。
 ///
@@ -125,9 +134,6 @@ impl CommandHandler for TargetSetAutoAttach {
         params: &'a Value,
     ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
         Box::pin(async move {
-            if ctx.session_id.is_some() {
-                return Err(CdpError::UNSUPPORTED_PARAMS);
-            }
             let auto_attach = params
                 .get("autoAttach")
                 .and_then(Value::as_bool)
@@ -145,6 +151,18 @@ impl CommandHandler for TargetSetAutoAttach {
                 Some(Value::Bool(true)) => true,
                 Some(_) => return Err(CdpError::INVALID_PARAMS),
             };
+            if let Some(sid) = ctx.session_id {
+                // セッション付き（子ターゲットの自動 attach）: 状態を保持するだけで子は作らない。
+                if auto_attach && !flatten {
+                    return Err(CdpError::UNSUPPORTED_PARAMS);
+                }
+                let state = auto_attach.then_some(wait_for_debugger);
+                ctx.state
+                    .registry()
+                    .set_child_auto_attach(sid, state)
+                    .map_err(|_| CdpError::INVALID_PARAMS)?;
+                return Ok(HandlerOutput::result(json!({})));
+            }
             let conn = ctx.conn.ok_or(CdpError::NO_CONNECTION)?;
             let state = ctx.state;
             if !auto_attach {
@@ -509,6 +527,72 @@ impl CommandHandler for PageSetLifecycleEventsEnabled {
                 .set_lifecycle_events(sid, enabled)
                 .map_err(|_| CdpError::INVALID_PARAMS)?;
             Ok(HandlerOutput::result(json!({})))
+        })
+    }
+}
+
+/// `Page.addScriptToEvaluateOnNewDocument`（空 `source` のみ。`CDP-2`・TASK-43.3l・#1040）。
+///
+/// Playwright の `newPage()` が `source:""` で送る。実行すべきスクリプトが無いので no-op が正しい応答になり、
+/// 受理するのは空の `source` だけ。非空の `source` は実行経路（`JS-4`・TASK-112）が無く、効いていないのに
+/// 成功を返すと stealth 用のスクリプト注入として働くため `UNSUPPORTED_PARAMS` で拒否する（`SEC-2`・`CDP-6`）。
+///
+/// 検証順: `sessionId` なしは `UNSUPPORTED_PARAMS` → `params` が非オブジェクトは `INVALID_PARAMS` →
+/// `source`・`worldName` 以外のキー（`includeCommandLineAPI`・`runImmediately` 等）は `UNSUPPORTED_PARAMS` →
+/// `source` が無い・文字列でないは `INVALID_PARAMS` → 非空 `source` は `UNSUPPORTED_PARAMS` →
+/// `worldName` が文字列でない・NUL を含むは `INVALID_PARAMS` → 長さ超過（`MAX_WORLD_NAME_LEN`）と
+/// セッションあたりの登録数超過は `-32000`（`CDP-7`）→ 未知・閉じたセッションは `INVALID_PARAMS`。
+/// 失敗時は状態を変えない。`worldName` の文字種は絞らない（Playwright は `@<hash>` 付きの名前を送る）。
+///
+/// 応答は `{"identifier": "<10 進連番>"}` だけでイベントは送らない。identifier は registry 全体の連番
+/// （接続スコープより広いが、採番を原子的にでき同一接続での再登録が別 identifier になる。セッション ID と
+/// 同じ性質で新しい情報漏えいは無い）。`worldName` は保持しない。止めたターゲットでも受理する。
+/// 差異（`REPAIR-3`）: 登録内容は件数だけを持ち、`Page.removeScriptToEvaluateOnNewDocument` は未実装。
+/// 将来仕様はページ JS 実行と繋いだ新文書での実行（`JS-4`・TASK-112）。UA・ヘッダ・`navigator` には触れない。
+pub(crate) struct PageAddScriptToEvaluateOnNewDocument;
+
+impl CommandHandler for PageAddScriptToEvaluateOnNewDocument {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            let sid = ctx.session_id.ok_or(CdpError::UNSUPPORTED_PARAMS)?;
+            let obj = params.as_object().ok_or(CdpError::INVALID_PARAMS)?;
+            if obj.keys().any(|k| k != "source" && k != "worldName") {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let source = obj
+                .get("source")
+                .and_then(Value::as_str)
+                .ok_or(CdpError::INVALID_PARAMS)?;
+            if !source.is_empty() {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            if let Some(w) = obj.get("worldName") {
+                let w = w.as_str().ok_or(CdpError::INVALID_PARAMS)?;
+                if w.contains('\0') {
+                    return Err(CdpError::INVALID_PARAMS);
+                }
+                if w.len() > crate::target::MAX_WORLD_NAME_LEN {
+                    return Err(CdpError::WORLD_NAME_TOO_LONG);
+                }
+            }
+            let id = ctx
+                .state
+                .registry()
+                .add_init_script(sid)
+                .map_err(|e| match e {
+                    crate::target::CdpStateError::TooManyInitScripts { .. } => {
+                        CdpError::INIT_SCRIPT_LIMIT_EXCEEDED
+                    }
+                    crate::target::CdpStateError::IdExhausted => CdpError::SERVER_ERROR,
+                    _ => CdpError::INVALID_PARAMS,
+                })?;
+            Ok(HandlerOutput::result(
+                json!({ "identifier": id.to_string() }),
+            ))
         })
     }
 }
@@ -1142,11 +1226,14 @@ mod tests {
                 let f = call(&st, Some(c), &auto_attach(1, extra)).await;
                 assert_eq!(f, vec![want.clone()], "{extra}");
             }
+            // セッション付きは TASK-43.3l（#1040）で受理に変わった。未知のセッションは invalid params
+            // （従来の unsupported params は「セッション付きは未実装」を意味しており、仕様の変更であって
+            // 検査の弱体化ではない）。
             let with_session = r#"{"id":1,"method":"Target.setAutoAttach","sessionId":"S1","params":{"autoAttach":true,"flatten":true}}"#;
             assert_eq!(
                 call(&st, Some(c), with_session).await,
                 vec![
-                    json!({"id":1,"sessionId":"S1","error":{"code":-32602,"message":"unsupported params"}})
+                    json!({"id":1,"sessionId":"S1","error":{"code":-32602,"message":"invalid params"}})
                 ]
             );
             assert_eq!(
@@ -2425,6 +2512,257 @@ mod tests {
                 !st.registry()
                     .is_page_enabled(&SessionId::parse(&sid).unwrap())
             );
+        }
+
+        // ---- Page.addScriptToEvaluateOnNewDocument・セッション付き Target.setAutoAttach（TASK-43.3l・#1040） ----
+
+        #[tokio::test]
+        async fn cdp2_add_script_empty_source_returns_increasing_identifiers() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let m = "Page.addScriptToEvaluateOnNewDocument";
+            let w = r#"{"source":"","worldName":"__playwright_utility_world_page@0123abcd"}"#;
+            assert_eq!(
+                call(&st, Some(c), &sreq(2, m, &sid, w)).await,
+                vec![json!({"id":2,"sessionId":sid,"result":{"identifier":"1"}})]
+            );
+            assert_eq!(
+                call(&st, Some(c), &sreq(3, m, &sid, r#"{"source":""}"#)).await,
+                vec![json!({"id":3,"sessionId":sid,"result":{"identifier":"2"}})]
+            );
+            assert_eq!(st.registry().init_script_count(&s), 2);
+        }
+
+        #[tokio::test]
+        async fn cdp2_add_script_is_accepted_on_paused_target() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let create =
+                r#"{"id":1,"method":"Target.createTarget","params":{"url":"about:blank"}}"#;
+            let _ = call(&st, Some(c), create).await;
+            let sid = {
+                let on = r#""autoAttach":true,"flatten":true,"waitForDebuggerOnStart":true"#;
+                let f = call(&st, Some(c), &auto_attach(2, on)).await;
+                f[1]["params"]["sessionId"].as_str().unwrap().to_owned()
+            };
+            let m = "Page.addScriptToEvaluateOnNewDocument";
+            assert_eq!(
+                call(&st, Some(c), &sreq(3, m, &sid, r#"{"source":""}"#)).await,
+                vec![json!({"id":3,"sessionId":sid,"result":{"identifier":"1"}})]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp6_add_script_rejects_bad_params_without_changing_state() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let m = "Page.addScriptToEvaluateOnNewDocument";
+            let long = format!(r#"{{"source":"","worldName":"{}"}}"#, "a".repeat(257));
+            let cases: Vec<(String, i64, &str)> = vec![
+                (
+                    r#"{"source":"","runImmediately":true}"#.into(),
+                    -32602,
+                    "unsupported params",
+                ),
+                (
+                    r#"{"source":"","includeCommandLineAPI":true}"#.into(),
+                    -32602,
+                    "unsupported params",
+                ),
+                ("{}".into(), -32602, "invalid params"),
+                (r#"{"source":1}"#.into(), -32602, "invalid params"),
+                (
+                    r#"{"source":"window.x=1"}"#.into(),
+                    -32602,
+                    "unsupported params",
+                ),
+                (
+                    r#"{"source":"","worldName":1}"#.into(),
+                    -32602,
+                    "invalid params",
+                ),
+                (
+                    r#"{"source":"","worldName":"a\u0000b"}"#.into(),
+                    -32602,
+                    "invalid params",
+                ),
+                (long, -32000, "world name too long"),
+            ];
+            for (i, (p, code, msg)) in cases.iter().enumerate() {
+                let id = 10 + i as i64;
+                assert_eq!(
+                    call(&st, Some(c), &sreq(id, m, &sid, p)).await,
+                    vec![serr(*code, msg, id, &sid)],
+                    "{p}"
+                );
+            }
+            // 非オブジェクトの params はディスパッチャが sessionId なしの invalid params にする。
+            assert_eq!(
+                call(&st, Some(c), &sreq(29, m, &sid, "[]")).await,
+                vec![err(-32602, "invalid params", 29)]
+            );
+            assert_eq!(
+                call(&st, Some(c), r#"{"id":30,"method":"Page.addScriptToEvaluateOnNewDocument","params":{"source":""}}"#).await,
+                vec![err(-32602, "unsupported params", 30)]
+            );
+            assert_eq!(
+                call(&st, Some(c), &sreq(31, m, "NoSuch-1", r#"{"source":""}"#)).await,
+                vec![serr(-32602, "invalid params", 31, "NoSuch-1")]
+            );
+            assert_eq!(st.registry().init_script_count(&s), 0);
+            // ちょうど 256 バイトは受理する。
+            let ok = format!(r#"{{"source":"","worldName":"{}"}}"#, "a".repeat(256));
+            assert_eq!(
+                call(&st, Some(c), &sreq(32, m, &sid, &ok)).await,
+                vec![json!({"id":32,"sessionId":sid,"result":{"identifier":"1"}})]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp7_add_script_rejects_over_session_limit() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let m = "Page.addScriptToEvaluateOnNewDocument";
+            for i in 0..crate::target::MAX_INIT_SCRIPTS_PER_SESSION {
+                let f = call(&st, Some(c), &sreq(100, m, &sid, r#"{"source":""}"#)).await;
+                assert_eq!(f[0]["result"]["identifier"], (i + 1).to_string());
+            }
+            assert_eq!(
+                call(&st, Some(c), &sreq(200, m, &sid, r#"{"source":""}"#)).await,
+                vec![serr(-32000, "too many init scripts", 200, &sid)]
+            );
+            assert_eq!(
+                st.registry().init_script_count(&s),
+                crate::target::MAX_INIT_SCRIPTS_PER_SESSION
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp2_session_set_auto_attach_records_state_without_children() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let sessions = st.registry().session_count();
+            let m = "Target.setAutoAttach";
+            let on = r#"{"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true}"#;
+            assert_eq!(
+                call(&st, Some(c), &sreq(2, m, &sid, on)).await,
+                vec![json!({"id":2,"sessionId":sid,"result":{}})]
+            );
+            assert_eq!(st.registry().child_auto_attach(&s), Some(true));
+            assert_eq!(st.registry().session_count(), sessions);
+            let off_wait = r#"{"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true}"#;
+            assert_eq!(
+                call(&st, Some(c), &sreq(3, m, &sid, off_wait)).await,
+                vec![json!({"id":3,"sessionId":sid,"result":{}})]
+            );
+            assert_eq!(st.registry().child_auto_attach(&s), Some(false));
+            // 接続なしの直接 dispatch でもセッション検証が通れば成功する。
+            assert_eq!(
+                call(&st, None, &sreq(4, m, &sid, on)).await,
+                vec![json!({"id":4,"sessionId":sid,"result":{}})]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp2_session_set_auto_attach_false_clears_state() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let m = "Target.setAutoAttach";
+            let _ = call(
+                &st,
+                Some(c),
+                &sreq(2, m, &sid, r#"{"autoAttach":true,"flatten":true}"#),
+            )
+            .await;
+            assert_eq!(st.registry().child_auto_attach(&s), Some(false));
+            assert_eq!(
+                call(&st, Some(c), &sreq(3, m, &sid, r#"{"autoAttach":false}"#)).await,
+                vec![json!({"id":3,"sessionId":sid,"result":{}})]
+            );
+            assert_eq!(st.registry().child_auto_attach(&s), None);
+        }
+
+        #[tokio::test]
+        async fn cdp2_session_set_auto_attach_rejects_filter_and_non_flatten() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let m = "Target.setAutoAttach";
+            let cases = [
+                (
+                    r#"{"autoAttach":true,"flatten":true,"filter":[{"type":"page"}]}"#,
+                    "unsupported params",
+                ),
+                (
+                    r#"{"autoAttach":true,"flatten":false}"#,
+                    "unsupported params",
+                ),
+                (r#"{"autoAttach":true}"#, "unsupported params"),
+                (r#"{"flatten":true}"#, "invalid params"),
+            ];
+            for (i, (p, msg)) in cases.iter().enumerate() {
+                let id = 2 + i as i64;
+                assert_eq!(
+                    call(&st, Some(c), &sreq(id, m, &sid, p)).await,
+                    vec![serr(-32602, msg, id, &sid)],
+                    "{p}"
+                );
+            }
+            assert_eq!(st.registry().child_auto_attach(&s), None);
+        }
+
+        #[tokio::test]
+        async fn cdp7_session_state_is_dropped_on_release_connection() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let _ = call(
+                &st,
+                Some(c),
+                &sreq(
+                    2,
+                    "Target.setAutoAttach",
+                    &sid,
+                    r#"{"autoAttach":true,"flatten":true}"#,
+                ),
+            )
+            .await;
+            let _ = call(
+                &st,
+                Some(c),
+                &sreq(
+                    3,
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    &sid,
+                    r#"{"source":""}"#,
+                ),
+            )
+            .await;
+            assert_eq!(st.registry().child_auto_attach(&s), Some(false));
+            assert_eq!(st.registry().init_script_count(&s), 1);
+            st.release_connection(c);
+            assert_eq!(st.registry().child_auto_attach(&s), None);
+            assert_eq!(st.registry().init_script_count(&s), 0);
         }
 
         #[tokio::test]

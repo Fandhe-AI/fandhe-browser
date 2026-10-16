@@ -47,10 +47,11 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 /// 引く）を前提にすること。`frame.id` が `"main"` のままだと一致しない（`docs/design/playwright-compat.md`）。
 /// `Log.enable`・`Runtime.enable`・`Network.enable`（43.3j）は有効フラグを立てて `{}` を返す（イベントは送らない。`REPAIR-3`）。
 /// `Page.setLifecycleEventsEnabled`（43.3k）は有効フラグを立てて `{}` を返す。この trace は遷移を含まないため
-/// `Page.lifecycleEvent` は現れない。`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（43.3m・#1041）は
-/// Playwright 既定値だけを受理して保持し `{}` を返す（保持値は読まれない。`REPAIR-3`）。収集は `newContext({viewport:null})` で行うため
-/// `Browser.getWindowForTarget`・`Emulation.setDeviceMetricsOverride` は送られない。残りの `Page.addScriptToEvaluateOnNewDocument` 等は
-/// 未実装で `-32601`。
+/// `Page.lifecycleEvent` は現れない。`Page.addScriptToEvaluateOnNewDocument`（空 `source` のみ。43.3l）は
+/// `{"identifier":"1"}`、セッション付き `Target.setAutoAttach`（43.3l）は状態を保持して `{}`（子 attach は 0 件）を返す。
+/// `Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（43.3m・#1041）は Playwright 既定値だけを受理して保持し
+/// `{}` を返す（保持値は読まれない。`REPAIR-3`）。収集は `newContext({viewport:null})` で行うため `Browser.getWindowForTarget`・
+/// `Emulation.setDeviceMetricsOverride` は送られず、`-32601` で失敗する呼び出しは無い。
 ///
 /// 注意: `Browser.getVersion` の応答に `CARGO_PKG_VERSION` が入るため、workspace の版を上げたら
 /// `make trace-playwright` でトレースを再取得すること。
@@ -345,7 +346,6 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
     let product = format!("fandhe-browser/{}", env!("CARGO_PKG_VERSION"));
     // セッション付きの未実装メソッド（`Log.enable` 等）は成功を装わず `-32601`（CDP-6・REPAIR-3）。
     let sid = "00000000000000000000000000000001";
-    let not_impl = |id: i64| json!({"id": id, "sessionId": sid, "error": {"code": -32601, "message": "method not implemented"}});
     let version = json!({"id": 1, "result": {
         "protocolVersion": "1.3", "product": product, "userAgent": product
     }});
@@ -382,15 +382,15 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
                 "id": "main", "loaderId": "2", "url": "about:blank", "mimeType": "text/html"
             }}}}),
             // `Log.enable`・`Runtime.enable`・`Network.enable`（43.3j）は受理して `{}`（イベントなし）。
-            // `Page.addScriptToEvaluateOnNewDocument`（id 12）は未実装。
             json!({"id": 9, "sessionId": sid, "result": {}}),
             // `Page.setLifecycleEventsEnabled`（43.3k）は有効フラグを立てて `{}`（この trace は遷移を含まず lifecycle は現れない）。
             json!({"id": 10, "sessionId": sid, "result": {}}),
             json!({"id": 11, "sessionId": sid, "result": {}}),
-            not_impl(12),
+            // 空 `source` の `Page.addScriptToEvaluateOnNewDocument`（43.3l）は no-op で、最初の identifier は "1"。
+            json!({"id": 12, "sessionId": sid, "result": {"identifier": "1"}}),
             json!({"id": 13, "sessionId": sid, "result": {}}),
-            // 子ターゲットの自動 attach（`sessionId` 付き `Target.setAutoAttach`）は未実装（43.3c）。
-            json!({"id": 14, "sessionId": sid, "error": {"code": -32602, "message": "unsupported params"}}),
+            // セッション付き `Target.setAutoAttach`（43.3l）は状態を保持するだけ。子ターゲットは作らず `{}`。
+            json!({"id": 14, "sessionId": sid, "result": {}}),
             // `Emulation.setFocusEmulationEnabled`・`setEmulatedMedia`（43.3m・#1041）は既定値を受理して `{}`（保持のみ）。
             json!({"id": 15, "sessionId": sid, "result": {}}),
             json!({"id": 16, "sessionId": sid, "result": {}}),
@@ -419,7 +419,7 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
             ("Emulation.setFocusEmulationEnabled", 1, 0),
             ("Log.enable", 1, 0),
             ("Network.enable", 1, 0),
-            ("Page.addScriptToEvaluateOnNewDocument", 0, 1),
+            ("Page.addScriptToEvaluateOnNewDocument", 1, 0),
             ("Page.enable", 1, 0),
             ("Page.getFrameTree", 1, 0),
             ("Page.setLifecycleEventsEnabled", 1, 0),
@@ -682,7 +682,7 @@ fn reach_report(recs: &[Value]) -> ReachReport {
 
 /// `newPage()` 到達状況の結合テスト（TASK-43.3f・#911、`CDP-2`・`CDP-6`・MS-4）。
 ///
-/// 現状は **未到達の事実を固定するテスト**であり、到達確認ではない。`newPage()` は 43.3i・43.3j 後、
+/// 現状は **未到達の事実を固定するテスト**であり、到達確認ではない。`newPage()` は 43.3i・43.3j・43.3l 後、
 /// `Page.getFrameTree` の応答の処理で `Frame has been detached.` を投げて止まる（frame id が targetId と
 /// 一致しないため。`Page.enable`・`Page.getFrameTree` 自体は成功）。ページ初期化メソッド群の実装後は、トレースを
 /// `make trace-playwright` で再取得し、`stages` がすべて成功・`first_stop` が `None`・`failed` が空
@@ -729,25 +729,9 @@ fn cdp2_playwright_newpage_reach_report_lists_first_stop_and_failures() {
             )
         })
         .collect();
-    let nf = "method not implemented";
     assert_eq!(
         failed,
-        [
-            (
-                12,
-                "Page.addScriptToEvaluateOnNewDocument",
-                true,
-                -32601,
-                nf
-            ),
-            (
-                14,
-                "Target.setAutoAttach",
-                true,
-                -32602,
-                "unsupported params"
-            ),
-        ],
+        Vec::<(u64, &str, bool, i64, &str)>::new(),
         "{pretty}"
     );
 }
