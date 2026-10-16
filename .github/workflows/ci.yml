@@ -1267,12 +1267,16 @@ jobs:
         run: |
           df -h /
           # mozjs_sys の build.rs が llvm-objdump を要求する。macos-latest の PATH に無い場合は
-          # 導入済みの Homebrew llvm の bin を PATH に足す（新規導入はしない）
+          # 導入済みの Homebrew llvm の llvm-objdump だけを専用ディレクトリへ symlink して PATH に足す
+          # （bin 全体を足すと Homebrew の clang が Apple clang を覆うため。新規導入はしない）
           if ! command -v llvm-objdump >/dev/null 2>&1; then
             for prefix in "$(brew --prefix llvm 2>/dev/null || true)" /opt/homebrew/opt/llvm /usr/local/opt/llvm; do
               if [ -n "$prefix" ] && [ -x "$prefix/bin/llvm-objdump" ]; then
-                echo "$prefix/bin" >> "$GITHUB_PATH"
-                export PATH="$prefix/bin:$PATH"
+                tools_dir="$RUNNER_TEMP/llvm-tools"
+                mkdir -p "$tools_dir"
+                ln -sf "$prefix/bin/llvm-objdump" "$tools_dir/llvm-objdump"
+                echo "$tools_dir" >> "$GITHUB_PATH"
+                export PATH="$PATH:$tools_dir"
                 break
               fi
             done
