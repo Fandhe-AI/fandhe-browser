@@ -1687,6 +1687,29 @@ pub fn parse_windows_process_table(
     Ok(rows)
 }
 
+/// 最大 `max_attempts` 回まで `attempt` を試し、最初の `Ok` を返す純関数
+/// （Issue #1051・TASK-84.6・PERF-3/PERF-6。Windows 版 `collect_owner_candidate_pids`
+/// が、プロセス表照会の実行失敗〔spawn 失敗・期限超過〕だけを再試行するために使う）。
+///
+/// `attempt` には 0 始まりの試行番号を渡す。全試行が失敗したら各試行の `Err` 文字列を
+/// 試行順に並べて返す（呼び出し側が reason へ整形する）。`max_attempts` が 0 のときは
+/// 一度も呼ばず空の `Vec` を返す。待機・ログ出力は呼び出し側のクロージャに任せ、
+/// 本関数は副作用を持たない。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn retry_on_err<T>(
+    max_attempts: usize,
+    mut attempt: impl FnMut(usize) -> Result<T, String>,
+) -> Result<T, Vec<String>> {
+    let mut errors = Vec::new();
+    for n in 0..max_attempts {
+        match attempt(n) {
+            Ok(v) => return Ok(v),
+            Err(e) => errors.push(e),
+        }
+    }
+    Err(errors)
+}
+
 /// プロセス表 `table`（PID・親 PID・作成時刻）から `root_pid` 自身と子孫の PID
 /// を幅優先で集める（TASK-84.6.4・#562。Windows 版
 /// `collect_owner_candidate_pids` が呼ぶ純関数）。
@@ -4141,6 +4164,53 @@ mod tests {
     #[test]
     fn parse_netstat_listen_pids_empty_output_is_empty() {
         assert_eq!(parse_netstat_listen_pids("", 9222, 8), Ok(Vec::new()));
+    }
+
+    // --- retry_on_err ---
+
+    #[test]
+    fn retry_on_err_returns_first_success_without_retrying() {
+        let mut calls = 0;
+        let r = retry_on_err(2, |n| {
+            calls += 1;
+            Ok::<_, String>(n)
+        });
+        assert_eq!(r, Ok(0));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn retry_on_err_succeeds_on_second_attempt() {
+        let r = retry_on_err(2, |n| {
+            if n == 0 {
+                Err("first".to_string())
+            } else {
+                Ok(n)
+            }
+        });
+        assert_eq!(r, Ok(1));
+    }
+
+    #[test]
+    fn retry_on_err_collects_all_errors_and_stops_at_max_attempts() {
+        let mut calls = 0;
+        let r: Result<(), Vec<String>> = retry_on_err(2, |n| {
+            calls += 1;
+            Err(format!("e{n}"))
+        });
+        assert_eq!(r, Err(vec!["e0".to_string(), "e1".to_string()]));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn retry_on_err_with_zero_attempts_never_calls() {
+        let mut calls = 0;
+        let r: Result<(), Vec<String>> = retry_on_err(0, |_| {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!(r, Err(Vec::new()));
+        assert_eq!(calls, 0);
     }
 
     // --- parse_windows_process_table / windows_descendant_pids ---

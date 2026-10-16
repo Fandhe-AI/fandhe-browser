@@ -1151,36 +1151,72 @@ fn collect_owner_candidate_pids(root_pid: u32, port: u16) -> Result<Vec<u32>, Po
     })
 }
 
-/// Windows のプロセス表照会（PowerShell + CIM）専用の期限。CI ランナーの実測で
-/// 成功時 6〜7 秒・失敗時 10 秒超（Issue #698）のため `EXTERNAL_COMMAND_DEADLINE`
-/// では足りない。照会は readiness の `elapsed` 確定後なので PERF-3 の値を汚さず、
-/// 上限付きである点も変わらない。他の外部コマンドの期限は変更しない。
+/// Windows のプロセス表照会（PowerShell + CIM）の 1 試行あたりの期限。CI ランナーの
+/// 実測で成功時 3〜10 秒が多いが、40 秒で成功・60 秒超で失敗した回もある
+/// （Issue #698・#1051）ため `EXTERNAL_COMMAND_DEADLINE` では足りない。照会は
+/// readiness の `elapsed` 確定後なので PERF-3 の値を汚さず、上限付きである点も
+/// 変わらない。他の外部コマンドの期限は変更しない。
 #[cfg(windows)]
 const WINDOWS_PROCESS_TABLE_QUERY_DEADLINE: Duration = Duration::from_secs(60);
 
+/// プロセス表照会の最大試行数（Issue #1051）。期限を延ばし続けず、新しい PowerShell
+/// プロセスでの 1 回だけの再試行で裾の重い遅延に備える。最悪所要時間は
+/// 期限 x 試行数 + 待機で有界。
+#[cfg(windows)]
+const WINDOWS_PROCESS_TABLE_QUERY_ATTEMPTS: usize = 2;
+
+/// 再試行前の待機（Issue #1051）。kill 済みの前試行のパイプ解放を待つ。
+#[cfg(windows)]
+const WINDOWS_PROCESS_TABLE_QUERY_RETRY_WAIT: Duration = Duration::from_millis(500);
+
 /// windows 版（TASK-84.6.4・#562）: `powershell.exe` で
-/// `Get-CimInstance Win32_Process` を 1 回実行して全プロセスの
+/// `Get-CimInstance Win32_Process` を実行して全プロセスの
 /// 「PID 親PID 作成時刻」を得て、Rust 側で `root_pid` の子孫を絞り込む。
 /// std では PPID を取れず、`tasklist` に PPID が無く、`wmic` は現行 Windows 11
 /// で既定から外されているための選択。スクリプトは外部の値を一切埋め込まない
 /// 固定文字列（ダブルクォートを含めず、`Command` の引用と干渉させない）で、
+/// `-Property` で必要な 3 列だけを照会し（高コストな列を算出させない。Issue #1051）、
 /// 全件を出力して絞り込む。1 回の CIM クエリは一貫したスナップショット
 /// なので、unix のような複数回走査の安定化はしない（所有者を先に照会して
 /// いるため、所有者は必ずスナップショットに現れる）。
-/// 失敗・期限超過（[`WINDOWS_PROCESS_TABLE_QUERY_DEADLINE`]）・出力上限到達・
-/// 形式不正・root 不在は `LookupFailed`。
+///
+/// 再試行（Issue #1051・PERF-3/PERF-6）: 実行自体の失敗（spawn 失敗・期限超過）
+/// だけを [`WINDOWS_PROCESS_TABLE_QUERY_ATTEMPTS`] 回まで新しいプロセスで再試行する。
+/// 非 0 終了・出力上限到達・形式不正・root 不在は決定的な失敗として再試行せず
+/// 即 `LookupFailed`（fail-closed）。再試行は新しいスナップショットで子孫を
+/// 数え直すだけで、所有者が消えていれば `Mismatch` 側に倒れる。
+/// 各試行の経過時間は stderr の `notice:` と最終 reason に残す。
 #[cfg(windows)]
 fn collect_owner_candidate_pids(root_pid: u32, port: u16) -> Result<Vec<u32>, PortOwnerError> {
-    const SCRIPT: &str = "Get-CimInstance -ClassName Win32_Process | ForEach-Object { $t = 0; if ($_.CreationDate) { $t = $_.CreationDate.ToFileTimeUtc() }; '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, $t }";
+    const SCRIPT: &str = "Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate | ForEach-Object { $t = 0; if ($_.CreationDate) { $t = $_.CreationDate.ToFileTimeUtc() }; '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, $t }";
     let lookup_failed = |reason: String| PortOwnerError::LookupFailed { port, reason };
-    let mut command = Command::new("powershell.exe");
-    command.args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT]);
-    let (status, stdout) = crate::support::run_capturing_output_with_deadline(
-        command,
-        WINDOWS_PROCESS_TABLE_QUERY_DEADLINE,
-        MAX_PROCESS_TABLE_OUTPUT_BYTES,
-    )
-    .map_err(|e| lookup_failed(format!("failed to run powershell: {e}")))?;
+    let (status, stdout) =
+        crate::support::retry_on_err(WINDOWS_PROCESS_TABLE_QUERY_ATTEMPTS, |n| {
+            let mut command = Command::new("powershell.exe");
+            command.args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT]);
+            let started = Instant::now();
+            let result = crate::support::run_capturing_output_with_deadline(
+                command,
+                WINDOWS_PROCESS_TABLE_QUERY_DEADLINE,
+                MAX_PROCESS_TABLE_OUTPUT_BYTES,
+            );
+            let elapsed = started.elapsed();
+            result.map_err(|e| {
+                let msg = format!("attempt {} ({:.1}s): {e}", n + 1, elapsed.as_secs_f64());
+                if n + 1 < WINDOWS_PROCESS_TABLE_QUERY_ATTEMPTS {
+                    eprintln!("notice: process table query {msg}; retrying");
+                    std::thread::sleep(WINDOWS_PROCESS_TABLE_QUERY_RETRY_WAIT);
+                }
+                msg
+            })
+        })
+        .map_err(|errors| {
+            lookup_failed(format!(
+                "failed to run powershell after {} attempts: [{}]",
+                WINDOWS_PROCESS_TABLE_QUERY_ATTEMPTS,
+                errors.join("; ")
+            ))
+        })?;
     if stdout.len() >= MAX_PROCESS_TABLE_OUTPUT_BYTES {
         return Err(lookup_failed(format!(
             "process table output reached {MAX_PROCESS_TABLE_OUTPUT_BYTES} bytes and may be truncated"

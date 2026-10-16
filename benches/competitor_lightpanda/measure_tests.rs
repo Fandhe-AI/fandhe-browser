@@ -1804,7 +1804,8 @@ fn check_port_owner_verifies_direct_child_listener() {
 }
 
 /// PERF-3/PERF-6（TASK-84.6.2・#560、TASK-84.6.3・#561、TASK-84.6.4・#562）: ポートを所有するのが子のツリー外
-/// （このテストプロセス）なら `Mismatch` になる。
+/// （このテストプロセス）なら `Mismatch` になる。Windows の CIM 照会が断続的に
+/// 遅い問題（Issue #1051）の調査のため所要時間を stderr へ出す。
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn check_port_owner_rejects_foreign_listener() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1819,7 +1820,13 @@ fn check_port_owner_rejects_foreign_listener() {
         .spawn()
         .expect("spawn sleep-grandchild");
     let child_pid = child.id();
+    let started = std::time::Instant::now();
     let result = measure::check_port_owner(child_pid, port);
+    // Issue #1051: Windows の CIM 照会の所要時間分布を CI ログで追えるようにする。
+    eprintln!(
+        "check_port_owner (foreign listener) took {:?}",
+        started.elapsed()
+    );
     let _ = child.kill();
     let _ = child.wait();
     match result {
