@@ -18,7 +18,8 @@
 #      （逆方向の混入。package 名の完全一致で判定する。ホスト lock の keyboard-types が
 #      部分文字列 boa に一致するため部分一致にしない。前方一致 fandhe-browser-* もホスト自身
 #      を誤検出するため使わない）
-#   E. servo-host の依存ツリーに webgl|webgpu|mozangle|gstreamer|lgpl 系が無いこと
+#   E. servo-host の依存ツリーに webgl|webgpu|gstreamer|lgpl 系が無いこと
+#      （mozangle は Windows の `no-wgl` で要るため対象外。#999）
 #      （既定で無効にしたはずの GPU・メディア・LGPL 系の混入検出）
 #   servo-host の manifest / Cargo.lock が無い場合は D・E を NG とする（fail-closed）。
 #
@@ -27,7 +28,7 @@
 # `cargo tree` は既定でホストのターゲットに絞って依存グラフを表示するため、本体側の
 # cfg(windows)/cfg(unix) の target 依存は当該 OS のランナーでしか現れない。よって本スクリプトは
 # 3 OS（ubuntu/macos/windows）それぞれで実行する必要がある（.claude/rules/ci.md の 3 OS 必須
-# ルール）。ホスト側は --target all で lock の全ターゲット分（mozangle 等の OS 固有依存を含む）
+# ルール）。ホスト側は --target all で lock の全ターゲット分（Windows 固有の mozangle 等の OS 固有依存を含む）
 # を調べる。ホストの依存クレートの取得が発生するが、ビルドは伴わない。
 #
 # これはクレート名に基づく簡易検出であり、リネームや再エクスポート経由の混入までは捕捉
@@ -44,7 +45,7 @@ cd "$REPO_ROOT"
 # Servo 非依存の IPC クライアントとして cli の常時依存になり得るため含めない。
 SERVO_PATTERN='servo'
 # E 用: ホストが既定で無効にしたはずの GPU・メディア・LGPL 系。
-HOST_FORBIDDEN_PATTERN='webgl|webgpu|mozangle|gstreamer|lgpl'
+HOST_FORBIDDEN_PATTERN='webgl|webgpu|gstreamer|lgpl'
 # D 用: メンバー以外に、ホストへ入ってはならない JS エンジンの package 名。
 JS_ENGINE_NAMES=$'v8\nboa_engine'
 
@@ -206,10 +207,10 @@ self_test() {
 
   # --- 検査 E（GPU・メディア・LGPL 系） ---
   local n
-  for n in servo-webgl webgpu-sys mozangle gstreamer-sys lgpl-thing; do
+  for n in servo-webgl webgpu-sys gstreamer-sys lgpl-thing; do
     expect "E: ${n} is detected" ng detect t "$HOST_FORBIDDEN_PATTERN" "$(printf 'tokio v1.0.0\n%s v0.1.0\n' "$n")"
   done
-  for n in glow surfman servo-canvas mozjs_sys; do
+  for n in glow surfman servo-canvas mozjs_sys mozangle; do
     expect "E: ${n} is not detected" ok detect t "$HOST_FORBIDDEN_PATTERN" "$(printf '%s v0.1.0\n' "$n")"
   done
   expect "E: bulk lines with one match at the end are detected" ng detect t "$HOST_FORBIDDEN_PATTERN" "${big_clean}├── gstreamer v0.1.0"$'\n'
@@ -316,7 +317,7 @@ require_file "$HOST_LOCK" "servo-host dependency tree" || HOST_OK=0
 if [ "$HOST_OK" -eq 0 ]; then
   STATUS=1
 else
-  # --target all: lock に載る全ターゲット分を調べ、OS 固有の依存（mozangle 等）を ubuntu でも検出する。
+  # --target all: lock に載る全ターゲット分を調べ、OS 固有の依存を ubuntu でも検出する。
   if ! OUT_HOST=$(cargo tree --manifest-path "$HOST_MANIFEST" --locked -e normal,build,dev --prefix none --target all); then
     echo "NG: cargo tree (servo-host) failed" >&2
     STATUS=1
