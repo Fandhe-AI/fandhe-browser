@@ -14,8 +14,9 @@
 //!   送出しない。残るスタブは [`navigation_events`] を参照。
 //! - HTML は `FetchResponse::body_text_lossy`（UTF-8 lossy）で文字列化する簡易実装。
 //!   文字コード判定は `CORE-5`・TASK-25 で置き換える。
-//! - `frameId` は [`MAIN_FRAME_ID`] の固定値。セッション／ターゲットに基づく決定は
-//!   TASK-43（`CDP-2`）で行う。
+//! - メインフレームの frame ID は、ターゲットあり（`sessionId` 付き）なら targetId と同じ値
+//!   （Chrome と同じ約束事。Playwright の `CRPage._sessionForFrame` が前提とする。TASK-43.3o・#1050・
+//!   `CDP-2`）。ターゲットを持たないブラウザレベルの遷移は [`MAIN_FRAME_ID`] を使う。子フレームは持たない。
 //! - `transitionType`・`referrer`・`frameId` 等の他パラメータは現時点では無視する。
 //!
 //! # ページ JS 実行の接続（TASK-112・`JS-4`・`JS-6`）
@@ -65,9 +66,16 @@ use crate::protocol::{
 };
 use crate::target::{CdpStateError, MAX_URL_LEN, TargetId, TargetRegistry};
 
-/// メインフレームの `frameId`（スタブ。将来はセッション → ターゲット ID。`CDP-2`・TASK-43）。
-/// `Page.frameNavigated` と `Page.getFrameTree`（43.3i）が同じ値を使う。
-pub(crate) const MAIN_FRAME_ID: &str = "main";
+/// ターゲットを持たないブラウザレベルの `Page.navigate`（`sessionId` なし）が使うフォールバックの frame ID。
+/// ターゲットありの場合のメインフレームの frame ID は targetId（[`main_frame_id`]。`CDP-2`・TASK-43.3o・#1050）。
+const MAIN_FRAME_ID: &str = "main";
+
+/// メインフレームの frame ID を返す。`Some` なら targetId（`Page.getFrameTree`・`Page.frameNavigated`・
+/// `Page.lifecycleEvent`・`Page.navigate` 応答で同じ値）、`None`（ブラウザレベル）なら [`MAIN_FRAME_ID`]。
+/// 子フレームのモデルは持たない（`REPAIR-3`）。
+pub(crate) fn main_frame_id(target: Option<&TargetId>) -> &str {
+    target.map_or(MAIN_FRAME_ID, TargetId::as_str)
+}
 
 /// メインフレームの `mimeType`（固定値。`Page.frameNavigated` と `Page.getFrameTree` で共有し食い違いを防ぐ）。
 pub(crate) const MAIN_FRAME_MIME_TYPE: &str = "text/html";
@@ -222,11 +230,16 @@ const LIFECYCLE_LOAD: &str = "load";
 /// `firstMeaningfulPaint`・`firstMeaningfulPaintCandidate`・`InteractiveTime` は送らない。対応する実体
 /// （DOM 構築完了通知・ネットワーク静止の計測・描画計測）が無く、偽の値で埋めないため。将来仕様は
 /// core・render の進捗に合わせた送出（TASK-43・TASK-44・`CDP-2`）。
-fn lifecycle_event(loader_id: &str, name: &'static str, timestamp: f64) -> CdpEvent {
+fn lifecycle_event(
+    frame_id: &str,
+    loader_id: &str,
+    name: &'static str,
+    timestamp: f64,
+) -> CdpEvent {
     CdpEvent {
         method: "Page.lifecycleEvent",
         params: json!({
-            "frameId": MAIN_FRAME_ID,
+            "frameId": frame_id,
             "loaderId": loader_id,
             "name": name,
             "timestamp": timestamp,
@@ -256,17 +269,28 @@ fn lifecycle_event(loader_id: &str, name: &'static str, timestamp: f64) -> CdpEv
 /// - `Page.enable` は実装済み（43.3i）だが、`Page.frameNavigated`・`Page.loadEventFired` は意図的に
 ///   購読ゲートしない（Chromium との差異。`Page.enable` を送らない既存の利用を壊さないため。`REPAIR-3`）。
 ///   `frameStartedLoading`・`domContentEventFired` 等は未実装（TASK-43・`CDP-2`）。
-fn navigation_events(loader_id: &str, url: &str, timestamp: f64, lifecycle: bool) -> Vec<CdpEvent> {
+fn navigation_events(
+    frame_id: &str,
+    loader_id: &str,
+    url: &str,
+    timestamp: f64,
+    lifecycle: bool,
+) -> Vec<CdpEvent> {
     let mut events = Vec::with_capacity(4);
     if lifecycle {
-        events.push(lifecycle_event(loader_id, LIFECYCLE_INIT, timestamp));
+        events.push(lifecycle_event(
+            frame_id,
+            loader_id,
+            LIFECYCLE_INIT,
+            timestamp,
+        ));
     }
     events.extend([
         CdpEvent {
             method: "Page.frameNavigated",
             params: json!({
                 "frame": {
-                    "id": MAIN_FRAME_ID,
+                    "id": frame_id,
                     "loaderId": loader_id,
                     "url": url,
                     "mimeType": MAIN_FRAME_MIME_TYPE,
@@ -282,7 +306,12 @@ fn navigation_events(loader_id: &str, url: &str, timestamp: f64, lifecycle: bool
         },
     ]);
     if lifecycle {
-        events.push(lifecycle_event(loader_id, LIFECYCLE_LOAD, timestamp));
+        events.push(lifecycle_event(
+            frame_id,
+            loader_id,
+            LIFECYCLE_LOAD,
+            timestamp,
+        ));
     }
     events
 }
@@ -628,7 +657,7 @@ impl CommandHandler for PageNavigate {
                         Ok(u) if u.len() <= MAX_URL_LEN => u,
                         _ => {
                             return Ok(HandlerOutput::result(json!({
-                                "frameId": MAIN_FRAME_ID,
+                                "frameId": tid.as_str(),
                                 "loaderId": format!(
                                     "{:x}",
                                     ctx.state.navigations().get_or_create(registry, tid).current_generation().get()
@@ -709,7 +738,7 @@ impl CommandHandler for PageNavigate {
                         let _gate = lock_gate(&self.gate);
                         if nav.current_generation() != g {
                             return Ok(HandlerOutput::result(json!({
-                                "frameId": MAIN_FRAME_ID,
+                                "frameId": tid.as_str(),
                                 "loaderId": out.loader_id,
                                 "errorText": out.error_text.unwrap_or("net::ERR_FAILED"),
                             })));
@@ -813,7 +842,7 @@ impl CommandHandler for PageNavigate {
                 }
             };
             let mut result = json!({
-                "frameId": MAIN_FRAME_ID,
+                "frameId": main_frame_id(target_id.as_ref()),
                 "loaderId": out.loader_id,
             });
             if let (Some(text), Some(obj)) = (out.error_text, result.as_object_mut()) {
@@ -872,9 +901,13 @@ impl CommandHandler for PageNavigate {
                     let lifecycle = ctx
                         .session_id
                         .is_some_and(|sid| ctx.state.registry().lifecycle_events_active(sid));
-                    for ev in
-                        navigation_events(&out.loader_id, &url, monotonic_seconds(), lifecycle)
-                    {
+                    for ev in navigation_events(
+                        main_frame_id(target_id.as_ref()),
+                        &out.loader_id,
+                        &url,
+                        monotonic_seconds(),
+                        lifecycle,
+                    ) {
                         output = output.with_event(ev);
                     }
                 }
@@ -1078,13 +1111,19 @@ mod tests {
     /// `navigation_events` は `frameNavigated` → `loadEventFired` を具体値で返す（TASK-42.3・`CDP-1`）。
     #[test]
     fn cdp1_navigation_events_shape() {
-        let ev = navigation_events("1", "http://example.test/", 1.5, false);
+        let ev = navigation_events(
+            "00000000000000000000000000000001",
+            "1",
+            "http://example.test/",
+            1.5,
+            false,
+        );
         assert_eq!(ev.len(), 2);
         assert_eq!(ev[0].method, "Page.frameNavigated");
         assert_eq!(
             serde_json::from_str::<Value>(&ev[0].to_json()).unwrap(),
             json!({"method": "Page.frameNavigated", "params": {
-                "frame": {"id": "main", "loaderId": "1",
+                "frame": {"id": "00000000000000000000000000000001", "loaderId": "1",
                     "url": "http://example.test/", "mimeType": "text/html"},
                 "type": "Navigation"}})
         );
@@ -1099,7 +1138,13 @@ mod tests {
     /// lifecycle の params が具体値で一致する（TASK-43.3k・`CDP-2`）。
     #[test]
     fn cdp2_navigation_events_with_lifecycle_order_and_shape() {
-        let ev = navigation_events("7", "http://example.test/", 2.5, true);
+        let ev = navigation_events(
+            "00000000000000000000000000000001",
+            "7",
+            "http://example.test/",
+            2.5,
+            true,
+        );
         let methods: Vec<&str> = ev.iter().map(|e| e.method).collect();
         assert_eq!(
             methods,
@@ -1112,11 +1157,11 @@ mod tests {
         );
         assert_eq!(
             ev[0].params,
-            json!({"frameId": "main", "loaderId": "7", "name": "init", "timestamp": 2.5})
+            json!({"frameId": "00000000000000000000000000000001", "loaderId": "7", "name": "init", "timestamp": 2.5})
         );
         assert_eq!(
             ev[3].params,
-            json!({"frameId": "main", "loaderId": "7", "name": "load", "timestamp": 2.5})
+            json!({"frameId": "00000000000000000000000000000001", "loaderId": "7", "name": "load", "timestamp": 2.5})
         );
         assert!(ev.iter().all(|e| e.session_id.is_none()));
     }
@@ -2361,13 +2406,16 @@ mod tests {
             let f = frames(d.dispatch(&st, &nav.to_string()).await);
             assert_eq!(f[0]["result"]["loaderId"], json!("1"), "{f:?}");
             assert_eq!(f[1]["params"]["frame"]["loaderId"], json!("1"));
+            // メインフレームの frame ID は targetId に揃う（TASK-43.3o・#1050・`CDP-2`）。
+            assert_eq!(f[0]["result"]["frameId"], json!(tid.as_str()));
+            assert_eq!(f[1]["params"]["frame"]["id"], json!(tid.as_str()));
             let req = json!({"id": 2, "method": "Page.getFrameTree", "sessionId": sid.as_str()});
             let g = frames(d.dispatch(&st, &req.to_string()).await);
             assert_eq!(
                 g,
                 vec![
                     json!({"id": 2, "sessionId": sid.as_str(), "result": {"frameTree": {"frame": {
-                    "id": "main", "loaderId": "1", "url": url, "mimeType": "text/html"}}}})
+                    "id": tid.as_str(), "loaderId": "1", "url": url, "mimeType": "text/html"}}}})
                 ]
             );
         }

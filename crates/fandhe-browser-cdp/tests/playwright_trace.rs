@@ -36,24 +36,25 @@ const TRACE: &str = include_str!("../../../harness/playwright-trace/results/newp
 const MAX_TRACE_LINES: usize = 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
-/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3l 後）。`connectOverCDP(noDefaults:true)` は
+/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3o 後）。`connectOverCDP(noDefaults:true)` は
 /// `Target.setAutoAttach`（`waitForDebuggerOnStart:true`）・`Target.getTargetInfo` を経て成功し、
 /// `newContext({acceptDownloads:false})` は `Target.createBrowserContext` と
 /// `browserContextId` 付き `Browser.setDownloadBehavior` を経て成功する。`newPage()` は
 /// `Target.createTarget` が成功して `Target.attachedToTarget`（`waitingForDebugger:true`）を応答の前に受け、
 /// セッション付きの初期化で、`Page.enable`・`Page.getFrameTree`（43.3i）は成功するが、`getFrameTree` の応答の処理で
-/// Playwright が `Frame has been detached.` を投げて失敗し `Target.closeTarget` を送る（`CDP-6`）。
-/// 原因は playwright-core 1.63.0 の `CRPage._sessionForFrame` が `_sessions.has(frame._id)`（セッションを targetId で
-/// 引く）を前提にすること。`frame.id` が `"main"` のままだと一致しない（`docs/design/playwright-compat.md`）。
+/// メインフレームの `frame.id` が
+/// targetId と一致する（43.3o・#1050。`Frame has been detached.` は解消）。続く `Page.createIsolatedWorld` と
+/// `Emulation.*` は `-32601` で、`Emulation.setFocusEmulationEnabled` の Protocol error で `newPage()` が失敗し
+/// `Target.closeTarget` を送る（`CDP-6`。`docs/design/playwright-compat.md`）。
 /// `Log.enable`・`Runtime.enable`・`Network.enable`（43.3j）は有効フラグを立てて `{}` を返す（イベントは送らない。`REPAIR-3`）。
 /// `Page.setLifecycleEventsEnabled`（43.3k）は有効フラグを立てて `{}` を返す。この trace は遷移を含まないため
 /// `Page.lifecycleEvent` は現れない。`Page.addScriptToEvaluateOnNewDocument`（空 `source` のみ。43.3l）は
 /// `{"identifier":"1"}`、セッション付き `Target.setAutoAttach`（43.3l）は状態を保持して `{}`（子 attach は 0 件）を返す。
-/// 残りの `Browser.getWindowForTarget`・`Emulation.*` 等は未実装で `-32601`。
+/// 残りの `Browser.getWindowForTarget`・`Page.createIsolatedWorld`・`Emulation.*` 等は未実装で `-32601`。
 ///
 /// 注意: `Browser.getVersion` の応答に `CARGO_PKG_VERSION` が入るため、workspace の版を上げたら
 /// `make trace-playwright` でトレースを再取得すること。
-const EXPECTED_SEND_METHODS: [&str; 20] = [
+const EXPECTED_SEND_METHODS: [&str; 21] = [
     "Browser.getVersion",
     "Target.setAutoAttach",
     "Target.getTargetInfo",
@@ -73,6 +74,7 @@ const EXPECTED_SEND_METHODS: [&str; 20] = [
     "Emulation.setDeviceMetricsOverride",
     "Emulation.setEmulatedMedia",
     "Runtime.runIfWaitingForDebugger",
+    "Page.createIsolatedWorld",
     "Target.closeTarget",
 ];
 
@@ -243,7 +245,7 @@ fn cdp2_playwright_trace_is_well_formed() {
         .collect();
     assert_eq!(sends, EXPECTED_SEND_METHODS);
     // 現状の到達点: connectOverCDP(http) と newContext が成功し、newPage は `Target.createTarget` が
-    // 通った後、`Page.getFrameTree` の応答の処理（`Frame has been detached.`）で失敗する。
+    // 通った後、`Emulation.setFocusEmulationEnabled` の Protocol error（未実装）で失敗する。
     let stages: Vec<(&str, bool)> = recs
         .iter()
         .filter(|r| r["kind"] == "stage")
@@ -346,6 +348,8 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
     let product = format!("fandhe-browser/{}", env!("CARGO_PKG_VERSION"));
     // セッション付きの未実装メソッド（`Log.enable` 等）は成功を装わず `-32601`（CDP-6・REPAIR-3）。
     let sid = "00000000000000000000000000000001";
+    // `Target.createTarget` 応答の targetId（sessionId とは別カウンタ。値が同じなのは偶然）。
+    let tid = "00000000000000000000000000000001";
     let not_impl = |id: i64| json!({"id": id, "sessionId": sid, "error": {"code": -32601, "message": "method not implemented"}});
     let version = json!({"id": 1, "result": {
         "protocolVersion": "1.3", "product": product, "userAgent": product
@@ -381,8 +385,9 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
             // `Page.enable`・`Page.getFrameTree`（43.3i）は実装済み。止めたターゲットでも初期 about:blank の
             // メインフレーム（`loaderId` は初期確定後の世代）を返す。
             json!({"id": 8, "sessionId": sid, "result": {}}),
+            // メインフレームの `frame.id` は targetId（TASK-43.3o・#1050。sessionId とは別カウンタの偶然の一致）。
             json!({"id": 9, "sessionId": sid, "result": {"frameTree": {"frame": {
-                "id": "main", "loaderId": "2", "url": "about:blank", "mimeType": "text/html"
+                "id": tid, "loaderId": "2", "url": "about:blank", "mimeType": "text/html"
             }}}}),
             // `Log.enable`・`Runtime.enable`・`Network.enable`（43.3j）は受理して `{}`（イベントなし）。
             // 他のセッション付き初期化メソッド（id 16-18）は未実装。
@@ -400,7 +405,9 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
             not_impl(18),
             // 止めたセッションの `Runtime.runIfWaitingForDebugger` は実際に再開して `{}`。
             json!({"id": 19, "sessionId": sid, "result": {}}),
-            json!({"id": 20, "result": {"success": true}}),
+            // `Page.createIsolatedWorld` は未実装（`-32601`。TASK-43.3o 後の次の停止点の一つ）。
+            not_impl(20),
+            json!({"id": 21, "result": {"success": true}}),
             json!({"method": "Target.detachedFromTarget", "params": {"sessionId": sid, "targetId": "00000000000000000000000000000001"}}),
         ]
     );
@@ -426,6 +433,7 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
             ("Log.enable", 1, 0),
             ("Network.enable", 1, 0),
             ("Page.addScriptToEvaluateOnNewDocument", 1, 0),
+            ("Page.createIsolatedWorld", 0, 1),
             ("Page.enable", 1, 0),
             ("Page.getFrameTree", 1, 0),
             ("Page.setLifecycleEventsEnabled", 1, 0),
@@ -689,9 +697,9 @@ fn reach_report(recs: &[Value]) -> ReachReport {
 
 /// `newPage()` 到達状況の結合テスト（TASK-43.3f・#911、`CDP-2`・`CDP-6`・MS-4）。
 ///
-/// 現状は **未到達の事実を固定するテスト**であり、到達確認ではない。`newPage()` は 43.3i・43.3j・43.3l 後、
-/// `Page.getFrameTree` の応答の処理で `Frame has been detached.` を投げて止まる（frame id が targetId と
-/// 一致しないため。`Page.enable`・`Page.getFrameTree` 自体は成功）。ページ初期化メソッド群の実装後は、トレースを
+/// 現状は **未到達の事実を固定するテスト**であり、到達確認ではない。`newPage()` は 43.3o 後、
+/// `Emulation.setFocusEmulationEnabled` の Protocol error（未実装）で止まる（frame id は targetId に揃い
+/// `Frame has been detached.` は解消。`Page.createIsolatedWorld` も未実装）。ページ初期化メソッド群の実装後は、トレースを
 /// `make trace-playwright` で再取得し、`stages` がすべて成功・`first_stop` が `None`・`failed` が空
 /// （または Playwright が握りつぶすものだけ）になるよう本テストを到達確認へ切り替える（#911 は open のまま）。
 /// 期待値を緩めたり `#[ignore]` で通したりしない。
@@ -717,9 +725,9 @@ fn cdp2_playwright_newpage_reach_report_lists_first_stop_and_failures() {
         report.first_stop,
         Some(FirstStop {
             stage: "newPage".to_owned(),
-            // Protocol error ではないため method は空（`method_from_protocol_error` が `None`）。
-            method: String::new(),
-            error: "browserContext.newPage: Frame has been detached.".to_owned(),
+            method: "Emulation.setFocusEmulationEnabled".to_owned(),
+            error: "browserContext.newPage: Protocol error (Emulation.setFocusEmulationEnabled): method not implemented"
+                .to_owned(),
         }),
         "{pretty}"
     );
@@ -744,6 +752,7 @@ fn cdp2_playwright_newpage_reach_report_lists_first_stop_and_failures() {
             (16, "Emulation.setFocusEmulationEnabled", true, -32601, nf),
             (17, "Emulation.setDeviceMetricsOverride", true, -32601, nf),
             (18, "Emulation.setEmulatedMedia", true, -32601, nf),
+            (20, "Page.createIsolatedWorld", true, -32601, nf),
         ],
         "{pretty}"
     );

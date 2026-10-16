@@ -76,6 +76,8 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
   `Page.lifecycleEvent` は現れない。`newPage()` の失敗は `Frame has been detached.` のまま。`failed` は id 7・13・15・16・17・18
 - TASK-43.3l（#1040）後の実測（2 回の実行で同一出力）。空 `source` の `Page.addScriptToEvaluateOnNewDocument` が `{"identifier":"1"}`、セッション付き
   `Target.setAutoAttach` が `{}` で成功する。`newPage()` の失敗は `Frame has been detached.` のまま。`failed` は id 7・16・17・18
+- TASK-43.3o（#1050）後の実測（2 回の実行で同一出力）。`Page.getFrameTree` の `frame.id` が targetId になり、`Frame has been detached.` は解消した。
+  次の送信 `Page.createIsolatedWorld` は `-32601`、`newPage()` は `Emulation.setFocusEmulationEnabled` の Protocol error で失敗する。`failed` は id 7・16・17・18・20
 - `Page.addScriptToEvaluateOnNewDocument` の `worldName` に含まれる乱数ハッシュは `<WORLD_HASH>` へ正規化する（決定的にするため）
 - 収集は `connectOverCDP(..., { noDefaults: true })` と `newContext({ acceptDownloads: false })` で行う。fandhe-browser は
   ダウンロード実行系が無く `Browser.setDownloadBehavior` の `allow`・`allowAndName` を拒否するため、Playwright の
