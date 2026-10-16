@@ -16,6 +16,31 @@ use fandhe_browser_core::NavigationState;
 
 use crate::target::{TargetId, TargetRegistry};
 
+/// `Page.getFrameTree` が返すメインフレームの現在状態（43.3i・#1037。将来の拡張に備え構造体にする。`REPAIR-4`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MainFrameSnapshot {
+    /// 現在の文書 URL。
+    pub(crate) url: String,
+    /// 現在の文書の `loaderId`（世代の hex。`Page.navigate`・`Page.frameNavigated` と同じ書式）。
+    pub(crate) loader_id: String,
+}
+
+/// 初期 `about:blank` を確定済みの新規状態を作る（begin + clear）。
+/// `commit_initial_blank` と初期 `loaderId` の導出が同じ手順を共有し、値の食い違いを防ぐ。
+fn new_committed_blank_state() -> Option<NavigationState> {
+    let nav = NavigationState::new();
+    nav.begin_navigation()
+        .and_then(|g| nav.clear_navigation(g))
+        .ok()?;
+    Some(nav)
+}
+
+/// 初期 `about:blank` 確定後の `loaderId`（まだ状態を持たない止めたターゲットの `Page.getFrameTree` 用）。
+fn initial_blank_loader_id() -> Option<String> {
+    let nav = new_committed_blank_state()?;
+    Some(format!("{:x}", nav.current_generation().get()))
+}
+
 /// ターゲット別の遷移状態表（`CDP-1` のターゲット境界）。
 ///
 /// 別ターゲットへの `Page.navigate` が他ターゲットの HTML・URL を上書きしないよう分離する。
@@ -61,15 +86,36 @@ impl TargetNavigations {
         if registry.target(tid).is_none() || m.contains_key(tid) {
             return false;
         }
-        let nav = NavigationState::new();
-        let committed = nav
-            .begin_navigation()
-            .and_then(|g| nav.clear_navigation(g))
-            .is_ok();
-        if committed {
-            m.insert(tid.clone(), Arc::new(nav));
+        match new_committed_blank_state() {
+            Some(nav) => {
+                m.insert(tid.clone(), Arc::new(nav));
+                true
+            }
+            None => false,
         }
-        committed
+    }
+
+    /// `tid` のメインフレームの現在状態を読み取り専用で返す（`Page.getFrameTree`。43.3i・#1037・`CDP-2`）。
+    ///
+    /// 未登録のターゲットは `None`（呼び出し側が `invalid params` に写す）。状態を作らず
+    /// `commit_initial_blank` も呼ばない。`url` は registry の値（止めたターゲットでは `about:blank`）、
+    /// `loader_id` は遷移状態の現在世代の hex。状態が無い（止めた）ターゲットは
+    /// 再開時に `commit_initial_blank` が作る世代と同じ値を返し、再開の前後で変わらない。
+    ///
+    /// 簡易実装（`REPAIR-3`）: 遷移中（begin 後・確定前）や取得失敗後は「進行中または失敗した世代」を返し、
+    /// `url` も registry の値（直前の URL、失敗時は試行した URL）になる。Chromium は確定済みの直前文書を返す。
+    /// また `url` と世代は別々に読むため、確定の瞬間に食い違う組を一瞬観測し得る。
+    pub(crate) fn frame_snapshot(
+        &self,
+        registry: &TargetRegistry,
+        tid: &TargetId,
+    ) -> Option<MainFrameSnapshot> {
+        let url = registry.target(tid)?.url().to_string();
+        let loader_id = match self.get(tid) {
+            Some(nav) => format!("{:x}", nav.current_generation().get()),
+            None => initial_blank_loader_id()?,
+        };
+        Some(MainFrameSnapshot { url, loader_id })
     }
 
     /// 読み取り専用。表に無ければ `None`（作成しない）。
@@ -187,6 +233,56 @@ mod tests {
         let t = reg.create_target(TargetKind::Page, "about:blank").unwrap();
         n.get_or_create(&reg, &t);
         assert_eq!(n.len(), 1);
+    }
+
+    #[test]
+    fn cdp2_initial_blank_loader_id_matches_commit_initial_blank() {
+        let reg = TargetRegistry::new();
+        let t = reg.create_target(TargetKind::Page, "about:blank").unwrap();
+        let n = TargetNavigations::new();
+        assert!(n.commit_initial_blank(&reg, &t));
+        let committed = format!("{:x}", n.get(&t).unwrap().current_generation().get());
+        assert_eq!(committed, "2");
+        assert_eq!(initial_blank_loader_id().as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn cdp2_frame_snapshot_uses_registry_url_and_generation() {
+        use fandhe_browser_core::NavigationResult;
+        let reg = TargetRegistry::new();
+        let t = reg.create_target(TargetKind::Page, "about:blank").unwrap();
+        let n = TargetNavigations::new();
+        // 状態なし（止めたターゲット相当）。状態は作らない。
+        let snap = n.frame_snapshot(&reg, &t).unwrap();
+        assert_eq!(
+            snap,
+            MainFrameSnapshot {
+                url: "about:blank".into(),
+                loader_id: "2".into()
+            }
+        );
+        assert_eq!(n.len(), 0);
+        // 確定後も同じ値。
+        assert!(n.commit_initial_blank(&reg, &t));
+        assert_eq!(n.frame_snapshot(&reg, &t).unwrap().loader_id, "2");
+        // 取得を伴う遷移の確定後は、その URL と世代。
+        let t2 = reg.create_target(TargetKind::Page, "about:blank").unwrap();
+        let st = n.get_or_create(&reg, &t2);
+        let g = st.begin_navigation().unwrap();
+        st.commit_navigation(g, NavigationResult::new("https://a.test/", ""))
+            .unwrap();
+        reg.set_target_url(&t2, "https://a.test/").unwrap();
+        assert_eq!(
+            n.frame_snapshot(&reg, &t2).unwrap(),
+            MainFrameSnapshot {
+                url: "https://a.test/".into(),
+                loader_id: "1".into()
+            }
+        );
+        // 未登録のターゲットは None。
+        let ghost = TargetId::parse("ghost-1").unwrap();
+        assert!(n.frame_snapshot(&reg, &ghost).is_none());
+        assert_eq!(n.len(), 2);
     }
 
     #[test]

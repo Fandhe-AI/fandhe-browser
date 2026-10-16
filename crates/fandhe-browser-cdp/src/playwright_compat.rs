@@ -1,4 +1,4 @@
-//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c、段階 2b は 43.3d、段階 2g は 43.3g、段階 2h は 43.3h）。
+//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c、段階 2b は 43.3d、段階 2g は 43.3g、段階 2h は 43.3h、段階 3a は 43.3i）。
 //!
 //! `protocol::builtin_handlers` から登録される。`Browser.getVersion`（43.3a）・
 //! `Target.getTargetInfo`（43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（43.3c）を
@@ -16,7 +16,9 @@
 //! `browserContextId` 付き `Browser.setDownloadBehavior`（context 単位で保持）を足し、全ページターゲットの
 //! `targetInfo` に `browserContextId` を載せる。`Target.disposeBrowserContext` は未実装（`REPAIR-3`）。
 //! 43.3e（#910）で `Target.createTarget`（応答の前に `Target.attachedToTarget` を送出）と
-//! `Runtime.runIfWaitingForDebugger` を足す。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
+//! `Runtime.runIfWaitingForDebugger` を足す。
+//! 43.3i（#1037）で `Page.enable`（セッション単位の有効フラグ。実効果は #1039 の `Page.lifecycleEvent` 送出ゲートのみ）と
+//! `Page.getFrameTree`（メインフレームのみ）を足す。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
 
 use serde_json::{Value, json};
 
@@ -24,6 +26,7 @@ use crate::conn_state::{
     ConnStateError, DownloadBehavior, DownloadSettings, validate_download_path,
 };
 use crate::discovery::{PRODUCT, PROTOCOL_VERSION};
+use crate::page::{MAIN_FRAME_ID, MAIN_FRAME_MIME_TYPE};
 use crate::protocol::{
     BoxFuture, CdpError, CdpEvent, CommandContext, CommandHandler, HandlerOutput,
 };
@@ -325,7 +328,7 @@ impl CommandHandler for TargetCloseTarget {
 /// `SERVER_ERROR`（巻き戻し済みで何も作らない）。
 ///
 /// 未実装（`REPAIR-3`）: 任意 URL の読み込み、`Target.targetCreated`（`Target.setDiscoverTargets` が
-/// 未実装）、初期読み込み時の `Page.frameNavigated` 等（`Page.enable` が未実装）、クライアントごとの待ち。
+/// 未実装）、初期 `about:blank` 読み込み時の `Page.frameNavigated`（`Page.enable` は 43.3i で実装済みだが未送出。段階 4 で要否を実測で判断）、クライアントごとの待ち。
 /// 既定 context に作ったターゲットは作成接続の切断では閉じない（Chromium のタブと同じ。
 /// `Target.closeTarget` で閉じる。上限 `MAX_TARGETS` が歯止め）。
 pub(crate) struct TargetCreateTarget;
@@ -418,6 +421,90 @@ impl CommandHandler for RuntimeRunIfWaitingForDebugger {
                 state.navigations().commit_initial_blank(registry, &tid);
             }
             Ok(HandlerOutput::result(json!({})))
+        })
+    }
+}
+
+/// `Page.enable`（`CDP-2`・TASK-43.3i・#1037）。
+///
+/// `sessionId` 付きで、そのセッションに有効フラグを立てて `{}` を返す（冪等）。フラグは registry の
+/// セッション表と同じロック・寿命で持つ（`conn_state` でなく `target.rs` に置く理由: 自動 attach 由来でない
+/// セッションも扱え、セッション削除と同時に消えて TOCTOU が起きないため）。実効果は #1039 の
+/// `Page.lifecycleEvent` 送出ゲートだけで、現時点ではイベント送出を何も変えない。
+///
+/// 差異（`REPAIR-3`）: 既存の `Page.frameNavigated`・`Page.loadEventFired` は `Page.enable` なしでも従来どおり
+/// 送出する（Chromium は有効化後のみ。`Page.enable` を送らない既存の利用と Puppeteer 系の回帰を避けるため）。
+/// この成功は実際の状態変更であり、検出回避の一律成功ではない（`SEC-2`）。
+/// `sessionId` なしは `UNSUPPORTED_PARAMS`、未知・閉じたセッションは `INVALID_PARAMS`。
+/// `params` にキーがあれば（`enableFileChooserOpenedEvent` を含む）黙って無視せず `UNSUPPORTED_PARAMS`
+/// （フラグは立てない）。
+pub(crate) struct PageEnable;
+
+impl CommandHandler for PageEnable {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            let sid = ctx.session_id.ok_or(CdpError::UNSUPPORTED_PARAMS)?;
+            let obj = params.as_object().ok_or(CdpError::INVALID_PARAMS)?;
+            if !obj.is_empty() {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            ctx.state
+                .registry()
+                .enable_page(sid)
+                .map_err(|_| CdpError::INVALID_PARAMS)?;
+            Ok(HandlerOutput::result(json!({})))
+        })
+    }
+}
+
+/// `Page.getFrameTree`（`CDP-2`・TASK-43.3i・#1037）。
+///
+/// `sessionId` 付きで、メインフレームだけの `frameTree` を返す。`Page.enable` は前提にしない（Chromium と同じ）。
+/// 読み取り専用で、遷移も状態作成もしない。`frame.id` は `Page.frameNavigated` と同じ [`MAIN_FRAME_ID`]。
+/// 止めたターゲットでも応答し、`url` は `about:blank`、`loaderId` は再開前後で同じ値
+/// （[`crate::navigation::TargetNavigations::frame_snapshot`]）。
+///
+/// 差異（`REPAIR-3`）: `childFrames` は返さない（子フレームのモデルがない）。値を持たない
+/// `securityOrigin`・`parentId`・`name` 等は偽の値で埋めず出さない。`mimeType` は固定値。遷移中・取得失敗後の
+/// 値は `frame_snapshot` の doc を参照。`sessionId` なし・`params` にキーありは `UNSUPPORTED_PARAMS`、
+/// 未知・閉じたセッションは `INVALID_PARAMS`。
+pub(crate) struct PageGetFrameTree;
+
+impl CommandHandler for PageGetFrameTree {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            let sid = ctx.session_id.ok_or(CdpError::UNSUPPORTED_PARAMS)?;
+            let obj = params.as_object().ok_or(CdpError::INVALID_PARAMS)?;
+            if !obj.is_empty() {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let state = ctx.state;
+            let registry = state.registry();
+            let tid = registry
+                .session_target(sid)
+                .ok_or(CdpError::INVALID_PARAMS)?;
+            let snap = state
+                .navigations()
+                .frame_snapshot(registry, &tid)
+                .ok_or(CdpError::INVALID_PARAMS)?;
+            Ok(HandlerOutput::result(json!({
+                "frameTree": {
+                    "frame": {
+                        "id": MAIN_FRAME_ID,
+                        "loaderId": snap.loader_id,
+                        "url": snap.url,
+                        "mimeType": MAIN_FRAME_MIME_TYPE,
+                    },
+                },
+            })))
         })
     }
 }
@@ -2001,6 +2088,186 @@ mod tests {
                     m.0
                 );
             }
+        }
+
+        // ---- Page.enable / Page.getFrameTree（TASK-43.3i・#1037） ----
+
+        fn sreq(id: i64, method: &str, sid: &str, params: &str) -> String {
+            format!(r#"{{"id":{id},"method":"{method}","sessionId":"{sid}","params":{params}}}"#)
+        }
+
+        fn serr(code: i64, msg: &str, id: i64, sid: &str) -> Value {
+            json!({"id": id, "sessionId": sid, "error": {"code": code, "message": msg}})
+        }
+
+        /// 自動 attach 済みのセッション付きで生きたページを作り、sessionId を返す。
+        async fn attached_session(st: &Arc<CdpState>, c: ConnId) -> String {
+            new_page(st, "about:blank");
+            let f = call(st, Some(c), &auto_attach(1, ON)).await;
+            f[1]["params"]["sessionId"].as_str().unwrap().to_owned()
+        }
+
+        #[tokio::test]
+        async fn cdp2_page_enable_with_session_returns_empty_and_is_idempotent() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            assert!(!st.registry().is_page_enabled(&s));
+            for id in [2, 3] {
+                assert_eq!(
+                    call(&st, Some(c), &sreq(id, "Page.enable", &sid, "{}")).await,
+                    vec![json!({"id":id,"sessionId":sid,"result":{}})]
+                );
+            }
+            assert!(st.registry().is_page_enabled(&s));
+        }
+
+        #[tokio::test]
+        async fn cdp2_page_enable_rejects_missing_or_unknown_session() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            assert_eq!(
+                call(&st, Some(c), r#"{"id":1,"method":"Page.enable"}"#).await,
+                vec![err(-32602, "unsupported params", 1)]
+            );
+            assert_eq!(
+                call(&st, Some(c), &sreq(2, "Page.enable", "NoSuch-1", "{}")).await,
+                vec![serr(-32602, "invalid params", 2, "NoSuch-1")]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp2_page_enable_rejects_unknown_params() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            for (id, p) in [
+                (2, r#"{"enableFileChooserOpenedEvent":true}"#),
+                (3, r#"{"enableFileChooserOpenedEvent":false}"#),
+            ] {
+                assert_eq!(
+                    call(&st, Some(c), &sreq(id, "Page.enable", &sid, p)).await,
+                    vec![serr(-32602, "unsupported params", id, &sid)]
+                );
+            }
+            assert!(
+                !st.registry()
+                    .is_page_enabled(&SessionId::parse(&sid).unwrap())
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp2_page_get_frame_tree_returns_main_frame_only() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let f = call(&st, Some(c), &sreq(2, "Page.getFrameTree", &sid, "{}")).await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"id":2,"sessionId":sid,"result":{"frameTree":{"frame":{
+                    "id":"main","loaderId":"2","url":"about:blank","mimeType":"text/html"}}}})
+                ]
+            );
+            let frame = f[0]["result"]["frameTree"]["frame"].as_object().unwrap();
+            for k in ["childFrames", "securityOrigin", "parentId"] {
+                assert!(!frame.contains_key(k));
+            }
+            assert!(f[0]["result"]["frameTree"].get("childFrames").is_none());
+            // 読み取り専用で状態を作らない。
+            assert_eq!(st.navigations().len(), 0);
+        }
+
+        #[tokio::test]
+        async fn cdp2_page_get_frame_tree_on_paused_target_keeps_loader_id_across_resume() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(
+                &st,
+                Some(c),
+                &auto_attach(
+                    1,
+                    r#""autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true"#,
+                ),
+            )
+            .await;
+            let f = call(&st, Some(c), &create_req(2, BLANK)).await;
+            let sid = f[0]["params"]["sessionId"].as_str().unwrap().to_owned();
+            let tree = |id: i64, loader: &str, url: &str| {
+                json!({"id":id,"sessionId":sid,"result":{"frameTree":{"frame":{
+                    "id":"main","loaderId":loader,"url":url,"mimeType":"text/html"}}}})
+            };
+            assert_eq!(
+                call(&st, Some(c), &sreq(3, "Page.getFrameTree", &sid, "{}")).await,
+                vec![tree(3, "2", "about:blank")]
+            );
+            assert_eq!(st.navigations().len(), 0);
+            call(&st, Some(c), &run_req(4, &sid)).await;
+            assert_eq!(
+                call(&st, Some(c), &sreq(5, "Page.getFrameTree", &sid, "{}")).await,
+                vec![tree(5, "2", "about:blank")]
+            );
+            let nav = call(
+                &st,
+                Some(c),
+                &sreq(6, "Page.navigate", &sid, r#"{"url":"about:blank"}"#),
+            )
+            .await;
+            assert_eq!(nav[0]["result"]["loaderId"], "4", "{nav:?}");
+            assert_eq!(nav[1]["method"], "Page.frameNavigated");
+            assert_eq!(nav[1]["params"]["frame"]["loaderId"], "4");
+            assert_eq!(
+                call(&st, Some(c), &sreq(7, "Page.getFrameTree", &sid, "{}")).await,
+                vec![tree(7, "4", "about:blank")]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp2_page_get_frame_tree_rejects_missing_unknown_session_and_params() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            assert_eq!(
+                call(&st, Some(c), r#"{"id":2,"method":"Page.getFrameTree"}"#).await,
+                vec![err(-32602, "unsupported params", 2)]
+            );
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c),
+                    &sreq(3, "Page.getFrameTree", "NoSuch-1", "{}")
+                )
+                .await,
+                vec![serr(-32602, "invalid params", 3, "NoSuch-1")]
+            );
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c),
+                    &sreq(4, "Page.getFrameTree", &sid, r#"{"x":1}"#)
+                )
+                .await,
+                vec![serr(-32602, "unsupported params", 4, &sid)]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp6_log_enable_with_session_remains_method_not_implemented() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            assert_eq!(
+                call(&st, Some(c), &sreq(2, "Log.enable", &sid, "{}")).await,
+                vec![serr(-32601, "method not implemented", 2, &sid)]
+            );
         }
     }
 }

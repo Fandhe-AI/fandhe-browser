@@ -13,7 +13,7 @@
 //! - 全メソッドは同期で、ロックのガードを返さない（await をまたぐ保持を起こさない）。
 //!   各メソッドは検証をすべて済ませてから表を変更するため、失敗時に表は不変。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -249,6 +249,9 @@ struct Tables {
     /// `waitForDebuggerOnStart` で止めたターゲットと、止めた（再開を待つ）セッション（#910・`CDP-2`）。
     /// ターゲットの閉鎖・context の破棄で消える。件数はターゲット数以下。
     paused: HashMap<TargetId, SessionId>,
+    /// `Page.enable` 済みのセッション（43.3i・#1037・`CDP-2`）。#1039 の `Page.lifecycleEvent` 送出ゲートが読む。
+    /// 寿命は `sessions` と同じで、削除と同じロック内で消す。件数は `MAX_SESSIONS` 以下（`CDP-7`）。
+    page_enabled: HashSet<SessionId>,
     next_target: u64,
     next_session: u64,
     next_context: u64,
@@ -285,6 +288,7 @@ impl TargetRegistry {
                 contexts,
                 default_context,
                 paused: HashMap::new(),
+                page_enabled: HashSet::new(),
                 next_target,
                 next_session,
                 next_context,
@@ -428,6 +432,7 @@ impl TargetRegistry {
         removed.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         for sid in &removed {
             t.sessions.remove(sid);
+            t.page_enabled.remove(sid);
         }
         Ok(removed)
     }
@@ -453,10 +458,28 @@ impl TargetRegistry {
 
     /// セッションを切り離し、attach 先のターゲット ID を返す。
     pub fn detach(&self, id: &SessionId) -> Result<TargetId, CdpStateError> {
-        self.lock()
-            .sessions
-            .remove(id)
-            .ok_or(CdpStateError::UnknownSession)
+        let mut t = self.lock();
+        t.page_enabled.remove(id);
+        t.sessions.remove(id).ok_or(CdpStateError::UnknownSession)
+    }
+
+    /// セッションに `Page.enable` 済みの印を付ける（冪等。43.3i・#1037・`CDP-2`）。
+    ///
+    /// 存在確認と設定を 1 回のロックで行う。フラグを `Tables` に置くのは、セッション削除と同じロック内で
+    /// 消せて TOCTOU が起きず、`conn_state` と違い自動 attach 由来でないセッションも扱えるため。
+    pub(crate) fn enable_page(&self, sid: &SessionId) -> Result<(), CdpStateError> {
+        let mut t = self.lock();
+        if !t.sessions.contains_key(sid) {
+            return Err(CdpStateError::UnknownSession);
+        }
+        t.page_enabled.insert(sid.clone());
+        Ok(())
+    }
+
+    /// `Page.enable` 済みか。#1039 の `Page.lifecycleEvent` 送出ゲートが読む（それまで本番からは未使用）。
+    #[cfg(test)]
+    pub(crate) fn is_page_enabled(&self, sid: &SessionId) -> bool {
+        self.lock().page_enabled.contains(sid)
     }
 
     /// セッションの attach 先ターゲットを返す。
@@ -613,6 +636,7 @@ impl TargetRegistry {
             sids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             for s in &sids {
                 t.sessions.remove(s);
+                t.page_enabled.remove(s);
             }
             closed.push((tid, sids));
         }
@@ -1073,6 +1097,41 @@ mod tests {
         r.dispose_browser_context(&c).unwrap();
         assert!(!r.is_paused(&t3));
         assert!(r.take_orphaned_paused().is_empty());
+    }
+
+    #[test]
+    fn cdp2_enable_page_is_idempotent_and_rejects_unknown_session() {
+        let r = TargetRegistry::new();
+        let t = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        let s = r.attach(&t).unwrap();
+        assert!(!r.is_page_enabled(&s));
+        r.enable_page(&s).unwrap();
+        r.enable_page(&s).unwrap();
+        assert!(r.is_page_enabled(&s));
+        let ghost = SessionId::parse("ghost-1").unwrap();
+        assert_eq!(r.enable_page(&ghost), Err(CdpStateError::UnknownSession));
+        assert!(!r.is_page_enabled(&ghost));
+    }
+
+    #[test]
+    fn cdp7_page_enabled_flag_is_dropped_on_detach_close_and_dispose() {
+        let r = TargetRegistry::new();
+        let t1 = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        let s1 = r.attach(&t1).unwrap();
+        r.enable_page(&s1).unwrap();
+        r.detach(&s1).unwrap();
+        assert!(!r.is_page_enabled(&s1));
+        let s1b = r.attach(&t1).unwrap();
+        r.enable_page(&s1b).unwrap();
+        r.close_target(&t1).unwrap();
+        assert!(!r.is_page_enabled(&s1b));
+        let c = r.create_browser_context().unwrap();
+        let (_t3, s3) = r
+            .create_target_attached(Some(&c), TargetKind::Page, "about:blank", false)
+            .unwrap();
+        r.enable_page(&s3).unwrap();
+        r.dispose_browser_context(&c).unwrap();
+        assert!(!r.is_page_enabled(&s3));
     }
 
     #[test]

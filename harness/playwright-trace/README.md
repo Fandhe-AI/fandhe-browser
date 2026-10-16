@@ -67,6 +67,9 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
   `connectOverCDP(http)` が成功する。`newContext()` は `Target.createBrowserContext` と `browserContextId` 付き
   `Browser.setDownloadBehavior` が成功して通る。`newPage()` は `Target.createTarget` が成功し（`Target.attachedToTarget` が応答の前に届く）、
   セッション付きの `Page.enable` の `-32601`（`method not implemented`。`CDP-6`・`REPAIR-3`）で失敗して `Target.closeTarget` を送る
+- TASK-43.3i（#1037）後の実測（2 回の実行で同一出力）。セッション付きの `Page.enable`（`{}`）と `Page.getFrameTree`
+  （`frame = {id:"main", loaderId:"2", url:"about:blank", mimeType:"text/html"}`）が成功し、`newPage()` の失敗は
+  `browserContext.newPage: Frame has been detached.` に変わる（`Log.enable` 以降は引き続き `-32601`）。`Page.frameNavigated` 待ちの停止は観測していない
 - `Page.addScriptToEvaluateOnNewDocument` の `worldName` に含まれる乱数ハッシュは `<WORLD_HASH>` へ正規化する（決定的にするため）
 - 収集は `connectOverCDP(..., { noDefaults: true })` と `newContext({ acceptDownloads: false })` で行う。fandhe-browser は
   ダウンロード実行系が無く `Browser.setDownloadBehavior` の `allow`・`allowAndName` を拒否するため、Playwright の
