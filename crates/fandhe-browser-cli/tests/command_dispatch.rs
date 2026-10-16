@@ -17,16 +17,31 @@ struct Outcome {
 }
 
 fn run(tag: &str, args: &[&str]) -> Outcome {
+    run_with_config(tag, args, None)
+}
+
+/// `config` を設定ファイルとして書き、`FANDHE_BROWSER_CONFIG` で渡して起動する。
+fn run_with_config(tag: &str, args: &[&str], config: Option<&str>) -> Outcome {
     let home: PathBuf =
         std::env::temp_dir().join(format!("fandhe-cli-dispatch-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&home).expect("home dir can be created");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-browser"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fandhe-browser"));
+    match config {
+        Some(content) => {
+            let file = home.join("fandhe-browser.toml");
+            std::fs::write(&file, content).expect("config file can be written");
+            cmd.env("FANDHE_BROWSER_CONFIG", &file);
+        }
+        None => {
+            cmd.env_remove("FANDHE_BROWSER_CONFIG");
+        }
+    }
+    let mut child = cmd
         .args(args)
         .env("HOME", &home)
         .env("XDG_DATA_HOME", &home)
         .env("LOCALAPPDATA", &home)
         .env("APPDATA", &home)
-        .env_remove("FANDHE_BROWSER_CONFIG")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -75,4 +90,43 @@ fn cli1_help_flag_prints_usage_and_exits_zero() {
         out.stdout
     );
     assert!(!out.stderr.contains("DevTools listening"));
+}
+
+#[test]
+fn cli1_launch_with_extra_argument_exits_with_usage_error() {
+    let out = run("launch-extra", &["launch", "extra"]);
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: unexpected argument 'extra'; run 'fandhe-browser --help' for usage"
+    );
+    assert!(!out.stderr.contains("DevTools listening"));
+}
+
+#[test]
+fn cli1_launch_with_unknown_option_exits_with_usage_error() {
+    let out = run("launch-bogus", &["launch", "--bogus"]);
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: unknown option '--bogus'; run 'fandhe-browser --help' for usage"
+    );
+}
+
+const UNBUNDLED_ENGINE_CONFIG: &str = "[js]\nengine = \"quickjs\"\n";
+
+#[test]
+fn cli1_launch_startup_failure_returns_error() {
+    let out = run_with_config("launch-fail", &["launch"], Some(UNBUNDLED_ENGINE_CONFIG));
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("\"quickjs\""), "stderr: {}", out.stderr);
+    assert!(!out.stderr.contains("DevTools listening"));
+}
+
+#[test]
+fn cli1_launch_and_no_args_share_startup_path() {
+    let launch = run_with_config("same-launch", &["launch"], Some(UNBUNDLED_ENGINE_CONFIG));
+    let bare = run_with_config("same-bare", &[], Some(UNBUNDLED_ENGINE_CONFIG));
+    assert_eq!(launch.code, bare.code);
+    assert_eq!(launch.stderr, bare.stderr);
 }

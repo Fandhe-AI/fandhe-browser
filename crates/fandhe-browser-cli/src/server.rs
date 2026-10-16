@@ -13,8 +13,8 @@
 //! - graceful shutdown: 現状は `BoundServer::run` で動かし続け、Ctrl-C は OS 既定の
 //!   シグナル動作で終了する（advisory lock は OS が解放する）。`run_until` による
 //!   正常停止には tokio の `signal` feature（依存変更・要承認）が要る
-//! - ポート・bind 先・プロファイルの明示指定: TASK-47（`CLI-1`）・TASK-60.4 で追加する。
-//!   現状は [`DEFAULT_ADDR`] 固定
+//! - ポート・bind 先の明示指定: #823（`CLI-3`）、プロファイルの明示指定: #287・TASK-60.4 で追加する
+//!   （`commands::launch`）。現状は [`DEFAULT_ADDR`] 固定
 //! - 描画実装のホストパスを設定ファイルから渡すこと: 設定キーが core の `Config` に未定義のため、
 //!   現状はホストパスを環境変数・本体の隣の実行ファイルからだけ解決する
 //!   （`render_host`。TASK-38.7・#236・`RENDER-3`。設定キーの追加は後続課題）
