@@ -206,7 +206,7 @@ v1 はホストが自分で fetch する（URL のみ送る）。Cookie・セッ
 - 本体側の既存検査 A / B は維持する（PATTERN は §3.2 のとおり調整）。
 - C: 本体の `cargo metadata` に `servo-host` が含まれず、ルート `Cargo.lock` に `servo` / `mozjs` 系が無い。
 - D: `servo-host` の依存ツリーに本体 workspace の package 名（`cargo metadata` で得た本体メンバーの集合。ホスト自身の `fandhe-browser-servo-host` は集合に含まれないため `fandhe-browser-*` の前方一致では判定しない）・`v8`・`boa_engine` が含まれない（逆方向の混入防止）。
-- E: `servo-host` の依存ツリーに `webgl|webgpu|mozangle|gstreamer|lgpl` が含まれない（試作の検査パターン）。`mozangle` は Windows ターゲットの `no-wgl` に限り許可し、`cargo tree --target` でターゲット別に検査する（非 Windows は mozangle を含めて NG、Windows は除く。#999）。
+- E: `servo-host` の依存ツリー（`cargo tree --target all` の出力全体）に `webgl|webgpu|gstreamer|lgpl` が含まれない（試作の検査パターン）。`mozangle` だけは Windows の `no-wgl` に限り許可し、非 Windows ターゲット（`deny.toml` の `[graph] targets` と一致を検査）ごとの `cargo tree --target` で禁止する（#999）。
 - 自己テスト（合成した `cargo tree` 出力）を追加し、大量一致時の fail-open を防ぐヒアストリング方式を踏襲する。
 
 ## 5. NOTICE・帰属表示
