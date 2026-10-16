@@ -343,3 +343,22 @@ fn cli1_screenshot_is_wired_and_reports_rendering_unavailable_without_host() {
     assert!(out.stdout.is_empty());
     assert!(!std::path::Path::new(&target).exists());
 }
+
+#[test]
+fn cli1_screenshot_full_page_is_rejected_as_unsupported() {
+    // v1 の描画ホストは full-page 未対応（固定ビューポート）。成功を装わず usage エラーで拒否し、
+    // ファイルを作らない。
+    let dir = OutDir::new("fullpage");
+    let target = dir.file("out.png");
+    let out = run(
+        "shot-fullpage",
+        &["screenshot", "--full-page", "https://a.example/", &target],
+    );
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: option '--full-page' is not supported yet; run 'fandhe-browser --help' for usage"
+    );
+    assert!(out.stdout.is_empty());
+    assert!(!std::path::Path::new(&target).exists());
+}

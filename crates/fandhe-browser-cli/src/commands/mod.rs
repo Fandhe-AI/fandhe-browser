@@ -120,6 +120,8 @@ pub(crate) enum UsageError {
     },
     /// オプションの値が不正（オプション名）。
     InvalidOptionValue { option: &'static str },
+    /// 認識はするが現時点では未対応のオプション（オプション名。成功を装わず拒否する。REPAIR-3）。
+    UnsupportedOption(&'static str),
 }
 
 /// 利用者入力を端末へ安全に出すため、エスケープして長さを切り詰める。
@@ -153,6 +155,9 @@ impl fmt::Display for UsageError {
             }
             Self::InvalidOptionValue { option } => {
                 write!(f, "invalid value for option '{option}'")
+            }
+            Self::UnsupportedOption(option) => {
+                write!(f, "option '{option}' is not supported yet")
             }
         }
     }
@@ -506,6 +511,8 @@ mod tests {
         );
         let i = UsageError::InvalidOptionValue { option: "--attr" };
         assert_eq!(i.to_string(), "invalid value for option '--attr'");
+        let u = UsageError::UnsupportedOption("--full-page");
+        assert_eq!(u.to_string(), "option '--full-page' is not supported yet");
     }
 
     #[test]

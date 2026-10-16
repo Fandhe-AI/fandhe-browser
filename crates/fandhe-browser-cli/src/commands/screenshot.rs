@@ -1,6 +1,6 @@
 //! スクリーンショット取得コマンド `screenshot`（TASK-47.5・Issue #286・`CLI-1`・MS-5）。
 //!
-//! `screenshot [--full-page] [--] <URL> <OUTPUT>` はプロセス内で描画ホスト（`render_host` が解決する
+//! `screenshot [--] <URL> <OUTPUT>` はプロセス内で描画ホスト（`render_host` が解決する
 //! `HostRenderer`）へ URL を 1 回読み込ませ、PNG を `OUTPUT` に書いて 1 行を stdout へ出し終了する
 //! （one-shot）。実行中の `launch` インスタンスや直前の `navigate` で開いたページは参照できない
 //! （navigate.rs と同じ理由。ai に `/ai/navigate` が無く、CDP クライアントには新規依存が要るため）。
@@ -19,6 +19,9 @@
 //!
 //! - 出力形式 `width=<W> height=<H> bytes=<N> url=<final_url>` は暫定。`CLI-3` の確定と合わせて見直す
 //! - `--profile`: #287（TASK-47.6）で [`ScreenshotCommandOptions`] に追加する
+//! - `--full-page`: v1 の描画ホストが未対応（固定ビューポート 1280x800。`servo-host-design.md` §2.3・
+//!   `SEC-2`）のため、解析時に usage エラーで拒否する。出力は常にビューポートの画像。ホストが対応したら
+//!   `ScreenshotOptions::with_full_page` を配線する（`RENDER-1`・`REPAIR-3`）
 //! - 上書きオプション・stdout への出力（`-`）・クリップやスケールの指定は未対応
 //! - `screenshot --help`: ハンドラは出力先を受け取らないため未対応（トップレベルの `--help` には載る）
 //! - DNS 名がプライベート IP へ解決される場合とリバインディングは `HostRenderer` の既知の制約
@@ -54,15 +57,12 @@ pub(crate) struct ScreenshotCommandOptions {
     pub(crate) url: String,
     /// 出力先ファイルパス（PNG）。
     pub(crate) output: PathBuf,
-    /// ビューポート外も含めてページ全体を取得する。
-    pub(crate) full_page: bool,
 }
 
 /// `screenshot` の引数を解析する（副作用なし）。`--` より後ろはすべて位置引数として扱う。
 pub(crate) fn parse_screenshot_args(
     args: &CommandArgs,
 ) -> Result<ScreenshotCommandOptions, UsageError> {
-    let mut full_page = false;
     let mut positionals: Vec<&String> = Vec::new();
     let mut only_positionals = false;
     for arg in args.as_slice() {
@@ -72,12 +72,7 @@ pub(crate) fn parse_screenshot_args(
         }
         match arg.as_str() {
             "--" => only_positionals = true,
-            "--full-page" => {
-                if full_page {
-                    return Err(UsageError::UnexpectedArgument(arg.clone()));
-                }
-                full_page = true;
-            }
+            "--full-page" => return Err(UsageError::UnsupportedOption("--full-page")),
             _ => return Err(UsageError::UnknownOption(arg.clone())),
         }
     }
@@ -90,7 +85,6 @@ pub(crate) fn parse_screenshot_args(
     Ok(ScreenshotCommandOptions {
         url: url.clone(),
         output: PathBuf::from(output),
-        full_page,
     })
 }
 
@@ -272,7 +266,7 @@ pub(crate) fn capture_with(
         .load(&PageRef::new(options.url.clone()))
         .map_err(ScreenshotError::Render)?;
     let shot = renderer
-        .capture_screenshot(&ScreenshotOptions::new().with_full_page(options.full_page))
+        .capture_screenshot(&ScreenshotOptions::new())
         .map_err(ScreenshotError::Render)?;
     match shot.format {
         ImageFormat::Png => {}
@@ -339,11 +333,10 @@ mod tests {
         CommandArgs::new(v.iter().map(|s| s.to_string()).collect())
     }
 
-    fn opts(url: &str, full_page: bool) -> ScreenshotCommandOptions {
+    fn opts(url: &str) -> ScreenshotCommandOptions {
         ScreenshotCommandOptions {
             url: url.to_string(),
             output: PathBuf::from("out.png"),
-            full_page,
         }
     }
 
@@ -406,23 +399,10 @@ mod tests {
         let base = ScreenshotCommandOptions {
             url: "https://a.example/".into(),
             output: PathBuf::from("o.png"),
-            full_page: false,
         };
         assert_eq!(
             parse_screenshot_args(&args(&["https://a.example/", "o.png"])).unwrap(),
             base
-        );
-        let full = ScreenshotCommandOptions {
-            full_page: true,
-            ..base.clone()
-        };
-        assert_eq!(
-            parse_screenshot_args(&args(&["--full-page", "https://a.example/", "o.png"])).unwrap(),
-            full
-        );
-        assert_eq!(
-            parse_screenshot_args(&args(&["https://a.example/", "o.png", "--full-page"])).unwrap(),
-            full
         );
         let dashed = parse_screenshot_args(&args(&["--", "https://a.example/", "-out.png"]));
         assert_eq!(dashed.unwrap().output, PathBuf::from("-out.png"));
@@ -451,10 +431,19 @@ mod tests {
             parse_screenshot_args(&args(&["--full-page=1", "u", "o"])).unwrap_err(),
             UsageError::UnknownOption("--full-page=1".into())
         );
-        assert_eq!(
-            parse_screenshot_args(&args(&["--full-page", "--full-page", "u", "o"])).unwrap_err(),
-            UsageError::UnexpectedArgument("--full-page".into())
-        );
+        let unsupported = UsageError::UnsupportedOption("--full-page");
+        for form in [
+            ["--full-page", "u", "o"],
+            ["u", "--full-page", "o"],
+            ["u", "o", "--full-page"],
+        ] {
+            assert_eq!(
+                parse_screenshot_args(&args(&form)).unwrap_err(),
+                unsupported
+            );
+        }
+        // `--` より後ろは位置引数として扱うため拒否されない。
+        assert!(parse_screenshot_args(&args(&["--", "--full-page", "o"])).is_ok());
     }
 
     /// `CLI-1`: 存在しないディレクトリ配下は panic せずエラーになる。
@@ -517,26 +506,22 @@ mod tests {
         ));
     }
 
-    /// `CLI-1`: 成功モックから final_url・寸法・バイト列が返り、full_page が渡る。
+    /// `CLI-1`: 成功モックから final_url・寸法・バイト列が返り、ビューポートのみを要求する。
     #[test]
-    fn cli1_screenshot_capture_with_returns_result_and_passes_full_page() {
+    fn cli1_screenshot_capture_with_returns_result_and_requests_viewport_only() {
         let mock = Mock::ok();
-        let (shot, url) = capture_with(&mock, &opts("https://a.example/", true)).unwrap();
+        let (shot, url) = capture_with(&mock, &opts("https://a.example/")).unwrap();
         assert_eq!(url, "https://a.example/");
         assert_eq!((shot.width, shot.height), (2, 3));
         assert_eq!(shot.data, vec![0x89, b'P', b'N', b'G', 1, 2, 3]);
-        assert_eq!(*mock.full_pages.lock().unwrap(), vec![true]);
+        assert_eq!(*mock.full_pages.lock().unwrap(), vec![false]);
         assert_eq!(*mock.loads.lock().unwrap(), vec!["https://a.example/"]);
-        let mock2 = Mock::ok();
-        capture_with(&mock2, &opts("https://a.example/", false)).unwrap();
-        assert_eq!(*mock2.full_pages.lock().unwrap(), vec![false]);
     }
 
     /// `CLI-1`: 無効レンダラーは成功を装わず固定文言で失敗する。
     #[test]
     fn cli1_screenshot_disabled_renderer_fails_closed() {
-        let err =
-            capture_with(&DisabledRenderer::new(), &opts("https://a.example/", false)).unwrap_err();
+        let err = capture_with(&DisabledRenderer::new(), &opts("https://a.example/")).unwrap_err();
         assert!(matches!(
             err,
             ScreenshotError::Render(RenderError::RenderingDisabled)
@@ -562,7 +547,7 @@ mod tests {
             ),
         ];
         for (f, expected) in cases {
-            let err = capture_with(&Mock::with(f), &opts("https://a.example/", false)).unwrap_err();
+            let err = capture_with(&Mock::with(f), &opts("https://a.example/")).unwrap_err();
             assert_eq!(err.to_string(), expected);
             assert!(!format!("{err:?}").contains("secret"));
         }
@@ -584,7 +569,7 @@ mod tests {
         ];
         for (url, needle) in cases {
             let mock = Mock::ok();
-            let err = capture_with(&mock, &opts(&url, false)).unwrap_err();
+            let err = capture_with(&mock, &opts(&url)).unwrap_err();
             assert!(err.to_string().contains(needle), "{url}: {err}");
             assert!(mock.loads.lock().unwrap().is_empty());
         }
