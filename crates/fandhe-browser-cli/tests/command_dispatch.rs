@@ -158,3 +158,73 @@ fn cli1_navigate_rejects_loopback_by_default() {
     assert!(out.stderr.contains("not allowed"), "stderr: {}", out.stderr);
     assert!(out.stdout.is_empty());
 }
+
+#[test]
+fn cli1_query_without_arguments_exits_with_usage_error() {
+    let out = run("query-none", &["query"]);
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: missing required argument 'URL'; run 'fandhe-browser --help' for usage"
+    );
+    assert!(!out.stderr.contains("DevTools listening"));
+}
+
+#[test]
+fn cli1_query_without_selector_exits_with_usage_error() {
+    let out = run("query-nosel", &["query", "https://a.example/"]);
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: missing required argument 'SELECTOR'; run 'fandhe-browser --help' for usage"
+    );
+}
+
+#[test]
+fn cli1_query_conflicting_options_exit_with_usage_error() {
+    let out = run(
+        "query-conflict",
+        &[
+            "query",
+            "--all",
+            "--attr",
+            "href",
+            "https://a.example/",
+            "a",
+        ],
+    );
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: options '--all' and '--attr' cannot be used together; run 'fandhe-browser --help' for usage"
+    );
+}
+
+#[test]
+fn cli1_query_unknown_option_exits_with_usage_error() {
+    let out = run(
+        "query-bogus",
+        &["query", "--bogus", "https://a.example/", "a"],
+    );
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: unknown option '--bogus'; run 'fandhe-browser --help' for usage"
+    );
+}
+
+#[test]
+fn cli1_query_invalid_url_exits_with_error() {
+    let out = run("query-invalid", &["query", "not-a-url", "h1"]);
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(out.stderr.trim(), "error: invalid URL");
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn cli1_query_rejects_loopback_by_default() {
+    let out = run("query-loopback", &["query", "http://127.0.0.1:9/", "h1"]);
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("not allowed"), "stderr: {}", out.stderr);
+    assert!(out.stdout.is_empty());
+}

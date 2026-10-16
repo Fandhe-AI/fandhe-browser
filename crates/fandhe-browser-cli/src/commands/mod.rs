@@ -20,6 +20,9 @@ use crate::server::StartupError;
 
 pub(crate) mod launch;
 pub(crate) mod navigate;
+pub(crate) mod query;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 /// usage エラー時の終了コード（`StartupError` 系の 1 と区別する）。
 const USAGE_EXIT_CODE: u8 = 2;
@@ -71,8 +74,8 @@ pub(crate) struct CommandSpec {
     pub(crate) run: Handler,
 }
 
-/// 本番の登録表。`launch`（#283）・`navigate`（#284）を登録済み。残りは #285〜#287 が追加する。
-pub(crate) const COMMANDS: &[CommandSpec] = &[launch::SPEC, navigate::SPEC];
+/// 本番の登録表。`launch`（#283）・`navigate`（#284）を登録済み。残りは #286〜#287 が追加する。
+pub(crate) const COMMANDS: &[CommandSpec] = &[launch::SPEC, navigate::SPEC, query::SPEC];
 
 /// ディスパッチ先の一式。
 #[derive(Debug, Clone, Copy)]
@@ -108,6 +111,13 @@ pub(crate) enum UsageError {
     UnexpectedArgument(String),
     /// 必須の位置引数が無い（引数名）。
     MissingArgument(&'static str),
+    /// 同時に指定できないオプションの組（先に現れた方・後に現れた方）。
+    ConflictingOptions {
+        first: &'static str,
+        second: &'static str,
+    },
+    /// オプションの値が不正（オプション名）。
+    InvalidOptionValue { option: &'static str },
 }
 
 /// 利用者入力を端末へ安全に出すため、エスケープして長さを切り詰める。
@@ -133,6 +143,15 @@ impl fmt::Display for UsageError {
             Self::UnknownOption(name) => write!(f, "unknown option '{}'", sanitize(name)),
             Self::UnexpectedArgument(a) => write!(f, "unexpected argument '{}'", sanitize(a)),
             Self::MissingArgument(name) => write!(f, "missing required argument '{name}'"),
+            Self::ConflictingOptions { first, second } => {
+                write!(
+                    f,
+                    "options '{first}' and '{second}' cannot be used together"
+                )
+            }
+            Self::InvalidOptionValue { option } => {
+                write!(f, "invalid value for option '{option}'")
+            }
         }
     }
 }
@@ -149,6 +168,8 @@ pub(crate) enum CommandError {
     Startup(StartupError),
     /// `navigate` の失敗。
     Navigate(navigate::NavigateError),
+    /// `query` の失敗。
+    Query(query::QueryError),
     /// 標準出力への書き込み失敗。
     Output(io::Error),
 }
@@ -169,6 +190,7 @@ impl fmt::Display for CommandError {
             Self::Usage(e) => write!(f, "{e}; run 'fandhe-browser --help' for usage"),
             Self::Startup(e) => write!(f, "{e}"),
             Self::Navigate(e) => write!(f, "{e}"),
+            Self::Query(e) => write!(f, "{e}"),
             Self::Output(_) => f.write_str("failed to write output"),
         }
     }
@@ -180,6 +202,7 @@ impl std::error::Error for CommandError {
             Self::Usage(e) => Some(e),
             Self::Startup(e) => Some(e),
             Self::Navigate(e) => Some(e),
+            Self::Query(e) => Some(e),
             Self::Output(e) => Some(e),
         }
     }
@@ -200,6 +223,12 @@ impl From<StartupError> for CommandError {
 impl From<navigate::NavigateError> for CommandError {
     fn from(e: navigate::NavigateError) -> Self {
         Self::Navigate(e)
+    }
+}
+
+impl From<query::QueryError> for CommandError {
+    fn from(e: query::QueryError) -> Self {
+        Self::Query(e)
     }
 }
 
@@ -418,6 +447,37 @@ mod tests {
             text.contains("navigate     Fetch a URL once and print the final URL and status"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn cli1_help_lists_query() {
+        let registry = Registry {
+            default: default_ok,
+            commands: COMMANDS,
+        };
+        let mut out = Vec::new();
+        dispatch(os(&["--help"]), &registry, &mut out).expect("help succeeds");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(
+                "query        Fetch a URL once and print text or an attribute of elements matching a CSS selector"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn cli1_conflicting_and_invalid_option_display() {
+        let c = UsageError::ConflictingOptions {
+            first: "--all",
+            second: "--attr",
+        };
+        assert_eq!(
+            c.to_string(),
+            "options '--all' and '--attr' cannot be used together"
+        );
+        let i = UsageError::InvalidOptionValue { option: "--attr" };
+        assert_eq!(i.to_string(), "invalid value for option '--attr'");
     }
 
     #[test]

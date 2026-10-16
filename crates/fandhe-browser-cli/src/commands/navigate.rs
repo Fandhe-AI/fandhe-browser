@@ -4,7 +4,8 @@
 //! ステータスを stdout に 1 行出して終了する（one-shot）。実行中の `launch` インスタンスへ接続する
 //! 方式は採らない（ai に `/ai/navigate` が無く、CDP クライアントには新規依存が要るため。#281 で依存追加は禁止）。
 //! そのため後続の query（#285）・screenshot（#286）は「直前の CLI 呼び出しで開いたページ」を参照できない。
-//! 取得の中核 [`navigate_with`] を `pub(crate)` で置き、後続コマンドが再利用できるようにしている。
+//! 取得の中核 [`fetch_page`] を `pub(crate)` で置き、query・screenshot が再利用できるようにしている
+//! （URL 長検査・SSRF 検証を経由しない取得経路を作らないため、取得はここに一本化する）。
 //!
 //! `cfg(target_os)` 分岐は置かず 3 OS で同一の引数体系・挙動とする（`CLI-1`）。
 //! 取得は `FetchOptions::default()`（ループバック・プライベートアドレスを拒否する SSRF 安全側の既定）で行い、
@@ -23,7 +24,7 @@
 use std::fmt;
 use std::io::{self, Write};
 
-use fandhe_browser_core::{Error, FetchOptions, Fetcher};
+use fandhe_browser_core::{Error, FetchOptions, FetchResponse, Fetcher};
 
 use super::{CommandArgs, CommandError, CommandOutcome, CommandSpec, UsageError};
 
@@ -135,29 +136,48 @@ impl From<Error> for NavigateError {
     }
 }
 
-/// 取得の中核。URL 長検査 → `about:blank` 特例 → 事前検証 → 取得。#285・#286 が再利用する。
-pub(crate) async fn navigate_with(
-    fetcher: &Fetcher,
-    url: &str,
-) -> Result<NavigateOutput, NavigateError> {
+/// [`fetch_page`] の結果。
+#[derive(Debug)]
+#[non_exhaustive]
+pub(crate) enum FetchedPage {
+    /// `about:blank`。取得せず、本文も無い。
+    Blank,
+    /// 取得済みの応答（4xx/5xx も完了したナビゲーションとして含む）。
+    Fetched(FetchResponse),
+}
+
+/// 取得の中核。URL 長検査 → `about:blank` 特例 → 事前検証 → 取得 → 最終 URL 長検査。
+///
+/// `navigate_with` のほか、query（#285）・screenshot（#286）が呼ぶ。
+pub(crate) async fn fetch_page(fetcher: &Fetcher, url: &str) -> Result<FetchedPage, NavigateError> {
     if url.len() > MAX_URL_LEN {
         return Err(NavigateError::UrlTooLong { limit: MAX_URL_LEN });
     }
     if url == "about:blank" {
-        return Ok(NavigateOutput {
-            final_url: url.to_string(),
-            status: None,
-        });
+        return Ok(FetchedPage::Blank);
     }
     fetcher.validate_url(url)?;
     let response = fetcher.get(url).await?;
-    let final_url = response.final_url().to_string();
-    if final_url.len() > MAX_URL_LEN {
+    if response.final_url().len() > MAX_URL_LEN {
         return Err(NavigateError::UrlTooLong { limit: MAX_URL_LEN });
     }
-    Ok(NavigateOutput {
-        final_url,
-        status: Some(response.status()),
+    Ok(FetchedPage::Fetched(response))
+}
+
+/// `navigate` の中核。[`fetch_page`] の結果を最終 URL とステータスへ写す。
+pub(crate) async fn navigate_with(
+    fetcher: &Fetcher,
+    url: &str,
+) -> Result<NavigateOutput, NavigateError> {
+    Ok(match fetch_page(fetcher, url).await? {
+        FetchedPage::Blank => NavigateOutput {
+            final_url: url.to_string(),
+            status: None,
+        },
+        FetchedPage::Fetched(response) => NavigateOutput {
+            final_url: response.final_url().to_string(),
+            status: Some(response.status()),
+        },
     })
 }
 
@@ -179,41 +199,12 @@ fn run(args: CommandArgs) -> Result<CommandOutcome, CommandError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use crate::commands::test_support::{block_on, loopback_fetcher, serve_once};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
-    use std::time::Duration;
 
     fn args(v: &[&str]) -> CommandArgs {
         CommandArgs::new(v.iter().map(|s| s.to_string()).collect())
-    }
-
-    fn block_on<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime builds")
-            .block_on(f)
-    }
-
-    /// 1 接続だけ受け付け、固定の応答を返すループバックサーバー。ポート番号を返す。
-    fn serve_once(response: &'static str) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            if let Ok((mut s, _)) = listener.accept() {
-                let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
-                let mut buf = [0u8; 2048];
-                let _ = s.read(&mut buf);
-                let _ = s.write_all(response.as_bytes());
-            }
-        });
-        port
-    }
-
-    fn loopback_fetcher() -> Fetcher {
-        Fetcher::new(FetchOptions::new().with_allow_private_network_access(true))
-            .expect("fetcher builds")
     }
 
     #[test]
