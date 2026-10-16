@@ -19,6 +19,7 @@ use std::process::ExitCode;
 use crate::server::StartupError;
 
 pub(crate) mod launch;
+pub(crate) mod navigate;
 
 /// usage エラー時の終了コード（`StartupError` 系の 1 と区別する）。
 const USAGE_EXIT_CODE: u8 = 2;
@@ -70,8 +71,8 @@ pub(crate) struct CommandSpec {
     pub(crate) run: Handler,
 }
 
-/// 本番の登録表。`launch`（#283）を登録済み。ナビゲーション等は #284〜#287 が追加する。
-pub(crate) const COMMANDS: &[CommandSpec] = &[launch::SPEC];
+/// 本番の登録表。`launch`（#283）・`navigate`（#284）を登録済み。残りは #285〜#287 が追加する。
+pub(crate) const COMMANDS: &[CommandSpec] = &[launch::SPEC, navigate::SPEC];
 
 /// ディスパッチ先の一式。
 #[derive(Debug, Clone, Copy)]
@@ -105,6 +106,8 @@ pub(crate) enum UsageError {
     UnknownOption(String),
     /// 余分な位置引数。
     UnexpectedArgument(String),
+    /// 必須の位置引数が無い（引数名）。
+    MissingArgument(&'static str),
 }
 
 /// 利用者入力を端末へ安全に出すため、エスケープして長さを切り詰める。
@@ -129,6 +132,7 @@ impl fmt::Display for UsageError {
             Self::UnknownCommand(name) => write!(f, "unknown command '{}'", sanitize(name)),
             Self::UnknownOption(name) => write!(f, "unknown option '{}'", sanitize(name)),
             Self::UnexpectedArgument(a) => write!(f, "unexpected argument '{}'", sanitize(a)),
+            Self::MissingArgument(name) => write!(f, "missing required argument '{name}'"),
         }
     }
 }
@@ -143,6 +147,8 @@ pub(crate) enum CommandError {
     Usage(UsageError),
     /// サーバー起動系の失敗（従来の `error: ...` 文言を維持するため委譲する）。
     Startup(StartupError),
+    /// `navigate` の失敗。
+    Navigate(navigate::NavigateError),
     /// 標準出力への書き込み失敗。
     Output(io::Error),
 }
@@ -162,6 +168,7 @@ impl fmt::Display for CommandError {
         match self {
             Self::Usage(e) => write!(f, "{e}; run 'fandhe-browser --help' for usage"),
             Self::Startup(e) => write!(f, "{e}"),
+            Self::Navigate(e) => write!(f, "{e}"),
             Self::Output(_) => f.write_str("failed to write output"),
         }
     }
@@ -172,6 +179,7 @@ impl std::error::Error for CommandError {
         match self {
             Self::Usage(e) => Some(e),
             Self::Startup(e) => Some(e),
+            Self::Navigate(e) => Some(e),
             Self::Output(e) => Some(e),
         }
     }
@@ -186,6 +194,12 @@ impl From<UsageError> for CommandError {
 impl From<StartupError> for CommandError {
     fn from(e: StartupError) -> Self {
         Self::Startup(e)
+    }
+}
+
+impl From<navigate::NavigateError> for CommandError {
+    fn from(e: navigate::NavigateError) -> Self {
+        Self::Navigate(e)
     }
 }
 
@@ -387,6 +401,21 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert!(
             text.contains("launch       Start the CDP/AI API server with the default profile"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn cli1_help_lists_navigate() {
+        let registry = Registry {
+            default: default_ok,
+            commands: COMMANDS,
+        };
+        let mut out = Vec::new();
+        dispatch(os(&["--help"]), &registry, &mut out).expect("help succeeds");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("navigate     Fetch a URL once and print the final URL and status"),
             "{text}"
         );
     }

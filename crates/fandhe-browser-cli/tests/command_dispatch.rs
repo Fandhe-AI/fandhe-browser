@@ -130,3 +130,31 @@ fn cli1_launch_and_no_args_share_startup_path() {
     assert_eq!(launch.code, bare.code);
     assert_eq!(launch.stderr, bare.stderr);
 }
+
+#[test]
+fn cli1_navigate_without_url_exits_with_usage_error() {
+    let out = run("nav-missing", &["navigate"]);
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: missing required argument 'URL'; run 'fandhe-browser --help' for usage"
+    );
+    assert!(!out.stderr.contains("DevTools listening"));
+}
+
+#[test]
+fn cli1_navigate_invalid_url_exits_with_error() {
+    let out = run("nav-invalid", &["navigate", "not-a-url"]);
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(out.stderr.trim(), "error: invalid URL");
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.contains("DevTools listening"));
+}
+
+#[test]
+fn cli1_navigate_rejects_loopback_by_default() {
+    let out = run("nav-loopback", &["navigate", "http://127.0.0.1:9/"]);
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("not allowed"), "stderr: {}", out.stderr);
+    assert!(out.stdout.is_empty());
+}
