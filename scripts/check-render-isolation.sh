@@ -19,8 +19,8 @@
 #      部分文字列 boa に一致するため部分一致にしない。前方一致 fandhe-browser-* もホスト自身
 #      を誤検出するため使わない）
 #   E. servo-host の依存ツリーに webgl|webgpu|mozangle|gstreamer|lgpl 系が無いこと。
-#      ただし mozangle は Windows ターゲットに限り許す（`no-wgl`・ANGLE。#999）ため、ターゲットごとに
-#      検査し、非 Windows では mozangle を含め、Windows では除いたパターンで判定する
+#      ただし mozangle は Windows ターゲットに限り許す（`no-wgl`・ANGLE。#999）ため、mozangle 以外は
+#      --target all 全体に適用し、mozangle は非 Windows ターゲットごとに判定する
 #      （既定で無効にしたはずの GPU・メディア・LGPL 系の混入検出）
 #   servo-host の manifest / Cargo.lock が無い場合は D・E を NG とする（fail-closed）。
 #
@@ -49,9 +49,8 @@ SERVO_PATTERN='servo'
 HOST_FORBIDDEN_PATTERN='webgl|webgpu|mozangle|gstreamer|lgpl'
 # E 用（Windows ターゲット）: Windows は `no-wgl` で mozangle（ANGLE）を許す（#999）。
 HOST_FORBIDDEN_PATTERN_WINDOWS='webgl|webgpu|gstreamer|lgpl'
-# E 用: ターゲット別に検査する。servo-host/deny.toml の [graph] targets と揃える。
+# E 用: mozangle を禁止する非 Windows ターゲット。servo-host/deny.toml の [graph] targets と揃える。
 HOST_TARGETS_NON_WINDOWS=(x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin)
-HOST_TARGETS_WINDOWS=(x86_64-pc-windows-msvc)
 # D 用: メンバー以外に、ホストへ入ってはならない JS エンジンの package 名。
 JS_ENGINE_NAMES=$'v8\nboa_engine'
 
@@ -343,17 +342,18 @@ else
       detect_exact "servo-host" "${MEMBER_NAMES}"$'\n'"${JS_ENGINE_NAMES}" "$OUT_HOST" || STATUS=1
     fi
     # 検査 E
-    # ターゲット別に取得する（取得失敗は NG。fail-closed）。非 Windows は mozangle を含めて、
-    # Windows は除いたパターンで判定する。
-    for t in "${HOST_TARGETS_NON_WINDOWS[@]}" "${HOST_TARGETS_WINDOWS[@]}"; do
+    # mozangle 以外の禁止パターンは従来どおり --target all の出力全体に適用する
+    # （musl・aarch64 Windows 等、固定ターゲット外に限定された依存も検出する）。
+    detect "servo-host" "$HOST_FORBIDDEN_PATTERN_WINDOWS" "$OUT_HOST" || STATUS=1
+    # mozangle は Windows ターゲットだけ許すため、非 Windows ターゲットごとに全パターンで判定する
+    # （取得失敗は NG。fail-closed）。
+    for t in "${HOST_TARGETS_NON_WINDOWS[@]}"; do
       if ! OUT_T=$(cargo tree --manifest-path "$HOST_MANIFEST" --locked -e normal,build,dev --prefix none --target "$t"); then
         echo "NG: cargo tree (servo-host, target $t) failed" >&2
         STATUS=1
         continue
       fi
-      pat="$HOST_FORBIDDEN_PATTERN"
-      case "$t" in *-windows-*) pat="$HOST_FORBIDDEN_PATTERN_WINDOWS" ;; esac
-      detect "servo-host ($t)" "$pat" "$OUT_T" || STATUS=1
+      detect "servo-host ($t)" "$HOST_FORBIDDEN_PATTERN" "$OUT_T" || STATUS=1
     done
   fi
 fi
