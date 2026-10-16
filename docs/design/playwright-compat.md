@@ -432,7 +432,31 @@ id 7・11・13・15・16・17・18。
 **実測**（`playwright-core` 1.63.0。トレースを再取得し 2 回の実行で同一出力）: id 13 は `{"identifier":"1"}`、id 15 は `{}` で成功する。
 `newPage` の失敗は `browserContext.newPage: Frame has been detached.` のまま変わらない。`failed` の残りは id 7・16・17・18。
 
-次の作業: #1041・#1042（`Emulation.*` 等）。frame id と targetId の関係は別途判断が要る。
+次の作業: #1041・#1042（`Emulation.*` 等）。frame id と targetId の関係は段階 3f（#1050）で解決した。
+
+### 段階 3f の実施結果（TASK-43.3o・#1050。実測 A）
+
+**実装範囲**（`CDP-2`・`REPAIR-3`・`SEC-2`）: メインフレームの frame ID を、ターゲットあり（`sessionId` 付き）なら targetId と同じ値にした
+（Chrome と同じ約束事。playwright-core 1.63.0 の `CRPage._sessionForFrame` が前提とする）。
+
+| 箇所 | frame ID |
+| ---- | -------- |
+| `Page.getFrameTree` の `frame.id` | targetId |
+| `Page.frameNavigated` の `frame.id` | targetId |
+| `Page.lifecycleEvent` の `frameId` | targetId |
+| `Page.navigate` 応答の `frameId`（成功・失敗・追い越しの全経路） | targetId |
+| `sessionId` なしのブラウザレベル `Page.navigate` | 従来どおり `"main"`（targetId が無いためのフォールバック。既存の期待値を変えない） |
+
+- `Page.loadEventFired` は `frameId` を持たない（CDP 仕様どおり）ため変更なし。`Page.navigate` の `frameId` パラメータは従来どおり無視する。
+  `frameId` を入力に取る既存メソッドは無い。子フレームのモデルは持たない（`REPAIR-3`）。
+- 識別面（UA・ヘッダ・`navigator`・画面・TLS・locale）には触れない（`SEC-2`）。
+- 期待値を変えたテストは、セッション付きの frame ID が `"main"` から targetId になった仕様変更によるもので、弱体化ではない。
+
+**実測**（`playwright-core` 1.63.0。トレースを再取得し 2 回の実行で同一出力）: `Page.getFrameTree` の `frame.id` は targetId になり、
+`browserContext.newPage: Frame has been detached.` は解消した。次の送信 `Page.createIsolatedWorld`（id 20）は `-32601`、`newPage` は
+`Emulation.setFocusEmulationEnabled` の Protocol error（`method not implemented`）で失敗する。`failed` は id 7・16・17・18・20。
+
+次の作業: #1041・#1042（`Emulation.*`・`Page.createIsolatedWorld` 等）。
 
 ### 段階 3e の実施結果（TASK-43.3m・#1041。実測 A と種別 B）
 
@@ -466,7 +490,9 @@ id 7・11・13・15・16・17・18。
 **実測 2 回目**（実装後。2 回の実行で同一出力）: `Emulation.setFocusEmulationEnabled`（id 15）・`Emulation.setEmulatedMedia`（id 16）は `{}` で成功し、
 `failed` から消えた。同梱の `newpage-trace.jsonl` では id 12（空 source の `Page.addScriptToEvaluateOnNewDocument`）は `{"identifier":"1"}`、
 id 14（セッション付き `Target.setAutoAttach`）は `{}` で成功し（#1040 で対応済み）、`failed` は空で CDP エラーは無い。
-`newPage` の失敗は `browserContext.newPage: Frame has been detached.` のまま変わらない。
+TASK-43.3o（#1050）の取り込み後に再取得した同梱トレース（3 回の実行で同一出力）では `Frame has been detached.` が解消し、`newPage` は成功する
+（stage の `ok:true`）。直後に `Page.createIsolatedWorld`（id 18）が送られるが、`newPage` は応答を待たないためトレースに応答（実際は未実装の `-32601`）は
+記録されず、`Target.closeTarget` も送られない。`failed` は空のまま。
 
 次の作業: #1042（ページ初期化メソッド群の残り）。
 

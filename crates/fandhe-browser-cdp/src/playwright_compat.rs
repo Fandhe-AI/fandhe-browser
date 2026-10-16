@@ -36,7 +36,7 @@ use crate::conn_state::{
     ConnStateError, DownloadBehavior, DownloadSettings, validate_download_path,
 };
 use crate::discovery::{PRODUCT, PROTOCOL_VERSION};
-use crate::page::{MAIN_FRAME_ID, MAIN_FRAME_MIME_TYPE};
+use crate::page::MAIN_FRAME_MIME_TYPE;
 use crate::protocol::{
     BoxFuture, CdpError, CdpEvent, CommandContext, CommandHandler, HandlerOutput,
 };
@@ -815,7 +815,7 @@ impl CommandHandler for NetworkEnable {
 /// `Page.getFrameTree`（`CDP-2`・TASK-43.3i・#1037）。
 ///
 /// `sessionId` 付きで、メインフレームだけの `frameTree` を返す。`Page.enable` は前提にしない（Chromium と同じ）。
-/// 読み取り専用で、遷移も状態作成もしない。`frame.id` は `Page.frameNavigated` と同じ [`MAIN_FRAME_ID`]。
+/// 読み取り専用で、遷移も状態作成もしない。`frame.id` は targetId（`Page.frameNavigated` と同じ値。TASK-43.3o・#1050）。
 /// 止めたターゲットでも応答し、`url` は `about:blank`、`loaderId` は再開前後で同じ値
 /// （[`crate::navigation::TargetNavigations::frame_snapshot`]）。
 ///
@@ -849,7 +849,7 @@ impl CommandHandler for PageGetFrameTree {
             Ok(HandlerOutput::result(json!({
                 "frameTree": {
                     "frame": {
-                        "id": MAIN_FRAME_ID,
+                        "id": tid.as_str(),
                         "loaderId": snap.loader_id,
                         "url": snap.url,
                         "mimeType": MAIN_FRAME_MIME_TYPE,
@@ -2461,6 +2461,16 @@ mod tests {
             f[1]["params"]["sessionId"].as_str().unwrap().to_owned()
         }
 
+        /// セッションのターゲットの targetId 文字列（メインフレームの frame ID と一致するはずの値）。
+        fn target_of(st: &Arc<CdpState>, sid: &str) -> String {
+            let s = SessionId::parse(sid).unwrap();
+            st.registry()
+                .session_target(&s)
+                .unwrap()
+                .as_str()
+                .to_owned()
+        }
+
         #[tokio::test]
         async fn cdp2_page_enable_with_session_returns_empty_and_is_idempotent() {
             let dir = TempDir::new();
@@ -2771,12 +2781,13 @@ mod tests {
             let st = state(&dir);
             let c = open_conn(&st, 1);
             let sid = attached_session(&st, c).await;
+            let tid = target_of(&st, &sid);
             let f = call(&st, Some(c), &sreq(2, "Page.getFrameTree", &sid, "{}")).await;
             assert_eq!(
                 f,
                 vec![
                     json!({"id":2,"sessionId":sid,"result":{"frameTree":{"frame":{
-                    "id":"main","loaderId":"2","url":"about:blank","mimeType":"text/html"}}}})
+                    "id":tid,"loaderId":"2","url":"about:blank","mimeType":"text/html"}}}})
                 ]
             );
             let frame = f[0]["result"]["frameTree"]["frame"].as_object().unwrap();
@@ -2804,9 +2815,10 @@ mod tests {
             .await;
             let f = call(&st, Some(c), &create_req(2, BLANK)).await;
             let sid = f[0]["params"]["sessionId"].as_str().unwrap().to_owned();
+            let tid = target_of(&st, &sid);
             let tree = |id: i64, loader: &str, url: &str| {
                 json!({"id":id,"sessionId":sid,"result":{"frameTree":{"frame":{
-                    "id":"main","loaderId":loader,"url":url,"mimeType":"text/html"}}}})
+                    "id":tid,"loaderId":loader,"url":url,"mimeType":"text/html"}}}})
             };
             assert_eq!(
                 call(&st, Some(c), &sreq(3, "Page.getFrameTree", &sid, "{}")).await,
@@ -3155,7 +3167,7 @@ mod tests {
                 .collect();
             assert_eq!(names, ["init", "load"]);
             for ev in [&nav[1], &nav[4]] {
-                assert_eq!(ev["params"]["frameId"], "main");
+                assert_eq!(ev["params"]["frameId"], target_of(&st, &sid).as_str());
                 assert_eq!(ev["params"]["loaderId"], loader);
                 assert_eq!(ev["sessionId"], sid.as_str());
             }

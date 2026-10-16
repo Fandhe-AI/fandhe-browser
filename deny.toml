@@ -6,11 +6,14 @@
 # 追加はユーザー承認制。Fandhe-AI/rust-ai-library の deny.toml と同一方針。
 
 [graph]
-# feature gate 配下の optional 依存（`rendering` feature の Servo 等。RENDER-1・
-# licensing.md）を既定 feature 集合のみの監査対象から漏らさないため、optional
-# 依存を含む全 feature を監査対象にする（fail-closed）。これにより Servo（MPL-2.0）
-# 追加時は [licenses] の allow に無い MPL-2.0 が検出され、`[licenses.exceptions]`
-# で明示許可するまで `make deny` が意図通り fail する。
+# feature gate 配下の optional 依存（`js-v8`・`js-boa`・`test-support` 等）を既定
+# feature 集合のみの監査対象から漏らさないため、optional 依存を含む全 feature を
+# 監査対象にする（fail-closed）。全 feature のグラフは任意の feature 構成のグラフを
+# 包含するため、この 1 回の検査で全構成を兼ねる（TASK-78.1・OSS-4。既定・エンジンなし・
+# 軽量・両エンジン同梱・全 feature の各構成で `licenses ok` を実測済み）。Servo は
+# 別 workspace の `servo-host/` に隔離しており、`servo-host/deny.toml` で検査する
+# （licensing.md・RENDER-1）。本体に MPL-2.0 等が混入すれば [licenses] の allow に
+# 無いため `make deny` が fail する。
 all-features = true
 # TASK-24.2（Issue #36・ビヘイビア CORE-1）の `fetch` 実装で追加した
 # `rustls-platform-verifier`（reqwest の推移依存）は、wasm32 ターゲット限定で
@@ -49,6 +52,7 @@ ignore = [
 ]
 
 [licenses]
+# 変更時は about.toml（cargo-about 設定。TASK-78.2）の accepted・targets も同時に更新する。
 version = 2
 include-dev = true
 # TASK-77・OSS-3（MS-1）対応: `cargo deny check licenses` による許可外ライセンス
@@ -65,9 +69,9 @@ include-dev = true
 # negative test（TASK-9.1・`make check-deny-license-reject`・#338）で継続的に
 # 検証している。
 #
-# MPL-2.0（Servo）は fandhe-browser-render crate 配下に限定する方針
-# （licensing.md・RENDER-1）のため、ここには追加しない。render crate 導入時に
-# `[licenses.exceptions]` で Servo 系 crate のみに個別許可する。
+# MPL-2.0 は本体 workspace では許可しない（fandhe-browser-render は Servo に依存しない
+# IPC クライアント）。許可するのは Servo ホストの `servo-host/deny.toml` だけ
+# （licensing.md・#915・RENDER-1・OSS-4）。
 allow = [
   "MIT",
   "Apache-2.0",

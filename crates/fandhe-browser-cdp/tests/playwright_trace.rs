@@ -36,22 +36,21 @@ const TRACE: &str = include_str!("../../../harness/playwright-trace/results/newp
 const MAX_TRACE_LINES: usize = 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
-/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3m 後）。`connectOverCDP(noDefaults:true)` は
+/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3o・43.3m 後）。`connectOverCDP(noDefaults:true)` は
 /// `Target.setAutoAttach`（`waitForDebuggerOnStart:true`）・`Target.getTargetInfo` を経て成功し、
 /// `newContext({acceptDownloads:false})` は `Target.createBrowserContext` と
 /// `browserContextId` 付き `Browser.setDownloadBehavior` を経て成功する。`newPage()` は
 /// `Target.createTarget` が成功して `Target.attachedToTarget`（`waitingForDebugger:true`）を応答の前に受け、
-/// セッション付きの初期化で、`Page.enable`・`Page.getFrameTree`（43.3i）は成功するが、`getFrameTree` の応答の処理で
-/// Playwright が `Frame has been detached.` を投げて失敗し `Target.closeTarget` を送る（`CDP-6`）。
-/// 原因は playwright-core 1.63.0 の `CRPage._sessionForFrame` が `_sessions.has(frame._id)`（セッションを targetId で
-/// 引く）を前提にすること。`frame.id` が `"main"` のままだと一致しない（`docs/design/playwright-compat.md`）。
+/// セッション付きの初期化で、`Page.enable`・`Page.getFrameTree`（43.3i）が成功する（`docs/design/playwright-compat.md`）。
 /// `Log.enable`・`Runtime.enable`・`Network.enable`（43.3j）は有効フラグを立てて `{}` を返す（イベントは送らない。`REPAIR-3`）。
 /// `Page.setLifecycleEventsEnabled`（43.3k）は有効フラグを立てて `{}` を返す。この trace は遷移を含まないため
 /// `Page.lifecycleEvent` は現れない。`Page.addScriptToEvaluateOnNewDocument`（空 `source` のみ。43.3l）は
 /// `{"identifier":"1"}`、セッション付き `Target.setAutoAttach`（43.3l）は状態を保持して `{}`（子 attach は 0 件）を返す。
 /// `Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（43.3m・#1041）は Playwright 既定値だけを受理して保持し
 /// `{}` を返す（保持値は読まれない。`REPAIR-3`）。収集は `newContext({viewport:null})` で行うため `Browser.getWindowForTarget`・
-/// `Emulation.setDeviceMetricsOverride` は送られず、`-32601` で失敗する呼び出しは無い。
+/// `Emulation.setDeviceMetricsOverride` は送られない。`getFrameTree` の `frame.id` は targetId に一致し（43.3o・#1050）、
+/// `newPage()` は成功する。直後に送られる `Page.createIsolatedWorld` は未実装（`-32601`）だが、`newPage()` は応答を待たず、
+/// トレースには応答が記録されない（`Target.closeTarget` も送られない）。
 ///
 /// 注意: `Browser.getVersion` の応答に `CARGO_PKG_VERSION` が入るため、workspace の版を上げたら
 /// `make trace-playwright` でトレースを再取得すること。
@@ -73,7 +72,7 @@ const EXPECTED_SEND_METHODS: [&str; 18] = [
     "Emulation.setFocusEmulationEnabled",
     "Emulation.setEmulatedMedia",
     "Runtime.runIfWaitingForDebugger",
-    "Target.closeTarget",
+    "Page.createIsolatedWorld",
 ];
 
 /// トレース内の `downloadPath` の正規化済みプレースホルダ（`harness/playwright-trace/lib.mjs` の
@@ -242,8 +241,7 @@ fn cdp2_playwright_trace_is_well_formed() {
         .map(|r| r["message"]["method"].as_str().expect("method is a string"))
         .collect();
     assert_eq!(sends, EXPECTED_SEND_METHODS);
-    // 現状の到達点: connectOverCDP(http) と newContext が成功し、newPage は `Target.createTarget` が
-    // 通った後、`Page.getFrameTree` の応答の処理（`Frame has been detached.`）で失敗する。
+    // 現状の到達点: connectOverCDP(http)・newContext・newPage がすべて成功する（43.3m・43.3o 後）。
     let stages: Vec<(&str, bool)> = recs
         .iter()
         .filter(|r| r["kind"] == "stage")
@@ -254,7 +252,7 @@ fn cdp2_playwright_trace_is_well_formed() {
         [
             ("connectOverCDP(http)", true),
             ("newContext", true),
-            ("newPage", false)
+            ("newPage", true)
         ]
     );
 }
@@ -315,7 +313,6 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
         .filter(|r| r["kind"] == "cdp" && r["dir"] == "recv")
         .map(|r| r["message"].clone())
         .collect();
-    let expected_len = recvs.len();
     let replayed = tokio::task::spawn_blocking(move || {
         let mut s = connect(addr);
         assert_eq!(
@@ -335,10 +332,6 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
                 }
             }
         }
-        // 最後の `Target.closeTarget` は応答の後に `Target.detachedFromTarget` を送る（CDP-5）。
-        while got.len() < expected_len {
-            got.push(read_text_json(&mut s));
-        }
         got
     })
     .await
@@ -346,6 +339,8 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
     let product = format!("fandhe-browser/{}", env!("CARGO_PKG_VERSION"));
     // セッション付きの未実装メソッド（`Log.enable` 等）は成功を装わず `-32601`（CDP-6・REPAIR-3）。
     let sid = "00000000000000000000000000000001";
+    // `Target.createTarget` 応答の targetId（sessionId とは別カウンタ。値が同じなのは偶然）。
+    let tid = "00000000000000000000000000000001";
     let version = json!({"id": 1, "result": {
         "protocolVersion": "1.3", "product": product, "userAgent": product
     }});
@@ -378,8 +373,9 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
             // `Page.enable`・`Page.getFrameTree`（43.3i）は実装済み。止めたターゲットでも初期 about:blank の
             // メインフレーム（`loaderId` は初期確定後の世代）を返す。
             json!({"id": 7, "sessionId": sid, "result": {}}),
+            // メインフレームの `frame.id` は targetId（TASK-43.3o・#1050。sessionId とは別カウンタの偶然の一致）。
             json!({"id": 8, "sessionId": sid, "result": {"frameTree": {"frame": {
-                "id": "main", "loaderId": "2", "url": "about:blank", "mimeType": "text/html"
+                "id": tid, "loaderId": "2", "url": "about:blank", "mimeType": "text/html"
             }}}}),
             // `Log.enable`・`Runtime.enable`・`Network.enable`（43.3j）は受理して `{}`（イベントなし）。
             json!({"id": 9, "sessionId": sid, "result": {}}),
@@ -396,12 +392,18 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
             json!({"id": 16, "sessionId": sid, "result": {}}),
             // 止めたセッションの `Runtime.runIfWaitingForDebugger` は実際に再開して `{}`。
             json!({"id": 17, "sessionId": sid, "result": {}}),
-            json!({"id": 18, "result": {"success": true}}),
-            json!({"method": "Target.detachedFromTarget", "params": {"sessionId": sid, "targetId": "00000000000000000000000000000001"}}),
+            // `Page.createIsolatedWorld` は未実装（`-32601`。トレースでは `newPage()` が応答を待たず未記録）。
+            json!({"id": 18, "sessionId": sid, "error": {"code": -32601, "message": "method not implemented"}}),
         ]
     );
     assert!(!artifacts.exists(), "downloadPath must not be created");
-    assert_eq!(replayed, recvs, "replay must match the recorded responses");
+    // 記録は `Page.createIsolatedWorld`（未実装で `-32601`）の応答より前に終わるため、最後の 1 件だけ記録に無い。
+    assert_eq!(
+        replayed.get(..recvs.len()),
+        Some(recvs.as_slice()),
+        "replay must match the recorded responses"
+    );
+    assert_eq!(replayed.len(), recvs.len() + 1);
 
     // 受信メソッドログ（CDP-6）がトレースの送信メソッドと一致する。
     let snap = st.received_methods();
@@ -420,12 +422,12 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
             ("Log.enable", 1, 0),
             ("Network.enable", 1, 0),
             ("Page.addScriptToEvaluateOnNewDocument", 1, 0),
+            ("Page.createIsolatedWorld", 0, 1),
             ("Page.enable", 1, 0),
             ("Page.getFrameTree", 1, 0),
             ("Page.setLifecycleEventsEnabled", 1, 0),
             ("Runtime.enable", 1, 0),
             ("Runtime.runIfWaitingForDebugger", 1, 0),
-            ("Target.closeTarget", 1, 0),
             ("Target.createBrowserContext", 1, 0),
             ("Target.createTarget", 1, 0),
             ("Target.getTargetInfo", 1, 0),
@@ -682,12 +684,9 @@ fn reach_report(recs: &[Value]) -> ReachReport {
 
 /// `newPage()` 到達状況の結合テスト（TASK-43.3f・#911、`CDP-2`・`CDP-6`・MS-4）。
 ///
-/// 現状は **未到達の事実を固定するテスト**であり、到達確認ではない。`newPage()` は 43.3i・43.3j・43.3l 後、
-/// `Page.getFrameTree` の応答の処理で `Frame has been detached.` を投げて止まる（frame id が targetId と
-/// 一致しないため。`Page.enable`・`Page.getFrameTree` 自体は成功）。ページ初期化メソッド群の実装後は、トレースを
-/// `make trace-playwright` で再取得し、`stages` がすべて成功・`first_stop` が `None`・`failed` が空
-/// （または Playwright が握りつぶすものだけ）になるよう本テストを到達確認へ切り替える（#911 は open のまま）。
-/// 期待値を緩めたり `#[ignore]` で通したりしない。
+/// 現状（43.3m・43.3o 後）は `newPage()` が成功し、トレースに記録された失敗応答は無い（stages がすべて成功・`first_stop` が
+/// `None`・`failed` が空）。ただし直後に送られる `Page.createIsolatedWorld` は未実装（`-32601`）で、`newPage()` が応答を待たないため
+/// トレースに応答が記録されないだけである（到達の完了ではない。#911 は open のまま）。期待値を緩めたり `#[ignore]` で通したりしない。
 #[test]
 fn cdp2_playwright_newpage_reach_report_lists_first_stop_and_failures() {
     let report = reach_report(&records());
@@ -702,20 +701,11 @@ fn cdp2_playwright_newpage_reach_report_lists_first_stop_and_failures() {
         [
             ("connectOverCDP(http)", true),
             ("newContext", true),
-            ("newPage", false)
+            ("newPage", true)
         ],
         "{pretty}"
     );
-    assert_eq!(
-        report.first_stop,
-        Some(FirstStop {
-            stage: "newPage".to_owned(),
-            // Protocol error ではないため method は空（`method_from_protocol_error` が `None`）。
-            method: String::new(),
-            error: "browserContext.newPage: Frame has been detached.".to_owned(),
-        }),
-        "{pretty}"
-    );
+    assert_eq!(report.first_stop, None, "{pretty}");
     let failed: Vec<(u64, &str, bool, i64, &str)> = report
         .failed
         .iter()

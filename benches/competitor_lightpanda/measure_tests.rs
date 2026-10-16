@@ -467,9 +467,11 @@ fn run_fake_sleep_parent() {
 }
 
 /// プロセスグループ終了テスト用の「孫」役。生存確認できる程度の時間
-/// （テストの期限より十分長い）だけ何もせず眠り続ける。
+/// （テストの期限より十分長い）だけ何もせず眠り続ける。Windows の CIM 照会は
+/// 初回の期限 60 秒 + 待機後の再試行（Issue #1051）まで root_pid が生存している必要が
+/// あるため、最大照会時間（約 2 分）を十分上回る 300 秒とする。テストは終了時に kill する。
 fn run_fake_sleep_grandchild() {
-    std::thread::sleep(Duration::from_secs(60));
+    std::thread::sleep(Duration::from_secs(300));
 }
 
 /// 通常のテスト実行（`--fandhe-fake-role` を伴わない起動）。`#[test]` 属性は
@@ -1804,7 +1806,8 @@ fn check_port_owner_verifies_direct_child_listener() {
 }
 
 /// PERF-3/PERF-6（TASK-84.6.2・#560、TASK-84.6.3・#561、TASK-84.6.4・#562）: ポートを所有するのが子のツリー外
-/// （このテストプロセス）なら `Mismatch` になる。
+/// （このテストプロセス）なら `Mismatch` になる。Windows の CIM 照会が断続的に
+/// 遅い問題（Issue #1051）の調査のため所要時間を stderr へ出す。
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn check_port_owner_rejects_foreign_listener() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1819,7 +1822,13 @@ fn check_port_owner_rejects_foreign_listener() {
         .spawn()
         .expect("spawn sleep-grandchild");
     let child_pid = child.id();
+    let started = std::time::Instant::now();
     let result = measure::check_port_owner(child_pid, port);
+    // Issue #1051: Windows の CIM 照会の所要時間分布を CI ログで追えるようにする。
+    eprintln!(
+        "check_port_owner (foreign listener) took {:?}",
+        started.elapsed()
+    );
     let _ = child.kill();
     let _ = child.wait();
     match result {

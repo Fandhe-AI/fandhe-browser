@@ -26,8 +26,7 @@
 //!   サイレントな切り詰めで成功を装わないためこの方針を維持する）
 //! - `sessionId` 付きの要求は、そのセッションのターゲットが最後に確定した文書
 //!   （`CdpState::navigations()`。#658）だけを返す。未遷移・遷移中・取得失敗は
-//!   `TARGET_DOCUMENT_UNAVAILABLE`（空文書を捏造しない）。`frameId` の固定値・
-//!   セッション／ターゲットに基づく決定は `CDP-2`・TASK-43（接続単位の nodeId 分離は実装済み）。
+//!   `TARGET_DOCUMENT_UNAVAILABLE`（空文書を捏造しない）。DOM 応答は `frameId` を出さない（frame ID は targetId。`CDP-2`・TASK-43.3o）。接続単位の nodeId 分離は実装済み。
 //!   `sessionId` なし（ブラウザレベル）は共有の直近 navigate 結果を読む
 //! - `<base href>` の解決は未実装。`href` 付き `base` 要素を持つ文書では `baseURL` を省略する
 //! - 採番は文書全体を走査するため、ノード数が [`MAX_NUMBERED_NODES`] を超える文書は

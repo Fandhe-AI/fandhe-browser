@@ -33,6 +33,7 @@ ignore = [
 ]
 
 [licenses]
+# 変更時は servo-host/about.toml（cargo-about 設定。TASK-78.2）の accepted・targets・例外も同時に更新する。
 version = 2
 include-dev = true
 # 本体と同じ許可集合に MPL-2.0 だけを足す。MPL-2.0 は crate ごとの例外にしない
@@ -72,8 +73,11 @@ allow-wildcard-paths = true
 # default-features = false の効果が退行して不要な描画バックエンドやコピーレフトのメディア層が
 # 入ることを検出する。「LGPL 系」を名前で表せる crate は無く、LGPL を持ち込む gstreamer 系を
 # 名前で明示し、残りは [licenses] の allow 外として二重に検出する。
+# mozangle（ANGLE。BSD-3-Clause）は Windows のみ `servo` の `no-wgl` feature 経由で入る（#999・
+# オーナー承認 2026-10-16）。ban は残し、`wrappers` で servo からの直接依存だけを許す。
+# Linux・macOS のグラフには現れないため、現れたら（`no-wgl` の誤配置等）bans で fail する。
 deny = [
-  { crate = "mozangle", reason = "WebGL 用 ANGLE バインディング。ホストは WebGL を使わない" },
+  { crate = "mozangle", wrappers = ["servo"], reason = "WebGL 用 ANGLE バインディング。Windows の no-wgl 経由の servo 直接依存だけ許す" },
   { crate = "servo-webgl", reason = "WebGL バックエンド。ホストは使わない" },
   { crate = "wgpu", reason = "WebGPU バックエンド。ホストは使わない" },
   { crate = "wgpu-core", reason = "WebGPU バックエンド。ホストは使わない" },
