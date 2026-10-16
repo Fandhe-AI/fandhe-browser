@@ -2,7 +2,7 @@
 
 配布コンテナ（軽量 = boa / 既定 = V8）にローカルフィクスチャ 12 種をボリュームマウントし、`text` / `texts` / `attr` 相当の取得が追加 OS ライブラリなしで動くことを確認するハーネス（TASK-66.1・Issue #302・`CTR-2`・MS-5。親 Issue #301）。
 
-**現状: 前提未充足のため 12/12 は未達成（blocked）**。配布バイナリに一発実行サブコマンドが無い（TASK-47.4・#285・`CLI-1`）ためで、本ハーネスは成功を装わず `result=blocked`（exit 2）を記録する。経緯は「要判断事項」を参照。
+**現状: 軽量コンテナで 12/12 成功**（`query --file`、#824 を利用。結果は「実行結果」参照）。一発実行を持たない旧バイナリに当たった場合は成功を装わず `result=blocked`（exit 2）を記録する。
 
 | 後続 | 内容 |
 | ---- | ---- |
@@ -47,20 +47,21 @@ bash harness/container-smoke/run.sh --role lite --image fandhe-browser:lite-smok
 | C11 | 11 Unicode | `static/07-unicode.html` | texts | `p.greeting` | — |
 | C12 | 12 壊れた HTML | `static/08-malformed.html` | texts | `ul.items li` | — |
 
-## 暫定契約（REPAIR-3）
+## 呼び出し契約と判定の限界
 
-配布バイナリの一発実行サブコマンドは未定義のため、以下は**仮置き**。`run.sh` の `build_task_argv` 1 関数に隔離してあり、TASK-47.4（#285）で構文が確定したらそこだけ差し替える。
+配布バイナリの `query` サブコマンド（TASK-47.4・#285・#824・`CLI-1`・`PERF-7`）を使う。構文は `run.sh` の `build_task_argv` 1 関数に隔離してある。
 
-- 仮の呼び出し形: `--file <コンテナ内パス> <text|texts|attr> <selector> [<attr>]`
-- 意味論（PoC-2 / PoC-8 を仮定）: `text` = 先頭一致要素のテキスト、`texts` = 全一致要素のテキストの JSON 配列、`attr` = 先頭一致要素の属性値。stdout に結果、成功時 exit 0
-- 比較: `text` / `attr` は末尾改行 1 個を除いて完全一致、`texts` は `jq -c` で正規化した配列の完全一致
+- 呼び出し: `query [--all | --attr NAME] --file <コンテナ内パス> -- <selector>`（`text` は無印、`texts` は `--all`、`attr` は `--attr NAME`）
+- 出力: JSON 文字列リテラルの 1 値 1 行。`text` / `attr` は先頭一致要素の 1 件のみ、`texts` は全一致要素
+- 比較: `jq -s` で配列へ正規化し、空白の連続を 1 個へ畳み前後を除いて比較する（CLI は `textContent` をそのまま返し、期待値は正規化済みのため）。`texts` は期待値全体と完全一致、`text` / `attr` は期待値の先頭 1 件と一致
+- **判定の限界**: `attr` は先頭一致要素の属性だけを返すため、期待値が複数の C04・C05・C10 は先頭要素のみの検証になる（全要素の属性取得は CLI 側の機能追加が必要）
 
 ## 判定の流れ
 
 1. 入力検証（role・image・platform・timeout・`tasks.json` のスキーマ）→ 不正は exit 2
 2. `--skip-build` でなければ `docker build -f docker/Dockerfile.release --target <role>`
 3. 構造確認: `docker create` + `docker export | tar -t` で `*.so` / `*.so.*` と `lib/`・`lib64/`・`usr/lib/` 配下の実体を数える（`shared_libs=`）。1 件でもあれば exit 1
-4. preflight: 先頭タスクの argv で起動し、終了するか確認する。終了せず `DevTools listening on` で始まる起動行を出していれば `result=blocked`（exit 2）、バナーも無ければ `timeout`（exit 1）
+4. preflight: 先頭タスクの argv で起動し、終了するか確認する。終了せず `DevTools listening on` で始まる起動行を出していれば（`query --file` 以前の旧バイナリ）`result=blocked`（exit 2）、バナーも無ければ `timeout`（exit 1）
 5. 12 タスクを順に実行し 1 タスク 1 行を出力、最後にサマリ
 
 コンテナ実行条件は固定で呼び出し側から変更できない: `--network none`、フィクスチャは `:ro` マウント、`--cap-drop ALL`、`no-new-privileges`、`--read-only` + `/data` を tmpfs（`uid=65532,gid=65532,mode=0700`。実機で起動を確認済み）、非 root（イメージ既定の UID 65532）。`--privileged`・`--init` は使わない。SSRF 防御（`file:` 拒否・private 帯拒否）を回避する経路は作らない。
@@ -79,13 +80,12 @@ container-smoke-summary: role=<role> total=12 executed=<N> success=<N> result=<p
 | ---- | ---- |
 | 0 | 12/12 成功 |
 | 1 | 実行したが失敗あり（不一致・非 0 終了・timeout・共有ライブラリ検出・build / inspect の失敗） |
-| 2 | 使用エラー・前提不足（引数 / `tasks.json` 不正、docker・jq 不在、daemon 不達、`--skip-build` でイメージ不在、一発実行サブコマンドが無い） |
+| 2 | 使用エラー・前提不足（引数 / `tasks.json` 不正、docker・jq 不在、daemon 不達、`--skip-build` でイメージ不在、旧バイナリで一発実行サブコマンドが無い） |
 
 ## 要判断事項
 
-1. **一発実行サブコマンドが無い**: 現行 `fandhe-browser`（`crates/fandhe-browser-cli/src/main.rs`）は argv を解釈せず、`DevTools listening on ws://127.0.0.1:9333/...` を出してサーバーとして動き続ける。サブコマンドは TASK-47（#282・#285。いずれも OPEN）で追加予定。#302・#303 は実質的に #285（`CLI-1`）の完了後に再実行する必要がある
-2. **ローカルファイル入力経路が仕様に無い**: HTML の入口は CDP `Page.navigate` → `Fetcher` のみで、`file:` は `DisallowedScheme`、loopback / private 帯は `DisallowedAddress` で拒否される。`CTR-2` の前提「フィクスチャをボリュームマウント」を満たすには、要素取得コマンドにローカル入力（PoC-2 の `--file` 相当）を持たせるか、`CTR-2` の確認方法を見直す必要がある。spec リポ側（`CLI-1`・TASK-47・`CTR-2`）の課題としてオーナー判断を要する
-3. 上記が解消するまで受入基準 1（12/12 成功）は達成できない。#302 は本ハーネスの追加だけでは close しない
+1. **`attr` の複数要素検証**: 上記のとおり C04・C05・C10 は先頭要素のみ。全要素検証が必要なら CLI への `--all --attr` 相当の追加をオーナーが判断する
+2. **ローカルファイル入力**: `query --file` はローカル操作者専用で、URL 経路の SSRF 防御（`file:` 拒否・private 帯拒否）は緩めていない。ハーネスはこの経路だけを使う
 
 ## 注意点
 
@@ -97,17 +97,20 @@ container-smoke-summary: role=<role> total=12 executed=<N> success=<N> result=<p
 
 ### 軽量コンテナ
 
-2026-10-11、ローカルの `fandhe-browser:lite`（amd64。release ビルド済みの既存イメージ。`--skip-build` のため HEAD 由来であることは未検証）に対し実行:
+2026-10-16、`docker/Dockerfile.release --target lite` を HEAD（#1077 取り込み後）から build して実行（amd64）:
 
 ```text
-$ bash harness/container-smoke/run.sh --role lite --skip-build --task-timeout 5
-container-smoke-env: role=lite image=fandhe-browser:lite id=sha256:fb23446d21df7aa7dea2f40527ef1310455a917598717d62c4d9dd0e93d31b4b platform=linux/amd64 docker_server=29.8.1 commit=76864b58695b dirty=1 built=no shared_libs=0
-container-smoke-summary: role=lite total=12 executed=0 success=0 result=blocked reason=one-shot-subcommand-unavailable
-(exit 2)
+$ bash harness/container-smoke/run.sh --role lite --image fandhe-browser:lite-smoke302
+container-smoke-env: role=lite image=fandhe-browser:lite-smoke302 id=sha256:c5c2b0d6... platform=linux/amd64 docker_server=29.8.1 commit=fbc392e998af dirty=1 built=yes shared_libs=0
+container-smoke: role=lite id=C01 ... status=ok exit=0
+  （C02〜C11 も status=ok）
+container-smoke: role=lite id=C12 fixture=static/08-malformed.html kind=texts status=ok exit=0
+container-smoke-summary: role=lite total=12 executed=12 success=12 result=pass reason=none
+(exit 0)
 ```
 
 - 追加 OS ライブラリ: イメージ内の共有ライブラリ類は 0 件（`shared_libs=0`。scratch）
-- 12 タスク: **0/12 実行（blocked）**。受入基準 1（12/12 成功）は未達。#285 完了とローカル入力経路の決定後に再実行して本節を更新する
+- 12 タスク: **12/12 成功**（受入基準 1・2 を満たす。ただし attr の複数要素は先頭のみの検証）
 
 ### 既定コンテナ
 

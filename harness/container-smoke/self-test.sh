@@ -43,12 +43,16 @@ case "$1" in
     for a in "$@"; do case "$a" in /fixtures/*) fx="${a#/fixtures/}" ;; esac; done
     id=$(jq -r --arg f "$fx" '.[] | select(.fixture == $f) | .id' "${FAKE_TASKS}")
     kind=$(jq -r --arg f "$fx" '.[] | select(.fixture == $f) | .kind' "${FAKE_TASKS}")
-    out=$(jq -c --arg f "$fx" '.[] | select(.fixture == $f) | .expected' "${FAKE_TASKS}")
-    [ "$kind" = "texts" ] || out=$(printf '%s' "$out" | jq -r '.[0]')
+    # 実 CLI と同じく JSON 文字列リテラルの 1 値 1 行。texts は全要素、text / attr は先頭 1 件。
+    if [ "$kind" = "texts" ]; then
+      out=$(jq -c --arg f "$fx" '.[] | select(.fixture == $f) | .expected[]' "${FAKE_TASKS}")
+    else
+      out=$(jq -c --arg f "$fx" '.[] | select(.fixture == $f) | .expected[0]' "${FAKE_TASKS}")
+    fi
     d="${FAKE_DIR}/state/${cid}"; mkdir -p "$d"
     echo 0 > "$d/exit"; echo false > "$d/running"; : > "$d/err"; printf '%s\n' "$out" > "$d/out"
     case "${FAKE_MODE}" in
-      mismatch) [ "$id" != "C05" ] || echo wrong > "$d/out" ;;
+      mismatch) [ "$id" != "C05" ] || echo '"wrong"' > "$d/out" ;;
       nonzero) [ "$id" != "C04" ] || echo 3 > "$d/exit" ;;
       server) echo true > "$d/running"; : > "$d/out"
               echo "DevTools listening on ws://127.0.0.1:9333/devtools/browser/x" > "$d/err" ;;
@@ -92,14 +96,21 @@ long300="$(head -c 500 /dev/zero | tr '\0' 'x' | sanitize_sample)"
 expect_eq "sanitize truncates to 300" "300" "${#long300}"
 expect_eq "count_lib_entries" "2" "$(printf './\n./fandhe-browser\n./lib/\n./lib/a\n./x.so.1\n' | count_lib_entries)"
 build_task_argv attr "nav a" href /fixtures/static/05-nav-links.html
-expect_eq "argv attr" "--file /fixtures/static/05-nav-links.html attr nav a href" "${TASK_ARGV[*]}"
+expect_eq "argv attr" "query --attr href --file /fixtures/static/05-nav-links.html -- nav a" "${TASK_ARGV[*]}"
 build_task_argv texts "p" "" /fixtures/x.html
-expect_eq "argv texts" "--file /fixtures/x.html texts p" "${TASK_ARGV[*]}"
-if compare_result texts '["a","b"]' '["a","b"]'; then ok "compare texts"; else ng "compare texts"; fi
-if compare_result texts '[ "a" , "b" ]' '["a","b"]'; then ok "compare texts normalizes"; else ng "compare texts normalizes"; fi
-if compare_result texts '["a"]' '["a","b"]'; then ng "compare texts mismatch"; else ok "compare texts mismatch"; fi
-if compare_result text $'x\n' '["x"]'; then ok "compare text strips newline"; else ng "compare text strips newline"; fi
-if compare_result attr 'y' '["x"]'; then ng "compare attr mismatch"; else ok "compare attr mismatch"; fi
+expect_eq "argv texts" "query --all --file /fixtures/x.html -- p" "${TASK_ARGV[*]}"
+build_task_argv text "title" "" /fixtures/x.html
+expect_eq "argv text" "query --file /fixtures/x.html -- title" "${TASK_ARGV[*]}"
+if compare_result texts $'"a"\n"b"\n' '["a","b"]'; then ok "compare texts"; else ng "compare texts"; fi
+if compare_result texts $'"a"\n"b"' '["a","b"]'; then ok "compare texts no trailing newline"; else ng "compare texts no trailing newline"; fi
+if compare_result texts $'"a"\n' '["a","b"]'; then ng "compare texts mismatch"; else ok "compare texts mismatch"; fi
+if compare_result texts $'"b"\n"a"\n' '["a","b"]'; then ng "compare texts order"; else ok "compare texts order"; fi
+if compare_result text $'"x"\n' '["x"]'; then ok "compare text"; else ng "compare text"; fi
+if compare_result text $'"x\\ny"\n' '["x\ny"]'; then ok "compare text escapes"; else ng "compare text escapes"; fi
+if compare_result texts $'"a\\n  b\\n"\n' '["a b"]'; then ok "compare collapses whitespace"; else ng "compare collapses whitespace"; fi
+if compare_result attr $'"y"\n' '["x"]'; then ng "compare attr mismatch"; else ok "compare attr mismatch"; fi
+if compare_result attr $'"x"\n' '["x","z"]'; then ok "compare attr first only"; else ng "compare attr first only"; fi
+if compare_result text 'raw' '["raw"]'; then ng "compare rejects non-JSON"; else ok "compare rejects non-JSON"; fi
 
 # --- 全体経路 ---
 scenario "all 12 pass" 0 pass clean.tar --role lite --skip-build --task-timeout 2

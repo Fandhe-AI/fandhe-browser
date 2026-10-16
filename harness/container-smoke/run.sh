@@ -6,10 +6,9 @@
 # 後続は #303（TASK-66.2・既定コンテナで本スクリプトを流用）と #304（TASK-66.3・JS スモーク）。
 # 出力契約・終了コード・暫定契約・要判断事項は README.md を参照。
 #
-# 【暫定契約・REPAIR-3】配布バイナリの一発実行サブコマンド（TASK-47.4・#285・CLI-1）は未実装で、
-# 現行バイナリは argv を解釈せずサーバーとして動き続ける。そのため preflight で一発実行の可否を判定し、
-# 不可なら `result=blocked` で exit 2 とする（成功を装わない）。呼び出し構文は build_task_argv に隔離してあり、
-# TASK-47.4 の確定後にそこだけ差し替える。
+# 呼び出しは `query [--all | --attr NAME] --file PATH -- SELECTOR`（#824・CLI-1）。一発実行を持たない旧バイナリ
+# （argv を解釈せずサーバーとして動き続ける）に当たった場合は preflight で `result=blocked`（exit 2）とし、
+# 成功を装わない。構文は build_task_argv に隔離してある。
 #
 # コンテナ実行条件は固定（呼び出し側から変更不可）: --network none・フィクスチャは :ro・--cap-drop ALL・
 # no-new-privileges・非 root（イメージ既定の UID 65532）。SSRF 防御（file: 拒否・private 帯拒否）を
@@ -104,32 +103,37 @@ validate_tasks() {
   done
 }
 
-# 暫定契約（README「暫定契約」参照）。タスク 1 件分の argv を TASK_ARGV に設定する。
+# 実 CLI の構文（`query [--all | --attr NAME] --file PATH SELECTOR`。TASK-47.4・#285・#824・CLI-1・PERF-7）に
+# 合わせ、タスク 1 件分の argv を TASK_ARGV に設定する。ENTRYPOINT が /fandhe-browser のため先頭は query。
 # $1=kind $2=selector $3=attr(空可) $4=コンテナ内のフィクスチャパス。
-# TASK-47.4（#285・CLI-1）で text/texts/attr の構文が確定したら、この関数だけ差し替える。
-# ローカルファイル入力の経路自体が仕様未定（README「要判断事項」）で、ここの形は仮置き。
+# 構文が変わったらこの関数だけ差し替える。
 TASK_ARGV=()
 build_task_argv() {
   local kind="$1" selector="$2" attr="$3" path="$4"
-  TASK_ARGV=(--file "$path" "$kind" "$selector")
-  if [ "$kind" = "attr" ]; then
-    TASK_ARGV+=("$attr")
-  fi
+  TASK_ARGV=(query)
+  case "$kind" in
+    texts) TASK_ARGV+=(--all) ;;
+    attr) TASK_ARGV+=(--attr "$attr") ;;
+  esac
+  TASK_ARGV+=(--file "$path" -- "$selector")
 }
 
 # $1=kind $2=実測 stdout $3=expected(JSON 配列) → 一致なら 0。
-# text/attr は末尾改行 1 個を除いて先頭要素と完全一致、texts は jq -c で正規化した配列の完全一致。
+# stdout は JSON 文字列リテラルの 1 値 1 行（query.rs の write_lines）。jq -s -c で配列へ正規化して比較する。
+# texts は expected 全体と完全一致。text / attr は先頭一致要素 1 件のみを返す仕様のため expected[0] と一致を見る
+# 空白は連続を 1 個へ畳み前後を除いて比較する（CLI は textContent をそのまま返し、期待値は core の
+# 正規化済みテキストのため。例: C12 の閉じタグなし li）。
+# （attr の expected が複数のタスク C04・C05・C10 は先頭要素のみの検証になる。README「判定の限界」）。
 compare_result() {
-  local kind="$1" actual="$2" expected="$3" want
+  local kind="$1" actual="$2" expected="$3" norm want
+  local ws='map(gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; ""))'
+  norm=$(printf '%s' "$actual" | jq -s -c "$ws" 2>/dev/null) || return 1
   if [ "$kind" = "texts" ]; then
-    local norm
-    norm=$(printf '%s' "$actual" | jq -c . 2>/dev/null) || return 1
-    [ "$norm" = "$(printf '%s' "$expected" | jq -c .)" ]
+    want=$(printf '%s' "$expected" | jq -c "$ws")
   else
-    want=$(printf '%s' "$expected" | jq -r '.[0]')
-    actual="${actual%$'\n'}"
-    [ "$actual" = "$want" ]
+    want=$(printf '%s' "$expected" | jq -c "[.[0]] | $ws")
   fi
+  [ "$norm" = "$want" ]
 }
 
 # 結果受け渡し用グローバル（サブシェルだと exit・CIDS が伝わらないため）。
@@ -306,7 +310,7 @@ main() {
   if [ "$RC_STATE" = "running" ]; then
     if printf '%s' "$RC_ERR" | grep -qF "$BANNER"; then
       echo "container-smoke-summary: role=${role} total=12 executed=0 success=0 result=blocked reason=one-shot-subcommand-unavailable"
-      echo "error: the image runs as a server and has no one-shot text/texts/attr subcommand (TASK-47.4 / #285 pending)" >&2
+      echo "error: the image runs as a server and has no one-shot text/texts/attr subcommand (it predates query --file, #824)" >&2
       exit 2
     fi
     echo "container-smoke-summary: role=${role} total=12 executed=0 success=0 result=fail reason=timeout"
@@ -330,7 +334,7 @@ main() {
       *)
         if [ "$RC_EXIT" != "0" ]; then
           status="nonzero-exit"
-        elif [ "$kind" = "texts" ] && ! printf '%s' "$RC_OUT" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        elif ! printf '%s' "$RC_OUT" | jq -s -e 'length > 0 and all(type == "string")' >/dev/null 2>&1; then
           status="invalid-output"
         elif compare_result "$kind" "$RC_OUT" "$expected"; then
           status="ok"
