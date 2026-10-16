@@ -8,7 +8,10 @@
 //! 日常操作コマンドの経路からは呼ばない（構造テスト `cli2_daily_command_sources_*` で固定）。
 //!
 //! 検出は外部プロセスを起動せず（`vswhere`・`python --version` も使わない）、ディレクトリ列挙と
-//! `is_file` だけで行う。そのため既知の限界がある。Microsoft Store の App Execution Alias
+//! `is_file` / `is_dir` だけで行う。標準パス以外の Visual Studio は、環境変数 `VSINSTALLDIR` と
+//! Visual Studio Installer の状態ファイル（`%ProgramData%\Microsoft\VisualStudio\Packages\_Instances\*\state.json`
+//! の `installationPath`）を読み取って探索対象に加える。SDK・MSVC は版名のディレクトリだけでなく
+//! 必須ヘッダー・ライブラリ・`cl.exe` の実体まで確認する。そのため既知の限界がある。Microsoft Store の App Execution Alias
 //! （`WindowsApps` 配下のスタブ）を実体と区別できず、Python・`uv` の版の下限も検査しない。
 //!
 //! 閾値の同期点: `.github/workflows/ci.yml` の `windows-servo-prereqs` ジョブと
@@ -32,6 +35,18 @@ const MIN_WINDOWS_SDK: [u32; 4] = [10, 0, 19041, 0];
 /// MSVC v143 とみなす toolset の範囲 `[14.30, 14.50)`（同期点: ci.yml）。
 const MSVC_V143_MIN: (u32, u32) = (14, 30);
 const MSVC_V143_MAX_EXCL: (u32, u32) = (14, 50);
+/// 状態ファイル 1 件で読む最大バイト数。
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// ホストアーキテクチャの SDK / MSVC ディレクトリ名（`x64`・`arm64`・`x86`）。
+fn host_arch_dir() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86" => "x86",
+        _ => "x64",
+    }
+}
 
 /// 前提条件の識別子。表示名は固定の英語 ID。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +118,13 @@ pub(crate) fn detect_current() -> SetupReport {
         let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
             .map(|p| std::env::split_paths(&p).take(MAX_PATH_ENTRIES).collect())
             .unwrap_or_default();
-        windows_report(pf86.as_deref(), pf.as_deref(), &path_dirs)
+        let mut vs_installs = std::env::var_os("VSINSTALLDIR")
+            .map(|v| vec![PathBuf::from(v)])
+            .unwrap_or_default();
+        if let Some(pd) = std::env::var_os("ProgramData") {
+            vs_installs.extend(installer_state_install_paths(&PathBuf::from(pd)));
+        }
+        windows_report(pf86.as_deref(), pf.as_deref(), &vs_installs, &path_dirs)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -120,6 +141,7 @@ pub(crate) fn detect_current() -> SetupReport {
 pub(crate) fn windows_report(
     program_files_x86: Option<&Path>,
     program_files: Option<&Path>,
+    vs_installs: &[PathBuf],
     path_dirs: &[PathBuf],
 ) -> SetupReport {
     let sdk = match program_files_x86 {
@@ -131,7 +153,14 @@ pub(crate) fn windows_report(
         .flatten()
         .map(|p| p.join("Microsoft Visual Studio"))
         .collect();
-    let (msvc, v143_dirs) = detect_msvc_v143(&msvc_roots_under(&vs_roots));
+    let mut msvc_roots = msvc_roots_under(&vs_roots);
+    for install in vs_installs {
+        let r = install.join("VC").join("Tools").join("MSVC");
+        if r.is_dir() && !msvc_roots.contains(&r) {
+            msvc_roots.push(r);
+        }
+    }
+    let (msvc, v143_dirs) = detect_msvc_v143(&msvc_roots);
     let atl = detect_atl_v143(&v143_dirs);
     let python = find_executable(path_dirs, &["python.exe", "python3.exe", "py.exe"]);
     let uv = find_executable(path_dirs, &["uv.exe"]);
@@ -174,6 +203,60 @@ fn sdk_missing() -> PrerequisiteStatus {
     }
 }
 
+/// Visual Studio Installer の状態ファイル群から `installationPath` を集める（読み取り専用）。
+///
+/// `<ProgramData>\Microsoft\VisualStudio\Packages\_Instances\<id>\state.json` を対象にする。
+/// 標準パス以外（例: `D:\VS`）へ導入した環境を検出するため。JSON パーサー依存を避け、
+/// キー直後の文字列リテラルだけを取り出す（失敗したら何も返さない）。
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+pub(crate) fn installer_state_install_paths(program_data: &Path) -> Vec<PathBuf> {
+    let instances = program_data
+        .join("Microsoft")
+        .join("VisualStudio")
+        .join("Packages")
+        .join("_Instances");
+    let mut out = Vec::new();
+    for (_, dir) in list_names(&instances) {
+        let state = dir.join("state.json");
+        let Ok(meta) = std::fs::metadata(&state) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() > MAX_STATE_BYTES {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&state) else {
+            continue;
+        };
+        if let Some(p) = extract_json_string(&text, "installationPath") {
+            let p = PathBuf::from(p);
+            if p.is_absolute() && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// `"key" : "value"` の最初の値を取り出す（`\\`・`\"`・`\/` のみ解除。他のエスケープは失敗扱い）。
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+fn extract_json_string(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let rest = text[text.find(&needle)? + needle.len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let mut val = String::new();
+    let mut chars = rest.chars();
+    loop {
+        match chars.next()? {
+            '"' => return Some(val),
+            '\\' => match chars.next()? {
+                c @ ('\\' | '"' | '/') => val.push(c),
+                _ => return None,
+            },
+            c => val.push(c),
+        }
+    }
+}
+
 /// 直下エントリ（UTF-8 名のもの）を上限付きで集める。読めなければ空。
 fn list_names(dir: &Path) -> Vec<(String, PathBuf)> {
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -199,9 +282,24 @@ fn parse_version<const N: usize>(s: &str) -> Option<[u32; N]> {
 }
 
 /// Windows SDK を `Include` 直下の版ディレクトリから検出する。
+///
+/// 版名のディレクトリであることに加え、`Include\<版>\um\Windows.h` と
+/// `Lib\<版>\um\<arch>\kernel32.lib`（`Lib` は `Include` の兄弟）の実体を確認する。
 pub(crate) fn detect_windows_sdk(include_root: &Path) -> PrerequisiteStatus {
+    let lib_root = include_root.parent().map(|p| p.join("Lib"));
     let best = list_names(include_root)
         .into_iter()
+        .filter(|(_, path)| path.is_dir())
+        .filter(|(n, path)| {
+            path.join("um").join("Windows.h").is_file()
+                && lib_root.as_ref().is_some_and(|l| {
+                    l.join(n)
+                        .join("um")
+                        .join(host_arch_dir())
+                        .join("kernel32.lib")
+                        .is_file()
+                })
+        })
         .filter_map(|(n, _)| parse_version::<4>(&n))
         .filter(|v| *v >= MIN_WINDOWS_SDK)
         .max();
@@ -220,7 +318,12 @@ pub(crate) fn detect_msvc_v143(msvc_roots: &[PathBuf]) -> (PrerequisiteStatus, V
         for (name, path) in list_names(root) {
             if let Some(v) = parse_version::<3>(&name) {
                 let mm = (v[0], v[1]);
-                if mm >= MSVC_V143_MIN && mm < MSVC_V143_MAX_EXCL {
+                // 空ディレクトリ・ATL だけが残った toolset を弾くため、コンパイラの実体まで確認する。
+                if mm >= MSVC_V143_MIN
+                    && mm < MSVC_V143_MAX_EXCL
+                    && path.is_dir()
+                    && msvc_cl_exe(&path).is_file()
+                {
                     found.push((v, path));
                 }
             }
@@ -236,6 +339,16 @@ pub(crate) fn detect_msvc_v143(msvc_roots: &[PathBuf]) -> (PrerequisiteStatus, V
         },
     };
     (status, found.into_iter().map(|(_, p)| p).collect())
+}
+
+/// toolset 内のホスト向け `cl.exe` のパス（`bin\Host<arch>\<arch>\cl.exe`）。
+fn msvc_cl_exe(toolset: &Path) -> PathBuf {
+    let a = host_arch_dir();
+    toolset
+        .join("bin")
+        .join(format!("Host{a}"))
+        .join(a)
+        .join("cl.exe")
 }
 
 /// v143 toolset のうち自身の `atlmfc\include\atlbase.h` を持つものがあるかを判定する。
@@ -312,14 +425,33 @@ mod tests {
         std::fs::write(p, b"").expect("touch");
     }
 
+    /// `<root>/Include` と `<root>/Lib` に実体付きの SDK 版を作り、`Include` を返す。
+    fn make_sdk(root: &Path, ver: &str) -> PathBuf {
+        touch(&root.join("Include").join(ver).join("um").join("Windows.h"));
+        touch(
+            &root
+                .join("Lib")
+                .join(ver)
+                .join("um")
+                .join(host_arch_dir())
+                .join("kernel32.lib"),
+        );
+        root.join("Include")
+    }
+    fn make_toolset(msvc_root: &Path, ver: &str) -> PathBuf {
+        let d = msvc_root.join(ver);
+        touch(&msvc_cl_exe(&d));
+        d
+    }
+
     #[test]
     fn cli2_sdk_picks_highest_version_at_or_above_minimum() {
         let t = TempDir::new();
-        for v in ["10.0.22621.0", "10.0.17763.0", "wdf"] {
-            mkdir(&t.owned.join(v));
-        }
+        let inc = make_sdk(&t.owned, "10.0.22621.0");
+        make_sdk(&t.owned, "10.0.17763.0");
+        mkdir(&inc.join("wdf"));
         assert_eq!(
-            detect_windows_sdk(&t.owned),
+            detect_windows_sdk(&inc),
             PrerequisiteStatus::Satisfied {
                 found: "10.0.22621.0".into()
             }
@@ -329,16 +461,83 @@ mod tests {
     #[test]
     fn cli2_sdk_missing_when_only_old_or_no_root() {
         let t = TempDir::new();
-        mkdir(&t.owned.join("10.0.17763.0"));
-        assert_eq!(detect_windows_sdk(&t.owned), sdk_missing());
+        let inc = make_sdk(&t.owned, "10.0.17763.0");
+        assert_eq!(detect_windows_sdk(&inc), sdk_missing());
         assert_eq!(detect_windows_sdk(&t.owned.join("nope")), sdk_missing());
+    }
+
+    #[test]
+    fn cli2_sdk_file_empty_dir_or_missing_lib_is_missing() {
+        let t = TempDir::new();
+        let inc = t.owned.join("Include");
+        touch(&inc.join("10.0.22621.0")); // 通常ファイル
+        mkdir(&inc.join("10.0.26100.0")); // 空ディレクトリ
+        touch(&inc.join("10.0.19041.0/um/Windows.h")); // Lib 側が無い
+        assert_eq!(detect_windows_sdk(&inc), sdk_missing());
+    }
+
+    #[test]
+    fn cli2_msvc_file_empty_dir_or_atl_only_is_missing() {
+        let t = TempDir::new();
+        touch(&t.owned.join("14.44.35207")); // 通常ファイル
+        mkdir(&t.owned.join("14.43.1")); // 空ディレクトリ
+        touch(&t.owned.join("14.42.1/atlmfc/include/atlbase.h")); // ATL のみ
+        let (st, dirs) = detect_msvc_v143(std::slice::from_ref(&t.owned));
+        assert_eq!(
+            st,
+            PrerequisiteStatus::Missing {
+                expected: "MSVC v143 toolset (14.30 to 14.49)"
+            }
+        );
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
+    fn cli2_installer_state_parsing() {
+        assert_eq!(
+            extract_json_string(r#"{"installationPath" : "D:\\VS"}"#, "installationPath"),
+            Some("D:\\VS".to_string())
+        );
+        assert_eq!(
+            extract_json_string(r#"{"x":"y"}"#, "installationPath"),
+            None
+        );
+        assert_eq!(
+            extract_json_string(r#"{"installationPath":"a\u0041"}"#, "installationPath"),
+            None
+        );
+        let t = TempDir::new();
+        let inst = t
+            .owned
+            .join("Microsoft/VisualStudio/Packages/_Instances/abc123");
+        mkdir(&inst);
+        std::fs::write(inst.join("state.json"), br#"{"installationPath":"rel/x"}"#).expect("write");
+        assert!(installer_state_install_paths(&t.owned).is_empty());
+    }
+
+    #[test]
+    fn cli2_custom_vs_install_dir_is_searched() {
+        let t = TempDir::new();
+        make_sdk(&t.owned.join("pf86/Windows Kits/10"), "10.0.26100.0");
+        let vs = t.owned.join("D/VS");
+        let d = make_toolset(&vs.join("VC/Tools/MSVC"), "14.44.35207");
+        touch(&d.join("atlmfc/include/atlbase.h"));
+        let r = windows_report(Some(&t.owned.join("pf86")), None, &[vs], &[]);
+        assert!(matches!(
+            r.checks[1].status,
+            PrerequisiteStatus::Satisfied { .. }
+        ));
+        assert!(matches!(
+            r.checks[2].status,
+            PrerequisiteStatus::Satisfied { .. }
+        ));
     }
 
     #[test]
     fn cli2_msvc_outside_v143_range_is_missing_and_atl_not_checked() {
         let t = TempDir::new();
-        mkdir(&t.owned.join("14.29.30133"));
-        mkdir(&t.owned.join("14.50.1"));
+        make_toolset(&t.owned, "14.29.30133");
+        make_toolset(&t.owned, "14.50.1");
         let (st, dirs) = detect_msvc_v143(std::slice::from_ref(&t.owned));
         assert_eq!(
             st,
@@ -355,7 +554,7 @@ mod tests {
     #[test]
     fn cli2_atl_missing_when_header_absent() {
         let t = TempDir::new();
-        mkdir(&t.owned.join("14.44.35207"));
+        make_toolset(&t.owned, "14.44.35207");
         let (st, dirs) = detect_msvc_v143(std::slice::from_ref(&t.owned));
         assert_eq!(
             st,
@@ -372,7 +571,8 @@ mod tests {
     #[test]
     fn cli2_atl_found_in_older_v143_toolset() {
         let t = TempDir::new();
-        mkdir(&t.owned.join("14.44.35207"));
+        make_toolset(&t.owned, "14.44.35207");
+        make_toolset(&t.owned, "14.38.33130");
         touch(&t.owned.join("14.38.33130/atlmfc/include/atlbase.h"));
         let (_, dirs) = detect_msvc_v143(std::slice::from_ref(&t.owned));
         assert_eq!(
@@ -422,7 +622,7 @@ mod tests {
 
     #[test]
     fn cli2_windows_report_without_inputs_is_unsatisfied_in_fixed_order() {
-        let r = windows_report(None, None, &[]);
+        let r = windows_report(None, None, &[], &[]);
         let ids: Vec<String> = r.checks.iter().map(|c| c.id.to_string()).collect();
         assert_eq!(
             ids,
@@ -441,14 +641,14 @@ mod tests {
         let t = TempDir::new();
         let pf86 = t.owned.join("pf86");
         let pf = t.owned.join("pf");
-        mkdir(&pf86.join("Windows Kits/10/Include/10.0.26100.0"));
-        touch(&pf.join(
-            "Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.44.35207/atlmfc/include/atlbase.h",
-        ));
+        make_sdk(&pf86.join("Windows Kits/10"), "10.0.26100.0");
+        let msvc = pf.join("Microsoft Visual Studio/18/Community/VC/Tools/MSVC");
+        let d = make_toolset(&msvc, "14.44.35207");
+        touch(&d.join("atlmfc/include/atlbase.h"));
         let bin = t.owned.join("bin");
         touch(&bin.join("python.exe"));
         touch(&bin.join("uv.exe"));
-        let r = windows_report(Some(&pf86), Some(&pf), &[bin]);
+        let r = windows_report(Some(&pf86), Some(&pf), &[], &[bin]);
         assert_eq!(r.missing().count(), 0);
         assert!(
             r.checks

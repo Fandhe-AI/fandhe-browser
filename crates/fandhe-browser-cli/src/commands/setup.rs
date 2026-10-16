@@ -123,8 +123,8 @@ mod tests {
     #[test]
     fn cli2_missing_prerequisites_error_and_exit_code() {
         let mut out = Vec::new();
-        let err =
-            run_with(&args(&[]), windows_report(None, None, &[]), &mut out).expect_err("missing");
+        let err = run_with(&args(&[]), windows_report(None, None, &[], &[]), &mut out)
+            .expect_err("missing");
         assert_eq!(
             err.to_string(),
             "missing OS-specific build prerequisites: windows-sdk, msvc-v143, python, uv; see docs/setup/windows.md"
