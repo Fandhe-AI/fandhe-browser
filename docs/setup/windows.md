@@ -131,7 +131,7 @@ VS 2026 では、v143 を導入しても既定のツールセットは v145 の�
 
   ```powershell
   $out = Get-ChildItem C:\st\debug\build -Directory -Filter 'mozangle-*' | ForEach-Object { Join-Path $_.FullName 'out' } | Where-Object { Test-Path (Join-Path $_ 'libEGL.dll') }
-  Copy-Item "$out\libEGL.dll", "$out\libGLESv2.dll" C:\st\debug\, C:\st\debug\deps\
+  foreach ($d in "C:\st\debug\", "C:\st\debug\deps\") { Copy-Item "$out\libEGL.dll", "$out\libGLESv2.dll" $d }
   ```
 
 ### 注意点
