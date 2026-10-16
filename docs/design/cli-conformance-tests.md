@@ -63,11 +63,13 @@ stderr は `error: <固定文言>`。usage エラーは末尾に `; run 'fandhe-
 
 | 項目 | Linux | macOS | Windows |
 | ---- | ----- | ----- | ------- |
-| 隔離 | `HOME`・`XDG_DATA_HOME` を `mktemp -d` へ | `HOME` を `mktemp -d` へ | `LOCALAPPDATA` は `...\AppData\Local` で終わる必要がある（`local_root.rs` の `REASON_BAD_LOCALAPPDATA`）ため差し替えない。実際の `%LOCALAPPDATA%` 配下を使い、後片付けを必須にする |
+| 隔離 | `HOME`・`XDG_DATA_HOME` を `mktemp -d` へ | `HOME` を `mktemp -d` へ | `LOCALAPPDATA` は `...\AppData\Local` で終わる必要がある（`local_root.rs` の `REASON_BAD_LOCALAPPDATA`）ため差し替えない。実際の `%LOCALAPPDATA%` 配下を使う。このため **専用の Windows ユーザー（または `%LOCALAPPDATA%\fandhe-browser` が存在しない新規環境）で実施する**ことを前提とし、実ユーザーの既存プロファイルと重ならない・ロック競合しないことを実施前に確認する。後片付けは本ケースで新規作成した領域だけに限る |
 | 既定プロファイルルート | `$XDG_DATA_HOME/fandhe-browser`（未設定時 `$HOME/.local/share/fandhe-browser`） | `$HOME/Library/Application Support/fandhe-browser` | `%LOCALAPPDATA%\fandhe-browser` |
-| `--profile-dir` の場所 `<P>` | `<TMP>/p` | `<TMP>/p` | `%LOCALAPPDATA%\fandhe-ct-<id>\p`（必ず配下） |
+| `--profile-dir` の場所 `<P>` | `<TMP>/p` | `<TMP>/p`（`<TMP>` は下記注の実体パス） | `%LOCALAPPDATA%\fandhe-ct-<id>\p`（必ず配下） |
 | 一時出力先 `<TMP>` | `mktemp -d` 配下 | `mktemp -d` 配下 | `$env:TEMP` 配下の新規ディレクトリ |
 | 終了操作（launch） | SIGINT（Ctrl+C） | 同左 | Ctrl+C / `Stop-Process` |
+
+macOS の注: `mktemp -d` は `/var/folders/...` を返すが `/var` は `/private/var` への symlink で、`ExplicitStore` は canonicalize せず `Profile::open` は祖先の symlink を拒否する。`<TMP>` は `TMP=$(cd "$(mktemp -d)" && pwd -P)` のように実体パスへ解決してから `<P>=<TMP>/p` を組み立てる。
 
 根拠: `crates/fandhe-browser-profile/src/store.rs` の `APP_DIR_NAME = "fandhe-browser"`。
 
@@ -91,7 +93,7 @@ ID は `CT-<コマンド>-<LINUX|MACOS|WINDOWS>`。3 OS とも argv の形は同
 - 補助確認: `GET http://127.0.0.1:9333/json/version` が 200 の JSON を返し、`webSocketDebuggerUrl` が stderr の URL と一致する
 - 副作用: 既定プロファイルルート（2.5）に `profile.lock` と `cookies`・`storage`・`cache`・`history` ができる
 - 終了操作の後: ポート 9333 が解放される（プロセスの終了コードは判定対象にしない）
-- 後片付け: 隔離用ディレクトリを削除する（Windows は `%LOCALAPPDATA%\fandhe-browser` の本ケースで作った分）
+- 後片付け: 隔離用ディレクトリを削除する（Windows は `%LOCALAPPDATA%\fandhe-browser` のうち本ケースで新規作成した分だけ。実施前から存在したものは削除しない）
 
 ### 3.2 ナビゲーション（`CT-NAV-*`）
 
