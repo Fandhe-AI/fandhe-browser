@@ -18,6 +18,8 @@ use std::process::ExitCode;
 
 use crate::server::StartupError;
 
+pub(crate) mod launch;
+
 /// usage エラー時の終了コード（`StartupError` 系の 1 と区別する）。
 const USAGE_EXIT_CODE: u8 = 2;
 /// エラー表示に載せる利用者入力の最大文字数（巨大引数・制御文字の端末出力を避ける）。
@@ -30,8 +32,13 @@ pub(crate) struct CommandArgs {
 }
 
 impl CommandArgs {
-    /// サブコマンド名より後ろの引数列。値取得ヘルパは使う側（47.2 以降）で追加するため、現状はテスト専用。
+    /// 解析済みの引数列を組み立てる（ハンドラ単体テスト用）。
     #[cfg(test)]
+    pub(crate) fn new(rest: Vec<String>) -> Self {
+        Self { rest }
+    }
+
+    /// サブコマンド名より後ろの引数列。
     pub(crate) fn as_slice(&self) -> &[String] {
         &self.rest
     }
@@ -63,8 +70,8 @@ pub(crate) struct CommandSpec {
     pub(crate) run: Handler,
 }
 
-/// 本番の登録表。47.1 時点では 0 件（#283〜#287 が起動・ナビゲーション等を追加する）。
-pub(crate) const COMMANDS: &[CommandSpec] = &[];
+/// 本番の登録表。`launch`（#283）を登録済み。ナビゲーション等は #284〜#287 が追加する。
+pub(crate) const COMMANDS: &[CommandSpec] = &[launch::SPEC];
 
 /// ディスパッチ先の一式。
 #[derive(Debug, Clone, Copy)]
@@ -96,6 +103,8 @@ pub(crate) enum UsageError {
     UnknownCommand(String),
     /// 未知のオプション。
     UnknownOption(String),
+    /// 余分な位置引数。
+    UnexpectedArgument(String),
 }
 
 /// 利用者入力を端末へ安全に出すため、エスケープして長さを切り詰める。
@@ -119,6 +128,7 @@ impl fmt::Display for UsageError {
             }
             Self::UnknownCommand(name) => write!(f, "unknown command '{}'", sanitize(name)),
             Self::UnknownOption(name) => write!(f, "unknown option '{}'", sanitize(name)),
+            Self::UnexpectedArgument(a) => write!(f, "unexpected argument '{}'", sanitize(a)),
         }
     }
 }
@@ -216,7 +226,7 @@ fn parse<'a>(
 fn write_help(out: &mut impl Write, registry: &Registry<'_>) -> io::Result<()> {
     writeln!(out, "Usage: fandhe-browser [COMMAND] [ARGS]...")?;
     writeln!(out)?;
-    writeln!(out, "With no command, starts the server.")?;
+    writeln!(out, "With no command, behaves like 'launch'.")?;
     writeln!(out)?;
     writeln!(out, "Commands:")?;
     for c in registry.commands {
@@ -364,6 +374,32 @@ mod tests {
             err,
             CommandError::Usage(UsageError::NonUtf8Argument { index: 1 })
         ));
+    }
+
+    #[test]
+    fn cli1_help_lists_launch() {
+        let registry = Registry {
+            default: default_ok,
+            commands: COMMANDS,
+        };
+        let mut out = Vec::new();
+        dispatch(os(&["--help"]), &registry, &mut out).expect("help succeeds");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("launch       Start the CDP/AI API server with the default profile"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn cli1_unexpected_argument_display_is_escaped_and_truncated() {
+        let long = format!("\x1b[31m{}", "x".repeat(200));
+        let shown = UsageError::UnexpectedArgument(long).to_string();
+        assert!(
+            shown.starts_with("unexpected argument '\\u{1b}[31m"),
+            "{shown}"
+        );
+        assert!(shown.ends_with("...'"), "{shown}");
     }
 
     #[test]

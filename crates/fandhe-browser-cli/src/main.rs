@@ -1,6 +1,6 @@
 //! バイナリ `fandhe-browser` の入口（TASK-41（41.5）・MS-3・`CDP-1`・`AISNAP-6`）。
 //!
-//! 引数なしでは OS 既定のプロファイルと `127.0.0.1:9333` でサーバーを起動する。引数は
+//! 引数なしでは `launch`（TASK-47.2・#283）と同じく OS 既定のプロファイルと `127.0.0.1:9333` でサーバーを起動する。引数は
 //! [`commands`] が `args_os` の手書き解析（#281）でディスパッチし、未知の引数は usage エラー
 //! （終了コード 2）にする（TASK-47.1・`CLI-1`）。組み立ての実体は [`server`] にあり、本ファイルは
 //! JS ワーカーフックへの分岐・ランタイム構築・エラー終了コードへの写像だけを担う
@@ -21,10 +21,6 @@ mod startup_config;
 
 use std::process::ExitCode;
 
-use fandhe_browser_profile::OsDefaultStore;
-
-use server::StartupError;
-
 fn main() -> ExitCode {
     // JS 評価用の子プロセス（`JS-1`・`JS-2`）として自分自身が再起動された場合に、ワーカー役へ
     // 分岐する入口（TASK-30・MS-3・#514）。js crate の `worker_main` を core の再エクスポート
@@ -37,7 +33,7 @@ fn main() -> ExitCode {
         return code;
     }
     let registry = commands::Registry {
-        default: run_default_server,
+        default: commands::launch::run_default,
         commands: commands::COMMANDS,
     };
     match commands::dispatch(
@@ -51,36 +47,4 @@ fn main() -> ExitCode {
             e.exit_code()
         }
     }
-}
-
-/// 引数なし起動のハンドラ。従来どおりサーバーを起動する（47.2 以降で起動コマンドへ委ねる）。
-fn run_default_server() -> Result<commands::CommandOutcome, commands::CommandError> {
-    run_main()?;
-    Ok(commands::CommandOutcome::Completed)
-}
-
-/// current_thread ランタイムを構築してサーバーを動かす。構築失敗は panic させず
-/// [`StartupError::Runtime`] として返す（release は `panic = "abort"`）。
-fn run_main() -> Result<(), StartupError> {
-    // 設定エラーはプロファイル open・bind より前に確定させる（サーバーを起動しない）。
-    // `[js] execute_page_scripts` からページスクリプト実行アクターのハンドルを作る（TASK-112・
-    // `JS-1`・`JS-4`）。ハンドルの構築だけではスレッドも JS 子プロセスも作らない（遅延起動）。
-    let config = startup_config::load_startup_config()?;
-    let page_scripts = page_scripts::handle_from_config(config.js());
-    // 描画ホストの解決も bind より前に行う。不正なパスはサーバーを起動せず非 0 終了させる（fail-closed）。
-    // 設定キーは core の `Config` に未定義のため `None` 固定（REPAIR-3。後続課題で config から渡す）。
-    // 解決できてもホストはここでは起動しない（`HostRenderer` は初回の描画要求で遅延起動する）。
-    let renderer = render_host::renderer_from_process(None)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(StartupError::Runtime)?;
-    // AI API ルータ（`/ai/*`）は既定の追加ルータとして CDP と同一リスナーへ合成する（TASK-19.3）。
-    runtime.block_on(server::run(
-        &OsDefaultStore::new(),
-        server::DEFAULT_ADDR,
-        server::default_router_factories(),
-        page_scripts,
-        renderer,
-    ))
 }
