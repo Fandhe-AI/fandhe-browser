@@ -107,12 +107,15 @@ is_windows_target() { case "$1" in *-windows-*) return 0 ;; *) return 1 ;; esac;
 
 # 検査 E 用: mozangle を引き込む唯一の経路である servo の `no-wgl` feature が、host manifest で
 # Windows 限定の target 依存にだけ付いていることを検査する（$1=servo-host の cargo metadata --no-deps の JSON）。
-# 固定ターゲット一覧（musl 等の一覧外）に頼らず cfg の式そのものを見るため、一覧外の非 Windows
-# ターゲットへ mozangle が入る変更も拒否する。`no-wgl` 付きの dependency が target 無し・
-# `windows` を含まない cfg・`not(` を含む cfg のいずれかなら NG。`no-wgl` 付きが 1 件も無ければ OK。
+# 固定ターゲット一覧（musl 等の一覧外）に頼らず target 指定そのものを見るため、一覧外の非 Windows
+# ターゲットへ mozangle が入る変更も拒否する。部分一致では `cfg(any(windows, target_env = "musl"))`
+# のような Windows を必須にしない式を通してしまうため、許可する target 指定は
+# NO_WGL_ALLOWED_TARGETS の明示集合との完全一致に限る（fail-closed）。`no-wgl` 付きの dependency が
+# target 無し・集合外の target のいずれかなら NG。`no-wgl` 付きが 1 件も無ければ OK。
+NO_WGL_ALLOWED_TARGETS='["cfg(windows)","cfg(target_os = \"windows\")","x86_64-pc-windows-msvc","aarch64-pc-windows-msvc"]'
 check_no_wgl_windows_only() {
   local bad
-  if ! bad="$(jq -r '[.packages[].dependencies[] | select((.features // []) | index("no-wgl")) | select(((.target // "") | test("windows") and (test("not\\s*\\(") | not)) | not) | "\(.name) target=\(.target // "none")"] | .[]' <<<"$1")"; then
+  if ! bad="$(jq -r --argjson allowed "$NO_WGL_ALLOWED_TARGETS" '[.packages[].dependencies[] | select((.features // []) | index("no-wgl")) | select((.target // "") as $t | ($allowed | index($t)) | not) | "\(.name) target=\(.target // "none")"] | .[]' <<<"$1")"; then
     echo "NG: failed to inspect servo-host manifest (jq)" >&2
     return 1
   fi
@@ -269,6 +272,10 @@ self_test() {
   expect "E: no-wgl on cfg(unix) is NG" ng check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":"cfg(unix)"}]}]}'
   expect "E: no-wgl on musl target_env is NG" ng check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":"cfg(target_env = \"musl\")"}]}]}'
   expect "E: no-wgl on cfg(not(windows)) is NG" ng check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":"cfg(not(windows))"}]}]}'
+  expect "E: no-wgl on cfg(target_os = windows) is allowed" ok check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":"cfg(target_os = \"windows\")"}]}]}'
+  expect "E: no-wgl on cfg(any(windows, musl)) is NG" ng check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":"cfg(any(windows, target_env = \"musl\"))"}]}]}'
+  expect "E: no-wgl on cfg(all(windows, unix)) is NG" ng check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":"cfg(all(windows, unix))"}]}]}'
+  expect "E: no-wgl on x86_64-pc-windows-gnu is NG" ng check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":"x86_64-pc-windows-gnu"}]}]}'
   expect "E: servo without no-wgl is allowed" ok check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["baked-in-resources"],"target":null}]}]}'
   expect "E: targets match deny.toml" ok check_targets_match "$(printf 'b\na\nw\n')" "a b" "w"
   expect "E: target missing from the check list is NG" ng check_targets_match "$(printf 'a\nb\nc\n')" "a b" "w"
