@@ -190,7 +190,19 @@ export class Reader {
     this.eof = false;
     this.max = max;
     this.wake = null;
+    this.stream = stream;
+    this.overflow = false;
+    this.stopped = false;
+    // 未処理バッファの総量上限（完成フレーム 1 個 + 次フレーム 1 個分）。追加前に検査する。
+    this.cap = 2 * (max + 5);
     stream.on('data', (d) => {
+      if (this.stopped) return;
+      if (this.buf.length + d.length > this.cap) {
+        this.overflow = true;
+        this.stop();
+        this.#notify();
+        return;
+      }
       this.buf = Buffer.concat([this.buf, d]);
       this.#notify();
     });
@@ -203,6 +215,18 @@ export class Reader {
     stream.on('error', end);
   }
 
+  // 受信を直ちに止め、バッファを破棄する（異常検出後・中断後に受信を続けない）。
+  stop() {
+    this.stopped = true;
+    this.buf = Buffer.alloc(0);
+    try {
+      this.stream.pause();
+      if (typeof this.stream.destroy === 'function') this.stream.destroy();
+    } catch {
+      // 既に閉じている場合は無視する。
+    }
+  }
+
   #notify() {
     const w = this.wake;
     this.wake = null;
@@ -213,6 +237,7 @@ export class Reader {
   async next(timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
+      if (this.overflow) throw new ProtoError('receive buffer limit exceeded');
       if (this.buf.length >= 4) {
         const len = this.buf.readUInt32LE(0);
         if (len === 0) throw new ProtoError('empty frame');
@@ -470,9 +495,20 @@ async function main(argv) {
   let success = 0;
   let abortReason = null;
 
+  // ワーカーを確実に終了させ、終了を待つ（孤児プロセス・無制限受信を残さない）。
+  const killWorker = async () => {
+    reader.stop();
+    try {
+      proc.kill('SIGKILL');
+    } catch {
+      // 既に終了している場合は無視する。
+    }
+    await Promise.race([closed, new Promise((r) => setTimeout(r, 3000))]);
+  };
+
   const diag = async (why) => {
     await Promise.race([closed, new Promise((r) => setTimeout(r, 2000))]);
-    console.error(`info: ${why}; worker exit=${exitCode ?? 'running'}; stderr tail: ${sanitize(errTail)}`);
+    console.error(`info: ${why}; worker exit=${exitCode ?? 'killed'}; stderr tail: ${sanitize(errTail)}`);
   };
 
   // ハンドシェイク。
@@ -485,15 +521,18 @@ async function main(argv) {
     const eng = hello.payload[2];
     if (ver !== PROTOCOL_VERSION) {
       console.error(`error: worker protocol version ${ver} != ${PROTOCOL_VERSION} (this driver is hard-coded to v${PROTOCOL_VERSION})`);
+      await killWorker();
       summary(total, 0, 0, 'blocked', 'hello-version-mismatch');
       return 2;
     }
     if (eng !== 0) {
       console.error(`error: worker engine byte ${eng} is not V8 (0)`);
+      await killWorker();
       summary(total, 0, 0, 'blocked', 'hello-engine-mismatch');
       return 2;
     }
   } catch (e) {
+    await killWorker();
     await diag(`handshake failed: ${e.message}`);
     const label = e instanceof TimeoutError ? 'timeout' : e instanceof CrashError ? 'crash' : 'protocol-error';
     summary(total, 0, 0, 'fail', `handshake-${label}`);
@@ -513,7 +552,9 @@ async function main(argv) {
       const deadline = Date.now() + timeoutMs;
       let outcome = null;
       while (outcome === null) {
-        const f = await reader.next(Math.max(1, deadline - Date.now()));
+        // 逆方向 RPC を連続送信されてもケース期限を超えて続行しない（反復ごとに絶対期限を確認する）。
+        if (Date.now() >= deadline) throw new TimeoutError('case deadline exceeded');
+        const f = await reader.next(deadline - Date.now());
         if (f === null) throw new CrashError('eof during case');
         if (f.tag === TAG.NATIVE_CALL) {
           const [id, a] = decNativeCall(f.payload);
@@ -540,6 +581,7 @@ async function main(argv) {
     } catch (e) {
       status = e instanceof TimeoutError ? 'timeout' : e instanceof CrashError ? 'crash' : 'protocol-error';
       abortReason = status;
+      await killWorker();
       await diag(`${c.id}: ${e.message}`);
     }
     console.log(`container-js-smoke: case=${c.id} category=${c.category} status=${status}`);
@@ -555,7 +597,7 @@ async function main(argv) {
       return 1;
     }
   } else {
-    proc.kill('SIGKILL');
+    await killWorker();
   }
   if (executed === 0) {
     summary(total, 0, 0, 'fail', 'no-cases-executed');

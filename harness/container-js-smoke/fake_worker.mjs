@@ -6,7 +6,8 @@
 // 第 1 引数のモードで異常系を再現する:
 //   ok / version（HELLO の版不一致）/ boa（エンジン不一致）/ badtag（未知 tag）/ huge（過大な長さ）/
 //   eof（評価中に終了）/ hang（無応答）/ mismatch（RESULT の値不一致）/ badutf8（不正 UTF-8 の文字列）/
-//   nohello（HELLO を送らず無応答）/ dirtyexit（SHUTDOWN 後に非 0 で終了）
+//   nohello（HELLO を送らず無応答）/ rpcflood（NATIVE_CALL を連続送信し RESULT を返さない）/ dirtyexit（SHUTDOWN 後に非 0 で終了）
+import { writeFileSync } from 'node:fs';
 import { Reader, TAG, SCRIPTS, NATIVE_ID, frame, encValue, MAX_FRAME_PAYLOAD_CHILD_TO_PARENT } from './driver.mjs';
 
 const mode = process.argv[2] ?? 'ok';
@@ -16,6 +17,12 @@ const error = (kind, msg) => out(TAG.ERROR, Buffer.concat([Buffer.from([kind]), 
 const reader = new Reader(process.stdin, MAX_FRAME_PAYLOAD_CHILD_TO_PARENT);
 
 if (mode === 'nohello') {
+  // 親が stdin を閉じたら終了する（孤児化させない）。
+  process.stdin.on('close', () => process.exit(0));
+  // 自己テストが孤児化の有無を kill -0 で確認できるよう PID を書き出す（テスト専用）。
+  if (process.env.CONTAINER_JS_SMOKE_FAKE_PID_FILE_FOR_TEST) {
+    writeFileSync(process.env.CONTAINER_JS_SMOKE_FAKE_PID_FILE_FOR_TEST, String(process.pid));
+  }
   setInterval(() => {}, 1000);
 } else {
   const hello = Buffer.alloc(3);
@@ -42,6 +49,17 @@ async function evaluate(script, first) {
   if (first && mode === 'huge') return process.stdout.write(Buffer.from([0xf0, 0xff, 0xff, 0xff]));
   if (first && mode === 'eof') process.exit(3);
   if (first && mode === 'hang') return setInterval(() => {}, 1000);
+  if (first && mode === 'rpcflood') {
+    // RESULT を返さず NATIVE_CALL を送り続ける（ケース期限の強制を検証する）。
+    const head = Buffer.alloc(8);
+    head.writeUInt32LE(NATIVE_ID.count, 0);
+    const tick = () => {
+      out(TAG.NATIVE_CALL, head);
+      setImmediate(tick);
+    };
+    tick();
+    return new Promise(() => {});
+  }
   switch (script) {
     case SCRIPTS.arith: return result(mode === 'mismatch' ? 8 : 7);
     case SCRIPTS.string:

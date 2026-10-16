@@ -68,6 +68,17 @@ expect_eq "hang: first case" timeout "$(status_of eval-arith)"
 run_mode nohello --case-timeout 1
 expect_eq "nohello: exit" 1 "$RC"
 expect_eq "nohello: summary" "container-js-smoke-summary: role=default total=17 executed=0 success=0 result=fail reason=handshake-timeout" "$(summary_of)"
+# ハンドシェイク失敗でワーカーを孤児として残さない（終了を待ってから戻る）。
+NOHELLO_PID_FILE="${TMP}/nohello.pid"
+CONTAINER_JS_SMOKE_FAKE_PID_FILE_FOR_TEST="$NOHELLO_PID_FILE" run_mode nohello --case-timeout 1
+if [ -s "$NOHELLO_PID_FILE" ] && ! kill -0 "$(cat "$NOHELLO_PID_FILE")" 2>/dev/null; then
+  ok "nohello: worker is not left running"
+else
+  ng "nohello: worker is not left running"
+fi
+run_mode rpcflood --case-timeout 1
+expect_eq "rpcflood: exit" 1 "$RC"
+expect_eq "rpcflood: first case" timeout "$(status_of eval-arith)"
 run_mode mismatch --case-timeout 10
 expect_eq "mismatch: exit" 1 "$RC"
 expect_eq "mismatch: eval-arith" mismatch "$(status_of eval-arith)"
