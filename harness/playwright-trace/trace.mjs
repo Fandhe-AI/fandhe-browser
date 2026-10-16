@@ -188,8 +188,10 @@ for (const p of ["/json/version", "/json/version/"]) {
 // 未実装。CDP-6・TASK-43.3g・#942）。既定のオプションでは Playwright が allowAndName を送って先へ進めないため、
 // noDefaults:true（接続直後の Browser.setDownloadBehavior を省く）と acceptDownloads:false（newContext で
 // deny + eventsEnabled:true を送る）を指定する。
+// viewport:null は、画面に近い Emulation.setDeviceMetricsOverride と Browser.getWindowForTarget の送信を省く
+// （ビューポートのモデルがまだ無く、受理する範囲を絞るオーナー方針のため。TASK-43.3m・#1041）。
 const CONNECT_OPTIONS = { timeout: STAGE_TIMEOUT_MS, noDefaults: true };
-const CONTEXT_OPTIONS = { acceptDownloads: false };
+const CONTEXT_OPTIONS = { acceptDownloads: false, viewport: null };
 
 let browser;
 if (endpoint.protocol === "http:") {

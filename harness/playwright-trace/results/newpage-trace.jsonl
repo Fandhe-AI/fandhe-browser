@@ -15,34 +15,30 @@
 {"seq":14,"kind":"stage","name":"newContext","ok":true}
 {"seq":15,"kind":"cdp","dir":"send","message":{"id":6,"method":"Target.createTarget","params":{"url":"about:blank","browserContextId":"00000000000000000000000000000002"}}}
 {"seq":16,"kind":"cdp","dir":"recv","message":{"method":"Target.attachedToTarget","params":{"sessionId":"00000000000000000000000000000001","targetInfo":{"attached":true,"browserContextId":"00000000000000000000000000000002","canAccessOpener":false,"targetId":"00000000000000000000000000000001","title":"about:blank","type":"page","url":"about:blank"},"waitingForDebugger":true}}}
-{"seq":17,"kind":"cdp","dir":"send","message":{"id":7,"method":"Browser.getWindowForTarget","sessionId":"00000000000000000000000000000001"}}
-{"seq":18,"kind":"cdp","dir":"recv","message":{"id":6,"result":{"targetId":"00000000000000000000000000000001"}}}
-{"seq":19,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":7,"sessionId":"00000000000000000000000000000001"}}
-{"seq":20,"kind":"cdp","dir":"send","message":{"id":8,"method":"Page.enable","sessionId":"00000000000000000000000000000001"}}
-{"seq":21,"kind":"cdp","dir":"send","message":{"id":9,"method":"Page.getFrameTree","sessionId":"00000000000000000000000000000001"}}
-{"seq":22,"kind":"cdp","dir":"send","message":{"id":10,"method":"Log.enable","params":{},"sessionId":"00000000000000000000000000000001"}}
-{"seq":23,"kind":"cdp","dir":"send","message":{"id":11,"method":"Page.setLifecycleEventsEnabled","params":{"enabled":true},"sessionId":"00000000000000000000000000000001"}}
-{"seq":24,"kind":"cdp","dir":"send","message":{"id":12,"method":"Runtime.enable","params":{},"sessionId":"00000000000000000000000000000001"}}
-{"seq":25,"kind":"cdp","dir":"send","message":{"id":13,"method":"Page.addScriptToEvaluateOnNewDocument","params":{"source":"","worldName":"__playwright_utility_world_page@<WORLD_HASH>"},"sessionId":"00000000000000000000000000000001"}}
-{"seq":26,"kind":"cdp","dir":"send","message":{"id":14,"method":"Network.enable","sessionId":"00000000000000000000000000000001"}}
-{"seq":27,"kind":"cdp","dir":"send","message":{"id":15,"method":"Target.setAutoAttach","params":{"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true},"sessionId":"00000000000000000000000000000001"}}
-{"seq":28,"kind":"cdp","dir":"send","message":{"id":16,"method":"Emulation.setFocusEmulationEnabled","params":{"enabled":true},"sessionId":"00000000000000000000000000000001"}}
-{"seq":29,"kind":"cdp","dir":"send","message":{"id":17,"method":"Emulation.setDeviceMetricsOverride","params":{"mobile":false,"width":1280,"height":720,"screenWidth":1280,"screenHeight":720,"deviceScaleFactor":1,"screenOrientation":{"angle":0,"type":"landscapePrimary"}},"sessionId":"00000000000000000000000000000001"}}
-{"seq":30,"kind":"cdp","dir":"send","message":{"id":18,"method":"Emulation.setEmulatedMedia","params":{"media":"","features":[{"name":"prefers-color-scheme","value":"light"},{"name":"prefers-reduced-motion","value":"no-preference"},{"name":"forced-colors","value":"none"},{"name":"prefers-contrast","value":"no-preference"}]},"sessionId":"00000000000000000000000000000001"}}
-{"seq":31,"kind":"cdp","dir":"send","message":{"id":19,"method":"Runtime.runIfWaitingForDebugger","sessionId":"00000000000000000000000000000001"}}
-{"seq":32,"kind":"cdp","dir":"recv","message":{"id":8,"result":{},"sessionId":"00000000000000000000000000000001"}}
-{"seq":33,"kind":"cdp","dir":"recv","message":{"id":9,"result":{"frameTree":{"frame":{"id":"main","loaderId":"2","mimeType":"text/html","url":"about:blank"}}},"sessionId":"00000000000000000000000000000001"}}
-{"seq":34,"kind":"cdp","dir":"send","message":{"id":20,"method":"Target.closeTarget","params":{"targetId":"00000000000000000000000000000001"}}}
-{"seq":35,"kind":"cdp","dir":"recv","message":{"id":10,"result":{},"sessionId":"00000000000000000000000000000001"}}
-{"seq":36,"kind":"cdp","dir":"recv","message":{"id":11,"result":{},"sessionId":"00000000000000000000000000000001"}}
-{"seq":37,"kind":"cdp","dir":"recv","message":{"id":12,"result":{},"sessionId":"00000000000000000000000000000001"}}
-{"seq":38,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":13,"sessionId":"00000000000000000000000000000001"}}
-{"seq":39,"kind":"cdp","dir":"recv","message":{"id":14,"result":{},"sessionId":"00000000000000000000000000000001"}}
-{"seq":40,"kind":"cdp","dir":"recv","message":{"error":{"code":-32602,"message":"unsupported params"},"id":15,"sessionId":"00000000000000000000000000000001"}}
-{"seq":41,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":16,"sessionId":"00000000000000000000000000000001"}}
-{"seq":42,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":17,"sessionId":"00000000000000000000000000000001"}}
-{"seq":43,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":18,"sessionId":"00000000000000000000000000000001"}}
-{"seq":44,"kind":"cdp","dir":"recv","message":{"id":19,"result":{},"sessionId":"00000000000000000000000000000001"}}
-{"seq":45,"kind":"cdp","dir":"recv","message":{"id":20,"result":{"success":true}}}
-{"seq":46,"kind":"cdp","dir":"recv","message":{"method":"Target.detachedFromTarget","params":{"sessionId":"00000000000000000000000000000001","targetId":"00000000000000000000000000000001"}}}
-{"seq":47,"kind":"stage","name":"newPage","ok":false,"error":"browserContext.newPage: Frame has been detached."}
+{"seq":17,"kind":"cdp","dir":"send","message":{"id":7,"method":"Page.enable","sessionId":"00000000000000000000000000000001"}}
+{"seq":18,"kind":"cdp","dir":"send","message":{"id":8,"method":"Page.getFrameTree","sessionId":"00000000000000000000000000000001"}}
+{"seq":19,"kind":"cdp","dir":"send","message":{"id":9,"method":"Log.enable","params":{},"sessionId":"00000000000000000000000000000001"}}
+{"seq":20,"kind":"cdp","dir":"send","message":{"id":10,"method":"Page.setLifecycleEventsEnabled","params":{"enabled":true},"sessionId":"00000000000000000000000000000001"}}
+{"seq":21,"kind":"cdp","dir":"send","message":{"id":11,"method":"Runtime.enable","params":{},"sessionId":"00000000000000000000000000000001"}}
+{"seq":22,"kind":"cdp","dir":"send","message":{"id":12,"method":"Page.addScriptToEvaluateOnNewDocument","params":{"source":"","worldName":"__playwright_utility_world_page@<WORLD_HASH>"},"sessionId":"00000000000000000000000000000001"}}
+{"seq":23,"kind":"cdp","dir":"send","message":{"id":13,"method":"Network.enable","sessionId":"00000000000000000000000000000001"}}
+{"seq":24,"kind":"cdp","dir":"send","message":{"id":14,"method":"Target.setAutoAttach","params":{"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true},"sessionId":"00000000000000000000000000000001"}}
+{"seq":25,"kind":"cdp","dir":"send","message":{"id":15,"method":"Emulation.setFocusEmulationEnabled","params":{"enabled":true},"sessionId":"00000000000000000000000000000001"}}
+{"seq":26,"kind":"cdp","dir":"send","message":{"id":16,"method":"Emulation.setEmulatedMedia","params":{"media":"","features":[{"name":"prefers-color-scheme","value":"light"},{"name":"prefers-reduced-motion","value":"no-preference"},{"name":"forced-colors","value":"none"},{"name":"prefers-contrast","value":"no-preference"}]},"sessionId":"00000000000000000000000000000001"}}
+{"seq":27,"kind":"cdp","dir":"send","message":{"id":17,"method":"Runtime.runIfWaitingForDebugger","sessionId":"00000000000000000000000000000001"}}
+{"seq":28,"kind":"cdp","dir":"recv","message":{"id":6,"result":{"targetId":"00000000000000000000000000000001"}}}
+{"seq":29,"kind":"cdp","dir":"recv","message":{"id":7,"result":{},"sessionId":"00000000000000000000000000000001"}}
+{"seq":30,"kind":"cdp","dir":"recv","message":{"id":8,"result":{"frameTree":{"frame":{"id":"main","loaderId":"2","mimeType":"text/html","url":"about:blank"}}},"sessionId":"00000000000000000000000000000001"}}
+{"seq":31,"kind":"cdp","dir":"send","message":{"id":18,"method":"Target.closeTarget","params":{"targetId":"00000000000000000000000000000001"}}}
+{"seq":32,"kind":"cdp","dir":"recv","message":{"id":9,"result":{},"sessionId":"00000000000000000000000000000001"}}
+{"seq":33,"kind":"cdp","dir":"recv","message":{"id":10,"result":{},"sessionId":"00000000000000000000000000000001"}}
+{"seq":34,"kind":"cdp","dir":"recv","message":{"id":11,"result":{},"sessionId":"00000000000000000000000000000001"}}
+{"seq":35,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":12,"sessionId":"00000000000000000000000000000001"}}
+{"seq":36,"kind":"cdp","dir":"recv","message":{"id":13,"result":{},"sessionId":"00000000000000000000000000000001"}}
+{"seq":37,"kind":"cdp","dir":"recv","message":{"error":{"code":-32602,"message":"unsupported params"},"id":14,"sessionId":"00000000000000000000000000000001"}}
+{"seq":38,"kind":"cdp","dir":"recv","message":{"id":15,"result":{},"sessionId":"00000000000000000000000000000001"}}
+{"seq":39,"kind":"cdp","dir":"recv","message":{"id":16,"result":{},"sessionId":"00000000000000000000000000000001"}}
+{"seq":40,"kind":"cdp","dir":"recv","message":{"id":17,"result":{},"sessionId":"00000000000000000000000000000001"}}
+{"seq":41,"kind":"cdp","dir":"recv","message":{"id":18,"result":{"success":true}}}
+{"seq":42,"kind":"cdp","dir":"recv","message":{"method":"Target.detachedFromTarget","params":{"sessionId":"00000000000000000000000000000001","targetId":"00000000000000000000000000000001"}}}
+{"seq":43,"kind":"stage","name":"newPage","ok":false,"error":"browserContext.newPage: Frame has been detached."}

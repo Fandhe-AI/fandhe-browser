@@ -285,9 +285,25 @@ struct Tables {
     /// `Log.enable`・`Runtime.enable`・`Network.enable` 済みのセッション（43.3j・#1038・`CDP-2`）。
     /// 寿命は `sessions` と同じで削除と同じロック内で消す。件数は `MAX_SESSIONS` 以下（`CDP-7`）。
     domains_enabled: HashMap<SessionId, SessionDomains>,
+    /// `Emulation.setFocusEmulationEnabled`・`setEmulatedMedia` で受理した検証済みの値（43.3m・#1041・`CDP-2`）。
+    /// どの API からも読まない（読み取りは `#[cfg(test)]` のみ）。寿命は `sessions` と同じで削除と同じロック内で
+    /// 消す。件数は `MAX_SESSIONS` 以下（`CDP-7`）。
+    emulation: HashMap<SessionId, SessionEmulation>,
     next_target: u64,
     next_session: u64,
     next_context: u64,
+}
+
+/// セッションごとの Emulation 保持値（43.3m・#1041・`CDP-2`）。
+///
+/// `Emulation.setFocusEmulationEnabled`・`setEmulatedMedia`（Playwright 既定値のみ）の検証済みの値を持つだけで、
+/// どの API も読まない。画面・UA・locale・タイムゾーンは含めない（`SEC-2`・`CDP-6`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SessionEmulation {
+    /// `setFocusEmulationEnabled` の直近の値。
+    pub(crate) focus: Option<bool>,
+    /// `setEmulatedMedia` で既定値を受理済みか。
+    pub(crate) media_default: bool,
 }
 
 /// ターゲット表とセッション表。単一 `Mutex` で保護し、
@@ -324,6 +340,7 @@ impl TargetRegistry {
                 page_enabled: HashSet::new(),
                 lifecycle_events_enabled: HashSet::new(),
                 domains_enabled: HashMap::new(),
+                emulation: HashMap::new(),
                 next_target,
                 next_session,
                 next_context,
@@ -470,6 +487,7 @@ impl TargetRegistry {
             t.page_enabled.remove(sid);
             t.lifecycle_events_enabled.remove(sid);
             t.domains_enabled.remove(sid);
+            t.emulation.remove(sid);
         }
         Ok(removed)
     }
@@ -499,6 +517,7 @@ impl TargetRegistry {
         t.page_enabled.remove(id);
         t.lifecycle_events_enabled.remove(id);
         t.domains_enabled.remove(id);
+        t.emulation.remove(id);
         t.sessions.remove(id).ok_or(CdpStateError::UnknownSession)
     }
 
@@ -551,6 +570,41 @@ impl TargetRegistry {
     #[cfg(test)]
     pub(crate) fn is_lifecycle_events_enabled(&self, sid: &SessionId) -> bool {
         self.lock().lifecycle_events_enabled.contains(sid)
+    }
+
+    /// `Emulation.setFocusEmulationEnabled` の検証済みの値を保持する（冪等。43.3m・#1041・`CDP-2`）。
+    ///
+    /// 保持値は読まれず、今は観測できる効果が無い（`REPAIR-3`。将来は render の境界ボックス・フォーカス管理と接続）。
+    /// 存在確認と設定を 1 回のロックで行う。置き場所の理由は [`Self::enable_page`]。
+    pub(crate) fn set_focus_emulation(
+        &self,
+        sid: &SessionId,
+        enabled: bool,
+    ) -> Result<(), CdpStateError> {
+        let mut t = self.lock();
+        if !t.sessions.contains_key(sid) {
+            return Err(CdpStateError::UnknownSession);
+        }
+        t.emulation.entry(sid.clone()).or_default().focus = Some(enabled);
+        Ok(())
+    }
+
+    /// `Emulation.setEmulatedMedia` で Playwright 既定値を受理した印を付ける（冪等。43.3m・#1041・`CDP-2`）。
+    ///
+    /// 既定値以外は呼び出し側が拒否するため、保持するのは「既定値を受理済み」の印だけ。読まれない（`REPAIR-3`）。
+    pub(crate) fn set_emulated_media_default(&self, sid: &SessionId) -> Result<(), CdpStateError> {
+        let mut t = self.lock();
+        if !t.sessions.contains_key(sid) {
+            return Err(CdpStateError::UnknownSession);
+        }
+        t.emulation.entry(sid.clone()).or_default().media_default = true;
+        Ok(())
+    }
+
+    /// セッションの Emulation 保持値（テスト用。本番コードからは読まない）。
+    #[cfg(test)]
+    pub(crate) fn emulation_of(&self, sid: &SessionId) -> Option<SessionEmulation> {
+        self.lock().emulation.get(sid).copied()
     }
 
     /// セッションに `Log`・`Runtime`・`Network` のいずれかの有効印を付ける（冪等。43.3j・#1038・`CDP-2`）。
@@ -735,6 +789,7 @@ impl TargetRegistry {
                 t.page_enabled.remove(s);
                 t.lifecycle_events_enabled.remove(s);
                 t.domains_enabled.remove(s);
+                t.emulation.remove(s);
             }
             closed.push((tid, sids));
         }
@@ -1287,6 +1342,66 @@ mod tests {
         r.set_lifecycle_events(&s3, true).unwrap();
         r.dispose_browser_context(&c).unwrap();
         assert!(!r.is_lifecycle_events_enabled(&s3));
+    }
+
+    #[test]
+    fn cdp2_emulation_state_is_idempotent_independent_and_rejects_unknown_session() {
+        let r = TargetRegistry::new();
+        let t = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        let s = r.attach(&t).unwrap();
+        assert_eq!(r.emulation_of(&s), None);
+        r.set_focus_emulation(&s, true).unwrap();
+        r.set_focus_emulation(&s, true).unwrap();
+        assert_eq!(
+            r.emulation_of(&s),
+            Some(SessionEmulation {
+                focus: Some(true),
+                media_default: false
+            })
+        );
+        r.set_emulated_media_default(&s).unwrap();
+        r.set_focus_emulation(&s, false).unwrap();
+        assert_eq!(
+            r.emulation_of(&s),
+            Some(SessionEmulation {
+                focus: Some(false),
+                media_default: true
+            })
+        );
+        // 他のフラグとは独立。
+        assert!(!r.is_page_enabled(&s));
+        assert!(!r.is_lifecycle_events_enabled(&s));
+        let ghost = SessionId::parse("ghost-1").unwrap();
+        assert_eq!(
+            r.set_focus_emulation(&ghost, true),
+            Err(CdpStateError::UnknownSession)
+        );
+        assert_eq!(
+            r.set_emulated_media_default(&ghost),
+            Err(CdpStateError::UnknownSession)
+        );
+        assert_eq!(r.emulation_of(&ghost), None);
+    }
+
+    #[test]
+    fn cdp7_emulation_state_is_dropped_on_detach_close_and_dispose() {
+        let r = TargetRegistry::new();
+        let t1 = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        let s1 = r.attach(&t1).unwrap();
+        r.set_focus_emulation(&s1, true).unwrap();
+        r.detach(&s1).unwrap();
+        assert_eq!(r.emulation_of(&s1), None);
+        let s1b = r.attach(&t1).unwrap();
+        r.set_emulated_media_default(&s1b).unwrap();
+        r.close_target(&t1).unwrap();
+        assert_eq!(r.emulation_of(&s1b), None);
+        let c = r.create_browser_context().unwrap();
+        let (_t3, s3) = r
+            .create_target_attached(Some(&c), TargetKind::Page, "about:blank", false)
+            .unwrap();
+        r.set_focus_emulation(&s3, true).unwrap();
+        r.dispose_browser_context(&c).unwrap();
+        assert_eq!(r.emulation_of(&s3), None);
     }
 
     #[test]

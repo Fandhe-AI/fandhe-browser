@@ -36,7 +36,7 @@ const TRACE: &str = include_str!("../../../harness/playwright-trace/results/newp
 const MAX_TRACE_LINES: usize = 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
-/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3j 後）。`connectOverCDP(noDefaults:true)` は
+/// 現状のトレースが示す到達点（2026-10 時点・TASK-43.3m 後）。`connectOverCDP(noDefaults:true)` は
 /// `Target.setAutoAttach`（`waitForDebuggerOnStart:true`）・`Target.getTargetInfo` を経て成功し、
 /// `newContext({acceptDownloads:false})` は `Target.createBrowserContext` と
 /// `browserContextId` 付き `Browser.setDownloadBehavior` を経て成功する。`newPage()` は
@@ -47,18 +47,20 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 /// 引く）を前提にすること。`frame.id` が `"main"` のままだと一致しない（`docs/design/playwright-compat.md`）。
 /// `Log.enable`・`Runtime.enable`・`Network.enable`（43.3j）は有効フラグを立てて `{}` を返す（イベントは送らない。`REPAIR-3`）。
 /// `Page.setLifecycleEventsEnabled`（43.3k）は有効フラグを立てて `{}` を返す。この trace は遷移を含まないため
-/// `Page.lifecycleEvent` は現れない。残りの `Page.addScriptToEvaluateOnNewDocument` 等は未実装で `-32601`。
+/// `Page.lifecycleEvent` は現れない。`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（43.3m・#1041）は
+/// Playwright 既定値だけを受理して保持し `{}` を返す（保持値は読まれない。`REPAIR-3`）。収集は `newContext({viewport:null})` で行うため
+/// `Browser.getWindowForTarget`・`Emulation.setDeviceMetricsOverride` は送られない。残りの `Page.addScriptToEvaluateOnNewDocument` 等は
+/// 未実装で `-32601`。
 ///
 /// 注意: `Browser.getVersion` の応答に `CARGO_PKG_VERSION` が入るため、workspace の版を上げたら
 /// `make trace-playwright` でトレースを再取得すること。
-const EXPECTED_SEND_METHODS: [&str; 20] = [
+const EXPECTED_SEND_METHODS: [&str; 18] = [
     "Browser.getVersion",
     "Target.setAutoAttach",
     "Target.getTargetInfo",
     "Target.createBrowserContext",
     "Browser.setDownloadBehavior",
     "Target.createTarget",
-    "Browser.getWindowForTarget",
     "Page.enable",
     "Page.getFrameTree",
     "Log.enable",
@@ -68,7 +70,6 @@ const EXPECTED_SEND_METHODS: [&str; 20] = [
     "Network.enable",
     "Target.setAutoAttach",
     "Emulation.setFocusEmulationEnabled",
-    "Emulation.setDeviceMetricsOverride",
     "Emulation.setEmulatedMedia",
     "Runtime.runIfWaitingForDebugger",
     "Target.closeTarget",
@@ -374,30 +375,28 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
                 "waitingForDebugger": true
             }}),
             json!({"id": 6, "result": {"targetId": "00000000000000000000000000000001"}}),
-            // `Browser.getWindowForTarget` は未実装（Playwright は握りつぶす）。
-            not_impl(7),
             // `Page.enable`・`Page.getFrameTree`（43.3i）は実装済み。止めたターゲットでも初期 about:blank の
             // メインフレーム（`loaderId` は初期確定後の世代）を返す。
-            json!({"id": 8, "sessionId": sid, "result": {}}),
-            json!({"id": 9, "sessionId": sid, "result": {"frameTree": {"frame": {
+            json!({"id": 7, "sessionId": sid, "result": {}}),
+            json!({"id": 8, "sessionId": sid, "result": {"frameTree": {"frame": {
                 "id": "main", "loaderId": "2", "url": "about:blank", "mimeType": "text/html"
             }}}}),
             // `Log.enable`・`Runtime.enable`・`Network.enable`（43.3j）は受理して `{}`（イベントなし）。
-            // 他のセッション付き初期化メソッド（id 13, 16-18）は未実装。
-            json!({"id": 10, "sessionId": sid, "result": {}}),
+            // `Page.addScriptToEvaluateOnNewDocument`（id 12）は未実装。
+            json!({"id": 9, "sessionId": sid, "result": {}}),
             // `Page.setLifecycleEventsEnabled`（43.3k）は有効フラグを立てて `{}`（この trace は遷移を含まず lifecycle は現れない）。
+            json!({"id": 10, "sessionId": sid, "result": {}}),
             json!({"id": 11, "sessionId": sid, "result": {}}),
-            json!({"id": 12, "sessionId": sid, "result": {}}),
-            not_impl(13),
-            json!({"id": 14, "sessionId": sid, "result": {}}),
+            not_impl(12),
+            json!({"id": 13, "sessionId": sid, "result": {}}),
             // 子ターゲットの自動 attach（`sessionId` 付き `Target.setAutoAttach`）は未実装（43.3c）。
-            json!({"id": 15, "sessionId": sid, "error": {"code": -32602, "message": "unsupported params"}}),
-            not_impl(16),
-            not_impl(17),
-            not_impl(18),
+            json!({"id": 14, "sessionId": sid, "error": {"code": -32602, "message": "unsupported params"}}),
+            // `Emulation.setFocusEmulationEnabled`・`setEmulatedMedia`（43.3m・#1041）は既定値を受理して `{}`（保持のみ）。
+            json!({"id": 15, "sessionId": sid, "result": {}}),
+            json!({"id": 16, "sessionId": sid, "result": {}}),
             // 止めたセッションの `Runtime.runIfWaitingForDebugger` は実際に再開して `{}`。
-            json!({"id": 19, "sessionId": sid, "result": {}}),
-            json!({"id": 20, "result": {"success": true}}),
+            json!({"id": 17, "sessionId": sid, "result": {}}),
+            json!({"id": 18, "result": {"success": true}}),
             json!({"method": "Target.detachedFromTarget", "params": {"sessionId": sid, "targetId": "00000000000000000000000000000001"}}),
         ]
     );
@@ -415,11 +414,9 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
         logged,
         [
             ("Browser.getVersion", 1, 0),
-            ("Browser.getWindowForTarget", 0, 1),
             ("Browser.setDownloadBehavior", 1, 0),
-            ("Emulation.setDeviceMetricsOverride", 0, 1),
-            ("Emulation.setEmulatedMedia", 0, 1),
-            ("Emulation.setFocusEmulationEnabled", 0, 1),
+            ("Emulation.setEmulatedMedia", 1, 0),
+            ("Emulation.setFocusEmulationEnabled", 1, 0),
             ("Log.enable", 1, 0),
             ("Network.enable", 1, 0),
             ("Page.addScriptToEvaluateOnNewDocument", 0, 1),
@@ -627,8 +624,7 @@ fn method_from_protocol_error(error: &str) -> Option<String> {
 }
 
 /// トレースを走査して到達レポートを作る。
-/// 最小 id のエラーは握りつぶされる `Browser.getWindowForTarget` で停止原因ではないため、
-/// 最初の停止は失敗した stage の `error` 文字列から決める。
+/// 最初の停止は、失敗した stage の `error` 文字列から決める（個々の CDP エラーは停止原因とは限らないため）。
 fn reach_report(recs: &[Value]) -> ReachReport {
     let mut stages = Vec::new();
     let mut first_stop = None;
@@ -737,24 +733,20 @@ fn cdp2_playwright_newpage_reach_report_lists_first_stop_and_failures() {
     assert_eq!(
         failed,
         [
-            (7, "Browser.getWindowForTarget", true, -32601, nf),
             (
-                13,
+                12,
                 "Page.addScriptToEvaluateOnNewDocument",
                 true,
                 -32601,
                 nf
             ),
             (
-                15,
+                14,
                 "Target.setAutoAttach",
                 true,
                 -32602,
                 "unsupported params"
             ),
-            (16, "Emulation.setFocusEmulationEnabled", true, -32601, nf),
-            (17, "Emulation.setDeviceMetricsOverride", true, -32601, nf),
-            (18, "Emulation.setEmulatedMedia", true, -32601, nf),
         ],
         "{pretty}"
     );

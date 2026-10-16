@@ -75,7 +75,10 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
 - TASK-43.3k（#1039）後の実測（2 回の実行で同一出力）。セッション付きの `Page.setLifecycleEventsEnabled` が `{}` で成功する。この trace は遷移を含まず
   `Page.lifecycleEvent` は現れない。`newPage()` の失敗は `Frame has been detached.` のまま。`failed` は id 7・13・15・16・17・18
 - `Page.addScriptToEvaluateOnNewDocument` の `worldName` に含まれる乱数ハッシュは `<WORLD_HASH>` へ正規化する（決定的にするため）
-- 収集は `connectOverCDP(..., { noDefaults: true })` と `newContext({ acceptDownloads: false })` で行う。fandhe-browser は
+- 収集は `connectOverCDP(..., { noDefaults: true })` と `newContext({ acceptDownloads: false, viewport: null })` で行う。fandhe-browser は
   ダウンロード実行系が無く `Browser.setDownloadBehavior` の `allow`・`allowAndName` を拒否するため、Playwright の
   既定のオプション（接続直後の `Browser.setDownloadBehavior`、`newContext` の `allowAndName`）では通らない
+- `viewport: null` は、画面に近い `Browser.getWindowForTarget`・`Emulation.setDeviceMetricsOverride` の送信を省くため（受理する範囲を絞るオーナー方針。TASK-43.3m・#1041）。
+  実測では送信が 20 件から 18 件になり、送信が残る `Emulation.*` は `setFocusEmulationEnabled`・`setEmulatedMedia` のみ。
+  TASK-43.3m 後は両者が `{}` で成功し、`failed` は id 12・14
 - 再生テスト（`tests/playwright_trace.rs`）は録画の応答列と現行サーバーの応答列を比較除外なしで完全一致させる

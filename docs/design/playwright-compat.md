@@ -410,6 +410,41 @@ id 7・11・13・15・16・17・18。
 
 次の作業: #1040〜#1042（ページ初期化メソッド群の残り）。
 
+### 段階 3e の実施結果（TASK-43.3m・#1041。実測 A と種別 B）
+
+画面に近い `Emulation.*` の受理を絞るオーナー方針（2026-10-15）に従い、先に収集ハーネスの `newContext` へ `viewport: null` を足して実測し、
+実測後も送られるメソッドだけを受理した。
+
+**実測 1 回目**（実装前。`playwright-core` 1.63.0。トレースを 2 回再取得し同一出力）: `viewport: null` で
+`Browser.getWindowForTarget`（旧 id 7）と `Emulation.setDeviceMetricsOverride`（旧 id 17）が**送られなくなった**。送信が残る `Emulation.*` は
+`setFocusEmulationEnabled` と `setEmulatedMedia` の 2 つ。送信メソッドは 20 件から 18 件になり、以降の id は繰り上がった。ソース読解の予測
+（`noDefaultViewport` で `getWindowForTarget` を省く・`emulatedSize()` が無いと `setDeviceMetricsOverride` を省く・`skipDefaultOverrides` は
+既定 context だけで真になるため focus と media は残る）と一致した。不足箇所一覧 #10 と到達結果の表にある旧 id（7・16〜18）は、
+`viewport: null` 導入前の記録として残す（本節で訂正）。
+
+**実装範囲**（`CDP-2`・`CDP-6`・`SEC-2`・`REPAIR-3`・`CDP-7`）:
+
+| メソッド | 受理条件 | エラー |
+| -------- | -------- | ------ |
+| `Emulation.setFocusEmulationEnabled` | 生存セッションの `sessionId` 付き・`params` が `{"enabled": bool}` のみ。`{}` を返し、検証済みの値を保持する（true・false とも冪等）。止めたターゲットでも受理する | `sessionId` なし・`enabled` 以外のキーは `-32602 unsupported params`、`enabled` が無い・bool でない・未知／閉じたセッションは `-32602 invalid params` |
+| `Emulation.setEmulatedMedia` | 生存セッションの `sessionId` 付き。`media` は `""` のみ、`features` は Playwright 既定の 4 件（`prefers-color-scheme:light`・`prefers-reduced-motion:no-preference`・`forced-colors:none`・`prefers-contrast:no-preference`）をちょうど 1 回ずつ（順不同）。`{}` を返し、既定値を受理した印を保持する | 既定値以外の値・未知の feature 名・重複・欠落・5 件以上・要素の余分なキー・`media` か `features` の欠落・未知のキーは `-32602 unsupported params`、型の不正・未知／閉じたセッションは `-32602 invalid params`（いずれも状態は変えない） |
+
+- `Emulation.setDeviceMetricsOverride` は `viewport: null` で送られなくなったため**実装しない**（`-32601` のまま。`cdp6_builtin_other_methods_remain_unimplemented`
+  と `cdp6_identity_and_screen_emulation_remain_method_not_implemented` で固定する）。`Emulation.setUserAgentOverride`・`setLocaleOverride`・`setTimezoneOverride`
+  も `-32601` のまま（`SEC-2`・`CDP-6`）。
+- 保持値は `target.rs` の `Tables.emulation`（セッションごとの小さな構造体）に置く（Issue 記載の `conn_state.rs` から外れる。理由は段階 3a と同じ。
+  セッション削除と同じロックで消え、件数は `MAX_SESSIONS` 以下）。消える経路は `detach`・`close_target`・`dispose_browser_context` の 3 つ。
+- **保持値はどの API からも読まれず、今は観測できる効果が無い**（`REPAIR-3`）。読み取り用メソッドは `#[cfg(test)]` だけに置く。
+  `Browser.getVersion`・`Target.getTargetInfo`・`Page.getFrameTree`・`Page.navigate` のイベント列が受理の前後で変わらないことをテストで固定する（`SEC-2`）。
+- **差異**: 実際の media・フォーカスのエミュレーションはしない。将来は render（TASK-38.5）のフォーカス管理・境界ボックスと CSSOM の media 評価に接続する（別 issue）。
+- 既定のビューポートのまま Playwright を使う利用者の `setDeviceMetricsOverride` はオーナー方針により本 issue では扱わない。
+
+**実測 2 回目**（実装後。2 回の実行で同一出力）: `Emulation.setFocusEmulationEnabled`（id 15）・`Emulation.setEmulatedMedia`（id 16）は `{}` で成功し、
+`failed` から消えた。`failed` の残りは id 12（`Page.addScriptToEvaluateOnNewDocument`、`-32601`）と id 14（セッション付き `Target.setAutoAttach`、`-32602`）。
+`newPage` の失敗は `browserContext.newPage: Frame has been detached.` のまま変わらない。
+
+次の作業: #1040・#1042（ページ初期化メソッド群の残り）。
+
 ### 原則
 
 | 原則 | 内容 | ビヘイビア |
