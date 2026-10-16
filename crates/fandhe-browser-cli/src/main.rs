@@ -5,6 +5,7 @@
 //! （終了コード 2）にする（TASK-47.1・`CLI-1`）。
 //! `navigate`（TASK-47.3・#284）は one-shot で URL を取得して結果を出力する。
 //! `query`（TASK-47.4・#285）は one-shot で URL を取得し、CSS セレクタに一致する要素のテキスト・属性を出力する。
+//! `--file <PATH>`（#824・`PERF-7`）を付けるとネットワークを使わずローカル HTML を照会する（cold start 計測用）。
 //! `screenshot`（TASK-47.5・#286）は one-shot で描画ホストに URL を読み込ませ、PNG をファイルへ書く。
 //! `setup`（TASK-48.1・#290・`CLI-2`）はセットアップ専用で、OS 固有のビルド前提を検出して報告する。
 //! `--profile-dir <PATH>`（TASK-47.6・#287）は全コマンド共通のプロファイル保管場所指定。

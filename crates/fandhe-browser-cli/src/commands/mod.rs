@@ -4,6 +4,8 @@
 //! 「既定ハンドラ（引数なし）」「help」「登録済みコマンド」「usage エラー」のいずれかへ振り分ける。
 //! 引数パーサは #281 の決定どおり新規依存なしの手書き（`args_os` 起点。非 UTF-8 でも panic しない）。
 //!
+//! `query --file PATH`（#824・`PERF-7`）はネットワークを使わずローカル HTML を照会する（cold start 計測用）。
+//!
 //! 拡張点: 後続の TASK-47.2〜47.5（#283〜#287）は `commands/<name>.rs` を追加し、
 //! [`COMMANDS`] へ [`CommandSpec`] を 1 行足す。全コマンド共通のプロファイル指定
 //! `--profile-dir <PATH>`（TASK-47.6・#287）はサブコマンド名の後ろに置き、各コマンドが
@@ -335,6 +337,13 @@ fn write_help(out: &mut impl Write, registry: &Registry<'_>) -> io::Result<()> {
         out,
         "  {:<18} Listen on 127.0.0.1:PORT (default 9333; 0 lets the OS choose)",
         "--port PORT"
+    )?;
+    writeln!(out)?;
+    writeln!(out, "Query options:")?;
+    writeln!(
+        out,
+        "  {:<18} Read HTML from a local file instead of fetching a URL",
+        "--file PATH"
     )
 }
 
@@ -523,6 +532,23 @@ mod tests {
         assert!(
             text.contains(
                 "query        Fetch a URL once and print text or an attribute of elements matching a CSS selector"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn cli1_help_lists_query_file_option() {
+        let registry = Registry {
+            default: default_ok,
+            commands: COMMANDS,
+        };
+        let mut out = Vec::new();
+        dispatch(os(&["--help"]), &registry, &mut out).expect("help succeeds");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(
+                "Query options:\n  --file PATH        Read HTML from a local file instead of fetching a URL"
             ),
             "{text}"
         );
