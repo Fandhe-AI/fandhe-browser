@@ -3,7 +3,7 @@ fandhe-browser 同梱ネイティブ部品のライセンス全文
 
 本ファイルは、Cargo 外で配布物へ同梱されるネイティブ部品のライセンス全文を、
 上流の一次ソースから取得した本文のまま (改変・要約なし) 収録する。
-節 1〜4 は TASK-76、節 15〜17 は Servo ホストの配布物向け (TASK-38・Issue #996)、節 5〜13 は v8 prebuilt の実測による追加 (TASK-78.3・OSS-4。
+節 1〜4 は TASK-76、節 15〜18 は Servo ホストの配布物向け (TASK-38・Issue #996。節 18 は Issue #999)、節 5〜13 は v8 prebuilt の実測による追加 (TASK-78.3・OSS-4。
 docs/design/v8-prebuilt-components.md)、節 14 は既定・軽量コンテナ同梱の CA バンドル (TASK-64.1)。
 部品の一覧・版・SPDX・同梱条件は NOTICE を参照する。
 
@@ -4235,3 +4235,46 @@ Legal Terms
 
 
 --- end of FTL.TXT ---
+
+================================================================================
+18. ANGLE (mozangle 0.7.1 同梱。Servo ホストの Windows 配布物)
+SPDX: BSD-3-Clause
+取得元: mozangle 0.7.1 パッケージ内 LICENSE (crates.io のパッケージ本文のまま。行末の空白のみ除去 (.editorconfig)。https://github.com/servo/mozangle のコミット eb6c6601ceffc6f3025aa6dd8ab8b95c3e6c8999)
+リビジョン: ANGLE は FIREFOX_153_3_0esr_RELEASE (861fdeb0d32fe1bd101fea886687e680f612d735) の gfx/angle (mozangle 0.7.1 の UPSTREAM)
+同梱条件: Windows で Servo の no-wgl を有効にした Servo ホストの配布物のみ (libEGL.dll・libGLESv2.dll。NOTICE 節 1)
+================================================================================
+
+// Copyright (C) 2002-2013 The ANGLE Project Authors.
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+//
+//     Redistributions of source code must retain the above copyright
+//     notice, this list of conditions and the following disclaimer.
+//
+//     Redistributions in binary form must reproduce the above
+//     copyright notice, this list of conditions and the following
+//     disclaimer in the documentation and/or other materials provided
+//     with the distribution.
+//
+//     Neither the name of TransGaming Inc., Google Inc., 3DLabs Inc.
+//     Ltd., nor the names of their contributors may be used to endorse
+//     or promote products derived from this software without specific
+//     prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+// FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+// COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+// INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+// BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+// CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+// LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+// ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+
+--- end of ANGLE LICENSE ---

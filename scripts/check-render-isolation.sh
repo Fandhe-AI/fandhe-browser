@@ -18,8 +18,11 @@
 #      （逆方向の混入。package 名の完全一致で判定する。ホスト lock の keyboard-types が
 #      部分文字列 boa に一致するため部分一致にしない。前方一致 fandhe-browser-* もホスト自身
 #      を誤検出するため使わない）
-#   E. servo-host の依存ツリーに webgl|webgpu|mozangle|gstreamer|lgpl 系が無いこと
-#      （既定で無効にしたはずの GPU・メディア・LGPL 系の混入検出）
+#   E. servo-host の依存ツリーに webgl|webgpu|gstreamer|lgpl 系が無いこと
+#      （既定で無効にしたはずの GPU・メディア・LGPL 系の混入検出。--target all の出力全体に適用し、
+#      musl・aarch64 Windows 等に限定された依存も検出する）。mozangle だけは Windows ターゲット
+#      （`no-wgl`・ANGLE。#999）に限り許すため、非 Windows ターゲットごとの cargo tree で禁止する。
+#      非 Windows の対象一覧が servo-host/deny.toml の [graph] targets と一致することも検査する
 #   servo-host の manifest / Cargo.lock が無い場合は D・E を NG とする（fail-closed）。
 #
 # 判定は cargo tree の package 名（先頭フィールド）に限る。path 依存に付く (/abs/path) を
@@ -27,7 +30,7 @@
 # `cargo tree` は既定でホストのターゲットに絞って依存グラフを表示するため、本体側の
 # cfg(windows)/cfg(unix) の target 依存は当該 OS のランナーでしか現れない。よって本スクリプトは
 # 3 OS（ubuntu/macos/windows）それぞれで実行する必要がある（.claude/rules/ci.md の 3 OS 必須
-# ルール）。ホスト側は --target all で lock の全ターゲット分（mozangle 等の OS 固有依存を含む）
+# ルール）。ホスト側は --target all で lock の全ターゲット分（Windows 固有の mozangle 等の OS 固有依存を含む）
 # を調べる。ホストの依存クレートの取得が発生するが、ビルドは伴わない。
 #
 # これはクレート名に基づく簡易検出であり、リネームや再エクスポート経由の混入までは捕捉
@@ -44,7 +47,12 @@ cd "$REPO_ROOT"
 # Servo 非依存の IPC クライアントとして cli の常時依存になり得るため含めない。
 SERVO_PATTERN='servo'
 # E 用: ホストが既定で無効にしたはずの GPU・メディア・LGPL 系。
-HOST_FORBIDDEN_PATTERN='webgl|webgpu|mozangle|gstreamer|lgpl'
+HOST_FORBIDDEN_PATTERN='webgl|webgpu|gstreamer|lgpl'
+# E 用（非 Windows ターゲットごと）: mozangle は Windows の `no-wgl`（ANGLE）に限り許す（#999）。
+HOST_MOZANGLE_PATTERN='mozangle'
+# servo-host/deny.toml の [graph] targets と一致させる（check_targets_match が検査する）。
+HOST_TARGETS_NON_WINDOWS=(x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin)
+HOST_TARGETS_WINDOWS=(x86_64-pc-windows-msvc)
 # D 用: メンバー以外に、ホストへ入ってはならない JS エンジンの package 名。
 JS_ENGINE_NAMES=$'v8\nboa_engine'
 
@@ -91,6 +99,82 @@ detect() {
     return 1
   fi
   echo "OK: dependency graph of ${label} contains no forbidden crates (pattern: ${pat})"
+  return 0
+}
+
+# 検査 E 用: ターゲット三つ組が Windows か。
+is_windows_target() { case "$1" in *-windows-*) return 0 ;; *) return 1 ;; esac; }
+
+# 検査 E 用: mozangle を引き込む唯一の経路である servo の `no-wgl` feature が、host manifest で
+# Windows 限定の target 依存にだけ付いていることを検査する（$1=servo-host の cargo metadata --no-deps の JSON）。
+# 固定ターゲット一覧（musl 等の一覧外）に頼らず target 指定そのものを見るため、一覧外の非 Windows
+# ターゲットへ mozangle が入る変更も拒否する。部分一致では `cfg(any(windows, target_env = "musl"))`
+# のような Windows を必須にしない式を通してしまうため、許可する target 指定は
+# NO_WGL_ALLOWED_TARGETS の明示集合との完全一致に限る（fail-closed）。`no-wgl` 付きの dependency が
+# target 無し・集合外の target のいずれかなら NG。`no-wgl` 付きが 1 件も無ければ OK。
+NO_WGL_ALLOWED_TARGETS='["cfg(windows)","cfg(target_os = \"windows\")","x86_64-pc-windows-msvc","aarch64-pc-windows-msvc"]'
+check_no_wgl_windows_only() {
+  local bad
+  if ! bad="$(jq -r --argjson allowed "$NO_WGL_ALLOWED_TARGETS" '[.packages[].dependencies[] | select((.features // []) | index("no-wgl")) | select((.target // "") as $t | ($allowed | index($t)) | not) | "\(.name) target=\(.target // "none")"] | .[]' <<<"$1")"; then
+    echo "NG: failed to inspect servo-host manifest (jq)" >&2
+    return 1
+  fi
+  bad="${bad//$'\r'/}"
+  if [ -n "$bad" ]; then
+    echo "NG: no-wgl (mozangle) is enabled outside a Windows-only target dependency:" >&2
+    printf '  %s\n' "$bad" >&2
+    return 1
+  fi
+  echo "OK: no-wgl (mozangle) is enabled only under a Windows-only target dependency"
+  return 0
+}
+
+# 検査 E 用: 依存グラフ全体（cargo metadata の resolve。全プラットフォーム分）で mozangle へ入る辺を
+# すべて調べ、Windows 限定と確認できた辺だけを許す（$1=servo-host の cargo metadata の JSON。--no-deps なし）。
+# 固定ターゲット一覧の検査では一覧外（musl 等）の非 Windows ターゲットに限定した直接依存を見落とすため、
+# 辺ごとに判定する。許可するのは (a) dep_kinds の target が NO_WGL_ALLOWED_TARGETS に完全一致する辺と、
+# (b) servo からの target なしの辺（servo の optional 依存で、有効化は no-wgl feature だけ。no-wgl が
+# Windows 限定であることは check_no_wgl_windows_only が別に検査する）。それ以外の辺が 1 本でもあれば NG。
+check_mozangle_edges_windows_only() {
+  local bad
+  if ! bad="$(jq -r --argjson allowed "$NO_WGL_ALLOWED_TARGETS" '
+      . as $m
+      | ([$m.packages[] | {key: .id, value: .name}] | from_entries) as $names
+      | [$m.packages[] | select(.name == "mozangle") | .id] as $ids
+      | [ $m.resolve.nodes[] | .id as $from | .deps[]?
+          | select(.pkg as $p | $ids | index($p))
+          | .dep_kinds[] as $k
+          | select(
+              ((($k.target // "") as $t | $allowed | index($t)) != null)
+              or ($names[$from] == "servo" and $k.target == null)
+              | not)
+          | "\($names[$from] // $from) -> mozangle target=\($k.target // "none")" ]
+      | .[]' <<<"$1")"; then
+    echo "NG: failed to inspect servo-host dependency graph (jq)" >&2
+    return 1
+  fi
+  bad="${bad//$'\r'/}"
+  if [ -n "$bad" ]; then
+    echo "NG: mozangle is reachable through a non-Windows-only dependency edge:" >&2
+    printf '  %s\n' "$bad" >&2
+    return 1
+  fi
+  echo "OK: every dependency edge into mozangle is Windows-only (or servo's no-wgl gated edge)"
+  return 0
+}
+
+# 検査 E 用: deny.toml の [graph] targets（$1。改行区切り）と、本スクリプトの検査対象
+# （$2=非 Windows・$3=Windows。空白区切り）が集合として一致するか。不一致・空は NG（fail-closed）。
+check_targets_match() {
+  local denyt="$1" mine want
+  mine="$(printf '%s\n' $2 $3 | sort -u)"
+  want="$(printf '%s\n' "$denyt" | sed '/^$/d' | sort -u)"
+  if [ -z "$want" ] || [ "$mine" != "$want" ]; then
+    echo "NG: servo-host targets differ from deny.toml [graph] targets" >&2
+    echo "  script:    $(tr '\n' ' ' <<<"$mine")" >&2
+    echo "  deny.toml: $(tr '\n' ' ' <<<"$want")" >&2
+    return 1
+  fi
   return 0
 }
 
@@ -206,12 +290,36 @@ self_test() {
 
   # --- 検査 E（GPU・メディア・LGPL 系） ---
   local n
-  for n in servo-webgl webgpu-sys mozangle gstreamer-sys lgpl-thing; do
+  for n in servo-webgl webgpu-sys gstreamer-sys lgpl-thing; do
     expect "E: ${n} is detected" ng detect t "$HOST_FORBIDDEN_PATTERN" "$(printf 'tokio v1.0.0\n%s v0.1.0\n' "$n")"
   done
-  for n in glow surfman servo-canvas mozjs_sys; do
+  for n in glow surfman servo-canvas mozjs_sys mozangle; do
     expect "E: ${n} is not detected" ok detect t "$HOST_FORBIDDEN_PATTERN" "$(printf '%s v0.1.0\n' "$n")"
   done
+  expect "E: gstreamer in --target all output is detected" ng detect t "$HOST_FORBIDDEN_PATTERN" "$(printf 'servo v0.6.0\nmozangle v0.7.1\ngstreamer v0.1.0\n')"
+  expect "E: mozangle alone is not in the all-target pattern" ok detect t "$HOST_FORBIDDEN_PATTERN" "$(printf 'servo v0.6.0\nmozangle v0.7.1\n')"
+  expect "E: mozangle on a non-Windows target is detected" ng detect t "$HOST_MOZANGLE_PATTERN" "$(printf 'servo v0.6.0\nmozangle v0.7.1\n')"
+  expect "E: mozangle on a Windows target is allowed (no check)" ok is_windows_target x86_64-pc-windows-msvc
+  expect "E: linux target is not Windows" ng is_windows_target x86_64-unknown-linux-gnu
+  expect "E: no-wgl on cfg(windows) is allowed" ok check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":"cfg(windows)"}]}]}'
+  expect "E: no-wgl without target is NG" ng check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":null}]}]}'
+  expect "E: no-wgl on cfg(unix) is NG" ng check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":"cfg(unix)"}]}]}'
+  expect "E: no-wgl on musl target_env is NG" ng check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":"cfg(target_env = \"musl\")"}]}]}'
+  expect "E: no-wgl on cfg(not(windows)) is NG" ng check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":"cfg(not(windows))"}]}]}'
+  expect "E: no-wgl on cfg(target_os = windows) is allowed" ok check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":"cfg(target_os = \"windows\")"}]}]}'
+  expect "E: no-wgl on cfg(any(windows, musl)) is NG" ng check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":"cfg(any(windows, target_env = \"musl\"))"}]}]}'
+  expect "E: no-wgl on cfg(all(windows, unix)) is NG" ng check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":"cfg(all(windows, unix))"}]}]}'
+  expect "E: no-wgl on x86_64-pc-windows-gnu is NG" ng check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["no-wgl"],"target":"x86_64-pc-windows-gnu"}]}]}'
+  expect "E: mozangle via servo (untargeted, no-wgl gated) is allowed" ok check_mozangle_edges_windows_only '{"packages":[{"id":"S","name":"servo"},{"id":"H","name":"servo-host"},{"id":"M","name":"mozangle"}],"resolve":{"nodes":[{"id":"S","deps":[{"pkg":"M","dep_kinds":[{"kind":null,"target":null}]}]}]}}'
+  expect "E: mozangle direct on cfg(windows) is allowed" ok check_mozangle_edges_windows_only '{"packages":[{"id":"S","name":"servo"},{"id":"H","name":"servo-host"},{"id":"M","name":"mozangle"}],"resolve":{"nodes":[{"id":"H","deps":[{"pkg":"M","dep_kinds":[{"kind":null,"target":"cfg(windows)"}]}]}]}}'
+  expect "E: mozangle direct on musl is NG" ng check_mozangle_edges_windows_only '{"packages":[{"id":"S","name":"servo"},{"id":"H","name":"servo-host"},{"id":"M","name":"mozangle"}],"resolve":{"nodes":[{"id":"H","deps":[{"pkg":"M","dep_kinds":[{"kind":null,"target":"cfg(target_env = \"musl\")"}]}]}]}}'
+  expect "E: mozangle direct untargeted from non-servo is NG" ng check_mozangle_edges_windows_only '{"packages":[{"id":"S","name":"servo"},{"id":"H","name":"servo-host"},{"id":"M","name":"mozangle"}],"resolve":{"nodes":[{"id":"H","deps":[{"pkg":"M","dep_kinds":[{"kind":null,"target":null}]}]}]}}'
+  expect "E: mozangle build-dep on any(windows, musl) is NG" ng check_mozangle_edges_windows_only '{"packages":[{"id":"S","name":"servo"},{"id":"H","name":"servo-host"},{"id":"M","name":"mozangle"}],"resolve":{"nodes":[{"id":"H","deps":[{"pkg":"M","dep_kinds":[{"kind":"build","target":"cfg(any(windows, target_env = \"musl\"))"}]}]}]}}'
+  expect "E: no mozangle in graph is OK" ok check_mozangle_edges_windows_only '{"packages":[{"id":"S","name":"servo"}],"resolve":{"nodes":[{"id":"S","deps":[]}]}}'
+  expect "E: servo without no-wgl is allowed" ok check_no_wgl_windows_only '{"packages":[{"dependencies":[{"name":"servo","features":["baked-in-resources"],"target":null}]}]}'
+  expect "E: targets match deny.toml" ok check_targets_match "$(printf 'b\na\nw\n')" "a b" "w"
+  expect "E: target missing from the check list is NG" ng check_targets_match "$(printf 'a\nb\nc\n')" "a b" "w"
+  expect "E: extra target in the check list is NG" ng check_targets_match "$(printf 'a\n')" "a b" "w"
   expect "E: bulk lines with one match at the end are detected" ng detect t "$HOST_FORBIDDEN_PATTERN" "${big_clean}├── gstreamer v0.1.0"$'\n'
   expect "E: bulk unrelated lines are not detected" ok detect t "$HOST_FORBIDDEN_PATTERN" "$big_clean"
 
@@ -316,7 +424,7 @@ require_file "$HOST_LOCK" "servo-host dependency tree" || HOST_OK=0
 if [ "$HOST_OK" -eq 0 ]; then
   STATUS=1
 else
-  # --target all: lock に載る全ターゲット分を調べ、OS 固有の依存（mozangle 等）を ubuntu でも検出する。
+  # 検査 D は --target all で lock に載る全ターゲット分を調べ、OS 固有の依存を ubuntu でも検出する。
   if ! OUT_HOST=$(cargo tree --manifest-path "$HOST_MANIFEST" --locked -e normal,build,dev --prefix none --target all); then
     echo "NG: cargo tree (servo-host) failed" >&2
     STATUS=1
@@ -332,8 +440,28 @@ else
     else
       detect_exact "servo-host" "${MEMBER_NAMES}"$'\n'"${JS_ENGINE_NAMES}" "$OUT_HOST" || STATUS=1
     fi
-    # 検査 E
+    # 検査 E: 禁止パターンは --target all の出力全体（OUT_HOST）に適用する。
     detect "servo-host" "$HOST_FORBIDDEN_PATTERN" "$OUT_HOST" || STATUS=1
+    # mozangle は非 Windows ターゲットごとに禁止する（Windows は許可）。cargo tree の失敗は NG。
+    DENY_TARGETS="$(sed -n '/^targets = \[/,/^\]/p' servo-host/deny.toml | grep -o '"[^"]*"' | tr -d '"' || true)"
+    check_targets_match "$DENY_TARGETS" "${HOST_TARGETS_NON_WINDOWS[*]}" "${HOST_TARGETS_WINDOWS[*]}" || STATUS=1
+    # mozangle を引き込む no-wgl が Windows 限定の target 依存だけにあることを manifest で検査する
+    # （固定ターゲット一覧に載らない musl 等への混入も拒否する）。
+    if HOST_META="$(cargo metadata --manifest-path "$HOST_MANIFEST" --locked --format-version 1)"; then
+      check_no_wgl_windows_only "$HOST_META" || STATUS=1
+      check_mozangle_edges_windows_only "$HOST_META" || STATUS=1
+    else
+      echo "NG: cargo metadata (servo-host) failed" >&2
+      STATUS=1
+    fi
+    for t in "${HOST_TARGETS_NON_WINDOWS[@]}"; do
+      if ! OUT_T=$(cargo tree --manifest-path "$HOST_MANIFEST" --locked -e normal,build,dev --prefix none --target "$t"); then
+        echo "NG: cargo tree (servo-host, target $t) failed" >&2
+        STATUS=1
+        continue
+      fi
+      detect "servo-host ($t)" "$HOST_MOZANGLE_PATTERN" "$OUT_T" || STATUS=1
+    done
   fi
 fi
 

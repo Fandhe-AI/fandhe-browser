@@ -32,7 +32,7 @@ Servo ホスト（`servo-host/`・別 workspace）を Linux x86_64 でビルド�
   個別に外した検証はしていません）。最小の apt パッケージ集合は未確認です。
 - Ubuntu 以外のディストリビューション、aarch64 は未確認です。
 - 各ツールの下限版は未確認です。
-- macOS・Windows は #1000 で扱います（Windows の前提は [windows.md](./windows.md)）。
+- macOS・Windows は #1000 で扱います（Windows の前提は [windows.md](./windows.md)）。macOS の CI（`servo-host-macos`）は Homebrew の llvm を使わず、`xcrun --find llvm-objdump`（無ければ `objdump`）で見つけた Xcode 同梱の objdump のパスを環境変数 `LLVM_OBJDUMP` で `mozjs_sys` に渡します。
 
 ## 前提の確認コマンド
 

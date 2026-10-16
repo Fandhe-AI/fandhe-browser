@@ -28,6 +28,13 @@ servo = { version = "=0.6.0", default-features = false, features = ["baked-in-re
 serde_json = "=1.0.154"
 image = { version = "=0.25.10", default-features = false, features = ["png"] }
 
+# Windows のみ ANGLE（mozangle）を既定にする `no-wgl` を足す（#999・オーナー承認 2026-10-16）。
+# 既定の WGL バックエンドは GPU の無い環境で WGL_NV_DX_interop が無く software rendering context を
+# 作れない。ANGLE なら D3D11 WARP で動く。feature は上の `servo` と統合され、Linux・macOS は変わらない。
+# 実行時に libEGL.dll・libGLESv2.dll（mozangle の OUT_DIR）が exe の隣か PATH に要る。
+[target.'cfg(windows)'.dependencies]
+servo = { version = "=0.6.0", default-features = false, features = ["baked-in-resources", "no-wgl"] }
+
 # 本体とは独立した workspace ルートであることを宣言する（空テーブル）。
 [workspace]
 

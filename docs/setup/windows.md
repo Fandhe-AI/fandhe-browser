@@ -114,6 +114,26 @@ VS 2026 では、v143 を導入しても既定のツールセットは v145 の�
   python -m pip install --require-hashes --only-binary=:all: --no-deps -r uv-requirements.txt
   ```
 
+### MozTools（SpiderMonkey のビルドツール）
+
+- `mozjs_sys`（Servo の JS エンジン）の Windows ビルドは MozTools 4.0（msys2 と `mozmake.exe`）か MozillaBuild を要求します。`MOZTOOLS_PATH` が未設定だと `build.rs` は `<target>/dependencies/moztools/4.0` を探し、短い `--target-dir`（例: `C:\st`）では見つからずに失敗します。
+- 取得元は servo/mozjs の README「Windows」節の `https://github.com/servo/servo-build-deps/releases/download/msvc-deps/moztools-4.0.zip` です。CI（`servo-host-windows`）は `ci.yml` の `MOZTOOLS_ZIP_SHA256` で zip を照合しており、同じ値で確認してください。zip を展開すると最上位に `moztools-4.0` ができるため、そのディレクトリ（`bin\mozmake.exe` と `msys2\usr\bin` を含む）を `MOZTOOLS_PATH` に指定します。
+
+  ```powershell
+  $env:MOZTOOLS_PATH = "C:\path\to\moztools-4.0"
+  ```
+
+### ANGLE（`no-wgl`）と DLL の配置
+
+- Servo ホスト（`servo-host/`）は Windows では `servo` の `no-wgl` feature を有効にして ANGLE（`mozangle`）を使います（`servo-host/Cargo.toml` の `[target.'cfg(windows)'.dependencies]`。#999）。既定の WGL バックエンドは `WGL_NV_DX_interop` を必須とし、GPU の無い環境（CI の runner 等）では `cannot set up software rendering context: RequiredExtensionUnavailable` で失敗するためです。ANGLE では software adapter が D3D11 WARP になります。
+- `mozangle` の `build.rs` が `libEGL.dll`・`libGLESv2.dll` を `<target>\debug\build\mozangle-*\out` に作ります。実行時は exe の隣か `PATH` にこれらが要ります。ビルド後、exe（`<target>\debug`）とテストバイナリ（`<target>\debug\deps`）の隣へコピーしてから `--selftest`・`cargo test` を実行してください（CI の `servo-host-windows` の「ANGLE の DLL を配置」ステップと同じ手順です）。
+- ANGLE は BSD-3-Clause で、DLL を配布物に同梱するため `NOTICE` に帰属表示があります。
+
+  ```powershell
+  $out = Get-ChildItem C:\st\debug\build -Directory -Filter 'mozangle-*' | ForEach-Object { Join-Path $_.FullName 'out' } | Where-Object { Test-Path (Join-Path $_ 'libEGL.dll') }
+  foreach ($d in "C:\st\debug\", "C:\st\debug\deps\") { Copy-Item "$out\libEGL.dll", "$out\libGLESv2.dll" $d }
+  ```
+
 ### 注意点
 
 - Servo の `target/` は 10〜15GB に達すると公称されています（PoC-12）。空き容量を確認し、長パスを避けるため `CARGO_TARGET_DIR` は短いパス（例: `C:\t`）に置くことを推奨します。
