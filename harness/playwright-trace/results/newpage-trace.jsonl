@@ -33,11 +33,11 @@
 {"seq":32,"kind":"cdp","dir":"recv","message":{"id":8,"result":{},"sessionId":"00000000000000000000000000000001"}}
 {"seq":33,"kind":"cdp","dir":"recv","message":{"id":9,"result":{"frameTree":{"frame":{"id":"main","loaderId":"2","mimeType":"text/html","url":"about:blank"}}},"sessionId":"00000000000000000000000000000001"}}
 {"seq":34,"kind":"cdp","dir":"send","message":{"id":20,"method":"Target.closeTarget","params":{"targetId":"00000000000000000000000000000001"}}}
-{"seq":35,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":10,"sessionId":"00000000000000000000000000000001"}}
+{"seq":35,"kind":"cdp","dir":"recv","message":{"id":10,"result":{},"sessionId":"00000000000000000000000000000001"}}
 {"seq":36,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":11,"sessionId":"00000000000000000000000000000001"}}
-{"seq":37,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":12,"sessionId":"00000000000000000000000000000001"}}
+{"seq":37,"kind":"cdp","dir":"recv","message":{"id":12,"result":{},"sessionId":"00000000000000000000000000000001"}}
 {"seq":38,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":13,"sessionId":"00000000000000000000000000000001"}}
-{"seq":39,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":14,"sessionId":"00000000000000000000000000000001"}}
+{"seq":39,"kind":"cdp","dir":"recv","message":{"id":14,"result":{},"sessionId":"00000000000000000000000000000001"}}
 {"seq":40,"kind":"cdp","dir":"recv","message":{"error":{"code":-32602,"message":"unsupported params"},"id":15,"sessionId":"00000000000000000000000000000001"}}
 {"seq":41,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":16,"sessionId":"00000000000000000000000000000001"}}
 {"seq":42,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":17,"sessionId":"00000000000000000000000000000001"}}

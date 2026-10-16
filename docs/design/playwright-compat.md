@@ -361,6 +361,28 @@ id 9（`Page.getFrameTree`）は `frameTree.frame = {id:"main", loaderId:"2", ur
 
 次の作業: #1038〜#1042（ページ初期化メソッド群の残り）。frame id と targetId の関係は別途判断が要る。
 
+### 段階 3b の実施結果（TASK-43.3j・#1038。実測 A）
+
+**実装範囲**（`CDP-2`・`CDP-6`・`SEC-2`・`REPAIR-3`・`CDP-7`）:
+
+| メソッド | 受理条件 | エラー |
+| -------- | -------- | ------ |
+| `Log.enable`・`Runtime.enable`・`Network.enable` | 生存セッションの `sessionId` 付き・`params` なし（または `{}`）。`{}` を返し、セッションにドメインごとの有効フラグを立てる（冪等）。止めたターゲット（`Runtime.runIfWaitingForDebugger` より前）でも受理する | `sessionId` なし・`params` にキーあり（`Network.enable` の `maxTotalBufferSize`・`maxResourceBufferSize`・`maxPostDataSize`・`reportDirectSocketTraffic` を含む）は `-32602 unsupported params`（フラグは立てない）、未知・閉じたセッションは `-32602 invalid params` |
+
+- フラグは `target.rs` の `Tables.domains_enabled`（`SessionDomain` ごとの bool）に置く（Issue 記載の `conn_state.rs` から外れる。理由は段階 3a と同じ。
+  `page_enabled` は #1039 との衝突を避けるため変更せず別持ちにした）。セッション削除と同じロックで消え、件数は `MAX_SESSIONS` 以下。
+- **イベントは送らない**（`REPAIR-3`）。`Runtime.executionContextCreated`・`consoleAPICalled` は `Runtime.evaluate` 等が未実装で、使えない
+  `context.id` を見せると偽の応答になるため送らない（実行コンテキストのモデルは TASK-44）。`Network.*`（`requestWillBeSent`・`responseReceived`・
+  `loadingFinished`・`loadingFailed`）と `Log.entryAdded` も送らない（後続 issue で追跡）。「イベントが来ない」ために生じる待ち（`page.evaluate` 等）は TASK-44 の課題。
+- 3 メソッドのフラグは fetch・ヘッダ・UA・`navigator` を何も変えない（`SEC-2`）。`*.disable`・`Network.setUserAgentOverride`・
+  `Emulation.setUserAgentOverride` は `-32601` のまま。
+
+**実測**（`playwright-core` 1.63.0。トレースを再取得し 2 回の実行で同一出力）: id 10（`Log.enable`）・12（`Runtime.enable`）・14（`Network.enable`）は
+`{}` で成功する。`newPage` の失敗は `browserContext.newPage: Frame has been detached.` のまま変わらない。`failed` の残りは
+id 7・11・13・15・16・17・18。
+
+次の作業: #1039〜#1042（ページ初期化メソッド群の残り）。frame id と targetId の関係は別途判断が要る。
+
 ### 原則
 
 | 原則 | 内容 | ビヘイビア |
