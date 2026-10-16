@@ -328,6 +328,112 @@ playwright-core 1.63.0 のソース読解では、`FrameSession._initialize` の
 実装 issue を起票して #911 の依存に加える。実装後にトレースを再取得し、テストを到達確認（stage がすべて成功・停止なし）へ切り替える。
 それまで #911 は open のまま残す。
 
+### 段階 3a の実施結果（TASK-43.3i・#1037。実測 A）
+
+**実装範囲**（`CDP-2`・`CDP-6`・`SEC-2`・`REPAIR-3`・`CDP-7`）:
+
+| メソッド | 受理条件 | エラー |
+| -------- | -------- | ------ |
+| `Page.enable` | 生存セッションの `sessionId` 付き・`params` なし（または `{}`）。`{}` を返し、セッションに有効フラグを立てる（冪等） | `sessionId` なし・`params` にキーあり（`enableFileChooserOpenedEvent` を含む）は `-32602 unsupported params`、未知・閉じたセッションは `-32602 invalid params` |
+| `Page.getFrameTree` | 生存セッション付き。`frameTree.frame`（`id:"main"`・`loaderId`・`url`・`mimeType:"text/html"`）のみ返す。`Page.enable` は前提にしない | `Page.enable` と同じ分け方 |
+
+- フラグは `target.rs` の `Tables.page_enabled` に置く（Issue 記載の `conn_state.rs` から外れる）。セッション削除（detach・`closeTarget`・
+  `disposeBrowserContext`）と同じロックで消えて TOCTOU が起きず、自動 attach 由来でないセッションも扱える。件数は `MAX_SESSIONS` 以下。
+- `Page.enable` の実効果は #1039 の `Page.lifecycleEvent` 送出ゲートだけで、現時点ではイベント送出を何も変えない。既存の
+  `Page.frameNavigated`・`Page.loadEventFired` は `Page.enable` なしでも従来どおり送出する（Chromium との差異）。
+- `getFrameTree` の `loaderId` は遷移状態の世代の hex。止めたターゲットは再開前後で同じ値（初期 `about:blank` 確定後の `"2"`）。
+  `childFrames`・`securityOrigin`・`parentId` は返さない。遷移中・取得失敗後は「進行中または失敗した世代」と registry の URL を返し、
+  Chromium（確定済みの直前文書）と異なる。
+
+**実測**（`playwright-core` 1.63.0・node v24.21.0。トレースを再取得し 2 回の実行で同一出力）: id 8（`Page.enable`）は `{}`、
+id 9（`Page.getFrameTree`）は `frameTree.frame = {id:"main", loaderId:"2", url:"about:blank", mimeType:"text/html"}` で成功する。
+`newPage` の失敗は `Protocol error` から **`browserContext.newPage: Frame has been detached.`** に変わった。この失敗は
+`Log.enable`（id 10）の `-32601` より前に起き、`Target.closeTarget` は id 9 の応答の直後に送られる（`Log.enable` 以降の `-32601` は
+後から届く）。`failed` の一覧から id 8・9 が消え、`Page.createIsolatedWorld` は送られていない。
+
+**`Page.frameNavigated` 待ちの有無**: 停止は `Frame has been detached.` で、`Page.frameNavigated` を待ったタイムアウトではない
+（再取得トレースで `frameNavigated` 待ちの停止は観測していない）。
+
+**停止原因（種別 B・ソース読み）**: playwright-core 1.63.0 の `CRPage._sessionForFrame` は `this._sessions.has(frame._id)`
+（セッションを targetId で引く）を前提にし、無ければ親フレームを辿って `Frame has been detached.` を投げる。`frame.id` を
+`"main"` で返しているため、targetId と一致せず止まる可能性が高い。どのコード経路で投げられたかは未確認。対処（frame id を targetId にする等）は
+`Page.frameNavigated` の `frame.id` と併せた設計判断になるため本 issue では行っていない（TASK-44 の `page.goto()` にも影響し得る）。
+
+次の作業: #1038〜#1042（ページ初期化メソッド群の残り）。frame id と targetId の関係は別途判断が要る。
+
+### 段階 3b の実施結果（TASK-43.3j・#1038。実測 A）
+
+**実装範囲**（`CDP-2`・`CDP-6`・`SEC-2`・`REPAIR-3`・`CDP-7`）:
+
+| メソッド | 受理条件 | エラー |
+| -------- | -------- | ------ |
+| `Log.enable`・`Runtime.enable`・`Network.enable` | 生存セッションの `sessionId` 付き・`params` なし（または `{}`）。`{}` を返し、セッションにドメインごとの有効フラグを立てる（冪等）。止めたターゲット（`Runtime.runIfWaitingForDebugger` より前）でも受理する | `sessionId` なし・`params` にキーあり（`Network.enable` の `maxTotalBufferSize`・`maxResourceBufferSize`・`maxPostDataSize`・`reportDirectSocketTraffic` を含む）は `-32602 unsupported params`（フラグは立てない）、未知・閉じたセッションは `-32602 invalid params` |
+
+- フラグは `target.rs` の `Tables.domains_enabled`（`SessionDomain` ごとの bool）に置く（Issue 記載の `conn_state.rs` から外れる。理由は段階 3a と同じ。
+  `page_enabled` は #1039 との衝突を避けるため変更せず別持ちにした）。セッション削除と同じロックで消え、件数は `MAX_SESSIONS` 以下。
+- **イベントは送らない**（`REPAIR-3`）。`Runtime.executionContextCreated`・`consoleAPICalled` は `Runtime.evaluate` 等が未実装で、使えない
+  `context.id` を見せると偽の応答になるため送らない（実行コンテキストのモデルは TASK-44）。`Network.*`（`requestWillBeSent`・`responseReceived`・
+  `loadingFinished`・`loadingFailed`）と `Log.entryAdded` も送らない（後続 issue で追跡）。「イベントが来ない」ために生じる待ち（`page.evaluate` 等）は TASK-44 の課題。
+- 3 メソッドのフラグは fetch・ヘッダ・UA・`navigator` を何も変えない（`SEC-2`）。`*.disable`・`Network.setUserAgentOverride`・
+  `Emulation.setUserAgentOverride` は `-32601` のまま。
+
+**実測**（`playwright-core` 1.63.0。トレースを再取得し 2 回の実行で同一出力）: id 10（`Log.enable`）・12（`Runtime.enable`）・14（`Network.enable`）は
+`{}` で成功する。`newPage` の失敗は `browserContext.newPage: Frame has been detached.` のまま変わらない。`failed` の残りは
+id 7・11・13・15・16・17・18。
+
+次の作業: #1039〜#1042（ページ初期化メソッド群の残り）。frame id と targetId の関係は別途判断が要る。
+
+### 段階 3c の実施結果（TASK-43.3k・#1039。実測 A と種別 B）
+
+**実装範囲**（`CDP-2`・`CDP-6`・`SEC-2`・`REPAIR-3`・`CDP-7`）:
+
+| メソッド | 受理条件 | エラー |
+| -------- | -------- | ------ |
+| `Page.setLifecycleEventsEnabled` | 生存セッションの `sessionId` 付き・`params` が `{"enabled": bool}` のみ。`{}` を返し、セッションの lifecycle 有効フラグを設定する（true・false とも冪等）。止めたターゲットでも受理する | `sessionId` なし・`enabled` 以外のキーは `-32602 unsupported params`、`enabled` が無い・bool でない・未知／閉じたセッションは `-32602 invalid params`（いずれもフラグは変えない） |
+
+- フラグは `target.rs` の `Tables.lifecycle_events_enabled` に置く（Issue 記載の `conn_state.rs` から外れる。理由は段階 3a と同じ）。
+  セッション削除と同じロックで消え、件数は `MAX_SESSIONS` 以下。
+- **送出**: `Page.enable` 済みかつ lifecycle 有効なセッションの `Page.navigate` が確定したとき、`Page.lifecycleEvent` を送る。
+  順序は 応答 → `init` → `Page.frameNavigated` → `Page.loadEventFired` → `load`（`page.rs` の `navigation_events` が正本）。
+  `frameId` は `main`、`loaderId` は応答と `frameNavigated` に一致し、`timestamp` は 3 イベントで同じ値。失敗・中断・追い越された遷移・
+  閉じたターゲットでは `frameNavigated` と同じ条件ブロックの中で判定するため送らない。順序の根拠（`init` は `load` より前、`load` は
+  `frameNavigated` より後）は Playwright / Puppeteer のソース読解による推定で、**種別 B（未実測）**。
+- **送らない名前**（`REPAIR-3`）: `DOMContentLoaded`・`networkAlmostIdle`・`networkIdle`・`commit`・`firstPaint` 系・`InteractiveTime`。実体が無く、
+  偽の値で埋めない。将来仕様は TASK-43・TASK-44（`CDP-2`）。
+- **差異**: 有効化時に現在の文書の lifecycle を再送しない（Chromium は再送する）。送り先は `Page.navigate` を送ったセッションだけ。
+  `Runtime.runIfWaitingForDebugger` による初期 `about:blank` の確定では送らない。
+- フラグは fetch・ヘッダ・UA・`navigator` を何も変えない（`SEC-2`）。
+
+**実測**（`playwright-core` 1.63.0。トレースを再取得し 2 回の実行で同一出力）: id 11（`Page.setLifecycleEventsEnabled`）は `{}` で成功する。
+`newPage` の失敗は `browserContext.newPage: Frame has been detached.` のまま変わらない。`failed` の残りは id 7・13・15・16・17・18。
+この trace は `Page.navigate` を含まないため、Playwright が `lifecycleEvent` を待つかは実測できていない（種別 B のまま）。
+
+次の作業: #1041・#1042（ページ初期化メソッド群の残り。#1040 は段階 3d で実施）。
+
+### 段階 3d の実施結果（TASK-43.3l・#1040。実測 A）
+
+**実装範囲**（`CDP-2`・`CDP-6`・`CDP-7`・`SEC-2`・`REPAIR-3`）:
+
+| メソッド | 受理条件 | エラー |
+| -------- | -------- | ------ |
+| `Page.addScriptToEvaluateOnNewDocument` | 生存セッションの `sessionId` 付き・`params` が `source`（空文字列のみ）と任意の `worldName`（文字列）だけ。`{"identifier":"<10 進連番>"}` を返す。止めたターゲットでも受理する | `sessionId` なし・非空 `source`・`source`／`worldName` 以外のキー（`runImmediately`・`includeCommandLineAPI` 等）は `-32602 unsupported params`、`source` 欠落・型違い・`worldName` の型違い／NUL・未知セッションは `-32602 invalid params`、`worldName` が 256 バイト超は `-32000 world name too long`、セッションあたり 64 件超は `-32000 too many init scripts` |
+| `Target.setAutoAttach`（`sessionId` 付き） | 生存セッション・`autoAttach` が bool。`autoAttach:true` は `flatten:true` 必須。`{}` を返し、`waitForDebuggerOnStart` とともに状態を保持する（`autoAttach:false` で解除）。イベントは 0 件 | `filter` 付き・`autoAttach:true` で `flatten` が `true` 以外は `-32602 unsupported params`、`autoAttach` 欠落・型違い・未知セッションは `-32602 invalid params` |
+
+- 状態は `target.rs` の `Tables`（`init_scripts`・`next_init_script`・`child_auto_attach`）に置く（Issue 記載の `conn_state.rs` から外れる。理由は段階 3a と同じ）。
+  セッション削除と同じロックで消え、切断・ターゲットの close・context の破棄で漏れない（付随状態の削除は `drop_session_state` に集約）。
+- **identifier は registry 全体の連番**（Issue 記載の接続スコープより広い）。採番を 1 回のロックで原子的にでき、同一接続での再登録が別 identifier になる。
+  セッション ID と同じ性質で新しい情報漏えいは無い。
+- **非空 `source` を拒否する理由**: 実行経路（`JS-4`・TASK-112）が無く、効いていないのに成功を返すと stealth 用のスクリプト注入として働く（`SEC-2`・`CDP-6`）。
+  空 `source` は実行しても何も起きないので no-op が事実と一致する。`worldName` は保持しない。
+- **差異**（`REPAIR-3`）: 子ターゲット（iframe・worker・OOPIF）のモデルが無く、セッション付き `Target.setAutoAttach` の attach 対象は常に 0 件
+  （事実と一致する応答で、一律の成功ではない）。`waitForDebuggerOnStart` は保持するだけ。`Page.removeScriptToEvaluateOnNewDocument` は未実装。
+- UA・ヘッダ・`navigator`・画面・TLS・locale には触れない。`Emulation.setUserAgentOverride`・`Network.setUserAgentOverride` は `-32601` のまま。
+
+**実測**（`playwright-core` 1.63.0。トレースを再取得し 2 回の実行で同一出力）: id 13 は `{"identifier":"1"}`、id 15 は `{}` で成功する。
+`newPage` の失敗は `browserContext.newPage: Frame has been detached.` のまま変わらない。`failed` の残りは id 7・16・17・18。
+
+次の作業: #1041・#1042（`Emulation.*` 等）。frame id と targetId の関係は別途判断が要る。
+
 ### 原則
 
 | 原則 | 内容 | ビヘイビア |

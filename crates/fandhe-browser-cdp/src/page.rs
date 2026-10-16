@@ -33,7 +33,9 @@
 //!   スクリプト実行（打ち切り含む）の完了後に送出される。追い越された遷移の分は送出しない。
 //!
 //! スタブ・差異（`REPAIR-3`）: 有効化は設定のみ（`Page.navigate` のオプションは未対応）。
-//! `Page.frameStoppedLoading`・`Page.lifecycleEvent` は未送出（`CDP-2`・TASK-43）。
+//! `Page.frameStoppedLoading` は未送出（`CDP-2`・TASK-43）。`Page.lifecycleEvent` は `Page.enable` と
+//! `Page.setLifecycleEventsEnabled` の両方が有効なセッションに `init`・`load` だけ送る（43.3k・#1039。
+//! 送らない名前は [`lifecycle_event`] を参照）。
 //! `Page.navigate` の応答自体もスクリプト完了後になる（実 Chromium との差異）。JS 段の全体期限は
 //! cdp 側には無く、アクターの待ち行列上限とランナーの実時間上限に依存する。
 //!
@@ -64,7 +66,11 @@ use crate::protocol::{
 use crate::target::{CdpStateError, MAX_URL_LEN, TargetId, TargetRegistry};
 
 /// メインフレームの `frameId`（スタブ。将来はセッション → ターゲット ID。`CDP-2`・TASK-43）。
+/// `Page.frameNavigated` と `Page.getFrameTree`（43.3i）が同じ値を使う。
 pub(crate) const MAIN_FRAME_ID: &str = "main";
+
+/// メインフレームの `mimeType`（固定値。`Page.frameNavigated` と `Page.getFrameTree` で共有し食い違いを防ぐ）。
+pub(crate) const MAIN_FRAME_MIME_TYPE: &str = "text/html";
 
 /// [`navigate`] の結果。将来の拡張（イベント用情報など）に備えて構造体にする（`REPAIR-4`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,9 +208,42 @@ fn monotonic_seconds() -> f64 {
     BASE.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
-/// 確定した遷移の CDP イベント列（`Page.frameNavigated` → `Page.loadEventFired`）を作る
-/// （TASK-42.3・`CDP-1`）。`PageNavigate::handle` が、遷移が確定し結果が公開された場合のみ呼ぶ。
-/// `session_id` は `Dispatcher::dispatch` がリクエストの値で補完するため `None` で返す。
+/// 送る `Page.lifecycleEvent` の名前（`init`）。commit の時点でサーバーが確定できる。
+const LIFECYCLE_INIT: &str = "init";
+/// 送る `Page.lifecycleEvent` の名前（`load`）。`Page.loadEventFired` と同じ時点で確定できる。
+const LIFECYCLE_LOAD: &str = "load";
+
+/// `Page.lifecycleEvent` を 1 件作る（TASK-43.3k・#1039・`CDP-2`）。`name` は上の固定定数のみを渡す
+/// （入力由来の文字列を載せない）。`session_id` は `Dispatcher::dispatch` が補完するため `None`。
+///
+/// # 送らない lifecycle 名（`REPAIR-3`）
+///
+/// `DOMContentLoaded`・`networkAlmostIdle`・`networkIdle`・`commit`・`firstPaint`・`firstContentfulPaint`・
+/// `firstMeaningfulPaint`・`firstMeaningfulPaintCandidate`・`InteractiveTime` は送らない。対応する実体
+/// （DOM 構築完了通知・ネットワーク静止の計測・描画計測）が無く、偽の値で埋めないため。将来仕様は
+/// core・render の進捗に合わせた送出（TASK-43・TASK-44・`CDP-2`）。
+fn lifecycle_event(loader_id: &str, name: &'static str, timestamp: f64) -> CdpEvent {
+    CdpEvent {
+        method: "Page.lifecycleEvent",
+        params: json!({
+            "frameId": MAIN_FRAME_ID,
+            "loaderId": loader_id,
+            "name": name,
+            "timestamp": timestamp,
+        }),
+        session_id: None,
+    }
+}
+
+/// 確定した遷移の CDP イベント列を作る（TASK-42.3・`CDP-1`）。`PageNavigate::handle` が、遷移が確定し
+/// 結果が公開された場合のみ呼ぶ。`session_id` は `Dispatcher::dispatch` がリクエストの値で補完するため
+/// `None` で返す。
+///
+/// 順序の正本はここ。`lifecycle` が偽なら `frameNavigated` → `loadEventFired`。真（`Page.enable` 済みかつ
+/// lifecycle 有効のセッション。43.3k・#1039）なら `lifecycle{init}` → `frameNavigated` → `loadEventFired` →
+/// `lifecycle{load}`。`init` は `load` より前、`load` は `frameNavigated` より後でなければならない
+/// （Playwright は新文書の commit で lifecycle をクリアし、Puppeteer は `init` で集合をリセットするため。
+/// ソース読解による推定で未実測）。`timestamp` は 3 イベントで同じ値。
 ///
 /// 送出順は `DispatchOutcome` の「レスポンス → イベント列」で確定とする。実 Chromium のように
 /// `frameNavigated` を応答より前へ出す並べ替えの要否は TASK-43（`CDP-2`）で判断する。
@@ -214,10 +253,15 @@ fn monotonic_seconds() -> f64 {
 /// - `frame.mimeType` は固定値 `text/html`（`NavigationResult` が Content-Type を保持しないため。
 ///   実値化は `CORE-5`・TASK-25 以降）。
 /// - `securityOrigin` 等の他フィールドは出さない。
-/// - `Page.enable` による購読ゲート・`frameStartedLoading`・`domContentEventFired` 等は未実装
-///   （TASK-43・`CDP-2`）。
-fn navigation_events(loader_id: &str, url: &str, timestamp: f64) -> [CdpEvent; 2] {
-    [
+/// - `Page.enable` は実装済み（43.3i）だが、`Page.frameNavigated`・`Page.loadEventFired` は意図的に
+///   購読ゲートしない（Chromium との差異。`Page.enable` を送らない既存の利用を壊さないため。`REPAIR-3`）。
+///   `frameStartedLoading`・`domContentEventFired` 等は未実装（TASK-43・`CDP-2`）。
+fn navigation_events(loader_id: &str, url: &str, timestamp: f64, lifecycle: bool) -> Vec<CdpEvent> {
+    let mut events = Vec::with_capacity(4);
+    if lifecycle {
+        events.push(lifecycle_event(loader_id, LIFECYCLE_INIT, timestamp));
+    }
+    events.extend([
         CdpEvent {
             method: "Page.frameNavigated",
             params: json!({
@@ -225,7 +269,7 @@ fn navigation_events(loader_id: &str, url: &str, timestamp: f64) -> [CdpEvent; 2
                     "id": MAIN_FRAME_ID,
                     "loaderId": loader_id,
                     "url": url,
-                    "mimeType": "text/html",
+                    "mimeType": MAIN_FRAME_MIME_TYPE,
                 },
                 "type": "Navigation",
             }),
@@ -236,7 +280,11 @@ fn navigation_events(loader_id: &str, url: &str, timestamp: f64) -> [CdpEvent; 2
             params: json!({ "timestamp": timestamp }),
             session_id: None,
         },
-    ]
+    ]);
+    if lifecycle {
+        events.push(lifecycle_event(loader_id, LIFECYCLE_LOAD, timestamp));
+    }
+    events
 }
 
 fn state_error(_: StateError) -> CdpError {
@@ -821,7 +869,12 @@ impl CommandHandler for PageNavigate {
                         .is_none_or(|(n, g)| n.current_generation() == *g)
                     && recheck_shared.is_none_or(|g| app_nav.current_generation() == g)
                 {
-                    for ev in navigation_events(&out.loader_id, &url, monotonic_seconds()) {
+                    let lifecycle = ctx
+                        .session_id
+                        .is_some_and(|sid| ctx.state.registry().lifecycle_events_active(sid));
+                    for ev in
+                        navigation_events(&out.loader_id, &url, monotonic_seconds(), lifecycle)
+                    {
                         output = output.with_event(ev);
                     }
                 }
@@ -1025,7 +1078,8 @@ mod tests {
     /// `navigation_events` は `frameNavigated` → `loadEventFired` を具体値で返す（TASK-42.3・`CDP-1`）。
     #[test]
     fn cdp1_navigation_events_shape() {
-        let ev = navigation_events("1", "http://example.test/", 1.5);
+        let ev = navigation_events("1", "http://example.test/", 1.5, false);
+        assert_eq!(ev.len(), 2);
         assert_eq!(ev[0].method, "Page.frameNavigated");
         assert_eq!(
             serde_json::from_str::<Value>(&ev[0].to_json()).unwrap(),
@@ -1039,6 +1093,32 @@ mod tests {
             json!({"method": "Page.loadEventFired", "params": {"timestamp": 1.5}})
         );
         assert!(ev[0].session_id.is_none() && ev[1].session_id.is_none());
+    }
+
+    /// `lifecycle` 真のとき `init` → `frameNavigated` → `loadEventFired` → `load` の順で、
+    /// lifecycle の params が具体値で一致する（TASK-43.3k・`CDP-2`）。
+    #[test]
+    fn cdp2_navigation_events_with_lifecycle_order_and_shape() {
+        let ev = navigation_events("7", "http://example.test/", 2.5, true);
+        let methods: Vec<&str> = ev.iter().map(|e| e.method).collect();
+        assert_eq!(
+            methods,
+            [
+                "Page.lifecycleEvent",
+                "Page.frameNavigated",
+                "Page.loadEventFired",
+                "Page.lifecycleEvent"
+            ]
+        );
+        assert_eq!(
+            ev[0].params,
+            json!({"frameId": "main", "loaderId": "7", "name": "init", "timestamp": 2.5})
+        );
+        assert_eq!(
+            ev[3].params,
+            json!({"frameId": "main", "loaderId": "7", "name": "load", "timestamp": 2.5})
+        );
+        assert!(ev.iter().all(|e| e.session_id.is_none()));
     }
 
     #[test]
@@ -2251,6 +2331,45 @@ mod tests {
                 .into_frames()
                 .remove(0);
             assert!(!raw.contains("dummy-secret") && !raw.contains("127.0.0.1"));
+        }
+
+        /// 遷移確定後の `Page.getFrameTree` が、確定した URL と `loaderId` を返す（43.3i・#1037・`CDP-2`）。
+        #[tokio::test]
+        async fn cdp2_page_get_frame_tree_reflects_committed_url() {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let tid = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let sid = st.registry().attach(&tid).unwrap();
+            let h = PageNavigate::new(FetchOptions::new().with_allow_private_network_access(true))
+                .unwrap();
+            let d = Dispatcher::from_handlers(vec![
+                ("Page.navigate", Box::new(h)),
+                (
+                    "Page.getFrameTree",
+                    Box::new(crate::playwright_compat::PageGetFrameTree),
+                ),
+            ])
+            .unwrap();
+            let port = serve("200 OK", "<p>tree</p>");
+            let url = format!("http://127.0.0.1:{port}/");
+            let nav = json!({"id": 1, "method": "Page.navigate", "sessionId": sid.as_str(),
+                "params": {"url": url}});
+            let f = frames(d.dispatch(&st, &nav.to_string()).await);
+            assert_eq!(f[0]["result"]["loaderId"], json!("1"), "{f:?}");
+            assert_eq!(f[1]["params"]["frame"]["loaderId"], json!("1"));
+            let req = json!({"id": 2, "method": "Page.getFrameTree", "sessionId": sid.as_str()});
+            let g = frames(d.dispatch(&st, &req.to_string()).await);
+            assert_eq!(
+                g,
+                vec![
+                    json!({"id": 2, "sessionId": sid.as_str(), "result": {"frameTree": {"frame": {
+                    "id": "main", "loaderId": "1", "url": url, "mimeType": "text/html"}}}})
+                ]
+            );
         }
 
         #[tokio::test]
