@@ -363,6 +363,43 @@ fn cli1_screenshot_full_page_is_rejected_as_unsupported() {
     assert!(!std::path::Path::new(&target).exists());
 }
 
+// --- TASK-48.1（#290・`CLI-2`）: セットアップ専用コマンド `setup` ---
+
+#[test]
+fn cli2_setup_with_extra_argument_exits_with_usage_error() {
+    let out = run("setup-extra", &["setup", "extra"]);
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: unexpected argument 'extra'; run 'fandhe-browser --help' for usage"
+    );
+}
+
+/// 判定（0 か 1）は環境依存で固定しない。判定の正しさは偽ディレクトリ木の単体テストが担保する。
+#[test]
+fn cli2_setup_reports_prerequisites_with_consistent_exit_code() {
+    let out = run("setup-real", &["setup"]);
+    match out.code {
+        Some(0) => {
+            let ok = out
+                .stdout
+                .starts_with("no OS-specific prerequisites are checked on ")
+                || out
+                    .stdout
+                    .lines()
+                    .all(|l| l.starts_with("ok ") || l.starts_with("skipped "));
+            assert!(ok, "stdout: {}", out.stdout);
+        }
+        Some(1) => assert!(
+            out.stderr
+                .starts_with("error: missing OS-specific build prerequisites: "),
+            "stderr: {}",
+            out.stderr
+        ),
+        other => panic!("unexpected exit code {other:?}: {}", out.stderr),
+    }
+}
+
 // --- TASK-47.6（#287・`CLI-1`・`PROF-1`）: 全コマンド共通の `--profile-dir` ---
 
 #[test]

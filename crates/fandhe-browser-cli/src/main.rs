@@ -6,6 +6,7 @@
 //! `navigate`（TASK-47.3・#284）は one-shot で URL を取得して結果を出力する。
 //! `query`（TASK-47.4・#285）は one-shot で URL を取得し、CSS セレクタに一致する要素のテキスト・属性を出力する。
 //! `screenshot`（TASK-47.5・#286）は one-shot で描画ホストに URL を読み込ませ、PNG をファイルへ書く。
+//! `setup`（TASK-48.1・#290・`CLI-2`）はセットアップ専用で、OS 固有のビルド前提を検出して報告する。
 //! `--profile-dir <PATH>`（TASK-47.6・#287）は全コマンド共通のプロファイル保管場所指定。
 //! サーバー組み立ての実体は [`server`] にあり、本ファイルは
 //! JS ワーカーフックへの分岐・ランタイム構築・エラー終了コードへの写像だけを担う
@@ -22,6 +23,7 @@ mod commands;
 mod page_scripts;
 mod render_host;
 mod server;
+mod setup;
 mod startup_config;
 
 use std::process::ExitCode;
