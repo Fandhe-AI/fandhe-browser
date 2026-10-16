@@ -87,7 +87,7 @@ container-size: role=lite image=fandhe-browser:issue913-lite digest=none id=sha2
 
 | 対象 | 実測（history-sum） | 机上 | 差（実測 − 机上） | 比 |
 | ---- | ------------------: | ---: | ----------------: | --: |
-| default | 53.75MB | 約 45.18MB | 約 +8.57MB | 約 1.18 倍 |
+| default | 53.75MB | 約 45.18MB | 約 +8.57MB | 約 1.19 倍 |
 | lite | 13.43MB | 約 12.31MB | 約 +1.12MB | 約 1.09 倍 |
 
 - 合計が近くても、内訳が机上と一致しているとは限らない。合計だけで「概算どおり」とは結論しない。机上は PoC-8 の `scratch` 4.37MB（`core-proto` バイナリ 2.63MB と、差し引きの残り 1.74MB）にエンジン増分（V8 +40.81MB・boa +7.94MB）を足した構成で、実測のレイヤ（バイナリ・CA・`/licenses`・`/data`）とは粒度が異なる
