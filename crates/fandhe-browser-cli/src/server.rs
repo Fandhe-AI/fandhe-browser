@@ -13,8 +13,8 @@
 //! - graceful shutdown: 現状は `BoundServer::run` で動かし続け、Ctrl-C は OS 既定の
 //!   シグナル動作で終了する（advisory lock は OS が解放する）。`run_until` による
 //!   正常停止には tokio の `signal` feature（依存変更・要承認）が要る
-//! - ポート・bind 先の明示指定: #823（`CLI-3`）、プロファイルの明示指定: #287・TASK-60.4 で追加する
-//!   （`commands::launch`）。現状は [`DEFAULT_ADDR`] 固定
+//! - ポートは `launch --port` で指定できる（#823・`CLI-3`。`commands::launch`）。bind 先の IP は
+//!   loopback 固定で変更手段を設けない（SEC-4）。既定は [`DEFAULT_ADDR`]
 //! - 描画実装のホストパスを設定ファイルから渡すこと: 設定キーが core の `Config` に未定義のため、
 //!   現状はホストパスを環境変数・本体の隣の実行ファイルからだけ解決する
 //!   （`render_host`。TASK-38.7・#236・`RENDER-3`。設定キーの追加は後続課題）
@@ -249,6 +249,11 @@ async fn bind(
     Ok((bound, cdp))
 }
 
+/// 起動通知 1 行を組み立てる。ポート 0 指定時も `local` は OS 割り当て後の実アドレス（`CLI-3`・#823。暫定形式）。
+pub(crate) fn listening_line(local: SocketAddr, browser_id: &str) -> String {
+    format!("DevTools listening on ws://{local}/devtools/browser/{browser_id}")
+}
+
 /// プロファイルを開いてサーバーを起動し、終了まで待つ（`main` から呼ばれる）。
 ///
 /// stderr へ Chromium 互換の `DevTools listening on ws://...` を 1 行出す
@@ -263,16 +268,22 @@ pub(crate) async fn run(
     let app = open_app_state_with(store, page_scripts, renderer)?;
     let (bound, cdp) = bind(&app, addr, extra).await?;
     let local = bound.local_addr().map_err(StartupError::Bind)?;
-    eprintln!(
-        "DevTools listening on ws://{local}/devtools/browser/{}",
-        cdp.browser_id().as_str()
-    );
+    eprintln!("{}", listening_line(local, cdp.browser_id().as_str()));
     bound.run().await.map_err(StartupError::Serve)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn cli3_listening_line_format() {
+        let local: SocketAddr = "127.0.0.1:9333".parse().unwrap();
+        assert_eq!(
+            listening_line(local, "ABC"),
+            "DevTools listening on ws://127.0.0.1:9333/devtools/browser/ABC"
+        );
+    }
 
     #[test]
     fn sec_ensure_loopback_rejects_non_loopback() {
@@ -504,6 +515,26 @@ pub(crate) mod tests {
                 err,
                 StartupError::Profile(ProfileError::Locked { .. })
             ));
+        }
+
+        /// `CLI-3`（#823）: ポート 0 で bind すると OS 割り当ての実ポートが通知行に入る。
+        #[tokio::test]
+        async fn cli3_port_zero_bind_reports_os_assigned_port() {
+            let dir = TempDir::new();
+            let app = open_app_state(&FixedStore(dir.path.clone())).unwrap();
+            let (bound, cdp) = bind(&app, "127.0.0.1:0".parse().unwrap(), vec![])
+                .await
+                .unwrap();
+            let local = bound.local_addr().unwrap();
+            assert_ne!(local.port(), 0);
+            let line = listening_line(local, cdp.browser_id().as_str());
+            assert!(
+                line.starts_with(&format!(
+                    "DevTools listening on ws://127.0.0.1:{}/",
+                    local.port()
+                )),
+                "{line}"
+            );
         }
 
         /// TASK-112（`JS-1`・`JS-4`）: `open_app_state_with` に渡したハンドルが、bind 後の

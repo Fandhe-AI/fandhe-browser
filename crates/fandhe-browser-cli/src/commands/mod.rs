@@ -328,6 +328,13 @@ fn write_help(out: &mut impl Write, registry: &Registry<'_>) -> io::Result<()> {
         out,
         "  {:<18} Use PATH as the profile storage directory instead of the OS default",
         "--profile-dir PATH"
+    )?;
+    writeln!(out)?;
+    writeln!(out, "Launch options:")?;
+    writeln!(
+        out,
+        "  {:<18} Listen on 127.0.0.1:PORT (default 9333; 0 lets the OS choose)",
+        "--port PORT"
     )
 }
 
