@@ -176,6 +176,11 @@ run_container() {
     fi
     sleep 1
   done
+  # 最後の inspect から期限までの間に正常終了した場合を timeout と誤判定しないよう再確認する。
+  if [ "$RC_STATE" = "running" ] \
+    && [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" = "false" ]; then
+    RC_STATE="exited"
+  fi
   RC_OUT=$(docker logs "$cid" 2>/dev/null || true)
   RC_ERR=$(docker logs "$cid" 2>&1 >/dev/null || true)
   if [ "$RC_STATE" = "exited" ]; then
