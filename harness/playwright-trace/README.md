@@ -82,5 +82,5 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
   既定のオプション（接続直後の `Browser.setDownloadBehavior`、`newContext` の `allowAndName`）では通らない
 - `viewport: null` は、画面に近い `Browser.getWindowForTarget`・`Emulation.setDeviceMetricsOverride` の送信を省くため（受理する範囲を絞るオーナー方針。TASK-43.3m・#1041）。
   実測では送信が 20 件から 18 件になり、送信が残る `Emulation.*` は `setFocusEmulationEnabled`・`setEmulatedMedia` のみ。
-  TASK-43.3m 後は両者が `{}` で成功し、`failed` は id 12・14
+  TASK-43.3m 後は両者が `{}` で成功し、同梱トレースの `failed` は空（id 12 は `{"identifier":"1"}`、id 14 は `{}` で成功）
 - 再生テスト（`tests/playwright_trace.rs`）は録画の応答列と現行サーバーの応答列を比較除外なしで完全一致させる

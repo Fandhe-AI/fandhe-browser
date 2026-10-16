@@ -464,10 +464,11 @@ id 7・11・13・15・16・17・18。
 - 既定のビューポートのまま Playwright を使う利用者の `setDeviceMetricsOverride` はオーナー方針により本 issue では扱わない。
 
 **実測 2 回目**（実装後。2 回の実行で同一出力）: `Emulation.setFocusEmulationEnabled`（id 15）・`Emulation.setEmulatedMedia`（id 16）は `{}` で成功し、
-`failed` から消えた。`failed` の残りは id 12（`Page.addScriptToEvaluateOnNewDocument`、`-32601`）と id 14（セッション付き `Target.setAutoAttach`、`-32602`）。
+`failed` から消えた。同梱の `newpage-trace.jsonl` では id 12（空 source の `Page.addScriptToEvaluateOnNewDocument`）は `{"identifier":"1"}`、
+id 14（セッション付き `Target.setAutoAttach`）は `{}` で成功し（#1040 で対応済み）、`failed` は空で CDP エラーは無い。
 `newPage` の失敗は `browserContext.newPage: Frame has been detached.` のまま変わらない。
 
-次の作業: #1040・#1042（ページ初期化メソッド群の残り）。
+次の作業: #1042（ページ初期化メソッド群の残り）。
 
 ### 原則
 
