@@ -16,6 +16,7 @@
 #   measure-container-size   既定・軽量コンテナと比較対象（Playwright 公式）のイメージサイズ計測（CTR-1・CTR-5。要 docker・jq）
 #   check-container-memory   コンテナ同時起動の集約メモリ測定スクリプトの自己テスト（TASK-67・CTR-3・CTR-7。Linux のみ。要 jq）
 #   measure-container-memory コンテナを N 個同時起動したときの集約メモリ測定（TASK-67。Linux のみ。要 docker・jq・cgroup v2）
+#   check-container-smoke    コンテナ（軽量 / 既定）でローカルフィクスチャ 12 種の代表タスクを確認（CTR-2。要 docker・jq）
 #   measure-cssom-profile-cost  CSSOM プロファイル読み込みのコスト計測（PLUG-8。要 jq）
 #   trace-playwright | check-playwright-trace | check-puppeteer-connect | check-playwright-connect   CDP トレース収集・自己テスト（要 node）
 #   test-playwright-connect  実 Playwright での接続試験（goto・セレクタ取得まで。TASK-44.1〜44.3。要 node/npm/ネットワーク。手動・CI 対象外）
@@ -26,6 +27,7 @@
 # CONTAINER_SIZE_REFERENCE_IMAGE・CONTAINER_SIZE_REFERENCE_DIGEST・CONTAINER_SIZE_DEFAULT_IMAGE・
 # CONTAINER_MEMORY_ARGS（空白区切りの追加引数）・CONTAINER_MEMORY_HELPER_IMAGE・CONTAINER_MEMORY_HELPER_DIGEST・
 # CONTAINER_SIZE_LITE_IMAGE・CONTAINER_SIZE_PLATFORM・CONTAINER_SIZE_SKIP_BUILD・CONTAINER_SIZE_NO_PULL（非空で有効）・
+# CONTAINER_SMOKE_ROLE（lite|default）・CONTAINER_SMOKE_IMAGE・CONTAINER_SMOKE_PLATFORM・CONTAINER_SMOKE_SKIP_BUILD（非空で有効）・CONTAINER_SMOKE_TASK_TIMEOUT・
 # MCP_ENVELOPE_TARGET_DIR・STATIC_LINK_TARGET_DIR・PLAYWRIGHT_VERSION・PLAYWRIGHT_INTEGRITY（既定値は scripts/versions.sh）。
 # 各ハーネスの詳細は harness/*/README.md・benches/*/README.md を参照。
 set -euo pipefail
@@ -46,6 +48,11 @@ name="$1"
 : "${CONTAINER_SIZE_SKIP_BUILD:=}"
 : "${CONTAINER_SIZE_NO_PULL:=}"
 : "${CONTAINER_MEMORY_ARGS:=}"
+: "${CONTAINER_SMOKE_ROLE:=lite}"
+: "${CONTAINER_SMOKE_IMAGE:=}"
+: "${CONTAINER_SMOKE_PLATFORM:=}"
+: "${CONTAINER_SMOKE_SKIP_BUILD:=}"
+: "${CONTAINER_SMOKE_TASK_TIMEOUT:=20}"
 : "${CSSOM_PROFILE_COST_ARGS:=--out benches/cssom_profile_cost/results/cssom-profile-cost.json}"
 
 # 相対 CARGO_TARGET_DIR でも resolve_bin（絶対パス必須）を通すため絶対化する。
@@ -256,6 +263,18 @@ case "${name}" in
       --helper-image "${CONTAINER_MEMORY_HELPER_IMAGE}" \
       --helper-digest "${CONTAINER_MEMORY_HELPER_DIGEST}" \
       ${CONTAINER_MEMORY_ARGS}
+    ;;
+  check-container-smoke)
+    # docker build（release）と実コンテナ起動を伴うため `make ci` には含めない（TASK-66.1・CTR-2）。
+    # 一発実行（query --file）を持たない旧イメージでは result=blocked で exit 2（harness/container-smoke/README.md）。
+    require_cmd docker "required by ${name}"
+    require_cmd jq "required by ${name}"
+    bash harness/container-smoke/self-test.sh
+    cm_args=(--role "${CONTAINER_SMOKE_ROLE}" --task-timeout "${CONTAINER_SMOKE_TASK_TIMEOUT}")
+    [ -z "${CONTAINER_SMOKE_IMAGE}" ] || cm_args+=(--image "${CONTAINER_SMOKE_IMAGE}")
+    [ -z "${CONTAINER_SMOKE_PLATFORM}" ] || cm_args+=(--platform "${CONTAINER_SMOKE_PLATFORM}")
+    [ -z "${CONTAINER_SMOKE_SKIP_BUILD}" ] || cm_args+=(--skip-build)
+    bash harness/container-smoke/run.sh "${cm_args[@]}"
     ;;
   measure-cssom-profile-cost)
     # release ビルドを伴う一度きりの記録で RSS がランナー差で揺れるため `make ci` には含めない。

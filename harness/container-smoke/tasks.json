@@ -1,0 +1,14 @@
+[
+  {"id":"C01","poc2":"01 static article","fixture":"static/01-article.html","kind":"texts","selector":"article h1, a[rel=author]","expected":["Rust の非同期ランタイム入門","相田 藍子"]},
+  {"id":"C02","poc2":"02 table","fixture":"static/02-table.html","kind":"texts","selector":"#prices tbody td.name","expected":["キーボード","マウス","モニタ"]},
+  {"id":"C03","poc2":"03 login form","fixture":"static/03-login-form.html","kind":"attr","selector":"form#login","attr":"action","expected":["/login"]},
+  {"id":"C04","poc2":"04 product list","fixture":"static/04-product-list.html","kind":"attr","selector":"li.product","attr":"data-sku","expected":["sku-001","sku-002","sku-003"]},
+  {"id":"C05","poc2":"05 nav links","fixture":"static/05-nav-links.html","kind":"attr","selector":"nav a","attr":"href","expected":["/","/about","/contact"]},
+  {"id":"C06","poc2":"06 SSR blog list","fixture":"ssr_spa_static/01-ssr-blog-list.html","kind":"texts","selector":"main article h2","expected":["サーバーサイドレンダリングの基礎","ハイドレーションとは何か","SPA とプリレンダリングの違い"]},
+  {"id":"C07","poc2":"07 CSR shell","fixture":"ssr_spa_static/06-csr-shell.html","kind":"text","selector":"title","expected":["CSR シェル"]},
+  {"id":"C08","poc2":"08 dashboard table","fixture":"ssr_spa_static/02-dashboard-table.html","kind":"texts","selector":"td[data-col=revenue]","expected":["120000","98000"]},
+  {"id":"C09","poc2":"09 checkbox radio","fixture":"ssr_spa_static/03-checkbox-radio-form.html","kind":"text","selector":"form#prefs textarea[name=bio]","expected":["よろしくお願いします。"]},
+  {"id":"C10","poc2":"10 image attributes","fixture":"static/06-images.html","kind":"attr","selector":"figure img","attr":"alt","expected":["ソファで眠る猫","公園を走る犬"]},
+  {"id":"C11","poc2":"11 unicode","fixture":"static/07-unicode.html","kind":"texts","selector":"p.greeting","expected":["こんにちは、世界 🌏","Bonjour le monde 🥐","Здравствуй, мир ✨"]},
+  {"id":"C12","poc2":"12 malformed HTML","fixture":"static/08-malformed.html","kind":"texts","selector":"ul.items li","expected":["りんご","みかん 説明文が 閉じタグなしで ネストしている"]}
+]
