@@ -9,7 +9,7 @@ Playwright 接続試験の実行基盤（TASK-44.1・Issue #476・ビヘイビ�
 | 範囲 | Issue |
 | ---- | ----- |
 | 実行基盤（サーバー・fixture 起動、スクリプト実行、結果の構造化回収、未導入時の明示的失敗） | #476（本ディレクトリ） |
-| `newPage()` 到達の確認 | #477（TASK-44.2） |
+| `newPage()` 到達の確認（実 Playwright テスト `cdp2_real_playwright_reaches_new_page`） | #477（TASK-44.2） |
 | `goto`・セレクタ取得 | #478（TASK-44.3） |
 | 結果レポート | #479（TASK-44.4） |
 

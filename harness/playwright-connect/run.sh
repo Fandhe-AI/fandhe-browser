@@ -4,7 +4,7 @@
 # 呼び出し元は Makefile の test-playwright-connect。playwright-core（exact 固定版）を
 # mktemp -d へ導入して verify-install.mjs で版・integrity・単独導入を検証し、
 # FANDHE_PLAYWRIGHT_MODULE_DIR に渡して実 Playwright 実行テスト
-# （tests/playwright_flow.rs の cdp2_real_playwright_flow_is_collected）を実行する。
+# （tests/playwright_flow.rs の cdp2_real_playwright_reaches_new_page）を実行する。
 # ブラウザ本体は取得せず、install script も実行しない。要 node/npm/cargo とネットワーク。
 # 導入の承認状況は README の「導入状況」を参照。
 #
@@ -41,7 +41,7 @@ node "$SCRIPT_DIR/../playwright-trace/verify-install.mjs" "$WORK" playwright-cor
 
 cd "$REPO_ROOT"
 out="$(FANDHE_PLAYWRIGHT_MODULE_DIR="$WORK" FANDHE_PLAYWRIGHT_VERSION="$PW_VERSION" \
-  cargo test -p fandhe-browser-cdp --test playwright_flow -- --ignored --exact cdp2_real_playwright_flow_is_collected 2>&1)" || {
+  cargo test -p fandhe-browser-cdp --test playwright_flow -- --ignored --exact cdp2_real_playwright_reaches_new_page 2>&1)" || {
   printf '%s\n' "$out" >&2
   exit 1
 }

@@ -5,7 +5,7 @@
 //! 自身の再実行で実現する（`puppeteer_connect.rs` と同じ流儀）ため、通常の
 //! `cargo test --workspace` では Node も Playwright も要らない。
 //!
-//! 実 Playwright を使う `cdp2_real_playwright_flow_is_collected` だけは導入が必要なため
+//! 実 Playwright を使う `cdp2_real_playwright_reaches_new_page` だけは導入が必要なため
 //! `#[ignore]` とし、`make test-playwright-connect`（`harness/playwright-connect/run.sh`）が
 //! `--ignored --exact` で明示実行する（0 件実行は失敗）。未導入での実行は skip せず
 //! [`HarnessError::ToolUnavailable`] で panic する（成功を装わない）。段階の成否の固定
@@ -252,12 +252,12 @@ fn cdp2_preflight_returns_command_when_version_matches() {
     }
 }
 
-/// CDP-2: 実 Playwright で `connect.mjs` を実行し、結果行を `Completed` として回収できる。
-/// 段階の成否（newPage 到達等）は固定しない（TASK-44.2 以降の担当）。導入が必要なため
-/// `make test-playwright-connect` が `--ignored --exact` で明示実行する。
+/// CDP-2・TASK-44.2: 実 Playwright で connectOverCDP → newContext → newPage が全段階成功する。
+/// 既知の回避オプション（noDefaults / acceptDownloads:false / viewport:null。`stages.mjs`）前提。
+/// 導入が必要なため `make test-playwright-connect` が `--ignored --exact` で明示実行する。
 #[test]
 #[ignore = "requires playwright-core; run via `make test-playwright-connect`"]
-fn cdp2_real_playwright_flow_is_collected() {
+fn cdp2_real_playwright_reaches_new_page() {
     let module_dir = std::env::var_os(PLAYWRIGHT_MODULE_DIR_ENV).map(PathBuf::from);
     let version = std::env::var("FANDHE_PLAYWRIGHT_VERSION")
         .expect("FANDHE_PLAYWRIGHT_VERSION must be set (see harness/playwright-connect/run.sh)");
@@ -271,11 +271,19 @@ fn cdp2_real_playwright_flow_is_collected() {
         start_fixture_server(vec![FixtureRoute::html("/index.html", "<p id=\"x\">x</p>")]);
     cmd.envs
         .push((FIXTURE_URL_ENV.to_string(), fixture.url("/index.html")));
-    match run_script(&cmd, &http_endpoint(server.addr), Duration::from_secs(120)) {
-        ScriptOutcome::Completed { stages, .. } => {
-            let names: Vec<&str> = stages.iter().map(|s| s.name.as_str()).collect();
-            assert_eq!(names, vec!["connect", "newContext", "newPage"]);
-        }
-        other => panic!("script result was not collected: {other:?}"),
-    }
+    let out = run_script(&cmd, &http_endpoint(server.addr), Duration::from_secs(120));
+    assert_eq!(
+        out,
+        ScriptOutcome::Completed {
+            ok: true,
+            step: "newPage".into(),
+            error: None,
+            stages: vec![
+                stage("connect", StageStatus::Ok, None),
+                stage("newContext", StageStatus::Ok, None),
+                stage("newPage", StageStatus::Ok, None),
+            ],
+        },
+        "newPage was not reached: {out:?}"
+    );
 }
