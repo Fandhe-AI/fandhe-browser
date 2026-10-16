@@ -9,7 +9,9 @@
 //! （`EXPECTED_*`）を更新する。TASK-43.3a で `/json/version/` と `Browser.getVersion` を追加し、
 //! TASK-43.3e（#910）で `Target.createTarget`（応答前の `Target.attachedToTarget`）と
 //! `Runtime.runIfWaitingForDebugger` を追加した。以降のメソッドの no-op は追加しない（`SEC-2`・`REPAIR-3`）。
-//! TASK-43.3f（#911）で `newPage()` の到達レポート（停止メソッドの一覧）を具体値で固定した（未到達の記録）。
+//! TASK-43.3f（#911）で `newPage()` の到達レポート（停止メソッドの一覧）を具体値で固定した（当時は未到達の記録）。
+//! TASK-43.3n（#1042）で `newPage()` の到達（stage がすべて成功・失敗応答なし・クリーンアップなし）を確認し、
+//! 到達として固定した。`goto()`・セレクタ取得は範囲外（TASK-44）。
 //!
 //! `CdpState` の構築に `Profile::open` が必要で、非 unix では `ProfileError::Unsupported` を返す仕様のため
 //! `#[cfg(unix)]` とする（任意の skip ではなく `tests/devtools_browser.rs` と同じ理由）。
@@ -613,6 +615,9 @@ struct ReachReport {
     stages: Vec<(String, bool)>,
     first_stop: Option<FirstStop>,
     failed: Vec<FailedCall>,
+    /// 失敗時のクリーンアップ系メソッド（送信した `Target.closeTarget`・受信した `Target.detachedFromTarget`）と、
+    /// 初期ナビゲーション系イベント（`Page.frameNavigated`・`Page.lifecycleEvent`）の観測結果。
+    observed: Vec<String>,
 }
 
 /// Playwright のエラー文言 `... Protocol error (<Method>): ...` からメソッド名を取り出す。
@@ -632,6 +637,7 @@ fn reach_report(recs: &[Value]) -> ReachReport {
     let mut first_stop = None;
     let mut sent: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
     let mut failed = Vec::new();
+    let mut observed = Vec::new();
     for r in recs {
         match r.get("kind").and_then(Value::as_str) {
             Some("stage") => {
@@ -653,6 +659,22 @@ fn reach_report(recs: &[Value]) -> ReachReport {
                     continue;
                 };
                 let id = msg.get("id").and_then(Value::as_u64);
+                let method = msg.get("method").and_then(Value::as_str);
+                let watched = matches!(
+                    (dir, method),
+                    (Some("send"), Some("Target.closeTarget"))
+                        | (
+                            Some("recv"),
+                            Some(
+                                "Target.detachedFromTarget"
+                                    | "Page.frameNavigated"
+                                    | "Page.lifecycleEvent"
+                            )
+                        )
+                );
+                if let (true, Some(m)) = (watched, method) {
+                    observed.push(format!("{}:{m}", dir.unwrap_or("")));
+                }
                 if dir == Some("send") {
                     if let (Some(id), Some(m)) = (id, msg.get("method").and_then(Value::as_str)) {
                         sent.insert(id, m.to_owned());
@@ -679,16 +701,24 @@ fn reach_report(recs: &[Value]) -> ReachReport {
         stages,
         first_stop,
         failed,
+        observed,
     }
 }
 
-/// `newPage()` 到達状況の結合テスト（TASK-43.3f・#911、`CDP-2`・`CDP-6`・MS-4）。
+/// `newPage()` 到達の確認テスト（TASK-43.3n・#1042、`CDP-2`・`CDP-6`・MS-4。前身は TASK-43.3f・#911 の未到達記録）。
 ///
-/// 現状（43.3m・43.3o 後）は `newPage()` が成功し、トレースに記録された失敗応答は無い（stages がすべて成功・`first_stop` が
-/// `None`・`failed` が空）。ただし直後に送られる `Page.createIsolatedWorld` は未実装（`-32601`）で、`newPage()` が応答を待たないため
-/// トレースに応答が記録されないだけである（到達の完了ではない。#911 は open のまま）。期待値を緩めたり `#[ignore]` で通したりしない。
+/// 到達の基準は、stages がすべて成功・`first_stop` が `None`・`failed` が空であること。
+/// `failed` が空なのは、収集オプション `newContext({viewport:null})`（TASK-43.3m）により
+/// `Browser.getWindowForTarget` が送られないため（許容条件の「`-32601` のみ」より厳しい）。
+/// `getWindowForTarget` は実体が無く値を作ると偽になるため、方針どおり `-32601` のまま残す（`SEC-2`・`CDP-6`）。
+/// 直後に送られる `Page.createIsolatedWorld` も未実装（`-32601`）だが、`newPage()` は応答を待たない。
+/// そのため応答は記録されない場合がある（収集のたびに入ることがある競合。記録済みトレースには無い）。
+/// 失敗時のクリーンアップ（`Target.closeTarget` 送信・`Target.detachedFromTarget` 受信）と、
+/// 初期 `about:blank` の `Page.frameNavigated`・`Page.lifecycleEvent` が無いまま成功することも固定する
+/// （後者は段階 4 が不要という判断の実測根拠）。`goto()`・セレクタ取得・`evaluate` は範囲外（TASK-44・`CDP-2`）。
+/// 期待値を緩めたり `#[ignore]` で通したりしない。
 #[test]
-fn cdp2_playwright_newpage_reach_report_lists_first_stop_and_failures() {
+fn cdp2_playwright_newpage_is_reached_without_failures_or_cleanup() {
     let report = reach_report(&records());
     let pretty = format!("{report:#?}");
     let stages: Vec<(&str, bool)> = report
@@ -724,4 +754,5 @@ fn cdp2_playwright_newpage_reach_report_lists_first_stop_and_failures() {
         Vec::<(u64, &str, bool, i64, &str)>::new(),
         "{pretty}"
     );
+    assert_eq!(report.observed, Vec::<String>::new(), "{pretty}");
 }

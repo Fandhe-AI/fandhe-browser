@@ -32,7 +32,7 @@ Playwright のソースは長く引用せず、関数名と要約に留める。
 | `connectOverCDP(http://…)` | 成功（`noDefaults:true` 指定時。TASK-43.3g・#942 で到達）。`Browser.getVersion`・`Target.setAutoAttach`（`waitForDebuggerOnStart:true` は受理）・`Target.getTargetInfo` が成功する。指定なしの既定オプションでは接続直後の `Browser.setDownloadBehavior`（`allowAndName`）が `-32602` で拒否され通らない（後述「段階 2g」） | A（現行 head での再取得）: seq 1〜9 |
 | `connectOverCDP(ws://…)` | 未実行（http 経由が成功するため、収集ハーネスの ws 直接の再試行は行われない） | A |
 | `newContext()` | 成功（`acceptDownloads:false` 指定時。TASK-43.3d・#909 で到達）。`Target.createBrowserContext`（`disposeOnDetach:true`）と `browserContextId` 付き `Browser.setDownloadBehavior`（`deny` + `eventsEnabled:true`）が成功する（後述「段階 2b の実施結果」） | A: seq 10〜14 |
-| `newPage()` | 失敗。`Target.createTarget` は成功し（TASK-43.3e・#910）、`Target.attachedToTarget` が応答の前に届く。セッション付きの初期化の最初の失敗 `Page.enable` の `-32601`（`method not implemented`）で止まる（後述「段階 2e の実施結果」） | A: seq 15〜47 |
+| `newPage()` | 成功（`connectOverCDP(noDefaults:true)`・`newContext({acceptDownloads:false, viewport:null})` 指定時。TASK-43.3n・#1042 で到達を確認。後述「到達結果（TASK-43.3n）」）。`Page.createIsolatedWorld`・`Browser.getWindowForTarget` は `-32601` のまま残るが `newPage()` は失敗しない | A: seq 15〜41 |
 
 `-32601` は未実装メソッドへ成功を捏造しない `CDP-6`・`SEC-2` の方針どおりの挙動で、バグではない。
 
@@ -494,7 +494,33 @@ TASK-43.3o（#1050）の取り込み後に再取得した同梱トレース（3 
 （stage の `ok:true`）。直後に `Page.createIsolatedWorld`（id 18）が送られるが、`newPage` は応答を待たないためトレースに応答（実際は未実装の `-32601`）は
 記録されず、`Target.closeTarget` も送られない。`failed` は空のまま。
 
-次の作業: #1042（ページ初期化メソッド群の残り）。
+次の作業: 後述「到達結果（TASK-43.3n）」で到達を確認した（#1042）。
+
+### 到達結果（TASK-43.3n・#1042。実測 A）
+
+`CDP-2`・`CDP-6`・MS-4。基準は main の `03fda9d0`、playwright-core 1.63.0、node v24.21.0、収集オプションは `connectOverCDP(noDefaults:true)`・`newContext({acceptDownloads:false, viewport:null})`。
+
+- 結果: 3 stage（`connectOverCDP(http)`・`newContext`・`newPage`）がすべて成功。`first_stop` なし、`failed` は空。
+  失敗時のクリーンアップ（`Target.closeTarget` の送信・`Target.detachedFromTarget` の受信）は無い。
+- 段階 3 の結果の要約:
+
+| 段階 | issue | 内容 |
+| ---- | ----- | ---- |
+| 3a | #1037 | `Page.enable`・`Page.getFrameTree` |
+| 3b | #1038 | `Log.enable`・`Runtime.enable`・`Network.enable` |
+| 3c | #1039 | `Page.setLifecycleEventsEnabled` |
+| 3d | #1040 | 空 `source` の `Page.addScriptToEvaluateOnNewDocument`・セッション付き `Target.setAutoAttach` |
+| 3f | #1050 | frame ID = targetId |
+| 3e | #1041 | `Emulation.setFocusEmulationEnabled`・`setEmulatedMedia`（`viewport:null`） |
+
+- 段階 4 の要否の最終判断: **不要**。「予測 #11 の訂正」（種別 B）を実測 A で裏づけた。初期 `about:blank` の `Page.frameNavigated` を送らずに
+  `newPage()` が成功し、トレースに `Page.frameNavigated`・`Page.lifecycleEvent` は 0 件。過去の訂正節は書き換えない。
+- 残る `-32601`: `Browser.getWindowForTarget`（`viewport:null` のため送られない。ウィンドウ境界の実体が無く値を作ると偽になるため、オーナー方針 2026-10-15 どおり `-32601` のまま）と、
+  `Page.createIsolatedWorld`（`newPage()` が応答を待たない。段階 3f の「次の作業」にある実装は #1042 では行わない）。
+- 収集の非決定性: `Page.createIsolatedWorld`（id 18）の `-32601` 応答が `newPage` stage の前後どちらに届くかは競合で、再取得 4 回中 1 回は応答が記録され
+  （seq 41、stage は seq 42 へずれる）、`failed` が 1 件になる。stage の結果は毎回成功。同梱トレースは応答なしの版を固定している（手で編集していない）。
+- 範囲外: `goto()`・セレクタ取得は TASK-44（`CDP-2`）。
+- 固定するテスト: `cdp2_playwright_newpage_is_reached_without_failures_or_cleanup`（`tests/playwright_trace.rs`）。
 
 ### 原則
 
