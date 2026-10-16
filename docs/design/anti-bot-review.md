@@ -58,6 +58,15 @@ SEC-3 は「本項は実測対象の選定基準であり、ブラウザ本体�
 
 新規 CDP メソッドを登録する際は、stealth 系のメソッド（`Emulation.*`・`Network.setUserAgentOverride`・`Page.addScriptToEvaluateOnNewDocument` 等）を SEC-2 の観点で個別にレビューする。これらは -32601 のまま残すか、ヘッダ・UA を実際に書き換えない旨を確認する。-32601 を固定する既存の回帰テスト（`tests/devtools_browser.rs`・`tests/playwright_trace.rs`）は維持する。
 
+例外（2026-10-15 オーナー判断。TASK-43.3m・#1041。Playwright `newPage()` 到達のため）: `Emulation.setFocusEmulationEnabled` と `Emulation.setEmulatedMedia` は、次の条件をすべて満たす場合に限り、値の保持だけで `{}` を返してよい。
+
+- 受理する値は Playwright が既定で送る値だけにする（`setFocusEmulationEnabled` は `enabled` の真偽、`setEmulatedMedia` は `media:""` と既定の media feature 値）。それ以外は `-32602`
+- 保持値をどの API の応答にも反映しない。UA・ヘッダ・`navigator`・画面・TLS・locale・タイムゾーンに触れない
+- 保持だけで実際のエミュレーションを行わないことを `///` と `docs/design/playwright-compat.md` に明記する（`REPAIR-3`）
+- `Emulation.setDeviceMetricsOverride`・`setUserAgentOverride`・`setLocaleOverride`・`setTimezoneOverride` と `Network.setUserAgentOverride` は `-32601` のまま（Playwright 側は `newContext({ viewport: null })` で `setDeviceMetricsOverride` を送らない）
+
+この例外は 2 メソッドの既定値に限る。保持値を実処理（CSSOM の media 評価・フォーカス管理など）に接続する際は、改めて SEC-2 の観点でレビューする。
+
 ## 確認記録
 
 | 日付 | 確認内容 | 結果 |
