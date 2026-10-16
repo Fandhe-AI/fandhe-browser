@@ -87,4 +87,6 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
   TASK-43.3m 後は両者が `{}` で成功し、同梱トレースの `failed` は空（id 12 は `{"identifier":"1"}`、id 14 は `{}` で成功）
 - TASK-43.3m と 43.3o の統合後の実測（3 回の実行で同一出力）。`newPage()` は成功する（stage `ok:true`）。直後に `Page.createIsolatedWorld`（id 18）が送られるが応答は記録されず
   （未実装で `-32601`。`newPage()` が待たない）、`Target.closeTarget` も送られない。送信は 18 件、`failed` は空
+- TASK-43.3n（#1042）で再取得し、`newPage()` の到達（3 stage 成功・`failed` 空・クリーンアップなし）を結合テストで固定した。
+  `Page.createIsolatedWorld` の `-32601` 応答は競合で記録されることがあり（4 回中 1 回）、その場合 `failed` が 1 件になる（stage は成功）
 - 再生テスト（`tests/playwright_trace.rs`）は録画の応答列と現行サーバーの応答列を比較除外なしで完全一致させる
