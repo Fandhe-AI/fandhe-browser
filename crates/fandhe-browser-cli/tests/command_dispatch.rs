@@ -229,3 +229,117 @@ fn cli1_query_rejects_loopback_by_default() {
     assert!(out.stderr.contains("not allowed"), "stderr: {}", out.stderr);
     assert!(out.stdout.is_empty());
 }
+/// screenshot 用の出力先ディレクトリ（テストごとに作り、`Drop` で削除する）。
+struct OutDir(PathBuf);
+
+impl OutDir {
+    fn new(tag: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("fandhe-cli-shot-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("out dir can be created");
+        Self(dir)
+    }
+
+    fn file(&self, name: &str) -> String {
+        self.0.join(name).to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for OutDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn cli1_screenshot_without_arguments_exits_with_usage_error() {
+    let out = run("shot-none", &["screenshot"]);
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: missing required argument 'URL'; run 'fandhe-browser --help' for usage"
+    );
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn cli1_screenshot_without_output_exits_with_usage_error() {
+    let out = run("shot-noout", &["screenshot", "https://a.example/"]);
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: missing required argument 'OUTPUT'; run 'fandhe-browser --help' for usage"
+    );
+}
+
+#[test]
+fn cli1_screenshot_invalid_url_exits_with_error_before_host_resolution() {
+    let dir = OutDir::new("invalid");
+    let target = dir.file("out.png");
+    let out = run("shot-invalid", &["screenshot", "not-a-url", &target]);
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    // ホスト解決（未設定なら "rendering is not available"）より前に URL 検証で止まる。
+    assert_eq!(out.stderr.trim(), "error: invalid URL");
+    assert!(out.stdout.is_empty());
+    assert!(!std::path::Path::new(&target).exists());
+}
+
+#[test]
+fn cli1_screenshot_rejects_loopback_by_default() {
+    let dir = OutDir::new("loopback");
+    let target = dir.file("out.png");
+    let out = run(
+        "shot-loopback",
+        &["screenshot", "http://127.0.0.1:9/", &target],
+    );
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("not allowed"), "stderr: {}", out.stderr);
+    assert!(out.stdout.is_empty());
+    assert!(!std::path::Path::new(&target).exists());
+}
+
+#[test]
+fn cli1_screenshot_rejects_existing_output_before_host_resolution() {
+    let dir = OutDir::new("exists");
+    let target = dir.file("out.png");
+    std::fs::write(&target, b"keep").expect("existing file can be written");
+    let out = run(
+        "shot-exists",
+        &["screenshot", "https://a.example/", &target],
+    );
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(out.stderr.trim(), "error: output file already exists");
+    assert!(out.stdout.is_empty());
+    // 既存ファイルは上書きされない。
+    assert_eq!(std::fs::read(&target).expect("file remains"), b"keep");
+}
+
+#[test]
+fn cli1_screenshot_output_is_validated_before_url() {
+    // 出力先不備と URL 不備が重なるときは出力先の検証が先に報告される。
+    let dir = OutDir::new("order");
+    let target = dir.file("out.png");
+    std::fs::write(&target, b"keep").expect("existing file can be written");
+    let out = run("shot-order", &["screenshot", "not-a-url", &target]);
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(out.stderr.trim(), "error: output file already exists");
+}
+
+#[test]
+fn cli1_screenshot_is_wired_and_reports_rendering_unavailable_without_host() {
+    // 検証を通る入力ではレンダラ解決まで到達する（登録表 → run の接続）。
+    // ホスト未設定では描画不可を英語で報告し、出力ファイルを作らない。
+    let dir = OutDir::new("nohost");
+    let target = dir.file("out.png");
+    let out = run(
+        "shot-nohost",
+        &["screenshot", "https://a.example/", &target],
+    );
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: rendering is not available (render host not found; set FANDHE_BROWSER_RENDER_HOST)"
+    );
+    assert!(out.stdout.is_empty());
+    assert!(!std::path::Path::new(&target).exists());
+}
