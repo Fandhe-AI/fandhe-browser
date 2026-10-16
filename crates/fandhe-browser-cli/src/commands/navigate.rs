@@ -4,8 +4,10 @@
 //! ステータスを stdout に 1 行出して終了する（one-shot）。実行中の `launch` インスタンスへ接続する
 //! 方式は採らない（ai に `/ai/navigate` が無く、CDP クライアントには新規依存が要るため。#281 で依存追加は禁止）。
 //! そのため後続の query（#285）・screenshot（#286）は「直前の CLI 呼び出しで開いたページ」を参照できない。
-//! 取得の中核 [`fetch_page`] を `pub(crate)` で置き、query・screenshot が再利用できるようにしている
+//! 取得の中核 [`fetch_page`] を `pub(crate)` で置き、query が再利用できるようにしている
 //! （URL 長検査・SSRF 検証を経由しない取得経路を作らないため、取得はここに一本化する）。
+//! screenshot は描画ホストが自分で取得するため `fetch_page` を使わず、URL 検査は core の
+//! `check_network_target_url` と `HostRenderer` で行う。
 //!
 //! `cfg(target_os)` 分岐は置かず 3 OS で同一の引数体系・挙動とする（`CLI-1`）。
 //! 取得は `FetchOptions::default()`（ループバック・プライベートアドレスを拒否する SSRF 安全側の既定）で行い、

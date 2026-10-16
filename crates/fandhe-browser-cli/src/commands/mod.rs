@@ -21,6 +21,7 @@ use crate::server::StartupError;
 pub(crate) mod launch;
 pub(crate) mod navigate;
 pub(crate) mod query;
+pub(crate) mod screenshot;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -74,8 +75,9 @@ pub(crate) struct CommandSpec {
     pub(crate) run: Handler,
 }
 
-/// 本番の登録表。`launch`（#283）・`navigate`（#284）を登録済み。残りは #286〜#287 が追加する。
-pub(crate) const COMMANDS: &[CommandSpec] = &[launch::SPEC, navigate::SPEC, query::SPEC];
+/// 本番の登録表。`launch`（#283）・`navigate`（#284）・`query`（#285）・`screenshot`（#286）を登録済み。残りは #287 が追加する。
+pub(crate) const COMMANDS: &[CommandSpec] =
+    &[launch::SPEC, navigate::SPEC, query::SPEC, screenshot::SPEC];
 
 /// ディスパッチ先の一式。
 #[derive(Debug, Clone, Copy)]
@@ -170,6 +172,8 @@ pub(crate) enum CommandError {
     Navigate(navigate::NavigateError),
     /// `query` の失敗。
     Query(query::QueryError),
+    /// `screenshot` の失敗。
+    Screenshot(screenshot::ScreenshotError),
     /// 標準出力への書き込み失敗。
     Output(io::Error),
 }
@@ -191,6 +195,7 @@ impl fmt::Display for CommandError {
             Self::Startup(e) => write!(f, "{e}"),
             Self::Navigate(e) => write!(f, "{e}"),
             Self::Query(e) => write!(f, "{e}"),
+            Self::Screenshot(e) => write!(f, "{e}"),
             Self::Output(_) => f.write_str("failed to write output"),
         }
     }
@@ -203,6 +208,7 @@ impl std::error::Error for CommandError {
             Self::Startup(e) => Some(e),
             Self::Navigate(e) => Some(e),
             Self::Query(e) => Some(e),
+            Self::Screenshot(e) => Some(e),
             Self::Output(e) => Some(e),
         }
     }
@@ -229,6 +235,12 @@ impl From<navigate::NavigateError> for CommandError {
 impl From<query::QueryError> for CommandError {
     fn from(e: query::QueryError) -> Self {
         Self::Query(e)
+    }
+}
+
+impl From<screenshot::ScreenshotError> for CommandError {
+    fn from(e: screenshot::ScreenshotError) -> Self {
+        Self::Screenshot(e)
     }
 }
 
@@ -462,6 +474,22 @@ mod tests {
             text.contains(
                 "query        Fetch a URL once and print text or an attribute of elements matching a CSS selector"
             ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn cli1_help_lists_screenshot() {
+        let registry = Registry {
+            default: default_ok,
+            commands: COMMANDS,
+        };
+        let mut out = Vec::new();
+        dispatch(os(&["--help"]), &registry, &mut out).expect("help succeeds");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("screenshot"), "{text}");
+        assert!(
+            text.contains("Render a URL once and save a PNG screenshot to a file"),
             "{text}"
         );
     }
