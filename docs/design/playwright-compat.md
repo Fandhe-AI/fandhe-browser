@@ -589,7 +589,7 @@ TASK-43.3o（#1050）の取り込み後に再取得した同梱トレース（3 
 
 #### 扱い・未達の明示
 
-- #250 の受入基準（セレクタで要素を取得すること）は未達。解消の前提は Runtime ドメインの最小実装（`Runtime.executionContextCreated` の送出・`Page.createIsolatedWorld`・`Runtime.callFunctionOn`・`Runtime.evaluate`）で、後続 Issue は未起票
+- #250 の受入基準（セレクタで要素を取得すること）は未達。解消の前提は Runtime ドメインの最小実装（`Runtime.executionContextCreated` の送出・`Page.createIsolatedWorld`・`Runtime.callFunctionOn`・`Runtime.evaluate`）で、後続 Issue は #1062 で追跡
 - 実装済みを装わない（`REPAIR-3`）。Runtime 実装後に `selector` が通ることを再実測して本節を更新する
 
 #### 再現手順
