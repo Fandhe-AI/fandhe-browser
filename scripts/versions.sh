@@ -18,6 +18,8 @@
 # CARGO_DENY_VERSION は Dockerfile の先行導入・ci.yml の rust-lint ジョブと値を同期させる。
 : "${LEFTHOOK_VERSION:=2.1.10}"
 : "${CARGO_DENY_VERSION:=0.20.2}"
+# CARGO_ABOUT_VERSION は make license-inventory（scripts/about.sh。TASK-78.2）の cargo-about。exact 固定で、不一致なら再導入する。
+: "${CARGO_ABOUT_VERSION:=0.9.2}"
 
 # check-binary-size（TASK-34.2・RENDER-2。harness/binary-size/README.md 参照）の対象 package と
 # 上限バイト数。上限値の根拠（Chromium 比 80% 以上削減・Chromium 実測 457.4MB の 20% 等）は

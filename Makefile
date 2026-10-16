@@ -25,7 +25,7 @@
 .PHONY: help setup rustup submodule hooks \
 	lint-md lint-yaml lint-editorconfig lint-commits lint-docs \
 	check-workspace-manifest fmt fmt-check lint test test-harness lint-rendering test-rendering \
-	check-render-isolation check-js-engine-isolation check-publish-private deny deny-servo-host check-deny-license-reject ci \
+	check-render-isolation check-js-engine-isolation check-publish-private deny deny-servo-host license-inventory license-inventory-servo-host check-deny-license-reject ci \
 	check-compat-practical check-compat-regression bench-record check-ci-changes check-bench-record \
 	check-binary-size check-static-link measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size measure-cssom-profile-cost \
 	docker-build docker-shell docker-ci trace-playwright check-playwright-trace check-puppeteer-connect
@@ -109,6 +109,12 @@ deny: ## cargo deny check advisories bans licenses sources（本体と servo-hos
 
 deny-servo-host: ## cargo deny check（servo-host のみ。servo-host/deny.toml を適用）
 	@scripts/deny.sh servo-host
+
+license-inventory: ## cargo about で全依存ツリーの解決後ライセンス一覧を生成し GPL 系 0 件を確認する（本体と servo-host。_/license-inventory/ に出力）
+	@scripts/about.sh
+
+license-inventory-servo-host: ## cargo about（servo-host のみ。servo-host/about.toml を適用）
+	@scripts/about.sh servo-host
 
 check-deny-license-reject: ## cargo deny が許可外ライセンスを reject することを canary で検証する（受入基準2の証跡）
 	@scripts/check-deny-license-reject.sh

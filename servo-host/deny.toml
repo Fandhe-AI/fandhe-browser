@@ -33,6 +33,7 @@ ignore = [
 ]
 
 [licenses]
+# 変更時は servo-host/about.toml（cargo-about 設定。TASK-78.2）の accepted・targets・例外も同時に更新する。
 version = 2
 include-dev = true
 # 本体と同じ許可集合に MPL-2.0 だけを足す。MPL-2.0 は crate ごとの例外にしない

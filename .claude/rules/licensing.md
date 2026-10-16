@@ -11,6 +11,7 @@
 - GPL / LGPL / AGPL 系の依存は導入しない
 - MPL-2.0 は本体の workspace（`crates/fandhe-browser-*`）では許可しない（本体の `deny.toml` に足さない）。許可するのは Servo ホスト（次節）の workspace の `deny.toml` だけにする
 - `deny.toml` の許可リストに対して `cargo deny check licenses`（`make deny`・`make ci` に含まれる）を実行し、許可外ライセンスを検出したら fail させる
+- cargo-deny が許可外ライセンスの合否を fail-closed で判定するのに対し、cargo-about（`make license-inventory`・`about.toml`・`servo-host/about.toml`）は全依存の解決後ライセンス一覧を棚卸しの一次資料として生成し、GPL 系が 0 件であることを確認する（OSS-4・TASK-78.2）。`about.toml` の `accepted`・`targets` は `deny.toml` と同期する
 
 ## Servo（MPL-2.0）の隔離
 

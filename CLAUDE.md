@@ -31,6 +31,7 @@ fandhe-browser/
 ├── docker/                        # 配布用 Dockerfile（Dockerfile.release: 既定コンテナ（V8）・軽量コンテナ（`--target lite`・boa のみ）・musl 静的・scratch。x86_64 必須・aarch64 任意〔`--platform linux/arm64`〕。TASK-64.1・64.2・64.3・CTR-1・CTR-4）
 ├── .markdownlint.jsonc / .yamllint / .editorconfig-checker.json  # lint-docs 設定
 ├── Cargo.toml                     #（予定）workspace 定義
+├── about.toml                     # cargo-about 設定（`make license-inventory`。全依存の解決後ライセンス一覧・OSS-4・TASK-78.2。deny.toml と同期。Servo ホスト側は servo-host/about.toml）
 ├── deny.toml                      # cargo-deny 設定（ライセンス・advisories 検査。本体用で MPL-2.0 は未許可。Servo ホスト側は servo-host/deny.toml）
 ├── crates/                        # 各 crate（mcp は stdio サーバー基盤のみ）
 │   ├── fandhe-browser-core/       #   fetch・HTML パース・DOM・query・CSSOM・config・可観測性
@@ -44,10 +45,11 @@ fandhe-browser/
 ├── servo-host/                    # Servo ホスト（別 workspace・別 Cargo.lock・本体 members の外でルート exclude。バイナリ fandhe-browser-servo-host。TASK-38・RENDER-1）
 │   ├── Cargo.toml / Cargo.lock    #   自前の [workspace]（単一 package）。本体と独立
 │   ├── deny.toml                  #   MPL-2.0 等の例外許可はここだけ
+│   ├── about.toml                 #   cargo-about 設定（ホスト用。MPL-2.0 許可）
 │   ├── src/                       #   main・server・engine・page・screenshot・layout
 │   └── tests/                     #   結合テスト
 ├── tests/ / benches/              #（予定）結合テスト・ベンチ
-├── scripts/                       # Makefile の実体（lib.sh・versions.sh・cargo-gate.sh・harness.sh・lint-docs.sh・setup.sh・deny.sh・help.sh 等）と依存グラフ検査等のスクリプト。check-render-isolation.sh（TASK-34.1・RENDER-1）・check-servo-host-isolation.sh（TASK-38・RENDER-1・servo-host が本体 members に無いこととルート Cargo.lock に Servo 系が無いことの検査）・check-js-engine-isolation.sh（TASK-32.4・JS-1）・check-static-link.sh（TASK-93.3・PLUG-1・musl 配布バイナリの動的リンクなし検査）・ci-changes.sh（CI の docs-only 判定）・ci-prune-target.sh（CI cache 保存前の prune）
+├── scripts/                       # Makefile の実体（lib.sh・versions.sh・cargo-gate.sh・harness.sh・lint-docs.sh・setup.sh・deny.sh・about.sh・help.sh 等）と依存グラフ検査等のスクリプト。check-render-isolation.sh（TASK-34.1・RENDER-1）・check-servo-host-isolation.sh（TASK-38・RENDER-1・servo-host が本体 members に無いこととルート Cargo.lock に Servo 系が無いことの検査）・check-js-engine-isolation.sh（TASK-32.4・JS-1）・check-static-link.sh（TASK-93.3・PLUG-1・musl 配布バイナリの動的リンクなし検査）・ci-changes.sh（CI の docs-only 判定）・ci-prune-target.sh（CI cache 保存前の prune）
 ├── profiles/                      # CSSOM gating 用ブラウザ挙動プロファイルデータ（chrome.json・safari.json・README.md。TASK-100.1・PLUG-8）
 ├── harness/                       # 互換性テストハーネス。compat-regression/（TASK-9.2・対象サイト群の動作率回帰チェック）・playwright-trace/（TASK-43.1・Playwright newPage() 到達までの CDP トレース収集）・compat-practical/（TASK-71.1・22 タスク定義・アクセス確認・実行対象バイナリ解決・TASK-71.2・22 タスク実行 run_core.sh・TASK-71.3・Chromium 実測との突合 make_matrix.sh）・puppeteer-connect/（TASK-45.1・Puppeteer 接続試験の実行基盤・TASK-45.2・段階別到達結果の回収）・binary-size/（TASK-34.2・既定 feature リリースバイナリのサイズ検査・TASK-31.1・JS エンジン構成別サイズ計測）・container-size/（TASK-65.1・コンテナイメージサイズ計測）実装済み
 ├── docs/
