@@ -239,7 +239,7 @@ case "${name}" in
       ${cs_args[@]+"${cs_args[@]}"}
     ;;
   check-container-smoke)
-    # docker build（release）と実コンテナ起動を伴うため `make ci` には含めない（TASK-66.1・CTR-2）。
+    # docker build（release）と実コンテナ起動を伴うため `make ci` には含めない（TASK-66.1・TASK-66.2・CTR-2。既定コンテナは CONTAINER_SMOKE_ROLE=default）。
     # 一発実行（query --file）を持たない旧イメージでは result=blocked で exit 2（harness/container-smoke/README.md）。
     require_cmd docker "required by ${name}"
     require_cmd jq "required by ${name}"

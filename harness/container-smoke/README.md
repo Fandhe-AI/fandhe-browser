@@ -1,12 +1,12 @@
 # container-smoke
 
-配布コンテナ（軽量 = boa / 既定 = V8）にローカルフィクスチャ 12 種をボリュームマウントし、`text` / `texts` / `attr` 相当の取得が追加 OS ライブラリなしで動くことを確認するハーネス（TASK-66.1・Issue #302・`CTR-2`・MS-5。親 Issue #301）。
+配布コンテナ（軽量 = boa / 既定 = V8）にローカルフィクスチャ 12 種をボリュームマウントし、`text` / `texts` / `attr` 相当の取得が追加 OS ライブラリなしで動くことを確認するハーネス（TASK-66.1・Issue #302、TASK-66.2・Issue #303・`CTR-2`・MS-5。親 Issue #301）。
 
-**現状: 軽量コンテナで 12/12 成功**（`query --file`、#824 を利用。結果は「実行結果」参照）。一発実行を持たない旧バイナリに当たった場合は成功を装わず `result=blocked`（exit 2）を記録する。
+**現状: 軽量コンテナ・既定コンテナとも 12/12 成功**（`query --file`、#824 を利用。結果は「実行結果」参照）。一発実行を持たない旧バイナリに当たった場合は成功を装わず `result=blocked`（exit 2）を記録する。
 
 | 後続 | 内容 |
 | ---- | ---- |
-| #303（TASK-66.2） | 既定コンテナで本スクリプトを流用（`--role default`） |
+| #303（TASK-66.2） | 既定コンテナで本スクリプトを流用（`--role default`）。実行結果は記入済み |
 | #304（TASK-66.3） | JS スモーク |
 
 ## 使い方
@@ -114,4 +114,18 @@ container-smoke-summary: role=lite total=12 executed=12 success=12 result=pass r
 
 ### 既定コンテナ
 
-Issue #303（TASK-66.2）で記入する。
+2026-10-16、`docker/Dockerfile.release --target default`（V8 同梱・scratch）を `docker build` で別途ビルド（ビルド元コミット `7abedd8001c8`・amd64）し、`CONTAINER_SMOKE_SKIP_BUILD=1` で実行（env 行が `built=no` なのはこのため）:
+
+```text
+$ CONTAINER_SMOKE_ROLE=default CONTAINER_SMOKE_IMAGE=fandhe-browser:default-smoke303 CONTAINER_SMOKE_SKIP_BUILD=1 make check-container-smoke
+container-smoke-env: role=default image=fandhe-browser:default-smoke303 id=sha256:779f250c... platform=linux/amd64 docker_server=29.8.1 commit=7abedd8001c8 dirty=0 built=no shared_libs=0
+container-smoke: role=default id=C01 fixture=static/01-article.html kind=texts status=ok exit=0
+  （C02〜C11 も status=ok）
+container-smoke: role=default id=C12 fixture=static/08-malformed.html kind=texts status=ok exit=0
+container-smoke-summary: role=default total=12 executed=12 success=12 result=pass reason=none
+(exit 0)
+```
+
+- 追加 OS ライブラリ: イメージ内の共有ライブラリ類は 0 件（`shared_libs=0`。scratch）
+- 12 タスク: **12/12 成功**（受入基準 1・2 を満たす。attr の C04・C05・C10 は軽量コンテナと同様に先頭要素のみの検証）
+- arm64: 任意（TASK-64.3）。本ホストは x86_64 のため未実施
