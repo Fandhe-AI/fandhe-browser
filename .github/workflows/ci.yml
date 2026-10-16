@@ -1266,22 +1266,29 @@ jobs:
       - name: "Servo ホストの system 依存の確認"
         run: |
           df -h /
-          # mozjs_sys の build.rs が llvm-objdump を要求する。macos-latest の PATH に無い場合は
-          # 導入済みの Homebrew llvm の llvm-objdump だけを専用ディレクトリへ symlink して PATH に足す
-          # （bin 全体を足すと Homebrew の clang が Apple clang を覆うため。新規導入はしない）
-          if ! command -v llvm-objdump >/dev/null 2>&1; then
-            for prefix in "$(brew --prefix llvm 2>/dev/null || true)" /opt/homebrew/opt/llvm /usr/local/opt/llvm; do
-              if [ -n "$prefix" ] && [ -x "$prefix/bin/llvm-objdump" ]; then
-                tools_dir="$RUNNER_TEMP/llvm-tools"
-                mkdir -p "$tools_dir"
-                ln -sf "$prefix/bin/llvm-objdump" "$tools_dir/llvm-objdump"
-                echo "$tools_dir" >> "$GITHUB_PATH"
-                export PATH="$PATH:$tools_dir"
-                break
-              fi
-            done
+          # mozjs_sys の configure（LLVM_OBJDUMP）は llvm-objdump を要求する。macos-latest には Homebrew の
+          # llvm が無いため、Xcode 同梱の LLVM 系 objdump を xcrun で探し、LLVM_OBJDUMP でパスを渡す
+          # （PATH は変えない。Homebrew llvm の bin を足すと Apple clang を覆うため。新規導入もしない）
+          objdump=""
+          for name in llvm-objdump objdump; do
+            if found="$(xcrun --find "$name" 2>/dev/null)" && [ -x "$found" ]; then
+              objdump="$found"
+              break
+            fi
+          done
+          if [ -z "$objdump" ]; then
+            echo "error: neither llvm-objdump nor objdump was found via xcrun" >&2
+            exit 1
           fi
-          for t in clang cmake pkg-config python3 make llvm-objdump; do
+          echo "LLVM_OBJDUMP=$objdump" >> "$GITHUB_ENV"
+          export LLVM_OBJDUMP="$objdump"
+          if [ ! -x "$LLVM_OBJDUMP" ]; then
+            echo "error: LLVM_OBJDUMP is not executable: $LLVM_OBJDUMP" >&2
+            exit 1
+          fi
+          echo "LLVM_OBJDUMP: $LLVM_OBJDUMP"
+          "$LLVM_OBJDUMP" --version | head -2
+          for t in clang cmake pkg-config python3 make; do
             if ! command -v "$t" >/dev/null 2>&1; then
               echo "error: $t is required but was not found on PATH" >&2
               exit 1
@@ -1337,6 +1344,11 @@ jobs:
       # uv は完全固定（win_amd64 wheel の sha256 で完全性を検証）
       UV_VERSION: "0.12.20"
       UV_WHEEL_SHA256: 1502e03f4da3280cbb493d356d59bdd401bf23197cd71df64e1c6feac156090c
+      # MozTools（mozjs_sys の Windows ビルドが使う msys2 と mozmake）は完全固定（zip の sha256 で検証）。
+      # 取得元は servo/mozjs の README「Windows」節。build.rs の MOZTOOLS_VERSION と版を揃える
+      MOZTOOLS_VERSION: "4.0"
+      MOZTOOLS_URL: https://github.com/servo/servo-build-deps/releases/download/msvc-deps/moztools-4.0.zip
+      MOZTOOLS_ZIP_SHA256: cceb354767ef3dad8813e63cb95ed081814225bf5fa15bfa083aa8b31a339153
     steps:
       - name: "長パスの有効化と空き容量の記録"
         run: |
@@ -1496,6 +1508,33 @@ jobs:
           if (-not (Get-Command llvm-objdump -ErrorAction SilentlyContinue)) {
             "$found" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           }
+      - name: "MozTools の導入（バージョン・ハッシュ固定）"
+        run: |
+          # mozjs_sys の build.rs（find_moztools）は MOZTOOLS_PATH を最優先で使う。未設定だと
+          # target dir の祖先から探して panic するため、zip を取得・sha256 照合・展開して指す
+          $work = Join-Path $env:RUNNER_TEMP 'moztools'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $zip = Join-Path $work 'moztools.zip'
+          Invoke-WebRequest -Uri $env:MOZTOOLS_URL -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+          if ($hash -ne $env:MOZTOOLS_ZIP_SHA256) {
+            Write-Host "::error::moztools zip sha256 mismatch (got: $hash)"
+            Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          $dest = Join-Path $work 'x'
+          Expand-Archive -Path $zip -DestinationPath $dest
+          Remove-Item $zip -Force
+          # zip の最上位は moztools-<版> ディレクトリ（msys2/ と bin/mozmake.exe を含む）
+          $root = Join-Path $dest "moztools-$env:MOZTOOLS_VERSION"
+          foreach ($rel in @('bin\mozmake.exe', 'msys2\usr\bin')) {
+            if (-not (Test-Path (Join-Path $root $rel))) {
+              Write-Host "::error::unexpected moztools layout: missing $rel under $root"
+              exit 1
+            }
+          }
+          Write-Host "MOZTOOLS_PATH: $root"
+          "MOZTOOLS_PATH=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: "[servo-host] cargo build（dev・--locked）"
         run: cargo build --manifest-path servo-host/Cargo.toml --locked --target-dir $env:SERVO_HOST_TARGET_DIR
       - name: "[servo-host] --selftest"

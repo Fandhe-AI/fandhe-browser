@@ -114,6 +114,15 @@ VS 2026 では、v143 を導入しても既定のツールセットは v145 の�
   python -m pip install --require-hashes --only-binary=:all: --no-deps -r uv-requirements.txt
   ```
 
+### MozTools（SpiderMonkey のビルドツール）
+
+- `mozjs_sys`（Servo の JS エンジン）の Windows ビルドは MozTools 4.0（msys2 と `mozmake.exe`）か MozillaBuild を要求します。`MOZTOOLS_PATH` が未設定だと `build.rs` は `<target>/dependencies/moztools/4.0` を探し、短い `--target-dir`（例: `C:\st`）では見つからずに失敗します。
+- 取得元は servo/mozjs の README「Windows」節の `https://github.com/servo/servo-build-deps/releases/download/msvc-deps/moztools-4.0.zip` です。CI（`servo-host-windows`）は `ci.yml` の `MOZTOOLS_ZIP_SHA256` で zip を照合しており、同じ値で確認してください。zip を展開すると最上位に `moztools-4.0` ができるため、そのディレクトリ（`bin\mozmake.exe` と `msys2\usr\bin` を含む）を `MOZTOOLS_PATH` に指定します。
+
+  ```powershell
+  $env:MOZTOOLS_PATH = "C:\path\to\moztools-4.0"
+  ```
+
 ### 注意点
 
 - Servo の `target/` は 10〜15GB に達すると公称されています（PoC-12）。空き容量を確認し、長パスを避けるため `CARGO_TARGET_DIR` は短いパス（例: `C:\t`）に置くことを推奨します。
