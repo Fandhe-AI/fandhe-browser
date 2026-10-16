@@ -134,8 +134,8 @@ JS
 OPTS_LOG="$FAKE_DIR/opts.log" node "$SCRIPT_DIR/trace.mjs" --endpoint http://127.0.0.1:9 --out "$FAKE_DIR/out6.jsonl" \
   --module-dir "$FAKE_DIR" --playwright-version 0.0.0 >/dev/null 2>&1
 grep -q '^connect .*"noDefaults":true' "$FAKE_DIR/opts.log" || { echo "FAIL: connectOverCDP must receive noDefaults:true" >&2; exit 1; }
-grep -q '^context {"acceptDownloads":false}$' "$FAKE_DIR/opts.log" || { echo "FAIL: newContext must receive acceptDownloads:false" >&2; exit 1; }
-echo "ok: noDefaults and acceptDownloads:false are passed to Playwright"
+grep -q '^context {"acceptDownloads":false,"viewport":null}$' "$FAKE_DIR/opts.log" || { echo "FAIL: newContext must receive acceptDownloads:false and viewport:null" >&2; exit 1; }
+echo "ok: noDefaults and acceptDownloads:false, viewport:null are passed to Playwright"
 
 # verify-install.mjs が導入結果の不一致を exit 1 で拒否し、一致なら 0 を返すこと（オフライン）。
 VDIR="$(mktemp -d)"

@@ -79,7 +79,12 @@ make check-playwright-trace  # オフライン自己テスト（要 node）
 - TASK-43.3o（#1050）後の実測（2 回の実行で同一出力）。`Page.getFrameTree` の `frame.id` が targetId になり、`Frame has been detached.` は解消した。
   次の送信 `Page.createIsolatedWorld` は `-32601`、`newPage()` は `Emulation.setFocusEmulationEnabled` の Protocol error で失敗する。`failed` は id 7・16・17・18・20
 - `Page.addScriptToEvaluateOnNewDocument` の `worldName` に含まれる乱数ハッシュは `<WORLD_HASH>` へ正規化する（決定的にするため）
-- 収集は `connectOverCDP(..., { noDefaults: true })` と `newContext({ acceptDownloads: false })` で行う。fandhe-browser は
+- 収集は `connectOverCDP(..., { noDefaults: true })` と `newContext({ acceptDownloads: false, viewport: null })` で行う。fandhe-browser は
   ダウンロード実行系が無く `Browser.setDownloadBehavior` の `allow`・`allowAndName` を拒否するため、Playwright の
   既定のオプション（接続直後の `Browser.setDownloadBehavior`、`newContext` の `allowAndName`）では通らない
+- `viewport: null` は、画面に近い `Browser.getWindowForTarget`・`Emulation.setDeviceMetricsOverride` の送信を省くため（受理する範囲を絞るオーナー方針。TASK-43.3m・#1041）。
+  実測では送信が 20 件から 18 件になり、送信が残る `Emulation.*` は `setFocusEmulationEnabled`・`setEmulatedMedia` のみ。
+  TASK-43.3m 後は両者が `{}` で成功し、同梱トレースの `failed` は空（id 12 は `{"identifier":"1"}`、id 14 は `{}` で成功）
+- TASK-43.3m と 43.3o の統合後の実測（3 回の実行で同一出力）。`newPage()` は成功する（stage `ok:true`）。直後に `Page.createIsolatedWorld`（id 18）が送られるが応答は記録されず
+  （未実装で `-32601`。`newPage()` が待たない）、`Target.closeTarget` も送られない。送信は 18 件、`failed` は空
 - 再生テスト（`tests/playwright_trace.rs`）は録画の応答列と現行サーバーの応答列を比較除外なしで完全一致させる

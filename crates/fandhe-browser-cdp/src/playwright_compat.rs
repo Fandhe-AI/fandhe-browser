@@ -1,4 +1,4 @@
-//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c、段階 2b は 43.3d、段階 2g は 43.3g、段階 2h は 43.3h、段階 3a は 43.3i、段階 3b は 43.3j、段階 3c は 43.3k）。
+//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c、段階 2b は 43.3d、段階 2g は 43.3g、段階 2h は 43.3h、段階 3a は 43.3i、段階 3b は 43.3j、段階 3c は 43.3k、段階 3e は 43.3m）。
 //!
 //! `protocol::builtin_handlers` から登録される。`Browser.getVersion`（43.3a）・
 //! `Target.getTargetInfo`（43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（43.3c）を
@@ -25,6 +25,10 @@
 //! セッションの `Page.navigate` が `Page.lifecycleEvent` の `init`・`load` を送る）を足す。
 //! 43.3l（#1040）で `Page.addScriptToEvaluateOnNewDocument`（空 `source` のみ受理・非空は拒否）と
 //! セッション付き `Target.setAutoAttach`（状態の保持のみ・子 attach は 0 件）を足す。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
+//! 43.3m（#1041）で `Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia` を足す。Playwright 既定値（`enabled:true`、
+//! `media:""` と既定 4 feature）だけを受理して検証済みの値をセッション状態に保持し、どの API からも読まない（観測できる
+//! 効果は無い。`REPAIR-3`）。`setDeviceMetricsOverride`・`setUserAgentOverride`・`setLocaleOverride`・`setTimezoneOverride` は
+//! `-32601` のまま（`SEC-2`・`CDP-6`）。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
 
 use serde_json::{Value, json};
 
@@ -593,6 +597,147 @@ impl CommandHandler for PageAddScriptToEvaluateOnNewDocument {
     }
 }
 
+/// `Emulation.setFocusEmulationEnabled`（`CDP-2`・TASK-43.3m・#1041）。
+///
+/// `sessionId` 付きで `{"enabled": true}`（Playwright 既定値。AGENTS.md の CDP-6 例外）だけを受け、
+/// 受理した印をセッション状態として保持して `{}` を返す（冪等）。検証順は [`PageSetLifecycleEventsEnabled`] と
+/// 同じ: `sessionId` なしは `UNSUPPORTED_PARAMS`、`params` が非オブジェクトは `INVALID_PARAMS`、`enabled` 以外の
+/// キーは `UNSUPPORTED_PARAMS`、`enabled` が無い・bool でないは `INVALID_PARAMS`、`enabled:false`（既定値以外）は
+/// `UNSUPPORTED_PARAMS`、未知・閉じたセッションは `INVALID_PARAMS`。いずれも状態を変えない。止めたターゲット（`Runtime.runIfWaitingForDebugger` より前）でも
+/// 受理する（Playwright は再開前に送る）。
+///
+/// 差異（`REPAIR-3`）: 保持値はどの API からも読まれず、今は観測できる効果が無い（フォーカス状態の
+/// エミュレーションはしない）。将来は render（TASK-38.5）のフォーカス管理と接続する（別 issue）。
+/// この成功は検証済みの値を実際に保持する状態変更で、検出回避のための一律成功ではない（`SEC-2`・`CDP-6`）。
+/// UA・ヘッダ・`navigator`・画面・locale・タイムゾーンには触れない。
+pub(crate) struct EmulationSetFocusEmulationEnabled;
+
+impl CommandHandler for EmulationSetFocusEmulationEnabled {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            let sid = ctx.session_id.ok_or(CdpError::UNSUPPORTED_PARAMS)?;
+            let obj = params.as_object().ok_or(CdpError::INVALID_PARAMS)?;
+            if obj.keys().any(|k| k != "enabled") {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let enabled = obj
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or(CdpError::INVALID_PARAMS)?;
+            // 既定値（true）以外は受理しない（CDP-6 例外は Playwright 既定値に限る）。
+            if !enabled {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            ctx.state
+                .registry()
+                .set_focus_emulation(sid, enabled)
+                .map_err(|_| CdpError::INVALID_PARAMS)?;
+            Ok(HandlerOutput::result(json!({})))
+        })
+    }
+}
+
+/// `Emulation.setEmulatedMedia` で受理する media feature の Playwright 既定値（`playwright-core` 1.63.0 の
+/// `newPage()` が送る 4 件。TASK-43.3m・#1041）。これ以外の name・value は受理しない。
+const DEFAULT_MEDIA_FEATURES: [(&str, &str); 4] = [
+    ("prefers-color-scheme", "light"),
+    ("prefers-reduced-motion", "no-preference"),
+    ("forced-colors", "none"),
+    ("prefers-contrast", "no-preference"),
+];
+
+/// `Emulation.setEmulatedMedia` の `params` を検証し、Playwright 既定値と一致するときだけ `Ok` を返す。
+///
+/// トップレベルのキーは `media`・`features` の両方が必須（欠落・他のキーは `UNSUPPORTED_PARAMS`）。`media` は
+/// 空文字のみ、`features` は既定の 4 件をちょうど 1 回ずつ（順不同）含む配列のみ受理する。型の不正は
+/// `INVALID_PARAMS`、既定値以外・未知の name・重複・欠落・余分なキーは `UNSUPPORTED_PARAMS`。
+/// 配列は 5 件以上を走査せず拒否する（無制限の走査を避ける）。
+fn validate_default_emulated_media(obj: &serde_json::Map<String, Value>) -> Result<(), CdpError> {
+    if obj.keys().any(|k| k != "media" && k != "features") {
+        return Err(CdpError::UNSUPPORTED_PARAMS);
+    }
+    let media = obj
+        .get("media")
+        .ok_or(CdpError::UNSUPPORTED_PARAMS)?
+        .as_str()
+        .ok_or(CdpError::INVALID_PARAMS)?;
+    let features = obj
+        .get("features")
+        .ok_or(CdpError::UNSUPPORTED_PARAMS)?
+        .as_array()
+        .ok_or(CdpError::INVALID_PARAMS)?;
+    if !media.is_empty() {
+        return Err(CdpError::UNSUPPORTED_PARAMS);
+    }
+    if features.len() > DEFAULT_MEDIA_FEATURES.len() {
+        return Err(CdpError::UNSUPPORTED_PARAMS);
+    }
+    let mut seen = [false; DEFAULT_MEDIA_FEATURES.len()];
+    for f in features {
+        let fo = f.as_object().ok_or(CdpError::INVALID_PARAMS)?;
+        let name = fo
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or(CdpError::INVALID_PARAMS)?;
+        let value = fo
+            .get("value")
+            .and_then(Value::as_str)
+            .ok_or(CdpError::INVALID_PARAMS)?;
+        if fo.len() != 2 {
+            return Err(CdpError::UNSUPPORTED_PARAMS);
+        }
+        let idx = DEFAULT_MEDIA_FEATURES
+            .iter()
+            .position(|(n, v)| *n == name && *v == value)
+            .ok_or(CdpError::UNSUPPORTED_PARAMS)?;
+        let slot = seen.get_mut(idx).ok_or(CdpError::UNSUPPORTED_PARAMS)?;
+        if *slot {
+            return Err(CdpError::UNSUPPORTED_PARAMS);
+        }
+        *slot = true;
+    }
+    if seen.iter().all(|s| *s) {
+        Ok(())
+    } else {
+        Err(CdpError::UNSUPPORTED_PARAMS)
+    }
+}
+
+/// `Emulation.setEmulatedMedia`（`CDP-2`・TASK-43.3m・#1041）。
+///
+/// `sessionId` 付きで、Playwright 既定値（`media:""` と 4 件の既定 feature）だけを受理し、受理済みの印を
+/// セッション状態に保持して `{}` を返す（冪等）。検証は `sessionId` なし（`UNSUPPORTED_PARAMS`）→ `params` が
+/// 非オブジェクト（`INVALID_PARAMS`）→ 値の検証（[`validate_default_emulated_media`]）→ 未知・閉じたセッション
+/// （`INVALID_PARAMS`）の順で、エラー時は状態を変えない。止めたターゲットでも受理する。
+///
+/// 差異（`REPAIR-3`）: 実際の media エミュレーションはしない。保持値は読まれず観測できる効果が無い。
+/// 既定値以外（`print`・`prefers-color-scheme:dark` 等）は `-32602` で拒否する。将来は CSSOM の media 評価と
+/// 接続する（別 issue）。この成功は検証済みの値を保持する状態変更で、一律成功ではない（`SEC-2`・`CDP-6`）。
+/// UA・ヘッダ・`navigator`・画面・locale・タイムゾーンには触れない。
+pub(crate) struct EmulationSetEmulatedMedia;
+
+impl CommandHandler for EmulationSetEmulatedMedia {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            let sid = ctx.session_id.ok_or(CdpError::UNSUPPORTED_PARAMS)?;
+            let obj = params.as_object().ok_or(CdpError::INVALID_PARAMS)?;
+            validate_default_emulated_media(obj)?;
+            ctx.state
+                .registry()
+                .set_emulated_media_default(sid)
+                .map_err(|_| CdpError::INVALID_PARAMS)?;
+            Ok(HandlerOutput::result(json!({})))
+        })
+    }
+}
 /// `Log.enable`・`Runtime.enable`・`Network.enable` の共通本体（`CDP-2`・TASK-43.3j・#1038）。
 ///
 /// 検証順は [`PageEnable`] と同じ。`sessionId` なしは `UNSUPPORTED_PARAMS`、未知・閉じたセッションは
@@ -3093,6 +3238,360 @@ mod tests {
             .await;
             let methods: Vec<&str> = nav.iter().filter_map(|v| v["method"].as_str()).collect();
             assert_eq!(methods, ["Page.frameNavigated", "Page.loadEventFired"]);
+        }
+
+        // ---- Emulation.setFocusEmulationEnabled・setEmulatedMedia（TASK-43.3m・#1041） ----
+
+        const MEDIA_TRACE: &str = r#"{"media":"","features":[{"name":"prefers-color-scheme","value":"light"},{"name":"prefers-reduced-motion","value":"no-preference"},{"name":"forced-colors","value":"none"},{"name":"prefers-contrast","value":"no-preference"}]}"#;
+
+        #[tokio::test]
+        async fn cdp2_emulation_accepts_trace_values_and_is_idempotent() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            assert_eq!(st.registry().emulation_of(&s), None);
+            for id in [2, 3] {
+                assert_eq!(
+                    call(
+                        &st,
+                        Some(c),
+                        &sreq(
+                            id,
+                            "Emulation.setFocusEmulationEnabled",
+                            &sid,
+                            r#"{"enabled":true}"#
+                        )
+                    )
+                    .await,
+                    vec![json!({"id":id,"sessionId":sid,"result":{}})]
+                );
+            }
+            for id in [4, 5] {
+                assert_eq!(
+                    call(
+                        &st,
+                        Some(c),
+                        &sreq(id, "Emulation.setEmulatedMedia", &sid, MEDIA_TRACE)
+                    )
+                    .await,
+                    vec![json!({"id":id,"sessionId":sid,"result":{}})]
+                );
+            }
+            assert_eq!(
+                st.registry().emulation_of(&s),
+                Some(crate::target::SessionEmulation {
+                    focus: Some(true),
+                    media_default: true
+                })
+            );
+            // `enabled:false` は既定値以外のため拒否され、直前の保持値（true）は変わらない。
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c),
+                    &sreq(
+                        6,
+                        "Emulation.setFocusEmulationEnabled",
+                        &sid,
+                        r#"{"enabled":false}"#,
+                    ),
+                )
+                .await,
+                vec![serr(-32602, "unsupported params", 6, &sid)]
+            );
+            assert_eq!(
+                st.registry().emulation_of(&s).map(|e| e.focus),
+                Some(Some(true))
+            );
+            // features は順不同で受理する。
+            let reordered = r#"{"media":"","features":[{"name":"prefers-contrast","value":"no-preference"},{"name":"forced-colors","value":"none"},{"name":"prefers-reduced-motion","value":"no-preference"},{"name":"prefers-color-scheme","value":"light"}]}"#;
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c),
+                    &sreq(7, "Emulation.setEmulatedMedia", &sid, reordered)
+                )
+                .await,
+                vec![json!({"id":7,"sessionId":sid,"result":{}})]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp2_emulation_focus_rejects_invalid_params_without_state_change() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let m = "Emulation.setFocusEmulationEnabled";
+            for (id, p, code, msg) in [
+                (2, r#"{}"#, -32602, "invalid params"),
+                (3, r#"{"enabled":"true"}"#, -32602, "invalid params"),
+                (4, r#"{"enabled":1}"#, -32602, "invalid params"),
+                (6, r#"{"enabled":true,"x":1}"#, -32602, "unsupported params"),
+                // 既定値以外（false）は拒否し、状態を作らない。
+                (7, r#"{"enabled":false}"#, -32602, "unsupported params"),
+            ] {
+                assert_eq!(
+                    call(&st, Some(c), &sreq(id, m, &sid, p)).await,
+                    vec![serr(code, msg, id, &sid)],
+                    "{p}"
+                );
+            }
+            assert_eq!(st.registry().emulation_of(&s), None);
+        }
+
+        #[tokio::test]
+        async fn cdp2_emulated_media_rejects_non_default_values_without_state_change() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let m = "Emulation.setEmulatedMedia";
+            let f = |name: &str, value: &str| format!(r#"{{"name":"{name}","value":"{value}"}}"#);
+            let d1 = f("prefers-color-scheme", "light");
+            let d2 = f("prefers-reduced-motion", "no-preference");
+            let d3 = f("forced-colors", "none");
+            let d4 = f("prefers-contrast", "no-preference");
+            let dark = f("prefers-color-scheme", "dark");
+            let unknown = f("color-gamut", "p3");
+            let extra = r#"{"name":"forced-colors","value":"none","x":1}"#;
+            let cases: Vec<(String, i64, &str)> = vec![
+                // 既定値以外の media
+                (
+                    format!(r#"{{"media":"print","features":[{d1},{d2},{d3},{d4}]}}"#),
+                    -32602,
+                    "unsupported params",
+                ),
+                // 既定値以外の value
+                (
+                    format!(r#"{{"media":"","features":[{dark},{d2},{d3},{d4}]}}"#),
+                    -32602,
+                    "unsupported params",
+                ),
+                // 未知の feature 名
+                (
+                    format!(r#"{{"media":"","features":[{unknown},{d2},{d3},{d4}]}}"#),
+                    -32602,
+                    "unsupported params",
+                ),
+                // 重複
+                (
+                    format!(r#"{{"media":"","features":[{d1},{d1},{d3},{d4}]}}"#),
+                    -32602,
+                    "unsupported params",
+                ),
+                // 欠落（3 件）
+                (
+                    format!(r#"{{"media":"","features":[{d1},{d2},{d3}]}}"#),
+                    -32602,
+                    "unsupported params",
+                ),
+                // 5 件
+                (
+                    format!(r#"{{"media":"","features":[{d1},{d2},{d3},{d4},{d1}]}}"#),
+                    -32602,
+                    "unsupported params",
+                ),
+                // 要素の余分なキー
+                (
+                    format!(r#"{{"media":"","features":[{d1},{d2},{extra},{d4}]}}"#),
+                    -32602,
+                    "unsupported params",
+                ),
+                // features の欠落・media の欠落・未知のトップレベルキー
+                (r#"{"media":""}"#.to_owned(), -32602, "unsupported params"),
+                (
+                    format!(r#"{{"features":[{d1},{d2},{d3},{d4}]}}"#),
+                    -32602,
+                    "unsupported params",
+                ),
+                (
+                    format!(r#"{{"media":"","features":[{d1},{d2},{d3},{d4}],"x":1}}"#),
+                    -32602,
+                    "unsupported params",
+                ),
+                // 型の不正
+                (
+                    format!(r#"{{"media":1,"features":[{d1},{d2},{d3},{d4}]}}"#),
+                    -32602,
+                    "invalid params",
+                ),
+                (
+                    r#"{"media":"","features":"x"}"#.to_owned(),
+                    -32602,
+                    "invalid params",
+                ),
+                (
+                    r#"{"media":"","features":[1,2,3,4]}"#.to_owned(),
+                    -32602,
+                    "invalid params",
+                ),
+                (
+                    r#"{"media":"","features":[{"name":1,"value":"x"}]}"#.to_owned(),
+                    -32602,
+                    "invalid params",
+                ),
+            ];
+            for (i, (p, code, msg)) in cases.iter().enumerate() {
+                let id = 2 + i as i64;
+                assert_eq!(
+                    call(&st, Some(c), &sreq(id, m, &sid, p)).await,
+                    vec![serr(*code, msg, id, &sid)],
+                    "{p}"
+                );
+            }
+            assert_eq!(st.registry().emulation_of(&s), None);
+        }
+
+        #[tokio::test]
+        async fn cdp2_emulation_rejects_missing_or_unknown_session() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            for (m, p) in [
+                ("Emulation.setFocusEmulationEnabled", r#"{"enabled":true}"#),
+                ("Emulation.setEmulatedMedia", MEDIA_TRACE),
+            ] {
+                assert_eq!(
+                    call(
+                        &st,
+                        Some(c),
+                        &format!(r#"{{"id":1,"method":"{m}","params":{p}}}"#)
+                    )
+                    .await,
+                    vec![err(-32602, "unsupported params", 1)],
+                    "{m}"
+                );
+                assert_eq!(
+                    call(&st, Some(c), &sreq(2, m, "NoSuch-1", p)).await,
+                    vec![serr(-32602, "invalid params", 2, "NoSuch-1")],
+                    "{m}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn cdp2_emulation_accepted_on_paused_target() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(
+                &st,
+                Some(c),
+                &auto_attach(
+                    1,
+                    r#""autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true"#,
+                ),
+            )
+            .await;
+            let f = call(&st, Some(c), &create_req(2, BLANK)).await;
+            assert_eq!(f[0]["params"]["waitingForDebugger"], true, "{f:?}");
+            let sid = f[0]["params"]["sessionId"].as_str().unwrap().to_owned();
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c),
+                    &sreq(
+                        10,
+                        "Emulation.setFocusEmulationEnabled",
+                        &sid,
+                        r#"{"enabled":true}"#
+                    )
+                )
+                .await,
+                vec![json!({"id":10,"sessionId":sid,"result":{}})]
+            );
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c),
+                    &sreq(11, "Emulation.setEmulatedMedia", &sid, MEDIA_TRACE)
+                )
+                .await,
+                vec![json!({"id":11,"sessionId":sid,"result":{}})]
+            );
+        }
+
+        /// `SEC-2`: 保持値は他の API の応答・イベントを変えない。
+        #[tokio::test]
+        async fn sec2_emulation_does_not_change_other_responses() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let target_id = st.registry().session_target(&s).unwrap();
+            let probe = |base: i64| {
+                vec![
+                    format!(r#"{{"id":{base},"method":"Browser.getVersion"}}"#),
+                    format!(
+                        r#"{{"id":{},"method":"Target.getTargetInfo","params":{{"targetId":"{}"}}}}"#,
+                        base + 1,
+                        target_id.as_str()
+                    ),
+                    sreq(base + 2, "Page.getFrameTree", &sid, "{}"),
+                ]
+            };
+            let mut before = Vec::new();
+            for t in probe(100) {
+                before.push(call(&st, Some(c), &t).await);
+            }
+            call(
+                &st,
+                Some(c),
+                &sreq(
+                    2,
+                    "Emulation.setFocusEmulationEnabled",
+                    &sid,
+                    r#"{"enabled":true}"#,
+                ),
+            )
+            .await;
+            call(
+                &st,
+                Some(c),
+                &sreq(3, "Emulation.setEmulatedMedia", &sid, MEDIA_TRACE),
+            )
+            .await;
+            let mut after = Vec::new();
+            for t in probe(100) {
+                after.push(call(&st, Some(c), &t).await);
+            }
+            assert_eq!(before, after);
+            let nav = call(
+                &st,
+                Some(c),
+                &sreq(9, "Page.navigate", &sid, r#"{"url":"about:blank"}"#),
+            )
+            .await;
+            let methods: Vec<&str> = nav.iter().filter_map(|v| v["method"].as_str()).collect();
+            assert_eq!(methods, ["Page.frameNavigated", "Page.loadEventFired"]);
+        }
+
+        /// `CDP-6`・`SEC-2`: 識別面・画面系のエミュレーションは受理しない。
+        #[tokio::test]
+        async fn cdp6_identity_and_screen_emulation_remain_method_not_implemented() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            for (id, m) in [
+                (2, "Emulation.setUserAgentOverride"),
+                (3, "Emulation.setLocaleOverride"),
+                (4, "Emulation.setTimezoneOverride"),
+                (5, "Emulation.setDeviceMetricsOverride"),
+                (6, "Network.setUserAgentOverride"),
+            ] {
+                assert_eq!(
+                    call(&st, Some(c), &sreq(id, m, &sid, "{}")).await,
+                    vec![serr(-32601, "method not implemented", id, &sid)],
+                    "{m}"
+                );
+            }
         }
 
         #[tokio::test]
