@@ -101,7 +101,7 @@ Cargo 依存 (通常依存・推移依存) の著作権表示・許諾文を、�
 scripts/gen-cargo-licenses.sh (cargo tree / cargo metadata による生成。新規依存なし) が
 各 crate パッケージ同梱の LICENSE / COPYING / NOTICE ファイルから連結し、
 イメージの /licenses/LICENSE-CARGO-DEPENDENCIES として同梱する。
-パッケージにライセンスファイルを含まない crate (v8・fandhe-backend 系) は、
+パッケージにライセンスファイルを含まない crate (v8・fandhe-backend 系・boa 系 (boa_ast / boa_engine / boa_gc / boa_interner / boa_macros / boa_parser / boa_string 0.22.0、small_btree / tag_ptr 0.1.0。Unlicense OR MIT の両文面を同梱)) は、
 docker/license-supplements/ に同梱した上流正本の全文 (タグ付きリビジョンから取得) で補う。
 補完文書も無い crate が 1 件でもあればスクリプトは失敗し (fail-closed)、
 著作権表示・許諾文を欠いたイメージは生成されない。SPDX 宣言のみで済ませることはしない。
