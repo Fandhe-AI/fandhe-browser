@@ -1,7 +1,7 @@
 //! cli の `main` 先頭の JS ワーカーフック（TASK-30・ビヘイビア `JS-2`・MS-3・#514）の結合テスト。
 //!
 //! マーカー環境変数付きで起動した実バイナリが、通常の起動処理（サーバー bind・
-//! `DevTools listening` の出力・将来の clap 解析）へ進まず、フックで終了することを確かめる。
+//! `DevTools listening` の出力・引数解析）へ進まず、フックで終了することを確かめる。
 //! フックが配線されていないと通常起動に進みサーバーが居座るため、期限付きで監視して kill する。
 
 use std::io::Read;
@@ -16,7 +16,7 @@ fn js2_worker_marker_short_circuits_cli_startup() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-browser"))
         // 数値でない値: js-v8 ありでは V8 初期化より前に即 FAILURE になり、3 OS で決定的。
         .env("FANDHE_BROWSER_JS_WORKER", "not-a-version")
-        // 将来 clap が入っても、フックが引数解析より前にあることを守らせる。
+        // 引数解析があっても、フックが引数解析より前にあることを守らせる。
         .arg("--definitely-not-a-cli-flag")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
