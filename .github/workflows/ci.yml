@@ -1246,8 +1246,8 @@ jobs:
     needs: changes
     if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.servo == 'true' }}
     runs-on: macos-latest
-    # 暫定。cache なしのコールドビルド。workflow_dispatch の計測値 × 約 1.5 に確定する（#999。根拠の run ID は確定時に追記）
-    timeout-minutes: 180
+    # cache なしのコールドビルド。workflow_dispatch の実測（最大 12.5 分。run 38842938258・38847207875）× 約 1.5（#999）
+    timeout-minutes: 20
     permissions:
       contents: read
     env:
@@ -1325,8 +1325,8 @@ jobs:
     needs: changes
     if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.servo == 'true' }}
     runs-on: windows-latest
-    # 暫定。cache なしのコールドビルド。workflow_dispatch の計測値 × 約 1.5 に確定する（#999。根拠の run ID は確定時に追記）
-    timeout-minutes: 240
+    # cache なしのコールドビルド。workflow_dispatch の実測（34 分。ANGLE のビルドを含む。run 38847207875）× 約 1.5（#999）
+    timeout-minutes: 55
     permissions:
       contents: read
     defaults:
