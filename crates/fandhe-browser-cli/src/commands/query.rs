@@ -1,10 +1,17 @@
 //! 要素取得コマンド `query`（TASK-47.4・Issue #285・`CLI-1`・MS-5）。
 //!
-//! `query [--all | --attr NAME] [--] <URL> <SELECTOR>` はプロセス内で core の [`Fetcher`] により URL を
+//! `query [--all | --attr NAME] [--file PATH] [--] <URL> <SELECTOR>` はプロセス内で core の [`Fetcher`] により URL を
 //! 1 回取得し、HTML をパースして CSS セレクタで照会し、結果を stdout に出して終了する（one-shot）。
 //! PoC-2 の CLI にあった `text`（既定）・`texts`（`--all`）・`attr`（`--attr NAME`）の 3 機能に対応する。
 //! 実行中の `launch` インスタンスへは接続しない（理由は [`super::navigate`] の module doc を参照）ため、
 //! 直前の `navigate` で開いたページは参照できない。
+//!
+//! `--file PATH` を指定するとネットワーク取得の代わりにローカルの HTML ファイルを読む（`query --file PATH SELECTOR`。
+//! URL は取らない）。TASK-104（#397）・`PERF-7` の cold start 計測で「ローカル fixture を処理してプロセス終了で完了する」
+//! 一発実行の対象コマンドとして使う（#824。`core-proto` の `--file` と同じ語彙）。この経路は [`Fetcher`]・
+//! tokio ランタイム・サーバーを構築しない（rustls 等の初期化が cold start のノイズになるため）。
+//! URL 経路の SSRF 防御（`file:` scheme・ループバック・プライベートアドレスの拒否）は緩めず、`--file` は
+//! CLI を実行するローカルの操作者だけが指定でき、CDP・AI API などリモートから到達する経路には公開しない。
 //!
 //! 取得は [`super::navigate::fetch_page`] に一本化している（URL 長検査・SSRF 検証を経由しない経路を作らない）。
 //! `FetchOptions::default()`（ループバック・プライベートアドレスを拒否する安全側の既定）で行い、
@@ -23,11 +30,13 @@
 //!   その際に上限値も見直す（`--all` は件数 [`MAX_RESULT_COUNT`]・合計バイト数 [`MAX_RESULT_BYTES`] を超えるとエラー）
 //! - `--profile-dir`（TASK-47.6・#287）はプロファイルを開いて `profile.lock` を保持するだけ。Cookie 連携は TASK-116・`PROF-7`
 //! - ページ JS の実行（`[js] execute_page_scripts`）: 未対応。JS が生成する要素は取れない
-//! - 文字コード判定（`CORE-5` (7)）: 未対応。本文は lossy な UTF-8 として扱う
+//! - 文字コード判定（`CORE-5` (7)）: 未対応。本文は lossy な UTF-8 として扱う（`--file` も同じ）
 //! - `query --help`: ハンドラは出力先を受け取らないため未対応（トップレベルの `--help` には載る）
 
 use std::fmt;
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
 use fandhe_browser_core::{
     Document, Error, FetchOptions, Fetcher, ParseOptions, parse_document, query_selector_all_str,
@@ -54,6 +63,21 @@ const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 /// `--all` が保持する結果の最大件数。
 const MAX_RESULT_COUNT: usize = 10_000;
 
+/// `--file` で読むローカルファイルの最大バイト数。
+///
+/// fetch の既定 `max_body_bytes` と同じ 16MiB。パースの既定上限（32MiB）より小さいため、実際に効くのはこちら。
+const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// 照会対象の入力源（REPAIR-4: 将来の入力源追加に備え non_exhaustive）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) enum QuerySource {
+    /// ネットワークから取得する URL（SSRF 検証を経由する）。
+    Url(String),
+    /// ローカルの HTML ファイル（`--file`。#824・`PERF-7` の計測用）。
+    File(PathBuf),
+}
+
 /// 取得する内容の種別。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -70,8 +94,8 @@ pub(crate) enum QueryMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) struct QueryOptions {
-    /// 取得先 URL。
-    pub(crate) url: String,
+    /// 入力源（URL またはローカルファイル）。
+    pub(crate) source: QuerySource,
     /// CSS セレクタ。
     pub(crate) selector: String,
     /// 取得する内容の種別。
@@ -84,6 +108,7 @@ pub(crate) struct QueryOptions {
 pub(crate) fn parse_query_args(args: &CommandArgs) -> Result<QueryOptions, UsageError> {
     let mut all = false;
     let mut attr: Option<String> = None;
+    let mut file: Option<PathBuf> = None;
     let mut profile = ProfileSelection::OsDefault;
     let mut positionals: Vec<&String> = Vec::new();
     let mut only_positionals = false;
@@ -126,11 +151,28 @@ pub(crate) fn parse_query_args(args: &CommandArgs) -> Result<QueryOptions, Usage
                 }
                 attr = Some(name.clone());
             }
+            "--file" => {
+                if file.is_some() {
+                    return Err(UsageError::UnexpectedArgument(arg.clone()));
+                }
+                let path = iter.next().ok_or(UsageError::MissingArgument("PATH"))?;
+                if path.is_empty() {
+                    return Err(UsageError::InvalidOptionValue { option: "--file" });
+                }
+                file = Some(PathBuf::from(path));
+            }
             _ => return Err(UsageError::UnknownOption(arg.clone())),
         }
     }
     let mut pos = positionals.into_iter();
-    let url = pos.next().ok_or(UsageError::MissingArgument("URL"))?;
+    let source = match file {
+        Some(path) => QuerySource::File(path),
+        None => QuerySource::Url(
+            pos.next()
+                .ok_or(UsageError::MissingArgument("URL"))?
+                .clone(),
+        ),
+    };
     let selector = pos.next().ok_or(UsageError::MissingArgument("SELECTOR"))?;
     if let Some(extra) = pos.next() {
         return Err(UsageError::UnexpectedArgument(extra.clone()));
@@ -141,7 +183,7 @@ pub(crate) fn parse_query_args(args: &CommandArgs) -> Result<QueryOptions, Usage
         (false, None) => QueryMode::FirstText,
     };
     Ok(QueryOptions {
-        url: url.clone(),
+        source,
         selector: selector.clone(),
         mode,
         profile,
@@ -164,6 +206,15 @@ pub(crate) enum QueryError {
     ElementNotFound,
     /// 一致した要素に指定の属性が無い。
     AttributeNotFound,
+    /// `--file` の入力ファイルを読めなかった（不在・権限など）。パスは表示に含めない。
+    ReadFile(io::Error),
+    /// `--file` の入力が通常ファイルではない（ディレクトリ等）。
+    NotRegularFile,
+    /// `--file` の入力が上限を超えた。
+    FileTooLarge {
+        /// 上限バイト数。
+        limit: u64,
+    },
     /// `--all` の結果が件数または合計バイト数の上限を超えた。
     ResultTooLarge,
 }
@@ -179,6 +230,11 @@ impl fmt::Display for QueryError {
             Self::Selector(Error::Unsupported { .. }) => f.write_str("unsupported selector syntax"),
             Self::Selector(_) => f.write_str("query failed"),
             Self::Parse(_) => f.write_str("failed to parse HTML"),
+            Self::ReadFile(_) => f.write_str("could not read input file"),
+            Self::NotRegularFile => f.write_str("input path is not a regular file"),
+            Self::FileTooLarge { limit } => {
+                write!(f, "input file is too large (limit {limit} bytes)")
+            }
             Self::ElementNotFound => f.write_str("no element matches the selector"),
             Self::AttributeNotFound => f.write_str("attribute not found on the matched element"),
             Self::ResultTooLarge => f.write_str("query result exceeds the size limit"),
@@ -191,7 +247,10 @@ impl std::error::Error for QueryError {
         match self {
             Self::Navigate(e) => Some(e),
             Self::Selector(e) | Self::Parse(e) => Some(e),
+            Self::ReadFile(e) => Some(e),
             Self::NoDocument
+            | Self::NotRegularFile
+            | Self::FileTooLarge { .. }
             | Self::ElementNotFound
             | Self::AttributeNotFound
             | Self::ResultTooLarge => None,
@@ -300,12 +359,52 @@ pub(crate) fn query_document(
     }
 }
 
-/// 取得 → パース → 照会の一連の処理。
+/// ローカルの HTML ファイルを上限付きで文字列として読む（`--file`）。
+///
+/// [`Fetcher`] や `file:` URL を経由しない独立した経路。通常ファイルのみ受け付け、`limit` 超過は
+/// [`QueryError::FileTooLarge`]。`take(limit + 1)` で読むため、FIFO・デバイスファイル・巨大ファイルでも
+/// 止まらずメモリも食い尽くさない（metadata の長さは信用しない）。文字コード判定は未対応（lossy UTF-8）。
+pub(crate) fn read_html_file(path: &Path, limit: u64) -> Result<String, QueryError> {
+    // Windows ではディレクトリの File::open の失敗の仕方が異なるため、先に種別を確かめて 3 OS で揃える。
+    let meta = std::fs::metadata(path).map_err(QueryError::ReadFile)?;
+    if !meta.is_file() {
+        return Err(QueryError::NotRegularFile);
+    }
+    let file = File::open(path).map_err(QueryError::ReadFile)?;
+    let mut buf = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(QueryError::ReadFile)?;
+    if buf.len() as u64 > limit {
+        return Err(QueryError::FileTooLarge { limit });
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// ローカルファイル → パース → 照会（同期・ネットワーク非依存）。`run` の `--file` 経路の中核。
+pub(crate) fn query_file(
+    path: &Path,
+    mode: &QueryMode,
+    selector: &str,
+    limit: u64,
+) -> Result<QueryOutput, QueryError> {
+    let html = read_html_file(path, limit)?;
+    let parsed = parse_document(&html, &ParseOptions::default()).map_err(QueryError::Parse)?;
+    let values = query_document(&parsed.document, mode, selector)?;
+    Ok(QueryOutput { values })
+}
+
+/// 取得 → パース → 照会の一連の処理（URL 入力専用。`File` 入力は [`query_file`] を使う）。
 pub(crate) async fn query_with(
     fetcher: &Fetcher,
     options: &QueryOptions,
 ) -> Result<QueryOutput, QueryError> {
-    let response = match navigate::fetch_page(fetcher, &options.url).await? {
+    let url = match &options.source {
+        QuerySource::Url(url) => url,
+        // File は run が query_file へ振り分けるためここへは来ない。来ても取得せず安全側で失敗させる。
+        QuerySource::File(_) => return Err(QueryError::NoDocument),
+    };
+    let response = match navigate::fetch_page(fetcher, url).await? {
         FetchedPage::Blank => return Err(QueryError::NoDocument),
         FetchedPage::Fetched(r) => r,
     };
@@ -316,10 +415,20 @@ pub(crate) async fn query_with(
 }
 
 /// サブコマンド `query` のハンドラ。usage エラーではランタイムも Fetcher も作らない。
+///
+/// `--file` 指定時は Fetcher・tokio ランタイムを作らず同期で完結する（cold start 計測のノイズを避ける。#824）。
 fn run(args: CommandArgs) -> Result<CommandOutcome, CommandError> {
     let options = parse_query_args(&args)?;
     // 検証エラー（終了コード 2）は副作用の前に確定させる。
     profile::build_store(&options.profile)?;
+    if let QuerySource::File(path) = &options.source {
+        let _profile = profile::open_explicit(&options.profile)?;
+        let output = query_file(path, &options.mode, &options.selector, MAX_FILE_BYTES)?;
+        output
+            .write_lines(&mut io::stdout().lock())
+            .map_err(CommandError::Output)?;
+        return Ok(CommandOutcome::Completed);
+    }
     let fetcher = Fetcher::new(FetchOptions::default())
         .map_err(|e| QueryError::Navigate(NavigateError::from(e)))?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -363,6 +472,94 @@ mod tests {
     }
 
     #[test]
+    fn cli1_query_file_parses_with_selector_only() {
+        let o = parse_query_args(&args(&["--file", "page.html", "h1"])).expect("ok");
+        assert_eq!(o.source, QuerySource::File("page.html".into()));
+        assert_eq!(o.selector, "h1");
+        assert_eq!(o.mode, QueryMode::FirstText);
+        // オプションは位置引数の後ろでもよく、--all と組み合わせられる。
+        let o = parse_query_args(&args(&["li", "--file", "p.html", "--all"])).expect("ok");
+        assert_eq!(o.source, QuerySource::File("p.html".into()));
+        assert_eq!(o.mode, QueryMode::AllTexts);
+        let o = parse_query_args(&args(&["--attr", "href", "--file", "p.html", "a"])).expect("ok");
+        assert_eq!(o.mode, QueryMode::Attribute("href".into()));
+    }
+
+    #[test]
+    fn cli1_query_file_rejects_bad_usage() {
+        assert_eq!(
+            parse_query_args(&args(&["h1", "--file"])).expect_err("no value"),
+            UsageError::MissingArgument("PATH")
+        );
+        assert_eq!(
+            parse_query_args(&args(&["--file", "", "h1"])).expect_err("empty"),
+            UsageError::InvalidOptionValue { option: "--file" }
+        );
+        assert_eq!(
+            parse_query_args(&args(&["--file", "a", "--file", "b", "h1"])).expect_err("dup"),
+            UsageError::UnexpectedArgument("--file".into())
+        );
+        assert_eq!(
+            parse_query_args(&args(&["--file", "a.html", "u", "h1"])).expect_err("extra"),
+            UsageError::UnexpectedArgument("h1".into())
+        );
+        assert_eq!(
+            parse_query_args(&args(&["--file", "a.html"])).expect_err("selector"),
+            UsageError::MissingArgument("SELECTOR")
+        );
+        // `--` より後ろの `--file` は位置引数（URL 扱い）。
+        let o = parse_query_args(&args(&["--", "--file", "h1"])).expect("ok");
+        assert_eq!(o.source, QuerySource::Url("--file".into()));
+    }
+
+    #[test]
+    fn perf7_query_file_reads_and_queries_local_html() {
+        let t = crate::server::tests::support::TempDir::new();
+        std::fs::create_dir_all(&t.owned).expect("dir");
+        let f = t.owned.join("page.html");
+        std::fs::write(&f, PAGE).expect("write");
+        let out = query_file(&f, &QueryMode::FirstText, "h1", MAX_FILE_BYTES).expect("ok");
+        assert_eq!(out.values, vec!["Title".to_string()]);
+        let out = query_file(&f, &QueryMode::AllTexts, "li", MAX_FILE_BYTES).expect("ok");
+        assert_eq!(out.values, vec!["1".to_string(), "2".to_string()]);
+    }
+
+    #[test]
+    fn perf7_query_file_missing_and_directory_are_errors() {
+        let t = crate::server::tests::support::TempDir::new();
+        std::fs::create_dir_all(&t.owned).expect("dir");
+        let e = read_html_file(&t.owned.join("nope.html"), MAX_FILE_BYTES).expect_err("missing");
+        assert!(matches!(e, QueryError::ReadFile(_)));
+        assert_eq!(e.to_string(), "could not read input file");
+        let e = read_html_file(&t.owned, MAX_FILE_BYTES).expect_err("dir");
+        assert!(matches!(e, QueryError::NotRegularFile));
+        assert_eq!(e.to_string(), "input path is not a regular file");
+    }
+
+    #[test]
+    fn perf7_query_file_over_limit_is_error() {
+        let t = crate::server::tests::support::TempDir::new();
+        std::fs::create_dir_all(&t.owned).expect("dir");
+        let f = t.owned.join("big.html");
+        std::fs::write(&f, "x".repeat(11)).expect("write");
+        let e = read_html_file(&f, 10).expect_err("too large");
+        assert!(matches!(e, QueryError::FileTooLarge { limit: 10 }));
+        assert_eq!(e.to_string(), "input file is too large (limit 10 bytes)");
+        // 上限ちょうどは通る。
+        assert_eq!(read_html_file(&f, 11).expect("at limit").len(), 11);
+    }
+
+    #[test]
+    fn perf7_query_file_non_utf8_is_lossy() {
+        let t = crate::server::tests::support::TempDir::new();
+        std::fs::create_dir_all(&t.owned).expect("dir");
+        let f = t.owned.join("bin.html");
+        std::fs::write(&f, b"<p>a\xffb</p>").expect("write");
+        let out = query_file(&f, &QueryMode::FirstText, "p", MAX_FILE_BYTES).expect("ok");
+        assert_eq!(out.values, vec!["a\u{fffd}b".to_string()]);
+    }
+
+    #[test]
     fn cli1_query_is_registered() {
         let n = crate::commands::COMMANDS
             .iter()
@@ -374,7 +571,7 @@ mod tests {
     #[test]
     fn cli1_query_parses_default_all_and_attr() {
         let o = parse_query_args(&args(&["https://a.example/", "h1"])).expect("ok");
-        assert_eq!(o.url, "https://a.example/");
+        assert_eq!(o.source, QuerySource::Url("https://a.example/".into()));
         assert_eq!(o.selector, "h1");
         assert_eq!(o.mode, QueryMode::FirstText);
         let o = parse_query_args(&args(&["--all", "https://a.example/", "li"])).expect("ok");
@@ -528,7 +725,7 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Length: 27\r\nConnection: close\r\n\r\n<html><h1>Hello</h1></html>",
         );
         let o = QueryOptions {
-            url: format!("http://127.0.0.1:{port}/"),
+            source: QuerySource::Url(format!("http://127.0.0.1:{port}/")),
             selector: "h1".into(),
             profile: ProfileSelection::OsDefault,
             mode: QueryMode::FirstText,
@@ -546,7 +743,7 @@ mod tests {
             "HTTP/1.1 404 Not Found\r\nContent-Length: 12\r\nConnection: close\r\n\r\n<p>gone</p>\n",
         );
         let o = QueryOptions {
-            url: format!("http://127.0.0.1:{port}/x"),
+            source: QuerySource::Url(format!("http://127.0.0.1:{port}/x")),
             selector: "p".into(),
             mode: QueryMode::FirstText,
             profile: ProfileSelection::OsDefault,
@@ -559,7 +756,7 @@ mod tests {
     fn cli1_query_with_rejects_loopback_and_file_by_default() {
         let f = Fetcher::new(FetchOptions::default()).expect("fetcher");
         let mk = |url: &str| QueryOptions {
-            url: url.into(),
+            source: QuerySource::Url(url.into()),
             selector: "h1".into(),
             mode: QueryMode::FirstText,
             profile: ProfileSelection::OsDefault,
@@ -580,7 +777,7 @@ mod tests {
     fn cli1_query_with_about_blank_has_no_document() {
         let f = Fetcher::new(FetchOptions::default()).expect("fetcher");
         let o = QueryOptions {
-            url: "about:blank".into(),
+            source: QuerySource::Url("about:blank".into()),
             selector: "h1".into(),
             mode: QueryMode::FirstText,
             profile: ProfileSelection::OsDefault,

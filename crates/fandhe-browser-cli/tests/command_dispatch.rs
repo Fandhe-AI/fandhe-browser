@@ -565,3 +565,62 @@ fn cli3_launch_port_zero_announces_assigned_port() {
         std::panic::resume_unwind(e);
     }
 }
+
+/// `query --file` の結合テスト用に一時 fixture ディレクトリを作る（呼び出し側が削除する）。
+fn query_file_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("fandhe-cli-qfile-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    dir
+}
+
+/// #824・`PERF-7`: ローカル HTML を読み、結果を stdout に出して終了コード 0 で終わる。
+#[test]
+fn cli1_query_file_prints_result_and_exits_zero() {
+    let dir = query_file_dir("ok");
+    let page = dir.join("page.html");
+    std::fs::write(&page, "<html><body><h1>Title</h1></body></html>\n").expect("fixture");
+    let out = run(
+        "qfile-ok",
+        &["query", "--file", page.to_str().expect("utf8"), "h1"],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+    assert_eq!(out.stdout, "\"Title\"\n");
+    assert_eq!(out.stderr, "");
+}
+
+#[test]
+fn cli1_query_file_missing_exits_with_error() {
+    let dir = query_file_dir("missing");
+    let missing = dir.join("nope.html");
+    let out = run(
+        "qfile-missing",
+        &["query", "--file", missing.to_str().expect("utf8"), "h1"],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.code, Some(1), "{}", out.stderr);
+    assert_eq!(out.stderr.trim(), "error: could not read input file");
+}
+
+#[test]
+fn cli1_query_file_directory_exits_with_error() {
+    let dir = query_file_dir("dir");
+    let out = run(
+        "qfile-dir",
+        &["query", "--file", dir.to_str().expect("utf8"), "h1"],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.code, Some(1), "{}", out.stderr);
+    assert_eq!(out.stderr.trim(), "error: input path is not a regular file");
+}
+
+#[test]
+fn cli1_query_file_without_value_exits_with_usage_error() {
+    let out = run("qfile-novalue", &["query", "h1", "--file"]);
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: missing required argument 'PATH'; run 'fandhe-browser --help' for usage"
+    );
+}
