@@ -27,7 +27,7 @@
 	check-workspace-manifest fmt fmt-check lint test test-harness lint-rendering test-rendering \
 	check-render-isolation check-js-engine-isolation check-publish-private deny deny-servo-host license-inventory license-inventory-servo-host check-deny-license-reject ci \
 	check-compat-practical check-compat-regression bench-record check-ci-changes check-bench-record \
-	check-binary-size check-static-link measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size measure-cssom-profile-cost \
+	check-binary-size check-static-link measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size check-container-smoke measure-cssom-profile-cost \
 	docker-build docker-shell docker-ci trace-playwright check-playwright-trace check-puppeteer-connect check-playwright-connect test-playwright-connect
 
 help: ## ターゲット一覧を表示する（Make 非依存の一覧: scripts/help.sh）
@@ -166,6 +166,9 @@ measure-js-binary-size: ## JS エンジン構成別（既定 V8 / 軽量 boa / �
 
 measure-container-size: ## 既定・軽量コンテナと比較対象（Playwright 公式）イメージのサイズを計測する（TASK-65.1・CTR-1・CTR-5。要 docker・jq）
 	@scripts/harness.sh measure-container-size
+
+check-container-smoke: ## コンテナ（軽量 / 既定）でローカルフィクスチャ 12 種の代表タスクを確認する（TASK-66.1・CTR-2。要 docker・jq）
+	@scripts/harness.sh check-container-smoke
 
 measure-cssom-profile-cost: ## CSSOM プロファイル読み込みのバイナリ増分・アイドル RSS 増分を計測する（TASK-100.6・PLUG-8）
 	@scripts/harness.sh measure-cssom-profile-cost
