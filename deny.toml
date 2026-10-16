@@ -52,6 +52,7 @@ ignore = [
 ]
 
 [licenses]
+# 変更時は about.toml（cargo-about 設定。TASK-78.2）の accepted・targets も同時に更新する。
 version = 2
 include-dev = true
 # TASK-77・OSS-3（MS-1）対応: `cargo deny check licenses` による許可外ライセンス
