@@ -27,7 +27,7 @@
 	check-workspace-manifest fmt fmt-check lint test test-harness lint-rendering test-rendering \
 	check-render-isolation check-js-engine-isolation check-publish-private deny deny-servo-host license-inventory license-inventory-servo-host check-deny-license-reject ci \
 	check-compat-practical check-compat-regression bench-record check-ci-changes check-bench-record \
-	check-binary-size check-static-link measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size check-container-smoke measure-cssom-profile-cost \
+	check-binary-size check-static-link measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size check-container-smoke check-container-memory measure-container-memory measure-cssom-profile-cost \
 	docker-build docker-shell docker-ci trace-playwright check-playwright-trace check-puppeteer-connect check-playwright-connect test-playwright-connect
 
 help: ## ターゲット一覧を表示する（Make 非依存の一覧: scripts/help.sh）
@@ -122,7 +122,7 @@ check-deny-license-reject: ## cargo deny が許可外ライセンスを reject �
 # `rendering` feature（Servo）を含めた検証（ci.md「既定ビルドと --features rendering の両方で検証」）も
 # make ci に含める。lint-rendering / test-rendering は feature 未定義の段階では skip して 0 終了するため、
 # workspace 作成前・render crate 追加前の CI を壊さない。docker-ci は make ci を呼ぶため自動的に含む。
-ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-js-engine-isolation check-publish-private test test-rendering deny check-deny-license-reject check-compat-regression check-compat-practical check-puppeteer-connect check-playwright-connect check-bench-record check-mcp-envelope check-ci-changes ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-js-engine-isolation check-publish-private test test-rendering deny check-deny-license-reject check-compat-regression check-compat-practical check-puppeteer-connect check-playwright-connect check-bench-record check-mcp-envelope check-container-memory check-ci-changes ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 実測ハーネス・ベンチ・計測（各 README: harness/*/README.md・benches/*/README.md）
@@ -166,6 +166,12 @@ measure-js-binary-size: ## JS エンジン構成別（既定 V8 / 軽量 boa / �
 
 measure-container-size: ## 既定・軽量コンテナと比較対象（Playwright 公式）イメージのサイズを計測する（TASK-65.1・CTR-1・CTR-5。要 docker・jq）
 	@scripts/harness.sh measure-container-size
+
+check-container-memory: ## コンテナ同時起動の集約メモリ測定スクリプトの自己テスト（TASK-67・CTR-3・CTR-7。Linux のみ。要 jq。docker 不要）
+	@scripts/harness.sh check-container-memory
+
+measure-container-memory: ## コンテナを N 個同時起動したときの集約メモリを測定する（TASK-67。要 docker・jq・cgroup v2。専用マシンで実行。CONTAINER_MEMORY_ARGS で引数指定）
+	@scripts/harness.sh measure-container-memory
 
 check-container-smoke: ## コンテナ（軽量 / 既定）でローカルフィクスチャ 12 種の代表タスクを確認する（TASK-66.1・CTR-2。要 docker・jq）
 	@scripts/harness.sh check-container-smoke

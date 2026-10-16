@@ -14,6 +14,8 @@
 #   check-plugin-overhead    上記の e2e smoke（unix のみ。0 件実行は NG）
 #   measure-js-binary-size   JS エンジン構成別バイナリサイズ計測（JS-3・PERF-1。要 jq）
 #   measure-container-size   既定・軽量コンテナと比較対象（Playwright 公式）のイメージサイズ計測（CTR-1・CTR-5。要 docker・jq）
+#   check-container-memory   コンテナ同時起動の集約メモリ測定スクリプトの自己テスト（TASK-67・CTR-3・CTR-7。Linux のみ。要 jq）
+#   measure-container-memory コンテナを N 個同時起動したときの集約メモリ測定（TASK-67。Linux のみ。要 docker・jq・cgroup v2）
 #   check-container-smoke    コンテナ（軽量 / 既定）でローカルフィクスチャ 12 種の代表タスクを確認（CTR-2。要 docker・jq）
 #   measure-cssom-profile-cost  CSSOM プロファイル読み込みのコスト計測（PLUG-8。要 jq）
 #   trace-playwright | check-playwright-trace | check-puppeteer-connect | check-playwright-connect   CDP トレース収集・自己テスト（要 node）
@@ -23,6 +25,7 @@
 # 上書き可能な環境変数（`make <target> VAR=value` も可）: BINARY_SIZE_PACKAGE・BINARY_SIZE_LIMIT_BYTES・
 # JS_BINARY_SIZE_STRIP（非空で --strip）・CSSOM_PROFILE_COST_ARGS・MCP_ENVELOPE_ARGS・
 # CONTAINER_SIZE_REFERENCE_IMAGE・CONTAINER_SIZE_REFERENCE_DIGEST・CONTAINER_SIZE_DEFAULT_IMAGE・
+# CONTAINER_MEMORY_ARGS（空白区切りの追加引数）・CONTAINER_MEMORY_HELPER_IMAGE・CONTAINER_MEMORY_HELPER_DIGEST・
 # CONTAINER_SIZE_LITE_IMAGE・CONTAINER_SIZE_PLATFORM・CONTAINER_SIZE_SKIP_BUILD・CONTAINER_SIZE_NO_PULL（非空で有効）・
 # CONTAINER_SMOKE_ROLE（lite|default）・CONTAINER_SMOKE_IMAGE・CONTAINER_SMOKE_PLATFORM・CONTAINER_SMOKE_SKIP_BUILD（非空で有効）・CONTAINER_SMOKE_TASK_TIMEOUT・
 # MCP_ENVELOPE_TARGET_DIR・STATIC_LINK_TARGET_DIR・PLAYWRIGHT_VERSION・PLAYWRIGHT_INTEGRITY（既定値は scripts/versions.sh）。
@@ -44,6 +47,7 @@ name="$1"
 : "${CONTAINER_SIZE_PLATFORM:=}"
 : "${CONTAINER_SIZE_SKIP_BUILD:=}"
 : "${CONTAINER_SIZE_NO_PULL:=}"
+: "${CONTAINER_MEMORY_ARGS:=}"
 : "${CONTAINER_SMOKE_ROLE:=lite}"
 : "${CONTAINER_SMOKE_IMAGE:=}"
 : "${CONTAINER_SMOKE_PLATFORM:=}"
@@ -237,6 +241,28 @@ case "${name}" in
       --default-image "${CONTAINER_SIZE_DEFAULT_IMAGE}" \
       --lite-image "${CONTAINER_SIZE_LITE_IMAGE}" \
       ${cs_args[@]+"${cs_args[@]}"}
+    ;;
+  check-container-memory)
+    # 測定対象（ホストの cgroup v2・/proc）が Linux 固有のため Linux のみ。macOS・Windows では何もしない
+    # （3 OS 共通の検査を特定 OS だけ飛ばすものではない。CI は harness-ubuntu のステップで実行する）。
+    if [ "$(uname -s)" != Linux ]; then
+      echo "skip: ${name} supports Linux only"
+      exit 0
+    fi
+    require_cmd jq "required by ${name}"
+    bash harness/container-memory/self-test.sh
+    ;;
+  measure-container-memory)
+    # 実測は専用マシンで人間が実行する（#306・#308）。ホストメモリを使い切る危険があるため `make ci` と
+    # CI には含めない。追加引数は CONTAINER_MEMORY_ARGS（空白区切り。意図的に単語分割する）。
+    require_cmd docker "required by ${name}"
+    require_cmd jq "required by ${name}"
+    bash harness/container-memory/self-test.sh
+    # shellcheck disable=SC2086 # 引数文字列は意図的に単語分割する
+    bash harness/container-memory/measure.sh \
+      --helper-image "${CONTAINER_MEMORY_HELPER_IMAGE}" \
+      --helper-digest "${CONTAINER_MEMORY_HELPER_DIGEST}" \
+      ${CONTAINER_MEMORY_ARGS}
     ;;
   check-container-smoke)
     # docker build（release）と実コンテナ起動を伴うため `make ci` には含めない（TASK-66.1・TASK-66.2・CTR-2。既定コンテナは CONTAINER_SMOKE_ROLE=default）。

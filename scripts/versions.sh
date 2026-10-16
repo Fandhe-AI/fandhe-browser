@@ -39,3 +39,11 @@
 # 更新手順: `docker buildx imagetools inspect <image>` の Digest を転記する。
 : "${CONTAINER_SIZE_REFERENCE_IMAGE:=mcr.microsoft.com/playwright:v1.49.0-noble}"
 : "${CONTAINER_SIZE_REFERENCE_DIGEST:=sha256:0fc07c73230cb7c376a528d7ffc83c4bdcdcd3fc7efbe54a2eed72b1ec118377}"
+
+# measure-container-memory（TASK-67・CTR-3・CTR-7。harness/container-memory/README.md 参照）の補助イメージ。
+# 測定対象と network namespace を共有して CDP の起動待ち（busybox の sh・wget）と loaded のナビゲート（node 22）
+# を行う。Cargo の依存ではなく、実行時に pull するだけで配布物には含めない。digest は manifest list で、
+# 取得時は digest 指定で pull し、取得後に RepoDigests と照合する（不一致は fail-closed）。
+# 更新手順: `docker buildx imagetools inspect node:22-alpine` の Digest を転記する。
+: "${CONTAINER_MEMORY_HELPER_IMAGE:=node:22-alpine}"
+: "${CONTAINER_MEMORY_HELPER_DIGEST:=sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402}"

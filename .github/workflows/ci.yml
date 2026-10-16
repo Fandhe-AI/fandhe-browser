@@ -900,6 +900,10 @@ jobs:
   #                            （macOS は #364・Windows は #365 が別手段で担う。前例は unix のみの
   #                            [mcp-envelope-smoke]）。`*-linux-gnu` のネイティブ配布物は対象外（#363）。
   #                            ビルド先は target/ の外（RUNNER_TEMP）に置き、cache に入れない
+  #   [container-memory-selftest]  コンテナ同時起動の集約メモリ測定スクリプトの自己テスト（TASK-67・
+  #                            #929・CTR-3・CTR-7）。偽 docker シムと偽の cgroup で動かし、実 docker・実測は
+  #                            行わない。測定対象がホストの cgroup v2 で Linux 固有のため ubuntu のみ
+  #                            （[static-link] と同じ扱いで、3 OS 共通の検査を特定 OS だけ飛ばすものではない）
   # cache・CARGO_INCREMENTAL=0・CARGO_PROFILE_DEV_DEBUG は 3 OS 共通（上記 rust-test と同じ）。
   harness-ubuntu:
     needs: changes
@@ -1058,6 +1062,9 @@ jobs:
       - name: "[static-link] musl 配布バイナリ（既定・軽量）の動的リンクなし検査"
         if: ${{ !cancelled() }}
         run: STATIC_LINK_TARGET_DIR="${RUNNER_TEMP}/static-link-target" make check-static-link
+      - name: "[container-memory-selftest] コンテナ同時起動の集約メモリ測定スクリプトの自己テスト（偽 docker・Linux 固有）"
+        if: ${{ !cancelled() }}
+        run: bash harness/container-memory/self-test.sh
       - name: "cache 保存前に workspace 成果物を prune"
         if: ${{ success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         run: bash scripts/ci-prune-target.sh
