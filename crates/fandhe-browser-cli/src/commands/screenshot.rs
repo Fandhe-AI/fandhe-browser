@@ -169,6 +169,8 @@ pub(crate) enum ScreenshotError {
     Navigate(NavigateError),
     /// `about:blank` は描画対象の文書が無い。
     NoDocument,
+    /// URL に userinfo（`user:pass@`）が含まれる。render プロトコルが拒否する入力のため事前に弾く。
+    UserinfoNotAllowed,
     /// 出力先パスの不備。
     OutputPath(OutputPathError),
     /// 描画の失敗。
@@ -186,6 +188,7 @@ impl fmt::Display for ScreenshotError {
             Self::NoDocument => f.write_str(
                 "screenshot requires a fetched document (about:blank has no content)",
             ),
+            Self::UserinfoNotAllowed => f.write_str("URL must not contain userinfo"),
             Self::OutputPath(e) => write!(f, "{e}"),
             Self::Render(e) => f.write_str(match e {
                 RenderError::RenderingDisabled => {
@@ -210,7 +213,7 @@ impl std::error::Error for ScreenshotError {
             Self::OutputPath(e) => Some(e),
             Self::Render(e) => Some(e),
             Self::Write(e) => Some(e),
-            Self::NoDocument | Self::UnsupportedFormat => None,
+            Self::NoDocument | Self::UserinfoNotAllowed | Self::UnsupportedFormat => None,
         }
     }
 }
@@ -252,8 +255,23 @@ pub(crate) fn precheck_url(url: &str) -> Result<(), ScreenshotError> {
         return Err(ScreenshotError::NoDocument);
     }
     check_network_target_url(url, false)
-        .map(|_| ())
-        .map_err(|e| ScreenshotError::Navigate(NavigateError::Fetch(e)))
+        .map_err(|e| ScreenshotError::Navigate(NavigateError::Fetch(e)))?;
+    // render の `LoadParams` は authority 内の `@` を拒否する（userinfo 禁止）。同じ条件で事前に弾き、
+    // ホスト起動後の汎用 `rendering failed` にしない。資格情報の値は表示しない。
+    let lower = url.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .unwrap_or("");
+    if rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .contains('@')
+    {
+        return Err(ScreenshotError::UserinfoNotAllowed);
+    }
+    Ok(())
 }
 
 /// 中核。URL 検証 → load → capture。レンダラーを注入できる形にしてモックでテストする。
@@ -577,6 +595,16 @@ mod tests {
             precheck_url("file:///etc/passwd").unwrap_err(),
             ScreenshotError::Navigate(NavigateError::Fetch(Error::DisallowedScheme { .. }))
         ));
+        for url in [
+            "https://user:pass@example.com/",
+            "https://user@example.com/",
+        ] {
+            let mock = Mock::ok();
+            let err = capture_with(&mock, &opts(url)).unwrap_err();
+            assert!(matches!(err, ScreenshotError::UserinfoNotAllowed), "{err}");
+            assert_eq!(err.to_string(), "URL must not contain userinfo");
+            assert!(mock.loads.lock().unwrap().is_empty());
+        }
         assert!(matches!(
             precheck_url("http://127.0.0.1:9/").unwrap_err(),
             ScreenshotError::Navigate(NavigateError::Fetch(Error::DisallowedAddress { .. }))
