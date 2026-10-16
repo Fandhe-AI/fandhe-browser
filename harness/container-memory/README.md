@@ -20,7 +20,7 @@
 | コマンド | `docker`・`jq`・`awk`・`bash` |
 | 権限 | docker を実行できるユーザー（docker グループは root と同等の権限のため扱いに注意）。`/sys/fs/cgroup` と `/proc/<pid>/cgroup` の読み取りに root は不要。rootless Docker は memory controller の delegation が必要 |
 | 測定対象イメージ | ローカルに存在すること（pull しない）。`docker build -f docker/Dockerfile.release -t fandhe-browser:default .`（軽量は `--target lite`） |
-| 補助イメージ | `node:22-alpine`（`scripts/versions.sh`。digest 指定で pull し、取得後に RepoDigests と照合する。不一致は fail-closed）。Cargo の依存ではなく、実行時に pull するだけで配布物には含めない |
+| 補助イメージ | `node:22-alpine`（`scripts/versions.sh`。digest 指定で pull し、取得後に RepoDigests と照合する（`docker.io/library/node@...` 表記・プラットフォーム別 manifest digest も許容）。不一致は fail-closed）。Cargo の依存ではなく、実行時に pull するだけで配布物には含めない |
 | ネットワーク | loaded 条件は公開 URL とブリッジ経由の外向き通信が要る |
 
 **専用マシンで実行すること。** N を増やすとホストのメモリを使い切り、ホスト OOM で他の作業が落ちる危険がある。
@@ -93,7 +93,7 @@ docker の実行ファイルは環境変数 `DOCKER_BIN` で差し替えられ�
 | `steps[].breakdowns` | `oom_kill`・`start_failed`・`ready_timeout`・`exited`・`navigate_failed` と `total` |
 | `steps[].oom_detail` | `memory.events` の `oom_kill` 合計と `State.OOMKilled` の件数（両方を記録） |
 | `steps[].memory_peak_bytes` / `memory_current_bytes` | `sum`・`avg`（整数の切り捨て）・`max`・`count` |
-| `steps[].ready_time` | 起動待ちの所要の `max`・`avg`（単位は `unit`） |
+| `steps[].ready_time` | 起動待ちの所要の `max`・`avg`（単位は常に `ms`。値がなければ `null`） |
 | `steps[].host_mem_used_pct` | 後始末の前のホストの使用率（(MemTotal − MemAvailable) / MemTotal） |
 
 終了コード: 0 = 測定が完了した（破綻があっても結果として 0）、1 = 測定の失敗（稼働中コンテナの cgroup を読めない・

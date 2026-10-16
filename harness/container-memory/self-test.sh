@@ -86,7 +86,7 @@ case "$1" in
       case "$args" in
         *json*)
           if [[ "$ref" == *@* ]]; then
-            echo "{\"Id\":\"sha256:helper\",\"RepoDigests\":[\"${FAKE_HELPER_DIGEST_REF:-$ref}\"]}"
+            echo "{\"Id\":\"sha256:helper\",\"Os\":\"linux\",\"Architecture\":\"amd64\",\"RepoDigests\":[\"${FAKE_HELPER_DIGEST_REF:-$ref}\"]}"
           else
             echo '{"Id":"sha256:imageid0123","RepoDigests":[]}'
           fi
@@ -96,6 +96,11 @@ case "$1" in
     fi
     ;;
   pull) exit 0 ;;
+  buildx)
+    # registry の index（--raw）。linux/amd64 のプラットフォーム別 manifest digest を返す
+    pd="${FAKE_PLAT_DIGEST:-sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee}"
+    echo "{\"manifests\":[{\"digest\":\"$pd\",\"platform\":{\"os\":\"linux\",\"architecture\":\"amd64\"}}]}"
+    ;;
   ps)
     want=""
     for a in "$@"; do case "$a" in label=*) want="${a#label=}" ;; esac; done
@@ -149,6 +154,8 @@ case "$1" in
       for a in "$@"; do case "$a" in container:*) net="${a#container:}" ;; esac; done
       k=$(kof "$net")
       if [[ "$args" == *navigate.mjs* ]]; then
+        # ナビゲート開始でホストのメモリ使用率が上限を超える状況を模擬する
+        [ -z "${NAV_RAISE_MEM:-}" ] || cp "$NAV_RAISE_MEM" "$SHIM_DIR/meminfo"
         sleep "${NAV_DELAY:-0}"
         [ "$k" = "${NAV_FAIL_K:-0}" ] && exit 1
       else
@@ -175,7 +182,7 @@ new_scene() {
   echo "cpu memory io" >"$S/cg/cgroup.controllers"
   cp "$TMP/meminfo40" "$S/meminfo"
   export SHIM_DIR="$S" FAKE_CG="$S/cg" FAKE_PROC="$S/proc"
-  unset FAKE_CGV FAKE_NO_IMAGE FAKE_HELPER_DIGEST_REF RUN_FAIL_K OOM_K EXITED_K NO_PEAK READY_DELAY READY_FAIL_K NAV_DELAY NAV_FAIL_K
+  unset FAKE_CGV FAKE_NO_IMAGE FAKE_HELPER_DIGEST_REF FAKE_PLAT_DIGEST NAV_RAISE_MEM RUN_FAIL_K OOM_K EXITED_K NO_PEAK READY_DELAY READY_FAIL_K NAV_DELAY NAV_FAIL_K
 }
 
 # $@ = measure.sh の追加引数。終了コードを返し、標準出力を $S/out.json、標準エラーを $S/err に残す
@@ -238,6 +245,19 @@ WRONG_DIGEST="sha256:$(printf 'f%.0s' $(seq 64))"
 export FAKE_HELPER_DIGEST_REF="node@${WRONG_DIGEST}"
 expect_rc "helper digest mismatch is fail-closed" 1 --n-list 1 --conditions idle
 
+# docker pull 後は `docker.io/library/node@...` など別表記で RepoDigests に入ることがある（同じ digest なら許容）
+new_scene
+export FAKE_HELPER_DIGEST_REF="docker.io/library/node@${DIGEST}"
+expect_rc "helper digest in another repo form is accepted" 0 --n-list 1 --no-doubling --conditions idle
+# プラットフォーム別 manifest digest で保持される場合も許容する（index から引いた digest と一致するとき）
+new_scene
+PLAT_DIGEST="sha256:$(printf 'c%.0s' $(seq 64))"
+export FAKE_HELPER_DIGEST_REF="docker.io/library/node@${PLAT_DIGEST}" FAKE_PLAT_DIGEST="$PLAT_DIGEST"
+expect_rc "helper platform digest is accepted" 0 --n-list 1 --no-doubling --conditions idle
+new_scene
+export FAKE_HELPER_DIGEST_REF="docker.io/library/node@${WRONG_DIGEST}"
+expect_rc "unrelated digest is still rejected" 1 --n-list 1 --conditions idle
+
 # --- 正常系（idle） ---
 new_scene
 printf 'foreign-container label-of-someone-else\n' >"$S/containers.foreign"
@@ -269,6 +289,7 @@ expect_jq "idle: docker client" "27.0.2" '.environment.docker_client_version'
 expect_jq "idle: cgroup version" "2" '.environment.cgroup_version'
 expect_jq "idle: cgroup driver" "systemd" '.environment.cgroup_driver'
 expect_jq "idle: mem total" "1024000000" '.environment.mem_total_bytes'
+expect_jq "idle: ready_time unit is ms" "ms" '.conditions[0].steps[0].ready_time.unit'
 expect_jq "idle: only idle condition" "1" '.conditions | length'
 expect_eq "idle: docker run -d count" "5" "$(grep -c '^run -d' "$S/calls.log")"
 expect_eq "idle: ran with hardening flags" "5" "$(grep '^run -d' "$S/calls.log" | grep -c -- '--cap-drop ALL --security-opt no-new-privileges')"
@@ -334,6 +355,8 @@ expect_jq "host limit: stop_reason" "host_memory_limit" '.conditions[0].stop_rea
 expect_jq "host limit: step incomplete" "false" '.conditions[0].steps[0].complete'
 expect_jq "host limit: nothing started" "0" '.conditions[0].steps[0].started'
 expect_jq "host limit: stops after the first step" "1" '.conditions[0].steps | length'
+expect_jq "host limit: empty aggregates are null" "null" '.conditions[0].steps[0].memory_peak_bytes.max'
+expect_jq "host limit: empty ready_time max is null" "null" '.conditions[0].steps[0].ready_time.max'
 expect_eq "host limit: no container was started" "0" "$(grep -c '^run -d' "$S/calls.log" || true)"
 new_scene
 cp "$TMP/meminfo85" "$S/meminfo"
@@ -357,6 +380,13 @@ expect_eq "loaded: navigate called once per container" "2" "$(grep -c 'navigate.
 expect_eq "loaded: navigate gets the URL and loopback endpoint" "2" "$(grep 'navigate.mjs' "$S/calls.log" | grep -c 'node /h/navigate.mjs http://127.0.0.1:9333 https://example.com/page$')"
 expect_eq "loaded: navigate.mjs mounted read-only" "2" "$(grep 'navigate.mjs' "$S/calls.log" | grep -c 'target=/h/navigate.mjs,readonly')"
 expect_eq "loaded: navigate runs in the target's namespace" "2" "$(grep 'navigate.mjs' "$S/calls.log" | grep -c -- '--network container:')"
+new_scene
+export NAV_RAISE_MEM="$TMP/meminfo85"
+expect_rc "navigate host limit run" 0 --n-list 3 --no-doubling --conditions loaded --navigate-concurrency 1 --url https://example.com/
+expect_jq "navigate host limit: step incomplete" "false" '.conditions[0].steps[0].complete'
+expect_jq "navigate host limit: stop_reason" "host_memory_limit" '.conditions[0].stop_reason'
+expect_eq "navigate host limit: navigation aborted after the first batch" "1" "$(grep -c 'navigate.mjs' "$S/calls.log")"
+expect_eq "navigate host limit: containers removed" "0" "$(wc -l <"$S/containers" | tr -d ' ')"
 new_scene
 export NAV_FAIL_K=1
 expect_rc "navigate failure run" 0 --n-list 2 --no-doubling --conditions loaded --url https://example.com/

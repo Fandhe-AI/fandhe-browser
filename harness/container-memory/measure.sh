@@ -202,6 +202,26 @@ cleanup() {
   exit "$rc"
 }
 
+# $1=helper の inspect JSON。RepoDigests にピン（`repo@sha256:...`）、同 digest を別のリポジトリ表記
+# （`docker.io/library/node@...`）で持つもの、または pull で入るプラットフォーム別 manifest digest のいずれかが
+# あれば 0。プラットフォーム digest は registry の index から os/arch 一致の manifest を引いて得る。
+# 取得できなければ不一致扱い（fail-closed）。
+helper_digest_matches() {
+  local info="$1" raw pd os arch
+  if printf '%s' "$info" | jq -e --arg d "$HELPER_PIN" --arg h "$HELPER_DIGEST" \
+    '(.RepoDigests // []) | any(. == $d or endswith("@" + $h))' >/dev/null; then
+    return 0
+  fi
+  os=$(printf '%s' "$info" | jq -r '.Os // empty' | tr -d '\r')
+  arch=$(printf '%s' "$info" | jq -r '.Architecture // empty' | tr -d '\r')
+  { [ -n "$os" ] && [ -n "$arch" ]; } || return 1
+  raw=$("$DOCKER" buildx imagetools inspect --raw "$HELPER_PIN" 2>/dev/null) || return 1
+  pd=$(printf '%s' "$raw" | jq -r --arg os "$os" --arg arch "$arch" \
+    '[.manifests[]? | select(.platform.os == $os and .platform.architecture == $arch) | .digest][0] // empty' | tr -d '\r')
+  [[ "$pd" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  printf '%s' "$info" | jq -e --arg p "@${pd}" '(.RepoDigests // []) | any(endswith($p))' >/dev/null
+}
+
 # --- 1 ステップ（条件 $1・N=$2） ---
 
 # 結果は STEP_COMPLETE（1/0）・STEP_TOTAL（破綻の合計）・STEP_HOST_PCT に入れ、
@@ -283,6 +303,18 @@ run_step() {
       [ -n "$rend" ] || continue
       rms=$((rend - st))
       { [ "$rrc" = 0 ] && [ "$rms" -le $((READY_TIMEOUT * 1000)) ]; } || continue
+      # ナビゲートで各コンテナのメモリが増えるため、バッチごとにホストの使用率を確認する。
+      # 上限に達したら追加のナビゲートを中止し、不完全ステップ（complete=false）として記録する。
+      if [ "$inflight" -eq 0 ]; then
+        pct=$(mem_used_pct "$MEMINFO") || {
+          echo "error: cannot read host memory from the meminfo file" >&2
+          exit 1
+        }
+        if pct_ge "$pct" "$HOST_LIMIT_PCT"; then
+          STEP_COMPLETE=0
+          break
+        fi
+      fi
       (
         rc=0
         "$DOCKER" run --rm --label "${LABEL_KEY}=${RUN_ID}" --network "container:${cc}" \
@@ -354,16 +386,16 @@ run_step() {
   }
 
   jq -Rn -c --argjson n "$n" --argjson complete "$STEP_COMPLETE" --argjson started "$started" \
-    --argjson start_failed "$start_failed" --argjson host "$STEP_HOST_PCT" --arg unit "$TIMING_UNIT" \
+    --argjson start_failed "$start_failed" --argjson host "$STEP_HOST_PCT" --arg unit "ms" \
     --argjson oom_events "$oom_events_total" --argjson oom_flag "$oom_flag_count" '
     [inputs | split("\t")] as $r
     | def cnt($s): [$r[] | select(.[1] == $s)] | length;
       def agg($i): [$r[] | .[$i] | select(. != "null") | tonumber] as $v
         | {sum: ($v | add // 0),
            avg: (if ($v | length) > 0 then (($v | add) / ($v | length) | floor) else null end),
-           max: ($v | max), count: ($v | length)};
+           max: (if ($v | length) > 0 then ($v | max) else null end), count: ($v | length)};
       def rt: [$r[] | .[3] | select(. != "null") | tonumber] as $v
-        | {max: ($v | max),
+        | {max: (if ($v | length) > 0 then ($v | max) else null end),
            avg: (if ($v | length) > 0 then (($v | add) / ($v | length) | floor) else null end),
            unit: $unit};
       {oom_kill: cnt("oom_kill"), start_failed: $start_failed, ready_timeout: cnt("ready_timeout"),
@@ -487,7 +519,7 @@ main() {
   fi
   local helper_info
   helper_info=$("$DOCKER" image inspect --format '{{json .}}' "$HELPER_PIN") || { echo "error: helper image inspect failed" >&2; exit 1; }
-  if ! printf '%s' "$helper_info" | jq -e --arg d "$HELPER_PIN" '(.RepoDigests // []) | index($d) != null' >/dev/null; then
+  if ! helper_digest_matches "$helper_info"; then
     echo "error: helper image digest does not match the pinned digest (fail-closed)" >&2
     exit 1
   fi
