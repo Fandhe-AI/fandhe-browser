@@ -239,6 +239,32 @@ struct ContextEntry {
     download: Option<DownloadSettings>,
 }
 
+/// セッション単位で有効化できるドメイン（43.3j・#1038・`CDP-2`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionDomain {
+    Log,
+    Runtime,
+    Network,
+}
+
+/// ドメインごとの有効フラグ。イベント送出は未実装で、現時点では印を持つだけ（`REPAIR-3`）。
+#[derive(Debug, Clone, Copy, Default)]
+struct SessionDomains {
+    log: bool,
+    runtime: bool,
+    network: bool,
+}
+
+impl SessionDomains {
+    fn slot(&mut self, d: SessionDomain) -> &mut bool {
+        match d {
+            SessionDomain::Log => &mut self.log,
+            SessionDomain::Runtime => &mut self.runtime,
+            SessionDomain::Network => &mut self.network,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Tables {
     targets: HashMap<TargetId, TargetInfo>,
@@ -252,6 +278,9 @@ struct Tables {
     /// `Page.enable` 済みのセッション（43.3i・#1037・`CDP-2`）。#1039 の `Page.lifecycleEvent` 送出ゲートが読む。
     /// 寿命は `sessions` と同じで、削除と同じロック内で消す。件数は `MAX_SESSIONS` 以下（`CDP-7`）。
     page_enabled: HashSet<SessionId>,
+    /// `Log.enable`・`Runtime.enable`・`Network.enable` 済みのセッション（43.3j・#1038・`CDP-2`）。
+    /// 寿命は `sessions` と同じで削除と同じロック内で消す。件数は `MAX_SESSIONS` 以下（`CDP-7`）。
+    domains_enabled: HashMap<SessionId, SessionDomains>,
     next_target: u64,
     next_session: u64,
     next_context: u64,
@@ -289,6 +318,7 @@ impl TargetRegistry {
                 default_context,
                 paused: HashMap::new(),
                 page_enabled: HashSet::new(),
+                domains_enabled: HashMap::new(),
                 next_target,
                 next_session,
                 next_context,
@@ -433,6 +463,7 @@ impl TargetRegistry {
         for sid in &removed {
             t.sessions.remove(sid);
             t.page_enabled.remove(sid);
+            t.domains_enabled.remove(sid);
         }
         Ok(removed)
     }
@@ -460,6 +491,7 @@ impl TargetRegistry {
     pub fn detach(&self, id: &SessionId) -> Result<TargetId, CdpStateError> {
         let mut t = self.lock();
         t.page_enabled.remove(id);
+        t.domains_enabled.remove(id);
         t.sessions.remove(id).ok_or(CdpStateError::UnknownSession)
     }
 
@@ -480,6 +512,31 @@ impl TargetRegistry {
     #[cfg(test)]
     pub(crate) fn is_page_enabled(&self, sid: &SessionId) -> bool {
         self.lock().page_enabled.contains(sid)
+    }
+
+    /// セッションに `Log`・`Runtime`・`Network` のいずれかの有効印を付ける（冪等。43.3j・#1038・`CDP-2`）。
+    ///
+    /// 存在確認と設定を 1 回のロックで行う。置き場所の理由は [`Self::enable_page`] と同じ。
+    pub(crate) fn enable_domain(
+        &self,
+        sid: &SessionId,
+        d: SessionDomain,
+    ) -> Result<(), CdpStateError> {
+        let mut t = self.lock();
+        if !t.sessions.contains_key(sid) {
+            return Err(CdpStateError::UnknownSession);
+        }
+        *t.domains_enabled.entry(sid.clone()).or_default().slot(d) = true;
+        Ok(())
+    }
+
+    /// ドメインが有効か。本番コードでは読む箇所がない（イベント送出の実装時に読む）。
+    #[cfg(test)]
+    pub(crate) fn is_domain_enabled(&self, sid: &SessionId, d: SessionDomain) -> bool {
+        self.lock()
+            .domains_enabled
+            .get_mut(sid)
+            .is_some_and(|x| *x.slot(d))
     }
 
     /// セッションの attach 先ターゲットを返す。
@@ -637,6 +694,7 @@ impl TargetRegistry {
             for s in &sids {
                 t.sessions.remove(s);
                 t.page_enabled.remove(s);
+                t.domains_enabled.remove(s);
             }
             closed.push((tid, sids));
         }
@@ -1132,6 +1190,64 @@ mod tests {
         r.enable_page(&s3).unwrap();
         r.dispose_browser_context(&c).unwrap();
         assert!(!r.is_page_enabled(&s3));
+    }
+
+    #[test]
+    fn cdp2_enable_domain_is_idempotent_per_domain_and_rejects_unknown_session() {
+        use SessionDomain::{Log, Network, Runtime};
+        let r = TargetRegistry::new();
+        let t = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        let s = r.attach(&t).unwrap();
+        for d in [Log, Runtime, Network] {
+            assert!(!r.is_domain_enabled(&s, d));
+            r.enable_domain(&s, d).unwrap();
+            r.enable_domain(&s, d).unwrap();
+            assert!(r.is_domain_enabled(&s, d));
+        }
+        let s2 = r.attach(&t).unwrap();
+        r.enable_domain(&s2, Log).unwrap();
+        assert!(r.is_domain_enabled(&s2, Log));
+        assert!(!r.is_domain_enabled(&s2, Runtime));
+        assert!(!r.is_domain_enabled(&s2, Network));
+        assert!(!r.is_page_enabled(&s2));
+        let ghost = SessionId::parse("ghost-1").unwrap();
+        assert_eq!(
+            r.enable_domain(&ghost, Log),
+            Err(CdpStateError::UnknownSession)
+        );
+        assert!(!r.is_domain_enabled(&ghost, Log));
+    }
+
+    #[test]
+    fn cdp7_domain_flags_are_dropped_on_detach_close_and_dispose() {
+        use SessionDomain::{Log, Network, Runtime};
+        let all = |r: &TargetRegistry, s: &SessionId| {
+            for d in [Log, Runtime, Network] {
+                r.enable_domain(s, d).unwrap();
+            }
+        };
+        let none = |r: &TargetRegistry, s: &SessionId| {
+            for d in [Log, Runtime, Network] {
+                assert!(!r.is_domain_enabled(s, d));
+            }
+        };
+        let r = TargetRegistry::new();
+        let t1 = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        let s1 = r.attach(&t1).unwrap();
+        all(&r, &s1);
+        r.detach(&s1).unwrap();
+        none(&r, &s1);
+        let s1b = r.attach(&t1).unwrap();
+        all(&r, &s1b);
+        r.close_target(&t1).unwrap();
+        none(&r, &s1b);
+        let c = r.create_browser_context().unwrap();
+        let (_t3, s3) = r
+            .create_target_attached(Some(&c), TargetKind::Page, "about:blank", false)
+            .unwrap();
+        all(&r, &s3);
+        r.dispose_browser_context(&c).unwrap();
+        none(&r, &s3);
     }
 
     #[test]

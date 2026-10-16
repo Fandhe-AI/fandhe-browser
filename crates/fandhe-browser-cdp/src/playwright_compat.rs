@@ -1,4 +1,4 @@
-//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c、段階 2b は 43.3d、段階 2g は 43.3g、段階 2h は 43.3h、段階 3a は 43.3i）。
+//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c、段階 2b は 43.3d、段階 2g は 43.3g、段階 2h は 43.3h、段階 3a は 43.3i、段階 3b は 43.3j）。
 //!
 //! `protocol::builtin_handlers` から登録される。`Browser.getVersion`（43.3a）・
 //! `Target.getTargetInfo`（43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（43.3c）を
@@ -18,7 +18,9 @@
 //! 43.3e（#910）で `Target.createTarget`（応答の前に `Target.attachedToTarget` を送出）と
 //! `Runtime.runIfWaitingForDebugger` を足す。
 //! 43.3i（#1037）で `Page.enable`（セッション単位の有効フラグ。実効果は #1039 の `Page.lifecycleEvent` 送出ゲートのみ）と
-//! `Page.getFrameTree`（メインフレームのみ）を足す。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
+//! `Page.getFrameTree`（メインフレームのみ）を足す。
+//! 43.3j（#1038）で `Log.enable`・`Runtime.enable`・`Network.enable`（セッション単位の有効フラグのみ。
+//! イベントは送らない。`REPAIR-3`）を足す。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
 
 use serde_json::{Value, json};
 
@@ -30,7 +32,9 @@ use crate::page::{MAIN_FRAME_ID, MAIN_FRAME_MIME_TYPE};
 use crate::protocol::{
     BoxFuture, CdpError, CdpEvent, CommandContext, CommandHandler, HandlerOutput,
 };
-use crate::target::{BrowserContextId, CdpStateError, SessionId, TargetId, TargetInfo};
+use crate::target::{
+    BrowserContextId, CdpStateError, SessionDomain, SessionId, TargetId, TargetInfo,
+};
 
 /// `Browser.getVersion`（`CDP-2`・TASK-43.3a）。
 ///
@@ -458,6 +462,84 @@ impl CommandHandler for PageEnable {
                 .map_err(|_| CdpError::INVALID_PARAMS)?;
             Ok(HandlerOutput::result(json!({})))
         })
+    }
+}
+
+/// `Log.enable`・`Runtime.enable`・`Network.enable` の共通本体（`CDP-2`・TASK-43.3j・#1038）。
+///
+/// 検証順は [`PageEnable`] と同じ。`sessionId` なしは `UNSUPPORTED_PARAMS`、未知・閉じたセッションは
+/// `INVALID_PARAMS`、`params` にキーがあれば黙って無視せず `UNSUPPORTED_PARAMS`（フラグは立てない）。
+/// 成功時はセッションの有効フラグを立てて `{}` だけを返し、イベントは 0 件（`REPAIR-3`）。
+/// 止めたターゲット（`Runtime.runIfWaitingForDebugger` より前）でも受理する。Playwright の `newPage()` が
+/// 再開前に送るため。フラグは fetch・ヘッダ・UA に一切影響しない（`SEC-2`）。
+fn enable_session_domain(
+    ctx: CommandContext<'_>,
+    params: &Value,
+    d: SessionDomain,
+) -> Result<HandlerOutput, CdpError> {
+    let sid = ctx.session_id.ok_or(CdpError::UNSUPPORTED_PARAMS)?;
+    let obj = params.as_object().ok_or(CdpError::INVALID_PARAMS)?;
+    if !obj.is_empty() {
+        return Err(CdpError::UNSUPPORTED_PARAMS);
+    }
+    ctx.state
+        .registry()
+        .enable_domain(sid, d)
+        .map_err(|_| CdpError::INVALID_PARAMS)?;
+    Ok(HandlerOutput::result(json!({})))
+}
+
+/// `Log.enable`（`CDP-2`・TASK-43.3j・#1038）。
+///
+/// セッションに有効フラグを立てて `{}` を返す（冪等）。差異（`REPAIR-3`）: `Log.entryAdded` は送らない。
+/// 将来仕様は JS コンソール・fetch 失敗などのログ送出。この成功は実際の状態変更であり、
+/// 検出回避の一律成功ではない（`SEC-2`・`CDP-6`）。検証は [`enable_session_domain`]。
+pub(crate) struct LogEnable;
+
+impl CommandHandler for LogEnable {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move { enable_session_domain(ctx, params, SessionDomain::Log) })
+    }
+}
+
+/// `Runtime.enable`（`CDP-2`・TASK-43.3j・#1038）。
+///
+/// セッションに有効フラグを立てて `{}` を返す（冪等）。差異（`REPAIR-3`）: `Runtime.executionContextCreated`・
+/// `consoleAPICalled` は送らない。`Runtime.evaluate` 等が未実装で、使えない `context.id` を見せると
+/// 偽の応答になるため。将来仕様は実行コンテキストのモデルを作ったうえでの送出（TASK-44）。
+/// 実際の状態変更であり検出回避の一律成功ではない（`SEC-2`・`CDP-6`）。検証は [`enable_session_domain`]。
+pub(crate) struct RuntimeEnable;
+
+impl CommandHandler for RuntimeEnable {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move { enable_session_domain(ctx, params, SessionDomain::Runtime) })
+    }
+}
+
+/// `Network.enable`（`CDP-2`・TASK-43.3j・#1038）。
+///
+/// セッションに有効フラグを立てて `{}` を返す（冪等）。差異（`REPAIR-3`）: `Network.requestWillBeSent`・
+/// `responseReceived`・`loadingFinished`・`loadingFailed` は送らない（将来仕様は `Page.navigate` の fetch に
+/// 対する送出。後続 issue で追跡）。バッファ系 params（`maxTotalBufferSize`・`maxResourceBufferSize`・
+/// `maxPostDataSize`・`reportDirectSocketTraffic` 等）は未実装のため `UNSUPPORTED_PARAMS`。
+/// フラグは fetch の挙動・ヘッダ・UA を何も変えない（`SEC-2`）。検証は [`enable_session_domain`]。
+pub(crate) struct NetworkEnable;
+
+impl CommandHandler for NetworkEnable {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move { enable_session_domain(ctx, params, SessionDomain::Network) })
     }
 }
 
@@ -2258,16 +2340,159 @@ mod tests {
             );
         }
 
+        const DOMAINS: [(&str, SessionDomain); 3] = [
+            ("Log.enable", SessionDomain::Log),
+            ("Runtime.enable", SessionDomain::Runtime),
+            ("Network.enable", SessionDomain::Network),
+        ];
+
         #[tokio::test]
-        async fn cdp6_log_enable_with_session_remains_method_not_implemented() {
+        async fn cdp2_log_runtime_network_enable_with_session_return_empty_and_are_idempotent() {
             let dir = TempDir::new();
             let st = state(&dir);
             let c = open_conn(&st, 1);
             let sid = attached_session(&st, c).await;
-            assert_eq!(
-                call(&st, Some(c), &sreq(2, "Log.enable", &sid, "{}")).await,
-                vec![serr(-32601, "method not implemented", 2, &sid)]
-            );
+            let s = SessionId::parse(&sid).unwrap();
+            let mut id = 1;
+            for (m, d) in DOMAINS {
+                assert!(!st.registry().is_domain_enabled(&s, d));
+                for _ in 0..2 {
+                    id += 1;
+                    assert_eq!(
+                        call(&st, Some(c), &sreq(id, m, &sid, "{}")).await,
+                        vec![json!({"id":id,"sessionId":sid,"result":{}})]
+                    );
+                }
+                assert!(st.registry().is_domain_enabled(&s, d));
+            }
+        }
+
+        #[tokio::test]
+        async fn cdp2_log_runtime_network_enable_reject_missing_or_unknown_session() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            for (m, _) in DOMAINS {
+                assert_eq!(
+                    call(&st, Some(c), &format!(r#"{{"id":1,"method":"{m}"}}"#)).await,
+                    vec![err(-32602, "unsupported params", 1)]
+                );
+                assert_eq!(
+                    call(&st, Some(c), &sreq(2, m, "NoSuch-1", "{}")).await,
+                    vec![serr(-32602, "invalid params", 2, "NoSuch-1")]
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn cdp2_network_enable_rejects_unimplemented_buffer_params() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            for (id, p) in [
+                (2, r#"{"maxTotalBufferSize":1000}"#),
+                (3, r#"{"maxResourceBufferSize":1000}"#),
+                (4, r#"{"maxPostDataSize":1000}"#),
+                (5, r#"{"reportDirectSocketTraffic":true}"#),
+            ] {
+                assert_eq!(
+                    call(&st, Some(c), &sreq(id, "Network.enable", &sid, p)).await,
+                    vec![serr(-32602, "unsupported params", id, &sid)]
+                );
+            }
+            assert!(!st.registry().is_domain_enabled(&s, SessionDomain::Network));
+        }
+
+        #[tokio::test]
+        async fn cdp2_log_and_runtime_enable_reject_non_empty_params() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            for (id, (m, d)) in [(2, DOMAINS[0]), (3, DOMAINS[1])] {
+                assert_eq!(
+                    call(&st, Some(c), &sreq(id, m, &sid, r#"{"x":1}"#)).await,
+                    vec![serr(-32602, "unsupported params", id, &sid)]
+                );
+                assert!(!st.registry().is_domain_enabled(&s, d));
+            }
+        }
+
+        #[tokio::test]
+        async fn cdp2_runtime_enable_does_not_emit_execution_context_created() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let f = call(&st, Some(c), &sreq(2, "Runtime.enable", &sid, "{}")).await;
+            assert_eq!(f, vec![json!({"id":2,"sessionId":sid,"result":{}})]);
+            assert!(f.iter().all(|v| v.get("method").is_none()));
+        }
+
+        #[tokio::test]
+        async fn cdp2_enables_accepted_on_paused_target_before_resume() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(
+                &st,
+                Some(c),
+                &auto_attach(
+                    1,
+                    r#""autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true"#,
+                ),
+            )
+            .await;
+            let f = call(&st, Some(c), &create_req(2, BLANK)).await;
+            assert_eq!(f[0]["params"]["waitingForDebugger"], true, "{f:?}");
+            let sid = f[0]["params"]["sessionId"].as_str().unwrap().to_owned();
+            for (i, (m, _)) in DOMAINS.iter().enumerate() {
+                let id = 10 + i as i64;
+                assert_eq!(
+                    call(&st, Some(c), &sreq(id, m, &sid, "{}")).await,
+                    vec![json!({"id":id,"sessionId":sid,"result":{}})]
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn cdp2_navigate_after_enables_emits_only_page_events() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            for (i, (m, _)) in DOMAINS.iter().enumerate() {
+                call(&st, Some(c), &sreq(2 + i as i64, m, &sid, "{}")).await;
+            }
+            let nav = call(
+                &st,
+                Some(c),
+                &sreq(9, "Page.navigate", &sid, r#"{"url":"about:blank"}"#),
+            )
+            .await;
+            let methods: Vec<&str> = nav.iter().filter_map(|v| v["method"].as_str()).collect();
+            assert_eq!(methods, ["Page.frameNavigated", "Page.loadEventFired"]);
+        }
+
+        #[tokio::test]
+        async fn cdp6_session_scoped_ua_override_and_disable_remain_method_not_implemented() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            for (id, m) in [
+                (2, "Network.setUserAgentOverride"),
+                (3, "Log.disable"),
+                (4, "Emulation.setUserAgentOverride"),
+            ] {
+                assert_eq!(
+                    call(&st, Some(c), &sreq(id, m, &sid, "{}")).await,
+                    vec![serr(-32601, "method not implemented", id, &sid)]
+                );
+            }
         }
     }
 }
