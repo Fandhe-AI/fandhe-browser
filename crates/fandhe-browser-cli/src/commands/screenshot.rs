@@ -18,7 +18,7 @@
 //! 以下は未実装・暫定で、実装済みを装わない（REPAIR-3）。
 //!
 //! - 出力形式 `width=<W> height=<H> bytes=<N> url=<final_url>` は暫定。`CLI-3` の確定と合わせて見直す
-//! - `--profile`: #287（TASK-47.6）で [`ScreenshotCommandOptions`] に追加する
+//! - `--profile-dir`（TASK-47.6・#287）はプロファイルを開いて `profile.lock` を保持するだけ。Cookie 連携は TASK-116・`PROF-7`
 //! - `--full-page`: v1 の描画ホストが未対応（固定ビューポート 1280x800。`servo-host-design.md` §2.3・
 //!   `SEC-2`）のため、解析時に usage エラーで拒否する。出力は常にビューポートの画像。ホストが対応したら
 //!   `ScreenshotOptions::with_full_page` を配線する（`RENDER-1`・`REPAIR-3`）
@@ -39,6 +39,7 @@ use fandhe_browser_core::render::{
 use fandhe_browser_render::protocol::MAX_URL_BYTES;
 
 use super::navigate::NavigateError;
+use super::profile::{self, ProfileSelection};
 use super::{CommandArgs, CommandError, CommandOutcome, CommandSpec, UsageError};
 use crate::render_host;
 
@@ -57,6 +58,8 @@ pub(crate) struct ScreenshotCommandOptions {
     pub(crate) url: String,
     /// 出力先ファイルパス（PNG）。
     pub(crate) output: PathBuf,
+    /// プロファイルの選択（`--profile-dir`）。
+    pub(crate) profile: ProfileSelection,
 }
 
 /// `screenshot` の引数を解析する（副作用なし）。`--` より後ろはすべて位置引数として扱う。
@@ -65,9 +68,14 @@ pub(crate) fn parse_screenshot_args(
 ) -> Result<ScreenshotCommandOptions, UsageError> {
     let mut positionals: Vec<&String> = Vec::new();
     let mut only_positionals = false;
-    for arg in args.as_slice() {
+    let mut profile = ProfileSelection::OsDefault;
+    let mut iter = args.as_slice().iter();
+    while let Some(arg) = iter.next() {
         if only_positionals || !arg.starts_with('-') {
             positionals.push(arg);
+            continue;
+        }
+        if profile::take_profile_dir(arg, &mut iter, &mut profile)? {
             continue;
         }
         match arg.as_str() {
@@ -85,6 +93,7 @@ pub(crate) fn parse_screenshot_args(
     Ok(ScreenshotCommandOptions {
         url: url.clone(),
         output: PathBuf::from(output),
+        profile,
     })
 }
 
@@ -321,7 +330,11 @@ fn run(args: CommandArgs) -> Result<CommandOutcome, CommandError> {
     let options = parse_screenshot_args(&args)?;
     validate_output_path(&options.output)
         .map_err(|e| CommandError::Screenshot(ScreenshotError::OutputPath(e)))?;
+    // プロファイル指定の検証（終了コード 2）も副作用・ホスト起動の前に確定させる。
+    profile::build_store(&options.profile)?;
     precheck_url(&options.url)?;
+    // 指定時のみ開き、コマンド終了までロックを保持する（出力ファイルの書き込みより前）。
+    let _profile = profile::open_explicit(&options.profile)?;
     let renderer = render_host::renderer_from_process(None)?;
     let (shot, final_url) = capture_with(&*renderer, &options)?;
     let bytes = write_png(&options.output, &shot)?;
@@ -355,6 +368,7 @@ mod tests {
         ScreenshotCommandOptions {
             url: url.to_string(),
             output: PathBuf::from("out.png"),
+            profile: ProfileSelection::OsDefault,
         }
     }
 
@@ -413,10 +427,23 @@ mod tests {
 
     /// `CLI-1`: 引数解析の正常系。
     #[test]
+    fn cli1_screenshot_parse_accepts_profile_dir() {
+        let o = parse_screenshot_args(&args(&[
+            "--profile-dir",
+            "d",
+            "https://a.example/",
+            "o.png",
+        ]))
+        .expect("ok");
+        assert_eq!(o.profile, ProfileSelection::Explicit("d".into()));
+    }
+
+    #[test]
     fn cli1_screenshot_parse_accepts_valid_forms() {
         let base = ScreenshotCommandOptions {
             url: "https://a.example/".into(),
             output: PathBuf::from("o.png"),
+            profile: ProfileSelection::OsDefault,
         };
         assert_eq!(
             parse_screenshot_args(&args(&["https://a.example/", "o.png"])).unwrap(),

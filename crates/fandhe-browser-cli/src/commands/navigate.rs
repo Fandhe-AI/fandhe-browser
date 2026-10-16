@@ -19,7 +19,7 @@
 //! 以下は未実装・暫定で、実装済みを装わない（REPAIR-3）。
 //!
 //! - 出力形式 `status=<code> url=<final_url>` は暫定。`CLI-3` の出力形式の確定と合わせて見直す
-//! - `--profile`: #287（TASK-47.6）で [`NavigateOptions`] に追加する。Cookie 連携は TASK-116・`PROF-7`
+//! - `--profile-dir`（TASK-47.6・#287）はプロファイルを開いて `profile.lock` を保持するだけ。Cookie 連携は TASK-116・`PROF-7`
 //! - ページ JS の実行（`[js] execute_page_scripts`）: 未対応（HTML 本文も出力しない）
 //! - `navigate --help`: ハンドラは出力先を受け取らないため未対応（トップレベルの `--help` には載る）
 
@@ -28,6 +28,7 @@ use std::io::{self, Write};
 
 use fandhe_browser_core::{Error, FetchOptions, FetchResponse, Fetcher};
 
+use super::profile::{self, ProfileSelection};
 use super::{CommandArgs, CommandError, CommandOutcome, CommandSpec, UsageError};
 
 /// 登録表（[`super::COMMANDS`]）へ載せる仕様。
@@ -46,23 +47,32 @@ const MAX_URL_LEN: usize = 8192;
 pub(crate) struct NavigateOptions {
     /// 取得先 URL。
     pub(crate) url: String,
+    /// プロファイルの選択（`--profile-dir`）。
+    pub(crate) profile: ProfileSelection,
 }
 
-/// `navigate` の引数を解析する（副作用なし）。
+/// `navigate` の引数を解析する（副作用なし）。`--profile-dir <PATH>` は位置引数の前後どちらでもよい。
 pub(crate) fn parse_navigate_args(args: &CommandArgs) -> Result<NavigateOptions, UsageError> {
-    let rest = args.as_slice();
-    match rest.first() {
-        Some(a) if a.starts_with('-') => return Err(UsageError::UnknownOption(a.clone())),
-        None => return Err(UsageError::MissingArgument("URL")),
-        Some(_) => {}
+    let mut profile = ProfileSelection::OsDefault;
+    let mut url: Option<&String> = None;
+    let mut iter = args.as_slice().iter();
+    while let Some(arg) = iter.next() {
+        if profile::take_profile_dir(arg, &mut iter, &mut profile)? {
+            continue;
+        }
+        if arg.starts_with('-') {
+            return Err(UsageError::UnknownOption(arg.clone()));
+        }
+        if url.is_some() {
+            return Err(UsageError::UnexpectedArgument(arg.clone()));
+        }
+        url = Some(arg);
     }
-    match rest.get(1) {
-        Some(a) if a.starts_with('-') => Err(UsageError::UnknownOption(a.clone())),
-        Some(a) => Err(UsageError::UnexpectedArgument(a.clone())),
-        None => Ok(NavigateOptions {
-            url: rest.first().cloned().unwrap_or_default(),
-        }),
-    }
+    let url = url.ok_or(UsageError::MissingArgument("URL"))?;
+    Ok(NavigateOptions {
+        url: url.clone(),
+        profile,
+    })
 }
 
 /// ナビゲーション結果。将来の拡張に備え構造体にする（REPAIR-4）。
@@ -186,11 +196,15 @@ pub(crate) async fn navigate_with(
 /// サブコマンド `navigate` のハンドラ。usage エラーではランタイムも Fetcher も作らない。
 fn run(args: CommandArgs) -> Result<CommandOutcome, CommandError> {
     let options = parse_navigate_args(&args)?;
+    // 検証エラー（終了コード 2）は副作用の前に確定させる。
+    profile::build_store(&options.profile)?;
     let fetcher = Fetcher::new(FetchOptions::default()).map_err(NavigateError::from)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(NavigateError::Runtime)?;
+    // 指定時のみ開き、コマンド終了までロックを保持する。
+    let _profile = profile::open_explicit(&options.profile)?;
     let output = runtime.block_on(navigate_with(&fetcher, &options.url))?;
     output
         .write_line(&mut io::stdout().lock())
@@ -243,6 +257,22 @@ mod tests {
     fn cli1_navigate_rejects_extra_positional() {
         let e = parse_navigate_args(&args(&["https://a.example/", "extra"])).expect_err("extra");
         assert_eq!(e, UsageError::UnexpectedArgument("extra".into()));
+    }
+
+    #[test]
+    fn cli1_navigate_profile_dir_before_or_after_url() {
+        use crate::commands::profile::ProfileSelection;
+        let want = ProfileSelection::Explicit("d".into());
+        let a =
+            parse_navigate_args(&args(&["--profile-dir", "d", "https://a.example/"])).expect("ok");
+        let b =
+            parse_navigate_args(&args(&["https://a.example/", "--profile-dir", "d"])).expect("ok");
+        assert_eq!(a.profile, want);
+        assert_eq!(a, b);
+        assert_eq!(
+            parse_navigate_args(&args(&["--profile", "d", "u"])),
+            Err(UsageError::UnknownOption("--profile".into()))
+        );
     }
 
     #[test]

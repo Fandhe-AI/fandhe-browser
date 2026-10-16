@@ -21,7 +21,7 @@
 //!
 //! - 出力形式（JSON 文字列リテラルの 1 行 1 値）は暫定。`CLI-3` の出力形式の確定と合わせて見直し、
 //!   その際に上限値も見直す（`--all` は件数 [`MAX_RESULT_COUNT`]・合計バイト数 [`MAX_RESULT_BYTES`] を超えるとエラー）
-//! - `--profile`: #287（TASK-47.6）で [`QueryOptions`] に追加する
+//! - `--profile-dir`（TASK-47.6・#287）はプロファイルを開いて `profile.lock` を保持するだけ。Cookie 連携は TASK-116・`PROF-7`
 //! - ページ JS の実行（`[js] execute_page_scripts`）: 未対応。JS が生成する要素は取れない
 //! - 文字コード判定（`CORE-5` (7)）: 未対応。本文は lossy な UTF-8 として扱う
 //! - `query --help`: ハンドラは出力先を受け取らないため未対応（トップレベルの `--help` には載る）
@@ -35,6 +35,7 @@ use fandhe_browser_core::{
 };
 
 use super::navigate::{self, FetchedPage, NavigateError};
+use super::profile::{self, ProfileSelection};
 use super::{CommandArgs, CommandError, CommandOutcome, CommandSpec, UsageError};
 
 /// 登録表（[`super::COMMANDS`]）へ載せる仕様。
@@ -75,18 +76,24 @@ pub(crate) struct QueryOptions {
     pub(crate) selector: String,
     /// 取得する内容の種別。
     pub(crate) mode: QueryMode,
+    /// プロファイルの選択（`--profile-dir`）。
+    pub(crate) profile: ProfileSelection,
 }
 
 /// `query` の引数を解析する（副作用なし）。`--` より後ろはすべて位置引数として扱う。
 pub(crate) fn parse_query_args(args: &CommandArgs) -> Result<QueryOptions, UsageError> {
     let mut all = false;
     let mut attr: Option<String> = None;
+    let mut profile = ProfileSelection::OsDefault;
     let mut positionals: Vec<&String> = Vec::new();
     let mut only_positionals = false;
     let mut iter = args.as_slice().iter();
     while let Some(arg) = iter.next() {
         if only_positionals || !arg.starts_with('-') {
             positionals.push(arg);
+            continue;
+        }
+        if profile::take_profile_dir(arg, &mut iter, &mut profile)? {
             continue;
         }
         match arg.as_str() {
@@ -137,6 +144,7 @@ pub(crate) fn parse_query_args(args: &CommandArgs) -> Result<QueryOptions, Usage
         url: url.clone(),
         selector: selector.clone(),
         mode,
+        profile,
     })
 }
 
@@ -310,12 +318,16 @@ pub(crate) async fn query_with(
 /// サブコマンド `query` のハンドラ。usage エラーではランタイムも Fetcher も作らない。
 fn run(args: CommandArgs) -> Result<CommandOutcome, CommandError> {
     let options = parse_query_args(&args)?;
+    // 検証エラー（終了コード 2）は副作用の前に確定させる。
+    profile::build_store(&options.profile)?;
     let fetcher = Fetcher::new(FetchOptions::default())
         .map_err(|e| QueryError::Navigate(NavigateError::from(e)))?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| QueryError::Navigate(NavigateError::Runtime(e)))?;
+    // 指定時のみ開き、コマンド終了までロックを保持する。
+    let _profile = profile::open_explicit(&options.profile)?;
     let output = runtime.block_on(query_with(&fetcher, &options))?;
     output
         .write_lines(&mut io::stdout().lock())
@@ -340,6 +352,15 @@ mod tests {
 
     const PAGE: &str = "<html><body><h1>Title</h1><ul><li>1</li><li>2</li></ul>\
                         <a href=\"/next\">n</a><a>bare</a></body></html>";
+
+    #[test]
+    fn cli1_query_profile_dir_and_double_dash() {
+        let o = parse_query_args(&args(&["--profile-dir", "d", "--all", "u", "s"])).expect("ok");
+        assert_eq!(o.profile, ProfileSelection::Explicit("d".into()));
+        // `--` より後ろは位置引数（余分な引数として拒否される）。
+        let e = parse_query_args(&args(&["u", "s", "--", "--profile-dir"])).expect_err("extra");
+        assert_eq!(e, UsageError::UnexpectedArgument("--profile-dir".into()));
+    }
 
     #[test]
     fn cli1_query_is_registered() {
@@ -509,6 +530,7 @@ mod tests {
         let o = QueryOptions {
             url: format!("http://127.0.0.1:{port}/"),
             selector: "h1".into(),
+            profile: ProfileSelection::OsDefault,
             mode: QueryMode::FirstText,
         };
         let out = block_on(query_with(&loopback_fetcher(), &o)).expect("ok");
@@ -527,6 +549,7 @@ mod tests {
             url: format!("http://127.0.0.1:{port}/x"),
             selector: "p".into(),
             mode: QueryMode::FirstText,
+            profile: ProfileSelection::OsDefault,
         };
         let out = block_on(query_with(&loopback_fetcher(), &o)).expect("ok");
         assert_eq!(out.values, vec!["gone".to_string()]);
@@ -539,6 +562,7 @@ mod tests {
             url: url.into(),
             selector: "h1".into(),
             mode: QueryMode::FirstText,
+            profile: ProfileSelection::OsDefault,
         };
         let e = block_on(query_with(&f, &mk("http://127.0.0.1:9/"))).expect_err("ssrf");
         assert!(matches!(
@@ -559,6 +583,7 @@ mod tests {
             url: "about:blank".into(),
             selector: "h1".into(),
             mode: QueryMode::FirstText,
+            profile: ProfileSelection::OsDefault,
         };
         let e = block_on(query_with(&f, &o)).expect_err("blank");
         assert!(matches!(e, QueryError::NoDocument));

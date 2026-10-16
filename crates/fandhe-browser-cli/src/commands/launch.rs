@@ -10,13 +10,12 @@
 //!
 //! - `--port`・ポート 0・起動後の実アドレスの機械可読通知（`CLI-3`）: #823 で
 //!   [`LaunchOptions::addr`] に追加する。現状は [`server::DEFAULT_ADDR`] 固定
-//! - プロファイルの明示指定: #287（TASK-47.6）で [`ProfileSelection`] にバリアントを足す。
-//!   現状は OS 既定のストアのみ
 //! - `launch --help`: ハンドラは出力先を受け取らないため未対応（`--help` は未知のオプション扱い。
 //!   トップレベルの `--help` に `launch` が載る）
 
-use fandhe_browser_profile::OsDefaultStore;
+use fandhe_browser_profile::ProfileStore;
 
+use super::profile::{self, ProfileSelection};
 use super::{CommandArgs, CommandError, CommandOutcome, CommandSpec, UsageError};
 use crate::server::{self, StartupError};
 use crate::{page_scripts, render_host, startup_config};
@@ -24,19 +23,11 @@ use crate::{page_scripts, render_host, startup_config};
 /// 登録表（[`super::COMMANDS`]）へ載せる仕様。
 pub(crate) const SPEC: CommandSpec = CommandSpec {
     name: "launch",
-    summary: "Start the CDP/AI API server with the default profile",
+    summary: "Start the CDP/AI API server with the default or specified profile",
     run,
 };
 
-/// プロファイルの選択方法。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub(crate) enum ProfileSelection {
-    /// OS 既定のプロファイルルート。
-    OsDefault,
-}
-
-/// 起動オプション。後続の `--port`（#823）・プロファイル指定（#287）の拡張点。
+/// 起動オプション。後続の `--port`（#823）の拡張点。`--profile-dir`（#287）は [`profile`] が解釈する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) struct LaunchOptions {
@@ -55,31 +46,46 @@ impl Default for LaunchOptions {
     }
 }
 
-/// `launch` の引数を解析する（副作用なし）。現状は受け付けるオプションが無い。
+/// `launch` の引数を解析する（副作用なし）。受け付けるのは `--profile-dir <PATH>` だけ。
 pub(crate) fn parse_launch_args(args: &CommandArgs) -> Result<LaunchOptions, UsageError> {
-    match args.as_slice().first() {
-        None => Ok(LaunchOptions::default()),
-        Some(a) if a.starts_with('-') => Err(UsageError::UnknownOption(a.clone())),
-        Some(a) => Err(UsageError::UnexpectedArgument(a.clone())),
+    let mut options = LaunchOptions::default();
+    let mut iter = args.as_slice().iter();
+    while let Some(arg) = iter.next() {
+        if profile::take_profile_dir(arg, &mut iter, &mut options.profile)? {
+            continue;
+        }
+        return Err(if arg.starts_with('-') {
+            UsageError::UnknownOption(arg.clone())
+        } else {
+            UsageError::UnexpectedArgument(arg.clone())
+        });
     }
+    Ok(options)
 }
 
 /// サブコマンド `launch` のハンドラ。
 fn run(args: CommandArgs) -> Result<CommandOutcome, CommandError> {
     let options = parse_launch_args(&args)?;
-    start_server(&options)?;
+    // パス検証は設定読み込み・bind より前に確定させる（失敗時はサーバーを起動しない）。
+    let store = profile::build_store(&options.profile)?;
+    start_server(&options, &store)?;
     Ok(CommandOutcome::Completed)
 }
 
 /// 引数なし起動のハンドラ（`main` が注入する）。`launch` と同じ既定オプションで起動する。
 pub(crate) fn run_default() -> Result<CommandOutcome, CommandError> {
-    start_server(&LaunchOptions::default())?;
+    let options = LaunchOptions::default();
+    let store = profile::build_store(&options.profile)?;
+    start_server(&options, &store)?;
     Ok(CommandOutcome::Completed)
 }
 
 /// 設定読み込み → 描画ホスト解決 → current_thread ランタイム構築 → サーバー起動。
 /// 構築失敗は panic させず [`StartupError`] として返す（release は `panic = "abort"`）。
-pub(crate) fn start_server(options: &LaunchOptions) -> Result<(), StartupError> {
+pub(crate) fn start_server(
+    options: &LaunchOptions,
+    store: &dyn ProfileStore,
+) -> Result<(), StartupError> {
     // 設定エラーはプロファイル open・bind より前に確定させる（サーバーを起動しない）。
     // `[js] execute_page_scripts` からページスクリプト実行アクターのハンドルを作る（TASK-112・
     // `JS-1`・`JS-4`）。ハンドルの構築だけではスレッドも JS 子プロセスも作らない（遅延起動）。
@@ -93,12 +99,9 @@ pub(crate) fn start_server(options: &LaunchOptions) -> Result<(), StartupError> 
         .enable_all()
         .build()
         .map_err(StartupError::Runtime)?;
-    let store = match options.profile {
-        ProfileSelection::OsDefault => OsDefaultStore::new(),
-    };
     // AI API ルータ（`/ai/*`）は既定の追加ルータとして CDP と同一リスナーへ合成する（TASK-19.3）。
     runtime.block_on(server::run(
-        &store,
+        store,
         options.addr,
         server::default_router_factories(),
         page_scripts,
@@ -125,6 +128,24 @@ mod tests {
         let o = parse_launch_args(&args(&[])).expect("no args is valid");
         assert_eq!(o.addr.to_string(), "127.0.0.1:9333");
         assert_eq!(o.profile, ProfileSelection::OsDefault);
+    }
+
+    #[test]
+    fn cli1_launch_accepts_profile_dir() {
+        let o = parse_launch_args(&args(&["--profile-dir", "p"])).expect("ok");
+        assert_eq!(o.profile, ProfileSelection::Explicit("p".into()));
+        assert_eq!(
+            parse_launch_args(&args(&["--profile-dir"])),
+            Err(UsageError::MissingArgument("PATH"))
+        );
+    }
+
+    #[test]
+    fn cli1_launch_profile_is_still_unknown_option() {
+        assert_eq!(
+            parse_launch_args(&args(&["--profile", "chrome"])),
+            Err(UsageError::UnknownOption("--profile".into()))
+        );
     }
 
     #[test]

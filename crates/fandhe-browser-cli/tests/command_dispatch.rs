@@ -362,3 +362,77 @@ fn cli1_screenshot_full_page_is_rejected_as_unsupported() {
     assert!(out.stdout.is_empty());
     assert!(!std::path::Path::new(&target).exists());
 }
+
+// --- TASK-47.6（#287・`CLI-1`・`PROF-1`）: 全コマンド共通の `--profile-dir` ---
+
+#[test]
+fn cli1_profile_dir_filesystem_root_is_validation_error() {
+    let out = run(
+        "profile-root",
+        &["navigate", "--profile-dir", "/", "about:blank"],
+    );
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("invalid profile directory"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
+}
+
+#[test]
+fn cli1_profile_dir_without_value_is_usage_error() {
+    let out = run("profile-missing", &["query", "--profile-dir"]);
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    assert!(out.stderr.contains("'PATH'"), "{}", out.stderr);
+}
+
+#[test]
+fn cli1_profile_alias_remains_unknown_option() {
+    let out = run(
+        "profile-alias",
+        &["navigate", "--profile", "x", "about:blank"],
+    );
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    assert!(out.stderr.contains("unknown option"), "{}", out.stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn prof1_profile_dir_creates_profile_and_runs_navigate() {
+    let parent = std::env::temp_dir().join(format!("fandhe-cli-prof-ok-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&parent);
+    std::fs::create_dir(&parent).expect("parent");
+    let dir = parent.join("p");
+    let dir_arg = dir.to_str().expect("utf8 path");
+    let out = run(
+        "profile-ok",
+        &["navigate", "--profile-dir", dir_arg, "about:blank"],
+    );
+    let lock_exists = dir.join("profile.lock").exists();
+    let _ = std::fs::remove_dir_all(&parent);
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+    assert_eq!(out.stdout.trim(), "url=about:blank");
+    assert!(lock_exists);
+}
+
+#[cfg(unix)]
+#[test]
+fn prof1_profile_dir_symlink_then_dotdot_is_rejected() {
+    let parent = std::env::temp_dir().join(format!("fandhe-cli-prof-ln-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&parent);
+    std::fs::create_dir(&parent).expect("parent");
+    let other = parent.join("other");
+    std::fs::create_dir(&other).expect("other");
+    let link = parent.join("link");
+    std::os::unix::fs::symlink(&other, &link).expect("symlink");
+    let arg = format!("{}/../p", link.display());
+    let out = run(
+        "profile-ln",
+        &["navigate", "--profile-dir", &arg, "about:blank"],
+    );
+    let created = parent.join("p").exists();
+    let _ = std::fs::remove_dir_all(&parent);
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    assert!(!created);
+}

@@ -5,8 +5,9 @@
 //! 引数パーサは #281 の決定どおり新規依存なしの手書き（`args_os` 起点。非 UTF-8 でも panic しない）。
 //!
 //! 拡張点: 後続の TASK-47.2〜47.5（#283〜#287）は `commands/<name>.rs` を追加し、
-//! [`COMMANDS`] へ [`CommandSpec`] を 1 行足す。プロファイル指定のような共通オプションを
-//! サブコマンド名の前に置くかコマンド側で解釈するかは #287 で決める（本モジュールは未実装）。
+//! [`COMMANDS`] へ [`CommandSpec`] を 1 行足す。全コマンド共通のプロファイル指定
+//! `--profile-dir <PATH>`（TASK-47.6・#287）はサブコマンド名の後ろに置き、各コマンドが
+//! [`profile::take_profile_dir`] で解釈する（サブコマンド名より前の `-` 始まりは従来どおり未知のオプション）。
 //!
 //! 解析（[`parse`]）と実行（[`dispatch`]）を分けるのは、プロセスを起動せずに単体テストするため。
 //! `cfg(target_os)` 分岐は置かず 3 OS で同一挙動とする（`CLI-1`）。
@@ -20,6 +21,7 @@ use crate::server::StartupError;
 
 pub(crate) mod launch;
 pub(crate) mod navigate;
+pub(crate) mod profile;
 pub(crate) mod query;
 pub(crate) mod screenshot;
 #[cfg(test)]
@@ -75,7 +77,7 @@ pub(crate) struct CommandSpec {
     pub(crate) run: Handler,
 }
 
-/// 本番の登録表。`launch`（#283）・`navigate`（#284）・`query`（#285）・`screenshot`（#286）を登録済み。残りは #287 が追加する。
+/// 本番の登録表。`launch`（#283）・`navigate`（#284）・`query`（#285）・`screenshot`（#286）を登録済み。
 pub(crate) const COMMANDS: &[CommandSpec] =
     &[launch::SPEC, navigate::SPEC, query::SPEC, screenshot::SPEC];
 
@@ -177,6 +179,8 @@ pub(crate) enum CommandError {
     Navigate(navigate::NavigateError),
     /// `query` の失敗。
     Query(query::QueryError),
+    /// プロファイル指定（`--profile-dir`）の失敗。
+    Profile(profile::ProfileOptionError),
     /// `screenshot` の失敗。
     Screenshot(screenshot::ScreenshotError),
     /// 標準出力への書き込み失敗。
@@ -188,6 +192,7 @@ impl CommandError {
     pub(crate) fn exit_code(&self) -> ExitCode {
         match self {
             Self::Usage(_) => ExitCode::from(USAGE_EXIT_CODE),
+            Self::Profile(e) if e.is_validation() => ExitCode::from(USAGE_EXIT_CODE),
             _ => ExitCode::FAILURE,
         }
     }
@@ -200,6 +205,7 @@ impl fmt::Display for CommandError {
             Self::Startup(e) => write!(f, "{e}"),
             Self::Navigate(e) => write!(f, "{e}"),
             Self::Query(e) => write!(f, "{e}"),
+            Self::Profile(e) => write!(f, "{e}"),
             Self::Screenshot(e) => write!(f, "{e}"),
             Self::Output(_) => f.write_str("failed to write output"),
         }
@@ -213,6 +219,7 @@ impl std::error::Error for CommandError {
             Self::Startup(e) => Some(e),
             Self::Navigate(e) => Some(e),
             Self::Query(e) => Some(e),
+            Self::Profile(e) => Some(e),
             Self::Screenshot(e) => Some(e),
             Self::Output(e) => Some(e),
         }
@@ -240,6 +247,12 @@ impl From<navigate::NavigateError> for CommandError {
 impl From<query::QueryError> for CommandError {
     fn from(e: query::QueryError) -> Self {
         Self::Query(e)
+    }
+}
+
+impl From<profile::ProfileOptionError> for CommandError {
+    fn from(e: profile::ProfileOptionError) -> Self {
+        Self::Profile(e)
     }
 }
 
@@ -292,7 +305,14 @@ fn write_help(out: &mut impl Write, registry: &Registry<'_>) -> io::Result<()> {
     for c in registry.commands {
         writeln!(out, "  {:<12} {}", c.name, c.summary)?;
     }
-    writeln!(out, "  {:<12} Show this help", "help")
+    writeln!(out, "  {:<12} Show this help", "help")?;
+    writeln!(out)?;
+    writeln!(out, "Options (all commands, after the command name):")?;
+    writeln!(
+        out,
+        "  {:<18} Use PATH as the profile storage directory instead of the OS default",
+        "--profile-dir PATH"
+    )
 }
 
 /// 引数列を解析して該当ハンドラを実行する。`main` から呼ばれる唯一の入口。
@@ -446,7 +466,9 @@ mod tests {
         dispatch(os(&["--help"]), &registry, &mut out).expect("help succeeds");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
-            text.contains("launch       Start the CDP/AI API server with the default profile"),
+            text.contains(
+                "launch       Start the CDP/AI API server with the default or specified profile"
+            ),
             "{text}"
         );
     }
@@ -497,6 +519,33 @@ mod tests {
             text.contains("Render a URL once and save a PNG screenshot to a file"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn cli1_profile_error_exit_codes() {
+        use fandhe_browser_profile::ProfileError;
+        use profile::ProfileOptionError;
+        let invalid = CommandError::from(ProfileOptionError::InvalidPath { reason: "x" });
+        assert_eq!(
+            format!("{:?}", invalid.exit_code()),
+            format!("{:?}", ExitCode::from(2))
+        );
+        assert_eq!(invalid.to_string(), "invalid profile directory: x");
+        let open = CommandError::from(ProfileOptionError::Open(ProfileError::Unsupported {
+            reason: "x",
+        }));
+        assert_eq!(
+            format!("{:?}", open.exit_code()),
+            format!("{:?}", ExitCode::FAILURE)
+        );
+    }
+
+    #[test]
+    fn cli1_help_lists_profile_dir_option() {
+        let mut out = Vec::new();
+        dispatch(os(&["--help"]), &registry(), &mut out).expect("help");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("--profile-dir PATH"), "{text}");
     }
 
     #[test]
