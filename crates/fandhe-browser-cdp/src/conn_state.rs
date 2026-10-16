@@ -33,7 +33,7 @@ use std::sync::{Mutex, PoisonError};
 
 use crate::protocol::ConnId;
 use crate::target::{
-    BrowserContextId, CdpStateError, SessionId, TargetId, TargetInfo, TargetRegistry,
+    BrowserContextId, CdpStateError, SessionId, TargetId, TargetInfo, TargetKind, TargetRegistry,
 };
 
 /// `downloadPath` の最大バイト長（巨大入力による無制限消費の防止）。
@@ -108,7 +108,7 @@ struct Entry {
     auto_attach_enabled: bool,
     /// `Target.setAutoAttach` の `waitForDebuggerOnStart`（`autoAttach:true` の間だけ有効）。
     /// 以後に attach される新しいターゲットを一時停止する指示で、既存ターゲットには適用しない。
-    /// 新しいターゲットの停止そのものは `Target.createTarget`（#910）で実装する（`REPAIR-3`）。
+    /// 新しいターゲットの停止は `Target.createTarget`（[`ConnectionScoped::create_target`]。#910）が行う。
     wait_for_debugger_on_start: bool,
     /// registry 側で消えたため所有記録から落としたが、まだ `Target.detachedFromTarget` を送出していないもの。
     pending_detached: Vec<(TargetId, SessionId)>,
@@ -125,6 +125,17 @@ pub(crate) struct Released {
     pub sessions: Vec<SessionId>,
     /// この接続が所有していた browser context。
     pub contexts: Vec<BrowserContextId>,
+}
+
+/// [`ConnectionScoped::create_target`] の結果。
+#[derive(Debug)]
+pub(crate) struct CreatedTarget {
+    /// 作成したターゲット。
+    pub info: TargetInfo,
+    /// 呼び出し接続の自動 attach が払い出したセッション（自動 attach 無効なら `None`）。
+    pub session: Option<SessionId>,
+    /// `waitForDebuggerOnStart` で止めたか（`Target.attachedToTarget` の `waitingForDebugger`）。
+    pub waiting_for_debugger: bool,
 }
 
 /// 接続操作の失敗。
@@ -194,6 +205,61 @@ impl ConnectionScoped {
             .map_err(ConnStateError::Registry)?;
         entry.owned_contexts.push(id.clone());
         Ok(id)
+    }
+
+    /// `Target.createTarget` の本体（#910・`CDP-2`・`CDP-7`）。生存確認・作成先 context の許可判定・
+    /// 作成・自動 attach・一時停止の登録を 1 回のロック（本表 → registry）で行う。
+    ///
+    /// 作成先は既定 context か自接続が所有する context に限る。未知の context と他接続の context は
+    /// どちらも `Registry(UnknownBrowserContext)` にして存在を漏らさない。自動 attach が有効なら
+    /// 同時に attach して記録し（後段の reconcile で二重 attach しない）、`waitForDebuggerOnStart` が
+    /// 有効ならそのセッションが再開するまで止める。セッション枠の枯渇ではターゲットも作らない（原子性）。
+    pub(crate) fn create_target(
+        &self,
+        conn: ConnId,
+        registry: &TargetRegistry,
+        context: Option<&BrowserContextId>,
+        url: &str,
+    ) -> Result<CreatedTarget, ConnStateError> {
+        let mut map = self.lock();
+        let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
+        if let Some(c) = context
+            && *c != registry.default_browser_context()
+            && !entry.owned_contexts.contains(c)
+        {
+            return Err(ConnStateError::Registry(
+                CdpStateError::UnknownBrowserContext,
+            ));
+        }
+        if entry.auto_attach_enabled {
+            let pause = entry.wait_for_debugger_on_start;
+            let (tid, sid) = registry
+                .create_target_attached(context, TargetKind::Page, url, pause)
+                .map_err(ConnStateError::Registry)?;
+            let info = registry
+                .target(&tid)
+                .ok_or(ConnStateError::Registry(CdpStateError::UnknownTarget))?;
+            entry.auto_attached.push((tid, sid.clone()));
+            Ok(CreatedTarget {
+                info,
+                session: Some(sid),
+                waiting_for_debugger: pause,
+            })
+        } else {
+            let tid = match context {
+                Some(c) => registry.create_target_in(c, TargetKind::Page, url),
+                None => registry.create_target(TargetKind::Page, url),
+            }
+            .map_err(ConnStateError::Registry)?;
+            let info = registry
+                .target(&tid)
+                .ok_or(ConnStateError::Registry(CdpStateError::UnknownTarget))?;
+            Ok(CreatedTarget {
+                info,
+                session: None,
+                waiting_for_debugger: false,
+            })
+        }
     }
 
     /// 自動 attach を有効にし、未 attach の既存ターゲットすべてへ attach して
@@ -335,8 +401,7 @@ impl ConnectionScoped {
         Ok(())
     }
 
-    /// 保持中の `waitForDebuggerOnStart`。`Target.createTarget`（#910）が新しいターゲットを
-    /// 一時停止するか決める際に参照する。実行系が未実装のためテストのみが読む（`REPAIR-3`）。
+    /// 保持中の `waitForDebuggerOnStart`（テスト用。本番は [`Self::create_target`] が内部で参照する）。
     #[cfg(test)]
     pub(crate) fn wait_for_debugger_on_start(&self, conn: ConnId) -> bool {
         self.lock()
@@ -348,6 +413,35 @@ impl ConnectionScoped {
     #[cfg(test)]
     pub(crate) fn download(&self, conn: ConnId) -> Option<DownloadSettings> {
         self.lock().get(&conn).and_then(|e| e.download.clone())
+    }
+
+    /// 接続が閉じてよいターゲットを閉じ、自接続の自動 attach 記録から該当セッションを落として
+    /// その SessionId を昇順で返す（`Target.closeTarget`・TASK-43.3h・`CDP-2`・`CDP-7`）。
+    /// 落とした分は `pending_detached` に積まない（`Target.detachedFromTarget` の送出は呼び出し側の
+    /// ハンドラに一本化し、続く `reconcile_auto_attach` での二重送出を防ぐ）。他接続のセッションは
+    /// その接続の次の reconcile で通知される。ロック順序は本表 → registry。
+    pub(crate) fn close_target(
+        &self,
+        conn: ConnId,
+        registry: &TargetRegistry,
+        tid: &TargetId,
+    ) -> Result<Vec<SessionId>, ConnStateError> {
+        let mut map = self.lock();
+        let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
+        registry
+            .close_target_in_contexts(tid, &entry.owned_contexts)
+            .map_err(ConnStateError::Registry)?;
+        let mut own: Vec<SessionId> = Vec::new();
+        entry.auto_attached.retain(|(t, s)| {
+            if t == tid {
+                own.push(s.clone());
+                false
+            } else {
+                true
+            }
+        });
+        own.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        Ok(own)
     }
 
     /// この接続が所有する browser context（テスト用）。
@@ -555,6 +649,46 @@ mod tests {
         let sid = cs.enable_auto_attach(c, &r, false).unwrap().remove(0).1;
         r.close_target(&t).unwrap();
         assert_eq!(cs.disable_auto_attach(c, &r).unwrap(), vec![(t, sid)]);
+    }
+
+    #[test]
+    fn cdp7_close_target_drops_own_sessions_without_pending_and_notifies_others_once() {
+        let r = TargetRegistry::new();
+        let c = ConnectionScoped::new();
+        let (a, b) = (ConnId::new(1), ConnId::new(2));
+        c.open(a);
+        c.open(b);
+        let t = page(&r);
+        c.enable_auto_attach(a, &r, false).unwrap();
+        c.enable_auto_attach(b, &r, false).unwrap();
+        let sa = c.close_target(a, &r, &t).unwrap();
+        assert_eq!(sa.len(), 1);
+        assert!(c.reconcile_auto_attach(a, &r, true).detached.is_empty());
+        assert_eq!(c.reconcile_auto_attach(b, &r, true).detached.len(), 1);
+        assert!(c.reconcile_auto_attach(b, &r, true).detached.is_empty());
+    }
+
+    #[test]
+    fn cdp7_close_target_rejects_foreign_context_and_unregistered_connection() {
+        let r = TargetRegistry::new();
+        let c = ConnectionScoped::new();
+        let (a, b) = (ConnId::new(1), ConnId::new(2));
+        c.open(a);
+        c.open(b);
+        let ctx = c.create_owned_browser_context(a, &r).unwrap();
+        let t = r
+            .create_target_in(&ctx, TargetKind::Page, "about:blank")
+            .unwrap();
+        assert_eq!(
+            c.close_target(b, &r, &t),
+            Err(ConnStateError::Registry(CdpStateError::UnknownTarget))
+        );
+        assert!(r.target(&t).is_some());
+        assert_eq!(
+            c.close_target(ConnId::new(9), &r, &t),
+            Err(ConnStateError::NotLive)
+        );
+        assert_eq!(c.close_target(a, &r, &t), Ok(vec![]));
     }
 
     #[test]

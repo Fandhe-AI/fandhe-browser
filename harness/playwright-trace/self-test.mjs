@@ -10,6 +10,7 @@ import {
   checkCollection,
   normalizeString,
   PLACEHOLDER_ARTIFACTS_DIR,
+  PLACEHOLDER_WORLD_HASH,
   verifyInstalledPackages,
   normalizeValue,
   parseProtocolLine,
@@ -166,6 +167,17 @@ t("checkCollection rejects empty traces but accepts failed-connection traces wit
 t("drainLines rejects an oversized chunk before splitting", () => {
   const many = "a\n".repeat(MAX_CHUNK_BYTES);
   assert.throws(() => drainLines("", many), /chunk exceeds buffer limit/);
+});
+
+t("normalize replaces the random utility world hash", () => {
+  assert.equal(PLACEHOLDER_WORLD_HASH, "<WORLD_HASH>");
+  assert.equal(
+    normalizeString("__playwright_utility_world_page@0671279d01b2623ea98714077670a2dc"),
+    "__playwright_utility_world_page@<WORLD_HASH>",
+  );
+  // 32 桁の 16 進以外・別の接頭辞は変えない。
+  assert.equal(normalizeString("__playwright_utility_world_page@abc"), "__playwright_utility_world_page@abc");
+  assert.equal(normalizeString("other@0671279d01b2623ea98714077670a2dc"), "other@0671279d01b2623ea98714077670a2dc");
 });
 
 t("normalize replaces playwright-artifacts temp dir (Linux/macOS/Windows)", () => {

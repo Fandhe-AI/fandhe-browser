@@ -1089,8 +1089,11 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.servo == 'true' }}
     runs-on: ubuntu-latest
-    # 仮置き。cache なし・ありの計測値 × 約 1.5 に確定する（#995。根拠の run ID は確定時に追記）
-    timeout-minutes: 120
+    # 確定値（#1029）。cache なし・main（release あり）の 49 分 10 秒（run 38779636655）× 約 1.5 ≒ 74 分から 75 分にした。
+    # key が変わる（servo-host/Cargo.lock・rustc・-vN）と main は cache なしの所要時間になるため、cache なしの値を基準にする。
+    # 参考: cache なし・PR 29 分 53 秒（38748905100）、cache あり・PR 約 2.5 分（38803361812 など）、
+    #   cache あり・main 22 分 18 秒（38805174165。[render-real-host] を含む。release ビルドは毎回コールドで約 15 分）
+    timeout-minutes: 75
     permissions:
       contents: read
     env:

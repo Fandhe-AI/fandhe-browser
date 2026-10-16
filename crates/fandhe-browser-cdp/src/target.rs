@@ -154,7 +154,8 @@ id_type!(
     /// browser context（シークレットウィンドウ相当の分離単位）の識別子。`CDP-2`。
     ///
     /// 名前空間は [`TargetId`] 等とは別で、桁・書式が同じためカウンタ値が一致すれば文字列も一致し得るが、
-    /// 機能上の意味は持たない（衝突の扱いは `Target.createTarget`〔#910〕の担当）。
+    /// 機能上の意味は持たない。ブラウザ ID との衝突は、`CdpState::new` がブラウザ ID を別名前空間
+    /// （最上位ビット）で払い出すため起きず、型も別なので `Target.createTarget`〔#910〕側の対応は不要。
     BrowserContextId
 );
 id_type!(
@@ -245,6 +246,9 @@ struct Tables {
     /// 既定 context を含む browser context 表。
     contexts: HashMap<BrowserContextId, ContextEntry>,
     default_context: BrowserContextId,
+    /// `waitForDebuggerOnStart` で止めたターゲットと、止めた（再開を待つ）セッション（#910・`CDP-2`）。
+    /// ターゲットの閉鎖・context の破棄で消える。件数はターゲット数以下。
+    paused: HashMap<TargetId, SessionId>,
     next_target: u64,
     next_session: u64,
     next_context: u64,
@@ -280,6 +284,7 @@ impl TargetRegistry {
                 sessions: HashMap::new(),
                 contexts,
                 default_context,
+                paused: HashMap::new(),
                 next_target,
                 next_session,
                 next_context,
@@ -298,7 +303,7 @@ impl TargetRegistry {
         self.create_target_impl(None, kind, url)
     }
 
-    /// 指定 browser context にターゲットを作成する（`Target.createTarget`〔#910〕が呼ぶ想定）。
+    /// 指定 browser context にターゲットを作成する（`Target.createTarget`〔#910〕が接続スコープ経由で呼ぶ）。
     /// 未知の context は [`CdpStateError::UnknownBrowserContext`]。上限は全 context 共通で、
     /// 失敗時は表を変更しない。
     pub fn create_target_in(
@@ -379,13 +384,41 @@ impl TargetRegistry {
         Ok(())
     }
 
-    /// ターゲットを閉じ、配下セッションを削除して、その SessionId を返す
-    /// （将来 `Target.detachedFromTarget` の送出に使う）。
+    /// ターゲットを所有判定なしで閉じ、配下セッションを削除して、その SessionId を昇順で返す。
+    /// 接続の権限を確認する経路（`Target.closeTarget`）は [`Self::close_target_in_contexts`] を使う。
     pub fn close_target(&self, id: &TargetId) -> Result<Vec<SessionId>, CdpStateError> {
         let mut t = self.lock();
+        Self::remove_target(&mut t, id)
+    }
+
+    /// 閉じてよい context に属するときだけターゲットを閉じる（`Target.closeTarget`・TASK-43.3h・`CDP-7`・`SEC-2`）。
+    ///
+    /// 許可されるのは既定 context か `allowed`（呼び出し接続が所有する context）に属するターゲット。
+    /// 判定と削除は 1 回のロックで行い（TOCTOU 回避）、未知・許可外はどちらも
+    /// [`CdpStateError::UnknownTarget`] にして存在を漏らさず、表は変えない。
+    /// `Target.createTarget` は作成先を既定 context か自接続の context に限る（[`crate::conn_state`]）ため、
+    /// ターゲット単位の所有を持たず context 単位の判定で足りる。
+    pub(crate) fn close_target_in_contexts(
+        &self,
+        id: &TargetId,
+        allowed: &[BrowserContextId],
+    ) -> Result<Vec<SessionId>, CdpStateError> {
+        let mut t = self.lock();
+        let permitted = t.targets.get(id).is_some_and(|info| {
+            info.browser_context_id == t.default_context
+                || allowed.contains(&info.browser_context_id)
+        });
+        if !permitted {
+            return Err(CdpStateError::UnknownTarget);
+        }
+        Self::remove_target(&mut t, id)
+    }
+
+    fn remove_target(t: &mut Tables, id: &TargetId) -> Result<Vec<SessionId>, CdpStateError> {
         if t.targets.remove(id).is_none() {
             return Err(CdpStateError::UnknownTarget);
         }
+        t.paused.remove(id);
         let mut removed: Vec<SessionId> = t
             .sessions
             .iter()
@@ -429,6 +462,93 @@ impl TargetRegistry {
     /// セッションの attach 先ターゲットを返す。
     pub fn session_target(&self, id: &SessionId) -> Option<TargetId> {
         self.lock().sessions.get(id).cloned()
+    }
+
+    /// ターゲットを作成して即 attach し、必要なら一時停止として登録する（1 回のロック。`CDP-7`）。
+    ///
+    /// セッション枠が無ければターゲットも作らず表を変更しない（原子性）。`pause` が true なら
+    /// 新しいセッションを「再開を待つセッション」として記録する（`waitForDebuggerOnStart`。`CDP-2`）。
+    /// `Target.createTarget`（[`crate::conn_state::ConnectionScoped::create_target`]）から呼ばれる。
+    pub(crate) fn create_target_attached(
+        &self,
+        context: Option<&BrowserContextId>,
+        kind: TargetKind,
+        url: &str,
+        pause: bool,
+    ) -> Result<(TargetId, SessionId), CdpStateError> {
+        if url.len() > MAX_URL_LEN {
+            return Err(CdpStateError::UrlTooLong { limit: MAX_URL_LEN });
+        }
+        let mut t = self.lock();
+        if t.sessions.len() >= MAX_SESSIONS {
+            return Err(CdpStateError::TooManySessions {
+                limit: MAX_SESSIONS,
+            });
+        }
+        let context = match context {
+            Some(c) if t.contexts.contains_key(c) => c.clone(),
+            Some(_) => return Err(CdpStateError::UnknownBrowserContext),
+            None => t.default_context.clone(),
+        };
+        if t.targets.len() >= MAX_TARGETS {
+            return Err(CdpStateError::TooManyTargets { limit: MAX_TARGETS });
+        }
+        let tn = t.next_target;
+        let next_t = tn.checked_add(1).ok_or(CdpStateError::IdExhausted)?;
+        let sn = t.next_session;
+        let next_s = sn.checked_add(1).ok_or(CdpStateError::IdExhausted)?;
+        let tid = TargetId::from_counter(tn);
+        let sid = SessionId::from_counter(sn);
+        t.next_target = next_t;
+        t.next_session = next_s;
+        t.targets.insert(
+            tid.clone(),
+            TargetInfo {
+                target_id: tid.clone(),
+                kind,
+                url: url.to_owned(),
+                browser_context_id: context,
+            },
+        );
+        t.sessions.insert(sid.clone(), tid.clone());
+        if pause {
+            t.paused.insert(tid.clone(), sid.clone());
+        }
+        Ok((tid, sid))
+    }
+
+    /// ターゲットが `waitForDebuggerOnStart` で止まったままか（`Page.navigate` の拒否判定用）。
+    pub(crate) fn is_paused(&self, id: &TargetId) -> bool {
+        self.lock().paused.contains_key(id)
+    }
+
+    /// `session` が止めたターゲットを再開して返す。止めたセッション以外・止まっていないターゲットは
+    /// `None`（`Runtime.runIfWaitingForDebugger`。Chromium と同じ実際の no-op）。
+    pub(crate) fn resume_by_session(&self, session: &SessionId) -> Option<TargetId> {
+        let mut t = self.lock();
+        let tid = t.sessions.get(session)?.clone();
+        if t.paused.get(&tid) == Some(session) {
+            t.paused.remove(&tid);
+            Some(tid)
+        } else {
+            None
+        }
+    }
+
+    /// 止めたセッションが外れた（detach・切断）ターゲットを再開対象として取り出す。
+    /// 永久停止で資源が残らないようにする（`CDP-7`）。呼び出し側が初期読み込みを行う。
+    pub(crate) fn take_orphaned_paused(&self) -> Vec<TargetId> {
+        let mut t = self.lock();
+        let orphaned: Vec<TargetId> = t
+            .paused
+            .iter()
+            .filter(|(_, s)| !t.sessions.contains_key(*s))
+            .map(|(tid, _)| tid.clone())
+            .collect();
+        for tid in &orphaned {
+            t.paused.remove(tid);
+        }
+        orphaned
     }
 
     /// 既定 browser context の ID。既存ページの `targetInfo.browserContextId` に使う。
@@ -483,6 +603,7 @@ impl TargetRegistry {
         let mut closed = Vec::with_capacity(targets.len());
         for tid in targets {
             t.targets.remove(&tid);
+            t.paused.remove(&tid);
             let mut sids: Vec<SessionId> = t
                 .sessions
                 .iter()
@@ -574,6 +695,38 @@ mod tests {
         assert_eq!(r.detach(&s), Ok(t));
         assert_eq!(r.session_target(&s), None);
         assert_eq!(r.detach(&s), Err(CdpStateError::UnknownSession));
+    }
+
+    #[test]
+    fn cdp7_close_target_in_contexts_checks_ownership() {
+        let r = TargetRegistry::new();
+        let own = r.create_browser_context().unwrap();
+        let other = r.create_browser_context().unwrap();
+        let d = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        let a = r
+            .create_target_in(&own, TargetKind::Page, "about:blank")
+            .unwrap();
+        let b = r
+            .create_target_in(&other, TargetKind::Page, "about:blank")
+            .unwrap();
+        let sb = r.attach(&b).unwrap();
+        let sd = r.attach(&d).unwrap();
+        assert_eq!(r.close_target_in_contexts(&d, &[]), Ok(vec![sd]));
+        assert_eq!(
+            r.close_target_in_contexts(&a, std::slice::from_ref(&own)),
+            Ok(vec![])
+        );
+        assert_eq!(
+            r.close_target_in_contexts(&b, std::slice::from_ref(&own)),
+            Err(CdpStateError::UnknownTarget)
+        );
+        assert!(r.target(&b).is_some());
+        assert_eq!(r.session_target(&sb), Some(b.clone()));
+        let ghost = TargetId::from_counter(9999);
+        assert_eq!(
+            r.close_target_in_contexts(&ghost, &[]),
+            Err(CdpStateError::UnknownTarget)
+        );
     }
 
     #[test]
@@ -871,5 +1024,72 @@ mod tests {
         assert_eq!(r.context_download(&c), Some(settings()));
         r.dispose_browser_context(&c).unwrap();
         assert!(r.context_download(&c).is_none());
+    }
+
+    #[test]
+    fn cdp2_create_target_attached_pauses_and_resumes_by_owning_session() {
+        let r = TargetRegistry::new();
+        let (t, s) = r
+            .create_target_attached(None, TargetKind::Page, "about:blank", true)
+            .unwrap();
+        assert_eq!(r.session_target(&s), Some(t.clone()));
+        assert!(r.is_paused(&t));
+        // 別セッションは再開できない。
+        let other = r.attach(&t).unwrap();
+        assert_eq!(r.resume_by_session(&other), None);
+        assert!(r.is_paused(&t));
+        assert_eq!(r.resume_by_session(&s), Some(t.clone()));
+        assert!(!r.is_paused(&t));
+        assert_eq!(r.resume_by_session(&s), None);
+        // 止めない作成は記録しない。
+        let (t2, _) = r
+            .create_target_attached(None, TargetKind::Page, "about:blank", false)
+            .unwrap();
+        assert!(!r.is_paused(&t2));
+    }
+
+    #[test]
+    fn cdp7_paused_record_is_dropped_on_close_dispose_and_orphaned_by_detach() {
+        let r = TargetRegistry::new();
+        let (t, s) = r
+            .create_target_attached(None, TargetKind::Page, "about:blank", true)
+            .unwrap();
+        assert!(r.take_orphaned_paused().is_empty());
+        r.detach(&s).unwrap();
+        assert_eq!(r.take_orphaned_paused(), vec![t.clone()]);
+        assert!(!r.is_paused(&t));
+        // 閉鎖で消える。
+        let (t2, _) = r
+            .create_target_attached(None, TargetKind::Page, "about:blank", true)
+            .unwrap();
+        r.close_target(&t2).unwrap();
+        assert!(!r.is_paused(&t2));
+        assert!(r.take_orphaned_paused().is_empty());
+        // context の破棄で消える。
+        let c = r.create_browser_context().unwrap();
+        let (t3, _) = r
+            .create_target_attached(Some(&c), TargetKind::Page, "about:blank", true)
+            .unwrap();
+        r.dispose_browser_context(&c).unwrap();
+        assert!(!r.is_paused(&t3));
+        assert!(r.take_orphaned_paused().is_empty());
+    }
+
+    #[test]
+    fn cdp7_create_target_attached_rolls_back_on_session_limit() {
+        let r = TargetRegistry::new();
+        let t = r.create_target(TargetKind::Page, "about:blank").unwrap();
+        while r.session_count() < MAX_SESSIONS {
+            r.attach(&t).unwrap();
+        }
+        let before = r.target_count();
+        assert_eq!(
+            r.create_target_attached(None, TargetKind::Page, "about:blank", true)
+                .unwrap_err(),
+            CdpStateError::TooManySessions {
+                limit: MAX_SESSIONS
+            }
+        );
+        assert_eq!(r.target_count(), before);
     }
 }

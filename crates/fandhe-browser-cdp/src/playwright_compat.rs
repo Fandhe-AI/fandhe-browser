@@ -1,4 +1,4 @@
-//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c、段階 2b は 43.3d、段階 2g は 43.3g）。
+//! Playwright / Puppeteer 接続互換のための最小ハンドラ群（TASK-43.3・`CDP-2`。段階 1 は 43.3a、段階 2a は 43.3b、段階 2c は 43.3c、段階 2b は 43.3d、段階 2g は 43.3g、段階 2h は 43.3h）。
 //!
 //! `protocol::builtin_handlers` から登録される。`Browser.getVersion`（43.3a）・
 //! `Target.getTargetInfo`（43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（43.3c）を
@@ -10,12 +10,13 @@
 //! `Target.setAutoAttach` は `TargetRegistry::attach` と `Target.attachedToTarget` の送出に繋ぐ。
 //! `Browser.setDownloadBehavior` は設定の検証と接続スコープでの保持までで、ダウンロード実行系
 //! （保存・`Browser.downloadWillBegin`・`downloadProgress`）は未実装（`CDP-6`・`REPAIR-3`）。
-//! 43.3g（#942）で `Target.setAutoAttach` の `waitForDebuggerOnStart:true`（保持のみ。新ターゲットの
-//! 停止は #910）と `Browser.setDownloadBehavior` の `deny` + `eventsEnabled:true` を受理する。
+//! 43.3g（#942）で `Target.setAutoAttach` の `waitForDebuggerOnStart:true`（保持。新ターゲットの
+//! 停止は 43.3e〔#910〕で実装）と `Browser.setDownloadBehavior` の `deny` + `eventsEnabled:true` を受理する。
 //! 43.3d（#909）で `Target.createBrowserContext`（`disposeOnDetach:true` のみ。接続切断で破棄）と
 //! `browserContextId` 付き `Browser.setDownloadBehavior`（context 単位で保持）を足し、全ページターゲットの
 //! `targetInfo` に `browserContextId` を載せる。`Target.disposeBrowserContext` は未実装（`REPAIR-3`）。
-//! 接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
+//! 43.3e（#910）で `Target.createTarget`（応答の前に `Target.attachedToTarget` を送出）と
+//! `Runtime.runIfWaitingForDebugger` を足す。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
 
 use serde_json::{Value, json};
 
@@ -26,7 +27,7 @@ use crate::discovery::{PRODUCT, PROTOCOL_VERSION};
 use crate::protocol::{
     BoxFuture, CdpError, CdpEvent, CommandContext, CommandHandler, HandlerOutput,
 };
-use crate::target::{BrowserContextId, SessionId, TargetId, TargetInfo};
+use crate::target::{BrowserContextId, CdpStateError, SessionId, TargetId, TargetInfo};
 
 /// `Browser.getVersion`（`CDP-2`・TASK-43.3a）。
 ///
@@ -98,7 +99,8 @@ impl CommandHandler for TargetGetTargetInfo {
 /// （Target.pdl）で止める対象は「以後に attach される新しいターゲット」で、Chromium も既存ターゲットを
 /// `waiting_for_debugger=false` で attach する（`target_handler.cc` の `AutoAttach(..., false)`）。
 /// 既存ターゲットの `Target.attachedToTarget` は `waitingForDebugger:false`。新しいターゲットの
-/// 実際の一時停止は `Target.createTarget`（#910）で実装し、現状は新ターゲットが現れる本番経路が無い。
+/// 一時停止は `Target.createTarget`（[`TargetCreateTarget`]。#910）が行い、
+/// `Runtime.runIfWaitingForDebugger` で再開する。
 /// 接続なしの直接 dispatch は `NO_CONNECTION`。
 /// イベントの `targetInfo` には所属 context の `browserContextId` が載る（TASK-43.3d・#909）。
 pub(crate) struct TargetSetAutoAttach;
@@ -146,18 +148,16 @@ impl CommandHandler for TargetSetAutoAttach {
             if !flatten {
                 return Err(CdpError::UNSUPPORTED_PARAMS);
             }
-            // `waitForDebuggerOnStart` は以後に attach される新しいターゲットだけを止める指示で、
+            // `waitForDebuggerOnStart` は以後に作られる新しいターゲットだけを止める指示で、
             // 既存ターゲットは止めない（このため下の既存ターゲット通知は `waitingForDebugger:false`）。
-            // 新しいターゲットの実際の一時停止は `Target.createTarget`（#910）で実装し、それまでは
-            // 値の保持のみ。新ターゲットを生む経路を #910 より前に足す場合は、停止と
-            // `waitingForDebugger:true` の通知を同時に実装すること（`REPAIR-3`・`CDP-6`）。
+            // 新しいターゲットの停止は `Target.createTarget` が接続状態の値を参照して行う（#910）。
             let attached = state
                 .conn_scoped()
                 .enable_auto_attach(conn, state.registry(), wait_for_debugger)
                 .map_err(conn_error)?;
             let mut out = HandlerOutput::result(json!({}));
             for (info, session_id) in &attached {
-                out = out.with_event(attached_event(info, session_id));
+                out = out.with_event(attached_event(info, session_id, false));
             }
             Ok(out)
         })
@@ -165,13 +165,21 @@ impl CommandHandler for TargetSetAutoAttach {
 }
 
 /// `Target.attachedToTarget`（flatten・ブラウザレベル）イベントを組み立てる。
-pub(crate) fn attached_event(info: &TargetInfo, session_id: &SessionId) -> CdpEvent {
+///
+/// `waiting_for_debugger` は `waitForDebuggerOnStart` で止めたターゲットを作成した接続にだけ `true`。
+/// 後から自動 attach で追従する他接続には `false`（その接続のためには待たない。クライアントごとの
+/// 待ちは持たない簡略化で、Chromium との差異。`REPAIR-3`）。
+pub(crate) fn attached_event(
+    info: &TargetInfo,
+    session_id: &SessionId,
+    waiting_for_debugger: bool,
+) -> CdpEvent {
     CdpEvent {
         method: "Target.attachedToTarget",
         params: json!({
             "sessionId": session_id.as_str(),
             "targetInfo": page_target_info(info, true),
-            "waitingForDebugger": false,
+            "waitingForDebugger": waiting_for_debugger,
         }),
         session_id: None,
     }
@@ -236,6 +244,180 @@ impl CommandHandler for TargetCreateBrowserContext {
             Ok(HandlerOutput::result(
                 json!({ "browserContextId": id.as_str() }),
             ))
+        })
+    }
+}
+
+/// `Target.closeTarget`（`CDP-2`・`CDP-7`・`SEC-2`・`REPAIR-3`・TASK-43.3h・#1028）。
+///
+/// Playwright は `newPage()` の初期化失敗時に `page._close()` でこれを送り、応答の成否は見ずに
+/// `Target.detachedFromTarget` 等の close イベントを待つ。成功時は `{"success":true}` を返し、
+/// 自接続が attach 済みのセッションごとに `Target.detachedFromTarget` を応答の後に送出する
+/// （`DispatchOutcome` の規約どおり応答 → イベント）。他接続のセッションの通知は、その接続の
+/// 次のコマンドに同伴する（push 経路が無いため。`ConnectionScoped::reconcile_auto_attach`）。
+///
+/// 閉じてよいのは既定 context か自接続が所有する context のターゲットだけ（判定は
+/// `TargetRegistry::close_target_in_contexts`。`Target.createTarget` は作成先をこの 2 種に限るため
+/// ターゲット単位の所有は持たない）。
+/// 未知・他接続の context・ブラウザ自身の ID・不正な ID はすべて同じ固定文言の `INVALID_PARAMS`
+/// にして存在を問い合わせる手段にしない。`sessionId` 付きは `UNSUPPORTED_PARAMS`、接続なしは
+/// `NO_CONNECTION`。ブラウザ全体は終了しない。
+///
+/// 未実装（`REPAIR-3`）: `Target.targetDestroyed` は `Target.setDiscoverTargets` が未実装で
+/// discover 有効な接続が存在しないため送らない。実装時は下の `detachedFromTarget` の後ろへ足す。
+pub(crate) struct TargetCloseTarget;
+
+impl CommandHandler for TargetCloseTarget {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            if ctx.session_id.is_some() {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let s = params
+                .get("targetId")
+                .and_then(Value::as_str)
+                .ok_or(CdpError::INVALID_PARAMS)?;
+            let id = TargetId::parse(s).map_err(|_| CdpError::INVALID_PARAMS)?;
+            let state = ctx.state;
+            // ブラウザ ID は registry を引く前に拒否する（TargetId と書式が同じで衝突し得る）。
+            if id.as_str() == state.browser_id().as_str() {
+                return Err(CdpError::INVALID_PARAMS);
+            }
+            let conn = ctx.conn.ok_or(CdpError::NO_CONNECTION)?;
+            let sessions = state
+                .conn_scoped()
+                .close_target(conn, state.registry(), &id)
+                .map_err(|e| match e {
+                    ConnStateError::NotLive => CdpError::NO_CONNECTION,
+                    ConnStateError::Registry(_) => CdpError::INVALID_PARAMS,
+                })?;
+            state.navigations().forget(&id);
+            let mut out = HandlerOutput::result(json!({ "success": true }));
+            for sid in &sessions {
+                out = out.with_event(detached_event(&id, sid));
+            }
+            // TODO(REPAIR-3): `Target.setDiscoverTargets` 実装時にここへ `Target.targetDestroyed` を足す。
+            Ok(out)
+        })
+    }
+}
+
+/// `Target.createTarget`（`CDP-2`・`CDP-5`・`CDP-6`・`CDP-7`・`SEC-2`・`REPAIR-3`・TASK-43.3e・#910）。
+///
+/// Playwright の `newPage()`（`url:"about:blank"`・`browserContextId`）が送る。ページターゲットを作り
+/// `{"targetId"}` を返す。呼び出し接続の自動 attach が有効なら同じロックで attach し、
+/// `Target.attachedToTarget` を**応答より前に**送出する（Playwright は応答時点でその targetId の
+/// ページがある前提で動くため。[`HandlerOutput::with_pre_event`]）。`waitForDebuggerOnStart` が有効な
+/// 接続ではターゲットを止めて `waitingForDebugger:true` で通知し、そのセッションの
+/// `Runtime.runIfWaitingForDebugger` まで初期 `about:blank` 文書を確定しない
+/// （[`RuntimeRunIfWaitingForDebugger`]）。止めないターゲットは作成時に確定する。
+///
+/// 受理する `params` は `url`（`"about:blank"` のみ。取得を伴わず SSRF の面を作らない）と
+/// `browserContextId`（省略時は既定 context。指定できるのは既定 context か自接続の context だけ）。
+/// `url` が他の文字列・他のキー（`newWindow`・`background`・`width` 等）は黙って無視せず
+/// `UNSUPPORTED_PARAMS`、`url` の欠落・型不正と `browserContextId` の型・書式不正・未知・他接続の
+/// context は `INVALID_PARAMS`（未知と権限外は同じ固定文言で存在を漏らさない）。`sessionId` 付きは
+/// `UNSUPPORTED_PARAMS`、接続なしは `NO_CONNECTION`、上限（ターゲット・セッション）超過は
+/// `SERVER_ERROR`（巻き戻し済みで何も作らない）。
+///
+/// 未実装（`REPAIR-3`）: 任意 URL の読み込み、`Target.targetCreated`（`Target.setDiscoverTargets` が
+/// 未実装）、初期読み込み時の `Page.frameNavigated` 等（`Page.enable` が未実装）、クライアントごとの待ち。
+/// 既定 context に作ったターゲットは作成接続の切断では閉じない（Chromium のタブと同じ。
+/// `Target.closeTarget` で閉じる。上限 `MAX_TARGETS` が歯止め）。
+pub(crate) struct TargetCreateTarget;
+
+impl CommandHandler for TargetCreateTarget {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            if ctx.session_id.is_some() {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let Some(obj) = params.as_object() else {
+                return Err(CdpError::INVALID_PARAMS);
+            };
+            if obj.keys().any(|k| k != "url" && k != "browserContextId") {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let url = obj
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or(CdpError::INVALID_PARAMS)?;
+            if url != "about:blank" {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let context = match obj.get("browserContextId") {
+                None => None,
+                Some(v) => {
+                    let s = v.as_str().ok_or(CdpError::INVALID_PARAMS)?;
+                    Some(BrowserContextId::parse(s).map_err(|_| CdpError::INVALID_PARAMS)?)
+                }
+            };
+            let conn = ctx.conn.ok_or(CdpError::NO_CONNECTION)?;
+            let state = ctx.state;
+            let created = state
+                .conn_scoped()
+                .create_target(conn, state.registry(), context.as_ref(), url)
+                .map_err(|e| match e {
+                    ConnStateError::NotLive => CdpError::NO_CONNECTION,
+                    ConnStateError::Registry(CdpStateError::UnknownBrowserContext) => {
+                        CdpError::INVALID_PARAMS
+                    }
+                    ConnStateError::Registry(_) => CdpError::SERVER_ERROR,
+                })?;
+            // 止めたターゲットは `Runtime.runIfWaitingForDebugger` まで初期文書を確定しない。
+            if !created.waiting_for_debugger {
+                state
+                    .navigations()
+                    .commit_initial_blank(state.registry(), created.info.target_id());
+            }
+            let mut out =
+                HandlerOutput::result(json!({ "targetId": created.info.target_id().as_str() }));
+            if let Some(sid) = &created.session {
+                out = out.with_pre_event(attached_event(
+                    &created.info,
+                    sid,
+                    created.waiting_for_debugger,
+                ));
+            }
+            Ok(out)
+        })
+    }
+}
+
+/// `Runtime.runIfWaitingForDebugger`（`CDP-2`・`SEC-2`・`REPAIR-3`・TASK-43.3e・#910）。
+///
+/// `waitForDebuggerOnStart` で止めたターゲットを、止めたセッション自身が再開する。再開で初期
+/// `about:blank` 文書を確定し `{}` を返す。止まっていないターゲットのセッションへは、Chromium と同じく
+/// 何もせず `{}`（実際の no-op であり、ここでの成功は検出回避等の一律成功ではない）。`sessionId` 必須
+/// （無ければ `UNSUPPORTED_PARAMS`）、未知・閉じたセッションは `INVALID_PARAMS`。
+/// 止めたセッションが外れた場合の再開は `CdpState::resume_orphaned_paused`。
+pub(crate) struct RuntimeRunIfWaitingForDebugger;
+
+impl CommandHandler for RuntimeRunIfWaitingForDebugger {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        _params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            let sid = ctx.session_id.ok_or(CdpError::UNSUPPORTED_PARAMS)?;
+            let state = ctx.state;
+            let registry = state.registry();
+            if registry.session_target(sid).is_none() {
+                return Err(CdpError::INVALID_PARAMS);
+            }
+            if let Some(tid) = registry.resume_by_session(sid) {
+                state.navigations().commit_initial_blank(registry, &tid);
+            }
+            Ok(HandlerOutput::result(json!({})))
         })
     }
 }
@@ -1222,6 +1404,603 @@ mod tests {
             call(&st, Some(c1), &dl(1, r#""behavior":"deny""#)).await;
             assert!(st.conn_scoped().download(c1).is_some());
             assert!(st.conn_scoped().download(c2).is_none());
+        }
+
+        fn close_req(id: i64, tid: &str) -> String {
+            format!(
+                r#"{{"id":{id},"method":"Target.closeTarget","params":{{"targetId":"{tid}"}}}}"#
+            )
+        }
+
+        fn detached(t: &TargetId, s: &str) -> Value {
+            json!({"method":"Target.detachedFromTarget","params":{"sessionId":s,"targetId":t.as_str()}})
+        }
+
+        #[tokio::test]
+        async fn cdp2_close_target_returns_success_then_detaches_once() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            let f = call(&st, Some(c), &auto_attach(1, ON)).await;
+            let sid = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            let f = call(&st, Some(c), &close_req(2, t.as_str())).await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"id":2,"result":{"success":true}}),
+                    detached(&t, &sid)
+                ]
+            );
+            assert!(st.registry().target(&t).is_none());
+            assert_eq!(st.registry().session_count(), 0);
+            // 二重送出しない。
+            let f = call(&st, Some(c), r#"{"id":3,"method":"Browser.getVersion"}"#).await;
+            assert_eq!(f.len(), 1);
+            // 閉じたターゲットは getTargetInfo で引けない。
+            let req = format!(
+                r#"{{"id":4,"method":"Target.getTargetInfo","params":{{"targetId":"{}"}}}}"#,
+                t.as_str()
+            );
+            assert_eq!(
+                call(&st, Some(c), &req).await,
+                vec![err(-32602, "invalid params", 4)]
+            );
+            // 接続・ブラウザ ID は使い続けられる。
+            let f = call(&st, Some(c), r#"{"id":5,"method":"Target.getTargetInfo"}"#).await;
+            assert_eq!(
+                f[0]["result"]["targetInfo"]["targetId"],
+                st.browser_id().as_str()
+            );
+            assert!(st.navigations().get(&t).is_none());
+        }
+
+        #[tokio::test]
+        async fn cdp2_close_target_without_attach_emits_only_response() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            let f = call(&st, Some(c), &close_req(1, t.as_str())).await;
+            assert_eq!(f, vec![json!({"id":1,"result":{"success":true}})]);
+        }
+
+        #[tokio::test]
+        async fn sec2_close_target_rejects_unknown_invalid_and_browser_id() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            let bad = err(-32602, "invalid params", 1);
+            let ghost = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+            for req in [
+                close_req(1, ghost),
+                close_req(1, "bad id!"),
+                close_req(1, st.browser_id().as_str()),
+                r#"{"id":1,"method":"Target.closeTarget","params":{"targetId":5}}"#.to_owned(),
+                r#"{"id":1,"method":"Target.closeTarget","params":{}}"#.to_owned(),
+            ] {
+                assert_eq!(call(&st, Some(c), &req).await, vec![bad.clone()], "{req}");
+            }
+            assert!(st.registry().target(&t).is_some());
+        }
+
+        /// 新規構築直後の最初のページ ID がブラウザ ID と衝突せず、閉じられて
+        /// `detachedFromTarget` が送られる一方、ブラウザ ID は拒否される（`CDP-2`・`SEC-2`）。
+        #[tokio::test]
+        async fn cdp2_close_target_first_page_on_fresh_state_is_closable() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            assert_ne!(t.as_str(), st.browser_id().as_str());
+            let f = call(&st, Some(c), &auto_attach(1, ON)).await;
+            let sid = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            assert_eq!(
+                call(&st, Some(c), &close_req(2, t.as_str())).await,
+                vec![
+                    json!({"id":2,"result":{"success":true}}),
+                    detached(&t, &sid)
+                ]
+            );
+            assert!(st.registry().target(&t).is_none());
+            assert_eq!(
+                call(&st, Some(c), &close_req(3, st.browser_id().as_str())).await,
+                vec![err(-32602, "invalid params", 3)]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp7_close_target_rejects_other_connections_context() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let (a, b) = (open_conn(&st, 1), open_conn(&st, 2));
+            let ctx = make_context(&st, a).await;
+            let t = st
+                .registry()
+                .create_target_in(&ctx, TargetKind::Page, "about:blank")
+                .unwrap();
+            assert_eq!(
+                call(&st, Some(b), &close_req(1, t.as_str())).await,
+                vec![err(-32602, "invalid params", 1)]
+            );
+            assert!(st.registry().target(&t).is_some());
+            assert_eq!(
+                call(&st, Some(a), &close_req(2, t.as_str())).await,
+                vec![json!({"id":2,"result":{"success":true}})]
+            );
+            assert!(st.registry().target(&t).is_none());
+        }
+
+        #[tokio::test]
+        async fn cdp7_close_target_notifies_other_connection_once() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let (a, b) = (open_conn(&st, 1), open_conn(&st, 2));
+            let t = new_page(&st, "about:blank");
+            call(&st, Some(a), &auto_attach(1, ON)).await;
+            let fb = call(&st, Some(b), &auto_attach(1, ON)).await;
+            let sb = fb[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            let f = call(&st, Some(a), &close_req(2, t.as_str())).await;
+            assert_eq!(f.len(), 2);
+            let ver = r#"{"id":3,"method":"Browser.getVersion"}"#;
+            let f = call(&st, Some(b), ver).await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(f[1], detached(&t, &sb));
+            assert_eq!(call(&st, Some(b), ver).await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn cdp2_close_target_rejects_session_and_requires_connection() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            let with_session = format!(
+                r#"{{"id":1,"method":"Target.closeTarget","sessionId":"S1","params":{{"targetId":"{}"}}}}"#,
+                t.as_str()
+            );
+            assert_eq!(
+                call(&st, Some(c), &with_session).await,
+                vec![
+                    json!({"id":1,"sessionId":"S1","error":{"code":-32602,"message":"unsupported params"}})
+                ]
+            );
+            assert_eq!(
+                call(&st, None, &close_req(2, t.as_str())).await,
+                vec![err(-32000, "no connection", 2)]
+            );
+            assert!(st.registry().target(&t).is_some());
+        }
+
+        // ---- Target.createTarget / Runtime.runIfWaitingForDebugger（TASK-43.3e・#910） ----
+
+        fn create_req(id: i64, params: &str) -> String {
+            format!(r#"{{"id":{id},"method":"Target.createTarget","params":{params}}}"#)
+        }
+
+        fn run_req(id: i64, sid: &str) -> String {
+            format!(
+                r#"{{"id":{id},"method":"Runtime.runIfWaitingForDebugger","sessionId":"{sid}"}}"#
+            )
+        }
+
+        fn get_doc(id: i64, sid: &str) -> String {
+            format!(r#"{{"id":{id},"method":"DOM.getDocument","sessionId":"{sid}"}}"#)
+        }
+
+        const BLANK: &str = r#"{"url":"about:blank"}"#;
+
+        #[tokio::test]
+        async fn cdp2_create_target_emits_attached_before_response() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(&st, Some(c), &auto_attach(1, ON)).await;
+            let f = call(&st, Some(c), &create_req(2, BLANK)).await;
+            // 応答より前に attachedToTarget。他にイベントは無い（二重 attach しない）。
+            assert_eq!(f.len(), 2, "{f:?}");
+            assert_eq!(f[0]["method"], "Target.attachedToTarget");
+            assert!(f[0].get("id").is_none());
+            assert_eq!(f[0]["params"]["waitingForDebugger"], false);
+            let tid = f[1]["result"]["targetId"].as_str().unwrap().to_owned();
+            assert_eq!(f[1]["id"], 2);
+            assert_eq!(f[0]["params"]["targetInfo"]["targetId"], tid);
+            assert_eq!(f[0]["params"]["targetInfo"]["type"], "page");
+            assert_eq!(f[0]["params"]["targetInfo"]["url"], "about:blank");
+            assert_eq!(
+                f[0]["params"]["targetInfo"]["browserContextId"],
+                st.registry().default_browser_context().as_str()
+            );
+            let sid = f[0]["params"]["sessionId"].as_str().unwrap().to_owned();
+            // 止めていないので初期 about:blank 文書は確定済み。
+            let d = call(&st, Some(c), &get_doc(3, &sid)).await;
+            assert_eq!(d[0]["result"]["root"]["nodeName"], "#document", "{d:?}");
+            // ブラウザ ID とは衝突しない。
+            assert_ne!(tid, st.browser_id().as_str());
+            // 次のコマンドでも二重に attach しない。
+            let again = call(&st, Some(c), &auto_attach(4, ON)).await;
+            assert_eq!(again, vec![json!({"id":4,"result":{}})]);
+        }
+
+        #[tokio::test]
+        async fn cdp2_create_target_without_auto_attach_returns_only_response() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let f = call(&st, Some(c), &create_req(1, BLANK)).await;
+            assert_eq!(f.len(), 1);
+            let tid = TargetId::parse(f[0]["result"]["targetId"].as_str().unwrap()).unwrap();
+            assert_eq!(f[0]["result"].as_object().unwrap().len(), 1);
+            assert!(st.registry().target(&tid).is_some());
+            assert_eq!(st.registry().session_count(), 0);
+            assert!(st.navigations().get(&tid).unwrap().latest().is_some());
+        }
+
+        #[tokio::test]
+        async fn cdp2_create_target_id_never_equals_browser_id() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let ctx = make_context(&st, c).await;
+            let f = call(&st, Some(c), &create_req(2, BLANK)).await;
+            let tid = f[0]["result"]["targetId"].as_str().unwrap();
+            assert_ne!(tid, st.browser_id().as_str());
+            assert_ne!(tid, ctx.as_str());
+        }
+
+        #[tokio::test]
+        async fn cdp2_create_target_waits_for_debugger_until_run_if_waiting() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(
+                &st,
+                Some(c),
+                &auto_attach(
+                    1,
+                    r#""autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true"#,
+                ),
+            )
+            .await;
+            let f = call(&st, Some(c), &create_req(2, BLANK)).await;
+            assert_eq!(f.len(), 2, "{f:?}");
+            assert_eq!(f[0]["params"]["waitingForDebugger"], true);
+            let sid = f[0]["params"]["sessionId"].as_str().unwrap().to_owned();
+            let tid = TargetId::parse(f[1]["result"]["targetId"].as_str().unwrap()).unwrap();
+            assert!(st.registry().is_paused(&tid));
+            // 再開前は文書が無く、遷移も拒否される。
+            assert_eq!(
+                call(&st, Some(c), &get_doc(3, &sid)).await,
+                vec![
+                    json!({"id":3,"sessionId":sid,"error":{"code":-32000,"message":"document not available for target"}})
+                ]
+            );
+            let nav = format!(
+                r#"{{"id":4,"method":"Page.navigate","sessionId":"{sid}","params":{{"url":"about:blank"}}}}"#
+            );
+            assert_eq!(
+                call(&st, Some(c), &nav).await,
+                vec![
+                    json!({"id":4,"sessionId":sid,"error":{"code":-32000,"message":"target is waiting for debugger"}})
+                ]
+            );
+            // 再開で初期文書が確定する。
+            assert_eq!(
+                call(&st, Some(c), &run_req(5, &sid)).await,
+                vec![json!({"id":5,"sessionId":sid,"result":{}})]
+            );
+            assert!(!st.registry().is_paused(&tid));
+            let d = call(&st, Some(c), &get_doc(6, &sid)).await;
+            assert_eq!(d[0]["result"]["root"]["nodeName"], "#document", "{d:?}");
+            // 2 回目も成功（no-op）。
+            assert_eq!(
+                call(&st, Some(c), &run_req(7, &sid)).await,
+                vec![json!({"id":7,"sessionId":sid,"result":{}})]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp2_create_target_without_wait_loads_immediately() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(
+                &st,
+                Some(c),
+                &auto_attach(
+                    1,
+                    r#""autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true"#,
+                ),
+            )
+            .await;
+            let f = call(&st, Some(c), &create_req(2, BLANK)).await;
+            assert_eq!(f[0]["params"]["waitingForDebugger"], false);
+            let tid = TargetId::parse(f[1]["result"]["targetId"].as_str().unwrap()).unwrap();
+            assert!(!st.registry().is_paused(&tid));
+            assert!(st.navigations().get(&tid).unwrap().latest().is_some());
+        }
+
+        #[tokio::test]
+        async fn cdp2_run_if_waiting_validates_session_and_is_noop_on_running_target() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            new_page(&st, "about:blank");
+            let f = call(&st, Some(c), &auto_attach(1, ON)).await;
+            let sid = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            assert_eq!(
+                call(&st, Some(c), &run_req(2, &sid)).await,
+                vec![json!({"id":2,"sessionId":sid,"result":{}})]
+            );
+            // 実際には何も確定しない（no-op）。
+            assert!(st.navigations().len() == 0);
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c),
+                    r#"{"id":3,"method":"Runtime.runIfWaitingForDebugger"}"#
+                )
+                .await,
+                vec![err(-32602, "unsupported params", 3)]
+            );
+            assert_eq!(
+                call(&st, Some(c), &run_req(4, "NoSuch-1")).await,
+                vec![
+                    json!({"id":4,"sessionId":"NoSuch-1","error":{"code":-32602,"message":"invalid params"}})
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp7_create_target_rejects_foreign_and_unknown_context() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let a = open_conn(&st, 1);
+            let b = open_conn(&st, 2);
+            let ctx_a = make_context(&st, a).await;
+            let own = format!(
+                r#"{{"url":"about:blank","browserContextId":"{}"}}"#,
+                ctx_a.as_str()
+            );
+            // 他接続の context は拒否（表は変わらない）。
+            assert_eq!(
+                call(&st, Some(b), &create_req(2, &own)).await,
+                vec![err(-32602, "invalid params", 2)]
+            );
+            assert_eq!(st.registry().target_count(), 0);
+            // 自接続の context には作れ、所属 context が載る。
+            let f = call(&st, Some(a), &create_req(3, &own)).await;
+            let tid = TargetId::parse(f[0]["result"]["targetId"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                st.registry().target(&tid).unwrap().browser_context_id(),
+                &ctx_a
+            );
+            // 既定 context も指定できる。
+            let def = format!(
+                r#"{{"url":"about:blank","browserContextId":"{}"}}"#,
+                st.registry().default_browser_context().as_str()
+            );
+            assert!(call(&st, Some(b), &create_req(4, &def)).await[0]["result"].is_object());
+            // 未知・書式不正・型不正は同じ固定文言。
+            for bad in [
+                r#"{"url":"about:blank","browserContextId":"9999999999999999"}"#,
+                r#"{"url":"about:blank","browserContextId":"bad id!"}"#,
+                r#"{"url":"about:blank","browserContextId":5}"#,
+            ] {
+                assert_eq!(
+                    call(&st, Some(a), &create_req(5, bad)).await,
+                    vec![err(-32602, "invalid params", 5)],
+                    "{bad}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn cdp6_create_target_rejects_non_blank_url_extra_params_and_session() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            for p in [
+                r#"{"url":"https://example.test/"}"#,
+                r#"{"url":"file:///etc/passwd"}"#,
+                r#"{"url":"about:blank","newWindow":true}"#,
+                r#"{"url":"about:blank","width":100}"#,
+                r#"{"url":"about:blank","background":false}"#,
+            ] {
+                assert_eq!(
+                    call(&st, Some(c), &create_req(1, p)).await,
+                    vec![err(-32602, "unsupported params", 1)],
+                    "{p}"
+                );
+            }
+            for p in ["{}", r#"{"url":5}"#] {
+                assert_eq!(
+                    call(&st, Some(c), &create_req(2, p)).await,
+                    vec![err(-32602, "invalid params", 2)],
+                    "{p}"
+                );
+            }
+            assert_eq!(
+                call(&st, None, &create_req(3, BLANK)).await,
+                vec![err(-32000, "no connection", 3)]
+            );
+            let with_session = format!(
+                r#"{{"id":4,"method":"Target.createTarget","sessionId":"S-1","params":{BLANK}}}"#
+            );
+            assert_eq!(
+                call(&st, Some(c), &with_session).await,
+                vec![
+                    json!({"id":4,"sessionId":"S-1","error":{"code":-32602,"message":"unsupported params"}})
+                ]
+            );
+            assert_eq!(st.registry().target_count(), 0);
+        }
+
+        #[tokio::test]
+        async fn cdp7_create_target_limits_roll_back() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            // ターゲット上限。
+            for _ in 0..crate::target::MAX_TARGETS {
+                new_page(&st, "about:blank");
+            }
+            assert_eq!(
+                call(&st, Some(c), &create_req(1, BLANK)).await,
+                vec![err(-32000, "server error", 1)]
+            );
+            assert_eq!(st.registry().target_count(), crate::target::MAX_TARGETS);
+            // セッション上限: ターゲットも作らない。
+            let dir2 = TempDir::new();
+            let st2 = state(&dir2);
+            let c2 = open_conn(&st2, 1);
+            let t = new_page(&st2, "about:blank");
+            call(&st2, Some(c2), &auto_attach(1, ON)).await;
+            while st2.registry().session_count() < MAX_SESSIONS {
+                st2.registry().attach(&t).unwrap();
+            }
+            let before = st2.registry().target_count();
+            assert_eq!(
+                call(&st2, Some(c2), &create_req(2, BLANK)).await,
+                vec![err(-32000, "server error", 2)]
+            );
+            assert_eq!(st2.registry().target_count(), before);
+        }
+
+        #[tokio::test]
+        async fn cdp7_paused_target_resumes_when_creating_connection_releases() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(
+                &st,
+                Some(c),
+                &auto_attach(
+                    1,
+                    r#""autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true"#,
+                ),
+            )
+            .await;
+            let f = call(&st, Some(c), &create_req(2, BLANK)).await;
+            let tid = TargetId::parse(f[1]["result"]["targetId"].as_str().unwrap()).unwrap();
+            assert!(st.navigations().get(&tid).is_none());
+            st.release_connection(c);
+            // 既定 context のターゲットは残り、初期文書が確定する（永久停止しない）。
+            assert!(st.registry().target(&tid).is_some());
+            assert!(!st.registry().is_paused(&tid));
+            assert!(st.navigations().get(&tid).unwrap().latest().is_some());
+        }
+
+        #[tokio::test]
+        async fn cdp7_paused_target_resumes_when_auto_attach_disabled() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(
+                &st,
+                Some(c),
+                &auto_attach(
+                    1,
+                    r#""autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true"#,
+                ),
+            )
+            .await;
+            let f = call(&st, Some(c), &create_req(2, BLANK)).await;
+            let tid = TargetId::parse(f[1]["result"]["targetId"].as_str().unwrap()).unwrap();
+            call(&st, Some(c), &auto_attach(3, r#""autoAttach":false"#)).await;
+            assert!(!st.registry().is_paused(&tid));
+            assert!(st.navigations().get(&tid).unwrap().latest().is_some());
+        }
+
+        #[tokio::test]
+        async fn cdp7_owned_context_target_is_disposed_on_release() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let ctx = make_context(&st, c).await;
+            let p = format!(
+                r#"{{"url":"about:blank","browserContextId":"{}"}}"#,
+                ctx.as_str()
+            );
+            let f = call(&st, Some(c), &create_req(2, &p)).await;
+            let tid = TargetId::parse(f[0]["result"]["targetId"].as_str().unwrap()).unwrap();
+            st.release_connection(c);
+            assert!(st.registry().target(&tid).is_none());
+        }
+
+        #[tokio::test]
+        async fn cdp2_create_target_notifies_other_connection_without_waiting_and_closes() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let a = open_conn(&st, 1);
+            let b = open_conn(&st, 2);
+            call(&st, Some(b), &auto_attach(1, ON)).await;
+            let f = call(&st, Some(a), &create_req(2, BLANK)).await;
+            assert_eq!(f.len(), 1);
+            let tid = f[0]["result"]["targetId"].as_str().unwrap().to_owned();
+            // 他接続は次のコマンドで追従 attach（waitingForDebugger:false）。
+            let g = call(&st, Some(b), &auto_attach(3, ON)).await;
+            assert_eq!(g.len(), 2);
+            assert_eq!(g[1]["method"], "Target.attachedToTarget");
+            assert_eq!(g[1]["params"]["waitingForDebugger"], false);
+            assert_eq!(g[1]["params"]["targetInfo"]["targetId"], tid);
+            // 作成したターゲットは Target.closeTarget で閉じられる。
+            let sid = g[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            let _ = sid;
+            let h = call(&st, Some(a), &close_req(4, &tid)).await;
+            assert_eq!(h, vec![json!({"id":4,"result":{"success":true}})]);
+        }
+
+        #[tokio::test]
+        async fn cdp2_create_target_close_emits_detached_for_own_session() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(&st, Some(c), &auto_attach(1, ON)).await;
+            let f = call(&st, Some(c), &create_req(2, BLANK)).await;
+            let sid = f[0]["params"]["sessionId"].as_str().unwrap().to_owned();
+            let tid = TargetId::parse(f[1]["result"]["targetId"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                call(&st, Some(c), &close_req(3, tid.as_str())).await,
+                vec![
+                    json!({"id":3,"result":{"success":true}}),
+                    detached(&tid, &sid)
+                ]
+            );
+        }
+        #[tokio::test]
+        async fn cdp1_commands_to_closed_session_are_rejected() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            let f = call(&st, Some(c), &auto_attach(1, ON)).await;
+            let sid = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            call(&st, Some(c), &close_req(2, t.as_str())).await;
+            for (i, m) in [
+                ("DOM.getDocument", "{}"),
+                ("Page.navigate", r#"{"url":"about:blank"}"#),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let req = format!(
+                    r#"{{"id":{},"method":"{}","sessionId":"{sid}","params":{}}}"#,
+                    10 + i,
+                    m.0,
+                    m.1
+                );
+                let id = 10 + i as i64;
+                assert_eq!(
+                    call(&st, Some(c), &req).await,
+                    vec![
+                        json!({"id":id,"sessionId":sid,"error":{"code":-32602,"message":"invalid params"}})
+                    ],
+                    "{}",
+                    m.0
+                );
+            }
         }
     }
 }
