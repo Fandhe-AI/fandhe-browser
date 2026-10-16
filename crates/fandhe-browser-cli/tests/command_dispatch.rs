@@ -36,6 +36,7 @@ fn run_with_config(tag: &str, args: &[&str], config: Option<&str>) -> Outcome {
             cmd.env_remove("FANDHE_BROWSER_CONFIG");
         }
     }
+    cmd.env_remove("FANDHE_BROWSER_RENDER_HOST");
     let mut child = cmd
         .args(args)
         .env("HOME", &home)
