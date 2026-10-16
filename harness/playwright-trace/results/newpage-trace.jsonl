@@ -31,8 +31,8 @@
 {"seq":30,"kind":"cdp","dir":"send","message":{"id":18,"method":"Emulation.setEmulatedMedia","params":{"media":"","features":[{"name":"prefers-color-scheme","value":"light"},{"name":"prefers-reduced-motion","value":"no-preference"},{"name":"forced-colors","value":"none"},{"name":"prefers-contrast","value":"no-preference"}]},"sessionId":"00000000000000000000000000000001"}}
 {"seq":31,"kind":"cdp","dir":"send","message":{"id":19,"method":"Runtime.runIfWaitingForDebugger","sessionId":"00000000000000000000000000000001"}}
 {"seq":32,"kind":"cdp","dir":"recv","message":{"id":8,"result":{},"sessionId":"00000000000000000000000000000001"}}
-{"seq":33,"kind":"cdp","dir":"recv","message":{"id":9,"result":{"frameTree":{"frame":{"id":"main","loaderId":"2","mimeType":"text/html","url":"about:blank"}}},"sessionId":"00000000000000000000000000000001"}}
-{"seq":34,"kind":"cdp","dir":"send","message":{"id":20,"method":"Target.closeTarget","params":{"targetId":"00000000000000000000000000000001"}}}
+{"seq":33,"kind":"cdp","dir":"recv","message":{"id":9,"result":{"frameTree":{"frame":{"id":"00000000000000000000000000000001","loaderId":"2","mimeType":"text/html","url":"about:blank"}}},"sessionId":"00000000000000000000000000000001"}}
+{"seq":34,"kind":"cdp","dir":"send","message":{"id":20,"method":"Page.createIsolatedWorld","params":{"frameId":"00000000000000000000000000000001","grantUniveralAccess":true,"worldName":"__playwright_utility_world_page@<WORLD_HASH>"},"sessionId":"00000000000000000000000000000001"}}
 {"seq":35,"kind":"cdp","dir":"recv","message":{"id":10,"result":{},"sessionId":"00000000000000000000000000000001"}}
 {"seq":36,"kind":"cdp","dir":"recv","message":{"id":11,"result":{},"sessionId":"00000000000000000000000000000001"}}
 {"seq":37,"kind":"cdp","dir":"recv","message":{"id":12,"result":{},"sessionId":"00000000000000000000000000000001"}}
@@ -40,9 +40,11 @@
 {"seq":39,"kind":"cdp","dir":"recv","message":{"id":14,"result":{},"sessionId":"00000000000000000000000000000001"}}
 {"seq":40,"kind":"cdp","dir":"recv","message":{"id":15,"result":{},"sessionId":"00000000000000000000000000000001"}}
 {"seq":41,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":16,"sessionId":"00000000000000000000000000000001"}}
-{"seq":42,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":17,"sessionId":"00000000000000000000000000000001"}}
-{"seq":43,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":18,"sessionId":"00000000000000000000000000000001"}}
-{"seq":44,"kind":"cdp","dir":"recv","message":{"id":19,"result":{},"sessionId":"00000000000000000000000000000001"}}
-{"seq":45,"kind":"cdp","dir":"recv","message":{"id":20,"result":{"success":true}}}
-{"seq":46,"kind":"cdp","dir":"recv","message":{"method":"Target.detachedFromTarget","params":{"sessionId":"00000000000000000000000000000001","targetId":"00000000000000000000000000000001"}}}
-{"seq":47,"kind":"stage","name":"newPage","ok":false,"error":"browserContext.newPage: Frame has been detached."}
+{"seq":42,"kind":"cdp","dir":"send","message":{"id":21,"method":"Target.closeTarget","params":{"targetId":"00000000000000000000000000000001"}}}
+{"seq":43,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":17,"sessionId":"00000000000000000000000000000001"}}
+{"seq":44,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":18,"sessionId":"00000000000000000000000000000001"}}
+{"seq":45,"kind":"cdp","dir":"recv","message":{"id":19,"result":{},"sessionId":"00000000000000000000000000000001"}}
+{"seq":46,"kind":"cdp","dir":"recv","message":{"error":{"code":-32601,"message":"method not implemented"},"id":20,"sessionId":"00000000000000000000000000000001"}}
+{"seq":47,"kind":"cdp","dir":"recv","message":{"id":21,"result":{"success":true}}}
+{"seq":48,"kind":"cdp","dir":"recv","message":{"method":"Target.detachedFromTarget","params":{"sessionId":"00000000000000000000000000000001","targetId":"00000000000000000000000000000001"}}}
+{"seq":49,"kind":"stage","name":"newPage","ok":false,"error":"browserContext.newPage: Protocol error (Emulation.setFocusEmulationEnabled): method not implemented"}
