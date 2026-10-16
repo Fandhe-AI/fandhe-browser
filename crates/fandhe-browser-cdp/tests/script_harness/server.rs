@@ -172,6 +172,7 @@ pub fn start_server() -> TestServer {
 }
 
 /// `GET /json/version` から `webSocketDebuggerUrl` を取得する（`puppeteer.connect` の入力相当）。
+#[allow(dead_code)] // 取り込むテストバイナリごとに使う項目が異なる（未使用は当該バイナリのみ）
 pub fn browser_ws_endpoint(addr: SocketAddr) -> String {
     let mut s = TcpStream::connect(addr).expect("connect");
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -196,4 +197,10 @@ pub fn browser_ws_endpoint(addr: SocketAddr) -> String {
     let prefix = format!("ws://127.0.0.1:{}/devtools/browser/", addr.port());
     assert!(url.starts_with(&prefix), "unexpected endpoint: {url}");
     url
+}
+
+/// Playwright `connectOverCDP` 用の HTTP エンドポイント（`http://127.0.0.1:<port>`。TASK-44.1・`CDP-2`）。
+#[allow(dead_code)] // 取り込むテストバイナリごとに使う項目が異なる（未使用は当該バイナリのみ）
+pub fn http_endpoint(addr: SocketAddr) -> String {
+    format!("http://127.0.0.1:{}", addr.port())
 }

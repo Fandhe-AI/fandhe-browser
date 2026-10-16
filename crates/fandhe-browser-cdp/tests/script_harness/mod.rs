@@ -17,14 +17,24 @@
 //!   トップレベル `ok: true` との不一致・`ok: false` なのに失敗段階が無い矛盾・`step` が最初の
 //!   失敗段階名と異なる矛盾）を検証し、違反は `Malformed` にする。
 //!
+//! # Playwright（TASK-44.1・#476、`CDP-2`）で追加された契約
+//! - エンドポイントは同じ [`ENDPOINT_ENV`] で渡すが、Playwright の `connectOverCDP` は HTTP
+//!   エンドポイント（[`http_endpoint`]。`http://127.0.0.1:<port>`）を受け取る。
+//! - ローカル fixture ページの URL は [`FIXTURE_URL_ENV`]（[`start_fixture_server`] が提供）。
+//! - playwright-core の導入先ディレクトリは [`PLAYWRIGHT_MODULE_DIR_ENV`]
+//!   （[`preflight_playwright`] が検査する）。
+//!
 //! # 安全性
 //! 子プロセスは締め切りで kill し、stderr は末尾のみ・stdout は結果行のみを上限付きで保持し、
 //! kill 後のリーダー待機にも上限を設ける
 //! （無制限確保による DoS の防止）。サーバーは `127.0.0.1:0` にのみ bind する。
+mod fixture;
 mod preflight;
 mod runner;
 mod server;
 
+#[allow(unused_imports)] // fixture を使わないテストバイナリでは未使用
+pub use fixture::*;
 pub use preflight::*;
 pub use runner::*;
 pub use server::*;

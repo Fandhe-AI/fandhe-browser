@@ -45,7 +45,7 @@ Harnesses, benches, measurements (scripts/harness.sh <name>)
   check-bench-record  check-binary-size  check-static-link  measure-mcp-envelope  check-mcp-envelope
   measure-plugin-overhead  check-plugin-overhead
   measure-js-binary-size  measure-container-size  measure-cssom-profile-cost  trace-playwright  check-playwright-trace
-  check-puppeteer-connect
+  check-puppeteer-connect  check-playwright-connect  test-playwright-connect
 
 Docker (one-line calls, not wrapped in scripts/)
   docker-build               docker compose build

@@ -28,7 +28,7 @@
 	check-render-isolation check-js-engine-isolation check-publish-private deny deny-servo-host license-inventory license-inventory-servo-host check-deny-license-reject ci \
 	check-compat-practical check-compat-regression bench-record check-ci-changes check-bench-record \
 	check-binary-size check-static-link measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size measure-cssom-profile-cost \
-	docker-build docker-shell docker-ci trace-playwright check-playwright-trace check-puppeteer-connect
+	docker-build docker-shell docker-ci trace-playwright check-playwright-trace check-puppeteer-connect check-playwright-connect test-playwright-connect
 
 help: ## ターゲット一覧を表示する（Make 非依存の一覧: scripts/help.sh）
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(firstword $(MAKEFILE_LIST)) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2}'
@@ -122,7 +122,7 @@ check-deny-license-reject: ## cargo deny が許可外ライセンスを reject �
 # `rendering` feature（Servo）を含めた検証（ci.md「既定ビルドと --features rendering の両方で検証」）も
 # make ci に含める。lint-rendering / test-rendering は feature 未定義の段階では skip して 0 終了するため、
 # workspace 作成前・render crate 追加前の CI を壊さない。docker-ci は make ci を呼ぶため自動的に含む。
-ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-js-engine-isolation check-publish-private test test-rendering deny check-deny-license-reject check-compat-regression check-compat-practical check-puppeteer-connect check-bench-record check-mcp-envelope check-ci-changes ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-js-engine-isolation check-publish-private test test-rendering deny check-deny-license-reject check-compat-regression check-compat-practical check-puppeteer-connect check-playwright-connect check-bench-record check-mcp-envelope check-ci-changes ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 実測ハーネス・ベンチ・計測（各 README: harness/*/README.md・benches/*/README.md）
@@ -178,6 +178,12 @@ check-playwright-trace: ## harness/playwright-trace のオフライン自己テ�
 
 check-puppeteer-connect: ## harness/puppeteer-connect のオフライン自己テストと Rust 契約テスト（puppeteer_contract）を実行する（要 node。TASK-45.2）
 	@scripts/harness.sh check-puppeteer-connect
+
+check-playwright-connect: ## harness/playwright-connect のオフライン自己テストと Rust 契約テスト（playwright_contract）を実行する（要 node。TASK-44.1）
+	@scripts/harness.sh check-playwright-connect
+
+test-playwright-connect: ## 実 Playwright で接続試験の実行基盤を検証する（手動・要 node/npm/ネットワーク。CI 対象外。TASK-44.1）
+	@scripts/harness.sh test-playwright-connect
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）

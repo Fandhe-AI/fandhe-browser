@@ -15,7 +15,8 @@
 #   measure-js-binary-size   JS エンジン構成別バイナリサイズ計測（JS-3・PERF-1。要 jq）
 #   measure-container-size   既定・軽量コンテナと比較対象（Playwright 公式）のイメージサイズ計測（CTR-1・CTR-5。要 docker・jq）
 #   measure-cssom-profile-cost  CSSOM プロファイル読み込みのコスト計測（PLUG-8。要 jq）
-#   trace-playwright | check-playwright-trace | check-puppeteer-connect   CDP トレース収集・自己テスト（要 node）
+#   trace-playwright | check-playwright-trace | check-puppeteer-connect | check-playwright-connect   CDP トレース収集・自己テスト（要 node）
+#   test-playwright-connect  実 Playwright での接続試験基盤の検証（TASK-44.1。要 node/npm/ネットワーク。手動・CI 対象外）
 #   test-harness             harness/render-screenshot のユニット・結合テスト（要 python3）
 #
 # 上書き可能な環境変数（`make <target> VAR=value` も可）: BINARY_SIZE_PACKAGE・BINARY_SIZE_LIMIT_BYTES・
@@ -246,6 +247,12 @@ case "${name}" in
     ;;
   check-puppeteer-connect)
     bash harness/puppeteer-connect/self-test.sh
+    ;;
+  check-playwright-connect)
+    bash harness/playwright-connect/self-test.sh
+    ;;
+  test-playwright-connect)
+    bash harness/playwright-connect/run.sh "${PLAYWRIGHT_VERSION}" "${PLAYWRIGHT_INTEGRITY}"
     ;;
   test-harness)
     # harness/render-screenshot は Rust workspace に属さない Python 標準ライブラリのみのスクリプト
