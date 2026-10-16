@@ -5,11 +5,14 @@
 //! 自身の再実行で実現する（`puppeteer_connect.rs` と同じ流儀）ため、通常の
 //! `cargo test --workspace` では Node も Playwright も要らない。
 //!
-//! 実 Playwright を使う `cdp2_real_playwright_reaches_new_page` だけは導入が必要なため
+//! 実 Playwright を使う `cdp2_real_playwright_goto_and_selector`（TASK-44.3・#478。
+//! connect → newContext → newPage → goto → selector の 5 段階。feature `test-support` 限定で、
+//! ループバック fixture への `Page.navigate` を許す入口を使う）だけは導入が必要なため
 //! `#[ignore]` とし、`make test-playwright-connect`（`harness/playwright-connect/run.sh`）が
-//! `--ignored --exact` で明示実行する（0 件実行は失敗）。未導入での実行は skip せず
-//! [`HarnessError::ToolUnavailable`] で panic する（成功を装わない）。段階の成否の固定
-//! （newPage 到達・goto・セレクタ）は TASK-44.2〜44.4 の担当で、ここでは回収できることだけを見る。
+//! `--features test-support --ignored --exact` で明示実行する（0 件実行は失敗）。未導入での実行は
+//! skip せず [`HarnessError::ToolUnavailable`] で panic する（成功を装わない）。
+//! セレクタ段階の期待値（テキスト・属性）は `harness/playwright-connect/stages.mjs` の
+//! `FIXTURE_EXPECT` と同じ値で、不一致は JS 側の `SelectorMismatch` として段階失敗になる。
 //!
 //! `Profile::open` が非 unix で `Unsupported` を返す仕様のため `#[cfg(unix)]`。
 
@@ -22,11 +25,18 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(feature = "test-support")]
+use script_harness::start_server_allowing_loopback;
 use script_harness::{
     FIXTURE_URL_ENV, FixtureRoute, HarnessError, PLAYWRIGHT_INSTALL_HINT,
     PLAYWRIGHT_MODULE_DIR_ENV, ScriptCommand, ScriptError, ScriptOutcome, StageResult, StageStatus,
     TempDir, http_endpoint, preflight_playwright, run_script, start_fixture_server, start_server,
 };
+
+/// セレクタ段階が取得する fixture ページ。`harness/playwright-connect/stages.mjs` の
+/// `FIXTURE_EXPECT`（`#target` のテキスト `Hello fixture`・属性 `data-role="greeting"`）と対応する。
+#[cfg(feature = "test-support")]
+const FIXTURE_HTML: &str = r#"<!doctype html><html><head><title>fixture</title></head><body><p id="target" data-role="greeting">Hello fixture</p></body></html>"#;
 
 const MODE_ENV: &str = "FANDHE_FAKE_PLAYWRIGHT_MODE";
 const D: Duration = Duration::from_secs(60);
@@ -46,11 +56,17 @@ fn fake_playwright_child_entry() {
             println!("FANDHE_SCRIPT_RESULT {{\"ok\":true,\"step\":\"{ep} {fx}\",\"error\":null}}")
         }
         "staged_ok" => println!(
-            "FANDHE_SCRIPT_RESULT {{\"ok\":true,\"step\":\"newPage\",\"error\":null,\"stages\":[{{\"name\":\"connect\",\"status\":\"ok\",\"error\":null}},{{\"name\":\"newContext\",\"status\":\"ok\",\"error\":null}},{{\"name\":\"newPage\",\"status\":\"ok\",\"error\":null}}]}}"
+            "FANDHE_SCRIPT_RESULT {{\"ok\":true,\"step\":\"selector\",\"error\":null,\"stages\":[{{\"name\":\"connect\",\"status\":\"ok\",\"error\":null}},{{\"name\":\"newContext\",\"status\":\"ok\",\"error\":null}},{{\"name\":\"newPage\",\"status\":\"ok\",\"error\":null}},{{\"name\":\"goto\",\"status\":\"ok\",\"error\":null}},{{\"name\":\"selector\",\"status\":\"ok\",\"error\":null}}]}}"
         ),
         "staged_fail" => {
             println!(
-                "FANDHE_SCRIPT_RESULT {{\"ok\":false,\"step\":\"newContext\",\"error\":{{\"name\":\"Error\",\"message\":\"Browser.setDownloadBehavior failed\"}},\"stages\":[{{\"name\":\"connect\",\"status\":\"ok\",\"error\":null}},{{\"name\":\"newContext\",\"status\":\"failed\",\"error\":{{\"name\":\"Error\",\"message\":\"Browser.setDownloadBehavior failed\"}}}},{{\"name\":\"newPage\",\"status\":\"not_reached\",\"error\":null}}]}}"
+                "FANDHE_SCRIPT_RESULT {{\"ok\":false,\"step\":\"newContext\",\"error\":{{\"name\":\"Error\",\"message\":\"Browser.setDownloadBehavior failed\"}},\"stages\":[{{\"name\":\"connect\",\"status\":\"ok\",\"error\":null}},{{\"name\":\"newContext\",\"status\":\"failed\",\"error\":{{\"name\":\"Error\",\"message\":\"Browser.setDownloadBehavior failed\"}}}},{{\"name\":\"newPage\",\"status\":\"not_reached\",\"error\":null}},{{\"name\":\"goto\",\"status\":\"not_reached\",\"error\":null}},{{\"name\":\"selector\",\"status\":\"not_reached\",\"error\":null}}]}}"
+            );
+            std::process::exit(1);
+        }
+        "selector_mismatch" => {
+            println!(
+                "FANDHE_SCRIPT_RESULT {{\"ok\":false,\"step\":\"selector\",\"error\":{{\"name\":\"SelectorMismatch\",\"message\":\"expected text Hello fixture got Bye\"}},\"stages\":[{{\"name\":\"connect\",\"status\":\"ok\",\"error\":null}},{{\"name\":\"newContext\",\"status\":\"ok\",\"error\":null}},{{\"name\":\"newPage\",\"status\":\"ok\",\"error\":null}},{{\"name\":\"goto\",\"status\":\"ok\",\"error\":null}},{{\"name\":\"selector\",\"status\":\"failed\",\"error\":{{\"name\":\"SelectorMismatch\",\"message\":\"expected text Hello fixture got Bye\"}}}}]}}"
             );
             std::process::exit(1);
         }
@@ -120,7 +136,7 @@ fn cdp2_passes_http_endpoint_and_fixture_url_to_script() {
     );
 }
 
-/// CDP-2: connect / newContext / newPage の段階別成功結果を回収できる。
+/// CDP-2: connect / newContext / newPage / goto / selector の段階別成功結果を回収できる。
 #[test]
 fn cdp2_collects_staged_success() {
     let out = run_script(&fake("staged_ok", None), "http://127.0.0.1:1", D);
@@ -128,12 +144,14 @@ fn cdp2_collects_staged_success() {
         out,
         ScriptOutcome::Completed {
             ok: true,
-            step: "newPage".into(),
+            step: "selector".into(),
             error: None,
             stages: vec![
                 stage("connect", StageStatus::Ok, None),
                 stage("newContext", StageStatus::Ok, None),
                 stage("newPage", StageStatus::Ok, None),
+                stage("goto", StageStatus::Ok, None),
+                stage("selector", StageStatus::Ok, None),
             ],
         }
     );
@@ -157,6 +175,33 @@ fn cdp2_collects_failure_with_error() {
                 stage("connect", StageStatus::Ok, None),
                 stage("newContext", StageStatus::Failed, Some(err)),
                 stage("newPage", StageStatus::NotReached, None),
+                stage("goto", StageStatus::NotReached, None),
+                stage("selector", StageStatus::NotReached, None),
+            ],
+        }
+    );
+}
+
+/// CDP-2・TASK-44.3: セレクタ段階の期待値不一致（期待値と実測値を含むエラー）を回収できる。
+#[test]
+fn cdp2_collects_selector_mismatch() {
+    let err = ("SelectorMismatch", "expected text Hello fixture got Bye");
+    let out = run_script(&fake("selector_mismatch", None), "http://127.0.0.1:1", D);
+    assert_eq!(
+        out,
+        ScriptOutcome::Completed {
+            ok: false,
+            step: "selector".into(),
+            error: Some(ScriptError {
+                name: err.0.into(),
+                message: err.1.into(),
+            }),
+            stages: vec![
+                stage("connect", StageStatus::Ok, None),
+                stage("newContext", StageStatus::Ok, None),
+                stage("newPage", StageStatus::Ok, None),
+                stage("goto", StageStatus::Ok, None),
+                stage("selector", StageStatus::Failed, Some(err)),
             ],
         }
     );
@@ -252,12 +297,15 @@ fn cdp2_preflight_returns_command_when_version_matches() {
     }
 }
 
-/// CDP-2・TASK-44.2: 実 Playwright で connectOverCDP → newContext → newPage が全段階成功する。
+/// CDP-2・TASK-44.3: 実 Playwright で connectOverCDP → newContext → newPage → goto → セレクタ取得
+/// （テキスト・属性が具体値と一致）まで全段階成功する。fixture はループバックのため、
+/// ループバック取得を許す `test-support` の入口でサーバーを起動する（本番の `endpoints()` は拒否）。
 /// 既知の回避オプション（noDefaults / acceptDownloads:false / viewport:null。`stages.mjs`）前提。
 /// 導入が必要なため `make test-playwright-connect` が `--ignored --exact` で明示実行する。
+#[cfg(feature = "test-support")]
 #[test]
 #[ignore = "requires playwright-core; run via `make test-playwright-connect`"]
-fn cdp2_real_playwright_reaches_new_page() {
+fn cdp2_real_playwright_goto_and_selector() {
     let module_dir = std::env::var_os(PLAYWRIGHT_MODULE_DIR_ENV).map(PathBuf::from);
     let version = std::env::var("FANDHE_PLAYWRIGHT_VERSION")
         .expect("FANDHE_PLAYWRIGHT_VERSION must be set (see harness/playwright-connect/run.sh)");
@@ -266,9 +314,8 @@ fn cdp2_real_playwright_reaches_new_page() {
     let mut cmd = preflight_playwright(module_dir.as_deref(), &harness_dir, &version)
         .unwrap_or_else(|e| panic!("playwright is unavailable (not skipping): {e:?}"));
 
-    let server = start_server();
-    let fixture =
-        start_fixture_server(vec![FixtureRoute::html("/index.html", "<p id=\"x\">x</p>")]);
+    let server = start_server_allowing_loopback();
+    let fixture = start_fixture_server(vec![FixtureRoute::html("/index.html", FIXTURE_HTML)]);
     cmd.envs
         .push((FIXTURE_URL_ENV.to_string(), fixture.url("/index.html")));
     let out = run_script(&cmd, &http_endpoint(server.addr), Duration::from_secs(120));
@@ -276,14 +323,22 @@ fn cdp2_real_playwright_reaches_new_page() {
         out,
         ScriptOutcome::Completed {
             ok: true,
-            step: "newPage".into(),
+            step: "selector".into(),
             error: None,
             stages: vec![
                 stage("connect", StageStatus::Ok, None),
                 stage("newContext", StageStatus::Ok, None),
                 stage("newPage", StageStatus::Ok, None),
+                stage("goto", StageStatus::Ok, None),
+                stage("selector", StageStatus::Ok, None),
             ],
         },
-        "newPage was not reached: {out:?}"
+        "selector stage was not reached: {out:?}"
+    );
+    // goto が fixture まで実際に届いた証拠。
+    assert!(
+        fixture.hits().iter().any(|p| p == "/index.html"),
+        "fixture was not fetched: {:?}",
+        fixture.hits()
     );
 }

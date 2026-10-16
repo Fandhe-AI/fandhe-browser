@@ -397,8 +397,14 @@ type HandlerTable = Vec<(&'static str, Box<dyn CommandHandler>)>;
 ///
 /// `Page.navigate` は既定の `FetchOptions`（内部アドレス拒否）で `Fetcher` を構築する。
 pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
-    let navigate =
-        PageNavigate::new(FetchOptions::default()).map_err(|_| DispatcherError::HandlerInit)?;
+    builtin_handlers_with(FetchOptions::default())
+}
+
+/// [`builtin_handlers`] の `Page.navigate` が使う `FetchOptions` を差し替えられる版。
+/// 本番経路は常に [`builtin_handlers`]（内部アドレス拒否）を使い、緩めた設定を渡すのは
+/// feature `test-support` の結合テスト入口だけ（`CDP-2`・TASK-44.3・SSRF 防御）。
+pub(crate) fn builtin_handlers_with(fetch: FetchOptions) -> Result<HandlerTable, DispatcherError> {
+    let navigate = PageNavigate::new(fetch).map_err(|_| DispatcherError::HandlerInit)?;
     Ok(vec![
         ("Page.navigate", Box::new(navigate)),
         (
@@ -484,6 +490,13 @@ impl Dispatcher {
     /// 組込みハンドラ表（[`builtin_handlers`]）から構築する。ws.rs の接続設定から呼ばれる。
     pub fn builtin() -> Result<Self, DispatcherError> {
         Self::from_handlers(builtin_handlers()?)
+    }
+
+    /// 組込みハンドラ表を `Page.navigate` の `FetchOptions` 差し替え付きで構築する
+    /// （feature `test-support` の結合テスト入口専用。`CDP-2`・TASK-44.3）。
+    #[cfg(feature = "test-support")]
+    pub fn builtin_with(fetch: FetchOptions) -> Result<Self, DispatcherError> {
+        Self::from_handlers(builtin_handlers_with(fetch)?)
     }
 
     /// 任意のハンドラ表から構築する。名前の検証と重複検出を行う。

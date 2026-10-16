@@ -1,7 +1,7 @@
 # playwright-connect
 
 Playwright 接続試験の実行基盤（TASK-44.1・Issue #476・ビヘイビア `CDP-2`・MS-4）。
-`chromium.connectOverCDP` → `newContext` → `newPage` の一連フローを、実クライアントで
+`chromium.connectOverCDP` → `newContext` → `newPage` → `goto` → セレクタ取得の一連フローを、実クライアントで
 試すための土台。共有基盤 `crates/fandhe-browser-cdp/tests/script_harness/`（TASK-45.1）を再利用する。
 
 ## 役割分担
@@ -9,8 +9,8 @@ Playwright 接続試験の実行基盤（TASK-44.1・Issue #476・ビヘイビ�
 | 範囲 | Issue |
 | ---- | ----- |
 | 実行基盤（サーバー・fixture 起動、スクリプト実行、結果の構造化回収、未導入時の明示的失敗） | #476（本ディレクトリ） |
-| `newPage()` 到達の確認（実 Playwright テスト `cdp2_real_playwright_reaches_new_page`） | #477（TASK-44.2） |
-| `goto`・セレクタ取得 | #478（TASK-44.3） |
+| `newPage()` 到達の確認（実 Playwright テストは 44.3 で `cdp2_real_playwright_goto_and_selector` に置き換え） | #477（TASK-44.2） |
+| `goto`・セレクタ取得（5 段階の実 Playwright テストとループバック fixture 用の `test-support` 入口） | #478（TASK-44.3） |
 | 結果レポート | #479（TASK-44.4） |
 
 先行の `harness/playwright-trace/`（TASK-43.1）は CDP トレース収集用で、本ディレクトリはテスト基盤用。
@@ -20,7 +20,7 @@ Playwright 接続試験の実行基盤（TASK-44.1・Issue #476・ビヘイビ�
 | ファイル | 内容 |
 | -------- | ---- |
 | `connect.mjs` | `playwright-core` で段階実行し、結果を 1 行で報告するスクリプト |
-| `stages.mjs` | 段階実行の純粋ロジック（クライアント注入可）。connect → newContext → newPage |
+| `stages.mjs` | 段階実行の純粋ロジック（クライアント注入可）。connect → newContext → newPage → goto → selector。期待値 `FIXTURE_EXPECT`（`#target` のテキスト・`data-role` 属性） |
 | `contract-sample.mjs` | Rust 側パーサーとの契約テスト用に `stages.mjs` の出力を再現する |
 | `self-test.mjs` / `self-test.sh` | オフライン自己テスト（`make check-playwright-connect`。要 node。Playwright・ネットワーク不要） |
 | `run.sh` | 実 Playwright 実行の入口（`make test-playwright-connect`。手動・要ネットワーク・CI 対象外） |
@@ -34,8 +34,9 @@ Playwright 接続試験の実行基盤（TASK-44.1・Issue #476・ビヘイビ�
   - `FANDHE_CDP_WS_ENDPOINT`: サーバーの HTTP エンドポイント `http://127.0.0.1:<port>`
     （名前は共有基盤のまま。Playwright の `connectOverCDP` は HTTP を受け取る。ループバック IP リテラル以外は拒否）
   - `FANDHE_PLAYWRIGHT_MODULE_DIR`: `node_modules/playwright-core` を持つ導入先
-  - `FANDHE_FIXTURE_URL`: fixture ページ URL（`goto` は TASK-44.3 で使用。現状未使用）
-- 結果行・`stages` の形式は `harness/puppeteer-connect/README.md` と同じ。段階は `connect` / `newContext` / `newPage`
+  - `FANDHE_FIXTURE_URL`: `goto` 先の fixture ページ URL（必須。ループバック IP リテラルの `http://` 以外は、Playwright 読み込み前に `goto` 段階の結果行つきで拒否）
+- 結果行・`stages` の形式は `harness/puppeteer-connect/README.md` と同じ。段階は `connect` / `newContext` / `newPage` / `goto` / `selector`。
+  セレクタ段階は `FIXTURE_EXPECT` と比べ、不一致は `SelectorMismatch`（期待値と実測値をメッセージに含む）、要素なしは `SelectorNotFound` で失敗する
 - 既知の回避策: `connectOverCDP(url, { noDefaults: true })`・`newContext({ acceptDownloads: false, viewport: null })`
   （`harness/playwright-trace/README.md`）。UA・フィンガープリントは変更しない（SEC-2）
 
@@ -43,7 +44,7 @@ Playwright 接続試験の実行基盤（TASK-44.1・Issue #476・ビヘイビ�
 
 - 基盤の自己テスト: `cargo test -p fandhe-browser-cdp --test playwright_flow`（node 不要）
 - スクリプト・契約の自己テスト: `make check-playwright-connect`（要 node）
-- 実 Playwright: `make test-playwright-connect`（`playwright-core` を `mktemp -d` へ一時導入。
+- 実 Playwright: `make test-playwright-connect`（`--features test-support` 付きで実行。`playwright-core` を `mktemp -d` へ一時導入。
   `scripts/versions.sh` の `PLAYWRIGHT_VERSION` / `PLAYWRIGHT_INTEGRITY`、`verify-install.mjs` で検証）
 
 ## 未導入時の扱い（AC3）
@@ -61,10 +62,13 @@ skip せず、理由と導入手順（`PLAYWRIGHT_INSTALL_HINT`）つきの `Har
 - 導入方式: (a) 推奨: 本 `run.sh` の一時導入（リポに何も置かない）、(b) `package.json` + lockfile をコミットして `npm ci --ignore-scripts`
 - CI 組み込み（`actions/setup-node` の SHA 固定・npm レジストリへのネットワークアクセス）は別途承認事項
 
-## 既知の制約（TASK-44.3 の前提）
+## 既知の制約（TASK-44.3）
 
-`start_server()` が使う `builtin_handlers()` の `Page.navigate` は既定の `FetchOptions`（内部アドレス拒否）で
-構築され、注入経路が無い。このため `127.0.0.1` の fixture への `goto` は SSRF ガードで拒否される見込み。
-44.3 でテスト用のループバック許可経路（cdp crate の変更。要セキュリティレビュー）が必要。
+- ループバック fixture への `goto`: 本番の `endpoints()` は `Page.navigate` を内部アドレス拒否（SSRF ガード）で構築する。
+  実テストは feature `test-support` の `test_support::endpoints_allowing_loopback` でサーバーを起動して許可する
+  （既定ビルド・本番の `endpoints()` は拒否のまま）。
+- セレクタ段階は現状到達しない: `Runtime.callFunctionOn`・`Runtime.evaluate`・`Page.createIsolatedWorld` が未実装
+  （`-32601`）のため、Playwright の locator が utility world の注入スクリプトを動かせず `StageTimeout` になる。
+  実測は `docs/design/playwright-compat.md` の「段階 TASK-44.3 の実施結果」を参照。解消には Runtime ドメインの実装が要る。
 
 Windows は `Profile::open` が未対応（#295・#955）のため `playwright_flow.rs` は unix のみ。

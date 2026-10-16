@@ -3,12 +3,12 @@
 // 役割: テスト基盤（crates/fandhe-browser-cdp/tests/script_harness）が起動した
 // fandhe-browser の CDP サーバーへ playwright-core で接続し、結果を stdout の 1 行
 // （FANDHE_SCRIPT_RESULT + JSON）で報告する。段階（stages。ロジックは stages.mjs）は
-// connect → newContext → newPage。外部 URL へはアクセスしない。
+// connect → newContext → newPage → goto → selector。外部 URL へはアクセスしない（fixture URL もループバックのみ許可）。
 //
 // 入力（環境変数）:
 //   FANDHE_CDP_WS_ENDPOINT        ループバックの http:// URL（connectOverCDP は HTTP エンドポイントを取る）
 //   FANDHE_PLAYWRIGHT_MODULE_DIR  playwright-core を導入したディレクトリ（node_modules を含む）
-//   FANDHE_FIXTURE_URL            fixture ページ URL（goto は TASK-44.3 で使う。現状は未使用）
+//   FANDHE_FIXTURE_URL            goto 先の fixture ページ URL（ループバック http:// のみ。必須。TASK-44.3）
 // UA・フィンガープリントを偽装するオプションは指定しない。
 
 import { createRequire } from "node:module";
@@ -34,9 +34,9 @@ process.on("unhandledRejection", async (e) => {
   process.exit(1);
 });
 
-// 接続先がループバック IP リテラルの http:// URL であることを URL 解析で厳密に検証する
+// 接続先・fixture URL がループバック IP リテラルの http:// URL（パスは許可） であることを URL 解析で厳密に検証する
 // （前方一致ではユーザー情報でホストを偽装できる）。
-function isLoopbackHttpEndpoint(value) {
+function isLoopbackHttpUrl(value) {
   let url;
   try {
     url = new URL(value);
@@ -51,8 +51,14 @@ function isLoopbackHttpEndpoint(value) {
 }
 
 const endpoint = process.env.FANDHE_CDP_WS_ENDPOINT ?? "";
-if (!isLoopbackHttpEndpoint(endpoint)) {
+if (!isLoopbackHttpUrl(endpoint)) {
   await report(false, "connect", new Error("endpoint must be a loopback http:// URL"));
+  process.exit(1);
+}
+// goto 先もループバック http:// に限る（外部・file: へ出さない。SSRF 防止）。パスは許可する。
+const fixtureUrl = process.env.FANDHE_FIXTURE_URL ?? "";
+if (!isLoopbackHttpUrl(fixtureUrl)) {
+  await report(false, "goto", new Error("fixture url must be a loopback http:// URL"));
   process.exit(1);
 }
 const moduleDir = process.env.FANDHE_PLAYWRIGHT_MODULE_DIR ?? "";
@@ -66,6 +72,7 @@ try {
   const result = await runStages({
     chromium,
     endpoint,
+    fixtureUrl,
     onStage: (name) => {
       currentStage = name;
     },

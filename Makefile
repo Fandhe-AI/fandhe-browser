@@ -182,7 +182,7 @@ check-puppeteer-connect: ## harness/puppeteer-connect のオフライン自己�
 check-playwright-connect: ## harness/playwright-connect のオフライン自己テストと Rust 契約テスト（playwright_contract）を実行する（要 node。TASK-44.1）
 	@scripts/harness.sh check-playwright-connect
 
-test-playwright-connect: ## 実 Playwright で connectOverCDP→newContext→newPage の到達を検証する（手動・要 node/npm/ネットワーク。CI 対象外。TASK-44.1・44.2）
+test-playwright-connect: ## 実 Playwright で connectOverCDP→newContext→newPage→goto→セレクタ取得を検証する（手動・要 node/npm/ネットワーク。CI 対象外。TASK-44.1〜44.3）
 	@scripts/harness.sh test-playwright-connect
 
 # --------------------------------------------------
