@@ -99,7 +99,7 @@ TASK-68.1（#489）。上記の正式値（基準コミット `411b1909…`・`l
 | 出典 | 削減率 | 備考 |
 | ---- | -----: | ---- |
 | PoC-8 `scratch` | 99.87% | 4.37MB / 3,390MB。`core-proto`（JS エンジンなし）。arm64・Docker Desktop |
-| PoC-8 `alpine` | 99.42% | 同上 |
+| PoC-8 `alpine` | 99.42% | 約 19.7MB / 3,390MB（削減率 99.42% から逆算した概算値。1 - 19.66/3,390 = 99.42%）。分母 3,390MB・`core-proto`・arm64・Docker Desktop の環境条件は `scratch` 行と同じ |
 | default（本測定） | 97.92% | history-sum 基準。分母 3,390MB で割った参考値は 98.41% |
 | lite（本測定） | 99.48% | history-sum 基準。同じく参考値は 99.60% |
 
