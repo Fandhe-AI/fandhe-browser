@@ -90,7 +90,7 @@ docker の実行ファイルは環境変数 `DOCKER_BIN` で差し替えられ�
 | `conditions[].stop_reason` | `breakdown`（破綻）・`host_memory_limit`・`max_n`（倍々の上限）・`completed`（`--no-doubling` で列を完走） |
 | `conditions[].steps[]` | N ごとの結果。`complete=false` はホストメモリ上限で起動を打ち切ったステップ |
 | `steps[].started` / `ready` / `measured` | 起動に成功した数 / 起動待ちを通過した数 / メモリ値を読めた数 |
-| `steps[].breakdowns` | `oom_kill`・`start_failed`・`ready_timeout`・`exited`・`navigate_failed` と `total` |。ナビゲート未実行（ホスト上限）は `navigate_not_run`（破綻に数えず complete=false で表す）
+| `steps[].breakdowns` | `oom_kill`・`start_failed`・`ready_timeout`・`exited`・`navigate_failed` と `total`。ナビゲート未実行（ホスト上限）は `navigate_not_run`（破綻に数えず complete=false で表す） |
 | `steps[].oom_detail` | `memory.events` の `oom_kill` 合計と `State.OOMKilled` の件数（両方を記録） |
 | `steps[].memory_peak_bytes` / `memory_current_bytes` | `sum`・`avg`（整数の切り捨て）・`max`・`count` |
 | `steps[].ready_time` | 起動待ちの所要の `max`・`avg`（単位は常に `ms`。値がなければ `null`） |
