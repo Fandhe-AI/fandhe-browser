@@ -151,7 +151,7 @@ pub const APP_DIR_NAME: &str = "fandhe-browser";
 /// - Linux 等（macOS 以外の Unix）: `$XDG_DATA_HOME/<app>`。未設定・空・相対パス・
 ///   `..` 含みのときは XDG Base Directory 仕様どおり無視し `$HOME/.local/share/<app>`
 /// - macOS: `$HOME/Library/Application Support/<app>`
-/// - Windows: `%LOCALAPPDATA%\<app>`
+/// - Windows: 既知フォルダ `FOLDERID_LocalAppData` の `\<app>`（環境変数 `LOCALAPPDATA` は見ない）
 /// - 上記以外: 既定値を持たないため [`ProfileError::DefaultRootUnavailable`]
 ///
 /// 必要な環境変数が使えなければ暗黙の代替先へ落とさず
@@ -390,7 +390,7 @@ impl<D: ProfileStore> ProfileStore for OverridableStore<D> {
     }
 }
 
-/// OS 標準の基点ディレクトリ（`$HOME`・`$XDG_DATA_HOME`・`%LOCALAPPDATA%`）を
+/// OS 標準の基点ディレクトリ（`$HOME`・`$XDG_DATA_HOME`・既知フォルダ `LocalAppData`）を
 /// 実体パスへ解決する（`XOS-7`・`PROF-1`・`PROF-4`）。
 ///
 /// [`Profile::open`] は祖先の symlink を拒否する（`PROF-1`・`PROF-4`）が、macOS の
@@ -463,15 +463,18 @@ fn resolve_macos<F: Fn(&str) -> Option<OsString>>(
     }
 }
 
-/// Windows の既定ルート。`USERPROFILE` 等へはフォールバックしない。
+/// Windows の既定ルート。入力は既知フォルダ `FOLDERID_LocalAppData` の取得結果
+/// （`win32::known_local_app_data`。取得失敗は `None`）で、環境変数は見ない（Issue #951）。
+/// `USERPROFILE` 等へもフォールバックしない。純粋関数のため Linux でも単体テストできる。
+///
+/// 取得失敗は `DefaultRootUnavailable`（`resolve_root` の既存契約。REPAIR-4）。一方
+/// [`Profile::open`] 側の基準の取得失敗は `Unsupported`。どちらも fail-closed。
 #[cfg(any(windows, test))]
-fn resolve_windows<F: Fn(&str) -> Option<OsString>>(
-    env: &F,
-) -> Result<(PathBuf, PathBuf), ProfileError> {
-    match usable_base(env("LOCALAPPDATA")) {
+fn resolve_windows(known_folder: Option<PathBuf>) -> Result<(PathBuf, PathBuf), ProfileError> {
+    match usable_base(known_folder.map(PathBuf::into_os_string)) {
         Some(local) => Ok((local, PathBuf::from(APP_DIR_NAME))),
         None => Err(ProfileError::DefaultRootUnavailable {
-            reason: "LOCALAPPDATA is not set to an absolute path",
+            reason: "the Local AppData known folder (FOLDERID_LocalAppData) could not be resolved to an absolute path",
         }),
     }
 }
@@ -495,9 +498,10 @@ fn platform_default_parts<F: Fn(&str) -> Option<OsString>>(
 /// 実行中の OS に対応する解決規則へ振り分け、（基点, アプリ用サフィックス）を返す。
 #[cfg(windows)]
 fn platform_default_parts<F: Fn(&str) -> Option<OsString>>(
-    env: &F,
+    _env: &F,
 ) -> Result<(PathBuf, PathBuf), ProfileError> {
-    resolve_windows(env)
+    // Windows は環境変数を見ない（既知フォルダ API。Issue #951）。シグネチャは他 OS と揃える。
+    resolve_windows(crate::win32::known_local_app_data().ok())
 }
 
 /// 実行中の OS に対応する解決規則へ振り分ける（既定値の定義がない OS）。
@@ -908,13 +912,15 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn xos_7_open_or_create_succeeds_under_local_app_data_on_windows() {
-        let lad = std::fs::canonicalize(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA"))
-            .expect("canonicalize LOCALAPPDATA");
+        let lad = std::fs::canonicalize(
+            crate::win32::known_local_app_data().expect("known folder must resolve"),
+        )
+        .expect("canonicalize known folder");
         let tmp = TempDir::new();
         let base = tmp.0.parent().expect("parent").to_path_buf();
         assert!(
             base.starts_with(&lad) && base != lad,
-            "テストの前提: TEMP ({base:?}) が LOCALAPPDATA ({lad:?}) 配下にあること"
+            "テストの前提: TEMP ({base:?}) が既知フォルダ LocalAppData ({lad:?}) 配下にあること"
         );
         let store = FixedStore {
             resolved: ResolvedRoot::new(tmp.0.clone(), RootSource::OsDefault),
@@ -1068,25 +1074,23 @@ mod tests {
         }
     }
 
-    /// XOS-7: Windows は LOCALAPPDATA 直下。
+    /// XOS-7: Windows は既知フォルダ（LocalAppData）直下。
     #[test]
-    fn xos_7_windows_uses_local_app_data() {
+    fn xos_7_windows_uses_known_folder() {
         let local = abs("local-app-data");
-        let env = env_of(&[("LOCALAPPDATA", os(&local))]);
-        assert_eq!(joined(resolve_windows(&env)), local.join("fandhe-browser"));
+        assert_eq!(
+            joined(resolve_windows(Some(local.clone()))),
+            local.join("fandhe-browser")
+        );
     }
 
-    /// XOS-7: Windows で LOCALAPPDATA が未設定・空・相対ならエラー（HOME 等へ落とさない）。
+    /// XOS-7: Windows で既知フォルダが取得できない・空・相対ならエラー（HOME 等へ落とさない）。
     #[test]
-    fn xos_7_windows_errors_without_local_app_data() {
-        for env in [
-            env_of(&[("HOME", os(&abs("home")))]),
-            env_of(&[("LOCALAPPDATA", OsString::new())]),
-            env_of(&[("LOCALAPPDATA", OsString::from("relative"))]),
-        ] {
+    fn xos_7_windows_errors_without_known_folder() {
+        for input in [None, Some(PathBuf::new()), Some(PathBuf::from("relative"))] {
             assert_eq!(
-                unavailable(resolve_windows(&env)),
-                "LOCALAPPDATA is not set to an absolute path"
+                unavailable(resolve_windows(input)),
+                "the Local AppData known folder (FOLDERID_LocalAppData) could not be resolved to an absolute path"
             );
         }
     }
@@ -1117,15 +1121,16 @@ mod tests {
         );
     }
 
-    /// XOS-7: Windows でディスパッチャが LOCALAPPDATA 規則を選ぶ。
+    /// XOS-7・PROF-6: Windows でディスパッチャは既知フォルダを使い、環境変数 `LOCALAPPDATA` は無視する。
     #[cfg(windows)]
     #[test]
-    fn xos_7_dispatcher_selects_local_app_data() {
-        let local = abs("dispatch-local");
-        let env = env_of(&[("LOCALAPPDATA", os(&local))]);
+    fn xos_7_dispatcher_uses_known_folder_and_ignores_env() {
+        let fake = abs("dispatch-local");
+        let env = env_of(&[("LOCALAPPDATA", os(&fake))]);
+        let known = crate::win32::known_local_app_data().expect("known folder");
         assert_eq!(
             joined(platform_default_parts(&env)),
-            local.join("fandhe-browser")
+            known.join("fandhe-browser")
         );
     }
 
