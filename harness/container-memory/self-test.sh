@@ -64,6 +64,19 @@ if [[ "$(now_ms)" =~ ^[0-9]{13,}$ ]]; then ok "now_ms is epoch milliseconds"; el
 
 # --- 偽 docker シム ---
 SHIM="$TMP/docker-shim"
+# getent ahostsv4 の偽シム（実 DNS は使わない）
+RSHIM="$TMP/resolve-shim"
+cat >"$RSHIM" <<'RSH'
+#!/usr/bin/env bash
+[ "$1" = ahostsv4 ] || exit 2
+case "$2" in
+  example.com | example.org) printf '93.184.216.34 STREAM %s\n' "$2" ;;
+  private.test) printf '10.0.0.1 STREAM %s\n' "$2" ;;
+  mixed.test) printf '93.184.216.34 STREAM %s\n127.0.0.1 STREAM %s\n' "$2" "$2" ;;
+  *) exit 2 ;;
+esac
+RSH
+chmod +x "$RSHIM"
 cat >"$SHIM" <<'SHIMEOF'
 #!/usr/bin/env bash
 # 偽 docker。呼び出しを calls.log に記録し、環境変数のシナリオに従って応答する。
@@ -85,7 +98,9 @@ case "$1" in
       if [ -n "${FAKE_NO_IMAGE:-}" ] && [[ "$ref" != *@* ]]; then exit 1; fi
       case "$args" in
         *json*)
-          if [[ "$ref" == *@* ]]; then
+          if [[ "$ref" == mcr.microsoft.com/*@* ]]; then
+            echo "{\"Id\":\"sha256:refid\",\"Os\":\"linux\",\"Architecture\":\"amd64\",\"RepoDigests\":[\"${FAKE_REF_DIGEST_REF:-$ref}\"]}"
+          elif [[ "$ref" == *@* ]]; then
             echo "{\"Id\":\"sha256:helper\",\"Os\":\"linux\",\"Architecture\":\"amd64\",\"RepoDigests\":[\"${FAKE_HELPER_DIGEST_REF:-$ref}\"]}"
           else
             echo '{"Id":"sha256:imageid0123","RepoDigests":[]}'
@@ -130,8 +145,14 @@ case "$1" in
     esac
     ;;
   run)
+    if [[ "$args" == *"--entrypoint sh "* ]]; then
+      # Chromium バイナリのパス解決（FAKE_CHROME_PATHS は改行区切り。未設定は 1 行の正常値）
+      printf '%b\n' "${FAKE_CHROME_PATHS-/ms-playwright/chromium-1148/chrome-linux/chrome}"
+      exit 0
+    fi
     if [[ " $args " == *" -d "* ]]; then
       n=$(cat "$S/counter"); k=$((n + 1)); echo "$k" >"$S/counter"
+      [ "$k" != "${RUN_RAISE_MEM_K:-0}" ] || cp "$RUN_RAISE_MEM_FILE" "$S/meminfo"
       [ "$k" = "${RUN_FAIL_K:-0}" ] && exit 125
       cid=$(printf '%064x' "$k")
       label=""
@@ -170,6 +191,7 @@ SHIMEOF
 chmod +x "$SHIM"
 
 DIGEST="sha256:$(printf '0123456789abcdef%.0s' 1 2 3 4)"
+REF_DIGEST="sha256:$(printf 'abcdef0123456789%.0s' 1 2 3 4)"
 SCENE_N=0
 # 新しいシナリオ用の状態ディレクトリを作る（S 以下に cgroup・proc・meminfo の偽ツリーを置く）
 new_scene() {
@@ -182,15 +204,17 @@ new_scene() {
   echo "cpu memory io" >"$S/cg/cgroup.controllers"
   cp "$TMP/meminfo40" "$S/meminfo"
   export SHIM_DIR="$S" FAKE_CG="$S/cg" FAKE_PROC="$S/proc"
-  unset FAKE_CGV FAKE_NO_IMAGE FAKE_HELPER_DIGEST_REF FAKE_PLAT_DIGEST NAV_RAISE_MEM RUN_FAIL_K OOM_K EXITED_K NO_PEAK READY_DELAY READY_FAIL_K NAV_DELAY NAV_FAIL_K
+  unset FAKE_CGV FAKE_NO_IMAGE FAKE_HELPER_DIGEST_REF FAKE_PLAT_DIGEST NAV_RAISE_MEM RUN_FAIL_K OOM_K EXITED_K NO_PEAK READY_DELAY READY_FAIL_K NAV_DELAY NAV_FAIL_K FAKE_REF_DIGEST_REF FAKE_CHROME_PATHS RUN_RAISE_MEM_K RUN_RAISE_MEM_FILE
 }
 
 # $@ = measure.sh の追加引数。終了コードを返し、標準出力を $S/out.json、標準エラーを $S/err に残す
 run_measure() {
   [ "$SHIM" != "docker" ] || { echo "refusing to run against a real docker" >&2; exit 1; }
-  DOCKER_BIN="$SHIM" bash "${HERE}/measure.sh" \
+  RESOLVE_BIN="$RSHIM" DOCKER_BIN="$SHIM" bash "${HERE}/measure.sh" \
     --cgroup-root "$S/cg" --proc-root "$S/proc" --meminfo "$S/meminfo" \
-    --helper-image node:22-alpine --helper-digest "$DIGEST" --settle 0 "$@" >"$S/out.json" 2>"$S/err"
+    --helper-image node:22-alpine --helper-digest "$DIGEST" \
+    --reference-image mcr.microsoft.com/playwright:v1.49.0-noble --reference-digest "$REF_DIGEST" \
+    --settle 0 "$@" >"$S/out.json" 2>"$S/err"
 }
 
 # $1=名前 $2=期待終了コード、残り=measure.sh の引数
@@ -299,6 +323,108 @@ expect_eq "cleanup: only the foreign container remains" "aaaaaaaaaaaa foreign=1"
 expect_eq "cleanup: every ps uses the run label filter" "0" "$(grep '^ps ' "$S/calls.log" | grep -vc -- '--filter label=fandhe-ctrmem.run=' || true)"
 expect_eq "cleanup: rm never targets the foreign container" "0" "$(grep '^rm ' "$S/calls.log" | grep -c 'aaaaaaaaaaaa' || true)"
 if grep -q '^rm -f ' "$S/calls.log"; then ok "cleanup: rm -f was called"; else ng "cleanup: rm -f was called"; fi
+
+# --- fandhe の回帰（既定 target の起動引数は #929 から変えない） ---
+new_scene
+expect_rc "fandhe target run" 0 --n-list 2 --no-doubling --conditions loaded --url https://example.com/
+expect_jq "fandhe: target" "fandhe" '.target'
+expect_jq "fandhe: max_ok_n" "2" '.conditions[0].max_ok_n'
+expect_jq "fandhe: launch entrypoint null" "null" '.launch.entrypoint'
+expect_jq "fandhe: pinned_digest null" "null" '.image.pinned_digest'
+expect_jq "fandhe: CTR-6 listed" "true" '.behaviors | index("CTR-6") != null'
+expect_eq "fandhe: no --entrypoint/--no-sandbox/--init" "0" "$(grep '^run -d' "$S/calls.log" | grep -cE -- '--entrypoint|--no-sandbox|--init' || true)"
+expect_eq "fandhe: navigate has no --page-target" "0" "$(grep 'navigate.mjs' "$S/calls.log" | grep -c -- '--page-target' || true)"
+expect_eq "fandhe: no path resolution" "0" "$(grep -c -- '--entrypoint sh' "$S/calls.log" || true)"
+
+# --- chromium target ---
+new_scene
+expect_rc "chromium: host resolving to private IP rejected" 2 --target chromium --n-list 1 --no-doubling --conditions loaded --url https://private.test/
+expect_rc "chromium: mixed public/private resolution rejected" 2 --target chromium --n-list 1 --no-doubling --conditions loaded --url https://mixed.test/
+expect_rc "chromium: unresolvable host rejected" 2 --target chromium --n-list 1 --no-doubling --conditions loaded --url https://nx.test/
+expect_rc "chromium: decimal-IP loopback host rejected" 2 --target chromium --n-list 1 --no-doubling --conditions loaded --url http://2130706433/
+new_scene
+expect_rc "chromium run" 0 --target chromium --n-list 2 --no-doubling --conditions idle,loaded --url https://example.com/p
+REFPIN="mcr.microsoft.com/playwright@${REF_DIGEST}"
+expect_jq "chromium: target" "chromium" '.target'
+expect_eq "chromium: every launch routes non-target traffic to a dead proxy" "0" "$(grep -- '--headless=new' "$S/calls.log" | grep -vc -- '--proxy-server=http://127.0.0.1:9 --proxy-bypass-list=<-loopback>;example.com' || true)"
+expect_eq "chromium: every launch pins the checked IP" "0" "$(grep -- '--headless=new' "$S/calls.log" | grep -vc -- '--host-resolver-rules=MAP example.com 93.184.216.34, MAP \* ~NOTFOUND' || true)"
+expect_jq "chromium: pinned digest" "$REFPIN" '.image.pinned_digest'
+expect_jq "chromium: image ref is the pin" "$REFPIN" '.image.ref'
+expect_jq "chromium: launch entrypoint" "/ms-playwright/chromium-1148/chrome-linux/chrome" '.launch.entrypoint'
+expect_jq "chromium: launch user" "pwuser" '.launch.user'
+expect_jq "chromium: launch init" "true" '.launch.init'
+expect_jq "chromium: launch args has no-sandbox" "true" '.launch.args | index("--no-sandbox") != null'
+expect_jq "chromium: both conditions complete" "completed completed" '[.conditions[].stop_reason] | join(" ")'
+expect_jq "chromium: max_ok_n idle" "2" '.conditions[0].max_ok_n'
+expect_jq "chromium: max_ok_n loaded" "2" '.conditions[1].max_ok_n'
+expect_eq "chromium: run -d count" "4" "$(grep -c '^run -d' "$S/calls.log")"
+expect_eq "chromium: entrypoint" "4" "$(grep '^run -d' "$S/calls.log" | grep -c -- '--entrypoint /ms-playwright/chromium-1148/chrome-linux/chrome')"
+expect_eq "chromium: user pwuser" "4" "$(grep '^run -d' "$S/calls.log" | grep -c -- '--user pwuser')"
+expect_eq "chromium: init" "4" "$(grep '^run -d' "$S/calls.log" | grep -c -- '--init')"
+expect_eq "chromium: no-sandbox and CDP port 9333" "4" "$(grep '^run -d' "$S/calls.log" | grep -- '--no-sandbox' | grep -c -- '--remote-debugging-port=9333')"
+expect_eq "chromium: loopback CDP address" "4" "$(grep '^run -d' "$S/calls.log" | grep -c -- '--remote-debugging-address=127.0.0.1')"
+expect_eq "chromium: hardening kept" "4" "$(grep '^run -d' "$S/calls.log" | grep -c -- '--cap-drop ALL --security-opt no-new-privileges')"
+expect_eq "chromium: image is repo@digest" "4" "$(grep '^run -d' "$S/calls.log" | grep -c -- " ${REFPIN} ")"
+expect_eq "chromium: never publishes ports or host network" "0" "$(grep -cE -- ' -p |--publish|--network host|--net host' "$S/calls.log" || true)"
+expect_eq "chromium: navigate has --page-target" "2" "$(grep 'navigate.mjs' "$S/calls.log" | grep -c -- 'http://127.0.0.1:9333 https://example.com/p --page-target$')"
+expect_eq "chromium: path resolved once with fixed command" "1" "$(grep -c -- "--entrypoint sh .* -c ls -d /ms-playwright/chromium-\[0-9\]\*/chrome-linux/chrome" "$S/calls.log")"
+expect_eq "chromium: path resolution is sandboxed" "1" "$(grep -- '--entrypoint sh' "$S/calls.log" | grep -c -- '--network none --cap-drop ALL --security-opt no-new-privileges')"
+
+# 既定の N 列（ホスト上限で最初のステップから止まるので何も起動しない）
+new_scene
+cp "$TMP/meminfo85" "$S/meminfo"
+expect_rc "chromium default n-list" 0 --target chromium --conditions idle --no-doubling
+expect_jq "chromium default n-list: values" "1 5 10 50 100 200 500" '.args.n_list | map(tostring) | join(" ")'
+new_scene
+cp "$TMP/meminfo85" "$S/meminfo"
+expect_rc "fandhe default n-list" 0 --conditions idle --no-doubling
+expect_jq "fandhe default n-list: values" "10 50 100 200 500" '.args.n_list | map(tostring) | join(" ")'
+new_scene
+expect_rc "chromium rejects --image" 2 --target chromium --image fandhe-browser:default --n-list 1
+expect_rc "target invalid" 2 --target firefox --n-list 1
+for v in "sha256:zz" ""; do
+  expect_rc "reference digest rejects [$v]" 2 --target chromium --n-list 1 --reference-digest "$v"
+done
+expect_rc "reference image needs tag" 2 --target chromium --n-list 1 --reference-image mcr.microsoft.com/playwright
+new_scene
+expect_eq "chromium: reference pin required" "2" "$(env -u CONTAINER_SIZE_REFERENCE_IMAGE -u CONTAINER_SIZE_REFERENCE_DIGEST DOCKER_BIN="$SHIM" bash "${HERE}/measure.sh" \
+  --cgroup-root "$S/cg" --proc-root "$S/proc" --meminfo "$S/meminfo" --helper-image node:22-alpine --helper-digest "$DIGEST" \
+  --target chromium --n-list 1 >/dev/null 2>&1; echo $?)"
+new_scene
+export FAKE_REF_DIGEST_REF="mcr.microsoft.com/playwright@${WRONG_DIGEST}"
+expect_rc "reference digest mismatch is fail-closed" 1 --target chromium --n-list 1 --conditions idle
+new_scene
+export FAKE_CHROME_PATHS=""
+expect_rc "chromium path: zero results" 2 --target chromium --n-list 1 --conditions idle
+new_scene
+export FAKE_CHROME_PATHS="/ms-playwright/chromium-1148/chrome-linux/chrome\n/ms-playwright/chromium-1200/chrome-linux/chrome"
+expect_rc "chromium path: two results" 2 --target chromium --n-list 1 --conditions idle
+new_scene
+export FAKE_CHROME_PATHS="/ms-playwright/chromium_headless_shell-1148/chrome-linux/headless_shell"
+expect_rc "chromium path: headless_shell is rejected" 2 --target chromium --n-list 1 --conditions idle
+new_scene
+export FAKE_CHROME_PATHS="/tmp/x;rm -rf /"
+expect_rc "chromium path: unexpected path" 2 --target chromium --n-list 1 --conditions idle
+expect_eq "chromium path: nothing started on failure" "0" "$(grep -c '^run -d' "$S/calls.log" || true)"
+
+# Chromium は小さい N でもホスト上限に届く。上限を守って止まり、直前の N が max_ok_n になる
+new_scene
+export RUN_RAISE_MEM_K=3 RUN_RAISE_MEM_FILE="$TMP/meminfo85"
+expect_rc "chromium host limit run" 0 --target chromium --n-list 2,4,8 --no-doubling --conditions idle
+expect_jq "chromium host limit: stop_reason" "host_memory_limit" '.conditions[0].stop_reason'
+expect_jq "chromium host limit: step incomplete" "false" '.conditions[0].steps[1].complete'
+expect_jq "chromium host limit: stops launching" "1" '.conditions[0].steps[1].started'
+expect_jq "chromium host limit: max_ok_n is the previous N" "2" '.conditions[0].max_ok_n'
+expect_eq "chromium host limit: no later step" "2" "$(jq '.conditions[0].steps | length' "$S/out.json")"
+new_scene
+export OOM_K=3
+expect_rc "chromium oom run" 0 --target chromium --n-list 2,3,5 --no-doubling --conditions idle
+expect_jq "chromium oom: stops at breakdown" "breakdown" '.conditions[0].stop_reason'
+expect_jq "chromium oom: max_ok_n is the previous N" "2" '.conditions[0].max_ok_n'
+new_scene
+export OOM_K=1
+expect_rc "chromium breakdown at first N" 0 --target chromium --n-list 1,2 --no-doubling --conditions idle
+expect_jq "chromium breakdown at first N: max_ok_n null" "null" '.conditions[0].max_ok_n'
 
 # --- 出力ファイル ---
 new_scene
@@ -416,6 +542,171 @@ if [ "$GOT" -ne 0 ]; then ok "SIGTERM: exits non-zero ($GOT)"; else ng "SIGTERM:
 expect_eq "SIGTERM: containers removed" "0" "$(wc -l <"$S/containers" | tr -d ' ')"
 if grep -q '^rm -f ' "$S/calls.log"; then ok "SIGTERM: cleanup called rm -f"; else ng "SIGTERM: cleanup called rm -f"; fi
 expect_eq "SIGTERM: no result emitted" "0" "$(wc -c <"$S/out.json" | tr -d ' ')"
+
+# --- compare.sh（削減率の算出。Docker 不要） ---
+CMP="${HERE}/compare.sh"
+# $1=target $2=condition $3=steps（JSON 配列）
+mk_result() {
+  jq -n --arg t "$1" --arg c "$2" --argjson steps "$3" '
+    {schema: "container-memory/v1", target: $t,
+     args: {image: "x", ready_timeout_s: 30, settle_s: 5, host_mem_limit_pct: 80, url: "https://example.com/", navigate_concurrency: 8},
+     image: {ref: "x", pinned_digest: null},
+     environment: {arch: "x86_64", kernel: "6.8.0", mem_total_bytes: 1024, cgroup_driver: "systemd"},
+     conditions: [{condition: $c, stop_reason: "completed", max_ok_n: null, steps: $steps}]}'
+}
+# $1=n $2=peak sum $3=current sum $4=complete $5=breakdown total
+mk_step() {
+  jq -n -c --argjson n "$1" --argjson p "$2" --argjson cur "$3" --argjson comp "${4:-true}" --argjson tot "${5:-0}" \
+    '{n: $n, complete: $comp, started: $n, measured: $n, breakdowns: {total: $tot},
+      memory_peak_bytes: {sum: $p}, memory_current_bytes: {sum: $cur}}'
+}
+CS="$TMP/cmp"
+mkdir -p "$CS"
+# 残り=compare.sh の引数。出力を $CS/out.json に残し終了コードを返す
+run_cmp() {
+  local rc=0
+  bash "$CMP" "$@" >"$CS/out.json" 2>"$CS/err" || rc=$?
+  return "$rc"
+}
+cmp_rc() { local name="$1" want="$2" got=0; shift 2; run_cmp "$@" || got=$?; expect_eq "$name" "$want" "$got"; }
+cmp_jq() { expect_eq "$1" "$2" "$(jq -r "$3" "$CS/out.json" 2>/dev/null || echo JQ_ERROR)"; }
+
+mk_result fandhe idle "[$(mk_step 100 500 400)]" >"$CS/f.json"
+mk_result chromium idle "[$(mk_step 100 1000 800)]" >"$CS/c.json"
+cmp_rc "compare: basic" 0 --fandhe "$CS/f.json" --chromium "$CS/c.json"
+cmp_jq "compare: comparable" "true" '.comparable'
+cmp_jq "compare: peak 500/1000 is 50.00" "50" '.comparisons[0].reduction_pct.memory_peak'
+cmp_jq "compare: current 400/800 is 50.00" "50" '.comparisons[0].reduction_pct.memory_current'
+cmp_jq "compare: schema" "container-memory-compare/v1" '.schema'
+cmp_jq "compare: reference CTR-3 met" "true" '.reference_thresholds.results[0].reference_threshold_met["CTR-3"]'
+cmp_jq "compare: reference CTR-6 not met" "false" '.reference_thresholds.results[0].reference_threshold_met["CTR-6"]'
+cmp_jq "compare: no extrapolation by default" "null" '.extrapolation'
+
+# 切り捨て（1/3 は 66.66。66.67 に丸めない）
+mk_result fandhe idle "[$(mk_step 100 1 1)]" >"$CS/f.json"
+mk_result chromium idle "[$(mk_step 100 3 3)]" >"$CS/c.json"
+cmp_rc "compare: floor" 0 --fandhe "$CS/f.json" --chromium "$CS/c.json"
+cmp_jq "compare: 1/3 floors to 66.66" "66.66" '.comparisons[0].reduction_pct.memory_peak'
+# fandhe の方が大きい場合は負の値のまま出す
+mk_result fandhe idle "[$(mk_step 100 1500 1500)]" >"$CS/f.json"
+mk_result chromium idle "[$(mk_step 100 1000 1000)]" >"$CS/c.json"
+cmp_rc "compare: negative" 0 --fandhe "$CS/f.json" --chromium "$CS/c.json"
+cmp_jq "compare: negative reduction" "-50" '.comparisons[0].reduction_pct.memory_peak'
+cmp_jq "compare: negative is not meeting thresholds" "false" '.reference_thresholds.results[0].reference_threshold_met["CTR-3"]'
+
+# 共通の N が無ければ理由だけを出し、数値を出さない
+mk_result fandhe idle "[$(mk_step 10 500 500)]" >"$CS/f.json"
+mk_result chromium idle "[$(mk_step 5 1000 1000)]" >"$CS/c.json"
+cmp_rc "compare: no common n" 0 --fandhe "$CS/f.json" --chromium "$CS/c.json"
+cmp_jq "compare: no common n: no numbers" "0" '[.comparisons[] | select(.reduction_pct != null)] | length'
+cmp_jq "compare: n=10 lacks chromium" "no_chromium_measurement_at_n" '.comparisons[] | select(.n == 10) | .reason'
+cmp_jq "compare: n=5 lacks fandhe" "no_fandhe_measurement_at_n" '.comparisons[] | select(.n == 5) | .reason'
+
+# 破綻・不完全・chromium のメモリ 0
+mk_result fandhe idle "[$(mk_step 10 500 500 false 0),$(mk_step 20 500 500 true 1),$(mk_step 30 500 500 true 0)]" >"$CS/f.json"
+mk_result chromium idle "[$(mk_step 10 1000 1000),$(mk_step 20 1000 1000),$(mk_step 30 1000 1000 false 0),$(mk_step 40 0 0)]" >"$CS/c.json"
+cmp_rc "compare: reasons" 0 --fandhe "$CS/f.json" --chromium "$CS/c.json"
+cmp_jq "compare: fandhe incomplete" "fandhe_step_incomplete" '.comparisons[] | select(.n == 10) | .reason'
+cmp_jq "compare: fandhe breakdown" "fandhe_breakdown" '.comparisons[] | select(.n == 20) | .reason'
+cmp_jq "compare: chromium incomplete" "chromium_step_incomplete" '.comparisons[] | select(.n == 30) | .reason'
+mk_result fandhe idle "[$(mk_step 40 10 10)]" >"$CS/f.json"
+cmp_rc "compare: chromium zero" 0 --fandhe "$CS/f.json" --chromium "$CS/c.json"
+cmp_jq "compare: chromium zero bytes" "chromium_zero_bytes" '.comparisons[] | select(.n == 40) | .reason'
+mk_result chromium idle "[$(mk_step 20 1000 1000 true 2)]" >"$CS/c.json"
+mk_result fandhe idle "[$(mk_step 20 500 500)]" >"$CS/f.json"
+cmp_rc "compare: chromium breakdown" 0 --fandhe "$CS/f.json" --chromium "$CS/c.json"
+cmp_jq "compare: chromium breakdown reason" "chromium_breakdown" '.comparisons[0].reason'
+
+# 環境・条件が食い違えば比較しない
+mk_result fandhe idle "[$(mk_step 100 500 500)]" >"$CS/f.json"
+mk_result chromium idle "[$(mk_step 100 1000 1000)]" >"$CS/c.json"
+for k in 'environment.kernel="6.9.0"' 'environment.arch="aarch64"' 'environment.mem_total_bytes=2048' \
+  'environment.cgroup_driver="cgroupfs"' 'args.ready_timeout_s=60' 'args.settle_s=1' 'args.host_mem_limit_pct=70'; do
+  jq --argjson v "${k#*=}" "(.${k%%=*}) = \$v" "$CS/c.json" >"$CS/c2.json"
+  cmp_rc "compare: mismatch ${k%%=*}" 0 --fandhe "$CS/f.json" --chromium "$CS/c2.json"
+  cmp_jq "compare: mismatch ${k%%=*} comparable=false" "false" '.comparable'
+  # shellcheck disable=SC2016 # jq 式の $x は jq 変数
+  cmp_jq "compare: mismatch ${k%%=*} reason" "${k%%=*}" '.reasons[0] | sub("^(environment|args)_mismatch:"; "") as $x | if startswith("environment") then "environment." + $x else "args." + $x end'
+  cmp_jq "compare: mismatch ${k%%=*} has no reductions" "0" '[.comparisons[] | select(.reduction_pct != null)] | length'
+done
+# loaded では url の食い違いも不一致。idle だけなら url は問わない
+mk_result fandhe loaded "[$(mk_step 100 500 500)]" >"$CS/f.json"
+mk_result chromium loaded "[$(mk_step 100 1000 1000)]" >"$CS/c.json"
+jq '.args.url = "https://example.org/"' "$CS/c.json" >"$CS/c2.json"
+cmp_rc "compare: url mismatch (loaded)" 0 --fandhe "$CS/f.json" --chromium "$CS/c2.json"
+cmp_jq "compare: url mismatch makes it incomparable" "args_mismatch:url" '.reasons[0]'
+jq '.args.navigate_concurrency = 64' "$CS/c.json" >"$CS/c2.json"
+cmp_rc "compare: navigate_concurrency mismatch (loaded)" 0 --fandhe "$CS/f.json" --chromium "$CS/c2.json"
+cmp_jq "compare: navigate_concurrency mismatch makes it incomparable" "args_mismatch:navigate_concurrency" '.reasons[0]'
+cmp_jq "compare: navigate_concurrency mismatch has no reductions" "0" '[.comparisons[] | select(.reduction_pct != null)] | length'
+cmp_rc "compare: loaded same url" 0 --fandhe "$CS/f.json" --chromium "$CS/c.json"
+cmp_jq "compare: loaded same url comparable" "true" '.comparable'
+mk_result fandhe idle "[$(mk_step 100 500 500)]" >"$CS/f.json"
+mk_result chromium loaded "[$(mk_step 100 1000 1000)]" >"$CS/c.json"
+cmp_rc "compare: no common condition" 0 --fandhe "$CS/f.json" --chromium "$CS/c.json"
+cmp_jq "compare: no common condition reason" "no_common_condition" '.reasons[0]'
+cmp_jq "compare: skipped conditions listed" "idle loaded" '.skipped_conditions | join(" ")'
+
+# 入力の検査（exit 2）
+mk_result fandhe idle "[$(mk_step 100 500 500)]" >"$CS/f.json"
+mk_result chromium idle "[$(mk_step 100 1000 1000)]" >"$CS/c.json"
+cmp_rc "compare: target swapped" 2 --fandhe "$CS/c.json" --chromium "$CS/f.json"
+cmp_rc "compare: both fandhe" 2 --fandhe "$CS/f.json" --chromium "$CS/f.json"
+jq 'del(.target)' "$CS/f.json" >"$CS/f-legacy.json"
+cmp_rc "compare: #929 output without target is fandhe" 0 --fandhe "$CS/f-legacy.json" --chromium "$CS/c.json"
+jq 'del(.target)' "$CS/c.json" >"$CS/c-legacy.json"
+cmp_rc "compare: chromium needs target" 2 --fandhe "$CS/f.json" --chromium "$CS/c-legacy.json"
+jq '.schema = "container-memory/v2"' "$CS/f.json" >"$CS/bad.json"
+cmp_rc "compare: bad schema" 2 --fandhe "$CS/bad.json" --chromium "$CS/c.json"
+printf 'not json' >"$CS/bad.json"
+cmp_rc "compare: not json" 2 --fandhe "$CS/bad.json" --chromium "$CS/c.json"
+jq '.conditions[0].steps[0].memory_peak_bytes.sum = "1"' "$CS/f.json" >"$CS/bad.json"
+cmp_rc "compare: string where number expected" 2 --fandhe "$CS/bad.json" --chromium "$CS/c.json"
+jq '.conditions[0].steps[0].memory_peak_bytes.sum = -5' "$CS/f.json" >"$CS/bad.json"
+cmp_rc "compare: negative bytes" 2 --fandhe "$CS/bad.json" --chromium "$CS/c.json"
+jq '.conditions += .conditions' "$CS/f.json" >"$CS/bad.json"
+cmp_rc "compare: duplicate condition" 2 --fandhe "$CS/bad.json" --chromium "$CS/c.json"
+for del in 'del(.environment.arch)' '.environment = {}' '.args = {}' 'del(.args.settle_s)' '.environment.mem_total_bytes = 0' \
+  '.args.host_mem_limit_pct = 0'; do
+  jq "$del" "$CS/f.json" >"$CS/bad.json"
+  cmp_rc "compare: missing required field [$del]" 2 --fandhe "$CS/bad.json" --chromium "$CS/c.json"
+done
+mk_result fandhe loaded "[$(mk_step 100 500 500)]" >"$CS/lf.json"
+mk_result chromium loaded "[$(mk_step 100 1000 1000)]" >"$CS/lc.json"
+for del in 'del(.args.url)' '.args.url = "file:///etc/passwd"' 'del(.args.navigate_concurrency)' '.args.navigate_concurrency = 0' '.args.navigate_concurrency = 65'; do
+  jq "$del" "$CS/lf.json" >"$CS/bad.json"
+  cmp_rc "compare: invalid loaded field [$del]" 2 --fandhe "$CS/bad.json" --chromium "$CS/lc.json"
+done
+# 不正なオブジェクトの後に正常なオブジェクトを連結した入力は拒否する（検証と計算の値のずれ防止）
+mk_result fandhe loaded "[$(mk_step 100 500 500)]" >"$CS/f.json"
+mk_result chromium loaded "[$(mk_step 100 1000 1000)]" >"$CS/c.json"
+{ jq '.target = "bogus"' "$CS/c.json"; cat "$CS/c.json"; } >"$CS/c-multi.json"
+cmp_rc "compare: concatenated JSON values (chromium)" 2 --fandhe "$CS/f.json" --chromium "$CS/c-multi.json"
+{ jq '.step = 1' "$CS/f.json" | jq '.conditions[0].steps[0].memory_peak_bytes.sum = -1'; cat "$CS/f.json"; } >"$CS/f-multi.json"
+cmp_rc "compare: concatenated JSON values (fandhe)" 2 --fandhe "$CS/f-multi.json" --chromium "$CS/c.json"
+cmp_rc "compare: missing file" 2 --fandhe "$CS/none.json" --chromium "$CS/c.json"
+cmp_rc "compare: missing --chromium" 2 --fandhe "$CS/f.json"
+cmp_rc "compare: unknown option" 2 --bogus
+cmp_rc "compare: bad poc1" 2 --fandhe "$CS/f.json" --chromium "$CS/c.json" --poc1-chromium-per-instance-bytes "1;x"
+cmp_rc "compare: bad poc8" 2 --fandhe "$CS/f.json" --chromium "$CS/c.json" --poc8-fandhe-n100-bytes 0
+
+# 外挿値は引数があるときだけ別オブジェクトに出し、削減率に影響しない
+cmp_rc "compare: baseline for extrapolation" 0 --fandhe "$CS/f.json" --chromium "$CS/c.json"
+BASE_RED=$(jq -c '.comparisons[0].reduction_pct' "$CS/out.json")
+cmp_rc "compare: with extrapolation" 0 --fandhe "$CS/f.json" --chromium "$CS/c.json" \
+  --poc1-chromium-per-instance-bytes 8 --poc8-fandhe-n100-bytes 400
+cmp_jq "compare: extrapolation kind" "extrapolated" '.extrapolation.kind'
+cmp_jq "compare: extrapolation does not change reduction" "$BASE_RED" '.comparisons[0].reduction_pct | tojson'
+cmp_jq "compare: PoC-1 extrapolated bytes" "800" '.extrapolation.poc1_chromium.rows[0].chromium_extrapolated_bytes'
+cmp_jq "compare: PoC-1 measured minus extrapolated" "25" '.extrapolation.poc1_chromium.rows[0].measured_minus_extrapolated_pct'
+cmp_jq "compare: PoC-8 measured minus extrapolated" "25" '.extrapolation.poc8_fandhe.rows[0].measured_minus_extrapolated_pct'
+cmp_rc "compare: only PoC-1" 0 --fandhe "$CS/f.json" --chromium "$CS/c.json" --poc1-chromium-per-instance-bytes 8
+cmp_jq "compare: extrapolation only PoC-1" "null" '.extrapolation.poc8_fandhe'
+# --out は一時ファイル経由
+cmp_rc "compare: --out" 0 --fandhe "$CS/f.json" --chromium "$CS/c.json" --out "$CS/res.json"
+expect_eq "compare: --out writes the file" "container-memory-compare/v1" "$(jq -r .schema "$CS/res.json")"
+expect_eq "compare: --out leaves stdout empty" "0" "$(wc -c <"$CS/out.json" | tr -d ' ')"
+expect_eq "compare: --out leaves no temp files" "1" "$(find "$CS" -maxdepth 1 -name 'res.json*' | wc -l | tr -d ' ')"
 
 # --- navigate.mjs の構文 ---
 if command -v node >/dev/null 2>&1; then

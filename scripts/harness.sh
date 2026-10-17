@@ -15,7 +15,8 @@
 #   measure-js-binary-size   JS エンジン構成別バイナリサイズ計測（JS-3・PERF-1。要 jq）
 #   measure-container-size   既定・軽量コンテナと比較対象（Playwright 公式）のイメージサイズ計測（CTR-1・CTR-5。要 docker・jq）
 #   check-container-memory   コンテナ同時起動の集約メモリ測定スクリプトの自己テスト（TASK-67・CTR-3・CTR-7。Linux のみ。要 jq）
-#   measure-container-memory コンテナを N 個同時起動したときの集約メモリ測定（TASK-67。Linux のみ。要 docker・jq・cgroup v2）
+#   measure-container-memory コンテナを N 個同時起動したときの集約メモリ測定（TASK-67。Linux のみ。要 docker・jq・cgroup v2。`--target chromium` で比較対象の Chromium も測る）
+#   compare-container-memory 2 つの測定結果 JSON から同じ N・同じ条件での削減率を算出（TASK-67・CTR-3・CTR-6。要 jq。docker 不要）
 #   check-container-smoke    コンテナ（軽量 / 既定）でローカルフィクスチャ 12 種の代表タスクを確認（CTR-2。要 docker・jq）
 #   check-container-js-smoke 既定コンテナ内で V8（musl）の JS 実行を確認（TASK-66.3・CTR-2。要 docker・node）
 #   measure-cssom-profile-cost  CSSOM プロファイル読み込みのコスト計測（PLUG-8。要 jq）
@@ -26,7 +27,7 @@
 # 上書き可能な環境変数（`make <target> VAR=value` も可）: BINARY_SIZE_PACKAGE・BINARY_SIZE_LIMIT_BYTES・
 # JS_BINARY_SIZE_STRIP（非空で --strip）・CSSOM_PROFILE_COST_ARGS・MCP_ENVELOPE_ARGS・
 # CONTAINER_SIZE_REFERENCE_IMAGE・CONTAINER_SIZE_REFERENCE_DIGEST・CONTAINER_SIZE_DEFAULT_IMAGE・
-# CONTAINER_MEMORY_ARGS（空白区切りの追加引数）・CONTAINER_MEMORY_HELPER_IMAGE・CONTAINER_MEMORY_HELPER_DIGEST・
+# CONTAINER_MEMORY_ARGS（空白区切りの追加引数）・CONTAINER_MEMORY_COMPARE_ARGS（同・compare 用）・CONTAINER_MEMORY_HELPER_IMAGE・CONTAINER_MEMORY_HELPER_DIGEST・
 # CONTAINER_SIZE_LITE_IMAGE・CONTAINER_SIZE_PLATFORM・CONTAINER_SIZE_SKIP_BUILD・CONTAINER_SIZE_NO_PULL（非空で有効）・
 # CONTAINER_SMOKE_ROLE（lite|default）・CONTAINER_SMOKE_IMAGE・CONTAINER_SMOKE_PLATFORM・CONTAINER_SMOKE_SKIP_BUILD（非空で有効）・CONTAINER_SMOKE_TASK_TIMEOUT・
 # CONTAINER_JS_SMOKE_IMAGE・CONTAINER_JS_SMOKE_PLATFORM・CONTAINER_JS_SMOKE_SKIP_BUILD（非空で有効）・CONTAINER_JS_SMOKE_CASE_TIMEOUT・
@@ -50,6 +51,7 @@ name="$1"
 : "${CONTAINER_SIZE_SKIP_BUILD:=}"
 : "${CONTAINER_SIZE_NO_PULL:=}"
 : "${CONTAINER_MEMORY_ARGS:=}"
+: "${CONTAINER_MEMORY_COMPARE_ARGS:=}"
 : "${CONTAINER_SMOKE_ROLE:=lite}"
 : "${CONTAINER_SMOKE_IMAGE:=}"
 : "${CONTAINER_SMOKE_PLATFORM:=}"
@@ -268,7 +270,17 @@ case "${name}" in
     bash harness/container-memory/measure.sh \
       --helper-image "${CONTAINER_MEMORY_HELPER_IMAGE}" \
       --helper-digest "${CONTAINER_MEMORY_HELPER_DIGEST}" \
+      --reference-image "${CONTAINER_SIZE_REFERENCE_IMAGE}" \
+      --reference-digest "${CONTAINER_SIZE_REFERENCE_DIGEST}" \
       ${CONTAINER_MEMORY_ARGS}
+    ;;
+  compare-container-memory)
+    # 実測済みの 2 つの結果 JSON を比較する（--fandhe・--chromium は CONTAINER_MEMORY_COMPARE_ARGS で渡す）。
+    # compare.sh は jq のみで動く（Docker・Linux 不要）。compare 側の自己テストは Linux 専用の
+    # check-container-memory（self-test.sh）に含まれるため、macOS・Windows でも比較できるようここでは呼ばない。
+    require_cmd jq "required by ${name}"
+    # shellcheck disable=SC2086 # 引数文字列は意図的に単語分割する
+    bash harness/container-memory/compare.sh ${CONTAINER_MEMORY_COMPARE_ARGS}
     ;;
   check-container-smoke)
     # docker build（release）と実コンテナ起動を伴うため `make ci` には含めない（TASK-66.1・TASK-66.2・CTR-2。既定コンテナは CONTAINER_SMOKE_ROLE=default）。
