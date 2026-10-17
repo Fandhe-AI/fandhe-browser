@@ -17,8 +17,9 @@
 #![allow(clippy::type_complexity)]
 
 use fandhe_browser_js::{
-    CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsEngineError, JsValue,
-    NativeCallContext, NativeFn, ObjectHandle, bundled_engines, create_engine,
+    CreateEngineError, DynamicImportId, DynamicImportRequest, EngineKind, EvaluateOptions,
+    JsEngine, JsEngineError, JsValue, ModuleEvaluation, ModuleId, ModuleRecord, ModuleRequest,
+    ModuleResolution, NativeCallContext, NativeFn, ObjectHandle, bundled_engines, create_engine,
     run_js_worker_if_requested,
 };
 
@@ -33,6 +34,23 @@ fn js_1_public_signatures_are_pinned_without_v8_types() {
     let _: fn() -> Option<std::process::ExitCode> = run_js_worker_if_requested;
     let _: fn(u32) -> ObjectHandle = ObjectHandle::from_raw;
     let _: fn(ObjectHandle) -> u32 = ObjectHandle::raw;
+    let _: fn(u32) -> ModuleId = ModuleId::from_raw;
+    let _: fn(ModuleId) -> u32 = ModuleId::raw;
+    let _: fn(u32) -> DynamicImportId = DynamicImportId::from_raw;
+    let _: fn(DynamicImportId) -> u32 = DynamicImportId::raw;
+    let _: fn(String) -> ModuleRequest = ModuleRequest::new;
+    let _: fn(&ModuleRequest) -> &str = ModuleRequest::specifier;
+    let _: fn(ModuleId, Vec<ModuleRequest>) -> ModuleRecord = ModuleRecord::new;
+    let _: fn(&ModuleRecord) -> ModuleId = ModuleRecord::id;
+    let _: fn(&ModuleRecord) -> &[ModuleRequest] = ModuleRecord::requests;
+    let _: fn(String, ModuleId) -> ModuleResolution = ModuleResolution::new;
+    let _: fn(&ModuleResolution) -> &str = ModuleResolution::specifier;
+    let _: fn(&ModuleResolution) -> ModuleId = ModuleResolution::target;
+    let _: fn(DynamicImportId, Option<ModuleId>, String) -> DynamicImportRequest =
+        DynamicImportRequest::new;
+    let _: fn(&DynamicImportRequest) -> DynamicImportId = DynamicImportRequest::id;
+    let _: fn(&DynamicImportRequest) -> Option<ModuleId> = DynamicImportRequest::referrer;
+    let _: fn(&DynamicImportRequest) -> &str = DynamicImportRequest::specifier;
     let _: fn(
         std::time::Instant,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -60,6 +78,15 @@ fn js_1_public_signatures_are_pinned_without_v8_types() {
         let _: Result<(), JsEngineError> = engine.inject_global_function("", func);
         let _: Result<(), JsEngineError> =
             engine.bind_dom_like_object("", Vec::<(String, NativeFn)>::new());
+        let _: Result<ModuleRecord, JsEngineError> = engine.compile_module("", "");
+        let _: Result<(), JsEngineError> =
+            engine.link_module(ModuleId::from_raw(0), &[] as &[ModuleResolution]);
+        let _: Result<ModuleEvaluation, JsEngineError> =
+            engine.evaluate_module(ModuleId::from_raw(0), options);
+        let _: Result<Vec<DynamicImportRequest>, JsEngineError> =
+            engine.take_dynamic_import_requests();
+        let _: Result<(), JsEngineError> =
+            engine.finish_dynamic_import(DynamicImportId::from_raw(0), Err(String::new()));
     }
 
     // 具体値の検査（テストとして実体を持たせる）。
@@ -76,7 +103,9 @@ fn js_1_public_enum_payloads_are_v8_free() {
         | JsEngineError::BindingFailed(m)
         | JsEngineError::ResourceLimitExceeded(m)
         | JsEngineError::Timeout(m)
-        | JsEngineError::EngineUnavailable(m) => {
+        | JsEngineError::EngineUnavailable(m)
+        | JsEngineError::ModuleResolutionFailed(m)
+        | JsEngineError::NotYetImplemented(m) => {
             let m: &String = m;
             assert_eq!(m, "t");
         }
@@ -95,6 +124,17 @@ fn js_1_public_enum_payloads_are_v8_free() {
             assert_eq!(*requested, EngineKind::V8);
         }
         _ => unreachable!("CreateEngineError is #[non_exhaustive]"),
+    }
+
+    let _: fn(String) -> ModuleEvaluation = ModuleEvaluation::rejected;
+    let evaluation = ModuleEvaluation::rejected("r".to_string());
+    match &evaluation {
+        ModuleEvaluation::Fulfilled | ModuleEvaluation::Pending => {}
+        ModuleEvaluation::Rejected { message, .. } => {
+            let message: &String = message;
+            assert_eq!(message, "r");
+        }
+        _ => unreachable!("ModuleEvaluation is #[non_exhaustive]"),
     }
 
     let value = JsValue::String("s".to_string());
