@@ -379,16 +379,25 @@ trap 'for p in ${FAKE_PIDS[@]+"${FAKE_PIDS[@]}"}; do kill "$p" 2>/dev/null || tr
 # 上限の根拠: Windows ランナーで node の起動に 5 秒を超えた実例がある（#938。旧上限 5 秒で 31 件が連鎖失敗した）。
 # 取得できない場合（上限超過・偽サーバーの早期終了・数字でない出力）は FAIL を 1 件数えて FAKE_PORT を空にする。
 # 後続ケースはそのまま走るため、原因の行が連鎖失敗より先に出る。
+# #956: run_core synthetic の接続失敗（Windows）は CI ログ上、偽サーバー側は健全で（約 4 秒後に同じサーバーで 22 件が通った）、
+# クライアント側 probe（単発 1.5 秒の fetch）の誤判定が有力と切り分けた。次回の再発を確定できるよう、偽サーバーの
+# stderr を FAKE_ERR に残し、待ち時間を info 行へ出す（失敗時は dump_fake_diag が使う）。
+FAKE_PID=""
+FAKE_ERR=""
 start_fake() {
-  local portfile="$WORK/fake.port.$RANDOM" pid
-  "$NODE_BIN" "$FAKE" "$@" >"$portfile" &
+  local portfile="$WORK/fake.port.$RANDOM" pid tries=0
+  FAKE_ERR="$portfile.err"
+  "$NODE_BIN" "$FAKE" "$@" >"$portfile" 2>"$FAKE_ERR" &
   pid=$!
+  FAKE_PID="$pid"
   FAKE_PIDS+=("$pid")
   for _ in $(seq 1 300); do
     [ -s "$portfile" ] && break
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.1
+    tries=$((tries + 1))
   done
+  echo "info [start_fake]: waited=$((tries * 100))ms args: $*"
   FAKE_PORT="$(tr -d '\r\n' <"$portfile")"
   case "$FAKE_PORT" in
     '' | *[!0-9]*)
@@ -397,6 +406,32 @@ start_fake() {
       FAKE_PORT=""
       ;;
   esac
+}
+# dump_fake_diag <pid> <port> <errfile>: 接続失敗時の切り分け材料を stderr へ出す（FAIL の件数は変えない。#956）。
+# 偽サーバーの生存・stderr 末尾・ポートの状態・自己テストとは独立した probe 1 回の結果を並べる。
+# 偽サーバーの出力は制御文字を除き行数を抑える（::error:: 風の文字列による CI ログ注入の防止）。
+dump_fake_diag() {
+  local pid="$1" port="$2" errfile="$3"
+  case "$port" in '' | *[!0-9]*) echo "diag: no numeric port" >&2; return 0 ;; esac
+  {
+    echo "diag [fake server]: pid=$pid alive=$(kill -0 "$pid" 2>/dev/null && echo yes || echo no)"
+    echo "diag [fake stderr tail]:"
+    tail -n 20 "$errfile" 2>/dev/null | tr -d '\000-\010\013-\037\177' | cut -c1-200 || true
+    echo "diag [port state]:"
+    case "$(uname -s)" in
+      MINGW* | MSYS* | CYGWIN*) netstat -ano 2>/dev/null | grep ":$port " | head -n 10 || echo "(no netstat match)" ;;
+      *)
+        if type -P ss >/dev/null 2>&1; then ss -ltn 2>/dev/null | grep ":$port " | head -n 10 || echo "(no ss match)"; else echo "(ss unavailable)"; fi ;;
+    esac
+    echo "diag [independent probe]:"
+    "$NODE_BIN" -e '
+const t = Date.now();
+const done = (m) => { console.log(m + " in " + (Date.now() - t) + "ms"); process.exit(0); };
+const req = require("node:http").get("http://127.0.0.1:" + process.argv[1] + "/json/version", (res) => { res.resume(); done("status " + res.statusCode); });
+req.on("error", (e) => done("error " + String((e && e.code) || "unknown").replace(/[^A-Za-z0-9_]/g, "").slice(0, 64)));
+setTimeout(() => done("timeout"), 5000);
+' "$port" 2>&1 | head -n 3 | tr -d '\000-\010\013-\037\177' | cut -c1-200 || true
+  } >&2
 }
 rc_task() { printf '{"id":"%s","cat":"%s","url":"%s","selector":"%s","kind":"%s"}' "$1" "$2" "$3" "$4" "$5"; }
 
@@ -433,7 +468,9 @@ else
     printf '%s,' "$(rc_task t9 form "$U/h" emptyform form)"
     printf '%s]\n' "$(rc_task t10 static "$U/i" ctl text)"
   } >"$WORK/rc.json"
+  SYN_FAIL0=$FAILURES
   expect_exit "run_core synthetic" 0 bash "$RUN_CORE" --no-spawn --endpoint "$EP" --tasks "$WORK/rc.json" --out "$WORK/rc.out.jsonl"
+  [ "$FAILURES" -eq "$SYN_FAIL0" ] || dump_fake_diag "$FAKE_PID" "$FAKE_PORT" "$FAKE_ERR"
   expect_contains "$LAST_OUTPUT" "success=4/10" "run_core success count"
   # 進捗出力にページ由来テキスト（::error:: 風）が出ない
   expect_eq "$(printf '%s' "$LAST_OUTPUT" | grep -c '::error::' || true)" "0" "run_core progress has no page text"
@@ -492,8 +529,16 @@ EARLY
 
   # 出力の原子性: 失敗時は既存の --out を壊さない
   printf 'KEEP\n' >"$WORK/keep.jsonl"
-  expect_exit "run_core no endpoint" 2 bash "$RUN_CORE" --no-spawn --endpoint "http://127.0.0.1:1" --out "$WORK/keep.jsonl"
+  expect_exit "run_core no endpoint" 2 bash "$RUN_CORE" --no-spawn --endpoint "http://127.0.0.1:1" --startup-timeout 3 --out "$WORK/keep.jsonl"
+  expect_contains "$LAST_OUTPUT" "endpoint is not responding" "run_core no endpoint message"
+  expect_contains "$LAST_OUTPUT" "last=" "run_core no endpoint reports last reason"
   expect_eq "$(cat "$WORK/keep.jsonl")" "KEEP" "run_core keeps existing out on failure"
+
+  # 応答しないサーバーでは成功を装わず、予算内で再試行して失敗する（#956 受入基準 3）
+  start_fake --hang-http
+  expect_exit "run_core hang endpoint" 2 bash "$RUN_CORE" --no-spawn --endpoint "http://127.0.0.1:$FAKE_PORT" --startup-timeout 2 --out "$WORK/keep.jsonl"
+  expect_contains "$LAST_OUTPUT" "last=timeout" "run_core hang endpoint reports timeout"
+  expect_eq "$(cat "$WORK/keep.jsonl")" "KEEP" "run_core hang keeps existing out"
 
   # webSocketDebuggerUrl のホスト/ポートが endpoint と一致しなければ接続しない
   start_fake --ws-host-mismatch
@@ -540,7 +585,7 @@ STUB
       expect_exit "run_core --page-js with --no-spawn" 2 bash "$RUN_CORE" --page-js v8 --no-spawn --out "$WORK/sp_n.jsonl"
       expect_exit "run_core --log relative" 2 bash "$RUN_CORE" --log relative.log --bin "$STUB_BIN/ok" --out "$WORK/sp_r.jsonl"
       expect_exit "run_core --log with --no-spawn" 2 bash "$RUN_CORE" --log "$WORK/x.log" --no-spawn --out "$WORK/sp_l.jsonl"
-      expect_exit "run_core child stopped" 2 bash "$RUN_CORE" --no-spawn --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp2.jsonl"
+      expect_exit "run_core child stopped" 2 bash "$RUN_CORE" --no-spawn --endpoint "http://127.0.0.1:$RC_PORT" --startup-timeout 3 --out "$WORK/sp2.jsonl"
       expect_exit "run_core startup timeout" 2 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/never" --endpoint "http://127.0.0.1:$RC_PORT" --startup-timeout 1 --out "$WORK/sp3.jsonl"
       expect_contains "$LAST_OUTPUT" "did not become ready" "run_core startup timeout message"
       expect_exit "run_core binary dies" 2 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/dies" --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp4.jsonl"
