@@ -531,8 +531,11 @@ mod tests {
             validate_output_path(Path::new("")).unwrap_err(),
             OutputPathError::Empty
         ));
+        // Windows の verbatim パスへ `join("..")` すると `..` が正規化されて親ディレクトリになるため、
+        // 文字列で連結して `..` 終端のパスを組み立てる。
+        let dotdot = PathBuf::from(format!("{}{MAIN_SEPARATOR}..", dir.owned.display()));
         assert!(matches!(
-            validate_output_path(&dir.owned.join("..")).unwrap_err(),
+            validate_output_path(&dotdot).unwrap_err(),
             OutputPathError::NotAFilePath
         ));
         let trailing = format!("{}{MAIN_SEPARATOR}x{MAIN_SEPARATOR}", dir.owned.display());
