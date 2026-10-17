@@ -1164,8 +1164,18 @@ const PS_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(target_os = "macos")]
 const PS_ABSOLUTE_PATH: &str = "/bin/ps";
 
-/// macOS: `ps -o rss= -p <pid>` の出力（キロバイト単位）を読む。macOS には
-/// Linux の `/proc` に相当する軽量な読み取り経路が無いため、外部コマンド
+/// macOS: `ps -o rss= -p <pid>` の出力（キロバイト単位）を読む。
+///
+/// **コストに関する既知の制限（`JS-6`・`PERF-7`・TASK-113・Issue #905）**:
+/// 1 回ごとにプロセスを起動するため、Linux（`/proc` 読み取り）・Windows
+/// （`GetProcessMemoryInfo`）より桁違いに重い。応答直後の同期確認
+/// （`process_engine::apply_post_response_rss_check`）が評価ごとにこれを呼ぶので、
+/// macOS のページ JS 実行の往復遅延の主因である疑いがある（帰属は
+/// `tests/v8_worker.rs` の `[js-roundtrip-diag]` 行で計測する）。
+/// 解消案は `proc_pidinfo(PROC_PIDTASKINFO)` による FFI 読み取りだが、`libc` の
+/// 直接依存と `unsafe` の新規追加が要るため、オーナー承認待ちで未実装。
+///
+/// macOS には Linux の `/proc` に相当する軽量な読み取り経路が無いため、外部コマンド
 /// を都度起動する（モジュール冒頭の表が説明するとおり、macOS では本関数
 /// が唯一の防衛線であるため、コストより確実性を優先する）。`ps` は
 /// [`PS_ABSOLUTE_PATH`]（絶対パス）で起動し、`PATH` の設定には依存しない。
@@ -1183,15 +1193,23 @@ fn read_rss_macos(pid: u32) -> Option<u64> {
         .spawn()
         .ok()?;
 
+    // 待ちは 1 ms から倍々に伸ばし 10 ms で頭打ちにする。固定 10 ms だと
+    // 数 ms で終わる `ps` でも毎回 10 ms 近く余計に待つため（`JS-6`・`PERF-7`・
+    // Issue #905）。`ps` の起動コスト自体はこれでは消えない。
     let deadline = Instant::now() + PS_TIMEOUT;
     let mut exit_status = None;
+    let mut step = Duration::from_millis(1);
     while Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(status)) => {
                 exit_status = Some(status);
                 break;
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(step.min(remaining));
+                step = (step * 2).min(Duration::from_millis(10));
+            }
             Err(_) => break,
         }
     }

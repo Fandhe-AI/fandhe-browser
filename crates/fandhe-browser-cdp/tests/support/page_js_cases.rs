@@ -184,6 +184,12 @@ fn handle_with_run(engine: &str, allow_loopback: bool, run: PageRunOptions) -> P
 /// （macOS ランナー等）では既定の script 2 秒 / page 5 秒に先に当たり、件数上限より先に
 /// `WallTime` で中断される（JS-6）。実時間上限だけを緩め、検証対象の上限は既定のままにする。
 /// 実時間上限そのものを検証するケース（無限ループ・累積時間）では使わない。
+///
+/// 遅さの原因の疑い（`JS-6`・`PERF-7`・TASK-113・Issue #905）: macOS では子の RSS 確認が
+/// 評価ごとに `/bin/ps` を同期起動する（`fandhe-browser-js` の `read_rss_macos`）。
+/// `proc_pidinfo` 方式への置き換え（依存追加と `unsafe` の承認待ち）が入り、macOS の実測で
+/// 既定の page 5 秒にタイマー 1000 回が収まると確認できるまで、この緩和は外さない。
+/// アサーション自体は弱めない。
 fn limit_handle(engine: &str, allow_loopback: bool) -> PageScriptHandle {
     handle_with_run(
         engine,
