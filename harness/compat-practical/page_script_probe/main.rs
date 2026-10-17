@@ -56,8 +56,11 @@ fn main() -> ExitCode {
 }
 
 /// `h1` 要素の件数（grep ではなく本実装のパーサーとセレクタで数える）。
+/// スクリプト実行用の解析と条件を揃えるため scripting 有効で解析する
+/// （無効だと `<noscript>` 内の `h1` が要素として数えられ、実行後の件数とずれる）。
 fn count_h1(html: &str) -> Option<u64> {
-    let parsed = parse_document(html, &ParseOptions::default()).ok()?;
+    let parsed =
+        parse_document(html, &ParseOptions::default().with_scripting_enabled(true)).ok()?;
     let doc = parsed.document;
     let found = query_selector_all_str(&doc, doc.root(), "h1").ok()?;
     Some(found.len() as u64)
