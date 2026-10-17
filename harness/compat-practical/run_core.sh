@@ -148,6 +148,8 @@ wait_ready_no_spawn() {
     # 期限超過（7）は直前の実際の失敗理由を隠さない（試行せず打ち切った場合は last を保持する）
     if [ "$rc" -ne 7 ] || [ -z "$last" ]; then last="$PROBE_REASON"; fi
     if [ "$rc" -ne 4 ] && [ "$rc" -ne 6 ]; then break; fi
+    # 予算を使い切った後は待たずに打ち切る（last を確実に実際の失敗理由のまま報告する）
+    node -e 'process.exit(Date.now() >= Number(process.argv[1]) ? 0 : 1)' "$deadline" && break
     sleep 0.3
   done
   die "endpoint is not responding: $ENDPOINT (attempts=$attempts, elapsed=$((SECONDS - start))s, last=${last:-unknown})"
