@@ -581,6 +581,8 @@ impl Profile {
     /// - 既に別の `Profile` が同じルートの `profile.lock` を保持している場合
     ///   [`ProfileError::Locked`]（この場合データ種別ディレクトリは一切
     ///   作成・変更しない）
+    ///   （祖先またはルート自身が symlink のために拒否した場合、理由は実体パスの
+    ///   指定を促す固定文言になる。`PROF-1`・`PROF-4`・#1089）
     /// - Windows で `%LOCALAPPDATA%` 配下でないルート（既知フォルダの取得失敗・
     ///   判定不能を含む）、およびその他のプラットフォームでは [`ProfileError::Unsupported`]
     ///   （何も作成しない）
@@ -1906,6 +1908,41 @@ fn open_or_create_child_dir(
     }
 }
 
+/// 祖先走査（[`open_dir_all_verified`]）で symlink が原因の拒否になったときに
+/// 表示する理由（パスを含まない固定文言）。CLI の `--profile-dir` が表示して
+/// 利用者に実体パスの指定を促す（`PROF-1`・`PROF-4`・`CLI-1`・#1089）。
+#[cfg(unix)]
+pub(crate) const SYMLINK_COMPONENT_REASON: &str = "a path component is a symlink; specify the real path without symlinks (on macOS, /tmp and /var are symlinks: use /private/tmp or /private/var)";
+
+/// 拒否済みの `InvalidLayout` の理由を、対象が symlink なら
+/// [`SYMLINK_COMPONENT_REASON`] へ差し替える（診断専用）。
+///
+/// `NOFOLLOW` 付き `openat` が symlink に返す errno は `ELOOP` ではなく
+/// `ENOTDIR` で、通常ファイルと区別できないため、親ハンドル相対の
+/// `fstatat(AT_SYMLINK_NOFOLLOW)` で種別だけ確かめる。拒否は直前の `openat` で
+/// 確定済みで、`statat` との間に差し替えられても変わるのは文言だけであり、
+/// 境界の判定・作成・パス再解決は行わない。判定不能なら元のエラーを返す
+/// （fail-closed。`PROF-1`・`PROF-4`・#1089）。
+#[cfg(unix)]
+fn refine_symlink_rejection(
+    parent: &OwnedFd,
+    name: &std::ffi::OsStr,
+    err: ProfileError,
+) -> ProfileError {
+    match err {
+        ProfileError::InvalidLayout { path, .. }
+            if rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|st| FileType::from_raw_mode(st.st_mode) == FileType::Symlink) =>
+        {
+            ProfileError::InvalidLayout {
+                path,
+                reason: SYMLINK_COMPONENT_REASON,
+            }
+        }
+        other => other,
+    }
+}
+
 /// `path` の祖先をファイルシステムのルート（絶対パスの場合）または
 /// カレントディレクトリ（相対パスの場合）から順にハンドルで辿り、必要な
 /// 中間ディレクトリを作成しながら `path` 自身のディレクトリハンドルを返す
@@ -1954,7 +1991,10 @@ fn open_dir_all_verified(path: &Path) -> Result<OwnedFd, ProfileError> {
         match component {
             Component::Normal(name) => {
                 display_path.push(name);
-                current = open_or_create_child_dir(&current, name, &display_path)?;
+                current = match open_or_create_child_dir(&current, name, &display_path) {
+                    Ok(fd) => fd,
+                    Err(err) => return Err(refine_symlink_rejection(&current, name, err)),
+                };
             }
             Component::ParentDir => {
                 display_path.push("..");
@@ -3157,6 +3197,79 @@ mod tests {
             0,
             "配下外に作られた"
         );
+    }
+
+    /// `PROF-4`・#1089: 祖先の symlink は実体パスを案内する理由で拒否し、何も作らない。
+    #[cfg(unix)]
+    #[test]
+    fn prof_4_open_rejects_symlink_ancestor_with_real_path_hint() {
+        let tmp = TempDir::new();
+        std::fs::create_dir_all(tmp.path().join("real")).unwrap();
+        std::os::unix::fs::symlink("real", tmp.path().join("link")).unwrap();
+        let err = Profile::open(tmp.path().join("link").join("p"))
+            .err()
+            .unwrap();
+        match err {
+            ProfileError::InvalidLayout { path, reason } => {
+                assert_eq!(path, tmp.path().join("link"));
+                assert_eq!(reason, SYMLINK_COMPONENT_REASON);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(!tmp.path().join("real").join("p").exists());
+    }
+
+    /// `PROF-4`・#1089: ルート自身が symlink でも同じ理由で拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn prof_4_open_rejects_symlink_root_with_real_path_hint() {
+        let tmp = TempDir::new();
+        std::fs::create_dir_all(tmp.path().join("real")).unwrap();
+        std::os::unix::fs::symlink("real", tmp.path().join("link")).unwrap();
+        let err = Profile::open(tmp.path().join("link")).err().unwrap();
+        match err {
+            ProfileError::InvalidLayout { path, reason } => {
+                assert_eq!(path, tmp.path().join("link"));
+                assert_eq!(reason, SYMLINK_COMPONENT_REASON);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join("real")).unwrap().count(),
+            0
+        );
+    }
+
+    /// `PROF-4`・#1089: 通常ファイルが途中にある場合は従来の理由のまま（誤分類しない）。
+    #[cfg(unix)]
+    #[test]
+    fn prof_4_open_regular_file_component_keeps_not_a_directory_reason() {
+        let tmp = TempDir::new();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("file"), b"x").unwrap();
+        let err = Profile::open(tmp.path().join("file").join("p"))
+            .err()
+            .unwrap();
+        match err {
+            ProfileError::InvalidLayout { reason, .. } => {
+                assert_eq!(reason, "path exists but is not a directory");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// `PROF-4`・#1089（macOS）: `/tmp` は `/private/tmp` への symlink のため案内付きで拒否する。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prof_4_macos_tmp_path_is_rejected_with_real_path_hint() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let p = PathBuf::from(format!("/tmp/fandhe-1089-{}-{n}/p", std::process::id()));
+        match Profile::open(&p).err().unwrap() {
+            ProfileError::InvalidLayout { reason, .. } => {
+                assert_eq!(reason, SYMLINK_COMPONENT_REASON);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     /// PROF-4: PoC-7（`docs/spec/03-poc/profile-isolation/profile-proto`）が
