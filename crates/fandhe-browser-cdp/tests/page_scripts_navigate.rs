@@ -103,9 +103,7 @@ mod cases {
     }
 
     pub fn run() {
-        let base = std::env::temp_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::temp_dir());
+        let base = fandhe_browser_profile::test_base_dir();
         let dir = base.join(format!("fandhe-cdp-page-scripts-{}", std::process::id()));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

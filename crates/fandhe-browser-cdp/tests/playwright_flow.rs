@@ -14,9 +14,7 @@
 //! セレクタ段階の期待値（テキスト・属性）は `harness/playwright-connect/stages.mjs` の
 //! `FIXTURE_EXPECT` と同じ値で、不一致は JS 側の `SelectorMismatch` として段階失敗になる。
 //!
-//! `Profile::open` が非 unix で `Unsupported` を返す仕様のため `#[cfg(unix)]`。
-
-#![cfg(unix)]
+//! `Profile::open` は Windows でも `%LOCALAPPDATA%` 配下なら成功するため 3 OS 共通（Issue #955）。
 
 mod script_harness;
 

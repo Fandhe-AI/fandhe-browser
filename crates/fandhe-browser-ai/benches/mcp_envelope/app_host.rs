@@ -28,8 +28,7 @@ impl TempDir {
             .map_or(0, |d| d.as_nanos());
         // Profile::open は root 経路上の symlink を拒否する（macOS の /var -> /private/var 等）ため、
         // 既存の一時ディレクトリを事前に実体パスへ解決する（profile 側の検査は緩めない。PROF 境界）。
-        let tmp = std::env::temp_dir();
-        let base = std::fs::canonicalize(&tmp).unwrap_or(tmp);
+        let base = fandhe_browser_profile::test_base_dir();
         Self(base.join(format!(
             "fandhe-mcp-envelope-{}-{n}-{nanos}",
             std::process::id()

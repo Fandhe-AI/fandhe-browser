@@ -1491,9 +1491,6 @@ mod tests {
         assert_eq!(nav.latest().unwrap().url(), "about:blank");
     }
 
-    // CdpState は AppState（Profile::open）が必要で非 unix では構築手段が無いため unix 限定
-    // （protocol.rs の `mod dispatch` と同じ理由）。
-    #[cfg(unix)]
     mod dispatch {
         use super::*;
         use crate::protocol::{DispatchOutcome, Dispatcher};
@@ -1510,9 +1507,7 @@ mod tests {
         impl TempDir {
             fn new() -> Self {
                 let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-                let base = std::env::temp_dir()
-                    .canonicalize()
-                    .unwrap_or_else(|_| std::env::temp_dir());
+                let base = fandhe_browser_profile::test_base_dir();
                 Self(base.join(format!("fandhe-cdp-page-test-{}-{n}", std::process::id())))
             }
         }
