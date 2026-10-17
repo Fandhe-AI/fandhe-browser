@@ -500,7 +500,7 @@ EARLY
   expect_exit "run_core ws mismatch" 2 bash "$RUN_CORE" --no-spawn --endpoint "http://127.0.0.1:$FAKE_PORT" --out "$WORK/mm.jsonl"
   expect_contains "$LAST_OUTPUT" "does not match endpoint" "run_core ws mismatch message"
 
-  # 起動経路（スタブバイナリ）。Windows は起動不可（固定の exit 2）
+  # 起動経路（スタブバイナリ）。Windows は XDG_DATA_HOME・HOME によるプロファイル隔離が効かないため起動不可（固定の exit 2）
   RC_PORT="$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})' | tr -d '\r\n')"
   STUB_BIN="$WORK/stubbin"
   mkdir -p "$STUB_BIN"

@@ -4,10 +4,7 @@
 //! 実 TCP（`127.0.0.1:0`）で core の `Server` に `router` と `browser_websocket_config` を
 //! 配線し、std の `TcpStream` で RFC 6455 のハンドシェイクとフレームを手組みして検証する
 //! （ハッシュ・WS クライアント依存を追加しない）。`CdpState` の構築には `Profile::open` が
-//! 必要で、非 unix では `ProfileError::Unsupported` を返す仕様のため `#[cfg(unix)]` とする
-//! （任意の skip ではなく `tests/json_endpoints.rs` と同じ理由）。
-
-#![cfg(unix)]
+//! 必要で、Windows でも `%LOCALAPPDATA%` 配下なら成功するため 3 OS 共通で実行する（Issue #955）。
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};

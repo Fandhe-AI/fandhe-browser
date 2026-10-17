@@ -1,10 +1,8 @@
 //! `GET /ai/plugins` の結合テスト（`PLUG-2`・TASK-92.4・Issue #356・`MS-9`）。
 //!
 //! TCP bind はせず `Router::dispatch` へ直接渡す。`AppState` の構築に必要な `Profile::open` は
-//! 非 unix で構築不能なため `#[cfg(unix)]`（`tests/api.rs` と同じ理由）。純粋部は
-//! `src/api.rs` のユニットテストが 3 OS で検証する。
-
-#![cfg(unix)]
+//! Windows でも `%LOCALAPPDATA%` 配下なら成功するため 3 OS 共通で実行する（Issue #955）。
+//! 純粋部は `src/api.rs` のユニットテストも 3 OS で検証する。
 
 use std::path::PathBuf;
 use std::sync::Arc;

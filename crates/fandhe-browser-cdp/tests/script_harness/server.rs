@@ -1,5 +1,5 @@
-//! テスト用 CDP サーバーの起動と `/json/version` 取得（`Profile::open` を使うため unix 限定の
-//! テストから使う。契約テストは取り込まない）。
+//! テスト用 CDP サーバーの起動と `/json/version` 取得（`Profile::open` を使うため、
+//! サーバーを要する結合テストだけが使う。契約テストは取り込まない）。
 
 use std::future::Future;
 use std::io::{Read, Write};

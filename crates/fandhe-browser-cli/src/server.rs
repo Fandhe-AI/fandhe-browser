@@ -418,11 +418,9 @@ pub(crate) mod tests {
         }
     }
 
-    // Windows でも `%LOCALAPPDATA%` 配下なら `Profile::open` で構築できるようになった（Issue #928）。
-    // 本モジュールの Windows 対応（`cfg(unix)` の解除）は後続 issue で扱う。それまでは unix 限定
-    // （任意の skip ではない。cdp の結合テストと同じ扱い）。
-    #[cfg(unix)]
-    mod unix {
+    // Windows でも `%LOCALAPPDATA%` 配下なら `Profile::open` で構築できる（Issue #928・#955）。
+    // テストの一時ルートは `%TEMP%`（`%LOCALAPPDATA%\Temp`）配下のため 3 OS 共通で実行する。
+    mod listener {
         use std::io::{Read, Write};
         use std::net::TcpStream;
         use std::time::Duration;

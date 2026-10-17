@@ -2,11 +2,8 @@
 //! （TASK-19.1・Issue #223、TASK-19.2・Issue #224、ビヘイビア `AISNAP-6`・`AISNAP-14`・MS-4）。
 //!
 //! TCP bind はせず `Router::dispatch` へ直接渡す。`AppState` の構築には `Profile::open` が
-//! 必要で、非 unix では `ProfileError::Unsupported` を返す仕様のため `#[cfg(unix)]` とする
-//! （任意の skip ではなく構築手段自体が無いため）。純粋部は `src/api.rs` のユニットテストが
-//! 3 OS で検証する。
-
-#![cfg(unix)]
+//! 必要で、Windows でも `%LOCALAPPDATA%` 配下（一時ディレクトリを含む）なら成功するため 3 OS 共通
+//! で実行する（Issue #955）。純粋部は `src/api.rs` のユニットテストも 3 OS で検証する。
 
 use std::path::PathBuf;
 use std::sync::Arc;

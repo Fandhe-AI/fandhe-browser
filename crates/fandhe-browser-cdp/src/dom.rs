@@ -1347,9 +1347,6 @@ mod tests {
         assert_eq!(r, Err(CdpError::ISSUED_LIMIT_EXCEEDED));
         assert_eq!(calls, 1);
     }
-    // CdpState は AppState（Profile::open）が必要で、非 unix では構築手段が無い
-    // （protocol.rs のテストと同じ理由）ため、状態を要するテストは unix 限定。
-    #[cfg(unix)]
     mod dispatch {
         use super::*;
         use crate::protocol::Dispatcher;

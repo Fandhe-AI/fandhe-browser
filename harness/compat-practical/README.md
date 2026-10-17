@@ -84,7 +84,7 @@ bash harness/compat-practical/run_core.sh [--tasks P] [--out P] [--bin P] [--end
 ```
 
 - 実行経路は **CDP クライアント方式**。CLI サブコマンド（TASK-47）は未実装で、`fandhe-browser` は引数なしで `127.0.0.1:9333` に CDP サーバーを立てるだけのため、`run_core.mjs` が `Page.navigate` → `DOM.getDocument` → `DOM.querySelector` → `DOM.requestChildNodes` を送って判定する（新規依存なし。Node 22 以降の組み込み WebSocket / fetch のみ）
-- 既定はバイナリ（`resolve_bin` の優先順位）を起動して終了時に停止する。固定ポートのため、起動前に endpoint が応答していたら中断する（他プロセスの誤計測防止）。計測用プロファイルは一時ディレクトリへ隔離する（`XDG_DATA_HOME`・`HOME`）。`--no-spawn` は起動済みサーバーへ接続する。Windows は profile crate の ACL 実装待ち（`XOS-7`〜`XOS-10`）でバイナリを起動できないため起動経路は exit 2（`--no-spawn`・`--validate-only` は動く）
+- 既定はバイナリ（`resolve_bin` の優先順位）を起動して終了時に停止する。固定ポートのため、起動前に endpoint が応答していたら中断する（他プロセスの誤計測防止）。計測用プロファイルは一時ディレクトリへ隔離する（`XDG_DATA_HOME`・`HOME`）。`--no-spawn` は起動済みサーバーへ接続する。Windows のバイナリは `XDG_DATA_HOME`・`HOME` を見ずに `%LOCALAPPDATA%` 配下をプロファイルに使い、上の隔離が効かず実プロファイルに触れる恐れがあるため（起動も未確認）、起動経路は exit 2（`--no-spawn`・`--validate-only` は動く）
 - `--endpoint` は `http://127.0.0.1:<port>` のみ（loopback 限定）。バイナリは 9333 固定で待ち受けるため、起動モードでは 9333 以外を拒否する（別ポートは `--no-spawn` のみ）。discovery の `webSocketDebuggerUrl` が同一ホスト・ポートでなければ接続しない
 - 期限: `--task-timeout`（既定 45・1〜120。タスク開始時に期限と区分を単調時計で確定し、各 CDP 操作へは残り時間を渡す。全体期限の残りが `--task-timeout` 以下のタスクが期限に達したら `blocked`、それ以外は `timeout`。同値は全体期限を優先）・`--total-timeout`（既定 1200・1〜3600。一度全体期限で `blocked` になったら以降のタスクは実行せず `reason: "blocked"`。タイムアウト以外のエラーは期限と無関係にそのエラーで記録）・`--startup-timeout`（既定 15・1〜60）
 - 判定（PoC-9 の成功基準に対応）: `text` は一致要素の部分木の text が空白除去後に非空、`texts` は **先頭一致 1 件**のテキスト非空（`DOM.querySelectorAll` が未実装のため。`method: "first_match"`・`match_count: null` とし件数は捏造しない）、`form` は部分木に `name` 属性付きの `input`/`textarea`/`select` が 1 件以上（`method: "form_fields"`・`match_count` に件数）

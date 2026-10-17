@@ -1,10 +1,9 @@
 //! `fandhe_browser_core::state` の公開 API を通した結合テスト
 //! （TASK-41（41.1）・#169、ビヘイビア `CDP-1`・`AISNAP-6`・`RENDER-1`・`PROF-1`）。
 //!
-//! `NavigationState` に関するテストは 3 OS 共通。`AppState` の構築には `Profile::open`
-//! が必要で、これは非 unix では `ProfileError::Unsupported` を返す仕様
-//! （`XOS-7`〜`XOS-10` 未実装）のため、構築を伴うテストは `#[cfg(unix)]` とする。
-//! 任意の skip ではなく、非 unix では `AppState` を構築する手段自体が無いためである。
+//! `NavigationState` に関するテストも `AppState` 構築を伴うテストも 3 OS 共通。`AppState` の構築
+//! には `Profile::open` が必要で、Windows でも `%LOCALAPPDATA%` 配下（一時ディレクトリを含む）
+//! なら成功する（Issue #955）。
 
 use fandhe_browser_core::{NavigationResult, NavigationState, StateError};
 
@@ -38,7 +37,6 @@ fn js4_navigation_scope_is_unique_per_state_and_stable() {
     assert_eq!(a.scope(), before);
 }
 
-#[cfg(unix)]
 mod app_state {
     use fandhe_browser_core::render::{
         BoundingBox, ElementRef, ElementVisibility, PageLoad, PageRef, RenderError, Renderer,
