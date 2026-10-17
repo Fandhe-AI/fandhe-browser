@@ -31,8 +31,8 @@
 //! `crates/fandhe-browser-profile/tests/profile_open.rs`）。並行アクセス時の
 //! データ分離は新規コードではなくデータディレクトリ分離（`PROF-6`）自体で
 //! 成立し、`PROF-2`（TASK-51・#182）は `tests/isolation.rs`、`PROF-3`
-//! （TASK-52・#184・#185）は `tests/concurrent_isolation.rs` が Unix 上で
-//! 確認する（Windows 版の追加は別 Issue の課題）。プロファイル削除
+//! （TASK-52・#184・#185）は `tests/concurrent_isolation.rs` が 3 OS で
+//! 確認する（Windows の書き込みはテスト側のアダプタ経由。#954）。プロファイル削除
 //! （`Profile::delete`。`PROF-5`、TASK-53（53.2）・#188）も実装済み。以下はいずれも
 //! 未実装であり、実装済みを装う公開 API・ダミー実装は置かない。
 //!

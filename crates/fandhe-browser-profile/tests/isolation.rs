@@ -35,14 +35,24 @@
 //! 1 回目の内容が末尾に残り、「最終状態 = 最後に書いた値」という
 //! `all_cases()` の期待（`steps_a` の末尾要素が最終状態）と食い違う。
 //!
-//! ## Windows を対象外にする理由
+//! ## Windows での実行と限界（Issue #954）
 //!
-//! 本ファイルは実際に `Profile::open`・ファイル作成を行う内容のため Unix 専用とする。
-//! Windows の `Profile::open` は `%LOCALAPPDATA%` 配下では成功する（Issue #928）が、
-//! 3 OS での分離テスト実行（`XOS-10`）の Windows 対応は別 Issue の課題で、
-//! 本タスクのスコープ外。
+//! 本ファイルは unix・Windows の両方で実行する（`XOS-10`）。
+//!
+//! - テストのルートは [`fandhe_browser_profile::test_base_dir`] を基点にする。Windows では既知フォルダ
+//!   （`FOLDERID_LocalAppData`）配下で、`TMPDIR`・`TEMP` は効かない
+//! - 書き込みは `tests/support/mod.rs` の `open_data_file` を使う。unix は
+//!   `Profile::create_file_in`、Windows は検証済みパスを std で開く。Windows の
+//!   `create_file_in`（ハンドル相対の書き込み）は #948 配下の Issue の完了まで未実装のため、
+//!   Windows で確かめているのは `Profile::open` が作るレイアウト・ロック・DACL・ルートの
+//!   ハンドル保持と、ディスク上でプロファイルが分離されていることで、製品の書き込み API
+//!   そのものではない（`REPAIR-3`）
+//! - Windows 専用に、DACL の継承（`prof_2_prof_6_windows_roots_have_protected_dacl_and_data_inherits_it`）
+//!   とルートのハンドル保持（`prof_2_windows_open_profile_root_cannot_be_swapped`）を検証する。
+//!   unix のパーミッションビット・`openat` 系ハンドルに相当する検証である
+//! - 二重 open の拒否は全 OS で検証する
 
-#![cfg(unix)]
+mod support;
 
 use fandhe_browser_profile::{DataKind, Profile, sanitize_component};
 use std::collections::{BTreeMap, BTreeSet};
@@ -485,13 +495,15 @@ impl TempDir {
         // macOS の `/var` -> `/private/var` のような OS 標準 symlink を
         // `Profile::open` の厳格な検証が弾いてしまうため、基点を
         // canonicalize してから使う（`tests/profile_open.rs` と同じ理由）。
-        let base = std::env::temp_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::temp_dir());
+        // Windows では既知フォルダ配下（`Profile::open` が受け付ける場所）になる。
+        let base = fandhe_browser_profile::test_base_dir();
         let path = base.join(format!(
             "fandhe-profile-isolation-test-{}-{n}",
             std::process::id()
         ));
+        // Windows の `Profile::open` は親の存在を前提にしてよいように、先に作る。
+        std::fs::create_dir_all(&path)
+            .unwrap_or_else(|e| panic!("テスト用ディレクトリの作成に失敗: {path:?} ({e})"));
         Self { path }
     }
 
@@ -502,7 +514,11 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        // 失敗してもテストは落とさないが、Windows でハンドル保持による残骸が
+        // 見えなくならないよう出力する。
+        if let Err(e) = std::fs::remove_dir_all(&self.path) {
+            eprintln!("TempDir の削除に失敗: {:?} ({e})", self.path);
+        }
     }
 }
 
@@ -902,9 +918,7 @@ fn prof_2_fixture_opens_two_sibling_profiles() {
 /// `set_len(0)` と先頭 seek で上書きを実現する（`P2-09` の最終状態のため）。
 /// [`run_case`] から呼ばれ、失敗は呼び出し側が `case.id` 付きで panic させる。
 fn write_entry(profile: &Profile, entry: &Entry, payload: &[u8]) -> Result<(), String> {
-    let mut file = profile
-        .create_file_in(entry.kind, OsStr::new(&entry.name))
-        .map_err(|e| format!("create_file_in({:?}, {:?}): {e}", entry.kind, entry.name))?;
+    let mut file = support::open_data_file(profile, entry.kind, OsStr::new(&entry.name))?;
     file.set_len(0).map_err(|e| format!("set_len: {e}"))?;
     file.seek(SeekFrom::Start(0))
         .map_err(|e| format!("seek: {e}"))?;
@@ -1167,4 +1181,164 @@ fn prof_2_on_disk_contamination_is_detected() {
             },
         ]
     );
+}
+/// `PROF-1`・`PROF-2`・Issue #954（全 OS）: ロックはプロファイル単位で、同じルートの
+/// 二重 open は `Locked` で拒否し、兄弟ルートの open は妨げない。drop 後は再 open できる。
+#[test]
+fn prof_1_prof_2_lock_is_per_profile_and_rejects_double_open() {
+    let tmp = TempDir::new();
+    let (profile_a, profile_b) = open_profile_pair(&tmp);
+    let root_a = profile_a.root().to_path_buf();
+
+    let err = Profile::open(&root_a)
+        .map(|_| ())
+        .expect_err("opened profile root must reject a second open");
+    assert!(
+        matches!(err, fandhe_browser_profile::ProfileError::Locked { .. }),
+        "{err:?}"
+    );
+    // 二重 open の失敗が、保持中の 2 プロファイルのレイアウトを壊していない。
+    assert!(snapshot(profile_a.root()).is_empty());
+    assert!(snapshot(profile_b.root()).is_empty());
+
+    drop(profile_a);
+    let reopened =
+        Profile::open(&root_a).unwrap_or_else(|e| panic!("drop 後の再 open に失敗: {e}"));
+    drop(reopened);
+    drop(profile_b);
+}
+
+/// Windows 専用: PowerShell で ACL を読む補助。パスは環境変数（`FANDHE_ACL_TARGET`）で
+/// 渡し、コマンド文字列には埋め込まない（インジェクション防止）。
+/// 返り値は `(AreAccessRulesProtected, [(SID, IsInherited, AccessControlType)], 現在ユーザーの SID)`。
+/// 失敗・解釈不能は panic する（fail-closed）。
+#[cfg(windows)]
+fn read_acl(path: &Path) -> (bool, Vec<(String, bool, String)>, String) {
+    const SCRIPT: &str = "$ErrorActionPreference='Stop'; \
+        $acl = Get-Acl -LiteralPath $env:FANDHE_ACL_TARGET; \
+        'PROTECTED=' + $acl.AreAccessRulesProtected; \
+        foreach ($r in $acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])) { \
+            'ACE=' + $r.IdentityReference.Value + '|' + $r.IsInherited + '|' + $r.AccessControlType }; \
+        'ME=' + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value";
+    let shown = path.to_string_lossy();
+    let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown).to_string();
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env("FANDHE_ACL_TARGET", &shown)
+        .output()
+        .unwrap_or_else(|e| panic!("powershell の起動に失敗: {e}"));
+    assert!(out.status.success(), "ACL の取得に失敗: {out:?}");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let mut protected = None;
+    let mut me = None;
+    let mut aces = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some(v) = line.strip_prefix("PROTECTED=") {
+            protected = Some(match v {
+                "True" => true,
+                "False" => false,
+                other => panic!("PROTECTED を解釈できない: {other:?}"),
+            });
+        } else if let Some(v) = line.strip_prefix("ME=") {
+            me = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("ACE=") {
+            let parts: Vec<&str> = v.split('|').collect();
+            assert_eq!(parts.len(), 3, "ACE を解釈できない: {line:?}");
+            let inherited = match parts[1] {
+                "True" => true,
+                "False" => false,
+                other => panic!("IsInherited を解釈できない: {other:?}"),
+            };
+            aces.push((parts[0].to_string(), inherited, parts[2].to_string()));
+        } else {
+            panic!("想定外の出力行: {line:?}");
+        }
+    }
+    (
+        protected.expect("PROTECTED 行が無い"),
+        aces,
+        me.expect("ME 行が無い"),
+    )
+}
+
+/// `PROF-2`・`PROF-6`・`XOS-8`・Issue #954（Windows）: 親が Everyone に緩く開いていても、
+/// 新規ルートは継承を切った DACL（SYSTEM・Administrators・本人のみ）になり、
+/// その配下に書いたデータファイルへ同じ範囲が継承される。unix のパーミッションビットに
+/// 相当する検証で、src の単体テスト `prof1_prof6_new_root_has_protected_dacl_under_permissive_parent`
+/// が確かめるルートに加え、データファイルへの継承まで結合レベルで確認する。
+#[cfg(windows)]
+#[test]
+fn prof_2_prof_6_windows_roots_have_protected_dacl_and_data_inherits_it() {
+    let tmp = TempDir::new();
+    // 自分の TempDir だけに Everyone を継承付きで与える（共有の基点には触れない）。
+    let shown = tmp.path().to_string_lossy().to_string();
+    let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown).to_string();
+    let grant = std::process::Command::new("icacls")
+        .arg(&shown)
+        .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+        .output()
+        .unwrap_or_else(|e| panic!("icacls の起動に失敗: {e}"));
+    assert!(grant.status.success(), "icacls の付与に失敗: {grant:?}");
+
+    let (profile_a, profile_b) = open_profile_pair(&tmp);
+    let e = entry(DataKind::Cookies, "example.com", marker("a", "dacl"));
+    write_entry(&profile_a, &e, &e.payload.bytes()).unwrap_or_else(|e| panic!("書き込み失敗: {e}"));
+    write_entry(&profile_b, &e, &e.payload.bytes()).unwrap_or_else(|e| panic!("書き込み失敗: {e}"));
+
+    for profile in [&profile_a, &profile_b] {
+        let (protected, aces, me) = read_acl(profile.root());
+        assert!(
+            protected,
+            "ルートの継承が切れていない: {:?}",
+            profile.root()
+        );
+        let sids: BTreeSet<String> = aces.iter().map(|(s, _, _)| s.clone()).collect();
+        let expected: BTreeSet<String> = ["S-1-5-18", "S-1-5-32-544", me.as_str()]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(sids, expected, "ルートの主体が想定と違う: {aces:?}");
+        assert!(
+            aces.iter()
+                .all(|(_, inherited, t)| !inherited && t == "Allow"),
+            "ルートの規則は継承なしの Allow のみのはず: {aces:?}"
+        );
+
+        let data = profile.data_dir(DataKind::Cookies).join("example.com");
+        let (_, data_aces, _) = read_acl(&data);
+        assert!(!data_aces.is_empty(), "データファイルの規則が空");
+        for (sid, inherited, _) in &data_aces {
+            assert!(*inherited, "継承されていない規則: {sid}");
+            assert!(expected.contains(sid), "想定外の主体が継承された: {sid}");
+            assert!(
+                !["S-1-1-0", "S-1-5-11", "S-1-5-32-545"].contains(&sid.as_str()),
+                "広い主体が継承された: {sid}"
+            );
+        }
+    }
+}
+
+/// `PROF-2`・Issue #954（Windows）: open 中のプロファイルのルートはハンドルが保持され、
+/// 別のパスへ差し替えられない（unix の `root_fd` 保持に相当）。両方を drop した後は
+/// 同じ rename が成功する（陽性対照。直前の失敗がハンドル保持によるものだと示す）。
+#[cfg(windows)]
+#[test]
+fn prof_2_windows_open_profile_root_cannot_be_swapped() {
+    let tmp = TempDir::new();
+    let (profile_a, profile_b) = open_profile_pair(&tmp);
+    let root_a = profile_a.root().to_path_buf();
+    let root_b = profile_b.root().to_path_buf();
+    let swapped = tmp.path().join("swapped");
+
+    assert!(
+        std::fs::rename(&root_a, &swapped).is_err(),
+        "open 中のルートを rename できてしまった"
+    );
+    assert!(root_a.is_dir() && root_b.is_dir());
+    assert!(!swapped.exists());
+
+    drop(profile_a);
+    drop(profile_b);
+    std::fs::rename(&root_a, &swapped).unwrap_or_else(|e| panic!("drop 後の rename に失敗: {e}"));
+    assert!(swapped.is_dir() && !root_a.exists());
 }

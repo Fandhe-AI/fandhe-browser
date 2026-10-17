@@ -30,7 +30,8 @@
 //!
 //! 並行アクセス時のデータ分離はデータディレクトリ分離（`PROF-6`）自体で成立し、
 //! `PROF-2`（`tests/isolation.rs`）・`PROF-3`（`tests/concurrent_isolation.rs`。
-//! TASK-51・TASK-52）が Unix 上で確認する。
+//! TASK-51・TASK-52）が 3 OS で確認する（Windows の書き込みはテスト側のアダプタ経由で、
+//! `create_file_in` 相当は未実装。#954）。
 //!
 //! `Profile::open` はルート直下の `profile.lock` に advisory lock を取ることで
 //! 同一プロファイルへの二重 open を拒否する（`PROF-1`、TASK-50（50.3）・#178。

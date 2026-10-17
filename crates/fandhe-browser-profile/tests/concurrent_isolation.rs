@@ -27,11 +27,14 @@
 //! 本体（`src/`）は変更しない。新規外部依存も追加しない
 //! （dependency-policy.md）。
 //!
-//! Windows の `Profile::open` は `%LOCALAPPDATA%` 配下では成功する（Issue #928）が、
-//! 本ファイルはディレクトリが実際に作られ書き込まれることを前提とするため
-//! Unix 専用とする。分離テストの Windows 対応は別 Issue の課題。
+//! unix・Windows の両方で実行する（Issue #954・`XOS-10`）。Windows ではテストのルートを
+//! 既知フォルダ配下（[`fandhe_browser_profile::test_base_dir`]）に置き、書き込みは
+//! `tests/support/mod.rs` の `open_data_file`（Windows は検証済みパスを std で開く。
+//! `Profile::create_file_in` の Windows 版は #948 配下の完了まで未実装。`REPAIR-3`）を使う。
+//! `prof_3_dangling_symlink_is_reported_as_missing` は unix のみ（Windows に対応が無い理由は
+//! そのテストの doc 参照）。
 
-#![cfg(unix)]
+mod support;
 
 use fandhe_browser_profile::{DataKind, Profile};
 use std::collections::BTreeSet;
@@ -70,13 +73,13 @@ impl TempDir {
         // 経由すると `Profile::open` の厳格な symlink 検証（PR #437
         // レビュー指摘）に弾かれるため、基点を事前に正規化する
         // （`tests/profile_open.rs` と同じ理由）。
-        let base = std::env::temp_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::temp_dir());
+        let base = fandhe_browser_profile::test_base_dir();
         let path = base.join(format!(
             "fandhe-profile-concurrent-test-{}-{n}",
             std::process::id()
         ));
+        std::fs::create_dir_all(&path)
+            .unwrap_or_else(|e| panic!("テスト用ディレクトリの作成に失敗: {path:?} ({e})"));
         Self { path }
     }
 
@@ -87,7 +90,9 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        if let Err(e) = std::fs::remove_dir_all(&self.path) {
+            eprintln!("TempDir の削除に失敗: {:?} ({e})", self.path);
+        }
     }
 }
 
@@ -327,9 +332,7 @@ fn run_concurrent_writes(base: &Path, config: &HarnessConfig) -> Vec<WorkerOutco
 /// `set_len(0)` で明示的に切り詰めてから書く（52.2 の読み戻しで最終内容を
 /// 一意にするために必須）。
 fn write_once(profile: &Profile, kind: DataKind, payload: &[u8]) -> Result<(), String> {
-    let mut file = profile
-        .create_file_in(kind, OsStr::new(TARGET_FILE_NAME))
-        .map_err(|err| err.to_string())?;
+    let mut file = support::open_data_file(profile, kind, OsStr::new(TARGET_FILE_NAME))?;
     file.set_len(0).map_err(|err| err.to_string())?;
     file.seek(SeekFrom::Start(0))
         .map_err(|err| err.to_string())?;
@@ -342,9 +345,7 @@ fn write_once(profile: &Profile, kind: DataKind, payload: &[u8]) -> Result<(), S
 /// ため古いバイトは残らず、`set_len(0)` による「空になる窓」も生じない。
 /// 並行ワーカーの混線検査が正常な書き込みを誤検出しないための書き込み方式。
 fn write_in_place(profile: &Profile, kind: DataKind, payload: &[u8]) -> Result<(), String> {
-    let mut file = profile
-        .create_file_in(kind, OsStr::new(TARGET_FILE_NAME))
-        .map_err(|err| err.to_string())?;
+    let mut file = support::open_data_file(profile, kind, OsStr::new(TARGET_FILE_NAME))?;
     file.write_all(payload).map_err(|err| err.to_string())?;
     Ok(())
 }
@@ -1081,6 +1082,11 @@ fn prof_3_unexpected_entry_is_detected() {
 
 /// `PROF-3`・#185（陰性対照）: 壊れた symlink を欠損（`MissingEntry`）として
 /// 1 件だけ報告し、`NotRegularFile` とは区別する。
+///
+/// unix のみ。Windows に対応が無い理由: ファイル symlink の作成には
+/// `SeCreateSymbolicLinkPrivilege` か開発者モードが要り CI ランナーで保証されず、
+/// ジャンクションはディレクトリ用の再解析ポイントで「リンク先の無いファイル symlink」を
+/// 模擬できない（Issue #954）。
 #[cfg(unix)]
 #[test]
 fn prof_3_dangling_symlink_is_reported_as_missing() {
