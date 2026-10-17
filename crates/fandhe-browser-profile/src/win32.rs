@@ -317,6 +317,14 @@ fn last_os_error() -> ProfileError {
     ProfileError::Io(std::io::Error::last_os_error())
 }
 
+/// 既存ルート検証（#953）の読み取り失敗を、既存ルート向けの理由で `InvalidLayout` にする。
+fn existing_root_err(reason: &'static str) -> ProfileError {
+    ProfileError::InvalidLayout {
+        path: PathBuf::new(),
+        reason,
+    }
+}
+
 fn bad_dacl() -> ProfileError {
     ProfileError::InvalidLayout {
         path: PathBuf::new(),
@@ -530,15 +538,28 @@ fn read_owner_and_dacl(
     }
     // `dacl` は `sd` の内部を指すため、`_sd` が生きている間だけ使う。
     let _sd = LocalMem(sd);
+    // 既存ルート検証（`want_owner`）では、構造上の失敗を既存ルート向けの理由で返す（#953）。
+    let dacl_err = || {
+        if want_owner {
+            existing_root_err(crate::local_root::REASON_EXISTING_ROOT_DACL)
+        } else {
+            bad_dacl()
+        }
+    };
     if dacl.is_null() || sd.is_null() {
-        return Err(bad_dacl());
+        return Err(dacl_err());
     }
     let owner_sid = if want_owner {
         if owner.is_null() {
-            return Err(bad_dacl());
+            return Err(existing_root_err(
+                crate::local_root::REASON_EXISTING_ROOT_OWNER,
+            ));
         }
         // SAFETY: `owner` は `sd` 内の有効な SID で、`_sd` が生きている間だけ使う。
-        Some(unsafe { sid_to_string(owner) }?)
+        Some(
+            unsafe { sid_to_string(owner) }
+                .map_err(|_| existing_root_err(crate::local_root::REASON_EXISTING_ROOT_OWNER))?,
+        )
     } else {
         None
     };
@@ -562,7 +583,7 @@ fn read_owner_and_dacl(
         return Err(last_os_error());
     }
     if info.AceCount > MAX_ACE_COUNT {
-        return Err(bad_dacl());
+        return Err(dacl_err());
     }
     let mut aces = Vec::new();
     for index in 0..info.AceCount {
