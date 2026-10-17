@@ -201,6 +201,30 @@ pub(crate) fn is_invalid_new_name(name: &OsStr) -> bool {
 /// 親ハンドル相対で作る・開く 1 要素の名前の UTF-16 長の上限（NTFS の要素長の上限）。
 pub(crate) const MAX_COMPONENT_UTF16_LEN: usize = 255;
 
+/// 名前が [`MAX_COMPONENT_UTF16_LEN`] 個の UTF-16 単位を超えるか。アロケーションせずに判定する。
+///
+/// Windows では `encode_wide` を上限 + 1 個で打ち切って数える（孤立サロゲートも 1 単位）。
+/// それ以外では、UTF-16 の 1 単位あたり高々 3 バイト（不正バイトは損失変換で 1 単位）
+/// なので、バイト長が上限の 3 倍を超えれば必ず超過とみなす。
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn exceeds_component_len(name: &OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        name.encode_wide().take(MAX_COMPONENT_UTF16_LEN + 1).count() > MAX_COMPONENT_UTF16_LEN
+    }
+    #[cfg(not(windows))]
+    {
+        let bytes = name.as_encoded_bytes();
+        bytes.len() > MAX_COMPONENT_UTF16_LEN * 3
+            || String::from_utf8_lossy(bytes)
+                .encode_utf16()
+                .take(MAX_COMPONENT_UTF16_LEN + 1)
+                .count()
+                > MAX_COMPONENT_UTF16_LEN
+    }
+}
+
 /// 親ハンドル相対の作成・open に渡す名前が、単一要素として安全かを検査する
 /// （`PROF-4`・`XOS-10`。OS 非依存の純粋関数）。
 ///
@@ -216,8 +240,8 @@ pub(crate) fn validate_single_component(name: &OsStr) -> Result<(), ProfileError
     if name.is_empty() || name == "." || name == ".." {
         return invalid("name must be a single non-empty path component");
     }
-    let s = name.to_string_lossy();
-    if s.encode_utf16().take(MAX_COMPONENT_UTF16_LEN + 1).count() > MAX_COMPONENT_UTF16_LEN {
+    // 文字列変換（to_string_lossy）は入力全体を確保するため、その前に長さを検査する。
+    if exceeds_component_len(name) {
         return invalid("name is longer than 255 UTF-16 code units");
     }
     if is_invalid_new_name(name) {
@@ -1157,6 +1181,40 @@ mod tests {
                 ),
                 "must reject {name:?}"
             );
+        }
+    }
+
+    #[test]
+    fn prof4_xos10_validate_single_component_rejects_oversized_before_conversion() {
+        // 巨大な名前は変換前に上限超過として拒否する（アロケーション前検査）。
+        let huge = "a".repeat(1 << 20);
+        assert!(matches!(
+            validate_single_component(OsStr::new(&huge)),
+            Err(ProfileError::InvalidComponent { .. })
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            // 不正 UTF-8 バイトの長大な名前も拒否する。
+            let bad = vec![0xFFu8; MAX_COMPONENT_UTF16_LEN + 1];
+            assert!(matches!(
+                validate_single_component(OsStr::from_bytes(&bad)),
+                Err(ProfileError::InvalidComponent { .. })
+            ));
+            let bad_huge = vec![0xFFu8; 1 << 20];
+            assert!(matches!(
+                validate_single_component(OsStr::from_bytes(&bad_huge)),
+                Err(ProfileError::InvalidComponent { .. })
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let lone: Vec<u16> = vec![0xD800; MAX_COMPONENT_UTF16_LEN + 1];
+            assert!(matches!(
+                validate_single_component(&OsString::from_wide(&lone)),
+                Err(ProfileError::InvalidComponent { .. })
+            ));
         }
     }
 
