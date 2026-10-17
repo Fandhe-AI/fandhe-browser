@@ -18,10 +18,10 @@ cargo test --workspace
 
 | ジョブ | OS | 実行条件 | 内容 |
 | ------ | -- | -------- | ---- |
-| `changes` | ubuntu | 常時 | 変更ファイルから `rust`・`harness`・`servo` を判定（`scripts/ci-changes.sh`。`servo` は `servo-host-{ubuntu,macos,windows}` と `rust-lint` のホスト deny ステップが消費する） |
+| `changes` | ubuntu | 常時 | 変更ファイルから `rust`・`harness`・`servo`・`native` を判定（`scripts/ci-changes.sh`。`native` は `rust-test-{macos,windows}` を PR で走らせるかの軸。`servo` は `servo-host-{ubuntu,macos,windows}` と `rust-lint` のホスト deny ステップが消費する） |
 | `lint-docs` | ubuntu | 常時 | markdownlint・yamllint・editorconfig-checker・commitlint（PR のみ） |
 | `rust-lint` | ubuntu | rust または servo | `cargo fmt --all --check`・`cargo deny check`・`make check-deny-license-reject`。servo 時はさらにホストの `cargo deny`（`scripts/deny.sh servo-host`。ホスト用 `servo-host/deny.toml`） |
-| `rust-test-{ubuntu,macos,windows}` | 3 OS（macOS・Windows は PR では skipped） | rust | clippy（`--all-features -D warnings`）・`cargo test --workspace --all-features`。ubuntu はさらに `real_host`（`test = false` で `--all-targets` から外れる）の明示 clippy（コンパイル確認のみ・ホスト不要。#998） |
+| `rust-test-{ubuntu,macos,windows}` | 3 OS（macOS・Windows は PR では、OS 依存の変更〔`native=true`〕を含むときだけ実行し、それ以外は skipped） | rust（macOS・Windows の PR 実行は rust かつ native） | clippy（`--all-features -D warnings`）・`cargo test --workspace --all-features`。ubuntu はさらに `real_host`（`test = false` で `--all-targets` から外れる）の明示 clippy（コンパイル確認のみ・ホスト不要。#998） |
 | `rust-features-{ubuntu,macos}` | ubuntu・macOS（macOS は PR では skipped） | rust | 既定 feature・エンジンなし・両エンジン同梱・`js-boa` 軽量ビルド・`js-v8` 単独の clippy / test |
 | `rust-features-windows-{default,engines,boa}` | windows（PR は skipped） | rust | 上と同じ検査を feature 構成の組ごとに 3 ジョブへ並列分割（`rust-features-windows` 1 ジョブでは cache なしで約 32 分・cache ありでも 15〜17 分かかったため。オーナー判断 2026-10-12。`default`: 既定 feature・`js-v8` 単独・cli エンジンなし check、`engines`: core 単独・両エンジン同梱、`boa`: `js-boa` 軽量ビルド・`js-boa` 単独） |
 | `harness-{ubuntu,macos,windows}` | 3 OS（macOS・Windows は PR では skipped） | rust または harness | 分離検証・ハーネス自己テスト・サイズ検査（後述。`mcp-envelope` は unix のみ） |
@@ -32,7 +32,7 @@ cargo test --workspace
 | `cross-target-check` | ubuntu | rust（PR でも実行） | macOS・Windows 向けのクロス型検査（`aarch64-apple-darwin`・`x86_64-pc-windows-msvc`。後述の範囲に限る） |
 
 - required checks は上表のジョブ名 19 件（`{...}` は展開して数える）に加え、`ai-review.yml` の `codex / review`・`codex / preflight`・`codex / post_feedback` と `Cursor Bugbot`。ジョブの追加・改名時は GitHub の ruleset の required checks を同時に更新する
-- macOS・Windows のジョブは `pull_request` では `if:` により skipped になる（skipped は required を満たす）。push（main）・`workflow_dispatch` では実行される
+- macOS・Windows のジョブは `pull_request` では `if:` により skipped になる（skipped は required を満たす）。例外は `rust-test-macos`・`rust-test-windows` で、`native=true`（後述）のときは PR でも実行する。push（main）・`workflow_dispatch` では実行される
 - 旧ジョブ名との対応: `rust-ci`（fmt・deny は `rust-lint`、clippy・test は `rust-test-*`）、`rust-ci-default-features`・`rust-ci-js-boa`・`rust-ci-js-v8` は `rust-features-*`（Windows は `rust-features-windows-*`）、`render-isolation`・`js-engine-isolation`・`compat-regression`・`puppeteer-connect-selftest`・`bench-record-selftest`・`mcp-envelope-smoke`・`binary-size` は `harness-*` のステップ（ステップ名の `[...]` 接頭辞が旧ジョブ名）、`deny-license-reject` は `rust-lint` のステップ。`servo-host-ubuntu` は新規ジョブ（#995）、`servo-host-macos`・`servo-host-windows` は新規ジョブ（#999）。いずれも ruleset への登録はオーナーが行い、登録されるまで自動マージが止まるのは想定内
 
 ### docs-only の判定（fail-closed）
@@ -40,16 +40,17 @@ cargo test --workspace
 - `changes` ジョブは、push（main）・`workflow_dispatch` では常に `rust=true`・`harness=true`・`servo=true` にする。`pull_request` では `git diff --name-only <base.sha>...<head.sha>` を `scripts/ci-changes.sh` に渡して判定する
 - `rust=false` になるのは、変更ファイルがすべて docs 扱いの allowlist（`*.md`（任意階層）・`docs/**`（`docs/spec` submodule ポインタを含む）・`.claude/**`・`.agents/**`・`LICENSE-*`・`NOTICE`・`skills-lock.json`・`.markdownlint.jsonc`・`.yamllint`・`.editorconfig-checker.json`・`commitlint.config.mjs`・`lefthook.yml`）に一致するときだけ。allowlist 外のパスが 1 つでもあれば `rust=true`。ただし `docs/design/**` はテスト・ビルドが読む（`include_str!` の `host-api.schema.json`・`read_to_string` のレポート md 等）ため、`*.md` であっても `rust=true` 扱い。`docs/` 配下を読むコードを追加したら `scripts/ci-changes.sh` の判定と自己テストを見直す
 - `.github/**`・`Cargo.*`・`crates/**`（配下の `*.md` を含む）・`scripts/**`・`Makefile`・`deny.toml`・`rust-toolchain.toml`・`profiles/**`・`benches/**`・`tests/**`・`Dockerfile`・`compose.yaml` は常に `rust=true`。`harness/**` の変更は `harness=true`。Rust のテスト・ビルドから読まれないと確認済みのディレクトリ（`binary-size`・`render-screenshot`・`cold-start`・`multi-instance-memory`・`container-memory`）だけを harness のみ扱いにし、それ以外（`compat_fixtures`・`playwright-trace` 等の `include_str!` 入力、workspace メンバーの `wpt_subset_runner`、未知の新規ディレクトリ）は `rust=true` も立てる（fail-closed）。harness ディレクトリを Rust から読むようにしたら、この allowlist から外す
+- `native=true` は独立軸（`rust-test-macos`・`rust-test-windows` を PR で走らせるかの判断。OS 依存の変更が main への push 後にしか red にならない再発の防止）。次のいずれかで立つ。(1) 変更ファイルに `crates/fandhe-browser-profile/` 配下がある、(2) `*.rs` の差分（`git diff -U0 <base>...<head> -- '*.rs'`。`changes` ジョブが `CI_CHANGES_RS_DIFF_FILE` でスクリプトへ渡す）の追加・削除行に `cfg(windows`・`cfg(unix`・`cfg(not(windows`・`cfg(not(unix`（`cfg(any(`・`cfg!(`・`cfg_attr(` 内を含む）・`target_os`・`target_family` がある。push（main）・`workflow_dispatch` では native の値によらず従来どおり全実行。`*.rs` の差分取得の失敗・diff ファイルが読めない・出力不正・入力が空は `native=true`
 - `servo=true` は独立軸（TASK-38・`RENDER-1`・設計 `servo-host-design.md` §6.1）。`servo-host/**`・`crates/fandhe-browser-render/**`（契約 fixture を含む）・`docs/design/render-host-protocol*`・`scripts/**`・`.github/**`・`rust-toolchain.toml` で立ち、入力が空のときも true。`servo-host/**` だけの変更は `rust=false`・`servo=true`（ただし `servo-host/deny.toml` は `make check-deny-license-reject`〔`rust-lint`〕が読むため `rust=true` にする。#991。別 workspace でルート `Cargo.toml` が `exclude` しており、本体のビルド・テストは読まない。契約 fixture は `crates/` 側に置く）
 - `servo=true` のとき `servo-host-ubuntu` と `rust-lint` が走る（main・`workflow_dispatch` ではさらに `servo-host-macos`・`servo-host-windows`。PR では skipped）。docs-only（`rust=false`・`servo=false`）の PR は従来どおり `lint-docs` と `changes` だけが走る
-- `git diff` の失敗・SHA の欠落・判定スクリプトの出力不正は `rust`・`harness`・`servo` のすべて `true`（全実行）に倒す。判定ロジックの変更後は `bash scripts/ci-changes.sh --self-test` を通す
+- `git diff` の失敗・SHA の欠落・判定スクリプトの出力不正は `rust`・`harness`・`servo`・`native` のすべて `true`（全実行）に倒す。判定ロジックの変更後は `bash scripts/ci-changes.sh --self-test` を通す
 - 下流ジョブが skipped になっても、`changes` 自身が required かつ失敗し得るため見逃さない。docs-only PR では `lint-docs` と `changes` だけが走る
 
 ## 3 OS CI（Linux・macOS・Windows 一級対応）
 
 3 OS のネイティブ実行の時機（オーナー判断 2026-10-10。macOS ランナーの同時実行枠待ちで全 PR の CI が詰まるため。参考: Fandhe-AI/fandhe-container の CI）:
 
-- **pull_request**: ubuntu のネイティブでビルド・テスト・分離検証を行う。macOS・Windows のネイティブジョブ（`*-macos`・`*-windows`・`windows-servo-prereqs`）は skipped にし、代わりに `cross-target-check` が Linux 上で macOS・Windows 向けの型検査を行う（範囲は下記）
+- **pull_request**: ubuntu のネイティブでビルド・テスト・分離検証を行う。macOS・Windows のネイティブジョブ（`*-macos`・`*-windows`・`windows-servo-prereqs`）は skipped にする（例外: OS 依存の変更〔`native=true`: profile crate 配下、または `*.rs` 差分の `cfg(windows`・`cfg(unix`・`target_os` 等〕を含む PR では `rust-test-macos`・`rust-test-windows` だけ実行する。2026-10-17 のユーザー承認。他の macOS・Windows ジョブは枠待ちで CI が詰まるのを避けるため対象外）。また、代わりに `cross-target-check` が Linux 上で macOS・Windows 向けの型検査を行う（範囲は下記）
 - **main への push**: 3 OS すべてのネイティブランナーで全ジョブを実行する（OS 依存のファイルシステム挙動のテスト〔パス・大文字小文字・ロック〕を含む）
 - **release 前**: 3 OS のネイティブで全部回す。`release.yml` は発火条件が `workflow_dispatch` 限定のため、`gh workflow run ci.yml --ref <ref>` で `ci.yml` を実行する（`workflow_dispatch` では 3 OS で回る）
 - 見落とすのは macOS・Windows 固有の **実行時の誤り**（テストの失敗・BSD / Git Bash のツール差・パス・大文字小文字・改行）で、PR では検出できず main への push 後に判明する。これはマージ前の待ち時間と引き換えにオーナーが判断した残存リスク。main の push で macOS・Windows だけが失敗した場合は、修正 PR で直す
