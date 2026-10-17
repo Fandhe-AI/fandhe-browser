@@ -540,6 +540,18 @@ EARLY
   expect_contains "$LAST_OUTPUT" "last=timeout" "run_core hang endpoint reports timeout"
   expect_eq "$(cat "$WORK/keep.jsonl")" "KEEP" "run_core hang keeps existing out"
 
+  # 予算が小さいときは各試行が残り時間で打ち切られ、期限内に失敗する（#956 指摘: probe は常に 3 秒待たない）
+  t0=$(date +%s)
+  expect_exit "run_core hang short budget" 2 bash "$RUN_CORE" --no-spawn --endpoint "http://127.0.0.1:$FAKE_PORT" --startup-timeout 1 --out "$WORK/keep.jsonl"
+  t1=$(date +%s)
+  expect_eq "$([ $((t1 - t0)) -le 2 ] && echo ok || echo "slow:$((t1 - t0))s")" "ok" "run_core hang short budget fails within deadline"
+
+  # 期限後に応答するサーバーは成功扱いにしない
+  start_fake --delay-http 1500
+  expect_exit "run_core late response" 2 bash "$RUN_CORE" --no-spawn --endpoint "http://127.0.0.1:$FAKE_PORT" --startup-timeout 1 --out "$WORK/keep.jsonl"
+  expect_contains "$LAST_OUTPUT" "endpoint is not responding" "run_core late response is not success"
+  expect_eq "$(cat "$WORK/keep.jsonl")" "KEEP" "run_core late response keeps existing out"
+
   # webSocketDebuggerUrl のホスト/ポートが endpoint と一致しなければ接続しない
   start_fake --ws-host-mismatch
   expect_exit "run_core ws mismatch" 2 bash "$RUN_CORE" --no-spawn --endpoint "http://127.0.0.1:$FAKE_PORT" --out "$WORK/mm.jsonl"

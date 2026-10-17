@@ -7,6 +7,7 @@
 //   127.0.0.1 のエフェメラルポートで listen し、ポート番号を stdout へ 1 行出す（stdout はこの 1 行だけ）。
 //   診断（listen 完了・受信した HTTP 要求・エラー）は時刻付きで stderr へ 1 行ずつ出す（#956。
 //   接続失敗時に「偽サーバーは健全だったか」を self-test.sh が切り分けるための材料）。
+//   --delay-http MS: /json/version の応答を MS ミリ秒遅らせる（期限後の応答を成功扱いにしない確認用）。
 //   --hang-http: TCP は受け付けるが HTTP 要求に応答しない（無応答サーバーで run_core が成功を装わない確認用）。
 // セレクタ文字列で挙動を切り替える（合成 tasks 側で指定）:
 //   nomatch=一致なし / unsupported=-32602 / toolarge=requestChildNodes が document too large /
@@ -18,6 +19,9 @@ import crypto from "node:crypto";
 const mismatch = process.argv.includes("--ws-host-mismatch");
 // --port N: 固定ポートで listen する（run_core.sh の起動経路テストで、スタブバイナリ経由で起動するため）
 const hangHttp = process.argv.includes("--hang-http");
+// --delay-http MS: /json/version の応答を MS ミリ秒遅らせる（期限後に応答するサーバーを成功扱いにしない確認用。#956）
+const delayIdx = process.argv.indexOf("--delay-http");
+const delayHttpMs = delayIdx >= 0 ? Number(process.argv[delayIdx + 1]) : 0;
 const portIdx = process.argv.indexOf("--port");
 const listenPort = portIdx >= 0 ? Number(process.argv[portIdx + 1]) : 0;
 
@@ -85,6 +89,14 @@ function childrenFor(selector) {
 const server = http.createServer((req, res) => {
   diag(`${req.method} ${req.url}`);
   if (hangHttp) return;
+  if (req.url === "/json/version" && delayHttpMs > 0) {
+    setTimeout(() => {
+      const port = server.address().port;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ Browser: "FakeCdp/0.0", webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/browser/fake` }));
+    }, delayHttpMs);
+    return;
+  }
   if (req.url === "/json/version") {
     const port = server.address().port;
     const wsPort = mismatch ? port + 1 : port;
