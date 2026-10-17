@@ -53,7 +53,7 @@ usage: measure.sh --fandhe-bin PATH [--chromium-bin PATH | --skip-chromium] [opt
   -n, --instances N            instances per target (1..200, default 50)
   --fandhe-bin PATH            fandhe-browser executable (release build recommended)
   --chromium-bin PATH          Chromium/Chrome executable (headless)
-  --chromium-extra-args "..."  extra flags for Chromium (e.g. "--no-sandbox"; split on spaces)
+  --chromium-extra-args "..."  extra flags for Chromium (e.g. "--no-sandbox"; split on spaces; recorded in the JSON)
   --skip-chromium              measure fandhe-browser only
   --skip-fandhe                measure Chromium only
   --url URL                    public http(s) URL for the "loaded" condition (required when loaded is
@@ -150,6 +150,16 @@ done
 case " $CHROMIUM_EXTRA " in
   *--remote-debugging-*|*--user-data-dir*) die "--chromium-extra-args must not set --remote-debugging-* or --user-data-dir (measure.sh owns them)" ;;
 esac
+# 追加引数は 1 回だけ配列に分割し、起動（launch_chromium）と JSON 記録（chromium_extra_args）の双方で
+# 同じ配列を使う（記録と実際に渡した引数を一致させる。glob 展開はしない）
+CHROMIUM_EXTRA_ARR=()
+CHROMIUM_NO_SANDBOX=false
+if [ "$SKIP_CHROMIUM" -eq 0 ] && [ -n "$CHROMIUM_EXTRA" ]; then
+  read -r -a CHROMIUM_EXTRA_ARR <<<"$CHROMIUM_EXTRA"
+  for a in "${CHROMIUM_EXTRA_ARR[@]}"; do
+    [ "$a" != "--no-sandbox" ] || CHROMIUM_NO_SANDBOX=true
+  done
+fi
 if [ -n "$URL" ]; then
   case "$URL" in http://*|https://*) ;; *) die "--url must be a public http(s):// URL (file: is rejected by the SSRF guard)" ;; esac
   # 明らかな loopback・プライベートホストは fandhe の SSRF ガードが拒否するため、計測前に弾く
@@ -224,6 +234,12 @@ if [ "$SKIP_FANDHE" -eq 0 ] && printf '%s\n' "${COND_LIST[@]}" | grep -qx loaded
   fi
 fi
 
+# Chromium は TMPDIR 配下の org.chromium.Chromium.XXXXXX に Unix ソケット（sun_path は 108 バイト上限）を
+# 置く。launch_chromium は TMPDIR を $WORK/t/<i> に向けるため、作業ディレクトリの親が長いと上限に近づく。
+# 実際の配置は Chromium のバージョン依存で本スクリプトからは確認できないため、使用エラーにはせず警告に留める
+if [ "$SKIP_CHROMIUM" -eq 0 ] && [ "$(printf '%s' "${TMPDIR:-/tmp}" | wc -c)" -gt 38 ]; then
+  log "warning: TMPDIR is long (over 38 bytes); Chromium's Unix socket path may exceed the 108-byte limit. Use a shorter TMPDIR"
+fi
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fandhe-mim.XXXXXX")"
 LEADERS=()   # 現サイクルの起動リーダー PID（setsid により pgid == pid）
 RESULTS=()   # JSON 断片
@@ -290,12 +306,46 @@ kill_all() {
   LEADERS=()
   teardown_egress
 }
+# 起動失敗の診断（対象プロセスのログ末尾を stderr へ出す）。ログは $WORK 内にあり終了時の cleanup で
+# 消えるため、失敗を返す直前（wait_*・navigate_*・sample_cycle）で呼ぶ。Chromium の stderr にはページ由来の
+# 文字列が混じりうるため、端末エスケープ（C0 制御文字）を除去し、行数・行長・インスタンス数を制限する。
+LOG_TAIL_LINES=20
+LOG_TAIL_MAX_INSTANCES=3
+LOG_TAIL_MAX_COLS=500
+show_log_tail() { # $1=ラベル $2=ログファイル
+  local label="$1" logf="$2"
+  echo "--- last $LOG_TAIL_LINES lines of $label log ($(basename "$logf")) ---" >&2
+  if [ -s "$logf" ]; then
+    { tail -n "$LOG_TAIL_LINES" "$logf" 2>/dev/null \
+      | LC_ALL=C tr -d '\000-\010\013-\037\177' \
+      | cut -c1-"$LOG_TAIL_MAX_COLS" >&2; } || true
+  else
+    echo "(log is empty)" >&2
+  fi
+  echo "--- end of $label log ---" >&2
+}
+show_dead_logs() { # $1=target。リーダーが消失したインスタンスのログ末尾を上限件数まで出す
+  local target="$1" i shown=0 dead=0
+  for ((i = 1; i <= N; i++)); do
+    kill -0 "${LEADERS[$((i - 1))]:-0}" 2>/dev/null && continue
+    dead=$((dead + 1))
+    if [ "$shown" -lt "$LOG_TAIL_MAX_INSTANCES" ]; then
+      shown=$((shown + 1))
+      show_log_tail "$target instance $i (pid ${LEADERS[$((i - 1))]:-?})" "$WORK/log-$target-$i.txt"
+    fi
+  done
+  if [ "$dead" -gt "$shown" ]; then
+    echo "... and $((dead - shown)) more dead $target instance(s) (logs not shown)" >&2
+  fi
+}
+
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM
   kill_all
   teardown_nat
-  rm -rf "$WORK"
+  # 削除は自分が mktemp -d で作った $WORK に限る（Chromium の一時ディレクトリも $WORK/t 配下）
+  if [ -n "${WORK:-}" ] && [ -d "$WORK" ]; then rm -rf -- "$WORK"; fi
   exit "$rc"
 }
 trap cleanup EXIT
@@ -358,13 +408,14 @@ attach_egress() { # $1=index $2=leader pid
 # errorText とロード完了を確認する（launch 引数の URL では取得失敗を検知できないため）。
 launch_chromium() { # $1=index
   local i="$1" udir="$WORK/chromium/$1"
-  local -a extra=()
-  mkdir -p "$udir"
-  if [ -n "$CHROMIUM_EXTRA" ]; then read -r -a extra <<<"$CHROMIUM_EXTRA"; fi
-  setsid "$CHROMIUM_BIN" --headless=new --disable-gpu --no-first-run \
+  local tdir="$WORK/t/$1"
+  # Chromium が TMPDIR 直下に作る org.chromium.Chromium.* を $WORK 内に閉じ込め、終了・失敗・中断の
+  # いずれでも cleanup が $WORK ごと消す。測定条件を変えないため、TMPDIR を渡すのは Chromium だけ
+  mkdir -p "$udir" "$tdir"
+  TMPDIR="$tdir" setsid "$CHROMIUM_BIN" --headless=new --disable-gpu --no-first-run \
     --no-default-browser-check "--user-data-dir=$udir" \
     --remote-debugging-address=127.0.0.1 "--remote-debugging-port=$((CHROMIUM_PORT_BASE + i))" \
-    "${extra[@]}" about:blank \
+    "${CHROMIUM_EXTRA_ARR[@]}" about:blank \
     >"$WORK/log-chromium-$i.txt" 2>&1 &
   LEADERS+=("$!")
 }
@@ -392,8 +443,8 @@ listener_owned_by_tree() { # $1=leader $2=port
 }
 
 # CDP の /json/version が応答するまで待ち、応答した待ち受けが今回起動したツリーの所有であることを確認する
-wait_cdp_ready() { # $1=label $2=leader $3=port $4=netns 内か(1/0)
-  local label="$1" pid="$2" port="$3" use_ns="$4" deadline
+wait_cdp_ready() { # $1=label $2=leader $3=port $4=netns 内か(1/0) $5=ログファイル
+  local label="$1" pid="$2" port="$3" use_ns="$4" logf="$5" deadline
   deadline=$((SECONDS + READY_TIMEOUT))
   while :; do
     if [ "$use_ns" -eq 1 ]; then
@@ -401,8 +452,8 @@ wait_cdp_ready() { # $1=label $2=leader $3=port $4=netns 内か(1/0)
     else
       curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$port/json/version" 2>/dev/null && break
     fi
-    kill -0 "$pid" 2>/dev/null || { echo "error: $label (pid $pid) exited during startup" >&2; return 1; }
-    [ "$SECONDS" -lt "$deadline" ] || { echo "error: $label (pid $pid) not ready in ${READY_TIMEOUT}s" >&2; return 1; }
+    kill -0 "$pid" 2>/dev/null || { echo "error: $label (pid $pid) exited during startup" >&2; show_log_tail "$label" "$logf"; return 1; }
+    [ "$SECONDS" -lt "$deadline" ] || { echo "error: $label (pid $pid) not ready in ${READY_TIMEOUT}s" >&2; show_log_tail "$label" "$logf"; return 1; }
     sleep 0.2
   done
   listener_owned_by_tree "$pid" "$port" \
@@ -411,24 +462,25 @@ wait_cdp_ready() { # $1=label $2=leader $3=port $4=netns 内か(1/0)
 
 wait_fandhe_ready() { # 全インスタンスの /json/version 応答と待ち受けの所有を確認する
   [ "$NO_READY_CHECK" -eq 0 ] || return 0
-  local pid
-  for pid in "${LEADERS[@]}"; do
-    wait_cdp_ready "fandhe instance" "$pid" "$FANDHE_PORT" 1 || return 1
+  local i
+  for ((i = 1; i <= N; i++)); do
+    wait_cdp_ready "fandhe instance $i" "${LEADERS[$((i - 1))]}" "$FANDHE_PORT" 1 "$WORK/log-fandhe-$i.txt" || return 1
   done
 }
 
 wait_chromium_ready() { # loaded 条件で全 Chromium インスタンスの CDP 応答と所有を確認する
   local i
   for ((i = 1; i <= N; i++)); do
-    wait_cdp_ready "chromium instance $i" "${LEADERS[$((i - 1))]}" "$((CHROMIUM_PORT_BASE + i))" 0 || return 1
+    wait_cdp_ready "chromium instance $i" "${LEADERS[$((i - 1))]}" "$((CHROMIUM_PORT_BASE + i))" 0 "$WORK/log-chromium-$i.txt" || return 1
   done
 }
 
 navigate_all() { # fandhe の全インスタンスで同一 URL を CDP 経由で読み込む
-  local pid
-  for pid in "${LEADERS[@]}"; do
+  local i pid
+  for ((i = 1; i <= N; i++)); do
+    pid="${LEADERS[$((i - 1))]}"
     in_ns "$pid" node "$SCRIPT_DIR/navigate.mjs" "http://127.0.0.1:$FANDHE_PORT" "$URL" >/dev/null \
-      || { echo "error: navigation failed for pid $pid" >&2; return 1; }
+      || { echo "error: navigation failed for pid $pid" >&2; show_log_tail "fandhe instance $i" "$WORK/log-fandhe-$i.txt"; return 1; }
   done
 }
 
@@ -436,9 +488,9 @@ navigate_chromium_all() { # Chromium の全インスタンスで同一 URL を C
   local i pid
   for ((i = 1; i <= N; i++)); do
     pid="${LEADERS[$((i - 1))]}"
-    kill -0 "$pid" 2>/dev/null || { echo "error: chromium instance $i (pid $pid) exited before navigation" >&2; return 1; }
+    kill -0 "$pid" 2>/dev/null || { echo "error: chromium instance $i (pid $pid) exited before navigation" >&2; show_log_tail "chromium instance $i" "$WORK/log-chromium-$i.txt"; return 1; }
     node "$SCRIPT_DIR/navigate.mjs" "http://127.0.0.1:$((CHROMIUM_PORT_BASE + i))" "$URL" --page-target >/dev/null \
-      || { echo "error: navigation failed for chromium instance $i" >&2; return 1; }
+      || { echo "error: navigation failed for chromium instance $i" >&2; show_log_tail "chromium instance $i" "$WORK/log-chromium-$i.txt"; return 1; }
   done
 }
 
@@ -462,7 +514,7 @@ sample_cycle() { # $1=target $2=condition。結果を RES_* と RESULTS へ
   for leader in "${LEADERS[@]}"; do
     kill -0 "$leader" 2>/dev/null && alive=$((alive + 1))
   done
-  [ "$alive" -eq "$N" ] || { echo "error: only $alive/$N $target instances alive before sampling" >&2; return 1; }
+  [ "$alive" -eq "$N" ] || { echo "error: only $alive/$N $target instances alive before sampling" >&2; show_dead_logs "$target"; return 1; }
   for leader in "${LEADERS[@]}"; do
     # リーダー自身の smaps_rollup 読み取り成功を必須にする（読めない・消失は失敗扱い）
     leader_read=0
@@ -479,12 +531,12 @@ sample_cycle() { # $1=target $2=condition。結果を RES_* と RESULTS へ
   done
   [ "$unreadable" -eq 0 ] || { echo "error: $unreadable live processes had unreadable smaps_rollup" >&2; return 1; }
   # 集計中にリーダーが消失するとその PID が黙って除外されるため、終了時にも全リーダーの生存を再確認する
-  [ "$lost_leader" -eq 0 ] || { echo "error: $lost_leader $target leader(s) unreadable or gone during sampling" >&2; return 1; }
+  [ "$lost_leader" -eq 0 ] || { echo "error: $lost_leader $target leader(s) unreadable or gone during sampling" >&2; show_dead_logs "$target"; return 1; }
   alive=0
   for leader in "${LEADERS[@]}"; do
     kill -0 "$leader" 2>/dev/null && alive=$((alive + 1))
   done
-  [ "$alive" -eq "$N" ] || { echo "error: only $alive/$N $target instances alive after sampling" >&2; return 1; }
+  [ "$alive" -eq "$N" ] || { echo "error: only $alive/$N $target instances alive after sampling" >&2; show_dead_logs "$target"; return 1; }
   RES_PSS["$target:$cond"]="$pss"
   RESULTS+=("$(printf '{"target":"%s","condition":"%s","instances":%d,"processes":%d,"pss_kib":%d,"rss_kib":%d,"pss_per_instance_kib":%s}' \
     "$target" "$cond" "$N" "$procs" "$pss" "$rss" "$(awk -v a="$pss" -v n="$N" 'BEGIN{printf "%.1f", a/n}')")")
@@ -551,9 +603,15 @@ json_escape() {
 }
 
 join_by() { local IFS=","; echo "$*"; }
+# 追加引数の JSON 配列（--skip-chromium では Chromium に何も渡さないため空配列で型を安定させる）
+EXTRA_JSON=""
+for a in "${CHROMIUM_EXTRA_ARR[@]}"; do
+  EXTRA_JSON="${EXTRA_JSON:+$EXTRA_JSON,}\"$(json_escape "$a")\""
+done
 {
   printf '{"schema_version":1,"task":"TASK-81","behaviors":["PERF-4","MEAS-6"],"metric":"pss_kib",'
   printf '"instances":%s,"net_mode":"%s","url":"%s","settle_sec":%s,' "$N" "${NET_MODE}" "$(json_escape "$URL")" "$SETTLE"
+  printf '"chromium_extra_args":[%s],"chromium_no_sandbox":%s,' "$EXTRA_JSON" "$CHROMIUM_NO_SANDBOX"
   printf '"environment":{"kernel":"%s","arch":"%s","cpus":%s,"mem_total_kib":%s},' \
     "$(uname -r)" "$(uname -m)" "$(nproc 2>/dev/null || echo 0)" "$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
   printf '"results":[%s],"comparisons":[%s]}\n' "$(join_by "${RESULTS[@]}")" "$(join_by "${COMPARISONS[@]:-}")"
