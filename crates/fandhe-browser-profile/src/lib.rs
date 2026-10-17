@@ -56,7 +56,8 @@
 //!   明示設定して任意のパスを許可する第 2 段階は、依存の feature 追加と `unsafe` の
 //!   承認が要るため未実装（後続。未判断）。Windows の `Profile` はルートのディレクトリ
 //!   ハンドルと `profile.lock` を改名・削除を共有しない形で保持するが、空のディレクトリの
-//!   再解析ポイント化は防げない（`local_root.rs` の「限界」。親のハンドルを起点にした作成への移行は後続。Issue #928 の PR #945 のレビューで判明。Issue #948・#950）。Windows では
+//!   再解析ポイント化は防げない（`local_root.rs` の「限界」。親のハンドルを起点にした作成への移行は後続。Issue #928 の PR #945 のレビューで判明。Issue #948・#950。親ハンドル相対の作成・open の関数は `win32` モジュールに用意済みで、
+//!   `unsafe` はこのモジュールに限る。`Profile::open` の切り替えは #950。Issue #949）。Windows では
 //!   ハンドル基準の走査・
 //!   `Profile::create_file_in`・`Profile::delete` も未実装
 
@@ -68,6 +69,9 @@ pub mod store;
 // `allow` で消さず、コンパイル対象を cfg で絞る）。
 #[cfg(any(windows, test))]
 mod local_root;
+// Windows 限定。Win32/NT 呼び出しと `unsafe` を置く唯一のモジュール（Issue #949・#947 の承認）。
+#[cfg(windows)]
+mod win32;
 // unix・Windows の `Profile::open` と単体テストが使う。それ以外の OS では未使用。
 #[cfg(any(unix, windows, test))]
 mod lock;
