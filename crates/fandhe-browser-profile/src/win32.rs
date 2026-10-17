@@ -1198,7 +1198,10 @@ mod tests {
 
     /// 偽の `%LOCALAPPDATA%`（`<t>/AppData/Local`。作成済み）。基準自体は検証対象外。
     fn fake_lad(t: &TempDir) -> PathBuf {
-        t.sub("AppData").join("Local")
+        // `sub` は `AppData` までしか作らないため、`Local` も明示的に作成する。
+        let lad = t.sub("AppData").join("Local");
+        std::fs::create_dir_all(&lad).expect("create fake LOCALAPPDATA");
+        lad
     }
 
     fn lad_env(lad: &Path) -> Option<OsString> {
