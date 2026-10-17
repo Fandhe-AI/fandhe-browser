@@ -189,12 +189,9 @@ impl ProfileStore for OsDefaultStore {
 ///
 /// - 相対パスは [`ExplicitStore::new`] の時点で 1 回だけ絶対化して固定する
 ///   （実行中の `chdir` で保存先が変わらないようにするため）
-/// - 祖先（最終要素より上）の symlink のうち、root 所有のもの（macOS の `/var`・`/tmp`、
-///   Linux の `/home` 等の OS 標準）だけを [`ExplicitStore::new`] が 1 回だけ解決して
-///   実体パスを保存する。root 以外の所有者の symlink（他者が仕込み得るもの）は解決せず、
-///   [`Profile::open`] が拒否する。最終要素（ルート自身）と、解決後に
-///   現れる要素の symlink は解決せず、従来どおり [`Profile::open`] がハンドル基準で拒否する
-///   （`PROF-1`・`PROF-4`・`XOS-7`）
+/// - `canonicalize` はしない。symlink の検証は [`Profile::open`] がハンドル基準で
+///   行う（`PROF-1`・`PROF-4`）。macOS の `/var` など OS 標準の symlink を含む
+///   パスは、[`Profile::open`] の doc と同様に呼び出し側で `canonicalize` が必要
 /// - `..` を含むパスは受け付けるが、[`ExplicitStore::new`] が副作用の前に字句的に
 ///   畳み込んで保存する（`/tmp/new-dir/../profile` は `/tmp/profile`）。畳み込まずに
 ///   [`Profile::open`] へ渡すと、途中要素（`/tmp/new-dir`）が最終ルートの外に作成される
@@ -240,7 +237,6 @@ impl ExplicitStore {
                 reason: "explicit profile root must not be the filesystem root",
             });
         }
-        let root = resolve_trusted_ancestors(&root, |uid| uid == 0)?;
         reject_shared_existing_dir(&root)?;
         Ok(Self { root })
     }
@@ -302,78 +298,6 @@ fn normalize_lexically(path: &Path) -> Result<PathBuf, ProfileError> {
         }
     }
     Ok(out)
-}
-
-/// `root` の祖先（最終要素より上）に含まれる symlink を、所有者が `trusted_owner` を
-/// 満たす場合だけ解決した実体パスを返す（`PROF-1`・`PROF-4`・`XOS-7`）。
-///
-/// [`Profile::open`] は祖先の symlink を拒否するため、macOS の `/var`（`/private/var`）や
-/// `/tmp` のような OS 標準の symlink を含む指定は開けない。そこで [`ExplicitStore::new`] が、
-/// root 所有（他者が差し替えられない）の symlink に限って 1 要素ずつ解決する。
-/// 他の所有者の symlink は他者が仕込めるため解決せずそのまま残し、[`Profile::open`] が
-/// 拒否する（従来の挙動。fail-closed）。最終要素も解決せず [`Profile::open`] の検証に委ねる。存在しない要素は symlink では
-/// あり得ないのでそのまま連結する。解決後の経路への差し替えは [`Profile::open`] が
-/// `NOFOLLOW` で検出する。unix 以外では何もしない（Windows は `local_root.rs` が担う）。
-fn resolve_trusted_ancestors(
-    root: &Path,
-    trusted_owner: impl Fn(u32) -> bool,
-) -> Result<PathBuf, ProfileError> {
-    #[cfg(unix)]
-    {
-        use std::ffi::OsString;
-        use std::os::unix::fs::MetadataExt;
-
-        /// symlink を辿る回数の上限（ループによる無限解決の防止）。
-        const MAX_SYMLINK_HOPS: usize = 40;
-
-        /// `path` の要素を、先頭が末尾に来る順で `stack` へ積む（`pop` で先頭から取り出す）。
-        fn push_components(stack: &mut Vec<OsString>, path: &Path) {
-            let mut comps: Vec<OsString> = path
-                .components()
-                .map(|c| c.as_os_str().to_os_string())
-                .collect();
-            comps.reverse();
-            stack.extend(comps);
-        }
-
-        let (Some(parent), Some(leaf)) = (root.parent(), root.file_name()) else {
-            return Ok(root.to_path_buf());
-        };
-        let mut stack: Vec<OsString> = Vec::new();
-        push_components(&mut stack, parent);
-        let mut current = PathBuf::new();
-        let mut hops = 0usize;
-        while let Some(name) = stack.pop() {
-            if name == "/" {
-                current = PathBuf::from("/");
-            } else if name == "." {
-            } else if name == ".." {
-                current.pop();
-            } else {
-                let next = current.join(&name);
-                match std::fs::symlink_metadata(&next) {
-                    Ok(meta) if meta.file_type().is_symlink() && trusted_owner(meta.uid()) => {
-                        hops += 1;
-                        if hops > MAX_SYMLINK_HOPS {
-                            return Err(ProfileError::InvalidLayout {
-                                path: next,
-                                reason: "explicit profile root has too many symbolic links",
-                            });
-                        }
-                        let target = std::fs::read_link(&next)?;
-                        push_components(&mut stack, &target);
-                    }
-                    _ => current = next,
-                }
-            }
-        }
-        Ok(current.join(leaf))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = trusted_owner;
-        Ok(root.to_path_buf())
-    }
 }
 
 /// 既存ディレクトリが他者にアクセス可能（unix で group/other の権限ビットまたは sticky 等が立っている）なら拒否する。
@@ -1465,81 +1389,6 @@ mod tests {
                 );
             }
             other => panic!("expected InvalidLayout, got {:?}", other.map(|_| ())),
-        }
-    }
-
-    /// 現在のプロセスの実効 uid 相当（テスト用ディレクトリの所有者）。
-    #[cfg(unix)]
-    fn test_owner_uid(dir: &Path) -> u32 {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(dir).unwrap().uid()
-    }
-
-    /// PROF-1・XOS-7: 信頼する所有者の祖先 symlink（macOS の `/var` -> `/private/var` 相当）は
-    /// 解決され、最終要素は解決されず、解決後の実体パスでプロファイルが開ける。
-    #[test]
-    #[cfg(unix)]
-    fn prof_1_trusted_ancestor_symlink_is_resolved_and_opens() {
-        let tmp = TempDir::new();
-        std::fs::create_dir_all(tmp.0.join("private").join("var")).unwrap();
-        std::os::unix::fs::symlink("private/var", tmp.0.join("var")).unwrap();
-        let uid = test_owner_uid(&tmp.0);
-        let raw = tmp.0.join("var").join("sub").join("p");
-        let resolved = resolve_trusted_ancestors(&raw, |u| u == uid).unwrap();
-        assert_eq!(
-            resolved,
-            tmp.0.join("private").join("var").join("sub").join("p")
-        );
-        let profile = Profile::open(&resolved).unwrap();
-        assert!(tmp.0.join("private/var/sub/p/profile.lock").exists());
-        drop(profile);
-    }
-
-    /// PROF-1・PROF-4: 信頼しない所有者（既定は root 以外）の祖先 symlink は解決されず、
-    /// `Profile::open` が拒否してリンク先へ何も作らない。
-    #[test]
-    #[cfg(unix)]
-    fn prof_1_untrusted_ancestor_symlink_is_not_resolved_and_open_rejects() {
-        let tmp = TempDir::new();
-        std::fs::create_dir_all(tmp.0.join("real")).unwrap();
-        std::os::unix::fs::symlink(tmp.0.join("real"), tmp.0.join("link")).unwrap();
-        let raw = tmp.0.join("link").join("p");
-        let resolved = resolve_trusted_ancestors(&raw, |_| false).unwrap();
-        assert_eq!(resolved, raw);
-        assert!(Profile::open(&resolved).is_err());
-        assert!(!tmp.0.join("real").join("p").exists());
-    }
-
-    /// PROF-1・PROF-4: 最終要素が symlink の場合は（所有者が信頼されていても）解決せず、
-    /// `Profile::open` が拒否してリンク先へ何も作らない。
-    #[test]
-    #[cfg(unix)]
-    fn prof_1_leaf_symlink_is_not_resolved_and_open_rejects() {
-        let tmp = TempDir::new();
-        std::fs::create_dir_all(tmp.0.join("real")).unwrap();
-        std::os::unix::fs::symlink(tmp.0.join("real"), tmp.0.join("leaf")).unwrap();
-        let uid = test_owner_uid(&tmp.0);
-        let raw = tmp.0.join("leaf");
-        let resolved = resolve_trusted_ancestors(&raw, |u| u == uid).unwrap();
-        assert_eq!(resolved, raw);
-        assert!(Profile::open(&resolved).is_err());
-        assert!(!tmp.0.join("real").join("profile.lock").exists());
-    }
-
-    /// PROF-1: symlink のループは上限で打ち切られ `InvalidLayout` になる。
-    #[test]
-    #[cfg(unix)]
-    fn prof_1_symlink_loop_is_bounded() {
-        let tmp = TempDir::new();
-        std::fs::create_dir_all(&tmp.0).unwrap();
-        std::os::unix::fs::symlink("b", tmp.0.join("a")).unwrap();
-        std::os::unix::fs::symlink("a", tmp.0.join("b")).unwrap();
-        let raw = tmp.0.join("a").join("p");
-        match resolve_trusted_ancestors(&raw, |_| true) {
-            Err(ProfileError::InvalidLayout { reason, .. }) => {
-                assert_eq!(reason, "explicit profile root has too many symbolic links")
-            }
-            other => panic!("expected InvalidLayout, got {other:?}"),
         }
     }
 
