@@ -21,9 +21,10 @@
 //!   `Err(ProfileError::Unsupported)` を返してディレクトリを作らず、既定 ACL のまま
 //!   機密データを書き込む偽装成功を避ける（security.md「偽装・回避機能の禁止」）。
 //!   ACL を明示設定して任意のパスを許可する第 2 段階は未実装（後続・未判断）。
-//!   ハンドル基準の作成（unix。下記参照）は Windows へは移植しておらず、境界は
-//!   `canonicalize` による作成前後の判定で守る。ハンドル相対（`FILE_FLAG_OPEN_REPARSE_POINT`
-//!   等）での作成は第 2 段階の要件として引き継ぐ（REPAIR-3）
+//!   ルートまでの各要素・`profile.lock`・データ種別ディレクトリの作成と open は、親の
+//!   ハンドルを起点にした NT API（`win32` モジュール。Issue #950）で行い、パスの再解決で
+//!   配下外に作られる経路は無い。作成前は `canonicalize` による判定で守る。`root_fd`・
+//!   `data_dir_fd` 相当の公開 API と、書き込み系のハンドル基準の操作は Windows に無い（REPAIR-3）
 //!
 //! 並行アクセス時のデータ分離はデータディレクトリ分離（`PROF-6`）自体で成立し、
 //! `PROF-2`（`tests/isolation.rs`）・`PROF-3`（`tests/concurrent_isolation.rs`。
@@ -60,10 +61,11 @@
 //! ルートまでの各ディレクトリと `profile.lock` を `FILE_SHARE_DELETE` なしで開いて保持し
 //! （`Profile` はルートのディレクトリハンドルと `profile.lock` のハンドルを生存中持つ）、
 //! 改名・削除による別実体への差し替えを防ぐ。ただし保持するハンドルを起点にした
-//! `root_fd`・`data_dir_fd` 相当の操作は Windows に無く（子の作成・オープンはパス基準）、
-//! 空のディレクトリを再解析ポイント化する競合は防げないため、この契約は unix 限定である
-//! （残る競合は `local_root.rs` のモジュール doc「限界」。ハンドル基準への移行は第 2 段階（後続）。Issue #928 の
-//! PR #945 のレビューで判明。Issue #948・#950）。
+//! `root_fd`・`data_dir_fd` 相当の公開 API は Windows に無く
+//! （`open` 内の作成・open はハンドル相対だが、`open` 後に保持するのはルートのハンドルだけ。
+//! データ種別ディレクトリのハンドルは閉じる）、書き込み系のハンドル基準の操作は第 2 段階
+//! （後続。#813）の要件のため、この契約は unix 限定である
+//! （残る限界は `local_root.rs` のモジュール doc「限界」）。
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -517,7 +519,7 @@ pub struct Profile {
     _lock: lock::ProfileLock,
     /// Windows 限定: 検証済みルートのディレクトリハンドル（削除・改名を共有しない）。
     /// `Profile` の生存中、ルートを改名・削除によって別実体へ差し替えられないように
-    /// 固定する（空のディレクトリの再解析ポイント化は防げない。`local_root.rs` の「限界」）。`_lock` の後に宣言して、先にロックを解放し、その後にルートの固定を解く。
+    /// 固定する（`local_root.rs` の「限界」）。`_lock` の後に宣言して、先にロックを解放し、その後にルートの固定を解く。
     #[cfg(windows)]
     _root_dir: std::fs::File,
 }
@@ -558,13 +560,12 @@ impl Profile {
     /// 保持して、改名・削除による差し替えを防ぐ。`Profile` はルートのハンドルと `profile.lock`
     /// を生存中持つ。ACL を明示設定して任意のパスを許可する第 2 段階は未実装（後続・未判断）。
     ///
-    /// Windows の限界（作成の途中で空のディレクトリが再解析ポイント化される競合は防げず、
-    /// 配下外に空のディレクトリ・`profile.lock` が作られ得ること、その状態から元に戻されると
-    /// `PROF-1` の二重 open の拒否が破れ得ること、子の作成・オープンがパス基準であること、
-    /// 内側へ向くジャンクションを許可すること、既存ディレクトリの ACL を確認しないこと、
-    /// `profile.lock` の所有者・ハードリンク数を検査しないこと等）は `local_root.rs` の
-    /// モジュール doc「限界」を参照。第 2 段階（親のハンドルを起点にした作成。後続。Issue #928 の
-    /// PR #945 のレビューで判明。Issue #948・#950）で解消する想定。
+    /// Windows の作成・open は、ルートまでの各要素・`profile.lock`・データ種別ディレクトリを
+    /// 親のハンドル相対（Issue #950）で行い、作成の途中の再解析ポイント化でも配下外に作らず、
+    /// ロックはルートの実体の `profile.lock` に取る。Windows の限界（起点の `LOCALAPPDATA` は
+    /// パスで開くこと、実機の FSCTL では未検証であること、内側へ向くジャンクションを許可する
+    /// こと、既存ディレクトリの ACL を確認しないこと、`profile.lock` の所有者・ハードリンク数を
+    /// 検査しないこと等）は `local_root.rs` のモジュール doc「限界」を参照。
     ///
     /// # エラー
     ///
@@ -710,11 +711,11 @@ impl Profile {
     /// 手順（詳細は [`crate::local_root`]）: ① 作成前に、ルートが `%LOCALAPPDATA%` の
     /// 厳密な配下であることを正規化後のパスで判定する（配下外・判定不能は何も作らず
     /// [`ProfileError::Unsupported`]）、② `%LOCALAPPDATA%` からルートまでを 1 要素ずつ
-    /// 改名・削除を共有しないハンドルで開いて保持し（無ければ作る）、実体が判定どおりで
-    /// あることを `canonicalize` で再確認する、③ `profile.lock` を開いてロックを取る、
-    /// ④ 4 つのデータ種別ディレクトリを作る。③④ の対象はパスで再解決するため、②の後に
-    /// 空のルートが再解析ポイント化される競合は防げない（`local_root.rs` の「限界」）。アクセス制限は既定の継承 ACL に依存し、ACL の
-    /// 設定・検証はしない（`PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`）。
+    /// 改名・削除を共有しないハンドルで親のハンドル相対に作成・open して保持し、実体が判定
+    /// どおりであることを `canonicalize` で事後に再確認する、③ ルートのハンドル相対で
+    /// `profile.lock` を開いてロックを取る、④ ルートのハンドル相対で 4 つのデータ種別
+    /// ディレクトリを作る。②〜④ はパスを再解決して作成しない（`local_root.rs` の「限界」）。
+    /// アクセス制限は既定の継承 ACL に依存し、ACL の設定・検証はしない（`PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`）。
     #[cfg(windows)]
     pub(crate) fn open_under_local_app_data(
         root: &Path,
@@ -727,19 +728,20 @@ impl Profile {
         let display_root = std::path::absolute(root)?;
 
         // `LOCALAPPDATA` からルートまでを 1 要素ずつ開き（無ければ作り）、削除・改名を共有
-        // しないハンドルを保持して経路を固定する（`create_dir_all` は使わない）。これで防げる
-        // のは改名・削除による差し替えまで。空のディレクトリの再解析ポイント化は防げず、後続の
-        // ロックとサブディレクトリの作成はパスで行うため、空のルートが再解析ポイント化されて
-        // 元に戻されると配下外の `profile.lock` のロックを持った `Profile` が返り得る
-        // （`PROF-1` の限界。`local_root.rs` のモジュール doc「限界」。親のハンドルを起点にした作成へ移行して解消する後続課題）。
+        // しないハンドルを保持して経路を固定する（`create_dir_all` は使わない）。作成・open は
+        // 親のハンドル相対で、空のディレクトリが途中で再解析ポイント化されても配下外には
+        // 作られない。後続のロックとサブディレクトリもルートのハンドル相対で作るため、ロックは
+        // 常にルートの実体の `profile.lock` に取られる（`PROF-1`。`local_root.rs` のモジュール
+        // doc「限界」）。
         let pinned = local_root::pin_root(&plan)?;
 
         // ロックはデータ種別ディレクトリより先に取る。2 回目の opener は
         // ここで `Locked` を返し、data dir には触れない（unix 側と同じ）。
-        let (lock_file, lock_path) = local_root::open_lock_file(plan.expected())?;
+        let root_handle = pinned.root()?;
+        let (lock_file, lock_path) = local_root::open_lock_file(root_handle, plan.expected())?;
         let profile_lock = lock::try_acquire(lock_file, &lock_path)?;
 
-        local_root::ensure_data_dirs(plan.expected())?;
+        local_root::ensure_data_dirs(root_handle, plan.expected())?;
 
         // 途中の要素のハンドルはここで閉じ、ルートのハンドルだけを `Profile` が保持する。
         let root_dir = pinned.into_root_handle()?;
@@ -3052,11 +3054,54 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         make_junction(&root.join("profile.lock"), &outside);
         let result = Profile::open_under_local_app_data(&root, Some(lad.into_os_string()));
-        // 開く前に `symlink_metadata` で通常ファイルでない既存物を検出して確定させる。
+        // ハンドル相対の open がジャンクション自体（ディレクトリ）を開き、種別の不一致で拒否する。
         assert!(
             matches!(result, Err(ProfileError::InvalidLayout { .. })),
             "{:?}",
             result.map(|_| ())
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "配下外に作られた"
+        );
+    }
+
+    /// PROF-1・XOS-10（Windows）: 作成の途中でルートのパスが配下外へ向き、その後に元の実体へ
+    /// 戻っても、ロックはルートのハンドルの実体の `profile.lock` に取られるため、二重 open は
+    /// `Locked` で拒否される（パスとハンドルを食い違わせて模擬。実機の FSCTL は未検証）。
+    /// パス基準の実装では、ロックが配下外のファイルに取られ 2 つ目の open が成功してしまう。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_windows_double_open_not_broken_by_redirect_and_revert() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let tmp = TempDir::new();
+        let lad = fake_local_app_data(&tmp);
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(lad.join("real")).unwrap();
+        // 保持中でも改名できるよう FILE_SHARE_DELETE 付きで開く（再解析ポイント化の模擬）。
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2 | 0x4)
+            .custom_flags(0x0200_0000)
+            .open(lad.join("real"))
+            .unwrap();
+        std::fs::rename(lad.join("real"), lad.join("moved")).unwrap();
+        make_junction(&lad.join("real"), &outside);
+        let (lock_file, lock_path) =
+            crate::local_root::open_lock_file(&handle, &lad.join("real")).unwrap();
+        let _held = lock::try_acquire(lock_file, &lock_path).unwrap();
+        // 実体（`moved`）を 2 つ目の opener の対象にする（元の名前へ戻した状態の模擬）。
+        let second = Profile::open_under_local_app_data(
+            &lad.join("moved"),
+            Some(lad.clone().into_os_string()),
+        );
+        assert!(
+            matches!(second, Err(ProfileError::Locked { .. })),
+            "{:?}",
+            second.map(|_| ())
         );
         assert_eq!(
             std::fs::read_dir(&outside).unwrap().count(),

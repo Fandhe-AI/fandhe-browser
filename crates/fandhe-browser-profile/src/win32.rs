@@ -9,9 +9,9 @@
 //!
 //! ## 文脈
 //!
-//! 現時点の呼び出し元はテストだけで、`local_root.rs` の `Profile::open` 経路は従来どおり
-//! パスで作成する。経路の切り替えは Issue #950 で行う（本モジュールの要素は #950 で使い始めたら
-//! `expect(dead_code)` が警告になるので外す）。DACL（#952・#953）・既知フォルダ API（#951）の
+//! 呼び出し元は `local_root.rs` の継ぎ目（`open_or_create_child_dir`・`open_or_create_child_file`）
+//! で、`Profile::open`（Windows）のルートまでの各要素・`profile.lock`・データ種別ディレクトリの
+//! 作成と open はすべて本モジュール経由（Issue #950）。DACL（#952・#953）・既知フォルダ API（#951）の
 //! `unsafe` も本モジュールに置く。`SecurityDescriptor` は null（親から継承）で、設定経路は
 //! #952 で足す。
 //!
@@ -24,9 +24,11 @@
 //! ## 限界（`REPAIR-3`）
 //!
 //! 保持中の空の親へ実際に `FSCTL_SET_REPARSE_POINT` を発行して競合を再現するテストは
-//! 置いていない（`DeviceIoControl` 用の追加の `unsafe` と feature が要るため）。親ハンドル相対の
-//! open は親のファイルオブジェクトを起点にするため、親の再解析ポイントは評価されない、という
-//! 理解に基づく。実機の FSCTL では未検証で、#950 の PR で扱うかを判断する。
+//! 置いていない（`DeviceIoControl` 用の追加の `unsafe` と feature が要り、Issue #947 の決定の
+//! 範囲外のため #950 でも追加しない）。代わりに、パスとハンドルを食い違わせる模擬テスト
+//! （`local_root.rs`・`profile.rs`）で「作成がハンドルの実体の下にだけ行われる」ことを確かめる。
+//! 親ハンドル相対の open は親のファイルオブジェクトを起点にするため、親の再解析ポイントは
+//! 評価されない、という理解に基づく。実機の FSCTL では未検証。
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -70,13 +72,6 @@ const REASON_NOT_FILE: &str = "entry exists but is not a regular file";
 /// 作成したか、既存を開いたか（`IoStatusBlock.Information` 由来）。
 ///
 /// #952 が「新規に作ったルートにだけ DACL を設定する」判定に使う。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Issue #950 で local_root.rs の Profile::open 経路から使う"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChildDisposition {
     /// 新規に作成した。
@@ -89,18 +84,18 @@ pub(crate) enum ChildDisposition {
 ///
 /// `file` は改名・削除を共有しない（`DELETE` を共有しない）ハンドルで、保持している間は
 /// 改名・削除による差し替えを防ぐ。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Issue #950 で local_root.rs の Profile::open 経路から使う"
-    )
-)]
 #[derive(Debug)]
 pub(crate) struct OpenedChild {
     /// 開いたディレクトリ / ファイルのハンドル。
     pub(crate) file: File,
     /// 作成か既存の open か。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Issue #952 で新規作成したルートにだけ DACL を設定する判定に使う"
+        )
+    )]
     pub(crate) disposition: ChildDisposition,
 }
 
@@ -109,13 +104,6 @@ pub(crate) struct OpenedChild {
 /// `name` は 1 要素の名前に限り（[`validate_single_component`] で検証）、再解析ポイントは
 /// 辿らず拒否する。`InvalidLayout.path` は親からの相対名。呼び出し側で必要ならフルパスに補う。
 /// `SecurityDescriptor` は null（親から継承）。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Issue #950 で local_root.rs の Profile::open 経路から使う"
-    )
-)]
 pub(crate) fn open_or_create_dir_at(
     parent: &File,
     name: &OsStr,
@@ -141,13 +129,6 @@ pub(crate) fn open_or_create_dir_at(
 ///
 /// 共有モードは READ・WRITE を共有し DELETE を共有しない（`profile.lock` の
 /// `File::try_lock` に使える同期ハンドル）。そのほかは [`open_or_create_dir_at`] と同じ。
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Issue #950 で local_root.rs の Profile::open 経路から使う"
-    )
-)]
 pub(crate) fn open_or_create_file_at(
     parent: &File,
     name: &OsStr,
@@ -255,7 +236,8 @@ fn nt_create_at(
 /// 失敗した NTSTATUS を `ProfileError` に写す。
 ///
 /// ディレクトリ / ファイルの種別不一致は `InvalidLayout`、それ以外は Win32 エラーへ変換して
-/// `Io` にする（`NotFound`・`AlreadyExists` 等の意味を残す。#950 の `pin_root` の再試行が依存）。
+/// `Io` にする（`NotFound`・`AlreadyExists` 等のエラーの種別を判別できるよう意味を残す。
+/// `FILE_OPEN_IF` により作成の競合の再試行は不要）。
 fn map_failure(status: i32, name: &OsStr) -> ProfileError {
     match status {
         STATUS_FILE_IS_A_DIRECTORY => invalid_layout(name, REASON_NOT_FILE),

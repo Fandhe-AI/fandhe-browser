@@ -55,9 +55,11 @@
 //!   `ProfileError::Unsupported` で拒否してディレクトリを作らない。Win32 API で ACL を
 //!   明示設定して任意のパスを許可する第 2 段階は、依存の feature 追加と `unsafe` の
 //!   承認が要るため未実装（後続。未判断）。Windows の `Profile` はルートのディレクトリ
-//!   ハンドルと `profile.lock` を改名・削除を共有しない形で保持するが、空のディレクトリの
-//!   再解析ポイント化は防げない（`local_root.rs` の「限界」。親のハンドルを起点にした作成への移行は後続。Issue #928 の PR #945 のレビューで判明。Issue #948・#950。親ハンドル相対の作成・open の関数は `win32` モジュールに用意済みで、
-//!   `unsafe` はこのモジュールに限る。`Profile::open` の切り替えは #950。Issue #949）。Windows では
+//!   ハンドルと `profile.lock` を改名・削除を共有しない形で保持する。ルートまでの各要素・
+//!   `profile.lock`・データ種別ディレクトリの作成と open は、親のハンドルを起点にした
+//!   NT API（`win32` モジュール。`unsafe` はこのモジュールに限る。Issue #949・#950）で行い、
+//!   作成の途中の再解析ポイント化でも配下外に作らない（残る限界は `local_root.rs` の「限界」。
+//!   実機の FSCTL では未検証）。Windows では
 //!   ハンドル基準の走査・
 //!   `Profile::create_file_in`・`Profile::delete` も未実装
 

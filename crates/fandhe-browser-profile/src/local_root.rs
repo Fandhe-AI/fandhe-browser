@@ -1,12 +1,10 @@
 //! Windows 向け: プロファイルルートが `%LOCALAPPDATA%` 配下かを判定し、
 //! ルート・`profile.lock`・データ種別ディレクトリを作る補助モジュール。
 //!
-//! `profile.rs` の `Profile::open`（Windows 分岐）から呼ばれる。Windows には
-//! unix の `openat` + `NOFOLLOW` に相当する「親のハンドルを起点に子を作る・開く」API
-//! （std だけでは書けない。ハンドル相対の関数は `win32` モジュールに用意済みだが、本経路は
-//! まだ使っておらず #950 で切り替える）がないため、次の方針で境界を守る。本経路の
-//! 子の作成・オープンは現状パス文字列で行い、親のハンドルは起点にならない
-//! （下記「限界」の根本原因）。
+//! `profile.rs` の `Profile::open`（Windows 分岐）から呼ばれる。ルートまでの各要素・
+//! `profile.lock`・データ種別ディレクトリの作成と open は、親のハンドルを起点に 1 要素の名前
+//! だけを渡す NT API（`win32` モジュール。Issue #949・#950）で行い、パス文字列を再解決しない。
+//! 次の方針で境界を守る。
 //!
 //! - 作成前（[`plan_root`]）: ルートの絶対パスから、存在する最も深い祖先を `canonicalize`
 //!   （短縮名・大文字小文字・`\\?\` 表記・symlink／ジャンクションを実体に解決）し、まだ存在しない
@@ -14,33 +12,27 @@
 //!   `%LOCALAPPDATA%` の**厳密な配下**であることをコンポーネント単位で確認する
 //!   （文字列の前方一致ではない。`...\Local` と `...\LocalEvil` を取り違えない）。
 //!   `LOCALAPPDATA` 自体も、実体が `...\AppData\Local` で終わり UNC でないことを要求する。
-//! - 経路の固定（[`pin_root`]）: `LOCALAPPDATA` からルートまで 1 要素ずつ、`FILE_SHARE_DELETE`
-//!   なし（`read(true)` + `FILE_SHARE_READ | FILE_SHARE_WRITE`）で開き（無ければ
-//!   `create_dir`）、ハンドルを保持する。保持している間、その要素の**改名・削除**（`DELETE`
-//!   アクセスを要する open）は共有違反で失敗するため、改名・削除による別実体（ジャンクション
-//!   等）への差し替えは防げる。一方、**空のディレクトリへ `FSCTL_SET_REPARSE_POINT` で再解析
-//!   ポイントを設定する操作は防げない**。この操作は改名・削除を伴わず、
-//!   `FILE_WRITE_ATTRIBUTES` だけを持つハンドルで通り、属性アクセスは共有モードの検査の対象外
-//!   だからである（`FILE_SHARE_WRITE` を外しても防げない。[MS-FSA] の記述による理解で、
-//!   実機では未検証）。再解析ポイントを設定できるのは空のディレクトリだけで、中身のある
-//!   ディレクトリは対象にならない。`FILE_FLAG_OPEN_REPARSE_POINT` でリンク自体を開き、属性で
-//!   再解析ポイントを検出して `InvalidLayout` にする（開く時点で既にあるものは検出できる）。
-//!   固定した後に `canonicalize` の結果も再確認する（[`verify_created_root`]）。
-//! - 固定後: `profile.lock` とデータ種別ディレクトリは、`plan_root` が返した期待パスの
-//!   文字列で扱う（固定したハンドルを起点にはしない）。サブディレクトリは開いて再解析
-//!   ポイントでないことと `canonicalize` の結果を確認する。`profile.lock` も `FILE_SHARE_DELETE`
-//!   なしで開き、ロックの生存中は改名・削除による別実体への差し替えを防ぐ。ルートの
-//!   ハンドルは `Profile` が生存中保持し、途中の要素のハンドルは `open` の終了時に閉じる。
-//!   検出時に、それまでに作ったディレクトリ・ファイルは削除しない（削除先が差し替え後の実体だと
-//!   境界外を消しかねないため。unix 側も途中で作ったディレクトリを戻さない方針に揃える）。
+//! - 経路の固定（[`pin_root`]）: `LOCALAPPDATA` だけはパスで開き（`canonicalize` 済み・再解析
+//!   ポイントの検査あり）、ルートまでの各要素は親のハンドル相対で作成・open する
+//!   （`FILE_OPEN_IF` で作成と open が原子的）。各ハンドルは `FILE_SHARE_DELETE` なしで保持され、
+//!   保持している間、その要素の**改名・削除**は共有違反で失敗する。再解析ポイントは
+//!   `FILE_OPEN_REPARSE_POINT` でリンク自体を開き、属性で検出して `InvalidLayout` にする。
+//!   固定した後に `canonicalize` の結果も事後に再確認する（検出専用の [`verify_created_root`]）。
+//! - 固定後: `profile.lock`（[`open_lock_file`]）とデータ種別ディレクトリ（[`ensure_data_dirs`]）も
+//!   ルートのハンドル相対で作成・open する。ロックは常にルートの実体の `profile.lock` に取られる。
+//!   `profile.lock` は `FILE_SHARE_DELETE` なしで開き、ロックの生存中は改名・削除による別実体への
+//!   差し替えを防ぐ。ルートのハンドルは `Profile` が生存中保持し、途中の要素のハンドルは `open` の
+//!   終了時に閉じる。検出時に、それまでに作ったディレクトリ・ファイルは削除しない（削除先が
+//!   差し替え後の実体だと境界外を消しかねないため。unix 側も途中で作ったディレクトリを戻さない
+//!   方針に揃える）。
 //!
 //! アクセス制限は OS の既定の継承 ACL に依存し、ACL の設定・検証はしない
 //! （既定の継承 ACL のままなら、`%LOCALAPPDATA%` 配下に新規作成したディレクトリは
 //! SYSTEM・Administrators・本人のみにアクセス権が付く。実測は Issue #813 のコメント）。
 //! Administrators と SYSTEM は読める。ACL を明示設定して任意のパスを許可する第 2 段階
 //! （既知フォルダ API を含む）は依存の feature 追加と `unsafe` の承認が要るため未実装
-//! （後続。未判断）。対応するビヘイビアは `PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`
-//! （Issue #928、#813）。
+//! （後続。未判断）。対応するビヘイビアは `PROF-1`・`PROF-4`・`PROF-6`・`XOS-7`・`XOS-10`
+//! （Issue #928、#813、#950）。
 //!
 //! ## 前提とする攻撃者像
 //!
@@ -50,57 +42,37 @@
 //!
 //! - 守れる: `open` の前から存在する、または競合なしで置かれた細工（既存のジャンクション・
 //!   symlink、不正な名前、配下外の指定）。`plan_root` と、開く時点の属性検査で拒否する。
-//!   また、固定中の要素・`profile.lock` の改名・削除による別実体への差し替え。
-//! - 守れない: 同じユーザーの別プロセスが、`open` の途中で**空のディレクトリ**を再解析ポイント化
-//!   する競合（固定済みのハンドルでは防げない。上記「経路の固定」）。第 2 段階（後続。Issue #928 の
-//!   PR #945 のレビューで判明。Issue #948・#950）で、親のハンドルを起点に子を作る・開く方式（Win32 / NT API の
-//!   直接呼び出し。`unsafe` と依存の承認が要る）へ移すまで残る。
+//!   固定中の要素・`profile.lock` の改名・削除による別実体への差し替え。
+//!   同じユーザーの別プロセスが `open` の途中で空のディレクトリを再解析ポイント化する競合
+//!   （設定して戻す場合を含む）: 子は親のハンドルの実体の下にだけでき、ロックもルートの実体の
+//!   `profile.lock` に取られるため、配下外への作成と `PROF-1` の二重 open の拒否の破れは起きない
+//!   （親のファイルオブジェクトを起点にした open は親の再解析ポイントを評価しない、という
+//!   理解に基づく。パスとハンドルを食い違わせる模擬テストで確認し、実機の FSCTL では未検証）。
 //!
 //! ## 限界（`REPAIR-3`。実装済みを装わない）
 //!
-//! 空のディレクトリが再解析ポイント化される競合について、コード上の処理順
-//! （`plan_root` → [`pin_root`] → [`verify_created_root`] → [`open_lock_file`] → ロック取得 →
-//! [`ensure_data_dirs`]）から読み取れる範囲を示す。再解析ポイントの設定先は既存のディレクトリ
-//! （ジャンクションの先）とする。Windows の実機では未検証。
-//!
-//! - 新規に作った途中の要素 X（作成直後は空）が、`pin_root` で X を開いた後に再解析ポイント化
-//!   された場合: X の下の次の要素の `create_dir` はパスで X を再解決するため、配下外に空の
-//!   ディレクトリを作り得る（X より後の要素の数まで続く。各要素は開き直して属性を確認する
-//!   が、先は通常のディレクトリなので通る）。[`verify_created_root`] の `canonicalize` が
-//!   期待パスと食い違うため、通常は `InvalidLayout` で検出される。作られたものは消さずに残る。
-//!   再解析ポイントが `verify_created_root` の前に外されると、この確認は通る。ただしルートが
-//!   配下外に作られていれば、`open_lock_file` が配下の（存在しない）ルートの下を開こうとして
-//!   `Io(NotFound)` になる。
-//! - ルート自身が空のまま（新規作成の直後、または既存の空のルート）、`verify_created_root` の
-//!   後・`profile.lock` の作成前に再解析ポイント化された場合: `open_lock_file` は期待パスを
-//!   再解決するため、`profile.lock` が配下外に作られ（または既存のものが開かれ）、ロックも
-//!   そのファイルに取られ得る。続く `ensure_data_dirs` の最初のデータ種別ディレクトリが配下外に
-//!   作られ、`canonicalize` した親がルートと一致しないため `InvalidLayout` で検出される。
-//!   配下外の `profile.lock`・ディレクトリは残る。
-//! - 上の状態から、`ensure_data_dirs` の前に再解析ポイントが外されて元の空のルートへ戻されると、
-//!   `open_lock_file` 以降にはロックファイルがルートの実体であることを確認する処理がなく、
-//!   `ensure_data_dirs` の確認も通るため、`open` が成功し得る。この場合 `Profile` は配下外の
-//!   `profile.lock` のロックを持ち、配下のルートには `profile.lock` が無い。後続の `open` は配下の
-//!   ルートに新しい `profile.lock` を作って別のロックを取れるので、`PROF-1` の二重 open の拒否は
-//!   破れ得る（コード上、起こり得る）。
-//! - `profile.lock` とデータ種別ディレクトリがルートにできた後は、ルートは空でなくなり再解析
-//!   ポイント化できない（守れている点）。作成直後で空のデータ種別ディレクトリ自体は再解析
-//!   ポイント化され得るが、現状 Windows の `Profile` にはパス基準の書き込み API が無い
-//!   （次々項）ため、本モジュールの範囲では配下外への書き込みにならない。
-//! - `LOCALAPPDATA` より上の祖先は直接は保持していない（子のハンドルが開いている間は祖先の
-//!   改名も失敗すると期待しているが、未確認〔Windows で要確認〕）。
-//! - `open` の成功後に固定されるのはルート自身だけ。ルートの下のファイル・サブディレクトリは
-//!   `Profile` がパスでしか持たない。Windows では書き込み系の操作（`delete` 等）が未実装で
-//!   現時点の実害は無いが、書き込み系を Windows で有効にする際はハンドル基準の実装が必須。
+//! - 起点の `LOCALAPPDATA` はパスで開く（`canonicalize` 済み・再解析ポイントの検査あり）。
+//!   それより上の祖先は保持しない（子のハンドルが開いている間は祖先の改名も失敗すると期待して
+//!   いるが、未確認〔Windows で要確認〕）。既知フォルダ API による確認は #951。
+//! - 固定後に要素が再解析ポイント化された場合、作成はハンドル相対で配下に留まる。
+//!   [`verify_created_root`] の `canonicalize` が食い違いを検出すると `InvalidLayout` になり、
+//!   作ったものは配下に残る。実機の FSCTL では未検証。
+//! - 作成直後で空のデータ種別ディレクトリは再解析ポイント化され得る。ただし Windows の
+//!   `Profile` にはパス基準の書き込み API が無く、本モジュールの範囲では配下外への書き込みに
+//!   ならない。書き込み系を Windows で有効にする際（#813 の第 2 段階）はハンドル基準が必須。
+//! - `open` の成功後に保持するのはルートのハンドルだけ。データ種別ディレクトリのハンドルは
+//!   確認後に閉じる。
+//! - 既存の要素にも名前の検査（`validate_single_component`）がかかる。Win32 で通常は作れない
+//!   名前（予約名・末尾の `.` 等）の既存要素は `InvalidComponent` で拒否される（fail-closed）。
 //! - 入力パスの中に `%LOCALAPPDATA%` の内側へ向くジャンクションがある場合は、`plan_root` が
 //!   実体に解決した（正規化後の）パスを開く（拒否はしない。unix は途中の symlink を
 //!   すべて拒否するので差がある）。固定の段階で見つかる再解析ポイントは拒否する。
 //!   `Local` 配下に OneDrive 等の再解析ポイントがある環境では、それを通る経路は拒否される。
 //! - 既存のルート・既存の中間ディレクトリの ACL は確認しない。独自の ACL が設定されて
-//!   いれば、継承 ACL の前提は成り立たない。
+//!   いれば、継承 ACL の前提は成り立たない（#952・#953）。
 //! - `LOCALAPPDATA` が既知フォルダの実体かどうかは確認しない。環境変数の値を使い、実体が
 //!   ローカルドライブ上で `AppData\Local` で終わることだけを見る（既知フォルダ API は `unsafe`
-//!   か依存の追加が要るため未実装）。環境変数が共有場所に作った同名の階層を指していれば、
+//!   か依存の追加が要るため未実装。#951）。環境変数が共有場所に作った同名の階層を指していれば、
 //!   継承 ACL の前提は成り立たない。#813 の実測は実際の `%LOCALAPPDATA%` 配下で行ったもので、
 //!   この場合は測っていない。
 //! - `profile.lock` の所有者・ハードリンク数は検査しない（unix との差）。
@@ -414,15 +386,15 @@ const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
-/// ディレクトリのハンドルを開く。無ければ `Ok(None)`。
+/// ディレクトリのハンドルをパスで開く。無ければ `Ok(None)`。起点の `LOCALAPPDATA`
+/// （[`pin_root`]）と、ハンドル相対にしない非 Windows の骨格だけが使う。
 ///
 /// Windows では `read(true)` + `FILE_SHARE_READ | FILE_SHARE_WRITE`（`FILE_SHARE_DELETE` なし）
 /// で開くため、このハンドルを保持している間、そのディレクトリの改名・削除（`DELETE`
 /// アクセスを要する open）は共有違反で失敗し、改名・削除による別実体への差し替えは防げる
 /// （属性アクセスだけのハンドルは共有モードの検査に参加しないので `read(true)` は必須）。
-/// ただし空のディレクトリへの `FSCTL_SET_REPARSE_POINT`（再解析ポイント化）は防げない。
-/// 改名・削除を伴わず `FILE_WRITE_ATTRIBUTES` だけで通り、属性アクセスは共有モードの検査対象外の
-/// ため、`FILE_SHARE_WRITE` を外しても同じである（モジュール doc「限界」）。
+/// 空のディレクトリへの `FSCTL_SET_REPARSE_POINT`（再解析ポイント化）は防げないが、
+/// 子の作成はハンドル相対のため配下外には作られない（モジュール doc「限界」）。
 /// `FILE_FLAG_OPEN_REPARSE_POINT` により、その名前がジャンクション・symlink ならリンク
 /// 自体が開き、ハンドルの属性で再解析ポイントを検出して [`ProfileError::InvalidLayout`]
 /// にする。Windows 以外ではハンドルによる固定はなく、通常の open 後にパスが symlink で
@@ -471,14 +443,23 @@ fn open_dir(path: &Path) -> Result<File, ProfileError> {
 }
 
 /// `LOCALAPPDATA` からルートまでの各ディレクトリのハンドル（先頭が `LOCALAPPDATA`、
-/// 末尾がルート）。保持している間、Windows ではそれらの改名・削除ができない
-/// （空のディレクトリの再解析ポイント化は防げない。モジュール doc「限界」）。
+/// 末尾がルート）。保持している間、Windows ではそれらの改名・削除ができない。
+/// ルートまでの各要素は親のハンドル相対で作成・open している（[`open_or_create_child_dir`]）。
 #[derive(Debug)]
 pub(crate) struct PinnedPath {
     dirs: Vec<File>,
 }
 
 impl PinnedPath {
+    /// ルート（末尾の要素）のハンドルを借りる。`profile.lock`・データ種別ディレクトリを
+    /// このハンドル相対で作る・開くために使う（`profile.rs` の `open_under_local_app_data` から呼ばれる）。
+    pub(crate) fn root(&self) -> Result<&File, ProfileError> {
+        self.dirs.last().ok_or(ProfileError::InvalidLayout {
+            path: PathBuf::new(),
+            reason: "no pinned directory handle",
+        })
+    }
+
     /// 途中の要素のハンドルを閉じ、ルートのハンドルだけを返す。`Profile` が生存中保持する
     /// （ルートの改名・削除・差し替えを防ぐ）。
     pub(crate) fn into_root_handle(mut self) -> Result<File, ProfileError> {
@@ -495,16 +476,109 @@ impl PinnedPath {
     }
 }
 
-/// `LOCALAPPDATA` からルートまでを 1 要素ずつ開き（無ければ作り）、各ディレクトリの
-/// ハンドルを保持して経路を固定する。
+/// `win32` が返す `InvalidLayout`（親からの相対名）のパスを、表示用に親のパスと連結して
+/// フルパスへ補う。それ以外のエラーはそのまま返す。
+#[cfg(windows)]
+fn with_full_path(err: ProfileError, parent_path: &Path) -> ProfileError {
+    match err {
+        ProfileError::InvalidLayout { path, reason } => ProfileError::InvalidLayout {
+            path: parent_path.join(path),
+            reason,
+        },
+        other => other,
+    }
+}
+
+/// 親ハンドル `parent` の直下に子ディレクトリ `name` を作成する（既にあれば開く）。
 ///
-/// 各ハンドルは通常のディレクトリ（再解析ポイントでない）であることを、開く時点で確認する。
-/// 親のハンドルを保持するのは親の改名・削除を防ぐためで、子の作成・オープンはパスで行う
-/// （親を起点にしない）。そのため、`create_dir` の前に親が空のまま再解析ポイント化されると
-/// 配下外に作り得る（モジュール doc「限界」）。開く時点で既にあるジャンクションは検出され、
-/// そこで止まる（`create_dir_all` のように先へ複数作らない）。`AlreadyExists`（並行して同じ
-/// ルートを開く別プロセス）は成功扱いにして開き直す。固定後に [`verify_created_root`] で
-/// `canonicalize` の結果も確認する（OS 非依存の骨格。`PROF-1`・`PROF-4`、TOCTOU 対策）。
+/// `pin_root`（ルートまでの各要素）と [`ensure_data_dirs`]（データ種別ディレクトリ）から
+/// 呼ばれる継ぎ目（`PROF-1`・`PROF-4`・`XOS-10`）。Windows では `win32::open_or_create_dir_at`
+/// （NT API。親のハンドルを起点にし、パス文字列を再解決しない）を呼ぶ。`parent_path` は
+/// エラー表示にだけ使い、解決には使わない。非 Windows はテスト用の骨格（本番の経路ではない）で、
+/// `create_dir` と [`open_dir`] によりパスで解決し、`parent` は使わない。
+fn open_or_create_child_dir(
+    parent: &File,
+    parent_path: &Path,
+    name: &OsStr,
+) -> Result<File, ProfileError> {
+    #[cfg(windows)]
+    {
+        crate::win32::open_or_create_dir_at(parent, name)
+            .map(|opened| opened.file)
+            .map_err(|err| with_full_path(err, parent_path))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = parent;
+        let path = parent_path.join(name);
+        match std::fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(ProfileError::Io(err)),
+        }
+        open_dir(&path)
+    }
+}
+
+/// 親ハンドル `parent` の直下にファイル `name`（`profile.lock`）を読み書き可能で作成する
+/// （既にあれば開く）。[`open_lock_file`] から呼ばれる継ぎ目で、方針は
+/// [`open_or_create_child_dir`] と同じ（Windows は `win32::open_or_create_file_at`、
+/// 非 Windows はパスで解決するテスト用の骨格）。通常ファイルでなければ `InvalidLayout`。
+fn open_or_create_child_file(
+    parent: &File,
+    parent_path: &Path,
+    name: &OsStr,
+) -> Result<File, ProfileError> {
+    #[cfg(windows)]
+    {
+        crate::win32::open_or_create_file_at(parent, name)
+            .map(|opened| opened.file)
+            .map_err(|err| with_full_path(err, parent_path))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = parent;
+        let path = parent_path.join(name);
+        // 既存物が通常ファイルでない（ディレクトリ・symlink 等）場合は、開く前に拒否する。
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if !m.file_type().is_file() => {
+                return Err(ProfileError::InvalidLayout {
+                    path,
+                    reason: "profile lock path is not a regular file",
+                });
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(ProfileError::Io(err)),
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(ProfileError::Io)?;
+        if !file.metadata().map_err(ProfileError::Io)?.is_file() {
+            return Err(ProfileError::InvalidLayout {
+                path,
+                reason: "profile lock path is not a regular file",
+            });
+        }
+        Ok(file)
+    }
+}
+
+/// `LOCALAPPDATA` からルートまでを 1 要素ずつ親のハンドル相対で作成・open し（既にあれば開く）、
+/// 各ディレクトリのハンドルを保持して経路を固定する。
+///
+/// 起点の `LOCALAPPDATA` だけはパスで開く（`canonicalize` 済み・再解析ポイント検査あり。
+/// 既知フォルダ API は #951 まで未対応）。以降は [`open_or_create_child_dir`] により、
+/// 作成と open が原子的（Windows は `FILE_OPEN_IF`）で、パスの再解決による配下外への作成は
+/// 起きない。並行して同じルートを開く別プロセスがあってもそのまま開ける。各ハンドルは
+/// 再解析ポイントでないディレクトリであることを開く時点で確認する。固定後に
+/// [`verify_created_root`] で実体の食い違いを事後に検出する（多層防御。OS 非依存の骨格。
+/// `PROF-1`・`PROF-4`）。既存の要素にも名前の検査（`validate_single_component`）がかかるため、
+/// Win32 で通常は作れない名前の既存要素は `InvalidComponent` で拒否される（fail-closed）。
 pub(crate) fn pin_root(plan: &RootPlan) -> Result<PinnedPath, ProfileError> {
     let relative = plan
         .expected
@@ -516,27 +590,22 @@ pub(crate) fn pin_root(plan: &RootPlan) -> Result<PinnedPath, ProfileError> {
         let Component::Normal(name) = component else {
             return Err(unsupported(REASON_UNSUPPORTED_FORM));
         };
+        let parent = dirs.last().ok_or(ProfileError::InvalidLayout {
+            path: current.clone(),
+            reason: "no pinned directory handle",
+        })?;
+        let handle = open_or_create_child_dir(parent, &current, name)?;
         current.push(name);
-        let handle = match try_open_dir(&current)? {
-            Some(handle) => handle,
-            None => {
-                match std::fs::create_dir(&current) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(err) => return Err(ProfileError::Io(err)),
-                }
-                open_dir(&current)?
-            }
-        };
         dirs.push(handle);
     }
     verify_created_root(plan)?;
     Ok(PinnedPath { dirs })
 }
 
-/// ルートの実体が作成前の判定どおりであることを再確認する。
+/// ルートの実体が作成前の判定どおりであることを再確認する（検出専用）。
 ///
-/// 食い違い（ジャンクション・symlink への差し替え）は [`ProfileError::InvalidLayout`]
+/// 作成はハンドル相対のため、配下外への作成を防ぐ役割はもう持たない。食い違い
+/// （ジャンクション・symlink への差し替え）は [`ProfileError::InvalidLayout`]
 /// （作ったものは消さない。モジュール doc の「限界」）。パスの再解決による確認なので、
 /// この確認より後の再解析ポイント化や、確認前に外された再解析ポイントは検出できない。
 fn verify_created_root(plan: &RootPlan) -> Result<(), ProfileError> {
@@ -557,75 +626,50 @@ fn verify_created_root(plan: &RootPlan) -> Result<(), ProfileError> {
     Ok(())
 }
 
-/// `root`（検証済みの実体パス）直下の `profile.lock` を開く（無ければ作る）。
+/// ルートのハンドル `root_dir` の直下の `profile.lock` を開く（無ければ作る）。
 ///
-/// symlink 等はリンク先を辿らず開き、通常ファイルでなければ
-/// [`ProfileError::InvalidLayout`] で拒否する。unix 側が行う所有者・ハードリンク数の
-/// 検査に相当するものは Windows にはない（ACL は継承に依存し検証しない。REPAIR-3）。
+/// `root_path` は表示とエラー用で、Windows では解決に使わない（ハンドル相対。再解析ポイントや
+/// 種別の不一致は `win32` が [`ProfileError::InvalidLayout`] で拒否する）。ロックは常にルートの
+/// 実体の `profile.lock` に取られ、作成の途中でルートが再解析ポイント化されても配下外の
+/// ファイルにはならない（`PROF-1`）。返すパスは `root_path.join("profile.lock")`
+/// （ロックのエラー表示用）。unix 側が行う所有者・ハードリンク数の検査に相当するものは
+/// Windows にはない（ACL は継承に依存し検証しない。REPAIR-3）。
 ///
-/// Windows では `FILE_SHARE_READ | FILE_SHARE_WRITE`（`FILE_SHARE_DELETE` なし）で開く。
-/// 返したハンドルを `ProfileLock` が保持している間、`profile.lock` の改名・削除は共有違反で
-/// 失敗し、別実体の `profile.lock` を作って二重 open をすり抜けることはできない（`PROF-1`）。
-/// READ・WRITE の共有は残すので、2 つ目の open は共有違反でなくロック取得失敗
-/// （[`ProfileError::Locked`]）で拒否される。親ディレクトリの固定は子の改名を防がないため、
-/// ファイル自身のハンドルで守る。ただし `root` はパスで再解決するため、`root` が空のうちに
-/// 再解析ポイント化されると配下外の `profile.lock` を開く・作る（モジュール doc「限界」）。
-pub(crate) fn open_lock_file(root: &Path) -> Result<(File, PathBuf), ProfileError> {
-    let path = root.join(LOCK_FILE_NAME);
-    // 既存物が通常ファイルでない（ディレクトリ・ジャンクション・symlink 等）場合は、開く前に
-    // `InvalidLayout` に確定させる。
-    match std::fs::symlink_metadata(&path) {
-        Ok(m) if !m.file_type().is_file() => {
-            return Err(ProfileError::InvalidLayout {
-                path,
-                reason: "profile lock path is not a regular file",
-            });
-        }
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(ProfileError::Io(err)),
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(&path).map_err(ProfileError::Io)?;
-    let metadata = file.metadata().map_err(ProfileError::Io)?;
-    if !metadata.is_file() {
-        return Err(ProfileError::InvalidLayout {
-            path,
-            reason: "profile lock path is not a regular file",
-        });
-    }
-    Ok((file, path))
+/// Windows のハンドルは READ・WRITE を共有し DELETE を共有しないため、`ProfileLock` が保持
+/// している間は改名・削除による別実体への差し替えを防ぐ。2 つ目の open は共有違反でなく
+/// ロック取得失敗（[`ProfileError::Locked`]）で拒否される。
+pub(crate) fn open_lock_file(
+    root_dir: &File,
+    root_path: &Path,
+) -> Result<(File, PathBuf), ProfileError> {
+    let file = open_or_create_child_file(root_dir, root_path, OsStr::new(LOCK_FILE_NAME))?;
+    Ok((file, root_path.join(LOCK_FILE_NAME)))
 }
 
-/// `root`（検証済みの実体パス）直下に 4 つのデータ種別ディレクトリを作り、
-/// 実体が `root` の直下の通常のディレクトリであること（symlink・ジャンクションでないこと）を
-/// ハンドルで確認する（確認後はハンドルを閉じる。`root` は呼び出し側が固定済みだが、
-/// 作成と確認はパスで行うため、`root` が空のうちの再解析ポイント化は防げない。検出は
-/// `canonicalize` の食い違いによる事後で、配下外に作ったものは残る）。
-pub(crate) fn ensure_data_dirs(root: &Path) -> Result<(), ProfileError> {
+/// ルートのハンドル `root_dir` の直下に 4 つのデータ種別ディレクトリを作り（既にあれば開き）、
+/// 通常のディレクトリであることを確認する（確認後はハンドルを閉じる）。
+///
+/// `root_path` は表示とエラー用。Windows ではハンドル相対のため構造上ルートの直下になり、
+/// パスの `canonicalize` による確認は行わない。非 Windows の骨格はパスで解決するため、
+/// `canonicalize` の結果が `root_path` の直下であることを確認する。
+pub(crate) fn ensure_data_dirs(root_dir: &File, root_path: &Path) -> Result<(), ProfileError> {
     for kind in DataKind::ALL {
-        let path = root.join(kind.dir_name());
-        match std::fs::create_dir(&path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(ProfileError::Io(err)),
-        }
-        open_dir(&path)?;
-        let actual = std::fs::canonicalize(&path).map_err(ProfileError::Io)?;
-        let is_dir = std::fs::symlink_metadata(&actual).is_ok_and(|m| m.is_dir());
-        if !is_dir || actual.parent() != Some(root) || actual.file_name() != path.file_name() {
-            return Err(ProfileError::InvalidLayout {
-                path,
-                reason: "profile data directory is not a plain directory directly under the root",
-            });
+        let name = OsStr::new(kind.dir_name());
+        let _dir = open_or_create_child_dir(root_dir, root_path, name)?;
+        #[cfg(not(windows))]
+        {
+            let path = root_path.join(name);
+            let actual = std::fs::canonicalize(&path).map_err(ProfileError::Io)?;
+            let is_dir = std::fs::symlink_metadata(&actual).is_ok_and(|m| m.is_dir());
+            if !is_dir
+                || actual.parent() != Some(root_path)
+                || actual.file_name() != path.file_name()
+            {
+                return Err(ProfileError::InvalidLayout {
+                    path,
+                    reason: "profile data directory is not a plain directory directly under the root",
+                });
+            }
         }
     }
     Ok(())
@@ -946,10 +990,11 @@ mod tests {
         let root = lad.join("p").join("q");
         let plan = plan_root(&root, env(&lad)).unwrap();
         pin_root(&plan).expect("通常のディレクトリは作れる");
-        pin_root(&plan).expect("既存（AlreadyExists）でも成功する");
-        let (_file, lock_path) = open_lock_file(plan.expected()).unwrap();
+        let pinned = pin_root(&plan).expect("既存（AlreadyExists）でも成功する");
+        let root_dir = pinned.root().expect("ルートのハンドル");
+        let (_file, lock_path) = open_lock_file(root_dir, plan.expected()).unwrap();
         assert_eq!(lock_path, root.join("profile.lock"));
-        ensure_data_dirs(plan.expected()).unwrap();
+        ensure_data_dirs(root_dir, plan.expected()).unwrap();
         for name in ["cookies", "storage", "cache", "history"] {
             assert!(root.join(name).is_dir(), "{name} がない");
         }
@@ -1010,7 +1055,8 @@ mod tests {
         let lad = tmp.lad();
         let root = lad.join("p");
         std::fs::create_dir_all(root.join("profile.lock")).unwrap();
-        let result = open_lock_file(&root);
+        let root_dir = open_dir(&root).unwrap();
+        let result = open_lock_file(&root_dir, &root);
         assert!(
             matches!(result, Err(ProfileError::InvalidLayout { .. })),
             "{result:?}"
@@ -1025,7 +1071,8 @@ mod tests {
         let root = lad.join("p");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("cookies"), b"x").unwrap();
-        let err = ensure_data_dirs(&root).expect_err("ファイルは拒否される");
+        let root_dir = open_dir(&root).unwrap();
+        let err = ensure_data_dirs(&root_dir, &root).expect_err("ファイルは拒否される");
         assert!(matches!(err, ProfileError::InvalidLayout { .. }), "{err:?}");
     }
 
@@ -1155,6 +1202,79 @@ mod tests {
             0,
             "配下外に作られた"
         );
+    }
+
+    /// `mklink /J`（cmd.exe は `\\?\` 付きパスを扱えないためドライブ形式へ戻して渡す）。
+    #[cfg(windows)]
+    fn mklink_junction(link: &Path, target: &Path) {
+        let plain = |p: &Path| PathBuf::from(p.to_string_lossy().trim_start_matches(r"\\?\"));
+        let output = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(plain(link))
+            .arg(plain(target))
+            .output()
+            .expect("cmd.exe を起動できる");
+        assert!(output.status.success(), "mklink /J failed");
+    }
+
+    /// `FILE_SHARE_DELETE` 付きで開く（保持中でも改名できる。パスとハンドルを食い違わせる模擬用）。
+    #[cfg(windows)]
+    fn open_dir_share_delete(path: &Path) -> File {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | 0x4)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .expect("ディレクトリを開ける")
+    }
+
+    /// PROF-1・PROF-4・XOS-10（Windows）: 親のパスがジャンクションへ差し替わっても（ハンドルは
+    /// 元の実体のまま）、`profile.lock` とデータ種別ディレクトリはハンドルの実体の下にだけでき、
+    /// 配下外には作られない（空のディレクトリの再解析ポイント化を、パスとハンドルの食い違いで模擬。
+    /// 実機の FSCTL は未検証。win32.rs の「限界」）。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_xos10_windows_lock_and_data_dirs_follow_root_handle_not_path() {
+        let tmp = TempDir::new();
+        let lad = tmp.lad();
+        let outside = tmp.0.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(lad.join("real")).unwrap();
+        let handle = open_dir_share_delete(&lad.join("real"));
+        std::fs::rename(lad.join("real"), lad.join("moved")).expect("改名できる");
+        mklink_junction(&lad.join("real"), &outside);
+        let stale = lad.join("real");
+        open_lock_file(&handle, &stale).expect("ロックはハンドルの実体に作られる");
+        ensure_data_dirs(&handle, &stale).expect("データ種別はハンドルの実体に作られる");
+        assert!(lad.join("moved").join("profile.lock").is_file());
+        for name in ["cookies", "storage", "cache", "history"] {
+            assert!(lad.join("moved").join(name).is_dir(), "{name} がない");
+        }
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "配下外に作られた"
+        );
+    }
+
+    /// PROF-1（Windows）: 同じ新規ルートへ同時に `pin_root` しても両方成功する
+    /// （`FILE_OPEN_IF` の原子性。作成の競合で失敗しない）。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_windows_pin_root_concurrent_create_is_atomic() {
+        let tmp = TempDir::new();
+        let lad = tmp.lad();
+        let plan = plan_root(&lad.join("a").join("b"), env(&lad)).unwrap();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4).map(|_| scope.spawn(|| pin_root(&plan))).collect();
+            for handle in handles {
+                handle.join().unwrap().expect("同時作成でも成功する");
+            }
+        });
+        assert_eq!(std::fs::read_dir(&lad).unwrap().count(), 1);
     }
 
     #[test]
