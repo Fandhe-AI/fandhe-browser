@@ -434,10 +434,20 @@ fn cli1_profile_alias_remains_unknown_option() {
     assert!(out.stderr.contains("unknown option"), "{}", out.stderr);
 }
 
+/// 祖先に symlink を含まない一時ディレクトリの基点（`PROF-1`・`PROF-4`）。
+///
+/// `--profile-dir` は祖先の symlink を `Profile::open` が拒否する。macOS の `temp_dir()` は
+/// `/var/folders/...`（`/var` は `/private/var` への symlink）を返すため、`--profile-dir` に渡す
+/// パスは `canonicalize` した実体パスを基点にする。
+#[cfg(unix)]
+fn real_temp_dir() -> PathBuf {
+    std::fs::canonicalize(std::env::temp_dir()).expect("temp_dir can be canonicalized")
+}
+
 #[cfg(unix)]
 #[test]
 fn prof1_profile_dir_creates_profile_and_runs_navigate() {
-    let parent = std::env::temp_dir().join(format!("fandhe-cli-prof-ok-{}", std::process::id()));
+    let parent = real_temp_dir().join(format!("fandhe-cli-prof-ok-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&parent);
     std::fs::create_dir(&parent).expect("parent");
     let dir = parent.join("p");
@@ -456,7 +466,7 @@ fn prof1_profile_dir_creates_profile_and_runs_navigate() {
 #[cfg(unix)]
 #[test]
 fn prof1_profile_dir_symlink_then_dotdot_is_rejected() {
-    let parent = std::env::temp_dir().join(format!("fandhe-cli-prof-ln-{}", std::process::id()));
+    let parent = real_temp_dir().join(format!("fandhe-cli-prof-ln-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&parent);
     std::fs::create_dir(&parent).expect("parent");
     let other = parent.join("other");
@@ -505,7 +515,7 @@ fn cli3_launch_port_zero_announces_assigned_port() {
     use std::net::TcpStream;
     use std::sync::mpsc;
 
-    let home = std::env::temp_dir().join(format!("fandhe-cli-port0-{}", std::process::id()));
+    let home = real_temp_dir().join(format!("fandhe-cli-port0-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir(&home).expect("home dir");
     let profile = home.join("p");
