@@ -15,6 +15,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MEASURE="$SCRIPT_DIR/measure.sh"
+# 呼び出し側の FANDHE_BROWSER_CONFIG は measure.sh が拒否する（終了コード 2）ため、テスト中は外す
+unset FANDHE_BROWSER_CONFIG
 [ "$(uname -s)" = "Linux" ] || { echo "error: Linux only" >&2; exit 4; }
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -51,7 +53,7 @@ for bad in 1.1.1.01 01.1.1.1 256.1.1.1 1.1.1 a.b.c.d; do
   "$MEASURE" -n 1 --dns "$bad" --fandhe-bin /bin/true --skip-chromium >/dev/null 2>&1 || st=$?
   [ "$st" -eq 2 ] || fail "--dns '$bad' must exit 2 (got $st)"
 done
-for opt in -n --settle --url --out --fandhe-bin --conditions; do
+for opt in -n --settle --url --out --fandhe-bin --conditions --page-js --peak-interval-ms; do
   st=0
   "$MEASURE" "$opt" >/dev/null 2>&1 || st=$?
   [ "$st" -eq 2 ] || fail "'$opt' without a value must exit 2 (got $st)"
@@ -475,6 +477,107 @@ ok "fake binary x2: processes=$procs pss_kib=$pss (process tree walked, JSON emi
 # 後始末: 偽バイナリが 1 つも残っていない
 if pgrep -f "$FAKE" >/dev/null 2>&1; then fail "leftover processes after run"; fi
 ok "no leftover processes"
+
+# ---- ページ JS（--page-js）とピーク記録（Issue #957、TASK-81、PERF-4・MEAS-6） ----
+# --page-js の値は v8|boa のみ。--skip-fandhe との併用、呼び出し側の FANDHE_BROWSER_CONFIG は起動前に終了コード 2
+for bad in spidermonkey V8 ""; do
+  expect_usage_error "--page-js '$bad'" --page-js "$bad"
+done
+expect_usage_error "--page-js with --peak-interval-ms 9" --page-js v8 --peak-interval-ms 9
+expect_usage_error "--peak-interval-ms 1001" --peak-interval-ms 1001
+expect_usage_error "--peak-interval-ms 050" --peak-interval-ms 050
+st=0
+"$MEASURE" --fandhe-bin /bin/true --chromium-bin /bin/true --skip-fandhe --conditions idle --page-js v8 >/dev/null 2>&1 || st=$?
+[ "$st" -eq 2 ] || fail "--page-js with --skip-fandhe must exit 2 (got $st)"
+for v in /x ""; do
+  st=0
+  FANDHE_BROWSER_CONFIG="$v" "$MEASURE" --fandhe-bin /bin/true --skip-chromium --conditions idle >/dev/null 2>&1 || st=$?
+  [ "$st" -eq 2 ] || fail "caller FANDHE_BROWSER_CONFIG='$v' must exit 2 (got $st)"
+done
+ok "--page-js / --peak-interval-ms validation; caller FANDHE_BROWSER_CONFIG (even empty) is rejected (exit 2)"
+
+# 設定ファイルの引き渡し: 起動した子が受け取った FANDHE_BROWSER_CONFIG のパスと内容を記録する偽バイナリ
+REC_DIR="$TMP/rec"; mkdir -p "$REC_DIR"
+cat >"$TMP/recorder" <<'REC_EOF'
+#!/bin/sh
+{ printf '%s\n' "${FANDHE_BROWSER_CONFIG-<unset>}"; [ -z "${FANDHE_BROWSER_CONFIG-}" ] || cat "$FANDHE_BROWSER_CONFIG"; } >"$FAKE_RECORD_DIR/$$.txt"
+exec sleep 300
+REC_EOF
+chmod +x "$TMP/recorder"
+EXPECT_CFG=$'[js]\nengine = "boa"\nexecute_page_scripts = true'
+if command -v jq >/dev/null 2>&1; then
+  rm -f "$REC_DIR"/*
+  OUT="$(FAKE_RECORD_DIR="$REC_DIR" "$MEASURE" -n 2 --fandhe-bin "$TMP/recorder" --skip-chromium --conditions idle --settle 1 \
+    --net-mode host --no-ready-check --allow-shared-port --page-js boa 2>/dev/null)" || fail "page-js recorder run failed"
+  [ "$(find "$REC_DIR" -type f | wc -l)" -eq 2 ] || fail "expected 2 recordings"
+  [ "$(for f in "$REC_DIR"/*; do head -1 "$f"; done | sort -u | wc -l)" -eq 2 ] || fail "each instance must get its own config path"
+  for f in "$REC_DIR"/*; do
+    [ "$(tail -n +2 "$f")" = "$EXPECT_CFG" ] || fail "config content mismatch: $(tail -n +2 "$f")"
+    case "$(head -1 "$f")" in /*/config/[12].toml) ;; *) fail "config path must be under the work dir: $(head -1 "$f")" ;; esac
+  done
+  jq -e '.page_js_enabled == true and .page_js_engine == "boa" and .peak_interval_ms == 50' <<<"$OUT" >/dev/null \
+    || fail "page_js_enabled/page_js_engine must be recorded"
+  ok "--page-js boa (host, N=2): per-instance config delivered via FANDHE_BROWSER_CONFIG; JSON records enabled/engine"
+  rm -f "$REC_DIR"/*
+  OUT="$(FAKE_RECORD_DIR="$REC_DIR" "$MEASURE" -n 2 --fandhe-bin "$TMP/recorder" --skip-chromium --conditions idle --settle 1 \
+    --net-mode host --no-ready-check --allow-shared-port 2>/dev/null)" || fail "no-page-js recorder run failed"
+  [ "$(for f in "$REC_DIR"/*; do head -1 "$f"; done | sort -u)" = "<unset>" ] || fail "without --page-js FANDHE_BROWSER_CONFIG must be unset"
+  jq -e '.page_js_enabled == false and .page_js_engine == null' <<<"$OUT" >/dev/null || fail "page_js must be recorded as disabled"
+  ok "without --page-js: FANDHE_BROWSER_CONFIG stays unset; JSON records disabled"
+  # netns 経路（外向き経路なしの idle）でも環境変数が届く。非特権 userns か root のときだけ
+  if unshare -Urn true 2>/dev/null || [ "$(id -u)" -eq 0 ]; then
+    rm -f "$REC_DIR"/*
+    FAKE_RECORD_DIR="$REC_DIR" "$MEASURE" -n 2 --fandhe-bin "$TMP/recorder" --skip-chromium --conditions idle --settle 1 \
+      --net-mode netns --no-ready-check --page-js v8 >/dev/null 2>&1 || fail "netns page-js recorder run failed"
+    [ "$(find "$REC_DIR" -type f | wc -l)" -eq 2 ] || fail "netns: expected 2 recordings"
+    for f in "$REC_DIR"/*; do
+      tail -n +2 "$f" | grep -q 'engine = "v8"' || fail "netns: config not delivered"
+    done
+    ok "--page-js v8 (netns, N=2): config delivered in the netns launch path"
+  else
+    echo "note: netns unavailable here; netns env delivery NOT verified"
+  fi
+else
+  echo "note: jq not found; --page-js config/JSON checks NOT verified"
+fi
+if pgrep -f "$TMP/recorder" >/dev/null 2>&1; then fail "leftover recorder processes"; fi
+
+# ピーク記録（idle の偽バイナリ）
+if command -v jq >/dev/null 2>&1; then
+  OUT="$("$MEASURE" -n 1 --fandhe-bin "$FAKE" --skip-chromium --conditions idle --settle 1 \
+    --net-mode host --no-ready-check 2>/dev/null)" || fail "peak idle run failed"
+  jq -e '.peak_interval_ms == 50 and (.results[0] | .peak_pss_kib >= .pss_kib and .peak_samples >= 1 and .peak_processes >= 1 and .peak_window_ms >= 0 and (has("js_worker") | not))' \
+    <<<"$OUT" >/dev/null || fail "peak fields (peak_pss_kib >= pss_kib, peak_samples >= 1)"
+  ok "idle: peak_pss_kib >= pss_kib, peak_samples >= 1, no js_worker key"
+fi
+
+# loaded + --page-js: JS ワーカー（偽 fandhe が起動する子）の確認とピーク。node とポート 9333 が必要
+if command -v node >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 && ! (exec 3<>/dev/tcp/127.0.0.1/9333) 2>/dev/null; then
+  node --check "$SCRIPT_DIR/fake_fandhe_cdp.mjs" || fail "fake_fandhe_cdp.mjs syntax"
+  printf '#!/bin/sh\nexec node "%s"\n' "$SCRIPT_DIR/fake_fandhe_cdp.mjs" >"$TMP/fake-js-fandhe"; chmod +x "$TMP/fake-js-fandhe"
+  run_loaded() { # $1=FAKE_SPAWN、以降=追加引数。stdout=JSON、終了コードを返す
+    local spawn="$1"; shift
+    FAKE_SPAWN="$spawn" "$MEASURE" -n 1 --fandhe-bin "$TMP/fake-js-fandhe" --skip-chromium --conditions loaded \
+      --url https://example.com/ --settle 3 --net-mode host --peak-interval-ms 20 "$@" 2>"$TMP/loaded.err"
+  }
+  st=0; OUT="$(run_loaded worker --page-js v8)" || st=$?
+  [ "$st" -eq 0 ] || fail "loaded --page-js with a worker must exit 0 (got $st): $(tail -3 "$TMP/loaded.err")"
+  jq -e '.results[0] | .js_worker.confirmed_instances == 1 and (.peak_pss_kib - .pss_kib) >= 16384' <<<"$OUT" >/dev/null \
+    || fail "worker confirmed and peak must exceed the post-settle pss by >= 16 MiB: $OUT"
+  ok "loaded --page-js: worker confirmed (confirmed_instances=1); peak_pss_kib captures the exited child"
+  st=0; OUT="$(run_loaded none --page-js v8)" || st=$?
+  [ "$st" -eq 1 ] || fail "loaded --page-js without a worker must exit 1 (got $st)"
+  grep -q 'was not observed for fandhe instance' "$TMP/loaded.err" || fail "missing worker error message"
+  [ -z "$OUT" ] || fail "no JSON may be emitted when the worker is not observed"
+  ok "loaded --page-js without a worker: exit 1, no result emitted (fail-closed)"
+  st=0; OUT="$(run_loaded none)" || st=$?
+  [ "$st" -eq 0 ] || fail "loaded without --page-js must not require a worker (got $st)"
+  jq -e '.results[0] | has("js_worker") | not' <<<"$OUT" >/dev/null || fail "js_worker must be absent without --page-js"
+  ok "loaded without --page-js: worker check not applied"
+  if pgrep -f "fake_fandhe_cdp.mjs" >/dev/null 2>&1; then fail "leftover fake fandhe processes"; fi
+else
+  echo "note: node/jq missing or port 9333 busy; loaded --page-js worker confirmation NOT verified"
+fi
 
 # 実バイナリ（N=1 host。固定ポート 9333 のため。N>=2 は netns が必要で、環境次第のため任意）
 if [ -n "${FANDHE_BIN:-}" ] && [ -x "$FANDHE_BIN" ]; then

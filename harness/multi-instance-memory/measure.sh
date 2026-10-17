@@ -12,6 +12,14 @@
 #       （loaded 条件の fandhe 側）root・iptables。
 # loaded 条件は公開 URL を使う。fandhe の Page.navigate は loopback・プライベートアドレス・file: を
 # SSRF ガードで拒否するため、netns ごとに veth ペア＋ホスト側 NAT（MASQUERADE）で外向き経路を用意する。
+# ページ JS（`--page-js v8|boa`）: 既定の fandhe-browser はページ JS 無効（`[js] execute_page_scripts = false`）。
+# 指定時はインスタンスごとに固定文面の設定ファイルを $WORK/config/<i>.toml に作り、起動時の環境変数
+# FANDHE_BROWSER_CONFIG で渡す（host・netns・外向き経路の 3 経路とも同じ env 前置配列を使う）。
+# 呼び出し側の FANDHE_BROWSER_CONFIG は、結果に記録されない設定が混ざるのを防ぐため、設定されていれば
+# （空文字でも）fandhe を測る前に終了コード 2 で拒否する。loaded 条件では JS ワーカー子プロセスが各
+# インスタンスで起動したこと（environ のマーカー or 回収済み子の cminflt 増加）を確認し、確認できなければ失敗にする。
+# 遷移開始から --settle 終了までの PSS 合算を --peak-interval-ms 以上の間隔で標本化し peak_pss_kib に記録する
+# （ワーカーは遅延起動でスクリプト後に終了するため、settle 後の pss_kib には映らない）。
 # 終了コード: 0 成功 / 1 計測失敗（起動後のプロセス消失・smaps 読み取り不可など）/ 2 使用エラー・前提不足。
 set -euo pipefail
 
@@ -45,6 +53,9 @@ ALLOW_SHARED_PORT=0
 POC1_CHROMIUM_KIB=""
 POC1_FANDHE_KIB=""
 EGRESS=0
+PAGE_JS=""            # "" | v8 | boa
+PAGE_JS_GIVEN=0
+PEAK_INTERVAL_MS=50   # ピーク標本化の最小間隔（下限。実際の間隔は peak_max_gap_ms に記録する）
 
 usage() {
   cat <<'USAGE'
@@ -64,6 +75,9 @@ usage: measure.sh --fandhe-bin PATH [--chromium-bin PATH | --skip-chromium] [opt
   --net-mode auto|netns|host   fandhe network isolation (default auto; see README)
   --poc1-chromium-kib KIB      PoC-1 per-instance PSS of Chromium (positive number), for linear extrapolation
   --poc1-fandhe-kib KIB        PoC-1 per-instance PSS of fandhe-browser (positive number; give both or neither)
+  --page-js v8|boa             enable page JS in fandhe-browser via a generated config file (FANDHE_BROWSER_CONFIG);
+                               the engine must be compiled into the binary. The caller's FANDHE_BROWSER_CONFIG must be unset
+  --peak-interval-ms MS        minimum interval of the peak PSS sampler, 10..1000 (default 50)
   --no-ready-check             skip the /json/version readiness poll (self-test only)
   --allow-shared-port          allow N>1 in host mode (self-test with a fake binary that binds no port)
   --out FILE                   write JSON to FILE (default stdout)
@@ -93,6 +107,8 @@ while [ $# -gt 0 ]; do
     --net-mode) need_value "$@"; NET_MODE="$2"; shift 2 ;;
     --poc1-chromium-kib) need_value "$@"; POC1_CHROMIUM_KIB="$2"; shift 2 ;;
     --poc1-fandhe-kib) need_value "$@"; POC1_FANDHE_KIB="$2"; shift 2 ;;
+    --page-js) need_value "$@"; PAGE_JS="$2"; PAGE_JS_GIVEN=1; shift 2 ;;
+    --peak-interval-ms) need_value "$@"; PEAK_INTERVAL_MS="$2"; shift 2 ;;
     --no-ready-check) NO_READY_CHECK=1; shift ;;
     --allow-shared-port) ALLOW_SHARED_PORT=1; shift ;;
     --out) need_value "$@"; OUT="$2"; shift 2 ;;
@@ -117,6 +133,11 @@ if [ -n "${MEASURE_READY_TIMEOUT_SEC:-}" ]; then
     || die "MEASURE_READY_TIMEOUT_SEC must be a positive decimal integer without leading zeros"
   READY_TIMEOUT="$MEASURE_READY_TIMEOUT_SEC"
 fi
+is_uint "$PEAK_INTERVAL_MS" && [ "$PEAK_INTERVAL_MS" -ge 10 ] && [ "$PEAK_INTERVAL_MS" -le 1000 ] \
+  || die "--peak-interval-ms must be a decimal integer in 10..1000 without leading zeros (got '$PEAK_INTERVAL_MS')"
+if [ "$PAGE_JS_GIVEN" -eq 1 ]; then
+  case "$PAGE_JS" in v8|boa) ;; *) die "--page-js must be v8 or boa" ;; esac
+fi
 case "$NET_MODE" in auto|netns|host) ;; *) die "--net-mode must be auto, netns or host" ;; esac
 # PoC-1 の基準値は PSS 専用で、正の有限値のみ受理する（0・負・非数は除算の分母になるため計測前に拒否）
 [ -z "$POC1_CHROMIUM_KIB" ] && [ -z "$POC1_FANDHE_KIB" ] \
@@ -132,6 +153,10 @@ octet='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
 [[ "$EGRESS_DNS" =~ ^$octet\.$octet\.$octet\.$octet$ ]] \
   || die "--dns must be a dotted-decimal IPv4 address without leading zeros"
 [ "$SKIP_CHROMIUM" -eq 0 ] || [ "$SKIP_FANDHE" -eq 0 ] || die "nothing to measure"
+[ "$PAGE_JS_GIVEN" -eq 0 ] || [ "$SKIP_FANDHE" -eq 0 ] || die "--page-js cannot be combined with --skip-fandhe"
+if [ "$SKIP_FANDHE" -eq 0 ] && [ -n "${FANDHE_BROWSER_CONFIG+x}" ]; then
+  die "FANDHE_BROWSER_CONFIG is set in the caller's environment; unset it (measure.sh passes its own config only with --page-js)"
+fi
 if [ "$SKIP_FANDHE" -eq 0 ]; then
   [ -n "$FANDHE_BIN" ] && [ -x "$FANDHE_BIN" ] || die "--fandhe-bin must be an executable file"
 fi
@@ -170,9 +195,12 @@ if [ -n "$URL" ]; then
     172.1[6-9].*|172.2[0-9].*|172.3[01].*) die "--url host '$url_host' is private; use a public URL" ;;
   esac
 fi
-for tool in ps awk curl sleep kill; do
+for tool in ps awk curl sleep kill tr grep; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
+if [ -n "$PAGE_JS" ] && ! printf '%s\n' "${COND_LIST[@]}" | grep -qx loaded; then
+  log "warning: --page-js without the loaded condition: no page is loaded, so no JS worker is started or checked"
+fi
 if printf '%s\n' "${COND_LIST[@]}" | grep -qx loaded && [ "$SKIP_FANDHE" -eq 0 ]; then
   command -v node >/dev/null 2>&1 || die "node (22+) is required for the loaded condition"
 fi
@@ -246,6 +274,11 @@ RESULTS=()   # JSON 断片
 declare -A RES_PSS
 VETH_HOST_IFS=()     # 作成したホスト側 veth（削除対象）
 NAT_RULES=()         # 追加した iptables ルール（"表 チェーン 条件..." 形式。削除時に -D へ置換）
+SAMPLER_PID=""       # ピーク標本化プロセス（LEADERS には入れない）
+PEAK_FILE=""         # サンプラーの出力ファイル（$WORK 内）
+declare -a CMIN0     # 区間開始時の各リーダーの cminflt
+PK_PEAK=0; PK_PROCS=0; PK_SAMPLES=0; PK_WINDOW=0; PK_GAP=0
+JS_WORKER_JSON=""    # 現サイクルの js_worker 断片（空なら出さない）
 IP_FORWARD_ORIG=""   # 変更前の net.ipv4.ip_forward（空なら未変更）
 
 # ---- 外向き経路（veth＋NAT）----
@@ -293,6 +326,7 @@ teardown_nat() {
 # ---- 後始末（trap）: 全プロセスグループを停止し作業ディレクトリを削除する ----
 kill_all() {
   local pid
+  stop_peak
   for pid in "${LEADERS[@]:-}"; do
     [ -n "$pid" ] || continue
     kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
@@ -357,14 +391,22 @@ if [ "$EGRESS" -eq 1 ] && [ "$NET_MODE" = "netns" ]; then setup_nat; fi
 # ---- 起動 ----
 launch_fandhe() { # $1=index
   local data="$WORK/data/$1" logf="$WORK/log-fandhe-$1.txt"
+  # 3 経路共通の環境変数。--page-js 指定時だけ設定ファイルを足す（未指定時は従来と同じ環境）。
+  # env・setsid・unshare・sh -c exec はいずれも exec するため、リーダー PID（$!）は変わらない
+  local -a lenv=("XDG_DATA_HOME=$data")
   mkdir -p "$data"
+  if [ -n "$PAGE_JS" ]; then
+    mkdir -p "$WORK/config"
+    printf '[js]\nengine = "%s"\nexecute_page_scripts = true\n' "$PAGE_JS" >"$WORK/config/$1.toml"
+    lenv+=("FANDHE_BROWSER_CONFIG=$WORK/config/$1.toml")
+  fi
   if [ "$NET_MODE" = "netns" ] && [ "$EGRESS" -eq 1 ]; then
     # 外向き経路あり: mount namespace も分け、netns 内だけ resolv.conf を差し替える（ホストの
     # スタブリゾルバ 127.0.0.53 等は netns から到達できないため）。root 前提（setup 時に確認済み）
     printf 'nameserver %s\n' "$EGRESS_DNS" >"$WORK/resolv-$1.conf"
     # sh -c の $0/$1 は後続の引数で、ここでは展開させない
     # shellcheck disable=SC2016
-    XDG_DATA_HOME="$data" setsid unshare -n -m \
+    env "${lenv[@]}" setsid unshare -n -m \
       sh -c 'ip link set lo up && mount --bind "$1" /etc/resolv.conf && exec "$0"' \
       "$FANDHE_BIN" "$WORK/resolv-$1.conf" >"$logf" 2>&1 &
     LEADERS+=("$!")
@@ -373,10 +415,10 @@ launch_fandhe() { # $1=index
   elif [ "$NET_MODE" = "netns" ]; then
     # sh -c の $0 は後続の引数（fandhe バイナリ）で、ここでは展開させない
     # shellcheck disable=SC2016
-    XDG_DATA_HOME="$data" setsid unshare "${NS_FLAGS[@]}" \
+    env "${lenv[@]}" setsid unshare "${NS_FLAGS[@]}" \
       sh -c 'ip link set lo up && exec "$0"' "$FANDHE_BIN" >"$logf" 2>&1 &
   else
-    XDG_DATA_HOME="$data" setsid "$FANDHE_BIN" >"$logf" 2>&1 &
+    env "${lenv[@]}" setsid "$FANDHE_BIN" >"$logf" 2>&1 &
   fi
   LEADERS+=("$!")
 }
@@ -509,6 +551,147 @@ tree_pids() { # $1=leader
     }'
 }
 
+# /proc/<pid>/stat の ")" より後ろ（第 3 フィールド state 以降）を返す。comm に空白・括弧を含みうるため
+# 最後の ")" で切る。プロセスが消えていれば失敗
+stat_after_comm() { # $1=pid
+  local s
+  s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  printf '%s\n' "${s##*) }"
+}
+# プロセス状態（R/S/Z 等の 1 文字）。消失なら失敗
+proc_state() { # $1=pid
+  local rest
+  rest="$(stat_after_comm "$1")" || return 1
+  printf '%s\n' "${rest%% *}"
+}
+# 回収済みの子のマイナーフォールト累計 cminflt（stat 第 11 フィールド = state 以降の 9 番目）
+proc_cminflt() { # $1=pid
+  local rest
+  rest="$(stat_after_comm "$1")" || return 1
+  # shellcheck disable=SC2086
+  set -- $rest
+  printf '%s\n' "${9:-0}"
+}
+
+# ピーク標本化（バックグラウンド）。ティックごとに ps を 1 回だけ実行し、全リーダーのツリー（子孫＋同一
+# プロセスグループ）の PSS を合算して "S <ms> <pss> <procs> <unreadable>" を出す。ゾンビ（回収待ちの終了済み子）
+# とティック中に消えたプロセスは数えない。target が fandhe のときは、リーダー以外のツリー内プロセスの
+# environ に FANDHE_BROWSER_JS_WORKER キーがあれば "W <instance>" を出す（キーの有無のみ判定し内容は出力しない）。
+peak_sampler() { # $1=出力ファイル $2=間隔 ms $3=target、残り=リーダー PID
+  trap - EXIT INT TERM   # 親の cleanup（リーダー kill・$WORK 削除）を継承して走らせない
+  local out="$1" interval_ms="$2" target="$3" sp=""; shift 3
+  local -A confirmed=()
+  trap '[ -z "$sp" ] || kill "$sp" 2>/dev/null; exit 0' TERM
+  local leaders="$*" ms kind a b c d idx pid
+  while :; do
+    ms=$((${EPOCHREALTIME/./} / 1000))
+    while read -r kind a b c d; do
+      case "$kind" in
+        S) printf 'S %s %s %s %s\n' "$a" "$b" "$c" "$d" >>"$out" ;;
+        C) # 候補: a=instance b=pid
+          [ -z "${confirmed[$a]:-}" ] || continue
+          if tr '\0' '\n' <"/proc/$b/environ" 2>/dev/null | grep -q '^FANDHE_BROWSER_JS_WORKER='; then
+            confirmed[$a]=1; printf 'W %s\n' "$a" >>"$out"
+          fi ;;
+      esac
+    done < <(ps -eo pid=,ppid=,pgid=,stat= | awk -v leaders="$leaders" -v ms="$ms" -v want_c="$([ "$target" = fandhe ] && echo 1 || echo 0)" '
+      { pid[NR]=$1; ppid[NR]=$2; pg[NR]=$3; st[NR]=$4; n=NR }
+      END {
+        nl = split(leaders, L, " ")
+        for (k = 1; k <= nl; k++) {
+          for (i = 1; i <= n; i++) if (pid[i] == L[k] || pg[i] == L[k]) if (!(pid[i] in idx)) idx[pid[i]] = k
+        }
+        do { ch = 0
+          for (i = 1; i <= n; i++) if (!(pid[i] in idx) && (ppid[i] in idx)) { idx[pid[i]] = idx[ppid[i]]; ch = 1 }
+        } while (ch)
+        pss = 0; procs = 0; unread = 0
+        for (i = 1; i <= n; i++) {
+          if (!(pid[i] in idx)) continue
+          if (st[i] ~ /^Z/) continue
+          f = "/proc/" pid[i] "/smaps_rollup"; got = 0; v = 0
+          while ((r = (getline line < f)) > 0) if (line ~ /^Pss:/) { split(line, F, " "); v = F[2]; got = 1 }
+          close(f)
+          if (got) { pss += v; procs++ }
+          else {
+            sf = "/proc/" pid[i] "/stat"; ok = ((getline sl < sf) > 0); close(sf)
+            if (ok) { sub(/^.*\) /, "", sl); if (substr(sl, 1, 1) != "Z") unread++ }
+          }
+          if (want_c && pid[i] != L[idx[pid[i]]]) print "C", idx[pid[i]], pid[i]
+        }
+        print "S", ms, pss, procs, unread
+      }')
+    sleep "$(awk -v m="$interval_ms" 'BEGIN{printf "%.3f", m/1000}')" &
+    sp=$!
+    wait "$sp" 2>/dev/null || true
+    sp=""
+  done
+}
+
+# 標本化の開始（fandhe は各リーダーの cminflt 基準値も保存する）。区間: 遷移の開始から --settle の終わりまで
+start_peak() { # $1=target
+  local target="$1" i
+  PEAK_FILE="$WORK/peak-$target.txt"
+  : >"$PEAK_FILE"
+  CMIN0=()
+  if [ "$target" = "fandhe" ]; then
+    for ((i = 1; i <= N; i++)); do CMIN0[i]="$(proc_cminflt "${LEADERS[$((i - 1))]}" || echo 0)"; done
+  fi
+  peak_sampler "$PEAK_FILE" "$PEAK_INTERVAL_MS" "$target" "${LEADERS[@]}" &
+  SAMPLER_PID=$!
+}
+stop_peak() {
+  [ -n "$SAMPLER_PID" ] || return 0
+  local k
+  # settle が 0 でも最低 1 ティックは取る（最大約 2 秒待つ）
+  for ((k = 0; k < 40; k++)); do
+    grep -q '^S ' "$PEAK_FILE" 2>/dev/null && break
+    sleep 0.05
+  done
+  kill -TERM "$SAMPLER_PID" 2>/dev/null || true
+  wait "$SAMPLER_PID" 2>/dev/null || true
+  SAMPLER_PID=""
+}
+
+# 標本化の集計。読めない生存プロセスがあれば失敗（過少計上を成功扱いにしない）
+summarize_peak() {
+  local line unread
+  line="$(awk '$1=="S" && NF>=5 {
+      t++; if (!seen || $3>peak) { peak=$3; procs=$4 } seen=1; unread+=$5
+      if (t>1 && $2-prev>gap) gap=$2-prev
+      if (t==1) first=$2
+      prev=$2 }
+    END { printf "%d %d %d %d %d %d", peak, procs, t, (t>0)?prev-first:0, gap, unread }' "$PEAK_FILE" 2>/dev/null)" || line="0 0 0 0 0 0"
+  read -r PK_PEAK PK_PROCS PK_SAMPLES PK_WINDOW PK_GAP unread <<<"$line"
+  [ "$unread" -eq 0 ] || { echo "error: peak sampler found $unread unreadable smaps_rollup reads on live processes" >&2; return 1; }
+}
+
+# fandhe/loaded/--page-js: 各インスタンスで JS ワーカーが起動したことを確認する。根拠は
+# (a) サンプラーが environ のマーカーを観測 / (b) 区間内に回収した子の cminflt 増加（子の種類は区別しない。
+# 現在の fandhe の子プロセスはワーカーのみ）。確認できないインスタンスがあれば失敗
+confirm_js_worker() {
+  JS_WORKER_JSON=""
+  local i cm obs=0 reap=0 ok=0 missing=""
+  local -A seen_w=()
+  while read -r k a; do [ "$k" = W ] && seen_w[$a]=1; done <"$PEAK_FILE"
+  for ((i = 1; i <= N; i++)); do
+    local by_obs=0 by_reap=0
+    [ -z "${seen_w[$i]:-}" ] || by_obs=1
+    cm="$(proc_cminflt "${LEADERS[$((i - 1))]}" || echo 0)"
+    [ "$cm" -le "${CMIN0[i]:-0}" ] || by_reap=1
+    obs=$((obs + by_obs)); reap=$((reap + by_reap))
+    if [ "$by_obs" -eq 1 ] || [ "$by_reap" -eq 1 ]; then ok=$((ok + 1))
+    elif [ "$(printf '%s' "$missing" | wc -w)" -lt 20 ]; then missing="$missing $i"
+    fi
+  done
+  if [ "$ok" -ne "$N" ]; then
+    echo "error: page JS worker process was not observed for fandhe instance(s):${missing:- (more than 20)} ($ok/$N confirmed)" >&2
+    show_dead_logs fandhe
+    show_log_tail "fandhe instance 1" "$WORK/log-fandhe-1.txt"
+    return 1
+  fi
+  JS_WORKER_JSON="$(printf ',"js_worker":{"confirmed_instances":%d,"observed_by_sampler":%d,"confirmed_by_reap_counter":%d}' "$ok" "$obs" "$reap")"
+}
+
 sample_cycle() { # $1=target $2=condition。結果を RES_* と RESULTS へ
   local target="$1" cond="$2" pss=0 rss=0 procs=0 unreadable=0 lost_leader=0 alive=0 leader leader_read p v
   for leader in "${LEADERS[@]}"; do
@@ -523,7 +706,8 @@ sample_cycle() { # $1=target $2=condition。結果を RES_* と RESULTS へ
       if v="$(awk '/^Pss:/{a=$2} /^Rss:/{b=$2} END{ if (a=="") exit 1; print a, b }' "/proc/$p/smaps_rollup" 2>/dev/null)"; then
         pss=$((pss + ${v%% *})); rss=$((rss + ${v##* })); procs=$((procs + 1))
         [ "$p" != "$leader" ] || leader_read=1
-      elif kill -0 "$p" 2>/dev/null; then
+      elif kill -0 "$p" 2>/dev/null && [ "$(proc_state "$p" 2>/dev/null || echo Z)" != "Z" ]; then
+        # ゾンビ（終了済みで親の回収待ち）はメモリを持たないため数えない
         unreadable=$((unreadable + 1))   # 生存しているのに読めない（権限）。合算が過少になるため失敗扱い
       fi
     done < <(tree_pids "$leader")
@@ -538,9 +722,13 @@ sample_cycle() { # $1=target $2=condition。結果を RES_* と RESULTS へ
   done
   [ "$alive" -eq "$N" ] || { echo "error: only $alive/$N $target instances alive after sampling" >&2; show_dead_logs "$target"; return 1; }
   RES_PSS["$target:$cond"]="$pss"
-  RESULTS+=("$(printf '{"target":"%s","condition":"%s","instances":%d,"processes":%d,"pss_kib":%d,"rss_kib":%d,"pss_per_instance_kib":%s}' \
-    "$target" "$cond" "$N" "$procs" "$pss" "$rss" "$(awk -v a="$pss" -v n="$N" 'BEGIN{printf "%.1f", a/n}')")")
-  log "$target/$cond: processes=$procs pss=${pss}KiB rss=${rss}KiB"
+  # peak_pss_kib は標本化の最大値と settle 後の pss_kib の大きい方（peak >= pss を常に成り立たせる）
+  local peak="$PK_PEAK"
+  [ "$peak" -gt "$pss" ] || peak="$pss"
+  RESULTS+=("$(printf '{"target":"%s","condition":"%s","instances":%d,"processes":%d,"pss_kib":%d,"rss_kib":%d,"pss_per_instance_kib":%s,"peak_pss_kib":%d,"peak_processes":%d,"peak_samples":%d,"peak_window_ms":%d,"peak_max_gap_ms":%d%s}' \
+    "$target" "$cond" "$N" "$procs" "$pss" "$rss" "$(awk -v a="$pss" -v n="$N" 'BEGIN{printf "%.1f", a/n}')" \
+    "$peak" "$PK_PROCS" "$PK_SAMPLES" "$PK_WINDOW" "$PK_GAP" "$JS_WORKER_JSON")")
+  log "$target/$cond: processes=$procs pss=${pss}KiB rss=${rss}KiB peak_pss=${peak}KiB (samples=$PK_SAMPLES)"
 }
 
 run_cycle() { # $1=target $2=condition
@@ -559,9 +747,16 @@ run_cycle() { # $1=target $2=condition
     fi
   done
   if [ "$target" = "fandhe" ]; then wait_fandhe_ready; fi
+  if [ "$target" = "chromium" ] && [ "$cond" = "loaded" ]; then wait_chromium_ready; fi
+  # 標本化の区間: 遷移の開始から --settle の終わりまで（idle は settle のみ）
+  start_peak "$target"
   if [ "$target" = "fandhe" ] && [ "$cond" = "loaded" ]; then navigate_all; fi
-  if [ "$target" = "chromium" ] && [ "$cond" = "loaded" ]; then wait_chromium_ready; navigate_chromium_all; fi
+  if [ "$target" = "chromium" ] && [ "$cond" = "loaded" ]; then navigate_chromium_all; fi
   sleep "$SETTLE"
+  stop_peak
+  summarize_peak
+  JS_WORKER_JSON=""
+  if [ "$target" = "fandhe" ] && [ "$cond" = "loaded" ] && [ -n "$PAGE_JS" ]; then confirm_js_worker; fi
   sample_cycle "$target" "$cond"
   kill_all
 }
@@ -611,6 +806,9 @@ done
 {
   printf '{"schema_version":1,"task":"TASK-81","behaviors":["PERF-4","MEAS-6"],"metric":"pss_kib",'
   printf '"instances":%s,"net_mode":"%s","url":"%s","settle_sec":%s,' "$N" "${NET_MODE}" "$(json_escape "$URL")" "$SETTLE"
+  if [ -n "$PAGE_JS" ]; then printf '"page_js_enabled":true,"page_js_engine":"%s",' "$PAGE_JS"
+  else printf '"page_js_enabled":false,"page_js_engine":null,'; fi
+  printf '"peak_interval_ms":%s,' "$PEAK_INTERVAL_MS"
   printf '"chromium_extra_args":[%s],"chromium_no_sandbox":%s,' "$EXTRA_JSON" "$CHROMIUM_NO_SANDBOX"
   printf '"environment":{"kernel":"%s","arch":"%s","cpus":%s,"mem_total_kib":%s},' \
     "$(uname -r)" "$(uname -m)" "$(nproc 2>/dev/null || echo 0)" "$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
