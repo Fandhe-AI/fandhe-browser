@@ -13,6 +13,7 @@
 #
 # 使い方: run_core.sh [--tasks P] [--out P] [--bin P] [--endpoint URL] [--no-spawn]
 #                     [--page-js v8|boa] [--log ABS_PATH] [--task-timeout SEC] [--total-timeout SEC] [--startup-timeout SEC] [--validate-only]
+# --startup-timeout は起動モードでは起動待ち、--no-spawn では接続確認の予算（拒否・2xx 以外は即失敗し理由を出力）。
 # 終了コード: 0=記録完了（失敗タスクがあっても 0。成否は計測結果でありゲートではない）
 #            1=記録の書き込み失敗・結果件数/id 集合の不一致
 #            2=入力・使用エラー（スキーマ違反・引数不正・jq/node 無し・バイナリ検証/起動失敗）
@@ -91,9 +92,67 @@ fi
 type -P node >/dev/null 2>&1 || die "node is required but was not found on PATH"
 node -e 'process.exit(typeof WebSocket === "function" ? 0 : 1)' || die "node has no built-in WebSocket (Node 22+ is required)"
 
-# endpoint の /json/version が応答するか（応答すれば 0）。判定は node の fetch で行い curl に依存しない
+# endpoint の /json/version が 2xx で応答するか（応答すれば 0）。curl に依存せず node の組み込み http で判定する。
+# 以前は fetch + AbortSignal.timeout(1500) の単発だったが、Windows ランナーで fetch の初回ロード（undici の遅延
+# 読み込み）と接続確立が 1.5 秒を超えて abort し、健全な偽サーバーを「無応答」と誤判定した疑いがある（#956。
+# 同じ偽サーバーが約 4 秒後に 22 件を処理できていた）。期限は要求を作った後に数え、1 回の上限を 3 秒とする。
+# 引数 $1（任意）は全体の期限（epoch ミリ秒）。指定時は試行前に残り時間を確認し、1 回の上限を min(3000ms, 残り) にし、
+# 成功時も期限内であることを確認する（期限後の応答を成功扱いにしない）。
+# 終了コード: 0=2xx / 3=接続拒否 / 4=期限切れ / 5=2xx 以外の HTTP / 6=その他 / 7=全体の期限超過（試行せず）。
+# 失敗理由（英語の固定書式。接続先の本文は出さない）は PROBE_REASON に入る。
+PROBE_REASON=""
 probe() {
-  node -e 'fetch(process.argv[1] + "/json/version", { signal: AbortSignal.timeout(1500) }).then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))' "$ENDPOINT" >/dev/null 2>&1
+  local rc raw deadline="${1:-0}"
+  set +e
+  raw=$(node -e '
+const http = require("node:http");
+const deadline = Number(process.argv[2]) || 0;
+const remain = deadline > 0 ? deadline - Date.now() : Infinity;
+const ms = Math.min(3000, remain);
+const done = (code, msg) => { if (msg) console.error(msg); process.exit(code); };
+if (!(ms > 0)) done(7, "deadline exceeded");
+const req = http.get(process.argv[1] + "/json/version", (res) => {
+  res.resume();
+  const s = res.statusCode;
+  if (s >= 200 && s < 300) {
+    if (deadline > 0 && Date.now() > deadline) done(7, "deadline exceeded");
+    done(0);
+  }
+  else done(5, "http status " + s);
+});
+setTimeout(() => done(4, "timeout after " + Math.round(ms) + "ms"), ms);
+req.on("error", (e) => {
+  const c = String((e && e.code) || "unknown").replace(/[^A-Za-z0-9_]/g, "").slice(0, 64);
+  if (c === "ECONNREFUSED") done(3, "refused");
+  else done(6, "error " + c);
+});
+' "$ENDPOINT" "$deadline" 2>&1 >/dev/null; echo "@rc=$?")
+  # サブシェル内の終了コードを末尾マーカーで受け取る（PIPESTATUS はコマンド置換の外へ出ない）
+  rc=$(printf '%s' "${raw##*@rc=}" | tr -d '\r\n')
+  PROBE_REASON=$(printf '%s' "${raw%@rc=*}" | tr -d '\000-\037\177' | cut -c1-120)
+  case "$rc" in '' | *[!0-9]*) rc=6 ;; esac
+  set -e
+  return "$rc"
+}
+
+# --no-spawn 用の接続確認。--startup-timeout を予算に、期限切れ・その他の失敗だけを有界リトライする（#956）。
+# 接続拒否（待ち受けが無い）と 2xx 以外は待っても好転しないため即失敗し、成功を装わない（REPAIR-5）。
+wait_ready_no_spawn() {
+  local start=$SECONDS attempts=0 rc=0 deadline last=""
+  # 期限はミリ秒精度の epoch で保持する（SECONDS は秒単位で --startup-timeout 1 では粗すぎる）
+  deadline=$(node -e 'process.stdout.write(String(Date.now() + Number(process.argv[1]) * 1000))' "$STARTUP_TIMEOUT") || die "cannot compute deadline"
+  while :; do
+    attempts=$((attempts + 1))
+    probe "$deadline" && return 0
+    rc=$?
+    # 期限超過（7）は直前の実際の失敗理由を隠さない（試行せず打ち切った場合は last を保持する）
+    if [ "$rc" -ne 7 ] || [ -z "$last" ]; then last="$PROBE_REASON"; fi
+    if [ "$rc" -ne 4 ] && [ "$rc" -ne 6 ]; then break; fi
+    # 予算を使い切った後は待たずに打ち切る（last を確実に実際の失敗理由のまま報告する）
+    node -e 'process.exit(Date.now() >= Number(process.argv[1]) ? 0 : 1)' "$deadline" && break
+    sleep 0.3
+  done
+  die "endpoint is not responding: $ENDPOINT (attempts=$attempts, elapsed=$((SECONDS - start))s, last=${last:-unknown})"
 }
 
 PID=""
@@ -159,7 +218,7 @@ if [ "$NO_SPAWN" -eq 0 ]; then
     sleep 0.3
   done
 else
-  probe || die "endpoint is not responding: $ENDPOINT"
+  wait_ready_no_spawn
 fi
 
 # Node クライアントを 1 回起動して全タスクを直列に実行する。URL は環境変数で渡す

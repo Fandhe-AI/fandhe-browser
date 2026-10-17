@@ -3,8 +3,12 @@
 // run_core.mjs の判定ロジック・期限・検証経路を確認するために使う。本物のサーバー挙動の代替では
 // なく、core の応答形（応答 → DOM.setChildNodes イベントの順）を模しただけの固定応答である。
 //
-// 使い方: node fake_cdp_server.mjs [--ws-host-mismatch] [--port N]
-//   127.0.0.1 のエフェメラルポートで listen し、ポート番号を stdout へ 1 行出す。
+// 使い方: node fake_cdp_server.mjs [--ws-host-mismatch] [--hang-http] [--port N]
+//   127.0.0.1 のエフェメラルポートで listen し、ポート番号を stdout へ 1 行出す（stdout はこの 1 行だけ）。
+//   診断（listen 完了・受信した HTTP 要求・エラー）は時刻付きで stderr へ 1 行ずつ出す（#956。
+//   接続失敗時に「偽サーバーは健全だったか」を self-test.sh が切り分けるための材料）。
+//   --delay-http MS: /json/version の応答を MS ミリ秒遅らせる（期限後の応答を成功扱いにしない確認用）。
+//   --hang-http: TCP は受け付けるが HTTP 要求に応答しない（無応答サーバーで run_core が成功を装わない確認用）。
 // セレクタ文字列で挙動を切り替える（合成 tasks 側で指定）:
 //   nomatch=一致なし / unsupported=-32602 / toolarge=requestChildNodes が document too large /
 //   emptytext=空テキスト / emptyform=name 付き入力なし / form*=フォーム / ctl=制御文字と長文 /
@@ -14,8 +18,18 @@ import crypto from "node:crypto";
 
 const mismatch = process.argv.includes("--ws-host-mismatch");
 // --port N: 固定ポートで listen する（run_core.sh の起動経路テストで、スタブバイナリ経由で起動するため）
+const hangHttp = process.argv.includes("--hang-http");
+// --delay-http MS: /json/version の応答を MS ミリ秒遅らせる（期限後に応答するサーバーを成功扱いにしない確認用。#956）
+const delayIdx = process.argv.indexOf("--delay-http");
+const delayHttpMs = delayIdx >= 0 ? Number(process.argv[delayIdx + 1]) : 0;
 const portIdx = process.argv.indexOf("--port");
 const listenPort = portIdx >= 0 ? Number(process.argv[portIdx + 1]) : 0;
+
+// stderr への診断 1 行。制御文字は除き長さを抑える（CI ログへの注入防止）
+function diag(msg) {
+  const clean = String(msg).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 200);
+  process.stderr.write(`fake: ${new Date().toISOString()} ${clean}\n`);
+}
 
 function frame(text) {
   const payload = Buffer.from(text, "utf8");
@@ -73,6 +87,16 @@ function childrenFor(selector) {
 }
 
 const server = http.createServer((req, res) => {
+  diag(`${req.method} ${req.url}`);
+  if (hangHttp) return;
+  if (req.url === "/json/version" && delayHttpMs > 0) {
+    setTimeout(() => {
+      const port = server.address().port;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ Browser: "FakeCdp/0.0", webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/browser/fake` }));
+    }, delayHttpMs);
+    return;
+  }
   if (req.url === "/json/version") {
     const port = server.address().port;
     const wsPort = mismatch ? port + 1 : port;
@@ -82,6 +106,12 @@ const server = http.createServer((req, res) => {
   }
   res.statusCode = 404;
   res.end();
+});
+
+server.on("error", (e) => diag(`error ${e && e.code}`));
+server.on("clientError", (e, socket) => {
+  diag(`clientError ${e && e.code}`);
+  socket.destroy();
 });
 
 server.on("upgrade", (req, socket) => {
@@ -128,5 +158,6 @@ server.on("upgrade", (req, socket) => {
 });
 
 server.listen(listenPort, "127.0.0.1", () => {
+  diag(`listening port=${server.address().port}`);
   process.stdout.write(`${server.address().port}\n`);
 });
