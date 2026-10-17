@@ -278,6 +278,7 @@ SAMPLER_PID=""       # ピーク標本化プロセス（LEADERS には入れな�
 PEAK_FILE=""         # サンプラーの出力ファイル（$WORK 内）
 declare -a CMIN0     # 区間開始時の各リーダーの cminflt
 PK_PEAK=0; PK_PROCS=0; PK_SAMPLES=0; PK_WINDOW=0; PK_GAP=0
+SAMPLER_DIED=0       # stop_peak がサンプラーの早期終了を検出したら 1
 JS_WORKER_JSON=""    # 現サイクルの js_worker 断片（空なら出さない）
 IP_FORWARD_ORIG=""   # 変更前の net.ipv4.ip_forward（空なら未変更）
 
@@ -647,6 +648,8 @@ stop_peak() {
     grep -q '^S ' "$PEAK_FILE" 2>/dev/null && break
     sleep 0.05
   done
+  # サンプラーは無限ループのため、TERM 前に既に終了していれば異常終了（標本が欠けるので summarize_peak で失敗にする）
+  kill -0 "$SAMPLER_PID" 2>/dev/null || SAMPLER_DIED=1
   kill -TERM "$SAMPLER_PID" 2>/dev/null || true
   wait "$SAMPLER_PID" 2>/dev/null || true
   SAMPLER_PID=""
@@ -655,13 +658,19 @@ stop_peak() {
 # 標本化の集計。読めない生存プロセスがあれば失敗（過少計上を成功扱いにしない）
 summarize_peak() {
   local line unread
+  if [ "$SAMPLER_DIED" -ne 0 ]; then
+    SAMPLER_DIED=0
+    echo "error: peak sampler exited abnormally before it was stopped" >&2
+    return 1
+  fi
   line="$(awk '$1=="S" && NF>=5 {
       t++; if (!seen || $3>peak) { peak=$3; procs=$4 } seen=1; unread+=$5
       if (t>1 && $2-prev>gap) gap=$2-prev
       if (t==1) first=$2
       prev=$2 }
-    END { printf "%d %d %d %d %d %d", peak, procs, t, (t>0)?prev-first:0, gap, unread }' "$PEAK_FILE" 2>/dev/null)" || line="0 0 0 0 0 0"
+    END { printf "%d %d %d %d %d %d", peak, procs, t, (t>0)?prev-first:0, gap, unread }' "$PEAK_FILE" 2>/dev/null)" || { echo "error: peak sample aggregation failed" >&2; return 1; }
   read -r PK_PEAK PK_PROCS PK_SAMPLES PK_WINDOW PK_GAP unread <<<"$line"
+  [ "${PK_SAMPLES:-0}" -gt 0 ] || { echo "error: no peak samples were collected" >&2; return 1; }
   [ "$unread" -eq 0 ] || { echo "error: peak sampler found $unread unreadable smaps_rollup reads on live processes" >&2; return 1; }
 }
 
@@ -723,11 +732,11 @@ sample_cycle() { # $1=target $2=condition。結果を RES_* と RESULTS へ
   [ "$alive" -eq "$N" ] || { echo "error: only $alive/$N $target instances alive after sampling" >&2; show_dead_logs "$target"; return 1; }
   RES_PSS["$target:$cond"]="$pss"
   # peak_pss_kib は標本化の最大値と settle 後の pss_kib の大きい方（peak >= pss を常に成り立たせる）
-  local peak="$PK_PEAK"
-  [ "$peak" -gt "$pss" ] || peak="$pss"
+  local peak="$PK_PEAK" peak_procs="$PK_PROCS"
+  if [ "$pss" -gt "$peak" ]; then peak="$pss"; peak_procs="$procs"; fi
   RESULTS+=("$(printf '{"target":"%s","condition":"%s","instances":%d,"processes":%d,"pss_kib":%d,"rss_kib":%d,"pss_per_instance_kib":%s,"peak_pss_kib":%d,"peak_processes":%d,"peak_samples":%d,"peak_window_ms":%d,"peak_max_gap_ms":%d%s}' \
     "$target" "$cond" "$N" "$procs" "$pss" "$rss" "$(awk -v a="$pss" -v n="$N" 'BEGIN{printf "%.1f", a/n}')" \
-    "$peak" "$PK_PROCS" "$PK_SAMPLES" "$PK_WINDOW" "$PK_GAP" "$JS_WORKER_JSON")")
+    "$peak" "$peak_procs" "$PK_SAMPLES" "$PK_WINDOW" "$PK_GAP" "$JS_WORKER_JSON")")
   log "$target/$cond: processes=$procs pss=${pss}KiB rss=${rss}KiB peak_pss=${peak}KiB (samples=$PK_SAMPLES)"
 }
 
@@ -754,7 +763,7 @@ run_cycle() { # $1=target $2=condition
   if [ "$target" = "chromium" ] && [ "$cond" = "loaded" ]; then navigate_chromium_all; fi
   sleep "$SETTLE"
   stop_peak
-  summarize_peak
+  summarize_peak || { kill_all; return 1; }
   JS_WORKER_JSON=""
   if [ "$target" = "fandhe" ] && [ "$cond" = "loaded" ] && [ -n "$PAGE_JS" ]; then confirm_js_worker; fi
   sample_cycle "$target" "$cond"
