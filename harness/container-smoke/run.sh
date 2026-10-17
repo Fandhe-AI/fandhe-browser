@@ -3,7 +3,7 @@
 # 配布コンテナ（軽量 = boa / 既定 = V8）にローカルフィクスチャ 12 種をボリュームマウントし、
 # text / texts / attr 相当の取得を実行して成否を判定する（TASK-66.1・Issue #302、TASK-66.2・Issue #303・CTR-2・MS-5。親 Issue #301）。
 # 呼び出し元は scripts/harness.sh の check-container-smoke（Makefile の同名ターゲット）。
-# 既定コンテナは --role default で同一スクリプトを流用する（TASK-66.2）。後続は #304（TASK-66.3・JS スモーク）。
+# 既定コンテナは --role default で同一スクリプトを流用する（TASK-66.2）。JS スモーク（TASK-66.3・#304）は harness/container-js-smoke/ が担う。
 # 出力契約・終了コード・暫定契約・要判断事項は README.md を参照。
 #
 # 呼び出しは `query [--all | --attr NAME] --file PATH -- SELECTOR`（#824・CLI-1）。一発実行を持たない旧バイナリ
