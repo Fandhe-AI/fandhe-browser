@@ -28,6 +28,23 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
     確認する。fandhe 側の固定ポート 9333 も同じ所有確認を行う。
     `Page.navigate` が `result.errorText` を返した場合（DNS・TLS・接続失敗、fandhe では SSRF ガードによる拒否も）は
     `navigate.mjs` が非 0 で終了し、計測は失敗（終了コード 1）になる。エラーページの PSS を loaded として出さない
+- **ページ JS（`--page-js <v8|boa>`、#957）**: fandhe-browser は既定でページ JS が無効
+  （`[js] execute_page_scripts = false`）で、JS を含むページを `--url` に渡しても JS は動かず、JS 評価の子プロセス
+  （同じバイナリを `FANDHE_BROWSER_JS_WORKER` マーカー付きで再実行するワーカー）も起動しない。`--page-js` を
+  指定すると、インスタンスごとに `[js] engine = "<v8|boa>"` と `execute_page_scripts = true` だけの設定ファイルを
+  作業ディレクトリに作り、`FANDHE_BROWSER_CONFIG` で渡す（host・netns・外向き経路の 3 経路とも同じ）。
+  結果 JSON に `page_js_enabled`・`page_js_engine` を記録する。ページ JS を含む公開 URL を選ぶこと
+  （JS が無いページではワーカーが起動せず、下記の確認で失敗する）
+  - ワーカーは遅延起動でスクリプトの実行後に終了するため、`--settle` 後の `pss_kib` には映らない。
+    子が生きている間のメモリは `peak_pss_kib` で見る（下記）
+  - **loaded でワーカーの起動を確認する**: 各 fandhe インスタンスで (a) 標本化中に、リーダー以外のツリー内
+    プロセスの `environ` に `FANDHE_BROWSER_JS_WORKER` キーを観測した（キーの有無のみ判定し値は読まない）、または
+    (b) 区間内にリーダーが回収した子が増えた（`/proc/<pid>/stat` の `cminflt` の増加。子の種類は区別しないが、
+    現在の fandhe の子プロセスはワーカーのみ）。どちらも確認できないインスタンスが 1 つでもあれば終了コード 1 にし、
+    loaded の結果は出力しない。根拠は `results[].js_worker`（`confirmed_instances`・`observed_by_sampler`・
+    `confirmed_by_reap_counter`）に残る。idle は遷移しないので子は起動せず、確認もしない（警告を出す）
+  - `--page-js` のエンジンはバイナリに同梱されたものと一致させる（既定ビルドは V8 のみ。`boa` は
+    `--no-default-features --features js-boa` 等でビルドする）。不一致は起動失敗として、ログ末尾に出る
 
 ## 前提
 
@@ -35,6 +52,14 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
   （`050`・`08` 等は bash 算術と `printf %d` で八進数扱いになるため使用エラー＝終了コード 2）。
   `--chromium-extra-args` に `--remote-debugging-*`・`--user-data-dir` は指定できない（検査した接続先とずれるため）
 
+- 呼び出し側の環境変数 `FANDHE_BROWSER_CONFIG` は、設定されていれば空文字でも fandhe を測る前に終了コード 2 で
+  拒否する（結果に記録されない設定が混ざるのを防ぐ。`--page-js` の有無にかかわらず `unset` してから実行する）
+- **ピーク標本化**: 遷移の開始から `--settle` の終わりまで（idle は settle のみ）、全リーダーのプロセスツリーの
+  PSS 合算を `--peak-interval-ms`（既定 50・範囲 10..1000）以上の間隔で標本化し、最大値を `peak_pss_kib` に
+  記録する。間隔は**下限**で、実際の間隔は N が大きいほど長くなる（`peak_max_gap_ms` で確かめる）。標本化は
+  間欠的なので、間隔より短命の子のピークは取りこぼしうる（2026-10-12 の単体確認では 10 ms 間隔で子の PSS 最大が
+  約 17 MiB）。サンプラーは測定対象と同じマシンで CPU を使う。終了済みで回収待ちの子（ゾンビ）はメモリを持たない
+  ので合算から外す。生存しているのに読めないプロセスがあれば失敗（終了コード 1）にする
 - **Linux 専用**（`/proc/<pid>/smaps_rollup`）。macOS・Windows では終了コード 2 で終わる
 - bash・ps・awk・curl に加え、`loaded` 条件は node 22 以降（fandhe・Chromium 双方の遷移確認に使う）（npm 依存なし）
 - fandhe-browser はリリースビルドを推奨（`cargo build --release -p fandhe-browser-cli`）。
@@ -140,6 +165,11 @@ sudo env PATH="$(dirname "$(command -v node)"):$PATH" harness/multi-instance-mem
 | キー | 内容 |
 | ---- | ---- |
 | `results[]` | `target`（fandhe/chromium）・`condition`（idle/loaded）・`processes`（合算対象数）・`pss_kib`・`rss_kib`・`pss_per_instance_kib` |
+| `results[].peak_pss_kib` | 標本化区間の PSS 合算の最大値と、settle 後の `pss_kib` の大きい方（常に `peak_pss_kib >= pss_kib`）。`pss_kib` の意味は変えていない |
+| `results[].peak_processes` / `peak_samples` / `peak_window_ms` / `peak_max_gap_ms` | ピーク時のプロセス数・標本数・標本化区間の実測長・標本間隔の最大の実測値（取りこぼしの程度の目安） |
+| `results[].js_worker` | fandhe・loaded・`--page-js` のときだけ。ワーカー起動の確認結果（`confirmed_instances`・`observed_by_sampler`・`confirmed_by_reap_counter`） |
+| `page_js_enabled` / `page_js_engine` | ページ JS の有効・無効と、エンジン（`"v8"`・`"boa"`。無効時は `null`） |
+| `peak_interval_ms` | `--peak-interval-ms`（標本化の最小間隔） |
 | `comparisons[]` | 条件ごとの `reduction_pct` = (1 - fandhe_pss / chromium_pss) x 100、`reference_threshold_met`（50% 以上か。参考値） |
 | `comparisons[].poc1_extrapolation` | `--poc1-*-kib` 指定時のみ。PoC-1 の 1 インスタンスあたり値 x N の線形外挿値と、実測の乖離率（`*_delta_pct`。正は実測が外挿より大きい） |
 | `chromium_extra_args` | Chromium に渡した追加引数の配列（`--skip-chromium` 時は `[]`） |
@@ -167,8 +197,10 @@ FANDHE_BIN=target/debug/fandhe-browser harness/multi-instance-memory/self-test.s
 往復、`navigate.mjs` の `errorText` 非 0 終了を確認する。偽 Chromium・偽 fandhe で起動失敗時のログ末尾の出力
 （20 行・3 インスタンスの上限・制御文字除去）、Chromium 一時ディレクトリの作業ディレクトリ内への配置と
 正常終了・TERM 中断時の削除（無関係な `org.chromium.Chromium.*` は残る）、`chromium_extra_args` の記録も
-確認する（いずれもオフライン・非 root）。veth/NAT（root）は自己テストの対象外で、
-実機でのオーナー実行時に確認する。
+確認する（いずれもオフライン・非 root）。`--page-js` の入力検証、呼び出し側の `FANDHE_BROWSER_CONFIG` の拒否、
+設定ファイルの引き渡し（host・netns の idle）、ピーク記録、偽 fandhe（`fake_fandhe_cdp.mjs`）による JS ワーカー
+確認（起動あり・なしで終了コード 0・1）も確認する。veth/NAT（root）の外向き経路は自己テストの対象外で、
+実機でのオーナー実行時に確認する（3 経路は同じ環境変数の組み立てを使う）。
 実バイナリ（N=1）と、可能なら netns の N=2 も確認する。CI には組み込まない。
 終了コード: 0 全検証済み / 1 失敗 / 3 Chromium 不在（Chromium 経路のみ未検証・他は合格。skip で 0 にしない）/ 4 Linux 以外。
 
@@ -182,11 +214,12 @@ FANDHE_BIN=target/debug/fandhe-browser harness/multi-instance-memory/self-test.s
 - fandhe-browser: コミット / ビルド（release・feature） / バイナリサイズ
 - Chromium: バージョン / 追加フラグ（JSON の `chromium_extra_args`。`--no-sandbox` なら明記）
 - ページ: URL（fixture の内容・サイズ） / settle 秒数 / N
+- ページ JS: 有効・無効 / エンジン（JSON の `page_js_enabled`・`page_js_engine`） / `peak_interval_ms` と `peak_max_gap_ms`
 
-| 条件 | fandhe PSS (KiB) | Chromium PSS (KiB) | 削減率 | 50% 以上 |
-| ---- | ---------------- | ------------------ | ------ | -------- |
-| idle | | | | |
-| loaded | | | | |
+| 条件 | fandhe PSS (KiB) | fandhe ピーク PSS (KiB) | Chromium PSS (KiB) | 削減率 | 50% 以上 |
+| ---- | ---------------- | ----------------------- | ------------------ | ------ | -------- |
+| idle | | | | | |
+| loaded | | | | | |
 
 ## PoC-1 線形外挿との差分
 
