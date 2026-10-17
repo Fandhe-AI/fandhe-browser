@@ -234,7 +234,7 @@ fn nt_create_at(
         )
     };
     if status < 0 {
-        return Err(map_failure(status));
+        return Err(map_failure(status, name));
     }
     if handle.is_null() {
         return Err(ProfileError::Io(std::io::Error::other(
@@ -256,10 +256,10 @@ fn nt_create_at(
 ///
 /// ディレクトリ / ファイルの種別不一致は `InvalidLayout`、それ以外は Win32 エラーへ変換して
 /// `Io` にする（`NotFound`・`AlreadyExists` 等の意味を残す。#950 の `pin_root` の再試行が依存）。
-fn map_failure(status: i32) -> ProfileError {
+fn map_failure(status: i32, name: &OsStr) -> ProfileError {
     match status {
-        STATUS_FILE_IS_A_DIRECTORY => invalid_layout(OsStr::new(""), REASON_NOT_FILE),
-        STATUS_NOT_A_DIRECTORY => invalid_layout(OsStr::new(""), REASON_NOT_DIR),
+        STATUS_FILE_IS_A_DIRECTORY => invalid_layout(name, REASON_NOT_FILE),
+        STATUS_NOT_A_DIRECTORY => invalid_layout(name, REASON_NOT_DIR),
         _ => ProfileError::Io(ntstatus_to_error(status)),
     }
 }
