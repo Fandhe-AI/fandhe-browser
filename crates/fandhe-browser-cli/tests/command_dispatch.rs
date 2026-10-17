@@ -439,6 +439,7 @@ fn cli1_profile_alias_remains_unknown_option() {
 /// `--profile-dir` は祖先の symlink を `Profile::open` が拒否する。macOS の `temp_dir()` は
 /// `/var/folders/...`（`/var` は `/private/var` への symlink）を返すため、`--profile-dir` に渡す
 /// パスは `canonicalize` した実体パスを基点にする。
+#[cfg(unix)]
 fn real_temp_dir() -> PathBuf {
     std::fs::canonicalize(std::env::temp_dir()).expect("temp_dir can be canonicalized")
 }
