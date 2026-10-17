@@ -20,9 +20,8 @@
 //! 制約（REPAIR-3）: UA は `Fetcher` 既定のまま（偽装しない。SEC-2）。実行上限は本番の既定で、
 //! 引数から変えられない。`<base>` 要素は `src` の同一オリジン判定に反映しない（簡易実装）。
 
-#[path = "../js_api_spike/spike.rs"]
-#[allow(dead_code)]
-mod spike;
+#[path = "../js_api_spike/common.rs"]
+mod common;
 
 mod probe;
 
@@ -30,6 +29,7 @@ use std::io::Write;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use common::{Obj, map_fetch_error, same_origin, sanitize_debug};
 use fandhe_browser_core::config::Config;
 use fandhe_browser_core::{
     FetchOptions, Fetcher, PageRunInput, PageRunOptions, ParseOptions, ScriptOutcome, ScriptSource,
@@ -38,7 +38,6 @@ use fandhe_browser_core::{
 };
 use probe::{Origin, ProbeArgs, class_label, lifecycle_label, script_line};
 use reqwest::Url;
-use spike::{Obj, map_fetch_error, same_origin, sanitize_debug};
 
 fn main() -> ExitCode {
     // V8 は子プロセスで評価されるため、ワーカー起動要求なら最初に処理する（JS-1 の契約）。

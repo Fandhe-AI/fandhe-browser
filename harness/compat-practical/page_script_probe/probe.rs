@@ -4,7 +4,7 @@
 //! 呼び出し元は同ディレクトリの `main.rs` だけ。ネットワークにも JS エンジンにも触れない
 //! ため、テストはオフラインで決定的に動く。出力は件数・分類名・種別だけで、ページ由来の
 //! 本文・URL・生の例外メッセージは含めない（security.md「秘密情報の混入防止」）。
-//! 例外の分類・JSON 組み立ては `js_api_spike/spike.rs` の純関数を再利用する。
+//! 例外の分類・JSON 組み立ては `js_api_spike/common.rs` の純関数を再利用する。
 
 use std::path::PathBuf;
 
@@ -13,7 +13,7 @@ use fandhe_browser_core::{
 };
 use reqwest::Url;
 
-use crate::spike::{EngineChoice, Obj, UsageError, classify, is_valid_id, parse_https_url};
+use crate::common::{EngineChoice, Obj, UsageError, classify, is_valid_id, parse_https_url};
 
 /// 引数（対象は 1 件。実行上限は本番の既定のままで、引数から変えられない）。
 #[derive(Debug)]
