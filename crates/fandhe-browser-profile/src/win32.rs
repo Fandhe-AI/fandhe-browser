@@ -454,6 +454,10 @@ pub(crate) struct DaclSummary {
 ///
 /// DACL が無い（null）場合は全員に許可なので `InvalidLayout`。新規ルートの検証と、
 /// 既存ルートを検証する #953 から使う。
+///
+/// 返す要約は SID・種別・継承フラグ・protected のみで、アクセスマスクの妥当性と本人 ACE の
+/// 存在は判定しない。#953 で既存ルート検証に流用する際は、呼び出し側でマスクと本人 ACE の
+/// 存在も検査すること。
 pub(crate) fn read_dacl(file: &File) -> Result<DaclSummary, ProfileError> {
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd: *mut c_void = std::ptr::null_mut();
@@ -540,6 +544,10 @@ pub(crate) fn read_dacl(file: &File) -> Result<DaclSummary, ProfileError> {
 
 /// 新規作成したルートの DACL が期待どおり（protected・継承 ACE なし・ACCESS_ALLOWED の
 /// 本人 / SYSTEM / Administrators のみ）かを検証する。満たさなければ `InvalidLayout`（fail-closed）。
+///
+/// 検証失敗時も作成済みディレクトリは削除しない（モジュールの方針）。再実行は
+/// `ChildDisposition::Opened` となり検証を行わず成功する。SD は作成時にアトミックに付くため
+/// 実害は読み戻しの一時エラー程度で、既存ルートの検証は #953 で行う。
 fn verify_protected_dacl(file: &File, user_sid: &str) -> Result<(), ProfileError> {
     let summary = read_dacl(file)?;
     let expected = |sid: &str| sid == user_sid || sid == SID_SYSTEM || sid == SID_ADMINISTRATORS;

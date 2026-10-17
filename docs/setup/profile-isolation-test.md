@@ -21,8 +21,8 @@ Linux ext4・macOS APFS・Windows NTFS の実機で確認する（`XOS-10`・`ME
 
 ### Windows NTFS が実行不能である根拠
 
-- Windows の `Profile::open` は、ルートが `%LOCALAPPDATA%` 配下のときだけ成功する（Issue #928。
-  新規ルートには作成時に保護付き DACL を付けて検証する（Issue #952）。既存ルートの ACL の検証は #953）。配下外は
+- Windows の `Profile::open` は、ルートが `%LOCALAPPDATA%` 配下のときだけ成功する（Issue #928）。
+  新規ルートには作成時に保護付き DACL を付けて検証する（Issue #952。既存ルートの ACL の検証は #953）。配下外は
   `ProfileError::Unsupported` でディレクトリを作らない（fail-closed）。ACL を明示設定して任意のパスを
   許可する第 2 段階（`XOS-7`）は未実装である（`crates/fandhe-browser-profile/src/local_root.rs`・
   `src/profile.rs` の `Profile::open_impl`）
