@@ -51,8 +51,8 @@
 //! - Windows のアクセス制限（`XOS-7`〜`XOS-10`）は第 1 段階として実装済み（Issue #928）。
 //!   プロファイルルートが `%LOCALAPPDATA%` 配下のときだけ `Profile::open` が成功し、
 //!   新規に作るルートには作成時に保護付き DACL（SYSTEM・Administrators・本人のみ。
-//!   Administrators と SYSTEM は読める）を付けて読み戻し検証する（Issue #952）。既存ルートの
-//!   所有者・DACL の検証は未実装（#953）。配下外のルートは
+//!   Administrators と SYSTEM は読める）を付けて読み戻し検証する（Issue #952）。既存ルートは
+//!   所有者・DACL を検証し、許可外の権限があれば `InvalidLayout` で拒否する（#953）。配下外のルートは
 //!   `ProfileError::Unsupported` で拒否してディレクトリを作らない。ACL を
 //!   明示設定して任意のパスを許可する第 2 段階は未実装（後続。未判断）。Windows の `Profile` はルートのディレクトリ
 //!   ハンドルと `profile.lock` を改名・削除を共有しない形で保持する。ルートまでの各要素・

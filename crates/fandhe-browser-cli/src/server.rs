@@ -22,7 +22,7 @@
 //! # 対応 OS
 //!
 //! Windows ではプロファイルルートが `%LOCALAPPDATA%` 配下のときだけ起動できる
-//! （`XOS-7`・`XOS-10`・Issue #928。新規ルートには保護付き DACL を付け、既存ルートの ACL は検証しない）。
+//! （`XOS-7`・`XOS-10`・Issue #928。新規ルートには保護付き DACL を付け、既存ルートは所有者・DACL を検証して拒否する）。
 //! 配下外・`LOCALAPPDATA` 未設定などでは `Profile::open` が `ProfileError::Unsupported` を
 //! 返し、cli は [`UNSUPPORTED_OS_MESSAGE`] を出して非ゼロ終了する（fail-closed）。
 //! Windows・unix 以外の OS も同じく `Unsupported` で終了する。成功を装うことはしない。
@@ -66,7 +66,8 @@ pub(crate) fn default_router_factories() -> Vec<RouterFactory> {
 /// `Profile::open` が `ProfileError::Unsupported` を返して起動に失敗した際の固定文言（`XOS-7`・`XOS-10`）。
 ///
 /// Windows では、プロファイルルートが `%LOCALAPPDATA%` 配下でない（`LOCALAPPDATA` 未設定・
-/// 判定不能を含む）ことが拒否理由で、既存ルートの ACL を検証しない代わりに配下のルートだけを許す
+/// 判定不能を含む）ことが拒否理由で、配下のルートだけを許す（所有者・DACL が許可外の既存ルートは
+/// `InvalidLayout` で別に拒否される。#953）
 /// fail-closed の意図を伝える。それ以外の OS（unix 以外）はプロファイル隔離が未対応であることを伝える。
 /// 入力のパス・環境変数の値は含めない。`main` が `error: ` を前置して stderr へ出し、非ゼロで終了する。
 #[cfg(windows)]

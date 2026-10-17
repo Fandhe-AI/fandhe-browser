@@ -33,8 +33,11 @@
 //! 本人・SYSTEM・Administrators だけを許可。配下へは継承）を `win32::open_or_create_protected_dir_at`
 //! が渡し、作成直後に読み戻して検証する。失敗すれば `open` は失敗する（Issue #952）。
 //! Administrators と SYSTEM は読める。`profile.lock`・データ種別ディレクトリはルートの DACL を
-//! 継承する。中間ディレクトリは親から継承のまま（DACL を付けない）。既存ルートの所有者・DACL は
-//! 検証しない（#953）。対応するビヘイビアは `PROF-1`・`PROF-4`・`PROF-6`・`XOS-7`・`XOS-10`
+//! 継承する。中間ディレクトリは親から継承のまま（DACL を付けない）。既存ルートは ACL を書き換えず、ハンドルから読んだ
+//! 所有者と DACL を [`check_existing_root_security`] で検証し、本人・SYSTEM・Administrators の外に権限が
+//! 出ていれば `InvalidLayout` で拒否する（締め直さない。unix の `open` との差と理由は
+//! `win32::verify_existing_root_security`。`profile.lock` もデータ種別ディレクトリも作る前に
+//! 拒否する。Issue #953）。対応するビヘイビアは `PROF-1`・`PROF-4`・`PROF-6`・`XOS-7`・`XOS-10`
 //! （Issue #928、#813、#950、#952）。
 //!
 //! ## 前提とする攻撃者像
@@ -71,10 +74,16 @@
 //!   実体に解決した（正規化後の）パスを開く（拒否はしない。unix は途中の symlink を
 //!   すべて拒否するので差がある）。固定の段階で見つかる再解析ポイントは拒否する。
 //!   `Local` 配下に OneDrive 等の再解析ポイントがある環境では、それを通る経路は拒否される。
-//! - 既存のルート・既存の中間ディレクトリの ACL は確認しない。保護付き DACL を付けるのは
-//!   新規に作るルートだけで、既存ルートの検証は #953。中間ディレクトリには DACL を付けない
-//!   ため、その名前が他ユーザーから見える可能性は残る。所有者は設定しない（昇格トークンでは
-//!   既定の所有者が Administrators になる）。
+//! - 既存の中間ディレクトリの ACL は確認しない。中間ディレクトリには DACL を付けないため、
+//!   その名前が他ユーザーから見える可能性は残る。保護付き DACL を付けるのは新規に作るルート
+//!   だけで、所有者は設定しない（昇格トークンでは既定の所有者が Administrators になるため、
+//!   既存ルートの検証は `TokenOwner` も許可する）。
+//! - 既存ルートの検証（#953）が見るのはルート自体の所有者と DACL だけで、ルート配下の既存の子
+//!   （`profile.lock`・データ種別ディレクトリ）に明示的に付けられた ACE は検証しない。保護なしの
+//!   ルート（第 1 段階で作られたもの）は、親の継承可能な ACE が後で変わると影響を受ける。
+//!   許可リスト方式のため、CREATOR OWNER などの特殊 SID や、本人・SYSTEM・Administrators 以外の
+//!   継承 ACE（AppContainer の SID 等）を持つ環境では拒否される（fail-closed）。所有者が別の
+//!   実ユーザーのルートの拒否は純粋関数のテストで担保し、実機テストは特権が要るため置かない。
 //! - 既知フォルダの値の出所はレジストリ（`HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\
 //!   User Shell Folders`）で、同じユーザーは書き換えられる。同じユーザーによる付け替えは防げない
 //!   （Issue #947 で受容した攻撃者像の範囲）。本変更で得られるのは、プロセスの環境ブロック
@@ -528,6 +537,51 @@ fn open_or_create_child_dir(
     }
 }
 
+/// 既存ルートの所有者が許可した主体でない場合の拒否理由（SID は含めない）。
+pub(crate) const REASON_EXISTING_ROOT_OWNER: &str = "existing profile root is owned by a principal other than the current user, SYSTEM or Administrators";
+/// 既存ルートの DACL が許可した主体の外へ権限を与えている場合の拒否理由（SID は含めない）。
+pub(crate) const REASON_EXISTING_ROOT_DACL: &str = "existing profile root grants access to principals other than the current user, SYSTEM and Administrators (or has a null DACL or an unsupported ACE)";
+/// `ACCESS_ALLOWED_ACE_TYPE`。
+const ACE_TYPE_ACCESS_ALLOWED: u8 = 0;
+/// `ACCESS_DENIED_ACE_TYPE`。
+const ACE_TYPE_ACCESS_DENIED: u8 = 1;
+
+/// 既存ルートの所有者と DACL が許可した主体の内側に収まるかを判定する純粋関数（Issue #953。
+/// `PROF-1`・`PROF-6`）。
+///
+/// `win32::verify_existing_root_security` が、ルートのハンドルから読んだ所有者 SID・ACE 一覧
+/// （`(ACE 種別, SID 文字列)`）と許可する SID の一覧 `allowed` を渡す。Windows 型に依存せず
+/// Linux でもテストできる。許可リスト方式で fail-closed:
+///
+/// - 所有者が取れない、または `allowed` に無ければ [`REASON_EXISTING_ROOT_OWNER`]
+/// - ACCESS_ALLOWED の ACE は、アクセスマスク・継承フラグ（継承専用を含む。配下へ継承される
+///   ため）にかかわらず SID が `allowed` に無ければ [`REASON_EXISTING_ROOT_DACL`]
+/// - ACCESS_DENIED は許可を狭めるだけなので通す。それ以外の ACE 種別は拒否する
+/// - 保護付き（継承を切った）かは問わない。第 1 段階（#928）の継承 ACL のルートを通すため
+/// - ACE が 0 件でも他者に許可しないので通す
+///
+/// 戻り値の `&'static str` は `ProfileError::InvalidLayout.reason` にそのまま入る。将来、専用の
+/// バリアントを足す場合も `ProfileError` は `#[non_exhaustive]` なので非破壊で足せる
+/// （`REPAIR-4`）。
+pub(crate) fn check_existing_root_security(
+    owner_sid: Option<&str>,
+    aces: &[(u8, &str)],
+    allowed: &[&str],
+) -> Result<(), &'static str> {
+    match owner_sid {
+        Some(owner) if allowed.contains(&owner) => {}
+        _ => return Err(REASON_EXISTING_ROOT_OWNER),
+    }
+    for &(ace_type, sid) in aces {
+        match ace_type {
+            ACE_TYPE_ACCESS_ALLOWED if allowed.contains(&sid) => {}
+            ACE_TYPE_ACCESS_DENIED => {}
+            _ => return Err(REASON_EXISTING_ROOT_DACL),
+        }
+    }
+    Ok(())
+}
+
 /// `pin_root` の最後の要素（プロファイルのルート）用の継ぎ目。Windows は
 /// `win32::open_or_create_protected_dir_at`（新規作成時に保護付き DACL を付けて検証する。
 /// Issue #952）、非 Windows は [`open_or_create_child_dir`] に委ねる（骨格。挙動は同じ）。
@@ -668,7 +722,7 @@ fn verify_created_root(plan: &RootPlan) -> Result<(), ProfileError> {
 /// 実体の `profile.lock` に取られ、作成の途中でルートが再解析ポイント化されても配下外の
 /// ファイルにはならない（`PROF-1`）。返すパスは `root_path.join("profile.lock")`
 /// （ロックのエラー表示用）。unix 側が行う所有者・ハードリンク数の検査に相当するものは
-/// Windows にはない（ACL は継承に依存し検証しない。REPAIR-3）。
+/// Windows にはない（REPAIR-3）。
 ///
 /// Windows のハンドルは READ・WRITE を共有し DELETE を共有しないため、`ProfileLock` が保持
 /// している間は改名・削除による別実体への差し替えを防ぐ。2 つ目の open は共有違反でなく
@@ -1382,5 +1436,56 @@ mod tests {
                 "must accept {name:?}"
             );
         }
+    }
+
+    // ---- 既存ルートの所有者・DACL 判定（Issue #953。純粋関数なので Linux でも動く） ----
+
+    const ME: &str = "S-1-5-21-1-2-3-1000";
+    const OTHER: &str = "S-1-5-21-1-2-3-1001";
+    const SYSTEM: &str = "S-1-5-18";
+    const ADMINS: &str = "S-1-5-32-544";
+    const ALLOWED: [&str; 4] = [ME, ME, SYSTEM, ADMINS];
+
+    fn check(owner: Option<&str>, aces: &[(u8, &str)]) -> Result<(), &'static str> {
+        check_existing_root_security(owner, aces, &ALLOWED)
+    }
+
+    #[test]
+    fn prof1_prof6_existing_root_default_acl_is_accepted() {
+        let aces = [(0, SYSTEM), (0, ADMINS), (0, ME)];
+        assert_eq!(check(Some(ME), &aces), Ok(()));
+        // 昇格トークンの既定の所有者（Administrators）。
+        assert_eq!(check(Some(ADMINS), &aces), Ok(()));
+        // ACE が 0 件でも他者には許可しない。
+        assert_eq!(check(Some(ME), &[]), Ok(()));
+    }
+
+    #[test]
+    fn prof1_prof6_existing_root_foreign_owner_is_rejected() {
+        assert_eq!(
+            check(Some(OTHER), &[(0, ME)]),
+            Err(REASON_EXISTING_ROOT_OWNER)
+        );
+        assert_eq!(check(None, &[(0, ME)]), Err(REASON_EXISTING_ROOT_OWNER));
+    }
+
+    #[test]
+    fn prof1_prof6_existing_root_grant_to_other_principals_is_rejected() {
+        for sid in ["S-1-1-0", "S-1-5-11", "S-1-5-32-545", "S-1-3-0", OTHER] {
+            assert_eq!(
+                check(Some(ME), &[(0, ME), (0, sid)]),
+                Err(REASON_EXISTING_ROOT_DACL),
+                "{sid}"
+            );
+        }
+    }
+
+    #[test]
+    fn prof1_prof6_existing_root_deny_ace_is_allowed_but_unknown_type_is_rejected() {
+        assert_eq!(check(Some(ME), &[(1, "S-1-1-0"), (0, ME)]), Ok(()));
+        assert_eq!(
+            check(Some(ME), &[(0, ME), (5, "")]),
+            Err(REASON_EXISTING_ROOT_DACL)
+        );
     }
 }

@@ -13,7 +13,8 @@
 //! で、`Profile::open`（Windows）のルートまでの各要素・`profile.lock`・データ種別ディレクトリの
 //! 作成と open はすべて本モジュール経由（Issue #950）。既知フォルダ API による基準ディレクトリの
 //! 取得（[`known_local_app_data`]。Issue #951）も本モジュールにあり、`local_root.rs`・`store.rs` が
-//! 呼ぶ。DACL（#952・#953）の `unsafe` も本モジュールに置く。通常の子の `SecurityDescriptor` は
+//! 呼ぶ。DACL（#952・#953）の `unsafe` も本モジュールに置く。既存ルートを開く場合は所有者と DACL を
+//! ハンドルから読んで検証する（#953）。通常の子の `SecurityDescriptor` は
 //! null（親から継承）で、プロファイルのルートだけ [`open_or_create_protected_dir_at`] が作成時に
 //! 保護付き DACL（本人・SYSTEM・Administrators のみ。Administrators と SYSTEM は読める）を渡し、
 //! 新規作成時は作成直後に読み戻して検証する（Issue #952）。
@@ -55,7 +56,8 @@ use windows_sys::Win32::Security::Authorization::{
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
     DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetSecurityDescriptorControl,
-    GetTokenInformation, INHERITED_ACE, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    GetTokenInformation, INHERITED_ACE, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+    TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
@@ -315,6 +317,14 @@ fn last_os_error() -> ProfileError {
     ProfileError::Io(std::io::Error::last_os_error())
 }
 
+/// 既存ルート検証（#953）の読み取り失敗を、既存ルート向けの理由で `InvalidLayout` にする。
+fn existing_root_err(reason: &'static str) -> ProfileError {
+    ProfileError::InvalidLayout {
+        path: PathBuf::new(),
+        reason,
+    }
+}
+
 fn bad_dacl() -> ProfileError {
     ProfileError::InvalidLayout {
         path: PathBuf::new(),
@@ -347,6 +357,14 @@ unsafe fn sid_to_string(sid: *mut c_void) -> Result<String, ProfileError> {
 
 /// 現在のプロセスのトークンのユーザー SID を文字列で返す。
 fn current_user_sid_string() -> Result<String, ProfileError> {
+    Ok(current_token_sids()?.0)
+}
+
+/// 現在のプロセスのトークンの `TokenUser` と `TokenOwner` の SID 文字列 `(user, owner)` を返す。
+///
+/// 昇格トークンでは新規オブジェクトの既定の所有者（`TokenOwner`）が Administrators になるため、
+/// 既存ルートの所有者検証（#953）は両方を許可する。
+fn current_token_sids() -> Result<(String, String), ProfileError> {
     let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: `GetCurrentProcess` は擬似ハンドルを返す。`token` は有効な出力先。
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
@@ -354,12 +372,31 @@ fn current_user_sid_string() -> Result<String, ProfileError> {
     }
     // SAFETY: 成功した `OpenProcessToken` が返した、他に所有者のいないハンドル。
     let token = unsafe { OwnedHandle::from_raw_handle(token as _) };
+    let user_buf = read_token_info(&token, TokenUser)?;
+    // SAFETY: 成功した呼び出しが `user_buf` の先頭に TOKEN_USER（Sid は buf 内を指す）を書いた。
+    // `user_buf` は 8 バイト整列。
+    let user_sid = unsafe { (*user_buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    // SAFETY: `user_sid` は `user_buf` 内の有効な SID で、`user_buf` はこの呼び出しの間生存する。
+    let user = unsafe { sid_to_string(user_sid) }?;
+    let owner_buf = read_token_info(&token, TokenOwner)?;
+    // SAFETY: 成功した呼び出しが `owner_buf` の先頭に TOKEN_OWNER（Owner は buf 内を指す）を書いた。
+    let owner_sid = unsafe { (*owner_buf.as_ptr().cast::<TOKEN_OWNER>()).Owner };
+    // SAFETY: `owner_sid` は `owner_buf` 内の有効な SID で、`owner_buf` はこの呼び出しの間生存する。
+    let owner = unsafe { sid_to_string(owner_sid) }?;
+    Ok((user, owner))
+}
+
+/// `GetTokenInformation(class)` の結果を 8 バイト整列のバッファで返す（サイズは上限検証つき）。
+fn read_token_info(
+    token: &OwnedHandle,
+    class: TOKEN_INFORMATION_CLASS,
+) -> Result<Vec<u64>, ProfileError> {
     let mut needed: u32 = 0;
     // SAFETY: サイズ取得の呼び出しで、バッファは null・長さ 0。
     unsafe {
         GetTokenInformation(
             token.as_raw_handle() as HANDLE,
-            TokenUser,
+            class,
             std::ptr::null_mut(),
             0,
             &mut needed,
@@ -377,7 +414,7 @@ fn current_user_sid_string() -> Result<String, ProfileError> {
     if unsafe {
         GetTokenInformation(
             token.as_raw_handle() as HANDLE,
-            TokenUser,
+            class,
             buf.as_mut_ptr().cast(),
             needed,
             &mut needed,
@@ -386,11 +423,7 @@ fn current_user_sid_string() -> Result<String, ProfileError> {
     {
         return Err(last_os_error());
     }
-    // SAFETY: 成功した呼び出しが `buf` の先頭に TOKEN_USER（Sid は `buf` 内を指す）を書いた。
-    // `buf` は 8 バイト整列。
-    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-    // SAFETY: `sid` は `buf` 内の有効な SID で、`buf` はこの呼び出しの間生存する。
-    unsafe { sid_to_string(sid) }
+    Ok(buf)
 }
 
 /// プロファイルのルートに渡す保護付き DACL を持つ自己相対のセキュリティ記述子。
@@ -457,21 +490,41 @@ pub(crate) struct DaclSummary {
 /// `file` のハンドルから DACL を読み戻して要約する（`READ_CONTROL`。`FILE_GENERIC_READ` に含む）。
 ///
 /// DACL が無い（null）場合は全員に許可なので `InvalidLayout`。新規ルートの検証と、
-/// 既存ルートを検証する #953 から使う。
+/// 既存ルートの検証（#953。[`read_owner_and_dacl`] 経由）から使う。
 ///
 /// 返す要約は SID・種別・継承フラグ・protected のみで、アクセスマスクの妥当性と本人 ACE の
-/// 存在は判定しない。#953 で既存ルート検証に流用する際は、呼び出し側でマスクと本人 ACE の
-/// 存在も検査すること。
+/// 存在は判定しない。既存ルートの判定（`local_root::check_existing_root_security`）は、
+/// マスクを見ずに許可外の主体への許可 ACE をすべて拒否することで答えている。
 pub(crate) fn read_dacl(file: &File) -> Result<DaclSummary, ProfileError> {
+    read_owner_and_dacl(file, false).map(|(_, dacl)| dacl)
+}
+
+/// `file` のハンドルから所有者 SID（文字列）と DACL を 1 回の呼び出しで読む。
+///
+/// `want_owner` が偽なら所有者は読まず `None`。真で所有者 SID が取れない（null）場合は
+/// `InvalidLayout`（fail-closed）。既存ルートの検証（#953）が使う。
+fn read_owner_and_dacl(
+    file: &File,
+    want_owner: bool,
+) -> Result<(Option<String>, DaclSummary), ProfileError> {
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd: *mut c_void = std::ptr::null_mut();
+    let mut owner: *mut c_void = std::ptr::null_mut();
+    let mut info = DACL_SECURITY_INFORMATION;
+    if want_owner {
+        info |= OWNER_SECURITY_INFORMATION;
+    }
     // SAFETY: `file` は有効なハンドル。出力先は有効で、不要な出力は null。
     let err = unsafe {
         GetSecurityInfo(
             file.as_raw_handle() as HANDLE,
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
+            info,
+            if want_owner {
+                std::ptr::addr_of_mut!(owner)
+            } else {
+                std::ptr::null_mut()
+            },
             std::ptr::null_mut(),
             &mut dacl,
             std::ptr::null_mut(),
@@ -485,9 +538,31 @@ pub(crate) fn read_dacl(file: &File) -> Result<DaclSummary, ProfileError> {
     }
     // `dacl` は `sd` の内部を指すため、`_sd` が生きている間だけ使う。
     let _sd = LocalMem(sd);
+    // 既存ルート検証（`want_owner`）では、構造上の失敗を既存ルート向けの理由で返す（#953）。
+    let dacl_err = || {
+        if want_owner {
+            existing_root_err(crate::local_root::REASON_EXISTING_ROOT_DACL)
+        } else {
+            bad_dacl()
+        }
+    };
     if dacl.is_null() || sd.is_null() {
-        return Err(bad_dacl());
+        return Err(dacl_err());
     }
+    let owner_sid = if want_owner {
+        if owner.is_null() {
+            return Err(existing_root_err(
+                crate::local_root::REASON_EXISTING_ROOT_OWNER,
+            ));
+        }
+        // SAFETY: `owner` は `sd` 内の有効な SID で、`_sd` が生きている間だけ使う。
+        Some(
+            unsafe { sid_to_string(owner) }
+                .map_err(|_| existing_root_err(crate::local_root::REASON_EXISTING_ROOT_OWNER))?,
+        )
+    } else {
+        None
+    };
     let mut control: u16 = 0;
     let mut revision: u32 = 0;
     // SAFETY: `sd` は GetSecurityInfo が返した有効な SD。
@@ -508,7 +583,7 @@ pub(crate) fn read_dacl(file: &File) -> Result<DaclSummary, ProfileError> {
         return Err(last_os_error());
     }
     if info.AceCount > MAX_ACE_COUNT {
-        return Err(bad_dacl());
+        return Err(dacl_err());
     }
     let mut aces = Vec::new();
     for index in 0..info.AceCount {
@@ -540,18 +615,22 @@ pub(crate) fn read_dacl(file: &File) -> Result<DaclSummary, ProfileError> {
             flags: header.AceFlags,
         });
     }
-    Ok(DaclSummary {
-        protected: control & SE_DACL_PROTECTED != 0,
-        aces,
-    })
+    Ok((
+        owner_sid,
+        DaclSummary {
+            protected: control & SE_DACL_PROTECTED != 0,
+            aces,
+        },
+    ))
 }
 
 /// 新規作成したルートの DACL が期待どおり（protected・継承 ACE なし・ACCESS_ALLOWED の
 /// 本人 / SYSTEM / Administrators のみ）かを検証する。満たさなければ `InvalidLayout`（fail-closed）。
 ///
 /// 検証失敗時も作成済みディレクトリは削除しない（モジュールの方針）。再実行は
-/// `ChildDisposition::Opened` となり検証を行わず成功する。SD は作成時にアトミックに付くため
-/// 実害は読み戻しの一時エラー程度で、既存ルートの検証は #953 で行う。
+/// `ChildDisposition::Opened` となり、新規用ではなく既存ルート用の検証を受ける。SD は作成時にアトミックに付くため
+/// 実害は読み戻しの一時エラー程度で、再実行時の既存ルートの検証は
+/// [`verify_existing_root_security`] が行う（#953）。
 fn verify_protected_dacl(file: &File, user_sid: &str) -> Result<(), ProfileError> {
     let summary = read_dacl(file)?;
     let expected = |sid: &str| sid == user_sid || sid == SID_SYSTEM || sid == SID_ADMINISTRATORS;
@@ -577,18 +656,66 @@ fn verify_protected_dacl_for_test(file: &File) -> Result<(), ProfileError> {
 /// 行う（緩い継承 ACL のままのディレクトリが存在する瞬間が無く、パスも再解決しない）。許可する
 /// のは本人・SYSTEM・Administrators だけで、Administrators と SYSTEM は読める。作成直後に
 /// ハンドルから DACL を読み戻して検証し、満たさなければ `Err`（作ったディレクトリは削除しない。
-/// モジュールの方針）。既存のルートを開いた場合は ACL を変えず検証もしない（所有者・DACL の
-/// 検証は #953）。ビヘイビアは `PROF-1`・`PROF-6`（Issue #952）。
+/// モジュールの方針）。既存のルートを開いた場合は ACL を書き換えず、ハンドルから所有者と DACL を
+/// 読んで [`verify_existing_root_security`] で検証し、許可した主体の外に権限が出ていれば
+/// `InvalidLayout`（Issue #953。拒否する理由は同関数）。ビヘイビアは `PROF-1`・`PROF-6`
+/// （Issue #952・#953）。
 pub(crate) fn open_or_create_protected_dir_at(
     parent: &File,
     name: &OsStr,
 ) -> Result<OpenedChild, ProfileError> {
     let sd = ProtectedSd::for_current_user()?;
     let child = open_dir_with_sd(parent, name, sd.as_ptr())?;
-    if child.disposition == ChildDisposition::Created {
-        verify_protected_dacl(&child.file, &sd.user_sid)?;
+    match child.disposition {
+        ChildDisposition::Created => verify_protected_dacl(&child.file, &sd.user_sid)?,
+        ChildDisposition::Opened => {
+            // 検証エラーの path は空で返るため、拒否したルート自身の相対名を補う
+            // （呼び出し側が親のパスと連結してフルパスにする）。
+            verify_existing_root_security(&child.file).map_err(|err| match err {
+                ProfileError::InvalidLayout { path, reason } if path.as_os_str().is_empty() => {
+                    ProfileError::InvalidLayout {
+                        path: PathBuf::from(name),
+                        reason,
+                    }
+                }
+                other => other,
+            })?
+        }
     }
     Ok(child)
+}
+
+/// 既存ルートの所有者と DACL を、ルートのハンドルから読んで検証する（Issue #953）。
+///
+/// 許可する主体は、現在のトークンの `TokenUser`・`TokenOwner`、SYSTEM、Administrators。
+/// 判定そのものは `local_root::check_existing_root_security`（純粋関数。Linux でもテスト）。
+///
+/// **締め直さず拒否する**（unix の `open` は `fchmod(0700)` で締め直すのと異なる）。理由:
+/// DACL の書き換えには `WRITE_DAC` が要り、継承 ACE を既存の子へ伝播させる処理はパスで配下を
+/// たどり直す（パスを再解決しない方針に反する）。ハンドルだけの書き換えでは既存の子に緩い継承
+/// ACE が残り、不完全な締め直しで成功を返すことになる（`REPAIR-3`）。緩い ACL の既存
+/// ディレクトリは誤って指定された共有ディレクトリかもしれず、書き換えると他の利用者の
+/// アクセスを奪う。ACL は変更せず、作ったものも削除しない。
+fn verify_existing_root_security(file: &File) -> Result<(), ProfileError> {
+    let (owner, dacl) = read_owner_and_dacl(file, true)?;
+    let (user, token_owner) = current_token_sids()?;
+    let allowed = [
+        user.as_str(),
+        token_owner.as_str(),
+        SID_SYSTEM,
+        SID_ADMINISTRATORS,
+    ];
+    let aces: Vec<(u8, &str)> = dacl
+        .aces
+        .iter()
+        .map(|ace| (ace.ace_type, ace.sid.as_str()))
+        .collect();
+    crate::local_root::check_existing_root_security(owner.as_deref(), &aces, &allowed).map_err(
+        |reason| ProfileError::InvalidLayout {
+            path: PathBuf::new(),
+            reason,
+        },
+    )
 }
 
 // ---- 既知フォルダ API（Issue #951） ----
@@ -943,22 +1070,104 @@ mod tests {
         }
     }
 
+    fn icacls(path: &Path, args: &[&str]) {
+        let out = Command::new("cmd")
+            .args(["/C", "icacls"])
+            .arg(strip_verbatim(path))
+            .args(args)
+            .output()
+            .expect("run icacls");
+        assert!(out.status.success(), "icacls failed: {out:?}");
+    }
+
+    /// Issue #953: 親から Everyone の許可を継承した既存ルートは、ACL を書き換えずに拒否する。
     #[test]
-    fn prof1_prof6_existing_root_is_opened_without_rewriting_dacl() {
+    fn prof1_prof6_existing_root_with_inherited_everyone_is_rejected() {
         let t = TempDir::new();
         let p = t.sub("p");
         grant_everyone_inheritable(&p);
-        // 緩い ACL のまま先に作られた既存ルート（検証は #953 の範囲）。
+        std::fs::create_dir(p.join("root")).expect("pre-existing root");
+        let parent = open_parent(&p);
+
+        let r = open_or_create_protected_dir_at(&parent, OsStr::new("root"));
+        assert!(
+            matches!(
+                r,
+                Err(ProfileError::InvalidLayout { reason, .. })
+                    if reason == crate::local_root::REASON_EXISTING_ROOT_DACL
+            ),
+            "{r:?}"
+        );
+        // 書き換えていない（Everyone が残っている）。
+        let probe = open_parent(&p.join("root"));
+        let dacl = read_dacl(&probe).expect("dacl");
+        assert!(
+            dacl.aces.iter().any(|a| a.sid == SID_EVERYONE),
+            "existing root must be left untouched: {dacl:?}"
+        );
+    }
+
+    /// Issue #953: 継承でなく既存ルート自体に明示した Everyone の許可も拒否する。
+    #[test]
+    fn prof1_prof6_existing_root_with_explicit_everyone_is_rejected() {
+        let t = TempDir::new();
+        let p = t.sub("p");
+        let root = p.join("root");
+        std::fs::create_dir(&root).expect("pre-existing root");
+        icacls(&root, &["/grant", "*S-1-1-0:F"]);
+        let parent = open_parent(&p);
+
+        let r = open_or_create_protected_dir_at(&parent, OsStr::new("root"));
+        assert!(
+            matches!(
+                r,
+                Err(ProfileError::InvalidLayout { reason, .. })
+                    if reason == crate::local_root::REASON_EXISTING_ROOT_DACL
+            ),
+            "{r:?}"
+        );
+    }
+
+    /// Issue #953: 本人・SYSTEM・Administrators だけを継承する親の下の既存ルート
+    /// （第 1 段階の継承 ACL のルート）は開ける。TEMP の ACL に頼らないよう親の ACL を固定する。
+    #[test]
+    fn prof1_prof6_existing_root_with_default_inherited_acl_is_opened() {
+        let t = TempDir::new();
+        let p = t.sub("p");
+        let user = format!(
+            "*{}:(OI)(CI)F",
+            current_user_sid_string().expect("user sid")
+        );
+        icacls(
+            &p,
+            &[
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+                &user,
+            ],
+        );
         std::fs::create_dir(p.join("root")).expect("pre-existing root");
         let parent = open_parent(&p);
 
         let root = open_or_create_protected_dir_at(&parent, OsStr::new("root")).expect("open");
         assert_eq!(root.disposition, ChildDisposition::Opened);
-        let dacl = read_dacl(&root.file).expect("dacl");
-        assert!(
-            dacl.aces.iter().any(|a| a.sid == SID_EVERYONE),
-            "existing root must be left untouched: {dacl:?}"
-        );
+    }
+
+    /// Issue #953（回帰）: 自分が作ったルート（保護付き DACL・昇格時は所有者が Administrators）を
+    /// 再び開くと通る。
+    #[test]
+    fn prof1_prof6_root_created_by_us_can_be_reopened() {
+        let t = TempDir::new();
+        let p = t.sub("p");
+        let parent = open_parent(&p);
+
+        let first = open_or_create_protected_dir_at(&parent, OsStr::new("root")).expect("create");
+        assert_eq!(first.disposition, ChildDisposition::Created);
+        drop(first);
+        let second = open_or_create_protected_dir_at(&parent, OsStr::new("root")).expect("reopen");
+        assert_eq!(second.disposition, ChildDisposition::Opened);
     }
 
     #[test]

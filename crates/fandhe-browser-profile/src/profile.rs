@@ -18,7 +18,8 @@
 //!   ルートが `%LOCALAPPDATA%` 配下のときだけ `Profile::open` が成功する
 //!   （[`crate::local_root`]）。新規に作るルートには作成時に保護付き DACL（本人・SYSTEM・
 //!   Administrators のみ。Administrators と SYSTEM は読める）を付けて読み戻し検証し、失敗すれば
-//!   `open` も失敗する（Issue #952）。既存ルートの所有者・DACL の検証は未実装（#953）。
+//!   `open` も失敗する（Issue #952）。既存ルートは ACL を書き換えず、ハンドルから読んだ所有者と DACL を検証し、本人・SYSTEM・
+//!   Administrators の外に権限が出ていれば `InvalidLayout` で拒否する（Issue #953）。
 //!   配下外のルートは `Err(ProfileError::Unsupported)` を返してディレクトリを作らず、
 //!   機密データを書き込む偽装成功を避ける（security.md「偽装・回避機能の禁止」）。
 //!   ACL を明示設定して任意のパスを許可する第 2 段階は未実装（後続・未判断）。
@@ -129,10 +130,10 @@ pub enum ProfileError {
     /// 現在のプラットフォームではプロファイルの隔離を安全に実施できないため、
     /// あえてプロファイルを作成せず `open` を失敗させる場合に返す。
     ///
-    /// Windows は新規ルートにだけ保護付き DACL を付け（Issue #952）、既存ルートの ACL 検証は
-    /// 未実装（#953。`XOS-7`〜`XOS-10`）。本人・Administrators・SYSTEM に限られる
-    /// `%LOCALAPPDATA%` 配下のルートだけを許可し（Issue #928。既存の中間ディレクトリや
-    /// 既存ルートに独自の ACL が設定されていれば本 crate はそれを確認しない）、それ以外のルートでは
+    /// Windows は新規ルートにだけ保護付き DACL を付け（Issue #952）、既存ルートは所有者と DACL を
+    /// 検証して拒否する（Issue #953。`XOS-7`〜`XOS-10`）。本人・Administrators・SYSTEM に限られる
+    /// `%LOCALAPPDATA%` 配下のルートだけを許可し（Issue #928。既存の中間ディレクトリの ACL は
+    /// 本 crate は確認しない）、それ以外のルートでは
     /// 何もせず成功を返すと Cookie・Storage 等の機密データが他ユーザーから読める
     /// 場所に置かれ得るため、`open` 自体を拒否する。「未実装の機能で成功を一律に
     /// 返すフォールバックを禁止する」方針（security.md・REPAIR-3）による。
@@ -550,8 +551,11 @@ impl Profile {
     /// 継承を切り、本人・SYSTEM・Administrators のみ許可。配下へ継承）を作成時に付け、作成直後に
     /// 読み戻して検証する（失敗すれば `open` も失敗。Issue #952）。Administrators と SYSTEM は
     /// 読める。ルートが `%LOCALAPPDATA%` の厳密な配下にあるときだけ許可し（新規ルートも
-    /// 既存ルートも通る。Issue #928。`PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`）、既存ルートの
-    /// 所有者・DACL は検証しない（#953）。中間ディレクトリには DACL を付けない（親から継承）。
+    /// 既存ルートも通る。Issue #928。`PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`）、既存ルートは
+    /// ACL を書き換えず、所有者と DACL を検証して許可外の権限があれば [`ProfileError::InvalidLayout`]
+    /// で拒否する（締め直す unix の `open` と異なり拒否する。理由は `win32::verify_existing_root_security`。
+    /// `profile.lock` もデータ種別ディレクトリも作る前に拒否する。Issue #953）。
+    /// 中間ディレクトリには DACL を付けない（親から継承）。
     /// `%LOCALAPPDATA%` 自体、配下外、基準（既知フォルダ `FOLDERID_LocalAppData`。環境変数
     /// `LOCALAPPDATA` は見ない。Issue #951）を取得できない・UNC・
     /// `...\AppData\Local` で終わらない場合、不正な名前（予約デバイス名・`:` 等）は何も作らず
@@ -602,9 +606,9 @@ impl Profile {
     /// `mkdirat(0700)` で作られるため誤って拒否されない。`ExplicitStore` の
     /// `open_or_create` から呼ばれる。
     ///
-    /// Windows では既存ルートの ACL を検証しない（#953）ため共有ルートの検査は行わず、
-    /// [`Profile::open`] と同じ `%LOCALAPPDATA%` 配下の判定だけが拒否の根拠になる
-    /// （`PROF-1`・`XOS-10`）。
+    /// Windows では [`Profile::open`] と `open_rejecting_shared_root` のどちらも、既存ルートの
+    /// 所有者と DACL が許可外なら拒否する（Issue #953。`PROF-1`・`XOS-10`）。unix の `open` は
+    /// 締め直すが Windows は両方拒否で、差の理由は `win32::verify_existing_root_security`。
     pub(crate) fn open_rejecting_shared_root(root: &Path) -> Result<Profile, ProfileError> {
         Self::open_impl(root, true)
     }
@@ -614,9 +618,8 @@ impl Profile {
         {
             // Windows は新規ルートにだけ保護付き DACL を付けて検証し（Issue #952）、
             // `%LOCALAPPDATA%` 配下のルートに限って開く（Issue #928。`PROF-1`・`PROF-6`・
-            // `XOS-7`・`XOS-10`）。共有ルートの拒否（unix の group/other 権限検査）は
-            // 既存ルートの ACL 検証（#953）が要るため行わず、
-            // 配下判定が同じ役割（他者が読めない場所のみ許可）を担う。
+            // `XOS-7`・`XOS-10`）。既存ルートの所有者・DACL の検証（Issue #953）は
+            // `reject_shared_root` にかかわらず常に行う（締め直さず拒否するため区別が無い）。
             let _ = reject_shared_root;
             // 基準ディレクトリは既知フォルダ API で決め、環境変数 `LOCALAPPDATA` は見ない
             // （Issue #951）。
@@ -743,7 +746,7 @@ impl Profile {
     /// どおりであることを `canonicalize` で事後に再確認する、③ ルートのハンドル相対で
     /// `profile.lock` を開いてロックを取る、④ ルートのハンドル相対で 4 つのデータ種別
     /// ディレクトリを作る。②〜④ はパスを再解決して作成しない（`local_root.rs` の「限界」）。
-    /// 新規ルートには保護付き DACL を付けて検証する。既存ルートの ACL は検証しない（#953。`PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`・Issue #952）。
+    /// 新規ルートには保護付き DACL を付けて検証する。既存ルートは所有者と DACL を検証して拒否する（#953。`PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`・Issue #952）。
     #[cfg(windows)]
     fn open_with_base(
         root: &Path,
@@ -3198,6 +3201,49 @@ mod tests {
             std::fs::read_dir(&outside).unwrap().count(),
             0,
             "配下外に作られた"
+        );
+    }
+
+    /// PROF-1・PROF-6・XOS-10（Windows、Issue #953）: Everyone に許可を与えた既存ルートは
+    /// `InvalidLayout` で拒否され、`path` にはルートのフルパスが入り、`profile.lock` も
+    /// データ種別ディレクトリも作られない。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_prof6_windows_open_rejects_existing_root_granting_everyone() {
+        let tmp = TempDir::new();
+        let lad = fake_local_app_data(&tmp);
+        let root = lad.join("shared");
+        std::fs::create_dir(&root).unwrap();
+        let shown = root.to_string_lossy();
+        let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown);
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "icacls"])
+            .arg(shown)
+            .args(["/grant", "*S-1-1-0:F"])
+            .output()
+            .expect("run icacls");
+        assert!(out.status.success(), "icacls failed: {out:?}");
+
+        let err = Profile::open_under_local_app_data(&root, Some(lad.into_os_string()))
+            .map(|_| ())
+            .expect_err("Everyone を許可した既存ルートは拒否される");
+        match err {
+            ProfileError::InvalidLayout { path, reason } => {
+                assert_eq!(
+                    reason,
+                    "existing profile root grants access to principals other than the current user, SYSTEM and Administrators (or has a null DACL or an unsupported ACE)"
+                );
+                assert_eq!(
+                    std::fs::canonicalize(&path).unwrap(),
+                    std::fs::canonicalize(&root).unwrap()
+                );
+            }
+            other => panic!("InvalidLayout を期待: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "拒否したルートの中に何も作られていない"
         );
     }
 
