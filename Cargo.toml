@@ -127,6 +127,8 @@ boa_engine = { version = "=0.22.0" }
 # safe API では ProcessMemoryLimit を設定できないため（ExtendedLimitInfo の内部が
 # pub(crate)）。unsafe はこの Win32 呼び出しに限定する（ユーザー承認 2026-09-28）。
 # 既に推移依存として Cargo.lock にある 0.61.2 を直接固定する。
+# profile crate も Windows 限定で直接依存する（Issue #947・2026-10-12 承認。用途は親ハンドル
+# 相対の NtCreateFile。feature は profile 側の Cargo.toml で加算する）。
 windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
   "Win32_Security",

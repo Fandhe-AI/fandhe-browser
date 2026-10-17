@@ -3,9 +3,10 @@
 //!
 //! `profile.rs` の `Profile::open`（Windows 分岐）から呼ばれる。Windows には
 //! unix の `openat` + `NOFOLLOW` に相当する「親のハンドルを起点に子を作る・開く」API
-//! （Win32 / NT API の直接呼び出しと `unsafe` は使わない方針のため std だけでは書けない）が
-//! ないため、次の方針で境界を守る。子の作成・オープンは常にパス文字列で行い、親のハンドルは
-//! 起点にならない（下記「限界」の根本原因）。
+//! （std だけでは書けない。ハンドル相対の関数は `win32` モジュールに用意済みだが、本経路は
+//! まだ使っておらず #950 で切り替える）がないため、次の方針で境界を守る。本経路の
+//! 子の作成・オープンは現状パス文字列で行い、親のハンドルは起点にならない
+//! （下記「限界」の根本原因）。
 //!
 //! - 作成前（[`plan_root`]）: ルートの絶対パスから、存在する最も深い祖先を `canonicalize`
 //!   （短縮名・大文字小文字・`\\?\` 表記・symlink／ジャンクションを実体に解決）し、まだ存在しない
@@ -195,6 +196,60 @@ pub(crate) fn is_invalid_new_name(name: &OsStr) -> bool {
         || s.ends_with('.')
         || s.ends_with(' ')
         || is_reserved_device_name(&s)
+}
+
+/// 親ハンドル相対で作る・開く 1 要素の名前の UTF-16 長の上限（NTFS の要素長の上限）。
+pub(crate) const MAX_COMPONENT_UTF16_LEN: usize = 255;
+
+/// 名前が [`MAX_COMPONENT_UTF16_LEN`] 個の UTF-16 単位を超えるか。アロケーションせずに判定する。
+///
+/// Windows では `encode_wide` を上限 + 1 個で打ち切って数える（孤立サロゲートも 1 単位）。
+/// それ以外では、UTF-16 の 1 単位あたり高々 3 バイト（不正バイトは損失変換で 1 単位）
+/// なので、バイト長が上限の 3 倍を超えれば必ず超過とみなす。
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn exceeds_component_len(name: &OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        name.encode_wide().take(MAX_COMPONENT_UTF16_LEN + 1).count() > MAX_COMPONENT_UTF16_LEN
+    }
+    #[cfg(not(windows))]
+    {
+        let bytes = name.as_encoded_bytes();
+        bytes.len() > MAX_COMPONENT_UTF16_LEN * 3
+            || String::from_utf8_lossy(bytes)
+                .encode_utf16()
+                .take(MAX_COMPONENT_UTF16_LEN + 1)
+                .count()
+                > MAX_COMPONENT_UTF16_LEN
+    }
+}
+
+/// 親ハンドル相対の作成・open に渡す名前が、単一要素として安全かを検査する
+/// （`PROF-4`・`XOS-10`。OS 非依存の純粋関数）。
+///
+/// `win32` モジュールの 2 関数が FFI を呼ぶ**前**に必ず通す。NT API は Win32 の正規化を通らず、
+/// 予約デバイス名や末尾の `.`・空白をリテラルの名前として作ってしまうため、
+/// [`is_invalid_new_name`] の規則をそのまま適用する。加えて、空・`.`・`..` と、UTF-16 で
+/// [`MAX_COMPONENT_UTF16_LEN`] を超える名前を拒否する（長さはアロケーション前に検査する）。
+/// 生の入力はエラーに保持しない。
+// 呼び出し元は Windows の `win32` モジュールと単体テストだけ。
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn validate_single_component(name: &OsStr) -> Result<(), ProfileError> {
+    let invalid = |reason: &'static str| Err(ProfileError::InvalidComponent { reason });
+    if name.is_empty() || name == "." || name == ".." {
+        return invalid("name must be a single non-empty path component");
+    }
+    // 文字列変換（to_string_lossy）は入力全体を確保するため、その前に長さを検査する。
+    if exceeds_component_len(name) {
+        return invalid("name is longer than 255 UTF-16 code units");
+    }
+    if is_invalid_new_name(name) {
+        return invalid(
+            "name contains a separator, reserved character, stream marker, control character, trailing dot/space, or is a reserved device name",
+        );
+    }
+    Ok(())
 }
 
 /// 作成前の判定結果。ファイルシステムには何も作っていない。
@@ -1100,5 +1155,77 @@ mod tests {
             0,
             "配下外に作られた"
         );
+    }
+
+    #[test]
+    fn prof4_xos10_validate_single_component_rejects_unsafe_names() {
+        let long = "a".repeat(MAX_COMPONENT_UTF16_LEN + 1);
+        for name in [
+            "",
+            ".",
+            "..",
+            "a\\b",
+            "a/b",
+            "a:b",
+            "CON",
+            "x.",
+            "x ",
+            "a\0b",
+            "a*b",
+            long.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    validate_single_component(OsStr::new(name)),
+                    Err(ProfileError::InvalidComponent { .. })
+                ),
+                "must reject {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prof4_xos10_validate_single_component_rejects_oversized_before_conversion() {
+        // 巨大な名前は変換前に上限超過として拒否する（アロケーション前検査）。
+        let huge = "a".repeat(1 << 20);
+        assert!(matches!(
+            validate_single_component(OsStr::new(&huge)),
+            Err(ProfileError::InvalidComponent { .. })
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            // 不正 UTF-8 バイトの長大な名前も拒否する。
+            let bad = vec![0xFFu8; MAX_COMPONENT_UTF16_LEN + 1];
+            assert!(matches!(
+                validate_single_component(OsStr::from_bytes(&bad)),
+                Err(ProfileError::InvalidComponent { .. })
+            ));
+            let bad_huge = vec![0xFFu8; 1 << 20];
+            assert!(matches!(
+                validate_single_component(OsStr::from_bytes(&bad_huge)),
+                Err(ProfileError::InvalidComponent { .. })
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let lone: Vec<u16> = vec![0xD800; MAX_COMPONENT_UTF16_LEN + 1];
+            assert!(matches!(
+                validate_single_component(&OsString::from_wide(&lone)),
+                Err(ProfileError::InvalidComponent { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn prof4_xos10_validate_single_component_accepts_plain_names() {
+        let max = "a".repeat(MAX_COMPONENT_UTF16_LEN);
+        for name in ["profile.lock", "cookies", "Dir", max.as_str()] {
+            assert!(
+                validate_single_component(OsStr::new(name)).is_ok(),
+                "must accept {name:?}"
+            );
+        }
     }
 }
