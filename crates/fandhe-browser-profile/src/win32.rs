@@ -15,7 +15,7 @@
 //! 取得（[`known_local_app_data`]。Issue #951）も本モジュールにあり、`local_root.rs`・`store.rs` が
 //! 呼ぶ。DACL（#952・#953）の `unsafe` も本モジュールに置く。既存ルートを開く場合は所有者と DACL を
 //! ハンドルから読んで検証する（#953）。通常の子の `SecurityDescriptor` は
-//! null（親から継承）で、プロファイルのルートだけ [`open_or_create_protected_dir_at`] が作成時に
+//! null（親から継承）で、プロファイルのルートと中間ディレクトリ（#1098）だけ [`open_or_create_protected_dir_at`] が作成時に
 //! 保護付き DACL（本人・SYSTEM・Administrators のみ。Administrators と SYSTEM は読める）を渡し、
 //! 新規作成時は作成直後に読み戻して検証する（Issue #952）。
 //!
@@ -69,7 +69,9 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 use windows_sys::core::PWSTR;
 
-use crate::local_root::validate_single_component;
+use crate::local_root::{
+    ProtectedDirRole, REASON_BAD_DACL, reason_for_role, validate_single_component,
+};
 use crate::profile::ProfileError;
 
 /// `IoStatusBlock.Information` の値: 新規に作成した（wdm.h の `FILE_CREATED`）。
@@ -89,7 +91,7 @@ const REASON_NOT_FILE: &str = "entry exists but is not a regular file";
 
 /// 作成したか、既存を開いたか（`IoStatusBlock.Information` 由来）。
 ///
-/// [`open_or_create_protected_dir_at`] が「新規に作ったルートだけ DACL を読み戻して検証する」
+/// [`open_or_create_protected_dir_at`] が「新規に作ったルート・中間ディレクトリだけ DACL を読み戻して検証する」
 /// 判定に使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChildDisposition {
@@ -293,7 +295,6 @@ const MAX_SID_STRING_CHARS: usize = 256;
 /// 検査する ACE 数の上限（新規ルートは 3 件のはず。巨大な ACL で長く回らないため）。
 const MAX_ACE_COUNT: u32 = 64;
 
-const REASON_BAD_DACL: &str = "newly created profile root does not have the expected protected DACL (owner, SYSTEM and Administrators only, no inherited entries)";
 const REASON_NO_USER_SID: &str =
     "could not determine the current user SID for the profile root DACL";
 
@@ -650,7 +651,8 @@ fn verify_protected_dacl_for_test(file: &File) -> Result<(), ProfileError> {
     verify_protected_dacl(file, &current_user_sid_string()?)
 }
 
-/// 親 `parent` の直下にプロファイルのルート `name` を、保護付き DACL で作成する。既にあれば開く。
+/// 親 `parent` の直下にプロファイルのルートまたは中間ディレクトリ `name`（`role`）を、保護付き
+/// DACL で作成する。既にあれば開く（Issue #1098 で中間ディレクトリにも適用）。
 ///
 /// 新規作成のときだけ、`NtCreateFile` に [`ProtectedSd`] を渡して作成と DACL の付与を原子的に
 /// 行う（緩い継承 ACL のままのディレクトリが存在する瞬間が無く、パスも再解決しない）。許可する
@@ -663,25 +665,27 @@ fn verify_protected_dacl_for_test(file: &File) -> Result<(), ProfileError> {
 pub(crate) fn open_or_create_protected_dir_at(
     parent: &File,
     name: &OsStr,
+    role: ProtectedDirRole,
 ) -> Result<OpenedChild, ProfileError> {
     let sd = ProtectedSd::for_current_user()?;
     let child = open_dir_with_sd(parent, name, sd.as_ptr())?;
-    match child.disposition {
-        ChildDisposition::Created => verify_protected_dacl(&child.file, &sd.user_sid)?,
-        ChildDisposition::Opened => {
-            // 検証エラーの path は空で返るため、拒否したルート自身の相対名を補う
-            // （呼び出し側が親のパスと連結してフルパスにする）。
-            verify_existing_root_security(&child.file).map_err(|err| match err {
-                ProfileError::InvalidLayout { path, reason } if path.as_os_str().is_empty() => {
-                    ProfileError::InvalidLayout {
-                        path: PathBuf::from(name),
-                        reason,
-                    }
-                }
-                other => other,
-            })?
-        }
-    }
+    let verified = match child.disposition {
+        ChildDisposition::Created => verify_protected_dacl(&child.file, &sd.user_sid),
+        ChildDisposition::Opened => verify_existing_root_security(&child.file),
+    };
+    // 検証エラーの path は空で返るため、拒否したディレクトリ自身の相対名を補う
+    // （呼び出し側が親のパスと連結してフルパスにする）。理由文は役割に応じて写像する。
+    verified.map_err(|err| match err {
+        ProfileError::InvalidLayout { path, reason } => ProfileError::InvalidLayout {
+            path: if path.as_os_str().is_empty() {
+                PathBuf::from(name)
+            } else {
+                path
+            },
+            reason: reason_for_role(role, reason),
+        },
+        other => other,
+    })?;
     Ok(child)
 }
 
@@ -1039,7 +1043,9 @@ mod tests {
             "control must inherit Everyone ACE: {control:?}"
         );
 
-        let root = open_or_create_protected_dir_at(&parent, OsStr::new("root")).expect("root");
+        let root =
+            open_or_create_protected_dir_at(&parent, OsStr::new("root"), ProtectedDirRole::Root)
+                .expect("root");
         assert_eq!(root.disposition, ChildDisposition::Created);
         let dacl = read_dacl(&root.file).expect("root dacl");
         assert!(dacl.protected, "{dacl:?}");
@@ -1089,7 +1095,8 @@ mod tests {
         std::fs::create_dir(p.join("root")).expect("pre-existing root");
         let parent = open_parent(&p);
 
-        let r = open_or_create_protected_dir_at(&parent, OsStr::new("root"));
+        let r =
+            open_or_create_protected_dir_at(&parent, OsStr::new("root"), ProtectedDirRole::Root);
         assert!(
             matches!(
                 r,
@@ -1117,7 +1124,8 @@ mod tests {
         icacls(&root, &["/grant", "*S-1-1-0:F"]);
         let parent = open_parent(&p);
 
-        let r = open_or_create_protected_dir_at(&parent, OsStr::new("root"));
+        let r =
+            open_or_create_protected_dir_at(&parent, OsStr::new("root"), ProtectedDirRole::Root);
         assert!(
             matches!(
                 r,
@@ -1151,7 +1159,9 @@ mod tests {
         std::fs::create_dir(p.join("root")).expect("pre-existing root");
         let parent = open_parent(&p);
 
-        let root = open_or_create_protected_dir_at(&parent, OsStr::new("root")).expect("open");
+        let root =
+            open_or_create_protected_dir_at(&parent, OsStr::new("root"), ProtectedDirRole::Root)
+                .expect("open");
         assert_eq!(root.disposition, ChildDisposition::Opened);
     }
 
@@ -1163,10 +1173,14 @@ mod tests {
         let p = t.sub("p");
         let parent = open_parent(&p);
 
-        let first = open_or_create_protected_dir_at(&parent, OsStr::new("root")).expect("create");
+        let first =
+            open_or_create_protected_dir_at(&parent, OsStr::new("root"), ProtectedDirRole::Root)
+                .expect("create");
         assert_eq!(first.disposition, ChildDisposition::Created);
         drop(first);
-        let second = open_or_create_protected_dir_at(&parent, OsStr::new("root")).expect("reopen");
+        let second =
+            open_or_create_protected_dir_at(&parent, OsStr::new("root"), ProtectedDirRole::Root)
+                .expect("reopen");
         assert_eq!(second.disposition, ChildDisposition::Opened);
     }
 
@@ -1180,6 +1194,157 @@ mod tests {
         let plain = open_or_create_dir_at(&parent, OsStr::new("plain")).expect("plain dir");
         let r = verify_protected_dacl_for_test(&plain.file);
         assert!(is_invalid_layout(&r), "{r:?}");
+    }
+
+    /// 偽の `%LOCALAPPDATA%`（`<t>/AppData/Local`。作成済み）。基準自体は検証対象外。
+    fn fake_lad(t: &TempDir) -> PathBuf {
+        // `sub` は `AppData` までしか作らないため、`Local` も明示的に作成する。
+        let lad = t.sub("AppData").join("Local");
+        std::fs::create_dir_all(&lad).expect("create fake LOCALAPPDATA");
+        lad
+    }
+
+    fn lad_env(lad: &Path) -> Option<OsString> {
+        Some(lad.as_os_str().to_os_string())
+    }
+
+    /// Issue #1098: 緩い基準の下で新規に作った中間ディレクトリとルートは、すべて保護付き DACL になる。
+    #[test]
+    fn prof1_prof6_new_intermediates_get_protected_dacl_under_permissive_base() {
+        let t = TempDir::new();
+        let lad = fake_lad(&t);
+        grant_everyone_inheritable(&lad);
+
+        // 前提（空振り防止）: 通常の作成は基準の Everyone を継承する。
+        std::fs::create_dir(lad.join("control")).expect("control");
+        let control = read_dacl(&open_parent(&lad.join("control"))).expect("control dacl");
+        assert!(
+            control.aces.iter().any(|a| a.sid == SID_EVERYONE),
+            "{control:?}"
+        );
+
+        let root = lad.join("a").join("b").join("root");
+        let plan = crate::local_root::plan_root(&root, lad_env(&lad)).expect("plan");
+        let _pinned = crate::local_root::pin_root(&plan).expect("pin");
+        for dir in [
+            lad.join("a"),
+            lad.join("a").join("b"),
+            lad.join("a").join("b").join("root"),
+        ] {
+            let dacl = read_dacl(&open_parent(&dir)).expect("dacl");
+            assert!(dacl.protected, "{dir:?}: {dacl:?}");
+            assert!(
+                dacl.aces
+                    .iter()
+                    .all(|a| a.ace_type == ACCESS_ALLOWED_ACE_TYPE
+                        && u32::from(a.flags) & INHERITED_ACE == 0),
+                "{dir:?}: {dacl:?}"
+            );
+            assert_eq!(sids(&dacl), expected_sids(), "{dir:?}");
+        }
+    }
+
+    /// Issue #1098: 明示的に Everyone を許可した既存の中間ディレクトリは拒否し、配下を作らず、
+    /// ACL も書き換えない。
+    #[test]
+    fn prof1_prof6_existing_intermediate_with_explicit_everyone_is_rejected() {
+        let t = TempDir::new();
+        let lad = fake_lad(&t);
+        let mid = lad.join("mid");
+        std::fs::create_dir(&mid).expect("mid");
+        icacls(&mid, &["/grant", "*S-1-1-0:F"]);
+
+        let plan = crate::local_root::plan_root(&mid.join("root"), lad_env(&lad)).expect("plan");
+        let r = crate::local_root::pin_root(&plan);
+        assert!(
+            matches!(
+                &r,
+                Err(ProfileError::InvalidLayout { path, reason })
+                    if *reason == crate::local_root::REASON_EXISTING_INTERMEDIATE_DACL
+                        && std::fs::canonicalize(path).ok() == std::fs::canonicalize(&mid).ok()
+            ),
+            "{r:?}"
+        );
+        assert_eq!(entry_count(&mid), 0, "nothing may be created under it");
+        let dacl = read_dacl(&open_parent(&mid)).expect("dacl");
+        assert!(dacl.aces.iter().any(|a| a.sid == SID_EVERYONE), "{dacl:?}");
+    }
+
+    /// Issue #1098: 基準から Everyone を継承した既存の中間ディレクトリも拒否する。
+    #[test]
+    fn prof1_prof6_existing_intermediate_with_inherited_everyone_is_rejected() {
+        let t = TempDir::new();
+        let lad = fake_lad(&t);
+        grant_everyone_inheritable(&lad);
+        let mid = lad.join("mid");
+        std::fs::create_dir(&mid).expect("mid");
+
+        let plan = crate::local_root::plan_root(&mid.join("root"), lad_env(&lad)).expect("plan");
+        let r = crate::local_root::pin_root(&plan);
+        assert!(
+            matches!(
+                &r,
+                Err(ProfileError::InvalidLayout { reason, .. })
+                    if *reason == crate::local_root::REASON_EXISTING_INTERMEDIATE_DACL
+            ),
+            "{r:?}"
+        );
+        assert_eq!(entry_count(&mid), 0);
+    }
+
+    /// Issue #1098（陽性対照）: 本人・SYSTEM・Administrators だけを継承する既存の中間ディレクトリは
+    /// 開け、ACL は書き換えない。
+    #[test]
+    fn prof1_prof6_existing_intermediate_with_default_acl_is_opened() {
+        let t = TempDir::new();
+        let lad = fake_lad(&t);
+        let user = format!(
+            "*{}:(OI)(CI)F",
+            current_user_sid_string().expect("user sid")
+        );
+        icacls(
+            &lad,
+            &[
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+                &user,
+            ],
+        );
+        let mid = lad.join("mid");
+        std::fs::create_dir(&mid).expect("mid");
+        let before = read_dacl(&open_parent(&mid)).expect("dacl");
+
+        let plan = crate::local_root::plan_root(&mid.join("root"), lad_env(&lad)).expect("plan");
+        let _pinned = crate::local_root::pin_root(&plan).expect("pin");
+        let after = read_dacl(&open_parent(&mid)).expect("dacl");
+        assert_eq!(before, after, "existing intermediate must not be rewritten");
+        assert!(!after.protected, "{after:?}");
+    }
+
+    /// Issue #1098: 役割が `Intermediate` のとき、拒否理由が中間ディレクトリ用に写像される。
+    #[test]
+    fn prof1_prof6_intermediate_role_maps_rejection_reason() {
+        let t = TempDir::new();
+        let p = t.sub("p");
+        grant_everyone_inheritable(&p);
+        std::fs::create_dir(p.join("mid")).expect("mid");
+        let parent = open_parent(&p);
+
+        let r = open_or_create_protected_dir_at(
+            &parent,
+            OsStr::new("mid"),
+            ProtectedDirRole::Intermediate,
+        );
+        assert!(
+            matches!(
+                r,
+                Err(ProfileError::InvalidLayout { reason, .. })
+                    if reason == crate::local_root::REASON_EXISTING_INTERMEDIATE_DACL
+            ),
+            "{r:?}"
+        );
     }
 
     /// XOS-7・PROF-6（Windows）: 既知フォルダは絶対パスで、実体は `...\AppData\Local`。

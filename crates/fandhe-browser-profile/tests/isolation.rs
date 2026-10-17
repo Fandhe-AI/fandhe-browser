@@ -1269,17 +1269,9 @@ fn read_acl(path: &Path) -> (bool, Vec<(String, bool, String)>, String) {
 #[cfg(windows)]
 #[test]
 fn prof_2_prof_6_windows_roots_have_protected_dacl_and_data_inherits_it() {
+    // 既存の中間ディレクトリ（TempDir）は許可リストで検証されるため、Everyone は付与しない
+    // （緩い基準の下の新規作成は src の単体テスト、緩い既存中間の拒否は下のテストが担う。#1098）。
     let tmp = TempDir::new();
-    // 自分の TempDir だけに Everyone を継承付きで与える（共有の基点には触れない）。
-    let shown = tmp.path().to_string_lossy().to_string();
-    let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown).to_string();
-    let grant = std::process::Command::new("icacls")
-        .arg(&shown)
-        .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
-        .output()
-        .unwrap_or_else(|e| panic!("icacls の起動に失敗: {e}"));
-    assert!(grant.status.success(), "icacls の付与に失敗: {grant:?}");
-
     let (profile_a, profile_b) = open_profile_pair(&tmp);
     let e = entry(DataKind::Cookies, "example.com", marker("a", "dacl"));
     write_entry(&profile_a, &e, &e.payload.bytes()).unwrap_or_else(|e| panic!("書き込み失敗: {e}"));
@@ -1316,6 +1308,33 @@ fn prof_2_prof_6_windows_roots_have_protected_dacl_and_data_inherits_it() {
             );
         }
     }
+}
+
+/// `PROF-1`・`PROF-6`・`XOS-10`・Issue #1098（Windows）: Everyone に許可を与えた既存の中間
+/// ディレクトリを経由するルートは `InvalidLayout` で拒否され、ルートは作られない。
+#[cfg(windows)]
+#[test]
+fn prof_6_windows_open_rejects_existing_intermediate_granting_everyone() {
+    let tmp = TempDir::new();
+    // 自分の TempDir だけに Everyone を与える（共有の基点には触れない）。
+    let shown = tmp.path().to_string_lossy().to_string();
+    let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown).to_string();
+    let grant = std::process::Command::new("icacls")
+        .arg(&shown)
+        .args(["/grant", "*S-1-1-0:F"])
+        .output()
+        .unwrap_or_else(|e| panic!("icacls の起動に失敗: {e}"));
+    assert!(grant.status.success(), "icacls の付与に失敗: {grant:?}");
+
+    let root = tmp.path().join("alice");
+    match Profile::open(&root) {
+        Err(fandhe_browser_profile::ProfileError::InvalidLayout { .. }) => {}
+        other => panic!("InvalidLayout を期待: {:?}", other.map(|_| ())),
+    }
+    assert!(
+        !root.exists(),
+        "拒否した中間ディレクトリの下にルートが作られている"
+    );
 }
 
 /// `PROF-2`・Issue #954（Windows）: open 中のプロファイルのルートはハンドルが保持され、
