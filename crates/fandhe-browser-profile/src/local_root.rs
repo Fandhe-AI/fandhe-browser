@@ -9,10 +9,13 @@
 //! - 作成前（[`plan_root`]）: ルートの絶対パスから、存在する最も深い祖先を `canonicalize`
 //!   （短縮名・大文字小文字・`\\?\` 表記・symlink／ジャンクションを実体に解決）し、まだ存在しない
 //!   残りの要素を足した「期待する実体パス」が、同じく `canonicalize` した
-//!   `%LOCALAPPDATA%` の**厳密な配下**であることをコンポーネント単位で確認する
+//!   `%LOCALAPPDATA%`（既知フォルダ `FOLDERID_LocalAppData`。下記）の**厳密な配下**であることをコンポーネント単位で確認する
 //!   （文字列の前方一致ではない。`...\Local` と `...\LocalEvil` を取り違えない）。
-//!   `LOCALAPPDATA` 自体も、実体が `...\AppData\Local` で終わり UNC でないことを要求する。
-//! - 経路の固定（[`pin_root`]）: `LOCALAPPDATA` だけはパスで開き（`canonicalize` 済み・再解析
+//!   基準ディレクトリ自体も、実体が `...\AppData\Local` で終わり UNC でないことを要求する。
+//! - 基準ディレクトリ: 環境変数 `LOCALAPPDATA` ではなく、既知フォルダ API
+//!   （`win32::known_local_app_data`。Issue #951）で取得した値を使う。プロセスの環境ブロックを
+//!   書き換えて基準を共有場所へ向けられない。
+//! - 経路の固定（[`pin_root`]）: 基準ディレクトリだけはパスで開き（`canonicalize` 済み・再解析
 //!   ポイントの検査あり）、ルートまでの各要素は親のハンドル相対で作成・open する
 //!   （`FILE_OPEN_IF` で作成と open が原子的）。各ハンドルは `FILE_SHARE_DELETE` なしで保持され、
 //!   保持している間、その要素の**改名・削除**は共有違反で失敗する。再解析ポイントは
@@ -30,8 +33,7 @@
 //! （既定の継承 ACL のままなら、`%LOCALAPPDATA%` 配下に新規作成したディレクトリは
 //! SYSTEM・Administrators・本人のみにアクセス権が付く。実測は Issue #813 のコメント）。
 //! Administrators と SYSTEM は読める。ACL を明示設定して任意のパスを許可する第 2 段階
-//! （既知フォルダ API を含む）は依存の feature 追加と `unsafe` の承認が要るため未実装
-//! （後続。未判断）。対応するビヘイビアは `PROF-1`・`PROF-4`・`PROF-6`・`XOS-7`・`XOS-10`
+//! は後続（#952・#953）。対応するビヘイビアは `PROF-1`・`PROF-4`・`PROF-6`・`XOS-7`・`XOS-10`
 //! （Issue #928、#813、#950）。
 //!
 //! ## 前提とする攻撃者像
@@ -51,9 +53,9 @@
 //!
 //! ## 限界（`REPAIR-3`。実装済みを装わない）
 //!
-//! - 起点の `LOCALAPPDATA` はパスで開く（`canonicalize` 済み・再解析ポイントの検査あり）。
-//!   それより上の祖先は保持しない（子のハンドルが開いている間は祖先の改名も失敗すると期待して
-//!   いるが、未確認〔Windows で要確認〕）。既知フォルダ API による確認は #951。
+//! - 起点は既知フォルダ API で取得した実体で、パスで開く（`canonicalize` 済み・再解析ポイントの
+//!   検査あり）。それより上の祖先は保持しない（子のハンドルが開いている間は祖先の改名も失敗すると
+//!   期待しているが、未確認〔Windows で要確認〕）。
 //! - 固定後に要素が再解析ポイント化された場合、作成はハンドル相対で配下に留まる。
 //!   [`verify_created_root`] の `canonicalize` が食い違いを検出すると `InvalidLayout` になり、
 //!   作ったものは配下に残る。実機の FSCTL では未検証。
@@ -70,11 +72,12 @@
 //!   `Local` 配下に OneDrive 等の再解析ポイントがある環境では、それを通る経路は拒否される。
 //! - 既存のルート・既存の中間ディレクトリの ACL は確認しない。独自の ACL が設定されて
 //!   いれば、継承 ACL の前提は成り立たない（#952・#953）。
-//! - `LOCALAPPDATA` が既知フォルダの実体かどうかは確認しない。環境変数の値を使い、実体が
-//!   ローカルドライブ上で `AppData\Local` で終わることだけを見る（既知フォルダ API は `unsafe`
-//!   か依存の追加が要るため未実装。#951）。環境変数が共有場所に作った同名の階層を指していれば、
-//!   継承 ACL の前提は成り立たない。#813 の実測は実際の `%LOCALAPPDATA%` 配下で行ったもので、
-//!   この場合は測っていない。
+//! - 既知フォルダの値の出所はレジストリ（`HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\
+//!   User Shell Folders`）で、同じユーザーは書き換えられる。同じユーザーによる付け替えは防げない
+//!   （Issue #947 で受容した攻撃者像の範囲）。本変更で得られるのは、プロセスの環境ブロック
+//!   （`LOCALAPPDATA`）から基準が導かれないことに限る。取得した値にも、ローカルドライブ・
+//!   `AppData\Local` で終わる形・ドライブルート拒否の検証をかけ続ける。`USERPROFILE` の
+//!   展開の扱いは `tests/known_folder_base.rs` のシナリオ (c) で観測し固定する。
 //! - `profile.lock` の所有者・ハードリンク数は検査しない（unix との差）。
 //!
 //! 判定ロジックは `std::fs` と `std::path` だけで書いてあり、Linux・macOS でも
@@ -87,14 +90,14 @@ use std::path::{Component, Path, PathBuf, Prefix};
 use crate::lock::LOCK_FILE_NAME;
 use crate::profile::{DataKind, ProfileError};
 
-/// `LOCALAPPDATA` が使えない場合の拒否理由。
-const REASON_NO_LOCALAPPDATA: &str = "LOCALAPPDATA must be set to an absolute path of an existing directory; on Windows, profile roots are only allowed under %LOCALAPPDATA% (XOS-7, XOS-10)";
-/// `LOCALAPPDATA` が UNC、または `...\AppData\Local` で終わらない場合の拒否理由。
-const REASON_BAD_LOCALAPPDATA: &str = "LOCALAPPDATA must resolve to a local drive path ending in AppData\\Local (UNC and redirected locations are not supported; the inherited-ACL assumption was only verified for the default location; XOS-7, XOS-10)";
+/// 基準ディレクトリ（既知フォルダ）が使えない場合の拒否理由。
+const REASON_NO_LOCALAPPDATA: &str = "the Local AppData known folder (FOLDERID_LocalAppData) must resolve to an absolute path of an existing directory; on Windows, profile roots are only allowed under it (XOS-7, XOS-10)";
+/// 基準ディレクトリが UNC、または `...\AppData\Local` で終わらない場合の拒否理由。
+const REASON_BAD_LOCALAPPDATA: &str = "the Local AppData known folder must resolve to a local drive path ending in AppData\\Local (UNC and redirected locations are not supported; the inherited-ACL assumption was only verified for the default location; XOS-7, XOS-10)";
 /// ルートが配下でない場合の拒否理由。
-const REASON_OUTSIDE: &str = "on Windows, the profile root must be a directory strictly under %LOCALAPPDATA% (inherited ACL is relied on; other locations are not supported yet; XOS-7, XOS-10)";
+const REASON_OUTSIDE: &str = "on Windows, the profile root must be a directory strictly under the Local AppData known folder (inherited ACL is relied on; other locations are not supported yet; XOS-7, XOS-10)";
 /// 正規化など、判定に必要な操作が失敗した場合の拒否理由。
-const REASON_CANNOT_VERIFY: &str = "on Windows, the profile root could not be verified to be under %LOCALAPPDATA% (path resolution failed); refusing to create it";
+const REASON_CANNOT_VERIFY: &str = "on Windows, the profile root could not be verified to be under the Local AppData known folder (path resolution failed); refusing to create it";
 /// `.` / `..` / 非ドライブのプレフィックス / ドライブ相対を含むパスの拒否理由。
 const REASON_UNSUPPORTED_FORM: &str = "on Windows, the profile root must be a plain drive-absolute path without '.' or '..' components (UNC, device and drive-relative paths are not supported)";
 /// 要素の名前が不正（代替データストリーム・予約デバイス名・予約文字・末尾の `.`／空白）な場合の拒否理由。
@@ -240,14 +243,16 @@ impl RootPlan {
     }
 }
 
-/// `LOCALAPPDATA` の値を検証し、`canonicalize` した実体パスを返す。
+/// 基準ディレクトリの候補を検証し、`canonicalize` した実体パスを返す。
 ///
+/// 本番では `win32::known_local_app_data()`（既知フォルダ API）の値だけが渡り、環境変数は
+/// 渡さない（Issue #951）。テストだけが偽の基準を渡す。
 /// 継承 ACL の実測（#813）は既定の `C:\Users\<user>\AppData\Local` で行われたため、
 /// 実体が UNC（フォルダリダイレクト・マップドドライブの先）や、末尾が
 /// `AppData\Local` でない場所（`C:\ProgramData` など）は認めない。緩める場合は
 /// 第 2 段階（既知フォルダ API で取得した値の検証）で扱う。
-fn resolve_base(local_app_data: Option<OsString>) -> Result<PathBuf, ProfileError> {
-    let value = local_app_data
+fn resolve_base(base_candidate: Option<OsString>) -> Result<PathBuf, ProfileError> {
+    let value = base_candidate
         .filter(|v| !v.is_empty())
         .ok_or(unsupported(REASON_NO_LOCALAPPDATA))?;
     let raw = PathBuf::from(value);
@@ -285,9 +290,9 @@ fn resolve_base(local_app_data: Option<OsString>) -> Result<PathBuf, ProfileErro
 /// 返す。いずれの場合もディレクトリは作らない（`PROF-1`・`XOS-7`・`XOS-10`）。
 pub(crate) fn plan_root(
     root: &Path,
-    local_app_data: Option<OsString>,
+    base_candidate: Option<OsString>,
 ) -> Result<RootPlan, ProfileError> {
-    let base = resolve_base(local_app_data)?;
+    let base = resolve_base(base_candidate)?;
 
     // ドライブ相対（`C:foo`）は、そのドライブのカレントディレクトリ次第で意味が変わるため
     // 絶対化の前に拒否する。

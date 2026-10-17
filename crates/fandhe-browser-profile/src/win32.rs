@@ -11,8 +11,9 @@
 //!
 //! 呼び出し元は `local_root.rs` の継ぎ目（`open_or_create_child_dir`・`open_or_create_child_file`）
 //! で、`Profile::open`（Windows）のルートまでの各要素・`profile.lock`・データ種別ディレクトリの
-//! 作成と open はすべて本モジュール経由（Issue #950）。DACL（#952・#953）・既知フォルダ API（#951）の
-//! `unsafe` も本モジュールに置く。`SecurityDescriptor` は null（親から継承）で、設定経路は
+//! 作成と open はすべて本モジュール経由（Issue #950）。既知フォルダ API による基準ディレクトリの
+//! 取得（[`known_local_app_data`]。Issue #951）も本モジュールにあり、`local_root.rs`・`store.rs` が
+//! 呼ぶ。DACL（#952・#953）の `unsafe` も本モジュールに置く。`SecurityDescriptor` は null（親から継承）で、設定経路は
 //! #952 で足す。
 //!
 //! ## 承認
@@ -30,9 +31,9 @@
 //! 親ハンドル相対の open は親のファイルオブジェクトを起点にするため、親の再解析ポイントは
 //! 評価されない、という理解に基づく。実機の FSCTL では未検証。
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::PathBuf;
@@ -49,7 +50,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FILE_TRAVERSE,
 };
+use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+use windows_sys::core::PWSTR;
 
 use crate::local_root::validate_single_component;
 use crate::profile::ProfileError;
@@ -250,6 +254,74 @@ fn ntstatus_to_error(status: i32) -> std::io::Error {
     // SAFETY: ポインタ引数を持たない純粋な変換関数で、任意の NTSTATUS 値を渡してよい。
     let code = unsafe { RtlNtStatusToDosError(status) };
     std::io::Error::from_raw_os_error(code as i32)
+}
+
+// ---- 既知フォルダ API（Issue #951） ----
+
+/// 既知フォルダを取得できなかった場合の拒否理由（パスは含めない）。
+const REASON_KNOWN_FOLDER_UNAVAILABLE: &str = "the Local AppData known folder (FOLDERID_LocalAppData) could not be resolved; refusing to use an unverified base directory (XOS-7, XOS-10)";
+/// 既知フォルダのパス長の上限（UTF-16 要素数。`\\?\` 付きの最大長 32,767 に合わせる）。
+const KNOWN_FOLDER_MAX_UNITS: usize = 32_767;
+
+/// `SHGetKnownFolderPath` が返した文字列を `CoTaskMemFree` で解放するガード。
+///
+/// API の契約では、成否にかかわらず（失敗時に非 null が入り得るため）返ったポインタを
+/// 解放する必要がある。HRESULT の判定より前に作り、早期 return でも漏らさない。
+struct CoTaskMemString(PWSTR);
+
+impl Drop for CoTaskMemString {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` は `SHGetKnownFolderPath` が COM タスクアロケータで確保した
+        // ポインタ、または null（初期値）。`CoTaskMemFree` は null を許容し、ガードは
+        // 所有権を 1 つだけ持つので解放は drop の 1 回に限られる。
+        unsafe { CoTaskMemFree(self.0.cast_const().cast()) };
+    }
+}
+
+/// 既知フォルダ `FOLDERID_LocalAppData` の実パスを OS から取得する。
+///
+/// `Profile::open`（`profile.rs`）の基準ディレクトリと、既定ルート（`store.rs` の
+/// `OsDefaultStore`。`XOS-7`）の起点に使う。環境変数 `LOCALAPPDATA` は見ない。プロセスの
+/// 環境ブロックを書き換えて基準を共有場所へ向けることを防ぐため（Issue #951・`PROF-6`・
+/// `XOS-10`）。ただし値の出所はレジストリ（`User Shell Folders`）で、同じユーザーは
+/// 書き換えられる（`local_root.rs` の「限界」）。取得できない場合は
+/// [`ProfileError::Unsupported`]（fail-closed。パスはエラーに含めない）。
+///
+/// `SHGetKnownFolderPath`・`CoTaskMemFree` は COM の初期化（`CoInitialize`）を必要としない。
+pub(crate) fn known_local_app_data() -> Result<PathBuf, ProfileError> {
+    let unavailable = || ProfileError::Unsupported {
+        reason: REASON_KNOWN_FOLDER_UNAVAILABLE,
+    };
+    let mut raw: PWSTR = std::ptr::null_mut();
+    // SAFETY: `FOLDERID_LocalAppData` は呼び出しの間生存する定数、`hToken` の null は現在の
+    // ユーザー、`&mut raw` は書き込み可能な有効なポインタ。`KF_FLAG_DEFAULT` は非負の定数で
+    // `u32` へ損失なく変換できる。
+    let hr = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_LocalAppData,
+            KF_FLAG_DEFAULT as u32,
+            std::ptr::null_mut(),
+            &mut raw,
+        )
+    };
+    // 成否にかかわらず解放が必要（上記）。判定より前にガードへ渡す。
+    let guard = CoTaskMemString(raw);
+    if hr < 0 || guard.0.is_null() {
+        return Err(unavailable());
+    }
+    let mut len = 0usize;
+    // SAFETY: 成功時の `guard.0` は NUL 終端の UTF-16 文字列で、`guard` の drop まで有効。
+    // 走査は上限 `KNOWN_FOLDER_MAX_UNITS` 要素までに限り、終端が見つからなければ読むのをやめる。
+    while len <= KNOWN_FOLDER_MAX_UNITS && unsafe { *guard.0.add(len) } != 0 {
+        len += 1;
+    }
+    if len == 0 || len > KNOWN_FOLDER_MAX_UNITS {
+        return Err(unavailable());
+    }
+    // SAFETY: 上の走査で `guard.0` から `len` 要素が読めることを確認済み（NUL の手前まで）。
+    // 読んだ内容は `OsString` へ複製し、ガードの解放前に使い終える。
+    let wide = unsafe { std::slice::from_raw_parts(guard.0, len) };
+    Ok(PathBuf::from(OsString::from_wide(wide)))
 }
 
 #[cfg(test)]
@@ -454,5 +526,24 @@ mod tests {
             &parent,
             OsStr::new("f")
         )));
+    }
+
+    /// XOS-7・PROF-6（Windows）: 既知フォルダは絶対パスで、実体は `...\AppData\Local`。
+    /// CI の通常環境では環境変数 `LOCALAPPDATA` の実体と一致する（対応の健全性確認）。
+    #[test]
+    fn xos7_known_local_app_data_is_absolute_and_ends_with_app_data_local() {
+        let kf = known_local_app_data().expect("known folder");
+        assert!(kf.is_absolute(), "{kf:?}");
+        let real = std::fs::canonicalize(&kf).expect("canonicalize known folder");
+        let tail: Vec<_> = real
+            .components()
+            .rev()
+            .take(2)
+            .map(|c| c.as_os_str().to_ascii_lowercase())
+            .collect();
+        assert_eq!(tail, [OsString::from("local"), OsString::from("appdata")]);
+        if let Some(env) = std::env::var_os("LOCALAPPDATA") {
+            assert_eq!(std::fs::canonicalize(env).expect("env canonicalize"), real);
+        }
     }
 }

@@ -135,8 +135,8 @@ pub enum ProfileError {
     /// 何もせず成功を返すと Cookie・Storage 等の機密データが他ユーザーから読める
     /// 場所に置かれ得るため、`open` 自体を拒否する。「未実装の機能で成功を一律に
     /// 返すフォールバックを禁止する」方針（security.md・REPAIR-3）による。
-    /// `LOCALAPPDATA` が未設定・相対パス・UNC・`AppData\Local` で終わらない場合、
-    /// 判定に必要な正規化の失敗、不正な名前（予約デバイス名・`:` 等）でも同じ。
+    /// 既知フォルダ（`FOLDERID_LocalAppData`）を取得できない、または取得した実体が UNC・
+    /// `AppData\Local` で終わらない場合、判定に必要な正規化の失敗、不正な名前（予約デバイス名・`:` 等）でも同じ。
     Unsupported {
         /// 未対応の理由を示す英語メッセージ。
         reason: &'static str,
@@ -175,7 +175,7 @@ pub enum ProfileError {
     /// OS 慣習の既定プロファイルルートを解決できない場合に返す
     /// （`XOS-7`、TASK-60（60.3）・#202。`store::OsDefaultStore` が返す）。
     ///
-    /// 必要な環境変数（`HOME`・`LOCALAPPDATA` 等）が未設定・空・相対パス・
+    /// 必要な環境変数（`HOME` 等。Windows は既知フォルダ `FOLDERID_LocalAppData` を取得できない場合）が未設定・空・相対パス・
     /// `..` 含みの場合や、既定値が定義されていないプラットフォームで使う。
     /// `/tmp` やカレントディレクトリへ暗黙にフォールバックせず失敗させる
     /// （fail-closed。REPAIR-3）。環境変数の値（ユーザー名を含みうる）は
@@ -551,7 +551,8 @@ impl Profile {
     /// 継承 ACL のままであれば、`%LOCALAPPDATA%` 配下のディレクトリは SYSTEM・
     /// Administrators・本人のみにアクセス権が付き、別の標準ユーザーからは読めない
     /// （Administrators と SYSTEM は読める。実測は #813）。ACL の設定と検証はしない。
-    /// `%LOCALAPPDATA%` 自体、配下外、`LOCALAPPDATA` が未設定・相対パス・UNC・
+    /// `%LOCALAPPDATA%` 自体、配下外、基準（既知フォルダ `FOLDERID_LocalAppData`。環境変数
+    /// `LOCALAPPDATA` は見ない。Issue #951）を取得できない・UNC・
     /// `...\AppData\Local` で終わらない場合、不正な名前（予約デバイス名・`:` 等）は何も作らず
     /// [`ProfileError::Unsupported`] を返す。判定は `canonicalize` 後のパスをコンポーネント
     /// 単位で比べ（8.3 短縮名・大文字小文字・`\\?\` 表記・`..`・symlink・ジャンクションを
@@ -562,7 +563,7 @@ impl Profile {
     ///
     /// Windows の作成・open は、ルートまでの各要素・`profile.lock`・データ種別ディレクトリを
     /// 親のハンドル相対（Issue #950）で行い、作成の途中の再解析ポイント化でも配下外に作らず、
-    /// ロックはルートの実体の `profile.lock` に取る。Windows の限界（起点の `LOCALAPPDATA` は
+    /// ロックはルートの実体の `profile.lock` に取る。Windows の限界（起点の基準ディレクトリは
     /// パスで開くこと、実機の FSCTL では未検証であること、内側へ向くジャンクションを許可する
     /// こと、既存ディレクトリの ACL を確認しないこと、`profile.lock` の所有者・ハードリンク数を
     /// 検査しないこと等）は `local_root.rs` のモジュール doc「限界」を参照。
@@ -580,7 +581,7 @@ impl Profile {
     /// - 既に別の `Profile` が同じルートの `profile.lock` を保持している場合
     ///   [`ProfileError::Locked`]（この場合データ種別ディレクトリは一切
     ///   作成・変更しない）
-    /// - Windows で `%LOCALAPPDATA%` 配下でないルート（`LOCALAPPDATA` の未設定・相対パス・
+    /// - Windows で `%LOCALAPPDATA%` 配下でないルート（既知フォルダの取得失敗・
     ///   判定不能を含む）、およびその他のプラットフォームでは [`ProfileError::Unsupported`]
     ///   （何も作成しない）
     /// - Windows で作成後の再確認が差し替え（ジャンクション等）を検出した場合
@@ -613,7 +614,9 @@ impl Profile {
             // 拒否（unix の group/other 権限検査）は ACL の検証が要るため行わず、
             // 配下判定が同じ役割（他者が読めない場所のみ許可）を担う。
             let _ = reject_shared_root;
-            Self::open_under_local_app_data(root, std::env::var_os("LOCALAPPDATA"))
+            // 基準ディレクトリは既知フォルダ API で決め、環境変数 `LOCALAPPDATA` は見ない
+            // （Issue #951）。
+            Self::open_under_known_local_app_data(root)
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -705,8 +708,29 @@ impl Profile {
         }
     }
 
-    /// Windows 向けの `open` 本体。`local_app_data` は `LOCALAPPDATA` の値で、テストから
-    /// 差し替えられるよう引数で受ける（公開 API は `std::env::var_os` の結果を渡す）。
+    /// Windows 向けの本番の入口。基準ディレクトリを既知フォルダ API
+    /// （`FOLDERID_LocalAppData`。[`crate::win32::known_local_app_data`]）で取得して
+    /// [`Profile::open_with_base`] へ渡す。基準を引数で受けないため、本番の経路から環境変数や
+    /// 呼び出し側の値で基準を変えられない（Issue #951）。取得できなければ
+    /// [`ProfileError::Unsupported`]（何も作らない）。
+    #[cfg(windows)]
+    fn open_under_known_local_app_data(root: &Path) -> Result<Profile, ProfileError> {
+        let base = crate::win32::known_local_app_data()?;
+        Self::open_with_base(root, Some(base.into_os_string()))
+    }
+
+    /// テスト専用の入口。偽の基準を差し込んで [`Profile::open_with_base`] を呼ぶ。
+    /// 本番の経路は基準を引数で受けない（Issue #951・`cfg(test)` に限る）。
+    #[cfg(all(windows, test))]
+    pub(crate) fn open_under_local_app_data(
+        root: &Path,
+        local_app_data: Option<std::ffi::OsString>,
+    ) -> Result<Profile, ProfileError> {
+        Self::open_with_base(root, local_app_data)
+    }
+
+    /// Windows 向けの `open` 本体。`base_candidate` は基準ディレクトリの候補で、本番では
+    /// 既知フォルダ API の値だけが渡る。
     ///
     /// 手順（詳細は [`crate::local_root`]）: ① 作成前に、ルートが `%LOCALAPPDATA%` の
     /// 厳密な配下であることを正規化後のパスで判定する（配下外・判定不能は何も作らず
@@ -717,13 +741,13 @@ impl Profile {
     /// ディレクトリを作る。②〜④ はパスを再解決して作成しない（`local_root.rs` の「限界」）。
     /// アクセス制限は既定の継承 ACL に依存し、ACL の設定・検証はしない（`PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`）。
     #[cfg(windows)]
-    pub(crate) fn open_under_local_app_data(
+    fn open_with_base(
         root: &Path,
-        local_app_data: Option<std::ffi::OsString>,
+        base_candidate: Option<std::ffi::OsString>,
     ) -> Result<Profile, ProfileError> {
         use crate::local_root;
 
-        let plan = local_root::plan_root(root, local_app_data)?;
+        let plan = local_root::plan_root(root, base_candidate)?;
         // 表示用のルートは unix 側と同じく絶対化した入力（検証済みの実体は `plan` が持つ）。
         let display_root = std::path::absolute(root)?;
 
@@ -2737,10 +2761,12 @@ mod tests {
 
     // ---- Windows: `%LOCALAPPDATA%` 配下のルートのみ許可（Issue #928。PROF-1・PROF-6・XOS-7・XOS-10） ----
 
-    /// 実環境の `LOCALAPPDATA`（テストの前提。未設定なら失敗させる）。
+    /// 実環境の既知フォルダ `FOLDERID_LocalAppData`（テストの前提。取得できなければ失敗させる）。
     #[cfg(windows)]
     fn real_local_app_data() -> std::ffi::OsString {
-        std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA must be set on Windows")
+        crate::win32::known_local_app_data()
+            .expect("known folder must resolve on Windows")
+            .into_os_string()
     }
 
     /// `cmd /C mklink /J` でジャンクションを作る（管理者権限は不要）。失敗はテスト失敗にする。
