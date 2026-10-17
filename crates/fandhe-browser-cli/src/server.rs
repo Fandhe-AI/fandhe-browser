@@ -149,6 +149,11 @@ impl fmt::Display for StartupError {
             Self::ConfigPathEmpty => f.write_str(CONFIG_PATH_EMPTY_MESSAGE),
             Self::ProfileRootNotWired => f.write_str(PROFILE_ROOT_NOT_WIRED_MESSAGE),
             Self::Profile(ProfileError::Unsupported { .. }) => f.write_str(UNSUPPORTED_OS_MESSAGE),
+            // InvalidLayout の理由はパスを含まない固定文言のため表示する
+            // （symlink 祖先の実体パス案内など。PROF-4・#1089）。
+            Self::Profile(ProfileError::InvalidLayout { reason, .. }) => {
+                write!(f, "invalid profile directory: {reason}")
+            }
             Self::Profile(_) => f.write_str("failed to open profile"),
             Self::WebSocketConfig(_) => f.write_str("failed to build websocket config"),
             Self::RouteConflict(_) => f.write_str("router merge conflict"),
@@ -314,6 +319,13 @@ pub(crate) mod tests {
             path: std::path::PathBuf::from("p"),
         });
         assert_eq!(other.to_string(), "failed to open profile");
+
+        // PROF-4・#1089: InvalidLayout は理由のみ表示しパスは出さない。
+        let layout = StartupError::Profile(ProfileError::InvalidLayout {
+            path: "secret-dir".into(),
+            reason: "x",
+        });
+        assert_eq!(layout.to_string(), "invalid profile directory: x");
     }
 
     /// 設定ファイルの I/O エラーは固定文言へ写像され、パスが表示に漏れない。

@@ -69,7 +69,7 @@ stderr は `error: <固定文言>`。usage エラーは末尾に `; run 'fandhe-
 | 一時出力先 `<TMP>` | `mktemp -d` 配下 | `mktemp -d` 配下 | `$env:TEMP` 配下の新規ディレクトリ |
 | 終了操作（launch） | SIGINT（Ctrl+C） | 同左 | Ctrl+C / `Stop-Process` |
 
-macOS の注: `mktemp -d` は `/var/folders/...` を返すが `/var` は `/private/var` への symlink で、`ExplicitStore` は canonicalize せず `Profile::open` は祖先の symlink を拒否する。`<TMP>` は `TMP=$(cd "$(mktemp -d)" && pwd -P)` のように実体パスへ解決してから `<P>=<TMP>/p` を組み立てる。
+macOS の注: `mktemp -d` は `/var/folders/...` を返すが `/var` は `/private/var` への symlink で、`ExplicitStore` は canonicalize せず `Profile::open` は祖先の symlink を拒否する。`<TMP>` は `TMP=$(cd "$(mktemp -d)" && pwd -P)` のように実体パスへ解決してから `<P>=<TMP>/p` を組み立てる。解決せずに渡すと `invalid profile directory: a path component is a symlink; specify the real path without symlinks (on macOS, /tmp and /var are symlinks: use /private/tmp or /private/var)` で終了コード 1 になる（境界は緩めず、拒否時に実体パスを案内する方針。#1089）。
 
 根拠: `crates/fandhe-browser-profile/src/store.rs` の `APP_DIR_NAME = "fandhe-browser"`。
 
@@ -185,6 +185,7 @@ ID は `CT-<コマンド>-E<n>`（3 OS 共通。結果は OS ごとに記録す�
 | `CT-PROFILE-E3` | `launch --profile-dir <P>` を常駐させたまま `["navigate", "--profile-dir", "<P>", "about:blank"]` | 1 | `profile is already in use` |
 | `CT-PROFILE-E4`（Windows のみ） | `%LOCALAPPDATA%` の外を `<P>` にして `["navigate", "--profile-dir", "<外>", "about:blank"]` | 1 | `on Windows, the profile root must be located under %LOCALAPPDATA% (XOS-7, XOS-10)`（`server.rs` の `UNSUPPORTED_OS_MESSAGE`。Windows で未実測）。Linux・macOS では同じ argv が成功するのが期待値 |
 | `CT-PROFILE-E5`（unix） | symlink を辿った後に `..` を含む `<P>`（既存テストと同等） | 2 | `invalid profile directory: …`。ディレクトリを作らない |
+| `CT-PROFILE-E6`（unix。任意） | symlink の祖先を含む `<P>`（macOS は `/tmp/x` で再現できる）で `["navigate", "--profile-dir", "<P>", "about:blank"]` | 1 | `invalid profile directory: a path component is a symlink; …`（文言は `profile.rs` の `SYMLINK_COMPONENT_REASON` から引き写した。リンク先にディレクトリを作らない。#1089） |
 
 補足:
 

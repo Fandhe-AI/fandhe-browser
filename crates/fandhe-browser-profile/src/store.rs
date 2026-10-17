@@ -191,7 +191,8 @@ impl ProfileStore for OsDefaultStore {
 ///   （実行中の `chdir` で保存先が変わらないようにするため）
 /// - `canonicalize` はしない。symlink の検証は [`Profile::open`] がハンドル基準で
 ///   行う（`PROF-1`・`PROF-4`）。macOS の `/var` など OS 標準の symlink を含む
-///   パスは、[`Profile::open`] の doc と同様に呼び出し側で `canonicalize` が必要
+///   パスは [`Profile::open`] が拒否し、実体パスを案内する理由（symlink を含む旨）を
+///   返す。境界は緩めず、`canonicalize` は呼び出し側の責務とする（#1089 の方針 A）
 /// - `..` を含むパスは受け付けるが、[`ExplicitStore::new`] が副作用の前に字句的に
 ///   畳み込んで保存する（`/tmp/new-dir/../profile` は `/tmp/profile`）。畳み込まずに
 ///   [`Profile::open`] へ渡すと、途中要素（`/tmp/new-dir`）が最終ルートの外に作成される
