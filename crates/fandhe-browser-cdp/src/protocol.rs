@@ -516,7 +516,7 @@ impl Dispatcher {
     /// 受信テキスト 1 件を処理する。パース失敗・未登録メソッド・ハンドラのエラーは
     /// すべてエラー応答になり、成功応答を捏造しない（`SEC-2`）。パースと名前検証を通った
     /// メソッド名だけが受信ログへ記録される（パース失敗は記録しない。`CDP-6`）。
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub async fn dispatch(&self, state: &Arc<CdpState>, text: &str) -> DispatchOutcome {
         self.dispatch_on(state, None, text).await
     }
