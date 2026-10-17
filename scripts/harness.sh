@@ -276,8 +276,9 @@ case "${name}" in
     ;;
   compare-container-memory)
     # 実測済みの 2 つの結果 JSON を比較する（--fandhe・--chromium は CONTAINER_MEMORY_COMPARE_ARGS で渡す）。
+    # compare.sh は jq のみで動く（Docker・Linux 不要）。compare 側の自己テストは Linux 専用の
+    # check-container-memory（self-test.sh）に含まれるため、macOS・Windows でも比較できるようここでは呼ばない。
     require_cmd jq "required by ${name}"
-    bash harness/container-memory/self-test.sh
     # shellcheck disable=SC2086 # 引数文字列は意図的に単語分割する
     bash harness/container-memory/compare.sh ${CONTAINER_MEMORY_COMPARE_ARGS}
     ;;
