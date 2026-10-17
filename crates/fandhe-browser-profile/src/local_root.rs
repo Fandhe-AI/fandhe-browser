@@ -29,11 +29,11 @@
 //!   差し替え後の実体だと境界外を消しかねないため。unix 側も途中で作ったディレクトリを戻さない
 //!   方針に揃える）。
 //!
-//! アクセス制限: Windows で新規に作るルートには、作成時に保護付き DACL（親からの継承を切り、
+//! アクセス制限: Windows で新規に作るルートと中間ディレクトリには、作成時に保護付き DACL（親からの継承を切り、
 //! 本人・SYSTEM・Administrators だけを許可。配下へは継承）を `win32::open_or_create_protected_dir_at`
 //! が渡し、作成直後に読み戻して検証する。失敗すれば `open` は失敗する（Issue #952）。
 //! Administrators と SYSTEM は読める。`profile.lock`・データ種別ディレクトリはルートの DACL を
-//! 継承する。中間ディレクトリは親から継承のまま（DACL を付けない）。既存ルートは ACL を書き換えず、ハンドルから読んだ
+//! 継承する。中間ディレクトリにも同じ DACL を付ける（Issue #1098）。既存のルート・中間ディレクトリは ACL を書き換えず、ハンドルから読んだ
 //! 所有者と DACL を [`check_existing_root_security`] で検証し、本人・SYSTEM・Administrators の外に権限が
 //! 出ていれば `InvalidLayout` で拒否する（締め直さない。unix の `open` との差と理由は
 //! `win32::verify_existing_root_security`。`profile.lock` もデータ種別ディレクトリも作る前に
@@ -74,10 +74,18 @@
 //!   実体に解決した（正規化後の）パスを開く（拒否はしない。unix は途中の symlink を
 //!   すべて拒否するので差がある）。固定の段階で見つかる再解析ポイントは拒否する。
 //!   `Local` 配下に OneDrive 等の再解析ポイントがある環境では、それを通る経路は拒否される。
-//! - 既存の中間ディレクトリの ACL は確認しない。中間ディレクトリには DACL を付けないため、
-//!   その名前が他ユーザーから見える可能性は残る。保護付き DACL を付けるのは新規に作るルート
-//!   だけで、所有者は設定しない（昇格トークンでは既定の所有者が Administrators になるため、
-//!   既存ルートの検証は `TokenOwner` も許可する）。
+//! - 保護付き DACL を付けるのは新規に作るルートと中間ディレクトリで（Issue #1098）、所有者は
+//!   設定しない（昇格トークンでは既定の所有者が Administrators になるため、既存の検証は
+//!   `TokenOwner` も許可する）。既存の中間ディレクトリはルートと同じ許可リストで検証し、外れれば
+//!   `InvalidLayout`（ACL は書き換えず、配下は作らない）。基準ディレクトリ（既知フォルダ）自体と
+//!   その祖先の ACL は検証しないため、最初の中間ディレクトリの名前は基準の ACL の範囲で列挙され
+//!   得る。検証は `open` 時点のみで、その後に同じユーザーが ACL を変えることは防がない。新規に
+//!   保護付きで作った中間ディレクトリの継承可能な ACE は、その配下に後で置かれる別のデータにも
+//!   継承される。既存の中間ディレクトリの兄弟エントリの ACL は検証しない。許可リスト方式のため、
+//!   本人・SYSTEM・Administrators 以外の ACE（CREATOR OWNER 等）を持つ既存の中間ディレクトリ
+//!   （環境によっては `%LOCALAPPDATA%\Temp` 等）を経由するルートは拒否される（fail-closed）。
+//!   所有者が別の実ユーザーの中間ディレクトリの拒否は特権が要るため実機テストを置かず、純粋関数
+//!   （`check_existing_root_security`・`reason_for_role`）のテストで担保する。
 //! - 既存ルートの検証（#953）が見るのはルート自体の所有者と DACL だけで、ルート配下の既存の子
 //!   （`profile.lock`・データ種別ディレクトリ）に明示的に付けられた ACE は検証しない。保護なしの
 //!   ルート（第 1 段階で作られたもの）は、親の継承可能な ACE が後で変わると影響を受ける。
@@ -541,6 +549,44 @@ fn open_or_create_child_dir(
 pub(crate) const REASON_EXISTING_ROOT_OWNER: &str = "existing profile root is owned by a principal other than the current user, SYSTEM or Administrators";
 /// 既存ルートの DACL が許可した主体の外へ権限を与えている場合の拒否理由（SID は含めない）。
 pub(crate) const REASON_EXISTING_ROOT_DACL: &str = "existing profile root grants access to principals other than the current user, SYSTEM and Administrators (or has a null DACL or an unsupported ACE)";
+/// 既存の中間ディレクトリの所有者が許可した主体でない場合の拒否理由（SID は含めない。Issue #1098）。
+pub(crate) const REASON_EXISTING_INTERMEDIATE_OWNER: &str = "existing intermediate directory of the profile root is owned by a principal other than the current user, SYSTEM or Administrators";
+/// 既存の中間ディレクトリの DACL が許可した主体の外へ権限を与えている場合の拒否理由（Issue #1098）。
+pub(crate) const REASON_EXISTING_INTERMEDIATE_DACL: &str = "existing intermediate directory of the profile root grants access to principals other than the current user, SYSTEM and Administrators (or has a null DACL or an unsupported ACE)";
+/// 新規作成したルートの DACL が期待と異なる場合の拒否理由（`win32.rs` が使う。Windows 以外では未使用）。
+pub(crate) const REASON_BAD_DACL: &str = "newly created profile root does not have the expected protected DACL (owner, SYSTEM and Administrators only, no inherited entries)";
+/// 新規作成した中間ディレクトリの DACL が期待と異なる場合の拒否理由（Issue #1098）。
+pub(crate) const REASON_BAD_DACL_INTERMEDIATE: &str = "newly created intermediate directory of the profile root does not have the expected protected DACL (owner, SYSTEM and Administrators only, no inherited entries)";
+
+/// 保護付き DACL の対象ディレクトリの役割（Issue #1098）。判定・DACL は同じで、拒否理由の
+/// 文言だけが異なる（中間ディレクトリの拒否に "profile root" と書くと誤解を招くため）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProtectedDirRole {
+    /// `%LOCALAPPDATA%` とルートの間の中間ディレクトリ。
+    Intermediate,
+    /// プロファイルのルート。
+    Root,
+}
+
+/// ルート向けの拒否理由 `root_reason` を、`role` に応じた理由へ写像する純粋関数。
+/// `win32::open_or_create_protected_dir_at` が検証エラーの `reason` に適用する。
+/// 役割に依存しない理由（再解析ポイント・非ディレクトリ等）はそのまま返す。
+/// `PROF-1`・`PROF-6`（Issue #1098）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn reason_for_role(role: ProtectedDirRole, root_reason: &'static str) -> &'static str {
+    if role == ProtectedDirRole::Root {
+        return root_reason;
+    }
+    if root_reason == REASON_EXISTING_ROOT_OWNER {
+        REASON_EXISTING_INTERMEDIATE_OWNER
+    } else if root_reason == REASON_EXISTING_ROOT_DACL {
+        REASON_EXISTING_INTERMEDIATE_DACL
+    } else if root_reason == REASON_BAD_DACL {
+        REASON_BAD_DACL_INTERMEDIATE
+    } else {
+        root_reason
+    }
+}
 /// `ACCESS_ALLOWED_ACE_TYPE`。
 const ACE_TYPE_ACCESS_ALLOWED: u8 = 0;
 /// `ACCESS_DENIED_ACE_TYPE`。
@@ -582,17 +628,20 @@ pub(crate) fn check_existing_root_security(
     Ok(())
 }
 
-/// `pin_root` の最後の要素（プロファイルのルート）用の継ぎ目。Windows は
-/// `win32::open_or_create_protected_dir_at`（新規作成時に保護付き DACL を付けて検証する。
-/// Issue #952）、非 Windows は [`open_or_create_child_dir`] に委ねる（骨格。挙動は同じ）。
-fn open_or_create_root_dir(
+/// `pin_root` の中間ディレクトリ・ルート用の継ぎ目。Windows は
+/// `win32::open_or_create_protected_dir_at`（新規作成時に保護付き DACL を付けて検証し、既存は
+/// 所有者と DACL を検証する。Issue #952・#953・#1098）、非 Windows は
+/// [`open_or_create_child_dir`] に委ねる（骨格。挙動は同じ）。
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn open_or_create_protected_dir(
     parent: &File,
     parent_path: &Path,
     name: &OsStr,
+    role: ProtectedDirRole,
 ) -> Result<File, ProfileError> {
     #[cfg(windows)]
     {
-        crate::win32::open_or_create_protected_dir_at(parent, name)
+        crate::win32::open_or_create_protected_dir_at(parent, name, role)
             .map(|opened| opened.file)
             .map_err(|err| with_full_path(err, parent_path))
     }
@@ -651,11 +700,12 @@ fn open_or_create_child_file(
 }
 
 /// `LOCALAPPDATA` からルートまでを 1 要素ずつ親のハンドル相対で作成・open し（既にあれば開く）、
-/// 各ディレクトリのハンドルを保持して経路を固定する。最後の要素（ルート）だけは新規作成時に
-/// 保護付き DACL を付ける（[`open_or_create_root_dir`]。Issue #952）。
+/// 各ディレクトリのハンドルを保持して経路を固定する。中間ディレクトリとルートは新規作成時に
+/// 保護付き DACL を付け、既存なら所有者と DACL を検証する（[`open_or_create_protected_dir`]。
+/// Issue #952・#953・#1098）。上から順に処理するため、中間で拒否されればそれより下は作られない。
 ///
 /// 起点の `LOCALAPPDATA` だけはパスで開く（`canonicalize` 済み・再解析ポイント検査あり。
-/// 既知フォルダ API は #951 まで未対応）。以降は [`open_or_create_child_dir`] により、
+/// 既知フォルダ API は #951 まで未対応）。以降は親ハンドル相対の作成・open により、
 /// 作成と open が原子的（Windows は `FILE_OPEN_IF`）で、パスの再解決による配下外への作成は
 /// 起きない。並行して同じルートを開く別プロセスがあってもそのまま開ける。各ハンドルは
 /// 再解析ポイントでないディレクトリであることを開く時点で確認する。固定後に
@@ -679,11 +729,12 @@ pub(crate) fn pin_root(plan: &RootPlan) -> Result<PinnedPath, ProfileError> {
             path: current.clone(),
             reason: "no pinned directory handle",
         })?;
-        let handle = if is_root {
-            open_or_create_root_dir(parent, &current, name)?
+        let role = if is_root {
+            ProtectedDirRole::Root
         } else {
-            open_or_create_child_dir(parent, &current, name)?
+            ProtectedDirRole::Intermediate
         };
+        let handle = open_or_create_protected_dir(parent, &current, name, role)?;
         current.push(name);
         dirs.push(handle);
     }
@@ -1448,6 +1499,28 @@ mod tests {
 
     fn check(owner: Option<&str>, aces: &[(u8, &str)]) -> Result<(), &'static str> {
         check_existing_root_security(owner, aces, &ALLOWED)
+    }
+
+    /// Issue #1098: 中間ディレクトリ用の理由への写像。役割に依存しない理由は不変。
+    #[test]
+    fn prof1_prof6_reason_for_role_maps_root_reasons_to_intermediate() {
+        use ProtectedDirRole::{Intermediate, Root};
+        let pairs = [
+            (
+                REASON_EXISTING_ROOT_OWNER,
+                REASON_EXISTING_INTERMEDIATE_OWNER,
+            ),
+            (REASON_EXISTING_ROOT_DACL, REASON_EXISTING_INTERMEDIATE_DACL),
+            (REASON_BAD_DACL, REASON_BAD_DACL_INTERMEDIATE),
+        ];
+        for (root, intermediate) in pairs {
+            assert_eq!(reason_for_role(Root, root), root);
+            assert_eq!(reason_for_role(Intermediate, root), intermediate);
+            assert!(intermediate.contains("intermediate directory"));
+        }
+        let neutral = "entry is a reparse point";
+        assert_eq!(reason_for_role(Root, neutral), neutral);
+        assert_eq!(reason_for_role(Intermediate, neutral), neutral);
     }
 
     #[test]

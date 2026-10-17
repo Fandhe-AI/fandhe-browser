@@ -131,10 +131,10 @@ pub enum ProfileError {
     /// 現在のプラットフォームではプロファイルの隔離を安全に実施できないため、
     /// あえてプロファイルを作成せず `open` を失敗させる場合に返す。
     ///
-    /// Windows は新規ルートにだけ保護付き DACL を付け（Issue #952）、既存ルートは所有者と DACL を
-    /// 検証して拒否する（Issue #953。`XOS-7`〜`XOS-10`）。本人・Administrators・SYSTEM に限られる
-    /// `%LOCALAPPDATA%` 配下のルートだけを許可し（Issue #928。既存の中間ディレクトリの ACL は
-    /// 本 crate は確認しない）、それ以外のルートでは
+    /// Windows は新規ルートと中間ディレクトリに保護付き DACL を付け（Issue #952・#1098）、既存の
+    /// ルート・中間ディレクトリは所有者と DACL を検証して拒否する（Issue #953・#1098。
+    /// `XOS-7`〜`XOS-10`）。本人・Administrators・SYSTEM に限られる
+    /// `%LOCALAPPDATA%` 配下のルートだけを許可し（Issue #928）、それ以外のルートでは
     /// 何もせず成功を返すと Cookie・Storage 等の機密データが他ユーザーから読める
     /// 場所に置かれ得るため、`open` 自体を拒否する。「未実装の機能で成功を一律に
     /// 返すフォールバックを禁止する」方針（security.md・REPAIR-3）による。
@@ -548,7 +548,7 @@ impl Profile {
     /// を drop した後もこのファイル自体は残り続ける（unlink しない理由は
     /// [`crate::lock`] のモジュール doc を参照）。
     ///
-    /// Windows ではパーミッション 700 の代わりに、新規に作るルートへ保護付き DACL（親からの
+    /// Windows ではパーミッション 700 の代わりに、新規に作るルート・中間ディレクトリへ保護付き DACL（親からの
     /// 継承を切り、本人・SYSTEM・Administrators のみ許可。配下へ継承）を作成時に付け、作成直後に
     /// 読み戻して検証する（失敗すれば `open` も失敗。Issue #952）。Administrators と SYSTEM は
     /// 読める。ルートが `%LOCALAPPDATA%` の厳密な配下にあるときだけ許可し（新規ルートも
@@ -556,7 +556,8 @@ impl Profile {
     /// ACL を書き換えず、所有者と DACL を検証して許可外の権限があれば [`ProfileError::InvalidLayout`]
     /// で拒否する（締め直す unix の `open` と異なり拒否する。理由は `win32::verify_existing_root_security`。
     /// `profile.lock` もデータ種別ディレクトリも作る前に拒否する。Issue #953）。
-    /// 中間ディレクトリには DACL を付けない（親から継承）。
+    /// `%LOCALAPPDATA%` とルートの間の中間ディレクトリにも同じ保護付き DACL を付け（新規）、既存は
+    /// ルートと同じ許可リストで検証して拒否する（Issue #1098。基準ディレクトリ自体の ACL は検証しない）。
     /// `%LOCALAPPDATA%` 自体、配下外、基準（既知フォルダ `FOLDERID_LocalAppData`。環境変数
     /// `LOCALAPPDATA` は見ない。Issue #951）を取得できない・UNC・
     /// `...\AppData\Local` で終わらない場合、不正な名前（予約デバイス名・`:` 等）は何も作らず
