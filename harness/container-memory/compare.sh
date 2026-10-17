@@ -96,6 +96,11 @@ main() {
   [ -r "$FANDHE" ] || die "--fandhe is not readable"
   [ -r "$CHROMIUM" ] || die "--chromium is not readable"
 
+  # jq は連結された複数の JSON 値を受け付け、-e の終了コードは最後の出力で決まる。検証した値と計算に使う値
+  # （--slurpfile の先頭要素）がずれないよう、各入力がちょうど 1 個の JSON 値であることを先に確認する。
+  jq -e -s 'length == 1' "$FANDHE" >/dev/null 2>&1 || die "--fandhe must contain exactly one JSON value"
+  jq -e -s 'length == 1' "$CHROMIUM" >/dev/null 2>&1 || die "--chromium must contain exactly one JSON value"
+
   jq -e --arg want fandhe "$VALIDATE_JQ" "$FANDHE" >/dev/null 2>&1 || die "--fandhe is not a valid container-memory/v1 result for target fandhe"
   jq -e --arg want chromium "$VALIDATE_JQ" "$CHROMIUM" >/dev/null 2>&1 || die "--chromium is not a valid container-memory/v1 result for target chromium"
 

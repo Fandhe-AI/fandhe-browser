@@ -28,6 +28,8 @@ ROOT="$(cd "${HERE}/../.." && pwd)"
 NAVIGATE_JS="${ROOT}/harness/multi-instance-memory/navigate.mjs"
 # 自己テストが偽 docker シムへ差し替える入口
 DOCKER="${DOCKER_BIN:-docker}"
+# chromium 経路の URL ホスト解決（自己テストが偽シムへ差し替える入口。getent ahostsv4 と同じ出力形式）
+RESOLVE="${RESOLVE_BIN:-getent}"
 LABEL_KEY="fandhe-ctrmem.run"
 CDP_ENDPOINT="http://127.0.0.1:9333"
 
@@ -240,6 +242,45 @@ digest_matches() {
     '[.manifests[]? | select(.platform.os == $os and .platform.architecture == $arch) | .digest][0] // empty' | tr -d '\r')
   [[ "$pd" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
   printf '%s' "$info" | jq -e --arg p "@${pd}" '(.RepoDigests // []) | any(endswith($p))' >/dev/null
+}
+
+# $1 = IPv4 アドレス。公開帯なら 0、loopback・プライベート・リンクローカル・CGNAT・ベンチマーク・
+# ドキュメント用・マルチキャスト以上なら 1 を返す（Chromium は本体の SSRF ガードを通らないため、
+# 測定側で解決結果を検査する）。
+is_public_ipv4() {
+  local ip="$1" a b c d
+  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]})) c=$((10#${BASH_REMATCH[3]})) d=$((10#${BASH_REMATCH[4]}))
+  [ "$a" -le 255 ] && [ "$b" -le 255 ] && [ "$c" -le 255 ] && [ "$d" -le 255 ] || return 1
+  case "$a" in
+    0 | 10 | 127) return 1 ;;
+  esac
+  [ "$a" -lt 224 ] || return 1
+  case "$a.$b.$c" in
+    192.0.0 | 192.0.2 | 198.51.100 | 203.0.113) return 1 ;;
+  esac
+  case "$a.$b" in
+    169.254 | 192.168) return 1 ;;
+  esac
+  if [ "$a" -eq 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ]; then return 1; fi
+  if [ "$a" -eq 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ]; then return 1; fi
+  if [ "$a" -eq 198 ] && { [ "$b" -eq 18 ] || [ "$b" -eq 19 ]; }; then return 1; fi
+  return 0
+}
+
+# $1 = URL のホスト（ポートなし）。DNS を測定側で解決し、全 A レコードが公開帯であることを確認して
+# 先頭の IP へ固定する。出力は Chromium の --host-resolver-rules の値。
+# 他のホスト（リダイレクト先・サブリソース）は ~NOTFOUND で名前解決させず、内部宛て通信を作らせない。
+# Chromium 側で再解決しないため DNS rebinding も防ぐ。
+chromium_resolver_rules() {
+  local host="$1" out ip first=""
+  out=$("$RESOLVE" ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u) || return 1
+  [ -n "$out" ] || return 1
+  while IFS= read -r ip; do
+    is_public_ipv4 "$ip" || return 1
+    [ -n "$first" ] || first="$ip"
+  done <<<"$out"
+  printf 'MAP %s %s, MAP * ~NOTFOUND' "$host" "$first"
 }
 
 # 参照イメージ内の Chromium 本体のパスを実行ごとに 1 回解決する（リビジョン番号はハードコードしない）。
@@ -564,6 +605,8 @@ main() {
   if [ "${#CONDS[@]}" -eq 2 ] && [ "${CONDS[0]}" = "${CONDS[1]}" ]; then die "--conditions must not repeat a condition"; fi
   local want_loaded=0
   for c in "${CONDS[@]}"; do [ "$c" != loaded ] || want_loaded=1; done
+  # chromium は既定で外部への名前解決を禁止する（loaded では下で対象ホストのみ許可に置き換える）
+  [ "$TARGET" != chromium ] || CHROMIUM_ARGS=("--host-resolver-rules=MAP * ~NOTFOUND" "${CHROMIUM_ARGS[@]}")
   if [ "$want_loaded" -eq 1 ]; then
     [ -n "$URL" ] || die "--url is required for the loaded condition"
     require_match "--url" "$URL" "$URL_RE"
@@ -574,6 +617,12 @@ main() {
       localhost | localhost:* | *.localhost | *.localhost:* | 127.* | 10.* | 192.168.* | 169.254.* | 0.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[01].*)
         die "--url host is loopback or private; use a public URL (SSRF guard)" ;;
     esac
+    if [ "$TARGET" = chromium ]; then
+      # Page.navigate は Chromium へ直送され本体の SSRF ガードを通らない。解決結果の検査と IP 固定を行う
+      local rules
+      rules=$(chromium_resolver_rules "${url_host%%:*}") || die "--url host does not resolve, or resolves to a non-public address (SSRF guard)"
+      CHROMIUM_ARGS=("--host-resolver-rules=${rules}" "${CHROMIUM_ARGS[@]:1}")
+    fi
   fi
 
   # --- 前提の検査（失敗は exit 2） ---

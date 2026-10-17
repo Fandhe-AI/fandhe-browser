@@ -64,6 +64,19 @@ if [[ "$(now_ms)" =~ ^[0-9]{13,}$ ]]; then ok "now_ms is epoch milliseconds"; el
 
 # --- 偽 docker シム ---
 SHIM="$TMP/docker-shim"
+# getent ahostsv4 の偽シム（実 DNS は使わない）
+RSHIM="$TMP/resolve-shim"
+cat >"$RSHIM" <<'RSH'
+#!/usr/bin/env bash
+[ "$1" = ahostsv4 ] || exit 2
+case "$2" in
+  example.com | example.org) printf '93.184.216.34 STREAM %s\n' "$2" ;;
+  private.test) printf '10.0.0.1 STREAM %s\n' "$2" ;;
+  mixed.test) printf '93.184.216.34 STREAM %s\n127.0.0.1 STREAM %s\n' "$2" "$2" ;;
+  *) exit 2 ;;
+esac
+RSH
+chmod +x "$RSHIM"
 cat >"$SHIM" <<'SHIMEOF'
 #!/usr/bin/env bash
 # 偽 docker。呼び出しを calls.log に記録し、環境変数のシナリオに従って応答する。
@@ -197,7 +210,7 @@ new_scene() {
 # $@ = measure.sh の追加引数。終了コードを返し、標準出力を $S/out.json、標準エラーを $S/err に残す
 run_measure() {
   [ "$SHIM" != "docker" ] || { echo "refusing to run against a real docker" >&2; exit 1; }
-  DOCKER_BIN="$SHIM" bash "${HERE}/measure.sh" \
+  RESOLVE_BIN="$RSHIM" DOCKER_BIN="$SHIM" bash "${HERE}/measure.sh" \
     --cgroup-root "$S/cg" --proc-root "$S/proc" --meminfo "$S/meminfo" \
     --helper-image node:22-alpine --helper-digest "$DIGEST" \
     --reference-image mcr.microsoft.com/playwright:v1.49.0-noble --reference-digest "$REF_DIGEST" \
@@ -325,9 +338,15 @@ expect_eq "fandhe: no path resolution" "0" "$(grep -c -- '--entrypoint sh' "$S/c
 
 # --- chromium target ---
 new_scene
+expect_rc "chromium: host resolving to private IP rejected" 2 --target chromium --n-list 1 --no-doubling --conditions loaded --url https://private.test/
+expect_rc "chromium: mixed public/private resolution rejected" 2 --target chromium --n-list 1 --no-doubling --conditions loaded --url https://mixed.test/
+expect_rc "chromium: unresolvable host rejected" 2 --target chromium --n-list 1 --no-doubling --conditions loaded --url https://nx.test/
+expect_rc "chromium: decimal-IP loopback host rejected" 2 --target chromium --n-list 1 --no-doubling --conditions loaded --url http://2130706433/
+new_scene
 expect_rc "chromium run" 0 --target chromium --n-list 2 --no-doubling --conditions idle,loaded --url https://example.com/p
 REFPIN="mcr.microsoft.com/playwright@${REF_DIGEST}"
 expect_jq "chromium: target" "chromium" '.target'
+expect_eq "chromium: every launch pins the checked IP" "0" "$(grep -- '--headless=new' "$S/calls.log" | grep -vc -- '--host-resolver-rules=MAP example.com 93.184.216.34, MAP \* ~NOTFOUND' || true)"
 expect_jq "chromium: pinned digest" "$REFPIN" '.image.pinned_digest'
 expect_jq "chromium: image ref is the pin" "$REFPIN" '.image.ref'
 expect_jq "chromium: launch entrypoint" "/ms-playwright/chromium-1148/chrome-linux/chrome" '.launch.entrypoint'
@@ -657,6 +676,13 @@ for del in 'del(.args.url)' '.args.url = "file:///etc/passwd"' 'del(.args.naviga
   jq "$del" "$CS/lf.json" >"$CS/bad.json"
   cmp_rc "compare: invalid loaded field [$del]" 2 --fandhe "$CS/bad.json" --chromium "$CS/lc.json"
 done
+# 不正なオブジェクトの後に正常なオブジェクトを連結した入力は拒否する（検証と計算の値のずれ防止）
+mk_result fandhe loaded "[$(mk_step 100 500 500)]" >"$CS/f.json"
+mk_result chromium loaded "[$(mk_step 100 1000 1000)]" >"$CS/c.json"
+{ jq '.target = "bogus"' "$CS/c.json"; cat "$CS/c.json"; } >"$CS/c-multi.json"
+cmp_rc "compare: concatenated JSON values (chromium)" 2 --fandhe "$CS/f.json" --chromium "$CS/c-multi.json"
+{ jq '.step = 1' "$CS/f.json" | jq '.conditions[0].steps[0].memory_peak_bytes.sum = -1'; cat "$CS/f.json"; } >"$CS/f-multi.json"
+cmp_rc "compare: concatenated JSON values (fandhe)" 2 --fandhe "$CS/f-multi.json" --chromium "$CS/c.json"
 cmp_rc "compare: missing file" 2 --fandhe "$CS/none.json" --chromium "$CS/c.json"
 cmp_rc "compare: missing --chromium" 2 --fandhe "$CS/f.json"
 cmp_rc "compare: unknown option" 2 --bogus
