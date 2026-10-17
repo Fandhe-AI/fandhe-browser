@@ -972,7 +972,12 @@ fn classify_evaluation_error(err: &JsEngineError) -> (ErrorKind, String) {
             ErrorKind::ResourceLimit,
             worker_protocol::truncate_for_wire(msg),
         ),
-        JsEngineError::EngineUnavailable(msg) => (
+        // モジュール系の 2 variant もワイヤ上に専用の `ErrorKind` が無いため
+        // `Evaluation` に畳む（プロトコル v6 で扱う。設計 §9 の 2。現状は
+        // evaluate_script から発生しない。`JS-4`・Issue #1109）。
+        JsEngineError::EngineUnavailable(msg)
+        | JsEngineError::ModuleResolutionFailed(msg)
+        | JsEngineError::NotYetImplemented(msg) => (
             ErrorKind::Evaluation,
             worker_protocol::truncate_for_wire(msg),
         ),

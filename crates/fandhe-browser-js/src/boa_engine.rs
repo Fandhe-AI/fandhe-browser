@@ -430,7 +430,9 @@ fn engine_error_message(err: &JsEngineError) -> &str {
         | JsEngineError::BindingFailed(msg)
         | JsEngineError::ResourceLimitExceeded(msg)
         | JsEngineError::Timeout(msg)
-        | JsEngineError::EngineUnavailable(msg) => msg,
+        | JsEngineError::EngineUnavailable(msg)
+        | JsEngineError::ModuleResolutionFailed(msg)
+        | JsEngineError::NotYetImplemented(msg) => msg,
     }
 }
 

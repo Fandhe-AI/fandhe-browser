@@ -170,6 +170,194 @@ impl ObjectHandle {
     }
 }
 
+/// 子プロセス側のモジュールマップ内で compile 済みの ES module を指す ID
+/// （`JS-4`・Issue #1109・`docs/design/es-module-design.md` §3）。
+///
+/// - [`ObjectHandle`]・`NativeCall` の ID・[`DynamicImportId`] とは **別の名前
+///   空間** であり、相互に流用しない
+/// - 子の再起動でモジュールマップは失われ、古い ID は無効になる
+/// - 子から届いた ID は untrusted。親は自分が受け取った ID と照合する契約
+///   （照合の実装は後続 issue）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ModuleId(u32);
+
+impl ModuleId {
+    /// 生の ID から作る。値の妥当性は検証しない（割り当ては実装側の責務）。
+    pub const fn from_raw(id: u32) -> Self {
+        Self(id)
+    }
+
+    /// 生の ID を返す（ワイヤ表現への変換用）。
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// 保留中の動的 `import()` 1 件を指す ID（`JS-4`・Issue #1109）。
+///
+/// [`ModuleId`]・[`ObjectHandle`] とは別の名前空間で、相互に流用しない。
+/// 子から届いた値は untrusted で、親は自分が受け取った ID と照合する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DynamicImportId(u32);
+
+impl DynamicImportId {
+    /// 生の ID から作る。値の妥当性は検証しない。
+    pub const fn from_raw(id: u32) -> Self {
+        Self(id)
+    }
+
+    /// 生の ID を返す（ワイヤ表現への変換用）。
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// モジュールのソースに書かれた依存 1 件（未解決の specifier。`JS-4`・Issue #1109）。
+///
+/// specifier は untrusted。解決と取得は呼び出し側（将来は core の
+/// `page_runner`）が `Fetcher`（scheme・内部アドレスの検査込み）経由で行う
+/// （`JS-8`・設計 §6）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ModuleRequest {
+    specifier: String,
+}
+
+impl ModuleRequest {
+    /// 生の specifier から作る。
+    pub fn new(specifier: String) -> Self {
+        Self { specifier }
+    }
+
+    /// ソースに書かれたままの specifier を返す。
+    pub fn specifier(&self) -> &str {
+        &self.specifier
+    }
+}
+
+/// [`JsEngine::compile_module`] の結果（`JS-4`・Issue #1109）。
+///
+/// compile したモジュールの [`ModuleId`] と、解決・取得が必要な依存の一覧。
+/// 呼び出し側は各依存を取得して compile し、[`JsEngine::link_module`] へ渡す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ModuleRecord {
+    id: ModuleId,
+    requests: Vec<ModuleRequest>,
+}
+
+impl ModuleRecord {
+    /// ID と依存一覧から作る。
+    pub fn new(id: ModuleId, requests: Vec<ModuleRequest>) -> Self {
+        Self { id, requests }
+    }
+
+    /// compile 済みモジュールの ID。
+    pub fn id(&self) -> ModuleId {
+        self.id
+    }
+
+    /// 解決が必要な依存の一覧。
+    pub fn requests(&self) -> &[ModuleRequest] {
+        &self.requests
+    }
+}
+
+/// [`JsEngine::link_module`] に渡す対応表の 1 行（`JS-4`・Issue #1109）。
+///
+/// 親が specifier を解決・取得・compile した結果で、specifier から compile
+/// 済みモジュールへの対応を表す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ModuleResolution {
+    specifier: String,
+    target: ModuleId,
+}
+
+impl ModuleResolution {
+    /// specifier と解決先から作る。
+    pub fn new(specifier: String, target: ModuleId) -> Self {
+        Self { specifier, target }
+    }
+
+    /// 依存の specifier（[`ModuleRequest::specifier`] と同じ文字列）。
+    pub fn specifier(&self) -> &str {
+        &self.specifier
+    }
+
+    /// 解決先モジュールの ID。
+    pub fn target(&self) -> ModuleId {
+        self.target
+    }
+}
+
+/// モジュール内・スクリプト内で呼ばれた動的 `import()` 1 件
+/// （[`JsEngine::take_dynamic_import_requests`] の戻り値。`JS-4`・Issue #1109）。
+///
+/// 将来は core の `page_runner` のイベントループの段で取り出され、取得後に
+/// [`JsEngine::finish_dynamic_import`] で完了させる（設計 §8）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DynamicImportRequest {
+    id: DynamicImportId,
+    referrer: Option<ModuleId>,
+    specifier: String,
+}
+
+impl DynamicImportRequest {
+    /// ID・呼び出し元・specifier から作る。
+    pub fn new(id: DynamicImportId, referrer: Option<ModuleId>, specifier: String) -> Self {
+        Self {
+            id,
+            referrer,
+            specifier,
+        }
+    }
+
+    /// 保留中の import を指す ID。
+    pub fn id(&self) -> DynamicImportId {
+        self.id
+    }
+
+    /// 呼び出し元モジュール。`None` は classic スクリプト（document）から
+    /// の呼び出しで、親は文書の base URL を基準に解決する。
+    pub fn referrer(&self) -> Option<ModuleId> {
+        self.referrer
+    }
+
+    /// 未解決の specifier（untrusted）。
+    pub fn specifier(&self) -> &str {
+        &self.specifier
+    }
+}
+
+/// [`JsEngine::evaluate_module`] の結果（`JS-4`・Issue #1109）。
+///
+/// microtask checkpoint の後の Promise の状態を表す。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ModuleEvaluation {
+    /// 評価が完了した。
+    Fulfilled,
+    /// top-level await や未完了の動的 import を待っている。
+    Pending,
+    /// 評価が例外で終わった。
+    #[non_exhaustive]
+    Rejected {
+        /// JS 由来の untrusted なメッセージ。将来のエンジン実装は
+        /// `EvaluationFailed` と同じ切り詰めを行う。
+        message: String,
+    },
+}
+
+impl ModuleEvaluation {
+    /// [`ModuleEvaluation::Rejected`] を作る。variant 自体が `#[non_exhaustive]`
+    /// のため、crate 外（core の fake エンジン等）はこの関数で組み立てる。
+    pub fn rejected(message: String) -> Self {
+        Self::Rejected { message }
+    }
+}
+
 /// 親プロセス側 `NativeCall` dispatch が [`super::process_engine::ParentNativeFn`]
 /// へ渡す、呼び出し 1 回に紐づく実行コンテキスト（`TASK-29`・Issue #526）。
 ///
@@ -394,6 +582,16 @@ pub enum JsEngineError {
     /// 次回の評価で新しい子プロセスが自動的に起動される（メッセージに
     /// "context was discarded" を含める）。
     EngineUnavailable(String),
+    /// モジュールの解決・link に失敗した（`JS-4`・Issue #1109）。未解決の
+    /// specifier が残る状態での評価、未知の [`ModuleId`] の参照、link の不整合。
+    ///
+    /// メッセージには specifier や URL（トークンを含み得る）を入れず、失敗の
+    /// 種別だけを入れる（設計 §6）。
+    ModuleResolutionFailed(String),
+    /// このエンジンがまだ対応していない操作（`JS-4`・`REPAIR-3`・Issue #1109）。
+    /// メッセージは操作名を含む固定の英語文言。モジュール API の既定実装が
+    /// 成功を装わずに返す。
+    NotYetImplemented(String),
 }
 
 impl std::fmt::Display for JsEngineError {
@@ -407,6 +605,10 @@ impl std::fmt::Display for JsEngineError {
             Self::Timeout(msg) => write!(f, "script evaluation timed out: {msg}"),
             Self::EngineUnavailable(msg) => {
                 write!(f, "js engine is temporarily unavailable: {msg}")
+            }
+            Self::ModuleResolutionFailed(msg) => write!(f, "module resolution failed: {msg}"),
+            Self::NotYetImplemented(msg) => {
+                write!(f, "js engine operation is not yet implemented: {msg}")
             }
         }
     }
@@ -434,6 +636,23 @@ impl std::error::Error for JsEngineError {}
 /// スレッド安全性: 実装は単一スレッドでの利用を前提としてよい（本トレイト
 /// に `Send`/`Sync` 境界は付けない。V8 の `Isolate` がスレッド固有のため）。
 /// 登録する [`NativeFn`] のみ `Send` を要求する（[`NativeFn`] 参照）。
+///
+/// # モジュール評価 API（`JS-4`・Issue #1109・設計 `es-module-design.md` §3）
+///
+/// `compile_module`・`link_module`・`evaluate_module`・
+/// `take_dynamic_import_requests`・`finish_dynamic_import` は、core 側の async な
+/// 取得を呼び出しの間に挟めるよう段階的に呼ぶ同期 API である。将来は core の
+/// `page_runner` が compile → 依存の取得と compile → link → evaluate の順に呼ぶ。
+/// 既定実装は [`JsEngineError::NotYetImplemented`] を返し、成功を装わない
+/// （`REPAIR-3`）。実装は後続 issue で行う。`JS-4` の現行挙動（module は実行せず
+/// 診断を出す）は本 API の追加では変わらない。
+///
+/// モジュールマップは子プロセスの中にあり、子が再起動されると失われる
+/// ("context was discarded")。[`inject_global_function`](Self::inject_global_function)・
+/// [`bind_dom_like_object`](Self::bind_dom_like_object) の登録分とは違い **再登録は
+/// しない**（スクリプトが作った状態と同じ扱い）。再起動後に古い [`ModuleId`] を
+/// 使うと失敗する。request 数・specifier 長・モジュール数の上限は実装側が
+/// アロケーション前に検査する（`JS-6`）。
 pub trait JsEngine {
     /// スクリプトを評価し、結果を [`JsValue`] で返す（`JS-1`「スクリプト
     /// 評価」）。
@@ -478,6 +697,70 @@ pub trait JsEngine {
         name: &str,
         methods: Vec<(String, NativeFn)>,
     ) -> Result<(), JsEngineError>;
+
+    /// ES module のソースを compile し、依存の一覧を返す（`JS-4`・Issue #1109）。
+    ///
+    /// `url` はモジュールの絶対 URL、`source` はソース。いずれも評価文字列や
+    /// シェルへ連結せず compile API へ直接渡す。呼び出し元は将来の core の
+    /// `page_runner`。既定は [`JsEngineError::NotYetImplemented`]（`REPAIR-3`）。
+    fn compile_module(&mut self, _url: &str, _source: &str) -> Result<ModuleRecord, JsEngineError> {
+        Err(module_api_not_yet_implemented("compile_module"))
+    }
+
+    /// `referrer` の依存を対応表どおりに link する（`JS-4`・Issue #1109）。
+    ///
+    /// 呼び出し順は compile → 依存先を compile → link → evaluate。未解決が
+    /// 残る状態や未知の [`ModuleId`] は [`JsEngineError::ModuleResolutionFailed`]。
+    /// 既定は [`JsEngineError::NotYetImplemented`]。
+    fn link_module(
+        &mut self,
+        _referrer: ModuleId,
+        _resolutions: &[ModuleResolution],
+    ) -> Result<(), JsEngineError> {
+        Err(module_api_not_yet_implemented("link_module"))
+    }
+
+    /// link 済みの `root` を instantiate・evaluate し、microtask checkpoint
+    /// 後の状態を返す（`JS-4`・Issue #1109）。
+    ///
+    /// `options.timeout()` は instantiate・evaluate・checkpoint 全体にかかり、
+    /// `options.max_result_bytes()` は [`ModuleEvaluation::Rejected`] のメッセージ
+    /// の上限になる。既定は [`JsEngineError::NotYetImplemented`]。
+    fn evaluate_module(
+        &mut self,
+        _root: ModuleId,
+        _options: &EvaluateOptions,
+    ) -> Result<ModuleEvaluation, JsEngineError> {
+        Err(module_api_not_yet_implemented("evaluate_module"))
+    }
+
+    /// 保留中の動的 `import()` を取り出す（`JS-4`・Issue #1109）。
+    ///
+    /// 将来は core のイベントループの段から呼ばれる（設計 §8）。既定は
+    /// [`JsEngineError::NotYetImplemented`]。
+    fn take_dynamic_import_requests(&mut self) -> Result<Vec<DynamicImportRequest>, JsEngineError> {
+        Err(module_api_not_yet_implemented(
+            "take_dynamic_import_requests",
+        ))
+    }
+
+    /// 動的 `import()` を完了させる（`JS-4`・Issue #1109）。`Ok` は compile・
+    /// link 済みの対象、`Err(String)` は親が付ける失敗の種別（URL を含めない）。
+    /// 既定は [`JsEngineError::NotYetImplemented`]。
+    fn finish_dynamic_import(
+        &mut self,
+        _id: DynamicImportId,
+        _result: Result<ModuleId, String>,
+    ) -> Result<(), JsEngineError> {
+        Err(module_api_not_yet_implemented("finish_dynamic_import"))
+    }
+}
+
+/// モジュール API の既定実装が返す「未対応」エラー（`REPAIR-3`）。
+fn module_api_not_yet_implemented(operation: &'static str) -> JsEngineError {
+    JsEngineError::NotYetImplemented(format!(
+        "{operation}: ES module evaluation is not supported by this engine yet"
+    ))
 }
 
 /// [`create_engine`] が失敗した際のエラー（TASK-28.3・`JS-1`）。
@@ -632,6 +915,103 @@ fn create_v8_engine() -> Result<Box<dyn JsEngine>, CreateEngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DefaultOnlyEngine;
+
+    impl JsEngine for DefaultOnlyEngine {
+        fn evaluate_script(
+            &mut self,
+            _script: &str,
+            _options: &EvaluateOptions,
+        ) -> Result<JsValue, JsEngineError> {
+            Ok(JsValue::Undefined)
+        }
+        fn inject_global_function(
+            &mut self,
+            _name: &str,
+            _func: NativeFn,
+        ) -> Result<(), JsEngineError> {
+            Ok(())
+        }
+        fn bind_dom_like_object(
+            &mut self,
+            _name: &str,
+            _methods: Vec<(String, NativeFn)>,
+        ) -> Result<(), JsEngineError> {
+            Ok(())
+        }
+    }
+
+    fn expect_not_yet<T>(result: Result<T, JsEngineError>, operation: &str) {
+        match result {
+            Err(JsEngineError::NotYetImplemented(msg)) => {
+                assert!(msg.starts_with(operation), "unexpected message: {msg}");
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("{operation} must not succeed by default"),
+        }
+    }
+
+    /// `JS-4`・`REPAIR-3`・Issue #1109: 既定実装は object-safe で、未対応の `Err` を返す。
+    #[test]
+    fn js_4_module_api_is_object_safe_and_defaults_to_not_yet_implemented() {
+        let mut engine: Box<dyn JsEngine> = Box::new(DefaultOnlyEngine);
+        let id = ModuleId::from_raw(1);
+        let options = EvaluateOptions::default();
+        expect_not_yet(
+            engine.compile_module("https://e.test/a.js", ""),
+            "compile_module",
+        );
+        expect_not_yet(engine.link_module(id, &[]), "link_module");
+        expect_not_yet(engine.evaluate_module(id, &options), "evaluate_module");
+        expect_not_yet(
+            engine.take_dynamic_import_requests(),
+            "take_dynamic_import_requests",
+        );
+        expect_not_yet(
+            engine.finish_dynamic_import(DynamicImportId::from_raw(2), Ok(id)),
+            "finish_dynamic_import",
+        );
+    }
+
+    /// `JS-4`・Issue #1109: 新 variant の Display。
+    #[test]
+    fn js_4_module_error_variants_display() {
+        assert_eq!(
+            JsEngineError::ModuleResolutionFailed("unlinked".to_string()).to_string(),
+            "module resolution failed: unlinked"
+        );
+        assert_eq!(
+            JsEngineError::NotYetImplemented("op".to_string()).to_string(),
+            "js engine operation is not yet implemented: op"
+        );
+    }
+
+    /// `JS-4`・Issue #1109: 値型の往復。
+    #[test]
+    fn js_4_module_value_types_round_trip() {
+        assert_eq!(ModuleId::from_raw(7).raw(), 7);
+        assert_eq!(DynamicImportId::from_raw(9).raw(), 9);
+        let record = ModuleRecord::new(
+            ModuleId::from_raw(3),
+            vec![ModuleRequest::new("./b.js".to_string())],
+        );
+        assert_eq!(record.id().raw(), 3);
+        assert_eq!(record.requests()[0].specifier(), "./b.js");
+        let resolution = ModuleResolution::new("./b.js".to_string(), ModuleId::from_raw(4));
+        assert_eq!(resolution.specifier(), "./b.js");
+        assert_eq!(resolution.target(), ModuleId::from_raw(4));
+        let doc = DynamicImportRequest::new(DynamicImportId::from_raw(1), None, "x".to_string());
+        assert_eq!(doc.referrer(), None);
+        assert_eq!(doc.id().raw(), 1);
+        assert_eq!(doc.specifier(), "x");
+        let m = DynamicImportRequest::new(
+            DynamicImportId::from_raw(2),
+            Some(ModuleId::from_raw(5)),
+            "y".to_string(),
+        );
+        assert_eq!(m.referrer(), Some(ModuleId::from_raw(5)));
+    }
 
     /// TASK-109・`JS-6`: 既定値は従来の固定値（2 秒・1M UTF-16 単位 = UTF-8 で 3 MiB）と等価。
     #[test]
