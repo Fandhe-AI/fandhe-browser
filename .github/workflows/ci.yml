@@ -92,6 +92,7 @@ jobs:
       rust: ${{ steps.detect.outputs.rust }}
       harness: ${{ steps.detect.outputs.harness }}
       servo: ${{ steps.detect.outputs.servo }}
+      native: ${{ steps.detect.outputs.native }}
     defaults:
       run:
         shell: bash
@@ -114,7 +115,8 @@ jobs:
             echo "rust=$1" >> "$GITHUB_OUTPUT"
             echo "harness=$2" >> "$GITHUB_OUTPUT"
             echo "servo=$3" >> "$GITHUB_OUTPUT"
-            echo "changes: rust=$1 harness=$2 servo=$3 ($4)"
+            echo "native=true" >> "$GITHUB_OUTPUT"
+            echo "changes: rust=$1 harness=$2 servo=$3 native=true ($4)"
           }
           if [ "$EVENT_NAME" != "pull_request" ]; then
             emit true true true "event=$EVENT_NAME"
@@ -131,17 +133,27 @@ jobs:
           fi
           echo "changed files:"
           printf '%s\n' "$files"
+          # native 軸（rust-test-macos・rust-test-windows を PR で走らせるか）の入力。*.rs の差分の
+          # OS 分岐を scripts/ci-changes.sh が見る。diff 失敗時は emit が native=true に倒す
+          rs_diff="$RUNNER_TEMP/rs.diff"
+          if ! git -c core.quotepath=false diff -U0 --no-renames "$BASE_SHA...$HEAD_SHA" -- '*.rs' > "$rs_diff"; then
+            echo "::warning::git diff for *.rs failed; running all jobs (fail-closed)"
+            emit true true true "rs git diff failed"
+            exit 0
+          fi
+          export CI_CHANGES_RS_DIFF_FILE="$rs_diff"
           if ! result="$(printf '%s\n' "$files" | bash scripts/ci-changes.sh)"; then
             echo "::warning::scripts/ci-changes.sh failed; running all jobs (fail-closed)"
             emit true true true "classifier failed"
             exit 0
           fi
-          # 出力は厳密な 3 行形式のみ受理する。欠落・想定外の値は下流ジョブが
+          # 出力は厳密な 4 行形式のみ受理する。欠落・想定外の値は下流ジョブが
           # skipped（= 成功扱い）になる fail-open を招くため全実行へ倒す
           if [ "$(printf '%s\n' "$result" | grep -cxE 'rust=(true|false)')" -ne 1 ] \
             || [ "$(printf '%s\n' "$result" | grep -cxE 'harness=(true|false)')" -ne 1 ] \
             || [ "$(printf '%s\n' "$result" | grep -cxE 'servo=(true|false)')" -ne 1 ] \
-            || [ "$(printf '%s\n' "$result" | wc -l | tr -d ' ')" -ne 3 ]; then
+            || [ "$(printf '%s\n' "$result" | grep -cxE 'native=(true|false)')" -ne 1 ] \
+            || [ "$(printf '%s\n' "$result" | wc -l | tr -d ' ')" -ne 4 ]; then
             echo "::warning::unexpected classifier output; running all jobs (fail-closed)"
             emit true true true "unexpected output"
             exit 0
@@ -343,7 +355,11 @@ jobs:
 
   rust-test-macos:
     needs: changes
-    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.rust == 'true' }}
+    # main・workflow_dispatch は従来どおり。PR は OS 依存の変更（profile crate・cfg 差分）のときだけ
+    # 走らせる（native 判定は scripts/ci-changes.sh。ジョブ名は変えない）
+    if: >-
+      ${{ needs.changes.outputs.rust == 'true'
+      && (github.event_name != 'pull_request' || needs.changes.outputs.native == 'true') }}
     runs-on: macos-latest
     timeout-minutes: 60
     permissions:
@@ -399,7 +415,11 @@ jobs:
 
   rust-test-windows:
     needs: changes
-    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.rust == 'true' }}
+    # main・workflow_dispatch は従来どおり。PR は OS 依存の変更（profile crate・cfg 差分）のときだけ
+    # 走らせる（native 判定は scripts/ci-changes.sh。ジョブ名は変えない）
+    if: >-
+      ${{ needs.changes.outputs.rust == 'true'
+      && (github.event_name != 'pull_request' || needs.changes.outputs.native == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 90
     permissions:

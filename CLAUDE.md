@@ -56,7 +56,7 @@ fandhe-browser/
 │   ├── design/                    # 設計ドキュメント（public。servo-host-design.md・render-host-protocol.schema.json 等）
 │   ├── setup/                     # 環境別セットアップ手順書（windows.md）
 │   └── spec/                      # fandhe-browser-spec submodule（private・要アクセス権）
-├── .github/workflows/             # ai-review・update-external・ci（push/pull_request で稼働・PR は ubuntu＋`cross-target-check`、main push で 3 OS・docs-only 判定は `scripts/ci-changes.sh`）/ release（発火条件は workflow_dispatch 限定のまま）
+├── .github/workflows/             # ai-review・update-external・ci（push/pull_request で稼働・PR は ubuntu＋`cross-target-check`＋OS 依存の変更〔profile crate・cfg 差分〕のときだけ macOS・Windows の `rust-test`、main push で 3 OS・docs-only 判定は `scripts/ci-changes.sh`）/ release（発火条件は workflow_dispatch 限定のまま）
 ├── .agents/skills/                # npx skills add の導入実体
 └── .claude/
     ├── agents/                    # カテゴリ別 subagent 定義
