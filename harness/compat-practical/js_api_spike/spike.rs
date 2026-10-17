@@ -30,6 +30,11 @@ use fandhe_browser_core::dom::Document;
 use fandhe_browser_core::{Error, FetchResponse, Fetcher, JsEngineError};
 use reqwest::Url;
 
+use crate::common::{
+    Classification, EngineChoice, FetchErrorClass, Obj, UsageError, classify, is_valid_id,
+    map_fetch_error, parse_https_url, usage,
+};
+
 /// js crate の 1 script あたり評価上限（`boa_engine.rs`/`v8_engine.rs` の
 /// `MAX_SCRIPT_SOURCE_BYTES` = 1 MiB の写し。js 側は `pub(crate)` のため値を写している）。
 pub const MAX_EVAL_BYTES: usize = 1_048_576;
@@ -42,30 +47,6 @@ pub const DEFAULT_TOTAL_TIMEOUT_SEC: u64 = 600;
 
 // ---------------------------------------------------------------- 引数
 
-/// 使用方法エラー（終了コード 2）。メッセージは英語。
-#[derive(Debug, PartialEq, Eq)]
-pub struct UsageError(pub String);
-
-fn usage<T>(msg: impl Into<String>) -> Result<T, UsageError> {
-    Err(UsageError(msg.into()))
-}
-
-/// `--engine` の選択。固定の TOML 定数へ写すだけで、引数文字列は TOML に連結しない。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EngineChoice {
-    V8,
-    Boa,
-}
-
-impl EngineChoice {
-    pub fn toml(self) -> &'static str {
-        match self {
-            EngineChoice::V8 => "[js]\nengine = \"v8\"\n",
-            EngineChoice::Boa => "[js]\nengine = \"boa\"\n",
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct Args {
     pub targets: Vec<(String, Url)>,
@@ -75,29 +56,6 @@ pub struct Args {
     pub fetch_timeout_sec: u64,
     pub total_timeout_sec: u64,
     pub debug_messages: bool,
-}
-
-/// `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`（tasks.json の `id` 規則）。
-pub fn is_valid_id(id: &str) -> bool {
-    let mut chars = id.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    id.len() <= 64
-        && first.is_ascii_alphanumeric()
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
-
-/// https のみ許可する URL 検証（空白・制御文字不可）。
-pub fn parse_https_url(s: &str) -> Result<Url, UsageError> {
-    if s.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return usage("URL must not contain whitespace or control characters");
-    }
-    let url = Url::parse(s).map_err(|_| UsageError("URL is not parseable".to_string()))?;
-    if url.scheme() != "https" {
-        return usage("only https URLs are allowed");
-    }
-    Ok(url)
 }
 
 fn parse_ranged<T: std::str::FromStr + PartialOrd + Copy>(
@@ -167,49 +125,6 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, UsageE
 
 // ------------------------------------------------------- 取得ポリシー
 
-/// 取得失敗の分類（`fetch_error` フィールドの語彙）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FetchErrorClass {
-    DisallowedScheme,
-    DisallowedAddress,
-    HttpStatus,
-    TooLarge,
-    Timeout,
-    Redirects,
-    Network,
-    /// 総時間上限（`--total-timeout`）に達して取得を打ち切った。
-    TotalTimeLimit,
-    Other,
-}
-
-impl FetchErrorClass {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            FetchErrorClass::DisallowedScheme => "disallowed_scheme",
-            FetchErrorClass::DisallowedAddress => "disallowed_address",
-            FetchErrorClass::HttpStatus => "http_status",
-            FetchErrorClass::TooLarge => "too_large",
-            FetchErrorClass::Timeout => "timeout",
-            FetchErrorClass::Redirects => "redirects",
-            FetchErrorClass::Network => "network",
-            FetchErrorClass::TotalTimeLimit => "total_time_limit",
-            FetchErrorClass::Other => "other",
-        }
-    }
-}
-
-pub fn map_fetch_error(e: &Error) -> FetchErrorClass {
-    match e {
-        Error::DisallowedScheme { .. } => FetchErrorClass::DisallowedScheme,
-        Error::DisallowedAddress { .. } => FetchErrorClass::DisallowedAddress,
-        Error::ResponseTooLarge { .. } => FetchErrorClass::TooLarge,
-        Error::Timeout { .. } => FetchErrorClass::Timeout,
-        Error::TooManyRedirects { .. } => FetchErrorClass::Redirects,
-        Error::Network { .. } => FetchErrorClass::Network,
-        _ => FetchErrorClass::Other,
-    }
-}
-
 /// harness 側の事前検査（1 層目）。`src` を `base`（ページの最終 URL）基準で解決し、
 /// https 以外（`file:`・`data:`・`javascript:`・`http:` 等）は取得前に拒否する。
 /// 内部アドレスの拒否は `Fetcher`（2 層目）が担う。
@@ -221,17 +136,43 @@ pub fn resolve_script_url(base: &Url, src: &str) -> Result<Url, FetchErrorClass>
     Ok(url)
 }
 
+/// `fetch_error` フィールドの語彙全体（js_api_spike 専用）。`Fetcher` 由来の分類
+/// （[`FetchErrorClass`]）に、HTTP 非 2xx と総時間上限を加える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchClass {
+    Mapped(FetchErrorClass),
+    HttpStatus,
+    /// 総時間上限（`--total-timeout`）に達して取得を打ち切った。
+    TotalTimeLimit,
+}
+
+impl FetchClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FetchClass::Mapped(c) => c.as_str(),
+            FetchClass::HttpStatus => "http_status",
+            FetchClass::TotalTimeLimit => "total_time_limit",
+        }
+    }
+}
+
+impl From<FetchErrorClass> for FetchClass {
+    fn from(c: FetchErrorClass) -> Self {
+        FetchClass::Mapped(c)
+    }
+}
+
 /// 取得失敗。非 2xx では数値ステータスを保持する（page_status の 403 / 404 / 503 の区別用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FetchFailure {
-    pub class: FetchErrorClass,
+    pub class: FetchClass,
     pub status: Option<u16>,
 }
 
 impl FetchFailure {
-    pub fn of(class: FetchErrorClass) -> Self {
+    pub fn of(class: impl Into<FetchClass>) -> Self {
         Self {
-            class,
+            class: class.into(),
             status: None,
         }
     }
@@ -246,7 +187,7 @@ pub async fn fetch_script(fetcher: &Fetcher, url: &str) -> Result<FetchResponse,
         .map_err(|e| FetchFailure::of(map_fetch_error(&e)))?;
     if !(200..300).contains(&resp.status()) {
         return Err(FetchFailure {
-            class: FetchErrorClass::HttpStatus,
+            class: FetchClass::HttpStatus,
             status: Some(resp.status()),
         });
     }
@@ -270,13 +211,6 @@ pub fn document_base_url(doc: &Document, final_url: &Url) -> Url {
         }
     }
     final_url.clone()
-}
-
-/// scheme・host・port が同じか（external script の `same_origin` 用）。
-pub fn same_origin(a: &Url, b: &Url) -> bool {
-    a.scheme() == b.scheme()
-        && a.host_str() == b.host_str()
-        && a.port_or_known_default() == b.port_or_known_default()
 }
 
 // ------------------------------------------------------- script 抽出
@@ -357,173 +291,6 @@ pub fn extract_scripts(doc: &Document, max: usize) -> (Vec<ScriptEntry>, usize) 
 }
 
 // ------------------------------------------------------------ 例外分類
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct Classification {
-    pub error_kind: Option<String>,
-    pub message_class: &'static str,
-    pub missing_api: Option<String>,
-    /// 失敗ではない結果（スカラーに表現できない評価値）。
-    pub non_scalar_result: bool,
-}
-
-/// `^[A-Za-z_$][A-Za-z0-9_$]{0,63}$` をドットでつないだパス（最大 128 文字・8 段）。
-pub fn is_valid_api_path(s: &str) -> bool {
-    if s.is_empty() || s.len() > 128 {
-        return false;
-    }
-    let mut segs = 0;
-    for seg in s.split('.') {
-        segs += 1;
-        let mut cs = seg.chars();
-        let Some(first) = cs.next() else {
-            return false;
-        };
-        if seg.len() > 64
-            || !(first.is_ascii_alphabetic() || first == '_' || first == '$')
-            || !cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-        {
-            return false;
-        }
-    }
-    segs <= 8
-}
-
-const KINDS: [&str; 5] = [
-    "ReferenceError",
-    "TypeError",
-    "SyntaxError",
-    "RangeError",
-    "Error",
-];
-
-fn api(s: &str) -> Option<String> {
-    let s = s.trim();
-    is_valid_api_path(s).then(|| s.to_string())
-}
-
-/// V8（`Uncaught ReferenceError: x is not defined (line N)`）と boa（接頭辞なしの
-/// `x is not defined`）の両形式を扱う純関数。
-pub fn classify(msg: &str) -> Classification {
-    let mut body = msg.trim();
-    let mut kind: Option<&str> = None;
-    let stripped = body.strip_prefix("Uncaught ").unwrap_or(body);
-    for k in KINDS {
-        if let Some(rest) = stripped.strip_prefix(k).and_then(|r| r.strip_prefix(':')) {
-            kind = Some(k);
-            body = rest.trim();
-            break;
-        }
-    }
-    // V8 の末尾 ` (line N)` を除去する。
-    if let Some(idx) = body.rfind(" (line ")
-        && body.ends_with(')')
-    {
-        body = body.get(..idx).unwrap_or(body);
-    }
-    let mk = |k: Option<&str>, class: &'static str, missing: Option<String>| Classification {
-        error_kind: k.map(str::to_string),
-        message_class: class,
-        missing_api: missing,
-        non_scalar_result: false,
-    };
-    if body.starts_with("evaluation result of type")
-        && body.ends_with("is not representable as JsValue")
-    {
-        return Classification {
-            error_kind: None,
-            message_class: "non_scalar_result",
-            missing_api: None,
-            non_scalar_result: true,
-        };
-    }
-    if let Some(name) = body.strip_suffix(" is not defined") {
-        return mk(kind.or(Some("ReferenceError")), "not_defined", api(name));
-    }
-    if let Some(name) = body.strip_suffix(" is not a function") {
-        return mk(kind, "not_a_function", api(name));
-    }
-    if let Some(name) = body.strip_suffix(" is not a constructor") {
-        return mk(kind, "not_a_constructor", api(name));
-    }
-    if body.starts_with("Cannot read properties of") {
-        return mk(kind, "read_property", None);
-    }
-    mk(kind, "other", None)
-}
-
-/// stderr 専用（`--debug-messages`）。300 文字で切り詰め、制御文字を空白にする。
-pub fn sanitize_debug(msg: &str) -> String {
-    msg.chars()
-        .take(300)
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
-}
-
-// ---------------------------------------------------------------- JSON
-
-pub fn json_escape(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    o.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\r' => o.push_str("\\r"),
-            '\t' => o.push_str("\\t"),
-            c if (c as u32) < 0x20 || (c as u32) == 0x7f => {
-                o.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => o.push(c),
-        }
-    }
-    o.push('"');
-    o
-}
-
-/// 平らな JSON オブジェクトの組み立て（挿入順を保つ）。
-#[derive(Default)]
-pub struct Obj(Vec<(&'static str, String)>);
-
-impl Obj {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn s(mut self, k: &'static str, v: &str) -> Self {
-        self.0.push((k, json_escape(v)));
-        self
-    }
-    pub fn n(mut self, k: &'static str, v: u64) -> Self {
-        self.0.push((k, v.to_string()));
-        self
-    }
-    pub fn opt_s(mut self, k: &'static str, v: Option<&str>) -> Self {
-        self.0.push((k, v.map_or("null".to_string(), json_escape)));
-        self
-    }
-    pub fn opt_n(mut self, k: &'static str, v: Option<u64>) -> Self {
-        self.0
-            .push((k, v.map_or("null".to_string(), |n| n.to_string())));
-        self
-    }
-    pub fn raw(mut self, k: &'static str, v: String) -> Self {
-        self.0.push((k, v));
-        self
-    }
-    pub fn strs(self, k: &'static str, v: &[String]) -> Self {
-        let items: Vec<String> = v.iter().map(|s| json_escape(s)).collect();
-        self.raw(k, format!("[{}]", items.join(",")))
-    }
-    pub fn line(self) -> String {
-        let fields: Vec<String> = self
-            .0
-            .into_iter()
-            .map(|(k, v)| format!("{}:{}", json_escape(k), v))
-            .collect();
-        format!("{{{}}}", fields.join(","))
-    }
-}
 
 // --------------------------------------------------------------- 記録
 
@@ -686,6 +453,7 @@ pub fn outcome_of_error(e: &Error) -> (&'static str, Option<Classification>, boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::{json_escape, same_origin};
     use fandhe_browser_core::{FetchOptions, ParseOptions, parse_document};
 
     fn fetcher() -> Fetcher {
@@ -743,7 +511,7 @@ mod tests {
             );
             assert_eq!(
                 fetch_script(&f, u).await.unwrap_err().class,
-                FetchErrorClass::DisallowedAddress,
+                FetchClass::Mapped(FetchErrorClass::DisallowedAddress),
                 "{u}"
             );
         }
@@ -757,7 +525,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .class,
-            FetchErrorClass::DisallowedScheme
+            FetchClass::Mapped(FetchErrorClass::DisallowedScheme)
         );
     }
 

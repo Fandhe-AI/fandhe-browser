@@ -24,6 +24,7 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 | `fake_cdp_server.mjs` | 自己テスト用の偽 CDP サーバー（loopback のみ） |
 | `self-test.sh` | 上記のオフライン自己テスト（curl はスタブ・CDP は偽サーバー。CI で実行） |
 | `js_api_spike/` | ページ内 JS が要求する Web API の計測スパイク（TASK-106。core の example `compat_js_api_spike` としてビルド） |
+| `page_script_probe/` | 本番と同じ経路でページ内 script の結果を script 単位に観測する診断プローブ（#964。core の example `compat_page_script_probe` としてビルド） |
 | `results/access_check.jsonl` | 到達可否の実測結果（下記「計測結果」） |
 | `results/core_results.jsonl` | `run_core.sh --page-js v8` の実測結果（ページ JS 有効） |
 | `results/core_results_js_off.jsonl` | 同一バイナリ・同日の対照（ページ JS 無効） |
@@ -218,4 +219,18 @@ target/release/examples/compat_js_api_spike \
 
 ### 人間が行う残作業
 
-実サイトでの実測と記録（b5・d2・d3 の不足 API 一覧）、`JS-5` の API 範囲確定と #777・#778・#779 との差分整理・追加 issue の要否判断、Trello が anti-bot・認証で解消しない場合の記録。結果をコミットするときは API 名と件数だけにし、本文・URL・Cookie は載せない。
+実サイトでの実測と記録（b5・d2・d3 の不足 API 一覧）、`JS-5` の API 範囲確定と #777・#778・#779 との差分整理・追加 issue の要否判断。Trello（b5）は #964 で原因を特定済み（anti-bot・認証ではなく ES module。`REPORT.md`）。結果をコミットするときは API 名と件数だけにし、本文・URL・Cookie は載せない。
+
+## page_script_probe（#964）
+
+b5（Trello）で `h1` が得られない原因を切り分ける診断プローブ。本番の `run_page_scripts` を既定の上限・
+`page_script_fetch_options()` で呼び、script 単位の結果を出す。`js_api_spike` と違い shim 導入後の実行結果で、
+22 タスクの通し実行では見えない「実行して成功したか・実行対象が無かったか」を区別できる。
+spec 対応: TASK-71 / MS-6 / `MEAS-4`・`JS-4`（関連 `JS-6`・`SEC-2`・`REPAIR-3`）。結果は `REPORT.md`。
+
+- ソースは `page_script_probe/`。`crates/fandhe-browser-core/Cargo.toml` の `[[example]] compat_page_script_probe`（新規依存なし）。自己テストはオフライン・決定的（`cargo test -p fandhe-browser-core --example compat_page_script_probe`）
+- 実行（実サイトへ出るため手動専用）: `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` のあと `target/release/examples/compat_page_script_probe --target b5=<https url> --engine v8 --out <path>`
+- 引数: `--target <id>=<https url>`（1 件）/ `--engine v8|boa`（既定 v8）/ `--out <path>`（既存ファイルは上書きせずエラー）/ `--debug-messages`（切り詰めた生メッセージを stderr のみへ）。実行上限・UA は引数から変えられない
+- 終了コード: 0 = 記録完了 / 1 = 書き込み失敗 / 2 = 入力・使用エラー（エンジン未同梱を含む）
+- 出力（JSONL）: `meta`・`page`（status・本文バイト数・リダイレクト有無・初期 HTML の `h1` 件数・script の内訳）・`script`（index ごとの outcome と分類）・`run`（abort・ライフサイクル・イベントループ・ページ内 fetch / XHR・ブリッジ診断の件数・実行後の `h1` 件数）
+- script の URL・本文・ページテキスト・Cookie・生の例外メッセージは出力しない（src は同一オリジンかの真偽値のみ）

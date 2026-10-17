@@ -160,3 +160,13 @@ path = "../../benches/cssom_profile_cost/profiled.rs"
 name = "compat_js_api_spike"
 path = "../../harness/compat-practical/js_api_spike/main.rs"
 test = true
+
+# TASK-71・Issue #964・`MEAS-4`・`JS-4`: b5（Trello）で h1 が得られない原因を切り分ける
+# 計測専用プローブ。本番と同じ `run_page_scripts` を既定の上限で呼び、script ごとの
+# outcome と初期 / 実行後 HTML の h1 件数を JSONL で出す。取得は `Fetcher` 経由のみ。
+# 非同期取得に必要な dev-dependency の tokio を再利用するため core の example とした
+# （新規依存なし）。出荷物ではない。`test = true` で自己テストを `cargo test` に載せる。
+[[example]]
+name = "compat_page_script_probe"
+path = "../../harness/compat-practical/page_script_probe/main.rs"
+test = true

@@ -16,21 +16,23 @@
 //! UA は `Fetcher` 既定の `fandhe-browser/<ver>` のまま。anti-bot の回避や DOM / navigator の
 //! 偽装は行わない（SEC 系）。簡易実装の制約は `spike.rs` 冒頭を参照（REPAIR-3）。
 
+mod common;
 mod spike;
 
 use std::io::Write;
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use common::{FetchErrorClass, same_origin, sanitize_debug};
 use fandhe_browser_core::FetchResponse;
 use fandhe_browser_core::config::Config;
 use fandhe_browser_core::js_stub::JsRuntime;
 use fandhe_browser_core::{FetchOptions, Fetcher, ParseOptions, parse_document};
 use reqwest::Url;
 use spike::{
-    Args, FetchErrorClass, FetchFailure, MAX_BODY_BYTES, MAX_EVAL_BYTES, ScriptEntry, ScriptRecord,
+    Args, FetchClass, FetchFailure, MAX_BODY_BYTES, MAX_EVAL_BYTES, ScriptEntry, ScriptRecord,
     ScriptSource, SiteRecord, document_base_url, fetch_script, meta_line, outcome_of_error,
-    resolve_script_url, same_origin, sanitize_debug,
+    resolve_script_url,
 };
 
 fn elapsed_ms(start: Instant) -> u64 {
@@ -138,13 +140,13 @@ async fn fetch_bounded(
 ) -> Result<FetchResponse, FetchFailure> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err(FetchFailure::of(FetchErrorClass::TotalTimeLimit));
+        return Err(FetchFailure::of(FetchClass::TotalTimeLimit));
     }
     let timeout = remaining.min(Duration::from_secs(args.fetch_timeout_sec));
     let fetcher = make_fetcher(timeout).map_err(|_| FetchFailure::of(FetchErrorClass::Other))?;
     fetch_script(&fetcher, url).await.map_err(|f| {
-        if f.class == FetchErrorClass::Timeout && Instant::now() >= deadline {
-            FetchFailure::of(FetchErrorClass::TotalTimeLimit)
+        if f.class == FetchClass::Mapped(FetchErrorClass::Timeout) && Instant::now() >= deadline {
+            FetchFailure::of(FetchClass::TotalTimeLimit)
         } else {
             f
         }
@@ -321,7 +323,7 @@ async fn eval_entry(
                     rec.elapsed_ms = elapsed_ms(fetch_start);
                     &external_body
                 }
-                Err(f) if f.class == FetchErrorClass::TotalTimeLimit => {
+                Err(f) if f.class == FetchClass::TotalTimeLimit => {
                     return skipped_record(id, entry, "total_time_limit");
                 }
                 Err(f) => {
