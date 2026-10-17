@@ -153,7 +153,12 @@
 //! - 応答直後の同期的な RSS 確認（`apply_post_response_rss_check`）は
 //!   呼び出しスレッド上で `read_child_rss_bytes` を 1 回だけ呼ぶ。Windows
 //!   は `GetProcessMemoryInfo`（psapi.dll の直接呼び出し）を使うため、
-//!   PowerShell 起動のようなプロセス生成コストは無い
+//!   PowerShell 起動のようなプロセス生成コストは無い。Linux は `/proc` 読み取り。
+//!   **macOS だけは評価ごとに `/bin/ps` を同期起動する**ため、1 往復の
+//!   遅延に数十 ms 乗る疑いがある（`JS-6`・`PERF-7`・TASK-113・Issue #905。
+//!   帰属は `tests/v8_worker.rs` の `[js-roundtrip-diag]` 行で計測する）。
+//!   `proc_pidinfo` による FFI 読み取りへ置き換える案は、`libc` の直接依存と
+//!   `unsafe` の新規追加が要るためオーナー承認待ちで未実装
 //! - 子はセキュリティ上のサンドボックスではない。同じユーザー権限で動作し、
 //!   seccomp 等も使わない。得られるのはクラッシュ・メモリの資源分離
 //!   だけである
@@ -344,7 +349,11 @@ fn child_memory_probe(
 /// [`MemoryMonitor`] が子のメモリ使用量を取得する際に呼ぶ関数の型
 /// （[`MemoryMonitor::spawn_with_threshold_and_probe`] が受け取る。
 /// clippy `type_complexity` 対応で型エイリアスに切り出した）。
-type MemoryProbeFn = Box<dyn Fn(&Arc<Mutex<Child>>, u32) -> Option<u64> + Send>;
+///
+/// `Arc` にしている理由: 継続監視の [`MemoryMonitor`] と、応答直後の同期確認
+/// （[`apply_post_response_rss_check`]）が**同じ実体**を共有するため
+/// （`JS-6`・`PERF-7`・Issue #905。診断用の差し替えが両経路に一貫して効く）。
+type MemoryProbeFn = Arc<dyn Fn(&Arc<Mutex<Child>>, u32) -> Option<u64> + Send + Sync>;
 
 /// [`MemoryMonitor`] が実際に使う、本番のメモリ使用量取得（[`child_memory_probe`]
 /// ＋ [`super::resource_limits::read_child_rss_bytes`] の組み合わせ）。
@@ -428,12 +437,13 @@ impl MemoryMonitor {
     /// 再現するため極端に小さい値を渡す）の 3 者が、いずれもこの単一の
     /// 関数を経由して呼び出し元から具体的なしきい値を指定できる必要が
     /// あるため。
+    #[cfg(test)]
     fn spawn_with_threshold(child: Arc<Mutex<Child>>, pid: u32, threshold_bytes: u64) -> Self {
         Self::spawn_with_threshold_and_probe(
             child,
             pid,
             threshold_bytes,
-            Box::new(default_memory_probe),
+            Arc::new(default_memory_probe),
         )
     }
 
@@ -637,6 +647,12 @@ struct WorkerHandle {
     /// `WorkerSpawnConfigForTest::rss_threshold_bytes_override` のドキュメント
     /// コメント参照。
     rss_threshold_bytes: u64,
+    /// [`memory_monitor`](Self::memory_monitor) と共有するメモリ使用量の
+    /// 取得関数。[`apply_post_response_rss_check`] の同期確認もこれを呼ぶ。
+    /// 本番は [`default_memory_probe`]。`V8ProcessEngine::set_memory_probe_for_test`
+    /// （feature `test-support`）だけが差し替えられる（`JS-6`・`PERF-7`・
+    /// Issue #905。macOS の往復遅延の帰属計測用）。
+    memory_probe: MemoryProbeFn,
 }
 
 impl WorkerHandle {
@@ -662,9 +678,25 @@ impl WorkerHandle {
     /// から指定できる（`spawn_worker` が
     /// `WorkerSpawnConfigForTest::rss_threshold_bytes_override` を渡す際に
     /// 使う。同フィールドのドキュメントコメント参照）。
+    #[cfg(test)]
     fn from_child_with_rss_threshold(
+        child: Child,
+        rss_threshold_bytes: u64,
+    ) -> Result<Self, JsEngineError> {
+        Self::from_child_with_rss_threshold_and_probe(
+            child,
+            rss_threshold_bytes,
+            Arc::new(default_memory_probe),
+        )
+    }
+
+    /// [`WorkerHandle::from_child_with_rss_threshold`] の本体。メモリ使用量の
+    /// 取得関数も差し替えられる（`spawn_worker` が
+    /// `V8ProcessEngine::memory_probe_override` を渡す。`JS-6`・Issue #905）。
+    fn from_child_with_rss_threshold_and_probe(
         mut child: Child,
         rss_threshold_bytes: u64,
+        memory_probe: MemoryProbeFn,
     ) -> Result<Self, JsEngineError> {
         let stdin = child.stdin.take().ok_or_else(|| {
             JsEngineError::EngineUnavailable(
@@ -757,8 +789,12 @@ impl WorkerHandle {
             })
         };
 
-        let memory_monitor =
-            MemoryMonitor::spawn_with_threshold(Arc::clone(&child), pid, rss_threshold_bytes);
+        let memory_monitor = MemoryMonitor::spawn_with_threshold_and_probe(
+            Arc::clone(&child),
+            pid,
+            rss_threshold_bytes,
+            Arc::clone(&memory_probe),
+        );
 
         Ok(WorkerHandle {
             child,
@@ -772,6 +808,7 @@ impl WorkerHandle {
             stderr_thread: Some(stderr_thread),
             memory_monitor,
             rss_threshold_bytes,
+            memory_probe,
         })
     }
 
@@ -1122,6 +1159,10 @@ pub enum DomLikeMemberFn {
 pub struct V8ProcessEngine {
     worker: Option<WorkerHandle>,
     spawn_config: WorkerSpawnConfigForTest,
+    /// メモリ使用量取得関数の差し替え（`None` なら本番の
+    /// [`default_memory_probe`]）。`set_memory_probe_for_test`（feature
+    /// `test-support`）だけが `Some` にできる（`JS-6`・`PERF-7`・Issue #905）。
+    memory_probe_override: Option<MemoryProbeFn>,
     /// 親側の `NativeCall` dispatch が実行する [`NativeFn`] の登録一覧
     /// （`TASK-29`・Issue #526）。登録 id は本 `Vec` の添字（`u32` へ変換
     /// して使う）であり、子から届く `NativeCall` フレームの `id` と対応
@@ -1163,6 +1204,7 @@ impl V8ProcessEngine {
         Self {
             worker: None,
             spawn_config: WorkerSpawnConfigForTest::default(),
+            memory_probe_override: None,
             native_fns: Vec::new(),
             host_bindings: Vec::new(),
             engine_kind,
@@ -1178,6 +1220,7 @@ impl V8ProcessEngine {
         Self {
             worker: None,
             spawn_config,
+            memory_probe_override: None,
             native_fns: Vec::new(),
             host_bindings: Vec::new(),
             engine_kind: EngineKind::V8,
@@ -1560,6 +1603,30 @@ impl V8ProcessEngine {
         self.worker.as_ref().map(|worker| worker.pid)
     }
 
+    /// テスト専用: 子のメモリ使用量取得関数を差し替える（以後に起動する子から
+    /// 有効。継続監視と応答直後の同期確認の両方へ同じ関数が渡る）。macOS の
+    /// 往復遅延が `ps` の同期起動に起因するかを切り分ける診断
+    /// （`JS-6`・`PERF-7`・TASK-113・Issue #905）専用で、しきい値判定自体は
+    /// 変えない。feature `test-support` 有効時のみ存在する（Issue #528）。
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_memory_probe_for_test(
+        &mut self,
+        probe: impl Fn(u32) -> Option<u64> + Send + Sync + 'static,
+    ) {
+        self.memory_probe_override = Some(Arc::new(move |_child, pid| probe(pid)));
+    }
+
+    /// テスト専用: 現在の子に対し**本番の**取得関数（[`default_memory_probe`]）を
+    /// 1 回実行して結果を返す（子が未起動なら `None`）。1 回あたりの所要時間を
+    /// 呼び出し側が計測する（`JS-6`・`PERF-7`・Issue #905）。
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn probe_worker_rss_for_test(&self) -> Option<u64> {
+        let worker = self.worker.as_ref()?;
+        default_memory_probe(&worker.child, worker.pid)
+    }
+
     /// テスト専用: 子プロセスの「起動＋ハンドシェイク」だけを行い、
     /// スクリプト評価は行わない（`TASK-29`・Issue #555・`CORE-3`・
     /// `PERF-6`・`PERF-7`）。`crates/fandhe-browser-js/benches/
@@ -1816,7 +1883,15 @@ impl V8ProcessEngine {
             .rss_threshold_bytes_override
             .map(|requested| requested.min(super::resource_limits::MAX_CHILD_RSS_BYTES))
             .unwrap_or(super::resource_limits::MAX_CHILD_RSS_BYTES);
-        let mut worker = WorkerHandle::from_child_with_rss_threshold(child, rss_threshold_bytes)?;
+        let memory_probe: MemoryProbeFn = self
+            .memory_probe_override
+            .clone()
+            .unwrap_or_else(|| Arc::new(default_memory_probe));
+        let mut worker = WorkerHandle::from_child_with_rss_threshold_and_probe(
+            child,
+            rss_threshold_bytes,
+            memory_probe,
+        )?;
 
         match worker.frame_rx.recv_timeout(HANDSHAKE_TIMEOUT) {
             Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::HELLO => {
@@ -3138,10 +3213,9 @@ fn apply_post_response_rss_check(
         return (Err(ensure_discarded_phrase(err)), false);
     }
 
-    let Some(probe) = child_memory_probe(&worker.child, worker.pid) else {
-        return (outcome, keep_worker);
-    };
-    let Some(rss_bytes) = super::resource_limits::read_child_rss_bytes(probe) else {
+    // 監視スレッドと同じ取得関数を使う（macOS では評価ごとに `ps` を起動する
+    // ため、この呼び出しが往復遅延の主因の疑い。`JS-6`・`PERF-7`・Issue #905）。
+    let Some(rss_bytes) = (worker.memory_probe)(&worker.child, worker.pid) else {
         return (outcome, keep_worker);
     };
     if rss_bytes <= worker.rss_threshold_bytes {
@@ -3680,7 +3754,7 @@ mod tests {
             Arc::clone(&child),
             pid,
             u64::MAX,
-            Box::new(|_child, _pid| None),
+            Arc::new(|_child, _pid| None),
         );
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -3769,7 +3843,7 @@ mod tests {
             Arc::clone(&child),
             pid,
             u64::MAX,
-            Box::new(|_child, _pid| None),
+            Arc::new(|_child, _pid| None),
         );
 
         // `MAX_CONSECUTIVE_PROBE_FAILURES` 回分のポーリング間隔を大幅に

@@ -192,9 +192,93 @@ fn main() -> ExitCode {
     js_1_create_engine_v8_blocking_native_fn_times_out_within_deadline();
     eprintln!("case: js_1_create_engine_v8_dom_like_method_runs");
     js_1_create_engine_v8_dom_like_method_runs();
+    eprintln!("case: perf_7_js_6_roundtrip_attribution_diagnostic");
+    perf_7_js_6_roundtrip_attribution_diagnostic();
     eprintln!("v8_worker: all cases passed");
 
     ExitCode::SUCCESS
+}
+
+/// 往復回数（初回の起動分を除く）。
+const ROUNDTRIP_DIAG_ITERATIONS: usize = 30;
+
+/// 中央値と最大値（ミリ秒）を返す。
+fn median_and_max_ms(mut samples: Vec<Duration>) -> (f64, f64) {
+    samples.sort();
+    let median = samples.get(samples.len() / 2).copied().unwrap_or_default();
+    let max = samples.last().copied().unwrap_or_default();
+    (median.as_secs_f64() * 1e3, max.as_secs_f64() * 1e3)
+}
+
+/// `evaluate_script("1")` を `ROUNDTRIP_DIAG_ITERATIONS` 回実行して各所要時間を返す
+/// （最初の 1 回は子の起動を含むため、ウォームアップとして計測から除く）。
+fn measure_evaluate_roundtrips(engine: &mut V8ProcessEngine) -> Vec<Duration> {
+    let mut samples = Vec::with_capacity(ROUNDTRIP_DIAG_ITERATIONS);
+    for i in 0..=ROUNDTRIP_DIAG_ITERATIONS {
+        let started = Instant::now();
+        let value = engine
+            .evaluate_script("1", &EvaluateOptions::default())
+            .unwrap_or_else(|err| panic!("evaluation must succeed: {err}"));
+        assert_eq!(value, JsValue::Number(1.0));
+        if i > 0 {
+            samples.push(started.elapsed());
+        }
+    }
+    samples
+}
+
+/// `JS-6`・`PERF-7`・TASK-113・Issue #905: macOS の V8 ページ JS 実行の往復遅延が
+/// 「評価ごとの `ps` 同期起動」に起因するかを切り分ける診断。
+///
+/// (a) 本番のメモリプローブ、(b) 常に `Some(0)` を返す差し替えプローブ、
+/// (c) 本番プローブ単体、の 3 つの 1 回あたり所要時間を 1 行（`[js-roundtrip-diag]`）に
+/// 出す。(b) が (a) より大幅に短く (c) が (a)-(b) に近ければ、原因は実装起因（プローブ）。
+/// (b) も遅ければプローブでは説明できない（writer/reader スレッドやランナー固有を疑う）。
+/// 時間はランナー差で揺れるため、しきい値ではアサートしない。アサートするのは
+/// 具体値（評価結果・差し替えプローブの呼び出し回数）だけ。
+fn perf_7_js_6_roundtrip_attribution_diagnostic() {
+    let mut real = V8ProcessEngine::new();
+    let real_samples = measure_evaluate_roundtrips(&mut real);
+
+    // (c) 本番プローブ単体（子は (a) の engine が保持している）。
+    let mut probe_samples = Vec::with_capacity(ROUNDTRIP_DIAG_ITERATIONS);
+    for _ in 0..ROUNDTRIP_DIAG_ITERATIONS {
+        let started = Instant::now();
+        let rss = real.probe_worker_rss_for_test();
+        probe_samples.push(started.elapsed());
+        assert!(
+            rss.is_some_and(|bytes| bytes > 0),
+            "RSS probe returned {rss:?}"
+        );
+    }
+
+    let calls = Arc::new(Mutex::new(0usize));
+    let calls_for_probe = Arc::clone(&calls);
+    let mut stubbed = V8ProcessEngine::new();
+    stubbed.set_memory_probe_for_test(move |_pid| {
+        if let Ok(mut n) = calls_for_probe.lock() {
+            *n += 1;
+        }
+        Some(0)
+    });
+    let stub_samples = measure_evaluate_roundtrips(&mut stubbed);
+    // 同期確認は評価 1 回につきちょうど 1 回（ウォームアップ 1 回 + 計測分）。
+    // 監視スレッド（75 ms 周期）の呼び出しも加わるため下限で固定する。
+    let call_count = calls.lock().map(|n| *n).unwrap_or(0);
+    assert!(
+        call_count > ROUNDTRIP_DIAG_ITERATIONS,
+        "the replaced probe must be called at least once per evaluation, got {call_count}"
+    );
+
+    let (real_median, real_max) = median_and_max_ms(real_samples);
+    let (stub_median, stub_max) = median_and_max_ms(stub_samples);
+    let (probe_median, probe_max) = median_and_max_ms(probe_samples);
+    eprintln!(
+        "[js-roundtrip-diag] os={} n={ROUNDTRIP_DIAG_ITERATIONS} real_median_ms={real_median:.2} \
+         real_max_ms={real_max:.2} stub_median_ms={stub_median:.2} stub_max_ms={stub_max:.2} \
+         probe_median_ms={probe_median:.2} probe_max_ms={probe_max:.2}",
+        std::env::consts::OS
+    );
 }
 
 /// JS-1・Issue #503 W6 観点 1「通常の評価」: 単純な算術式が期待どおりの
