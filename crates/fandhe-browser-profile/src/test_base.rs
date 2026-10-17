@@ -19,10 +19,10 @@ pub fn test_base_dir() -> PathBuf {
     {
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
             let dir = PathBuf::from(local).join("fandhe-test-tmp");
-            if std::fs::create_dir_all(&dir).is_ok() {
-                if let Ok(c) = dir.canonicalize() {
-                    return c;
-                }
+            if std::fs::create_dir_all(&dir).is_ok()
+                && let Ok(c) = dir.canonicalize()
+            {
+                return c;
             }
         }
     }
