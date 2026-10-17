@@ -451,21 +451,30 @@ async function main(argv) {
     if (platform) args.push('--platform', platform);
     args.push(image);
   }
+  // ホストの環境変数は継承させない（docker CLI の動作に必要な最小限のみ）。
+  // TLS 接続の daemon（DOCKER_TLS_VERIFY・DOCKER_CERT_PATH）でも run.sh と同じ接続先に届くよう保持する。
+  // docker run と後始末の docker rm -f は同じ env を使い、接続設定を統一する。
+  const env = fake
+    ? process.env
+    : Object.fromEntries(
+      ['PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONFIG', 'DOCKER_CONTEXT', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH']
+        .filter((k) => process.env[k] !== undefined)
+        .map((k) => [k, process.env[k]]),
+    );
+
   // docker CLI を kill してもコンテナは残るため、終了時に必ず rm -f する。
+  // daemon が無応答でも無期限に待たないよう timeout と SIGKILL を付け、失敗時は診断を残して終了する。
   const removeContainer = () => {
-    if (!fake) spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore' });
+    if (fake) return;
+    const r = spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore', env, timeout: 15000, killSignal: 'SIGKILL' });
+    if (r.error || r.status !== 0) {
+      const why = r.error ? sanitize(r.error.message) : `exit=${r.status}`;
+      console.error(`warning: failed to remove container ${name} (${why}); remove it manually with docker rm -f`);
+    }
   };
   process.on('exit', removeContainer);
   for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(130));
 
-  // ホストの環境変数は継承させない（docker CLI の動作に必要な最小限のみ）。
-  const env = fake
-    ? process.env
-    : Object.fromEntries(
-      ['PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONFIG', 'DOCKER_CONTEXT']
-        .filter((k) => process.env[k] !== undefined)
-        .map((k) => [k, process.env[k]]),
-    );
   const proc = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'], env });
   let errTail = '';
   let errHead = '';
