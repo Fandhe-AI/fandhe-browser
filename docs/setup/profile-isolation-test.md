@@ -13,31 +13,30 @@ Linux ext4・macOS APFS・Windows NTFS の実機で確認する（`XOS-10`・`ME
 
 ## 現状の実施可否
 
-| OS / FS | 実施可否 | 理由 |
+| OS / FS | 実施可否 | 備考 |
 | ------- | -------- | ---- |
-| Linux ext4 | 可 | 対象テストは `#![cfg(unix)]` で実行される |
+| Linux ext4 | 可 | 対象テストは unix で実行される |
 | macOS APFS | 可 | 同上 |
-| Windows NTFS | **現状は実行不能** | 後述 |
+| Windows NTFS | 可（Issue #954 以降） | 下記の限界あり |
 
-### Windows NTFS が実行不能である根拠
+### Windows NTFS での実行と限界
 
-- Windows の `Profile::open` は、ルートが `%LOCALAPPDATA%` 配下のときだけ成功する（Issue #928）。
-  新規ルートには作成時に保護付き DACL を付けて検証する（Issue #952。既存ルートの ACL の検証は #953）。配下外は
-  `ProfileError::Unsupported` でディレクトリを作らない（fail-closed）。ACL を明示設定して任意のパスを
-  許可する第 2 段階（`XOS-7`）は未実装である（`crates/fandhe-browser-profile/src/local_root.rs`・
-  `src/profile.rs` の `Profile::open_impl`）
-- `crates/fandhe-browser-profile/src/store.rs` のモジュール doc も同じ事実（配下では成功・配下外は
-  `Unsupported`）を述べている
-- `crates/fandhe-browser-profile/tests/isolation.rs` と `tests/concurrent_isolation.rs` は `#![cfg(unix)]` の
-  ままで、分離テストの Windows 対応は別 Issue である。Windows 側は `src/profile.rs` の `#[cfg(windows)]`
-  テスト（`prof1_windows_open_succeeds_under_real_local_app_data`、
-  `xos10_windows_open_rejects_outside_roots_without_creating` など）が、配下では成功し配下外では
-  `Unsupported` を返すことを確認するのみ
-- Windows ACL 実装方式の判断は #813 が追跡している（本書作成時点で OPEN）。Windows の実施は #813 と
-  後続の ACL 実装の完了待ちで、**実施時期・順序は未決定（オーナー判断待ち）**
-
-したがって当面は Linux・macOS を先に実施して部分報告とし、Windows は ACL 実装後に追記する。
-`Unsupported` を返すだけの Windows 実行を「分離テスト合格」として記録しない（`REPAIR-3`）。
+- Windows の `Profile::open` は、ルートが既知フォルダ（`FOLDERID_LocalAppData`）配下のときだけ成功する
+  （Issue #928・#951）。新規ルートには保護付き DACL を設定し（#952）、既存ルートは所有者と DACL を検証する
+  （#953）。配下外は `ProfileError::Unsupported` でディレクトリを作らない（fail-closed）
+- 分離テスト（`tests/isolation.rs`・`tests/concurrent_isolation.rs`）は Issue #954 で Windows でも
+  実行されるようになった。テストのルートは既知フォルダ配下の `fandhe-test-tmp`
+  （`fandhe_browser_profile::test_base_dir()`）で、`TMPDIR`・`TEMP` は効かない
+- **限界 1**: Windows の `Profile::create_file_in`（ハンドル相対の書き込み）は #948 配下の Issue の完了まで
+  未実装のため、Windows のテストは `tests/support/mod.rs` のアダプタ経由（検証済みパスを std で開く）で
+  書き込む。確かめているのは `Profile::open` が作るレイアウト・ロック・DACL・ルートのハンドル保持と、
+  ディスク上の分離であり、製品の書き込み API そのものではない（`REPAIR-3`）。#948 の完了後に
+  アダプタを製品 API へ置き換える
+- **限界 2**: `prof_3_dangling_symlink_is_reported_as_missing` は unix のみ（Windows のファイル symlink
+  作成には特権が要り、ジャンクションでは「リンク先の無いファイル symlink」を模擬できない）
+- Windows 専用に、DACL の継承（`prof_2_prof_6_windows_roots_have_protected_dacl_and_data_inherits_it`）、
+  ルートのハンドル保持（`prof_2_windows_open_profile_root_cannot_be_swapped`）を検証する。
+  二重 open の拒否（`prof_1_prof_2_lock_is_per_profile_and_rejects_double_open`）は全 OS で検証する
 
 ## 対象テスト
 
@@ -54,7 +53,7 @@ Linux ext4・macOS APFS・Windows NTFS の実機で確認する（`XOS-10`・`ME
 関連テスト（`PROF-3` の 5 プロファイル並行アクセス。`tests/concurrent_isolation.rs`）も同じ
 プロファイル分離の信頼性に関わるため、実施時に併せて実行して結果を記録するとよい。
 
-## 事前準備（Linux・macOS 共通）
+## 事前準備（共通）
 
 1. Rust stable（`rust-toolchain.toml`）と、本リポジトリの通常のビルド環境を用意する
 2. リポジトリを取得する。`docs/spec` は不要（ビルド・テストは spec 抜きで成立する）
@@ -98,6 +97,19 @@ cargo test -p fandhe-browser-profile --test concurrent_isolation -- --nocapture
 macOS では `/var` → `/private/var` のような標準 symlink があるため、テスト側が一時領域を
 `canonicalize` してから使う（`isolation.rs` の `TempDir`）。`TMPDIR` はそのままでよい。
 
+## Windows NTFS
+
+```powershell
+# テストの基点は既知フォルダ（%LOCALAPPDATA%）配下の fandhe-test-tmp（TMPDIR・TEMP は効かない）
+fsutil fsinfo volumeinfo C:     # File System Name が NTFS であること（LocalAppData のあるボリューム）
+systeminfo | findstr /B /C:"OS Name" /C:"OS Version"
+
+cargo test -p fandhe-browser-profile --test isolation -- --nocapture
+cargo test -p fandhe-browser-profile --test concurrent_isolation -- --nocapture
+```
+
+DACL の検証は `powershell`（Get-Acl）と `icacls` を使う。いずれも標準で入っている。
+
 ## 判定の見方
 
 - 各 `cargo test` が `test result: ok.` で終わり、`failed` / `ignored` が 0 であること
@@ -130,6 +142,9 @@ Issue #295 へ貼る。OS ごとに 1 表を作る。
 | prof_2_on_disk_contamination_is_detected（陰性対照） | ok / FAILED | - | |
 | tests/isolation.rs の残りのメタテスト | N 件 ok | - | |
 | tests/concurrent_isolation.rs（PROF-3） | N 件 ok | 混線 0 | 任意 |
+| prof_1_prof_2_lock_is_per_profile_and_rejects_double_open（全 OS） | ok / FAILED | - | |
+| prof_2_prof_6_windows_roots_have_protected_dacl_and_data_inherits_it（Windows のみ） | ok / FAILED | - | |
+| prof_2_windows_open_profile_root_cannot_be_swapped（Windows のみ） | ok / FAILED | - | |
 
 ## 判定
 
@@ -158,24 +173,21 @@ PROF-2 on <OS / FS>: 合格 / 不合格（理由）
 
 ## 部分報告の書式
 
-Windows が未実施の間は、Linux・macOS の結果を #295 に部分報告として貼る。
+一部の OS だけ実施した場合は、実施済みの結果を #295 に部分報告として貼る。
 
 ```markdown
-## 部分報告（Linux ext4 / macOS APFS）
+## 部分報告（<実施済みの OS / FS>）
 
-- 実施済み: Linux ext4（合格 / 不合格）、macOS APFS（合格 / 不合格）。詳細は各表のとおり
-- 未実施: Windows NTFS
-  - 理由: 分離テスト（`tests/isolation.rs`）が `#![cfg(unix)]` のまま。`Profile::open` は
-    `%LOCALAPPDATA%` 配下で成功する（Issue #928）が、配下外は `Unsupported`（#813 で方式を判断中）
-  - 再開条件: Windows の ACL 実装完了後に本手順（`tests/isolation.rs` の `#![cfg(unix)]` の扱いを含む）を
-    Windows 向けに見直して実施する
+- 実施済み: <OS / FS>（合格 / 不合格）。詳細は各表のとおり
+- 未実施: <OS / FS>（理由）
 - 本 Issue の受け入れ条件（3 OS 分の測定レポート）は未達のため、close しない
 ```
 
 ## Windows 実施時の申し送り
 
-- `tests/isolation.rs` と `tests/concurrent_isolation.rs` は `#![cfg(unix)]` のため、Windows で実行するには
-  ACL 実装後にテスト側の cfg 方針と Windows 向けの隔離検証（ACL の確認）を別途設計する必要がある。
-  この設計は本書では行わない（**未決定（オーナー判断待ち）**）
+- Windows の分離テストは Issue #954 で `cfg` の方針が決まった（共通の検証は 3 OS で実行し、unix 専用の
+  検証は `cfg(unix)` に残し、Windows には DACL・ハンドル保持の対応する検証を足した）。限界は上記
+  「Windows NTFS での実行と限界」のとおりで、結果を記録するときも書き込みがアダプタ経由であることを併記する
+- #295 の実機実施は担当: 人間の別作業で、本書は手順書であって結果ではない
 - #295 のコメントにある、Windows での Playwright トレース収集経路（`CDP-3` 系・
-  `make trace-playwright` が Windows で失敗する件）の有効化確認も、ACL 実装後に同じ機会で行う
+  `make trace-playwright` が Windows で失敗する件）の有効化確認も、実機実施の機会に行う
