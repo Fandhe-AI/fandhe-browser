@@ -647,7 +647,19 @@ pub(crate) fn open_or_create_protected_dir_at(
     let child = open_dir_with_sd(parent, name, sd.as_ptr())?;
     match child.disposition {
         ChildDisposition::Created => verify_protected_dacl(&child.file, &sd.user_sid)?,
-        ChildDisposition::Opened => verify_existing_root_security(&child.file)?,
+        ChildDisposition::Opened => {
+            // 検証エラーの path は空で返るため、拒否したルート自身の相対名を補う
+            // （呼び出し側が親のパスと連結してフルパスにする）。
+            verify_existing_root_security(&child.file).map_err(|err| match err {
+                ProfileError::InvalidLayout { path, reason } if path.as_os_str().is_empty() => {
+                    ProfileError::InvalidLayout {
+                        path: PathBuf::from(name),
+                        reason,
+                    }
+                }
+                other => other,
+            })?
+        }
     }
     Ok(child)
 }
