@@ -41,7 +41,7 @@
 #      次のいずれかで native=true にする。
 #        a. crates/fandhe-browser-profile/ 配下の変更（パス・ロック・ファイルシステム依存）
 #        b. 環境変数 CI_CHANGES_RS_DIFF_FILE が指す unified diff（`git diff -U0 -- '*.rs'` の出力）の
-#           追加・削除行に、単語境界つきの windows / unix トークン、または target_os / target_family
+#           追加・削除行に、単語境界つき（BSD grep でも動くよう \b ではなく POSIX 文字クラスで表現）の windows / unix トークン、または target_os / target_family
 #           が含まれる。cfg( の有無は問わない（複数行の #[cfg(any(\n windows,\n unix,\n))] で
 #           cfg( と windows が別行になっても拾うため。過検出は native=true 側＝安全側）
 #      diff ファイルが指定されているのに読めない場合は native=true（fail-closed）。未指定のときは
@@ -57,7 +57,7 @@ diff_has_os_cfg() {
   [ -r "$1" ] || return 2
   local rc=0
   grep -E '^[+-]' -- "$1" | grep -vE '^(\+\+\+|---)' \
-    | grep -qE '\b(windows|unix)\b|target_os|target_family' || rc=$?
+    | grep -qE '(^|[^[:alnum:]_])(windows|unix)([^[:alnum:]_]|$)|target_os|target_family' || rc=$?
   # grep -q: 0=一致 1=不一致 それ以外=エラー（fail-closed のため 2 に寄せる）
   case "$rc" in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
 }
