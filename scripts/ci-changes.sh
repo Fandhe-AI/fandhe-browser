@@ -41,8 +41,9 @@
 #      次のいずれかで native=true にする。
 #        a. crates/fandhe-browser-profile/ 配下の変更（パス・ロック・ファイルシステム依存）
 #        b. 環境変数 CI_CHANGES_RS_DIFF_FILE が指す unified diff（`git diff -U0 -- '*.rs'` の出力）の
-#           追加・削除行に cfg(windows / cfg(unix / cfg(not(windows / cfg(not(unix / target_os /
-#           target_family 等の OS 分岐が含まれる。cfg(any(...)・cfg!(・cfg_attr( 内の同キーワードも拾う
+#           追加・削除行に、単語境界つきの windows / unix トークン、または target_os / target_family
+#           が含まれる。cfg( の有無は問わない（複数行の #[cfg(any(\n windows,\n unix,\n))] で
+#           cfg( と windows が別行になっても拾うため。過検出は native=true 側＝安全側）
 #      diff ファイルが指定されているのに読めない場合は native=true（fail-closed）。未指定のときは
 #      パス判定だけを行う（自己テスト用。ワークフローは常に指定する）。
 # 入力が 1 行も無い場合は判定材料が無いため rust・harness・servo・native をすべて true にする。
@@ -56,7 +57,7 @@ diff_has_os_cfg() {
   [ -r "$1" ] || return 2
   local rc=0
   grep -E '^[+-]' -- "$1" | grep -vE '^(\+\+\+|---)' \
-    | grep -qE 'cfg(_attr|!)?\(.*(windows|unix)|target_os|target_family' || rc=$?
+    | grep -qE '\b(windows|unix)\b|target_os|target_family' || rc=$?
   # grep -q: 0=一致 1=不一致 それ以外=エラー（fail-closed のため 2 に寄せる）
   case "$rc" in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
 }
@@ -223,6 +224,9 @@ self_test() {
   expect_native "cfg(any(unix, ...))" true "$rs" $'+#[cfg(any(unix, target_os = "wasi"))]'
   expect_native "target_os in code" true "$rs" $'+if cfg!(target_os = "macos") {}'
   expect_native "target_family" true "$rs" $'+#[cfg(target_family = "unix")]'
+  expect_native "multi-line cfg: windows on its own line" true "$rs" $'+    windows,'
+  expect_native "multi-line cfg: unix on its own line" true "$rs" $'-    unix,\n+    any(target_os = "x"),'
+  expect_native "multi-line cfg: only cfg(any( line changed" false "$rs" $'+#[cfg(any(\n+    feature = "a",'
   expect_native "windows word in unchanged context only" false "$rs" $' cfg(windows) context\n--- a/windows.rs\n+++ b/windows.rs'
   expect_native "windows word without cfg" false "$rs" $'+// Windows notes'
   expect_native "diff unreadable (fail-closed)" true "$rs" __missing__
