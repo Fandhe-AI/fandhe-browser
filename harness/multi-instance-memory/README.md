@@ -39,10 +39,42 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
 - bash・ps・awk・curl に加え、`loaded` 条件は node 22 以降（fandhe・Chromium 双方の遷移確認に使う）（npm 依存なし）
 - fandhe-browser はリリースビルドを推奨（`cargo build --release -p fandhe-browser-cli`）。
   JS エンジン構成を変えた場合は構成を記録に残す
-- Chromium/Chrome の実行ファイル（`--chromium-bin`）。root で実行する場合やコンテナ内では
-  `--chromium-extra-args "--no-sandbox"` が必要になることがある
+- Chromium/Chrome の実行ファイル（`--chromium-bin`）。sandbox が使えない環境（root 実行・コンテナ内・
+  非特権 user namespace の制限）では `--chromium-extra-args "--no-sandbox"` が必要になる。指定した追加引数は
+  結果 JSON の `chromium_extra_args`・`chromium_no_sandbox` に記録されるので、sandbox 無効で測った場合は
+  レポートに明記する。共有ライブラリの不足は `ldd "$CHROMIUM_BIN" | grep 'not found'` で確認する
 - 同一バイナリ・同一マシンで Chromium と同一セッションに測る（`MEAS-6` の前提は Linux 実機。
   リソース不足でスワップが起きると PSS 以外の指標に影響するため、空きメモリを事前に確認する）
+
+### 実行前に確認する権限と環境
+
+| 実行内容 | 必要な権限 |
+| -------- | ---------- |
+| idle・N=1 | 非特権で可 |
+| idle・N>=2（fandhe 側は netns） | root、または非特権 user namespace。Ubuntu 23.10 以降は `kernel.apparmor_restrict_unprivileged_userns` 等で制限されうる。事前に `unshare -Urn true` で確認する |
+| loaded（fandhe 側） | root 必須（veth・iptables・`ip_forward`） |
+
+- `FANDHE_BIN` を渡した `self-test.sh` は netns の N=2 実行のため `unshare -Urn` を試す。失敗する環境では
+  note を出して未検証扱いにする
+- `sudo` では PATH が引き継がれず node が見つからない（`node (22+) is required`・終了コード 2）ことがある。
+  `sudo env PATH="$(dirname "$(command -v node)"):$PATH" harness/multi-instance-memory/measure.sh ...` で渡す
+- 作業ディレクトリは `${TMPDIR:-/tmp}/fandhe-mim.*`。Chromium の `TMPDIR` はその中（`t/<i>`）に向けるため、
+  Chromium が作る `org.chromium.Chromium.*` も終了・失敗・中断時に作業ディレクトリごと削除される
+  （作業ディレクトリ以外は削除しない）。`TMPDIR` が長いと Chromium の Unix ソケットのパス長上限（108 バイト）に
+  近づくため、38 バイトを超える場合は警告を出す
+
+## 起動失敗時の確認手順
+
+対象プロセスが起動直後に終了した場合（sandbox 不可・共有ライブラリ不足など）、そのプロセスのログ末尾
+（1 インスタンス 20 行・最大 3 インスタンス。残りは件数のみ。制御文字は除去）をエラー出力（stderr）に出す。
+
+1. stderr の `--- last 20 lines of ... log ---` を読む。典型例: `No usable sandbox` は
+   `--chromium-extra-args "--no-sandbox"` か user namespace の設定、`error while loading shared libraries` は
+   不足ライブラリの導入
+2. `-n 1 --conditions idle` で再現する
+3. Chromium 単体で確認する: `"$CHROMIUM_BIN" --headless=new --no-sandbox --dump-dom about:blank`
+4. 異常終了後の残留を確認する:
+   `pgrep -af 'fandhe-browser|chrom'`・`ls -d "${TMPDIR:-/tmp}"/fandhe-mim.* "${TMPDIR:-/tmp}"/org.chromium.Chromium.*`
 
 ## ネットワーク分離（重要な制約）
 
@@ -85,7 +117,8 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
 #      loopback・プライベートアドレス・file: は SSRF ガードで拒否されるため使えない）
 
 # 2. 計測（loaded は veth/NAT のため root。sudo で実行。出力は JSON）
-sudo harness/multi-instance-memory/measure.sh -n 50 \
+#    sudo では node の PATH を引き継ぐ（前提の節を参照）
+sudo env PATH="$(dirname "$(command -v node)"):$PATH" harness/multi-instance-memory/measure.sh -n 50 \
   --fandhe-bin target/release/fandhe-browser \
   --chromium-bin /usr/bin/chromium --chromium-extra-args "--no-sandbox" \
   --url <公開 URL（例: https://example.com/）> \
@@ -109,6 +142,8 @@ sudo harness/multi-instance-memory/measure.sh -n 50 \
 | `results[]` | `target`（fandhe/chromium）・`condition`（idle/loaded）・`processes`（合算対象数）・`pss_kib`・`rss_kib`・`pss_per_instance_kib` |
 | `comparisons[]` | 条件ごとの `reduction_pct` = (1 - fandhe_pss / chromium_pss) x 100、`reference_threshold_met`（50% 以上か。参考値） |
 | `comparisons[].poc1_extrapolation` | `--poc1-*-kib` 指定時のみ。PoC-1 の 1 インスタンスあたり値 x N の線形外挿値と、実測の乖離率（`*_delta_pct`。正は実測が外挿より大きい） |
+| `chromium_extra_args` | Chromium に渡した追加引数の配列（`--skip-chromium` 時は `[]`） |
+| `chromium_no_sandbox` | 追加引数に `--no-sandbox` を含むか（`--skip-chromium` 時は `false`）。sandbox 無効で測った場合はレポートに記載する |
 | `environment` | カーネル・アーキテクチャ・CPU 数・総メモリ（ホスト名・IP は含めない） |
 
 ## PoC-1 線形外挿との比較方法
@@ -129,7 +164,10 @@ FANDHE_BIN=target/debug/fandhe-browser harness/multi-instance-memory/self-test.s
 
 小さな N（2）で偽バイナリを起動し、プロセスツリー走査・PSS 合算・JSON 出力・残留なしを確認する。
 あわせて PoC-1 基準値・`--url`（loopback/private/`file:` 拒否）の入力検証、URL の JSON エスケープの
-往復、`navigate.mjs` の `errorText` 非 0 終了を確認する。veth/NAT（root）は自己テストの対象外で、
+往復、`navigate.mjs` の `errorText` 非 0 終了を確認する。偽 Chromium・偽 fandhe で起動失敗時のログ末尾の出力
+（20 行・3 インスタンスの上限・制御文字除去）、Chromium 一時ディレクトリの作業ディレクトリ内への配置と
+正常終了・TERM 中断時の削除（無関係な `org.chromium.Chromium.*` は残る）、`chromium_extra_args` の記録も
+確認する（いずれもオフライン・非 root）。veth/NAT（root）は自己テストの対象外で、
 実機でのオーナー実行時に確認する。
 実バイナリ（N=1）と、可能なら netns の N=2 も確認する。CI には組み込まない。
 終了コード: 0 全検証済み / 1 失敗 / 3 Chromium 不在（Chromium 経路のみ未検証・他は合格。skip で 0 にしない）/ 4 Linux 以外。
@@ -142,7 +180,7 @@ FANDHE_BIN=target/debug/fandhe-browser harness/multi-instance-memory/self-test.s
 - 実施日 / 実施者:
 - 環境: カーネル / CPU 数 / 総メモリ / 分離方式（netns・root の有無）
 - fandhe-browser: コミット / ビルド（release・feature） / バイナリサイズ
-- Chromium: バージョン / 追加フラグ
+- Chromium: バージョン / 追加フラグ（JSON の `chromium_extra_args`。`--no-sandbox` なら明記）
 - ページ: URL（fixture の内容・サイズ） / settle 秒数 / N
 
 | 条件 | fandhe PSS (KiB) | Chromium PSS (KiB) | 削減率 | 50% 以上 |

@@ -234,13 +234,124 @@ exec sleep 300
 FAKECR_EOF
 chmod +x "$TMP/fake-chromium"
 mkdir -p "$TMP/cargs"
-ARGS_DIR="$TMP/cargs" "$MEASURE" -n 2 --fandhe-bin /bin/true --skip-fandhe --chromium-bin "$TMP/fake-chromium" \
-  --conditions idle --settle 0 >/dev/null 2>&1 || fail "fake chromium idle run failed"
+CR_OUT="$(ARGS_DIR="$TMP/cargs" "$MEASURE" -n 2 --fandhe-bin /bin/true --skip-fandhe --chromium-bin "$TMP/fake-chromium" \
+  --chromium-extra-args "--no-sandbox --lang=en-US" --conditions idle --settle 0 2>/dev/null)" \
+  || fail "fake chromium idle run failed"
 cat "$TMP"/cargs/args.* >"$TMP/cargs.all"
 for want in --remote-debugging-address=127.0.0.1 --remote-debugging-port=9401 --remote-debugging-port=9402 about:blank; do
   grep -qxF -- "$want" "$TMP/cargs.all" || fail "chromium args must include '$want'"
 done
-ok "chromium launch args: loopback-only remote debugging port per instance, about:blank"
+for want in --no-sandbox --lang=en-US; do
+  grep -qxF -- "$want" "$TMP/cargs.all" || fail "chromium args must include extra '$want'"
+done
+ok "chromium launch args: loopback-only remote debugging port per instance, about:blank, extra args"
+
+# A4: 追加引数が結果 JSON に記録される（sandbox 無効で測ったことが分かる）
+if command -v jq >/dev/null 2>&1; then
+  jq -e '.chromium_extra_args == ["--no-sandbox","--lang=en-US"] and .chromium_no_sandbox == true' <<<"$CR_OUT" >/dev/null \
+    || fail "JSON must record chromium_extra_args and chromium_no_sandbox=true"
+else
+  grep -q '"chromium_extra_args":\["--no-sandbox","--lang=en-US"\],"chromium_no_sandbox":true' <<<"$CR_OUT" \
+    || fail "JSON must record chromium_extra_args and chromium_no_sandbox=true"
+fi
+ok "JSON records chromium_extra_args and chromium_no_sandbox"
+
+# A1/A5: 起動直後に終了する Chromium（sandbox 不可を模す）。ログ末尾 20 行だけが stderr に出る
+cat >"$TMP/dying-chromium" <<'DYING_EOF'
+#!/bin/sh
+i=1
+while [ "$i" -le 100 ]; do echo "line $i" >&2; i=$((i + 1)); done
+printf 'esc\033[31mred\033[0m\n' >&2
+echo 'FATAL: fake sandbox failure' >&2
+exit 1
+DYING_EOF
+chmod +x "$TMP/dying-chromium"
+port_in_use_st() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+if port_in_use_st 9401; then
+  echo "note: 127.0.0.1:9401 is already in use; startup-failure diagnostics NOT verified"
+else
+  st=0
+  "$MEASURE" -n 1 --fandhe-bin /bin/true --skip-fandhe --chromium-bin "$TMP/dying-chromium" \
+    --conditions idle --settle 1 >/dev/null 2>"$TMP/dying.err" || st=$?
+  [ "$st" -eq 1 ] || fail "dying chromium must exit 1 (got $st)"
+  grep -q 'only 0/1 chromium instances alive' "$TMP/dying.err" || fail "dying chromium: alive count error missing"
+  grep -q 'FATAL: fake sandbox failure' "$TMP/dying.err" || fail "dying chromium: log tail must be on stderr"
+  grep -q 'line 100' "$TMP/dying.err" || fail "dying chromium: last log line missing"
+  if grep -qx 'line 1' "$TMP/dying.err" || grep -qx 'line 80' "$TMP/dying.err"; then fail "log tail must be limited to the last 20 lines"; fi
+  if grep -q "$(printf '\033')" "$TMP/dying.err"; then fail "control characters must be stripped from the log tail"; fi
+  ok "startup failure: last 20 log lines on stderr (older lines and control characters excluded)"
+
+  # 表示インスタンス数の上限（4 個中 3 個まで、残りは件数のみ）
+  if port_in_use_st 9404; then
+    echo "note: 127.0.0.1:9404 is already in use; log-tail instance cap NOT verified"
+  else
+    st=0
+    "$MEASURE" -n 4 --fandhe-bin /bin/true --skip-fandhe --chromium-bin "$TMP/dying-chromium" \
+      --conditions idle --settle 1 >/dev/null 2>"$TMP/dying4.err" || st=$?
+    [ "$st" -eq 1 ] || fail "dying chromium x4 must exit 1 (got $st)"
+    [ "$(grep -c '^--- last 20 lines of chromium instance' "$TMP/dying4.err")" = 3 ] || fail "log tail must cover at most 3 instances"
+    grep -q 'and 1 more dead chromium instance' "$TMP/dying4.err" || fail "remaining dead instances must be counted"
+    ok "startup failure: log tails capped at 3 instances, the rest counted"
+  fi
+fi
+
+# 起動失敗（fandhe 経路・準備確認）: 共有ライブラリ不足を模す
+if port_in_use_st 9333; then
+  echo "note: 127.0.0.1:9333 is already in use; fandhe startup-failure diagnostics NOT verified"
+else
+  printf '#!/bin/sh\necho "error while loading shared libraries: libfake.so.1" >&2\nexit 127\n' >"$TMP/dying-fandhe"
+  chmod +x "$TMP/dying-fandhe"
+  st=0
+  MEASURE_READY_TIMEOUT_SEC=5 "$MEASURE" -n 1 --fandhe-bin "$TMP/dying-fandhe" --skip-chromium \
+    --conditions idle --settle 0 --net-mode host >/dev/null 2>"$TMP/dyingf.err" || st=$?
+  [ "$st" -eq 1 ] || fail "dying fandhe must exit 1 (got $st)"
+  grep -q 'exited during startup' "$TMP/dyingf.err" || fail "dying fandhe: startup exit error missing"
+  grep -q 'libfake.so.1' "$TMP/dyingf.err" || fail "dying fandhe: log tail must be on stderr"
+  ok "startup failure (fandhe readiness): log tail on stderr"
+fi
+
+# A2/A5: Chromium の一時ディレクトリ（org.chromium.Chromium.*）は作業ディレクトリ内に作られ、
+# 正常終了・TERM 中断のいずれでも消える。それ以外（番兵）は消さない
+cat >"$TMP/tmp-chromium" <<'TMPCR_EOF'
+#!/bin/sh
+d="$(mktemp -d "${TMPDIR:-/tmp}/org.chromium.Chromium.XXXXXX")"
+echo "$d" >"$ARGS_DIR/tmpdir.$$"
+exec sleep 300
+TMPCR_EOF
+chmod +x "$TMP/tmp-chromium"
+mkdir -p "$TMP/mtmp" "$TMP/targs"
+mkdir "$TMP/mtmp/org.chromium.Chromium.sentinel"
+assert_chromium_tmp_cleaned() { # $1=説明
+  local f d n=0
+  for f in "$TMP"/targs/tmpdir.*; do
+    [ -e "$f" ] || continue
+    n=$((n + 1)); d="$(cat "$f")"
+    case "$d" in "$TMP"/mtmp/fandhe-mim.*/t/*) ;; *) fail "$1: chromium tmp dir must be inside the work dir (got $d)" ;; esac
+    [ ! -e "$d" ] || fail "$1: chromium tmp dir must be removed ($d)"
+  done
+  [ "$n" -ge 1 ] || fail "$1: fake chromium did not record its tmp dir"
+  if compgen -G "$TMP/mtmp/fandhe-mim.*" >/dev/null; then fail "$1: work dir must be removed"; fi
+  [ -d "$TMP/mtmp/org.chromium.Chromium.sentinel" ] || fail "$1: unrelated org.chromium.Chromium.* must not be deleted"
+  if pgrep -f "$TMP/tmp-chromium" >/dev/null 2>&1; then fail "$1: leftover fake chromium processes"; fi
+}
+TMPDIR="$TMP/mtmp" ARGS_DIR="$TMP/targs" "$MEASURE" -n 2 --fandhe-bin /bin/true --skip-fandhe --chromium-bin "$TMP/tmp-chromium" \
+  --conditions idle --settle 1 >/dev/null 2>&1 || fail "tmp-chromium normal run failed"
+assert_chromium_tmp_cleaned "normal exit"
+ok "chromium tmp dirs are created inside the work dir and removed on normal exit (unrelated dirs kept)"
+
+# 中断（TERM）。Ctrl-C（INT）も同じ EXIT trap の cleanup を通る。非対話 bash のバックグラウンドジョブは
+# SIGINT が無視された状態で始まるため、ここでは TERM で検証する。trap は前景の sleep の終了後に走るので settle は短くする
+rm -f "$TMP"/targs/tmpdir.*
+TMPDIR="$TMP/mtmp" ARGS_DIR="$TMP/targs" "$MEASURE" -n 2 --fandhe-bin /bin/true --skip-fandhe --chromium-bin "$TMP/tmp-chromium" \
+  --conditions idle --settle 3 >/dev/null 2>&1 &
+mpid=$!
+for _ in $(seq 1 100); do [ "$(find "$TMP/targs" -name 'tmpdir.*' | wc -l)" -ge 2 ] && break; sleep 0.1; done
+kill -TERM "$mpid" 2>/dev/null || true
+st=0; wait "$mpid" 2>/dev/null || st=$?
+[ "$st" -eq 143 ] || fail "TERM must exit 143 (got $st)"
+assert_chromium_tmp_cleaned "TERM interrupt"
+ok "chromium tmp dirs are removed when measure.sh is interrupted (TERM -> exit 143)"
+rm -f "$TMP"/targs/tmpdir.*
 
 # ポート競合・接続先の取り違え（ポート 9401 を使う別プロセス）。node が必要
 if command -v node >/dev/null 2>&1; then
@@ -354,6 +465,10 @@ procs="$(json_num "$OUT" processes)"; pss="$(json_num "$OUT" pss_kib)"
 if command -v jq >/dev/null 2>&1; then
   jq -e '.task == "TASK-81" and .instances == 2 and (.results | length) == 1' <<<"$OUT" >/dev/null \
     || fail "JSON shape"
+fi
+if command -v jq >/dev/null 2>&1; then
+  jq -e '.chromium_extra_args == [] and .chromium_no_sandbox == false' <<<"$OUT" >/dev/null \
+    || fail "--skip-chromium JSON must have empty chromium_extra_args and chromium_no_sandbox=false"
 fi
 ok "fake binary x2: processes=$procs pss_kib=$pss (process tree walked, JSON emitted)"
 
