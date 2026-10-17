@@ -66,6 +66,7 @@
 pub mod normalize;
 pub mod profile;
 pub mod store;
+mod test_base;
 
 // Windows の実装と、他 OS では単体テストだけが使う（未使用警告をモジュール単位の
 // `allow` で消さず、コンパイル対象を cfg で絞る）。
@@ -86,3 +87,5 @@ pub use store::{
     APP_DIR_NAME, ExplicitStore, LongPath, LongPathKind, OsDefaultStore, OverridableStore,
     ProfileStore, ResolvedRoot, RootSource, to_long_path,
 };
+#[doc(hidden)]
+pub use test_base::test_base_dir;

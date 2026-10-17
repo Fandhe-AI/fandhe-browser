@@ -45,9 +45,7 @@ mod cdp_state {
     impl TempDir {
         fn new() -> Self {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let base = std::env::temp_dir()
-                .canonicalize()
-                .unwrap_or_else(|_| std::env::temp_dir());
+            let base = fandhe_browser_profile::test_base_dir();
             Self(base.join(format!("fandhe-cdp-state-test-{}-{n}", std::process::id())))
         }
     }

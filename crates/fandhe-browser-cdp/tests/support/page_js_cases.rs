@@ -9,7 +9,7 @@
 //! - **CDP 層（全 OS）**: `test_support::LoopbackDispatcher` で `Page.navigate` → `DOM.*` を
 //!   実行し、イベント列・DOM・所要時間・フィクスチャの到達数を検証する。`Profile::open` は
 //!   Windows では `%LOCALAPPDATA%` 配下のルートに限り成功する（Issue #928）ため、一時ディレクトリは
-//!   `std::env::temp_dir()` 配下に作る。配下でない環境では `Profile::open` が `Unsupported` で失敗し、
+//!   `fandhe_browser_profile::test_base_dir()`（Windows は `%LOCALAPPDATA%` 配下）に作る。配下でない環境では `Profile::open` が `Unsupported` で失敗し、
 //!   テストも失敗する（skip しない）。
 //! - **アクター層（全 OS）**: 同じフィクスチャ HTML・同じハンドル構成で `PageScriptHandle` を直接
 //!   呼び、CDP 経路が捨てる診断（`PageRunOutput` の打ち切り種別・スクリプト別結果・
@@ -640,7 +640,7 @@ fn actor_cases(engine: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// CDP 層のケース（全 OS。Windows は temp_dir() が %LOCALAPPDATA% 配下であることが前提）
+// CDP 層のケース（全 OS。Windows は test_base_dir() が %LOCALAPPDATA% 配下を返す）
 // ---------------------------------------------------------------------------
 
 mod cdp_layer {
@@ -662,9 +662,7 @@ mod cdp_layer {
     impl TempDir {
         fn new() -> Self {
             static SEQ: AtomicUsize = AtomicUsize::new(0);
-            let base = std::env::temp_dir()
-                .canonicalize()
-                .unwrap_or_else(|_| std::env::temp_dir());
+            let base = fandhe_browser_profile::test_base_dir();
             Self(base.join(format!(
                 "fandhe-cdp-page-js-{}-{}",
                 std::process::id(),

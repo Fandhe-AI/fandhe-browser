@@ -103,9 +103,7 @@ mod ai_state {
     impl TempDir {
         fn new() -> Self {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let base = std::env::temp_dir()
-                .canonicalize()
-                .unwrap_or_else(|_| std::env::temp_dir());
+            let base = fandhe_browser_profile::test_base_dir();
             Self(base.join(format!("fandhe-ai-plugin-test-{}-{n}", std::process::id())))
         }
     }
@@ -193,9 +191,7 @@ mod http_flow {
     impl TempDir {
         fn new() -> Self {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let base = std::env::temp_dir()
-                .canonicalize()
-                .unwrap_or_else(|_| std::env::temp_dir());
+            let base = fandhe_browser_profile::test_base_dir();
             Self(base.join(format!(
                 "fandhe-ai-plugin-flow-test-{}-{n}",
                 std::process::id()

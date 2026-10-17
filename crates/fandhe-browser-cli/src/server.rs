@@ -375,7 +375,7 @@ pub(crate) mod tests {
         #[test]
         fn xos7_open_app_state_succeeds_under_local_app_data_on_windows() {
             let dir = TempDir::new();
-            // 前提: 一時ディレクトリ（`temp_dir()` 基点）が `%LOCALAPPDATA%` 配下であること。
+            // 前提: 一時ディレクトリ（`test_base_dir()` 基点）が `%LOCALAPPDATA%` 配下であること。
             let base = local_app_data();
             let owned = std::fs::canonicalize(&dir.owned).expect("temp dir exists");
             assert!(
@@ -959,9 +959,7 @@ pub(crate) mod tests {
 
         impl TempDir {
             pub(crate) fn new() -> Self {
-                let base = std::env::temp_dir()
-                    .canonicalize()
-                    .unwrap_or_else(|_| std::env::temp_dir());
+                let base = fandhe_browser_profile::test_base_dir();
                 loop {
                     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
                     let owned = base.join(format!("fandhe-cli-test-{}-{n}", std::process::id()));

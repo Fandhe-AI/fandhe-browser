@@ -1084,9 +1084,7 @@ mod tests {
 
         impl TempDir {
             fn new() -> Self {
-                let base = std::env::temp_dir()
-                    .canonicalize()
-                    .unwrap_or_else(|_| std::env::temp_dir());
+                let base = fandhe_browser_profile::test_base_dir();
                 for _ in 0..64 {
                     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
                     let nanos = std::time::SystemTime::now()
